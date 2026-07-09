@@ -744,8 +744,22 @@ range non-contiguous over a strict linear numbering (a use at a program point *b
 dominating def), which basic linear-scan mishandles. A3's first cut detects a back-edge (a
 branch/jump target id ≤ the emitting block id) and honest-stops with a named error rather than
 mis-allocate (M.3). **Law-first:** an honest-stop that names the deferral beats a silently-wrong
-allocation; the acyclic subset is exactly what A2's interp runs today, so the A3 gate is provable
-without loops. Named follow-up: **A3-loop** — live-range holes / interval union over back-edges (the
+allocation; the single-block subset A2's interp runs today is provable without loops.
+
+> **⚠️ KNOWN OVER-APPROXIMATION (#384 A3 review, 2026-07-09).** The `target id ≤ block id` proxy is
+> only a true back-edge test when block ids are **topological**, which A1 lowering does NOT guarantee:
+> `lower_if_value` allocates the merge block **before** the arm bodies, so a nested `if`/`match` arm's
+> tail block gets a **higher** id than the merge it targets, and `close_arm_to` emits a forward (in
+> CFG) but **backward-in-id** `LJump`. The proxy therefore **false-positives on acyclic nested
+> control flow**, honest-stopping valid `if`/`match`-nested functions — and, worse, the strict linear
+> numbering is itself inverted for such blocks. This is **fail-safe** (an error, never a miscompile)
+> and **currently unreachable in the pipeline** (A3 regalloc is not yet wired into a compile path;
+> single-block fixtures are what ship + are proven). But the doc's earlier claim that "the whole
+> acyclic subset is provable" was too strong — it holds only for the **single-block** subset. Precise
+> back-edge detection (topological block numbering, or DFS/dominance) is a **prerequisite before
+> regalloc is wired in (A4/D)** and is tracked as its own follow-up.
+
+Named follow-up: **A3-loop** — live-range holes / interval union over back-edges (the
 standard linear-scan-with-holes extension), landed when A1/A2 exercise `loop` end-to-end through the
 interp. This is stated up front so no one claims A3 covers loops.
 

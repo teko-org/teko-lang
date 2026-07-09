@@ -836,3 +836,98 @@ fn rgt_regalloc_func_back_edge_honest_stops() {
     teko::assert::is_true(is_err)
 }
 
+#test
+fn rgt_rewrite_movk_inreg_def_dedup() {
+    let a0: RegAssignment = InReg { vreg_id = 0 to u32; phys = 9 to u32 }
+    let sr = rgt_sr(teko::list::push(teko::list::empty(), a0))
+    let out = rewrite_inst(aapcs64(), sr, movk_inst(true, rgt_v(0), 2 to u32, 16 to u32), 0 to u32)
+    teko::assert::is_true(out.len == (1 to u64))
+    teko::assert::is_true(rgt_inst_all_phys(out[0]))
+}
+
+#test
+fn rgt_rewrite_movk_spilled_def_dedup() {
+    let a0: RegAssignment = Spilled { vreg_id = 0 to u32; slot = 0 to u32 }
+    let sr = rgt_sr(teko::list::push(teko::list::empty(), a0))
+    let out = rewrite_inst(aapcs64(), sr, movk_inst(true, rgt_v(0), 2 to u32, 16 to u32), 0 to u32)
+    teko::assert::is_true(out.len == (5 to u64))
+    teko::assert::is_true(rgt_is_frame_addr(out[0]))
+    teko::assert::is_true(rgt_is_load(out[1]))
+    teko::assert::is_true(rgt_inst_all_phys(out[2]))
+    teko::assert::is_true(rgt_is_frame_addr(out[3]))
+    teko::assert::is_true(rgt_is_store(out[4]))
+}
+
+/**
+ * rgt_movk_fixture — `movz v0=3; movk v0=5<<16; mov x0=v0; ret` → 0x50003
+ * (327683); drives the RMW MMovK (def==use) through regalloc + interp so the
+ * def-dedup path is proven end-to-end, not just structurally.
+ *
+ * @return []MInst  the fixture stream
+ */
+fn rgt_movk_fixture() -> []MInst {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movz_inst(true, rgt_v(0), 3 to u32, 0 to u32))
+    insts = teko::list::push(insts, movk_inst(true, rgt_v(0), 5 to u32, 16 to u32))
+    insts = teko::list::push(insts, mov_inst(true, rgt_p(0), rgt_v(0)))
+    insts = teko::list::push(insts, ret_inst())
+    insts
+}
+
+#test
+fn rgt_regalloc_movk_rmw_interp_equivalence() {
+    let f = rgt_named_func("main", rgt_movk_fixture())
+    let pre = minst_interp(rgt_module_of(f), "main", rgt_no_args())
+    teko::assert::is_true(pre == (327683 to i128))
+    let colored = match regalloc_module(aapcs64(), rgt_module_of(f)) {
+        MModule as mm => mm
+        error => return
+    }
+    let post = minst_interp(colored, "main", rgt_no_args())
+    teko::assert::is_true(post == pre)
+}
+
+#test
+fn rgt_regalloc_conditional_terminators_honest_stop() {
+    let bc = rgt_func(teko::list::push(teko::list::empty(), MBranchCond { cond = MCond::EQ; target = 0 to u32 }))
+    let e1 = match regalloc_func(aapcs64(), bc) {
+        MFunc => false
+        error => true
+    }
+    teko::assert::is_true(e1)
+    let cbz = rgt_func(teko::list::push(teko::list::empty(), MCbz { wide = true; zero = true; a = rgt_p(0); target = 0 to u32 }))
+    let e2 = match regalloc_func(aapcs64(), cbz) {
+        MFunc => false
+        error => true
+    }
+    teko::assert::is_true(e2)
+}
+
+#test
+fn rgt_linear_scan_equal_start_tie_break() {
+    let virt = teko::list::push(teko::list::push(teko::list::empty(), ai_iv(1, 0, 5, false)), ai_iv(0, 0, 7, false))
+    let scan = linear_scan(aapcs64(), ai_set(virt, teko::list::empty()))
+    teko::assert::is_true(ai_phys(scan, 0) != (100000 to u32))
+    teko::assert::is_true(ai_phys(scan, 1) != (100000 to u32))
+    teko::assert::is_true(ai_phys(scan, 0) != ai_phys(scan, 1))
+}
+
+#test
+fn rgt_compute_intervals_use_only_vreg() {
+    let f = rgt_func(teko::list::push(teko::list::push(teko::list::empty(), cmp_inst(true, rgt_v(0), rgt_p(0))), ret_inst()))
+    let iset = match compute_intervals(number_insts(f)) {
+        IntervalSet as s => s
+        error => return
+    }
+    teko::assert::is_true(iv_has(iset.virt, 0, 0, 0))
+}
+
+#test
+fn rgt_linear_scan_two_spill_marks_prior_spilled() {
+    let virt = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
+        ai_iv(0, 0, 3, false)), ai_iv(1, 1, 100, false)), ai_iv(2, 2, 50, false)), ai_iv(3, 3, 4, false))
+    let scan = linear_scan(ai_tiny_abi(), ai_set(virt, teko::list::empty()))
+    teko::assert::is_true(ai_spilled(scan, 1))
+    teko::assert::is_true(ai_spilled(scan, 2))
+}
+
