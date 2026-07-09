@@ -395,8 +395,8 @@ fn pipeline_composes_across_wrappers() {
 /**
  * A WriteFn that accepts at most HALF of each offered region (rounding up so a 1-byte
  * region still makes progress), appending the accepted prefix to a caller-owned MemWriter.
- * Drives the `tee_write_fn` min-progress path: a `write_all` over a tee whose secondary is
- * this half-taker must loop until BOTH sinks have drained the whole region.
+ * Drives the `tee_write_fn` rate-mismatched path: the tee drains this half-taker to
+ * completion via `write_all`, so it takes several calls to absorb the whole region.
  *
  * @param sink  the caller-owned in-memory accumulator advanced on each partial accept
  * @return      a WriteFn that takes ceil(len/2) bytes per call and reports that count
@@ -426,8 +426,8 @@ fn failing_write_fn() -> WriteFn {
 }
 
 /**
- * `tee_write_fn` mirrors each write into both sinks and a `write_all` driver leaves both
- * holding the full region, reporting the min of the two accepted counts (equal here).
+ * `tee_write_fn` mirrors each write into both sinks; a `write_all` driver leaves both
+ * holding the full region, and the tee reports the whole region length.
  */
 #test
 fn tee_write_fn_mirrors_to_both_sinks() {
@@ -441,14 +441,13 @@ fn tee_write_fn_mirrors_to_both_sinks() {
 }
 
 /**
- * When both sinks accept only a partial prefix per call, `tee_write_fn` reports the SMALLER
- * of the two accepted counts, and the `write_all` driver keeps looping until BOTH sinks
- * have drained the whole region. Both sinks are partial-consistent (they append exactly the
- * bytes they report), which is the contract a min-progress tee requires — a sink that
- * commits more than it reports would double-append the re-offered tail.
+ * When both sinks accept only a partial prefix per call, `tee_write_fn` drains each sink to
+ * completion (via `write_all`) before it reports, so BOTH end up holding the whole region
+ * exactly once and the tee reports the full region length — no re-offered tail and no
+ * double-append, regardless of the two sinks' differing per-call rates.
  */
 #test
-fn tee_write_fn_reports_min_progress() {
+fn tee_write_fn_drains_rate_mismatched_sinks() {
     mut fast_sink = MemWriter::empty()
     mut slow_sink = MemWriter::empty()
     let tee = tee_write_fn(half_taking_write_fn(fast_sink), half_taking_write_fn(slow_sink))

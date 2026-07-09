@@ -1,0 +1,1960 @@
+use teko::lir
+
+/**
+ * MRegClass — the AArch64 register file a value lives in: general-purpose
+ * (x/w registers, the SP/LR) or floating-point/SIMD (v/d/s/h registers).
+ * A VReg's class is fixed by its defining op (an integer op defines a GPR,
+ * a float op an FPR), so `class_of` (the isel side-table) never guesses.
+ *
+ * @since #383 A2-1
+ */
+pub type MRegClass = enum { GPR; FPR }
+
+/**
+ * MReg — one register operand: a virtual register (`is_phys=false`, `id` an
+ * abstract number the A3 allocator colors) or a physical register
+ * (`is_phys=true`, `id` an ISA number — x0..x30, SP=31 in the GPR class;
+ * v0..v31 in the FPR class). Physical pins carry the AAPCS64 constraints
+ * (argument/return registers) isel plants and A3 coalesces.
+ *
+ * @since #383 A2-1
+ */
+pub type MReg = struct { id: u32; reg_class: MRegClass; is_phys: bool }
+
+/**
+ * MMem — a base-plus-displacement address operand: `[base, #offset]`. A
+ * folded `LFieldAddr` rides in `offset` (a compile-time byte constant); the
+ * plain case is `offset=0`. The A4 encoder maps `offset` to the scaled/
+ * unscaled immediate form; A3 may rewrite `base` to a frame register.
+ *
+ * @since #383 A2-1
+ */
+pub type MMem = struct { base: MReg; offset: i32 }
+
+/**
+ * MRelocKind — which relocation an address-materialization instruction owes
+ * the A4 encoder: the ADRP page (`PageHi`), the ADD/LDR low-12 page offset
+ * (`PageLo`), or a direct branch target (`Call`). A2 records the kind + the
+ * already-final symbol; A4 emits the actual relocation entry.
+ *
+ * @since #383 A2-1
+ */
+pub type MRelocKind = enum { PageHi; PageLo; Call }
+
+/**
+ * MCond — an AArch64 condition code, chosen from an integer/float compare
+ * opcode. The unsigned lane (`LO/LS/HI/HS`) is picked for the `*U` compares,
+ * the signed lane (`LT/LE/GT/GE`) for the `*S` compares — signedness rides
+ * the LIR opcode, so the mapping is total and mechanical.
+ *
+ * @since #383 A2-1
+ */
+pub type MCond = enum { EQ; NE; LT; LE; GT; GE; LO; LS; HI; HS }
+
+/**
+ * MAluOp — the closed set of AArch64 register-register ALU operations
+ * `MAlu`/`MAluImm` select: the arithmetic (`Add`/`Sub`/`Mul`/`Sdiv`/`Udiv`),
+ * bitwise (`And`/`Orr`/`Eor`), and shift (`Lsl`/`Asr`/`Lsr`) mnemonics, one
+ * per `LBinOp` arithmetic/bitwise/shift case (§3.1 of the isel plan).
+ *
+ * @since #383 A2-1
+ */
+pub type MAluOp = enum { Add; Sub; Mul; Sdiv; Udiv; And; Orr; Eor; Lsl; Asr; Lsr }
+
+/**
+ * MFAluOp — the closed set of AArch64 float ALU operations `MFAlu` selects:
+ * `FAdd`/`FSub`/`FMul`/`FDiv`, one per `LBinOp` float-arithmetic case.
+ *
+ * @since #383 A2-1
+ */
+pub type MFAluOp = enum { FAdd; FSub; FMul; FDiv }
+
+/**
+ * MExtOp — the closed set of AArch64 sign/zero-extend mnemonics `MExt`
+ * selects: `Sxtb`/`Sxth`/`Sxtw` for a narrow `SExt`, `Uxtb`/`Uxth`/`Uxtw` for
+ * a narrow `ZExt` (§3.1 of the isel plan).
+ *
+ * @since #383 A2-1
+ */
+pub type MExtOp = enum { Sxtb; Sxth; Sxtw; Uxtb; Uxth; Uxtw }
+
+/**
+ * MCvtOp — the closed set of AArch64 int/float conversion mnemonics `MCvt`
+ * selects: `Scvtf`/`Ucvtf` for `IToF`, `Fcvtzs`/`Fcvtzu` for `FToI`, `Fcvt`
+ * for `FToF` (§3.1 of the isel plan).
+ *
+ * @since #383 A2-1
+ */
+pub type MCvtOp = enum { Scvtf; Ucvtf; Fcvtzs; Fcvtzu; Fcvt }
+
+/**
+ * MMemSize — the access width `MLoad`/`MStore` transfer: the GPR byte/half/
+ * word/doubleword widths (`B`/`H`/`W`/`X`) or the FPR single/double widths
+ * (`S`/`D`), chosen from the LIR value's machine class at the memory op.
+ *
+ * @since #383 A2-1
+ */
+pub type MMemSize = enum { B; H; W; X; S; D }
+
+/**
+ * MAlu — a register-register ALU op: `dst = a <op> b` (ADD/SUB/MUL/SDIV/
+ * UDIV/AND/ORR/EOR/LSL/ASR/LSR), the selection of an `LBin` arithmetic/
+ * bitwise/shift case (§3.1 of the isel plan).
+ *
+ * @since #383 A2-1
+ */
+pub type MAlu = struct {
+    /**
+     * op — which ALU mnemonic to emit.
+     */
+    op: MAluOp
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the result is written to.
+     */
+    dst: MReg
+    /**
+     * a — the first source register operand.
+     */
+    a: MReg
+    /**
+     * b — the second source register operand.
+     */
+    b: MReg
+}
+
+/**
+ * MAluImm — a register-immediate ALU op: `dst = a <op> #imm`, the folded
+ * `LFieldAddr` (an ADD-by-constant) and the add/sub-by-const peephole.
+ *
+ * @since #383 A2-1
+ */
+pub type MAluImm = struct {
+    /**
+     * op — which ALU mnemonic to emit.
+     */
+    op: MAluOp
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the result is written to.
+     */
+    dst: MReg
+    /**
+     * a — the source register operand.
+     */
+    a: MReg
+    /**
+     * imm — the immediate operand.
+     */
+    imm: i64
+}
+
+/**
+ * MMSub — `dst = c - a * b` (MSUB), the second half of `IRemS`/`IRemU`
+ * (an SDIV/UDIV quotient into a scratch register, then this).
+ *
+ * @since #383 A2-1
+ */
+pub type MMSub = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the remainder is written to.
+     */
+    dst: MReg
+    /**
+     * a — the quotient register (SDIV/UDIV's result).
+     */
+    a: MReg
+    /**
+     * b — the divisor register.
+     */
+    b: MReg
+    /**
+     * c — the dividend register (the MSUB minuend).
+     */
+    c: MReg
+}
+
+/**
+ * MNeg — `dst = -a` (NEG), the selection of `INeg`.
+ *
+ * @since #383 A2-1
+ */
+pub type MNeg = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the negated value is written to.
+     */
+    dst: MReg
+    /**
+     * a — the source register operand.
+     */
+    a: MReg
+}
+
+/**
+ * MMvn — `dst = ~a` (MVN), the selection of `INot`.
+ *
+ * @since #383 A2-1
+ */
+pub type MMvn = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the complemented value is written to.
+     */
+    dst: MReg
+    /**
+     * a — the source register operand.
+     */
+    a: MReg
+}
+
+/**
+ * MFAlu — a float register-register ALU op: `dst = a <op> b` (FADD/FSUB/
+ * FMUL/FDIV), the selection of an `LBin` float-arithmetic case.
+ *
+ * @since #383 A2-1
+ */
+pub type MFAlu = struct {
+    /**
+     * op — which float ALU mnemonic to emit.
+     */
+    op: MFAluOp
+    /**
+     * dbl — true for the f64 (D-register) form, false for the f32
+     * (S-register) form.
+     */
+    dbl: bool
+    /**
+     * dst — the destination register the result is written to.
+     */
+    dst: MReg
+    /**
+     * a — the first source register operand.
+     */
+    a: MReg
+    /**
+     * b — the second source register operand.
+     */
+    b: MReg
+}
+
+/**
+ * MFNeg — `dst = -a` (FNEG), the selection of `FNeg`.
+ *
+ * @since #383 A2-1
+ */
+pub type MFNeg = struct {
+    /**
+     * dbl — true for the f64 (D-register) form, false for the f32
+     * (S-register) form.
+     */
+    dbl: bool
+    /**
+     * dst — the destination register the negated value is written to.
+     */
+    dst: MReg
+    /**
+     * a — the source register operand.
+     */
+    a: MReg
+}
+
+/**
+ * MCmp — an integer compare (CMP, `SUBS xzr, a, b`) that sets the condition
+ * flags without materializing a value; consumed by a fused `MBranchCond` or
+ * followed by an `MCSet` when the compare is used as a plain value.
+ *
+ * @since #383 A2-1
+ */
+pub type MCmp = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * a — the first compared register operand.
+     */
+    a: MReg
+    /**
+     * b — the second compared register operand.
+     */
+    b: MReg
+}
+
+/**
+ * MCmpImm — an integer compare against an immediate (CMP …, #imm), the
+ * cond-vs-0/cond-vs-const shape of a fused branch or a `MCSet` value.
+ *
+ * @since #383 A2-1
+ */
+pub type MCmpImm = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * a — the compared register operand.
+     */
+    a: MReg
+    /**
+     * imm — the immediate compared against.
+     */
+    imm: i64
+}
+
+/**
+ * MFCmp — a float compare (FCMP), the selection of an `LBin` float-compare
+ * case; consumed the same way as `MCmp` (fused branch or `MCSet`).
+ *
+ * @since #383 A2-1
+ */
+pub type MFCmp = struct {
+    /**
+     * dbl — true for the f64 (D-register) form, false for the f32
+     * (S-register) form.
+     */
+    dbl: bool
+    /**
+     * a — the first compared register operand.
+     */
+    a: MReg
+    /**
+     * b — the second compared register operand.
+     */
+    b: MReg
+}
+
+/**
+ * MCSet — `dst = (cond) ? 1 : 0` (CSET), materializing a preceding `MCmp`/
+ * `MFCmp` as a plain 0/1 value (an integer/float compare NOT fused into a
+ * branch).
+ *
+ * @since #383 A2-1
+ */
+pub type MCSet = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the 0/1 result is written to.
+     */
+    dst: MReg
+    /**
+     * cond — the AArch64 condition code tested against the flags a prior
+     * compare set.
+     */
+    cond: MCond
+}
+
+/**
+ * MMovZ — `dst = imm16 << shift` (MOVZ), one 16-bit lane of an integer
+ * literal's minimal materialization sequence (`materialize_int`, A2-2).
+ *
+ * @since #383 A2-1
+ */
+pub type MMovZ = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the lane is written to.
+     */
+    dst: MReg
+    /**
+     * imm16 — the 16-bit lane value.
+     */
+    imm16: u32
+    /**
+     * shift — the lane's bit position (0/16/32/48).
+     */
+    shift: u32
+}
+
+/**
+ * MMovK — `dst |= imm16 << shift`, keeping the other lanes (MOVK), a
+ * follow-up lane of `materialize_int` after the first `MMovZ`/`MMovN`.
+ *
+ * @since #383 A2-1
+ */
+pub type MMovK = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the lane is merged into.
+     */
+    dst: MReg
+    /**
+     * imm16 — the 16-bit lane value.
+     */
+    imm16: u32
+    /**
+     * shift — the lane's bit position (0/16/32/48).
+     */
+    shift: u32
+}
+
+/**
+ * MMovN — `dst = ~(imm16 << shift)` (MOVN), the inverted-literal
+ * materialization `materialize_int` picks when it is the denser encoding.
+ *
+ * @since #383 A2-1
+ */
+pub type MMovN = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register the inverted lane is written to.
+     */
+    dst: MReg
+    /**
+     * imm16 — the 16-bit lane value (before inversion).
+     */
+    imm16: u32
+    /**
+     * shift — the lane's bit position (0/16/32/48).
+     */
+    shift: u32
+}
+
+/**
+ * MFMov — `dst = src` across the GPR/FPR boundary or between two FPRs
+ * (FMOV), the `LConstFloat` bit-materialization and FPR-FPR moves.
+ *
+ * @since #383 A2-1
+ */
+pub type MFMov = struct {
+    /**
+     * dbl — true for the f64 (D-register) form, false for the f32
+     * (S-register) form.
+     */
+    dbl: bool
+    /**
+     * dst — the destination register.
+     */
+    dst: MReg
+    /**
+     * src — the source register.
+     */
+    src: MReg
+}
+
+/**
+ * MMov — `dst = src` between two GPRs (ORR xzr-form reg move), the
+ * `Trunc` W-view write and ordinary/edge register moves.
+ *
+ * @since #383 A2-1
+ */
+pub type MMov = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * dst — the destination register.
+     */
+    dst: MReg
+    /**
+     * src — the source register.
+     */
+    src: MReg
+}
+
+/**
+ * MExt — a narrow sign/zero-extend (SXTB/SXTH/SXTW/UXTB/UXTH/UXTW), the
+ * selection of a narrow `SExt`/`ZExt`.
+ *
+ * @since #383 A2-1
+ */
+pub type MExt = struct {
+    /**
+     * op — which extend mnemonic to emit.
+     */
+    op: MExtOp
+    /**
+     * dst — the destination register the extended value is written to.
+     */
+    dst: MReg
+    /**
+     * a — the source register operand.
+     */
+    a: MReg
+}
+
+/**
+ * MCvt — an int/float conversion (SCVTF/UCVTF/FCVTZS/FCVTZU/FCVT), the
+ * selection of `IToF`/`FToI`/`FToF`.
+ *
+ * @since #383 A2-1
+ */
+pub type MCvt = struct {
+    /**
+     * op — which conversion mnemonic to emit.
+     */
+    op: MCvtOp
+    /**
+     * dst — the destination register the converted value is written to.
+     */
+    dst: MReg
+    /**
+     * a — the source register operand.
+     */
+    a: MReg
+}
+
+/**
+ * MLoad — load a value from memory (LDR/LDRB/LDRH/LDRSW/LDRSB/LDRSH), the
+ * selection of `LLoad` (size/sign by the loaded value's machine class).
+ *
+ * @since #383 A2-1
+ */
+pub type MLoad = struct {
+    /**
+     * size — the access width (byte/half/word/doubleword, or the FPR S/D
+     * form).
+     */
+    size: MMemSize
+    /**
+     * sign — true when the narrow load sign-extends into the destination
+     * register, false for a zero-extending or plain load.
+     */
+    sign: bool
+    /**
+     * dst — the destination register the loaded value is written to.
+     */
+    dst: MReg
+    /**
+     * mem — the base-plus-displacement address loaded from.
+     */
+    mem: MMem
+}
+
+/**
+ * MStore — store a value to memory (STR/STRB/STRH), the selection of
+ * `LStore` (size by the stored value's machine class).
+ *
+ * @since #383 A2-1
+ */
+pub type MStore = struct {
+    /**
+     * size — the access width (byte/half/word/doubleword, or the FPR S/D
+     * form).
+     */
+    size: MMemSize
+    /**
+     * src — the register holding the value stored.
+     */
+    src: MReg
+    /**
+     * mem — the base-plus-displacement address stored to.
+     */
+    mem: MMem
+}
+
+/**
+ * MFrameAddr — the abstract address of a reserved frame slot (`ADD dst,
+ * FP/SP, #slotoff`, resolved once A3 finalizes the frame layout), the
+ * selection of `LAlloca`.
+ *
+ * @since #383 A2-1
+ */
+pub type MFrameAddr = struct {
+    /**
+     * dst — the destination register the slot's address is written to.
+     */
+    dst: MReg
+    /**
+     * slot — the frame-slot index (an `MFunc.frame` table entry).
+     */
+    slot: u32
+}
+
+/**
+ * MAdrp — the page-relative high bits of a symbol's address (ADRP), the
+ * first half of the `LGlobalAddr`/`LFuncAddr` ADRP+ADD relocation pair.
+ *
+ * @since #383 A2-1
+ */
+pub type MAdrp = struct {
+    /**
+     * dst — the destination register the page address is written to.
+     */
+    dst: MReg
+    /**
+     * sym — the already-final relocation symbol name.
+     */
+    sym: str
+    /**
+     * kind — which relocation the A4 encoder owes this instruction.
+     */
+    kind: MRelocKind
+}
+
+/**
+ * MAddLo — the low-12 page-offset completion of an `MAdrp` (ADD dst, a,
+ * #:lo12:sym), the second half of the ADRP+ADD relocation pair.
+ *
+ * @since #383 A2-1
+ */
+pub type MAddLo = struct {
+    /**
+     * dst — the destination register the full address is written to.
+     */
+    dst: MReg
+    /**
+     * a — the register holding the `MAdrp`-produced page address.
+     */
+    a: MReg
+    /**
+     * sym — the already-final relocation symbol name (matches the paired
+     * `MAdrp`).
+     */
+    sym: str
+    /**
+     * kind — which relocation the A4 encoder owes this instruction.
+     */
+    kind: MRelocKind
+}
+
+/**
+ * MBranch — an unconditional branch (B) to a machine block, the selection
+ * of `LJump` (after its edge moves are emitted).
+ *
+ * @since #383 A2-1
+ */
+pub type MBranch = struct {
+    /**
+     * target — the machine-block id this branch transfers control to.
+     */
+    target: u32
+}
+
+/**
+ * MBranchCond — a conditional branch (B.cond) to a machine block, the
+ * fused-compare taken-edge of an `LBranch`.
+ *
+ * @since #383 A2-1
+ */
+pub type MBranchCond = struct {
+    /**
+     * cond — the AArch64 condition code tested against the flags a prior
+     * `MCmp`/`MFCmp` set.
+     */
+    cond: MCond
+    /**
+     * target — the machine-block id taken when `cond` holds.
+     */
+    target: u32
+}
+
+/**
+ * MCbz — a compare-and-branch on a register (CBZ/CBNZ), the non-fused
+ * `LBranch` lowering (the boolean condition register tested directly).
+ *
+ * @since #383 A2-1
+ */
+pub type MCbz = struct {
+    /**
+     * wide — true for the 64-bit X-register form, false for the 32-bit
+     * W-register form.
+     */
+    wide: bool
+    /**
+     * zero — true for CBZ (branch when `a` is zero), false for CBNZ
+     * (branch when `a` is nonzero).
+     */
+    zero: bool
+    /**
+     * a — the tested register operand.
+     */
+    a: MReg
+    /**
+     * target — the machine-block id branched to when the test holds.
+     */
+    target: u32
+}
+
+/**
+ * MCall — a direct call (BL) to an already-mangled symbol, the selection
+ * of `LCall` (after its AAPCS64 argument lowering, §3.4/§3.5).
+ *
+ * @since #383 A2-1
+ */
+pub type MCall = struct {
+    /**
+     * sym — the callee's already-mangled (or runtime `tk_*`) symbol.
+     */
+    sym: str
+    /**
+     * uses — every physical argument register this call pins (the A3
+     * liveness set).
+     */
+    uses: []MReg
+    /**
+     * ret_reg — the physical register (x0/v0) the callee's result lands
+     * in, meaningful only when `has_result` is true.
+     */
+    ret_reg: MReg
+    /**
+     * has_result — true when the call yields a value the caller consumes.
+     */
+    has_result: bool
+    /**
+     * variadic — mirrors the callee's variadic marker (the Darwin arm64
+     * variadic-tail-on-stack rule, §3.5).
+     */
+    variadic: bool
+}
+
+/**
+ * MCallIndirect — an indirect call (BLR) through a register holding the
+ * callee's address, the selection of `LCallIndirect` (the vtable/closure
+ * dispatch path).
+ *
+ * @since #383 A2-1
+ */
+pub type MCallIndirect = struct {
+    /**
+     * target — the register holding the callee's address.
+     */
+    target: MReg
+    /**
+     * uses — every physical argument register this call pins (the A3
+     * liveness set).
+     */
+    uses: []MReg
+    /**
+     * ret_reg — the physical register (x0/v0) the callee's result lands
+     * in, meaningful only when `has_result` is true.
+     */
+    ret_reg: MReg
+    /**
+     * has_result — true when the call yields a value the caller consumes.
+     */
+    has_result: bool
+}
+
+/**
+ * MRet — a return terminator (RET). The returned value (if any) is already
+ * pinned to x0/v0 by a preceding `MMov`/`MFMov`, so this case carries no
+ * operand — the selection of `LRet`.
+ *
+ * @since #383 A2-1
+ */
+pub type MRet = struct { }
+
+/**
+ * MInst — the machine-instruction payload: one of the AArch64-keyed cases
+ * above. A `MInst` carries virtual registers (A3 colors them) and physical-
+ * register pins (the ABI); it holds no encoded bytes (§2.2 of the isel
+ * plan).
+ *
+ * @since #383 A2-1
+ */
+pub type MInst = variant MAlu | MAluImm | MMSub | MNeg | MMvn | MFAlu | MFNeg | MCmp | MCmpImm | MFCmp | MCSet | MMovZ | MMovK | MMovN | MFMov | MMov | MExt | MCvt | MLoad | MStore | MFrameAddr | MAdrp | MAddLo | MBranch | MBranchCond | MCbz | MCall | MCallIndirect | MRet
+
+/**
+ * MBlock — a machine basic block: its id, its block-args (the SSA-lite
+ * merge parameters carried over from LIR block-args), and its instruction
+ * stream. Mirrors `LBlock`'s shape.
+ *
+ * @since #383 A2-1
+ */
+pub type MBlock = struct {
+    /**
+     * id — the block's identifier, referenced by `MBranch`/`MBranchCond`/
+     * `MCbz` targets.
+     */
+    id: u32
+    /**
+     * params — the block-arg registers a merge into this block carries
+     * (mirrors `LBlock.params`, threaded through VReg-for-VReg by isel).
+     */
+    params: []MReg
+    /**
+     * insts — the instruction stream, in order, normally ending in a
+     * terminator (`MBranch`/`MBranchCond`/`MCbz`/`MCall` with `variadic`
+     * tail-call semantics aside/`MRet`).
+     */
+    insts: []MInst
+}
+
+/**
+ * MFunc — one selected function: its already-mangled symbol, its blocks,
+ * and its frame-slot table. Mirrors `LFunc`'s shape; the frame table grows
+ * one entry per selected `LAlloca` (A2-4) and A3 finalizes each entry's
+ * FP/SP displacement.
+ *
+ * @since #383 A2-1
+ */
+pub type MFunc = struct {
+    /**
+     * symbol — the function's already-mangled (or lifted) symbol.
+     */
+    symbol: str
+    /**
+     * blocks — the function's machine basic blocks, in selection order.
+     */
+    blocks: []MBlock
+    /**
+     * frame — the reserved frame slots, one entry per selected `LAlloca`,
+     * in reservation order (each entry reuses `LAlloca`'s own byte-size/
+     * alignment shape).
+     */
+    frame: []lir::LAlloca
+}
+
+/**
+ * MModule — the whole selected program: its functions, plus the rodata/
+ * global/struct-layout tables carried THROUGH unchanged from the source
+ * `LModule` (A4 emits their bytes; isel never touches them).
+ *
+ * @since #383 A2-1
+ */
+pub type MModule = struct {
+    /**
+     * funcs — the selected functions, in declaration order.
+     */
+    funcs: []MFunc
+    /**
+     * rodata — the source `LModule`'s rodata table, unchanged.
+     */
+    rodata: []lir::LRodata
+    /**
+     * globals — the source `LModule`'s globals table, unchanged.
+     */
+    globals: []lir::LGlobal
+    /**
+     * layouts — the source `LModule`'s struct-layout table, unchanged.
+     */
+    layouts: []lir::LStructLayout
+}
+
+/**
+ * vreg — a virtual register operand: `id` is an abstract number the A3
+ * allocator later colors.
+ *
+ * @param u32 id  the virtual register's abstract id
+ * @param MRegClass reg_class  which register file (GPR/FPR) it lives in
+ * @return MReg  the virtual register operand
+ */
+pub fn vreg(id: u32, reg_class: MRegClass) -> MReg {
+    MReg { id = id; reg_class = reg_class; is_phys = false }
+}
+
+/**
+ * preg — a physical register operand: `id` is an ISA register number
+ * (x0..x30/SP=31 for GPR, v0..v31 for FPR).
+ *
+ * @param u32 id  the ISA register number
+ * @param MRegClass reg_class  which register file (GPR/FPR) it lives in
+ * @return MReg  the physical register operand
+ */
+pub fn preg(id: u32, reg_class: MRegClass) -> MReg {
+    MReg { id = id; reg_class = reg_class; is_phys = true }
+}
+
+/**
+ * alu_inst — a `dst = a <op> b` instruction (MAlu).
+ *
+ * @param MAluOp op  which ALU mnemonic to emit
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param MReg a  the first source register
+ * @param MReg b  the second source register
+ * @return MInst  the built instruction
+ */
+pub fn alu_inst(op: MAluOp, wide: bool, dst: MReg, a: MReg, b: MReg) -> MInst {
+    MAlu { op = op; wide = wide; dst = dst; a = a; b = b }
+}
+
+/**
+ * alu_imm_inst — a `dst = a <op> #imm` instruction (MAluImm).
+ *
+ * @param MAluOp op  which ALU mnemonic to emit
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param MReg a  the source register
+ * @param i64 imm  the immediate operand
+ * @return MInst  the built instruction
+ */
+pub fn alu_imm_inst(op: MAluOp, wide: bool, dst: MReg, a: MReg, imm: i64) -> MInst {
+    MAluImm { op = op; wide = wide; dst = dst; a = a; imm = imm }
+}
+
+/**
+ * msub_inst — a `dst = c - a * b` instruction (MMSub), the second half of
+ * an `IRemS`/`IRemU` lowering.
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param MReg a  the quotient register
+ * @param MReg b  the divisor register
+ * @param MReg c  the dividend register
+ * @return MInst  the built instruction
+ */
+pub fn msub_inst(wide: bool, dst: MReg, a: MReg, b: MReg, c: MReg) -> MInst {
+    MMSub { wide = wide; dst = dst; a = a; b = b; c = c }
+}
+
+/**
+ * neg_inst — a `dst = -a` instruction (MNeg).
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param MReg a  the source register
+ * @return MInst  the built instruction
+ */
+pub fn neg_inst(wide: bool, dst: MReg, a: MReg) -> MInst {
+    MNeg { wide = wide; dst = dst; a = a }
+}
+
+/**
+ * mvn_inst — a `dst = ~a` instruction (MMvn).
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param MReg a  the source register
+ * @return MInst  the built instruction
+ */
+pub fn mvn_inst(wide: bool, dst: MReg, a: MReg) -> MInst {
+    MMvn { wide = wide; dst = dst; a = a }
+}
+
+/**
+ * falu_inst — a float `dst = a <op> b` instruction (MFAlu).
+ *
+ * @param MFAluOp op  which float ALU mnemonic to emit
+ * @param bool dbl  true for the f64 D form, false for f32 S
+ * @param MReg dst  the destination register
+ * @param MReg a  the first source register
+ * @param MReg b  the second source register
+ * @return MInst  the built instruction
+ */
+pub fn falu_inst(op: MFAluOp, dbl: bool, dst: MReg, a: MReg, b: MReg) -> MInst {
+    MFAlu { op = op; dbl = dbl; dst = dst; a = a; b = b }
+}
+
+/**
+ * fneg_inst — a float `dst = -a` instruction (MFNeg).
+ *
+ * @param bool dbl  true for the f64 D form, false for f32 S
+ * @param MReg dst  the destination register
+ * @param MReg a  the source register
+ * @return MInst  the built instruction
+ */
+pub fn fneg_inst(dbl: bool, dst: MReg, a: MReg) -> MInst {
+    MFNeg { dbl = dbl; dst = dst; a = a }
+}
+
+/**
+ * cmp_inst — an integer compare instruction (MCmp), setting the flags from
+ * `a` and `b` with no destination register.
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg a  the first compared register
+ * @param MReg b  the second compared register
+ * @return MInst  the built instruction
+ */
+pub fn cmp_inst(wide: bool, a: MReg, b: MReg) -> MInst {
+    MCmp { wide = wide; a = a; b = b }
+}
+
+/**
+ * cmp_imm_inst — an integer compare-against-immediate instruction
+ * (MCmpImm).
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg a  the compared register
+ * @param i64 imm  the immediate compared against
+ * @return MInst  the built instruction
+ */
+pub fn cmp_imm_inst(wide: bool, a: MReg, imm: i64) -> MInst {
+    MCmpImm { wide = wide; a = a; imm = imm }
+}
+
+/**
+ * fcmp_inst — a float compare instruction (MFCmp).
+ *
+ * @param bool dbl  true for the f64 D form, false for f32 S
+ * @param MReg a  the first compared register
+ * @param MReg b  the second compared register
+ * @return MInst  the built instruction
+ */
+pub fn fcmp_inst(dbl: bool, a: MReg, b: MReg) -> MInst {
+    MFCmp { dbl = dbl; a = a; b = b }
+}
+
+/**
+ * cset_inst — a `dst = (cond) ? 1 : 0` instruction (MCSet), materializing a
+ * preceding compare as a plain value.
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param MCond cond  the condition code tested
+ * @return MInst  the built instruction
+ */
+pub fn cset_inst(wide: bool, dst: MReg, cond: MCond) -> MInst {
+    MCSet { wide = wide; dst = dst; cond = cond }
+}
+
+/**
+ * movz_inst — a `dst = imm16 << shift` instruction (MMovZ), one lane of an
+ * integer literal's materialization sequence.
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param u32 imm16  the 16-bit lane value
+ * @param u32 shift  the lane's bit position (0/16/32/48)
+ * @return MInst  the built instruction
+ */
+pub fn movz_inst(wide: bool, dst: MReg, imm16: u32, shift: u32) -> MInst {
+    MMovZ { wide = wide; dst = dst; imm16 = imm16; shift = shift }
+}
+
+/**
+ * movk_inst — a `dst |= imm16 << shift` instruction (MMovK), a follow-up
+ * lane of an integer literal's materialization sequence.
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param u32 imm16  the 16-bit lane value
+ * @param u32 shift  the lane's bit position (0/16/32/48)
+ * @return MInst  the built instruction
+ */
+pub fn movk_inst(wide: bool, dst: MReg, imm16: u32, shift: u32) -> MInst {
+    MMovK { wide = wide; dst = dst; imm16 = imm16; shift = shift }
+}
+
+/**
+ * movn_inst — a `dst = ~(imm16 << shift)` instruction (MMovN), the
+ * inverted-literal materialization form.
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param u32 imm16  the 16-bit lane value (before inversion)
+ * @param u32 shift  the lane's bit position (0/16/32/48)
+ * @return MInst  the built instruction
+ */
+pub fn movn_inst(wide: bool, dst: MReg, imm16: u32, shift: u32) -> MInst {
+    MMovN { wide = wide; dst = dst; imm16 = imm16; shift = shift }
+}
+
+/**
+ * fmov_inst — a `dst = src` instruction across the GPR/FPR boundary or
+ * between two FPRs (MFMov).
+ *
+ * @param bool dbl  true for the f64 D form, false for f32 S
+ * @param MReg dst  the destination register
+ * @param MReg src  the source register
+ * @return MInst  the built instruction
+ */
+pub fn fmov_inst(dbl: bool, dst: MReg, src: MReg) -> MInst {
+    MFMov { dbl = dbl; dst = dst; src = src }
+}
+
+/**
+ * mov_inst — a `dst = src` instruction between two GPRs (MMov).
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param MReg src  the source register
+ * @return MInst  the built instruction
+ */
+pub fn mov_inst(wide: bool, dst: MReg, src: MReg) -> MInst {
+    MMov { wide = wide; dst = dst; src = src }
+}
+
+/**
+ * ext_inst — a narrow sign/zero-extend instruction (MExt).
+ *
+ * @param MExtOp op  which extend mnemonic to emit
+ * @param MReg dst  the destination register
+ * @param MReg a  the source register
+ * @return MInst  the built instruction
+ */
+pub fn ext_inst(op: MExtOp, dst: MReg, a: MReg) -> MInst {
+    MExt { op = op; dst = dst; a = a }
+}
+
+/**
+ * cvt_inst — an int/float conversion instruction (MCvt).
+ *
+ * @param MCvtOp op  which conversion mnemonic to emit
+ * @param MReg dst  the destination register
+ * @param MReg a  the source register
+ * @return MInst  the built instruction
+ */
+pub fn cvt_inst(op: MCvtOp, dst: MReg, a: MReg) -> MInst {
+    MCvt { op = op; dst = dst; a = a }
+}
+
+/**
+ * load_inst — a memory-load instruction (MLoad).
+ *
+ * @param MMemSize size  the access width
+ * @param bool sign  true for a sign-extending narrow load
+ * @param MReg dst  the destination register
+ * @param MMem mem  the loaded address
+ * @return MInst  the built instruction
+ */
+pub fn load_inst(size: MMemSize, sign: bool, dst: MReg, mem: MMem) -> MInst {
+    MLoad { size = size; sign = sign; dst = dst; mem = mem }
+}
+
+/**
+ * store_inst — a memory-store instruction (MStore).
+ *
+ * @param MMemSize size  the access width
+ * @param MReg src  the register holding the stored value
+ * @param MMem mem  the stored-to address
+ * @return MInst  the built instruction
+ */
+pub fn store_inst(size: MMemSize, src: MReg, mem: MMem) -> MInst {
+    MStore { size = size; src = src; mem = mem }
+}
+
+/**
+ * frame_addr_inst — a frame-slot address instruction (MFrameAddr).
+ *
+ * @param MReg dst  the destination register
+ * @param u32 slot  the frame-slot index
+ * @return MInst  the built instruction
+ */
+pub fn frame_addr_inst(dst: MReg, slot: u32) -> MInst {
+    MFrameAddr { dst = dst; slot = slot }
+}
+
+/**
+ * adrp_inst — a page-relative address-high instruction (MAdrp), the first
+ * half of an ADRP+ADD relocation pair.
+ *
+ * @param MReg dst  the destination register
+ * @param str sym  the already-final relocation symbol name
+ * @param MRelocKind kind  which relocation the A4 encoder owes it
+ * @return MInst  the built instruction
+ */
+pub fn adrp_inst(dst: MReg, sym: str, kind: MRelocKind) -> MInst {
+    MAdrp { dst = dst; sym = sym; kind = kind }
+}
+
+/**
+ * add_lo_inst — a low-12 page-offset completion instruction (MAddLo), the
+ * second half of an ADRP+ADD relocation pair.
+ *
+ * @param MReg dst  the destination register
+ * @param MReg a  the register holding the paired `MAdrp`'s page address
+ * @param str sym  the already-final relocation symbol name
+ * @param MRelocKind kind  which relocation the A4 encoder owes it
+ * @return MInst  the built instruction
+ */
+pub fn add_lo_inst(dst: MReg, a: MReg, sym: str, kind: MRelocKind) -> MInst {
+    MAddLo { dst = dst; a = a; sym = sym; kind = kind }
+}
+
+/**
+ * branch_inst — an unconditional-branch terminator (MBranch).
+ *
+ * @param u32 target  the machine-block id branched to
+ * @return MInst  the built instruction
+ */
+pub fn branch_inst(target: u32) -> MInst {
+    MBranch { target = target }
+}
+
+/**
+ * branch_cond_inst — a conditional-branch terminator (MBranchCond).
+ *
+ * @param MCond cond  the condition code tested
+ * @param u32 target  the machine-block id taken when `cond` holds
+ * @return MInst  the built instruction
+ */
+pub fn branch_cond_inst(cond: MCond, target: u32) -> MInst {
+    MBranchCond { cond = cond; target = target }
+}
+
+/**
+ * cbz_inst — a compare-and-branch terminator (MCbz).
+ *
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param bool zero  true for CBZ, false for CBNZ
+ * @param MReg a  the tested register
+ * @param u32 target  the machine-block id branched to when the test holds
+ * @return MInst  the built instruction
+ */
+pub fn cbz_inst(wide: bool, zero: bool, a: MReg, target: u32) -> MInst {
+    MCbz { wide = wide; zero = zero; a = a; target = target }
+}
+
+/**
+ * call_inst — a direct-call instruction (MCall).
+ *
+ * @param str sym  the callee's already-mangled symbol
+ * @param []MReg uses  every physical argument register this call pins
+ * @param MReg ret_reg  the physical result register (meaningful iff
+ *                       `has_result`)
+ * @param bool has_result  true when the call yields a consumed value
+ * @param bool variadic  mirrors the callee's variadic marker
+ * @return MInst  the built instruction
+ */
+pub fn call_inst(sym: str, uses: []MReg, ret_reg: MReg, has_result: bool, variadic: bool) -> MInst {
+    MCall { sym = sym; uses = uses; ret_reg = ret_reg; has_result = has_result; variadic = variadic }
+}
+
+/**
+ * call_indirect_inst — an indirect-call instruction (MCallIndirect).
+ *
+ * @param MReg target  the register holding the callee's address
+ * @param []MReg uses  every physical argument register this call pins
+ * @param MReg ret_reg  the physical result register (meaningful iff
+ *                       `has_result`)
+ * @param bool has_result  true when the call yields a consumed value
+ * @return MInst  the built instruction
+ */
+pub fn call_indirect_inst(target: MReg, uses: []MReg, ret_reg: MReg, has_result: bool) -> MInst {
+    MCallIndirect { target = target; uses = uses; ret_reg = ret_reg; has_result = has_result }
+}
+
+/**
+ * ret_inst — a return terminator (MRet). The returned value, if any, is
+ * already pinned to x0/v0 by a preceding move.
+ *
+ * @return MInst  the built instruction
+ */
+pub fn ret_inst() -> MInst {
+    MRet { }
+}
+
+/**
+ * empty_mmodule — a module with no functions/rodata/globals/layouts (the
+ * isel seed, mirroring `lir::empty_module`).
+ *
+ * @return MModule  the empty module
+ */
+pub fn empty_mmodule() -> MModule {
+    MModule { funcs = teko::list::empty(); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+/**
+ * new_mfunc — a fresh MFunc with an empty single block (#M0) and an empty
+ * frame table (mirrors `lir::new_func`).
+ *
+ * @param str symbol  the function's already-mangled symbol
+ * @return MFunc  the seeded function
+ */
+pub fn new_mfunc(symbol: str) -> MFunc {
+    let entry = MBlock { id = 0; params = teko::list::empty(); insts = teko::list::empty() }
+    MFunc { symbol = symbol; blocks = teko::list::push(teko::list::empty(), entry); frame = teko::list::empty() }
+}
+
+/**
+ * push_minst_block — a copy of `b` with `inst` appended to its instruction
+ * stream (an `append_minst` helper, mirrors `lir`'s `push_inst_block`).
+ *
+ * @param MBlock b  the block to extend
+ * @param MInst inst  the instruction to append
+ * @return MBlock  the extended block
+ */
+fn push_minst_block(b: MBlock, inst: MInst) -> MBlock {
+    MBlock { id = b.id; params = b.params; insts = teko::list::push(b.insts, inst) }
+}
+
+/**
+ * append_minst — a copy of `f` with `inst` appended to the block whose id
+ * is `block_id` (mirrors `lir::append_inst`).
+ *
+ * @param MFunc f  the function to extend
+ * @param u32 block_id  which block's instruction stream gains `inst`
+ * @param MInst inst  the instruction to append
+ * @return MFunc  the extended function
+ */
+pub fn append_minst(f: MFunc, block_id: u32, inst: MInst) -> MFunc {
+    mut blocks: []MBlock = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let b = f.blocks[i]
+        let nb = if b.id == block_id { push_minst_block(b, inst) } else { b }
+        blocks = teko::list::push(blocks, nb)
+        i++
+    }
+    MFunc { symbol = f.symbol; blocks = blocks; frame = f.frame }
+}
+
+/**
+ * append_block — a copy of `f` with `blk` appended after its existing blocks
+ * (the multi-block/edge-split builder; `append_minst` then targets it by id).
+ *
+ * @param MFunc f  the function to extend
+ * @param MBlock blk  the block to append
+ * @return MFunc  the extended function
+ */
+pub fn append_block(f: MFunc, blk: MBlock) -> MFunc {
+    MFunc { symbol = f.symbol; blocks = teko::list::push(f.blocks, blk); frame = f.frame }
+}
+
+/**
+ * append_frame — a copy of `f` with one frame slot reserved (one entry per
+ * selected `LAlloca`, in reservation order; the new slot's index is
+ * `f.frame.len` taken BEFORE the append).
+ *
+ * @param MFunc f  the function to extend
+ * @param lir::LAlloca slot  the alloca whose byte-size/alignment the slot reuses
+ * @return MFunc  the extended function
+ */
+pub fn append_frame(f: MFunc, slot: lir::LAlloca) -> MFunc {
+    MFunc { symbol = f.symbol; blocks = f.blocks; frame = teko::list::push(f.frame, slot) }
+}
+
+/**
+ * mreg_list_set — a copy of `xs` with position `index` replaced by `reg`
+ * (positions past the end are left unchanged).
+ *
+ * @param []MReg xs  the register list
+ * @param u32 index  the position to replace
+ * @param MReg reg  the replacement register
+ * @return []MReg  the updated list
+ */
+fn mreg_list_set(xs: []MReg, index: u32, reg: MReg) -> []MReg {
+    mut out: []MReg = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out = teko::list::push(out, if (i to u32) == index { reg } else { xs[i] })
+        i++
+    }
+    out
+}
+
+/**
+ * set_block_param — a copy of `f` in which machine block `block_id`'s
+ * parameter at `index` is replaced by `reg`. A mirror block's params are
+ * built with a provisional register class (the VReg id is known up front,
+ * the class only once a feeding edge move is selected); this refines one
+ * entry to the class carried by that value.
+ *
+ * @param MFunc f  the function to update
+ * @param u32 block_id  the block whose parameter is refined
+ * @param u32 index  the parameter position to replace
+ * @param MReg reg  the refined parameter register
+ * @return MFunc  the updated function
+ */
+pub fn set_block_param(f: MFunc, block_id: u32, index: u32, reg: MReg) -> MFunc {
+    mut blocks: []MBlock = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let b = f.blocks[i]
+        let nb = if b.id == block_id { MBlock { id = b.id; params = mreg_list_set(b.params, index, reg); insts = b.insts } } else { b }
+        blocks = teko::list::push(blocks, nb)
+        i++
+    }
+    MFunc { symbol = f.symbol; blocks = blocks; frame = f.frame }
+}
+
+/**
+ * add_mfunc — a copy of `m` with `f` appended (mirrors `lir::add_func`).
+ *
+ * @param MModule m  the module to extend
+ * @param MFunc f  the function to append
+ * @return MModule  the extended module
+ */
+pub fn add_mfunc(m: MModule, f: MFunc) -> MModule {
+    MModule { funcs = teko::list::push(m.funcs, f); rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+}
+
+/**
+ * wide_suffix — the printer suffix for a `wide` flag: `"x"` for the 64-bit
+ * X-register form, `"w"` for the 32-bit W-register form.
+ *
+ * @param bool wide  the flag to render
+ * @return str  the register-width suffix
+ */
+fn wide_suffix(wide: bool) -> str {
+    if wide { "x" } else { "w" }
+}
+
+/**
+ * dbl_suffix — the printer suffix for a `dbl` flag: `"d"` for the f64
+ * D-register form, `"s"` for the f32 S-register form.
+ *
+ * @param bool dbl  the flag to render
+ * @return str  the register-width suffix
+ */
+fn dbl_suffix(dbl: bool) -> str {
+    if dbl { "d" } else { "s" }
+}
+
+/**
+ * reg_ref — a register operand's printer text: `%N` for a virtual register,
+ * `%pN` for a physical one.
+ *
+ * @param MReg r  the register to render
+ * @return str  the operand text
+ */
+fn reg_ref(r: MReg) -> str {
+    let num = teko::u64_to_str(r.id to u64)
+    if r.is_phys { teko::str::concat("%p", num) } else { teko::str::concat("%", num) }
+}
+
+/**
+ * mem_ref — a memory operand's printer text: `[base, #offset]`.
+ *
+ * @param MMem m  the memory operand to render
+ * @return str  the operand text
+ */
+fn mem_ref(m: MMem) -> str {
+    teko::str::concat("[", reg_ref(m.base), ", #", teko::i64_to_str(m.offset to i64), "]")
+}
+
+/**
+ * print_regs — a comma-separated list of register operands (no surrounding
+ * parens; the caller supplies them).
+ *
+ * @param []MReg regs  the registers to render, in order
+ * @return str  the rendered list
+ */
+fn print_regs(regs: []MReg) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= regs.len { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, reg_ref(regs[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * alu_op_name — the printer mnemonic for an `MAluOp`.
+ *
+ * @param MAluOp op  the operation to name
+ * @return str  its lowercase AArch64 mnemonic
+ */
+fn alu_op_name(op: MAluOp) -> str {
+    match op {
+        Add => "add"; Sub => "sub"; Mul => "mul"
+        Sdiv => "sdiv"; Udiv => "udiv"
+        And => "and"; Orr => "orr"; Eor => "eor"
+        Lsl => "lsl"; Asr => "asr"; Lsr => "lsr"
+    }
+}
+
+/**
+ * falu_op_name — the printer mnemonic for an `MFAluOp`.
+ *
+ * @param MFAluOp op  the operation to name
+ * @return str  its lowercase AArch64 mnemonic
+ */
+fn falu_op_name(op: MFAluOp) -> str {
+    match op { FAdd => "fadd"; FSub => "fsub"; FMul => "fmul"; FDiv => "fdiv" }
+}
+
+/**
+ * ext_op_name — the printer mnemonic for an `MExtOp`.
+ *
+ * @param MExtOp op  the operation to name
+ * @return str  its lowercase AArch64 mnemonic
+ */
+fn ext_op_name(op: MExtOp) -> str {
+    match op {
+        Sxtb => "sxtb"; Sxth => "sxth"; Sxtw => "sxtw"
+        Uxtb => "uxtb"; Uxth => "uxth"; Uxtw => "uxtw"
+    }
+}
+
+/**
+ * cvt_op_name — the printer mnemonic for an `MCvtOp`.
+ *
+ * @param MCvtOp op  the operation to name
+ * @return str  its lowercase AArch64 mnemonic
+ */
+fn cvt_op_name(op: MCvtOp) -> str {
+    match op { Scvtf => "scvtf"; Ucvtf => "ucvtf"; Fcvtzs => "fcvtzs"; Fcvtzu => "fcvtzu"; Fcvt => "fcvt" }
+}
+
+/**
+ * mem_size_name — the printer suffix for an `MMemSize`.
+ *
+ * @param MMemSize s  the access width to name
+ * @return str  its lowercase letter (b/h/w/x/s/d)
+ */
+fn mem_size_name(s: MMemSize) -> str {
+    match s { B => "b"; H => "h"; W => "w"; X => "x"; S => "s"; D => "d" }
+}
+
+/**
+ * cond_name — the printer mnemonic for an `MCond`.
+ *
+ * @param MCond c  the condition code to name
+ * @return str  its lowercase AArch64 condition mnemonic
+ */
+fn cond_name(c: MCond) -> str {
+    match c {
+        EQ => "eq"; NE => "ne"
+        LT => "lt"; LE => "le"; GT => "gt"; GE => "ge"
+        LO => "lo"; LS => "ls"; HI => "hi"; HS => "hs"
+    }
+}
+
+/**
+ * reloc_kind_name — the printer suffix for an `MRelocKind`.
+ *
+ * @param MRelocKind k  the relocation kind to name
+ * @return str  its lowercase name
+ */
+fn reloc_kind_name(k: MRelocKind) -> str {
+    match k { PageHi => "page_hi"; PageLo => "page_lo"; Call => "call" }
+}
+
+/**
+ * print_alu — `<op>.<w> dst, a, b`.
+ *
+ * @param MAlu i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_alu(i: MAlu) -> str {
+    teko::str::concat(alu_op_name(i.op), ".", wide_suffix(i.wide), " ", reg_ref(i.dst), ", ", reg_ref(i.a), ", ", reg_ref(i.b))
+}
+
+/**
+ * print_alu_imm — `<op>.<w> dst, a, #imm`.
+ *
+ * @param MAluImm i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_alu_imm(i: MAluImm) -> str {
+    teko::str::concat(alu_op_name(i.op), ".", wide_suffix(i.wide), " ", reg_ref(i.dst), ", ", reg_ref(i.a), ", #", teko::i64_to_str(i.imm))
+}
+
+/**
+ * print_msub — `msub.<w> dst, a, b, c`.
+ *
+ * @param MMSub i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_msub(i: MMSub) -> str {
+    teko::str::concat("msub.", wide_suffix(i.wide), " ", reg_ref(i.dst), ", ", reg_ref(i.a), ", ", reg_ref(i.b), ", ", reg_ref(i.c))
+}
+
+/**
+ * print_neg — `neg.<w> dst, a`.
+ *
+ * @param MNeg i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_neg(i: MNeg) -> str {
+    teko::str::concat("neg.", wide_suffix(i.wide), " ", reg_ref(i.dst), ", ", reg_ref(i.a))
+}
+
+/**
+ * print_mvn — `mvn.<w> dst, a`.
+ *
+ * @param MMvn i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_mvn(i: MMvn) -> str {
+    teko::str::concat("mvn.", wide_suffix(i.wide), " ", reg_ref(i.dst), ", ", reg_ref(i.a))
+}
+
+/**
+ * print_falu — `<op>.<w> dst, a, b` (the float form).
+ *
+ * @param MFAlu i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_falu(i: MFAlu) -> str {
+    teko::str::concat(falu_op_name(i.op), ".", dbl_suffix(i.dbl), " ", reg_ref(i.dst), ", ", reg_ref(i.a), ", ", reg_ref(i.b))
+}
+
+/**
+ * print_fneg — `fneg.<w> dst, a`.
+ *
+ * @param MFNeg i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_fneg(i: MFNeg) -> str {
+    teko::str::concat("fneg.", dbl_suffix(i.dbl), " ", reg_ref(i.dst), ", ", reg_ref(i.a))
+}
+
+/**
+ * print_cmp — `cmp.<w> a, b`.
+ *
+ * @param MCmp i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_cmp(i: MCmp) -> str {
+    teko::str::concat("cmp.", wide_suffix(i.wide), " ", reg_ref(i.a), ", ", reg_ref(i.b))
+}
+
+/**
+ * print_cmp_imm — `cmp.<w> a, #imm`.
+ *
+ * @param MCmpImm i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_cmp_imm(i: MCmpImm) -> str {
+    teko::str::concat("cmp.", wide_suffix(i.wide), " ", reg_ref(i.a), ", #", teko::i64_to_str(i.imm))
+}
+
+/**
+ * print_fcmp — `fcmp.<w> a, b` (the float form).
+ *
+ * @param MFCmp i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_fcmp(i: MFCmp) -> str {
+    teko::str::concat("fcmp.", dbl_suffix(i.dbl), " ", reg_ref(i.a), ", ", reg_ref(i.b))
+}
+
+/**
+ * print_cset — `cset.<w> dst, <cond>`.
+ *
+ * @param MCSet i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_cset(i: MCSet) -> str {
+    teko::str::concat("cset.", wide_suffix(i.wide), " ", reg_ref(i.dst), ", ", cond_name(i.cond))
+}
+
+/**
+ * print_movi — the shared `<mnemonic>.<w> dst, #imm16, lsl #shift` text
+ * for the MOVZ/MOVK/MOVN family (extracted so the three cases share one
+ * rendering rule).
+ *
+ * @param str mnemonic  which of movz/movk/movn to render
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @param MReg dst  the destination register
+ * @param u32 imm16  the 16-bit lane value
+ * @param u32 shift  the lane's bit position
+ * @return str  the rendered text
+ */
+fn print_movi(mnemonic: str, wide: bool, dst: MReg, imm16: u32, shift: u32) -> str {
+    teko::str::concat(mnemonic, ".", wide_suffix(wide), " ", reg_ref(dst), ", #", teko::u64_to_str(imm16 to u64), ", lsl #", teko::u64_to_str(shift to u64))
+}
+
+/**
+ * print_movz — `movz.<w> dst, #imm16, lsl #shift`.
+ *
+ * @param MMovZ i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_movz(i: MMovZ) -> str {
+    print_movi("movz", i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * print_movk — `movk.<w> dst, #imm16, lsl #shift`.
+ *
+ * @param MMovK i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_movk(i: MMovK) -> str {
+    print_movi("movk", i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * print_movn — `movn.<w> dst, #imm16, lsl #shift`.
+ *
+ * @param MMovN i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_movn(i: MMovN) -> str {
+    print_movi("movn", i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * print_fmov — `fmov.<w> dst, src`.
+ *
+ * @param MFMov i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_fmov(i: MFMov) -> str {
+    teko::str::concat("fmov.", dbl_suffix(i.dbl), " ", reg_ref(i.dst), ", ", reg_ref(i.src))
+}
+
+/**
+ * print_mov — `mov.<w> dst, src`.
+ *
+ * @param MMov i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_mov(i: MMov) -> str {
+    teko::str::concat("mov.", wide_suffix(i.wide), " ", reg_ref(i.dst), ", ", reg_ref(i.src))
+}
+
+/**
+ * print_ext — `<op> dst, a`.
+ *
+ * @param MExt i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_ext(i: MExt) -> str {
+    teko::str::concat(ext_op_name(i.op), " ", reg_ref(i.dst), ", ", reg_ref(i.a))
+}
+
+/**
+ * print_cvt — `<op> dst, a`.
+ *
+ * @param MCvt i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_cvt(i: MCvt) -> str {
+    teko::str::concat(cvt_op_name(i.op), " ", reg_ref(i.dst), ", ", reg_ref(i.a))
+}
+
+/**
+ * print_load — `ldr[s].<size> dst, [mem]` (the `s` marks a sign-extending
+ * narrow load).
+ *
+ * @param MLoad i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_load(i: MLoad) -> str {
+    let mnemonic = if i.sign { "ldrs" } else { "ldr" }
+    teko::str::concat(mnemonic, ".", mem_size_name(i.size), " ", reg_ref(i.dst), ", ", mem_ref(i.mem))
+}
+
+/**
+ * print_store — `str.<size> src, [mem]`.
+ *
+ * @param MStore i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_store(i: MStore) -> str {
+    teko::str::concat("str.", mem_size_name(i.size), " ", reg_ref(i.src), ", ", mem_ref(i.mem))
+}
+
+/**
+ * print_frame_addr — `frame_addr dst, #slot`.
+ *
+ * @param MFrameAddr i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_frame_addr(i: MFrameAddr) -> str {
+    teko::str::concat("frame_addr ", reg_ref(i.dst), ", #", teko::u64_to_str(i.slot to u64))
+}
+
+/**
+ * print_adrp — `adrp.<kind> dst, @sym`.
+ *
+ * @param MAdrp i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_adrp(i: MAdrp) -> str {
+    teko::str::concat("adrp.", reloc_kind_name(i.kind), " ", reg_ref(i.dst), ", @", i.sym)
+}
+
+/**
+ * print_add_lo — `add_lo.<kind> dst, a, @sym`.
+ *
+ * @param MAddLo i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_add_lo(i: MAddLo) -> str {
+    teko::str::concat("add_lo.", reloc_kind_name(i.kind), " ", reg_ref(i.dst), ", ", reg_ref(i.a), ", @", i.sym)
+}
+
+/**
+ * print_branch — `b #M<target>`.
+ *
+ * @param MBranch i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_branch(i: MBranch) -> str {
+    teko::str::concat("b #M", teko::u64_to_str(i.target to u64))
+}
+
+/**
+ * print_branch_cond — `b.<cond> #M<target>`.
+ *
+ * @param MBranchCond i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_branch_cond(i: MBranchCond) -> str {
+    teko::str::concat("b.", cond_name(i.cond), " #M", teko::u64_to_str(i.target to u64))
+}
+
+/**
+ * print_cbz — `cbz[n].<w> a, #M<target>` (the `n` marks CBNZ).
+ *
+ * @param MCbz i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_cbz(i: MCbz) -> str {
+    let mnemonic = if i.zero { "cbz" } else { "cbnz" }
+    teko::str::concat(mnemonic, ".", wide_suffix(i.wide), " ", reg_ref(i.a), ", #M", teko::u64_to_str(i.target to u64))
+}
+
+/**
+ * print_call — `call @sym(uses)`, with an optional ` variadic` marker and
+ * an optional ` -> ret_reg` result suffix.
+ *
+ * @param MCall i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_call(i: MCall) -> str {
+    mut out = teko::str::concat("call @", i.sym, "(", print_regs(i.uses), ")")
+    if i.variadic { out = teko::str::concat(out, " variadic") }
+    if i.has_result { out = teko::str::concat(out, " -> ", reg_ref(i.ret_reg)) }
+    out
+}
+
+/**
+ * print_call_indirect — `call.indirect target(uses)`, with an optional
+ * ` -> ret_reg` result suffix.
+ *
+ * @param MCallIndirect i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_call_indirect(i: MCallIndirect) -> str {
+    mut out = teko::str::concat("call.indirect ", reg_ref(i.target), "(", print_regs(i.uses), ")")
+    if i.has_result { out = teko::str::concat(out, " -> ", reg_ref(i.ret_reg)) }
+    out
+}
+
+/**
+ * print_ret — `ret`. The returned value, if any, was already pinned by a
+ * preceding move, so `MRet` carries nothing further to render.
+ *
+ * @param MRet i  the instruction to render (carries no fields)
+ * @return str  the rendered text
+ */
+fn print_ret(i: MRet) -> str {
+    "ret"
+}
+
+/**
+ * print_minst — the instruction text for one `MInst` (no result prefix —
+ * a case's own destination operand, when it has one, already renders it).
+ *
+ * @param MInst i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_minst(i: MInst) -> str {
+    match i {
+        MAlu as x => print_alu(x)
+        MAluImm as x => print_alu_imm(x)
+        MMSub as x => print_msub(x)
+        MNeg as x => print_neg(x)
+        MMvn as x => print_mvn(x)
+        MFAlu as x => print_falu(x)
+        MFNeg as x => print_fneg(x)
+        MCmp as x => print_cmp(x)
+        MCmpImm as x => print_cmp_imm(x)
+        MFCmp as x => print_fcmp(x)
+        MCSet as x => print_cset(x)
+        MMovZ as x => print_movz(x)
+        MMovK as x => print_movk(x)
+        MMovN as x => print_movn(x)
+        MFMov as x => print_fmov(x)
+        MMov as x => print_mov(x)
+        MExt as x => print_ext(x)
+        MCvt as x => print_cvt(x)
+        MLoad as x => print_load(x)
+        MStore as x => print_store(x)
+        MFrameAddr as x => print_frame_addr(x)
+        MAdrp as x => print_adrp(x)
+        MAddLo as x => print_add_lo(x)
+        MBranch as x => print_branch(x)
+        MBranchCond as x => print_branch_cond(x)
+        MCbz as x => print_cbz(x)
+        MCall as x => print_call(x)
+        MCallIndirect as x => print_call_indirect(x)
+        MRet as x => print_ret(x)
+    }
+}
+
+/**
+ * print_mblock — a block header `  #Mn:` (with block-args when present)
+ * followed by its instructions, one per line, 4-space indented.
+ *
+ * @param MBlock b  the block to render
+ * @return str  the rendered text
+ */
+fn print_mblock(b: MBlock) -> str {
+    mut out = teko::str::concat("  #M", teko::u64_to_str(b.id to u64))
+    if b.params.len != 0 { out = teko::str::concat(out, "(", print_regs(b.params), ")") }
+    out = teko::str::concat(out, ":\n")
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        out = teko::str::concat(out, "    ", print_minst(b.insts[i]), "\n")
+        i++
+    }
+    out
+}
+
+/**
+ * print_mfunc — a full function: `func @sym {` + its blocks + `}`.
+ *
+ * @param MFunc f  the function to render
+ * @return str  the rendered text
+ */
+fn print_mfunc(f: MFunc) -> str {
+    mut out = teko::str::concat("func @", f.symbol, " {\n")
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        out = teko::str::concat(out, print_mblock(f.blocks[i]))
+        i++
+    }
+    teko::str::concat(out, "}\n")
+}
+
+/**
+ * minst_print — the whole selected module as stable text: every function,
+ * in declaration order, blank-line separated. The rodata/globals/layouts
+ * tables ride THROUGH `MModule` unchanged from the source `LModule` (A1's
+ * own printer already covers their diff/fixpoint gate), so this dump
+ * renders only the machine instructions — the artifact A2's golden-dump
+ * tests read.
+ *
+ * @param MModule m  the module to render
+ * @return str  the module's stable text
+ */
+pub fn minst_print(m: MModule) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        if i > 0 { out = teko::str::concat(out, "\n") }
+        out = teko::str::concat(out, print_mfunc(m.funcs[i]))
+        i++
+    }
+    out
+}
