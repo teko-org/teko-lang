@@ -17,12 +17,22 @@
 >
 > **⚖️ RULING — RELEASE WAVES (remodel, the `beta` line):** delivery proceeds in **waves**, one per
 > `0.X` version, each finalizing a coherent subset via an umbrella PR + sub-PRs (never committing to
-> `main`; each wave gets its own W15 sweep + doc-sync pre-launch). The sequence: **0.1** = memory
-> model + `unsafe` (by type) + `adopt` (epic **#340**, base `docs/design/memory-unsafe-backend-remodel.md`);
-> **0.2** = own AOT backend + linker (VM retirement begins there); **0.3** = concurrency (`Intent<T>`,
-> async/await, threading); **0.4+** = the remaining backlog (the phases/rounds below, mapped onto
-> waves). When the backlog is empty → **`1.0.0.0` = LTS**. The `alpha` line (`0.0.1.x`) is pre-remodel.
-> The phase/round structure below is the DETAILED work; the waves are how it ships.
+> `main`; each wave gets its own W15 sweep + doc-sync pre-launch). A **wave is a large, fully-RESOLVED
+> body of work — never a ripple** (owner decree 2026-07-09: *"as ondas não são marolas … elas têm que
+> ser resolvidas; para marolas temos as sub-sub"*); small increments are sub-sub-PRs, and **nothing
+> ships incomplete / with deferrers** — a blocker "only possible in a later wave" is an architecture
+> design failure, to be anticipated and resolved in the issue that needs it. The sequence: **0.1** =
+> memory model + `unsafe` (by type) + `adopt` (epic **#340**, base `docs/design/memory-unsafe-backend-remodel.md`);
+> **0.2** = `unsafe`-by-type re-tag (RawBuf/Arena); **0.3.0.x** = own AOT backend + linker — the
+> end-to-end STRUCTURE (A1–E, #382–#394) with named honest-stops; **0.3.1** = backend COMPLETION +
+> debt-reckoning (a PATCH of the 0.3 line, so the backend epic **#395 stays OPEN until 100%**): resolve
+> **everything incomplete** — bugs (#301/#352/#412/#416/…), backend completeness (i128 register-pair
+> #222, FPR-spill, `loop` back-edges, splitting, has_back_edge #443), and stdlib partials
+> (#163/#184/#189/#194); **0.4** = the remaining backlog (concurrency `Intent<T>` #164, SlotMap #338,
+> packaging, tooling — the phases/rounds below). All of the backend, incl. the A4\* encoder slices,
+> completes **within 0.3** (0.3.0 structure + 0.3.1 completion). When the backlog is empty →
+> **`1.0.0.0` = LTS**. The `alpha` line (`0.0.1.x`) is pre-remodel. The phase/round structure below is
+> the DETAILED work; the waves are how it ships.
 >
 > This is the single, ordered execution sequence for ALL open teko-lang work. It consolidates:
 > the legislator's session critiques/directives, and every not-yet-done item mined from

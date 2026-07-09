@@ -1,0 +1,710 @@
+use teko::lir
+
+/**
+ * mit_i128 — the i128 carrier for a small integer literal in the harness
+ * fixtures (mirrors `lir_interp_test.tkt`'s `iwt_i128`).
+ *
+ * @param i64 v  the literal value
+ * @return i128  its i128 carrier
+ */
+fn mit_i128(v: i64) -> i128 {
+    v to i128
+}
+
+/**
+ * mit_no_args — an empty argument list.
+ *
+ * @return []i128  the empty list
+ */
+fn mit_no_args() -> []i128 {
+    teko::list::empty()
+}
+
+/**
+ * mit_r — a virtual GPR register operand with the given id (a fixture-
+ * building shorthand for the direct-`MInst` unit tests below).
+ *
+ * @param u32 id  the virtual register's abstract id
+ * @return MReg  the virtual GPR register operand
+ */
+fn mit_r(id: u32) -> MReg {
+    vreg(id, MRegClass::GPR)
+}
+
+/**
+ * mit_fr — a virtual FPR register operand with the given id.
+ *
+ * @param u32 id  the virtual register's abstract id
+ * @return MReg  the virtual FPR register operand
+ */
+fn mit_fr(id: u32) -> MReg {
+    vreg(id, MRegClass::FPR)
+}
+
+/**
+ * mit_mem — a base-plus-displacement memory operand.
+ *
+ * @param MReg base  the base register
+ * @param i32 offset  the byte displacement
+ * @return MMem  the memory operand
+ */
+fn mit_mem(base: MReg, offset: i32) -> MMem {
+    MMem { base = base; offset = offset }
+}
+
+/**
+ * mit_single_block_func — a one-block function named `sym` whose
+ * instruction stream is exactly `insts` (a direct-construction fixture
+ * shorthand bypassing `select_lfunc`, for unit-testing `minst_interp`
+ * itself in isolation).
+ *
+ * @param str sym  the function's symbol
+ * @param []MInst insts  the block's instruction stream
+ * @return MFunc  the built function
+ */
+fn mit_single_block_func(sym: str, insts: []MInst) -> MFunc {
+    let b = MBlock { id = 0; params = teko::list::empty(); insts = insts }
+    MFunc { symbol = sym; blocks = teko::list::push(teko::list::empty(), b); frame = teko::list::empty() }
+}
+
+/**
+ * mit_module_of — a module containing exactly `f`.
+ *
+ * @param MFunc f  the function to wrap
+ * @return MModule  the built module
+ */
+fn mit_module_of(f: MFunc) -> MModule {
+    add_mfunc(empty_mmodule(), f)
+}
+
+/**
+ * mit_one_inst_result — run `minst_interp` over a one-instruction `main`
+ * function whose sole instruction is `inst` (the honest-stop coverage
+ * sweep's shared shape below).
+ *
+ * @param MInst inst  the instruction to run
+ * @return i128  the produced exit code (or -1 on any honest-stop)
+ */
+fn mit_one_inst_result(inst: MInst) -> i128 {
+    minst_interp(mit_module_of(mit_single_block_func("main", teko::list::push(teko::list::empty(), inst))), "main", mit_no_args())
+}
+
+#test
+fn mit_unimplemented_cases_all_honest_stop() {
+    teko::assert::is_true(mit_one_inst_result(mvn_inst(true, mit_r(1), mit_r(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(falu_inst(MFAluOp::FAdd, true, mit_fr(1), mit_fr(0), mit_fr(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(fneg_inst(true, mit_fr(1), mit_fr(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(fcmp_inst(true, mit_fr(0), mit_fr(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(fmov_inst(true, mit_fr(0), mit_r(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(ext_inst(MExtOp::Sxtb, mit_r(1), mit_r(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(cvt_inst(MCvtOp::Scvtf, mit_fr(0), mit_r(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(load_inst(MMemSize::X, false, mit_r(1), mit_mem(mit_r(0), 0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(store_inst(MMemSize::X, mit_r(0), mit_mem(mit_r(0), 0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(frame_addr_inst(mit_r(0), 0)) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(adrp_inst(mit_r(0), "sym", MRelocKind::PageHi)) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(add_lo_inst(mit_r(0), mit_r(0), "sym", MRelocKind::PageLo)) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(branch_cond_inst(MCond::EQ, 0)) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(cbz_inst(true, true, mit_r(0), 0)) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(call_inst("tk_exit", teko::list::empty(), preg(0, MRegClass::GPR), false, false)) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(call_indirect_inst(mit_r(0), teko::list::empty(), preg(0, MRegClass::GPR), false)) == mit_i128(-1))
+}
+
+/**
+ * mit_run_lfunc — select `f` to machine code and run it end to end: the
+ * A2-3 control-flow tests build a LIR function, lower it through the real
+ * `select_lfunc`, and execute the selected `MInst` stream, so a wrong branch
+ * target or a dropped edge move shows up as a wrong exit code (a selection
+ * error maps to -1, the shared honest-stop sentinel).
+ *
+ * @param lir::LFunc f  the function to select and run (its symbol is "main")
+ * @return i128  the executed exit code, or -1 on a selection error
+ */
+fn mit_run_lfunc(f: lir::LFunc) -> i128 {
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return -1 to i128 }
+    minst_interp(mit_module_of(mf), "main", mit_no_args())
+}
+
+#test
+fn mit_a23_jump_carries_block_arg() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let v0 = lir::alloc_vreg(b1.func)
+    let bp = lir::add_block_param(v0.func, b1.block_id)
+    let s0 = lir::append_inst(bp.func, 0, lir::const_int_inst(v0.vreg, 7 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::jump_inst(b1.block_id, teko::list::push(teko::list::empty(), v0.vreg), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s2) == mit_i128(7))
+}
+
+#test
+fn mit_a23_fused_branch_takes_then() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let v3 = lir::alloc_vreg(v2.func)
+    let v4 = lir::alloc_vreg(v3.func)
+    let s0 = lir::append_inst(v4.func, 0, lir::const_int_inst(v0.vreg, 5 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(v1.vreg, 5 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::bin_inst(v2.vreg, lir::LBinOp::ICmpEq, v0.vreg, v1.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::branch_inst(v2.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s4 = lir::append_inst(s3, b1.block_id, lir::const_int_inst(v3.vreg, 100 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b1.block_id, lir::ret_inst(v3.vreg, 0, 0))
+    let s6 = lir::append_inst(s5, b2.block_id, lir::const_int_inst(v4.vreg, 200 to i128, 0, 0))
+    let s7 = lir::append_inst(s6, b2.block_id, lir::ret_inst(v4.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s7) == mit_i128(100))
+}
+
+#test
+fn mit_a23_generic_branch_takes_else_when_false() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let s0 = lir::append_inst(v2.func, 0, lir::const_int_inst(v0.vreg, 0 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::const_int_inst(v1.vreg, 10 to i128, 0, 0))
+    let s3 = lir::append_inst(s2, b1.block_id, lir::ret_inst(v1.vreg, 0, 0))
+    let s4 = lir::append_inst(s3, b2.block_id, lir::const_int_inst(v2.vreg, 20 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b2.block_id, lir::ret_inst(v2.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s5) == mit_i128(20))
+}
+
+#test
+fn mit_a23_branch_edge_arg_splits_and_moves() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let vc = lir::alloc_vreg(b2.func)
+    let va = lir::alloc_vreg(vc.func)
+    let bp = lir::add_block_param(va.func, b1.block_id)
+    let ve = lir::alloc_vreg(bp.func)
+    let s0 = lir::append_inst(ve.func, 0, lir::const_int_inst(vc.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(va.vreg, 42 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::branch_inst(vc.vreg, b1.block_id, teko::list::push(teko::list::empty(), va.vreg), b2.block_id, teko::list::empty(), 0, 0))
+    let s3 = lir::append_inst(s2, b1.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    let s4 = lir::append_inst(s3, b2.block_id, lir::const_int_inst(ve.vreg, 99 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b2.block_id, lir::ret_inst(ve.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s5) == mit_i128(42))
+}
+
+#test
+fn mit_a23_diamond_false_takes_else_over_neg_and_merge() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let b3 = lir::alloc_block(b2.func)
+    let v0 = lir::alloc_vreg(b3.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let v3 = lir::alloc_vreg(v2.func)
+    let v4 = lir::alloc_vreg(v3.func)
+    let bp = lir::add_block_param(v4.func, b3.block_id)
+    let s0 = lir::append_inst(bp.func, 0, lir::const_int_inst(v0.vreg, 5 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(v1.vreg, 7 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::bin_inst(v2.vreg, lir::LBinOp::ICmpEq, v0.vreg, v1.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::branch_inst(v2.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s4 = lir::append_inst(s3, b1.block_id, lir::un_inst(v3.vreg, lir::LUnOp::INeg, v0.vreg, 0, 0))
+    let s5 = lir::append_inst(s4, b1.block_id, lir::jump_inst(b3.block_id, teko::list::push(teko::list::empty(), v3.vreg), 0, 0))
+    let s6 = lir::append_inst(s5, b2.block_id, lir::const_int_inst(v4.vreg, 200 to i128, 0, 0))
+    let s7 = lir::append_inst(s6, b2.block_id, lir::jump_inst(b3.block_id, teko::list::push(teko::list::empty(), v4.vreg), 0, 0))
+    let s8 = lir::append_inst(s7, b3.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s8) == mit_i128(200))
+}
+
+/**
+ * mit_alu_binop_result — `movz r0,a_val; movz r1,b_val; %2 = op r0,r1; mov
+ * p0,%2; ret`, returning `minst_interp`'s exit code — the shared shape
+ * every `eval_alu` coverage test below uses (both operands are DEFINED, so
+ * execution actually reaches `eval_alu`, unlike a bare undefined-register
+ * fixture).
+ *
+ * @param MAluOp op  the operation to evaluate
+ * @param u32 a_val  the first operand literal
+ * @param u32 b_val  the second operand literal
+ * @return i128  the produced exit code (or -1 on any honest-stop)
+ */
+fn mit_alu_binop_result(op: MAluOp, a_val: u32, b_val: u32) -> i128 {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movz_inst(true, mit_r(0), a_val, 0))
+    insts = teko::list::push(insts, movz_inst(true, mit_r(1), b_val, 0))
+    insts = teko::list::push(insts, alu_inst(op, true, mit_r(2), mit_r(0), mit_r(1)))
+    insts = teko::list::push(insts, mov_inst(true, preg(0, MRegClass::GPR), mit_r(2)))
+    insts = teko::list::push(insts, ret_inst())
+    let f = mit_single_block_func("main", insts)
+    minst_interp(mit_module_of(f), "main", mit_no_args())
+}
+
+#test
+fn mit_alu_covers_every_arithmetic_op() {
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Add, 3, 4) == mit_i128(7))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Sub, 10, 3) == mit_i128(7))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Mul, 6, 7) == mit_i128(42))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Sdiv, 20, 3) == mit_i128(6))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Udiv, 20, 3) == mit_i128(6))
+}
+
+#test
+fn mit_bitwise_and_shift_alu_ops_honest_stop() {
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::And, 3, 4) == mit_i128(-1))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Orr, 3, 4) == mit_i128(-1))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Eor, 3, 4) == mit_i128(-1))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Lsl, 3, 4) == mit_i128(-1))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Asr, 3, 4) == mit_i128(-1))
+    teko::assert::is_true(mit_alu_binop_result(MAluOp::Lsr, 3, 4) == mit_i128(-1))
+}
+
+#test
+fn mit_missing_entry_is_negative_sentinel() {
+    teko::assert::is_true(minst_interp(empty_mmodule(), "nope", mit_no_args()) == mit_i128(-1))
+}
+
+#test
+fn mit_empty_function_is_negative_sentinel() {
+    let f = MFunc { symbol = "main"; blocks = teko::list::empty(); frame = teko::list::empty() }
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(-1))
+}
+
+#test
+fn mit_block_falls_through_without_a_terminator_is_negative_sentinel() {
+    let f = mit_single_block_func("main", teko::list::empty())
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(-1))
+}
+
+#test
+fn mit_void_ret_returns_zero() {
+    let f = mit_single_block_func("main", teko::list::push(teko::list::empty(), ret_inst()))
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(0))
+}
+
+#test
+fn mit_alu_imm_evaluates_directly() {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movz_inst(true, mit_r(0), 5, 0))
+    insts = teko::list::push(insts, alu_imm_inst(MAluOp::Add, true, mit_r(1), mit_r(0), 3 to i64))
+    insts = teko::list::push(insts, mov_inst(true, preg(0, MRegClass::GPR), mit_r(1)))
+    insts = teko::list::push(insts, ret_inst())
+    let f = mit_single_block_func("main", insts)
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(8))
+}
+
+#test
+fn mit_alu_imm_zero_division_honest_stops() {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movz_inst(true, mit_r(0), 5, 0))
+    insts = teko::list::push(insts, alu_imm_inst(MAluOp::Sdiv, true, mit_r(1), mit_r(0), 0 to i64))
+    insts = teko::list::push(insts, ret_inst())
+    let f = mit_single_block_func("main", insts)
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(-1))
+}
+
+#test
+fn mit_undefined_register_reads_honest_stop() {
+    teko::assert::is_true(mit_one_inst_result(alu_inst(MAluOp::Add, true, mit_r(9), mit_r(0), mit_r(1))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(alu_imm_inst(MAluOp::Add, true, mit_r(9), mit_r(0), 1 to i64)) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(msub_inst(true, mit_r(9), mit_r(0), mit_r(1), mit_r(2))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(neg_inst(true, mit_r(9), mit_r(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(cmp_inst(true, mit_r(9), mit_r(0))) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(cmp_imm_inst(true, mit_r(9), 0 to i64)) == mit_i128(-1))
+    teko::assert::is_true(mit_one_inst_result(mov_inst(true, mit_r(1), mit_r(9))) == mit_i128(-1))
+}
+
+#test
+fn mit_cset_before_any_compare_is_internal_error() {
+    teko::assert::is_true(mit_one_inst_result(cset_inst(true, mit_r(0), MCond::EQ)) == mit_i128(-1))
+}
+
+/**
+ * mit_cmp_cset_result — run `cmp a,b then cset dst,cond then ret dst`
+ * (`a`/`b` first materialized via MOVZ), returning `minst_interp`'s exit
+ * code — the shared shape every `MCond` coverage test below uses.
+ *
+ * @param u32 a_val  the left compared literal (0-255)
+ * @param u32 b_val  the right compared literal (0-255)
+ * @param MCond cond  the condition to test
+ * @return i128  the produced exit code (0 or 1)
+ */
+fn mit_cmp_cset_result(a_val: u32, b_val: u32, cond: MCond) -> i128 {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movz_inst(true, mit_r(0), a_val, 0))
+    insts = teko::list::push(insts, movz_inst(true, mit_r(1), b_val, 0))
+    insts = teko::list::push(insts, cmp_inst(true, mit_r(0), mit_r(1)))
+    insts = teko::list::push(insts, cset_inst(true, mit_r(2), cond))
+    insts = teko::list::push(insts, mov_inst(true, preg(0, MRegClass::GPR), mit_r(2)))
+    insts = teko::list::push(insts, ret_inst())
+    let f = mit_single_block_func("main", insts)
+    minst_interp(mit_module_of(f), "main", mit_no_args())
+}
+
+#test
+fn mit_cset_covers_every_condition_code() {
+    teko::assert::is_true(mit_cmp_cset_result(3, 3, MCond::EQ) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(3, 4, MCond::NE) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(3, 4, MCond::LT) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(3, 3, MCond::LE) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(5, 4, MCond::GT) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(5, 5, MCond::GE) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(3, 4, MCond::LO) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(3, 3, MCond::LS) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(5, 4, MCond::HI) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(5, 5, MCond::HS) == mit_i128(1))
+    teko::assert::is_true(mit_cmp_cset_result(3, 3, MCond::LT) == mit_i128(0))
+}
+
+#test
+fn mit_cmp_imm_feeds_cset() {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movz_inst(true, mit_r(0), 7, 0))
+    insts = teko::list::push(insts, cmp_imm_inst(true, mit_r(0), 7 to i64))
+    insts = teko::list::push(insts, cset_inst(true, mit_r(1), MCond::EQ))
+    insts = teko::list::push(insts, mov_inst(true, preg(0, MRegClass::GPR), mit_r(1)))
+    insts = teko::list::push(insts, ret_inst())
+    let f = mit_single_block_func("main", insts)
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(1))
+}
+
+#test
+fn mit_movk_merges_lanes_into_a_negative_32bit_value() {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movz_inst(false, mit_r(0), 65533, 0))
+    insts = teko::list::push(insts, movk_inst(false, mit_r(0), 65535, 16))
+    insts = teko::list::push(insts, mov_inst(true, preg(0, MRegClass::GPR), mit_r(0)))
+    insts = teko::list::push(insts, ret_inst())
+    let f = mit_single_block_func("main", insts)
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(-3))
+}
+
+#test
+fn mit_movk_with_no_preceding_write_starts_from_zero() {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movk_inst(true, mit_r(0), 5, 0))
+    insts = teko::list::push(insts, mov_inst(true, preg(0, MRegClass::GPR), mit_r(0)))
+    insts = teko::list::push(insts, ret_inst())
+    let f = mit_single_block_func("main", insts)
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(5))
+}
+
+#test
+fn mit_register_file_round_trips_through_every_class_and_phys_combo() {
+    mut insts: []MInst = teko::list::empty()
+    insts = teko::list::push(insts, movz_inst(true, mit_fr(0), 7, 0))
+    insts = teko::list::push(insts, mov_inst(true, preg(0, MRegClass::FPR), mit_fr(0)))
+    insts = teko::list::push(insts, mov_inst(true, mit_r(0), preg(0, MRegClass::FPR)))
+    insts = teko::list::push(insts, mov_inst(true, preg(0, MRegClass::GPR), mit_r(0)))
+    insts = teko::list::push(insts, ret_inst())
+    let f = mit_single_block_func("main", insts)
+    teko::assert::is_true(minst_interp(mit_module_of(f), "main", mit_no_args()) == mit_i128(7))
+}
+
+/**
+ * mit_lir_const_ret — `func @main() { %0 = const val; ret %0 }`, the
+ * "straight-line, no calls" analog of `lir_interp_test.tkt`'s F1: A2-2 does
+ * not yet select `LCall`, so these equivalence fixtures return the value
+ * directly instead of routing it through `tk_exit`.
+ *
+ * @param i64 val  the constant to return
+ * @return lir::LModule  the built module
+ */
+fn mit_lir_const_ret(val: i64) -> lir::LModule {
+    mut f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I32)
+    let c = lir::alloc_vreg(f)
+    f = c.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(c.vreg, mit_i128(val), 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(c.vreg, 0, 0))
+    lir::add_func(lir::empty_module(), f)
+}
+
+#test
+fn mit_equivalence_const_and_ret() {
+    let m = mit_lir_const_ret(42)
+    let selected = match select_module(m) { MModule as x => x; error => return }
+    teko::assert::is_true(minst_interp(selected, "main", mit_no_args()) == lir::interp_lmodule(m, "main", mit_no_args()))
+    teko::assert::is_true(lir::interp_lmodule(m, "main", mit_no_args()) == mit_i128(42))
+}
+
+/**
+ * mit_lir_mul_ret — `func @main() { %0=a; %1=b; %2=a*b; ret %2 }`, the
+ * `ret`-based analog of `lir_interp_test.tkt`'s F2.
+ *
+ * @param i64 a  the first factor
+ * @param i64 b  the second factor
+ * @return lir::LModule  the built module
+ */
+fn mit_lir_mul_ret(a: i64, b: i64) -> lir::LModule {
+    mut f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I32)
+    let va = lir::alloc_vreg(f)
+    f = va.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(va.vreg, mit_i128(a), 0, 0))
+    let vb = lir::alloc_vreg(f)
+    f = vb.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(vb.vreg, mit_i128(b), 0, 0))
+    let vp = lir::alloc_vreg(f)
+    f = vp.func
+    f = lir::append_inst(f, 0, lir::bin_inst(vp.vreg, lir::LBinOp::IMul, va.vreg, vb.vreg, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(vp.vreg, 0, 0))
+    lir::add_func(lir::empty_module(), f)
+}
+
+#test
+fn mit_equivalence_mul_and_ret() {
+    let m = mit_lir_mul_ret(6, 7)
+    let selected = match select_module(m) { MModule as x => x; error => return }
+    teko::assert::is_true(minst_interp(selected, "main", mit_no_args()) == lir::interp_lmodule(m, "main", mit_no_args()))
+    teko::assert::is_true(lir::interp_lmodule(m, "main", mit_no_args()) == mit_i128(42))
+}
+
+/**
+ * mit_lir_div_ret — `func @main() { %0=a; %1=b; %2=a/b(signed); ret %2 }`,
+ * the `ret`-based analog of `lir_interp_test.tkt`'s F4.
+ *
+ * @param i64 a  the dividend
+ * @param i64 b  the divisor
+ * @return lir::LModule  the built module
+ */
+fn mit_lir_div_ret(a: i64, b: i64) -> lir::LModule {
+    mut f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I32)
+    let va = lir::alloc_vreg(f)
+    f = va.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(va.vreg, mit_i128(a), 0, 0))
+    let vb = lir::alloc_vreg(f)
+    f = vb.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(vb.vreg, mit_i128(b), 0, 0))
+    let vq = lir::alloc_vreg(f)
+    f = vq.func
+    f = lir::append_inst(f, 0, lir::bin_inst(vq.vreg, lir::LBinOp::IDivS, va.vreg, vb.vreg, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(vq.vreg, 0, 0))
+    lir::add_func(lir::empty_module(), f)
+}
+
+#test
+fn mit_equivalence_signed_division() {
+    let m = mit_lir_div_ret(100, 7)
+    let selected = match select_module(m) { MModule as x => x; error => return }
+    teko::assert::is_true(minst_interp(selected, "main", mit_no_args()) == lir::interp_lmodule(m, "main", mit_no_args()))
+    teko::assert::is_true(lir::interp_lmodule(m, "main", mit_no_args()) == mit_i128(14))
+}
+
+/**
+ * mit_lir_rem_ret — `func @main() { %0=a; %1=b; %2=a%b(signed); ret %2 }`.
+ *
+ * @param i64 a  the dividend
+ * @param i64 b  the divisor
+ * @return lir::LModule  the built module
+ */
+fn mit_lir_rem_ret(a: i64, b: i64) -> lir::LModule {
+    mut f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I32)
+    let va = lir::alloc_vreg(f)
+    f = va.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(va.vreg, mit_i128(a), 0, 0))
+    let vb = lir::alloc_vreg(f)
+    f = vb.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(vb.vreg, mit_i128(b), 0, 0))
+    let vr = lir::alloc_vreg(f)
+    f = vr.func
+    f = lir::append_inst(f, 0, lir::bin_inst(vr.vreg, lir::LBinOp::IRemS, va.vreg, vb.vreg, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(vr.vreg, 0, 0))
+    lir::add_func(lir::empty_module(), f)
+}
+
+#test
+fn mit_equivalence_signed_remainder_via_msub() {
+    let m = mit_lir_rem_ret(100, 7)
+    let selected = match select_module(m) { MModule as x => x; error => return }
+    teko::assert::is_true(minst_interp(selected, "main", mit_no_args()) == lir::interp_lmodule(m, "main", mit_no_args()))
+    teko::assert::is_true(lir::interp_lmodule(m, "main", mit_no_args()) == mit_i128(2))
+}
+
+/**
+ * mit_lir_neg_ret — `func @main() { %0 = const val; %1 = ineg %0; ret %1
+ * }`, the `ret`-based analog of `lir_interp_test.tkt`'s F5 (which routed
+ * the negation through a call — out of A2-2 scope).
+ *
+ * @param i64 val  the value to negate
+ * @return lir::LModule  the built module
+ */
+fn mit_lir_neg_ret(val: i64) -> lir::LModule {
+    mut f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I32)
+    let c = lir::alloc_vreg(f)
+    f = c.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(c.vreg, mit_i128(val), 0, 0))
+    let n = lir::alloc_vreg(f)
+    f = n.func
+    f = lir::append_inst(f, 0, lir::un_inst(n.vreg, lir::LUnOp::INeg, c.vreg, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(n.vreg, 0, 0))
+    lir::add_func(lir::empty_module(), f)
+}
+
+#test
+fn mit_equivalence_unary_negation_round_trip() {
+    let m = mit_lir_neg_ret(-42)
+    let selected = match select_module(m) { MModule as x => x; error => return }
+    teko::assert::is_true(minst_interp(selected, "main", mit_no_args()) == lir::interp_lmodule(m, "main", mit_no_args()))
+    teko::assert::is_true(lir::interp_lmodule(m, "main", mit_no_args()) == mit_i128(42))
+}
+
+/**
+ * mit_lir_add_params — `func @teko__demo__add(%0,%1) { %2 = iadd %0,%1;
+ * ret %2 }` invoked directly as the entry (A2-2 has no calls, so the
+ * two-param equivalence fixture below runs THIS function as the harness
+ * entry, feeding `args` positionally).
+ *
+ * @return lir::LModule  the built module
+ */
+fn mit_lir_add_params() -> lir::LModule {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), lir::LType::I64), lir::LType::I64)
+    mut f = lir::new_func("teko__demo__add", 2, ptypes, lir::LType::I64)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    f = lir::append_inst(f, 0, lir::param_inst(1, 1, 0, 0))
+    let r = lir::alloc_vreg(f)
+    f = r.func
+    f = lir::append_inst(f, 0, lir::bin_inst(r.vreg, lir::LBinOp::IAdd, 0, 1, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(r.vreg, 0, 0))
+    lir::add_func(lir::empty_module(), f)
+}
+
+#test
+fn mit_equivalence_two_param_add() {
+    let m = mit_lir_add_params()
+    let selected = match select_module(m) { MModule as x => x; error => return }
+    let args = teko::list::push(teko::list::push(teko::list::empty(), mit_i128(40)), mit_i128(2))
+    teko::assert::is_true(minst_interp(selected, "teko__demo__add", args) == lir::interp_lmodule(m, "teko__demo__add", args))
+    teko::assert::is_true(lir::interp_lmodule(m, "teko__demo__add", args) == mit_i128(42))
+}
+
+/**
+ * mit_lir_bitwise_ret — `func @main() { %0=a; %1=b; %2 = a AND b; ret %2
+ * }`: `lir_interp` itself honest-stops on bitwise ops today, so this
+ * equivalence fixture proves BOTH oracles honest-stop identically (the
+ * plan's closing note), not that a real value matches.
+ *
+ * @return lir::LModule  the built module
+ */
+fn mit_lir_bitwise_ret() -> lir::LModule {
+    mut f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I32)
+    let va = lir::alloc_vreg(f)
+    f = va.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(va.vreg, mit_i128(6), 0, 0))
+    let vb = lir::alloc_vreg(f)
+    f = vb.func
+    f = lir::append_inst(f, 0, lir::const_int_inst(vb.vreg, mit_i128(3), 0, 0))
+    let vr = lir::alloc_vreg(f)
+    f = vr.func
+    f = lir::append_inst(f, 0, lir::bin_inst(vr.vreg, lir::LBinOp::IAnd, va.vreg, vb.vreg, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(vr.vreg, 0, 0))
+    lir::add_func(lir::empty_module(), f)
+}
+
+#test
+fn mit_equivalence_bitwise_honest_stops_both_sides() {
+    let m = mit_lir_bitwise_ret()
+    let selected = match select_module(m) { MModule as x => x; error => return }
+    teko::assert::is_true(minst_interp(selected, "main", mit_no_args()) == lir::interp_lmodule(m, "main", mit_no_args()))
+    teko::assert::is_true(lir::interp_lmodule(m, "main", mit_no_args()) == mit_i128(-1))
+}
+
+/**
+ * mit_lir_float_const_ret — `func @main() { %0 = const.float bits; ret %0
+ * }`: `lir_interp` honest-stops on `LConstFloat` unconditionally, so this
+ * proves `minst_interp` honest-stops identically once selection reaches
+ * the same instruction.
+ *
+ * @return lir::LModule  the built module
+ */
+fn mit_lir_float_const_ret() -> lir::LModule {
+    mut f = lir::new_func("main", 0, teko::list::empty(), lir::LType::F64)
+    let c = lir::alloc_vreg(f)
+    f = c.func
+    f = lir::append_inst(f, 0, lir::const_float_inst(c.vreg, 4607182418800017408 to u64, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(c.vreg, 0, 0))
+    lir::add_func(lir::empty_module(), f)
+}
+
+#test
+fn mit_equivalence_float_const_honest_stops_both_sides() {
+    let m = mit_lir_float_const_ret()
+    let selected = match select_module(m) { MModule as x => x; error => return }
+    teko::assert::is_true(minst_interp(selected, "main", mit_no_args()) == lir::interp_lmodule(m, "main", mit_no_args()))
+    teko::assert::is_true(lir::interp_lmodule(m, "main", mit_no_args()) == mit_i128(-1))
+}
+
+#test
+fn mit_a24_store_then_load_round_trips() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let a = lir::alloc_vreg(f0)
+    let v = lir::alloc_vreg(a.func)
+    let ld = lir::alloc_vreg(v.func)
+    let s0 = lir::append_inst(ld.func, 0, lir::alloca_inst(a.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(v.vreg, 42 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::store_inst(a.vreg, v.vreg, lir::LType::I64, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::load_inst(ld.vreg, a.vreg, lir::LType::I64, 0, 0))
+    let s4 = lir::append_inst(s3, 0, lir::ret_inst(ld.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s4) == mit_i128(42))
+}
+
+#test
+fn mit_a24_field_addr_offset_round_trips() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let a = lir::alloc_vreg(f0)
+    let fa = lir::alloc_vreg(a.func)
+    let v = lir::alloc_vreg(fa.func)
+    let ld = lir::alloc_vreg(v.func)
+    let s0 = lir::append_inst(ld.func, 0, lir::alloca_inst(a.vreg, 16, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::field_addr_inst(fa.vreg, a.vreg, 8, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::const_int_inst(v.vreg, 99 to i128, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::store_inst(fa.vreg, v.vreg, lir::LType::I64, 0, 0))
+    let s4 = lir::append_inst(s3, 0, lir::load_inst(ld.vreg, fa.vreg, lir::LType::I64, 0, 0))
+    let s5 = lir::append_inst(s4, 0, lir::ret_inst(ld.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s5) == mit_i128(99))
+}
+
+#test
+fn mit_a24_store_overwrites_same_address() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let a = lir::alloc_vreg(f0)
+    let v1 = lir::alloc_vreg(a.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let ld = lir::alloc_vreg(v2.func)
+    let s0 = lir::append_inst(ld.func, 0, lir::alloca_inst(a.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(v1.vreg, 10 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::store_inst(a.vreg, v1.vreg, lir::LType::I64, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::const_int_inst(v2.vreg, 20 to i128, 0, 0))
+    let s4 = lir::append_inst(s3, 0, lir::store_inst(a.vreg, v2.vreg, lir::LType::I64, 0, 0))
+    let s5 = lir::append_inst(s4, 0, lir::load_inst(ld.vreg, a.vreg, lir::LType::I64, 0, 0))
+    let s6 = lir::append_inst(s5, 0, lir::ret_inst(ld.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s6) == mit_i128(20))
+}
+
+#test
+fn mit_a24_load_uninitialized_reads_zero() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let a = lir::alloc_vreg(f0)
+    let ld = lir::alloc_vreg(a.func)
+    let s0 = lir::append_inst(ld.func, 0, lir::alloca_inst(a.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::load_inst(ld.vreg, a.vreg, lir::LType::I64, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(ld.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s2) == mit_i128(0))
+}
+
+#test
+fn mit_a25_tk_exit_returns_its_code() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::const_int_inst(v.vreg, 42 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_inst("tk_exit", teko::list::push(teko::list::empty(), v.vreg), false, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(v.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s2) == mit_i128(42))
+}
+
+#test
+fn mit_a25_non_tk_exit_call_honest_stops() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::const_int_inst(v.vreg, 5 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_inst("teko__demo__f", teko::list::empty(), false, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(v.vreg, 0, 0))
+    teko::assert::is_true(mit_run_lfunc(s2) == mit_i128(-1))
+}
