@@ -678,3 +678,389 @@ fn compute_intervals(stream: []NumberedInst) -> IntervalSet | error {
     }
     IntervalSet { virt = virt; fixed = fixed; call_points = cps }
 }
+
+/**
+ * InReg — a virtual register assigned to a physical register.
+ *
+ * @since #384 A3-3
+ */
+pub type InReg = struct {
+    /**
+     * vreg_id — the virtual register colored.
+     */
+    vreg_id: u32
+    /**
+     * phys — the physical register id it was assigned.
+     */
+    phys: u32
+}
+
+/**
+ * Spilled — a virtual register spilled to a frame slot (register pressure
+ * exceeded its class's pool).
+ *
+ * @since #384 A3-3
+ */
+pub type Spilled = struct {
+    /**
+     * vreg_id — the virtual register spilled.
+     */
+    vreg_id: u32
+    /**
+     * slot — the spill-slot index (A3-4 finalizes it to a frame offset).
+     */
+    slot: u32
+}
+
+/**
+ * RegAssignment — the allocation outcome for one virtual register: kept
+ * `InReg` or `Spilled` to the stack.
+ *
+ * @since #384 A3-3
+ */
+pub type RegAssignment = variant InReg | Spilled
+
+/**
+ * ScanResult — the linear-scan output: one assignment per virtual interval,
+ * plus the callee-saved registers the scan used (A4 saves/restores them).
+ *
+ * @since #384 A3-3
+ */
+pub type ScanResult = struct {
+    /**
+     * assignments — one `RegAssignment` per virtual interval.
+     */
+    assignments: []RegAssignment
+    /**
+     * used_callee_saved — the callee-saved physregs the scan assigned.
+     */
+    used_callee_saved: []u32
+}
+
+/**
+ * ActiveEntry — a currently-assigned virtual interval in the scan's active
+ * set: its vreg, the physreg it holds, its end point, and its class.
+ *
+ * @since #384 A3-3
+ */
+type ActiveEntry = struct {
+    /**
+     * vreg_id — the active virtual register.
+     */
+    vreg_id: u32
+    /**
+     * phys — the physical register it holds.
+     */
+    phys: u32
+    /**
+     * end — the interval's end point (when it frees the register).
+     */
+    end: u32
+    /**
+     * reg_class — the register file it lives in.
+     */
+    reg_class: MRegClass
+}
+
+/**
+ * interval_before — the start-order comparator (tie-break by `reg_id` for a
+ * deterministic scan, M.2): true iff `a` sorts strictly before `b`.
+ *
+ * @param LiveInterval a  the first interval
+ * @param LiveInterval b  the second interval
+ * @return bool  true iff `a` precedes `b`
+ */
+fn interval_before(a: LiveInterval, b: LiveInterval) -> bool {
+    if a.start != b.start { a.start < b.start } else { a.reg_id < b.reg_id }
+}
+
+/**
+ * sort_by_start — the virtual intervals in start order (an insertion sort;
+ * deterministic tie-break by `reg_id`).
+ *
+ * @param []LiveInterval virt  the virtual intervals
+ * @return []LiveInterval  the start-sorted intervals
+ */
+fn sort_by_start(virt: []LiveInterval) -> []LiveInterval {
+    mut out: []LiveInterval = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= virt.len { break }
+        let v = virt[i]
+        mut ins: []LiveInterval = teko::list::empty()
+        mut placed: bool = false
+        mut j: u64 = 0
+        loop {
+            if j >= out.len { break }
+            let o = out[j]
+            if !placed && interval_before(v, o) {
+                ins = teko::list::push(ins, v)
+                placed = true
+            }
+            ins = teko::list::push(ins, o)
+            j++
+        }
+        if !placed { ins = teko::list::push(ins, v) }
+        out = ins
+        i++
+    }
+    out
+}
+
+/**
+ * expire_active — the active entries still live at `point` (drop those whose
+ * `end` is before it, freeing their physregs).
+ *
+ * @param []ActiveEntry active  the active set
+ * @param u32 point  the current interval's start
+ * @return []ActiveEntry  the surviving active entries
+ */
+fn expire_active(active: []ActiveEntry, point: u32) -> []ActiveEntry {
+    mut out: []ActiveEntry = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= active.len { break }
+        if active[i].end >= point { out = teko::list::push(out, active[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * ranges_overlap — whether `[s1,e1]` and `[s2,e2]` share any point.
+ *
+ * @param u32 s1  the first start
+ * @param u32 e1  the first end
+ * @param u32 s2  the second start
+ * @param u32 e2  the second end
+ * @return bool  true iff they overlap
+ */
+fn ranges_overlap(s1: u32, e1: u32, s2: u32, e2: u32) -> bool {
+    s1 <= e2 && s2 <= e1
+}
+
+/**
+ * phys_held — whether an active entry currently holds physreg `phys` in
+ * `reg_class`.
+ *
+ * @param []ActiveEntry active  the active set
+ * @param u32 phys  the physreg id
+ * @param MRegClass reg_class  the register class
+ * @return bool  true iff held
+ */
+fn phys_held(active: []ActiveEntry, phys: u32, reg_class: MRegClass) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= active.len { break }
+        if active[i].phys == phys && active[i].reg_class == reg_class { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * phys_fixed_overlap — whether any fixed pin interval on physreg `phys` in
+ * `reg_class` overlaps `[start, end]` (a pre-colored region the allocator must
+ * not reuse).
+ *
+ * @param []LiveInterval fixed  the fixed pin intervals
+ * @param u32 phys  the physreg id
+ * @param MRegClass reg_class  the register class
+ * @param u32 start  the candidate interval start
+ * @param u32 end  the candidate interval end
+ * @return bool  true iff a fixed pin overlaps
+ */
+fn phys_fixed_overlap(fixed: []LiveInterval, phys: u32, reg_class: MRegClass, start: u32, end: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= fixed.len { break }
+        let fx = fixed[i]
+        if fx.reg_id == phys && fx.reg_class == reg_class && ranges_overlap(fx.start, fx.end, start, end) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * candidate_pool — the physregs `v` may take: from `allocatable_pool` in its
+ * fixed order, excluding those held by an active entry, blocked by an
+ * overlapping fixed pin, or (when `v` crosses a call) caller-saved (§3.3).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param LiveInterval v  the interval to color
+ * @param []ActiveEntry active  the active set
+ * @param []LiveInterval fixed  the fixed pin intervals
+ * @return []u32  the ordered candidate physreg ids
+ */
+fn candidate_pool(abi: AbiDescriptor, v: LiveInterval, active: []ActiveEntry, fixed: []LiveInterval) -> []u32 {
+    let pool = allocatable_pool(abi, v.reg_class)
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= pool.len { break }
+        let p = pool[i]
+        let free = !phys_held(active, p, v.reg_class) && !phys_fixed_overlap(fixed, p, v.reg_class, v.start, v.end)
+        let call_ok = !v.crosses_call || !is_caller_saved(abi, preg(p, v.reg_class))
+        if free && call_ok { out = teko::list::push(out, p) }
+        i++
+    }
+    out
+}
+
+/**
+ * FurthestActive — the active entry with the largest `end` in a class (the
+ * furthest-next-use spill victim), or `found=false`.
+ *
+ * @since #384 A3-3
+ */
+type FurthestActive = struct {
+    /**
+     * found — whether an active entry of the class exists.
+     */
+    found: bool
+    /**
+     * vreg_id — the victim's virtual register.
+     */
+    vreg_id: u32
+    /**
+     * phys — the physreg it holds (freed if it loses the spill compare).
+     */
+    phys: u32
+    /**
+     * end — its end point (the furthest next use).
+     */
+    end: u32
+}
+
+/**
+ * furthest_active — the active entry of class `reg_class` with the largest
+ * `end` (the furthest-next-use spill candidate), or `found=false`.
+ *
+ * @param []ActiveEntry active  the active set
+ * @param MRegClass reg_class  the register class
+ * @return FurthestActive  the furthest entry, or none
+ */
+fn furthest_active(active: []ActiveEntry, reg_class: MRegClass) -> FurthestActive {
+    mut best = FurthestActive { found = false; vreg_id = 0; phys = 0; end = 0 }
+    mut i: u64 = 0
+    loop {
+        if i >= active.len { break }
+        let a = active[i]
+        if a.reg_class == reg_class {
+            if !best.found || a.end > best.end {
+                best = FurthestActive { found = true; vreg_id = a.vreg_id; phys = a.phys; end = a.end }
+            }
+        }
+        i++
+    }
+    best
+}
+
+/**
+ * remove_active — the active set with the entry for `vreg_id` removed.
+ *
+ * @param []ActiveEntry active  the active set
+ * @param u32 vreg_id  the vreg whose entry to drop
+ * @return []ActiveEntry  the reduced active set
+ */
+fn remove_active(active: []ActiveEntry, vreg_id: u32) -> []ActiveEntry {
+    mut out: []ActiveEntry = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= active.len { break }
+        if active[i].vreg_id != vreg_id { out = teko::list::push(out, active[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * mark_spilled — the assignment list with `vreg_id`'s `InReg` replaced by a
+ * `Spilled{slot}` (the furthest-next-use victim loses its register).
+ *
+ * @param []RegAssignment assignments  the assignments so far
+ * @param u32 vreg_id  the victim vreg
+ * @param u32 slot  its new spill slot
+ * @return []RegAssignment  the updated assignments
+ */
+fn mark_spilled(assignments: []RegAssignment, vreg_id: u32, slot: u32) -> []RegAssignment {
+    mut out: []RegAssignment = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= assignments.len { break }
+        let a = assignments[i]
+        let repl = match a {
+            InReg as r => if r.vreg_id == vreg_id { Spilled { vreg_id = vreg_id; slot = slot } } else { a }
+            Spilled => a
+        }
+        out = teko::list::push(out, repl)
+        i++
+    }
+    out
+}
+
+/**
+ * add_unique_u32 — `list` with `x` appended iff not already present.
+ *
+ * @param []u32 list  the list
+ * @param u32 x  the value to add
+ * @return []u32  the (possibly extended) list
+ */
+fn add_unique_u32(list: []u32, x: u32) -> []u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        if list[i] == x { return list }
+        i++
+    }
+    teko::list::push(list, x)
+}
+
+/**
+ * linear_scan — the §3.3 Poletto–Sarkar linear scan extended for fixed pin
+ * intervals and call clobbers: the virtual intervals are colored in start
+ * order, expiring the active set at each start, choosing the first candidate
+ * physreg (free of active + fixed-pin overlap, callee-saved if the value
+ * crosses a call), and on register pressure spilling the furthest-next-use.
+ *
+ * @param AbiDescriptor abi  the register file the scan colors from
+ * @param IntervalSet ivals  the computed intervals (A3-2)
+ * @return ScanResult  the per-vreg assignments + the callee-saved used
+ */
+fn linear_scan(abi: AbiDescriptor, ivals: IntervalSet) -> ScanResult {
+    let sorted = sort_by_start(ivals.virt)
+    mut active: []ActiveEntry = teko::list::empty()
+    mut assignments: []RegAssignment = teko::list::empty()
+    mut used_callee: []u32 = teko::list::empty()
+    mut next_slot: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        let v = sorted[i]
+        active = expire_active(active, v.start)
+        let cand = candidate_pool(abi, v, active, ivals.fixed)
+        if cand.len > 0 {
+            let phys = cand[0]
+            active = teko::list::push(active, ActiveEntry { vreg_id = v.reg_id; phys = phys; end = v.end; reg_class = v.reg_class })
+            assignments = teko::list::push(assignments, InReg { vreg_id = v.reg_id; phys = phys })
+            if is_callee_saved(abi, preg(phys, v.reg_class)) { used_callee = add_unique_u32(used_callee, phys) }
+        } else {
+            let far = furthest_active(active, v.reg_class)
+            if far.found && far.end > v.end {
+                let slot = next_slot
+                next_slot = next_slot + 1
+                assignments = mark_spilled(assignments, far.vreg_id, slot)
+                active = remove_active(active, far.vreg_id)
+                active = teko::list::push(active, ActiveEntry { vreg_id = v.reg_id; phys = far.phys; end = v.end; reg_class = v.reg_class })
+                assignments = teko::list::push(assignments, InReg { vreg_id = v.reg_id; phys = far.phys })
+                if is_callee_saved(abi, preg(far.phys, v.reg_class)) { used_callee = add_unique_u32(used_callee, far.phys) }
+            } else {
+                let slot = next_slot
+                next_slot = next_slot + 1
+                assignments = teko::list::push(assignments, Spilled { vreg_id = v.reg_id; slot = slot })
+            }
+        }
+        i++
+    }
+    ScanResult { assignments = assignments; used_callee_saved = used_callee }
+}
