@@ -161,6 +161,93 @@ fn iv_set(v0: IReg128Vec, id: u32, val: i128) -> IReg128Vec {
 }
 
 /**
+ * MemCell — one written memory address and its value (a sparse cell: only
+ * addresses actually stored to are recorded; an unread address reads back 0,
+ * matching an `alloca`'s zero-initialized frame).
+ *
+ * @since #383 A2-4
+ */
+type MemCell = struct {
+    /**
+     * addr — the byte address (an `MFrameAddr` base plus `MMem` displacement).
+     */
+    addr: i128
+    /**
+     * val — the whole value stored at `addr` (size-agnostic, mirroring
+     * `lir_interp`'s one-cell-per-address approximation).
+     */
+    val: i128
+}
+
+/**
+ * MMemStore — the abstract-machine memory: a sparse list of written cells.
+ * Size-agnostic like `lir_interp`'s `MemStore` (each address holds a whole
+ * value); the A2-4 harness only needs store→load round-trips to agree, and it
+ * asserts against a known result, so no byte-accurate layout is modeled.
+ *
+ * @since #383 A2-4
+ */
+type MMemStore = struct {
+    /**
+     * cells — the written cells, most-recent-write-wins on read.
+     */
+    cells: []MemCell
+}
+
+/**
+ * memstore_new — an empty memory (the interpreter run's seed).
+ *
+ * @return MMemStore  the empty memory
+ */
+fn memstore_new() -> MMemStore { MMemStore { cells = teko::list::empty() } }
+
+/**
+ * mem_get — read the value at `addr`; an address never stored to reads 0.
+ *
+ * @param MMemStore m  the memory to read
+ * @param i128 addr  the address to read
+ * @return i128  the stored value, or 0 if the address was never written
+ */
+fn mem_get(m: MMemStore, addr: i128) -> i128 {
+    mut i: u64 = 0
+    loop {
+        if i >= m.cells.len { break }
+        if m.cells[i].addr == addr { return m.cells[i].val }
+        i++
+    }
+    0 to i128
+}
+
+/**
+ * mem_set — write `val` at `addr`, returning the updated memory (rewrite the
+ * existing cell if present, else append a fresh one — functional, mirrors
+ * `mrf_set`).
+ *
+ * @param MMemStore m  the memory to update
+ * @param i128 addr  the address to write
+ * @param i128 val  the value to store
+ * @return MMemStore  the updated memory
+ */
+fn mem_set(m: MMemStore, addr: i128, val: i128) -> MMemStore {
+    mut found = false
+    mut cells: []MemCell = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.cells.len { break }
+        let c = m.cells[i]
+        if c.addr == addr {
+            cells = teko::list::push(cells, MemCell { addr = addr; val = val })
+            found = true
+        } else {
+            cells = teko::list::push(cells, c)
+        }
+        i++
+    }
+    if !found { cells = teko::list::push(cells, MemCell { addr = addr; val = val }) }
+    MMemStore { cells = cells }
+}
+
+/**
  * MRegFile — the abstract-machine register state: four independent
  * register vectors (GPR/FPR, each virtual and physical), plus the ONE
  * pending compare's operands (`MCmp`/`MCmpImm` set them; the following
@@ -199,6 +286,11 @@ type MRegFile = struct {
      * first compare is an internal error).
      */
     has_flags: bool
+    /**
+     * mem — the abstract-machine memory (A2-4 `MStore`/`MLoad` write/read it;
+     * every other step carries it through unchanged).
+     */
+    mem: MMemStore
 }
 
 /**
@@ -211,6 +303,7 @@ fn mrf_new() -> MRegFile {
     MRegFile {
         gpr_v = iv_new(); fpr_v = iv_new(); gpr_p = iv_new(); fpr_p = iv_new()
         flag_a = 0 to i128; flag_b = 0 to i128; has_flags = false
+        mem = memstore_new()
     }
 }
 
@@ -242,13 +335,13 @@ fn mrf_vec_of(mrf: MRegFile, r: MReg) -> IReg128Vec {
 fn mrf_with_vec(mrf: MRegFile, r: MReg, v: IReg128Vec) -> MRegFile {
     if r.is_phys {
         match r.reg_class {
-            MRegClass::GPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = v; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags }
-            MRegClass::FPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = v; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags }
+            MRegClass::GPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = v; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mrf.mem }
+            MRegClass::FPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = v; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mrf.mem }
         }
     } else {
         match r.reg_class {
-            MRegClass::GPR => MRegFile { gpr_v = v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags }
-            MRegClass::FPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags }
+            MRegClass::GPR => MRegFile { gpr_v = v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mrf.mem }
+            MRegClass::FPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mrf.mem }
         }
     }
 }
@@ -287,7 +380,7 @@ fn mrf_set(mrf: MRegFile, r: MReg, val: i128) -> MRegFile {
  * @return MRegFile  the updated register file
  */
 fn mrf_with_flags(mrf: MRegFile, a: i128, b: i128) -> MRegFile {
-    MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = a; flag_b = b; has_flags = true }
+    MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = a; flag_b = b; has_flags = true; mem = mrf.mem }
 }
 
 /**
@@ -726,13 +819,84 @@ fn out_of_scope(msg: str, mrf: MRegFile) -> MIStep {
 }
 
 /**
+ * mrf_with_mem — a copy of `mrf` with its memory replaced (an `MStore` step),
+ * every register and the pending compare unchanged.
+ *
+ * @param MRegFile mrf  the register file to update
+ * @param MMemStore mem  the replacement memory
+ * @return MRegFile  the updated register file
+ */
+fn mrf_with_mem(mrf: MRegFile, mem: MMemStore) -> MRegFile {
+    MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mem }
+}
+
+/**
+ * frame_slot_addr — the abstract byte address of frame slot `slot`: each slot
+ * owns a wide, non-overlapping window and none maps to 0 (so a frame pointer
+ * is never the null address). The exact value is arbitrary — the harness only
+ * needs store→load round-trips through it to agree, and an `MFrameAddr` for a
+ * given slot always resolves to the same base here.
+ *
+ * @param u32 slot  the frame-slot index
+ * @return i128  the slot's base address
+ */
+fn frame_slot_addr(slot: u32) -> i128 {
+    ((slot to i128) + (1 to i128)) * (65536 to i128)
+}
+
+/**
+ * interp_frame_addr — an `MFrameAddr` step: materialize the slot's base
+ * address into its destination register.
+ *
+ * @param MRegFile mrf  the register file to update
+ * @param MFrameAddr x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_frame_addr(mrf: MRegFile, x: MFrameAddr) -> MIStep {
+    mistep_cont(mrf_set(mrf, x.dst, frame_slot_addr(x.slot)))
+}
+
+/**
+ * interp_load — an `MLoad` step: read memory at `base + #offset` into the
+ * destination register (a never-written address reads 0).
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MLoad x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_load(mrf: MRegFile, x: MLoad) -> MIStep {
+    let base = mrf_get(mrf, x.mem.base)
+    if !base.ok { return mistep_stop(mires_error("minst interp: load base register is undefined"), mrf) }
+    let addr = base.value + (x.mem.offset to i128)
+    mistep_cont(mrf_set(mrf, x.dst, mem_get(mrf.mem, addr)))
+}
+
+/**
+ * interp_store — an `MStore` step: write the source register's value into
+ * memory at `base + #offset`.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MStore x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_store(mrf: MRegFile, x: MStore) -> MIStep {
+    let base = mrf_get(mrf, x.mem.base)
+    let src = mrf_get(mrf, x.src)
+    if !base.ok || !src.ok { return mistep_stop(mires_error("minst interp: store base/src register is undefined"), mrf) }
+    let addr = base.value + (x.mem.offset to i128)
+    mistep_cont(mrf_with_mem(mrf, mem_set(mrf.mem, addr, src.value)))
+}
+
+/**
  * interp_one — execute one `MInst`, dispatching by case (§4 of the isel
  * plan). A2-2's own selections (`MAlu`/`MAluImm`/`MMSub`/`MNeg`/`MCmp`/
  * `MCmpImm`/`MCSet`/`MMovZ`/`MMovK`/`MMovN`/`MMov`/`MRet`) plus A2-3 control
- * flow (`MBranch`/`MBranchCond`/`MCbz`) execute for real; every other case
- * honest-stops, naming either `lir_interp`'s own matching gap (float/bitwise/
- * shift/`INot`/conversions) or the later A2 sub-sub-PR that selects it
- * (memory/rodata: A2-4; calls: A2-5).
+ * flow (`MBranch`/`MBranchCond`/`MCbz`) plus A2-4 memory (`MFrameAddr`/
+ * `MLoad`/`MStore`) execute for real; every other case honest-stops, naming
+ * either `lir_interp`'s own matching gap (float/bitwise/shift/`INot`/
+ * conversions), the symbol relocations `MAdrp`/`MAddLo` (no run-time address
+ * without a linker — golden-dump only), or the later A2 sub-sub-PR that
+ * selects it (calls: A2-5).
  *
  * @param MRegFile mrf  the register file to read/update
  * @param MInst inst  the instruction to execute
@@ -758,11 +922,11 @@ fn interp_one(mrf: MRegFile, inst: MInst) -> MIStep {
         MMov as x => interp_mov(mrf, x)
         MExt => out_of_scope("minst interp: narrow extends are out of the A2-2 run subset (typed memory values land in A2-4)", mrf)
         MCvt => out_of_scope("minst interp: int/float conversions are out of the A2-2 run subset (matches lir interp's own gap)", mrf)
-        MLoad => out_of_scope("minst interp: memory ops are out of the A2-2 run subset (A2-4)", mrf)
-        MStore => out_of_scope("minst interp: memory ops are out of the A2-2 run subset (A2-4)", mrf)
-        MFrameAddr => out_of_scope("minst interp: memory ops are out of the A2-2 run subset (A2-4)", mrf)
-        MAdrp => out_of_scope("minst interp: address materialization is out of the A2-2 run subset (A2-4)", mrf)
-        MAddLo => out_of_scope("minst interp: address materialization is out of the A2-2 run subset (A2-4)", mrf)
+        MLoad as x => interp_load(mrf, x)
+        MStore as x => interp_store(mrf, x)
+        MFrameAddr as x => interp_frame_addr(mrf, x)
+        MAdrp => out_of_scope("minst interp: ADRP is a symbol relocation — a linker-free interp has no run-time address for it (golden-dump only)", mrf)
+        MAddLo => out_of_scope("minst interp: ADD-lo is a symbol relocation — a linker-free interp has no run-time address for it (golden-dump only)", mrf)
         MBranch as x => interp_branch(mrf, x)
         MBranchCond as x => interp_branch_cond(mrf, x)
         MCbz as x => interp_cbz(mrf, x)
