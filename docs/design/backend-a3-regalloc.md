@@ -741,23 +741,23 @@ follow-up: **A4-frame** (prologue/epilogue + `MFrameAddr` offset resolution + sa
 ### 6.2 Loop back-edges are a NAMED honest-stop in A3-2 (named: A3-loop)
 A2's runnable control flow is the acyclic `if`/`match` lowering; a `loop` back-edge makes a live
 range non-contiguous over a strict linear numbering (a use at a program point *before* the
-dominating def), which basic linear-scan mishandles. A3's first cut detects a back-edge (a
-branch/jump target id ≤ the emitting block id) and honest-stops with a named error rather than
+dominating def), which basic linear-scan mishandles. A3 detects a real back-edge as a **retreating
+edge in RPO** (`pos(target) ≤ pos(source)`) and honest-stops with a named error rather than
 mis-allocate (M.3). **Law-first:** an honest-stop that names the deferral beats a silently-wrong
-allocation; the single-block subset A2's interp runs today is provable without loops.
+allocation; the acyclic subset is fully allocated (all `if`/`match` nesting), only true `loop`
+back-edges stop.
 
-> **⚠️ KNOWN OVER-APPROXIMATION (#384 A3 review, 2026-07-09).** The `target id ≤ block id` proxy is
-> only a true back-edge test when block ids are **topological**, which A1 lowering does NOT guarantee:
-> `lower_if_value` allocates the merge block **before** the arm bodies, so a nested `if`/`match` arm's
-> tail block gets a **higher** id than the merge it targets, and `close_arm_to` emits a forward (in
-> CFG) but **backward-in-id** `LJump`. The proxy therefore **false-positives on acyclic nested
-> control flow**, honest-stopping valid `if`/`match`-nested functions — and, worse, the strict linear
-> numbering is itself inverted for such blocks. This is **fail-safe** (an error, never a miscompile)
-> and **currently unreachable in the pipeline** (A3 regalloc is not yet wired into a compile path;
-> single-block fixtures are what ship + are proven). But the doc's earlier claim that "the whole
-> acyclic subset is provable" was too strong — it holds only for the **single-block** subset. Precise
-> back-edge detection (topological block numbering, or DFS/dominance) is a **prerequisite before
-> regalloc is wired in (A4/D)** and is tracked as its own follow-up.
+> **✅ RESOLVED by #443 (RPO position back-edge test), 2026-07-09.** The earlier `target id ≤ block
+> id` proxy was only a true back-edge test when block ids were topological, which A1 lowering does
+> NOT guarantee (`lower_if_value` allocates the merge block before the arm bodies, so a nested arm's
+> tail gets a higher id than the merge it targets → a backward-in-id but forward-in-CFG `LJump`). The
+> proxy therefore false-positived on acyclic nested control flow AND the strict linear numbering was
+> itself inverted for such blocks. **Fix (#443):** `regalloc_func` computes an RPO block order once
+> (`rpo_block_order`) and threads it — `number_insts` flattens in RPO (so every def precedes its uses;
+> the inversion is gone) and `has_back_edge` tests RPO position (so acyclic nesting has no retreating
+> edge and allocates, while a real `loop` latch→header still retreats and honest-stops). Renumber, not
+> reorder: block ids + `MFunc.blocks` order + branch targets are untouched, so the interp is provably
+> unaffected. See `docs/design/backend-443-rpo-numbering.md`.
 
 Named follow-up: **A3-loop** — live-range holes / interval union over back-edges (the
 standard linear-scan-with-holes extension), landed when A1/A2 exercise `loop` end-to-end through the

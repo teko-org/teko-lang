@@ -21,24 +21,205 @@ pub type NumberedInst = struct {
 }
 
 /**
- * number_insts — flatten `f`'s blocks into one linearly-numbered instruction
- * stream in block order (§3.1). Every later pass (interval computation, the
- * scan, the rewrite) indexes liveness by these points.
+ * u32_in — whether `list` contains `x`.
+ *
+ * @param []u32 list  the list to search
+ * @param u32 x  the value to find
+ * @return bool  true iff `x` is present
+ */
+fn u32_in(list: []u32, x: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        if list[i] == x { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * reverse_u32 — `list` reversed (post-order becomes reverse-post-order).
+ *
+ * @param []u32 list  the list to reverse
+ * @return []u32  the reversed list
+ */
+fn reverse_u32(list: []u32) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = list.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        out = teko::list::push(out, list[i])
+    }
+    out
+}
+
+/**
+ * block_insts_of — the instruction list of `f`'s block with id `id`, or the
+ * empty list if no such block (a defensive default; every real target names a
+ * present block).
+ *
+ * @param MFunc f  the function to search
+ * @param u32 id  the block id
+ * @return []MInst  the block's instructions, or empty
+ */
+fn block_insts_of(f: MFunc, id: u32) -> []MInst {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id == id { return f.blocks[i].insts }
+        i++
+    }
+    teko::list::empty()
+}
+
+/**
+ * block_successors — the CFG successors of `f`'s block `id`: every distinct
+ * terminator target in the block (a block ends in up to two terminators — a
+ * conditional `MBranchCond`/`MCbz` plus a trailing unconditional `MBranch`).
+ * Collected in instruction order for a deterministic RPO (M.2).
+ *
+ * @param MFunc f  the function
+ * @param u32 id  the block whose successors to enumerate
+ * @return []u32  the distinct successor block ids, in terminator order
+ */
+fn block_successors(f: MFunc, id: u32) -> []u32 {
+    let insts = block_insts_of(f, id)
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= insts.len { break }
+        let t = terminator_target(insts[i])
+        if t.has { out = add_unique_u32(out, t.target) }
+        i++
+    }
+    out
+}
+
+/**
+ * RpoState — the fold state of the post-order DFS: the ids already visited and
+ * the post-order accumulator (a block is appended after all its successors).
+ *
+ * @since #443
+ */
+type RpoState = struct {
+    /**
+     * visited — the block ids the DFS has already entered.
+     */
+    visited: []u32
+    /**
+     * post — the post-order sequence so far (reversed to RPO by the driver).
+     */
+    post: []u32
+}
+
+/**
+ * rpo_visit — the post-order DFS step: enter `id` (once), recurse into every
+ * successor in order, then append `id` to the post-order. Threads the visited
+ * set + accumulator functionally so no block is entered twice (the recursion
+ * is bounded by CFG nesting depth, small for structured control flow).
+ *
+ * @param MFunc f  the function whose CFG is walked
+ * @param u32 id  the block id to visit
+ * @param RpoState st  the visited set + post-order so far
+ * @return RpoState  the updated visited set + post-order
+ */
+fn rpo_visit(f: MFunc, id: u32, st: RpoState) -> RpoState {
+    if u32_in(st.visited, id) { return st }
+    let succs = block_successors(f, id)
+    mut cur = RpoState { visited = teko::list::push(st.visited, id); post = st.post }
+    mut i: u64 = 0
+    loop {
+        if i >= succs.len { break }
+        cur = rpo_visit(f, succs[i], cur)
+        i++
+    }
+    RpoState { visited = cur.visited; post = teko::list::push(cur.post, id) }
+}
+
+/**
+ * append_unvisited — `order` extended with any of `f`'s block ids not already
+ * present, in block-list order. Keeps the numbering TOTAL: an unreachable
+ * block (never reached from entry) still receives program points so no vreg is
+ * left un-numbered. Reachable functions are unchanged.
+ *
+ * @param MFunc f  the function
+ * @param []u32 order  the reachable-block order so far
+ * @return []u32  the order extended with any unreachable block ids
+ */
+fn append_unvisited(f: MFunc, order: []u32) -> []u32 {
+    mut out = order
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let bid = f.blocks[i].id
+        if !u32_in(out, bid) { out = teko::list::push(out, bid) }
+        i++
+    }
+    out
+}
+
+/**
+ * rpo_block_order — the reverse-post-order block-id sequence of `f`, entry
+ * first: a topological linearization of the acyclic CFG (a real `loop`
+ * back-edge is the one retreating edge, detected by position, §3). The
+ * numbering + back-edge coordinate the allocator indexes by, replacing the
+ * allocation-order id proxy (#443). Unreachable blocks are appended last so
+ * the order covers every block.
  *
  * @param MFunc f  the selected function
- * @return []NumberedInst  the flattened, numbered stream
+ * @return []u32  the RPO block-id order (entry first)
  */
-fn number_insts(f: MFunc) -> []NumberedInst {
+fn rpo_block_order(f: MFunc) -> []u32 {
+    if f.blocks.len == 0 { return teko::list::empty() }
+    let entry = f.blocks[0].id
+    let st = rpo_visit(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() })
+    append_unvisited(f, reverse_u32(st.post))
+}
+
+/**
+ * block_pos — the position of block id `id` in the RPO `order` (its liveness
+ * rank), or `order.len` if absent (a defensive default — an absent target
+ * looks like the last position, never a spurious back-edge).
+ *
+ * @param []u32 order  the RPO block-id order
+ * @param u32 id  the block id to rank
+ * @return u32  the 0-based RPO position, or `order.len`
+ */
+fn block_pos(order: []u32, id: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= order.len { break }
+        if order[i] == id { return i to u32 }
+        i++
+    }
+    order.len to u32
+}
+
+/**
+ * number_insts — flatten `f`'s blocks into one linearly-numbered instruction
+ * stream in RPO block order (§3.1). RPO is a topological order of the acyclic
+ * CFG, so every def precedes all its uses — the inversion the allocation-order
+ * flattening produced for a nested `if`/`match` merge is gone (#443). Every
+ * later pass (interval computation, the scan, the rewrite) indexes liveness by
+ * these points.
+ *
+ * @param MFunc f  the selected function
+ * @param []u32 order  the RPO block-id order (from `rpo_block_order`)
+ * @return []NumberedInst  the flattened, RPO-numbered stream
+ */
+fn number_insts(f: MFunc, order: []u32) -> []NumberedInst {
     mut out: []NumberedInst = teko::list::empty()
     mut p: u32 = 0
     mut bi: u64 = 0
     loop {
-        if bi >= f.blocks.len { break }
-        let b = f.blocks[bi]
+        if bi >= order.len { break }
+        let bid = order[bi]
+        let insts = block_insts_of(f, bid)
         mut ii: u64 = 0
         loop {
-            if ii >= b.insts.len { break }
-            out = teko::list::push(out, NumberedInst { point = p; block_id = b.id; inst = b.insts[ii] })
+            if ii >= insts.len { break }
+            out = teko::list::push(out, NumberedInst { point = p; block_id = bid; inst = insts[ii] })
             p = p + 1
             ii++
         }
@@ -395,21 +576,26 @@ fn terminator_target(inst: MInst) -> TargetOpt {
 }
 
 /**
- * has_back_edge — whether any branch/jump targets a block id at-or-before its
- * own (a loop). A3-2's first cut honest-stops on a back-edge (§6.2): a strict
- * linear numbering cannot represent a live range wrapping a back-edge without
- * interval holes, deferred to the A3-loop follow-up.
+ * has_back_edge — whether any terminator is a RETREATING edge in RPO
+ * (`pos(target) <= pos(source)`): the exact loop test on a reducible CFG (§3).
+ * An acyclic nested `if`/`match` has no retreating edge (all forward in RPO),
+ * so it no longer false-positives; a real `loop` latch→header edge retreats
+ * and still honest-stops (A3-loop deferral, §6.2). Replaces the
+ * allocation-order id proxy (#443).
  *
  * @param []NumberedInst stream  the numbered stream
- * @return bool  true iff a back-edge is present
+ * @param []u32 order  the RPO block-id order
+ * @return bool  true iff a retreating (back-)edge is present
  */
-fn has_back_edge(stream: []NumberedInst) -> bool {
+fn has_back_edge(stream: []NumberedInst, order: []u32) -> bool {
     mut i: u64 = 0
     loop {
         if i >= stream.len { break }
         let ni = stream[i]
         let t = terminator_target(ni.inst)
-        if t.has && t.target <= ni.block_id { return true }
+        if t.has {
+            if block_pos(order, t.target) <= block_pos(order, ni.block_id) { return true }
+        }
         i++
     }
     false
@@ -642,16 +828,17 @@ fn phys_intervals(events: []RegEvent, r: MReg, stream: []NumberedInst, call_poin
 }
 
 /**
- * compute_intervals — the §3.2 liveness pass: one walk of the numbered stream
- * driven by the §1.1 def/use table, producing the virtual intervals to color
- * and the fixed pin intervals to block. Honest-stops on a loop back-edge
- * (§6.2, the A3-loop follow-up).
+ * compute_intervals — the §3.2 liveness pass: one walk of the RPO-numbered
+ * stream driven by the §1.1 def/use table, producing the virtual intervals to
+ * color and the fixed pin intervals to block. Honest-stops on a real loop
+ * back-edge (§6.2, the A3-loop follow-up), detected by RPO position (#443).
  *
- * @param []NumberedInst stream  the numbered instruction stream
+ * @param []NumberedInst stream  the RPO-numbered instruction stream
+ * @param []u32 order  the RPO block-id order (for the back-edge test)
  * @return IntervalSet | error  the computed intervals, or the back-edge stop
  */
-fn compute_intervals(stream: []NumberedInst) -> IntervalSet | error {
-    if has_back_edge(stream) {
+fn compute_intervals(stream: []NumberedInst, order: []u32) -> IntervalSet | error {
+    if has_back_edge(stream, order) {
         return error { message = "regalloc: a loop back-edge needs live-range holes over the strict linear numbering — deferred to the A3-loop follow-up (§6.2)" }
     }
     let events = collect_events(stream)
@@ -1620,18 +1807,20 @@ pub fn all_physical(f: MFunc) -> bool {
 }
 
 /**
- * regalloc_func — allocate one function end-to-end: number, compute intervals,
- * scan, rewrite. Returns a NAMED honest-stop error on a loop back-edge (§6.2,
- * via `compute_intervals`) or on an FPR-value spill (A3 lowers GPR spills
- * only).
+ * regalloc_func — allocate one function end-to-end: RPO-order, number, compute
+ * intervals, scan, rewrite. Returns a NAMED honest-stop error on a real loop
+ * back-edge (§6.2, via `compute_intervals`) or on an FPR-value spill (A3 lowers
+ * GPR spills only). The RPO order is computed once and threaded so the
+ * numbering and the back-edge test share one topological linearization (#443).
  *
  * @param AbiDescriptor abi  the register file
  * @param MFunc f  the selected function (virtual MRegs + ABI pins)
  * @return MFunc | error  the fully-colored function, or a named honest-stop
  */
 pub fn regalloc_func(abi: AbiDescriptor, f: MFunc) -> MFunc | error {
-    let numbered = number_insts(f)
-    let ivals = match compute_intervals(numbered) {
+    let order = rpo_block_order(f)
+    let numbered = number_insts(f, order)
+    let ivals = match compute_intervals(numbered, order) {
         IntervalSet as s => s
         error as e => return e
     }
