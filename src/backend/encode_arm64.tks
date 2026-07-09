@@ -1446,3 +1446,323 @@ pub fn encode_inst_word(layout: FrameLayout, inst: MInst) -> EncWord | error {
         MRet => encode_ret()
     }
 }
+
+/**
+ * Reloc — one symbol relocation the object writer (A4-4) turns into a Mach-O
+ * `relocation_info` entry: the byte offset within the function's `__text` image
+ * (module-rebased at assembly) where the fixup applies, the target symbol's
+ * already-final name, and which `MRelocKind` field it patches. A2 pre-tags every
+ * symbol reference with its kind (`minst.tks:42`), so A4 owes no analysis — one
+ * `Reloc` per `MAdrp`/`MAddLo`/`MCall`.
+ *
+ * @since #385 A4-3
+ */
+pub type Reloc = struct {
+    /**
+     * offset — the byte offset of the relocated instruction word, relative to
+     * this function's `__text` base (word index times 4).
+     */
+    offset: u32
+    /**
+     * sym — the target symbol's final name (unprefixed; the writer adds `_`).
+     */
+    sym: str
+    /**
+     * kind — which ARM64 relocation this instruction owes (PAGE21/PAGEOFF12/
+     * BRANCH26).
+     */
+    kind: MRelocKind
+}
+
+/**
+ * EncodedFunc — one function lowered to machine bytes: its already-final symbol,
+ * its `__text` words in layout order (prologue ++ every block's encoded
+ * instructions ++ epilogues, with intra-function branch displacements resolved),
+ * and its function-relative symbol relocations (offsets rebased to the module
+ * `__text` at assembly, A4-4). The function's byte size is `words.len * 4`.
+ *
+ * @since #385 A4-3
+ */
+pub type EncodedFunc = struct {
+    /**
+     * symbol — the function's already-final symbol (unprefixed).
+     */
+    symbol: str
+    /**
+     * words — the encoded instruction stream, in layout order (u32 words,
+     * flattened little-endian by the module writer in A4-4).
+     */
+    words: []u32
+    /**
+     * relocs — the symbol relocations, offsets relative to this function's
+     * `__text` base.
+     */
+    relocs: []Reloc
+}
+
+/**
+ * BlockOffset — one machine block's starting word index in the function's
+ * emitted stream, keyed by the block's id. The branch-patch pass looks a
+ * displacement target up here; ids are non-topological after #443, so a keyed
+ * lookup (not a positional index) is required.
+ *
+ * @since #385 A4-3
+ */
+type BlockOffset = struct {
+    /**
+     * id — the machine block's id (an `MBranch`/`MBranchCond`/`MCbz` target).
+     */
+    id: u32
+    /**
+     * word — the block's starting word index in the emitted stream.
+     */
+    word: u32
+}
+
+/**
+ * honest_farbranch — the named honest-stop for a branch displacement that does
+ * not fit its instruction field (imm26 = ±128 MB for B, imm19 = ±1 MB for
+ * B.cond/CBZ/CBNZ). Real functions are tiny, so this is an internal-invariant
+ * guard — reached only by a pathological (constructed) input, never silently
+ * mis-encoded.
+ *
+ * @return error  the `A4-farbranch` named honest-stop
+ */
+fn honest_farbranch() -> error {
+    error { message = "A4-farbranch: branch displacement out of the imm26/imm19 field range (internal invariant — real functions are tiny)" }
+}
+
+/**
+ * honest_badblock — the named honest-stop for a branch whose target block id is
+ * absent from the function's block set. An internal-invariant guard: isel/
+ * regalloc only emit branches to real blocks, so a miss means a malformed
+ * `MFunc`, caught here rather than encoded to a wrong displacement.
+ *
+ * @return error  the `A4-badblock` named honest-stop
+ */
+fn honest_badblock() -> error {
+    error { message = "A4-badblock: branch target block id not found in the function (internal invariant)" }
+}
+
+/**
+ * imm26_fits — whether a word-displacement fits the signed 26-bit B field
+ * (`[-2^25, 2^25-1]`, i.e. ±128 MB in bytes).
+ *
+ * @param i64 disp_words  the target-minus-here displacement in whole words
+ * @return bool  true iff it is encodable in imm26
+ */
+fn imm26_fits(disp_words: i64) -> bool {
+    (disp_words >= ((0 to i64) - (33554432 to i64))) && (disp_words <= (33554431 to i64))
+}
+
+/**
+ * imm19_fits — whether a word-displacement fits the signed 19-bit B.cond/CBZ
+ * field (`[-2^18, 2^18-1]`, i.e. ±1 MB in bytes).
+ *
+ * @param i64 disp_words  the target-minus-here displacement in whole words
+ * @return bool  true iff it is encodable in imm19
+ */
+fn imm19_fits(disp_words: i64) -> bool {
+    (disp_words >= ((0 to i64) - (262144 to i64))) && (disp_words <= (262143 to i64))
+}
+
+/**
+ * twos_field — the low `bits`-wide two's-complement encoding of a signed
+ * word-displacement, computed WITHOUT casting a negative `i64` through `to u32`
+ * (that overflow-checks and panics): a non-negative value narrows directly, a
+ * negative value of magnitude `m` becomes `2^bits - m` within the field. The
+ * caller has already range-checked `disp_words`, so `2^bits - m` never
+ * underflows.
+ *
+ * @param i64 disp_words  the in-range signed displacement in whole words
+ * @param u32 bits  the field width (26 for B, 19 for B.cond/CBZ)
+ * @return u32  the field's `bits`-wide two's-complement value
+ */
+fn twos_field(disp_words: i64, bits: u32) -> u32 {
+    let modulus = (1 to u32) << bits
+    let mask = modulus - (1 to u32)
+    if disp_words >= (0 to i64) {
+        return (disp_words to u32) & mask
+    }
+    let mag = ((0 to i64) - disp_words) to u32
+    (modulus - mag) & mask
+}
+
+/**
+ * branch_disp_field — the OR-mask a resolved intra-function branch contributes
+ * to its word: for form 0 (B, imm26) the two's-complement displacement in bits
+ * 0-25; for form 1 (B.cond/CBZ, imm19) the displacement in bits 5-23. A
+ * displacement outside the field raises the `A4-farbranch` honest-stop.
+ *
+ * @param i64 disp_words  the target-minus-here displacement in whole words
+ * @param u32 form  the displacement field selector (0=imm26, 1=imm19)
+ * @return u32 | error  the OR-mask, or the `A4-farbranch` honest-stop
+ */
+fn branch_disp_field(disp_words: i64, form: u32) -> u32 | error {
+    if form == (0 to u32) {
+        if !imm26_fits(disp_words) { return honest_farbranch() }
+        return twos_field(disp_words, 26 to u32)
+    }
+    if !imm19_fits(disp_words) { return honest_farbranch() }
+    twos_field(disp_words, 19 to u32) << (5 to u32)
+}
+
+/**
+ * lookup_block_offset — the starting word index of the block whose id is `id`,
+ * or the `A4-badblock` honest-stop when no such block was emitted. A linear scan
+ * of the (tiny) per-function offset table, since block ids are non-topological.
+ *
+ * @param []BlockOffset offsets  the recorded per-block starting word indices
+ * @param u32 id  the target block id
+ * @return u32 | error  the block's starting word index, or `A4-badblock`
+ */
+fn lookup_block_offset(offsets: []BlockOffset, id: u32) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= offsets.len { break }
+        let bo = offsets[i]
+        if bo.id == id { return bo.word }
+        i++
+    }
+    honest_badblock()
+}
+
+/**
+ * wrap_plain_words — append each raw instruction word of `ws` to the `EncWord`
+ * stream as a position-independent `plain_word` (the prologue/epilogue expansion
+ * carries no branch or reloc fixup).
+ *
+ * @param []EncWord acc0  the `EncWord` stream to extend
+ * @param []u32 ws  the raw instruction words to append
+ * @return []EncWord  `acc0` followed by each word wrapped as a plain `EncWord`
+ */
+fn wrap_plain_words(acc0: []EncWord, ws: []u32) -> []EncWord {
+    mut acc = acc0
+    mut i: u64 = 0
+    loop {
+        if i >= ws.len { break }
+        acc = teko::list::push(acc, plain_word(ws[i]))
+        i++
+    }
+    acc
+}
+
+/**
+ * encode_one — append one instruction's `EncWord`(s) to the stream: an `MRet`
+ * expands to the frame epilogue words (A4-2 left it bare) followed by the RET
+ * word; every other instruction encodes to its single `EncWord` via
+ * `encode_inst_word`. Any named honest-stop propagates out.
+ *
+ * @param FrameLayout layout  the enclosing function's resolved frame
+ * @param []EncWord words0  the `EncWord` stream to extend
+ * @param MInst inst  the instruction to encode
+ * @return []EncWord | error  the extended stream, or a named honest-stop
+ */
+fn encode_one(layout: FrameLayout, words0: []EncWord, inst: MInst) -> []EncWord | error {
+    if inst_is_ret(inst) {
+        let epi = match emit_epilogue(layout) { []u32 as w => w; error as e => return e }
+        let after = wrap_plain_words(words0, epi)
+        return teko::list::push(after, encode_ret())
+    }
+    let ew = match encode_inst_word(layout, inst) { EncWord as x => x; error as e => return e }
+    teko::list::push(words0, ew)
+}
+
+/**
+ * encode_block_words — append every instruction of one block to the `EncWord`
+ * stream, in order, expanding `MRet` as `encode_one` does. Any named honest-stop
+ * propagates out.
+ *
+ * @param FrameLayout layout  the enclosing function's resolved frame
+ * @param []EncWord words0  the `EncWord` stream to extend
+ * @param MBlock blk  the block whose instructions to encode
+ * @return []EncWord | error  the extended stream, or a named honest-stop
+ */
+fn encode_block_words(layout: FrameLayout, words0: []EncWord, blk: MBlock) -> []EncWord | error {
+    mut words = words0
+    mut i: u64 = 0
+    loop {
+        if i >= blk.insts.len { break }
+        words = match encode_one(layout, words, blk.insts[i]) { []EncWord as w => w; error as e => return e }
+        i++
+    }
+    words
+}
+
+/**
+ * resolve_word — the final u32 of one emitted `EncWord`: a position-independent
+ * or symbol-reference word is returned as-is (the reloc placeholder stays; the
+ * linker patches it), a branch word gets its displacement patched from the
+ * recorded block offsets (`disp = target_offset - here`, in whole words). A
+ * missing target or an out-of-field displacement raises a named honest-stop.
+ *
+ * @param EncWord ew  the emitted word
+ * @param u32 here  this word's own index in the function's stream
+ * @param []BlockOffset offsets  the recorded per-block starting word indices
+ * @return u32 | error  the resolved word, or a named honest-stop
+ */
+fn resolve_word(ew: EncWord, here: u32, offsets: []BlockOffset) -> u32 | error {
+    if !ew.has_branch { return ew.word }
+    let target_off = match lookup_block_offset(offsets, ew.target) { u32 as v => v; error as e => return e }
+    let disp_words = (target_off to i64) - (here to i64)
+    let field = match branch_disp_field(disp_words, ew.branch_form) { u32 as v => v; error as e => return e }
+    ew.word | field
+}
+
+/**
+ * finalize_func — the patch pass: resolve every emitted `EncWord` to its final
+ * word (patching branch displacements from the recorded block offsets) and
+ * collect one `Reloc` per symbol-reference word (its offset the word index times
+ * 4). Produces the `EncodedFunc` hand-off to the A4-4 Mach-O writer.
+ *
+ * @param str symbol  the function's already-final symbol
+ * @param []EncWord words  the emitted `EncWord` stream (prologue ++ blocks)
+ * @param []BlockOffset offsets  the recorded per-block starting word indices
+ * @return EncodedFunc | error  the encoded function, or a named honest-stop
+ */
+fn finalize_func(symbol: str, words: []EncWord, offsets: []BlockOffset) -> EncodedFunc | error {
+    mut out_words: []u32 = teko::list::empty()
+    mut relocs: []Reloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= words.len { break }
+        let ew = words[i]
+        let w = match resolve_word(ew, i to u32, offsets) { u32 as v => v; error as e => return e }
+        out_words = teko::list::push(out_words, w)
+        if ew.has_reloc {
+            relocs = teko::list::push(relocs, Reloc { offset = (i to u32) * (4 to u32); sym = ew.reloc_sym; kind = ew.reloc_kind })
+        }
+        i++
+    }
+    EncodedFunc { symbol = symbol; words = out_words; relocs = relocs }
+}
+
+/**
+ * encode_func — lower one fully-colored `MFunc` to an `EncodedFunc`: compute its
+ * frame layout (A4-2), prepend the prologue, encode every block in `f.blocks`
+ * order (RPO after #443) recording each block's starting word index, expand
+ * `MFrameAddr`/`MRet`, then resolve intra-function branch displacements from the
+ * recorded offsets and collect the symbol relocations. Arm64 is fixed-width, so
+ * block offsets are exact after one encode pass — no branch relaxation. Any
+ * instruction's named honest-stop propagates out unchanged.
+ *
+ * @param AbiDescriptor abi  the register file (for the callee-saved save-set)
+ * @param MFunc f  the fully-physical function
+ * @return EncodedFunc | error  the encoded function, or a named honest-stop
+ */
+pub fn encode_func(abi: AbiDescriptor, f: MFunc) -> EncodedFunc | error {
+    let layout = compute_frame_layout(abi, f)
+    let pro_words = match emit_prologue(layout) { []u32 as w => w; error as e => return e }
+    mut words: []EncWord = wrap_plain_words(teko::list::empty(), pro_words)
+    mut offsets: []BlockOffset = teko::list::empty()
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let blk = f.blocks[bi]
+        let off = words.len to u32
+        offsets = teko::list::push(offsets, BlockOffset { id = blk.id; word = off })
+        words = match encode_block_words(layout, words, blk) { []EncWord as w => w; error as e => return e }
+        bi++
+    }
+    finalize_func(f.symbol, words, offsets)
+}
