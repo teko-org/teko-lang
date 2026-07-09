@@ -1495,3 +1495,76 @@ fn l_block_offsets() -> []BlockOffset {
 fn l_encwords() -> []EncWord {
     teko::list::empty()
 }
+
+#test
+/**
+ * framed_branch_crosses_expanded_epilogue — the review-flagged expansion-shift
+ * guard: a FRAMED function whose early-return block (non-last) expands `MRet`
+ * into epilogue+RET, with a forward `b.eq` crossing that whole expansion. The
+ * assertion is structural (not tautological): the word AT `branch + disp`
+ * must BE the target block's distinctive first instruction (`movz x0,#7`),
+ * proving the branch lands past the expanded epilogue, not inside it.
+ *
+ * @return void
+ */
+fn framed_branch_crosses_expanded_epilogue() {
+    let b0 = mblock(0 to u32, i3(mov_inst(true, p(19), p(0)), cmp_inst(true, p(0), p(1)), branch_cond_inst(MCond::EQ, 5 to u32)))
+    let b1 = mblock(2 to u32, i2(movz_inst(true, p(0), 1, 0), ret_inst()))
+    let b2 = mblock(5 to u32, i2(movz_inst(true, p(0), 7, 0), ret_inst()))
+    let e = ef(func_blocks(bl3(b0, b1, b2)))
+    teko::assert::is_true(e.words.len == 17)
+    mut bi: u64 = 0
+    mut found: bool = false
+    mut i: u64 = 0
+    loop {
+        if i >= e.words.len { break }
+        if (e.words[i] >> 24) == (0x54 to u32) {
+            bi = i
+            found = true
+            break
+        }
+        i++
+    }
+    teko::assert::is_true(found)
+    let disp = (e.words[bi] >> 5) & (0x7FFFF to u32)
+    teko::assert::is_true(disp > (0 to u32))
+    teko::assert::is_true(e.words[bi + (disp to u64)] == (0xD28000E0 to u32))
+}
+
+#test
+/**
+ * branch_disp_field_extremes_encode — the review-flagged half-pinned boundary:
+ * the LAST in-range values on both sides must ENCODE (a `>=`→`>` typo at the
+ * negative extreme would silently reject them): imm26 accepts ±(-2^25 /
+ * 2^25-1), imm19 accepts ±(-2^18 / 2^18-1), with the exact two's-complement
+ * fields.
+ *
+ * @return void
+ */
+fn branch_disp_field_extremes_encode() {
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(33554432 to i64), 0 to u32)) == (0x2000000 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(33554431 to i64, 0 to u32)) == (0x1FFFFFF to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(262144 to i64), 1 to u32)) == (0x800000 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(262143 to i64, 1 to u32)) == (0x7FFFE0 to u32))
+}
+
+#test
+/**
+ * reloc_offset_includes_prologue — the review-flagged A4-4 hand-off property:
+ * in a FRAMED function (call + ret forces the FP/LR frame) the `Reloc.offset`
+ * must point AT the BL placeholder word in the full stream — i.e. it includes
+ * the prologue shift (`words[offset/4] == 0x94000000`), so A4-4's module
+ * concatenation rebases from the right base.
+ *
+ * @return void
+ */
+fn reloc_offset_includes_prologue() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i2(call_inst("helper", no_uses, p(0), false, false), ret_inst())
+    let e = ef(func_of(l_frame(), insts))
+    teko::assert::is_true(e.relocs.len == 1)
+    let r = e.relocs[0]
+    teko::assert::is_true(r.offset > (0 to u32))
+    teko::assert::is_true(e.words[(r.offset / (4 to u32)) to u64] == (0x94000000 to u32))
+    teko::assert::is_true(r.sym == "helper")
+}
