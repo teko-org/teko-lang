@@ -14,6 +14,16 @@ on:
 permissions:
   contents: read
 
+# Sub-sub-PRs (a PR whose base is a `fix/issue-*` mini-umbrella) build the WHOLE corpus
+# under the sanitizer — the COMPILER's own memory safety is exercised end-to-end over
+# every source file — but skip RUNNING the native #test suite under it, which is the
+# expensive part. That keeps the high-value guard (our hand-written arena/memory code,
+# checked as the sanitized compiler compiles the corpus) while cutting the per-slice cost.
+# On the umbrella/main push (empty flag) the full suite runs under the sanitizer, so any
+# codegen UB in the generated C is caught before the wave ships. See the CI-perf model.
+env:
+  VERIFY_FLAG: ${{ (github.event_name == 'pull_request' && startsWith(github.base_ref, 'fix/issue-')) && '--no-verify' || '' }}
+
 jobs:
   # ── path filter ──────────────────────────────────────────────────────────────
   changes:
@@ -68,7 +78,7 @@ jobs:
       - name: Build gen1 under ASan + UBSan (cc wrapper)
         run: |
           sh scripts/ci_cc_wrap.sh "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          teko . -o bin
+          teko . -o bin $VERIFY_FLAG
 
       # This lane runs the NATIVE gate (`./bin/teko . -o gen2-asan`): the sanitized gen1 compiles the
       # whole project through the PRODUCTION native pipeline (front-end -> emitted C -> host cc ->
@@ -100,7 +110,7 @@ jobs:
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=0:quarantine_size_mb=64:malloc_context_size=5
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./bin/teko . -o gen2-asan
+        run: ./bin/teko . -o gen2-asan $VERIFY_FLAG
 
       # The native gate above already ASan-covers the whole native BUILD pipeline (tk_emit_c /
       # cg_lift_program / tk_emit_tsym / run_cc) — that heavy allocation traffic through the arena is
@@ -182,7 +192,7 @@ jobs:
       - name: Build gen1 under TSan (cc wrapper)
         run: |
           sh scripts/ci_cc_wrap.sh "-fsanitize=thread -fno-omit-frame-pointer -g"
-          teko . -o bin
+          teko . -o bin $VERIFY_FLAG
 
       # SMOKE (not the full suite — see the BUILD + SMOKE rationale above; RESTORE the
       # full `teko test .` gate under TSan as the concurrency surface lands). Build ONE

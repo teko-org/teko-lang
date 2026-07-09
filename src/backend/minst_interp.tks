@@ -314,17 +314,19 @@ fn seed_params(mrf0: MRegFile, args: []i128) -> MRegFile {
  * MIResult — one instruction's outcome. `tag` selects: 0 = CONTINUE (the
  * block loop advances, never surfaced to the caller), 1 = RETURN (an
  * `MRet` carrying the function's result), 2 = ERROR (an out-of-subset
- * instruction reached at "runtime").
+ * instruction reached at "runtime"), 3 = JUMP (a taken branch to another
+ * block, its target id carried in `value` — A2-3).
  *
  * @since #383 A2-2
  */
 type MIResult = struct {
     /**
-     * tag — which outcome this is (0/1/2, see the type doc).
+     * tag — which outcome this is (0/1/2/3, see the type doc).
      */
     tag: u32
     /**
-     * value — the RETURN outcome's carried value (0 otherwise).
+     * value — the RETURN outcome's carried value, or the JUMP outcome's
+     * target block id (0 otherwise).
      */
     value: i128
     /**
@@ -371,6 +373,24 @@ fn is_micontinue(r: MIResult) -> bool { r.tag == 0 }
  * @return bool  whether it is RETURN
  */
 fn is_mireturn(r: MIResult) -> bool { r.tag == 1 }
+
+/**
+ * mires_jump — a taken branch to another block (`MBranch`, or the taken edge
+ * of an `MBranchCond`/`MCbz`), carrying the target block id.
+ *
+ * @param u32 target  the destination block id
+ * @return MIResult  the JUMP outcome
+ */
+fn mires_jump(target: u32) -> MIResult { MIResult { tag = 3; value = target to i128; message = "" } }
+
+/**
+ * is_mijump — true iff `r` is a JUMP outcome (control transfers to another
+ * block).
+ *
+ * @param MIResult r  the outcome to test
+ * @return bool  whether it is JUMP
+ */
+fn is_mijump(r: MIResult) -> bool { r.tag == 3 }
 
 /**
  * MIStep — one instruction's effect: an `MIResult` + the register file it
@@ -707,12 +727,12 @@ fn out_of_scope(msg: str, mrf: MRegFile) -> MIStep {
 
 /**
  * interp_one — execute one `MInst`, dispatching by case (§4 of the isel
- * plan). A2-2's OWN selections (`MAlu`/`MAluImm`/`MMSub`/`MNeg`/`MCmp`/
- * `MCmpImm`/`MCSet`/`MMovZ`/`MMovK`/`MMovN`/`MMov`/`MRet`) execute for
- * real; every other case honest-stops, naming either `lir_interp`'s own
- * matching gap (float/bitwise/shift/`INot`/conversions) or the later A2
- * sub-sub-PR that selects it (memory/rodata: A2-4; control flow: A2-3;
- * calls: A2-5).
+ * plan). A2-2's own selections (`MAlu`/`MAluImm`/`MMSub`/`MNeg`/`MCmp`/
+ * `MCmpImm`/`MCSet`/`MMovZ`/`MMovK`/`MMovN`/`MMov`/`MRet`) plus A2-3 control
+ * flow (`MBranch`/`MBranchCond`/`MCbz`) execute for real; every other case
+ * honest-stops, naming either `lir_interp`'s own matching gap (float/bitwise/
+ * shift/`INot`/conversions) or the later A2 sub-sub-PR that selects it
+ * (memory/rodata: A2-4; calls: A2-5).
  *
  * @param MRegFile mrf  the register file to read/update
  * @param MInst inst  the instruction to execute
@@ -743,9 +763,9 @@ fn interp_one(mrf: MRegFile, inst: MInst) -> MIStep {
         MFrameAddr => out_of_scope("minst interp: memory ops are out of the A2-2 run subset (A2-4)", mrf)
         MAdrp => out_of_scope("minst interp: address materialization is out of the A2-2 run subset (A2-4)", mrf)
         MAddLo => out_of_scope("minst interp: address materialization is out of the A2-2 run subset (A2-4)", mrf)
-        MBranch => out_of_scope("minst interp: control flow is out of the A2-2 run subset (A2-3)", mrf)
-        MBranchCond => out_of_scope("minst interp: control flow is out of the A2-2 run subset (A2-3)", mrf)
-        MCbz => out_of_scope("minst interp: control flow is out of the A2-2 run subset (A2-3)", mrf)
+        MBranch as x => interp_branch(mrf, x)
+        MBranchCond as x => interp_branch_cond(mrf, x)
+        MCbz as x => interp_cbz(mrf, x)
         MCall => out_of_scope("minst interp: calls are out of the A2-2 run subset (A2-5)", mrf)
         MCallIndirect => out_of_scope("minst interp: calls are out of the A2-2 run subset (A2-5)", mrf)
         MRet => interp_ret(mrf)
@@ -753,26 +773,69 @@ fn interp_one(mrf: MRegFile, inst: MInst) -> MIStep {
 }
 
 /**
- * interp_mblock — run `b`'s instructions in order until a terminal
- * (RETURN/ERROR) outcome; a block that falls off its instruction stream
- * without one is an internal error (A2-2's selector always ends a block in
- * `MRet`).
+ * interp_branch — an `MBranch` step: an unconditional jump to its target
+ * block.
+ *
+ * @param MRegFile mrf  the register file (carried through unchanged)
+ * @param MBranch x  the instruction to execute
+ * @return MIStep  the JUMP outcome
+ */
+fn interp_branch(mrf: MRegFile, x: MBranch) -> MIStep {
+    mistep_stop(mires_jump(x.target), mrf)
+}
+
+/**
+ * interp_branch_cond — an `MBranchCond` step: jump to its target when the
+ * pending compare's flags satisfy `cond`, else fall through to the next
+ * instruction (the unconditional branch to the else edge).
+ *
+ * @param MRegFile mrf  the register file to read
+ * @param MBranchCond x  the instruction to execute
+ * @return MIStep  the JUMP (taken) or CONTINUE (fall-through) outcome
+ */
+fn interp_branch_cond(mrf: MRegFile, x: MBranchCond) -> MIStep {
+    if !mrf.has_flags { return mistep_stop(mires_error("minst interp: branch.cond with no preceding compare (internal)"), mrf) }
+    if cond_holds(x.cond, mrf.flag_a, mrf.flag_b) { mistep_stop(mires_jump(x.target), mrf) } else { mistep_cont(mrf) }
+}
+
+/**
+ * interp_cbz — an `MCbz` step: read the tested register and jump to the
+ * target when its zero-ness matches `zero` (CBZ is `zero=true`, CBNZ is
+ * `zero=false`), else fall through.
+ *
+ * @param MRegFile mrf  the register file to read
+ * @param MCbz x  the instruction to execute
+ * @return MIStep  the JUMP (taken) or CONTINUE (fall-through) outcome
+ */
+fn interp_cbz(mrf: MRegFile, x: MCbz) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    if !a.ok { return mistep_stop(mires_error("minst interp: cbz operand register is undefined"), mrf) }
+    let is_zero = a.value == (0 to i128)
+    if is_zero == x.zero { mistep_stop(mires_jump(x.target), mrf) } else { mistep_cont(mrf) }
+}
+
+/**
+ * run_mblock — run `b`'s instructions in order until a terminal step
+ * (RETURN/ERROR/JUMP), returning that step's outcome AND the register file it
+ * left behind so the block-following driver threads register state from one
+ * block into the next. A block that falls off its stream without a terminator
+ * is an internal error (the selector always ends a block in a terminator).
  *
  * @param MBlock b  the block to execute
  * @param MRegFile mrf0  the entering register file
- * @return MIResult  the block's terminal outcome
+ * @return MIStep  the terminal step (outcome + resulting register file)
  */
-fn interp_mblock(b: MBlock, mrf0: MRegFile) -> MIResult {
+fn run_mblock(b: MBlock, mrf0: MRegFile) -> MIStep {
     mut mrf = mrf0
     mut i: u64 = 0
     loop {
         if i >= b.insts.len { break }
         let step = interp_one(mrf, b.insts[i])
-        if !is_micontinue(step.result) { return step.result }
+        if !is_micontinue(step.result) { return step }
         mrf = step.mrf
         i++
     }
-    mires_error("minst interp: block fell through without a terminator")
+    mistep_stop(mires_error("minst interp: block fell through without a terminator"), mrf)
 }
 
 /**
@@ -820,12 +883,47 @@ fn find_mfunc(m: MModule, sym: str) -> MFuncHit {
 }
 
 /**
- * minst_interp — run the function named `entry` in `m` with `args`,
- * returning the exit code the selected program would produce: a `ret`
- * value from the entry (A2-2 has no `MCall`, so no `tk_exit` unwind is
- * reachable yet); a missing function, an empty function, or any
- * honest-stop yields the same NEGATIVE sentinel `interp_lmodule` uses (-1),
- * so the two oracles compare directly.
+ * MBlockHit — a block-by-id lookup result within a function.
+ *
+ * @since #383 A2-3
+ */
+type MBlockHit = struct {
+    /**
+     * found — whether `block` is a real match.
+     */
+    found: bool
+    /**
+     * block — the matched block (meaningful only when `found`).
+     */
+    block: MBlock
+}
+
+/**
+ * find_mblock — the block of `f` whose id is `block_id`, or `found=false`
+ * (a dangling branch target — an internal error the driver maps to -1).
+ *
+ * @param MFunc f  the function to search
+ * @param u32 block_id  the block id to find
+ * @return MBlockHit  the lookup outcome
+ */
+fn find_mblock(f: MFunc, block_id: u32) -> MBlockHit {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id == block_id { return MBlockHit { found = true; block = f.blocks[i] } }
+        i++
+    }
+    MBlockHit { found = false; block = MBlock { id = 0; params = teko::list::empty(); insts = teko::list::empty() } }
+}
+
+/**
+ * minst_interp — run the function named `entry` in `m` with `args`, following
+ * its control-flow graph block to block from the entry until an `MRet`, and
+ * returning the exit code the selected program would produce. The register
+ * file threads across blocks (block-args arrive as the edge moves that
+ * precede each branch). A missing/empty function, an honest-stop, a dangling
+ * branch target, or a runaway block budget all yield the same NEGATIVE
+ * sentinel `interp_lmodule` uses (-1), so the two oracles compare directly.
  *
  * @param MModule m  the selected module to execute
  * @param str entry  the entry function's symbol
@@ -836,7 +934,18 @@ pub fn minst_interp(m: MModule, entry: str, args: []i128) -> i128 {
     let f = find_mfunc(m, entry)
     if !f.found { return -1 to i128 }
     if f.func.blocks.len == 0 { return -1 to i128 }
-    let mrf = seed_params(mrf_new(), args)
-    let result = interp_mblock(f.func.blocks[0], mrf)
-    if is_mireturn(result) { result.value } else { -1 to i128 }
+    mut mrf = seed_params(mrf_new(), args)
+    mut cur: u32 = f.func.blocks[0].id
+    mut budget: u64 = 0
+    loop {
+        if budget >= 1000000 { break }
+        budget++
+        let hit = find_mblock(f.func, cur)
+        if !hit.found { return -1 to i128 }
+        let step = run_mblock(hit.block, mrf)
+        mrf = step.mrf
+        if is_mireturn(step.result) { return step.result.value }
+        if is_mijump(step.result) { cur = step.result.value to u32 } else { return -1 to i128 }
+    }
+    -1 to i128
 }
