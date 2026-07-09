@@ -1447,11 +1447,151 @@ fn select_branch(ctx0: SelCtx, f: lir::LFunc, br: lir::LBranch) -> SelCtx | erro
 }
 
 /**
+ * mem_size_of — the load/store transfer size for a machine class: B/H/W/X for
+ * the integer widths (and Ptr = X), S/D for f32/f64. An i128 (register-pair
+ * transfer) and an f16 (no single-register size) honest-stop, as does a
+ * void-typed access (malformed).
+ *
+ * @param lir::LType t  the accessed value's machine class
+ * @return MMemSize | error  the transfer size, or a NAMED honest-stop
+ */
+fn mem_size_of(t: lir::LType) -> MMemSize | error {
+    match t {
+        lir::LType::I8 => MMemSize::B
+        lir::LType::I16 => MMemSize::H
+        lir::LType::I32 => MMemSize::W
+        lir::LType::I64 => MMemSize::X
+        lir::LType::Ptr => MMemSize::X
+        lir::LType::F32 => MMemSize::S
+        lir::LType::F64 => MMemSize::D
+        lir::LType::I128 => error { message = "isel arm64: an i128 memory access needs a register-pair transfer, deferred alongside i128 materialization (§6.3)" }
+        lir::LType::F16 => error { message = "isel arm64: an f16 memory access has no single-register transfer size in A2-4" }
+        lir::LType::Void => error { message = "isel arm64: a void-typed memory access is malformed (internal)" }
+    }
+}
+
+/**
+ * select_alloca — the `LAlloca` selection: reserve a frame slot (its index is
+ * the current frame length) and materialize its address with `MFrameAddr`; A3
+ * resolves the slot to an FP/SP displacement. The address is a Ptr (wide GPR).
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LAlloca a  the alloca op (its byte-size/alignment shape)
+ * @return SelCtx  the advanced context
+ */
+fn select_alloca(ctx0: SelCtx, inst: lir::LInst, a: lir::LAlloca) -> SelCtx {
+    let slot = ctx0.func.frame.len to u32
+    let ctx1 = SelCtx { func = append_frame(ctx0.func, a); vinfo = ctx0.vinfo; next_scratch = ctx0.next_scratch; cur_block = ctx0.cur_block; next_block = ctx0.next_block }
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx2 = selctx_set_vinfo(ctx1, inst.result, MRegClass::GPR, true)
+    selctx_emit(ctx2, frame_addr_inst(dst, slot))
+}
+
+/**
+ * select_field_addr — the `LFieldAddr` selection: `ADD dst, base, #offset`
+ * (an `MAluImm`, a Ptr result). The fold of the offset into a following
+ * `MMem` displacement is deferred to A4 so A2's golden dumps stay 1:1 (M.1).
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LFieldAddr fa  the field-address op
+ * @return SelCtx  the advanced context
+ */
+fn select_field_addr(ctx0: SelCtx, inst: lir::LInst, fa: lir::LFieldAddr) -> SelCtx {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    selctx_emit(ctx1, alu_imm_inst(MAluOp::Add, true, dst, vreg(fa.base, MRegClass::GPR), fa.offset to i64))
+}
+
+/**
+ * select_load — the `LLoad` selection: `MLoad{size, sign, dst, [addr, #0]}`,
+ * size + register file from the loaded `ty`. Loads zero-extend (`sign=false`):
+ * a narrow value's own producing `Trunc`/`ZExt`/`SExt` chain already fixed its
+ * class, so the load itself does not re-sign.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LLoad l  the load op
+ * @return SelCtx | error  the advanced context, or a propagated size error
+ */
+fn select_load(ctx0: SelCtx, inst: lir::LInst, l: lir::LLoad) -> SelCtx | error {
+    let size = match mem_size_of(l.ty) { MMemSize as s => s; error as e => return e }
+    let reg_class = mregclass_of_ltype(l.ty)
+    let wide = ltype_is_wide(l.ty)
+    let dst = vreg(inst.result, reg_class)
+    let ctx1 = selctx_set_vinfo(ctx0, inst.result, reg_class, wide)
+    selctx_emit(ctx1, load_inst(size, false, dst, MMem { base = vreg(l.addr, MRegClass::GPR); offset = 0 to i32 }))
+}
+
+/**
+ * select_store — the `LStore` selection: `MStore{size, value, [addr, #0]}`,
+ * size + register file from the stored `ty`. No result VReg.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LStore s  the store op
+ * @return SelCtx | error  the advanced context, or a propagated size error
+ */
+fn select_store(ctx0: SelCtx, s: lir::LStore) -> SelCtx | error {
+    let size = match mem_size_of(s.ty) { MMemSize as sz => sz; error as e => return e }
+    let reg_class = mregclass_of_ltype(s.ty)
+    selctx_emit(ctx0, store_inst(size, vreg(s.value, reg_class), MMem { base = vreg(s.addr, MRegClass::GPR); offset = 0 to i32 }))
+}
+
+/**
+ * select_addr_pair — the shared `ADRP + ADD` relocation pair that
+ * materializes a symbol's address: `MAdrp{dst, sym, hi}` then
+ * `MAddLo{dst, dst, sym, lo}`. `LGlobalAddr` uses the data `PageHi`/`PageLo`
+ * kinds; `LFuncAddr` uses the text `Call` kind (A4 emits the matching reloc).
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param str symbol  the symbol whose address is materialized
+ * @param MRelocKind hi  the ADRP (page-high) relocation kind
+ * @param MRelocKind lo  the ADD (page-low) relocation kind
+ * @return SelCtx  the advanced context
+ */
+fn select_addr_pair(ctx0: SelCtx, inst: lir::LInst, symbol: str, hi: MRelocKind, lo: MRelocKind) -> SelCtx {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    let ctx2 = selctx_emit(ctx1, adrp_inst(dst, symbol, hi))
+    selctx_emit(ctx2, add_lo_inst(dst, dst, symbol, lo))
+}
+
+/**
+ * select_global_addr — the `LGlobalAddr` selection: the data `ADRP + ADD`
+ * relocation pair (`PageHi`/`PageLo`) for a rodata/global symbol.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LGlobalAddr g  the global-address op
+ * @return SelCtx  the advanced context
+ */
+fn select_global_addr(ctx0: SelCtx, inst: lir::LInst, g: lir::LGlobalAddr) -> SelCtx {
+    select_addr_pair(ctx0, inst, g.symbol, MRelocKind::PageHi, MRelocKind::PageLo)
+}
+
+/**
+ * select_func_addr — the `LFuncAddr` selection: the same `ADRP + ADD` pair as
+ * a global address but with the text `Call` relocation kind, so A4 emits a
+ * text-section reloc for the function symbol.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LFuncAddr fa  the function-address op
+ * @return SelCtx  the advanced context
+ */
+fn select_func_addr(ctx0: SelCtx, inst: lir::LInst, fa: lir::LFuncAddr) -> SelCtx {
+    select_addr_pair(ctx0, inst, fa.symbol, MRelocKind::Call, MRelocKind::Call)
+}
+
+/**
  * select_inst — the per-`LOp` dispatch (§3 of the isel plan): the A2-2 core
  * cases (`LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`) plus A2-3
- * control flow (`LJump`/`LBranch`) select; the remaining cases are a NAMED
- * honest-stop naming the sub-sub-PR that covers each (memory/rodata: A2-4;
- * calls: A2-5).
+ * control flow (`LJump`/`LBranch`) plus A2-4 memory (`LAlloca`/`LFieldAddr`/
+ * `LLoad`/`LStore`/`LGlobalAddr`/`LFuncAddr`) select; the remaining cases are a
+ * NAMED honest-stop naming the sub-sub-PR that covers them (the calls
+ * `LCall`/`LCallIndirect`: A2-5).
  *
  * @param SelCtx ctx  the context to extend
  * @param lir::LFunc f  the enclosing function (`LParam` needs its
@@ -1469,13 +1609,13 @@ fn select_inst(ctx: SelCtx, f: lir::LFunc, inst: lir::LInst) -> SelCtx | error {
         lir::LRet as r => select_ret(ctx, r)
         lir::LJump as j => select_jump(ctx, f, j)
         lir::LBranch as br => select_branch(ctx, f, br)
-        lir::LAlloca => error { message = "isel arm64: `alloca` is out of A2-2 scope (memory ops land in A2-4)" }
-        lir::LFieldAddr => error { message = "isel arm64: `field_addr` is out of A2-2 scope (memory ops land in A2-4)" }
-        lir::LLoad => error { message = "isel arm64: `load` is out of A2-2 scope (memory ops land in A2-4)" }
-        lir::LStore => error { message = "isel arm64: `store` is out of A2-2 scope (memory ops land in A2-4)" }
-        lir::LGlobalAddr => error { message = "isel arm64: `global_addr` is out of A2-2 scope (memory/rodata ops land in A2-4)" }
+        lir::LAlloca as a => select_alloca(ctx, inst, a)
+        lir::LFieldAddr as fa => select_field_addr(ctx, inst, fa)
+        lir::LLoad as l => select_load(ctx, inst, l)
+        lir::LStore as s => select_store(ctx, s)
+        lir::LGlobalAddr as g => select_global_addr(ctx, inst, g)
         lir::LCallIndirect => error { message = "isel arm64: `call.indirect` is out of A2-2 scope (calls land in A2-5)" }
-        lir::LFuncAddr => error { message = "isel arm64: `func_addr` is out of A2-2 scope (calls land in A2-5)" }
+        lir::LFuncAddr as fa => select_func_addr(ctx, inst, fa)
         lir::LCall => error { message = "isel arm64: `call` is out of A2-2 scope (calls land in A2-5)" }
     }
 }
