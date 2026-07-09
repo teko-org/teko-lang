@@ -434,16 +434,16 @@ that could desync, and keeps A3's output type frozen (§7, D-A).
 /**
  * FrameLayout — the resolved stack frame of one function: its total 16-aligned
  * byte size, the ordered callee-saved registers to save/restore (re-derived by
- * scanning, §3.1), and the base offset from which `slot_offset` computes each
- * frame slot's SP-relative address. Purely a side-table the encoder reads; the
- * block stream is never rewritten (so the A3 interp oracle stays valid).
+ * scanning, §3.1), and the SP-relative byte offset of EVERY frame slot. Purely
+ * a side-table the encoder reads; the block stream is never rewritten (so the
+ * A3 interp oracle stays valid).
  *
  * @since #385 A4-2
  */
 pub type FrameLayout = struct {
     /**
      * size — the total frame size in bytes, rounded up to 16 (AAPCS64 SP
-     * 16-alignment).
+     * 16-alignment); 0 for a frameless function.
      */
     size: u32
     /**
@@ -456,19 +456,27 @@ pub type FrameLayout = struct {
      */
     saved_fpr: []u32
     /**
-     * slots_base — the SP-relative byte offset where the frame-slot region
-     * begins; `slot k` sits at `slots_base + k * spill_slot_bytes`.
+     * slot_offsets — the SP-relative byte offset of each `MFunc.frame` entry,
+     * in frame order. Each slot honors its OWN `LAlloca` alignment (NOT a
+     * uniform `slot * spill_slot_bytes` stride — the compiler emits
+     * mixed-size/mixed-align allocas for structs/arrays/pointer-pairs,
+     * `lower.tks:1110/1331/3144/3274`), so `MFrameAddr{slot}` resolves to `ADD
+     * dst, sp, #slot_offsets[slot]`.
      */
-    slots_base: u32
+    slot_offsets: []u32
 }
 
 /**
  * compute_frame_layout — build a function's `FrameLayout`: re-derive the
- * callee-saved save-set (§3.1), sum the frame-slot bytes (`f.frame`, one
- * `LAlloca` per slot), reserve 16 for FP/LR, and round the whole to 16. The
- * slot region sits at the bottom of the frame (`slots_base = 0`); the saved
- * registers and FP/LR sit above it. A slot offset exceeding the ADD-imm 12-bit
- * field is a NAMED honest-stop (`A4-bigframe`, §6).
+ * callee-saved save-set (§3.1), lay out the frame slots bottom-up honoring each
+ * `LAlloca`'s alignment (`slot k` at `align_up(end of slot k-1, align_k)`), and
+ * size the frame: 0 when FRAMELESS (no slots, no callee-saved, and no LR to
+ * preserve — the `exit(n)` leaf), else slot region + callee-saved area (8 bytes
+ * each) + 16 for FP/LR, rounded to 16. A pure side-table pass — it never
+ * mutates the block stream, and returns a `FrameLayout` unconditionally; an
+ * offset that outruns its encodable field is a NAMED honest-stop
+ * (`A4-bigframe`, §6) raised at EMISSION time (`encode_frame_addr` /
+ * `emit_prologue`), not here.
  *
  * @param AbiDescriptor abi  the register file (callee-saved partition + slot size)
  * @param MFunc f  the fully-physical function
@@ -478,8 +486,8 @@ pub fn compute_frame_layout(abi: AbiDescriptor, f: MFunc) -> FrameLayout { … }
 
 /**
  * slot_offset — the SP-relative byte offset of frame slot `slot` under
- * `layout` (`slots_base + slot * spill_slot_bytes`), the concrete address
- * `MFrameAddr{slot}` resolves to (an ADD from SP, §2.4).
+ * `layout` (a direct lookup into the alignment-honoring `slot_offsets` map),
+ * the concrete address `MFrameAddr{slot}` resolves to (an ADD from SP, §2.4).
  *
  * @param FrameLayout layout  the resolved frame
  * @param u32 slot  the frame-slot index
@@ -488,13 +496,22 @@ pub fn compute_frame_layout(abi: AbiDescriptor, f: MFunc) -> FrameLayout { … }
 pub fn slot_offset(layout: FrameLayout, slot: u32) -> u32 { … }
 ```
 
-**Prologue** (emitted first in `encode_func`, size `N`): `sub sp, sp, #N` (`0xD1000000 |
-(N/? )…` — SUB-imm) ; `stp x29, x30, [sp, #N-16]` ; `add x29, sp, #N-16` (set FP) ; one `stp`
-per saved-callee-saved pair (`0xA9000000 | (imm7<<15) | (Rt2<<10) | (31<<5) | Rt`, imm7 = off/8).
-**Epilogue** (emitted at every `MRet`, LIFO): the `ldp`s ; `ldp x29, x30, [sp, #N-16]` ; `add sp, sp,
-#N` ; `ret`. STP/LDP are encoder-internal byte sequences, NOT `MInst`s (there is no store-pair
-`MInst`); `encode_func` emits their words directly. `MFrameAddr{dst,slot}` → `ADD dst, sp,
-#slot_offset(layout,slot)`.
+**Frame decision.** A function is FRAMELESS (`size=0`, no prologue/epilogue) iff it has no frame
+slots, uses no callee-saved registers, AND does not need LR preserved — where LR preservation is
+needed only when the body BOTH makes a call (clobbering LR) AND has a reachable `MRet` (`needs_lr_save`
+= `has_call && has_ret`). A leaf, or the `exit(n)`-terminated virtual-`main` (a call but no `MRet`), is
+thus frameless; a call-and-return function with no slots/callee-saved still gets the minimal 16-byte
+FP/LR frame (the doc's N=16 case).
+
+**Prologue** (size `N`): `sub sp, sp, #N` ; `stp x29, x30, [sp, #N-16]` ; `add x29, sp, #N-16` (set FP)
+; one `stp` per saved-callee-saved pair (`0xA9000000 | (imm7<<15) | (Rt2<<10) | (31<<5) | Rt`, imm7 =
+off/8), the odd trailing register of a class via a single `str`. **Epilogue** (LIFO): the `ldp`s/`ldr`s
+; `ldp x29, x30, [sp, #N-16]` ; `add sp, sp, #N`. STP/LDP are encoder-internal byte sequences, NOT
+`MInst`s (there is no store-pair `MInst`). A4-2 emits these via `emit_prologue`/`emit_epilogue`; the
+`RET` stays the `MRet` encoding (`encode_ret`), which the A4-3 function-encode layer emits immediately
+after the epilogue words. `MFrameAddr{dst,slot}` → `ADD dst, sp, #slot_offset(layout,slot)`. The
+single `A4-bigframe` guard is the FP/LR pair offset (`N-16`) fitting the signed 7-bit STP field: when
+it does, every smaller pair/slot offset fits too.
 
 > **First-light note.** The keystone fixture `exit(42)` produces a **frameless** `main` (no spills, no
 > allocas, a non-returning `bl _tk_exit` — LR is clobbered but never restored), so its `FrameLayout` is

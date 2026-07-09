@@ -1,3 +1,5 @@
+use teko::lir
+
 /**
  * p — a physical GPR operand with the given ISA id (a golden-vector fixture
  * shorthand; A4 runs post-regalloc, so every operand is physical).
@@ -7,6 +9,180 @@
  */
 fn p(id: u32) -> MReg {
     preg(id, MRegClass::GPR)
+}
+
+/**
+ * frameless_layout — the `FrameLayout` of a function with no frame: `size=0`,
+ * no callee-saved registers, no slots. Threaded through the A4-1 per-`MInst`
+ * golden checks so the instruction subset that never touches the frame encodes
+ * BYTE-FOR-BYTE as before the `layout` parameter was added.
+ *
+ * @return FrameLayout  the empty (frameless) frame side-table
+ */
+fn frameless_layout() -> FrameLayout {
+    FrameLayout {
+        size = 0 to u32
+        saved_gpr = teko::list::empty()
+        saved_fpr = teko::list::empty()
+        slot_offsets = teko::list::empty()
+    }
+}
+
+/**
+ * layout_of — a `FrameLayout` built directly from its parts, for the frame
+ * golden vectors that pin the exact prologue/epilogue/`MFrameAddr` words to a
+ * known frame without routing through `compute_frame_layout`.
+ *
+ * @param u32 size  the total 16-aligned frame size
+ * @param []u32 gpr  the callee-saved GPR ids (ascending)
+ * @param []u32 fpr  the callee-saved FPR ids (ascending)
+ * @param []u32 slots  the SP-relative slot offsets
+ * @return FrameLayout  the assembled frame side-table
+ */
+fn layout_of(size: u32, gpr: []u32, fpr: []u32, slots: []u32) -> FrameLayout {
+    FrameLayout { size = size; saved_gpr = gpr; saved_fpr = fpr; slot_offsets = slots }
+}
+
+/**
+ * alloca_slot — a frame-slot table entry (`LAlloca`) of the given byte size and
+ * alignment, the mixed-frame `compute_frame_layout` fixture shorthand.
+ *
+ * @param u32 bytes  the slot's byte size
+ * @param u32 align  the slot's alignment
+ * @return lir::LAlloca  the frame-slot entry
+ */
+fn alloca_slot(bytes: u32, align: u32) -> lir::LAlloca {
+    lir::LAlloca { bytes = bytes; align = align }
+}
+
+/**
+ * func_of — an `MFunc` with the given frame table and a single block holding
+ * `insts`, the `compute_frame_layout` / save-set fixture shorthand.
+ *
+ * @param []lir::LAlloca frame  the frame-slot table
+ * @param []MInst insts  the single block's instruction stream
+ * @return MFunc  the assembled function
+ */
+fn func_of(frame: []lir::LAlloca, insts: []MInst) -> MFunc {
+    let block = MBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    MFunc { symbol = "t"; blocks = teko::list::push(teko::list::empty(), block); frame = frame }
+}
+
+/**
+ * l0 — the empty `[]u32` vector, typed for the frame fixtures.
+ *
+ * @return []u32  an empty u32 list
+ */
+fn l0() -> []u32 {
+    teko::list::empty()
+}
+
+/**
+ * l1 — a one-element `[]u32` vector.
+ *
+ * @param u32 a  the sole element
+ * @return []u32  `[a]`
+ */
+fn l1(a: u32) -> []u32 {
+    teko::list::push(l0(), a)
+}
+
+/**
+ * l2 — a two-element `[]u32` vector, in order.
+ *
+ * @param u32 a  the first element
+ * @param u32 b  the second element
+ * @return []u32  `[a, b]`
+ */
+fn l2(a: u32, b: u32) -> []u32 {
+    teko::list::push(l1(a), b)
+}
+
+/**
+ * l3 — a three-element `[]u32` vector, in order.
+ *
+ * @param u32 a  the first element
+ * @param u32 b  the second element
+ * @param u32 c  the third element
+ * @return []u32  `[a, b, c]`
+ */
+fn l3(a: u32, b: u32, c: u32) -> []u32 {
+    teko::list::push(l2(a, b), c)
+}
+
+/**
+ * l_frame — the empty frame-slot table, typed for the fixtures.
+ *
+ * @return []lir::LAlloca  an empty frame table
+ */
+fn l_frame() -> []lir::LAlloca {
+    teko::list::empty()
+}
+
+/**
+ * l_insts — the empty instruction list, typed for the fixtures.
+ *
+ * @return []MInst  an empty instruction stream
+ */
+fn l_insts() -> []MInst {
+    teko::list::empty()
+}
+
+/**
+ * pro — the prologue words of `layout`, or the empty list on an unexpected
+ * honest-stop (so a golden length/word assertion fails loudly rather than
+ * aborting).
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return []u32  the prologue words, or empty on error
+ */
+fn pro(layout: FrameLayout) -> []u32 {
+    match emit_prologue(layout) {
+        error as e => l0()
+        []u32 as w => w
+    }
+}
+
+/**
+ * epi — the epilogue teardown words of `layout`, or the empty list on an
+ * unexpected honest-stop.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return []u32  the epilogue words, or empty on error
+ */
+fn epi(layout: FrameLayout) -> []u32 {
+    match emit_epilogue(layout) {
+        error as e => l0()
+        []u32 as w => w
+    }
+}
+
+/**
+ * pro_stop — the prologue honest-stop message of `layout`, or `<ok>` when it
+ * emits successfully.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return str  the error message, or `<ok>`
+ */
+fn pro_stop(layout: FrameLayout) -> str {
+    match emit_prologue(layout) {
+        error as e => e.message
+        []u32 as w => "<ok>"
+    }
+}
+
+/**
+ * epi_stop — the epilogue honest-stop message of `layout`, or `<ok>` when it
+ * emits successfully.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return str  the error message, or `<ok>`
+ */
+fn epi_stop(layout: FrameLayout) -> str {
+    match emit_epilogue(layout) {
+        error as e => e.message
+        []u32 as w => "<ok>"
+    }
 }
 
 /**
@@ -60,7 +236,22 @@ fn bad_word() -> EncWord {
  * @return EncWord  the encoded word, or the sentinel on error
  */
 fn enc(inst: MInst) -> EncWord {
-    match encode_inst_word(inst) {
+    match encode_inst_word(frameless_layout(), inst) {
+        EncWord as x => x
+        error as e => bad_word()
+    }
+}
+
+/**
+ * enc_with — encode `inst` under an explicit `layout` (the `MFrameAddr` golden
+ * path), falling back to the `bad_word` sentinel on an unexpected honest-stop.
+ *
+ * @param FrameLayout layout  the enclosing frame
+ * @param MInst inst  the instruction to encode
+ * @return EncWord  the encoded word, or the sentinel on error
+ */
+fn enc_with(layout: FrameLayout, inst: MInst) -> EncWord {
+    match encode_inst_word(layout, inst) {
         EncWord as x => x
         error as e => bad_word()
     }
@@ -74,7 +265,22 @@ fn enc(inst: MInst) -> EncWord {
  * @return str  the error message, or `<ok>` when it encodes
  */
 fn stop_of(inst: MInst) -> str {
-    match encode_inst_word(inst) {
+    match encode_inst_word(frameless_layout(), inst) {
+        EncWord as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * stop_of_with — the honest-stop message `inst` produces under an explicit
+ * `layout`, or `<ok>` when it encodes (the `MFrameAddr` big-frame stop path).
+ *
+ * @param FrameLayout layout  the enclosing frame
+ * @param MInst inst  the instruction to encode
+ * @return str  the error message, or `<ok>` when it encodes
+ */
+fn stop_of_with(layout: FrameLayout, inst: MInst) -> str {
+    match encode_inst_word(layout, inst) {
         EncWord as x => "<ok>"
         error as e => e.message
     }
@@ -94,7 +300,7 @@ fn assert_word(inst: MInst, expected: u32) {
 
 /**
  * assert_stop — assert that `inst` honest-stops with a message containing the
- * named token (`A4-fp`/`A4-bigimm`/`A4-ldur`/`A4-frame`).
+ * named token (`A4-fp`/`A4-bigimm`/`A4-ldur`/`A4-bigframe`).
  *
  * @param MInst inst  the instruction to encode
  * @param str name  the named-stop token expected in the message
@@ -408,13 +614,331 @@ fn fpr_memory_honest_stops() {
 
 #test
 /**
- * frame_addr_honest_stop — `MFrameAddr` raises the `A4-frame` honest-stop in
- * A4-1 (its resolution needs the A4-2 FrameLayout).
+ * frameless_layout_leaves_a41_goldens_unchanged — threading a frameless
+ * `FrameLayout` through `encode_inst_word` leaves the A4-1 integer/control/
+ * memory encodings BYTE-FOR-BYTE identical (the layout parameter is inert for
+ * every case that does not touch the frame).
  *
  * @return void
  */
-fn frame_addr_honest_stop() {
-    assert_stop(frame_addr_inst(p(0), 0), "A4-frame")
+fn frameless_layout_leaves_a41_goldens_unchanged() {
+    let fl = frameless_layout()
+    teko::assert::is_true(enc_with(fl, movz_inst(true, p(0), 42, 0)).word == (0xD2800540 to u32))
+    teko::assert::is_true(enc_with(fl, alu_inst(MAluOp::Add, true, p(0), p(1), p(2))).word == (0x8B020020 to u32))
+    teko::assert::is_true(enc_with(fl, ret_inst()).word == (0xD65F03C0 to u32))
+}
+
+#test
+/**
+ * empty_frame_is_frameless — a leaf function (a compute + `ret`, no call, no
+ * allocas) resolves to a frameless layout: `size=0`, no callee-saved, no slots.
+ *
+ * @return void
+ */
+fn empty_frame_is_frameless() {
+    let insts = teko::list::push(teko::list::push(l_insts(), mov_inst(true, p(0), p(1))), ret_inst())
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (0 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+    teko::assert::is_true(fl.saved_fpr.len == 0)
+    teko::assert::is_true(fl.slot_offsets.len == 0)
+}
+
+#test
+/**
+ * minimal_frame_is_16 — a function that BOTH calls and returns but has no slots
+ * and no callee-saved registers still needs FP/LR preserved: a 16-byte frame
+ * (the doc's N=16 minimal frame).
+ *
+ * @return void
+ */
+fn minimal_frame_is_16() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = teko::list::push(teko::list::push(l_insts(), call_inst("callee", no_uses, p(0), false, false)), ret_inst())
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (16 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+    teko::assert::is_true(fl.slot_offsets.len == 0)
+}
+
+#test
+/**
+ * call_without_ret_is_frameless — a function that makes a call but never returns
+ * (the `exit(n)`-terminated virtual-`main` shape: no `MRet`) needs no LR save,
+ * so with no slots and no callee-saved it is frameless (`size=0`).
+ *
+ * @return void
+ */
+fn call_without_ret_is_frameless() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = teko::list::push(l_insts(), call_inst("tk_exit", no_uses, p(0), false, false))
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (0 to u32))
+}
+
+#test
+/**
+ * multi_slot_mixed_align_offsets — a frame of three allocas with mixed sizes and
+ * alignments lays out each slot at its own aligned offset (`[0, 16, 24]`), and
+ * the whole frame rounds to 16 (`48`).
+ *
+ * @return void
+ */
+fn multi_slot_mixed_align_offsets() {
+    let frame = teko::list::push(teko::list::push(teko::list::push(l_frame(), alloca_slot(16, 8)), alloca_slot(4, 4)), alloca_slot(8, 8))
+    let fl = compute_frame_layout(aapcs64(), func_of(frame, l_insts()))
+    teko::assert::is_true(fl.slot_offsets.len == 3)
+    teko::assert::is_true(fl.slot_offsets[0] == (0 to u32))
+    teko::assert::is_true(fl.slot_offsets[1] == (16 to u32))
+    teko::assert::is_true(fl.slot_offsets[2] == (24 to u32))
+    teko::assert::is_true(fl.size == (48 to u32))
+}
+
+#test
+/**
+ * frame_rounds_to_16 — a single 8-byte slot plus one callee-saved GPR rounds the
+ * total (slots 16 + saved 8 + FP/LR 16 = 40) up to 48.
+ *
+ * @return void
+ */
+fn frame_rounds_to_16() {
+    let frame = teko::list::push(l_frame(), alloca_slot(8, 8))
+    let insts = teko::list::push(l_insts(), mov_inst(true, p(19), p(0)))
+    let fl = compute_frame_layout(aapcs64(), func_of(frame, insts))
+    teko::assert::is_true(fl.slot_offsets[0] == (0 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 1)
+    teko::assert::is_true(fl.saved_gpr[0] == (19 to u32))
+    teko::assert::is_true(fl.size == (48 to u32))
+}
+
+#test
+/**
+ * save_set_uses_callee_saved — scanning operands that touch the callee-saved
+ * x25/x28/x19/x22 (out of order, one repeated) and the caller-saved x0/x1/x2
+ * re-derives the ascending, duplicate-free `saved_gpr=[19,22,25,28]` — the
+ * front-insert, mid-insert-with-continuation, end-append, and dedup paths of the
+ * ordered insert.
+ *
+ * @return void
+ */
+fn save_set_uses_callee_saved() {
+    let i0 = alu_inst(MAluOp::Add, true, p(0), p(25), p(28))
+    let i1 = alu_inst(MAluOp::Add, true, p(1), p(19), p(22))
+    let i2 = alu_inst(MAluOp::Add, true, p(2), p(25), p(0))
+    let insts = teko::list::push(teko::list::push(teko::list::push(l_insts(), i0), i1), i2)
+    let saved = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(saved.saved_gpr.len == 4)
+    teko::assert::is_true(saved.saved_gpr[0] == (19 to u32))
+    teko::assert::is_true(saved.saved_gpr[1] == (22 to u32))
+    teko::assert::is_true(saved.saved_gpr[2] == (25 to u32))
+    teko::assert::is_true(saved.saved_gpr[3] == (28 to u32))
+    teko::assert::is_true(saved.saved_fpr.len == 0)
+}
+
+#test
+/**
+ * save_set_no_callee_saved — a function touching only caller-saved x0/x1
+ * re-derives an empty callee-saved GPR set.
+ *
+ * @return void
+ */
+fn save_set_no_callee_saved() {
+    let i0 = alu_inst(MAluOp::Add, true, p(0), p(1), p(0))
+    let insts = teko::list::push(l_insts(), i0)
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+    teko::assert::is_true(fl.saved_fpr.len == 0)
+}
+
+#test
+/**
+ * save_set_uses_callee_saved_fpr — an instruction reading the callee-saved v8
+ * re-derives `saved_fpr=[8]` (the FPR half of the save-set, exercised via a
+ * float op whose registers `inst_regs` reports even though its encoding stops).
+ *
+ * @return void
+ */
+fn save_set_uses_callee_saved_fpr() {
+    let i0 = fmov_inst(true, fp(8), fp(0))
+    let insts = teko::list::push(l_insts(), i0)
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.saved_fpr.len == 1)
+    teko::assert::is_true(fl.saved_fpr[0] == (8 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+}
+
+#test
+/**
+ * frameless_prologue_epilogue_empty — a `size=0` layout emits neither prologue
+ * nor epilogue words.
+ *
+ * @return void
+ */
+fn frameless_prologue_epilogue_empty() {
+    let fl = frameless_layout()
+    teko::assert::is_true(pro(fl).len == 0)
+    teko::assert::is_true(epi(fl).len == 0)
+}
+
+#test
+/**
+ * minimal_prologue_epilogue_words — the FP/LR-only 16-byte frame's exact
+ * prologue (`sub sp,#16`; `stp x29,x30,[sp,#0]`; `add x29,sp,#0`) and epilogue
+ * (`ldp x29,x30,[sp,#0]`; `add sp,#16`).
+ *
+ * @return void
+ */
+fn minimal_prologue_epilogue_words() {
+    let fl = layout_of(16 to u32, l0(), l0(), l0())
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 3)
+    teko::assert::is_true(pr[0] == (0xD10043FF to u32))
+    teko::assert::is_true(pr[1] == (0xA9007BFD to u32))
+    teko::assert::is_true(pr[2] == (0x910003FD to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep.len == 2)
+    teko::assert::is_true(ep[0] == (0xA9407BFD to u32))
+    teko::assert::is_true(ep[1] == (0x910043FF to u32))
+}
+
+#test
+/**
+ * callee_saved_gpr_pair_words — a 48-byte frame saving the x19/x20 pair emits
+ * the FP/LR save at `#32`, the FP-set at `#32`, and the `stp x19,x20,[sp,#16]`
+ * pair (restored by `ldp x19,x20,[sp,#16]`).
+ *
+ * @return void
+ */
+fn callee_saved_gpr_pair_words() {
+    let fl = layout_of(48 to u32, l2(19, 20), l0(), l1(0))
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 4)
+    teko::assert::is_true(pr[0] == (0xD100C3FF to u32))
+    teko::assert::is_true(pr[1] == (0xA9027BFD to u32))
+    teko::assert::is_true(pr[2] == (0x910083FD to u32))
+    teko::assert::is_true(pr[3] == (0xA90153F3 to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep.len == 3)
+    teko::assert::is_true(ep[0] == (0xA94153F3 to u32))
+    teko::assert::is_true(ep[1] == (0xA9427BFD to u32))
+    teko::assert::is_true(ep[2] == (0x9100C3FF to u32))
+}
+
+#test
+/**
+ * callee_saved_gpr_single_word — an odd callee-saved count (only x19) in a
+ * 32-byte frame emits a single `str x19,[sp,#8]` (restored by `ldr
+ * x19,[sp,#8]`).
+ *
+ * @return void
+ */
+fn callee_saved_gpr_single_word() {
+    let fl = layout_of(32 to u32, l1(19), l0(), l0())
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 4)
+    teko::assert::is_true(pr[3] == (0xF90007F3 to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep[0] == (0xF94007F3 to u32))
+}
+
+#test
+/**
+ * callee_saved_fpr_pair_words — a 48-byte frame saving the v8/v9 FPR pair emits
+ * `stp d8,d9,[sp,#16]` (restored by `ldp d8,d9,[sp,#16]`).
+ *
+ * @return void
+ */
+fn callee_saved_fpr_pair_words() {
+    let fl = layout_of(48 to u32, l0(), l2(8, 9), l1(0))
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 4)
+    teko::assert::is_true(pr[3] == (0x6D0127E8 to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep[0] == (0x6D4127E8 to u32))
+}
+
+#test
+/**
+ * callee_saved_fpr_single_word — an odd FPR count (only v8) in a 32-byte frame
+ * emits a single `str d8,[sp,#8]` (restored by `ldr d8,[sp,#8]`).
+ *
+ * @return void
+ */
+fn callee_saved_fpr_single_word() {
+    let fl = layout_of(32 to u32, l0(), l1(8), l0())
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 4)
+    teko::assert::is_true(pr[3] == (0xFD0007E8 to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep[0] == (0xFD4007E8 to u32))
+}
+
+#test
+/**
+ * frame_addr_resolves_to_add — `MFrameAddr` resolves through the layout to `ADD
+ * dst, sp, #slot_offset`: slot 0 at offset 8 → `add x0,sp,#8`; a second slot at
+ * offset 16 into x5 → `add x5,sp,#16`. The word carries no branch/reloc fixup.
+ *
+ * @return void
+ */
+fn frame_addr_resolves_to_add() {
+    let fl = layout_of(32 to u32, l0(), l0(), l2(8, 16))
+    let ew0 = enc_with(fl, frame_addr_inst(p(0), 0))
+    teko::assert::is_true(ew0.word == (0x910023E0 to u32))
+    teko::assert::is_false(ew0.has_branch)
+    teko::assert::is_false(ew0.has_reloc)
+    teko::assert::is_true(enc_with(fl, frame_addr_inst(p(5), 1)).word == (0x910043E5 to u32))
+}
+
+#test
+/**
+ * frame_addr_slot_zero_offset — a slot at offset 0 resolves to `add dst,sp,#0`.
+ *
+ * @return void
+ */
+fn frame_addr_slot_zero_offset() {
+    let fl = layout_of(32 to u32, l0(), l0(), l1(0))
+    teko::assert::is_true(enc_with(fl, frame_addr_inst(p(0), 0)).word == (0x910003E0 to u32))
+}
+
+#test
+/**
+ * slot_offset_reads_the_map — `slot_offset` is a direct lookup into the
+ * alignment-honoring per-slot map.
+ *
+ * @return void
+ */
+fn slot_offset_reads_the_map() {
+    let fl = layout_of(48 to u32, l0(), l0(), l3(0, 16, 24))
+    teko::assert::is_true(slot_offset(fl, 0 to u32) == (0 to u32))
+    teko::assert::is_true(slot_offset(fl, 1 to u32) == (16 to u32))
+    teko::assert::is_true(slot_offset(fl, 2 to u32) == (24 to u32))
+}
+
+#test
+/**
+ * big_frame_addr_honest_stops — a slot offset beyond the 12-bit ADD-imm field
+ * raises the `A4-bigframe` honest-stop.
+ *
+ * @return void
+ */
+fn big_frame_addr_honest_stops() {
+    let fl = layout_of(8192 to u32, l0(), l0(), l1(5000))
+    teko::assert::str_contains(stop_of_with(fl, frame_addr_inst(p(0), 0)), "A4-bigframe")
+}
+
+#test
+/**
+ * big_prologue_epilogue_honest_stops — a frame whose FP/LR pair offset outruns
+ * the signed 7-bit STP field raises `A4-bigframe` from both prologue and
+ * epilogue.
+ *
+ * @return void
+ */
+fn big_prologue_epilogue_honest_stops() {
+    let fl = layout_of(1024 to u32, l0(), l0(), l0())
+    teko::assert::str_contains(pro_stop(fl), "A4-bigframe")
+    teko::assert::str_contains(epi_stop(fl), "A4-bigframe")
 }
 
 #test
@@ -444,4 +968,51 @@ fn unscaled_offset_honest_stops() {
     assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), 4)), "A4-ldur")
     assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), 32768)), "A4-ldur")
     assert_stop(store_inst(MMemSize::H, p(0), m(p(1), 1)), "A4-ldur")
+}
+
+#test
+/**
+ * layout_zero_and_one_align_slots — an alloca with `align = 0` or `align = 1`
+ * lays out at the running offset unchanged (the guarded `align_up` no-op arm,
+ * the same contract as `lir::align_up`): slots `[{8,0},{8,1},{4,4}]` sit at
+ * `[0, 8, 16]` (slots region 32) and the FP/LR pair brings the frame to 48.
+ *
+ * @return void
+ */
+fn layout_zero_and_one_align_slots() {
+    let frame = teko::list::push(teko::list::push(teko::list::push(l_frame(), alloca_slot(8, 0)), alloca_slot(8, 1)), alloca_slot(4, 4))
+    let fl = compute_frame_layout(aapcs64(), func_of(frame, l_insts()))
+    teko::assert::is_true(fl.slot_offsets[0] == (0 to u32))
+    teko::assert::is_true(fl.slot_offsets[1] == (8 to u32))
+    teko::assert::is_true(fl.slot_offsets[2] == (16 to u32))
+    teko::assert::is_true(fl.size == (48 to u32))
+}
+
+#test
+/**
+ * callee_saved_only_leaf_is_framed — a no-call, no-slot leaf that touches x19
+ * is framed purely by its save-set: size = 16 (FP/LR) + 8 (x19) rounded to 32.
+ *
+ * @return void
+ */
+fn callee_saved_only_leaf_is_framed() {
+    let insts = teko::list::push(l_insts(), alu_inst(MAluOp::Add, true, p(19), p(0), p(1)))
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.saved_gpr.len == 1)
+    teko::assert::is_true(fl.size == (32 to u32))
+}
+
+#test
+/**
+ * indirect_call_without_ret_is_frameless — an `MCallIndirect` with no `MRet`
+ * (the BLR-terminated shape) stays frameless, mirroring the direct-call case:
+ * `has_call` alone never forces LR preservation.
+ *
+ * @return void
+ */
+fn indirect_call_without_ret_is_frameless() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = teko::list::push(l_insts(), call_indirect_inst(p(9), no_uses, p(0), false))
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (0 to u32))
 }
