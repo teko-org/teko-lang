@@ -1,0 +1,83 @@
+/**
+ * rat_gpr — a physical GPR register operand with the given ISA id (a
+ * descriptor-test shorthand).
+ *
+ * @param u32 id  the physical register id
+ * @return MReg  the physical GPR register
+ */
+fn rat_gpr(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * rat_fpr — a physical FPR register operand with the given ISA id.
+ *
+ * @param u32 id  the physical register id
+ * @return MReg  the physical FPR register
+ */
+fn rat_fpr(id: u32) -> MReg {
+    preg(id, MRegClass::FPR)
+}
+
+#test
+fn rat_arg_reg_fills_x0_to_x7_v0_to_v7_then_overflows() {
+    let abi = aapcs64()
+    let a0 = arg_reg(abi, MRegClass::GPR, 0)
+    teko::assert::is_true(a0.ok)
+    teko::assert::is_true(a0.reg.id == 0)
+    teko::assert::is_true(a0.reg.is_phys)
+    teko::assert::is_true(a0.reg.reg_class == MRegClass::GPR)
+    let a7 = arg_reg(abi, MRegClass::GPR, 7)
+    teko::assert::is_true(a7.ok)
+    teko::assert::is_true(a7.reg.id == 7)
+    let a8 = arg_reg(abi, MRegClass::GPR, 8)
+    teko::assert::is_true(!a8.ok)
+    let f0 = arg_reg(abi, MRegClass::FPR, 0)
+    teko::assert::is_true(f0.ok)
+    teko::assert::is_true(f0.reg.id == 0)
+    teko::assert::is_true(f0.reg.reg_class == MRegClass::FPR)
+    let f8 = arg_reg(abi, MRegClass::FPR, 8)
+    teko::assert::is_true(!f8.ok)
+}
+
+#test
+fn rat_allocatable_pool_caller_saved_first_excludes_reserved() {
+    let abi = aapcs64()
+    let gpr = allocatable_pool(abi, MRegClass::GPR)
+    teko::assert::is_true(gpr[0] == 0)
+    teko::assert::is_true(contains_u32(gpr, 14))
+    teko::assert::is_true(!contains_u32(gpr, 15))
+    teko::assert::is_true(!contains_u32(gpr, 18))
+    teko::assert::is_true(contains_u32(gpr, 19))
+    teko::assert::is_true(contains_u32(gpr, 28))
+    teko::assert::is_true(!contains_u32(gpr, 29))
+    let fpr = allocatable_pool(abi, MRegClass::FPR)
+    teko::assert::is_true(fpr[0] == 0)
+    teko::assert::is_true(contains_u32(fpr, 8))
+    teko::assert::is_true(!contains_u32(fpr, 30))
+    teko::assert::is_true(!contains_u32(fpr, 31))
+}
+
+#test
+fn rat_caller_and_callee_saved_partition() {
+    let abi = aapcs64()
+    teko::assert::is_true(is_caller_saved(abi, rat_gpr(0)))
+    teko::assert::is_true(!is_caller_saved(abi, rat_gpr(19)))
+    teko::assert::is_true(is_callee_saved(abi, rat_gpr(19)))
+    teko::assert::is_true(!is_callee_saved(abi, rat_gpr(0)))
+    teko::assert::is_true(!is_callee_saved(abi, rat_gpr(30)))
+    teko::assert::is_true(is_caller_saved(abi, rat_fpr(0)))
+    teko::assert::is_true(!is_caller_saved(abi, rat_fpr(8)))
+    teko::assert::is_true(is_callee_saved(abi, rat_fpr(8)))
+}
+
+#test
+fn rat_spill_scratch_reserved_registers() {
+    let abi = aapcs64()
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0).id == 15)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 2).id == 17)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0).is_phys)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0).id == 30)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 1).id == 31)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0).reg_class == MRegClass::FPR)
+}
