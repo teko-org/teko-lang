@@ -1,0 +1,447 @@
+/**
+ * p — a physical GPR operand with the given ISA id (a golden-vector fixture
+ * shorthand; A4 runs post-regalloc, so every operand is physical).
+ *
+ * @param u32 id  the ISA register number (x0..x30, SP/XZR=31)
+ * @return MReg  the physical GPR operand
+ */
+fn p(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * fp — a physical FPR operand with the given ISA id (a golden-vector fixture
+ * shorthand for the float honest-stop cases).
+ *
+ * @param u32 id  the ISA register number (v0..v31)
+ * @return MReg  the physical FPR operand
+ */
+fn fp(id: u32) -> MReg {
+    preg(id, MRegClass::FPR)
+}
+
+/**
+ * m — a base-plus-displacement memory operand (a golden-vector fixture
+ * shorthand for the load/store cases).
+ *
+ * @param MReg base  the base register
+ * @param i32 off  the byte displacement
+ * @return MMem  the memory operand
+ */
+fn m(base: MReg, off: i32) -> MMem {
+    MMem { base = base; offset = off }
+}
+
+/**
+ * bad_word — the sentinel `EncWord` returned when a golden fixture that must
+ * encode unexpectedly honest-stops: its all-ones word never matches a real
+ * expected encoding, so the assertion fails loudly.
+ *
+ * @return EncWord  the impossible-word sentinel
+ */
+fn bad_word() -> EncWord {
+    EncWord {
+        word = 0xFFFFFFFF to u32
+        has_branch = false
+        target = 0 to u32
+        branch_form = 0 to u32
+        has_reloc = false
+        reloc_sym = "<error>"
+        reloc_kind = MRelocKind::Call
+    }
+}
+
+/**
+ * enc — encode `inst`, unwrapping the success case and falling back to the
+ * `bad_word` sentinel on an unexpected honest-stop (so a golden assertion on
+ * the word fails rather than aborting the test).
+ *
+ * @param MInst inst  the instruction to encode
+ * @return EncWord  the encoded word, or the sentinel on error
+ */
+fn enc(inst: MInst) -> EncWord {
+    match encode_inst_word(inst) {
+        EncWord as x => x
+        error as e => bad_word()
+    }
+}
+
+/**
+ * stop_of — the honest-stop message `inst` produces, or `<ok>` when it encodes
+ * successfully. Lets an honest-stop test assert the named stop is raised.
+ *
+ * @param MInst inst  the instruction to encode
+ * @return str  the error message, or `<ok>` when it encodes
+ */
+fn stop_of(inst: MInst) -> str {
+    match encode_inst_word(inst) {
+        EncWord as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * assert_word — assert that `inst` encodes to the exact 32-bit `expected` word
+ * (the position-independent golden-vector check).
+ *
+ * @param MInst inst  the instruction to encode
+ * @param u32 expected  the known-good arm64 instruction word
+ * @return void
+ */
+fn assert_word(inst: MInst, expected: u32) {
+    teko::assert::is_true(enc(inst).word == expected)
+}
+
+/**
+ * assert_stop — assert that `inst` honest-stops with a message containing the
+ * named token (`A4-fp`/`A4-bigimm`/`A4-ldur`/`A4-frame`).
+ *
+ * @param MInst inst  the instruction to encode
+ * @param str name  the named-stop token expected in the message
+ * @return void
+ */
+fn assert_stop(inst: MInst, name: str) {
+    teko::assert::str_contains(stop_of(inst), name)
+}
+
+#test
+/**
+ * emit_u32_le_splits_little_endian — `emit_u32_le` splits a word into four
+ * ascending little-endian bytes (the shared `[]byte` build idiom).
+ *
+ * @return void
+ */
+fn emit_u32_le_splits_little_endian() {
+    let bytes = emit_u32_le(teko::list::empty(), 0xD2800540 to u32)
+    teko::assert::is_true(bytes.len == 4)
+    teko::assert::is_true(bytes[0] == (0x40 to byte))
+    teko::assert::is_true(bytes[1] == (0x05 to byte))
+    teko::assert::is_true(bytes[2] == (0x80 to byte))
+    teko::assert::is_true(bytes[3] == (0xD2 to byte))
+}
+
+#test
+/**
+ * encodes_the_movz_family — MOVZ/MOVK/MOVN across widths and lane shifts.
+ *
+ * @return void
+ */
+fn encodes_the_movz_family() {
+    assert_word(movz_inst(true, p(0), 42, 0), 0xD2800540)
+    assert_word(movz_inst(false, p(0), 42, 0), 0x52800540)
+    assert_word(movz_inst(true, p(0), 100, 16), 0xD2A00C80)
+    assert_word(movk_inst(true, p(0), 200, 32), 0xF2C01900)
+    assert_word(movn_inst(false, p(0), 1, 0), 0x12800020)
+}
+
+#test
+/**
+ * encodes_the_gpr_move — a GPR-GPR move (ORR from XZR) in both widths.
+ *
+ * @return void
+ */
+fn encodes_the_gpr_move() {
+    assert_word(mov_inst(true, p(0), p(8)), 0xAA0803E0)
+    assert_word(mov_inst(false, p(0), p(8)), 0x2A0803E0)
+}
+
+#test
+/**
+ * encodes_every_integer_alu_reg — all eleven register-register ALU ops, over
+ * `x0, x1, x2` (dst=0, a=1, b=2), covering `alu_reg_base` end to end.
+ *
+ * @return void
+ */
+fn encodes_every_integer_alu_reg() {
+    assert_word(alu_inst(MAluOp::Add, true, p(0), p(1), p(2)), 0x8B020020)
+    assert_word(alu_inst(MAluOp::Add, false, p(0), p(1), p(2)), 0x0B020020)
+    assert_word(alu_inst(MAluOp::Sub, true, p(0), p(1), p(2)), 0xCB020020)
+    assert_word(alu_inst(MAluOp::And, true, p(0), p(1), p(2)), 0x8A020020)
+    assert_word(alu_inst(MAluOp::Orr, true, p(0), p(1), p(2)), 0xAA020020)
+    assert_word(alu_inst(MAluOp::Eor, true, p(0), p(1), p(2)), 0xCA020020)
+    assert_word(alu_inst(MAluOp::Mul, true, p(0), p(1), p(2)), 0x9B027C20)
+    assert_word(alu_inst(MAluOp::Sdiv, true, p(0), p(1), p(2)), 0x9AC20C20)
+    assert_word(alu_inst(MAluOp::Udiv, true, p(0), p(1), p(2)), 0x9AC20820)
+    assert_word(alu_inst(MAluOp::Lsl, true, p(0), p(1), p(2)), 0x9AC22020)
+    assert_word(alu_inst(MAluOp::Lsr, true, p(0), p(1), p(2)), 0x9AC22420)
+    assert_word(alu_inst(MAluOp::Asr, true, p(0), p(1), p(2)), 0x9AC22820)
+}
+
+#test
+/**
+ * encodes_alu_immediate — ADD/SUB immediates in both widths, plus the
+ * negative-immediate add/sub flip (`ADD #-k` == `SUB #k`).
+ *
+ * @return void
+ */
+fn encodes_alu_immediate() {
+    assert_word(alu_imm_inst(MAluOp::Add, true, p(0), p(1), 7 to i64), 0x91001C20)
+    assert_word(alu_imm_inst(MAluOp::Sub, true, p(0), p(1), 7 to i64), 0xD1001C20)
+    assert_word(alu_imm_inst(MAluOp::Add, false, p(0), p(1), 7 to i64), 0x11001C20)
+    assert_word(alu_imm_inst(MAluOp::Add, true, p(0), p(1), (0 to i64) - (7 to i64)), 0xD1001C20)
+    assert_word(alu_imm_inst(MAluOp::Sub, true, p(0), p(1), (0 to i64) - (7 to i64)), 0x91001C20)
+}
+
+#test
+/**
+ * encodes_msub_neg_mvn — the MSUB remainder form, NEG (SUB from XZR), and MVN
+ * (ORN from XZR).
+ *
+ * @return void
+ */
+fn encodes_msub_neg_mvn() {
+    assert_word(msub_inst(true, p(0), p(1), p(2), p(3)), 0x9B028C20)
+    assert_word(neg_inst(true, p(0), p(1)), 0xCB0103E0)
+    assert_word(neg_inst(false, p(0), p(1)), 0x4B0103E0)
+    assert_word(mvn_inst(false, p(0), p(1)), 0x2A2103E0)
+    assert_word(mvn_inst(true, p(0), p(1)), 0xAA2103E0)
+}
+
+#test
+/**
+ * encodes_compares — CMP (SUBS to XZR) register and immediate forms in both
+ * widths.
+ *
+ * @return void
+ */
+fn encodes_compares() {
+    assert_word(cmp_inst(true, p(1), p(2)), 0xEB02003F)
+    assert_word(cmp_inst(false, p(1), p(2)), 0x6B02003F)
+    assert_word(cmp_imm_inst(true, p(1), 7 to i64), 0xF1001C3F)
+    assert_word(cmp_imm_inst(false, p(1), 7 to i64), 0x71001C3F)
+}
+
+#test
+/**
+ * encodes_cset_all_conditions — CSET (CSINC with the inverted condition) for
+ * all ten `MCond` values, covering `cond_code` end to end.
+ *
+ * @return void
+ */
+fn encodes_cset_all_conditions() {
+    assert_word(cset_inst(true, p(0), MCond::EQ), 0x9A9F17E0)
+    assert_word(cset_inst(false, p(0), MCond::NE), 0x1A9F07E0)
+    assert_word(cset_inst(true, p(0), MCond::LT), 0x9A9FA7E0)
+    assert_word(cset_inst(true, p(0), MCond::LE), 0x9A9FC7E0)
+    assert_word(cset_inst(true, p(0), MCond::GT), 0x9A9FD7E0)
+    assert_word(cset_inst(true, p(0), MCond::GE), 0x9A9FB7E0)
+    assert_word(cset_inst(true, p(0), MCond::LO), 0x9A9F27E0)
+    assert_word(cset_inst(true, p(0), MCond::LS), 0x9A9F87E0)
+    assert_word(cset_inst(true, p(0), MCond::HI), 0x9A9F97E0)
+    assert_word(cset_inst(true, p(0), MCond::HS), 0x9A9F37E0)
+}
+
+#test
+/**
+ * encodes_every_extend — the six narrow sign/zero-extends (SBFM/UBFM),
+ * covering `ext_base` end to end.
+ *
+ * @return void
+ */
+fn encodes_every_extend() {
+    assert_word(ext_inst(MExtOp::Sxtb, p(0), p(1)), 0x93401C20)
+    assert_word(ext_inst(MExtOp::Sxth, p(0), p(1)), 0x93403C20)
+    assert_word(ext_inst(MExtOp::Sxtw, p(0), p(1)), 0x93407C20)
+    assert_word(ext_inst(MExtOp::Uxtb, p(0), p(1)), 0x53001C20)
+    assert_word(ext_inst(MExtOp::Uxth, p(0), p(1)), 0x53003C20)
+    assert_word(ext_inst(MExtOp::Uxtw, p(0), p(1)), 0xD3407C20)
+}
+
+#test
+/**
+ * encodes_loads — LDR/LDRB/LDRH plus the sign-extending LDRSB/LDRSH/LDRSW,
+ * including scaled offsets, covering `load_form` end to end.
+ *
+ * @return void
+ */
+fn encodes_loads() {
+    assert_word(load_inst(MMemSize::X, false, p(0), m(p(1), 0)), 0xF9400020)
+    assert_word(load_inst(MMemSize::X, false, p(0), m(p(1), 8)), 0xF9400420)
+    assert_word(load_inst(MMemSize::W, false, p(0), m(p(1), 4)), 0xB9400420)
+    assert_word(load_inst(MMemSize::B, false, p(0), m(p(1), 0)), 0x39400020)
+    assert_word(load_inst(MMemSize::H, false, p(0), m(p(1), 0)), 0x79400020)
+    assert_word(load_inst(MMemSize::B, true, p(0), m(p(1), 0)), 0x39800020)
+    assert_word(load_inst(MMemSize::H, true, p(0), m(p(1), 0)), 0x79800020)
+    assert_word(load_inst(MMemSize::W, true, p(0), m(p(1), 0)), 0xB9800020)
+}
+
+#test
+/**
+ * encodes_stores — STR/STRB/STRH across widths and scaled offsets, covering
+ * `store_form` end to end.
+ *
+ * @return void
+ */
+fn encodes_stores() {
+    assert_word(store_inst(MMemSize::X, p(0), m(p(1), 0)), 0xF9000020)
+    assert_word(store_inst(MMemSize::X, p(0), m(p(1), 16)), 0xF9000820)
+    assert_word(store_inst(MMemSize::W, p(0), m(p(1), 4)), 0xB9000420)
+    assert_word(store_inst(MMemSize::B, p(0), m(p(1), 0)), 0x39000020)
+    assert_word(store_inst(MMemSize::H, p(0), m(p(1), 0)), 0x79000020)
+}
+
+#test
+/**
+ * encodes_indirect_call_and_ret — BLR (position-independent) and the bare RET
+ * word.
+ *
+ * @return void
+ */
+fn encodes_indirect_call_and_ret() {
+    let no_uses: []MReg = teko::list::empty()
+    assert_word(call_indirect_inst(p(8), no_uses, p(0), false), 0xD63F0100)
+    assert_word(ret_inst(), 0xD65F03C0)
+}
+
+#test
+/**
+ * encodes_unconditional_branch_placeholder — B emits the `0x14000000`
+ * placeholder flagged for imm26 patching with its target block id.
+ *
+ * @return void
+ */
+fn encodes_unconditional_branch_placeholder() {
+    let ew = enc(branch_inst(3))
+    teko::assert::is_true(ew.word == (0x14000000 to u32))
+    teko::assert::is_true(ew.has_branch)
+    teko::assert::is_false(ew.has_reloc)
+    teko::assert::is_true(ew.target == (3 to u32))
+    teko::assert::is_true(ew.branch_form == (0 to u32))
+}
+
+#test
+/**
+ * encodes_conditional_branch_placeholder — B.cond bakes the condition and flags
+ * imm19 patching; the condition rides bits 0-3.
+ *
+ * @return void
+ */
+fn encodes_conditional_branch_placeholder() {
+    let ew = enc(branch_cond_inst(MCond::NE, 2))
+    teko::assert::is_true(ew.word == (0x54000001 to u32))
+    teko::assert::is_true(ew.has_branch)
+    teko::assert::is_true(ew.target == (2 to u32))
+    teko::assert::is_true(ew.branch_form == (1 to u32))
+    assert_word(branch_cond_inst(MCond::EQ, 0), 0x54000000)
+}
+
+#test
+/**
+ * encodes_compare_and_branch_placeholder — CBZ/CBNZ bake the register and
+ * zero/nonzero opcode and flag imm19 patching, over both widths.
+ *
+ * @return void
+ */
+fn encodes_compare_and_branch_placeholder() {
+    let ew = enc(cbz_inst(true, true, p(5), 4))
+    teko::assert::is_true(ew.word == (0xB4000005 to u32))
+    teko::assert::is_true(ew.has_branch)
+    teko::assert::is_true(ew.target == (4 to u32))
+    teko::assert::is_true(ew.branch_form == (1 to u32))
+    assert_word(cbz_inst(false, false, p(5), 4), 0x35000005)
+    assert_word(cbz_inst(true, false, p(5), 4), 0xB5000005)
+}
+
+#test
+/**
+ * encodes_direct_call_reloc — BL emits the `0x94000000` placeholder flagged for
+ * a `Call` (BRANCH26) relocation on the callee symbol.
+ *
+ * @return void
+ */
+fn encodes_direct_call_reloc() {
+    let no_uses: []MReg = teko::list::empty()
+    let ew = enc(call_inst("tk_exit", no_uses, p(0), false, false))
+    teko::assert::is_true(ew.word == (0x94000000 to u32))
+    teko::assert::is_true(ew.has_reloc)
+    teko::assert::is_false(ew.has_branch)
+    teko::assert::str_contains(ew.reloc_sym, "tk_exit")
+    teko::assert::str_contains(reloc_kind_name(ew.reloc_kind), "call")
+}
+
+#test
+/**
+ * encodes_adrp_addlo_reloc — ADRP and ADD-lo12 emit their placeholders flagged
+ * for the PAGE21/PAGEOFF12 relocations, carrying the instruction's own kind.
+ *
+ * @return void
+ */
+fn encodes_adrp_addlo_reloc() {
+    let hi = enc(adrp_inst(p(3), "msg", MRelocKind::PageHi))
+    teko::assert::is_true(hi.word == (0x90000003 to u32))
+    teko::assert::is_true(hi.has_reloc)
+    teko::assert::str_contains(reloc_kind_name(hi.reloc_kind), "page_hi")
+    let lo = enc(add_lo_inst(p(1), p(2), "msg", MRelocKind::PageLo))
+    teko::assert::is_true(lo.word == (0x91000041 to u32))
+    teko::assert::is_true(lo.has_reloc)
+    teko::assert::str_contains(reloc_kind_name(lo.reloc_kind), "page_lo")
+}
+
+#test
+/**
+ * float_family_honest_stops — every FP-family case raises the `A4-fp` named
+ * honest-stop.
+ *
+ * @return void
+ */
+fn float_family_honest_stops() {
+    assert_stop(falu_inst(MFAluOp::FAdd, true, fp(0), fp(1), fp(2)), "A4-fp")
+    assert_stop(fneg_inst(true, fp(0), fp(1)), "A4-fp")
+    assert_stop(fcmp_inst(true, fp(0), fp(1)), "A4-fp")
+    assert_stop(fmov_inst(true, fp(0), fp(1)), "A4-fp")
+    assert_stop(cvt_inst(MCvtOp::Scvtf, fp(0), p(1)), "A4-fp")
+}
+
+#test
+/**
+ * fpr_memory_honest_stops — loads/stores of the `S`/`D` FPR widths raise the
+ * `A4-fp` honest-stop.
+ *
+ * @return void
+ */
+fn fpr_memory_honest_stops() {
+    assert_stop(load_inst(MMemSize::S, false, fp(0), m(p(1), 0)), "A4-fp")
+    assert_stop(load_inst(MMemSize::D, false, fp(0), m(p(1), 0)), "A4-fp")
+    assert_stop(store_inst(MMemSize::S, fp(0), m(p(1), 0)), "A4-fp")
+    assert_stop(store_inst(MMemSize::D, fp(0), m(p(1), 0)), "A4-fp")
+}
+
+#test
+/**
+ * frame_addr_honest_stop — `MFrameAddr` raises the `A4-frame` honest-stop in
+ * A4-1 (its resolution needs the A4-2 FrameLayout).
+ *
+ * @return void
+ */
+fn frame_addr_honest_stop() {
+    assert_stop(frame_addr_inst(p(0), 0), "A4-frame")
+}
+
+#test
+/**
+ * big_immediate_honest_stops — an out-of-range or non-add/sub immediate raises
+ * the `A4-bigimm` honest-stop, for both ALU-imm and CMP-imm.
+ *
+ * @return void
+ */
+fn big_immediate_honest_stops() {
+    assert_stop(alu_imm_inst(MAluOp::Add, true, p(0), p(1), 5000 to i64), "A4-bigimm")
+    assert_stop(alu_imm_inst(MAluOp::Add, true, p(0), p(1), (0 to i64) - (5000 to i64)), "A4-bigimm")
+    assert_stop(alu_imm_inst(MAluOp::And, true, p(0), p(1), 3 to i64), "A4-bigimm")
+    assert_stop(cmp_imm_inst(true, p(1), 5000 to i64), "A4-bigimm")
+    assert_stop(cmp_imm_inst(true, p(1), (0 to i64) - (1 to i64)), "A4-bigimm")
+}
+
+#test
+/**
+ * unscaled_offset_honest_stops — a negative, unaligned, or too-large load/store
+ * offset raises the `A4-ldur` honest-stop, covering each `scaled_offset` guard.
+ *
+ * @return void
+ */
+fn unscaled_offset_honest_stops() {
+    assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), (0 to i32) - (8 to i32))), "A4-ldur")
+    assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), 4)), "A4-ldur")
+    assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), 32768)), "A4-ldur")
+    assert_stop(store_inst(MMemSize::H, p(0), m(p(1), 1)), "A4-ldur")
+}
