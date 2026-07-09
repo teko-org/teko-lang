@@ -1,0 +1,238 @@
+/**
+ * NumberedInst — one `MInst` tagged with its linear program point and its
+ * source block id: the coordinate system every liveness pass indexes by
+ * (§3.1). Points are dense and increase in block order.
+ *
+ * @since #384 A3-2
+ */
+pub type NumberedInst = struct {
+    /**
+     * point — the instruction's linear program point (0-based, block order).
+     */
+    point: u32
+    /**
+     * block_id — the `MBlock` this instruction was flattened from.
+     */
+    block_id: u32
+    /**
+     * inst — the machine instruction at this point.
+     */
+    inst: MInst
+}
+
+/**
+ * number_insts — flatten `f`'s blocks into one linearly-numbered instruction
+ * stream in block order (§3.1). Every later pass (interval computation, the
+ * scan, the rewrite) indexes liveness by these points.
+ *
+ * @param MFunc f  the selected function
+ * @return []NumberedInst  the flattened, numbered stream
+ */
+fn number_insts(f: MFunc) -> []NumberedInst {
+    mut out: []NumberedInst = teko::list::empty()
+    mut p: u32 = 0
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            out = teko::list::push(out, NumberedInst { point = p; block_id = b.id; inst = b.insts[ii] })
+            p = p + 1
+            ii++
+        }
+        bi++
+    }
+    out
+}
+
+/**
+ * InstRegs — the def/use decomposition of one `MInst` (§1.1): its optional
+ * defined register, the registers it uses, and whether it is a call (which
+ * clobbers the caller-saved set). This is the single source of truth both
+ * interval computation and the rewrite read, so the def/use table lives in
+ * ONE place (M.5).
+ *
+ * @since #384 A3-2
+ */
+pub type InstRegs = struct {
+    /**
+     * has_def — true iff the instruction writes a register (`def_reg`).
+     */
+    has_def: bool
+    /**
+     * def_reg — the defined register (meaningful only when `has_def`).
+     */
+    def_reg: MReg
+    /**
+     * uses — every register the instruction reads, in operand order.
+     */
+    uses: []MReg
+    /**
+     * is_call — true for `MCall`/`MCallIndirect` (clobbers caller-saved).
+     */
+    is_call: bool
+}
+
+/**
+ * ir_dummy — the placeholder `def_reg` for a no-def decomposition (never read
+ * when `has_def` is false).
+ *
+ * @return MReg  an arbitrary physical register
+ */
+fn ir_dummy() -> MReg {
+    preg(0, MRegClass::GPR)
+}
+
+/**
+ * one_reg — a single-register use list.
+ *
+ * @param MReg a  the register
+ * @return []MReg  the one-element list
+ */
+fn one_reg(a: MReg) -> []MReg {
+    teko::list::push(teko::list::empty(), a)
+}
+
+/**
+ * two_regs — a two-register use list, in order.
+ *
+ * @param MReg a  the first register
+ * @param MReg b  the second register
+ * @return []MReg  the two-element list
+ */
+fn two_regs(a: MReg, b: MReg) -> []MReg {
+    teko::list::push(one_reg(a), b)
+}
+
+/**
+ * three_regs — a three-register use list, in order (the `MMSub` case).
+ *
+ * @param MReg a  the first register
+ * @param MReg b  the second register
+ * @param MReg c  the third register
+ * @return []MReg  the three-element list
+ */
+fn three_regs(a: MReg, b: MReg, c: MReg) -> []MReg {
+    teko::list::push(two_regs(a, b), c)
+}
+
+/**
+ * cons_reg — `a` prepended to `rest` (the `MCallIndirect` target-plus-args
+ * use list).
+ *
+ * @param MReg a  the register to prepend
+ * @param []MReg rest  the tail
+ * @return []MReg  `a` followed by every element of `rest`
+ */
+fn cons_reg(a: MReg, rest: []MReg) -> []MReg {
+    mut out = one_reg(a)
+    mut i: u64 = 0
+    loop {
+        if i >= rest.len { break }
+        out = teko::list::push(out, rest[i])
+        i++
+    }
+    out
+}
+
+/**
+ * ir_def — a define-only decomposition (a fresh materialization / address).
+ *
+ * @param MReg d  the defined register
+ * @return InstRegs  `{has_def, def_reg=d, no uses}`
+ */
+fn ir_def(d: MReg) -> InstRegs {
+    InstRegs { has_def = true; def_reg = d; uses = teko::list::empty(); is_call = false }
+}
+
+/**
+ * ir_def_use — a define-and-use decomposition.
+ *
+ * @param MReg d  the defined register
+ * @param []MReg us  the used registers
+ * @return InstRegs  `{has_def, def_reg=d, uses=us}`
+ */
+fn ir_def_use(d: MReg, us: []MReg) -> InstRegs {
+    InstRegs { has_def = true; def_reg = d; uses = us; is_call = false }
+}
+
+/**
+ * ir_use — a use-only decomposition (a store / compare / conditional test).
+ *
+ * @param []MReg us  the used registers
+ * @return InstRegs  `{no def, uses=us}`
+ */
+fn ir_use(us: []MReg) -> InstRegs {
+    InstRegs { has_def = false; def_reg = ir_dummy(); uses = us; is_call = false }
+}
+
+/**
+ * ir_none — an empty decomposition (a terminator with no register operand).
+ *
+ * @return InstRegs  `{no def, no uses}`
+ */
+fn ir_none() -> InstRegs {
+    InstRegs { has_def = false; def_reg = ir_dummy(); uses = teko::list::empty(); is_call = false }
+}
+
+/**
+ * ir_call — a call decomposition: the pinned arg physregs are `uses`, the
+ * result register is a def iff the call produces one, and `is_call` marks the
+ * caller-saved clobber.
+ *
+ * @param MReg ret  the result register
+ * @param bool has_result  whether the call defines `ret`
+ * @param []MReg us  the pinned argument physregs
+ * @return InstRegs  the call decomposition
+ */
+fn ir_call(ret: MReg, has_result: bool, us: []MReg) -> InstRegs {
+    InstRegs { has_def = has_result; def_reg = ret; uses = us; is_call = true }
+}
+
+/**
+ * inst_regs — decompose one `MInst` into its def/use registers per the §1.1
+ * table. A flat per-case match over the 29-case `MInst` variant
+ * (`minst.tks:787`). Two subtleties the table encodes: `MMovK` is
+ * read-modify-write (its `dst` is BOTH a use and a def — `minst.tks:406`), and
+ * `MRet` carries no operand (its returned value was pre-pinned to x0/v0 by a
+ * preceding move, so the pin's interval is extended to the terminator by
+ * `compute_intervals`, not reported here).
+ *
+ * @param MInst inst  the instruction to decompose
+ * @return InstRegs  its def/use decomposition
+ */
+pub fn inst_regs(inst: MInst) -> InstRegs {
+    match inst {
+        MAlu as x => ir_def_use(x.dst, two_regs(x.a, x.b))
+        MAluImm as x => ir_def_use(x.dst, one_reg(x.a))
+        MMSub as x => ir_def_use(x.dst, three_regs(x.a, x.b, x.c))
+        MNeg as x => ir_def_use(x.dst, one_reg(x.a))
+        MMvn as x => ir_def_use(x.dst, one_reg(x.a))
+        MFAlu as x => ir_def_use(x.dst, two_regs(x.a, x.b))
+        MFNeg as x => ir_def_use(x.dst, one_reg(x.a))
+        MCmp as x => ir_use(two_regs(x.a, x.b))
+        MCmpImm as x => ir_use(one_reg(x.a))
+        MFCmp as x => ir_use(two_regs(x.a, x.b))
+        MCSet as x => ir_def(x.dst)
+        MMovZ as x => ir_def(x.dst)
+        MMovK as x => ir_def_use(x.dst, one_reg(x.dst))
+        MMovN as x => ir_def(x.dst)
+        MFMov as x => ir_def_use(x.dst, one_reg(x.src))
+        MMov as x => ir_def_use(x.dst, one_reg(x.src))
+        MExt as x => ir_def_use(x.dst, one_reg(x.a))
+        MCvt as x => ir_def_use(x.dst, one_reg(x.a))
+        MLoad as x => ir_def_use(x.dst, one_reg(x.mem.base))
+        MStore as x => ir_use(two_regs(x.src, x.mem.base))
+        MFrameAddr as x => ir_def(x.dst)
+        MAdrp as x => ir_def(x.dst)
+        MAddLo as x => ir_def_use(x.dst, one_reg(x.a))
+        MBranch => ir_none()
+        MBranchCond => ir_none()
+        MCbz as x => ir_use(one_reg(x.a))
+        MCall as x => ir_call(x.ret_reg, x.has_result, x.uses)
+        MCallIndirect as x => ir_call(x.ret_reg, x.has_result, cons_reg(x.target, x.uses))
+        MRet => ir_none()
+    }
+}
