@@ -969,3 +969,50 @@ fn unscaled_offset_honest_stops() {
     assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), 32768)), "A4-ldur")
     assert_stop(store_inst(MMemSize::H, p(0), m(p(1), 1)), "A4-ldur")
 }
+
+#test
+/**
+ * layout_zero_and_one_align_slots — an alloca with `align = 0` or `align = 1`
+ * lays out at the running offset unchanged (the guarded `align_up` no-op arm,
+ * the same contract as `lir::align_up`): slots `[{8,0},{8,1},{4,4}]` sit at
+ * `[0, 8, 16]` (slots region 32) and the FP/LR pair brings the frame to 48.
+ *
+ * @return void
+ */
+fn layout_zero_and_one_align_slots() {
+    let frame = teko::list::push(teko::list::push(teko::list::push(l_frame(), alloca_slot(8, 0)), alloca_slot(8, 1)), alloca_slot(4, 4))
+    let fl = compute_frame_layout(aapcs64(), func_of(frame, l_insts()))
+    teko::assert::is_true(fl.slot_offsets[0] == (0 to u32))
+    teko::assert::is_true(fl.slot_offsets[1] == (8 to u32))
+    teko::assert::is_true(fl.slot_offsets[2] == (16 to u32))
+    teko::assert::is_true(fl.size == (48 to u32))
+}
+
+#test
+/**
+ * callee_saved_only_leaf_is_framed — a no-call, no-slot leaf that touches x19
+ * is framed purely by its save-set: size = 16 (FP/LR) + 8 (x19) rounded to 32.
+ *
+ * @return void
+ */
+fn callee_saved_only_leaf_is_framed() {
+    let insts = teko::list::push(l_insts(), alu_inst(MAluOp::Add, true, p(19), p(0), p(1)))
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.saved_gpr.len == 1)
+    teko::assert::is_true(fl.size == (32 to u32))
+}
+
+#test
+/**
+ * indirect_call_without_ret_is_frameless — an `MCallIndirect` with no `MRet`
+ * (the BLR-terminated shape) stays frameless, mirroring the direct-call case:
+ * `has_call` alone never forces LR preservation.
+ *
+ * @return void
+ */
+fn indirect_call_without_ret_is_frameless() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = teko::list::push(l_insts(), call_indirect_inst(p(9), no_uses, p(0), false))
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (0 to u32))
+}
