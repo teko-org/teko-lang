@@ -888,6 +888,26 @@ fn interp_store(mrf: MRegFile, x: MStore) -> MIStep {
 }
 
 /**
+ * interp_call — an `MCall` step: only `tk_exit` executes — it reads the exit
+ * code pinned in x0 and unwinds the program with it (with no callee recursion
+ * yet, an exit is a RETURN from the sole running function). Every other call —
+ * a user function or another `tk_*` — is golden-dump-only until the interp
+ * recurses into callees.
+ *
+ * @param MRegFile mrf  the register file to read
+ * @param MCall x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_call(mrf: MRegFile, x: MCall) -> MIStep {
+    if x.sym == "tk_exit" {
+        let code = mrf_get(mrf, preg(0, MRegClass::GPR))
+        if !code.ok { return mistep_stop(mires_error("minst interp: tk_exit with no exit code pinned in x0 (internal)"), mrf) }
+        return mistep_stop(mires_return(code.value), mrf)
+    }
+    mistep_stop(mires_error("minst interp: only tk_exit is executed; user-function and other tk_* calls are golden-dump-only until the interp recurses into callees"), mrf)
+}
+
+/**
  * interp_one — execute one `MInst`, dispatching by case (§4 of the isel
  * plan). A2-2's own selections (`MAlu`/`MAluImm`/`MMSub`/`MNeg`/`MCmp`/
  * `MCmpImm`/`MCSet`/`MMovZ`/`MMovK`/`MMovN`/`MMov`/`MRet`) plus A2-3 control
@@ -930,8 +950,8 @@ fn interp_one(mrf: MRegFile, inst: MInst) -> MIStep {
         MBranch as x => interp_branch(mrf, x)
         MBranchCond as x => interp_branch_cond(mrf, x)
         MCbz as x => interp_cbz(mrf, x)
-        MCall => out_of_scope("minst interp: calls are out of the A2-2 run subset (A2-5)", mrf)
-        MCallIndirect => out_of_scope("minst interp: calls are out of the A2-2 run subset (A2-5)", mrf)
+        MCall as x => interp_call(mrf, x)
+        MCallIndirect => out_of_scope("minst interp: an indirect call needs the func-address model + callee recursion — golden-dump-only in A2-5", mrf)
         MRet => interp_ret(mrf)
     }
 }

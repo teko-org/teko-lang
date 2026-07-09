@@ -1586,12 +1586,126 @@ fn select_func_addr(ctx0: SelCtx, inst: lir::LInst, fa: lir::LFuncAddr) -> SelCt
 }
 
 /**
- * select_inst — the per-`LOp` dispatch (§3 of the isel plan): the A2-2 core
- * cases (`LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`) plus A2-3
- * control flow (`LJump`/`LBranch`) plus A2-4 memory (`LAlloca`/`LFieldAddr`/
- * `LLoad`/`LStore`/`LGlobalAddr`/`LFuncAddr`) select; the remaining cases are a
- * NAMED honest-stop naming the sub-sub-PR that covers them (the calls
- * `LCall`/`LCallIndirect`: A2-5).
+ * PinnedArgs — the outcome of lowering a call's arguments into their AAPCS64
+ * argument registers: the advanced context + the pinned physical registers
+ * (the `uses` the `MCall`/`MCallIndirect` records for A3 liveness).
+ *
+ * @since #383 A2-5
+ */
+type PinnedArgs = struct {
+    /**
+     * ctx — the context with every argument pinned into its ABI register.
+     */
+    ctx: SelCtx
+    /**
+     * uses — the physical argument registers pinned, in argument order.
+     */
+    uses: []MReg
+}
+
+/**
+ * pin_args — lower each argument into its AAPCS64 slot: classify by the arg's
+ * recorded register file (GPR fills x0..x7, FPR fills v0..v7, counted
+ * independently) and pin it with a `MMov`/`MFMov` into that physical register,
+ * collecting the physregs as the call's `uses`. Overflow past 8 of a class
+ * needs the stack-arg area, and a variadic call needs the callee's fixed arity
+ * to split its register/stack halves (§3.5) — `LCall` carries neither, so both
+ * honest-stop with a NAMED error (the call stack-arg + fixed-arity follow-up).
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param []u32 args  the argument VRegs, in declaration order
+ * @param bool variadic  whether the call is variadic (honest-stops here)
+ * @return PinnedArgs | error  the pinned args, or a NAMED honest-stop
+ */
+fn pin_args(ctx0: SelCtx, args: []u32, variadic: bool) -> PinnedArgs | error {
+    if variadic {
+        return error { message = "isel arm64: a variadic call needs the callee's fixed arity to route its tail to the stack (AAPCS64 §3.5); LCall carries no arity — deferred to the call stack-arg follow-up" }
+    }
+    mut ctx = ctx0
+    mut uses: []MReg = teko::list::empty()
+    mut gpr_n: u32 = 0
+    mut fpr_n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        let a = args[i]
+        let info = vinfo_get(ctx.vinfo, a)
+        let is_fpr = info.reg_class == MRegClass::FPR
+        let idx = if is_fpr { fpr_n } else { gpr_n }
+        if idx >= 8 {
+            return error { message = "isel arm64: more than 8 arguments of one register class needs the AAPCS64 stack-arg slot — deferred to the call stack-arg follow-up" }
+        }
+        let phys = preg(idx, info.reg_class)
+        let mv = if is_fpr { fmov_inst(info.wide, phys, vreg(a, MRegClass::FPR)) } else { mov_inst(info.wide, phys, vreg(a, MRegClass::GPR)) }
+        ctx = selctx_emit(ctx, mv)
+        uses = teko::list::push(uses, phys)
+        if is_fpr { fpr_n = fpr_n + 1 } else { gpr_n = gpr_n + 1 }
+        i++
+    }
+    PinnedArgs { ctx = ctx; uses = uses }
+}
+
+/**
+ * select_call_result — after a call, move its result out of the ABI result
+ * register into the result VReg (when the call produces one). The result class
+ * is taken as GPR (x0): `LInst` carries no result type, so a float-returning
+ * call (v0) is a documented limitation until the LIR records a call's result
+ * type.
+ *
+ * @param SelCtx ctx0  the post-call context to extend
+ * @param lir::LInst inst  the call instruction (its result VReg + `has_result`)
+ * @param MReg ret_reg  the ABI result register the call wrote
+ * @return SelCtx  the advanced context
+ */
+fn select_call_result(ctx0: SelCtx, inst: lir::LInst, ret_reg: MReg) -> SelCtx {
+    if !inst.has_result {
+        return ctx0
+    }
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    selctx_emit(ctx1, mov_inst(true, dst, ret_reg))
+}
+
+/**
+ * select_call — the `LCall` selection: lower the arguments into their AAPCS64
+ * registers (`pin_args`), emit `MCall{sym, uses, ret_reg, has_result,
+ * variadic}`, then move the result out of x0 if the call produces one.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LCall c  the call op
+ * @return SelCtx | error  the advanced context, or a propagated error
+ */
+fn select_call(ctx0: SelCtx, inst: lir::LInst, c: lir::LCall) -> SelCtx | error {
+    let pinned = match pin_args(ctx0, c.args, c.variadic) { PinnedArgs as p => p; error as e => return e }
+    let ret_reg = preg(0, MRegClass::GPR)
+    let ctx1 = selctx_emit(pinned.ctx, call_inst(c.symbol, pinned.uses, ret_reg, inst.has_result, c.variadic))
+    select_call_result(ctx1, inst, ret_reg)
+}
+
+/**
+ * select_call_indirect — the `LCallIndirect` selection: identical argument
+ * lowering, then `MCallIndirect{target, uses, ret_reg, has_result}` (BLR
+ * through the target Ptr VReg), then the result move.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LCallIndirect ci  the indirect-call op
+ * @return SelCtx | error  the advanced context, or a propagated error
+ */
+fn select_call_indirect(ctx0: SelCtx, inst: lir::LInst, ci: lir::LCallIndirect) -> SelCtx | error {
+    let pinned = match pin_args(ctx0, ci.args, ci.variadic) { PinnedArgs as p => p; error as e => return e }
+    let ret_reg = preg(0, MRegClass::GPR)
+    let ctx1 = selctx_emit(pinned.ctx, call_indirect_inst(vreg(ci.target, MRegClass::GPR), pinned.uses, ret_reg, inst.has_result))
+    select_call_result(ctx1, inst, ret_reg)
+}
+
+/**
+ * select_inst — the per-`LOp` dispatch (§3 of the isel plan): with A2-5's
+ * calls (`LCall`/`LCallIndirect`) the whole `LOp` frontier now selects — the
+ * A2-2 core (`LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`), A2-3
+ * control flow (`LJump`/`LBranch`), A2-4 memory (`LAlloca`/`LFieldAddr`/
+ * `LLoad`/`LStore`/`LGlobalAddr`/`LFuncAddr`), and A2-5 calls.
  *
  * @param SelCtx ctx  the context to extend
  * @param lir::LFunc f  the enclosing function (`LParam` needs its
@@ -1614,9 +1728,9 @@ fn select_inst(ctx: SelCtx, f: lir::LFunc, inst: lir::LInst) -> SelCtx | error {
         lir::LLoad as l => select_load(ctx, inst, l)
         lir::LStore as s => select_store(ctx, s)
         lir::LGlobalAddr as g => select_global_addr(ctx, inst, g)
-        lir::LCallIndirect => error { message = "isel arm64: `call.indirect` is out of A2-2 scope (calls land in A2-5)" }
+        lir::LCallIndirect as ci => select_call_indirect(ctx, inst, ci)
         lir::LFuncAddr as fa => select_func_addr(ctx, inst, fa)
-        lir::LCall => error { message = "isel arm64: `call` is out of A2-2 scope (calls land in A2-5)" }
+        lir::LCall as c => select_call(ctx, inst, c)
     }
 }
 
