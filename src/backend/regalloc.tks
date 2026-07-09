@@ -1064,3 +1064,604 @@ fn linear_scan(abi: AbiDescriptor, ivals: IntervalSet) -> ScanResult {
     }
     ScanResult { assignments = assignments; used_callee_saved = used_callee }
 }
+
+/**
+ * AssignLookup — the assignment outcome for a queried virtual register
+ * (option-struct, M.2): `found` is false when the id has no interval;
+ * otherwise `is_spill` selects between `phys` (an `InReg` color) and `slot`
+ * (a `Spilled` frame slot).
+ *
+ * @since #384 A3-4
+ */
+pub type AssignLookup = struct {
+    /**
+     * found — true iff the queried id has an assignment.
+     */
+    found: bool
+    /**
+     * is_spill — true iff the assignment is a `Spilled` (read `slot`).
+     */
+    is_spill: bool
+    /**
+     * phys — the assigned physical register id (when `!is_spill`).
+     */
+    phys: u32
+    /**
+     * slot — the spill-relative frame slot (when `is_spill`).
+     */
+    slot: u32
+}
+
+/**
+ * al_none — the not-found `AssignLookup`.
+ *
+ * @return AssignLookup  found=false
+ */
+fn al_none() -> AssignLookup {
+    AssignLookup { found = false; is_spill = false; phys = 0 to u32; slot = 0 to u32 }
+}
+
+/**
+ * in_lookup — the `AssignLookup` for an `InReg` assignment `r` if it names
+ * `vreg_id`, else not-found.
+ *
+ * @param InReg r  the candidate in-register assignment
+ * @param u32 vreg_id  the queried id
+ * @return AssignLookup  the hit, or found=false
+ */
+fn in_lookup(r: InReg, vreg_id: u32) -> AssignLookup {
+    if r.vreg_id == vreg_id {
+        AssignLookup { found = true; is_spill = false; phys = r.phys; slot = 0 to u32 }
+    } else {
+        al_none()
+    }
+}
+
+/**
+ * sp_lookup — the `AssignLookup` for a `Spilled` assignment `s` if it names
+ * `vreg_id`, else not-found.
+ *
+ * @param Spilled s  the candidate spilled assignment
+ * @param u32 vreg_id  the queried id
+ * @return AssignLookup  the hit, or found=false
+ */
+fn sp_lookup(s: Spilled, vreg_id: u32) -> AssignLookup {
+    if s.vreg_id == vreg_id {
+        AssignLookup { found = true; is_spill = true; phys = 0 to u32; slot = s.slot }
+    } else {
+        al_none()
+    }
+}
+
+/**
+ * assign_lookup — the `RegAssignment` for virtual id `vreg_id`, flattened into
+ * an `AssignLookup` (found=false when no interval named it). Vreg ids are
+ * unique across register classes (isel draws every vreg from one counter), so
+ * the id alone keys the assignment.
+ *
+ * @param ScanResult sr  the linear-scan output
+ * @param u32 vreg_id  the virtual register to resolve
+ * @return AssignLookup  the assignment, or found=false
+ */
+pub fn assign_lookup(sr: ScanResult, vreg_id: u32) -> AssignLookup {
+    mut i: u64 = 0
+    loop {
+        if i >= sr.assignments.len { break }
+        let a = sr.assignments[i]
+        let hit = match a {
+            InReg as r => in_lookup(r, vreg_id)
+            Spilled as s => sp_lookup(s, vreg_id)
+        }
+        if hit.found { return hit }
+        i++
+    }
+    al_none()
+}
+
+/**
+ * SubstEntry — one virtual-register substitution for the rewrite: the virtual
+ * id `vid` becomes the physical register `to` (a color, a spill reload
+ * scratch, or a spill def scratch).
+ *
+ * @since #384 A3-4
+ */
+pub type SubstEntry = struct {
+    /**
+     * vid — the virtual register id being replaced.
+     */
+    vid: u32
+    /**
+     * to — the physical register it maps to.
+     */
+    to: MReg
+}
+
+/**
+ * subst_has — whether `table` already substitutes virtual id `vid`.
+ *
+ * @param []SubstEntry table  the substitution table
+ * @param u32 vid  the virtual id to test
+ * @return bool  true iff already present
+ */
+fn subst_has(table: []SubstEntry, vid: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        if table[i].vid == vid { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * subst_find — `r` mapped through `table`: a physical pin passes through
+ * unchanged; a virtual register resolves to its table entry, or (defensively,
+ * for a register with no interval) to itself.
+ *
+ * @param []SubstEntry table  the substitution table
+ * @param MReg r  the register to map
+ * @return MReg  the substituted register
+ */
+fn subst_find(table: []SubstEntry, r: MReg) -> MReg {
+    if r.is_phys { return r }
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        let e = table[i]
+        if e.vid == r.id { return e.to }
+        i++
+    }
+    r
+}
+
+/**
+ * map_regs_list — element-wise substitution of an `MReg` list (an `MCall`/
+ * `MCallIndirect` `uses` list).
+ *
+ * @param []MReg list  the register list
+ * @param []SubstEntry table  the substitution table
+ * @return []MReg  the substituted list
+ */
+fn map_regs_list(list: []MReg, table: []SubstEntry) -> []MReg {
+    mut out: []MReg = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        out = teko::list::push(out, subst_find(table, list[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * map_minst_regs — a copy of `inst` with every `MReg` field replaced through
+ * `table` (a flat per-case reconstruction over the 29-case variant, mirroring
+ * `inst_regs`'s dispatch). `MCall`/`MCallIndirect` map their `uses`
+ * element-wise, their `ret_reg`, and (indirect) their `target`. This is the
+ * single point where the machine-IR's register-field shape is walked for
+ * rewriting — a missed case would leak a virtual register into the output,
+ * which the all-physical invariant test catches.
+ *
+ * @param MInst inst  the instruction to rewrite
+ * @param []SubstEntry table  the substitution table
+ * @return MInst  the rewritten instruction
+ */
+pub fn map_minst_regs(inst: MInst, table: []SubstEntry) -> MInst {
+    match inst {
+        MAlu as x => MAlu { op = x.op; wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a); b = subst_find(table, x.b) }
+        MAluImm as x => MAluImm { op = x.op; wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a); imm = x.imm }
+        MMSub as x => MMSub { wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a); b = subst_find(table, x.b); c = subst_find(table, x.c) }
+        MNeg as x => MNeg { wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MMvn as x => MMvn { wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MFAlu as x => MFAlu { op = x.op; dbl = x.dbl; dst = subst_find(table, x.dst); a = subst_find(table, x.a); b = subst_find(table, x.b) }
+        MFNeg as x => MFNeg { dbl = x.dbl; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MCmp as x => MCmp { wide = x.wide; a = subst_find(table, x.a); b = subst_find(table, x.b) }
+        MCmpImm as x => MCmpImm { wide = x.wide; a = subst_find(table, x.a); imm = x.imm }
+        MFCmp as x => MFCmp { dbl = x.dbl; a = subst_find(table, x.a); b = subst_find(table, x.b) }
+        MCSet as x => MCSet { wide = x.wide; dst = subst_find(table, x.dst); cond = x.cond }
+        MMovZ as x => MMovZ { wide = x.wide; dst = subst_find(table, x.dst); imm16 = x.imm16; shift = x.shift }
+        MMovK as x => MMovK { wide = x.wide; dst = subst_find(table, x.dst); imm16 = x.imm16; shift = x.shift }
+        MMovN as x => MMovN { wide = x.wide; dst = subst_find(table, x.dst); imm16 = x.imm16; shift = x.shift }
+        MFMov as x => MFMov { dbl = x.dbl; dst = subst_find(table, x.dst); src = subst_find(table, x.src) }
+        MMov as x => MMov { wide = x.wide; dst = subst_find(table, x.dst); src = subst_find(table, x.src) }
+        MExt as x => MExt { op = x.op; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MCvt as x => MCvt { op = x.op; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MLoad as x => MLoad { size = x.size; sign = x.sign; dst = subst_find(table, x.dst); mem = MMem { base = subst_find(table, x.mem.base); offset = x.mem.offset } }
+        MStore as x => MStore { size = x.size; src = subst_find(table, x.src); mem = MMem { base = subst_find(table, x.mem.base); offset = x.mem.offset } }
+        MFrameAddr as x => MFrameAddr { dst = subst_find(table, x.dst); slot = x.slot }
+        MAdrp as x => MAdrp { dst = subst_find(table, x.dst); sym = x.sym; kind = x.kind }
+        MAddLo as x => MAddLo { dst = subst_find(table, x.dst); a = subst_find(table, x.a); sym = x.sym; kind = x.kind }
+        MBranch as x => MBranch { target = x.target }
+        MBranchCond as x => MBranchCond { cond = x.cond; target = x.target }
+        MCbz as x => MCbz { wide = x.wide; zero = x.zero; a = subst_find(table, x.a); target = x.target }
+        MCall as x => MCall { sym = x.sym; uses = map_regs_list(x.uses, table); ret_reg = subst_find(table, x.ret_reg); has_result = x.has_result; variadic = x.variadic }
+        MCallIndirect as x => MCallIndirect { target = subst_find(table, x.target); uses = map_regs_list(x.uses, table); ret_reg = subst_find(table, x.ret_reg); has_result = x.has_result }
+        MRet => MRet { }
+    }
+}
+
+/**
+ * minst_single — a one-element instruction list.
+ *
+ * @param MInst x  the instruction
+ * @return []MInst  the singleton list
+ */
+fn minst_single(x: MInst) -> []MInst {
+    teko::list::push(teko::list::empty(), x)
+}
+
+/**
+ * minst_cat — `a` followed by every element of `b`.
+ *
+ * @param []MInst a  the prefix list
+ * @param []MInst b  the suffix list
+ * @return []MInst  the concatenation
+ */
+fn minst_cat(a: []MInst, b: []MInst) -> []MInst {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * emit_gpr_reload — the two-instruction GPR spill reload into `sv`: compute the
+ * slot address into `sv`, then load the slot value into `sv` (base==dst is
+ * legal, §1.4). Both the address and the value live in `sv`.
+ *
+ * @param MReg sv  the GPR scratch to reload into
+ * @param u32 slot  the absolute frame slot
+ * @return []MInst  the reload sequence
+ */
+fn emit_gpr_reload(sv: MReg, slot: u32) -> []MInst {
+    let fa = frame_addr_inst(sv, slot)
+    let ld = load_inst(MMemSize::X, false, sv, MMem { base = sv; offset = 0 to i32 })
+    teko::list::push(minst_single(fa), ld)
+}
+
+/**
+ * emit_gpr_store — the two-instruction GPR spill store of the value already in
+ * `dsv`: compute the slot address into a distinct scratch `asv`, then store
+ * `dsv` to `[asv]`.
+ *
+ * @param MReg dsv  the GPR scratch holding the value to store
+ * @param MReg asv  a distinct GPR scratch for the slot address
+ * @param u32 slot  the absolute frame slot
+ * @return []MInst  the store sequence
+ */
+fn emit_gpr_store(dsv: MReg, asv: MReg, slot: u32) -> []MInst {
+    let fa = frame_addr_inst(asv, slot)
+    let st = store_inst(MMemSize::X, dsv, MMem { base = asv; offset = 0 to i32 })
+    teko::list::push(minst_single(fa), st)
+}
+
+/**
+ * add_use_subst — the substitution table extended for one instruction operand
+ * use `u`: a physical pin or an already-mapped id is left as-is; an `InReg`
+ * use maps to its color; a `Spilled` GPR use draws the next reload scratch
+ * (`nth`), whose reload is appended to `reloads`. Returns the grown table, the
+ * grown reloads, and the advanced scratch counter via `UseAcc`. FPR spills are
+ * ruled out upstream (`detect_fpr_spill`), so the scratch is always GPR.
+ *
+ * @param AbiDescriptor abi  the register file (for spill scratch)
+ * @param ScanResult sr  the allocation
+ * @param MReg u  the use operand
+ * @param u32 frame_base  the first spill frame slot index
+ * @param UseAcc acc  the table/reloads/counter so far
+ * @return UseAcc  the updated accumulator
+ */
+fn add_use_subst(abi: AbiDescriptor, sr: ScanResult, u: MReg, frame_base: u32, acc: UseAcc) -> UseAcc {
+    if u.is_phys { return acc }
+    if subst_has(acc.table, u.id) { return acc }
+    let la = assign_lookup(sr, u.id)
+    if !la.found { return acc }
+    if la.is_spill {
+        let sv = spill_scratch(abi, MRegClass::GPR, acc.nth)
+        let reloads2 = minst_cat(acc.reloads, emit_gpr_reload(sv, frame_base + la.slot))
+        let table2 = teko::list::push(acc.table, SubstEntry { vid = u.id; to = sv })
+        return UseAcc { table = table2; reloads = reloads2; nth = acc.nth + 1 }
+    }
+    let table3 = teko::list::push(acc.table, SubstEntry { vid = u.id; to = preg(la.phys, u.reg_class) })
+    UseAcc { table = table3; reloads = acc.reloads; nth = acc.nth }
+}
+
+/**
+ * UseAcc — the fold state while substituting an instruction's use operands:
+ * the substitution table, the accumulated reload sequence, and the next
+ * reload-scratch index.
+ *
+ * @since #384 A3-4
+ */
+type UseAcc = struct {
+    /**
+     * table — the substitution entries so far.
+     */
+    table: []SubstEntry
+    /**
+     * reloads — the reload instructions so far (emitted before the inst).
+     */
+    reloads: []MInst
+    /**
+     * nth — the next spill-reload scratch index.
+     */
+    nth: u32
+}
+
+/**
+ * rewrite_inst — expand one instruction into its final physical sequence: the
+ * reloads for its spilled uses, the register-substituted instruction, and the
+ * store for a spilled def (§3.4). Non-spilled operands map to their `InReg`
+ * physreg; physical pins pass through. Assumes GPR-only spills (guaranteed by
+ * `regalloc_func`'s `detect_fpr_spill` pre-check).
+ *
+ * @param AbiDescriptor abi  the register file (for spill scratch)
+ * @param ScanResult sr  the allocation
+ * @param MInst inst  the instruction to rewrite
+ * @param u32 frame_base  the first spill frame slot index
+ * @return []MInst  the reloads ++ the rewritten instruction ++ the store
+ */
+pub fn rewrite_inst(abi: AbiDescriptor, sr: ScanResult, inst: MInst, frame_base: u32) -> []MInst {
+    let ir = inst_regs(inst)
+    mut acc = UseAcc { table = teko::list::empty(); reloads = teko::list::empty(); nth = 0 to u32 }
+    mut ui: u64 = 0
+    loop {
+        if ui >= ir.uses.len { break }
+        acc = add_use_subst(abi, sr, ir.uses[ui], frame_base, acc)
+        ui++
+    }
+    mut table = acc.table
+    mut stores: []MInst = teko::list::empty()
+    if ir.has_def {
+        let d = ir.def_reg
+        if !d.is_phys {
+            let la = assign_lookup(sr, d.id)
+            if la.found {
+                if la.is_spill {
+                    let dsv = spill_scratch(abi, MRegClass::GPR, 0 to u32)
+                    let asv = spill_scratch(abi, MRegClass::GPR, 1 to u32)
+                    if !subst_has(table, d.id) {
+                        table = teko::list::push(table, SubstEntry { vid = d.id; to = dsv })
+                    }
+                    stores = emit_gpr_store(dsv, asv, frame_base + la.slot)
+                } else {
+                    if !subst_has(table, d.id) {
+                        table = teko::list::push(table, SubstEntry { vid = d.id; to = preg(la.phys, d.reg_class) })
+                    }
+                }
+            }
+        }
+    }
+    let mapped = map_minst_regs(inst, table)
+    minst_cat(minst_cat(acc.reloads, minst_single(mapped)), stores)
+}
+
+/**
+ * count_spills — the number of `Spilled` assignments (one fresh frame slot
+ * each) in `sr`.
+ *
+ * @param ScanResult sr  the allocation
+ * @return u32  the spill count
+ */
+fn count_spills(sr: ScanResult) -> u32 {
+    mut n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= sr.assignments.len { break }
+        let is_sp = match sr.assignments[i] { InReg => false; Spilled => true }
+        if is_sp { n = n + 1 }
+        i++
+    }
+    n
+}
+
+/**
+ * reg_is_fpr_spill — whether the virtual register `r` is spilled in `sr` AND
+ * lives in the FPR class (the case A3 honest-stops).
+ *
+ * @param ScanResult sr  the allocation
+ * @param MReg r  the register to test
+ * @return bool  true iff an FPR spill
+ */
+fn reg_is_fpr_spill(sr: ScanResult, r: MReg) -> bool {
+    if r.is_phys { return false }
+    if r.reg_class != MRegClass::FPR { return false }
+    let la = assign_lookup(sr, r.id)
+    la.found && la.is_spill
+}
+
+/**
+ * inst_has_fpr_spill — whether any operand of `inst` is an FPR spill.
+ *
+ * @param ScanResult sr  the allocation
+ * @param MInst inst  the instruction to scan
+ * @return bool  true iff an FPR spill operand is present
+ */
+fn inst_has_fpr_spill(sr: ScanResult, inst: MInst) -> bool {
+    let ir = inst_regs(inst)
+    if ir.has_def {
+        if reg_is_fpr_spill(sr, ir.def_reg) { return true }
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ir.uses.len { break }
+        if reg_is_fpr_spill(sr, ir.uses[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * detect_fpr_spill — whether allocating `f` under `sr` spills any FPR value.
+ * A3 lowers GPR spills only; an FPR spill is a NAMED honest-stop
+ * (`regalloc_func` returns an error), deferred to a follow-up.
+ *
+ * @param ScanResult sr  the allocation
+ * @param MFunc f  the function
+ * @return bool  true iff any FPR value is spilled
+ */
+fn detect_fpr_spill(sr: ScanResult, f: MFunc) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            if inst_has_fpr_spill(sr, b.insts[ii]) { return true }
+            ii++
+        }
+        bi++
+    }
+    false
+}
+
+/**
+ * append_spill_slots — `f.frame` extended by one `LAlloca` per `Spilled`
+ * assignment (§3.5); each spill slot reuses the ABI's slot size/alignment. The
+ * returned frame's new entries occupy indices `f.frame.len ..` — the absolute
+ * slot the reload/store `MFrameAddr` references.
+ *
+ * @param AbiDescriptor abi  the register file (for slot size/align)
+ * @param []lir::LAlloca frame  the function's existing frame table
+ * @param u32 spills  the spill count
+ * @return []lir::LAlloca  the extended frame table
+ */
+fn append_spill_slots(abi: AbiDescriptor, frame: []lir::LAlloca, spills: u32) -> []lir::LAlloca {
+    mut out = frame
+    mut i: u32 = 0
+    loop {
+        if i >= spills { break }
+        out = teko::list::push(out, lir::LAlloca { bytes = abi.spill_slot_bytes; align = abi.spill_slot_align })
+        i = i + 1
+    }
+    out
+}
+
+/**
+ * rewrite_block — one block with every instruction rewritten and flattened;
+ * block params are carried through unchanged (they are merge metadata, not an
+ * executed operand — the edge moves in the stream carry the values).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param ScanResult sr  the allocation
+ * @param MBlock b  the block to rewrite
+ * @param u32 frame_base  the first spill frame slot index
+ * @return MBlock  the rewritten block
+ */
+fn rewrite_block(abi: AbiDescriptor, sr: ScanResult, b: MBlock, frame_base: u32) -> MBlock {
+    mut insts: []MInst = teko::list::empty()
+    mut ii: u64 = 0
+    loop {
+        if ii >= b.insts.len { break }
+        insts = minst_cat(insts, rewrite_inst(abi, sr, b.insts[ii], frame_base))
+        ii++
+    }
+    MBlock { id = b.id; params = b.params; insts = insts }
+}
+
+/**
+ * rewrite_func — rebuild every block from its rewritten instruction sequences
+ * and finalize the frame (§3.5), yielding an `MFunc` whose every `MInst`
+ * operand is physical.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MFunc f  the selected function
+ * @param ScanResult sr  the allocation
+ * @return MFunc  the fully-colored function
+ */
+fn rewrite_func(abi: AbiDescriptor, f: MFunc, sr: ScanResult) -> MFunc {
+    let frame_base = f.frame.len to u32
+    let frame = append_spill_slots(abi, f.frame, count_spills(sr))
+    mut blocks: []MBlock = teko::list::empty()
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        blocks = teko::list::push(blocks, rewrite_block(abi, sr, f.blocks[bi], frame_base))
+        bi++
+    }
+    MFunc { symbol = f.symbol; blocks = blocks; frame = frame }
+}
+
+/**
+ * all_physical — whether every `MInst` operand of `f` is a physical register
+ * (the §4.1 all-physical invariant: no virtual register survived the rewrite).
+ * Block params are metadata, not executed operands, and are not checked.
+ *
+ * @param MFunc f  the colored function
+ * @return bool  true iff fully physical
+ */
+pub fn all_physical(f: MFunc) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            let ir = inst_regs(b.insts[ii])
+            if ir.has_def {
+                if !ir.def_reg.is_phys { return false }
+            }
+            mut ui: u64 = 0
+            loop {
+                if ui >= ir.uses.len { break }
+                if !ir.uses[ui].is_phys { return false }
+                ui++
+            }
+            ii++
+        }
+        bi++
+    }
+    true
+}
+
+/**
+ * regalloc_func — allocate one function end-to-end: number, compute intervals,
+ * scan, rewrite. Returns a NAMED honest-stop error on a loop back-edge (§6.2,
+ * via `compute_intervals`) or on an FPR-value spill (A3 lowers GPR spills
+ * only).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MFunc f  the selected function (virtual MRegs + ABI pins)
+ * @return MFunc | error  the fully-colored function, or a named honest-stop
+ */
+pub fn regalloc_func(abi: AbiDescriptor, f: MFunc) -> MFunc | error {
+    let numbered = number_insts(f)
+    let ivals = match compute_intervals(numbered) {
+        IntervalSet as s => s
+        error as e => return e
+    }
+    let sr = linear_scan(abi, ivals)
+    if detect_fpr_spill(sr, f) {
+        return error { message = "regalloc: FPR-value spill not yet supported (A3 lowers GPR spills only; own-backend FPR-spill deferral)" }
+    }
+    rewrite_func(abi, f, sr)
+}
+
+/**
+ * regalloc_module — allocate every function of `m`, carrying the rodata /
+ * globals / layouts tables through unchanged (A3 touches only registers +
+ * frame, exactly as `select_module` carries them).
+ *
+ * @param AbiDescriptor abi  the register file to allocate from
+ * @param MModule m  the selected module
+ * @return MModule | error  the colored module, or the first function's error
+ */
+pub fn regalloc_module(abi: AbiDescriptor, m: MModule) -> MModule | error {
+    mut funcs: []MFunc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        let rf = match regalloc_func(abi, m.funcs[i]) {
+            MFunc as g => g
+            error as e => return e
+        }
+        funcs = teko::list::push(funcs, rf)
+        i++
+    }
+    MModule { funcs = funcs; rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+}
