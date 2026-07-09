@@ -1,0 +1,763 @@
+/**
+ * EncWord — one instruction's encoding outcome: its base word plus an optional
+ * pending fixup. A position-independent instruction resolves to just `word`
+ * (`has_branch`/`has_reloc` false). A branch carries `has_branch=true` +
+ * `target` (the machine-block id, patched once block offsets are known in
+ * A4-3). A symbol reference carries `has_reloc=true` + `reloc_sym`/`reloc_kind`
+ * (the `Reloc` record is materialized in A4-3).
+ *
+ * @since #385 A4-1
+ */
+pub type EncWord = struct {
+    /**
+     * word — the base 32-bit encoding (operand fields filled, branch/reloc
+     * fields left zero for later patching).
+     */
+    word: u32
+    /**
+     * has_branch — true iff `target` is an intra-function block displacement to
+     * patch after layout (A4-3).
+     */
+    has_branch: bool
+    /**
+     * target — the destination machine-block id (meaningful when `has_branch`).
+     */
+    target: u32
+    /**
+     * branch_form — which displacement field a later pass patches: 0=B(imm26),
+     * 1=B.cond/CBZ(imm19). Sizes the sign-extended range check.
+     */
+    branch_form: u32
+    /**
+     * has_reloc — true iff this word owes a symbol `Reloc` (BL/ADRP/ADDLo).
+     */
+    has_reloc: bool
+    /**
+     * reloc_sym — the relocation's target symbol (meaningful when `has_reloc`).
+     */
+    reloc_sym: str
+    /**
+     * reloc_kind — the relocation kind (meaningful when `has_reloc`).
+     */
+    reloc_kind: MRelocKind
+}
+
+/**
+ * MemForm — a load/store base word paired with its access scale: the pairing
+ * lets `encode_load`/`encode_store` derive the size template and the immediate
+ * scale in one `MMemSize` match, so the FPR (`S`/`D`) honest-stop is raised
+ * exactly once per memory op instead of in two separate lookups.
+ *
+ * @since #385 A4-1
+ */
+type MemForm = struct {
+    /**
+     * base — the size-and-direction template word (the LDR/STR family entry),
+     * with the immediate/register fields left zero.
+     */
+    base: u32
+    /**
+     * scale — the access width in bytes (1/2/4/8); the scaled unsigned
+     * immediate is `offset / scale`.
+     */
+    scale: u32
+}
+
+/**
+ * plain_word — an `EncWord` for a position-independent instruction: just the
+ * finished 32-bit word, with no branch displacement and no symbol relocation
+ * pending. The reloc/branch fields carry inert defaults.
+ *
+ * @param u32 w  the finished instruction word
+ * @return EncWord  the word with no pending fixup
+ */
+fn plain_word(w: u32) -> EncWord {
+    EncWord {
+        word = w
+        has_branch = false
+        target = 0 to u32
+        branch_form = 0 to u32
+        has_reloc = false
+        reloc_sym = ""
+        reloc_kind = MRelocKind::Call
+    }
+}
+
+/**
+ * branch_word — an `EncWord` for an intra-function branch: the base word (with
+ * the displacement field still zero) plus the destination block id and which
+ * displacement field the A4-3 patch pass fills.
+ *
+ * @param u32 w  the base word (condition/register fields filled, displacement zero)
+ * @param u32 target  the destination machine-block id
+ * @param u32 form  the displacement field selector (0=imm26, 1=imm19)
+ * @return EncWord  the word flagged for branch patching
+ */
+fn branch_word(w: u32, target: u32, form: u32) -> EncWord {
+    EncWord {
+        word = w
+        has_branch = true
+        target = target
+        branch_form = form
+        has_reloc = false
+        reloc_sym = ""
+        reloc_kind = MRelocKind::Call
+    }
+}
+
+/**
+ * reloc_word — an `EncWord` for a symbol reference: the placeholder word (with
+ * the immediate the linker patches left zero) plus the target symbol and the
+ * relocation kind the A4-3 assembly turns into a `Reloc` record.
+ *
+ * @param u32 w  the placeholder word (register fields filled, immediate zero)
+ * @param str sym  the target symbol's already-final name
+ * @param MRelocKind kind  which relocation this word owes
+ * @return EncWord  the word flagged for symbol relocation
+ */
+fn reloc_word(w: u32, sym: str, kind: MRelocKind) -> EncWord {
+    EncWord {
+        word = w
+        has_branch = false
+        target = 0 to u32
+        branch_form = 0 to u32
+        has_reloc = true
+        reloc_sym = sym
+        reloc_kind = kind
+    }
+}
+
+/**
+ * emit_u32_le — append `w` to `buf` as four little-endian bytes (the arm64
+ * instruction-word / Mach-O little-endian-field emit primitive), the shared
+ * `[]byte` idiom (`src/compress/compress.tks`). All bit-slicing stays in u32
+ * arithmetic; only the final `& 0xFF` narrows to `byte`.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 w  the 32-bit word to append
+ * @return []byte  `buf` followed by w's four little-endian bytes
+ */
+pub fn emit_u32_le(buf: []byte, w: u32) -> []byte {
+    mut b = teko::list::push(buf, (w & (0xFF to u32)) to byte)
+    b = teko::list::push(b, ((w >> (8 to u32)) & (0xFF to u32)) to byte)
+    b = teko::list::push(b, ((w >> (16 to u32)) & (0xFF to u32)) to byte)
+    teko::list::push(b, ((w >> (24 to u32)) & (0xFF to u32)) to byte)
+}
+
+/**
+ * enc_reg — a physical `MReg`'s 5-bit ISA field value: its `id` directly
+ * (x0..x30/SP=31 for GPR, v0..v31 for FPR). SP vs XZR (both id 31) is decided
+ * by the INSTRUCTION template, not the register, so no per-register
+ * disambiguation happens here.
+ *
+ * @param MReg r  a physical register (A4 runs post-regalloc)
+ * @return u32  its 5-bit ISA field value
+ */
+fn enc_reg(r: MReg) -> u32 {
+    r.id
+}
+
+/**
+ * enc_rd — the `Rd`/`Rt` destination field (bits 0-4): the register id, no
+ * shift.
+ *
+ * @param MReg r  the destination/transfer register
+ * @return u32  the register id placed in bits 0-4
+ */
+fn enc_rd(r: MReg) -> u32 {
+    enc_reg(r)
+}
+
+/**
+ * enc_rn — the `Rn` first-source field (bits 5-9): the register id shifted
+ * left by 5.
+ *
+ * @param MReg r  the first source / base register
+ * @return u32  the register id placed in bits 5-9
+ */
+fn enc_rn(r: MReg) -> u32 {
+    enc_reg(r) << (5 to u32)
+}
+
+/**
+ * enc_rm — the `Rm` second-source field (bits 16-20): the register id shifted
+ * left by 16.
+ *
+ * @param MReg r  the second source register
+ * @return u32  the register id placed in bits 16-20
+ */
+fn enc_rm(r: MReg) -> u32 {
+    enc_reg(r) << (16 to u32)
+}
+
+/**
+ * enc_ra — the `Ra` accumulator field (bits 10-14) of the MADD/MSUB form: the
+ * register id shifted left by 10.
+ *
+ * @param MReg r  the accumulator (minuend) register
+ * @return u32  the register id placed in bits 10-14
+ */
+fn enc_ra(r: MReg) -> u32 {
+    enc_reg(r) << (10 to u32)
+}
+
+/**
+ * sf_bit — the size flag for a `wide` operand: `1 << 31` (the 64-bit X form),
+ * or 0 (the 32-bit W form). Every width-parametric template below is stored in
+ * its bit-31-clear (32-bit) shape, so this ORs the 64-bit form back in.
+ *
+ * @param bool wide  true for the 64-bit form
+ * @return u32  `1 << 31` when wide, else 0
+ */
+fn sf_bit(wide: bool) -> u32 {
+    if wide { (1 to u32) << (31 to u32) } else { 0 to u32 }
+}
+
+/**
+ * cond_code — the 4-bit AArch64 condition field for an `MCond`: the encoding
+ * B.cond tests directly, and the value CSET inverts (`^ 1`) into CSINC.
+ *
+ * @param MCond c  the condition code
+ * @return u32  its 4-bit AArch64 condition field
+ */
+fn cond_code(c: MCond) -> u32 {
+    match c {
+        EQ => 0 to u32
+        NE => 1 to u32
+        LT => 11 to u32
+        LE => 13 to u32
+        GT => 12 to u32
+        GE => 10 to u32
+        LO => 3 to u32
+        LS => 9 to u32
+        HI => 8 to u32
+        HS => 2 to u32
+    }
+}
+
+/**
+ * honest_fp — the single named honest-stop the float family (`MFAlu`/`MFNeg`/
+ * `MFCmp`/`MFMov`/`MCvt`) and the FPR (`S`/`D`) memory widths raise: FP encoding
+ * is regular but deferred to 0.3.1 (appendix of the A4 crumb plan), so a float
+ * fixture stops IDENTICALLY on the own-native side and is compared at the stop.
+ *
+ * @return error  the `A4-fp` named honest-stop
+ */
+fn honest_fp() -> error {
+    error { message = "A4-fp: float-op / FPR encoding deferred to 0.3.1 (encodings in the A4 crumb-plan appendix)" }
+}
+
+/**
+ * honest_bigimm — the named honest-stop for an ALU/CMP immediate that does not
+ * fit the inline 12-bit field (magnitude outside `[0, 4095]`, or a non-add/sub
+ * immediate op that would need a bitmask/logical-immediate form): both are
+ * closed by the MOVZ+register-op sequence in 0.3.1.
+ *
+ * @return error  the `A4-bigimm` named honest-stop
+ */
+fn honest_bigimm() -> error {
+    error { message = "A4-bigimm: immediate not inline-encodable (needs the MOVZ+register-op sequence, deferred to 0.3.1)" }
+}
+
+/**
+ * honest_ldur — the named honest-stop for a load/store offset the scaled
+ * unsigned form cannot express (negative, not a multiple of the access size,
+ * or beyond the 12-bit scaled field): closed by the LDUR/STUR unscaled form in
+ * 0.3.1. Spills use offset 0, so this is not reached by the keystone corpus.
+ *
+ * @return error  the `A4-ldur` named honest-stop
+ */
+fn honest_ldur() -> error {
+    error { message = "A4-ldur: unscaled / out-of-range load-store offset (needs LDUR/STUR, deferred to 0.3.1)" }
+}
+
+/**
+ * honest_frame — the named honest-stop for `MFrameAddr` in A4-1: resolving a
+ * frame-slot address to `ADD dst, sp, #off` needs the `FrameLayout` A4-2
+ * computes, which A4-1 deliberately does not pull in. A4-2 replaces this arm
+ * with the resolved ADD.
+ *
+ * @return error  the `A4-frame` named honest-stop
+ */
+fn honest_frame() -> error {
+    error { message = "A4-frame: frame-slot address resolution needs the A4-2 FrameLayout (deferred to A4-2)" }
+}
+
+/**
+ * alu_reg_base — the bit-31-clear (32-bit) template word for a register-register
+ * ALU op, uniform in its `(Rm<<16) | (Rn<<5) | Rd` field placement. `Mul` bakes
+ * `Ra=XZR` (MADD) and the SDIV/UDIV/shift forms bake their fixed opcode bits;
+ * the 64-bit form is recovered by ORing `sf_bit`.
+ *
+ * @param MAluOp op  the ALU operation
+ * @return u32  the 32-bit template word
+ */
+fn alu_reg_base(op: MAluOp) -> u32 {
+    match op {
+        Add => 0x0B000000 to u32
+        Sub => 0x4B000000 to u32
+        Mul => 0x1B007C00 to u32
+        Sdiv => 0x1AC00C00 to u32
+        Udiv => 0x1AC00800 to u32
+        And => 0x0A000000 to u32
+        Orr => 0x2A000000 to u32
+        Eor => 0x4A000000 to u32
+        Lsl => 0x1AC02000 to u32
+        Asr => 0x1AC02800 to u32
+        Lsr => 0x1AC02400 to u32
+    }
+}
+
+/**
+ * add_sub_imm_base — the bit-31-clear (32-bit) template for the ADD/SUB
+ * immediate form, with the add/sub swap a negative immediate demands folded in
+ * (`ADD #-k` encodes as `SUB #k`). A non-add/sub immediate op raises the
+ * `A4-bigimm` stop (logical/mul immediates need the register-op sequence).
+ *
+ * @param MAluOp op  the ALU operation (add/sub encode inline)
+ * @param bool negative  true when the source immediate is negative
+ * @return u32 | error  the template word, or the `A4-bigimm` honest-stop
+ */
+fn add_sub_imm_base(op: MAluOp, negative: bool) -> u32 | error {
+    match op {
+        Add => if negative { 0x51000000 to u32 } else { 0x11000000 to u32 }
+        Sub => if negative { 0x11000000 to u32 } else { 0x51000000 to u32 }
+        _ => honest_bigimm()
+    }
+}
+
+/**
+ * ext_base — the full template word for a narrow sign/zero-extend (SBFM/UBFM
+ * with the fixed immr=0 and per-op imms baked in): SXTB/SXTH/SXTW extend into
+ * the 64-bit X form, UXTB/UXTH stay in the 32-bit W form, and UXTW zero-extends
+ * a word into the 64-bit X form. The `(Rn<<5) | Rd` fields OR on top.
+ *
+ * @param MExtOp op  the extend operation
+ * @return u32  the full template word (immr/imms already placed)
+ */
+fn ext_base(op: MExtOp) -> u32 {
+    match op {
+        Sxtb => 0x93401C00 to u32
+        Sxth => 0x93403C00 to u32
+        Sxtw => 0x93407C00 to u32
+        Uxtb => 0x53001C00 to u32
+        Uxth => 0x53003C00 to u32
+        Uxtw => 0xD3407C00 to u32
+    }
+}
+
+/**
+ * load_form — the LDR-family template + access scale for a load width, keyed
+ * by `MMemSize` and sign-extension: the plain forms (LDR/LDRB/LDRH), the
+ * sign-extending narrow forms (LDRSB/LDRSH into X, LDRSW), and the `S`/`D`
+ * FPR widths that raise the `A4-fp` honest-stop.
+ *
+ * @param MMemSize size  the access width
+ * @param bool sign  true for a sign-extending narrow load
+ * @return MemForm | error  the template + scale, or the `A4-fp` honest-stop
+ */
+fn load_form(size: MMemSize, sign: bool) -> MemForm | error {
+    match size {
+        B => MemForm { base = if sign { 0x39800000 to u32 } else { 0x39400000 to u32 }; scale = 1 to u32 }
+        H => MemForm { base = if sign { 0x79800000 to u32 } else { 0x79400000 to u32 }; scale = 2 to u32 }
+        W => MemForm { base = if sign { 0xB9800000 to u32 } else { 0xB9400000 to u32 }; scale = 4 to u32 }
+        X => MemForm { base = 0xF9400000 to u32; scale = 8 to u32 }
+        S => honest_fp()
+        D => honest_fp()
+    }
+}
+
+/**
+ * store_form — the STR-family template + access scale for a store width, keyed
+ * by `MMemSize`: STR/STRB/STRH/STR(X), with the `S`/`D` FPR widths raising the
+ * `A4-fp` honest-stop.
+ *
+ * @param MMemSize size  the access width
+ * @return MemForm | error  the template + scale, or the `A4-fp` honest-stop
+ */
+fn store_form(size: MMemSize) -> MemForm | error {
+    match size {
+        B => MemForm { base = 0x39000000 to u32; scale = 1 to u32 }
+        H => MemForm { base = 0x79000000 to u32; scale = 2 to u32 }
+        W => MemForm { base = 0xB9000000 to u32; scale = 4 to u32 }
+        X => MemForm { base = 0xF9000000 to u32; scale = 8 to u32 }
+        S => honest_fp()
+        D => honest_fp()
+    }
+}
+
+/**
+ * scaled_offset — the 12-bit scaled unsigned immediate for `offset` under an
+ * `scale`-byte access: `offset / scale`, valid only when `offset` is
+ * non-negative, a multiple of `scale`, and the quotient fits 12 bits. Any
+ * other offset raises the `A4-ldur` honest-stop.
+ *
+ * @param i32 offset  the base-plus-displacement byte offset
+ * @param u32 scale  the access width in bytes
+ * @return u32 | error  the scaled immediate, or the `A4-ldur` honest-stop
+ */
+fn scaled_offset(offset: i32, scale: u32) -> u32 | error {
+    if offset < (0 to i32) { return honest_ldur() }
+    let uoff = offset to u32
+    if (uoff % scale) != (0 to u32) { return honest_ldur() }
+    let imm = uoff / scale
+    if imm > (4095 to u32) { return honest_ldur() }
+    imm
+}
+
+/**
+ * encode_alu — a register-register ALU op: `alu_reg_base | sf | Rm | Rn | Rd`.
+ *
+ * @param MAlu i  the ALU instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_alu(i: MAlu) -> EncWord {
+    plain_word(alu_reg_base(i.op) | sf_bit(i.wide) | enc_rm(i.b) | enc_rn(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_alu_imm — an ADD/SUB immediate op: the 12-bit immediate is checked
+ * against the inline field (magnitude in `[0, 4095]`, else `A4-bigimm`), a
+ * negative immediate flips add/sub, and the magnitude ORs into the word.
+ *
+ * @param MAluImm i  the immediate ALU instruction (operand physical)
+ * @return EncWord | error  the encoded word, or a named honest-stop
+ */
+fn encode_alu_imm(i: MAluImm) -> EncWord | error {
+    let hi = 4095 to i64
+    let lo = (0 to i64) - hi
+    if i.imm > hi { return honest_bigimm() }
+    if i.imm < lo { return honest_bigimm() }
+    let neg = i.imm < (0 to i64)
+    let base = match add_sub_imm_base(i.op, neg) { u32 as b => b; error as e => return e }
+    let mag = if neg { (0 to i64) - i.imm } else { i.imm }
+    let field = ((mag to u32) & (0xFFF to u32)) << (10 to u32)
+    plain_word(base | sf_bit(i.wide) | field | enc_rn(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_msub — `dst = c - a*b` (MSUB): `0x1B008000 | sf | Rm(b) | Ra(c) |
+ * Rn(a) | Rd(dst)`, the remainder half of `IRemS`/`IRemU`.
+ *
+ * @param MMSub i  the MSUB instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_msub(i: MMSub) -> EncWord {
+    let base = 0x1B008000 to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.b) | enc_ra(i.c) | enc_rn(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_neg — `dst = -a` as SUB from XZR: `0x4B0003E0 | sf | Rm(a) | Rd(dst)`
+ * (the template bakes `Rn=XZR`).
+ *
+ * @param MNeg i  the NEG instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_neg(i: MNeg) -> EncWord {
+    let base = 0x4B0003E0 to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_mvn — `dst = ~a` as ORN from XZR: `0x2A2003E0 | sf | Rm(a) | Rd(dst)`
+ * (the template bakes `Rn=XZR` and the ORN N-bit).
+ *
+ * @param MMvn i  the MVN instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_mvn(i: MMvn) -> EncWord {
+    let base = 0x2A2003E0 to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_cmp — CMP as SUBS into XZR: `0x6B00001F | sf | Rm(b) | Rn(a)` (the
+ * template bakes `Rd=XZR`), setting NZCV without writing a result.
+ *
+ * @param MCmp i  the compare instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_cmp(i: MCmp) -> EncWord {
+    let base = 0x6B00001F to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.b) | enc_rn(i.a))
+}
+
+/**
+ * encode_cmp_imm — CMP against an immediate as SUBS-imm into XZR: `0x7100001F
+ * | sf | (imm12<<10) | Rn(a)`. A negative or out-of-range immediate raises the
+ * `A4-bigimm` honest-stop (the CMN-form / MOVZ sequence is deferred).
+ *
+ * @param MCmpImm i  the immediate compare instruction (operand physical)
+ * @return EncWord | error  the encoded word, or the `A4-bigimm` honest-stop
+ */
+fn encode_cmp_imm(i: MCmpImm) -> EncWord | error {
+    let hi = 4095 to i64
+    if i.imm > hi { return honest_bigimm() }
+    if i.imm < (0 to i64) { return honest_bigimm() }
+    let base = 0x7100001F to u32
+    let field = ((i.imm to u32) & (0xFFF to u32)) << (10 to u32)
+    plain_word(base | sf_bit(i.wide) | field | enc_rn(i.a))
+}
+
+/**
+ * encode_cset — CSET as CSINC from XZR: `0x1A9F07E0 | sf | (invert(cond)<<12) |
+ * Rd`. CSET materializes a compare's result, so the condition field holds the
+ * INVERTED code (`cond_code ^ 1`).
+ *
+ * @param MCSet i  the conditional-set instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_cset(i: MCSet) -> EncWord {
+    let base = 0x1A9F07E0 to u32
+    let field = ((cond_code(i.cond) ^ (1 to u32)) & (0xF to u32)) << (12 to u32)
+    plain_word(base | sf_bit(i.wide) | field | enc_rd(i.dst))
+}
+
+/**
+ * encode_movi — the shared MOVZ/MOVK/MOVN encoding: `base | sf | (hw<<21) |
+ * (imm16<<5) | Rd`, with `hw = shift/16` selecting the 16-bit lane.
+ *
+ * @param u32 base  the family template (MOVZ/MOVK/MOVN, bit-31-clear)
+ * @param bool wide  true for the 64-bit X form
+ * @param MReg dst  the destination register
+ * @param u32 imm16  the 16-bit lane value
+ * @param u32 shift  the lane's bit position (0/16/32/48)
+ * @return EncWord  the encoded word
+ */
+fn encode_movi(base: u32, wide: bool, dst: MReg, imm16: u32, shift: u32) -> EncWord {
+    let hw = (shift / (16 to u32)) << (21 to u32)
+    let imm = (imm16 & (0xFFFF to u32)) << (5 to u32)
+    plain_word(base | sf_bit(wide) | hw | imm | enc_rd(dst))
+}
+
+/**
+ * encode_movz — MOVZ (`dst = imm16 << shift`), template `0x52800000`.
+ *
+ * @param MMovZ i  the MOVZ instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_movz(i: MMovZ) -> EncWord {
+    encode_movi(0x52800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * encode_movk — MOVK (`dst |= imm16 << shift`, keeping other lanes), template
+ * `0x72800000`.
+ *
+ * @param MMovK i  the MOVK instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_movk(i: MMovK) -> EncWord {
+    encode_movi(0x72800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * encode_movn — MOVN (`dst = ~(imm16 << shift)`), template `0x12800000`.
+ *
+ * @param MMovN i  the MOVN instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_movn(i: MMovN) -> EncWord {
+    encode_movi(0x12800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * encode_mov — a GPR-GPR move as ORR from XZR: `0x2A0003E0 | sf | Rm(src) |
+ * Rd(dst)` (the template bakes `Rn=XZR`).
+ *
+ * @param MMov i  the move instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_mov(i: MMov) -> EncWord {
+    let base = 0x2A0003E0 to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.src) | enc_rd(i.dst))
+}
+
+/**
+ * encode_ext — a narrow sign/zero-extend as SBFM/UBFM: `ext_base | Rn(a) |
+ * Rd(dst)` (the template bakes the width bits and the fixed immr/imms).
+ *
+ * @param MExt i  the extend instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_ext(i: MExt) -> EncWord {
+    plain_word(ext_base(i.op) | enc_rn(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_load — a scaled-offset load: `load_form.base | (imm12<<10) | Rn(base)
+ * | Rd(dst)`, with the offset scaled by the access width. FPR widths raise
+ * `A4-fp`; an unscaled/out-of-range offset raises `A4-ldur`.
+ *
+ * @param MLoad i  the load instruction (operands physical)
+ * @return EncWord | error  the encoded word, or a named honest-stop
+ */
+fn encode_load(i: MLoad) -> EncWord | error {
+    let form = match load_form(i.size, i.sign) { MemForm as f => f; error as e => return e }
+    let imm = match scaled_offset(i.mem.offset, form.scale) { u32 as v => v; error as e => return e }
+    let field = (imm & (0xFFF to u32)) << (10 to u32)
+    plain_word(form.base | field | enc_rn(i.mem.base) | enc_rd(i.dst))
+}
+
+/**
+ * encode_store — a scaled-offset store: `store_form.base | (imm12<<10) |
+ * Rn(base) | Rt(src)`, with the offset scaled by the access width. FPR widths
+ * raise `A4-fp`; an unscaled/out-of-range offset raises `A4-ldur`.
+ *
+ * @param MStore i  the store instruction (operands physical)
+ * @return EncWord | error  the encoded word, or a named honest-stop
+ */
+fn encode_store(i: MStore) -> EncWord | error {
+    let form = match store_form(i.size) { MemForm as f => f; error as e => return e }
+    let imm = match scaled_offset(i.mem.offset, form.scale) { u32 as v => v; error as e => return e }
+    let field = (imm & (0xFFF to u32)) << (10 to u32)
+    plain_word(form.base | field | enc_rn(i.mem.base) | enc_rd(i.src))
+}
+
+/**
+ * encode_branch — an unconditional branch (B): the placeholder `0x14000000`
+ * flagged for imm26 displacement patching (A4-3) with its target block id.
+ *
+ * @param MBranch i  the branch instruction
+ * @return EncWord  the branch-flagged placeholder word
+ */
+fn encode_branch(i: MBranch) -> EncWord {
+    let base = 0x14000000 to u32
+    branch_word(base, i.target, 0 to u32)
+}
+
+/**
+ * encode_branch_cond — a conditional branch (B.cond): `0x54000000 | cond` (the
+ * condition is position-independent) flagged for imm19 displacement patching
+ * (A4-3) with its taken-target block id.
+ *
+ * @param MBranchCond i  the conditional-branch instruction
+ * @return EncWord  the branch-flagged placeholder word
+ */
+fn encode_branch_cond(i: MBranchCond) -> EncWord {
+    let base = 0x54000000 to u32
+    let w = base | (cond_code(i.cond) & (0xF to u32))
+    branch_word(w, i.target, 1 to u32)
+}
+
+/**
+ * encode_cbz — a compare-and-branch (CBZ/CBNZ): `base | sf | Rt(a)` flagged for
+ * imm19 displacement patching (A4-3). The register and zero/nonzero opcode are
+ * position-independent; only the displacement is deferred.
+ *
+ * @param MCbz i  the compare-and-branch instruction (operand physical)
+ * @return EncWord  the branch-flagged placeholder word
+ */
+fn encode_cbz(i: MCbz) -> EncWord {
+    let base = if i.zero { 0x34000000 to u32 } else { 0x35000000 to u32 }
+    let w = base | sf_bit(i.wide) | enc_rd(i.a)
+    branch_word(w, i.target, 1 to u32)
+}
+
+/**
+ * encode_call — a direct call (BL): the placeholder `0x94000000` flagged for a
+ * `Call` (BRANCH26) relocation on the callee symbol; the linker patches the
+ * displacement.
+ *
+ * @param MCall i  the direct-call instruction
+ * @return EncWord  the reloc-flagged placeholder word
+ */
+fn encode_call(i: MCall) -> EncWord {
+    let base = 0x94000000 to u32
+    reloc_word(base, i.sym, MRelocKind::Call)
+}
+
+/**
+ * encode_call_indirect — an indirect call (BLR): `0xD63F0000 | Rn(target)`, a
+ * position-independent word (no relocation, no displacement).
+ *
+ * @param MCallIndirect i  the indirect-call instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_call_indirect(i: MCallIndirect) -> EncWord {
+    let base = 0xD63F0000 to u32
+    plain_word(base | enc_rn(i.target))
+}
+
+/**
+ * encode_adrp — the page-high half of a symbol address (ADRP): the placeholder
+ * `0x90000000 | Rd` flagged for the instruction's relocation kind (PAGE21); the
+ * linker patches the page immediate.
+ *
+ * @param MAdrp i  the ADRP instruction (operand physical)
+ * @return EncWord  the reloc-flagged placeholder word
+ */
+fn encode_adrp(i: MAdrp) -> EncWord {
+    let base = 0x90000000 to u32
+    reloc_word(base | enc_rd(i.dst), i.sym, i.kind)
+}
+
+/**
+ * encode_add_lo — the page-low completion of an `MAdrp` (ADD lo12): the
+ * placeholder `0x91000000 | Rn(a) | Rd` flagged for the instruction's
+ * relocation kind (PAGEOFF12); the linker patches the low-12 immediate.
+ *
+ * @param MAddLo i  the ADD-lo12 instruction (operands physical)
+ * @return EncWord  the reloc-flagged placeholder word
+ */
+fn encode_add_lo(i: MAddLo) -> EncWord {
+    let base = 0x91000000 to u32
+    reloc_word(base | enc_rn(i.a) | enc_rd(i.dst), i.sym, i.kind)
+}
+
+/**
+ * encode_ret — a return terminator (RET): the bare `0xD65F03C0` word. The
+ * epilogue that precedes it is prepended by `encode_func` in A4-2; A4-1 emits
+ * only the RET itself.
+ *
+ * @return EncWord  the RET word
+ */
+fn encode_ret() -> EncWord {
+    plain_word(0xD65F03C0 to u32)
+}
+
+/**
+ * encode_inst_word — encode one fully-physical `MInst` to its `EncWord`, a
+ * TOTAL per-case match over the 29-case variant mirroring `print_minst`'s
+ * dispatch. The position-independent integer/control/memory subset encodes
+ * fully; branches and symbol references return placeholder words flagged for
+ * A4-3 patching; `MFrameAddr` (A4-2), the float family, big immediates, and
+ * unscaled offsets return their NAMED honest-stops.
+ *
+ * @param MInst inst  the instruction to encode (all operands physical)
+ * @return EncWord | error  the encoding, or a named honest-stop
+ */
+pub fn encode_inst_word(inst: MInst) -> EncWord | error {
+    match inst {
+        MAlu as x => encode_alu(x)
+        MAluImm as x => encode_alu_imm(x)
+        MMSub as x => encode_msub(x)
+        MNeg as x => encode_neg(x)
+        MMvn as x => encode_mvn(x)
+        MFAlu => honest_fp()
+        MFNeg => honest_fp()
+        MCmp as x => encode_cmp(x)
+        MCmpImm as x => encode_cmp_imm(x)
+        MFCmp => honest_fp()
+        MCSet as x => encode_cset(x)
+        MMovZ as x => encode_movz(x)
+        MMovK as x => encode_movk(x)
+        MMovN as x => encode_movn(x)
+        MFMov => honest_fp()
+        MMov as x => encode_mov(x)
+        MExt as x => encode_ext(x)
+        MCvt => honest_fp()
+        MLoad as x => encode_load(x)
+        MStore as x => encode_store(x)
+        MFrameAddr => honest_frame()
+        MAdrp as x => encode_adrp(x)
+        MAddLo as x => encode_add_lo(x)
+        MBranch as x => encode_branch(x)
+        MBranchCond as x => encode_branch_cond(x)
+        MCbz as x => encode_cbz(x)
+        MCall as x => encode_call(x)
+        MCallIndirect as x => encode_call_indirect(x)
+        MRet => encode_ret()
+    }
+}
