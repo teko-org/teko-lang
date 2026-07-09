@@ -193,7 +193,7 @@ fn iat_movn_with_a_follow_up_movk_lane() {
 
 #test
 fn iat_materialize_bits_narrow_form_direct() {
-    let ctx0 = SelCtx { func = new_mfunc("main"); vinfo = vinfo_empty(); next_scratch = 0 }
+    let ctx0 = SelCtx { func = new_mfunc("main"); vinfo = vinfo_empty(); next_scratch = 0; cur_block = 0; next_block = 1 }
     let ctx1 = materialize_bits(ctx0, vreg(0, MRegClass::GPR), 42 to u64, false)
     let text = minst_print(add_mfunc(empty_mmodule(), ctx1.func))
     teko::assert::str_contains(text, "movz.w %0, #42, lsl #0")
@@ -364,19 +364,25 @@ fn iat_select_module_carries_rodata_globals_layouts_through() {
 
 #test
 fn iat_select_module_propagates_a_function_error() {
-    let bad = lir::add_func(lir::empty_module(), lir::alloc_block(iat_main_ret()).func)
+    let f = lir::append_inst(lir::new_func("main", 0, teko::list::empty(), lir::LType::I64), 0, lir::alloca_inst(0, 8, 8, 0, 0))
+    let bad = lir::add_func(lir::empty_module(), f)
     match select_module(bad) {
         MModule => teko::assert::is_true(false)
-        error as e => teko::assert::str_contains(e.message, "multi-block")
+        error as e => teko::assert::str_contains(e.message, "A2-4")
     }
 }
 
 #test
-fn iat_multi_block_function_honest_stops() {
-    let f = lir::alloc_block(iat_main_ret()).func
-    match select_lfunc(f) {
-        MFunc => teko::assert::is_true(false)
-        error as e => teko::assert::str_contains(e.message, "multi-block functions are out of A2-2 scope")
+fn iat_multi_block_function_selects() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let v0 = lir::alloc_vreg(b1.func)
+    let s0 = lir::append_inst(v0.func, 0, lir::jump_inst(b1.block_id, teko::list::empty(), 0, 0))
+    let s1 = lir::append_inst(s0, b1.block_id, lir::const_int_inst(v0.vreg, 3 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    match select_lfunc(s2) {
+        MFunc as mf => teko::assert::is_true(mf.blocks.len == 2)
+        error => teko::assert::is_true(false)
     }
 }
 
@@ -567,15 +573,73 @@ fn iat_deferred_error(inst: lir::LInst, needle: str) {
     }
 }
 
-#test
-fn iat_jump_is_deferred_to_a2_3() {
-    iat_deferred_error(lir::jump_inst(0, teko::list::empty(), 0, 0), "A2-3")
+/**
+ * iat_dump — select `f` and render the machine module as text (the A2-3
+ * golden-dump fixtures assert against key lines of this).
+ *
+ * @param lir::LFunc f  the function to select and print
+ * @return str  the rendered machine text ("" on a selection error)
+ */
+fn iat_dump(f: lir::LFunc) -> str {
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return "" }
+    minst_print(add_mfunc(empty_mmodule(), mf))
 }
 
 #test
-fn iat_branch_is_deferred_to_a2_3() {
-    let c = iat_const(iat_main_ret(), 1)
-    iat_deferred_error(lir::branch_inst(c.vreg, 0, teko::list::empty(), 0, teko::list::empty(), 0, 0), "A2-3")
+fn iat_a23_jump_emits_edge_move_and_branch() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let v0 = lir::alloc_vreg(b1.func)
+    let bp = lir::add_block_param(v0.func, b1.block_id)
+    let s0 = lir::append_inst(bp.func, 0, lir::const_int_inst(v0.vreg, 7 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::jump_inst(b1.block_id, teko::list::push(teko::list::empty(), v0.vreg), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    let text = iat_dump(s2)
+    teko::assert::str_contains(text, "#M1(%1")
+    teko::assert::str_contains(text, "b #M1")
+}
+
+#test
+fn iat_a23_fused_compare_branch() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let v3 = lir::alloc_vreg(v2.func)
+    let v4 = lir::alloc_vreg(v3.func)
+    let s0 = lir::append_inst(v4.func, 0, lir::const_int_inst(v0.vreg, 5 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(v1.vreg, 5 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::bin_inst(v2.vreg, lir::LBinOp::ICmpEq, v0.vreg, v1.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::branch_inst(v2.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s4 = lir::append_inst(s3, b1.block_id, lir::const_int_inst(v3.vreg, 100 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b1.block_id, lir::ret_inst(v3.vreg, 0, 0))
+    let s6 = lir::append_inst(s5, b2.block_id, lir::const_int_inst(v4.vreg, 200 to i128, 0, 0))
+    let s7 = lir::append_inst(s6, b2.block_id, lir::ret_inst(v4.vreg, 0, 0))
+    let text = iat_dump(s7)
+    teko::assert::str_contains(text, "cmp.")
+    teko::assert::str_contains(text, "b.eq #M1")
+    teko::assert::str_contains(text, "b #M2")
+}
+
+#test
+fn iat_a23_generic_boolean_branch() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let s0 = lir::append_inst(v2.func, 0, lir::const_int_inst(v0.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::const_int_inst(v1.vreg, 10 to i128, 0, 0))
+    let s3 = lir::append_inst(s2, b1.block_id, lir::ret_inst(v1.vreg, 0, 0))
+    let s4 = lir::append_inst(s3, b2.block_id, lir::const_int_inst(v2.vreg, 20 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b2.block_id, lir::ret_inst(v2.vreg, 0, 0))
+    let text = iat_dump(s5)
+    teko::assert::str_contains(text, "cbnz")
+    teko::assert::str_contains(text, "b #M2")
 }
 
 #test

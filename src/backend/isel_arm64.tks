@@ -143,6 +143,18 @@ type SelCtx = struct {
      * out.
      */
     next_scratch: u32
+    /**
+     * cur_block — the machine-block id `selctx_emit` currently appends to.
+     * A2-2 only ever had #M0; A2-3 threads it so each selected `LBlock`
+     * emits into its mirror block and split edge blocks emit into their own.
+     */
+    cur_block: u32
+    /**
+     * next_block — the next fresh machine-block id `selctx_new_block` may
+     * hand out for a split edge block (starts past the highest `LBlock` id
+     * so an edge block never collides with a mirror block).
+     */
+    next_block: u32
 }
 
 /**
@@ -154,7 +166,53 @@ type SelCtx = struct {
  * @return SelCtx  the advanced context
  */
 fn selctx_emit(ctx: SelCtx, inst: MInst) -> SelCtx {
-    SelCtx { func = append_minst(ctx.func, 0, inst); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch }
+    SelCtx { func = append_minst(ctx.func, ctx.cur_block, inst); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
+}
+
+/**
+ * selctx_switch — retarget the context so subsequent `selctx_emit`s append
+ * to machine block `block_id` (used when selection moves from one `LBlock`'s
+ * mirror to the next, or into a freshly-split edge block).
+ *
+ * @param SelCtx ctx  the context to retarget
+ * @param u32 block_id  the machine-block id to emit into next
+ * @return SelCtx  the retargeted context
+ */
+fn selctx_switch(ctx: SelCtx, block_id: u32) -> SelCtx {
+    SelCtx { func = ctx.func; vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = block_id; next_block = ctx.next_block }
+}
+
+/**
+ * FreshBlock — a freshly-allocated machine block (its id) plus the advanced
+ * context that reserved it and appended the empty block to the function.
+ *
+ * @since #383 A2-3
+ */
+type FreshBlock = struct {
+    /**
+     * ctx — the context with the block reserved and appended.
+     */
+    ctx: SelCtx
+    /**
+     * id — the reserved machine-block id.
+     */
+    id: u32
+}
+
+/**
+ * selctx_new_block — append a fresh empty machine block (no params — a split
+ * edge block carries its merge values as edge moves, never as block params)
+ * and hand back its id. The context's emit target is left unchanged; call
+ * `selctx_switch` to start emitting into it.
+ *
+ * @param SelCtx ctx  the context to extend
+ * @return FreshBlock  the advanced context + the reserved block id
+ */
+fn selctx_new_block(ctx: SelCtx) -> FreshBlock {
+    let id = ctx.next_block
+    let blk = MBlock { id = id; params = teko::list::empty(); insts = teko::list::empty() }
+    let advanced = SelCtx { func = append_block(ctx.func, blk); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = id + 1 }
+    FreshBlock { ctx = advanced; id = id }
 }
 
 /**
@@ -168,7 +226,7 @@ fn selctx_emit(ctx: SelCtx, inst: MInst) -> SelCtx {
  * @return SelCtx  the advanced context
  */
 fn selctx_set_vinfo(ctx: SelCtx, id: u32, reg_class: MRegClass, wide: bool) -> SelCtx {
-    SelCtx { func = ctx.func; vinfo = vinfo_set(ctx.vinfo, id, reg_class, wide); next_scratch = ctx.next_scratch }
+    SelCtx { func = ctx.func; vinfo = vinfo_set(ctx.vinfo, id, reg_class, wide); next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
 }
 
 /**
@@ -200,7 +258,7 @@ type FreshScratch = struct {
  */
 fn selctx_scratch(ctx: SelCtx, reg_class: MRegClass) -> FreshScratch {
     let id = ctx.next_scratch
-    let advanced = SelCtx { func = ctx.func; vinfo = ctx.vinfo; next_scratch = id + 1 }
+    let advanced = SelCtx { func = ctx.func; vinfo = ctx.vinfo; next_scratch = id + 1; cur_block = ctx.cur_block; next_block = ctx.next_block }
     FreshScratch { ctx = advanced; reg = vreg(id, reg_class) }
 }
 
@@ -631,11 +689,16 @@ fn select_fcmp(ctx0: SelCtx, inst: lir::LInst, cond: MCond, a: u32, bb: u32, dbl
  * operand was selected, and its width recorded, before this use).
  *
  * @param SelCtx ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function (the compare-fusion test reads
+ *                      its function-wide use counts)
  * @param lir::LInst inst  the enclosing instruction (its result VReg)
  * @param lir::LBin b  the binary op
  * @return SelCtx  the advanced context
  */
-fn select_bin(ctx0: SelCtx, inst: lir::LInst, b: lir::LBin) -> SelCtx {
+fn select_bin(ctx0: SelCtx, f: lir::LFunc, inst: lir::LInst, b: lir::LBin) -> SelCtx {
+    if cmp_kind_of(b.op).is_cmp && is_fused_compare(f, inst.result) {
+        return ctx0
+    }
     let a_info = vinfo_get(ctx0.vinfo, b.a)
     match b.op {
         lir::LBinOp::IAdd => select_alu(ctx0, inst, MAluOp::Add, b.a, b.b, a_info.wide)
@@ -997,10 +1060,398 @@ fn select_ret(ctx0: SelCtx, r: lir::LRet) -> SelCtx {
 }
 
 /**
- * select_inst — the per-`LOp` dispatch (§3 of the isel plan): the A2-2
- * core cases (`LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`)
- * select; every other case is a NAMED honest-stop naming the sub-sub-PR
- * that covers it (control flow: A2-3; memory/rodata: A2-4; calls: A2-5).
+ * CmpKind — the classification of an `LBinOp`: whether it is a compare, and
+ * if so whether it is a float compare and which `MCond` its taken edge tests.
+ *
+ * @since #383 A2-3
+ */
+type CmpKind = struct {
+    /**
+     * is_cmp — true iff the opcode is an integer or float compare.
+     */
+    is_cmp: bool
+    /**
+     * is_float — true iff the compare is a float compare (`MFCmp` vs `MCmp`).
+     */
+    is_float: bool
+    /**
+     * cond — the AArch64 condition the compare's taken edge tests (only
+     * meaningful when `is_cmp`).
+     */
+    cond: MCond
+}
+
+/**
+ * cmp_kind_of — classify an `LBinOp` as a compare (with its `MCond`) or not.
+ * The single source of truth for the opcode→condition map, shared by the
+ * value-producing compare selection (`select_bin`) and the fused branch
+ * (`select_branch`).
+ *
+ * @param lir::LBinOp op  the binary opcode
+ * @return CmpKind  its compare classification
+ */
+fn cmp_kind_of(op: lir::LBinOp) -> CmpKind {
+    match op {
+        lir::LBinOp::ICmpEq => CmpKind { is_cmp = true; is_float = false; cond = MCond::EQ }
+        lir::LBinOp::ICmpNe => CmpKind { is_cmp = true; is_float = false; cond = MCond::NE }
+        lir::LBinOp::ICmpLtS => CmpKind { is_cmp = true; is_float = false; cond = MCond::LT }
+        lir::LBinOp::ICmpLtU => CmpKind { is_cmp = true; is_float = false; cond = MCond::LO }
+        lir::LBinOp::ICmpLeS => CmpKind { is_cmp = true; is_float = false; cond = MCond::LE }
+        lir::LBinOp::ICmpLeU => CmpKind { is_cmp = true; is_float = false; cond = MCond::LS }
+        lir::LBinOp::ICmpGtS => CmpKind { is_cmp = true; is_float = false; cond = MCond::GT }
+        lir::LBinOp::ICmpGtU => CmpKind { is_cmp = true; is_float = false; cond = MCond::HI }
+        lir::LBinOp::ICmpGeS => CmpKind { is_cmp = true; is_float = false; cond = MCond::GE }
+        lir::LBinOp::ICmpGeU => CmpKind { is_cmp = true; is_float = false; cond = MCond::HS }
+        lir::LBinOp::FCmpEq => CmpKind { is_cmp = true; is_float = true; cond = MCond::EQ }
+        lir::LBinOp::FCmpNe => CmpKind { is_cmp = true; is_float = true; cond = MCond::NE }
+        lir::LBinOp::FCmpLt => CmpKind { is_cmp = true; is_float = true; cond = MCond::LT }
+        lir::LBinOp::FCmpLe => CmpKind { is_cmp = true; is_float = true; cond = MCond::LE }
+        lir::LBinOp::FCmpGt => CmpKind { is_cmp = true; is_float = true; cond = MCond::GT }
+        lir::LBinOp::FCmpGe => CmpKind { is_cmp = true; is_float = true; cond = MCond::GE }
+        _ => CmpKind { is_cmp = false; is_float = false; cond = MCond::EQ }
+    }
+}
+
+/**
+ * count_in_list — how many entries of `xs` equal `vreg`.
+ *
+ * @param []u32 xs  the VReg list to scan
+ * @param u32 vreg  the VReg to count
+ * @return u32  its occurrence count
+ */
+fn count_in_list(xs: []u32, vreg: u32) -> u32 {
+    mut n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == vreg { n++ }
+        i++
+    }
+    n
+}
+
+/**
+ * b2n — a boolean as its 0/1 count, typed `u32` so the occurrence sums below
+ * anchor to `u32` (a bare `1`/`0` literal has no type context in the arms
+ * that never touch a `u32`-typed subexpression).
+ *
+ * @param bool cond  the condition to count
+ * @return u32  1 when `cond`, else 0
+ */
+fn b2n(cond: bool) -> u32 {
+    if cond { 1 } else { 0 }
+}
+
+/**
+ * count_in_inst — how many times `vreg` appears as an operand of `inst`.
+ * Only the operand-bearing ops selectable in A2-3 scope are enumerated
+ * (const/param have no operands; the memory/call ops are A2-4/A2-5 and any
+ * function still carrying one honest-stops before its output ships, so a
+ * conservative zero here can never let a wrong fusion escape).
+ *
+ * @param lir::LInst inst  the instruction to inspect
+ * @param u32 vreg  the VReg to count
+ * @return u32  its operand-occurrence count in `inst`
+ */
+fn count_in_inst(inst: lir::LInst, vreg: u32) -> u32 {
+    match inst.op {
+        lir::LBin as b => b2n(b.a == vreg) + b2n(b.b == vreg)
+        lir::LUn as u => b2n(u.a == vreg)
+        lir::LRet as r => b2n(r.has_value && r.value == vreg)
+        lir::LJump as j => count_in_list(j.args, vreg)
+        lir::LBranch as br => b2n(br.cond == vreg) + count_in_list(br.t_args, vreg) + count_in_list(br.f_args, vreg)
+        _ => 0 to u32
+    }
+}
+
+/**
+ * count_uses — how many operand slots across the whole function read `vreg`.
+ * The compare-into-branch fusion test (a compare is fused only when its sole
+ * consumer is the branch) reads this.
+ *
+ * @param lir::LFunc f  the function to scan
+ * @param u32 vreg  the VReg to count
+ * @return u32  its total use count
+ */
+fn count_uses(f: lir::LFunc, vreg: u32) -> u32 {
+    mut n: u32 = 0
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let insts = f.blocks[bi].insts
+        mut ii: u64 = 0
+        loop {
+            if ii >= insts.len { break }
+            n = n + count_in_inst(insts[ii], vreg)
+            ii++
+        }
+        bi++
+    }
+    n
+}
+
+/**
+ * used_as_branch_cond — whether some `LBranch` in `f` tests `vreg` directly
+ * as its condition (the second half of the fusion test: the sole use is a
+ * branch condition, not a jump-arg or arithmetic operand).
+ *
+ * @param lir::LFunc f  the function to scan
+ * @param u32 vreg  the VReg to check
+ * @return bool  true iff a branch's `cond` is `vreg`
+ */
+fn used_as_branch_cond(f: lir::LFunc, vreg: u32) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let insts = f.blocks[bi].insts
+        mut ii: u64 = 0
+        loop {
+            if ii >= insts.len { break }
+            let hit = match insts[ii].op { lir::LBranch as br => br.cond == vreg; _ => false }
+            if hit { return true }
+            ii++
+        }
+        bi++
+    }
+    false
+}
+
+/**
+ * is_fused_compare — whether the compare producing `result` is fused into a
+ * branch: its result is read exactly once, and that read is a branch's
+ * condition. A fused compare emits nothing at its own site (`select_bin`);
+ * the branch re-emits `MCmp`/`MFCmp` over the same operands (`select_branch`).
+ *
+ * @param lir::LFunc f  the enclosing function
+ * @param u32 result  the compare's result VReg
+ * @return bool  true iff the compare is fused into a branch
+ */
+fn is_fused_compare(f: lir::LFunc, result: u32) -> bool {
+    count_uses(f, result) == 1 && used_as_branch_cond(f, result)
+}
+
+/**
+ * DefCmp — the resolved definition of a branch condition when that
+ * definition is a compare: the opcode and its two operand VRegs.
+ *
+ * @since #383 A2-3
+ */
+type DefCmp = struct {
+    /**
+     * found — true iff the condition's defining instruction is a compare.
+     */
+    found: bool
+    /**
+     * op — the compare opcode (meaningful only when `found`).
+     */
+    op: lir::LBinOp
+    /**
+     * a — the first compared operand VReg.
+     */
+    a: u32
+    /**
+     * bb — the second compared operand VReg.
+     */
+    bb: u32
+}
+
+/**
+ * find_cmp_def — locate the instruction defining `vreg` and, when it is a
+ * compare `LBin`, return its opcode + operands (so a fused branch can
+ * re-emit the compare it never materialized).
+ *
+ * @param lir::LFunc f  the function to scan
+ * @param u32 vreg  the condition VReg to resolve
+ * @return DefCmp  the compare definition, or `found=false`
+ */
+fn find_cmp_def(f: lir::LFunc, vreg: u32) -> DefCmp {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let insts = f.blocks[bi].insts
+        mut ii: u64 = 0
+        loop {
+            if ii >= insts.len { break }
+            let inst = insts[ii]
+            if inst.has_result && inst.result == vreg {
+                return match inst.op {
+                    lir::LBin as b => DefCmp { found = cmp_kind_of(b.op).is_cmp; op = b.op; a = b.a; bb = b.b }
+                    _ => DefCmp { found = false; op = lir::LBinOp::IAdd; a = 0; bb = 0 }
+                }
+            }
+            ii++
+        }
+        bi++
+    }
+    DefCmp { found = false; op = lir::LBinOp::IAdd; a = 0; bb = 0 }
+}
+
+/**
+ * block_params_of — the block-arg VRegs declared by the `LBlock` with id
+ * `block_id` (the destinations an edge move copies into).
+ *
+ * @param lir::LFunc f  the function to search
+ * @param u32 block_id  the target block id
+ * @return []u32  its param VRegs (empty if the block has none/does not exist)
+ */
+fn block_params_of(f: lir::LFunc, block_id: u32) -> []u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id == block_id { return f.blocks[i].params }
+        i++
+    }
+    teko::list::empty()
+}
+
+/**
+ * selctx_set_block_param — refine mirror block `block_id`'s parameter at
+ * `index` to `reg` in the context's function (the class becomes known when
+ * the feeding edge move is selected).
+ *
+ * @param SelCtx ctx  the context to update
+ * @param u32 block_id  the target block
+ * @param u32 index  the parameter position
+ * @param MReg reg  the refined parameter register
+ * @return SelCtx  the updated context
+ */
+fn selctx_set_block_param(ctx: SelCtx, block_id: u32, index: u32, reg: MReg) -> SelCtx {
+    SelCtx { func = set_block_param(ctx.func, block_id, index, reg); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
+}
+
+/**
+ * emit_edge_moves — the parallel-copy of `args` into the block params of
+ * `target`, emitted into the current block just before the branch. A plain
+ * sequential copy is correct here by construction: a block param is always a
+ * FRESH VReg (from `add_block_param`), disjoint from every jump arg, so no
+ * source is also a destination and no cycle can arise. Each move also refines
+ * the target param's register class and records the param's `class_of`.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function (for the target's params)
+ * @param u32 target  the destination block id
+ * @param []u32 args  the block-args this edge supplies, positionally
+ * @return SelCtx | error  the advanced context, or a NAMED error on an
+ *                         arg/param count mismatch (internal)
+ */
+fn emit_edge_moves(ctx0: SelCtx, f: lir::LFunc, target: u32, args: []u32) -> SelCtx | error {
+    let params = block_params_of(f, target)
+    if params.len != args.len {
+        return error { message = "isel arm64: edge arg count does not match target block param count (internal)" }
+    }
+    mut ctx = ctx0
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        let src = args[i]
+        let src_info = vinfo_get(ctx.vinfo, src)
+        let dst = vreg(params[i], src_info.reg_class)
+        let mv = if src_info.reg_class == MRegClass::FPR { fmov_inst(src_info.wide, dst, vreg(src, MRegClass::FPR)) } else { mov_inst(src_info.wide, dst, vreg(src, MRegClass::GPR)) }
+        let ctx_a = selctx_emit(ctx, mv)
+        let ctx_b = selctx_set_block_param(ctx_a, target, i to u32, dst)
+        ctx = selctx_set_vinfo(ctx_b, params[i], src_info.reg_class, src_info.wide)
+        i++
+    }
+    ctx
+}
+
+/**
+ * select_jump — the `LJump` selection: the parallel-copy of its block-args
+ * into the target's params, then an unconditional `MBranch` to the target.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function
+ * @param lir::LJump j  the jump op
+ * @return SelCtx | error  the advanced context, or a propagated error
+ */
+fn select_jump(ctx0: SelCtx, f: lir::LFunc, j: lir::LJump) -> SelCtx | error {
+    let ctx1 = match emit_edge_moves(ctx0, f, j.target, j.args) { SelCtx as c => c; error as e => return e }
+    selctx_emit(ctx1, branch_inst(j.target))
+}
+
+/**
+ * EdgeRes — a resolved branch edge: the block the branch actually targets
+ * (the real block for an empty-arg edge, or a freshly-split edge block that
+ * performs the moves then branches on), plus the advanced context.
+ *
+ * @since #383 A2-3
+ */
+type EdgeRes = struct {
+    /**
+     * ctx — the advanced context (edge block appended when one was split).
+     */
+    ctx: SelCtx
+    /**
+     * block — the machine-block id the branch transfers control to.
+     */
+    block: u32
+}
+
+/**
+ * resolve_edge — the landing block for one branch edge. An AArch64
+ * conditional branch cannot carry moves, so an edge that supplies block-args
+ * is split into its own block (the moves, then `MBranch` to the real target)
+ * and the branch targets that edge block; an empty-arg edge branches straight
+ * to its target (the fast path A1 hits in practice). The current emit target
+ * is restored before returning.
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function
+ * @param u32 target  the edge's real destination block
+ * @param []u32 args  the block-args the edge supplies (empty for the fast path)
+ * @return EdgeRes | error  the landing block + advanced context, or an error
+ */
+fn resolve_edge(ctx0: SelCtx, f: lir::LFunc, target: u32, args: []u32) -> EdgeRes | error {
+    if args.len == 0 {
+        return EdgeRes { ctx = ctx0; block = target }
+    }
+    let saved = ctx0.cur_block
+    let fb = selctx_new_block(ctx0)
+    let ctx_in = selctx_switch(fb.ctx, fb.id)
+    let ctx_moved = match emit_edge_moves(ctx_in, f, target, args) { SelCtx as c => c; error as e => return e }
+    let ctx_end = selctx_emit(ctx_moved, branch_inst(target))
+    let ctx_back = selctx_switch(ctx_end, saved)
+    EdgeRes { ctx = ctx_back; block = fb.id }
+}
+
+/**
+ * select_branch — the `LBranch` selection: resolve each edge to a landing
+ * block (splitting an arg-carrying edge, §3.2), then in the branch block emit
+ * the conditional test to the taken edge and an unconditional `MBranch` to
+ * the else edge. When the condition is a compare fused into this branch
+ * (`is_fused_compare`), re-emit `MCmp`/`MFCmp` over its operands + a
+ * `MBranchCond`; otherwise test the boolean condition register with a CBNZ
+ * (`MCbz{zero=false}`).
+ *
+ * @param SelCtx ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function
+ * @param lir::LBranch br  the branch op
+ * @return SelCtx | error  the advanced context, or a propagated error
+ */
+fn select_branch(ctx0: SelCtx, f: lir::LFunc, br: lir::LBranch) -> SelCtx | error {
+    let t_land = match resolve_edge(ctx0, f, br.t_target, br.t_args) { EdgeRes as r => r; error as e => return e }
+    let f_land = match resolve_edge(t_land.ctx, f, br.f_target, br.f_args) { EdgeRes as r => r; error as e => return e }
+    let ctx1 = f_land.ctx
+    let dc = find_cmp_def(f, br.cond)
+    let ctx2 = if dc.found && is_fused_compare(f, br.cond) {
+        let ck = cmp_kind_of(dc.op)
+        let a_info = vinfo_get(ctx1.vinfo, dc.a)
+        let cmp = if ck.is_float { fcmp_inst(a_info.wide, vreg(dc.a, MRegClass::FPR), vreg(dc.bb, MRegClass::FPR)) } else { cmp_inst(a_info.wide, vreg(dc.a, MRegClass::GPR), vreg(dc.bb, MRegClass::GPR)) }
+        let ca = selctx_emit(ctx1, cmp)
+        selctx_emit(ca, branch_cond_inst(ck.cond, t_land.block))
+    } else {
+        let c_info = vinfo_get(ctx1.vinfo, br.cond)
+        selctx_emit(ctx1, cbz_inst(c_info.wide, false, vreg(br.cond, MRegClass::GPR), t_land.block))
+    }
+    selctx_emit(ctx2, branch_inst(f_land.block))
+}
+
+/**
+ * select_inst — the per-`LOp` dispatch (§3 of the isel plan): the A2-2 core
+ * cases (`LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`) plus A2-3
+ * control flow (`LJump`/`LBranch`) select; the remaining cases are a NAMED
+ * honest-stop naming the sub-sub-PR that covers each (memory/rodata: A2-4;
+ * calls: A2-5).
  *
  * @param SelCtx ctx  the context to extend
  * @param lir::LFunc f  the enclosing function (`LParam` needs its
@@ -1012,12 +1463,12 @@ fn select_inst(ctx: SelCtx, f: lir::LFunc, inst: lir::LInst) -> SelCtx | error {
     match inst.op {
         lir::LConstInt as c => select_const_int(ctx, inst, c)
         lir::LConstFloat as c => select_const_float(ctx, inst, c)
-        lir::LBin as b => select_bin(ctx, inst, b)
+        lir::LBin as b => select_bin(ctx, f, inst, b)
         lir::LUn as u => select_un(ctx, inst, u)
         lir::LParam as p => select_param(ctx, f, inst, p)
         lir::LRet as r => select_ret(ctx, r)
-        lir::LJump => error { message = "isel arm64: `jump` is out of A2-2 scope (control flow lands in A2-3)" }
-        lir::LBranch => error { message = "isel arm64: `branch` is out of A2-2 scope (control flow lands in A2-3)" }
+        lir::LJump as j => select_jump(ctx, f, j)
+        lir::LBranch as br => select_branch(ctx, f, br)
         lir::LAlloca => error { message = "isel arm64: `alloca` is out of A2-2 scope (memory ops land in A2-4)" }
         lir::LFieldAddr => error { message = "isel arm64: `field_addr` is out of A2-2 scope (memory ops land in A2-4)" }
         lir::LLoad => error { message = "isel arm64: `load` is out of A2-2 scope (memory ops land in A2-4)" }
@@ -1052,21 +1503,95 @@ fn select_insts(ctx0: SelCtx, f: lir::LFunc, insts: []lir::LInst) -> SelCtx | er
 }
 
 /**
- * select_lfunc — select one `LFunc` into an `MFunc`: A2-2 requires a
- * SINGLE block (full control-flow selection is A2-3), so a multi-block
- * function honest-stops rather than silently dropping later blocks.
+ * provisional_params — a mirror block's params built from its `LBlock` param
+ * VRegs with a provisional GPR class; each entry is refined to its real class
+ * by `emit_edge_moves` when a feeding edge is selected.
+ *
+ * @param []u32 pids  the block's param VReg ids
+ * @return []MReg  the provisional param registers
+ */
+fn provisional_params(pids: []u32) -> []MReg {
+    mut out: []MReg = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= pids.len { break }
+        out = teko::list::push(out, vreg(pids[i], MRegClass::GPR))
+        i++
+    }
+    out
+}
+
+/**
+ * build_mirror_blocks — an `MFunc` with one empty machine block per `LBlock`,
+ * same id + (provisionally-classed) params, in source order. Selection then
+ * fills each block's instructions and splits edge blocks in past them.
+ *
+ * @param lir::LFunc f  the function whose block skeleton is mirrored
+ * @return MFunc  the empty-bodied mirror function
+ */
+fn build_mirror_blocks(f: lir::LFunc) -> MFunc {
+    mut blocks: []MBlock = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let lb = f.blocks[i]
+        blocks = teko::list::push(blocks, MBlock { id = lb.id; params = provisional_params(lb.params); insts = teko::list::empty() })
+        i++
+    }
+    MFunc { symbol = f.symbol; blocks = blocks; frame = teko::list::empty() }
+}
+
+/**
+ * max_block_id — the highest `LBlock` id in `f` (edge blocks are numbered
+ * past it so a split edge block never collides with a mirror block).
+ *
+ * @param lir::LFunc f  the function to scan
+ * @return u32  its greatest block id
+ */
+fn max_block_id(f: lir::LFunc) -> u32 {
+    mut m: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id > m { m = f.blocks[i].id }
+        i++
+    }
+    m
+}
+
+/**
+ * select_all_blocks — select every `LBlock` of `f` in order, retargeting the
+ * emit cursor to each block's mirror before selecting its instructions.
+ *
+ * @param SelCtx ctx0  the initial context (targeting the entry block)
+ * @param lir::LFunc f  the function to select
+ * @return SelCtx | error  the fully-advanced context, or the first error
+ */
+fn select_all_blocks(ctx0: SelCtx, f: lir::LFunc) -> SelCtx | error {
+    mut ctx = ctx0
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let lb = f.blocks[i]
+        let switched = selctx_switch(ctx, lb.id)
+        ctx = match select_insts(switched, f, lb.insts) { SelCtx as c => c; error as e => return e }
+        i++
+    }
+    ctx
+}
+
+/**
+ * select_lfunc — select one `LFunc` into an `MFunc`: build the mirror block
+ * skeleton, then select every block's instructions (A2-3 handles the full
+ * control-flow set — jumps, branches, and their split edge blocks).
  *
  * @param lir::LFunc f  the function to select
- * @return MFunc | error  the selected function, or a NAMED error (a
- *                        multi-block function, or any instruction's own
- *                        propagated error)
+ * @return MFunc | error  the selected function, or any instruction's own
+ *                        propagated error
  */
 pub fn select_lfunc(f: lir::LFunc) -> MFunc | error {
-    if f.blocks.len != 1 {
-        return error { message = "isel arm64: multi-block functions are out of A2-2 scope (control flow lands in A2-3)" }
-    }
-    let ctx0 = SelCtx { func = new_mfunc(f.symbol); vinfo = vinfo_empty(); next_scratch = f.next_vreg }
-    let done = match select_insts(ctx0, f, f.blocks[0].insts) { SelCtx as c => c; error as e => return e }
+    let ctx0 = SelCtx { func = build_mirror_blocks(f); vinfo = vinfo_empty(); next_scratch = f.next_vreg; cur_block = 0; next_block = max_block_id(f) + 1 }
+    let done = match select_all_blocks(ctx0, f) { SelCtx as c => c; error as e => return e }
     done.func
 }
 
