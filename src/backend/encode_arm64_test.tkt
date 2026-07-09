@@ -1016,3 +1016,555 @@ fn indirect_call_without_ret_is_frameless() {
     let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
     teko::assert::is_true(fl.size == (0 to u32))
 }
+
+/**
+ * i1 — a one-instruction stream, typed for the `encode_func` fixtures.
+ *
+ * @param MInst a  the sole instruction
+ * @return []MInst  `[a]`
+ */
+fn i1(a: MInst) -> []MInst {
+    teko::list::push(l_insts(), a)
+}
+
+/**
+ * i2 — a two-instruction stream, in order.
+ *
+ * @param MInst a  the first instruction
+ * @param MInst b  the second instruction
+ * @return []MInst  `[a, b]`
+ */
+fn i2(a: MInst, b: MInst) -> []MInst {
+    teko::list::push(i1(a), b)
+}
+
+/**
+ * i3 — a three-instruction stream, in order.
+ *
+ * @param MInst a  the first instruction
+ * @param MInst b  the second instruction
+ * @param MInst c  the third instruction
+ * @return []MInst  `[a, b, c]`
+ */
+fn i3(a: MInst, b: MInst, c: MInst) -> []MInst {
+    teko::list::push(i2(a, b), c)
+}
+
+/**
+ * i4 — a four-instruction stream, in order.
+ *
+ * @param MInst a  the first instruction
+ * @param MInst b  the second instruction
+ * @param MInst c  the third instruction
+ * @param MInst d  the fourth instruction
+ * @return []MInst  `[a, b, c, d]`
+ */
+fn i4(a: MInst, b: MInst, c: MInst, d: MInst) -> []MInst {
+    teko::list::push(i3(a, b, c), d)
+}
+
+/**
+ * mblock — a machine block with the given id and instruction stream and no
+ * block params, the multi-block `encode_func` fixture shorthand.
+ *
+ * @param u32 id  the block's id (a branch target)
+ * @param []MInst insts  the block's instruction stream
+ * @return MBlock  the assembled block
+ */
+fn mblock(id: u32, insts: []MInst) -> MBlock {
+    MBlock { id = id; params = teko::list::empty(); insts = insts }
+}
+
+/**
+ * l_blocks — the empty `[]MBlock` list, typed for the fixtures.
+ *
+ * @return []MBlock  an empty block list
+ */
+fn l_blocks() -> []MBlock {
+    teko::list::empty()
+}
+
+/**
+ * bl1 — a one-block list.
+ *
+ * @param MBlock a  the sole block
+ * @return []MBlock  `[a]`
+ */
+fn bl1(a: MBlock) -> []MBlock {
+    teko::list::push(l_blocks(), a)
+}
+
+/**
+ * bl2 — a two-block list, in layout order.
+ *
+ * @param MBlock a  the first block
+ * @param MBlock b  the second block
+ * @return []MBlock  `[a, b]`
+ */
+fn bl2(a: MBlock, b: MBlock) -> []MBlock {
+    teko::list::push(bl1(a), b)
+}
+
+/**
+ * bl3 — a three-block list, in layout order.
+ *
+ * @param MBlock a  the first block
+ * @param MBlock b  the second block
+ * @param MBlock c  the third block
+ * @return []MBlock  `[a, b, c]`
+ */
+fn bl3(a: MBlock, b: MBlock, c: MBlock) -> []MBlock {
+    teko::list::push(bl2(a, b), c)
+}
+
+/**
+ * bl4 — a four-block list, in layout order.
+ *
+ * @param MBlock a  the first block
+ * @param MBlock b  the second block
+ * @param MBlock c  the third block
+ * @param MBlock d  the fourth block
+ * @return []MBlock  `[a, b, c, d]`
+ */
+fn bl4(a: MBlock, b: MBlock, c: MBlock, d: MBlock) -> []MBlock {
+    teko::list::push(bl3(a, b, c), d)
+}
+
+/**
+ * func_blocks — an `MFunc` with an empty frame and the given blocks.
+ *
+ * @param []MBlock blocks  the function's blocks, in layout order
+ * @return MFunc  the assembled function
+ */
+fn func_blocks(blocks: []MBlock) -> MFunc {
+    MFunc { symbol = "t"; blocks = blocks; frame = l_frame() }
+}
+
+/**
+ * l_relocs — the empty `[]Reloc` list, typed for the sentinel func.
+ *
+ * @return []Reloc  an empty reloc list
+ */
+fn l_relocs() -> []Reloc {
+    teko::list::empty()
+}
+
+/**
+ * bad_func — the sentinel `EncodedFunc` returned when a golden fixture that must
+ * encode unexpectedly honest-stops: its single all-ones word never matches a
+ * real expected stream, so the golden length/word assertion fails loudly.
+ *
+ * @return EncodedFunc  the impossible-encoding sentinel
+ */
+fn bad_func() -> EncodedFunc {
+    EncodedFunc { symbol = "<error>"; words = l1(0xFFFFFFFF to u32); relocs = l_relocs() }
+}
+
+/**
+ * ef — encode `f` through `encode_func`, unwrapping the success case and falling
+ * back to the `bad_func` sentinel on an unexpected honest-stop.
+ *
+ * @param MFunc f  the function to encode
+ * @return EncodedFunc  the encoded function, or the sentinel on error
+ */
+fn ef(f: MFunc) -> EncodedFunc {
+    match encode_func(aapcs64(), f) {
+        EncodedFunc as x => x
+        error as e => bad_func()
+    }
+}
+
+/**
+ * ef_stop — the honest-stop message `encode_func` produces for `f`, or `<ok>`
+ * when it encodes successfully.
+ *
+ * @param MFunc f  the function to encode
+ * @return str  the error message, or `<ok>`
+ */
+fn ef_stop(f: MFunc) -> str {
+    match encode_func(aapcs64(), f) {
+        EncodedFunc as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * kind_name — the printable name of an `MRelocKind`, for the reloc-record golden
+ * assertions.
+ *
+ * @param MRelocKind k  the relocation kind
+ * @return str  `PageHi`/`PageLo`/`Call`
+ */
+fn kind_name(k: MRelocKind) -> str {
+    match k {
+        PageHi => "PageHi"
+        PageLo => "PageLo"
+        Call => "Call"
+    }
+}
+
+/**
+ * field_ok — the field value of a `branch_disp_field` result, or an all-ones
+ * sentinel on an unexpected honest-stop (so a golden assertion fails loudly).
+ *
+ * @param u32 | error r  the `branch_disp_field` outcome
+ * @return u32  the field value, or the sentinel on error
+ */
+fn field_ok(r: u32 | error) -> u32 {
+    match r {
+        u32 as v => v
+        error as e => 0xFFFFFFFF to u32
+    }
+}
+
+/**
+ * field_stop — the honest-stop message of a `branch_disp_field` result, or
+ * `<ok>` when it produces a field.
+ *
+ * @param u32 | error r  the `branch_disp_field` outcome
+ * @return str  the error message, or `<ok>`
+ */
+fn field_stop(r: u32 | error) -> str {
+    match r {
+        u32 as v => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * neg64 — the i64 negation of a non-negative magnitude, the fixtures' shorthand
+ * for a backward/out-of-range displacement.
+ *
+ * @param i64 m  the magnitude
+ * @return i64  `-m`
+ */
+fn neg64(m: i64) -> i64 {
+    (0 to i64) - m
+}
+
+#test
+/**
+ * straight_line_exit_encodes_with_bl_reloc — a frameless `movz x0,#42; bl
+ * tk_exit` function encodes to the two A4-1 goldens (the BL a placeholder word)
+ * plus one `Reloc{offset=4, "tk_exit", Call}`; no prologue, no branch fixups.
+ *
+ * @return void
+ */
+fn straight_line_exit_encodes_with_bl_reloc() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i2(movz_inst(true, p(0), 42, 0), call_inst("tk_exit", no_uses, p(0), false, false))
+    let e = ef(func_blocks(bl1(mblock(0 to u32, insts))))
+    teko::assert::is_true(e.words.len == 2)
+    teko::assert::is_true(e.words[0] == (0xD2800540 to u32))
+    teko::assert::is_true(e.words[1] == (0x94000000 to u32))
+    teko::assert::is_true(e.relocs.len == 1)
+    teko::assert::is_true(e.relocs[0].offset == (4 to u32))
+    teko::assert::is_true(e.relocs[0].sym == "tk_exit")
+    teko::assert::is_true(kind_name(e.relocs[0].kind) == "Call")
+}
+
+#test
+/**
+ * diamond_forward_branches_patch_correctly — a four-block if/match diamond with
+ * NON-topological ids (0,7,3,9 in layout order) patches every forward branch:
+ * `b.eq` (imm19, +3 words), `cbz x0` (imm19, +3), `b` (imm26, +1). The seven
+ * words are byte-exact (assembler-verified) and carry no relocations.
+ *
+ * @return void
+ */
+fn diamond_forward_branches_patch_correctly() {
+    let b0 = mblock(0 to u32, i2(cmp_inst(true, p(0), p(1)), branch_cond_inst(MCond::EQ, 3 to u32)))
+    let b1 = mblock(7 to u32, i2(movz_inst(true, p(0), 1, 0), cbz_inst(true, true, p(0), 9 to u32)))
+    let b2 = mblock(3 to u32, i2(movz_inst(true, p(0), 2, 0), branch_inst(9 to u32)))
+    let b3 = mblock(9 to u32, i1(ret_inst()))
+    let e = ef(func_blocks(bl4(b0, b1, b2, b3)))
+    teko::assert::is_true(e.words.len == 7)
+    teko::assert::is_true(e.words[0] == (0xEB01001F to u32))
+    teko::assert::is_true(e.words[1] == (0x54000060 to u32))
+    teko::assert::is_true(e.words[2] == (0xD2800020 to u32))
+    teko::assert::is_true(e.words[3] == (0xB4000060 to u32))
+    teko::assert::is_true(e.words[4] == (0xD2800040 to u32))
+    teko::assert::is_true(e.words[5] == (0x14000001 to u32))
+    teko::assert::is_true(e.words[6] == (0xD65F03C0 to u32))
+    teko::assert::is_true(e.relocs.len == 0)
+}
+
+#test
+/**
+ * framed_function_prepends_prologue_and_expands_ret — a `mov x19,x0; ret`
+ * function (callee-saved x19 forces a 32-byte frame) prepends the four prologue
+ * words and expands `MRet` into the three epilogue words followed by RET — nine
+ * byte-exact words (assembler-verified), no relocations.
+ *
+ * @return void
+ */
+fn framed_function_prepends_prologue_and_expands_ret() {
+    let insts = i2(mov_inst(true, p(19), p(0)), ret_inst())
+    let e = ef(func_of(l_frame(), insts))
+    teko::assert::is_true(e.words.len == 9)
+    teko::assert::is_true(e.words[0] == (0xD10083FF to u32))
+    teko::assert::is_true(e.words[1] == (0xA9017BFD to u32))
+    teko::assert::is_true(e.words[2] == (0x910043FD to u32))
+    teko::assert::is_true(e.words[3] == (0xF90007F3 to u32))
+    teko::assert::is_true(e.words[4] == (0xAA0003F3 to u32))
+    teko::assert::is_true(e.words[5] == (0xF94007F3 to u32))
+    teko::assert::is_true(e.words[6] == (0xA9417BFD to u32))
+    teko::assert::is_true(e.words[7] == (0x910083FF to u32))
+    teko::assert::is_true(e.words[8] == (0xD65F03C0 to u32))
+    teko::assert::is_true(e.relocs.len == 0)
+}
+
+#test
+/**
+ * backward_branches_encode_negative_displacements — a three-block function whose
+ * final block branches BACKWARD (`b.eq` to block 0, `b` to block 1, both −3
+ * words) encodes the two's-complement displacements (`0x54FFFFA0` imm19,
+ * `0x17FFFFFD` imm26 — assembler-verified) without honest-stopping (regalloc
+ * gates real `loop`s, but `encode_func` encodes a negative displacement).
+ *
+ * @return void
+ */
+fn backward_branches_encode_negative_displacements() {
+    let b0 = mblock(0 to u32, i1(movz_inst(true, p(0), 7, 0)))
+    let b1 = mblock(1 to u32, i1(movz_inst(true, p(1), 8, 0)))
+    let b2 = mblock(2 to u32, i3(cmp_inst(true, p(0), p(1)), branch_cond_inst(MCond::EQ, 0 to u32), branch_inst(1 to u32)))
+    let e = ef(func_blocks(bl3(b0, b1, b2)))
+    teko::assert::is_true(e.words.len == 5)
+    teko::assert::is_true(e.words[0] == (0xD28000E0 to u32))
+    teko::assert::is_true(e.words[1] == (0xD2800101 to u32))
+    teko::assert::is_true(e.words[2] == (0xEB01001F to u32))
+    teko::assert::is_true(e.words[3] == (0x54FFFFA0 to u32))
+    teko::assert::is_true(e.words[4] == (0x17FFFFFD to u32))
+}
+
+#test
+/**
+ * reloc_records_carry_exact_offsets_kinds_syms — an `adrp; add-lo; movz; bl`
+ * function collects three relocations in order: `{0,"g",PageHi}`,
+ * `{4,"g",PageLo}`, `{12,"tk_exit",Call}` — the placeholder words stay
+ * (linker-patched), and every offset/symbol/kind is exact.
+ *
+ * @return void
+ */
+fn reloc_records_carry_exact_offsets_kinds_syms() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i4(adrp_inst(p(1), "g", MRelocKind::PageHi), add_lo_inst(p(1), p(1), "g", MRelocKind::PageLo), movz_inst(true, p(0), 0, 0), call_inst("tk_exit", no_uses, p(0), false, false))
+    let e = ef(func_blocks(bl1(mblock(0 to u32, insts))))
+    teko::assert::is_true(e.words.len == 4)
+    teko::assert::is_true(e.words[0] == (0x90000001 to u32))
+    teko::assert::is_true(e.words[1] == (0x91000021 to u32))
+    teko::assert::is_true(e.words[3] == (0x94000000 to u32))
+    teko::assert::is_true(e.relocs.len == 3)
+    teko::assert::is_true(e.relocs[0].offset == (0 to u32))
+    teko::assert::is_true(e.relocs[0].sym == "g")
+    teko::assert::is_true(kind_name(e.relocs[0].kind) == "PageHi")
+    teko::assert::is_true(e.relocs[1].offset == (4 to u32))
+    teko::assert::is_true(kind_name(e.relocs[1].kind) == "PageLo")
+    teko::assert::is_true(e.relocs[2].offset == (12 to u32))
+    teko::assert::is_true(e.relocs[2].sym == "tk_exit")
+    teko::assert::is_true(kind_name(e.relocs[2].kind) == "Call")
+}
+
+#test
+/**
+ * branch_disp_field_forward_and_backward — the displacement encoder produces the
+ * imm26/imm19 OR-masks for forward (+) and backward (−) displacements, the
+ * two's-complement halves the golden branch words carry.
+ *
+ * @return void
+ */
+fn branch_disp_field_forward_and_backward() {
+    teko::assert::is_true(field_ok(branch_disp_field(1 to i64, 0 to u32)) == (1 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(3 to i64, 1 to u32)) == (0x60 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(3 to i64), 0 to u32)) == (0x3FFFFFD to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(3 to i64), 1 to u32)) == (0xFFFFA0 to u32))
+}
+
+#test
+/**
+ * branch_disp_field_far_honest_stops — a displacement past the imm26 field (both
+ * directions) and past the imm19 field (both directions) raises the
+ * `A4-farbranch` honest-stop, covering each range guard.
+ *
+ * @return void
+ */
+fn branch_disp_field_far_honest_stops() {
+    teko::assert::str_contains(field_stop(branch_disp_field(33554432 to i64, 0 to u32)), "A4-farbranch")
+    teko::assert::str_contains(field_stop(branch_disp_field(neg64(33554433 to i64), 0 to u32)), "A4-farbranch")
+    teko::assert::str_contains(field_stop(branch_disp_field(262144 to i64, 1 to u32)), "A4-farbranch")
+    teko::assert::str_contains(field_stop(branch_disp_field(neg64(262145 to i64), 1 to u32)), "A4-farbranch")
+}
+
+#test
+/**
+ * dangling_branch_target_honest_stops — a branch to a block id absent from the
+ * function raises the `A4-badblock` internal-invariant honest-stop.
+ *
+ * @return void
+ */
+fn dangling_branch_target_honest_stops() {
+    let e = func_blocks(bl1(mblock(0 to u32, i1(branch_inst(99 to u32)))))
+    teko::assert::str_contains(ef_stop(e), "A4-badblock")
+}
+
+#test
+/**
+ * far_branch_target_through_resolve_word_honest_stops — a branch whose recorded
+ * target sits past the imm26 field propagates `A4-farbranch` out of
+ * `resolve_word` (the range guard is unreachable via real tiny functions, so it
+ * is exercised through a crafted offset table).
+ *
+ * @return void
+ */
+fn far_branch_target_through_resolve_word_honest_stops() {
+    let ew = branch_word(0x14000000 to u32, 5 to u32, 0 to u32)
+    let offsets = teko::list::push(l_block_offsets(), bo(5 to u32, 33554432 to u32))
+    match resolve_word(ew, 0 to u32, offsets) {
+        u32 as v => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "A4-farbranch")
+    }
+}
+
+#test
+/**
+ * encode_func_propagates_prologue_big_frame — a function whose frame outruns the
+ * STP field surfaces the prologue's `A4-bigframe` honest-stop from `encode_func`.
+ *
+ * @return void
+ */
+fn encode_func_propagates_prologue_big_frame() {
+    let frame = teko::list::push(l_frame(), alloca_slot(8192, 8))
+    let e = func_of(frame, i1(ret_inst()))
+    teko::assert::str_contains(ef_stop(e), "A4-bigframe")
+}
+
+#test
+/**
+ * encode_one_ret_big_frame_honest_stops — `encode_one` on an `MRet` under a
+ * frame too large surfaces the epilogue's `A4-bigframe` honest-stop (the
+ * epilogue-error arm, unreachable via `encode_func` since the prologue fails
+ * first on the same frame).
+ *
+ * @return void
+ */
+fn encode_one_ret_big_frame_honest_stops() {
+    let layout = layout_of(8208 to u32, l0(), l0(), l0())
+    match encode_one(layout, l_encwords(), ret_inst()) {
+        []EncWord as w => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "A4-bigframe")
+    }
+}
+
+#test
+/**
+ * encode_func_propagates_inst_honest_stop — a non-terminator instruction that
+ * honest-stops (a float op → `A4-fp`) propagates out of `encode_func` unchanged.
+ *
+ * @return void
+ */
+fn encode_func_propagates_inst_honest_stop() {
+    let e = func_of(l_frame(), i1(falu_inst(MFAluOp::FAdd, true, fp(0), fp(1), fp(2))))
+    teko::assert::str_contains(ef_stop(e), "A4-fp")
+}
+
+/**
+ * bo — a `BlockOffset` fixture, the crafted offset-table shorthand.
+ *
+ * @param u32 id  the block id
+ * @param u32 word  the block's starting word index
+ * @return BlockOffset  the assembled offset entry
+ */
+fn bo(id: u32, word: u32) -> BlockOffset {
+    BlockOffset { id = id; word = word }
+}
+
+/**
+ * l_block_offsets — the empty `[]BlockOffset` list, typed for the fixtures.
+ *
+ * @return []BlockOffset  an empty offset list
+ */
+fn l_block_offsets() -> []BlockOffset {
+    teko::list::empty()
+}
+
+/**
+ * l_encwords — the empty `[]EncWord` list, typed for the `encode_one` fixture.
+ *
+ * @return []EncWord  an empty EncWord list
+ */
+fn l_encwords() -> []EncWord {
+    teko::list::empty()
+}
+
+#test
+/**
+ * framed_branch_crosses_expanded_epilogue — the review-flagged expansion-shift
+ * guard: a FRAMED function whose early-return block (non-last) expands `MRet`
+ * into epilogue+RET, with a forward `b.eq` crossing that whole expansion. The
+ * assertion is structural (not tautological): the word AT `branch + disp`
+ * must BE the target block's distinctive first instruction (`movz x0,#7`),
+ * proving the branch lands past the expanded epilogue, not inside it.
+ *
+ * @return void
+ */
+fn framed_branch_crosses_expanded_epilogue() {
+    let b0 = mblock(0 to u32, i3(mov_inst(true, p(19), p(0)), cmp_inst(true, p(0), p(1)), branch_cond_inst(MCond::EQ, 5 to u32)))
+    let b1 = mblock(2 to u32, i2(movz_inst(true, p(0), 1, 0), ret_inst()))
+    let b2 = mblock(5 to u32, i2(movz_inst(true, p(0), 7, 0), ret_inst()))
+    let e = ef(func_blocks(bl3(b0, b1, b2)))
+    teko::assert::is_true(e.words.len == 17)
+    mut bi: u64 = 0
+    mut found: bool = false
+    mut i: u64 = 0
+    loop {
+        if i >= e.words.len { break }
+        if (e.words[i] >> 24) == (0x54 to u32) {
+            bi = i
+            found = true
+            break
+        }
+        i++
+    }
+    teko::assert::is_true(found)
+    let disp = (e.words[bi] >> 5) & (0x7FFFF to u32)
+    teko::assert::is_true(disp > (0 to u32))
+    teko::assert::is_true(e.words[bi + (disp to u64)] == (0xD28000E0 to u32))
+}
+
+#test
+/**
+ * branch_disp_field_extremes_encode — the review-flagged half-pinned boundary:
+ * the LAST in-range values on both sides must ENCODE (a `>=`→`>` typo at the
+ * negative extreme would silently reject them): imm26 accepts ±(-2^25 /
+ * 2^25-1), imm19 accepts ±(-2^18 / 2^18-1), with the exact two's-complement
+ * fields.
+ *
+ * @return void
+ */
+fn branch_disp_field_extremes_encode() {
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(33554432 to i64), 0 to u32)) == (0x2000000 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(33554431 to i64, 0 to u32)) == (0x1FFFFFF to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(262144 to i64), 1 to u32)) == (0x800000 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(262143 to i64, 1 to u32)) == (0x7FFFE0 to u32))
+}
+
+#test
+/**
+ * reloc_offset_includes_prologue — the review-flagged A4-4 hand-off property:
+ * in a FRAMED function (call + ret forces the FP/LR frame) the `Reloc.offset`
+ * must point AT the BL placeholder word in the full stream — i.e. it includes
+ * the prologue shift (`words[offset/4] == 0x94000000`), so A4-4's module
+ * concatenation rebases from the right base.
+ *
+ * @return void
+ */
+fn reloc_offset_includes_prologue() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i2(call_inst("helper", no_uses, p(0), false, false), ret_inst())
+    let e = ef(func_of(l_frame(), insts))
+    teko::assert::is_true(e.relocs.len == 1)
+    let r = e.relocs[0]
+    teko::assert::is_true(r.offset > (0 to u32))
+    teko::assert::is_true(e.words[(r.offset / (4 to u32)) to u64] == (0x94000000 to u32))
+    teko::assert::is_true(r.sym == "helper")
+}
