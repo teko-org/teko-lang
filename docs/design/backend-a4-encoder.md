@@ -554,9 +554,14 @@ A minimal `MH_OBJECT` (relocatable) Mach-O for arm64, enough for `ld`/`cc` to li
   `reloff`/`nreloc`/`flags`. `__data` (globals) is **deferred** (`A4-globals` honest-stop — the N2
   subset lowers no `LGlobal`, `lir.tks:151`).
 - **`LC_BUILD_VERSION`** — platform `PLATFORM_MACOS = 1` + minos/sdk (modern `ld` wants it).
-- **`LC_SYMTAB`** — the `nlist_64` array + string table: defined symbols (`_main`, each mangled
-  function, each rodata symbol) with `N_SECT | N_EXT`, section index, section-relative value;
-  undefined symbols (`_tk_exit`, any not-yet-emitted callee) with `N_UNDF | N_EXT`, value 0.
+- **`LC_SYMTAB`** — the `nlist_64` array + string table: each defined symbol carries `N_SECT`, its
+  section index, and its ABSOLUTE value (`section.addr + section-relative offset` — NOT the bare
+  offset; a `__const` symbol's `section.addr` is `text_size`, so a bare offset understates it and
+  `ld` hard-rejects the object). Functions (`_main`, each mangled function) additionally carry
+  `N_EXT` (globally visible, so `crt0`/other objects can call them); rodata symbols do NOT (file-local,
+  mirroring `clang`'s own convention for string constants — avoids a duplicate-symbol clash when two
+  objects each define the same-named constant at Phase E link). Undefined symbols (`_tk_exit`, any
+  not-yet-emitted callee) carry `N_UNDF | N_EXT`, value 0.
 - **`LC_DYSYMTAB`** — the ilocalsym/iextdefsym/iundefsym ranges (`ld` requires it even for a static
   object); the writer orders the symbol table {locals, defined-ext, undefined} so the three ranges are
   contiguous.
@@ -790,13 +795,12 @@ A3 (done) + #443 (done) ─▶ A4-1 ─▶ A4-2 ─▶ A4-3 ─▶ A4-4 ─▶ A
   `A4-bigframe` stop. **Proven by:** prologue/epilogue + `MFrameAddr` golden bytes + offset-table
   asserts (tiny-descriptor spill fixture). No e2e.
 - **A4-3 · branch layout + fixups + relocs** — `Reloc`, block-offset recording, branch-displacement
-  patching (§3.3), `EncodedFunc`, symbol `Reloc` collection, `encode_module` (concat + rebase + symbol
-  table). **Proven by:** two-block `if` displacement + ADRP/ADDLo/BL reloc-record golden asserts. No
-  object.
-- **A4-4 · Mach-O object writer** — `src/backend/objfile_macho.tks`: `Symbol`, `EncodedModule`,
-  `emit_macho` (header + segment/sections + build-version + symtab + dysymtab + reloc tables); the
-  `A4-globals` stop. **Proven by:** header/symtab/reloc golden bytes + `llvm-objdump`/`otool`
-  well-formedness on macOS-arm64.
+  patching (§3.3), `EncodedFunc`, symbol `Reloc` collection. **Proven by:** two-block `if`
+  displacement + ADRP/ADDLo/BL reloc-record golden asserts. No object.
+- **A4-4 · Mach-O object writer** — `Symbol`, `EncodedModule`, `encode_module` (concat + rebase +
+  symbol table) added to `src/backend/encode_arm64.tks`; `src/backend/objfile_macho.tks`: `emit_macho`
+  (header + segment/sections + build-version + symtab + dysymtab + reloc tables); the `A4-globals`
+  stop. **Proven by:** header/symtab/reloc golden bytes + `otool`/`nm` well-formedness on macOS-arm64.
 - **A4-5 · link + differential (KEYSTONE)** — `emit_native` in `src/build/project.tks`, `link_object`
   (extracted from `run_cc`), the `TEKO_BACKEND=native` seam, `scripts/diff_c_own.sh`, the §9.2
   fixtures; the `A4-args` stop. **Proven by:** `own-native == C-native (== interp)` exit codes over the
