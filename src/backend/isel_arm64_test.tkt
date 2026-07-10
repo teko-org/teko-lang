@@ -1,0 +1,753 @@
+use teko::lir
+
+/**
+ * iat_i128 — the i128 carrier for a small integer literal in the isel
+ * fixtures (mirrors `lir_interp_test.tkt`'s `iwt_i128`).
+ *
+ * @param i64 v  the literal value
+ * @return i128  its i128 carrier
+ */
+fn iat_i128(v: i64) -> i128 {
+    v to i128
+}
+
+/**
+ * iat_bin — append `%r = op a, b` to `f0`, returning the advanced function
+ * plus the fresh result VReg (a fixture-building shorthand shared by every
+ * test below).
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param lir::LBinOp op  the binary op
+ * @param u32 a  the first operand VReg
+ * @param u32 b  the second operand VReg
+ * @return lir::FreshVReg  the advanced function + the result VReg
+ */
+fn iat_bin(f0: lir::LFunc, op: lir::LBinOp, a: u32, b: u32) -> lir::FreshVReg {
+    let r = lir::alloc_vreg(f0)
+    lir::FreshVReg { func = lir::append_inst(r.func, 0, lir::bin_inst(r.vreg, op, a, b, 0, 0)); vreg = r.vreg }
+}
+
+/**
+ * iat_un — append `%r = op a` to `f0`, returning the advanced function plus
+ * the fresh result VReg.
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param lir::LUnOp op  the unary op
+ * @param u32 a  the operand VReg
+ * @return lir::FreshVReg  the advanced function + the result VReg
+ */
+fn iat_un(f0: lir::LFunc, op: lir::LUnOp, a: u32) -> lir::FreshVReg {
+    let r = lir::alloc_vreg(f0)
+    lir::FreshVReg { func = lir::append_inst(r.func, 0, lir::un_inst(r.vreg, op, a, 0, 0)); vreg = r.vreg }
+}
+
+/**
+ * iat_const — append `%r = const val` to `f0`, returning the advanced
+ * function plus the fresh result VReg.
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param i64 val  the literal value
+ * @return lir::FreshVReg  the advanced function + the result VReg
+ */
+fn iat_const(f0: lir::LFunc, val: i64) -> lir::FreshVReg {
+    let r = lir::alloc_vreg(f0)
+    lir::FreshVReg { func = lir::append_inst(r.func, 0, lir::const_int_inst(r.vreg, iat_i128(val), 0, 0)); vreg = r.vreg }
+}
+
+/**
+ * iat_const_float — append `%r = const.float bits` to `f0`, returning the
+ * advanced function plus the fresh result VReg.
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param u64 bits  the IEEE bit pattern
+ * @return lir::FreshVReg  the advanced function + the result VReg
+ */
+fn iat_const_float(f0: lir::LFunc, bits: u64) -> lir::FreshVReg {
+    let r = lir::alloc_vreg(f0)
+    lir::FreshVReg { func = lir::append_inst(r.func, 0, lir::const_float_inst(r.vreg, bits, 0, 0)); vreg = r.vreg }
+}
+
+/**
+ * iat_ret — append `ret value` to `f0`.
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param u32 value  the returned VReg
+ * @return lir::LFunc  the advanced function
+ */
+fn iat_ret(f0: lir::LFunc, value: u32) -> lir::LFunc {
+    lir::append_inst(f0, 0, lir::ret_inst(value, 0, 0))
+}
+
+/**
+ * iat_two_i64_params — a fresh 2-param (I64, I64) -> I64 function named
+ * `sym`, its entry block already carrying both `LParam` instructions.
+ *
+ * @param str sym  the function's symbol
+ * @return lir::LFunc  the seeded function
+ */
+fn iat_two_i64_params(sym: str) -> lir::LFunc {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), lir::LType::I64), lir::LType::I64)
+    mut f = lir::new_func(sym, 2, ptypes, lir::LType::I64)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    lir::append_inst(f, 0, lir::param_inst(1, 1, 0, 0))
+}
+
+#test
+fn iat_golden_two_param_add() {
+    mut f = iat_two_i64_params("teko__demo__add")
+    let r = iat_bin(f, lir::LBinOp::IAdd, 0, 1)
+    f = iat_ret(r.func, r.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "func @teko__demo__add {")
+    teko::assert::str_contains(text, "mov.x %0, %p0")
+    teko::assert::str_contains(text, "mov.x %1, %p1")
+    teko::assert::str_contains(text, "add.x %2, %0, %1")
+    teko::assert::str_contains(text, "mov.x %p0, %2")
+    teko::assert::str_contains(text, "ret")
+}
+
+/**
+ * iat_main_ret — a zero-param `main` returning a fully-built expression
+ * (the "straight-line, no calls" analog of `lir_interp_test.tkt`'s F1-F5:
+ * A2-2 does not yet select `LCall`, so the equivalence fixtures below use a
+ * plain `ret` in place of a `tk_exit`).
+ *
+ * @return lir::LFunc  the seeded, empty-bodied function
+ */
+fn iat_main_ret() -> lir::LFunc {
+    lir::new_func("main", 0, teko::list::empty(), lir::LType::I32)
+}
+
+#test
+fn iat_golden_const_and_ret() {
+    let c = iat_const(iat_main_ret(), 42)
+    let f = iat_ret(c.func, c.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "func @main {")
+    teko::assert::str_contains(text, "movz.x %0, #42, lsl #0")
+    teko::assert::str_contains(text, "mov.x %p0, %0")
+    teko::assert::str_contains(text, "ret")
+}
+
+#test
+fn iat_golden_rem_via_msub() {
+    mut f = iat_two_i64_params("teko__demo__rem")
+    let r = iat_bin(f, lir::LBinOp::IRemS, 0, 1)
+    f = iat_ret(r.func, r.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "sdiv.x %3, %0, %1")
+    teko::assert::str_contains(text, "msub.x %2, %3, %1, %0")
+}
+
+#test
+fn iat_golden_negate() {
+    let c = iat_const(iat_main_ret(), -42)
+    let n = iat_un(c.func, lir::LUnOp::INeg, c.vreg)
+    let f = iat_ret(n.func, n.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "movn.x %0, #41, lsl #0")
+    teko::assert::str_contains(text, "neg.x %1, %0")
+}
+
+#test
+fn iat_movz_movk_multi_lane_constant() {
+    let c = iat_const(iat_main_ret(), 65538)
+    let f = iat_ret(c.func, c.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "movz.x %0, #2, lsl #0")
+    teko::assert::str_contains(text, "movk.x %0, #1, lsl #16")
+}
+
+#test
+fn iat_const_zero_is_a_single_movz() {
+    let c = iat_const(iat_main_ret(), 0)
+    let f = iat_ret(c.func, c.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "movz.x %0, #0, lsl #0")
+}
+
+#test
+fn iat_const_minus_one_is_a_single_movn_with_zero_imm() {
+    let c = iat_const(iat_main_ret(), -1)
+    let f = iat_ret(c.func, c.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "movn.x %0, #0, lsl #0")
+}
+
+#test
+fn iat_movn_with_a_follow_up_movk_lane() {
+    let c = iat_const(iat_main_ret(), -65538)
+    let f = iat_ret(c.func, c.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "movn.x %0, #1, lsl #0")
+    teko::assert::str_contains(text, "movk.x %0, #65534, lsl #16")
+}
+
+#test
+fn iat_materialize_bits_narrow_form_direct() {
+    let ctx0 = SelCtx { func = new_mfunc("main"); vinfo = vinfo_empty(); next_scratch = 0; cur_block = 0; next_block = 1 }
+    let ctx1 = materialize_bits(ctx0, vreg(0, MRegClass::GPR), 42 to u64, false)
+    let text = minst_print(add_mfunc(empty_mmodule(), ctx1.func))
+    teko::assert::str_contains(text, "movz.w %0, #42, lsl #0")
+}
+
+#test
+fn iat_const_float_stages_bits_then_fmov() {
+    let c = iat_const_float(iat_main_ret(), 4607182418800017408 to u64)
+    let f = iat_ret(c.func, c.vreg)
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "fmov.d %0, %1")
+}
+
+/**
+ * iat_negated_double_bits — the IEEE bit pattern of a NEGATIVE double (the
+ * sign bit set), computed as a runtime OR rather than a literal past
+ * i64::MAX (the same parser-range workaround `two_pow_64` uses): flips the
+ * sign bit of 1.5's bit pattern, yielding -1.5's.
+ *
+ * @return u64  -1.5's IEEE bit pattern
+ */
+fn iat_negated_double_bits() -> u64 {
+    let sign_bit = (1 to u64) << (63 to u64)
+    sign_bit | (4607182418800017408 to u64)
+}
+
+#test
+fn iat_const_float_with_sign_bit_set_selects_without_error() {
+    let c = iat_const_float(iat_main_ret(), iat_negated_double_bits())
+    let f = iat_ret(c.func, c.vreg)
+    match select_lfunc(f) {
+        MFunc as mf => teko::assert::str_contains(minst_print(add_mfunc(empty_mmodule(), mf)), "fmov.d %0, %1")
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * iat_kitchen_sink — a two-param (I64,I64) function exercising every
+ * `LBinOp` arithmetic/bitwise/shift/compare case plus every `LUnOp` case
+ * (the coverage sweep for `select_bin`/`select_un`'s full dispatch),
+ * ending `ret`. Assertions below are ROBUST — they check the opcode
+ * mnemonic appears, not exact register numbers (ids shift as the fixture
+ * grows).
+ *
+ * @return lir::LFunc  the built function
+ */
+fn iat_kitchen_sink() -> lir::LFunc {
+    mut f = iat_two_i64_params("teko__demo__kitchen_sink")
+    f = iat_bin(f, lir::LBinOp::IAdd, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ISub, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IMul, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IDivS, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IDivU, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IRemS, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IRemU, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IAnd, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IOr, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IXor, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IShl, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IShrS, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::IShrU, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpEq, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpNe, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpLtS, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpLtU, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpLeS, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpLeU, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpGtS, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpGtU, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpGeS, 0, 1).func
+    f = iat_bin(f, lir::LBinOp::ICmpGeU, 0, 1).func
+    f = iat_un(f, lir::LUnOp::INeg, 0).func
+    f = iat_un(f, lir::LUnOp::INot, 0).func
+    f = iat_un(f, lir::LUnOp::Trunc, 0).func
+    f = iat_un(f, lir::LUnOp::ZExt, 0).func
+    let last = iat_un(f, lir::LUnOp::SExt, 0)
+    f = last.func
+    iat_ret(f, last.vreg)
+}
+
+#test
+fn iat_kitchen_sink_covers_every_int_bin_and_un_op() {
+    let mf = match select_lfunc(iat_kitchen_sink()) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "add.x ")
+    teko::assert::str_contains(text, "sub.x ")
+    teko::assert::str_contains(text, "mul.x ")
+    teko::assert::str_contains(text, "sdiv.x ")
+    teko::assert::str_contains(text, "udiv.x ")
+    teko::assert::str_contains(text, "msub.x ")
+    teko::assert::str_contains(text, "and.x ")
+    teko::assert::str_contains(text, "orr.x ")
+    teko::assert::str_contains(text, "eor.x ")
+    teko::assert::str_contains(text, "lsl.x ")
+    teko::assert::str_contains(text, "asr.x ")
+    teko::assert::str_contains(text, "lsr.x ")
+    teko::assert::str_contains(text, "cset.w ")
+    teko::assert::str_contains(text, "eq")
+    teko::assert::str_contains(text, "ne")
+    teko::assert::str_contains(text, "lt")
+    teko::assert::str_contains(text, "lo")
+    teko::assert::str_contains(text, "le")
+    teko::assert::str_contains(text, "ls")
+    teko::assert::str_contains(text, "gt")
+    teko::assert::str_contains(text, "hi")
+    teko::assert::str_contains(text, "ge")
+    teko::assert::str_contains(text, "hs")
+    teko::assert::str_contains(text, "neg.x ")
+    teko::assert::str_contains(text, "mvn.x ")
+    teko::assert::str_contains(text, "mov.w ")
+}
+
+/**
+ * iat_float_kitchen_sink — a two-float-const function exercising every
+ * `LBinOp` float case plus `FNeg`/`IToF`/`FToI`/`FToF` (the coverage sweep
+ * for the float side of `select_bin`/`select_un`).
+ *
+ * @return lir::LFunc  the built function
+ */
+fn iat_float_kitchen_sink() -> lir::LFunc {
+    mut f = iat_two_i64_params("teko__demo__float_kitchen_sink")
+    let a = iat_const_float(f, 4607182418800017408 to u64)
+    f = a.func
+    let b = iat_const_float(f, 4611686018427387904 to u64)
+    f = b.func
+    f = iat_bin(f, lir::LBinOp::FAdd, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FSub, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FMul, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FDiv, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FCmpEq, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FCmpNe, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FCmpLt, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FCmpLe, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FCmpGt, a.vreg, b.vreg).func
+    f = iat_bin(f, lir::LBinOp::FCmpGe, a.vreg, b.vreg).func
+    f = iat_un(f, lir::LUnOp::FNeg, a.vreg).func
+    f = iat_un(f, lir::LUnOp::IToF, 0).func
+    f = iat_un(f, lir::LUnOp::FToI, a.vreg).func
+    let last = iat_un(f, lir::LUnOp::FToF, a.vreg)
+    f = last.func
+    iat_ret(f, last.vreg)
+}
+
+#test
+fn iat_float_kitchen_sink_covers_every_float_op() {
+    let mf = match select_lfunc(iat_float_kitchen_sink()) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "fadd.d ")
+    teko::assert::str_contains(text, "fsub.d ")
+    teko::assert::str_contains(text, "fmul.d ")
+    teko::assert::str_contains(text, "fdiv.d ")
+    teko::assert::str_contains(text, "fcmp.d ")
+    teko::assert::str_contains(text, "fneg.d ")
+    teko::assert::str_contains(text, "scvtf ")
+    teko::assert::str_contains(text, "fcvtzs ")
+    teko::assert::str_contains(text, "fcvt ")
+}
+
+#test
+fn iat_select_module_carries_rodata_globals_layouts_through() {
+    let rodata = teko::list::push(teko::list::empty(), lir::LRodata { symbol = ".Lstr0"; bytes = teko::list::empty() })
+    let m0 = lir::with_rodata(lir::add_func(lir::empty_module(), iat_ret(iat_const(iat_main_ret(), 7).func, iat_const(iat_main_ret(), 7).vreg)), rodata)
+    let selected = match select_module(m0) { MModule as x => x; error => return }
+    teko::assert::is_true(selected.rodata.len == 1)
+    teko::assert::is_true(selected.funcs.len == 1)
+}
+
+#test
+fn iat_select_module_propagates_a_function_error() {
+    let f = lir::append_inst(lir::new_func("main", 0, teko::list::empty(), lir::LType::I64), 0, lir::void_call_inst("tk_printf", teko::list::empty(), true, 0, 0))
+    let bad = lir::add_func(lir::empty_module(), f)
+    match select_module(bad) {
+        MModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "variadic")
+    }
+}
+
+#test
+fn iat_multi_block_function_selects() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let v0 = lir::alloc_vreg(b1.func)
+    let s0 = lir::append_inst(v0.func, 0, lir::jump_inst(b1.block_id, teko::list::empty(), 0, 0))
+    let s1 = lir::append_inst(s0, b1.block_id, lir::const_int_inst(v0.vreg, 3 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    match select_lfunc(s2) {
+        MFunc as mf => teko::assert::is_true(mf.blocks.len == 2)
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn iat_i128_constant_beyond_64_bits_honest_stops() {
+    let big = (4294967296 to i128) * (4294967296 to i128)
+    let f = iat_main_ret()
+    let r = lir::alloc_vreg(f)
+    let f2 = lir::append_inst(r.func, 0, lir::const_int_inst(r.vreg, big, 0, 0))
+    match select_lfunc(iat_ret(f2, r.vreg)) {
+        MFunc => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "register-pair materialization")
+    }
+}
+
+#test
+fn iat_i128_param_honest_stops() {
+    let ptypes = teko::list::push(teko::list::empty(), lir::LType::I128)
+    mut f = lir::new_func("teko__demo__i128_param", 1, ptypes, lir::LType::I128)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    match select_lfunc(iat_ret(f, 0)) {
+        MFunc => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "register-pair ABI slot")
+    }
+}
+
+/**
+ * iat_nine_i64_ptypes — nine `I64` parameter machine classes (the AAPCS64
+ * GPR-window-overflow fixture: 8 fill x0..x7, the 9th spills, which A2-2
+ * defers to A2-5).
+ *
+ * @return []lir::LType  the nine-entry parameter-type list
+ */
+fn iat_nine_i64_ptypes() -> []lir::LType {
+    mut out: []lir::LType = teko::list::empty()
+    mut i: u32 = 0
+    loop {
+        if i >= 9 { break }
+        out = teko::list::push(out, lir::LType::I64)
+        i++
+    }
+    out
+}
+
+#test
+fn iat_ninth_gpr_param_honest_stops() {
+    mut f = lir::new_func("teko__demo__nine_params", 9, iat_nine_i64_ptypes(), lir::LType::I64)
+    mut i: u32 = 0
+    loop {
+        if i >= 9 { break }
+        f = lir::append_inst(f, 0, lir::param_inst(i, i, 0, 0))
+        i++
+    }
+    match select_lfunc(iat_ret(f, 0)) {
+        MFunc => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "more than 8 arguments")
+    }
+}
+
+#test
+fn iat_param_index_out_of_range_honest_stops() {
+    let f = iat_main_ret()
+    let r = lir::alloc_vreg(f)
+    let f2 = lir::append_inst(r.func, 0, lir::param_inst(r.vreg, 3, 0, 0))
+    match select_lfunc(iat_ret(f2, 0)) {
+        MFunc => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "param index out of range")
+    }
+}
+
+#test
+fn iat_void_ret_selects_bare_ret() {
+    let f = lir::append_inst(iat_main_ret(), 0, lir::ret_void_inst(0, 0))
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "ret")
+}
+
+/**
+ * iat_one_param_func — a single-parameter function of machine class `ty`
+ * (its own return type too, so a scalar `ret` is well-formed), its param
+ * already read via `LParam` and returned directly — the coverage sweep for
+ * `mregclass_of_ltype`/`ltype_is_wide`'s full per-`LType` dispatch (every
+ * case but `I128`, which errors — tested separately).
+ *
+ * @param lir::LType ty  the parameter's (and return's) machine class
+ * @return lir::LFunc  the built function
+ */
+fn iat_one_param_func(ty: lir::LType) -> lir::LFunc {
+    let ptypes = teko::list::push(teko::list::empty(), ty)
+    mut f = lir::new_func("teko__demo__one_param", 1, ptypes, ty)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    iat_ret(f, 0)
+}
+
+/**
+ * iat_select_succeeds — whether `select_lfunc(f)` selects without error.
+ *
+ * @param lir::LFunc f  the function to select
+ * @return bool  whether selection succeeded
+ */
+fn iat_select_succeeds(f: lir::LFunc) -> bool {
+    match select_lfunc(f) { MFunc => true; error => false }
+}
+
+#test
+fn iat_select_param_covers_every_scalar_machine_class() {
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::I8)))
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::I16)))
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::I32)))
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::I64)))
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::Ptr)))
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::Void)))
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::F16)))
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::F32)))
+    teko::assert::is_true(iat_select_succeeds(iat_one_param_func(lir::LType::F64)))
+    teko::assert::is_true(!iat_select_succeeds(iat_one_param_func(lir::LType::I128)))
+}
+
+/**
+ * iat_mregclass_and_wide_cover_i128_directly — `mregclass_of_ltype`/
+ * `ltype_is_wide`'s own `I128` arms are otherwise UNREACHABLE through
+ * `select_param` (its `ltype_is_i128` guard already honest-stops before
+ * either helper is consulted for the CURRENTLY-selected parameter) — a
+ * direct unit call proves the two total, declared mappings anyway.
+ */
+#test
+fn iat_mregclass_and_wide_cover_i128_directly() {
+    teko::assert::is_true(mregclass_of_ltype(lir::LType::I128) == MRegClass::GPR)
+    teko::assert::is_true(ltype_is_wide(lir::LType::I128) == true)
+}
+
+/**
+ * iat_mixed_gpr_fpr_params — a 3-param function `(F64, I64, F64)`: proves
+ * the AAPCS64 classifier counts EACH register file independently
+ * (`gpr_index_before`/`fpr_index_before`, §3.5) — param 1 (I64) walks ONE
+ * earlier FPR entry (the classifier's GPR-count "no match" branch); param
+ * 2 (F64) walks a MIXED earlier pair, one FPR match and one GPR non-match
+ * (both branches of the FPR-count loop in a single call).
+ *
+ * @return lir::LFunc  the built function
+ */
+fn iat_mixed_gpr_fpr_params() -> lir::LFunc {
+    let t1 = teko::list::push(teko::list::empty(), lir::LType::F64)
+    let t2 = teko::list::push(t1, lir::LType::I64)
+    let ptypes = teko::list::push(t2, lir::LType::F64)
+    mut f = lir::new_func("teko__demo__mixed_params", 3, ptypes, lir::LType::I64)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    f = lir::append_inst(f, 0, lir::param_inst(1, 1, 0, 0))
+    f = lir::append_inst(f, 0, lir::param_inst(2, 2, 0, 0))
+    iat_ret(f, 1)
+}
+
+#test
+fn iat_mixed_gpr_fpr_params_assigns_independent_class_slots() {
+    let mf = match select_lfunc(iat_mixed_gpr_fpr_params()) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "fmov.d %0, %p0")
+    teko::assert::str_contains(text, "mov.x %1, %p0")
+    teko::assert::str_contains(text, "fmov.d %2, %p1")
+}
+
+#test
+fn iat_bin_on_an_unrecorded_vreg_defaults_to_gpr_wide() {
+    mut f = iat_main_ret()
+    let r = lir::alloc_vreg(f)
+    f = r.func
+    f = lir::append_inst(f, 0, lir::bin_inst(r.vreg, lir::LBinOp::IAdd, 99, 98, 0, 0))
+    let mf = match select_lfunc(iat_ret(f, r.vreg)) { MFunc as x => x; error => return }
+    let text = minst_print(add_mfunc(empty_mmodule(), mf))
+    teko::assert::str_contains(text, "add.x %0, %99, %98")
+}
+
+/**
+ * iat_deferred_error — assert that a one-instruction function built from
+ * `inst` honest-stops with a message containing `needle` (the shared shape
+ * of every "out of A2-2 scope" test below).
+ *
+ * @param lir::LInst inst  the out-of-scope instruction
+ * @param str needle  the expected honest-stop substring
+ * @return void
+ */
+fn iat_deferred_error(inst: lir::LInst, needle: str) {
+    let f = lir::append_inst(iat_main_ret(), 0, inst)
+    match select_lfunc(f) {
+        MFunc => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, needle)
+    }
+}
+
+/**
+ * iat_dump — select `f` and render the machine module as text (the A2-3
+ * golden-dump fixtures assert against key lines of this).
+ *
+ * @param lir::LFunc f  the function to select and print
+ * @return str  the rendered machine text ("" on a selection error)
+ */
+fn iat_dump(f: lir::LFunc) -> str {
+    let mf = match select_lfunc(f) { MFunc as x => x; error => return "" }
+    minst_print(add_mfunc(empty_mmodule(), mf))
+}
+
+#test
+fn iat_a23_jump_emits_edge_move_and_branch() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let v0 = lir::alloc_vreg(b1.func)
+    let bp = lir::add_block_param(v0.func, b1.block_id)
+    let s0 = lir::append_inst(bp.func, 0, lir::const_int_inst(v0.vreg, 7 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::jump_inst(b1.block_id, teko::list::push(teko::list::empty(), v0.vreg), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    let text = iat_dump(s2)
+    teko::assert::str_contains(text, "#M1(%1")
+    teko::assert::str_contains(text, "b #M1")
+}
+
+#test
+fn iat_a23_fused_compare_branch() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let v3 = lir::alloc_vreg(v2.func)
+    let v4 = lir::alloc_vreg(v3.func)
+    let s0 = lir::append_inst(v4.func, 0, lir::const_int_inst(v0.vreg, 5 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(v1.vreg, 5 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::bin_inst(v2.vreg, lir::LBinOp::ICmpEq, v0.vreg, v1.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::branch_inst(v2.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s4 = lir::append_inst(s3, b1.block_id, lir::const_int_inst(v3.vreg, 100 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b1.block_id, lir::ret_inst(v3.vreg, 0, 0))
+    let s6 = lir::append_inst(s5, b2.block_id, lir::const_int_inst(v4.vreg, 200 to i128, 0, 0))
+    let s7 = lir::append_inst(s6, b2.block_id, lir::ret_inst(v4.vreg, 0, 0))
+    let text = iat_dump(s7)
+    teko::assert::str_contains(text, "cmp.")
+    teko::assert::str_contains(text, "b.eq #M1")
+    teko::assert::str_contains(text, "b #M2")
+}
+
+#test
+fn iat_a23_generic_boolean_branch() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let s0 = lir::append_inst(v2.func, 0, lir::const_int_inst(v0.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::const_int_inst(v1.vreg, 10 to i128, 0, 0))
+    let s3 = lir::append_inst(s2, b1.block_id, lir::ret_inst(v1.vreg, 0, 0))
+    let s4 = lir::append_inst(s3, b2.block_id, lir::const_int_inst(v2.vreg, 20 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b2.block_id, lir::ret_inst(v2.vreg, 0, 0))
+    let text = iat_dump(s5)
+    teko::assert::str_contains(text, "cbnz")
+    teko::assert::str_contains(text, "b #M2")
+}
+
+#test
+fn iat_a24_alloca_reserves_frame_slot() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::alloca_inst(v.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::ret_inst(v.vreg, 0, 0))
+    teko::assert::str_contains(iat_dump(s1), "frame_addr %0, #0")
+}
+
+#test
+fn iat_a24_field_addr_is_add_immediate() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let fa = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(fa.func, 0, lir::alloca_inst(base.vreg, 16, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::field_addr_inst(fa.vreg, base.vreg, 8, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(fa.vreg, 0, 0))
+    teko::assert::str_contains(iat_dump(s2), "add.x %1, %0, #8")
+}
+
+#test
+fn iat_a24_load_is_ldr() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let ld = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(ld.func, 0, lir::alloca_inst(base.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::load_inst(ld.vreg, base.vreg, lir::LType::I64, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(ld.vreg, 0, 0))
+    teko::assert::str_contains(iat_dump(s2), "ldr.x %1, [%0, #0]")
+}
+
+#test
+fn iat_a24_store_is_str() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let val = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(val.func, 0, lir::alloca_inst(base.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(val.vreg, 42 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::store_inst(base.vreg, val.vreg, lir::LType::I64, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::ret_inst(val.vreg, 0, 0))
+    teko::assert::str_contains(iat_dump(s3), "str.x %1, [%0, #0]")
+}
+
+#test
+fn iat_a24_global_addr_is_adrp_add_data_reloc() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::global_addr_inst(v.vreg, ".Lstr0", 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::ret_inst(v.vreg, 0, 0))
+    let text = iat_dump(s1)
+    teko::assert::str_contains(text, "adrp.page_hi %0, @.Lstr0")
+    teko::assert::str_contains(text, "add_lo.page_lo %0, %0, @.Lstr0")
+}
+
+#test
+fn iat_a25_call_pins_arg_and_emits_mcall() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::const_int_inst(v.vreg, 42 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_inst("tk_exit", teko::list::push(teko::list::empty(), v.vreg), false, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(v.vreg, 0, 0))
+    let text = iat_dump(s2)
+    teko::assert::str_contains(text, "%p0, %0")
+    teko::assert::str_contains(text, "call @tk_exit(%p0)")
+}
+
+#test
+fn iat_a25_call_indirect_is_blr_through_target() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let t = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(t.func, 0, lir::alloca_inst(t.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_indirect_inst(t.vreg, teko::list::empty(), false, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(t.vreg, 0, 0))
+    teko::assert::str_contains(iat_dump(s2), "call.indirect %0()")
+}
+
+#test
+fn iat_a25_variadic_call_honest_stops() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::const_int_inst(v.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_inst("tk_printf", teko::list::push(teko::list::empty(), v.vreg), true, 0, 0))
+    match select_lfunc(s1) {
+        MFunc => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "variadic")
+    }
+}
+
+#test
+fn iat_a24_func_addr_is_adrp_add_text_reloc() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::func_addr_inst(v.vreg, "teko__demo__f", 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::ret_inst(v.vreg, 0, 0))
+    let text = iat_dump(s1)
+    teko::assert::str_contains(text, "adrp.call %0, @teko__demo__f")
+    teko::assert::str_contains(text, "add_lo.call %0, %0, @teko__demo__f")
+}
+
+#test
+fn iat_a25_call_with_result_moves_x0_out() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let r = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(r.func, 0, lir::call_inst(r.vreg, "teko__demo__f", teko::list::empty(), false, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::ret_inst(r.vreg, 0, 0))
+    let text = iat_dump(s1)
+    teko::assert::str_contains(text, "call @teko__demo__f() -> %p0")
+    teko::assert::str_contains(text, "mov.x %0, %p0")
+}

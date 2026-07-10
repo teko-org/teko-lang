@@ -159,6 +159,46 @@ fn print_ret(r: LRet) -> str {
     if r.has_value { teko::str::concat("ret ", vreg_ref(r.value)) } else { "ret" }
 }
 
+/** print_alloca — `alloca <bytes>, align <align>` (A1-3, #382). */
+fn print_alloca(a: LAlloca) -> str {
+    teko::str::concat("alloca ", teko::u64_to_str(a.bytes to u64), ", align ", teko::u64_to_str(a.align to u64))
+}
+
+/** print_field_addr — `field_addr %base, <offset>` (A1-3, #382). */
+fn print_field_addr(fa: LFieldAddr) -> str {
+    teko::str::concat("field_addr ", vreg_ref(fa.base), ", ", teko::u64_to_str(fa.offset to u64))
+}
+
+/** print_load — `load.<ty> %addr` (A1-3, #382). */
+fn print_load(l: LLoad) -> str {
+    teko::str::concat("load.", ltype_name(l.ty), " ", vreg_ref(l.addr))
+}
+
+/** print_store — `store.<ty> %addr, %value` (A1-3, #382). */
+fn print_store(s: LStore) -> str {
+    teko::str::concat("store.", ltype_name(s.ty), " ", vreg_ref(s.addr), ", ", vreg_ref(s.value))
+}
+
+/** print_global_addr — `global_addr @<symbol>` (A1-4, #382). */
+fn print_global_addr(g: LGlobalAddr) -> str {
+    teko::str::concat("global_addr @", g.symbol)
+}
+
+/**
+ * print_call_indirect — `call.indirect %<target>(<args>)` (A1-6, #382).
+ *
+ * @param LCallIndirect c  the indirect-call op to print
+ * @return str  the op text (no result prefix)
+ */
+fn print_call_indirect(c: LCallIndirect) -> str {
+    teko::str::concat("call.indirect ", vreg_ref(c.target), "(", print_args(c.args), ")")
+}
+
+/** print_func_addr — `funcaddr @<symbol>` (A1-7, #382). */
+fn print_func_addr(fa: LFuncAddr) -> str {
+    teko::str::concat("funcaddr @", fa.symbol)
+}
+
 /** print_jump — `jump #B<target>(<args>)`. */
 fn print_jump(j: LJump) -> str {
     teko::str::concat("jump #B", teko::u64_to_str(j.target to u64), "(", print_args(j.args), ")")
@@ -185,6 +225,13 @@ fn print_op(op: LOp) -> str {
         LRet as r => print_ret(r)
         LJump as j => print_jump(j)
         LBranch as br => print_branch(br)
+        LAlloca as a => print_alloca(a)
+        LFieldAddr as fa => print_field_addr(fa)
+        LLoad as l => print_load(l)
+        LStore as s => print_store(s)
+        LGlobalAddr as g => print_global_addr(g)
+        LCallIndirect as ci => print_call_indirect(ci)
+        LFuncAddr as fa => print_func_addr(fa)
     }
 }
 
@@ -235,10 +282,93 @@ fn print_func(f: LFunc) -> str {
     teko::str::concat(out, "}\n")
 }
 
-/** print_lmodule — the whole module as stable text: every function in declaration
+/** print_layout — one struct-layout header line: `layout <name>: size=<N> align=<N>
+    { <field>@<offset>, … }` (A1-3, #382). */
+fn print_layout(l: LStructLayout) -> str {
+    mut out = teko::str::concat("layout ", l.name, ": size=", teko::u64_to_str(l.size to u64), " align=", teko::u64_to_str(l.align to u64), " {")
+    mut i: u64 = 0
+    loop {
+        if i >= l.field_names.len { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, l.field_names[i], "@", teko::u64_to_str(l.field_offsets[i] to u64))
+        i++
+    }
+    teko::str::concat(out, "}\n")
+}
+
+/** print_layouts — every registered struct layout, one header line each, in table order
+    (empty for a module with no aggregates — byte-identical to N1's output). */
+fn print_layouts(m: LModule) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= m.layouts.len { break }
+        out = teko::str::concat(out, print_layout(m.layouts[i]))
+        i++
+    }
+    out
+}
+
+/** print_rodata_bytes — a rodata entry's raw bytes as a `[b0, b1, …]` decimal list — binary-
+    safe (no C-string escaping needed) and fully deterministic (A1-4, #382). */
+fn print_rodata_bytes(bytes: []byte) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= bytes.len { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, teko::u64_to_str(bytes[i] to u64))
+        i++
+    }
+    out
+}
+
+/** print_rodata_entry — one rodata header line: `rodata <symbol>: [<bytes>]` (A1-4, #382). */
+fn print_rodata_entry(r: LRodata) -> str {
+    teko::str::concat("rodata ", r.symbol, ": [", print_rodata_bytes(r.bytes), "]\n")
+}
+
+/** print_rodata_section — every interned rodata entry, one header line each, in table order
+    (empty for a module with no interned strings — byte-identical to A1-3's output)
+    (A1-4, #382). */
+fn print_rodata_section(m: LModule) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= m.rodata.len { break }
+        out = teko::str::concat(out, print_rodata_entry(m.rodata[i]))
+        i++
+    }
+    out
+}
+
+/** print_global_entry — one global header line: `global <symbol>: <ty> [<bytes>]`
+    (A1-4, #382). */
+fn print_global_entry(g: LGlobal) -> str {
+    teko::str::concat("global ", g.symbol, ": ", ltype_name(g.ty), " [", print_rodata_bytes(g.bytes), "]\n")
+}
+
+/** print_globals_section — every declared global, one header line each, in table order
+    (empty for a module with no globals — A1-4, #382). */
+fn print_globals_section(m: LModule) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= m.globals.len { break }
+        out = teko::str::concat(out, print_global_entry(m.globals[i]))
+        i++
+    }
+    out
+}
+
+/** print_lmodule — the whole module as stable text: its struct-layout table, its rodata
+    table, its globals table (each section empty when unused — byte-identical to A1-3's
+    output for a module with no aggregates/strings), then every function in declaration
     order, blank-line separated. This is the artifact the diff/fixpoint gate reads. */
 pub fn print_lmodule(m: LModule) -> str {
-    mut out = ""
+    mut out = print_layouts(m)
+    out = teko::str::concat(out, print_rodata_section(m))
+    out = teko::str::concat(out, print_globals_section(m))
     mut i: u64 = 0
     loop {
         if i >= m.funcs.len { break }
