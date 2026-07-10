@@ -1,0 +1,869 @@
+/**
+ * EncInstX86 — one x86-64 instruction's encoding outcome: its variable-length
+ * byte string plus optional pending fixups. A position-independent instruction
+ * resolves to just `bytes` (`has_branch`/`has_reloc` false). An intra-function
+ * branch carries a `rel32` fixup — the byte offset WITHIN `bytes` of the 4-byte
+ * little-endian displacement field and the destination machine-block id —
+ * patched once every block's byte offset is known (the B1-6 layout pass). A
+ * symbol reference carries a relocation shape (the byte offset of its rel32
+ * field + the target symbol + kind), materialized into an `Elf64_Rela` at B1-7.
+ * Mirrors arm64's `EncWord`, byte-granular instead of fixed 32-bit words.
+ *
+ * @since #386 B1-5
+ */
+pub type EncInstX86 = struct {
+    /**
+     * bytes — the instruction's encoded bytes (1..15), in order, ready to
+     * append to the function's `.text` image.
+     */
+    bytes: []byte
+    /**
+     * has_branch — true iff a `rel32` block displacement must be patched in.
+     */
+    has_branch: bool
+    /**
+     * branch_field_off — the byte offset within `bytes` of the 4-byte rel32
+     * field (meaningful when `has_branch`).
+     */
+    branch_field_off: u32
+    /**
+     * target — the destination machine-block id (meaningful when `has_branch`).
+     */
+    target: u32
+    /**
+     * has_reloc — true iff this instruction owes a symbol relocation.
+     */
+    has_reloc: bool
+    /**
+     * reloc_field_off — the byte offset within `bytes` of the relocated field.
+     */
+    reloc_field_off: u32
+    /**
+     * reloc_sym — the relocation's target symbol (meaningful when `has_reloc`).
+     */
+    reloc_sym: str
+    /**
+     * reloc_kind — the relocation kind (meaningful when `has_reloc`).
+     */
+    reloc_kind: RelocKindX86
+}
+
+/**
+ * FrameLayoutX86 — the resolved stack frame of one x86-64 function: its total
+ * 16-aligned byte size, the ordered callee-saved registers to save/restore
+ * (re-derived by scanning the physical function, not carried by `MFuncX86`),
+ * and the RSP-relative byte offset of every `MFuncX86.frame` slot. Purely a
+ * side-table the encoder reads to resolve `MFrameAddrX86` to a concrete
+ * `lea dst, [rsp+off]`; the block stream is never rewritten. A `size` of 0
+ * marks a frameless function (no prologue/epilogue). B1-5 defines the type and
+ * resolves `MFrameAddrX86` through it (the §6.1 signature); B1-6 fills it via
+ * `compute_frame_layout_x86` and emits the matching prologue/epilogue. Mirrors
+ * arm64's `FrameLayout`.
+ *
+ * @since #386 B1-5
+ */
+pub type FrameLayoutX86 = struct {
+    /**
+     * size — the total frame size in bytes, rounded up to 16 (SysV 16-byte
+     * call-site alignment); 0 for a frameless function.
+     */
+    size: u32
+    /**
+     * saved_gpr — the callee-saved GPR ids to push/pop, ascending for a
+     * deterministic prologue.
+     */
+    saved_gpr: []u32
+    /**
+     * saved_fpr — the callee-saved FPR ids to save/restore, ascending.
+     */
+    saved_fpr: []u32
+    /**
+     * slot_offsets — the RSP-relative byte offset of each `MFuncX86.frame`
+     * entry, in frame order; `MFrameAddrX86{slot}` resolves to
+     * `lea dst, [rsp+slot_offsets[slot]]`.
+     */
+    slot_offsets: []u32
+}
+
+/**
+ * X86MemOp — the encoding descriptor for a memory-operand `mov`/`movsx`-family
+ * instruction: the operand-size prefix, the REX.W bit, whether the opcode is
+ * `0F`-escaped, the primary opcode byte, and whether the register operand is
+ * 8-bit (which forces a REX prefix when it is SIL/DIL/BPL/SPL or R8..R15, so
+ * the low byte is addressable). `load_memop_x86`/`store_memop_x86` produce it;
+ * `emit_mem_op_x86` consumes it for both loads and stores.
+ *
+ * @since #386 B1-5
+ */
+type X86MemOp = struct {
+    /**
+     * op66 — emit the `0x66` operand-size prefix (the 16-bit word forms).
+     */
+    op66: bool
+    /**
+     * rexw — set the REX.W bit (the 64-bit quadword / sign-extending forms).
+     */
+    rexw: bool
+    /**
+     * two_byte — the opcode is `0F`-escaped (`movsx`).
+     */
+    two_byte: bool
+    /**
+     * opcode — the primary opcode byte (after any `0F` escape).
+     */
+    opcode: u32
+    /**
+     * byte_reg — the register operand is 8-bit (a byte load's destination or a
+     * byte store's source), so a REX prefix is forced when its id is >= 4
+     * (SIL/DIL/BPL/SPL/R8..R15).
+     */
+    byte_reg: bool
+}
+
+/**
+ * push_byte_x86 — append the low 8 bits of `v` to `buf` as one byte, the
+ * variable-length x86 emit primitive (all bit-slicing stays in `u32`; only the
+ * final `& 0xFF` narrows to `byte`, the VM byte-width anchoring rule).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 v  the value whose low byte is appended
+ * @return []byte  `buf` followed by `v & 0xFF`
+ */
+fn push_byte_x86(buf: []byte, v: u32) -> []byte {
+    teko::list::push(buf, (v & (0xFF to u32)) to byte)
+}
+
+/**
+ * push_imm32_x86 — append the low 32 bits of `x` to `buf` as four little-endian
+ * bytes. The mask keeps a NEGATIVE `x` from panicking on the `to u32` cast (the
+ * two's-complement bit pattern is computed by masking, not by a signed cast).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param i64 x  the value whose low 32 bits are appended (imm32 / disp32)
+ * @return []byte  `buf` followed by the four little-endian bytes
+ */
+fn push_imm32_x86(buf: []byte, x: i64) -> []byte {
+    emit_u32_le(buf, (x & (0xFFFFFFFF to i64)) to u32)
+}
+
+/**
+ * push_imm64_x86 — append the 64 bits of `x` to `buf` as eight little-endian
+ * bytes (the `movabs` immediate), split into two masked 32-bit halves so a
+ * NEGATIVE `x` never reaches a panicking signed `to u64` cast.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param i64 x  the 64-bit immediate to append
+ * @return []byte  `buf` followed by the eight little-endian bytes
+ */
+fn push_imm64_x86(buf: []byte, x: i64) -> []byte {
+    let lo = (x & (0xFFFFFFFF to i64)) to u32
+    let hi = ((x >> (32 to i64)) & (0xFFFFFFFF to i64)) to u32
+    emit_u32_le(emit_u32_le(buf, lo), hi)
+}
+
+/**
+ * rex_x86 — the REX prefix byte value `0x40 | (W<<3) | (R<<2) | (X<<1) | B`:
+ * `W` the 64-bit operand size, `R` the ModRM.reg high bit, `X` the SIB.index
+ * high bit, `B` the ModRM.rm / SIB.base / opcode-reg high bit.
+ *
+ * @param bool w  the operand-size (REX.W) bit
+ * @param bool r  the reg-field extension (REX.R) bit
+ * @param bool x  the index-field extension (REX.X) bit
+ * @param bool b  the rm/base/opcode-reg extension (REX.B) bit
+ * @return u32  the REX prefix byte value
+ */
+fn rex_x86(w: bool, r: bool, x: bool, b: bool) -> u32 {
+    (0x40 to u32) | ((w to u32) << (3 to u32)) | ((r to u32) << (2 to u32)) | ((x to u32) << (1 to u32)) | (b to u32)
+}
+
+/**
+ * push_rex_x86 — append a REX prefix to `buf` only when it carries information
+ * (any of W/R/X/B set); a bare `0x40` is elided, matching what an assembler
+ * emits for a non-byte operation. Byte operations that need the bare `0x40` to
+ * reach SIL/DIL/BPL/SPL go through `push_rex_forced_x86` instead.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param bool w  the REX.W bit
+ * @param bool r  the REX.R bit
+ * @param bool x  the REX.X bit
+ * @param bool b  the REX.B bit
+ * @return []byte  `buf`, with a REX prefix appended iff it is non-trivial
+ */
+fn push_rex_x86(buf: []byte, w: bool, r: bool, x: bool, b: bool) -> []byte {
+    let v = rex_x86(w, r, x, b)
+    if v == (0x40 to u32) { return buf }
+    push_byte_x86(buf, v)
+}
+
+/**
+ * push_rex_forced_x86 — append a REX prefix to `buf` UNCONDITIONALLY, including
+ * a bare `0x40`. Used where a byte register (SIL/DIL/BPL/SPL) needs the prefix
+ * to be addressable, or where REX.W is always required.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param bool w  the REX.W bit
+ * @param bool r  the REX.R bit
+ * @param bool x  the REX.X bit
+ * @param bool b  the REX.B bit
+ * @return []byte  `buf` followed by the REX prefix byte
+ */
+fn push_rex_forced_x86(buf: []byte, w: bool, r: bool, x: bool, b: bool) -> []byte {
+    push_byte_x86(buf, rex_x86(w, r, x, b))
+}
+
+/**
+ * modrm_x86 — the ModRM byte `(mod<<6) | (reg<<3) | rm`, the addressing-mode
+ * byte every register/memory operand rides. `mod=11` is register-direct;
+ * `mod=00/01/10` select the [base], [base+disp8], [base+disp32] memory forms.
+ *
+ * @param u32 md  the 2-bit mode field
+ * @param u32 reg  the 3-bit reg / opcode-extension field
+ * @param u32 rm  the 3-bit rm field
+ * @return u32  the ModRM byte value
+ */
+fn modrm_x86(md: u32, reg: u32, rm: u32) -> u32 {
+    ((md & (0x3 to u32)) << (6 to u32)) | ((reg & (0x7 to u32)) << (3 to u32)) | (rm & (0x7 to u32))
+}
+
+/**
+ * reg_low3_x86 — a physical register's low 3 bits, the value that rides the
+ * ModRM.reg / ModRM.rm / SIB / opcode-`+rd` fields (the high bit routes into a
+ * REX extension bit via `reg_ext_x86`).
+ *
+ * @param MReg r  a physical register (B1 runs post-regalloc)
+ * @return u32  the register id's low 3 bits
+ */
+fn reg_low3_x86(r: MReg) -> u32 {
+    r.id & (0x7 to u32)
+}
+
+/**
+ * reg_ext_x86 — whether a physical register needs a REX extension bit: true for
+ * R8..R15 / XMM8..XMM15 (id >= 8), whose high bit cannot ride the 3-bit ModRM
+ * field and must route into REX.R/REX.B/REX.X.
+ *
+ * @param MReg r  a physical register
+ * @return bool  true iff the register's id has its 4th bit set
+ */
+fn reg_ext_x86(r: MReg) -> bool {
+    (r.id & (0x8 to u32)) != (0 to u32)
+}
+
+/**
+ * cond_cc_x86 — the 4-bit x86 condition code (`tttn`) for an `MCond`, shared by
+ * `Jcc` (opcode `0x80+cc`) and `SETcc` (opcode `0x90+cc`): equality (E/NE),
+ * signed (L/LE/G/GE), unsigned (B/BE/A/AE), one per abstract condition.
+ *
+ * @param MCond c  the condition code
+ * @return u32  its 4-bit x86 condition-code field
+ */
+fn cond_cc_x86(c: MCond) -> u32 {
+    match c {
+        EQ => 0x4 to u32
+        NE => 0x5 to u32
+        LT => 0xC to u32
+        LE => 0xE to u32
+        GT => 0xF to u32
+        GE => 0xD to u32
+        LO => 0x2 to u32
+        LS => 0x6 to u32
+        HI => 0x7 to u32
+        HS => 0x3 to u32
+    }
+}
+
+/**
+ * fits_i32_x86 — whether a 64-bit immediate fits the signed 32-bit field a
+ * `mov r64, imm32`(sign-extended) uses: an out-of-range value takes the 10-byte
+ * `movabs r64, imm64` form instead (§6.3 of the B1 plan).
+ *
+ * @param i64 x  the immediate to classify
+ * @return bool  true iff `x` is in `[-2^31, 2^31 - 1]`
+ */
+fn fits_i32_x86(x: i64) -> bool {
+    let hi = 2147483647 to i64
+    let lo = (0 to i64) - (2147483648 to i64)
+    x >= lo && x <= hi
+}
+
+/**
+ * honest_fp_x86 — the single named honest-stop the SSE float family raises when
+ * it reaches the B1-5 encoder core: an `MLoadX86`/`MStoreX86` whose register
+ * operand is FPR-class is an SSE memory move (MOVSD/MOVSS), deferred to 0.3.1
+ * with the rest of the float family (`B1-fp`, mirroring arm64's `A4-fp`). A
+ * float fixture stops IDENTICALLY on the own-native side and is compared at the
+ * stop, never at a fabricated value.
+ *
+ * @return error  the `B1-fp` named honest-stop
+ */
+fn honest_fp_x86() -> error {
+    error { message = "B1-fp: SSE float-op / FPR load-store encoding deferred to 0.3.1 (encodings in the B1 crumb-plan appendix)" }
+}
+
+/**
+ * plain_inst_x86 — an `EncInstX86` for a position-independent instruction: just
+ * the finished bytes, with no branch displacement and no symbol relocation
+ * pending (the fixup fields carry inert defaults).
+ *
+ * @param []byte bytes  the finished instruction bytes
+ * @return EncInstX86  the instruction with no pending fixup
+ */
+fn plain_inst_x86(bytes: []byte) -> EncInstX86 {
+    EncInstX86 {
+        bytes = bytes
+        has_branch = false
+        branch_field_off = 0 to u32
+        target = 0 to u32
+        has_reloc = false
+        reloc_field_off = 0 to u32
+        reloc_sym = ""
+        reloc_kind = RelocKindX86::Plt32
+    }
+}
+
+/**
+ * branch_inst_x86 — an `EncInstX86` for an intra-function branch: the bytes
+ * (with the rel32 field still zero) plus the byte offset of that field and the
+ * destination machine-block id the B1-6 patch pass fills.
+ *
+ * @param []byte bytes  the instruction bytes (rel32 field zeroed)
+ * @param u32 field_off  the byte offset of the 4-byte rel32 field
+ * @param u32 target  the destination machine-block id
+ * @return EncInstX86  the instruction flagged for branch patching
+ */
+fn branch_inst_x86(bytes: []byte, field_off: u32, target: u32) -> EncInstX86 {
+    EncInstX86 {
+        bytes = bytes
+        has_branch = true
+        branch_field_off = field_off
+        target = target
+        has_reloc = false
+        reloc_field_off = 0 to u32
+        reloc_sym = ""
+        reloc_kind = RelocKindX86::Plt32
+    }
+}
+
+/**
+ * reloc_inst_x86 — an `EncInstX86` for a symbol reference: the placeholder
+ * bytes (with the relocated field zeroed) plus the byte offset of that field,
+ * the target symbol, and the relocation kind the B1-7 ELF writer turns into an
+ * `Elf64_Rela` entry.
+ *
+ * @param []byte bytes  the instruction bytes (relocated field zeroed)
+ * @param u32 field_off  the byte offset of the relocated field
+ * @param str sym  the target symbol's already-final name
+ * @param RelocKindX86 kind  which relocation this instruction owes
+ * @return EncInstX86  the instruction flagged for symbol relocation
+ */
+fn reloc_inst_x86(bytes: []byte, field_off: u32, sym: str, kind: RelocKindX86) -> EncInstX86 {
+    EncInstX86 {
+        bytes = bytes
+        has_branch = false
+        branch_field_off = 0 to u32
+        target = 0 to u32
+        has_reloc = true
+        reloc_field_off = field_off
+        reloc_sym = sym
+        reloc_kind = kind
+    }
+}
+
+/**
+ * emit_rr_x86 — append a register-to-register instruction (ModRM `mod=11`) to
+ * `buf`: the REX prefix (from `reg`/`rm`'s widths + extensions), the optional
+ * `0F` escape, the opcode, and the ModRM byte tying `reg` (the reg field) to
+ * `rm` (the rm field). The caller fixes which operand is reg vs rm per opcode.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param bool rexw  set REX.W (the 64-bit form)
+ * @param bool two_byte  the opcode is `0F`-escaped
+ * @param u32 opcode  the primary opcode byte
+ * @param MReg reg  the ModRM.reg-field register
+ * @param MReg rm  the ModRM.rm-field register
+ * @return []byte  `buf` followed by the encoded instruction
+ */
+fn emit_rr_x86(buf: []byte, rexw: bool, two_byte: bool, opcode: u32, reg: MReg, rm: MReg) -> []byte {
+    mut b = push_rex_x86(buf, rexw, reg_ext_x86(reg), false, reg_ext_x86(rm))
+    if two_byte { b = push_byte_x86(b, 0x0F to u32) }
+    b = push_byte_x86(b, opcode)
+    push_byte_x86(b, modrm_x86(3 to u32, reg_low3_x86(reg), reg_low3_x86(rm)))
+}
+
+/**
+ * emit_rm_ext_x86 — append a single-register instruction whose ModRM.reg field
+ * is an OPCODE EXTENSION (`/0../7`), not a register: the REX prefix (from `rm`),
+ * the opcode, and the ModRM byte `mod=11 | (ext_field<<3) | rm`. Drives the
+ * unary `neg`/`not` (F7 /3, /2), the `shl`/`shr`/`sar` (D3 /4, /5, /7), and the
+ * `idiv`/`div` (F7 /7, /6) forms.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param bool rexw  set REX.W (the 64-bit form)
+ * @param u32 opcode  the primary opcode byte
+ * @param u32 ext_field  the ModRM.reg opcode-extension value
+ * @param MReg rm  the ModRM.rm-field register
+ * @return []byte  `buf` followed by the encoded instruction
+ */
+fn emit_rm_ext_x86(buf: []byte, rexw: bool, opcode: u32, ext_field: u32, rm: MReg) -> []byte {
+    mut b = push_rex_x86(buf, rexw, false, false, reg_ext_x86(rm))
+    b = push_byte_x86(b, opcode)
+    push_byte_x86(b, modrm_x86(3 to u32, ext_field, reg_low3_x86(rm)))
+}
+
+/**
+ * push_mem_operand_x86 — append the ModRM + optional SIB + optional displacement
+ * that address `mem` under a given `reg3` (the reg-field low 3 bits). A base of
+ * RSP/R12 (low 3 == 4) always forces a SIB byte (`0x24`, no index); a base of
+ * RBP/R13 (low 3 == 5) always carries at least a disp8 (its `mod=00` slot means
+ * rip-relative). Zero displacements otherwise elide the disp; small ones take a
+ * disp8; larger ones a disp32.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 reg3  the ModRM.reg-field low 3 bits
+ * @param MMem mem  the base-plus-displacement address operand
+ * @return []byte  `buf` followed by the ModRM/SIB/disp bytes
+ */
+fn push_mem_operand_x86(buf: []byte, reg3: u32, mem: MMem) -> []byte {
+    let base3 = reg_low3_x86(mem.base)
+    let disp = mem.offset to i64
+    let need_sib = base3 == (0x4 to u32)
+    let is_rbp = base3 == (0x5 to u32)
+    let zero_disp = disp == (0 to i64) && !is_rbp
+    let disp8 = disp >= ((0 to i64) - (128 to i64)) && disp <= (127 to i64)
+    let md = if zero_disp { 0 to u32 } else { if disp8 { 1 to u32 } else { 2 to u32 } }
+    let rm = if need_sib { 0x4 to u32 } else { base3 }
+    mut b = push_byte_x86(buf, modrm_x86(md, reg3, rm))
+    if need_sib { b = push_byte_x86(b, ((0x4 to u32) << (3 to u32)) | base3) }
+    if md == (1 to u32) { b = push_byte_x86(b, (disp & (0xFF to i64)) to u32) }
+    if md == (2 to u32) { b = push_imm32_x86(b, disp) }
+    b
+}
+
+/**
+ * emit_mem_op_x86 — encode a memory-operand instruction (a load's `dst` or a
+ * store's `src` as the register operand): the optional `0x66` prefix, the REX
+ * prefix (with a forced byte-register prefix when needed), the optional `0F`
+ * escape, the opcode, and the ModRM/SIB/disp addressing `mem`.
+ *
+ * @param X86MemOp form  the size/sign encoding descriptor
+ * @param MReg regop  the register operand (load dst / store src)
+ * @param MMem mem  the memory operand
+ * @return EncInstX86  the encoded memory instruction
+ */
+fn emit_mem_op_x86(form: X86MemOp, regop: MReg, mem: MMem) -> EncInstX86 {
+    mut b: []byte = teko::list::empty()
+    if form.op66 { b = push_byte_x86(b, 0x66 to u32) }
+    let force = form.byte_reg && (regop.id >= (0x4 to u32))
+    let rr = reg_ext_x86(regop)
+    let rb = reg_ext_x86(mem.base)
+    b = if force { push_rex_forced_x86(b, form.rexw, rr, false, rb) } else { push_rex_x86(b, form.rexw, rr, false, rb) }
+    if form.two_byte { b = push_byte_x86(b, 0x0F to u32) }
+    b = push_byte_x86(b, form.opcode)
+    plain_inst_x86(push_mem_operand_x86(b, reg_low3_x86(regop), mem))
+}
+
+/**
+ * load_memop_x86 — the encoding descriptor for a load width + sign: the plain
+ * `mov` size ladder (byte `8A`, word `66 8B`, dword `8B`, qword `REX.W 8B`) for
+ * a non-sign-extending load, and the sign-extending `movsxd`(D, `REX.W 63`) /
+ * `movsx`(W `REX.W 0F BF`, B `REX.W 0F BE`) forms when `sign` is set. The byte
+ * load's destination is 8-bit, so it sets `byte_reg` (the SIL/DIL/BPL/SPL REX
+ * trap); the size ladder mirrors the scope's `88/8A` + `0x66` opcode list.
+ *
+ * @param MMemSizeX86 size  the access width (byte/word/dword/qword)
+ * @param bool sign  true for a sign-extending narrow load
+ * @return X86MemOp  the load encoding descriptor
+ */
+fn load_memop_x86(size: MMemSizeX86, sign: bool) -> X86MemOp {
+    match size {
+        Q => X86MemOp { op66 = false; rexw = true; two_byte = false; opcode = 0x8B to u32; byte_reg = false }
+        D => if sign {
+            X86MemOp { op66 = false; rexw = true; two_byte = false; opcode = 0x63 to u32; byte_reg = false }
+        } else {
+            X86MemOp { op66 = false; rexw = false; two_byte = false; opcode = 0x8B to u32; byte_reg = false }
+        }
+        W => if sign {
+            X86MemOp { op66 = false; rexw = true; two_byte = true; opcode = 0xBF to u32; byte_reg = false }
+        } else {
+            X86MemOp { op66 = true; rexw = false; two_byte = false; opcode = 0x8B to u32; byte_reg = false }
+        }
+        B => if sign {
+            X86MemOp { op66 = false; rexw = true; two_byte = true; opcode = 0xBE to u32; byte_reg = false }
+        } else {
+            X86MemOp { op66 = false; rexw = false; two_byte = false; opcode = 0x8A to u32; byte_reg = true }
+        }
+    }
+}
+
+/**
+ * store_memop_x86 — the encoding descriptor for a store width: `mov`(Q/D), the
+ * `0x66`-prefixed word store(W), and the byte store(B, whose register source is
+ * 8-bit and so sets `byte_reg`). Stores never sign-extend, so there is no sign
+ * parameter (mirroring `MStoreX86` carrying no `sign` field).
+ *
+ * @param MMemSizeX86 size  the access width (byte/word/dword/qword)
+ * @return X86MemOp  the store encoding descriptor
+ */
+fn store_memop_x86(size: MMemSizeX86) -> X86MemOp {
+    match size {
+        Q => X86MemOp { op66 = false; rexw = true; two_byte = false; opcode = 0x89 to u32; byte_reg = false }
+        D => X86MemOp { op66 = false; rexw = false; two_byte = false; opcode = 0x89 to u32; byte_reg = false }
+        W => X86MemOp { op66 = true; rexw = false; two_byte = false; opcode = 0x89 to u32; byte_reg = false }
+        B => X86MemOp { op66 = false; rexw = false; two_byte = false; opcode = 0x88 to u32; byte_reg = true }
+    }
+}
+
+/**
+ * alu_opcode_x86 — the primary opcode byte for a two-address `OP r/m64, r64`
+ * ALU op (the reg-into-rm direction isel selects): ADD `01`, SUB `29`, AND
+ * `21`, OR `09`, XOR `31`.
+ *
+ * @param MAluOpX86 op  the ALU operation
+ * @return u32  its `OP r/m, r` opcode byte
+ */
+fn alu_opcode_x86(op: MAluOpX86) -> u32 {
+    match op {
+        Add => 0x01 to u32
+        Sub => 0x29 to u32
+        And => 0x21 to u32
+        Or => 0x09 to u32
+        Xor => 0x31 to u32
+    }
+}
+
+/**
+ * shift_ext_x86 — the ModRM.reg opcode-extension for a `D3 /ext` shift-by-CL:
+ * SHL `/4`, SHR `/5`, SAR `/7`.
+ *
+ * @param MShiftOpX86 op  the shift operation
+ * @return u32  its opcode-extension value
+ */
+fn shift_ext_x86(op: MShiftOpX86) -> u32 {
+    match op {
+        Shl => 0x4 to u32
+        Shr => 0x5 to u32
+        Sar => 0x7 to u32
+    }
+}
+
+/**
+ * encode_movimm_x86 — `dst = imm` (MMovImmX86): `mov r32, imm32` (`B8+rd id`)
+ * for the 32-bit form; `mov r64, imm32`(sign-extended, `REX.W C7 /0 id`) when
+ * the 64-bit value fits a signed 32-bit field; else `movabs r64, imm64`
+ * (`REX.W B8+rd io`, the arm64 MOVZ/MOVK-chain case).
+ *
+ * @param MMovImmX86 i  the immediate-move instruction (operand physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_movimm_x86(i: MMovImmX86) -> EncInstX86 {
+    if !i.wide {
+        mut b = push_rex_x86(teko::list::empty(), false, false, false, reg_ext_x86(i.dst))
+        b = push_byte_x86(b, (0xB8 to u32) + reg_low3_x86(i.dst))
+        return plain_inst_x86(push_imm32_x86(b, i.imm64))
+    }
+    if fits_i32_x86(i.imm64) {
+        mut b = push_rex_x86(teko::list::empty(), true, false, false, reg_ext_x86(i.dst))
+        b = push_byte_x86(b, 0xC7 to u32)
+        b = push_byte_x86(b, modrm_x86(3 to u32, 0 to u32, reg_low3_x86(i.dst)))
+        return plain_inst_x86(push_imm32_x86(b, i.imm64))
+    }
+    mut b = push_rex_x86(teko::list::empty(), true, false, false, reg_ext_x86(i.dst))
+    b = push_byte_x86(b, (0xB8 to u32) + reg_low3_x86(i.dst))
+    plain_inst_x86(push_imm64_x86(b, i.imm64))
+}
+
+/**
+ * encode_mov_x86 — a GPR-GPR move (`mov r/m64, r64`, `REX.W 89 /r`): the source
+ * rides the ModRM.reg field, the destination the rm field.
+ *
+ * @param MMovX86 i  the register-copy instruction (operands physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_mov_x86(i: MMovX86) -> EncInstX86 {
+    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, false, 0x89 to u32, i.src, i.dst))
+}
+
+/**
+ * encode_alu_rm_x86 — a two-address `dst = dst OP src` ALU op (`OP r/m64, r64`):
+ * the source rides the ModRM.reg field, the read-modify-write destination the
+ * rm field (§4.2). The preceding `MMovX86` seeded `dst` with the left operand.
+ *
+ * @param MAluRmX86 i  the two-address ALU instruction (operands physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_alu_rm_x86(i: MAluRmX86) -> EncInstX86 {
+    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, false, alu_opcode_x86(i.op), i.src, i.dst))
+}
+
+/**
+ * encode_imul_x86 — a two-address signed multiply (`imul r64, r/m64`,
+ * `REX.W 0F AF /r`): unlike the `OP r/m, r` ALU direction, the DESTINATION
+ * rides the ModRM.reg field and the source the rm field (the `0F AF` form).
+ *
+ * @param MImulX86 i  the multiply instruction (operands physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_imul_x86(i: MImulX86) -> EncInstX86 {
+    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, true, 0xAF to u32, i.dst, i.src))
+}
+
+/**
+ * encode_divseq_x86 — the fixed-register division/remainder macro (MDivSeqX86)
+ * expanded to its whole byte sequence: `mov rax, a` ; `cqo`(signed 64) /
+ * `cdq`(signed 32) / `xor edx, edx`(unsigned) ; `idiv`/`div b` (`F7 /7` or
+ * `/6`) ; `mov dst, rax` (quotient) or `mov dst, rdx` (remainder). RAX is id 0,
+ * RDX id 2 (§3, §4.4).
+ *
+ * @param MDivSeqX86 i  the division/remainder instruction (operands physical)
+ * @return EncInstX86  the encoded instruction sequence
+ */
+fn encode_divseq_x86(i: MDivSeqX86) -> EncInstX86 {
+    let rax = preg(0 to u32, MRegClass::GPR)
+    let rdx = preg(2 to u32, MRegClass::GPR)
+    mut b = emit_rr_x86(teko::list::empty(), i.wide, false, 0x89 to u32, i.a, rax)
+    if i.is_signed {
+        if i.wide { b = push_byte_x86(b, 0x48 to u32) }
+        b = push_byte_x86(b, 0x99 to u32)
+    } else {
+        b = push_byte_x86(b, 0x31 to u32)
+        b = push_byte_x86(b, 0xD2 to u32)
+    }
+    let ext_field = if i.is_signed { 0x7 to u32 } else { 0x6 to u32 }
+    b = emit_rm_ext_x86(b, i.wide, 0xF7 to u32, ext_field, i.b)
+    let srcreg = if i.is_rem { rdx } else { rax }
+    plain_inst_x86(emit_rr_x86(b, i.wide, false, 0x89 to u32, srcreg, i.dst))
+}
+
+/**
+ * encode_shift_x86 — a two-address shift-by-CL (`shl`/`shr`/`sar r/m64, cl`,
+ * `D3 /ext`): the count was pre-moved to CL by a preceding `MMovX86`, so the
+ * shift names only the shifted rm-field destination.
+ *
+ * @param MShiftX86 i  the shift instruction (operand physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_shift_x86(i: MShiftX86) -> EncInstX86 {
+    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, 0xD3 to u32, shift_ext_x86(i.op), i.dst))
+}
+
+/**
+ * encode_cmp_x86 — an integer compare (`cmp r/m64, r64`, `REX.W 39 /r`) that
+ * sets the flags from `a - b`: `a` rides the ModRM.rm field, `b` the reg field.
+ *
+ * @param MCmpX86 i  the compare instruction (operands physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_cmp_x86(i: MCmpX86) -> EncInstX86 {
+    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, false, 0x39 to u32, i.b, i.a))
+}
+
+/**
+ * encode_setcc_x86 — materialize a preceding compare as a 0/1 value: `setcc
+ * dst8` (`0F 90+cc /0`) then `movzx dst32, dst8` (`0F B6 /r`). A byte register
+ * SIL/DIL/BPL/SPL or R8..R15 (id >= 4) forces a REX prefix on both halves so
+ * the low byte is addressable (§6.3).
+ *
+ * @param MSetccX86 i  the conditional-set instruction (operand physical)
+ * @return EncInstX86  the encoded instruction sequence
+ */
+fn encode_setcc_x86(i: MSetccX86) -> EncInstX86 {
+    let cc = cond_cc_x86(i.cond)
+    let force = i.dst.id >= (0x4 to u32)
+    let dst_ext = reg_ext_x86(i.dst)
+    let dst_low3 = reg_low3_x86(i.dst)
+    mut b = if force { push_rex_forced_x86(teko::list::empty(), false, false, false, dst_ext) } else { teko::list::empty() }
+    b = push_byte_x86(b, 0x0F to u32)
+    b = push_byte_x86(b, (0x90 to u32) + cc)
+    b = push_byte_x86(b, modrm_x86(3 to u32, 0 to u32, dst_low3))
+    if force { b = push_rex_forced_x86(b, false, dst_ext, false, dst_ext) }
+    b = push_byte_x86(b, 0x0F to u32)
+    b = push_byte_x86(b, 0xB6 to u32)
+    plain_inst_x86(push_byte_x86(b, modrm_x86(3 to u32, dst_low3, dst_low3)))
+}
+
+/**
+ * encode_neg_x86 — a two-address negate (`neg r/m64`, `F7 /3`).
+ *
+ * @param MNegX86 i  the negate instruction (operand physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_neg_x86(i: MNegX86) -> EncInstX86 {
+    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, 0xF7 to u32, 0x3 to u32, i.dst))
+}
+
+/**
+ * encode_not_x86 — a two-address complement (`not r/m64`, `F7 /2`).
+ *
+ * @param MNotX86 i  the complement instruction (operand physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_not_x86(i: MNotX86) -> EncInstX86 {
+    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, 0xF7 to u32, 0x2 to u32, i.dst))
+}
+
+/**
+ * encode_load_x86 — a memory load (`mov`/`movsx dst, [base+disp]`) per
+ * `load_memop_x86`'s size/sign descriptor, addressing `mem` (SIB `0x24` when
+ * the base is RSP/R12, forced disp8 when RBP/R13). An FPR-class destination is
+ * an SSE move and honest-stops (`B1-fp`).
+ *
+ * @param MLoadX86 i  the load instruction (operands physical)
+ * @return EncInstX86 | error  the encoded instruction, or the `B1-fp` honest-stop
+ */
+fn encode_load_x86(i: MLoadX86) -> EncInstX86 | error {
+    if i.dst.reg_class == MRegClass::FPR { return honest_fp_x86() }
+    emit_mem_op_x86(load_memop_x86(i.size, i.sign), i.dst, i.mem)
+}
+
+/**
+ * encode_store_x86 — a memory store (`mov [base+disp], src`) per
+ * `store_memop_x86`'s size descriptor, addressing `mem`. An FPR-class source is
+ * an SSE move and honest-stops (`B1-fp`).
+ *
+ * @param MStoreX86 i  the store instruction (operands physical)
+ * @return EncInstX86 | error  the encoded instruction, or the `B1-fp` honest-stop
+ */
+fn encode_store_x86(i: MStoreX86) -> EncInstX86 | error {
+    if i.src.reg_class == MRegClass::FPR { return honest_fp_x86() }
+    emit_mem_op_x86(store_memop_x86(i.size), i.src, i.mem)
+}
+
+/**
+ * encode_frame_addr_x86 — resolve `MFrameAddrX86{dst, slot}` to
+ * `lea dst, [rsp + slot_offsets[slot]]` (`REX.W 8D /r`). The RSP base (id 4)
+ * forces a SIB byte `0x24` (emitted by `push_mem_operand_x86`), the single most
+ * common x86 encoding mistake; frame addresses are always 64-bit.
+ *
+ * @param FrameLayoutX86 layout  the enclosing function's resolved frame
+ * @param MFrameAddrX86 i  the frame-slot address instruction (destination physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_frame_addr_x86(layout: FrameLayoutX86, i: MFrameAddrX86) -> EncInstX86 {
+    let off = layout.slot_offsets[i.slot to u64]
+    let mem = MMem { base = preg(4 to u32, MRegClass::GPR); offset = off to i32 }
+    mut b = push_rex_x86(teko::list::empty(), true, reg_ext_x86(i.dst), false, reg_ext_x86(mem.base))
+    b = push_byte_x86(b, 0x8D to u32)
+    plain_inst_x86(push_mem_operand_x86(b, reg_low3_x86(i.dst), mem))
+}
+
+/**
+ * encode_lea_rip_x86 — a rip-relative address load (`lea dst, [rip+disp32]`,
+ * `REX.W 8D /r` with `mod=00 rm=101`): the disp32 is a zeroed placeholder the
+ * B1-7 ELF writer relocates (`R_X86_64_PC32`/`PLT32`), collapsing arm64's
+ * ADRP+ADD pair into one instruction + one relocation (§4.3).
+ *
+ * @param MLeaRipX86 i  the address-materialization instruction (operand physical)
+ * @return EncInstX86  the reloc-flagged placeholder instruction
+ */
+fn encode_lea_rip_x86(i: MLeaRipX86) -> EncInstX86 {
+    mut b = push_rex_forced_x86(teko::list::empty(), true, reg_ext_x86(i.dst), false, false)
+    b = push_byte_x86(b, 0x8D to u32)
+    b = push_byte_x86(b, modrm_x86(0 to u32, reg_low3_x86(i.dst), 0x5 to u32))
+    let field_off = b.len to u32
+    reloc_inst_x86(emit_u32_le(b, 0 to u32), field_off, i.sym, i.kind)
+}
+
+/**
+ * encode_jmp_x86 — an unconditional branch (`jmp rel32`, `E9 cd`): the rel32 is
+ * a zeroed placeholder the B1-6 layout pass patches with the block displacement.
+ *
+ * @param MJmpX86 i  the unconditional-branch instruction
+ * @return EncInstX86  the branch-flagged placeholder instruction
+ */
+fn encode_jmp_x86(i: MJmpX86) -> EncInstX86 {
+    mut b = push_byte_x86(teko::list::empty(), 0xE9 to u32)
+    let field_off = b.len to u32
+    branch_inst_x86(emit_u32_le(b, 0 to u32), field_off, i.target)
+}
+
+/**
+ * encode_jcc_x86 — a conditional branch (`jcc rel32`, `0F 80+cc cd`): the rel32
+ * is a zeroed placeholder the B1-6 layout pass patches; the condition byte is
+ * position-independent.
+ *
+ * @param MJccX86 i  the conditional-branch instruction
+ * @return EncInstX86  the branch-flagged placeholder instruction
+ */
+fn encode_jcc_x86(i: MJccX86) -> EncInstX86 {
+    mut b = push_byte_x86(teko::list::empty(), 0x0F to u32)
+    b = push_byte_x86(b, (0x80 to u32) + cond_cc_x86(i.cond))
+    let field_off = b.len to u32
+    branch_inst_x86(emit_u32_le(b, 0 to u32), field_off, i.target)
+}
+
+/**
+ * encode_call_x86 — a direct call (`call rel32`, `E8 cd`): the rel32 is a
+ * zeroed placeholder, flagged for a `Plt32` (`R_X86_64_PLT32`) relocation on
+ * the callee symbol (addend −4 supplied by the B1-7 writer).
+ *
+ * @param MCallX86 i  the direct-call instruction
+ * @return EncInstX86  the reloc-flagged placeholder instruction
+ */
+fn encode_call_x86(i: MCallX86) -> EncInstX86 {
+    mut b = push_byte_x86(teko::list::empty(), 0xE8 to u32)
+    let field_off = b.len to u32
+    reloc_inst_x86(emit_u32_le(b, 0 to u32), field_off, i.sym, RelocKindX86::Plt32)
+}
+
+/**
+ * encode_call_ind_x86 — an indirect call through a register (`call r/m64`,
+ * `FF /2`): a position-independent instruction (no relocation, no displacement).
+ *
+ * @param MCallIndX86 i  the indirect-call instruction (operand physical)
+ * @return EncInstX86  the encoded instruction
+ */
+fn encode_call_ind_x86(i: MCallIndX86) -> EncInstX86 {
+    mut b = push_rex_x86(teko::list::empty(), false, false, false, reg_ext_x86(i.target))
+    b = push_byte_x86(b, 0xFF to u32)
+    plain_inst_x86(push_byte_x86(b, modrm_x86(3 to u32, 0x2 to u32, reg_low3_x86(i.target))))
+}
+
+/**
+ * encode_ret_x86 — a return terminator (`ret`, `C3`). The B1-6 frame slice
+ * prepends the epilogue; the B1-5 core emits only the bare `ret` byte (the
+ * arm64 A4-1 `encode_ret` precedent).
+ *
+ * @return EncInstX86  the `ret` instruction
+ */
+fn encode_ret_x86() -> EncInstX86 {
+    plain_inst_x86(push_byte_x86(teko::list::empty(), 0xC3 to u32))
+}
+
+/**
+ * encode_inst_x86 — encode one fully-physical `MInstX86` to its `EncInstX86`, a
+ * TOTAL per-case match over the 19-case variant mirroring `print_minst_x86`'s
+ * dispatch and arm64's `encode_inst_word`. The position-independent integer/
+ * memory subset encodes fully; `MJmpX86`/`MJccX86` and `MCallX86`/`MLeaRipX86`
+ * return placeholder bytes flagged for the B1-6 rel32 patch / B1-7 relocation;
+ * `MFrameAddrX86` resolves through `layout` to the real `lea dst, [rsp+off]`
+ * (SIB-forced). An FPR-operand load/store returns the named `B1-fp` honest-stop
+ * (0.3.1); the x86 forms are natively wide (imm32 / movabs imm64 / disp32), so
+ * `B1-bigimm`/`B1-memindex` are unreachable in this core.
+ *
+ * @param FrameLayoutX86 layout  the enclosing function's resolved frame (for `MFrameAddrX86`)
+ * @param MInstX86 inst  the instruction to encode (all operands physical)
+ * @return EncInstX86 | error  the encoding, or the `B1-fp` honest-stop
+ */
+pub fn encode_inst_x86(layout: FrameLayoutX86, inst: MInstX86) -> EncInstX86 | error {
+    match inst {
+        MMovImmX86 as x => encode_movimm_x86(x)
+        MMovX86 as x => encode_mov_x86(x)
+        MAluRmX86 as x => encode_alu_rm_x86(x)
+        MImulX86 as x => encode_imul_x86(x)
+        MDivSeqX86 as x => encode_divseq_x86(x)
+        MShiftX86 as x => encode_shift_x86(x)
+        MCmpX86 as x => encode_cmp_x86(x)
+        MSetccX86 as x => encode_setcc_x86(x)
+        MJccX86 as x => encode_jcc_x86(x)
+        MNegX86 as x => encode_neg_x86(x)
+        MNotX86 as x => encode_not_x86(x)
+        MLoadX86 as x => encode_load_x86(x)
+        MStoreX86 as x => encode_store_x86(x)
+        MFrameAddrX86 as x => encode_frame_addr_x86(layout, x)
+        MLeaRipX86 as x => encode_lea_rip_x86(x)
+        MJmpX86 as x => encode_jmp_x86(x)
+        MCallX86 as x => encode_call_x86(x)
+        MCallIndX86 as x => encode_call_ind_x86(x)
+        MRetX86 => encode_ret_x86()
+    }
+}
