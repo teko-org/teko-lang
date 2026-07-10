@@ -798,6 +798,63 @@ fn xat_branch_with_edge_args_splits_edge_block() {
 }
 
 #test
+fn xat_branch_taken_edge_mismatch_propagates() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let s0 = lir::append_inst(v0.func, 0, lir::const_int_inst(v0.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::push(teko::list::empty(), v0.vreg), b2.block_id, teko::list::empty(), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, b2.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    match select_lfunc_x86(s3) {
+        MFuncX86 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "does not match")
+    }
+}
+
+#test
+fn xat_branch_else_edge_mismatch_propagates() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let s0 = lir::append_inst(v0.func, 0, lir::const_int_inst(v0.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::push(teko::list::empty(), v0.vreg), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, b2.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    match select_lfunc_x86(s3) {
+        MFuncX86 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "does not match")
+    }
+}
+
+#test
+fn xat_branch_on_fused_float_compare_propagates() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let s0 = lir::append_inst(f0, 0, lir::bin_inst(0, lir::LBinOp::FCmpEq, 1, 2, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(0, 1, teko::list::empty(), 2, teko::list::empty(), 0, 0))
+    let br = lir::LBranch { cond = 0; t_target = 1; t_args = teko::list::empty(); f_target = 2; f_args = teko::list::empty() }
+    match select_branch_x86(xat_bare_ctx("main"), s1, br) {
+        SelCtxX86 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B1-fp")
+    }
+}
+
+#test
+fn xat_variadic_indirect_call_propagates() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let t = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(t.func, 0, lir::alloca_inst(t.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_indirect_inst(t.vreg, teko::list::empty(), true, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(t.vreg, 0, 0))
+    match select_lfunc_x86(s2) {
+        MFuncX86 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "variadic")
+    }
+}
+
+#test
 fn xat_fused_float_compare_branch_names_b1_fp() {
     let ctx = xat_bare_ctx("main")
     let dc = DefCmp { found = true; op = lir::LBinOp::FCmpEq; a = 0; bb = 1 }
