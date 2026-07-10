@@ -790,13 +790,12 @@ A3 (done) + #443 (done) ─▶ A4-1 ─▶ A4-2 ─▶ A4-3 ─▶ A4-4 ─▶ A
   `A4-bigframe` stop. **Proven by:** prologue/epilogue + `MFrameAddr` golden bytes + offset-table
   asserts (tiny-descriptor spill fixture). No e2e.
 - **A4-3 · branch layout + fixups + relocs** — `Reloc`, block-offset recording, branch-displacement
-  patching (§3.3), `EncodedFunc`, symbol `Reloc` collection, `encode_module` (concat + rebase + symbol
-  table). **Proven by:** two-block `if` displacement + ADRP/ADDLo/BL reloc-record golden asserts. No
-  object.
-- **A4-4 · Mach-O object writer** — `src/backend/objfile_macho.tks`: `Symbol`, `EncodedModule`,
-  `emit_macho` (header + segment/sections + build-version + symtab + dysymtab + reloc tables); the
-  `A4-globals` stop. **Proven by:** header/symtab/reloc golden bytes + `llvm-objdump`/`otool`
-  well-formedness on macOS-arm64.
+  patching (§3.3), `EncodedFunc`, symbol `Reloc` collection. **Proven by:** two-block `if`
+  displacement + ADRP/ADDLo/BL reloc-record golden asserts. No object.
+- **A4-4 · Mach-O object writer** — `Symbol`, `EncodedModule`, `encode_module` (concat + rebase +
+  symbol table) added to `src/backend/encode_arm64.tks`; `src/backend/objfile_macho.tks`: `emit_macho`
+  (header + segment/sections + build-version + symtab + dysymtab + reloc tables); the `A4-globals`
+  stop. **Proven by:** header/symtab/reloc golden bytes + `otool`/`nm` well-formedness on macOS-arm64.
 - **A4-5 · link + differential (KEYSTONE)** — `emit_native` in `src/build/project.tks`, `link_object`
   (extracted from `run_cc`), the `TEKO_BACKEND=native` seam, `scripts/diff_c_own.sh`, the §9.2
   fixtures; the `A4-args` stop. **Proven by:** `own-native == C-native (== interp)` exit codes over the

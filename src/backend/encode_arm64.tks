@@ -1768,3 +1768,346 @@ pub fn encode_func(abi: AbiDescriptor, f: MFunc) -> EncodedFunc | error {
     }
     finalize_func(f.symbol, words, offsets)
 }
+
+/**
+ * Symbol — one symbol-table entry: its name, whether it is defined in this
+ * object, which section it lives in (when defined), and its offset within that
+ * section. Undefined symbols (the `tk_*` runtime + any not-yet-emitted callee)
+ * carry `defined=false`; the relocations reference them by name, the Mach-O
+ * writer by table index.
+ *
+ * @since #385 A4-4
+ */
+pub type Symbol = struct {
+    /**
+     * name — the symbol's final name (unprefixed; the writer adds the `_`).
+     */
+    name: str
+    /**
+     * defined — true iff this object defines the symbol (a `__text`/`__const`
+     * datum), false for an external reference.
+     */
+    defined: bool
+    /**
+     * sect — the 1-based Mach-O section index the definition lives in
+     * (meaningful only when `defined`): 1 for `__text`, 2 for `__const`.
+     */
+    sect: u8
+    /**
+     * offset — the byte offset of the definition within its section
+     * (meaningful only when `defined`).
+     */
+    offset: u32
+}
+
+/**
+ * EncodedModule — the whole program lowered to section images + a flat symbol
+ * table: the concatenated `__text` bytes, the `__const` (rodata) bytes, the
+ * defined-then-undefined symbol list, and the module-rebased relocations. The
+ * Mach-O writer (A4-4) turns this into an object file; no arm64 knowledge
+ * remains past this boundary (the writer is ISA-agnostic — Phase B reuses its
+ * shape).
+ *
+ * @since #385 A4-4
+ */
+pub type EncodedModule = struct {
+    /**
+     * text — the `__TEXT,__text` section image (all functions concatenated,
+     * each function's words flattened little-endian).
+     */
+    text: []byte
+    /**
+     * rodata — the `__TEXT,__const` section image (interned string bytes, all
+     * rodata entries concatenated).
+     */
+    rodata: []byte
+    /**
+     * symbols — the symbol table, defined entries first then undefined: one
+     * defined entry per function and per rodata entry, plus one undefined entry
+     * per externally-referenced symbol not defined in-module.
+     */
+    symbols: []Symbol
+    /**
+     * relocs — every relocation, `text`-section-relative (module-rebased), in
+     * emission order.
+     */
+    relocs: []Reloc
+}
+
+/**
+ * honest_globals — the named honest-stop A4-4 raises for a module carrying
+ * top-level data globals: the `__data` section + its GOT data relocs are not
+ * emitted by A4 (the N2 subset lowers no `LGlobal`, so this is unreached by the
+ * keystone corpus), and are closed when lowering starts emitting globals.
+ *
+ * @return error  the `A4-globals` named honest-stop
+ */
+fn honest_globals() -> error {
+    error { message = "A4-globals: __data section + GOT data relocs deferred (the N2 subset lowers no LGlobal)" }
+}
+
+/**
+ * append_words_le — append each u32 word of `ws` to a byte buffer as four
+ * little-endian bytes (the per-function `__text` word stream flattened into the
+ * module image).
+ *
+ * @param []byte buf  the byte buffer to extend
+ * @param []u32 ws  the instruction words to flatten
+ * @return []byte  `buf` followed by every word's little-endian bytes
+ */
+fn append_words_le(buf: []byte, ws: []u32) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= ws.len { break }
+        b = emit_u32_le(b, ws[i])
+        i++
+    }
+    b
+}
+
+/**
+ * rebase_relocs — append each function-relative `Reloc` of `relocs` to `acc`
+ * with its byte offset shifted by `base` (the function's `__text` base), so the
+ * module reloc offset points at the instruction word in the concatenated image.
+ *
+ * @param []Reloc acc  the running module reloc list
+ * @param []Reloc relocs  one function's function-relative relocations
+ * @param u32 base  the function's `__text` base byte offset
+ * @return []Reloc  `acc` followed by the rebased relocations
+ */
+fn rebase_relocs(acc: []Reloc, relocs: []Reloc, base: u32) -> []Reloc {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let r = relocs[i]
+        out = teko::list::push(out, Reloc { offset = r.offset + base; sym = r.sym; kind = r.kind })
+        i++
+    }
+    out
+}
+
+/**
+ * ModuleText — the running `__text` assembly of the module: the concatenated
+ * byte image, the module-rebased relocations, the defined function symbols, and
+ * the current base (the next function's `__text` byte offset).
+ *
+ * @since #385 A4-4
+ */
+type ModuleText = struct {
+    /**
+     * text — the concatenated `__text` bytes so far.
+     */
+    text: []byte
+    /**
+     * relocs — the module-rebased relocations so far.
+     */
+    relocs: []Reloc
+    /**
+     * syms — one defined `__text` symbol per function encoded so far.
+     */
+    syms: []Symbol
+    /**
+     * base — the next function's `__text` base byte offset (the current image
+     * length).
+     */
+    base: u32
+}
+
+/**
+ * empty_module_text — the seed `ModuleText`: empty image, no relocations, no
+ * symbols, base 0.
+ *
+ * @return ModuleText  the seed accumulator
+ */
+fn empty_module_text() -> ModuleText {
+    ModuleText { text = teko::list::empty(); relocs = teko::list::empty(); syms = teko::list::empty(); base = 0 to u32 }
+}
+
+/**
+ * fold_func_into_text — encode one function and fold it into the running module
+ * `__text`: record its defined symbol at the current base (section 1, `__text`),
+ * append its words as little-endian bytes, and rebase its relocs by the base.
+ * The base advances by the function's byte length (`words.len * 4`). Any named
+ * honest-stop from `encode_func` propagates out.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param ModuleText acc  the running `__text` assembly
+ * @param MFunc f  the fully-physical function to encode
+ * @return ModuleText | error  the extended assembly, or a named honest-stop
+ */
+fn fold_func_into_text(abi: AbiDescriptor, acc: ModuleText, f: MFunc) -> ModuleText | error {
+    let ef = match encode_func(abi, f) { EncodedFunc as x => x; error as e => return e }
+    let sym = Symbol { name = ef.symbol; defined = true; sect = 1 to u8; offset = acc.base }
+    let text = append_words_le(acc.text, ef.words)
+    let relocs = rebase_relocs(acc.relocs, ef.relocs, acc.base)
+    let syms = teko::list::push(acc.syms, sym)
+    let base = acc.base + ((ef.words.len to u32) * (4 to u32))
+    ModuleText { text = text; relocs = relocs; syms = syms; base = base }
+}
+
+/**
+ * encode_functions — fold every function of the module into one `ModuleText`
+ * (concatenated `__text` image + rebased relocations + one defined symbol per
+ * function). Any function's named honest-stop propagates out.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param []MFunc funcs  the module's fully-physical functions
+ * @return ModuleText | error  the assembled `__text`, or a named honest-stop
+ */
+fn encode_functions(abi: AbiDescriptor, funcs: []MFunc) -> ModuleText | error {
+    mut acc = empty_module_text()
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        let next = match fold_func_into_text(abi, acc, funcs[i]) { ModuleText as x => x; error as e => return e }
+        acc = next
+        i++
+    }
+    acc
+}
+
+/**
+ * ModuleRodata — the `__const` assembly of the module: the concatenated rodata
+ * byte image and one defined `__const` symbol per rodata entry.
+ *
+ * @since #385 A4-4
+ */
+type ModuleRodata = struct {
+    /**
+     * bytes — the concatenated `__const` image (all rodata entries).
+     */
+    bytes: []byte
+    /**
+     * syms — one defined `__const` symbol per rodata entry (section 2).
+     */
+    syms: []Symbol
+}
+
+/**
+ * append_bytes — append every byte of `src` to `buf`.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param []byte src  the bytes to append
+ * @return []byte  `buf` followed by `src`
+ */
+fn append_bytes(buf: []byte, src: []byte) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= src.len { break }
+        b = teko::list::push(b, src[i])
+        i++
+    }
+    b
+}
+
+/**
+ * encode_rodata — build the `__const` image and its defined symbols: each
+ * `LRodata` entry is placed at the running byte offset with a defined section-2
+ * symbol (the ADRP/ADD-lo relocations in `__text` resolve to it at link time).
+ *
+ * @param []lir::LRodata rodata  the module's interned rodata table
+ * @return ModuleRodata  the `__const` image + its defined symbols
+ */
+fn encode_rodata(rodata: []lir::LRodata) -> ModuleRodata {
+    mut bytes: []byte = teko::list::empty()
+    mut syms: []Symbol = teko::list::empty()
+    mut off: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        let rd = rodata[i]
+        syms = teko::list::push(syms, Symbol { name = rd.symbol; defined = true; sect = 2 to u8; offset = off })
+        bytes = append_bytes(bytes, rd.bytes)
+        off = off + (rd.bytes.len to u32)
+        i++
+    }
+    ModuleRodata { bytes = bytes; syms = syms }
+}
+
+/**
+ * name_in_symbols — whether some symbol in `syms` already carries `name` (a
+ * defined function/rodata symbol, or an already-collected undefined one).
+ *
+ * @param []Symbol syms  the symbols to scan
+ * @param str name  the symbol name to look for
+ * @return bool  true iff `name` is present
+ */
+fn name_in_symbols(syms: []Symbol, name: str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= syms.len { break }
+        if syms[i].name == name { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * collect_undefined — one undefined `Symbol` per relocation target not defined
+ * in `defined` and not already collected (dedup'd, in first-reference order):
+ * the `tk_*` runtime symbols and any not-yet-emitted callee.
+ *
+ * @param []Symbol defined  the module's defined symbols
+ * @param []Reloc relocs  the module's relocations
+ * @return []Symbol  the undefined symbols, deduplicated
+ */
+fn collect_undefined(defined: []Symbol, relocs: []Reloc) -> []Symbol {
+    mut undef: []Symbol = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let name = relocs[i].sym
+        let known = name_in_symbols(defined, name) || name_in_symbols(undef, name)
+        if !known {
+            undef = teko::list::push(undef, Symbol { name = name; defined = false; sect = 0 to u8; offset = 0 to u32 })
+        }
+        i++
+    }
+    undef
+}
+
+/**
+ * concat_symbols — append every symbol of `b` to `a` (defined symbols first,
+ * then undefined, so the symbol table's three Mach-O ranges stay contiguous).
+ *
+ * @param []Symbol a  the leading symbols
+ * @param []Symbol b  the trailing symbols
+ * @return []Symbol  `a` followed by `b`
+ */
+fn concat_symbols(a: []Symbol, b: []Symbol) -> []Symbol {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * encode_module — encode every `MFunc` of `m`, concatenate their `__text` words
+ * into the module image and REBASE each function's reloc offsets by its `__text`
+ * base, intern the rodata bytes into `__const`, and build the symbol table (one
+ * defined entry per function, one per rodata entry, then one undefined entry per
+ * externally-referenced symbol not defined in-module). A module carrying data
+ * globals raises the `A4-globals` honest-stop (the N2 subset lowers none); any
+ * function's encode honest-stop propagates out unchanged.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MModule m  the fully-colored module
+ * @return EncodedModule | error  the section images + symbols + relocs, or a
+ *                                 named honest-stop
+ */
+pub fn encode_module(abi: AbiDescriptor, m: MModule) -> EncodedModule | error {
+    if m.globals.len > (0 to u64) { return honest_globals() }
+    let mt = match encode_functions(abi, m.funcs) { ModuleText as x => x; error as e => return e }
+    let rod = encode_rodata(m.rodata)
+    let defined = concat_symbols(mt.syms, rod.syms)
+    let undef = collect_undefined(defined, mt.relocs)
+    let symbols = concat_symbols(defined, undef)
+    EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+}

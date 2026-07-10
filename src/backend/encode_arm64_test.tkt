@@ -1568,3 +1568,247 @@ fn reloc_offset_includes_prologue() {
     teko::assert::is_true(e.words[(r.offset / (4 to u32)) to u64] == (0x94000000 to u32))
     teko::assert::is_true(r.sym == "helper")
 }
+
+/**
+ * named_func — an `MFunc` with the given symbol and blocks and an empty frame,
+ * the `encode_module` multi-function fixture shorthand.
+ *
+ * @param str sym  the function's symbol
+ * @param []MBlock blocks  the function's blocks
+ * @return MFunc  the assembled function
+ */
+fn named_func(sym: str, blocks: []MBlock) -> MFunc {
+    MFunc { symbol = sym; blocks = blocks; frame = l_frame() }
+}
+
+/**
+ * one_block_func — an `MFunc` of one block (id 0) holding `insts`, for the
+ * `encode_module` fixtures.
+ *
+ * @param str sym  the function's symbol
+ * @param []MInst insts  the sole block's instructions
+ * @return MFunc  the assembled function
+ */
+fn one_block_func(sym: str, insts: []MInst) -> MFunc {
+    named_func(sym, bl1(mblock(0 to u32, insts)))
+}
+
+/**
+ * l_bytes — the empty `[]byte` list, typed for the sentinel module.
+ *
+ * @return []byte  an empty byte list
+ */
+fn l_bytes() -> []byte {
+    teko::list::empty()
+}
+
+/**
+ * l_syms — the empty `[]Symbol` list, typed for the sentinel module.
+ *
+ * @return []Symbol  an empty symbol list
+ */
+fn l_syms() -> []Symbol {
+    teko::list::empty()
+}
+
+/**
+ * bad_module — the sentinel `EncodedModule` returned when an `encode_module`
+ * fixture that must succeed unexpectedly honest-stops, so the assertion fails
+ * loudly rather than aborting.
+ *
+ * @return EncodedModule  the empty sentinel module
+ */
+fn bad_module() -> EncodedModule {
+    EncodedModule { text = l_bytes(); rodata = l_bytes(); symbols = l_syms(); relocs = l_relocs() }
+}
+
+/**
+ * em — encode module `m` through `encode_module`, unwrapping the success case
+ * and falling back to the sentinel on an unexpected honest-stop.
+ *
+ * @param MModule m  the module to encode
+ * @return EncodedModule  the encoded module, or the sentinel on error
+ */
+fn em(m: MModule) -> EncodedModule {
+    match encode_module(aapcs64(), m) {
+        EncodedModule as x => x
+        error as e => bad_module()
+    }
+}
+
+/**
+ * em_stop — the honest-stop message `encode_module` produces for `m`, or `<ok>`
+ * when it succeeds.
+ *
+ * @param MModule m  the module to encode
+ * @return str  the error message, or `<ok>`
+ */
+fn em_stop(m: MModule) -> str {
+    match encode_module(aapcs64(), m) {
+        EncodedModule as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rodata_of — a one-entry rodata table with the given symbol and bytes, the
+ * `__const` fixture shorthand.
+ *
+ * @param str sym  the rodata symbol
+ * @param []byte bs  the rodata bytes
+ * @return []lir::LRodata  the one-entry rodata table
+ */
+fn rodata_of(sym: str, bs: []byte) -> []lir::LRodata {
+    teko::list::push(teko::list::empty(), lir::LRodata { symbol = sym; bytes = bs })
+}
+
+/**
+ * module_with_rodata — an `MModule` with the given functions and rodata table
+ * (no globals/layouts), for the `__const` encode tests.
+ *
+ * @param []MFunc funcs  the module's functions
+ * @param []lir::LRodata rodata  the rodata table
+ * @return MModule  the assembled module
+ */
+fn module_with_rodata(funcs: []MFunc, rodata: []lir::LRodata) -> MModule {
+    MModule { funcs = funcs; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+/**
+ * two_func_module — a two-function `MModule` (no rodata/globals/layouts), for
+ * the concatenation + rebase tests.
+ *
+ * @param MFunc f1  the first function
+ * @param MFunc f2  the second function
+ * @return MModule  the assembled module
+ */
+fn two_func_module(f1: MFunc, f2: MFunc) -> MModule {
+    add_mfunc(add_mfunc(empty_mmodule(), f1), f2)
+}
+
+#test
+/**
+ * module_concatenates_text_and_rebases_relocs — the A4-4 hand-off the A4-3
+ * review pinned: a first function of THREE words (`adrp; add-lo; ret`, 12
+ * bytes, carrying two relocs) followed by a second function whose sole word is a
+ * `bl tk_exit`. The module `__text` is 16 bytes; the second function's `bl`
+ * reloc offset is 12 (it INCLUDES the first function's byte length), and its
+ * defined symbol offset is 12 — proving the per-function rebase.
+ *
+ * @return void
+ */
+fn module_concatenates_text_and_rebases_relocs() {
+    let no_uses: []MReg = teko::list::empty()
+    let f1 = one_block_func("f1", i3(adrp_inst(p(0), "g", MRelocKind::PageHi), add_lo_inst(p(0), p(0), "g", MRelocKind::PageLo), ret_inst()))
+    let f2 = one_block_func("f2", i1(call_inst("tk_exit", no_uses, p(0), false, false)))
+    let e = em(two_func_module(f1, f2))
+    teko::assert::is_true(e.text.len == (16 to u64))
+    teko::assert::is_true(e.relocs.len == 3)
+    teko::assert::is_true(e.relocs[0].offset == (0 to u32))
+    teko::assert::is_true(e.relocs[1].offset == (4 to u32))
+    teko::assert::is_true(e.relocs[2].offset == (12 to u32))
+    teko::assert::is_true(e.relocs[2].sym == "tk_exit")
+    teko::assert::is_true(kind_name(e.relocs[2].kind) == "Call")
+}
+
+#test
+/**
+ * module_symbol_table_is_defined_then_undefined — the two functions become
+ * defined `__text` symbols (`f1` at offset 0, `f2` at 12), followed by one
+ * undefined symbol per external target (`g`, `tk_exit`) in first-reference
+ * order — the defined-then-undefined contract the Mach-O ranges rely on.
+ *
+ * @return void
+ */
+fn module_symbol_table_is_defined_then_undefined() {
+    let no_uses: []MReg = teko::list::empty()
+    let f1 = one_block_func("f1", i3(adrp_inst(p(0), "g", MRelocKind::PageHi), add_lo_inst(p(0), p(0), "g", MRelocKind::PageLo), ret_inst()))
+    let f2 = one_block_func("f2", i1(call_inst("tk_exit", no_uses, p(0), false, false)))
+    let e = em(two_func_module(f1, f2))
+    teko::assert::is_true(e.symbols.len == 4)
+    teko::assert::is_true(e.symbols[0].name == "f1")
+    teko::assert::is_true(e.symbols[0].defined)
+    teko::assert::is_true(e.symbols[0].sect == (1 to u8))
+    teko::assert::is_true(e.symbols[0].offset == (0 to u32))
+    teko::assert::is_true(e.symbols[1].name == "f2")
+    teko::assert::is_true(e.symbols[1].defined)
+    teko::assert::is_true(e.symbols[1].offset == (12 to u32))
+    teko::assert::is_false(e.symbols[2].defined)
+    teko::assert::is_true(e.symbols[2].name == "g")
+    teko::assert::is_false(e.symbols[3].defined)
+    teko::assert::is_true(e.symbols[3].name == "tk_exit")
+}
+
+#test
+/**
+ * module_dedups_undefined_symbols — two calls to the SAME external symbol
+ * collapse to a single undefined entry (the relocations still both reference it
+ * by name), so the symbol table never double-lists a callee.
+ *
+ * @return void
+ */
+fn module_dedups_undefined_symbols() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i2(call_inst("tk_puts", no_uses, p(0), false, false), call_inst("tk_puts", no_uses, p(0), false, false))
+    let e = em(add_mfunc(empty_mmodule(), one_block_func("main", insts)))
+    teko::assert::is_true(e.relocs.len == 2)
+    teko::assert::is_true(e.symbols.len == 2)
+    teko::assert::is_true(e.symbols[0].name == "main")
+    teko::assert::is_true(e.symbols[1].name == "tk_puts")
+    teko::assert::is_false(e.symbols[1].defined)
+}
+
+#test
+/**
+ * module_interns_rodata_into_const — a rodata entry becomes `__const` bytes plus
+ * a defined section-2 symbol at its offset; a second entry is placed after the
+ * first, its symbol offset the first entry's byte length.
+ *
+ * @return void
+ */
+fn module_interns_rodata_into_const() {
+    let r0 = teko::list::push(teko::list::push(teko::list::push(l_bytes(), 0x68 to byte), 0x69 to byte), 0 to byte)
+    let r1 = teko::list::push(teko::list::push(l_bytes(), 0x41 to byte), 0 to byte)
+    let rodata = teko::list::push(rodata_of("s0", r0), lir::LRodata { symbol = "s1"; bytes = r1 })
+    let f = one_block_func("main", i1(ret_inst()))
+    let funcs = teko::list::push(teko::list::empty(), f)
+    let e = em(module_with_rodata(funcs, rodata))
+    teko::assert::is_true(e.rodata.len == (5 to u64))
+    teko::assert::is_true(e.rodata[0] == (0x68 to byte))
+    teko::assert::is_true(e.symbols.len == 3)
+    teko::assert::is_true(e.symbols[1].name == "s0")
+    teko::assert::is_true(e.symbols[1].defined)
+    teko::assert::is_true(e.symbols[1].sect == (2 to u8))
+    teko::assert::is_true(e.symbols[1].offset == (0 to u32))
+    teko::assert::is_true(e.symbols[2].name == "s1")
+    teko::assert::is_true(e.symbols[2].offset == (3 to u32))
+}
+
+#test
+/**
+ * module_globals_honest_stops — a module carrying a top-level data global raises
+ * the `A4-globals` named honest-stop (the `__data` section is deferred; the N2
+ * subset lowers none).
+ *
+ * @return void
+ */
+fn module_globals_honest_stops() {
+    let f = one_block_func("main", i1(ret_inst()))
+    let funcs = teko::list::push(teko::list::empty(), f)
+    let globals = teko::list::push(teko::list::empty(), lir::LGlobal { symbol = "gv"; ty = lir::LType::I32; bytes = l_bytes() })
+    let m = MModule { funcs = funcs; rodata = teko::list::empty(); globals = globals; layouts = teko::list::empty() }
+    teko::assert::str_contains(em_stop(m), "A4-globals")
+}
+
+#test
+/**
+ * module_propagates_function_honest_stop — a function that honest-stops during
+ * encode (a float op → `A4-fp`) propagates the stop out of `encode_module`
+ * unchanged.
+ *
+ * @return void
+ */
+fn module_propagates_function_honest_stop() {
+    let f = one_block_func("main", i1(falu_inst(MFAluOp::FAdd, true, fp(0), fp(1), fp(2))))
+    teko::assert::str_contains(em_stop(add_mfunc(empty_mmodule(), f)), "A4-fp")
+}
