@@ -279,13 +279,23 @@ The arm64 `ADRP`+`ADD` pair (two relocs `PageHi`/`PageLo`, `minst.tks:611,632`) 
 `{dst; sym; kind}` and lowers to one `EncInst` + one `RelocX86` — a genuine simplification the ELF
 writer inherits (§7.3).
 
-### 4.4 Division/remainder — fixed-register pins (mirrors `select_rem`'s scratch idiom)
+### 4.4 Division/remainder — the divide models as a call (corrected B1-4 contract)
 
-x86 `idiv src` divides `RDX:RAX` by `src`, quotient→RAX, remainder→RDX. isel pins physical RAX/RDX
-(as `preg`, exactly as arm64 pins arg regs), emits `mov rax, a` ; `cqo` (signed) or `xor edx,edx`
-(unsigned) ; `idiv/div b` ; then `mov dst, rax`(quot) or `mov dst, rdx`(rem). The pins are `is_fixed`
-`LiveInterval`s the shared scan already avoids (`candidate_pool`, `regalloc.tks:1110`). `MDivSeqX86`
-carries the whole sequence's operands so `inst_regs_x86` reports the RAX/RDX defs + clobbers.
+x86 `idiv src` divides `RDX:RAX` by `src`, quotient→RAX, remainder→RDX. isel emits ONE `MDivSeqX86`
+macro carrying the sequence's operands (`dst`, dividend `a`, divisor `b`); the encoder (B1-5) expands
+it to `mov rax, a` ; `cqo` (signed) or `xor edx,edx` (unsigned) ; `idiv/div b` ; then `mov dst, rax`
+(quot) or `mov dst, rdx` (rem). At **regalloc** time the stream therefore holds only the macro — there
+are NO explicit RAX/RDX pin instructions to build `is_fixed` `LiveInterval`s from, and the frozen
+`InstRegs` (`regalloc.tks:260`) carries a single `def_reg` and no clobber list, so the RAX + RDX
+clobbers cannot be spelled as two fixed defs. So `inst_regs_x86(MDivSeqX86)` reports
+**`ir_call(dst, true, [a, b])` — `is_call = true`** (the corrected contract, overriding an earlier
+"fixed RAX/RDX intervals" wording; from the B1-3 adversarial review). Modelling the divide as a call
+makes every value live ACROSS it avoid the whole caller-saved set (RAX + RDX included, via
+`candidate_pool`, `regalloc.tks:1110`); and the DIVISOR `b` is itself protected because its last use
+IS the divide point and A3's `crosses_call` uses the `(start, end]` boundary (end == the call point
+counts as crossing), so `b` also lands off RAX/RDX. Sound, mildly pessimistic (a value that could
+have reused a caller-saved register the divide does not actually clobber is conservatively pushed to a
+callee-save); a fixed-clobber refinement is a named **0.3.1** item.
 
 ### 4.5 SysV argument/return lowering
 
