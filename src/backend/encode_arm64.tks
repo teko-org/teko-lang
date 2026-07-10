@@ -1,0 +1,2134 @@
+/**
+ * EncWord — one instruction's encoding outcome: its base word plus an optional
+ * pending fixup. A position-independent instruction resolves to just `word`
+ * (`has_branch`/`has_reloc` false). A branch carries `has_branch=true` +
+ * `target` (the machine-block id, patched once block offsets are known in
+ * A4-3). A symbol reference carries `has_reloc=true` + `reloc_sym`/`reloc_kind`
+ * (the `Reloc` record is materialized in A4-3).
+ *
+ * @since #385 A4-1
+ */
+pub type EncWord = struct {
+    /**
+     * word — the base 32-bit encoding (operand fields filled, branch/reloc
+     * fields left zero for later patching).
+     */
+    word: u32
+    /**
+     * has_branch — true iff `target` is an intra-function block displacement to
+     * patch after layout (A4-3).
+     */
+    has_branch: bool
+    /**
+     * target — the destination machine-block id (meaningful when `has_branch`).
+     */
+    target: u32
+    /**
+     * branch_form — which displacement field a later pass patches: 0=B(imm26),
+     * 1=B.cond/CBZ(imm19). Sizes the sign-extended range check.
+     */
+    branch_form: u32
+    /**
+     * has_reloc — true iff this word owes a symbol `Reloc` (BL/ADRP/ADDLo).
+     */
+    has_reloc: bool
+    /**
+     * reloc_sym — the relocation's target symbol (meaningful when `has_reloc`).
+     */
+    reloc_sym: str
+    /**
+     * reloc_kind — the relocation kind (meaningful when `has_reloc`).
+     */
+    reloc_kind: MRelocKind
+}
+
+/**
+ * FrameLayout — the resolved stack frame of one function: its total 16-aligned
+ * byte size, the ordered callee-saved registers to save/restore (re-derived by
+ * scanning the physical function, not carried by `MFunc`), and the SP-relative
+ * byte offset of every `MFunc.frame` slot. Purely a side-table the encoder
+ * reads; the block stream is never rewritten (so the A3 interp oracle, which
+ * models frame slots directly and has no SP, stays valid on the pre-encode
+ * `MFunc`). A `size` of 0 marks a frameless function (no prologue/epilogue).
+ *
+ * @since #385 A4-2
+ */
+pub type FrameLayout = struct {
+    /**
+     * size — the total frame size in bytes, rounded up to 16 (AAPCS64 SP
+     * 16-alignment); 0 for a frameless function.
+     */
+    size: u32
+    /**
+     * saved_gpr — the callee-saved GPR ids to STP/LDP (FP/LR handled
+     * separately), ascending for a deterministic prologue (M.2).
+     */
+    saved_gpr: []u32
+    /**
+     * saved_fpr — the callee-saved FPR ids to save/restore, ascending.
+     */
+    saved_fpr: []u32
+    /**
+     * slot_offsets — the SP-relative byte offset of each `MFunc.frame` entry,
+     * in frame order; `MFrameAddr{slot}` resolves to `ADD dst, sp,
+     * #slot_offsets[slot]`. Each entry honors its `LAlloca` alignment, so
+     * mixed-size/mixed-align frames (structs/arrays/spills) map correctly.
+     */
+    slot_offsets: []u32
+}
+
+/**
+ * MemForm — a load/store base word paired with its access scale: the pairing
+ * lets `encode_load`/`encode_store` derive the size template and the immediate
+ * scale in one `MMemSize` match, so the FPR (`S`/`D`) honest-stop is raised
+ * exactly once per memory op instead of in two separate lookups.
+ *
+ * @since #385 A4-1
+ */
+type MemForm = struct {
+    /**
+     * base — the size-and-direction template word (the LDR/STR family entry),
+     * with the immediate/register fields left zero.
+     */
+    base: u32
+    /**
+     * scale — the access width in bytes (1/2/4/8); the scaled unsigned
+     * immediate is `offset / scale`.
+     */
+    scale: u32
+}
+
+/**
+ * plain_word — an `EncWord` for a position-independent instruction: just the
+ * finished 32-bit word, with no branch displacement and no symbol relocation
+ * pending. The reloc/branch fields carry inert defaults.
+ *
+ * @param u32 w  the finished instruction word
+ * @return EncWord  the word with no pending fixup
+ */
+fn plain_word(w: u32) -> EncWord {
+    EncWord {
+        word = w
+        has_branch = false
+        target = 0 to u32
+        branch_form = 0 to u32
+        has_reloc = false
+        reloc_sym = ""
+        reloc_kind = MRelocKind::Call
+    }
+}
+
+/**
+ * branch_word — an `EncWord` for an intra-function branch: the base word (with
+ * the displacement field still zero) plus the destination block id and which
+ * displacement field the A4-3 patch pass fills.
+ *
+ * @param u32 w  the base word (condition/register fields filled, displacement zero)
+ * @param u32 target  the destination machine-block id
+ * @param u32 form  the displacement field selector (0=imm26, 1=imm19)
+ * @return EncWord  the word flagged for branch patching
+ */
+fn branch_word(w: u32, target: u32, form: u32) -> EncWord {
+    EncWord {
+        word = w
+        has_branch = true
+        target = target
+        branch_form = form
+        has_reloc = false
+        reloc_sym = ""
+        reloc_kind = MRelocKind::Call
+    }
+}
+
+/**
+ * reloc_word — an `EncWord` for a symbol reference: the placeholder word (with
+ * the immediate the linker patches left zero) plus the target symbol and the
+ * relocation kind the A4-3 assembly turns into a `Reloc` record.
+ *
+ * @param u32 w  the placeholder word (register fields filled, immediate zero)
+ * @param str sym  the target symbol's already-final name
+ * @param MRelocKind kind  which relocation this word owes
+ * @return EncWord  the word flagged for symbol relocation
+ */
+fn reloc_word(w: u32, sym: str, kind: MRelocKind) -> EncWord {
+    EncWord {
+        word = w
+        has_branch = false
+        target = 0 to u32
+        branch_form = 0 to u32
+        has_reloc = true
+        reloc_sym = sym
+        reloc_kind = kind
+    }
+}
+
+/**
+ * emit_u32_le — append `w` to `buf` as four little-endian bytes (the arm64
+ * instruction-word / Mach-O little-endian-field emit primitive), the shared
+ * `[]byte` idiom (`src/compress/compress.tks`). All bit-slicing stays in u32
+ * arithmetic; only the final `& 0xFF` narrows to `byte`.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 w  the 32-bit word to append
+ * @return []byte  `buf` followed by w's four little-endian bytes
+ */
+pub fn emit_u32_le(buf: []byte, w: u32) -> []byte {
+    mut b = teko::list::push(buf, (w & (0xFF to u32)) to byte)
+    b = teko::list::push(b, ((w >> (8 to u32)) & (0xFF to u32)) to byte)
+    b = teko::list::push(b, ((w >> (16 to u32)) & (0xFF to u32)) to byte)
+    teko::list::push(b, ((w >> (24 to u32)) & (0xFF to u32)) to byte)
+}
+
+/**
+ * enc_reg — a physical `MReg`'s 5-bit ISA field value: its `id` directly
+ * (x0..x30/SP=31 for GPR, v0..v31 for FPR). SP vs XZR (both id 31) is decided
+ * by the INSTRUCTION template, not the register, so no per-register
+ * disambiguation happens here.
+ *
+ * @param MReg r  a physical register (A4 runs post-regalloc)
+ * @return u32  its 5-bit ISA field value
+ */
+fn enc_reg(r: MReg) -> u32 {
+    r.id
+}
+
+/**
+ * enc_rd — the `Rd`/`Rt` destination field (bits 0-4): the register id, no
+ * shift.
+ *
+ * @param MReg r  the destination/transfer register
+ * @return u32  the register id placed in bits 0-4
+ */
+fn enc_rd(r: MReg) -> u32 {
+    enc_reg(r)
+}
+
+/**
+ * enc_rn — the `Rn` first-source field (bits 5-9): the register id shifted
+ * left by 5.
+ *
+ * @param MReg r  the first source / base register
+ * @return u32  the register id placed in bits 5-9
+ */
+fn enc_rn(r: MReg) -> u32 {
+    enc_reg(r) << (5 to u32)
+}
+
+/**
+ * enc_rm — the `Rm` second-source field (bits 16-20): the register id shifted
+ * left by 16.
+ *
+ * @param MReg r  the second source register
+ * @return u32  the register id placed in bits 16-20
+ */
+fn enc_rm(r: MReg) -> u32 {
+    enc_reg(r) << (16 to u32)
+}
+
+/**
+ * enc_ra — the `Ra` accumulator field (bits 10-14) of the MADD/MSUB form: the
+ * register id shifted left by 10.
+ *
+ * @param MReg r  the accumulator (minuend) register
+ * @return u32  the register id placed in bits 10-14
+ */
+fn enc_ra(r: MReg) -> u32 {
+    enc_reg(r) << (10 to u32)
+}
+
+/**
+ * sf_bit — the size flag for a `wide` operand: `1 << 31` (the 64-bit X form),
+ * or 0 (the 32-bit W form). Every width-parametric template below is stored in
+ * its bit-31-clear (32-bit) shape, so this ORs the 64-bit form back in.
+ *
+ * @param bool wide  true for the 64-bit form
+ * @return u32  `1 << 31` when wide, else 0
+ */
+fn sf_bit(wide: bool) -> u32 {
+    if wide { (1 to u32) << (31 to u32) } else { 0 to u32 }
+}
+
+/**
+ * cond_code — the 4-bit AArch64 condition field for an `MCond`: the encoding
+ * B.cond tests directly, and the value CSET inverts (`^ 1`) into CSINC.
+ *
+ * @param MCond c  the condition code
+ * @return u32  its 4-bit AArch64 condition field
+ */
+fn cond_code(c: MCond) -> u32 {
+    match c {
+        EQ => 0 to u32
+        NE => 1 to u32
+        LT => 11 to u32
+        LE => 13 to u32
+        GT => 12 to u32
+        GE => 10 to u32
+        LO => 3 to u32
+        LS => 9 to u32
+        HI => 8 to u32
+        HS => 2 to u32
+    }
+}
+
+/**
+ * honest_fp — the single named honest-stop the float family (`MFAlu`/`MFNeg`/
+ * `MFCmp`/`MFMov`/`MCvt`) and the FPR (`S`/`D`) memory widths raise: FP encoding
+ * is regular but deferred to 0.3.1 (appendix of the A4 crumb plan), so a float
+ * fixture stops IDENTICALLY on the own-native side and is compared at the stop.
+ *
+ * @return error  the `A4-fp` named honest-stop
+ */
+fn honest_fp() -> error {
+    error { message = "A4-fp: float-op / FPR encoding deferred to 0.3.1 (encodings in the A4 crumb-plan appendix)" }
+}
+
+/**
+ * honest_bigimm — the named honest-stop for an ALU/CMP immediate that does not
+ * fit the inline 12-bit field (magnitude outside `[0, 4095]`, or a non-add/sub
+ * immediate op that would need a bitmask/logical-immediate form): both are
+ * closed by the MOVZ+register-op sequence in 0.3.1.
+ *
+ * @return error  the `A4-bigimm` named honest-stop
+ */
+fn honest_bigimm() -> error {
+    error { message = "A4-bigimm: immediate not inline-encodable (needs the MOVZ+register-op sequence, deferred to 0.3.1)" }
+}
+
+/**
+ * honest_ldur — the named honest-stop for a load/store offset the scaled
+ * unsigned form cannot express (negative, not a multiple of the access size,
+ * or beyond the 12-bit scaled field): closed by the LDUR/STUR unscaled form in
+ * 0.3.1. Spills use offset 0, so this is not reached by the keystone corpus.
+ *
+ * @return error  the `A4-ldur` named honest-stop
+ */
+fn honest_ldur() -> error {
+    error { message = "A4-ldur: unscaled / out-of-range load-store offset (needs LDUR/STUR, deferred to 0.3.1)" }
+}
+
+/**
+ * honest_bigframe — the named honest-stop for a frame whose offsets outrun
+ * their encodable fields: an `MFrameAddr` slot offset beyond the ADD-imm 12-bit
+ * field (> 4095), or a prologue/epilogue STP/LDP pair offset beyond the signed
+ * 7-bit scaled field (frame > 512 bytes). Both are closed by the large-frame
+ * SUB/register-materialized sequences in 0.3.1.
+ *
+ * @return error  the `A4-bigframe` named honest-stop
+ */
+fn honest_bigframe() -> error {
+    error { message = "A4-bigframe: frame slot / prologue offset beyond the encodable field (large-frame sequence deferred to 0.3.1)" }
+}
+
+/**
+ * alu_reg_base — the bit-31-clear (32-bit) template word for a register-register
+ * ALU op, uniform in its `(Rm<<16) | (Rn<<5) | Rd` field placement. `Mul` bakes
+ * `Ra=XZR` (MADD) and the SDIV/UDIV/shift forms bake their fixed opcode bits;
+ * the 64-bit form is recovered by ORing `sf_bit`.
+ *
+ * @param MAluOp op  the ALU operation
+ * @return u32  the 32-bit template word
+ */
+fn alu_reg_base(op: MAluOp) -> u32 {
+    match op {
+        Add => 0x0B000000 to u32
+        Sub => 0x4B000000 to u32
+        Mul => 0x1B007C00 to u32
+        Sdiv => 0x1AC00C00 to u32
+        Udiv => 0x1AC00800 to u32
+        And => 0x0A000000 to u32
+        Orr => 0x2A000000 to u32
+        Eor => 0x4A000000 to u32
+        Lsl => 0x1AC02000 to u32
+        Asr => 0x1AC02800 to u32
+        Lsr => 0x1AC02400 to u32
+    }
+}
+
+/**
+ * add_sub_imm_base — the bit-31-clear (32-bit) template for the ADD/SUB
+ * immediate form, with the add/sub swap a negative immediate demands folded in
+ * (`ADD #-k` encodes as `SUB #k`). A non-add/sub immediate op raises the
+ * `A4-bigimm` stop (logical/mul immediates need the register-op sequence).
+ *
+ * @param MAluOp op  the ALU operation (add/sub encode inline)
+ * @param bool negative  true when the source immediate is negative
+ * @return u32 | error  the template word, or the `A4-bigimm` honest-stop
+ */
+fn add_sub_imm_base(op: MAluOp, negative: bool) -> u32 | error {
+    match op {
+        Add => if negative { 0x51000000 to u32 } else { 0x11000000 to u32 }
+        Sub => if negative { 0x11000000 to u32 } else { 0x51000000 to u32 }
+        _ => honest_bigimm()
+    }
+}
+
+/**
+ * ext_base — the full template word for a narrow sign/zero-extend (SBFM/UBFM
+ * with the fixed immr=0 and per-op imms baked in): SXTB/SXTH/SXTW extend into
+ * the 64-bit X form, UXTB/UXTH stay in the 32-bit W form, and UXTW zero-extends
+ * a word into the 64-bit X form. The `(Rn<<5) | Rd` fields OR on top.
+ *
+ * @param MExtOp op  the extend operation
+ * @return u32  the full template word (immr/imms already placed)
+ */
+fn ext_base(op: MExtOp) -> u32 {
+    match op {
+        Sxtb => 0x93401C00 to u32
+        Sxth => 0x93403C00 to u32
+        Sxtw => 0x93407C00 to u32
+        Uxtb => 0x53001C00 to u32
+        Uxth => 0x53003C00 to u32
+        Uxtw => 0xD3407C00 to u32
+    }
+}
+
+/**
+ * load_form — the LDR-family template + access scale for a load width, keyed
+ * by `MMemSize` and sign-extension: the plain forms (LDR/LDRB/LDRH), the
+ * sign-extending narrow forms (LDRSB/LDRSH into X, LDRSW), and the `S`/`D`
+ * FPR widths that raise the `A4-fp` honest-stop.
+ *
+ * @param MMemSize size  the access width
+ * @param bool sign  true for a sign-extending narrow load
+ * @return MemForm | error  the template + scale, or the `A4-fp` honest-stop
+ */
+fn load_form(size: MMemSize, sign: bool) -> MemForm | error {
+    match size {
+        B => MemForm { base = if sign { 0x39800000 to u32 } else { 0x39400000 to u32 }; scale = 1 to u32 }
+        H => MemForm { base = if sign { 0x79800000 to u32 } else { 0x79400000 to u32 }; scale = 2 to u32 }
+        W => MemForm { base = if sign { 0xB9800000 to u32 } else { 0xB9400000 to u32 }; scale = 4 to u32 }
+        X => MemForm { base = 0xF9400000 to u32; scale = 8 to u32 }
+        S => honest_fp()
+        D => honest_fp()
+    }
+}
+
+/**
+ * store_form — the STR-family template + access scale for a store width, keyed
+ * by `MMemSize`: STR/STRB/STRH/STR(X), with the `S`/`D` FPR widths raising the
+ * `A4-fp` honest-stop.
+ *
+ * @param MMemSize size  the access width
+ * @return MemForm | error  the template + scale, or the `A4-fp` honest-stop
+ */
+fn store_form(size: MMemSize) -> MemForm | error {
+    match size {
+        B => MemForm { base = 0x39000000 to u32; scale = 1 to u32 }
+        H => MemForm { base = 0x79000000 to u32; scale = 2 to u32 }
+        W => MemForm { base = 0xB9000000 to u32; scale = 4 to u32 }
+        X => MemForm { base = 0xF9000000 to u32; scale = 8 to u32 }
+        S => honest_fp()
+        D => honest_fp()
+    }
+}
+
+/**
+ * scaled_offset — the 12-bit scaled unsigned immediate for `offset` under an
+ * `scale`-byte access: `offset / scale`, valid only when `offset` is
+ * non-negative, a multiple of `scale`, and the quotient fits 12 bits. Any
+ * other offset raises the `A4-ldur` honest-stop.
+ *
+ * @param i32 offset  the base-plus-displacement byte offset
+ * @param u32 scale  the access width in bytes
+ * @return u32 | error  the scaled immediate, or the `A4-ldur` honest-stop
+ */
+fn scaled_offset(offset: i32, scale: u32) -> u32 | error {
+    if offset < (0 to i32) { return honest_ldur() }
+    let uoff = offset to u32
+    if (uoff % scale) != (0 to u32) { return honest_ldur() }
+    let imm = uoff / scale
+    if imm > (4095 to u32) { return honest_ldur() }
+    imm
+}
+
+/**
+ * encode_alu — a register-register ALU op: `alu_reg_base | sf | Rm | Rn | Rd`.
+ *
+ * @param MAlu i  the ALU instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_alu(i: MAlu) -> EncWord {
+    plain_word(alu_reg_base(i.op) | sf_bit(i.wide) | enc_rm(i.b) | enc_rn(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_alu_imm — an ADD/SUB immediate op: the 12-bit immediate is checked
+ * against the inline field (magnitude in `[0, 4095]`, else `A4-bigimm`), a
+ * negative immediate flips add/sub, and the magnitude ORs into the word.
+ *
+ * @param MAluImm i  the immediate ALU instruction (operand physical)
+ * @return EncWord | error  the encoded word, or a named honest-stop
+ */
+fn encode_alu_imm(i: MAluImm) -> EncWord | error {
+    let hi = 4095 to i64
+    let lo = (0 to i64) - hi
+    if i.imm > hi { return honest_bigimm() }
+    if i.imm < lo { return honest_bigimm() }
+    let neg = i.imm < (0 to i64)
+    let base = match add_sub_imm_base(i.op, neg) { u32 as b => b; error as e => return e }
+    let mag = if neg { (0 to i64) - i.imm } else { i.imm }
+    let field = ((mag to u32) & (0xFFF to u32)) << (10 to u32)
+    plain_word(base | sf_bit(i.wide) | field | enc_rn(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_msub — `dst = c - a*b` (MSUB): `0x1B008000 | sf | Rm(b) | Ra(c) |
+ * Rn(a) | Rd(dst)`, the remainder half of `IRemS`/`IRemU`.
+ *
+ * @param MMSub i  the MSUB instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_msub(i: MMSub) -> EncWord {
+    let base = 0x1B008000 to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.b) | enc_ra(i.c) | enc_rn(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_neg — `dst = -a` as SUB from XZR: `0x4B0003E0 | sf | Rm(a) | Rd(dst)`
+ * (the template bakes `Rn=XZR`).
+ *
+ * @param MNeg i  the NEG instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_neg(i: MNeg) -> EncWord {
+    let base = 0x4B0003E0 to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_mvn — `dst = ~a` as ORN from XZR: `0x2A2003E0 | sf | Rm(a) | Rd(dst)`
+ * (the template bakes `Rn=XZR` and the ORN N-bit).
+ *
+ * @param MMvn i  the MVN instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_mvn(i: MMvn) -> EncWord {
+    let base = 0x2A2003E0 to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_cmp — CMP as SUBS into XZR: `0x6B00001F | sf | Rm(b) | Rn(a)` (the
+ * template bakes `Rd=XZR`), setting NZCV without writing a result.
+ *
+ * @param MCmp i  the compare instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_cmp(i: MCmp) -> EncWord {
+    let base = 0x6B00001F to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.b) | enc_rn(i.a))
+}
+
+/**
+ * encode_cmp_imm — CMP against an immediate as SUBS-imm into XZR: `0x7100001F
+ * | sf | (imm12<<10) | Rn(a)`. A negative or out-of-range immediate raises the
+ * `A4-bigimm` honest-stop (the CMN-form / MOVZ sequence is deferred).
+ *
+ * @param MCmpImm i  the immediate compare instruction (operand physical)
+ * @return EncWord | error  the encoded word, or the `A4-bigimm` honest-stop
+ */
+fn encode_cmp_imm(i: MCmpImm) -> EncWord | error {
+    let hi = 4095 to i64
+    if i.imm > hi { return honest_bigimm() }
+    if i.imm < (0 to i64) { return honest_bigimm() }
+    let base = 0x7100001F to u32
+    let field = ((i.imm to u32) & (0xFFF to u32)) << (10 to u32)
+    plain_word(base | sf_bit(i.wide) | field | enc_rn(i.a))
+}
+
+/**
+ * encode_cset — CSET as CSINC from XZR: `0x1A9F07E0 | sf | (invert(cond)<<12) |
+ * Rd`. CSET materializes a compare's result, so the condition field holds the
+ * INVERTED code (`cond_code ^ 1`).
+ *
+ * @param MCSet i  the conditional-set instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_cset(i: MCSet) -> EncWord {
+    let base = 0x1A9F07E0 to u32
+    let field = ((cond_code(i.cond) ^ (1 to u32)) & (0xF to u32)) << (12 to u32)
+    plain_word(base | sf_bit(i.wide) | field | enc_rd(i.dst))
+}
+
+/**
+ * encode_movi — the shared MOVZ/MOVK/MOVN encoding: `base | sf | (hw<<21) |
+ * (imm16<<5) | Rd`, with `hw = shift/16` selecting the 16-bit lane.
+ *
+ * @param u32 base  the family template (MOVZ/MOVK/MOVN, bit-31-clear)
+ * @param bool wide  true for the 64-bit X form
+ * @param MReg dst  the destination register
+ * @param u32 imm16  the 16-bit lane value
+ * @param u32 shift  the lane's bit position (0/16/32/48)
+ * @return EncWord  the encoded word
+ */
+fn encode_movi(base: u32, wide: bool, dst: MReg, imm16: u32, shift: u32) -> EncWord {
+    let hw = (shift / (16 to u32)) << (21 to u32)
+    let imm = (imm16 & (0xFFFF to u32)) << (5 to u32)
+    plain_word(base | sf_bit(wide) | hw | imm | enc_rd(dst))
+}
+
+/**
+ * encode_movz — MOVZ (`dst = imm16 << shift`), template `0x52800000`.
+ *
+ * @param MMovZ i  the MOVZ instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_movz(i: MMovZ) -> EncWord {
+    encode_movi(0x52800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * encode_movk — MOVK (`dst |= imm16 << shift`, keeping other lanes), template
+ * `0x72800000`.
+ *
+ * @param MMovK i  the MOVK instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_movk(i: MMovK) -> EncWord {
+    encode_movi(0x72800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * encode_movn — MOVN (`dst = ~(imm16 << shift)`), template `0x12800000`.
+ *
+ * @param MMovN i  the MOVN instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_movn(i: MMovN) -> EncWord {
+    encode_movi(0x12800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+}
+
+/**
+ * encode_mov — a GPR-GPR move as ORR from XZR: `0x2A0003E0 | sf | Rm(src) |
+ * Rd(dst)` (the template bakes `Rn=XZR`).
+ *
+ * @param MMov i  the move instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_mov(i: MMov) -> EncWord {
+    let base = 0x2A0003E0 to u32
+    plain_word(base | sf_bit(i.wide) | enc_rm(i.src) | enc_rd(i.dst))
+}
+
+/**
+ * encode_ext — a narrow sign/zero-extend as SBFM/UBFM: `ext_base | Rn(a) |
+ * Rd(dst)` (the template bakes the width bits and the fixed immr/imms).
+ *
+ * @param MExt i  the extend instruction (operands physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_ext(i: MExt) -> EncWord {
+    plain_word(ext_base(i.op) | enc_rn(i.a) | enc_rd(i.dst))
+}
+
+/**
+ * encode_load — a scaled-offset load: `load_form.base | (imm12<<10) | Rn(base)
+ * | Rd(dst)`, with the offset scaled by the access width. FPR widths raise
+ * `A4-fp`; an unscaled/out-of-range offset raises `A4-ldur`.
+ *
+ * @param MLoad i  the load instruction (operands physical)
+ * @return EncWord | error  the encoded word, or a named honest-stop
+ */
+fn encode_load(i: MLoad) -> EncWord | error {
+    let form = match load_form(i.size, i.sign) { MemForm as f => f; error as e => return e }
+    let imm = match scaled_offset(i.mem.offset, form.scale) { u32 as v => v; error as e => return e }
+    let field = (imm & (0xFFF to u32)) << (10 to u32)
+    plain_word(form.base | field | enc_rn(i.mem.base) | enc_rd(i.dst))
+}
+
+/**
+ * encode_store — a scaled-offset store: `store_form.base | (imm12<<10) |
+ * Rn(base) | Rt(src)`, with the offset scaled by the access width. FPR widths
+ * raise `A4-fp`; an unscaled/out-of-range offset raises `A4-ldur`.
+ *
+ * @param MStore i  the store instruction (operands physical)
+ * @return EncWord | error  the encoded word, or a named honest-stop
+ */
+fn encode_store(i: MStore) -> EncWord | error {
+    let form = match store_form(i.size) { MemForm as f => f; error as e => return e }
+    let imm = match scaled_offset(i.mem.offset, form.scale) { u32 as v => v; error as e => return e }
+    let field = (imm & (0xFFF to u32)) << (10 to u32)
+    plain_word(form.base | field | enc_rn(i.mem.base) | enc_rd(i.src))
+}
+
+/**
+ * encode_branch — an unconditional branch (B): the placeholder `0x14000000`
+ * flagged for imm26 displacement patching (A4-3) with its target block id.
+ *
+ * @param MBranch i  the branch instruction
+ * @return EncWord  the branch-flagged placeholder word
+ */
+fn encode_branch(i: MBranch) -> EncWord {
+    let base = 0x14000000 to u32
+    branch_word(base, i.target, 0 to u32)
+}
+
+/**
+ * encode_branch_cond — a conditional branch (B.cond): `0x54000000 | cond` (the
+ * condition is position-independent) flagged for imm19 displacement patching
+ * (A4-3) with its taken-target block id.
+ *
+ * @param MBranchCond i  the conditional-branch instruction
+ * @return EncWord  the branch-flagged placeholder word
+ */
+fn encode_branch_cond(i: MBranchCond) -> EncWord {
+    let base = 0x54000000 to u32
+    let w = base | (cond_code(i.cond) & (0xF to u32))
+    branch_word(w, i.target, 1 to u32)
+}
+
+/**
+ * encode_cbz — a compare-and-branch (CBZ/CBNZ): `base | sf | Rt(a)` flagged for
+ * imm19 displacement patching (A4-3). The register and zero/nonzero opcode are
+ * position-independent; only the displacement is deferred.
+ *
+ * @param MCbz i  the compare-and-branch instruction (operand physical)
+ * @return EncWord  the branch-flagged placeholder word
+ */
+fn encode_cbz(i: MCbz) -> EncWord {
+    let base = if i.zero { 0x34000000 to u32 } else { 0x35000000 to u32 }
+    let w = base | sf_bit(i.wide) | enc_rd(i.a)
+    branch_word(w, i.target, 1 to u32)
+}
+
+/**
+ * encode_call — a direct call (BL): the placeholder `0x94000000` flagged for a
+ * `Call` (BRANCH26) relocation on the callee symbol; the linker patches the
+ * displacement.
+ *
+ * @param MCall i  the direct-call instruction
+ * @return EncWord  the reloc-flagged placeholder word
+ */
+fn encode_call(i: MCall) -> EncWord {
+    let base = 0x94000000 to u32
+    reloc_word(base, i.sym, MRelocKind::Call)
+}
+
+/**
+ * encode_call_indirect — an indirect call (BLR): `0xD63F0000 | Rn(target)`, a
+ * position-independent word (no relocation, no displacement).
+ *
+ * @param MCallIndirect i  the indirect-call instruction (operand physical)
+ * @return EncWord  the encoded word
+ */
+fn encode_call_indirect(i: MCallIndirect) -> EncWord {
+    let base = 0xD63F0000 to u32
+    plain_word(base | enc_rn(i.target))
+}
+
+/**
+ * encode_adrp — the page-high half of a symbol address (ADRP): the placeholder
+ * `0x90000000 | Rd` flagged for the instruction's relocation kind (PAGE21); the
+ * linker patches the page immediate.
+ *
+ * @param MAdrp i  the ADRP instruction (operand physical)
+ * @return EncWord  the reloc-flagged placeholder word
+ */
+fn encode_adrp(i: MAdrp) -> EncWord {
+    let base = 0x90000000 to u32
+    reloc_word(base | enc_rd(i.dst), i.sym, i.kind)
+}
+
+/**
+ * encode_add_lo — the page-low completion of an `MAdrp` (ADD lo12): the
+ * placeholder `0x91000000 | Rn(a) | Rd` flagged for the instruction's
+ * relocation kind (PAGEOFF12); the linker patches the low-12 immediate.
+ *
+ * @param MAddLo i  the ADD-lo12 instruction (operands physical)
+ * @return EncWord  the reloc-flagged placeholder word
+ */
+fn encode_add_lo(i: MAddLo) -> EncWord {
+    let base = 0x91000000 to u32
+    reloc_word(base | enc_rn(i.a) | enc_rd(i.dst), i.sym, i.kind)
+}
+
+/**
+ * encode_ret — a return terminator (RET): the bare `0xD65F03C0` word. The
+ * epilogue that precedes it is prepended by `encode_func` in A4-2; A4-1 emits
+ * only the RET itself.
+ *
+ * @return EncWord  the RET word
+ */
+fn encode_ret() -> EncWord {
+    plain_word(0xD65F03C0 to u32)
+}
+
+/**
+ * Saved — the re-derived callee-saved register partition of one function: the
+ * GPR ids and FPR ids that appear as a def or use somewhere in the physical
+ * body and are callee-saved (so the prologue must preserve them). Both lists
+ * are kept ascending and duplicate-free as they are built.
+ *
+ * @since #385 A4-2
+ */
+type Saved = struct {
+    /**
+     * gpr — the ascending, duplicate-free callee-saved GPR ids used.
+     */
+    gpr: []u32
+    /**
+     * fpr — the ascending, duplicate-free callee-saved FPR ids used.
+     */
+    fpr: []u32
+}
+
+/**
+ * SlotLayout — the frame-slot region of one function: the SP-relative byte
+ * offset of each slot (alignment-honoring, in frame order) and the total slot
+ * region size rounded up to 16 (so the callee-saved save area above it starts
+ * 16-aligned).
+ *
+ * @since #385 A4-2
+ */
+type SlotLayout = struct {
+    /**
+     * offsets — the SP-relative byte offset of each `MFunc.frame` entry.
+     */
+    offsets: []u32
+    /**
+     * slots_size — the 16-rounded total byte size of the slot region.
+     */
+    slots_size: u32
+}
+
+/**
+ * align_up — round `x` up to the next multiple of `a`, the standard
+ * stack-slot / frame-size alignment step. A no-op when `a` is 0/1 (the same
+ * guarded contract as `lir::align_up` — a zero-size/zero-align entry never
+ * grows or divides the running offset).
+ *
+ * @param u32 x  the value to round
+ * @param u32 a  the alignment (a power of two, or 0/1 for none)
+ * @return u32  the least multiple of `a` not less than `x`
+ */
+fn align_up(x: u32, a: u32) -> u32 {
+    if a <= 1 { return x }
+    (((x + a) - (1 to u32)) / a) * a
+}
+
+/**
+ * insert_sorted_unique — `xs` (assumed ascending) with `v` inserted in order,
+ * or `xs` unchanged when `v` is already present. Keeps the re-derived save-set
+ * deterministic (M.2) and duplicate-free without a separate sort pass.
+ *
+ * @param []u32 xs  the ascending, duplicate-free list
+ * @param u32 v  the id to insert
+ * @return []u32  the list with `v` present exactly once, still ascending
+ */
+fn insert_sorted_unique(xs: []u32, v: u32) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut inserted = false
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        let cur = xs[i]
+        if cur == v { return xs }
+        if !inserted {
+            if v < cur {
+                out = teko::list::push(out, v)
+                inserted = true
+            }
+        }
+        out = teko::list::push(out, cur)
+        i++
+    }
+    if !inserted { out = teko::list::push(out, v) }
+    out
+}
+
+/**
+ * consider_reg — fold one register into the callee-saved partition: a
+ * caller-saved / non-allocatable register (including FP/LR/SP) is ignored; a
+ * callee-saved one is inserted into its class's ascending list.
+ *
+ * @param AbiDescriptor abi  the register file (callee-saved partition)
+ * @param Saved acc  the partition so far
+ * @param MReg r  a physical register the instruction defs or uses
+ * @return Saved  the partition with `r` folded in
+ */
+fn consider_reg(abi: AbiDescriptor, acc: Saved, r: MReg) -> Saved {
+    if !is_callee_saved(abi, r) { return acc }
+    if r.reg_class == MRegClass::FPR {
+        return Saved { gpr = acc.gpr; fpr = insert_sorted_unique(acc.fpr, r.id) }
+    }
+    Saved { gpr = insert_sorted_unique(acc.gpr, r.id); fpr = acc.fpr }
+}
+
+/**
+ * scan_inst_saved — fold one instruction's def and use registers into the
+ * callee-saved partition (via `inst_regs`, the same def/use decomposition
+ * regalloc reads — the emitted instructions ARE the source of truth, §3.1 D-A).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param Saved acc0  the partition so far
+ * @param MInst inst  the physical instruction to scan
+ * @return Saved  the partition with `inst`'s registers folded in
+ */
+fn scan_inst_saved(abi: AbiDescriptor, acc0: Saved, inst: MInst) -> Saved {
+    let ir = inst_regs(inst)
+    mut acc = acc0
+    if ir.has_def {
+        acc = consider_reg(abi, acc, ir.def_reg)
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ir.uses.len { break }
+        acc = consider_reg(abi, acc, ir.uses[i])
+        i++
+    }
+    acc
+}
+
+/**
+ * scan_block_saved — fold one block's instruction stream into the callee-saved
+ * partition.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param Saved acc0  the partition so far
+ * @param MBlock b  the block to scan
+ * @return Saved  the partition with `b`'s registers folded in
+ */
+fn scan_block_saved(abi: AbiDescriptor, acc0: Saved, b: MBlock) -> Saved {
+    mut acc = acc0
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        acc = scan_inst_saved(abi, acc, b.insts[i])
+        i++
+    }
+    acc
+}
+
+/**
+ * collect_callee_saved — re-derive the callee-saved save-set of a physical
+ * function by scanning every block's def/use registers (§3.1). `MFunc` does not
+ * carry `used_callee_saved` (regalloc drops it), so A4 recomputes it; FP/LR are
+ * excluded here (never allocatable) and saved unconditionally by the prologue.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MFunc f  the fully-physical function
+ * @return Saved  the ascending, duplicate-free callee-saved GPR/FPR ids used
+ */
+fn collect_callee_saved(abi: AbiDescriptor, f: MFunc) -> Saved {
+    mut acc = Saved { gpr = teko::list::empty(); fpr = teko::list::empty() }
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        acc = scan_block_saved(abi, acc, f.blocks[i])
+        i++
+    }
+    acc
+}
+
+/**
+ * compute_slot_offsets — lay out the frame-slot region bottom-up, honoring each
+ * `LAlloca`'s own alignment and byte size: slot k sits at `align_up(end of
+ * slot k-1, align_k)`. Produces the per-slot SP offsets and the 16-rounded
+ * region size.
+ *
+ * @param []lir::LAlloca frame  the ordered frame-slot table (`MFunc.frame`)
+ * @return SlotLayout  the per-slot offsets + rounded region size
+ */
+fn compute_slot_offsets(frame: []lir::LAlloca) -> SlotLayout {
+    mut offsets: []u32 = teko::list::empty()
+    mut running: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= frame.len { break }
+        let la = frame[i]
+        let at = align_up(running, la.align)
+        offsets = teko::list::push(offsets, at)
+        running = at + la.bytes
+        i++
+    }
+    SlotLayout { offsets = offsets; slots_size = align_up(running, 16 to u32) }
+}
+
+/**
+ * inst_is_call — whether an instruction is a call (clobbers LR), read from the
+ * `inst_regs` decomposition so the definition stays single-sourced.
+ *
+ * @param MInst inst  the instruction
+ * @return bool  true iff `inst` is `MCall`/`MCallIndirect`
+ */
+fn inst_is_call(inst: MInst) -> bool {
+    inst_regs(inst).is_call
+}
+
+/**
+ * inst_is_ret — whether an instruction is the return terminator.
+ *
+ * @param MInst inst  the instruction
+ * @return bool  true iff `inst` is `MRet`
+ */
+fn inst_is_ret(inst: MInst) -> bool {
+    match inst {
+        MRet => true
+        _ => false
+    }
+}
+
+/**
+ * block_any_call — whether any instruction in `b` is a call.
+ *
+ * @param MBlock b  the block to scan
+ * @return bool  true iff `b` contains a call
+ */
+fn block_any_call(b: MBlock) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        if inst_is_call(b.insts[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * block_any_ret — whether any instruction in `b` is the return terminator.
+ *
+ * @param MBlock b  the block to scan
+ * @return bool  true iff `b` contains an `MRet`
+ */
+fn block_any_ret(b: MBlock) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        if inst_is_ret(b.insts[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * func_any_call — whether the function makes any call.
+ *
+ * @param MFunc f  the function to scan
+ * @return bool  true iff any block contains a call
+ */
+fn func_any_call(f: MFunc) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if block_any_call(f.blocks[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * func_any_ret — whether the function has a reachable return terminator.
+ *
+ * @param MFunc f  the function to scan
+ * @return bool  true iff any block contains an `MRet`
+ */
+fn func_any_ret(f: MFunc) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if block_any_ret(f.blocks[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * needs_lr_save — whether LR must be preserved across the function body: true
+ * only when the function BOTH makes a call (clobbering LR) AND can return
+ * (so the clobbered LR would be read). A leaf function, or the `exit(n)`-
+ * terminated virtual-`main` (a call but no `MRet`), needs no LR save — the
+ * frameless first-light case (§3.2 first-light note).
+ *
+ * @param MFunc f  the fully-physical function
+ * @return bool  true iff the prologue must save FP/LR for LR preservation
+ */
+fn needs_lr_save(f: MFunc) -> bool {
+    func_any_call(f) && func_any_ret(f)
+}
+
+/**
+ * frame_total_size — the total 16-aligned frame size: 0 when the function is
+ * frameless (no slots, no callee-saved registers, no LR to preserve), else the
+ * slot region + the callee-saved save area (8 bytes each) + 16 for FP/LR,
+ * rounded up to 16.
+ *
+ * @param u32 slots_size  the 16-rounded slot-region size
+ * @param Saved saved  the re-derived callee-saved partition
+ * @param bool lr_save  whether FP/LR must be preserved (`needs_lr_save`)
+ * @return u32  the total frame size (0 when frameless)
+ */
+fn frame_total_size(slots_size: u32, saved: Saved, lr_save: bool) -> u32 {
+    let n_saved = (saved.gpr.len + saved.fpr.len) to u32
+    let framed = (slots_size > (0 to u32)) || (n_saved > (0 to u32)) || lr_save
+    if !framed { return 0 to u32 }
+    align_up(slots_size + (n_saved * (8 to u32)) + (16 to u32), 16 to u32)
+}
+
+/**
+ * compute_frame_layout — build a function's `FrameLayout`: re-derive the
+ * callee-saved save-set (§3.1), lay out the frame slots honoring each
+ * `LAlloca`'s alignment, and size the whole frame (0 when frameless). A pure
+ * side-table pass — it does NOT mutate the block stream, so the A3 interp
+ * oracle stays valid on the pre-encode `MFunc`. Offsets that outrun their
+ * encodable fields are caught at emission time (`A4-bigframe`), not here.
+ *
+ * @param AbiDescriptor abi  the register file (callee-saved partition)
+ * @param MFunc f  the fully-physical function
+ * @return FrameLayout  the resolved frame side-table
+ */
+pub fn compute_frame_layout(abi: AbiDescriptor, f: MFunc) -> FrameLayout {
+    let saved = collect_callee_saved(abi, f)
+    let slots = compute_slot_offsets(f.frame)
+    let size = frame_total_size(slots.slots_size, saved, needs_lr_save(f))
+    FrameLayout {
+        size = size
+        saved_gpr = saved.gpr
+        saved_fpr = saved.fpr
+        slot_offsets = slots.offsets
+    }
+}
+
+/**
+ * slot_offset — the SP-relative byte offset of frame slot `slot` under
+ * `layout`, the concrete displacement `MFrameAddr{slot}` resolves to (an ADD
+ * from SP). A direct lookup into the alignment-honoring per-slot map.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @param u32 slot  the frame-slot index (a valid `MFunc.frame` index)
+ * @return u32  the SP-relative byte offset
+ */
+pub fn slot_offset(layout: FrameLayout, slot: u32) -> u32 {
+    layout.slot_offsets[slot to u64]
+}
+
+/**
+ * sub_sp_imm_word — `SUB sp, sp, #imm12` (the 64-bit form, Rn=Rd=SP): the
+ * prologue's stack-claim word.
+ *
+ * @param u32 imm12  the byte amount to subtract (0..4095)
+ * @return u32  the encoded instruction word
+ */
+fn sub_sp_imm_word(imm12: u32) -> u32 {
+    (0xD1000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | (31 to u32)
+}
+
+/**
+ * add_sp_imm_word — `ADD dst, sp, #imm12` (the 64-bit form, Rn=SP): the
+ * stack-release word (dst=SP), the FP-setup word (dst=x29), and the resolved
+ * `MFrameAddr` word (dst=slot register) all share this shape.
+ *
+ * @param u32 dst_id  the destination register id (31=SP for `add sp,sp`)
+ * @param u32 imm12  the byte amount to add (0..4095)
+ * @return u32  the encoded instruction word
+ */
+fn add_sp_imm_word(dst_id: u32, imm12: u32) -> u32 {
+    (0x91000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | dst_id
+}
+
+/**
+ * stp_gpr — `STP xa, xb, [sp, #imm7*8]` (the 64-bit GPR store-pair, Rn=SP): one
+ * callee-saved GPR pair (and the FP/LR pair) save word.
+ *
+ * @param u32 ra  the first (lower-address) register id
+ * @param u32 rb  the second (higher-address) register id
+ * @param u32 imm7  the scaled signed offset (byte offset / 8)
+ * @return u32  the encoded instruction word
+ */
+fn stp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
+    (0xA9000000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+}
+
+/**
+ * ldp_gpr — `LDP xa, xb, [sp, #imm7*8]` (the 64-bit GPR load-pair, Rn=SP): the
+ * epilogue restore counterpart of `stp_gpr`.
+ *
+ * @param u32 ra  the first (lower-address) register id
+ * @param u32 rb  the second (higher-address) register id
+ * @param u32 imm7  the scaled signed offset (byte offset / 8)
+ * @return u32  the encoded instruction word
+ */
+fn ldp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
+    (0xA9400000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+}
+
+/**
+ * str_gpr_sp — `STR xa, [sp, #imm12*8]` (the 64-bit GPR unsigned-offset store,
+ * Rn=SP): the odd trailing callee-saved GPR save word.
+ *
+ * @param u32 ra  the register id to store
+ * @param u32 imm12  the scaled unsigned offset (byte offset / 8)
+ * @return u32  the encoded instruction word
+ */
+fn str_gpr_sp(ra: u32, imm12: u32) -> u32 {
+    (0xF9000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+}
+
+/**
+ * ldr_gpr_sp — `LDR xa, [sp, #imm12*8]` (the 64-bit GPR unsigned-offset load,
+ * Rn=SP): the epilogue restore counterpart of `str_gpr_sp`.
+ *
+ * @param u32 ra  the register id to load
+ * @param u32 imm12  the scaled unsigned offset (byte offset / 8)
+ * @return u32  the encoded instruction word
+ */
+fn ldr_gpr_sp(ra: u32, imm12: u32) -> u32 {
+    (0xF9400000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+}
+
+/**
+ * stp_fpr — `STP da, db, [sp, #imm7*8]` (the 64-bit FP store-pair, Rn=SP): one
+ * callee-saved FPR pair save word.
+ *
+ * @param u32 ra  the first (lower-address) register id
+ * @param u32 rb  the second (higher-address) register id
+ * @param u32 imm7  the scaled signed offset (byte offset / 8)
+ * @return u32  the encoded instruction word
+ */
+fn stp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
+    (0x6D000000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+}
+
+/**
+ * ldp_fpr — `LDP da, db, [sp, #imm7*8]` (the 64-bit FP load-pair, Rn=SP): the
+ * epilogue restore counterpart of `stp_fpr`.
+ *
+ * @param u32 ra  the first (lower-address) register id
+ * @param u32 rb  the second (higher-address) register id
+ * @param u32 imm7  the scaled signed offset (byte offset / 8)
+ * @return u32  the encoded instruction word
+ */
+fn ldp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
+    (0x6D400000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+}
+
+/**
+ * str_fpr_sp — `STR da, [sp, #imm12*8]` (the 64-bit FP unsigned-offset store,
+ * Rn=SP): the odd trailing callee-saved FPR save word.
+ *
+ * @param u32 ra  the register id to store
+ * @param u32 imm12  the scaled unsigned offset (byte offset / 8)
+ * @return u32  the encoded instruction word
+ */
+fn str_fpr_sp(ra: u32, imm12: u32) -> u32 {
+    (0xFD000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+}
+
+/**
+ * ldr_fpr_sp — `LDR da, [sp, #imm12*8]` (the 64-bit FP unsigned-offset load,
+ * Rn=SP): the epilogue restore counterpart of `str_fpr_sp`.
+ *
+ * @param u32 ra  the register id to load
+ * @param u32 imm12  the scaled unsigned offset (byte offset / 8)
+ * @return u32  the encoded instruction word
+ */
+fn ldr_fpr_sp(ra: u32, imm12: u32) -> u32 {
+    (0xFD400000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+}
+
+/**
+ * pair_frame_word — the STP (store) or LDP (load) word for a register pair,
+ * selecting the GPR or FPR family. Dispatched by the `is_store`/`is_fpr`
+ * booleans (never a `match` on a bool, per the style law).
+ *
+ * @param u32 ra  the first (lower-address) register id
+ * @param u32 rb  the second (higher-address) register id
+ * @param u32 imm7  the scaled signed offset (byte offset / 8)
+ * @param bool is_fpr  true for the FP register family
+ * @param bool is_store  true for a save (STP), false for a restore (LDP)
+ * @return u32  the encoded instruction word
+ */
+fn pair_frame_word(ra: u32, rb: u32, imm7: u32, is_fpr: bool, is_store: bool) -> u32 {
+    if is_store {
+        if is_fpr { return stp_fpr(ra, rb, imm7) }
+        return stp_gpr(ra, rb, imm7)
+    }
+    if is_fpr { return ldp_fpr(ra, rb, imm7) }
+    ldp_gpr(ra, rb, imm7)
+}
+
+/**
+ * single_frame_word — the STR (store) or LDR (load) word for one register,
+ * selecting the GPR or FPR family — the odd trailing register of a class.
+ *
+ * @param u32 ra  the register id
+ * @param u32 imm12  the scaled unsigned offset (byte offset / 8)
+ * @param bool is_fpr  true for the FP register family
+ * @param bool is_store  true for a save (STR), false for a restore (LDR)
+ * @return u32  the encoded instruction word
+ */
+fn single_frame_word(ra: u32, imm12: u32, is_fpr: bool, is_store: bool) -> u32 {
+    if is_store {
+        if is_fpr { return str_fpr_sp(ra, imm12) }
+        return str_gpr_sp(ra, imm12)
+    }
+    if is_fpr { return ldr_fpr_sp(ra, imm12) }
+    ldr_gpr_sp(ra, imm12)
+}
+
+/**
+ * emit_frame_mem — append the save (or restore) words for one register class's
+ * callee-saved list, packed as consecutive STP/LDP pairs with a trailing
+ * STR/LDR for an odd count, starting at SP offset `base`. Every offset is a
+ * multiple of 8 by construction, so the scaled fields are exact.
+ *
+ * @param []u32 words0  the word buffer to extend
+ * @param []u32 ids  the class's ascending callee-saved ids
+ * @param u32 base  the SP byte offset of the first id
+ * @param bool is_fpr  true for the FP register family
+ * @param bool is_store  true for saves (prologue), false for restores (epilogue)
+ * @return []u32  `words0` followed by the class's save/restore words
+ */
+fn emit_frame_mem(words0: []u32, ids: []u32, base: u32, is_fpr: bool, is_store: bool) -> []u32 {
+    mut words = words0
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        let off = base + ((i to u32) * (8 to u32))
+        let has_pair = (i + 1) < ids.len
+        if has_pair {
+            words = teko::list::push(words, pair_frame_word(ids[i], ids[i + 1], off / (8 to u32), is_fpr, is_store))
+            i = i + 2
+        } else {
+            words = teko::list::push(words, single_frame_word(ids[i], off / (8 to u32), is_fpr, is_store))
+            i = i + 1
+        }
+    }
+    words
+}
+
+/**
+ * callee_base_offset — the SP byte offset of the first callee-saved register,
+ * placed directly below the FP/LR pair (which sits in the top 16 bytes), so any
+ * 16-alignment padding falls between the slot region and this save area.
+ *
+ * @param FrameLayout layout  the resolved frame (size > 0)
+ * @return u32  the SP offset of the first callee-saved register
+ */
+fn callee_base_offset(layout: FrameLayout) -> u32 {
+    let n = (layout.saved_gpr.len + layout.saved_fpr.len) to u32
+    (layout.size - (16 to u32)) - (n * (8 to u32))
+}
+
+/**
+ * emit_callee_area — append the callee-saved save (or restore) words: the GPR
+ * list first, then the FPR list immediately above it, each class pair-packed.
+ *
+ * @param []u32 words0  the word buffer to extend
+ * @param FrameLayout layout  the resolved frame (size > 0)
+ * @param bool is_store  true for saves (prologue), false for restores (epilogue)
+ * @return []u32  `words0` followed by the callee-saved words
+ */
+fn emit_callee_area(words0: []u32, layout: FrameLayout, is_store: bool) -> []u32 {
+    let base = callee_base_offset(layout)
+    let after_gpr = emit_frame_mem(words0, layout.saved_gpr, base, false, is_store)
+    let fpr_base = base + ((layout.saved_gpr.len to u32) * (8 to u32))
+    emit_frame_mem(after_gpr, layout.saved_fpr, fpr_base, true, is_store)
+}
+
+/**
+ * frame_fits — whether the FP/LR store-pair offset (the largest pair offset,
+ * `size - 16`) fits the signed 7-bit scaled field. When it does, every smaller
+ * pair/slot offset fits too, so this single check guards the whole prologue and
+ * epilogue against `A4-bigframe`.
+ *
+ * @param FrameLayout layout  the resolved frame (size > 0)
+ * @return bool  true iff the frame's offsets are all encodable
+ */
+fn frame_fits(layout: FrameLayout) -> bool {
+    ((layout.size - (16 to u32)) / (8 to u32)) <= (63 to u32)
+}
+
+/**
+ * emit_prologue — the function's entry sequence, or an empty list for a
+ * frameless function: `sub sp, sp, #size`; `stp x29, x30, [sp, #size-16]`;
+ * `add x29, sp, #size-16` (set FP); then one save per callee-saved pair/single.
+ * A frame too large for the STP field raises `A4-bigframe`.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return []u32 | error  the prologue words, or the `A4-bigframe` honest-stop
+ */
+pub fn emit_prologue(layout: FrameLayout) -> []u32 | error {
+    if layout.size == (0 to u32) {
+        let none: []u32 = teko::list::empty()
+        return none
+    }
+    if !frame_fits(layout) { return honest_bigframe() }
+    let top = layout.size - (16 to u32)
+    mut words: []u32 = teko::list::empty()
+    words = teko::list::push(words, sub_sp_imm_word(layout.size))
+    words = teko::list::push(words, stp_gpr(29 to u32, 30 to u32, top / (8 to u32)))
+    words = teko::list::push(words, add_sp_imm_word(29 to u32, top))
+    emit_callee_area(words, layout, true)
+}
+
+/**
+ * emit_epilogue — the function's frame-teardown sequence (LIFO), or an empty
+ * list for a frameless function: restore the callee-saved registers; `ldp x29,
+ * x30, [sp, #size-16]`; `add sp, sp, #size`. The `RET` itself is the `MRet`
+ * encoding (`encode_ret`), which the function-encode layer (A4-3) emits
+ * immediately after these words. A frame too large raises `A4-bigframe`.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return []u32 | error  the teardown words (RET excluded), or `A4-bigframe`
+ */
+pub fn emit_epilogue(layout: FrameLayout) -> []u32 | error {
+    if layout.size == (0 to u32) {
+        let none: []u32 = teko::list::empty()
+        return none
+    }
+    if !frame_fits(layout) { return honest_bigframe() }
+    let top = layout.size - (16 to u32)
+    mut words: []u32 = emit_callee_area(teko::list::empty(), layout, false)
+    words = teko::list::push(words, ldp_gpr(29 to u32, 30 to u32, top / (8 to u32)))
+    words = teko::list::push(words, add_sp_imm_word(31 to u32, layout.size))
+    words
+}
+
+/**
+ * encode_frame_addr — resolve `MFrameAddr{dst, slot}` to `ADD dst, sp,
+ * #slot_offset(layout, slot)`, the A4-2 replacement for A4-1's `A4-frame`
+ * honest-stop. A slot offset beyond the 12-bit ADD-imm field raises
+ * `A4-bigframe`.
+ *
+ * @param FrameLayout layout  the function's resolved frame
+ * @param MFrameAddr i  the frame-slot address instruction (operand physical)
+ * @return EncWord | error  the encoded ADD, or the `A4-bigframe` honest-stop
+ */
+fn encode_frame_addr(layout: FrameLayout, i: MFrameAddr) -> EncWord | error {
+    let off = slot_offset(layout, i.slot)
+    if off > (4095 to u32) { return honest_bigframe() }
+    plain_word(add_sp_imm_word(enc_reg(i.dst), off))
+}
+
+/**
+ * encode_inst_word — encode one fully-physical `MInst` to its `EncWord`, a
+ * TOTAL per-case match over the 29-case variant mirroring `print_minst`'s
+ * dispatch. The position-independent integer/control/memory subset encodes
+ * fully; branches and symbol references return placeholder words flagged for
+ * A4-3 patching; `MFrameAddr` resolves through `layout` to the real `ADD dst,
+ * sp, #off` (A4-2); the float family, big immediates, unscaled offsets, and
+ * big-frame offsets return their NAMED honest-stops.
+ *
+ * @param FrameLayout layout  the enclosing function's resolved frame (for `MFrameAddr`)
+ * @param MInst inst  the instruction to encode (all operands physical)
+ * @return EncWord | error  the encoding, or a named honest-stop
+ */
+pub fn encode_inst_word(layout: FrameLayout, inst: MInst) -> EncWord | error {
+    match inst {
+        MAlu as x => encode_alu(x)
+        MAluImm as x => encode_alu_imm(x)
+        MMSub as x => encode_msub(x)
+        MNeg as x => encode_neg(x)
+        MMvn as x => encode_mvn(x)
+        MFAlu => honest_fp()
+        MFNeg => honest_fp()
+        MCmp as x => encode_cmp(x)
+        MCmpImm as x => encode_cmp_imm(x)
+        MFCmp => honest_fp()
+        MCSet as x => encode_cset(x)
+        MMovZ as x => encode_movz(x)
+        MMovK as x => encode_movk(x)
+        MMovN as x => encode_movn(x)
+        MFMov => honest_fp()
+        MMov as x => encode_mov(x)
+        MExt as x => encode_ext(x)
+        MCvt => honest_fp()
+        MLoad as x => encode_load(x)
+        MStore as x => encode_store(x)
+        MFrameAddr as x => encode_frame_addr(layout, x)
+        MAdrp as x => encode_adrp(x)
+        MAddLo as x => encode_add_lo(x)
+        MBranch as x => encode_branch(x)
+        MBranchCond as x => encode_branch_cond(x)
+        MCbz as x => encode_cbz(x)
+        MCall as x => encode_call(x)
+        MCallIndirect as x => encode_call_indirect(x)
+        MRet => encode_ret()
+    }
+}
+
+/**
+ * Reloc — one symbol relocation the object writer (A4-4) turns into a Mach-O
+ * `relocation_info` entry: the byte offset within the function's `__text` image
+ * (module-rebased at assembly) where the fixup applies, the target symbol's
+ * already-final name, and which `MRelocKind` field it patches. A2 pre-tags every
+ * symbol reference with its kind (`minst.tks:42`), so A4 owes no analysis — one
+ * `Reloc` per `MAdrp`/`MAddLo`/`MCall`.
+ *
+ * @since #385 A4-3
+ */
+pub type Reloc = struct {
+    /**
+     * offset — the byte offset of the relocated instruction word, relative to
+     * this function's `__text` base (word index times 4).
+     */
+    offset: u32
+    /**
+     * sym — the target symbol's final name (unprefixed; the writer adds `_`).
+     */
+    sym: str
+    /**
+     * kind — which ARM64 relocation this instruction owes (PAGE21/PAGEOFF12/
+     * BRANCH26).
+     */
+    kind: MRelocKind
+}
+
+/**
+ * EncodedFunc — one function lowered to machine bytes: its already-final symbol,
+ * its `__text` words in layout order (prologue ++ every block's encoded
+ * instructions ++ epilogues, with intra-function branch displacements resolved),
+ * and its function-relative symbol relocations (offsets rebased to the module
+ * `__text` at assembly, A4-4). The function's byte size is `words.len * 4`.
+ *
+ * @since #385 A4-3
+ */
+pub type EncodedFunc = struct {
+    /**
+     * symbol — the function's already-final symbol (unprefixed).
+     */
+    symbol: str
+    /**
+     * words — the encoded instruction stream, in layout order (u32 words,
+     * flattened little-endian by the module writer in A4-4).
+     */
+    words: []u32
+    /**
+     * relocs — the symbol relocations, offsets relative to this function's
+     * `__text` base.
+     */
+    relocs: []Reloc
+}
+
+/**
+ * BlockOffset — one machine block's starting word index in the function's
+ * emitted stream, keyed by the block's id. The branch-patch pass looks a
+ * displacement target up here; ids are non-topological after #443, so a keyed
+ * lookup (not a positional index) is required.
+ *
+ * @since #385 A4-3
+ */
+type BlockOffset = struct {
+    /**
+     * id — the machine block's id (an `MBranch`/`MBranchCond`/`MCbz` target).
+     */
+    id: u32
+    /**
+     * word — the block's starting word index in the emitted stream.
+     */
+    word: u32
+}
+
+/**
+ * honest_farbranch — the named honest-stop for a branch displacement that does
+ * not fit its instruction field (imm26 = ±128 MB for B, imm19 = ±1 MB for
+ * B.cond/CBZ/CBNZ). Real functions are tiny, so this is an internal-invariant
+ * guard — reached only by a pathological (constructed) input, never silently
+ * mis-encoded.
+ *
+ * @return error  the `A4-farbranch` named honest-stop
+ */
+fn honest_farbranch() -> error {
+    error { message = "A4-farbranch: branch displacement out of the imm26/imm19 field range (internal invariant — real functions are tiny)" }
+}
+
+/**
+ * honest_badblock — the named honest-stop for a branch whose target block id is
+ * absent from the function's block set. An internal-invariant guard: isel/
+ * regalloc only emit branches to real blocks, so a miss means a malformed
+ * `MFunc`, caught here rather than encoded to a wrong displacement.
+ *
+ * @return error  the `A4-badblock` named honest-stop
+ */
+fn honest_badblock() -> error {
+    error { message = "A4-badblock: branch target block id not found in the function (internal invariant)" }
+}
+
+/**
+ * imm26_fits — whether a word-displacement fits the signed 26-bit B field
+ * (`[-2^25, 2^25-1]`, i.e. ±128 MB in bytes).
+ *
+ * @param i64 disp_words  the target-minus-here displacement in whole words
+ * @return bool  true iff it is encodable in imm26
+ */
+fn imm26_fits(disp_words: i64) -> bool {
+    (disp_words >= ((0 to i64) - (33554432 to i64))) && (disp_words <= (33554431 to i64))
+}
+
+/**
+ * imm19_fits — whether a word-displacement fits the signed 19-bit B.cond/CBZ
+ * field (`[-2^18, 2^18-1]`, i.e. ±1 MB in bytes).
+ *
+ * @param i64 disp_words  the target-minus-here displacement in whole words
+ * @return bool  true iff it is encodable in imm19
+ */
+fn imm19_fits(disp_words: i64) -> bool {
+    (disp_words >= ((0 to i64) - (262144 to i64))) && (disp_words <= (262143 to i64))
+}
+
+/**
+ * twos_field — the low `bits`-wide two's-complement encoding of a signed
+ * word-displacement, computed WITHOUT casting a negative `i64` through `to u32`
+ * (that overflow-checks and panics): a non-negative value narrows directly, a
+ * negative value of magnitude `m` becomes `2^bits - m` within the field. The
+ * caller has already range-checked `disp_words`, so `2^bits - m` never
+ * underflows.
+ *
+ * @param i64 disp_words  the in-range signed displacement in whole words
+ * @param u32 bits  the field width (26 for B, 19 for B.cond/CBZ)
+ * @return u32  the field's `bits`-wide two's-complement value
+ */
+fn twos_field(disp_words: i64, bits: u32) -> u32 {
+    let modulus = (1 to u32) << bits
+    let mask = modulus - (1 to u32)
+    if disp_words >= (0 to i64) {
+        return (disp_words to u32) & mask
+    }
+    let mag = ((0 to i64) - disp_words) to u32
+    (modulus - mag) & mask
+}
+
+/**
+ * branch_disp_field — the OR-mask a resolved intra-function branch contributes
+ * to its word: for form 0 (B, imm26) the two's-complement displacement in bits
+ * 0-25; for form 1 (B.cond/CBZ, imm19) the displacement in bits 5-23. A
+ * displacement outside the field raises the `A4-farbranch` honest-stop.
+ *
+ * @param i64 disp_words  the target-minus-here displacement in whole words
+ * @param u32 form  the displacement field selector (0=imm26, 1=imm19)
+ * @return u32 | error  the OR-mask, or the `A4-farbranch` honest-stop
+ */
+fn branch_disp_field(disp_words: i64, form: u32) -> u32 | error {
+    if form == (0 to u32) {
+        if !imm26_fits(disp_words) { return honest_farbranch() }
+        return twos_field(disp_words, 26 to u32)
+    }
+    if !imm19_fits(disp_words) { return honest_farbranch() }
+    twos_field(disp_words, 19 to u32) << (5 to u32)
+}
+
+/**
+ * lookup_block_offset — the starting word index of the block whose id is `id`,
+ * or the `A4-badblock` honest-stop when no such block was emitted. A linear scan
+ * of the (tiny) per-function offset table, since block ids are non-topological.
+ *
+ * @param []BlockOffset offsets  the recorded per-block starting word indices
+ * @param u32 id  the target block id
+ * @return u32 | error  the block's starting word index, or `A4-badblock`
+ */
+fn lookup_block_offset(offsets: []BlockOffset, id: u32) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= offsets.len { break }
+        let bo = offsets[i]
+        if bo.id == id { return bo.word }
+        i++
+    }
+    honest_badblock()
+}
+
+/**
+ * wrap_plain_words — append each raw instruction word of `ws` to the `EncWord`
+ * stream as a position-independent `plain_word` (the prologue/epilogue expansion
+ * carries no branch or reloc fixup).
+ *
+ * @param []EncWord acc0  the `EncWord` stream to extend
+ * @param []u32 ws  the raw instruction words to append
+ * @return []EncWord  `acc0` followed by each word wrapped as a plain `EncWord`
+ */
+fn wrap_plain_words(acc0: []EncWord, ws: []u32) -> []EncWord {
+    mut acc = acc0
+    mut i: u64 = 0
+    loop {
+        if i >= ws.len { break }
+        acc = teko::list::push(acc, plain_word(ws[i]))
+        i++
+    }
+    acc
+}
+
+/**
+ * encode_one — append one instruction's `EncWord`(s) to the stream: an `MRet`
+ * expands to the frame epilogue words (A4-2 left it bare) followed by the RET
+ * word; every other instruction encodes to its single `EncWord` via
+ * `encode_inst_word`. Any named honest-stop propagates out.
+ *
+ * @param FrameLayout layout  the enclosing function's resolved frame
+ * @param []EncWord words0  the `EncWord` stream to extend
+ * @param MInst inst  the instruction to encode
+ * @return []EncWord | error  the extended stream, or a named honest-stop
+ */
+fn encode_one(layout: FrameLayout, words0: []EncWord, inst: MInst) -> []EncWord | error {
+    if inst_is_ret(inst) {
+        let epi = match emit_epilogue(layout) { []u32 as w => w; error as e => return e }
+        let after = wrap_plain_words(words0, epi)
+        return teko::list::push(after, encode_ret())
+    }
+    let ew = match encode_inst_word(layout, inst) { EncWord as x => x; error as e => return e }
+    teko::list::push(words0, ew)
+}
+
+/**
+ * encode_block_words — append every instruction of one block to the `EncWord`
+ * stream, in order, expanding `MRet` as `encode_one` does. Any named honest-stop
+ * propagates out.
+ *
+ * @param FrameLayout layout  the enclosing function's resolved frame
+ * @param []EncWord words0  the `EncWord` stream to extend
+ * @param MBlock blk  the block whose instructions to encode
+ * @return []EncWord | error  the extended stream, or a named honest-stop
+ */
+fn encode_block_words(layout: FrameLayout, words0: []EncWord, blk: MBlock) -> []EncWord | error {
+    mut words = words0
+    mut i: u64 = 0
+    loop {
+        if i >= blk.insts.len { break }
+        let next = match encode_one(layout, words, blk.insts[i]) { []EncWord as w => w; error as e => return e }
+        words = next
+        i++
+    }
+    words
+}
+
+/**
+ * resolve_word — the final u32 of one emitted `EncWord`: a position-independent
+ * or symbol-reference word is returned as-is (the reloc placeholder stays; the
+ * linker patches it), a branch word gets its displacement patched from the
+ * recorded block offsets (`disp = target_offset - here`, in whole words). A
+ * missing target or an out-of-field displacement raises a named honest-stop.
+ *
+ * @param EncWord ew  the emitted word
+ * @param u32 here  this word's own index in the function's stream
+ * @param []BlockOffset offsets  the recorded per-block starting word indices
+ * @return u32 | error  the resolved word, or a named honest-stop
+ */
+fn resolve_word(ew: EncWord, here: u32, offsets: []BlockOffset) -> u32 | error {
+    if !ew.has_branch { return ew.word }
+    let target_off = match lookup_block_offset(offsets, ew.target) { u32 as v => v; error as e => return e }
+    let disp_words = (target_off to i64) - (here to i64)
+    let field = match branch_disp_field(disp_words, ew.branch_form) { u32 as v => v; error as e => return e }
+    ew.word | field
+}
+
+/**
+ * finalize_func — the patch pass: resolve every emitted `EncWord` to its final
+ * word (patching branch displacements from the recorded block offsets) and
+ * collect one `Reloc` per symbol-reference word (its offset the word index times
+ * 4). Produces the `EncodedFunc` hand-off to the A4-4 Mach-O writer.
+ *
+ * @param str symbol  the function's already-final symbol
+ * @param []EncWord words  the emitted `EncWord` stream (prologue ++ blocks)
+ * @param []BlockOffset offsets  the recorded per-block starting word indices
+ * @return EncodedFunc | error  the encoded function, or a named honest-stop
+ */
+fn finalize_func(symbol: str, words: []EncWord, offsets: []BlockOffset) -> EncodedFunc | error {
+    mut out_words: []u32 = teko::list::empty()
+    mut relocs: []Reloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= words.len { break }
+        let ew = words[i]
+        let w = match resolve_word(ew, i to u32, offsets) { u32 as v => v; error as e => return e }
+        out_words = teko::list::push(out_words, w)
+        if ew.has_reloc {
+            relocs = teko::list::push(relocs, Reloc { offset = (i to u32) * (4 to u32); sym = ew.reloc_sym; kind = ew.reloc_kind })
+        }
+        i++
+    }
+    EncodedFunc { symbol = symbol; words = out_words; relocs = relocs }
+}
+
+/**
+ * encode_func — lower one fully-colored `MFunc` to an `EncodedFunc`: compute its
+ * frame layout (A4-2), prepend the prologue, encode every block in `f.blocks`
+ * order (RPO after #443) recording each block's starting word index, expand
+ * `MFrameAddr`/`MRet`, then resolve intra-function branch displacements from the
+ * recorded offsets and collect the symbol relocations. Arm64 is fixed-width, so
+ * block offsets are exact after one encode pass — no branch relaxation. Any
+ * instruction's named honest-stop propagates out unchanged.
+ *
+ * @param AbiDescriptor abi  the register file (for the callee-saved save-set)
+ * @param MFunc f  the fully-physical function
+ * @return EncodedFunc | error  the encoded function, or a named honest-stop
+ */
+pub fn encode_func(abi: AbiDescriptor, f: MFunc) -> EncodedFunc | error {
+    let layout = compute_frame_layout(abi, f)
+    let pro_words = match emit_prologue(layout) { []u32 as w => w; error as e => return e }
+    mut words: []EncWord = wrap_plain_words(teko::list::empty(), pro_words)
+    mut offsets: []BlockOffset = teko::list::empty()
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let blk = f.blocks[bi]
+        let off = words.len to u32
+        offsets = teko::list::push(offsets, BlockOffset { id = blk.id; word = off })
+        let next = match encode_block_words(layout, words, blk) { []EncWord as w => w; error as e => return e }
+        words = next
+        bi++
+    }
+    finalize_func(f.symbol, words, offsets)
+}
+
+/**
+ * Symbol — one symbol-table entry: its name, whether it is defined in this
+ * object, which section it lives in (when defined), its offset within that
+ * section, and whether it is file-local. Undefined symbols (the `tk_*` runtime
+ * + any not-yet-emitted callee) carry `defined=false`; the relocations
+ * reference them by name, the Mach-O writer by table index. `local` mirrors
+ * `clang`'s own convention (verified against a reference object): a function
+ * symbol is always global (so the C runtime's `crt0`/other objects can see
+ * it), a rodata symbol is always file-local (so two objects may each define
+ * their own same-named string constant without a duplicate-symbol clash at
+ * link time, Phase E) — `local` is meaningless for an undefined symbol (always
+ * global-external by construction).
+ *
+ * @since #385 A4-4
+ */
+pub type Symbol = struct {
+    /**
+     * name — the symbol's final name (unprefixed; the writer adds the `_`).
+     */
+    name: str
+    /**
+     * defined — true iff this object defines the symbol (a `__text`/`__const`
+     * datum), false for an external reference.
+     */
+    defined: bool
+    /**
+     * sect — the 1-based Mach-O section index the definition lives in
+     * (meaningful only when `defined`): 1 for `__text`, 2 for `__const`.
+     */
+    sect: u8
+    /**
+     * offset — the byte offset of the definition within its section
+     * (meaningful only when `defined`).
+     */
+    offset: u32
+    /**
+     * local — true iff a defined symbol is file-local (`N_SECT` without
+     * `N_EXT`, and belongs in `LC_DYSYMTAB`'s leading local range); false for a
+     * globally-visible defined symbol or for any undefined symbol.
+     */
+    local: bool
+}
+
+/**
+ * EncodedModule — the whole program lowered to section images + a flat symbol
+ * table: the concatenated `__text` bytes, the `__const` (rodata) bytes, the
+ * defined-then-undefined symbol list, and the module-rebased relocations. The
+ * Mach-O writer (A4-4) turns this into an object file; no arm64 knowledge
+ * remains past this boundary (the writer is ISA-agnostic — Phase B reuses its
+ * shape).
+ *
+ * @since #385 A4-4
+ */
+pub type EncodedModule = struct {
+    /**
+     * text — the `__TEXT,__text` section image (all functions concatenated,
+     * each function's words flattened little-endian).
+     */
+    text: []byte
+    /**
+     * rodata — the `__TEXT,__const` section image (interned string bytes, all
+     * rodata entries concatenated).
+     */
+    rodata: []byte
+    /**
+     * symbols — the symbol table, in Mach-O's required local-then-global-then-
+     * undefined order: one file-local entry per rodata entry, one globally-
+     * visible entry per function, then one undefined entry per externally-
+     * referenced symbol not defined in-module.
+     */
+    symbols: []Symbol
+    /**
+     * relocs — every relocation, `text`-section-relative (module-rebased), in
+     * emission order.
+     */
+    relocs: []Reloc
+}
+
+/**
+ * honest_globals — the named honest-stop A4-4 raises for a module carrying
+ * top-level data globals: the `__data` section + its GOT data relocs are not
+ * emitted by A4 (the N2 subset lowers no `LGlobal`, so this is unreached by the
+ * keystone corpus), and are closed when lowering starts emitting globals.
+ *
+ * @return error  the `A4-globals` named honest-stop
+ */
+fn honest_globals() -> error {
+    error { message = "A4-globals: __data section + GOT data relocs deferred (the N2 subset lowers no LGlobal)" }
+}
+
+/**
+ * append_words_le — append each u32 word of `ws` to a byte buffer as four
+ * little-endian bytes (the per-function `__text` word stream flattened into the
+ * module image).
+ *
+ * @param []byte buf  the byte buffer to extend
+ * @param []u32 ws  the instruction words to flatten
+ * @return []byte  `buf` followed by every word's little-endian bytes
+ */
+fn append_words_le(buf: []byte, ws: []u32) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= ws.len { break }
+        b = emit_u32_le(b, ws[i])
+        i++
+    }
+    b
+}
+
+/**
+ * rebase_relocs — append each function-relative `Reloc` of `relocs` to `acc`
+ * with its byte offset shifted by `base` (the function's `__text` base), so the
+ * module reloc offset points at the instruction word in the concatenated image.
+ *
+ * @param []Reloc acc  the running module reloc list
+ * @param []Reloc relocs  one function's function-relative relocations
+ * @param u32 base  the function's `__text` base byte offset
+ * @return []Reloc  `acc` followed by the rebased relocations
+ */
+fn rebase_relocs(acc: []Reloc, relocs: []Reloc, base: u32) -> []Reloc {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let r = relocs[i]
+        out = teko::list::push(out, Reloc { offset = r.offset + base; sym = r.sym; kind = r.kind })
+        i++
+    }
+    out
+}
+
+/**
+ * ModuleText — the running `__text` assembly of the module: the concatenated
+ * byte image, the module-rebased relocations, the defined function symbols, and
+ * the current base (the next function's `__text` byte offset).
+ *
+ * @since #385 A4-4
+ */
+type ModuleText = struct {
+    /**
+     * text — the concatenated `__text` bytes so far.
+     */
+    text: []byte
+    /**
+     * relocs — the module-rebased relocations so far.
+     */
+    relocs: []Reloc
+    /**
+     * syms — one defined `__text` symbol per function encoded so far.
+     */
+    syms: []Symbol
+    /**
+     * base — the next function's `__text` base byte offset (the current image
+     * length).
+     */
+    base: u32
+}
+
+/**
+ * empty_module_text — the seed `ModuleText`: empty image, no relocations, no
+ * symbols, base 0.
+ *
+ * @return ModuleText  the seed accumulator
+ */
+fn empty_module_text() -> ModuleText {
+    ModuleText { text = teko::list::empty(); relocs = teko::list::empty(); syms = teko::list::empty(); base = 0 to u32 }
+}
+
+/**
+ * fold_func_into_text — encode one function and fold it into the running module
+ * `__text`: record its GLOBAL defined symbol at the current base (section 1,
+ * `__text` — a function must stay globally visible so the C runtime's `crt0`
+ * and other objects can call it), append its words as little-endian bytes, and
+ * rebase its relocs by the base. The base advances by the function's byte
+ * length (`words.len * 4`). Any named honest-stop from `encode_func` propagates
+ * out.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param ModuleText acc  the running `__text` assembly
+ * @param MFunc f  the fully-physical function to encode
+ * @return ModuleText | error  the extended assembly, or a named honest-stop
+ */
+fn fold_func_into_text(abi: AbiDescriptor, acc: ModuleText, f: MFunc) -> ModuleText | error {
+    let ef = match encode_func(abi, f) { EncodedFunc as x => x; error as e => return e }
+    let sym = Symbol { name = ef.symbol; defined = true; sect = 1 to u8; offset = acc.base; local = false }
+    let text = append_words_le(acc.text, ef.words)
+    let relocs = rebase_relocs(acc.relocs, ef.relocs, acc.base)
+    let syms = teko::list::push(acc.syms, sym)
+    let base = acc.base + ((ef.words.len to u32) * (4 to u32))
+    ModuleText { text = text; relocs = relocs; syms = syms; base = base }
+}
+
+/**
+ * encode_functions — fold every function of the module into one `ModuleText`
+ * (concatenated `__text` image + rebased relocations + one defined symbol per
+ * function). Any function's named honest-stop propagates out.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param []MFunc funcs  the module's fully-physical functions
+ * @return ModuleText | error  the assembled `__text`, or a named honest-stop
+ */
+fn encode_functions(abi: AbiDescriptor, funcs: []MFunc) -> ModuleText | error {
+    mut acc = empty_module_text()
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        let next = match fold_func_into_text(abi, acc, funcs[i]) { ModuleText as x => x; error as e => return e }
+        acc = next
+        i++
+    }
+    acc
+}
+
+/**
+ * ModuleRodata — the `__const` assembly of the module: the concatenated rodata
+ * byte image and one defined `__const` symbol per rodata entry.
+ *
+ * @since #385 A4-4
+ */
+type ModuleRodata = struct {
+    /**
+     * bytes — the concatenated `__const` image (all rodata entries).
+     */
+    bytes: []byte
+    /**
+     * syms — one defined `__const` symbol per rodata entry (section 2).
+     */
+    syms: []Symbol
+}
+
+/**
+ * append_bytes — append every byte of `src` to `buf`.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param []byte src  the bytes to append
+ * @return []byte  `buf` followed by `src`
+ */
+fn append_bytes(buf: []byte, src: []byte) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= src.len { break }
+        b = teko::list::push(b, src[i])
+        i++
+    }
+    b
+}
+
+/**
+ * encode_rodata — build the `__const` image and its defined symbols: each
+ * `LRodata` entry is placed at the running byte offset with a defined, FILE-
+ * LOCAL section-2 symbol (the ADRP/ADD-lo relocations in `__text` resolve to it
+ * at link time; local mirrors `clang`'s own convention for string constants, so
+ * same-named rodata in two objects never collides at Phase E multi-object
+ * link).
+ *
+ * @param []lir::LRodata rodata  the module's interned rodata table
+ * @return ModuleRodata  the `__const` image + its defined symbols
+ */
+fn encode_rodata(rodata: []lir::LRodata) -> ModuleRodata {
+    mut bytes: []byte = teko::list::empty()
+    mut syms: []Symbol = teko::list::empty()
+    mut off: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        let rd = rodata[i]
+        syms = teko::list::push(syms, Symbol { name = rd.symbol; defined = true; sect = 2 to u8; offset = off; local = true })
+        bytes = append_bytes(bytes, rd.bytes)
+        off = off + (rd.bytes.len to u32)
+        i++
+    }
+    ModuleRodata { bytes = bytes; syms = syms }
+}
+
+/**
+ * name_in_symbols — whether some symbol in `syms` already carries `name` (a
+ * defined function/rodata symbol, or an already-collected undefined one).
+ *
+ * @param []Symbol syms  the symbols to scan
+ * @param str name  the symbol name to look for
+ * @return bool  true iff `name` is present
+ */
+fn name_in_symbols(syms: []Symbol, name: str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= syms.len { break }
+        if syms[i].name == name { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * collect_undefined — one undefined `Symbol` per relocation target not defined
+ * in `defined` and not already collected (dedup'd, in first-reference order):
+ * the `tk_*` runtime symbols and any not-yet-emitted callee.
+ *
+ * @param []Symbol defined  the module's defined symbols
+ * @param []Reloc relocs  the module's relocations
+ * @return []Symbol  the undefined symbols, deduplicated
+ */
+fn collect_undefined(defined: []Symbol, relocs: []Reloc) -> []Symbol {
+    mut undef: []Symbol = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let name = relocs[i].sym
+        let known = name_in_symbols(defined, name) || name_in_symbols(undef, name)
+        if !known {
+            undef = teko::list::push(undef, Symbol { name = name; defined = false; sect = 0 to u8; offset = 0 to u32; local = false })
+        }
+        i++
+    }
+    undef
+}
+
+/**
+ * concat_symbols — append every symbol of `b` to `a`. `encode_module` calls
+ * this twice, in the order that keeps the symbol table's three Mach-O ranges
+ * (local, global-defined, undefined) contiguous.
+ *
+ * @param []Symbol a  the leading symbols
+ * @param []Symbol b  the trailing symbols
+ * @return []Symbol  `a` followed by `b`
+ */
+fn concat_symbols(a: []Symbol, b: []Symbol) -> []Symbol {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * encode_module — encode every `MFunc` of `m`, concatenate their `__text` words
+ * into the module image and REBASE each function's reloc offsets by its `__text`
+ * base, intern the rodata bytes into `__const`, and build the symbol table in
+ * the Mach-O-required LOCAL-then-GLOBAL-then-UNDEFINED order: one file-local
+ * entry per rodata entry, one globally-visible entry per function, then one
+ * undefined entry per externally-referenced symbol not defined in-module (the
+ * three contiguous ranges `LC_DYSYMTAB` needs). A module carrying data globals
+ * raises the `A4-globals` honest-stop (the N2 subset lowers none); any
+ * function's encode honest-stop propagates out unchanged.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MModule m  the fully-colored module
+ * @return EncodedModule | error  the section images + symbols + relocs, or a
+ *                                 named honest-stop
+ */
+pub fn encode_module(abi: AbiDescriptor, m: MModule) -> EncodedModule | error {
+    if m.globals.len > (0 to u64) { return honest_globals() }
+    let mt = match encode_functions(abi, m.funcs) { ModuleText as x => x; error as e => return e }
+    let rod = encode_rodata(m.rodata)
+    let defined = concat_symbols(rod.syms, mt.syms)
+    let undef = collect_undefined(defined, mt.relocs)
+    let symbols = concat_symbols(defined, undef)
+    EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+}
