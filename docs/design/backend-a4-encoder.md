@@ -710,9 +710,11 @@ integer, `exit(n)`-terminated subset A2/A3 already run.
 
 ---
 
-## 8. The main-tail divergence — GROUNDED + RESOLVED in A4-5 (integrator fold #21)
+## 8. The main-tail divergence — GROUNDED in A4-5 (integrator fold #21); end-to-end fixture PENDING
 
-**Finding: there is NO divergence — both backends already honor the #423 trailing-exit ruling.** The A4
+**Finding: there is NO SEMANTIC divergence — both backends already honor the #423 trailing-exit ruling
+(proven by source-level analysis; an end-to-end own-native fixture is a pending fast-follow, see the
+caveat below).** The A4
 design flagged a suspected divergence: that the C backend's `main` "unconditionally `return 0`"
 (`codegen.tks:8449`) while the LIR virtual-`main` returns the trailing loose EXPRESSION's value
 (`lower_virtual_main`, `lower.tks:4053`). Grounding BOTH sides in A4-5 shows that premise was a MISREAD
@@ -733,10 +735,19 @@ expression IS the process exit code. Both backends implement it; they are ALIGNE
 corpus is scoped to `exit(n)`-terminated fixtures not to sidestep a divergence (there is none) but
 because that is (a) exactly the subset the LIR interp oracle validates and (b) the own-backend's
 frameless-`main` first light (`bl _tk_exit`, no `MRet`). This exit(n)-corpus convention is codified in
-`scripts/diff_c_own.sh`'s header. A trailing-VALUE `main` rides the own path's `MRet` machinery (A4-2),
-which the frame goldens already cover; extending the corpus to a non-`exit(n)` fixture is a mechanical
-fast-follow, not a semantic gap. **No new issue, no honest-stop for trailing-exit — the two backends
-agree.**
+`scripts/diff_c_own.sh`'s header.
+
+**Caveat — the parity above is proven by source-level analysis + the A4-2 frame goldens, NOT yet by an
+end-to-end own-native fixture.** A trailing-VALUE `main` is FRAMED (it falls through to `MRet` rather
+than diverging through `bl _tk_exit`), so it rides the own path's `MRet` + prologue/epilogue machinery
+(A4-2) — machinery the frame goldens exercise directly (`encode_arm64_test.tkt`'s spill/return fixture),
+but which the A4-5 exit(n) corpus, by construction, never reaches (every corpus fixture diverges before
+any `MRet`). No fixture in `examples/regressions/own_*` yet exercises a framed `main` through
+`diff_c_own.sh` end to end. Today the corpus cannot add one: the only two ways to make a non-trivial
+FRAMED `main` (a spill, or a `match`/loop needing a real return path) either need `A4-args` (a real
+argv-carrying entry) or hit the same inherited `A3-loop`/`A4-bigframe` stops `own_match_exit` already
+documents. **This is a scope note, not a re-opened tension** — the fast-follow is mechanical (add a
+framed-`main` fixture once A3-loop or an equivalent unblocks one), not a new design question.
 
 ---
 

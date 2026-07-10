@@ -22,6 +22,19 @@
 # emitted `.o` (which A4-4 could only pin via golden bytes — now there is an object
 # on disk), so the host toolchain (otool/nm/ld -r) cross-checks the writer's bytes.
 #
+# ── harness-blind-spot guards (review finding F1) ───────────────────────────────────
+# A silently-misconfigured `TEKO` (e.g. the C bootstrap, or any binary predating
+# emit_native) makes the `TEKO_BACKEND=native` env seam a pure NO-OP: the "own" build
+# silently falls back to the C backend, so "own == C" trivially holds — a blind spot
+# that would mask ANY own-backend regression. Two positive guards close it:
+#   (a) the "own" build's captured output MUST contain emit_native's EXCLUSIVE success
+#       marker, `"(own backend)"` (`project.tks::emit_native`, printed ONLY by that
+#       path, never by the C `backend()` arm) — its absence is a FAIL, not a pass.
+#   (b) the own-native `.o` MUST exist on disk before `check_macho.sh` runs — an
+#       absent object here is a harness FAILURE (never a skip; `check_macho.sh`'s own
+#       honest-skip is for STANDALONE invocation with no object at all, not for this
+#       harness where the own-native build already reported success + the marker).
+#
 # GATED on macOS-arm64 (needs the host Mach-O `ld` reachable through `cc`); on any
 # other host the harness HONEST-SKIPS with a named reason (exit 0). The own arm64
 # encoder emits Mach-O only — ELF/PE are Phases B/C.
@@ -44,6 +57,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEKO="${TEKO:-./bin/teko}"
 BUILDER="${BUILDER:-./build/teko}"
 CHECK_MACHO="$script_dir/scripts/check_macho.sh"
+OWN_BACKEND_MARKER="(own backend)"
 
 resolve_abs() {
     case "$1" in
@@ -85,30 +99,49 @@ CORPUS=(
     own_sub_exit
     own_if_exit
     own_match_exit
+    own_print_exit
 )
 
 # ── KNOWN-STOP list ────────────────────────────────────────────────────────────────────
 # Fixtures the own backend cannot yet build end-to-end because they reach a NAMED,
-# INHERITED honest-stop BEFORE encode (§6). For these the harness asserts the own build
-# HONESTLY STOPS with the named error (never a fabricated artifact — M.3) while C-native
-# succeeds. The day the own build starts SUCCEEDING (the stop was closed) the fixture turns
-# XSTOP and the harness fails LOUDLY, so the list is pruned and the fixture joins the
-# compared exit(n) corpus.
+# reproducible stop (§6, or a linker-surfaced gap below). For these the harness asserts
+# the own build FAILS with the EXPECTED signature (parallel `KNOWN_STOP_ERR` entry) while
+# C-native succeeds — never a fabricated artifact (M.3). The day the own build starts
+# SUCCEEDING (the stop was closed) the fixture turns XSTOP and the harness fails LOUDLY,
+# so the list is pruned and the fixture joins the compared exit(n) corpus.
 #
 # own_match_exit — `match` lowering trips the regalloc back-edge over-approximation
-#   (A3-loop, backend-a3-regalloc.md §6.2): #443's RPO numbering unblocked acyclic `if`/`match`
-#   merges for allocation, but a `match` over a literal discriminant still presents a branch the
-#   linear back-edge test misclassifies, so regalloc honest-stops. `if`/`else` (own_if_exit)
-#   allocates fine, proving the multi-block path works; `match` joins the compared corpus when
-#   A3-loop lands.
+#   (A3-loop, backend-a3-regalloc.md §6.2): #443's RPO numbering unblocked acyclic `if`/
+#   `match` merges for allocation, but a `match` over a literal discriminant still
+#   presents a branch the linear back-edge test misclassifies, so regalloc honest-stops
+#   with a NAMED compiler diagnostic ("A3-loop"). `if`/`else` (own_if_exit) allocates
+#   fine, proving the multi-block path works; `match` joins the corpus when A3-loop lands.
+#
+# own_print_exit — `teko::io::println` has NO builtin mapping in the LIR lowering
+#   (`src/lir/lower.tks`), unlike the C backend's codegen.tks (which special-cases the
+#   bare-name `println` call to the runtime symbol `tk_println`, `codegen.tks:2290`).
+#   The own pipeline therefore lowers the call as an ordinary cross-module call and
+#   mangles the WRONG external symbol (`_println` instead of `_tk_println`) — every own
+#   pass (isel/regalloc/encode/emit_macho) succeeds and writes a well-formed `.o`
+#   (`check_macho.sh` passes it), but the SYSTEM LINKER then rejects the executable link
+#   with "Undefined symbols ... _println" — a linker-surfaced gap, not a compiler
+#   `fail()` diagnostic. This is a REPORTED adjacent finding (LIR's builtin-call surface
+#   is narrower than codegen's): closes when LIR gains a builtin table mirroring
+#   codegen.tks's io/str/mem builtin dispatch.
 declare -a KNOWN_STOP=(
     own_match_exit
+    own_print_exit
 )
-KNOWN_STOP_ERR="A3-loop"
+declare -a KNOWN_STOP_ERR=(
+    "A3-loop"
+    "_println"
+)
 
-is_known_stop() {
-    local n="$1" x
-    for x in "${KNOWN_STOP[@]}"; do [[ "$x" == "$n" ]] && return 0; done
+known_stop_index_of() {
+    local n="$1" i
+    for i in "${!KNOWN_STOP[@]}"; do
+        if [[ "${KNOWN_STOP[$i]}" == "$n" ]]; then printf '%s' "$i"; return 0; fi
+    done
     return 1
 }
 
@@ -128,6 +161,23 @@ failed_names=() xstop_names=()
 echo "diff_c_own: teko=$teko_abs — ${#fixtures[@]} fixture(s) (macOS-arm64 C-vs-own differential)"
 echo
 
+# check_known_stop — the KNOWN-STOP verdict for `name`: KSTOP when the own build FAILED
+# with its expected signature (`$work/$name.obuild` carries the parallel `KNOWN_STOP_ERR`
+# substring); XSTOP-as-FAIL otherwise (a silent-no-op seam OR a genuinely closed stop —
+# either way, the harness must fail loudly rather than pass silently, F1).
+check_known_stop() {
+    local name="$1" idx err
+    idx="$(known_stop_index_of "$name")"
+    err="${KNOWN_STOP_ERR[$idx]}"
+    if [[ "$own_build_rc" -ne 0 ]] && grep -qF "$err" "$work/$name.obuild"; then
+        kstop=$((kstop + 1))
+        printf 'KSTOP %-16s own backend honest-stops (%s), C-native exit=%s — joins the corpus when the stop lands\n' "$name" "$err" "$c_exit"
+        return
+    fi
+    fail=$((fail + 1)); failed_names+=("$name"); xstop_names+=("$name")
+    printf 'XSTOP %-16s KNOWN-STOP fixture no longer stops on %s (own build rc=%s) — prune KNOWN_STOP and add to the compared corpus\n' "$name" "$err" "$own_build_rc"
+}
+
 for proj in "${fixtures[@]}"; do
     name="$(basename "$proj")"
     cout="$work/$name-c"
@@ -146,15 +196,8 @@ for proj in "${fixtures[@]}"; do
     TEKO_BACKEND=native "$teko_abs" build "$proj" -o "$oout" >"$work/$name.obuild" 2>&1
     own_build_rc=$?
 
-    # ── KNOWN-STOP fixture: assert the own backend HONESTLY stops (named error) ─────
-    if is_known_stop "$name"; then
-        if [[ "$own_build_rc" -ne 0 ]] && grep -q "$KNOWN_STOP_ERR" "$work/$name.obuild"; then
-            kstop=$((kstop + 1))
-            printf 'KSTOP %-16s own backend honest-stops (%s), C-native exit=%s — joins the corpus when the stop lands\n' "$name" "$KNOWN_STOP_ERR" "$c_exit"
-        else
-            fail=$((fail + 1)); failed_names+=("$name"); xstop_names+=("$name")
-            printf 'XSTOP %-16s KNOWN-STOP fixture no longer stops on %s (own build rc=%s) — prune KNOWN_STOP and add to the compared corpus\n' "$name" "$KNOWN_STOP_ERR" "$own_build_rc"
-        fi
+    if known_stop_index_of "$name" >/dev/null; then
+        check_known_stop "$name"
         continue
     fi
 
@@ -164,6 +207,23 @@ for proj in "${fixtures[@]}"; do
         tail -8 "$work/$name.obuild" | sed 's/^/      | /'
         continue
     fi
+
+    # F1(a) — positively assert the OWN backend actually ran (never trust a bare exit 0).
+    if ! grep -qF "$OWN_BACKEND_MARKER" "$work/$name.obuild"; then
+        fail=$((fail + 1)); failed_names+=("$name")
+        printf 'FAIL  %-16s own-native build did NOT report "%s" — TEKO_BACKEND=native was a silent no-op (wrong/stale teko binary?), NOT a real own-backend build\n' "$name" "$OWN_BACKEND_MARKER"
+        tail -8 "$work/$name.obuild" | sed 's/^/      | /'
+        continue
+    fi
+
+    # F1(b) — the own-native `.o` MUST exist; its absence here is a FAIL, never a skip.
+    objp="$oout/$name.o"
+    if [[ ! -f "$objp" ]]; then
+        fail=$((fail + 1)); failed_names+=("$name")
+        printf 'FAIL  %-16s own-native build reported success but no %s.o was written\n' "$name" "$name"
+        continue
+    fi
+
     "$oout/$name" >"$work/$name.oout" 2>&1
     own_exit=$?
 
@@ -179,7 +239,7 @@ for proj in "${fixtures[@]}"; do
         continue
     fi
 
-    if ! "$CHECK_MACHO" "$oout/$name.o" >"$work/$name.macho" 2>&1; then
+    if ! "$CHECK_MACHO" "$objp" >"$work/$name.macho" 2>&1; then
         fail=$((fail + 1)); failed_names+=("$name")
         printf 'FAIL  %-16s check_macho rejected the emitted %s.o\n' "$name" "$name"
         tail -5 "$work/$name.macho" | sed 's/^/      | /'
