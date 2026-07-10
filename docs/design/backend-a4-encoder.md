@@ -710,18 +710,44 @@ integer, `exit(n)`-terminated subset A2/A3 already run.
 
 ---
 
-## 8. Adjacent finding — REPORTED up (not resolved here)
+## 8. The main-tail divergence — GROUNDED in A4-5 (integrator fold #21); end-to-end fixture PENDING
 
-**The virtual-`main` exit-code semantics diverge between backends for TRAILING-VALUE programs.** The C
-backend's `main` unconditionally `return 0` after the loose statements (`codegen.tks:8449`), whereas
-the LIR virtual-`main` returns the trailing loose EXPRESSION's value as the exit code
-(`lower_virtual_main`, `lower.tks:4053`; `lower_main_tail`). For an `exit(n)`-terminated program both
-call `tk_exit(n)` → identical. But a program whose "answer" is a bare trailing value (no `exit(...)`)
-would exit `0` under C-native and `n` under own-native — a differential FALSE POSITIVE that is a
-**lowering / corpus-scope** question, not an A4 encoder bug. A4 sidesteps it by scoping the differential
-corpus to `exit(n)`-terminated fixtures (exactly the interp-validated subset). **Reported to the
-integrator** to fold: either align the two `main` tail conventions (A1/lowering) or codify the
-`exit(n)`-only corpus rule in the differential harness. A4 does not turn this into a new issue.
+**Finding: there is NO SEMANTIC divergence — both backends already honor the #423 trailing-exit ruling
+(proven by source-level analysis; an end-to-end own-native fixture is a pending fast-follow, see the
+caveat below).** The A4
+design flagged a suspected divergence: that the C backend's `main` "unconditionally `return 0`"
+(`codegen.tks:8449`) while the LIR virtual-`main` returns the trailing loose EXPRESSION's value
+(`lower_virtual_main`, `lower.tks:4053`). Grounding BOTH sides in A4-5 shows that premise was a MISREAD
+of line 8449:
+
+- **C backend.** `emit_program_main` (`codegen.tks:8412`) emits the LAST loose statement through
+  `emit_block_tail` → `emit_exprstmt_tail`, whose `in_main` branch emits `return (int)(<tail value>);`
+  (`codegen.tks:5499-5502`). The `return 0;` at line 8449 is a FALL-THROUGH DEFAULT — dead code when a
+  value-carrying tail already returned. So the C backend returns the trailing expression's value as the
+  exit code (verified empirically: `6 * 7` → C-native exit 42, VM exit 42).
+- **LIR own backend.** `#423` (commit `87f81b6`, "virtual-main trailing exit") touched ONLY the LIR side
+  (`lower.tks`/`lir.tks`) — it made `close_virtual_main` MIRROR `lower_fn_body`'s #421 trailing-expression
+  auto-return, bringing LIR INTO PARITY with the already-existing C behavior. The C backend was not
+  touched by #423 because it was already correct.
+
+**Resolution (law-consistent, no deferral).** The ratified semantic (#421/#423) is: a trailing loose
+expression IS the process exit code. Both backends implement it; they are ALIGNED. The differential
+corpus is scoped to `exit(n)`-terminated fixtures not to sidestep a divergence (there is none) but
+because that is (a) exactly the subset the LIR interp oracle validates and (b) the own-backend's
+frameless-`main` first light (`bl _tk_exit`, no `MRet`). This exit(n)-corpus convention is codified in
+`scripts/diff_c_own.sh`'s header.
+
+**Caveat — the parity above is proven by source-level analysis + the A4-2 frame goldens, NOT yet by an
+end-to-end own-native fixture.** A trailing-VALUE `main` is FRAMED (it falls through to `MRet` rather
+than diverging through `bl _tk_exit`), so it rides the own path's `MRet` + prologue/epilogue machinery
+(A4-2) — machinery the frame goldens exercise directly (`encode_arm64_test.tkt`'s spill/return fixture),
+but which the A4-5 exit(n) corpus, by construction, never reaches (every corpus fixture diverges before
+any `MRet`). No fixture in `examples/regressions/own_*` yet exercises a framed `main` through
+`diff_c_own.sh` end to end. Today the corpus cannot add one: the only two ways to make a non-trivial
+FRAMED `main` (a spill, or a `match`/loop needing a real return path) either need `A4-args` (a real
+argv-carrying entry) or hit the same inherited `A3-loop`/`A4-bigframe` stops `own_match_exit` already
+documents. **This is a scope note, not a re-opened tension** — the fast-follow is mechanical (add a
+framed-`main` fixture once A3-loop or an equivalent unblocks one), not a new design question.
 
 ---
 
