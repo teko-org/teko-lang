@@ -178,6 +178,26 @@ fn rpo_block_order(f: MFunc) -> []u32 {
 }
 
 /**
+ * reachable_blocks — the block ids reachable from `f`'s entry, via the same
+ * post-order DFS `rpo_block_order` walks (§3). A block absent from this set is
+ * dead code — for example a `match`'s defensive fallback block past an
+ * irrefutable final arm, which no branch targets because the last pattern test
+ * jumps unconditionally into its own body. `append_unvisited` still numbers
+ * such a block (keeping the numbering TOTAL), placing it LAST; the back-edge
+ * test uses this set to EXCLUDE its edges, since a dead block cannot form a
+ * loop the allocator must model (A4-6, #385 — the acyclic false-positive the
+ * `if` fix #443 did not cover for `match`).
+ *
+ * @param MFunc f  the selected function
+ * @return []u32  the entry-reachable block ids (the DFS-visited set)
+ */
+fn reachable_blocks(f: MFunc) -> []u32 {
+    if f.blocks.len == 0 { return teko::list::empty() }
+    let entry = f.blocks[0].id
+    rpo_visit(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() }).visited
+}
+
+/**
  * block_pos — the position of block id `id` in the RPO `order` (its liveness
  * rank), or `order.len` if absent (a defensive default — an absent target
  * looks like the last position, never a spurious back-edge).
@@ -576,24 +596,30 @@ fn terminator_target(inst: MInst) -> TargetOpt {
 }
 
 /**
- * has_back_edge — whether any terminator is a RETREATING edge in RPO
- * (`pos(target) <= pos(source)`): the exact loop test on a reducible CFG (§3).
- * An acyclic nested `if`/`match` has no retreating edge (all forward in RPO),
- * so it no longer false-positives; a real `loop` latch→header edge retreats
+ * has_back_edge — whether any terminator on an ENTRY-REACHABLE block is a
+ * RETREATING edge in RPO (`pos(target) <= pos(source)`): the exact loop test on
+ * a reducible CFG (§3). An acyclic nested `if`/`match` has no retreating edge
+ * among its reachable blocks, so it no longer false-positives — including a
+ * `match` whose irrefutable final arm leaves its defensive fallback UNREACHABLE
+ * (that dead block lands LAST in the numbering, so its forward jump to the
+ * merge would otherwise look like a retreat; `reachable` excludes it, A4-6
+ * #385). A real `loop` latch→header edge retreats between two reachable blocks
  * and still honest-stops (A3-loop deferral, §6.2). Replaces the
  * allocation-order id proxy (#443).
  *
  * @param []NumberedInst stream  the numbered stream
  * @param []u32 order  the RPO block-id order
- * @return bool  true iff a retreating (back-)edge is present
+ * @param []u32 reachable  the entry-reachable block ids (dead-block sources are
+ *                         excluded — a dead edge is not a loop, §6.2)
+ * @return bool  true iff a retreating (back-)edge leaves a reachable block
  */
-fn has_back_edge(stream: []NumberedInst, order: []u32) -> bool {
+fn has_back_edge(stream: []NumberedInst, order: []u32, reachable: []u32) -> bool {
     mut i: u64 = 0
     loop {
         if i >= stream.len { break }
         let ni = stream[i]
         let t = terminator_target(ni.inst)
-        if t.has {
+        if t.has && u32_in(reachable, ni.block_id) {
             if block_pos(order, t.target) <= block_pos(order, ni.block_id) { return true }
         }
         i++
@@ -831,14 +857,16 @@ fn phys_intervals(events: []RegEvent, r: MReg, stream: []NumberedInst, call_poin
  * compute_intervals — the §3.2 liveness pass: one walk of the RPO-numbered
  * stream driven by the §1.1 def/use table, producing the virtual intervals to
  * color and the fixed pin intervals to block. Honest-stops on a real loop
- * back-edge (§6.2, the A3-loop follow-up), detected by RPO position (#443).
+ * back-edge (§6.2, the A3-loop follow-up), detected by RPO position among the
+ * ENTRY-REACHABLE blocks (#443; dead-block edges excluded, A4-6 #385).
  *
  * @param []NumberedInst stream  the RPO-numbered instruction stream
  * @param []u32 order  the RPO block-id order (for the back-edge test)
+ * @param []u32 reachable  the entry-reachable block ids (for the back-edge test)
  * @return IntervalSet | error  the computed intervals, or the back-edge stop
  */
-fn compute_intervals(stream: []NumberedInst, order: []u32) -> IntervalSet | error {
-    if has_back_edge(stream, order) {
+fn compute_intervals(stream: []NumberedInst, order: []u32, reachable: []u32) -> IntervalSet | error {
+    if has_back_edge(stream, order, reachable) {
         return error { message = "regalloc: a loop back-edge needs live-range holes over the strict linear numbering — deferred to the A3-loop follow-up (§6.2)" }
     }
     let events = collect_events(stream)
@@ -1811,7 +1839,9 @@ pub fn all_physical(f: MFunc) -> bool {
  * intervals, scan, rewrite. Returns a NAMED honest-stop error on a real loop
  * back-edge (§6.2, via `compute_intervals`) or on an FPR-value spill (A3 lowers
  * GPR spills only). The RPO order is computed once and threaded so the
- * numbering and the back-edge test share one topological linearization (#443).
+ * numbering and the back-edge test share one topological linearization (#443);
+ * the entry-reachable set is threaded beside it so the back-edge test ignores
+ * dead-block edges (a `match`'s unreachable fallback, A4-6 #385).
  *
  * @param AbiDescriptor abi  the register file
  * @param MFunc f  the selected function (virtual MRegs + ABI pins)
@@ -1820,7 +1850,7 @@ pub fn all_physical(f: MFunc) -> bool {
 pub fn regalloc_func(abi: AbiDescriptor, f: MFunc) -> MFunc | error {
     let order = rpo_block_order(f)
     let numbered = number_insts(f, order)
-    let ivals = match compute_intervals(numbered, order) {
+    let ivals = match compute_intervals(numbered, order, reachable_blocks(f)) {
         IntervalSet as s => s
         error as e => return e
     }

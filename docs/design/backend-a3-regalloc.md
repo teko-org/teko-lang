@@ -759,6 +759,19 @@ back-edges stop.
 > reorder: block ids + `MFunc.blocks` order + branch targets are untouched, so the interp is provably
 > unaffected. See `docs/design/backend-443-rpo-numbering.md`.
 
+> **✅ REFINED by #385 A4-6 (dead-block reachability filter), 2026-07-10.** #443 fixed the acyclic
+> false-positive for the REACHABLE blocks, but did not cover a second acyclic false-positive it did not
+> yet exercise: a `match` whose final arm is IRREFUTABLE (a `_` wildcard) lowers its last pattern test
+> as an UNCONDITIONAL jump into that arm's body, so the defensive-fallback block `lower_match_value`
+> emits past the last arm has NO predecessor — it is UNREACHABLE. `rpo_block_order`'s `append_unvisited`
+> still numbers it (keeping the numbering total, so its dead vregs are not dropped), placing it LAST;
+> its own forward jump to the merge block therefore RETREATS by RPO position (`pos(merge) ≤ pos(dead)`)
+> and `has_back_edge` false-tripped on a pure acyclic DAG (the A4-5 `own_match_exit` fixture's
+> KNOWN_STOP). **Fix (A4-6):** `has_back_edge` (and `compute_intervals`/`regalloc_func`) now thread the
+> entry-reachable block set (`reachable_blocks`, the DFS-visited set) and consider a retreating edge a
+> back-edge ONLY when its SOURCE block is reachable — a dead block cannot form a loop the allocator must
+> model. Real `loop` latch→header edges retreat between two reachable blocks and still honest-stop.
+
 Named follow-up: **A3-loop** — live-range holes / interval union over back-edges (the
 standard linear-scan-with-holes extension), landed when A1/A2 exercise `loop` end-to-end through the
 interp. This is stated up front so no one claims A3 covers loops.
