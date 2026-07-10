@@ -113,9 +113,9 @@ type X86MemOp = struct {
      */
     opcode: u32
     /**
-     * byte_reg — the register operand is 8-bit (a byte load's destination or a
-     * byte store's source), so a REX prefix is forced when its id is >= 4
-     * (SIL/DIL/BPL/SPL/R8..R15).
+     * byte_reg — the register operand is 8-bit (a byte store's source; loads
+     * zero-extend via `movzx` into a 32-bit register and never set this), so a
+     * REX prefix is forced when its id is >= 4 (SIL/DIL/BPL/SPL/R8..R15).
      */
     byte_reg: bool
 }
@@ -162,6 +162,19 @@ fn push_imm64_x86(buf: []byte, x: i64) -> []byte {
 }
 
 /**
+ * bit_u32 — a boolean as its 0/1 `u32` value, the bit-assembly primitive the
+ * REX-prefix builder folds into each extension field's shift. Extracted so the
+ * REX byte is composed by shifting these bits into place (bool casts are not in
+ * the bootstrap seed, so `if`-selection stands in for a `bool to u32` cast).
+ *
+ * @param bool flag  the boolean to reduce
+ * @return u32  1 when `flag`, else 0
+ */
+fn bit_u32(flag: bool) -> u32 {
+    if flag { 1 to u32 } else { 0 to u32 }
+}
+
+/**
  * rex_x86 — the REX prefix byte value `0x40 | (W<<3) | (R<<2) | (X<<1) | B`:
  * `W` the 64-bit operand size, `R` the ModRM.reg high bit, `X` the SIB.index
  * high bit, `B` the ModRM.rm / SIB.base / opcode-reg high bit.
@@ -173,11 +186,8 @@ fn push_imm64_x86(buf: []byte, x: i64) -> []byte {
  * @return u32  the REX prefix byte value
  */
 fn rex_x86(w: bool, r: bool, x: bool, b: bool) -> u32 {
-    let wbit = if w { 0x8 to u32 } else { 0 to u32 }
-    let rbit = if r { 0x4 to u32 } else { 0 to u32 }
-    let xbit = if x { 0x2 to u32 } else { 0 to u32 }
-    let bbit = if b { 0x1 to u32 } else { 0 to u32 }
-    (((0x40 to u32) | wbit) | (rbit | xbit)) | bbit
+    let hi = ((0x40 to u32) | (bit_u32(w) << (3 to u32))) | (bit_u32(r) << (2 to u32))
+    (hi | (bit_u32(x) << (1 to u32))) | bit_u32(b)
 }
 
 /**
@@ -467,12 +477,15 @@ fn emit_mem_op_x86(form: X86MemOp, regop: MReg, mem: MMem) -> EncInstX86 {
 }
 
 /**
- * load_memop_x86 — the encoding descriptor for a load width + sign: the plain
- * `mov` size ladder (byte `8A`, word `66 8B`, dword `8B`, qword `REX.W 8B`) for
- * a non-sign-extending load, and the sign-extending `movsxd`(D, `REX.W 63`) /
- * `movsx`(W `REX.W 0F BF`, B `REX.W 0F BE`) forms when `sign` is set. The byte
- * load's destination is 8-bit, so it sets `byte_reg` (the SIL/DIL/BPL/SPL REX
- * trap); the size ladder mirrors the scope's `88/8A` + `0x66` opcode list.
+ * load_memop_x86 — the encoding descriptor for a load width + sign. Non-sign
+ * loads ZERO-EXTEND (the isel's `select_load_x86` contract — `sign=false` loads
+ * zero-extend, matching arm64's zero-extending LDRB/LDRH): dword `mov r32`
+ * (`8B`, the r32 write clears bits 32..63), word `movzx r32, r/m16` (`0F B7`),
+ * byte `movzx r32, r/m8` (`0F B6`), qword `mov r64` (`REX.W 8B`). A plain
+ * `mov r8`/`mov r16` is REJECTED here — it leaves the destination's upper bits
+ * stale, violating the zero-extend contract. Sign loads use `movsxd`(D,
+ * `REX.W 63`) / `movsx`(W `REX.W 0F BF`, B `REX.W 0F BE`). The zero-extending
+ * forms address memory (not an 8-bit register), so none sets `byte_reg`.
  *
  * @param MMemSizeX86 size  the access width (byte/word/dword/qword)
  * @param bool sign  true for a sign-extending narrow load
@@ -489,12 +502,12 @@ fn load_memop_x86(size: MMemSizeX86, sign: bool) -> X86MemOp {
         W => if sign {
             X86MemOp { op66 = false; rexw = true; two_byte = true; opcode = 0xBF to u32; byte_reg = false }
         } else {
-            X86MemOp { op66 = true; rexw = false; two_byte = false; opcode = 0x8B to u32; byte_reg = false }
+            X86MemOp { op66 = false; rexw = false; two_byte = true; opcode = 0xB7 to u32; byte_reg = false }
         }
         B => if sign {
             X86MemOp { op66 = false; rexw = true; two_byte = true; opcode = 0xBE to u32; byte_reg = false }
         } else {
-            X86MemOp { op66 = false; rexw = false; two_byte = false; opcode = 0x8A to u32; byte_reg = true }
+            X86MemOp { op66 = false; rexw = false; two_byte = true; opcode = 0xB6 to u32; byte_reg = false }
         }
     }
 }
