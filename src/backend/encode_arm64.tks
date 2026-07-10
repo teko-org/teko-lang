@@ -1771,10 +1771,16 @@ pub fn encode_func(abi: AbiDescriptor, f: MFunc) -> EncodedFunc | error {
 
 /**
  * Symbol — one symbol-table entry: its name, whether it is defined in this
- * object, which section it lives in (when defined), and its offset within that
- * section. Undefined symbols (the `tk_*` runtime + any not-yet-emitted callee)
- * carry `defined=false`; the relocations reference them by name, the Mach-O
- * writer by table index.
+ * object, which section it lives in (when defined), its offset within that
+ * section, and whether it is file-local. Undefined symbols (the `tk_*` runtime
+ * + any not-yet-emitted callee) carry `defined=false`; the relocations
+ * reference them by name, the Mach-O writer by table index. `local` mirrors
+ * `clang`'s own convention (verified against a reference object): a function
+ * symbol is always global (so the C runtime's `crt0`/other objects can see
+ * it), a rodata symbol is always file-local (so two objects may each define
+ * their own same-named string constant without a duplicate-symbol clash at
+ * link time, Phase E) — `local` is meaningless for an undefined symbol (always
+ * global-external by construction).
  *
  * @since #385 A4-4
  */
@@ -1798,6 +1804,12 @@ pub type Symbol = struct {
      * (meaningful only when `defined`).
      */
     offset: u32
+    /**
+     * local — true iff a defined symbol is file-local (`N_SECT` without
+     * `N_EXT`, and belongs in `LC_DYSYMTAB`'s leading local range); false for a
+     * globally-visible defined symbol or for any undefined symbol.
+     */
+    local: bool
 }
 
 /**
@@ -1822,9 +1834,10 @@ pub type EncodedModule = struct {
      */
     rodata: []byte
     /**
-     * symbols — the symbol table, defined entries first then undefined: one
-     * defined entry per function and per rodata entry, plus one undefined entry
-     * per externally-referenced symbol not defined in-module.
+     * symbols — the symbol table, in Mach-O's required local-then-global-then-
+     * undefined order: one file-local entry per rodata entry, one globally-
+     * visible entry per function, then one undefined entry per externally-
+     * referenced symbol not defined in-module.
      */
     symbols: []Symbol
     /**
@@ -1927,10 +1940,12 @@ fn empty_module_text() -> ModuleText {
 
 /**
  * fold_func_into_text — encode one function and fold it into the running module
- * `__text`: record its defined symbol at the current base (section 1, `__text`),
- * append its words as little-endian bytes, and rebase its relocs by the base.
- * The base advances by the function's byte length (`words.len * 4`). Any named
- * honest-stop from `encode_func` propagates out.
+ * `__text`: record its GLOBAL defined symbol at the current base (section 1,
+ * `__text` — a function must stay globally visible so the C runtime's `crt0`
+ * and other objects can call it), append its words as little-endian bytes, and
+ * rebase its relocs by the base. The base advances by the function's byte
+ * length (`words.len * 4`). Any named honest-stop from `encode_func` propagates
+ * out.
  *
  * @param AbiDescriptor abi  the register file
  * @param ModuleText acc  the running `__text` assembly
@@ -1939,7 +1954,7 @@ fn empty_module_text() -> ModuleText {
  */
 fn fold_func_into_text(abi: AbiDescriptor, acc: ModuleText, f: MFunc) -> ModuleText | error {
     let ef = match encode_func(abi, f) { EncodedFunc as x => x; error as e => return e }
-    let sym = Symbol { name = ef.symbol; defined = true; sect = 1 to u8; offset = acc.base }
+    let sym = Symbol { name = ef.symbol; defined = true; sect = 1 to u8; offset = acc.base; local = false }
     let text = append_words_le(acc.text, ef.words)
     let relocs = rebase_relocs(acc.relocs, ef.relocs, acc.base)
     let syms = teko::list::push(acc.syms, sym)
@@ -2005,8 +2020,11 @@ fn append_bytes(buf: []byte, src: []byte) -> []byte {
 
 /**
  * encode_rodata — build the `__const` image and its defined symbols: each
- * `LRodata` entry is placed at the running byte offset with a defined section-2
- * symbol (the ADRP/ADD-lo relocations in `__text` resolve to it at link time).
+ * `LRodata` entry is placed at the running byte offset with a defined, FILE-
+ * LOCAL section-2 symbol (the ADRP/ADD-lo relocations in `__text` resolve to it
+ * at link time; local mirrors `clang`'s own convention for string constants, so
+ * same-named rodata in two objects never collides at Phase E multi-object
+ * link).
  *
  * @param []lir::LRodata rodata  the module's interned rodata table
  * @return ModuleRodata  the `__const` image + its defined symbols
@@ -2019,7 +2037,7 @@ fn encode_rodata(rodata: []lir::LRodata) -> ModuleRodata {
     loop {
         if i >= rodata.len { break }
         let rd = rodata[i]
-        syms = teko::list::push(syms, Symbol { name = rd.symbol; defined = true; sect = 2 to u8; offset = off })
+        syms = teko::list::push(syms, Symbol { name = rd.symbol; defined = true; sect = 2 to u8; offset = off; local = true })
         bytes = append_bytes(bytes, rd.bytes)
         off = off + (rd.bytes.len to u32)
         i++
@@ -2062,7 +2080,7 @@ fn collect_undefined(defined: []Symbol, relocs: []Reloc) -> []Symbol {
         let name = relocs[i].sym
         let known = name_in_symbols(defined, name) || name_in_symbols(undef, name)
         if !known {
-            undef = teko::list::push(undef, Symbol { name = name; defined = false; sect = 0 to u8; offset = 0 to u32 })
+            undef = teko::list::push(undef, Symbol { name = name; defined = false; sect = 0 to u8; offset = 0 to u32; local = false })
         }
         i++
     }
@@ -2070,8 +2088,9 @@ fn collect_undefined(defined: []Symbol, relocs: []Reloc) -> []Symbol {
 }
 
 /**
- * concat_symbols — append every symbol of `b` to `a` (defined symbols first,
- * then undefined, so the symbol table's three Mach-O ranges stay contiguous).
+ * concat_symbols — append every symbol of `b` to `a`. `encode_module` calls
+ * this twice, in the order that keeps the symbol table's three Mach-O ranges
+ * (local, global-defined, undefined) contiguous.
  *
  * @param []Symbol a  the leading symbols
  * @param []Symbol b  the trailing symbols
@@ -2091,10 +2110,12 @@ fn concat_symbols(a: []Symbol, b: []Symbol) -> []Symbol {
 /**
  * encode_module — encode every `MFunc` of `m`, concatenate their `__text` words
  * into the module image and REBASE each function's reloc offsets by its `__text`
- * base, intern the rodata bytes into `__const`, and build the symbol table (one
- * defined entry per function, one per rodata entry, then one undefined entry per
- * externally-referenced symbol not defined in-module). A module carrying data
- * globals raises the `A4-globals` honest-stop (the N2 subset lowers none); any
+ * base, intern the rodata bytes into `__const`, and build the symbol table in
+ * the Mach-O-required LOCAL-then-GLOBAL-then-UNDEFINED order: one file-local
+ * entry per rodata entry, one globally-visible entry per function, then one
+ * undefined entry per externally-referenced symbol not defined in-module (the
+ * three contiguous ranges `LC_DYSYMTAB` needs). A module carrying data globals
+ * raises the `A4-globals` honest-stop (the N2 subset lowers none); any
  * function's encode honest-stop propagates out unchanged.
  *
  * @param AbiDescriptor abi  the register file
@@ -2106,7 +2127,7 @@ pub fn encode_module(abi: AbiDescriptor, m: MModule) -> EncodedModule | error {
     if m.globals.len > (0 to u64) { return honest_globals() }
     let mt = match encode_functions(abi, m.funcs) { ModuleText as x => x; error as e => return e }
     let rod = encode_rodata(m.rodata)
-    let defined = concat_symbols(mt.syms, rod.syms)
+    let defined = concat_symbols(rod.syms, mt.syms)
     let undef = collect_undefined(defined, mt.relocs)
     let symbols = concat_symbols(defined, undef)
     EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }

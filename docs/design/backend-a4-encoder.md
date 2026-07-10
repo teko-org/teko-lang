@@ -554,9 +554,14 @@ A minimal `MH_OBJECT` (relocatable) Mach-O for arm64, enough for `ld`/`cc` to li
   `reloff`/`nreloc`/`flags`. `__data` (globals) is **deferred** (`A4-globals` honest-stop — the N2
   subset lowers no `LGlobal`, `lir.tks:151`).
 - **`LC_BUILD_VERSION`** — platform `PLATFORM_MACOS = 1` + minos/sdk (modern `ld` wants it).
-- **`LC_SYMTAB`** — the `nlist_64` array + string table: defined symbols (`_main`, each mangled
-  function, each rodata symbol) with `N_SECT | N_EXT`, section index, section-relative value;
-  undefined symbols (`_tk_exit`, any not-yet-emitted callee) with `N_UNDF | N_EXT`, value 0.
+- **`LC_SYMTAB`** — the `nlist_64` array + string table: each defined symbol carries `N_SECT`, its
+  section index, and its ABSOLUTE value (`section.addr + section-relative offset` — NOT the bare
+  offset; a `__const` symbol's `section.addr` is `text_size`, so a bare offset understates it and
+  `ld` hard-rejects the object). Functions (`_main`, each mangled function) additionally carry
+  `N_EXT` (globally visible, so `crt0`/other objects can call them); rodata symbols do NOT (file-local,
+  mirroring `clang`'s own convention for string constants — avoids a duplicate-symbol clash when two
+  objects each define the same-named constant at Phase E link). Undefined symbols (`_tk_exit`, any
+  not-yet-emitted callee) carry `N_UNDF | N_EXT`, value 0.
 - **`LC_DYSYMTAB`** — the ilocalsym/iextdefsym/iundefsym ranges (`ld` requires it even for a static
   object); the writer orders the symbol table {locals, defined-ext, undefined} so the three ranges are
   contiguous.

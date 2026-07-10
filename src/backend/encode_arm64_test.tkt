@@ -1713,10 +1713,11 @@ fn module_concatenates_text_and_rebases_relocs() {
 
 #test
 /**
- * module_symbol_table_is_defined_then_undefined — the two functions become
- * defined `__text` symbols (`f1` at offset 0, `f2` at 12), followed by one
- * undefined symbol per external target (`g`, `tk_exit`) in first-reference
- * order — the defined-then-undefined contract the Mach-O ranges rely on.
+ * module_symbol_table_is_defined_then_undefined — with no rodata (no locals),
+ * the two functions become globally-visible `__text` symbols (`f1` at offset
+ * 0, `f2` at 12), followed by one undefined symbol per external target (`g`,
+ * `tk_exit`) in first-reference order — the local-then-global-then-undefined
+ * contract the Mach-O ranges rely on, degenerate with an empty local range.
  *
  * @return void
  */
@@ -1728,10 +1729,12 @@ fn module_symbol_table_is_defined_then_undefined() {
     teko::assert::is_true(e.symbols.len == 4)
     teko::assert::is_true(e.symbols[0].name == "f1")
     teko::assert::is_true(e.symbols[0].defined)
+    teko::assert::is_false(e.symbols[0].local)
     teko::assert::is_true(e.symbols[0].sect == (1 to u8))
     teko::assert::is_true(e.symbols[0].offset == (0 to u32))
     teko::assert::is_true(e.symbols[1].name == "f2")
     teko::assert::is_true(e.symbols[1].defined)
+    teko::assert::is_false(e.symbols[1].local)
     teko::assert::is_true(e.symbols[1].offset == (12 to u32))
     teko::assert::is_false(e.symbols[2].defined)
     teko::assert::is_true(e.symbols[2].name == "g")
@@ -1776,6 +1779,7 @@ fn module_intra_call_stays_defined() {
     teko::assert::is_true(e.symbols.len == 2)
     teko::assert::is_true(e.symbols[0].name == "f1")
     teko::assert::is_true(e.symbols[0].defined)
+    teko::assert::is_false(e.symbols[0].local)
     teko::assert::is_true(e.symbols[1].name == "f2")
     teko::assert::is_true(e.symbols[1].defined)
     teko::assert::is_true(e.relocs.len == 1)
@@ -1784,9 +1788,60 @@ fn module_intra_call_stays_defined() {
 
 #test
 /**
+ * module_three_funcs_cumulative_rebase — a THIRD function's reloc offset must
+ * include BOTH prior functions' lengths: `f1` (3 words, 12 bytes, one reloc at
+ * function-relative 8), `f2` (1 word, 4 bytes, no reloc), `f3` (1 word, a `bl`
+ * at function-relative 0). The module rebase must land `f3`'s defined symbol at
+ * offset 16 (12+4) and its `bl` reloc at 16 — not just 4 (only `f2`'s length),
+ * the transitive-accumulation case a 2-function fixture cannot distinguish from
+ * a bug that rebases from the IMMEDIATELY-preceding function alone.
+ *
+ * @return void
+ */
+fn module_three_funcs_cumulative_rebase() {
+    let no_uses: []MReg = teko::list::empty()
+    let f1 = one_block_func("f1", i3(movz_inst(true, p(0), 1, 0), movz_inst(true, p(1), 2, 0), ret_inst()))
+    let f2 = one_block_func("f2", i1(movz_inst(true, p(0), 3, 0)))
+    let f3 = one_block_func("f3", i1(call_inst("tk_exit", no_uses, p(0), false, false)))
+    let m = add_mfunc(add_mfunc(add_mfunc(empty_mmodule(), f1), f2), f3)
+    let e = em(m)
+    teko::assert::is_true(e.text.len == (20 to u64))
+    teko::assert::is_true(e.symbols.len == 4)
+    teko::assert::is_true(e.symbols[0].name == "f1")
+    teko::assert::is_true(e.symbols[0].offset == (0 to u32))
+    teko::assert::is_true(e.symbols[1].name == "f2")
+    teko::assert::is_true(e.symbols[1].offset == (12 to u32))
+    teko::assert::is_true(e.symbols[2].name == "f3")
+    teko::assert::is_true(e.symbols[2].offset == (16 to u32))
+    teko::assert::is_true(e.relocs.len == 1)
+    teko::assert::is_true(e.relocs[0].offset == (16 to u32))
+    teko::assert::is_true(e.relocs[0].sym == "tk_exit")
+}
+
+#test
+/**
+ * empty_module_encodes_to_empty_everything — a module with no functions, no
+ * rodata, and no globals encodes to an empty `__text`/`__const`, an empty
+ * symbol table, and no relocations (the degenerate base case of the module
+ * fold, exercised end to end rather than assumed).
+ *
+ * @return void
+ */
+fn empty_module_encodes_to_empty_everything() {
+    let e = em(empty_mmodule())
+    teko::assert::is_true(e.text.len == 0)
+    teko::assert::is_true(e.rodata.len == 0)
+    teko::assert::is_true(e.symbols.len == 0)
+    teko::assert::is_true(e.relocs.len == 0)
+}
+
+#test
+/**
  * module_interns_rodata_into_const — a rodata entry becomes `__const` bytes plus
- * a defined section-2 symbol at its offset; a second entry is placed after the
- * first, its symbol offset the first entry's byte length.
+ * a defined, FILE-LOCAL section-2 symbol at its offset; a second entry is
+ * placed after the first, its symbol offset the first entry's byte length. The
+ * two file-local rodata symbols sort BEFORE the globally-visible function
+ * symbol (`s0`,`s1`,`main` — the local-then-global order `LC_DYSYMTAB` needs).
  *
  * @return void
  */
@@ -1800,12 +1855,18 @@ fn module_interns_rodata_into_const() {
     teko::assert::is_true(e.rodata.len == (5 to u64))
     teko::assert::is_true(e.rodata[0] == (0x68 to byte))
     teko::assert::is_true(e.symbols.len == 3)
-    teko::assert::is_true(e.symbols[1].name == "s0")
-    teko::assert::is_true(e.symbols[1].defined)
-    teko::assert::is_true(e.symbols[1].sect == (2 to u8))
-    teko::assert::is_true(e.symbols[1].offset == (0 to u32))
-    teko::assert::is_true(e.symbols[2].name == "s1")
-    teko::assert::is_true(e.symbols[2].offset == (3 to u32))
+    teko::assert::is_true(e.symbols[0].name == "s0")
+    teko::assert::is_true(e.symbols[0].defined)
+    teko::assert::is_true(e.symbols[0].local)
+    teko::assert::is_true(e.symbols[0].sect == (2 to u8))
+    teko::assert::is_true(e.symbols[0].offset == (0 to u32))
+    teko::assert::is_true(e.symbols[1].name == "s1")
+    teko::assert::is_true(e.symbols[1].local)
+    teko::assert::is_true(e.symbols[1].offset == (3 to u32))
+    teko::assert::is_true(e.symbols[2].name == "main")
+    teko::assert::is_true(e.symbols[2].defined)
+    teko::assert::is_false(e.symbols[2].local)
+    teko::assert::is_true(e.symbols[2].sect == (1 to u8))
 }
 
 #test

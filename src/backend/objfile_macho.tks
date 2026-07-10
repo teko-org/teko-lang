@@ -132,9 +132,8 @@ fn build_strtab(symbols: []Symbol) -> StrTab {
 }
 
 /**
- * count_defined — the number of defined symbols in `symbols` (the leading run of
- * the defined-then-undefined table): `LC_DYSYMTAB`'s `nextdefsym`, and the start
- * index of the undefined range (`iundefsym`).
+ * count_defined — the number of defined symbols in `symbols` (local + global):
+ * the start index of the undefined range (`iundefsym`).
  *
  * @param []Symbol symbols  the symbol table
  * @return u32  the count of `defined` symbols
@@ -145,6 +144,25 @@ fn count_defined(symbols: []Symbol) -> u32 {
     loop {
         if i >= symbols.len { break }
         if symbols[i].defined { n = n + (1 to u32) }
+        i++
+    }
+    n
+}
+
+/**
+ * count_local — the number of file-local defined symbols in `symbols` (the
+ * leading run of the local-then-global-then-undefined table): `LC_DYSYMTAB`'s
+ * `nlocalsym`, and the start index of the global-defined range (`iextdefsym`).
+ *
+ * @param []Symbol symbols  the symbol table
+ * @return u32  the count of `defined && local` symbols
+ */
+fn count_local(symbols: []Symbol) -> u32 {
+    mut n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        if symbols[i].defined && symbols[i].local { n = n + (1 to u32) }
         i++
     }
     n
@@ -265,10 +283,15 @@ type MachoLayout = struct {
      */
     strtab_size: u32
     /**
-     * ndef — the number of defined symbols (`nextdefsym`; the undefined range
-     * starts here).
+     * ndef — the number of defined symbols, local + global (the undefined
+     * range starts here: `iundefsym`).
      */
     ndef: u32
+    /**
+     * nlocal — the number of file-local defined symbols (`nlocalsym`; the
+     * global-defined range starts here: `iextdefsym`).
+     */
+    nlocal: u32
     /**
      * nundef — the number of undefined symbols (`nundefsym`).
      */
@@ -303,6 +326,7 @@ fn compute_macho_layout(enc: EncodedModule, strtab_size: u32) -> MachoLayout {
     let nsyms = enc.symbols.len to u32
     let symtab_end = symtab_offset + (nsyms * (16 to u32))
     let ndef = count_defined(enc.symbols)
+    let nlocal = count_local(enc.symbols)
     MachoLayout {
         nsects = nsects
         sizeofcmds = sizeofcmds
@@ -317,6 +341,7 @@ fn compute_macho_layout(enc: EncodedModule, strtab_size: u32) -> MachoLayout {
         strtab_offset = symtab_end
         strtab_size = strtab_size
         ndef = ndef
+        nlocal = nlocal
         nundef = nsyms - ndef
     }
 }
@@ -442,21 +467,23 @@ fn emit_symtab_cmd(buf: []byte, lay: MachoLayout) -> []byte {
 
 /**
  * emit_dysymtab_cmd — the `LC_DYSYMTAB` load command (80 bytes): the three
- * contiguous symbol ranges (no locals; the defined-external run then the
- * undefined run) and the twelve unused table pointers (all zero). `ld` requires
- * this command even for a static object.
+ * contiguous symbol ranges — local (`ilocalsym=0`/`nlocalsym`), global-defined
+ * (`iextdefsym=nlocal`/`nextdefsym`), undefined (`iundefsym=ndef`/`nundefsym`)
+ * — and the twelve unused table pointers (all zero). `ld` requires this command
+ * even for a static object.
  *
  * @param []byte buf  the buffer to extend
  * @param MachoLayout lay  the resolved layout
  * @return []byte  `buf` followed by the 80-byte dysymtab command
  */
 fn emit_dysymtab_cmd(buf: []byte, lay: MachoLayout) -> []byte {
+    let nextdef = lay.ndef - lay.nlocal
     mut b = emit_u32_le(buf, 0x0B to u32)
     b = emit_u32_le(b, 80 to u32)
     b = emit_u32_le(b, 0 to u32)
-    b = emit_u32_le(b, 0 to u32)
-    b = emit_u32_le(b, 0 to u32)
-    b = emit_u32_le(b, lay.ndef)
+    b = emit_u32_le(b, lay.nlocal)
+    b = emit_u32_le(b, lay.nlocal)
+    b = emit_u32_le(b, nextdef)
     b = emit_u32_le(b, lay.ndef)
     b = emit_u32_le(b, lay.nundef)
     mut i: u32 = 0
@@ -494,20 +521,42 @@ fn emit_reloc_table(buf: []byte, enc: EncodedModule) -> []byte {
 }
 
 /**
+ * section_addr — the `section_64` `addr` (vm address, section-relative to 0)
+ * of a 1-based Mach-O section index: 0 for `__text` (section 1), `text_size`
+ * for `__const` (section 2, laid out immediately after `__text` — the same
+ * value `emit_segment` gives that section's `addr` field). An `nlist_64`
+ * `n_value` is the symbol's ABSOLUTE address, `section_addr + Symbol.offset` —
+ * NOT the bare section-relative offset (the F1 fix: a bare offset understates
+ * every `__const` symbol by `text_size`, which `ld` hard-rejects).
+ *
+ * @param u8 sect  the 1-based section index (1 or 2)
+ * @param u32 text_size  the `__text` section's byte size
+ * @return u32  the section's vm address
+ */
+fn section_addr(sect: u8, text_size: u32) -> u32 {
+    if sect == (2 to u8) { return text_size }
+    0 to u32
+}
+
+/**
  * emit_one_symbol — one `nlist_64` (16 bytes): the `n_strx` name offset, then
- * the type/section/value pair — a defined symbol is `N_SECT | N_EXT` (0x0F) in
- * its section at its section offset, an undefined symbol is `N_UNDF | N_EXT`
- * (0x01) with section 0 and value 0. `n_desc` is always 0.
+ * the type/section/value triple — a defined symbol is `N_SECT` (0x0E), plus
+ * `N_EXT` (making it `0x0F`) unless `local`, in its section at its ABSOLUTE
+ * address (`section_addr(s.sect, text_size) + s.offset`, the F1 fix); an
+ * undefined symbol is `N_UNDF | N_EXT` (0x01) with section 0 and value 0.
+ * `n_desc` is always 0.
  *
  * @param []byte buf  the buffer to extend
  * @param Symbol s  the symbol to emit
  * @param u32 strx  the symbol's name offset in the string table
+ * @param u32 text_size  the `__text` section's byte size (for `__const`'s addr)
  * @return []byte  `buf` followed by the 16-byte `nlist_64`
  */
-fn emit_one_symbol(buf: []byte, s: Symbol, strx: u32) -> []byte {
+fn emit_one_symbol(buf: []byte, s: Symbol, strx: u32, text_size: u32) -> []byte {
     mut b = emit_u32_le(buf, strx)
     if s.defined {
-        b = emit_u8_field(b, 0x0F to u32)
+        let ntype = if s.local { 0x0E to u32 } else { 0x0F to u32 }
+        b = emit_u8_field(b, ntype)
         b = emit_u8_field(b, s.sect to u32)
     } else {
         b = emit_u8_field(b, 0x01 to u32)
@@ -515,25 +564,27 @@ fn emit_one_symbol(buf: []byte, s: Symbol, strx: u32) -> []byte {
     }
     b = teko::list::push(b, 0 to byte)
     b = teko::list::push(b, 0 to byte)
-    let value = if s.defined { s.offset to u64 } else { 0 to u64 }
+    let value = if s.defined { (section_addr(s.sect, text_size) + s.offset) to u64 } else { 0 to u64 }
     emit_u64_le(b, value)
 }
 
 /**
  * emit_symtab — the `nlist_64` symbol table: one entry per symbol, in
- * defined-then-undefined order, each carrying its string-table name offset.
+ * local-then-global-then-undefined order, each carrying its string-table name
+ * offset and its section-absolute address.
  *
  * @param []byte buf  the buffer to extend
  * @param []Symbol symbols  the symbol table
  * @param StrTab strtab  the string table (for the per-symbol name offsets)
+ * @param u32 text_size  the `__text` section's byte size (for `__const`'s addr)
  * @return []byte  `buf` followed by the symbol-table entries
  */
-fn emit_symtab(buf: []byte, symbols: []Symbol, strtab: StrTab) -> []byte {
+fn emit_symtab(buf: []byte, symbols: []Symbol, strtab: StrTab, text_size: u32) -> []byte {
     mut b = buf
     mut i: u64 = 0
     loop {
         if i >= symbols.len { break }
-        b = emit_one_symbol(b, symbols[i], strtab.strx[i])
+        b = emit_one_symbol(b, symbols[i], strtab.strx[i], text_size)
         i++
     }
     b
@@ -566,6 +617,6 @@ pub fn emit_macho(enc: EncodedModule) -> []byte {
     b = pad_to_mult(b, 4 to u32)
     b = emit_reloc_table(b, enc)
     b = pad_to_mult(b, 8 to u32)
-    b = emit_symtab(b, enc.symbols, strtab)
+    b = emit_symtab(b, enc.symbols, strtab, lay.text_size)
     append_bytes(b, strtab.bytes)
 }

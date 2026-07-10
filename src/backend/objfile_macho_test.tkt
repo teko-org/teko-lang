@@ -216,9 +216,13 @@ fn mo_rodata_module() -> MModule {
 /**
  * rodata_module_emits_const_section — a module with rodata emits a two-section
  * segment: `__text` (4 bytes, no relocations) plus `__const` (3 bytes at file
- * offset 396), the 3 rodata bytes are `hi\0`, the seg-data-to-reloc gap is
- * zero-padded (offset 399 → 400), and both `main` and `s0` are defined symbols
- * (sections 1 and 2). The whole object is 443 bytes.
+ * offset 396), the 3 rodata bytes are `hi\0`, the seg-data-to-symtab gap is
+ * zero-padded (offset 399 → 400). The symbol table is LOCAL-then-GLOBAL: `s0`
+ * (rodata) is `N_SECT` only (0x0E, no `N_EXT`) with `n_value = text_size + 0 =
+ * 4` (the F1 fix — an ABSOLUTE address, not a bare section-relative offset);
+ * `main` is `N_SECT | N_EXT` (0x0F) with `n_value = 0`. `LC_DYSYMTAB` reports
+ * `nlocalsym=1`/`iextdefsym=1`/`nextdefsym=1`/`nundefsym=0`. The string table
+ * lists `_s0` before `_main` (locals first). The whole object is 443 bytes.
  *
  * @return void
  */
@@ -239,18 +243,34 @@ fn rodata_module_emits_const_section() {
     teko::assert::is_true(obj[397] == (0x69 to byte))
     teko::assert::is_true(obj[398] == (0 to byte))
     teko::assert::is_true(obj[399] == (0 to byte))
-    teko::assert::is_true(mo_u32_at(obj, 332 to u64) == (2 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 324 to u64) == (1 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 328 to u64) == (1 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 332 to u64) == (1 to u32))
     teko::assert::is_true(mo_u32_at(obj, 340 to u64) == (0 to u32))
+    teko::assert::is_true(obj[404] == (0x0E to byte))
+    teko::assert::is_true(obj[405] == (2 to byte))
+    teko::assert::is_true(mo_u32_at(obj, 408 to u64) == (4 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 412 to u64) == (0 to u32))
+    teko::assert::is_true(obj[420] == (0x0F to byte))
+    teko::assert::is_true(obj[421] == (1 to byte))
+    teko::assert::is_true(mo_u32_at(obj, 424 to u64) == (0 to u32))
+    teko::assert::is_true(obj[433] == (0x5F to byte))
+    teko::assert::is_true(obj[434] == (0x73 to byte))
+    teko::assert::is_true(obj[435] == (0x30 to byte))
+    teko::assert::is_true(obj[436] == (0 to byte))
+    teko::assert::is_true(obj[437] == (0x5F to byte))
+    teko::assert::is_true(obj[438] == (0x6D to byte))
 }
 
 /**
- * mo_two_syms — a two-entry defined symbol list, for the `sym_index` fixtures.
+ * mo_two_syms — a two-entry defined, global symbol list, for the `sym_index`
+ * fixtures.
  *
- * @return []Symbol  `[a, b]`, both defined
+ * @return []Symbol  `[a, b]`, both defined and global
  */
 fn mo_two_syms() -> []Symbol {
-    let a = Symbol { name = "a"; defined = true; sect = 1 to u8; offset = 0 to u32 }
-    let b = Symbol { name = "b"; defined = true; sect = 1 to u8; offset = 0 to u32 }
+    let a = Symbol { name = "a"; defined = true; sect = 1 to u8; offset = 0 to u32; local = false }
+    let b = Symbol { name = "b"; defined = true; sect = 1 to u8; offset = 0 to u32; local = false }
     teko::list::push(teko::list::push(teko::list::empty(), a), b)
 }
 
@@ -307,27 +327,67 @@ fn pad_to_mult_rounds_up() {
     teko::assert::is_true(already.len == (8 to u64))
 }
 
-#test
 /**
- * emit_relocs_all_three_kinds — an object whose `__text` carries an `adrp`,
- * `add-lo`, and `bl` emits three `relocation_info` entries, exercising the
- * PAGE21/PAGEOFF12/BRANCH26 encoders and the defined/undefined symbol indices
- * (the ADRP/ADD-lo target a defined `__const` symbol, the BL an undefined one).
+ * mo_rodata_reloc_module — a frameless `main` of `adrp x0,"s0"; add-lo
+ * x0,x0,"s0"; bl tk_exit` (no `ret`, so it stays frameless) plus one rodata
+ * entry `s0 = "A\0"`. Exercises all three ARM64 relocation kinds against both
+ * a DEFINED (`s0`, local `__const`) and an UNDEFINED (`tk_exit`) target in one
+ * object — the F2(a) round-trip fixture.
  *
- * @return void
+ * @return MModule  the one-function, one-rodata, three-reloc module
  */
-fn emit_relocs_all_three_kinds() {
+fn mo_rodata_reloc_module() -> MModule {
     let insts = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), adrp_inst(mo_gpr(0), "s0", MRelocKind::PageHi)), add_lo_inst(mo_gpr(0), mo_gpr(0), "s0", MRelocKind::PageLo)), call_inst("tk_exit", mo_no_uses(), mo_gpr(0), false, false))
     let bytes = teko::list::push(teko::list::push(teko::list::empty(), 0x41 to byte), 0 to byte)
     let rodata = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "s0"; bytes = bytes })
     let funcs = teko::list::push(teko::list::empty(), mo_func("main", insts))
-    let m = MModule { funcs = funcs; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
-    let enc = match encode_module(aapcs64(), m) {
+    MModule { funcs = funcs; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+#test
+/**
+ * rodata_reloc_module_pins_symtab_and_page_relocs — the F1/F2/F3 round-trip
+ * pin: `s0` (local, `__const`) carries `n_value = text_size(12) + 0 = 12` (the
+ * F1 fix — the ABSOLUTE address, not the bare offset 0 the pre-fix writer
+ * emitted) and `N_SECT`-only type `0x0E` (the F3 local-symbol fix); `main`
+ * (global, `__text`) stays `N_SECT | N_EXT` (0x0F) at `n_value = 0`. The three
+ * `relocation_info` words are byte-pinned: `PAGE21`→s0 (`0x3D000000`,
+ * pc-relative, symbol index 0), `PAGEOFF12`→s0 (`0x4C000000`, absolute, same
+ * index), `BRANCH26`→tk_exit (`0x2D000002`, pc-relative, symbol index 2 — the
+ * undefined entry sorts after the two defined ones). `LC_DYSYMTAB` reports
+ * `nlocalsym=1`/`nextdefsym=1`/`nundefsym=1`. The whole object is 500 bytes.
+ *
+ * @return void
+ */
+fn rodata_reloc_module_pins_symtab_and_page_relocs() {
+    let enc = match encode_module(aapcs64(), mo_rodata_reloc_module()) {
         EncodedModule as x => x
         error as e => bad_enc()
     }
     teko::assert::is_true(enc.relocs.len == 3)
-    teko::assert::is_true(mo_u32_at(emit_macho(enc), 160 to u64) > (0 to u32))
+    teko::assert::is_true(enc.symbols.len == 3)
+    let obj = emit_macho(enc)
+    teko::assert::is_true(obj.len == (500 to u64))
+    teko::assert::is_true(mo_u32_at(obj, 324 to u64) == (1 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 328 to u64) == (1 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 332 to u64) == (1 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 336 to u64) == (2 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 340 to u64) == (1 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 408 to u64) == (0 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 412 to u64) == (0x3D000000 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 416 to u64) == (4 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 420 to u64) == (0x4C000000 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 424 to u64) == (8 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 428 to u64) == (0x2D000002 to u32))
+    teko::assert::is_true(obj[436] == (0x0E to byte))
+    teko::assert::is_true(obj[437] == (2 to byte))
+    teko::assert::is_true(mo_u32_at(obj, 440 to u64) == (12 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 444 to u64) == (0 to u32))
+    teko::assert::is_true(obj[452] == (0x0F to byte))
+    teko::assert::is_true(obj[453] == (1 to byte))
+    teko::assert::is_true(mo_u32_at(obj, 456 to u64) == (0 to u32))
+    teko::assert::is_true(obj[468] == (0x01 to byte))
+    teko::assert::is_true(obj[469] == (0 to byte))
 }
 
 /**
@@ -340,3 +400,53 @@ fn bad_enc() -> EncodedModule {
     EncodedModule { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
 }
 
+#test
+/**
+ * empty_module_emits_a_minimal_valid_object — a module with no functions, no
+ * rodata, and no globals still emits a well-formed (if degenerate) object: one
+ * `__text` section of size 0, zero relocations, zero symbols, and a 1-byte
+ * string table (just the reserved leading NUL) — the F2(d) base-case golden,
+ * exercised end to end through `emit_macho` rather than assumed.
+ *
+ * @return void
+ */
+fn empty_module_emits_a_minimal_valid_object() {
+    let enc = match encode_module(aapcs64(), empty_mmodule()) {
+        EncodedModule as x => x
+        error as e => bad_enc()
+    }
+    let obj = emit_macho(enc)
+    teko::assert::is_true(obj.len == (313 to u64))
+    teko::assert::is_true(mo_u32_at(obj, 0 to u64) == (0xFEEDFACF to u32))
+    teko::assert::is_true(mo_u32_at(obj, 96 to u64) == (1 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 144 to u64) == (0 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 152 to u64) == (312 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 164 to u64) == (0 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 220 to u64) == (0 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 240 to u64) == (0 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 244 to u64) == (0 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 252 to u64) == (0 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 256 to u64) == (0 to u32))
+    teko::assert::is_true(mo_u32_at(obj, 260 to u64) == (0 to u32))
+    teko::assert::is_true(obj[312] == (0 to byte))
+}
+
+#test
+/**
+ * dump_rodata_object_for_host_validation — TEMPORARY dev-dump (removed before
+ * commit): writes the rodata-bearing object to the scratchpad so the host
+ * toolchain (`otool`/`nm`/`ld -r`) can validate the F1 n_value fix.
+ *
+ * @return void
+ */
+fn dump_rodata_object_for_host_validation() {
+    let enc = match encode_module(aapcs64(), mo_rodata_reloc_module()) {
+        EncodedModule as x => x
+        error as e => bad_enc()
+    }
+    let obj = emit_macho(enc)
+    match teko::io::write_file_bytes("/private/tmp/claude-501/-Users-schivei-projects-teko-lang/ec6e34d6-eebf-45f2-88ba-51eb5c2fb12d/scratchpad/a44-rodata.o", obj) {
+        error as e => teko::assert::is_true(false)
+        null => teko::assert::is_true(true)
+    }
+}
