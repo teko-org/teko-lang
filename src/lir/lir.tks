@@ -74,8 +74,56 @@ pub type LJump = struct { target: u32; args: []u32 }
     target block + its block-args. N1 does not emit branches; declared for N2. */
 pub type LBranch = struct { cond: u32; t_target: u32; t_args: []u32; f_target: u32; f_args: []u32 }
 
+/** LAlloca — reserve a stack slot of `bytes` size and `align` alignment, yielding its
+    address as a Ptr VReg. The lowering computes bytes/align from the struct-layout table;
+    the address is the base an aggregate's field stores and loads key off (A1-3, #382). */
+pub type LAlloca = struct { bytes: u32; align: u32 }
+
+/** LFieldAddr — the address of a field inside an aggregate: `base + offset`, a Ptr VReg.
+    `offset` is a COMPILE-TIME CONSTANT byte offset (from the struct-layout table, or a
+    constant-folded array/slice index times its element stride); a DYNAMIC index instead
+    multiplies through an ordinary `IMul` then `IAdd`s onto the base — this op only ever
+    carries a static offset (A1-3, #382). */
+pub type LFieldAddr = struct { base: u32; offset: u32 }
+
+/** LLoad — load a value of machine class `ty` from address `addr` (a Ptr VReg), yielding
+    the value (A1-3, #382). */
+pub type LLoad = struct { addr: u32; ty: LType }
+
+/** LStore — store `value` (of machine class `ty`) to address `addr` (a Ptr VReg); yields
+    no value (A1-3, #382). */
+pub type LStore = struct { addr: u32; value: u32; ty: LType }
+
+/** LGlobalAddr — the address of a named global/rodata symbol (a Ptr VReg). String literals
+    intern their bytes into the module's rodata table (`LRodata`) and reference the entry here;
+    the symbol is already the final linker name (the LIR never re-mangles, mirroring `LCall`)
+    (A1-4, #382). */
+pub type LGlobalAddr = struct { symbol: str }
+
+/**
+ * LCallIndirect — call the function whose address is `target` (a Ptr VReg)
+ * with `args`. The vtable-dispatch path (A1-6) loads the slot address
+ * (base=vtable, offset=`slot*ptr-size`) then calls through it, `data`
+ * prepended as the first arg; the closure path (A1-7) calls the closure's
+ * function-pointer field the same way. `has_result`/`result` live on the
+ * enclosing `LInst`, exactly as for `LCall`.
+ *
+ * @since #382 A1-6
+ */
+pub type LCallIndirect = struct { target: u32; args: []u32; variadic: bool }
+
+/**
+ * LFuncAddr — the address of a named function (a Ptr VReg): a function used
+ * as a VALUE (`TVar.is_func`) or the callable slot of a closure/thunk literal
+ * (`TLambda`). Distinct from `LGlobalAddr` so isel emits a text-section
+ * relocation, not a data one.
+ *
+ * @since #382 A1-7
+ */
+pub type LFuncAddr = struct { symbol: str }
+
 /** LOp — the instruction payload (one of the operation cases above). */
-pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch
+pub type LOp = variant LConstInt | LConstFloat | LBin | LUn | LCall | LParam | LRet | LJump | LBranch | LAlloca | LFieldAddr | LLoad | LStore | LGlobalAddr | LCallIndirect | LFuncAddr
 
 /** LInst — one instruction: the VReg it defines (has_result=false for terminators
     and void calls), its op, and the source position propagated from the TExpr (for
@@ -92,13 +140,23 @@ pub type LBlock = struct { id: u32; params: []u32; insts: []LInst }
     during lowering (functional threading — no mutable module state). */
 pub type LFunc = struct { symbol: str; n_params: u32; param_types: []LType; ret_type: LType; blocks: []LBlock; next_vreg: u32 }
 
-/** LModule — the whole lowered program: its functions. Structs/globals/rodata
-    enter in N2. */
-pub type LModule = struct { funcs: []LFunc }
+/** LRodata — one read-only data entry: its already-final symbol + the raw bytes (a string
+    literal's UTF-8, or an interpolation piece's UTF-8). Referenced by `LGlobalAddr`
+    (A1-4, #382). */
+pub type LRodata = struct { symbol: str; bytes: []byte }
 
-/** empty_module — a module with no functions (the lowering seed). */
+/** LGlobal — one mutable/immutable top-level datum: its symbol, machine class, and
+    initializer image. No A1-4 lowering produces one yet (top-level consts are a later
+    construct); the field exists now so `LModule` widens only once (A1-4, #382). */
+pub type LGlobal = struct { symbol: str; ty: LType; bytes: []byte }
+
+/** LModule — the whole lowered program: its functions, its rodata + global tables, and the
+    struct-layout table (A1-3/A1-4, #382). */
+pub type LModule = struct { funcs: []LFunc; rodata: []LRodata; globals: []LGlobal; layouts: []LStructLayout }
+
+/** empty_module — a module with no functions/rodata/globals/layouts (the lowering seed). */
 pub fn empty_module() -> LModule {
-    LModule { funcs = teko::list::empty() }
+    LModule { funcs = teko::list::empty(); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
 }
 
 /** new_func — a fresh LFunc with an empty single block (#B0) reserving VRegs
@@ -162,6 +220,94 @@ pub fn ret_void_inst(line: u32, col: u32) -> LInst {
     LInst { result = 0; has_result = false; op = LRet { has_value = false; value = 0 }; line = line; col = col }
 }
 
+/** jump_inst — an unconditional `jump #Btarget(args)` terminator carrying block-args (the
+    SSA-lite merge). */
+pub fn jump_inst(target: u32, args: []u32, line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LJump { target = target; args = args }; line = line; col = col }
+}
+
+/** branch_inst — a conditional `branch %cond, #Bt(targs), #Bf(fargs)` terminator. */
+pub fn branch_inst(cond: u32, t_target: u32, t_args: []u32, f_target: u32, f_args: []u32, line: u32, col: u32) -> LInst {
+    LInst {
+        result = 0; has_result = false
+        op = LBranch { cond = cond; t_target = t_target; t_args = t_args; f_target = f_target; f_args = f_args }
+        line = line; col = col
+    }
+}
+
+/** alloca_inst — a `%r = alloca <bytes>, align <align>` instruction (A1-3, #382). */
+pub fn alloca_inst(result: u32, bytes: u32, align: u32, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LAlloca { bytes = bytes; align = align }; line = line; col = col }
+}
+
+/** field_addr_inst — a `%r = field_addr %base, <offset>` instruction: the address `offset`
+    bytes past `base` (A1-3, #382). */
+pub fn field_addr_inst(result: u32, base: u32, offset: u32, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LFieldAddr { base = base; offset = offset }; line = line; col = col }
+}
+
+/** load_inst — a `%r = load.<ty> %addr` instruction (A1-3, #382). */
+pub fn load_inst(result: u32, addr: u32, ty: LType, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LLoad { addr = addr; ty = ty }; line = line; col = col }
+}
+
+/** store_inst — a `store.<ty> %addr, %value` instruction; yields no value (A1-3, #382). */
+pub fn store_inst(addr: u32, value: u32, ty: LType, line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LStore { addr = addr; value = value; ty = ty }; line = line; col = col }
+}
+
+/** global_addr_inst — a `%r = global_addr @<symbol>` instruction: the address of a rodata/
+    global entry (A1-4, #382). */
+pub fn global_addr_inst(result: u32, symbol: str, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LGlobalAddr { symbol = symbol }; line = line; col = col }
+}
+
+/**
+ * call_indirect_inst — a value-producing `%r = call.indirect %target(args)`
+ * instruction (A1-6, #382).
+ *
+ * @param u32 result    the VReg the call's return value is stored into
+ * @param u32 target    the VReg holding the callee's address
+ * @param []u32 args    the (already-lowered) argument VRegs, in order
+ * @param bool variadic whether the callee's variadic marker is set
+ * @param u32 line      the source line (propagated for the `.tsym` map)
+ * @param u32 col       the source column (propagated for the `.tsym` map)
+ * @return LInst  the built instruction
+ */
+pub fn call_indirect_inst(result: u32, target: u32, args: []u32, variadic: bool, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LCallIndirect { target = target; args = args; variadic = variadic }; line = line; col = col }
+}
+
+/**
+ * void_call_indirect_inst — a `call.indirect %target(args)` instruction that
+ * yields no value (a statement-level interface/closure call) (A1-6, #382).
+ *
+ * @param u32 target    the VReg holding the callee's address
+ * @param []u32 args    the (already-lowered) argument VRegs, in order
+ * @param bool variadic whether the callee's variadic marker is set
+ * @param u32 line      the source line (propagated for the `.tsym` map)
+ * @param u32 col       the source column (propagated for the `.tsym` map)
+ * @return LInst  the built instruction
+ */
+pub fn void_call_indirect_inst(target: u32, args: []u32, variadic: bool, line: u32, col: u32) -> LInst {
+    LInst { result = 0; has_result = false; op = LCallIndirect { target = target; args = args; variadic = variadic }; line = line; col = col }
+}
+
+/**
+ * func_addr_inst — a `%r = funcaddr @<symbol>` instruction: the address of a
+ * named function used as a value (A1-7, #382).
+ *
+ * @param u32 result  the VReg the resolved address is stored into
+ * @param str symbol  the target function's already-mangled (or lifted)
+ *                     symbol
+ * @param u32 line  the source line (propagated for the `.tsym` map)
+ * @param u32 col  the source column (propagated for the `.tsym` map)
+ * @return LInst  the built instruction
+ */
+pub fn func_addr_inst(result: u32, symbol: str, line: u32, col: u32) -> LInst {
+    LInst { result = result; has_result = true; op = LFuncAddr { symbol = symbol }; line = line; col = col }
+}
+
 /** push_inst_block — a fresh block with `inst` appended to its instruction stream. */
 fn push_inst_block(b: LBlock, inst: LInst) -> LBlock {
     LBlock { id = b.id; params = b.params; insts = teko::list::push(b.insts, inst) }
@@ -198,5 +344,238 @@ pub fn alloc_vreg(f: LFunc) -> FreshVReg {
 
 /** add_func — return a copy of `m` with `f` appended. */
 pub fn add_func(m: LModule, f: LFunc) -> LModule {
-    LModule { funcs = teko::list::push(m.funcs, f) }
+    LModule { funcs = teko::list::push(m.funcs, f); rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+}
+
+/**
+ * rename_lfunc — a copy of `f` with its symbol replaced by `symbol` (every
+ * other field unchanged). A lifted closure/lambda body's FINAL symbol is only
+ * known once its OWN body has finished lowering (a NESTED lambda inside it
+ * may reserve ids first, A1-7 #382), so it is built with a placeholder
+ * symbol and renamed here once its real id is known.
+ *
+ * @param LFunc f  the function to rename
+ * @param str symbol  its final symbol
+ * @return LFunc  `f` with `symbol` replacing its own
+ */
+pub fn rename_lfunc(f: LFunc, symbol: str) -> LFunc {
+    LFunc { symbol = symbol; n_params = f.n_params; param_types = f.param_types; ret_type = f.ret_type; blocks = f.blocks; next_vreg = f.next_vreg }
+}
+
+/** add_layout — return a copy of `m` with the struct layout `l` appended. */
+pub fn add_layout(m: LModule, l: LStructLayout) -> LModule {
+    LModule { funcs = m.funcs; rodata = m.rodata; globals = m.globals; layouts = teko::list::push(m.layouts, l) }
+}
+
+/** add_rodata — return a copy of `m` with the rodata entry `r` appended (A1-4, #382). */
+pub fn add_rodata(m: LModule, r: LRodata) -> LModule {
+    LModule { funcs = m.funcs; rodata = teko::list::push(m.rodata, r); globals = m.globals; layouts = m.layouts }
+}
+
+/** add_global — return a copy of `m` with the global entry `g` appended (A1-4, #382). */
+pub fn add_global(m: LModule, g: LGlobal) -> LModule {
+    LModule { funcs = m.funcs; rodata = m.rodata; globals = teko::list::push(m.globals, g); layouts = m.layouts }
+}
+
+/** with_rodata — return a copy of `m` with its ENTIRE rodata table replaced by `rodata`
+    (used once, at the end of `lower_program`, to fold the whole-program interned-string
+    table the per-function lowering accumulated — A1-4, #382). */
+pub fn with_rodata(m: LModule, rodata: []LRodata) -> LModule {
+    LModule { funcs = m.funcs; rodata = rodata; globals = m.globals; layouts = m.layouts }
+}
+
+/** BlockRef — a freshly-allocated block's id + the function that reserved it (a plain
+    zero-param block — the then/else/head/exit arms a control-flow construct switches into;
+    a MERGE block additionally gets a block-arg via add_block_param). */
+pub type BlockRef = struct { func: LFunc; block_id: u32 }
+
+/** alloc_block — reserve a fresh empty block (no params) in `f`, appended after its
+    existing blocks. Block ids are dense and sequential: `f.blocks.len` IS the next free id
+    (the entry block #B0 is the only one `new_func` reserves, so the first `alloc_block`
+    yields #B1). */
+pub fn alloc_block(f: LFunc) -> BlockRef {
+    let id = f.blocks.len to u32
+    let b = LBlock { id = id; params = teko::list::empty(); insts = teko::list::empty() }
+    let widened = LFunc {
+        symbol = f.symbol; n_params = f.n_params; param_types = f.param_types; ret_type = f.ret_type
+        blocks = teko::list::push(f.blocks, b); next_vreg = f.next_vreg
+    }
+    BlockRef { func = widened; block_id = id }
+}
+
+/** BlockParam — a fresh block-arg reserved on an existing block: its VReg + the advanced
+    function (the block's params list gains exactly one more slot, positionally matching
+    the jump/branch edges that target it). */
+pub type BlockParam = struct { func: LFunc; vreg: u32 }
+
+/** add_block_param — reserve a fresh VReg and append it as a block-arg (an SSA-lite merge
+    parameter) on the block whose id is `block_id`. A merge block gets exactly one call to
+    this per value it carries (N1/N2 control-flow merges carry at most one). */
+pub fn add_block_param(f: LFunc, block_id: u32) -> BlockParam {
+    let fresh = alloc_vreg(f)
+    BlockParam { func = set_block_param(fresh.func, block_id, fresh.vreg); vreg = fresh.vreg }
+}
+
+/** set_block_param — return a copy of `f` with `vreg` appended to the params list of the
+    block whose id is `block_id` (mirrors append_inst's per-block rewrite shape). */
+fn set_block_param(f: LFunc, block_id: u32, vreg: u32) -> LFunc {
+    mut blocks: []LBlock = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let b = f.blocks[i]
+        let nb = if b.id == block_id { LBlock { id = b.id; params = teko::list::push(b.params, vreg); insts = b.insts } } else { b }
+        blocks = teko::list::push(blocks, nb)
+        i++
+    }
+    LFunc { symbol = f.symbol; n_params = f.n_params; param_types = f.param_types; ret_type = f.ret_type; blocks = blocks; next_vreg = f.next_vreg }
+}
+
+/**
+ * LStructLayout — the resolved layout of one aggregate: its canonical NAME, total size,
+ * alignment, and each field's byte offset — declared order, natural alignment, no
+ * reordering, so a plain-C struct laid out by `cc` agrees with this table BY CONSTRUCTION
+ * (the A4 C-vs-own differential holds without extra bookkeeping). `field_names` parallels
+ * `field_offsets` AND `field_types` (same index) so a field is found BY NAME
+ * (the lowering never re-derives the declared order — it reads it straight
+ * out of this table) (A1-3, #382). `field_types` additionally carries each
+ * field's OWN machine class (A1-5, #382 — a variant `FieldPattern` destructure
+ * needs it to pick the right `load` width for a field it did not itself
+ * type-check).
+ */
+pub type LStructLayout = struct { name: str; size: u32; align: u32; field_names: []str; field_offsets: []u32; field_types: []LType }
+
+/**
+ * ltype_size — the byte size of one machine class: 1/2/4/8/16 for I8..I128 and F16/F32/F64
+ * by width, 8 for a Ptr (a 64-bit address), 0 for the value-less Void marker.
+ *
+ * @param LType t  the machine class
+ * @return u32  its size in bytes
+ */
+pub fn ltype_size(t: LType) -> u32 {
+    match t {
+        I8 => 1
+        I16 => 2
+        I32 => 4
+        I64 => 8
+        I128 => 16
+        F16 => 2
+        F32 => 4
+        F64 => 8
+        Ptr => 8
+        Void => 0
+    }
+}
+
+/**
+ * ltype_align — the natural alignment of one machine class: identical to its size for every
+ * scalar class here (each is a power of two), matching a plain C struct's default layout.
+ *
+ * @param LType t  the machine class
+ * @return u32  its alignment in bytes
+ */
+pub fn ltype_align(t: LType) -> u32 { ltype_size(t) }
+
+/**
+ * align_up — round `v` up to the next multiple of `a` (a no-op when `v` already fits, or
+ * when `a` is 0/1 — the zero-size Void case never grows the running offset).
+ *
+ * @param u32 v  the value to round
+ * @param u32 a  the alignment (a power of two, or 0/1 for none)
+ * @return u32  `v` rounded up to a multiple of `a`
+ */
+fn align_up(v: u32, a: u32) -> u32 {
+    if a <= 1 { return v }
+    let rem = v % a
+    if rem == 0 { return v }
+    v + (a - rem)
+}
+
+/**
+ * layout_of — compute a struct's declared-order, natural-alignment layout from its
+ * SCALAR per-field machine classes: each field's own size/align comes from
+ * `ltype_size`/`ltype_align` (delegates to `layout_of_sized`). A nested struct-by-value
+ * field does NOT fit this scalar mapping (its real width is its own recursively-resolved
+ * layout, not a single `LType`'s size) — `layout_of_fields` (lower.tks) resolves that case
+ * and calls `layout_of_sized` directly instead (#414, #382).
+ *
+ * @param str name  the struct's canonical (declaring) name
+ * @param []str field_names  the fields, in DECLARED order
+ * @param []LType field_types  each field's machine class, parallel to `field_names`
+ * @return LStructLayout  the resolved size/align/per-field offsets
+ */
+pub fn layout_of(name: str, field_names: []str, field_types: []LType) -> LStructLayout {
+    layout_of_sized(name, field_names, field_types, ltype_sizes_of(field_types), ltype_aligns_of(field_types))
+}
+
+/**
+ * layout_of_sized — compute a struct's declared-order layout from EXPLICIT per-field
+ * size/align arrays (rather than deriving them from `field_types`' scalar `ltype_size`/
+ * `ltype_align`): walk the fields in order, padding each one's offset up to its own
+ * `field_aligns` entry, then round the whole struct's size up to its widest field's
+ * alignment (the standard C struct-layout algorithm, so A2+'s isel and the eventual
+ * C-vs-own differential agree with `cc` by construction — the plan's §5.3 resolution).
+ * `layout_of_fields` (lower.tks) uses this directly so a nested struct-by-value field can
+ * supply its OWN recursively-resolved size/align instead of a scalar `LType`'s (#414, #382).
+ *
+ * @param str name  the struct's canonical (declaring) name
+ * @param []str field_names  the fields, in DECLARED order
+ * @param []LType field_types  each field's machine class, parallel to `field_names`
+ *                             (a nested struct-by-value field still carries `Ptr` here —
+ *                             only its SIZE/ALIGN are overridden, not its load/store class)
+ * @param []u32 field_sizes  each field's byte size, parallel to `field_names`
+ * @param []u32 field_aligns  each field's byte alignment, parallel to `field_names`
+ * @return LStructLayout  the resolved size/align/per-field offsets
+ */
+pub fn layout_of_sized(name: str, field_names: []str, field_types: []LType, field_sizes: []u32, field_aligns: []u32) -> LStructLayout {
+    mut offsets: []u32 = teko::list::empty()
+    mut cur: u32 = 0
+    mut max_align: u32 = 1
+    mut i: u64 = 0
+    loop {
+        if i >= field_types.len { break }
+        let al = field_aligns[i]
+        let aligned = align_up(cur, al)
+        offsets = teko::list::push(offsets, aligned)
+        cur = aligned + field_sizes[i]
+        if al > max_align { max_align = al }
+        i++
+    }
+    LStructLayout { name = name; size = align_up(cur, max_align); align = max_align; field_names = field_names; field_offsets = offsets; field_types = field_types }
+}
+
+/**
+ * ltype_sizes_of — each entry of `field_types` mapped through `ltype_size`, in order
+ * (a `layout_of`/`layout_of_sized` helper — #414, #382).
+ *
+ * @param []LType field_types  the machine classes to size
+ * @return []u32  the parallel byte sizes
+ */
+fn ltype_sizes_of(field_types: []LType) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= field_types.len { break }
+        out = teko::list::push(out, ltype_size(field_types[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * ltype_aligns_of — each entry of `field_types` mapped through `ltype_align`, in order
+ * (a `layout_of`/`layout_of_sized` helper — #414, #382).
+ *
+ * @param []LType field_types  the machine classes to align
+ * @return []u32  the parallel byte alignments
+ */
+fn ltype_aligns_of(field_types: []LType) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= field_types.len { break }
+        out = teko::list::push(out, ltype_align(field_types[i]))
+        i++
+    }
+    out
 }
