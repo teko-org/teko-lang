@@ -1,0 +1,1135 @@
+/**
+ * teko::backend (isel-over-interp harness) — re-interpret a SELECTED
+ * `MModule` over the SAME abstract model `teko::lir`'s `lir_interp` uses
+ * (an unmasked i128-carrier register value, no byte-accurate layout), so
+ * `minst_interp(select_module(m), entry, args) == interp_lmodule(m, entry,
+ * args)` is a like-for-like equivalence check (§4/§6.2 of the isel plan).
+ * This is A2's permanent equivalence oracle; it retires once A4's real
+ * C-vs-own byte differential subsumes it.
+ *
+ * Scope (A2-2): the straight-line integer subset the core selector covers
+ * (`MAlu`'s arithmetic lane, `MMSub`, `MNeg`, `MCmp`/`MCmpImm`/`MCSet`,
+ * `MMovZ`/`MMovK`/`MMovN`, `MMov`, `MRet`). Every other `MInst` case is a
+ * NAMED honest-stop — EXACTLY mirroring `lir_interp`'s own gaps (bitwise/
+ * shift ops, `INot`/`FNeg`/float ops/conversions) or naming the later A2
+ * sub-sub-PR that selects it (memory: A2-4; control flow: A2-3; calls:
+ * A2-5) — so a fixture that reaches one honest-stops IDENTICALLY on both
+ * sides of the equivalence check, per the plan's closing note.
+ *
+ * @since #383 A2-2
+ */
+
+/**
+ * two_pow_32 — the constant 2^32 as an i128 (a literal that fits the
+ * parser's working range directly, unlike 2^64 in `isel_arm64.tks`).
+ *
+ * @return i128  2^32
+ */
+fn two_pow_32() -> i128 {
+    4294967296 to i128
+}
+
+/**
+ * decode_signed64 — the signed i128 value a 64-bit two's-complement bit
+ * pattern represents: non-negative when the sign bit (bit 63) is clear,
+ * otherwise `bits - 2^64`.
+ *
+ * @param u64 bits  the 64-bit bit pattern to decode
+ * @return i128  its signed value
+ */
+fn decode_signed64(bits: u64) -> i128 {
+    let sign_boundary = 9223372036854775807 to u64
+    if bits > sign_boundary { (bits to i128) - two_pow_64() } else { bits to i128 }
+}
+
+/**
+ * decode_signed32 — the signed i128 value a 32-bit two's-complement bit
+ * pattern (the low 32 bits of `bits`) represents, mirroring
+ * `decode_signed64` at the narrower width.
+ *
+ * @param u64 bits  the bit pattern to decode (only its low 32 bits are read)
+ * @return i128  its signed value
+ */
+fn decode_signed32(bits: u64) -> i128 {
+    let masked = bits & mask32_u64()
+    let sign_boundary = 2147483647 to u64
+    if masked > sign_boundary { (masked to i128) - two_pow_32() } else { masked to i128 }
+}
+
+/**
+ * decode_signed — the signed i128 value a register-width bit pattern
+ * represents, at width `wide` (true for 64-bit, false for 32-bit) — the
+ * inverse of `isel_arm64.tks`'s `u64_bits_of`, used to re-derive the
+ * logical value a `MOVZ`/`MOVK`/`MOVN` sequence assembles.
+ *
+ * @param u64 bits  the bit pattern to decode
+ * @param bool wide  true for the 64-bit X form, false for 32-bit W
+ * @return i128  its signed value
+ */
+fn decode_signed(bits: u64, wide: bool) -> i128 {
+    if wide { decode_signed64(bits) } else { decode_signed32(bits) }
+}
+
+/**
+ * IVRead — a growable register-value read: whether the position was
+ * defined + its value (mirrors `teko::lir`'s `RFRead`).
+ *
+ * @since #383 A2-2
+ */
+type IVRead = struct {
+    /**
+     * ok — true iff the position had already been written.
+     */
+    ok: bool
+    /**
+     * value — the stored value (meaningful only when `ok`).
+     */
+    value: i128
+}
+
+/**
+ * IReg128Vec — a growable, positionally-indexed i128 register vector (one
+ * of the four register files `MRegFile` holds — GPR/FPR, virtual/
+ * physical), mirroring `teko::lir`'s `RegFile`.
+ *
+ * @since #383 A2-2
+ */
+type IReg128Vec = struct {
+    /**
+     * values — each recorded position's value, parallel to `set`.
+     */
+    values: []i128
+    /**
+     * set — whether each position has actually been written.
+     */
+    set: []bool
+}
+
+/**
+ * iv_new — an empty register vector.
+ *
+ * @return IReg128Vec  the empty vector
+ */
+fn iv_new() -> IReg128Vec {
+    IReg128Vec { values = teko::list::empty(); set = teko::list::empty() }
+}
+
+/**
+ * iv_get — read position `id`; `ok=false` when it is out of range or was
+ * never written.
+ *
+ * @param IReg128Vec v  the vector to read
+ * @param u32 id  the position to read
+ * @return IVRead  the read outcome
+ */
+fn iv_get(v: IReg128Vec, id: u32) -> IVRead {
+    let i = id to u64
+    if i >= v.values.len { return IVRead { ok = false; value = 0 to i128 } }
+    if !v.set[i] { return IVRead { ok = false; value = 0 to i128 } }
+    IVRead { ok = true; value = v.values[i] }
+}
+
+/**
+ * iv_set — write `val` into position `id`, growing the vector first when
+ * `id` is past its current length.
+ *
+ * @param IReg128Vec v0  the vector to update
+ * @param u32 id  the position to write
+ * @param i128 val  the value to store
+ * @return IReg128Vec  the updated vector
+ */
+fn iv_set(v0: IReg128Vec, id: u32, val: i128) -> IReg128Vec {
+    let need = (id to u64) + 1
+    mut values = v0.values
+    mut set = v0.set
+    loop {
+        if values.len >= need { break }
+        values = teko::list::push(values, 0 to i128)
+        set = teko::list::push(set, false)
+    }
+    mut out_values: []i128 = teko::list::empty()
+    mut out_set: []bool = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= values.len { break }
+        let is_target = (i to u32) == id
+        out_values = teko::list::push(out_values, if is_target { val } else { values[i] })
+        out_set = teko::list::push(out_set, if is_target { true } else { set[i] })
+        i++
+    }
+    IReg128Vec { values = out_values; set = out_set }
+}
+
+/**
+ * MemCell — one written memory address and its value (a sparse cell: only
+ * addresses actually stored to are recorded; an unread address reads back 0,
+ * matching an `alloca`'s zero-initialized frame).
+ *
+ * @since #383 A2-4
+ */
+type MemCell = struct {
+    /**
+     * addr — the byte address (an `MFrameAddr` base plus `MMem` displacement).
+     */
+    addr: i128
+    /**
+     * val — the whole value stored at `addr` (size-agnostic, mirroring
+     * `lir_interp`'s one-cell-per-address approximation).
+     */
+    val: i128
+}
+
+/**
+ * MMemStore — the abstract-machine memory: a sparse list of written cells.
+ * Size-agnostic like `lir_interp`'s `MemStore` (each address holds a whole
+ * value); the A2-4 harness only needs store→load round-trips to agree, and it
+ * asserts against a known result, so no byte-accurate layout is modeled.
+ *
+ * @since #383 A2-4
+ */
+type MMemStore = struct {
+    /**
+     * cells — the written cells, most-recent-write-wins on read.
+     */
+    cells: []MemCell
+}
+
+/**
+ * memstore_new — an empty memory (the interpreter run's seed).
+ *
+ * @return MMemStore  the empty memory
+ */
+fn memstore_new() -> MMemStore { MMemStore { cells = teko::list::empty() } }
+
+/**
+ * mem_get — read the value at `addr`; an address never stored to reads 0.
+ *
+ * @param MMemStore m  the memory to read
+ * @param i128 addr  the address to read
+ * @return i128  the stored value, or 0 if the address was never written
+ */
+fn mem_get(m: MMemStore, addr: i128) -> i128 {
+    mut i: u64 = 0
+    loop {
+        if i >= m.cells.len { break }
+        if m.cells[i].addr == addr { return m.cells[i].val }
+        i++
+    }
+    0 to i128
+}
+
+/**
+ * mem_set — write `val` at `addr`, returning the updated memory (rewrite the
+ * existing cell if present, else append a fresh one — functional, mirrors
+ * `mrf_set`).
+ *
+ * @param MMemStore m  the memory to update
+ * @param i128 addr  the address to write
+ * @param i128 val  the value to store
+ * @return MMemStore  the updated memory
+ */
+fn mem_set(m: MMemStore, addr: i128, val: i128) -> MMemStore {
+    mut found = false
+    mut cells: []MemCell = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.cells.len { break }
+        let c = m.cells[i]
+        if c.addr == addr {
+            cells = teko::list::push(cells, MemCell { addr = addr; val = val })
+            found = true
+        } else {
+            cells = teko::list::push(cells, c)
+        }
+        i++
+    }
+    if !found { cells = teko::list::push(cells, MemCell { addr = addr; val = val }) }
+    MMemStore { cells = cells }
+}
+
+/**
+ * MRegFile — the abstract-machine register state: four independent
+ * register vectors (GPR/FPR, each virtual and physical), plus the ONE
+ * pending compare's operands (`MCmp`/`MCmpImm` set them; the following
+ * `MCSet` reads them — A2-2's selector always emits the two adjacent, so a
+ * single pending slot suffices, mirroring a real flags register).
+ *
+ * @since #383 A2-2
+ */
+type MRegFile = struct {
+    /**
+     * gpr_v — the virtual GPR register vector.
+     */
+    gpr_v: IReg128Vec
+    /**
+     * fpr_v — the virtual FPR register vector.
+     */
+    fpr_v: IReg128Vec
+    /**
+     * gpr_p — the physical GPR register vector (x0..x30).
+     */
+    gpr_p: IReg128Vec
+    /**
+     * fpr_p — the physical FPR register vector (v0..v31).
+     */
+    fpr_p: IReg128Vec
+    /**
+     * flag_a — the left operand of the most recent `MCmp`/`MCmpImm`.
+     */
+    flag_a: i128
+    /**
+     * flag_b — the right operand of the most recent `MCmp`/`MCmpImm`.
+     */
+    flag_b: i128
+    /**
+     * has_flags — true once a compare has run (an `MCSet` before the
+     * first compare is an internal error).
+     */
+    has_flags: bool
+    /**
+     * mem — the abstract-machine memory (A2-4 `MStore`/`MLoad` write/read it;
+     * every other step carries it through unchanged).
+     */
+    mem: MMemStore
+}
+
+/**
+ * mrf_new — a register file with every vector empty and no pending
+ * compare (the interpreter run's seed).
+ *
+ * @return MRegFile  the empty register file
+ */
+fn mrf_new() -> MRegFile {
+    MRegFile {
+        gpr_v = iv_new(); fpr_v = iv_new(); gpr_p = iv_new(); fpr_p = iv_new()
+        flag_a = 0 to i128; flag_b = 0 to i128; has_flags = false
+        mem = memstore_new()
+    }
+}
+
+/**
+ * mrf_vec_of — the register vector `r` lives in (one of the four,
+ * selected by its class and physical/virtual flag).
+ *
+ * @param MRegFile mrf  the register file to read
+ * @param MReg r  the register operand naming the vector
+ * @return IReg128Vec  the selected vector
+ */
+fn mrf_vec_of(mrf: MRegFile, r: MReg) -> IReg128Vec {
+    if r.is_phys {
+        match r.reg_class { MRegClass::GPR => mrf.gpr_p; MRegClass::FPR => mrf.fpr_p }
+    } else {
+        match r.reg_class { MRegClass::GPR => mrf.gpr_v; MRegClass::FPR => mrf.fpr_v }
+    }
+}
+
+/**
+ * mrf_with_vec — a copy of `mrf` with the vector `r` lives in replaced by
+ * `v` (the other three vectors, plus the pending compare, unchanged).
+ *
+ * @param MRegFile mrf  the register file to update
+ * @param MReg r  the register operand naming the vector to replace
+ * @param IReg128Vec v  the replacement vector
+ * @return MRegFile  the updated register file
+ */
+fn mrf_with_vec(mrf: MRegFile, r: MReg, v: IReg128Vec) -> MRegFile {
+    if r.is_phys {
+        match r.reg_class {
+            MRegClass::GPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = v; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mrf.mem }
+            MRegClass::FPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = v; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mrf.mem }
+        }
+    } else {
+        match r.reg_class {
+            MRegClass::GPR => MRegFile { gpr_v = v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mrf.mem }
+            MRegClass::FPR => MRegFile { gpr_v = mrf.gpr_v; fpr_v = v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mrf.mem }
+        }
+    }
+}
+
+/**
+ * mrf_get — read register `r`'s current value.
+ *
+ * @param MRegFile mrf  the register file to read
+ * @param MReg r  the register operand to read
+ * @return IVRead  the read outcome
+ */
+fn mrf_get(mrf: MRegFile, r: MReg) -> IVRead {
+    iv_get(mrf_vec_of(mrf, r), r.id)
+}
+
+/**
+ * mrf_set — write `val` into register `r`, returning the updated register
+ * file.
+ *
+ * @param MRegFile mrf  the register file to update
+ * @param MReg r  the register operand to write
+ * @param i128 val  the value to store
+ * @return MRegFile  the updated register file
+ */
+fn mrf_set(mrf: MRegFile, r: MReg, val: i128) -> MRegFile {
+    mrf_with_vec(mrf, r, iv_set(mrf_vec_of(mrf, r), r.id, val))
+}
+
+/**
+ * mrf_with_flags — record `a`/`b` as the pending compare operands (an
+ * `MCmp`/`MCmpImm` step), returning the updated register file.
+ *
+ * @param MRegFile mrf  the register file to update
+ * @param i128 a  the left compared value
+ * @param i128 b  the right compared value
+ * @return MRegFile  the updated register file
+ */
+fn mrf_with_flags(mrf: MRegFile, a: i128, b: i128) -> MRegFile {
+    MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = a; flag_b = b; has_flags = true; mem = mrf.mem }
+}
+
+/**
+ * seed_params — write `args` positionally into the physical GPR argument
+ * registers (x0..). A2-2's own fixtures pass only GPR/integer parameters;
+ * FPR argument seeding follows once float parameters are selected.
+ *
+ * @param MRegFile mrf0  the register file to seed
+ * @param []i128 args  the entry function's argument values
+ * @return MRegFile  the seeded register file
+ */
+fn seed_params(mrf0: MRegFile, args: []i128) -> MRegFile {
+    mut mrf = mrf0
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        mrf = mrf_set(mrf, preg(i to u32, MRegClass::GPR), args[i])
+        i++
+    }
+    mrf
+}
+
+/**
+ * MIResult — one instruction's outcome. `tag` selects: 0 = CONTINUE (the
+ * block loop advances, never surfaced to the caller), 1 = RETURN (an
+ * `MRet` carrying the function's result), 2 = ERROR (an out-of-subset
+ * instruction reached at "runtime"), 3 = JUMP (a taken branch to another
+ * block, its target id carried in `value` — A2-3).
+ *
+ * @since #383 A2-2
+ */
+type MIResult = struct {
+    /**
+     * tag — which outcome this is (0/1/2/3, see the type doc).
+     */
+    tag: u32
+    /**
+     * value — the RETURN outcome's carried value, or the JUMP outcome's
+     * target block id (0 otherwise).
+     */
+    value: i128
+    /**
+     * message — the ERROR outcome's message ("" otherwise).
+     */
+    message: str
+}
+
+/**
+ * mires_continue — a non-terminator step's placeholder.
+ *
+ * @return MIResult  the CONTINUE outcome
+ */
+fn mires_continue() -> MIResult { MIResult { tag = 0; value = 0 to i128; message = "" } }
+
+/**
+ * mires_return — an `MRet` terminator carrying the function's result.
+ *
+ * @param i128 v  the returned value
+ * @return MIResult  the RETURN outcome
+ */
+fn mires_return(v: i128) -> MIResult { MIResult { tag = 1; value = v; message = "" } }
+
+/**
+ * mires_error — an out-of-subset instruction reached at "runtime".
+ *
+ * @param str msg  the honest-stop message
+ * @return MIResult  the ERROR outcome
+ */
+fn mires_error(msg: str) -> MIResult { MIResult { tag = 2; value = 0 to i128; message = msg } }
+
+/**
+ * is_micontinue — true iff `r` is a CONTINUE placeholder.
+ *
+ * @param MIResult r  the outcome to test
+ * @return bool  whether it is CONTINUE
+ */
+fn is_micontinue(r: MIResult) -> bool { r.tag == 0 }
+
+/**
+ * is_mireturn — true iff `r` is a RETURN outcome.
+ *
+ * @param MIResult r  the outcome to test
+ * @return bool  whether it is RETURN
+ */
+fn is_mireturn(r: MIResult) -> bool { r.tag == 1 }
+
+/**
+ * mires_jump — a taken branch to another block (`MBranch`, or the taken edge
+ * of an `MBranchCond`/`MCbz`), carrying the target block id.
+ *
+ * @param u32 target  the destination block id
+ * @return MIResult  the JUMP outcome
+ */
+fn mires_jump(target: u32) -> MIResult { MIResult { tag = 3; value = target to i128; message = "" } }
+
+/**
+ * is_mijump — true iff `r` is a JUMP outcome (control transfers to another
+ * block).
+ *
+ * @param MIResult r  the outcome to test
+ * @return bool  whether it is JUMP
+ */
+fn is_mijump(r: MIResult) -> bool { r.tag == 3 }
+
+/**
+ * MIStep — one instruction's effect: an `MIResult` + the register file it
+ * leaves.
+ *
+ * @since #383 A2-2
+ */
+type MIStep = struct {
+    /**
+     * result — the instruction's outcome.
+     */
+    result: MIResult
+    /**
+     * mrf — the register file after the instruction ran.
+     */
+    mrf: MRegFile
+}
+
+/**
+ * mistep_cont — a non-terminator step: continue with the updated register
+ * file.
+ *
+ * @param MRegFile mrf  the updated register file
+ * @return MIStep  the CONTINUE step
+ */
+fn mistep_cont(mrf: MRegFile) -> MIStep { MIStep { result = mires_continue(); mrf = mrf } }
+
+/**
+ * mistep_stop — a terminator/error step: propagate `r`.
+ *
+ * @param MIResult r  the outcome to propagate
+ * @param MRegFile mrf  the register file at the point of stopping
+ * @return MIStep  the terminal step
+ */
+fn mistep_stop(r: MIResult, mrf: MRegFile) -> MIStep { MIStep { result = r; mrf = mrf } }
+
+/**
+ * AluEval — the result of an `MAluOp` evaluation: a computed value, or an
+ * error message when the op or a zero divisor is out of the run subset.
+ *
+ * @since #383 A2-2
+ */
+type AluEval = struct {
+    /**
+     * ok — true iff `value` is meaningful.
+     */
+    ok: bool
+    /**
+     * value — the computed result (meaningful only when `ok`).
+     */
+    value: i128
+    /**
+     * message — the honest-stop message (meaningful only when `!ok`).
+     */
+    message: str
+}
+
+/**
+ * alu_ok — a successful ALU evaluation.
+ *
+ * @param i128 v  the computed value
+ * @return AluEval  the successful outcome
+ */
+fn alu_ok(v: i128) -> AluEval { AluEval { ok = true; value = v; message = "" } }
+
+/**
+ * alu_err — a failed ALU evaluation (an out-of-subset op or a zero
+ * divisor).
+ *
+ * @param str msg  the honest-stop message
+ * @return AluEval  the failed outcome
+ */
+fn alu_err(msg: str) -> AluEval { AluEval { ok = false; value = 0 to i128; message = msg } }
+
+/**
+ * alu_div — integer division with a zero-divisor guard, mirroring
+ * `lir_interp`'s `eval_div`.
+ *
+ * @param i128 a  the dividend
+ * @param i128 b  the divisor
+ * @return AluEval  the quotient, or a divide-by-zero honest-stop
+ */
+fn alu_div(a: i128, b: i128) -> AluEval {
+    if b == (0 to i128) { return alu_err("minst interp: divide by zero") }
+    alu_ok(a / b)
+}
+
+/**
+ * eval_alu — the arithmetic of an `MAluOp`: `Add`/`Sub`/`Mul`/`Sdiv`/`Udiv`
+ * evaluate over the unmasked i128 carrier (matching `lir_interp`'s own
+ * unmasked model, so the equivalence check holds for any in-range value);
+ * the bitwise/shift lane (`And`/`Orr`/`Eor`/`Lsl`/`Asr`/`Lsr`) honest-stops,
+ * mirroring `lir_interp`'s OWN gap for those `LBinOp` cases today.
+ *
+ * @param MAluOp op  the operation to evaluate
+ * @param i128 a  the first operand
+ * @param i128 b  the second operand
+ * @return AluEval  the computed value, or a honest-stop
+ */
+fn eval_alu(op: MAluOp, a: i128, b: i128) -> AluEval {
+    match op {
+        MAluOp::Add => alu_ok(a + b)
+        MAluOp::Sub => alu_ok(a - b)
+        MAluOp::Mul => alu_ok(a * b)
+        MAluOp::Sdiv => alu_div(a, b)
+        MAluOp::Udiv => alu_div(a, b)
+        MAluOp::And => alu_err("minst interp: bitwise ops are out of the A2-2 run subset (matches lir interp's own gap)")
+        MAluOp::Orr => alu_err("minst interp: bitwise ops are out of the A2-2 run subset (matches lir interp's own gap)")
+        MAluOp::Eor => alu_err("minst interp: bitwise ops are out of the A2-2 run subset (matches lir interp's own gap)")
+        MAluOp::Lsl => alu_err("minst interp: shift ops are out of the A2-2 run subset (matches lir interp's own gap)")
+        MAluOp::Asr => alu_err("minst interp: shift ops are out of the A2-2 run subset (matches lir interp's own gap)")
+        MAluOp::Lsr => alu_err("minst interp: shift ops are out of the A2-2 run subset (matches lir interp's own gap)")
+    }
+}
+
+/**
+ * cond_holds — whether `MCond` `c` holds for the pending compare operands
+ * `a`/`b`, using the carrier's plain (signed) i128 operators for BOTH the
+ * signed and unsigned lanes — A2-2's own fixtures are non-negative, so the
+ * two agree, exactly mirroring `lir_interp`'s own `eval_bin` reasoning for
+ * `ICmpLtS` vs `ICmpLtU`.
+ *
+ * @param MCond c  the condition code to test
+ * @param i128 a  the left compared value
+ * @param i128 b  the right compared value
+ * @return bool  whether the condition holds
+ */
+fn cond_holds(c: MCond, a: i128, b: i128) -> bool {
+    match c {
+        MCond::EQ => a == b
+        MCond::NE => a != b
+        MCond::LT => a < b
+        MCond::LE => a <= b
+        MCond::GT => a > b
+        MCond::GE => a >= b
+        MCond::LO => a < b
+        MCond::LS => a <= b
+        MCond::HI => a > b
+        MCond::HS => a >= b
+    }
+}
+
+/**
+ * interp_alu — an `MAlu` step: evaluate `eval_alu` over its two current
+ * operand values, storing the result (or propagating a honest-stop).
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MAlu x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_alu(mrf: MRegFile, x: MAlu) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    let b = mrf_get(mrf, x.b)
+    if !a.ok || !b.ok { return mistep_stop(mires_error("minst interp: alu operand register is undefined"), mrf) }
+    let r = eval_alu(x.op, a.value, b.value)
+    if !r.ok { return mistep_stop(mires_error(r.message), mrf) }
+    mistep_cont(mrf_set(mrf, x.dst, r.value))
+}
+
+/**
+ * interp_alu_imm — an `MAluImm` step: evaluate `eval_alu` over its
+ * register operand and immediate.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MAluImm x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_alu_imm(mrf: MRegFile, x: MAluImm) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    if !a.ok { return mistep_stop(mires_error("minst interp: alu_imm operand register is undefined"), mrf) }
+    let r = eval_alu(x.op, a.value, x.imm to i128)
+    if !r.ok { return mistep_stop(mires_error(r.message), mrf) }
+    mistep_cont(mrf_set(mrf, x.dst, r.value))
+}
+
+/**
+ * interp_msub — an `MMSub` step: `dst = c - a*b`, the second half of an
+ * `IRemS`/`IRemU` lowering (`a` is the preceding SDIV/UDIV's quotient).
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MMSub x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_msub(mrf: MRegFile, x: MMSub) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    let b = mrf_get(mrf, x.b)
+    let c = mrf_get(mrf, x.c)
+    if !a.ok || !b.ok || !c.ok { return mistep_stop(mires_error("minst interp: msub operand register is undefined"), mrf) }
+    mistep_cont(mrf_set(mrf, x.dst, c.value - a.value * b.value))
+}
+
+/**
+ * interp_neg — an `MNeg` step: `dst = -a`.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MNeg x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_neg(mrf: MRegFile, x: MNeg) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    if !a.ok { return mistep_stop(mires_error("minst interp: neg operand register is undefined"), mrf) }
+    mistep_cont(mrf_set(mrf, x.dst, -a.value))
+}
+
+/**
+ * interp_cmp — an `MCmp` step: record its two operands as the pending
+ * compare (a following `MCSet` reads them).
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MCmp x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_cmp(mrf: MRegFile, x: MCmp) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    let b = mrf_get(mrf, x.b)
+    if !a.ok || !b.ok { return mistep_stop(mires_error("minst interp: cmp operand register is undefined"), mrf) }
+    mistep_cont(mrf_with_flags(mrf, a.value, b.value))
+}
+
+/**
+ * interp_cmp_imm — an `MCmpImm` step: record its register operand and
+ * immediate as the pending compare.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MCmpImm x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_cmp_imm(mrf: MRegFile, x: MCmpImm) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    if !a.ok { return mistep_stop(mires_error("minst interp: cmp_imm operand register is undefined"), mrf) }
+    mistep_cont(mrf_with_flags(mrf, a.value, x.imm to i128))
+}
+
+/**
+ * interp_cset — an `MCSet` step: materialize the pending compare's
+ * `cond_holds` truth as a 0/1 value.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MCSet x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_cset(mrf: MRegFile, x: MCSet) -> MIStep {
+    if !mrf.has_flags { return mistep_stop(mires_error("minst interp: cset with no preceding compare (internal)"), mrf) }
+    let truth = cond_holds(x.cond, mrf.flag_a, mrf.flag_b)
+    mistep_cont(mrf_set(mrf, x.dst, if truth { 1 to i128 } else { 0 to i128 }))
+}
+
+/**
+ * interp_movz — an `MMovZ` step: `dst = imm16 << shift`, decoded back to
+ * its signed logical value at `x.wide`'s width.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MMovZ x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_movz(mrf: MRegFile, x: MMovZ) -> MIStep {
+    let lane_bits = (x.imm16 to u64) << (x.shift to u64)
+    mistep_cont(mrf_set(mrf, x.dst, decode_signed(lane_bits, x.wide)))
+}
+
+/**
+ * interp_movk — an `MMovK` step: OR a new lane into `dst`'s CURRENT bit
+ * pattern (re-derived from its currently-decoded signed value, masked to
+ * `x.wide`'s width so a narrower chain's upper bits stay zero-extended,
+ * matching a real W-register write), decoding the merged pattern back to
+ * its signed value.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MMovK x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_movk(mrf: MRegFile, x: MMovK) -> MIStep {
+    let cur = mrf_get(mrf, x.dst)
+    let base_bits = (if cur.ok { u64_bits_of(cur.value) } else { 0 to u64 }) & mask_for(x.wide)
+    let lane_bits = (x.imm16 to u64) << (x.shift to u64)
+    mistep_cont(mrf_set(mrf, x.dst, decode_signed(base_bits | lane_bits, x.wide)))
+}
+
+/**
+ * interp_movn — an `MMovN` step: `dst = ~(imm16 << shift)`, decoded back to
+ * its signed logical value at `x.wide`'s width.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MMovN x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_movn(mrf: MRegFile, x: MMovN) -> MIStep {
+    let lane_bits = (x.imm16 to u64) << (x.shift to u64)
+    mistep_cont(mrf_set(mrf, x.dst, decode_signed(~lane_bits, x.wide)))
+}
+
+/**
+ * interp_mov — an `MMov` step: a plain register-to-register copy (the
+ * `LParam`/`LRet` pin-move, and the `Trunc`/`ZExt`/`SExt` identity — see
+ * `select_identity_mov`'s own doc for why this stays unmasked).
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MMov x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_mov(mrf: MRegFile, x: MMov) -> MIStep {
+    let src = mrf_get(mrf, x.src)
+    if !src.ok { return mistep_stop(mires_error("minst interp: mov source register is undefined"), mrf) }
+    mistep_cont(mrf_set(mrf, x.dst, src.value))
+}
+
+/**
+ * interp_ret — an `MRet` step: the function's result is whatever value a
+ * preceding `MMov`/`MFMov` pinned into the physical GPR result register
+ * (x0); an unset x0 means no such move ran, i.e. a void return, so the
+ * result is 0 — mirroring `lir_interp`'s own void-return value.
+ *
+ * @param MRegFile mrf  the register file to read
+ * @return MIStep  the RETURN step
+ */
+fn interp_ret(mrf: MRegFile) -> MIStep {
+    let px0 = mrf_get(mrf, preg(0, MRegClass::GPR))
+    if px0.ok { return mistep_stop(mires_return(px0.value), mrf) }
+    mistep_stop(mires_return(0 to i128), mrf)
+}
+
+/**
+ * out_of_scope — a honest-stop `MIStep` naming which later A2 sub-sub-PR
+ * (or which existing `lir_interp` gap) covers an `MInst` case A2-2 does not
+ * yet execute.
+ *
+ * @param str msg  the honest-stop message
+ * @param MRegFile mrf  the register file at the point of stopping
+ * @return MIStep  the ERROR step
+ */
+fn out_of_scope(msg: str, mrf: MRegFile) -> MIStep {
+    mistep_stop(mires_error(msg), mrf)
+}
+
+/**
+ * mrf_with_mem — a copy of `mrf` with its memory replaced (an `MStore` step),
+ * every register and the pending compare unchanged.
+ *
+ * @param MRegFile mrf  the register file to update
+ * @param MMemStore mem  the replacement memory
+ * @return MRegFile  the updated register file
+ */
+fn mrf_with_mem(mrf: MRegFile, mem: MMemStore) -> MRegFile {
+    MRegFile { gpr_v = mrf.gpr_v; fpr_v = mrf.fpr_v; gpr_p = mrf.gpr_p; fpr_p = mrf.fpr_p; flag_a = mrf.flag_a; flag_b = mrf.flag_b; has_flags = mrf.has_flags; mem = mem }
+}
+
+/**
+ * frame_slot_addr — the abstract byte address of frame slot `slot`: each slot
+ * owns a wide, non-overlapping window and none maps to 0 (so a frame pointer
+ * is never the null address). The exact value is arbitrary — the harness only
+ * needs store→load round-trips through it to agree, and an `MFrameAddr` for a
+ * given slot always resolves to the same base here.
+ *
+ * @param u32 slot  the frame-slot index
+ * @return i128  the slot's base address
+ */
+fn frame_slot_addr(slot: u32) -> i128 {
+    ((slot to i128) + (1 to i128)) * (65536 to i128)
+}
+
+/**
+ * interp_frame_addr — an `MFrameAddr` step: materialize the slot's base
+ * address into its destination register.
+ *
+ * @param MRegFile mrf  the register file to update
+ * @param MFrameAddr x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_frame_addr(mrf: MRegFile, x: MFrameAddr) -> MIStep {
+    mistep_cont(mrf_set(mrf, x.dst, frame_slot_addr(x.slot)))
+}
+
+/**
+ * interp_load — an `MLoad` step: read memory at `base + #offset` into the
+ * destination register (a never-written address reads 0).
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MLoad x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_load(mrf: MRegFile, x: MLoad) -> MIStep {
+    let base = mrf_get(mrf, x.mem.base)
+    if !base.ok { return mistep_stop(mires_error("minst interp: load base register is undefined"), mrf) }
+    let addr = base.value + (x.mem.offset to i128)
+    mistep_cont(mrf_set(mrf, x.dst, mem_get(mrf.mem, addr)))
+}
+
+/**
+ * interp_store — an `MStore` step: write the source register's value into
+ * memory at `base + #offset`.
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MStore x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_store(mrf: MRegFile, x: MStore) -> MIStep {
+    let base = mrf_get(mrf, x.mem.base)
+    let src = mrf_get(mrf, x.src)
+    if !base.ok || !src.ok { return mistep_stop(mires_error("minst interp: store base/src register is undefined"), mrf) }
+    let addr = base.value + (x.mem.offset to i128)
+    mistep_cont(mrf_with_mem(mrf, mem_set(mrf.mem, addr, src.value)))
+}
+
+/**
+ * interp_call — an `MCall` step: only `tk_exit` executes — it reads the exit
+ * code pinned in x0 and unwinds the program with it (with no callee recursion
+ * yet, an exit is a RETURN from the sole running function). Every other call —
+ * a user function or another `tk_*` — is golden-dump-only until the interp
+ * recurses into callees.
+ *
+ * @param MRegFile mrf  the register file to read
+ * @param MCall x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_call(mrf: MRegFile, x: MCall) -> MIStep {
+    if x.sym == "tk_exit" {
+        let code = mrf_get(mrf, preg(0, MRegClass::GPR))
+        if !code.ok { return mistep_stop(mires_error("minst interp: tk_exit with no exit code pinned in x0 (internal)"), mrf) }
+        return mistep_stop(mires_return(code.value), mrf)
+    }
+    mistep_stop(mires_error("minst interp: only tk_exit is executed; user-function and other tk_* calls are golden-dump-only until the interp recurses into callees"), mrf)
+}
+
+/**
+ * interp_one — execute one `MInst`, dispatching by case (§4 of the isel
+ * plan). A2-2's own selections (`MAlu`/`MAluImm`/`MMSub`/`MNeg`/`MCmp`/
+ * `MCmpImm`/`MCSet`/`MMovZ`/`MMovK`/`MMovN`/`MMov`/`MRet`) plus A2-3 control
+ * flow (`MBranch`/`MBranchCond`/`MCbz`) plus A2-4 memory (`MFrameAddr`/
+ * `MLoad`/`MStore`) execute for real; every other case honest-stops, naming
+ * either `lir_interp`'s own matching gap (float/bitwise/shift/`INot`/
+ * conversions), the symbol relocations `MAdrp`/`MAddLo` (no run-time address
+ * without a linker — golden-dump only), or the later A2 sub-sub-PR that
+ * selects it (calls: A2-5).
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MInst inst  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_one(mrf: MRegFile, inst: MInst) -> MIStep {
+    match inst {
+        MAlu as x => interp_alu(mrf, x)
+        MAluImm as x => interp_alu_imm(mrf, x)
+        MMSub as x => interp_msub(mrf, x)
+        MNeg as x => interp_neg(mrf, x)
+        MMvn => out_of_scope("minst interp: bitwise not is out of the A2-2 run subset (matches lir interp's own INot gap)", mrf)
+        MFAlu => out_of_scope("minst interp: float ops are out of the A2-2 run subset (matches lir interp's own float gap)", mrf)
+        MFNeg => out_of_scope("minst interp: float ops are out of the A2-2 run subset (matches lir interp's own float gap)", mrf)
+        MCmp as x => interp_cmp(mrf, x)
+        MCmpImm as x => interp_cmp_imm(mrf, x)
+        MFCmp => out_of_scope("minst interp: float ops are out of the A2-2 run subset (matches lir interp's own float gap)", mrf)
+        MCSet as x => interp_cset(mrf, x)
+        MMovZ as x => interp_movz(mrf, x)
+        MMovK as x => interp_movk(mrf, x)
+        MMovN as x => interp_movn(mrf, x)
+        MFMov => out_of_scope("minst interp: float ops are out of the A2-2 run subset (matches lir interp's own float gap)", mrf)
+        MMov as x => interp_mov(mrf, x)
+        MExt => out_of_scope("minst interp: narrow extends are out of the A2-2 run subset (typed memory values land in A2-4)", mrf)
+        MCvt => out_of_scope("minst interp: int/float conversions are out of the A2-2 run subset (matches lir interp's own gap)", mrf)
+        MLoad as x => interp_load(mrf, x)
+        MStore as x => interp_store(mrf, x)
+        MFrameAddr as x => interp_frame_addr(mrf, x)
+        MAdrp => out_of_scope("minst interp: ADRP is a symbol relocation — a linker-free interp has no run-time address for it (golden-dump only)", mrf)
+        MAddLo => out_of_scope("minst interp: ADD-lo is a symbol relocation — a linker-free interp has no run-time address for it (golden-dump only)", mrf)
+        MBranch as x => interp_branch(mrf, x)
+        MBranchCond as x => interp_branch_cond(mrf, x)
+        MCbz as x => interp_cbz(mrf, x)
+        MCall as x => interp_call(mrf, x)
+        MCallIndirect => out_of_scope("minst interp: an indirect call needs the func-address model + callee recursion — golden-dump-only in A2-5", mrf)
+        MRet => interp_ret(mrf)
+    }
+}
+
+/**
+ * interp_branch — an `MBranch` step: an unconditional jump to its target
+ * block.
+ *
+ * @param MRegFile mrf  the register file (carried through unchanged)
+ * @param MBranch x  the instruction to execute
+ * @return MIStep  the JUMP outcome
+ */
+fn interp_branch(mrf: MRegFile, x: MBranch) -> MIStep {
+    mistep_stop(mires_jump(x.target), mrf)
+}
+
+/**
+ * interp_branch_cond — an `MBranchCond` step: jump to its target when the
+ * pending compare's flags satisfy `cond`, else fall through to the next
+ * instruction (the unconditional branch to the else edge).
+ *
+ * @param MRegFile mrf  the register file to read
+ * @param MBranchCond x  the instruction to execute
+ * @return MIStep  the JUMP (taken) or CONTINUE (fall-through) outcome
+ */
+fn interp_branch_cond(mrf: MRegFile, x: MBranchCond) -> MIStep {
+    if !mrf.has_flags { return mistep_stop(mires_error("minst interp: branch.cond with no preceding compare (internal)"), mrf) }
+    if cond_holds(x.cond, mrf.flag_a, mrf.flag_b) { mistep_stop(mires_jump(x.target), mrf) } else { mistep_cont(mrf) }
+}
+
+/**
+ * interp_cbz — an `MCbz` step: read the tested register and jump to the
+ * target when its zero-ness matches `zero` (CBZ is `zero=true`, CBNZ is
+ * `zero=false`), else fall through.
+ *
+ * @param MRegFile mrf  the register file to read
+ * @param MCbz x  the instruction to execute
+ * @return MIStep  the JUMP (taken) or CONTINUE (fall-through) outcome
+ */
+fn interp_cbz(mrf: MRegFile, x: MCbz) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    if !a.ok { return mistep_stop(mires_error("minst interp: cbz operand register is undefined"), mrf) }
+    let is_zero = a.value == (0 to i128)
+    if is_zero == x.zero { mistep_stop(mires_jump(x.target), mrf) } else { mistep_cont(mrf) }
+}
+
+/**
+ * run_mblock — run `b`'s instructions in order until a terminal step
+ * (RETURN/ERROR/JUMP), returning that step's outcome AND the register file it
+ * left behind so the block-following driver threads register state from one
+ * block into the next. A block that falls off its stream without a terminator
+ * is an internal error (the selector always ends a block in a terminator).
+ *
+ * @param MBlock b  the block to execute
+ * @param MRegFile mrf0  the entering register file
+ * @return MIStep  the terminal step (outcome + resulting register file)
+ */
+fn run_mblock(b: MBlock, mrf0: MRegFile) -> MIStep {
+    mut mrf = mrf0
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        let step = interp_one(mrf, b.insts[i])
+        if !is_micontinue(step.result) { return step }
+        mrf = step.mrf
+        i++
+    }
+    mistep_stop(mires_error("minst interp: block fell through without a terminator"), mrf)
+}
+
+/**
+ * MFuncHit — a module function lookup result.
+ *
+ * @since #383 A2-2
+ */
+type MFuncHit = struct {
+    /**
+     * found — whether `func` is a real match.
+     */
+    found: bool
+    /**
+     * func — the matched function (meaningful only when `found`).
+     */
+    func: MFunc
+}
+
+/**
+ * empty_mfunc — the sentinel `find_mfunc` returns with `found=false`
+ * (never read).
+ *
+ * @return MFunc  an empty placeholder function
+ */
+fn empty_mfunc() -> MFunc {
+    new_mfunc("")
+}
+
+/**
+ * find_mfunc — the function in `m` whose symbol is `sym`, or
+ * `found=false`.
+ *
+ * @param MModule m  the module to search
+ * @param str sym  the symbol to find
+ * @return MFuncHit  the lookup outcome
+ */
+fn find_mfunc(m: MModule, sym: str) -> MFuncHit {
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        if m.funcs[i].symbol == sym { return MFuncHit { found = true; func = m.funcs[i] } }
+        i++
+    }
+    MFuncHit { found = false; func = empty_mfunc() }
+}
+
+/**
+ * MBlockHit — a block-by-id lookup result within a function.
+ *
+ * @since #383 A2-3
+ */
+type MBlockHit = struct {
+    /**
+     * found — whether `block` is a real match.
+     */
+    found: bool
+    /**
+     * block — the matched block (meaningful only when `found`).
+     */
+    block: MBlock
+}
+
+/**
+ * find_mblock — the block of `f` whose id is `block_id`, or `found=false`
+ * (a dangling branch target — an internal error the driver maps to -1).
+ *
+ * @param MFunc f  the function to search
+ * @param u32 block_id  the block id to find
+ * @return MBlockHit  the lookup outcome
+ */
+fn find_mblock(f: MFunc, block_id: u32) -> MBlockHit {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id == block_id { return MBlockHit { found = true; block = f.blocks[i] } }
+        i++
+    }
+    MBlockHit { found = false; block = MBlock { id = 0; params = teko::list::empty(); insts = teko::list::empty() } }
+}
+
+/**
+ * minst_interp — run the function named `entry` in `m` with `args`, following
+ * its control-flow graph block to block from the entry until an `MRet`, and
+ * returning the exit code the selected program would produce. The register
+ * file threads across blocks (block-args arrive as the edge moves that
+ * precede each branch). A missing/empty function, an honest-stop, a dangling
+ * branch target, or a runaway block budget all yield the same NEGATIVE
+ * sentinel `interp_lmodule` uses (-1), so the two oracles compare directly.
+ *
+ * @param MModule m  the selected module to execute
+ * @param str entry  the entry function's symbol
+ * @param []i128 args  the entry function's argument values
+ * @return i128  the produced exit code, or -1 on any honest-stop
+ */
+pub fn minst_interp(m: MModule, entry: str, args: []i128) -> i128 {
+    let f = find_mfunc(m, entry)
+    if !f.found { return -1 to i128 }
+    if f.func.blocks.len == 0 { return -1 to i128 }
+    mut mrf = seed_params(mrf_new(), args)
+    mut cur: u32 = f.func.blocks[0].id
+    mut budget: u64 = 0
+    loop {
+        if budget >= 1000000 { break }
+        budget++
+        let hit = find_mblock(f.func, cur)
+        if !hit.found { return -1 to i128 }
+        let step = run_mblock(hit.block, mrf)
+        mrf = step.mrf
+        if is_mireturn(step.result) { return step.result.value }
+        if is_mijump(step.result) { cur = step.result.value to u32 } else { return -1 to i128 }
+    }
+    -1 to i128
+}
