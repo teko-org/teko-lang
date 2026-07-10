@@ -3932,12 +3932,128 @@ fn cov_line_branch(sites: []BranchSite, fn_idx: u64, ln: u32) -> LineBr {
     LineBr { taken = taken; total = total }
 }
 
-// cov_cobertura — build a Cobertura XML report from the LAST run's marks. ONE <class> per production
-// function (filename = its source file). The class <lines> are the REAL executable lines (every line
-// with an evaluated expression, hit via cov_line_hit); a line that hosts an if/match also carries the
-// branch condition-coverage. Single-quoted attributes (valid XML) so no `"`-escaping is needed.
+/**
+ * Tally one production function's LINE coverage: how many of its distinct executable lines were
+ * hit versus how many exist. The denominator is the walk's `lines.len`; the numerator counts the
+ * lines for which `cov_line_hit` is true for this function index.
+ *
+ * @param w       the function's walked coverage sites and distinct executable lines
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @return        a CovCount whose `cov` is the hit-line count and `val` the total line count
+ */
+fn cov_fn_line_tally(w: CovWalk, fn_idx: u64) -> CovCount {
+    mut cov: u64 = 0
+    mut k = 0
+    loop {
+        if k >= w.lines.len { break }
+        if teko::cov_line_hit(fn_idx, w.lines[k]) { cov = cov + 1 }
+        k = k + 1
+    }
+    CovCount { cov = cov; val = w.lines.len }
+}
+
+/**
+ * Tally one production function's BRANCH coverage: how many condition outcomes were taken versus
+ * how many outcomes exist across every if/match site in the function.
+ *
+ * @param w       the function's walked coverage sites and distinct executable lines
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @return        a CovCount whose `cov` is the taken-outcome count and `val` the total outcomes
+ */
+fn cov_fn_branch_tally(w: CovWalk, fn_idx: u64) -> CovCount {
+    mut cov: u64 = 0
+    mut val: u64 = 0
+    mut s = 0
+    loop {
+        if s >= w.sites.len { break }
+        mut o: u64 = 0
+        loop {
+            if o >= w.sites[s].n { break }
+            if teko::cov_branch_hit(fn_idx, w.sites[s].line, w.sites[s].col, o) { cov = cov + 1 }
+            o = o + 1
+        }
+        val = val + w.sites[s].n
+        s = s + 1
+    }
+    CovCount { cov = cov; val = val }
+}
+
+/**
+ * Append one Cobertura `<line …/>` element per distinct executable line of a production function
+ * onto the copy-grow byte buffer, in walk order. A line that hosts an if/match additionally
+ * carries its condition-coverage percentage. The buffer is threaded linearly (append_fo frees the
+ * superseded backing on grow), so accumulation stays O(total) rather than the O(N²) retention that
+ * repeated `str::concat` would incur.
+ *
+ * @param buf     the copy-grow byte buffer being built
+ * @param w       the function's walked coverage sites and distinct executable lines
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @return        the buffer with this function's `<line>` elements appended
+ */
+fn cov_emit_lines(buf: []byte, w: CovWalk, fn_idx: u64) -> []byte {
+    mut b = buf
+    mut k = 0
+    loop {
+        if k >= w.lines.len { break }
+        let ln = w.lines[k]
+        let lhit: u64 = if teko::cov_line_hit(fn_idx, ln) { 1 to u64 } else { 0 to u64 }
+        let lb = cov_line_branch(w.sites, fn_idx, ln)
+        if lb.total > 0 {
+            let pct = lb.taken * 100 / lb.total
+            b = teko::mem::append_fo(b, $"          <line number='{ln}' hits='{lhit}' branch='true' condition-coverage='{pct}% ({lb.taken}/{lb.total})'/>\n")
+        } else {
+            b = teko::mem::append_fo(b, $"          <line number='{ln}' hits='{lhit}'/>\n")
+        }
+        k = k + 1
+    }
+    b
+}
+
+/**
+ * Append one production function's complete Cobertura `<class>` block onto the copy-grow byte
+ * buffer: the class header (line/branch rates from the supplied tallies), its single-method
+ * `<methods>` summary, and its `<lines>` (via cov_emit_lines). Attributes are single-quoted (valid
+ * XML) so no `"`-escaping is needed. The class name is namespace-qualified when the function has a
+ * namespace, otherwise the bare name.
+ *
+ * @param buf     the copy-grow byte buffer being built
+ * @param f       the production function whose class block is emitted
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @param w       the function's walked coverage sites and distinct executable lines
+ * @param lt      the function's line tally (cov = hit lines, val = total lines)
+ * @param bt      the function's branch tally (cov = taken outcomes, val = total outcomes)
+ * @param fnhit   1 when the function itself was executed at least once, else 0
+ * @return        the buffer with this function's `<class>` block appended
+ */
+fn cov_emit_class(buf: []byte, f: checker::TFunction, fn_idx: u64, w: CovWalk, lt: CovCount, bt: CovCount, fnhit: u64) -> []byte {
+    let cname = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
+    let lrate = cov_rate_str(lt.cov, lt.val)
+    let brate = cov_rate_str(bt.cov, bt.val)
+    mut b = teko::mem::append_fo(buf, $"      <class name='{cname}' filename='{f.file}' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n")
+    b = teko::mem::append_fo(b, $"        <methods><method name='{f.name}' signature='()V' line-rate='{lrate}' branch-rate='{brate}'><lines><line number='{f.line}' hits='{fnhit}'/></lines></method></methods>\n")
+    b = teko::mem::append_fo(b, "        <lines>\n")
+    b = cov_emit_lines(b, w, fn_idx)
+    teko::mem::append_fo(b, "        </lines>\n      </class>\n")
+}
+
+/**
+ * Build a Cobertura XML coverage report from the LAST run's marks — one `<class>` per production
+ * function (its filename is the function's source file). Each class's `<lines>` are the real
+ * executable lines (every line with an evaluated expression, hit via cov_line_hit); a line that
+ * hosts an if/match also carries its branch condition-coverage.
+ *
+ * The whole report accumulates into a copy-grow `[]byte` buffer via teko::mem::append_fo (the
+ * codegen's emitter mechanism): each append frees the superseded backing on grow, so the report
+ * costs O(final-size) memory instead of the O(N²) arena retention that repeated str::concat
+ * incurred — every intermediate prefix stayed live, ballooning to tens of GB on the compiler
+ * itself (#468). The `body` buffer holds every class, then the header/footer (which need the
+ * whole-program aggregate rates) wrap it into `out`, converted to a str exactly once at return.
+ *
+ * @param prog  the fully-typed program whose production functions are reported
+ * @return      the complete Cobertura XML document as a str
+ */
 exp fn cov_cobertura(prog: checker::TProgram) -> str {
-    mut body = ""
+    mut body: []byte = teko::list::empty()
     mut lines_cov: u64 = 0; mut lines_val: u64 = 0
     mut br_cov: u64 = 0; mut br_val: u64 = 0
     mut i = 0
@@ -3946,46 +4062,13 @@ exp fn cov_cobertura(prog: checker::TProgram) -> str {
         match prog.items[i] {
             checker::TFunction as f => {
                 if !f.is_test && f.namespace != "teko::vm" {
-                    let fnhit: u64 = if teko::cov_is_marked(i to u64) { 1 to u64 } else { 0 to u64 }
                     let w = cov_walk_block(f.body, cov_walk_empty())
-                    // LINE coverage — one <line> per distinct executable body line.
-                    mut llines = ""
-                    mut flc: u64 = 0; mut flv: u64 = 0
-                    mut k = 0
-                    loop {
-                        if k >= w.lines.len { break }
-                        let ln = w.lines[k]
-                        let lhit: u64 = if teko::cov_line_hit(i to u64, ln) { 1 to u64 } else { 0 to u64 }
-                        flv = flv + 1; flc = flc + lhit
-                        let lb = cov_line_branch(w.sites, i to u64, ln)
-                        if lb.total > 0 {
-                            let pct = lb.taken * 100 / lb.total
-                            llines = teko::str::concat(llines, $"          <line number='{ln}' hits='{lhit}' branch='true' condition-coverage='{pct}% ({lb.taken}/{lb.total})'/>\n")
-                        } else {
-                            llines = teko::str::concat(llines, $"          <line number='{ln}' hits='{lhit}'/>\n")
-                        }
-                        k = k + 1
-                    }
-                    lines_cov = lines_cov + flc; lines_val = lines_val + flv
-                    // BRANCH coverage — taken/total over every site.
-                    mut fbc: u64 = 0; mut fbv: u64 = 0
-                    mut s = 0
-                    loop {
-                        if s >= w.sites.len { break }
-                        mut o: u64 = 0
-                        loop { if o >= w.sites[s].n { break }; if teko::cov_branch_hit(i to u64, w.sites[s].line, w.sites[s].col, o) { fbc = fbc + 1 }; o = o + 1 }
-                        fbv = fbv + w.sites[s].n
-                        s = s + 1
-                    }
-                    br_cov = br_cov + fbc; br_val = br_val + fbv
-                    let cname = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
-                    let lrate = cov_rate_str(flc, flv)
-                    let brate = cov_rate_str(fbc, fbv)
-                    body = teko::str::concat(body, $"      <class name='{cname}' filename='{f.file}' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n")
-                    body = teko::str::concat(body, $"        <methods><method name='{f.name}' signature='()V' line-rate='{lrate}' branch-rate='{brate}'><lines><line number='{f.line}' hits='{fnhit}'/></lines></method></methods>\n")
-                    body = teko::str::concat(body, "        <lines>\n")
-                    body = teko::str::concat(body, llines)
-                    body = teko::str::concat(body, "        </lines>\n      </class>\n")
+                    let lt = cov_fn_line_tally(w, i to u64)
+                    let bt = cov_fn_branch_tally(w, i to u64)
+                    lines_cov = lines_cov + lt.cov; lines_val = lines_val + lt.val
+                    br_cov = br_cov + bt.cov; br_val = br_val + bt.val
+                    let fnhit: u64 = if teko::cov_is_marked(i to u64) { 1 to u64 } else { 0 to u64 }
+                    body = cov_emit_class(body, f, i to u64, w, lt, bt, fnhit)
                 }
             }
             _ => { }
@@ -3994,13 +4077,14 @@ exp fn cov_cobertura(prog: checker::TProgram) -> str {
     }
     let lrate = cov_rate_str(lines_cov, lines_val)
     let brate = cov_rate_str(br_cov, br_val)
-    mut out = "<?xml version='1.0' ?>\n"
-    out = teko::str::concat(out, $"<coverage line-rate='{lrate}' branch-rate='{brate}' lines-covered='{lines_cov}' lines-valid='{lines_val}' branches-covered='{br_cov}' branches-valid='{br_val}' complexity='0' version='teko' timestamp='0'>\n")
-    out = teko::str::concat(out, "  <sources><source>.</source></sources>\n  <packages>\n")
-    out = teko::str::concat(out, $"    <package name='teko' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n      <classes>\n")
-    out = teko::str::concat(out, body)
-    out = teko::str::concat(out, "      </classes>\n    </package>\n  </packages>\n</coverage>\n")
-    out
+    mut out: []byte = teko::list::empty()
+    out = teko::mem::append_fo(out, "<?xml version='1.0' ?>\n")
+    out = teko::mem::append_fo(out, $"<coverage line-rate='{lrate}' branch-rate='{brate}' lines-covered='{lines_cov}' lines-valid='{lines_val}' branches-covered='{br_cov}' branches-valid='{br_val}' complexity='0' version='teko' timestamp='0'>\n")
+    out = teko::mem::append_fo(out, "  <sources><source>.</source></sources>\n  <packages>\n")
+    out = teko::mem::append_fo(out, $"    <package name='teko' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n      <classes>\n")
+    out = teko::mem::append_fo(out, str(body))
+    out = teko::mem::append_fo(out, "      </classes>\n    </package>\n  </packages>\n</coverage>\n")
+    str(out)
 }
 
 // ---------------------------------------------------------------------------
