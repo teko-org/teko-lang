@@ -1,0 +1,622 @@
+/**
+ * emit_u64_le — append `v` to `buf` as eight little-endian bytes (the Mach-O
+ * 64-bit field emit primitive: `vmaddr`/`vmsize`/`fileoff`/`filesize`, a
+ * `section_64` `addr`/`size`, and an `nlist_64` `n_value`). All bit-slicing
+ * stays in u64 arithmetic; only the final `& 0xFF` narrows to `byte`.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u64 v  the 64-bit value to append
+ * @return []byte  `buf` followed by v's eight little-endian bytes
+ */
+fn emit_u64_le(buf: []byte, v: u64) -> []byte {
+    mut b = teko::list::push(buf, (v & (0xFF to u64)) to byte)
+    b = teko::list::push(b, ((v >> (8 to u64)) & (0xFF to u64)) to byte)
+    b = teko::list::push(b, ((v >> (16 to u64)) & (0xFF to u64)) to byte)
+    b = teko::list::push(b, ((v >> (24 to u64)) & (0xFF to u64)) to byte)
+    b = teko::list::push(b, ((v >> (32 to u64)) & (0xFF to u64)) to byte)
+    b = teko::list::push(b, ((v >> (40 to u64)) & (0xFF to u64)) to byte)
+    b = teko::list::push(b, ((v >> (48 to u64)) & (0xFF to u64)) to byte)
+    teko::list::push(b, ((v >> (56 to u64)) & (0xFF to u64)) to byte)
+}
+
+/**
+ * emit_str_bytes — append every byte of `s` to `buf` (a symbol name into the
+ * string table, or a fixed section/segment name before padding). A `str` is a
+ * byte sequence indexed by `s[i]`, so no re-encoding happens.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param str s  the string whose bytes to append
+ * @return []byte  `buf` followed by s's raw bytes
+ */
+fn emit_str_bytes(buf: []byte, s: str) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        b = teko::list::push(b, s[i])
+        i++
+    }
+    b
+}
+
+/**
+ * emit_fixed16 — append `s`'s bytes then zero-pad to exactly 16 bytes (the
+ * `section_64` `sectname`/`segname` fixed fields, and the `LC_SEGMENT_64` empty
+ * segment name). `s` is at most 16 bytes for every name A4 emits.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param str s  the name (at most 16 bytes)
+ * @return []byte  `buf` followed by s zero-padded to 16 bytes
+ */
+fn emit_fixed16(buf: []byte, s: str) -> []byte {
+    mut b = emit_str_bytes(buf, s)
+    mut n: u64 = s.len
+    loop {
+        if n >= (16 to u64) { break }
+        b = teko::list::push(b, 0 to byte)
+        n++
+    }
+    b
+}
+
+/**
+ * emit_u8_field — append one byte-wide field (an `nlist_64` `n_type`/`n_sect`),
+ * narrowing the u32 field value to a single `byte`.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 v  the field value (0..255)
+ * @return []byte  `buf` followed by v's low byte
+ */
+fn emit_u8_field(buf: []byte, v: u32) -> []byte {
+    teko::list::push(buf, (v & (0xFF to u32)) to byte)
+}
+
+/**
+ * pad_to_mult — append zero bytes until the buffer length is a multiple of `k`
+ * (the section-data-to-relocation-table 4-byte and the relocation-to-symbol-
+ * table 8-byte gaps). `k` is a small power of two, so the loop terminates.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 k  the alignment (a small power of two)
+ * @return []byte  `buf` zero-padded up to a multiple of `k`
+ */
+fn pad_to_mult(buf: []byte, k: u32) -> []byte {
+    mut b = buf
+    loop {
+        if ((b.len to u32) % k) == (0 to u32) { break }
+        b = teko::list::push(b, 0 to byte)
+    }
+    b
+}
+
+/**
+ * StrTab — the assembled Mach-O string table: the raw bytes (a leading NUL then
+ * one `_`-prefixed, NUL-terminated name per symbol) and the parallel per-symbol
+ * `n_strx` offsets the `nlist_64` entries carry.
+ *
+ * @since #385 A4-4
+ */
+type StrTab = struct {
+    /**
+     * bytes — the string-table image (leading NUL + `_name\0` per symbol).
+     */
+    bytes: []byte
+    /**
+     * strx — the byte offset of each symbol's name in `bytes`, in symbol order.
+     */
+    strx: []u32
+}
+
+/**
+ * build_strtab — assemble the string table from the symbol list: a leading NUL
+ * (the reserved empty name at index 0), then each symbol's Mach-O name — the
+ * `_` prefix the object format requires, the unprefixed `Symbol.name`, and a
+ * NUL terminator — recording each name's start offset as its `n_strx`.
+ *
+ * @param []Symbol symbols  the symbol table, in emission order
+ * @return StrTab  the string-table bytes + the per-symbol name offsets
+ */
+fn build_strtab(symbols: []Symbol) -> StrTab {
+    mut bytes: []byte = teko::list::push(teko::list::empty(), 0 to byte)
+    mut strx: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        strx = teko::list::push(strx, bytes.len to u32)
+        bytes = teko::list::push(bytes, 0x5F to byte)
+        bytes = emit_str_bytes(bytes, symbols[i].name)
+        bytes = teko::list::push(bytes, 0 to byte)
+        i++
+    }
+    StrTab { bytes = bytes; strx = strx }
+}
+
+/**
+ * count_defined — the number of defined symbols in `symbols` (local + global):
+ * the start index of the undefined range (`iundefsym`).
+ *
+ * @param []Symbol symbols  the symbol table
+ * @return u32  the count of `defined` symbols
+ */
+fn count_defined(symbols: []Symbol) -> u32 {
+    mut n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        if symbols[i].defined { n = n + (1 to u32) }
+        i++
+    }
+    n
+}
+
+/**
+ * count_local — the number of file-local defined symbols in `symbols` (the
+ * leading run of the local-then-global-then-undefined table): `LC_DYSYMTAB`'s
+ * `nlocalsym`, and the start index of the global-defined range (`iextdefsym`).
+ *
+ * @param []Symbol symbols  the symbol table
+ * @return u32  the count of `defined && local` symbols
+ */
+fn count_local(symbols: []Symbol) -> u32 {
+    mut n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        if symbols[i].defined && symbols[i].local { n = n + (1 to u32) }
+        i++
+    }
+    n
+}
+
+/**
+ * sym_index — the symbol-table index of the symbol named `name` (the
+ * `relocation_info` `r_symbolnum`), or `symbols.len` when absent. `encode_module`
+ * adds every relocation target to the table, so the absent-sentinel is
+ * unreached for a well-formed `EncodedModule` (and is covered directly by a
+ * unit test on a hand-built input).
+ *
+ * @param []Symbol symbols  the symbol table
+ * @param str name  the target symbol's unprefixed name
+ * @return u32  the symbol's index, or `symbols.len` when not found
+ */
+fn sym_index(symbols: []Symbol, name: str) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        if symbols[i].name == name { return i to u32 }
+        i++
+    }
+    symbols.len to u32
+}
+
+/**
+ * reloc_type_value — the ARM64 Mach-O relocation type for an `MRelocKind`:
+ * `ARM64_RELOC_PAGE21`(3) for `PageHi`, `ARM64_RELOC_PAGEOFF12`(4) for `PageLo`,
+ * `ARM64_RELOC_BRANCH26`(2) for `Call` (the 1:1 mapping isel pre-tags, §2.2).
+ *
+ * @param MRelocKind k  the relocation kind
+ * @return u32  the `r_type` field value
+ */
+fn reloc_type_value(k: MRelocKind) -> u32 {
+    match k {
+        PageHi => 3 to u32
+        PageLo => 4 to u32
+        Call => 2 to u32
+    }
+}
+
+/**
+ * reloc_pcrel — the `r_pcrel` bit for an `MRelocKind`: 1 for the PC-relative
+ * PAGE21 (ADRP) and BRANCH26 (BL) fixups, 0 for the absolute PAGEOFF12 (ADD
+ * lo12) fixup.
+ *
+ * @param MRelocKind k  the relocation kind
+ * @return u32  the `r_pcrel` field value (0 or 1)
+ */
+fn reloc_pcrel(k: MRelocKind) -> u32 {
+    match k {
+        PageHi => 1 to u32
+        PageLo => 0 to u32
+        Call => 1 to u32
+    }
+}
+
+/**
+ * MachoLayout — the resolved file offsets and counts of a Mach-O object: sizes
+ * driving the load commands (computed BEFORE any bytes are emitted, so the
+ * commands can reference the section/relocation/symbol/string table positions),
+ * and the symbol partition counts driving `LC_DYSYMTAB`.
+ *
+ * @since #385 A4-4
+ */
+type MachoLayout = struct {
+    /**
+     * nsects — the segment's section count (1 for `__text` only, 2 with
+     * `__const`).
+     */
+    nsects: u32
+    /**
+     * sizeofcmds — the total byte size of all load commands (the header's
+     * `sizeofcmds`).
+     */
+    sizeofcmds: u32
+    /**
+     * text_offset — the file offset of the `__text` section data (immediately
+     * after the load commands).
+     */
+    text_offset: u32
+    /**
+     * text_size — the `__text` section byte size.
+     */
+    text_size: u32
+    /**
+     * const_offset — the file offset of the `__const` section data (immediately
+     * after `__text`).
+     */
+    const_offset: u32
+    /**
+     * const_size — the `__const` section byte size (0 when no rodata).
+     */
+    const_size: u32
+    /**
+     * reloc_offset — the 4-aligned file offset of the `__text` relocation table.
+     */
+    reloc_offset: u32
+    /**
+     * nreloc — the number of `__text` relocation entries.
+     */
+    nreloc: u32
+    /**
+     * symtab_offset — the 8-aligned file offset of the `nlist_64` symbol table.
+     */
+    symtab_offset: u32
+    /**
+     * nsyms — the number of symbol-table entries.
+     */
+    nsyms: u32
+    /**
+     * strtab_offset — the file offset of the string table (after the symbols).
+     */
+    strtab_offset: u32
+    /**
+     * strtab_size — the string-table byte size.
+     */
+    strtab_size: u32
+    /**
+     * ndef — the number of defined symbols, local + global (the undefined
+     * range starts here: `iundefsym`).
+     */
+    ndef: u32
+    /**
+     * nlocal — the number of file-local defined symbols (`nlocalsym`; the
+     * global-defined range starts here: `iextdefsym`).
+     */
+    nlocal: u32
+    /**
+     * nundef — the number of undefined symbols (`nundefsym`).
+     */
+    nundef: u32
+}
+
+/**
+ * compute_macho_layout — resolve every file offset and count of the object from
+ * the `EncodedModule` and the pre-built string-table size: the load commands
+ * come first (their size fixes `text_offset`), then the section data
+ * (`__text` then `__const`, contiguous), the 4-aligned relocation table, the
+ * 8-aligned symbol table, and the string table. Mirrors the emission order
+ * exactly, so the load-command offset fields point at the real data.
+ *
+ * @param EncodedModule enc  the section images + symbols + relocations
+ * @param u32 strtab_size  the pre-built string-table byte size
+ * @return MachoLayout  the resolved offsets + counts
+ */
+fn compute_macho_layout(enc: EncodedModule, strtab_size: u32) -> MachoLayout {
+    let nsects = if enc.rodata.len > (0 to u64) { 2 to u32 } else { 1 to u32 }
+    let seg_cmdsize = (72 to u32) + (nsects * (80 to u32))
+    let sizeofcmds = seg_cmdsize + (24 to u32) + (24 to u32) + (80 to u32)
+    let text_offset = (32 to u32) + sizeofcmds
+    let text_size = enc.text.len to u32
+    let const_offset = text_offset + text_size
+    let const_size = enc.rodata.len to u32
+    let seg_data_end = const_offset + const_size
+    let nreloc = enc.relocs.len to u32
+    let reloc_offset = align_up(seg_data_end, 4 to u32)
+    let reloc_end = reloc_offset + (nreloc * (8 to u32))
+    let symtab_offset = align_up(reloc_end, 8 to u32)
+    let nsyms = enc.symbols.len to u32
+    let symtab_end = symtab_offset + (nsyms * (16 to u32))
+    let ndef = count_defined(enc.symbols)
+    let nlocal = count_local(enc.symbols)
+    MachoLayout {
+        nsects = nsects
+        sizeofcmds = sizeofcmds
+        text_offset = text_offset
+        text_size = text_size
+        const_offset = const_offset
+        const_size = const_size
+        reloc_offset = reloc_offset
+        nreloc = nreloc
+        symtab_offset = symtab_offset
+        nsyms = nsyms
+        strtab_offset = symtab_end
+        strtab_size = strtab_size
+        ndef = ndef
+        nlocal = nlocal
+        nundef = nsyms - ndef
+    }
+}
+
+/**
+ * emit_header — the `mach_header_64` (32 bytes): magic `0xFEEDFACF`, cputype
+ * `CPU_TYPE_ARM64` (0x0100000C), cpusubtype 0, filetype `MH_OBJECT` (1), the
+ * four load commands, `sizeofcmds`, flags 0, reserved 0.
+ *
+ * @param []byte buf  the (empty) buffer to extend
+ * @param MachoLayout lay  the resolved layout (for `sizeofcmds`)
+ * @return []byte  `buf` followed by the 32-byte header
+ */
+fn emit_header(buf: []byte, lay: MachoLayout) -> []byte {
+    mut b = emit_u32_le(buf, 0xFEEDFACF to u32)
+    b = emit_u32_le(b, 0x0100000C to u32)
+    b = emit_u32_le(b, 0 to u32)
+    b = emit_u32_le(b, 1 to u32)
+    b = emit_u32_le(b, 4 to u32)
+    b = emit_u32_le(b, lay.sizeofcmds)
+    b = emit_u32_le(b, 0 to u32)
+    emit_u32_le(b, 0 to u32)
+}
+
+/**
+ * emit_section — one `section_64` (80 bytes): the 16-byte section and segment
+ * names, the vm `addr`/`size`, the file `offset`, the log2 `align`, the
+ * relocation `reloff`/`nreloc`, the `flags`, and three reserved words.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param str sectname  the section name (at most 16 bytes)
+ * @param str segname  the segment name (at most 16 bytes)
+ * @param u32 addr  the section vm address
+ * @param u32 size  the section byte size
+ * @param u32 offset  the section file offset
+ * @param u32 align  the log2 alignment
+ * @param u32 reloff  the relocation-table file offset (0 when none)
+ * @param u32 nreloc  the relocation count
+ * @param u32 sect_flags  the section flags
+ * @return []byte  `buf` followed by the 80-byte `section_64`
+ */
+fn emit_section(buf: []byte, sectname: str, segname: str, addr: u32, size: u32, offset: u32, align: u32, reloff: u32, nreloc: u32, sect_flags: u32) -> []byte {
+    mut b = emit_fixed16(buf, sectname)
+    b = emit_fixed16(b, segname)
+    b = emit_u64_le(b, addr to u64)
+    b = emit_u64_le(b, size to u64)
+    b = emit_u32_le(b, offset)
+    b = emit_u32_le(b, align)
+    b = emit_u32_le(b, reloff)
+    b = emit_u32_le(b, nreloc)
+    b = emit_u32_le(b, sect_flags)
+    b = emit_u32_le(b, 0 to u32)
+    b = emit_u32_le(b, 0 to u32)
+    emit_u32_le(b, 0 to u32)
+}
+
+/**
+ * emit_segment — the single `LC_SEGMENT_64` load command (empty segment name)
+ * and its sections: `__text` (pure-instructions, carrying the relocations) and,
+ * when rodata is present, `__const`. The segment's `filesize` spans the
+ * contiguous section data; `vmsize` rounds that to 16-byte alignment.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param MachoLayout lay  the resolved layout
+ * @return []byte  `buf` followed by the segment command and its sections
+ */
+fn emit_segment(buf: []byte, lay: MachoLayout) -> []byte {
+    let seg_cmdsize = (72 to u32) + (lay.nsects * (80 to u32))
+    let data_size = lay.text_size + lay.const_size
+    mut b = emit_u32_le(buf, 0x19 to u32)
+    b = emit_u32_le(b, seg_cmdsize)
+    b = emit_fixed16(b, "")
+    b = emit_u64_le(b, 0 to u64)
+    b = emit_u64_le(b, align_up(data_size, 16 to u32) to u64)
+    b = emit_u64_le(b, lay.text_offset to u64)
+    b = emit_u64_le(b, data_size to u64)
+    b = emit_u32_le(b, 7 to u32)
+    b = emit_u32_le(b, 7 to u32)
+    b = emit_u32_le(b, lay.nsects)
+    b = emit_u32_le(b, 0 to u32)
+    let text_reloff = if lay.nreloc > (0 to u32) { lay.reloc_offset } else { 0 to u32 }
+    b = emit_section(b, "__text", "__TEXT", 0 to u32, lay.text_size, lay.text_offset, 2 to u32, text_reloff, lay.nreloc, 0x80000400 to u32)
+    if lay.nsects > (1 to u32) {
+        b = emit_section(b, "__const", "__TEXT", lay.text_size, lay.const_size, lay.const_offset, 0 to u32, 0 to u32, 0 to u32, 0 to u32)
+    }
+    b
+}
+
+/**
+ * emit_build_version — the `LC_BUILD_VERSION` load command (24 bytes): platform
+ * `PLATFORM_MACOS` (1), a fixed minos/sdk of 11.0.0 (so the object is
+ * deterministic across hosts, satisfying FIXPOINT), and no build tools. Modern
+ * `ld` requires this command on a relocatable object.
+ *
+ * @param []byte buf  the buffer to extend
+ * @return []byte  `buf` followed by the 24-byte build-version command
+ */
+fn emit_build_version(buf: []byte) -> []byte {
+    mut b = emit_u32_le(buf, 0x32 to u32)
+    b = emit_u32_le(b, 24 to u32)
+    b = emit_u32_le(b, 1 to u32)
+    b = emit_u32_le(b, 0x000B0000 to u32)
+    b = emit_u32_le(b, 0x000B0000 to u32)
+    emit_u32_le(b, 0 to u32)
+}
+
+/**
+ * emit_symtab_cmd — the `LC_SYMTAB` load command (24 bytes): the symbol-table
+ * file offset + count and the string-table file offset + size.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param MachoLayout lay  the resolved layout
+ * @return []byte  `buf` followed by the 24-byte symtab command
+ */
+fn emit_symtab_cmd(buf: []byte, lay: MachoLayout) -> []byte {
+    mut b = emit_u32_le(buf, 2 to u32)
+    b = emit_u32_le(b, 24 to u32)
+    b = emit_u32_le(b, lay.symtab_offset)
+    b = emit_u32_le(b, lay.nsyms)
+    b = emit_u32_le(b, lay.strtab_offset)
+    emit_u32_le(b, lay.strtab_size)
+}
+
+/**
+ * emit_dysymtab_cmd — the `LC_DYSYMTAB` load command (80 bytes): the three
+ * contiguous symbol ranges — local (`ilocalsym=0`/`nlocalsym`), global-defined
+ * (`iextdefsym=nlocal`/`nextdefsym`), undefined (`iundefsym=ndef`/`nundefsym`)
+ * — and the twelve unused table pointers (all zero). `ld` requires this command
+ * even for a static object.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param MachoLayout lay  the resolved layout
+ * @return []byte  `buf` followed by the 80-byte dysymtab command
+ */
+fn emit_dysymtab_cmd(buf: []byte, lay: MachoLayout) -> []byte {
+    let nextdef = lay.ndef - lay.nlocal
+    mut b = emit_u32_le(buf, 0x0B to u32)
+    b = emit_u32_le(b, 80 to u32)
+    b = emit_u32_le(b, 0 to u32)
+    b = emit_u32_le(b, lay.nlocal)
+    b = emit_u32_le(b, lay.nlocal)
+    b = emit_u32_le(b, nextdef)
+    b = emit_u32_le(b, lay.ndef)
+    b = emit_u32_le(b, lay.nundef)
+    mut i: u32 = 0
+    loop {
+        if i >= (12 to u32) { break }
+        b = emit_u32_le(b, 0 to u32)
+        i++
+    }
+    b
+}
+
+/**
+ * emit_reloc_table — the `__text` `relocation_info` array: one 8-byte entry per
+ * relocation — the section-relative `r_address`, then the packed
+ * `r_symbolnum | r_pcrel<<24 | r_length(2)<<25 | r_extern(1)<<27 | r_type<<28`.
+ * Every A4 relocation is an external, long, symbol-indexed fixup.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param EncodedModule enc  the module (relocations + symbol table for indices)
+ * @return []byte  `buf` followed by the relocation entries
+ */
+fn emit_reloc_table(buf: []byte, enc: EncodedModule) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= enc.relocs.len { break }
+        let r = enc.relocs[i]
+        b = emit_u32_le(b, r.offset)
+        let symnum = sym_index(enc.symbols, r.sym)
+        let packed = symnum | (reloc_pcrel(r.kind) << (24 to u32)) | ((2 to u32) << (25 to u32)) | ((1 to u32) << (27 to u32)) | (reloc_type_value(r.kind) << (28 to u32))
+        b = emit_u32_le(b, packed)
+        i++
+    }
+    b
+}
+
+/**
+ * section_addr — the `section_64` `addr` (vm address, section-relative to 0)
+ * of a 1-based Mach-O section index: 0 for `__text` (section 1), `text_size`
+ * for `__const` (section 2, laid out immediately after `__text` — the same
+ * value `emit_segment` gives that section's `addr` field). An `nlist_64`
+ * `n_value` is the symbol's ABSOLUTE address, `section_addr + Symbol.offset` —
+ * NOT the bare section-relative offset (the F1 fix: a bare offset understates
+ * every `__const` symbol by `text_size`, which `ld` hard-rejects).
+ *
+ * @param u8 sect  the 1-based section index (1 or 2)
+ * @param u32 text_size  the `__text` section's byte size
+ * @return u32  the section's vm address
+ */
+fn section_addr(sect: u8, text_size: u32) -> u32 {
+    if sect == (2 to u8) { return text_size }
+    0 to u32
+}
+
+/**
+ * emit_one_symbol — one `nlist_64` (16 bytes): the `n_strx` name offset, then
+ * the type/section/value triple — a defined symbol is `N_SECT` (0x0E), plus
+ * `N_EXT` (making it `0x0F`) unless `local`, in its section at its ABSOLUTE
+ * address (`section_addr(s.sect, text_size) + s.offset`, the F1 fix); an
+ * undefined symbol is `N_UNDF | N_EXT` (0x01) with section 0 and value 0.
+ * `n_desc` is always 0.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param Symbol s  the symbol to emit
+ * @param u32 strx  the symbol's name offset in the string table
+ * @param u32 text_size  the `__text` section's byte size (for `__const`'s addr)
+ * @return []byte  `buf` followed by the 16-byte `nlist_64`
+ */
+fn emit_one_symbol(buf: []byte, s: Symbol, strx: u32, text_size: u32) -> []byte {
+    mut b = emit_u32_le(buf, strx)
+    if s.defined {
+        let ntype = if s.local { 0x0E to u32 } else { 0x0F to u32 }
+        b = emit_u8_field(b, ntype)
+        b = emit_u8_field(b, s.sect to u32)
+    } else {
+        b = emit_u8_field(b, 0x01 to u32)
+        b = emit_u8_field(b, 0 to u32)
+    }
+    b = teko::list::push(b, 0 to byte)
+    b = teko::list::push(b, 0 to byte)
+    let value = if s.defined { (section_addr(s.sect, text_size) + s.offset) to u64 } else { 0 to u64 }
+    emit_u64_le(b, value)
+}
+
+/**
+ * emit_symtab — the `nlist_64` symbol table: one entry per symbol, in
+ * local-then-global-then-undefined order, each carrying its string-table name
+ * offset and its section-absolute address.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param []Symbol symbols  the symbol table
+ * @param StrTab strtab  the string table (for the per-symbol name offsets)
+ * @param u32 text_size  the `__text` section's byte size (for `__const`'s addr)
+ * @return []byte  `buf` followed by the symbol-table entries
+ */
+fn emit_symtab(buf: []byte, symbols: []Symbol, strtab: StrTab, text_size: u32) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        b = emit_one_symbol(b, symbols[i], strtab.strx[i], text_size)
+        i++
+    }
+    b
+}
+
+/**
+ * emit_macho — assemble a Mach-O `MH_OBJECT` for arm64 from an `EncodedModule`:
+ * the `mach_header_64` + `LC_SEGMENT_64` (`__text`/`__const`) +
+ * `LC_BUILD_VERSION` + `LC_SYMTAB` + `LC_DYSYMTAB`, then the section images, the
+ * `__text` relocation table, and the symbol + string tables. Enough for
+ * `cc`/`ld` to link into a runnable executable against the C-built `teko_rt`
+ * (D-2 option 1 bootstrap). The `__info_plist` section is added at LINK time
+ * (A4-5, `-Wl,-sectcreate`), not embedded here. Data globals + GOT relocs are
+ * the `A4-globals` stop, raised earlier in `encode_module`.
+ *
+ * @param EncodedModule enc  the section images + symbols + relocations
+ * @return []byte  the Mach-O object file bytes
+ */
+pub fn emit_macho(enc: EncodedModule) -> []byte {
+    let strtab = build_strtab(enc.symbols)
+    let lay = compute_macho_layout(enc, strtab.bytes.len to u32)
+    mut b: []byte = teko::list::empty()
+    b = emit_header(b, lay)
+    b = emit_segment(b, lay)
+    b = emit_build_version(b)
+    b = emit_symtab_cmd(b, lay)
+    b = emit_dysymtab_cmd(b, lay)
+    b = append_bytes(b, enc.text)
+    b = append_bytes(b, enc.rodata)
+    b = pad_to_mult(b, 4 to u32)
+    b = emit_reloc_table(b, enc)
+    b = pad_to_mult(b, 8 to u32)
+    b = emit_symtab(b, enc.symbols, strtab, lay.text_size)
+    append_bytes(b, strtab.bytes)
+}

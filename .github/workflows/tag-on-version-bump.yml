@@ -86,6 +86,62 @@ jobs:
           echo "derived=$DERIVED" >> "$GITHUB_OUTPUT"
           echo "teko.tkp-derived tag = $DERIVED"
 
+      # ── RELEASE GATE ────────────────────────────────────────────────────────────
+      # The manifest-bump push and the CI workflows fire on the SAME commit IN PARALLEL.
+      # The tag minted below triggers release.yml (build + publish), so it must NEVER be
+      # created from a red commit. Block here until the push-triggered CI concludes GREEN
+      # on this exact SHA. Only the two workflows that actually run on this push are
+      # awaited — "Native Build & Test" (the CI gate) and "Sanitizers & Stress" (the
+      # Sanitizer gate). SAST/CodeQL is pull_request-only: it already gated the sub-PR
+      # merge and does not run on this push, so awaiting it would hang (and force-adding
+      # it to the push would re-run CodeQL on every seed bump — pure cost). Idempotent: a
+      # manifest touch that did not bump the version leaves the tag present, so we skip
+      # WITHOUT waiting. A red or timed-out gate exits non-zero → no tag, no release.
+      - name: Gate the release — require CI green on this commit before tagging
+        env:
+          DERIVED: ${{ steps.derive.outputs.derived }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if git ls-remote --exit-code --tags origin "refs/tags/$DERIVED" >/dev/null 2>&1; then
+            echo "SKIP: tag '$DERIVED' already exists — nothing to gate."
+            exit 0
+          fi
+          SHA="$GITHUB_SHA"
+          DEADLINE=$(( $(date +%s) + 60 * 60 ))   # 60 min ceiling for the ASan long-pole
+          echo "Gating '$DERIVED' on the push CI for $SHA (CI gate + Sanitizer gate)…"
+          while :; do
+            all_done=1
+            failed=""
+            for wf in "Native Build & Test" "Sanitizers & Stress"; do
+              info="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${SHA}" \
+                        --jq "[.workflow_runs[] | select(.name==\"$wf\")] | sort_by(.run_number) | last | \"\(.status)|\(.conclusion)\"" || true)"
+              st="${info%%|*}"
+              cc="${info##*|}"
+              if [ -z "$info" ] || [ "$st" != "completed" ]; then
+                echo "  · $wf — ${st:-pending}"
+                all_done=0
+              elif [ "$cc" != "success" ]; then
+                echo "  ✗ $wf — completed=$cc"
+                failed="$failed [$wf=$cc]"
+              else
+                echo "  ✓ $wf — success"
+              fi
+            done
+            if [ -n "$failed" ]; then
+              echo "ABORT: required CI not green on $SHA:$failed"
+              echo "NOT tagging '$DERIVED'. Fix the failure and re-push (which re-bumps/re-tags)."
+              exit 1
+            fi
+            [ "$all_done" = "1" ] && { echo "All required gates GREEN on $SHA — proceeding to tag + release."; break; }
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "TIMEOUT waiting for CI on $SHA — NOT tagging (safe default)."
+              exit 1
+            fi
+            echo "…waiting 30s"
+            sleep 30
+          done
+
       - name: Create + push tag if it does not already exist
         env:
           DERIVED: ${{ steps.derive.outputs.derived }}

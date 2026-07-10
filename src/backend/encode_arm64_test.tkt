@@ -1,0 +1,1899 @@
+use teko::lir
+
+/**
+ * p — a physical GPR operand with the given ISA id (a golden-vector fixture
+ * shorthand; A4 runs post-regalloc, so every operand is physical).
+ *
+ * @param u32 id  the ISA register number (x0..x30, SP/XZR=31)
+ * @return MReg  the physical GPR operand
+ */
+fn p(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * frameless_layout — the `FrameLayout` of a function with no frame: `size=0`,
+ * no callee-saved registers, no slots. Threaded through the A4-1 per-`MInst`
+ * golden checks so the instruction subset that never touches the frame encodes
+ * BYTE-FOR-BYTE as before the `layout` parameter was added.
+ *
+ * @return FrameLayout  the empty (frameless) frame side-table
+ */
+fn frameless_layout() -> FrameLayout {
+    FrameLayout {
+        size = 0 to u32
+        saved_gpr = teko::list::empty()
+        saved_fpr = teko::list::empty()
+        slot_offsets = teko::list::empty()
+    }
+}
+
+/**
+ * layout_of — a `FrameLayout` built directly from its parts, for the frame
+ * golden vectors that pin the exact prologue/epilogue/`MFrameAddr` words to a
+ * known frame without routing through `compute_frame_layout`.
+ *
+ * @param u32 size  the total 16-aligned frame size
+ * @param []u32 gpr  the callee-saved GPR ids (ascending)
+ * @param []u32 fpr  the callee-saved FPR ids (ascending)
+ * @param []u32 slots  the SP-relative slot offsets
+ * @return FrameLayout  the assembled frame side-table
+ */
+fn layout_of(size: u32, gpr: []u32, fpr: []u32, slots: []u32) -> FrameLayout {
+    FrameLayout { size = size; saved_gpr = gpr; saved_fpr = fpr; slot_offsets = slots }
+}
+
+/**
+ * alloca_slot — a frame-slot table entry (`LAlloca`) of the given byte size and
+ * alignment, the mixed-frame `compute_frame_layout` fixture shorthand.
+ *
+ * @param u32 bytes  the slot's byte size
+ * @param u32 align  the slot's alignment
+ * @return lir::LAlloca  the frame-slot entry
+ */
+fn alloca_slot(bytes: u32, align: u32) -> lir::LAlloca {
+    lir::LAlloca { bytes = bytes; align = align }
+}
+
+/**
+ * func_of — an `MFunc` with the given frame table and a single block holding
+ * `insts`, the `compute_frame_layout` / save-set fixture shorthand.
+ *
+ * @param []lir::LAlloca frame  the frame-slot table
+ * @param []MInst insts  the single block's instruction stream
+ * @return MFunc  the assembled function
+ */
+fn func_of(frame: []lir::LAlloca, insts: []MInst) -> MFunc {
+    let block = MBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    MFunc { symbol = "t"; blocks = teko::list::push(teko::list::empty(), block); frame = frame }
+}
+
+/**
+ * l0 — the empty `[]u32` vector, typed for the frame fixtures.
+ *
+ * @return []u32  an empty u32 list
+ */
+fn l0() -> []u32 {
+    teko::list::empty()
+}
+
+/**
+ * l1 — a one-element `[]u32` vector.
+ *
+ * @param u32 a  the sole element
+ * @return []u32  `[a]`
+ */
+fn l1(a: u32) -> []u32 {
+    teko::list::push(l0(), a)
+}
+
+/**
+ * l2 — a two-element `[]u32` vector, in order.
+ *
+ * @param u32 a  the first element
+ * @param u32 b  the second element
+ * @return []u32  `[a, b]`
+ */
+fn l2(a: u32, b: u32) -> []u32 {
+    teko::list::push(l1(a), b)
+}
+
+/**
+ * l3 — a three-element `[]u32` vector, in order.
+ *
+ * @param u32 a  the first element
+ * @param u32 b  the second element
+ * @param u32 c  the third element
+ * @return []u32  `[a, b, c]`
+ */
+fn l3(a: u32, b: u32, c: u32) -> []u32 {
+    teko::list::push(l2(a, b), c)
+}
+
+/**
+ * l_frame — the empty frame-slot table, typed for the fixtures.
+ *
+ * @return []lir::LAlloca  an empty frame table
+ */
+fn l_frame() -> []lir::LAlloca {
+    teko::list::empty()
+}
+
+/**
+ * l_insts — the empty instruction list, typed for the fixtures.
+ *
+ * @return []MInst  an empty instruction stream
+ */
+fn l_insts() -> []MInst {
+    teko::list::empty()
+}
+
+/**
+ * pro — the prologue words of `layout`, or the empty list on an unexpected
+ * honest-stop (so a golden length/word assertion fails loudly rather than
+ * aborting).
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return []u32  the prologue words, or empty on error
+ */
+fn pro(layout: FrameLayout) -> []u32 {
+    match emit_prologue(layout) {
+        error as e => l0()
+        []u32 as w => w
+    }
+}
+
+/**
+ * epi — the epilogue teardown words of `layout`, or the empty list on an
+ * unexpected honest-stop.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return []u32  the epilogue words, or empty on error
+ */
+fn epi(layout: FrameLayout) -> []u32 {
+    match emit_epilogue(layout) {
+        error as e => l0()
+        []u32 as w => w
+    }
+}
+
+/**
+ * pro_stop — the prologue honest-stop message of `layout`, or `<ok>` when it
+ * emits successfully.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return str  the error message, or `<ok>`
+ */
+fn pro_stop(layout: FrameLayout) -> str {
+    match emit_prologue(layout) {
+        error as e => e.message
+        []u32 as w => "<ok>"
+    }
+}
+
+/**
+ * epi_stop — the epilogue honest-stop message of `layout`, or `<ok>` when it
+ * emits successfully.
+ *
+ * @param FrameLayout layout  the resolved frame
+ * @return str  the error message, or `<ok>`
+ */
+fn epi_stop(layout: FrameLayout) -> str {
+    match emit_epilogue(layout) {
+        error as e => e.message
+        []u32 as w => "<ok>"
+    }
+}
+
+/**
+ * fp — a physical FPR operand with the given ISA id (a golden-vector fixture
+ * shorthand for the float honest-stop cases).
+ *
+ * @param u32 id  the ISA register number (v0..v31)
+ * @return MReg  the physical FPR operand
+ */
+fn fp(id: u32) -> MReg {
+    preg(id, MRegClass::FPR)
+}
+
+/**
+ * m — a base-plus-displacement memory operand (a golden-vector fixture
+ * shorthand for the load/store cases).
+ *
+ * @param MReg base  the base register
+ * @param i32 off  the byte displacement
+ * @return MMem  the memory operand
+ */
+fn m(base: MReg, off: i32) -> MMem {
+    MMem { base = base; offset = off }
+}
+
+/**
+ * bad_word — the sentinel `EncWord` returned when a golden fixture that must
+ * encode unexpectedly honest-stops: its all-ones word never matches a real
+ * expected encoding, so the assertion fails loudly.
+ *
+ * @return EncWord  the impossible-word sentinel
+ */
+fn bad_word() -> EncWord {
+    EncWord {
+        word = 0xFFFFFFFF to u32
+        has_branch = false
+        target = 0 to u32
+        branch_form = 0 to u32
+        has_reloc = false
+        reloc_sym = "<error>"
+        reloc_kind = MRelocKind::Call
+    }
+}
+
+/**
+ * enc — encode `inst`, unwrapping the success case and falling back to the
+ * `bad_word` sentinel on an unexpected honest-stop (so a golden assertion on
+ * the word fails rather than aborting the test).
+ *
+ * @param MInst inst  the instruction to encode
+ * @return EncWord  the encoded word, or the sentinel on error
+ */
+fn enc(inst: MInst) -> EncWord {
+    match encode_inst_word(frameless_layout(), inst) {
+        EncWord as x => x
+        error as e => bad_word()
+    }
+}
+
+/**
+ * enc_with — encode `inst` under an explicit `layout` (the `MFrameAddr` golden
+ * path), falling back to the `bad_word` sentinel on an unexpected honest-stop.
+ *
+ * @param FrameLayout layout  the enclosing frame
+ * @param MInst inst  the instruction to encode
+ * @return EncWord  the encoded word, or the sentinel on error
+ */
+fn enc_with(layout: FrameLayout, inst: MInst) -> EncWord {
+    match encode_inst_word(layout, inst) {
+        EncWord as x => x
+        error as e => bad_word()
+    }
+}
+
+/**
+ * stop_of — the honest-stop message `inst` produces, or `<ok>` when it encodes
+ * successfully. Lets an honest-stop test assert the named stop is raised.
+ *
+ * @param MInst inst  the instruction to encode
+ * @return str  the error message, or `<ok>` when it encodes
+ */
+fn stop_of(inst: MInst) -> str {
+    match encode_inst_word(frameless_layout(), inst) {
+        EncWord as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * stop_of_with — the honest-stop message `inst` produces under an explicit
+ * `layout`, or `<ok>` when it encodes (the `MFrameAddr` big-frame stop path).
+ *
+ * @param FrameLayout layout  the enclosing frame
+ * @param MInst inst  the instruction to encode
+ * @return str  the error message, or `<ok>` when it encodes
+ */
+fn stop_of_with(layout: FrameLayout, inst: MInst) -> str {
+    match encode_inst_word(layout, inst) {
+        EncWord as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * assert_word — assert that `inst` encodes to the exact 32-bit `expected` word
+ * (the position-independent golden-vector check).
+ *
+ * @param MInst inst  the instruction to encode
+ * @param u32 expected  the known-good arm64 instruction word
+ * @return void
+ */
+fn assert_word(inst: MInst, expected: u32) {
+    teko::assert::is_true(enc(inst).word == expected)
+}
+
+/**
+ * assert_stop — assert that `inst` honest-stops with a message containing the
+ * named token (`A4-fp`/`A4-bigimm`/`A4-ldur`/`A4-bigframe`).
+ *
+ * @param MInst inst  the instruction to encode
+ * @param str name  the named-stop token expected in the message
+ * @return void
+ */
+fn assert_stop(inst: MInst, name: str) {
+    teko::assert::str_contains(stop_of(inst), name)
+}
+
+#test
+/**
+ * emit_u32_le_splits_little_endian — `emit_u32_le` splits a word into four
+ * ascending little-endian bytes (the shared `[]byte` build idiom).
+ *
+ * @return void
+ */
+fn emit_u32_le_splits_little_endian() {
+    let bytes = emit_u32_le(teko::list::empty(), 0xD2800540 to u32)
+    teko::assert::is_true(bytes.len == 4)
+    teko::assert::is_true(bytes[0] == (0x40 to byte))
+    teko::assert::is_true(bytes[1] == (0x05 to byte))
+    teko::assert::is_true(bytes[2] == (0x80 to byte))
+    teko::assert::is_true(bytes[3] == (0xD2 to byte))
+}
+
+#test
+/**
+ * encodes_the_movz_family — MOVZ/MOVK/MOVN across widths and lane shifts.
+ *
+ * @return void
+ */
+fn encodes_the_movz_family() {
+    assert_word(movz_inst(true, p(0), 42, 0), 0xD2800540)
+    assert_word(movz_inst(false, p(0), 42, 0), 0x52800540)
+    assert_word(movz_inst(true, p(0), 100, 16), 0xD2A00C80)
+    assert_word(movk_inst(true, p(0), 200, 32), 0xF2C01900)
+    assert_word(movn_inst(false, p(0), 1, 0), 0x12800020)
+}
+
+#test
+/**
+ * encodes_the_gpr_move — a GPR-GPR move (ORR from XZR) in both widths.
+ *
+ * @return void
+ */
+fn encodes_the_gpr_move() {
+    assert_word(mov_inst(true, p(0), p(8)), 0xAA0803E0)
+    assert_word(mov_inst(false, p(0), p(8)), 0x2A0803E0)
+}
+
+#test
+/**
+ * encodes_every_integer_alu_reg — all eleven register-register ALU ops, over
+ * `x0, x1, x2` (dst=0, a=1, b=2), covering `alu_reg_base` end to end.
+ *
+ * @return void
+ */
+fn encodes_every_integer_alu_reg() {
+    assert_word(alu_inst(MAluOp::Add, true, p(0), p(1), p(2)), 0x8B020020)
+    assert_word(alu_inst(MAluOp::Add, false, p(0), p(1), p(2)), 0x0B020020)
+    assert_word(alu_inst(MAluOp::Sub, true, p(0), p(1), p(2)), 0xCB020020)
+    assert_word(alu_inst(MAluOp::And, true, p(0), p(1), p(2)), 0x8A020020)
+    assert_word(alu_inst(MAluOp::Orr, true, p(0), p(1), p(2)), 0xAA020020)
+    assert_word(alu_inst(MAluOp::Eor, true, p(0), p(1), p(2)), 0xCA020020)
+    assert_word(alu_inst(MAluOp::Mul, true, p(0), p(1), p(2)), 0x9B027C20)
+    assert_word(alu_inst(MAluOp::Sdiv, true, p(0), p(1), p(2)), 0x9AC20C20)
+    assert_word(alu_inst(MAluOp::Udiv, true, p(0), p(1), p(2)), 0x9AC20820)
+    assert_word(alu_inst(MAluOp::Lsl, true, p(0), p(1), p(2)), 0x9AC22020)
+    assert_word(alu_inst(MAluOp::Lsr, true, p(0), p(1), p(2)), 0x9AC22420)
+    assert_word(alu_inst(MAluOp::Asr, true, p(0), p(1), p(2)), 0x9AC22820)
+}
+
+#test
+/**
+ * encodes_alu_immediate — ADD/SUB immediates in both widths, plus the
+ * negative-immediate add/sub flip (`ADD #-k` == `SUB #k`).
+ *
+ * @return void
+ */
+fn encodes_alu_immediate() {
+    assert_word(alu_imm_inst(MAluOp::Add, true, p(0), p(1), 7 to i64), 0x91001C20)
+    assert_word(alu_imm_inst(MAluOp::Sub, true, p(0), p(1), 7 to i64), 0xD1001C20)
+    assert_word(alu_imm_inst(MAluOp::Add, false, p(0), p(1), 7 to i64), 0x11001C20)
+    assert_word(alu_imm_inst(MAluOp::Add, true, p(0), p(1), (0 to i64) - (7 to i64)), 0xD1001C20)
+    assert_word(alu_imm_inst(MAluOp::Sub, true, p(0), p(1), (0 to i64) - (7 to i64)), 0x91001C20)
+}
+
+#test
+/**
+ * encodes_msub_neg_mvn — the MSUB remainder form, NEG (SUB from XZR), and MVN
+ * (ORN from XZR).
+ *
+ * @return void
+ */
+fn encodes_msub_neg_mvn() {
+    assert_word(msub_inst(true, p(0), p(1), p(2), p(3)), 0x9B028C20)
+    assert_word(neg_inst(true, p(0), p(1)), 0xCB0103E0)
+    assert_word(neg_inst(false, p(0), p(1)), 0x4B0103E0)
+    assert_word(mvn_inst(false, p(0), p(1)), 0x2A2103E0)
+    assert_word(mvn_inst(true, p(0), p(1)), 0xAA2103E0)
+}
+
+#test
+/**
+ * encodes_compares — CMP (SUBS to XZR) register and immediate forms in both
+ * widths.
+ *
+ * @return void
+ */
+fn encodes_compares() {
+    assert_word(cmp_inst(true, p(1), p(2)), 0xEB02003F)
+    assert_word(cmp_inst(false, p(1), p(2)), 0x6B02003F)
+    assert_word(cmp_imm_inst(true, p(1), 7 to i64), 0xF1001C3F)
+    assert_word(cmp_imm_inst(false, p(1), 7 to i64), 0x71001C3F)
+}
+
+#test
+/**
+ * encodes_cset_all_conditions — CSET (CSINC with the inverted condition) for
+ * all ten `MCond` values, covering `cond_code` end to end.
+ *
+ * @return void
+ */
+fn encodes_cset_all_conditions() {
+    assert_word(cset_inst(true, p(0), MCond::EQ), 0x9A9F17E0)
+    assert_word(cset_inst(false, p(0), MCond::NE), 0x1A9F07E0)
+    assert_word(cset_inst(true, p(0), MCond::LT), 0x9A9FA7E0)
+    assert_word(cset_inst(true, p(0), MCond::LE), 0x9A9FC7E0)
+    assert_word(cset_inst(true, p(0), MCond::GT), 0x9A9FD7E0)
+    assert_word(cset_inst(true, p(0), MCond::GE), 0x9A9FB7E0)
+    assert_word(cset_inst(true, p(0), MCond::LO), 0x9A9F27E0)
+    assert_word(cset_inst(true, p(0), MCond::LS), 0x9A9F87E0)
+    assert_word(cset_inst(true, p(0), MCond::HI), 0x9A9F97E0)
+    assert_word(cset_inst(true, p(0), MCond::HS), 0x9A9F37E0)
+}
+
+#test
+/**
+ * encodes_every_extend — the six narrow sign/zero-extends (SBFM/UBFM),
+ * covering `ext_base` end to end.
+ *
+ * @return void
+ */
+fn encodes_every_extend() {
+    assert_word(ext_inst(MExtOp::Sxtb, p(0), p(1)), 0x93401C20)
+    assert_word(ext_inst(MExtOp::Sxth, p(0), p(1)), 0x93403C20)
+    assert_word(ext_inst(MExtOp::Sxtw, p(0), p(1)), 0x93407C20)
+    assert_word(ext_inst(MExtOp::Uxtb, p(0), p(1)), 0x53001C20)
+    assert_word(ext_inst(MExtOp::Uxth, p(0), p(1)), 0x53003C20)
+    assert_word(ext_inst(MExtOp::Uxtw, p(0), p(1)), 0xD3407C20)
+}
+
+#test
+/**
+ * encodes_loads — LDR/LDRB/LDRH plus the sign-extending LDRSB/LDRSH/LDRSW,
+ * including scaled offsets, covering `load_form` end to end.
+ *
+ * @return void
+ */
+fn encodes_loads() {
+    assert_word(load_inst(MMemSize::X, false, p(0), m(p(1), 0)), 0xF9400020)
+    assert_word(load_inst(MMemSize::X, false, p(0), m(p(1), 8)), 0xF9400420)
+    assert_word(load_inst(MMemSize::W, false, p(0), m(p(1), 4)), 0xB9400420)
+    assert_word(load_inst(MMemSize::B, false, p(0), m(p(1), 0)), 0x39400020)
+    assert_word(load_inst(MMemSize::H, false, p(0), m(p(1), 0)), 0x79400020)
+    assert_word(load_inst(MMemSize::B, true, p(0), m(p(1), 0)), 0x39800020)
+    assert_word(load_inst(MMemSize::H, true, p(0), m(p(1), 0)), 0x79800020)
+    assert_word(load_inst(MMemSize::W, true, p(0), m(p(1), 0)), 0xB9800020)
+}
+
+#test
+/**
+ * encodes_stores — STR/STRB/STRH across widths and scaled offsets, covering
+ * `store_form` end to end.
+ *
+ * @return void
+ */
+fn encodes_stores() {
+    assert_word(store_inst(MMemSize::X, p(0), m(p(1), 0)), 0xF9000020)
+    assert_word(store_inst(MMemSize::X, p(0), m(p(1), 16)), 0xF9000820)
+    assert_word(store_inst(MMemSize::W, p(0), m(p(1), 4)), 0xB9000420)
+    assert_word(store_inst(MMemSize::B, p(0), m(p(1), 0)), 0x39000020)
+    assert_word(store_inst(MMemSize::H, p(0), m(p(1), 0)), 0x79000020)
+}
+
+#test
+/**
+ * encodes_indirect_call_and_ret — BLR (position-independent) and the bare RET
+ * word.
+ *
+ * @return void
+ */
+fn encodes_indirect_call_and_ret() {
+    let no_uses: []MReg = teko::list::empty()
+    assert_word(call_indirect_inst(p(8), no_uses, p(0), false), 0xD63F0100)
+    assert_word(ret_inst(), 0xD65F03C0)
+}
+
+#test
+/**
+ * encodes_unconditional_branch_placeholder — B emits the `0x14000000`
+ * placeholder flagged for imm26 patching with its target block id.
+ *
+ * @return void
+ */
+fn encodes_unconditional_branch_placeholder() {
+    let ew = enc(branch_inst(3))
+    teko::assert::is_true(ew.word == (0x14000000 to u32))
+    teko::assert::is_true(ew.has_branch)
+    teko::assert::is_false(ew.has_reloc)
+    teko::assert::is_true(ew.target == (3 to u32))
+    teko::assert::is_true(ew.branch_form == (0 to u32))
+}
+
+#test
+/**
+ * encodes_conditional_branch_placeholder — B.cond bakes the condition and flags
+ * imm19 patching; the condition rides bits 0-3.
+ *
+ * @return void
+ */
+fn encodes_conditional_branch_placeholder() {
+    let ew = enc(branch_cond_inst(MCond::NE, 2))
+    teko::assert::is_true(ew.word == (0x54000001 to u32))
+    teko::assert::is_true(ew.has_branch)
+    teko::assert::is_true(ew.target == (2 to u32))
+    teko::assert::is_true(ew.branch_form == (1 to u32))
+    assert_word(branch_cond_inst(MCond::EQ, 0), 0x54000000)
+}
+
+#test
+/**
+ * encodes_compare_and_branch_placeholder — CBZ/CBNZ bake the register and
+ * zero/nonzero opcode and flag imm19 patching, over both widths.
+ *
+ * @return void
+ */
+fn encodes_compare_and_branch_placeholder() {
+    let ew = enc(cbz_inst(true, true, p(5), 4))
+    teko::assert::is_true(ew.word == (0xB4000005 to u32))
+    teko::assert::is_true(ew.has_branch)
+    teko::assert::is_true(ew.target == (4 to u32))
+    teko::assert::is_true(ew.branch_form == (1 to u32))
+    assert_word(cbz_inst(false, false, p(5), 4), 0x35000005)
+    assert_word(cbz_inst(true, false, p(5), 4), 0xB5000005)
+}
+
+#test
+/**
+ * encodes_direct_call_reloc — BL emits the `0x94000000` placeholder flagged for
+ * a `Call` (BRANCH26) relocation on the callee symbol.
+ *
+ * @return void
+ */
+fn encodes_direct_call_reloc() {
+    let no_uses: []MReg = teko::list::empty()
+    let ew = enc(call_inst("tk_exit", no_uses, p(0), false, false))
+    teko::assert::is_true(ew.word == (0x94000000 to u32))
+    teko::assert::is_true(ew.has_reloc)
+    teko::assert::is_false(ew.has_branch)
+    teko::assert::str_contains(ew.reloc_sym, "tk_exit")
+    teko::assert::str_contains(reloc_kind_name(ew.reloc_kind), "call")
+}
+
+#test
+/**
+ * encodes_adrp_addlo_reloc — ADRP and ADD-lo12 emit their placeholders flagged
+ * for the PAGE21/PAGEOFF12 relocations, carrying the instruction's own kind.
+ *
+ * @return void
+ */
+fn encodes_adrp_addlo_reloc() {
+    let hi = enc(adrp_inst(p(3), "msg", MRelocKind::PageHi))
+    teko::assert::is_true(hi.word == (0x90000003 to u32))
+    teko::assert::is_true(hi.has_reloc)
+    teko::assert::str_contains(reloc_kind_name(hi.reloc_kind), "page_hi")
+    let lo = enc(add_lo_inst(p(1), p(2), "msg", MRelocKind::PageLo))
+    teko::assert::is_true(lo.word == (0x91000041 to u32))
+    teko::assert::is_true(lo.has_reloc)
+    teko::assert::str_contains(reloc_kind_name(lo.reloc_kind), "page_lo")
+}
+
+#test
+/**
+ * float_family_honest_stops — every FP-family case raises the `A4-fp` named
+ * honest-stop.
+ *
+ * @return void
+ */
+fn float_family_honest_stops() {
+    assert_stop(falu_inst(MFAluOp::FAdd, true, fp(0), fp(1), fp(2)), "A4-fp")
+    assert_stop(fneg_inst(true, fp(0), fp(1)), "A4-fp")
+    assert_stop(fcmp_inst(true, fp(0), fp(1)), "A4-fp")
+    assert_stop(fmov_inst(true, fp(0), fp(1)), "A4-fp")
+    assert_stop(cvt_inst(MCvtOp::Scvtf, fp(0), p(1)), "A4-fp")
+}
+
+#test
+/**
+ * fpr_memory_honest_stops — loads/stores of the `S`/`D` FPR widths raise the
+ * `A4-fp` honest-stop.
+ *
+ * @return void
+ */
+fn fpr_memory_honest_stops() {
+    assert_stop(load_inst(MMemSize::S, false, fp(0), m(p(1), 0)), "A4-fp")
+    assert_stop(load_inst(MMemSize::D, false, fp(0), m(p(1), 0)), "A4-fp")
+    assert_stop(store_inst(MMemSize::S, fp(0), m(p(1), 0)), "A4-fp")
+    assert_stop(store_inst(MMemSize::D, fp(0), m(p(1), 0)), "A4-fp")
+}
+
+#test
+/**
+ * frameless_layout_leaves_a41_goldens_unchanged — threading a frameless
+ * `FrameLayout` through `encode_inst_word` leaves the A4-1 integer/control/
+ * memory encodings BYTE-FOR-BYTE identical (the layout parameter is inert for
+ * every case that does not touch the frame).
+ *
+ * @return void
+ */
+fn frameless_layout_leaves_a41_goldens_unchanged() {
+    let fl = frameless_layout()
+    teko::assert::is_true(enc_with(fl, movz_inst(true, p(0), 42, 0)).word == (0xD2800540 to u32))
+    teko::assert::is_true(enc_with(fl, alu_inst(MAluOp::Add, true, p(0), p(1), p(2))).word == (0x8B020020 to u32))
+    teko::assert::is_true(enc_with(fl, ret_inst()).word == (0xD65F03C0 to u32))
+}
+
+#test
+/**
+ * empty_frame_is_frameless — a leaf function (a compute + `ret`, no call, no
+ * allocas) resolves to a frameless layout: `size=0`, no callee-saved, no slots.
+ *
+ * @return void
+ */
+fn empty_frame_is_frameless() {
+    let insts = teko::list::push(teko::list::push(l_insts(), mov_inst(true, p(0), p(1))), ret_inst())
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (0 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+    teko::assert::is_true(fl.saved_fpr.len == 0)
+    teko::assert::is_true(fl.slot_offsets.len == 0)
+}
+
+#test
+/**
+ * minimal_frame_is_16 — a function that BOTH calls and returns but has no slots
+ * and no callee-saved registers still needs FP/LR preserved: a 16-byte frame
+ * (the doc's N=16 minimal frame).
+ *
+ * @return void
+ */
+fn minimal_frame_is_16() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = teko::list::push(teko::list::push(l_insts(), call_inst("callee", no_uses, p(0), false, false)), ret_inst())
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (16 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+    teko::assert::is_true(fl.slot_offsets.len == 0)
+}
+
+#test
+/**
+ * call_without_ret_is_frameless — a function that makes a call but never returns
+ * (the `exit(n)`-terminated virtual-`main` shape: no `MRet`) needs no LR save,
+ * so with no slots and no callee-saved it is frameless (`size=0`).
+ *
+ * @return void
+ */
+fn call_without_ret_is_frameless() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = teko::list::push(l_insts(), call_inst("tk_exit", no_uses, p(0), false, false))
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (0 to u32))
+}
+
+#test
+/**
+ * multi_slot_mixed_align_offsets — a frame of three allocas with mixed sizes and
+ * alignments lays out each slot at its own aligned offset (`[0, 16, 24]`), and
+ * the whole frame rounds to 16 (`48`).
+ *
+ * @return void
+ */
+fn multi_slot_mixed_align_offsets() {
+    let frame = teko::list::push(teko::list::push(teko::list::push(l_frame(), alloca_slot(16, 8)), alloca_slot(4, 4)), alloca_slot(8, 8))
+    let fl = compute_frame_layout(aapcs64(), func_of(frame, l_insts()))
+    teko::assert::is_true(fl.slot_offsets.len == 3)
+    teko::assert::is_true(fl.slot_offsets[0] == (0 to u32))
+    teko::assert::is_true(fl.slot_offsets[1] == (16 to u32))
+    teko::assert::is_true(fl.slot_offsets[2] == (24 to u32))
+    teko::assert::is_true(fl.size == (48 to u32))
+}
+
+#test
+/**
+ * frame_rounds_to_16 — a single 8-byte slot plus one callee-saved GPR rounds the
+ * total (slots 16 + saved 8 + FP/LR 16 = 40) up to 48.
+ *
+ * @return void
+ */
+fn frame_rounds_to_16() {
+    let frame = teko::list::push(l_frame(), alloca_slot(8, 8))
+    let insts = teko::list::push(l_insts(), mov_inst(true, p(19), p(0)))
+    let fl = compute_frame_layout(aapcs64(), func_of(frame, insts))
+    teko::assert::is_true(fl.slot_offsets[0] == (0 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 1)
+    teko::assert::is_true(fl.saved_gpr[0] == (19 to u32))
+    teko::assert::is_true(fl.size == (48 to u32))
+}
+
+#test
+/**
+ * save_set_uses_callee_saved — scanning operands that touch the callee-saved
+ * x25/x28/x19/x22 (out of order, one repeated) and the caller-saved x0/x1/x2
+ * re-derives the ascending, duplicate-free `saved_gpr=[19,22,25,28]` — the
+ * front-insert, mid-insert-with-continuation, end-append, and dedup paths of the
+ * ordered insert.
+ *
+ * @return void
+ */
+fn save_set_uses_callee_saved() {
+    let i0 = alu_inst(MAluOp::Add, true, p(0), p(25), p(28))
+    let i1 = alu_inst(MAluOp::Add, true, p(1), p(19), p(22))
+    let i2 = alu_inst(MAluOp::Add, true, p(2), p(25), p(0))
+    let insts = teko::list::push(teko::list::push(teko::list::push(l_insts(), i0), i1), i2)
+    let saved = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(saved.saved_gpr.len == 4)
+    teko::assert::is_true(saved.saved_gpr[0] == (19 to u32))
+    teko::assert::is_true(saved.saved_gpr[1] == (22 to u32))
+    teko::assert::is_true(saved.saved_gpr[2] == (25 to u32))
+    teko::assert::is_true(saved.saved_gpr[3] == (28 to u32))
+    teko::assert::is_true(saved.saved_fpr.len == 0)
+}
+
+#test
+/**
+ * save_set_no_callee_saved — a function touching only caller-saved x0/x1
+ * re-derives an empty callee-saved GPR set.
+ *
+ * @return void
+ */
+fn save_set_no_callee_saved() {
+    let i0 = alu_inst(MAluOp::Add, true, p(0), p(1), p(0))
+    let insts = teko::list::push(l_insts(), i0)
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+    teko::assert::is_true(fl.saved_fpr.len == 0)
+}
+
+#test
+/**
+ * save_set_uses_callee_saved_fpr — an instruction reading the callee-saved v8
+ * re-derives `saved_fpr=[8]` (the FPR half of the save-set, exercised via a
+ * float op whose registers `inst_regs` reports even though its encoding stops).
+ *
+ * @return void
+ */
+fn save_set_uses_callee_saved_fpr() {
+    let i0 = fmov_inst(true, fp(8), fp(0))
+    let insts = teko::list::push(l_insts(), i0)
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.saved_fpr.len == 1)
+    teko::assert::is_true(fl.saved_fpr[0] == (8 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+}
+
+#test
+/**
+ * frameless_prologue_epilogue_empty — a `size=0` layout emits neither prologue
+ * nor epilogue words.
+ *
+ * @return void
+ */
+fn frameless_prologue_epilogue_empty() {
+    let fl = frameless_layout()
+    teko::assert::is_true(pro(fl).len == 0)
+    teko::assert::is_true(epi(fl).len == 0)
+}
+
+#test
+/**
+ * minimal_prologue_epilogue_words — the FP/LR-only 16-byte frame's exact
+ * prologue (`sub sp,#16`; `stp x29,x30,[sp,#0]`; `add x29,sp,#0`) and epilogue
+ * (`ldp x29,x30,[sp,#0]`; `add sp,#16`).
+ *
+ * @return void
+ */
+fn minimal_prologue_epilogue_words() {
+    let fl = layout_of(16 to u32, l0(), l0(), l0())
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 3)
+    teko::assert::is_true(pr[0] == (0xD10043FF to u32))
+    teko::assert::is_true(pr[1] == (0xA9007BFD to u32))
+    teko::assert::is_true(pr[2] == (0x910003FD to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep.len == 2)
+    teko::assert::is_true(ep[0] == (0xA9407BFD to u32))
+    teko::assert::is_true(ep[1] == (0x910043FF to u32))
+}
+
+#test
+/**
+ * callee_saved_gpr_pair_words — a 48-byte frame saving the x19/x20 pair emits
+ * the FP/LR save at `#32`, the FP-set at `#32`, and the `stp x19,x20,[sp,#16]`
+ * pair (restored by `ldp x19,x20,[sp,#16]`).
+ *
+ * @return void
+ */
+fn callee_saved_gpr_pair_words() {
+    let fl = layout_of(48 to u32, l2(19, 20), l0(), l1(0))
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 4)
+    teko::assert::is_true(pr[0] == (0xD100C3FF to u32))
+    teko::assert::is_true(pr[1] == (0xA9027BFD to u32))
+    teko::assert::is_true(pr[2] == (0x910083FD to u32))
+    teko::assert::is_true(pr[3] == (0xA90153F3 to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep.len == 3)
+    teko::assert::is_true(ep[0] == (0xA94153F3 to u32))
+    teko::assert::is_true(ep[1] == (0xA9427BFD to u32))
+    teko::assert::is_true(ep[2] == (0x9100C3FF to u32))
+}
+
+#test
+/**
+ * callee_saved_gpr_single_word — an odd callee-saved count (only x19) in a
+ * 32-byte frame emits a single `str x19,[sp,#8]` (restored by `ldr
+ * x19,[sp,#8]`).
+ *
+ * @return void
+ */
+fn callee_saved_gpr_single_word() {
+    let fl = layout_of(32 to u32, l1(19), l0(), l0())
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 4)
+    teko::assert::is_true(pr[3] == (0xF90007F3 to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep[0] == (0xF94007F3 to u32))
+}
+
+#test
+/**
+ * callee_saved_fpr_pair_words — a 48-byte frame saving the v8/v9 FPR pair emits
+ * `stp d8,d9,[sp,#16]` (restored by `ldp d8,d9,[sp,#16]`).
+ *
+ * @return void
+ */
+fn callee_saved_fpr_pair_words() {
+    let fl = layout_of(48 to u32, l0(), l2(8, 9), l1(0))
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 4)
+    teko::assert::is_true(pr[3] == (0x6D0127E8 to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep[0] == (0x6D4127E8 to u32))
+}
+
+#test
+/**
+ * callee_saved_fpr_single_word — an odd FPR count (only v8) in a 32-byte frame
+ * emits a single `str d8,[sp,#8]` (restored by `ldr d8,[sp,#8]`).
+ *
+ * @return void
+ */
+fn callee_saved_fpr_single_word() {
+    let fl = layout_of(32 to u32, l0(), l1(8), l0())
+    let pr = pro(fl)
+    teko::assert::is_true(pr.len == 4)
+    teko::assert::is_true(pr[3] == (0xFD0007E8 to u32))
+    let ep = epi(fl)
+    teko::assert::is_true(ep[0] == (0xFD4007E8 to u32))
+}
+
+#test
+/**
+ * frame_addr_resolves_to_add — `MFrameAddr` resolves through the layout to `ADD
+ * dst, sp, #slot_offset`: slot 0 at offset 8 → `add x0,sp,#8`; a second slot at
+ * offset 16 into x5 → `add x5,sp,#16`. The word carries no branch/reloc fixup.
+ *
+ * @return void
+ */
+fn frame_addr_resolves_to_add() {
+    let fl = layout_of(32 to u32, l0(), l0(), l2(8, 16))
+    let ew0 = enc_with(fl, frame_addr_inst(p(0), 0))
+    teko::assert::is_true(ew0.word == (0x910023E0 to u32))
+    teko::assert::is_false(ew0.has_branch)
+    teko::assert::is_false(ew0.has_reloc)
+    teko::assert::is_true(enc_with(fl, frame_addr_inst(p(5), 1)).word == (0x910043E5 to u32))
+}
+
+#test
+/**
+ * frame_addr_slot_zero_offset — a slot at offset 0 resolves to `add dst,sp,#0`.
+ *
+ * @return void
+ */
+fn frame_addr_slot_zero_offset() {
+    let fl = layout_of(32 to u32, l0(), l0(), l1(0))
+    teko::assert::is_true(enc_with(fl, frame_addr_inst(p(0), 0)).word == (0x910003E0 to u32))
+}
+
+#test
+/**
+ * slot_offset_reads_the_map — `slot_offset` is a direct lookup into the
+ * alignment-honoring per-slot map.
+ *
+ * @return void
+ */
+fn slot_offset_reads_the_map() {
+    let fl = layout_of(48 to u32, l0(), l0(), l3(0, 16, 24))
+    teko::assert::is_true(slot_offset(fl, 0 to u32) == (0 to u32))
+    teko::assert::is_true(slot_offset(fl, 1 to u32) == (16 to u32))
+    teko::assert::is_true(slot_offset(fl, 2 to u32) == (24 to u32))
+}
+
+#test
+/**
+ * big_frame_addr_honest_stops — a slot offset beyond the 12-bit ADD-imm field
+ * raises the `A4-bigframe` honest-stop.
+ *
+ * @return void
+ */
+fn big_frame_addr_honest_stops() {
+    let fl = layout_of(8192 to u32, l0(), l0(), l1(5000))
+    teko::assert::str_contains(stop_of_with(fl, frame_addr_inst(p(0), 0)), "A4-bigframe")
+}
+
+#test
+/**
+ * big_prologue_epilogue_honest_stops — a frame whose FP/LR pair offset outruns
+ * the signed 7-bit STP field raises `A4-bigframe` from both prologue and
+ * epilogue.
+ *
+ * @return void
+ */
+fn big_prologue_epilogue_honest_stops() {
+    let fl = layout_of(1024 to u32, l0(), l0(), l0())
+    teko::assert::str_contains(pro_stop(fl), "A4-bigframe")
+    teko::assert::str_contains(epi_stop(fl), "A4-bigframe")
+}
+
+#test
+/**
+ * big_immediate_honest_stops — an out-of-range or non-add/sub immediate raises
+ * the `A4-bigimm` honest-stop, for both ALU-imm and CMP-imm.
+ *
+ * @return void
+ */
+fn big_immediate_honest_stops() {
+    assert_stop(alu_imm_inst(MAluOp::Add, true, p(0), p(1), 5000 to i64), "A4-bigimm")
+    assert_stop(alu_imm_inst(MAluOp::Add, true, p(0), p(1), (0 to i64) - (5000 to i64)), "A4-bigimm")
+    assert_stop(alu_imm_inst(MAluOp::And, true, p(0), p(1), 3 to i64), "A4-bigimm")
+    assert_stop(cmp_imm_inst(true, p(1), 5000 to i64), "A4-bigimm")
+    assert_stop(cmp_imm_inst(true, p(1), (0 to i64) - (1 to i64)), "A4-bigimm")
+}
+
+#test
+/**
+ * unscaled_offset_honest_stops — a negative, unaligned, or too-large load/store
+ * offset raises the `A4-ldur` honest-stop, covering each `scaled_offset` guard.
+ *
+ * @return void
+ */
+fn unscaled_offset_honest_stops() {
+    assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), (0 to i32) - (8 to i32))), "A4-ldur")
+    assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), 4)), "A4-ldur")
+    assert_stop(load_inst(MMemSize::X, false, p(0), m(p(1), 32768)), "A4-ldur")
+    assert_stop(store_inst(MMemSize::H, p(0), m(p(1), 1)), "A4-ldur")
+}
+
+#test
+/**
+ * layout_zero_and_one_align_slots — an alloca with `align = 0` or `align = 1`
+ * lays out at the running offset unchanged (the guarded `align_up` no-op arm,
+ * the same contract as `lir::align_up`): slots `[{8,0},{8,1},{4,4}]` sit at
+ * `[0, 8, 16]` (slots region 32) and the FP/LR pair brings the frame to 48.
+ *
+ * @return void
+ */
+fn layout_zero_and_one_align_slots() {
+    let frame = teko::list::push(teko::list::push(teko::list::push(l_frame(), alloca_slot(8, 0)), alloca_slot(8, 1)), alloca_slot(4, 4))
+    let fl = compute_frame_layout(aapcs64(), func_of(frame, l_insts()))
+    teko::assert::is_true(fl.slot_offsets[0] == (0 to u32))
+    teko::assert::is_true(fl.slot_offsets[1] == (8 to u32))
+    teko::assert::is_true(fl.slot_offsets[2] == (16 to u32))
+    teko::assert::is_true(fl.size == (48 to u32))
+}
+
+#test
+/**
+ * callee_saved_only_leaf_is_framed — a no-call, no-slot leaf that touches x19
+ * is framed purely by its save-set: size = 16 (FP/LR) + 8 (x19) rounded to 32.
+ *
+ * @return void
+ */
+fn callee_saved_only_leaf_is_framed() {
+    let insts = teko::list::push(l_insts(), alu_inst(MAluOp::Add, true, p(19), p(0), p(1)))
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.saved_gpr.len == 1)
+    teko::assert::is_true(fl.size == (32 to u32))
+}
+
+#test
+/**
+ * indirect_call_without_ret_is_frameless — an `MCallIndirect` with no `MRet`
+ * (the BLR-terminated shape) stays frameless, mirroring the direct-call case:
+ * `has_call` alone never forces LR preservation.
+ *
+ * @return void
+ */
+fn indirect_call_without_ret_is_frameless() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = teko::list::push(l_insts(), call_indirect_inst(p(9), no_uses, p(0), false))
+    let fl = compute_frame_layout(aapcs64(), func_of(l_frame(), insts))
+    teko::assert::is_true(fl.size == (0 to u32))
+}
+
+/**
+ * i1 — a one-instruction stream, typed for the `encode_func` fixtures.
+ *
+ * @param MInst a  the sole instruction
+ * @return []MInst  `[a]`
+ */
+fn i1(a: MInst) -> []MInst {
+    teko::list::push(l_insts(), a)
+}
+
+/**
+ * i2 — a two-instruction stream, in order.
+ *
+ * @param MInst a  the first instruction
+ * @param MInst b  the second instruction
+ * @return []MInst  `[a, b]`
+ */
+fn i2(a: MInst, b: MInst) -> []MInst {
+    teko::list::push(i1(a), b)
+}
+
+/**
+ * i3 — a three-instruction stream, in order.
+ *
+ * @param MInst a  the first instruction
+ * @param MInst b  the second instruction
+ * @param MInst c  the third instruction
+ * @return []MInst  `[a, b, c]`
+ */
+fn i3(a: MInst, b: MInst, c: MInst) -> []MInst {
+    teko::list::push(i2(a, b), c)
+}
+
+/**
+ * i4 — a four-instruction stream, in order.
+ *
+ * @param MInst a  the first instruction
+ * @param MInst b  the second instruction
+ * @param MInst c  the third instruction
+ * @param MInst d  the fourth instruction
+ * @return []MInst  `[a, b, c, d]`
+ */
+fn i4(a: MInst, b: MInst, c: MInst, d: MInst) -> []MInst {
+    teko::list::push(i3(a, b, c), d)
+}
+
+/**
+ * mblock — a machine block with the given id and instruction stream and no
+ * block params, the multi-block `encode_func` fixture shorthand.
+ *
+ * @param u32 id  the block's id (a branch target)
+ * @param []MInst insts  the block's instruction stream
+ * @return MBlock  the assembled block
+ */
+fn mblock(id: u32, insts: []MInst) -> MBlock {
+    MBlock { id = id; params = teko::list::empty(); insts = insts }
+}
+
+/**
+ * l_blocks — the empty `[]MBlock` list, typed for the fixtures.
+ *
+ * @return []MBlock  an empty block list
+ */
+fn l_blocks() -> []MBlock {
+    teko::list::empty()
+}
+
+/**
+ * bl1 — a one-block list.
+ *
+ * @param MBlock a  the sole block
+ * @return []MBlock  `[a]`
+ */
+fn bl1(a: MBlock) -> []MBlock {
+    teko::list::push(l_blocks(), a)
+}
+
+/**
+ * bl2 — a two-block list, in layout order.
+ *
+ * @param MBlock a  the first block
+ * @param MBlock b  the second block
+ * @return []MBlock  `[a, b]`
+ */
+fn bl2(a: MBlock, b: MBlock) -> []MBlock {
+    teko::list::push(bl1(a), b)
+}
+
+/**
+ * bl3 — a three-block list, in layout order.
+ *
+ * @param MBlock a  the first block
+ * @param MBlock b  the second block
+ * @param MBlock c  the third block
+ * @return []MBlock  `[a, b, c]`
+ */
+fn bl3(a: MBlock, b: MBlock, c: MBlock) -> []MBlock {
+    teko::list::push(bl2(a, b), c)
+}
+
+/**
+ * bl4 — a four-block list, in layout order.
+ *
+ * @param MBlock a  the first block
+ * @param MBlock b  the second block
+ * @param MBlock c  the third block
+ * @param MBlock d  the fourth block
+ * @return []MBlock  `[a, b, c, d]`
+ */
+fn bl4(a: MBlock, b: MBlock, c: MBlock, d: MBlock) -> []MBlock {
+    teko::list::push(bl3(a, b, c), d)
+}
+
+/**
+ * func_blocks — an `MFunc` with an empty frame and the given blocks.
+ *
+ * @param []MBlock blocks  the function's blocks, in layout order
+ * @return MFunc  the assembled function
+ */
+fn func_blocks(blocks: []MBlock) -> MFunc {
+    MFunc { symbol = "t"; blocks = blocks; frame = l_frame() }
+}
+
+/**
+ * l_relocs — the empty `[]Reloc` list, typed for the sentinel func.
+ *
+ * @return []Reloc  an empty reloc list
+ */
+fn l_relocs() -> []Reloc {
+    teko::list::empty()
+}
+
+/**
+ * bad_func — the sentinel `EncodedFunc` returned when a golden fixture that must
+ * encode unexpectedly honest-stops: its single all-ones word never matches a
+ * real expected stream, so the golden length/word assertion fails loudly.
+ *
+ * @return EncodedFunc  the impossible-encoding sentinel
+ */
+fn bad_func() -> EncodedFunc {
+    EncodedFunc { symbol = "<error>"; words = l1(0xFFFFFFFF to u32); relocs = l_relocs() }
+}
+
+/**
+ * ef — encode `f` through `encode_func`, unwrapping the success case and falling
+ * back to the `bad_func` sentinel on an unexpected honest-stop.
+ *
+ * @param MFunc f  the function to encode
+ * @return EncodedFunc  the encoded function, or the sentinel on error
+ */
+fn ef(f: MFunc) -> EncodedFunc {
+    match encode_func(aapcs64(), f) {
+        EncodedFunc as x => x
+        error as e => bad_func()
+    }
+}
+
+/**
+ * ef_stop — the honest-stop message `encode_func` produces for `f`, or `<ok>`
+ * when it encodes successfully.
+ *
+ * @param MFunc f  the function to encode
+ * @return str  the error message, or `<ok>`
+ */
+fn ef_stop(f: MFunc) -> str {
+    match encode_func(aapcs64(), f) {
+        EncodedFunc as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * kind_name — the printable name of an `MRelocKind`, for the reloc-record golden
+ * assertions.
+ *
+ * @param MRelocKind k  the relocation kind
+ * @return str  `PageHi`/`PageLo`/`Call`
+ */
+fn kind_name(k: MRelocKind) -> str {
+    match k {
+        PageHi => "PageHi"
+        PageLo => "PageLo"
+        Call => "Call"
+    }
+}
+
+/**
+ * field_ok — the field value of a `branch_disp_field` result, or an all-ones
+ * sentinel on an unexpected honest-stop (so a golden assertion fails loudly).
+ *
+ * @param u32 | error r  the `branch_disp_field` outcome
+ * @return u32  the field value, or the sentinel on error
+ */
+fn field_ok(r: u32 | error) -> u32 {
+    match r {
+        u32 as v => v
+        error as e => 0xFFFFFFFF to u32
+    }
+}
+
+/**
+ * field_stop — the honest-stop message of a `branch_disp_field` result, or
+ * `<ok>` when it produces a field.
+ *
+ * @param u32 | error r  the `branch_disp_field` outcome
+ * @return str  the error message, or `<ok>`
+ */
+fn field_stop(r: u32 | error) -> str {
+    match r {
+        u32 as v => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * neg64 — the i64 negation of a non-negative magnitude, the fixtures' shorthand
+ * for a backward/out-of-range displacement.
+ *
+ * @param i64 m  the magnitude
+ * @return i64  `-m`
+ */
+fn neg64(m: i64) -> i64 {
+    (0 to i64) - m
+}
+
+#test
+/**
+ * straight_line_exit_encodes_with_bl_reloc — a frameless `movz x0,#42; bl
+ * tk_exit` function encodes to the two A4-1 goldens (the BL a placeholder word)
+ * plus one `Reloc{offset=4, "tk_exit", Call}`; no prologue, no branch fixups.
+ *
+ * @return void
+ */
+fn straight_line_exit_encodes_with_bl_reloc() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i2(movz_inst(true, p(0), 42, 0), call_inst("tk_exit", no_uses, p(0), false, false))
+    let e = ef(func_blocks(bl1(mblock(0 to u32, insts))))
+    teko::assert::is_true(e.words.len == 2)
+    teko::assert::is_true(e.words[0] == (0xD2800540 to u32))
+    teko::assert::is_true(e.words[1] == (0x94000000 to u32))
+    teko::assert::is_true(e.relocs.len == 1)
+    teko::assert::is_true(e.relocs[0].offset == (4 to u32))
+    teko::assert::is_true(e.relocs[0].sym == "tk_exit")
+    teko::assert::is_true(kind_name(e.relocs[0].kind) == "Call")
+}
+
+#test
+/**
+ * diamond_forward_branches_patch_correctly — a four-block if/match diamond with
+ * NON-topological ids (0,7,3,9 in layout order) patches every forward branch:
+ * `b.eq` (imm19, +3 words), `cbz x0` (imm19, +3), `b` (imm26, +1). The seven
+ * words are byte-exact (assembler-verified) and carry no relocations.
+ *
+ * @return void
+ */
+fn diamond_forward_branches_patch_correctly() {
+    let b0 = mblock(0 to u32, i2(cmp_inst(true, p(0), p(1)), branch_cond_inst(MCond::EQ, 3 to u32)))
+    let b1 = mblock(7 to u32, i2(movz_inst(true, p(0), 1, 0), cbz_inst(true, true, p(0), 9 to u32)))
+    let b2 = mblock(3 to u32, i2(movz_inst(true, p(0), 2, 0), branch_inst(9 to u32)))
+    let b3 = mblock(9 to u32, i1(ret_inst()))
+    let e = ef(func_blocks(bl4(b0, b1, b2, b3)))
+    teko::assert::is_true(e.words.len == 7)
+    teko::assert::is_true(e.words[0] == (0xEB01001F to u32))
+    teko::assert::is_true(e.words[1] == (0x54000060 to u32))
+    teko::assert::is_true(e.words[2] == (0xD2800020 to u32))
+    teko::assert::is_true(e.words[3] == (0xB4000060 to u32))
+    teko::assert::is_true(e.words[4] == (0xD2800040 to u32))
+    teko::assert::is_true(e.words[5] == (0x14000001 to u32))
+    teko::assert::is_true(e.words[6] == (0xD65F03C0 to u32))
+    teko::assert::is_true(e.relocs.len == 0)
+}
+
+#test
+/**
+ * framed_function_prepends_prologue_and_expands_ret — a `mov x19,x0; ret`
+ * function (callee-saved x19 forces a 32-byte frame) prepends the four prologue
+ * words and expands `MRet` into the three epilogue words followed by RET — nine
+ * byte-exact words (assembler-verified), no relocations.
+ *
+ * @return void
+ */
+fn framed_function_prepends_prologue_and_expands_ret() {
+    let insts = i2(mov_inst(true, p(19), p(0)), ret_inst())
+    let e = ef(func_of(l_frame(), insts))
+    teko::assert::is_true(e.words.len == 9)
+    teko::assert::is_true(e.words[0] == (0xD10083FF to u32))
+    teko::assert::is_true(e.words[1] == (0xA9017BFD to u32))
+    teko::assert::is_true(e.words[2] == (0x910043FD to u32))
+    teko::assert::is_true(e.words[3] == (0xF90007F3 to u32))
+    teko::assert::is_true(e.words[4] == (0xAA0003F3 to u32))
+    teko::assert::is_true(e.words[5] == (0xF94007F3 to u32))
+    teko::assert::is_true(e.words[6] == (0xA9417BFD to u32))
+    teko::assert::is_true(e.words[7] == (0x910083FF to u32))
+    teko::assert::is_true(e.words[8] == (0xD65F03C0 to u32))
+    teko::assert::is_true(e.relocs.len == 0)
+}
+
+#test
+/**
+ * backward_branches_encode_negative_displacements — a three-block function whose
+ * final block branches BACKWARD (`b.eq` to block 0, `b` to block 1, both −3
+ * words) encodes the two's-complement displacements (`0x54FFFFA0` imm19,
+ * `0x17FFFFFD` imm26 — assembler-verified) without honest-stopping (regalloc
+ * gates real `loop`s, but `encode_func` encodes a negative displacement).
+ *
+ * @return void
+ */
+fn backward_branches_encode_negative_displacements() {
+    let b0 = mblock(0 to u32, i1(movz_inst(true, p(0), 7, 0)))
+    let b1 = mblock(1 to u32, i1(movz_inst(true, p(1), 8, 0)))
+    let b2 = mblock(2 to u32, i3(cmp_inst(true, p(0), p(1)), branch_cond_inst(MCond::EQ, 0 to u32), branch_inst(1 to u32)))
+    let e = ef(func_blocks(bl3(b0, b1, b2)))
+    teko::assert::is_true(e.words.len == 5)
+    teko::assert::is_true(e.words[0] == (0xD28000E0 to u32))
+    teko::assert::is_true(e.words[1] == (0xD2800101 to u32))
+    teko::assert::is_true(e.words[2] == (0xEB01001F to u32))
+    teko::assert::is_true(e.words[3] == (0x54FFFFA0 to u32))
+    teko::assert::is_true(e.words[4] == (0x17FFFFFD to u32))
+}
+
+#test
+/**
+ * reloc_records_carry_exact_offsets_kinds_syms — an `adrp; add-lo; movz; bl`
+ * function collects three relocations in order: `{0,"g",PageHi}`,
+ * `{4,"g",PageLo}`, `{12,"tk_exit",Call}` — the placeholder words stay
+ * (linker-patched), and every offset/symbol/kind is exact.
+ *
+ * @return void
+ */
+fn reloc_records_carry_exact_offsets_kinds_syms() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i4(adrp_inst(p(1), "g", MRelocKind::PageHi), add_lo_inst(p(1), p(1), "g", MRelocKind::PageLo), movz_inst(true, p(0), 0, 0), call_inst("tk_exit", no_uses, p(0), false, false))
+    let e = ef(func_blocks(bl1(mblock(0 to u32, insts))))
+    teko::assert::is_true(e.words.len == 4)
+    teko::assert::is_true(e.words[0] == (0x90000001 to u32))
+    teko::assert::is_true(e.words[1] == (0x91000021 to u32))
+    teko::assert::is_true(e.words[3] == (0x94000000 to u32))
+    teko::assert::is_true(e.relocs.len == 3)
+    teko::assert::is_true(e.relocs[0].offset == (0 to u32))
+    teko::assert::is_true(e.relocs[0].sym == "g")
+    teko::assert::is_true(kind_name(e.relocs[0].kind) == "PageHi")
+    teko::assert::is_true(e.relocs[1].offset == (4 to u32))
+    teko::assert::is_true(kind_name(e.relocs[1].kind) == "PageLo")
+    teko::assert::is_true(e.relocs[2].offset == (12 to u32))
+    teko::assert::is_true(e.relocs[2].sym == "tk_exit")
+    teko::assert::is_true(kind_name(e.relocs[2].kind) == "Call")
+}
+
+#test
+/**
+ * branch_disp_field_forward_and_backward — the displacement encoder produces the
+ * imm26/imm19 OR-masks for forward (+) and backward (−) displacements, the
+ * two's-complement halves the golden branch words carry.
+ *
+ * @return void
+ */
+fn branch_disp_field_forward_and_backward() {
+    teko::assert::is_true(field_ok(branch_disp_field(1 to i64, 0 to u32)) == (1 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(3 to i64, 1 to u32)) == (0x60 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(3 to i64), 0 to u32)) == (0x3FFFFFD to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(3 to i64), 1 to u32)) == (0xFFFFA0 to u32))
+}
+
+#test
+/**
+ * branch_disp_field_far_honest_stops — a displacement past the imm26 field (both
+ * directions) and past the imm19 field (both directions) raises the
+ * `A4-farbranch` honest-stop, covering each range guard.
+ *
+ * @return void
+ */
+fn branch_disp_field_far_honest_stops() {
+    teko::assert::str_contains(field_stop(branch_disp_field(33554432 to i64, 0 to u32)), "A4-farbranch")
+    teko::assert::str_contains(field_stop(branch_disp_field(neg64(33554433 to i64), 0 to u32)), "A4-farbranch")
+    teko::assert::str_contains(field_stop(branch_disp_field(262144 to i64, 1 to u32)), "A4-farbranch")
+    teko::assert::str_contains(field_stop(branch_disp_field(neg64(262145 to i64), 1 to u32)), "A4-farbranch")
+}
+
+#test
+/**
+ * dangling_branch_target_honest_stops — a branch to a block id absent from the
+ * function raises the `A4-badblock` internal-invariant honest-stop.
+ *
+ * @return void
+ */
+fn dangling_branch_target_honest_stops() {
+    let e = func_blocks(bl1(mblock(0 to u32, i1(branch_inst(99 to u32)))))
+    teko::assert::str_contains(ef_stop(e), "A4-badblock")
+}
+
+#test
+/**
+ * far_branch_target_through_resolve_word_honest_stops — a branch whose recorded
+ * target sits past the imm26 field propagates `A4-farbranch` out of
+ * `resolve_word` (the range guard is unreachable via real tiny functions, so it
+ * is exercised through a crafted offset table).
+ *
+ * @return void
+ */
+fn far_branch_target_through_resolve_word_honest_stops() {
+    let ew = branch_word(0x14000000 to u32, 5 to u32, 0 to u32)
+    let offsets = teko::list::push(l_block_offsets(), bo(5 to u32, 33554432 to u32))
+    match resolve_word(ew, 0 to u32, offsets) {
+        u32 as v => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "A4-farbranch")
+    }
+}
+
+#test
+/**
+ * encode_func_propagates_prologue_big_frame — a function whose frame outruns the
+ * STP field surfaces the prologue's `A4-bigframe` honest-stop from `encode_func`.
+ *
+ * @return void
+ */
+fn encode_func_propagates_prologue_big_frame() {
+    let frame = teko::list::push(l_frame(), alloca_slot(8192, 8))
+    let e = func_of(frame, i1(ret_inst()))
+    teko::assert::str_contains(ef_stop(e), "A4-bigframe")
+}
+
+#test
+/**
+ * encode_one_ret_big_frame_honest_stops — `encode_one` on an `MRet` under a
+ * frame too large surfaces the epilogue's `A4-bigframe` honest-stop (the
+ * epilogue-error arm, unreachable via `encode_func` since the prologue fails
+ * first on the same frame).
+ *
+ * @return void
+ */
+fn encode_one_ret_big_frame_honest_stops() {
+    let layout = layout_of(8208 to u32, l0(), l0(), l0())
+    match encode_one(layout, l_encwords(), ret_inst()) {
+        []EncWord as w => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "A4-bigframe")
+    }
+}
+
+#test
+/**
+ * encode_func_propagates_inst_honest_stop — a non-terminator instruction that
+ * honest-stops (a float op → `A4-fp`) propagates out of `encode_func` unchanged.
+ *
+ * @return void
+ */
+fn encode_func_propagates_inst_honest_stop() {
+    let e = func_of(l_frame(), i1(falu_inst(MFAluOp::FAdd, true, fp(0), fp(1), fp(2))))
+    teko::assert::str_contains(ef_stop(e), "A4-fp")
+}
+
+/**
+ * bo — a `BlockOffset` fixture, the crafted offset-table shorthand.
+ *
+ * @param u32 id  the block id
+ * @param u32 word  the block's starting word index
+ * @return BlockOffset  the assembled offset entry
+ */
+fn bo(id: u32, word: u32) -> BlockOffset {
+    BlockOffset { id = id; word = word }
+}
+
+/**
+ * l_block_offsets — the empty `[]BlockOffset` list, typed for the fixtures.
+ *
+ * @return []BlockOffset  an empty offset list
+ */
+fn l_block_offsets() -> []BlockOffset {
+    teko::list::empty()
+}
+
+/**
+ * l_encwords — the empty `[]EncWord` list, typed for the `encode_one` fixture.
+ *
+ * @return []EncWord  an empty EncWord list
+ */
+fn l_encwords() -> []EncWord {
+    teko::list::empty()
+}
+
+#test
+/**
+ * framed_branch_crosses_expanded_epilogue — the review-flagged expansion-shift
+ * guard: a FRAMED function whose early-return block (non-last) expands `MRet`
+ * into epilogue+RET, with a forward `b.eq` crossing that whole expansion. The
+ * assertion is structural (not tautological): the word AT `branch + disp`
+ * must BE the target block's distinctive first instruction (`movz x0,#7`),
+ * proving the branch lands past the expanded epilogue, not inside it.
+ *
+ * @return void
+ */
+fn framed_branch_crosses_expanded_epilogue() {
+    let b0 = mblock(0 to u32, i3(mov_inst(true, p(19), p(0)), cmp_inst(true, p(0), p(1)), branch_cond_inst(MCond::EQ, 5 to u32)))
+    let b1 = mblock(2 to u32, i2(movz_inst(true, p(0), 1, 0), ret_inst()))
+    let b2 = mblock(5 to u32, i2(movz_inst(true, p(0), 7, 0), ret_inst()))
+    let e = ef(func_blocks(bl3(b0, b1, b2)))
+    teko::assert::is_true(e.words.len == 17)
+    mut bi: u64 = 0
+    mut found: bool = false
+    mut i: u64 = 0
+    loop {
+        if i >= e.words.len { break }
+        if (e.words[i] >> 24) == (0x54 to u32) {
+            bi = i
+            found = true
+            break
+        }
+        i++
+    }
+    teko::assert::is_true(found)
+    let disp = (e.words[bi] >> 5) & (0x7FFFF to u32)
+    teko::assert::is_true(disp > (0 to u32))
+    teko::assert::is_true(e.words[bi + (disp to u64)] == (0xD28000E0 to u32))
+}
+
+#test
+/**
+ * branch_disp_field_extremes_encode — the review-flagged half-pinned boundary:
+ * the LAST in-range values on both sides must ENCODE (a `>=`→`>` typo at the
+ * negative extreme would silently reject them): imm26 accepts ±(-2^25 /
+ * 2^25-1), imm19 accepts ±(-2^18 / 2^18-1), with the exact two's-complement
+ * fields.
+ *
+ * @return void
+ */
+fn branch_disp_field_extremes_encode() {
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(33554432 to i64), 0 to u32)) == (0x2000000 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(33554431 to i64, 0 to u32)) == (0x1FFFFFF to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(neg64(262144 to i64), 1 to u32)) == (0x800000 to u32))
+    teko::assert::is_true(field_ok(branch_disp_field(262143 to i64, 1 to u32)) == (0x7FFFE0 to u32))
+}
+
+#test
+/**
+ * reloc_offset_includes_prologue — the review-flagged A4-4 hand-off property:
+ * in a FRAMED function (call + ret forces the FP/LR frame) the `Reloc.offset`
+ * must point AT the BL placeholder word in the full stream — i.e. it includes
+ * the prologue shift (`words[offset/4] == 0x94000000`), so A4-4's module
+ * concatenation rebases from the right base.
+ *
+ * @return void
+ */
+fn reloc_offset_includes_prologue() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i2(call_inst("helper", no_uses, p(0), false, false), ret_inst())
+    let e = ef(func_of(l_frame(), insts))
+    teko::assert::is_true(e.relocs.len == 1)
+    let r = e.relocs[0]
+    teko::assert::is_true(r.offset > (0 to u32))
+    teko::assert::is_true(e.words[(r.offset / (4 to u32)) to u64] == (0x94000000 to u32))
+    teko::assert::is_true(r.sym == "helper")
+}
+
+/**
+ * named_func — an `MFunc` with the given symbol and blocks and an empty frame,
+ * the `encode_module` multi-function fixture shorthand.
+ *
+ * @param str sym  the function's symbol
+ * @param []MBlock blocks  the function's blocks
+ * @return MFunc  the assembled function
+ */
+fn named_func(sym: str, blocks: []MBlock) -> MFunc {
+    MFunc { symbol = sym; blocks = blocks; frame = l_frame() }
+}
+
+/**
+ * one_block_func — an `MFunc` of one block (id 0) holding `insts`, for the
+ * `encode_module` fixtures.
+ *
+ * @param str sym  the function's symbol
+ * @param []MInst insts  the sole block's instructions
+ * @return MFunc  the assembled function
+ */
+fn one_block_func(sym: str, insts: []MInst) -> MFunc {
+    named_func(sym, bl1(mblock(0 to u32, insts)))
+}
+
+/**
+ * l_bytes — the empty `[]byte` list, typed for the sentinel module.
+ *
+ * @return []byte  an empty byte list
+ */
+fn l_bytes() -> []byte {
+    teko::list::empty()
+}
+
+/**
+ * l_syms — the empty `[]Symbol` list, typed for the sentinel module.
+ *
+ * @return []Symbol  an empty symbol list
+ */
+fn l_syms() -> []Symbol {
+    teko::list::empty()
+}
+
+/**
+ * bad_module — the sentinel `EncodedModule` returned when an `encode_module`
+ * fixture that must succeed unexpectedly honest-stops, so the assertion fails
+ * loudly rather than aborting.
+ *
+ * @return EncodedModule  the empty sentinel module
+ */
+fn bad_module() -> EncodedModule {
+    EncodedModule { text = l_bytes(); rodata = l_bytes(); symbols = l_syms(); relocs = l_relocs() }
+}
+
+/**
+ * em — encode module `m` through `encode_module`, unwrapping the success case
+ * and falling back to the sentinel on an unexpected honest-stop.
+ *
+ * @param MModule m  the module to encode
+ * @return EncodedModule  the encoded module, or the sentinel on error
+ */
+fn em(m: MModule) -> EncodedModule {
+    match encode_module(aapcs64(), m) {
+        EncodedModule as x => x
+        error as e => bad_module()
+    }
+}
+
+/**
+ * em_stop — the honest-stop message `encode_module` produces for `m`, or `<ok>`
+ * when it succeeds.
+ *
+ * @param MModule m  the module to encode
+ * @return str  the error message, or `<ok>`
+ */
+fn em_stop(m: MModule) -> str {
+    match encode_module(aapcs64(), m) {
+        EncodedModule as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rodata_of — a one-entry rodata table with the given symbol and bytes, the
+ * `__const` fixture shorthand.
+ *
+ * @param str sym  the rodata symbol
+ * @param []byte bs  the rodata bytes
+ * @return []lir::LRodata  the one-entry rodata table
+ */
+fn rodata_of(sym: str, bs: []byte) -> []lir::LRodata {
+    teko::list::push(teko::list::empty(), lir::LRodata { symbol = sym; bytes = bs })
+}
+
+/**
+ * module_with_rodata — an `MModule` with the given functions and rodata table
+ * (no globals/layouts), for the `__const` encode tests.
+ *
+ * @param []MFunc funcs  the module's functions
+ * @param []lir::LRodata rodata  the rodata table
+ * @return MModule  the assembled module
+ */
+fn module_with_rodata(funcs: []MFunc, rodata: []lir::LRodata) -> MModule {
+    MModule { funcs = funcs; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+/**
+ * two_func_module — a two-function `MModule` (no rodata/globals/layouts), for
+ * the concatenation + rebase tests.
+ *
+ * @param MFunc f1  the first function
+ * @param MFunc f2  the second function
+ * @return MModule  the assembled module
+ */
+fn two_func_module(f1: MFunc, f2: MFunc) -> MModule {
+    add_mfunc(add_mfunc(empty_mmodule(), f1), f2)
+}
+
+#test
+/**
+ * module_concatenates_text_and_rebases_relocs — the A4-4 hand-off the A4-3
+ * review pinned: a first function of THREE words (`adrp; add-lo; ret`, 12
+ * bytes, carrying two relocs) followed by a second function whose sole word is a
+ * `bl tk_exit`. The module `__text` is 16 bytes; the second function's `bl`
+ * reloc offset is 12 (it INCLUDES the first function's byte length), and its
+ * defined symbol offset is 12 — proving the per-function rebase.
+ *
+ * @return void
+ */
+fn module_concatenates_text_and_rebases_relocs() {
+    let no_uses: []MReg = teko::list::empty()
+    let f1 = one_block_func("f1", i3(adrp_inst(p(0), "g", MRelocKind::PageHi), add_lo_inst(p(0), p(0), "g", MRelocKind::PageLo), ret_inst()))
+    let f2 = one_block_func("f2", i1(call_inst("tk_exit", no_uses, p(0), false, false)))
+    let e = em(two_func_module(f1, f2))
+    teko::assert::is_true(e.text.len == (16 to u64))
+    teko::assert::is_true(e.relocs.len == 3)
+    teko::assert::is_true(e.relocs[0].offset == (0 to u32))
+    teko::assert::is_true(e.relocs[1].offset == (4 to u32))
+    teko::assert::is_true(e.relocs[2].offset == (12 to u32))
+    teko::assert::is_true(e.relocs[2].sym == "tk_exit")
+    teko::assert::is_true(kind_name(e.relocs[2].kind) == "Call")
+}
+
+#test
+/**
+ * module_symbol_table_is_defined_then_undefined — with no rodata (no locals),
+ * the two functions become globally-visible `__text` symbols (`f1` at offset
+ * 0, `f2` at 12), followed by one undefined symbol per external target (`g`,
+ * `tk_exit`) in first-reference order — the local-then-global-then-undefined
+ * contract the Mach-O ranges rely on, degenerate with an empty local range.
+ *
+ * @return void
+ */
+fn module_symbol_table_is_defined_then_undefined() {
+    let no_uses: []MReg = teko::list::empty()
+    let f1 = one_block_func("f1", i3(adrp_inst(p(0), "g", MRelocKind::PageHi), add_lo_inst(p(0), p(0), "g", MRelocKind::PageLo), ret_inst()))
+    let f2 = one_block_func("f2", i1(call_inst("tk_exit", no_uses, p(0), false, false)))
+    let e = em(two_func_module(f1, f2))
+    teko::assert::is_true(e.symbols.len == 4)
+    teko::assert::is_true(e.symbols[0].name == "f1")
+    teko::assert::is_true(e.symbols[0].defined)
+    teko::assert::is_false(e.symbols[0].local)
+    teko::assert::is_true(e.symbols[0].sect == (1 to u8))
+    teko::assert::is_true(e.symbols[0].offset == (0 to u32))
+    teko::assert::is_true(e.symbols[1].name == "f2")
+    teko::assert::is_true(e.symbols[1].defined)
+    teko::assert::is_false(e.symbols[1].local)
+    teko::assert::is_true(e.symbols[1].offset == (12 to u32))
+    teko::assert::is_false(e.symbols[2].defined)
+    teko::assert::is_true(e.symbols[2].name == "g")
+    teko::assert::is_false(e.symbols[3].defined)
+    teko::assert::is_true(e.symbols[3].name == "tk_exit")
+}
+
+#test
+/**
+ * module_dedups_undefined_symbols — two calls to the SAME external symbol
+ * collapse to a single undefined entry (the relocations still both reference it
+ * by name), so the symbol table never double-lists a callee.
+ *
+ * @return void
+ */
+fn module_dedups_undefined_symbols() {
+    let no_uses: []MReg = teko::list::empty()
+    let insts = i2(call_inst("tk_puts", no_uses, p(0), false, false), call_inst("tk_puts", no_uses, p(0), false, false))
+    let e = em(add_mfunc(empty_mmodule(), one_block_func("main", insts)))
+    teko::assert::is_true(e.relocs.len == 2)
+    teko::assert::is_true(e.symbols.len == 2)
+    teko::assert::is_true(e.symbols[0].name == "main")
+    teko::assert::is_true(e.symbols[1].name == "tk_puts")
+    teko::assert::is_false(e.symbols[1].defined)
+}
+
+#test
+/**
+ * module_intra_call_stays_defined — a call whose target is another in-module
+ * function references a DEFINED symbol, so `collect_undefined` skips it (no
+ * undefined entry is added): the two functions are the only symbols, and the
+ * relocation still names the callee. Covers the defined-lookup-true path of the
+ * undefined-symbol collection.
+ *
+ * @return void
+ */
+fn module_intra_call_stays_defined() {
+    let no_uses: []MReg = teko::list::empty()
+    let f1 = one_block_func("f1", i1(ret_inst()))
+    let f2 = one_block_func("f2", i1(call_inst("f1", no_uses, p(0), false, false)))
+    let e = em(two_func_module(f1, f2))
+    teko::assert::is_true(e.symbols.len == 2)
+    teko::assert::is_true(e.symbols[0].name == "f1")
+    teko::assert::is_true(e.symbols[0].defined)
+    teko::assert::is_false(e.symbols[0].local)
+    teko::assert::is_true(e.symbols[1].name == "f2")
+    teko::assert::is_true(e.symbols[1].defined)
+    teko::assert::is_true(e.relocs.len == 1)
+    teko::assert::is_true(e.relocs[0].sym == "f1")
+}
+
+#test
+/**
+ * module_three_funcs_cumulative_rebase — a THIRD function's reloc offset must
+ * include BOTH prior functions' lengths: `f1` (3 words, 12 bytes, one reloc at
+ * function-relative 8), `f2` (1 word, 4 bytes, no reloc), `f3` (1 word, a `bl`
+ * at function-relative 0). The module rebase must land `f3`'s defined symbol at
+ * offset 16 (12+4) and its `bl` reloc at 16 — not just 4 (only `f2`'s length),
+ * the transitive-accumulation case a 2-function fixture cannot distinguish from
+ * a bug that rebases from the IMMEDIATELY-preceding function alone.
+ *
+ * @return void
+ */
+fn module_three_funcs_cumulative_rebase() {
+    let no_uses: []MReg = teko::list::empty()
+    let f1 = one_block_func("f1", i3(movz_inst(true, p(0), 1, 0), movz_inst(true, p(1), 2, 0), ret_inst()))
+    let f2 = one_block_func("f2", i1(movz_inst(true, p(0), 3, 0)))
+    let f3 = one_block_func("f3", i1(call_inst("tk_exit", no_uses, p(0), false, false)))
+    let m = add_mfunc(add_mfunc(add_mfunc(empty_mmodule(), f1), f2), f3)
+    let e = em(m)
+    teko::assert::is_true(e.text.len == (20 to u64))
+    teko::assert::is_true(e.symbols.len == 4)
+    teko::assert::is_true(e.symbols[0].name == "f1")
+    teko::assert::is_true(e.symbols[0].offset == (0 to u32))
+    teko::assert::is_true(e.symbols[1].name == "f2")
+    teko::assert::is_true(e.symbols[1].offset == (12 to u32))
+    teko::assert::is_true(e.symbols[2].name == "f3")
+    teko::assert::is_true(e.symbols[2].offset == (16 to u32))
+    teko::assert::is_true(e.relocs.len == 1)
+    teko::assert::is_true(e.relocs[0].offset == (16 to u32))
+    teko::assert::is_true(e.relocs[0].sym == "tk_exit")
+}
+
+#test
+/**
+ * empty_module_encodes_to_empty_everything — a module with no functions, no
+ * rodata, and no globals encodes to an empty `__text`/`__const`, an empty
+ * symbol table, and no relocations (the degenerate base case of the module
+ * fold, exercised end to end rather than assumed).
+ *
+ * @return void
+ */
+fn empty_module_encodes_to_empty_everything() {
+    let e = em(empty_mmodule())
+    teko::assert::is_true(e.text.len == 0)
+    teko::assert::is_true(e.rodata.len == 0)
+    teko::assert::is_true(e.symbols.len == 0)
+    teko::assert::is_true(e.relocs.len == 0)
+}
+
+#test
+/**
+ * module_interns_rodata_into_const — a rodata entry becomes `__const` bytes plus
+ * a defined, FILE-LOCAL section-2 symbol at its offset; a second entry is
+ * placed after the first, its symbol offset the first entry's byte length. The
+ * two file-local rodata symbols sort BEFORE the globally-visible function
+ * symbol (`s0`,`s1`,`main` — the local-then-global order `LC_DYSYMTAB` needs).
+ *
+ * @return void
+ */
+fn module_interns_rodata_into_const() {
+    let r0 = teko::list::push(teko::list::push(teko::list::push(l_bytes(), 0x68 to byte), 0x69 to byte), 0 to byte)
+    let r1 = teko::list::push(teko::list::push(l_bytes(), 0x41 to byte), 0 to byte)
+    let rodata = teko::list::push(rodata_of("s0", r0), lir::LRodata { symbol = "s1"; bytes = r1 })
+    let f = one_block_func("main", i1(ret_inst()))
+    let funcs = teko::list::push(teko::list::empty(), f)
+    let e = em(module_with_rodata(funcs, rodata))
+    teko::assert::is_true(e.rodata.len == (5 to u64))
+    teko::assert::is_true(e.rodata[0] == (0x68 to byte))
+    teko::assert::is_true(e.symbols.len == 3)
+    teko::assert::is_true(e.symbols[0].name == "s0")
+    teko::assert::is_true(e.symbols[0].defined)
+    teko::assert::is_true(e.symbols[0].local)
+    teko::assert::is_true(e.symbols[0].sect == (2 to u8))
+    teko::assert::is_true(e.symbols[0].offset == (0 to u32))
+    teko::assert::is_true(e.symbols[1].name == "s1")
+    teko::assert::is_true(e.symbols[1].local)
+    teko::assert::is_true(e.symbols[1].offset == (3 to u32))
+    teko::assert::is_true(e.symbols[2].name == "main")
+    teko::assert::is_true(e.symbols[2].defined)
+    teko::assert::is_false(e.symbols[2].local)
+    teko::assert::is_true(e.symbols[2].sect == (1 to u8))
+}
+
+#test
+/**
+ * module_globals_honest_stops — a module carrying a top-level data global raises
+ * the `A4-globals` named honest-stop (the `__data` section is deferred; the N2
+ * subset lowers none).
+ *
+ * @return void
+ */
+fn module_globals_honest_stops() {
+    let f = one_block_func("main", i1(ret_inst()))
+    let funcs = teko::list::push(teko::list::empty(), f)
+    let globals = teko::list::push(teko::list::empty(), lir::LGlobal { symbol = "gv"; ty = lir::LType::I32; bytes = l_bytes() })
+    let m = MModule { funcs = funcs; rodata = teko::list::empty(); globals = globals; layouts = teko::list::empty() }
+    teko::assert::str_contains(em_stop(m), "A4-globals")
+}
+
+#test
+/**
+ * module_propagates_function_honest_stop — a function that honest-stops during
+ * encode (a float op → `A4-fp`) propagates the stop out of `encode_module`
+ * unchanged.
+ *
+ * @return void
+ */
+fn module_propagates_function_honest_stop() {
+    let f = one_block_func("main", i1(falu_inst(MFAluOp::FAdd, true, fp(0), fp(1), fp(2))))
+    teko::assert::str_contains(em_stop(add_mfunc(empty_mmodule(), f)), "A4-fp")
+}

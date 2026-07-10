@@ -430,10 +430,14 @@ pub fn flush_write(write: WriteFn, state: Ref<BufWriterState>) -> u64 | error {
 
 /**
  * Fan every write out to TWO sinks — the tee combinator (IO0's missing piece). Each
- * incoming region is offered to `primary` then `secondary`; the reported progress is the
- * SMALLER of the two accepted counts, so a `write_all` driver keeps looping until both
- * sinks have drained the whole region (M.1 fail-loud — a lagging sink is never dropped).
- * A sink error aborts the tee with that error.
+ * incoming region is FULLY drained into BOTH sinks (each via `write_all`) before the tee
+ * reports it consumed, then the tee reports the whole region length. This is the correct
+ * shape for ASYMMETRIC sinks: an earlier min-progress design offered the same region to
+ * both sinks and reported `min(accepted)`, so its `write_all` driver re-offered the tail
+ * and any sink that had already taken more than the min received those bytes a SECOND time
+ * (silent data corruption). Draining each sink to completion here means neither sink ever
+ * re-receives bytes it already accepted (M.1 fail-loud — a lagging sink is never dropped,
+ * `write_all` errors on a no-progress sink). A sink error aborts the tee with that error.
  *
  * @param primary    the first sink (e.g. the real destination)
  * @param secondary  the second sink (e.g. a hash/audit/log sink)
@@ -444,10 +448,10 @@ pub fn flush_write(write: WriteFn, state: Ref<BufWriterState>) -> u64 | error {
  */
 pub fn tee_write_fn(primary: WriteFn, secondary: WriteFn) -> WriteFn {
     let teed: WriteFn = (from: Buf) => {
-        let a = match primary(from) { u64 as n => n; error as e => return e }
-        let b = match secondary(from) { u64 as n => n; error as e => return e }
-        if a <= b { return a }
-        b
+        let wrote = match write_all(primary, from) { u64 as n => n; error as e => return e }
+        let mirrored = match write_all(secondary, from) { u64 as m => m; error as e => return e }
+        if mirrored != wrote { return error { message = "io::tee_write_fn: sinks drained unequal counts" } }
+        wrote
     }
     teed
 }
