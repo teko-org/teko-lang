@@ -110,12 +110,9 @@ CORPUS=(
 # SUCCEEDING (the stop was closed) the fixture turns XSTOP and the harness fails LOUDLY,
 # so the list is pruned and the fixture joins the compared exit(n) corpus.
 #
-# own_match_exit — `match` lowering trips the regalloc back-edge over-approximation
-#   (A3-loop, backend-a3-regalloc.md §6.2): #443's RPO numbering unblocked acyclic `if`/
-#   `match` merges for allocation, but a `match` over a literal discriminant still
-#   presents a branch the linear back-edge test misclassifies, so regalloc honest-stops
-#   with a NAMED compiler diagnostic ("A3-loop"). `if`/`else` (own_if_exit) allocates
-#   fine, proving the multi-block path works; `match` joins the corpus when A3-loop lands.
+# own_match_exit — PROMOTED to the compared corpus (A4-6): the false back-edge came from
+#   the irrefutable-`_` dead fallback block (unreachable source counted as a retreat);
+#   `has_back_edge` is now reachability-aware, `match` allocates and runs (own == C == 42).
 #
 # own_print_exit — `teko::io::println` has NO builtin mapping in the LIR lowering
 #   (`src/lir/lower.tks`), unlike the C backend's codegen.tks (which special-cases the
@@ -129,11 +126,9 @@ CORPUS=(
 #   is narrower than codegen's): closes when LIR gains a builtin table mirroring
 #   codegen.tks's io/str/mem builtin dispatch.
 declare -a KNOWN_STOP=(
-    own_match_exit
     own_print_exit
 )
 declare -a KNOWN_STOP_ERR=(
-    "A3-loop"
     "_println"
 )
 
