@@ -621,3 +621,41 @@ pass; the deferrals (A3-loop for real loops, A3-splitting, A4-frame) are unchang
 for the integrator to confirm (not a design tension): the fix branch base — the active backend wave
 umbrella (`remodel/backend-build`), and whether #443 rides as a sub-PR or a mini-umbrella if it
 grows.
+
+## 11. A4-6 follow-up — the UNREACHABLE-block false-positive #443 did not cover (#385)
+
+#443 removed the acyclic false-positive for the blocks the RPO DFS reaches. It did **not** cover a
+second, distinct acyclic false-positive because no #443 fixture exercised it: a **dead** block whose
+forward edge retreats only because `append_unvisited` numbers it last.
+
+**The shape.** `lower_match_value` (`src/lir/lower.tks`) always emits a defensive-fallback block past
+the last arm (a `const 0; jump merge`, mirroring the codegen's defensive-return spirit). When the
+final arm is **irrefutable** — a `_` wildcard, the common exhaustive tail — its pattern test lowers to
+an UNCONDITIONAL `jump` straight into that arm's body (`close_test_to`, `test.always`), so the
+fallback block that arm allocated as its own "next test" target has **no predecessor**. It is
+unreachable dead code.
+
+**Why it tripped.** `rpo_block_order` = DFS-from-entry (reachable, in RPO) **then**
+`append_unvisited` (every remaining block, block-list order, so the numbering stays total and no dead
+vreg is dropped). The dead fallback lands LAST. Its own forward `jump` to the merge block — which the
+DFS numbered earlier — thus satisfies `pos(merge) ≤ pos(fallback)`, the exact retreating-edge test.
+`has_back_edge` reported a back-edge on a CFG that is a pure acyclic DAG. Forensic trace for
+`match 5 { 1 => 40, 2 => 41, _ => 42 }` (8 machine blocks): RPO order `[0,3,5,6,4,2,1,7]`, block 7 the
+dead fallback (unreachable), `pos(7)=7`, its successor the merge block 1 at `pos(1)=6` →
+`6 ≤ 7` → false back-edge → the A4-5 `own_match_exit` fixture KNOWN_STOPped at `regalloc_func`.
+
+**Root cause class.** Scenario (a) of the A4-6 brief — a block reachable only via a "missed edge"
+lands at the end of the order and its forward branch to the merge looks like a retreat — in its purest
+form: the block is reachable via **no** edge at all (genuinely dead), so no edge is "missing" from
+`block_successors`; the CFG is correctly modeled and correctly acyclic. The defect is entirely that the
+back-edge test counted an edge leaving a dead block.
+
+**Fix.** A retreating edge is a real loop back-edge only if it is part of a cycle **reachable from
+entry**; a dead block cannot form such a loop. `reachable_blocks(f)` returns the DFS-visited set (the
+reachable blocks, before `append_unvisited`), and `has_back_edge` counts a retreat only when its
+SOURCE block is in that set. `compute_intervals` and `regalloc_func` thread the reachable set beside
+the order (one extra argument, mechanical at both call sites). The dead block is still numbered (its
+vregs still get program points — allocation of dead code stays correct and harmless), it just no
+longer contributes a spurious back-edge. A **reachable** `loop` latch→header edge is unaffected and
+still honest-stops (A3-loop deferral). Contained to `src/backend/regalloc.tks`; no isel/lower change —
+the dead block is a legitimate, intentional part of the match lowering, not a bug to remove.
