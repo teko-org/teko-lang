@@ -31,6 +31,21 @@ if [ -z "$TAGS" ]; then
   exit 1
 fi
 
+# SEED = the NEWEST usable released seed, ALWAYS. Features are ADDITIVE, so the freshest compiler
+# builds any older-or-equal source; there is no reason to pin an older one. `TAGS` is already
+# newest-version-first, and the `seed_from_tag` loop below skips a tag whose asset is missing (an
+# in-progress release building ITSELF) or whose binary miscompiled (version-sanity), falling to the
+# next — so "newest first" self-heals the self-build case without a channel split.
+#
+# This SUPERSEDES the old stable/beta channel selection (owner ruling 2026-07-08). That split
+# EXCLUDED `*-beta` tags from a `main`/`*-alpha` lane so it "never seeded from an in-progress
+# umbrella" — but every released seed is gated + working, and once `main` moved onto the `-beta`
+# line (0.1.0.0-beta shipped) the exclusion pinned the umbrella->main lane to the pre-remodel
+# `0.0.1.x-alpha`, which cannot parse wave-new `src/` syntax (`unsafe`/`#must_free`). Always-newest
+# fixes that: during the whole `0.X` beta era the newest release supplies every feature, and at
+# `1.0.0.0` the newest is simply the stable release.
+echo "ci_provision_teko: newest-first seed (base='${GITHUB_BASE_REF:-}' ref='${GITHUB_REF_NAME:-}' type='${GITHUB_REF_TYPE:-}')"
+
 seed_from_tag() {
   tag="$1"
   # Candidate asset labels: exact; then the glibc-suffixed form (a bare linux-<arch> maps to the

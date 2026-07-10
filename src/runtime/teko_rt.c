@@ -1131,6 +1131,63 @@ void tk_region_drop(tk_region *r) {
     free(r);
 }
 
+// (#337) tk_region_drop_subtree(root) — the `adopt` bulk-drop. Drop `root` AND every live region
+// whose ->parent ancestor chain reaches `root`, in a single sweep. Reuses the existing parent-ptr
+// tree (remodel §1 L4 "owner-tag new; tree exists"): the "owner tag" is the ancestor-reaches-root
+// predicate over the ->parent edges, so NO new field is needed. Cycles among the OBJECTS the
+// subtree holds are irrelevant — nothing is freed per-object; the whole knot goes at once.
+// NULL-tolerant. The registry is snapshotted into a local list of the reachable regions FIRST (so
+// the walk is not disturbed by the per-region unlink), then each is freed off the local — the same
+// re-entrancy discipline tk_regions_free_all uses. The ancestor walk is O(depth) per region, so the
+// sweep is O(regions * depth); adopt subtrees are small, so this naive form is acceptable (a child
+// list would make it linear but adds a field to every region — deferred until profiling demands it).
+static int tk_region_ancestor_reaches(tk_region *r, tk_region *root) {
+    for (tk_region *p = r; p != NULL; p = p->parent) {
+        if (p == root) return 1;
+    }
+    return 0;
+}
+
+void tk_region_drop_subtree(tk_region *root) {
+    if (root == NULL) return;                        // NULL-tolerant
+    // Snapshot every reachable region into a detached local list threaded via its `reg_next` slot,
+    // unlinking each from the global registry as it is collected — so a second sweep or
+    // tk_regions_free_all never sees (and double-frees) a region this sweep owns.
+    tk_region *doomed = NULL;
+    tk_region *cur = tk_g_regs;
+    while (cur != NULL) {
+        tk_region *rnext = cur->reg_next;
+        if (tk_region_ancestor_reaches(cur, root)) {
+            if (tk_g_regs == cur) {
+                tk_g_regs = cur->reg_next;
+            } else {
+                for (tk_region *p = tk_g_regs; p != NULL; p = p->reg_next) {
+                    if (p->reg_next == cur) { p->reg_next = cur->reg_next; break; }
+                }
+            }
+            cur->reg_next = doomed;                  // prepend onto the detached local list
+            doomed = cur;
+        }
+        cur = rnext;
+    }
+    // Free each collected region off the detached local (chunks + entries + header), preserving the
+    // arena-obs accounting tk_region_drop does — so TEKO_ARENA_OBS reports the whole subtree as
+    // reclaimed, not leaked to the process root.
+    while (doomed != NULL) {
+        tk_region *dnext = doomed->reg_next;
+        struct tk_chunk *c = doomed->head;
+        doomed->head = NULL;
+        if (tk_obs_on == 1) {
+            tk_obs_regions_dropped += 1;
+            for (struct tk_chunk *oc = c; oc != NULL; oc = oc->next) tk_obs_drop_bytes += oc->used;
+        }
+        while (c != NULL) { struct tk_chunk *next = c->next; tk_chunk_free(c); c = next; }
+        free(doomed->entries); doomed->entries = NULL; doomed->nentries = 0; doomed->entries_cap = 0;
+        free(doomed);
+        doomed = dnext;
+    }
+}
+
 // (W9.3b) free EVERY still-live region (root + every live scoped frame/block region) and empty the
 // registry. Idempotent + re-entrancy-safe: it detaches the whole list into a local FIRST, then frees
 // each off the local — so tk_region_drop's registry-unlink (which it calls indirectly? no — we free
