@@ -398,6 +398,48 @@ fn rx_entry_live_pins_and_result_pin_intervals() {
     teko::assert::is_true(rx_iv_has(iset.fixed, 0, 4, 5))
 }
 
+#test
+fn rx_result_pin_without_terminator_is_not_extended() {
+    let insts = teko::list::push(teko::list::empty(), movimm_x86(rx_p(0), 5 to i64, true))
+    let iset = match rx_intervals(rx_func(insts)) { IntervalSet as s => s; error => return }
+    teko::assert::is_true(rx_iv_has(iset.fixed, 0, 0, 0))
+}
+
+/**
+ * rx_double_phys_def_fixture — `mov rax=#1; mov v0=rax; mov rax=#2; mov rcx=rax;
+ * ret` — RAX is DEFINED twice with a use between, so its pin splits into two
+ * intervals (`[0,1]` and `[2,3]`), exercising the physreg-redefinition split in
+ * `phys_intervals_x86`.
+ *
+ * @return []MInstX86  the fixture stream
+ */
+fn rx_double_phys_def_fixture() -> []MInstX86 {
+    mut insts: []MInstX86 = teko::list::empty()
+    insts = teko::list::push(insts, movimm_x86(rx_p(0), 1 to i64, true))
+    insts = teko::list::push(insts, mov_x86(rx_v(0), rx_p(0), true))
+    insts = teko::list::push(insts, movimm_x86(rx_p(0), 2 to i64, true))
+    insts = teko::list::push(insts, mov_x86(rx_p(1), rx_p(0), true))
+    insts = teko::list::push(insts, ret_x86())
+    insts
+}
+
+#test
+fn rx_repeated_physical_def_splits_into_two_pins() {
+    let iset = match rx_intervals(rx_func(rx_double_phys_def_fixture())) { IntervalSet as s => s; error => return }
+    teko::assert::is_true(rx_iv_has(iset.fixed, 0, 0, 1))
+    teko::assert::is_true(rx_iv_has(iset.fixed, 0, 2, 3))
+}
+
+#test
+fn rx_fpr_spill_detection_covers_def_and_use() {
+    let mem = rx_mem(rx_p(7), 0 to i32)
+    let a10: RegAssignment = Spilled { vreg_id = 10 to u32; slot = 0 to u32 }
+    let sr = rx_sr(teko::list::push(teko::list::empty(), a10))
+    teko::assert::is_true(inst_has_fpr_spill_x86(sr, load_x86(MMemSizeX86::Q, false, rx_vf(10), mem)))
+    teko::assert::is_true(inst_has_fpr_spill_x86(sr, store_x86(MMemSizeX86::Q, rx_vf(10), mem)))
+    teko::assert::is_false(inst_has_fpr_spill_x86(sr, movimm_x86(rx_v(0), 1 to i64, true)))
+}
+
 /**
  * rx_call_cross_fixture — `mov v0=#5; call tk_x; mov rax=v0; ret` — `v0` is live
  * across the call and must be marked `crosses_call`, then land callee-saved.
