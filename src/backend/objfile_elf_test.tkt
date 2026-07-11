@@ -1,0 +1,368 @@
+use teko::lir
+
+/**
+ * el_p — a physical GPR operand with the given x86 ISA id (the ELF-writer
+ * fixture shorthand; B1 runs post-regalloc, every operand physical).
+ *
+ * @param u32 id  the x86 ISA register number
+ * @return MReg  the physical GPR operand
+ */
+fn el_p(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * el_block — a machine block (no params) with the given id and stream.
+ *
+ * @param u32 id  the block id
+ * @param []MInstX86 insts  the block's instructions
+ * @return MBlockX86  the built block
+ */
+fn el_block(id: u32, insts: []MInstX86) -> MBlockX86 {
+    MBlockX86 { id = id; params = teko::list::empty(); insts = insts }
+}
+
+/**
+ * el_1block_func — a single-block `MFuncX86` with the given symbol, stream, and
+ * frame.
+ *
+ * @param str sym  the function's symbol
+ * @param []MInstX86 insts  the block's instructions
+ * @param []lir::LAlloca frame  the function's frame slots
+ * @return MFuncX86  the built function
+ */
+fn el_1block_func(sym: str, insts: []MInstX86, frame: []lir::LAlloca) -> MFuncX86 {
+    MFuncX86 { symbol = sym; blocks = [el_block(0 to u32, insts)]; frame = frame }
+}
+
+/**
+ * el_no_frame — the empty `[]lir::LAlloca` frame (a frameless function).
+ *
+ * @return []lir::LAlloca  an empty frame slot list
+ */
+fn el_no_frame() -> []lir::LAlloca {
+    teko::list::empty()
+}
+
+/**
+ * el_object_of — encode `m` under `sysv64()` and assemble its ELF object, or an
+ * empty buffer on an unexpected honest-stop (so a golden length/byte assertion
+ * fails loudly rather than aborting the run).
+ *
+ * @param MModuleX86 m  the module to encode + emit
+ * @return []byte  the ELF object bytes, or empty on error
+ */
+fn el_object_of(m: MModuleX86) -> []byte {
+    match encode_module_x86(sysv64(), m) {
+        EncodedModuleX86 as x => emit_elf(x)
+        error as e => teko::list::empty()
+    }
+}
+
+/**
+ * el_u32_at — the little-endian u32 read from `bytes` at byte index `i` (the
+ * golden-object field reader).
+ *
+ * @param []byte bytes  the object bytes
+ * @param u64 i  the field's byte offset
+ * @return u32  the little-endian u32 at `i`
+ */
+fn el_u32_at(bytes: []byte, i: u64) -> u32 {
+    (bytes[i] to u32) | ((bytes[i + (1 to u64)] to u32) << (8 to u32)) | ((bytes[i + (2 to u64)] to u32) << (16 to u32)) | ((bytes[i + (3 to u64)] to u32) << (24 to u32))
+}
+
+/**
+ * el_u16_at — the little-endian u16 read from `bytes` at byte index `i` (the
+ * `Elf64_Ehdr`/`Elf64_Sym` 16-bit-field reader).
+ *
+ * @param []byte bytes  the object bytes
+ * @param u64 i  the field's byte offset
+ * @return u32  the little-endian u16 at `i`
+ */
+fn el_u16_at(bytes: []byte, i: u64) -> u32 {
+    (bytes[i] to u32) | ((bytes[i + (1 to u64)] to u32) << (8 to u32))
+}
+
+/**
+ * el_exit_module — the keystone `exit`-shape: a single frameless `main` of one
+ * `call tk_exit` (no return), no rodata — the smallest module carrying a text
+ * image, a defined global function, an undefined extern, and one `Plt32`
+ * relocation.
+ *
+ * @return MModuleX86  the one-function module
+ */
+fn el_exit_module() -> MModuleX86 {
+    let f = el_1block_func("main", [call_x86("tk_exit", teko::list::empty(), el_p(0), false, false)], el_no_frame())
+    MModuleX86 { funcs = [f]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+#test
+/**
+ * elf_header_is_x86_64_relocatable — the `Elf64_Ehdr` of the `exit` object: the
+ * `\x7fELF` magic, ELFCLASS64 / ELFDATA2LSB / EV_CURRENT / ELFOSABI_SYSV
+ * `e_ident`, `e_type = ET_REL`(1), `e_machine = EM_X86_64`(62), `e_shoff = 240`,
+ * `e_ehsize = 64`, `e_shentsize = 64`, `e_shnum = 7`, `e_shstrndx = 5`. The whole
+ * object is 688 bytes.
+ *
+ * @return void
+ */
+fn elf_header_is_x86_64_relocatable() {
+    let obj = el_object_of(el_exit_module())
+    teko::assert::is_true(obj.len == (688 to u64))
+    teko::assert::is_true(obj[0] == (0x7F to byte))
+    teko::assert::is_true(obj[1] == (0x45 to byte))
+    teko::assert::is_true(obj[2] == (0x4C to byte))
+    teko::assert::is_true(obj[3] == (0x46 to byte))
+    teko::assert::is_true(obj[4] == (2 to byte))
+    teko::assert::is_true(obj[5] == (1 to byte))
+    teko::assert::is_true(obj[6] == (1 to byte))
+    teko::assert::is_true(obj[7] == (0 to byte))
+    teko::assert::is_true(el_u16_at(obj, 16 to u64) == (1 to u32))
+    teko::assert::is_true(el_u16_at(obj, 18 to u64) == (62 to u32))
+    teko::assert::is_true(el_u32_at(obj, 20 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 40 to u64) == (240 to u32))
+    teko::assert::is_true(el_u16_at(obj, 52 to u64) == (64 to u32))
+    teko::assert::is_true(el_u16_at(obj, 58 to u64) == (64 to u32))
+    teko::assert::is_true(el_u16_at(obj, 60 to u64) == (7 to u32))
+    teko::assert::is_true(el_u16_at(obj, 62 to u64) == (5 to u32))
+}
+
+#test
+/**
+ * elf_text_symtab_and_plt32_reloc — the `exit` object's `.text` image is the
+ * `call` placeholder `E8 00 00 00 00` at file offset 64; the `.symtab` (at 72)
+ * holds the reserved null symbol, then `main` as `GLOBAL|FUNC` (`st_info = 0x12`,
+ * `st_shndx = 1`, section-relative `st_value = 0`), then `tk_exit` as
+ * `GLOBAL|NOTYPE` (`0x10`, `st_shndx = 0`); the single `.rela.text` entry (at
+ * 216) is `R_X86_64_PLT32`(4) against symbol index 2 (`tk_exit`) with addend −4.
+ *
+ * @return void
+ */
+fn elf_text_symtab_and_plt32_reloc() {
+    let obj = el_object_of(el_exit_module())
+    teko::assert::is_true(obj[64] == (0xE8 to byte))
+    teko::assert::is_true(el_u32_at(obj, 65 to u64) == (0 to u32))
+    teko::assert::is_true(el_u32_at(obj, 72 to u64) == (0 to u32))
+    teko::assert::is_true(el_u32_at(obj, 96 to u64) == (1 to u32))
+    teko::assert::is_true(obj[100] == (0x12 to byte))
+    teko::assert::is_true(el_u16_at(obj, 102 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 104 to u64) == (0 to u32))
+    teko::assert::is_true(el_u32_at(obj, 120 to u64) == (6 to u32))
+    teko::assert::is_true(obj[124] == (0x10 to byte))
+    teko::assert::is_true(el_u16_at(obj, 126 to u64) == (0 to u32))
+    teko::assert::is_true(el_u32_at(obj, 216 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 224 to u64) == (4 to u32))
+    teko::assert::is_true(el_u32_at(obj, 228 to u64) == (2 to u32))
+    teko::assert::is_true(el_u32_at(obj, 232 to u64) == (0xFFFFFFFC to u32))
+    teko::assert::is_true(el_u32_at(obj, 236 to u64) == (0xFFFFFFFF to u32))
+}
+
+#test
+/**
+ * elf_strtab_and_section_headers — the `exit` object's `.strtab` (at 144) starts
+ * with the reserved NUL then `main` and `tk_exit`; the seven `Elf64_Shdr`
+ * headers (at 240) pin `.text` (PROGBITS, ALLOC|EXECINSTR, offset 64, size 5,
+ * align 16), `.symtab` (SYMTAB, `sh_link = 4`, `sh_info = 1` first-global, offset
+ * 72, entsize 24), and `.rela.text` (RELA, `sh_link = 3`, `sh_info = 1`, offset
+ * 216, entsize 24).
+ *
+ * @return void
+ */
+fn elf_strtab_and_section_headers() {
+    let obj = el_object_of(el_exit_module())
+    teko::assert::is_true(obj[144] == (0 to byte))
+    teko::assert::is_true(obj[145] == (0x6D to byte))
+    teko::assert::is_true(obj[150] == (0x74 to byte))
+    teko::assert::is_true(obj[158] == (0 to byte))
+    teko::assert::is_true(obj[159] == (0x2E to byte))
+    teko::assert::is_true(el_u32_at(obj, 304 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 308 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 312 to u64) == (6 to u32))
+    teko::assert::is_true(el_u32_at(obj, 328 to u64) == (64 to u32))
+    teko::assert::is_true(el_u32_at(obj, 336 to u64) == (5 to u32))
+    teko::assert::is_true(el_u32_at(obj, 352 to u64) == (16 to u32))
+    teko::assert::is_true(el_u32_at(obj, 436 to u64) == (2 to u32))
+    teko::assert::is_true(el_u32_at(obj, 456 to u64) == (72 to u32))
+    teko::assert::is_true(el_u32_at(obj, 472 to u64) == (4 to u32))
+    teko::assert::is_true(el_u32_at(obj, 476 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 488 to u64) == (24 to u32))
+    teko::assert::is_true(el_u32_at(obj, 628 to u64) == (4 to u32))
+    teko::assert::is_true(el_u32_at(obj, 632 to u64) == (0x40 to u32))
+    teko::assert::is_true(el_u32_at(obj, 648 to u64) == (216 to u32))
+    teko::assert::is_true(el_u32_at(obj, 664 to u64) == (3 to u32))
+    teko::assert::is_true(el_u32_at(obj, 668 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 680 to u64) == (24 to u32))
+}
+
+/**
+ * el_rodata_module — a frameless `main` of `lea rax, [rip+"s0"]` (a `Pc32`
+ * rodata reference) then `ret`, plus one rodata datum `s0 = "A\0"`. Exercises the
+ * `.rodata` `STT_SECTION` symbol + the rodata-target relocation the writer folds
+ * onto the section symbol.
+ *
+ * @return MModuleX86  the one-function, one-rodata module
+ */
+fn el_rodata_module() -> MModuleX86 {
+    let insts = [lea_rip_x86(el_p(0), "s0", RelocKindX86::Pc32), ret_x86()]
+    let f = el_1block_func("main", insts, el_no_frame())
+    let rbytes = [0x41 to byte, 0 to byte]
+    let rodata = [lir::LRodata { symbol = "s0"; bytes = rbytes }]
+    MModuleX86 { funcs = [f]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+#test
+/**
+ * elf_rodata_uses_section_symbol_and_pc32 — the rodata object's `.symtab` (at 80)
+ * carries the `.rodata` `STT_SECTION` local symbol (`st_info = 0x03`,
+ * `st_shndx = 2`) BEFORE the global `main`, so `.symtab.sh_info` (first-global) is
+ * 2; the single `Pc32` relocation (at 216) is `R_X86_64_PC32`(2) against symbol
+ * index 1 (the section symbol, NOT a per-string symbol) with addend −4 — the ELF
+ * idiom that dodges per-string symbols and cross-object name clashes.
+ *
+ * @return void
+ */
+fn elf_rodata_uses_section_symbol_and_pc32() {
+    let obj = el_object_of(el_rodata_module())
+    teko::assert::is_true(obj[108] == (0x03 to byte))
+    teko::assert::is_true(el_u16_at(obj, 110 to u64) == (2 to u32))
+    teko::assert::is_true(obj[132] == (0x12 to byte))
+    teko::assert::is_true(el_u16_at(obj, 134 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 456 to u64) == (80 to u32))
+    teko::assert::is_true(el_u32_at(obj, 476 to u64) == (2 to u32))
+    teko::assert::is_true(el_u32_at(obj, 216 to u64) == (3 to u32))
+    teko::assert::is_true(el_u32_at(obj, 224 to u64) == (2 to u32))
+    teko::assert::is_true(el_u32_at(obj, 228 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 232 to u64) == (0xFFFFFFFC to u32))
+}
+
+/**
+ * el_rodata_off_module — a hand-built `EncodedModuleX86` whose rodata datum `s1`
+ * sits at `.rodata` byte offset 8, with a `Pc32` relocation targeting it. Pins
+ * the writer's addend folding — the section-symbol relocation's addend becomes
+ * `base(−4) + rodata_offset(8) = 4` — without routing through isel.
+ *
+ * @return EncodedModuleX86  the hand-built module
+ */
+fn el_rodata_off_module() -> EncodedModuleX86 {
+    let text = [0x48 to byte, 0x8D to byte, 0x05 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0xC3 to byte]
+    let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte]
+    let s1 = Symbol { name = "s1"; defined = true; sect = 2 to u8; offset = 8 to u32; local = true }
+    let main = Symbol { name = "main"; defined = true; sect = 1 to u8; offset = 0 to u32; local = false }
+    let reloc = RelocX86 { offset = 3 to u32; sym = "s1"; kind = RelocKindX86::Pc32; addend = (0 to i64) - (4 to i64) }
+    EncodedModuleX86 { text = text; rodata = rodata; symbols = [s1, main]; relocs = [reloc] }
+}
+
+#test
+/**
+ * elf_folds_rodata_offset_into_addend — the hand-built offset-8 rodata module's
+ * lone relocation (at file offset 224 — its 10-byte `.rodata` pushes `.symtab`/
+ * `.strtab`/`.rela.text` past the exit-module positions) has `r_offset = 3`, is
+ * `R_X86_64_PC32`(2) against the section symbol (index 1), and carries the folded
+ * addend `−4 + 8 = 4`, proving the writer adds the datum's `.rodata` offset onto
+ * the base addend so `S + A − P` lands on `s1`.
+ *
+ * @return void
+ */
+fn elf_folds_rodata_offset_into_addend() {
+    let obj = emit_elf(el_rodata_off_module())
+    teko::assert::is_true(el_u32_at(obj, 224 to u64) == (3 to u32))
+    teko::assert::is_true(el_u32_at(obj, 232 to u64) == (2 to u32))
+    teko::assert::is_true(el_u32_at(obj, 236 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 240 to u64) == (4 to u32))
+    teko::assert::is_true(el_u32_at(obj, 244 to u64) == (0 to u32))
+}
+
+/**
+ * el_abs64_module — a hand-built `EncodedModuleX86` with an `Abs64` relocation
+ * targeting an undefined data global. `encode_module_x86` never produces this (it
+ * raises `B1-globals` first, so a `lea` only ever carries `Pc32`/`Plt32`), but
+ * feeding it directly documents and pins the future `R_X86_64_64` data-reloc
+ * encoding the writer will emit.
+ *
+ * @return EncodedModuleX86  the hand-built Abs64 module
+ */
+fn el_abs64_module() -> EncodedModuleX86 {
+    let text = [0x48 to byte, 0xB8 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0xC3 to byte]
+    let main = Symbol { name = "main"; defined = true; sect = 1 to u8; offset = 0 to u32; local = false }
+    let gv = Symbol { name = "gv"; defined = false; sect = 0 to u8; offset = 0 to u32; local = false }
+    let reloc = RelocX86 { offset = 2 to u32; sym = "gv"; kind = RelocKindX86::Abs64; addend = 0 to i64 }
+    EncodedModuleX86 { text = text; rodata = teko::list::empty(); symbols = [main, gv]; relocs = [reloc] }
+}
+
+#test
+/**
+ * elf_abs64_emits_r_x86_64_64 — the hand-built `Abs64` module's relocation (at
+ * 216) is `R_X86_64_64`(1) against the undefined `gv` (symbol index 2) with
+ * addend 0: the writer's correct future data-global encoding, reachable only by a
+ * hand-built input since `encode_module_x86` honest-stops on globals first.
+ *
+ * @return void
+ */
+fn elf_abs64_emits_r_x86_64_64() {
+    let obj = emit_elf(el_abs64_module())
+    teko::assert::is_true(el_u32_at(obj, 224 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 228 to u64) == (2 to u32))
+    teko::assert::is_true(el_u32_at(obj, 232 to u64) == (0 to u32))
+}
+
+#test
+/**
+ * elf_reloc_type_maps_all_kinds — the `RelocKindX86` → `R_X86_64_*` mapping:
+ * `Plt32`→PLT32(4), `Pc32`→PC32(2), `Abs64`→64(1). The `lea`-only `Pc32`/`Plt32`
+ * paths are the live B1 cases; `Abs64`(1) is the documented future data path.
+ *
+ * @return void
+ */
+fn elf_reloc_type_maps_all_kinds() {
+    teko::assert::is_true(elf_reloc_type(RelocKindX86::Plt32) == (4 to u32))
+    teko::assert::is_true(elf_reloc_type(RelocKindX86::Pc32) == (2 to u32))
+    teko::assert::is_true(elf_reloc_type(RelocKindX86::Abs64) == (1 to u32))
+}
+
+#test
+/**
+ * elf_symbol_index_finds_and_sentinels — `elf_symbol_index` returns a present
+ * symbol's index and, for an absent name, the one-past-end sentinel
+ * (`syms.len`), covering both arms of the lookup the relocation table relies on.
+ *
+ * @return void
+ */
+fn elf_symbol_index_finds_and_sentinels() {
+    let syms = [ElfSym { name = ""; info = 0 to u32; shndx = 0 to u32; value = 0 to u32 }, ElfSym { name = "main"; info = 0x12 to u32; shndx = 1 to u32; value = 0 to u32 }]
+    teko::assert::is_true(elf_symbol_index(syms, "main") == (1 to u32))
+    teko::assert::is_true(elf_symbol_index(syms, "absent") == (2 to u32))
+}
+
+#test
+/**
+ * elf_secsym_and_first_global_sentinels — `elf_rodata_secsym_index` returns the
+ * one-past-end sentinel when no `.rodata` section symbol is present, and
+ * `elf_first_global_index` returns `syms.len` for an all-local table (the
+ * degenerate no-function/no-extern case), covering both fall-through arms.
+ *
+ * @return void
+ */
+fn elf_secsym_and_first_global_sentinels() {
+    let only_local = [ElfSym { name = ""; info = 0 to u32; shndx = 0 to u32; value = 0 to u32 }, ElfSym { name = ""; info = 0x03 to u32; shndx = 2 to u32; value = 0 to u32 }]
+    teko::assert::is_true(elf_first_global_index(only_local) == (2 to u32))
+    let no_rodata = [ElfSym { name = ""; info = 0 to u32; shndx = 0 to u32; value = 0 to u32 }, ElfSym { name = "main"; info = 0x12 to u32; shndx = 1 to u32; value = 0 to u32 }]
+    teko::assert::is_true(elf_rodata_secsym_index(no_rodata) == (2 to u32))
+}
+
+#test
+/**
+ * elf_empty_module_still_valid — a module with no functions, rodata, or globals
+ * emits a well-formed object: a single null symbol (`sh_info` first-global = 1),
+ * empty `.text`/`.rodata`/`.rela.text`, and the seven section headers — the
+ * degenerate base case exercised end to end through `emit_elf`.
+ *
+ * @return void
+ */
+fn elf_empty_module_still_valid() {
+    let m = MModuleX86 { funcs = teko::list::empty(); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let obj = el_object_of(m)
+    teko::assert::is_true(obj[0] == (0x7F to byte))
+    teko::assert::is_true(el_u16_at(obj, 60 to u64) == (7 to u32))
+    teko::assert::is_true(el_u16_at(obj, 16 to u64) == (1 to u32))
+    teko::assert::is_true(el_u32_at(obj, 40 to u64) == (obj.len to u32) - (448 to u32))
+}
