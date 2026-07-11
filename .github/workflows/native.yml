@@ -113,16 +113,19 @@ jobs:
       # pure formatting. Formatting stays covered by running `teko fmt` + the per-wave W15
       # retrofit. Re-add a `fmt --check` gate only once #372 makes fmt align properly.
 
-  # ── RISC-V cross-compile + QEMU (BLOCKING — gated in the CI gate job) ─────────
+  # ── RISC-V own==C differential under QEMU (BLOCKING — gated in the CI gate job) ─
   riscv64-qemu:
     needs: changes
-    # DISABLED (owner ruling 2026-07-06, compile-time): running the FULL `test . --coverage`
-    # under qemu user-mode emulation was ~8-9m of the CI wall-clock (85% is emulated EXECUTION,
-    # not compiling). Commented out as a FUTURE-SUPPORT pendency — re-enable (flip to
-    # `needs.changes.outputs.run == 'true'`) when there is a real riscv64 runner (no qemu) or
-    # the native gate is fast enough to smoke riscv arch-correctness cheaply. Tracking: #305.
-    if: false
-    name: build-test / linux-riscv64 (qemu)
+    # RE-ENABLED + RE-SCOPED (issue #387 B2-8): the OLD lane ran the FULL `test . --coverage`
+    # under qemu user-mode (~8-9m, 85% emulated EXECUTION), so it was disabled (#305). B2-8
+    # replaces that with the FAST tiny exit(n) C-vs-own differential (seconds, not minutes):
+    # build gen1 (the PR compiler under test, which now carries the own riscv64 AOT backend),
+    # then run scripts/diff_c_own.sh in riscv mode — each exit(n) fixture built BOTH via the
+    # C backend cross-compiled for riscv AND via the own riscv pipeline (TEKO_TARGET=riscv64-linux),
+    # both cross-linked by riscv64-linux-gnu-gcc, both RUN under qemu-riscv64-static, asserting
+    # own_exit == C_exit. This proves own==C on riscv end-to-end without the full emulated gate.
+    if: needs.changes.outputs.run == 'true'
+    name: build-test / linux-riscv64 (qemu own==C differential)
     runs-on: ubuntu-latest
     continue-on-error: false
     permissions:
@@ -138,27 +141,31 @@ jobs:
           sudo apt-get install -y gcc-riscv64-linux-gnu qemu-user-static clang
 
       # riscv has no release binary asset, so it can't download a seed like the other
-      # platforms. But it MUST NOT cmake-build from the frozen C twins — those are frozen
-      # historical code (no-mirroring ruling) and diverge from the live `.tks` (e.g. they
-      # lack the #263 enum-vs-PrimKind fix), so a cmake build tests a STALE compiler and
-      # fails on current sources (LIR's `F32` LType tripped exactly that). Instead: seed
-      # the x86_64 released binary, have it EMIT the CURRENT compiler's C (gen-1), and
-      # cross-compile THAT for riscv — testing the same compiler the other platforms run.
+      # platforms. Seed the x86_64 released binary; it builds gen1 (the PR compiler under
+      # test) from THIS branch's src/, so gen1 carries the own riscv64 AOT backend
+      # (emit_native_riscv) — the C bootstrap / a cmake build from the frozen twins would
+      # NOT. The differential runs gen1, never the raw seed.
       - name: Provision teko (x86_64 released seed)
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/ci_provision_teko.sh linux-x86_64
 
-      - name: Emit the current compiler's C (gen-1, gate skipped here)
-        run: teko . -o gen1 --no-verify
+      - name: Build gen1 (the PR compiler under test — carries emit_native_riscv)
+        run: teko . -o bin --no-verify
 
-      - name: Cross-compile gen-1's teko.c for riscv64 (static)
-        run: |
-          riscv64-linux-gnu-gcc -std=c2x -w -static -Isrc/runtime -Isrc/assert \
-            gen1/teko.c src/runtime/teko_rt.c src/assert/assert.c -lm -o teko-riscv
-
-      - name: Run the gate under QEMU user-mode
-        run: qemu-riscv64-static ./teko-riscv . -o /tmp/rvbin --no-verify
+      # The fast riscv own==C differential: TEKO_DIFF_TARGET=riscv64-linux selects the riscv
+      # lane in diff_c_own.sh (NOT uname — this host is x86_64). Per exit(n) fixture it builds
+      # the C-riscv binary (C backend + TEKO_CC=riscv64-linux-gnu-gcc) and the own-riscv binary
+      # (TEKO_BACKEND=native TEKO_TARGET=riscv64-linux + cross-gcc-as-linker), runs BOTH under
+      # qemu-riscv64-static, and asserts identical exit code + stdout, plus check_elf.sh (riscv
+      # binutils) well-formedness on the own .o. own_print_exit stays a KNOWN-STOP (the shared
+      # println LIR-builtin gap, target-independent).
+      - name: RISC-V C-vs-own differential under QEMU (own AOT backend == C backend, on gen1)
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+          TEKO_DIFF_TARGET: riscv64-linux
+        run: ./scripts/diff_c_own.sh
 
   # ── differential VM==native harness (issue #54) ──────────────────────────────
   # Cross-runs every examples/regressions/* project through BOTH engines (`teko run`
@@ -383,8 +390,9 @@ jobs:
           fi
 
           # riscv64-qemu is BLOCKING (main-integrity law: green means green everywhere).
-          # It seeds from the released x86_64 binary and cross-compiles the current
-          # compiler's emitted C (issue #276), so a failure is a real regression, not
+          # It seeds from the released x86_64 binary, builds gen1 (the PR compiler carrying
+          # the own riscv64 AOT backend), and runs the exit(n) own==C differential under
+          # qemu-riscv64-static (issue #387 B2-8), so a failure is a real regression, not
           # infra noise — a red riscv gates the merge and, downstream, the release.
           if [ "$RISCV_RESULT" = "failure" ] || [ "$RISCV_RESULT" = "cancelled" ]; then
             echo "ERROR: riscv64-qemu $RISCV_RESULT"
