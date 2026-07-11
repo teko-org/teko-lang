@@ -1,0 +1,670 @@
+/**
+ * emit_u16_le_coff — append `v`'s low 16 bits to `buf` as two little-endian bytes
+ * (the `IMAGE_FILE_HEADER` `Machine`/`NumberOfSections`/`SizeOfOptionalHeader`/
+ * `Characteristics`, the `IMAGE_SECTION_HEADER` `NumberOfRelocations`/
+ * `NumberOfLinenumbers`, the `IMAGE_SYMBOL` `SectionNumber`/`Type`, and the
+ * `IMAGE_RELOCATION` `Type`). The bit-slicing stays in `u32` arithmetic; only the
+ * final `& 0xFF` narrows each half to a `byte`. The COFF analog of ELF's
+ * `emit_u16_le_elf` (a parallel writer, §1.3 — the neutral `emit_u32_le`/
+ * `emit_u64_le` stay single-sourced, but the 16-bit emit is per-format).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 v  the field value (only the low 16 bits are emitted)
+ * @return []byte  `buf` followed by v's two little-endian low bytes
+ */
+fn emit_u16_le_coff(buf: []byte, v: u32) -> []byte {
+    mut b = teko::list::push(buf, (v & (0xFF to u32)) to byte)
+    teko::list::push(b, ((v >> (8 to u32)) & (0xFF to u32)) to byte)
+}
+
+/**
+ * emit_zeros_coff — append exactly `n` zero bytes to `buf` (the fixed-width
+ * padding of an 8-byte COFF `Name` field: a section name or an inline symbol name
+ * shorter than 8 bytes is NUL-padded to the field width). `n` is small and
+ * non-negative, so the loop terminates.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u64 n  the number of zero bytes to append
+ * @return []byte  `buf` followed by `n` zero bytes
+ */
+fn emit_zeros_coff(buf: []byte, n: u64) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        b = teko::list::push(b, 0 to byte)
+        i++
+    }
+    b
+}
+
+/**
+ * emit_coff_name8_str — append `s`'s bytes then zero-pad to exactly 8 bytes (an
+ * `IMAGE_SECTION_HEADER` `Name` field). Every section name B3 emits (`.text`,
+ * `.rdata`) is at most 8 bytes, so it stays inline (a longer name would use the
+ * `"/off"` string-table form — the named `B3-longsectname` case B3 never hits,
+ * since its two section names are both ≤ 8).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param str s  the section name (at most 8 bytes)
+ * @return []byte  `buf` followed by `s` zero-padded to 8 bytes
+ */
+fn emit_coff_name8_str(buf: []byte, s: str) -> []byte {
+    let b = emit_str_bytes(buf, s)
+    emit_zeros_coff(b, (8 to u64) - s.len)
+}
+
+/**
+ * CoffSymbol — one resolved `IMAGE_SYMBOL` (the COFF analog of ELF's `ElfSym`):
+ * the symbol's bare Windows-x64 name, its section-relative `Value`, its 1-based
+ * `SectionNumber` (0 = undefined), its `Type`, and its `StorageClass`. Every MVP
+ * symbol carries 0 aux records (the `B3-sectaux` stop). The per-rodata-datum
+ * neutral locals are NOT represented individually — they collapse into the single
+ * `.rdata` `STATIC` section symbol (§5.3), so a rodata relocation targets that
+ * symbol plus an in-place addend.
+ *
+ * @since #388 B3-3
+ */
+type CoffSymbol = struct {
+    /** name — the symbol's bare name (no `_` prefix on Windows x64). */
+    name: str
+    /** value — the `Value`: a defined symbol's section-relative byte offset, else 0. */
+    value: u32
+    /** section_number — the 1-based `SectionNumber` (1=`.text`, 2=`.rdata`, 0=undefined). */
+    section_number: u32
+    /** sym_type — the `Type`: `0x20` (DTYPE_FUNCTION) for a `.text` function, else 0. */
+    sym_type: u32
+    /** storage_class — the `StorageClass`: 2 (EXTERNAL) or 3 (STATIC section symbol). */
+    storage_class: u32
+}
+
+/**
+ * coff_has_rodata_section — whether the module defines any file-local `.rdata`
+ * datum (a defined, local, section-2 neutral `Symbol`): gates emission of the
+ * single `.rdata` `STATIC` section symbol that every rodata relocation targets
+ * (§5.3). The COFF idiom (like ELF's `STT_SECTION`) collapses every per-string
+ * symbol into one section symbol + an in-place addend, dodging per-string symbols
+ * and their cross-object duplicate-name clashes at the E2 link.
+ *
+ * @param []Symbol symbols  the module's neutral symbol list
+ * @return bool  true iff a defined section-2 local symbol is present
+ */
+fn coff_has_rodata_section(symbols: []Symbol) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        let s = symbols[i]
+        if s.defined && s.local && s.sect == (2 to u8) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * coff_append_globals — append each defined, globally-visible neutral `Symbol` (a
+ * defined function) to `out` as an `EXTERNAL` `DTYPE_FUNCTION` symbol
+ * (`SectionNumber=1`, `Type=0x20`, `StorageClass=2`) at its section-relative
+ * `.text` `Value` — the bare offset, never rebased (COFF `Value` in a relocatable
+ * is section-relative, like ELF's `st_value` and UNLIKE Mach-O's absolute
+ * `n_value`; the A4-4 Mach-O rebase is INAPPLICABLE — §5.5). Runs after the
+ * `.rdata` section symbol so the static-then-external order holds.
+ *
+ * @param []CoffSymbol out  the table so far (the optional `.rdata` section symbol)
+ * @param []Symbol symbols  the module's neutral symbol list
+ * @return []CoffSymbol  `out` followed by every defined global function symbol
+ */
+fn coff_append_globals(out: []CoffSymbol, symbols: []Symbol) -> []CoffSymbol {
+    mut acc = out
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        let s = symbols[i]
+        if s.defined && !s.local {
+            acc = teko::list::push(acc, CoffSymbol { name = s.name; value = s.offset; section_number = 1 to u32; sym_type = 0x20 to u32; storage_class = 2 to u32 })
+        }
+        i++
+    }
+    acc
+}
+
+/**
+ * coff_append_undefined — append each undefined neutral `Symbol` (an externally-
+ * referenced name this object does not define, e.g. `tk_exit`) to `out` as an
+ * `EXTERNAL` undefined symbol (`SectionNumber=0` IMAGE_SYM_UNDEFINED, `Type=0`,
+ * `Value=0`, `StorageClass=2`). Runs last, after every defined symbol.
+ *
+ * @param []CoffSymbol out  the table so far (section symbol + defined globals)
+ * @param []Symbol symbols  the module's neutral symbol list
+ * @return []CoffSymbol  `out` followed by every undefined extern symbol
+ */
+fn coff_append_undefined(out: []CoffSymbol, symbols: []Symbol) -> []CoffSymbol {
+    mut acc = out
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        let s = symbols[i]
+        if !s.defined {
+            acc = teko::list::push(acc, CoffSymbol { name = s.name; value = 0 to u32; section_number = 0 to u32; sym_type = 0 to u32; storage_class = 2 to u32 })
+        }
+        i++
+    }
+    acc
+}
+
+/**
+ * coff_build_symbols — the object's `IMAGE_SYMBOL` table in static-then-external
+ * order (mirroring the ELF/Mach-O convention for determinism, though COFF — unlike
+ * ELF's `sh_info` — imposes no ordering requirement; correctness rides purely on
+ * `SymbolTableIndex`, §5.5): the `.rdata` `STATIC` section symbol (only when rodata
+ * is present), then every defined function as an `EXTERNAL` `DTYPE_FUNCTION` symbol
+ * at its section-relative `.text` offset, then every undefined extern. The neutral
+ * list's per-rodata locals are represented by the one section symbol, so a
+ * function's `Value` stays the bare section-relative offset (the Mach-O F1 rebase
+ * is inapplicable to COFF, §5.5).
+ *
+ * @param []Symbol symbols  the module's neutral symbol list
+ * @return []CoffSymbol  the resolved symbol table, static-then-external
+ */
+fn coff_build_symbols(symbols: []Symbol) -> []CoffSymbol {
+    mut out: []CoffSymbol = teko::list::empty()
+    if coff_has_rodata_section(symbols) {
+        out = teko::list::push(out, CoffSymbol { name = ".rdata"; value = 0 to u32; section_number = 2 to u32; sym_type = 0 to u32; storage_class = 3 to u32 })
+    }
+    out = coff_append_globals(out, symbols)
+    coff_append_undefined(out, symbols)
+}
+
+/**
+ * CoffStrtab — the assembled COFF string table plus the per-symbol name
+ * resolution: the string-table image (a 4-byte little-endian total-size field —
+ * INCLUDING itself, minimum 4 — then each >8-byte name NUL-terminated) and, per
+ * symbol in emission order, the strtab offset a >8-byte name resolves to (`0` for a
+ * ≤8-byte name, which emits inline from the symbol's own `name` — a name is inline
+ * iff `name.len ≤ 8`, so no parallel inline-bytes array is needed). Names ≤ 8 bytes
+ * never enter `bytes`.
+ *
+ * @since #388 B3-3
+ */
+type CoffStrtab = struct {
+    /** bytes — the string-table image (4-byte size prefix + NUL-terminated long names). */
+    bytes: []byte
+    /** long_offset — per symbol: the strtab offset for a >8-byte name, else 0 (inline). */
+    long_offset: []u32
+}
+
+/**
+ * build_coff_strtab — assemble the COFF string table from the symbol list: every
+ * name ≤ 8 bytes emits INLINE in the symbol's 8-byte `Name` field (NUL-padded, bare
+ * — no `_` prefix on Windows x64 — so it never enters `bytes`, recorded as
+ * `long_offset = 0`); every longer name is appended to `bytes` (NUL-terminated) and
+ * its offset recorded so the symbol emits the `[0,0,0,0]`+offset union. `bytes`
+ * opens with the 4-byte total-size field (patched last, once every long name is
+ * placed — the size INCLUDES the 4 bytes, so the first long name lands at offset
+ * 4). The COFF analog of Mach-O's `build_strtab` (which prepends `_`) and ELF's
+ * `build_elf_strtab` (a bare NUL-run) — neither reusable, since COFF's size-prefix +
+ * inline-≤8 layout is structurally distinct (§5.1, D-B).
+ *
+ * @param []CoffSymbol symbols  the resolved symbol table, in emission order
+ * @return CoffStrtab  the string-table bytes + per-symbol >8-byte-name offsets
+ */
+fn build_coff_strtab(symbols: []CoffSymbol) -> CoffStrtab {
+    mut bytes: []byte = emit_zeros_coff(teko::list::empty(), 4 to u64)
+    mut long_offset: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        let nm = symbols[i].name
+        if nm.len <= (8 to u64) {
+            long_offset = teko::list::push(long_offset, 0 to u32)
+        } else {
+            long_offset = teko::list::push(long_offset, bytes.len to u32)
+            bytes = emit_str_bytes(bytes, nm)
+            bytes = teko::list::push(bytes, 0 to byte)
+        }
+        i++
+    }
+    let sized = write_u32_le_at(bytes, 0 to u32, bytes.len to u32)
+    CoffStrtab { bytes = sized; long_offset = long_offset }
+}
+
+/**
+ * coff_symbol_index — the 0-based index of the symbol named `name` in the resolved
+ * COFF symbol table, or `syms.len` when absent. This is the `IMAGE_RELOCATION`
+ * `SymbolTableIndex` (the A4-4/B1-7-class correctness point, §5.5): the MVP emits 0
+ * aux records, so the index equals the emission position; were `B3-sectaux` to add
+ * a section-definition aux record, the indices would shift and a golden pins it.
+ * The absent sentinel is unreached for a well-formed module (every non-rodata
+ * reloc target is a defined function or an undefined extern in the table) and is
+ * covered by a direct unit test on a hand-built input.
+ *
+ * @param []CoffSymbol syms  the resolved symbol table
+ * @param str name  the target symbol's name
+ * @return u32  the symbol's index, or `syms.len` when not found
+ */
+fn coff_symbol_index(syms: []CoffSymbol, name: str) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= syms.len { break }
+        if syms[i].name == name { return i to u32 }
+        i++
+    }
+    syms.len to u32
+}
+
+/**
+ * coff_rodata_secsym_index — the 0-based index of the `.rdata` `STATIC` section
+ * symbol (`SectionNumber == 2`, `StorageClass == 3`), the target every rodata
+ * relocation resolves to, or `syms.len` when no rodata section symbol was emitted.
+ * The absent case is unreached because a rodata relocation is emitted only when the
+ * rodata datum — and thus its section symbol — exists, and is covered by a direct
+ * unit test on a hand-built input.
+ *
+ * @param []CoffSymbol syms  the resolved symbol table
+ * @return u32  the `.rdata` section symbol's index, or `syms.len`
+ */
+fn coff_rodata_secsym_index(syms: []CoffSymbol) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= syms.len { break }
+        if syms[i].section_number == (2 to u32) && syms[i].storage_class == (3 to u32) { return i to u32 }
+        i++
+    }
+    syms.len to u32
+}
+
+/**
+ * coff_reloc_type — the numeric `IMAGE_REL_AMD64_*` type for the reused
+ * `RelocKindX86` the x86 encoder already tags: `Plt32`/`Pc32` → REL32(0x0004) (a
+ * PC-relative-to-next-instruction fixup — the −4 SysV/ELF addend is IMPLICIT in
+ * the COFF REL32 definition, so it is NOT written to a reloc field the way ELF
+ * writes `r_addend`), `Abs64` → ADDR64(0x0001). The ONLY COFF-specific knowledge
+ * the writer injects (the adapter mirror of `elf_reloc_type`). `Abs64` is the
+ * FUTURE data-global path (`B3-globals`, raised earlier in `encode_module_x86`),
+ * so a real B3 object never carries an ADDR64 relocation; the arm is covered by a
+ * direct unit test.
+ *
+ * @param RelocKindX86 kind  the relocation kind the encoder tagged
+ * @return u32  the `IMAGE_RELOCATION` `Type` field value
+ */
+fn coff_reloc_type(kind: RelocKindX86) -> u32 {
+    match kind {
+        Plt32 => 0x0004 to u32
+        Pc32 => 0x0004 to u32
+        Abs64 => 0x0001 to u32
+    }
+}
+
+/**
+ * CoffRodataHit — the result of resolving a relocation's target against the
+ * module's rodata locals: whether the named target is a defined, file-local
+ * `.rdata` datum, and (when it is) that datum's byte offset within `.rdata`. A hit
+ * re-points the relocation at the `.rdata` section symbol and writes the offset
+ * in-place into the `.text` disp32 field (the COFF idiom that dodges per-string
+ * symbols — like Mach-O, unlike ELF's explicit `r_addend`); a miss leaves the
+ * relocation targeting the named function/extern symbol directly.
+ *
+ * @since #388 B3-3
+ */
+type CoffRodataHit = struct {
+    /** found — true iff the relocation target is a defined section-2 local. */
+    found: bool
+    /** offset — the target datum's byte offset within `.rdata` (0 on a miss). */
+    offset: u32
+}
+
+/**
+ * coff_rodata_hit — resolve `name` against the module's rodata locals: a hit iff
+ * some neutral `Symbol` named `name` is defined, file-local, and section-2 (a
+ * `.rdata` datum), carrying that datum's `.rdata` byte offset. `coff_build_relocs`
+ * re-targets a hit at the `.rdata` section symbol and `coff_apply_rodata_addends`
+ * writes the offset in-place into the disp32 field.
+ *
+ * @param []Symbol symbols  the module's neutral symbol list
+ * @param str name  the relocation's target symbol name
+ * @return CoffRodataHit  whether it is a rodata local, and its offset
+ */
+fn coff_rodata_hit(symbols: []Symbol, name: str) -> CoffRodataHit {
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        let s = symbols[i]
+        if s.defined && s.local && s.sect == (2 to u8) && s.name == name {
+            return CoffRodataHit { found = true; offset = s.offset }
+        }
+        i++
+    }
+    CoffRodataHit { found = false; offset = 0 to u32 }
+}
+
+/**
+ * CoffReloc — one resolved `IMAGE_RELOCATION` (10 bytes): the `.text`-section-
+ * relative `VirtualAddress` of the patched field, the 0-based `SymbolTableIndex`
+ * it targets, and the `IMAGE_REL_AMD64_*` `Type`. COFF carries NO addend field —
+ * the REL32 −4 is implicit and any rodata addend rides in-place in the `.text`
+ * bytes (§5.4), so this row holds no addend.
+ *
+ * @since #388 B3-3
+ */
+type CoffReloc = struct {
+    /** virtual_address — the patched field's `.text`-section-relative byte offset (module-rebased). */
+    virtual_address: u32
+    /** symbol_index — the 0-based `SymbolTableIndex` of the target symbol. */
+    symbol_index: u32
+    /** rtype — the `IMAGE_REL_AMD64_*` `Type` value (REL32=0x0004, ADDR64=0x0001). */
+    rtype: u32
+}
+
+/**
+ * coff_build_relocs — resolve every neutral `RelocX86` into an `IMAGE_RELOCATION`
+ * row: a rodata target (a defined section-2 local) re-points at the `.rdata`
+ * section symbol (its offset is folded in-place by `coff_apply_rodata_addends`,
+ * NOT into a reloc field — COFF has none); any other target (a defined function or
+ * an undefined extern) takes that symbol's table index. The `VirtualAddress` is
+ * the encoder's module-rebased `.text`-relative field offset, unchanged; the
+ * `RelocKindX86` maps through `coff_reloc_type` (the only COFF knowledge injected).
+ *
+ * @param []Symbol symbols  the module's neutral symbol list (for rodata resolution)
+ * @param []CoffSymbol coffsyms  the resolved COFF symbol table (for target indices)
+ * @param []RelocX86 relocs  the module-rebased relocations, in emission order
+ * @return []CoffReloc  the resolved relocation rows, in emission order
+ */
+fn coff_build_relocs(symbols: []Symbol, coffsyms: []CoffSymbol, relocs: []RelocX86) -> []CoffReloc {
+    let secidx = coff_rodata_secsym_index(coffsyms)
+    mut out: []CoffReloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let r = relocs[i]
+        let hit = coff_rodata_hit(symbols, r.sym)
+        let symidx = if hit.found { secidx } else { coff_symbol_index(coffsyms, r.sym) }
+        out = teko::list::push(out, CoffReloc { virtual_address = r.offset; symbol_index = symidx; rtype = coff_reloc_type(r.kind) })
+        i++
+    }
+    out
+}
+
+/**
+ * coff_apply_rodata_addends — fold every rodata relocation's target offset in-place
+ * into the `.text` disp32 field (the COFF/Mach-O idiom — COFF has no `r_addend`,
+ * §5.4). For each `RelocX86` whose target is a defined section-2 local, write that
+ * datum's `.rdata` byte offset as a little-endian `u32` at the reloc's `.text`
+ * offset (the −4 is implicit in COFF REL32, so ONLY the rodata offset is written,
+ * never the base −4); a non-rodata reloc (the exit corpus's `call tk_exit` REL32)
+ * leaves the field as the encoder emitted it (0). Returns `text` unchanged when no
+ * relocation is a rodata hit.
+ *
+ * @param []byte text  the `.text` section image (rel32 fields as the encoder left them)
+ * @param []Symbol symbols  the module's neutral symbol list (for rodata resolution)
+ * @param []RelocX86 relocs  the module-rebased relocations, in emission order
+ * @return []byte  `text` with each rodata reloc's `.rdata` offset folded in-place
+ */
+fn coff_apply_rodata_addends(text: []byte, symbols: []Symbol, relocs: []RelocX86) -> []byte {
+    mut buf = text
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let r = relocs[i]
+        let hit = coff_rodata_hit(symbols, r.sym)
+        if hit.found { buf = write_u32_le_at(buf, r.offset, hit.offset) }
+        i++
+    }
+    buf
+}
+
+/**
+ * CoffLayout — the resolved file offsets, sizes, and counts of a COFF object,
+ * computed BEFORE any bytes are emitted so the file header's `PointerToSymbolTable`
+ * and each section header's `PointerToRawData`/`PointerToRelocations` reference the
+ * real data positions. The emission order mirrors this exactly:
+ * `[IMAGE_FILE_HEADER][section headers][.text][.rdata][.text relocations][symbols][strtab]`
+ * (no optional header, no PE image concerns — a relocatable object, §5.1). COFF
+ * object files require no inter-record padding, so the offsets are contiguous.
+ *
+ * @since #388 B3-3
+ */
+type CoffLayout = struct {
+    /** num_sections — the section count (1 for `.text` only, 2 with `.rdata`). */
+    num_sections: u32
+    /** text_size — the `.text` `SizeOfRawData`. */
+    text_size: u32
+    /** text_offset — the file offset of the `.text` bytes (after the section headers). */
+    text_offset: u32
+    /** rdata_size — the `.rdata` `SizeOfRawData` (0 when no rodata). */
+    rdata_size: u32
+    /** rdata_offset — the file offset of the `.rdata` bytes (immediately after `.text`). */
+    rdata_offset: u32
+    /** reloc_offset — the file offset of the `.text` relocation array (after all section data). */
+    reloc_offset: u32
+    /** num_relocs — the number of `.text` relocations. */
+    num_relocs: u32
+    /** symtab_offset — the file offset of the `IMAGE_SYMBOL` table (`PointerToSymbolTable`). */
+    symtab_offset: u32
+    /** num_symbols — the symbol-record count (`NumberOfSymbols`; 0 aux records in the MVP). */
+    num_symbols: u32
+}
+
+/**
+ * compute_coff_layout — resolve every file offset and count of the object from the
+ * `EncodedModuleX86` and the pre-built symbol/relocation counts: the file header
+ * (20 bytes) then the section headers (40 bytes each) fix `text_offset`, then the
+ * `.text` and `.rdata` section images are contiguous, then the `.text` relocation
+ * array, then the symbol table (packed 18-byte records), then the string table.
+ * Mirrors the emission order exactly, so every header offset field points at the
+ * real data. No padding — COFF object records need no alignment (§5.1).
+ *
+ * @param EncodedModuleX86 enc  the section images (for the `.text`/`.rdata` sizes)
+ * @param u32 num_symbols  the pre-built symbol-record count
+ * @param u32 num_relocs  the pre-built `.text` relocation count
+ * @return CoffLayout  the resolved offsets, sizes, and counts
+ */
+fn compute_coff_layout(enc: EncodedModuleX86, num_symbols: u32, num_relocs: u32) -> CoffLayout {
+    let num_sections = if enc.rodata.len > (0 to u64) { 2 to u32 } else { 1 to u32 }
+    let text_size = enc.text.len to u32
+    let text_offset = (20 to u32) + (num_sections * (40 to u32))
+    let rdata_size = enc.rodata.len to u32
+    let rdata_offset = text_offset + text_size
+    let reloc_offset = rdata_offset + rdata_size
+    let symtab_offset = reloc_offset + (num_relocs * (10 to u32))
+    CoffLayout {
+        num_sections = num_sections
+        text_size = text_size
+        text_offset = text_offset
+        rdata_size = rdata_size
+        rdata_offset = rdata_offset
+        reloc_offset = reloc_offset
+        num_relocs = num_relocs
+        symtab_offset = symtab_offset
+        num_symbols = num_symbols
+    }
+}
+
+/**
+ * emit_coff_header — the `IMAGE_FILE_HEADER` (20 bytes): `Machine=0x8664`
+ * (IMAGE_FILE_MACHINE_AMD64), `NumberOfSections`, `TimeDateStamp=0` (deterministic
+ * — FIXPOINT, NOT the wall clock), `PointerToSymbolTable`, `NumberOfSymbols`,
+ * `SizeOfOptionalHeader=0` (a relocatable object has no optional header), and
+ * `Characteristics=0`.
+ *
+ * @param []byte buf  the (empty) buffer to extend
+ * @param CoffLayout lay  the resolved layout (for the section/symbol counts + offset)
+ * @return []byte  `buf` followed by the 20-byte file header
+ */
+fn emit_coff_header(buf: []byte, lay: CoffLayout) -> []byte {
+    mut b = emit_u16_le_coff(buf, 0x8664 to u32)
+    b = emit_u16_le_coff(b, lay.num_sections)
+    b = emit_u32_le(b, 0 to u32)
+    b = emit_u32_le(b, lay.symtab_offset)
+    b = emit_u32_le(b, lay.num_symbols)
+    b = emit_u16_le_coff(b, 0 to u32)
+    emit_u16_le_coff(b, 0 to u32)
+}
+
+/**
+ * emit_coff_section — one `IMAGE_SECTION_HEADER` (40 bytes): the 8-byte `Name`,
+ * `VirtualSize=0` and `VirtualAddress=0` (both 0 in a relocatable object),
+ * `SizeOfRawData`, `PointerToRawData`, `PointerToRelocations` (0 when none),
+ * `PointerToLinenumbers=0`, `NumberOfRelocations`, `NumberOfLinenumbers=0`, and
+ * `Characteristics` (`0x60500020` for `.text`, `0x40400040` for `.rdata`).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param str name  the section name (at most 8 bytes)
+ * @param u32 raw_size  the section's `SizeOfRawData`
+ * @param u32 raw_ptr  the section data's file offset (`PointerToRawData`)
+ * @param u32 reloc_ptr  the relocation array's file offset (0 when none)
+ * @param u32 nreloc  the relocation count
+ * @param u32 characteristics  the section `Characteristics` flags
+ * @return []byte  `buf` followed by the 40-byte section header
+ */
+fn emit_coff_section(buf: []byte, name: str, raw_size: u32, raw_ptr: u32, reloc_ptr: u32, nreloc: u32, characteristics: u32) -> []byte {
+    mut b = emit_coff_name8_str(buf, name)
+    b = emit_u32_le(b, 0 to u32)
+    b = emit_u32_le(b, 0 to u32)
+    b = emit_u32_le(b, raw_size)
+    b = emit_u32_le(b, raw_ptr)
+    b = emit_u32_le(b, reloc_ptr)
+    b = emit_u32_le(b, 0 to u32)
+    b = emit_u16_le_coff(b, nreloc)
+    b = emit_u16_le_coff(b, 0 to u32)
+    emit_u32_le(b, characteristics)
+}
+
+/**
+ * emit_coff_sections — the section headers: the `.text` header (carrying the
+ * relocation pointer when relocations are present) and, when rodata is present, the
+ * `.rdata` header. `.text` is code+execute+read 16-byte-aligned (`0x60500020`);
+ * `.rdata` is initialized-data read-only 8-byte-aligned (`0x40400040`).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param CoffLayout lay  the resolved layout
+ * @return []byte  `buf` followed by the section headers
+ */
+fn emit_coff_sections(buf: []byte, lay: CoffLayout) -> []byte {
+    let text_reloc_ptr = if lay.num_relocs > (0 to u32) { lay.reloc_offset } else { 0 to u32 }
+    mut b = emit_coff_section(buf, ".text", lay.text_size, lay.text_offset, text_reloc_ptr, lay.num_relocs, 0x60500020 to u32)
+    if lay.num_sections > (1 to u32) {
+        b = emit_coff_section(b, ".rdata", lay.rdata_size, lay.rdata_offset, 0 to u32, 0 to u32, 0x40400040 to u32)
+    }
+    b
+}
+
+/**
+ * emit_coff_sym_name — the 8-byte `IMAGE_SYMBOL` `Name` union: a name ≤ 8 bytes is
+ * the raw bytes NUL-padded to 8; a name > 8 bytes is the `Zeroes` sentinel — four
+ * zero bytes — then the 4-byte little-endian `Offset` into the string table (§5.1).
+ * The ≤8-vs->8 branch keys off `name.len` (`long_off` is meaningful, and nonzero,
+ * only for the long-name form).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param str name  the symbol's bare name
+ * @param u32 long_off  the string-table offset for a long name (ignored when inline)
+ * @return []byte  `buf` followed by the 8-byte `Name` union
+ */
+fn emit_coff_sym_name(buf: []byte, name: str, long_off: u32) -> []byte {
+    if name.len <= (8 to u64) {
+        let b = emit_str_bytes(buf, name)
+        return emit_zeros_coff(b, (8 to u64) - name.len)
+    }
+    let z = emit_zeros_coff(buf, 4 to u64)
+    emit_u32_le(z, long_off)
+}
+
+/**
+ * emit_coff_one_symbol — one `IMAGE_SYMBOL` (18 bytes, packed — NOT 4-aligned): the
+ * 8-byte `Name` union, the section-relative `Value`, the 1-based `SectionNumber`,
+ * the `Type`, the `StorageClass`, and `NumberOfAuxSymbols=0` (the MVP emits no aux
+ * records — the `B3-sectaux` stop).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param CoffSymbol sym  the symbol to emit
+ * @param u32 long_off  the symbol's string-table offset for a >8-byte name (else 0)
+ * @return []byte  `buf` followed by the 18-byte `IMAGE_SYMBOL`
+ */
+fn emit_coff_one_symbol(buf: []byte, sym: CoffSymbol, long_off: u32) -> []byte {
+    mut b = emit_coff_sym_name(buf, sym.name, long_off)
+    b = emit_u32_le(b, sym.value)
+    b = emit_u16_le_coff(b, sym.section_number)
+    b = emit_u16_le_coff(b, sym.sym_type)
+    b = emit_u8_field(b, sym.storage_class)
+    emit_u8_field(b, 0 to u32)
+}
+
+/**
+ * emit_coff_symtab — the `IMAGE_SYMBOL` table: one packed 18-byte record per
+ * symbol, in static-then-external order, each carrying its `Name` union (inline when
+ * `name.len ≤ 8`, else the strtab offset from `strtab`) and its section-relative
+ * `Value`. The table is PACKED (18-byte records are not 4-aligned) — no padding is
+ * inserted (§9.3 VM gotcha (b)).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param []CoffSymbol syms  the resolved symbol table
+ * @param CoffStrtab strtab  the string table (for the per-symbol long-name offset)
+ * @return []byte  `buf` followed by the symbol-table records
+ */
+fn emit_coff_symtab(buf: []byte, syms: []CoffSymbol, strtab: CoffStrtab) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= syms.len { break }
+        b = emit_coff_one_symbol(b, syms[i], strtab.long_offset[i])
+        i++
+    }
+    b
+}
+
+/**
+ * emit_coff_relocs — the `.text` `IMAGE_RELOCATION` array: one 10-byte record per
+ * relocation — the `.text`-section-relative `VirtualAddress`, the 0-based
+ * `SymbolTableIndex`, and the `IMAGE_REL_AMD64_*` `Type` (16-bit). No addend field
+ * (COFF has none — §5.4).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param []CoffReloc relocs  the resolved relocation rows
+ * @return []byte  `buf` followed by the relocation records
+ */
+fn emit_coff_relocs(buf: []byte, relocs: []CoffReloc) -> []byte {
+    mut b = buf
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let r = relocs[i]
+        b = emit_u32_le(b, r.virtual_address)
+        b = emit_u32_le(b, r.symbol_index)
+        b = emit_u16_le_coff(b, r.rtype)
+        i++
+    }
+    b
+}
+
+/**
+ * emit_coff — assemble an `IMAGE_FILE_MACHINE_AMD64` relocatable PE/COFF object
+ * from an `EncodedModuleX86`: the 20-byte `IMAGE_FILE_HEADER` + the
+ * `IMAGE_SECTION_HEADER`s (`.text`, and `.rdata` when rodata is present) + the
+ * section images (with each rodata relocation's `.rdata` byte offset folded in-place
+ * into the `.text` disp32) + the `.text` `IMAGE_RELOCATION` array + the 18-byte
+ * `IMAGE_SYMBOL` table (static-then-external, the `.rdata` STATIC section symbol,
+ * bare Windows-x64 names) + the 4-byte-size-prefixed string table (only >8-byte
+ * names). Enough for `clang -target x86_64-windows` / `lld-link` to link into a
+ * runnable `.exe` against the C-built `teko_rt` (D-2 option 1 bootstrap). The writer
+ * is ISA-agnostic (consumes only `EncodedModuleX86`'s byte images + symbols +
+ * relocations), so E2/#226's COFF linker reuses its shape. Data globals + the
+ * callee-saved-XMM save path are the `B3-globals`/`B3-xmm-callee-saved` stops,
+ * raised earlier in the pipeline.
+ *
+ * @param EncodedModuleX86 enc  the section images + symbols + relocations
+ * @return []byte  the PE/COFF object file bytes
+ */
+pub fn emit_coff(enc: EncodedModuleX86) -> []byte {
+    let coffsyms = coff_build_symbols(enc.symbols)
+    let strtab = build_coff_strtab(coffsyms)
+    let relocs = coff_build_relocs(enc.symbols, coffsyms, enc.relocs)
+    let patched_text = coff_apply_rodata_addends(enc.text, enc.symbols, enc.relocs)
+    let lay = compute_coff_layout(enc, coffsyms.len to u32, relocs.len to u32)
+    mut b: []byte = teko::list::empty()
+    b = emit_coff_header(b, lay)
+    b = emit_coff_sections(b, lay)
+    b = append_bytes(b, patched_text)
+    b = append_bytes(b, enc.rodata)
+    b = emit_coff_relocs(b, relocs)
+    b = emit_coff_symtab(b, coffsyms, strtab)
+    append_bytes(b, strtab.bytes)
+}
