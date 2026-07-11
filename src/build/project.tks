@@ -407,13 +407,16 @@ fn teko_cc_env() -> str {
 /**
  * default_cc_for_target — the cross-compiler that links the own object for a
  * non-host `NativeTarget` when neither the manifest `cc` nor the `TEKO_CC` seam
- * pins one (#387 B2-8, D-D): `riscv64-linux-gnu-gcc` for `Riscv64Linux` (it
- * compiles the C `teko_rt`/`assert` runtime FOR riscv and links it with the own
- * riscv `.o` into a qemu-runnable executable). The `Arm64Macho` and `X8664Linux`
- * arms return the host `"cc"` — the default build's link line is byte-unchanged,
- * because an unset `TEKO_TARGET` resolves to `Arm64Macho` → `"cc"` exactly as the
- * pre-B2 `else` branch did. D1/#390's real `--target` supersedes this env-derived
- * default.
+ * pins one (#387 B2-8, D-D; #388 B3-4, D-F): `riscv64-linux-gnu-gcc` for
+ * `Riscv64Linux` (it compiles the C `teko_rt`/`assert` runtime FOR riscv and links
+ * it with the own riscv `.o` into a qemu-runnable executable). The `Arm64Macho`,
+ * `X8664Linux` and `X8664Windows` arms return the host `"cc"` — the executing
+ * differential runs each on its OWN native runner (macOS-arm64, linux-x86_64 and
+ * windows-x86_64 respectively), so the host `cc` IS the target compiler there (on
+ * the Windows runner it resolves to the host clang, which drives lld-link, D-F).
+ * The default build's link line is byte-unchanged, because an unset `TEKO_TARGET`
+ * resolves to `Arm64Macho` → `"cc"` exactly as the pre-B2 `else` branch did.
+ * D1/#390's real `--target` supersedes this env-derived default.
  *
  * @param t  the resolved own-backend target
  * @return   the compiler command for `t`
@@ -423,6 +426,7 @@ fn default_cc_for_target(t: NativeTarget) -> str {
         NativeTarget::Riscv64Linux => "riscv64-linux-gnu-gcc"
         NativeTarget::X8664Linux => "cc"
         NativeTarget::Arm64Macho => "cc"
+        NativeTarget::X8664Windows => "cc"
     }
 }
 
@@ -686,26 +690,29 @@ fn native_backend_selected() -> bool {
 
 /**
  * NativeTarget — which own-AOT-backend target the temporary `TEKO_TARGET` env
- * seam selects (D-D, #386 B1-8; #387 B2-8): the default `Arm64Macho` (the A4
- * reference — arm64 machine code in a Mach-O object), `X8664Linux` (x86-64 SysV
- * machine code in an ELF object), or `Riscv64Linux` (RISC-V RV64GC/LP64D machine
- * code in an ELF object). Targets are named by OS, not by object format (ruling
- * #390): the format (ELF/Mach-O) is a consequence of the OS, so `x86_64-linux`
- * and `riscv64-linux` — not `x86_64-elf`/`riscv64-elf` (ELF spans many kernels
- * the binary does not port between) — are canonical. The seam mirrors
- * `TEKO_BACKEND` and is read only when the own backend is already active;
- * D1/#390 supersedes it with the real `--target` manifest flag.
+ * seam selects (D-D, #386 B1-8; #387 B2-8; #388 B3-4): the default `Arm64Macho`
+ * (the A4 reference — arm64 machine code in a Mach-O object), `X8664Linux`
+ * (x86-64 SysV machine code in an ELF object), `Riscv64Linux` (RISC-V RV64GC/LP64D
+ * machine code in an ELF object), or `X8664Windows` (x86-64 machine code — the SAME
+ * ISA as `X8664Linux`, differing ONLY in the Win64 register file `win64` and the
+ * PE/COFF object format `emit_coff` — in a Windows PE/COFF object). Targets are
+ * named by OS, not by object format (ruling #390): the format (ELF/Mach-O/COFF) is
+ * a consequence of the OS, so `x86_64-linux`, `riscv64-linux` and `x86_64-windows` —
+ * not `x86_64-elf`/`riscv64-elf`/`x86_64-pe` (a format spans many kernels the binary
+ * does not port between) — are canonical. The seam mirrors `TEKO_BACKEND` and is
+ * read only when the own backend is already active; D1/#390 supersedes it with the
+ * real `--target` manifest flag.
  */
-type NativeTarget = enum { Arm64Macho; X8664Linux; Riscv64Linux }
+type NativeTarget = enum { Arm64Macho; X8664Linux; Riscv64Linux; X8664Windows }
 
 /**
  * target_from_name — map a raw `TEKO_TARGET` value to a `NativeTarget`:
- * `x86_64-linux` selects the x86-64 SysV/ELF pipeline and `riscv64-linux` the
- * RISC-V LP64D/ELF pipeline (both canonical, OS-based per ruling #390);
- * `x86_64-elf`/`riscv64-elf` are accepted as deprecated format-named aliases.
- * Every other value — including `arm64-macos`, an empty string, or a typo —
- * falls back to the default `Arm64Macho`, so an unrecognized target never
- * silently mis-lowers.
+ * `x86_64-linux` selects the x86-64 SysV/ELF pipeline, `riscv64-linux` the
+ * RISC-V LP64D/ELF pipeline, and `x86_64-windows` the x86-64 Win64/PE-COFF
+ * pipeline (all canonical, OS-based per ruling #390); `x86_64-elf`/`riscv64-elf`/
+ * `x86_64-win`/`x86_64-pe` are accepted as deprecated format-named aliases. Every
+ * other value — including `arm64-macos`, an empty string, or a typo — falls back
+ * to the default `Arm64Macho`, so an unrecognized target never silently mis-lowers.
  *
  * @param name  the raw `TEKO_TARGET` environment value
  * @return      the selected own-backend target
@@ -715,6 +722,9 @@ fn target_from_name(name: str) -> NativeTarget {
     if name == "x86_64-elf" { return NativeTarget::X8664Linux }
     if name == "riscv64-linux" { return NativeTarget::Riscv64Linux }
     if name == "riscv64-elf" { return NativeTarget::Riscv64Linux }
+    if name == "x86_64-windows" { return NativeTarget::X8664Windows }
+    if name == "x86_64-win" { return NativeTarget::X8664Windows }
+    if name == "x86_64-pe" { return NativeTarget::X8664Windows }
     NativeTarget::Arm64Macho
 }
 
@@ -747,12 +757,15 @@ fn strip_trailing_slash(dir: str) -> str {
 
 /**
  * emit_native — the own-AOT-backend driver (the #385 A4-5 KEYSTONE, extended for
- * x86-64 at #386 B1-8 and RISC-V at #387 B2-8): lower the checked program to
- * target-independent LIR, then dispatch on `native_target()` to the per-ISA tail —
- * arm64 `MInst`/AAPCS64/Mach-O (the default, byte-unchanged A4 path), x86-64
- * `MInstX86`/SysV/ELF (the B1 path, `TEKO_TARGET=x86_64-linux`), or RISC-V
- * `MInstRiscv`/LP64D/ELF (the B2 path, `TEKO_TARGET=riscv64-linux`). Each tail
- * selects instructions, allocates registers,
+ * x86-64 at #386 B1-8, RISC-V at #387 B2-8 and Windows at #388 B3-4): lower the
+ * checked program to target-independent LIR, then dispatch on `native_target()` to
+ * the per-ISA tail — arm64 `MInst`/AAPCS64/Mach-O (the default, byte-unchanged A4
+ * path), x86-64 `MInstX86`/SysV/ELF (the B1 path, `TEKO_TARGET=x86_64-linux`),
+ * RISC-V `MInstRiscv`/LP64D/ELF (the B2 path, `TEKO_TARGET=riscv64-linux`), or
+ * x86-64 `MInstX86`/Win64/PE-COFF (the B3 path, `TEKO_TARGET=x86_64-windows` — the
+ * SAME x86 ISA as the Linux path, differing only in the `win64` register file and
+ * the `emit_coff` object format). Each tail selects instructions, allocates
+ * registers,
  * encodes machine bytes, wraps them in the target object format, writes the `.o`,
  * and links it into a native executable against the C-built `teko_rt`/`assert`
  * runtime via `cc`-as-linker (`link_object`, the D-C bootstrap). Any pipeline
@@ -778,6 +791,7 @@ fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
         NativeTarget::X8664Linux => emit_native_x86(dir, od, stem, lmod, prog, m)
         NativeTarget::Riscv64Linux => emit_native_riscv(dir, od, stem, lmod, prog, m)
         NativeTarget::Arm64Macho => emit_native_arm64(dir, od, stem, lmod, prog, m)
+        NativeTarget::X8664Windows => emit_native_win(dir, od, stem, lmod, prog, m)
     }
 }
 
@@ -860,18 +874,51 @@ fn emit_native_riscv(dir: str, od: str, stem: str, lmod: teko::lir::LModule, pro
 }
 
 /**
- * finish_native_object — the object-format-agnostic tail shared by both own-backend
- * targets: write the encoded object bytes to `<od>/<stem>.o`, link it into
- * `<od>/<stem>` via `cc`-as-linker (`link_object`) against the C-built runtime,
- * write the `.tsym` symbol map beside the binary (best-effort — a write error never
- * fails the build), and print the EXCLUSIVE `"(own backend)"` success marker the
- * differential harness keys on (F1(a)). Factoring it here keeps the arm64 and x86
- * tails identical past the encoder, so the two link paths never drift.
+ * emit_native_win — the Windows x86-64 / PE-COFF own-backend tail (#388 B3-4): select
+ * x86-64 `MInstX86` from the lowered module (the REUSED B1 isel — Windows x64 IS the
+ * x86-64 ISA), allocate registers under the Win64 register file (`win64` — RCX/RDX/R8/R9
+ * arguments, RDI/RSI callee-saved, the 32-byte shadow space), encode to the SAME x86
+ * machine bytes (the REUSED B1 encoder — only the frame side-table reserves the shadow
+ * space, B3-2), wrap them in an `IMAGE_FILE_MACHINE_AMD64` PE/COFF object (`emit_coff`),
+ * and hand the bytes to `finish_native_object` (write `.o` + cc/clang-link + `.tsym` +
+ * success marker). The isel/regalloc/encoder are the B1 x86 code UNCHANGED — only
+ * `win64()` and `emit_coff` differ. Reached only via `TEKO_TARGET=x86_64-windows`; the
+ * emitted `.o` is a Win64 COFF, so the executing C-vs-own differential runs on the
+ * windows-x86_64 CI runner (which runs the PE NATIVELY — no emulator, unlike B2's qemu),
+ * while a macOS host still writes the `.o` for the byte / `llvm-readobj --coff-*`
+ * cross-check even though `cc` cannot link a PE there (the link honest-skips).
  *
  * @param dir   the project directory (for diagnostics)
  * @param od    the slash-stripped output directory (already created)
  * @param stem  the output artifact name (the manifest `name`)
- * @param obj   the encoded object-file bytes (Mach-O or ELF)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_win(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+    let sel = match teko::backend::select_module_x86(lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let col = match teko::backend::regalloc_module_x86(teko::backend::win64(), sel) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let enc = match teko::backend::encode_module_x86(teko::backend::win64(), col) { teko::backend::EncodedModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    finish_native_object(dir, od, stem, teko::backend::emit_coff(enc), prog, m)
+}
+
+/**
+ * finish_native_object — the object-format-agnostic tail shared by every own-backend
+ * target: write the encoded object bytes to `<od>/<stem>.o`, link it into
+ * `<od>/<stem>` via `cc`-as-linker (`link_object`) against the C-built runtime,
+ * write the `.tsym` symbol map beside the binary (best-effort — a write error never
+ * fails the build), and print the EXCLUSIVE `"(own backend)"` success marker the
+ * differential harness keys on (F1(a)). Factoring it here keeps the arm64, x86 and
+ * Windows tails identical past the encoder, so the link paths never drift. The `.o`
+ * is written BEFORE the link, so a cross-host link that cannot proceed (e.g. a macOS
+ * host asked for a Windows PE) still leaves the object on disk for the byte /
+ * well-formedness cross-check.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param obj   the encoded object-file bytes (Mach-O, ELF or PE/COFF)
  * @param prog  the checked program (`.tsym` emission)
  * @param m     the resolved manifest (link knobs)
  * @return      0 on a successful write+link, else the failing status
