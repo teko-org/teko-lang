@@ -1004,17 +1004,98 @@ fn frame_sub_size_x86(slots_size: u32, n_saved: u32) -> u32 {
 }
 
 /**
+ * inst_is_call_x86 — whether one machine instruction issues a call
+ * (`MCallX86`/`MCallIndX86`), the per-instruction predicate `block_makes_call_x86`
+ * folds over a block stream to decide whether a Win64 frame must reserve the
+ * caller's shadow space (§4.1).
+ *
+ * @param MInstX86 i  the instruction to classify
+ * @return bool  true iff `i` is a direct or indirect call
+ */
+fn inst_is_call_x86(i: MInstX86) -> bool {
+    match i {
+        MCallX86 => true
+        MCallIndX86 => true
+        _ => false
+    }
+}
+
+/**
+ * block_makes_call_x86 — whether any instruction in one block issues a call, the
+ * block-level fold `func_makes_call_x86` walks over every block (the x86 mirror
+ * of `scan_block_saved_x86`'s block scan).
+ *
+ * @param MBlockX86 b  the block to scan
+ * @return bool  true iff `b` contains a call instruction
+ */
+fn block_makes_call_x86(b: MBlockX86) -> bool {
+    mut found = false
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        if inst_is_call_x86(b.insts[i]) { found = true; break }
+        i++
+    }
+    found
+}
+
+/**
+ * func_makes_call_x86 — whether the physical `MFuncX86` contains any call
+ * (`MCallX86`/`MCallIndX86`), so `compute_frame_layout_x86` knows to reserve the
+ * Win64 shadow space (a caller-only obligation — a leaf function reserves none).
+ * A total scan over every block's instructions, mirroring the shape of
+ * `collect_callee_saved_x86`'s block walk. On SysV (`shadow_space == 0`) the
+ * result is unused, so the scan runs only on the Win64 path (§4.1).
+ *
+ * @param MFuncX86 f  the fully-physical function
+ * @return bool  true iff the function issues at least one call
+ */
+fn func_makes_call_x86(f: MFuncX86) -> bool {
+    mut found = false
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if block_makes_call_x86(f.blocks[i]) { found = true; break }
+        i++
+    }
+    found
+}
+
+/**
+ * shadow_bytes_x86 — the Win64 caller-reserved shadow-space contribution to a
+ * function's frame: `abi.shadow_space` when the register file reserves shadow
+ * space (Win64: 32) AND the function makes a call (a callee expects 32 bytes to
+ * spill its four register args), else 0. Every non-Win64 ABI leaves
+ * `shadow_space` 0, so this returns 0 and the frame bytes stay byte-identical to
+ * SysV/AAPCS64/LP64D (the FIXPOINT guardrail, §2.2); a Win64 LEAF (no call) also
+ * returns 0, so it is frameless when it has no slots/callee-saved (§4.2).
+ *
+ * @param AbiDescriptor abi  the register file (its `shadow_space` field)
+ * @param MFuncX86 f  the fully-physical function (scanned for a call)
+ * @return u32  the shadow bytes to fold into the frame (32 for a calling Win64 function, else 0)
+ */
+fn shadow_bytes_x86(abi: AbiDescriptor, f: MFuncX86) -> u32 {
+    if abi.shadow_space == (0 to u32) { return 0 to u32 }
+    if !func_makes_call_x86(f) { return 0 to u32 }
+    abi.shadow_space
+}
+
+/**
  * compute_frame_layout_x86 — build a function's `FrameLayoutX86`: re-derive the
  * callee-saved save-set by scanning the physical `MFuncX86`, lay out the frame
  * slots honoring each `LAlloca`'s alignment (the neutral `compute_slot_offsets`),
- * size the `sub rsp` region for SysV 16-byte call-boundary alignment, and shift
- * every slot offset above the callee-saved push region so `MFrameAddrX86`
- * resolves to `lea dst, [rsp+off]`. A pure side-table pass — it never mutates the
- * block stream, so the interp oracle stays valid on the pre-encode function. The
- * x86 mirror of arm64's `compute_frame_layout`; frames beyond the imm32 `sub`
- * field are caught at prologue emission (`B1-bigframe`, near-N/A), not here.
+ * fold in the Win64 caller-reserved shadow space (`shadow_bytes_x86` — 32 for a
+ * calling Win64 function, 0 for every other ABI so the frame bytes stay
+ * byte-identical), size the `sub rsp` region for SysV 16-byte call-boundary
+ * alignment, and shift every slot offset above the callee-saved push region AND
+ * the shadow region so `MFrameAddrX86` resolves to `lea dst, [rsp+off]`. A pure
+ * side-table pass — it never mutates the block stream, so the interp oracle stays
+ * valid on the pre-encode function. The x86 mirror of arm64's
+ * `compute_frame_layout`; frames beyond the imm32 `sub` field are caught at
+ * prologue emission (`B1-bigframe`, near-N/A), not here. 32 is 16-aligned, so the
+ * shadow reservation never perturbs the SysV alignment residue (§4.2).
  *
- * @param AbiDescriptor abi  the register file (callee-saved partition)
+ * @param AbiDescriptor abi  the register file (callee-saved partition + shadow space)
  * @param MFuncX86 f  the fully-physical function
  * @return FrameLayoutX86  the resolved frame side-table
  */
@@ -1022,8 +1103,9 @@ pub fn compute_frame_layout_x86(abi: AbiDescriptor, f: MFuncX86) -> FrameLayoutX
     let saved = collect_callee_saved_x86(abi, f)
     let slots = compute_slot_offsets(f.frame)
     let n_saved = (saved.gpr.len + saved.fpr.len) to u32
-    let size = frame_sub_size_x86(slots.slots_size, n_saved)
-    let slot_offsets = shift_slot_offsets_x86(slots.offsets, n_saved * (8 to u32))
+    let shadow = shadow_bytes_x86(abi, f)
+    let size = frame_sub_size_x86(slots.slots_size + shadow, n_saved)
+    let slot_offsets = shift_slot_offsets_x86(slots.offsets, (n_saved * (8 to u32)) + shadow)
     FrameLayoutX86 {
         size = size
         saved_gpr = saved.gpr
@@ -1143,21 +1225,41 @@ fn emit_saved_pushes_x86(buf: []byte, layout: FrameLayoutX86) -> []byte {
 }
 
 /**
- * emit_prologue_x86 — the SysV function entry sequence, or an empty list for a
- * frameless function: `push rbp` ; `mov rbp,rsp` ; `sub rsp,#N` (elided when
- * `N==0`) ; one `push` per callee-saved GPR (ascending). The frame size is
+ * honest_xmm_callee_saved_x86 — the named `B3-xmm-callee-saved` honest-stop for a
+ * frame that would push a callee-saved XMM. Win64 preserves XMM6-15 across a
+ * call, so an FP value live across a call lands in `saved_fpr` and needs a
+ * `movaps [rsp+off], xmm` spill/reload — UNIMPLEMENTED (`emit_saved_pushes_x86` is
+ * GPR-only). The integer corpus allocates no XMM (FP is the `B3-fp` stop), so
+ * `saved_fpr` is empty in practice; a non-empty `saved_fpr` stops here rather
+ * than mis-emitting (§2.2, rides `B3-fp`).
+ *
+ * @return error  the `B3-xmm-callee-saved` named honest-stop
+ */
+fn honest_xmm_callee_saved_x86() -> error {
+    error { message = "B3-xmm-callee-saved: callee-saved XMM6-15 save path (movaps) unimplemented (integer corpus allocates no XMM; rides B3-fp)" }
+}
+
+/**
+ * emit_prologue_x86 — the SysV/Win64 function entry sequence, or an empty list for
+ * a frameless function: `push rbp` ; `mov rbp,rsp` ; `sub rsp,#N` (elided when
+ * `N==0`, and under Win64 `#N` folds in the 32-byte shadow space when the function
+ * calls) ; one `push` per callee-saved GPR (ascending). The frame size is
  * pre-aligned so RSP is 16-aligned at every call boundary. A frame too large for
- * the imm32 `sub` field raises `B1-bigframe`. The x86 mirror of arm64's
- * `emit_prologue`.
+ * the imm32 `sub` field raises `B1-bigframe`; a callee-saved XMM (a non-empty
+ * `saved_fpr`, Win64-only) raises `B3-xmm-callee-saved` rather than mis-emitting.
+ * The x86 mirror of arm64's `emit_prologue`.
  *
  * @param FrameLayoutX86 layout  the resolved frame
- * @return []byte | error  the prologue bytes, or the `B1-bigframe` honest-stop
+ * @return []byte | error  the prologue bytes, or a named honest-stop
+ * @throws  `B1-bigframe` when the `sub rsp` amount overruns the imm32 field, or
+ *          `B3-xmm-callee-saved` when a callee-saved XMM must be spilled
  */
 pub fn emit_prologue_x86(layout: FrameLayoutX86) -> []byte | error {
     if !frame_is_framed_x86(layout) {
         let none: []byte = teko::list::empty()
         return none
     }
+    if layout.saved_fpr.len > (0 to u64) { return honest_xmm_callee_saved_x86() }
     let after_rbp = emit_mov_rbp_rsp_x86(emit_push_reg_x86(teko::list::empty(), 5 to u32))
     let after_sub = match emit_sub_rsp_x86(after_rbp, layout.size) { []byte as w => w; error as e => return e }
     emit_saved_pushes_x86(after_sub, layout)
