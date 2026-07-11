@@ -64,10 +64,18 @@ if command -v "$LLD_LINK" >/dev/null 2>&1; then
     # every one of these switches does (a bare leading `/`) — before lld-link ever
     # sees it, turning `/nologo` into a bogus filesystem path and making a
     # perfectly well-formed object look "rejected". MSYS_NO_PATHCONV (Git-Bash) and
-    # MSYS2_ARG_CONV_EXCL="*" (MSYS2) both disable that conversion for this one
-    # invocation; both are no-ops outside an MSYS shell (macOS/Linux), so exporting
-    # them unconditionally is safe everywhere.
-    link_out="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$LLD_LINK" /nologo "/out:$tmp_exe" /entry:main /subsystem:console /force:unresolved "$OBJ" 2>&1)"
+    # MSYS2_ARG_CONV_EXCL="*" (MSYS2) disable that conversion for this one invocation.
+    # BUT disabling conversion also stops the FILE-PATH args ($OBJ, /out:) from being
+    # translated — a POSIX `/tmp/…` path the native lld-link.exe cannot open. So convert
+    # the file paths to Windows form explicitly with `cygpath -w` (present only under
+    # MSYS/Cygwin; absent on macOS/Linux, where the paths pass through and the host
+    # lld-link accepts POSIX). Net: /switches reach lld-link intact AND the files open.
+    obj_arg="$OBJ"; out_arg="$tmp_exe"
+    if command -v cygpath >/dev/null 2>&1; then
+        obj_arg="$(cygpath -w "$OBJ")"
+        out_arg="$(cygpath -w "$tmp_exe")"
+    fi
+    link_out="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$LLD_LINK" /nologo "/out:$out_arg" /entry:main /subsystem:console /force:unresolved "$obj_arg" 2>&1)"
     link_rc=$?
     rm -f "$tmp_exe"
     if [[ "$link_rc" -ne 0 ]]; then
