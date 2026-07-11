@@ -629,6 +629,46 @@ fn native_backend_selected() -> bool {
 }
 
 /**
+ * NativeTarget — which own-AOT-backend target the temporary `TEKO_TARGET` env
+ * seam selects (D-D, #386 B1-8): the default `Arm64Macho` (the A4 reference —
+ * arm64 machine code in a Mach-O object) or `X8664Elf` (x86-64 SysV machine code
+ * in an ELF object). The seam mirrors `TEKO_BACKEND` and is read only when the own
+ * backend is already active; D1/#390 supersedes it with the real `--target`
+ * manifest flag.
+ */
+type NativeTarget = enum { Arm64Macho; X8664Elf }
+
+/**
+ * target_from_name — map a raw `TEKO_TARGET` value to a `NativeTarget`:
+ * `x86_64-elf` (the design-doc-canonical spelling) or `x86_64-linux` (the task
+ * spelling) select the x86-64 SysV/ELF pipeline; every other value — including
+ * `arm64-macos`, an empty string, or a typo — falls back to the default
+ * `Arm64Macho`, so an unrecognized target never silently mis-lowers.
+ *
+ * @param name  the raw `TEKO_TARGET` environment value
+ * @return      the selected own-backend target
+ */
+fn target_from_name(name: str) -> NativeTarget {
+    if name == "x86_64-elf" { return NativeTarget::X8664Elf }
+    if name == "x86_64-linux" { return NativeTarget::X8664Elf }
+    NativeTarget::Arm64Macho
+}
+
+/**
+ * native_target — which own-backend target the temporary `TEKO_TARGET` env seam
+ * selects (D-D, #386 B1-8), consulted by `emit_native` after `native_backend_selected`
+ * has already chosen the own backend. An unset/absent variable → the default
+ * `Arm64Macho`, so the default build stays byte-identical (FIXPOINT preserved) and
+ * the arm64 differential is untouched. D1/#390 supersedes this env read with the
+ * real `--target` manifest flag.
+ *
+ * @return the selected own-backend target
+ */
+fn native_target() -> NativeTarget {
+    match teko::env::var("TEKO_TARGET") { str as v => target_from_name(v); error => NativeTarget::Arm64Macho }
+}
+
+/**
  * strip_trailing_slash — `dir` without a single trailing `/`, so a joined
  * `<dir>/<stem>` never doubles the separator (`./bin/` → `./bin`). Returns `dir`
  * unchanged when it is empty or has no trailing slash.
@@ -642,13 +682,16 @@ fn strip_trailing_slash(dir: str) -> str {
 }
 
 /**
- * emit_native — the own-AOT-backend driver (the #385 A4-5 KEYSTONE): lower the
- * checked program to LIR, select arm64 `MInst`, allocate registers, encode to
- * arm64 machine bytes, wrap them in a Mach-O object, write the `.o` to disk, and
- * link it into a native executable against the C-built `teko_rt`/`assert` runtime
- * via `cc`-as-linker (`link_object`, the D-C bootstrap). Any pipeline pass's NAMED
- * honest-stop (`A4-fp`/`A4-bigimm`/`A4-args`/…) propagates out unchanged as a
- * `fail`, so an unsupported program stops identically to any other backend
+ * emit_native — the own-AOT-backend driver (the #385 A4-5 KEYSTONE, extended for
+ * x86-64 at #386 B1-8): lower the checked program to target-independent LIR, then
+ * dispatch on `native_target()` to the per-ISA tail — arm64 `MInst`/AAPCS64/Mach-O
+ * (the default, byte-unchanged A4 path) or x86-64 `MInstX86`/SysV/ELF (the B1 path,
+ * `TEKO_TARGET=x86_64-elf`). Each tail selects instructions, allocates registers,
+ * encodes machine bytes, wraps them in the target object format, writes the `.o`,
+ * and links it into a native executable against the C-built `teko_rt`/`assert`
+ * runtime via `cc`-as-linker (`link_object`, the D-C bootstrap). Any pipeline
+ * pass's NAMED honest-stop (`A4-fp`/`B1-fp`/`B1-args`/…) propagates out unchanged
+ * as a `fail`, so an unsupported program stops identically to any other backend
  * diagnostic (M.3 — never a fabricated artifact) and the C-vs-own differential
  * compares at the stop, not a fake value. Reached only through the
  * `TEKO_BACKEND=native` seam (`native_backend_selected`); the default C path is
@@ -665,10 +708,80 @@ fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
     let od = strip_trailing_slash(out_dir)
     match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
     let lmod = match teko::lir::lower_program(prog) { teko::lir::LModule as x => x; error as e => return fail(dir, e.message) }
+    match native_target() {
+        NativeTarget::X8664Elf => emit_native_x86(dir, od, stem, lmod, prog, m)
+        NativeTarget::Arm64Macho => emit_native_arm64(dir, od, stem, lmod, prog, m)
+    }
+}
+
+/**
+ * emit_native_arm64 — the arm64/Mach-O own-backend tail (the A4 reference, #385):
+ * select arm64 `MInst` from the lowered module, allocate registers under AAPCS64,
+ * encode to arm64 machine words, wrap them in a Mach-O object, and hand the bytes
+ * to `finish_native_object` (write `.o` + `cc`-link + `.tsym` + success marker).
+ * This is the DEFAULT own-backend path, byte-for-byte unchanged from A4-5 (the
+ * same pipeline calls in the same order), so the arm64 differential and the
+ * default output's FIXPOINT are preserved.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_arm64(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
     let sel = match teko::backend::select_module(lmod) { teko::backend::MModule as x => x; error as e => return fail(dir, e.message) }
     let col = match teko::backend::regalloc_module(teko::backend::aapcs64(), sel) { teko::backend::MModule as x => x; error as e => return fail(dir, e.message) }
     let enc = match teko::backend::encode_module(teko::backend::aapcs64(), col) { teko::backend::EncodedModule as x => x; error as e => return fail(dir, e.message) }
-    let obj = teko::backend::emit_macho(enc)
+    finish_native_object(dir, od, stem, teko::backend::emit_macho(enc), prog, m)
+}
+
+/**
+ * emit_native_x86 — the x86-64/ELF own-backend tail (#386 B1): select x86-64
+ * `MInstX86` from the lowered module, allocate registers under the SysV AMD64
+ * register file (`sysv64`), encode to variable-length x86 machine bytes, wrap them
+ * in an `ET_REL` ELF64 object (`emit_elf`), and hand the bytes to
+ * `finish_native_object` (write `.o` + `cc`-link + `.tsym` + success marker).
+ * Reached only via `TEKO_TARGET=x86_64-elf`; the emitted `.o` is a linux x86-64
+ * object, so the executing C-vs-own differential runs on a linux-x86_64 host
+ * (`scripts/diff_c_own.sh`), while a macOS host still writes the `.o` for the
+ * byte / well-formedness cross-check even though `cc` cannot link an ELF there.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_x86(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+    let sel = match teko::backend::select_module_x86(lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let col = match teko::backend::regalloc_module_x86(teko::backend::sysv64(), sel) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let enc = match teko::backend::encode_module_x86(teko::backend::sysv64(), col) { teko::backend::EncodedModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    finish_native_object(dir, od, stem, teko::backend::emit_elf(enc), prog, m)
+}
+
+/**
+ * finish_native_object — the object-format-agnostic tail shared by both own-backend
+ * targets: write the encoded object bytes to `<od>/<stem>.o`, link it into
+ * `<od>/<stem>` via `cc`-as-linker (`link_object`) against the C-built runtime,
+ * write the `.tsym` symbol map beside the binary (best-effort — a write error never
+ * fails the build), and print the EXCLUSIVE `"(own backend)"` success marker the
+ * differential harness keys on (F1(a)). Factoring it here keeps the arm64 and x86
+ * tails identical past the encoder, so the two link paths never drift.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param obj   the encoded object-file bytes (Mach-O or ELF)
+ * @param prog  the checked program (`.tsym` emission)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful write+link, else the failing status
+ */
+fn finish_native_object(dir: str, od: str, stem: str, obj: []byte, prog: checker::TProgram, m: Manifest) -> i32 {
     let objp = teko::str::concat(od, "/", teko::str::concat(stem, ".o"))
     let binp = teko::str::concat(od, "/", stem)
     match teko::io::write_file_bytes(objp, obj) { error as e => return fail(dir, e.message); null => { } }
