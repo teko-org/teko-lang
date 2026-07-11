@@ -1,0 +1,520 @@
+/**
+ * rvenc_pg — a physical GPR operand with the given RISC-V register id (a
+ * golden-vector fixture shorthand; B2-5 runs post-regalloc, so every operand is
+ * physical). Prefixed `rvenc_` to avoid the shared `teko::backend` namespace's
+ * arm64/x86 test-helper names (the x86 `ex_` precedent).
+ *
+ * @param u32 id  the RISC-V register number (x0..x31)
+ * @return MReg  the physical GPR operand
+ */
+fn rvenc_pg(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * rvenc_pf — a physical FPR operand with the given RISC-V register id (the `B2-fp`
+ * stop fixture: an FPR load/store/ALU operand).
+ *
+ * @param u32 id  the RISC-V float register number (f0..f31)
+ * @return MReg  the physical FPR operand
+ */
+fn rvenc_pf(id: u32) -> MReg {
+    preg(id, MRegClass::FPR)
+}
+
+/**
+ * rvenc_mem — a base-plus-displacement12 memory operand `off(base)`.
+ *
+ * @param u32 base_id  the base register id (x0..x31)
+ * @param i32 off  the signed 12-bit displacement
+ * @return MMem  the memory operand
+ */
+fn rvenc_mem(base_id: u32, off: i32) -> MMem {
+    MMem { base = rvenc_pg(base_id); offset = off }
+}
+
+/**
+ * rvenc_bad_word — the sentinel `EncWordRiscv` (`word = 0xFFFFFFFF`) an unexpected
+ * honest-stop falls back to, so a golden word assertion fails loudly rather than
+ * aborting the test.
+ *
+ * @return EncWordRiscv  the all-ones sentinel word
+ */
+fn rvenc_bad_word() -> EncWordRiscv {
+    EncWordRiscv {
+        word = 0xFFFFFFFF to u32
+        has_branch = false
+        branch_form = 0 to u32
+        target = 0 to u32
+        has_reloc = false
+        reloc_sym = "<error>"
+        reloc_kind = RelocKindRiscv::Call
+    }
+}
+
+/**
+ * rvenc_enc — encode `inst`, unwrapping the success case and falling back to the
+ * `rvenc_bad_word` sentinel on an unexpected honest-stop.
+ *
+ * @param MInstRiscv inst  the instruction to encode
+ * @return EncWordRiscv  the encoded word, or the sentinel on error
+ */
+fn rvenc_enc(inst: MInstRiscv) -> EncWordRiscv {
+    match encode_inst_word_riscv(inst) {
+        EncWordRiscv as x => x
+        error as e => rvenc_bad_word()
+    }
+}
+
+/**
+ * rvenc_stop — the honest-stop message `inst` produces, or `<ok>` when it encodes
+ * successfully.
+ *
+ * @param MInstRiscv inst  the instruction to encode
+ * @return str  the error message, or `<ok>` when it encodes
+ */
+fn rvenc_stop(inst: MInstRiscv) -> str {
+    match encode_inst_word_riscv(inst) {
+        EncWordRiscv as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rvenc_assert_word — assert that `inst` encodes to the exact 32-bit `expected`
+ * word (the position-independent golden-vector check, assembler-cross-checked).
+ *
+ * @param MInstRiscv inst  the instruction to encode
+ * @param u32 expected  the known-good RISC-V instruction word
+ * @return void
+ */
+fn rvenc_assert_word(inst: MInstRiscv, expected: u32) {
+    teko::assert::is_true(rvenc_enc(inst).word == expected)
+}
+
+/**
+ * rvenc_assert_stop — assert that `inst` honest-stops with a message containing the
+ * named token (`B2-fp`/`B2-bigimm`/`B2-aluform`/`B2-6`).
+ *
+ * @param MInstRiscv inst  the instruction to encode
+ * @param str name  the named-stop token expected in the message
+ * @return void
+ */
+fn rvenc_assert_stop(inst: MInstRiscv, name: str) {
+    teko::assert::str_contains(rvenc_stop(inst), name)
+}
+
+/**
+ * rvenc_btype_full — the FULL B-type word an assembled branch produces at byte
+ * displacement `disp`: the placeholder `base` OR the scrambled two's-complement
+ * displacement (`btype_scramble` over `twos_field`), the exact composition the
+ * B2-6 word-patch pass performs. Lets a golden assert the scramble against the
+ * assembler.
+ *
+ * @param u32 base  the placeholder B-type word (immediate zero)
+ * @param i64 disp  the byte displacement (target - here)
+ * @return u32  the full B-type word
+ */
+fn rvenc_btype_full(base: u32, disp: i64) -> u32 {
+    base | btype_scramble(twos_field(disp, 13 to u32))
+}
+
+/**
+ * rvenc_jtype_full — the FULL J-type word an assembled `jal` produces at byte
+ * displacement `disp`: the placeholder `base` OR the scrambled two's-complement
+ * displacement (`jtype_scramble` over `twos_field`).
+ *
+ * @param u32 base  the placeholder J-type word (immediate zero)
+ * @param i64 disp  the byte displacement (target - here)
+ * @return u32  the full J-type word
+ */
+fn rvenc_jtype_full(base: u32, disp: i64) -> u32 {
+    base | jtype_scramble(twos_field(disp, 21 to u32))
+}
+
+/**
+ * rvenc_alu_r — a register-register ALU instruction fixture (`dst=a0, a=a1, b=a2`).
+ *
+ * @param MAluOpRiscv op  the ALU op
+ * @param bool wide  the width flag
+ * @return MInstRiscv  the built instruction
+ */
+fn rvenc_alu_r(op: MAluOpRiscv, wide: bool) -> MInstRiscv {
+    alu_r_riscv(op, wide, rvenc_pg(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32))
+}
+
+#test
+/**
+ * rvenc_encodes_r_type_base — the 64-bit `OP` (0x33) register-register ALU words
+ * for `add`/`sub`/`sll`/`xor`/`srl`/`sra`/`or`/`and` (a0, a1, a2), each
+ * assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_r_type_base() {
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Add, true), 0x00C58533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sub, true), 0x40C58533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sll, true), 0x00C59533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Xor, true), 0x00C5C533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Srl, true), 0x00C5D533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sra, true), 0x40C5D533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Or, true), 0x00C5E533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::And, true), 0x00C5F533 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_m_extension — the M-extension `mul`/`div`/`divu`/`rem`/`remu` words
+ * (funct7 = 0x01), each a SINGLE native instruction (the RISC-V div/rem
+ * simplification), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_m_extension() {
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Mul, true), 0x02C58533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Div, true), 0x02C5C533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Divu, true), 0x02C5D533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Rem, true), 0x02C5E533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Remu, true), 0x02C5F533 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_op32_w_forms — the RV64 `OP-32` (0x3B) 32-bit `*w` words
+ * (`addw`/`subw`/`sllw`/`srlw`/`sraw`/`mulw`/`divw`/`divuw`/`remw`/`remuw`),
+ * selected by `wide=false`, assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_op32_w_forms() {
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Add, false), 0x00C5853B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sub, false), 0x40C5853B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sll, false), 0x00C5953B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Srl, false), 0x00C5D53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sra, false), 0x40C5D53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Mul, false), 0x02C5853B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Div, false), 0x02C5C53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Divu, false), 0x02C5D53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Rem, false), 0x02C5E53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Remu, false), 0x02C5F53B to u32)
+}
+
+#test
+/**
+ * rvenc_bitwise_ops_ignore_wide — `and`/`or`/`xor` have NO `OP-32` `*w` form, so a
+ * `wide=false` selection lowers to the SAME base (0x33) word as `wide=true` (the
+ * base op already yields the correct 32-bit result). Guards the encoder against
+ * emitting a nonexistent `andw`/`orw`/`xorw` for isel's 32-bit bitwise output.
+ *
+ * @return void
+ */
+fn rvenc_bitwise_ops_ignore_wide() {
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::And, false), 0x00C5F533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Or, false), 0x00C5E533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Xor, false), 0x00C5C533 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_slt — the set-less-than `slt`(funct3=2)/`sltu`(funct3=3) words
+ * (a0, a1, a2), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_slt() {
+    rvenc_assert_word(slt_riscv(rvenc_pg(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32), false), 0x00C5A533 to u32)
+    rvenc_assert_word(slt_riscv(rvenc_pg(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32), true), 0x00C5B533 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_i_type_alu — the `li` (`addi rd, x0, imm`), `addi`/`xori`/`sltiu`
+ * register-immediate words, including a NEGATIVE immediate (`addi a0,a1,-100`
+ * and `xori a0,a1,-1`, exercising the masked two's-complement field with no
+ * panicking cast), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_i_type_alu() {
+    rvenc_assert_word(li_riscv(rvenc_pg(10 to u32), 42 to i32), 0x02A00513 to u32)
+    rvenc_assert_word(alu_i_riscv(MAluOpRiscv::Addi, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 100 to i32), 0x06458513 to u32)
+    rvenc_assert_word(alu_i_riscv(MAluOpRiscv::Addi, rvenc_pg(10 to u32), rvenc_pg(11 to u32), (0 to i32) - (100 to i32)), 0xF9C58513 to u32)
+    rvenc_assert_word(alu_i_riscv(MAluOpRiscv::Xori, rvenc_pg(10 to u32), rvenc_pg(11 to u32), (0 to i32) - (1 to i32)), 0xFFF5C513 to u32)
+    rvenc_assert_word(alu_i_riscv(MAluOpRiscv::Sltiu, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 1 to i32), 0x0015B513 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_loads — every load width/sign form (`ld`/`lw`/`lwu`/`lh`/`lhu`/`lb`/
+ * `lbu`) plus a NEGATIVE offset (`ld a0,-8(sp)`), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_loads() {
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::D, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 8 to i32)), 0x00813503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::W, true, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 4 to i32)), 0x00412503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::W, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 4 to i32)), 0x00416503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::H, true, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 2 to i32)), 0x00211503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::H, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 2 to i32)), 0x00215503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::B, true, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 1 to i32)), 0x00110503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::B, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 1 to i32)), 0x00114503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::D, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, (0 to i32) - (8 to i32))), 0xFF813503 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_stores — every store width (`sd`/`sw`/`sh`/`sb`) plus a NEGATIVE
+ * offset (`sd a1,-8(sp)`), exercising the S-type SPLIT immediate (imm[11:5] /
+ * imm[4:0]), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_stores() {
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::D, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 8 to i32)), 0x00B13423 to u32)
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::W, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 4 to i32)), 0x00B12223 to u32)
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::H, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 2 to i32)), 0x00B11123 to u32)
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::B, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 1 to i32)), 0x00B100A3 to u32)
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::D, rvenc_pg(11 to u32), rvenc_mem(2 to u32, (0 to i32) - (8 to i32))), 0xFEB13C23 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_u_type — `lui`/`auipc` U-type words (immediate placed directly, no
+ * scramble), including `auipc ra, 0` (the reloc-free base of the B2-6 call
+ * macro), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_u_type() {
+    rvenc_assert_word(lui_riscv(rvenc_pg(10 to u32), 0x12345 to u32), 0x12345537 to u32)
+    rvenc_assert_word(auipc_riscv(rvenc_pg(10 to u32), 0x12345 to u32), 0x12345517 to u32)
+    rvenc_assert_word(auipc_riscv(rvenc_pg(1 to u32), 0 to u32), 0x00000097 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_control_words — the single-word control forms: `jalr a0, 0(a1)`,
+ * the `MCallIndRiscv` `jalr ra, 0(a1)`, and `ret` (`jalr x0, 0(ra)` =
+ * 0x00008067), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_control_words() {
+    rvenc_assert_word(jalr_riscv(rvenc_pg(10 to u32), rvenc_pg(11 to u32), 0 to i32), 0x00058567 to u32)
+    rvenc_assert_word(call_ind_riscv(rvenc_pg(11 to u32), teko::list::empty(), rvenc_pg(10 to u32), false), 0x000580E7 to u32)
+    rvenc_assert_word(ret_riscv(), 0x00008067 to u32)
+}
+
+#test
+/**
+ * rvenc_branch_placeholder_flags — a fused compare-branch encodes to its base word
+ * (scrambled displacement ZERO) flagged `has_branch`, `branch_form=0`, and the
+ * target block id; the immediate field is patched later by B2-6.
+ *
+ * @return void
+ */
+fn rvenc_branch_placeholder_flags() {
+    let w = rvenc_enc(branch_riscv(MCond::EQ, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 7 to u32))
+    teko::assert::is_true(w.word == (0x00B50063 to u32))
+    teko::assert::is_true(w.has_branch)
+    teko::assert::is_true(w.branch_form == (0 to u32))
+    teko::assert::is_true(w.target == (7 to u32))
+    teko::assert::is_false(w.has_reloc)
+}
+
+/**
+ * rvenc_branch_word — the placeholder base word `branch_riscv(cond, a0, a1, 5)`
+ * encodes to (the scrambled displacement is zero, so `word` IS the base). Lets a
+ * golden pin every condition's funct3 + operand-swap through the encoder.
+ *
+ * @param MCond cond  the branch condition
+ * @return u32  the placeholder B-type word
+ */
+fn rvenc_branch_word(cond: MCond) -> u32 {
+    rvenc_enc(branch_riscv(cond, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 5 to u32)).word
+}
+
+#test
+/**
+ * rvenc_encodes_every_branch_condition — the placeholder B-type base word for
+ * ALL ten `MCond` conditions through the encoder: the six direct forms
+ * (`beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu`) and the four order-only forms
+ * (`GT`/`LE`/`HI`/`LS`) which reuse `blt`/`bge`/`bltu`/`bgeu` with the operands
+ * SWAPPED (rs1/rs2 exchanged), each cross-checked against a self-branch
+ * (disp = 0) assembled word.
+ *
+ * @return void
+ */
+fn rvenc_encodes_every_branch_condition() {
+    teko::assert::is_true(rvenc_branch_word(MCond::EQ) == (0x00B50063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::NE) == (0x00B51063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::LT) == (0x00B54063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::GE) == (0x00B55063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::LO) == (0x00B56063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::HS) == (0x00B57063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::GT) == (0x00A5C063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::LE) == (0x00A5D063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::HI) == (0x00A5E063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::LS) == (0x00A5F063 to u32))
+}
+
+#test
+/**
+ * rvenc_jal_placeholder_flags — an unconditional `jal x0, block` encodes to its
+ * base word (0x6F, scrambled displacement ZERO) flagged `has_branch`,
+ * `branch_form=1`, and the target block id.
+ *
+ * @return void
+ */
+fn rvenc_jal_placeholder_flags() {
+    let w = rvenc_enc(jal_riscv(9 to u32))
+    teko::assert::is_true(w.word == (0x0000006F to u32))
+    teko::assert::is_true(w.has_branch)
+    teko::assert::is_true(w.branch_form == (1 to u32))
+    teko::assert::is_true(w.target == (9 to u32))
+}
+
+#test
+/**
+ * rvenc_btype_scramble_all_conditions — the B-type displacement scramble for ALL
+ * six branch conditions at a forward offset, each cross-checked against the
+ * exact `clang`/`objdump` full word (base placeholder OR the scrambled
+ * displacement).
+ *
+ * @return void
+ */
+fn rvenc_btype_scramble_all_conditions() {
+    teko::assert::is_true(rvenc_btype_full(0x00B50063 to u32, 32 to i64) == (0x02B50063 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B51063 to u32, 28 to i64) == (0x00B51E63 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B54063 to u32, 24 to i64) == (0x00B54C63 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B55063 to u32, 20 to i64) == (0x00B55A63 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B56063 to u32, 16 to i64) == (0x00B56863 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B57063 to u32, 12 to i64) == (0x00B57663 to u32))
+}
+
+#test
+/**
+ * rvenc_btype_scramble_negative_and_boundary — the B-type scramble for a NEGATIVE
+ * (backward) displacement — exercising the `twos_field` two's-complement path
+ * with NO panicking negative cast — and the near-±4 KiB boundary offsets, each
+ * cross-checked against the assembler.
+ *
+ * @return void
+ */
+fn rvenc_btype_scramble_negative_and_boundary() {
+    teko::assert::is_true(rvenc_btype_full(0x00D60063 to u32, (0 to i64) - (32 to i64)) == (0xFED600E3 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B50063 to u32, 4064 to i64) == (0x7EB500E3 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B55063 to u32, (0 to i64) - (4064 to i64)) == (0x82B55063 to u32))
+}
+
+#test
+/**
+ * rvenc_jtype_scramble_goldens — the J-type displacement scramble for a forward
+ * offset (rd = x0), a large backward offset with rd = ra (exercising both the
+ * negative two's-complement path AND a non-zero `rd` base), and another large
+ * backward offset (rd = x0), each cross-checked against `clang`/`objdump`.
+ *
+ * @return void
+ */
+fn rvenc_jtype_scramble_goldens() {
+    teko::assert::is_true(rvenc_jtype_full(0x0000006F to u32, 24 to i64) == (0x0180006F to u32))
+    teko::assert::is_true(rvenc_jtype_full(0x000000EF to u32, (0 to i64) - (6132 to i64)) == (0x80DFE0EF to u32))
+    teko::assert::is_true(rvenc_jtype_full(0x0000006F to u32, (0 to i64) - (6152 to i64)) == (0xFF8FE06F to u32))
+}
+
+#test
+/**
+ * rvenc_reloc_word_primitive — `reloc_word_riscv` builds the reloc-flagged
+ * placeholder word the B2-6 emit pass composes into the call/address pairs: the
+ * base word preserved, `has_reloc` set, the `Call` kind and symbol carried.
+ * Exercises the `auipc ra, 0` (0x00000097) placeholder the call macro relocates.
+ *
+ * @return void
+ */
+fn rvenc_reloc_word_primitive() {
+    let w = reloc_word_riscv(0x00000097 to u32, "tk_exit", RelocKindRiscv::Call)
+    teko::assert::is_true(w.word == (0x00000097 to u32))
+    teko::assert::is_true(w.has_reloc)
+    teko::assert::is_false(w.has_branch)
+    teko::assert::str_contains(w.reloc_sym, "tk_exit")
+    let is_call = match w.reloc_kind { Call => true; _ => false }
+    teko::assert::is_true(is_call)
+}
+
+#test
+/**
+ * rvenc_reloc_type_numeric_map — `riscv_reloc_type` maps each `RelocKindRiscv` to
+ * its numeric `R_RISCV_*` type: Call=19, PcRelHi20=23, PcRelLo12=24, Branch=16,
+ * Jal=17, Abs64=2 (the values the reused ELF writer emits into `r_info`).
+ *
+ * @return void
+ */
+fn rvenc_reloc_type_numeric_map() {
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::Call) == (19 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::PcRelHi20) == (23 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::PcRelLo12) == (24 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::Branch) == (16 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::Jal) == (17 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::Abs64) == (2 to u32))
+}
+
+#test
+/**
+ * rvenc_fp_honest_stop — an FPR-class load, store, or ALU operand raises the
+ * `B2-fp` named honest-stop (the F/D family is deferred to 0.3.1).
+ *
+ * @return void
+ */
+fn rvenc_fp_honest_stop() {
+    rvenc_assert_stop(load_riscv(MMemSizeRiscv::D, false, rvenc_pf(10 to u32), rvenc_mem(2 to u32, 0 to i32)), "B2-fp")
+    rvenc_assert_stop(store_riscv(MMemSizeRiscv::D, rvenc_pf(11 to u32), rvenc_mem(2 to u32, 0 to i32)), "B2-fp")
+    rvenc_assert_stop(alu_r_riscv(MAluOpRiscv::Add, true, rvenc_pf(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32)), "B2-fp")
+}
+
+#test
+/**
+ * rvenc_bigimm_honest_stop — an immediate outside the signed imm12 window
+ * (`[-2048, 2047]`) raises `B2-bigimm` from the `li`, `addi`, load, store, and
+ * `jalr` immediate paths; the window boundaries (2047 / -2048) encode fine.
+ *
+ * @return void
+ */
+fn rvenc_bigimm_honest_stop() {
+    rvenc_assert_stop(li_riscv(rvenc_pg(10 to u32), 2048 to i32), "B2-bigimm")
+    rvenc_assert_stop(li_riscv(rvenc_pg(10 to u32), (0 to i32) - (2049 to i32)), "B2-bigimm")
+    rvenc_assert_stop(alu_i_riscv(MAluOpRiscv::Addi, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 4096 to i32), "B2-bigimm")
+    rvenc_assert_stop(load_riscv(MMemSizeRiscv::D, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 2048 to i32)), "B2-bigimm")
+    rvenc_assert_stop(store_riscv(MMemSizeRiscv::D, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 3000 to i32)), "B2-bigimm")
+    rvenc_assert_stop(jalr_riscv(rvenc_pg(10 to u32), rvenc_pg(11 to u32), 5000 to i32), "B2-bigimm")
+    teko::assert::is_true(rvenc_stop(li_riscv(rvenc_pg(10 to u32), 2047 to i32)) == "<ok>")
+    teko::assert::is_true(rvenc_stop(li_riscv(rvenc_pg(10 to u32), (0 to i32) - (2048 to i32))) == "<ok>")
+}
+
+#test
+/**
+ * rvenc_aluform_internal_invariant — the crossed register/immediate ALU forms an
+ * `MAluOpRiscv` can name but isel never selects (an immediate-only op in a
+ * register-register `MAluRRiscv`, a register-register op in a register-immediate
+ * `MAluIRiscv`) raise the `B2-aluform` internal-invariant guard.
+ *
+ * @return void
+ */
+fn rvenc_aluform_internal_invariant() {
+    rvenc_assert_stop(alu_r_riscv(MAluOpRiscv::Addi, true, rvenc_pg(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32)), "B2-aluform")
+    rvenc_assert_stop(alu_i_riscv(MAluOpRiscv::Add, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 0 to i32), "B2-aluform")
+}
+
+#test
+/**
+ * rvenc_b2_6_deferred_cases — the multi-word/frame cases the B2-6 emit pass
+ * assembles (`MCallRiscv` auipc+jalr pair, `MLlaRiscv` auipc+addi pair + label,
+ * `MFrameAddrRiscv` frame-slot address) return their `B2-6` slice-boundary stops
+ * from this single-word core.
+ *
+ * @return void
+ */
+fn rvenc_b2_6_deferred_cases() {
+    rvenc_assert_stop(call_riscv("tk_exit", teko::list::empty(), rvenc_pg(10 to u32), false, false), "B2-6")
+    rvenc_assert_stop(lla_riscv(rvenc_pg(10 to u32), "some_data"), "B2-6")
+    rvenc_assert_stop(frame_addr_riscv(rvenc_pg(10 to u32), 0 to u32), "B2-6")
+}
