@@ -18,9 +18,10 @@
 # both return the tail value), so the exit(n) scope is a corpus convention, not a
 # semantic divergence.
 #
-# For each own-native build the harness also runs scripts/check_macho.sh on the REAL
-# emitted `.o` (which A4-4 could only pin via golden bytes — now there is an object
-# on disk), so the host toolchain (otool/nm/ld -r) cross-checks the writer's bytes.
+# For each own-native build the harness also runs a host-tool well-formedness check
+# on the REAL emitted `.o`: scripts/check_macho.sh (otool/nm/ld -r) on the macOS-arm64
+# Mach-O lane, scripts/check_elf.sh (readelf/objdump/nm/ld -r) on the linux-x86_64 ELF
+# lane — the writer's bytes cross-checked by the same host toolchain that consumes them.
 #
 # ── harness-blind-spot guards (review finding F1) ───────────────────────────────────
 # A silently-misconfigured `TEKO` (e.g. the C bootstrap, or any binary predating
@@ -35,9 +36,13 @@
 #       honest-skip is for STANDALONE invocation with no object at all, not for this
 #       harness where the own-native build already reported success + the marker).
 #
-# GATED on macOS-arm64 (needs the host Mach-O `ld` reachable through `cc`); on any
-# other host the harness HONEST-SKIPS with a named reason (exit 0). The own arm64
-# encoder emits Mach-O only — ELF/PE are Phases B/C.
+# TWO EXECUTING LANES, host-selected (issue #386 B1-8):
+#   macOS-arm64  → own emits arm64 Mach-O; TEKO_BACKEND=native; check_macho.sh.
+#   linux-x86_64 → own emits x86-64 ELF;   TEKO_BACKEND=native TEKO_TARGET=x86_64-linux;
+#                  check_elf.sh. This lane RUNS the ELF (the linux runner executes it),
+#                  the executing C-vs-own differential the macOS lane cannot host.
+# On any OTHER host the harness HONEST-SKIPS with a named reason (exit 0). PE/riscv/wasm
+# are later clusters (B2/B3/C1).
 #
 # usage: scripts/diff_c_own.sh [fixture-dir ...]
 #   TEKO=<self-hosted-teko>   (default: ./bin/teko — MUST carry emit_native; the C
@@ -48,15 +53,27 @@
 
 set -u
 
-if [[ "$(uname)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
-    echo "diff_c_own: skipped — the own backend emits arm64 Mach-O; needs a macOS-arm64 host (cc/ld) on $(uname)-$(uname -m)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+host_os="$(uname -s)"
+host_arch="$(uname -m)"
+if [[ "$host_os" == "Darwin" && "$host_arch" == "arm64" ]]; then
+    FLAVOR="macOS-arm64 Mach-O"
+    OWN_TARGET_ENV=""
+    OBJ_CHECK="$script_dir/scripts/check_macho.sh"
+    OBJ_CHECK_NAME="check_macho"
+elif [[ "$host_os" == "Linux" && "$host_arch" == "x86_64" ]]; then
+    FLAVOR="linux-x86_64 ELF"
+    OWN_TARGET_ENV="TEKO_TARGET=x86_64-linux"
+    OBJ_CHECK="$script_dir/scripts/check_elf.sh"
+    OBJ_CHECK_NAME="check_elf"
+else
+    echo "diff_c_own: skipped — the own backend runs its executing differential on macOS-arm64 (Mach-O) or linux-x86_64 (ELF); host is $host_os-$host_arch"
     exit 0
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEKO="${TEKO:-./bin/teko}"
 BUILDER="${BUILDER:-./build/teko}"
-CHECK_MACHO="$script_dir/scripts/check_macho.sh"
 OWN_BACKEND_MARKER="(own backend)"
 
 resolve_abs() {
@@ -118,18 +135,21 @@ CORPUS=(
 #   (`src/lir/lower.tks`), unlike the C backend's codegen.tks (which special-cases the
 #   bare-name `println` call to the runtime symbol `tk_println`, `codegen.tks:2290`).
 #   The own pipeline therefore lowers the call as an ordinary cross-module call and
-#   mangles the WRONG external symbol (`_println` instead of `_tk_println`) — every own
-#   pass (isel/regalloc/encode/emit_macho) succeeds and writes a well-formed `.o`
-#   (`check_macho.sh` passes it), but the SYSTEM LINKER then rejects the executable link
-#   with "Undefined symbols ... _println" — a linker-surfaced gap, not a compiler
-#   `fail()` diagnostic. This is a REPORTED adjacent finding (LIR's builtin-call surface
-#   is narrower than codegen's): closes when LIR gains a builtin table mirroring
+#   mangles the WRONG external symbol (`println` instead of `tk_println`) — every own
+#   pass (isel/regalloc/encode/emit_{macho,elf}) succeeds and writes a well-formed `.o`
+#   (the `check_*` script passes it), but the SYSTEM LINKER then rejects the executable
+#   link with an undefined-symbol error (Mach-O "Undefined symbols ... _println" /
+#   ELF "undefined reference to `println'") — a linker-surfaced gap, not a compiler
+#   `fail()` diagnostic. The KNOWN_STOP_ERR substring is the bare `println` so it matches
+#   BOTH linkers (Mach-O's `_`-prefixed form contains it; ELF carries no `_` prefix,
+#   objfile_elf.tks:44). A REPORTED adjacent finding (LIR's builtin-call surface is
+#   narrower than codegen's): closes when LIR gains a builtin table mirroring
 #   codegen.tks's io/str/mem builtin dispatch.
 declare -a KNOWN_STOP=(
     own_print_exit
 )
 declare -a KNOWN_STOP_ERR=(
-    "_println"
+    "println"
 )
 
 known_stop_index_of() {
@@ -153,7 +173,7 @@ trap 'rm -rf "$work"' EXIT
 pass=0 fail=0 kstop=0
 failed_names=() xstop_names=()
 
-echo "diff_c_own: teko=$teko_abs — ${#fixtures[@]} fixture(s) (macOS-arm64 C-vs-own differential)"
+echo "diff_c_own: teko=$teko_abs — ${#fixtures[@]} fixture(s) ($FLAVOR C-vs-own differential)"
 echo
 
 # check_known_stop — the KNOWN-STOP verdict for `name`: KSTOP when the own build FAILED
@@ -188,7 +208,7 @@ for proj in "${fixtures[@]}"; do
     "$cout/$name" >"$work/$name.cout" 2>&1
     c_exit=$?
 
-    TEKO_BACKEND=native "$teko_abs" build "$proj" -o "$oout" >"$work/$name.obuild" 2>&1
+    env TEKO_BACKEND=native $OWN_TARGET_ENV "$teko_abs" build "$proj" -o "$oout" >"$work/$name.obuild" 2>&1
     own_build_rc=$?
 
     if known_stop_index_of "$name" >/dev/null; then
@@ -234,10 +254,10 @@ for proj in "${fixtures[@]}"; do
         continue
     fi
 
-    if ! "$CHECK_MACHO" "$objp" >"$work/$name.macho" 2>&1; then
+    if ! "$OBJ_CHECK" "$objp" >"$work/$name.objcheck" 2>&1; then
         fail=$((fail + 1)); failed_names+=("$name")
-        printf 'FAIL  %-16s check_macho rejected the emitted %s.o\n' "$name" "$name"
-        tail -5 "$work/$name.macho" | sed 's/^/      | /'
+        printf 'FAIL  %-16s %s rejected the emitted %s.o\n' "$name" "$OBJ_CHECK_NAME" "$name"
+        tail -5 "$work/$name.objcheck" | sed 's/^/      | /'
         continue
     fi
 
