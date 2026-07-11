@@ -624,7 +624,7 @@ pub fn emit_elf(enc: EncodedModuleX86) -> []byte { … }
 ```teko
 /**
  * native_target — which own-backend target the temporary `TEKO_TARGET` seam
- * selects: `x86_64-elf` when the env var is exactly that, else the default
+ * selects: `x86_64-linux` when the env var is exactly that (OS-based per ruling #390; `x86_64-elf` accepted as deprecated alias), else the default
  * `arm64-macho` (the A4 reference). OFF/absent → the arm64 path, so the default
  * build stays byte-identical (FIXPOINT) and the arm64 differential is untouched.
  * D1/#390 supersedes this with the real `--target` manifest flag.
@@ -632,7 +632,7 @@ pub fn emit_elf(enc: EncodedModuleX86) -> []byte { … }
  * @return NativeTarget  the selected own-backend target
  */
 fn native_target() -> NativeTarget {
-    match teko::env::var("TEKO_TARGET") { str as v => if v == "x86_64-elf" { NativeTarget::X8664Elf } else { NativeTarget::Arm64Macho }; error => NativeTarget::Arm64Macho }
+    match teko::env::var("TEKO_TARGET") { str as v => if v == "x86_64-linux" { NativeTarget::X8664Elf } else { NativeTarget::Arm64Macho }; error => NativeTarget::Arm64Macho }
 }
 ```
 
@@ -643,7 +643,7 @@ the arm64 default output is byte-for-byte unchanged → fixpoint holds); the `X8
 linux-x86_64 host `cc` links the ELF against `teko_rt.c`/`assert.c`). The exclusive success marker
 stays `"(own backend)"` (the harness's F1(a) guard, `diff_c_own.sh:60`).
 
-> **Cross-host honesty.** On the macOS-arm64 dev host, selecting `x86_64-elf` PRODUCES a valid ELF
+> **Cross-host honesty.** On the macOS-arm64 dev host, selecting `x86_64-linux` PRODUCES a valid ELF
 > `.o` but `cc` cannot LINK an x86 ELF there — so `link_object` fails. The harness (§8.2) therefore
 > only EXECUTES the x86 lane on linux-x86_64; on macOS it byte-tests the `.o` (llvm-readobj is
 > cross-format) and honest-skips the link/run. `emit_native`'s x86 arm still writes the `.o` before
@@ -653,7 +653,7 @@ stays `"(own backend)"` (the harness's F1(a) guard, `diff_c_own.sh:60`).
 
 Extend `scripts/diff_c_own.sh` (today macOS-arm64-only, `:51`) with a **linux-x86_64 lane**: when
 `uname -s -m` is `Linux x86_64`, build each corpus fixture twice (`TEKO_BACKEND=native` for the C
-side unset, and `TEKO_BACKEND=native TEKO_TARGET=x86_64-elf` for the own side), assert
+side unset, and `TEKO_BACKEND=native TEKO_TARGET=x86_64-linux` for the own side), assert
 `C-native exit == own-native exit` + identical stdout, and run an ELF well-formedness check
 (`scripts/check_elf.sh` — new, mirroring `check_macho.sh`: `readelf -h/-S/-s/-r` + `objdump -d`
 sanity + `ld -r` accept). The same F1 guards apply: the own build MUST print `"(own backend)"`, and
