@@ -940,21 +940,56 @@ fn finish_native_object(dir: str, od: str, stem: str, obj: []byte, prog: checker
 // Front-end (manifest → discover → assemble → check), then the native backend over the
 // merged program. The output binary stem is the manifest `name`.
 // =========================================================================
-// dirname_of — the parent directory of `path` (everything before the last '/'), or "." when
-// `path` has no separator. A minimal local helper (no teko::fs::dirname exists yet).
+/**
+ * The parent directory of `path` — everything before the rightmost path separator — or "."
+ * when `path` carries no separator. A minimal local helper (no teko::fs::dirname exists yet).
+ * A reverse byte scan finds the rightmost of a POSIX '/' and a Windows '\', so a POSIX path
+ * with no '\' splits at exactly its last '/' — byte-identical to a plain last-'/' split. The
+ * scan is used instead of teko::str::last_index_of because that builtin is native-only (the VM
+ * does not implement it), and dirname_of is exercised by both engines.
+ *
+ * @param path  an argv[0]-style invocation path, POSIX- or Windows-separated
+ * @return      the directory portion of `path`, or "." when it carries no separator
+ */
 fn dirname_of(path: str) -> str {
-    match teko::str::last_index_of(path, "/") {
-        u64 as i => teko::str::slice_to(path, i)
-        error => "."
+    mut i = path.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        let b = path[i]
+        if b == b'/' || b == b'\\' { return teko::str::slice_to(path, i) }
     }
+    "."
 }
 
-// abs_path_of — make `path` absolute against `cwd` when it isn't already (POSIX/Windows both
-// accept forward slashes here; `path` is either an argv[0]-style invocation path or already
-// absolute). Returns "" when neither is usable.
+/**
+ * Whether `b` is an ASCII letter (A-Z or a-z) — the drive-letter test for a Windows absolute
+ * path such as `C:\...`. Named with an `_ascii_` segment to stay distinct from the `is_alpha`
+ * char builtin, which classifies a full Unicode `char` rather than a raw path byte.
+ *
+ * @param b  the byte to classify
+ * @return   true when `b` is an ASCII letter
+ */
+fn is_ascii_alpha(b: byte) -> bool {
+    (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z')
+}
+
+/**
+ * Make `path` absolute against `cwd` when it isn't already, recognising POSIX and Windows
+ * absolute shapes without disturbing the POSIX arm: a leading '/' (POSIX, checked FIRST and
+ * unchanged), a `<letter>:` drive prefix (`C:\...` or `C:/...`), or a `\\` UNC prefix — each is
+ * already absolute and returned as-is. Anything else is joined onto `cwd` with a '/'. Returns
+ * "" when `path` is empty, or when a relative `path` has no `cwd` to anchor it.
+ *
+ * @param path  an argv[0]-style invocation path or an already-absolute path
+ * @param cwd   the directory a relative `path` is resolved against
+ * @return      the absolute form of `path`, or "" when neither input is usable
+ */
 fn abs_path_of(path: str, cwd: str) -> str {
     if path.len == 0 { return "" }
-    if path[0] == b'/' { return path }   // already absolute
+    if path[0] == b'/' { return path }
+    if path.len >= 2 && is_ascii_alpha(path[0]) && path[1] == b':' { return path }
+    if path.len >= 2 && path[0] == b'\\' && path[1] == b'\\' { return path }
     if cwd.len == 0 { return "" }
     teko::str::concat(cwd, "/", path)
 }
