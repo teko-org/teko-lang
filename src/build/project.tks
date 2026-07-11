@@ -409,11 +409,12 @@ fn teko_cc_env() -> str {
  * non-host `NativeTarget` when neither the manifest `cc` nor the `TEKO_CC` seam
  * pins one (#387 B2-8, D-D): `riscv64-linux-gnu-gcc` for `Riscv64Linux` (it
  * compiles the C `teko_rt`/`assert` runtime FOR riscv and links it with the own
- * riscv `.o` into a qemu-runnable executable). The `Arm64Macho` and `X8664Linux`
- * arms return the host `"cc"` — the default build's link line is byte-unchanged,
- * because an unset `TEKO_TARGET` resolves to `Arm64Macho` → `"cc"` exactly as the
- * pre-B2 `else` branch did. D1/#390's real `--target` supersedes this env-derived
- * default.
+ * riscv `.o` into a qemu-runnable executable) and `x86_64-w64-mingw32-gcc` for
+ * `X8664Windows` (the MinGW cross-cc that links the own PE/COFF `.o` into a
+ * Windows executable). The `Arm64Macho` and `X8664Linux` arms return the host
+ * `"cc"` — the default build's link line is byte-unchanged, because an unset
+ * `TEKO_TARGET` resolves to `Arm64Macho` → `"cc"` exactly as the pre-B2 `else`
+ * branch did. D1/#390's real `--target` supersedes this env-derived default.
  *
  * @param t  the resolved own-backend target
  * @return   the compiler command for `t`
@@ -421,6 +422,7 @@ fn teko_cc_env() -> str {
 fn default_cc_for_target(t: NativeTarget) -> str {
     match t {
         NativeTarget::Riscv64Linux => "riscv64-linux-gnu-gcc"
+        NativeTarget::X8664Windows => "x86_64-w64-mingw32-gcc"
         NativeTarget::X8664Linux => "cc"
         NativeTarget::Arm64Macho => "cc"
     }
@@ -686,26 +688,28 @@ fn native_backend_selected() -> bool {
 
 /**
  * NativeTarget — which own-AOT-backend target the temporary `TEKO_TARGET` env
- * seam selects (D-D, #386 B1-8; #387 B2-8): the default `Arm64Macho` (the A4
- * reference — arm64 machine code in a Mach-O object), `X8664Linux` (x86-64 SysV
- * machine code in an ELF object), or `Riscv64Linux` (RISC-V RV64GC/LP64D machine
- * code in an ELF object). Targets are named by OS, not by object format (ruling
- * #390): the format (ELF/Mach-O) is a consequence of the OS, so `x86_64-linux`
- * and `riscv64-linux` — not `x86_64-elf`/`riscv64-elf` (ELF spans many kernels
- * the binary does not port between) — are canonical. The seam mirrors
+ * seam selects (D-D, #386 B1-8; #387 B2-8; #388 B3): the default `Arm64Macho`
+ * (the A4 reference — arm64 machine code in a Mach-O object), `X8664Linux`
+ * (x86-64 SysV machine code in an ELF object), `Riscv64Linux` (RISC-V
+ * RV64GC/LP64D machine code in an ELF object), or `X8664Windows` (x86-64 Win64
+ * machine code — the SAME x86 ISA as `X8664Linux`, differing only in the ABI
+ * register file and PE/COFF object format). Targets are named by OS, not by
+ * object format (ruling #390): the format (ELF/Mach-O/COFF) is a consequence of
+ * the OS, so `x86_64-linux`, `riscv64-linux`, and `x86_64-windows` — not
+ * `x86_64-elf`/`riscv64-elf`/`x86_64-coff` — are canonical. The seam mirrors
  * `TEKO_BACKEND` and is read only when the own backend is already active;
  * D1/#390 supersedes it with the real `--target` manifest flag.
  */
-type NativeTarget = enum { Arm64Macho; X8664Linux; Riscv64Linux }
+type NativeTarget = enum { Arm64Macho; X8664Linux; Riscv64Linux; X8664Windows }
 
 /**
  * target_from_name — map a raw `TEKO_TARGET` value to a `NativeTarget`:
- * `x86_64-linux` selects the x86-64 SysV/ELF pipeline and `riscv64-linux` the
- * RISC-V LP64D/ELF pipeline (both canonical, OS-based per ruling #390);
- * `x86_64-elf`/`riscv64-elf` are accepted as deprecated format-named aliases.
- * Every other value — including `arm64-macos`, an empty string, or a typo —
- * falls back to the default `Arm64Macho`, so an unrecognized target never
- * silently mis-lowers.
+ * `x86_64-linux` selects the x86-64 SysV/ELF pipeline, `riscv64-linux` the
+ * RISC-V LP64D/ELF pipeline, and `x86_64-windows` the x86-64 Win64/COFF pipeline
+ * (all canonical, OS-based per ruling #390); `x86_64-elf`/`riscv64-elf`/
+ * `x86_64-coff` are accepted as deprecated format-named aliases. Every other
+ * value — including `arm64-macos`, an empty string, or a typo — falls back to
+ * the default `Arm64Macho`, so an unrecognized target never silently mis-lowers.
  *
  * @param name  the raw `TEKO_TARGET` environment value
  * @return      the selected own-backend target
@@ -715,6 +719,8 @@ fn target_from_name(name: str) -> NativeTarget {
     if name == "x86_64-elf" { return NativeTarget::X8664Linux }
     if name == "riscv64-linux" { return NativeTarget::Riscv64Linux }
     if name == "riscv64-elf" { return NativeTarget::Riscv64Linux }
+    if name == "x86_64-windows" { return NativeTarget::X8664Windows }
+    if name == "x86_64-coff" { return NativeTarget::X8664Windows }
     NativeTarget::Arm64Macho
 }
 
@@ -777,6 +783,7 @@ fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
     match native_target() {
         NativeTarget::X8664Linux => emit_native_x86(dir, od, stem, lmod, prog, m)
         NativeTarget::Riscv64Linux => emit_native_riscv(dir, od, stem, lmod, prog, m)
+        NativeTarget::X8664Windows => emit_native_win(dir, od, stem, lmod, prog, m)
         NativeTarget::Arm64Macho => emit_native_arm64(dir, od, stem, lmod, prog, m)
     }
 }
@@ -825,10 +832,40 @@ fn emit_native_arm64(dir: str, od: str, stem: str, lmod: teko::lir::LModule, pro
  * @return      0 on a successful build+link, else the failing status
  */
 fn emit_native_x86(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
-    let sel = match teko::backend::select_module_x86(lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let sel = match teko::backend::select_module_x86(teko::backend::sysv64(), lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
     let col = match teko::backend::regalloc_module_x86(teko::backend::sysv64(), sel) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
     let enc = match teko::backend::encode_module_x86(teko::backend::sysv64(), col) { teko::backend::EncodedModuleX86 as x => x; error as e => return fail(dir, e.message) }
     finish_native_object(dir, od, stem, teko::backend::emit_elf(enc), prog, m)
+}
+
+/**
+ * emit_native_win — the x86-64/Win64/PE-COFF own-backend tail (#388 B3): select
+ * x86-64 `MInstX86` from the lowered module under the Win64 ABI register file
+ * (`win64` — call/return arguments land in RCX/RDX/R8/R9, the byte-differing
+ * counterpart of the SysV `emit_native_x86`), allocate registers under the same
+ * `win64` descriptor, encode to the SAME variable-length x86 machine bytes as the
+ * Linux path (the x86 ISA is shared — only the ABI register partition differs),
+ * wrap them in a PE/COFF object (`emit_coff`, B3-3), and hand the bytes to
+ * `finish_native_object` (write `.o` + `cc`-link + `.tsym` + success marker).
+ * Reached only via `TEKO_TARGET=x86_64-windows`; the emitted `.o` is a Windows
+ * x86-64 object, so the executing C-vs-own differential runs on a Windows host
+ * (B3-4), while a non-Windows host still writes the `.o` for the byte /
+ * well-formedness cross-check (`llvm-readobj` is cross-format) even though the
+ * host `cc` cannot link a PE there without the MinGW cross toolchain.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_win(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+    let sel = match teko::backend::select_module_x86(teko::backend::win64(), lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let col = match teko::backend::regalloc_module_x86(teko::backend::win64(), sel) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let enc = match teko::backend::encode_module_x86(teko::backend::win64(), col) { teko::backend::EncodedModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    finish_native_object(dir, od, stem, teko::backend::emit_coff(enc), prog, m)
 }
 
 /**
