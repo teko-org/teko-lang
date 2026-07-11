@@ -38,7 +38,7 @@
 #
 # TWO EXECUTING LANES, host-selected (issue #386 B1-8):
 #   macOS-arm64  → own emits arm64 Mach-O; TEKO_BACKEND=native; check_macho.sh.
-#   linux-x86_64 → own emits x86-64 ELF;   TEKO_BACKEND=native TEKO_TARGET=x86_64-elf;
+#   linux-x86_64 → own emits x86-64 ELF;   TEKO_BACKEND=native TEKO_TARGET=x86_64-linux;
 #                  check_elf.sh. This lane RUNS the ELF (the linux runner executes it),
 #                  the executing C-vs-own differential the macOS lane cannot host.
 # On any OTHER host the harness HONEST-SKIPS with a named reason (exit 0). PE/riscv/wasm
@@ -64,7 +64,7 @@ if [[ "$host_os" == "Darwin" && "$host_arch" == "arm64" ]]; then
     OBJ_CHECK_NAME="check_macho"
 elif [[ "$host_os" == "Linux" && "$host_arch" == "x86_64" ]]; then
     FLAVOR="linux-x86_64 ELF"
-    OWN_TARGET_ENV="TEKO_TARGET=x86_64-elf"
+    OWN_TARGET_ENV="TEKO_TARGET=x86_64-linux"
     OBJ_CHECK="$script_dir/scripts/check_elf.sh"
     OBJ_CHECK_NAME="check_elf"
 else

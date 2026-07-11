@@ -631,26 +631,30 @@ fn native_backend_selected() -> bool {
 /**
  * NativeTarget — which own-AOT-backend target the temporary `TEKO_TARGET` env
  * seam selects (D-D, #386 B1-8): the default `Arm64Macho` (the A4 reference —
- * arm64 machine code in a Mach-O object) or `X8664Elf` (x86-64 SysV machine code
- * in an ELF object). The seam mirrors `TEKO_BACKEND` and is read only when the own
+ * arm64 machine code in a Mach-O object) or `X8664Linux` (x86-64 SysV machine
+ * code in an ELF object). Targets are named by OS, not by object format (ruling
+ * #390): the format (ELF/Mach-O) is a consequence of the OS, so `x86_64-linux`
+ * — not `x86_64-elf` (ELF spans many kernels the binary does not port between) —
+ * is canonical. The seam mirrors `TEKO_BACKEND` and is read only when the own
  * backend is already active; D1/#390 supersedes it with the real `--target`
  * manifest flag.
  */
-type NativeTarget = enum { Arm64Macho; X8664Elf }
+type NativeTarget = enum { Arm64Macho; X8664Linux }
 
 /**
  * target_from_name — map a raw `TEKO_TARGET` value to a `NativeTarget`:
- * `x86_64-elf` (the design-doc-canonical spelling) or `x86_64-linux` (the task
- * spelling) select the x86-64 SysV/ELF pipeline; every other value — including
- * `arm64-macos`, an empty string, or a typo — falls back to the default
- * `Arm64Macho`, so an unrecognized target never silently mis-lowers.
+ * `x86_64-linux` (canonical, OS-based per ruling #390) selects the x86-64
+ * SysV/ELF pipeline; `x86_64-elf` is accepted as a deprecated format-named alias.
+ * Every other value — including `arm64-macos`, an empty string, or a typo —
+ * falls back to the default `Arm64Macho`, so an unrecognized target never
+ * silently mis-lowers.
  *
  * @param name  the raw `TEKO_TARGET` environment value
  * @return      the selected own-backend target
  */
 fn target_from_name(name: str) -> NativeTarget {
-    if name == "x86_64-elf" { return NativeTarget::X8664Elf }
-    if name == "x86_64-linux" { return NativeTarget::X8664Elf }
+    if name == "x86_64-linux" { return NativeTarget::X8664Linux }
+    if name == "x86_64-elf" { return NativeTarget::X8664Linux }
     NativeTarget::Arm64Macho
 }
 
@@ -686,7 +690,7 @@ fn strip_trailing_slash(dir: str) -> str {
  * x86-64 at #386 B1-8): lower the checked program to target-independent LIR, then
  * dispatch on `native_target()` to the per-ISA tail — arm64 `MInst`/AAPCS64/Mach-O
  * (the default, byte-unchanged A4 path) or x86-64 `MInstX86`/SysV/ELF (the B1 path,
- * `TEKO_TARGET=x86_64-elf`). Each tail selects instructions, allocates registers,
+ * `TEKO_TARGET=x86_64-linux`). Each tail selects instructions, allocates registers,
  * encodes machine bytes, wraps them in the target object format, writes the `.o`,
  * and links it into a native executable against the C-built `teko_rt`/`assert`
  * runtime via `cc`-as-linker (`link_object`, the D-C bootstrap). Any pipeline
@@ -709,7 +713,7 @@ fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
     match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
     let lmod = match teko::lir::lower_program(prog) { teko::lir::LModule as x => x; error as e => return fail(dir, e.message) }
     match native_target() {
-        NativeTarget::X8664Elf => emit_native_x86(dir, od, stem, lmod, prog, m)
+        NativeTarget::X8664Linux => emit_native_x86(dir, od, stem, lmod, prog, m)
         NativeTarget::Arm64Macho => emit_native_arm64(dir, od, stem, lmod, prog, m)
     }
 }
@@ -744,7 +748,7 @@ fn emit_native_arm64(dir: str, od: str, stem: str, lmod: teko::lir::LModule, pro
  * register file (`sysv64`), encode to variable-length x86 machine bytes, wrap them
  * in an `ET_REL` ELF64 object (`emit_elf`), and hand the bytes to
  * `finish_native_object` (write `.o` + `cc`-link + `.tsym` + success marker).
- * Reached only via `TEKO_TARGET=x86_64-elf`; the emitted `.o` is a linux x86-64
+ * Reached only via `TEKO_TARGET=x86_64-linux`; the emitted `.o` is a linux x86-64
  * object, so the executing C-vs-own differential runs on a linux-x86_64 host
  * (`scripts/diff_c_own.sh`), while a macOS host still writes the `.o` for the
  * byte / well-formedness cross-check even though `cc` cannot link an ELF there.
