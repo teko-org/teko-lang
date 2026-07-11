@@ -1062,3 +1062,201 @@ fn rvenc_badblock_stop() -> str {
 fn rvenc_badblock_internal_invariant() {
     teko::assert::str_contains(rvenc_badblock_stop(), "B2-badblock")
 }
+
+/**
+ * rvenc_func_stop — the honest-stop message encoding `f` through the full
+ * `encode_func_riscv` pass produces, or `<ok>` when it encodes.
+ *
+ * @param MFuncRiscv f  the function to encode
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_func_stop(f: MFuncRiscv) -> str {
+    match encode_func_riscv(riscv64_lp64d(), f, 0 to u32) {
+        FuncEncOutRiscv as o => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rvenc_fp_load_func — a frameless function whose only instruction is an FPR
+ * load (`fld fa0, 0(sp)`): the `B2-fp` honest-stop propagates from the
+ * single-word encoder up through the B2-6 emit pass (fa0 is caller-saved, so the
+ * frame stays empty and the stop comes from the load, not the prologue).
+ *
+ * @return MFuncRiscv  the FP-load function
+ */
+fn rvenc_fp_load_func() -> MFuncRiscv {
+    append_minst_riscv(new_mfunc_riscv("fp"), 0 to u32, load_riscv(MMemSizeRiscv::D, false, rvenc_pf(10 to u32), rvenc_mem(2 to u32, 0 to i32)))
+}
+
+/**
+ * rvenc_bigframe_func — a function reserving a 4096-byte slot (a 4112-byte frame,
+ * past the `addi` imm12 window): `encode_func_riscv`'s prologue emission
+ * propagates `B2-bigframe`.
+ *
+ * @return MFuncRiscv  the oversized-frame function
+ */
+fn rvenc_bigframe_func() -> MFuncRiscv {
+    append_minst_riscv(append_frame_riscv(new_mfunc_riscv("big"), lir::LAlloca { bytes = 4096 to u32; align = 8 to u32 }), 0 to u32, ret_riscv())
+}
+
+#test
+/**
+ * rvenc_func_pass_propagates_stops — a single-word honest-stop (an FPR load →
+ * `B2-fp`) and an oversized frame (→ `B2-bigframe`) both propagate out of the
+ * full `encode_func_riscv` emit pass rather than being swallowed.
+ *
+ * @return void
+ */
+fn rvenc_func_pass_propagates_stops() {
+    teko::assert::str_contains(rvenc_func_stop(rvenc_fp_load_func()), "B2-fp")
+    teko::assert::str_contains(rvenc_func_stop(rvenc_bigframe_func()), "B2-bigframe")
+}
+
+/**
+ * rvenc_module_stop — the honest-stop message encoding `m` through the full
+ * `encode_module_riscv` pass produces, or `<ok>` when it encodes.
+ *
+ * @param MModuleRiscv m  the module to encode
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_module_stop(m: MModuleRiscv) -> str {
+    match encode_module_riscv(riscv64_lp64d(), m) {
+        EncodedModuleRiscv as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+#test
+/**
+ * rvenc_module_pass_propagates_function_stop — a function's honest-stop (an FPR
+ * load → `B2-fp`) propagates out of the whole-module `encode_module_riscv` pass.
+ *
+ * @return void
+ */
+fn rvenc_module_pass_propagates_function_stop() {
+    let m = MModuleRiscv { funcs = teko::list::push(teko::list::empty(), rvenc_fp_load_func()); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    teko::assert::str_contains(rvenc_module_stop(m), "B2-fp")
+}
+
+#test
+/**
+ * rvenc_module_globals_honest_stop — a module carrying a top-level data global
+ * raises the `B2-globals` honest-stop (the `.data`/`.bss` sections are deferred;
+ * the N2 subset lowers none).
+ *
+ * @return void
+ */
+fn rvenc_module_globals_honest_stop() {
+    let g = lir::LGlobal { symbol = "gv"; ty = lir::LType::I32; bytes = teko::list::empty() }
+    let m = MModuleRiscv { funcs = teko::list::empty(); rodata = teko::list::empty(); globals = teko::list::push(teko::list::empty(), g); layouts = teko::list::empty() }
+    teko::assert::str_contains(rvenc_module_stop(m), "B2-globals")
+}
+
+/**
+ * rvenc_frame_addr_bigframe_stop — the honest-stop `encode_frame_addr_riscv`
+ * produces for a slot offset beyond the signed 12-bit `addi` field (a crafted
+ * `FrameLayoutRiscv` with a 3000-byte slot offset), the defensive guard the real
+ * `frame_fits_riscv` prologue check normally forecloses.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_frame_addr_bigframe_stop() -> str {
+    let layout = FrameLayoutRiscv { size = 3008 to u32; saved_gpr = teko::list::empty(); saved_fpr = teko::list::empty(); slot_offsets = teko::list::push(teko::list::empty(), 3000 to u32) }
+    match encode_frame_addr_riscv(layout, MFrameAddrRiscv { dst = rvenc_pg(10 to u32); slot = 0 to u32 }) {
+        EncWordRiscv as v => "<ok>"
+        error as e => e.message
+    }
+}
+
+#test
+/**
+ * rvenc_frame_addr_bigframe — a frame-slot address beyond the `addi` imm12 field
+ * raises `B2-bigframe` directly from `encode_frame_addr_riscv` (the slot-address
+ * arm of the big-frame limit).
+ *
+ * @return void
+ */
+fn rvenc_frame_addr_bigframe() {
+    teko::assert::str_contains(rvenc_frame_addr_bigframe_stop(), "B2-bigframe")
+}
+
+/**
+ * rvenc_big_layout — a crafted `FrameLayoutRiscv` whose size and single slot
+ * offset both exceed the `addi` imm12 window, forcing the frame-emission
+ * honest-stops the normal `frame_fits_riscv` prologue guard forecloses.
+ *
+ * @return FrameLayoutRiscv  the oversized frame side-table
+ */
+fn rvenc_big_layout() -> FrameLayoutRiscv {
+    FrameLayoutRiscv { size = 3008 to u32; saved_gpr = teko::list::empty(); saved_fpr = teko::list::empty(); slot_offsets = teko::list::push(teko::list::empty(), 3000 to u32) }
+}
+
+/**
+ * rvenc_empty_emit — a seed `FuncEmitRiscv` accumulator (empty words/labels,
+ * counter 0), the input the emit-pass helpers extend.
+ *
+ * @return FuncEmitRiscv  the seed accumulator
+ */
+fn rvenc_empty_emit() -> FuncEmitRiscv {
+    FuncEmitRiscv { words = teko::list::empty(); labels = teko::list::empty(); label_ctr = 0 to u32 }
+}
+
+/**
+ * rvenc_ret_seq_stop — the honest-stop `encode_ret_seq_riscv` propagates when the
+ * epilogue overflows the `addi` window, or `<ok>` on success.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_ret_seq_stop() -> str {
+    match encode_ret_seq_riscv(rvenc_big_layout(), rvenc_empty_emit()) {
+        FuncEmitRiscv as a => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rvenc_frame_addr_push_stop — the honest-stop `encode_frame_addr_push_riscv`
+ * propagates when the slot address overflows the `addi` window, or `<ok>`.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_frame_addr_push_stop() -> str {
+    match encode_frame_addr_push_riscv(rvenc_big_layout(), rvenc_empty_emit(), MFrameAddrRiscv { dst = rvenc_pg(10 to u32); slot = 0 to u32 }) {
+        FuncEmitRiscv as a => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rvenc_resolve_word_stop — the honest-stop `resolve_word_riscv` propagates when a
+ * branch target sits past the B-type field: a `beq` whose target block is 2000
+ * words away (8000 bytes > ±4 KiB), or `<ok>`.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_resolve_word_stop() -> str {
+    let ew = rvenc_enc(branch_riscv(MCond::EQ, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 1 to u32))
+    let offsets = teko::list::push(teko::list::empty(), BlockOffsetRiscv { id = 1 to u32; word = 2000 to u32 })
+    match resolve_word_riscv(ew, 0 to u32, offsets) {
+        u32 as v => "<ok>"
+        error as e => e.message
+    }
+}
+
+#test
+/**
+ * rvenc_emit_helpers_propagate_stops — the emit-pass wrapper helpers propagate
+ * their underlying honest-stops rather than swallowing them: the epilogue
+ * (`encode_ret_seq_riscv` → `B2-bigframe`), the frame-slot address
+ * (`encode_frame_addr_push_riscv` → `B2-bigframe`), and the branch resolve
+ * (`resolve_word_riscv` → `B2-farbranch`) each surface the stop the normal
+ * pipeline's earlier guards foreclose.
+ *
+ * @return void
+ */
+fn rvenc_emit_helpers_propagate_stops() {
+    teko::assert::str_contains(rvenc_ret_seq_stop(), "B2-bigframe")
+    teko::assert::str_contains(rvenc_frame_addr_push_stop(), "B2-bigframe")
+    teko::assert::str_contains(rvenc_resolve_word_stop(), "B2-farbranch")
+}
