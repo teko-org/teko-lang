@@ -1,0 +1,244 @@
+/**
+ * mx_r — a virtual GPR register operand with the given id (a fixture-building
+ * shorthand shared by every x86 test below).
+ *
+ * @param u32 id  the virtual register's abstract id
+ * @return MReg  the virtual GPR register operand
+ */
+fn mx_r(id: u32) -> MReg {
+    vreg(id, MRegClass::GPR)
+}
+
+/**
+ * mx_p — a physical GPR register operand with the given id (a fixture-building
+ * shorthand shared by every x86 test below).
+ *
+ * @param u32 id  the physical register's ISA number
+ * @return MReg  the physical GPR register operand
+ */
+fn mx_p(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * mx_mem — a base-plus-displacement memory operand (a fixture-building
+ * shorthand shared by every x86 test below).
+ *
+ * @param MReg base  the base register
+ * @param i32 offset  the byte displacement
+ * @return MMem  the memory operand
+ */
+fn mx_mem(base: MReg, offset: i32) -> MMem {
+    MMem { base = base; offset = offset }
+}
+
+/**
+ * mx_block0 — the first machine block of `mx_full_module`'s fixture function:
+ * every value-producing `MInstX86` case (immediate/register moves, the
+ * two-address ALU/mul, the fixed-register div/rem across every signed/rem
+ * combination, shifts, compares, every condition code via setcc, unary
+ * neg/not, every memory access width plus a signed narrow load, frame and
+ * rip-relative addressing), ending in a jump to block #M1. Split out so no
+ * single function grows unbounded (W15 — flatten by extraction).
+ *
+ * @return MBlockX86  the value-producing block
+ */
+fn mx_block0() -> MBlockX86 {
+    let insts = [
+        movimm_x86(mx_r(10), 42 to i64, true),
+        movimm_x86(mx_r(11), 7 to i64, false),
+        mov_x86(mx_r(12), mx_r(0), true),
+        mov_x86(mx_r(13), mx_r(0), false),
+        alu_rm_x86(MAluOpX86::Add, mx_r(10), mx_r(1), true),
+        alu_rm_x86(MAluOpX86::Sub, mx_r(11), mx_r(1), false),
+        alu_rm_x86(MAluOpX86::And, mx_r(14), mx_r(1), true),
+        alu_rm_x86(MAluOpX86::Or, mx_r(15), mx_r(1), true),
+        alu_rm_x86(MAluOpX86::Xor, mx_r(16), mx_r(1), true),
+        imul_x86(mx_r(17), mx_r(1), true),
+        divseq_x86(mx_r(18), mx_r(0), mx_r(1), true, false, true),
+        divseq_x86(mx_r(19), mx_r(0), mx_r(1), false, false, true),
+        divseq_x86(mx_r(20), mx_r(0), mx_r(1), true, true, true),
+        divseq_x86(mx_r(21), mx_r(0), mx_r(1), false, true, false),
+        shift_x86(MShiftOpX86::Shl, mx_r(22), true),
+        shift_x86(MShiftOpX86::Shr, mx_r(23), true),
+        shift_x86(MShiftOpX86::Sar, mx_r(24), false),
+        cmp_x86(mx_r(0), mx_r(1), true),
+        cmp_x86(mx_r(0), mx_r(1), false),
+        setcc_x86(mx_r(30), MCond::EQ),
+        setcc_x86(mx_r(31), MCond::NE),
+        setcc_x86(mx_r(32), MCond::LT),
+        setcc_x86(mx_r(33), MCond::LE),
+        setcc_x86(mx_r(34), MCond::GT),
+        setcc_x86(mx_r(35), MCond::GE),
+        setcc_x86(mx_r(36), MCond::LO),
+        setcc_x86(mx_r(37), MCond::LS),
+        setcc_x86(mx_r(38), MCond::HI),
+        setcc_x86(mx_r(39), MCond::HS),
+        neg_x86(mx_r(40), true),
+        not_x86(mx_r(41), false),
+        load_x86(MMemSizeX86::Q, false, mx_r(50), mx_mem(mx_r(0), 8)),
+        load_x86(MMemSizeX86::D, false, mx_r(51), mx_mem(mx_r(0), 0)),
+        load_x86(MMemSizeX86::W, false, mx_r(52), mx_mem(mx_r(0), 2)),
+        load_x86(MMemSizeX86::B, true, mx_r(53), mx_mem(mx_r(0), -4 to i32)),
+        store_x86(MMemSizeX86::Q, mx_r(0), mx_mem(mx_r(1), 0)),
+        store_x86(MMemSizeX86::D, mx_r(0), mx_mem(mx_r(1), 4)),
+        frame_addr_x86(mx_r(60), 3),
+        lea_rip_x86(mx_r(61), "some_global", RelocKindX86::Pc32),
+        lea_rip_x86(mx_r(62), "some_func", RelocKindX86::Plt32),
+        lea_rip_x86(mx_r(63), "some_data", RelocKindX86::Abs64),
+        jmp_x86(1)
+    ]
+    MBlockX86 { id = 0; params = teko::list::empty(); insts = insts }
+}
+
+/**
+ * mx_block1 — the second machine block of `mx_full_module`'s fixture function:
+ * the control-flow + call terminators (`MJccX86`/`MCallX86`/`MCallIndX86`/
+ * `MRetX86`), spanning the variadic/result and empty/one/two-argument call
+ * shapes, and carrying one block-arg so the printer's params-header branch is
+ * exercised (W15 — flatten by extraction).
+ *
+ * @return MBlockX86  the control-flow block
+ */
+fn mx_block1() -> MBlockX86 {
+    let insts = [
+        jcc_x86(MCond::EQ, 0),
+        jcc_x86(MCond::GE, 1),
+        call_x86("tk_exit", [mx_p(7)], mx_p(0), false, false),
+        call_x86("tk_add", [mx_p(7), mx_p(6)], mx_p(0), true, true),
+        call_ind_x86(mx_r(0), teko::list::empty(), mx_p(0), false),
+        call_ind_x86(mx_r(0), [mx_p(7)], mx_p(0), true),
+        ret_x86()
+    ]
+    MBlockX86 { id = 1; params = [mx_r(80)]; insts = insts }
+}
+
+/**
+ * mx_full_module — a module with two functions: `kitchen_sink_x86` (one
+ * instance of every `MInstX86` case, spanning both `wide` forms, every
+ * `MCond`, every `MMemSizeX86`, every `RelocKindX86`, every div signed/rem
+ * combination, and both `is_phys` states) plus `leaf_x86` (a minimal one-block
+ * function), exercising the whole printer surface the golden-dump tests below
+ * assert against.
+ *
+ * @return MModuleX86  the fixture module
+ */
+fn mx_full_module() -> MModuleX86 {
+    let sink = MFuncX86 {
+        symbol = "kitchen_sink_x86"
+        blocks = [mx_block0(), mx_block1()]
+        frame = teko::list::empty()
+    }
+    let leaf_block = MBlockX86 { id = 0; params = teko::list::empty(); insts = [ret_x86()] }
+    let leaf = MFuncX86 { symbol = "leaf_x86"; blocks = [leaf_block]; frame = teko::list::empty() }
+    add_mfunc_x86(add_mfunc_x86(empty_mmodule_x86(), sink), leaf)
+}
+
+#test
+fn mx_prints_moves_and_two_address_alu() {
+    let text = minst_print_x86(mx_full_module())
+    teko::assert::str_contains(text, "mov.q %10, #42")
+    teko::assert::str_contains(text, "mov.d %11, #7")
+    teko::assert::str_contains(text, "mov.q %12, %0")
+    teko::assert::str_contains(text, "mov.d %13, %0")
+    teko::assert::str_contains(text, "add.q %10, %1")
+    teko::assert::str_contains(text, "sub.d %11, %1")
+    teko::assert::str_contains(text, "and.q %14, %1")
+    teko::assert::str_contains(text, "or.q %15, %1")
+    teko::assert::str_contains(text, "xor.q %16, %1")
+}
+
+#test
+fn mx_prints_mul_div_and_shift() {
+    let text = minst_print_x86(mx_full_module())
+    teko::assert::str_contains(text, "imul.q %17, %1")
+    teko::assert::str_contains(text, "idiv.q %18, %0, %1")
+    teko::assert::str_contains(text, "div.q %19, %0, %1")
+    teko::assert::str_contains(text, "irem.q %20, %0, %1")
+    teko::assert::str_contains(text, "rem.d %21, %0, %1")
+    teko::assert::str_contains(text, "shl.q %22, cl")
+    teko::assert::str_contains(text, "shr.q %23, cl")
+    teko::assert::str_contains(text, "sar.d %24, cl")
+}
+
+#test
+fn mx_prints_compares_and_every_condition_via_setcc() {
+    let text = minst_print_x86(mx_full_module())
+    teko::assert::str_contains(text, "cmp.q %0, %1")
+    teko::assert::str_contains(text, "cmp.d %0, %1")
+    teko::assert::str_contains(text, "sete %30")
+    teko::assert::str_contains(text, "setne %31")
+    teko::assert::str_contains(text, "setl %32")
+    teko::assert::str_contains(text, "setle %33")
+    teko::assert::str_contains(text, "setg %34")
+    teko::assert::str_contains(text, "setge %35")
+    teko::assert::str_contains(text, "setb %36")
+    teko::assert::str_contains(text, "setbe %37")
+    teko::assert::str_contains(text, "seta %38")
+    teko::assert::str_contains(text, "setae %39")
+}
+
+#test
+fn mx_prints_unary_and_every_memory_form() {
+    let text = minst_print_x86(mx_full_module())
+    teko::assert::str_contains(text, "neg.q %40")
+    teko::assert::str_contains(text, "not.d %41")
+    teko::assert::str_contains(text, "mov.q %50, [%0 + 8]")
+    teko::assert::str_contains(text, "mov.d %51, [%0 + 0]")
+    teko::assert::str_contains(text, "mov.w %52, [%0 + 2]")
+    teko::assert::str_contains(text, "movsx.b %53, [%0 + -4]")
+    teko::assert::str_contains(text, "mov.q [%1 + 0], %0")
+    teko::assert::str_contains(text, "mov.d [%1 + 4], %0")
+}
+
+#test
+fn mx_prints_frame_and_rip_relative_addressing() {
+    let text = minst_print_x86(mx_full_module())
+    teko::assert::str_contains(text, "lea %60, [frame #3]")
+    teko::assert::str_contains(text, "lea.pc32 %61, [rip @some_global]")
+    teko::assert::str_contains(text, "lea.plt32 %62, [rip @some_func]")
+    teko::assert::str_contains(text, "lea.abs64 %63, [rip @some_data]")
+}
+
+#test
+fn mx_prints_control_flow_and_calls() {
+    let text = minst_print_x86(mx_full_module())
+    teko::assert::str_contains(text, "jmp #M1")
+    teko::assert::str_contains(text, "  #M1(%80):")
+    teko::assert::str_contains(text, "je #M0")
+    teko::assert::str_contains(text, "jge #M1")
+    teko::assert::str_contains(text, "call @tk_exit(%p7)")
+    teko::assert::str_contains(text, "call @tk_add(%p7, %p6) variadic -> %p0")
+    teko::assert::str_contains(text, "call.indirect %0()")
+    teko::assert::str_contains(text, "call.indirect %0(%p7) -> %p0")
+    teko::assert::str_contains(text, "ret")
+}
+
+#test
+fn mx_separates_multiple_functions_by_a_blank_line() {
+    let text = minst_print_x86(mx_full_module())
+    teko::assert::str_contains(text, "func @kitchen_sink_x86 {")
+    teko::assert::str_contains(text, "}\n\nfunc @leaf_x86 {")
+}
+
+#test
+fn mx_builds_a_two_block_function_with_the_incremental_api() {
+    mut f = new_mfunc_x86("teko__demo__addx")
+    f = append_minst_x86(f, 0, alu_rm_x86(MAluOpX86::Add, mx_r(2), mx_r(1), true))
+    f = append_minst_x86(f, 0, jmp_x86(1))
+    let blk1 = MBlockX86 { id = 1; params = [mx_r(3), mx_r(4)]; insts = teko::list::empty() }
+    f = append_block_x86(f, blk1)
+    f = append_minst_x86(f, 1, mov_x86(mx_p(0), mx_r(3), true))
+    f = append_minst_x86(f, 1, ret_x86())
+    f = append_frame_x86(f, lir::LAlloca { bytes = 8; align = 8 })
+    f = set_block_param_x86(f, 1, 0, mx_r(5))
+    teko::assert::is_true(f.frame.len == 1)
+    let text = minst_print_x86(add_mfunc_x86(empty_mmodule_x86(), f))
+    teko::assert::str_contains(text, "func @teko__demo__addx {")
+    teko::assert::str_contains(text, "  #M0:")
+    teko::assert::str_contains(text, "    add.q %2, %1")
+    teko::assert::str_contains(text, "    jmp #M1")
+    teko::assert::str_contains(text, "  #M1(%5, %4):")
+    teko::assert::str_contains(text, "    mov.q %p0, %3")
+    teko::assert::str_contains(text, "    ret")
+}
