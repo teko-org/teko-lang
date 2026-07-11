@@ -70,6 +70,17 @@ set -u
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# TK_RT_DIR pinned ABSOLUTE (project.tks::rt_dir reads it verbatim; assert_dir derives
+# the sibling `<parent-of-rt>/assert` from it, so one absolute anchor resolves BOTH
+# teko_rt.c and assert.c). Every fixture build below runs with CWD == the fixture
+# project dir, not $script_dir, so project.tks's compiler-relative probe
+# (set_rt_dir_from_compiler) is the only other resolution path — and it fails on the
+# Windows runner (a general out-of-tree-build gap, reported separately, not fixed
+# here), falling back to a CWD-relative "src/runtime" that never resolves from a
+# fixture dir. Exporting an absolute TK_RT_DIR here sidesteps both platform probes
+# uniformly, so every lane (macOS/Linux/Windows) finds the runtime the same way.
+export TK_RT_DIR="$script_dir/src/runtime"
+
 host_os="$(uname -s)"
 host_arch="$(uname -m)"
 diff_target="${TEKO_DIFF_TARGET:-}"
