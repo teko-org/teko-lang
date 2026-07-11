@@ -177,57 +177,54 @@ fn coff_build_symbols(symbols: []Symbol) -> []CoffSymbol {
 /**
  * CoffStrtab — the assembled COFF string table plus the per-symbol name
  * resolution: the string-table image (a 4-byte little-endian total-size field —
- * INCLUDING itself, minimum 4 — then each >8-byte name NUL-terminated), and, per
- * symbol in emission order, either the ≤8-byte inline name bytes or the strtab
- * offset a >8-byte name resolves to. Names ≤ 8 bytes never enter `bytes`.
+ * INCLUDING itself, minimum 4 — then each >8-byte name NUL-terminated) and, per
+ * symbol in emission order, the strtab offset a >8-byte name resolves to (`0` for a
+ * ≤8-byte name, which emits inline from the symbol's own `name` — a name is inline
+ * iff `name.len ≤ 8`, so no parallel inline-bytes array is needed). Names ≤ 8 bytes
+ * never enter `bytes`.
  *
  * @since #388 B3-3
  */
 type CoffStrtab = struct {
     /** bytes — the string-table image (4-byte size prefix + NUL-terminated long names). */
     bytes: []byte
-    /** inline_name — per symbol: the ≤8 raw name bytes when the name fits inline, else empty. */
-    inline_name: [][]byte
-    /** long_offset — per symbol: the strtab offset for a >8-byte name, else 0. */
+    /** long_offset — per symbol: the strtab offset for a >8-byte name, else 0 (inline). */
     long_offset: []u32
 }
 
 /**
  * build_coff_strtab — assemble the COFF string table from the symbol list: every
- * name ≤ 8 bytes is recorded for INLINE emission in the symbol's 8-byte `Name`
- * field (NUL-padded, bare — no `_` prefix on Windows x64); every longer name is
- * appended to `bytes` (NUL-terminated) and its offset recorded so the symbol emits
- * the `[0,0,0,0]`+offset union. `bytes` opens with the 4-byte total-size field
- * (patched last, once every long name is placed — the size INCLUDES the 4 bytes,
- * so the first long name lands at offset 4). The COFF analog of Mach-O's
- * `build_strtab` (which prepends `_`) and ELF's `build_elf_strtab` (a bare
- * NUL-run) — neither reusable, since COFF's size-prefix + inline-≤8 layout is
- * structurally distinct (§5.1, D-B).
+ * name ≤ 8 bytes emits INLINE in the symbol's 8-byte `Name` field (NUL-padded, bare
+ * — no `_` prefix on Windows x64 — so it never enters `bytes`, recorded as
+ * `long_offset = 0`); every longer name is appended to `bytes` (NUL-terminated) and
+ * its offset recorded so the symbol emits the `[0,0,0,0]`+offset union. `bytes`
+ * opens with the 4-byte total-size field (patched last, once every long name is
+ * placed — the size INCLUDES the 4 bytes, so the first long name lands at offset
+ * 4). The COFF analog of Mach-O's `build_strtab` (which prepends `_`) and ELF's
+ * `build_elf_strtab` (a bare NUL-run) — neither reusable, since COFF's size-prefix +
+ * inline-≤8 layout is structurally distinct (§5.1, D-B).
  *
  * @param []CoffSymbol symbols  the resolved symbol table, in emission order
- * @return CoffStrtab  the string-table bytes + per-symbol inline/offset resolution
+ * @return CoffStrtab  the string-table bytes + per-symbol >8-byte-name offsets
  */
 fn build_coff_strtab(symbols: []CoffSymbol) -> CoffStrtab {
     mut bytes: []byte = emit_zeros_coff(teko::list::empty(), 4 to u64)
-    mut inline_name: [][]byte = teko::list::empty()
     mut long_offset: []u32 = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= symbols.len { break }
         let nm = symbols[i].name
         if nm.len <= (8 to u64) {
-            inline_name = teko::list::push(inline_name, emit_str_bytes(teko::list::empty(), nm))
             long_offset = teko::list::push(long_offset, 0 to u32)
         } else {
             long_offset = teko::list::push(long_offset, bytes.len to u32)
-            inline_name = teko::list::push(inline_name, teko::list::empty())
             bytes = emit_str_bytes(bytes, nm)
             bytes = teko::list::push(bytes, 0 to byte)
         }
         i++
     }
     let sized = write_u32_le_at(bytes, 0 to u32, bytes.len to u32)
-    CoffStrtab { bytes = sized; inline_name = inline_name; long_offset = long_offset }
+    CoffStrtab { bytes = sized; long_offset = long_offset }
 }
 
 /**
@@ -552,20 +549,20 @@ fn emit_coff_sections(buf: []byte, lay: CoffLayout) -> []byte {
 
 /**
  * emit_coff_sym_name — the 8-byte `IMAGE_SYMBOL` `Name` union: a name ≤ 8 bytes is
- * the raw bytes NUL-padded to 8 (`inline_bytes` non-empty); a name > 8 bytes is the
- * `Zeroes` sentinel — four zero bytes — then the 4-byte little-endian `Offset` into
- * the string table (`inline_bytes` empty, §5.1). Every COFF symbol name here is
- * non-empty, so an empty `inline_bytes` unambiguously marks the long-name form.
+ * the raw bytes NUL-padded to 8; a name > 8 bytes is the `Zeroes` sentinel — four
+ * zero bytes — then the 4-byte little-endian `Offset` into the string table (§5.1).
+ * The ≤8-vs->8 branch keys off `name.len` (`long_off` is meaningful, and nonzero,
+ * only for the long-name form).
  *
  * @param []byte buf  the buffer to extend
- * @param []byte inline_bytes  the ≤8 inline name bytes, or empty for a long name
+ * @param str name  the symbol's bare name
  * @param u32 long_off  the string-table offset for a long name (ignored when inline)
  * @return []byte  `buf` followed by the 8-byte `Name` union
  */
-fn emit_coff_sym_name(buf: []byte, inline_bytes: []byte, long_off: u32) -> []byte {
-    if inline_bytes.len > (0 to u64) {
-        let b = append_bytes(buf, inline_bytes)
-        return emit_zeros_coff(b, (8 to u64) - inline_bytes.len)
+fn emit_coff_sym_name(buf: []byte, name: str, long_off: u32) -> []byte {
+    if name.len <= (8 to u64) {
+        let b = emit_str_bytes(buf, name)
+        return emit_zeros_coff(b, (8 to u64) - name.len)
     }
     let z = emit_zeros_coff(buf, 4 to u64)
     emit_u32_le(z, long_off)
@@ -579,12 +576,11 @@ fn emit_coff_sym_name(buf: []byte, inline_bytes: []byte, long_off: u32) -> []byt
  *
  * @param []byte buf  the buffer to extend
  * @param CoffSymbol sym  the symbol to emit
- * @param []byte inline_bytes  the symbol's ≤8 inline name bytes, or empty for a long name
- * @param u32 long_off  the symbol's string-table offset for a long name
+ * @param u32 long_off  the symbol's string-table offset for a >8-byte name (else 0)
  * @return []byte  `buf` followed by the 18-byte `IMAGE_SYMBOL`
  */
-fn emit_coff_one_symbol(buf: []byte, sym: CoffSymbol, inline_bytes: []byte, long_off: u32) -> []byte {
-    mut b = emit_coff_sym_name(buf, inline_bytes, long_off)
+fn emit_coff_one_symbol(buf: []byte, sym: CoffSymbol, long_off: u32) -> []byte {
+    mut b = emit_coff_sym_name(buf, sym.name, long_off)
     b = emit_u32_le(b, sym.value)
     b = emit_u16_le_coff(b, sym.section_number)
     b = emit_u16_le_coff(b, sym.sym_type)
@@ -594,14 +590,14 @@ fn emit_coff_one_symbol(buf: []byte, sym: CoffSymbol, inline_bytes: []byte, long
 
 /**
  * emit_coff_symtab — the `IMAGE_SYMBOL` table: one packed 18-byte record per
- * symbol, in static-then-external order, each carrying its `Name` union (inline or
- * strtab offset from `strtab`) and its section-relative `Value`. The table is
- * PACKED (18-byte records are not 4-aligned) — no padding is inserted (§9.3 VM
- * gotcha (b)).
+ * symbol, in static-then-external order, each carrying its `Name` union (inline when
+ * `name.len ≤ 8`, else the strtab offset from `strtab`) and its section-relative
+ * `Value`. The table is PACKED (18-byte records are not 4-aligned) — no padding is
+ * inserted (§9.3 VM gotcha (b)).
  *
  * @param []byte buf  the buffer to extend
  * @param []CoffSymbol syms  the resolved symbol table
- * @param CoffStrtab strtab  the string table (for the per-symbol name resolution)
+ * @param CoffStrtab strtab  the string table (for the per-symbol long-name offset)
  * @return []byte  `buf` followed by the symbol-table records
  */
 fn emit_coff_symtab(buf: []byte, syms: []CoffSymbol, strtab: CoffStrtab) -> []byte {
@@ -609,7 +605,7 @@ fn emit_coff_symtab(buf: []byte, syms: []CoffSymbol, strtab: CoffStrtab) -> []by
     mut i: u64 = 0
     loop {
         if i >= syms.len { break }
-        b = emit_coff_one_symbol(b, syms[i], strtab.inline_name[i], strtab.long_offset[i])
+        b = emit_coff_one_symbol(b, syms[i], strtab.long_offset[i])
         i++
     }
     b
