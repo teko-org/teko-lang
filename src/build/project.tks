@@ -391,53 +391,117 @@ fn append_reachable_os_lib_flags(argv: []str, m: Manifest, tos: str, reachable: 
     out
 }
 
-// Run the host C compiler over `cfile`, producing `binary`. Full parity with driver.c::run_cc: cc
-// sees the runtime + assert dirs (-I) and compiles BOTH seed sources (teko_rt.c + assert.c) plus
-// -lm, in one reuse-the-host-toolchain invocation (M.5). Returns the cc exit code.
-fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
+/**
+ * build_cc_argv — assemble the host-`cc` command line that turns one input file
+ * (`input`, a generated `.c` for the C backend or an own-backend `.o`) into the
+ * native `binary`, in full parity with `driver.c::run_cc` (M.5, reuse the host
+ * toolchain in one invocation). The line carries: the `[extern] cc` override
+ * (else `cc`); the portable `-std`/error-limit spelling for the detected compiler
+ * family (clang `-std=c23`/`-ferror-limit=0`, else GCC's `-std=c2x`/`-fmax-errors=0`);
+ * `-w` to silence warnings on machine-generated C; the project version baked into
+ * `teko_rt`'s `tk_rt_version()` as a BARE `-DTEKO_VERSION_STRING` token (embedded
+ * quotes broke Windows arg re-parsing); the cross knobs (`-target`/`--sysroot`/
+ * `-nostdlib`, C7.1f); the runtime + assert include dirs; the input; the two C
+ * runtime seed sources (`teko_rt.c` + `assert.c`); `-lm` (unless freestanding); the
+ * reachable `[extern.libs]` link flags (C7.20); and, on macOS, the `__info_plist`
+ * `-Wl,-sectcreate` section. Shared verbatim by `run_cc` (a `.c` input) and
+ * `link_object` (an own-backend `.o` input) so both link the SAME way — the only
+ * difference is the input file, keeping the two paths from drifting.
+ *
+ * @param input   the input path — a generated `.c` (C backend) or a `.o` (own backend)
+ * @param binary  the output native executable path
+ * @param m       the resolved manifest (cc override, version, cross knobs, libs)
+ * @param prog    the checked program (for extern-reachability of the link flags)
+ * @return        the full `cc` argument vector, ready for `teko::process::run`
+ */
+fn build_cc_argv(input: str, binary: str, m: Manifest, prog: checker::TProgram) -> []str {
     let rt = rt_dir()
     let asrt = assert_dir(rt)
-    let cc = if m.cc.len > 0 { m.cc } else { "cc" }   // C7.1f: [extern] cc override
+    let cc = if m.cc.len > 0 { m.cc } else { "cc" }
     let is_clang = cc_family_is_clang(cc, binary)
     mut argv: []str = teko::list::empty()
     argv = teko::list::push(argv, cc)
     argv = teko::list::push(argv, if is_clang { "-std=c23" } else { "-std=c2x" })
-    argv = teko::list::push(argv, "-w")   // silence warnings on generated C (machine output)
-    argv = teko::list::push(argv, if is_clang { "-ferror-limit=0" } else { "-fmax-errors=0" })   // show every genuine error (GCC's unlimited-errors analog on non-clang)
-    // (CLI --version) embed the project's RAW manifest version into teko_rt.c's tk_rt_version()
-    // (source of truth = this project's own `.tkp`). Mirrors driver.c::run_cc's -DTEKO_VERSION_STRING
-    // and CMake's TEKO_VERSION_STRING — RAW `version` + `-<suffix>` (no gen substitution). The value
-    // is a BARE token (teko_rt.c stringizes it) — embedded quotes broke Windows arg re-parsing.
+    argv = teko::list::push(argv, "-w")
+    argv = teko::list::push(argv, if is_clang { "-ferror-limit=0" } else { "-fmax-errors=0" })
     let verval = if m.suffix.len > 0 { teko::str::concat(teko::str::concat(m.version, "-"), m.suffix) } else { m.version }
     argv = teko::list::push(argv, teko::str::concat("-DTEKO_VERSION_STRING=", verval))
-    if m.target.len > 0 { argv = teko::list::push(teko::list::push(argv, "-target"), m.target) }   // C7.1f: cross target triple
-    if m.sysroot.len > 0 { argv = teko::list::push(teko::list::push(argv, "--sysroot"), m.sysroot) }   // C7.1f: cross sysroot
-    if m.freestanding { argv = teko::list::push(argv, "-nostdlib") }   // C7.1f: drop implicit libc
+    if m.target.len > 0 { argv = teko::list::push(teko::list::push(argv, "-target"), m.target) }
+    if m.sysroot.len > 0 { argv = teko::list::push(teko::list::push(argv, "--sysroot"), m.sysroot) }
+    if m.freestanding { argv = teko::list::push(argv, "-nostdlib") }
     argv = teko::list::push(argv, "-I")
     argv = teko::list::push(argv, rt)
     argv = teko::list::push(argv, "-I")
     argv = teko::list::push(argv, asrt)
-    argv = teko::list::push(argv, cfile)
+    argv = teko::list::push(argv, input)
     argv = teko::list::push(argv, teko::str::concat(rt, "/teko_rt.c"))
     argv = teko::list::push(argv, teko::str::concat(asrt, "/assert.c"))
-    if !m.freestanding { argv = teko::list::push(argv, "-lm") }   // libm (skipped under freestanding)
+    if !m.freestanding { argv = teko::list::push(argv, "-lm") }
     let reachable = reachable_libs(prog)
     argv = append_reachable_link_flags(argv, m, reachable)
     let tos = target_os(m)
     argv = append_reachable_os_lib_flags(argv, m, tos, reachable)
-    // C7.1k: on macOS, embed an Info.plist section so the Mach-O carries native version metadata
-    // (mdls / `Get Info` / `otool -s __TEXT __info_plist`). Best-effort — a plist write failure must
-    // not break the build. (Windows VERSIONINFO + a Linux ELF note are the staged follow-ons.)
-    if tos == "macos" {
-        let plist = teko::str::concat(binary, ".Info.plist")
-        match teko::io::write_file(plist, plist_xml(m)) {
-            null => { argv = teko::list::push(argv, teko::str::concat("-Wl,-sectcreate,__TEXT,__info_plist,", plist)) }
-            error => { }
-        }
-    }
+    argv = append_macos_plist_flag(argv, binary, m, tos)
     argv = teko::list::push(argv, "-o")
-    argv = teko::list::push(argv, binary)
-    teko::process::run(argv)
+    teko::list::push(argv, binary)
+}
+
+/**
+ * append_macos_plist_flag — on a macOS target, write the project's `Info.plist`
+ * beside `binary` and append the `-Wl,-sectcreate,__TEXT,__info_plist,<plist>`
+ * flag so the linked Mach-O carries native version metadata (C7.1k; visible to
+ * `mdls` / `otool -s __TEXT __info_plist`). Best-effort — a plist write failure
+ * leaves `argv` unchanged and never breaks the build. A no-op off macOS (the
+ * Windows VERSIONINFO + Linux ELF note are the staged follow-ons).
+ *
+ * @param argv    the link argument vector so far
+ * @param binary  the output executable path (the plist lands at `<binary>.Info.plist`)
+ * @param m       the manifest (project identity embedded in the plist)
+ * @param tos     the resolved target OS ("macos" enables the section)
+ * @return        `argv` with the sectcreate flag appended on macOS, else unchanged
+ */
+fn append_macos_plist_flag(argv: []str, binary: str, m: Manifest, tos: str) -> []str {
+    if tos != "macos" { return argv }
+    let plist = teko::str::concat(binary, ".Info.plist")
+    match teko::io::write_file(plist, plist_xml(m)) {
+        null => teko::list::push(argv, teko::str::concat("-Wl,-sectcreate,__TEXT,__info_plist,", plist))
+        error => argv
+    }
+}
+
+/**
+ * run_cc — compile the generated C `cfile` into the native `binary` via the host
+ * `cc` (the C-backend link path). A thin wrapper over `build_cc_argv` (which
+ * assembles the shared link line): pass the `.c` as the input and run it.
+ *
+ * @param cfile   the generated C translation unit
+ * @param binary  the output native executable path
+ * @param m       the resolved manifest
+ * @param prog    the checked program (extern-reachability)
+ * @return        the `cc` process exit code (0 on success)
+ */
+fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
+    teko::process::run(build_cc_argv(cfile, binary, m, prog))
+}
+
+/**
+ * link_object — link the own-backend Mach-O object `objfile` into the native
+ * `binary` via the host `cc`-as-linker (D-C, the #385 A4-5 keystone: `cc obj.o
+ * teko_rt.c assert.c -lm -o exe`). Reuses `build_cc_argv` verbatim — the ONLY
+ * difference from `run_cc` is a `.o` input in place of a `.c`, so the own object
+ * links against the same C-built `teko_rt`/`assert` runtime (resolving `_tk_exit`,
+ * `_tk_set_args`, `_tk_region_*`) and inherits the same `[extern.libs]` flags +
+ * macOS `__info_plist` parity for free. Toolchain independence (dropping `cc` for
+ * the own linker) is Phase E/#226; this bootstrap links through `cc`.
+ *
+ * @param objfile  the own-backend Mach-O `.o` (from `emit_macho` + `write_file_bytes`)
+ * @param binary   the output native executable path
+ * @param m        the resolved manifest
+ * @param prog     the checked program (extern-reachability)
+ * @return         the `cc` process exit code (0 on success)
+ */
+fn link_object(objfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
+    teko::process::run(build_cc_argv(objfile, binary, m, prog))
 }
 
 // (C7.1k) plist_xml — a minimal macOS Info.plist carrying the project's identity, embedded into the
@@ -459,9 +523,24 @@ fn plist_xml(m: Manifest) -> str {
                         teko::str::concat("  <key>CFBundleGetInfoString</key><string>", info, "</string>\n</dict>\n</plist>\n"))))))
 }
 
-// Lower → write .c → invoke cc → report. Returns 0 on success. `stem` is the output binary name
-// (the manifest `name`); artifacts go to `out_dir`/<stem>{.c,} (default "bin", or the `-o <dir>`
-// argument), created at the project root (cwd after the front-end chdir'd). Mirrors driver.c.
+/**
+ * backend — the artifact dispatch: lower the checked program to the native
+ * `binary` and report. `stem` is the output name (the manifest `name`); artifacts
+ * land under `out_dir` (default "bin", or `-o <dir>`), created at the project root
+ * (the cwd after the front-end chdir'd). Mirrors `driver.c`. The library kinds
+ * (static/shared) are honest stops (M.3); `package` emits a `.tkl`; the default
+ * `binary` kind emits C and links via `cc` — UNLESS the temporary
+ * `TEKO_BACKEND=native` seam (D-B, #385 A4-5) selects the own AOT backend
+ * (`emit_native`). The seam is OFF by default, so the default build stays
+ * byte-identical (FIXPOINT); D1/#390 replaces it with the real `--backend` flag.
+ *
+ * @param dir      the project directory (for diagnostics)
+ * @param stem     the output artifact name (the manifest `name`)
+ * @param out_dir  the build output directory (`-o`, default "bin")
+ * @param prog     the checked, typed program
+ * @param m        the resolved manifest
+ * @return         0 on a successful build, else the failing status
+ */
 fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
     // (C7.1m) artifact-kind dispatch. Binary → the native executable backend below. The library kinds
     // are HONEST STOPS until their increments land (M.3 — no fake artifact): static/shared = native
@@ -512,14 +591,16 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
         teko::io::println(teko::str::concat("teko: ", dir, teko::str::concat(": packaged ", tkl_path, "")))
         return 0
     }
+    if native_backend_selected() {
+        return emit_native(dir, stem, out_dir, prog, m)
+    }
     let emitted = match codegen::tk_emit_c(prog) { str as s => s; error as e => return fail(dir, e.message) }
     // C7.1k — append the build-metadata C so every binary carries its identity (what(1)/strings).
     let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(m.name, m.version, m.suffix, m.description))
-    // trim a trailing `/` from the output dir so `-o ./bin/build/` doesn't yield `./bin/build//teko`.
-    let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
-    match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }   // idempotent — error? null = success
-    let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))   // <out_dir>/<stem>.c
-    let binp = teko::str::concat(od, "/", stem)   // <out_dir>/<stem>
+    let od = strip_trailing_slash(out_dir)
+    match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
+    let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))
+    let binp = teko::str::concat(od, "/", stem)
     match teko::io::write_file(cfile, csrc) {
         error as e => return fail(dir, e.message)
         null => { }   // error? — null = success
@@ -531,6 +612,188 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
     // the .tsym is debug metadata for the E4 native stack-trace, not the artifact).
     match teko::io::write_file(teko::str::concat(binp, ".tsym"), codegen::tk_emit_tsym(prog)) { error => { }; null => { } }
     teko::io::println(teko::str::concat("teko: ", dir, teko::str::concat(": built ", binp, "")))
+    0
+}
+
+/**
+ * native_backend_selected — is the temporary own-AOT-backend seam active, i.e.
+ * `TEKO_BACKEND=native` in the environment (D-B, #385 A4-5)? OFF by default (any
+ * other value or an unset variable → false → the C backend), so the default build
+ * stays byte-identical and the FIXPOINT holds. D1/#390 supersedes this env read
+ * with the real `--backend={c,native}` manifest flag.
+ *
+ * @return true iff `TEKO_BACKEND` is exactly "native"
+ */
+fn native_backend_selected() -> bool {
+    match teko::env::var("TEKO_BACKEND") { str as v => v == "native"; error => false }
+}
+
+/**
+ * NativeTarget — which own-AOT-backend target the temporary `TEKO_TARGET` env
+ * seam selects (D-D, #386 B1-8): the default `Arm64Macho` (the A4 reference —
+ * arm64 machine code in a Mach-O object) or `X8664Linux` (x86-64 SysV machine
+ * code in an ELF object). Targets are named by OS, not by object format (ruling
+ * #390): the format (ELF/Mach-O) is a consequence of the OS, so `x86_64-linux`
+ * — not `x86_64-elf` (ELF spans many kernels the binary does not port between) —
+ * is canonical. The seam mirrors `TEKO_BACKEND` and is read only when the own
+ * backend is already active; D1/#390 supersedes it with the real `--target`
+ * manifest flag.
+ */
+type NativeTarget = enum { Arm64Macho; X8664Linux }
+
+/**
+ * target_from_name — map a raw `TEKO_TARGET` value to a `NativeTarget`:
+ * `x86_64-linux` (canonical, OS-based per ruling #390) selects the x86-64
+ * SysV/ELF pipeline; `x86_64-elf` is accepted as a deprecated format-named alias.
+ * Every other value — including `arm64-macos`, an empty string, or a typo —
+ * falls back to the default `Arm64Macho`, so an unrecognized target never
+ * silently mis-lowers.
+ *
+ * @param name  the raw `TEKO_TARGET` environment value
+ * @return      the selected own-backend target
+ */
+fn target_from_name(name: str) -> NativeTarget {
+    if name == "x86_64-linux" { return NativeTarget::X8664Linux }
+    if name == "x86_64-elf" { return NativeTarget::X8664Linux }
+    NativeTarget::Arm64Macho
+}
+
+/**
+ * native_target — which own-backend target the temporary `TEKO_TARGET` env seam
+ * selects (D-D, #386 B1-8), consulted by `emit_native` after `native_backend_selected`
+ * has already chosen the own backend. An unset/absent variable → the default
+ * `Arm64Macho`, so the default build stays byte-identical (FIXPOINT preserved) and
+ * the arm64 differential is untouched. D1/#390 supersedes this env read with the
+ * real `--target` manifest flag.
+ *
+ * @return the selected own-backend target
+ */
+fn native_target() -> NativeTarget {
+    match teko::env::var("TEKO_TARGET") { str as v => target_from_name(v); error => NativeTarget::Arm64Macho }
+}
+
+/**
+ * strip_trailing_slash — `dir` without a single trailing `/`, so a joined
+ * `<dir>/<stem>` never doubles the separator (`./bin/` → `./bin`). Returns `dir`
+ * unchanged when it is empty or has no trailing slash.
+ *
+ * @param dir  the directory path
+ * @return     `dir` with one trailing `/` removed, if present
+ */
+fn strip_trailing_slash(dir: str) -> str {
+    if dir.len > 0 && dir[dir.len - 1] == b'/' { return teko::str::slice_to(dir, dir.len - 1) }
+    dir
+}
+
+/**
+ * emit_native — the own-AOT-backend driver (the #385 A4-5 KEYSTONE, extended for
+ * x86-64 at #386 B1-8): lower the checked program to target-independent LIR, then
+ * dispatch on `native_target()` to the per-ISA tail — arm64 `MInst`/AAPCS64/Mach-O
+ * (the default, byte-unchanged A4 path) or x86-64 `MInstX86`/SysV/ELF (the B1 path,
+ * `TEKO_TARGET=x86_64-linux`). Each tail selects instructions, allocates registers,
+ * encodes machine bytes, wraps them in the target object format, writes the `.o`,
+ * and links it into a native executable against the C-built `teko_rt`/`assert`
+ * runtime via `cc`-as-linker (`link_object`, the D-C bootstrap). Any pipeline
+ * pass's NAMED honest-stop (`A4-fp`/`B1-fp`/`B1-args`/…) propagates out unchanged
+ * as a `fail`, so an unsupported program stops identically to any other backend
+ * diagnostic (M.3 — never a fabricated artifact) and the C-vs-own differential
+ * compares at the stop, not a fake value. Reached only through the
+ * `TEKO_BACKEND=native` seam (`native_backend_selected`); the default C path is
+ * untouched.
+ *
+ * @param dir      the project directory (for diagnostics)
+ * @param stem     the output artifact name (the manifest `name`)
+ * @param out_dir  the build output directory (`-o`, default "bin")
+ * @param prog     the checked, typed program
+ * @param m        the resolved manifest (link knobs)
+ * @return         0 on a successful build+link, else the failing status
+ */
+fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+    let od = strip_trailing_slash(out_dir)
+    match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
+    let lmod = match teko::lir::lower_program(prog) { teko::lir::LModule as x => x; error as e => return fail(dir, e.message) }
+    match native_target() {
+        NativeTarget::X8664Linux => emit_native_x86(dir, od, stem, lmod, prog, m)
+        NativeTarget::Arm64Macho => emit_native_arm64(dir, od, stem, lmod, prog, m)
+    }
+}
+
+/**
+ * emit_native_arm64 — the arm64/Mach-O own-backend tail (the A4 reference, #385):
+ * select arm64 `MInst` from the lowered module, allocate registers under AAPCS64,
+ * encode to arm64 machine words, wrap them in a Mach-O object, and hand the bytes
+ * to `finish_native_object` (write `.o` + `cc`-link + `.tsym` + success marker).
+ * This is the DEFAULT own-backend path, byte-for-byte unchanged from A4-5 (the
+ * same pipeline calls in the same order), so the arm64 differential and the
+ * default output's FIXPOINT are preserved.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_arm64(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+    let sel = match teko::backend::select_module(lmod) { teko::backend::MModule as x => x; error as e => return fail(dir, e.message) }
+    let col = match teko::backend::regalloc_module(teko::backend::aapcs64(), sel) { teko::backend::MModule as x => x; error as e => return fail(dir, e.message) }
+    let enc = match teko::backend::encode_module(teko::backend::aapcs64(), col) { teko::backend::EncodedModule as x => x; error as e => return fail(dir, e.message) }
+    finish_native_object(dir, od, stem, teko::backend::emit_macho(enc), prog, m)
+}
+
+/**
+ * emit_native_x86 — the x86-64/ELF own-backend tail (#386 B1): select x86-64
+ * `MInstX86` from the lowered module, allocate registers under the SysV AMD64
+ * register file (`sysv64`), encode to variable-length x86 machine bytes, wrap them
+ * in an `ET_REL` ELF64 object (`emit_elf`), and hand the bytes to
+ * `finish_native_object` (write `.o` + `cc`-link + `.tsym` + success marker).
+ * Reached only via `TEKO_TARGET=x86_64-linux`; the emitted `.o` is a linux x86-64
+ * object, so the executing C-vs-own differential runs on a linux-x86_64 host
+ * (`scripts/diff_c_own.sh`), while a macOS host still writes the `.o` for the
+ * byte / well-formedness cross-check even though `cc` cannot link an ELF there.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_x86(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+    let sel = match teko::backend::select_module_x86(lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let col = match teko::backend::regalloc_module_x86(teko::backend::sysv64(), sel) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let enc = match teko::backend::encode_module_x86(teko::backend::sysv64(), col) { teko::backend::EncodedModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    finish_native_object(dir, od, stem, teko::backend::emit_elf(enc), prog, m)
+}
+
+/**
+ * finish_native_object — the object-format-agnostic tail shared by both own-backend
+ * targets: write the encoded object bytes to `<od>/<stem>.o`, link it into
+ * `<od>/<stem>` via `cc`-as-linker (`link_object`) against the C-built runtime,
+ * write the `.tsym` symbol map beside the binary (best-effort — a write error never
+ * fails the build), and print the EXCLUSIVE `"(own backend)"` success marker the
+ * differential harness keys on (F1(a)). Factoring it here keeps the arm64 and x86
+ * tails identical past the encoder, so the two link paths never drift.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param obj   the encoded object-file bytes (Mach-O or ELF)
+ * @param prog  the checked program (`.tsym` emission)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful write+link, else the failing status
+ */
+fn finish_native_object(dir: str, od: str, stem: str, obj: []byte, prog: checker::TProgram, m: Manifest) -> i32 {
+    let objp = teko::str::concat(od, "/", teko::str::concat(stem, ".o"))
+    let binp = teko::str::concat(od, "/", stem)
+    match teko::io::write_file_bytes(objp, obj) { error as e => return fail(dir, e.message); null => { } }
+    if link_object(objp, binp, m, prog) != 0 {
+        return fail(dir, "cc failed to link the own-backend object")
+    }
+    match teko::io::write_file(teko::str::concat(binp, ".tsym"), codegen::tk_emit_tsym(prog)) { error => { }; null => { } }
+    teko::io::println(teko::str::concat("teko: ", dir, teko::str::concat(": built ", binp, " (own backend)")))
     0
 }
 
