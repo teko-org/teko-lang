@@ -773,6 +773,46 @@ fn rvenc_bigframe_honest_stop() {
 }
 
 /**
+ * rvenc_fpr_callee_func — a function whose only instruction defines fs0
+ * (`rvenc_pf(8)`, id 8 — callee-saved per `riscv64_lp64d`'s `fpr_allocatable`,
+ * `abi_riscv64.tks:60-64`): an `MLoadRiscv{dst=fs0}` (the frame-layout scan
+ * reads `inst_regs_riscv`'s def/use table directly, independent of the
+ * single-word encoder's own FPR rejection). The scan folds fs0 into
+ * `saved_fpr`, which ALONE forces `frame_total_size` to frame the function
+ * (`n_saved >= 1`), so `layout.size > 0` — past the `size == 0` frameless guard
+ * — reaching the LIVE `saved_fpr.len > 0` honest-stop in both
+ * `emit_prologue_riscv` and `emit_epilogue_riscv`.
+ *
+ * @return MFuncRiscv  the callee-saved-FPR fixture
+ */
+fn rvenc_fpr_callee_func() -> MFuncRiscv {
+    append_minst_riscv(new_mfunc_riscv("fprcallee"), 0 to u32, load_riscv(MMemSizeRiscv::D, false, rvenc_pf(8 to u32), rvenc_mem(2 to u32, 0 to i32)))
+}
+
+#test
+/**
+ * rvenc_fpr_callee_saved_honest_stop — a callee-saved FPR (fs0) in the scanned
+ * save-set is a LIVE reachable case (fs0-fs11/id 8,9,18-27 ARE callee-saved
+ * allocatable FPRs, `abi_riscv64.tks:53-63`), NOT an unreachable arm: the frame
+ * layout records `saved_fpr = [8]` with `size > 0`, and BOTH
+ * `emit_prologue_riscv` and `emit_epilogue_riscv` raise `B2-fp` (the F/D
+ * `fsd`/`fld` save/restore family is deferred to 0.3.1) rather than silently
+ * skipping the callee-saved FPR save.
+ *
+ * @return void
+ */
+fn rvenc_fpr_callee_saved_honest_stop() {
+    let layout = rvenc_layout(rvenc_fpr_callee_func())
+    teko::assert::is_true(layout.saved_fpr.len == (1 to u64))
+    teko::assert::is_true(layout.saved_fpr[0 to u64] == (8 to u32))
+    teko::assert::is_true(layout.size > (0 to u32))
+    let pro_stop = match emit_prologue_riscv(layout) { []u32 as w => "<ok>"; error as e => e.message }
+    let epi_stop = match emit_epilogue_riscv(layout) { []u32 as w => "<ok>"; error as e => e.message }
+    teko::assert::str_contains(pro_stop, "B2-fp")
+    teko::assert::str_contains(epi_stop, "B2-fp")
+}
+
+/**
  * rvenc_encode_func — encode `f` under the LP64D register file (label counter 0),
  * unwrapping the success case to its `EncodedFuncRiscv` and falling back to an
  * empty encoding on an unexpected honest-stop.
@@ -1259,4 +1299,68 @@ fn rvenc_emit_helpers_propagate_stops() {
     teko::assert::str_contains(rvenc_ret_seq_stop(), "B2-bigframe")
     teko::assert::str_contains(rvenc_frame_addr_push_stop(), "B2-bigframe")
     teko::assert::str_contains(rvenc_resolve_word_stop(), "B2-farbranch")
+}
+
+#test
+/**
+ * rvenc_encode_func_splices_frame_around_body — the headline B2-6 deliverable:
+ * a FRAMED function ending in `MRetRiscv` encodes to ONE concatenated stream —
+ * the prologue at the FRONT (5 words), the block body in the middle (`add
+ * s1,s1,a0` then the `call tk_thing` `auipc`+`jalr` pair), and the epilogue+
+ * `ret` at the END (4+1 words) — 13 words total, EVERY word assembler-
+ * cross-checked (the prologue/epilogue words match
+ * `rvenc_prologue_call_frame`/`rvenc_epilogue_call_frame`, the `add`/`auipc`/
+ * `jalr`/`ret` words match the `zig cc -mcpu=generic_rv64` oracle). The single
+ * `Call` reloc sits at its function-relative byte offset (24, past the
+ * prologue+`add`), targeting `tk_thing` — not swallowed by the piecewise
+ * prologue/epilogue-only checks.
+ *
+ * @return void
+ */
+fn rvenc_encode_func_splices_frame_around_body() {
+    let ef = rvenc_encode_func(rvenc_call_func())
+    teko::assert::is_true(ef.words.len == (13 to u64))
+    teko::assert::is_true(ef.words[0 to u64] == (0xFE010113 to u32))
+    teko::assert::is_true(ef.words[1 to u64] == (0x00113C23 to u32))
+    teko::assert::is_true(ef.words[2 to u64] == (0x00813823 to u32))
+    teko::assert::is_true(ef.words[3 to u64] == (0x02010413 to u32))
+    teko::assert::is_true(ef.words[4 to u64] == (0x00913423 to u32))
+    teko::assert::is_true(ef.words[5 to u64] == (0x00A484B3 to u32))
+    teko::assert::is_true(ef.words[6 to u64] == (0x00000097 to u32))
+    teko::assert::is_true(ef.words[7 to u64] == (0x000080E7 to u32))
+    teko::assert::is_true(ef.words[8 to u64] == (0x00813483 to u32))
+    teko::assert::is_true(ef.words[9 to u64] == (0x01013403 to u32))
+    teko::assert::is_true(ef.words[10 to u64] == (0x01813083 to u32))
+    teko::assert::is_true(ef.words[11 to u64] == (0x02010113 to u32))
+    teko::assert::is_true(ef.words[12 to u64] == (0x00008067 to u32))
+    teko::assert::is_true(ef.relocs.len == (1 to u64))
+    teko::assert::is_true(ef.relocs[0 to u64].offset == (24 to u32))
+    teko::assert::str_contains(ef.relocs[0 to u64].sym, "tk_thing")
+}
+
+#test
+/**
+ * rvenc_module_rebases_reloc_at_nonzero_base — a two-function module rebases the
+ * SECOND function's `Call` reloc offset by the FIRST function's `.text` byte
+ * length: the frameless `main` (`rvenc_call_only_func`, 3 words = 12 bytes)
+ * precedes the framed `caller` (`rvenc_call_func`, 13 words), so `caller`'s
+ * reloc (function-relative offset 24) lands at MODULE offset 12+24=36 — the
+ * nonzero-base rebase arithmetic `fold_func_into_text_riscv` performs, only
+ * exercised at base 0 by the single-function module tests.
+ *
+ * @return void
+ */
+fn rvenc_module_rebases_reloc_at_nonzero_base() {
+    let m0 = add_mfunc_riscv(empty_mmodule_riscv(), rvenc_call_only_func())
+    let m1 = add_mfunc_riscv(m0, rvenc_call_func())
+    let enc = match encode_module_riscv(riscv64_lp64d(), m1) {
+        EncodedModuleRiscv as x => x
+        error as e => EncodedModuleRiscv { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
+    }
+    teko::assert::is_true(enc.text.len == (64 to u64))
+    teko::assert::is_true(enc.relocs.len == (2 to u64))
+    teko::assert::is_true(enc.relocs[0 to u64].offset == (4 to u32))
+    teko::assert::str_contains(enc.relocs[0 to u64].sym, "tk_exit")
+    teko::assert::is_true(enc.relocs[1 to u64].offset == (36 to u32))
+    teko::assert::str_contains(enc.relocs[1 to u64].sym, "tk_thing")
 }
