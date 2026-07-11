@@ -61,8 +61,15 @@ ref x: Ref<Ref<T>>  → Ref<Ref<Ref<T>>>  (***T)
 
 Cada `Ref<>` além do primeiro vai no tipo. Aninhamento profundo é raro e **verboso, sem açúcar** — é o preço a pagar.
 
-### `ref x: []T`
-`ref x: []T` = `Ref<[]T>` = **alias do array inteiro** (uma indireção sobre o array todo). ≠ `[]Ref<T>` (array de aliases). `fn fill(ref buf: []int) { buf[0] = 9 }` faz write-through no array do caller. O modificador aplica no nível externo (o array); `[]` é parte do tipo apontado.
+### `ref x: []T` — tipo subjacente `Ref<[]T>`, mas inicializa com o VALOR
+O **tipo subjacente** é `Ref<[]T>` (**alias do array inteiro**, uma indireção sobre o array todo; ≠ `[]Ref<T>`, array de aliases). Mas você **NÃO** inicializa com um `Ref<[]T>` — inicializa com o **próprio valor** (o desugar encapsula, §4.1):
+
+```
+ref x: []T = [t1, t2]           // inicializa com o VALOR; o desugar ENCAPSULA num Ref (= R5)
+ref x: []T = marshall(algumptr) // inicializar a partir de um ptr cru precisa de Marshall (explícito)
+```
+
+`fn fill(ref buf: []int) { buf[0] = 9 }` faz write-through no array do caller. O modificador aplica no nível externo (o array); `[]` é parte do tipo apontado.
 
 ---
 
@@ -81,11 +88,22 @@ f<U>(x) // U livre → 0 descasca, passa o Ref inteiro
 
 Consequências: (a) acesso a chained-refs é transparente **pro valor** e ao mesmo tempo o nível do meio é **endereçável via tipo**, sem sigilo; (b) contra um `U` genérico livre não há descasca-surpresa (é por isso que genéricos são sãos); (c) é o mecanismo de refs+overload do C++ / conversão implícita encadeada. Custo: acopla o deref à resolução de tipos no checker.
 
+### 4.1 O desugar é BIDIRECIONAL (dono 2026-07-11)
+A transparência não é só descascar — é uma fronteira de **mão dupla** entre **valor** e **Ref**, implícita nos dois sentidos; e a fronteira **`ptr` ↔ `Ref`** é sempre explícita via **Marshall**.
+
+| | valor ↔ Ref — **desugar IMPLÍCITO** | ptr ↔ Ref — **Marshall EXPLÍCITO** |
+|---|---|---|
+| **Encapsular** (valor → Ref, no init/attach) | `ref x: T = <valor>` → embrulha o valor num Ref (= R5, copia na arena) | `ref x: T = marshall(p)` |
+| **Descascar** (Ref → valor, no uso) | usar `ref x` em contexto de valor → auto-deref dirigido por tipo (§4) | `marshall(x)` → o ptr cru |
+
+Ou seja: você **inicializa/atribui** um `ref` com um **valor** (o desugar encapsula) e o **usa** como valor (o desugar descasca) — em nenhum dos dois você escreve `Ref<>` nem sigilo. Só o cruzamento com o **`ptr` cru** exige o Marshall explícito (é a fronteira `unsafe`). A direção *encapsular* é a que faltava: o `= Ref<[]T>` do rascunho anterior estava errado — o RHS é o **valor**, não um `Ref`.
+
 ---
 
 ## 5. Marshall & a fronteira `Ref`/`Ptr`
 
-- **Marshall** é a fronteira explícita: obter o **ponteiro cru** (FFI, `Ptr<T>`) **e** a **cópia-de-valor automática** quando um `Ref` flui pra `let` (§6). Um conceito só pra cruzar a fronteira da referência. *(Spelling TBD — ver casos abertos.)*
+- **Marshall** é a fronteira explícita do **`ptr` cru** (FFI, `Ptr<T>`), nos **dois sentidos**: `marshall(p)` embrulha um ptr num `ref`; `marshall(x)` extrai o ptr de um `ref`. É o único cruzamento `unsafe`. *(Spelling TBD — ver casos abertos.)*
+- **Correção (dono 2026-07-11):** Marshall **NÃO** cobre o `valor ↔ Ref` — esse é o **desugar implícito** (§4.1, encapsular/descascar). A cópia `Ref→let` (R8) é a direção *descascar* do desugar, **não** Marshall.
 - **`Ptr<T>` é UNSAFE-only.** `Ptr → Ref` pode **panicar** (tipo incompatível, estouro de memória; checado). Até FFI, se não for `unsafe`, usa **`Ref`**. Relação: `Ref` = seguro/transparente/default; `Ptr` = cru/explícito/`unsafe`, via Marshall.
 
 ---
@@ -99,7 +117,7 @@ Consequências: (a) acesso a chained-refs é transparente **pro valor** e ao mes
 - **R5. Copy-on-attach.** Anexar um valor **não-Ref** a um destino `Ref<>` materializa uma **cópia** na arena do destino. Ponteiro nunca acontece implícito.
 - **R6. Retorno materializa na arena do caller.** Retornar um valor local como `ref T` copia-o pra arena do caller (R5) → seguro.
 - **R7. Borrow-down aliasa.** Passar uma variável `mut` viva a um param `ref` aliasa o storage do caller (write-through muta o do caller). Seguro porque o storage do caller sobrevive à chamada. *(Restringido por A2/A5.)*
-- **R8. Ref→let = Marshall-copia.** `let y = someRef` copia o valor; `y` é `T` (cópia). O `let` é firewall de imutabilidade + de escape.
+- **R8. Ref→let = desugar-descasca-copia** (§4.1, direção *descascar* — NÃO Marshall). `let y = someRef` copia o valor; `y` é `T` (cópia). O `let` é firewall de imutabilidade + de escape.
 - **R9. "Referenciável" é opt-in.** `mut x: T` é mutável mas não referenciável-pra-cima; um `Ref` construído sobre ele (fora do borrow-down R7) é **sobre cópia** (R5). Ponteiro genuíno que escapa exige `ref`/`Ref<>` explícito → controle manual.
 - **R10. Encapsulamento.** `a.field = v` num `let a` **panica** — escrita direta externa de campo exige binding `mut`, mesmo com campo mutável. O objeto muta os próprios campos via seus métodos.
 - **R11. Sem GC; arenas lexicais.** Um `Ref` é válido só enquanto viva a arena que segura seu alvo.
