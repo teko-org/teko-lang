@@ -66,7 +66,7 @@ objfile_macho}.tks`, `src/build/project.tks`, `scripts/{diff_c_own,check_elf,che
   the `compute_frame_layout_x86` shadow reservation + the `B3-xmm-callee-saved` stop; B1's x86 frame
   goldens stay byte-identical since SysV `shadow_space=0`) → `B3-3` `objfile_coff` writer (the big new
   piece: `IMAGE_FILE_HEADER` + section headers + the 18-byte symbol table + string table + relocations;
-  assembler-verified via `clang -target x86_64-windows-msvc -c` + `llvm-readobj --coff-*`) → `B3-4`
+  assembler-verified via `clang -target x86_64-windows-msvc -c` + `llvm-readobj --sections/--symbols/--relocations`) → `B3-4`
   target dispatch (`NativeTarget::X8664Windows`, `TEKO_TARGET=x86_64-windows`) + `emit_native_win` +
   the Windows C-vs-own differential lane + `check_coff.sh` (**#388 CLOSES here**).
 - **Differential placement — WINDOWS RUNS PE NATIVELY (no qemu), macOS byte-tests.** The executing
@@ -74,7 +74,7 @@ objfile_macho}.tks`, `src/build/project.tks`, `scripts/{diff_c_own,check_elf,che
   directly — the key advantage over B2's qemu-riscv case), wired onto the existing `windows-selfhost`
   lane (`sanitizers.yml`, already self-builds gen-1 on Windows and is already BLOCKING in the sanitizer
   gate). Locally on macOS-arm64: COFF goldens (byte-vectors, assembler-cross-checked with
-  `clang -target x86_64-windows-msvc -c` → a real COFF `.obj`) run machine-free; `llvm-readobj --coff-*`
+  `clang -target x86_64-windows-msvc -c` → a real COFF `.obj`) run machine-free; `llvm-readobj --sections/--symbols/--relocations`
   round-trips the emitted object cross-format; execution honest-skips (macOS cannot run PE). Cross-link
   proof via `lld-link` / `clang -target x86_64-windows`.
 - **No genuine HALT.** Both flagged tensions resolve law-first with clear winners (§8 D-B/D-C). The
@@ -614,7 +614,7 @@ Baked A4-4/B1-7-class findings (as COFF requirements):
  * `TEKO_TARGET=x86_64-windows`; the emitted object is a Win64 COFF, so the executing
  * C-vs-own differential runs on the windows-x86_64 runner (which runs PE NATIVELY —
  * no emulator, unlike B2's qemu), while a macOS host still writes the object for the
- * byte / `llvm-readobj --coff-*` cross-check even though it cannot LINK or RUN a PE.
+ * byte / `llvm-readobj --sections/--symbols/--relocations` cross-check even though it cannot LINK or RUN a PE.
  * The isel/regalloc/encoder are the B1 x86 code UNCHANGED — only `win64()` + `emit_coff`
  * differ (§1.1).
  *
@@ -646,7 +646,7 @@ native Windows binaries in `release.yml`).
 > **Cross-host honesty.** On the macOS-arm64 dev host, selecting `x86_64-windows` PRODUCES a valid COFF
 > object but the host toolchain cannot LINK a PE nor RUN it — so the link honest-skips. `emit_native_win`
 > still writes the `.o` before the link attempt, so the object is always available for the
-> `llvm-readobj --coff-*` byte cross-check (§6.2). Only the windows-x86_64 runner EXECUTES the lane.
+> `llvm-readobj --sections/--symbols/--relocations` byte cross-check (§6.2). Only the windows-x86_64 runner EXECUTES the lane.
 
 ### 6.2 The differential — WINDOWS runs PE natively, macOS byte-tests
 
@@ -662,11 +662,13 @@ linked by host clang/lld-link), run BOTH natively, assert identical exit code + 
 undefined-symbol error, the same target-independent gap B1/B2 inherit).
 
 `scripts/check_coff.sh` (new, the COFF sibling of `check_elf.sh`/`check_macho.sh`): `llvm-readobj
---file-headers --coff-sections --coff-symbols --coff-relocations` asserts
-`IMAGE_FILE_MACHINE_AMD64` + a `.text` section + a defined text symbol + a `REL32` reloc;
-`llvm-objdump -d` disassembles `.text`; a `lld-link`/`clang -target x86_64-windows` dry link (or `-c`
-consumability) confirms the object is linker-acceptable. `llvm-readobj`/`llvm-objdump` are cross-format,
-so the script runs on macOS too (execution honest-skips; the byte-goldens are the machine-free proof).
+--file-headers --sections --symbols --relocations` (the format-generic flags — `--coff-sections`/
+`--coff-symbols`/`--coff-relocations` do NOT exist in llvm-readobj ≥ 18; the generic flags are stable
+across versions and already cross-format on a COFF object) asserts `IMAGE_FILE_MACHINE_AMD64` + a
+`.text` section + a defined text symbol + a `REL32` reloc; `llvm-objdump -d` disassembles `.text`; a
+`lld-link`/`clang -target x86_64-windows` dry link (or `-c` consumability) confirms the object is
+linker-acceptable. `llvm-readobj`/`llvm-objdump` are cross-format, so the script runs on macOS too
+(execution honest-skips; the byte-goldens are the machine-free proof).
 
 **CI wiring.** The `windows-selfhost` lane (`sanitizers.yml:239`) already provisions the seed +
 self-builds gen-1 on Windows and is already BLOCKING in the sanitizer `gate` job (`:267`). B3-4 adds
@@ -681,7 +683,7 @@ placement, and the FIRST executing own==C differential that runs the artifact NA
 | encoder golden byte-vectors (already B1's — reused, shared ISA) | — (B1 owns) | ✓ unit gate |
 | `emit_coff` header/section/symtab/reloc golden bytes (`clang -target x86_64-windows-msvc -c` oracle) | ✓ | ✓ (clang cross-targets; machine-free) |
 | Win64 frame goldens (`sub rsp,32` shadow) + B1 SysV frame goldens byte-identical | ✓ | ✓ |
-| `.obj` well-formedness (`llvm-readobj --coff-*` / `llvm-objdump` / `lld-link`) | ✓ | ✓ (llvm tools cross-format) |
+| `.obj` well-formedness (`llvm-readobj --sections/--symbols/--relocations` / `llvm-objdump` / `lld-link`) | ✓ | ✓ (llvm tools cross-format) |
 | **executing `C-native == own-native` differential** | ✓ (runs the PE natively) | honest-skip (cannot run PE) |
 | arm64 Mach-O + x86-64 ELF + riscv64 ELF differentials | unchanged | unchanged |
 
@@ -800,7 +802,7 @@ the COFF `.o` via host `clang -target x86_64-windows` (which drives `lld-link`) 
   (`Type=0x0004` REL32, correct `SymbolTableIndex`); a >8-byte name (`tk_region_alloc`) → the
   `[0,0,0,0]`+offset union + a string-table entry (the size-prefix + inline-≤8 mechanism); the
   `.rdata` STATIC section symbol when rodata present. **Each vector re-derived against
-  `clang -target x86_64-windows-msvc -c` + `llvm-readobj --coff-*`** (the table is spec, the assembler
+  `clang -target x86_64-windows-msvc -c` + `llvm-readobj --sections/--symbols/--relocations`** (the table is spec, the assembler
   is oracle — the A4/B1/B2 discipline).
 - **Win64 frame** (B3-2, `encode_x86_64_test.tkt` extension): a `main` calling `tk_exit(42)` under
   `win64()` → `compute_frame_layout_x86(win64(), f).size == 32`, framed prologue `55` (`push rbp`) +
@@ -863,7 +865,7 @@ object format (COFF), so it hardens the shared pipeline against ABI/format coupl
 - After **B3-2** (Win64 frame): full CI gate + the Win64 frame goldens (`sub rsp,32` shadow) green +
   **every B1 SysV frame golden byte-identical** (the field-addition guardrail).
 - After **B3-3** (COFF writer): full CI gate + the `emit_coff` header/section/symtab/reloc goldens
-  green + `llvm-readobj --coff-*` / `lld-link` consumability on the emitted object (any host,
+  green + `llvm-readobj --sections/--symbols/--relocations` / `lld-link` consumability on the emitted object (any host,
   machine-free).
 - The **KEYSTONE full CI ritual at B3-4**: the whole gate — both engines + fixpoint + the **windows-x86_64
   C-vs-own leg green** (executing the PE NATIVELY on the runner) + the macOS byte-test lane green + all
@@ -915,7 +917,7 @@ B2 (done, #387) ─▶ B3-1 ─────▶ B3-2 ──────▶ B3-3 �
   symbol table (the name union) + `build_coff_strtab` (size-prefix + inline-≤8) + `IMAGE_RELOCATION`
   (`coff_reloc_type` re-mapping the reused `RelocKindX86`), baking the §5.5 findings; the
   `B3-globals`/`B3-rodata-addend`/`B3-sectaux`/`B3-relocovfl` stops. **Proven by:** header/section/symtab/
-  strtab/reloc goldens (assembler-cross-checked) + `llvm-readobj --coff-*` / `lld-link` well-formedness
+  strtab/reloc goldens (assembler-cross-checked) + `llvm-readobj --sections/--symbols/--relocations` / `lld-link` well-formedness
   (machine-free, any host). No e2e.
 - **B3-4 · target dispatch + Windows differential (KEYSTONE)** — `NativeTarget::X8664Windows` +
   `target_from_name` + `emit_native_win` (§6.1), `scripts/check_coff.sh`, the `diff_c_own.sh`

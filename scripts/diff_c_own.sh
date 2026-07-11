@@ -120,14 +120,18 @@ elif [[ ( "$host_os" == MINGW* || "$host_os" == MSYS* || "$host_os" == CYGWIN* )
     # The windows-x86_64 lane (issue #388 B3-4). A Git-Bash/MSYS/Cygwin host on the
     # GitHub windows-x86_64 runner: own emits an IMAGE_FILE_MACHINE_AMD64 PE/COFF
     # object (the SAME x86 ISA as the linux lane, under the win64 register file +
-    # emit_coff), linked by the host cc (clang → lld-link) into a `.exe` and RUN
-    # NATIVELY — the PE executes directly, no emulator (the key advantage over the
-    # cross riscv lane's qemu). RUN_WRAP stays empty (native execution); the MSYS
-    # exec layer auto-appends `.exe`, so the bare `$cout/$name` / `$oout/$name`
-    # invocations run the produced executable. check_coff.sh cross-checks the object
-    # with the LLVM tools the runner ships.
+    # emit_coff), linked NATIVELY (host == target, TEKO_CC=cc — overriding
+    # default_cc_for_target's x86_64-w64-mingw32-gcc, which is the CROSS-cc for a
+    # non-Windows dev host; "cc" is the SAME literal command the pre-existing
+    # windows-x86_64 build-test job already resolves to a working clang link) into a
+    # `.exe` and RUN NATIVELY — the PE executes directly, no emulator (the key
+    # advantage over the cross riscv lane's qemu). RUN_WRAP stays empty (native
+    # execution); the MSYS exec layer auto-appends `.exe`, so the bare
+    # `$cout/$name` / `$oout/$name` invocations run the produced executable.
+    # check_coff.sh cross-checks the object with the LLVM tools the runner ships.
     FLAVOR="windows-x86_64 PE/COFF"
     OWN_TARGET_ENV="TEKO_TARGET=x86_64-windows"
+    TEKO_CC_ENV="TEKO_CC=cc"
     OBJ_CHECK="$script_dir/scripts/check_coff.sh"
     OBJ_CHECK_NAME="check_coff"
 else
