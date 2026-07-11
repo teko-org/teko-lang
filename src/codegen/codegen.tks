@@ -8486,14 +8486,32 @@ fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte 
     b
 }
 
-/** emit_test_call — one test invocation in the native gate: `print("test <label> ... ")`, then the
-    mangled test symbol call, then `println("ok")`. The label is `namespace::name` (or bare `name`),
-    matching run_tests_cov's label exactly. Under `cov` the body's lines/branches are attributed to
-    this test via `tk_cov_enter(idx)`/`tk_cov_leave` (the same brackets the VM runner uses). (#265) */
+/**
+ * Emits one native-gate test invocation, mirroring the VM's `run_tests_cov` per-test body exactly:
+ * `print("test <label> ... ")`, the mangled test symbol call, then `println("ok")`. The label is
+ * `namespace::name` (or bare `name`), matching `run_tests_cov`'s label. Under `cov` the body's
+ * lines/branches are attributed to this test via `tk_cov_enter(idx)`/`tk_cov_leave` (the same
+ * brackets the VM runner uses).
+ *
+ * (#469) Each invocation is wrapped in a `tk_arena_push()` / `tk_arena_pop()` checkpoint — the port
+ * of the #109 test-gate memory bound to native. The push precedes the print and the pop follows the
+ * `println("ok")`, so the whole per-test span (label prints, the test's transient allocations) is
+ * bulk-freed after each test instead of accumulating in the never-dropped root region across the
+ * ~1500-test run. The coverage sinks (`tk_cov_*`) are libc-heap, so the marks recorded inside the
+ * span survive the pop — the cov brackets nest strictly inside the arena brackets, exactly as the
+ * VM runner orders them (arena_push … cov_enter … body … cov_leave … arena_pop).
+ *
+ * @param buf  the output byte buffer to append the emitted C to
+ * @param f    the `#test` function being invoked (its namespace + name form the label and symbol)
+ * @param idx  the `prog.items` coverage id passed to `tk_cov_enter` under `cov`
+ * @param cov  whether `CgMode::TestCov` is active (emit the `tk_cov_enter`/`tk_cov_leave` brackets)
+ * @return     the buffer with this test's invocation appended
+ */
 fn emit_test_call(buf: []byte, f: checker::TFunction, idx: u64, cov: bool) -> []byte {
     let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
     let head = teko::str::concat("test ", label, " ... ")
-    mut b = cb(buf, "    tk_print((tk_str){ (const tk_byte *)\"")
+    mut b = cb(buf, "    tk_arena_push();\n")
+    b = cb(b, "    tk_print((tk_str){ (const tk_byte *)\"")
     b = cb_cstr_escaped(b, head)
     b = cb(b, "\", ")
     b = cb_u128_digits(b, head.len to u128)
@@ -8503,6 +8521,7 @@ fn emit_test_call(buf: []byte, f: checker::TFunction, idx: u64, cov: bool) -> []
     b = cb(b, "();\n")
     if cov { b = cb(b, "    tk_cov_leave();\n") }
     b = cb(b, "    tk_println((tk_str){ (const tk_byte *)\"ok\", 2 });\n")
+    b = cb(b, "    tk_arena_pop();\n")
     b
 }
 
