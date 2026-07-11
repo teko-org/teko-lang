@@ -153,13 +153,142 @@ fn wvt_get(t: WasmVTypeTable, id: u32) -> u8 {
 }
 
 /**
+ * WasmScope — one open structured-control scope during CFGStackify
+ * placement: its kind (`block`/`loop`/`if`) and, for a `block`/`loop`, the
+ * LIR block whose boundary the scope's label targets (a `br` to that block
+ * resolves to this scope's relative depth). The pass keeps a stack of
+ * these; `br` depth is the distance from the branch site down to the
+ * matching scope (`backend-c1-wasm.md` §3.5).
+ *
+ * @since #389 C1-3
+ */
+pub type WasmScope = struct {
+    /**
+     * kind — `wasm_scope_kind_block()` (label at its `end`, a forward
+     * exit), `wasm_scope_kind_loop()` (label at its start, a back-edge/
+     * continue), or `wasm_scope_kind_if()` (a structural diamond, never a
+     * `br` target — it only occupies a depth slot).
+     */
+    kind: u8
+    /**
+     * label_block — the LIR block id this scope's label targets
+     * (meaningful for `block`/`loop`; unused, always `0`, for `if`).
+     */
+    label_block: u32
+}
+
+/**
+ * wasm_scope_kind_block — the `WasmScope.kind` tag for an `if`-free forward
+ * label scope (a wrapped loop exit, or a `br` skip-ahead target).
+ *
+ * @return u8  the `block` scope-kind tag
+ */
+fn wasm_scope_kind_block() -> u8 {
+    0 to u8
+}
+
+/**
+ * wasm_scope_kind_loop — the `WasmScope.kind` tag for a loop scope (a `br`
+ * to it is the back-edge/continue).
+ *
+ * @return u8  the `loop` scope-kind tag
+ */
+fn wasm_scope_kind_loop() -> u8 {
+    1 to u8
+}
+
+/**
+ * wasm_scope_kind_if — the `WasmScope.kind` tag for an `if`/`else`
+ * structural diamond: it occupies a depth slot but is never a `br` target
+ * (its own fallthrough IS the merge).
+ *
+ * @return u8  the `if` scope-kind tag
+ */
+fn wasm_scope_kind_if() -> u8 {
+    2 to u8
+}
+
+/**
+ * wasm_scope_stack_push — open a new scope on top of `scopes`.
+ *
+ * @param []WasmScope scopes  the scope stack to extend
+ * @param u8 kind  the new scope's kind (`wasm_scope_kind_*`)
+ * @param u32 label_block  the new scope's label target (unused for `if`)
+ * @return []WasmScope  the extended stack, the new scope innermost
+ */
+fn wasm_scope_stack_push(scopes: []WasmScope, kind: u8, label_block: u32) -> []WasmScope {
+    teko::list::push(scopes, WasmScope { kind = kind; label_block = label_block })
+}
+
+/**
+ * wasm_scope_stack_pop — close the innermost open scope of `scopes`.
+ *
+ * @param []WasmScope scopes  the scope stack to shrink
+ * @return []WasmScope  `scopes` with its last entry removed (unchanged if
+ *                       already empty)
+ */
+fn wasm_scope_stack_pop(scopes: []WasmScope) -> []WasmScope {
+    let keep = if scopes.len == 0 { 0 to u64 } else { scopes.len - 1 }
+    mut out: []WasmScope = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= keep { break }
+        out = teko::list::push(out, scopes[i])
+        i++
+    }
+    out
+}
+
+/**
+ * ScopeDepthResult — the outcome of searching the scope stack for a
+ * `block`/`loop` labelled by a specific LIR block id.
+ */
+type ScopeDepthResult = struct {
+    /**
+     * found — whether a matching `block`/`loop` scope is currently open.
+     */
+    found: bool
+    /**
+     * depth — its relative `br` depth (innermost open scope = `0`);
+     * meaningless when `found` is `false`.
+     */
+    depth: u32
+}
+
+/**
+ * wasm_scope_stack_depth_of — search `scopes` for an open `block`/`loop`
+ * labelled `label_block`, and its relative `br` depth (§3.3's "the distance
+ * from the branch site down to the matching scope" — the innermost open
+ * scope is depth `0`; an `if` scope on the stack still consumes one depth
+ * slot even though it can never itself be the match).
+ *
+ * @param []WasmScope scopes  the currently open scope stack
+ * @param u32 label_block  the LIR block id a `br` is targeting
+ * @return ScopeDepthResult  whether it is open, and at what depth
+ */
+fn wasm_scope_stack_depth_of(scopes: []WasmScope, label_block: u32) -> ScopeDepthResult {
+    mut i: u64 = 0
+    loop {
+        if i >= scopes.len { break }
+        let s = scopes[i]
+        let is_label = s.kind == wasm_scope_kind_block() || s.kind == wasm_scope_kind_loop()
+        if is_label && s.label_block == label_block {
+            return ScopeDepthResult { found = true; depth = ((scopes.len - 1) - i) to u32 }
+        }
+        i++
+    }
+    ScopeDepthResult { found = false; depth = 0 to u32 }
+}
+
+/**
  * StackifyCtx — the stackifier's threaded state while lowering one
- * straight-line instruction stream: the already-emitted code-entry body
- * bytes and the `WasmVTypeTable` recording every VReg lowered so far.
- * Mirrors `isel_arm64.tks`'s `SelCtx`, but with no register file / block
- * bookkeeping — wasm's only per-value state is its valtype (locals are
- * allocated 1:1 with VReg ids, so there is no scratch/frame table to
- * thread).
+ * function's whole instruction stream: the already-emitted code-entry body
+ * bytes, the `WasmVTypeTable` recording every VReg lowered so far, the
+ * CFGStackify scope stack currently open (`WasmScope`, §3), and the next
+ * free scratch-local id (`next_scratch`, §4.3's parallel-copy staging).
+ * Mirrors `isel_arm64.tks`'s `SelCtx`, but with no register file — wasm's
+ * per-value state is its valtype plus (during control-flow lowering) the
+ * structured-control scope stack a `br`'s label depth resolves against.
  */
 type StackifyCtx = struct {
     /**
@@ -168,9 +297,25 @@ type StackifyCtx = struct {
      */
     body: []byte
     /**
-     * vtypes — the per-VReg wasm valtype side-table recorded so far.
+     * vtypes — the per-VReg wasm valtype side-table recorded so far
+     * (indexed by VReg id for every real LIR value, and by scratch id —
+     * `next_scratch` and up — for every parallel-copy staging temp).
      */
     vtypes: WasmVTypeTable
+    /**
+     * scopes — the CFGStackify structured-control scope stack currently
+     * open, outermost first (§3.3): a `block`/`loop` entry's `label_block`
+     * is the LIR block id a `br` reaching it resolves to; an `if` entry
+     * only occupies a depth slot (never a `br` target).
+     */
+    scopes: []WasmScope
+    /**
+     * next_scratch — the next unused local id available for parallel-copy
+     * staging (§4.3): seeded from the function's `next_vreg` (one past
+     * every real LIR VReg) and incremented per allocation, so a scratch
+     * local never collides with a VReg-backed one.
+     */
+    next_scratch: u32
 }
 
 /**
@@ -182,7 +327,7 @@ type StackifyCtx = struct {
  * @return StackifyCtx  the advanced context
  */
 fn sc_byte(ctx: StackifyCtx, b: byte) -> StackifyCtx {
-    StackifyCtx { body = teko::list::push(ctx.body, b); vtypes = ctx.vtypes }
+    StackifyCtx { body = teko::list::push(ctx.body, b); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch }
 }
 
 /**
@@ -194,7 +339,7 @@ fn sc_byte(ctx: StackifyCtx, b: byte) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_uleb(ctx: StackifyCtx, v: u64) -> StackifyCtx {
-    StackifyCtx { body = emit_uleb128(ctx.body, v); vtypes = ctx.vtypes }
+    StackifyCtx { body = emit_uleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch }
 }
 
 /**
@@ -206,7 +351,7 @@ fn sc_uleb(ctx: StackifyCtx, v: u64) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_sleb(ctx: StackifyCtx, v: i64) -> StackifyCtx {
-    StackifyCtx { body = emit_sleb128(ctx.body, v); vtypes = ctx.vtypes }
+    StackifyCtx { body = emit_sleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch }
 }
 
 /**
@@ -221,7 +366,7 @@ fn sc_sleb(ctx: StackifyCtx, v: i64) -> StackifyCtx {
 fn sc_f64_bits(ctx: StackifyCtx, bits: u64) -> StackifyCtx {
     let lo = (bits & (0xFFFFFFFF to u64)) to u32
     let hi = (bits >> (32 to u64)) to u32
-    StackifyCtx { body = emit_u32_le(emit_u32_le(ctx.body, lo), hi); vtypes = ctx.vtypes }
+    StackifyCtx { body = emit_u32_le(emit_u32_le(ctx.body, lo), hi); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch }
 }
 
 /**
@@ -260,7 +405,7 @@ fn sc_local_set(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_set_vtype(ctx: StackifyCtx, vreg: u32, vt: u8) -> StackifyCtx {
-    StackifyCtx { body = ctx.body; vtypes = wvt_set(ctx.vtypes, vreg, vt) }
+    StackifyCtx { body = ctx.body; vtypes = wvt_set(ctx.vtypes, vreg, vt); scopes = ctx.scopes; next_scratch = ctx.next_scratch }
 }
 
 /**
@@ -276,6 +421,246 @@ fn sc_set_vtype(ctx: StackifyCtx, vreg: u32, vt: u8) -> StackifyCtx {
  */
 fn sc_memarg(ctx: StackifyCtx, align: u32, offset: u32) -> StackifyCtx {
     sc_uleb(sc_uleb(ctx, align to u64), offset to u64)
+}
+
+/**
+ * wasm_blocktype_void — the `0x40` blocktype byte every `block`/`loop`/`if`
+ * in the MVP carries: `[] -> []` (no operand-stack value crosses a scope
+ * boundary — block-args cross edges as local copies instead, §4.3), so no
+ * construct ever needs a value-type or type-index blocktype.
+ *
+ * @return byte  the void blocktype byte
+ */
+fn wasm_blocktype_void() -> byte {
+    0x40 to byte
+}
+
+/**
+ * sc_open_block — emit a `block` opcode (`0x02`) + void blocktype, and open
+ * a matching `WasmScope` labelled `label_block` on the context's scope
+ * stack (a forward exit target: a `br` reaching it jumps to its `end`).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 label_block  the LIR block id this scope's label targets
+ * @return StackifyCtx  the advanced, scope-extended context
+ */
+fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
+    let opened = sc_byte(sc_byte(ctx, 0x02 to byte), wasm_blocktype_void())
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_block(), label_block); next_scratch = opened.next_scratch }
+}
+
+/**
+ * sc_open_loop — emit a `loop` opcode (`0x03`) + void blocktype, and open a
+ * matching `WasmScope` labelled `label_block` (a back-edge target: a `br`
+ * reaching it jumps to its OWN start, i.e. `continue`).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 label_block  the loop header's own LIR block id
+ * @return StackifyCtx  the advanced, scope-extended context
+ */
+fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
+    let opened = sc_byte(sc_byte(ctx, 0x03 to byte), wasm_blocktype_void())
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_loop(), label_block); next_scratch = opened.next_scratch }
+}
+
+/**
+ * sc_open_if — emit an `if` opcode (`0x04`) + void blocktype, and open a
+ * matching (unlabelled) `WasmScope` — it only occupies a depth slot; its
+ * own natural fallthrough past `else`/`end` IS the merge, so it is never a
+ * `br` target.
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @return StackifyCtx  the advanced, scope-extended context
+ */
+fn sc_open_if(ctx: StackifyCtx) -> StackifyCtx {
+    let opened = sc_byte(sc_byte(ctx, 0x04 to byte), wasm_blocktype_void())
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_if(), 0 to u32); next_scratch = opened.next_scratch }
+}
+
+/**
+ * sc_close_scope — emit the closing `end` (`0x0B`) for the innermost open
+ * scope, and pop it off the context's scope stack (shared by `block`/
+ * `loop`/`if` — they all close the same way).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @return StackifyCtx  the advanced, scope-shrunk context
+ */
+fn sc_close_scope(ctx: StackifyCtx) -> StackifyCtx {
+    let closed = sc_byte(ctx, 0x0B to byte)
+    StackifyCtx { body = closed.body; vtypes = closed.vtypes; scopes = wasm_scope_stack_pop(closed.scopes); next_scratch = closed.next_scratch }
+}
+
+/**
+ * sc_br — emit an unconditional `br` (`0x0C`) to the scope `depth` levels
+ * out (§3.3's label-depth arithmetic).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 depth  the relative scope depth to branch to
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_br(ctx: StackifyCtx, depth: u32) -> StackifyCtx {
+    sc_uleb(sc_byte(ctx, 0x0C to byte), depth to u64)
+}
+
+/**
+ * ScratchAlloc — a freshly reserved parallel-copy staging local (§4.3): its
+ * id and the context advanced past the reservation (its valtype already
+ * recorded).
+ */
+type ScratchAlloc = struct {
+    /**
+     * ctx — the context with the scratch id's valtype recorded and
+     * `next_scratch` advanced past it.
+     */
+    ctx: StackifyCtx
+    /**
+     * id — the freshly reserved scratch local id.
+     */
+    id: u32
+}
+
+/**
+ * sc_alloc_scratch — reserve one fresh scratch local of valtype `vt`: a
+ * local id no real LIR VReg ever uses (`next_scratch` starts at the
+ * function's own `next_vreg` and only grows), used to stage a value through
+ * a parallel-copy edge without ever aliasing a real destination (§4.3).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param u8 vt  the scratch local's wasm valtype
+ * @return ScratchAlloc  the reserved id + the advanced context
+ */
+fn sc_alloc_scratch(ctx0: StackifyCtx, vt: u8) -> ScratchAlloc {
+    let id = ctx0.next_scratch
+    let ctx1 = StackifyCtx { body = ctx0.body; vtypes = wvt_set(ctx0.vtypes, id, vt); scopes = ctx0.scopes; next_scratch = id + 1 }
+    ScratchAlloc { ctx = ctx1; id = id }
+}
+
+/**
+ * emit_single_copy — the one-param edge-copy fast path: `local.get $arg;
+ * local.set $param` (no interference is possible with a single pair, so no
+ * staging is needed).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param u32 param  the destination block-param VReg
+ * @param u32 arg  the source VReg
+ * @return StackifyCtx  the advanced context
+ */
+fn emit_single_copy(ctx0: StackifyCtx, param: u32, arg: u32) -> StackifyCtx {
+    let vt = wvt_get(ctx0.vtypes, arg)
+    let moved = sc_local_set(sc_local_get(ctx0, arg), param)
+    sc_set_vtype(moved, param, vt)
+}
+
+/**
+ * StagedSources — the phase-1 outcome of a multi-param edge copy: the
+ * context advanced past every source materialization, plus the ordered
+ * list of fresh scratch ids each source now lives in.
+ */
+type StagedSources = struct {
+    /**
+     * ctx — the context after every source has been copied into its own
+     * scratch local.
+     */
+    ctx: StackifyCtx
+    /**
+     * scratches — each source's scratch local id, parallel to the original
+     * `args` list.
+     */
+    scratches: []u32
+}
+
+/**
+ * stage_sources — phase 1 of a parallel-copy-safe multi-param edge copy:
+ * materialize every source VReg into its OWN fresh scratch local, in order
+ * (`sc_alloc_scratch`), before any destination param is written — this is
+ * what makes the SECOND phase (`commit_scratches`) safe even when a
+ * destination param aliases a LATER source (the classic swap hazard a
+ * loop-carried multi-scalar back-edge can produce, `promote_env`,
+ * `lower.tks`).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param []u32 args  the source VRegs, in target-param order
+ * @return StagedSources  the advanced context + the parallel scratch ids
+ */
+fn stage_sources(ctx0: StackifyCtx, args: []u32) -> StagedSources {
+    mut ctx = ctx0
+    mut scratches: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        let vt = wvt_get(ctx.vtypes, args[i])
+        let got = sc_local_get(ctx, args[i])
+        let alloc = sc_alloc_scratch(got, vt)
+        ctx = sc_local_set(alloc.ctx, alloc.id)
+        scratches = teko::list::push(scratches, alloc.id)
+        i++
+    }
+    StagedSources { ctx = ctx; scratches = scratches }
+}
+
+/**
+ * commit_scratches — phase 2 of a parallel-copy-safe multi-param edge copy:
+ * copy each staged scratch (`stage_sources`) into its real destination
+ * param, in order. Every source was ALREADY captured in phase 1, so this
+ * phase can freely overwrite a param that some OTHER source also happened
+ * to alias, without losing its old value.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param []u32 params  the destination block-param VRegs
+ * @param []u32 scratches  each param's staged scratch id (`stage_sources`)
+ * @return StackifyCtx  the advanced context
+ */
+fn commit_scratches(ctx0: StackifyCtx, params: []u32, scratches: []u32) -> StackifyCtx {
+    mut ctx = ctx0
+    mut i: u64 = 0
+    loop {
+        if i >= params.len { break }
+        let vt = wvt_get(ctx.vtypes, scratches[i])
+        let moved = sc_local_set(sc_local_get(ctx, scratches[i]), params[i])
+        ctx = sc_set_vtype(moved, params[i], vt)
+        i++
+    }
+    ctx
+}
+
+/**
+ * emit_staged_copies — the multi-param (`>= 2`) edge-copy path: stage every
+ * source into its own scratch (`stage_sources`), then commit every scratch
+ * into its real destination (`commit_scratches`) — the always-correct
+ * "materialize everything, then assign everything" parallel-copy
+ * sequentialization (§4.3), sidestepping any need to detect interference
+ * cycles.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param []u32 params  the destination block-param VRegs
+ * @param []u32 args  the source VRegs, parallel to `params`
+ * @return StackifyCtx  the advanced context
+ */
+fn emit_staged_copies(ctx0: StackifyCtx, params: []u32, args: []u32) -> StackifyCtx {
+    let staged = stage_sources(ctx0, args)
+    commit_scratches(staged.ctx, params, staged.scratches)
+}
+
+/**
+ * emit_edge_copies — cross one `LJump`/`LBranch` edge's block-args into its
+ * target's params (§4.3): a plain single copy for the (current, always
+ * `<= 1` in a merge's own SSA-lite phi, but a loop's PROMOTED env can carry
+ * several, `promote_env`) common single-param case, or the parallel-copy-
+ * safe staged form once two or more params are involved.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param []u32 params  the target block's params
+ * @param []u32 args  the edge's own argument VRegs, parallel to `params`
+ * @return StackifyCtx | error  the advanced context, or a NAMED internal
+ *                              error when the two lists' arity disagrees
+ */
+fn emit_edge_copies(ctx0: StackifyCtx, params: []u32, args: []u32) -> StackifyCtx | error {
+    if params.len != args.len {
+        return error { message = "stackify: block-arg/param arity mismatch (internal)" }
+    }
+    if params.len == 0 { return ctx0 }
+    if params.len == 1 { return emit_single_copy(ctx0, params[0], args[0]) }
+    emit_staged_copies(ctx0, params, args)
 }
 
 /**
@@ -928,15 +1313,21 @@ fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, 
 }
 
 /**
- * stackify_inst — the per-`LOp` dispatch: a total match over the closed
- * 16-case `LOp` alphabet (`backend-c1-wasm.md` §1). The straight-line subset
- * (`LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`/`LFieldAddr`/
- * `LLoad`/`LStore`/`LCall`) lowers to real wasm bytes; every other case is a
- * NAMED honest-stop naming the slice that owns it — `LJump`/`LBranch`
- * (structured control flow, C1-3), `LAlloca`/`LGlobalAddr` (the
- * shadow-stack/rodata linear-memory layout, C1-4), `LCallIndirect`/
- * `LFuncAddr` (the funcref table, C1-4/C1-5) — so a function that needs them
- * stops honestly rather than being silently mis-lowered.
+ * stackify_inst — the per-`LOp` dispatch for the STRAIGHT-LINE subset: a
+ * total match over the closed 16-case `LOp` alphabet (`backend-c1-wasm.md`
+ * §1). `LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`/`LFieldAddr`/
+ * `LLoad`/`LStore`/`LCall` lower to real wasm bytes here; `LAlloca`/
+ * `LGlobalAddr` (the shadow-stack/rodata linear-memory layout, C1-4) and
+ * `LCallIndirect`/`LFuncAddr` (the funcref table, C1-4/C1-5) are NAMED
+ * honest-stops naming the slice that owns them. `LRet`/`LJump`/`LBranch`
+ * are terminators — CFGStackify (`stackify_control`) dispatches them
+ * itself (`render_terminator`/`render_jump_terminator`/`render_branch_
+ * terminator`, §3), reading the CFG/scope context this per-instruction
+ * dispatcher does not carry, so reaching any of them here is an internal
+ * misuse (a caller handing a terminator to the straight-line lowerer
+ * instead of splicing it via `render_straight` — `stackify_func`/
+ * `stackify_control` never do; `stackify_insts` is only ever called on
+ * `all_but_last` a block's own instructions).
  *
  * @param StackifyCtx ctx  the context to extend
  * @param LFunc f  the enclosing function (`LParam` needs its `param_types`)
@@ -952,9 +1343,9 @@ fn stackify_inst(ctx: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, inst
         lir::LBin as b => stackify_bin(ctx, inst, b)
         lir::LUn as u => stackify_un(ctx, inst, u)
         lir::LParam as p => stackify_param(ctx, f, inst, p)
-        lir::LRet as r => stackify_ret(ctx, r)
-        lir::LJump => error { message = "stackify: C1-3-required — a jump between blocks needs the structured-control CFGStackify pass (block/loop/br), not yet implemented (C1-3)" }
-        lir::LBranch => error { message = "stackify: C1-3-required — a conditional branch needs the structured-control CFGStackify pass (if/else/br_if), not yet implemented (C1-3)" }
+        lir::LRet => error { message = "stackify: a return terminator must be rendered by stackify_control's terminator dispatch (render_terminator), not the per-instruction stackify_inst — internal misuse" }
+        lir::LJump => error { message = "stackify: a jump terminator must be rendered by stackify_control's terminator dispatch (render_jump_terminator), not the per-instruction stackify_inst — internal misuse" }
+        lir::LBranch => error { message = "stackify: a branch terminator must be rendered by stackify_control's terminator dispatch (render_branch_terminator), not the per-instruction stackify_inst — internal misuse" }
         lir::LAlloca => error { message = "stackify: C1-alloca — a stack allocation needs the shadow-stack SP global + linear-memory layout, not yet implemented (C1-4)" }
         lir::LFieldAddr as fa => stackify_field_addr(ctx, inst, fa)
         lir::LLoad as l => stackify_load(ctx, inst, l)
@@ -987,6 +1378,1280 @@ fn stackify_insts(ctx0: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, in
         i++
     }
     ctx
+}
+
+/* ==========================================================================
+ * C1-3 — CFGStackify: small list/table utilities the CFG analysis shares.
+ * ========================================================================== */
+
+/**
+ * u32_list_has — whether `xs` contains `x`.
+ *
+ * @param []u32 xs  the list to search
+ * @param u32 x  the value to find
+ * @return bool  true iff `x` is present
+ */
+fn u32_list_has(xs: []u32, x: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == x { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * u32_list_add_unique — `xs` with `x` appended, unless it is already present
+ * (the distinct-successor/distinct-exit-target accumulator).
+ *
+ * @param []u32 xs  the list to extend
+ * @param u32 x  the value to add
+ * @return []u32  `xs`, plus `x` if it was not already there
+ */
+fn u32_list_add_unique(xs: []u32, x: u32) -> []u32 {
+    if u32_list_has(xs, x) { return xs }
+    teko::list::push(xs, x)
+}
+
+/**
+ * u32_list_reverse — `xs` reversed (a post-order DFS sequence becomes RPO).
+ *
+ * @param []u32 xs  the list to reverse
+ * @return []u32  the reversed list
+ */
+fn u32_list_reverse(xs: []u32) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = xs.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        out = teko::list::push(out, xs[i])
+    }
+    out
+}
+
+/**
+ * u32_pos — the 0-based position of `id` in `order`, or `order.len` if
+ * absent (a defensive default: an absent target sorts last, never a
+ * spurious back-edge).
+ *
+ * @param []u32 order  the RPO block-id order
+ * @param u32 id  the block id to rank
+ * @return u32  its position, or `order.len`
+ */
+fn u32_pos(order: []u32, id: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= order.len { break }
+        if order[i] == id { return i to u32 }
+        i++
+    }
+    order.len to u32
+}
+
+/**
+ * u32_table_get — the value at position `id` of a dense `[]u32` table, or
+ * `0` when `id` is out of range (a defensive default; every real caller
+ * only ever indexes a block id the table was sized for).
+ *
+ * @param []u32 t  the positional table
+ * @param u32 id  the position to read
+ * @return u32  the stored value, or `0`
+ */
+fn u32_table_get(t: []u32, id: u32) -> u32 {
+    let i = id to u64
+    if i >= t.len { return 0 to u32 }
+    t[i]
+}
+
+/**
+ * u32_table_set — a copy of `t` with position `id` replaced by `v`
+ * (positions past the end are left unchanged; mirrors `minst.tks`'s
+ * `mreg_list_set` rebuild idiom).
+ *
+ * @param []u32 t  the positional table to update
+ * @param u32 id  the position to replace
+ * @param u32 v  the replacement value
+ * @return []u32  the updated table
+ */
+fn u32_table_set(t: []u32, id: u32, v: u32) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= t.len { break }
+        out = teko::list::push(out, if (i to u32) == id { v } else { t[i] })
+        i++
+    }
+    out
+}
+
+/**
+ * u32_unset — the sentinel `[]u32`-table value meaning "not yet computed"
+ * (an idom entry before its first pass, or an RPO position for a block that
+ * is not reachable) — larger than any real position/id a small function
+ * can have.
+ *
+ * @return u32  the sentinel value
+ */
+fn u32_unset() -> u32 {
+    4294967295 to u32
+}
+
+/* ==========================================================================
+ * C1-3 — CFG analysis: successors, RPO, dominators, natural loops.
+ * ========================================================================== */
+
+/**
+ * TermTargets — the successor block ids one `LInst` terminator names:
+ * `LRet` names none, `LJump` names one, `LBranch` names two (`t_target`
+ * then `f_target`); every other `LOp` (a non-terminator, mid-block
+ * instruction) also names none.
+ */
+type TermTargets = struct {
+    /**
+     * has_a — whether a first successor is present.
+     */
+    has_a: bool
+    /**
+     * a — the first successor block id (`LJump.target` or
+     * `LBranch.t_target`); meaningless when `has_a` is false.
+     */
+    a: u32
+    /**
+     * has_b — whether a second successor is present (`LBranch` only).
+     */
+    has_b: bool
+    /**
+     * b — the second successor block id (`LBranch.f_target`); meaningless
+     * when `has_b` is false.
+     */
+    b: u32
+}
+
+/**
+ * term_targets_of — the successor block ids named by one instruction's op,
+ * if it is a terminator (`LJump`/`LBranch`); none for every other case
+ * (`LRet` included — a return has no CFG successor).
+ *
+ * @param LOp op  the instruction's op
+ * @return TermTargets  its named successors, if any
+ */
+fn term_targets_of(op: lir::LOp) -> TermTargets {
+    match op {
+        lir::LJump as j => TermTargets { has_a = true; a = j.target; has_b = false; b = 0 to u32 }
+        lir::LBranch as br => TermTargets { has_a = true; a = br.t_target; has_b = true; b = br.f_target }
+        _ => TermTargets { has_a = false; a = 0 to u32; has_b = false; b = 0 to u32 }
+    }
+}
+
+/**
+ * blocks_by_id — `f`'s blocks reindexed so position `id` holds the block
+ * whose own id is `id` (a positional table every later CFG-analysis
+ * function reads in O(1); built via a safe per-id search rather than
+ * blindly trusting `alloc_block`'s own "ids are dense and sequential"
+ * contract, mirroring this file's own `stackify_param` "do NOT blind-trust"
+ * discipline, §3.2).
+ *
+ * @param LFunc f  the function whose blocks to reindex
+ * @return []LBlock  the positionally-indexed blocks
+ */
+fn blocks_by_id(f: lir::LFunc) -> []lir::LBlock {
+    mut out: []lir::LBlock = teko::list::empty()
+    mut id: u32 = 0 to u32
+    loop {
+        if (id to u64) >= f.blocks.len { break }
+        out = teko::list::push(out, lir_block_search(f, id))
+        id++
+    }
+    out
+}
+
+/**
+ * lir_block_search — a linear search for `f`'s block whose id is `id` (the
+ * safe fallback `blocks_by_id` builds its positional table from); defaults
+ * to `f.blocks[0]` when absent (defensive only — every id this file queries
+ * names a real block).
+ *
+ * @param LFunc f  the function to search
+ * @param u32 id  the block id to find
+ * @return LBlock  the matching block, or `f.blocks[0]`
+ */
+fn lir_block_search(f: lir::LFunc, id: u32) -> lir::LBlock {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id == id { return f.blocks[i] }
+        i++
+    }
+    f.blocks[0]
+}
+
+/**
+ * successors_table — every block's `TermTargets`, positionally indexed by
+ * block id (`blocks[i]` is block id `i`, `blocks_by_id`'s contract).
+ *
+ * @param []LBlock blocks  the positionally-indexed blocks
+ * @return []TermTargets  each block's terminator targets, same order
+ */
+fn successors_table(blocks: []lir::LBlock) -> []TermTargets {
+    mut out: []TermTargets = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= blocks.len { break }
+        let insts = blocks[i].insts
+        let tt = if insts.len == 0 { TermTargets { has_a = false; a = 0 to u32; has_b = false; b = 0 to u32 } } else { term_targets_of(insts[insts.len - 1].op) }
+        out = teko::list::push(out, tt)
+        i++
+    }
+    out
+}
+
+/**
+ * successors_of — the distinct CFG successor block ids of block `id`
+ * (`t_target`/`f_target` collapse to one entry when they name the same
+ * block).
+ *
+ * @param []TermTargets succs  the module's successors table
+ * @param u32 id  the block whose successors to read
+ * @return []u32  its distinct successor block ids
+ */
+fn successors_of(succs: []TermTargets, id: u32) -> []u32 {
+    let tt = succs[id to u64]
+    mut out: []u32 = teko::list::empty()
+    if tt.has_a { out = u32_list_add_unique(out, tt.a) }
+    if tt.has_b { out = u32_list_add_unique(out, tt.b) }
+    out
+}
+
+/**
+ * LirRpoState — the post-order DFS fold state (mirrors `regalloc.tks`'s
+ * own `RpoState`, recomputed here locally so C1 never depends on #443's
+ * register-target RPO — D-W3, `backend-c1-wasm.md` §11).
+ */
+type LirRpoState = struct {
+    /**
+     * visited — the block ids the DFS has already entered.
+     */
+    visited: []u32
+    /**
+     * post — the post-order sequence so far (reversed to RPO by the
+     * driver).
+     */
+    post: []u32
+}
+
+/**
+ * lir_rpo_visit — the post-order DFS step: enter `id` (once), recurse into
+ * every successor in order, then append `id` to the post-order.
+ *
+ * @param []TermTargets succs  the module's successors table
+ * @param u32 id  the block id to visit
+ * @param LirRpoState st  the visited set + post-order so far
+ * @return LirRpoState  the updated visited set + post-order
+ */
+fn lir_rpo_visit(succs: []TermTargets, id: u32, st: LirRpoState) -> LirRpoState {
+    if u32_list_has(st.visited, id) { return st }
+    let ss = successors_of(succs, id)
+    mut cur = LirRpoState { visited = teko::list::push(st.visited, id); post = st.post }
+    mut i: u64 = 0
+    loop {
+        if i >= ss.len { break }
+        cur = lir_rpo_visit(succs, ss[i], cur)
+        i++
+    }
+    LirRpoState { visited = cur.visited; post = teko::list::push(cur.post, id) }
+}
+
+/**
+ * lir_rpo_order — the reverse-post-order block-id sequence reachable from
+ * `entry` (an unreachable block — dead code no valid Teko source emits
+ * reachable-only-by-construction, but a `match`'s defensive fallback CAN
+ * leave one, `regalloc.tks`'s own `reachable_blocks` precedent — is simply
+ * never rendered, since nothing ever branches to it).
+ *
+ * @param []TermTargets succs  the module's successors table
+ * @param u32 entry  the function's entry block id
+ * @return []u32  the RPO block-id order, entry first
+ */
+fn lir_rpo_order(succs: []TermTargets, entry: u32) -> []u32 {
+    let st = lir_rpo_visit(succs, entry, LirRpoState { visited = teko::list::empty(); post = teko::list::empty() })
+    u32_list_reverse(st.post)
+}
+
+/**
+ * PredEntry — one block's predecessor list (a `preds_table`'s positional
+ * entry, indexed by block id).
+ */
+type PredEntry = struct {
+    /**
+     * preds — the distinct block ids with an edge into this block.
+     */
+    preds: []u32
+}
+
+/**
+ * preds_table_empty — a predecessor table sized for `n` blocks, every entry
+ * starting empty.
+ *
+ * @param u64 n  the block count to size for
+ * @return []PredEntry  the empty-per-entry table
+ */
+fn preds_table_empty(n: u64) -> []PredEntry {
+    mut out: []PredEntry = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = teko::list::push(out, PredEntry { preds = teko::list::empty() })
+        i++
+    }
+    out
+}
+
+/**
+ * preds_table_add — a copy of `t` with `source` appended to `target`'s
+ * predecessor list (mirrors `minst.tks`'s per-index rebuild idiom).
+ *
+ * @param []PredEntry t  the predecessor table to update
+ * @param u32 target  the block whose predecessor list gains `source`
+ * @param u32 source  the predecessor block id to add
+ * @return []PredEntry  the updated table
+ */
+fn preds_table_add(t: []PredEntry, target: u32, source: u32) -> []PredEntry {
+    mut out: []PredEntry = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= t.len { break }
+        let e = t[i]
+        out = teko::list::push(out, if (i to u32) == target { PredEntry { preds = teko::list::push(e.preds, source) } } else { e })
+        i++
+    }
+    out
+}
+
+/**
+ * preds_table_of — the predecessor table built from every reachable
+ * block's own successor edges (an edge `b -> s`, for every `s` of every
+ * `b` in `order`, adds `b` to `s`'s predecessor list).
+ *
+ * @param []TermTargets succs  the module's successors table
+ * @param []u32 order  the RPO-reachable block-id order
+ * @return []PredEntry  the predecessor table, sized to `succs.len`
+ */
+fn preds_table_of(succs: []TermTargets, order: []u32) -> []PredEntry {
+    mut t = preds_table_empty(succs.len)
+    mut i: u64 = 0
+    loop {
+        if i >= order.len { break }
+        let bid = order[i]
+        let ss = successors_of(succs, bid)
+        mut j: u64 = 0
+        loop {
+            if j >= ss.len { break }
+            t = preds_table_add(t, ss[j], bid)
+            j++
+        }
+        i++
+    }
+    t
+}
+
+/**
+ * preds_of — the predecessor block ids recorded for `id`.
+ *
+ * @param []PredEntry t  the predecessor table
+ * @param u32 id  the block whose predecessors to read
+ * @return []u32  its predecessor block ids
+ */
+fn preds_of(t: []PredEntry, id: u32) -> []u32 {
+    t[id to u64].preds
+}
+
+/**
+ * rpo_pos_table — a positional `[]u32` giving each block id's own RPO
+ * position (`u32_unset()` for a block absent from `order`, i.e.
+ * unreachable) — the fast O(1) lookup `compute_idom`'s intersect loop reads
+ * instead of repeatedly re-scanning `order` (`u32_pos`).
+ *
+ * @param u64 n  the block count to size for
+ * @param []u32 order  the RPO block-id order
+ * @return []u32  each block id's RPO position, or the sentinel
+ */
+fn rpo_pos_table(n: u64, order: []u32) -> []u32 {
+    mut t: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        t = teko::list::push(t, u32_unset())
+        i++
+    }
+    mut j: u64 = 0
+    loop {
+        if j >= order.len { break }
+        t = u32_table_set(t, order[j], j to u32)
+        j++
+    }
+    t
+}
+
+/**
+ * idom_table_init — the immediate-dominator table's seed: `entry` dominates
+ * itself, every other block starts unset (`compute_idom`'s fixpoint fills
+ * them in).
+ *
+ * @param u64 n  the block count to size for
+ * @param u32 entry  the function's entry block id
+ * @return []u32  the seeded idom table
+ */
+fn idom_table_init(n: u64, entry: u32) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = teko::list::push(out, if (i to u32) == entry { entry } else { u32_unset() })
+        i++
+    }
+    out
+}
+
+/**
+ * FoundPred — the outcome of scanning a predecessor list for one already
+ * processed by `compute_idom`'s current pass.
+ */
+type FoundPred = struct {
+    /**
+     * found — whether such a predecessor exists.
+     */
+    found: bool
+    /**
+     * pred — the first one found; meaningless when `found` is `false`.
+     */
+    pred: u32
+}
+
+/**
+ * first_processed_pred — the first of `ps` whose `idom` entry is already
+ * set (the Cooper-Harvey-Kennedy fixpoint's seed for a block's own
+ * intersect chain — a reducible CFG processed in RPO order always has at
+ * least one forward predecessor already processed by the time its own
+ * successor is visited in the SAME left-to-right pass).
+ *
+ * @param []u32 ps  the block's predecessor ids
+ * @param []u32 idom  the idom table so far this pass
+ * @return FoundPred  the first already-processed predecessor, if any
+ */
+fn first_processed_pred(ps: []u32, idom: []u32) -> FoundPred {
+    mut i: u64 = 0
+    loop {
+        if i >= ps.len { break }
+        if u32_table_get(idom, ps[i]) != u32_unset() { return FoundPred { found = true; pred = ps[i] } }
+        i++
+    }
+    FoundPred { found = false; pred = 0 to u32 }
+}
+
+/**
+ * idom_intersect — the Cooper-Harvey-Kennedy "intersect" step: walk both
+ * fingers up their own idom chains (toward `entry`, i.e. toward smaller RPO
+ * position) until they meet, using `pos` to decide which finger is
+ * currently behind.
+ *
+ * @param []u32 idom  the idom table so far
+ * @param []u32 pos  each block id's RPO position (`rpo_pos_table`)
+ * @param u32 a0  the first finger's starting block id
+ * @param u32 b0  the second finger's starting block id
+ * @return u32  the block id both fingers converge to (their common
+ *              dominator)
+ */
+fn idom_intersect(idom: []u32, pos: []u32, a0: u32, b0: u32) -> u32 {
+    mut a = a0
+    mut b = b0
+    loop {
+        if a == b { return a }
+        loop {
+            if u32_table_get(pos, a) <= u32_table_get(pos, b) { break }
+            a = u32_table_get(idom, a)
+        }
+        loop {
+            if u32_table_get(pos, b) <= u32_table_get(pos, a) { break }
+            b = u32_table_get(idom, b)
+        }
+    }
+}
+
+/**
+ * idom_pass — one Cooper-Harvey-Kennedy fixpoint sweep over `order` (skips
+ * `entry`): for each block with at least one already-processed predecessor
+ * this sweep, recompute its immediate dominator as the intersection of
+ * every already-processed predecessor.
+ *
+ * @param []u32 order  the RPO block-id order
+ * @param []PredEntry preds  the predecessor table
+ * @param []u32 pos  each block id's RPO position
+ * @param []u32 idom0  the idom table before this sweep
+ * @param u32 entry  the function's entry block id
+ * @return IdomPassResult  the (possibly) updated idom table, and whether
+ *                         any entry changed this sweep
+ */
+type IdomPassResult = struct {
+    /**
+     * idom — the idom table after this sweep.
+     */
+    idom: []u32
+    /**
+     * changed — whether any entry changed during this sweep.
+     */
+    changed: bool
+}
+
+fn idom_pass(order: []u32, preds: []PredEntry, pos: []u32, idom0: []u32, entry: u32) -> IdomPassResult {
+    mut idom = idom0
+    mut changed = false
+    mut oi: u64 = 0
+    loop {
+        if oi >= order.len { break }
+        let b = order[oi]
+        if b != entry {
+            let ps = preds_of(preds, b)
+            let seed = first_processed_pred(ps, idom)
+            if seed.found {
+                mut new_idom = seed.pred
+                mut pi: u64 = 0
+                loop {
+                    if pi >= ps.len { break }
+                    let p = ps[pi]
+                    if p != seed.pred && u32_table_get(idom, p) != u32_unset() {
+                        new_idom = idom_intersect(idom, pos, p, new_idom)
+                    }
+                    pi++
+                }
+                if u32_table_get(idom, b) != new_idom {
+                    idom = u32_table_set(idom, b, new_idom)
+                    changed = true
+                }
+            }
+        }
+        oi++
+    }
+    IdomPassResult { idom = idom; changed = changed }
+}
+
+/**
+ * compute_idom — the immediate-dominator table for every RPO-reachable
+ * block: the Cooper-Harvey-Kennedy fixpoint (`idom_pass`), swept until no
+ * entry changes.
+ *
+ * @param []u32 order  the RPO block-id order
+ * @param []PredEntry preds  the predecessor table
+ * @param u64 n  the block count to size the table for
+ * @param u32 entry  the function's entry block id
+ * @return []u32  the converged idom table
+ */
+fn compute_idom(order: []u32, preds: []PredEntry, n: u64, entry: u32) -> []u32 {
+    let pos = rpo_pos_table(n, order)
+    mut idom = idom_table_init(n, entry)
+    loop {
+        let pass = idom_pass(order, preds, pos, idom, entry)
+        idom = pass.idom
+        if !pass.changed { break }
+    }
+    idom
+}
+
+/**
+ * CfgInfo — one function's whole reducible-CFG analysis, threaded
+ * read-only through every CFGStackify placement function: the RPO order,
+ * the successors table, the predecessor table, the immediate-dominator
+ * table, and the entry block id.
+ *
+ * @since #389 C1-3
+ */
+type CfgInfo = struct {
+    /**
+     * order — the RPO block-id order, entry first.
+     */
+    order: []u32
+    /**
+     * succs — every block's terminator targets, positionally by id.
+     */
+    succs: []TermTargets
+    /**
+     * preds — every block's predecessor list, positionally by id.
+     */
+    preds: []PredEntry
+    /**
+     * idom — every reachable block's immediate dominator, positionally by
+     * id.
+     */
+    idom: []u32
+    /**
+     * entry — the function's entry block id.
+     */
+    entry: u32
+}
+
+/**
+ * build_cfg_info — compute a function's whole `CfgInfo` from its
+ * positionally-indexed blocks: successors, RPO, predecessors, then
+ * dominators.
+ *
+ * @param []LBlock blocks  the positionally-indexed blocks (`blocks_by_id`)
+ * @param u32 entry  the function's entry block id
+ * @return CfgInfo  the computed analysis
+ */
+fn build_cfg_info(blocks: []lir::LBlock, entry: u32) -> CfgInfo {
+    let succs = successors_table(blocks)
+    let order = lir_rpo_order(succs, entry)
+    let preds = preds_table_of(succs, order)
+    let idom = compute_idom(order, preds, blocks.len, entry)
+    CfgInfo { order = order; succs = succs; preds = preds; idom = idom; entry = entry }
+}
+
+/**
+ * dominates — whether block `a` dominates block `b` (every path from
+ * `entry` to `b` passes through `a`), read by walking `b`'s own idom chain.
+ *
+ * @param CfgInfo cfg  the function's CFG analysis
+ * @param u32 a  the candidate dominator
+ * @param u32 b  the block to test
+ * @return bool  whether `a` dominates `b`
+ */
+fn dominates(cfg: CfgInfo, a: u32, b: u32) -> bool {
+    mut x = b
+    loop {
+        if x == a { return true }
+        if x == cfg.entry { return false }
+        x = u32_table_get(cfg.idom, x)
+    }
+}
+
+/**
+ * is_cfg_irreducible — the belt-and-suspenders reducibility guard (§3.4):
+ * true iff some retreating edge (`pos(target) <= pos(source)` in RPO) has
+ * a target that does NOT dominate its source — the Hecht-Ullman
+ * characterization of an irreducible (multi-entry) cycle. Grounded
+ * unreachable from structured Teko source (§3.1): the frontend's ONLY
+ * cyclic construct (`loop`) always emits a single-header natural loop.
+ *
+ * @param CfgInfo cfg  the function's CFG analysis
+ * @return bool  whether an irreducible cycle was found
+ */
+fn is_cfg_irreducible(cfg: CfgInfo) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= cfg.order.len { break }
+        let b = cfg.order[i]
+        let ss = successors_of(cfg.succs, b)
+        mut j: u64 = 0
+        loop {
+            if j >= ss.len { break }
+            let s = ss[j]
+            if u32_pos(cfg.order, s) <= u32_pos(cfg.order, b) && !dominates(cfg, s, b) {
+                return true
+            }
+            j++
+        }
+        i++
+    }
+    false
+}
+
+/**
+ * is_loop_header — whether `h` is a natural-loop header: some reachable
+ * block `x` has an edge `x -> h` that retreats in RPO AND `h` dominates
+ * `x` (the Hecht-Ullman back-edge test, safe to apply unconditionally once
+ * `is_cfg_irreducible` has already been checked function-wide).
+ *
+ * @param CfgInfo cfg  the function's CFG analysis
+ * @param u32 h  the candidate loop-header block id
+ * @return bool  whether `h` has a back-edge into it
+ */
+fn is_loop_header(cfg: CfgInfo, h: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= cfg.order.len { break }
+        let x = cfg.order[i]
+        let ss = successors_of(cfg.succs, x)
+        mut j: u64 = 0
+        loop {
+            if j >= ss.len { break }
+            if ss[j] == h && u32_pos(cfg.order, h) <= u32_pos(cfg.order, x) && dominates(cfg, h, x) { return true }
+            j++
+        }
+        i++
+    }
+    false
+}
+
+/**
+ * natural_loop_body_from — the natural loop's block set for ONE back-edge
+ * `latch -> h`: the standard backward-reachability closure (`h` and
+ * `latch` seed the set; each newly added block's own predecessors are
+ * added too, until no more are found) — every block that can reach `latch`
+ * without leaving through `h` (`h`'s OWN other predecessors, e.g. the
+ * pre-loop entry edge, are never explored, since the closure never expands
+ * `h` itself).
+ *
+ * @param CfgInfo cfg  the function's CFG analysis
+ * @param u32 h  the loop header block id
+ * @param u32 latch  one back-edge source reaching `h`
+ * @return []u32  the natural loop's block ids (including `h`)
+ */
+fn natural_loop_body_from(cfg: CfgInfo, h: u32, latch: u32) -> []u32 {
+    if h == latch { return teko::list::push(teko::list::empty(), h) }
+    mut body = teko::list::push(teko::list::push(teko::list::empty(), h), latch)
+    mut wi: u64 = 1
+    loop {
+        if wi >= body.len { break }
+        let m = body[wi]
+        let ps = preds_of(cfg.preds, m)
+        mut pi: u64 = 0
+        loop {
+            if pi >= ps.len { break }
+            if !u32_list_has(body, ps[pi]) { body = teko::list::push(body, ps[pi]) }
+            pi++
+        }
+        wi++
+    }
+    body
+}
+
+/**
+ * loop_body_of — the FULL natural-loop block set for header `h`: the union
+ * of `natural_loop_body_from` over every back-edge reaching it (ordinarily
+ * exactly one, per the "only loop" law's single-latch construction, §3.1;
+ * unioned defensively in case a future lowering ever grows a second
+ * latch).
+ *
+ * @param CfgInfo cfg  the function's CFG analysis
+ * @param u32 h  the loop header block id
+ * @return []u32  the loop's whole block set (including `h`)
+ */
+fn loop_body_of(cfg: CfgInfo, h: u32) -> []u32 {
+    mut body = teko::list::push(teko::list::empty(), h)
+    mut i: u64 = 0
+    loop {
+        if i >= cfg.order.len { break }
+        let x = cfg.order[i]
+        let ss = successors_of(cfg.succs, x)
+        mut j: u64 = 0
+        loop {
+            if j >= ss.len { break }
+            if ss[j] == h && u32_pos(cfg.order, h) <= u32_pos(cfg.order, x) && dominates(cfg, h, x) {
+                let contrib = natural_loop_body_from(cfg, h, x)
+                mut k: u64 = 0
+                loop {
+                    if k >= contrib.len { break }
+                    body = u32_list_add_unique(body, contrib[k])
+                    k++
+                }
+            }
+            j++
+        }
+        i++
+    }
+    body
+}
+
+/**
+ * loop_exit_targets — the distinct successor block ids OUTSIDE `body` that
+ * some block IN `body` names (the loop's own `break` targets — the "only
+ * loop" law guarantees exactly one, `exitb`, but this is computed
+ * generally).
+ *
+ * @param CfgInfo cfg  the function's CFG analysis
+ * @param []u32 body  the loop's own block set (`loop_body_of`)
+ * @return []u32  the distinct exit target block ids
+ */
+fn loop_exit_targets(cfg: CfgInfo, body: []u32) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= body.len { break }
+        let ss = successors_of(cfg.succs, body[i])
+        mut j: u64 = 0
+        loop {
+            if j >= ss.len { break }
+            if !u32_list_has(body, ss[j]) { out = u32_list_add_unique(out, ss[j]) }
+            j++
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * MergeResult — the outcome of searching for a branch block's own NEW
+ * if/else merge (`merge_target_of`).
+ */
+type MergeResult = struct {
+    /**
+     * found — whether a merge was found.
+     */
+    found: bool
+    /**
+     * target — the merge block id; meaningless when `found` is `false`.
+     */
+    target: u32
+}
+
+/**
+ * merge_target_of — the block `b`'s own NEW if/else merge, if any: a block
+ * `m` with `idom(m) == b` (created exactly at `b`'s own branch — a block
+ * can branch at most once, so at most one such `m` exists) AND indegree
+ * `>= 2` (a genuine join, not a straight continuation) AND NOT already an
+ * open scope in `scopes` (the loop-exit exclusion: a loop's OWN exit block
+ * can ALSO have `idom == b` for some branch `b` buried deep inside the
+ * loop body whenever multiple `break` sites happen to share `b` as their
+ * nearest common dominator — that block must stay the enclosing loop's
+ * OWN wrapped exit, never an inner branch's inline "new merge", so it is
+ * excluded here whenever its wrapping scope is already open, §3.3).
+ *
+ * @param CfgInfo cfg  the function's CFG analysis
+ * @param []WasmScope scopes  the currently open scope stack
+ * @param u32 b  the branch block to search from
+ * @return MergeResult  the found merge, if any
+ */
+fn merge_target_of(cfg: CfgInfo, scopes: []WasmScope, b: u32) -> MergeResult {
+    mut i: u64 = 0
+    loop {
+        if i >= cfg.order.len { break }
+        let m = cfg.order[i]
+        let is_candidate = m != b && u32_table_get(cfg.idom, m) == b && preds_of(cfg.preds, m).len >= 2
+        if is_candidate && !wasm_scope_stack_depth_of(scopes, m).found {
+            return MergeResult { found = true; target = m }
+        }
+        i++
+    }
+    MergeResult { found = false; target = 0 to u32 }
+}
+
+/**
+ * filter_relevant_exits — a loop's own exit targets (`loop_exit_targets`)
+ * narrowed to the ones that genuinely need THIS loop's own wrapping
+ * `block`: excludes any target already reachable via an open ANCESTOR
+ * scope (a labelled `break OuterLoop` skipping past this loop entirely —
+ * its `br` resolves at the ancestor's OWN depth, needing no new wrap here)
+ * or already equal to the caller's own `stop` (deferred to that ancestor's
+ * post-region continuation). The "only loop" law guarantees at most one
+ * entry survives the filter — a genuinely new local exit target.
+ *
+ * @param []u32 exits  the loop's raw exit targets (`loop_exit_targets`)
+ * @param []WasmScope scopes  the currently open scope stack
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @return []u32  the exit targets this loop must wrap itself
+ */
+fn filter_relevant_exits(exits: []u32, scopes: []WasmScope, stop: EdgeStop) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= exits.len { break }
+        let e = exits[i]
+        let already_open = wasm_scope_stack_depth_of(scopes, e).found
+        if !already_open && !edge_stop_matches(stop, e) {
+            out = teko::list::push(out, e)
+        }
+        i++
+    }
+    out
+}
+
+/* ==========================================================================
+ * C1-3 — the recursive region renderer.
+ * ========================================================================== */
+
+/**
+ * EdgeStop — the caller-supplied "natural merge continuation" a region's
+ * rendering defers to instead of recursing further: reaching this exact
+ * block id ends the CURRENT region without emitting it, trusting the
+ * caller (the branch/loop that set it) to render it exactly once, right
+ * after its own scope closes.
+ */
+type EdgeStop = struct {
+    /**
+     * has — whether a stop target is set (a top-level render has none).
+     */
+    has: bool
+    /**
+     * target — the block id to stop at; meaningless when `has` is `false`.
+     */
+    target: u32
+}
+
+/**
+ * edge_stop_none — no stop target (the top-level function render, and
+ * every loop header's own straight-line body).
+ *
+ * @return EdgeStop  the empty stop
+ */
+fn edge_stop_none() -> EdgeStop {
+    EdgeStop { has = false; target = 0 to u32 }
+}
+
+/**
+ * edge_stop_at — a stop target of `b` (an enclosing branch's own
+ * newly-found merge, §3.3's `merge_target_of`).
+ *
+ * @param u32 b  the block id to stop at
+ * @return EdgeStop  the set stop
+ */
+fn edge_stop_at(b: u32) -> EdgeStop {
+    EdgeStop { has = true; target = b }
+}
+
+/**
+ * edge_stop_matches — whether `stop` is set to exactly `b`.
+ *
+ * @param EdgeStop stop  the stop to test
+ * @param u32 b  the block id to compare against
+ * @return bool  whether `stop` targets `b`
+ */
+fn edge_stop_matches(stop: EdgeStop, b: u32) -> bool {
+    stop.has && stop.target == b
+}
+
+/**
+ * RenderEnv — the read-only environment threaded through the whole
+ * recursive region renderer: the LIR function (straight-line lowering
+ * needs its `param_types`), its positionally-indexed blocks, the call-
+ * target resolver, and its whole CFG analysis.
+ */
+type RenderEnv = struct {
+    /**
+     * func — the LIR function being rendered.
+     */
+    func: lir::LFunc
+    /**
+     * blocks — `func`'s blocks, positionally indexed by id.
+     */
+    blocks: []lir::LBlock
+    /**
+     * symbols — the call-target resolver (`LCall`).
+     */
+    symbols: WasmSymbolTable
+    /**
+     * cfg — the function's whole CFG analysis.
+     */
+    cfg: CfgInfo
+}
+
+/**
+ * EdgeResult — one edge's fully-resolved outcome (`render_edge`): the
+ * advanced context (its block-arg copies already emitted) and which of the
+ * three shapes it took.
+ */
+type EdgeResult = struct {
+    /**
+     * ctx — the context advanced past the edge's own block-arg copies (and
+     * its `br`, when `kind` is `edge_result_branch()`).
+     */
+    ctx: StackifyCtx
+    /**
+     * kind — `edge_result_stop()` / `edge_result_branch()` /
+     * `edge_result_more()`.
+     */
+    kind: u8
+    /**
+     * target — the edge's own target block id.
+     */
+    target: u32
+}
+
+/**
+ * edge_result_stop — the edge reached the caller's own `stop` target:
+ * nothing more to render on this path (the caller renders `target` itself,
+ * once, after its own scope closes).
+ *
+ * @return u8  the "stop" edge-result tag
+ */
+fn edge_result_stop() -> u8 {
+    0 to u8
+}
+
+/**
+ * edge_result_branch — the edge's target is an open scope: a `br` was
+ * emitted (a `continue`, a `break`, or a labelled skip past several
+ * enclosing scopes at once).
+ *
+ * @return u8  the "branch" edge-result tag
+ */
+fn edge_result_branch() -> u8 {
+    1 to u8
+}
+
+/**
+ * edge_result_more — the edge's target is neither `stop` nor already open:
+ * the caller must keep rendering by recursing into it directly (the
+ * straight-line "this is simply the next block" fallthrough case).
+ *
+ * @return u8  the "more" edge-result tag
+ */
+fn edge_result_more() -> u8 {
+    2 to u8
+}
+
+/**
+ * render_edge — resolve one `LJump`/`LBranch` edge (§3.3 step 4): copy its
+ * block-args into the target's params (`emit_edge_copies`), then classify
+ * the target as the caller's own `stop`, an already-open scope (emitting
+ * `br`), or neither (the caller must recurse).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param RenderEnv env  the read-only render environment
+ * @param u32 target  the edge's target block id
+ * @param []u32 args  the edge's own block-args
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @return EdgeResult | error  the resolved edge, or `emit_edge_copies`'s
+ *                             propagated internal error
+ */
+fn render_edge(ctx0: StackifyCtx, env: RenderEnv, target: u32, args: []u32, stop: EdgeStop) -> EdgeResult | error {
+    let params = env.blocks[target to u64].params
+    let copied = match emit_edge_copies(ctx0, params, args) { StackifyCtx as c => c; error as e => return e }
+    if edge_stop_matches(stop, target) {
+        return EdgeResult { ctx = copied; kind = edge_result_stop(); target = target }
+    }
+    let sd = wasm_scope_stack_depth_of(copied.scopes, target)
+    if sd.found {
+        return EdgeResult { ctx = sc_br(copied, sd.depth); kind = edge_result_branch(); target = target }
+    }
+    EdgeResult { ctx = copied; kind = edge_result_more(); target = target }
+}
+
+/**
+ * render_arm — render one `if`/`else` arm (or a plain `LJump`'s single
+ * edge): resolve its edge (`render_edge`), recursing into the target only
+ * when neither `stop` nor an open scope claimed it.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param RenderEnv env  the read-only render environment
+ * @param u32 target  the arm's target block id
+ * @param []u32 args  the arm's own block-args
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @return StackifyCtx | error  the advanced context, or a propagated error
+ */
+fn render_arm(ctx0: StackifyCtx, env: RenderEnv, target: u32, args: []u32, stop: EdgeStop) -> StackifyCtx | error {
+    let er = match render_edge(ctx0, env, target, args, stop) { EdgeResult as r => r; error as e => return e }
+    if er.kind == edge_result_more() {
+        return render_region(er.ctx, env, stop, er.target)
+    }
+    er.ctx
+}
+
+/**
+ * all_but_last — `insts` without its own last element (a block's
+ * instructions minus its terminator).
+ *
+ * @param []LInst insts  the instruction stream
+ * @return []LInst  every instruction but the last
+ */
+fn all_but_last(insts: []lir::LInst) -> []lir::LInst {
+    let keep = if insts.len == 0 { 0 to u64 } else { insts.len - 1 }
+    mut out: []lir::LInst = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= keep { break }
+        out = teko::list::push(out, insts[i])
+        i++
+    }
+    out
+}
+
+/**
+ * render_jump_terminator — an `LJump` terminator: resolve its one edge
+ * (`render_edge`), recursing into its target when neither `stop` nor an
+ * open scope claimed it.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param RenderEnv env  the read-only render environment
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @param LJump j  the jump terminator
+ * @return StackifyCtx | error  the advanced context, or a propagated error
+ */
+fn render_jump_terminator(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, j: lir::LJump) -> StackifyCtx | error {
+    let er = match render_edge(ctx0, env, j.target, j.args, stop) { EdgeResult as r => r; error as e => return e }
+    if er.kind == edge_result_more() {
+        return render_region(er.ctx, env, stop, er.target)
+    }
+    er.ctx
+}
+
+/**
+ * render_branch_terminator — an `LBranch` terminator: the structured `if`
+ * diamond (§3.3 step 4). Finds `b`'s own new merge, if any
+ * (`merge_target_of`), renders `local.get cond; if …then-arm… else
+ * …else-arm… end` (both arms sharing the SAME inner stop — the found
+ * merge, or `stop` passed straight through when there is none), then
+ * continues rendering the merge itself (under the OUTER `stop`) once the
+ * `if` closes.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param RenderEnv env  the read-only render environment
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @param u32 b  the branch's own block id (`merge_target_of` needs it)
+ * @param LBranch br  the branch terminator
+ * @return StackifyCtx | error  the advanced context, or a propagated error
+ */
+fn render_branch_terminator(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, b: u32, br: lir::LBranch) -> StackifyCtx | error {
+    let mr = merge_target_of(env.cfg, ctx0.scopes, b)
+    let inner_stop = if mr.found { edge_stop_at(mr.target) } else { stop }
+    let opened = sc_open_if(sc_local_get(ctx0, br.cond))
+    let then_done = match render_arm(opened, env, br.t_target, br.t_args, inner_stop) { StackifyCtx as c => c; error as e => return e }
+    let mid = sc_byte(then_done, 0x05 to byte)
+    let else_done = match render_arm(mid, env, br.f_target, br.f_args, inner_stop) { StackifyCtx as c => c; error as e => return e }
+    let closed = sc_close_scope(else_done)
+    if mr.found {
+        return render_region(closed, env, stop, mr.target)
+    }
+    closed
+}
+
+/**
+ * render_terminator — dispatch one block's own terminator instruction
+ * (`LRet`/`LJump`/`LBranch` — the only three `LOp` cases a well-formed
+ * block ever ends in).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param RenderEnv env  the read-only render environment
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @param u32 b  the enclosing block's own id (`LBranch` needs it)
+ * @param LInst term  the terminator instruction
+ * @return StackifyCtx | error  the advanced context, or a propagated/named
+ *                              internal error
+ */
+fn render_terminator(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, b: u32, term: lir::LInst) -> StackifyCtx | error {
+    match term.op {
+        lir::LRet as r => stackify_ret(ctx0, r)
+        lir::LJump as j => render_jump_terminator(ctx0, env, stop, j)
+        lir::LBranch as br => render_branch_terminator(ctx0, env, stop, b, br)
+        _ => error { message = "stackify: a block must end in LRet/LJump/LBranch (internal)" }
+    }
+}
+
+/**
+ * render_straight — render block `b`'s own straight-line instructions
+ * (`stackify_insts`, every instruction but the terminator) then its
+ * terminator (`render_terminator`).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param RenderEnv env  the read-only render environment
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @param u32 b  the block id to render
+ * @return StackifyCtx | error  the advanced context, or a propagated/named
+ *                              internal error
+ */
+fn render_straight(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, b: u32) -> StackifyCtx | error {
+    let blk = env.blocks[b to u64]
+    if blk.insts.len == 0 {
+        return error { message = "stackify: a block with no instructions has no terminator (internal)" }
+    }
+    let stepped = match stackify_insts(ctx0, env.func, env.symbols, all_but_last(blk.insts)) { StackifyCtx as c => c; error as e => return e }
+    render_terminator(stepped, env, stop, b, blk.insts[blk.insts.len - 1])
+}
+
+/**
+ * err_irreducible — the NAMED honest-stop `C1-irreducible` (§3.4): a
+ * belt-and-suspenders tripwire for a lowering bug that emitted a CFG shape
+ * structured Teko source cannot produce — never expected to fire from
+ * valid input.
+ *
+ * @param str detail  which specific defensive check tripped
+ * @return error  the named error
+ */
+fn err_irreducible(detail: str) -> error {
+    error { message = $"stackify: C1-irreducible — irreducible control flow ({detail}) — unreachable from structured Teko source; report to the compiler team" }
+}
+
+/**
+ * render_loop — a loop header `h` (§3.3 step 3): wraps the header..body
+ * span in `loop … end` (a `br` to it is `continue`); when the loop has a
+ * genuinely new (not already open, not the caller's own `stop`) exit
+ * target (`filter_relevant_exits`), additionally wraps the whole thing in
+ * an outer `block … end` (a `br` to it is `break`), then continues
+ * rendering the exit target under the OUTER `stop` once both close. More
+ * than one such newly-relevant exit target is the NAMED honest-stop
+ * `C1-irreducible` — the "only loop" law guarantees a single loop has at
+ * most one (every `break`, however deeply nested, targets the SAME
+ * `exitb`; a labelled `break` past an ENCLOSING loop always resolves via
+ * an already-open ancestor scope, never a second fresh target here, §3.3).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param RenderEnv env  the read-only render environment
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @param u32 h  the loop header block id
+ * @return StackifyCtx | error  the advanced context, or the named
+ *                              `C1-irreducible` stop
+ */
+fn render_loop(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, h: u32) -> StackifyCtx | error {
+    let body = loop_body_of(env.cfg, h)
+    let exits = loop_exit_targets(env.cfg, body)
+    let relevant = filter_relevant_exits(exits, ctx0.scopes, stop)
+    if relevant.len > 1 {
+        return err_irreducible("a loop with more than one newly-reachable exit target")
+    }
+    let has_exit = relevant.len == 1
+    let exit_target = if has_exit { relevant[0] } else { 0 to u32 }
+    let opened = if has_exit { sc_open_block(ctx0, exit_target) } else { ctx0 }
+    let loop_opened = sc_open_loop(opened, h)
+    let body_done = match render_straight(loop_opened, env, edge_stop_none(), h) { StackifyCtx as c => c; error as e => return e }
+    let loop_closed = sc_close_scope(body_done)
+    if !has_exit { return loop_closed }
+    render_region(sc_close_scope(loop_closed), env, stop, exit_target)
+}
+
+/**
+ * render_region — render block `b` and everything its own control flow
+ * naturally leads into, stopping at `stop` (or at a `br`) rather than
+ * recursing forever: a loop header dispatches to `render_loop`; every
+ * other block dispatches to `render_straight`.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param RenderEnv env  the read-only render environment
+ * @param EdgeStop stop  the enclosing region's own stop target, if any
+ * @param u32 b  the block id to render
+ * @return StackifyCtx | error  the advanced context, or a propagated/named
+ *                              error
+ */
+fn render_region(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, b: u32) -> StackifyCtx | error {
+    if edge_stop_matches(stop, b) { return ctx0 }
+    if is_loop_header(env.cfg, b) { return render_loop(ctx0, env, stop, b) }
+    render_straight(ctx0, env, stop, b)
+}
+
+/**
+ * stackify_control — the CFGStackify entry point (§3): reconstruct one
+ * `LFunc`'s reducible CFG into structured control flow, starting from its
+ * entry block. Checks reducibility ONCE, function-wide
+ * (`is_cfg_irreducible`), before any placement — an irreducible cycle is
+ * the NAMED honest-stop `C1-irreducible`. Deliberately fuses the design
+ * doc's two-phase shape (an abstract marker stream, then a separate byte
+ * emitter) into ONE recursive pass: nothing in this MVP consumes an
+ * abstract marker stream besides the byte emitter itself, so a separate
+ * `StructuredFunc`/`WasmMarker` representation would be pure ceremony (the
+ * M.1 "no unreachable complexity" discipline) — `render_region` emits
+ * final wasm bytes directly, threading the SAME scope-stack/valtype state
+ * `stackify_func`'s straight-line lowering already threads.
+ *
+ * @param LFunc f  the function to lower (its `blocks` a reducible CFG)
+ * @param WasmSymbolTable symbols  the call-target resolver (`LCall`)
+ * @return StackifyCtx | error  the fully-rendered context (its `body` NOT
+ *                              yet closed by the function's own trailing
+ *                              `end`), or a NAMED honest-stop
+ *
+ * @since #389 C1-3
+ */
+pub fn stackify_control(f: lir::LFunc, symbols: WasmSymbolTable) -> StackifyCtx | error {
+    if f.blocks.len == 0 {
+        return error { message = "stackify: a function with no blocks has no entry (internal)" }
+    }
+    let blocks = blocks_by_id(f)
+    let entry = f.blocks[0].id
+    let cfg = build_cfg_info(blocks, entry)
+    if is_cfg_irreducible(cfg) {
+        return err_irreducible("a multi-entry loop (a back-edge whose target does not dominate its source)")
+    }
+    let env = RenderEnv { func = f; blocks = blocks; symbols = symbols; cfg = cfg }
+    let ctx0 = StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = f.next_vreg }
+    render_region(ctx0, env, edge_stop_none(), entry)
 }
 
 /**
@@ -1053,30 +2718,25 @@ pub type WasmFuncBody = struct {
 }
 
 /**
- * stackify_func — lower one straight-line `LFunc` to its `WasmFuncBody`:
- * every VReg becomes its own wasm local (`backend-c1-wasm.md` §4.1 — no
- * register allocation, just a total `VReg -> local index` identity map), the
- * sole block's instructions lower via `stackify_insts`, and the body is
- * closed with the code-entry `end`. A function with more than one block is
- * the NAMED honest-stop `C1-3-required`: mapping arbitrary inter-block edges
- * to wasm's structured `block`/`loop`/`if` scopes is the CFGStackify region
- * pass, out of this slice's scope (C1-3) — this slice only lowers the
- * single-block (branch-free) subset.
+ * stackify_func — lower one `LFunc` (single-block OR multi-block) to its
+ * `WasmFuncBody`: every VReg becomes its own wasm local (`backend-c1-wasm.md`
+ * §4.1 — no register allocation, just a total `VReg -> local index` identity
+ * map, extended with fresh scratch ids past `next_vreg` for parallel-copy
+ * staging, §4.3), the whole CFG renders via `stackify_control` (the
+ * CFGStackify pass, §3), and the body is closed with the code-entry `end`.
+ * The former `C1-3-required` single-block restriction is GONE — a reducible
+ * multi-block CFG is now fully supported; only a genuinely irreducible one
+ * (a lowering bug, never valid Teko source) still stops honestly.
  *
- * @param LFunc f  the function to lower (`f.blocks` must hold exactly one
- *                 block)
+ * @param LFunc f  the function to lower
  * @param WasmSymbolTable calls  the call-target resolver (`LCall`)
- * @return WasmFuncBody | error  the lowered payload, or a NAMED honest-stop
- *                               (`C1-3-required` for multi-block input, or
- *                               any instruction's own propagated stop)
+ * @return WasmFuncBody | error  the lowered payload, or a propagated/named
+ *                               honest-stop (`C1-irreducible`, an
+ *                               instruction's own stop, or an internal error)
  */
 pub fn stackify_func(f: lir::LFunc, calls: WasmSymbolTable) -> WasmFuncBody | error {
-    if f.blocks.len != 1 {
-        return error { message = "stackify: C1-3-required — stackify_func only lowers single-block (straight-line) functions; multi-block control flow needs the structured-control CFGStackify pass (C1-3)" }
-    }
-    let ctx0 = StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty() }
-    let done = match stackify_insts(ctx0, f, calls, f.blocks[0].insts) { StackifyCtx as c => c; error as e => return e }
+    let done = match stackify_control(f, calls) { StackifyCtx as c => c; error as e => return e }
     let body = teko::list::push(done.body, 0x0B to byte)
-    let groups = wasm_local_groups_of(done.vtypes, f.n_params, f.next_vreg)
+    let groups = wasm_local_groups_of(done.vtypes, f.n_params, done.next_scratch)
     WasmFuncBody { local_groups = groups; body = body }
 }
