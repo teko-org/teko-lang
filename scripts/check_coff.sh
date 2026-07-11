@@ -55,10 +55,26 @@ if command -v "$OBJDUMP" >/dev/null 2>&1; then
 fi
 
 if command -v "$LLD_LINK" >/dev/null 2>&1; then
+    echo "check_coff: $("$LLD_LINK" --version 2>&1 | head -1)"
     tmp_exe="$(mktemp -u "${TMPDIR:-/tmp}/check-coff.XXXXXX").exe"
-    "$LLD_LINK" /nologo "/out:$tmp_exe" /entry:main /subsystem:console /force:unresolved "$OBJ" >/dev/null 2>&1 \
-        || fail "lld-link rejected $OBJ (not linker-consumable)"
+    # lld-link is a NATIVE Windows tool using single-leading-slash switches
+    # (/nologo, /entry:, /subsystem:, /force:). Invoked from a Git-Bash/MSYS shell
+    # (the windows-selfhost CI lane), MSYS's automatic POSIX-to-Windows path
+    # conversion mangles any argument that LOOKS like a POSIX absolute path — which
+    # every one of these switches does (a bare leading `/`) — before lld-link ever
+    # sees it, turning `/nologo` into a bogus filesystem path and making a
+    # perfectly well-formed object look "rejected". MSYS_NO_PATHCONV (Git-Bash) and
+    # MSYS2_ARG_CONV_EXCL="*" (MSYS2) both disable that conversion for this one
+    # invocation; both are no-ops outside an MSYS shell (macOS/Linux), so exporting
+    # them unconditionally is safe everywhere.
+    link_out="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$LLD_LINK" /nologo "/out:$tmp_exe" /entry:main /subsystem:console /force:unresolved "$OBJ" 2>&1)"
+    link_rc=$?
     rm -f "$tmp_exe"
+    if [[ "$link_rc" -ne 0 ]]; then
+        echo "check_coff: lld-link rejected $OBJ (rc=$link_rc) — full output below:"
+        echo "$link_out" | sed 's/^/      | /'
+        fail "lld-link rejected $OBJ (not linker-consumable)"
+    fi
 fi
 
 echo "check_coff: OK — $OBJ is a well-formed, linker-consumable IMAGE_FILE_MACHINE_AMD64 PE/COFF object"
