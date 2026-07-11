@@ -1,0 +1,1082 @@
+use teko::lir
+
+/**
+ * wasm_vt_i32 — the `i32` wasm value-type byte (`0x7F`), the valtype every
+ * sub-32 integer width (`I8`/`I16`/`I32`) and `Ptr` collapse to in wasm32
+ * (`backend-c1-wasm.md` §1.1).
+ *
+ * @return u8  the `i32` valtype byte
+ */
+fn wasm_vt_i32() -> u8 {
+    0x7F to u8
+}
+
+/**
+ * wasm_vt_i64 — the `i64` wasm value-type byte (`0x7E`).
+ *
+ * @return u8  the `i64` valtype byte
+ */
+fn wasm_vt_i64() -> u8 {
+    0x7E to u8
+}
+
+/**
+ * wasm_vt_f32 — the `f32` wasm value-type byte (`0x7D`).
+ *
+ * @return u8  the `f32` valtype byte
+ */
+fn wasm_vt_f32() -> u8 {
+    0x7D to u8
+}
+
+/**
+ * wasm_vt_f64 — the `f64` wasm value-type byte (`0x7C`).
+ *
+ * @return u8  the `f64` valtype byte
+ */
+fn wasm_vt_f64() -> u8 {
+    0x7C to u8
+}
+
+/**
+ * wasm_valtype — the wasm value-type byte an `LType` machine class maps to
+ * (`backend-c1-wasm.md` §1.1): the sub-32 integer widths and `Ptr` collapse
+ * to `i32`, `I64` maps to `i64`, `F32`/`F64` map directly. `I128` and `F16`
+ * have no wasm value type at all — the two NAMED honest-stops `C1-i128`
+ * (shared with A2's own i128 route) and `C1-f16` (matching the register
+ * targets' own f16 gap). `Void` is a valueless machine class (never a real
+ * operand), so it also has no valtype byte — an internal-error arm, distinct
+ * from the two design-named stops, exercised directly by a unit test rather
+ * than reachable through valid lowering.
+ *
+ * @param LType t  the machine class to map
+ * @return u8 | error  the wasm valtype byte, or a named honest-stop
+ */
+pub fn wasm_valtype(t: lir::LType) -> u8 | error {
+    match t {
+        lir::LType::I8 => wasm_vt_i32()
+        lir::LType::I16 => wasm_vt_i32()
+        lir::LType::I32 => wasm_vt_i32()
+        lir::LType::I64 => wasm_vt_i64()
+        lir::LType::I128 => error { message = "stackify: C1-i128 — wasm has no native i128 valtype, deferred (shared with A2's i128 route, backend-a4-encoder.md §6.3)" }
+        lir::LType::F16 => error { message = "stackify: C1-f16 — wasm has no native f16 valtype, deferred (matches the register targets' f16 gap)" }
+        lir::LType::F32 => wasm_vt_f32()
+        lir::LType::F64 => wasm_vt_f64()
+        lir::LType::Ptr => wasm_vt_i32()
+        lir::LType::Void => error { message = "stackify: wasm_valtype — a Void machine class has no wasm value type (internal)" }
+    }
+}
+
+/**
+ * WasmVTypeTable — the stackifier's per-VReg side-table: each VReg's already
+ * resolved wasm valtype byte, densely indexed (VReg ids are assigned in
+ * strictly increasing order by the LIR's own SSA allocator, so a growable
+ * positional array suffices — mirrors `isel_arm64.tks`'s `VInfoTable`
+ * `class_of` mechanism, but keyed by the concrete valtype byte rather than a
+ * register-class/width pair, since a wasm local's type cannot be
+ * reinterpreted the way a physical register's view can). Every VReg that
+ * defines a value records its valtype here before any later instruction
+ * reads it (the LIR's def-before-use SSA property).
+ */
+type WasmVTypeTable = struct {
+    /**
+     * vtypes — each recorded VReg's wasm valtype byte, positionally indexed
+     * by VReg id.
+     */
+    vtypes: []u8
+}
+
+/**
+ * wvt_empty — a side-table with no VRegs recorded yet (a function's
+ * lowering seed).
+ *
+ * @return WasmVTypeTable  the empty table
+ */
+fn wvt_empty() -> WasmVTypeTable {
+    WasmVTypeTable { vtypes = teko::list::empty() }
+}
+
+/**
+ * wvt_grow — pad `t` with placeholder `i32` entries until it holds at least
+ * `n` positions, so a subsequent positional write never runs past the end
+ * of the array.
+ *
+ * @param WasmVTypeTable t  the table to pad
+ * @param u64 n  the minimum length the padded table must reach
+ * @return WasmVTypeTable  the padded table
+ */
+fn wvt_grow(t: WasmVTypeTable, n: u64) -> WasmVTypeTable {
+    mut vts = t.vtypes
+    loop {
+        if vts.len >= n { break }
+        vts = teko::list::push(vts, wasm_vt_i32())
+    }
+    WasmVTypeTable { vtypes = vts }
+}
+
+/**
+ * wvt_set — record `vt` as the wasm valtype of VReg `id`, growing the table
+ * first when `id` is past its current length (a fresh rebuild of the
+ * positional array with the one entry rewritten, mirroring the isel
+ * side-table's `vinfo_set`).
+ *
+ * @param WasmVTypeTable t0  the table to update
+ * @param u32 id  the VReg id being recorded
+ * @param u8 vt  its wasm valtype byte
+ * @return WasmVTypeTable  the updated table
+ */
+fn wvt_set(t0: WasmVTypeTable, id: u32, vt: u8) -> WasmVTypeTable {
+    let grown = wvt_grow(t0, (id to u64) + 1)
+    mut out: []u8 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= grown.vtypes.len { break }
+        out = teko::list::push(out, if (i to u32) == id { vt } else { grown.vtypes[i] })
+        i++
+    }
+    WasmVTypeTable { vtypes = out }
+}
+
+/**
+ * wvt_get — the recorded wasm valtype of VReg `id`, or the `i32` default
+ * when `id` was never recorded (defensive only — the LIR's SSA property
+ * guarantees every operand is recorded before it is read).
+ *
+ * @param WasmVTypeTable t  the table to read
+ * @param u32 id  the VReg id to look up
+ * @return u8  its recorded (or default) wasm valtype byte
+ */
+fn wvt_get(t: WasmVTypeTable, id: u32) -> u8 {
+    let i = id to u64
+    if i >= t.vtypes.len { return wasm_vt_i32() }
+    t.vtypes[i]
+}
+
+/**
+ * StackifyCtx — the stackifier's threaded state while lowering one
+ * straight-line instruction stream: the already-emitted code-entry body
+ * bytes and the `WasmVTypeTable` recording every VReg lowered so far.
+ * Mirrors `isel_arm64.tks`'s `SelCtx`, but with no register file / block
+ * bookkeeping — wasm's only per-value state is its valtype (locals are
+ * allocated 1:1 with VReg ids, so there is no scratch/frame table to
+ * thread).
+ */
+type StackifyCtx = struct {
+    /**
+     * body — the function body bytes emitted so far (the code-entry
+     * instruction stream, not yet terminated by the closing `end`).
+     */
+    body: []byte
+    /**
+     * vtypes — the per-VReg wasm valtype side-table recorded so far.
+     */
+    vtypes: WasmVTypeTable
+}
+
+/**
+ * sc_byte — append one raw byte (an opcode, or a section/kind tag) to the
+ * context's body.
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param byte b  the byte to append
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_byte(ctx: StackifyCtx, b: byte) -> StackifyCtx {
+    StackifyCtx { body = teko::list::push(ctx.body, b); vtypes = ctx.vtypes }
+}
+
+/**
+ * sc_uleb — append `v` to the context's body as unsigned LEB128 (a local
+ * index, a memarg field, a funcidx).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u64 v  the value to encode
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_uleb(ctx: StackifyCtx, v: u64) -> StackifyCtx {
+    StackifyCtx { body = emit_uleb128(ctx.body, v); vtypes = ctx.vtypes }
+}
+
+/**
+ * sc_sleb — append `v` to the context's body as signed LEB128 (an
+ * `i32.const`/`i64.const` immediate).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param i64 v  the signed value to encode
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_sleb(ctx: StackifyCtx, v: i64) -> StackifyCtx {
+    StackifyCtx { body = emit_sleb128(ctx.body, v); vtypes = ctx.vtypes }
+}
+
+/**
+ * sc_f64_bits — append `bits` to the context's body as the raw 8-byte
+ * little-endian IEEE754 binary64 pattern (an `f64.const` immediate, which is
+ * NOT LEB128-encoded).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u64 bits  the IEEE bit pattern to append
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_f64_bits(ctx: StackifyCtx, bits: u64) -> StackifyCtx {
+    let lo = (bits & (0xFFFFFFFF to u64)) to u32
+    let hi = (bits >> (32 to u64)) to u32
+    StackifyCtx { body = emit_u32_le(emit_u32_le(ctx.body, lo), hi); vtypes = ctx.vtypes }
+}
+
+/**
+ * sc_local_get — emit `local.get $vreg` (`0x20`): the VReg's own id IS its
+ * local index (the "one wasm local per VReg" model, `backend-c1-wasm.md`
+ * §4.1 — no separate VReg-to-local remap table is needed, since wasm's own
+ * "params are the leading locals" convention already matches the LIR's own
+ * "params are VRegs 0..n_params-1" convention).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 vreg  the VReg (and local index) to read
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_local_get(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
+    sc_uleb(sc_byte(ctx, 0x20 to byte), vreg to u64)
+}
+
+/**
+ * sc_local_set — emit `local.set $vreg` (`0x21`).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 vreg  the VReg (and local index) to write
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_local_set(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
+    sc_uleb(sc_byte(ctx, 0x21 to byte), vreg to u64)
+}
+
+/**
+ * sc_set_vtype — record `vt` as VReg `vreg`'s wasm valtype in the context's
+ * side-table, without touching the emitted body bytes.
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 vreg  the VReg being recorded
+ * @param u8 vt  its wasm valtype byte
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_set_vtype(ctx: StackifyCtx, vreg: u32, vt: u8) -> StackifyCtx {
+    StackifyCtx { body = ctx.body; vtypes = wvt_set(ctx.vtypes, vreg, vt) }
+}
+
+/**
+ * sc_memarg — append a wasm memory-instruction's trailing `align, offset`
+ * pair (both ULEB128), shared by every load/store lowering.
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 align  the alignment hint (log2 of the natural access width)
+ * @param u32 offset  the constant byte offset (always `0` in the MVP — any
+ *                     static field offset is already folded into the
+ *                     address by a preceding `LFieldAddr`)
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_memarg(ctx: StackifyCtx, align: u32, offset: u32) -> StackifyCtx {
+    sc_uleb(sc_uleb(ctx, align to u64), offset to u64)
+}
+
+/**
+ * stackify_max_i32 — `i32::MAX` (`2147483647`) as an i128, the upper bound
+ * of the "does this constant fit i32" test (`stackify_fits_i32`).
+ *
+ * @return i128  i32::MAX
+ */
+fn stackify_max_i32() -> i128 {
+    2147483647 to i128
+}
+
+/**
+ * stackify_min_i32 — `i32::MIN`, computed as `-(i32::MAX) - 1` so no literal
+ * names the boundary value directly (mirrors `isel_arm64.tks`'s
+ * `min_i64_i128` pattern).
+ *
+ * @return i128  i32::MIN
+ */
+fn stackify_min_i32() -> i128 {
+    -(stackify_max_i32()) - (1 to i128)
+}
+
+/**
+ * stackify_fits_i32 — true iff `v` lies within the i32 range: the test that
+ * picks a `LConstInt`'s wasm width. A constant with no other type
+ * information defaults to the NARROWEST no-information-loss wasm width —
+ * `i32` (wasm32's own native word size, matching `Ptr`'s own collapse to
+ * `i32`) rather than arm64 isel's "always widest" default, because unlike a
+ * physical register a wasm local's declared type cannot be reinterpreted
+ * later: choosing `i32` whenever the value fits keeps every ordinary
+ * literal (the `exit`/arith corpus) in the natural wasm32 family.
+ *
+ * @param i128 v  the value to check
+ * @return bool  whether `v` fits an i32
+ */
+fn stackify_fits_i32(v: i128) -> bool {
+    v >= stackify_min_i32() && v <= stackify_max_i32()
+}
+
+/**
+ * WasmMemOp — one `LType`'s resolved memory-access shape: the load opcode
+ * (zero-extending for a sub-32 width, per `isel_arm64.tks`'s own
+ * `select_load` convention — "a narrow value's own producing Trunc/ZExt/
+ * SExt chain already fixed its class, so the load itself does not re-sign"),
+ * the (single, sign-agnostic) store opcode, the natural-alignment hint, and
+ * the resulting wasm valtype. The single source of truth `stackify_load`/
+ * `stackify_store` both key off `LLoad.ty`/`LStore.ty`.
+ */
+type WasmMemOp = struct {
+    /**
+     * load_op — the wasm load opcode byte for this machine class.
+     */
+    load_op: byte
+    /**
+     * store_op — the wasm store opcode byte for this machine class.
+     */
+    store_op: byte
+    /**
+     * align — the memarg alignment hint (log2 of the natural access width).
+     */
+    align: u32
+    /**
+     * valtype — the wasm valtype a load of this machine class yields.
+     */
+    valtype: u8
+}
+
+/**
+ * wasm_mem_op — the load/store opcode pair + alignment + valtype for one
+ * `LType`'s memory access (`backend-c1-wasm.md` §4.4). `I8`/`I16` load
+ * zero-extending (`i32.load8_u`/`i32.load16_u`) into the shared `i32` family
+ * their valtype already collapses to; `I32`/`Ptr` share the natural `i32`
+ * load/store; `I64`/`F32`/`F64` each get their own natural-width op. `I128`/
+ * `F16` are the same two named honest-stops `wasm_valtype` names; `Void` is
+ * the same internal-error arm.
+ *
+ * @param LType t  the accessed machine class
+ * @return WasmMemOp | error  the resolved memory-access shape, or a named
+ *                            honest-stop
+ */
+fn wasm_mem_op(t: lir::LType) -> WasmMemOp | error {
+    match t {
+        lir::LType::I8 => WasmMemOp { load_op = 0x2D to byte; store_op = 0x3A to byte; align = 0 to u32; valtype = wasm_vt_i32() }
+        lir::LType::I16 => WasmMemOp { load_op = 0x2F to byte; store_op = 0x3B to byte; align = 1 to u32; valtype = wasm_vt_i32() }
+        lir::LType::I32 => WasmMemOp { load_op = 0x28 to byte; store_op = 0x36 to byte; align = 2 to u32; valtype = wasm_vt_i32() }
+        lir::LType::I64 => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vt_i64() }
+        lir::LType::Ptr => WasmMemOp { load_op = 0x28 to byte; store_op = 0x36 to byte; align = 2 to u32; valtype = wasm_vt_i32() }
+        lir::LType::F32 => WasmMemOp { load_op = 0x2A to byte; store_op = 0x38 to byte; align = 2 to u32; valtype = wasm_vt_f32() }
+        lir::LType::F64 => WasmMemOp { load_op = 0x2B to byte; store_op = 0x39 to byte; align = 3 to u32; valtype = wasm_vt_f64() }
+        lir::LType::I128 => error { message = "stackify: C1-i128 — an i128 memory access has no wasm valtype, deferred (shared with A2's i128 route)" }
+        lir::LType::F16 => error { message = "stackify: C1-f16 — an f16 memory access has no wasm valtype, deferred (matches the register targets' f16 gap)" }
+        lir::LType::Void => error { message = "stackify: a void-typed memory access is malformed (internal)" }
+    }
+}
+
+/**
+ * stackify_const_int — the `LConstInt` lowering: `i32.const`/`i64.const`
+ * (`stackify_fits_i32` picks the narrowest lossless wasm width, §4.1),
+ * `local.set` into the result's own VReg-numbered local. A value beyond the
+ * i64 range is the `C1-i128` honest-stop (`fits_i64`, shared with A2's own
+ * i128-constant materialization gate).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LConstInt c  the constant op
+ * @return StackifyCtx | error  the advanced context, or the `C1-i128` stop
+ */
+fn stackify_const_int(ctx0: StackifyCtx, inst: lir::LInst, c: lir::LConstInt) -> StackifyCtx | error {
+    if !fits_i64(c.val) {
+        return error { message = "stackify: C1-i128 — an integer constant beyond 64 bits needs register-pair materialization, deferred (shared with A2's i128 route, backend-a4-encoder.md §6.3)" }
+    }
+    let narrow = stackify_fits_i32(c.val)
+    let op = if narrow { 0x41 to byte } else { 0x42 to byte }
+    let vt = if narrow { wasm_vt_i32() } else { wasm_vt_i64() }
+    let ctx1 = sc_sleb(sc_byte(ctx0, op), c.val to i64)
+    let ctx2 = sc_local_set(ctx1, inst.result)
+    sc_set_vtype(ctx2, inst.result, vt)
+}
+
+/**
+ * stackify_const_float — the `LConstFloat` lowering: always the `f64` form
+ * (mirroring `isel_arm64.tks`'s `select_const_float`'s own "always the
+ * f64/D form" default — the LIR carries no per-value float width for a bare
+ * constant), `f64.const` + its raw IEEE bit pattern, `local.set` into the
+ * result's own VReg-numbered local.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LConstFloat c  the constant op
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_const_float(ctx0: StackifyCtx, inst: lir::LInst, c: lir::LConstFloat) -> StackifyCtx {
+    let ctx1 = sc_f64_bits(sc_byte(ctx0, 0x44 to byte), c.bits)
+    let ctx2 = sc_local_set(ctx1, inst.result)
+    sc_set_vtype(ctx2, inst.result, wasm_vt_f64())
+}
+
+/**
+ * WasmBinOpInfo — one `LBinOp` case's resolved wasm shape at a given
+ * operand width: the opcode byte, and whether the op is a compare (whose
+ * wasm result is ALWAYS `i32`, regardless of the compared operands' own
+ * width — mirroring `isel_arm64.tks`'s own `select_icmp`/`select_fcmp`
+ * always recording a narrow/GPR result).
+ */
+type WasmBinOpInfo = struct {
+    /**
+     * opcode — the wasm instruction byte for this op at this width.
+     */
+    opcode: byte
+    /**
+     * is_cmp — true iff this is an integer/float compare (its wasm result
+     * is always `i32`, never the compared operands' own width).
+     */
+    is_cmp: bool
+}
+
+/**
+ * wasm_binop_info — the total per-`LBinOp` opcode table
+ * (`backend-c1-wasm.md` §4.4, cross-checked against the wasm core spec's
+ * numeric-instruction opcode listing): `wide=true` selects the `i64`/`f64`
+ * family member, `wide=false` the `i32`/`f32` one. Every case shares the
+ * SAME instruction shape (`local.get a; local.get b; <opcode>; local.set
+ * r`), so — unlike arm64/x86 isel, which need a distinct selection function
+ * per instruction SHAPE (`MAlu` vs `MCmp`+`MCSet` vs a two-instruction
+ * `IRemS`/`IRemU`) — wasm's native `rem_s`/`rem_u`/compare-to-i32
+ * instructions let every `LBinOp` case reduce to one opcode lookup.
+ *
+ * @param LBinOp op  the binary opcode
+ * @param bool wide  true to select the 64-bit-family member
+ * @return WasmBinOpInfo  the resolved opcode + compare classification
+ */
+fn wasm_binop_info(op: lir::LBinOp, wide: bool) -> WasmBinOpInfo {
+    match op {
+        lir::LBinOp::IAdd => WasmBinOpInfo { opcode = if wide { 0x7C to byte } else { 0x6A to byte }; is_cmp = false }
+        lir::LBinOp::ISub => WasmBinOpInfo { opcode = if wide { 0x7D to byte } else { 0x6B to byte }; is_cmp = false }
+        lir::LBinOp::IMul => WasmBinOpInfo { opcode = if wide { 0x7E to byte } else { 0x6C to byte }; is_cmp = false }
+        lir::LBinOp::IDivS => WasmBinOpInfo { opcode = if wide { 0x7F to byte } else { 0x6D to byte }; is_cmp = false }
+        lir::LBinOp::IDivU => WasmBinOpInfo { opcode = if wide { 0x80 to byte } else { 0x6E to byte }; is_cmp = false }
+        lir::LBinOp::IRemS => WasmBinOpInfo { opcode = if wide { 0x81 to byte } else { 0x6F to byte }; is_cmp = false }
+        lir::LBinOp::IRemU => WasmBinOpInfo { opcode = if wide { 0x82 to byte } else { 0x70 to byte }; is_cmp = false }
+        lir::LBinOp::IAnd => WasmBinOpInfo { opcode = if wide { 0x83 to byte } else { 0x71 to byte }; is_cmp = false }
+        lir::LBinOp::IOr => WasmBinOpInfo { opcode = if wide { 0x84 to byte } else { 0x72 to byte }; is_cmp = false }
+        lir::LBinOp::IXor => WasmBinOpInfo { opcode = if wide { 0x85 to byte } else { 0x73 to byte }; is_cmp = false }
+        lir::LBinOp::IShl => WasmBinOpInfo { opcode = if wide { 0x86 to byte } else { 0x74 to byte }; is_cmp = false }
+        lir::LBinOp::IShrS => WasmBinOpInfo { opcode = if wide { 0x87 to byte } else { 0x75 to byte }; is_cmp = false }
+        lir::LBinOp::IShrU => WasmBinOpInfo { opcode = if wide { 0x88 to byte } else { 0x76 to byte }; is_cmp = false }
+        lir::LBinOp::ICmpEq => WasmBinOpInfo { opcode = if wide { 0x51 to byte } else { 0x46 to byte }; is_cmp = true }
+        lir::LBinOp::ICmpNe => WasmBinOpInfo { opcode = if wide { 0x52 to byte } else { 0x47 to byte }; is_cmp = true }
+        lir::LBinOp::ICmpLtS => WasmBinOpInfo { opcode = if wide { 0x53 to byte } else { 0x48 to byte }; is_cmp = true }
+        lir::LBinOp::ICmpLtU => WasmBinOpInfo { opcode = if wide { 0x54 to byte } else { 0x49 to byte }; is_cmp = true }
+        lir::LBinOp::ICmpLeS => WasmBinOpInfo { opcode = if wide { 0x57 to byte } else { 0x4C to byte }; is_cmp = true }
+        lir::LBinOp::ICmpLeU => WasmBinOpInfo { opcode = if wide { 0x58 to byte } else { 0x4D to byte }; is_cmp = true }
+        lir::LBinOp::ICmpGtS => WasmBinOpInfo { opcode = if wide { 0x55 to byte } else { 0x4A to byte }; is_cmp = true }
+        lir::LBinOp::ICmpGtU => WasmBinOpInfo { opcode = if wide { 0x56 to byte } else { 0x4B to byte }; is_cmp = true }
+        lir::LBinOp::ICmpGeS => WasmBinOpInfo { opcode = if wide { 0x59 to byte } else { 0x4E to byte }; is_cmp = true }
+        lir::LBinOp::ICmpGeU => WasmBinOpInfo { opcode = if wide { 0x5A to byte } else { 0x4F to byte }; is_cmp = true }
+        lir::LBinOp::FAdd => WasmBinOpInfo { opcode = if wide { 0xA0 to byte } else { 0x92 to byte }; is_cmp = false }
+        lir::LBinOp::FSub => WasmBinOpInfo { opcode = if wide { 0xA1 to byte } else { 0x93 to byte }; is_cmp = false }
+        lir::LBinOp::FMul => WasmBinOpInfo { opcode = if wide { 0xA2 to byte } else { 0x94 to byte }; is_cmp = false }
+        lir::LBinOp::FDiv => WasmBinOpInfo { opcode = if wide { 0xA3 to byte } else { 0x95 to byte }; is_cmp = false }
+        lir::LBinOp::FCmpEq => WasmBinOpInfo { opcode = if wide { 0x61 to byte } else { 0x5B to byte }; is_cmp = true }
+        lir::LBinOp::FCmpNe => WasmBinOpInfo { opcode = if wide { 0x62 to byte } else { 0x5C to byte }; is_cmp = true }
+        lir::LBinOp::FCmpLt => WasmBinOpInfo { opcode = if wide { 0x63 to byte } else { 0x5D to byte }; is_cmp = true }
+        lir::LBinOp::FCmpLe => WasmBinOpInfo { opcode = if wide { 0x65 to byte } else { 0x5F to byte }; is_cmp = true }
+        lir::LBinOp::FCmpGt => WasmBinOpInfo { opcode = if wide { 0x64 to byte } else { 0x5E to byte }; is_cmp = true }
+        lir::LBinOp::FCmpGe => WasmBinOpInfo { opcode = if wide { 0x66 to byte } else { 0x60 to byte }; is_cmp = true }
+    }
+}
+
+/**
+ * stackify_bin — the `LBin` lowering: `local.get a; local.get b; <opcode>;
+ * local.set r` for every case (`wasm_binop_info`). The result's wasm valtype
+ * is `i32` for a compare, else inherited from operand `a` (an SSA guarantee:
+ * `a` was already lowered, and its valtype recorded, before this use —
+ * mirrors `isel_arm64.tks`'s `select_bin` reading `a`'s already-recorded
+ * `class_of` entry).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LBin b  the binary op
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_bin(ctx0: StackifyCtx, inst: lir::LInst, b: lir::LBin) -> StackifyCtx {
+    let a_vt = wvt_get(ctx0.vtypes, b.a)
+    let wide = a_vt == wasm_vt_i64() || a_vt == wasm_vt_f64()
+    let info = wasm_binop_info(b.op, wide)
+    let ctx1 = sc_local_get(ctx0, b.a)
+    let ctx2 = sc_local_get(ctx1, b.b)
+    let ctx3 = sc_byte(ctx2, info.opcode)
+    let ctx4 = sc_local_set(ctx3, inst.result)
+    let dst_vt = if info.is_cmp { wasm_vt_i32() } else { a_vt }
+    sc_set_vtype(ctx4, inst.result, dst_vt)
+}
+
+/**
+ * stackify_ineg — the `INeg` lowering: wasm has no native integer negate, so
+ * `INeg a` renders as `0 - a` (`<width>.const 0; local.get a; <width>.sub`),
+ * matching the design doc's worked example (§4.4). The result stays at
+ * operand `a`'s own width (mirroring arm64's own `wide=a_info.wide`
+ * propagation).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param u8 a_vt  `a`'s already-recorded wasm valtype
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_ineg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
+    let wide = a_vt == wasm_vt_i64()
+    let const_op = if wide { 0x42 to byte } else { 0x41 to byte }
+    let sub_op = if wide { 0x7D to byte } else { 0x6B to byte }
+    let ctx1 = sc_sleb(sc_byte(ctx0, const_op), 0 to i64)
+    let ctx2 = sc_local_get(ctx1, a)
+    let ctx3 = sc_byte(ctx2, sub_op)
+    let ctx4 = sc_local_set(ctx3, inst.result)
+    sc_set_vtype(ctx4, inst.result, a_vt)
+}
+
+/**
+ * stackify_inot — the `INot` lowering: wasm has no native bitwise-not, so
+ * `INot a` renders as `a XOR -1` (`<width>.const -1; local.get a;
+ * <width>.xor`), matching the design doc's worked example (§4.4).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param u8 a_vt  `a`'s already-recorded wasm valtype
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_inot(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
+    let wide = a_vt == wasm_vt_i64()
+    let const_op = if wide { 0x42 to byte } else { 0x41 to byte }
+    let xor_op = if wide { 0x85 to byte } else { 0x73 to byte }
+    let ctx1 = sc_sleb(sc_byte(ctx0, const_op), -1 to i64)
+    let ctx2 = sc_local_get(ctx1, a)
+    let ctx3 = sc_byte(ctx2, xor_op)
+    let ctx4 = sc_local_set(ctx3, inst.result)
+    sc_set_vtype(ctx4, inst.result, a_vt)
+}
+
+/**
+ * stackify_fneg — the `FNeg` lowering: wasm's native `f32.neg`/`f64.neg`,
+ * selected by operand `a`'s own recorded float width.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param u8 a_vt  `a`'s already-recorded wasm valtype
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_fneg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
+    let op = if a_vt == wasm_vt_f64() { 0x9A to byte } else { 0x8C to byte }
+    let ctx1 = sc_byte(sc_local_get(ctx0, a), op)
+    let ctx2 = sc_local_set(ctx1, inst.result)
+    sc_set_vtype(ctx2, inst.result, a_vt)
+}
+
+/**
+ * stackify_trunc — the `Trunc` lowering: always an `i32` result (mirroring
+ * arm64's own `select_identity_mov(..., wide=false)` "Trunc always picks the
+ * W form"). When the operand is already `i32`-family (its write already
+ * narrow), the op is a plain local-to-local copy; when it is `i64`, an
+ * explicit `i32.wrap_i64` performs the real narrowing.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param u8 a_vt  `a`'s already-recorded wasm valtype
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_trunc(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
+    let ctx1 = sc_local_get(ctx0, a)
+    let ctx2 = if a_vt == wasm_vt_i64() { sc_byte(ctx1, 0xA7 to byte) } else { ctx1 }
+    let ctx3 = sc_local_set(ctx2, inst.result)
+    sc_set_vtype(ctx3, inst.result, wasm_vt_i32())
+}
+
+/**
+ * stackify_identity — the `ZExt`/`SExt` lowering: a plain local-to-local
+ * copy at operand `a`'s OWN width (mirroring arm64's own `select_identity_
+ * mov(..., wide=a_info.wide)` — "the LIR carries no per-value width for
+ * these... a bit-preserving move is the honest match for that same
+ * semantics"; a real narrowing/widening extend is selected once a value
+ * instead crosses a typed memory boundary, `LLoad`'s own `ty`).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param u8 a_vt  `a`'s already-recorded wasm valtype
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_identity(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
+    let ctx1 = sc_local_get(ctx0, a)
+    let ctx2 = sc_local_set(ctx1, inst.result)
+    sc_set_vtype(ctx2, inst.result, a_vt)
+}
+
+/**
+ * stackify_itof — the `IToF` lowering: always an `f64` result (mirroring
+ * arm64's own `select_itof`'s always-D-form default), signed source
+ * (`LUnOp` declares no unsigned `IToF` variant, the same documented default
+ * `select_itof` uses), the source opcode selected by operand `a`'s own
+ * recorded integer width.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param u8 a_vt  `a`'s already-recorded wasm valtype
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_itof(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
+    let op = if a_vt == wasm_vt_i64() { 0xB9 to byte } else { 0xB7 to byte }
+    let ctx1 = sc_byte(sc_local_get(ctx0, a), op)
+    let ctx2 = sc_local_set(ctx1, inst.result)
+    sc_set_vtype(ctx2, inst.result, wasm_vt_f64())
+}
+
+/**
+ * stackify_ftoi — the `FToI` lowering: always an `i32` result, signed
+ * destination (mirroring arm64's own `select_ftoi`'s `Fcvtzs`-always
+ * default), the source opcode selected by operand `a`'s own recorded float
+ * width.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param u8 a_vt  `a`'s already-recorded wasm valtype
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_ftoi(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
+    let op = if a_vt == wasm_vt_f64() { 0xAA to byte } else { 0xA8 to byte }
+    let ctx1 = sc_byte(sc_local_get(ctx0, a), op)
+    let ctx2 = sc_local_set(ctx1, inst.result)
+    sc_set_vtype(ctx2, inst.result, wasm_vt_i32())
+}
+
+/**
+ * stackify_ftof — the `FToF` lowering: the ONLY two-float-width family, so
+ * (unlike every other `LUn` case) the result width is the OPPOSITE of the
+ * operand's — `f64` demotes to `f32`, `f32` promotes to `f64` — the total,
+ * symmetric reading of "convert between the two wasm float widths" the LIR
+ * gives no further information to refine.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param u8 a_vt  `a`'s already-recorded wasm valtype
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_ftof(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
+    let demote = a_vt == wasm_vt_f64()
+    let op = if demote { 0xB6 to byte } else { 0xBB to byte }
+    let dst_vt = if demote { wasm_vt_f32() } else { wasm_vt_f64() }
+    let ctx1 = sc_byte(sc_local_get(ctx0, a), op)
+    let ctx2 = sc_local_set(ctx1, inst.result)
+    sc_set_vtype(ctx2, inst.result, dst_vt)
+}
+
+/**
+ * stackify_un — the `LUn` dispatch: one lowering per `LUnOp` case
+ * (`backend-c1-wasm.md` §4.4), operand `a`'s wasm valtype read once and
+ * threaded to whichever case handles it.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LUn u  the unary op
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_un(ctx0: StackifyCtx, inst: lir::LInst, u: lir::LUn) -> StackifyCtx {
+    let a_vt = wvt_get(ctx0.vtypes, u.a)
+    match u.op {
+        lir::LUnOp::INeg => stackify_ineg(ctx0, inst, u.a, a_vt)
+        lir::LUnOp::INot => stackify_inot(ctx0, inst, u.a, a_vt)
+        lir::LUnOp::FNeg => stackify_fneg(ctx0, inst, u.a, a_vt)
+        lir::LUnOp::Trunc => stackify_trunc(ctx0, inst, u.a, a_vt)
+        lir::LUnOp::ZExt => stackify_identity(ctx0, inst, u.a, a_vt)
+        lir::LUnOp::SExt => stackify_identity(ctx0, inst, u.a, a_vt)
+        lir::LUnOp::IToF => stackify_itof(ctx0, inst, u.a, a_vt)
+        lir::LUnOp::FToI => stackify_ftoi(ctx0, inst, u.a, a_vt)
+        lir::LUnOp::FToF => stackify_ftof(ctx0, inst, u.a, a_vt)
+    }
+}
+
+/**
+ * stackify_param — the `LParam` lowering: `local.get $index; local.set $r`
+ * (a plain local-to-local copy). `index` and `r` NAME THE SAME local for
+ * every param the LIR lowering ever emits (`LParam{index}` always defines
+ * VReg `index`, `lower.tks`'s own `param_inst(i, i, ...)` convention), so
+ * this is a redundant-but-always-correct self-copy rather than a trusted
+ * alias — the copy form is emitted regardless, so correctness never depends
+ * on that unchecked invariant continuing to hold (mirrors §3.2's own
+ * "do NOT blind-trust" discipline).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LFunc f  the enclosing function (its `param_types`)
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LParam p  the parameter op
+ * @return StackifyCtx | error  the advanced context, or a NAMED error when
+ *                              `p.index` is out of range (internal), or
+ *                              `wasm_valtype`'s propagated honest-stop
+ */
+fn stackify_param(ctx0: StackifyCtx, f: lir::LFunc, inst: lir::LInst, p: lir::LParam) -> StackifyCtx | error {
+    if (p.index to u64) >= f.param_types.len {
+        return error { message = "stackify: param index out of range (internal)" }
+    }
+    let vt = match wasm_valtype(f.param_types[p.index to u64]) { u8 as v => v; error as e => return e }
+    let ctx1 = sc_local_set(sc_local_get(ctx0, p.index), inst.result)
+    sc_set_vtype(ctx1, inst.result, vt)
+}
+
+/**
+ * stackify_ret — the `LRet` lowering: for a value-carrying return, push the
+ * returned VReg's local then `return` (`0x0F`); a void return emits `return`
+ * alone. `return` is used unconditionally (rather than relying on the
+ * fall-off-the-end-of-the-function form) so the lowering is correct
+ * regardless of `LRet`'s position in the instruction stream.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LRet r  the return op
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_ret(ctx0: StackifyCtx, r: lir::LRet) -> StackifyCtx {
+    let ctx1 = if r.has_value { sc_local_get(ctx0, r.value) } else { ctx0 }
+    sc_byte(ctx1, 0x0F to byte)
+}
+
+/**
+ * stackify_field_addr — the `LFieldAddr` lowering: `local.get $base;
+ * i32.const offset; i32.add; local.set $r` — pure `i32` (`Ptr`) arithmetic,
+ * no linear-memory layout knowledge needed (unlike `LAlloca`/`LGlobalAddr`,
+ * this op only ever adds a compile-time-constant byte offset onto an
+ * already-computed address).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LFieldAddr fa  the field-address op
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_field_addr(ctx0: StackifyCtx, inst: lir::LInst, fa: lir::LFieldAddr) -> StackifyCtx {
+    let ctx1 = sc_local_get(ctx0, fa.base)
+    let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), fa.offset to i64)
+    let ctx3 = sc_byte(ctx2, 0x6A to byte)
+    let ctx4 = sc_local_set(ctx3, inst.result)
+    sc_set_vtype(ctx4, inst.result, wasm_vt_i32())
+}
+
+/**
+ * stackify_load — the `LLoad` lowering: `local.get $addr; <ty>.load
+ * align,0; local.set $r` (`wasm_mem_op` resolves the opcode/alignment/
+ * valtype from `l.ty`). The offset is always `0` — any static field offset
+ * already rode a preceding `LFieldAddr` into the address.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LLoad l  the load op
+ * @return StackifyCtx | error  the advanced context, or `wasm_mem_op`'s
+ *                              propagated honest-stop
+ */
+fn stackify_load(ctx0: StackifyCtx, inst: lir::LInst, l: lir::LLoad) -> StackifyCtx | error {
+    let mem = match wasm_mem_op(l.ty) { WasmMemOp as m => m; error as e => return e }
+    let ctx1 = sc_local_get(ctx0, l.addr)
+    let ctx2 = sc_byte(ctx1, mem.load_op)
+    let ctx3 = sc_memarg(ctx2, mem.align, 0 to u32)
+    let ctx4 = sc_local_set(ctx3, inst.result)
+    sc_set_vtype(ctx4, inst.result, mem.valtype)
+}
+
+/**
+ * stackify_store — the `LStore` lowering: `local.get $addr; local.get
+ * $value; <ty>.store align,0` (no result). The `i32`-vs-`i64` store FAMILY
+ * is derived from `s.ty` (mirroring arm64's own `select_store`'s "size +
+ * register file from the stored ty", reading through to the value operand
+ * rather than trusting its own recorded valtype) — a well-formed-LIR
+ * precondition: `s.value`'s own actual local already agrees with `s.ty`'s
+ * implied width.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LStore s  the store op
+ * @return StackifyCtx | error  the advanced context, or `wasm_mem_op`'s
+ *                              propagated honest-stop
+ */
+fn stackify_store(ctx0: StackifyCtx, s: lir::LStore) -> StackifyCtx | error {
+    let mem = match wasm_mem_op(s.ty) { WasmMemOp as m => m; error as e => return e }
+    let ctx1 = sc_local_get(ctx0, s.addr)
+    let ctx2 = sc_local_get(ctx1, s.value)
+    let ctx3 = sc_byte(ctx2, mem.store_op)
+    sc_memarg(ctx3, mem.align, 0 to u32)
+}
+
+/**
+ * WasmCallTarget — one already-resolved call target: the callee's wasm
+ * function index and its return machine class (`Void` for a callee that
+ * returns nothing). `stackify_call` needs both to decide whether a result
+ * lands in a local, is dropped, or is absent — a decision that fundamentally
+ * needs the CALLEE's own signature, external knowledge `LCall` itself does
+ * not carry.
+ */
+pub type WasmCallTarget = struct {
+    /**
+     * func_index — the callee's index into the module's function index
+     * space (imports first, then defined functions).
+     */
+    func_index: u32
+    /**
+     * ret_type — the callee's return machine class (`Void` for no return
+     * value).
+     */
+    ret_type: lir::LType
+}
+
+/**
+ * WasmSymbolTable — a caller-supplied resolver mapping an already-mangled
+ * `LCall.symbol` to its `WasmCallTarget`. Resolving every function/import in
+ * a whole program to its index is module-level "link/dispatch" work
+ * (`backend-c1-wasm.md` C1-5); this slice only needs to TRANSLATE a call
+ * instruction given an already-resolved target, so the table is built and
+ * threaded in by the caller rather than derived here.
+ */
+pub type WasmSymbolTable = struct {
+    /**
+     * symbols — the registered already-mangled symbols, parallel to
+     * `targets`.
+     */
+    symbols: []str
+    /**
+     * targets — each symbol's resolved call target, parallel to `symbols`.
+     */
+    targets: []WasmCallTarget
+}
+
+/**
+ * wasm_symtab_empty — a resolver table with no symbols registered yet.
+ *
+ * @return WasmSymbolTable  the empty table
+ */
+pub fn wasm_symtab_empty() -> WasmSymbolTable {
+    WasmSymbolTable { symbols = teko::list::empty(); targets = teko::list::empty() }
+}
+
+/**
+ * wasm_symtab_add — register `symbol`'s call target, returning the
+ * extended table.
+ *
+ * @param WasmSymbolTable t  the table to extend
+ * @param str symbol  the already-mangled symbol to register
+ * @param WasmCallTarget target  its resolved call target
+ * @return WasmSymbolTable  the extended table
+ */
+pub fn wasm_symtab_add(t: WasmSymbolTable, symbol: str, target: WasmCallTarget) -> WasmSymbolTable {
+    WasmSymbolTable { symbols = teko::list::push(t.symbols, symbol); targets = teko::list::push(t.targets, target) }
+}
+
+/**
+ * wasm_resolve_call — the `WasmCallTarget` registered under `symbol`, or a
+ * NAMED error when it was never registered (a genuine "the caller owed us
+ * this" boundary — resolving every program symbol is C1-5's link/dispatch
+ * job, not this slice's).
+ *
+ * @param WasmSymbolTable t  the resolver table to search
+ * @param str symbol  the already-mangled symbol to resolve
+ * @return WasmCallTarget | error  the resolved target, or a NAMED error
+ */
+fn wasm_resolve_call(t: WasmSymbolTable, symbol: str) -> WasmCallTarget | error {
+    mut i: u64 = 0
+    loop {
+        if i >= t.symbols.len { break }
+        if t.symbols[i] == symbol { return t.targets[i] }
+        i++
+    }
+    error { message = $"stackify: unresolved call symbol '{symbol}' — the caller must register it in the WasmSymbolTable first (link/dispatch is C1-5 territory)" }
+}
+
+/**
+ * stackify_call — the `LCall` lowering: push every argument's local, `call
+ * $funcidx` (`wasm_resolve_call` names the target). When the callee returns
+ * a value: captured into the result's local when `inst.has_result`, else
+ * `drop`ped (`0x1A`) to keep the operand stack balanced for a
+ * statement-level call whose result is discarded. A `Void`-returning callee
+ * needs neither.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param WasmSymbolTable symbols  the call-target resolver
+ * @param LInst inst  the enclosing instruction (its result VReg, and
+ *                     whether the caller captures the result)
+ * @param LCall c  the call op
+ * @return StackifyCtx | error  the advanced context, or a propagated
+ *                              honest-stop (an unresolved symbol, or the
+ *                              callee's own `C1-i128`/`C1-f16` return type)
+ */
+fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, c: lir::LCall) -> StackifyCtx | error {
+    let target = match wasm_resolve_call(symbols, c.symbol) { WasmCallTarget as t => t; error as e => return e }
+    mut ctx = ctx0
+    mut i: u64 = 0
+    loop {
+        if i >= c.args.len { break }
+        ctx = sc_local_get(ctx, c.args[i])
+        i++
+    }
+    ctx = sc_uleb(sc_byte(ctx, 0x10 to byte), target.func_index to u64)
+    if target.ret_type == lir::LType::Void {
+        return ctx
+    }
+    let vt = match wasm_valtype(target.ret_type) { u8 as v => v; error as e => return e }
+    if inst.has_result {
+        let captured = sc_local_set(ctx, inst.result)
+        return sc_set_vtype(captured, inst.result, vt)
+    }
+    sc_byte(ctx, 0x1A to byte)
+}
+
+/**
+ * stackify_inst — the per-`LOp` dispatch: a total match over the closed
+ * 16-case `LOp` alphabet (`backend-c1-wasm.md` §1). The straight-line subset
+ * (`LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`/`LFieldAddr`/
+ * `LLoad`/`LStore`/`LCall`) lowers to real wasm bytes; every other case is a
+ * NAMED honest-stop naming the slice that owns it — `LJump`/`LBranch`
+ * (structured control flow, C1-3), `LAlloca`/`LGlobalAddr` (the
+ * shadow-stack/rodata linear-memory layout, C1-4), `LCallIndirect`/
+ * `LFuncAddr` (the funcref table, C1-4/C1-5) — so a function that needs them
+ * stops honestly rather than being silently mis-lowered.
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param LFunc f  the enclosing function (`LParam` needs its `param_types`)
+ * @param WasmSymbolTable symbols  the call-target resolver (`LCall`)
+ * @param LInst inst  the instruction to lower
+ * @return StackifyCtx | error  the advanced context, or a propagated/named
+ *                              honest-stop
+ */
+fn stackify_inst(ctx: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, inst: lir::LInst) -> StackifyCtx | error {
+    match inst.op {
+        lir::LConstInt as c => stackify_const_int(ctx, inst, c)
+        lir::LConstFloat as c => stackify_const_float(ctx, inst, c)
+        lir::LBin as b => stackify_bin(ctx, inst, b)
+        lir::LUn as u => stackify_un(ctx, inst, u)
+        lir::LParam as p => stackify_param(ctx, f, inst, p)
+        lir::LRet as r => stackify_ret(ctx, r)
+        lir::LJump => error { message = "stackify: C1-3-required — a jump between blocks needs the structured-control CFGStackify pass (block/loop/br), not yet implemented (C1-3)" }
+        lir::LBranch => error { message = "stackify: C1-3-required — a conditional branch needs the structured-control CFGStackify pass (if/else/br_if), not yet implemented (C1-3)" }
+        lir::LAlloca => error { message = "stackify: C1-alloca — a stack allocation needs the shadow-stack SP global + linear-memory layout, not yet implemented (C1-4)" }
+        lir::LFieldAddr as fa => stackify_field_addr(ctx, inst, fa)
+        lir::LLoad as l => stackify_load(ctx, inst, l)
+        lir::LStore as s => stackify_store(ctx, s)
+        lir::LGlobalAddr => error { message = "stackify: C1-globaladdr — a rodata/global address needs the data-section layout, not yet implemented (C1-4)" }
+        lir::LCallIndirect => error { message = "stackify: C1-callindirect — an indirect call needs the wasm funcref table, not yet implemented (C1-4/C1-5)" }
+        lir::LFuncAddr => error { message = "stackify: C1-funcaddr — a function-value address needs the wasm funcref table, not yet implemented (C1-4/C1-5)" }
+        lir::LCall as c => stackify_call(ctx, symbols, inst, c)
+    }
+}
+
+/**
+ * stackify_insts — lower every instruction of `insts`, in order, threading
+ * the context forward and short-circuiting on the first error.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param LFunc f  the enclosing function
+ * @param WasmSymbolTable symbols  the call-target resolver
+ * @param []LInst insts  the instruction stream to lower
+ * @return StackifyCtx | error  the fully-advanced context, or the first
+ *                              propagated error
+ */
+fn stackify_insts(ctx0: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, insts: []lir::LInst) -> StackifyCtx | error {
+    mut ctx = ctx0
+    mut i: u64 = 0
+    loop {
+        if i >= insts.len { break }
+        let stepped = match stackify_inst(ctx, f, symbols, insts[i]) { StackifyCtx as c => c; error as e => return e }
+        ctx = stepped
+        i++
+    }
+    ctx
+}
+
+/**
+ * wasm_local_groups_of — the non-parameter locals declared after `from`
+ * (inclusive) up to `to` (exclusive), read from `vtypes` and run-length
+ * compressed into `(count, valtype)` groups (wasm's own local-declaration
+ * shape, `objfile_wasm.tks`'s `WasmLocalGroup`).
+ *
+ * @param WasmVTypeTable vtypes  the fully-populated per-VReg valtype table
+ * @param u32 from  the first non-parameter VReg id (== `f.n_params`)
+ * @param u32 to  one past the last VReg id (== `f.next_vreg`)
+ * @return []WasmLocalGroup  the run-length-compressed local declarations
+ */
+fn wasm_local_groups_of(vtypes: WasmVTypeTable, from: u32, to: u32) -> []WasmLocalGroup {
+    mut groups: []WasmLocalGroup = teko::list::empty()
+    mut i: u32 = from
+    mut cur_vt: u8 = 0 to u8
+    mut cur_count: u32 = 0 to u32
+    mut have_cur = false
+    loop {
+        if i >= to { break }
+        let vt = wvt_get(vtypes, i)
+        if have_cur && vt == cur_vt {
+            cur_count++
+        } else {
+            if have_cur {
+                groups = teko::list::push(groups, WasmLocalGroup { count = cur_count; valtype = cur_vt })
+            }
+            cur_vt = vt
+            cur_count = 1 to u32
+            have_cur = true
+        }
+        i++
+    }
+    if have_cur {
+        groups = teko::list::push(groups, WasmLocalGroup { count = cur_count; valtype = cur_vt })
+    }
+    groups
+}
+
+/**
+ * WasmFuncBody — one straight-line `LFunc`'s lowered wasm code-entry
+ * payload: its non-parameter local declarations and its instruction body
+ * bytes (already terminated by the code-entry `end`, `0x0B`). The caller
+ * (a later slice, wiring a whole `WasmModule`) pairs this with a resolved
+ * `type_index` to build the `objfile_wasm.tks` `WasmFunc` `emit_wasm`
+ * packages into the code section — this slice stops at the per-function
+ * payload, since interning a module-wide type table is C1-5 "link/dispatch"
+ * territory, not per-function instruction lowering.
+ *
+ * @since #389 C1-2
+ */
+pub type WasmFuncBody = struct {
+    /**
+     * local_groups — the non-parameter locals, as run-length `(count,
+     * valtype)` groups in local-index order.
+     */
+    local_groups: []WasmLocalGroup
+    /**
+     * body — the function body bytes, ending with the code-entry `end`
+     * (`0x0B`).
+     */
+    body: []byte
+}
+
+/**
+ * stackify_func — lower one straight-line `LFunc` to its `WasmFuncBody`:
+ * every VReg becomes its own wasm local (`backend-c1-wasm.md` §4.1 — no
+ * register allocation, just a total `VReg -> local index` identity map), the
+ * sole block's instructions lower via `stackify_insts`, and the body is
+ * closed with the code-entry `end`. A function with more than one block is
+ * the NAMED honest-stop `C1-3-required`: mapping arbitrary inter-block edges
+ * to wasm's structured `block`/`loop`/`if` scopes is the CFGStackify region
+ * pass, out of this slice's scope (C1-3) — this slice only lowers the
+ * single-block (branch-free) subset.
+ *
+ * @param LFunc f  the function to lower (`f.blocks` must hold exactly one
+ *                 block)
+ * @param WasmSymbolTable calls  the call-target resolver (`LCall`)
+ * @return WasmFuncBody | error  the lowered payload, or a NAMED honest-stop
+ *                               (`C1-3-required` for multi-block input, or
+ *                               any instruction's own propagated stop)
+ */
+pub fn stackify_func(f: lir::LFunc, calls: WasmSymbolTable) -> WasmFuncBody | error {
+    if f.blocks.len != 1 {
+        return error { message = "stackify: C1-3-required — stackify_func only lowers single-block (straight-line) functions; multi-block control flow needs the structured-control CFGStackify pass (C1-3)" }
+    }
+    let ctx0 = StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty() }
+    let done = match stackify_insts(ctx0, f, calls, f.blocks[0].insts) { StackifyCtx as c => c; error as e => return e }
+    let body = teko::list::push(done.body, 0x0B to byte)
+    let groups = wasm_local_groups_of(done.vtypes, f.n_params, f.next_vreg)
+    WasmFuncBody { local_groups = groups; body = body }
+}
