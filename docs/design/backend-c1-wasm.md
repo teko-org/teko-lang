@@ -234,6 +234,43 @@ an honest-stop). Rationale, law-first:
   what lets the region reconstruction be a simple, total, one-pass placement instead of a general
   relooper — while remaining robust to block ordering (M.2) and honest about the one impossible case.
 
+### 3.2.1 Prior-art validation (a 6-toolchain survey, folded in at C1-3)
+
+Before C1-3 landed, the integrator surveyed Zig, LLVM, Emscripten/Relooper, Go, Ramsey's "Beyond
+Relooper" (ICFP'22), and the WASI-vs-Browser split — confirming the CFGStackify bet above, and
+explaining *why* it is the right one for THIS codebase specifically:
+
+- **The decisive analog: Zig (own backend, source is already goto-free).** Zig's
+  `src/codegen/wasm/CodeGen.zig` has **no relooper, no CFGStackify, no region-tree rebuild** — its IR
+  (AIR) arrives at the backend **already structured** (`block`/`loop`/`cond_br`/`br`/`repeat`), because
+  ZIR→Sema preserve the source's own goto-free structure end to end. The backend is a recursive walk
+  with one `block_depth` counter; branch resolution is `br (block_depth - recorded_depth)` arithmetic.
+  Irreducibility literally cannot arise, so Zig carries no tripwire for it at all.
+- **Why C1 cannot take Zig's shortcut.** Zig skips CFGStackify because its IR stays structured
+  end-to-end. **The LIR is FLAT on purpose** (`LFunc.blocks` + `LJump`/`LBranch`, SSA-lite) — shared by
+  the 4 register targets, whose isel + linear-scan regalloc need a linearized CFG. This puts C1 in
+  LLVM's situation (flat IR → `WebAssemblyCFGStackify` + `FixIrreducibleControlFlow`), not Zig's.
+  Ramsey's dominator-based structuring (ICFP'22) is the correct, clean algorithm for a flat *reducible*
+  CFG — exactly the scoped CFGStackify this section specifies.
+- **The refinement considered and REJECTED: a Zig-like lowering side-table.** `lower_loop`/
+  `lower_if_*`/`lower_match_*` already know their own loop headers/diamonds at lowering time; the
+  backend could just trust a side-table instead of recomputing dominators. Rejected: (1) it would touch
+  the SHARED `lower.tks`, risking byte-identity on the 4 shipped native targets plus W15/coverage churn;
+  (2) it creates a desync hazard — the side-table would need to survive any future block-level transform
+  between lowering and this backend; (3) it dilutes the C1 architectural proof ("the LIR alone drives the
+  stack machine — wasm touches nothing upstream"). A well-understood dominator pass is worth more than
+  that coupling.
+- **Go's giant dispatch loop — the anti-pattern.** Go compiles goroutine bodies to one big loop plus a
+  `br_table` dispatching on a "PC" variable — universal (accepts irreducible input) but slow (every edge
+  pays the dispatch), justified there only by goroutine stack-switching. Wrong for Teko: it would erase
+  the whole point of emitting structured control flow.
+- **WASI vs Browser: zero control-flow difference.** `block`/`loop`/`br`/`br_table` are core-spec and
+  host-agnostic; no surveyed toolchain branches its CFG lowering by host. The WASI/Browser split (C1-4
+  onward) is entirely an imports/runtime-boundary concern, never a control-flow one.
+
+**Verdict:** no plan change — §3.2's scoped CFGStackify is confirmed, now with the empirical grounding
+above (PR #403 ratification, 2026-07-11).
+
 ### 3.3 The algorithm (specialized CFGStackify)
 
 The pass (`stackify_control` in `stackify.tks`) mirrors LLVM's marker-placement approach:
