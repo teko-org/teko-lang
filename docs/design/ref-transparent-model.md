@@ -30,25 +30,25 @@ As três legais **não se confundem**:
 
 - `let x: T` — não rebinda, não muta. Cópia congelada.
 - `mut x: T` — muta o local, mas **não é ponteiro**; não aliasa nada. Anexar isto a um `Ref<>` **copia**.
-- `mut x: Ref<T>` — o único que aliasa; write-through.
+- `ref x: T` — o único que aliasa; write-through (tipo subjacente `Ref<T>`).
 
 A célula proibida (`let x: Ref<T>`) diz: **não existe referência imutável.** Leitura imutável ⟹ cópia (`let x: T`). Consequência deliberada: **referência ⟹ sempre canal de escrita; imutabilidade ⟹ sempre posse de valor.**
 
 ---
 
-## 3. Sintaxe: o modificador `ref`
+## 3. Sintaxe: o modificador `ref` — forma PRIMÁRIA e EXCLUSIVA
 
-`ref` é o **3º modificador de binding**, açúcar para `mut x: Ref<T>`. A distinção valor-vs-referência só importa no binding (nos use-sites a transparência iguala tudo), então mora ali; o tipo anotado fica limpo.
+`ref` é o **3º modificador de binding**, **forma PRIMÁRIA e EXCLUSIVA** de declarar uma referência. **`mut x: Ref<T>` NÃO EXISTE como binding syntax** — `Ref<T>` é só tipo (em posições-de-tipo). A distinção valor-vs-referência só importa no binding (nos use-sites a transparência iguala tudo), então mora ali; o tipo anotado fica limpo.
 
-| binding      | é                   | tipo subjacente |
-|--------------|---------------------|-----------------|
-| `let x: T`   | valor imutável      | `T`             |
-| `mut x: T`   | valor mutável       | `T`             |
-| `ref x: T`   | referência mutável  | `Ref<T>`        |
+| binding      | é                      | tipo subjacente |
+|--------------|------------------------|-----------------|
+| `let x: T`   | valor imutável         | `T`             |
+| `mut x: T`   | valor mutável          | `T`             |
+| `ref x: T`   | referência mutável     | `Ref<T>` (subjacente) |
 
 - `ref` é **inerentemente** alias-mutável — não há `let ref`/`mut ref`. A regra "sem referência imutável" cai estruturalmente.
 - Param-borrow: `fn accumulate(ref acc: []int, x: int)`.
-- **O tipo `Ref<T>` NÃO desaparece** — vive em toda posição-de-tipo que um modificador de binding não alcança: campos de struct (`r: Ref<T>`), args genéricos (`[]Ref<T>`, `Map<K, Ref<V>>`), retornos (`-> ref T`), e o aninhamento.
+- **O tipo `Ref<T>` NÃO desaparece** — vive em toda posição-de-tipo que um modificador de binding não alcança: campos de struct (`r: Ref<T>`), args genéricos (`[]Ref<T>`, `Map<K, Ref<V>>`), retornos (`-> ref T`), e o aninhamento. Binding **sempre** usa o modificador `ref`, nunca a anotação `Ref<T>`.
 
 ### Aninhamento — `Ref<Ref<T>>` / `**T`
 O modificador `ref` dá o nível **mais externo**; o tipo `Ref<T>` dá os internos:
@@ -106,6 +106,9 @@ Ou seja: você **inicializa/atribui** um `ref` com um **valor** (o desugar encap
 - **Correção (dono 2026-07-11):** Marshall **NÃO** cobre o `valor ↔ Ref` — esse é o **desugar implícito** (§4.1, encapsular/descascar). A cópia `Ref→let` (R8) é a direção *descascar* do desugar, **não** Marshall.
 - **`Ptr<T>` é UNSAFE-only.** `Ptr → Ref` pode **panicar** (tipo incompatível, estouro de memória; checado). Até FFI, se não for `unsafe`, usa **`Ref`**. Relação: `Ref` = seguro/transparente/default; `Ptr` = cru/explícito/`unsafe`, via Marshall.
 
+### Rebind de referências
+Atribuição `ref x = ...` é sempre **write-through** (R4), nunca **rebind** (re-apontar a referência pra outro lugar). O binding é **fixo** por design (C++-style). Para trocar o alvo de duas referências — operação rara e explícita — use a função **SAFE** `teko::marshall::swap<T>(ref a: T, ref b: T)`, que troca os valores pelos quais ambas apontam (não rebind, troca de conteúdo). Ponteiro rebind cru só via `Ptr<T>` / Marshall (territorio `unsafe`).
+
 ---
 
 ## 6. Semântica (as regras base R1–R11)
@@ -159,7 +162,7 @@ As emendas **não são remendos**: são a especificação da *spine* (L1 do remo
 - **A1 — Copy-on-attach + escape TRANSITIVOS.** Materializar/verificar **cada aresta `Ref` alcançável** dentro de agregado/coleção/closure no retorno/store que cruza arena — não só o topo. O escape checker vira **field-sensitive + transitivo**. *(Fecha: struct-field, collection-return, collection-copy, closure-capture, o soundness-hole duro.)*
 - **A2 — Borrow-down é NÃO-ESCAPANTE.** Um `Ref` de borrow-down só flui **pra baixo**; guardá-lo pra cima (out-param mut, campo, coleção, closure que escapa) = erro de compilação. *(Fecha: collection-store, closure-two-hop, parte do DI.)*
 - **A3 — Precedência R5-vs-R7 no param.** Não-Ref **lvalue** → param `ref` = **R7 alias**; não-Ref **rvalue/temporário** → param `ref` = **R5 cópia** (na arena do callee, não-escapante). Distinção lvalue/rvalue explícita. *(Fecha: o conflito de regra genuine-escape/copy-alias-seam.)*
-- **A4 — `mut x: Ref<T>` / `ref x: T` EXIGE init na declaração** (definite-assignment, estilo C++). R3 só barra `let Ref`; um `ref` sem init + R4 (write-through never rebind) = deref de lixo no 1º `=`. Sem binding `ref` não-inicializado. *(Fecha: uninit-Ref.)*
+- **A4 — `ref x: T` EXIGE init na declaração** (definite-assignment, estilo C++). R3 só barra `let Ref`; um `ref` sem init + R4 (write-through never rebind) = deref de lixo no 1º `=`. Sem binding `ref` não-inicializado. *(Fecha: uninit-Ref.)*
 - **A5 — Borrow-down composto no path + R10.** Borrow-down do place `p` só se **todo segmento** do access-path é `mut` (binding-raiz mut E cada campo mut). Write-through via `ref` emprestado **é escrita externa** (sujeita a R10). Path enraizado em `let` nunca é borrow-elegível. *(Fecha: referenceable-path.)*
 - **A6 — Free exige posse + DI monotônico.** `mem::free` (e todo free consumidor) **ILEGAL** via `ref` não-dono (borrow-down/não-owning); o resíduo ganha uma **2ª classe**: "free de storage aliasado por Ref vivo", rastreada interproceduralmente. `#wire` roda check de **monotonicidade de lifetime** (Ref de holder-L só liga a provider ≥L; `singleton ≤ scoped ≤ transient` por profundidade de região) **ou** desugar antes do pass de escape. *(Fecha: defer-free, DI-captive.)*
 
@@ -184,11 +187,10 @@ Até a análise transitiva (a *spine*) existir: `Ref`-dentro-de-agregado-que-esc
 
 1. **Spelling do Marshall** — keyword `marshall`? `teko::marshall(r)`? `r as ptr<T>`? E escopo (só `unsafe`/FFI, ou geral pra a cópia-pra-let?).
 2. **Os "casos específicos" de `let → mut`** — o dono deixou pra discutir; hoje `let ↛ mut`.
-3. **Rebind de `ref`** — default recomendado: **binding fixo** (C++-style, sem rebind por `=`); rebind cru só via `Ptr`/Marshall. Confirmar.
-4. **Sem borrow imutável (`&T`)** — passar objeto grande `let`-possuído só-pra-ler força cópia (a matriz é 2×2, não 2×3). Recomendação: **aceitar o custo** (cópia de arena barata, caso raro) e reavaliar via PGO; introduzir um view read-only só se o profiler apontar cópias grandes quentes.
-5. **Soundness do auto-deref dirigido por tipo (§4)** — regra nova; rodar um mini soundness-pass dedicado antes de cravar (garantir que o descascamento type-directed não reabre nenhum buraco fechado).
-6. **`Ref` como campo de struct** — coberto por A1 (transitividade) + A5 (path); confirmar a interação com tipos adotados/DI-managed.
-7. **Método mutante num `let a`** — recomendação: exige `mut` também (senão `let` não é firewall real). Confirmar (R10 hoje fala só de escrita direta de campo).
+3. **Sem borrow imutável (`&T`)** — passar objeto grande `let`-possuído só-pra-ler força cópia (a matriz é 2×2, não 2×3). Recomendação: **aceitar o custo** (cópia de arena barata, caso raro) e reavaliar via PGO; introduzir um view read-only só se o profiler apontar cópias grandes quentes.
+4. **Soundness do auto-deref dirigido por tipo (§4)** — regra nova; rodar um mini soundness-pass dedicado antes de cravar (garantir que o descascamento type-directed não reabre nenhum buraco fechado).
+5. **`Ref` como campo de struct** — coberto por A1 (transitividade) + A5 (path); confirmar a interação com tipos adotados/DI-managed.
+6. **Método mutante num `let a`** — recomendação: exige `mut` também (senão `let` não é firewall real). Confirmar (R10 hoje fala só de escrita direta de campo).
 
 ---
 
