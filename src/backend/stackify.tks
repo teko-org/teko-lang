@@ -426,15 +426,6 @@ type StackifyCtx = struct {
      * Meaningless when `has_frame` is `false`.
      */
     slots: WasmSlotTable
-    /**
-     * relocs — every `call` site's own `WasmCallReloc` emitted so far,
-     * `offset` relative to `body`'s own start (C1-5, `backend-c1-wasm.md`
-     * §5.4): `stackify_call` appends one entry per lowered `LCall`; the
-     * module assembler (`wasm_assemble_program`) re-bases them onto the
-     * final code section's own byte offsets (`objfile_wasm.tks`'s
-     * `wasm_absolute_code_relocs`).
-     */
-    relocs: []WasmCallReloc
 }
 
 /**
@@ -446,7 +437,7 @@ type StackifyCtx = struct {
  * @return StackifyCtx  the advanced context
  */
 fn sc_byte(ctx: StackifyCtx, b: byte) -> StackifyCtx {
-    StackifyCtx { body = teko::list::push(ctx.body, b); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots; relocs = ctx.relocs }
+    StackifyCtx { body = teko::list::push(ctx.body, b); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -458,7 +449,7 @@ fn sc_byte(ctx: StackifyCtx, b: byte) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_uleb(ctx: StackifyCtx, v: u64) -> StackifyCtx {
-    StackifyCtx { body = emit_uleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots; relocs = ctx.relocs }
+    StackifyCtx { body = emit_uleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -470,7 +461,7 @@ fn sc_uleb(ctx: StackifyCtx, v: u64) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_sleb(ctx: StackifyCtx, v: i64) -> StackifyCtx {
-    StackifyCtx { body = emit_sleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots; relocs = ctx.relocs }
+    StackifyCtx { body = emit_sleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -485,7 +476,7 @@ fn sc_sleb(ctx: StackifyCtx, v: i64) -> StackifyCtx {
 fn sc_f64_bits(ctx: StackifyCtx, bits: u64) -> StackifyCtx {
     let lo = (bits & (0xFFFFFFFF to u64)) to u32
     let hi = (bits >> (32 to u64)) to u32
-    StackifyCtx { body = emit_u32_le(emit_u32_le(ctx.body, lo), hi); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots; relocs = ctx.relocs }
+    StackifyCtx { body = emit_u32_le(emit_u32_le(ctx.body, lo), hi); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -586,25 +577,7 @@ fn sc_global_set(ctx: StackifyCtx, idx: u32) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_set_vtype(ctx: StackifyCtx, vreg: u32, vt: u8) -> StackifyCtx {
-    StackifyCtx { body = ctx.body; vtypes = wvt_set(ctx.vtypes, vreg, vt); scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots; relocs = ctx.relocs }
-}
-
-/**
- * sc_record_call_reloc — append a `WasmCallReloc` to the context's own
- * relocation list, without touching the emitted body bytes (C1-5,
- * `backend-c1-wasm.md` §5.4): `stackify_call` records ONE of these for
- * every `call` instruction it lowers, `offset` the byte position — relative
- * to `body`'s own start — where the just-emitted `0x10` opcode's ULEB128
- * funcidx operand begins.
- *
- * @param StackifyCtx ctx  the context to extend
- * @param u32 offset  the operand's byte offset within `ctx.body`
- * @param u32 func_index  the callee's absolute wasm function index
- * @return StackifyCtx  the advanced context
- */
-fn sc_record_call_reloc(ctx: StackifyCtx, offset: u32, func_index: u32) -> StackifyCtx {
-    let reloc = WasmCallReloc { offset = offset; func_index = func_index }
-    StackifyCtx { body = ctx.body; vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots; relocs = teko::list::push(ctx.relocs, reloc) }
+    StackifyCtx { body = ctx.body; vtypes = wvt_set(ctx.vtypes, vreg, vt); scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -645,7 +618,7 @@ fn wasm_blocktype_void() -> byte {
  */
 fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x02 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_block(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; relocs = opened.relocs }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_block(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots }
 }
 
 /**
@@ -659,7 +632,7 @@ fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
  */
 fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x03 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_loop(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; relocs = opened.relocs }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_loop(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots }
 }
 
 /**
@@ -673,7 +646,7 @@ fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
  */
 fn sc_open_if(ctx: StackifyCtx) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x04 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_if(), 0 to u32); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; relocs = opened.relocs }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_if(), 0 to u32); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots }
 }
 
 /**
@@ -686,7 +659,7 @@ fn sc_open_if(ctx: StackifyCtx) -> StackifyCtx {
  */
 fn sc_close_scope(ctx: StackifyCtx) -> StackifyCtx {
     let closed = sc_byte(ctx, 0x0B to byte)
-    StackifyCtx { body = closed.body; vtypes = closed.vtypes; scopes = wasm_scope_stack_pop(closed.scopes); next_scratch = closed.next_scratch; has_frame = closed.has_frame; frame_base = closed.frame_base; slots = closed.slots; relocs = closed.relocs }
+    StackifyCtx { body = closed.body; vtypes = closed.vtypes; scopes = wasm_scope_stack_pop(closed.scopes); next_scratch = closed.next_scratch; has_frame = closed.has_frame; frame_base = closed.frame_base; slots = closed.slots }
 }
 
 /**
@@ -730,7 +703,7 @@ type ScratchAlloc = struct {
  */
 fn sc_alloc_scratch(ctx0: StackifyCtx, vt: u8) -> ScratchAlloc {
     let id = ctx0.next_scratch
-    let ctx1 = StackifyCtx { body = ctx0.body; vtypes = wvt_set(ctx0.vtypes, id, vt); scopes = ctx0.scopes; next_scratch = id + 1; has_frame = ctx0.has_frame; frame_base = ctx0.frame_base; slots = ctx0.slots; relocs = ctx0.relocs }
+    let ctx1 = StackifyCtx { body = ctx0.body; vtypes = wvt_set(ctx0.vtypes, id, vt); scopes = ctx0.scopes; next_scratch = id + 1; has_frame = ctx0.has_frame; frame_base = ctx0.frame_base; slots = ctx0.slots }
     ScratchAlloc { ctx = ctx1; id = id }
 }
 
@@ -747,7 +720,7 @@ fn sc_alloc_scratch(ctx0: StackifyCtx, vt: u8) -> ScratchAlloc {
  * @return StackifyCtx  the frame-recording context
  */
 fn sc_set_frame(ctx: StackifyCtx, frame_base: u32, slots: WasmSlotTable) -> StackifyCtx {
-    StackifyCtx { body = ctx.body; vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = true; frame_base = frame_base; slots = slots; relocs = ctx.relocs }
+    StackifyCtx { body = ctx.body; vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = true; frame_base = frame_base; slots = slots }
 }
 
 /**
@@ -1757,13 +1730,15 @@ fn wasm_resolve_data(t: WasmSymbolTable, symbol: str) -> u32 | error {
 
 /**
  * stackify_call — the `LCall` lowering: push every argument's local, `call
- * $funcidx` (`wasm_resolve_call` names the target), recording a
- * `WasmCallReloc` for the operand just emitted (`sc_record_call_reloc`,
- * C1-5, §5.4 — `wasm_assemble_program`/`emit_wasm`'s relocatable mode
- * consumes it). When the callee returns a value: captured into the
- * result's local when `inst.has_result`, else `drop`ped (`0x1A`) to keep
+ * $funcidx` (`wasm_resolve_call` names the target). When the callee returns
+ * a value: captured into the result's local when `inst.has_result`, else
+ * `drop`ped (`0x1A`) to keep
  * the operand stack balanced for a statement-level call whose result is
- * discarded. A `Void`-returning callee needs neither.
+ * discarded. A `Void`-returning callee needs neither. The `call`'s funcidx
+ * operand is the callee's already-final absolute index (`WasmCallTarget.
+ * func_index`), emitted as a minimal-width ULEB128 — the module is
+ * self-contained (`backend-wasm.md` §1.2), so every function index is fixed
+ * at assembly time and no linker ever repositions it.
  *
  * @param StackifyCtx ctx0  the context to extend
  * @param WasmSymbolTable symbols  the call-target resolver
@@ -1783,9 +1758,7 @@ fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, 
         ctx = sc_local_get(ctx, c.args[i])
         i++
     }
-    let opened = sc_byte(ctx, 0x10 to byte)
-    let call_offset = opened.body.len to u32
-    ctx = sc_record_call_reloc(sc_uleb(opened, target.func_index to u64), call_offset, target.func_index)
+    ctx = sc_uleb(sc_byte(ctx, 0x10 to byte), target.func_index to u64)
     if target.ret_type == lir::LType::Void {
         return ctx
     }
@@ -3161,7 +3134,7 @@ pub fn stackify_control(f: lir::LFunc, symbols: WasmSymbolTable) -> StackifyCtx 
         return err_irreducible("a multi-entry loop (a back-edge whose target does not dominate its source)")
     }
     let env = RenderEnv { func = f; blocks = blocks; symbols = symbols; cfg = cfg }
-    let seed = StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = f.next_vreg; has_frame = false; frame_base = 0 to u32; slots = wst_empty(); relocs = teko::list::empty() }
+    let seed = StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = f.next_vreg; has_frame = false; frame_base = 0 to u32; slots = wst_empty() }
     let allocas = collect_alloca_insts(f)
     let ctx0 = if allocas.len == 0 { seed } else { emit_frame_prologue(seed, compute_wasm_frame_layout(allocas)) }
     render_region(ctx0, env, edge_stop_none(), entry)
@@ -3228,13 +3201,6 @@ pub type WasmFuncBody = struct {
      * (`0x0B`).
      */
     body: []byte
-    /**
-     * relocs — every `call` site's own `WasmCallReloc`, `offset` relative
-     * to `body`'s own start (C1-5, §5.4 — `sc_record_call_reloc`'s
-     * accumulated list, carried through unchanged from the finished
-     * `StackifyCtx`).
-     */
-    relocs: []WasmCallReloc
 }
 
 /**
@@ -3258,7 +3224,7 @@ pub fn stackify_func(f: lir::LFunc, calls: WasmSymbolTable) -> WasmFuncBody | er
     let done = match stackify_control(f, calls) { StackifyCtx as c => c; error as e => return e }
     let body = teko::list::push(done.body, 0x0B to byte)
     let groups = wasm_local_groups_of(done.vtypes, f.n_params, done.next_scratch)
-    WasmFuncBody { local_groups = groups; body = body; relocs = done.relocs }
+    WasmFuncBody { local_groups = groups; body = body }
 }
 
 /**
@@ -3506,94 +3472,14 @@ fn wasm_build_program_types(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -> []W
 }
 
 /**
- * wasm_bytes_slice — the bytes of `b` in `[from, to)` (a half-open range), read
- * one at a time (no `[]byte` slice-range syntax used elsewhere in this
- * codebase yet). `wasm_pad_call_relocs`'s own copy-the-unchanged-spans
- * helper.
- *
- * @param []byte b  the source bytes
- * @param u64 from  the first index to copy (inclusive)
- * @param u64 to  one past the last index to copy (exclusive)
- * @return []byte  the copied span
- */
-fn wasm_bytes_slice(b: []byte, from: u64, to: u64) -> []byte {
-    mut out: []byte = teko::list::empty()
-    mut i = from
-    loop {
-        if i >= to { break }
-        out = teko::list::push(out, b[i])
-        i++
-    }
-    out
-}
-
-/**
- * WasmPaddedBody — `wasm_pad_call_relocs`'s own result: a function body
- * with every `call`-site funcidx operand widened to the fixed 5-byte
- * padded form, and the SAME relocations re-based onto the widened bytes.
- *
- * @since #389 C1-5
- */
-pub type WasmPaddedBody = struct {
-    /**
-     * body — the widened function body bytes.
-     */
-    body: []byte
-    /**
-     * relocs — the SAME relocations, `offset` re-based onto `body`'s own
-     * (now-longer) byte positions.
-     */
-    relocs: []WasmCallReloc
-}
-
-/**
- * wasm_pad_call_relocs — rewrite `body`'s own COMPACT call-site funcidx
- * operands (`stackify_call`'s own minimal-width `emit_uleb128` — unchanged,
- * so the whole C1-2..C1-4 test suite that lowers a `call` directly keeps
- * its own compact-encoding goldens byte-identical) into `wasm-ld`'s fixed
- * 5-byte padded form (`emit_uleb128_padded5`, §5.4) — the module-assembly-
- * only widening C1-5 needs for a RELOCATABLE object, applied once here
- * rather than baked into `stackify_call` itself. `relocs` is `stackify_
- * call`'s own append-only, always-ascending-by-offset list (`sc_record_
- * call_reloc` records each one at the body length AT THAT POINT, and body
- * only ever grows), so ONE forward pass — copy the unchanged span before
- * each reloc, widen its own operand, track the running byte growth — both
- * rewrites the bytes and re-bases every later offset in one walk.
- *
- * @param []byte body  the stackified function body (compact call operands)
- * @param []WasmCallReloc relocs  `body`'s own recorded relocations, in
- *                                ascending `offset` order
- * @return WasmPaddedBody  the widened body + re-based relocations
- */
-fn wasm_pad_call_relocs(body: []byte, relocs: []WasmCallReloc) -> WasmPaddedBody {
-    mut out: []byte = teko::list::empty()
-    mut new_relocs: []WasmCallReloc = teko::list::empty()
-    mut cursor: u64 = 0
-    mut i: u64 = 0
-    loop {
-        if i >= relocs.len { break }
-        let r = relocs[i]
-        out = append_bytes(out, wasm_bytes_slice(body, cursor, r.offset to u64))
-        let new_offset = out.len to u32
-        out = emit_uleb128_padded5(out, r.func_index to u64)
-        new_relocs = teko::list::push(new_relocs, WasmCallReloc { offset = new_offset; func_index = r.func_index })
-        let compact_len = emit_uleb128(teko::list::empty(), r.func_index to u64).len
-        cursor = (r.offset to u64) + compact_len
-        i++
-    }
-    out = append_bytes(out, wasm_bytes_slice(body, cursor, body.len))
-    WasmPaddedBody { body = out; relocs = new_relocs }
-}
-
-/**
  * wasm_build_program_funcs — every `LModule.funcs` entry stackified
  * (`stackify_func`) into its own `WasmFunc`: `type_index` matches `wasm_
- * build_program_types`'s own per-function assignment, `name` is the
- * function's already-mangled `LFunc.symbol` (the linking-symbol name,
- * C1-5), and `relocs`/`local_groups`/`body` carry through from the
- * stackifier's own `WasmFuncBody` — its `body`/`relocs` WIDENED first
- * (`wasm_pad_call_relocs`) so every call-site funcidx operand is
- * `wasm-ld`-rewritable.
+ * build_program_types`'s own per-function assignment, and `local_groups`/
+ * `body` carry through unchanged from the stackifier's own `WasmFuncBody`.
+ * The module is self-contained (`backend-wasm.md` §1.2), so each call-site
+ * funcidx operand is already the callee's final absolute index (minimal-
+ * width ULEB128) — no relocation table, no operand widening, and no linker
+ * pass exists to consume one.
  *
  * @param WasmWasiImportSet wasi  the WASI import set (its own import count)
  * @param []LFunc funcs  the module's defined functions
@@ -3608,9 +3494,8 @@ fn wasm_build_program_funcs(wasi: WasmWasiImportSet, funcs: []lir::LFunc, symtab
     loop {
         if i >= funcs.len { break }
         let body = match stackify_func(funcs[i], symtab) { WasmFuncBody as x => x; error as e => return e }
-        let padded = wasm_pad_call_relocs(body.body, body.relocs)
         let type_index = (import_count + i) to u32
-        out = teko::list::push(out, WasmFunc { type_index = type_index; local_groups = body.local_groups; body = padded.body; name = funcs[i].symbol; relocs = padded.relocs })
+        out = teko::list::push(out, WasmFunc { type_index = type_index; local_groups = body.local_groups; body = body.body })
         i++
     }
     out
@@ -3644,20 +3529,46 @@ fn wasm_find_main_index(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -> u32 | e
 }
 
 /**
+ * wasm_find_main_ret — the program's own `"main"` `LFunc`'s return type,
+ * the `_start` synthesizer (`wasm_synth_start`) needs to decide whether to
+ * push a default `i32.const 0` exit code (a `Void` `main`) or forward
+ * `main`'s own `i32` result to `proc_exit`. Shares `wasm_find_main_index`'s
+ * NAMED internal-misuse guard: an artifact reaching here always has a `main`
+ * (`lir::lower_virtual_main`).
+ *
+ * @param []LFunc funcs  the module's defined functions
+ * @return LType | error  `"main"`'s own return type, or a NAMED internal
+ *                        error
+ */
+fn wasm_find_main_ret(funcs: []lir::LFunc) -> lir::LType | error {
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        if funcs[i].symbol == "main" {
+            return funcs[i].ret_type
+        }
+        i++
+    }
+    error { message = "stackify: wasm_assemble_program — no `main` entry function found in the lowered module (internal)" }
+}
+
+/**
  * wasm_synth_start — the WASI command entry point, `_start` (the owner's
  * own C1-5 invariant: a wasm COMMAND module — the `exit(n)` case this slice
  * targets — MUST export `_start`, the symbol `wasmtime`/every WASI host
  * looks up; the Teko front-end's own "virtual main" tail-exit convention
- * BECOMES this `_start`, §9): `call $main; call $proc_exit; end` — `main`'s
- * own `i32` result (LIR's C-style "`main` returns the exit code" ABI,
- * `lir::lower_virtual_main`) lands on the operand stack right where `proc_
- * exit`'s own single `i32` parameter needs it, so NO local staging is
- * needed at all. Both calls get their own `WasmCallReloc` (§5.4), matching
- * every other lowered `call` site — encoded straight to the fixed 5-byte
- * padded width (`emit_uleb128_padded5`), since this function is hand-built
- * fresh for C1-5 (no legacy compact-encoding golden depends on it, unlike
- * `stackify_call`'s own output, which `wasm_pad_call_relocs` re-pads AFTER
- * the fact instead).
+ * BECOMES this `_start`, §9): `call $main; call $proc_exit; end`. When
+ * `main` returns `i32` (LIR's C-style "`main` returns the exit code" ABI,
+ * `lir::lower_virtual_main`), its own result lands on the operand stack
+ * right where `proc_exit`'s single `i32` parameter needs it, so NO local
+ * staging is needed. When `main` returns `Void`, it leaves NOTHING on the
+ * stack, so a literal `i32.const 0` is pushed first — the standard WASI
+ * `_start` "exit 0 on a clean fall-through" shape — keeping `proc_exit`'s
+ * `i32` argument balanced instead of underflowing the operand stack
+ * (`backend-wasm.md` finding 4). Both `call` funcidx operands are the final
+ * absolute index encoded minimal-width (`emit_uleb128`): the module is
+ * self-contained (§1.2), so no relocation is recorded and no linker
+ * rewrites them.
  *
  * @param u32 type_index  the module's own `() -> ()` type-table index for
  *                        `_start`'s signature (`wasm_assemble_program`
@@ -3665,22 +3576,22 @@ fn wasm_find_main_index(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -> u32 | e
  *                        table)
  * @param u32 main_index  `"main"`'s own absolute function index
  * @param u32 proc_exit_index  the WASI `proc_exit` import's own index
+ * @param LType main_ret  `main`'s own return type — `Void` triggers the
+ *                        default `i32.const 0` exit-code push
  * @return WasmFunc  the `_start` code entry
  */
-fn wasm_synth_start(type_index: u32, main_index: u32, proc_exit_index: u32) -> WasmFunc {
+fn wasm_synth_start(type_index: u32, main_index: u32, proc_exit_index: u32, main_ret: lir::LType) -> WasmFunc {
     mut body: []byte = teko::list::empty()
     body = teko::list::push(body, 0x10 to byte)
-    let main_call_offset = body.len to u32
-    body = emit_uleb128_padded5(body, main_index to u64)
+    body = emit_uleb128(body, main_index to u64)
+    if main_ret == lir::LType::Void {
+        body = teko::list::push(body, 0x41 to byte)
+        body = emit_sleb128(body, 0 to i64)
+    }
     body = teko::list::push(body, 0x10 to byte)
-    let exit_call_offset = body.len to u32
-    body = emit_uleb128_padded5(body, proc_exit_index to u64)
+    body = emit_uleb128(body, proc_exit_index to u64)
     body = teko::list::push(body, 0x0B to byte)
-    let relocs = [
-        WasmCallReloc { offset = main_call_offset; func_index = main_index },
-        WasmCallReloc { offset = exit_call_offset; func_index = proc_exit_index }
-    ]
-    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = body; name = "_start"; relocs = relocs }
+    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = body }
 }
 
 /**
@@ -3811,8 +3722,9 @@ pub fn wasm_assemble_program(lmod: lir::LModule) -> WasmModule | error {
     let types = match wasm_build_program_types(wasi, lmod.funcs) { []WasmFuncType as t => t; error as e => return e }
     let funcs = match wasm_build_program_funcs(wasi, lmod.funcs, symtab) { []WasmFunc as f => f; error as e => return e }
     let main_index = match wasm_find_main_index(wasi, lmod.funcs) { u32 as x => x; error as e => return e }
+    let main_ret = match wasm_find_main_ret(lmod.funcs) { lir::LType as x => x; error as e => return e }
     let start_type_index = types.len to u32
-    let start = wasm_synth_start(start_type_index, main_index, wasi.proc_exit_index)
+    let start = wasm_synth_start(start_type_index, main_index, wasi.proc_exit_index, main_ret)
     let start_index = wasm_program_func_index(wasi.imports.len, lmod.funcs.len)
     let plan = wasm_program_memory_plan(lmod, rodata)
     WasmModule {

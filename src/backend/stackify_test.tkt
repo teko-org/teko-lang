@@ -8,7 +8,7 @@ use teko::lir
  * @return StackifyCtx  the empty context
  */
 fn sft_ctx0() -> StackifyCtx {
-    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = 0 to u32; has_frame = false; frame_base = 0 to u32; slots = wst_empty(); relocs = teko::list::empty() }
+    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = 0 to u32; has_frame = false; frame_base = 0 to u32; slots = wst_empty() }
 }
 
 /**
@@ -739,9 +739,10 @@ fn wasm_symtab_add_then_resolve_round_trips() {
 /**
  * stackify_call_void_matches_design_doc_golden — the design doc's own
  * worked example (§12.1): `LCall{tk_exit} -> local.get arg; call funcidx`.
- * ALSO covers C1-5's own reloc-recording (`sc_record_call_reloc`): the
- * `call` opcode lands at body index `2`, so its ULEB128 funcidx operand
- * begins at index `3` — the ONE `WasmCallReloc` this call records.
+ * The `call` opcode lands at body index `2`, its minimal-width ULEB128
+ * funcidx operand (`3`, the callee's final absolute index) at index `3` —
+ * the module is self-contained (`backend-wasm.md` §1.2), so the operand is
+ * baked directly with no relocation recorded.
  *
  * @return void
  */
@@ -751,9 +752,6 @@ fn stackify_call_void_matches_design_doc_golden() {
     let inst = lir::void_call_inst("tk_exit", args, false, 0, 0)
     let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "tk_exit"; args = args; variadic = false }) { StackifyCtx as x => x; error => return }
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x00 to byte, 0x10 to byte, 0x03 to byte]))
-    teko::assert::is_true(out.relocs.len == (1 to u64))
-    teko::assert::is_true(out.relocs[0].offset == (3 to u32))
-    teko::assert::is_true(out.relocs[0].func_index == (3 to u32))
 }
 
 #test
@@ -898,7 +896,6 @@ fn stackify_inst_alloca_dispatches_to_stackify_alloca() {
         has_frame = true
         frame_base = 9 to u32
         slots = wst_set(wst_empty(), 0, 16 to u32)
-        relocs = teko::list::empty()
     }
     let alloca = lir::alloca_inst(0, 8, 8, 0, 0)
     let out = match stackify_inst(seeded, sft_empty_func(), wasm_symtab_empty(), alloca) { StackifyCtx as x => x; error => return }
@@ -2048,8 +2045,8 @@ fn wasm_sp_global_is_a_mutable_i32() {
  * `%0 = const 0; call tk_exit(%0); ret %0` — the `own_exit_zero` fixture's
  * own shape (a call the program-wide symbol table always resolves,
  * `"tk_exit"`). The first fixture of the C1-5 `wasm_assemble_program`
- * suite below — the whole-module assembler, the `wasm-ld` relocatable-
- * object link/dispatch job (`backend-c1-wasm.md` §5.4/§9).
+ * suite below — the whole-module assembler that emits a self-contained
+ * wasm module (`backend-wasm.md` §1.2, `backend-c1-wasm.md` §9).
  *
  * @return lir::LFunc  the seeded `main` function
  */
@@ -2221,27 +2218,24 @@ fn build_program_types_propagates_a_func_type_of_stop() {
 
 #test
 /**
- * build_program_funcs_names_and_widens_call_relocs — `sft_main_func`'s own
- * `tk_exit` call comes back COMPACT from `stackify_func` but WIDENED
- * (`wasm_pad_call_relocs`) in the packaged `WasmFunc`: its `relocs[0].
- * offset` lands on a byte whose value, once padded, spans 5 bytes ending
- * right before the trailing `end` (`0x0B`) — `name` is the function's own
- * symbol.
+ * build_program_funcs_packages_a_self_contained_func — `sft_main_func`
+ * stackifies into ONE packaged `WasmFunc` at its interned `type_index` (past
+ * the two WASI imports), its body carrying the compact, already-final
+ * call-site funcidx operands and terminated by the code-entry `end` (`0x0B`)
+ * — no relocation table, no operand widening (`backend-wasm.md` §1.2's
+ * self-contained module).
  *
  * @return void
  */
-fn build_program_funcs_names_and_widens_call_relocs() {
+fn build_program_funcs_packages_a_self_contained_func() {
     let wasi = wasm_wasi_import_set()
     let symtab = wasm_register_program_symbols(wasi, [sft_main_func()])
     let funcs = match wasm_build_program_funcs(wasi, [sft_main_func()], symtab) { []WasmFunc as x => x; error => return }
     teko::assert::is_true(funcs.len == (1 to u64))
     let f = funcs[0]
-    teko::assert::is_true(f.name == "main")
     teko::assert::is_true(f.type_index == (2 to u32))
-    teko::assert::is_true(f.relocs.len == (1 to u64))
-    let r = f.relocs[0]
-    teko::assert::is_true(r.func_index == wasi.proc_exit_index)
-    teko::assert::is_true((r.offset to u64) + (5 to u64) <= f.body.len)
+    teko::assert::is_true(f.body.len > (0 to u64))
+    teko::assert::is_true(f.body[f.body.len - 1] == (0x0B to byte))
 }
 
 #test
@@ -2291,28 +2285,45 @@ fn find_main_index_missing_main_is_a_named_internal_error() {
 
 #test
 /**
- * synth_start_calls_main_then_proc_exit_with_padded_operands — `call
- * $main` (padded 5-byte funcidx `7`) then `call $proc_exit` (padded 5-byte
- * funcidx `0`) then `end` — both calls own a `WasmCallReloc` at the right
- * byte offset.
+ * synth_start_i32_main_forwards_the_result_to_proc_exit — an `i32`-returning
+ * `main`: `call $main` (compact funcidx `7`) leaves the exit code on the
+ * stack, then `call $proc_exit` (compact funcidx `0`) then `end`. The module
+ * is self-contained (`backend-wasm.md` §1.2), so the funcidx operands are
+ * minimal-width and no relocation is recorded.
  *
  * @return void
  */
-fn synth_start_calls_main_then_proc_exit_with_padded_operands() {
-    let f = wasm_synth_start(9 to u32, 7 to u32, 0 to u32)
+fn synth_start_i32_main_forwards_the_result_to_proc_exit() {
+    let f = wasm_synth_start(9 to u32, 7 to u32, 0 to u32, lir::LType::I32)
     teko::assert::is_true(f.type_index == (9 to u32))
-    teko::assert::is_true(f.name == "_start")
     let want = [
-        0x10 to byte, 0x87 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x00 to byte,
-        0x10 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x00 to byte,
+        0x10 to byte, 0x07 to byte,
+        0x10 to byte, 0x00 to byte,
         0x0B to byte
     ]
     teko::assert::is_true(wasm_bytes_eq(f.body, want))
-    teko::assert::is_true(f.relocs.len == (2 to u64))
-    teko::assert::is_true(f.relocs[0].offset == (1 to u32))
-    teko::assert::is_true(f.relocs[0].func_index == (7 to u32))
-    teko::assert::is_true(f.relocs[1].offset == (7 to u32))
-    teko::assert::is_true(f.relocs[1].func_index == (0 to u32))
+}
+
+#test
+/**
+ * synth_start_void_main_pushes_a_default_exit_code — a `Void`-returning
+ * `main` leaves NOTHING on the stack, so `_start` pushes a literal `i32.
+ * const 0` (`0x41 0x00`) between `call $main` and `call $proc_exit` — the
+ * standard WASI "exit 0 on clean fall-through" `_start` shape that keeps
+ * `proc_exit`'s `i32` argument balanced instead of underflowing the operand
+ * stack (`backend-wasm.md` finding 4).
+ *
+ * @return void
+ */
+fn synth_start_void_main_pushes_a_default_exit_code() {
+    let f = wasm_synth_start(9 to u32, 7 to u32, 0 to u32, lir::LType::Void)
+    let want = [
+        0x10 to byte, 0x07 to byte,
+        0x41 to byte, 0x00 to byte,
+        0x10 to byte, 0x00 to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(f.body, want))
 }
 
 #test
@@ -2402,52 +2413,14 @@ fn program_memory_plan_with_a_frame_adds_the_sp_global() {
 
 #test
 /**
- * bytes_slice_covers_the_half_open_range — a mid-range slice, an
- * empty-range slice (`from == to`), and a slice reaching the buffer's own
- * end.
- *
- * @return void
- */
-fn bytes_slice_covers_the_half_open_range() {
-    let b = [0x00 to byte, 0x01 to byte, 0x02 to byte, 0x03 to byte]
-    teko::assert::is_true(wasm_bytes_eq(wasm_bytes_slice(b, 1 to u64, 3 to u64), [0x01 to byte, 0x02 to byte]))
-    teko::assert::is_true(wasm_bytes_slice(b, 2 to u64, 2 to u64).len == (0 to u64))
-    teko::assert::is_true(wasm_bytes_eq(wasm_bytes_slice(b, 2 to u64, 4 to u64), [0x02 to byte, 0x03 to byte]))
-}
-
-#test
-/**
- * pad_call_relocs_widens_every_operand_and_rebases_offsets — two compact
- * `call`s (`local.get 0; call $3` then `call $9`) both widen to 5-byte
- * operands; the second reloc's own re-based offset accounts for the
- * FIRST widened call's own +4-byte growth.
- *
- * @return void
- */
-fn pad_call_relocs_widens_every_operand_and_rebases_offsets() {
-    let body = [0x20 to byte, 0x00 to byte, 0x10 to byte, 0x03 to byte, 0x10 to byte, 0x09 to byte, 0x0B to byte]
-    let relocs = [WasmCallReloc { offset = 3 to u32; func_index = 3 to u32 }, WasmCallReloc { offset = 5 to u32; func_index = 9 to u32 }]
-    let padded = wasm_pad_call_relocs(body, relocs)
-    teko::assert::is_true(padded.relocs.len == (2 to u64))
-    teko::assert::is_true(padded.relocs[0].offset == (3 to u32))
-    teko::assert::is_true(padded.relocs[1].offset == (9 to u32))
-    let want = [
-        0x20 to byte, 0x00 to byte, 0x10 to byte,
-        0x83 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x00 to byte,
-        0x10 to byte,
-        0x89 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x00 to byte,
-        0x0B to byte
-    ]
-    teko::assert::is_true(wasm_bytes_eq(padded.body, want))
-}
-
-#test
-/**
  * assemble_program_own_exit_zero_shape_exports_start — the `own_exit_zero`
  * corpus fixture's own shape (`main` only, no rodata, no alloca): the
  * assembled module exports EXACTLY `"_start"` (the owner's own C1-5
- * invariant), its `funcs` list is `[main, _start]` (two entries), and the
- * type table carries the WASI pair plus one entry per defined function.
+ * invariant) at the synthesized entry's own function index (past the two
+ * WASI imports and the one defined `main`), its `funcs` list is
+ * `[main, _start]` (two entries, the last closed by the code-entry `end`),
+ * and the type table carries the WASI pair plus one entry per defined
+ * function.
  *
  * @return void
  */
@@ -2456,9 +2429,11 @@ fn assemble_program_own_exit_zero_shape_exports_start() {
     let m = match wasm_assemble_program(lmod) { WasmModule as x => x; error => return }
     teko::assert::is_true(m.exports.len == (1 to u64))
     teko::assert::is_true(m.exports[0].name == "_start")
+    teko::assert::is_true(m.exports[0].index == (3 to u32))
     teko::assert::is_true(m.funcs.len == (2 to u64))
-    teko::assert::is_true(m.funcs[0].name == "main")
-    teko::assert::is_true(m.funcs[1].name == "_start")
+    let start = m.funcs[1]
+    teko::assert::is_true(start.body.len > (0 to u64))
+    teko::assert::is_true(start.body[start.body.len - 1] == (0x0B to byte))
     teko::assert::is_true(m.types.len == (4 to u64))
     teko::assert::is_true(m.imports.len == (2 to u64))
 }
