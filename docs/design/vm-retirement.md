@@ -6,6 +6,14 @@ já está velha e caducando"*). Branch `docs/vm-retirement`, base `remodel/backe
 DRAFT PR. This is a **KEYSTONE removal**: after it, `teko` has ONE execution engine — native
 AOT (own backend + the C backend) — and the VM==native differential is gone.
 
+> **Owner principle (ratified 2026-07-12): 100% VM removal.** *"Se está aposentado, não se mantém
+> na ativa; tudo que precisar pra remover 100% a VM deverá ser feito."* Nothing VM stays active in
+> any form. The §10 micro-decisions are therefore **RATIFIED**, not defaults: the REPL is retired
+> (VM-only, no native repoint without a JIT), the C-bootstrap is removed, `--vm-gate` is removed
+> outright, `teko test` keeps its name over the native engine, and **`teko run` is REPOINTED to a
+> native debug build-and-execute** (like `cargo run` / `go run`) — the command survives, only the VM
+> machinery behind it goes.
+
 > This is a PLAN. It designs the sunset of `src/vm/` and the inversion of the gate split
 > (memory `teko-native-test-gate` / `teko-verify-both-with-test-gate` — native was the DEFAULT
 > gate since #168/#265; this makes it the ONLY one). It grounds every crumb in the merged code:
@@ -17,19 +25,24 @@ AOT (own backend + the C backend) — and the VM==native differential is gone.
 
 ## 0. TL;DR
 
-- **Load-bearing UX decision — `teko test` stays, repointed to NATIVE.** `teko test <dir>` keeps its
-  contract (run the `.tkt` suite, report pass/fail + coverage, emit NO release binary) but drives it
-  through the already-shipping `run_native_gate` (#265) instead of `vm::run_tests_cov`. It becomes a
-  thin wrapper over the native gate's test-run leg. Rejected: removing `teko test` in favour of
-  `teko . -o bin` (that also builds a release binary, and CI's `./bin/teko test .` self-test would
-  need repointing to a heavier invocation for no benefit).
+- **Load-bearing UX decision — BOTH `teko test` and `teko run` survive, repointed to NATIVE.**
+  - `teko test <dir>` keeps its contract (run the `.tkt` suite, report pass/fail + coverage, emit NO
+    release binary) but drives it through the already-shipping `run_native_gate` (#265) instead of
+    `vm::run_tests_cov` — a thin wrapper over the native gate's test-run leg.
+  - `teko run <dir>` keeps its contract (build-and-execute the project, propagate the program's exit
+    code) but does it as a **native DEBUG build + exec** (`cargo run` / `go run` shape) instead of
+    VM-eval: front-end → codegen → link with the debug profile (`-g`, assertions on, no optimization)
+    to a scratch dir → run the produced binary. Only the VM eval path (`vm::run`) is removed; the
+    COMMAND stays. Rejected for `teko test`: removing it in favour of `teko . -o bin` (that also builds
+    a release binary, and CI's `./bin/teko test .` self-test would need repointing for no benefit).
 - **Crumb count: 5**, dependency-ordered so each is independently gate-able and only ONE self-host
   re-baseline is in flight at a time:
   1. **CI-first** — delete the `vm-gate-nightly` lane + the VM==native differential step + gut
      `diff_vm_native.sh`'s VM side. Stops the false-failures immediately (no `src/` change → no
      re-baseline). *This is the smallest unblock.*
-  2. **Driver repoint** — `teko test` → native; delete `teko run`/`run_project`/`run_gate_vm`/
-     `--vm-gate`; delete the dead legacy mirror `src/driver.tks`. (re-baseline #1)
+  2. **Driver repoint** — `teko test` → native gate; `teko run` → native-debug build-and-exec; delete
+     the VM eval path (`run_gate_vm`, the `vm::run`/`vm::run_tests*` callers) + `--vm-gate`; delete the
+     dead legacy mirror `src/driver.tks`. (re-baseline #1)
   3. **Retire the REPL** — remove `src/repl/` + the `repl` subcommand (its only consumer of the VM
      *interpreter*, and a VM-only dev tool). (re-baseline #2)
   4. **Move coverage out + delete `src/vm/`** — relocate the engine-independent coverage subsystem to
@@ -41,7 +54,7 @@ AOT (own backend + the C backend) — and the VM==native differential is gone.
   `functions_coverage`, `line_coverage`, `branch_coverage`, `*_coverage_pct`, and their
   `CovWalk`/`BranchSite`/`CovCount` helpers) lives in `vm.tks` but is consumed by the NATIVE gate —
   it **moves**, it is not deleted; (b) the **REPL** is a deep consumer of the VM interpreter types —
-  it is retired *with* the VM (micro-decision M1, default = retire).
+  it is retired *with* the VM (micro-decision M1, RATIFIED = retire).
 - **No HALT.** Both hazards resolve cleanly law-first. No non-VM type is trapped in `src/vm/` that
   cannot move.
 
@@ -74,10 +87,11 @@ Nothing in `checker`, `codegen`, `lexer`, `parser`, `backend`, `lir`, `emit`, or
 `teko::vm`. The blast radius is exactly these files.
 
 ### 1.3 The dispatch (`main.tks`)
-`teko run` → `teko::build::run_project` → `vm::run`. `teko test` → `teko::build::test_project` →
-`vm::run_tests_cov`. `teko repl` → `teko::repl::run_cli` (VM interpreter). `teko build` / `teko . -o bin`
-→ `compile_project_g`, whose D4 gate is NATIVE by default (`run_native_gate`) and only opts back to the
-VM under `--vm-gate` / `TEKO_VM_GATE=1`.
+`teko run` → `teko::build::run_project` → `vm::run` (**repointed to native-debug**, §2.2). `teko test` →
+`teko::build::test_project` → `vm::run_tests_cov` (**repointed to native**, §2.1). `teko repl` →
+`teko::repl::run_cli` (VM interpreter — retired). `teko build` / `teko . -o bin` → `compile_project_g`,
+whose D4 gate is NATIVE by default (`run_native_gate`) and only opts back to the VM under `--vm-gate` /
+`TEKO_VM_GATE=1` (**the opt-out is removed outright**, §2/M3).
 
 ### 1.4 CI + scripts
 - `.github/workflows/native.yml`:
@@ -98,7 +112,13 @@ VM under `--vm-gate` / `TEKO_VM_GATE=1`.
 
 ---
 
-## 2. What `teko test` becomes (the load-bearing decision)
+## 2. What `teko test` and `teko run` become (the load-bearing decisions)
+
+Both subcommands survive; only the VM engine behind them is replaced by native AOT. `teko build`
+stays the RELEASE build; `teko run` is its DEBUG-flavored build-and-execute sibling; `teko test` is
+the native test gate without a release artifact.
+
+### 2.1 `teko test` → native test-run
 
 **Decision: keep `teko test`, repoint it to a native test-run.** It becomes a thin wrapper over
 `run_native_gate` (which already emits a test-profile C TU whose `main()` calls each `#test`,
@@ -154,6 +174,91 @@ Notes for the implementer:
 **CI impact:** `./bin/teko test .` (the `diff-vm-native` gen1 self-test at native.yml:264, and the
 retired `vm-gate-nightly` line) becomes a native run with no workflow edit — the subcommand is the same,
 the engine underneath changed.
+
+### 2.2 `teko run` → native DEBUG build-and-execute (repointed, not dropped)
+
+**Decision: keep `teko run`, repoint it to a native debug build + exec** (the `cargo run` / `go run`
+shape). It preserves the exact exit-code contract the VM path had — the program's own exit
+(`teko::exit(n)` → n; a panic → non-zero) — but produces it by RUNNING a native binary instead of
+tree-walking. Like `go run`, it builds-and-runs the PROGRAM; it does NOT run the `.tkt` gate (that is
+`teko test`) and does NOT run the D4 coverage floors.
+
+`src/build/project.tks::run_project` today:
+
+```teko
+fn run_project(dir: str) -> i32 {
+    let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
+    vm::run(fe.prog)
+}
+```
+
+post-retirement (the implementer copies this verbatim):
+
+```teko
+/**
+ * The `teko run <dir>` entry (post-VM): build the project with the DEBUG profile and EXECUTE the
+ * resulting native binary — the `cargo run` / `go run` shape. Same front-end as `teko build` but
+ * WITHOUT the `.tkt` tests (a run, not a gate) and WITHOUT the D4 coverage floors: this is the fast
+ * debug-iteration command. The debug profile links with `-g` (DWARF for the E4 native stack trace,
+ * fed by the `.tsym` map), assertions ON, and no optimization (see build_cc_argv's `debug` seam).
+ * The binary is built to a scratch dir, then run; the returned status is the PROGRAM's own exit code
+ * (teko::exit(n) -> n, a panic -> non-zero) — the exact contract the retired VM `run` path had.
+ *
+ * @param dir  the project directory (already the cwd; the front-end chdir'd in)
+ * @return     the executed program's exit code, or a non-zero build/diagnostic status
+ */
+fn run_project(dir: str) -> i32 {
+    let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
+    let stem = fe.manifest.name
+    let bc = build_debug_and_report(dir, stem, "target/debug", fe.prog, fe.manifest)
+    if bc != 0 { return bc }
+    let binp = teko::str::concat("target/debug/", stem)
+    let argv = teko::list::push(teko::list::empty(), binp)
+    teko::process::run(argv)
+}
+```
+
+Supporting shape the implementer adds — a debug seam threaded through the shared link line, so the C
+and own backends both honor it without forking `build_cc_argv`:
+
+```teko
+/**
+ * build_cc_argv gains a `debug` toggle: when true it appends the DEBUG profile flags to the shared
+ * link line — `-g` (emit DWARF so the E4 native stack trace resolves against the `.tsym` map) — and
+ * leaves optimization OFF (the pipeline's default is already `-O0`) and assertions ON (assert.c is
+ * always linked; nothing defines NDEBUG). When false the line is byte-identical to today's build, so
+ * the FIXPOINT and every release artifact are unchanged.
+ *
+ * @param input   the input path (a generated `.c` or an own-backend `.o`)
+ * @param binary  the output native executable path
+ * @param m       the resolved manifest
+ * @param prog    the checked program (extern-reachability)
+ * @param debug   append the debug profile flags (`-g`); false = today's byte-identical release line
+ * @return        the full `cc` argument vector, ready for teko::process::run
+ */
+fn build_cc_argv(input: str, binary: str, m: Manifest, prog: checker::TProgram, debug: bool) -> []str
+```
+
+`run_cc` / `link_object` pass `debug=false` (release, byte-identical); a new `build_debug_and_report`
+mirrors `codegen_and_report` but calls `build_cc_argv(..., true)` and writes the `.tsym` beside the
+binary (debug metadata is exactly what the debug profile wants). Notes for the implementer:
+
+- **No optimization split exists today.** `build_cc_argv` currently passes no `-O`/`-g`/`-DNDEBUG`, so
+  today's single profile is already unoptimized with assertions live. The debug profile therefore adds
+  only `-g`; the "release vs debug" distinction is `-g` presence (+ the `.tsym`), nothing more, until a
+  real optimization pass is designed (a separate, later concern — NOT this issue).
+- **Scratch dir:** build to `target/debug/<stem>` (created if absent), consistent with the `cargo`/`go`
+  target-dir convention, so `teko run` never clobbers `bin/` (the release output). Passing `-o
+  target/debug` keeps run artifacts out of the release path.
+- **Backend parity:** `teko run` respects `TEKO_BACKEND=native` (the own-AOT seam) exactly as `teko
+  build` does — `build_debug_and_report` branches on `native_backend_selected()` the same way
+  `codegen_and_report` does, so the debug run works on both backends and feeds the own==C differential.
+- **Exit-code fidelity:** the returned status is the child program's, propagated unchanged — a faithful
+  repoint of the VM `run` contract (only the engine changed).
+
+**CI impact:** `scripts/diff_vm_native.sh` used `teko run` for the VM side of the differential; crumb 1
+removes that (the own==C differential is the replacement). No CI step depends on `teko run` producing VM
+output afterward.
 
 ---
 
@@ -270,7 +375,7 @@ interpreter front-end. It persists a `vm::Venv`, runs each typed line via `vm::e
 back `vm::Value`/`vm::StructVal`/`vm::OptVal`. A native AOT compiler has no line-by-line eval without a
 JIT or a compile-per-line loop (both out of scope for #524). Since the REPL is *defined* as "an
 interactive session over the VM" (DT3) and is a dev tool, not part of the language contract, it is
-retired with the VM (micro-decision **M1**, default = retire; §10). This is the correct order: the REPL
+retired with the VM (micro-decision **M1**, RATIFIED = retire; §10). This is the correct order: the REPL
 must be removed **before** `src/vm/` is deleted, or the compiler will not typecheck.
 
 ---
@@ -295,10 +400,13 @@ self-host fixpoint re-baseline, sequenced strictly one-at-a-time (§6).
   and no VM step. **Proves:** the wrapper-descent false-failure path is gone from CI; the replacement
   cross-checks still gate.
 
-### Crumb 2 — driver repoint (`teko test` → native; drop `teko run`; drop `--vm-gate`)
+### Crumb 2 — driver repoint (`teko test` → native gate; `teko run` → native-debug; drop the VM eval path + `--vm-gate`)
 **Files:** `src/build/project.tks`, `main.tks`, delete `src/driver.tks`.
-- `test_project` → native (the verbatim body in §2).
-- Delete `run_project` (VM `teko run`), `run_gate_vm`, `vm_gate_requested`; simplify `native_gate_of`
+- `test_project` → native (the verbatim body in §2.1).
+- `run_project` → native-debug build-and-exec (the verbatim body in §2.2); add the `debug` seam to
+  `build_cc_argv` + the new `build_debug_and_report`. The `teko run` COMMAND and its `main.tks` arm
+  STAY; only the `vm::run` eval call is replaced.
+- Delete `run_gate_vm`, `vm_gate_requested` (the VM eval + gate path); simplify `native_gate_of`
   and collapse `run_gate` to always-native:
 
   ```teko
@@ -319,16 +427,20 @@ self-host fixpoint re-baseline, sequenced strictly one-at-a-time (§6).
 
   Update `compile_project_g`'s signature to drop the now-inert `native_gate` parameter (it is always
   native), threading through to `run_gate`. `main.tks`'s `compile_project_g(...)` call sites drop the
-  `native_gate_of(args)` argument. `project_arg_of` keeps `--vm-gate` in its flag-skip list for one
-  release as an *inert-accepted* flag (so an old script does not error), or drop it — see M3.
-- `main.tks`: remove the `if cmd == "run"` arm and its `run_project` call; remove the `teko run …` and
-  `--vm-gate …` lines from the `--help` banner; leave the `repl` arm for crumb 3.
+  `native_gate_of(args)` argument. **Remove `--vm-gate` outright** (M3, ratified): drop it from
+  `project_arg_of`'s flag-skip list and delete `native_gate_of` — the flag is gone, not inert
+  (`TEKO_VM_GATE` is likewise no longer read). A stray `--vm-gate` now falls through as an unknown token
+  (the standard "not a project" path), which is the honest signal that the VM is gone.
+- `main.tks`: KEEP the `if cmd == "run"` arm (it now calls the native-debug `run_project`); rewrite the
+  `teko run …` help line to "build (debug) and run the project's native binary"; remove the `--vm-gate …`
+  help line. Leave the `repl` arm for crumb 3.
 - Delete `src/driver.tks` — a dead legacy C-twin mirror (its `run`/`compile`/`backend`/`compile_project`
   are called by NOTHING; superseded by `src/build/project.tks` + `main.tks`; it `use teko::vm` only for
   its dead `run`). Removing it also drops dead uncovered functions → coverage floors improve.
-- **Ritual leg:** full native gate + fixpoint. **Proves:** `teko test .` runs native and passes;
-  `teko run <proj>` is honestly rejected (exit 2, "unknown subcommand"); `--help` no longer advertises
-  `run`/`vm-gate`; `gen2 == gen3`.
+- **Ritual leg:** full native gate + a `teko run` exec smoke + fixpoint. **Proves:** `teko test .` runs
+  native and passes; `teko run <proj>` builds a debug binary and executes it, propagating the program's
+  exit code (e.g. `teko::exit(5)` → 5); `--help` advertises `run` as a native debug-run and no longer
+  lists `--vm-gate`; `gen2 == gen3`.
 
 ### Crumb 3 — retire the REPL
 **Files:** delete `src/repl/repl.tks`, `src/repl/repl_test.tkt`; `main.tks`.
@@ -366,7 +478,8 @@ self-host fixpoint re-baseline, sequenced strictly one-at-a-time (§6).
 `TEKO_MASTER_PLAN.md`, `README.md`/`CONTRIBUTING.md` (if they mention `teko run`/`teko repl`/the VM).
 - Remove stale VM-lane comments/rationale (sanitizers.yml per-test-rewind note; native.yml VM prose).
 - DECISION_LOG entry (D-number, the retirement + M1/M2/M3 defaults, base = issue #524 owner ratification).
-- MASTER_PLAN: mark the VM/`teko run`/REPL rows retired; note native is the sole engine.
+- MASTER_PLAN: mark the VM interpreter + REPL rows retired; note `teko run`/`teko test` are now native
+  (`teko run` = native debug build-and-exec); native is the sole engine.
 - **Ritual leg:** the FULL gate (this is the closing ritual point). **Proves:** the whole wave is green,
   documentation matches reality, `gen2 == gen3` one final time.
 
@@ -401,9 +514,9 @@ All exit codes are the NATIVE binary's; the VM column is intentionally gone.
 |---|---|---|---|
 | `examples/regressions/wrapper_match_descent/` | a `match` on a single-field wrapper (`Ref`/`Ptr`/`Optional`/`Slice`) that the VM's wrapper-descent bug mis-handled — the shape that blocked #520 | builds + runs, `exit(N)` for a fixed `N`, **asserted** | proves the retired VM's false-failure is now a *pass* natively |
 | `examples/regressions/nonnull_bind_asserted/` | the `_ as x` binding class (#517 Finding 1) with an **assertion** that the bound value is the real payload, not null/0 | build fails at the checker (once the checker fix lands) OR runs and the assert holds | replaces the differential's abort-oracle with an asserted native guard |
-| CLI (in `scripts/cli_flags_test.sh`) | `teko run <projdir>` | exit 2, stderr "unknown subcommand" / usage | proves `teko run` retired |
+| `scripts/native_regressions.sh` (or `diff_c_own.sh`) | `teko run examples/regressions/exit_success_path` | builds a debug binary under `target/debug/` and EXECUTES it; exit == the program's own (e.g. 5) | proves `teko run` is native-debug build-and-exec, not VM, not removed |
 | CLI (in `scripts/cli_flags_test.sh`) | `teko repl` | exit 2 (M1 = retire) | proves the REPL retired |
-| CLI (in `scripts/cli_flags_test.sh`) | `teko --help` | stdout/stderr does NOT contain `run`, `repl`, `--vm-gate` (negative grep); DOES contain `test`, `build`, `fmt` | proves the banner matches reality |
+| CLI (in `scripts/cli_flags_test.sh`) | `teko --help` | stdout/stderr does NOT contain `repl` or `--vm-gate` (negative grep); DOES contain `run` (as a native debug-run), `test`, `build`, `fmt` | proves the banner matches reality |
 | gate (existing) | `teko . -o bin` self-build | exit 0; functions/lines/branches floors pass | proves the coverage move preserved the floors |
 | gate (existing) | `teko . -o bin --coverage` | `cobertura.xml` byte-identical to pre-move on the same corpus | proves `cov_cobertura` moved cleanly |
 | differential (existing) | `scripts/diff_c_own.sh` over the `exit(n)` corpus | own-native exit == C-native exit | the replacement cross-check still gates |
@@ -431,11 +544,11 @@ each `fix/issue-524-*` sub-PR runs CI; wait for aggregate AllGreen + a fresh see
 ## 9. Risks + law tensions (with recommended resolution)
 
 1. **REPL is a hard interpreter consumer (LAW TENSION: "issues are 100%" vs "the REPL needs an
-   interpreter").** Resolution (law-first): the REPL is *defined* as "a session over the VM" and is a dev
-   tool, not a language-contract surface. "Native is the sole engine" (owner ratification) ⇒ the
-   interpreter goes ⇒ its only front-end goes with it. Retiring it does not regress the language. Folded
-   into this issue (not spun off — memory `teko-issues-must-be-100-percent`). Surfaced as M1 for owner
-   ratification. **Not a HALT** (clean law-first default).
+   interpreter").** Resolution (owner-ratified 100%-VM-removal principle): the REPL is *defined* as "a
+   session over the VM" and is a dev tool, not a language-contract surface. "Native is the sole engine"
+   ⇒ the interpreter goes ⇒ its only front-end goes with it (it cannot repoint to native without a JIT).
+   Retiring it does not regress the language. Folded into this issue (not spun off — memory
+   `teko-issues-must-be-100-percent`). **Not a HALT** (clean, and now ratified — M1).
 2. **Coverage-floor regression from the move.** Mitigated by retargeting the self-exclusion guards to
    `"teko::coverage"` (§4.3) — the coverage machinery stays excluded from its own floors, exactly as the
    VM was. Crumb 4's ritual re-checks all three floors + Cobertura byte-identity.
@@ -446,10 +559,11 @@ each `fix/issue-524-*` sub-PR runs CI; wait for aggregate AllGreen + a fresh see
    alternative in M2.
 4. **Re-baseline collision with #520/#521/#522.** Mitigated by the strict window in §6 (land after #520
    merges, before G1/G2 start; sequential within the issue).
-5. **`--vm-gate` / `TEKO_VM_GATE=1` in external scripts.** A CI/dev script setting these would silently
-   change behaviour if the flag is dropped hard. Mitigated: keep `--vm-gate` in `project_arg_of`'s skip
-   list for one release as an *inert, accepted, no-op* flag (M3), with a one-line deprecation notice, and
-   drop it next wave.
+5. **`--vm-gate` / `TEKO_VM_GATE=1` in external scripts.** Removed OUTRIGHT (M3, ratified — nothing VM
+   stays active, not even an inert flag). A CI/dev script still passing `--vm-gate` now sees it fall
+   through as an unknown token (the standard "not a project" diagnostic), which is the honest signal the
+   VM is gone. In-tree: the retirement removes every `--vm-gate`/`TEKO_VM_GATE` reference from
+   `native.yml`/scripts in crumb 1, so nothing in the repo depends on it.
 6. **`vm_test.tkt` coverage contribution.** `vm_test.tkt` tested `teko::vm` (excluded from coverage), so
    deleting it removes only self-excluded tests — no other module loses coverage. Verified at crumb 4's
    floor re-check.
@@ -459,24 +573,28 @@ moves cleanly to `teko::coverage` (§4). No widely-depended-on type is stuck.
 
 ---
 
-## 10. Micro-decisions for owner ratification (defaults proposed)
+## 10. Micro-decisions — RATIFIED (owner 2026-07-12)
 
-- **M1 — Retire the REPL with the VM (default: RETIRE).** The REPL is a VM-interpreter front-end (DT3, a
-  dev tool). "Native is the sole engine" leaves it no engine, and a native/JIT REPL is out of scope for
-  #524. Default: remove `src/repl/` + the `repl` subcommand + its help line. Alternative (rejected):
-  keep the interpreter alive privately just for the REPL — contradicts the ratification and preserves the
-  wrapper-descent bug + sync burden. *Reversible:* a future native/JIT REPL is a fresh issue.
-- **M2 — Fully retire the C-bootstrap (default: RETIRE the C-bootstrap `teko` exe + delete `src/vm/`'s C
-  twins).** `main.c`/`src/driver.c` `#include "vm/vm.h"`; the exe is vestigial (seed = downloaded
-  release; CI never runs cmake). Default: drop `add_executable(teko …)` + `TEKO_VM_SOURCES`, keep the
-  `teko_bootstrap` lib as the frozen front-end guard. Conservative alternative: delete only `vm.tks` +
-  `vm_test.tkt`, keep the frozen `vm.c`/`vm.h`/`driver.c`/`main.c` untouched — but that leaves a C twin
-  with no Teko original and a VM compiled into `build/teko`, which reads as debt. *Reversible:* git.
-- **M3 — `--vm-gate` / `TEKO_VM_GATE` (default: keep INERT one release, then drop).** Accept-and-ignore
-  the flag with a deprecation notice so an old CI/dev script does not hard-error, then remove next wave.
-  Alternative: drop immediately (cleaner, minor breakage risk for out-of-tree scripts).
-- **M4 — `teko test` (default: KEEP, native-wrapped; §2).** Alternative (rejected): remove it in favour
-  of `teko . -o bin`.
+All five collapse to ONE owner principle: **100% VM removal** — *"se está aposentado, não se mantém na
+ativa; tudo que precisar pra remover 100% a VM deverá ser feito."* Nothing VM stays active in any form.
+These are ratified, not defaults awaiting a decision; the implementer executes them as written.
+
+- **M1 — Retire the REPL with the VM: RATIFIED = RETIRE.** The REPL is a VM-interpreter front-end (DT3,
+  a dev tool) and cannot repoint to native without a JIT. Remove `src/repl/` + the `repl` subcommand +
+  its help line. *Reversible:* a future native/JIT REPL is a fresh issue.
+- **M2 — Retire the C-bootstrap: RATIFIED = REMOVE.** Drop `add_executable(teko …)` (`main.c` +
+  `src/driver.c`, which `#include "vm/vm.h"`) + `TEKO_VM_SOURCES` from CMake, and delete `src/vm/`'s C
+  twins. The exe is vestigial (seed = downloaded release; CI never invokes cmake). The `teko_bootstrap`
+  lib stays (minus vm.c) as the frozen front-end compile-regression guard. *Reversible:* git.
+- **M3 — `--vm-gate` / `TEKO_VM_GATE`: RATIFIED = REMOVE OUTRIGHT.** Not inert, not deprecated-then-
+  dropped — gone in this issue. Delete the flag from `project_arg_of`, delete `native_gate_of` /
+  `vm_gate_requested`, and strip every `--vm-gate`/`TEKO_VM_GATE` mention from `native.yml`/scripts/help.
+- **M4 — `teko test`: RATIFIED = KEEP, native.** The name and contract survive over the #265 native gate
+  (§2.1). (Rejected: removing it in favour of `teko . -o bin`.)
+- **M5 — `teko run`: RATIFIED = KEEP, native-debug.** The command survives, repointed to a native DEBUG
+  build-and-execute (`cargo run` / `go run` shape; §2.2). Only `vm::run` behind it is removed. The
+  exit-code contract is preserved; the debug profile adds `-g` + the `.tsym` to today's already-
+  unoptimized, assertions-on build.
 
 ---
 
