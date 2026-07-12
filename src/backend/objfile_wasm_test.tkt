@@ -50,6 +50,7 @@ fn wt_empty_module() -> WasmModule {
         types = teko::list::empty()
         imports = teko::list::empty()
         funcs = teko::list::empty()
+        globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
         exports = teko::list::empty()
@@ -69,6 +70,7 @@ fn wt_empty_main_module() -> WasmModule {
         types = [wt_void_functype()]
         imports = teko::list::empty()
         funcs = [WasmFunc { type_index = 0 to u32; local_groups = teko::list::empty(); body = [0x0B to byte] }]
+        globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
         exports = [WasmExport { name = "main"; kind = 0x00 to byte; index = 0 to u32 }]
@@ -87,6 +89,7 @@ fn wt_import_only_module() -> WasmModule {
         types = [wt_void_functype()]
         imports = [WasmImport { module = "wasi_snapshot_preview1"; field = "proc_exit"; type_index = 0 to u32 }]
         funcs = teko::list::empty()
+        globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
         exports = teko::list::empty()
@@ -104,6 +107,7 @@ fn wt_memory_only_module() -> WasmModule {
         types = teko::list::empty()
         imports = teko::list::empty()
         funcs = teko::list::empty()
+        globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 1 to u32
         exports = teko::list::empty()
@@ -122,6 +126,7 @@ fn wt_data_segment_module() -> WasmModule {
         types = teko::list::empty()
         imports = teko::list::empty()
         funcs = teko::list::empty()
+        globals = teko::list::empty()
         data = [WasmDataSegment { offset = 0 to u32; bytes = [0x68 to byte, 0x69 to byte] }]
         mem_min_pages = 1 to u32
         exports = teko::list::empty()
@@ -140,6 +145,7 @@ fn wt_locals_func_module() -> WasmModule {
         types = [wt_void_functype()]
         imports = teko::list::empty()
         funcs = [WasmFunc { type_index = 0 to u32; local_groups = [WasmLocalGroup { count = 2 to u32; valtype = 0x7F to u8 }]; body = [0x0B to byte] }]
+        globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
         exports = [WasmExport { name = "f"; kind = 0x00 to byte; index = 0 to u32 }]
@@ -162,9 +168,52 @@ fn wt_kitchen_sink_module() -> WasmModule {
         types = [wt_void_functype()]
         imports = [WasmImport { module = "env"; field = "tk_exit"; type_index = 0 to u32 }]
         funcs = [WasmFunc { type_index = 0 to u32; local_groups = teko::list::empty(); body = [0x10 to byte, 0x00 to byte, 0x0B to byte] }]
+        globals = teko::list::empty()
         data = [WasmDataSegment { offset = 0 to u32; bytes = [0x78 to byte] }]
         mem_min_pages = 1 to u32
         exports = [WasmExport { name = "main"; kind = 0x00 to byte; index = 1 to u32 }]
+    }
+}
+
+/**
+ * wt_sp_global_module — a module declaring one mutable `i32` global
+ * initialized to `1024` (the shadow-stack `SP` shape, `backend-c1-wasm.md`
+ * §6.1). Matches `wat2wasm` on `(module (global (mut i32) (i32.const
+ * 1024)))`.
+ *
+ * @return WasmModule  the SP-global-only module
+ */
+fn wt_sp_global_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = [WasmGlobal { valtype = 0x7F to u8; mutable = true; init = 1024 to i64 }]
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_wasi_import_module — a module carrying exactly `wasm_wasi_import_set`'s
+ * own two interned types + two imports and nothing else. Matches `wat2wasm`
+ * on `(module (import "wasi_snapshot_preview1" "proc_exit" (func (param
+ * i32))) (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32
+ * i32 i32) (result i32))))`.
+ *
+ * @return WasmModule  the WASI-import-set-only module
+ */
+fn wt_wasi_import_module() -> WasmModule {
+    let wasi = wasm_wasi_import_set()
+    WasmModule {
+        types = wasi.types
+        imports = wasi.imports
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        exports = teko::list::empty()
     }
 }
 
@@ -397,4 +446,77 @@ fn every_section_together_matches_wat2wasm_reference() {
         0x0B to byte, 0x01 to byte, 0x78 to byte
     ]
     teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * global_section_matches_wat2wasm_reference — a single mutable `i32` global
+ * initialized to `1024` (the shadow-stack `SP` shape), byte-for-byte
+ * identical to `wat2wasm` (`06 07 01 7F 01 41 80 08 0B`).
+ *
+ * @return void
+ */
+fn global_section_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_sp_global_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x06 to byte, 0x07 to byte, 0x01 to byte, 0x7F to byte, 0x01 to byte, 0x41 to byte, 0x80 to byte, 0x08 to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * global_section_const_global_clears_the_mutable_flag — a non-mutable
+ * global emits the `0x00` (const) mutability byte instead of `0x01`,
+ * covering `wasm_append_global`'s other arm.
+ *
+ * @return void
+ */
+fn global_section_const_global_clears_the_mutable_flag() {
+    let m = WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = [WasmGlobal { valtype = 0x7F to u8; mutable = false; init = 0 to i64 }]
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        exports = teko::list::empty()
+    }
+    let got = emit_wasm(m)
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x06 to byte, 0x06 to byte, 0x01 to byte, 0x7F to byte, 0x00 to byte, 0x41 to byte, 0x00 to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * wasi_import_set_matches_wat2wasm_reference — `wasm_wasi_import_set`'s own
+ * two types + two imports, byte-for-byte identical to `wat2wasm` on the
+ * equivalent hand-written `.wat` (§6.2's `proc_exit`/`fd_write` shapes).
+ *
+ * @return void
+ */
+fn wasi_import_set_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_wasi_import_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x01 to byte, 0x0D to byte, 0x02 to byte, 0x60 to byte, 0x01 to byte, 0x7F to byte, 0x00 to byte, 0x60 to byte,
+        0x04 to byte, 0x7F to byte, 0x7F to byte, 0x7F to byte, 0x7F to byte, 0x01 to byte, 0x7F to byte, 0x02 to byte,
+        0x46 to byte, 0x02 to byte, 0x16 to byte, 0x77 to byte, 0x61 to byte, 0x73 to byte, 0x69 to byte, 0x5F to byte,
+        0x73 to byte, 0x6E to byte, 0x61 to byte, 0x70 to byte, 0x73 to byte, 0x68 to byte, 0x6F to byte, 0x74 to byte,
+        0x5F to byte, 0x70 to byte, 0x72 to byte, 0x65 to byte, 0x76 to byte, 0x69 to byte, 0x65 to byte, 0x77 to byte,
+        0x31 to byte, 0x09 to byte, 0x70 to byte, 0x72 to byte, 0x6F to byte, 0x63 to byte, 0x5F to byte, 0x65 to byte,
+        0x78 to byte, 0x69 to byte, 0x74 to byte, 0x00 to byte, 0x00 to byte, 0x16 to byte, 0x77 to byte, 0x61 to byte,
+        0x73 to byte, 0x69 to byte, 0x5F to byte, 0x73 to byte, 0x6E to byte, 0x61 to byte, 0x70 to byte, 0x73 to byte,
+        0x68 to byte, 0x6F to byte, 0x74 to byte, 0x5F to byte, 0x70 to byte, 0x72 to byte, 0x65 to byte, 0x76 to byte,
+        0x69 to byte, 0x65 to byte, 0x77 to byte, 0x31 to byte, 0x08 to byte, 0x66 to byte, 0x64 to byte, 0x5F to byte,
+        0x77 to byte, 0x72 to byte, 0x69 to byte, 0x74 to byte, 0x65 to byte, 0x00 to byte, 0x01 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+    teko::assert::is_true(wt_wasi_import_module().imports[0].type_index == wasm_wasi_import_set().proc_exit_index)
+    teko::assert::is_true(wasm_wasi_import_set().fd_write_index == (1 to u32))
 }
