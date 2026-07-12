@@ -1556,8 +1556,8 @@ fn is_foreach_elem_placeholder(p: parser::Pattern) -> bool {
  * `cg_path_last`/`cg_emit_case_key_str` already compare against for an ordinary `Foo as v` bind
  * (mirrors the "#109 W3 bare-vs-bare" convention throughout match.tks/vm.tks/codegen.tks — the
  * runtime never carries a namespace). Handles the realistic element-type shapes (prim, byte, char,
- * str, a named struct/class/enum); a slice/optional/inline-variant element is a clean, named
- * internal error (not yet supported by the for-each desugar).
+ * str, a named struct/class/enum); every other `Type` case is a clean, named internal error (not
+ * yet supported by the for-each desugar).
  *
  * @param t  the iterator's resolved element type (`_it`'s `T?` with `null` stripped)
  * @return   the bare runtime name string, or an error for an unnameable element type
@@ -1571,6 +1571,18 @@ fn elem_type_name(t: Type) -> str | error {
         Named as n => name_last_segment(n.name)
         _ => error { message = "internal: a for-each iterator's element type must be a nameable type (prim/byte/char/str/named) — this shape is not yet supported" }
     }
+}
+
+/**
+ * optional_inner_or_self — the Optional-stripped inner of `t` (or `t` itself when it is not an
+ * Optional). A DEDICATED, single-purpose function (not inlined) so every caller shares ONE
+ * extraction point.
+ *
+ * @param t  the type to strip
+ * @return   `t`'s Optional inner, or `t` unchanged
+ */
+fn optional_inner_or_self(t: Type) -> Type {
+    match t { Optional as o => o.inner; _ => t }
 }
 
 /**
@@ -1590,7 +1602,7 @@ fn elem_type_name(t: Type) -> str | error {
 fn resolve_foreach_arm(a: parser::Arm, subject: Type) -> parser::Arm | error {
     if !is_foreach_elem_placeholder(a.pattern) { return a }
     let bp = match a.pattern { parser::BindPattern as b => b; _ => return a }
-    let inner = match subject { Optional as o => o.inner; _ => subject }
+    let inner = optional_inner_or_self(subject)
     let tn = match elem_type_name(inner) { str as s => s; error as e => return e }
     let segs = teko::list::push(teko::list::empty(), parser::Segment { name = tn })
     let real = parser::BindPattern { type_name = parser::Path { segments = segs }; has_binding = bp.has_binding; binding = bp.binding; is_slice = false; slice_type = null; type_args = teko::list::empty() }
@@ -1623,22 +1635,23 @@ fn resolve_foreach_placeholders(arms: []parser::Arm, subject: Type) -> []parser:
  * `check_pattern`'s name-based type-RESOLUTION (`bind_pattern_type`/`resolve_named`'s bare-path rule
  * requires the SAME referencing namespace as the type's own declaration — the element type may live
  * elsewhere; the SAME reason the existing `?.` desugar's `safe_nav_match` ALSO builds its `TArm`
- * directly instead of going through `check_pattern`). The element name binds directly to the
- * ALREADY-KNOWN type (no re-derivation needed — it came straight from `_it`'s resolved return
- * type), the body types against that binding, and the emitted `TArm.pattern` carries a REAL,
- * bare-named `BindPattern` (`elem_type_name`) — so VM's `pat_match`/codegen's `emit_pat_binds` see
- * an ORDINARY named bind and need no special case (#517, §5.4.1).
+ * directly instead of going through `check_pattern`). Extracts the placeholder's `BindPattern` and
+ * the element type in ONE function (mirrors `resolve_foreach_arm`'s shape), binds the element name
+ * directly to the ALREADY-KNOWN type (no re-derivation needed — it came straight from `_it`'s
+ * resolved return type), types the body against that binding, and the emitted `TArm.pattern`
+ * carries a REAL, bare-named `BindPattern` (`elem_type_name`) — so VM's `pat_match`/codegen's
+ * `emit_pat_binds` see an ORDINARY named bind and need no special case (#517, §5.4.1).
  *
  * @param a        the syntactic placeholder arm
- * @param bp       `a.pattern`, already known to be the placeholder `BindPattern`
  * @param subject  the match's subject type (an Optional; its inner is the element type T)
  * @param env      the enclosing type environment
  * @param table    the type table
- * @return         the typed arm, or an error when T is not a nameable element type or the guard is
- *                 non-bool
+ * @return         the typed arm, or an error when the pattern is not the expected placeholder
+ *                 shape, T is not a nameable element type, or the guard is non-bool
  */
-fn type_foreach_elem_arm(a: parser::Arm, bp: parser::BindPattern, subject: Type, env: Env, table: TypeTable) -> TArm | error {
-    let inner = match subject { Optional as o => o.inner; _ => subject }
+fn type_foreach_elem_arm(a: parser::Arm, subject: Type, env: Env, table: TypeTable) -> TArm | error {
+    let bp = match a.pattern { parser::BindPattern as b => b; _ => return error { message = "internal: for-each placeholder must be a BindPattern" } }
+    let inner = optional_inner_or_self(subject)
     let tn = match elem_type_name(inner) { str as s => s; error as e => return e }
     let e2 = define(env, bp.binding, inner, false)
     let body = match type_block(a.body, e2, table) { TypedBlock as bk => bk; error as err => return err }
@@ -1664,10 +1677,7 @@ fn type_foreach_elem_arm(a: parser::Arm, bp: parser::BindPattern, subject: Type,
  * @return         the typed arm, or an error
  */
 fn type_match_arm(a: parser::Arm, subject: Type, env: Env, table: TypeTable) -> TArm | error {
-    if is_foreach_elem_placeholder(a.pattern) {
-        let bp = match a.pattern { parser::BindPattern as b => b; _ => return error { message = "internal: for-each placeholder must be a BindPattern" } }
-        return type_foreach_elem_arm(a, bp, subject, env, table)
-    }
+    if is_foreach_elem_placeholder(a.pattern) { return type_foreach_elem_arm(a, subject, env, table) }
     type_arm(a, subject, env, table)
 }
 
