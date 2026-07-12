@@ -119,6 +119,12 @@ Every op below lives in the stdlib namespace **`teko::marshall`** (spelling rati
 given as a copy-paste-ready, full-Javadoc Teko signature the implementer adds verbatim. All ops that
 name `ptr`/`uptr` are `unsafe fn` by the §4 gate; `swap` is the sole SAFE member.
 
+**The OPERAND LAW [PINNED, owner 2026-07-13]: only `Ref` or `Ptr` enter Marshall.** Every operand of
+every `teko::marshall` op must already be reference/pointer-typed (`Ref<T>`, `ptr<T>`, `uptr`). Bare
+values — including `mut` lvalues — are compile errors at a marshall call site; **no implicit
+borrow-down (R7/A3) occurs at the Marshall door** (the addressing must pre-exist and be visible —
+the case-C principle). Full statement + fixtures in §5.6.
+
 ### 5.0 Module skeleton (compiles today; the honest-stops mark the blocked bodies)
 
 ```teko
@@ -316,9 +322,11 @@ acceptable, and honest about the copy (M.5 "you see the copy").
  * call `a` holds `b`'s former value and vice-versa; the two references still alias the same two
  * storage slots they did before.
  *
- * @param T a  the first reference (write-through target)
- * @param T b  the second reference (write-through target)
- * @example teko::marshall::swap(x, y)   // x and y are `ref` bindings
+ * @param T a  the first reference (write-through target — must ALREADY be a reference)
+ * @param T b  the second reference (write-through target — must ALREADY be a reference)
+ * @example ref rx: i64 = x
+ * @example ref ry: i64 = y
+ * @example teko::marshall::swap(rx, ry)   // operands are Ref<i64> — pre-existing, visible addressing
  * @since 0.3.1
  */
 pub fn swap<T>(ref a: T, ref b: T) {
@@ -328,9 +336,17 @@ pub fn swap<T>(ref a: T, ref b: T) {
 }
 ```
 
-Both args are `ref` (mut alias); passing a `let`-bound value is rejected (`swap` needs write-through
-targets) — `marshall_swap_on_let_rejected`. This body compiles against **today's** `.value` Ref too
-(it is plain assignment + one local), so `swap` is UNBLOCKED (crumb C3).
+**[PINNED] ruling (owner 2026-07-13) — the Marshall OPERAND LAW: only `Ref` or `Ptr` enter
+`teko::marshall`.** Every op in this namespace accepts ONLY reference/pointer-typed operands
+(`Ref<T>`, `ptr<T>`, `uptr`). A bare VALUE — including a `mut` lvalue — is a compile error at a
+marshall call site: **no implicit borrow-down (R7/A3) happens at the Marshall door.** The addressing
+must pre-exist and be visible (the case-C principle: `ref` marks addressing); Marshall never
+manufactures a reference from a value silently. Ordinary functions with `ref` params keep R7
+borrow-down as usual — the restriction is specific to the boundary namespace. So: passing a
+`let`-bound value is rejected (`marshall_swap_on_let_rejected`), and passing a `mut`-bound VALUE is
+equally rejected (`marshall_swap_on_mut_value_rejected`) — the caller borrows explicitly first
+(`ref rx: i64 = x`). This body compiles against **today's** `.value` Ref too (it is plain assignment
++ one local), so `swap` is UNBLOCKED (crumb C3).
 
 ### 5.7 Slices/arrays of pointers — element-wise, in v1
 
@@ -500,6 +516,7 @@ convention as `arena_manual_ok`/`unsafe_rawbuf_roundtrip`). REJECT fixtures carr
 | `marshall_ptr_optional_rejected` | `ptr<T>?` — the forbidden `?`-over-ptr (§5.3) |
 | `marshall_wrap_type_mismatch_rejected` | `wrap<str>` of a `ptr<int>` — the STATIC type check (§5.1) |
 | `marshall_swap_on_let_rejected` | `swap` on a `let`-bound arg (needs `ref` write-through, §5.6) |
+| `marshall_swap_on_mut_value_rejected` | `swap` on a `mut` VALUE lvalue — the operand law: no implicit borrow-down at the Marshall door (§5.6) |
 
 **PANIC — native, non-zero exit:**
 
