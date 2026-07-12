@@ -348,12 +348,39 @@ equally rejected (`marshall_swap_on_mut_value_rejected`) — the caller borrows 
 (`ref rx: i64 = x`). This body compiles against **today's** `.value` Ref too (it is plain assignment
 + one local), so `swap` is UNBLOCKED (crumb C3).
 
-### 5.7 Slices/arrays of pointers — element-wise, in v1
+### 5.7 Arrays of pointers and references [RATIFIED, owner 2026-07-13]
 
-`[]ptr<T>` is an unsafe type (Ptr contagion, §4); `[]ref T` is safe. They share an **identical
-C-representation** (both arrays of `T *`), so a bulk crossing is a null-scan one way and a no-op
-reinterpret the other. v1 ships only the **element-wise** primitives (§5.1/§5.2 applied per element);
-a bulk `wrap_slice`/`unwrap_slice` convenience is deferred and built ON them (it must null-panic each
+**The safe side — `[]ref T` (slice of references, a VALUE whose elements alias):**
+
+- **Element access** is transparent (type-directed peel): `xs[i]` in a value context reads THROUGH
+  the element's reference; **element assignment is WRITE-THROUGH, never rebind** (R4 extended to
+  elements — re-pointing an element means rebuilding the slice).
+- **Attaching a VALUE** to a ref collection (literal element, `push`) = **R5 copy-on-attach** — the
+  value is materialized in the arena and the element aliases the COPY (the Marshall operand law does
+  NOT apply here; `[]ref T` is ordinary safe-world code).
+- **Nullability (Case D applied):** `[]ref T?` ✓ (elements alias optional VALUES) · `([]ref T)?` ✓
+  (the `?` sits on the slice/value layer) · a `?` on any ref layer ✗ at any depth.
+- **A slice-of-refs FIELD carries no modifier** (`d: []ref T`): the field is a VALUE whose type
+  shows the refs — the `ref` modifier marks "this declaration IS a reference", which a slice is not.
+- **Escape (A1):** a ref collection is a ref-carrying aggregate — local use ✓; crossing arenas
+  (return/store) ✗ conservative until the spine proves cases (this was literally the
+  "collection-return" hole of the adversarial soundness pass).
+- The three shapes stay distinct: `ref xs: []T` (alias of the WHOLE array) ≠ `[]ref T` (array OF
+  aliases) ≠ `ref xs: []ref T` (alias of an array of aliases — two depth-1 chains, inside the cap).
+
+**The raw side — `ptr` IS the array (C MODE, owner):** `[]ptr<T>` exists (an unsafe type by Ptr
+contagion, §4) as a Teko slice whose elements are raw pointers — elements are raw-REBINDABLE
+(`ps[0] = ps[1]` is legal; the raw world has no R4). But the raw world's native array idiom is the
+C one: **a base `ptr<T>` + indexing/arithmetic (`p[i]`, `p + n`, §5.5) — the pointer IS the array.**
+Consequently **`ptr<[]T>` is REJECTED**: a Teko slice is a fat value (`ptr+len`), not a C type; a
+raw pointer to one would be a category mixup — the raw world carries base+len separately (the
+RawBuf pattern is exactly that answer). `ptr<ptr<T>>` stays legal (C `T**` interop; unsafe depth is
+unbounded, per the cap ruling).
+
+**Crossing in bulk:** `[]ptr<T>` and `[]ref T` share an **identical C-representation** (both arrays
+of `T *`), so a bulk crossing is a null-scan one way and a no-op reinterpret the other. v1 ships
+only the **element-wise** primitives (§5.1/§5.2 applied per element); a bulk
+`wrap_slice`/`unwrap_slice` convenience is deferred and built ON them (it must null-panic each
 element on the way in — no cheaper than the loop). Documented so the implementer does not invent a
 "cheap" unchecked bulk crossing that would smuggle a null past R2.
 
