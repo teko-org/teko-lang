@@ -119,6 +119,7 @@ COMPILE_FAIL=(
     free_captured_by_container_rejected
     free_field_extract_rejected
     loop_label_lowercase
+    loop_range_counter_leak
 )
 
 is_expected_fail() {
