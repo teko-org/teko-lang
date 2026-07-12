@@ -72,7 +72,7 @@ fn lam_collect_stmt(s: parser::Statement, refs: Ref<[]str>, bound: Ref<[]str>) -
         }
         parser::Assign as a => { lam_collect_expr(a.value, refs, bound); match a.kind { parser::AssignKind::Field => lam_collect_expr(a.target, refs, bound); _ => { } } }   // (#88) a closure writing `obj.f = …` captures the receiver's free vars
         parser::Return as r => if r.has_value { lam_collect_expr(r.value, refs, bound) } else { }
-        parser::LoopStmt as l => lam_collect_block(l.body, refs, bound)
+        parser::LoopStmt as l => { lam_collect_block(l.init, refs, bound); lam_collect_block(l.body, refs, bound) }
         parser::ExprStmt as es => lam_collect_expr(es.expr, refs, bound)
         parser::DeferStmt as d => lam_collect_block(d.body, refs, bound)
         parser::AdoptStmt as a => lam_collect_block(a.body, refs, bound)
@@ -3032,9 +3032,21 @@ fn type_return(r: parser::Return, env: Env, table: TypeTable) -> TypedStmt | err
     TypedStmt { node = TReturn { has_value = r.has_value; value = v }; env = env }   // value gated by has_value (B.20); the return-type match is enforced by type_function's check_returns (C5)
 }
 
+/**
+ * type_loop — type a `[LABEL:] loop [head] { … }` (#517). The head is already desugared: `init`
+ * is typed in a LOOP-PRIVATE child scope so its bindings (counter / bound / `_first` / `_it`) do
+ * NOT leak past the loop, then `body` is typed in that same scope (so the body reads the preamble).
+ * The env returned is the CALLER's env — every loop-local binding (init AND body) is dropped.
+ *
+ * @param l the surface loop node (label + init + body)
+ * @param env the enclosing type environment
+ * @param table the type table
+ * @return the typed loop statement paired with the UNCHANGED outer env, or a type error
+ */
 fn type_loop(l: parser::LoopStmt, env: Env, table: TypeTable) -> TypedStmt | error {
-    let tb = match type_block(l.body, env, table) { TypedBlock as bk => bk; error as e => return e }
-    TypedStmt { node = TLoopStmt { label = l.label; body = tb.stmts }; env = env }   // body bindings stay block-local; label carried (M.5)
+    let ib = match type_block(l.init, env, table) { TypedBlock as bk => bk; error as e => return e }
+    let bb = match type_block(l.body, ib.env, table) { TypedBlock as bk => bk; error as e => return e }
+    TypedStmt { node = TLoopStmt { label = l.label; init = ib.stmts; body = bb.stmts }; env = env }
 }
 
 fn type_exprstmt(es: parser::ExprStmt, env: Env, table: TypeTable) -> TypedStmt | error {
@@ -3717,7 +3729,7 @@ fn stmt_has_free(s: TStatement) -> bool {
         TBinding as b => expr_has_free(b.value)
         TAssign as a => expr_has_free(a.value)
         TReturn as r => if r.has_value { expr_has_free(r.value) } else { false }
-        TLoopStmt as l => stmts_have_free(l.body)
+        TLoopStmt as l => stmts_have_free(l.init) || stmts_have_free(l.body)
         TDeferStmt as d => stmts_have_free(d.body)
         TAdoptStmt as a => stmts_have_free(a.body)
         TBreakStmt => false
@@ -3797,7 +3809,7 @@ fn check_ref_storability_stmt(s: TStatement, spine: Spine) -> error? {
     match s {
         TBinding as b => match check_ref_bind_storable(b, spine) { error as e => return e; null => check_ref_storability_expr(b.value, spine) }
         TAssign as a => match check_ref_assign_storable(a, spine) { error as e => return e; null => check_ref_storability_expr(a.value, spine) }
-        TLoopStmt as l => check_ref_storability_block(l.body, spine)
+        TLoopStmt as l => match check_ref_storability_block(l.init, spine) { error as e => return e; null => check_ref_storability_block(l.body, spine) }
         TDeferStmt as d => check_ref_storability_block(d.body, spine)
         TAdoptStmt as a => check_ref_storability_block(a.body, spine)
         TReturn as r => if r.has_value { check_ref_storability_expr(r.value, spine) } else { null }

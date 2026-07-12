@@ -5805,12 +5805,61 @@ fn emit_return(buf: []byte, prog: checker::TProgram, r: checker::TReturn, in_mai
     cb(out, ";\n")
 }
 
-// emit_loop — a TLoopStmt -> `while (1) { … }`, nesting one indent level deeper. A LABELED loop
-// (M.5) gets a continue-target `tk_lbl_<NAME>_cont: ;` at the TOP of its body (so `continue L`
-// lowers to `goto tk_lbl_<NAME>_cont;`, re-running the body == the next while(1) iteration) and a
-// break-target `tk_lbl_<NAME>_break: ;` AFTER the loop (so `break L` lowers to `goto …_break;`).
-// A bare loop is unchanged. (C: TK_TSTMT_LOOP branch; C grew the inner indent with snprintf.)
+/**
+ * emit_loop — a TLoopStmt. When `init` is EMPTY (infinite / while loop), this emits the bare
+ * `while (1) { … }` unchanged (byte-identical to pre-#517). When `init` is non-empty (range /
+ * 3-part / for-each), the loop is wrapped in a `{ … }` C scope so the run-once preamble bindings
+ * (`i` / `_hi` / `_first` / `_it`) live loop-locally and do NOT leak past the loop, then the
+ * `while (1)` loop is emitted one indent deeper. The loop MECHANISM itself (continue-target,
+ * break-target, region, defers) is emitted by `emit_loop_while` and is UNTOUCHED (#517).
+ *
+ * @param buf the output byte buffer
+ * @param l the typed loop node (label + init + body)
+ * @param in_main whether this loop is emitted inside `main`
+ * @param prog the whole typed program
+ * @param ret_type the enclosing function's return type
+ * @param indent the current indentation string
+ * @param frame the enclosing region-frame expression
+ * @param escaping the names whose values escape the current frame
+ * @param regions the active region-frame stack
+ * @param fn_body the enclosing function's body (for block-local analysis)
+ * @param dctx the defer context
+ * @return the buffer with the loop emitted, or a codegen error
+ */
 fn emit_loop(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    if l.init.len == 0 { return emit_loop_while(buf, l, in_main, prog, ret_type, indent, frame, escaping, regions, fn_body, dctx) }
+    mut out = cb(buf, indent)
+    out = cb(out, "{\n")
+    let inner = cb_indent_deeper(indent)
+    out = match emit_block(out, l.init, in_main, prog, ret_type, inner, escaping, regions, fn_body, dctx, teko::list::empty(), false) { []byte as o => o; error as err => return err }
+    out = match emit_loop_while(out, l, in_main, prog, ret_type, inner, frame, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, indent)
+    out = cb(out, "}\n")
+    out
+}
+
+/**
+ * emit_loop_while — emit a TLoopStmt's `while (1) { … }` core (the #517-UNTOUCHED loop mechanism).
+ * A LABELED loop (M.5) gets a continue-target `tk_lbl_<NAME>_cont: ;` at the TOP of its body (so
+ * `continue L` lowers to `goto tk_lbl_<NAME>_cont;`, re-running the body == the next while(1)
+ * iteration) and a break-target `tk_lbl_<NAME>_break: ;` AFTER the loop (so `break L` lowers to
+ * `goto …_break;`). A bare loop is unchanged. (C: TK_TSTMT_LOOP branch; C grew the inner indent
+ * with snprintf.)
+ *
+ * @param buf the output byte buffer
+ * @param l the typed loop node (label + body; `init` already emitted by the caller)
+ * @param in_main whether this loop is emitted inside `main`
+ * @param prog the whole typed program
+ * @param ret_type the enclosing function's return type
+ * @param indent the current indentation string
+ * @param frame the enclosing region-frame expression
+ * @param escaping the names whose values escape the current frame
+ * @param regions the active region-frame stack
+ * @param fn_body the enclosing function's body (for block-local analysis)
+ * @param dctx the defer context
+ * @return the buffer with the while-loop emitted, or a codegen error
+ */
+fn emit_loop_while(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let labeled = l.label.len > 0
     mut out = cb(buf, indent)
     out = cb(out, "while (1) {\n")
@@ -6850,7 +6899,7 @@ fn cg_collect_block_opts(set: CgTypeSet, stmts: []checker::TStatement) -> CgType
             // bare `T` (widened) — mirrors the TBinding arm collecting b.bound.
             checker::TAssign as a => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); match a.kind { parser::AssignKind::Field => s = cg_collect_expr_opts(s, a.target); _ => { } } }   // (#88) the FIELD LHS receiver may carry optional types too
             checker::TReturn as r => { if r.has_value { s = cg_collect_expr_opts(s, r.value) } }
-            checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.body) }
+            checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.init); s = cg_collect_block_opts(s, l.body) }
             checker::TExprStmt as es => { s = cg_collect_expr_opts(s, es.expr) }
             checker::TDeferStmt as d => { s = cg_collect_block_opts(s, d.body) }
             checker::TAdoptStmt as a => { s = cg_collect_block_opts(s, a.body) }
@@ -7625,7 +7674,7 @@ fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStateme
         checker::TBinding as b => checker::TBinding { kind = b.kind; target = b.target; bound = b.bound; value = cg_lift_expr(b.value, acc) }
         checker::TAssign as a => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = match a.kind { parser::AssignKind::Field => cg_lift_expr(a.target, acc); _ => a.target } }   // (#88) lift lambdas in the FIELD LHS receiver too
         checker::TReturn as r => checker::TReturn { has_value = r.has_value; value = if r.has_value { cg_lift_expr(r.value, acc) } else { r.value } }
-        checker::TLoopStmt as l => checker::TLoopStmt { label = l.label; body = cg_lift_block(l.body, acc) }
+        checker::TLoopStmt as l => checker::TLoopStmt { label = l.label; init = cg_lift_block(l.init, acc); body = cg_lift_block(l.body, acc) }
         checker::TExprStmt as es => checker::TExprStmt { expr = cg_lift_expr(es.expr, acc) }
         checker::TDeferStmt as d => checker::TDeferStmt { body = cg_lift_block(d.body, acc) }
         checker::TAdoptStmt as a => checker::TAdoptStmt { name = a.name; body = cg_lift_block(a.body, acc) }
