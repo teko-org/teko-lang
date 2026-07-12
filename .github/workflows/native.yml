@@ -1,21 +1,18 @@
 name: Native Build & Test
 
-# CI runs on PULL REQUESTS (the per-PR gate) plus a nightly SCHEDULE (the VM-regression lane).
+# CI runs on PULL REQUESTS (the per-PR gate) plus PUSHES to remodel/** integration branches.
 # Branch protection requires the PR checks green before a PR can merge, so every commit that
 # reaches main was already 100% green — re-running the full suite on the post-merge push would
 # only duplicate that work and burn pipeline minutes. The release trusts this and builds from a
 # main tag WITHOUT re-validating (see release.yml). chore/reboot stays listed so PRs targeting the
-# integration branch still get checks (#54). The `schedule:` trigger drives ONLY vm-gate-nightly
-# (#168): since the native gate became the default per-PR gate, the VM gate runs once nightly over
-# the full corpus to keep VM regressions caught without paying the ~1.5 GB VM-gate memory per PR.
+# integration branch still get checks (#54). The nightly VM-regression SCHEDULE trigger is retired
+# with the VM CI lane itself (issue #524) — native is now the sole engine, gated on every PR.
 on:
   pull_request:
     branches: [main, master, chore/reboot, 'remodel/**', 'fix/issue-*']
   push:
     branches: ['remodel/**']
     paths-ignore: ['**.md', 'docs/**']
-  schedule:
-    - cron: '0 6 * * *'
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
@@ -23,9 +20,8 @@ permissions:
 
 jobs:
   # ── path filter ──────────────────────────────────────────────────────────────
-  # PR-only: the paths-filter needs a pull_request context. On the nightly `schedule`
-  # trigger this job is skipped, so every per-PR job (needs: changes) skips too, and
-  # only vm-gate-nightly (which does NOT need changes) runs.
+  # PR-only: the paths-filter needs a pull_request context, so this job — and every
+  # job that `needs: changes` — only runs on pull_request events.
   changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -131,8 +127,10 @@ jobs:
       # (function/line/branch, #265 Track A) from the native run's merged marks. Because the tests
       # run out-of-process, the compiler's own peak stays codegen-only (~940 MB here) instead of the
       # VM gate's ~1.5 GB in-process functional-env balloon — the per-PR gate memory drop. This is
-      # ONE gate per platform (the historical VM+native double is gone); the VM gate moves to the
-      # scheduled `vm-gate-nightly` lane below. `--vm-gate` still forces the VM gate for local debug.
+      # ONE gate per platform; the nightly VM-regression lane is retired (issue #524 — the
+      # VM==native differential's false-failures now outweigh its remaining coverage; see
+      # docs/design/vm-retirement.md §3). `--vm-gate` still exists for local debug until the VM
+      # engine itself is retired in a later #524 crumb.
       - name: Test gate (native on the primary; compile-only elsewhere — perf)
         shell: bash
         run: |
@@ -202,13 +200,15 @@ jobs:
           TEKO_DIFF_TARGET: riscv64-linux
         run: ./scripts/diff_c_own.sh
 
-  # ── differential VM==native harness (issue #54) ──────────────────────────────
-  # Cross-runs every examples/regressions/* project through BOTH engines (`teko run`
-  # on the VM, `teko build` through the host cc + execute) and asserts identical exit
-  # codes and program stdout. This is the structural gate the audit divergences
-  # (#47/#48/#49/#50, the destructor gap) slipped past: `teko test .` only exercises
-  # the .tkt corpus and never feeds examples/regressions/* to a real cc.
-  diff-vm-native:
+  # ── gen1 checks: self-test, CLI surface, and the own==C differential (issue #524) ──
+  # Builds gen1 (the PR's compiler under test) from the downloaded release seed, then runs
+  # its own gate + CLI-surface smokes + the CWD-build-regression check (#64) + the own AOT
+  # backend == C backend differential. The own==C differential is the replacement
+  # cross-check for the retired VM==native harness (issue #524): the VM shared the
+  # front-end with native but not codegen, so it protected little there while its
+  # wrapper-descent bug (VM-only) cost real false-failures — see
+  # docs/design/vm-retirement.md §3.
+  gen1-checks:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     strategy:
@@ -224,7 +224,7 @@ jobs:
             label: macos-arm64
             install_deps: ""
 
-    name: diff VM==native / ${{ matrix.os }}
+    name: gen1 checks / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     permissions:
@@ -234,7 +234,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The native side of the harness compiles the GENERATED C (+ the runtime seam
+      # The own==C differential compiles the GENERATED C (+ the runtime seam
       # teko_rt.c) with the host cc — so cc is still needed; the COMPILER itself is
       # the downloaded release, not a from-source build.
       - name: Install cc
@@ -275,11 +275,14 @@ jobs:
         shell: bash
         run: ./scripts/region_drop_subtree_test.sh
 
-      - name: Differential harness (VM == native over examples/regressions, on gen1)
+      # CWD-build-regression check (issue #64): `cd <project> && teko build .` — the exact
+      # invocation shape a real user takes — must exit 0 and produce a working binary, for
+      # both the seed compiler and the self-hosted gen1 binary it just built.
+      - name: CWD build regression check (issue #64, on gen1)
         shell: bash
         env:
           TEKO: ./bin/teko
-        run: ./scripts/diff_vm_native.sh
+        run: ./scripts/native_regressions.sh
 
       # ── C-vs-own differential (issue #385 A4-5 arm64; issue #386 B1-8 x86-64) ──
       # The own AOT backend (TEKO_BACKEND=native) links a real native executable via cc.
@@ -350,44 +353,11 @@ jobs:
       - name: Run the x86_64-glibc cross artifact over the corpus (miscompile guard)
         run: ./gd-linux-x86_64-glibc/teko . -o /tmp/xrun --no-verify
 
-  # ── nightly VM-gate lane (#168 governance) ────────────────────────────────────
-  # Since the native gate became the DEFAULT per-PR gate (#168 memory-debt fix), the VM gate no
-  # longer runs on every PR — its ~1.5 GB in-process functional-env peak was the per-PR gate
-  # memory debt. But the VM is still the dev/debug/WASM engine and must not silently regress, so
-  # `teko test .` (the full #test corpus, VM-interpreted, all three coverage floors) runs once
-  # NIGHTLY over the whole corpus. This keeps VM==native parity honest at the gate level; the
-  # per-PR diff-vm-native job already proves VM==native RELEASE parity on every PR. Runs ONLY on
-  # the schedule trigger (not on PRs), so it adds ZERO per-PR wall-clock or memory.
-  vm-gate-nightly:
-    name: VM gate (nightly regression)
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Provision teko from the latest release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: ./scripts/ci_provision_teko.sh linux-x86_64
-
-      - name: Build gen1 (native default gate) so the VM lane tests THIS corpus
-        shell: bash
-        run: teko . -o bin
-
-      - name: VM gate over the full corpus (teko test .)
-        shell: bash
-        run: ./bin/teko test .
-
-  # ── gate: aggregates all build-test + riscv + differential + cross-smoke results ──
+  # ── gate: aggregates all build-test + riscv + gen1-checks + cross-smoke results ──
   gate:
     name: CI gate
     runs-on: ubuntu-latest
-    needs: [changes, build-test, riscv64-qemu, diff-vm-native, release-cross-smoke]
+    needs: [changes, build-test, riscv64-qemu, gen1-checks, release-cross-smoke]
     if: always()
     permissions: {}
 
@@ -396,14 +366,14 @@ jobs:
         run: |
           BUILD_RESULT="${{ needs.build-test.result }}"
           RISCV_RESULT="${{ needs.riscv64-qemu.result }}"
-          DIFF_RESULT="${{ needs.diff-vm-native.result }}"
+          GEN1_RESULT="${{ needs.gen1-checks.result }}"
           SMOKE_RESULT="${{ needs.release-cross-smoke.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
           echo "changes.run   = $CHANGES"
           echo "build-test    = $BUILD_RESULT"
           echo "riscv64-qemu  = $RISCV_RESULT"
-          echo "diff-vm-native = $DIFF_RESULT"
+          echo "gen1-checks   = $GEN1_RESULT"
           echo "release-cross-smoke = $SMOKE_RESULT"
 
           # If the paths filter said nothing relevant changed, everything skipped → OK
@@ -418,9 +388,11 @@ jobs:
             exit 1
           fi
 
-          # diff-vm-native must be success — a divergence between the engines gates
-          if [ "$DIFF_RESULT" = "failure" ] || [ "$DIFF_RESULT" = "cancelled" ]; then
-            echo "ERROR: diff-vm-native $DIFF_RESULT"
+          # gen1-checks must be success — gen1's own gate, CLI surface, the CWD-build
+          # regression check (#64), and the own==C differential are all folded into this
+          # job; any failure there gates the merge.
+          if [ "$GEN1_RESULT" = "failure" ] || [ "$GEN1_RESULT" = "cancelled" ]; then
+            echo "ERROR: gen1-checks $GEN1_RESULT"
             exit 1
           fi
 
