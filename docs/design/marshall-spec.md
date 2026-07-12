@@ -433,44 +433,50 @@ crossing verb, and stay operators under any option.)
 
 ## 8. FFI patterns cookbook
 
-All patterns live inside `unsafe fn` (they name `ptr`); each hands a **safe** value back across the
-boundary. These use the (migrated-to-`unsafe`, §4) `teko::mem` primitives + Marshall.
+**The FFI WRAPPER LAW [PINNED, owner 2026-07-13]: a wrapper receives `ref` or `ptr` — data never
+crosses BY VALUE inside a wrapper.** The caller owns the data and either LENDS it (`ref`,
+write-through) or hands the RAW ADDRESS (`ptr`). Copies and conversions are EXPLICIT at the call
+site, never hidden inside the wrapper body (M.5: you see the copy). Scalar RESULTS may still cross
+out by value (a safe value legally leaves an `unsafe fn`); the law is about payloads — strings,
+buffers, aggregates. Corollary of the §5 operand law, extended from the marshall ops to the whole
+boundary zone.
 
-**8.1 C string out and back** (`char*` APIs):
+**8.1 C string APIs — a THIN raw shim; conversions live at the caller:**
 ```teko
 /**
- * Passes a Teko `str` to a C `char*` API and copies the C result back to a safe `str`. `unsafe
- * fn` (names `ptr`); returns a safe `str` (crosses out legally).
- * @param str name  the string to hand to the C API
- * @return str  a freshly copied Teko string of the C result
+ * The thin shim over the C `char*` API: pointers in, pointer out, NOTHING copied inside.
+ * @param ptr<byte> c_name  a NUL-terminated C string the caller prepared
+ * @return ptr<byte>  the C API's own result pointer (ownership per the C API's contract)
  */
-pub unsafe fn greet(name: str) -> str {
-    let c_in: ptr<byte> = teko::mem::as_cstr(name)   // fresh NUL-terminated copy
-    let c_out: ptr<byte> = c_api_greet(c_in)         // extern C, returns char*
-    teko::mem::str_from_cstr(c_out)                  // copy back to safe str
+pub unsafe fn greet_raw(c_name: ptr<byte>) -> ptr<byte> {
+    c_api_greet(c_name)
+}
+
+// the CALLER makes every copy visibly, at the call site:
+unsafe fn caller(name: str) -> str {
+    let c_in: ptr<byte> = teko::mem::as_cstr(name)     // VISIBLE copy #1 (NUL-terminated)
+    let c_out: ptr<byte> = greet_raw(c_in)
+    teko::mem::str_from_cstr(c_out)                    // VISIBLE copy #2 (back to safe str)
 }
 ```
 
-**8.2 Buffer fill via `&`** (a C API writing into a caller buffer):
+**8.2 Buffer fill — the wrapper BORROWS the caller's buffer (write-through, zero copies):**
 ```teko
 /**
- * Allocates a raw buffer, hands its address to a C fill routine, and returns the bytes as a safe
- * `[]byte`. Demonstrates the `&`/`RawBuf` path.
- * @param u64 n  buffer length in bytes
- * @return []byte  the filled bytes, copied to a safe slice
+ * Hands the CALLER's buffer to a C fill routine — write-through via the borrowed `ref`; the
+ * wrapper allocates nothing and copies nothing. The caller sizes and owns the buffer.
+ * @param []byte buf  the caller's buffer (borrowed; filled in place)
  */
-pub unsafe fn fill(n: u64) -> []byte {
-    mut buf: RawBuf = teko::mem::unsafe::rawbuf_alloc(n)
-    c_api_fill(buf.ptr, buf.len)                       // ptr<byte> straight to C
-    teko::mem::unsafe::rawbuf_read(buf)                // safe []byte copy out
+pub unsafe fn fill(ref buf: []byte) {
+    c_api_fill(teko::mem::buf_ptr(buf), buf.len)       // raw address of the BORROWED storage
 }
 ```
 
-**8.3 Struct pointer round-trip via Marshall** (lift a raw struct ptr to a `Ref` for a safe helper):
+**8.3 Struct pointer lift via Marshall** (the model pattern — it RECEIVES the pointer):
 ```teko
 /**
  * Wraps a raw `ptr<Node>` from a C API into a `Ref<Node>`, runs a SAFE helper over it, and
- * returns a by-value safe summary. Shows `wrap` as the ptr->Ref lift and the value crossing out.
+ * returns a by-value scalar summary (legal: scalar out). Shows `wrap` as the ptr->Ref lift.
  * @param ptr<Node> raw  a raw, non-null node pointer from C
  * @return i64  a value computed by the safe helper
  */
@@ -480,9 +486,18 @@ pub unsafe fn summarize(raw: ptr<Node>) -> i64 {
 }
 ```
 
-**8.4 Storing a handle as `uptr`** (the D35 Arena pattern, generalized): use `to_uptr`/`from_uptr`
-around any `unsafe`-type field that must carry a raw address as a word (opaque callback contexts,
-region handles). See `Arena.region: uptr` for the shipped instance.
+**8.4 Handles are TYPED POINTERS, not words.** Holding a raw address as a `uptr` word in a field
+loses the type and the reader's pointer-visibility — per the wrapper law, an unsafe struct holds
+the `ptr<T>` itself:
+```teko
+unsafe type CApiSession = struct {
+    h: ptr<CApiCtx>       // typed, visible, greppable — never `h: uptr`
+}
+```
+The `to_uptr`/`from_uptr` bridge (§5.4) remains for genuine WORD-transport seams (an ABI field that
+is an integer, a callback context squeezed through a C `void*`-as-word API) — transport, not
+storage. **Follow-up flagged:** the shipped `Arena.region: uptr` (D35) predates this law; re-tag to
+a typed opaque ptr when the 0.3.1 marshall crumbs land (tracked with C1).
 
 ---
 
