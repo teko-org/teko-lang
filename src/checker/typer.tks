@@ -1528,6 +1528,149 @@ fn safe_nav_match(recv: TExpr, inner_name: str, binder: str, armv: TExpr) -> TEx
     TExpr { kind = TMatchExpr { subject = recv; arms = arms }; type = result; line = 0; col = 0 }
 }
 
+/**
+ * is_foreach_elem_placeholder — is `p` the for-each loop-head desugar's element-bind placeholder
+ * (§5.4)? `loop mut x in <it> { … }` desugars (`parser::loop_head.tks`) to `match _it() { null =>
+ * break; <placeholder> => { … } }`, where `<placeholder>` is a `BindPattern` with an EMPTY
+ * `type_name` — an internal marker reachable ONLY from the parser's own for-each desugar, never
+ * from user source (a literal `_ as x` is now a parse-time error: `_` is a discard, `as x` a
+ * capture — a semantic contradiction, owner ruling). `resolve_foreach_arm`, BEFORE any
+ * pattern-matching/exhaustiveness/codegen ever sees a for-each match's arms, rewrites this
+ * placeholder into a REAL `T as x` bind (T = the iterator's resolved element type) — the SAME
+ * sound, pre-existing named-bind mechanism `Foo as v` already uses, so VM/native/LIR need NO
+ * special case.
+ *
+ * @param p  the arm pattern to classify
+ * @return   true iff `p` is the for-each placeholder
+ */
+fn is_foreach_elem_placeholder(p: parser::Pattern) -> bool {
+    match p {
+        parser::BindPattern as bp => bp.type_name.segments.len == 0 && !bp.is_slice && bp.has_binding
+        _ => false
+    }
+}
+
+/**
+ * elem_type_name — the RUNTIME-facing BARE name of a for-each iterator's element type `t` — the
+ * SAME bare, unqualified spelling VM's `bind_case_name`/`val_type_matches` and codegen's
+ * `cg_path_last`/`cg_emit_case_key_str` already compare against for an ordinary `Foo as v` bind
+ * (mirrors the "#109 W3 bare-vs-bare" convention throughout match.tks/vm.tks/codegen.tks — the
+ * runtime never carries a namespace). Handles the realistic element-type shapes (prim, byte, char,
+ * str, a named struct/class/enum); a slice/optional/inline-variant element is a clean, named
+ * internal error (not yet supported by the for-each desugar).
+ *
+ * @param t  the iterator's resolved element type (`_it`'s `T?` with `null` stripped)
+ * @return   the bare runtime name string, or an error for an unnameable element type
+ */
+fn elem_type_name(t: Type) -> str | error {
+    match t {
+        Prim as p => prim_name(p.kind)
+        Byte => "byte"
+        Char => "char"
+        Str => "str"
+        Named as n => name_last_segment(n.name)
+        _ => error { message = "internal: a for-each iterator's element type must be a nameable type (prim/byte/char/str/named) — this shape is not yet supported" }
+    }
+}
+
+/**
+ * resolve_foreach_arm — the SYNTACTIC completion one match arm needs for `exhaustive`'s coverage
+ * check ONLY: when `a.pattern` is the for-each placeholder, rewrite it into a `BindPattern` carrying
+ * a non-empty `type_name` (so `present_case_covered` recognizes it as covering the present case,
+ * exactly like it already does for `Foo as v`); every other arm (the `null => break` arm, and any
+ * ordinary user arm) passes through unchanged. This rewrite is NEVER re-resolved via `resolve_named`
+ * (see `type_foreach_elem_arm` for the actual TYPED binding, which bypasses name-resolution — the
+ * element type may live outside the match's own referencing namespace, exactly the reason the
+ * existing `?.` desugar's `safe_nav_match` ALSO bypasses it).
+ *
+ * @param a        the syntactic match arm
+ * @param subject  the match's subject type (an Optional when this is a for-each pull)
+ * @return         the (possibly rewritten) arm, or an error when the element type is unnameable
+ */
+fn resolve_foreach_arm(a: parser::Arm, subject: Type) -> parser::Arm | error {
+    if !is_foreach_elem_placeholder(a.pattern) { return a }
+    let bp = match a.pattern { parser::BindPattern as b => b; _ => return a }
+    let inner = match subject { Optional as o => o.inner; _ => subject }
+    let tn = match elem_type_name(inner) { str as s => s; error as e => return e }
+    let segs = teko::list::push(teko::list::empty(), parser::Segment { name = tn })
+    let real = parser::BindPattern { type_name = parser::Path { segments = segs }; has_binding = bp.has_binding; binding = bp.binding; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    parser::Arm { pattern = real; has_when = a.has_when; guard = a.guard; body = a.body }
+}
+
+/**
+ * resolve_foreach_placeholders — complete every arm of a match's arm list (`resolve_foreach_arm`,
+ * applied in order) — used ONLY to build the arm list `exhaustive` checks coverage against. A no-op
+ * (returns `arms` unchanged) for any match that carries no placeholder.
+ *
+ * @param arms     the syntactic match arm list
+ * @param subject  the match's subject type
+ * @return         the (possibly rewritten) arm list, or the first arm's completion error
+ */
+fn resolve_foreach_placeholders(arms: []parser::Arm, subject: Type) -> []parser::Arm | error {
+    mut out: []parser::Arm = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= arms.len { break }
+        let ra = match resolve_foreach_arm(arms[i], subject) { parser::Arm as a => a; error as e => return e }
+        out = teko::list::push(out, ra)
+        i++
+    }
+    out
+}
+
+/**
+ * type_foreach_elem_arm — TYPE the for-each pull's element-bind placeholder arm DIRECTLY, bypassing
+ * `check_pattern`'s name-based type-RESOLUTION (`bind_pattern_type`/`resolve_named`'s bare-path rule
+ * requires the SAME referencing namespace as the type's own declaration — the element type may live
+ * elsewhere; the SAME reason the existing `?.` desugar's `safe_nav_match` ALSO builds its `TArm`
+ * directly instead of going through `check_pattern`). The element name binds directly to the
+ * ALREADY-KNOWN type (no re-derivation needed — it came straight from `_it`'s resolved return
+ * type), the body types against that binding, and the emitted `TArm.pattern` carries a REAL,
+ * bare-named `BindPattern` (`elem_type_name`) — so VM's `pat_match`/codegen's `emit_pat_binds` see
+ * an ORDINARY named bind and need no special case (#517, §5.4.1).
+ *
+ * @param a        the syntactic placeholder arm
+ * @param bp       `a.pattern`, already known to be the placeholder `BindPattern`
+ * @param subject  the match's subject type (an Optional; its inner is the element type T)
+ * @param env      the enclosing type environment
+ * @param table    the type table
+ * @return         the typed arm, or an error when T is not a nameable element type or the guard is
+ *                 non-bool
+ */
+fn type_foreach_elem_arm(a: parser::Arm, bp: parser::BindPattern, subject: Type, env: Env, table: TypeTable) -> TArm | error {
+    let inner = match subject { Optional as o => o.inner; _ => subject }
+    let tn = match elem_type_name(inner) { str as s => s; error as e => return e }
+    let e2 = define(env, bp.binding, inner, false)
+    let body = match type_block(a.body, e2, table) { TypedBlock as bk => bk; error as err => return err }
+    mut guard = TExpr { kind = TNumber { is_float = false; value = 0; fval = 0.0 }; type = Void { }; line = 0; col = 0 }
+    if a.has_when {
+        let g = match type_expr(a.guard, e2, table) { TExpr as te => te; error as err => return err }
+        if !is_bool(g.type) { return error { message = "a `when` guard must be a bool" } }
+        guard = g
+    }
+    let segs = teko::list::push(teko::list::empty(), parser::Segment { name = tn })
+    let real = parser::BindPattern { type_name = parser::Path { segments = segs }; has_binding = bp.has_binding; binding = bp.binding; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    TArm { pattern = real; has_when = a.has_when; guard = guard; body = body.stmts }
+}
+
+/**
+ * type_match_arm — type ONE match arm, routing the for-each desugar's placeholder arm through the
+ * bypass (`type_foreach_elem_arm`) and every other arm through the ordinary, unmodified `type_arm`.
+ *
+ * @param a        the syntactic match arm
+ * @param subject  the match's subject type
+ * @param env      the enclosing type environment
+ * @param table    the type table
+ * @return         the typed arm, or an error
+ */
+fn type_match_arm(a: parser::Arm, subject: Type, env: Env, table: TypeTable) -> TArm | error {
+    if is_foreach_elem_placeholder(a.pattern) {
+        let bp = match a.pattern { parser::BindPattern as b => b; _ => return error { message = "internal: for-each placeholder must be a BindPattern" } }
+        return type_foreach_elem_arm(a, bp, subject, env, table)
+    }
+    type_arm(a, subject, env, table)
+}
+
 // validate a `?.` receiver: must be a NON-sentinel optional; enrich the disjoint-domain
 // case (an `X | error` union reads via `match`, never `?.` — the LAW's other half).
 fn safe_nav_receiver(receiver: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
@@ -2723,7 +2866,7 @@ fn type_match(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | error
     mut i = 0
     loop {
         if i >= m.arms.len { break }
-        let ai = match type_arm(m.arms[i], s.type, env, table) { TArm as a => a; error as e => return e }
+        let ai = match type_match_arm(m.arms[i], s.type, env, table) { TArm as a => a; error as e => return e }
         arms = teko::list::push(arms, ai)
         if !tblock_diverges(ai.body) {
             let t = tblock_type(ai.body)
@@ -2732,7 +2875,8 @@ fn type_match(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | error
         }
         i++
     }
-    if !exhaustive(m.arms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
+    let rarms = match resolve_foreach_placeholders(m.arms, s.type) { []parser::Arm as a => a; error as e => return e }
+    if !exhaustive(rarms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
     let result = if have_type { first } else { Void { } }   // all arms diverge → void
     TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = result; line = 0; col = 0 }
 }
@@ -2744,11 +2888,12 @@ fn type_match_stmt(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | 
     mut i = 0
     loop {
         if i >= m.arms.len { break }
-        let ai = match type_arm(m.arms[i], s.type, env, table) { TArm as a => a; error as e => return e }
+        let ai = match type_match_arm(m.arms[i], s.type, env, table) { TArm as a => a; error as e => return e }
         arms = teko::list::push(arms, ai)
         i++
     }
-    if !exhaustive(m.arms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
+    let rarms = match resolve_foreach_placeholders(m.arms, s.type) { []parser::Arm as a => a; error as e => return e }
+    if !exhaustive(rarms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
     TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = Void { }; line = 0; col = 0 }
 }
 

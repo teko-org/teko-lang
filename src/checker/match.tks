@@ -2,18 +2,6 @@
 
 use teko::parser
 
-/**
- * is_wildcard_bind — is `bp` the type-free wildcard-binding pattern `_ as x` (#517)? It names no
- * nominal case (empty `type_name`) and is not a slice bind (`[]T as x`), so it catches ANY value
- * and binds it — the enabler for the for-each element bind, and general beyond loops.
- *
- * @param bp  the bind pattern to classify
- * @return    true iff `bp` is a `_ as x` wildcard-binding pattern
- */
-pub fn is_wildcard_bind(bp: parser::BindPattern) -> bool {
-    bp.type_name.segments.len == 0 && !bp.is_slice
-}
-
 // (C7b) is `name` a member of the enum body?
 fn enum_has_member(eb: parser::EnumBody, name: str) -> bool {
     mut i = 0
@@ -33,7 +21,6 @@ fn check_enum_pattern(p: parser::Pattern, subject: Type, eb: parser::EnumBody, e
     match p {
         parser::WildcardPattern => env
         parser::BindPattern as bp => {
-            if is_wildcard_bind(bp) { if !bp.has_binding { return env }; return define(env, bp.binding, subject, false) }
             if bp.is_slice { return error { message = "a slice pattern cannot match an enum value" } }
             let name = bp.type_name.segments[bp.type_name.segments.len - 1].name
             if !enum_has_member(eb, name) { return error { message = $"not a member of the enum: {name}" } }
@@ -185,7 +172,6 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
         parser::NullPattern => return error { message = "`null` pattern requires an optional subject (`T?`) — REBOOT_PLAN §202" }
         parser::WildcardPattern => env
         parser::BindPattern as bp => {
-            if is_wildcard_bind(bp) { if !bp.has_binding { return env }; return define(env, bp.binding, subject, false) }
             // `[]T as x` resolves the slice TYPE-expr; a path bind resolves the named/builtin case.
             // (#109 W2, R5) a PLAIN named bind (not `[]T`, not `Foo<i64>`) first resolves CONTEXTUALLY
             // against the subject variant's members — a bare cross-namespace case name still binds.
@@ -286,11 +272,7 @@ fn has_wildcard(arms: []parser::Arm) -> bool {
     loop {
         if i >= arms.len { break }
         if !arms[i].has_when {
-            match arms[i].pattern {
-                parser::WildcardPattern => return true
-                parser::BindPattern as bp => { if is_wildcard_bind(bp) { return true } }
-                _ => { }
-            }
+            match arms[i].pattern { parser::WildcardPattern => return true; _ => { } }
         }
         i++
     }
@@ -317,7 +299,7 @@ fn bind_case_name(bp: parser::BindPattern, table: TypeTable, ref_ns: str) -> str
 fn arm_case_names(p: parser::Pattern, table: TypeTable, ref_ns: str) -> []str {
     match p {
         parser::BindPattern as bp => {
-            if bp.type_name.segments.len == 0 { teko::list::empty() }
+            if bp.is_slice { teko::list::empty() }
             else { teko::list::push(teko::list::empty(), bind_case_name(bp, table, ref_ns)) }
         }
         parser::FieldPattern as fp => teko::list::push(teko::list::empty(), fp.type_name.segments[fp.type_name.segments.len - 1].name)
@@ -327,7 +309,7 @@ fn arm_case_names(p: parser::Pattern, table: TypeTable, ref_ns: str) -> []str {
             loop {
                 if i >= ap.options.len { break }
                 match ap.options[i] {
-                    parser::BindPattern as bp => { if bp.type_name.segments.len > 0 { names = teko::list::push(names, bind_case_name(bp, table, ref_ns)) } }
+                    parser::BindPattern as bp => { if !bp.is_slice { names = teko::list::push(names, bind_case_name(bp, table, ref_ns)) } }
                     parser::FieldPattern as fp => { names = teko::list::push(names, fp.type_name.segments[fp.type_name.segments.len - 1].name) }
                     _ => { }
                 }
@@ -456,7 +438,7 @@ fn present_case_covered(arms: []parser::Arm, inner: Type, table: TypeTable, ref_
         if !arms[i].has_when {
             match arms[i].pattern {
                 parser::WildcardPattern => return true
-                parser::BindPattern as bp => { if is_wildcard_bind(bp) { return true } else if bp.type_name.segments.len > 0 { return true } }
+                parser::BindPattern as bp => { if bp.type_name.segments.len > 0 { return true } }   // `T as x` / `T`
                 _ => { }
             }
         }

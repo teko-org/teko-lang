@@ -123,6 +123,7 @@ COMPILE_FAIL=(
     loop_three_part_nonbool_cond
     loop_foreach_raw_collection
     loop_foreach_destructure_unknown_field
+    underscore_as_x_rejected
 )
 
 is_expected_fail() {

@@ -669,23 +669,6 @@ fn alt_pattern_check() {
     match check_pattern(balt, color_subject(), empty_env(), color_table()) { Env => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
-/** wildcard_bind_pattern_check — `_ as x` (empty type_name) binds over a plain subject, an optional
-    subject (null stripped), and an enum subject; the `_ as _` discard binds nothing (#517). */
-#test
-fn wildcard_bind_pattern_check() {
-    let wb = parser::BindPattern { type_name = parser::Path { segments = teko::list::empty() }; has_binding = true; binding = "x"; is_slice = false; slice_type = null; type_args = teko::list::empty() }
-    match check_pattern(wb, i64t(), empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let opt: Type = Optional { inner = i64t() }
-    match check_pattern(wb, opt, empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    match check_pattern(wb, color_subject(), empty_env(), color_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let eb = parser::EnumBody { members = teko::list::push(teko::list::push(teko::list::empty(), "RED"), "GREEN") }
-    match check_enum_pattern(wb, Named { name = "Color" }, eb, empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    let wbd = parser::BindPattern { type_name = parser::Path { segments = teko::list::empty() }; has_binding = false; binding = ""; is_slice = false; slice_type = null; type_args = teko::list::empty() }
-    match check_pattern(wbd, i64t(), empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    match check_pattern(wbd, color_subject(), empty_env(), color_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    match check_enum_pattern(wbd, Named { name = "Color" }, eb, empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-}
-
 #test
 fn exhaustive_with_alt() {
     mut opts: []parser::Pattern = teko::list::push(teko::list::empty(), case_pat("RED"))
@@ -811,6 +794,67 @@ fn checker_enum_and_optional_patterns() {
     mut opt_arms: []parser::Arm = teko::list::push(teko::list::empty(), null_arm)
     opt_arms = teko::list::push(opt_arms, bind_arm)
     teko::assert::is_true(exhaustive(opt_arms, opt_i64, empty_table(), ""))
+}
+
+/** foreach_placeholder_resolves_to_real_named_bind — resolve_foreach_arm completes the for-each
+    desugar's placeholder (an empty-type_name BindPattern, unreachable from user source since `_ as
+    x` is a parse error) into a REAL `T as x` bind — the pre-existing named-bind mechanism, unchanged
+    (#517). A non-placeholder arm (the `null => break` arm, or an ordinary user pattern) passes
+    through resolve_foreach_arm untouched, and resolve_foreach_placeholders restores an unmodified
+    exhaustive()'s view of the completed arm list to the SAME shape an ordinary, hand-written
+    `null => …; i64 as x => …` match already achieves. */
+#test
+fn foreach_placeholder_resolves_to_real_named_bind() {
+    let opt_i64 = Optional { inner = i64t() }
+    let placeholder = parser::BindPattern { type_name = parser::Path { segments = teko::list::empty() }; has_binding = true; binding = "_tk_elem_L1C1"; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    let resolved = match resolve_foreach_arm(arm_of(placeholder), opt_i64) { parser::Arm as a => a; error => { teko::assert::is_true(false); return } }
+    match resolved.pattern {
+        parser::BindPattern as bp => {
+            teko::assert::is_true(bp.type_name.segments.len == 1)
+            teko::assert::is_true(bp.type_name.segments[0].name == "i64")
+            teko::assert::is_true(bp.has_binding)
+            teko::assert::is_true(bp.binding == "_tk_elem_L1C1")
+        }
+        _ => teko::assert::is_true(false)
+    }
+    let null_a = arm_of(parser::NullPattern { })
+    let null_out = match resolve_foreach_arm(null_a, opt_i64) { parser::Arm as a => a; error => { teko::assert::is_true(false); return } }
+    match null_out.pattern { parser::NullPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    mut placeholder_arms: []parser::Arm = teko::list::push(teko::list::empty(), null_a)
+    placeholder_arms = teko::list::push(placeholder_arms, arm_of(placeholder))
+    let rarms = match resolve_foreach_placeholders(placeholder_arms, opt_i64) { []parser::Arm as a => a; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(exhaustive(rarms, opt_i64, empty_table(), ""))
+}
+
+/** foreach_elem_arm_typing_and_dispatch — type_match_arm routes a placeholder arm through
+    type_foreach_elem_arm (binds the element directly, types the body against it, honors/rejects a
+    `when` guard exactly like an ordinary arm) and routes any other arm through the unmodified
+    type_arm (#517). */
+#test
+fn foreach_elem_arm_typing_and_dispatch() {
+    let opt_i64 = Optional { inner = i64t() }
+    let placeholder = parser::BindPattern { type_name = parser::Path { segments = teko::list::empty() }; has_binding = true; binding = "_tk_elem_L2C2"; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    let ph_arm = parser::Arm { pattern = placeholder; has_when = false; guard = e_num(0); body = one_stmt(e_var("_tk_elem_L2C2")) }
+    let typed = match type_match_arm(ph_arm, opt_i64, empty_env(), empty_table()) { TArm as a => a; error => { teko::assert::is_true(false); return } }
+    match typed.pattern { parser::BindPattern as bp => teko::assert::is_true(bp.type_name.segments[0].name == "i64"); _ => teko::assert::is_true(false) }
+    teko::assert::is_true(typed.body.len == 1)
+    let ph_guarded = parser::Arm { pattern = placeholder; has_when = true; guard = ek(parser::BoolLit { value = true }); body = one_stmt(e_var("_tk_elem_L2C2")) }
+    match type_match_arm(ph_guarded, opt_i64, empty_env(), empty_table()) { TArm => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let ph_bad_guard = parser::Arm { pattern = placeholder; has_when = true; guard = e_num(1); body = one_stmt(e_var("_tk_elem_L2C2")) }
+    match type_match_arm(ph_bad_guard, opt_i64, empty_env(), empty_table()) { TArm => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    match type_match_arm(arm_of(parser::WildcardPattern { }), i64t(), empty_env(), empty_table()) { TArm => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** elem_type_name_covers_all_shapes — every realistic for-each element type resolves to its
+    bare runtime name (byte/char/str/a named struct's own last segment); an unnameable shape
+    (e.g. a slice) is a clean internal error (#517). */
+#test
+fn elem_type_name_covers_all_shapes() {
+    match elem_type_name(Byte { }) { str as s => teko::assert::is_true(s == "byte"); error => teko::assert::is_true(false) }
+    match elem_type_name(Char { }) { str as s => teko::assert::is_true(s == "char"); error => teko::assert::is_true(false) }
+    match elem_type_name(Str { }) { str as s => teko::assert::is_true(s == "str"); error => teko::assert::is_true(false) }
+    match elem_type_name(Named { name = "loop_foreach_destructure::Pair" }) { str as s => teko::assert::is_true(s == "Pair"); error => teko::assert::is_true(false) }
+    match elem_type_name(Slice { element = i64t() }) { str => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 // ---------------------------------------------------------------------------

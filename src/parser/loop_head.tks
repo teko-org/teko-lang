@@ -205,13 +205,18 @@ fn loop_null_break_arm() -> Arm {
 }
 
 /**
- * loop_elem_bind_arm — the `_ as <elem> => { <bind-body> }` arm of a for-each pull: bind the yielded
- * (non-null) element to the hygienic `elem` temp via the `_ as x` wildcard bind, then run the
- * element-binding body (`mut x = <elem>` / per-field, followed by the user body) (#517, §5.4).
+ * loop_elem_bind_arm — the PLACEHOLDER present-value arm of a for-each pull. `_ as x` (a type-free
+ * discard-then-capture) is banned as USER syntax (owner ruling: `_` is a discard, `as x` a capture —
+ * a semantic contradiction) — `parse_pattern_primary` rejects it at parse time. This function still
+ * builds the SAME `BindPattern` shape (an empty `type_name`, unreachable from any valid source text)
+ * as an INTERNAL MARKER ONLY: the checker's `resolve_foreach_arm` (typer.tks) rewrites it, before any
+ * pattern-matching/exhaustiveness/codegen ever observes it, into a REAL `T as x` bind using the
+ * iterator's resolved element type `T` (known at for-each-typing time from `_it : () -> T?`) — the
+ * existing, sound named-bind mechanism, unchanged (#517, §5.4).
  *
- * @param elem_name  the hygienic element temp bound by the `_ as` pattern
+ * @param elem_name  the hygienic element temp the checker will bind
  * @param body       the element-binding body (loop-local copy binding(s) + user statements)
- * @return           the `_ as <elem> => { … }` match arm
+ * @return           the placeholder `=> { … }` match arm, pending checker completion
  */
 fn loop_elem_bind_arm(elem_name: str, body: []Statement) -> Arm {
     let pat = BindPattern { type_name = Path { segments = teko::list::empty() }; has_binding = true; binding = elem_name; is_slice = false; slice_type = null; type_args = teko::list::empty() }
@@ -219,7 +224,7 @@ fn loop_elem_bind_arm(elem_name: str, body: []Statement) -> Arm {
 }
 
 /**
- * loop_match_pull — the for-each pull statement `match _it() { null => break; _ as <elem> => { … } }`
+ * loop_match_pull — the for-each pull statement `match _it() { null => break; <placeholder> => { … } }`
  * at the TOP of the body, so `continue` re-pulls (advances) the iterator (#517, §5.4).
  *
  * @param it_name    the iterator temp (the closure `() -> T?`)
