@@ -121,6 +121,7 @@ COMPILE_FAIL=(
     loop_label_lowercase
     loop_range_counter_leak
     loop_three_part_nonbool_cond
+    loop_foreach_raw_collection
 )
 
 is_expected_fail() {
