@@ -30,12 +30,13 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
-      run: ${{ steps.filter.outputs.run }}
+      run: ${{ steps.decide.outputs.run }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
         with:
+          list-files: shell
           filters: |
             run:
               - 'src/**'
@@ -44,6 +45,40 @@ jobs:
               - 'scripts/**'
               - 'CMakeLists.txt'
               - '.github/workflows/native.yml'
+
+      # Docs-only guard (owner ruling 2026-07-11): the allowlist globs (src/**, tests/**, …)
+      # also match Markdown that lives INSIDE those trees (e.g. src/checker/capability_audit.md),
+      # so a pure-documentation edit would otherwise trigger the whole heavy gate. Skip only when
+      # EVERY matched file is *.md — any single non-Markdown match still forces the full run, so
+      # this can never hide a real source change from the gate (fail-safe: it can under-skip, never
+      # over-skip). A trigger-level `paths-ignore` is deliberately NOT used here: the `gate` job is
+      # a REQUIRED status check, and skipping the whole workflow would leave it never reported →
+      # the PR would hang "waiting for CI gate". The always-running gate + this filter is the fix.
+      - name: Decide (skip when the change is Markdown-only)
+        id: decide
+        shell: bash
+        env:
+          MATCHED: ${{ steps.filter.outputs.run }}
+          FILES: ${{ steps.filter.outputs.run_files }}
+        run: |
+          if [ "$MATCHED" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No allowlisted path changed — nothing to gate."
+            exit 0
+          fi
+          run=false
+          for f in $FILES; do
+            case "$f" in
+              *.md) ;;                 # Markdown — does not, by itself, force a run
+              *)    run=true ;;        # any non-Markdown match forces the full gate
+            esac
+          done
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ "$run" = "true" ]; then
+            echo "Non-Markdown changes present — running the full gate."
+          else
+            echo "Markdown-only change under the allowlisted paths — skipping the heavy gate."
+          fi
 
   # ── matrix: Linux x86_64 + arm64, macOS arm64, Windows x86_64 + arm64 ──────
   # NOTE: Windows uses Clang (not MSVC) because the project requires __int128 and
