@@ -8,7 +8,7 @@ use teko::lir
  * @return StackifyCtx  the empty context
  */
 fn sft_ctx0() -> StackifyCtx {
-    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = 0 to u32; has_frame = false; frame_base = 0 to u32; slots = wst_empty() }
+    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = 0 to u32; has_frame = false; frame_base = 0 to u32; slots = wst_empty(); relocs = teko::list::empty() }
 }
 
 /**
@@ -739,6 +739,9 @@ fn wasm_symtab_add_then_resolve_round_trips() {
 /**
  * stackify_call_void_matches_design_doc_golden — the design doc's own
  * worked example (§12.1): `LCall{tk_exit} -> local.get arg; call funcidx`.
+ * ALSO covers C1-5's own reloc-recording (`sc_record_call_reloc`): the
+ * `call` opcode lands at body index `2`, so its ULEB128 funcidx operand
+ * begins at index `3` — the ONE `WasmCallReloc` this call records.
  *
  * @return void
  */
@@ -748,6 +751,9 @@ fn stackify_call_void_matches_design_doc_golden() {
     let inst = lir::void_call_inst("tk_exit", args, false, 0, 0)
     let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "tk_exit"; args = args; variadic = false }) { StackifyCtx as x => x; error => return }
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x00 to byte, 0x10 to byte, 0x03 to byte]))
+    teko::assert::is_true(out.relocs.len == (1 to u64))
+    teko::assert::is_true(out.relocs[0].offset == (3 to u32))
+    teko::assert::is_true(out.relocs[0].func_index == (3 to u32))
 }
 
 #test
@@ -892,6 +898,7 @@ fn stackify_inst_alloca_dispatches_to_stackify_alloca() {
         has_frame = true
         frame_base = 9 to u32
         slots = wst_set(wst_empty(), 0, 16 to u32)
+        relocs = teko::list::empty()
     }
     let alloca = lir::alloca_inst(0, 8, 8, 0, 0)
     let out = match stackify_inst(seeded, sft_empty_func(), wasm_symtab_empty(), alloca) { StackifyCtx as x => x; error => return }
@@ -2034,4 +2041,506 @@ fn wasm_sp_global_is_a_mutable_i32() {
     teko::assert::is_true(g.mutable)
     teko::assert::is_true(g.init == (1024 to i64))
     teko::assert::is_true(wasm_sp_global_index() == (0 to u32))
+}
+
+/**
+ * sft_main_func — a minimal `"main"` `LFunc` (`i32`-returning, 0 params):
+ * `%0 = const 0; call tk_exit(%0); ret %0` — the `own_exit_zero` fixture's
+ * own shape (a call the program-wide symbol table always resolves,
+ * `"tk_exit"`). The first fixture of the C1-5 `wasm_assemble_program`
+ * suite below — the whole-module assembler, the `wasm-ld` relocatable-
+ * object link/dispatch job (`backend-c1-wasm.md` §5.4/§9).
+ *
+ * @return lir::LFunc  the seeded `main` function
+ */
+fn sft_main_func() -> lir::LFunc {
+    let insts = [
+        lir::const_int_inst(0, 0, 0, 0),
+        lir::void_call_inst("tk_exit", [0 to u32], false, 0, 0),
+        lir::ret_inst(0, 0, 0)
+    ]
+    let block = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    lir::LFunc { symbol = "main"; n_params = 0 to u32; param_types = teko::list::empty(); ret_type = lir::LType::I32; blocks = [block]; next_vreg = 1 to u32 }
+}
+
+/**
+ * sft_alloca_func — a `Void`-returning `LFunc` with ONE `LAlloca` (`8`
+ * bytes, `8`-aligned) then `ret` — the `wasm_program_has_any_frame` /
+ * `wasm_program_memory_plan` "needs a shadow-stack frame" fixture.
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_alloca_func() -> lir::LFunc {
+    let insts = [lir::alloca_inst(0, 8, 8, 0, 0), lir::ret_inst(0, 0, 0)]
+    let block = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    lir::LFunc { symbol = "teko__test__alloca"; n_params = 0 to u32; param_types = teko::list::empty(); ret_type = lir::LType::Void; blocks = [block]; next_vreg = 1 to u32 }
+}
+
+/**
+ * sft_i128_ret_func — a `Void`-param, `I128`-returning `LFunc` — `wasm_
+ * func_type_of`'s own honest-stop (`C1-i128`) fixture, its return side.
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_i128_ret_func() -> lir::LFunc {
+    lir::new_func("teko__test__i128ret", 0, teko::list::empty(), lir::LType::I128)
+}
+
+/**
+ * sft_i128_param_func — an `I128`-param, `Void`-returning `LFunc` —
+ * `wasm_func_type_of`'s own honest-stop (`C1-i128`) fixture, its param
+ * side.
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_i128_param_func() -> lir::LFunc {
+    lir::new_func("teko__test__i128param", 1, [lir::LType::I128], lir::LType::Void)
+}
+
+#test
+/**
+ * mem_pages_for_floors_at_one_page_and_rounds_up — `0` still requests one
+ * page (the never-zero floor); a value exactly on a page boundary needs
+ * exactly that many pages; one byte OVER a boundary rounds up to the NEXT
+ * page.
+ *
+ * @return void
+ */
+fn mem_pages_for_floors_at_one_page_and_rounds_up() {
+    teko::assert::is_true(wasm_mem_pages_for(0 to u32) == (1 to u32))
+    teko::assert::is_true(wasm_mem_pages_for(65536 to u32) == (1 to u32))
+    teko::assert::is_true(wasm_mem_pages_for(65537 to u32) == (2 to u32))
+}
+
+#test
+/**
+ * program_func_index_shifts_by_the_import_count — a defined function at
+ * position `2`, with `2` host imports ahead of it, resolves to absolute
+ * index `4`.
+ *
+ * @return void
+ */
+fn program_func_index_shifts_by_the_import_count() {
+    teko::assert::is_true(wasm_program_func_index(2 to u64, 2 to u64) == (4 to u32))
+}
+
+#test
+/**
+ * register_program_symbols_resolves_tk_exit_and_every_func — `"tk_exit"`
+ * resolves DIRECTLY to the WASI `proc_exit` import's own index; `"main"`
+ * resolves to its own absolute index (past the two WASI imports).
+ *
+ * @return void
+ */
+fn register_program_symbols_resolves_tk_exit_and_every_func() {
+    let wasi = wasm_wasi_import_set()
+    let t = wasm_register_program_symbols(wasi, [sft_main_func()])
+    let exit_target = match wasm_resolve_call(t, "tk_exit") { WasmCallTarget as x => x; error => return }
+    teko::assert::is_true(exit_target.func_index == wasi.proc_exit_index)
+    teko::assert::is_true(exit_target.ret_type == lir::LType::Void)
+    let main_target = match wasm_resolve_call(t, "main") { WasmCallTarget as x => x; error => return }
+    teko::assert::is_true(main_target.func_index == (2 to u32))
+    teko::assert::is_true(main_target.ret_type == lir::LType::I32)
+}
+
+#test
+/**
+ * func_type_of_translates_params_and_a_nonvoid_result — `sft_main_func`'s
+ * own `() -> i32` signature translates to no params + one `i32` result.
+ *
+ * @return void
+ */
+fn func_type_of_translates_params_and_a_nonvoid_result() {
+    let t = match wasm_func_type_of(sft_main_func()) { WasmFuncType as x => x; error => return }
+    teko::assert::is_true(t.params.len == (0 to u64))
+    teko::assert::is_true(t.results.len == (1 to u64))
+    teko::assert::is_true(t.results[0] == (wasm_vt_i32() to byte))
+}
+
+#test
+/**
+ * func_type_of_a_void_function_has_no_results — `sft_empty_func`'s own
+ * `() -> void` signature translates to zero results (the MVP's no-multi-
+ * value shape, §4.3).
+ *
+ * @return void
+ */
+fn func_type_of_a_void_function_has_no_results() {
+    let t = match wasm_func_type_of(sft_empty_func()) { WasmFuncType as x => x; error => return }
+    teko::assert::is_true(t.results.len == (0 to u64))
+}
+
+#test
+/**
+ * func_type_of_propagates_the_i128_stop_on_either_side — an `I128` PARAM
+ * and an `I128` RESULT both propagate `wasm_valtype`'s own `C1-i128`
+ * honest-stop.
+ *
+ * @return void
+ */
+fn func_type_of_propagates_the_i128_stop_on_either_side() {
+    match wasm_func_type_of(sft_i128_param_func()) {
+        WasmFuncType => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+    match wasm_func_type_of(sft_i128_ret_func()) {
+        WasmFuncType => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * build_program_types_appends_wasi_then_one_per_func — the WASI import
+ * set's own two types come first, then one entry for `sft_main_func`,
+ * totaling three.
+ *
+ * @return void
+ */
+fn build_program_types_appends_wasi_then_one_per_func() {
+    let wasi = wasm_wasi_import_set()
+    let types = match wasm_build_program_types(wasi, [sft_main_func()]) { []WasmFuncType as x => x; error => return }
+    teko::assert::is_true(types.len == (3 to u64))
+    teko::assert::is_true(types[2].results.len == (1 to u64))
+}
+
+#test
+/**
+ * build_program_types_propagates_a_func_type_of_stop — a function whose
+ * own signature honest-stops propagates out of the whole type table build.
+ *
+ * @return void
+ */
+fn build_program_types_propagates_a_func_type_of_stop() {
+    let wasi = wasm_wasi_import_set()
+    match wasm_build_program_types(wasi, [sft_i128_ret_func()]) {
+        []WasmFuncType => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * build_program_funcs_names_and_widens_call_relocs — `sft_main_func`'s own
+ * `tk_exit` call comes back COMPACT from `stackify_func` but WIDENED
+ * (`wasm_pad_call_relocs`) in the packaged `WasmFunc`: its `relocs[0].
+ * offset` lands on a byte whose value, once padded, spans 5 bytes ending
+ * right before the trailing `end` (`0x0B`) — `name` is the function's own
+ * symbol.
+ *
+ * @return void
+ */
+fn build_program_funcs_names_and_widens_call_relocs() {
+    let wasi = wasm_wasi_import_set()
+    let symtab = wasm_register_program_symbols(wasi, [sft_main_func()])
+    let funcs = match wasm_build_program_funcs(wasi, [sft_main_func()], symtab) { []WasmFunc as x => x; error => return }
+    teko::assert::is_true(funcs.len == (1 to u64))
+    let f = funcs[0]
+    teko::assert::is_true(f.name == "main")
+    teko::assert::is_true(f.type_index == (2 to u32))
+    teko::assert::is_true(f.relocs.len == (1 to u64))
+    let r = f.relocs[0]
+    teko::assert::is_true(r.func_index == wasi.proc_exit_index)
+    teko::assert::is_true((r.offset to u64) + (5 to u64) <= f.body.len)
+}
+
+#test
+/**
+ * build_program_funcs_propagates_a_stackify_func_stop — a function whose
+ * own body honest-stops propagates out of the whole per-function build.
+ *
+ * @return void
+ */
+fn build_program_funcs_propagates_a_stackify_func_stop() {
+    let wasi = wasm_wasi_import_set()
+    match wasm_build_program_funcs(wasi, [sft_i128_ret_func()], wasm_symtab_empty()) {
+        []WasmFunc => teko::assert::is_true(false)
+        error => { }
+    }
+}
+
+#test
+/**
+ * find_main_index_locates_main_past_the_imports — `sft_main_func` is the
+ * ONLY function, so it resolves to `wasi.imports.len` (right past every
+ * host import).
+ *
+ * @return void
+ */
+fn find_main_index_locates_main_past_the_imports() {
+    let wasi = wasm_wasi_import_set()
+    let idx = match wasm_find_main_index(wasi, [sft_main_func()]) { u32 as x => x; error => return }
+    teko::assert::is_true(idx == (wasi.imports.len to u32))
+}
+
+#test
+/**
+ * find_main_index_missing_main_is_a_named_internal_error — a function list
+ * with no `"main"` symbol is the genuine internal-misuse guard (`emit_
+ * native_wasm` never reaches this for a real binary artifact).
+ *
+ * @return void
+ */
+fn find_main_index_missing_main_is_a_named_internal_error() {
+    let wasi = wasm_wasi_import_set()
+    match wasm_find_main_index(wasi, [sft_empty_func()]) {
+        u32 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "no `main` entry function found")
+    }
+}
+
+#test
+/**
+ * synth_start_calls_main_then_proc_exit_with_padded_operands — `call
+ * $main` (padded 5-byte funcidx `7`) then `call $proc_exit` (padded 5-byte
+ * funcidx `0`) then `end` — both calls own a `WasmCallReloc` at the right
+ * byte offset.
+ *
+ * @return void
+ */
+fn synth_start_calls_main_then_proc_exit_with_padded_operands() {
+    let f = wasm_synth_start(9 to u32, 7 to u32, 0 to u32)
+    teko::assert::is_true(f.type_index == (9 to u32))
+    teko::assert::is_true(f.name == "_start")
+    let want = [
+        0x10 to byte, 0x87 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x00 to byte,
+        0x10 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x00 to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(f.body, want))
+    teko::assert::is_true(f.relocs.len == (2 to u64))
+    teko::assert::is_true(f.relocs[0].offset == (1 to u32))
+    teko::assert::is_true(f.relocs[0].func_index == (7 to u32))
+    teko::assert::is_true(f.relocs[1].offset == (7 to u32))
+    teko::assert::is_true(f.relocs[1].func_index == (0 to u32))
+}
+
+#test
+/**
+ * program_has_any_frame_true_when_some_func_has_an_alloca — a two-function
+ * list, `main` first (no alloca) then `sft_alloca_func` — `true` overall.
+ *
+ * @return void
+ */
+fn program_has_any_frame_true_when_some_func_has_an_alloca() {
+    teko::assert::is_true(wasm_program_has_any_frame([sft_main_func(), sft_alloca_func()]))
+}
+
+#test
+/**
+ * program_has_any_frame_false_with_no_alloca_anywhere — neither
+ * `sft_main_func` nor `sft_empty_func` has an `LAlloca`.
+ *
+ * @return void
+ */
+fn program_has_any_frame_false_with_no_alloca_anywhere() {
+    teko::assert::is_true(!wasm_program_has_any_frame([sft_main_func(), sft_empty_func()]))
+}
+
+#test
+/**
+ * program_data_segments_omits_an_empty_rodata_layout — a rodata layout
+ * with zero interned bytes yields NO data segment at all (not one framed
+ * empty segment).
+ *
+ * @return void
+ */
+fn program_data_segments_omits_an_empty_rodata_layout() {
+    let layout = wasm_layout_rodata(teko::list::empty(), 8 to u32)
+    teko::assert::is_true(wasm_program_data_segments(layout).len == (0 to u64))
+}
+
+#test
+/**
+ * program_data_segments_keeps_a_nonempty_rodata_layout — a rodata layout
+ * with at least one interned entry yields exactly one data segment.
+ *
+ * @return void
+ */
+fn program_data_segments_keeps_a_nonempty_rodata_layout() {
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let layout = wasm_layout_rodata(rodata, 8 to u32)
+    let segs = wasm_program_data_segments(layout)
+    teko::assert::is_true(segs.len == (1 to u64))
+    teko::assert::is_true(segs[0].offset == (8 to u32))
+}
+
+#test
+/**
+ * program_memory_plan_with_no_frame_and_no_rodata_needs_no_globals — a
+ * program with neither rodata nor an `LAlloca` anywhere gets NO globals and
+ * the one-page floor.
+ *
+ * @return void
+ */
+fn program_memory_plan_with_no_frame_and_no_rodata_needs_no_globals() {
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let plan = wasm_program_memory_plan(lmod, rodata)
+    teko::assert::is_true(plan.globals.len == (0 to u64))
+    teko::assert::is_true(plan.mem_min_pages == (1 to u32))
+}
+
+#test
+/**
+ * program_memory_plan_with_a_frame_adds_the_sp_global — a program with
+ * SOME `LAlloca` gets exactly one `SP` global, initialized past the
+ * (8-byte-aligned) rodata region's own end plus the fixed stack-region
+ * size.
+ *
+ * @return void
+ */
+fn program_memory_plan_with_a_frame_adds_the_sp_global() {
+    let lmod = lir::LModule { funcs = [sft_alloca_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let plan = wasm_program_memory_plan(lmod, rodata)
+    teko::assert::is_true(plan.globals.len == (1 to u64))
+    teko::assert::is_true(plan.globals[0].mutable)
+    teko::assert::is_true(plan.globals[0].init == ((8 to i64) + (65536 to i64)))
+    teko::assert::is_true(plan.mem_min_pages == (2 to u32))
+}
+
+#test
+/**
+ * bytes_slice_covers_the_half_open_range — a mid-range slice, an
+ * empty-range slice (`from == to`), and a slice reaching the buffer's own
+ * end.
+ *
+ * @return void
+ */
+fn bytes_slice_covers_the_half_open_range() {
+    let b = [0x00 to byte, 0x01 to byte, 0x02 to byte, 0x03 to byte]
+    teko::assert::is_true(wasm_bytes_eq(wasm_bytes_slice(b, 1 to u64, 3 to u64), [0x01 to byte, 0x02 to byte]))
+    teko::assert::is_true(wasm_bytes_slice(b, 2 to u64, 2 to u64).len == (0 to u64))
+    teko::assert::is_true(wasm_bytes_eq(wasm_bytes_slice(b, 2 to u64, 4 to u64), [0x02 to byte, 0x03 to byte]))
+}
+
+#test
+/**
+ * pad_call_relocs_widens_every_operand_and_rebases_offsets — two compact
+ * `call`s (`local.get 0; call $3` then `call $9`) both widen to 5-byte
+ * operands; the second reloc's own re-based offset accounts for the
+ * FIRST widened call's own +4-byte growth.
+ *
+ * @return void
+ */
+fn pad_call_relocs_widens_every_operand_and_rebases_offsets() {
+    let body = [0x20 to byte, 0x00 to byte, 0x10 to byte, 0x03 to byte, 0x10 to byte, 0x09 to byte, 0x0B to byte]
+    let relocs = [WasmCallReloc { offset = 3 to u32; func_index = 3 to u32 }, WasmCallReloc { offset = 5 to u32; func_index = 9 to u32 }]
+    let padded = wasm_pad_call_relocs(body, relocs)
+    teko::assert::is_true(padded.relocs.len == (2 to u64))
+    teko::assert::is_true(padded.relocs[0].offset == (3 to u32))
+    teko::assert::is_true(padded.relocs[1].offset == (9 to u32))
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x10 to byte,
+        0x83 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x00 to byte,
+        0x10 to byte,
+        0x89 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x00 to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(padded.body, want))
+}
+
+#test
+/**
+ * assemble_program_own_exit_zero_shape_exports_start — the `own_exit_zero`
+ * corpus fixture's own shape (`main` only, no rodata, no alloca): the
+ * assembled module exports EXACTLY `"_start"` (the owner's own C1-5
+ * invariant), its `funcs` list is `[main, _start]` (two entries), and the
+ * type table carries the WASI pair plus one entry per defined function.
+ *
+ * @return void
+ */
+fn assemble_program_own_exit_zero_shape_exports_start() {
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.exports.len == (1 to u64))
+    teko::assert::is_true(m.exports[0].name == "_start")
+    teko::assert::is_true(m.funcs.len == (2 to u64))
+    teko::assert::is_true(m.funcs[0].name == "main")
+    teko::assert::is_true(m.funcs[1].name == "_start")
+    teko::assert::is_true(m.types.len == (4 to u64))
+    teko::assert::is_true(m.imports.len == (2 to u64))
+}
+
+/**
+ * sft_rodata_func — a `Ptr`-returning `"main"` `LFunc` that resolves ONE
+ * rodata symbol (`LGlobalAddr`) — the ordering regression this fixture
+ * guards: `wasm_assemble_program` must lay out + register rodata BEFORE
+ * stackifying ANY function, or this `LGlobalAddr` site fails to resolve.
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_rodata_func() -> lir::LFunc {
+    let insts = [lir::global_addr_inst(0, "teko__rodata__0", 0, 0), lir::ret_inst(0, 0, 0)]
+    let block = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    lir::LFunc { symbol = "main"; n_params = 0 to u32; param_types = teko::list::empty(); ret_type = lir::LType::Ptr; blocks = [block]; next_vreg = 1 to u32 }
+}
+
+#test
+/**
+ * assemble_program_resolves_rodata_symbols_before_stackifying — a program
+ * whose only function reads a rodata symbol (`LGlobalAddr`) assembles
+ * cleanly, AND the module's own data section places it at `wasm_rodata_
+ * base` — proving `wasm_assemble_program` lays rodata out (and registers
+ * it into the symbol table) BEFORE stackifying `main`, not after.
+ *
+ * @return void
+ */
+fn assemble_program_resolves_rodata_symbols_before_stackifying() {
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let lmod = lir::LModule { funcs = [sft_rodata_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.data.len == (1 to u64))
+    teko::assert::is_true(m.data[0].offset == wasm_rodata_base())
+}
+
+#test
+/**
+ * assemble_program_rejects_top_level_globals — `LModule.globals` non-empty
+ * is the NAMED `C1-globals` honest-stop (mirrors A4-4), checked BEFORE any
+ * function is even stackified.
+ *
+ * @return void
+ */
+fn assemble_program_rejects_top_level_globals() {
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = [lir::LGlobal { symbol = "teko__g__x"; ty = lir::LType::I32; bytes = teko::list::empty() }]; layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-globals")
+    }
+}
+
+#test
+/**
+ * assemble_program_propagates_a_func_type_stop — a program whose only
+ * function's own signature honest-stops (`C1-i128`) propagates out of the
+ * whole assembly, before `wasm_find_main_index` is even reached.
+ *
+ * @return void
+ */
+fn assemble_program_propagates_a_func_type_stop() {
+    let lmod = lir::LModule { funcs = [sft_i128_ret_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * assemble_program_with_no_main_is_a_named_internal_error — a program with
+ * no `"main"` symbol (but an otherwise WELL-FORMED function — `sft_alloca_
+ * func`, unlike `sft_empty_func`'s own terminator-less throwaway block,
+ * which fails stackification itself before `wasm_find_main_index` is even
+ * reached) propagates `wasm_find_main_index`'s own NAMED internal error.
+ *
+ * @return void
+ */
+fn assemble_program_with_no_main_is_a_named_internal_error() {
+    let lmod = lir::LModule { funcs = [sft_alloca_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "no `main` entry function found")
+    }
 }

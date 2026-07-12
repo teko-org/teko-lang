@@ -27,6 +27,40 @@ pub fn emit_uleb128(buf: []byte, v: u64) -> []byte {
 }
 
 /**
+ * emit_uleb128_padded5 — append `v` (a 32-bit-range value) to `buf` as an
+ * OVER-LONG, FIXED five-byte ULEB128: the continuation bit forced on the
+ * first four groups regardless of `v`'s own natural width, the fifth group
+ * always the closing byte. The wasm core spec explicitly PERMITS an
+ * over-long `uN` encoding up to `ceil(N/7)` groups (five, for a 32-bit
+ * field) — not just "allowed", but the load-bearing shape every relocatable
+ * `call` funcidx operand `wasm-ld` may need to REWRITE in place uses, so
+ * patching a wider index never has to shift surrounding bytes (cross-
+ * checked against a real `clang --target=wasm32-wasi -c` object's own
+ * relocatable `call` operands via `wasm-objdump`/hex inspection — C1-5,
+ * `backend-c1-wasm.md` §5.4; `emit_uleb128`'s own MINIMAL-width encoding
+ * stays correct and unchanged for every NON-relocatable byte, e.g. local
+ * indices and memory offsets, which `wasm-ld` never rewrites).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u64 v  the value to encode (must fit in 32 bits)
+ * @return []byte  `buf` followed by v's fixed 5-byte padded ULEB128 bytes
+ */
+pub fn emit_uleb128_padded5(buf: []byte, v: u64) -> []byte {
+    mut b = buf
+    mut x = v
+    mut i: u64 = 0
+    loop {
+        if i >= (4 to u64) {
+            b = teko::list::push(b, (x & (0x7F to u64)) to byte)
+            return b
+        }
+        b = teko::list::push(b, ((x & (0x7F to u64)) | (0x80 to u64)) to byte)
+        x = x >> (7 to u64)
+        i++
+    }
+}
+
+/**
  * emit_sleb128 — append `v` to `buf` as signed LEB128 (7 bits per group, low
  * group first; a group terminates the encoding once its sign bit (bit 6)
  * already matches the remaining sign-extended value — an all-0s tail for a
@@ -184,6 +218,41 @@ pub type WasmLocalGroup = struct {
 }
 
 /**
+ * WasmCallReloc — one `call` instruction's own funcidx relocation: the
+ * position, within some byte stream, where its wasm function-index operand
+ * begins, and the absolute wasm function index the operand already encodes.
+ * Two distinct byte-stream framings reuse this same shape
+ * (`backend-c1-wasm.md` §5.4): `stackify.tks`'s `StackifyCtx`/`WasmFuncBody`
+ * record `offset` relative to ONE function's own body bytes (before the code
+ * section's per-entry framing is known); `emit_wasm`'s relocatable-mode
+ * assembly then SHIFTS each function's own relocations by its final
+ * code-section-relative base, producing the `reloc.CODE` custom section
+ * `wasm-ld` consumes (`R_WASM_FUNCTION_INDEX_LEB`, relocation type `0`). The
+ * operand's `func_index` is ALREADY the correct absolute value for a
+ * single-input-object link (this object's own index space, imports first
+ * then defined functions, `backend-c1-wasm.md` §5.2) — the relocation exists
+ * so `wasm-ld` can re-derive it correctly when this object is merged with
+ * others, not because the baked-in byte is wrong on its own.
+ *
+ * @since #389 C1-5
+ */
+pub type WasmCallReloc = struct {
+    /**
+     * offset — the byte position, within the relevant stream, where the
+     * `call` instruction's ULEB128 funcidx operand begins (immediately
+     * after the `0x10` opcode byte).
+     */
+    offset: u32
+    /**
+     * func_index — the callee's absolute wasm function index (this
+     * object's own index space): both the value already baked into the
+     * operand bytes AND the `reloc.CODE` entry's linking-symbol-table index
+     * (this object's one-symbol-per-function-index convention, §5.4).
+     */
+    func_index: u32
+}
+
+/**
  * WasmFunc — one function's code-section entry: the index into the module's
  * type section for its `(params) -> (results)` shape, its non-parameter
  * local declarations (`WasmLocalGroup` runs, after the params), and its
@@ -210,6 +279,18 @@ pub type WasmFunc = struct {
      * (`0x0B`).
      */
     body: []byte
+    /**
+     * name — this function's own linking-symbol name (`emit_wasm`'s
+     * relocatable mode only, C1-5; ignored otherwise, since the core wasm
+     * format never names a defined function by itself).
+     */
+    name: str
+    /**
+     * relocs — this function's own `call`-site relocations, `offset`
+     * relative to `body`'s own start (`emit_wasm`'s relocatable mode only,
+     * C1-5; ignored otherwise).
+     */
+    relocs: []WasmCallReloc
 }
 
 /**
@@ -649,15 +730,20 @@ fn wasm_data_section(data: []WasmDataSegment) -> []byte {
  * section-id ordering the wasm spec requires (`backend-c1-wasm.md` §5.2). A
  * part with nothing to say (an empty list, or `mem_min_pages == 0`) omits
  * its section entirely rather than framing a zero-length one. Parallels
- * `emit_macho`/`emit_elf` (a per-format module writer), but emits a
- * self-contained MODULE, not a relocatable `.o` for `cc`/`ld` — the
- * relocatable-object `linking`/`reloc.*` custom sections (§5.4) are C1-5
- * territory, not this slice.
+ * `emit_macho`/`emit_elf` (a per-format module writer). When `relocatable`
+ * is set, two trailing CUSTOM sections turn the module into a `wasm-ld`
+ * INPUT object rather than a finished executable (§5.4, C1-5): `"linking"`
+ * (the `WASM_SYMBOL_TABLE`, `wasm_linking_section`) and, whenever at least
+ * one `call` site needs one, `"reloc.CODE"` (`wasm_reloc_code_section`) —
+ * the relocatable-object `link_wasm`/`emit_native_wasm` hands to `wasm-ld`.
  *
  * @param WasmModule m  the module to serialize
- * @return []byte  the wasm module bytes
+ * @param bool relocatable  append the `wasm-ld` linking/relocation custom
+ *                          sections (C1-5) instead of emitting a
+ *                          self-contained final module
+ * @return []byte  the wasm module (or relocatable object) bytes
  */
-pub fn emit_wasm(m: WasmModule) -> []byte {
+pub fn emit_wasm(m: WasmModule, relocatable: bool) -> []byte {
     mut b = wasm_preamble()
     if m.types.len > (0 to u64) {
         b = wasm_section(b, 1 to byte, wasm_type_section(m.types))
@@ -683,5 +769,263 @@ pub fn emit_wasm(m: WasmModule) -> []byte {
     if m.data.len > (0 to u64) {
         b = wasm_section(b, 11 to byte, wasm_data_section(m.data))
     }
+    if !relocatable {
+        return b
+    }
+    emit_wasm_relocatable_tail(b, m)
+}
+
+/**
+ * emit_wasm_relocatable_tail — `emit_wasm`'s relocatable-mode-only suffix
+ * (C1-5, §5.4): the `"linking"` custom section, then — only when at least
+ * one `call` site anywhere in the module recorded a relocation — the
+ * `"reloc.CODE"` custom section. Split out of `emit_wasm` itself so the
+ * common section-framing loop above stays a single, flat, early-return
+ * shape.
+ *
+ * @param []byte b  the module bytes so far (every core section already
+ *                  framed)
+ * @param WasmModule m  the module being serialized
+ * @return []byte  `b` followed by the relocatable-object custom sections
+ */
+fn emit_wasm_relocatable_tail(b: []byte, m: WasmModule) -> []byte {
+    mut out = wasm_linking_section(b, m)
+    let relocs = wasm_absolute_code_relocs(m)
+    if relocs.len > (0 to u64) {
+        out = wasm_reloc_code_section(out, m, relocs)
+    }
+    out
+}
+
+/**
+ * wasm_custom_section — frame ONE custom (id `0`) section: the section id,
+ * ULEB128 payload length, then the payload itself — `name`'s own ULEB128
+ * length-prefixed bytes followed by `contents` (every custom section's
+ * payload starts with its own name, per the wasm spec's custom-section
+ * shape; `wasm_section`'s generic `id ++ size ++ payload` framing handles
+ * the outer wrapping the same way it does for every KNOWN section).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param str name  the custom section's own name (e.g. `"linking"`)
+ * @param []byte contents  the custom section's payload, after its own name
+ * @return []byte  `buf` followed by the framed custom section
+ */
+fn wasm_custom_section(buf: []byte, name: str, contents: []byte) -> []byte {
+    mut payload = emit_uleb128(teko::list::empty(), name.len)
+    payload = emit_str_bytes(payload, name)
+    payload = append_bytes(payload, contents)
+    wasm_section(buf, 0x00 to byte, payload)
+}
+
+/**
+ * wasm_known_section_count_before_code — how many KNOWN sections `emit_wasm`
+ * frames before the code section for `m` (type/import/function/memory/
+ * global/export, each present only when non-empty, `backend-c1-wasm.md`
+ * §5.2): the code section's own 0-based ordinal position among every
+ * section this module actually emits — the `reloc.CODE` custom section's
+ * mandatory `target_section` field (the `wasm-ld` object-format convention,
+ * cross-checked against a real `clang --target=wasm32-wasi -c` object via
+ * `wasm-objdump -x`).
+ *
+ * @param WasmModule m  the module being assembled
+ * @return u32  the code section's own ordinal position
+ */
+fn wasm_known_section_count_before_code(m: WasmModule) -> u32 {
+    mut n: u32 = 0 to u32
+    if m.types.len > (0 to u64) { n++ }
+    if m.imports.len > (0 to u64) { n++ }
+    if m.funcs.len > (0 to u64) { n++ }
+    if m.mem_min_pages > (0 to u32) { n++ }
+    if m.globals.len > (0 to u64) { n++ }
+    if m.exports.len > (0 to u64) { n++ }
+    n
+}
+
+/**
+ * wasm_symbol_flag_undefined — the `linking` symbol-table `WASM_SYM_
+ * UNDEFINED` flag bit (`0x10`): this symbol is not defined in this object
+ * (an import `wasm-ld` must resolve, or — when paired with `wasm_symbol_
+ * flag_explicit_name` — a host-provided import that stays an import in the
+ * final linked module, exactly the WASI syscalls this backend imports,
+ * `backend-c1-wasm.md` §6.2).
+ *
+ * @return u64  the flag bit
+ */
+fn wasm_symbol_flag_undefined() -> u64 {
+    0x10 to u64
+}
+
+/**
+ * wasm_symbol_flag_explicit_name — the `linking` symbol-table `WASM_SYM_
+ * EXPLICIT_NAME` flag bit (`0x40`): this symbol's own `(module, field)`
+ * import pair is authoritative and must be preserved verbatim rather than
+ * derived from the C-style `"env"` convention — every WASI import this
+ * backend emits sets it (cross-checked against a real `clang --target=
+ * wasm32-wasi -c` object's own `wasi_snapshot_preview1` imports via
+ * `wasm-objdump -x`).
+ *
+ * @return u64  the flag bit
+ */
+fn wasm_symbol_flag_explicit_name() -> u64 {
+    0x40 to u64
+}
+
+/**
+ * wasm_linking_symbol_entry — one `WASM_SYMBOL_TABLE` function-symbol entry
+ * (`backend-c1-wasm.md` §5.4/Appendix): the `SYMTAB_FUNCTION` kind byte
+ * (`0x00`), the ULEB128 flags, the ULEB128 function index, then — whenever
+ * the symbol is DEFINED or carries `wasm_symbol_flag_explicit_name` — its
+ * own ULEB128-length-prefixed name (the tool-conventions rule: an
+ * undefined, non-explicit-name symbol's name is instead implied by its own
+ * import entry, so it is omitted there; every symbol this backend ever
+ * builds IS either defined or explicit-name, so this function always writes
+ * one).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u64 sym_flags  the symbol's own flag bits (`WASM_SYM_*`) —
+ *                       parameter named `sym_flags` (not `flags`, a
+ *                       reserved bitflag-enum-declaration keyword)
+ * @param u32 index  the symbol's function index
+ * @param str name  the symbol's own name
+ * @return []byte  `buf` followed by the encoded symbol entry
+ */
+fn wasm_linking_symbol_entry(buf: []byte, sym_flags: u64, index: u32, name: str) -> []byte {
+    mut b = teko::list::push(buf, 0x00 to byte)
+    b = emit_uleb128(b, sym_flags)
+    b = emit_uleb128(b, index to u64)
+    b = emit_uleb128(b, name.len)
+    emit_str_bytes(b, name)
+}
+
+/**
+ * wasm_symbol_table_payload — the `WASM_SYMBOL_TABLE` subsection payload
+ * (subsection id `8`, `backend-c1-wasm.md` §5.4): the ULEB128 entry count
+ * followed by one function-symbol entry per import (`UNDEFINED |
+ * EXPLICIT_NAME`, §6.2 — every import this backend emits is a genuine WASI
+ * host syscall, never a cross-object symbol needing resolution) then one
+ * per defined function (no flags — always resolved locally), in the SAME
+ * order as the module's own function index space (imports first, then
+ * `funcs`, §5.2) — so a symbol's own table INDEX always equals its function
+ * index (`WasmCallReloc.func_index`'s own convention).
+ *
+ * @param WasmModule m  the module being assembled
+ * @return []byte  the symbol-table subsection payload (unframed)
+ */
+fn wasm_symbol_table_payload(m: WasmModule) -> []byte {
+    let total = m.imports.len + m.funcs.len
+    mut b = emit_uleb128(teko::list::empty(), total)
+    let import_flags = wasm_symbol_flag_undefined() | wasm_symbol_flag_explicit_name()
+    mut i: u64 = 0
+    loop {
+        if i >= m.imports.len { break }
+        b = wasm_linking_symbol_entry(b, import_flags, i to u32, m.imports[i].field)
+        i++
+    }
+    mut j: u64 = 0
+    loop {
+        if j >= m.funcs.len { break }
+        let idx = (m.imports.len + j) to u32
+        b = wasm_linking_symbol_entry(b, 0 to u64, idx, m.funcs[j].name)
+        j++
+    }
     b
+}
+
+/**
+ * wasm_linking_section — the `"linking"` custom section (`backend-c1-wasm.md`
+ * §5.4): the linking-format version (`2`) followed by the `WASM_SYMBOL_
+ * TABLE` subsection (id `8`, ULEB128 size, `wasm_symbol_table_payload`) —
+ * `wasm-ld`'s own entry point into recognizing this module as a relocatable
+ * OBJECT rather than a finished executable.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param WasmModule m  the module being assembled
+ * @return []byte  `buf` followed by the framed `"linking"` custom section
+ */
+fn wasm_linking_section(buf: []byte, m: WasmModule) -> []byte {
+    let symtab = wasm_symbol_table_payload(m)
+    mut sub = teko::list::push(teko::list::empty(), 0x08 to byte)
+    sub = emit_uleb128(sub, symtab.len)
+    sub = append_bytes(sub, symtab)
+    mut payload = emit_uleb128(teko::list::empty(), 2 to u64)
+    payload = append_bytes(payload, sub)
+    wasm_custom_section(buf, "linking", payload)
+}
+
+/**
+ * wasm_code_section_base_len — the code section payload's own leading
+ * ULEB128 function-count field's byte length (§5.2) — every function's own
+ * relocations are shifted past this fixed prefix, the starting point
+ * `wasm_absolute_code_relocs`'s running offset accumulates from.
+ *
+ * @param WasmModule m  the module being assembled
+ * @return u32  the function-count ULEB128 field's own byte length
+ */
+fn wasm_code_section_base_len(m: WasmModule) -> u32 {
+    emit_uleb128(teko::list::empty(), m.funcs.len).len to u32
+}
+
+/**
+ * wasm_absolute_code_relocs — every defined function's own `WasmCallReloc`s
+ * (`WasmFunc.relocs`, body-relative), re-based to the CODE SECTION PAYLOAD's
+ * own byte offsets (§5.4): each function's own entry is `ULEB128(entry_
+ * byte_len) ++ local_decls ++ body` (`wasm_code_entry`), so a body-relative
+ * reloc offset becomes section-relative by adding the running byte count of
+ * every earlier framed entry, THIS entry's own length-prefix, and THIS
+ * entry's own local declarations.
+ *
+ * @param WasmModule m  the module being assembled
+ * @return []WasmCallReloc  every function's relocations, section-relative
+ */
+fn wasm_absolute_code_relocs(m: WasmModule) -> []WasmCallReloc {
+    mut out: []WasmCallReloc = teko::list::empty()
+    mut base: u32 = wasm_code_section_base_len(m)
+    mut fi: u64 = 0
+    loop {
+        if fi >= m.funcs.len { break }
+        let f = m.funcs[fi]
+        let entry = wasm_code_entry(f)
+        let prefix_len = emit_uleb128(teko::list::empty(), entry.len).len to u32
+        let local_len = wasm_local_decls(f.local_groups).len to u32
+        let body_base = base + prefix_len + local_len
+        mut ri: u64 = 0
+        loop {
+            if ri >= f.relocs.len { break }
+            let r = f.relocs[ri]
+            out = teko::list::push(out, WasmCallReloc { offset = body_base + r.offset; func_index = r.func_index })
+            ri++
+        }
+        base = base + prefix_len + (entry.len to u32)
+        fi++
+    }
+    out
+}
+
+/**
+ * wasm_reloc_code_section — the `"reloc.CODE"` custom section (§5.4): the
+ * code section's own ordinal position (`wasm_known_section_count_before_
+ * code`), the ULEB128 relocation count, then each `R_WASM_FUNCTION_INDEX_
+ * LEB` (type `0`, no addend) entry — the type byte, the ULEB128
+ * section-relative offset, and the ULEB128 linking-symbol-table index (this
+ * backend's own symbol-index-equals-func-index convention,
+ * `wasm_symbol_table_payload`).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param WasmModule m  the module being assembled
+ * @param []WasmCallReloc relocs  every relocation, already section-relative
+ *                                (`wasm_absolute_code_relocs`)
+ * @return []byte  `buf` followed by the framed `"reloc.CODE"` custom section
+ */
+fn wasm_reloc_code_section(buf: []byte, m: WasmModule, relocs: []WasmCallReloc) -> []byte {
+    mut payload = emit_uleb128(teko::list::empty(), wasm_known_section_count_before_code(m) to u64)
+    payload = emit_uleb128(payload, relocs.len)
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        payload = teko::list::push(payload, 0x00 to byte)
+        payload = emit_uleb128(payload, relocs[i].offset to u64)
+        payload = emit_uleb128(payload, relocs[i].func_index to u64)
+        i++
+    }
+    wasm_custom_section(buf, "reloc.CODE", payload)
 }
