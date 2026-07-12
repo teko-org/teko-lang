@@ -233,6 +233,55 @@ fn mk_fn(name: str, ret: parser::TypeExpr, body: []parser::Statement) -> parser:
     parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = ret; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
 }
 
+/** type_function_with_loop_body — a `Ref`-param function whose body contains a `loop { break }`
+    types cleanly and drives the ref-storability walker over the loop node (its guard descends the
+    body only for a Ref-carrying/free-carrying function, #517). */
+#test
+fn type_function_with_loop_body() {
+    let ref_ann: parser::TypeExpr = parser::NamedType { path = path1("Ref"); args = teko::list::push(teko::list::empty(), named_t("i64")) }
+    let rp = parser::Param { name = "r"; has_type = true; type_ann = ref_ann; is_params = false; has_default = false; default_expr = e_num(0) }
+    let params = teko::list::push(teko::list::empty(), rp)
+    let brk: []parser::Statement = teko::list::push(teko::list::empty(), parser::BreakStmt { label = "" })
+    mut body: []parser::Statement = teko::list::push(teko::list::empty(), loop_stmt(brk))
+    body = teko::list::push(body, st(e_num(0)))
+    let f = parser::Function { name = "looper"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    match type_function(f, empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** lam_collect_descends_loop_init — the closure free-variable collector walks a loop's `init` (and
+    body): a var read in the init is collected as a free reference (#517). */
+#test
+fn lam_collect_descends_loop_init() {
+    mut refs: []str = teko::list::empty()
+    mut bound: []str = teko::list::empty()
+    let ib: parser::Statement = parser::Binding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "_hi" }; has_type = false; type_ann = named_t("void"); value = e_var("n") }
+    let init: []parser::Statement = teko::list::push(teko::list::empty(), ib)
+    let brk: []parser::Statement = teko::list::push(teko::list::empty(), parser::BreakStmt { label = "" })
+    let loopnode: parser::Statement = parser::LoopStmt { label = ""; init = init; body = brk }
+    let stmts: []parser::Statement = teko::list::push(teko::list::empty(), loopnode)
+    lam_collect_block(stmts, refs, bound)
+    mut found = false
+    mut i = 0
+    loop {
+        if i >= refs.len { break }
+        if refs[i] == "n" { found = true }
+        i++
+    }
+    teko::assert::is_true(found)
+}
+
+/** chain_stats_descends_loop_init — the self-append-chain escape analysis walks a loop's `init` (and
+    body) for the named chain (#517). */
+#test
+fn chain_stats_descends_loop_init() {
+    let init: []TStatement = teko::list::push(teko::list::empty(), t_let("_hi", tnum(3)))
+    let brk: []TStatement = teko::list::push(teko::list::empty(), TBreakStmt { label = "" })
+    let loopnode: TStatement = TLoopStmt { label = ""; init = init; body = brk }
+    let stmts: []TStatement = teko::list::push(teko::list::empty(), loopnode)
+    let cs = chain_stats_block(stmts, "x")
+    teko::assert::is_true(cs.self_appends == 0)
+}
+
 #test
 fn types_function_and_program() {
     let f = mk_fn("id", named_t("u32"), one_stmt(e_var("x")))
@@ -618,6 +667,23 @@ fn alt_pattern_check() {
     bopts = teko::list::push(bopts, parser::BindPattern { type_name = path1("GREEN"); has_binding = true; binding = "g"; is_slice = false; slice_type = null; type_args = teko::list::empty() })
     let balt = parser::AltPattern { options = bopts }
     match check_pattern(balt, color_subject(), empty_env(), color_table()) { Env => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/** wildcard_bind_pattern_check — `_ as x` (empty type_name) binds over a plain subject, an optional
+    subject (null stripped), and an enum subject; the `_ as _` discard binds nothing (#517). */
+#test
+fn wildcard_bind_pattern_check() {
+    let wb = parser::BindPattern { type_name = parser::Path { segments = teko::list::empty() }; has_binding = true; binding = "x"; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    match check_pattern(wb, i64t(), empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let opt: Type = Optional { inner = i64t() }
+    match check_pattern(wb, opt, empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    match check_pattern(wb, color_subject(), empty_env(), color_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let eb = parser::EnumBody { members = teko::list::push(teko::list::push(teko::list::empty(), "RED"), "GREEN") }
+    match check_enum_pattern(wb, Named { name = "Color" }, eb, empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let wbd = parser::BindPattern { type_name = parser::Path { segments = teko::list::empty() }; has_binding = false; binding = ""; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    match check_pattern(wbd, i64t(), empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    match check_pattern(wbd, color_subject(), empty_env(), color_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    match check_enum_pattern(wbd, Named { name = "Color" }, eb, empty_env(), empty_table()) { Env => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 
 #test
