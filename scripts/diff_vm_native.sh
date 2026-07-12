@@ -122,6 +122,7 @@ COMPILE_FAIL=(
     loop_range_counter_leak
     loop_three_part_nonbool_cond
     loop_foreach_raw_collection
+    loop_foreach_destructure_unknown_field
 )
 
 is_expected_fail() {

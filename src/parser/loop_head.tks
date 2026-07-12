@@ -425,24 +425,61 @@ fn parse_loop_three_part(tokens: []lexer::Token, tgt: Parsed<BindTarget>, ann: A
 }
 
 /**
- * loop_foreach_bind_body — build a for-each arm's element-binding body: bind the user's target to a
- * loop-local COPY of the yielded element (`<elem>`), then the user statements. A SimpleName binds
- * `mut x = <elem>` (a copy, no write-back — owner 2026-07-12); a destructure target is a later crumb
- * (#517, §5.4).
+ * loop_field_access — a field-read expression `<recv>.<field>`, positioned at (`line`, `col`) — one
+ * per-field extraction of a for-each destructure (`mut a = _elem.a`) (#517, §5.5).
  *
- * @param tgt        the parsed bind-target (SimpleName for now)
+ * @param recv_name  the receiver variable name (the element temp)
+ * @param field      the field to read
+ * @param line       the source line to stamp
+ * @param col        the source column to stamp
+ * @return           the `<recv>.<field>` expression
+ */
+fn loop_field_access(recv_name: str, field: str, line: u32, col: u32) -> Expr {
+    Expr { kind = FieldAccess { receiver = loop_var(recv_name, line, col); field = field }; line = line; col = col }
+}
+
+/**
+ * loop_destructure_binds — expand a for-each destructure target `{ a; b }` to per-field loop-local
+ * copies `mut a = _elem.a; mut b = _elem.b`, then the user body. Reuses field-access + simple
+ * bindings (NOT the incomplete B.13 general destructure path); each field type is inferred and an
+ * unknown field name is the checker's "no such field" error (#517, §5.5).
+ *
+ * @param names      the destructured field names, in order
  * @param elem_name  the hygienic element temp bound by the `_ as` pattern
- * @param ann        the parsed `: T` annotation (applied to the copy binding)
  * @param body       the parsed user body
  * @param line       the loop keyword's source line
  * @param col        the loop keyword's source column
- * @return           the element-binding body, or a parse error for an unsupported target
- * @throws           when the target is a destructure (a later crumb)
+ * @return           the element-binding body (per-field copies + user statements)
  */
-fn loop_foreach_bind_body(tgt: BindTarget, elem_name: str, ann: Annotation, body: []Statement, line: u32, col: u32) -> []Statement | error {
+fn loop_destructure_binds(names: []str, elem_name: str, body: []Statement, line: u32, col: u32) -> []Statement {
+    mut binds: []Statement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        binds = teko::list::push(binds, loop_mut_binding(names[i], loop_field_access(elem_name, names[i], line, col)))
+        i++
+    }
+    loop_append_all(binds, body)
+}
+
+/**
+ * loop_foreach_bind_body — build a for-each arm's element-binding body: bind the user's target to a
+ * loop-local COPY of the yielded element (`<elem>`), then the user statements. A SimpleName binds
+ * `mut x = <elem>`; a destructure expands to per-field `mut a = <elem>.a` copies. All copies, no
+ * write-back — owner 2026-07-12 (#517, §5.4/§5.5).
+ *
+ * @param tgt        the parsed bind-target (SimpleName or DestructurePattern)
+ * @param elem_name  the hygienic element temp bound by the `_ as` pattern
+ * @param ann        the parsed `: T` annotation (applied to a SimpleName copy binding)
+ * @param body       the parsed user body
+ * @param line       the loop keyword's source line
+ * @param col        the loop keyword's source column
+ * @return           the element-binding body
+ */
+fn loop_foreach_bind_body(tgt: BindTarget, elem_name: str, ann: Annotation, body: []Statement, line: u32, col: u32) -> []Statement {
     match tgt {
         SimpleName as sn => prepend_stmt(loop_counter_binding(sn.name, loop_var(elem_name, line, col), ann.has_type, ann.type_ann), body)
-        DestructurePattern => error { message = "loop for-each destructure forms land in a later step" }
+        DestructurePattern as dp => loop_destructure_binds(dp.names, elem_name, body, line, col)
     }
 }
 
@@ -468,7 +505,7 @@ fn parse_loop_foreach(tokens: []lexer::Token, tgt: Parsed<BindTarget>, ann: Anno
     let blk = match parse_block(tokens, it.next) { ParsedList<Statement> as x => x; error as e => return e }
     let elem_name = loop_temp("elem", line, col)
     let it_name = loop_temp("it", line, col)
-    let bind_body = match loop_foreach_bind_body(tgt.node, elem_name, ann, blk.items, line, col) { []Statement as b => b; error as e => return e }
+    let bind_body = loop_foreach_bind_body(tgt.node, elem_name, ann, blk.items, line, col)
     let pull = loop_match_pull(it_name, elem_name, bind_body, line, col)
     let init: []Statement = teko::list::push(teko::list::empty(), loop_mut_binding(it_name, it.node))
     let body: []Statement = teko::list::push(teko::list::empty(), pull)
