@@ -1,13 +1,14 @@
 use teko::lir
 
 /**
- * sft_ctx0 — a fresh `StackifyCtx` with an empty body and no VRegs recorded
- * (the fixture every lowering-function test starts from).
+ * sft_ctx0 — a fresh `StackifyCtx` with an empty body, no VRegs recorded,
+ * and no shadow-stack frame (the fixture every lowering-function test
+ * starts from).
  *
  * @return StackifyCtx  the empty context
  */
 fn sft_ctx0() -> StackifyCtx {
-    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = 0 to u32 }
+    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = 0 to u32; has_frame = false; frame_base = 0 to u32; slots = wst_empty() }
 }
 
 /**
@@ -844,22 +845,58 @@ fn stackify_inst_jump_and_branch_are_internal_misuse() {
 
 #test
 /**
- * stackify_inst_alloca_and_global_addr_are_the_c1_4_stop — the
- * shadow-stack/rodata linear-memory layout is out of C1-2's scope.
+ * stackify_inst_global_addr_matches_design_doc_golden — `LGlobalAddr`
+ * dispatched through `stackify_inst`, resolving via a registered data
+ * symbol: `i32.const 100; local.set 0` (`41 E4 00 21 00`, §12.1's own
+ * `LGlobalAddr -> i32.const dataaddr` shape).
  *
  * @return void
  */
-fn stackify_inst_alloca_and_global_addr_are_the_c1_4_stop() {
-    let alloca = lir::alloca_inst(0, 8, 8, 0, 0)
-    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), alloca) {
-        StackifyCtx => teko::assert::is_true(false)
-        error as e => teko::assert::str_contains(e.message, "C1-alloca")
-    }
+fn stackify_inst_global_addr_matches_design_doc_golden() {
+    let symbols = wasm_symtab_add_data(wasm_symtab_empty(), "teko__rodata__0", 100 to u32)
     let global_addr = lir::global_addr_inst(0, "teko__rodata__0", 0, 0)
+    let out = match stackify_inst(sft_ctx0(), sft_empty_func(), symbols, global_addr) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x41 to byte, 0xE4 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte]))
+    teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_inst_global_addr_unresolved_symbol_is_a_named_error — a rodata
+ * symbol the caller never registered.
+ *
+ * @return void
+ */
+fn stackify_inst_global_addr_unresolved_symbol_is_a_named_error() {
+    let global_addr = lir::global_addr_inst(0, "teko__rodata__missing", 0, 0)
     match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), global_addr) {
         StackifyCtx => teko::assert::is_true(false)
-        error as e => teko::assert::str_contains(e.message, "C1-globaladdr")
+        error as e => teko::assert::str_contains(e.message, "unresolved data symbol")
     }
+}
+
+#test
+/**
+ * stackify_inst_alloca_dispatches_to_stackify_alloca — `LAlloca` reads its
+ * own precomputed slot offset from a manually-seeded frame (`frame_base=9`,
+ * slot offset `16`): `local.get 9; i32.const 16; i32.add; local.set 0`.
+ *
+ * @return void
+ */
+fn stackify_inst_alloca_dispatches_to_stackify_alloca() {
+    let seeded = StackifyCtx {
+        body = teko::list::empty()
+        vtypes = wvt_empty()
+        scopes = teko::list::empty()
+        next_scratch = 10 to u32
+        has_frame = true
+        frame_base = 9 to u32
+        slots = wst_set(wst_empty(), 0, 16 to u32)
+    }
+    let alloca = lir::alloca_inst(0, 8, 8, 0, 0)
+    let out = match stackify_inst(seeded, sft_empty_func(), wasm_symtab_empty(), alloca) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x09 to byte, 0x41 to byte, 0x10 to byte, 0x6A to byte, 0x21 to byte, 0x00 to byte]))
+    teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
 }
 
 #test
@@ -1061,13 +1098,14 @@ fn stackify_inst_dispatches_every_remaining_straight_line_case() {
  * @return void
  */
 fn stackify_func_propagates_a_mid_stream_instruction_error() {
-    mut f = lir::new_func("teko__test__alloca_mid", 0, teko::list::empty(), lir::LType::Void)
+    mut f = lir::new_func("teko__test__callind_mid", 0, teko::list::empty(), lir::LType::Void)
     let r0 = lir::alloc_vreg(f)
-    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 8, 8, 0, 0))
+    f = lir::append_inst(r0.func, 0, lir::const_int_inst(r0.vreg, 0 to i128, 0, 0))
+    f = lir::append_inst(f, 0, lir::void_call_indirect_inst(r0.vreg, teko::list::empty(), false, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
     match stackify_func(f, wasm_symtab_empty()) {
         WasmFuncBody => teko::assert::is_true(false)
-        error as e => teko::assert::str_contains(e.message, "C1-alloca")
+        error as e => teko::assert::str_contains(e.message, "C1-callindirect")
     }
 }
 
@@ -1743,4 +1781,257 @@ fn stackify_func_loop_back_edge_arity_mismatch_propagates_through_render_loop() 
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "arity mismatch")
     }
+}
+
+#test
+/**
+ * wst_get_defaults_to_zero_when_unset — the defensive out-of-range default
+ * (never reached from valid input — every `LAlloca` is pre-scanned into the
+ * table before its own lowering).
+ *
+ * @return void
+ */
+fn wst_get_defaults_to_zero_when_unset() {
+    teko::assert::is_true(wst_get(wst_empty(), 3) == (0 to u32))
+}
+
+#test
+/**
+ * alloca_of_non_alloca_is_an_all_zero_placeholder — `alloca_of`'s own
+ * defensive fallback arm, exercised directly on a non-`LAlloca` instruction
+ * (never reached from `collect_alloca_insts`'s own pre-filtered callers).
+ *
+ * @return void
+ */
+fn alloca_of_non_alloca_is_an_all_zero_placeholder() {
+    let a = alloca_of(lir::ret_void_inst(0, 0))
+    teko::assert::is_true(a.bytes == (0 to u32))
+    teko::assert::is_true(a.align == (1 to u32))
+}
+
+#test
+/**
+ * compute_wasm_frame_layout_single_alloca — one `LAlloca{bytes=8,align=8}`
+ * gets offset `0`, and the frame's own size/alignment match it exactly.
+ *
+ * @return void
+ */
+fn compute_wasm_frame_layout_single_alloca() {
+    let inst = lir::alloca_inst(0, 8, 8, 0, 0)
+    let layout = compute_wasm_frame_layout([inst])
+    teko::assert::is_true(wst_get(layout.slots, 0) == (0 to u32))
+    teko::assert::is_true(layout.frame_size == (8 to u32))
+    teko::assert::is_true(layout.frame_align == (8 to u32))
+}
+
+#test
+/**
+ * compute_wasm_frame_layout_packs_two_allocas_with_padding — a `bytes=4,
+ * align=4` slot followed by a `bytes=8,align=8` slot: the second slot is
+ * padded up to offset `8` (its own alignment), and the frame's own
+ * alignment/size follow the WIDER slot.
+ *
+ * @return void
+ */
+fn compute_wasm_frame_layout_packs_two_allocas_with_padding() {
+    let a = lir::alloca_inst(0, 4, 4, 0, 0)
+    let b = lir::alloca_inst(1, 8, 8, 0, 0)
+    let layout = compute_wasm_frame_layout([a, b])
+    teko::assert::is_true(wst_get(layout.slots, 0) == (0 to u32))
+    teko::assert::is_true(wst_get(layout.slots, 1) == (8 to u32))
+    teko::assert::is_true(layout.frame_size == (16 to u32))
+    teko::assert::is_true(layout.frame_align == (8 to u32))
+}
+
+#test
+/**
+ * collect_alloca_insts_finds_every_alloca_in_block_order — a two-block
+ * function with one `LAlloca` per block: both are found, in block order.
+ *
+ * @return void
+ */
+fn collect_alloca_insts_finds_every_alloca_in_block_order() {
+    mut f = lir::new_func("teko__test__collect_alloca", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 4, 4, 0, 0))
+    f = lir::append_inst(f, 0, lir::jump_inst(1, teko::list::empty(), 0, 0))
+    let b1 = lir::alloc_block(f)
+    f = b1.func
+    let r1 = lir::alloc_vreg(f)
+    f = lir::append_inst(r1.func, b1.block_id, lir::alloca_inst(r1.vreg, 8, 8, 0, 0))
+    f = lir::append_inst(f, b1.block_id, lir::ret_void_inst(0, 0))
+    let found = collect_alloca_insts(f)
+    teko::assert::is_true(found.len == 2)
+    teko::assert::is_true(found[0].result == r0.vreg)
+    teko::assert::is_true(found[1].result == r1.vreg)
+}
+
+#test
+/**
+ * stackify_func_single_alloca_matches_wat2wasm_reference — `fn f() -> i32 {
+ * alloca(8, align=8) }`: the shadow-stack prologue, the `LAlloca` site's own
+ * offset-`0` address computation, and the epilogue-before-`return`, all
+ * byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn stackify_func_single_alloca_matches_wat2wasm_reference() {
+    mut f = lir::new_func("teko__test__single_alloca", 0, teko::list::empty(), lir::LType::I32)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 8, 8, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(r0.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x23 to byte, 0x00 to byte, 0x41 to byte, 0x08 to byte, 0x6B to byte, 0x41 to byte, 0x78 to byte, 0x71 to byte,
+        0x22 to byte, 0x01 to byte, 0x24 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x41 to byte, 0x00 to byte,
+        0x6A to byte, 0x21 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x24 to byte, 0x00 to byte, 0x20 to byte,
+        0x00 to byte, 0x0F to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (2 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_unaligned_alloca_skips_the_align_down_mask — a single
+ * `bytes=3, align=1` alloca needs no `i32.and` mask in its prologue (`align
+ * <= 1` is a no-op, `wasm_align_down_i32`'s other arm), byte-for-byte
+ * identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn stackify_func_unaligned_alloca_skips_the_align_down_mask() {
+    mut f = lir::new_func("teko__test__unaligned_alloca", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 3, 1, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x23 to byte, 0x00 to byte, 0x41 to byte, 0x03 to byte, 0x6B to byte, 0x22 to byte, 0x01 to byte, 0x24 to byte,
+        0x00 to byte, 0x20 to byte, 0x01 to byte, 0x41 to byte, 0x00 to byte, 0x6A to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x01 to byte, 0x24 to byte, 0x00 to byte, 0x0F to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (2 to u32))
+}
+
+#test
+/**
+ * stackify_func_two_allocas_matches_wat2wasm_reference — two allocas
+ * (`bytes=4,align=4` then `bytes=8,align=8`) in one function: ONE prologue
+ * bump for the whole `frame_size=16` frame, each site its own fixed offset
+ * (`0`/`8`), byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn stackify_func_two_allocas_matches_wat2wasm_reference() {
+    mut f = lir::new_func("teko__test__two_allocas", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 4, 4, 0, 0))
+    let r1 = lir::alloc_vreg(f)
+    f = lir::append_inst(r1.func, 0, lir::alloca_inst(r1.vreg, 8, 8, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x23 to byte, 0x00 to byte, 0x41 to byte, 0x10 to byte, 0x6B to byte, 0x41 to byte, 0x78 to byte, 0x71 to byte,
+        0x22 to byte, 0x02 to byte, 0x24 to byte, 0x00 to byte, 0x20 to byte, 0x02 to byte, 0x41 to byte, 0x00 to byte,
+        0x6A to byte, 0x21 to byte, 0x00 to byte, 0x20 to byte, 0x02 to byte, 0x41 to byte, 0x08 to byte, 0x6A to byte,
+        0x21 to byte, 0x01 to byte, 0x20 to byte, 0x02 to byte, 0x24 to byte, 0x00 to byte, 0x0F to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (3 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+/**
+ * srt_rodata — one `LRodata` entry (`symbol`, `bytes`), the fixture
+ * `wasm_layout_rodata`'s own tests build from.
+ *
+ * @param str symbol  the entry's symbol
+ * @param []byte bytes  its raw byte content
+ * @return lir::LRodata  the entry
+ */
+fn srt_rodata(symbol: str, bytes: []byte) -> lir::LRodata {
+    lir::LRodata { symbol = symbol; bytes = bytes }
+}
+
+#test
+/**
+ * wasm_layout_rodata_places_entries_back_to_back — two entries (`"hi"` then
+ * `"!"`) starting at base `0`: contiguous offsets, no padding, and `end` one
+ * past the last byte.
+ *
+ * @return void
+ */
+fn wasm_layout_rodata_places_entries_back_to_back() {
+    let rodata = [srt_rodata("s0", [0x68 to byte, 0x69 to byte]), srt_rodata("s1", [0x21 to byte])]
+    let layout = wasm_layout_rodata(rodata, 0 to u32)
+    teko::assert::is_true(layout.segment.offset == (0 to u32))
+    teko::assert::is_true(wasm_bytes_eq(layout.segment.bytes, [0x68 to byte, 0x69 to byte, 0x21 to byte]))
+    teko::assert::is_true(layout.symbols.len == 2)
+    teko::assert::is_true(layout.symbols[0] == "s0" && layout.symbols[1] == "s1")
+    teko::assert::is_true(layout.offsets[0] == (0 to u32) && layout.offsets[1] == (2 to u32))
+    teko::assert::is_true(layout.end == (3 to u32))
+}
+
+#test
+/**
+ * wasm_layout_rodata_honors_a_nonzero_base — the same two entries, but
+ * placed starting at base `100` (the caller's own memory-plan choice).
+ *
+ * @return void
+ */
+fn wasm_layout_rodata_honors_a_nonzero_base() {
+    let rodata = [srt_rodata("s0", [0x68 to byte, 0x69 to byte])]
+    let layout = wasm_layout_rodata(rodata, 100 to u32)
+    teko::assert::is_true(layout.segment.offset == (100 to u32))
+    teko::assert::is_true(layout.offsets[0] == (100 to u32))
+    teko::assert::is_true(layout.end == (102 to u32))
+}
+
+#test
+/**
+ * wasm_symtab_add_rodata_registers_every_entry — a laid-out rodata table
+ * registers ALL of its own symbols into a `WasmSymbolTable` in one call,
+ * each resolving to its own offset.
+ *
+ * @return void
+ */
+fn wasm_symtab_add_rodata_registers_every_entry() {
+    let rodata = [srt_rodata("s0", [0x68 to byte, 0x69 to byte]), srt_rodata("s1", [0x21 to byte])]
+    let layout = wasm_layout_rodata(rodata, 0 to u32)
+    let symbols = wasm_symtab_add_rodata(wasm_symtab_empty(), layout)
+    match wasm_resolve_data(symbols, "s0") { u32 as o => teko::assert::is_true(o == (0 to u32)); error => teko::assert::is_true(false) }
+    match wasm_resolve_data(symbols, "s1") { u32 as o => teko::assert::is_true(o == (2 to u32)); error => teko::assert::is_true(false) }
+}
+
+#test
+/**
+ * wasm_honest_globals_names_c1_globals — the module-level `LGlobal` stop's
+ * own message.
+ *
+ * @return void
+ */
+fn wasm_honest_globals_names_c1_globals() {
+    teko::assert::str_contains(wasm_honest_globals().message, "C1-globals")
+}
+
+#test
+/**
+ * wasm_sp_global_is_a_mutable_i32 — `wasm_sp_global`'s own builder shape:
+ * always `i32`, always mutable, carrying the caller's own `init` through
+ * unchanged.
+ *
+ * @return void
+ */
+fn wasm_sp_global_is_a_mutable_i32() {
+    let g = wasm_sp_global(1024 to i64)
+    teko::assert::is_true(g.valtype == wasm_vt_i32())
+    teko::assert::is_true(g.mutable)
+    teko::assert::is_true(g.init == (1024 to i64))
+    teko::assert::is_true(wasm_sp_global_index() == (0 to u32))
 }

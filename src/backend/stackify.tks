@@ -281,14 +281,104 @@ fn wasm_scope_stack_depth_of(scopes: []WasmScope, label_block: u32) -> ScopeDept
 }
 
 /**
+ * WasmSlotTable — the stackifier's per-VReg shadow-stack-slot side-table:
+ * each `LAlloca` result VReg's frame-base-relative byte offset (§6.1),
+ * densely indexed by VReg id exactly like `WasmVTypeTable` (the LIR's own
+ * strictly-increasing VReg id allocation makes a positional array
+ * sufficient). Built ONCE, ahead of lowering, from the function's whole
+ * static frame layout (`compute_wasm_frame_layout`) — every Teko `LAlloca`
+ * carries a compile-time-constant `bytes`/`align` (no VLA), so the whole
+ * function's frame can be laid out up front, exactly like a native frame
+ * (mirrors `encode_arm64.tks`'s `MFunc.frame` + `SlotLayout`, PARALLELED
+ * rather than reused, `backend-c1-wasm.md` §1.3) — this is what keeps an
+ * `LAlloca` SITE inside a `loop` body correct: it resolves to the SAME
+ * fixed slot every iteration instead of bumping `SP` again each pass.
+ *
+ * @since #389 C1-4
+ */
+type WasmSlotTable = struct {
+    /**
+     * offsets — each recorded alloca VReg's frame-base-relative byte
+     * offset, positionally indexed by VReg id (`0` for an unrecorded VReg —
+     * never read for one, since every `LAlloca` is pre-scanned before
+     * lowering begins).
+     */
+    offsets: []u32
+}
+
+/**
+ * wst_empty — a slot table with no `LAlloca` VRegs recorded yet.
+ *
+ * @return WasmSlotTable  the empty table
+ */
+fn wst_empty() -> WasmSlotTable {
+    WasmSlotTable { offsets = teko::list::empty() }
+}
+
+/**
+ * wst_grow — pad `t` with placeholder `0` entries until it holds at least
+ * `n` positions (mirrors `wvt_grow`).
+ *
+ * @param WasmSlotTable t  the table to pad
+ * @param u64 n  the minimum length the padded table must reach
+ * @return WasmSlotTable  the padded table
+ */
+fn wst_grow(t: WasmSlotTable, n: u64) -> WasmSlotTable {
+    mut os = t.offsets
+    loop {
+        if os.len >= n { break }
+        os = teko::list::push(os, 0 to u32)
+    }
+    WasmSlotTable { offsets = os }
+}
+
+/**
+ * wst_set — record `off` as the frame-base-relative offset of VReg `id`,
+ * growing the table first when needed (mirrors `wvt_set`).
+ *
+ * @param WasmSlotTable t0  the table to update
+ * @param u32 id  the `LAlloca` result VReg being recorded
+ * @param u32 off  its frame-base-relative byte offset
+ * @return WasmSlotTable  the updated table
+ */
+fn wst_set(t0: WasmSlotTable, id: u32, off: u32) -> WasmSlotTable {
+    let grown = wst_grow(t0, (id to u64) + 1)
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= grown.offsets.len { break }
+        out = teko::list::push(out, if (i to u32) == id { off } else { grown.offsets[i] })
+        i++
+    }
+    WasmSlotTable { offsets = out }
+}
+
+/**
+ * wst_get — the recorded frame-base-relative offset of VReg `id`, or `0`
+ * when `id` was never recorded (defensive only — every `LAlloca` site is
+ * pre-scanned into the table before its own lowering is ever reached).
+ *
+ * @param WasmSlotTable t  the table to read
+ * @param u32 id  the VReg id to look up
+ * @return u32  its recorded (or default) offset
+ */
+fn wst_get(t: WasmSlotTable, id: u32) -> u32 {
+    let i = id to u64
+    if i >= t.offsets.len { return 0 to u32 }
+    t.offsets[i]
+}
+
+/**
  * StackifyCtx — the stackifier's threaded state while lowering one
  * function's whole instruction stream: the already-emitted code-entry body
  * bytes, the `WasmVTypeTable` recording every VReg lowered so far, the
- * CFGStackify scope stack currently open (`WasmScope`, §3), and the next
- * free scratch-local id (`next_scratch`, §4.3's parallel-copy staging).
- * Mirrors `isel_arm64.tks`'s `SelCtx`, but with no register file — wasm's
- * per-value state is its valtype plus (during control-flow lowering) the
- * structured-control scope stack a `br`'s label depth resolves against.
+ * CFGStackify scope stack currently open (`WasmScope`, §3), the next free
+ * scratch-local id (`next_scratch`, §4.3's parallel-copy staging), and the
+ * function's shadow-stack frame (`has_frame`/`frame_base`/`slots`, C1-4's
+ * `LAlloca` support — §6.1). Mirrors `isel_arm64.tks`'s `SelCtx`, but with
+ * no register file — wasm's per-value state is its valtype plus (during
+ * control-flow lowering) the structured-control scope stack a `br`'s label
+ * depth resolves against.
  */
 type StackifyCtx = struct {
     /**
@@ -316,6 +406,26 @@ type StackifyCtx = struct {
      * local never collides with a VReg-backed one.
      */
     next_scratch: u32
+    /**
+     * has_frame — whether this function reserves a shadow-stack frame (it
+     * contains at least one `LAlloca`): when `false`, `frame_base`/`slots`
+     * are unused and `LRet`'s epilogue restores nothing.
+     */
+    has_frame: bool
+    /**
+     * frame_base — the scratch local holding this call's own frame base
+     * (the `SP` value right after the prologue's ONE bump, §6.1): every
+     * `LAlloca` site computes `frame_base + its own slot offset`, and every
+     * `LRet` epilogue restores `SP` from it. Meaningless when `has_frame`
+     * is `false`.
+     */
+    frame_base: u32
+    /**
+     * slots — the function's whole `LAlloca` frame layout (`WasmSlotTable`,
+     * built once by `compute_wasm_frame_layout` ahead of lowering).
+     * Meaningless when `has_frame` is `false`.
+     */
+    slots: WasmSlotTable
 }
 
 /**
@@ -327,7 +437,7 @@ type StackifyCtx = struct {
  * @return StackifyCtx  the advanced context
  */
 fn sc_byte(ctx: StackifyCtx, b: byte) -> StackifyCtx {
-    StackifyCtx { body = teko::list::push(ctx.body, b); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch }
+    StackifyCtx { body = teko::list::push(ctx.body, b); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -339,7 +449,7 @@ fn sc_byte(ctx: StackifyCtx, b: byte) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_uleb(ctx: StackifyCtx, v: u64) -> StackifyCtx {
-    StackifyCtx { body = emit_uleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch }
+    StackifyCtx { body = emit_uleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -351,7 +461,7 @@ fn sc_uleb(ctx: StackifyCtx, v: u64) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_sleb(ctx: StackifyCtx, v: i64) -> StackifyCtx {
-    StackifyCtx { body = emit_sleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch }
+    StackifyCtx { body = emit_sleb128(ctx.body, v); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -366,7 +476,7 @@ fn sc_sleb(ctx: StackifyCtx, v: i64) -> StackifyCtx {
 fn sc_f64_bits(ctx: StackifyCtx, bits: u64) -> StackifyCtx {
     let lo = (bits & (0xFFFFFFFF to u64)) to u32
     let hi = (bits >> (32 to u64)) to u32
-    StackifyCtx { body = emit_u32_le(emit_u32_le(ctx.body, lo), hi); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch }
+    StackifyCtx { body = emit_u32_le(emit_u32_le(ctx.body, lo), hi); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -396,6 +506,68 @@ fn sc_local_set(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
 }
 
 /**
+ * sc_local_tee — emit `local.tee $vreg` (`0x22`): sets the local like
+ * `local.set` but leaves the value on the operand stack too — the shadow-
+ * stack prologue's own "compute the new `SP`, capture it into `frame_base`,
+ * AND still have it on the stack to feed `global.set`" step (§6.1).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 vreg  the VReg (and local index) to write-and-keep
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_local_tee(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
+    sc_uleb(sc_byte(ctx, 0x22 to byte), vreg to u64)
+}
+
+/**
+ * wasm_sp_global_index — the shadow-stack `SP` global's module-wide index.
+ * The MVP declares no other backend-internal global and no LIR-level
+ * `LGlobal` ever lowers to a wasm global (`wasm_honest_globals`, C1-4), so
+ * `SP` is always the FIRST (and only) entry of a module's global section —
+ * a safe compile-time constant for the whole slice.
+ *
+ * @return u32  the `SP` global's index (`0`)
+ */
+pub fn wasm_sp_global_index() -> u32 {
+    0 to u32
+}
+
+/**
+ * wasm_sp_global — build the shadow-stack `SP` global's own module-level
+ * declaration (`objfile_wasm.tks`'s `WasmGlobal`): a mutable `i32`
+ * initialized to `init` (§6.1 — "top of the reserved stack region", a
+ * whole-module memory-layout decision left to the caller, C1-5 territory).
+ *
+ * @param i64 init  the `SP` global's initial value
+ * @return WasmGlobal  the `SP` global declaration
+ */
+pub fn wasm_sp_global(init: i64) -> WasmGlobal {
+    WasmGlobal { valtype = wasm_vt_i32(); mutable = true; init = init }
+}
+
+/**
+ * sc_global_get — emit `global.get $idx` (`0x23`).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 idx  the global index to read
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_global_get(ctx: StackifyCtx, idx: u32) -> StackifyCtx {
+    sc_uleb(sc_byte(ctx, 0x23 to byte), idx to u64)
+}
+
+/**
+ * sc_global_set — emit `global.set $idx` (`0x24`).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 idx  the global index to write
+ * @return StackifyCtx  the advanced context
+ */
+fn sc_global_set(ctx: StackifyCtx, idx: u32) -> StackifyCtx {
+    sc_uleb(sc_byte(ctx, 0x24 to byte), idx to u64)
+}
+
+/**
  * sc_set_vtype — record `vt` as VReg `vreg`'s wasm valtype in the context's
  * side-table, without touching the emitted body bytes.
  *
@@ -405,7 +577,7 @@ fn sc_local_set(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_set_vtype(ctx: StackifyCtx, vreg: u32, vt: u8) -> StackifyCtx {
-    StackifyCtx { body = ctx.body; vtypes = wvt_set(ctx.vtypes, vreg, vt); scopes = ctx.scopes; next_scratch = ctx.next_scratch }
+    StackifyCtx { body = ctx.body; vtypes = wvt_set(ctx.vtypes, vreg, vt); scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots }
 }
 
 /**
@@ -446,7 +618,7 @@ fn wasm_blocktype_void() -> byte {
  */
 fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x02 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_block(), label_block); next_scratch = opened.next_scratch }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_block(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots }
 }
 
 /**
@@ -460,7 +632,7 @@ fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
  */
 fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x03 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_loop(), label_block); next_scratch = opened.next_scratch }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_loop(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots }
 }
 
 /**
@@ -474,7 +646,7 @@ fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
  */
 fn sc_open_if(ctx: StackifyCtx) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x04 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_if(), 0 to u32); next_scratch = opened.next_scratch }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_if(), 0 to u32); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots }
 }
 
 /**
@@ -487,7 +659,7 @@ fn sc_open_if(ctx: StackifyCtx) -> StackifyCtx {
  */
 fn sc_close_scope(ctx: StackifyCtx) -> StackifyCtx {
     let closed = sc_byte(ctx, 0x0B to byte)
-    StackifyCtx { body = closed.body; vtypes = closed.vtypes; scopes = wasm_scope_stack_pop(closed.scopes); next_scratch = closed.next_scratch }
+    StackifyCtx { body = closed.body; vtypes = closed.vtypes; scopes = wasm_scope_stack_pop(closed.scopes); next_scratch = closed.next_scratch; has_frame = closed.has_frame; frame_base = closed.frame_base; slots = closed.slots }
 }
 
 /**
@@ -531,8 +703,215 @@ type ScratchAlloc = struct {
  */
 fn sc_alloc_scratch(ctx0: StackifyCtx, vt: u8) -> ScratchAlloc {
     let id = ctx0.next_scratch
-    let ctx1 = StackifyCtx { body = ctx0.body; vtypes = wvt_set(ctx0.vtypes, id, vt); scopes = ctx0.scopes; next_scratch = id + 1 }
+    let ctx1 = StackifyCtx { body = ctx0.body; vtypes = wvt_set(ctx0.vtypes, id, vt); scopes = ctx0.scopes; next_scratch = id + 1; has_frame = ctx0.has_frame; frame_base = ctx0.frame_base; slots = ctx0.slots }
     ScratchAlloc { ctx = ctx1; id = id }
+}
+
+/**
+ * sc_set_frame — record `frame_base`/`slots` as this context's own shadow-
+ * stack frame (`has_frame` becomes `true`), without touching the emitted
+ * body bytes (the prologue itself already emitted its own bytes via
+ * `sc_global_get`/`sc_local_tee`/`sc_global_set` before this call records
+ * the frame).
+ *
+ * @param StackifyCtx ctx  the context to extend
+ * @param u32 frame_base  the scratch local holding this call's frame base
+ * @param WasmSlotTable slots  the function's whole `LAlloca` frame layout
+ * @return StackifyCtx  the frame-recording context
+ */
+fn sc_set_frame(ctx: StackifyCtx, frame_base: u32, slots: WasmSlotTable) -> StackifyCtx {
+    StackifyCtx { body = ctx.body; vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = true; frame_base = frame_base; slots = slots }
+}
+
+/**
+ * wasm_align_up — round `x` up to the next multiple of `a` (the shadow-
+ * stack frame-slot packing step, mirroring `encode_arm64.tks`'s own
+ * `align_up`, PARALLELED rather than reused per the wasm-specific
+ * discipline, `backend-c1-wasm.md` §1.3). A no-op when `a` is `0`/`1`.
+ *
+ * @param u32 x  the value to round
+ * @param u32 a  the alignment (a power of two, or 0/1 for none)
+ * @return u32  the least multiple of `a` not less than `x`
+ */
+fn wasm_align_up(x: u32, a: u32) -> u32 {
+    if a <= 1 { return x }
+    (((x + a) - (1 to u32)) / a) * a
+}
+
+/**
+ * wasm_align_down_i32 — append the `i32.and`-with-a-negative-power-of-two-
+ * mask idiom that rounds the `i32` value currently on the operand stack DOWN
+ * to a multiple of `align` (`x & -align` — the two's-complement identity `-a
+ * == ~(a-1)` for a power-of-two `a`, §6.1's "`align_down(SP - bytes,
+ * align)`"). A no-op when `align` is `0`/`1` (mirrors `wasm_align_up`'s own
+ * guard).
+ *
+ * @param StackifyCtx ctx0  the context to extend (a value already on the
+ *                          operand stack)
+ * @param u32 align  the alignment to round down to
+ * @return StackifyCtx  the advanced context
+ */
+fn wasm_align_down_i32(ctx0: StackifyCtx, align: u32) -> StackifyCtx {
+    if align <= 1 { return ctx0 }
+    let ctx1 = sc_sleb(sc_byte(ctx0, 0x41 to byte), -(align to i64))
+    sc_byte(ctx1, 0x71 to byte)
+}
+
+/**
+ * inst_is_alloca — whether `inst` is an `LAlloca` (the frame-layout
+ * pre-scan's own per-instruction test, mirrors `encode_arm64.tks`'s
+ * `inst_is_call`/`inst_is_ret`).
+ *
+ * @param LInst inst  the instruction to test
+ * @return bool  true iff `inst.op` is `LAlloca`
+ */
+fn inst_is_alloca(inst: lir::LInst) -> bool {
+    match inst.op {
+        lir::LAlloca => true
+        _ => false
+    }
+}
+
+/**
+ * alloca_of — `inst`'s own `LAlloca` payload (a well-formed-caller
+ * precondition: only ever called on an instruction `inst_is_alloca` already
+ * confirmed); an all-zero placeholder on any other case, so the function
+ * stays total without a caller-facing error.
+ *
+ * @param LInst inst  the instruction (assumed `LAlloca`)
+ * @return LAlloca  its payload, or an all-zero placeholder
+ */
+fn alloca_of(inst: lir::LInst) -> lir::LAlloca {
+    match inst.op {
+        lir::LAlloca as a => a
+        _ => lir::LAlloca { bytes = 0 to u32; align = 1 to u32 }
+    }
+}
+
+/**
+ * collect_alloca_insts — every `LAlloca` instruction in `f`, in block-array/
+ * instruction order (a deterministic, if not necessarily CFG-traversal-
+ * order, scan — sufficient because each slot is keyed by its own VReg id,
+ * §the `WasmSlotTable` doc, not by scan position).
+ *
+ * @param LFunc f  the function to scan
+ * @return []LInst  every `LAlloca` instruction found, in scan order
+ */
+fn collect_alloca_insts(f: lir::LFunc) -> []lir::LInst {
+    mut out: []lir::LInst = teko::list::empty()
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let insts = f.blocks[bi].insts
+        mut ii: u64 = 0
+        loop {
+            if ii >= insts.len { break }
+            if inst_is_alloca(insts[ii]) { out = teko::list::push(out, insts[ii]) }
+            ii++
+        }
+        bi++
+    }
+    out
+}
+
+/**
+ * WasmFrameLayout — one function's whole static shadow-stack frame
+ * (`compute_wasm_frame_layout`): every `LAlloca` site's own frame-base-
+ * relative offset (`WasmSlotTable`), the total frame size the ONE prologue
+ * bump reserves, and the frame's own alignment (the largest `align` among
+ * its slots — the standard "align the whole frame to its most-aligned
+ * member" packing rule).
+ */
+type WasmFrameLayout = struct {
+    /**
+     * slots — every `LAlloca` VReg's own frame-base-relative offset.
+     */
+    slots: WasmSlotTable
+    /**
+     * frame_size — the total frame byte size (the prologue's `SP -=
+     * frame_size`), rounded up to `frame_align`.
+     */
+    frame_size: u32
+    /**
+     * frame_align — the largest `align` among the function's own `LAlloca`
+     * sites (`1` when the list is empty — never read in that case, since
+     * `stackify_control` skips the whole prologue).
+     */
+    frame_align: u32
+}
+
+/**
+ * compute_wasm_frame_layout — lay out `allocas` bottom-up (`wasm_align_up`
+ * between consecutive slots, exactly mirroring `encode_arm64.tks`'s own
+ * `compute_slot_offsets`): every Teko `LAlloca` carries a compile-time-
+ * constant `bytes`/`align` (no VLA), so the WHOLE function's frame can be
+ * sized and packed ONCE, ahead of lowering — the design that keeps a loop-
+ * body `LAlloca` correct (its slot is FIXED across iterations, never a
+ * fresh runtime bump per pass, the `WasmSlotTable` doc's own rationale).
+ *
+ * @param []LInst allocas  every `LAlloca` instruction in the function
+ *                         (`collect_alloca_insts`)
+ * @return WasmFrameLayout  the packed per-slot offsets + the frame's own
+ *                           total size/alignment
+ */
+fn compute_wasm_frame_layout(allocas: []lir::LInst) -> WasmFrameLayout {
+    mut t = wst_empty()
+    mut running: u32 = 0
+    mut max_align: u32 = 1
+    mut i: u64 = 0
+    loop {
+        if i >= allocas.len { break }
+        let a = alloca_of(allocas[i])
+        let at = wasm_align_up(running, a.align)
+        t = wst_set(t, allocas[i].result, at)
+        running = at + a.bytes
+        if a.align > max_align { max_align = a.align }
+        i++
+    }
+    WasmFrameLayout { slots = t; frame_size = wasm_align_up(running, max_align); frame_align = max_align }
+}
+
+/**
+ * emit_frame_prologue — reserve a fresh scratch local (`frame_base`) and
+ * emit the shadow-stack prologue that fills it: `global.get $SP; i32.const
+ * frame_size; i32.sub; [align_down]; local.tee $frame_base; global.set $SP`
+ * (`backend-c1-wasm.md` §6.1's shadow-stack bump, realized ONCE per call
+ * rather than once per `LAlloca` site — the task's own "prólogo/epílogo de
+ * função ajustam o SP" shape). Every individual `LAlloca` site
+ * (`stackify_alloca`) then just adds its own precomputed offset to
+ * `frame_base` — pure compile-time-constant arithmetic, no further `SP`
+ * mutation.
+ *
+ * @param StackifyCtx ctx0  the context to extend (BEFORE any body lowering)
+ * @param WasmFrameLayout layout  the function's whole frame layout
+ * @return StackifyCtx  the advanced, frame-recording context
+ */
+fn emit_frame_prologue(ctx0: StackifyCtx, layout: WasmFrameLayout) -> StackifyCtx {
+    let reserved = sc_alloc_scratch(ctx0, wasm_vt_i32())
+    let ctx1 = sc_global_get(reserved.ctx, wasm_sp_global_index())
+    let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), layout.frame_size to i64)
+    let ctx3 = sc_byte(ctx2, 0x6B to byte)
+    let ctx4 = wasm_align_down_i32(ctx3, layout.frame_align)
+    let ctx5 = sc_local_tee(ctx4, reserved.id)
+    let ctx6 = sc_global_set(ctx5, wasm_sp_global_index())
+    sc_set_frame(ctx6, reserved.id, layout.slots)
+}
+
+/**
+ * emit_frame_epilogue — restore `SP` from `frame_base` (`local.get
+ * $frame_base; global.set $SP`) before every `LRet` — a no-op when the
+ * function reserves no frame (`!ctx0.has_frame`). Required regardless of
+ * loops: without it, every REPEATED CALL to the same function would bump
+ * `SP` again without ever giving the space back, eventually exhausting the
+ * shadow-stack region.
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @return StackifyCtx  the advanced context (unchanged when frameless)
+ */
+fn emit_frame_epilogue(ctx0: StackifyCtx) -> StackifyCtx {
+    if !ctx0.has_frame { return ctx0 }
+    let ctx1 = sc_local_get(ctx0, ctx0.frame_base)
+    sc_global_set(ctx1, wasm_sp_global_index())
 }
 
 /**
@@ -1113,27 +1492,31 @@ fn stackify_param(ctx0: StackifyCtx, f: lir::LFunc, inst: lir::LInst, p: lir::LP
 }
 
 /**
- * stackify_ret — the `LRet` lowering: for a value-carrying return, push the
- * returned VReg's local then `return` (`0x0F`); a void return emits `return`
- * alone. `return` is used unconditionally (rather than relying on the
+ * stackify_ret — the `LRet` lowering: restore `SP` first when the function
+ * reserves a shadow-stack frame (`emit_frame_epilogue` — a no-op
+ * otherwise), then for a value-carrying return push the returned VReg's
+ * local, then `return` (`0x0F`); a void return emits `return` alone.
+ * `return` is used unconditionally (rather than relying on the
  * fall-off-the-end-of-the-function form) so the lowering is correct
- * regardless of `LRet`'s position in the instruction stream.
+ * regardless of `LRet`'s position in the instruction stream — and every
+ * function-exit path is an `LRet` (`backend-c1-wasm.md` §1), so this is the
+ * ONLY site the epilogue needs.
  *
  * @param StackifyCtx ctx0  the context to extend
  * @param LRet r  the return op
  * @return StackifyCtx  the advanced context
  */
 fn stackify_ret(ctx0: StackifyCtx, r: lir::LRet) -> StackifyCtx {
-    let ctx1 = if r.has_value { sc_local_get(ctx0, r.value) } else { ctx0 }
+    let restored = emit_frame_epilogue(ctx0)
+    let ctx1 = if r.has_value { sc_local_get(restored, r.value) } else { restored }
     sc_byte(ctx1, 0x0F to byte)
 }
 
 /**
  * stackify_field_addr — the `LFieldAddr` lowering: `local.get $base;
  * i32.const offset; i32.add; local.set $r` — pure `i32` (`Ptr`) arithmetic,
- * no linear-memory layout knowledge needed (unlike `LAlloca`/`LGlobalAddr`,
- * this op only ever adds a compile-time-constant byte offset onto an
- * already-computed address).
+ * no linear-memory layout knowledge needed (this op only ever adds a
+ * compile-time-constant byte offset onto an already-computed address).
  *
  * @param StackifyCtx ctx0  the context to extend
  * @param LInst inst  the enclosing instruction (its result VReg)
@@ -1143,6 +1526,30 @@ fn stackify_ret(ctx0: StackifyCtx, r: lir::LRet) -> StackifyCtx {
 fn stackify_field_addr(ctx0: StackifyCtx, inst: lir::LInst, fa: lir::LFieldAddr) -> StackifyCtx {
     let ctx1 = sc_local_get(ctx0, fa.base)
     let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), fa.offset to i64)
+    let ctx3 = sc_byte(ctx2, 0x6A to byte)
+    let ctx4 = sc_local_set(ctx3, inst.result)
+    sc_set_vtype(ctx4, inst.result, wasm_vt_i32())
+}
+
+/**
+ * stackify_alloca — the `LAlloca` lowering: `local.get $frame_base;
+ * i32.const offset; i32.add; local.set $r`, where `offset` is this
+ * instruction's OWN precomputed frame-base-relative slot (`ctx0.slots`,
+ * `compute_wasm_frame_layout`) — pure compile-time-constant arithmetic, the
+ * SAME shape as `stackify_field_addr`. The actual `SP` reservation already
+ * happened once, in the function's own `emit_frame_prologue`; this site
+ * never mutates `SP` itself (§6.1, the `WasmSlotTable` doc's loop-safety
+ * rationale).
+ *
+ * @param StackifyCtx ctx0  the context to extend (`has_frame` already
+ *                          established by `stackify_control`)
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @return StackifyCtx  the advanced context
+ */
+fn stackify_alloca(ctx0: StackifyCtx, inst: lir::LInst) -> StackifyCtx {
+    let off = wst_get(ctx0.slots, inst.result)
+    let ctx1 = sc_local_get(ctx0, ctx0.frame_base)
+    let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), off to i64)
     let ctx3 = sc_byte(ctx2, 0x6A to byte)
     let ctx4 = sc_local_set(ctx3, inst.result)
     sc_set_vtype(ctx4, inst.result, wasm_vt_i32())
@@ -1214,22 +1621,35 @@ pub type WasmCallTarget = struct {
 
 /**
  * WasmSymbolTable — a caller-supplied resolver mapping an already-mangled
- * `LCall.symbol` to its `WasmCallTarget`. Resolving every function/import in
- * a whole program to its index is module-level "link/dispatch" work
- * (`backend-c1-wasm.md` C1-5); this slice only needs to TRANSLATE a call
- * instruction given an already-resolved target, so the table is built and
- * threaded in by the caller rather than derived here.
+ * `LCall.symbol` to its `WasmCallTarget`, AND an already-laid-out
+ * `LGlobalAddr.symbol` to its linear-memory offset (C1-4, `wasm_layout_
+ * rodata`). Resolving every function/import/rodata symbol in a whole
+ * program to its final index/offset is module-level "link/dispatch" work
+ * (`backend-c1-wasm.md` C1-5); this slice only needs to TRANSLATE a call or
+ * global-address instruction given an already-resolved target, so the
+ * table is built and threaded in by the caller rather than derived here.
  */
 pub type WasmSymbolTable = struct {
     /**
-     * symbols — the registered already-mangled symbols, parallel to
+     * symbols — the registered already-mangled call symbols, parallel to
      * `targets`.
      */
     symbols: []str
     /**
-     * targets — each symbol's resolved call target, parallel to `symbols`.
+     * targets — each call symbol's resolved call target, parallel to
+     * `symbols`.
      */
     targets: []WasmCallTarget
+    /**
+     * data_symbols — the registered rodata/global symbols, parallel to
+     * `data_offsets`.
+     */
+    data_symbols: []str
+    /**
+     * data_offsets — each data symbol's resolved linear-memory offset,
+     * parallel to `data_symbols`.
+     */
+    data_offsets: []u32
 }
 
 /**
@@ -1238,7 +1658,7 @@ pub type WasmSymbolTable = struct {
  * @return WasmSymbolTable  the empty table
  */
 pub fn wasm_symtab_empty() -> WasmSymbolTable {
-    WasmSymbolTable { symbols = teko::list::empty(); targets = teko::list::empty() }
+    WasmSymbolTable { symbols = teko::list::empty(); targets = teko::list::empty(); data_symbols = teko::list::empty(); data_offsets = teko::list::empty() }
 }
 
 /**
@@ -1251,7 +1671,20 @@ pub fn wasm_symtab_empty() -> WasmSymbolTable {
  * @return WasmSymbolTable  the extended table
  */
 pub fn wasm_symtab_add(t: WasmSymbolTable, symbol: str, target: WasmCallTarget) -> WasmSymbolTable {
-    WasmSymbolTable { symbols = teko::list::push(t.symbols, symbol); targets = teko::list::push(t.targets, target) }
+    WasmSymbolTable { symbols = teko::list::push(t.symbols, symbol); targets = teko::list::push(t.targets, target); data_symbols = t.data_symbols; data_offsets = t.data_offsets }
+}
+
+/**
+ * wasm_symtab_add_data — register `symbol`'s linear-memory offset (a
+ * `LGlobalAddr` target), returning the extended table.
+ *
+ * @param WasmSymbolTable t  the table to extend
+ * @param str symbol  the rodata/global symbol to register
+ * @param u32 offset  its linear-memory offset
+ * @return WasmSymbolTable  the extended table
+ */
+pub fn wasm_symtab_add_data(t: WasmSymbolTable, symbol: str, offset: u32) -> WasmSymbolTable {
+    WasmSymbolTable { symbols = t.symbols; targets = t.targets; data_symbols = teko::list::push(t.data_symbols, symbol); data_offsets = teko::list::push(t.data_offsets, offset) }
 }
 
 /**
@@ -1272,6 +1705,27 @@ fn wasm_resolve_call(t: WasmSymbolTable, symbol: str) -> WasmCallTarget | error 
         i++
     }
     error { message = $"stackify: unresolved call symbol '{symbol}' — the caller must register it in the WasmSymbolTable first (link/dispatch is C1-5 territory)" }
+}
+
+/**
+ * wasm_resolve_data — the linear-memory offset registered under `symbol`,
+ * or a NAMED error when it was never registered (mirrors `wasm_resolve_
+ * call`'s own "the caller owed us this" boundary — laying out every
+ * program's rodata is C1-4's `wasm_layout_rodata`/C1-5's module-assembly
+ * job, not this per-instruction slice's).
+ *
+ * @param WasmSymbolTable t  the resolver table to search
+ * @param str symbol  the rodata/global symbol to resolve
+ * @return u32 | error  the resolved offset, or a NAMED error
+ */
+fn wasm_resolve_data(t: WasmSymbolTable, symbol: str) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= t.data_symbols.len { break }
+        if t.data_symbols[i] == symbol { return t.data_offsets[i] }
+        i++
+    }
+    error { message = $"stackify: unresolved data symbol '{symbol}' — the caller must register it in the WasmSymbolTable first (rodata layout is C1-4/C1-5 territory)" }
 }
 
 /**
@@ -1313,15 +1767,36 @@ fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, 
 }
 
 /**
+ * stackify_global_addr — the `LGlobalAddr` lowering: `i32.const offset;
+ * local.set $r`, where `offset` is `g.symbol`'s already laid-out linear-
+ * memory offset (`wasm_resolve_data`, C1-4's `wasm_layout_rodata`) — the
+ * wasm analog of arm64's `ADRP+ADD` symbol-address pair, but a single
+ * instruction since a wasm `Ptr` is already the flat linear-memory address
+ * (`backend-c1-wasm.md` §6.1 — no page-relative relocation needed).
+ *
+ * @param StackifyCtx ctx0  the context to extend
+ * @param WasmSymbolTable symbols  the data-symbol resolver
+ * @param LInst inst  the enclosing instruction (its result VReg)
+ * @param LGlobalAddr g  the global-address op
+ * @return StackifyCtx | error  the advanced context, or `wasm_resolve_
+ *                              data`'s propagated unresolved-symbol error
+ */
+fn stackify_global_addr(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, g: lir::LGlobalAddr) -> StackifyCtx | error {
+    let off = match wasm_resolve_data(symbols, g.symbol) { u32 as o => o; error as e => return e }
+    let ctx1 = sc_sleb(sc_byte(ctx0, 0x41 to byte), off to i64)
+    let ctx2 = sc_local_set(ctx1, inst.result)
+    sc_set_vtype(ctx2, inst.result, wasm_vt_i32())
+}
+
+/**
  * stackify_inst — the per-`LOp` dispatch for the STRAIGHT-LINE subset: a
  * total match over the closed 16-case `LOp` alphabet (`backend-c1-wasm.md`
  * §1). `LConstInt`/`LConstFloat`/`LBin`/`LUn`/`LParam`/`LRet`/`LFieldAddr`/
- * `LLoad`/`LStore`/`LCall` lower to real wasm bytes here; `LAlloca`/
- * `LGlobalAddr` (the shadow-stack/rodata linear-memory layout, C1-4) and
- * `LCallIndirect`/`LFuncAddr` (the funcref table, C1-4/C1-5) are NAMED
- * honest-stops naming the slice that owns them. `LRet`/`LJump`/`LBranch`
- * are terminators — CFGStackify (`stackify_control`) dispatches them
- * itself (`render_terminator`/`render_jump_terminator`/`render_branch_
+ * `LLoad`/`LStore`/`LCall`/`LAlloca`/`LGlobalAddr` lower to real wasm bytes
+ * here; `LCallIndirect`/`LFuncAddr` (the funcref table, C1-4/C1-5) are the
+ * remaining NAMED honest-stops. `LRet`/`LJump`/`LBranch` are terminators —
+ * CFGStackify (`stackify_control`) dispatches them itself
+ * (`render_terminator`/`render_jump_terminator`/`render_branch_
  * terminator`, §3), reading the CFG/scope context this per-instruction
  * dispatcher does not carry, so reaching any of them here is an internal
  * misuse (a caller handing a terminator to the straight-line lowerer
@@ -1331,7 +1806,8 @@ fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, 
  *
  * @param StackifyCtx ctx  the context to extend
  * @param LFunc f  the enclosing function (`LParam` needs its `param_types`)
- * @param WasmSymbolTable symbols  the call-target resolver (`LCall`)
+ * @param WasmSymbolTable symbols  the call-target/data-symbol resolver
+ *                                 (`LCall`/`LGlobalAddr`)
  * @param LInst inst  the instruction to lower
  * @return StackifyCtx | error  the advanced context, or a propagated/named
  *                              honest-stop
@@ -1346,11 +1822,11 @@ fn stackify_inst(ctx: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, inst
         lir::LRet => error { message = "stackify: a return terminator must be rendered by stackify_control's terminator dispatch (render_terminator), not the per-instruction stackify_inst — internal misuse" }
         lir::LJump => error { message = "stackify: a jump terminator must be rendered by stackify_control's terminator dispatch (render_jump_terminator), not the per-instruction stackify_inst — internal misuse" }
         lir::LBranch => error { message = "stackify: a branch terminator must be rendered by stackify_control's terminator dispatch (render_branch_terminator), not the per-instruction stackify_inst — internal misuse" }
-        lir::LAlloca => error { message = "stackify: C1-alloca — a stack allocation needs the shadow-stack SP global + linear-memory layout, not yet implemented (C1-4)" }
+        lir::LAlloca => stackify_alloca(ctx, inst)
         lir::LFieldAddr as fa => stackify_field_addr(ctx, inst, fa)
         lir::LLoad as l => stackify_load(ctx, inst, l)
         lir::LStore as s => stackify_store(ctx, s)
-        lir::LGlobalAddr => error { message = "stackify: C1-globaladdr — a rodata/global address needs the data-section layout, not yet implemented (C1-4)" }
+        lir::LGlobalAddr as g => stackify_global_addr(ctx, symbols, inst, g)
         lir::LCallIndirect => error { message = "stackify: C1-callindirect — an indirect call needs the wasm funcref table, not yet implemented (C1-4/C1-5)" }
         lir::LFuncAddr => error { message = "stackify: C1-funcaddr — a function-value address needs the wasm funcref table, not yet implemented (C1-4/C1-5)" }
         lir::LCall as c => stackify_call(ctx, symbols, inst, c)
@@ -2629,10 +3105,14 @@ fn render_region(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, b: u32) -> S
  * `StructuredFunc`/`WasmMarker` representation would be pure ceremony (the
  * M.1 "no unreachable complexity" discipline) — `render_region` emits
  * final wasm bytes directly, threading the SAME scope-stack/valtype state
- * `stackify_func`'s straight-line lowering already threads.
+ * `stackify_func`'s straight-line lowering already threads. When `f`
+ * contains at least one `LAlloca`, the shadow-stack prologue
+ * (`emit_frame_prologue`) is emitted FIRST, ahead of the entry block's own
+ * bytes (C1-4, §6.1) — a frameless function pays nothing.
  *
  * @param LFunc f  the function to lower (its `blocks` a reducible CFG)
- * @param WasmSymbolTable symbols  the call-target resolver (`LCall`)
+ * @param WasmSymbolTable symbols  the call-target/data-symbol resolver
+ *                                 (`LCall`/`LGlobalAddr`)
  * @return StackifyCtx | error  the fully-rendered context (its `body` NOT
  *                              yet closed by the function's own trailing
  *                              `end`), or a NAMED honest-stop
@@ -2650,7 +3130,9 @@ pub fn stackify_control(f: lir::LFunc, symbols: WasmSymbolTable) -> StackifyCtx 
         return err_irreducible("a multi-entry loop (a back-edge whose target does not dominate its source)")
     }
     let env = RenderEnv { func = f; blocks = blocks; symbols = symbols; cfg = cfg }
-    let ctx0 = StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = f.next_vreg }
+    let seed = StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = f.next_vreg; has_frame = false; frame_base = 0 to u32; slots = wst_empty() }
+    let allocas = collect_alloca_insts(f)
+    let ctx0 = if allocas.len == 0 { seed } else { emit_frame_prologue(seed, compute_wasm_frame_layout(allocas)) }
     render_region(ctx0, env, edge_stop_none(), entry)
 }
 
@@ -2739,4 +3221,101 @@ pub fn stackify_func(f: lir::LFunc, calls: WasmSymbolTable) -> WasmFuncBody | er
     let body = teko::list::push(done.body, 0x0B to byte)
     let groups = wasm_local_groups_of(done.vtypes, f.n_params, done.next_scratch)
     WasmFuncBody { local_groups = groups; body = body }
+}
+
+/**
+ * WasmRodataLayout — the module's whole rodata assembly (C1-4, §6.1's
+ * "rodata at a fixed low base"): every `LRodata` entry placed back-to-back
+ * starting at `base` as ONE concatenated data segment (`objfile_wasm.tks`'s
+ * `WasmDataSegment`), plus the per-symbol offset table `LGlobalAddr`
+ * resolves against.
+ *
+ * @since #389 C1-4
+ */
+pub type WasmRodataLayout = struct {
+    /**
+     * segment — the concatenated rodata bytes as one active data segment
+     * placed at `base`.
+     */
+    segment: WasmDataSegment
+    /**
+     * symbols — each interned `LRodata` entry's own symbol, parallel to
+     * `offsets`.
+     */
+    symbols: []str
+    /**
+     * offsets — each entry's own absolute linear-memory offset, parallel
+     * to `symbols`.
+     */
+    offsets: []u32
+    /**
+     * end — one past the last rodata byte (`base` plus the total rodata
+     * size) — the caller's shadow-stack region starts here (§6.1).
+     */
+    end: u32
+}
+
+/**
+ * wasm_layout_rodata — place every `LRodata` entry back-to-back starting at
+ * `base`: string bytes carry no alignment requirement beyond `1`, so no
+ * padding is needed between entries. Mirrors `encode_arm64.tks`'s
+ * `encode_rodata`, PARALLELED rather than reused (§1.3) — wasm needs no
+ * per-entry symbol TABLE (no linker to resolve against at this slice), just
+ * the offset table this per-instruction `LGlobalAddr` lowering reads.
+ *
+ * @param []LRodata rodata  the module's interned rodata table
+ * @param u32 base  the linear-memory offset the first byte lands at
+ * @return WasmRodataLayout  the data segment + the symbol->offset table
+ */
+pub fn wasm_layout_rodata(rodata: []lir::LRodata, base: u32) -> WasmRodataLayout {
+    mut bytes: []byte = teko::list::empty()
+    mut symbols: []str = teko::list::empty()
+    mut offsets: []u32 = teko::list::empty()
+    mut off = base
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        let rd = rodata[i]
+        symbols = teko::list::push(symbols, rd.symbol)
+        offsets = teko::list::push(offsets, off)
+        bytes = append_bytes(bytes, rd.bytes)
+        off = off + (rd.bytes.len to u32)
+        i++
+    }
+    WasmRodataLayout { segment = WasmDataSegment { offset = base; bytes = bytes }; symbols = symbols; offsets = offsets; end = off }
+}
+
+/**
+ * wasm_symtab_add_rodata — register every `WasmRodataLayout` entry's own
+ * symbol/offset into `t` in one pass (`wasm_symtab_add_data`), so a caller
+ * assembling a module registers a whole rodata table's worth of
+ * `LGlobalAddr` targets in one call.
+ *
+ * @param WasmSymbolTable t  the table to extend
+ * @param WasmRodataLayout layout  the laid-out rodata (`wasm_layout_rodata`)
+ * @return WasmSymbolTable  the extended table
+ */
+pub fn wasm_symtab_add_rodata(t: WasmSymbolTable, layout: WasmRodataLayout) -> WasmSymbolTable {
+    mut out = t
+    mut i: u64 = 0
+    loop {
+        if i >= layout.symbols.len { break }
+        out = wasm_symtab_add_data(out, layout.symbols[i], layout.offsets[i])
+        i++
+    }
+    out
+}
+
+/**
+ * wasm_honest_globals — the module-level `C1-globals` honest-stop (mirrors
+ * `encode_arm64.tks`'s `honest_globals`, PARALLELED not reused): top-level
+ * `LGlobal` data has no wasm lowering in the MVP (the N2 subset lowers
+ * none). A future module assembler (C1-5's `emit_native_wasm`) calls this
+ * when `LModule.globals` is non-empty, mirroring A4-4's own `if m.globals.
+ * len > 0 { return honest_globals() }` guard.
+ *
+ * @return error  the named `C1-globals` honest-stop
+ */
+pub fn wasm_honest_globals() -> error {
+    error { message = "stackify: C1-globals — top-level LGlobal data has no wasm lowering yet (the N2 subset lowers none), mirrors A4-globals" }
 }
