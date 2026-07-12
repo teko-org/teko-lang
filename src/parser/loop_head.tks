@@ -241,10 +241,50 @@ fn loop_range_init(name: str, lo: Expr, hi: Expr, has_type: bool, type_ann: Type
 }
 
 /**
- * loop_range_body — fold a range head onto the front of the user body: a guarded step
- * `if !_first { i += 1 }` at the TOP (so `continue` runs it), the `_first = false` reset, and the
- * captured-endpoint guard `if !(i < _hi) { break }` (`<=` for `..=`), then the user statements
- * (#517, §5.2).
+ * loop_append_all — append every statement of `src` onto `dst`, preserving order (#517).
+ *
+ * @param dst  the accumulator list
+ * @param src  the statements to append
+ * @return     `dst` with `src` appended
+ */
+fn loop_append_all(dst: []Statement, src: []Statement) -> []Statement {
+    mut out = dst
+    mut i: u64 = 0
+    loop {
+        if i >= src.len { break }
+        out = teko::list::push(out, src[i])
+        i++
+    }
+    out
+}
+
+/**
+ * loop_first_guarded_body — the shared range/3-part body fold: a guarded step `if !_first { <step> }`
+ * at the TOP (so `continue` runs it), the `_first = false` reset, and the exit guard
+ * `if !<guard_cond> { break }`, then the user statements. The range head passes `i += 1` / `i < _hi`;
+ * the 3-part head passes the user's step / condition (§5.2/§5.3, #517).
+ *
+ * @param step        the guarded step statement (run at the TOP from iteration 2 on)
+ * @param guard_cond  the loop-continues condition (broken when false)
+ * @param first_name  the first-iteration temp name
+ * @param body        the parsed user body
+ * @param line        the loop keyword's source line
+ * @param col         the loop keyword's source column
+ * @return            the folded body statement list
+ */
+fn loop_first_guarded_body(step: Statement, guard_cond: Expr, first_name: str, body: []Statement, line: u32, col: u32) -> []Statement {
+    let guarded_step = loop_if_then(loop_not(loop_var(first_name, line, col), line, col), step, line, col)
+    let clear_first = loop_assign_simple(first_name, lexer::TokenKind::Assign, loop_bool(false, line, col))
+    let guard = loop_cond_break(guard_cond, line, col)
+    mut full: []Statement = teko::list::push(teko::list::empty(), guarded_step)
+    full = teko::list::push(full, clear_first)
+    full = teko::list::push(full, guard)
+    loop_append_all(full, body)
+}
+
+/**
+ * loop_range_body — fold a range head onto the front of the user body: a guarded step `i += 1` and
+ * the captured-endpoint guard `i < _hi` (`<=` for `..=`), via `loop_first_guarded_body` (#517, §5.2).
  *
  * @param name       the counter name
  * @param hi_name    the endpoint temp name
@@ -257,19 +297,8 @@ fn loop_range_init(name: str, lo: Expr, hi: Expr, has_type: bool, type_ann: Type
  */
 fn loop_range_body(name: str, hi_name: str, first_name: str, inclusive: bool, body: []Statement, line: u32, col: u32) -> []Statement {
     let step = loop_assign_simple(name, lexer::TokenKind::PlusEq, loop_one(line, col))
-    let guarded_step = loop_if_then(loop_not(loop_var(first_name, line, col), line, col), step, line, col)
-    let clear_first = loop_assign_simple(first_name, lexer::TokenKind::Assign, loop_bool(false, line, col))
-    let guard = loop_cond_break(loop_less(loop_var(name, line, col), loop_var(hi_name, line, col), inclusive, line, col), line, col)
-    mut full = teko::list::push(teko::list::empty(), guarded_step)
-    full = teko::list::push(full, clear_first)
-    full = teko::list::push(full, guard)
-    mut i: u64 = 0
-    loop {
-        if i >= body.len { break }
-        full = teko::list::push(full, body[i])
-        i++
-    }
-    full
+    let guard_cond = loop_less(loop_var(name, line, col), loop_var(hi_name, line, col), inclusive, line, col)
+    loop_first_guarded_body(step, guard_cond, first_name, body, line, col)
 }
 
 /**
@@ -303,9 +332,46 @@ fn parse_loop_range(tokens: []lexer::Token, tgt: Parsed<BindTarget>, ann: Annota
 }
 
 /**
+ * parse_loop_three_part — `[LABEL:] loop mut i [: T] = <init> ; <cond> ; <step> { B }` (§5.3): the
+ * counter starts at `<init>`, `<step>` (any statement) runs guarded at the TOP so `continue` runs
+ * it, and `<cond>` is RE-EVALUATED every iteration (C-`for` semantics — not captured). Desugars to
+ * `init = [mut i = <init>, mut _first = true]` and a `loop_first_guarded_body` fold (#517).
+ *
+ * @param tokens    the token stream
+ * @param tgt       the parsed bind-target (must be a SimpleName)
+ * @param ann       the parsed `: T` annotation (applied to the counter)
+ * @param init_pos  the position of the init expression (just past `=`)
+ * @param label     the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @param line      the loop keyword's source line
+ * @param col       the loop keyword's source column
+ * @return          the parsed loop statement, or a parse error
+ */
+fn parse_loop_three_part(tokens: []lexer::Token, tgt: Parsed<BindTarget>, ann: Annotation, init_pos: u64, label: str, line: u32, col: u32) -> Parsed<Statement> | error {
+    let a = match parse_expr(tokens, init_pos) { Parsed<Expr> as x => x; error as e => return e }
+    if !is_kind_at(tokens, a.next, lexer::TokenKind::Semicolon) {
+        return err_at(tokens, a.next, "expected ';' after the loop init")
+    }
+    let cond = match parse_expr(tokens, a.next + 1) { Parsed<Expr> as x => x; error as e => return e }
+    if !is_kind_at(tokens, cond.next, lexer::TokenKind::Semicolon) {
+        return err_at(tokens, cond.next, "expected ';' after the loop condition")
+    }
+    let step = match parse_statement(tokens, cond.next + 1) { Parsed<Statement> as x => x; error as e => return e }
+    if !is_kind_at(tokens, step.next, lexer::TokenKind::LBrace) {
+        return err_at(tokens, step.next, "expected '{' after the loop step")
+    }
+    let name = match tgt.node { SimpleName as sn => sn.name; _ => return err_at(tokens, init_pos, "a 3-part loop binds a single counter name, not a destructure") }
+    let blk = match parse_block(tokens, step.next) { ParsedList<Statement> as x => x; error as e => return e }
+    let first_name = loop_temp("first", line, col)
+    mut init: []Statement = teko::list::push(teko::list::empty(), loop_counter_binding(name, a.node, ann.has_type, ann.type_ann))
+    init = teko::list::push(init, loop_mut_binding(first_name, loop_bool(true, line, col)))
+    let body = loop_first_guarded_body(step.node, cond.node, first_name, blk.items, line, col)
+    Parsed<Statement> { node = LoopStmt { label = label; init = init; body = body }; next = blk.next }
+}
+
+/**
  * parse_loop_binding — parse a `mut <bind-target> [: T]` loop head, then dispatch on the separator:
  * `in` with a `..`/`..=` iterable is a range (§5.2); any other `in` is a for-each (a later crumb);
- * `=` is a 3-part head (a later crumb). Binding is `mut` only (#517).
+ * `=` is a 3-part head (§5.3, `parse_loop_three_part`). Binding is `mut` only (#517).
  *
  * @param tokens   the token stream
  * @param mut_pos  the position of the `mut` keyword (just past `loop`)
@@ -329,7 +395,7 @@ fn parse_loop_binding(tokens: []lexer::Token, mut_pos: u64, label: str, line: u3
         return err_at(tokens, after_in, "loop for-each forms land in a later step")
     }
     if is_kind_at(tokens, ann.next, lexer::TokenKind::Assign) {
-        return err_at(tokens, ann.next, "loop 3-part forms land in a later step")
+        return parse_loop_three_part(tokens, tgt, ann, ann.next + 1, label, line, col)
     }
     err_at(tokens, ann.next, "expected `in` or `;` after a loop binding")
 }

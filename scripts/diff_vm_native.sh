@@ -120,6 +120,7 @@ COMPILE_FAIL=(
     free_field_extract_rejected
     loop_label_lowercase
     loop_range_counter_leak
+    loop_three_part_nonbool_cond
 )
 
 is_expected_fail() {
