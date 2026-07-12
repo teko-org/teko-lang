@@ -24,7 +24,7 @@ safe↔unsafe" mandate.
 
 ## 1. Intent
 
-`Ref<T>` is the safe, transparent reference; it never appears as a raw address and it is protected
+The surface `ref T` (internally `Reference{T}`) is the safe, transparent reference; it never appears as a raw address and it is protected
 by the arena/region model (R11) and the spine (A1–A6). `ptr<T>` is the raw C address — nullable,
 untracked, and (per **[PINNED]** ruling 4) **`unsafe`-only**. Between them there must be **exactly
 one, explicit, greppable crossing** — never an implicit coercion. That crossing is Marshall.
@@ -52,9 +52,9 @@ Three boundaries exist in the memory model. Only ONE is Marshall.
 
 | boundary | mechanism | safety | who owns it |
 |---|---|---|---|
-| **valor ↔ Ref** | implicit **bidirectional desugar** (§4.1 ref model): encapsulate on init/attach (R5, copy into arena), descásca on use (type-directed auto-deref §4) | SAFE, invisible | the desugar; the spine |
-| **ptr ↔ Ref** | **MARSHALL** — explicit, named, `unsafe`-gated (`wrap`/`unwrap`, this doc) | UNSAFE crossing; null-checked in | the dev, at the crossing |
-| **value ↔ value** exchange | `teko::marshall::swap<T>` **[PINNED]** — write-through both Refs; never touches a ptr | **SAFE** | the spine (R4 write-through) |
+| **valor ↔ ref** | implicit **bidirectional desugar** (§4.1 ref model): encapsulate on init/attach (R5, copy into arena), descásca on use (type-directed auto-deref §4) | SAFE, invisible | the desugar; the spine |
+| **ptr ↔ ref** | **MARSHALL** — explicit, named, `unsafe`-gated (`wrap`/`unwrap`, this doc) | UNSAFE crossing; null-checked in | the dev, at the crossing |
+| **value ↔ value** exchange | `teko::marshall::swap<T>` **[PINNED]** — write-through both refs; never touches a ptr | **SAFE** | the spine (R4 write-through) |
 
 **[PINNED] ruling 2 — `swap` is a VALUE swap, and it is SAFE.** `swap` lives in the `teko::marshall`
 namespace for discoverability (it is the sanctioned "exchange" primitive, adjacent to rebind
@@ -119,8 +119,8 @@ Every op below lives in the stdlib namespace **`teko::marshall`** (spelling rati
 given as a copy-paste-ready, full-Javadoc Teko signature the implementer adds verbatim. All ops that
 name `ptr`/`uptr` are `unsafe fn` by the §4 gate; `swap` is the sole SAFE member.
 
-**The OPERAND LAW [PINNED, owner 2026-07-13]: only `Ref` or `Ptr` enter Marshall.** Every operand of
-every `teko::marshall` op must already be reference/pointer-typed (`Ref<T>`, `ptr<T>`, `uptr`). Bare
+**The OPERAND LAW [PINNED, owner 2026-07-13]: only `ref` or `ptr` enter Marshall.** Every operand of
+every `teko::marshall` op must already be reference/pointer-typed (`ref T`, `ptr<T>`, `uptr`). Bare
 values — including `mut` lvalues — are compile errors at a marshall call site; **no implicit
 borrow-down (R7/A3) occurs at the Marshall door** (the addressing must pre-exist and be visible —
 the case-C principle). Full statement + fixtures in §5.6.
@@ -143,11 +143,11 @@ the case-C principle). Full statement + fixtures in §5.6.
  */
 ```
 
-### 5.1 `wrap` — raw pointer INTO a safe reference (`ptr<T> -> Ref<T>`) [checked, may panic]
+### 5.1 `wrap` — raw pointer INTO a safe reference (`ptr<T> -> ref T`) [checked, may panic]
 
 The sanctioned crossing OUT of the raw world: takes a raw address the dev asserts is live and hands
-back a spine-tracked `Ref<T>`. **Safety class:** `unsafe fn` (names `ptr<T>`); the *result* is a
-safe `Ref<T>` that legally crosses back to safe code (§2 boundary rule: a safe type may leave an
+back a spine-tracked `ref T` (underlying type `Reference{T}`). **Safety class:** `unsafe fn` (names `ptr<T>`); the *result* is a
+safe `ref T` that legally crosses back to safe code (§2 boundary rule: a safe type may leave an
 `unsafe fn`).
 
 **Checks on entry (the owner's "which are feasible and at what cost"):**
@@ -161,7 +161,7 @@ safe `Ref<T>` that legally crosses back to safe code (§2 boundary rule: a safe 
 ```teko
 /**
  * Wraps a raw `ptr<T>` the caller asserts points at a LIVE `T` into a safe, spine-tracked
- * `Ref<T>` — the sanctioned crossing OUT of the raw pointer world. The pointee type `T` is
+ * `ref T` — the sanctioned crossing OUT of the raw pointer world. The pointee type `T` is
  * checked against the pointer's element type at COMPILE time (a mismatch is a compile error,
  * not a panic); an opaque `ptr` requires `T` be named explicitly at the call. The ONE runtime
  * guard is the R2 non-null invariant: a null `p` PANICS (M.1), because a null `Ref<T>` cannot
@@ -169,44 +169,44 @@ safe `Ref<T>` that legally crosses back to safe code (§2 boundary rule: a safe 
  * returned `Ref<T>` re-enters spine jurisdiction (A1-A6) from the wrap point on.
  *
  * @param ptr<T> p  a raw, non-null address the caller asserts points at a live `T`
- * @return Ref<T>  a safe reference aliasing `*p`
+ * @return ref T  a safe reference aliasing `*p`
  * @throws panic  if `p` is null (the R2 never-null invariant would be violated)
- * @example ref node: Node = teko::marshall::wrap<Node>(raw_node_ptr)
+ * @example ref node: Node = teko::marshall::wrap<Node>(raw_node_ptr)  // result is ref Node
  * @since 0.3.1
  */
-pub unsafe fn wrap<T>(p: ptr<T>) -> Ref<T> {
-    // BLOCKED on the transparent Ref redesign (§4 ref model). Body: null-panic guard, then
-    // reinterpret p as the bare `T *` a Reference<T> already is (zero-cost, §3).
+pub unsafe fn wrap<T>(p: ptr<T>) -> ref T {
+    // BLOCKED on the transparent ref redesign (§4 ref model). Body: null-panic guard, then
+    // reinterpret p as the bare `T *` a Reference{T} already is (zero-cost, §3).
 }
 ```
 
-### 5.2 `unwrap` — safe reference OUT to a raw pointer (`Ref<T> -> ptr<T>`) [unsafe-only]
+### 5.2 `unwrap` — safe reference OUT to a raw pointer (`ref T -> ptr<T>`) [unsafe-only]
 
-The crossing INTO the raw world: extracts the raw address a `Ref<T>` holds. **Safety class:**
+The crossing INTO the raw world: extracts the raw address a `ref T` holds. **Safety class:**
 `unsafe fn`; the *result* is a `ptr<T>`, an unsafe type, so it can be **named only inside unsafe
 context** — safe code cannot hold the result (`marshall_unwrap_in_safe_rejected`).
 
-**Checks:** **NONE, and none possible.** At the instant of extraction a `Ref<T>` is always non-null
+**Checks:** **NONE, and none possible.** At the instant of extraction a `ref T` is always non-null
 and correctly typed, so the `ptr<T>` is trivially valid *now*. The danger is entirely downstream
 (the raw ptr outliving the Ref's arena) — that is the spine's event horizon, owned by `unsafe`.
 Honesty demands we state: `unwrap` is *infallible at the crossing and dangerous forever after*.
 
 ```teko
 /**
- * Extracts the raw `ptr<T>` a `Ref<T>` holds — the crossing INTO the raw pointer world. The
+ * Extracts the raw `ptr<T>` a `ref T` holds — the crossing INTO the raw pointer world. The
  * extraction is infallible: a `Ref<T>` is always non-null and correctly typed, so the yielded
  * `ptr<T>` is valid at the instant of the call. It is `unsafe fn` and yields an `unsafe` type,
  * so safe code cannot hold the result. From this point the spine (A1-A6) no longer tracks the
  * address: keeping `p` past the arena that owns `r`'s pointee is a use-after-free the caller,
  * not the compiler, must prevent.
  *
- * @param Ref<T> r  a safe reference
+ * @param ref T r  a safe reference
  * @return ptr<T>  the raw, non-null address `r` aliases
- * @example let raw: ptr<Node> = teko::marshall::unwrap(node_ref)
+ * @example let raw: ptr<Node> = teko::marshall::unwrap(node_ref)  // result is ptr<Node>
  * @since 0.3.1
  */
 pub unsafe fn unwrap<T>(r: Ref<T>) -> ptr<T> {
-    // BLOCKED on the transparent Ref redesign. Body: reinterpret the Reference<T>'s bare
+    // BLOCKED on the transparent ref redesign. Body: reinterpret the Reference{T}'s bare
     // `T *` as ptr<T> (zero-cost, §3). No guard.
 }
 ```
@@ -217,7 +217,7 @@ pub unsafe fn unwrap<T>(r: Ref<T>) -> ptr<T> {
 
 - A raw `ptr<T>` **is nullable by construction** — it is a raw address, and 0 is a legal bit-pattern.
   This is honest C semantics (M.3): a raw pointer that pretended it could never be null would be a
-  lie. `wrap` is the gate that turns "maybe-null raw address" into "never-null `Ref`".
+  lie. `wrap` is the gate that turns "maybe-null raw address" into "never-null `ref T`".
 - **`ptr<T>?` (Teko's `?`-Optional layered over a raw ptr) is a category error and is REJECTED**
   (`marshall_ptr_optional_rejected`). `?`/`Optional` is a *safe-world* construct with a defined
   sentinel discipline; stacking it on a raw address pretends a safety the raw pointer does not have
@@ -308,7 +308,7 @@ surface token; if the lexer lacks a distinct arrow, it desugars to `(*p).field` 
 ### 5.6 `swap` — the SAFE value exchange [PINNED ruling 2]
 
 Not Marshall proper (never touches `ptr`); the sole SAFE member of the namespace. Swaps the
-*pointed-at values* of two `Ref<T>` via R4 write-through both ways — a target-rebind is structurally
+*pointed-at values* of two `ref T` via R4 write-through both ways — a target-rebind is structurally
 impossible (R4). Runs on the VM **and** native (it is safe), so its fixture is a *differential*
 oracle, unlike every unsafe fixture (native-only). Costs three `T`-copies (temp + two writes);
 acceptable, and honest about the copy (M.5 "you see the copy").
@@ -326,7 +326,7 @@ acceptable, and honest about the copy (M.5 "you see the copy").
  * @param T b  the second reference (write-through target — must ALREADY be a reference)
  * @example ref rx: i64 = x
  * @example ref ry: i64 = y
- * @example teko::marshall::swap(rx, ry)   // operands are Ref<i64> — pre-existing, visible addressing
+ * @example teko::marshall::swap(rx, ry)   // operands are ref i64 — pre-existing, visible addressing
  * @since 0.3.1
  */
 pub fn swap<T>(ref a: T, ref b: T) {
@@ -336,9 +336,9 @@ pub fn swap<T>(ref a: T, ref b: T) {
 }
 ```
 
-**[PINNED] ruling (owner 2026-07-13) — the Marshall OPERAND LAW: only `Ref` or `Ptr` enter
+**[PINNED] ruling (owner 2026-07-13) — the Marshall OPERAND LAW: only `ref` or `ptr` enter
 `teko::marshall`.** Every op in this namespace accepts ONLY reference/pointer-typed operands
-(`Ref<T>`, `ptr<T>`, `uptr`). A bare VALUE — including a `mut` lvalue — is a compile error at a
+(`ref T`, `ptr<T>`, `uptr`). A bare VALUE — including a `mut` lvalue — is a compile error at a
 marshall call site: **no implicit borrow-down (R7/A3) happens at the Marshall door.** The addressing
 must pre-exist and be visible (the case-C principle: `ref` marks addressing); Marshall never
 manufactures a reference from a value silently. Ordinary functions with `ref` params keep R7
@@ -350,7 +350,7 @@ equally rejected (`marshall_swap_on_mut_value_rejected`) — the caller borrows 
 
 ### 5.7 Slices/arrays of pointers — element-wise, in v1
 
-`[]ptr<T>` is an unsafe type (Ptr contagion, §4); `[]Ref<T>` is safe. They share an **identical
+`[]ptr<T>` is an unsafe type (Ptr contagion, §4); `[]ref T` is safe. They share an **identical
 C-representation** (both arrays of `T *`), so a bulk crossing is a null-scan one way and a no-op
 reinterpret the other. v1 ships only the **element-wise** primitives (§5.1/§5.2 applied per element);
 a bulk `wrap_slice`/`unwrap_slice` convenience is deferred and built ON them (it must null-panic each
@@ -359,17 +359,17 @@ element on the way in — no cheaper than the loop). Documented so the implement
 
 ```teko
 /**
- * Wraps every raw pointer in a `[]ptr<T>` into a `[]Ref<T>`, null-checking each element (R2).
+ * Wraps every raw pointer in a `[]ptr<T>` into a `[]ref T`, null-checking each element (R2).
  * DEFERRED to a follow-up: it is pure convenience over per-element `wrap` (§5.1) and no cheaper
  * (each element still null-panics). Listed here so the contract is fixed: it is `unsafe fn`
  * (names `[]ptr<T>`) and PANICS on the first null element.
  *
  * @param []ptr<T> ps  a slice of raw pointers, each asserted live and non-null
- * @return []Ref<T>  a safe slice of references, one per input element
+ * @return []ref T  a safe slice of references, one per input element
  * @throws panic  on the first null element
  * @since 0.3.1
  */
-pub unsafe fn wrap_slice<T>(ps: []ptr<T>) -> []Ref<T> { /* deferred; loop of wrap */ }
+pub unsafe fn wrap_slice<T>(ps: []ptr<T>) -> []ref T { /* deferred; loop of wrap */ }
 ```
 
 ---
@@ -407,19 +407,19 @@ crossing verb, and stay operators under any option.)
 ## 7. Interaction with unsafe-by-type, sigils, arenas/regions (R11), and the spine (A1–A6)
 
 - **Unsafe-by-type (§4):** Marshall is the *only* sanctioned producer/consumer of `ptr`/`uptr`
-  across the boundary. `wrap`'s output (safe `Ref<T>`) is the one thing that may leave an `unsafe
+  across the boundary. `wrap`'s output (safe `ref T`) is the one thing that may leave an `unsafe
   fn` per the memory-unsafe §2 boundary rule (alongside a by-value safe copy and `Owned<T>`).
   `unwrap`'s output (`ptr<T>`) may not — it stays inside unsafe context by the containment gate.
 - **Sigils (§5.5):** the raw operators are gated by the *same* unsafe context check that lets a body
   name `ptr<T>` — no separate mechanism. One gate, uniformly enforced.
 - **Arenas/regions & R11:** `unwrap` is the spine's **event horizon**. A `ptr<T>` obtained from a
-  `Ref` into an arena is valid only while that arena lives (R11); the spine stops tracking at the
+  `ref T` into an arena is valid only while that arena lives (R11); the spine stops tracking at the
   `unwrap`, so keeping the ptr past the arena is a UAF the dev owns. This composes exactly with the
   `unsafe #must_free` Arena (memory-unsafe §2c): `region_alloc` already yields a `ptr<T>` into a
-  manual region; Marshall is the disciplined way to *lift* such a ptr into a temporary `Ref<T>` for
-  a safe helper and drop back — never storing the `Ref` past the region (that store is rejected by
+  manual region; Marshall is the disciplined way to *lift* such a ptr into a temporary `ref T` for
+  a safe helper and drop back — never storing the `ref` past the region (that store is rejected by
   A1/A2 on the safe side, and the raw ptr's lifetime is `unsafe`-owned on the other).
-- **The spine (A1–A6):** `wrap` re-enters spine jurisdiction — the produced `Ref<T>` is subject to
+- **The spine (A1–A6):** `wrap` re-enters spine jurisdiction — the produced `ref T` is subject to
   A1 (transitive escape), A2 (borrow-down non-escaping), A4 (definite-assignment), A5 (path), A6
   (free needs ownership). The spine **cannot** verify the wrapped pointee is live (it came from
   outside) — the null check is the only compiler guard; lifetime correctness is the dev's asserted
@@ -475,14 +475,14 @@ pub unsafe fn fill(ref buf: []byte) {
 **8.3 Struct pointer lift via Marshall** (the model pattern — it RECEIVES the pointer):
 ```teko
 /**
- * Wraps a raw `ptr<Node>` from a C API into a `Ref<Node>`, runs a SAFE helper over it, and
+ * Wraps a raw `ptr<Node>` from a C API into a `ref Node`, runs a SAFE helper over it, and
  * returns a by-value scalar summary (legal: scalar out). Shows `wrap` as the ptr->Ref lift.
  * @param ptr<Node> raw  a raw, non-null node pointer from C
  * @return i64  a value computed by the safe helper
  */
 pub unsafe fn summarize(raw: ptr<Node>) -> i64 {
-    ref n: Node = teko::marshall::wrap<Node>(raw)      // null-panics if raw is null
-    node_weight(n)                                     // a plain SAFE fn taking `ref Node`
+    ref n: Node = teko::marshall::wrap<Node>(raw)      // null-panics if raw is null; result is ref Node
+    node_weight(n)                                     // a plain SAFE fn taking ref Node
 }
 ```
 
@@ -517,7 +517,7 @@ convention as `arena_manual_ok`/`unsafe_rawbuf_roundtrip`). REJECT fixtures carr
 | `marshall_uptr_roundtrip` | native-only | §5.4 `to_uptr`→`from_uptr` identity; exit = deref of the rebuilt ptr |
 | `marshall_ptr_arith_index` | native-only | §5.5 `p + n`, `p[n]`, `*p`, `&x` inside `unsafe fn`; exit = summed elements |
 | `marshall_ffi_cstr_roundtrip` | native-only | §8.1 `as_cstr`→`str_from_cstr` through a local C stub |
-| `marshall_slice_wrap` | native-only | §5.7 element-wise `[]ptr<T>`↔`[]Ref<T>` |
+| `marshall_slice_wrap` | native-only | §5.7 element-wise `[]ptr<T>`↔`[]ref T` |
 
 **REJECT — `EXPECT_COMPILE_FAIL`:**
 
@@ -604,11 +604,11 @@ Smallest safe steps, each independently gate-able. **UNBLOCKED** crumbs land aga
   Fixtures: `marshall_swap_values` (VM+native differential), `marshall_swap_on_let_rejected`.
   **Ritual: full gate** (first SAFE Marshall member; the safe surface is now complete).
 
-- **C4 — `wrap` [BLOCKED on transparent Ref].** Add `teko::marshall::wrap<T>` (§5.1): static
+- **C4 — `wrap` [BLOCKED on transparent ref].** Add `teko::marshall::wrap<T>` (§5.1): static
   type-check + runtime null-panic + zero-cost reinterpret. Fixtures: `marshall_wrap_unwrap_roundtrip`
   (with C5), `marshall_wrap_null_panics`, `marshall_wrap_type_mismatch_rejected`.
 
-- **C5 — `unwrap` [BLOCKED on transparent Ref].** Add `teko::marshall::unwrap<T>` (§5.2). Fixtures:
+- **C5 — `unwrap` [BLOCKED on transparent ref].** Add `teko::marshall::unwrap<T>` (§5.2). Fixtures:
   `marshall_unwrap_in_safe_rejected`, and complete `marshall_wrap_unwrap_roundtrip`.
   **Ritual: full gate** (the ptr↔Ref boundary is now complete — the core of the issue).
 
@@ -623,7 +623,7 @@ Smallest safe steps, each independently gate-able. **UNBLOCKED** crumbs land aga
 
 **Sequencing note (stable seed):** C0–C3 + C6 + C8 use only features already in the current seed
 (unsafe modifier, generics, operators), so they land immediately. C4/C5/C7 wait on the transparent
-`Ref<T>` redesign; their fixtures and signatures (above) are authored now so they resume in minutes
+`ref` redesign; their fixtures and signatures (above) are authored now so they resume in minutes
 when that dependency closes.
 
 ---
