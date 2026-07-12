@@ -1,0 +1,120 @@
+// src/parser/loop_head.tks   (namespace 'teko::parser')
+
+use teko::lexer
+
+/**
+ * prepend_stmt — build a fresh statement list with `head` in front of `rest`, preserving order.
+ * Used to fold a synthesized head statement (the condition-break) onto the front of a parsed loop
+ * body (#517).
+ *
+ * @param head  the statement to place first
+ * @param rest  the following statements, in order
+ * @return      a new `[]Statement` = `[head, ...rest]`
+ */
+fn prepend_stmt(head: Statement, rest: []Statement) -> []Statement {
+    mut out = teko::list::push(teko::list::empty(), head)
+    mut i: u64 = 0
+    loop {
+        if i >= rest.len { break }
+        out = teko::list::push(out, rest[i])
+        i++
+    }
+    out
+}
+
+/**
+ * loop_break — the synthesized `break` (innermost, unlabeled) a desugared head emits to leave the
+ * loop when its condition fails (#517).
+ *
+ * @return  a `BreakStmt` targeting the innermost loop
+ */
+fn loop_break() -> Statement {
+    BreakStmt { label = "" }
+}
+
+/**
+ * loop_not — wrap `e` in a boolean `!e`, positioned at (`line`, `col`) — the negated condition of a
+ * folded `if !<cond> { break }` (#517).
+ *
+ * @param e     the condition expression to negate
+ * @param line  the source line to stamp on the synthesized node
+ * @param col   the source column to stamp on the synthesized node
+ * @return      the `Expr` `!e`
+ */
+fn loop_not(e: Expr, line: u32, col: u32) -> Expr {
+    Expr { kind = Unary { op = lexer::TokenKind::Bang; operand = e }; line = line; col = col }
+}
+
+/**
+ * loop_cond_break — the folded `if !<cond> { break }` statement a while/3-part head places at the
+ * TOP of the loop body, so a false condition exits and a `continue` re-checks the condition (#517).
+ *
+ * @param cond  the loop's boolean condition expression
+ * @param line  the source line to stamp on the synthesized nodes
+ * @param col   the source column to stamp on the synthesized nodes
+ * @return      the `if !<cond> { break }` statement
+ */
+fn loop_cond_break(cond: Expr, line: u32, col: u32) -> Statement {
+    let neg = loop_not(cond, line, col)
+    let brk = teko::list::push(teko::list::empty(), loop_break())
+    let iff = Expr { kind = IfExpr { cond = neg; then_blk = brk; has_else = false; else_blk = teko::list::empty() }; line = line; col = col }
+    ExprStmt { expr = iff }
+}
+
+/**
+ * parse_loop_infinite — `[LABEL:] loop { … }`: the head is empty; the body is the parsed block
+ * verbatim and `init` is empty (#517).
+ *
+ * @param tokens  the token stream
+ * @param brace_pos  the position of the loop body's `{`
+ * @param label  the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @return  the parsed loop statement, or a parse error
+ */
+fn parse_loop_infinite(tokens: []lexer::Token, brace_pos: u64, label: str) -> Parsed<Statement> | error {
+    let blk = match parse_block(tokens, brace_pos) { ParsedList<Statement> as x => x; error as e => return e }
+    Parsed<Statement> { node = LoopStmt { label = label; init = teko::list::empty(); body = blk.items }; next = blk.next }
+}
+
+/**
+ * parse_loop_while — `[LABEL:] loop <cond> { B }`: parse the boolean condition with the scrutinee
+ * form (so a trailing `{` opens the body, not a struct literal), then fold it into the body as
+ * `if !<cond> { break }` at the TOP so `continue` re-checks it. `init` stays empty (#517).
+ *
+ * @param tokens  the token stream
+ * @param cond_pos  the position of the condition expression (just past `loop`)
+ * @param label  the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @param line  the loop keyword's source line (stamped on synthesized nodes)
+ * @param col  the loop keyword's source column (stamped on synthesized nodes)
+ * @return  the parsed loop statement, or a parse error
+ */
+fn parse_loop_while(tokens: []lexer::Token, cond_pos: u64, label: str, line: u32, col: u32) -> Parsed<Statement> | error {
+    let cond = match parse_expr_no_struct(tokens, cond_pos) { Parsed<Expr> as x => x; error as e => return e }
+    if !is_kind_at(tokens, cond.next, lexer::TokenKind::LBrace) {
+        return err_at(tokens, cond.next, "expected '{' after the loop condition")
+    }
+    let blk = match parse_block(tokens, cond.next) { ParsedList<Statement> as x => x; error as e => return e }
+    let body = prepend_stmt(loop_cond_break(cond.node, line, col), blk.items)
+    Parsed<Statement> { node = LoopStmt { label = label; init = teko::list::empty(); body = body }; next = blk.next }
+}
+
+/**
+ * parse_loop — dispatch a loop head after the `loop` keyword (#517). The token just past `loop`
+ * selects the form: `{` = infinite; `mut` = a binding head (range / for-each / 3-part — a later
+ * crumb; an honest error for now); anything else = a while condition. The `label` is the
+ * UPPER_SNAKE prefix ("" when unlabeled); its format is enforced by the checker's `check_labels`.
+ *
+ * @param tokens  the token stream
+ * @param loop_pos  the position of the `loop` keyword
+ * @param label  the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @return  the parsed loop statement, or a parse error
+ */
+fn parse_loop(tokens: []lexer::Token, loop_pos: u64, label: str) -> Parsed<Statement> | error {
+    let after = loop_pos + 1
+    if is_kind_at(tokens, after, lexer::TokenKind::LBrace) {
+        return parse_loop_infinite(tokens, after, label)
+    }
+    if is_kind_at(tokens, after, lexer::TokenKind::Mut) {
+        return err_at(tokens, after, "loop binding forms land in a later step")
+    }
+    parse_loop_while(tokens, after, label, tokens[loop_pos].line, tokens[loop_pos].col)
+}

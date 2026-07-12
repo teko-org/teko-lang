@@ -118,6 +118,7 @@ COMPILE_FAIL=(
     free_aliased_rejected
     free_captured_by_container_rejected
     free_field_extract_rejected
+    loop_label_lowercase
 )
 
 is_expected_fail() {

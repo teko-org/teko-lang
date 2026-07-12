@@ -871,10 +871,55 @@ fn parses_loop_break_continue() {
     }
 }
 
+/** rejects_malformed_loop — a while-head with no body brace, and an unclosed infinite body, both
+    fail to parse (#517: `loop x` is now a while-condition `x` that then wants a `{`). */
 #test
 fn rejects_malformed_loop() {
-    teko::assert::is_true(stmt_errors("loop x"))   // no `{` after loop
-    teko::assert::is_true(stmt_errors("loop {"))   // unclosed loop body
+    teko::assert::is_true(stmt_errors("loop x"))
+    teko::assert::is_true(stmt_errors("loop {"))
+}
+
+/** parses_prefix_label — `OUTER: loop { break OUTER }` parses to a labeled `LoopStmt` (#517 prefix
+    label), empty `init`, whose body is a single `break OUTER`. */
+#test
+fn parses_prefix_label() {
+    match stmt_of("OUTER: loop { break OUTER }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.label == "OUTER")
+            teko::assert::is_true(l.init.len == 0)
+            teko::assert::is_true(l.body.len == 1)
+            match l.body[0] { BreakStmt as b => teko::assert::is_true(b.label == "OUTER"); _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** parses_while_head — `loop n < 3 { }` folds the condition into the body as a leading
+    `if !(n < 3) { break }` (#517 while-head), leaving `init` empty and `label` unset. */
+#test
+fn parses_while_head() {
+    match stmt_of("loop n < 3 { }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.label == "")
+            teko::assert::is_true(l.init.len == 0)
+            teko::assert::is_true(l.body.len == 1)
+            match l.body[0] { ExprStmt as es => match es.expr.kind { IfExpr => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** parses_bare_ident_while_head — `loop ready { }` treats `ready` as a boolean while-condition, NOT
+    a label (labels are the prefix form only) (#517). */
+#test
+fn parses_bare_ident_while_head() {
+    match stmt_of("loop ready { }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.label == "")
+            teko::assert::is_true(l.body.len == 1)
+        }
+        _ => teko::assert::is_true(false)
+    }
 }
 
 // appended to parser_test.tkt — P4e if/match-expression tests (reuses expr_of).
