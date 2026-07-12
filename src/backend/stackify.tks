@@ -1732,9 +1732,13 @@ fn wasm_resolve_data(t: WasmSymbolTable, symbol: str) -> u32 | error {
  * stackify_call — the `LCall` lowering: push every argument's local, `call
  * $funcidx` (`wasm_resolve_call` names the target). When the callee returns
  * a value: captured into the result's local when `inst.has_result`, else
- * `drop`ped (`0x1A`) to keep the operand stack balanced for a
- * statement-level call whose result is discarded. A `Void`-returning callee
- * needs neither.
+ * `drop`ped (`0x1A`) to keep
+ * the operand stack balanced for a statement-level call whose result is
+ * discarded. A `Void`-returning callee needs neither. The `call`'s funcidx
+ * operand is the callee's already-final absolute index (`WasmCallTarget.
+ * func_index`), emitted as a minimal-width ULEB128 — the module is
+ * self-contained (`backend-wasm.md` §1.2), so every function index is fixed
+ * at assembly time and no linker ever repositions it.
  *
  * @param StackifyCtx ctx0  the context to extend
  * @param WasmSymbolTable symbols  the call-target resolver
@@ -3318,4 +3322,418 @@ pub fn wasm_symtab_add_rodata(t: WasmSymbolTable, layout: WasmRodataLayout) -> W
  */
 pub fn wasm_honest_globals() -> error {
     error { message = "stackify: C1-globals — top-level LGlobal data has no wasm lowering yet (the N2 subset lowers none), mirrors A4-globals" }
+}
+
+/**
+ * wasm_rodata_base — the fixed linear-memory offset the program's rodata
+ * starts at (§6.1's "rodata at a fixed low base"): a small margin above
+ * address `0` so no real datum ever lands at the null address.
+ *
+ * @return u32  the rodata region's own base offset
+ */
+fn wasm_rodata_base() -> u32 {
+    8 to u32
+}
+
+/**
+ * wasm_stack_region_bytes — the shadow-stack region's own fixed byte size
+ * (§6.1): reserved directly above rodata, the `SP` global's initial value
+ * is this many bytes above the rodata region's own end, and `LAlloca`
+ * bumps `SP` DOWN into it. A flat, generous default (`64` KiB) — right-
+ * sizing it is `#453`'s `#arena_size` territory, not this slice's.
+ *
+ * @return u32  the shadow-stack region's own byte size
+ */
+fn wasm_stack_region_bytes() -> u32 {
+    65536 to u32
+}
+
+/**
+ * wasm_mem_page_bytes — one wasm linear-memory page's own byte size
+ * (`65536`, the wasm core spec's fixed page granularity).
+ *
+ * @return u32  one page's own byte size
+ */
+fn wasm_mem_page_bytes() -> u32 {
+    65536 to u32
+}
+
+/**
+ * wasm_mem_pages_for — the minimum page count covering `top` bytes,
+ * rounded UP to the next whole page and floored at `1` (a module always
+ * declares at least one page, §5.2 — even a program with neither rodata
+ * nor a shadow-stack frame still gets a usable linear memory).
+ *
+ * @param u32 top  the highest byte offset the module's own layout reaches
+ * @return u32  the page count `emit_wasm`'s memory section requests
+ */
+fn wasm_mem_pages_for(top: u32) -> u32 {
+    let page = wasm_mem_page_bytes()
+    let pages = (top + page - (1 to u32)) / page
+    if pages < (1 to u32) {
+        return 1 to u32
+    }
+    pages
+}
+
+/**
+ * wasm_program_func_index — the absolute wasm function index a DEFINED
+ * function at position `pos` (0-based, in `LModule.funcs` order) resolves
+ * to: the module's own index space places every import first, then every
+ * defined function (§5.2), so `pos` simply shifts by `import_count`.
+ *
+ * @param u64 import_count  how many host imports the module declares
+ * @param u64 pos  the function's own 0-based position in `LModule.funcs`
+ * @return u32  the function's absolute wasm function index
+ */
+fn wasm_program_func_index(import_count: u64, pos: u64) -> u32 {
+    (import_count + pos) to u32
+}
+
+/**
+ * wasm_register_program_symbols — the whole program's `WasmSymbolTable`
+ * (C1-5, the "link/dispatch" job C1-2's `wasm_resolve_call` doc deferred
+ * here): `"tk_exit"` resolves DIRECTLY to the WASI `proc_exit` import
+ * (§6.2 — their signatures match exactly, `(i32) -> ()`, so no separate
+ * runtime-provided `tk_exit` symbol is needed for the MVP corpus), and
+ * every `LModule.funcs` entry resolves to its own assigned absolute index
+ * (`wasm_program_func_index`) — so a future cross-function call (none in
+ * the MVP corpus, `backend-c1-wasm.md` §12.2) already resolves correctly.
+ *
+ * @param WasmWasiImportSet wasi  the WASI import set (`proc_exit`'s index)
+ * @param []LFunc funcs  the module's defined functions, in `LModule.funcs`
+ *                       order
+ * @return WasmSymbolTable  the whole-program call-target resolver
+ */
+fn wasm_register_program_symbols(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -> WasmSymbolTable {
+    mut t = wasm_symtab_empty()
+    t = wasm_symtab_add(t, "tk_exit", WasmCallTarget { func_index = wasi.proc_exit_index; ret_type = lir::LType::Void })
+    let import_count = wasi.imports.len
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        let idx = wasm_program_func_index(import_count, i)
+        t = wasm_symtab_add(t, funcs[i].symbol, WasmCallTarget { func_index = idx; ret_type = funcs[i].ret_type })
+        i++
+    }
+    t
+}
+
+/**
+ * wasm_func_type_of — the `(params) -> (results)` `WasmFuncType` an
+ * `LFunc`'s own signature maps to: every `param_types` entry through
+ * `wasm_valtype` (in order), and a single result whenever `ret_type` is not
+ * `Void` (the MVP's no-multi-value shape, §4.3). Propagates `wasm_valtype`'s
+ * own honest-stops (`C1-i128`/`C1-f16`) on either side.
+ *
+ * @param LFunc f  the function whose signature to translate
+ * @return WasmFuncType | error  the translated signature, or a propagated
+ *                               honest-stop
+ */
+fn wasm_func_type_of(f: lir::LFunc) -> WasmFuncType | error {
+    mut params: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.param_types.len { break }
+        let vt = match wasm_valtype(f.param_types[i]) { u8 as v => v; error as e => return e }
+        params = teko::list::push(params, vt to byte)
+        i++
+    }
+    if f.ret_type == lir::LType::Void {
+        return WasmFuncType { params = params; results = teko::list::empty() }
+    }
+    let rvt = match wasm_valtype(f.ret_type) { u8 as v => v; error as e => return e }
+    WasmFuncType { params = params; results = [rvt to byte] }
+}
+
+/**
+ * wasm_build_program_types — the module's whole type table, BEFORE the
+ * synthesized `_start`'s own trailing entry (`wasm_assemble_program` appends
+ * that one itself): the WASI import set's own two types (indices `0`/`1`,
+ * §6.2), then one entry per `LModule.funcs` function, in order (so a
+ * function at position `i` owns type index `wasi.types.len + i`, matching
+ * `wasm_program_func_index`'s own index-space convention).
+ *
+ * @param WasmWasiImportSet wasi  the WASI import set (its own two types)
+ * @param []LFunc funcs  the module's defined functions
+ * @return []WasmFuncType | error  the type table, or a propagated
+ *                                 `wasm_func_type_of` honest-stop
+ */
+fn wasm_build_program_types(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -> []WasmFuncType | error {
+    mut types = wasi.types
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        let t = match wasm_func_type_of(funcs[i]) { WasmFuncType as x => x; error as e => return e }
+        types = teko::list::push(types, t)
+        i++
+    }
+    types
+}
+
+/**
+ * wasm_build_program_funcs — every `LModule.funcs` entry stackified
+ * (`stackify_func`) into its own `WasmFunc`: `type_index` matches `wasm_
+ * build_program_types`'s own per-function assignment, and `local_groups`/
+ * `body` carry through unchanged from the stackifier's own `WasmFuncBody`.
+ * The module is self-contained (`backend-wasm.md` §1.2), so each call-site
+ * funcidx operand is already the callee's final absolute index (minimal-
+ * width ULEB128) — no relocation table, no operand widening, and no linker
+ * pass exists to consume one.
+ *
+ * @param WasmWasiImportSet wasi  the WASI import set (its own import count)
+ * @param []LFunc funcs  the module's defined functions
+ * @param WasmSymbolTable symtab  the whole-program call-target resolver
+ * @return []WasmFunc | error  the defined-function code entries, or a
+ *                             propagated `stackify_func` honest-stop
+ */
+fn wasm_build_program_funcs(wasi: WasmWasiImportSet, funcs: []lir::LFunc, symtab: WasmSymbolTable) -> []WasmFunc | error {
+    mut out: []WasmFunc = teko::list::empty()
+    let import_count = wasi.imports.len
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        let body = match stackify_func(funcs[i], symtab) { WasmFuncBody as x => x; error as e => return e }
+        let type_index = (import_count + i) to u32
+        out = teko::list::push(out, WasmFunc { type_index = type_index; local_groups = body.local_groups; body = body.body })
+        i++
+    }
+    out
+}
+
+/**
+ * wasm_find_main_index — the program's own `"main"` `LFunc`'s absolute wasm
+ * function index (`wasm_program_func_index`), the callee `_start` invokes
+ * (§9's `emit_native_wasm` doc — "the LIR's own `main` LFunc"). A NAMED
+ * internal error when no function is named `"main"`: `emit_native_wasm`
+ * only ever reaches this for a BINARY artifact, whose front-end always
+ * synthesizes one (`lir::lower_virtual_main`), so this is a genuine
+ * internal-misuse guard, not a reachable user-facing case.
+ *
+ * @param WasmWasiImportSet wasi  the WASI import set (its own import count)
+ * @param []LFunc funcs  the module's defined functions
+ * @return u32 | error  `"main"`'s absolute function index, or a NAMED
+ *                       internal error
+ */
+fn wasm_find_main_index(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -> u32 | error {
+    let import_count = wasi.imports.len
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        if funcs[i].symbol == "main" {
+            return wasm_program_func_index(import_count, i)
+        }
+        i++
+    }
+    error { message = "stackify: wasm_assemble_program — no `main` entry function found in the lowered module (internal)" }
+}
+
+/**
+ * wasm_find_main_ret — the program's own `"main"` `LFunc`'s return type,
+ * the `_start` synthesizer (`wasm_synth_start`) needs to decide whether to
+ * push a default `i32.const 0` exit code (a `Void` `main`) or forward
+ * `main`'s own `i32` result to `proc_exit`. Shares `wasm_find_main_index`'s
+ * NAMED internal-misuse guard: an artifact reaching here always has a `main`
+ * (`lir::lower_virtual_main`).
+ *
+ * @param []LFunc funcs  the module's defined functions
+ * @return LType | error  `"main"`'s own return type, or a NAMED internal
+ *                        error
+ */
+fn wasm_find_main_ret(funcs: []lir::LFunc) -> lir::LType | error {
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        if funcs[i].symbol == "main" {
+            return funcs[i].ret_type
+        }
+        i++
+    }
+    error { message = "stackify: wasm_assemble_program — no `main` entry function found in the lowered module (internal)" }
+}
+
+/**
+ * wasm_synth_start — the WASI command entry point, `_start` (the owner's
+ * own C1-5 invariant: a wasm COMMAND module — the `exit(n)` case this slice
+ * targets — MUST export `_start`, the symbol `wasmtime`/every WASI host
+ * looks up; the Teko front-end's own "virtual main" tail-exit convention
+ * BECOMES this `_start`, §9): `call $main; call $proc_exit; end`. When
+ * `main` returns `i32` (LIR's C-style "`main` returns the exit code" ABI,
+ * `lir::lower_virtual_main`), its own result lands on the operand stack
+ * right where `proc_exit`'s single `i32` parameter needs it, so NO local
+ * staging is needed. When `main` returns `Void`, it leaves NOTHING on the
+ * stack, so a literal `i32.const 0` is pushed first — the standard WASI
+ * `_start` "exit 0 on a clean fall-through" shape — keeping `proc_exit`'s
+ * `i32` argument balanced instead of underflowing the operand stack
+ * (`backend-wasm.md` finding 4). Both `call` funcidx operands are the final
+ * absolute index encoded minimal-width (`emit_uleb128`): the module is
+ * self-contained (§1.2), so no relocation is recorded and no linker
+ * rewrites them.
+ *
+ * @param u32 type_index  the module's own `() -> ()` type-table index for
+ *                        `_start`'s signature (`wasm_assemble_program`
+ *                        appends one past `wasm_build_program_types`'s own
+ *                        table)
+ * @param u32 main_index  `"main"`'s own absolute function index
+ * @param u32 proc_exit_index  the WASI `proc_exit` import's own index
+ * @param LType main_ret  `main`'s own return type — `Void` triggers the
+ *                        default `i32.const 0` exit-code push
+ * @return WasmFunc  the `_start` code entry
+ */
+fn wasm_synth_start(type_index: u32, main_index: u32, proc_exit_index: u32, main_ret: lir::LType) -> WasmFunc {
+    mut body: []byte = teko::list::empty()
+    body = teko::list::push(body, 0x10 to byte)
+    body = emit_uleb128(body, main_index to u64)
+    if main_ret == lir::LType::Void {
+        body = teko::list::push(body, 0x41 to byte)
+        body = emit_sleb128(body, 0 to i64)
+    }
+    body = teko::list::push(body, 0x10 to byte)
+    body = emit_uleb128(body, proc_exit_index to u64)
+    body = teko::list::push(body, 0x0B to byte)
+    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = body }
+}
+
+/**
+ * wasm_program_has_any_frame — does ANY function in `funcs` need the
+ * shared shadow-stack `SP` global (at least one `LAlloca` site, §6.1)? A
+ * module declares the `SP` global (index `0`, `wasm_sp_global_index`) iff
+ * this is `true` — a program with no `LAlloca` anywhere needs no shadow
+ * stack at all.
+ *
+ * @param []LFunc funcs  the module's defined functions
+ * @return bool  `true` iff some function has at least one `LAlloca`
+ */
+fn wasm_program_has_any_frame(funcs: []lir::LFunc) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        if collect_alloca_insts(funcs[i]).len > (0 to u64) {
+            return true
+        }
+        i++
+    }
+    false
+}
+
+/**
+ * WasmMemoryPlan — the module's whole linear-memory layout decision (§6.1):
+ * the laid-out rodata (`wasm_layout_rodata`), the module's own globals
+ * (the `SP` global, present only when `wasm_program_has_any_frame`), and
+ * the initial page count covering both.
+ *
+ * @since #389 C1-5
+ */
+pub type WasmMemoryPlan = struct {
+    /**
+     * rodata — the program's rodata, laid out starting at `wasm_rodata_
+     * base` (empty when the program interns none).
+     */
+    rodata: WasmRodataLayout
+    /**
+     * globals — the module's own globals: one mutable `i32` `SP` global
+     * when any function needs a shadow-stack frame, else empty.
+     */
+    globals: []WasmGlobal
+    /**
+     * mem_min_pages — the initial linear-memory size, in 64 KiB pages,
+     * covering rodata plus (when present) the whole shadow-stack region.
+     */
+    mem_min_pages: u32
+}
+
+/**
+ * wasm_program_memory_plan — decide the whole program's linear-memory
+ * globals + sizing from an ALREADY-LAID-OUT rodata (§6.1's low-to-high
+ * plan: rodata, then the shadow stack): when at least one function needs a
+ * shadow-stack frame (`wasm_program_has_any_frame`), the `SP` global's own
+ * initial value is set to the rodata region's own end (8-byte aligned)
+ * plus `wasm_stack_region_bytes`, and the memory is sized to cover it;
+ * otherwise the memory covers rodata alone (still at least one page,
+ * `wasm_mem_pages_for`'s own floor). Takes `rodata` PRE-COMPUTED — `wasm_
+ * assemble_program` must lay it out BEFORE stackifying any function (an
+ * `LGlobalAddr` site resolves through the SAME `WasmSymbolTable` a rodata
+ * symbol registers into, `wasm_symtab_add_rodata`), so this function must
+ * not recompute it a second time from `lmod` alone.
+ *
+ * @param LModule lmod  the whole lowered program (its `funcs`, for `wasm_
+ *                      program_has_any_frame`)
+ * @param WasmRodataLayout rodata  the already-laid-out rodata (`wasm_
+ *                                 layout_rodata`)
+ * @return WasmMemoryPlan  the resolved rodata layout + globals + page count
+ */
+fn wasm_program_memory_plan(lmod: lir::LModule, rodata: WasmRodataLayout) -> WasmMemoryPlan {
+    let rodata_top = wasm_align_up(rodata.end, 8 to u32)
+    if !wasm_program_has_any_frame(lmod.funcs) {
+        return WasmMemoryPlan { rodata = rodata; globals = teko::list::empty(); mem_min_pages = wasm_mem_pages_for(rodata_top) }
+    }
+    let sp_init = rodata_top + wasm_stack_region_bytes()
+    let sp_global = WasmGlobal { valtype = wasm_vt_i32(); mutable = true; init = sp_init to i64 }
+    WasmMemoryPlan { rodata = rodata; globals = [sp_global]; mem_min_pages = wasm_mem_pages_for(sp_init) }
+}
+
+/**
+ * wasm_program_data_segments — the module's own data-section entries: the
+ * laid-out rodata's one concatenated segment, but ONLY when it actually
+ * carries bytes (a program that interns no rodata gets no data section at
+ * all, rather than one framed empty segment).
+ *
+ * @param WasmRodataLayout rodata  the laid-out rodata (`wasm_program_
+ *                                 memory_plan`)
+ * @return []WasmDataSegment  zero or one data segment
+ */
+fn wasm_program_data_segments(rodata: WasmRodataLayout) -> []WasmDataSegment {
+    if rodata.segment.bytes.len > (0 to u64) {
+        return [rodata.segment]
+    }
+    teko::list::empty()
+}
+
+/**
+ * wasm_assemble_program — the whole own-backend wasm module assembler
+ * (C1-5's "link/dispatch" job every earlier slice deferred here,
+ * `backend-c1-wasm.md` §5.2/§9): the program's rodata laid out FIRST and
+ * registered into the symbol table (`wasm_symtab_add_rodata`) — an
+ * `LGlobalAddr` site resolves through the SAME table `stackify_func`
+ * reads, so this must happen BEFORE any function is stackified, not after
+ * — then every `LModule.funcs` entry stackified in place (`wasm_build_
+ * program_funcs`), the WASI import set wired in (`wasm_wasi_import_set`),
+ * the synthesized `_start` command entry point appended and EXPORTED (the
+ * owner's own C1-5 invariant — a wasm command module MUST export `_start`,
+ * §9's doc, `wasm_synth_start`), and the whole program's linear memory
+ * sized around the ALREADY-LAID-OUT rodata (`wasm_program_memory_plan`).
+ * Returns the NAMED `C1-globals` honest-stop when `lmod.globals` is
+ * non-empty (mirrors A4-4's own guard, `wasm_honest_globals`) before
+ * touching anything else, and propagates any per-function honest-stop
+ * unchanged (`C1-i128`/`C1-f16`/`C1-irreducible`/an unresolved call/data
+ * symbol).
+ *
+ * @param LModule lmod  the whole lowered program
+ * @return WasmModule | error  the assembled module, ready for `emit_wasm`,
+ *                             or a propagated/named honest-stop
+ */
+pub fn wasm_assemble_program(lmod: lir::LModule) -> WasmModule | error {
+    if lmod.globals.len > (0 to u64) {
+        return wasm_honest_globals()
+    }
+    let wasi = wasm_wasi_import_set()
+    let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let symtab = wasm_symtab_add_rodata(wasm_register_program_symbols(wasi, lmod.funcs), rodata)
+    let types = match wasm_build_program_types(wasi, lmod.funcs) { []WasmFuncType as t => t; error as e => return e }
+    let funcs = match wasm_build_program_funcs(wasi, lmod.funcs, symtab) { []WasmFunc as f => f; error as e => return e }
+    let main_index = match wasm_find_main_index(wasi, lmod.funcs) { u32 as x => x; error as e => return e }
+    let main_ret = match wasm_find_main_ret(lmod.funcs) { lir::LType as x => x; error as e => return e }
+    let start_type_index = types.len to u32
+    let start = wasm_synth_start(start_type_index, main_index, wasi.proc_exit_index, main_ret)
+    let start_index = wasm_program_func_index(wasi.imports.len, lmod.funcs.len)
+    let plan = wasm_program_memory_plan(lmod, rodata)
+    WasmModule {
+        types = teko::list::push(types, WasmFuncType { params = teko::list::empty(); results = teko::list::empty() })
+        imports = wasi.imports
+        funcs = teko::list::push(funcs, start)
+        globals = plan.globals
+        data = wasm_program_data_segments(plan.rodata)
+        mem_min_pages = plan.mem_min_pages
+        exports = [WasmExport { name = "_start"; kind = 0x00 to byte; index = start_index }]
+    }
 }

@@ -630,24 +630,31 @@ fn native_backend_selected() -> bool {
 
 /**
  * NativeTarget — which own-AOT-backend target the temporary `TEKO_TARGET` env
- * seam selects (D-D, #386 B1-8): the default `Arm64Macho` (the A4 reference —
- * arm64 machine code in a Mach-O object) or `X8664Linux` (x86-64 SysV machine
- * code in an ELF object). Targets are named by OS, not by object format (ruling
- * #390): the format (ELF/Mach-O) is a consequence of the OS, so `x86_64-linux`
- * — not `x86_64-elf` (ELF spans many kernels the binary does not port between) —
+ * seam selects (D-D, #386 B1-8; the wasm variants at #389 C1-5): the default
+ * `Arm64Macho` (the A4 reference — arm64 machine code in a Mach-O object),
+ * `X8664Linux` (x86-64 SysV machine code in an ELF object), `Wasm32Wasi` (a
+ * WASI command module — the `exit(n)`/arithmetic/control-flow corpus this
+ * slice targets, `backend-c1-wasm.md` §8), or `Wasm32Browser` (the SAME
+ * emitted module, a JS-import runtime binding instead of WASI — its full
+ * wiring is C1-7 territory; reaching it here is a NAMED stop for now, §9).
+ * Targets are named by OS, not by object format (ruling #390): the format
+ * (ELF/Mach-O) is a consequence of the OS, so `x86_64-linux` — not
+ * `x86_64-elf` (ELF spans many kernels the binary does not port between) —
  * is canonical. The seam mirrors `TEKO_BACKEND` and is read only when the own
  * backend is already active; D1/#390 supersedes it with the real `--target`
  * manifest flag.
  */
-type NativeTarget = enum { Arm64Macho; X8664Linux }
+type NativeTarget = enum { Arm64Macho; X8664Linux; Wasm32Wasi; Wasm32Browser }
 
 /**
  * target_from_name — map a raw `TEKO_TARGET` value to a `NativeTarget`:
  * `x86_64-linux` (canonical, OS-based per ruling #390) selects the x86-64
- * SysV/ELF pipeline; `x86_64-elf` is accepted as a deprecated format-named alias.
- * Every other value — including `arm64-macos`, an empty string, or a typo —
- * falls back to the default `Arm64Macho`, so an unrecognized target never
- * silently mis-lowers.
+ * SysV/ELF pipeline; `x86_64-elf` is accepted as a deprecated format-named
+ * alias; `wasm32-wasi`/`wasm32`/`wasm`/`wasi` select the WASI wasm target
+ * (#389 C1-5); `wasm32-browser`/`wasm-browser`/`browser` select the Browser
+ * variant. Every other value — including `arm64-macos`, an empty string, or
+ * a typo — falls back to the default `Arm64Macho`, so an unrecognized
+ * target never silently mis-lowers.
  *
  * @param name  the raw `TEKO_TARGET` environment value
  * @return      the selected own-backend target
@@ -655,6 +662,13 @@ type NativeTarget = enum { Arm64Macho; X8664Linux }
 fn target_from_name(name: str) -> NativeTarget {
     if name == "x86_64-linux" { return NativeTarget::X8664Linux }
     if name == "x86_64-elf" { return NativeTarget::X8664Linux }
+    if name == "wasm32-wasi" { return NativeTarget::Wasm32Wasi }
+    if name == "wasm32" { return NativeTarget::Wasm32Wasi }
+    if name == "wasm" { return NativeTarget::Wasm32Wasi }
+    if name == "wasi" { return NativeTarget::Wasm32Wasi }
+    if name == "wasm32-browser" { return NativeTarget::Wasm32Browser }
+    if name == "wasm-browser" { return NativeTarget::Wasm32Browser }
+    if name == "browser" { return NativeTarget::Wasm32Browser }
     NativeTarget::Arm64Macho
 }
 
@@ -715,6 +729,8 @@ fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
     match native_target() {
         NativeTarget::X8664Linux => emit_native_x86(dir, od, stem, lmod, prog, m)
         NativeTarget::Arm64Macho => emit_native_arm64(dir, od, stem, lmod, prog, m)
+        NativeTarget::Wasm32Wasi => emit_native_wasm(dir, od, stem, lmod, prog, m, false)
+        NativeTarget::Wasm32Browser => emit_native_wasm(dir, od, stem, lmod, prog, m, true)
     }
 }
 
@@ -792,6 +808,50 @@ fn finish_native_object(dir: str, od: str, stem: str, obj: []byte, prog: checker
     if link_object(objp, binp, m, prog) != 0 {
         return fail(dir, "cc failed to link the own-backend object")
     }
+    match teko::io::write_file(teko::str::concat(binp, ".tsym"), codegen::tk_emit_tsym(prog)) { error => { }; null => { } }
+    teko::io::println(teko::str::concat("teko: ", dir, teko::str::concat(": built ", binp, " (own backend)")))
+    0
+}
+
+/**
+ * emit_native_wasm — the wasm own-backend tail (#389 C1-5, reworked to the
+ * ratified `backend-wasm.md` §1.2 shape): assemble the lowered LIR module
+ * into a whole `WasmModule` (`teko::backend::wasm_assemble_program` —
+ * stackify every function, wire the WASI import set, synthesize + export
+ * `_start`, lay out linear memory; propagates any pipeline honest-stop, e.g.
+ * `C1-globals`/`C1-i128`/`C1-f16`/`C1-irreducible`, unchanged as a `fail`,
+ * M.3), then serialize it (`emit_wasm`) to a finished, SELF-CONTAINED
+ * `.wasm` module and write it DIRECTLY to `<od>/<stem>.wasm`. §1.2 is
+ * law: the wasm path emits ONE module that IMPORTS its runtime via WASI
+ * imports — there is no relocatable-object + external-linker step (no
+ * `wasm-ld`, no `zig`-compiled shim), so the emitted bytes ARE the runnable
+ * artifact (the module already embeds its linear memory, the `_start`
+ * export, and its active data). Writes the `.tsym` symbol map beside the
+ * module (best-effort, mirrors `finish_native_object`) and prints the
+ * EXCLUSIVE `"(own backend)"` success marker the differential harness keys
+ * on (F1(a)). The `Wasm32Browser` variant's JS-import self-contained module
+ * + glue is C1-7 territory (§9) — reaching it here is a clean, NAMED stop,
+ * not a silent Browser-as-WASI fallback.
+ *
+ * @param dir      the project directory (diagnostics)
+ * @param od       the slash-stripped output directory (already created)
+ * @param stem     the output artifact name
+ * @param lmod     the lowered LIR module
+ * @param prog     the checked program (`.tsym` emission)
+ * @param m        the resolved manifest (unused today — no wasm-side
+ *                 `[extern]`/`cc` override yet; kept for signature parity
+ *                 with the register targets' own `emit_native_*` tails)
+ * @param browser  `true` for the `Wasm32Browser` variant (JS-import + glue,
+ *                 C1-7 territory — not yet wired)
+ * @return         0 on a successful build, else the failing status
+ */
+fn emit_native_wasm(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest, browser: bool) -> i32 {
+    if browser {
+        return fail(dir, "wasm32-browser: the JS-import Browser variant is not wired yet (#389 C1-7 territory, backend-c1-wasm.md §9)")
+    }
+    let wmod = match teko::backend::wasm_assemble_program(lmod) { teko::backend::WasmModule as x => x; error as e => return fail(dir, e.message) }
+    let binp = teko::str::concat(od, "/", teko::str::concat(stem, ".wasm"))
+    match teko::io::write_file_bytes(binp, teko::backend::emit_wasm(wmod)) { error as e => return fail(dir, e.message); null => { } }
     match teko::io::write_file(teko::str::concat(binp, ".tsym"), codegen::tk_emit_tsym(prog)) { error => { }; null => { } }
     teko::io::println(teko::str::concat("teko: ", dir, teko::str::concat(": built ", binp, " (own backend)")))
     0
