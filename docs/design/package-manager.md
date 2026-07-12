@@ -514,11 +514,13 @@ is reconstructible and does NOT enter the lockfile.
 
 ---
 
-## 4. Security / threat-model
+## 4. Security / threat-model — 3 layers, default-strict (owner APPROVED 2026-07-11)
 
-The package manager's security posture is a first-class deliverable, not an afterthought. Teko has
-two **structural** wins here that npm and Cargo lack — assert them strongly — and a short list of
-concerns the owner has decided how to handle.
+The package manager's security posture is a first-class deliverable, not an afterthought. Teko's
+approach is **DEFAULT-STRICT** (no opt-in): three mandatory layers stack verification-reproducible
++ integrity + transparency + authenticity. Two **structural** wins over npm/Cargo/Go + a keyless
+signature model (Sigstore) + counter-signing at the registry layer = **consumer-first, trustless
+end-to-end**.
 
 ### 4.1 Structural wins
 
@@ -537,33 +539,72 @@ concerns the owner has decided how to handle.
   correctness one. This is the direct answer to "M.2 is a straitjacket": M.2 is precisely what
   makes the distributed cache trustless (the Bazel remote-cache argument).
 
-### 4.2 What is signed (integrity now, authenticity later)
+### 4.2 Three-layer security model (ENFORCED BY DEFAULT)
 
-- The **integrity hash** covers the ENTIRE `.tkl` (tkh + tkb + tsym), computed at
-  publish/fetch time.
+#### Layer 0 — Verification-reproducible
+Byte-identity (§2.6, M.2): a consumer recompiles the source AST in their own context and compares
+the output hash. **Prerequisite:** gensym must be **DETERMINISTIC** (currently gensym is
+buf.len-based, context-dependent → byte-identity only holds whole-program today; W16/C12.1
+ratified as the fix for per-fn gensym stability). Until W16/C12.1, byte-identity verification
+applies at the whole-program level only.
+
+#### Layer 1 — Integrity (SHA-256 CRYPT OGRAPHIC, MANDATORY)
+- The **integrity hash** (SHA-256, no fallback to FNV) covers the **ENTIRE `.tkl`** (tkh + tkb + tsym),
+  computed at publish/fetch time. FNV is used ONLY as a cache-key (non-security).
 - The **lockfile PINS** that hash (`LockEntry.integrity`); a build verifies every `.tkl` against
-  its pinned hash (tamper detection — §3.4).
-- The **registry index** carries the hash (the index entry for `(name, version)` includes the
-  `.tkl` integrity), so a fetch can be checked before the artifact is trusted.
-- **Authenticity** (a crypto publisher SIGNATURE over the hash — Ed25519/OpenPGP, PK7) is a LATER
-  layer for registry PACKAGES — EXCEPT for `tool` run-time execution (§4.3, §5).
+  its pinned hash (tamper detection — §3.4). Build FAILS if hash mismatches.
+- The **registry index** carries the hash (the index entry for `(name, version)` includes the `.tkl`
+  integrity hash), so a fetch can be verified before the artifact is trusted.
+- **Prerequisite:** `teko::crypto::hash` with SHA-256 streaming already exists (`src/crypto/hash.tks`
+  — `sha256_of` + streaming). Layer 1 gates on this, not deferred.
 
-### 4.3 Concerns (owner's decisions)
+#### Layer 2 — Transparency (Merkle append-only log + registry counter-signing + offline verify)
+- **Merkle append-only log:** the registry maintains a **transparent log** of every published `.tkb`
+  (structurally identical to Rekor, Sigstore's transparency log). The log is APPEND-ONLY (gossip-auditable).
+- **Registry counter-signing:** every `.tkl` published to the registry is **automatically
+  counter-signed by the registry** (following NuGet's model — ~100% baseline, zero effort from
+  publisher). The signature anchors the artifact to the log entry.
+- **Federated + gossip:** the registry is **not a single point of failure** — federation + gossip
+  auditing (mirrors, secondary registries) from day 1 (Go sumdb reference).
+- **Offline verification:** the proofs travel WITH the artifact (no network call during verify) — a
+  **bundle** carries the log proof so a consumer can verify inclusion offline.
 
-- **Tools re-introduce arbitrary execution at RUN time (§5).** A `tool` is an executable a dev
-  installs and RUNS — that is arbitrary code execution, unlike a linked library package. This is
-  the ONE place authenticity must **not** be deferred: a `tool` installed from a REMOTE registry
-  must be authenticity-checked (signature), not merely integrity-hashed. Law-first recommendation
-  (M.1/M.3): until PK7 signing lands, installing a `tool` from a remote registry is an
-  **honest-stop** (`teko` refuses with a clear "remote tool install requires signature
-  verification (PK7)"), while a `tool` from a local `path=`/`git=` source — dev-controlled, same
-  trust as building your own source — works now. See §8 for the confirm-this flag.
+#### Layer 3 — Authenticity (KEYLESS, Sigstore/Fulcio + OIDC)
+- **Keyless identity (Sigstore/Fulcio/Rekor):** identities are OIDC-bound (GitHub, Google, etc.);
+  short-lived ephemeral certs (15 min) issued on-the-fly. ZERO key management.
+- **CI workflow provenance:** the signature proves "this came from this repo+commit+CI run" —
+  attestation-as-a-service.
+- **MANDATORY for `tool` artifacts** — a tool runs arbitrary code at install time, so authenticity
+  is non-deferred. See §5.3 / honest-stop.
+- **OPTIONAL for library packages** — but ENFORCED BY DEFAULT (consumer policy is per-identity +
+  log-inclusion, not fingerprints of certificates — survives key rotation). Opt-out is explicit
+  per-project, recorded, auditable.
+
+**NOT implemented:** SLSA build-provenance (atestar a máquina de build) — Teko's byte-identity
+(recompile-and-check) substitutes for SLSA L2/L3 (no pre-built artifacts, consumer builds from
+source). The verify-reproducible invariant is Teko's answer to "prove the build did not contain
+malware".
+
+### 4.3 Tools (arbitrary code at RUN time)
+
+A `tool` is an executable a dev installs and RUNS — that is arbitrary code execution. This is the
+**ONE place** layer-2 (transparency) is insufficient and layer-3 (authenticity) is MANDATORY, not
+deferred (see §5.3 for the full profile).
+
+**Law-first policy (M.1/M.3):** until PK7 keyless signing lands, installing a `tool` from a remote
+registry is an **honest-stop** (`teko` refuses with a clear "remote tool install requires signature
+verification (PK7)"). A `tool` from a local `path=`/`git=` source — dev-controlled, same trust as
+building your own source — works now.
+
+### 4.4 Other concerns (operator-level, not compiler)
+
 - **Typosquatting.** `@publisher/name` scoping helps (a name is owned within a publisher scope).
   The registry (deferred, §7) needs anti-squat policy + publisher identity verification. Recorded
   as a registry-layer requirement, not a compiler one.
 - **Runtime capability / sandbox.** v1 = full-trust-once-installed (like Cargo/npm). FUTURE =
-  capability-based execution / an opt-in **WASI-sandbox** for running tools in isolation (connects
-  to the wasm backend targets N6a/N6b). Recorded as a future direction, out of PK0–PK3 scope.
+  capability-based execution / an opt-in **WASI-sandbox** for running tools in isolation (chroot to
+  project, client-open / server-opt-in). Connects to wasm backend targets (N6a WASI / N6b browser).
+  Recorded as a future direction, out of PK0–PK3 scope.
 
 ---
 
@@ -757,8 +798,9 @@ declared interface fed by an in-memory fixture today and by the real store when 
 
 New module `src/build/lockfile.tks` (namespace `teko::build`): `LockEntry`, `Lockfile`,
 `write_lockfile`, `parse_lockfile`, `lockfile_matches`; integrity hash over the whole `.tkl`
-(reuse `teko::crypto::hash` / the existing FNV or a SHA-256 when `teko::crypto` is available —
-honest-stop to a content hash the store already computes if crypto is not yet wired).
+**SHA-256 CRYPTOGRAPHIC (MANDATORY, no FNV fallback)** via `teko::crypto::hash` (streaming
+sha256_of; already exists in `src/crypto/hash.tks` #194-204). FNV is used ONLY for cache-keys
+(non-security). Layer-1 integrity gates on sha256 being wired.
 
 - **Fixtures:**
   - `L1` (VM `.tkt`) resolve → `write_lockfile` → `parse_lockfile` → `lockfile_matches` = true
@@ -826,9 +868,10 @@ later without redesign.
 - **PK5 — CLI verbs beyond `clean`/`--no-cache`.** `add`/`update`/`publish`/`vendor`/`tree`.
 - **PK6 — registry (index / protocol).** Recommended shape = a static HTTPS index (no live
   server needed for resolution); the index carries the per-`(name,version)` integrity hash.
-- **PK7 — signing (crypto authenticity).** Ed25519/OpenPGP publisher signatures over the integrity
-  hash. **Exception:** authenticity for `tool` run-time execution is NOT deferred (§4.3/§5) — it
-  is the honest-stop gate on remote tool installs from day one.
+- **PK7 — keyless signing (Sigstore/Fulcio/Rekor).** OIDC-bound short-lived ephemeral certs
+  (GitHub, Google, etc.) + transparent log integration. Replaces traditional key-based signatures
+  (Ed25519/OpenPGP are NOT used). **Exception:** authenticity for `tool` run-time execution is
+  NOT deferred (§4.3/§5.3) — it is the honest-stop gate on remote tool installs from day one.
 - **Workspaces** (multi-package repos) — a later CLI/resolver extension.
 - **Registry server + site `teko-lang.cloud` + package server.** The owner's direction: server
   LATER; first the version + the definitions (this doc). The VPS (`root@187.77.42.87`,
@@ -875,7 +918,7 @@ later without redesign.
    architect; this doc chooses a PARALLEL `[tools]` section (M.2 explicit — install ≠ link). Please
    confirm the section name (`[tools]`) or veto in favor of a role flag on `[dependencies]`.
 2. **Remote `tool` install honest-stop until PK7.** This doc gates remote-registry tool installs
-   behind signature verification (§4.3/§5.2) — a `tool` runs arbitrary code, so integrity-only is
+   behind signature verification (§4.3/§5.3) — a `tool` runs arbitrary code, so integrity-only is
    insufficient. Local `path=`/`git=` tools work now. Confirm this is the desired v1 posture (it
    means the FIRST usable remote tools wait for PK7).
 3. **`@publisher/name` ↔ canonical-root binding.** The registry scope `@publisher/unit` maps to the
@@ -883,12 +926,8 @@ later without redesign.
    binding the registry scope to the declared root (must `@acme/json`'s `.tkp` declare a matching
    canonical root? is `@publisher` recorded in the `.tkh` manifest block?) is a registry-layer
    detail. Minor; can be settled when PK6 (registry) opens, but flagged so it is not forgotten.
-4. **Integrity hash algorithm now.** This doc uses "the content hash covering the whole `.tkl`".
-   If `teko::crypto::hash` (SHA-256) is not yet wired when C6 lands, the honest fallback is the
-   store's existing content hash (FNV frame). Confirm SHA-256-when-available is acceptable, or pin
-   the algorithm now.
 
-None of these four blocks the PK0–PK3 design or the crumb sequence; items 1 and 2 are the two the
+None of these three blocks the PK0–PK3 design or the crumb sequence; items 1 and 2 are the two the
 owner most likely wants to weigh in on before C8 (the `tool` crumb).
 
 ---
