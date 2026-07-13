@@ -805,8 +805,26 @@ fn lwt_lowers_match_statement_merges_with_zero_block_args() {
     teko::assert::str_contains(text, "jump #B1()")
 }
 
+/**
+ * lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch — PR #553
+ * review finding, `match`'s own shape (mirrors
+ * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`'s if-shape
+ * proof): `let s=1; match x { 1 => { defer { s = s + 100 } }; _ => {} };
+ * return s` — the `defer` registers ONLY inside arm0's own body. Arm0's own
+ * block (`#B2`) must fire it — LIFO, from the defer-delta base THIS arm
+ * itself started at — as part of ITS OWN close, immediately before its jump
+ * to the merge (`#B1`); the wildcard arm's own body (`#B4`, which never
+ * registers a defer) just jumps straight there too, with nothing to replay;
+ * the merge/tail block (`#B1`) must contain NOTHING but the plain `ret %1` —
+ * proving arm0's own defer registration was reset off the pending-defer
+ * stack before the merge, never replayed a second time there (the exact
+ * leak `close_arm_replaying_defers` fixes for `lower_match_arm_stmt`, the
+ * SAME class of bug as the if-statement's own arms).
+ *
+ * @return void
+ */
 #test
-fn lwt_probe_defer_inside_match_arm() {
+fn lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch() {
     let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
     let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
     let subject = lwt_var("x", checker::PrimKind::I64)
@@ -820,7 +838,9 @@ fn lwt_probe_defer_inside_match_arm() {
     let f = lwt_fn("match_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
-    teko::io::println(text)
+    teko::assert::str_contains(text, "  #B1:\n    ret %1\n  #B2:")
+    teko::assert::str_contains(text, "  #B2:\n    %4 = const 100\n    %5 = iadd %1, %4\n    jump #B1()")
+    teko::assert::str_contains(text, "  #B4:\n    jump #B1()")
 }
 
 #test
