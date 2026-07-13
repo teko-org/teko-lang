@@ -1,0 +1,1280 @@
+use teko::lir
+
+/**
+ * MAluOpRiscv — the closed set of RISC-V integer ALU mnemonics the
+ * three-address register-register `MAluRRiscv` and the register-immediate12
+ * `MAluIRiscv` select. The register-register roots (`Add`/`Sub`/`And`/`Or`/
+ * `Xor`/`Sll`/`Srl`/`Sra`, plus the M-extension `Mul`/`Div`/`Divu`/`Rem`/
+ * `Remu`) each name a single native RV64 instruction — UNLIKE x86, RISC-V is
+ * three-address and its division/remainder are one M-extension instruction
+ * apiece (§4.2/§4.3). The immediate roots (`Addi`/`Xori`/`Sltiu`) cover the
+ * low-12 add of the `lui`+`addi` constant pair, the `not` (`xori rd, rs, -1`),
+ * and the set-less-than-immediate step of the value-compare sequence (§4.4).
+ * Set-less-than register-register (`slt`/`sltu`) is its own `MSltRiscv` case,
+ * so it rides no member here.
+ *
+ * @since #387 B2-2
+ */
+pub type MAluOpRiscv = enum { Add; Sub; And; Or; Xor; Sll; Srl; Sra; Mul; Div; Divu; Rem; Remu; Addi; Xori; Sltiu }
+
+/**
+ * MMemSizeRiscv — the access width an `MLoadRiscv`/`MStoreRiscv` transfers, in
+ * RISC-V integer-width naming: `B` (byte, 8-bit), `H` (halfword, 16-bit), `W`
+ * (word, 32-bit), `D` (doubleword, 64-bit). A load additionally carries a sign
+ * flag selecting the sign-extending (`lb`/`lh`/`lw`) versus zero-extending
+ * (`lbu`/`lhu`/`lwu`) narrow form; the full-width `ld` and every store
+ * (`sb`/`sh`/`sw`/`sd`) ignore sign. The F/D float widths are the `B2-fp`
+ * honest-stop (0.3.1) and enter with the float memory ops, not here.
+ *
+ * @since #387 B2-2
+ */
+pub type MMemSizeRiscv = enum { B; H; W; D }
+
+/**
+ * RelocKindRiscv — which RISC-V ELF relocation an address-materialization,
+ * call, or (future) cross-section branch owes the B2 encoder. `Call` is the
+ * `auipc`+`jalr` call macro (`R_RISCV_CALL_PLT`). `PcRelHi20`/`PcRelLo12` are
+ * the PAIRED data-address relocations of the `lla` `auipc`+`addi` sequence.
+ * `Branch`/`Jal` name the cross-section branch relocations for symmetry and
+ * future far-branch relaxation (the MVP patches every intra-function branch
+ * directly, so a B2 object never carries one). `Abs64` is the future
+ * data-global path (`R_RISCV_64`, the `B2-globals` stop). Declared with the IR
+ * (mirroring x86's `RelocKindX86` home in `minst_x86.tks`); the encoder (B2-5)
+ * maps each to its numeric `R_RISCV_*` type.
+ *
+ * @since #387 B2-2
+ */
+pub type RelocKindRiscv = enum { Call; PcRelHi20; PcRelLo12; Branch; Jal; Abs64 }
+
+/**
+ * MLiRiscv — `dst = imm` for a small immediate that fits the signed 12-bit
+ * window (`addi rd, x0, imm12`), the selection of a small `LConstInt`. A
+ * 32-bit literal splits into `MLuiRiscv`+`MAluIRiscv` and a 64-bit literal
+ * hits the `B2-bigimm` honest-stop, so this case carries only the ±2048 form
+ * (§4.1).
+ *
+ * @since #387 B2-2
+ */
+pub type MLiRiscv = struct {
+    /**
+     * dst — the destination register the immediate is written to.
+     */
+    dst: MReg
+    /**
+     * imm — the signed 12-bit immediate (the encoder range-checks ±2048).
+     */
+    imm: i32
+}
+
+/**
+ * MLuiRiscv — `dst = imm << 12` (`lui rd, imm20`), the high-20-bit half of a
+ * 32-bit constant materialization whose low-12 half is a following
+ * `MAluIRiscv`(`Addi`) (§4.1). The immediate is the raw 20-bit U-type field.
+ *
+ * @since #387 B2-2
+ */
+pub type MLuiRiscv = struct {
+    /**
+     * dst — the destination register the upper immediate is written to.
+     */
+    dst: MReg
+    /**
+     * imm — the unsigned 20-bit U-type immediate (bits [31:12] of the result).
+     */
+    imm: u32
+}
+
+/**
+ * MAuipcRiscv — `dst = pc + (imm << 12)` (`auipc rd, imm20`), the standalone
+ * PC-relative upper-immediate. The `lla` and `call` sequences carry their own
+ * relocated `auipc` inside `MLlaRiscv`/`MCallRiscv`; this bare case is the
+ * plain, un-relocated U-type form (§6.4).
+ *
+ * @since #387 B2-2
+ */
+pub type MAuipcRiscv = struct {
+    /**
+     * dst — the destination register the PC-relative value is written to.
+     */
+    dst: MReg
+    /**
+     * imm — the unsigned 20-bit U-type immediate (bits [31:12] of the addend).
+     */
+    imm: u32
+}
+
+/**
+ * MAluRRiscv — a three-address register-register ALU op: `dst = a <op> b`
+ * (`add`/`sub`/`and`/`or`/`xor`/`sll`/`srl`/`sra`, the M-extension
+ * `mul`/`div`/`divu`/`rem`/`remu`). RISC-V is three-address, so — UNLIKE x86's
+ * destructive `MAluRmX86` — the destination is written directly with NO
+ * copy-at-def, `dst` is a pure def, and division/remainder each collapse to a
+ * single native instruction (§4.2/§4.3). `wide` selects the RV64 width at
+ * encode: the base `OP` form (64-bit) when true, the `OP-32` `*w` form
+ * (`addw`/`subw`/…/`remuw`, 32-bit) when false.
+ *
+ * @since #387 B2-2
+ */
+pub type MAluRRiscv = struct {
+    /**
+     * op — which register-register ALU mnemonic to emit.
+     */
+    op: MAluOpRiscv
+    /**
+     * dst — the destination register the result is written to.
+     */
+    dst: MReg
+    /**
+     * a — the first source register (rs1).
+     */
+    a: MReg
+    /**
+     * b — the second source register (rs2).
+     */
+    b: MReg
+    /**
+     * wide — true for the 64-bit base `OP` form, false for the 32-bit `*w`
+     * `OP-32` form.
+     */
+    wide: bool
+}
+
+/**
+ * MAluIRiscv — a register-immediate12 ALU op: `dst = a <op> imm`
+ * (`addi`/`xori`/`sltiu`), the low-12 add of the constant pair, the `not`
+ * (`xori rd, rs, -1`), and the set-less-than-immediate step of a value-compare
+ * (§4.1/§4.4). The modelled operations act on the full XLEN, so this case
+ * carries no `wide` flag (the RV64 32-bit `addiw` enters with a later slice).
+ *
+ * @since #387 B2-2
+ */
+pub type MAluIRiscv = struct {
+    /**
+     * op — which register-immediate ALU mnemonic to emit.
+     */
+    op: MAluOpRiscv
+    /**
+     * dst — the destination register the result is written to.
+     */
+    dst: MReg
+    /**
+     * a — the source register (rs1).
+     */
+    a: MReg
+    /**
+     * imm — the signed 12-bit immediate (the encoder range-checks ±2048).
+     */
+    imm: i32
+}
+
+/**
+ * MSltRiscv — a set-less-than: `dst = (a < b) ? 1 : 0` (`slt`/`sltu`), the
+ * boolean-materializing primitive the value-compare sequence builds on (§4.4).
+ * RISC-V has no `setcc`, so an integer compare used as a plain value lowers to
+ * this plus small `xori`/`sltiu`/`sub` fixups (isel's job, B2-3); the branch
+ * form is instead a single `MBranchRiscv`.
+ *
+ * @since #387 B2-2
+ */
+pub type MSltRiscv = struct {
+    /**
+     * dst — the destination register the 0/1 result is written to.
+     */
+    dst: MReg
+    /**
+     * a — the first compared register (rs1).
+     */
+    a: MReg
+    /**
+     * b — the second compared register (rs2).
+     */
+    b: MReg
+    /**
+     * is_unsigned — true for the unsigned `sltu`, false for the signed `slt`.
+     * Named `is_unsigned` for parity with the div/rem signedness convention.
+     */
+    is_unsigned: bool
+}
+
+/**
+ * MLoadRiscv — load a value from memory (`ld`/`lw`/`lh`/`lb`/`lbu`/`lhu`/`lwu
+ * rd, off(rs1)`), the selection of `LLoad`. `size` is the transfer width;
+ * `sign` picks the sign-extending narrow form over the zero-extending one
+ * (`lb` vs `lbu`, etc.). The full-width `ld` ignores sign. RISC-V's only
+ * addressing mode is base+imm12, carried in the neutral `MMem` (§4.1).
+ *
+ * @since #387 B2-2
+ */
+pub type MLoadRiscv = struct {
+    /**
+     * size — the access width (byte/half/word/double).
+     */
+    size: MMemSizeRiscv
+    /**
+     * sign — true when a narrow load sign-extends (`lb`/`lh`/`lw`), false for
+     * the zero-extending form (`lbu`/`lhu`/`lwu`); ignored at width `D`.
+     */
+    sign: bool
+    /**
+     * dst — the destination register the loaded value is written to.
+     */
+    dst: MReg
+    /**
+     * mem — the base-plus-displacement12 address loaded from.
+     */
+    mem: MMem
+}
+
+/**
+ * MStoreRiscv — store a value to memory (`sd`/`sw`/`sh`/`sb rs2, off(rs1)`),
+ * the selection of `LStore`. `size` is the stored width; stores never
+ * sign-extend, so this case carries no `sign` field (§4.1).
+ *
+ * @since #387 B2-2
+ */
+pub type MStoreRiscv = struct {
+    /**
+     * size — the access width (byte/half/word/double).
+     */
+    size: MMemSizeRiscv
+    /**
+     * src — the register holding the value stored.
+     */
+    src: MReg
+    /**
+     * mem — the base-plus-displacement12 address stored to.
+     */
+    mem: MMem
+}
+
+/**
+ * MBranchRiscv — a fused compare-and-branch: `if a <cond> b goto target`
+ * (`beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu rs1, rs2, block`), the taken edge of an
+ * `LBranch`. RISC-V branches ARE compare-and-branch, so a fused compare+branch
+ * is a SINGLE B-type instruction — no separate compare, no flags register
+ * (§4.4). The four order-only conditions (`GT`/`LE`/`HI`/`LS`) reuse the
+ * `blt`/`bge`/`bltu`/`bgeu` mnemonics with the two operands swapped. The B2
+ * encoder scrambles the block displacement into the B-type immediate (§6.3).
+ *
+ * @since #387 B2-2
+ */
+pub type MBranchRiscv = struct {
+    /**
+     * cond — the abstract condition code tested between `a` and `b`.
+     */
+    cond: MCond
+    /**
+     * a — the first compared register (rs1 before any operand swap).
+     */
+    a: MReg
+    /**
+     * b — the second compared register (rs2 before any operand swap).
+     */
+    b: MReg
+    /**
+     * target — the machine-block id taken when `cond` holds.
+     */
+    target: u32
+}
+
+/**
+ * MJalRiscv — an unconditional branch (`jal x0, block`, the link discarded),
+ * the selection of `LJump` after its edge moves are emitted. The B2 encoder
+ * scrambles the block displacement into the J-type immediate (§6.3).
+ *
+ * @since #387 B2-2
+ */
+pub type MJalRiscv = struct {
+    /**
+     * target — the machine-block id this branch transfers control to.
+     */
+    target: u32
+}
+
+/**
+ * MJalrRiscv — an indirect jump-and-link (`jalr rd, off(rs1)`), the general
+ * register-relative control-transfer primitive. The higher-level call/return
+ * cases (`MCallRiscv`/`MCallIndRiscv`/`MRetRiscv`) model their own fixed
+ * `jalr` shapes; this bare case is the plain form (§4.1).
+ *
+ * @since #387 B2-2
+ */
+pub type MJalrRiscv = struct {
+    /**
+     * dst — the register the return address (`pc + 4`) is written to.
+     */
+    dst: MReg
+    /**
+     * base — the register holding the jump-target base address (rs1).
+     */
+    base: MReg
+    /**
+     * offset — the signed 12-bit displacement added to `base`.
+     */
+    offset: i32
+}
+
+/**
+ * MCallRiscv — a direct call (`auipc ra, 0 ; jalr ra, 0(ra)` with one
+ * `R_RISCV_CALL_PLT` relocation on the `auipc`), the selection of `LCall`
+ * after its LP64D argument lowering. The linker fills BOTH instructions from
+ * the single reloc, so no synthesized label is needed (§4.5).
+ *
+ * @since #387 B2-2
+ */
+pub type MCallRiscv = struct {
+    /**
+     * sym — the callee's already-mangled (or runtime `tk_*`) symbol.
+     */
+    sym: str
+    /**
+     * uses — every physical argument register this call pins (the liveness set
+     * the shared regalloc reads).
+     */
+    uses: []MReg
+    /**
+     * ret_reg — the physical register (`a0`/`fa0`) the callee's result lands
+     * in, meaningful only when `has_result` is true.
+     */
+    ret_reg: MReg
+    /**
+     * has_result — true when the call yields a value the caller consumes.
+     */
+    has_result: bool
+    /**
+     * variadic — mirrors the callee's variadic marker (LP64D passes named
+     * float args in FPRs, then the tail in GPRs).
+     */
+    variadic: bool
+}
+
+/**
+ * MCallIndRiscv — an indirect call (`jalr ra, 0(rs1)`) through a register
+ * holding the callee's address, the selection of `LCallIndirect` (the
+ * vtable/closure dispatch path).
+ *
+ * @since #387 B2-2
+ */
+pub type MCallIndRiscv = struct {
+    /**
+     * target — the register holding the callee's address (rs1).
+     */
+    target: MReg
+    /**
+     * uses — every physical argument register this call pins (the liveness set
+     * the shared regalloc reads).
+     */
+    uses: []MReg
+    /**
+     * ret_reg — the physical register (`a0`/`fa0`) the callee's result lands
+     * in, meaningful only when `has_result` is true.
+     */
+    ret_reg: MReg
+    /**
+     * has_result — true when the call yields a value the caller consumes.
+     */
+    has_result: bool
+}
+
+/**
+ * MLlaRiscv — a PC-relative address materialization: `auipc rd, %pcrel_hi(sym)
+ * ; addi rd, rd, %pcrel_lo(label)` with the PAIRED `R_RISCV_PCREL_HI20`/
+ * `R_RISCV_PCREL_LO12_I` relocations and a synthesized local `.text` label,
+ * the selection of `LGlobalAddr`/`LFuncAddr` (the arm64 `ADRP`+`ADD` / x86
+ * `lea rip` analog). isel emits one `MLlaRiscv`; the B2 encoder expands it to
+ * the two instructions, the two relocations, and the label (§4.5/§7.2). RISC-V
+ * has a single PC-relative addressing mechanism, so — UNLIKE x86's
+ * `MLeaRipX86` — this case carries no per-instruction relocation-kind choice.
+ *
+ * @since #387 B2-2
+ */
+pub type MLlaRiscv = struct {
+    /**
+     * dst — the destination register the full address is written to.
+     */
+    dst: MReg
+    /**
+     * sym — the already-final target symbol name.
+     */
+    sym: str
+}
+
+/**
+ * MFrameAddrRiscv — the abstract address of a reserved frame slot
+ * (`addi rd, sp, off`, resolved once B2 finalizes the frame layout), the
+ * selection of `LAlloca`. The concrete `sp` displacement is filled from the
+ * `FrameLayoutRiscv` side-table at encode (§6.5), so the IR carries only the
+ * slot index.
+ *
+ * @since #387 B2-2
+ */
+pub type MFrameAddrRiscv = struct {
+    /**
+     * dst — the destination register the slot's address is written to.
+     */
+    dst: MReg
+    /**
+     * slot — the frame-slot index (an `MFuncRiscv.frame` table entry).
+     */
+    slot: u32
+}
+
+/**
+ * MRetRiscv — a return terminator (`jalr x0, 0(ra)`, i.e. `ret`). The returned
+ * value (if any) is already pinned to `a0`/`fa0` by a preceding move, and the
+ * epilogue is prepended by the B2 encoder (§6.5), so this case carries no
+ * operand — the selection of `LRet`.
+ *
+ * @since #387 B2-2
+ */
+pub type MRetRiscv = struct { }
+
+/**
+ * MInstRiscv — the RISC-V RV64G machine-instruction payload: one of the LP64D-
+ * keyed cases above. An `MInstRiscv` carries virtual registers (the shared
+ * regalloc colors them) and physical-register pins (the LP64D ABI); it holds
+ * no encoded bytes. The F/D float family (float ALU/compare/convert/negate,
+ * the `fa*` argument path) is the `B2-fp` honest-stop (0.3.1) and enters this
+ * variant then, not now (§4.1).
+ *
+ * @since #387 B2-2
+ */
+pub type MInstRiscv = variant MLiRiscv | MLuiRiscv | MAuipcRiscv | MAluRRiscv | MAluIRiscv | MSltRiscv | MLoadRiscv | MStoreRiscv | MBranchRiscv | MJalRiscv | MJalrRiscv | MCallRiscv | MCallIndRiscv | MLlaRiscv | MFrameAddrRiscv | MRetRiscv
+
+/**
+ * MBlockRiscv — a RISC-V machine basic block: its id, its block-args (the
+ * SSA-lite merge parameters carried over from LIR block-args), and its
+ * instruction stream. Mirrors x86's `MBlockX86`/arm64's `MBlock` shape.
+ *
+ * @since #387 B2-2
+ */
+pub type MBlockRiscv = struct {
+    /**
+     * id — the block's identifier, referenced by `MBranchRiscv`/`MJalRiscv`
+     * targets.
+     */
+    id: u32
+    /**
+     * params — the block-arg registers a merge into this block carries
+     * (mirrors `LBlock.params`, threaded through VReg-for-VReg by isel).
+     */
+    params: []MReg
+    /**
+     * insts — the instruction stream, in order, normally ending in a
+     * terminator (`MBranchRiscv`/`MJalRiscv`/`MRetRiscv`).
+     */
+    insts: []MInstRiscv
+}
+
+/**
+ * MFuncRiscv — one selected RISC-V function: its already-mangled symbol, its
+ * blocks, and its frame-slot table. Mirrors x86's `MFuncX86` shape; the frame
+ * table grows one entry per selected `LAlloca` and B2 finalizes each entry's
+ * `sp` displacement. It carries no `used_callee_saved` set — the encoder
+ * re-derives the save-set by scanning the physical function (the A4/B1
+ * precedent, §6.5).
+ *
+ * @since #387 B2-2
+ */
+pub type MFuncRiscv = struct {
+    /**
+     * symbol — the function's already-mangled (or lifted) symbol.
+     */
+    symbol: str
+    /**
+     * blocks — the function's machine basic blocks, in selection order.
+     */
+    blocks: []MBlockRiscv
+    /**
+     * frame — the reserved frame slots, one entry per selected `LAlloca`, in
+     * reservation order (each entry reuses `LAlloca`'s byte-size/alignment).
+     */
+    frame: []lir::LAlloca
+}
+
+/**
+ * MModuleRiscv — the whole selected RISC-V program: its functions, plus the
+ * rodata/global/struct-layout tables carried THROUGH unchanged from the source
+ * `LModule` (the B2 encoder emits their bytes; isel never touches them).
+ * Mirrors x86's `MModuleX86` shape.
+ *
+ * @since #387 B2-2
+ */
+pub type MModuleRiscv = struct {
+    /**
+     * funcs — the selected functions, in declaration order.
+     */
+    funcs: []MFuncRiscv
+    /**
+     * rodata — the source `LModule`'s rodata table, unchanged.
+     */
+    rodata: []lir::LRodata
+    /**
+     * globals — the source `LModule`'s globals table, unchanged.
+     */
+    globals: []lir::LGlobal
+    /**
+     * layouts — the source `LModule`'s struct-layout table, unchanged.
+     */
+    layouts: []lir::LStructLayout
+}
+
+/**
+ * li_riscv — a small-immediate load `dst = imm` instruction (MLiRiscv).
+ *
+ * @param MReg dst  the destination register
+ * @param i32 imm  the signed 12-bit immediate
+ * @return MInstRiscv  the built instruction
+ */
+pub fn li_riscv(dst: MReg, imm: i32) -> MInstRiscv {
+    MLiRiscv { dst = dst; imm = imm }
+}
+
+/**
+ * lui_riscv — an upper-immediate `dst = imm << 12` instruction (MLuiRiscv).
+ *
+ * @param MReg dst  the destination register
+ * @param u32 imm  the unsigned 20-bit U-type immediate
+ * @return MInstRiscv  the built instruction
+ */
+pub fn lui_riscv(dst: MReg, imm: u32) -> MInstRiscv {
+    MLuiRiscv { dst = dst; imm = imm }
+}
+
+/**
+ * auipc_riscv — a PC-relative upper-immediate `dst = pc + (imm << 12)`
+ * instruction (MAuipcRiscv).
+ *
+ * @param MReg dst  the destination register
+ * @param u32 imm  the unsigned 20-bit U-type immediate
+ * @return MInstRiscv  the built instruction
+ */
+pub fn auipc_riscv(dst: MReg, imm: u32) -> MInstRiscv {
+    MAuipcRiscv { dst = dst; imm = imm }
+}
+
+/**
+ * alu_r_riscv — a three-address `dst = a <op> b` register-register instruction
+ * (MAluRRiscv). No copy-at-def — RISC-V is three-address (the arm64 shape).
+ *
+ * @param MAluOpRiscv op  which register-register ALU mnemonic to emit
+ * @param bool wide  true for the 64-bit base form, false for the 32-bit `*w`
+ * @param MReg dst  the destination register
+ * @param MReg a  the first source register (rs1)
+ * @param MReg b  the second source register (rs2)
+ * @return MInstRiscv  the built instruction
+ */
+pub fn alu_r_riscv(op: MAluOpRiscv, wide: bool, dst: MReg, a: MReg, b: MReg) -> MInstRiscv {
+    MAluRRiscv { op = op; dst = dst; a = a; b = b; wide = wide }
+}
+
+/**
+ * alu_i_riscv — a register-immediate12 `dst = a <op> imm` instruction
+ * (MAluIRiscv).
+ *
+ * @param MAluOpRiscv op  which register-immediate ALU mnemonic to emit
+ * @param MReg dst  the destination register
+ * @param MReg a  the source register (rs1)
+ * @param i32 imm  the signed 12-bit immediate
+ * @return MInstRiscv  the built instruction
+ */
+pub fn alu_i_riscv(op: MAluOpRiscv, dst: MReg, a: MReg, imm: i32) -> MInstRiscv {
+    MAluIRiscv { op = op; dst = dst; a = a; imm = imm }
+}
+
+/**
+ * slt_riscv — a set-less-than `dst = (a < b) ? 1 : 0` instruction (MSltRiscv).
+ *
+ * @param MReg dst  the destination register
+ * @param MReg a  the first compared register (rs1)
+ * @param MReg b  the second compared register (rs2)
+ * @param bool is_unsigned  true for `sltu`, false for the signed `slt`
+ * @return MInstRiscv  the built instruction
+ */
+pub fn slt_riscv(dst: MReg, a: MReg, b: MReg, is_unsigned: bool) -> MInstRiscv {
+    MSltRiscv { dst = dst; a = a; b = b; is_unsigned = is_unsigned }
+}
+
+/**
+ * load_riscv — a memory-load instruction (MLoadRiscv).
+ *
+ * @param MMemSizeRiscv size  the access width
+ * @param bool sign  true for a sign-extending narrow load
+ * @param MReg dst  the destination register
+ * @param MMem mem  the base-plus-displacement12 address loaded from
+ * @return MInstRiscv  the built instruction
+ */
+pub fn load_riscv(size: MMemSizeRiscv, sign: bool, dst: MReg, mem: MMem) -> MInstRiscv {
+    MLoadRiscv { size = size; sign = sign; dst = dst; mem = mem }
+}
+
+/**
+ * store_riscv — a memory-store instruction (MStoreRiscv).
+ *
+ * @param MMemSizeRiscv size  the access width
+ * @param MReg src  the register holding the stored value
+ * @param MMem mem  the base-plus-displacement12 address stored to
+ * @return MInstRiscv  the built instruction
+ */
+pub fn store_riscv(size: MMemSizeRiscv, src: MReg, mem: MMem) -> MInstRiscv {
+    MStoreRiscv { size = size; src = src; mem = mem }
+}
+
+/**
+ * branch_riscv — a fused compare-and-branch terminator (MBranchRiscv).
+ *
+ * @param MCond cond  the condition code tested between `a` and `b`
+ * @param MReg a  the first compared register (rs1)
+ * @param MReg b  the second compared register (rs2)
+ * @param u32 target  the machine-block id taken when `cond` holds
+ * @return MInstRiscv  the built instruction
+ */
+pub fn branch_riscv(cond: MCond, a: MReg, b: MReg, target: u32) -> MInstRiscv {
+    MBranchRiscv { cond = cond; a = a; b = b; target = target }
+}
+
+/**
+ * jal_riscv — an unconditional-branch terminator (MJalRiscv).
+ *
+ * @param u32 target  the machine-block id branched to
+ * @return MInstRiscv  the built instruction
+ */
+pub fn jal_riscv(target: u32) -> MInstRiscv {
+    MJalRiscv { target = target }
+}
+
+/**
+ * jalr_riscv — an indirect jump-and-link instruction (MJalrRiscv).
+ *
+ * @param MReg dst  the register the return address is written to
+ * @param MReg base  the register holding the target base address (rs1)
+ * @param i32 offset  the signed 12-bit displacement added to `base`
+ * @return MInstRiscv  the built instruction
+ */
+pub fn jalr_riscv(dst: MReg, base: MReg, offset: i32) -> MInstRiscv {
+    MJalrRiscv { dst = dst; base = base; offset = offset }
+}
+
+/**
+ * call_riscv — a direct-call instruction (MCallRiscv).
+ *
+ * @param str sym  the callee's already-mangled symbol
+ * @param []MReg uses  every physical argument register this call pins
+ * @param MReg ret_reg  the physical result register (meaningful iff
+ *                       `has_result`)
+ * @param bool has_result  true when the call yields a consumed value
+ * @param bool variadic  mirrors the callee's variadic marker
+ * @return MInstRiscv  the built instruction
+ */
+pub fn call_riscv(sym: str, uses: []MReg, ret_reg: MReg, has_result: bool, variadic: bool) -> MInstRiscv {
+    MCallRiscv { sym = sym; uses = uses; ret_reg = ret_reg; has_result = has_result; variadic = variadic }
+}
+
+/**
+ * call_ind_riscv — an indirect-call instruction (MCallIndRiscv).
+ *
+ * @param MReg target  the register holding the callee's address
+ * @param []MReg uses  every physical argument register this call pins
+ * @param MReg ret_reg  the physical result register (meaningful iff
+ *                       `has_result`)
+ * @param bool has_result  true when the call yields a consumed value
+ * @return MInstRiscv  the built instruction
+ */
+pub fn call_ind_riscv(target: MReg, uses: []MReg, ret_reg: MReg, has_result: bool) -> MInstRiscv {
+    MCallIndRiscv { target = target; uses = uses; ret_reg = ret_reg; has_result = has_result }
+}
+
+/**
+ * lla_riscv — a PC-relative address-materialization instruction (MLlaRiscv),
+ * the `auipc`+`addi` pair the B2 encoder expands with a paired relocation.
+ *
+ * @param MReg dst  the destination register
+ * @param str sym  the already-final target symbol name
+ * @return MInstRiscv  the built instruction
+ */
+pub fn lla_riscv(dst: MReg, sym: str) -> MInstRiscv {
+    MLlaRiscv { dst = dst; sym = sym }
+}
+
+/**
+ * frame_addr_riscv — a frame-slot address instruction (MFrameAddrRiscv).
+ *
+ * @param MReg dst  the destination register
+ * @param u32 slot  the frame-slot index
+ * @return MInstRiscv  the built instruction
+ */
+pub fn frame_addr_riscv(dst: MReg, slot: u32) -> MInstRiscv {
+    MFrameAddrRiscv { dst = dst; slot = slot }
+}
+
+/**
+ * ret_riscv — a return terminator (MRetRiscv). The returned value, if any, is
+ * already pinned to `a0`/`fa0` by a preceding move.
+ *
+ * @return MInstRiscv  the built instruction
+ */
+pub fn ret_riscv() -> MInstRiscv {
+    MRetRiscv { }
+}
+
+/**
+ * empty_mmodule_riscv — a module with no functions/rodata/globals/layouts (the
+ * isel seed, mirroring x86's `empty_mmodule_x86`).
+ *
+ * @return MModuleRiscv  the empty module
+ */
+pub fn empty_mmodule_riscv() -> MModuleRiscv {
+    MModuleRiscv { funcs = teko::list::empty(); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+/**
+ * new_mfunc_riscv — a fresh MFuncRiscv with an empty single block (#M0) and an
+ * empty frame table (mirrors x86's `new_mfunc_x86`).
+ *
+ * @param str symbol  the function's already-mangled symbol
+ * @return MFuncRiscv  the seeded function
+ */
+pub fn new_mfunc_riscv(symbol: str) -> MFuncRiscv {
+    let entry = MBlockRiscv { id = 0; params = teko::list::empty(); insts = teko::list::empty() }
+    MFuncRiscv { symbol = symbol; blocks = teko::list::push(teko::list::empty(), entry); frame = teko::list::empty() }
+}
+
+/**
+ * push_minst_block_riscv — a copy of `b` with `inst` appended to its
+ * instruction stream (an `append_minst_riscv` helper, mirrors x86's
+ * `push_minst_block_x86`).
+ *
+ * @param MBlockRiscv b  the block to extend
+ * @param MInstRiscv inst  the instruction to append
+ * @return MBlockRiscv  the extended block
+ */
+fn push_minst_block_riscv(b: MBlockRiscv, inst: MInstRiscv) -> MBlockRiscv {
+    MBlockRiscv { id = b.id; params = b.params; insts = teko::list::push(b.insts, inst) }
+}
+
+/**
+ * append_minst_riscv — a copy of `f` with `inst` appended to the block whose
+ * id is `block_id` (mirrors x86's `append_minst_x86`).
+ *
+ * @param MFuncRiscv f  the function to extend
+ * @param u32 block_id  which block's instruction stream gains `inst`
+ * @param MInstRiscv inst  the instruction to append
+ * @return MFuncRiscv  the extended function
+ */
+pub fn append_minst_riscv(f: MFuncRiscv, block_id: u32, inst: MInstRiscv) -> MFuncRiscv {
+    mut blocks: []MBlockRiscv = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let b = f.blocks[i]
+        let nb = if b.id == block_id { push_minst_block_riscv(b, inst) } else { b }
+        blocks = teko::list::push(blocks, nb)
+        i++
+    }
+    MFuncRiscv { symbol = f.symbol; blocks = blocks; frame = f.frame }
+}
+
+/**
+ * append_block_riscv — a copy of `f` with `blk` appended after its existing
+ * blocks (the multi-block/edge-split builder; `append_minst_riscv` then targets
+ * it by id). Mirrors x86's `append_block_x86`.
+ *
+ * @param MFuncRiscv f  the function to extend
+ * @param MBlockRiscv blk  the block to append
+ * @return MFuncRiscv  the extended function
+ */
+pub fn append_block_riscv(f: MFuncRiscv, blk: MBlockRiscv) -> MFuncRiscv {
+    MFuncRiscv { symbol = f.symbol; blocks = teko::list::push(f.blocks, blk); frame = f.frame }
+}
+
+/**
+ * append_frame_riscv — a copy of `f` with one frame slot reserved (one entry
+ * per selected `LAlloca`, in reservation order; the new slot's index is
+ * `f.frame.len` taken BEFORE the append). Mirrors x86's `append_frame_x86`.
+ *
+ * @param MFuncRiscv f  the function to extend
+ * @param lir::LAlloca slot  the alloca whose byte-size/alignment the slot reuses
+ * @return MFuncRiscv  the extended function
+ */
+pub fn append_frame_riscv(f: MFuncRiscv, slot: lir::LAlloca) -> MFuncRiscv {
+    MFuncRiscv { symbol = f.symbol; blocks = f.blocks; frame = teko::list::push(f.frame, slot) }
+}
+
+/**
+ * mreg_list_set_riscv — a copy of `xs` with position `index` replaced by `reg`
+ * (positions past the end are left unchanged). Mirrors x86's
+ * `mreg_list_set_x86`.
+ *
+ * @param []MReg xs  the register list
+ * @param u32 index  the position to replace
+ * @param MReg reg  the replacement register
+ * @return []MReg  the updated list
+ */
+fn mreg_list_set_riscv(xs: []MReg, index: u32, reg: MReg) -> []MReg {
+    mut out: []MReg = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out = teko::list::push(out, if (i to u32) == index { reg } else { xs[i] })
+        i++
+    }
+    out
+}
+
+/**
+ * set_block_param_riscv — a copy of `f` in which machine block `block_id`'s
+ * parameter at `index` is replaced by `reg`. A mirror block's params are built
+ * with a provisional register class (the VReg id is known up front, the class
+ * only once a feeding edge move is selected); this refines one entry to the
+ * class carried by that value. Mirrors x86's `set_block_param_x86`.
+ *
+ * @param MFuncRiscv f  the function to update
+ * @param u32 block_id  the block whose parameter is refined
+ * @param u32 index  the parameter position to replace
+ * @param MReg reg  the refined parameter register
+ * @return MFuncRiscv  the updated function
+ */
+pub fn set_block_param_riscv(f: MFuncRiscv, block_id: u32, index: u32, reg: MReg) -> MFuncRiscv {
+    mut blocks: []MBlockRiscv = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let b = f.blocks[i]
+        let nb = if b.id == block_id { MBlockRiscv { id = b.id; params = mreg_list_set_riscv(b.params, index, reg); insts = b.insts } } else { b }
+        blocks = teko::list::push(blocks, nb)
+        i++
+    }
+    MFuncRiscv { symbol = f.symbol; blocks = blocks; frame = f.frame }
+}
+
+/**
+ * add_mfunc_riscv — a copy of `m` with `f` appended (mirrors x86's
+ * `add_mfunc_x86`).
+ *
+ * @param MModuleRiscv m  the module to extend
+ * @param MFuncRiscv f  the function to append
+ * @return MModuleRiscv  the extended module
+ */
+pub fn add_mfunc_riscv(m: MModuleRiscv, f: MFuncRiscv) -> MModuleRiscv {
+    MModuleRiscv { funcs = teko::list::push(m.funcs, f); rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+}
+
+/**
+ * wide_suffix_riscv — the printer suffix for a `wide` flag: `""` for the 64-bit
+ * base form (`add`), `"w"` for the 32-bit `OP-32` form (`addw`). RISC-V folds
+ * the width into the mnemonic itself, so the suffix is appended with no dot.
+ *
+ * @param bool wide  the flag to render
+ * @return str  the mnemonic width suffix (`""` or `"w"`)
+ */
+fn wide_suffix_riscv(wide: bool) -> str {
+    if wide { "" } else { "w" }
+}
+
+/**
+ * reg_ref_riscv — a register operand's printer text: `%N` for a virtual
+ * register, `%pN` for a physical one.
+ *
+ * @param MReg r  the register to render
+ * @return str  the operand text
+ */
+fn reg_ref_riscv(r: MReg) -> str {
+    let num = teko::u64_to_str(r.id to u64)
+    if r.is_phys { teko::str::concat("%p", num) } else { teko::str::concat("%", num) }
+}
+
+/**
+ * mem_ref_riscv — a memory operand's printer text in RISC-V `off(base)` form.
+ *
+ * @param MMem m  the memory operand to render
+ * @return str  the operand text
+ */
+fn mem_ref_riscv(m: MMem) -> str {
+    teko::str::concat(teko::i64_to_str(m.offset to i64), "(", reg_ref_riscv(m.base), ")")
+}
+
+/**
+ * print_regs_riscv — a comma-separated list of register operands (no
+ * surrounding parens; the caller supplies them).
+ *
+ * @param []MReg regs  the registers to render, in order
+ * @return str  the rendered list
+ */
+fn print_regs_riscv(regs: []MReg) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= regs.len { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, reg_ref_riscv(regs[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * alu_op_name_riscv — the printer mnemonic for an `MAluOpRiscv`.
+ *
+ * @param MAluOpRiscv op  the operation to name
+ * @return str  its lowercase RISC-V mnemonic
+ */
+fn alu_op_name_riscv(op: MAluOpRiscv) -> str {
+    match op {
+        Add => "add"; Sub => "sub"; And => "and"; Or => "or"; Xor => "xor"
+        Sll => "sll"; Srl => "srl"; Sra => "sra"
+        Mul => "mul"; Div => "div"; Divu => "divu"; Rem => "rem"; Remu => "remu"
+        Addi => "addi"; Xori => "xori"; Sltiu => "sltiu"
+    }
+}
+
+/**
+ * load_mnemonic_riscv — the printer mnemonic for a load width + sign: the
+ * sign-extending `lb`/`lh`/`lw` versus the zero-extending `lbu`/`lhu`/`lwu`,
+ * and the full-width `ld` (sign-agnostic).
+ *
+ * @param MMemSizeRiscv size  the access width
+ * @param bool sign  true for the sign-extending narrow form
+ * @return str  the RISC-V load mnemonic
+ */
+fn load_mnemonic_riscv(size: MMemSizeRiscv, sign: bool) -> str {
+    match size {
+        B => if sign { "lb" } else { "lbu" }
+        H => if sign { "lh" } else { "lhu" }
+        W => if sign { "lw" } else { "lwu" }
+        D => "ld"
+    }
+}
+
+/**
+ * store_mnemonic_riscv — the printer mnemonic for a store width
+ * (`sb`/`sh`/`sw`/`sd`); stores never sign-extend.
+ *
+ * @param MMemSizeRiscv size  the access width
+ * @return str  the RISC-V store mnemonic
+ */
+fn store_mnemonic_riscv(size: MMemSizeRiscv) -> str {
+    match size { B => "sb"; H => "sh"; W => "sw"; D => "sd" }
+}
+
+/**
+ * slt_mnemonic_riscv — the printer mnemonic for a set-less-than signedness:
+ * the unsigned `sltu` or the signed `slt`.
+ *
+ * @param bool is_unsigned  true for the unsigned form
+ * @return str  the RISC-V set-less-than mnemonic
+ */
+fn slt_mnemonic_riscv(is_unsigned: bool) -> str {
+    if is_unsigned { "sltu" } else { "slt" }
+}
+
+/**
+ * branch_mnemonic_riscv — the printer mnemonic for an `MCond` in RISC-V B-type
+ * form: the six direct conditions (`beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu`) plus
+ * the four order-only conditions (`GT`/`LE`/`HI`/`LS`) which reuse the
+ * `blt`/`bge`/`bltu`/`bgeu` mnemonics with operands swapped
+ * (`branch_swaps_riscv`).
+ *
+ * @param MCond c  the condition code to name
+ * @return str  its lowercase RISC-V branch mnemonic
+ */
+fn branch_mnemonic_riscv(c: MCond) -> str {
+    match c {
+        EQ => "beq"; NE => "bne"
+        LT => "blt"; GE => "bge"; LO => "bltu"; HS => "bgeu"
+        GT => "blt"; LE => "bge"; HI => "bltu"; LS => "bgeu"
+    }
+}
+
+/**
+ * branch_swaps_riscv — whether an `MCond`'s RISC-V branch form swaps its two
+ * operands: the order-only conditions (`GT`/`LE`/`HI`/`LS`) reuse an inverse
+ * mnemonic with operands exchanged, the other six render in source order.
+ *
+ * @param MCond c  the condition code to test
+ * @return bool  true when the branch operands are exchanged
+ */
+fn branch_swaps_riscv(c: MCond) -> bool {
+    match c {
+        EQ => false; NE => false
+        LT => false; GE => false; LO => false; HS => false
+        GT => true; LE => true; HI => true; LS => true
+    }
+}
+
+/**
+ * reloc_kind_name_riscv — the printer name for a `RelocKindRiscv`. Exported as
+ * part of the RISC-V machine-code printer surface (the B2 encoder reuses it for
+ * relocation-record dumps), so the enum is a first-class part of the golden
+ * surface even though no `MInstRiscv` case stores a relocation kind.
+ *
+ * @param RelocKindRiscv k  the relocation kind to name
+ * @return str  its lowercase name
+ */
+pub fn reloc_kind_name_riscv(k: RelocKindRiscv) -> str {
+    match k {
+        Call => "call"; PcRelHi20 => "pcrel_hi20"; PcRelLo12 => "pcrel_lo12"
+        Branch => "branch"; Jal => "jal"; Abs64 => "abs64"
+    }
+}
+
+/**
+ * print_li_riscv — `li dst, #imm`.
+ *
+ * @param MLiRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_li_riscv(i: MLiRiscv) -> str {
+    teko::str::concat("li ", reg_ref_riscv(i.dst), ", #", teko::i64_to_str(i.imm to i64))
+}
+
+/**
+ * print_lui_riscv — `lui dst, #imm`.
+ *
+ * @param MLuiRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_lui_riscv(i: MLuiRiscv) -> str {
+    teko::str::concat("lui ", reg_ref_riscv(i.dst), ", #", teko::u64_to_str(i.imm to u64))
+}
+
+/**
+ * print_auipc_riscv — `auipc dst, #imm`.
+ *
+ * @param MAuipcRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_auipc_riscv(i: MAuipcRiscv) -> str {
+    teko::str::concat("auipc ", reg_ref_riscv(i.dst), ", #", teko::u64_to_str(i.imm to u64))
+}
+
+/**
+ * print_alu_r_riscv — `<op><w> dst, a, b` (the three-address register-register
+ * form; the `w` suffix marks the 32-bit `OP-32` variant).
+ *
+ * @param MAluRRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_alu_r_riscv(i: MAluRRiscv) -> str {
+    teko::str::concat(alu_op_name_riscv(i.op), wide_suffix_riscv(i.wide), " ", reg_ref_riscv(i.dst), ", ", reg_ref_riscv(i.a), ", ", reg_ref_riscv(i.b))
+}
+
+/**
+ * print_alu_i_riscv — `<op> dst, a, #imm` (the register-immediate12 form).
+ *
+ * @param MAluIRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_alu_i_riscv(i: MAluIRiscv) -> str {
+    teko::str::concat(alu_op_name_riscv(i.op), " ", reg_ref_riscv(i.dst), ", ", reg_ref_riscv(i.a), ", #", teko::i64_to_str(i.imm to i64))
+}
+
+/**
+ * print_slt_riscv — `<slt|sltu> dst, a, b`.
+ *
+ * @param MSltRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_slt_riscv(i: MSltRiscv) -> str {
+    teko::str::concat(slt_mnemonic_riscv(i.is_unsigned), " ", reg_ref_riscv(i.dst), ", ", reg_ref_riscv(i.a), ", ", reg_ref_riscv(i.b))
+}
+
+/**
+ * print_load_riscv — `<load> dst, off(base)`.
+ *
+ * @param MLoadRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_load_riscv(i: MLoadRiscv) -> str {
+    teko::str::concat(load_mnemonic_riscv(i.size, i.sign), " ", reg_ref_riscv(i.dst), ", ", mem_ref_riscv(i.mem))
+}
+
+/**
+ * print_store_riscv — `<store> src, off(base)`.
+ *
+ * @param MStoreRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_store_riscv(i: MStoreRiscv) -> str {
+    teko::str::concat(store_mnemonic_riscv(i.size), " ", reg_ref_riscv(i.src), ", ", mem_ref_riscv(i.mem))
+}
+
+/**
+ * print_branch_riscv — `<branch> a, b, #Mtarget` (with the two operands
+ * exchanged for the order-only conditions, per `branch_swaps_riscv`).
+ *
+ * @param MBranchRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_branch_riscv(i: MBranchRiscv) -> str {
+    let swap = branch_swaps_riscv(i.cond)
+    let first = if swap { i.b } else { i.a }
+    let second = if swap { i.a } else { i.b }
+    teko::str::concat(branch_mnemonic_riscv(i.cond), " ", reg_ref_riscv(first), ", ", reg_ref_riscv(second), ", #M", teko::u64_to_str(i.target to u64))
+}
+
+/**
+ * print_jal_riscv — `jal x0, #Mtarget` (the discarded-link unconditional jump).
+ *
+ * @param MJalRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_jal_riscv(i: MJalRiscv) -> str {
+    teko::str::concat("jal x0, #M", teko::u64_to_str(i.target to u64))
+}
+
+/**
+ * print_jalr_riscv — `jalr dst, off(base)`.
+ *
+ * @param MJalrRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_jalr_riscv(i: MJalrRiscv) -> str {
+    teko::str::concat("jalr ", reg_ref_riscv(i.dst), ", ", teko::i64_to_str(i.offset to i64), "(", reg_ref_riscv(i.base), ")")
+}
+
+/**
+ * print_call_riscv — `call @sym(uses)`, with an optional ` variadic` marker
+ * and an optional ` -> ret_reg` result suffix.
+ *
+ * @param MCallRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_call_riscv(i: MCallRiscv) -> str {
+    mut out = teko::str::concat("call @", i.sym, "(", print_regs_riscv(i.uses), ")")
+    if i.variadic { out = teko::str::concat(out, " variadic") }
+    if i.has_result { out = teko::str::concat(out, " -> ", reg_ref_riscv(i.ret_reg)) }
+    out
+}
+
+/**
+ * print_call_ind_riscv — `call.indirect target(uses)`, with an optional
+ * ` -> ret_reg` result suffix.
+ *
+ * @param MCallIndRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_call_ind_riscv(i: MCallIndRiscv) -> str {
+    mut out = teko::str::concat("call.indirect ", reg_ref_riscv(i.target), "(", print_regs_riscv(i.uses), ")")
+    if i.has_result { out = teko::str::concat(out, " -> ", reg_ref_riscv(i.ret_reg)) }
+    out
+}
+
+/**
+ * print_lla_riscv — `lla dst, @sym` (the auipc+addi PC-relative address pair).
+ *
+ * @param MLlaRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_lla_riscv(i: MLlaRiscv) -> str {
+    teko::str::concat("lla ", reg_ref_riscv(i.dst), ", @", i.sym)
+}
+
+/**
+ * print_frame_addr_riscv — `addi dst, sp, [frame #slot]`.
+ *
+ * @param MFrameAddrRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_frame_addr_riscv(i: MFrameAddrRiscv) -> str {
+    teko::str::concat("addi ", reg_ref_riscv(i.dst), ", sp, [frame #", teko::u64_to_str(i.slot to u64), "]")
+}
+
+/**
+ * print_ret_riscv — `ret`. The returned value, if any, was already pinned by a
+ * preceding move, so `MRetRiscv` carries nothing further to render.
+ *
+ * @param MRetRiscv i  the instruction to render (carries no fields)
+ * @return str  the rendered text
+ */
+fn print_ret_riscv(i: MRetRiscv) -> str {
+    "ret"
+}
+
+/**
+ * print_minst_riscv — the instruction text for one `MInstRiscv` (no result
+ * prefix — a case's own destination operand, when it has one, already renders
+ * it).
+ *
+ * @param MInstRiscv i  the instruction to render
+ * @return str  the rendered text
+ */
+fn print_minst_riscv(i: MInstRiscv) -> str {
+    match i {
+        MLiRiscv as x => print_li_riscv(x)
+        MLuiRiscv as x => print_lui_riscv(x)
+        MAuipcRiscv as x => print_auipc_riscv(x)
+        MAluRRiscv as x => print_alu_r_riscv(x)
+        MAluIRiscv as x => print_alu_i_riscv(x)
+        MSltRiscv as x => print_slt_riscv(x)
+        MLoadRiscv as x => print_load_riscv(x)
+        MStoreRiscv as x => print_store_riscv(x)
+        MBranchRiscv as x => print_branch_riscv(x)
+        MJalRiscv as x => print_jal_riscv(x)
+        MJalrRiscv as x => print_jalr_riscv(x)
+        MCallRiscv as x => print_call_riscv(x)
+        MCallIndRiscv as x => print_call_ind_riscv(x)
+        MLlaRiscv as x => print_lla_riscv(x)
+        MFrameAddrRiscv as x => print_frame_addr_riscv(x)
+        MRetRiscv as x => print_ret_riscv(x)
+    }
+}
+
+/**
+ * print_mblock_riscv — a block header `  #Mn:` (with block-args when present)
+ * followed by its instructions, one per line, 4-space indented.
+ *
+ * @param MBlockRiscv b  the block to render
+ * @return str  the rendered text
+ */
+fn print_mblock_riscv(b: MBlockRiscv) -> str {
+    mut out = teko::str::concat("  #M", teko::u64_to_str(b.id to u64))
+    if b.params.len != 0 { out = teko::str::concat(out, "(", print_regs_riscv(b.params), ")") }
+    out = teko::str::concat(out, ":\n")
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        out = teko::str::concat(out, "    ", print_minst_riscv(b.insts[i]), "\n")
+        i++
+    }
+    out
+}
+
+/**
+ * print_mfunc_riscv — a full function: `func @sym {` + its blocks + `}`.
+ *
+ * @param MFuncRiscv f  the function to render
+ * @return str  the rendered text
+ */
+fn print_mfunc_riscv(f: MFuncRiscv) -> str {
+    mut out = teko::str::concat("func @", f.symbol, " {\n")
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        out = teko::str::concat(out, print_mblock_riscv(f.blocks[i]))
+        i++
+    }
+    teko::str::concat(out, "}\n")
+}
+
+/**
+ * minst_print_riscv — the whole selected RISC-V module as stable text: every
+ * function, in declaration order, blank-line separated. The rodata/globals/
+ * layouts tables ride THROUGH `MModuleRiscv` unchanged from the source
+ * `LModule`, so this dump renders only the machine instructions — the
+ * assembly-level ground truth the B2-2 golden-dump tests read (mirroring x86's
+ * `minst_print_x86`).
+ *
+ * @param MModuleRiscv m  the module to render
+ * @return str  the module's stable text
+ */
+pub fn minst_print_riscv(m: MModuleRiscv) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        if i > 0 { out = teko::str::concat(out, "\n") }
+        out = teko::str::concat(out, print_mfunc_riscv(m.funcs[i]))
+        i++
+    }
+    out
+}

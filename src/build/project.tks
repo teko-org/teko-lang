@@ -392,11 +392,69 @@ fn append_reachable_os_lib_flags(argv: []str, m: Manifest, tos: str, reachable: 
 }
 
 /**
+ * teko_cc_env — the raw value of the `TEKO_CC` cross-linker env seam (#387 B2-8),
+ * or "" when it is unset. The seam mirrors `TEKO_BACKEND`/`TEKO_TARGET`: it lets a
+ * differential lane override the compiler `build_cc_argv` invokes without a
+ * manifest edit, so the same self-hosted `teko` cross-links the own `.o` on a host
+ * whose default `cc` cannot (the linux-x86_64 CI runner linking a riscv64 object).
+ *
+ * @return the `TEKO_CC` value, or "" when the variable is absent
+ */
+fn teko_cc_env() -> str {
+    match teko::env::var("TEKO_CC") { str as v => v; error => "" }
+}
+
+/**
+ * default_cc_for_target — the cross-compiler that links the own object for a
+ * non-host `NativeTarget` when neither the manifest `cc` nor the `TEKO_CC` seam
+ * pins one (#387 B2-8, D-D): `riscv64-linux-gnu-gcc` for `Riscv64Linux` (it
+ * compiles the C `teko_rt`/`assert` runtime FOR riscv and links it with the own
+ * riscv `.o` into a qemu-runnable executable) and `x86_64-w64-mingw32-gcc` for
+ * `X8664Windows` (the MinGW cross-cc that links the own PE/COFF `.o` into a
+ * Windows executable). The `Arm64Macho` and `X8664Linux` arms return the host
+ * `"cc"` — the default build's link line is byte-unchanged, because an unset
+ * `TEKO_TARGET` resolves to `Arm64Macho` → `"cc"` exactly as the pre-B2 `else`
+ * branch did. D1/#390's real `--target` supersedes this env-derived default.
+ *
+ * @param t  the resolved own-backend target
+ * @return   the compiler command for `t`
+ */
+fn default_cc_for_target(t: NativeTarget) -> str {
+    match t {
+        NativeTarget::Riscv64Linux => "riscv64-linux-gnu-gcc"
+        NativeTarget::X8664Windows => "x86_64-w64-mingw32-gcc"
+        NativeTarget::X8664Linux => "cc"
+        NativeTarget::Arm64Macho => "cc"
+    }
+}
+
+/**
+ * resolve_cc — pick the compiler `build_cc_argv` invokes, in precedence order
+ * (#387 B2-8, D-D): the manifest `[extern] cc` override wins; then the `TEKO_CC`
+ * env seam; then the `TEKO_TARGET`-derived cross-cc for a non-host target
+ * (`default_cc_for_target`); else the host `"cc"`. The default build (no manifest
+ * `cc`, no `TEKO_CC`, no `TEKO_TARGET`) resolves to `"cc"` unchanged, so the
+ * emitted link line — and the product FIXPOINT — stay byte-identical.
+ *
+ * @param m  the resolved manifest (the `cc` override, if any)
+ * @return   the compiler command for the current build
+ */
+fn resolve_cc(m: Manifest) -> str {
+    if m.cc.len > 0 { return m.cc }
+    let env_cc = teko_cc_env()
+    if env_cc.len > 0 { return env_cc }
+    default_cc_for_target(native_target())
+}
+
+/**
  * build_cc_argv — assemble the host-`cc` command line that turns one input file
  * (`input`, a generated `.c` for the C backend or an own-backend `.o`) into the
  * native `binary`, in full parity with `driver.c::run_cc` (M.5, reuse the host
- * toolchain in one invocation). The line carries: the `[extern] cc` override
- * (else `cc`); the portable `-std`/error-limit spelling for the detected compiler
+ * toolchain in one invocation). The line carries: the compiler chosen by
+ * `resolve_cc` (the `[extern] cc` override, else the `TEKO_CC` env seam, else the
+ * `TEKO_TARGET`-derived cross-cc for a non-host target — `riscv64-linux-gnu-gcc`
+ * for `riscv64-linux`, #387 B2-8 — else the host `cc`); the portable
+ * `-std`/error-limit spelling for the detected compiler
  * family (clang `-std=c23`/`-ferror-limit=0`, else GCC's `-std=c2x`/`-fmax-errors=0`);
  * `-w` to silence warnings on machine-generated C; the project version baked into
  * `teko_rt`'s `tk_rt_version()` as a BARE `-DTEKO_VERSION_STRING` token (embedded
@@ -406,24 +464,31 @@ fn append_reachable_os_lib_flags(argv: []str, m: Manifest, tos: str, reachable: 
  * reachable `[extern.libs]` link flags (C7.20); and, on macOS, the `__info_plist`
  * `-Wl,-sectcreate` section. Shared verbatim by `run_cc` (a `.c` input) and
  * `link_object` (an own-backend `.o` input) so both link the SAME way — the only
- * difference is the input file, keeping the two paths from drifting.
+ * difference is the input file, keeping the two paths from drifting. When `debug`
+ * is set it also appends the DEBUG profile flag `-g` (emit DWARF so the E4 native
+ * stack trace resolves against the `.tsym` map); optimization stays OFF and
+ * assertions ON either way (the pipeline's single profile is already `-O0` with
+ * `assert.c` linked and nothing defining NDEBUG), so `debug=false` is byte-identical
+ * to today's release link line and the FIXPOINT is preserved.
  *
  * @param input   the input path — a generated `.c` (C backend) or a `.o` (own backend)
  * @param binary  the output native executable path
  * @param m       the resolved manifest (cc override, version, cross knobs, libs)
  * @param prog    the checked program (for extern-reachability of the link flags)
+ * @param debug   append the debug profile flag (`-g`); false = today's byte-identical release line
  * @return        the full `cc` argument vector, ready for `teko::process::run`
  */
-fn build_cc_argv(input: str, binary: str, m: Manifest, prog: checker::TProgram) -> []str {
+fn build_cc_argv(input: str, binary: str, m: Manifest, prog: checker::TProgram, debug: bool) -> []str {
     let rt = rt_dir()
     let asrt = assert_dir(rt)
-    let cc = if m.cc.len > 0 { m.cc } else { "cc" }
+    let cc = resolve_cc(m)
     let is_clang = cc_family_is_clang(cc, binary)
     mut argv: []str = teko::list::empty()
     argv = teko::list::push(argv, cc)
     argv = teko::list::push(argv, if is_clang { "-std=c23" } else { "-std=c2x" })
     argv = teko::list::push(argv, "-w")
     argv = teko::list::push(argv, if is_clang { "-ferror-limit=0" } else { "-fmax-errors=0" })
+    if debug { argv = teko::list::push(argv, "-g") }
     let verval = if m.suffix.len > 0 { teko::str::concat(teko::str::concat(m.version, "-"), m.suffix) } else { m.version }
     argv = teko::list::push(argv, teko::str::concat("-DTEKO_VERSION_STRING=", verval))
     if m.target.len > 0 { argv = teko::list::push(teko::list::push(argv, "-target"), m.target) }
@@ -481,7 +546,24 @@ fn append_macos_plist_flag(argv: []str, binary: str, m: Manifest, tos: str) -> [
  * @return        the `cc` process exit code (0 on success)
  */
 fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
-    teko::process::run(build_cc_argv(cfile, binary, m, prog))
+    teko::process::run(build_cc_argv(cfile, binary, m, prog, false))
+}
+
+/**
+ * run_cc_debug — the DEBUG-profile sibling of `run_cc` (the `teko run` build path):
+ * compile the generated C `cfile` into `binary` with `build_cc_argv(..., true)`, so
+ * the link line carries `-g` (DWARF for the E4 native stack trace, resolved against
+ * the `.tsym` map) on top of the already-unoptimized, assertions-on release line.
+ * The ONLY difference from `run_cc` is the debug flag, keeping the two paths aligned.
+ *
+ * @param cfile   the generated C translation unit
+ * @param binary  the output native executable path
+ * @param m       the resolved manifest
+ * @param prog    the checked program (extern-reachability)
+ * @return        the `cc` process exit code (0 on success)
+ */
+fn run_cc_debug(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
+    teko::process::run(build_cc_argv(cfile, binary, m, prog, true))
 }
 
 /**
@@ -501,7 +583,7 @@ fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 
  * @return         the `cc` process exit code (0 on success)
  */
 fn link_object(objfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
-    teko::process::run(build_cc_argv(objfile, binary, m, prog))
+    teko::process::run(build_cc_argv(objfile, binary, m, prog, false))
 }
 
 // (C7.1k) plist_xml — a minimal macOS Info.plist carrying the project's identity, embedded into the
@@ -630,23 +712,29 @@ fn native_backend_selected() -> bool {
 
 /**
  * NativeTarget — which own-AOT-backend target the temporary `TEKO_TARGET` env
- * seam selects (D-D, #386 B1-8): the default `Arm64Macho` (the A4 reference —
- * arm64 machine code in a Mach-O object) or `X8664Linux` (x86-64 SysV machine
- * code in an ELF object). Targets are named by OS, not by object format (ruling
- * #390): the format (ELF/Mach-O) is a consequence of the OS, so `x86_64-linux`
- * — not `x86_64-elf` (ELF spans many kernels the binary does not port between) —
- * is canonical. The seam mirrors `TEKO_BACKEND` and is read only when the own
+ * seam selects (D-D, #386 B1-8; #387 B2-8; #388 B3-4): the default `Arm64Macho`
+ * (the A4 reference — arm64 machine code in a Mach-O object), `X8664Linux`
+ * (x86-64 SysV machine code in an ELF object), `Riscv64Linux` (RISC-V
+ * RV64GC/LP64D machine code in an ELF object), or `X8664Windows` (x86-64 Win64
+ * machine code — the SAME x86 ISA as `X8664Linux`, differing only in the ABI
+ * register file and PE/COFF object format). Targets are named by OS, not by
+ * object format (ruling #390): the format (ELF/Mach-O/COFF) is a consequence of
+ * the OS, so `x86_64-linux`, `riscv64-linux`, and `x86_64-windows` — not
+ * `x86_64-elf`/`riscv64-elf`/`x86_64-coff`/`x86_64-win`/`x86_64-pe` — are
+ * canonical. The seam mirrors `TEKO_BACKEND` and is read only when the own
  * backend is already active; D1/#390 supersedes it with the real `--target`
  * manifest flag.
  */
-type NativeTarget = enum { Arm64Macho; X8664Linux }
+type NativeTarget = enum { Arm64Macho; X8664Linux; Riscv64Linux; X8664Windows }
 
 /**
  * target_from_name — map a raw `TEKO_TARGET` value to a `NativeTarget`:
- * `x86_64-linux` (canonical, OS-based per ruling #390) selects the x86-64
- * SysV/ELF pipeline; `x86_64-elf` is accepted as a deprecated format-named alias.
- * Every other value — including `arm64-macos`, an empty string, or a typo —
- * falls back to the default `Arm64Macho`, so an unrecognized target never
+ * `x86_64-linux` selects the x86-64 SysV/ELF pipeline, `riscv64-linux` the
+ * RISC-V LP64D/ELF pipeline, and `x86_64-windows` the x86-64 Win64/PE-COFF
+ * pipeline (all canonical, OS-based per ruling #390); `x86_64-elf`/`riscv64-elf`/
+ * `x86_64-coff`/`x86_64-win`/`x86_64-pe` are accepted as deprecated format-named
+ * aliases. Every other value — including `arm64-macos`, an empty string, or a
+ * typo — falls back to the default `Arm64Macho`, so an unrecognized target never
  * silently mis-lowers.
  *
  * @param name  the raw `TEKO_TARGET` environment value
@@ -655,6 +743,12 @@ type NativeTarget = enum { Arm64Macho; X8664Linux }
 fn target_from_name(name: str) -> NativeTarget {
     if name == "x86_64-linux" { return NativeTarget::X8664Linux }
     if name == "x86_64-elf" { return NativeTarget::X8664Linux }
+    if name == "riscv64-linux" { return NativeTarget::Riscv64Linux }
+    if name == "riscv64-elf" { return NativeTarget::Riscv64Linux }
+    if name == "x86_64-windows" { return NativeTarget::X8664Windows }
+    if name == "x86_64-win" { return NativeTarget::X8664Windows }
+    if name == "x86_64-pe" { return NativeTarget::X8664Windows }
+    if name == "x86_64-coff" { return NativeTarget::X8664Windows }
     NativeTarget::Arm64Macho
 }
 
@@ -686,11 +780,38 @@ fn strip_trailing_slash(dir: str) -> str {
 }
 
 /**
+ * mkdir_p — create `dir` and every missing parent, since `teko::fs::mkdir` is a single
+ * `mkdir(2)` (it will not create `target/debug` unless `target` already exists). Walk the
+ * path left to right, creating each `/`-terminated prefix in turn, then the full path; an
+ * already-existing level is a no-op (`tk_rt_mkdir` treats EEXIST as success). Used by the
+ * `teko run` debug builder, whose scratch dir (`target/debug`) is two levels deep.
+ *
+ * @param dir  the directory to create (with any parents it needs)
+ * @return     an `error` when a level cannot be created, else `null` on success
+ */
+fn mkdir_p(dir: str) -> error? {
+    mut i: u64 = 0
+    loop {
+        if i >= dir.len { break }
+        if dir[i] == b'/' && i > 0 {
+            match teko::fs::mkdir(teko::str::slice_to(dir, i)) { error as e => return e; null => { } }
+        }
+        i = i + 1
+    }
+    teko::fs::mkdir(dir)
+}
+
+/**
  * emit_native — the own-AOT-backend driver (the #385 A4-5 KEYSTONE, extended for
- * x86-64 at #386 B1-8): lower the checked program to target-independent LIR, then
- * dispatch on `native_target()` to the per-ISA tail — arm64 `MInst`/AAPCS64/Mach-O
- * (the default, byte-unchanged A4 path) or x86-64 `MInstX86`/SysV/ELF (the B1 path,
- * `TEKO_TARGET=x86_64-linux`). Each tail selects instructions, allocates registers,
+ * x86-64 at #386 B1-8, RISC-V at #387 B2-8 and Windows at #388 B3-4): lower the
+ * checked program to target-independent LIR, then dispatch on `native_target()` to
+ * the per-ISA tail — arm64 `MInst`/AAPCS64/Mach-O (the default, byte-unchanged A4
+ * path), x86-64 `MInstX86`/SysV/ELF (the B1 path, `TEKO_TARGET=x86_64-linux`),
+ * RISC-V `MInstRiscv`/LP64D/ELF (the B2 path, `TEKO_TARGET=riscv64-linux`), or
+ * x86-64 `MInstX86`/Win64/PE-COFF (the B3 path, `TEKO_TARGET=x86_64-windows` — the
+ * SAME x86 ISA as the Linux path, differing only in the `win64` register file and
+ * the `emit_coff` object format). Each tail selects instructions, allocates
+ * registers,
  * encodes machine bytes, wraps them in the target object format, writes the `.o`,
  * and links it into a native executable against the C-built `teko_rt`/`assert`
  * runtime via `cc`-as-linker (`link_object`, the D-C bootstrap). Any pipeline
@@ -714,6 +835,8 @@ fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
     let lmod = match teko::lir::lower_program(prog) { teko::lir::LModule as x => x; error as e => return fail(dir, e.message) }
     match native_target() {
         NativeTarget::X8664Linux => emit_native_x86(dir, od, stem, lmod, prog, m)
+        NativeTarget::Riscv64Linux => emit_native_riscv(dir, od, stem, lmod, prog, m)
+        NativeTarget::X8664Windows => emit_native_win(dir, od, stem, lmod, prog, m)
         NativeTarget::Arm64Macho => emit_native_arm64(dir, od, stem, lmod, prog, m)
     }
 }
@@ -762,25 +885,86 @@ fn emit_native_arm64(dir: str, od: str, stem: str, lmod: teko::lir::LModule, pro
  * @return      0 on a successful build+link, else the failing status
  */
 fn emit_native_x86(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
-    let sel = match teko::backend::select_module_x86(lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let sel = match teko::backend::select_module_x86(teko::backend::sysv64(), lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
     let col = match teko::backend::regalloc_module_x86(teko::backend::sysv64(), sel) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
     let enc = match teko::backend::encode_module_x86(teko::backend::sysv64(), col) { teko::backend::EncodedModuleX86 as x => x; error as e => return fail(dir, e.message) }
     finish_native_object(dir, od, stem, teko::backend::emit_elf(enc), prog, m)
 }
 
 /**
- * finish_native_object — the object-format-agnostic tail shared by both own-backend
- * targets: write the encoded object bytes to `<od>/<stem>.o`, link it into
- * `<od>/<stem>` via `cc`-as-linker (`link_object`) against the C-built runtime,
- * write the `.tsym` symbol map beside the binary (best-effort — a write error never
- * fails the build), and print the EXCLUSIVE `"(own backend)"` success marker the
- * differential harness keys on (F1(a)). Factoring it here keeps the arm64 and x86
- * tails identical past the encoder, so the two link paths never drift.
+ * emit_native_win — the x86-64/Win64/PE-COFF own-backend tail (#388 B3): select
+ * x86-64 `MInstX86` from the lowered module under the Win64 ABI register file
+ * (`win64` — call/return arguments land in RCX/RDX/R8/R9, the byte-differing
+ * counterpart of the SysV `emit_native_x86`), allocate registers under the same
+ * `win64` descriptor, encode to the SAME variable-length x86 machine bytes as the
+ * Linux path (the x86 ISA is shared — only the ABI register partition differs),
+ * wrap them in a PE/COFF object (`emit_coff`, B3-3), and hand the bytes to
+ * `finish_native_object` (write `.o` + `cc`-link + `.tsym` + success marker).
+ * Reached only via `TEKO_TARGET=x86_64-windows`; the emitted `.o` is a Windows
+ * x86-64 object, so the executing C-vs-own differential runs on a Windows host
+ * (B3-4), while a non-Windows host still writes the `.o` for the byte /
+ * well-formedness cross-check (`llvm-readobj` is cross-format) even though the
+ * host `cc` cannot link a PE there without the MinGW cross toolchain.
  *
  * @param dir   the project directory (for diagnostics)
  * @param od    the slash-stripped output directory (already created)
  * @param stem  the output artifact name (the manifest `name`)
- * @param obj   the encoded object-file bytes (Mach-O or ELF)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_win(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+    let sel = match teko::backend::select_module_x86(teko::backend::win64(), lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let col = match teko::backend::regalloc_module_x86(teko::backend::win64(), sel) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    let enc = match teko::backend::encode_module_x86(teko::backend::win64(), col) { teko::backend::EncodedModuleX86 as x => x; error as e => return fail(dir, e.message) }
+    finish_native_object(dir, od, stem, teko::backend::emit_coff(enc), prog, m)
+}
+
+/**
+ * emit_native_riscv — the riscv64/ELF own-backend tail (#387 B2): select RISC-V
+ * `MInstRiscv` from the lowered module, allocate registers under the LP64D
+ * register file (`riscv64_lp64d`), encode to fixed-32 RISC-V machine words, wrap
+ * them in an `ET_REL` ELF64 object (`emit_elf_riscv` → the shared
+ * `emit_elf_object`), and hand the bytes to `finish_native_object` (write `.o` +
+ * cc-link + `.tsym` + success marker). Reached only via
+ * `TEKO_TARGET=riscv64-linux`; the emitted `.o` is a riscv64 object, so the
+ * executing C-vs-own differential runs on the linux-x86_64 CI runner under
+ * `qemu-riscv64-static` with a riscv64 cross-linker (§8.2), while a macOS host
+ * still writes the `.o` for the byte / well-formedness cross-check (`llvm-readobj`
+ * is cross-format) even though no riscv cross-linker/emulator runs there.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_riscv(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+    let sel = match teko::backend::select_module_riscv(lmod) { teko::backend::MModuleRiscv as x => x; error as e => return fail(dir, e.message) }
+    let col = match teko::backend::regalloc_module_riscv(teko::backend::riscv64_lp64d(), sel) { teko::backend::MModuleRiscv as x => x; error as e => return fail(dir, e.message) }
+    let enc = match teko::backend::encode_module_riscv(teko::backend::riscv64_lp64d(), col) { teko::backend::EncodedModuleRiscv as x => x; error as e => return fail(dir, e.message) }
+    finish_native_object(dir, od, stem, teko::backend::emit_elf_riscv(enc), prog, m)
+}
+
+/**
+ * finish_native_object — the object-format-agnostic tail shared by every own-backend
+ * target: write the encoded object bytes to `<od>/<stem>.o`, link it into
+ * `<od>/<stem>` via `cc`-as-linker (`link_object`) against the C-built runtime,
+ * write the `.tsym` symbol map beside the binary (best-effort — a write error never
+ * fails the build), and print the EXCLUSIVE `"(own backend)"` success marker the
+ * differential harness keys on (F1(a)). Factoring it here keeps the arm64, x86 and
+ * Windows tails identical past the encoder, so the link paths never drift. The `.o`
+ * is written BEFORE the link, so a cross-host link that cannot proceed (e.g. a macOS
+ * host asked for a Windows PE) still leaves the object on disk for the byte /
+ * well-formedness cross-check.
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param obj   the encoded object-file bytes (Mach-O, ELF or PE/COFF)
  * @param prog  the checked program (`.tsym` emission)
  * @param m     the resolved manifest (link knobs)
  * @return      0 on a successful write+link, else the failing status
@@ -802,21 +986,56 @@ fn finish_native_object(dir: str, od: str, stem: str, obj: []byte, prog: checker
 // Front-end (manifest → discover → assemble → check), then the native backend over the
 // merged program. The output binary stem is the manifest `name`.
 // =========================================================================
-// dirname_of — the parent directory of `path` (everything before the last '/'), or "." when
-// `path` has no separator. A minimal local helper (no teko::fs::dirname exists yet).
+/**
+ * The parent directory of `path` — everything before the rightmost path separator — or "."
+ * when `path` carries no separator. A minimal local helper (no teko::fs::dirname exists yet).
+ * A reverse byte scan finds the rightmost of a POSIX '/' and a Windows '\', so a POSIX path
+ * with no '\' splits at exactly its last '/' — byte-identical to a plain last-'/' split. The
+ * scan is used instead of teko::str::last_index_of because that builtin is native-only (the VM
+ * does not implement it), and dirname_of is exercised by both engines.
+ *
+ * @param path  an argv[0]-style invocation path, POSIX- or Windows-separated
+ * @return      the directory portion of `path`, or "." when it carries no separator
+ */
 fn dirname_of(path: str) -> str {
-    match teko::str::last_index_of(path, "/") {
-        u64 as i => teko::str::slice_to(path, i)
-        error => "."
+    mut i = path.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        let b = path[i]
+        if b == b'/' || b == b'\\' { return teko::str::slice_to(path, i) }
     }
+    "."
 }
 
-// abs_path_of — make `path` absolute against `cwd` when it isn't already (POSIX/Windows both
-// accept forward slashes here; `path` is either an argv[0]-style invocation path or already
-// absolute). Returns "" when neither is usable.
+/**
+ * Whether `b` is an ASCII letter (A-Z or a-z) — the drive-letter test for a Windows absolute
+ * path such as `C:\...`. Named with an `_ascii_` segment to stay distinct from the `is_alpha`
+ * char builtin, which classifies a full Unicode `char` rather than a raw path byte.
+ *
+ * @param b  the byte to classify
+ * @return   true when `b` is an ASCII letter
+ */
+fn is_ascii_alpha(b: byte) -> bool {
+    (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z')
+}
+
+/**
+ * Make `path` absolute against `cwd` when it isn't already, recognising POSIX and Windows
+ * absolute shapes without disturbing the POSIX arm: a leading '/' (POSIX, checked FIRST and
+ * unchanged), a `<letter>:` drive prefix (`C:\...` or `C:/...`), or a `\\` UNC prefix — each is
+ * already absolute and returned as-is. Anything else is joined onto `cwd` with a '/'. Returns
+ * "" when `path` is empty, or when a relative `path` has no `cwd` to anchor it.
+ *
+ * @param path  an argv[0]-style invocation path or an already-absolute path
+ * @param cwd   the directory a relative `path` is resolved against
+ * @return      the absolute form of `path`, or "" when neither input is usable
+ */
 fn abs_path_of(path: str, cwd: str) -> str {
     if path.len == 0 { return "" }
-    if path[0] == b'/' { return path }   // already absolute
+    if path[0] == b'/' { return path }
+    if path.len >= 2 && is_ascii_alpha(path[0]) && path[1] == b':' { return path }
+    if path.len >= 2 && path[0] == b'\\' && path[1] == b'\\' { return path }
     if cwd.len == 0 { return "" }
     teko::str::concat(cwd, "/", path)
 }
@@ -911,7 +1130,7 @@ fn ensure_rt_dir_abs() {
  *  @param out_dir  the build output directory (`-o`, default "bin")
  *  @return         0 on a fully gated, successfully built release, else the failing status
  *  @since #265 */
-fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false, true) }
+fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false) }
 
 // (#148) report_peak — the compiler prints its own memory cost at the end of a successful build
 // (peak RSS via teko::mem::peak_rss; 0 = unavailable on this host → print suppressed).
@@ -1038,35 +1257,14 @@ fn release_build_of(dir: str, out_dir: str) -> i32 {
     codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest)
 }
 
-/** run_gate_vm — the D4 test-gate body run on the VM (the OPT-OUT engine since #168, `--vm-gate` /
- *  `TEKO_VM_GATE=1`): run every `#test` interpreted (fail-fast), enforce all three coverage floors
- *  (coverage_gate_result — the VM's in-process marks cover function/line/branch fully), then rebuild
- *  the release program. This is the pre-#265 gate verbatim — same floors as the native default — kept
- *  for VM debugging and as the nightly VM-regression lane. It interprets the tests IN-PROCESS, so it
- *  carries the ~1.5 GB functional-env peak the native default avoids.
- *
- *  @param dir      the project directory (for diagnostics)
- *  @param out_dir  the build output directory
- *  @param gen_cov  write a Cobertura report (`--coverage`)
- *  @param fe       the already-assembled front-end product (checked program + manifest)
- *  @return         0 when every test passes, every floor is met, and the release build succeeds
- *  @since #265 */
-fn run_gate_vm(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
-    let trc = vm::run_tests_cov(fe.prog, true, gen_cov, cobertura_path_of(out_dir, gen_cov))
-    if trc != 0 { return trc }
-    let gate_rc = coverage_gate_result(dir, fe)
-    if gate_rc != 0 { return gate_rc }
-    release_build_of(dir, out_dir)
-}
-
 /** run_gate_native — the D4 test-gate body run NATIVELY (the DEFAULT since #168): run every `#test`
  *  compiled-native (run_native_gate, fail-fast), then enforce ALL THREE coverage floors
  *  (function/line/branch) via coverage_gate_result — the SAME floor fn the VM lane uses. Track A's
  *  per-fn line/branch instrumentation (tk_cov_line_at/tk_cov_branch_at) makes the native run populate
  *  the line and branch sinks too, so coverage_gate_result works VERBATIM on the merged native sinks.
  *  Because run_native_gate runs the compiled tests in a CHILD process, this compiler's own peak stays
- *  codegen-only (~366 MB) instead of the VM gate's in-process functional-env balloon (~1.5 GB) — the
- *  #168 memory-debt fix. `--vm-gate` opts back out to run_gate_vm for VM debugging.
+ *  codegen-only (~366 MB) instead of the retired VM gate's in-process functional-env balloon (~1.5 GB)
+ *  — the #168 memory-debt fix. Since #524 (VM retirement) this is the SOLE gate engine.
  *
  *  @param dir      the project directory (for diagnostics)
  *  @param out_dir  the build output directory (the test TU + binary + .tkcov land under it)
@@ -1089,21 +1287,18 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
     release_build_of(dir, out_dir)
 }
 
-/** run_gate — the D4 test-gate body proper: dispatch to the native gate (the DEFAULT since #168)
- *  or the VM gate (`--vm-gate` opt-out, `!native_gate`). Split out of compile_project_g so the
- *  `no_verify` short-circuit stays a single early return instead of nesting the whole gate one
- *  level deeper.
+/**
+ * run_gate — the D4 test-gate body: run every `#test` NATIVELY (#265, the sole engine after
+ * VM retirement), then enforce the three coverage floors and rebuild the release program.
  *
- *  @param dir          the project directory (for diagnostics)
- *  @param out_dir      the build output directory
- *  @param gen_cov      write a Cobertura report (`--coverage`)
- *  @param native_gate  run the native gate (true, the default) or the VM gate (false, `--vm-gate`)
- *  @param fe           the already-assembled front-end product (checked program + manifest)
- *  @return             0 when the gate passes and the release build succeeds, else the failing status
- *  @since #265 */
-fn run_gate(dir: str, out_dir: str, gen_cov: bool, native_gate: bool, fe: Frontend) -> i32 {
-    if native_gate { return run_gate_native(dir, out_dir, gen_cov, fe) }
-    run_gate_vm(dir, out_dir, gen_cov, fe)
+ * @param dir      the project directory (diagnostics)
+ * @param out_dir  the output directory (default "bin")
+ * @param gen_cov  `--coverage` — write the Cobertura report
+ * @param fe       the front-end result assembled WITH the `.tkt` tests
+ * @return         0 when the gate passes and the release build succeeds, else the failing status
+ */
+fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
+    run_gate_native(dir, out_dir, gen_cov, fe)
 }
 
 /** No `#test` functions at all: ignore the gate, build the production program straight from the
@@ -1111,24 +1306,22 @@ fn run_gate(dir: str, out_dir: str, gen_cov: bool, native_gate: bool, fe: Fronte
 fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend) -> i32 { codegen_and_report(dir, out_dir, fe.prog, fe.manifest) }
 
 /** compile_project_g — the build with the D4 TEST GATE (ON BY DEFAULT; `--no-test` is IGNORED for a
- *  build — a release MUST run its tests). Assemble WITH the `.tkt` tests, run them on the gate engine
+ *  build — a release MUST run its tests). Assemble WITH the `.tkt` tests, run them on the NATIVE gate
  *  FIRST (fail-fast — a failed assertion aborts the build before any emission), THEN codegen the
- *  production program (tests stripped, run_gate). `native_gate` selects the engine (true = native, the
- *  DEFAULT since #168 — child-process tests, ~366 MB compiler peak; false = VM via `--vm-gate`, the
- *  ~1.5 GB in-process gate kept for debugging). The ONLY skips are a project with NO `#test` functions
- *  (build_no_tests_present), or an explicit `no_verify=true` (issue #249 lever A — `--no-verify`,
- *  build_ungated): a CI-only escape hatch for a self-host chain that has ALREADY proven the gate
- *  on an earlier generation and only needs the fixpoint (`gen2.c == gen3.c`), not a second full
- *  re-verification. `no_verify` changes NOTHING when false — the untouched default.
+ *  production program (tests stripped, run_gate). Since #524 (VM retirement) the gate is ALWAYS native
+ *  (#265, child-process tests, ~366 MB compiler peak) — the only engine. The ONLY skips are a project
+ *  with NO `#test` functions (build_no_tests_present), or an explicit `no_verify=true` (issue #249
+ *  lever A — `--no-verify`, build_ungated): a CI-only escape hatch for a self-host chain that has
+ *  ALREADY proven the gate on an earlier generation and only needs the fixpoint (`gen2.c == gen3.c`),
+ *  not a second full re-verification. `no_verify` changes NOTHING when false — the untouched default.
  *
  *  @param dir          the project directory
  *  @param out_dir      the build output directory (`-o`, default "bin")
  *  @param gen_cov      write a Cobertura report (`--coverage`)
  *  @param no_verify    skip the gate entirely (`--no-verify`, #249 lever A)
- *  @param native_gate  run the native gate (true, the default) or the VM gate (false, `--vm-gate`)
  *  @return             0 on a fully gated, successfully built release, else the failing status
  *  @since #265 */
-fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, native_gate: bool) -> i32 {
+fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool) -> i32 {
     ensure_rt_dir_abs()
     match teko::env::chdir(dir) { error => return fail(dir, "cannot enter project directory"); null => { } }
     if no_verify {
@@ -1139,7 +1332,7 @@ fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, nat
             if !has_tests(fe.prog) {
                 return build_no_tests_present(dir, out_dir, fe)
             }
-            run_gate(dir, out_dir, gen_cov, native_gate, fe)
+            run_gate(dir, out_dir, gen_cov, fe)
         }
         error as e => return fail(dir, e.message)
     }
@@ -1202,44 +1395,12 @@ fn no_verify_of(args: []str) -> bool {
     false
 }
 
-/** vm_gate_requested — does the build OPT OUT of the native gate back to the VM gate — `--vm-gate`
- *  in the args, or `TEKO_VM_GATE=1` in the environment (the CI/local escape hatch, no arg-list
- *  plumbing needed)? Since #168 the native gate is the DEFAULT (it runs the `#test` corpus in a
- *  CHILD process, so the compiler's own peak drops to codegen-only ~366 MB instead of the VM's
- *  in-process ~1.5 GB functional-env balloon — the memory-debt fix); `--vm-gate` forces the
- *  historical VM-interpreted gate for a dev who wants to debug on the VM.
- *
- *  @param args  the full CLI argument vector
- *  @return      true iff `--vm-gate` is present or `TEKO_VM_GATE=1` is set (force the VM gate)
- *  @since #168 */
-fn vm_gate_requested(args: []str) -> bool {
-    mut i: u64 = 0
-    loop {
-        if i >= args.len { break }
-        if args[i] == "--vm-gate" { return true }
-        i = i + 1
-    }
-    match teko::env::var("TEKO_VM_GATE") { str as v => v == "1"; error => false }
-}
-
-/** native_gate_of — which engine runs the D4 `.tkt` test gate, defaulting to NATIVE since #168
- *  (the memory-debt fix: the native gate runs tests in a child process, dropping the compiler's
- *  own peak to codegen-only). The native gate is the DEFAULT; `--vm-gate` / `TEKO_VM_GATE=1`
- *  (vm_gate_requested) opts back OUT to the VM-interpreted gate. The legacy `--native-gate` /
- *  `TEKO_NATIVE_GATE=1` are accepted as inert no-ops (they now request what is already the
- *  default), so existing invocations keep working.
- *
- *  @param args  the full CLI argument vector
- *  @return      true (run the native gate) unless the VM gate was explicitly requested
- *  @since #265 (opt-in), #168 (default) */
-fn native_gate_of(args: []str) -> bool {
-    !vm_gate_requested(args)
-}
-
 /** project_arg_of — the FIRST non-flag positional (the project) from `start`, or "" if none (the
  *  caller reports). Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored),
- *  `--no-verify` (#249 lever A), `--native-gate` (#265, now an inert no-op), and `--vm-gate`
- *  (#168 opt-out) — every recognized build flag — so none of them is mistaken for the project.
+ *  `--no-verify` (#249 lever A), and `--native-gate` (#265, now an inert no-op) — every recognized
+ *  build flag — so none of them is mistaken for the project. `--vm-gate` was removed outright with
+ *  the VM (#524, M3): a stray `--vm-gate` now falls through as an unknown positional, the honest
+ *  "not a project" signal that the VM is gone.
  *
  *  @param args   the full CLI argument vector
  *  @param start  the index to begin scanning from (2 for a subcommand, 1 for a bare project)
@@ -1253,34 +1414,110 @@ fn project_arg_of(args: []str, start: u64) -> str {
         else if args[i] == "--no-test" { i = i + 1 }
         else if args[i] == "--no-verify" { i = i + 1 }
         else if args[i] == "--native-gate" { i = i + 1 }
-        else if args[i] == "--vm-gate" { i = i + 1 }
         else { return args[i] }
     }
     ""
 }
 
-// =========================================================================
-// run_project — mirror driver.c::tk_run_project (the `teko run <dir>` entry, debug
-// profile). Same front-end as the build, but INTERPRET the checked merged tree on the VM
-// (vm::run) instead of codegen → cc. The exit code is the virtual-main's (a panic exits
-// non-zero from inside the VM with a "teko: panic: …" message).
-// =========================================================================
-fn run_project(dir: str) -> i32 {
-    let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
-    vm::run(fe.prog)
+/**
+ * build_debug_binary — lower `prog` to the native `<out_dir>/<stem>` executable with the DEBUG
+ * profile, the `teko run` build tail. Honours the `TEKO_BACKEND=native` own-AOT seam exactly as
+ * the release `backend` does: own backend → `emit_native` (links via `link_object`, the release
+ * line — the `-g` debug metadata is the C backend's contribution); else emit C, link it with the
+ * debug `cc` line (`run_cc_debug` → `build_cc_argv(..., true)`), write the `.tsym` beside the
+ * binary (best-effort — debug metadata for the E4 native stack trace), and print the built marker.
+ * Mirrors `backend`'s binary path; the caller (`build_debug_and_report`) has already created
+ * `out_dir` and its parents (`mkdir_p`).
+ *
+ * @param dir      the project directory (for diagnostics)
+ * @param stem     the output artifact name (the manifest `name`)
+ * @param out_dir  the debug scratch directory (`target/debug`, already created)
+ * @param prog     the checked, typed program
+ * @param m        the resolved manifest
+ * @return         0 on a successful build, else the failing status
+ */
+fn build_debug_binary(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+    if native_backend_selected() {
+        return emit_native(dir, stem, out_dir, prog, m)
+    }
+    let emitted = match codegen::tk_emit_c(prog) { str as s => s; error as e => return fail(dir, e.message) }
+    let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(m.name, m.version, m.suffix, m.description))
+    let od = strip_trailing_slash(out_dir)
+    let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))
+    let binp = teko::str::concat(od, "/", stem)
+    match teko::io::write_file(cfile, csrc) { error as e => return fail(dir, e.message); null => { } }
+    if run_cc_debug(cfile, binp, m, prog) != 0 {
+        return fail(dir, "cc failed to build the generated C")
+    }
+    match teko::io::write_file(teko::str::concat(binp, ".tsym"), codegen::tk_emit_tsym(prog)) { error => { }; null => { } }
+    teko::io::println(teko::str::concat("teko: ", dir, teko::str::concat(": built ", binp, "")))
+    0
 }
 
-// =========================================================================
-// test_project — the `teko test <dir>` entry (D2). Same front-end as run, but ASSEMBLED WITH
-// the `.tkt` test files, then the VM runs every `#test` function (vm::run_tests) instead of the
-// virtual-main. Fail-fast: a failed assertion panics from inside the VM (non-zero exit); all
-// pass → exit 0. An empty suite (no `#test`) is not a failure.
-// =========================================================================
-// `gen_cov` (from `--coverage`) writes a Cobertura report to <cwd>/cobertura.xml (the project root,
-// since the front-end has chdir'd into the project; `teko test` has no `-o` output dir).
+/**
+ * build_debug_and_report — the `teko run` build entry (post-VM): create `out_dir` (and any missing
+ * parents — `mkdir_p`, since `target/debug` is two levels deep), build `prog` to `<out_dir>/<stem>`
+ * with the DEBUG profile (`build_debug_binary`), and on success report the peak memory cost (#148).
+ * Mirrors `codegen_and_report` but drives the debug link line and takes the explicit `stem`/`out_dir`
+ * the run scratch dir needs.
+ *
+ * @param dir      the project directory (for diagnostics)
+ * @param stem     the output artifact name (the manifest `name`)
+ * @param out_dir  the debug scratch directory (`target/debug`)
+ * @param prog     the checked, typed program
+ * @param m        the resolved manifest
+ * @return         0 on a successful build, else the failing status
+ */
+fn build_debug_and_report(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+    match mkdir_p(strip_trailing_slash(out_dir)) { error => return fail(dir, "cannot create the output directory"); null => { } }
+    let rc = build_debug_binary(dir, stem, out_dir, prog, m)
+    if rc == 0 { report_peak() }
+    rc
+}
+
+/**
+ * The `teko run <dir>` entry (post-VM): build the project with the DEBUG profile and EXECUTE the
+ * resulting native binary — the `cargo run` / `go run` shape. Same front-end as `teko build` but
+ * WITHOUT the `.tkt` tests (a run, not a gate) and WITHOUT the D4 coverage floors: this is the fast
+ * debug-iteration command. The debug profile links with `-g` (DWARF for the E4 native stack trace,
+ * fed by the `.tsym` map), assertions ON, and no optimization (see build_cc_argv's `debug` seam).
+ * The binary is built to a scratch dir, then run; the returned status is the PROGRAM's own exit code
+ * (teko::exit(n) -> n, a panic -> non-zero) — the exact contract the retired VM `run` path had.
+ *
+ * @param dir  the project directory (already the cwd; the front-end chdir'd in)
+ * @return     the executed program's exit code, or a non-zero build/diagnostic status
+ */
+fn run_project(dir: str) -> i32 {
+    ensure_rt_dir_abs()
+    let fe = match project_frontend(dir) { Frontend as x => x; error as e => return fail(dir, e.message) }
+    let stem = fe.manifest.name
+    let bc = build_debug_and_report(dir, stem, "target/debug", fe.prog, fe.manifest)
+    if bc != 0 { return bc }
+    let binp = teko::str::concat("target/debug/", stem)
+    let argv = teko::list::push(teko::list::empty(), binp)
+    teko::process::run(argv)
+}
+
+/**
+ * The `teko test <dir>` entry (D2, post-VM): assemble WITH the `.tkt` tests, then run every
+ * `#test` NATIVELY via the #265 native gate (emit a test-profile C TU, compile with `run_cc`,
+ * run the child fail-fast — a failed assert panics with a non-zero exit, M.1), and enforce the
+ * D4 coverage floors. Unlike `teko build`, it emits NO release binary. `--coverage` writes a
+ * Cobertura report to `<cwd>/cobertura.xml` (the project root — `teko test` has no `-o`).
+ *
+ * @param dir      the project directory (already the cwd; the front-end chdir'd in)
+ * @param gen_cov  `--coverage` — write the Cobertura report next to the project root
+ * @return         0 when every test passes and the floors hold, else the failing status
+ */
 fn test_project(dir: str, gen_cov: bool) -> i32 {
+    ensure_rt_dir_abs()
     let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
-    let trc = if gen_cov { vm::run_tests_cov(fe.prog, true, true, "cobertura.xml") } else { vm::run_tests_cov(fe.prog, true, false, "") }
+    let trc = run_native_gate(dir, "bin", fe.prog, fe.manifest)
     if trc != 0 { return trc }
+    if gen_cov {
+        let xml = vm::cov_cobertura(fe.prog)
+        match teko::io::write_file("cobertura.xml", xml) { error as e => return fail(dir, e.message); null => { } }
+        teko::io::println("teko: wrote coverage report cobertura.xml")
+    }
     coverage_gate_result(dir, fe)
 }

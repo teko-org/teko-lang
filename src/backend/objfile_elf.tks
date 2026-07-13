@@ -123,14 +123,93 @@ fn elf_has_rodata_section(symbols: []Symbol) -> bool {
 }
 
 /**
+ * elf_append_text_locals — append each file-local `.text` symbol (a defined,
+ * file-local, section-1 `Symbol` — the RISC-V `.Lpcrel_hiN` pcrel-pair labels of
+ * §7.2) to `out` as an `STB_LOCAL|STT_NOTYPE` entry (`st_info = 0x00`,
+ * `st_shndx = 1`, section-relative `st_value`). x86-64 produces NO section-1
+ * local (only section-2 rodata locals, globals, and undefined externs), so this
+ * pass is inert for x86 and its symbol table — and thus its object bytes — stay
+ * unchanged (the B2-7 reuse guardrail). The labels slot into the leading LOCAL
+ * block, so `.symtab.sh_info` (first-global) still counts them correctly.
+ *
+ * @param []ElfSym out  the table so far (null + optional `.rodata` section symbol)
+ * @param []Symbol symbols  the module's neutral symbol list
+ * @return []ElfSym  `out` followed by every section-1 file-local symbol
+ */
+fn elf_append_text_locals(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
+    mut acc = out
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        let s = symbols[i]
+        if s.defined && s.local && s.sect == (1 to u8) {
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x00 to u32; shndx = 1 to u32; value = s.offset })
+        }
+        i++
+    }
+    acc
+}
+
+/**
+ * elf_append_globals — append each defined, globally-visible `Symbol` (a defined
+ * function) to `out` as a `GLOBAL|FUNC` entry (`st_info = 0x12`, `st_shndx = 1`)
+ * at its section-relative `.text` offset — the bare offset, never rebased (the
+ * Mach-O F1 inverse). Runs after every local symbol so the ELF-required
+ * local-then-global order holds.
+ *
+ * @param []ElfSym out  the table so far (null + rodata section + `.text` locals)
+ * @param []Symbol symbols  the module's neutral symbol list
+ * @return []ElfSym  `out` followed by every defined global function symbol
+ */
+fn elf_append_globals(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
+    mut acc = out
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        let s = symbols[i]
+        if s.defined && !s.local {
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x12 to u32; shndx = 1 to u32; value = s.offset })
+        }
+        i++
+    }
+    acc
+}
+
+/**
+ * elf_append_undefined — append each undefined `Symbol` (an externally-referenced
+ * name this object does not define) to `out` as a `GLOBAL|NOTYPE` entry
+ * (`st_info = 0x10`, `st_shndx = SHN_UNDEF`(0), `st_value = 0`). Runs last, after
+ * every defined symbol.
+ *
+ * @param []ElfSym out  the table so far (null + locals + defined globals)
+ * @param []Symbol symbols  the module's neutral symbol list
+ * @return []ElfSym  `out` followed by every undefined extern symbol
+ */
+fn elf_append_undefined(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
+    mut acc = out
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        let s = symbols[i]
+        if !s.defined {
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x10 to u32; shndx = 0 to u32; value = 0 to u32 })
+        }
+        i++
+    }
+    acc
+}
+
+/**
  * elf_build_symbols — the object's `Elf64_Sym` table in the ELF-required
  * LOCAL-then-GLOBAL order: the reserved null symbol, then (when rodata is
- * present) the `.rodata` `STT_SECTION` local symbol, then every defined function
- * as `GLOBAL|FUNC` at its section-relative `.text` offset (`st_shndx = 1`), then
- * every undefined extern as `GLOBAL|NOTYPE` (`st_shndx = SHN_UNDEF`). The
- * neutral `Symbol` list's per-rodata locals are NOT emitted individually — they
- * are represented by the one section symbol, so `st_value` for a function stays
- * the bare section-relative offset (never rebased, the Mach-O F1 inverse).
+ * present) the `.rodata` `STT_SECTION` local symbol, then every file-local
+ * `.text` label (the RISC-V `.Lpcrel_hiN` locals, §7.2 — none for x86), then
+ * every defined function as `GLOBAL|FUNC` at its section-relative `.text` offset
+ * (`st_shndx = 1`), then every undefined extern as `GLOBAL|NOTYPE`
+ * (`st_shndx = SHN_UNDEF`). The neutral `Symbol` list's per-rodata locals are NOT
+ * emitted individually — they are represented by the one section symbol, so
+ * `st_value` for a function stays the bare section-relative offset (never
+ * rebased, the Mach-O F1 inverse).
  *
  * @param []Symbol symbols  the module's neutral symbol list
  * @return []ElfSym  the resolved symbol table, local-then-global
@@ -140,25 +219,9 @@ fn elf_build_symbols(symbols: []Symbol) -> []ElfSym {
     if elf_has_rodata_section(symbols) {
         out = teko::list::push(out, ElfSym { name = ""; info = 0x03 to u32; shndx = 2 to u32; value = 0 to u32 })
     }
-    mut i: u64 = 0
-    loop {
-        if i >= symbols.len { break }
-        let s = symbols[i]
-        if s.defined && !s.local {
-            out = teko::list::push(out, ElfSym { name = s.name; info = 0x12 to u32; shndx = 1 to u32; value = s.offset })
-        }
-        i++
-    }
-    mut j: u64 = 0
-    loop {
-        if j >= symbols.len { break }
-        let s = symbols[j]
-        if !s.defined {
-            out = teko::list::push(out, ElfSym { name = s.name; info = 0x10 to u32; shndx = 0 to u32; value = 0 to u32 })
-        }
-        j++
-    }
-    out
+    out = elf_append_text_locals(out, symbols)
+    out = elf_append_globals(out, symbols)
+    elf_append_undefined(out, symbols)
 }
 
 /**
@@ -340,28 +403,31 @@ type ElfRela = struct {
 }
 
 /**
- * elf_build_relas — resolve every module relocation into an `Elf64_Rela` row: a
- * rodata target (a defined section-2 local) re-points at the `.rodata` section
- * symbol with its `.rodata` byte offset folded onto the addend; any other target
- * (a defined function or an undefined extern) keeps its base addend and takes
- * that symbol's POST-partition table index. The `r_offset` is the encoder's
- * module-rebased `.text`-relative field offset, unchanged.
+ * elf_build_relas — resolve every neutral `ElfRelocReq` of `obj` into an
+ * `Elf64_Rela` row: a rodata target (a defined section-2 local) re-points at the
+ * `.rodata` section symbol with its `.rodata` byte offset folded onto the addend;
+ * any other target (a defined function, a `.text` pcrel label, or an undefined
+ * extern) keeps its base addend and takes that symbol's POST-partition table
+ * index. The numeric `R_<arch>_*` type rides through unchanged — each per-ISA
+ * adapter already lowered its own `RelocKind*` to `rtype`, so no ISA knowledge
+ * remains here. The `r_offset` is the encoder's module-rebased `.text`-relative
+ * field offset, unchanged.
  *
- * @param EncodedModuleX86 enc  the module (relocations + neutral symbols)
+ * @param ElfObject obj  the neutral object (`ElfRelocReq` rows + neutral symbols)
  * @param []ElfSym syms  the resolved symbol table (for target indices)
  * @return []ElfRela  the resolved relocation rows, in emission order
  */
-fn elf_build_relas(enc: EncodedModuleX86, syms: []ElfSym) -> []ElfRela {
+fn elf_build_relas(obj: ElfObject, syms: []ElfSym) -> []ElfRela {
     let secidx = elf_rodata_secsym_index(syms)
     mut out: []ElfRela = teko::list::empty()
     mut i: u64 = 0
     loop {
-        if i >= enc.relocs.len { break }
-        let r = enc.relocs[i]
-        let hit = elf_rodata_hit(enc.symbols, r.sym)
+        if i >= obj.relocs.len { break }
+        let r = obj.relocs[i]
+        let hit = elf_rodata_hit(obj.symbols, r.sym)
         let symidx = if hit.found { secidx } else { elf_symbol_index(syms, r.sym) }
         let addend = if hit.found { r.addend + (hit.offset to i64) } else { r.addend }
-        out = teko::list::push(out, ElfRela { offset = r.offset; symidx = symidx; rtype = elf_reloc_type(r.kind); addend = addend })
+        out = teko::list::push(out, ElfRela { offset = r.offset; symidx = symidx; rtype = r.rtype; addend = addend })
         i++
     }
     out
@@ -477,7 +543,7 @@ type ElfLayout = struct {
  * `.strtab` and `.shstrtab` (byte strings, align 1) follow their predecessors
  * directly. Mirrors `emit_elf`'s emission order exactly.
  *
- * @param EncodedModuleX86 enc  the section images (for the `.text`/`.rodata` sizes)
+ * @param ElfObject obj  the neutral object (for the `.text`/`.rodata` sizes)
  * @param u32 nsyms  the `Elf64_Sym` count
  * @param u32 nrela  the `Elf64_Rela` count
  * @param u32 strtab_len  the pre-built `.strtab` byte size
@@ -485,11 +551,11 @@ type ElfLayout = struct {
  * @param u32 first_global  `.symtab`'s `sh_info`
  * @return ElfLayout  the resolved offsets + sizes + counts
  */
-fn compute_elf_layout(enc: EncodedModuleX86, nsyms: u32, nrela: u32, strtab_len: u32, shstrtab_len: u32, first_global: u32) -> ElfLayout {
+fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, strtab_len: u32, shstrtab_len: u32, first_global: u32) -> ElfLayout {
     let text_offset = 64 to u32
-    let text_size = enc.text.len to u32
+    let text_size = obj.text.len to u32
     let rodata_offset = align_up(text_offset + text_size, 8 to u32)
-    let rodata_size = enc.rodata.len to u32
+    let rodata_size = obj.rodata.len to u32
     let symtab_offset = align_up(rodata_offset + rodata_size, 8 to u32)
     let symtab_size = nsyms * (24 to u32)
     let strtab_offset = symtab_offset + symtab_size
@@ -520,16 +586,20 @@ fn compute_elf_layout(enc: EncodedModuleX86, nsyms: u32, nrela: u32, strtab_len:
 /**
  * emit_elf_header — the 64-byte `Elf64_Ehdr`: the `e_ident` magic (`\x7fELF` +
  * ELFCLASS64 + ELFDATA2LSB + EV_CURRENT + ELFOSABI_SYSV + 8 pad bytes), then
- * `e_type = ET_REL`(1), `e_machine = EM_X86_64`(62), `e_version = 1`, zero
- * `e_entry`/`e_phoff`, the computed `e_shoff`, zero `e_flags`, `e_ehsize = 64`,
- * zero program-header fields, `e_shentsize = 64`, `e_shnum = 7`, and
- * `e_shstrndx = 5` (`.shstrtab`).
+ * `e_type = ET_REL`(1), the supplied `e_machine` (EM_X86_64=62 / EM_RISCV=243),
+ * `e_version = 1`, zero `e_entry`/`e_phoff`, the computed `e_shoff`, the supplied
+ * `e_flags` (0 for x86-64 / EF_RISCV_FLOAT_ABI_DOUBLE=0x0004 for RV64 LP64D),
+ * `e_ehsize = 64`, zero program-header fields, `e_shentsize = 64`, `e_shnum = 7`,
+ * and `e_shstrndx = 5` (`.shstrtab`). The `e_machine`/`e_flags` are the ONLY
+ * ISA-varying bytes of the reused header (§7.1).
  *
  * @param []byte buf  the (empty) buffer to extend
  * @param ElfLayout lay  the resolved layout (for `e_shoff`)
+ * @param u32 e_machine  the ELF `e_machine` (62=x86-64, 243=riscv)
+ * @param u32 e_flags  the ELF `e_flags` (0=x86-64, 0x0004=RV64 LP64D hard-float)
  * @return []byte  `buf` followed by the 64-byte Ehdr
  */
-fn emit_elf_header(buf: []byte, lay: ElfLayout) -> []byte {
+fn emit_elf_header(buf: []byte, lay: ElfLayout, e_machine: u32, e_flags: u32) -> []byte {
     mut b = teko::list::push(buf, 0x7F to byte)
     b = teko::list::push(b, 0x45 to byte)
     b = teko::list::push(b, 0x4C to byte)
@@ -545,12 +615,12 @@ fn emit_elf_header(buf: []byte, lay: ElfLayout) -> []byte {
         k++
     }
     b = emit_u16_le_elf(b, 1 to u32)
-    b = emit_u16_le_elf(b, 62 to u32)
+    b = emit_u16_le_elf(b, e_machine)
     b = emit_u32_le(b, 1 to u32)
     b = emit_u64_le(b, 0 to u64)
     b = emit_u64_le(b, 0 to u64)
     b = emit_u64_le(b, lay.shoff to u64)
-    b = emit_u32_le(b, 0 to u32)
+    b = emit_u32_le(b, e_flags)
     b = emit_u16_le_elf(b, 64 to u32)
     b = emit_u16_le_elf(b, 0 to u32)
     b = emit_u16_le_elf(b, 0 to u32)
@@ -679,34 +749,106 @@ fn emit_elf_relas(buf: []byte, relas: []ElfRela) -> []byte {
 }
 
 /**
- * emit_elf — assemble an x86-64 `ET_REL` ELF64 object from an `EncodedModuleX86`:
- * the `Elf64_Ehdr` + the seven section images (`.text`/`.rodata` bytes, the
- * `Elf64_Sym` table local-then-global with the `.rodata` `STT_SECTION` symbol,
+ * ElfRelocReq — one ALREADY-RESOLVED relocation the neutral ELF writer turns into
+ * an `Elf64_Rela`: the `.text`-relative field offset (`r_offset`), the target
+ * symbol NAME (resolved to an index by the writer), the NUMERIC `R_<arch>_*` type
+ * (each per-ISA encoder maps its own `RelocKind*` → the number, so the writer
+ * holds no ISA knowledge), and the addend. This is the ISA-agnostic form of
+ * `RelocX86`/`RelocRiscv` — the per-ISA reloc's `kind` is already lowered to
+ * `rtype`.
+ *
+ * @since #387 B2-7
+ */
+pub type ElfRelocReq = struct {
+    /**
+     * offset — the patched field's `.text`-section-relative byte offset.
+     */
+    offset: u32
+    /**
+     * sym — the target symbol's final name (a function, an extern, a `.rodata`
+     * datum, or a `.text` pcrel label).
+     */
+    sym: str
+    /**
+     * rtype — the numeric `R_<arch>_*` relocation type (per-ISA-mapped).
+     */
+    rtype: u32
+    /**
+     * addend — the `r_addend`; a rodata target folds its `.rodata` offset onto
+     * this base.
+     */
+    addend: i64
+}
+
+/**
+ * ElfObject — the ISA-agnostic input to the shared ELF64 writer: the machine id
+ * (`e_machine`: EM_X86_64=62, EM_RISCV=243), the ABI flags (`e_flags`: 0 for
+ * x86-64, EF_RISCV_FLOAT_ABI_DOUBLE=0x0004 for RV64 LP64D), the `.text`/`.rodata`
+ * section images, the neutral `Symbol` list (local-then-global-then-undefined,
+ * now INCLUDING per-pcrel-pair `.text` label locals — §7.2), and the resolved
+ * `ElfRelocReq` rows. Both `emit_elf` (x86) and `emit_elf_riscv` build this and
+ * call `emit_elf_object`; the writer is ISA-agnostic, so E1 (the ELF static
+ * linker) reuses it unchanged.
+ *
+ * @since #387 B2-7
+ */
+pub type ElfObject = struct {
+    /**
+     * e_machine — the ELF `e_machine` (62=x86-64, 243=riscv).
+     */
+    e_machine: u32
+    /**
+     * e_flags — the ELF `e_flags` (0=x86-64, 0x0004=RV64 LP64D hard-float).
+     */
+    e_flags: u32
+    /**
+     * text — the `.text` section image.
+     */
+    text: []byte
+    /**
+     * rodata — the `.rodata` section image.
+     */
+    rodata: []byte
+    /**
+     * symbols — the neutral symbol list (locals incl. `.text` pcrel labels, then
+     * globals, then undefined).
+     */
+    symbols: []Symbol
+    /**
+     * relocs — the resolved relocation requests, `.text`-relative, in emission
+     * order.
+     */
+    relocs: []ElfRelocReq
+}
+
+/**
+ * emit_elf_object — the ISA-AGNOSTIC ELF64 `ET_REL` writer (the extracted B1
+ * body): the `Elf64_Ehdr` (with the supplied `e_machine`/`e_flags`) + the seven
+ * section images (`.text`/`.rodata` bytes, the `Elf64_Sym` table local-then-global
+ * with the `.rodata` `STT_SECTION` symbol AND any `.text` pcrel-label locals,
  * `.strtab`, `.shstrtab`, the `.rela.text` `Elf64_Rela` table) + the seven
  * `Elf64_Shdr` headers. Enough for `cc`/`ld` to link into a runnable executable
- * against the C-built `teko_rt` (D-2 option 1 bootstrap). The writer is
- * ISA-agnostic (it consumes only the byte images + symbols + relocations), so E1
- * (the ELF static linker) reuses its shape. Data globals + `R_X86_64_64` data
- * relocs are the `B1-globals` stop, raised earlier in `encode_module_x86`, so a
- * B1 object never carries an `Abs64` relocation; a defined function's `st_value`
- * stays the bare section-relative `.text` offset (the exact inverse of Mach-O's
- * rebased `n_value`).
+ * against the C-built `teko_rt` (D-2 option 1 bootstrap). No ISA knowledge remains
+ * past this boundary — the per-ISA `emit_elf`/`emit_elf_riscv` adapters supply the
+ * machine, flags, and numeric reloc types, so E1 (the ELF static linker) reuses
+ * this verbatim. A defined function's `st_value` stays the bare section-relative
+ * `.text` offset (the exact inverse of Mach-O's rebased `n_value`).
  *
- * @param EncodedModuleX86 enc  the section images + symbols + relocations
+ * @param ElfObject obj  the machine id + flags + section images + symbols + relocs
  * @return []byte  the ELF64 object file bytes
  */
-pub fn emit_elf(enc: EncodedModuleX86) -> []byte {
-    let syms = elf_build_symbols(enc.symbols)
+pub fn emit_elf_object(obj: ElfObject) -> []byte {
+    let syms = elf_build_symbols(obj.symbols)
     let strtab = build_elf_strtab(elf_sym_names(syms))
     let shstrtab = build_elf_strtab(elf_section_names())
-    let relas = elf_build_relas(enc, syms)
+    let relas = elf_build_relas(obj, syms)
     let first_global = elf_first_global_index(syms)
-    let lay = compute_elf_layout(enc, syms.len to u32, relas.len to u32, strtab.bytes.len to u32, shstrtab.bytes.len to u32, first_global)
+    let lay = compute_elf_layout(obj, syms.len to u32, relas.len to u32, strtab.bytes.len to u32, shstrtab.bytes.len to u32, first_global)
     mut b: []byte = teko::list::empty()
-    b = emit_elf_header(b, lay)
-    b = append_bytes(b, enc.text)
+    b = emit_elf_header(b, lay, obj.e_machine, obj.e_flags)
+    b = append_bytes(b, obj.text)
     b = pad_to_mult(b, 8 to u32)
-    b = append_bytes(b, enc.rodata)
+    b = append_bytes(b, obj.rodata)
     b = pad_to_mult(b, 8 to u32)
     b = emit_elf_symtab(b, syms, strtab)
     b = append_bytes(b, strtab.bytes)
@@ -715,4 +857,50 @@ pub fn emit_elf(enc: EncodedModuleX86) -> []byte {
     b = emit_elf_relas(b, relas)
     b = pad_to_mult(b, 8 to u32)
     emit_elf_shdrs(b, lay, shstrtab.strx)
+}
+
+/**
+ * x86_reloc_reqs — lower every `RelocX86` of `enc` to a neutral `ElfRelocReq`,
+ * mapping the x86 `kind` to its numeric `R_X86_64_*` type via `elf_reloc_type`
+ * (the ONLY x86 knowledge the adapter injects). The offset, target name, and
+ * base addend ride through unchanged; the shared writer folds a rodata target's
+ * `.rodata` offset onto the addend and resolves the name to a symbol index.
+ *
+ * @param EncodedModuleX86 enc  the x86 module (relocations)
+ * @return []ElfRelocReq  the neutral relocation requests, in emission order
+ */
+fn x86_reloc_reqs(enc: EncodedModuleX86) -> []ElfRelocReq {
+    mut out: []ElfRelocReq = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= enc.relocs.len { break }
+        let r = enc.relocs[i]
+        out = teko::list::push(out, ElfRelocReq { offset = r.offset; sym = r.sym; rtype = elf_reloc_type(r.kind); addend = r.addend })
+        i++
+    }
+    out
+}
+
+/**
+ * emit_elf — the x86-64 ELF adapter (B1's entry, now delegating): map the
+ * `EncodedModuleX86` to a neutral `ElfObject` (`e_machine`=62, `e_flags`=0, each
+ * `RelocX86` lowered to an `ElfRelocReq` via `elf_reloc_type`) and hand it to the
+ * shared `emit_elf_object`. The byte output is IDENTICAL to B1's pre-B2 writer
+ * (B1's goldens are the guardrail — they must stay byte-for-byte green), so the
+ * x86 differential is untouched. Data globals + `R_X86_64_64` data relocs are the
+ * `B1-globals` stop, raised earlier in `encode_module_x86`, so a B1 object never
+ * carries an `Abs64` relocation.
+ *
+ * @param EncodedModuleX86 enc  the section images + symbols + relocations
+ * @return []byte  the ELF64 object file bytes
+ */
+pub fn emit_elf(enc: EncodedModuleX86) -> []byte {
+    emit_elf_object(ElfObject {
+        e_machine = 62 to u32
+        e_flags = 0 to u32
+        text = enc.text
+        rodata = enc.rodata
+        symbols = enc.symbols
+        relocs = x86_reloc_reqs(enc)
+    })
 }

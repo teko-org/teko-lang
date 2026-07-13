@@ -1,0 +1,325 @@
+/**
+ * rv_r — a virtual GPR register operand with the given id (a fixture-building
+ * shorthand shared by every RISC-V test below).
+ *
+ * @param u32 id  the virtual register's abstract id
+ * @return MReg  the virtual GPR register operand
+ */
+fn rv_r(id: u32) -> MReg {
+    vreg(id, MRegClass::GPR)
+}
+
+/**
+ * rv_p — a physical GPR register operand with the given id (a fixture-building
+ * shorthand shared by every RISC-V test below).
+ *
+ * @param u32 id  the physical register's RISC-V register number
+ * @return MReg  the physical GPR register operand
+ */
+fn rv_p(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * rv_mem — a base-plus-displacement12 memory operand (a fixture-building
+ * shorthand shared by every RISC-V test below).
+ *
+ * @param MReg base  the base register
+ * @param i32 offset  the byte displacement
+ * @return MMem  the memory operand
+ */
+fn rv_mem(base: MReg, offset: i32) -> MMem {
+    MMem { base = base; offset = offset }
+}
+
+/**
+ * rv_block0 — the arithmetic block of `rv_full_module`'s fixture function:
+ * small/upper/PC-relative immediate materialization, every three-address
+ * register-register ALU mnemonic in both the 64-bit base form and the 32-bit
+ * `*w` form (covering every signed/unsigned mul/div/rem combination), every
+ * register-immediate12 ALU mnemonic, and both set-less-than signednesses,
+ * ending in a jump to block #M1. Split out so no single fixture grows unbounded
+ * (W15 — flatten by extraction).
+ *
+ * @return MBlockRiscv  the arithmetic block
+ */
+fn rv_block0() -> MBlockRiscv {
+    let insts = [
+        li_riscv(rv_r(10), 42 to i32),
+        lui_riscv(rv_r(11), 74565 to u32),
+        auipc_riscv(rv_r(12), 0 to u32),
+        alu_r_riscv(MAluOpRiscv::Add, true, rv_r(13), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Sub, true, rv_r(14), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::And, true, rv_r(15), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Or, true, rv_r(16), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Xor, true, rv_r(17), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Sll, true, rv_r(18), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Srl, true, rv_r(19), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Sra, true, rv_r(20), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Mul, true, rv_r(21), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Div, true, rv_r(22), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Divu, true, rv_r(23), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Rem, true, rv_r(24), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Remu, true, rv_r(25), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Add, false, rv_r(26), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Sub, false, rv_r(27), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Mul, false, rv_r(28), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Div, false, rv_r(29), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Divu, false, rv_r(30), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Rem, false, rv_r(31), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Remu, false, rv_r(32), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Sll, false, rv_r(33), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Srl, false, rv_r(34), rv_r(1), rv_r(2)),
+        alu_r_riscv(MAluOpRiscv::Sra, false, rv_r(35), rv_r(1), rv_r(2)),
+        alu_i_riscv(MAluOpRiscv::Addi, rv_r(36), rv_r(1), 100 to i32),
+        alu_i_riscv(MAluOpRiscv::Xori, rv_r(37), rv_r(1), -1 to i32),
+        alu_i_riscv(MAluOpRiscv::Sltiu, rv_r(38), rv_r(1), 1 to i32),
+        slt_riscv(rv_r(39), rv_r(1), rv_r(2), false),
+        slt_riscv(rv_r(40), rv_r(1), rv_r(2), true),
+        jal_riscv(1)
+    ]
+    MBlockRiscv { id = 0; params = teko::list::empty(); insts = insts }
+}
+
+/**
+ * rv_block1 — the memory/addressing block of `rv_full_module`'s fixture
+ * function: every load width across both sign forms (`ld`/`lw`/`lwu`/`lh`/
+ * `lhu`/`lb`/`lbu`), every store width (`sd`/`sw`/`sh`/`sb`, including a
+ * negative displacement), the frame-slot and PC-relative address forms, and an
+ * indirect jump-and-link, ending in a jump to block #M2 (W15 — flatten by
+ * extraction).
+ *
+ * @return MBlockRiscv  the memory/addressing block
+ */
+fn rv_block1() -> MBlockRiscv {
+    let insts = [
+        load_riscv(MMemSizeRiscv::D, false, rv_r(41), rv_mem(rv_r(1), 8 to i32)),
+        load_riscv(MMemSizeRiscv::W, true, rv_r(42), rv_mem(rv_r(1), 0 to i32)),
+        load_riscv(MMemSizeRiscv::W, false, rv_r(43), rv_mem(rv_r(1), 4 to i32)),
+        load_riscv(MMemSizeRiscv::H, true, rv_r(44), rv_mem(rv_r(1), 2 to i32)),
+        load_riscv(MMemSizeRiscv::H, false, rv_r(45), rv_mem(rv_r(1), 6 to i32)),
+        load_riscv(MMemSizeRiscv::B, true, rv_r(46), rv_mem(rv_r(1), -4 to i32)),
+        load_riscv(MMemSizeRiscv::B, false, rv_r(47), rv_mem(rv_r(1), 1 to i32)),
+        store_riscv(MMemSizeRiscv::D, rv_r(1), rv_mem(rv_r(2), 0 to i32)),
+        store_riscv(MMemSizeRiscv::W, rv_r(1), rv_mem(rv_r(2), 4 to i32)),
+        store_riscv(MMemSizeRiscv::H, rv_r(1), rv_mem(rv_r(2), 2 to i32)),
+        store_riscv(MMemSizeRiscv::B, rv_r(1), rv_mem(rv_r(2), 1 to i32)),
+        frame_addr_riscv(rv_r(48), 3),
+        lla_riscv(rv_r(49), "some_global"),
+        jalr_riscv(rv_r(50), rv_r(1), 0 to i32),
+        jal_riscv(2)
+    ]
+    MBlockRiscv { id = 1; params = teko::list::empty(); insts = insts }
+}
+
+/**
+ * rv_block2 — the control-flow block of `rv_full_module`'s fixture function:
+ * the fused compare-and-branch across every condition code (the six direct
+ * `beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu` plus the four operand-swapped
+ * order-only conditions), the direct/indirect call shapes spanning the
+ * variadic/result and empty/one/two-argument forms, and the return terminator,
+ * carrying one block-arg so the printer's params-header branch is exercised
+ * (W15 — flatten by extraction).
+ *
+ * @return MBlockRiscv  the control-flow block
+ */
+fn rv_block2() -> MBlockRiscv {
+    let insts = [
+        branch_riscv(MCond::EQ, rv_r(1), rv_r(2), 0),
+        branch_riscv(MCond::NE, rv_r(1), rv_r(2), 1),
+        branch_riscv(MCond::LT, rv_r(1), rv_r(2), 0),
+        branch_riscv(MCond::GE, rv_r(1), rv_r(2), 1),
+        branch_riscv(MCond::LO, rv_r(1), rv_r(2), 0),
+        branch_riscv(MCond::HS, rv_r(1), rv_r(2), 1),
+        branch_riscv(MCond::GT, rv_r(1), rv_r(2), 0),
+        branch_riscv(MCond::LE, rv_r(1), rv_r(2), 1),
+        branch_riscv(MCond::HI, rv_r(1), rv_r(2), 0),
+        branch_riscv(MCond::LS, rv_r(1), rv_r(2), 1),
+        call_riscv("tk_exit", [rv_p(10)], rv_p(10), false, false),
+        call_riscv("tk_add", [rv_p(10), rv_p(11)], rv_p(10), true, true),
+        call_ind_riscv(rv_r(1), teko::list::empty(), rv_p(10), false),
+        call_ind_riscv(rv_r(1), [rv_p(10)], rv_p(10), true),
+        ret_riscv()
+    ]
+    MBlockRiscv { id = 2; params = [rv_r(80)]; insts = insts }
+}
+
+/**
+ * rv_full_module — a module with two functions: `kitchen_sink_riscv` (one
+ * instance of every `MInstRiscv` case, spanning both `wide` forms, every
+ * `MCond`, every `MMemSizeRiscv`, every signed/unsigned mul/div/rem
+ * combination, and both `is_phys` states) plus `leaf_riscv` (a minimal
+ * one-block function), exercising the whole printer surface the golden-dump
+ * tests below assert against.
+ *
+ * @return MModuleRiscv  the fixture module
+ */
+fn rv_full_module() -> MModuleRiscv {
+    let sink = MFuncRiscv {
+        symbol = "kitchen_sink_riscv"
+        blocks = [rv_block0(), rv_block1(), rv_block2()]
+        frame = teko::list::empty()
+    }
+    let leaf_block = MBlockRiscv { id = 0; params = teko::list::empty(); insts = [ret_riscv()] }
+    let leaf = MFuncRiscv { symbol = "leaf_riscv"; blocks = [leaf_block]; frame = teko::list::empty() }
+    add_mfunc_riscv(add_mfunc_riscv(empty_mmodule_riscv(), sink), leaf)
+}
+
+#test
+fn rv_prints_immediate_materialization() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "li %10, #42")
+    teko::assert::str_contains(text, "lui %11, #74565")
+    teko::assert::str_contains(text, "auipc %12, #0")
+}
+
+#test
+fn rv_prints_three_address_alu_base_forms() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "add %13, %1, %2")
+    teko::assert::str_contains(text, "sub %14, %1, %2")
+    teko::assert::str_contains(text, "and %15, %1, %2")
+    teko::assert::str_contains(text, "or %16, %1, %2")
+    teko::assert::str_contains(text, "xor %17, %1, %2")
+    teko::assert::str_contains(text, "sll %18, %1, %2")
+    teko::assert::str_contains(text, "srl %19, %1, %2")
+    teko::assert::str_contains(text, "sra %20, %1, %2")
+}
+
+#test
+fn rv_prints_native_mul_div_rem_both_widths() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "mul %21, %1, %2")
+    teko::assert::str_contains(text, "div %22, %1, %2")
+    teko::assert::str_contains(text, "divu %23, %1, %2")
+    teko::assert::str_contains(text, "rem %24, %1, %2")
+    teko::assert::str_contains(text, "remu %25, %1, %2")
+    teko::assert::str_contains(text, "mulw %28, %1, %2")
+    teko::assert::str_contains(text, "divw %29, %1, %2")
+    teko::assert::str_contains(text, "divuw %30, %1, %2")
+    teko::assert::str_contains(text, "remw %31, %1, %2")
+    teko::assert::str_contains(text, "remuw %32, %1, %2")
+}
+
+#test
+fn rv_prints_the_thirty_two_bit_w_arithmetic_and_shift_forms() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "addw %26, %1, %2")
+    teko::assert::str_contains(text, "subw %27, %1, %2")
+    teko::assert::str_contains(text, "sllw %33, %1, %2")
+    teko::assert::str_contains(text, "srlw %34, %1, %2")
+    teko::assert::str_contains(text, "sraw %35, %1, %2")
+}
+
+#test
+fn rv_prints_immediate_alu_and_set_less_than() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "addi %36, %1, #100")
+    teko::assert::str_contains(text, "xori %37, %1, #-1")
+    teko::assert::str_contains(text, "sltiu %38, %1, #1")
+    teko::assert::str_contains(text, "slt %39, %1, %2")
+    teko::assert::str_contains(text, "sltu %40, %1, %2")
+}
+
+#test
+fn rv_prints_every_load_width_and_sign_form() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "ld %41, 8(%1)")
+    teko::assert::str_contains(text, "lw %42, 0(%1)")
+    teko::assert::str_contains(text, "lwu %43, 4(%1)")
+    teko::assert::str_contains(text, "lh %44, 2(%1)")
+    teko::assert::str_contains(text, "lhu %45, 6(%1)")
+    teko::assert::str_contains(text, "lb %46, -4(%1)")
+    teko::assert::str_contains(text, "lbu %47, 1(%1)")
+}
+
+#test
+fn rv_prints_every_store_width() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "sd %1, 0(%2)")
+    teko::assert::str_contains(text, "sw %1, 4(%2)")
+    teko::assert::str_contains(text, "sh %1, 2(%2)")
+    teko::assert::str_contains(text, "sb %1, 1(%2)")
+}
+
+#test
+fn rv_prints_frame_pcrel_and_indirect_jump_forms() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "addi %48, sp, [frame #3]")
+    teko::assert::str_contains(text, "lla %49, @some_global")
+    teko::assert::str_contains(text, "jalr %50, 0(%1)")
+    teko::assert::str_contains(text, "jal x0, #M1")
+    teko::assert::str_contains(text, "jal x0, #M2")
+}
+
+#test
+fn rv_prints_every_condition_code_via_the_fused_branch() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "beq %1, %2, #M0")
+    teko::assert::str_contains(text, "bne %1, %2, #M1")
+    teko::assert::str_contains(text, "blt %1, %2, #M0")
+    teko::assert::str_contains(text, "bge %1, %2, #M1")
+    teko::assert::str_contains(text, "bltu %1, %2, #M0")
+    teko::assert::str_contains(text, "bgeu %1, %2, #M1")
+    teko::assert::str_contains(text, "blt %2, %1, #M0")
+    teko::assert::str_contains(text, "bge %2, %1, #M1")
+    teko::assert::str_contains(text, "bltu %2, %1, #M0")
+    teko::assert::str_contains(text, "bgeu %2, %1, #M1")
+}
+
+#test
+fn rv_prints_calls_and_return() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "call @tk_exit(%p10)")
+    teko::assert::str_contains(text, "call @tk_add(%p10, %p11) variadic -> %p10")
+    teko::assert::str_contains(text, "call.indirect %1()")
+    teko::assert::str_contains(text, "call.indirect %1(%p10) -> %p10")
+    teko::assert::str_contains(text, "ret")
+}
+
+#test
+fn rv_prints_block_headers_and_the_params_header() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "func @kitchen_sink_riscv {")
+    teko::assert::str_contains(text, "  #M0:")
+    teko::assert::str_contains(text, "  #M2(%80):")
+}
+
+#test
+fn rv_separates_multiple_functions_by_a_blank_line() {
+    let text = minst_print_riscv(rv_full_module())
+    teko::assert::str_contains(text, "func @kitchen_sink_riscv {")
+    teko::assert::str_contains(text, "}\n\nfunc @leaf_riscv {")
+}
+
+#test
+fn rv_names_every_relocation_kind() {
+    teko::assert::is_true(reloc_kind_name_riscv(RelocKindRiscv::Call) == "call")
+    teko::assert::is_true(reloc_kind_name_riscv(RelocKindRiscv::PcRelHi20) == "pcrel_hi20")
+    teko::assert::is_true(reloc_kind_name_riscv(RelocKindRiscv::PcRelLo12) == "pcrel_lo12")
+    teko::assert::is_true(reloc_kind_name_riscv(RelocKindRiscv::Branch) == "branch")
+    teko::assert::is_true(reloc_kind_name_riscv(RelocKindRiscv::Jal) == "jal")
+    teko::assert::is_true(reloc_kind_name_riscv(RelocKindRiscv::Abs64) == "abs64")
+}
+
+#test
+fn rv_builds_a_two_block_function_with_the_incremental_api() {
+    mut f = new_mfunc_riscv("teko__demo__addx")
+    f = append_minst_riscv(f, 0, alu_r_riscv(MAluOpRiscv::Add, true, rv_r(2), rv_r(1), rv_r(0)))
+    f = append_minst_riscv(f, 0, jal_riscv(1))
+    let blk1 = MBlockRiscv { id = 1; params = [rv_r(3), rv_r(4)]; insts = teko::list::empty() }
+    f = append_block_riscv(f, blk1)
+    f = append_minst_riscv(f, 1, alu_i_riscv(MAluOpRiscv::Addi, rv_p(10), rv_r(3), 0 to i32))
+    f = append_minst_riscv(f, 1, ret_riscv())
+    f = append_frame_riscv(f, lir::LAlloca { bytes = 8; align = 8 })
+    f = set_block_param_riscv(f, 1, 0, rv_r(5))
+    teko::assert::is_true(f.frame.len == 1)
+    let text = minst_print_riscv(add_mfunc_riscv(empty_mmodule_riscv(), f))
+    teko::assert::str_contains(text, "func @teko__demo__addx {")
+    teko::assert::str_contains(text, "  #M0:")
+    teko::assert::str_contains(text, "    add %2, %1, %0")
+    teko::assert::str_contains(text, "    jal x0, #M1")
+    teko::assert::str_contains(text, "  #M1(%5, %4):")
+    teko::assert::str_contains(text, "    addi %p10, %3, #0")
+    teko::assert::str_contains(text, "    ret")
+}
