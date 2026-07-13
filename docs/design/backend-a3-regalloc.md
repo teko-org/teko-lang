@@ -348,6 +348,29 @@ fn number_insts(f: MFunc) -> []NumberedInst { … }
 > order), which linear-scan handles only with live-range holes / interval union. A3-2 detects a
 > back-edge (a branch/jump target whose id ≤ the current block id) and honest-stops with a named
 > error, deferring loop-body allocation to the A3 loop follow-up.
+>
+> **§6.2 RESOLVED (#389 A3-loop pull-forward, owner ruling 2026-07-13 "fix fully now, any size").**
+> The honest-stop's own wording — "needs live-range holes over the strict linear numbering" —
+> **overstates the CORRECTNESS requirement.** True lifetime holes (interval range-lists so a value
+> live across a loop but unused in a sub-region can share its register in the hole) are a
+> *quality* optimisation (fewer spills), NOT a correctness prerequisite. The **smallest correct
+> approach is loop-liveness extension**: after the naive `[firstDef, lastUse]` intervals are
+> computed, for every natural loop `[header_pt, latch_pt]` (each retreating edge `has_back_edge`
+> already finds), **extend any interval that is live at the loop header to reach at least
+> `latch_pt`** — the classic "a value live at a loop header is live across the whole loop body"
+> fixup. This closes the ONE real gap in the contiguous model: a value defined before/at the
+> header and last-*used* mid-body would otherwise have its interval truncated at that mid-body
+> use, letting a later-in-body value steal its register and clobber it for the next iteration.
+> Extension is conservative (never underestimates liveness) and needs NO new interval
+> representation — `LiveInterval` stays a single `[start, end]`; only `end` grows, and
+> `crosses_call` is recomputed over the widened range. Because the A1 frontend threads EVERY
+> loop-carried scalar through a loop-header block-param (`promote_env`, `lower.tks`) — whose
+> destructed edge-move gives it an entry-edge def (low point) AND a back-edge def/use (high
+> point) — its naive interval *already* spans `[entry, latch]`; the extension is therefore a
+> no-op for today's integer-loop corpus but is the correctness insurance that lets the honest-stop
+> be removed for ALL loop shapes (loop-invariants held in a reg across the body, alloca base
+> pointers, future frontends). **True lifetime holes remain a deferred QUALITY follow-up (a
+> separate named crumb), never a keystone blocker.**
 
 ### 3.2 Pass 2 — live-interval computation (`compute_intervals`)
 

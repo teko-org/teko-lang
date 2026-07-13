@@ -437,3 +437,60 @@ does not flag the new `LOp` cases as a frozen-enum violation.
 Every construct in §1.2 has a concrete lowering above; every new op has a print + interp + fixture
 plan; the sequencing respects the memory-before-match / memory-before-dispatch dependencies. **A1 does
 not HALT.**
+
+## 6. Merge blocks must thread scalar RE-ASSIGNMENTS (#389 A3-loop root, 2026-07-13)
+
+**Pinned root of the range-`for` back-edge miscompile.** The bug reported as "the range-loop
+back-edge fails to thread the counter increment" is NOT in either backend's edge-copy emission —
+it is an A1 **merge-lowering** defect shared by both own backends (own-native inherits it too; it is
+merely MASKED there by the §6.2 loop honest-stop firing first). A `mut` scalar RE-ASSIGNED inside an
+`if`/`match` arm (`lower_assign_simple` rebinds `env[name]` to a fresh SSA-lite VReg) is **dropped at
+the merge**: `lower_if_stmt`/`lower_if_value`/`lower_match_*` allocate the merge block with only the
+value block-arg (zero for a statement `if`), and rebuild the post-merge context from the PRE-branch
+`ctx.env`. The arm-local rebind never reaches a merge block-param, so after the merge the name reads
+its stale pre-branch VReg.
+
+The range-`for` desugar `loop mut i in a..b { … }` makes this load-bearing: the per-iteration STEP
+is emitted as a guarded `if !first { i = i + 1 }` at the body top (so `continue` re-runs it). The
+increment IS computed, but the `if`-merge drops the `i` rebind, so the loop back-edge
+(`close_loop_body` → `jump_args_for_names(env, names)`) carries the stale header `i` — the counter
+freezes. Manual loops with a TOP-LEVEL `i = i + 1` are unaffected (the rebind is in the body env the
+back-edge reads). Proof (own-wasm, wasmtime): `if 1==1 { x=5 }; exit(x)` → exit 0 (C-oracle 5);
+`loop { …; if 1==1 { i = i+1 } }` → infinite loop (frozen `i`); the same increment top-level → exit 6.
+
+**Fix (A1, one site-family, backend-agnostic).** At each statement-bearing merge — `lower_if_stmt`,
+`lower_if_value`, and the `match` statement/value merges — thread the scalars an arm re-assigns,
+mirroring `promote_env`/`jump_args_for_names` (the SAME machinery loop headers already use):
+
+```teko
+/**
+ * reassigned_scalars — the enclosing-scope SCALAR names some arm of this
+ * branch re-assigns (`TAssign`, `AssignKind::Simple`), so the merge must
+ * carry them as block-params. A static pre-scan of the arm statement blocks
+ * against `env` — computed BEFORE lowering, so the merge params can be
+ * allocated up front and each arm's closing jump can supply them. An arm
+ * with no such assignment contributes nothing, so an `if`/`match` that
+ * mutates no enclosing scalar keeps its CURRENT zero-scalar-param merge
+ * (no LIR change, no regression risk for the existing acyclic corpus).
+ *
+ * @param []checker::TStatement arms  every arm's statement block, flattened
+ * @param LEnv env  the pre-branch scalar environment (the promotable names)
+ * @return []str  the distinct enclosing scalar names re-assigned in any arm
+ */
+fn reassigned_scalars(arms: []checker::TStatement, env: LEnv) -> []str { … }
+```
+
+Each merge then adds one block-param per reassigned name (after any existing value param), every
+arm's closing jump appends `jump_args_for_names(arm_env, names)`, and the post-merge env maps each
+reassigned name to its new merge param. **No backend change is required:** the wasm stackifier's
+`emit_edge_copies` (§4.3 parallel-copy) and the native isel's `emit_edge_moves` already thread
+multi-param FORWARD merges (this is why the loop-carried accumulator `s` — a top-level rebind — has
+always threaded correctly). A forward merge param has an ordinary forward interval, so it does NOT
+trip the §6.2 loop honest-stop.
+
+**Minimality vs. promote-all.** Promoting EVERY enclosing scalar at every merge (as loop headers do)
+is also correct but adds redundant self-copies and register pressure to every `if`, changing the LIR
+of the existing GREEN acyclic corpus (regression surface). The reassigned-only pre-scan keeps every
+mutation-free `if`/`match` byte-identical and touches only branches that actually mutate — the
+smallest correct, lowest-regression fix. **This is the load-bearing keystone fix: with it, own-wasm
+== C-native on `wasm_loop_count`/`wasm_continue_step` (exit 6) with ZERO stackifier change.**
