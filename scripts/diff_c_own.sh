@@ -60,11 +60,12 @@
 # later cluster (C1).
 #
 # usage: scripts/diff_c_own.sh [fixture-dir ...]
-#   TEKO=<self-hosted-teko>   (default: ./bin/teko — MUST carry emit_native; the C
-#                              bootstrap ./build/teko / the seed does NOT, so the env
-#                              seam would be a silent no-op there — never use the seed)
-#   BUILDER=<seed-teko>       (default: ./build/teko then `teko` on PATH) — used ONLY
-#                              to self-host ./bin/teko when it is missing
+#   TEKO=<self-hosted-teko>   (default: ./bin/teko — MUST carry emit_native; the raw
+#                              seed does NOT, so the env seam would be a silent no-op
+#                              there — never use the seed itself as TEKO)
+#   BUILDER=<seed-teko>       (default: ./.teko/teko — the fetch_teko.sh-cached seed —
+#                              then `teko` on PATH) — used ONLY to self-host ./bin/teko
+#                              when it is missing
 
 set -u
 
@@ -151,7 +152,7 @@ else
 fi
 
 TEKO="${TEKO:-./bin/teko}"
-BUILDER="${BUILDER:-./build/teko}"
+BUILDER="${BUILDER:-./.teko/teko}"
 OWN_BACKEND_MARKER="(own backend)"
 
 resolve_abs() {
@@ -164,9 +165,10 @@ resolve_abs() {
 teko_abs="$(resolve_abs "$TEKO")"
 builder_abs="$(resolve_abs "$BUILDER")"
 
-# Self-host ./bin/teko from the seed when it is missing (a fresh checkout / a CI job
-# that only built ./build/teko). The RESULT carries emit_native because it is built
-# from THIS branch's src/, so its TEKO_BACKEND=native seam is real.
+# Self-host ./bin/teko from the seed when it is missing (a fresh checkout / a dev
+# host that only fetched the seed, not yet self-hosted). The RESULT carries
+# emit_native because it is built from THIS branch's src/, so its
+# TEKO_BACKEND=native seam is real.
 if [[ ! -x "$teko_abs" ]]; then
     if [[ ! -x "$builder_abs" ]]; then
         if command -v teko >/dev/null 2>&1; then builder_abs="$(command -v teko)"; fi

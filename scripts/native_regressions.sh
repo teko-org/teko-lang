@@ -16,12 +16,13 @@
 # (PR #66).
 #
 # usage: scripts/native_regressions.sh
-#   TEKO=<path-to-teko-binary>   (default: ./build/teko)
+#   TEKO=<path-to-teko-binary>   (default: ./.teko/teko — the fetch_teko.sh-cached seed;
+#                                 CI always sets TEKO=./bin/teko, the self-hosted gen1)
 #   CWD_REGRESSION_FIXTURE=<dir> (default: examples/regressions/char_ops)
 
 set -u
 
-TEKO="${TEKO:-./build/teko}"
+TEKO="${TEKO:-./.teko/teko}"
 CWD_REGRESSION_FIXTURE="${CWD_REGRESSION_FIXTURE:-examples/regressions/char_ops}"
 
 # Run a command with a timeout when `timeout` exists (Linux CI); raw otherwise (macOS dev).
@@ -115,8 +116,9 @@ else
     printf 'FAIL  %-28s bootstrap compiler not found/executable at %s\n' "cwd_build_bootstrap" "$bootstrap_abs"
 fi
 
-# Self-host on the fly if ./bin/teko is not already there (a fresh checkout / a CI job
-# that only built ./build/teko, which is the norm — this is what makes the check work
+# Self-host on the fly if ./bin/teko is not already there (a fresh checkout / a dev
+# host that only fetched the seed — CI always passes TEKO=./bin/teko already built,
+# so this fallback fires only in local/agent use — this is what makes the check work
 # with ZERO workflow changes: the harness builds what it needs to test).
 if [ ! -x "$selfhosted_abs" ]; then
     if [ -x "$bootstrap_abs" ]; then
