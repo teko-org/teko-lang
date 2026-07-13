@@ -1,0 +1,1076 @@
+use teko::parser
+
+/**
+ * A scalar `i64` type — a value that can never carry a reachable `Reference`.
+ *
+ * The SP-1 (#389/#498) unit suite lives beside `borrow.tks` so it reaches both the PUBLIC query
+ * surface (`type_reaches_ref` / `fn_borrow_summary` / the `BorrowSummaryEnv` builders) and every
+ * private helper the two pure queries are built from, proving each lattice/walk step in isolation
+ * on hand-built `Type`/`TAST` input — mirroring `spine_test.tkt`'s own methodology.
+ *
+ * @return the `i64` primitive type
+ */
+fn bw_i64() -> Type { Prim { kind = PrimKind::I64 } }
+
+/**
+ * The `bool` primitive type.
+ *
+ * @return the `bool` primitive type
+ */
+fn bw_bool() -> Type { Prim { kind = PrimKind::Bool } }
+
+/**
+ * A `Reference` type wrapping `inner`.
+ *
+ * @param inner  the referenced type
+ * @return       `Reference { inner = inner }`
+ */
+fn bw_ref(inner: Type) -> Type { Reference { inner = inner } }
+
+/**
+ * A `Named` (user struct/class/trait/alias/…) type by bare name.
+ *
+ * @param name  the type's registered name
+ * @return      `Named { name = name }`
+ */
+fn bw_named(name: str) -> Type { Named { name = name } }
+
+/**
+ * A function (closure) TYPE with the given params/return — `variadic`/`param_names`/`defaults`
+ * carry inert defaults (never read by `type_reaches_ref`/`fn_borrow_summary`).
+ *
+ * @param params  the function type's parameter types
+ * @param ret     the function type's return type
+ * @return        the `Func` type
+ */
+fn bw_func_type(params: []Type, ret: Type) -> Type {
+    Func { params = params; ret = ret; variadic = false; param_names = teko::list::empty(); n_required = params.len; defaults = teko::list::empty() }
+}
+
+/**
+ * A single-segment syntactic path.
+ *
+ * @param name  the segment name
+ * @return      a `parser::Path` with one segment
+ */
+fn bw_path(name: str) -> parser::Path {
+    parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) }
+}
+
+/**
+ * A plain named-type syntactic annotation (no generic args).
+ *
+ * @param name  the annotated type's name
+ * @return      a `parser::NamedType` annotation
+ */
+fn bw_named_ann(name: str) -> parser::TypeExpr {
+    parser::NamedType { path = bw_path(name); args = teko::list::empty() }
+}
+
+/**
+ * A `Ref<inner_name>` syntactic annotation.
+ *
+ * @param inner_name  the referenced type's name
+ * @return            a `parser::NamedType` headed `Ref` with one type argument
+ */
+fn bw_ref_ann(inner_name: str) -> parser::TypeExpr {
+    parser::NamedType { path = bw_path("Ref"); args = teko::list::push(teko::list::empty(), bw_named_ann(inner_name)) }
+}
+
+/**
+ * One struct/class/trait field declaration, always `pub`/non-`intern` (the field's own visibility
+ * is irrelevant to reachability).
+ *
+ * @param name      the field's name
+ * @param type_ann  the field's syntactic type annotation
+ * @return          a `parser::Field`
+ */
+fn bw_field(name: str, type_ann: parser::TypeExpr) -> parser::Field {
+    parser::Field { name = name; type_ann = type_ann; vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+}
+
+/**
+ * A `TypeDecl` shell with the given body and every other field at its inert default (private,
+ * undocumented, no DI, no unsafe/must_free marker) — the shape every `bw_*_decl` builder shares.
+ *
+ * @param name  the declared type's name
+ * @param body  its `TypeBody`
+ * @return      the `TypeDecl`
+ */
+fn bw_decl(name: str, body: parser::TypeBody) -> parser::TypeDecl {
+    parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+}
+
+/**
+ * A `type Name = struct { fields }` declaration.
+ *
+ * @param name    the struct's name
+ * @param fields  its fields
+ * @return        the `TypeDecl`
+ */
+fn bw_struct_decl(name: str, fields: []parser::Field) -> parser::TypeDecl {
+    bw_decl(name, parser::StructBody { fields = fields; methods = teko::list::empty(); implements = teko::list::empty() })
+}
+
+/**
+ * A `type Name = class [Base] { fields }` declaration.
+ *
+ * @param name       the class's name
+ * @param fields     its OWN fields (excluding any inherited from `base_name`)
+ * @param has_base   does it declare a base class?
+ * @param base_name  the base class's name (valid iff `has_base`)
+ * @return           the `TypeDecl`
+ */
+fn bw_class_decl(name: str, fields: []parser::Field, has_base: bool, base_name: str) -> parser::TypeDecl {
+    bw_decl(name, parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = has_base; base_name = base_name; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = fields; methods = teko::list::empty() })
+}
+
+/**
+ * A `type Name = trait { fields }` declaration.
+ *
+ * @param name    the trait's name
+ * @param fields  its fields
+ * @return        the `TypeDecl`
+ */
+fn bw_trait_decl(name: str, fields: []parser::Field) -> parser::TypeDecl {
+    bw_decl(name, parser::TraitBody { fields = fields; methods = teko::list::empty() })
+}
+
+/**
+ * A `type Name = <type_ann>` transparent alias declaration.
+ *
+ * @param name      the alias's name
+ * @param type_ann  the aliased syntactic type
+ * @return          the `TypeDecl`
+ */
+fn bw_alias_decl(name: str, type_ann: parser::TypeExpr) -> parser::TypeDecl {
+    bw_decl(name, parser::AliasBody { alias = type_ann })
+}
+
+/**
+ * A `type Name = variant M1 | M2 | …` union declaration.
+ *
+ * @param name     the variant's name
+ * @param members  its member type annotations
+ * @return         the `TypeDecl`
+ */
+fn bw_variant_decl(name: str, members: []parser::TypeExpr) -> parser::TypeDecl {
+    bw_decl(name, parser::VariantBody { type_expr = parser::UnionType { members = members } })
+}
+
+/**
+ * A `type Name = enum { … }` declaration (member names are irrelevant to reachability).
+ *
+ * @param name  the enum's name
+ * @return      the `TypeDecl`
+ */
+fn bw_enum_decl(name: str) -> parser::TypeDecl {
+    bw_decl(name, parser::EnumBody { members = teko::list::empty() })
+}
+
+/**
+ * A `type Name = flags { … }` declaration.
+ *
+ * @param name  the flags type's name
+ * @return      the `TypeDecl`
+ */
+fn bw_flags_decl(name: str) -> parser::TypeDecl {
+    bw_decl(name, parser::FlagsBody { members = teko::list::empty(); values = teko::list::empty() })
+}
+
+/**
+ * A `extern type Name` opaque-handle declaration.
+ *
+ * @param name  the extern type's name
+ * @return      the `TypeDecl`
+ */
+fn bw_extern_decl(name: str) -> parser::TypeDecl {
+    bw_decl(name, parser::ExternBody { })
+}
+
+/**
+ * A `type Name = interface { … }` declaration.
+ *
+ * @param name  the interface's name
+ * @return      the `TypeDecl`
+ */
+fn bw_iface_decl(name: str) -> parser::TypeDecl {
+    bw_decl(name, parser::InterfaceBody { extends = teko::list::empty(); methods = teko::list::empty() })
+}
+
+/**
+ * A `TypeTable` registering exactly one declaration under its own name, at the root namespace.
+ *
+ * @param decl  the declaration to register
+ * @return      a one-entry `TypeTable`
+ */
+fn bw_table1(decl: parser::TypeDecl) -> TypeTable {
+    teko::list::push(teko::list::empty(), TypeReg { name = decl.name; namespace = ""; vis = parser::Visibility::Private; decl = decl })
+}
+
+/**
+ * A `TypeTable` registering two declarations at the root namespace.
+ *
+ * @param a  the first declaration
+ * @param b  the second declaration
+ * @return   a two-entry `TypeTable`
+ */
+fn bw_table2(a: parser::TypeDecl, b: parser::TypeDecl) -> TypeTable {
+    teko::list::push(bw_table1(a), TypeReg { name = b.name; namespace = ""; vis = parser::Visibility::Private; decl = b })
+}
+
+/**
+ * The empty `TypeTable` (no declarations registered).
+ *
+ * @return an empty `TypeTable`
+ */
+fn bw_empty_table() -> TypeTable { teko::list::empty() }
+
+/**
+ * `type_reaches_ref` answers `true` directly on a bare `Reference` — the base case every deeper
+ * walk bottoms out on.
+ */
+#test fn reaches_ref_true_on_bare_reference() {
+    teko::assert::is_true(type_reaches_ref(bw_ref(bw_i64()), bw_empty_table(), teko::list::empty()))
+}
+
+/**
+ * `type_reaches_ref` answers `false` on a plain scalar (the `_ => false` fallback arm covering
+ * every non-composite, non-Named `Type` case).
+ */
+#test fn reaches_ref_false_on_scalar() {
+    teko::assert::is_false(type_reaches_ref(bw_i64(), bw_empty_table(), teko::list::empty()))
+}
+
+/**
+ * A `Slice` reaches ref iff its element does.
+ */
+#test fn reaches_ref_slice_follows_element() {
+    teko::assert::is_true(type_reaches_ref(Slice { element = bw_ref(bw_i64()) }, bw_empty_table(), teko::list::empty()))
+    teko::assert::is_false(type_reaches_ref(Slice { element = bw_i64() }, bw_empty_table(), teko::list::empty()))
+}
+
+/**
+ * An `Optional` reaches ref iff its inner does.
+ */
+#test fn reaches_ref_optional_follows_inner() {
+    teko::assert::is_true(type_reaches_ref(Optional { inner = bw_ref(bw_i64()) }, bw_empty_table(), teko::list::empty()))
+    teko::assert::is_false(type_reaches_ref(Optional { inner = bw_i64() }, bw_empty_table(), teko::list::empty()))
+}
+
+/**
+ * A `Variant` reaches ref iff ANY member does — a reaching member past the first one still short-
+ * circuits `types_reach_ref`'s scan, and an all-clear member list falls through to `false`.
+ */
+#test fn reaches_ref_variant_any_member() {
+    let members = teko::list::push(teko::list::push(teko::list::empty(), bw_i64()), bw_ref(bw_i64()))
+    teko::assert::is_true(type_reaches_ref(Variant { members = members }, bw_empty_table(), teko::list::empty()))
+    let clear = teko::list::push(teko::list::push(teko::list::empty(), bw_i64()), Str { })
+    teko::assert::is_false(type_reaches_ref(Variant { members = clear }, bw_empty_table(), teko::list::empty()))
+}
+
+/**
+ * A `Func` type reaches ref through its RETURN type (short-circuiting before ever looking at
+ * params), through a PARAMETER type when the return is clear, or through neither.
+ */
+#test fn reaches_ref_func_return_or_params() {
+    teko::assert::is_true(type_reaches_ref(bw_func_type(teko::list::empty(), bw_ref(bw_i64())), bw_empty_table(), teko::list::empty()))
+    let ref_param = teko::list::push(teko::list::empty(), bw_ref(bw_i64()))
+    teko::assert::is_true(type_reaches_ref(bw_func_type(ref_param, bw_i64()), bw_empty_table(), teko::list::empty()))
+    let plain_param = teko::list::push(teko::list::empty(), bw_i64())
+    teko::assert::is_false(type_reaches_ref(bw_func_type(plain_param, bw_i64()), bw_empty_table(), teko::list::empty()))
+}
+
+/**
+ * A `Named` type whose name is already on `visited` contributes NO new edge (the cycle guard) —
+ * answers `false` without consulting the table at all, so it is safe even against an empty table.
+ */
+#test fn reaches_ref_named_cycle_guard_stops_revisit() {
+    let visited = teko::list::push(teko::list::empty(), "Self")
+    teko::assert::is_false(type_reaches_ref(bw_named("Self"), bw_empty_table(), visited))
+}
+
+/**
+ * A `Named` type absent from the table is unresolvable — conservatively answers `true`.
+ */
+#test fn reaches_ref_named_unknown_is_conservative_true() {
+    teko::assert::is_true(type_reaches_ref(bw_named("Ghost"), bw_empty_table(), teko::list::empty()))
+}
+
+/**
+ * A struct reaches ref iff any of its fields does.
+ */
+#test fn reaches_ref_named_struct_field() {
+    let with_ref = bw_struct_decl("Holder", teko::list::push(teko::list::empty(), bw_field("r", bw_ref_ann("i64"))))
+    teko::assert::is_true(type_reaches_ref(bw_named("Holder"), bw_table1(with_ref), teko::list::empty()))
+    let without = bw_struct_decl("Plain", teko::list::push(teko::list::empty(), bw_field("n", bw_named_ann("i64"))))
+    teko::assert::is_false(type_reaches_ref(bw_named("Plain"), bw_table1(without), teko::list::empty()))
+}
+
+/**
+ * A struct field whose annotation does not resolve (an unknown field type) makes the whole
+ * `deriver_field_view` call fail — `field_view_list_reaches_ref`'s `error` arm conservatively
+ * answers `true`.
+ */
+#test fn reaches_ref_named_struct_unresolvable_field_is_conservative_true() {
+    let bad = bw_struct_decl("Bad", teko::list::push(teko::list::empty(), bw_field("x", bw_named_ann("Nonexistent"))))
+    teko::assert::is_true(type_reaches_ref(bw_named("Bad"), bw_table1(bad), teko::list::empty()))
+}
+
+/**
+ * A class reaches ref through its OWN fields, and — via `deriver_field_view`'s base-chain fold —
+ * through an INHERITED field too, even when the derived class's own fields are all clear.
+ */
+#test fn reaches_ref_named_class_own_and_inherited_fields() {
+    let own_ref = bw_class_decl("OwnHolder", teko::list::push(teko::list::empty(), bw_field("r", bw_ref_ann("i64"))), false, "")
+    teko::assert::is_true(type_reaches_ref(bw_named("OwnHolder"), bw_table1(own_ref), teko::list::empty()))
+
+    let base = bw_class_decl("Base", teko::list::push(teko::list::empty(), bw_field("r", bw_ref_ann("i64"))), false, "")
+    let derived = bw_class_decl("Derived", teko::list::empty(), true, "Base")
+    teko::assert::is_true(type_reaches_ref(bw_named("Derived"), bw_table2(base, derived), teko::list::empty()))
+
+    let clear_base = bw_class_decl("ClearBase", teko::list::push(teko::list::empty(), bw_field("n", bw_named_ann("i64"))), false, "")
+    let clear_derived = bw_class_decl("ClearDerived", teko::list::empty(), true, "ClearBase")
+    teko::assert::is_false(type_reaches_ref(bw_named("ClearDerived"), bw_table2(clear_base, clear_derived), teko::list::empty()))
+}
+
+/**
+ * A trait reaches ref iff any of its OWN fields does (`fields_reach_ref`, the non-`deriver_field_view`
+ * path — traits are never a struct/class).
+ */
+#test fn reaches_ref_named_trait_field() {
+    let with_ref = bw_trait_decl("RefTrait", teko::list::push(teko::list::empty(), bw_field("r", bw_ref_ann("i64"))))
+    teko::assert::is_true(type_reaches_ref(bw_named("RefTrait"), bw_table1(with_ref), teko::list::empty()))
+    let without = bw_trait_decl("PlainTrait", teko::list::push(teko::list::empty(), bw_field("n", bw_named_ann("i64"))))
+    teko::assert::is_false(type_reaches_ref(bw_named("PlainTrait"), bw_table1(without), teko::list::empty()))
+}
+
+/**
+ * A transparent alias reaches ref iff its resolved aliased type does.
+ */
+#test fn reaches_ref_named_alias_follows_target() {
+    let ref_alias = bw_alias_decl("RefAlias", bw_ref_ann("i64"))
+    teko::assert::is_true(type_reaches_ref(bw_named("RefAlias"), bw_table1(ref_alias), teko::list::empty()))
+    let plain_alias = bw_alias_decl("PlainAlias", bw_named_ann("i64"))
+    teko::assert::is_false(type_reaches_ref(bw_named("PlainAlias"), bw_table1(plain_alias), teko::list::empty()))
+}
+
+/**
+ * An alias whose target does not resolve (an unknown name) conservatively answers `true`
+ * (`type_expr_reaches_ref`'s `error` arm).
+ */
+#test fn reaches_ref_named_alias_unresolvable_target_is_conservative_true() {
+    let bad_alias = bw_alias_decl("BadAlias", bw_named_ann("Nonexistent"))
+    teko::assert::is_true(type_reaches_ref(bw_named("BadAlias"), bw_table1(bad_alias), teko::list::empty()))
+}
+
+/**
+ * A `variant` union reaches ref iff any of its resolved members does — reuses the same
+ * `type_expr_reaches_ref` helper an alias uses, but through the `VariantBody` match arm.
+ */
+#test fn reaches_ref_named_variant_union_member() {
+    let members = teko::list::push(teko::list::push(teko::list::empty(), bw_named_ann("i64")), bw_ref_ann("i64"))
+    let with_ref = bw_variant_decl("RefUnion", members)
+    teko::assert::is_true(type_reaches_ref(bw_named("RefUnion"), bw_table1(with_ref), teko::list::empty()))
+    let clear = teko::list::push(teko::list::empty(), bw_named_ann("i64"))
+    let without = bw_variant_decl("PlainUnion", clear)
+    teko::assert::is_false(type_reaches_ref(bw_named("PlainUnion"), bw_table1(without), teko::list::empty()))
+}
+
+/**
+ * An enum/flags declaration carries no data — always `false`, regardless of the table.
+ */
+#test fn reaches_ref_named_enum_and_flags_are_false() {
+    teko::assert::is_false(type_reaches_ref(bw_named("Color"), bw_table1(bw_enum_decl("Color")), teko::list::empty()))
+    teko::assert::is_false(type_reaches_ref(bw_named("Perm"), bw_table1(bw_flags_decl("Perm")), teko::list::empty()))
+}
+
+/**
+ * An `extern type` (opaque foreign handle) and an `interface` (non-instantiable contract) both
+ * conservatively answer `true` — this walk cannot see inside either.
+ */
+#test fn reaches_ref_named_extern_and_interface_are_conservative_true() {
+    teko::assert::is_true(type_reaches_ref(bw_named("Handle"), bw_table1(bw_extern_decl("Handle")), teko::list::empty()))
+    teko::assert::is_true(type_reaches_ref(bw_named("Shape"), bw_table1(bw_iface_decl("Shape")), teko::list::empty()))
+}
+
+/**
+ * A minimal `TFunction` with the given params and body — every field `fn_borrow_summary` never
+ * reads carries an inert default (mirrors `spine_test.tkt`'s own `sp_fn`).
+ *
+ * @param params  the function's parameters
+ * @param body    the function's typed statement block
+ * @return        a `TFunction`
+ */
+fn bw_fn(params: []parser::Param, body: []TStatement) -> TFunction {
+    TFunction { name = "f"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; return_type = Void { }; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; namespace = "t"; file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+}
+
+/**
+ * A parameter — only its NAME is ever read by `fn_borrow_summary` (a parameter's TYPE is taken from
+ * where it is actually READ in the body, per `resolve_var_borrow`'s design), so the syntactic
+ * annotation here is an inert placeholder.
+ *
+ * @param name  the parameter's name
+ * @return      a `parser::Param`
+ */
+fn bw_param(name: str) -> parser::Param {
+    parser::Param { name = name; has_type = true; type_ann = bw_named_ann("i64"); is_params = false; has_default = false; default_expr = bw_no_expr() }
+}
+
+/**
+ * The inert placeholder syntactic expression a `Param`'s unused default slot carries.
+ *
+ * @return a `parser::Number` 0 expression
+ */
+fn bw_no_expr() -> parser::Expr {
+    parser::Expr { kind = parser::Number { is_float = false; value = 0; fval = 0.0 }; line = 0; col = 0 }
+}
+
+/**
+ * A typed bare-variable read.
+ *
+ * @param name  the variable's name
+ * @param t     its resolved type
+ * @return      a `TVar` typed expression
+ */
+fn bw_var(name: str, t: Type) -> TExpr {
+    TExpr { kind = TVar { name = name; is_func = false; func_ns = "" }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * A typed bare read of a top-level named FUNCTION used as a VALUE (`is_func = true`) — names no
+ * parameter, so it never contributes a borrow.
+ *
+ * @param name  the function's name
+ * @param t     its (closure) type
+ * @return      a `TVar` typed expression with `is_func = true`
+ */
+fn bw_var_func(name: str, t: Type) -> TExpr {
+    TExpr { kind = TVar { name = name; is_func = true; func_ns = "" }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * A discarded expression statement.
+ *
+ * @param e  the typed expression
+ * @return   a `TExprStmt` statement
+ */
+fn bw_exprstmt(e: TExpr) -> TStatement { TExprStmt { expr = e } }
+
+/**
+ * A `let name = value` top-level binding.
+ *
+ * @param name   the bound name
+ * @param value  the binding's typed RHS
+ * @return       a `TBinding` statement
+ */
+fn bw_let(name: str, value: TExpr) -> TStatement {
+    TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = name }; bound = value.type; value = value }
+}
+
+/**
+ * A binding to a DESTRUCTURE pattern (names no single local — contributes no `LocalDef`).
+ *
+ * @param names  the destructured names
+ * @param value  the binding's typed RHS
+ * @return       a `TBinding` statement whose target is a `DestructurePattern`
+ */
+fn bw_let_destructure(names: []str, value: TExpr) -> TStatement {
+    TBinding { kind = parser::BindKind::Let; target = parser::DestructurePattern { names = names }; bound = value.type; value = value }
+}
+
+/**
+ * A `name = value` simple-name assignment.
+ *
+ * @param name   the assigned name
+ * @param value  the typed RHS
+ * @return       a `TAssign` statement of kind `Simple`
+ */
+fn bw_assign(name: str, value: TExpr) -> TStatement {
+    TAssign { kind = parser::AssignKind::Simple; name = name; op = lexer::TokenKind::Assign; bound = value.type; value = value; deref = false; target = bw_no_texpr() }
+}
+
+/**
+ * The inert placeholder typed expression an unused `TAssign.target` carries.
+ *
+ * @return a `TNullLit` sentinel `TExpr`
+ */
+fn bw_no_texpr() -> TExpr {
+    TExpr { kind = TNullLit { }; type = Void { }; line = 0; col = 0 }
+}
+
+/**
+ * A `return value` statement.
+ *
+ * @param value  the typed return value
+ * @return       a `TReturn` statement with `has_value = true`
+ */
+fn bw_return(value: TExpr) -> TStatement {
+    TReturn { has_value = true; value = value }
+}
+
+/**
+ * A value-less `return` statement.
+ *
+ * @return a `TReturn` statement with `has_value = false`
+ */
+fn bw_return_void() -> TStatement {
+    TReturn { has_value = false; value = bw_no_texpr() }
+}
+
+/**
+ * An unlabeled `loop { body }` statement.
+ *
+ * @param body  the typed loop body
+ * @return      a `TLoopStmt` statement
+ */
+fn bw_loop(body: []TStatement) -> TStatement { TLoopStmt { label = ""; init = teko::list::empty(); body = body } }
+
+/**
+ * An unlabeled `defer { body }` statement.
+ *
+ * @param body  the typed defer body
+ * @return      a `TDeferStmt` statement
+ */
+fn bw_defer(body: []TStatement) -> TStatement { TDeferStmt { body = body } }
+
+/**
+ * An anonymous `adopt { body }` statement.
+ *
+ * @param body  the typed adopter body
+ * @return      a `TAdoptStmt` statement
+ */
+fn bw_adopt(body: []TStatement) -> TStatement { TAdoptStmt { name = ""; body = body } }
+
+/**
+ * An unlabeled `break` statement.
+ *
+ * @return a `TBreakStmt` statement
+ */
+fn bw_break() -> TStatement { TBreakStmt { label = "" } }
+
+/**
+ * An unlabeled `continue` statement.
+ *
+ * @return a `TContinueStmt` statement
+ */
+fn bw_continue() -> TStatement { TContinueStmt { label = "" } }
+
+/**
+ * A typed `if cond { then_blk } [else { else_blk }]` expression.
+ *
+ * @param then_blk  the then-branch's typed body
+ * @param else_blk  the else-branch's typed body (ignored when `has_else` is false)
+ * @param has_else  does an else branch follow?
+ * @param t         the if-expression's resolved type
+ * @return          a `TIfExpr` typed expression
+ */
+fn bw_if(then_blk: []TStatement, else_blk: []TStatement, has_else: bool, t: Type) -> TExpr {
+    TExpr { kind = TIfExpr { cond = bw_var("c", bw_bool()); then_blk = then_blk; has_else = has_else; else_blk = else_blk }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * One WILDCARD-pattern `match` arm with the given typed body.
+ *
+ * @param body  the arm's typed body
+ * @return      a `TArm`
+ */
+fn bw_arm(body: []TStatement) -> TArm {
+    TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = bw_no_texpr(); body = body }
+}
+
+/**
+ * A typed `match` expression over a dummy subject, with the given arms.
+ *
+ * @param arms  the typed arms
+ * @param t     the match-expression's resolved type
+ * @return      a `TMatchExpr` typed expression
+ */
+fn bw_match(arms: []TArm, t: Type) -> TExpr {
+    TExpr { kind = TMatchExpr { subject = bw_var("subj", bw_i64()); arms = arms }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * A closure literal with the given captures, zero params, and a dummy body — `fn_borrow_summary`
+ * only ever reads `.captures` (never the body, matching the spine's own shallow-closure-body bound).
+ *
+ * @param captures  the closure's captured variables
+ * @param ret       the closure's return type
+ * @return          a `TLambda` typed expression
+ */
+fn bw_lambda(captures: []TCapture, ret: Type) -> TExpr {
+    TExpr { kind = TLambda { params = teko::list::empty(); body = teko::list::empty(); captures = captures; ret = ret; lift_id = 0 }; type = bw_func_type(teko::list::empty(), ret); line = 0; col = 0 }
+}
+
+/**
+ * One closure capture.
+ *
+ * @param name  the captured variable's name
+ * @param t     its resolved type
+ * @return      a `TCapture`
+ */
+fn bw_capture(name: str, t: Type) -> TCapture {
+    TCapture { name = name; type = t; by_ref = false }
+}
+
+/**
+ * A typed struct-init `Name { … }` with the given field values (field names are irrelevant to
+ * borrow resolution — only the VALUES are walked).
+ *
+ * @param vals  the typed field values
+ * @return      a `TStructInit` typed expression
+ */
+fn bw_struct_init(vals: []TExpr) -> TExpr {
+    TExpr { kind = TStructInit { field_names = teko::list::empty(); field_vals = vals }; type = bw_named("Agg"); line = 0; col = 0 }
+}
+
+/**
+ * A typed array literal `[ … ]` with the given (non-spread) element values.
+ *
+ * @param vals  the typed element values
+ * @return      a `TArrayLit` typed expression
+ */
+fn bw_array_lit(vals: []TExpr) -> TExpr {
+    mut elems: []TArrayElem = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= vals.len { break }
+        elems = teko::list::push(elems, TArrayElem { is_spread = false; expr = vals[i] })
+        i++
+    }
+    TExpr { kind = TArrayLit { elements = elems }; type = Slice { element = bw_i64() }; line = 0; col = 0 }
+}
+
+/**
+ * A typed call to a NAMED function (`is_closure_call = false`), with the given arguments.
+ *
+ * @param name     the callee's bare name
+ * @param call_ns  the callee's resolved namespace ("" = root/local)
+ * @param args     the typed arguments
+ * @param t        the call's resolved result type
+ * @return         a `TCall` typed expression
+ */
+fn bw_call(name: str, call_ns: str, args: []TExpr, t: Type) -> TExpr {
+    TExpr { kind = TCall { callee = bw_path(name); args = args; call_ns = call_ns; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * A typed call THROUGH a local closure VALUE (`is_closure_call = true`) — its target is a runtime
+ * value, never statically known, so `resolve_call_borrow` never consults `ctx.env` for it.
+ *
+ * @param t  the call's resolved result type
+ * @return   a `TCall` typed expression with `is_closure_call = true`
+ */
+fn bw_closure_call(t: Type) -> TExpr {
+    TExpr { kind = TCall { callee = bw_path("f"); args = teko::list::empty(); call_ns = ""; is_closure_call = true; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * A typed binary expression — a shape `resolve_borrow` does not specifically model, so it always
+ * falls back to `borrow_fallback` on its own (given) type.
+ *
+ * @param t  the binary expression's resolved type
+ * @return   a `TBinary` typed expression
+ */
+fn bw_binary(t: Type) -> TExpr {
+    TExpr { kind = TBinary { op = lexer::TokenKind::Plus; left = bw_var("a", bw_i64()); right = bw_var("b", bw_i64()) }; type = t; line = 0; col = 0 }
+}
+
+/**
+ * `fn_borrow_summary` on an empty body borrows nothing (the vacuous case — no escaping candidate
+ * expression exists to resolve).
+ */
+#test fn borrow_summary_empty_body_borrows_nothing() {
+    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), teko::list::empty()), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * A tail read of a `Reference`-typed parameter marks that parameter's index; a tail read of a plain
+ * scalar parameter marks nothing.
+ */
+#test fn borrow_summary_direct_tail_param_read() {
+    let ref_params = teko::list::push(teko::list::empty(), bw_param("cur"))
+    let ref_body = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("cur", bw_ref(bw_i64()))))
+    let ref_sum = fn_borrow_summary(bw_fn(ref_params, ref_body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(ref_sum.returns_all)
+    teko::assert::is_true(ref_sum.returns_borrow_of.len == 1)
+    teko::assert::is_true(ref_sum.returns_borrow_of[0] == 0)
+
+    let scalar_params = teko::list::push(teko::list::empty(), bw_param("v"))
+    let scalar_body = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("v", bw_i64())))
+    let scalar_sum = fn_borrow_summary(bw_fn(scalar_params, scalar_body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(scalar_sum.returns_all)
+    teko::assert::is_true(scalar_sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * A tail read of a bare TOP-LEVEL FUNCTION reference (`is_func = true`) never marks a parameter — it
+ * names no parameter at all.
+ */
+#test fn borrow_summary_func_value_tail_borrows_nothing() {
+    let body = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var_func("helper", bw_func_type(teko::list::empty(), bw_i64()))))
+    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * A tail read of an UNRESOLVABLE name (neither a parameter nor a local) falls back on its observed
+ * type: widening when that type reaches a `Reference`, contributing nothing otherwise.
+ */
+#test fn borrow_summary_unresolved_name_falls_back_on_type() {
+    let widens = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("global", bw_ref(bw_i64()))))
+    let widen_sum = fn_borrow_summary(bw_fn(teko::list::empty(), widens), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_true(widen_sum.returns_all)
+
+    let clear = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("global", bw_i64())))
+    let clear_sum = fn_borrow_summary(bw_fn(teko::list::empty(), clear), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(clear_sum.returns_all)
+    teko::assert::is_true(clear_sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * THE CORPUS IDIOM: `let it: T = () => { … }; it` — a closure literal bound to a top-level local,
+ * then read bare in tail position. The one-hop local-alias chase resolves `it` back to the `TLambda`
+ * and unions its captures: a `Reference` param captured directly marks its index; a captured plain
+ * scalar param does not.
+ */
+#test fn borrow_summary_local_bound_lambda_resolves_captures() {
+    let params = teko::list::push(teko::list::push(teko::list::empty(), bw_param("v")), bw_param("cur"))
+    let caps = teko::list::push(teko::list::push(teko::list::empty(), bw_capture("v", bw_i64())), bw_capture("cur", bw_ref(bw_i64())))
+    let lam = bw_lambda(caps, Optional { inner = bw_i64() })
+    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_let("it", lam)), bw_exprstmt(bw_var("it", lam.type)))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+    teko::assert::is_true(sum.returns_borrow_of[0] == 1)
+}
+
+/**
+ * A closure with NO captures at all (the `empty()`-shaped iterator) trivially borrows nothing —
+ * the capture-union loop simply never runs.
+ */
+#test fn borrow_summary_lambda_with_no_captures_borrows_nothing() {
+    let lam = bw_lambda(teko::list::empty(), Optional { inner = bw_i64() })
+    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_let("it", lam)), bw_exprstmt(bw_var("it", lam.type)))
+    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * A closure PARAMETER (a `Func`-typed value, e.g. a combinator's upstream `src: IntIter`) captured
+ * directly into the returned closure marks its index too — `Func` is inherently OPAQUE (its captured
+ * env is invisible in the type), so `param_borrow` marks it regardless of what `type_reaches_ref`
+ * finds in the bare signature (proves §B2.2 slice 1b's "param-rooted closure capture stays precise").
+ */
+#test fn borrow_summary_closure_param_capture_is_opaque_but_precise() {
+    let src_type = bw_func_type(teko::list::empty(), Optional { inner = bw_i64() })
+    let params = teko::list::push(teko::list::empty(), bw_param("src"))
+    let caps = teko::list::push(teko::list::empty(), bw_capture("src", src_type))
+    let lam = bw_lambda(caps, Optional { inner = bw_i64() })
+    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_let("mapped", lam)), bw_exprstmt(bw_var("mapped", lam.type)))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+    teko::assert::is_true(sum.returns_borrow_of[0] == 0)
+}
+
+/**
+ * A SELF-REFERENTIAL local (`let x = x`) can never resolve to a param — the cycle guard fires on
+ * the second visit and the walk widens (the safe direction; this shape cannot arise from a real
+ * `let` in practice, but the pure query stays total and terminating regardless).
+ */
+#test fn borrow_summary_self_referential_local_widens() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_let("x", bw_var("x", bw_i64()))), bw_exprstmt(bw_var("x", bw_i64())))
+    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_true(sum.returns_all)
+}
+
+/**
+ * A call THROUGH a local closure value (`is_closure_call = true`) has no statically-known callee —
+ * it falls back on its own result type, exactly like an unresolved name: widening when the result
+ * type reaches ref, contributing nothing when it does not.
+ */
+#test fn borrow_summary_closure_call_falls_back_on_result_type() {
+    let widens = teko::list::push(teko::list::empty(), bw_exprstmt(bw_closure_call(bw_ref(bw_i64()))))
+    let widen_sum = fn_borrow_summary(bw_fn(teko::list::empty(), widens), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_true(widen_sum.returns_all)
+
+    let clear = teko::list::push(teko::list::empty(), bw_exprstmt(bw_closure_call(bw_i64())))
+    let clear_sum = fn_borrow_summary(bw_fn(teko::list::empty(), clear), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(clear_sum.returns_all)
+    teko::assert::is_true(clear_sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * A call to a NAMED function absent from `callee_sum` (not yet summarized / a genuine external) has
+ * an unknown summary — falls back on the call's own result type, just like a closure call.
+ */
+#test fn borrow_summary_call_to_unsummarized_callee_falls_back() {
+    let call = bw_call("helper", "t", teko::list::empty(), bw_ref(bw_i64()))
+    let body = teko::list::push(teko::list::empty(), bw_exprstmt(call))
+    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_true(sum.returns_all)
+}
+
+/**
+ * A call to a callee whose OWN summary is `returns_all` widens the CALLER too (the widening
+ * propagates one hop up the borrow call-graph).
+ */
+#test fn borrow_summary_call_to_widened_callee_widens_caller() {
+    let env = borrow_summary_env_insert(borrow_summary_env_empty(), "t", "helper", BorrowSummary { returns_borrow_of = teko::list::empty(); returns_all = true })
+    let call = bw_call("helper", "t", teko::list::empty(), bw_i64())
+    let body = teko::list::push(teko::list::empty(), bw_exprstmt(call))
+    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), env)
+    teko::assert::is_true(sum.returns_all)
+}
+
+/**
+ * A call to a PRECISELY-summarized callee composes bottom-up: the borrowed callee-parameter index
+ * maps onto the ACTUAL argument fed there, and — when that argument is itself one of the CALLER's
+ * own parameters — the caller inherits that parameter's index. An out-of-range borrowed index (more
+ * indices than the call actually supplies) is silently skipped, never crashing.
+ */
+#test fn borrow_summary_call_composes_argument_onto_caller_param() {
+    let callee_sum = BorrowSummary { returns_borrow_of = teko::list::push(teko::list::empty(), 0 to u32); returns_all = false }
+    let env = borrow_summary_env_insert(borrow_summary_env_empty(), "t", "wrap", callee_sum)
+    let params = teko::list::push(teko::list::empty(), bw_param("cur"))
+    let args = teko::list::push(teko::list::empty(), bw_var("cur", bw_ref(bw_i64())))
+    let call = bw_call("wrap", "t", args, Optional { inner = bw_i64() })
+    let body = teko::list::push(teko::list::empty(), bw_exprstmt(call))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), env)
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+    teko::assert::is_true(sum.returns_borrow_of[0] == 0)
+
+    let oob_sum = BorrowSummary { returns_borrow_of = teko::list::push(teko::list::empty(), 3 to u32); returns_all = false }
+    let oob_env = borrow_summary_env_insert(borrow_summary_env_empty(), "t", "wrap2", oob_sum)
+    let oob_call = bw_call("wrap2", "t", teko::list::empty(), bw_i64())
+    let oob_body = teko::list::push(teko::list::empty(), bw_exprstmt(oob_call))
+    let oob_result = fn_borrow_summary(bw_fn(teko::list::empty(), oob_body), bw_empty_table(), oob_env)
+    teko::assert::is_false(oob_result.returns_all)
+    teko::assert::is_true(oob_result.returns_borrow_of.len == 0)
+}
+
+/**
+ * A struct-init aggregate escaping in tail position borrows every parameter reachable through ANY
+ * of its field values (the whole aggregate escapes as one value).
+ */
+#test fn borrow_summary_struct_init_unions_field_values() {
+    let params = teko::list::push(teko::list::push(teko::list::empty(), bw_param("a")), bw_param("b"))
+    let vals = teko::list::push(teko::list::push(teko::list::empty(), bw_var("a", bw_ref(bw_i64()))), bw_var("b", bw_i64()))
+    let body = teko::list::push(teko::list::empty(), bw_exprstmt(bw_struct_init(vals)))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+    teko::assert::is_true(sum.returns_borrow_of[0] == 0)
+}
+
+/**
+ * An array literal escaping in tail position likewise unions every element's borrow contribution —
+ * and two elements naming the SAME parameter dedupe to one index (the `union_idx_list` dedup path).
+ */
+#test fn borrow_summary_array_lit_unions_and_dedupes_elements() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let vals = teko::list::push(teko::list::push(teko::list::empty(), bw_var("r", bw_ref(bw_i64()))), bw_var("r", bw_ref(bw_i64())))
+    let body = teko::list::push(teko::list::empty(), bw_exprstmt(bw_array_lit(vals)))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+    teko::assert::is_true(sum.returns_borrow_of[0] == 0)
+}
+
+/**
+ * A shape `resolve_borrow` does not specifically model (a binary expression) falls back to
+ * `borrow_fallback` on its own type — widening or not, exactly as an unresolved-name read would.
+ */
+#test fn borrow_summary_unmodeled_shape_falls_back_on_own_type() {
+    let widens = teko::list::push(teko::list::empty(), bw_exprstmt(bw_binary(bw_ref(bw_i64()))))
+    let widen_sum = fn_borrow_summary(bw_fn(teko::list::empty(), widens), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_true(widen_sum.returns_all)
+
+    let clear = teko::list::push(teko::list::empty(), bw_exprstmt(bw_binary(bw_i64())))
+    let clear_sum = fn_borrow_summary(bw_fn(teko::list::empty(), clear), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(clear_sum.returns_all)
+}
+
+/**
+ * An explicit `return` NOT in tail position (a mid-body early exit) still contributes its value; a
+ * value-less `return` contributes nothing.
+ */
+#test fn borrow_summary_explicit_return_contributes_its_value() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_return(bw_var("r", bw_ref(bw_i64())))), bw_exprstmt(bw_var("nope", bw_i64())))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+
+    let void_body = teko::list::push(teko::list::empty(), bw_return_void())
+    let void_sum = fn_borrow_summary(bw_fn(teko::list::empty(), void_body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(void_sum.returns_all)
+    teko::assert::is_true(void_sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * An interior (non-tail) expression-statement's value is DISCARDED, not an escaping candidate — a
+ * plain call there contributes nothing (no nested `return` inside it either).
+ */
+#test fn borrow_summary_discarded_interior_statement_contributes_nothing() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let discarded = bw_call("side_effect", "t", teko::list::empty(), bw_i64())
+    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_exprstmt(discarded)), bw_exprstmt(bw_var("nope", bw_i64())))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * A tail-position `if`/`else` is DECOMPOSED into its two branch tails as separate escaping
+ * candidates — a `return` (or implicit tail) surfacing either branch's value contributes it, so a
+ * borrow appearing in only ONE branch still shows up in the summary (the safe union, not a
+ * path-sensitive pick).
+ */
+#test fn borrow_summary_tail_if_decomposes_both_branches() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let then_blk = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("r", bw_ref(bw_i64()))))
+    let else_blk = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("plain", bw_i64())))
+    let iff = bw_if(then_blk, else_blk, true, bw_i64())
+    let body = teko::list::push(teko::list::empty(), bw_exprstmt(iff))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+    teko::assert::is_true(sum.returns_borrow_of[0] == 0)
+}
+
+/**
+ * Likewise, a tail-position `match`'s arm bodies are each their own tail candidate.
+ */
+#test fn borrow_summary_tail_match_decomposes_arms() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let arm = bw_arm(teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("r", bw_ref(bw_i64())))))
+    let mtch = bw_match(teko::list::push(teko::list::empty(), arm), bw_i64())
+    let body = teko::list::push(teko::list::empty(), bw_exprstmt(mtch))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+}
+
+/**
+ * A `return` hiding inside a NON-tail `if`'s branch (reached through a top-level `TBinding`'s RHS)
+ * is still found — `collect_nested_returns_expr` descends into either branch hunting for it.
+ */
+#test fn borrow_summary_nested_return_inside_binding_if_is_found() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let then_blk = teko::list::push(teko::list::empty(), bw_return(bw_var("r", bw_ref(bw_i64()))))
+    let iff = bw_if(then_blk, teko::list::empty(), false, bw_i64())
+    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_let("x", iff)), bw_exprstmt(bw_var("nope", bw_i64())))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+}
+
+/**
+ * A `return` hiding inside a NON-tail `match`'s arm (reached through a top-level `TAssign`'s RHS) is
+ * likewise found.
+ */
+#test fn borrow_summary_nested_return_inside_assign_match_is_found() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let arm = bw_arm(teko::list::push(teko::list::empty(), bw_return(bw_var("r", bw_ref(bw_i64())))))
+    let mtch = bw_match(teko::list::push(teko::list::empty(), arm), bw_i64())
+    let first = teko::list::push(teko::list::empty(), bw_let("x", bw_var("r", bw_i64())))
+    let body = teko::list::push(first, bw_assign("x", mtch))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+}
+
+/**
+ * A `return` inside a `loop { }` body is found (an explicit `return` always escapes, regardless of
+ * the enclosing loop/defer/adopt not itself being a tail position).
+ */
+#test fn borrow_summary_return_inside_loop_is_found() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let loop_body = teko::list::push(teko::list::empty(), bw_return(bw_var("r", bw_ref(bw_i64()))))
+    let body = teko::list::push(teko::list::empty(), bw_loop(loop_body))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+}
+
+/**
+ * A `return` inside a `defer { }` body is found (the same recursive descent as `loop`).
+ */
+#test fn borrow_summary_return_inside_defer_is_found() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let defer_body = teko::list::push(teko::list::empty(), bw_return(bw_var("r", bw_ref(bw_i64()))))
+    let body = teko::list::push(teko::list::empty(), bw_defer(defer_body))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+}
+
+/**
+ * A `return` inside an `adopt { }` body is found (the same recursive descent as `loop`/`defer`).
+ * `break`/`continue` statements alongside it contribute nothing and never crash the walk.
+ */
+#test fn borrow_summary_return_inside_adopt_is_found_alongside_break_continue() {
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let adopt_body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), bw_break()), bw_continue()), bw_return(bw_var("r", bw_ref(bw_i64()))))
+    let body = teko::list::push(teko::list::empty(), bw_adopt(adopt_body))
+    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 1)
+}
+
+/**
+ * A binding to a DESTRUCTURE target contributes no `LocalDef` — a later read of one of its names
+ * resolves as an ordinary unresolved name (falls back on its own observed type), never crashing.
+ */
+#test fn borrow_summary_destructure_binding_contributes_no_local() {
+    let names = teko::list::push(teko::list::empty(), "x")
+    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_let_destructure(names, bw_var("r", bw_ref(bw_i64())))), bw_exprstmt(bw_var("x", bw_i64())))
+    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), borrow_summary_env_empty())
+    teko::assert::is_false(sum.returns_all)
+    teko::assert::is_true(sum.returns_borrow_of.len == 0)
+}
+
+/**
+ * `borrow_summary_env_find` (via a summarized call) answers the RIGHT summary for the RIGHT
+ * qualified key even with more than one callee registered, and `call_last_segment`/`call_target_key`
+ * degrade cleanly on a callee path with no segments at all (never crashing, just naming the empty
+ * key — a shape that cannot arise from a real call, but the pure helper stays total).
+ */
+#test fn borrow_summary_env_distinguishes_multiple_callees_and_empty_path_is_total() {
+    let sum_a = BorrowSummary { returns_borrow_of = teko::list::push(teko::list::empty(), 0 to u32); returns_all = false }
+    let sum_b = BorrowSummary { returns_borrow_of = teko::list::empty(); returns_all = true }
+    let env = borrow_summary_env_insert(borrow_summary_env_insert(borrow_summary_env_empty(), "t", "a", sum_a), "t", "b", sum_b)
+
+    let params = teko::list::push(teko::list::empty(), bw_param("r"))
+    let args = teko::list::push(teko::list::empty(), bw_var("r", bw_ref(bw_i64())))
+    let call_a = bw_call("a", "t", args, Optional { inner = bw_i64() })
+    let body_a = teko::list::push(teko::list::empty(), bw_exprstmt(call_a))
+    let result_a = fn_borrow_summary(bw_fn(params, body_a), bw_empty_table(), env)
+    teko::assert::is_false(result_a.returns_all)
+    teko::assert::is_true(result_a.returns_borrow_of.len == 1)
+
+    let call_b = bw_call("b", "t", teko::list::empty(), bw_i64())
+    let body_b = teko::list::push(teko::list::empty(), bw_exprstmt(call_b))
+    let result_b = fn_borrow_summary(bw_fn(teko::list::empty(), body_b), bw_empty_table(), env)
+    teko::assert::is_true(result_b.returns_all)
+
+    let empty_path = TCall { callee = parser::Path { segments = teko::list::empty() }; args = teko::list::empty(); call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }
+    teko::assert::is_true(call_last_segment(empty_path.callee) == "")
+    teko::assert::is_true(call_target_key(empty_path) == "")
+}
+
+/**
+ * `borrow_summary_env_empty` starts with no keys; `borrow_summary_env_find` on it (or on any key it
+ * was never given) answers `null`.
+ */
+#test fn borrow_summary_env_empty_finds_nothing() {
+    teko::assert::is_true(match borrow_summary_env_find(borrow_summary_env_empty(), "t::nope") { BorrowSummary => false; null => true })
+}

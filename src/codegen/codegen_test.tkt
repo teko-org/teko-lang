@@ -747,6 +747,51 @@ fn cgt_emit_value_match_arm_commits_tail() {
     teko::assert::is_true(!teko::str::contains(result, "tk_region_new"))
 }
 
+/** cgt_emit_loop_with_init — a loop with a NON-empty `init` wraps in a `{ }` C scope and emits the
+    preamble binding before `while (1)` (#517 emit_loop init wrapper). */
+#test
+fn cgt_emit_loop_with_init() {
+    let prog = cgt_prog()
+    let init_bind: checker::TStatement = checker::TBinding {
+        kind = parser::BindKind::Mut
+        target = parser::SimpleName { name = "_hi" }
+        bound = checker::Prim { kind = checker::PrimKind::I64 }
+        value = cgt_num_i64(3)
+    }
+    let init: []checker::TStatement = teko::list::push(cgt_empty_stmts(), init_bind)
+    let body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBreakStmt { label = "" })
+    let loop_s: checker::TStatement = checker::TLoopStmt { label = ""; init = init; body = body }
+    let ret_type = checker::Prim { kind = checker::PrimKind::I64 }
+    mut b: []checker::TStatement = teko::list::push(cgt_empty_stmts(), loop_s)
+    b = teko::list::push(b, cgt_ret(cgt_num_i64(0)))
+    let f = cgt_fn0("cgt_loop_init", "teko::cgt", ret_type, b)
+    let r = match emit_function(cgt_empty(), prog, f) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(teko::str::contains(r, "_hi"))
+    teko::assert::is_true(teko::str::contains(r, "while"))
+}
+
+/** cgt_loop_init_walkers — the codegen collect-optionals and lambda-lift walkers descend into a
+    loop's `init` preamble as well as its body (#517). */
+#test
+fn cgt_loop_init_walkers() {
+    let init_bind: checker::TStatement = checker::TBinding {
+        kind = parser::BindKind::Mut
+        target = parser::SimpleName { name = "_hi" }
+        bound = checker::Prim { kind = checker::PrimKind::I64 }
+        value = cgt_num_i64(3)
+    }
+    let init: []checker::TStatement = teko::list::push(cgt_empty_stmts(), init_bind)
+    let body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBreakStmt { label = "" })
+    let loop_s: checker::TStatement = checker::TLoopStmt { label = ""; init = init; body = body }
+    let stmts: []checker::TStatement = teko::list::push(cgt_empty_stmts(), loop_s)
+    let set0 = CgTypeSet { inners = teko::list::empty(); slices = teko::list::empty(); variants = teko::list::empty() }
+    let collected = cg_collect_block_opts(set0, stmts)
+    teko::assert::is_true(collected.inners.len == 0)
+    mut acc = StampAcc { next = 0; fns = teko::list::empty(); lams = teko::list::empty() }
+    let lifted = cg_lift_block(stmts, acc)
+    teko::assert::is_true(lifted.len == 1)
+}
+
 // ---------------------------------------------------------------------------
 // Group N: emit_function — the full pipeline
 //   emit_function, emit_function_sig, emit_block_tail, emit_block, emit_stmt,
@@ -760,7 +805,7 @@ fn cgt_emit_function_comprehensive() {
 
     // Body 1: loop{break} + if-stmt + binding + assign + return tail
     let break_body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBreakStmt { label = "" })
-    let loop_s: checker::TStatement = checker::TLoopStmt { label = ""; body = break_body }
+    let loop_s: checker::TStatement = checker::TLoopStmt { label = ""; init = teko::list::empty(); body = break_body }
 
     // if (true) { } — no else — statement position → emit_if_stmt → cb_indent_deeper
     let empty_blk = cgt_empty_stmts()

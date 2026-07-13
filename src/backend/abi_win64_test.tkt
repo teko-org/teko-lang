@@ -1,0 +1,293 @@
+/**
+ * wn_gpr — a physical GPR register operand with the given Win64 encoding id (a
+ * descriptor-test shorthand).
+ *
+ * @param u32 id  the physical register id (RAX=0..R15=15)
+ * @return MReg  the physical GPR register
+ */
+fn wn_gpr(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * wn_fpr — a physical FPR (XMM) register operand with the given id.
+ *
+ * @param u32 id  the physical register id (XMM0=0..XMM15=15)
+ * @return MReg  the physical FPR register
+ */
+fn wn_fpr(id: u32) -> MReg {
+    preg(id, MRegClass::FPR)
+}
+
+/**
+ * wn_iv — a virtual GPR live interval (a neutrality-proof scan-test shorthand,
+ * driving the SHARED linear scan under the Win64 register file).
+ *
+ * @param u32 reg_id  the virtual register id
+ * @param u32 start  the start program point
+ * @param u32 end  the last-use program point
+ * @param bool crosses  whether the value is live across a call
+ * @return LiveInterval  the virtual interval
+ */
+fn wn_iv(reg_id: u32, start: u32, end: u32, crosses: bool) -> LiveInterval {
+    LiveInterval { reg_id = reg_id; reg_class = MRegClass::GPR; start = start; end = end; is_fixed = false; crosses_call = crosses }
+}
+
+/**
+ * wn_fixed — a fixed GPR pin interval on physical register `reg_id` (the shape
+ * isel plants for an argument-register pin), for the fixed-pin-avoidance proof.
+ *
+ * @param u32 reg_id  the pinned physical register id
+ * @param u32 start  the start program point
+ * @param u32 end  the last-use program point
+ * @return LiveInterval  the fixed pin interval
+ */
+fn wn_fixed(reg_id: u32, start: u32, end: u32) -> LiveInterval {
+    LiveInterval { reg_id = reg_id; reg_class = MRegClass::GPR; start = start; end = end; is_fixed = true; crosses_call = false }
+}
+
+/**
+ * wn_set — an `IntervalSet` from virtual + fixed intervals with no call points
+ * (`crosses_call` on a virtual interval alone drives the call-clobber filter).
+ *
+ * @param []LiveInterval virt  the virtual intervals to color
+ * @param []LiveInterval fixed  the fixed pin intervals to block
+ * @return IntervalSet  the interval set
+ */
+fn wn_set(virt: []LiveInterval, fixed: []LiveInterval) -> IntervalSet {
+    IntervalSet { virt = virt; fixed = fixed; call_points = teko::list::empty() }
+}
+
+/**
+ * wn_phys — the physical register `vreg_id` was assigned by the scan, or the
+ * sentinel 100000 if it was spilled or absent.
+ *
+ * @param ScanResult scan  the linear-scan result
+ * @param u32 vreg_id  the virtual register to resolve
+ * @return u32  its assigned physreg id, or 100000
+ */
+fn wn_phys(scan: ScanResult, vreg_id: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= scan.assignments.len { break }
+        let got = match scan.assignments[i] {
+            InReg as r => if r.vreg_id == vreg_id { r.phys } else { 100000 to u32 }
+            Spilled => 100000 to u32
+        }
+        if got != 100000 to u32 { return got }
+        i++
+    }
+    100000 to u32
+}
+
+/**
+ * wn_spilled — whether `vreg_id` was spilled to a frame slot by the scan.
+ *
+ * @param ScanResult scan  the linear-scan result
+ * @param u32 vreg_id  the virtual register to query
+ * @return bool  true iff spilled
+ */
+fn wn_spilled(scan: ScanResult, vreg_id: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= scan.assignments.len { break }
+        let sp = match scan.assignments[i] {
+            Spilled as s => s.vreg_id == vreg_id
+            InReg => false
+        }
+        if sp { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * wn_tiny_abi — a two-register Win64-flavored GPR descriptor whose only
+ * allocatable registers are the callee-saved pair RBX(3)/R12(12), forcing a
+ * spill under three-value pressure. Caller-saved is empty so `crosses_call`
+ * filtering never interferes with the pressure proof; the spill scratch is the
+ * real Win64 R10/R11 and the shadow space is the real Win64 32.
+ *
+ * @return AbiDescriptor  the tiny Win64 register file
+ */
+fn wn_tiny_abi() -> AbiDescriptor {
+    mut alloc: []u32 = teko::list::empty()
+    alloc = teko::list::push(alloc, 3)
+    alloc = teko::list::push(alloc, 12)
+    AbiDescriptor {
+        gpr_arg = alloc
+        fpr_arg = teko::list::empty()
+        gpr_allocatable = alloc
+        fpr_allocatable = teko::list::empty()
+        gpr_caller_saved = teko::list::empty()
+        fpr_caller_saved = teko::list::empty()
+        gpr_spill_scratch = push_range(teko::list::empty(), 10, 11)
+        fpr_spill_scratch = teko::list::empty()
+        spill_slot_bytes = 8
+        spill_slot_align = 8
+        shadow_space = 32 to u32
+    }
+}
+
+#test
+fn wn_arg_reg_fills_four_argument_registers_then_overflows() {
+    let abi = win64()
+    let a0 = arg_reg(abi, MRegClass::GPR, 0)
+    teko::assert::is_true(a0.ok)
+    teko::assert::is_true(a0.reg.id == 1)
+    teko::assert::is_true(a0.reg.is_phys)
+    teko::assert::is_true(a0.reg.reg_class == MRegClass::GPR)
+    teko::assert::is_true(arg_reg(abi, MRegClass::GPR, 1).reg.id == 2)
+    teko::assert::is_true(arg_reg(abi, MRegClass::GPR, 2).reg.id == 8)
+    let a3 = arg_reg(abi, MRegClass::GPR, 3)
+    teko::assert::is_true(a3.ok)
+    teko::assert::is_true(a3.reg.id == 9)
+    teko::assert::is_true(!arg_reg(abi, MRegClass::GPR, 4).ok)
+    let f0 = arg_reg(abi, MRegClass::FPR, 0)
+    teko::assert::is_true(f0.ok)
+    teko::assert::is_true(f0.reg.id == 0)
+    teko::assert::is_true(f0.reg.reg_class == MRegClass::FPR)
+    teko::assert::is_true(arg_reg(abi, MRegClass::FPR, 3).reg.id == 3)
+    teko::assert::is_true(!arg_reg(abi, MRegClass::FPR, 4).ok)
+}
+
+#test
+fn wn_allocatable_pool_caller_saved_first_excludes_frame_and_scratch() {
+    let abi = win64()
+    let gpr = allocatable_pool(abi, MRegClass::GPR)
+    teko::assert::is_true(gpr[0] == 0)
+    teko::assert::is_true(is_caller_saved(abi, wn_gpr(gpr[0])))
+    teko::assert::is_true(contains_u32(gpr, 1))
+    teko::assert::is_true(contains_u32(gpr, 2))
+    teko::assert::is_true(contains_u32(gpr, 8))
+    teko::assert::is_true(contains_u32(gpr, 9))
+    teko::assert::is_true(contains_u32(gpr, 6))
+    teko::assert::is_true(contains_u32(gpr, 7))
+    teko::assert::is_true(!contains_u32(gpr, 4))
+    teko::assert::is_true(!contains_u32(gpr, 5))
+    teko::assert::is_true(!contains_u32(gpr, 10))
+    teko::assert::is_true(!contains_u32(gpr, 11))
+    teko::assert::is_true(contains_u32(gpr, 3))
+    teko::assert::is_true(contains_u32(gpr, 12))
+    teko::assert::is_true(contains_u32(gpr, 15))
+    let fpr = allocatable_pool(abi, MRegClass::FPR)
+    teko::assert::is_true(fpr[0] == 0)
+    teko::assert::is_true(contains_u32(fpr, 6))
+    teko::assert::is_true(contains_u32(fpr, 15))
+    teko::assert::is_true(!contains_u32(fpr, 4))
+    teko::assert::is_true(!contains_u32(fpr, 5))
+}
+
+#test
+fn wn_caller_and_callee_saved_partition_rdi_rsi_flip() {
+    let abi = win64()
+    teko::assert::is_true(is_caller_saved(abi, wn_gpr(0)))
+    teko::assert::is_true(is_caller_saved(abi, wn_gpr(1)))
+    teko::assert::is_true(is_caller_saved(abi, wn_gpr(11)))
+    teko::assert::is_true(!is_callee_saved(abi, wn_gpr(1)))
+    teko::assert::is_true(is_callee_saved(abi, wn_gpr(7)))
+    teko::assert::is_true(is_callee_saved(abi, wn_gpr(6)))
+    teko::assert::is_true(!is_caller_saved(abi, wn_gpr(7)))
+    teko::assert::is_true(!is_caller_saved(abi, wn_gpr(6)))
+    teko::assert::is_true(is_callee_saved(abi, wn_gpr(3)))
+    teko::assert::is_true(is_callee_saved(abi, wn_gpr(12)))
+    teko::assert::is_true(!is_callee_saved(abi, wn_gpr(5)))
+    teko::assert::is_true(is_caller_saved(abi, wn_fpr(0)))
+    teko::assert::is_true(is_caller_saved(abi, wn_fpr(5)))
+    teko::assert::is_true(is_callee_saved(abi, wn_fpr(6)))
+    teko::assert::is_true(!is_callee_saved(abi, wn_fpr(0)))
+}
+
+#test
+fn wn_spill_scratch_reserved_registers() {
+    let abi = win64()
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0).id == 10)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 1).id == 11)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0).is_phys)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0).id == 4)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 1).id == 5)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0).reg_class == MRegClass::FPR)
+}
+
+#test
+fn wn_disjoint_intervals_reuse_a_register() {
+    let virt = teko::list::push(teko::list::push(teko::list::empty(), wn_iv(0, 0, 2, false)), wn_iv(1, 3, 5, false))
+    let scan = linear_scan(win64(), wn_set(virt, teko::list::empty()))
+    teko::assert::is_true(wn_phys(scan, 0) == wn_phys(scan, 1))
+    teko::assert::is_true(wn_phys(scan, 0) != 100000 to u32)
+}
+
+#test
+fn wn_overlapping_intervals_get_distinct_registers() {
+    let virt = teko::list::push(teko::list::push(teko::list::empty(), wn_iv(0, 0, 5, false)), wn_iv(1, 2, 7, false))
+    let scan = linear_scan(win64(), wn_set(virt, teko::list::empty()))
+    teko::assert::is_true(wn_phys(scan, 0) != wn_phys(scan, 1))
+    teko::assert::is_true(wn_phys(scan, 0) != 100000 to u32)
+    teko::assert::is_true(wn_phys(scan, 1) != 100000 to u32)
+}
+
+#test
+fn wn_crosses_call_gets_a_callee_saved_register() {
+    let abi = win64()
+    let virt = teko::list::push(teko::list::empty(), wn_iv(0, 0, 5, true))
+    let scan = linear_scan(abi, wn_set(virt, teko::list::empty()))
+    let p = wn_phys(scan, 0)
+    teko::assert::is_true(p != 100000 to u32)
+    teko::assert::is_true(p == 3)
+    teko::assert::is_true(is_callee_saved(abi, wn_gpr(p)))
+    teko::assert::is_true(!is_caller_saved(abi, wn_gpr(p)))
+}
+
+#test
+fn wn_crosses_call_may_use_rsi_callee_saved_the_flip() {
+    let virt = teko::list::push(teko::list::empty(), wn_iv(0, 0, 5, true))
+    mut fixed: []LiveInterval = teko::list::empty()
+    fixed = teko::list::push(fixed, wn_fixed(3, 0, 5))
+    fixed = teko::list::push(fixed, wn_fixed(12, 0, 5))
+    fixed = teko::list::push(fixed, wn_fixed(13, 0, 5))
+    fixed = teko::list::push(fixed, wn_fixed(14, 0, 5))
+    fixed = teko::list::push(fixed, wn_fixed(15, 0, 5))
+    let win = linear_scan(win64(), wn_set(virt, fixed))
+    let p = wn_phys(win, 0)
+    teko::assert::is_true(p == 6 to u32)
+    teko::assert::is_true(is_callee_saved(win64(), wn_gpr(p)))
+    teko::assert::is_true(!is_caller_saved(win64(), wn_gpr(p)))
+    let sv = linear_scan(sysv64(), wn_set(virt, fixed))
+    teko::assert::is_true(wn_spilled(sv, 0))
+    teko::assert::is_true(is_caller_saved(sysv64(), wn_gpr(6)))
+    teko::assert::is_true(is_caller_saved(sysv64(), wn_gpr(7)))
+}
+
+#test
+fn wn_fixed_pin_on_rcx_arg_reg_is_avoided() {
+    let virt = teko::list::push(teko::list::empty(), wn_iv(0, 0, 5, false))
+    mut fixed: []LiveInterval = teko::list::empty()
+    fixed = teko::list::push(fixed, wn_fixed(0, 0, 5))
+    fixed = teko::list::push(fixed, wn_fixed(1, 0, 5))
+    fixed = teko::list::push(fixed, wn_fixed(2, 0, 5))
+    fixed = teko::list::push(fixed, wn_fixed(8, 0, 5))
+    fixed = teko::list::push(fixed, wn_fixed(9, 0, 5))
+    let scan = linear_scan(win64(), wn_set(virt, fixed))
+    teko::assert::is_true(wn_phys(scan, 0) != 1 to u32)
+    teko::assert::is_true(wn_phys(scan, 0) == 3 to u32)
+}
+
+#test
+fn wn_pressure_spills_furthest_next_use() {
+    let virt = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
+        wn_iv(0, 0, 9, false)), wn_iv(1, 1, 5, false)), wn_iv(2, 2, 3, false))
+    let scan = linear_scan(wn_tiny_abi(), wn_set(virt, teko::list::empty()))
+    teko::assert::is_true(wn_spilled(scan, 0))
+    teko::assert::is_true(!wn_spilled(scan, 2))
+    teko::assert::is_true(wn_phys(scan, 2) != 100000 to u32)
+    teko::assert::is_true(wn_phys(scan, 999) == 100000 to u32)
+}
+
+#test
+fn wn_shadow_space_is_32_and_other_abis_are_zero() {
+    teko::assert::is_true(win64().shadow_space == 32 to u32)
+    teko::assert::is_true(sysv64().shadow_space == 0 to u32)
+    teko::assert::is_true(aapcs64().shadow_space == 0 to u32)
+    teko::assert::is_true(win64().spill_slot_bytes == 8 to u32)
+    teko::assert::is_true(win64().spill_slot_align == 8 to u32)
+}
