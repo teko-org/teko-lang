@@ -198,6 +198,8 @@ CORPUS=(
     own_match_exit
     own_logical_not
     own_print_exit
+    own_loop_range_native
+    own_loop_nested_range
 )
 
 # ── KNOWN-STOP list ────────────────────────────────────────────────────────────────────

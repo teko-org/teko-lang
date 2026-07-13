@@ -280,12 +280,48 @@ fn rgt_value_crossing_a_call_is_marked() {
 }
 
 #test
-fn rgt_back_edge_honest_stops() {
+fn rgt_self_loop_allocates_and_natural_loops_finds_it() {
     let insts = teko::list::push(teko::list::empty(), branch_inst(0))
-    match rgt_intervals(rgt_func(insts)) {
-        IntervalSet => teko::assert::is_true(false)
-        error as e => teko::assert::str_contains(e.message, "back-edge")
-    }
+    let f = rgt_func(insts)
+    let o = rpo_block_order(f)
+    let stream = number_insts(f, o)
+    let loops = natural_loops(stream, o, reachable_blocks(f))
+    teko::assert::is_true(loops.len == (1 to u64))
+    teko::assert::is_true(loops[0].header_pt == (0 to u32))
+    teko::assert::is_true(loops[0].latch_pt == (0 to u32))
+    let ok = match rgt_intervals(f) { IntervalSet => true; error => false }
+    teko::assert::is_true(ok)
+}
+
+#test
+fn rgt_natural_loops_empty_on_acyclic_diamond() {
+    let f = rgt_diamond_fixture()
+    let o = rpo_block_order(f)
+    let stream = number_insts(f, o)
+    let loops = natural_loops(stream, o, reachable_blocks(f))
+    teko::assert::is_true(loops.len == (0 to u64))
+}
+
+#test
+fn rgt_extend_over_loops_widens_header_live_to_latch() {
+    let loops = teko::list::push(teko::list::empty(), NaturalLoop { header_pt = 2 to u32; latch_pt = 8 to u32 })
+    mut virt: []LiveInterval = teko::list::empty()
+    virt = teko::list::push(virt, ai_iv(0, 1, 4, false))
+    virt = teko::list::push(virt, ai_iv(1, 5, 7, false))
+    let out = extend_over_loops(virt, loops, teko::list::empty())
+    teko::assert::is_true(iv_has(out, 0, 1, 8))
+    teko::assert::is_true(iv_has(out, 1, 5, 7))
+}
+
+#test
+fn rgt_extend_over_loops_recomputes_crosses_call() {
+    let loops = teko::list::push(teko::list::empty(), NaturalLoop { header_pt = 2 to u32; latch_pt = 8 to u32 })
+    let cps = teko::list::push(teko::list::empty(), 6 to u32)
+    mut virt: []LiveInterval = teko::list::empty()
+    virt = teko::list::push(virt, ai_iv(0, 1, 4, false))
+    let out = extend_over_loops(virt, loops, cps)
+    teko::assert::is_true(iv_has(out, 0, 1, 8))
+    teko::assert::is_true(iv_crosses(out, 0))
 }
 
 /**
@@ -852,15 +888,15 @@ fn rgt_regalloc_module_carries_tables_and_propagates() {
 }
 
 #test
-fn rgt_regalloc_func_back_edge_honest_stops() {
+fn rgt_regalloc_func_two_block_loop_allocates() {
     let b0 = MBlock { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), MBranch { target = 1 to u32 }) }
     let b1 = MBlock { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), MBranch { target = 0 to u32 }) }
     let f = MFunc { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let is_err = match regalloc_func(aapcs64(), f) {
-        MFunc => false
-        error => true
+    let ok = match regalloc_func(aapcs64(), f) {
+        MFunc => true
+        error => false
     }
-    teko::assert::is_true(is_err)
+    teko::assert::is_true(ok)
 }
 
 #test
@@ -915,19 +951,19 @@ fn rgt_regalloc_movk_rmw_interp_equivalence() {
 }
 
 #test
-fn rgt_regalloc_conditional_terminators_honest_stop() {
+fn rgt_regalloc_conditional_terminators_allocate() {
     let bc = rgt_func(teko::list::push(teko::list::empty(), MBranchCond { cond = MCond::EQ; target = 0 to u32 }))
-    let e1 = match regalloc_func(aapcs64(), bc) {
-        MFunc => false
-        error => true
+    let ok1 = match regalloc_func(aapcs64(), bc) {
+        MFunc => true
+        error => false
     }
-    teko::assert::is_true(e1)
+    teko::assert::is_true(ok1)
     let cbz = rgt_func(teko::list::push(teko::list::empty(), MCbz { wide = true; zero = true; a = rgt_p(0); target = 0 to u32 }))
-    let e2 = match regalloc_func(aapcs64(), cbz) {
-        MFunc => false
-        error => true
+    let ok2 = match regalloc_func(aapcs64(), cbz) {
+        MFunc => true
+        error => false
     }
-    teko::assert::is_true(e2)
+    teko::assert::is_true(ok2)
 }
 
 #test

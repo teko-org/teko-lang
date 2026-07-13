@@ -423,52 +423,79 @@ fn phys_intervals_x86(events: []RegEvent, r: MReg, stream: []NumberedInstX86, ca
 }
 
 /**
- * has_back_edge_x86 — whether any terminator on an ENTRY-REACHABLE block is a
- * RETREATING edge in RPO (`pos(target) <= pos(source)`): the exact loop test on
- * a reducible CFG. An acyclic nested `if`/`match` has no retreating edge among
- * its reachable blocks (dead-block sources excluded — a dead edge is not a
- * loop). A real `loop` latch→header edge retreats between two reachable blocks
- * and honest-stops. The x86 mirror of the neutral `has_back_edge`; reuses
- * `block_pos` and `u32_in`.
+ * block_first_point_x86 — the smallest program point of any instruction in
+ * block `block_id` of the x86 stream, or 0 when absent. The stream is
+ * RPO-numbered, so this is the block's entry point (a loop header's `header_pt`).
+ * The x86 mirror of the neutral `block_first_point`.
  *
- * @param []NumberedInstX86 stream  the numbered stream
+ * @param []NumberedInstX86 stream  the RPO-numbered stream
+ * @param u32 block_id  the block whose first point to find
+ * @return u32  the block's smallest program point (0 if absent)
+ */
+fn block_first_point_x86(stream: []NumberedInstX86, block_id: u32) -> u32 {
+    mut have: bool = false
+    mut best: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.block_id == block_id {
+            if !have || ni.point < best { best = ni.point; have = true }
+        }
+        i++
+    }
+    best
+}
+
+/**
+ * natural_loops_x86 — every natural loop of the reachable x86 CFG, one per
+ * retreating (loop back-)edge (`pos(target) <= pos(source)` on an entry-reachable
+ * source): its target is the loop header and its source-branch point the latch.
+ * Dead-block sources are excluded (a dead edge is not a loop) and acyclic
+ * `if`/`match` nesting has no retreating edge, so the result is empty for the
+ * acyclic subset. The x86 mirror of the neutral `natural_loops`; feeds the
+ * shared `extend_over_loops`, superseding the back-edge honest-stop bool.
+ *
+ * @param []NumberedInstX86 stream  the RPO-numbered stream
  * @param []u32 order  the RPO block-id order
  * @param []u32 reachable  the entry-reachable block ids
- * @return bool  true iff a retreating (back-)edge leaves a reachable block
+ * @return []NaturalLoop  one loop span per retreating edge
  */
-fn has_back_edge_x86(stream: []NumberedInstX86, order: []u32, reachable: []u32) -> bool {
+fn natural_loops_x86(stream: []NumberedInstX86, order: []u32, reachable: []u32) -> []NaturalLoop {
+    mut out: []NaturalLoop = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= stream.len { break }
         let ni = stream[i]
         let t = terminator_target_x86(ni.inst)
         if t.has && u32_in(reachable, ni.block_id) {
-            if block_pos(order, t.target) <= block_pos(order, ni.block_id) { return true }
+            if block_pos(order, t.target) <= block_pos(order, ni.block_id) {
+                out = teko::list::push(out, NaturalLoop { header_pt = block_first_point_x86(stream, t.target); latch_pt = ni.point })
+            }
         }
         i++
     }
-    false
+    out
 }
 
 /**
  * compute_intervals_x86 — the liveness pass over the x86 stream: one walk driven
  * by `inst_regs_x86`, producing the virtual intervals to color and the fixed pin
  * intervals to block (both the register-abstract `LiveInterval`, reused). The
- * ISA-specific walk (events, call points, back-edge, pin extension) is mirrored;
- * the register-abstract processing (`distinct_regs`, `virt_interval`) is reused
- * so the subtle interval logic stays single-sourced. Honest-stops on a real loop
- * back-edge (the inherited A3-loop deferral). The x86 mirror of the neutral
+ * ISA-specific walk (events, call points, natural loops, pin extension) is
+ * mirrored; the register-abstract processing (`distinct_regs`, `virt_interval`,
+ * `extend_over_loops`) is reused so the subtle interval logic stays
+ * single-sourced. The naive virtual intervals are widened over every natural
+ * loop (§6.2), so header-live values survive the body across the back-edge — the
+ * loops the honest-stop once refused now allocate. The x86 mirror of the neutral
  * `compute_intervals`.
  *
  * @param []NumberedInstX86 stream  the RPO-numbered instruction stream
- * @param []u32 order  the RPO block-id order (for the back-edge test)
- * @param []u32 reachable  the entry-reachable block ids (for the back-edge test)
- * @return IntervalSet | error  the computed intervals, or the back-edge stop
+ * @param []u32 order  the RPO block-id order (for the natural-loop test)
+ * @param []u32 reachable  the entry-reachable block ids (for the natural-loop test)
+ * @return IntervalSet | error  the computed intervals
  */
 fn compute_intervals_x86(stream: []NumberedInstX86, order: []u32, reachable: []u32) -> IntervalSet | error {
-    if has_back_edge_x86(stream, order, reachable) {
-        return error { message = "regalloc x86-64: a loop back-edge needs live-range holes over the strict linear numbering — deferred to the A3-loop follow-up (§6.2)" }
-    }
     let events = collect_events_x86(stream)
     let regs = distinct_regs(events)
     let cps = call_points_of_x86(stream)
@@ -491,6 +518,7 @@ fn compute_intervals_x86(stream: []NumberedInstX86, order: []u32, reachable: []u
         }
         i++
     }
+    virt = extend_over_loops(virt, natural_loops_x86(stream, order, reachable), cps)
     IntervalSet { virt = virt; fixed = fixed; call_points = cps }
 }
 
