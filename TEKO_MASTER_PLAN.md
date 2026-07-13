@@ -35,8 +35,18 @@
 > #475, profiling #479/#480, static slices #461, grouped attributes #477); **0.4** = the remaining
 > backlog (concurrency `Intent<T>` #164, SlotMap #338, packaging, tooling — the phases/rounds below).
 > All of the backend, incl. the A4\* encoder slices, completes **within 0.3** (0.3.0 structure + 0.3.1
-> completion). When the backlog is empty → **`1.0.0.0` = LTS**. The `alpha` line (`0.0.1.x`) is
-> pre-remodel. The phase/round structure below is the DETAILED work; the waves are how it ships.
+> completion). ~~When the backlog is empty → **`1.0.0.0` = LTS**~~ — **SUPERSEDED by the STS ruling
+> below.** The `alpha` line (`0.0.1.x`) is pre-remodel. The phase/round structure below is the DETAILED
+> work; the waves are how it ships.
+>
+> **⚖️ RULING 2026-07-13 — STS BEFORE LTS (owner):** the owner is not ready to freeze a 1.0. When the
+> pre-evolution backlog empties, the line closes as an **STS release** (short-term support), NOT
+> `1.0.0.0`. The post-STS window then runs the **EVOLUTIONS** — dynamic wasm modules #530 (Model 1:
+> grant/leadbox/hot-swap), WASI FFI #535 (Model 2), `#leadbox` #534, the cross-language contract SDKs,
+> the browser playground #509, native-lib emission + source generators + FFI-bindings #440/#441/#506 —
+> plus a **future-work survey**, and only after that does **`1.0.0.0` = LTS** cut. The #234 W15 final
+> sweep stays the LAST gate before the LTS (unchanged); each wave still closes with its own W15 sweep
+> + final bump (the 0.3.0 close reconfirmed by the owner 2026-07-13).
 >
 > This is the single, ordered execution sequence for ALL open teko-lang work. It consolidates:
 > the legislator's session critiques/directives, and every not-yet-done item mined from
