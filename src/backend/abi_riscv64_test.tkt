@@ -1,0 +1,311 @@
+/**
+ * rv_gpr — a physical GPR register operand with the given RISC-V register id (a
+ * descriptor-test shorthand).
+ *
+ * @param u32 id  the physical register id (x0=0..x31=31)
+ * @return MReg  the physical GPR register
+ */
+fn rv_gpr(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * rv_fpr — a physical FPR register operand with the given RISC-V register id.
+ *
+ * @param u32 id  the physical register id (f0=0..f31=31)
+ * @return MReg  the physical FPR register
+ */
+fn rv_fpr(id: u32) -> MReg {
+    preg(id, MRegClass::FPR)
+}
+
+/**
+ * rv_iv — a virtual GPR live interval (a neutrality-proof scan-test shorthand,
+ * driving the SHARED linear scan under the RISC-V LP64D register file).
+ *
+ * @param u32 reg_id  the virtual register id
+ * @param u32 start  the start program point
+ * @param u32 end  the last-use program point
+ * @param bool crosses  whether the value is live across a call
+ * @return LiveInterval  the virtual interval
+ */
+fn rv_iv(reg_id: u32, start: u32, end: u32, crosses: bool) -> LiveInterval {
+    LiveInterval { reg_id = reg_id; reg_class = MRegClass::GPR; start = start; end = end; is_fixed = false; crosses_call = crosses }
+}
+
+/**
+ * rv_fixed — a fixed GPR pin interval on physical register `reg_id` (the shape
+ * isel plants for an argument-register pin), for the a0-pin-avoidance proof.
+ *
+ * @param u32 reg_id  the pinned physical register id
+ * @param u32 start  the start program point
+ * @param u32 end  the last-use program point
+ * @return LiveInterval  the fixed pin interval
+ */
+fn rv_fixed(reg_id: u32, start: u32, end: u32) -> LiveInterval {
+    LiveInterval { reg_id = reg_id; reg_class = MRegClass::GPR; start = start; end = end; is_fixed = true; crosses_call = false }
+}
+
+/**
+ * rv_set — an `IntervalSet` from virtual + fixed intervals with no call points
+ * (`crosses_call` on a virtual interval alone drives the call-clobber filter).
+ *
+ * @param []LiveInterval virt  the virtual intervals to color
+ * @param []LiveInterval fixed  the fixed pin intervals to block
+ * @return IntervalSet  the interval set
+ */
+fn rv_set(virt: []LiveInterval, fixed: []LiveInterval) -> IntervalSet {
+    IntervalSet { virt = virt; fixed = fixed; call_points = teko::list::empty() }
+}
+
+/**
+ * rv_active — a GPR active-set entry holding physical register `phys` until
+ * `end`, for driving `candidate_pool`'s held-register exclusion under the
+ * RISC-V register file.
+ *
+ * @param u32 vreg_id  the active virtual register
+ * @param u32 phys  the physical register it holds
+ * @param u32 end  the interval end point
+ * @return ActiveEntry  the active-set entry
+ */
+fn rv_active(vreg_id: u32, phys: u32, end: u32) -> ActiveEntry {
+    ActiveEntry { vreg_id = vreg_id; phys = phys; end = end; reg_class = MRegClass::GPR }
+}
+
+/**
+ * rv_phys — the physical register `vreg_id` was assigned by the scan, or the
+ * sentinel 100000 if it was spilled or absent.
+ *
+ * @param ScanResult scan  the linear-scan result
+ * @param u32 vreg_id  the virtual register to resolve
+ * @return u32  its assigned physreg id, or 100000
+ */
+fn rv_phys(scan: ScanResult, vreg_id: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= scan.assignments.len { break }
+        let got = match scan.assignments[i] {
+            InReg as r => if r.vreg_id == vreg_id { r.phys } else { 100000 to u32 }
+            Spilled => 100000 to u32
+        }
+        if got != 100000 to u32 { return got }
+        i++
+    }
+    100000 to u32
+}
+
+/**
+ * rv_spilled — whether `vreg_id` was spilled to a frame slot by the scan.
+ *
+ * @param ScanResult scan  the linear-scan result
+ * @param u32 vreg_id  the virtual register to query
+ * @return bool  true iff spilled
+ */
+fn rv_spilled(scan: ScanResult, vreg_id: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= scan.assignments.len { break }
+        let sp = match scan.assignments[i] {
+            Spilled as s => s.vreg_id == vreg_id
+            InReg => false
+        }
+        if sp { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * rv_tiny_abi — a two-register RISC-V-flavored GPR descriptor whose only
+ * allocatable registers are the callee-saved pair s1(9)/s2(18), forcing a spill
+ * under three-value pressure. Caller-saved is empty so `crosses_call` filtering
+ * never interferes with the pressure proof; the spill scratch is the real
+ * RISC-V t4/t5/t6.
+ *
+ * @return AbiDescriptor  the tiny RISC-V register file
+ */
+fn rv_tiny_abi() -> AbiDescriptor {
+    let alloc: []u32 = [9, 18]
+    AbiDescriptor {
+        gpr_arg = alloc
+        fpr_arg = teko::list::empty()
+        gpr_allocatable = alloc
+        fpr_allocatable = teko::list::empty()
+        gpr_caller_saved = teko::list::empty()
+        fpr_caller_saved = teko::list::empty()
+        gpr_spill_scratch = push_range(teko::list::empty(), 29, 31)
+        fpr_spill_scratch = teko::list::empty()
+        spill_slot_bytes = 8
+        spill_slot_align = 8
+        shadow_space = 0 to u32
+    }
+}
+
+#test
+fn rv_arg_reg_fills_argument_registers_then_overflows() {
+    let abi = riscv64_lp64d()
+    let a0 = arg_reg(abi, MRegClass::GPR, 0)
+    teko::assert::is_true(a0.ok)
+    teko::assert::is_true(a0.reg.id == 10)
+    teko::assert::is_true(a0.reg.is_phys)
+    teko::assert::is_true(a0.reg.reg_class == MRegClass::GPR)
+    teko::assert::is_true(arg_reg(abi, MRegClass::GPR, 1).reg.id == 11)
+    teko::assert::is_true(arg_reg(abi, MRegClass::GPR, 4).reg.id == 14)
+    let a7 = arg_reg(abi, MRegClass::GPR, 7)
+    teko::assert::is_true(a7.ok)
+    teko::assert::is_true(a7.reg.id == 17)
+    teko::assert::is_true(!arg_reg(abi, MRegClass::GPR, 8).ok)
+    let f0 = arg_reg(abi, MRegClass::FPR, 0)
+    teko::assert::is_true(f0.ok)
+    teko::assert::is_true(f0.reg.id == 10)
+    teko::assert::is_true(f0.reg.reg_class == MRegClass::FPR)
+    teko::assert::is_true(arg_reg(abi, MRegClass::FPR, 7).reg.id == 17)
+    teko::assert::is_true(!arg_reg(abi, MRegClass::FPR, 8).ok)
+}
+
+#test
+fn rv_allocatable_pool_caller_saved_first_excludes_frame_and_scratch() {
+    let abi = riscv64_lp64d()
+    let gpr = allocatable_pool(abi, MRegClass::GPR)
+    teko::assert::is_true(gpr[0] == 5)
+    teko::assert::is_true(is_caller_saved(abi, rv_gpr(gpr[0])))
+    teko::assert::is_true(gpr[11] == 28)
+    teko::assert::is_true(gpr[12] == 9)
+    teko::assert::is_true(contains_u32(gpr, 6))
+    teko::assert::is_true(contains_u32(gpr, 7))
+    teko::assert::is_true(contains_u32(gpr, 10))
+    teko::assert::is_true(contains_u32(gpr, 17))
+    teko::assert::is_true(contains_u32(gpr, 18))
+    teko::assert::is_true(contains_u32(gpr, 27))
+    teko::assert::is_true(!contains_u32(gpr, 0))
+    teko::assert::is_true(!contains_u32(gpr, 1))
+    teko::assert::is_true(!contains_u32(gpr, 2))
+    teko::assert::is_true(!contains_u32(gpr, 3))
+    teko::assert::is_true(!contains_u32(gpr, 4))
+    teko::assert::is_true(!contains_u32(gpr, 8))
+    teko::assert::is_true(!contains_u32(gpr, 29))
+    teko::assert::is_true(!contains_u32(gpr, 30))
+    teko::assert::is_true(!contains_u32(gpr, 31))
+    let fpr = allocatable_pool(abi, MRegClass::FPR)
+    teko::assert::is_true(fpr[0] == 0)
+    teko::assert::is_true(fpr[18] == 8)
+    teko::assert::is_true(contains_u32(fpr, 9))
+    teko::assert::is_true(contains_u32(fpr, 29))
+    teko::assert::is_true(!contains_u32(fpr, 30))
+    teko::assert::is_true(!contains_u32(fpr, 31))
+}
+
+#test
+fn rv_caller_and_callee_saved_partition() {
+    let abi = riscv64_lp64d()
+    teko::assert::is_true(is_caller_saved(abi, rv_gpr(1)))
+    teko::assert::is_true(is_caller_saved(abi, rv_gpr(5)))
+    teko::assert::is_true(is_caller_saved(abi, rv_gpr(10)))
+    teko::assert::is_true(is_caller_saved(abi, rv_gpr(31)))
+    teko::assert::is_true(!is_caller_saved(abi, rv_gpr(9)))
+    teko::assert::is_true(is_callee_saved(abi, rv_gpr(9)))
+    teko::assert::is_true(is_callee_saved(abi, rv_gpr(18)))
+    teko::assert::is_true(!is_callee_saved(abi, rv_gpr(10)))
+    teko::assert::is_true(!is_callee_saved(abi, rv_gpr(1)))
+    teko::assert::is_true(!is_callee_saved(abi, rv_gpr(2)))
+    teko::assert::is_true(!is_callee_saved(abi, rv_gpr(8)))
+    teko::assert::is_true(is_caller_saved(abi, rv_fpr(0)))
+    teko::assert::is_true(is_caller_saved(abi, rv_fpr(10)))
+    teko::assert::is_true(is_callee_saved(abi, rv_fpr(8)))
+    teko::assert::is_true(!is_callee_saved(abi, rv_fpr(0)))
+}
+
+#test
+fn rv_spill_scratch_reserved_registers() {
+    let abi = riscv64_lp64d()
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0).id == 29)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 1).id == 30)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 2).id == 31)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0).is_phys)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0).id == 30)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 1).id == 31)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0).reg_class == MRegClass::FPR)
+}
+
+#test
+fn rv_disjoint_intervals_reuse_a_register() {
+    let virt = teko::list::push(teko::list::push(teko::list::empty(), rv_iv(0, 0, 2, false)), rv_iv(1, 3, 5, false))
+    let scan = linear_scan(riscv64_lp64d(), rv_set(virt, teko::list::empty()))
+    teko::assert::is_true(rv_phys(scan, 0) == rv_phys(scan, 1))
+    teko::assert::is_true(rv_phys(scan, 0) != 100000 to u32)
+}
+
+#test
+fn rv_overlapping_intervals_get_distinct_registers() {
+    let virt = teko::list::push(teko::list::push(teko::list::empty(), rv_iv(0, 0, 5, false)), rv_iv(1, 2, 7, false))
+    let scan = linear_scan(riscv64_lp64d(), rv_set(virt, teko::list::empty()))
+    teko::assert::is_true(rv_phys(scan, 0) != rv_phys(scan, 1))
+    teko::assert::is_true(rv_phys(scan, 0) != 100000 to u32)
+    teko::assert::is_true(rv_phys(scan, 1) != 100000 to u32)
+}
+
+#test
+fn rv_crosses_call_gets_a_callee_saved_register() {
+    let abi = riscv64_lp64d()
+    let virt = teko::list::push(teko::list::empty(), rv_iv(0, 0, 5, true))
+    let scan = linear_scan(abi, rv_set(virt, teko::list::empty()))
+    let p = rv_phys(scan, 0)
+    teko::assert::is_true(p != 100000 to u32)
+    teko::assert::is_true(p == 9)
+    teko::assert::is_true(is_callee_saved(abi, rv_gpr(p)))
+    teko::assert::is_true(!is_caller_saved(abi, rv_gpr(p)))
+}
+
+#test
+fn rv_fixed_pin_on_a0_arg_reg_is_avoided() {
+    let virt = teko::list::push(teko::list::empty(), rv_iv(0, 0, 5, false))
+    mut fixed: []LiveInterval = teko::list::empty()
+    fixed = teko::list::push(fixed, rv_fixed(5, 0, 5))
+    fixed = teko::list::push(fixed, rv_fixed(6, 0, 5))
+    fixed = teko::list::push(fixed, rv_fixed(7, 0, 5))
+    fixed = teko::list::push(fixed, rv_fixed(10, 0, 5))
+    let scan = linear_scan(riscv64_lp64d(), rv_set(virt, fixed))
+    teko::assert::is_true(rv_phys(scan, 0) != 10 to u32)
+    teko::assert::is_true(rv_phys(scan, 0) == 11 to u32)
+}
+
+#test
+fn rv_pressure_spills_furthest_next_use() {
+    let virt = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
+        rv_iv(0, 0, 9, false)), rv_iv(1, 1, 5, false)), rv_iv(2, 2, 3, false))
+    let scan = linear_scan(rv_tiny_abi(), rv_set(virt, teko::list::empty()))
+    teko::assert::is_true(rv_spilled(scan, 0))
+    teko::assert::is_true(!rv_spilled(scan, 2))
+    teko::assert::is_true(rv_phys(scan, 2) != 100000 to u32)
+    teko::assert::is_true(rv_phys(scan, 999) == 100000 to u32)
+}
+
+#test
+fn rv_candidate_pool_orders_caller_saved_first() {
+    let cp = candidate_pool(riscv64_lp64d(), rv_iv(0, 0, 5, false), teko::list::empty(), teko::list::empty())
+    teko::assert::is_true(cp[0] == 5)
+    teko::assert::is_true(contains_u32(cp, 9))
+    teko::assert::is_true(contains_u32(cp, 10))
+}
+
+#test
+fn rv_candidate_pool_crossing_call_excludes_caller_saved() {
+    let cp = candidate_pool(riscv64_lp64d(), rv_iv(0, 0, 5, true), teko::list::empty(), teko::list::empty())
+    teko::assert::is_true(cp[0] == 9)
+    teko::assert::is_true(!contains_u32(cp, 5))
+    teko::assert::is_true(!contains_u32(cp, 10))
+    teko::assert::is_true(contains_u32(cp, 18))
+}
+
+#test
+fn rv_candidate_pool_skips_held_and_fixed_registers() {
+    let abi = riscv64_lp64d()
+    let held = teko::list::push(teko::list::empty(), rv_active(1, 5, 5))
+    let cp_held = candidate_pool(abi, rv_iv(0, 0, 5, false), held, teko::list::empty())
+    teko::assert::is_true(cp_held[0] == 6)
+    teko::assert::is_true(!contains_u32(cp_held, 5))
+    let pinned = teko::list::push(teko::list::empty(), rv_fixed(5, 0, 5))
+    let cp_fixed = candidate_pool(abi, rv_iv(0, 0, 5, false), teko::list::empty(), pinned)
+    teko::assert::is_true(cp_fixed[0] == 6)
+    teko::assert::is_true(!contains_u32(cp_fixed, 5))
+}

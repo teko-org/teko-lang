@@ -15,16 +15,11 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | erro
         let v = match parse_expr(tokens, after) { Parsed<Expr> as x => x; error as e => return e }
         return Parsed<Statement> { node = Return { has_value = true; value = v.node }; next = v.next }
     }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && is_kind_at(tokens, pos + 1, lexer::TokenKind::Colon) && is_kind_at(tokens, pos + 2, lexer::TokenKind::Loop) {
+        return parse_loop(tokens, pos + 2, tokens[pos].text)
+    }
     if is_kind_at(tokens, pos, lexer::TokenKind::Loop) {
-        // optional label: `loop NAME { … }` (an IDENT right after `loop`, before the brace)
-        mut label = ""
-        mut lbrace = pos + 1
-        if is_kind_at(tokens, pos + 1, lexer::TokenKind::Ident) { label = tokens[pos + 1].text; lbrace = pos + 2 }
-        if !is_kind_at(tokens, lbrace, lexer::TokenKind::LBrace) {
-            return err_at(tokens, lbrace, "expected '{' after `loop`")
-        }
-        let blk = match parse_block(tokens, lbrace) { ParsedList<Statement> as x => x; error as e => return e }
-        return Parsed<Statement> { node = LoopStmt { label = label; body = blk.items }; next = blk.next }
+        return parse_loop(tokens, pos, "")
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Break) {
         // optional label on the SAME line: `break NAME` (a separator would tokenize between)
@@ -100,7 +95,7 @@ fn is_adopt_head(tokens: []lexer::Token, pos: u64) -> bool {
 
 /**
  * parse_adopt — parse a contextual `adopt [name] { stmts }` at `pos` (the `adopt` ident). An
- * optional bound name (an ident before the `{`, mirroring the `loop NAME {` label) is captured;
+ * optional bound name (an ident before the `{`, the same `adopt NAME {` suffix shape) is captured;
  * a mandatory block then follows, reusing parse_block. Unlike `defer`, the body may contain
  * `return`/`break`/`continue` and nested `adopt` — no rejection here.
  *
@@ -200,8 +195,3 @@ fn parse_assign(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
     Parsed<Statement> { node = Assign { kind = AssignKind::Simple; name = name; op = op; value = v.node; deref = false; target = no_expr() }; next = v.next }
 }
 
-// (added to parse_statement, P4d; labels — M.5)
-//   loop [NAME] { body } → LoopStmt { label = NAME?, body = <block> }   (reuses parse_block)
-//   break [NAME]         → BreakStmt { label = NAME? }
-//   continue [NAME]      → ContinueStmt { label = NAME? }
-// (label empty "" = unlabeled / innermost loop)
