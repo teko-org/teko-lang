@@ -1,0 +1,573 @@
+use teko::lexer
+
+/**
+ * prepend_stmt — build a fresh statement list with `head` in front of `rest`, preserving order.
+ * Used to fold a synthesized head statement (the condition-break) onto the front of a parsed loop
+ * body (#517).
+ *
+ * @param head  the statement to place first
+ * @param rest  the following statements, in order
+ * @return      a new `[]Statement` = `[head, ...rest]`
+ */
+fn prepend_stmt(head: Statement, rest: []Statement) -> []Statement {
+    mut out = teko::list::push(teko::list::empty(), head)
+    mut i: u64 = 0
+    loop {
+        if i >= rest.len { break }
+        out = teko::list::push(out, rest[i])
+        i++
+    }
+    out
+}
+
+/**
+ * loop_break — the synthesized `break` (innermost, unlabeled) a desugared head emits to leave the
+ * loop when its condition fails (#517).
+ *
+ * @return  a `BreakStmt` targeting the innermost loop
+ */
+fn loop_break() -> Statement {
+    BreakStmt { label = "" }
+}
+
+/**
+ * loop_not — wrap `e` in a boolean `!e`, positioned at (`line`, `col`) — the negated condition of a
+ * folded `if !<cond> { break }` (#517).
+ *
+ * @param e     the condition expression to negate
+ * @param line  the source line to stamp on the synthesized node
+ * @param col   the source column to stamp on the synthesized node
+ * @return      the `Expr` `!e`
+ */
+fn loop_not(e: Expr, line: u32, col: u32) -> Expr {
+    Expr { kind = Unary { op = lexer::TokenKind::Bang; operand = e }; line = line; col = col }
+}
+
+/**
+ * loop_cond_break — the folded `if !<cond> { break }` statement a while/3-part head places at the
+ * TOP of the loop body, so a false condition exits and a `continue` re-checks the condition (#517).
+ *
+ * @param cond  the loop's boolean condition expression
+ * @param line  the source line to stamp on the synthesized nodes
+ * @param col   the source column to stamp on the synthesized nodes
+ * @return      the `if !<cond> { break }` statement
+ */
+fn loop_cond_break(cond: Expr, line: u32, col: u32) -> Statement {
+    let neg = loop_not(cond, line, col)
+    let brk = teko::list::push(teko::list::empty(), loop_break())
+    let iff = Expr { kind = IfExpr { cond = neg; then_blk = brk; has_else = false; else_blk = teko::list::empty() }; line = line; col = col }
+    ExprStmt { expr = iff }
+}
+
+/**
+ * loop_temp — a hygienic, user-unwritable temp name for a desugared loop head, unique per loop
+ * (keyed on the loop keyword's position): `_tk_<kind>_L<line>C<col>` (#517).
+ *
+ * @param kind  the temp's role (`hi` / `first` / `it` / `elem`)
+ * @param line  the loop keyword's source line
+ * @param col   the loop keyword's source column
+ * @return      the reserved temp name
+ */
+fn loop_temp(kind: str, line: u32, col: u32) -> str {
+    $"_tk_{kind}_L{line}C{col}"
+}
+
+/**
+ * loop_mut_binding — a `mut <name> = <value>` binding with no type annotation (inferred), the shape
+ * of every desugared loop-head preamble binding (#517).
+ *
+ * @param name   the bound name
+ * @param value  the initializer expression
+ * @return       the `mut` binding statement
+ */
+fn loop_mut_binding(name: str, value: Expr) -> Statement {
+    Binding { kind = BindKind::Mut; target = SimpleName { name = name }; has_type = false; type_ann = no_type(); value = value }
+}
+
+/**
+ * loop_counter_binding — a `mut <name>[: T] = <value>` binding as a `Statement`, the range counter
+ * carrying the user's optional type annotation (#517).
+ *
+ * @param name      the counter name
+ * @param value     the counter's initializer (the low endpoint)
+ * @param has_type  whether the counter carries a `: T` annotation
+ * @param type_ann  the counter's type annotation (valid iff `has_type`)
+ * @return          the `mut` counter binding statement
+ */
+fn loop_counter_binding(name: str, value: Expr, has_type: bool, type_ann: TypeExpr) -> Statement {
+    Binding { kind = BindKind::Mut; target = SimpleName { name = name }; has_type = has_type; type_ann = type_ann; value = value }
+}
+
+/**
+ * loop_var — a variable-read expression `name`, positioned at (`line`, `col`) (#517).
+ *
+ * @param name  the variable name
+ * @param line  the source line to stamp
+ * @param col   the source column to stamp
+ * @return      the `Var` expression
+ */
+fn loop_var(name: str, line: u32, col: u32) -> Expr {
+    Expr { kind = Var { name = name }; line = line; col = col }
+}
+
+/**
+ * loop_bool — a boolean literal expression, positioned at (`line`, `col`) (#517).
+ *
+ * @param v     the boolean value
+ * @param line  the source line to stamp
+ * @param col   the source column to stamp
+ * @return      the `BoolLit` expression
+ */
+fn loop_bool(v: bool, line: u32, col: u32) -> Expr {
+    Expr { kind = BoolLit { value = v }; line = line; col = col }
+}
+
+/**
+ * loop_one — the integer literal `1`, positioned at (`line`, `col`) — the range step increment
+ * (#517).
+ *
+ * @param line  the source line to stamp
+ * @param col   the source column to stamp
+ * @return      the `Number` `1` expression
+ */
+fn loop_one(line: u32, col: u32) -> Expr {
+    Expr { kind = Number { is_float = false; value = 1; fval = 0.0 }; line = line; col = col }
+}
+
+/**
+ * loop_assign_simple — a simple assignment `name op= value` (op = `=`/`+=`/…), the desugared step /
+ * `_first` reset of a range or 3-part head (#517).
+ *
+ * @param name   the target variable name
+ * @param op     the assignment operator token (`Assign` / `PlusEq` / …)
+ * @param value  the right-hand side
+ * @return       the assignment statement
+ */
+fn loop_assign_simple(name: str, op: lexer::TokenKind, value: Expr) -> Statement {
+    Assign { kind = AssignKind::Simple; name = name; op = op; value = value; deref = false; target = no_expr() }
+}
+
+/**
+ * loop_less — a comparison `lo < hi` (exclusive) or `lo <= hi` (inclusive) as a single-term
+ * `Compare`, the range guard condition (#517).
+ *
+ * @param lo         the counter expression
+ * @param hi         the captured endpoint expression
+ * @param inclusive  true for `..=` (`<=`), false for `..` (`<`)
+ * @param line       the source line to stamp
+ * @param col        the source column to stamp
+ * @return           the comparison expression
+ */
+fn loop_less(lo: Expr, hi: Expr, inclusive: bool, line: u32, col: u32) -> Expr {
+    let op = if inclusive { lexer::TokenKind::Le } else { lexer::TokenKind::Lt }
+    let term = CmpTerm { op = op; operand = hi }
+    Expr { kind = Compare { first = lo; rest = teko::list::push(teko::list::empty(), term) }; line = line; col = col }
+}
+
+/**
+ * loop_if_then — a folded `if <cond> { <then> }` statement (no else) — the guarded step
+ * `if !_first { i += 1 }` a range/3-part head places at the TOP of the body (#517).
+ *
+ * @param cond  the guard condition expression
+ * @param then  the single guarded statement
+ * @param line  the source line to stamp
+ * @param col   the source column to stamp
+ * @return      the `if <cond> { <then> }` statement
+ */
+fn loop_if_then(cond: Expr, then: Statement, line: u32, col: u32) -> Statement {
+    let blk = teko::list::push(teko::list::empty(), then)
+    let iff = Expr { kind = IfExpr { cond = cond; then_blk = blk; has_else = false; else_blk = teko::list::empty() }; line = line; col = col }
+    ExprStmt { expr = iff }
+}
+
+/**
+ * loop_nullary_call — a nullary call expression `name()`, positioned at (`line`, `col`) — the
+ * iterator pull `_it()` at the top of a for-each body (#517, §5.4).
+ *
+ * @param name  the callee name (the iterator temp)
+ * @param line  the source line to stamp
+ * @param col   the source column to stamp
+ * @return      the `name()` call expression
+ */
+fn loop_nullary_call(name: str, line: u32, col: u32) -> Expr {
+    let path = Path { segments = teko::list::push(teko::list::empty(), Segment { name = name }) }
+    Expr { kind = Call { callee = path; args = teko::list::empty(); arg_names = teko::list::empty(); type_args = teko::list::empty() }; line = line; col = col }
+}
+
+/**
+ * loop_null_break_arm — the `null => break` arm of a for-each pull: when the iterator is exhausted
+ * (`null`), leave the loop (#517, §5.4).
+ *
+ * @return  the `null => break` match arm
+ */
+fn loop_null_break_arm() -> Arm {
+    Arm { pattern = NullPattern { }; has_when = false; guard = no_expr(); body = teko::list::push(teko::list::empty(), loop_break()) }
+}
+
+/**
+ * loop_elem_bind_arm — the PLACEHOLDER present-value arm of a for-each pull. `_ as x` (a type-free
+ * discard-then-capture) is banned as USER syntax (owner ruling: `_` is a discard, `as x` a capture —
+ * a semantic contradiction) — `parse_pattern_primary` rejects it at parse time. This function still
+ * builds the SAME `BindPattern` shape (an empty `type_name`, unreachable from any valid source text)
+ * as an INTERNAL MARKER ONLY: the checker's `resolve_foreach_arm` (typer.tks) rewrites it, before any
+ * pattern-matching/exhaustiveness/codegen ever observes it, into a REAL `T as x` bind using the
+ * iterator's resolved element type `T` (known at for-each-typing time from `_it : () -> T?`) — the
+ * existing, sound named-bind mechanism, unchanged (#517, §5.4).
+ *
+ * @param elem_name  the hygienic element temp the checker will bind
+ * @param body       the element-binding body (loop-local copy binding(s) + user statements)
+ * @return           the placeholder `=> { … }` match arm, pending checker completion
+ */
+fn loop_elem_bind_arm(elem_name: str, body: []Statement) -> Arm {
+    let pat = BindPattern { type_name = Path { segments = teko::list::empty() }; has_binding = true; binding = elem_name; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    Arm { pattern = pat; has_when = false; guard = no_expr(); body = body }
+}
+
+/**
+ * loop_match_pull — the for-each pull statement `match _it() { null => break; <placeholder> => { … } }`
+ * at the TOP of the body, so `continue` re-pulls (advances) the iterator (#517, §5.4).
+ *
+ * @param it_name    the iterator temp (the closure `() -> T?`)
+ * @param elem_name  the hygienic element temp
+ * @param body       the element-binding body
+ * @param line       the loop keyword's source line
+ * @param col        the loop keyword's source column
+ * @return           the pull `match` statement
+ */
+fn loop_match_pull(it_name: str, elem_name: str, body: []Statement, line: u32, col: u32) -> Statement {
+    mut arms = teko::list::push(teko::list::empty(), loop_null_break_arm())
+    arms = teko::list::push(arms, loop_elem_bind_arm(elem_name, body))
+    let m = Expr { kind = MatchExpr { subject = loop_nullary_call(it_name, line, col); arms = arms }; line = line; col = col }
+    ExprStmt { expr = m }
+}
+
+/**
+ * parse_loop_infinite — `[LABEL:] loop { … }`: the head is empty; the body is the parsed block
+ * verbatim and `init` is empty (#517).
+ *
+ * @param tokens  the token stream
+ * @param brace_pos  the position of the loop body's `{`
+ * @param label  the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @return  the parsed loop statement, or a parse error
+ */
+fn parse_loop_infinite(tokens: []lexer::Token, brace_pos: u64, label: str) -> Parsed<Statement> | error {
+    let blk = match parse_block(tokens, brace_pos) { ParsedList<Statement> as x => x; error as e => return e }
+    Parsed<Statement> { node = LoopStmt { label = label; init = teko::list::empty(); body = blk.items }; next = blk.next }
+}
+
+/**
+ * parse_loop_while — `[LABEL:] loop <cond> { B }`: parse the boolean condition with the scrutinee
+ * form (so a trailing `{` opens the body, not a struct literal), then fold it into the body as
+ * `if !<cond> { break }` at the TOP so `continue` re-checks it. `init` stays empty (#517).
+ *
+ * @param tokens  the token stream
+ * @param cond_pos  the position of the condition expression (just past `loop`)
+ * @param label  the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @param line  the loop keyword's source line (stamped on synthesized nodes)
+ * @param col  the loop keyword's source column (stamped on synthesized nodes)
+ * @return  the parsed loop statement, or a parse error
+ */
+fn parse_loop_while(tokens: []lexer::Token, cond_pos: u64, label: str, line: u32, col: u32) -> Parsed<Statement> | error {
+    let cond = match parse_expr_no_struct(tokens, cond_pos) { Parsed<Expr> as x => x; error as e => return e }
+    if !is_kind_at(tokens, cond.next, lexer::TokenKind::LBrace) {
+        return err_at(tokens, cond.next, "expected '{' after the loop condition")
+    }
+    let blk = match parse_block(tokens, cond.next) { ParsedList<Statement> as x => x; error as e => return e }
+    let body = prepend_stmt(loop_cond_break(cond.node, line, col), blk.items)
+    Parsed<Statement> { node = LoopStmt { label = label; init = teko::list::empty(); body = body }; next = blk.next }
+}
+
+/**
+ * loop_range_init — the run-once preamble of a range head: `mut i = lo` (the counter, carrying the
+ * user's optional type annotation), `mut _hi = hi` (the endpoint, captured ONCE at entry), and
+ * `mut _first = true` (the first-iteration guard) (#517, §5.2).
+ *
+ * @param name       the counter name
+ * @param lo         the low endpoint (counter's initial value)
+ * @param hi         the high endpoint (captured once into `_hi`)
+ * @param has_type   whether the counter carries a `: T` annotation
+ * @param type_ann   the counter's type annotation (valid iff `has_type`)
+ * @param hi_name    the hygienic endpoint temp name
+ * @param first_name the hygienic first-iteration temp name
+ * @param line       the loop keyword's source line
+ * @param col        the loop keyword's source column
+ * @return           the `init` preamble statement list
+ */
+fn loop_range_init(name: str, lo: Expr, hi: Expr, has_type: bool, type_ann: TypeExpr, hi_name: str, first_name: str, line: u32, col: u32) -> []Statement {
+    let counter = loop_counter_binding(name, lo, has_type, type_ann)
+    mut init: []Statement = teko::list::push(teko::list::empty(), counter)
+    init = teko::list::push(init, loop_mut_binding(hi_name, hi))
+    init = teko::list::push(init, loop_mut_binding(first_name, loop_bool(true, line, col)))
+    init
+}
+
+/**
+ * loop_append_all — append every statement of `src` onto `dst`, preserving order (#517).
+ *
+ * @param dst  the accumulator list
+ * @param src  the statements to append
+ * @return     `dst` with `src` appended
+ */
+fn loop_append_all(dst: []Statement, src: []Statement) -> []Statement {
+    mut out = dst
+    mut i: u64 = 0
+    loop {
+        if i >= src.len { break }
+        out = teko::list::push(out, src[i])
+        i++
+    }
+    out
+}
+
+/**
+ * loop_first_guarded_body — the shared range/3-part body fold: a guarded step `if !_first { <step> }`
+ * at the TOP (so `continue` runs it), the `_first = false` reset, and the exit guard
+ * `if !<guard_cond> { break }`, then the user statements. The range head passes `i += 1` / `i < _hi`;
+ * the 3-part head passes the user's step / condition (§5.2/§5.3, #517).
+ *
+ * @param step        the guarded step statement (run at the TOP from iteration 2 on)
+ * @param guard_cond  the loop-continues condition (broken when false)
+ * @param first_name  the first-iteration temp name
+ * @param body        the parsed user body
+ * @param line        the loop keyword's source line
+ * @param col         the loop keyword's source column
+ * @return            the folded body statement list
+ */
+fn loop_first_guarded_body(step: Statement, guard_cond: Expr, first_name: str, body: []Statement, line: u32, col: u32) -> []Statement {
+    let guarded_step = loop_if_then(loop_not(loop_var(first_name, line, col), line, col), step, line, col)
+    let clear_first = loop_assign_simple(first_name, lexer::TokenKind::Assign, loop_bool(false, line, col))
+    let guard = loop_cond_break(guard_cond, line, col)
+    mut full: []Statement = teko::list::push(teko::list::empty(), guarded_step)
+    full = teko::list::push(full, clear_first)
+    full = teko::list::push(full, guard)
+    loop_append_all(full, body)
+}
+
+/**
+ * loop_range_body — fold a range head onto the front of the user body: a guarded step `i += 1` and
+ * the captured-endpoint guard `i < _hi` (`<=` for `..=`), via `loop_first_guarded_body` (#517, §5.2).
+ *
+ * @param name       the counter name
+ * @param hi_name    the endpoint temp name
+ * @param first_name the first-iteration temp name
+ * @param inclusive  true for `..=` (`<=` guard), false for `..` (`<` guard)
+ * @param body       the parsed user body
+ * @param line       the loop keyword's source line
+ * @param col        the loop keyword's source column
+ * @return           the folded body statement list
+ */
+fn loop_range_body(name: str, hi_name: str, first_name: str, inclusive: bool, body: []Statement, line: u32, col: u32) -> []Statement {
+    let step = loop_assign_simple(name, lexer::TokenKind::PlusEq, loop_one(line, col))
+    let guard_cond = loop_less(loop_var(name, line, col), loop_var(hi_name, line, col), inclusive, line, col)
+    loop_first_guarded_body(step, guard_cond, first_name, body, line, col)
+}
+
+/**
+ * parse_loop_range — `[LABEL:] loop mut i [: T] in <lo>..<hi> { B }` (`..=` inclusive): capture the
+ * endpoints ONCE and desugar to a counter/endpoint/`_first` preamble plus a folded guarded-step +
+ * guard body (§5.2). A destructure target on a range is rejected (a range yields a single value)
+ * (#517).
+ *
+ * @param tokens   the token stream
+ * @param tgt      the parsed bind-target (must be a SimpleName)
+ * @param ann      the parsed `: T` annotation (applied to the counter)
+ * @param lo       the already-parsed low endpoint (its `.next` is the `..`/`..=` token)
+ * @param inclusive true for `..=`, false for `..`
+ * @param label    the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @param line     the loop keyword's source line
+ * @param col      the loop keyword's source column
+ * @return         the parsed loop statement, or a parse error
+ */
+fn parse_loop_range(tokens: []lexer::Token, tgt: Parsed<BindTarget>, ann: Annotation, lo: Parsed<Expr>, inclusive: bool, label: str, line: u32, col: u32) -> Parsed<Statement> | error {
+    let hi = match parse_expr_no_struct(tokens, lo.next + 1) { Parsed<Expr> as x => x; error as e => return e }
+    if !is_kind_at(tokens, hi.next, lexer::TokenKind::LBrace) {
+        return err_at(tokens, hi.next, "expected '{' after the loop range")
+    }
+    let name = match tgt.node { SimpleName as sn => sn.name; _ => return err_at(tokens, lo.next, "a range loop binds a single name, not a destructure") }
+    let blk = match parse_block(tokens, hi.next) { ParsedList<Statement> as x => x; error as e => return e }
+    let hi_name = loop_temp("hi", line, col)
+    let first_name = loop_temp("first", line, col)
+    let init = loop_range_init(name, lo.node, hi.node, ann.has_type, ann.type_ann, hi_name, first_name, line, col)
+    let body = loop_range_body(name, hi_name, first_name, inclusive, blk.items, line, col)
+    Parsed<Statement> { node = LoopStmt { label = label; init = init; body = body }; next = blk.next }
+}
+
+/**
+ * parse_loop_three_part — `[LABEL:] loop mut i [: T] = <init> ; <cond> ; <step> { B }` (§5.3): the
+ * counter starts at `<init>`, `<step>` (any statement) runs guarded at the TOP so `continue` runs
+ * it, and `<cond>` is RE-EVALUATED every iteration (C-`for` semantics — not captured). Desugars to
+ * `init = [mut i = <init>, mut _first = true]` and a `loop_first_guarded_body` fold (#517).
+ *
+ * @param tokens    the token stream
+ * @param tgt       the parsed bind-target (must be a SimpleName)
+ * @param ann       the parsed `: T` annotation (applied to the counter)
+ * @param init_pos  the position of the init expression (just past `=`)
+ * @param label     the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @param line      the loop keyword's source line
+ * @param col       the loop keyword's source column
+ * @return          the parsed loop statement, or a parse error
+ */
+fn parse_loop_three_part(tokens: []lexer::Token, tgt: Parsed<BindTarget>, ann: Annotation, init_pos: u64, label: str, line: u32, col: u32) -> Parsed<Statement> | error {
+    let a = match parse_expr(tokens, init_pos) { Parsed<Expr> as x => x; error as e => return e }
+    if !is_kind_at(tokens, a.next, lexer::TokenKind::Semicolon) {
+        return err_at(tokens, a.next, "expected ';' after the loop init")
+    }
+    let cond = match parse_expr(tokens, a.next + 1) { Parsed<Expr> as x => x; error as e => return e }
+    if !is_kind_at(tokens, cond.next, lexer::TokenKind::Semicolon) {
+        return err_at(tokens, cond.next, "expected ';' after the loop condition")
+    }
+    let step = match parse_statement(tokens, cond.next + 1) { Parsed<Statement> as x => x; error as e => return e }
+    if !is_kind_at(tokens, step.next, lexer::TokenKind::LBrace) {
+        return err_at(tokens, step.next, "expected '{' after the loop step")
+    }
+    let name = match tgt.node { SimpleName as sn => sn.name; _ => return err_at(tokens, init_pos, "a 3-part loop binds a single counter name, not a destructure") }
+    let blk = match parse_block(tokens, step.next) { ParsedList<Statement> as x => x; error as e => return e }
+    let first_name = loop_temp("first", line, col)
+    mut init: []Statement = teko::list::push(teko::list::empty(), loop_counter_binding(name, a.node, ann.has_type, ann.type_ann))
+    init = teko::list::push(init, loop_mut_binding(first_name, loop_bool(true, line, col)))
+    let body = loop_first_guarded_body(step.node, cond.node, first_name, blk.items, line, col)
+    Parsed<Statement> { node = LoopStmt { label = label; init = init; body = body }; next = blk.next }
+}
+
+/**
+ * loop_field_access — a field-read expression `<recv>.<field>`, positioned at (`line`, `col`) — one
+ * per-field extraction of a for-each destructure (`mut a = _elem.a`) (#517, §5.5).
+ *
+ * @param recv_name  the receiver variable name (the element temp)
+ * @param field      the field to read
+ * @param line       the source line to stamp
+ * @param col        the source column to stamp
+ * @return           the `<recv>.<field>` expression
+ */
+fn loop_field_access(recv_name: str, field: str, line: u32, col: u32) -> Expr {
+    Expr { kind = FieldAccess { receiver = loop_var(recv_name, line, col); field = field }; line = line; col = col }
+}
+
+/**
+ * loop_destructure_binds — expand a for-each destructure target `{ a; b }` to per-field loop-local
+ * copies `mut a = _elem.a; mut b = _elem.b`, then the user body. Reuses field-access + simple
+ * bindings (NOT the incomplete B.13 general destructure path); each field type is inferred and an
+ * unknown field name is the checker's "no such field" error (#517, §5.5).
+ *
+ * @param names      the destructured field names, in order
+ * @param elem_name  the hygienic element temp bound by the `_ as` pattern
+ * @param body       the parsed user body
+ * @param line       the loop keyword's source line
+ * @param col        the loop keyword's source column
+ * @return           the element-binding body (per-field copies + user statements)
+ */
+fn loop_destructure_binds(names: []str, elem_name: str, body: []Statement, line: u32, col: u32) -> []Statement {
+    mut binds: []Statement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        binds = teko::list::push(binds, loop_mut_binding(names[i], loop_field_access(elem_name, names[i], line, col)))
+        i++
+    }
+    loop_append_all(binds, body)
+}
+
+/**
+ * loop_foreach_bind_body — build a for-each arm's element-binding body: bind the user's target to a
+ * loop-local COPY of the yielded element (`<elem>`), then the user statements. A SimpleName binds
+ * `mut x = <elem>`; a destructure expands to per-field `mut a = <elem>.a` copies. All copies, no
+ * write-back — owner 2026-07-12 (#517, §5.4/§5.5).
+ *
+ * @param tgt        the parsed bind-target (SimpleName or DestructurePattern)
+ * @param elem_name  the hygienic element temp bound by the `_ as` pattern
+ * @param ann        the parsed `: T` annotation (applied to a SimpleName copy binding)
+ * @param body       the parsed user body
+ * @param line       the loop keyword's source line
+ * @param col        the loop keyword's source column
+ * @return           the element-binding body
+ */
+fn loop_foreach_bind_body(tgt: BindTarget, elem_name: str, ann: Annotation, body: []Statement, line: u32, col: u32) -> []Statement {
+    match tgt {
+        SimpleName as sn => prepend_stmt(loop_counter_binding(sn.name, loop_var(elem_name, line, col), ann.has_type, ann.type_ann), body)
+        DestructurePattern as dp => loop_destructure_binds(dp.names, elem_name, body, line, col)
+    }
+}
+
+/**
+ * parse_loop_foreach — `[LABEL:] loop mut x [: T] in <it> { B }` where `<it> : () -> T?` is a
+ * closure iterator (§5.4): desugar to `init = [mut _it = <it>]` and a body that pulls at the TOP —
+ * `match _it() { null => break; _ as _elem => { mut x = _elem; ...B } }` — so `continue` re-pulls
+ * (advances). A raw collection (not callable) fails typing at `_it()` (the deferred case) (#517).
+ *
+ * @param tokens  the token stream
+ * @param tgt     the parsed bind-target
+ * @param ann     the parsed `: T` annotation (applied to the copy binding)
+ * @param it      the already-parsed iterable expression (its `.next` is the body `{`)
+ * @param label   the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @param line    the loop keyword's source line
+ * @param col     the loop keyword's source column
+ * @return        the parsed loop statement, or a parse error
+ */
+fn parse_loop_foreach(tokens: []lexer::Token, tgt: Parsed<BindTarget>, ann: Annotation, it: Parsed<Expr>, label: str, line: u32, col: u32) -> Parsed<Statement> | error {
+    if !is_kind_at(tokens, it.next, lexer::TokenKind::LBrace) {
+        return err_at(tokens, it.next, "expected '{' after the loop iterable")
+    }
+    let blk = match parse_block(tokens, it.next) { ParsedList<Statement> as x => x; error as e => return e }
+    let elem_name = loop_temp("elem", line, col)
+    let it_name = loop_temp("it", line, col)
+    let bind_body = loop_foreach_bind_body(tgt.node, elem_name, ann, blk.items, line, col)
+    let pull = loop_match_pull(it_name, elem_name, bind_body, line, col)
+    let init: []Statement = teko::list::push(teko::list::empty(), loop_mut_binding(it_name, it.node))
+    let body: []Statement = teko::list::push(teko::list::empty(), pull)
+    Parsed<Statement> { node = LoopStmt { label = label; init = init; body = body }; next = blk.next }
+}
+
+/**
+ * parse_loop_binding — parse a `mut <bind-target> [: T]` loop head, then dispatch on the separator:
+ * `in` with a `..`/`..=` iterable is a range (§5.2); any other `in` is a closure-iterator for-each
+ * (§5.4, `parse_loop_foreach`); `=` is a 3-part head (§5.3, `parse_loop_three_part`). Binding is
+ * `mut` only (#517).
+ *
+ * @param tokens   the token stream
+ * @param mut_pos  the position of the `mut` keyword (just past `loop`)
+ * @param label    the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @param line     the loop keyword's source line
+ * @param col      the loop keyword's source column
+ * @return         the parsed loop statement, or a parse error
+ */
+fn parse_loop_binding(tokens: []lexer::Token, mut_pos: u64, label: str, line: u32, col: u32) -> Parsed<Statement> | error {
+    let tgt = match parse_bind_target(tokens, mut_pos + 1) { Parsed<BindTarget> as x => x; error as e => return e }
+    let ann = match parse_annotation(tokens, tgt.next) { Annotation as x => x; error as e => return e }
+    if is_kind_at(tokens, ann.next, lexer::TokenKind::In) {
+        let after_in = ann.next + 1
+        let lo = match parse_expr_no_struct(tokens, after_in) { Parsed<Expr> as x => x; error as e => return e }
+        if is_kind_at(tokens, lo.next, lexer::TokenKind::DotDot) {
+            return parse_loop_range(tokens, tgt, ann, lo, false, label, line, col)
+        }
+        if is_kind_at(tokens, lo.next, lexer::TokenKind::DotDotEq) {
+            return parse_loop_range(tokens, tgt, ann, lo, true, label, line, col)
+        }
+        return parse_loop_foreach(tokens, tgt, ann, lo, label, line, col)
+    }
+    if is_kind_at(tokens, ann.next, lexer::TokenKind::Assign) {
+        return parse_loop_three_part(tokens, tgt, ann, ann.next + 1, label, line, col)
+    }
+    err_at(tokens, ann.next, "expected `in` or `;` after a loop binding")
+}
+
+/**
+ * parse_loop — dispatch a loop head after the `loop` keyword (#517). The token just past `loop`
+ * selects the form: `{` = infinite; `mut` = a binding head (range / for-each / 3-part, via
+ * `parse_loop_binding`); anything else = a while condition. The `label` is the UPPER_SNAKE prefix
+ * ("" when unlabeled); its format is enforced by the checker's `check_labels`.
+ *
+ * @param tokens  the token stream
+ * @param loop_pos  the position of the `loop` keyword
+ * @param label  the UPPER_SNAKE prefix label, or "" when unlabeled
+ * @return  the parsed loop statement, or a parse error
+ */
+fn parse_loop(tokens: []lexer::Token, loop_pos: u64, label: str) -> Parsed<Statement> | error {
+    let after = loop_pos + 1
+    if is_kind_at(tokens, after, lexer::TokenKind::LBrace) {
+        return parse_loop_infinite(tokens, after, label)
+    }
+    if is_kind_at(tokens, after, lexer::TokenKind::Mut) {
+        return parse_loop_binding(tokens, after, label, tokens[loop_pos].line, tokens[loop_pos].col)
+    }
+    parse_loop_while(tokens, after, label, tokens[loop_pos].line, tokens[loop_pos].col)
+}

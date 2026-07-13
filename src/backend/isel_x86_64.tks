@@ -469,21 +469,26 @@ fn select_un_x86(ctx0: SelCtxX86, inst: lir::LInst, u: lir::LUn) -> SelCtxX86 | 
 }
 
 /**
- * select_param_x86 — the `LParam` selection (§4.5): move the SysV integer
- * argument register for the parameter's GPR-class index (RDI/RSI/RDX/RCX/R8/R9,
- * read through `arg_reg(sysv64(), ...)` because the SysV argument sequence is
- * NOT the contiguous encoding order) into the parameter's VReg. A float-class
+ * select_param_x86 — the `LParam` selection (§4.5): move the target ABI's
+ * integer argument register for the parameter's GPR-class index (SysV
+ * RDI/RSI/RDX/RCX/R8/R9; Win64 RCX/RDX/R8/R9), read through `arg_reg(abi, ...)`
+ * because neither argument sequence is the contiguous encoding order, into the
+ * parameter's VReg. The `abi` descriptor is threaded from the emit driver, so
+ * the SAME isel code receives arguments in SysV registers on x86-linux and in
+ * the Win64 registers on x86_64-windows (the byte-identical SysV path passes
+ * `sysv64()`, exactly the descriptor the old hardcode named). A float-class
  * parameter needs an XMM move (the `B1-fp` stop), an i128 parameter a
- * register-pair slot (the i128-inherited stop), and a parameter past the
- * 6-register window the SysV stack-arg slot (the `B1-args` stop).
+ * register-pair slot (the i128-inherited stop), and a parameter past the ABI's
+ * integer-argument register window the stack-arg slot (the `B1-args` stop).
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param SelCtxX86 ctx0  the context to extend
  * @param lir::LFunc f  the enclosing function (its `param_types`)
  * @param lir::LInst inst  the enclosing instruction (its result VReg)
  * @param lir::LParam p  the parameter op
  * @return SelCtxX86 | error  the advanced context, or a NAMED honest-stop
  */
-fn select_param_x86(ctx0: SelCtxX86, f: lir::LFunc, inst: lir::LInst, p: lir::LParam) -> SelCtxX86 | error {
+fn select_param_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc, inst: lir::LInst, p: lir::LParam) -> SelCtxX86 | error {
     if (p.index to u64) >= f.param_types.len {
         return error { message = "isel x86-64: param index out of range (internal)" }
     }
@@ -495,9 +500,9 @@ fn select_param_x86(ctx0: SelCtxX86, f: lir::LFunc, inst: lir::LInst, p: lir::LP
         return error { message = "isel x86-64: B1-fp — a float parameter arrives in an XMM register via an SSE move, the float honest-stop (0.3.1)" }
     }
     let class_index = gpr_index_before(f.param_types, p.index)
-    let slot = arg_reg(sysv64(), MRegClass::GPR, class_index)
+    let slot = arg_reg(abi, MRegClass::GPR, class_index)
     if !slot.ok {
-        return error { message = "isel x86-64: B1-args — more than 6 integer arguments needs the SysV stack-arg slot (0.3.1)" }
+        return error { message = "isel x86-64: B1-args — an integer parameter past the ABI's argument-register window needs the stack-arg slot (0.3.1)" }
     }
     let wide = ltype_is_wide(ty)
     let dst = vreg(inst.result, MRegClass::GPR)
@@ -867,23 +872,27 @@ type PinnedArgsX86 = struct {
 }
 
 /**
- * pin_args_x86 — lower each argument into its SysV integer slot (§4.5): pin it
- * with a `mov` into the physical register `arg_reg(sysv64(), GPR, n)` names
- * (RDI/RSI/RDX/RCX/R8/R9, read through the descriptor because the SysV argument
- * order is not the contiguous encoding order), collecting the physregs as the
- * call's `uses`. A float-class argument needs an XMM move (the `B1-fp` stop),
- * an argument past the 6-register window the SysV stack-arg slot (the `B1-args`
- * stop), and a variadic call the register/stack split + the AL vector count
- * (also `B1-args`) — `LCall` carries neither, so both honest-stop.
+ * pin_args_x86 — lower each argument into the target ABI's integer slot (§4.5):
+ * pin it with a `mov` into the physical register `arg_reg(abi, GPR, n)` names
+ * (SysV RDI/RSI/RDX/RCX/R8/R9; Win64 RCX/RDX/R8/R9, read through the descriptor
+ * because neither argument order is the contiguous encoding order), collecting
+ * the physregs as the call's `uses`. The `abi` descriptor is threaded from the
+ * emit driver so the SAME isel places a call's outgoing arguments in SysV
+ * registers on x86-linux and in the Win64 registers on x86_64-windows. A
+ * float-class argument needs an XMM move (the `B1-fp` stop), an argument past
+ * the ABI's argument-register window the stack-arg slot (the `B1-args` stop),
+ * and a variadic call the register/stack split + the AL vector count (also
+ * `B1-args`) — `LCall` carries neither, so both honest-stop.
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param SelCtxX86 ctx0  the context to extend
  * @param args  the argument VRegs, in declaration order
  * @param bool variadic  whether the call is variadic (honest-stops here)
  * @return PinnedArgsX86 | error  the pinned args, or a NAMED honest-stop
  */
-fn pin_args_x86(ctx0: SelCtxX86, args: []u32, variadic: bool) -> PinnedArgsX86 | error {
+fn pin_args_x86(abi: AbiDescriptor, ctx0: SelCtxX86, args: []u32, variadic: bool) -> PinnedArgsX86 | error {
     if variadic {
-        return error { message = "isel x86-64: B1-args — a variadic call needs the SysV register/stack split and the AL vector count; LCall carries no arity (0.3.1)" }
+        return error { message = "isel x86-64: B1-args — a variadic call needs the register/stack split and the AL vector count; LCall carries no arity (0.3.1)" }
     }
     mut ctx = ctx0
     mut uses: []MReg = teko::list::empty()
@@ -896,9 +905,9 @@ fn pin_args_x86(ctx0: SelCtxX86, args: []u32, variadic: bool) -> PinnedArgsX86 |
         if info.reg_class == MRegClass::FPR {
             return error { message = "isel x86-64: B1-fp — a float call argument arrives in an XMM register via an SSE move, the float honest-stop (0.3.1)" }
         }
-        let slot = arg_reg(sysv64(), MRegClass::GPR, gpr_n)
+        let slot = arg_reg(abi, MRegClass::GPR, gpr_n)
         if !slot.ok {
-            return error { message = "isel x86-64: B1-args — more than 6 integer arguments needs the SysV stack-arg slot (0.3.1)" }
+            return error { message = "isel x86-64: B1-args — an integer call argument past the ABI's argument-register window needs the stack-arg slot (0.3.1)" }
         }
         ctx = selctx_x86_emit(ctx, mov_x86(slot.reg, vreg(a, MRegClass::GPR), info.wide))
         uses = teko::list::push(uses, slot.reg)
@@ -931,17 +940,19 @@ fn select_call_result_x86(ctx0: SelCtxX86, inst: lir::LInst, ret_reg: MReg) -> S
 
 /**
  * select_call_x86 — the `LCall` selection (§4.5): lower the arguments into
- * their SysV registers (`pin_args_x86`), emit `MCallX86{sym, uses, ret_reg,
- * has_result, variadic}` with the result pinned to RAX (decision D-A), then
- * move the result out of RAX if the call produces one.
+ * the target ABI's registers (`pin_args_x86`), emit `MCallX86{sym, uses,
+ * ret_reg, has_result, variadic}` with the result pinned to RAX (decision D-A —
+ * RAX is the integer result on both SysV and Win64), then move the result out
+ * of RAX if the call produces one.
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param SelCtxX86 ctx0  the context to extend
  * @param lir::LInst inst  the enclosing instruction (its result VReg)
  * @param lir::LCall c  the call op
  * @return SelCtxX86 | error  the advanced context, or a propagated error
  */
-fn select_call_x86(ctx0: SelCtxX86, inst: lir::LInst, c: lir::LCall) -> SelCtxX86 | error {
-    let pinned = match pin_args_x86(ctx0, c.args, c.variadic) { PinnedArgsX86 as p => p; error as e => return e }
+fn select_call_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, c: lir::LCall) -> SelCtxX86 | error {
+    let pinned = match pin_args_x86(abi, ctx0, c.args, c.variadic) { PinnedArgsX86 as p => p; error as e => return e }
     let ret_reg = rax_x86()
     let ctx1 = selctx_x86_emit(pinned.ctx, call_x86(c.symbol, pinned.uses, ret_reg, inst.has_result, c.variadic))
     select_call_result_x86(ctx1, inst, ret_reg)
@@ -952,13 +963,14 @@ fn select_call_x86(ctx0: SelCtxX86, inst: lir::LInst, c: lir::LCall) -> SelCtxX8
  * lowering, then `MCallIndX86{target, uses, ret_reg, has_result}` (a `call`
  * through the target Ptr VReg), then the result move.
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param SelCtxX86 ctx0  the context to extend
  * @param lir::LInst inst  the enclosing instruction (its result VReg)
  * @param lir::LCallIndirect ci  the indirect-call op
  * @return SelCtxX86 | error  the advanced context, or a propagated error
  */
-fn select_call_indirect_x86(ctx0: SelCtxX86, inst: lir::LInst, ci: lir::LCallIndirect) -> SelCtxX86 | error {
-    let pinned = match pin_args_x86(ctx0, ci.args, ci.variadic) { PinnedArgsX86 as p => p; error as e => return e }
+fn select_call_indirect_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, ci: lir::LCallIndirect) -> SelCtxX86 | error {
+    let pinned = match pin_args_x86(abi, ctx0, ci.args, ci.variadic) { PinnedArgsX86 as p => p; error as e => return e }
     let ret_reg = rax_x86()
     let ctx1 = selctx_x86_emit(pinned.ctx, call_ind_x86(vreg(ci.target, MRegClass::GPR), pinned.uses, ret_reg, inst.has_result))
     select_call_result_x86(ctx1, inst, ret_reg)
@@ -972,18 +984,20 @@ fn select_call_indirect_x86(ctx0: SelCtxX86, inst: lir::LInst, ci: lir::LCallInd
  * literal case honest-stops (`B1-fp`); every other float route stops inside its
  * own selection helper.
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64), read
+ *                           by the parameter-receipt and call-argument arms
  * @param SelCtxX86 ctx  the context to extend
  * @param lir::LFunc f  the enclosing function (`LParam`/`LJump`/`LBranch` read it)
  * @param lir::LInst inst  the instruction to select
  * @return SelCtxX86 | error  the advanced context, or a propagated/named error
  */
-fn select_inst_x86(ctx: SelCtxX86, f: lir::LFunc, inst: lir::LInst) -> SelCtxX86 | error {
+fn select_inst_x86(abi: AbiDescriptor, ctx: SelCtxX86, f: lir::LFunc, inst: lir::LInst) -> SelCtxX86 | error {
     match inst.op {
         lir::LConstInt as c => select_const_int_x86(ctx, inst, c)
         lir::LConstFloat as c => select_const_float_x86(ctx, inst, c)
         lir::LBin as b => select_bin_x86(ctx, f, inst, b)
         lir::LUn as u => select_un_x86(ctx, inst, u)
-        lir::LParam as p => select_param_x86(ctx, f, inst, p)
+        lir::LParam as p => select_param_x86(abi, ctx, f, inst, p)
         lir::LRet as r => select_ret_x86(ctx, r)
         lir::LJump as j => select_jump_x86(ctx, f, j)
         lir::LBranch as br => select_branch_x86(ctx, f, br)
@@ -992,9 +1006,9 @@ fn select_inst_x86(ctx: SelCtxX86, f: lir::LFunc, inst: lir::LInst) -> SelCtxX86
         lir::LLoad as l => select_load_x86(ctx, inst, l)
         lir::LStore as s => select_store_x86(ctx, s)
         lir::LGlobalAddr as g => select_global_addr_x86(ctx, inst, g)
-        lir::LCallIndirect as ci => select_call_indirect_x86(ctx, inst, ci)
+        lir::LCallIndirect as ci => select_call_indirect_x86(abi, ctx, inst, ci)
         lir::LFuncAddr as fa => select_func_addr_x86(ctx, inst, fa)
-        lir::LCall as c => select_call_x86(ctx, inst, c)
+        lir::LCall as c => select_call_x86(abi, ctx, inst, c)
     }
 }
 
@@ -1002,18 +1016,19 @@ fn select_inst_x86(ctx: SelCtxX86, f: lir::LFunc, inst: lir::LInst) -> SelCtxX86
  * select_insts_x86 — select every instruction of `insts`, in order, threading
  * the context forward and short-circuiting on the first error.
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param SelCtxX86 ctx0  the context to extend
  * @param lir::LFunc f  the enclosing function
  * @param insts  the instruction stream to select
  * @return SelCtxX86 | error  the fully-advanced context, or the first
  *                            propagated error
  */
-fn select_insts_x86(ctx0: SelCtxX86, f: lir::LFunc, insts: []lir::LInst) -> SelCtxX86 | error {
+fn select_insts_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc, insts: []lir::LInst) -> SelCtxX86 | error {
     mut ctx = ctx0
     mut i: u64 = 0
     loop {
         if i >= insts.len { break }
-        let stepped = match select_inst_x86(ctx, f, insts[i]) { SelCtxX86 as c => c; error as e => return e }
+        let stepped = match select_inst_x86(abi, ctx, f, insts[i]) { SelCtxX86 as c => c; error as e => return e }
         ctx = stepped
         i++
     }
@@ -1082,18 +1097,19 @@ fn max_block_id_x86(f: lir::LFunc) -> u32 {
  * select_all_blocks_x86 — select every `LBlock` of `f` in order, retargeting
  * the emit cursor to each block's mirror before selecting its instructions.
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param SelCtxX86 ctx0  the initial context (targeting the entry block)
  * @param lir::LFunc f  the function to select
  * @return SelCtxX86 | error  the fully-advanced context, or the first error
  */
-fn select_all_blocks_x86(ctx0: SelCtxX86, f: lir::LFunc) -> SelCtxX86 | error {
+fn select_all_blocks_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc) -> SelCtxX86 | error {
     mut ctx = ctx0
     mut i: u64 = 0
     loop {
         if i >= f.blocks.len { break }
         let lb = f.blocks[i]
         let switched = selctx_x86_switch(ctx, lb.id)
-        let stepped = match select_insts_x86(switched, f, lb.insts) { SelCtxX86 as c => c; error as e => return e }
+        let stepped = match select_insts_x86(abi, switched, f, lb.insts) { SelCtxX86 as c => c; error as e => return e }
         ctx = stepped
         i++
     }
@@ -1103,33 +1119,38 @@ fn select_all_blocks_x86(ctx0: SelCtxX86, f: lir::LFunc) -> SelCtxX86 | error {
 /**
  * select_lfunc_x86 — select one `LFunc` into an `MFuncX86`: build the mirror
  * block skeleton, then select every block's instructions (the full control-flow
- * set — jumps, branches, and their split edge blocks).
+ * set — jumps, branches, and their split edge blocks) under the target ABI.
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param lir::LFunc f  the function to select
  * @return MFuncX86 | error  the selected function, or any instruction's own
  *                           propagated error
  */
-pub fn select_lfunc_x86(f: lir::LFunc) -> MFuncX86 | error {
+pub fn select_lfunc_x86(abi: AbiDescriptor, f: lir::LFunc) -> MFuncX86 | error {
     let ctx0 = SelCtxX86 { func = build_mirror_blocks_x86(f); vinfo = vinfo_empty(); next_scratch = f.next_vreg; cur_block = 0; next_block = max_block_id_x86(f) + 1 }
-    let done = match select_all_blocks_x86(ctx0, f) { SelCtxX86 as c => c; error as e => return e }
+    let done = match select_all_blocks_x86(abi, ctx0, f) { SelCtxX86 as c => c; error as e => return e }
     done.func
 }
 
 /**
- * select_module_x86 — select every function of `m` into an `MModuleX86`,
- * carrying its rodata/globals/layouts tables through UNCHANGED (isel never
- * touches their bytes — the encoder/ELF writer does).
+ * select_module_x86 — select every function of `m` into an `MModuleX86` under
+ * the target ABI, carrying its rodata/globals/layouts tables through UNCHANGED
+ * (isel never touches their bytes — the encoder/ELF/COFF writer does). The
+ * `abi` descriptor is threaded from the emit driver: `emit_native_x86` passes
+ * `sysv64()` (the byte-identical x86-linux path) and `emit_native_win` passes
+ * `win64()` (call/return arguments land in RCX/RDX/R8/R9).
  *
+ * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param lir::LModule m  the module to select
  * @return MModuleX86 | error  the selected module, or the first function's
  *                             propagated error
  */
-pub fn select_module_x86(m: lir::LModule) -> MModuleX86 | error {
+pub fn select_module_x86(abi: AbiDescriptor, m: lir::LModule) -> MModuleX86 | error {
     mut out = MModuleX86 { funcs = teko::list::empty(); rodata = m.rodata; globals = m.globals; layouts = m.layouts }
     mut i: u64 = 0
     loop {
         if i >= m.funcs.len { break }
-        let mf = match select_lfunc_x86(m.funcs[i]) { MFuncX86 as x => x; error as e => return e }
+        let mf = match select_lfunc_x86(abi, m.funcs[i]) { MFuncX86 as x => x; error as e => return e }
         out = add_mfunc_x86(out, mf)
         i++
     }

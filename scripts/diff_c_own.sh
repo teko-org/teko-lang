@@ -21,7 +21,9 @@
 # For each own-native build the harness also runs a host-tool well-formedness check
 # on the REAL emitted `.o`: scripts/check_macho.sh (otool/nm/ld -r) on the macOS-arm64
 # Mach-O lane, scripts/check_elf.sh (readelf/objdump/nm/ld -r) on the linux-x86_64 ELF
-# lane — the writer's bytes cross-checked by the same host toolchain that consumes them.
+# lane, scripts/check_coff.sh (llvm-readobj/llvm-objdump/lld-link) on the windows-x86_64
+# PE/COFF lane — the writer's bytes cross-checked by the same host toolchain that
+# consumes them.
 #
 # ── harness-blind-spot guards (review finding F1) ───────────────────────────────────
 # A silently-misconfigured `TEKO` (e.g. the C bootstrap, or any binary predating
@@ -36,13 +38,26 @@
 #       honest-skip is for STANDALONE invocation with no object at all, not for this
 #       harness where the own-native build already reported success + the marker).
 #
-# TWO EXECUTING LANES, host-selected (issue #386 B1-8):
+# FOUR EXECUTING LANES (issue #386 B1-8; issue #387 B2-8; issue #388 B3-4):
 #   macOS-arm64  → own emits arm64 Mach-O; TEKO_BACKEND=native; check_macho.sh.
 #   linux-x86_64 → own emits x86-64 ELF;   TEKO_BACKEND=native TEKO_TARGET=x86_64-linux;
 #                  check_elf.sh. This lane RUNS the ELF (the linux runner executes it),
 #                  the executing C-vs-own differential the macOS lane cannot host.
-# On any OTHER host the harness HONEST-SKIPS with a named reason (exit 0). PE/riscv/wasm
-# are later clusters (B2/B3/C1).
+#   windows-x86_64 → own emits x86-64 PE/COFF; TEKO_BACKEND=native TEKO_TARGET=x86_64-windows;
+#                  check_coff.sh. Detected by a Git-Bash/MSYS/Cygwin `uname` (MINGW*/MSYS*/
+#                  CYGWIN*) with x86_64. This lane RUNS the PE NATIVELY (no emulator — the
+#                  windows runner executes the artifact directly, the first own==C
+#                  differential to run on its target OS without emulation), the host cc
+#                  (clang → lld-link) links, check_coff.sh cross-checks the object.
+#   riscv64      → own emits riscv64 ELF;  selected EXPLICITLY by TEKO_DIFF_TARGET=riscv64-linux
+#                  (NOT uname — the CI host is linux-x86_64), cross-linked by
+#                  riscv64-linux-gnu-gcc (TEKO_CC), both C-native and own-native binaries
+#                  RUN under qemu-riscv64-static, check_elf.sh cross-checks with the riscv
+#                  binutils (ELF_TOOLCHAIN/ELF_MACHINE). Honest-skips when the cross-gcc /
+#                  qemu are absent (e.g. a macOS dev host, where the encoder + emit_elf_riscv
+#                  goldens in `teko test .` are the byte cross-check instead).
+# On any OTHER host the harness HONEST-SKIPS with a named reason (exit 0). wasm is a
+# later cluster (C1).
 #
 # usage: scripts/diff_c_own.sh [fixture-dir ...]
 #   TEKO=<self-hosted-teko>   (default: ./bin/teko — MUST carry emit_native; the C
@@ -55,9 +70,54 @@ set -u
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# TK_RT_DIR pinned ABSOLUTE (project.tks::rt_dir reads it verbatim; assert_dir derives
+# the sibling `<parent-of-rt>/assert` from it, so one absolute anchor resolves BOTH
+# teko_rt.c and assert.c). Every fixture build below runs with CWD == the fixture
+# project dir, not $script_dir, so project.tks's compiler-relative probe
+# (set_rt_dir_from_compiler) is the only other resolution path — and it fails on the
+# Windows runner (a general out-of-tree-build gap, reported separately, not fixed
+# here), falling back to a CWD-relative "src/runtime" that never resolves from a
+# fixture dir. Exporting an absolute TK_RT_DIR here sidesteps both platform probes
+# uniformly, so every lane (macOS/Linux/Windows) finds the runtime the same way.
+export TK_RT_DIR="$script_dir/src/runtime"
+
 host_os="$(uname -s)"
 host_arch="$(uname -m)"
-if [[ "$host_os" == "Darwin" && "$host_arch" == "arm64" ]]; then
+diff_target="${TEKO_DIFF_TARGET:-}"
+
+# RUN_WRAP wraps BOTH the C-native and own-native executions (empty = run natively;
+# `qemu-riscv64-static` for the cross riscv lane). TEKO_CC_ENV forces the compiler
+# `build_cc_argv` invokes (empty = host cc; a cross-gcc token for a cross lane).
+# OBJ_CHECK_ENV prefixes the OBJ_CHECK invocation (empty = host binutils; the
+# riscv toolchain prefix + machine for check_elf). All three interpolate UNQUOTED,
+# matching the existing `$OWN_TARGET_ENV` env-string convention (no embedded spaces).
+RUN_WRAP=""
+TEKO_CC_ENV=""
+OBJ_CHECK_ENV=""
+
+if [[ "$diff_target" == "riscv64-linux" ]]; then
+    # The EXPLICITLY-selected riscv64 lane (issue #387 B2-8). The CI host is
+    # linux-x86_64 (uname reports x86_64, NOT riscv), so the target is chosen by
+    # TEKO_DIFF_TARGET, never uname. Both binaries are riscv64 ELF, cross-linked by
+    # riscv64-linux-gnu-gcc and RUN under qemu-riscv64-static. Requires the riscv
+    # cross-gcc + qemu; absent (e.g. a macOS dev host), honest-skip — the macOS byte
+    # cross-check is the encoder + emit_elf_riscv goldens in `teko test .`.
+    if ! command -v riscv64-linux-gnu-gcc >/dev/null 2>&1; then
+        echo "diff_c_own: skipped — TEKO_DIFF_TARGET=riscv64-linux needs riscv64-linux-gnu-gcc (the cross-linker); not found on this host"
+        exit 0
+    fi
+    if ! command -v qemu-riscv64-static >/dev/null 2>&1; then
+        echo "diff_c_own: skipped — TEKO_DIFF_TARGET=riscv64-linux needs qemu-riscv64-static (the executing emulator); not found on this host"
+        exit 0
+    fi
+    FLAVOR="linux-riscv64 ELF (qemu)"
+    OWN_TARGET_ENV="TEKO_TARGET=riscv64-linux"
+    TEKO_CC_ENV="TEKO_CC=riscv64-linux-gnu-gcc"
+    RUN_WRAP="qemu-riscv64-static"
+    OBJ_CHECK="$script_dir/scripts/check_elf.sh"
+    OBJ_CHECK_NAME="check_elf"
+    OBJ_CHECK_ENV="ELF_TOOLCHAIN=riscv64-linux-gnu- ELF_MACHINE=RISC-V"
+elif [[ "$host_os" == "Darwin" && "$host_arch" == "arm64" ]]; then
     FLAVOR="macOS-arm64 Mach-O"
     OWN_TARGET_ENV=""
     OBJ_CHECK="$script_dir/scripts/check_macho.sh"
@@ -67,8 +127,26 @@ elif [[ "$host_os" == "Linux" && "$host_arch" == "x86_64" ]]; then
     OWN_TARGET_ENV="TEKO_TARGET=x86_64-linux"
     OBJ_CHECK="$script_dir/scripts/check_elf.sh"
     OBJ_CHECK_NAME="check_elf"
+elif [[ ( "$host_os" == MINGW* || "$host_os" == MSYS* || "$host_os" == CYGWIN* ) && "$host_arch" == "x86_64" ]]; then
+    # The windows-x86_64 lane (issue #388 B3-4). A Git-Bash/MSYS/Cygwin host on the
+    # GitHub windows-x86_64 runner: own emits an IMAGE_FILE_MACHINE_AMD64 PE/COFF
+    # object (the SAME x86 ISA as the linux lane, under the win64 register file +
+    # emit_coff), linked NATIVELY (host == target, TEKO_CC=cc — overriding
+    # default_cc_for_target's x86_64-w64-mingw32-gcc, which is the CROSS-cc for a
+    # non-Windows dev host; "cc" is the SAME literal command the pre-existing
+    # windows-x86_64 build-test job already resolves to a working clang link) into a
+    # `.exe` and RUN NATIVELY — the PE executes directly, no emulator (the key
+    # advantage over the cross riscv lane's qemu). RUN_WRAP stays empty (native
+    # execution); the MSYS exec layer auto-appends `.exe`, so the bare
+    # `$cout/$name` / `$oout/$name` invocations run the produced executable.
+    # check_coff.sh cross-checks the object with the LLVM tools the runner ships.
+    FLAVOR="windows-x86_64 PE/COFF"
+    OWN_TARGET_ENV="TEKO_TARGET=x86_64-windows"
+    TEKO_CC_ENV="TEKO_CC=cc"
+    OBJ_CHECK="$script_dir/scripts/check_coff.sh"
+    OBJ_CHECK_NAME="check_coff"
 else
-    echo "diff_c_own: skipped — the own backend runs its executing differential on macOS-arm64 (Mach-O) or linux-x86_64 (ELF); host is $host_os-$host_arch"
+    echo "diff_c_own: skipped — the own backend runs its executing differential on macOS-arm64 (Mach-O), linux-x86_64 (ELF) or windows-x86_64 (PE/COFF); host is $host_os-$host_arch"
     exit 0
 fi
 
@@ -198,17 +276,17 @@ for proj in "${fixtures[@]}"; do
     cout="$work/$name-c"
     oout="$work/$name-own"
 
-    ( unset TEKO_BACKEND; "$teko_abs" build "$proj" -o "$cout" ) >"$work/$name.cbuild" 2>&1
+    ( unset TEKO_BACKEND; env $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$cout" ) >"$work/$name.cbuild" 2>&1
     if [[ $? -ne 0 ]]; then
         fail=$((fail + 1)); failed_names+=("$name")
         printf 'FAIL  %-16s C-native build failed\n' "$name"
         tail -8 "$work/$name.cbuild" | sed 's/^/      | /'
         continue
     fi
-    "$cout/$name" >"$work/$name.cout" 2>&1
+    $RUN_WRAP "$cout/$name" >"$work/$name.cout" 2>&1
     c_exit=$?
 
-    env TEKO_BACKEND=native $OWN_TARGET_ENV "$teko_abs" build "$proj" -o "$oout" >"$work/$name.obuild" 2>&1
+    env TEKO_BACKEND=native $OWN_TARGET_ENV $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$oout" >"$work/$name.obuild" 2>&1
     own_build_rc=$?
 
     if known_stop_index_of "$name" >/dev/null; then
@@ -239,7 +317,7 @@ for proj in "${fixtures[@]}"; do
         continue
     fi
 
-    "$oout/$name" >"$work/$name.oout" 2>&1
+    $RUN_WRAP "$oout/$name" >"$work/$name.oout" 2>&1
     own_exit=$?
 
     if [[ "$c_exit" -ne "$own_exit" ]]; then
@@ -254,7 +332,7 @@ for proj in "${fixtures[@]}"; do
         continue
     fi
 
-    if ! "$OBJ_CHECK" "$objp" >"$work/$name.objcheck" 2>&1; then
+    if ! env $OBJ_CHECK_ENV "$OBJ_CHECK" "$objp" >"$work/$name.objcheck" 2>&1; then
         fail=$((fail + 1)); failed_names+=("$name")
         printf 'FAIL  %-16s %s rejected the emitted %s.o\n' "$name" "$OBJ_CHECK_NAME" "$name"
         tail -5 "$work/$name.objcheck" | sed 's/^/      | /'
