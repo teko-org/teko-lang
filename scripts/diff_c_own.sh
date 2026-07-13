@@ -200,6 +200,8 @@ CORPUS=(
     own_print_exit
     own_loop_range_native
     own_loop_nested_range
+    own_defer_arm_write_propagates
+    own_value_if_rhs_reassign
 )
 
 # ── KNOWN-STOP list ────────────────────────────────────────────────────────────────────
