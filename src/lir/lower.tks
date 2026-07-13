@@ -688,12 +688,18 @@ fn lower_compare(ctx: LowerCtx, e: checker::TExpr, cmp: checker::TCompare) -> Lo
 
 /**
  * lower_call — a direct, interface-dispatch, or closure call. The `exit`/
- * `panic` builtins map to their runtime symbols (tk_exit / tk_panic_str),
- * matching the C backend; a Teko-Teko call resolves its symbol through the
- * shared mangler (call_ns::name). Arguments lower left-to-right. A DYNAMIC
+ * `panic` builtins and the `print`/`println`/`eprint`/`eprintln`/`write`/
+ * `ewrite` io builtins map to their runtime symbols (tk_exit / tk_panic_str /
+ * tk_print / …), matching the C backend; a Teko-Teko call resolves its
+ * symbol through the shared mangler (call_ns::name). A DYNAMIC
  * contract-method call (`is_iface_dispatch`) routes to `lower_iface_call`
  * (A1-6, #382); a call through a local closure VALUE (`is_closure_call`)
- * routes to `lower_closure_call` (A1-7, #382).
+ * routes to `lower_closure_call` (A1-7, #382). A resolved symbol taking its
+ * lone argument as a runtime `tk_str` (the C1-6 io/panic group,
+ * `is_str_arg_builtin`) routes to `lower_str_arg_call`, which lowers that ONE
+ * argument through the (ptr, len) FAT pair (`lower_fat_expr`) instead of the
+ * generic left-to-right scalar path — every other call lowers its arguments
+ * plainly (`lower_args`) and emits through `lower_call_symbol`.
  *
  * @param LowerCtx ctx  the lowering context
  * @param checker::TExpr e  the call expression (for its type + source
@@ -706,8 +712,60 @@ fn lower_compare(ctx: LowerCtx, e: checker::TExpr, cmp: checker::TCompare) -> Lo
 fn lower_call(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall) -> Lowered | error {
     if c.is_closure_call { return lower_closure_call(ctx, e, c) }
     if c.is_iface_dispatch { return lower_iface_call(ctx, e, c) }
+    let sym = match call_symbol(c) { str as s => s; error as err => return err }
+    if is_str_arg_builtin(sym) { return lower_str_arg_call(ctx, e, sym, c) }
     let lo = match lower_args(ctx, c.args) { LoweredArgs as x => x; error as err => return err }
-    lower_call_symbol(lo.ctx, e, c, lo.vregs)
+    lower_call_symbol(lo.ctx, e, sym, lo.vregs)
+}
+
+/**
+ * is_str_arg_builtin — does the resolved runtime symbol `sym` take its LONE
+ * argument as a `tk_str` (a 2-eightbyte `{ptr; len}` struct passed BY VALUE,
+ * `teko_rt.h:45-48`)? These seven — the io group (`tk_print`/`tk_println`/
+ * `tk_eprint`/`tk_eprintln`/`tk_write`/`tk_ewrite`) plus `tk_panic_str` — are
+ * every `(tk_str) -> void`/`_Noreturn` runtime entry the N1 builtin table
+ * resolves DIRECTLY (`call_symbol`), as opposed to `tk_str_concat`/
+ * `tk_i64_to_str`/… which `lower_interp` calls by a hardcoded symbol and
+ * which stay on the plain scalar path (their own multi-register/return-value
+ * ABI is the SEPARATE, wider N2 gap `lower_fat_expr`'s own doc names —
+ * REPORTED up, not this crumb's scope). A lone struct-by-value argument
+ * decomposes to EXACTLY two consecutive AAPCS64/SysV general registers, so
+ * passing (ptr, len) as two flat `LCall` operands reproduces the true C ABI
+ * with NO isel/regalloc/stackify change (`lower_str_arg_call`).
+ *
+ * @param str sym  the resolved runtime symbol (`call_symbol`'s result)
+ * @return bool  true iff `sym` is one of the seven single-`tk_str`-arg
+ *               runtime entries
+ */
+fn is_str_arg_builtin(sym: str) -> bool {
+    sym == "tk_print" || sym == "tk_println" || sym == "tk_eprint" || sym == "tk_eprintln" || sym == "tk_write" || sym == "tk_ewrite" || sym == "tk_panic_str"
+}
+
+/**
+ * lower_str_arg_call — lower a call to a single-`tk_str`-argument runtime
+ * builtin (`is_str_arg_builtin`): the ONE argument through `lower_fat_expr`
+ * (its (ptr, len) pair, the A1-4 fat-pointer PRODUCER set — a literal, an
+ * array literal, or a `let`-bound fat local), emitted as a two-operand void
+ * `LCall` (`ptr` then `len`, matching `tk_str`'s field order). A call whose
+ * argument is not one of those closed producers (e.g. an interpolation or
+ * another call's result) propagates `lower_fat_expr`'s own NAMED N2
+ * honest-stop unchanged — never a fabricated/garbage-ABI call.
+ *
+ * @param LowerCtx ctx  the lowering context
+ * @param checker::TExpr e  the call expression (its source position)
+ * @param str sym  the resolved runtime symbol (`is_str_arg_builtin` true)
+ * @param checker::TCall c  the call node (its single argument)
+ * @return Lowered | error  the advanced context + a dummy 0 VReg (every
+ *                          `is_str_arg_builtin` target is void/`_Noreturn`),
+ *                          or a NAMED internal/N2 honest-stop
+ */
+fn lower_str_arg_call(ctx: LowerCtx, e: checker::TExpr, sym: str, c: checker::TCall) -> Lowered | error {
+    if c.args.len != 1 {
+        return error { message = teko::str::concat("native backend N1: `", sym, "` expects exactly one str argument (internal)") }
+    }
+    let fo = match lower_fat_expr(ctx, c.args[0]) { LoweredFat as x => x; error as err => return err }
+    let inst = void_call_inst(sym, two_args(fo.ptr, fo.len), false, e.line, e.col)
+    Lowered { ctx = ctx_append(fo.ctx, inst); vreg = 0 }
 }
 
 /** LoweredArgs — the context after lowering an argument list + the VRegs, in order. */
@@ -752,11 +810,11 @@ fn lower_args_from(ctx: LowerCtx, args: []checker::TExpr, start: u64) -> Lowered
     LoweredArgs { ctx = cur; vregs = vregs }
 }
 
-/** lower_call_symbol — emit the LCall for a resolved argument list. A void-returning call
-    (a diverging builtin or a void fn) emits a valueless instruction and returns a dummy
-    VReg the caller must not read; a value call allocates a result VReg. */
-fn lower_call_symbol(ctx: LowerCtx, e: checker::TExpr, c: checker::TCall, vregs: []u32) -> Lowered | error {
-    let sym = match call_symbol(c) { str as s => s; error as err => return err }
+/** lower_call_symbol — emit the LCall for an ALREADY-RESOLVED symbol over an
+    already-lowered argument list. A void-returning call (a diverging builtin or a void fn)
+    emits a valueless instruction and returns a dummy VReg the caller must not read; a value
+    call allocates a result VReg. */
+fn lower_call_symbol(ctx: LowerCtx, e: checker::TExpr, sym: str, vregs: []u32) -> Lowered | error {
     if type_is_void(e.type) {
         let inst = void_call_inst(sym, vregs, false, e.line, e.col)
         return Lowered { ctx = ctx_append(ctx, inst); vreg = 0 }
@@ -773,9 +831,11 @@ fn type_is_void(t: checker::Type) -> bool {
     match t { checker::Void => true; _ => false }
 }
 
-/** call_symbol — the LIR symbol a direct call targets: `exit`/`panic` -> their runtime
-    twins; a Teko-Teko call -> the mangled call_ns::name. A call the N1 subset does not
-    recognize (a builtin other than exit/panic) honest-stops. */
+/** call_symbol — the LIR symbol a direct call targets: `exit`/`panic` and the io group
+    (`print`/`println`/`eprint`/`eprintln`/`write`/`ewrite`) -> their runtime twins, mirroring
+    the C backend's own bare-name builtin dispatch (`codegen.tks:2289-2297`); a Teko-Teko call
+    -> the mangled call_ns::name. A call the N1 subset does not recognize (a builtin other
+    than this set) honest-stops. */
 fn call_symbol(c: checker::TCall) -> str | error {
     let segs = c.callee.segments
     if segs.len == 0 { return error { message = "native backend N1: empty call path (internal)" } }
@@ -783,6 +843,12 @@ fn call_symbol(c: checker::TCall) -> str | error {
     let addressable = (segs.len == 1) || (segs[0].name == "teko")
     if addressable && last == "exit" { return "tk_exit" }
     if addressable && last == "panic" { return "tk_panic_str" }
+    if addressable && last == "print" { return "tk_print" }
+    if addressable && last == "println" { return "tk_println" }
+    if addressable && last == "eprint" { return "tk_eprint" }
+    if addressable && last == "eprintln" { return "tk_eprintln" }
+    if addressable && last == "write" { return "tk_write" }
+    if addressable && last == "ewrite" { return "tk_ewrite" }
     if c.call_ns.len == 0 && segs.len == 1 {
         return error { message = teko::str::concat("native backend N1: builtin `", last, "` not yet lowered (N2)") }
     }
@@ -1988,7 +2054,14 @@ fn unwrap_optional(t: checker::Type) -> checker::Type {
     mirroring the null sentinel every Optional shares with its inner type); the present arm
     merges `a` itself (already unwrapped — no re-lowering), the absent arm lowers `b` (which
     may itself diverge, e.g. `a ?? panic(...)` — its dead post-call jump is harmless, mirrors
-    `lower_if_value`'s own arm-closing convention) (A1-4, #382). */
+    `lower_if_value`'s own arm-closing convention) (A1-4, #382). The final merged context is
+    built from `ro.ctx` (the RHS's own POST-lowering context), NOT `ctx1` (the pre-RHS one) —
+    `ctx_with` only OVERRIDES `func`/`block_id`/`env` and copies every other field (rodata,
+    lifted closures, …) from its first argument, so building it from `ctx1` would SILENTLY
+    DROP any rodata `co.right` interned (e.g. a string literal fed to `panic`, C1-6 — a
+    genuine miscompile: the caller emits a `global_addr` relocation against a symbol whose
+    definition never made it into the module). `ctx1.env` is still the right ENV (unchanged
+    across both arms — neither introduces a new binding visible past the merge). */
 fn lower_coalesce(ctx: LowerCtx, e: checker::TExpr, co: checker::TCoalesce) -> Lowered | error {
     let lo = match lower_expr(ctx, co.left) { Lowered as x => x; error as err => return err }
     let thenb = alloc_block(lo.ctx.func)
@@ -2003,7 +2076,7 @@ fn lower_coalesce(ctx: LowerCtx, e: checker::TExpr, co: checker::TCoalesce) -> L
     let ro = match lower_expr(else_ctx, co.right) { Lowered as x => x; error as err => return err }
     let else_args = teko::list::push(teko::list::empty(), ro.vreg)
     let else_func = close_arm_to(ro.ctx, mergeb.block_id, else_args, e.line, e.col)
-    Lowered { ctx = ctx_with(ctx1, else_func, mergeb.block_id, ctx1.env); vreg = mp.vreg }
+    Lowered { ctx = ctx_with(ro.ctx, else_func, mergeb.block_id, ctx1.env); vreg = mp.vreg }
 }
 
 /** lower_safe_field_access — `recv?.field` on an optional STRUCT receiver (the checker

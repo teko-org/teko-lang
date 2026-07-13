@@ -4346,14 +4346,78 @@ pub fn wasm_honest_globals() -> error {
 }
 
 /**
+ * wasm_io_iov_base_addr — the fixed linear-memory offset of the synthesized
+ * io/panic trampolines' own scratch `__wasi_ciovec_t.buf` field (4 bytes,
+ * §6.2/C1-6): every `tk_print`/`tk_println`/`tk_eprint`/`tk_eprintln`/
+ * `tk_write`/`tk_ewrite`/`tk_panic_str` call reuses this SAME 16-byte
+ * scratch region (never reentrant/nested — one host `fd_write` call always
+ * runs to completion before the next begins), so no per-call allocation is
+ * needed.
+ *
+ * @return u32  the scratch iovec `buf` field's own offset
+ */
+fn wasm_io_iov_base_addr() -> u32 {
+    0 to u32
+}
+
+/**
+ * wasm_io_iov_len_addr — the scratch region's `__wasi_ciovec_t.buf_len`
+ * field (4 bytes, right after `wasm_io_iov_base_addr`).
+ *
+ * @return u32  the scratch iovec `buf_len` field's own offset
+ */
+fn wasm_io_iov_len_addr() -> u32 {
+    4 to u32
+}
+
+/**
+ * wasm_io_nwritten_addr — the scratch region's `fd_write` OUT parameter
+ * (the bytes-written count WASI writes back; the MVP trampolines never
+ * read it — `fd_write`'s own `errno` RESULT is dropped too, M.4 — a fully
+ * honest MVP write path, not a hidden partial-write retry loop).
+ *
+ * @return u32  the scratch `nwritten` out-param's own offset
+ */
+fn wasm_io_nwritten_addr() -> u32 {
+    8 to u32
+}
+
+/**
+ * wasm_io_nl_byte_addr — the scratch region's single-byte trailing-newline
+ * buffer (`tk_println`/`tk_eprintln` write `0x0A` here, then point a
+ * SECOND one-byte iovec at it — the same scratch iovec fields get reused
+ * for this second `fd_write`, §6.2).
+ *
+ * @return u32  the scratch newline byte's own offset
+ */
+fn wasm_io_nl_byte_addr() -> u32 {
+    12 to u32
+}
+
+/**
+ * wasm_io_scratch_bytes — the whole io/panic scratch region's own byte
+ * size (the iovec's two `u32` fields + the `nwritten` out-param + the
+ * one-byte newline buffer, rounded up so the program's rodata — which
+ * starts right after it, `wasm_rodata_base` — keeps its own natural
+ * 8-byte alignment).
+ *
+ * @return u32  the scratch region's own byte size
+ */
+fn wasm_io_scratch_bytes() -> u32 {
+    16 to u32
+}
+
+/**
  * wasm_rodata_base — the fixed linear-memory offset the program's rodata
- * starts at (§6.1's "rodata at a fixed low base"): a small margin above
- * address `0` so no real datum ever lands at the null address.
+ * starts at (§6.1's "rodata at a fixed low base"): right after the
+ * io/panic trampolines' own scratch region (`wasm_io_scratch_bytes`), so no
+ * real datum ever lands at the null address and no rodata byte ever
+ * aliases the scratch iovec/newline buffer.
  *
  * @return u32  the rodata region's own base offset
  */
 fn wasm_rodata_base() -> u32 {
-    8 to u32
+    wasm_io_scratch_bytes()
 }
 
 /**
@@ -4621,6 +4685,276 @@ fn wasm_synth_start(type_index: u32, main_index: u32, proc_exit_index: u32, main
 }
 
 /**
+ * wasm_op_i32_const — append `i32.const v` (`0x41` then `v` SLEB128) — the
+ * shared opcode-emission primitive every C1-6 io/panic trampoline builds
+ * its scratch-address/immediate pushes from.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param i64 v  the constant value
+ * @return []byte  `buf` followed by the encoded instruction
+ */
+fn wasm_op_i32_const(buf: []byte, v: i64) -> []byte {
+    emit_sleb128(teko::list::push(buf, 0x41 to byte), v)
+}
+
+/**
+ * wasm_op_local_get — append `local.get idx` (`0x20` then the ULEB128
+ * local index).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 idx  the local index
+ * @return []byte  `buf` followed by the encoded instruction
+ */
+fn wasm_op_local_get(buf: []byte, idx: u32) -> []byte {
+    emit_uleb128(teko::list::push(buf, 0x20 to byte), idx to u64)
+}
+
+/**
+ * wasm_op_store32 — append `i32.store` at natural (4-byte) alignment,
+ * offset `0` (`0x36 0x02 0x00`) — every C1-6 trampoline store's memarg (the
+ * address is always already computed via a preceding `i32.const`, so the
+ * memarg's own offset immediate stays `0`).
+ *
+ * @param []byte buf  the buffer to extend
+ * @return []byte  `buf` followed by the encoded instruction
+ */
+fn wasm_op_store32(buf: []byte) -> []byte {
+    let b = teko::list::push(buf, 0x36 to byte)
+    let b2 = teko::list::push(b, 0x02 to byte)
+    teko::list::push(b2, 0x00 to byte)
+}
+
+/**
+ * wasm_op_store8 — append `i32.store8` at 1-byte alignment, offset `0`
+ * (`0x3A 0x00 0x00`) — the trailing-newline byte store.
+ *
+ * @param []byte buf  the buffer to extend
+ * @return []byte  `buf` followed by the encoded instruction
+ */
+fn wasm_op_store8(buf: []byte) -> []byte {
+    let b = teko::list::push(buf, 0x3A to byte)
+    let b2 = teko::list::push(b, 0x00 to byte)
+    teko::list::push(b2, 0x00 to byte)
+}
+
+/**
+ * wasm_op_call — append `call funcidx` (`0x10` then the ULEB128 function
+ * index).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 funcidx  the callee's absolute function index
+ * @return []byte  `buf` followed by the encoded instruction
+ */
+fn wasm_op_call(buf: []byte, funcidx: u32) -> []byte {
+    emit_uleb128(teko::list::push(buf, 0x10 to byte), funcidx to u64)
+}
+
+/**
+ * wasm_op_drop — append `drop` (`0x1A`).
+ *
+ * @param []byte buf  the buffer to extend
+ * @return []byte  `buf` followed by the encoded instruction
+ */
+fn wasm_op_drop(buf: []byte) -> []byte {
+    teko::list::push(buf, 0x1A to byte)
+}
+
+/**
+ * wasm_emit_fd_write_call — append one `fd_write(fd, iov_base_addr, 1,
+ * nwritten_addr)` call + a `drop` of its `errno` result (§6.2/§7, C1-6):
+ * the scratch iovec/nwritten fields (`wasm_io_iov_base_addr`/…) are
+ * assumed ALREADY populated by the caller.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u32 fd  the target WASI file descriptor (1 = stdout, 2 = stderr)
+ * @param u32 fd_write_index  the WASI `fd_write` import's own function
+ *                            index
+ * @return []byte  `buf` followed by the call + drop
+ */
+fn wasm_emit_fd_write_call(buf: []byte, fd: u32, fd_write_index: u32) -> []byte {
+    let b0 = wasm_op_i32_const(buf, fd to i64)
+    let b1 = wasm_op_i32_const(b0, wasm_io_iov_base_addr() to i64)
+    let b2 = wasm_op_i32_const(b1, 1 to i64)
+    let b3 = wasm_op_i32_const(b2, wasm_io_nwritten_addr() to i64)
+    let b4 = wasm_op_call(b3, fd_write_index)
+    wasm_op_drop(b4)
+}
+
+/**
+ * wasm_io_write_newline — the trailing-newline tail `wasm_synth_io_write`
+ * appends for `tk_println`/`tk_eprintln`: stage a single `0x0A` byte at
+ * `wasm_io_nl_byte_addr`, point the scratch iovec at it (length `1`), then
+ * a second `fd_write` call (§6.2, C1-6).
+ *
+ * @param []byte buf  the buffer to extend (after the first `fd_write`)
+ * @param u32 fd  the target WASI file descriptor
+ * @param u32 fd_write_index  the WASI `fd_write` import's own function
+ *                            index
+ * @return []byte  `buf` followed by the newline write
+ */
+fn wasm_io_write_newline(buf: []byte, fd: u32, fd_write_index: u32) -> []byte {
+    let b0 = wasm_op_i32_const(buf, wasm_io_nl_byte_addr() to i64)
+    let b1 = wasm_op_i32_const(b0, 10 to i64)
+    let b2 = wasm_op_store8(b1)
+    let b3 = wasm_op_i32_const(b2, wasm_io_iov_base_addr() to i64)
+    let b4 = wasm_op_i32_const(b3, wasm_io_nl_byte_addr() to i64)
+    let b5 = wasm_op_store32(b4)
+    let b6 = wasm_op_i32_const(b5, wasm_io_iov_len_addr() to i64)
+    let b7 = wasm_op_i32_const(b6, 1 to i64)
+    let b8 = wasm_op_store32(b7)
+    wasm_emit_fd_write_call(b8, fd, fd_write_index)
+}
+
+/**
+ * wasm_synth_io_write — the `fd_write`-backed trampoline for one io
+ * builtin (`tk_print`/`tk_println`/`tk_eprint`/`tk_eprintln`/`tk_write`/
+ * `tk_ewrite`, §7 WASI interop + C1-6 — this is the "runtime rides the
+ * WASI `fd_write` import" wiring `backend-wasm.md:775` names, killing the
+ * `own_print_exit` println gap): a `(ptr: i32, len: i32) -> ()` function
+ * that stores `(ptr, len)` into the scratch iovec, calls `fd_write(fd,
+ * …)` once, and — when `newline` — a SECOND `fd_write` of one `0x0A` byte
+ * staged at `wasm_io_nl_byte_addr`. `tk_write`/`tk_ewrite` are
+ * byte-identical to `tk_print`/`tk_eprint` (`teko_rt.c:1300-1303` — no
+ * newline, same fd), so the symbol table points BOTH names at the SAME
+ * funcidx rather than duplicating the body (`wasm_register_io_symbols`).
+ *
+ * @param u32 fd  the target WASI file descriptor (1 = stdout, 2 = stderr)
+ * @param bool newline  whether to append a trailing `'\n'` (`println`/
+ *                      `eprintln`)
+ * @param u32 type_index  the module's own `(i32, i32) -> ()` type-table
+ *                        index every io/panic trampoline shares
+ * @param u32 fd_write_index  the WASI `fd_write` import's own function
+ *                            index
+ * @return WasmFunc  the trampoline's code-section entry
+ */
+fn wasm_synth_io_write(fd: u32, newline: bool, type_index: u32, fd_write_index: u32) -> WasmFunc {
+    let b0 = wasm_op_i32_const(teko::list::empty(), wasm_io_iov_base_addr() to i64)
+    let b1 = wasm_op_local_get(b0, 0 to u32)
+    let b2 = wasm_op_store32(b1)
+    let b3 = wasm_op_i32_const(b2, wasm_io_iov_len_addr() to i64)
+    let b4 = wasm_op_local_get(b3, 1 to u32)
+    let b5 = wasm_op_store32(b4)
+    let b6 = wasm_emit_fd_write_call(b5, fd, fd_write_index)
+    let body = if newline { wasm_io_write_newline(b6, fd, fd_write_index) } else { b6 }
+    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = teko::list::push(body, 0x0B to byte) }
+}
+
+/**
+ * wasm_synth_panic_str — the `tk_panic_str` trampoline (§8, C1-6's panic
+ * host-import + trap): a `(ptr: i32, len: i32) -> ()` function that stores
+ * `(ptr, len)` into the scratch iovec, `fd_write`s the structured panic
+ * message to STDERR (fd `2` — the host OBSERVES it, §8 step 1 realized
+ * through the already-imported WASI `fd_write`, `backend-wasm.md:595`'s
+ * "the panic import can map to a fd_write of the message"), then
+ * `unreachable` (`0x00`) TRAPS the instance (§8 step 2, M.1 — observe +
+ * report, never recover). No return is ever reached — code after
+ * `unreachable` is unreachable-typed, so sharing the io writers' own
+ * `(i32,i32)->()` type never mismatches the operand stack.
+ *
+ * @param u32 type_index  the shared io/panic `(i32, i32) -> ()` type index
+ * @param u32 fd_write_index  the WASI `fd_write` import's own function
+ *                            index
+ * @return WasmFunc  the trampoline's code-section entry
+ */
+fn wasm_synth_panic_str(type_index: u32, fd_write_index: u32) -> WasmFunc {
+    let b0 = wasm_op_i32_const(teko::list::empty(), wasm_io_iov_base_addr() to i64)
+    let b1 = wasm_op_local_get(b0, 0 to u32)
+    let b2 = wasm_op_store32(b1)
+    let b3 = wasm_op_i32_const(b2, wasm_io_iov_len_addr() to i64)
+    let b4 = wasm_op_local_get(b3, 1 to u32)
+    let b5 = wasm_op_store32(b4)
+    let b6 = wasm_emit_fd_write_call(b5, 2 to u32, fd_write_index)
+    let b7 = teko::list::push(b6, 0x00 to byte)
+    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = teko::list::push(b7, 0x0B to byte) }
+}
+
+/**
+ * WasmIoPanicFuncs — the five synthesized io/panic trampolines (C1-6):
+ * `tk_print`/`tk_println`/`tk_eprint`/`tk_eprintln`/`tk_panic_str`, in this
+ * FIXED order — `wasm_assemble_program` appends them right after the
+ * program's own `LModule.funcs`, so each one's funcidx is `import_count +
+ * lmod.funcs.len + position` (`wasm_register_io_symbols`).
+ *
+ * @since #389 C1-6
+ */
+pub type WasmIoPanicFuncs = struct {
+    /**
+     * funcs — the five trampoline bodies, in the fixed `print, println,
+     * eprint, eprintln, panic_str` order.
+     */
+    funcs: []WasmFunc
+}
+
+/**
+ * wasm_synth_io_panic_funcs — build the five io/panic trampolines sharing
+ * ONE `(i32, i32) -> ()` type-table entry.
+ *
+ * @param u32 type_index  the shared io/panic type-table index
+ * @param u32 fd_write_index  the WASI `fd_write` import's own function
+ *                            index
+ * @return WasmIoPanicFuncs  the five trampoline bodies, fixed order
+ */
+fn wasm_synth_io_panic_funcs(type_index: u32, fd_write_index: u32) -> WasmIoPanicFuncs {
+    let stdout_fd = 1 to u32
+    let stderr_fd = 2 to u32
+    let p = wasm_synth_io_write(stdout_fd, false, type_index, fd_write_index)
+    let pln = wasm_synth_io_write(stdout_fd, true, type_index, fd_write_index)
+    let ep = wasm_synth_io_write(stderr_fd, false, type_index, fd_write_index)
+    let epln = wasm_synth_io_write(stderr_fd, true, type_index, fd_write_index)
+    let pan = wasm_synth_panic_str(type_index, fd_write_index)
+    WasmIoPanicFuncs { funcs = [p, pln, ep, epln, pan] }
+}
+
+/**
+ * wasm_register_io_symbols — register the five synthesized trampolines'
+ * runtime symbols into `t`: `tk_print`/`tk_write` and `tk_eprint`/
+ * `tk_ewrite` share a funcidx pair (`teko_rt.c:1300-1303`'s own identical
+ * bodies), `tk_println`/`tk_eprintln` get their own, and `tk_panic_str`
+ * closes the set (§8).
+ *
+ * @param WasmSymbolTable t  the table to extend
+ * @param u32 base_index  the first trampoline's own funcidx (`print`'s) —
+ *                        the remaining four follow at `base_index+1..+4`,
+ *                        matching `wasm_synth_io_panic_funcs`'s fixed order
+ * @return WasmSymbolTable  the extended table
+ */
+fn wasm_register_io_symbols(t: WasmSymbolTable, base_index: u32) -> WasmSymbolTable {
+    let print_ix = base_index
+    let println_ix = base_index + (1 to u32)
+    let eprint_ix = base_index + (2 to u32)
+    let eprintln_ix = base_index + (3 to u32)
+    let panic_ix = base_index + (4 to u32)
+    let vt = lir::LType::Void
+    mut out = wasm_symtab_add(t, "tk_print", WasmCallTarget { func_index = print_ix; ret_type = vt })
+    out = wasm_symtab_add(out, "tk_write", WasmCallTarget { func_index = print_ix; ret_type = vt })
+    out = wasm_symtab_add(out, "tk_println", WasmCallTarget { func_index = println_ix; ret_type = vt })
+    out = wasm_symtab_add(out, "tk_eprint", WasmCallTarget { func_index = eprint_ix; ret_type = vt })
+    out = wasm_symtab_add(out, "tk_ewrite", WasmCallTarget { func_index = eprint_ix; ret_type = vt })
+    out = wasm_symtab_add(out, "tk_eprintln", WasmCallTarget { func_index = eprintln_ix; ret_type = vt })
+    wasm_symtab_add(out, "tk_panic_str", WasmCallTarget { func_index = panic_ix; ret_type = vt })
+}
+
+/**
+ * append_wasm_funcs — append every entry of `src` to `funcs`, in order
+ * (`[]WasmFunc` has no built-in concat; mirrors `encode_arm64.tks`'s
+ * `append_bytes` shape over a different element type).
+ *
+ * @param []WasmFunc funcs  the list to extend
+ * @param []WasmFunc src  the entries to append
+ * @return []WasmFunc  `funcs` followed by `src`
+ */
+fn append_wasm_funcs(funcs: []WasmFunc, src: []WasmFunc) -> []WasmFunc {
+    mut out = funcs
+    mut i: u64 = 0
+    loop {
+        if i >= src.len { break }
+        out = teko::list::push(out, src[i])
+        i++
+    }
+    out
+}
+
+/**
  * wasm_program_has_any_frame — does ANY function in `funcs` need the
  * shared shadow-stack `SP` global (at least one `LAlloca` site, §6.1)? A
  * module declares the `SP` global (index `0`, `wasm_sp_global_index`) iff
@@ -4716,23 +5050,41 @@ fn wasm_program_data_segments(rodata: WasmRodataLayout) -> []WasmDataSegment {
 }
 
 /**
+ * wasm_io_base_index — the first io/panic trampoline's own absolute funcidx
+ * (`wasm_synth_io_panic_funcs`'s fixed `print, println, eprint, eprintln,
+ * panic_str` order starts here): right after every `LModule.funcs` entry,
+ * in the shared import-then-defined function index space
+ * (`wasm_program_func_index`).
+ *
+ * @param WasmWasiImportSet wasi  the WASI import set (its own import count)
+ * @param LModule lmod  the whole lowered program (its own `funcs` count)
+ * @return u32  the first trampoline's own absolute funcidx
+ */
+fn wasm_io_base_index(wasi: WasmWasiImportSet, lmod: lir::LModule) -> u32 {
+    wasm_program_func_index(wasi.imports.len, lmod.funcs.len)
+}
+
+/**
  * wasm_assemble_program — the whole own-backend wasm module assembler
  * (C1-5's "link/dispatch" job every earlier slice deferred here,
  * `backend-c1-wasm.md` §5.2/§9): the program's rodata laid out FIRST and
  * registered into the symbol table (`wasm_symtab_add_rodata`) — an
  * `LGlobalAddr` site resolves through the SAME table `stackify_func`
  * reads, so this must happen BEFORE any function is stackified, not after
- * — then every `LModule.funcs` entry stackified in place (`wasm_build_
- * program_funcs`), the WASI import set wired in (`wasm_wasi_import_set`),
- * the synthesized `_start` command entry point appended and EXPORTED (the
- * owner's own C1-5 invariant — a wasm command module MUST export `_start`,
- * §9's doc, `wasm_synth_start`), and the whole program's linear memory
- * sized around the ALREADY-LAID-OUT rodata (`wasm_program_memory_plan`).
- * Returns the NAMED `C1-globals` honest-stop when `lmod.globals` is
- * non-empty (mirrors A4-4's own guard, `wasm_honest_globals`) before
- * touching anything else, and propagates any per-function honest-stop
- * unchanged (`C1-i128`/`C1-f16`/`C1-irreducible`/an unresolved call/data
- * symbol).
+ * — the five C1-6 io/panic trampolines' own symbols registered ALONGSIDE
+ * the program's own (`wasm_register_io_symbols`, so a Teko function
+ * calling `println`/`panic` resolves them too), then every `LModule.funcs`
+ * entry stackified in place (`wasm_build_program_funcs`), the WASI import
+ * set wired in (`wasm_wasi_import_set`), the trampolines themselves
+ * appended (`wasm_synth_io_panic_funcs`, §7/§8), the synthesized `_start`
+ * command entry point appended LAST and EXPORTED (the owner's own C1-5
+ * invariant — a wasm command module MUST export `_start`, §9's doc,
+ * `wasm_synth_start`), and the whole program's linear memory sized around
+ * the ALREADY-LAID-OUT rodata (`wasm_program_memory_plan`). Returns the
+ * NAMED `C1-globals` honest-stop when `lmod.globals` is non-empty (mirrors
+ * A4-4's own guard, `wasm_honest_globals`) before touching anything else,
+ * and propagates any per-function honest-stop unchanged
+ * (`C1-i128`/`C1-f16`/`C1-irreducible`/an unresolved call/data symbol).
  *
  * @param LModule lmod  the whole lowered program
  * @return WasmModule | error  the assembled module, ready for `emit_wasm`,
@@ -4744,19 +5096,26 @@ pub fn wasm_assemble_program(lmod: lir::LModule) -> WasmModule | error {
     }
     let wasi = wasm_wasi_import_set()
     let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
-    let symtab = wasm_symtab_add_rodata(wasm_register_program_symbols(wasi, lmod.funcs), rodata)
+    let io_base_index = wasm_io_base_index(wasi, lmod)
+    let program_symtab = wasm_register_io_symbols(wasm_register_program_symbols(wasi, lmod.funcs), io_base_index)
+    let symtab = wasm_symtab_add_rodata(program_symtab, rodata)
     let types = match wasm_build_program_types(wasi, lmod.funcs) { []WasmFuncType as t => t; error as e => return e }
     let funcs = match wasm_build_program_funcs(wasi, lmod.funcs, symtab) { []WasmFunc as f => f; error as e => return e }
+    let io_type_index = types.len to u32
+    let io_type = WasmFuncType { params = [0x7F to byte, 0x7F to byte]; results = teko::list::empty() }
+    let types_with_io = teko::list::push(types, io_type)
+    let io_panic = wasm_synth_io_panic_funcs(io_type_index, wasi.fd_write_index)
+    let funcs_with_io = append_wasm_funcs(funcs, io_panic.funcs)
     let main_index = match wasm_find_main_index(wasi, lmod.funcs) { u32 as x => x; error as e => return e }
     let main_ret = match wasm_find_main_ret(lmod.funcs) { lir::LType as x => x; error as e => return e }
-    let start_type_index = types.len to u32
+    let start_type_index = types_with_io.len to u32
     let start = match wasm_synth_start(start_type_index, main_index, wasi.proc_exit_index, main_ret) { WasmFunc as s => s; error as e => return e }
-    let start_index = wasm_program_func_index(wasi.imports.len, lmod.funcs.len)
+    let start_index = io_base_index + (io_panic.funcs.len to u32)
     let plan = wasm_program_memory_plan(lmod, rodata)
     WasmModule {
-        types = teko::list::push(types, WasmFuncType { params = teko::list::empty(); results = teko::list::empty() })
+        types = teko::list::push(types_with_io, WasmFuncType { params = teko::list::empty(); results = teko::list::empty() })
         imports = wasi.imports
-        funcs = teko::list::push(funcs, start)
+        funcs = teko::list::push(funcs_with_io, start)
         globals = plan.globals
         data = wasm_program_data_segments(plan.rodata)
         mem_min_pages = plan.mem_min_pages
