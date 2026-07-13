@@ -327,6 +327,34 @@ fn lwt_lowers_if_stmt_without_else_via_branch_and_merge() {
 }
 
 #test
+/**
+ * lwt_if_stmt_then_arm_keeps_its_own_interned_rodata — an else-less
+ * if-statement whose THEN arm interns a fresh rodata entry (a `println`
+ * call's string literal). Regression for a genuine miscompile: prior to the
+ * C1-6 audit, `lower_if_stmt`'s no-else `else_ctx`/final context were built
+ * from the PRE-BRANCH `ctx`, so `ctx_with`'s field-copy silently DROPPED the
+ * THEN arm's own rodata growth even though nothing in the else side ever ran
+ * — the same class of bug `lower_coalesce` had. Asserts the rodata entry AND
+ * the call survive past the merge.
+ *
+ * @return void
+ */
+fn lwt_if_stmt_then_arm_keeps_its_own_interned_rodata() {
+    let a = lwt_var("a", checker::PrimKind::I64)
+    let b = lwt_var("b", checker::PrimKind::I64)
+    let cond = lwt_cmp(a, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, b)))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_str_call1("println", "only-in-then")))
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("a", "i64")), lwt_param("b", "i64"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(ifstmt)), lwt_ret(b))
+    let f = lwt_fn("announce", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_println(")
+}
+
+#test
 fn lwt_lowers_if_expr_merges_with_a_block_arg() {
     let x = lwt_var("x", checker::PrimKind::I64)
     let y = lwt_var("y", checker::PrimKind::I64)
@@ -343,6 +371,35 @@ fn lwt_lowers_if_expr_merges_with_a_block_arg() {
     teko::assert::str_contains(text, "  #B1:\n    jump #B3(%0)")
     teko::assert::str_contains(text, "  #B2:\n    jump #B3(%1)")
     teko::assert::str_contains(text, "  #B3(%3):\n    ret %3")
+}
+
+#test
+/**
+ * lwt_if_value_then_arm_keeps_its_own_interned_rodata — a value-producing
+ * if-expression whose THEN arm interns a fresh rodata entry (a `println`
+ * call's string literal) as an EFFECT statement before its own tail value.
+ * Regression for the same C1-6 miscompile class as `lower_coalesce`'s: prior
+ * to the audit, `lower_if_value`'s `else_ctx`/final context were built from
+ * the PRE-BRANCH `ctx`, dropping the THEN arm's rodata growth even though
+ * the ELSE arm never ran. Asserts the rodata entry AND the call survive past
+ * the merge.
+ *
+ * @return void
+ */
+fn lwt_if_value_then_arm_keeps_its_own_interned_rodata() {
+    let x = lwt_var("x", checker::PrimKind::I64)
+    let y = lwt_var("y", checker::PrimKind::I64)
+    let cond = lwt_cmp(x, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, y)))
+    let then_blk = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_str_call1("println", "only-in-then"))), lwt_exprstmt(x))
+    let else_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(y))
+    let ifexpr = lwt_if_value(cond, then_blk, else_blk, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("x", "i64")), lwt_param("y", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(ifexpr))
+    let f = lwt_fn("announce_pick", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_println(")
 }
 
 #test
@@ -624,6 +681,36 @@ fn lwt_lowers_match_value_scalar_arms_via_icmpeq() {
 }
 
 #test
+/**
+ * lwt_match_value_arm_keeps_its_own_interned_rodata — a value-producing
+ * `match` whose FIRST arm interns a fresh rodata entry (a `println` call's
+ * string literal) as an EFFECT statement before its own tail value; its
+ * other arms never run it. Regression for the same C1-6 miscompile class as
+ * `lower_coalesce`'s, spanning both `lower_match_arm_value` (the per-arm
+ * fold step) and `lower_match_value` (the final fallback-block context):
+ * either one sourcing its returned/final context from a stale pre-arm `ctx`
+ * would silently DROP the arm's rodata growth. Asserts the rodata entry AND
+ * the call survive past the merge.
+ *
+ * @return void
+ */
+fn lwt_match_value_arm_keeps_its_own_interned_rodata() {
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let arm0_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_str_call1("println", "only-in-arm0"))), lwt_exprstmt(lwt_num_i64(10 to i128)))
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), arm0_body)
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(match_expr))
+    let f = lwt_fn("announce_pick2", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_println(")
+}
+
+#test
 fn lwt_lowers_match_enum_member_pattern_via_registered_ordinal() {
     let subject = lwt_typed_var("c", checker::Named { name = "Color" })
     let arm0 = lwt_arm(lwt_bind_pattern("Red", ""), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(10 to i128))))
@@ -716,6 +803,34 @@ fn lwt_lowers_match_statement_merges_with_zero_block_args() {
     teko::assert::str_contains(text, "call @teko__demo__track(")
     teko::assert::is_true(!teko::str::contains(text, "#B1(%"))
     teko::assert::str_contains(text, "jump #B1()")
+}
+
+#test
+/**
+ * lwt_match_stmt_arm_keeps_its_own_interned_rodata — a STATEMENT-position
+ * `match` whose FIRST arm interns a fresh rodata entry (a `println` call's
+ * string literal); its wildcard fallback arm never runs it. Regression for
+ * the same C1-6 miscompile class as `lower_coalesce`'s, spanning both
+ * `lower_match_arm_stmt` (the per-arm fold step) and `lower_match_stmt` (the
+ * final merge context): either one sourcing its returned/final context from
+ * a stale pre-arm `ctx` would silently DROP the arm's rodata growth. Asserts
+ * the rodata entry AND the call survive past the merge.
+ *
+ * @return void
+ */
+fn lwt_match_stmt_arm_keeps_its_own_interned_rodata() {
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_str_call1("println", "only-in-arm0"))))
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_stmt = checker::TExpr { kind = checker::TMatchExpr { subject = subject; arms = arms }; type = checker::Void { }; line = 0; col = 0 }
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(match_stmt)), lwt_ret(lwt_num_i64(0 to i128)))
+    let f = lwt_fn("announce_match_stmt", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_println(")
 }
 
 #test

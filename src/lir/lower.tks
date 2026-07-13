@@ -2005,7 +2005,13 @@ fn lower_if_expr(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr) -> Lower
 
 /** lower_if_stmt — the Void (no-value) shape: both arms lower their statement block for
     effect only and merge with zero block-args; a missing `else` is a pass-through arm (jumps
-    straight to the merge). */
+    straight to the merge). The else-arm's own context, and the final merged context, are
+    built from `then_done`/`else_done` (the ARM-THREADED context each arm's own lowering
+    actually produced), NEVER from the pre-branch `ctx` — `ctx_with` only OVERRIDES `func`/
+    `block_id`/`env` and copies every other field (rodata, lifted closures, …) from its FIRST
+    argument, so sourcing either point from `ctx` would SILENTLY DROP whatever an arm interned
+    (a genuine miscompile: a `global_addr` relocation against a symbol whose definition never
+    reached the module — the SAME class of bug `lower_coalesce` had, C1-6 audit). */
 fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vreg: u32) -> Lowered | error {
     let thenb = alloc_block(ctx.func)
     let elseb = alloc_block(thenb.func)
@@ -2014,15 +2020,17 @@ fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vre
     let ctx1 = ctx_append(ctx_with(ctx, mergeblk.func, ctx.block_id, ctx.env), br)
     let then_done = match lower_block(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerCtx as c => c; error as err => return err }
     let then_func = close_arm_to(then_done, mergeblk.block_id, teko::list::empty(), e.line, e.col)
-    let else_ctx = ctx_with(ctx, then_func, elseb.block_id, ctx.env)
+    let else_ctx = ctx_with(then_done, then_func, elseb.block_id, ctx.env)
     let else_done = if f.has_else { match lower_block(else_ctx, f.else_blk) { LowerCtx as c => c; error as err => return err } } else { else_ctx }
     let else_func = close_arm_to(else_done, mergeblk.block_id, teko::list::empty(), e.line, e.col)
-    Lowered { ctx = ctx_with(ctx, else_func, mergeblk.block_id, ctx.env); vreg = 0 }
+    Lowered { ctx = ctx_with(else_done, else_func, mergeblk.block_id, ctx.env); vreg = 0 }
 }
 
 /** lower_if_value — the value-producing shape: both arms' TAIL values become the merge
     block's single block-arg (the if-expression's result VReg). An if-without-else used as a
-    value is out of the N1 subset (mirrors emit_if_value's own honest-stop). */
+    value is out of the N1 subset (mirrors emit_if_value's own honest-stop). Mirrors
+    `lower_if_stmt`'s own arm-threading discipline: `else_ctx` and the final merged context
+    are built from `then_val.ctx`/`else_val.ctx`, never the pre-branch `ctx` (C1-6 audit). */
 fn lower_if_value(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vreg: u32) -> Lowered | error {
     if !f.has_else { return error { message = "native backend N1: if-without-else used as a value not yet lowered (N2)" } }
     let thenb = alloc_block(ctx.func)
@@ -2034,11 +2042,11 @@ fn lower_if_value(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vr
     let then_val = match lower_block_value(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerBlockValue as x => x; error as err => return err }
     let then_args = teko::list::push(teko::list::empty(), then_val.vreg)
     let then_func = close_arm_to(then_val.ctx, mergeblk.block_id, then_args, e.line, e.col)
-    let else_ctx = ctx_with(ctx, then_func, elseb.block_id, ctx.env)
+    let else_ctx = ctx_with(then_val.ctx, then_func, elseb.block_id, ctx.env)
     let else_val = match lower_block_value(else_ctx, f.else_blk) { LowerBlockValue as x => x; error as err => return err }
     let else_args = teko::list::push(teko::list::empty(), else_val.vreg)
     let else_func = close_arm_to(else_val.ctx, mergeblk.block_id, else_args, e.line, e.col)
-    Lowered { ctx = ctx_with(ctx, else_func, mergeblk.block_id, ctx.env); vreg = mp.vreg }
+    Lowered { ctx = ctx_with(else_val.ctx, else_func, mergeblk.block_id, ctx.env); vreg = mp.vreg }
 }
 
 /** unwrap_optional — the inner `T` of an `Optional<T>`; any other type is already unwrapped
@@ -2780,13 +2788,19 @@ fn lower_match_guard(ctx: LowerCtx, arm: checker::TArm, next_block: u32) -> Matc
  * @param u32 merge_id  the merge block id the arm's tail value jumps to
  * @return LowerCtx  the context positioned at the next-arm test block
  * @throws  when the arm's entry or body fails to lower
+ *
+ * @implNote the returned context is built from `bv.ctx` (the arm's own
+ * BODY-threaded context), never the incoming `ctx` — `ctx_with` copies
+ * rodata/lifted-closures from its first argument, so sourcing from `ctx`
+ * would drop whatever the arm's test/guard/body interned (the SAME class
+ * of bug `lower_coalesce`/`lower_if_value` had, C1-6 audit).
  */
 fn lower_match_arm_value(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj, merge_id: u32) -> LowerCtx | error {
     let step = match lower_match_arm_entry(ctx, e, arm, subj) { MatchArmEntry as x => x; error as err => return err }
     let bv = match lower_block_value(step.ctx, arm.body) { LowerBlockValue as x => x; error as err => return err }
     let args = teko::list::push(teko::list::empty(), bv.vreg)
     let closed = close_arm_to(bv.ctx, merge_id, args, e.line, e.col)
-    ctx_with(ctx, closed, step.next_block, ctx.env)
+    ctx_with(bv.ctx, closed, step.next_block, ctx.env)
 }
 
 /**
@@ -2833,6 +2847,11 @@ fn lower_match_arms_value(ctx: LowerCtx, e: checker::TExpr, arms: []checker::TAr
  * @return Lowered  the advanced context (positioned at the merge block) + its
  *                  result VReg
  * @throws  when any arm fails to lower
+ *
+ * @implNote C1-6 audit: the final context is sourced from `with_zero` (the
+ *           fallback-block context, which itself carries every arm's rodata
+ *           and lifted-closure growth via `chain`), never the stale
+ *           pre-lowering `ctx` — mirrors the `lower_coalesce` fix.
  */
 fn lower_match_value(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, subj: MatchSubj) -> Lowered | error {
     let mergeb = alloc_block(ctx.func)
@@ -2843,7 +2862,7 @@ fn lower_match_value(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, s
     let with_zero = ctx_append(fb.ctx, const_int_inst(fb.vreg, 0 to i128, e.line, e.col))
     let fallback_args = teko::list::push(teko::list::empty(), fb.vreg)
     let closed = append_inst(with_zero.func, with_zero.block_id, jump_inst(mergeb.block_id, fallback_args, e.line, e.col))
-    Lowered { ctx = ctx_with(ctx, closed, mergeb.block_id, ctx.env); vreg = mp.vreg }
+    Lowered { ctx = ctx_with(with_zero, closed, mergeb.block_id, ctx.env); vreg = mp.vreg }
 }
 
 /**
@@ -2859,12 +2878,18 @@ fn lower_match_value(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, s
  * @param u32 merge_id  the merge block id the arm jumps to after its body
  * @return LowerCtx  the context positioned at the next-arm test block
  * @throws  when the arm's entry or body fails to lower
+ *
+ * @implNote C1-6 audit: the returned context is sourced from `done` (the
+ *           post-body context, which carries this arm's rodata and
+ *           lifted-closure growth), never the stale pre-arm `ctx` — otherwise
+ *           `lower_match_arms_stmt`'s fold would drop each arm's growth in
+ *           turn, mirroring the `lower_coalesce` fix.
  */
 fn lower_match_arm_stmt(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj, merge_id: u32) -> LowerCtx | error {
     let step = match lower_match_arm_entry(ctx, e, arm, subj) { MatchArmEntry as x => x; error as err => return err }
     let done = match lower_block(step.ctx, arm.body) { LowerCtx as c => c; error as err => return err }
     let closed = close_arm_to(done, merge_id, teko::list::empty(), e.line, e.col)
-    ctx_with(ctx, closed, step.next_block, ctx.env)
+    ctx_with(done, closed, step.next_block, ctx.env)
 }
 
 /**
@@ -2906,13 +2931,18 @@ fn lower_match_arms_stmt(ctx: LowerCtx, e: checker::TExpr, arms: []checker::TArm
  * @return Lowered  the advanced context (positioned at the merge block); `vreg`
  *                  unused
  * @throws  when any arm fails to lower
+ *
+ * @implNote C1-6 audit: the final context is sourced from `chain` (the
+ *           fold's result, carrying every arm's rodata and lifted-closure
+ *           growth), never the stale pre-lowering `ctx` — mirrors the
+ *           `lower_coalesce` fix.
  */
 fn lower_match_stmt(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, subj: MatchSubj) -> Lowered | error {
     let mergeb = alloc_block(ctx.func)
     let base_ctx = ctx_with(ctx, mergeb.func, ctx.block_id, ctx.env)
     let chain = match lower_match_arms_stmt(base_ctx, e, m.arms, subj, mergeb.block_id) { LowerCtx as c => c; error as err => return err }
     let closed = append_inst(chain.func, chain.block_id, jump_inst(mergeb.block_id, teko::list::empty(), e.line, e.col))
-    Lowered { ctx = ctx_with(ctx, closed, mergeb.block_id, ctx.env); vreg = 0 }
+    Lowered { ctx = ctx_with(chain, closed, mergeb.block_id, ctx.env); vreg = 0 }
 }
 
 /**
