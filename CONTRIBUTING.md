@@ -4,24 +4,24 @@ Thanks for your interest! Teko is a young, fast-moving project with a few **non-
 
 ## The invariants
 
-### 1. The SUPREME RULE — zero `.c`/`.h` ↔ `.tks` misalignment
+### 1. Native is the sole engine (ruling 2026-07-13, #524)
 
-**Teko-only (ruling 2026-07-04):** the compiler's canonical source is Teko (`src/**/*.tks`) and ALL new work is implemented in Teko only. The C23 files (`src/**/*.{c,h}` except the runtime) are the FROZEN historical bootstrap — do NOT extend them for new features; the bootstrap seed is the previous released `teko` binary (or the released `teko-bootstrap-src` any-cc snapshot). The one exception is `src/runtime/teko_rt.{c,h}` (and `src/assert/assert.{c,h}`): the execution runtime linked into generated programs stays maintained C — it is the FFI seam, not mirrored compiler logic. Until CI seeds from the released binary, compiler sources must not USE a new language feature in their own code (implement feature X written in the pre-X feature set; the corpus may adopt X once a seed containing X exists).
+**VM retired:** the compiler's canonical source is Teko (`src/**/*.tks`), and the C23 bootstrap files (`src/**/*.{c,h}` except the runtime) are archived at tag `0.0.1.3-bootstrap`. All new work is written in Teko only; do NOT extend the frozen C bootstrap. The one exception is `src/runtime/teko_rt.{c,h}` (and `src/assert/assert.{c,h}`): the execution runtime linked into generated programs stays maintained C — it is the FFI seam for native binaries. CI seeds from the latest released `teko` binary; compiler sources must not USE a new language feature before a seed containing it exists (implement feature X in pre-X syntax; the corpus adopts X once a seed has it).
 
-### 2. Differential equivalence — VM == native
+### 2. Native verification gate
 
-Every validated change must behave identically on the VM (`teko run`/`teko test`) and in native output (`teko build`). Regression examples in `examples/` encode expected exit codes for both engines.
+Every validated change must pass the native gate (`teko test .` with coverage). Regression examples in `examples/` encode expected exit codes for native execution.
 
-### 3. Verify BOTH engines + the self-host fixpoint
+### 3. Verify native build + the self-host fixpoint
 
 Before marking work done:
 
 ```sh
-./build/teko build . -o bin          # C bootstrap engine, runs the .tkt test gate
-./bin/teko  build . -o /tmp/gen2     # self-hosted engine, same gate through vm.tks
+./bin/teko build . -o /tmp/gen1      # self-hosted engine gen-1
+./bin/teko test .                     # run the full test gate (native) with coverage enforced
 ```
 
-The two generated C outputs must be byte-identical after gensym normalization, and gen-2 == gen-3 exactly. See [docs/BUILDING.md](docs/BUILDING.md) §5.
+The generated C output (gen-2 from gen-1 rebuilt) must match gen-1 exactly (fixpoint). See [docs/BUILDING.md](docs/BUILDING.md) §5.
 
 ### 4. Law-first design
 
@@ -38,7 +38,7 @@ Language-design tensions are resolved by the laws in [TEKO_CONSTITUTION.md](TEKO
 
 - Compiler tests are Teko functions annotated `#test`, in files ending `.tkt`, run by `teko test .`.
 - `teko build` runs the test gate before codegen and enforces the coverage floors in `teko.tkp` — a PR that drops coverage below the floor will not build.
-- New language features need a regression example under `examples/regressions/<name>/` (a `.tkp` + sources whose exit code proves the behavior), verified on **both** engines.
+- New language features need a regression example under `examples/regressions/<name>/` (a `.tkp` + sources whose exit code proves the behavior), verified natively.
 
 ## Style
 
