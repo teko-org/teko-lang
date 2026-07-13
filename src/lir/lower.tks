@@ -1856,19 +1856,25 @@ fn contains_str(xs: []str, s: str) -> bool {
 /**
  * collect_reassigned_stmts — accumulate into `acc` the target of every
  * `TAssign` of `AssignKind::Simple` reachable in `stmts`, DESCENDING into the
- * statement blocks of a nested statement-form `if`/`match` and a `loop`. A
- * reassignment buried one control-flow level down still rebinds the
- * enclosing scalar PAST that inner merge, so the OUTER merge must carry it
- * too — the SAME drop, one level in. Expression-position `if`/`match` values
- * are not walked: their own lowering threads any reassignment through their
- * own merge before this branch's merge is ever reached. A `defer` body is
- * NOT descended into (review round 1, Finding 1): an arm's closing jump-args
- * are sampled from its env BEFORE `close_arm_replaying_defers` replays the
- * defer body, so a reassignment inside a defer can never reach the merge
- * param with its post-defer value — threading one would only mint a
- * spurious param carrying the STALE pre-defer VReg, fixing nothing. Real
- * defer-write propagation is a separate, pre-existing gap (tracked as F1b),
- * not this fix (#389 F1).
+ * statement blocks of a nested statement-form `if`/`match`, a `loop`, a
+ * `defer` body, AND the value-position `if`/`match` RHS of a `let`/`mut`
+ * binding. A reassignment buried one control-flow level down still rebinds the
+ * enclosing scalar PAST that inner merge, so the OUTER merge must carry it too
+ * — the SAME drop, one level in.
+ *
+ * A `defer` body IS descended (#389 F1b item 1): a statement-arm's closing
+ * jump-args are now re-sampled from the POST-`replay_defers` env
+ * (`close_arm_replaying_defers`), so a scalar a defer body reassigns reaches
+ * the merge param with its POST-defer value — the descent is a REAL fix, not
+ * the stale param F1 removed it to avoid (F1 sampled the args PRE-replay, so a
+ * defer descent then would only have minted a param carrying the stale
+ * pre-defer VReg).
+ *
+ * A binding's value-position `if`/`match` RHS IS descended (#389 F1b item 2):
+ * `if outer { let y = if inner { x = 5; x } else { 0 } }` reassigns the
+ * enclosing `x` inside the INNER value-if, which threads `x` through its OWN
+ * merge — but the OUTER statement merge still reads `x` past it, so the outer
+ * merge must carry `x` too or the rebind is DROPPED at the outer merge.
  *
  * @param []checker::TStatement stmts  the statement block to scan
  * @param []str acc  the assignment targets gathered so far
@@ -1888,10 +1894,10 @@ fn collect_reassigned_stmts(stmts: []checker::TStatement, acc: []str) -> []str {
 /**
  * collect_reassigned_stmt — one statement's contribution to the
  * reassigned-target scan: a `Simple` `TAssign` yields its `name`; a
- * statement-form `if`/`match` (a `TExprStmt`) and a `loop` recurse into their
- * own statement blocks; every other statement — INCLUDING a `defer` (review
- * round 1, Finding 1; see `collect_reassigned_stmts`'s doc) — contributes
- * nothing (#389 F1).
+ * `let`/`mut` `TBinding` descends into its value-position `if`/`match` RHS
+ * (#389 F1b item 2); a statement-form `if`/`match` (a `TExprStmt`), a `loop`,
+ * and a `defer` body (#389 F1b item 1) recurse into their own statement
+ * blocks; every other statement contributes nothing (#389 F1).
  *
  * @param checker::TStatement s  the statement to scan
  * @param []str acc  the assignment targets gathered so far
@@ -1901,8 +1907,10 @@ fn collect_reassigned_stmts(stmts: []checker::TStatement, acc: []str) -> []str {
 fn collect_reassigned_stmt(s: checker::TStatement, acc: []str) -> []str {
     match s {
         checker::TAssign as a => match a.kind { parser::AssignKind::Simple => teko::list::push(acc, a.name); _ => acc }
+        checker::TBinding as b => collect_reassigned_value_expr(b.value, acc)
         checker::TExprStmt as es => collect_reassigned_expr_stmt(es.expr, acc)
         checker::TLoopStmt as l => collect_reassigned_stmts(l.body, collect_reassigned_stmts(l.init, acc))
+        checker::TDeferStmt as d => collect_reassigned_stmts(d.body, acc)
         _ => acc
     }
 }
@@ -1919,6 +1927,26 @@ fn collect_reassigned_stmt(s: checker::TStatement, acc: []str) -> []str {
  *                assignments
  */
 fn collect_reassigned_expr_stmt(e: checker::TExpr, acc: []str) -> []str {
+    match e.kind {
+        checker::TIfExpr as f => collect_reassigned_if(f, acc)
+        checker::TMatchExpr as m => collect_reassigned_match(m, acc)
+        _ => acc
+    }
+}
+
+/**
+ * collect_reassigned_value_expr — the reassigned-target scan of a binding's
+ * value-position expression: only a value-form `if`/`match` bears arm blocks
+ * whose reassignments escape into the enclosing scope PAST their own merge, so
+ * the OUTER statement merge must carry them too; any other expression kind
+ * contributes nothing (#389 F1b item 2).
+ *
+ * @param checker::TExpr e  the binding's initializer expression
+ * @param []str acc  the assignment targets gathered so far
+ * @return []str  `acc` extended with the value-if/match RHS's simple
+ *                assignments
+ */
+fn collect_reassigned_value_expr(e: checker::TExpr, acc: []str) -> []str {
     match e.kind {
         checker::TIfExpr as f => collect_reassigned_if(f, acc)
         checker::TMatchExpr as m => collect_reassigned_match(m, acc)
@@ -1978,12 +2006,13 @@ fn bind_target_names(t: parser::BindTarget) -> []str {
 /**
  * collect_bound_stmts — accumulate into `acc` every name a `let`/`mut`
  * `TBinding` introduces anywhere reachable in `stmts`, descending the SAME
- * statement-form `if`/`match`/`loop` shapes `collect_reassigned_stmts` walks
- * (never a `defer` body, symmetric with that scan). This is the
- * shadow-exclusion guard's raw material (review round 1, Finding 2): a name
- * this collects is one some arm REBINDS to a fresh, block-scoped local, so a
- * same-named `TAssign` anywhere in that arm's reach may be reassigning the
- * SHADOW, not the enclosing scalar (#389 F1).
+ * statement-form `if`/`match`/`loop`/`defer`/binding-RHS shapes
+ * `collect_reassigned_stmts` walks (kept symmetric so a shadow is seen
+ * WHEREVER a reassignment is). This is the shadow-exclusion guard's raw
+ * material (review round 1, Finding 2): a name this collects is one some arm
+ * REBINDS to a fresh, block-scoped local, so a same-named `TAssign` anywhere
+ * in that arm's reach may be reassigning the SHADOW, not the enclosing scalar
+ * (#389 F1).
  *
  * @param []checker::TStatement stmts  the statement block to scan
  * @param []str acc  the bound names gathered so far
@@ -2001,10 +2030,13 @@ fn collect_bound_stmts(stmts: []checker::TStatement, acc: []str) -> []str {
 }
 
 /**
- * collect_bound_stmt — one statement's contribution to the bound-name scan:
- * a `TBinding` yields its target's names; a statement-form `if`/`match` (a
- * `TExprStmt`) and a `loop` recurse into their own statement blocks; every
- * other statement contributes nothing (#389 F1).
+ * collect_bound_stmt — one statement's contribution to the bound-name scan: a
+ * `TBinding` yields its target's names AND descends into its value-position
+ * `if`/`match` RHS (a shadow inside a bound value-if, symmetric with the
+ * reassigned scan's own RHS descent, #389 F1b item 2); a statement-form
+ * `if`/`match` (a `TExprStmt`), a `loop`, and a `defer` body recurse into
+ * their own statement blocks; every other statement contributes nothing
+ * (#389 F1).
  *
  * @param checker::TStatement s  the statement to scan
  * @param []str acc  the bound names gathered so far
@@ -2012,9 +2044,29 @@ fn collect_bound_stmts(stmts: []checker::TStatement, acc: []str) -> []str {
  */
 fn collect_bound_stmt(s: checker::TStatement, acc: []str) -> []str {
     match s {
-        checker::TBinding as b => append_all_str(acc, bind_target_names(b.target))
+        checker::TBinding as b => collect_bound_value_expr(b.value, append_all_str(acc, bind_target_names(b.target)))
         checker::TExprStmt as es => collect_bound_expr_stmt(es.expr, acc)
         checker::TLoopStmt as l => collect_bound_stmts(l.body, collect_bound_stmts(l.init, acc))
+        checker::TDeferStmt as d => collect_bound_stmts(d.body, acc)
+        _ => acc
+    }
+}
+
+/**
+ * collect_bound_value_expr — the bound-name scan of a binding's value-position
+ * expression: only a value-form `if`/`match` bears arm blocks whose own
+ * bindings could SHADOW an enclosing scalar the reassigned scan sees through
+ * that SAME RHS; any other expression kind contributes nothing (#389 F1b item
+ * 2 — the symmetric mirror of `collect_reassigned_value_expr`).
+ *
+ * @param checker::TExpr e  the binding's initializer expression
+ * @param []str acc  the bound names gathered so far
+ * @return []str  `acc` extended with the value-if/match RHS's own bound names
+ */
+fn collect_bound_value_expr(e: checker::TExpr, acc: []str) -> []str {
+    match e.kind {
+        checker::TIfExpr as f => collect_bound_if(f, acc)
+        checker::TMatchExpr as m => collect_bound_match(m, acc)
         _ => acc
     }
 }
@@ -2029,6 +2081,27 @@ fn collect_bound_stmt(s: checker::TStatement, acc: []str) -> []str {
  * @return []str  `acc` with every element of `xs` appended, in order
  */
 fn append_all_str(acc: []str, xs: []str) -> []str {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out = teko::list::push(out, xs[i])
+        i++
+    }
+    out
+}
+
+/**
+ * append_all_u32 — append every element of `xs`, in order, to `acc` (the u32
+ * mirror of `append_all_str`; `close_arm_replaying_defers` concatenates an
+ * arm's PRE-replay value block-args onto its POST-replay scalar merge-args)
+ * (#389 F1b).
+ *
+ * @param []u32 acc  the list to extend
+ * @param []u32 xs  the elements to append
+ * @return []u32  `acc` with every element of `xs` appended, in order
+ */
+fn append_all_u32(acc: []u32, xs: []u32) -> []u32 {
     mut out = acc
     mut i: u64 = 0
     loop {
@@ -2583,6 +2656,15 @@ pub type ClosedArm = struct { ctx: LowerCtx; func: LFunc }
  * `loop_targets` (and, after this same audit, `defers` too — see
  * `close_loop`'s own doc).
  *
+ * The merge jump's block-args are `value_args` (captured PRE-replay, so a
+ * value arm's merge VALUE stays the pre-defer tail — the timing the
+ * `lwt_defer_inside_*_value_arm` goldens pin) FOLLOWED BY each reassigned
+ * enclosing scalar in `names`, each re-sampled from the POST-replay env so a
+ * `defer`'s write to one reaches its merge param with the POST-defer value.
+ * Before #389 F1b the scalar args were sampled from the arm's PRE-replay env,
+ * silently dropping any defer write to an enclosing scalar past the merge (the
+ * latent same-class miscompile F1 left as a documented residual).
+ *
  * A terminated arm (an early `return`/`break`/`continue` already fired
  * every defer ITS OWN scope owns, from ITS OWN base — `lower_return`/
  * `lower_break`/`lower_continue`) never reaches `target` at all: this
@@ -2598,17 +2680,25 @@ pub type ClosedArm = struct { ctx: LowerCtx; func: LFunc }
  *                                               slice itself is what gets
  *                                               restored)
  * @param u32 target  the merge block id
- * @param []u32 args  the merge jump's block-args
+ * @param []u32 value_args  the arm's PRE-replay value block-args (the
+ *                          if/match tail-value VReg for a value arm, empty for
+ *                          a statement arm) — captured BEFORE the defer replay
+ *                          so the merge VALUE stays pre-defer (#389 F1b)
+ * @param []str names  the reassigned enclosing scalars the merge threads, in
+ *                     param order; each is re-sampled from the POST-replay env
+ *                     so a `defer`'s write to one reaches its merge param with
+ *                     the post-defer value (#389 F1b item 1)
  * @param u32 line  the source line to stamp the replayed defers/jump with
  * @param u32 col  the source column to stamp the replayed defers/jump with
  * @return ClosedArm | error  the closed arm + the resume context, or a
  *                             NAMED internal error when a pending defer
  *                             body fails to lower
  */
-fn close_arm_replaying_defers(ctx: LowerCtx, pre_arm_defers: []checker::TDeferStmt, target: u32, args: []u32, line: u32, col: u32) -> ClosedArm | error {
+fn close_arm_replaying_defers(ctx: LowerCtx, pre_arm_defers: []checker::TDeferStmt, target: u32, value_args: []u32, names: []str, line: u32, col: u32) -> ClosedArm | error {
     if block_terminated(ctx.func, ctx.block_id) { return ClosedArm { ctx = ctx_with_defers(ctx, pre_arm_defers); func = ctx.func } }
     let replayed = match replay_defers(ctx, pre_arm_defers.len) { LowerCtx as c => c; error as err => return err }
     let reset = ctx_with_defers(replayed, pre_arm_defers)
+    let args = append_all_u32(value_args, jump_args_for_names(replayed.env, names))
     ClosedArm { ctx = reset; func = close_arm_to(reset, target, args, line, col) }
 }
 
@@ -2682,12 +2772,13 @@ fn lower_if_expr(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr) -> Lower
     arm registers fires only on ITS OWN branch, never leaking into the other arm or past the
     merge (PR #553 review finding). A scalar an arm RE-ASSIGNS (`reassigned_scalars`) is
     threaded through the merge as a block-param: the merge gains one param per reassigned name,
-    each arm's closing jump supplies that name's CURRENT VReg, and the post-merge env rebinds
-    each to its merge param — otherwise an arm-local rebind (`if c { x = 5 }`) would be DROPPED
-    at the merge and the name would read its stale pre-branch VReg past the `if` (the #389
-    A3-loop range-`for` back-edge root: the per-iteration `if !first { i = i+1 }` step froze the
-    counter). A branch that mutates no enclosing scalar adds ZERO params and stays byte-identical
-    (#389 F1). */
+    each arm's closing jump supplies that name's CURRENT VReg (re-sampled POST-defer-replay in
+    `close_arm_replaying_defers`, so a `defer { s = s + 100 }` in the arm reaches the merge with
+    its post-defer value, #389 F1b item 1), and the post-merge env rebinds each to its merge
+    param — otherwise an arm-local rebind (`if c { x = 5 }`) would be DROPPED at the merge and
+    the name would read its stale pre-branch VReg past the `if` (the #389 A3-loop range-`for`
+    back-edge root: the per-iteration `if !first { i = i+1 }` step froze the counter). A branch
+    that mutates no enclosing scalar adds ZERO params and stays byte-identical (#389 F1). */
 fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vreg: u32) -> Lowered | error {
     let names = reassigned_scalars(if_arm_stmts(f), ctx.env)
     let thenb = alloc_block(ctx.func)
@@ -2697,10 +2788,10 @@ fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vre
     let br = branch_inst(cond_vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), e.line, e.col)
     let ctx1 = ctx_append(ctx_with(ctx, merged.func, ctx.block_id, ctx.env), br)
     let then_done = match lower_block(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerCtx as c => c; error as err => return err }
-    let then_closed = match close_arm_replaying_defers(then_done, ctx1.defers, mergeblk.block_id, jump_args_for_names(then_done.env, names), e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    let then_closed = match close_arm_replaying_defers(then_done, ctx1.defers, mergeblk.block_id, teko::list::empty(), names, e.line, e.col) { ClosedArm as c => c; error as err => return err }
     let else_ctx = ctx_with(then_closed.ctx, then_closed.func, elseb.block_id, ctx.env)
     let else_done = if f.has_else { match lower_block(else_ctx, f.else_blk) { LowerCtx as c => c; error as err => return err } } else { else_ctx }
-    let else_closed = match close_arm_replaying_defers(else_done, ctx1.defers, mergeblk.block_id, jump_args_for_names(else_done.env, names), e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    let else_closed = match close_arm_replaying_defers(else_done, ctx1.defers, mergeblk.block_id, teko::list::empty(), names, e.line, e.col) { ClosedArm as c => c; error as err => return err }
     Lowered { ctx = ctx_with(else_closed.ctx, else_closed.func, mergeblk.block_id, merged.env); vreg = 0 }
 }
 
@@ -2713,7 +2804,10 @@ fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vre
     or past the merge (PR #553 review finding). A scalar an arm RE-ASSIGNS is threaded through
     the merge exactly as in `lower_if_stmt`, EXCEPT the merge's FIRST block-param is the
     if-expression's own result value — the reassigned-scalar params follow it, so each arm's
-    jump supplies `[tail_value] ++ scalar_args` (`merge_value_args`) (#389 F1). */
+    jump supplies `[tail_value] ++ scalar_args`: the tail VALUE is captured PRE-defer-replay
+    (so the merge value stays pre-defer) while the scalar args are re-sampled POST-replay inside
+    `close_arm_replaying_defers`, so a `defer`'s write to a reassigned scalar reaches its merge
+    param without disturbing the pre-defer merge value (#389 F1/F1b). */
 fn lower_if_value(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vreg: u32) -> Lowered | error {
     if !f.has_else { return error { message = "native backend N1: if-without-else used as a value not yet lowered (N2)" } }
     let names = reassigned_scalars(if_arm_stmts(f), ctx.env)
@@ -2725,12 +2819,10 @@ fn lower_if_value(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vr
     let br = branch_inst(cond_vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), e.line, e.col)
     let ctx1 = ctx_append(ctx_with(ctx, merged.func, ctx.block_id, ctx.env), br)
     let then_val = match lower_block_value(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerBlockValue as x => x; error as err => return err }
-    let then_args = merge_value_args(then_val.vreg, jump_args_for_names(then_val.ctx.env, names))
-    let then_closed = match close_arm_replaying_defers(then_val.ctx, ctx1.defers, mergeblk.block_id, then_args, e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    let then_closed = match close_arm_replaying_defers(then_val.ctx, ctx1.defers, mergeblk.block_id, teko::list::push(teko::list::empty(), then_val.vreg), names, e.line, e.col) { ClosedArm as c => c; error as err => return err }
     let else_ctx = ctx_with(then_closed.ctx, then_closed.func, elseb.block_id, ctx.env)
     let else_val = match lower_block_value(else_ctx, f.else_blk) { LowerBlockValue as x => x; error as err => return err }
-    let else_args = merge_value_args(else_val.vreg, jump_args_for_names(else_val.ctx.env, names))
-    let else_closed = match close_arm_replaying_defers(else_val.ctx, ctx1.defers, mergeblk.block_id, else_args, e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    let else_closed = match close_arm_replaying_defers(else_val.ctx, ctx1.defers, mergeblk.block_id, teko::list::push(teko::list::empty(), else_val.vreg), names, e.line, e.col) { ClosedArm as c => c; error as err => return err }
     Lowered { ctx = ctx_with(else_closed.ctx, else_closed.func, mergeblk.block_id, merged.env); vreg = mp.vreg }
 }
 
@@ -3485,13 +3577,15 @@ fn lower_match_guard(ctx: LowerCtx, arm: checker::TArm, next_block: u32) -> Matc
  * sibling arm or past the merge (PR #553 review finding). The closing jump
  * supplies `[tail_value] ++ scalar_args`, mirroring `lower_if_value`, so a
  * scalar this arm re-assigns reaches the merge param instead of being
- * dropped (#389 F1).
+ * dropped (#389 F1) — the tail value is captured PRE-defer-replay while the
+ * scalar args are re-sampled POST-replay inside `close_arm_replaying_defers`,
+ * so a `defer`'s write to a reassigned scalar propagates without disturbing
+ * the pre-defer merge value (#389 F1b item 1).
  */
 fn lower_match_arm_value(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj, merge_id: u32, names: []str) -> LowerCtx | error {
     let step = match lower_match_arm_entry(ctx, e, arm, subj) { MatchArmEntry as x => x; error as err => return err }
     let bv = match lower_block_value(step.ctx, arm.body) { LowerBlockValue as x => x; error as err => return err }
-    let args = merge_value_args(bv.vreg, jump_args_for_names(bv.ctx.env, names))
-    let closed = match close_arm_replaying_defers(bv.ctx, ctx.defers, merge_id, args, e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    let closed = match close_arm_replaying_defers(bv.ctx, ctx.defers, merge_id, teko::list::push(teko::list::empty(), bv.vreg), names, e.line, e.col) { ClosedArm as c => c; error as err => return err }
     ctx_with(closed.ctx, closed.func, step.next_block, ctx.env)
 }
 
@@ -3588,14 +3682,16 @@ fn lower_match_value(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, s
  *           `close_arm_replaying_defers` (not the bare `close_arm_to`), so a
  *           `defer` this arm registers fires only on ITS OWN match, never
  *           leaking into a sibling arm or past the merge (PR #553 review
- *           finding). The closing jump supplies `names`' current VRegs, so a
- *           scalar this arm re-assigns reaches the merge param instead of
- *           being dropped (#389 F1).
+ *           finding). The closing jump supplies `names`' current VRegs,
+ *           re-sampled POST-defer-replay in `close_arm_replaying_defers`, so a
+ *           scalar this arm re-assigns — INCLUDING inside a `defer` body —
+ *           reaches the merge param instead of being dropped (#389 F1/F1b
+ *           item 1).
  */
 fn lower_match_arm_stmt(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj, merge_id: u32, names: []str) -> LowerCtx | error {
     let step = match lower_match_arm_entry(ctx, e, arm, subj) { MatchArmEntry as x => x; error as err => return err }
     let done = match lower_block(step.ctx, arm.body) { LowerCtx as c => c; error as err => return err }
-    let closed = match close_arm_replaying_defers(done, ctx.defers, merge_id, jump_args_for_names(done.env, names), e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    let closed = match close_arm_replaying_defers(done, ctx.defers, merge_id, teko::list::empty(), names, e.line, e.col) { ClosedArm as c => c; error as err => return err }
     ctx_with(closed.ctx, closed.func, step.next_block, ctx.env)
 }
 

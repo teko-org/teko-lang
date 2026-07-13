@@ -193,6 +193,8 @@ CORPUS=(
     own_logical_not
     wasm_loop_count
     wasm_continue_step
+    own_defer_arm_write_propagates
+    own_value_if_rhs_reassign
 )
 KIND=(
     exit
@@ -204,6 +206,8 @@ KIND=(
     print
     trap
     print
+    exit
+    exit
     exit
     exit
     exit
@@ -225,6 +229,8 @@ TARGET=(
     wasm32-wasi
     wasm32-wasi
     wasm64-wasi
+    wasm32-wasi
+    wasm32-wasi
     wasm32-wasi
     wasm32-wasi
     wasm32-wasi

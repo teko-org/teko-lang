@@ -494,3 +494,48 @@ of the existing GREEN acyclic corpus (regression surface). The reassigned-only p
 mutation-free `if`/`match` byte-identical and touches only branches that actually mutate — the
 smallest correct, lowest-regression fix. **This is the load-bearing keystone fix: with it, own-wasm
 == C-native on `wasm_loop_count`/`wasm_continue_step` (exit 6) with ZERO stackifier change.**
+
+## 6.1 F1b — the SAME-CLASS merge-drop residuals F1's review surfaced (#389, 2026-07-13)
+
+F1 fixed the plain-`if c { x = 5 }` case, but its adversarial review found three MORE arm-merge sites
+that dropped an enclosing scalar the SAME way — each a latent SILENT miscompile (own-backend != C).
+Two are TRACTABLE and fixed here; the third needs a scope-aware `lenv` rework and is routed to the
+architect.
+
+**Item 1 — defer-write-propagation (FIXED).** A `defer { s = s + 100 }` inside an if/match STATEMENT
+arm reassigns the enclosing `mut s`, but the arm's closing jump-args were sampled from its env BEFORE
+`close_arm_replaying_defers` replayed the defer (which mutates `s`), so the merge received the
+PRE-defer `s`. Proof: `mut s=1; match x { 1 => { defer { s = s+100 } }; _ => {} }; exit(s)` → C 101,
+own (pre-F1b) 1. Fix: `close_arm_replaying_defers` now takes the reassigned `names` and re-samples
+their jump-args from the POST-`replay_defers` env, appended AFTER the arm's PRE-replay `value_args`
+(the value block-arg stays pre-defer — a VALUE arm's merge value must remain the pre-defer tail, per
+the `lwt_defer_inside_*_value_arm` goldens). The `TDeferStmt` descent F1 removed from the
+reassigned-scalar scan (a half-fix that would have minted a stale param) is RE-ADDED, now a real fix
+because the args are sampled post-replay. Fixture: `own_defer_arm_write_propagates` (exit 101).
+
+**Item 2 — value-if / value-match RHS reassignment (FIXED).** `if outer { let y = if inner { x = 5;
+x } else { 0 } }; exit(x)` dropped `x = 5` at the OUTER statement merge: the reassigned-scalar scan
+had no `TBinding` case and did not descend a value-position if/match RHS, so the outer merge never
+saw `x` (the inner value-if threads `x` through its OWN merge, but the outer merge past the binding
+must carry it too). Proof: C 5, own (pre-F1b) 1. Fix: `collect_reassigned_stmt` gains a `TBinding`
+case that descends the binding's value-position `if`/`match` RHS (`collect_reassigned_value_expr`);
+the shadow-exclusion `collect_bound_stmt` gains the symmetric RHS descent so a shadow inside the same
+RHS is still excluded. Fixture: `own_value_if_rhs_reassign` (exit 5).
+
+**Item 3 — across-all-arms over-exclusion (ROUTED TO ARCHITECT).** F1's shadow-exclusion guard is
+across-ALL-arms: if a name is legitimately reassigned as the enclosing scalar in one arm BUT shadowed
+in another, it is excluded for BOTH, so the legitimate arm reverts to the drop. Proof: `mut x=1;
+match k { A => { x = 5 }; _ => { mut x=99; x=x+1 } }; exit(x)` → on the A path C 5, own 1.
+
+*Assessment.* A PER-ARM fix — thread the name for ALL arms, but have a SHADOWING arm supply the
+ENCLOSING binding's PRE-branch VReg (skipping its own shadow) instead of excluding the name globally
+— is *partially* tractable and strictly non-regressing (it fixes the shadow-ONLY arm and leaves the
+shadow arm's own merge-arg exactly as today). BUT it is NOT a complete fix: an arm that reassigns the
+enclosing scalar BEFORE shadowing it (`_ => { x = 3; mut x = 99; … }`) needs the enclosing's LAST
+pre-shadow VReg, which an append-only newest-first `lenv` cannot recover without scope markers — that
+residual stays a silent stale-read. It also INVERTS F1's shadow-exclusion model (Finding 2), changing
+the currently-GREEN shadow goldens (`lwt_if_stmt_shadowed_scalar_excluded_from_merge`,
+`own_if_mut_shadow_no_leak`) from zero-param to threaded merges, and bloats the per-arm arg threading
+that items 1+2 already grow. A COMPLETE, sound fix requires a scope-aware `lenv` (the reviewer's own
+judgment). Rather than land an incomplete fix that destabilizes the merge model alongside items 1+2,
+item 3 is reported for architect routing.

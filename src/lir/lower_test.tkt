@@ -407,6 +407,48 @@ fn lwt_if_stmt_reassigned_scalar_threads_a_merge_param() {
 
 #test
 /**
+ * lwt_if_stmt_value_if_rhs_reassign_threads_the_outer_merge — the #389 F1b
+ * item 2 proof at the LIR level: a `mut` scalar reassigned INSIDE a
+ * value-position `if` that is the RHS of a `let` binding in an OUTER
+ * statement-`if` arm must ALSO thread through the OUTER merge, not just the
+ * inner value-if's own. `if 1 == 1 { let y = if 1 == 1 { x = 5; x } else { 0
+ * } }; return x` — the inner value-if threads `x` through its OWN merge
+ * (`#B6(%8, %9)`, value param `%8` + scalar `%9`), so past the binding `x`
+ * reads `%9`; the OUTER statement merge must carry `x` too or the read past
+ * the outer `if` freezes at the stale pre-branch `x` (`%0`). F1b's
+ * `collect_reassigned_stmt` `TBinding` case descends into the binding's
+ * value-position `if`/`match` RHS, so the reassigned-scalar scan SEES `x` and
+ * the outer merge gains its param (`#B3(%4)`). Asserts the inner arms feed the
+ * inner merge (`#B4`/`#B5` → `#B6`), the outer then-arm (which ENDS in the
+ * inner merge block `#B6`) closes carrying the POST-inner `x` (`jump
+ * #B3(%9)`), the outer else pass-through carries the PRE-branch `x` (`#B2` →
+ * `jump #B3(%0)`), and the read past the outer merge sees the merge param
+ * (`#B3(%4): ret %4`). Before F1b the outer merge carried ZERO params and
+ * `return x` read the stale `%0`.
+ *
+ * @return void
+ */
+fn lwt_if_stmt_value_if_rhs_reassign_threads_the_outer_merge() {
+    let inner_cond = lwt_cmp(lwt_num_i64(1 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::EqEq, lwt_num_i64(1 to i128))))
+    let inner_then = teko::list::push(teko::list::push(teko::list::empty(), lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(5 to i128), checker::PrimKind::I64)), lwt_exprstmt(lwt_var("x", checker::PrimKind::I64)))
+    let inner_else = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128)))
+    let inner_if = lwt_if_value(inner_cond, inner_then, inner_else, checker::PrimKind::I64)
+    let outer_then = teko::list::push(teko::list::empty(), lwt_bind("y", inner_if, checker::PrimKind::I64))
+    let outer_cond = lwt_cmp(lwt_num_i64(1 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::EqEq, lwt_num_i64(1 to i128))))
+    let ifstmt = lwt_if_stmt(outer_cond, outer_then, false, teko::list::empty())
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("nested_value_if_rhs", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B4:\n    %10 = const 5\n    jump #B6(%10, %10)")
+    teko::assert::str_contains(text, "  #B5:\n    %11 = const 0\n    jump #B6(%11, %0)")
+    teko::assert::str_contains(text, "  #B6(%8, %9):\n    jump #B3(%9)")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%0)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4")
+}
+
+#test
+/**
  * lwt_if_stmt_non_mutating_arm_keeps_zero_param_merge — the byte-identical
  * guard for #389 F1: an if-STATEMENT whose then arm mutates NO enclosing
  * scalar (a bare read `if 1 < 2 { x }`) must keep its CURRENT zero-param
@@ -955,17 +997,24 @@ fn lwt_lowers_match_statement_merges_with_zero_block_args() {
  * lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch — PR #553
  * review finding, `match`'s own shape (mirrors
  * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`'s if-shape
- * proof): `let s=1; match x { 1 => { defer { s = s + 100 } }; _ => {} };
- * return s` — the `defer` registers ONLY inside arm0's own body. Arm0's own
- * block (`#B2`) must fire it — LIFO, from the defer-delta base THIS arm
- * itself started at — as part of ITS OWN close, immediately before its jump
- * to the merge (`#B1`); the wildcard arm's own body (`#B4`, which never
- * registers a defer) just jumps straight there too, with nothing to replay;
- * the merge/tail block (`#B1`) must contain NOTHING but the plain `ret %1` —
- * proving arm0's own defer registration was reset off the pending-defer
- * stack before the merge, never replayed a second time there (the exact
- * leak `close_arm_replaying_defers` fixes for `lower_match_arm_stmt`, the
- * SAME class of bug as the if-statement's own arms).
+ * proof), UPDATED for #389 F1b item 1 (defer-write propagation): `let s=1;
+ * match x { 1 => { defer { s = s + 100 } }; _ => {} }; return s` — the `defer`
+ * registers ONLY inside arm0's own body. Arm0's own block (`#B2`) fires it —
+ * LIFO, from the defer-delta base THIS arm itself started at — as part of ITS
+ * OWN close, immediately before its jump to the merge (`#B1`).
+ *
+ * `s` is now THREADED through the merge as a block-param (`#B1(%2)`): the
+ * `defer`'s reassignment of the enclosing `s` is a Simple `TAssign` the
+ * reassigned-scalar scan reaches through the defer body (`collect_reassigned_
+ * stmt`'s re-added `TDeferStmt` descent), and `close_arm_replaying_defers`
+ * re-samples arm0's closing scalar arg from its POST-replay env, so arm0 jumps
+ * `#B1(%6)` — its POST-defer `s` (`%6 = iadd %1, %5`). The wildcard arm (`#B4`,
+ * no defer) jumps its own untouched `s`, `#B1(%1)`, and the tail reads the
+ * merge param, `ret %2`. Before F1b the merge carried ZERO params and the tail
+ * read the STALE pre-defer `s` (`ret %1`) — the OLD golden shape encoded that
+ * same-class silent merge-drop; the arm block still holds the single `iadd`
+ * (the defer is never replayed a second time at the merge, `close_arm_
+ * replaying_defers`'s original PR #553 fix).
  *
  * @return void
  */
@@ -984,32 +1033,37 @@ fn lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch() {
     let f = lwt_fn("match_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
-    teko::assert::str_contains(text, "  #B1:\n    ret %1\n  #B2:")
-    teko::assert::str_contains(text, "  #B2:\n    %4 = const 100\n    %5 = iadd %1, %4\n    jump #B1()")
-    teko::assert::str_contains(text, "  #B4:\n    jump #B1()")
+    teko::assert::str_contains(text, "  #B1(%2):\n    ret %2\n  #B2:")
+    teko::assert::str_contains(text, "  #B2:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B1(%6)")
+    teko::assert::str_contains(text, "  #B4:\n    jump #B1(%1)")
 }
 
 /**
  * lwt_defer_inside_match_value_arm_fires_only_on_that_arms_own_branch — PR
- * #553 follow-up nit: the VALUE-producing (`lower_match_arm_value`) mirror
- * of `lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch`: `let
- * s=1; return match x { 1 => { defer { s = s + 100 }; s } _ => s }` — the
- * `defer` registers ONLY inside arm0's own body, before its own tail value
- * `s`. Arm0's own body block (`#B2`) must fire it — LIFO, from the
- * defer-delta base THIS arm itself started at — AFTER its tail value is
- * read (so the merge still receives the PRE-defer `s`, `%1`) but BEFORE its
- * jump to the merge; the wildcard arm's own body (`#B4`, reached through
- * its own pass-through entry `#B3`, which never registers a defer) just
- * jumps its own tail value straight to the merge; the merge block (`#B1`)
- * must carry NOTHING but the plain `ret` of its own block-arg — proving
- * arm0's own defer registration was reset off the pending-defer stack
- * before the merge, never replayed a second time there (the value-producing
- * sibling of `close_arm_replaying_defers`'s `lower_match_arm_stmt` fix).
- * `#B1` is allocated BEFORE either arm (mirrors `lower_match_value`'s own
- * `mergeb`-first shape, unlike an if-expression's merge-allocated-LAST
- * shape), so it prints immediately followed by `#B2`'s own header, never a
- * trailing `}` (that closes the function after the LAST-allocated block,
- * the dead-code fallback past the last arm).
+ * #553 follow-up nit, UPDATED for #389 F1b item 1: the VALUE-producing
+ * (`lower_match_arm_value`) mirror of
+ * `lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch`: `let s=1;
+ * return match x { 1 => { defer { s = s + 100 }; s } _ => s }` — the `defer`
+ * registers ONLY inside arm0's own body, before its own tail value `s`. Arm0's
+ * own body block (`#B2`) fires it — LIFO, from the defer-delta base THIS arm
+ * itself started at — AFTER its tail value is read but BEFORE its jump.
+ *
+ * The merge now carries TWO params, `#B1(%2, %3)`: the FIRST (`%2`) is the
+ * match RESULT value, the SECOND (`%3`) the threaded enclosing scalar `s`
+ * (F1b re-adds the `TDeferStmt` descent, so the defer's `s = s + 100` is seen
+ * by the reassigned-scalar scan). CRITICALLY the VALUE arg stays PRE-defer: the
+ * tail `s` (`%1`) is captured before the defer replays, so arm0 jumps
+ * `#B1(%1, %7)` — value `%1` (pre-defer) THEN scalar `%7` (post-defer `s`,
+ * `%7 = iadd %1, %6`); `close_arm_replaying_defers` re-samples only the SCALAR
+ * arg from the post-replay env, never the value. The wildcard arm (`#B4`, via
+ * its pass-through `#B3`, no defer) jumps `#B1(%1, %1)`; the tail returns the
+ * VALUE param, `ret %2`. Before F1b the merge carried only the value param
+ * (`#B1(%2)`) and jumped `#B1(%1)` — the OLD golden shape dropped `s` at the
+ * merge; the arm block still holds its single `iadd` (defer never replayed
+ * twice). `#B1` is allocated BEFORE either arm (mirrors `lower_match_value`'s
+ * own `mergeb`-first shape), so it prints immediately followed by `#B2`'s own
+ * header, never a trailing `}` (that closes the function after the
+ * LAST-allocated block, the dead-code fallback past the last arm).
  *
  * @return void
  */
@@ -1028,10 +1082,10 @@ fn lwt_defer_inside_match_value_arm_fires_only_on_that_arms_own_branch() {
     let f = lwt_fn("match_value_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
-    teko::assert::str_contains(text, "  #B2:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B1(%1)")
+    teko::assert::str_contains(text, "  #B2:\n    %6 = const 100\n    %7 = iadd %1, %6\n    jump #B1(%1, %7)")
     teko::assert::str_contains(text, "  #B3:\n    jump #B4()")
-    teko::assert::str_contains(text, "  #B4:\n    jump #B1(%1)")
-    teko::assert::str_contains(text, "  #B1(%2):\n    ret %2\n  #B2:")
+    teko::assert::str_contains(text, "  #B4:\n    jump #B1(%1, %1)")
+    teko::assert::str_contains(text, "  #B1(%2, %3):\n    ret %2\n  #B2:")
 }
 
 #test
@@ -1995,18 +2049,24 @@ fn lwt_lowers_a_defer_fires_independently_on_each_of_two_return_paths() {
 
 /**
  * lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch — PR #553
- * review finding: `let s=1; if x>0 { defer { s = s + 100 } }; return s` —
- * the `defer` registers ONLY inside the THEN arm, never before the `if`.
- * The THEN arm (`#B1`) must fire it — LIFO, from the defer-delta base this
- * arm itself started at — as part of ITS OWN close, immediately before its
- * jump to the merge; the ELSE arm (`#B2`, the implicit pass-through — no
- * `else` block) never runs it, so it just jumps straight to the merge; the
- * merge/tail block (`#B3`) must contain NOTHING but the plain `ret %1` —
- * proving the arm's own defer registration was reset off the pending-defer
- * stack before the merge, never replayed a second time there (the exact
- * leak `close_arm_replaying_defers` fixes: before it, `#B3` would ALSO
- * carry a stray `iadd`, firing unconditionally regardless of which branch
- * ran at runtime).
+ * review finding, UPDATED for #389 F1b item 1 (defer-write propagation):
+ * `let s=1; if x>0 { defer { s = s + 100 } }; return s` — the `defer`
+ * registers ONLY inside the THEN arm, never before the `if`. The THEN arm
+ * (`#B1`) fires it — LIFO, from the defer-delta base this arm itself started
+ * at — as part of ITS OWN close, immediately before its jump to the merge.
+ *
+ * `s` is now THREADED through the merge as a block-param (`#B3(%4)`): F1b
+ * re-adds the `TDeferStmt` descent so the defer's `s = s + 100` is seen, and
+ * `close_arm_replaying_defers` re-samples the THEN arm's scalar arg from its
+ * POST-replay env, so THEN jumps `#B3(%6)` — its POST-defer `s` (`%6 = iadd
+ * %1, %5`). The ELSE arm (`#B2`, the implicit pass-through — no `else` block)
+ * never runs the defer, so it jumps its own untouched `s`, `#B3(%1)`, and the
+ * tail reads the merge param, `ret %4`. Before F1b the merge carried ZERO
+ * params and the tail read the STALE pre-defer `s` (`ret %1`) — the OLD golden
+ * shape encoded that same-class silent merge-drop; the arm block still holds
+ * the single `iadd` and `#B3` never carries a stray one (the defer is never
+ * replayed a second time at the merge, `close_arm_replaying_defers`'s original
+ * PR #553 fix, unconditional-fire regardless of branch).
  *
  * @return void
  */
@@ -2023,25 +2083,28 @@ fn lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch() {
     let f = lwt_fn("arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
-    teko::assert::str_contains(text, "  #B1:\n    %4 = const 100\n    %5 = iadd %1, %4\n    jump #B3()")
-    teko::assert::str_contains(text, "  #B2:\n    jump #B3()")
-    teko::assert::str_contains(text, "  #B3:\n    ret %1\n}")
+    teko::assert::str_contains(text, "  #B1:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B3(%6)")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%1)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4\n}")
 }
 
 /**
  * lwt_defer_inside_else_arm_fires_only_on_that_arms_own_branch — PR #553
- * follow-up nit: the ELSE-arm mirror of
+ * follow-up nit, UPDATED for #389 F1b item 1: the ELSE-arm mirror of
  * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`: `let s=1; if
  * x>0 { } else { defer { s = s + 100 } }; return s` — the `defer` registers
  * ONLY inside the ELSE arm, never the empty THEN arm. The THEN arm (`#B1`,
- * empty — no statements at all) just jumps straight to the merge; the ELSE
- * arm (`#B2`) must fire it — LIFO, from the defer-delta base THIS arm
- * itself started at — as part of ITS OWN close, immediately before its jump
- * to the merge; the merge/tail block (`#B3`) must contain NOTHING but the
- * plain `ret %1` — proving the ELSE arm's own defer registration was reset
- * off the pending-defer stack before the merge, never replayed a second
- * time there (`close_arm_replaying_defers` scopes EITHER arm identically,
- * not just the THEN side).
+ * empty) jumps its own untouched `s` straight to the merge, `#B3(%1)`; the
+ * ELSE arm (`#B2`) fires the defer — LIFO, from the defer-delta base THIS arm
+ * itself started at — as part of ITS OWN close, then jumps its POST-defer `s`,
+ * `#B3(%6)` (`%6 = iadd %1, %5`), `close_arm_replaying_defers` re-sampling the
+ * scalar arg from its post-replay env. `s` is THREADED as the merge param
+ * `#B3(%4)` and the tail reads it, `ret %4` — proving the ELSE arm's defer
+ * write reaches the merge (F1b's `TDeferStmt` descent scopes EITHER arm
+ * identically, not just the THEN side). Before F1b the merge carried ZERO
+ * params and the tail read the STALE pre-defer `s` (`ret %1`) — the OLD golden
+ * shape encoded that same-class silent merge-drop; the defer is still never
+ * replayed a second time at the merge (its original PR #553 scope fix).
  *
  * @return void
  */
@@ -2058,26 +2121,32 @@ fn lwt_defer_inside_else_arm_fires_only_on_that_arms_own_branch() {
     let f = lwt_fn("else_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
-    teko::assert::str_contains(text, "  #B1:\n    jump #B3()")
-    teko::assert::str_contains(text, "  #B2:\n    %4 = const 100\n    %5 = iadd %1, %4\n    jump #B3()")
-    teko::assert::str_contains(text, "  #B3:\n    ret %1\n}")
+    teko::assert::str_contains(text, "  #B1:\n    jump #B3(%1)")
+    teko::assert::str_contains(text, "  #B2:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B3(%6)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4\n}")
 }
 
 /**
  * lwt_defer_inside_if_value_then_arm_fires_only_on_that_arms_own_branch —
- * PR #553 follow-up nit: the VALUE-producing (`lower_if_value`) shape of
+ * PR #553 follow-up nit, UPDATED for #389 F1b item 1: the VALUE-producing
+ * (`lower_if_value`) shape of
  * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`: `let s=1;
  * return if x>0 { defer { s = s + 100 }; s } else { s }` — the `defer`
- * registers ONLY inside the THEN arm, before its own tail value `s`. The
- * THEN arm (`#B1`) must fire it — LIFO, from the defer-delta base THIS arm
- * itself started at — AFTER its tail value is read (so the merge still
- * receives the PRE-defer `s`, `%1`) but BEFORE its jump to the merge; the
- * ELSE arm (`#B2`, which never registers a defer) just jumps its own tail
- * value straight to the merge; the merge block (`#B3`) must carry NOTHING
- * but the plain `ret` of its own block-arg — proving the THEN arm's own
- * defer registration was reset off the pending-defer stack before the
- * merge, never replayed a second time there (the value-producing sibling of
- * `close_arm_replaying_defers`'s `lower_if_stmt` fix).
+ * registers ONLY inside the THEN arm, before its own tail value `s`. The THEN
+ * arm (`#B1`) fires it — LIFO, from the defer-delta base THIS arm itself
+ * started at — AFTER its tail value is read but BEFORE its jump.
+ *
+ * The merge now carries TWO params, `#B3(%4, %5)`: the FIRST (`%4`) is the
+ * if-expression RESULT value, the SECOND (`%5`) the threaded enclosing scalar
+ * `s` (F1b's `TDeferStmt` descent sees the defer's `s = s + 100`). CRITICALLY
+ * the VALUE arg stays PRE-defer: the tail `s` (`%1`) is captured before the
+ * defer replays, so the THEN arm jumps `#B3(%1, %7)` — value `%1` (pre-defer)
+ * THEN scalar `%7` (post-defer `s`, `%7 = iadd %1, %6`); `close_arm_replaying_
+ * defers` re-samples only the SCALAR arg from the post-replay env, never the
+ * value. The ELSE arm (`#B2`, no defer) jumps `#B3(%1, %1)`; the tail returns
+ * the VALUE param, `ret %4`. Before F1b the merge carried only the value param
+ * (`#B3(%4)`) and jumped `#B3(%1)` — the OLD golden shape dropped `s` at the
+ * merge; the defer is still never replayed a second time there.
  *
  * @return void
  */
@@ -2094,9 +2163,9 @@ fn lwt_defer_inside_if_value_then_arm_fires_only_on_that_arms_own_branch() {
     let f = lwt_fn("if_value_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
-    teko::assert::str_contains(text, "  #B1:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B3(%1)")
-    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%1)")
-    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4\n}")
+    teko::assert::str_contains(text, "  #B1:\n    %6 = const 100\n    %7 = iadd %1, %6\n    jump #B3(%1, %7)")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%1, %1)")
+    teko::assert::str_contains(text, "  #B3(%4, %5):\n    ret %4\n}")
 }
 
 /**
