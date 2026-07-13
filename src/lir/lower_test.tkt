@@ -207,11 +207,32 @@ fn lwt_lbinop_of_rejects_non_arithmetic() {
     teko::assert::is_true(match lbinop_of(lexer::TokenKind::Amp, checker::PrimKind::I64) { LBinOp => false; error => true })
 }
 
+/**
+ * lwt_lunop_of_picks_negation_family — lunop_of maps `-` to INeg/FNeg by family.
+ * `!` (Bang) is deliberately NOT mapped here: it is intercepted in lower_unary and
+ * lowered to a logical `operand == 0` (F1c fix, #389), so lunop_of returns an error for
+ * it rather than the old bitwise LUnOp::INot (which miscompiled `!` on the own backend).
+ */
 #test
 fn lwt_lunop_of_picks_negation_family() {
     teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Minus, checker::PrimKind::I64, LUnOp::INeg))
     teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Minus, checker::PrimKind::F64, LUnOp::FNeg))
-    teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Bang, checker::PrimKind::Bool, LUnOp::INot))
+    teko::assert::is_true(match lunop_of(lexer::TokenKind::Bang, checker::PrimKind::Bool) { LUnOp => false; error => true })
+}
+
+/**
+ * lwt_lowers_logical_not_to_icmpeq_zero — `!` lowers to a LOGICAL-not: a `const 0`
+ * then an `icmpeq operand, 0` (F1c fix, #389), NOT a bitwise `inot`. The operand here is
+ * `1 < 2` (%2 = icmplts %0, %1); the not then emits %3 = const 0 and %4 = icmpeq %2, %3.
+ */
+#test
+fn lwt_lowers_logical_not_to_icmpeq_zero() {
+    let cond = lwt_cmp(lwt_num_i64(1 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, lwt_num_i64(2 to i128))))
+    let e = lwt_unary(lexer::TokenKind::Bang, cond, checker::PrimKind::Bool)
+    let text = lwt_lower_expr_text(e)
+    teko::assert::str_contains(text, "%3 = const 0")
+    teko::assert::str_contains(text, "%4 = icmpeq %2, %3")
+    teko::assert::is_true(!teko::str::contains(text, "inot"))
 }
 
 #test

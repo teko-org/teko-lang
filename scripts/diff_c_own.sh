@@ -196,6 +196,7 @@ CORPUS=(
     own_sub_exit
     own_if_exit
     own_match_exit
+    own_logical_not
     own_print_exit
 )
 

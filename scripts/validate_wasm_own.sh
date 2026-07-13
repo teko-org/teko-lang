@@ -148,20 +148,22 @@ fixture_root="$script_dir/examples/regressions"
 # (`reassigned_scalars`/`collect_bound_stmts`, `src/lir/lower.tks`) is correct for the own-wasm
 # backend on a NON-LOOP if/match merge.
 #
-# `wasm_loop_count` (FIX-2) and `wasm_continue_step` (§11.5) remain WITHHELD from CORPUS —
-# EMPIRICALLY RE-VERIFIED after F1 (self-hosted build + wasmtime run, not just design-doc
-# reasoning): the LIR F1 emits for these fixtures is byte-for-byte CORRECT (hand-traced through
-# `print_lmodule`'s dump — the range-`for` step's own if-merge threads the reassigned loop
-# counter exactly as intended, and the computed back-edge arguments already carry the right
-# value at every iteration). The remaining own-wasm exit-0 (still-frozen) is therefore NOT the
-# A1 LIR merge-drop root F1 fixes — it is a SEPARATE, previously-unexercised own-WASM
-# STACKIFIER gap: a loop-carried value that flows through an INTERMEDIATE (non-loop-head) merge
-# block before reaching the loop's own back-edge jump (a "merge-of-merge" chain only F1's fix
-# can produce, since before F1 no if-statement merge ever carried a scalar param at all) is not
-# correctly propagated by `emit_edge_copies`/the wasm local-slot assignment. REPORTED for a
-# follow-up crumb (tracked as F1c, distinct from F1b's defer-write-propagation/value-if-RHS
-# items) — out of THIS crumb's LIR-only scope (`stackify.tks`/isel are explicitly untouched).
-# Silently wiring these two at exit 6 here would redden CI on a leg that does not yet pass.
+# `wasm_loop_count` (FIX-2, sum(0..4) = 6) and `wasm_continue_step` (§11.5, sum of the even i
+# in 0..6 = 6) join the corpus with the F1c fix (#389). F1c RETARGETS the earlier "stackifier
+# gap" diagnosis, which was WRONG: `src/backend/stackify.tks` is correct and untouched. The
+# real root was in the SHARED LIR — `src/lir/lower.tks` lowered `!` (logical-not) to the
+# BITWISE one's-complement (LUnOp::INot), and for a bool operand `!1 = 0xFFFFFFFE` / `!0 =
+# 0xFFFFFFFF` are BOTH nonzero, so a conditional branch (tests nonzero) took the then-arm for
+# `!true` AND `!false` alike. The range-`for` desugar (`src/parser/loop_head.tks`: `if !_first
+# { i += 1 }` and `if !(i < _hi) { break }`) therefore broke on iteration 1 -> exit 0. F1c
+# lowers `!` to a LOGICAL not (`operand == 0`), so these loops now iterate correctly and
+# own-wasm(wasmtime) == C-native == 6. `own_logical_not` joins as the DIRECT proof of `!` on
+# both own backends (the first own-backend fixture to exercise `!` at all).
+#
+# `own_logical_not` (F1c, #389): `mut b = true; if !b { exit(1) }; if !(1 < 2) { exit(2) };
+# if !(2 < 1) { exit(7) }; exit(0)` -> 7. `!true` (both `!b` and `!(1<2)`) is false so exit(1)
+# and exit(2) are SKIPPED; `!(2<1)` = `!false` is TRUE so exit(7) FIRES. The old bitwise-INot
+# would have fired exit(1) first. own-wasm(wasmtime) == C-native on exit 7.
 #
 # `own_match_pattern_binding_no_collision` (F1's review round 1, Finding 2(ii) proof — a
 # `Shape` variant's `Circle as x` arm collides by name with the enclosing `x` a sibling arm
@@ -188,6 +190,9 @@ CORPUS=(
     wasm_labeled_break
     own_if_reassign_exit
     own_if_mut_shadow_no_leak
+    own_logical_not
+    wasm_loop_count
+    wasm_continue_step
 )
 KIND=(
     exit
@@ -199,6 +204,9 @@ KIND=(
     print
     trap
     print
+    exit
+    exit
+    exit
     exit
     exit
     exit
@@ -217,6 +225,9 @@ TARGET=(
     wasm32-wasi
     wasm32-wasi
     wasm64-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
     wasm32-wasi
     wasm32-wasi
     wasm32-wasi

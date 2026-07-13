@@ -207,12 +207,21 @@ fn lbinop_int(op: lexer::TokenKind, signed: bool) -> LBinOp | error {
     }
 }
 
-/** lunop_of — the LUnOp for a prefix operator token given the operand's PrimKind. `-`
-    picks FNeg/INeg by kind; `!` picks INot. N1 does not lower `~`. */
+/**
+ * lunop_of — the LUnOp for an ARITHMETIC prefix operator token given the operand's
+ * PrimKind. `-` picks FNeg/INeg by kind. `!` (logical-not) is NOT handled here — it is
+ * intercepted in lower_unary and lowered to a logical `operand == 0` (see
+ * lower_logical_not), so mapping `!` to the bitwise LUnOp::INot (the F1c miscompile) is
+ * gone. N1 does not lower `~`.
+ *
+ * @param lexer::TokenKind op  the prefix operator token
+ * @param checker::PrimKind k  the operand's PrimKind (selects the float/int family for `-`)
+ * @return LUnOp  the negation LUnOp for `-`
+ * @throws  for any operator other than `-` (`!` is handled by lower_unary; `~` is N2)
+ */
 pub fn lunop_of(op: lexer::TokenKind, k: checker::PrimKind) -> LUnOp | error {
     match op {
         lexer::TokenKind::Minus => if prim_is_float_kind(k) { LUnOp::FNeg } else { LUnOp::INeg }
-        lexer::TokenKind::Bang => LUnOp::INot
         _ => error { message = "native backend N1: unary operator not yet lowered (N2)" }
     }
 }
@@ -541,13 +550,57 @@ fn lower_binary(ctx: LowerCtx, e: checker::TExpr, b: checker::TBinary) -> Lowere
     Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
 }
 
-/** lower_unary — lower the operand, then emit the LUn chosen by the operand's PrimKind. */
+/**
+ * lower_unary — lower a prefix-unary expression. `!` (logical-not) lowers to a
+ * LOGICAL-not (`operand == 0`) via lower_logical_not; every other prefix operator
+ * lowers the operand then emits the LUn chosen by the operand's PrimKind.
+ *
+ * @param LowerCtx ctx  the lowering context to append the expression's instructions into
+ * @param checker::TExpr e  the unary expression (carries its source line/col and type)
+ * @param checker::TUnary u  the unary node (the operator token and its operand)
+ * @return Lowered  the appended context plus the VReg holding the unary's value
+ * @throws  when the operand's type is out of the arithmetic subset, or the operator
+ *          is a prefix form not yet lowered (N2)
+ */
 fn lower_unary(ctx: LowerCtx, e: checker::TExpr, u: checker::TUnary) -> Lowered | error {
     let ao = match lower_expr(ctx, u.operand) { Lowered as x => x; error as err => return err }
+    if is_logical_not(u.op) { return lower_logical_not(ao, e.line, e.col) }
     let k = match prim_kind_of(u.operand.type) { checker::PrimKind as p => p; error as err => return err }
     let op = match lunop_of(u.op, k) { LUnOp as o => o; error as err => return err }
     let r = ctx_alloc(ao.ctx)
     let inst = un_inst(r.vreg, op, ao.vreg, e.line, e.col)
+    Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
+}
+
+/**
+ * is_logical_not — is this prefix operator token the `!` (logical-not) operator?
+ *
+ * @param lexer::TokenKind op  the prefix operator token
+ * @return bool  true only for `!` (Bang)
+ */
+fn is_logical_not(op: lexer::TokenKind) -> bool {
+    match op { lexer::TokenKind::Bang => true; _ => false }
+}
+
+/**
+ * lower_logical_not — emit a LOGICAL-not of an already-lowered operand: `operand == 0`
+ * (a `const 0` plus an `ICmpEq`). `!` is bool-only in Teko (checker-enforced), so the
+ * operand is always `0`/`1` and this yields the clean complement (`1==0 → 0`, `0==0 → 1`).
+ * This is NOT a bitwise one's-complement (LUnOp::INot): `INot 1 = 0xFFFFFFFE` is still
+ * nonzero, so a conditional branch (which tests nonzero) would take the then-arm for BOTH
+ * `!true` and `!false` — the F1c miscompile this replaces. For a non-bool truthy int the
+ * `==0` semantics remain the correct logical-not.
+ *
+ * @param Lowered ao  the already-lowered operand (its context and value VReg)
+ * @param u32 line  the source line to stamp the emitted instructions with
+ * @param u32 col  the source column to stamp the emitted instructions with
+ * @return Lowered  the appended context plus the VReg holding the logical-not's `0`/`1`
+ */
+fn lower_logical_not(ao: Lowered, line: u32, col: u32) -> Lowered {
+    let z = ctx_alloc(ao.ctx)
+    let with_zero = ctx_append(z.ctx, const_int_inst(z.vreg, 0 to i128, line, col))
+    let r = ctx_alloc(with_zero)
+    let inst = bin_inst(r.vreg, LBinOp::ICmpEq, ao.vreg, z.vreg, line, col)
     Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
 }
 
