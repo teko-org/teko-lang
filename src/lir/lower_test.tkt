@@ -355,6 +355,62 @@ fn lwt_if_stmt_then_arm_keeps_its_own_interned_rodata() {
 }
 
 #test
+/**
+ * lwt_if_stmt_reassigned_scalar_threads_a_merge_param — the #389 F1 ROOT
+ * proof at the LIR level: an else-less if-STATEMENT whose then arm
+ * RE-ASSIGNS an enclosing scalar (`if 1 < 2 { x = 5 }`) must thread that
+ * scalar through the merge as a block-param. Asserts the merge `#B3` gained a
+ * param (`#B3(%4)`), the then arm's jump carries the REASSIGNED VReg
+ * (`jump #B3(%5)`, the `x = 5` value), the else pass-through carries the
+ * PRE-branch VReg (`jump #B3(%0)`, the `let x = 0` value), and the read past
+ * the merge sees the merge param (`ret %4`) — before F1 the rebind was
+ * dropped and `x` froze at its stale pre-branch VReg.
+ *
+ * @return void
+ */
+fn lwt_if_stmt_reassigned_scalar_threads_a_merge_param() {
+    let one = lwt_num_i64(1 to i128)
+    let two = lwt_num_i64(2 to i128)
+    let cond = lwt_cmp(one, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, two)))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(5 to i128), checker::PrimKind::I64))
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(0 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("bump", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "branch %3, #B1(), #B2()")
+    teko::assert::str_contains(text, "jump #B3(%5)")
+    teko::assert::str_contains(text, "jump #B3(%0)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4")
+}
+
+#test
+/**
+ * lwt_if_stmt_non_mutating_arm_keeps_zero_param_merge — the byte-identical
+ * guard for #389 F1: an if-STATEMENT whose then arm mutates NO enclosing
+ * scalar (a bare read `if 1 < 2 { x }`) must keep its CURRENT zero-param
+ * merge — `reassigned_scalars` is reassigned-ONLY, never promote-all, so the
+ * existing acyclic corpus stays unchanged. Asserts the merge `#B3` carries no
+ * param (`#B3:` with a bare `jump #B3()`) and reads `x` at its unchanged
+ * pre-branch VReg (`ret %0`).
+ *
+ * @return void
+ */
+fn lwt_if_stmt_non_mutating_arm_keeps_zero_param_merge() {
+    let one = lwt_num_i64(1 to i128)
+    let two = lwt_num_i64(2 to i128)
+    let cond = lwt_cmp(one, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, two)))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_var("x", checker::PrimKind::I64)))
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(0 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("keep", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "jump #B3()")
+    teko::assert::str_contains(text, "  #B3:\n    ret %0")
+}
+
+#test
 fn lwt_lowers_if_expr_merges_with_a_block_arg() {
     let x = lwt_var("x", checker::PrimKind::I64)
     let y = lwt_var("y", checker::PrimKind::I64)

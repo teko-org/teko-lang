@@ -132,31 +132,23 @@ fixture_root="$script_dir/examples/regressions"
 # TEKO_TARGET=wasm64-wasi and its own-wasm leg runs with wasmtime's `-W memory64=y`/
 # wasm-validate's `--enable-memory64` (the memory64 proposal is NOT on by default).
 #
-# Three of the five §14.1/§12.2 FIX-1/FIX-2 engine-level control-flow proofs (#389
-# C1-8b) join the corpus here: `wasm_if_both_diverge` proves FIX-1(b) (an if/else whose
-# both arms diverge has no merge block, so neither arm gets an arm label); `wasm_break_in_if`
-# proves FIX-1(c) (a break nested in an if inside a loop still gets its single-predecessor
-# loop-exit labeled unconditionally); `wasm_labeled_break` proves #520 (a labeled break
-# resolves to a multi-level `br N` at the right scope depth). All three are PLAIN `loop {
-# }` shapes (no range/`for` head) — verified own-wasm(wasmtime) == C-native.
+# The five §14.1/§12.2 FIX-1/FIX-2 engine-level control-flow proofs (#389 C1-8b) join the
+# corpus here: `wasm_if_both_diverge` proves FIX-1(b) (an if/else whose both arms diverge has
+# no merge block, so neither arm gets an arm label); `wasm_break_in_if` proves FIX-1(c) (a
+# break nested in an if inside a loop still gets its single-predecessor loop-exit labeled
+# unconditionally); `wasm_labeled_break` proves #520 (a labeled break resolves to a multi-level
+# `br N` at the right scope depth). Those three are PLAIN `loop { }` shapes (no range/`for`
+# head) — verified own-wasm(wasmtime) == C-native. The remaining two (`wasm_loop_count`,
+# `wasm_continue_step`) are the range-`for` shapes F1 unblocks (see below).
 #
-# `wasm_loop_count` (FIX-2) and `wasm_continue_step` (§11.5) are AUTHORED on disk
-# (examples/regressions/wasm_loop_count, .../wasm_continue_step — same verbatim §14.1
-# shapes) but DELIBERATELY WITHHELD from CORPUS: C1-8b's local verification (own-wasm
-# under wasmtime vs the C-native oracle) surfaced a REAL, previously-undetected own-wasm
-# defect, NOT a fixture-authoring mistake — reproduced independently on the pre-existing,
-# unrelated `loop_range` fixture (own-native ALSO honest-stops on the identical shape today
-# with regalloc's own NAMED "a loop back-edge needs live-range holes" deferral, #6.2/A3-loop
-# — but own-WASM does not share that guard, since §3.1 skips regalloc entirely for wasm
-# locals, so it silently EMITS A VALID-BUT-WRONG module instead of honest-stopping). The
-# extensible/range-for `loop mut i in a..b { … }` desugar's per-iteration loop variable
-# never gets threaded back through the loop's own back-edge state in the wasm stackifier
-# (own-wasm's counter freezes at its initial value while the accumulator still updates,
-# reproduced independent of `continue` — see the PR report for the disassembled repro).
-# Manual C-style loops (`mut i = 0; loop { …; i = i + 1 }`, no range head) are UNAFFECTED.
-# Silently adding these two here (or fabricating a "known-wrong" soft pass) would bury a
-# genuine miscompilation under a green gate — REPORTED up for its own bugfix crumb; this
-# crumb stays fixtures/shell/YAML-only and ships only the three verified-correct additions.
+# `wasm_loop_count` (FIX-2) and `wasm_continue_step` (§11.5) join CORPUS with F1 (#389): the
+# defect C1-8b's local verification surfaced was NOT a wasm stackifier bug but a SHARED A1
+# LIR merge-lowering defect (backend-a1-lir-lowering.md §6) — a `mut` scalar RE-ASSIGNED inside
+# an `if`/`match` arm (the range-`for` desugar's per-iteration `if !first { i = i + 1 }` step)
+# was dropped at the arm's merge, so the loop back-edge carried the stale header counter and it
+# froze. F1 threads arm-reassigned scalars through the merge as block-params (the SAME machinery
+# loop headers use), fixing own-wasm range loops with ZERO stackifier change. `own_if_reassign_exit`
+# joins as the loop-independent ROOT proof: `mut x = 0; if 1 == 1 { x = 5 }; exit(x)` -> 5.
 CORPUS=(
     own_exit_zero
     own_exit_code
@@ -171,6 +163,9 @@ CORPUS=(
     wasm_if_both_diverge
     wasm_break_in_if
     wasm_labeled_break
+    wasm_loop_count
+    wasm_continue_step
+    own_if_reassign_exit
 )
 KIND=(
     exit
@@ -182,6 +177,9 @@ KIND=(
     print
     trap
     print
+    exit
+    exit
+    exit
     exit
     exit
     exit
@@ -198,6 +196,9 @@ TARGET=(
     wasm32-wasi
     wasm32-wasi
     wasm64-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
     wasm32-wasi
     wasm32-wasi
     wasm32-wasi
