@@ -63,7 +63,7 @@ done
 for f in --help -h; do
   run_flag "$f"
   [ "$RC" -eq 0 ] || fail "'$f' exit $RC (want 0)"
-  # the banner goes to stderr (leads with the version line, like main.c's usage()).
+  # the banner goes to stderr (leads with the version line — main.tks's usage banner).
   printf '%s\n' "$ERR" | grep -qF "$EXPECTED" || fail "'$f' banner missing version line '$EXPECTED'"
   printf '%s\n' "$ERR" | grep -q "usage: teko"   || fail "'$f' banner missing 'usage: teko'"
 done
