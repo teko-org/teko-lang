@@ -197,7 +197,6 @@ CORPUS=(
     own_if_exit
     own_match_exit
     own_print_exit
-    wasm_defer_arm_scope
 )
 
 # ── KNOWN-STOP list ────────────────────────────────────────────────────────────────────
@@ -233,15 +232,6 @@ CORPUS=(
 #   not yet lowered (N2)" — a COMPILER diagnostic, not a linker failure. The
 #   KNOWN_STOP_ERR substring below matches THIS new signature.
 #
-# wasm_defer_arm_scope — an if-statement THEN-arm `defer` scoping regression (#389,
-#   PR #553 review finding): `close_arm_replaying_defers` (`src/lir/lower.tks`) is a
-#   LOWERING-layer (LIR-construction) fix, shared by EVERY backend that consumes the
-#   LIR it builds — own-native (this harness) as much as own-wasm (its OWN corpus,
-#   `scripts/validate_wasm_own.sh`). Its `println("A")`/`println("B")` args are PLAIN
-#   string literals (never interpolated), so it lands squarely in the io-group `str`
-#   FAT-pair path #389 C1-6 already closed for `own_print_exit` above — never the
-#   later, SEPARATE call-result fat-pointer gap that keeps `own_print_exit` itself in
-#   KNOWN_STOP. Compared here (own == C == exit 7, stdout "B\n" only).
 declare -a KNOWN_STOP=(
     own_print_exit
 )
