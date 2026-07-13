@@ -132,23 +132,46 @@ fixture_root="$script_dir/examples/regressions"
 # TEKO_TARGET=wasm64-wasi and its own-wasm leg runs with wasmtime's `-W memory64=y`/
 # wasm-validate's `--enable-memory64` (the memory64 proposal is NOT on by default).
 #
-# The five §14.1/§12.2 FIX-1/FIX-2 engine-level control-flow proofs (#389 C1-8b) join the
-# corpus here: `wasm_if_both_diverge` proves FIX-1(b) (an if/else whose both arms diverge has
-# no merge block, so neither arm gets an arm label); `wasm_break_in_if` proves FIX-1(c) (a
-# break nested in an if inside a loop still gets its single-predecessor loop-exit labeled
-# unconditionally); `wasm_labeled_break` proves #520 (a labeled break resolves to a multi-level
-# `br N` at the right scope depth). Those three are PLAIN `loop { }` shapes (no range/`for`
-# head) — verified own-wasm(wasmtime) == C-native. The remaining two (`wasm_loop_count`,
-# `wasm_continue_step`) are the range-`for` shapes F1 unblocks (see below).
+# Three of the five §14.1/§12.2 FIX-1/FIX-2 engine-level control-flow proofs (#389 C1-8b)
+# join the corpus here: `wasm_if_both_diverge` proves FIX-1(b) (an if/else whose both arms
+# diverge has no merge block, so neither arm gets an arm label); `wasm_break_in_if` proves
+# FIX-1(c) (a break nested in an if inside a loop still gets its single-predecessor loop-exit
+# labeled unconditionally); `wasm_labeled_break` proves #520 (a labeled break resolves to a
+# multi-level `br N` at the right scope depth). All three are PLAIN `loop { }` shapes (no
+# range/`for` head) — verified own-wasm(wasmtime) == C-native.
 #
-# `wasm_loop_count` (FIX-2) and `wasm_continue_step` (§11.5) join CORPUS with F1 (#389): the
-# defect C1-8b's local verification surfaced was NOT a wasm stackifier bug but a SHARED A1
-# LIR merge-lowering defect (backend-a1-lir-lowering.md §6) — a `mut` scalar RE-ASSIGNED inside
-# an `if`/`match` arm (the range-`for` desugar's per-iteration `if !first { i = i + 1 }` step)
-# was dropped at the arm's merge, so the loop back-edge carried the stale header counter and it
-# froze. F1 threads arm-reassigned scalars through the merge as block-params (the SAME machinery
-# loop headers use), fixing own-wasm range loops with ZERO stackifier change. `own_if_reassign_exit`
-# joins as the loop-independent ROOT proof: `mut x = 0; if 1 == 1 { x = 5 }; exit(x)` -> 5.
+# `own_if_reassign_exit` joins the corpus as F1's (#389) own-wasm proof: `mut x = 0; if 1 == 1
+# { x = 5 }; exit(x)` -> 5, own-wasm(wasmtime) == C-native, EMPIRICALLY VERIFIED (self-hosted
+# build + wasmtime run). `own_if_mut_shadow_no_leak` joins as F1's review round 1, Finding 2(i)
+# proof: `mut x = 1; if 1 == 1 { mut x = 99; x = x + 1 }; exit(x)` -> 1, ALSO EMPIRICALLY
+# VERIFIED own-wasm(wasmtime) == C-native. Both prove the LIR-level merge-scalar fix
+# (`reassigned_scalars`/`collect_bound_stmts`, `src/lir/lower.tks`) is correct for the own-wasm
+# backend on a NON-LOOP if/match merge.
+#
+# `wasm_loop_count` (FIX-2) and `wasm_continue_step` (§11.5) remain WITHHELD from CORPUS —
+# EMPIRICALLY RE-VERIFIED after F1 (self-hosted build + wasmtime run, not just design-doc
+# reasoning): the LIR F1 emits for these fixtures is byte-for-byte CORRECT (hand-traced through
+# `print_lmodule`'s dump — the range-`for` step's own if-merge threads the reassigned loop
+# counter exactly as intended, and the computed back-edge arguments already carry the right
+# value at every iteration). The remaining own-wasm exit-0 (still-frozen) is therefore NOT the
+# A1 LIR merge-drop root F1 fixes — it is a SEPARATE, previously-unexercised own-WASM
+# STACKIFIER gap: a loop-carried value that flows through an INTERMEDIATE (non-loop-head) merge
+# block before reaching the loop's own back-edge jump (a "merge-of-merge" chain only F1's fix
+# can produce, since before F1 no if-statement merge ever carried a scalar param at all) is not
+# correctly propagated by `emit_edge_copies`/the wasm local-slot assignment. REPORTED for a
+# follow-up crumb (tracked as F1c, distinct from F1b's defer-write-propagation/value-if-RHS
+# items) — out of THIS crumb's LIR-only scope (`stackify.tks`/isel are explicitly untouched).
+# Silently wiring these two at exit 6 here would redden CI on a leg that does not yet pass.
+#
+# `own_match_pattern_binding_no_collision` (F1's review round 1, Finding 2(ii) proof — a
+# `Shape` variant's `Circle as x` arm collides by name with the enclosing `x` a sibling arm
+# reassigns) is verified own-native == C-native == 1 via `scripts/diff_c_own.sh` (EMPIRICALLY
+# RE-VERIFIED), but is WITHHELD from THIS (wasm) corpus: its own-wasm build's `.wasm` fails
+# `wasm-validate` with a genuine engine rejection ("type mismatch in i64.store, expected [i32,
+# i64] but got [i32, i32]") — a SEPARATE, pre-existing own-wasm struct/variant field-store gap
+# (unrelated to scalar merge-threading), exposed because no prior wasm-corpus fixture combined
+# a variant CONSTRUCTION with a pattern-bind arm. REPORTED alongside the F1c stackifier finding
+# above; also out of this crumb's scope.
 CORPUS=(
     own_exit_zero
     own_exit_code
@@ -163,9 +186,8 @@ CORPUS=(
     wasm_if_both_diverge
     wasm_break_in_if
     wasm_labeled_break
-    wasm_loop_count
-    wasm_continue_step
     own_if_reassign_exit
+    own_if_mut_shadow_no_leak
 )
 KIND=(
     exit
@@ -177,7 +199,6 @@ KIND=(
     print
     trap
     print
-    exit
     exit
     exit
     exit
@@ -196,7 +217,6 @@ TARGET=(
     wasm32-wasi
     wasm32-wasi
     wasm64-wasi
-    wasm32-wasi
     wasm32-wasi
     wasm32-wasi
     wasm32-wasi

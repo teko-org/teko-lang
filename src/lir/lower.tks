@@ -1803,12 +1803,19 @@ fn contains_str(xs: []str, s: str) -> bool {
 /**
  * collect_reassigned_stmts — accumulate into `acc` the target of every
  * `TAssign` of `AssignKind::Simple` reachable in `stmts`, DESCENDING into the
- * statement blocks of a nested statement-form `if`/`match`, a `loop`, and a
- * `defer`. A reassignment buried one control-flow level down still rebinds
- * the enclosing scalar PAST that inner merge, so the OUTER merge must carry
- * it too — the SAME drop, one level in. Expression-position `if`/`match`
- * values are not walked: their own lowering threads any reassignment through
- * their own merge before this branch's merge is ever reached (#389 F1).
+ * statement blocks of a nested statement-form `if`/`match` and a `loop`. A
+ * reassignment buried one control-flow level down still rebinds the
+ * enclosing scalar PAST that inner merge, so the OUTER merge must carry it
+ * too — the SAME drop, one level in. Expression-position `if`/`match` values
+ * are not walked: their own lowering threads any reassignment through their
+ * own merge before this branch's merge is ever reached. A `defer` body is
+ * NOT descended into (review round 1, Finding 1): an arm's closing jump-args
+ * are sampled from its env BEFORE `close_arm_replaying_defers` replays the
+ * defer body, so a reassignment inside a defer can never reach the merge
+ * param with its post-defer value — threading one would only mint a
+ * spurious param carrying the STALE pre-defer VReg, fixing nothing. Real
+ * defer-write propagation is a separate, pre-existing gap (tracked as F1b),
+ * not this fix (#389 F1).
  *
  * @param []checker::TStatement stmts  the statement block to scan
  * @param []str acc  the assignment targets gathered so far
@@ -1828,8 +1835,9 @@ fn collect_reassigned_stmts(stmts: []checker::TStatement, acc: []str) -> []str {
 /**
  * collect_reassigned_stmt — one statement's contribution to the
  * reassigned-target scan: a `Simple` `TAssign` yields its `name`; a
- * statement-form `if`/`match` (a `TExprStmt`), a `loop`, and a `defer`
- * recurse into their own statement blocks; every other statement contributes
+ * statement-form `if`/`match` (a `TExprStmt`) and a `loop` recurse into their
+ * own statement blocks; every other statement — INCLUDING a `defer` (review
+ * round 1, Finding 1; see `collect_reassigned_stmts`'s doc) — contributes
  * nothing (#389 F1).
  *
  * @param checker::TStatement s  the statement to scan
@@ -1842,7 +1850,6 @@ fn collect_reassigned_stmt(s: checker::TStatement, acc: []str) -> []str {
         checker::TAssign as a => match a.kind { parser::AssignKind::Simple => teko::list::push(acc, a.name); _ => acc }
         checker::TExprStmt as es => collect_reassigned_expr_stmt(es.expr, acc)
         checker::TLoopStmt as l => collect_reassigned_stmts(l.body, collect_reassigned_stmts(l.init, acc))
-        checker::TDeferStmt as d => collect_reassigned_stmts(d.body, acc)
         _ => acc
     }
 }
@@ -1900,6 +1907,199 @@ fn collect_reassigned_match(m: checker::TMatchExpr, acc: []str) -> []str {
 }
 
 /**
+ * bind_target_names — every name a `let`/`mut` `TBinding`'s target
+ * introduces: one name for a `SimpleName` target, or the whole destructured
+ * set for a `DestructurePattern` target (review round 1, Finding 2 — the
+ * shadow-exclusion guard's atomic name source) (#389 F1).
+ *
+ * @param parser::BindTarget t  the binding's target
+ * @return []str  every name `t` introduces
+ */
+fn bind_target_names(t: parser::BindTarget) -> []str {
+    match t {
+        parser::SimpleName as sn => teko::list::push(teko::list::empty(), sn.name)
+        parser::DestructurePattern as dp => dp.names
+    }
+}
+
+/**
+ * collect_bound_stmts — accumulate into `acc` every name a `let`/`mut`
+ * `TBinding` introduces anywhere reachable in `stmts`, descending the SAME
+ * statement-form `if`/`match`/`loop` shapes `collect_reassigned_stmts` walks
+ * (never a `defer` body, symmetric with that scan). This is the
+ * shadow-exclusion guard's raw material (review round 1, Finding 2): a name
+ * this collects is one some arm REBINDS to a fresh, block-scoped local, so a
+ * same-named `TAssign` anywhere in that arm's reach may be reassigning the
+ * SHADOW, not the enclosing scalar (#389 F1).
+ *
+ * @param []checker::TStatement stmts  the statement block to scan
+ * @param []str acc  the bound names gathered so far
+ * @return []str  `acc` extended with every `let`/`mut` binding name found
+ */
+fn collect_bound_stmts(stmts: []checker::TStatement, acc: []str) -> []str {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= stmts.len { break }
+        out = collect_bound_stmt(stmts[i], out)
+        i++
+    }
+    out
+}
+
+/**
+ * collect_bound_stmt — one statement's contribution to the bound-name scan:
+ * a `TBinding` yields its target's names; a statement-form `if`/`match` (a
+ * `TExprStmt`) and a `loop` recurse into their own statement blocks; every
+ * other statement contributes nothing (#389 F1).
+ *
+ * @param checker::TStatement s  the statement to scan
+ * @param []str acc  the bound names gathered so far
+ * @return []str  `acc` extended with this statement's own bound names
+ */
+fn collect_bound_stmt(s: checker::TStatement, acc: []str) -> []str {
+    match s {
+        checker::TBinding as b => append_all_str(acc, bind_target_names(b.target))
+        checker::TExprStmt as es => collect_bound_expr_stmt(es.expr, acc)
+        checker::TLoopStmt as l => collect_bound_stmts(l.body, collect_bound_stmts(l.init, acc))
+        _ => acc
+    }
+}
+
+/**
+ * append_all_str — append every element of `xs`, in order, to `acc` (the
+ * shared tail `collect_bound_stmt`/pattern-name collection reduces onto)
+ * (#389 F1).
+ *
+ * @param []str acc  the list to extend
+ * @param []str xs  the elements to append
+ * @return []str  `acc` with every element of `xs` appended, in order
+ */
+fn append_all_str(acc: []str, xs: []str) -> []str {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out = teko::list::push(out, xs[i])
+        i++
+    }
+    out
+}
+
+/**
+ * collect_bound_expr_stmt — the bound-name scan of a statement's expression:
+ * only a statement-form `if`/`match` bears further statement blocks to
+ * descend into; any other expression kind contributes nothing (#389 F1).
+ *
+ * @param checker::TExpr e  the expression-statement's expression
+ * @param []str acc  the bound names gathered so far
+ * @return []str  `acc` extended with the nested control-flow's own bound
+ *                names
+ */
+fn collect_bound_expr_stmt(e: checker::TExpr, acc: []str) -> []str {
+    match e.kind {
+        checker::TIfExpr as f => collect_bound_if(f, acc)
+        checker::TMatchExpr as m => collect_bound_match(m, acc)
+        _ => acc
+    }
+}
+
+/**
+ * collect_bound_if — descend the bound-name scan into both blocks of a
+ * nested statement-form `if` (the else block only when present) (#389 F1).
+ *
+ * @param checker::TIfExpr f  the nested if node
+ * @param []str acc  the bound names gathered so far
+ * @return []str  `acc` extended with both arms' own bound names
+ */
+fn collect_bound_if(f: checker::TIfExpr, acc: []str) -> []str {
+    let after_then = collect_bound_stmts(f.then_blk, acc)
+    if f.has_else { return collect_bound_stmts(f.else_blk, after_then) }
+    after_then
+}
+
+/**
+ * collect_bound_match — descend the bound-name scan into every arm body of a
+ * nested statement-form `match` (#389 F1).
+ *
+ * @param checker::TMatchExpr m  the nested match node
+ * @param []str acc  the bound names gathered so far
+ * @return []str  `acc` extended with every arm body's own bound names
+ */
+fn collect_bound_match(m: checker::TMatchExpr, acc: []str) -> []str {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= m.arms.len { break }
+        out = collect_bound_stmts(m.arms[i].body, out)
+        i++
+    }
+    out
+}
+
+/**
+ * pattern_bound_names — every name a match `Pattern` binds: a `BindPattern`
+ * yields its `binding` when `has_binding`; a `FieldPattern` yields every
+ * requested field name (each becomes a bound local); an `AltPattern` yields
+ * the union over its options; any other pattern kind binds nothing (review
+ * round 1, Finding 2 — a match arm's OWN pattern binding collides with an
+ * enclosing scalar of the same name exactly like a `let`/`mut` shadow) (#389
+ * F1).
+ *
+ * @param parser::Pattern p  the pattern to scan
+ * @return []str  every name `p` binds
+ */
+fn pattern_bound_names(p: parser::Pattern) -> []str {
+    match p {
+        parser::BindPattern as bp => if bp.has_binding { teko::list::push(teko::list::empty(), bp.binding) } else { teko::list::empty() }
+        parser::FieldPattern as fp => fp.fields
+        parser::AltPattern as ap => collect_alt_pattern_names(ap.options, teko::list::empty())
+        _ => teko::list::empty()
+    }
+}
+
+/**
+ * collect_alt_pattern_names — the union of `pattern_bound_names` over every
+ * option of an `AltPattern`, in order (#389 F1).
+ *
+ * @param []parser::Pattern options  the alternation's options
+ * @param []str acc  the bound names gathered so far
+ * @return []str  `acc` extended with every option's own bound names
+ */
+fn collect_alt_pattern_names(options: []parser::Pattern, acc: []str) -> []str {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= options.len { break }
+        out = append_all_str(out, pattern_bound_names(options[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * collect_match_pattern_bound_names — the union of `pattern_bound_names`
+ * over every arm's OWN pattern, across all of a match's arms (review round
+ * 1, Finding 2's shadow-exclusion guard for a match's pattern bindings, which
+ * `collect_bound_stmts` cannot see — a pattern binding is not a `TBinding`
+ * statement) (#389 F1).
+ *
+ * @param []checker::TArm arms  the match's arms
+ * @param []str acc  the bound names gathered so far
+ * @return []str  `acc` extended with every arm's own pattern-binding names
+ */
+fn collect_match_pattern_bound_names(arms: []checker::TArm, acc: []str) -> []str {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= arms.len { break }
+        out = append_all_str(out, pattern_bound_names(arms[i].pattern))
+        i++
+    }
+    out
+}
+
+/**
  * reassigned_scalars — the enclosing-scope SCALAR names some arm of this
  * branch re-assigns (`TAssign`, `AssignKind::Simple`), so the merge must
  * carry them as block-params. A static pre-scan of the arm statement blocks
@@ -1911,24 +2111,77 @@ fn collect_reassigned_match(m: checker::TMatchExpr, acc: []str) -> []str {
  * names bound as SCALARS in `env` qualify (a fat `str`/`slice` local stays
  * unpromoted, mirroring `promote_env`), and the result is DISTINCT and in
  * `env` order so the merge params, each arm's jump args, and the rebuilt
- * post-merge env all agree positionally (#389 F1).
+ * post-merge env all agree positionally.
+ *
+ * A name ANY arm re-binds via its own `let`/`mut` (`collect_bound_stmts`) is
+ * EXCLUDED even when an assignment of that same name is also seen (review
+ * round 1, Finding 2 — the shadow-exclusion guard): `mut x=1; if c { mut
+ * x=99; x=x+1 }` must NOT thread `x` — the inner assignment reassigns the
+ * BLOCK-SCOPED shadow, and threading it would carry the shadow's value past
+ * the merge as if it were the enclosing scalar's, a genuine miscompile. An
+ * excluded name simply falls back to the pre-F1 dropped-at-merge behavior
+ * (a documented, pre-existing gap — not a regression this fix introduces)
+ * (#389 F1).
  *
  * @param []checker::TStatement arms  every arm's statement block, flattened
  * @param LEnv env  the pre-branch scalar environment (the promotable names)
- * @return []str  the distinct enclosing scalar names re-assigned in any arm
+ * @return []str  the distinct enclosing scalar names re-assigned, and not
+ *                shadowed, in any arm
  */
 fn reassigned_scalars(arms: []checker::TStatement, env: LEnv) -> []str {
     let raw = collect_reassigned_stmts(arms, teko::list::empty())
+    let bound = collect_bound_stmts(arms, teko::list::empty())
     mut out: []str = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= env.names.len { break }
-        if !env.has_len[i] && contains_str(raw, env.names[i]) && !contains_str(out, env.names[i]) {
+        if !env.has_len[i] && contains_str(raw, env.names[i]) && !contains_str(bound, env.names[i]) && !contains_str(out, env.names[i]) {
             out = teko::list::push(out, env.names[i])
         }
         i++
     }
     out
+}
+
+/**
+ * exclude_names — `names` with every entry present in `excluded` removed,
+ * preserving order (#389 F1, review round 1 Finding 2).
+ *
+ * @param []str names  the candidate list
+ * @param []str excluded  the names to drop
+ * @return []str  `names` minus every entry also in `excluded`
+ */
+fn exclude_names(names: []str, excluded: []str) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        if !contains_str(excluded, names[i]) { out = teko::list::push(out, names[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * reassigned_scalars_for_match — `reassigned_scalars` over a match's arm
+ * bodies, ADDITIONALLY excluding any name some arm's own PATTERN binds
+ * (review round 1, Finding 2): `match v { Some(x) => { <use x> }; None => {
+ * x=5 } }` must not thread `x` — the `Some` arm's pattern-bound `x` and the
+ * `None` arm's enclosing-scalar reassignment share a name only by
+ * coincidence, and `jump_args_for_names`'s newest-first lookup would resolve
+ * the `Some` arm's closing jump against ITS OWN pattern binding instead of
+ * the enclosing scalar, a genuine miscompile on that arm's path. An excluded
+ * name falls back to the pre-F1 dropped-at-merge behavior (#389 F1).
+ *
+ * @param []checker::TArm arms  the match's arms
+ * @param LEnv env  the pre-branch scalar environment (the promotable names)
+ * @return []str  the distinct enclosing scalar names re-assigned, and not
+ *                shadowed by any arm's binding OR pattern, in any arm
+ */
+fn reassigned_scalars_for_match(arms: []checker::TArm, env: LEnv) -> []str {
+    let candidates = reassigned_scalars(match_arm_stmts(arms), env)
+    let pattern_bound = collect_match_pattern_bound_names(arms, teko::list::empty())
+    exclude_names(candidates, pattern_bound)
 }
 
 /**
@@ -3241,10 +3494,12 @@ fn lower_match_arms_value(ctx: LowerCtx, e: checker::TExpr, arms: []checker::TAr
  *           pre-lowering `ctx` — mirrors the `lower_coalesce` fix. A scalar an
  *           arm re-assigns is threaded through the merge as an extra param
  *           after the value param (`add_merge_scalar_params`), mirroring
- *           `lower_if_value` (#389 F1).
+ *           `lower_if_value`, EXCEPT a name any arm's PATTERN also binds is
+ *           excluded (`reassigned_scalars_for_match`, review round 1 Finding
+ *           2) (#389 F1).
  */
 fn lower_match_value(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, subj: MatchSubj) -> Lowered | error {
-    let names = reassigned_scalars(match_arm_stmts(m.arms), ctx.env)
+    let names = reassigned_scalars_for_match(m.arms, ctx.env)
     let mergeb = alloc_block(ctx.func)
     let mp = add_block_param(mergeb.func, mergeb.block_id)
     let merged = add_merge_scalar_params(mp.func, mergeb.block_id, ctx.env, names)
@@ -3337,10 +3592,12 @@ fn lower_match_arms_stmt(ctx: LowerCtx, e: checker::TExpr, arms: []checker::TArm
  *           growth), never the stale pre-lowering `ctx` — mirrors the
  *           `lower_coalesce` fix. A scalar an arm re-assigns is threaded
  *           through the merge as a block-param (`add_merge_scalar_params`),
- *           mirroring `lower_if_stmt` (#389 F1).
+ *           mirroring `lower_if_stmt`, EXCEPT a name any arm's PATTERN also
+ *           binds is excluded (`reassigned_scalars_for_match`, review round
+ *           1 Finding 2) (#389 F1).
  */
 fn lower_match_stmt(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, subj: MatchSubj) -> Lowered | error {
-    let names = reassigned_scalars(match_arm_stmts(m.arms), ctx.env)
+    let names = reassigned_scalars_for_match(m.arms, ctx.env)
     let mergeb = alloc_block(ctx.func)
     let merged = add_merge_scalar_params(mergeb.func, mergeb.block_id, ctx.env, names)
     let base_ctx = ctx_with(ctx, merged.func, ctx.block_id, ctx.env)
