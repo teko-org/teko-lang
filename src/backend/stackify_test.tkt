@@ -1346,23 +1346,33 @@ fn stackify_func_match_three_arm_chain_matches_wat2wasm_golden() {
     f = lir::append_inst(f, arm2.block_id, lir::jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), r300.vreg), 0, 0))
     f = lir::append_inst(f, mergeb.block_id, lir::ret_inst(mp.vreg, 0, 0))
     let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
-    /* Each guard's own `c*`/`cmp*` pair is single-use, same-block, LIFO —
-     * both ride the stack (dropping their own `local.set`/`local.get`
-     * traffic, including the fused compare feeding `if` directly). `k`
-     * (the match scrutinee) is used TWICE, once per guard, in TWO
-     * DIFFERENT blocks — cross-block, so it stays an ordinary local
-     * exactly as before, and each guard's own `eq` reads it fresh. Each
+    /* Each guard's own `cmp*` (the `ICmpEq` result) is single-use,
+     * same-block, LIFO — it rides the stack, dropping its own `local.set`/
+     * `local.get` traffic (the fused compare feeding `if` directly). Each
+     * guard's own `c*` constant does NOT also elide, even though it is
+     * ALSO single-use/same-block: `k` (the match scrutinee) is used TWICE,
+     * once per guard, in TWO DIFFERENT blocks — cross-block, so `k` itself
+     * stays an ordinary local — and `resolve_inst_operands`' own
+     * ALL-OR-NOTHING rule (§5 condition 3) means `cmp*`'s two-operand
+     * `eq` can only ride ITS OWN operands off the stack as a matched PAIR;
+     * since `k` never rides (cross-block), `c*` is forced back to a local
+     * too rather than partially riding alone — a partial ride would
+     * silently invert `cmp*`'s two operands relative to each other on the
+     * real wasm stack (the miscompile this all-or-nothing rule closes;
+     * `eq` is symmetric, so an EARLIER, buggy version of this fixture
+     * happened to still assert a byte-correct-looking golden with `c*`
+     * wrongly eliding — this is the corrected, order-honest shape). Each
      * arm's own `r100`/`r200`/`r300` stays a local too — its one use is an
      * edge-copy argument into `mergeb`, not a computational consumer. */
     let want = [
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
-        0x41 to byte, 0x00 to byte,
-        0x20 to byte, 0x00 to byte, 0x46 to byte,
+        0x41 to byte, 0x00 to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x00 to byte, 0x20 to byte, 0x02 to byte, 0x46 to byte,
         0x04 to byte, 0x40 to byte,
         0x41 to byte, 0xE4 to byte, 0x00 to byte, 0x21 to byte, 0x06 to byte, 0x20 to byte, 0x06 to byte, 0x21 to byte, 0x01 to byte,
         0x05 to byte,
-        0x41 to byte, 0x01 to byte,
-        0x20 to byte, 0x00 to byte, 0x46 to byte,
+        0x41 to byte, 0x01 to byte, 0x21 to byte, 0x04 to byte,
+        0x20 to byte, 0x00 to byte, 0x20 to byte, 0x04 to byte, 0x46 to byte,
         0x04 to byte, 0x40 to byte,
         0x41 to byte, 0xC8 to byte, 0x01 to byte, 0x21 to byte, 0x07 to byte, 0x20 to byte, 0x07 to byte, 0x21 to byte, 0x01 to byte,
         0x05 to byte,
@@ -2806,4 +2816,149 @@ fn wasm_synth_start_rejects_a_non_i32_non_void_main_ret() {
         WasmFunc => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-main-ret")
     }
+}
+
+/* ==========================================================================
+ * C1-5 — the adversarial-review fix (PR #546): `resolve_inst_operands`'s
+ * own PARTIAL-match branch (a real, reproduced miscompile — a pop-as-you-go
+ * scan that only cancelled what was STILL pending on a mismatch left
+ * ALREADY-POPPED top matches wrongly riding the stack, inverting a
+ * non-commutative op's operand order) is now ALL-OR-NOTHING, and
+ * `sc_use_operands` mirrors the same rule on the emission side.
+ * ========================================================================== */
+
+#test
+/**
+ * resolve_inst_operands_partial_match_cancels_the_whole_pending_stack — the
+ * exact shape the adversarial review reproduced end-to-end: `pending =
+ * [c]` (one entry, tentatively `Drop`), an instruction whose own reversed
+ * reads are `[c, bp]` — the LAST-pushed operand (`c`) matches `pending`'s
+ * top, but the operand BEFORE it (`bp`) is not pending at all (it is
+ * `Normal`, multi-use). The old "pop the matches, cancel only what's left"
+ * shape left `c` wrongly `Drop` (already popped, so never revisited by the
+ * cancellation step) — the fix cancels `c` too, over the ORIGINAL pending,
+ * because a PARTIAL ride is exactly as unsound as a total mismatch.
+ *
+ * @return void
+ */
+fn resolve_inst_operands_partial_match_cancels_the_whole_pending_stack() {
+    let table0 = et_set(et_empty(), 10 to u32, elide_kind_drop())
+    let pending = teko::list::push(teko::list::empty(), PendingItem { vreg = 10 to u32; is_load = false })
+    let result = resolve_inst_operands(pending, table0, [10 to u32, 99 to u32])
+    teko::assert::is_true(result.pending.len == 0)
+    teko::assert::is_true(et_get(result.table, 10 to u32) == elide_kind_normal())
+}
+
+/**
+ * sft_bp_via_block_param — a 2-block, 1-param `LFunc` whose param reaches a
+ * SECOND block purely as that block's own incoming block-arg (`bp`) — a
+ * block-param is FORCED-LOCAL regardless of use count (§5), so `bp` is
+ * `Normal` with NO extra "give it a second use" fixture noise. `op(bp,
+ * const)` (built by the caller) is the fixture's own operand pair: `bp`
+ * (`Normal`, never pending) paired with a FRESH single-use constant (a
+ * `Drop` CANDIDATE the fix must downgrade back to `Normal`, since `bp`
+ * itself can never ride).
+ *
+ * @param lir::LBinOp op  the binary op `bp op const_val` computes
+ * @param i128 const_val  the second operand's own constant value
+ * @return lir::LFunc  the seeded function (its own `ret`'s value is the
+ *                      op's own result)
+ */
+fn sft_bp_via_block_param(op: lir::LBinOp, const_val: i128) -> lir::LFunc {
+    mut f = lir::new_func("teko__test__bp_op_const", 1, [lir::LType::I32], lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    let b1 = lir::alloc_block(f)
+    let bp = lir::add_block_param(b1.func, b1.block_id)
+    let entry_args = teko::list::push(teko::list::empty(), 0 to u32)
+    f = lir::append_inst(bp.func, 0, lir::jump_inst(b1.block_id, entry_args, 0, 0))
+    let c = lir::alloc_vreg(f)
+    f = lir::append_inst(c.func, b1.block_id, lir::const_int_inst(c.vreg, const_val, 0, 0))
+    let r = lir::alloc_vreg(f)
+    f = lir::append_inst(r.func, b1.block_id, lir::bin_inst(r.vreg, op, bp.vreg, c.vreg, 0, 0))
+    lir::append_inst(f, b1.block_id, lir::ret_inst(r.vreg, 0, 0))
+}
+
+#test
+/**
+ * stackify_func_non_commutative_sub_keeps_the_correct_operand_order — the
+ * adversarial review's own repro, end to end: `bp - 7`. Before the fix this
+ * emitted `i32.const 7; local.get bp; i32.sub` (`7 - bp`, WRONG); the fix
+ * forces BOTH operands off the stack (`bp` was never eligible; `7`'s
+ * partial ride is now correctly cancelled too), so the ALL-LOCALS order is
+ * preserved: `local.get bp; i32.const 7; i32.sub` (`bp - 7`, CORRECT).
+ *
+ * @return void
+ */
+fn stackify_func_non_commutative_sub_keeps_the_correct_operand_order() {
+    let f = sft_bp_via_block_param(lir::LBinOp::ISub, 7 to i128)
+    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
+        0x41 to byte, 0x07 to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x01 to byte, 0x20 to byte, 0x02 to byte, 0x6B to byte,
+        0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * stackify_func_non_commutative_compare_keeps_the_correct_operand_order —
+ * the comparison-family repro: `bp < 7` (`ICmpLtS`). Every comparison is
+ * non-commutative the SAME way `ISub` is; the fix's own all-or-nothing rule
+ * applies identically: `local.get bp; i32.const 7; i32.lt_s`.
+ *
+ * @return void
+ */
+fn stackify_func_non_commutative_compare_keeps_the_correct_operand_order() {
+    let f = sft_bp_via_block_param(lir::LBinOp::ICmpLtS, 7 to i128)
+    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
+        0x41 to byte, 0x07 to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x01 to byte, 0x20 to byte, 0x02 to byte, 0x48 to byte,
+        0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * stackify_func_store_with_normal_addr_and_a_would_be_drop_value — an
+ * `LStore` golden: `addr` is a block-param (`Normal`, never pending) and
+ * `value` is a single-use constant that would (buggily) partially ride the
+ * stack alone. The fix forces `value` back to a local too — `local.get
+ * addr; local.get value; i32.store` — never `i32.const N` left riding into
+ * a store whose OWN address operand comes from a DIFFERENT, unrelated
+ * local.get, which would silently store the WRONG value at the WRONG
+ * moment relative to the address.
+ *
+ * @return void
+ */
+fn stackify_func_store_with_normal_addr_and_a_would_be_drop_value() {
+    mut f = lir::new_func("teko__test__store_normal_addr", 1, [lir::LType::I32], lir::LType::Void)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    let b1 = lir::alloc_block(f)
+    let addr = lir::add_block_param(b1.func, b1.block_id)
+    let entry_args = teko::list::push(teko::list::empty(), 0 to u32)
+    f = lir::append_inst(addr.func, 0, lir::jump_inst(b1.block_id, entry_args, 0, 0))
+    let cval = lir::alloc_vreg(f)
+    f = lir::append_inst(cval.func, b1.block_id, lir::const_int_inst(cval.vreg, 42 to i128, 0, 0))
+    f = lir::append_inst(f, b1.block_id, lir::store_inst(addr.vreg, cval.vreg, lir::LType::I32, 0, 0))
+    f = lir::append_inst(f, b1.block_id, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
+        0x41 to byte, 0x2A to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x01 to byte, 0x20 to byte, 0x02 to byte,
+        0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
 }

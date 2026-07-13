@@ -753,16 +753,19 @@ fn pending_match_run(pending0: []u32, reversed_reads: []u32) -> u64 {
  * sc_use_operands — the value-stack peephole's own OPERAND-READ entry point
  * (§5): resolve `vregs` (one instruction's own operand VRegs, in push
  * order) against `ctx0.pending` as ONE unit, mirroring `compute_block_
- * elide`'s own static `resolve_inst_operands` exactly — a trailing
- * (rightmost, last-pushed) contiguous run may already be sitting on the
- * real wasm operand stack from its own producer(s); every operand BEFORE
- * that run is fetched fresh, `sc_local_get`, in ordinary push order. A
- * single independent top-of-`pending` check per operand (checking `a` then
- * `b` in that order) is UNSOUND for 2+ operands: once a LATER-pushed
- * operand has correctly matched and popped, an EARLIER one may only now
- * become reachable at the new top — checking `a` FIRST would miss it. This
- * is why every multi-operand call site (`LBin`/`LStore`/`LCall`) routes
- * through this batched form rather than one `sc_use_operands([v])` per
+ * elide`'s own static `resolve_inst_operands` exactly — an ALL-OR-NOTHING
+ * match: only when EVERY one of `vregs` matches `pending`'s own top `len
+ * (vregs)` entries, in order, do they ALL ride the stack (popped, no bytes
+ * emitted for any of them). Any partial match is treated as NO match at
+ * all — every operand is fetched fresh, `sc_local_get`, in push order —
+ * because a partial ride would leave the FRESH operands' own `local.get`
+ * pushed ON TOP of the still-riding one, inverting the two relative to each
+ * other on the real wasm stack (§5's own miscompile finding: a partial
+ * match on a non-commutative op like `ISub` silently swaps the operand
+ * order). A single independent top-of-`pending` check per operand (`a`
+ * then `b`) is ALSO unsound for the identical reason, which is why every
+ * multi-operand call site (`LBin`/`LStore`/`LCall`) routes through this
+ * batched, all-or-nothing form rather than one `sc_use_operands([v])` per
  * operand.
  *
  * @param StackifyCtx ctx0  the context to extend
@@ -771,7 +774,8 @@ fn pending_match_run(pending0: []u32, reversed_reads: []u32) -> u64 {
  * @since #389 C1-5
  */
 fn sc_use_operands(ctx0: StackifyCtx, vregs: []u32) -> StackifyCtx {
-    let k = pending_match_run(ctx0.pending, u32_list_reverse(vregs))
+    let run = pending_match_run(ctx0.pending, u32_list_reverse(vregs))
+    let k = if run == vregs.len { run } else { 0 to u64 }
     let consumed = StackifyCtx { body = ctx0.body; vtypes = ctx0.vtypes; scopes = ctx0.scopes; next_scratch = ctx0.next_scratch; has_frame = ctx0.has_frame; frame_base = ctx0.frame_base; slots = ctx0.slots; elide = ctx0.elide; pending = u32_stack_pop_n(ctx0.pending, k) }
     let fresh_count = vregs.len - k
     mut ctx = consumed
@@ -2778,22 +2782,71 @@ type PendingFlush = struct {
 }
 
 /**
+ * pending_matches_all — a NON-DESTRUCTIVE, read-only check: does the WHOLE
+ * of `reversed_reads` (an instruction's own operand VRegs, in REVERSE push
+ * order) match `pending`'s own top `len(reversed_reads)` entries, in order,
+ * all the way through? `resolve_inst_operands` (§5 condition 3, LIFO) needs
+ * to know this BEFORE committing to popping anything — see its own doc for
+ * why a partial pop-as-you-go is unsound.
+ *
+ * @param []PendingItem pending0  the simulated pending stack to test
+ * @param []u32 reversed_reads  the instruction's own operand VRegs, in
+ *                               REVERSE push order
+ * @return bool  true iff every one of `reversed_reads` matches, in order
+ * @since #389 C1-5
+ */
+fn pending_matches_all(pending0: []PendingItem, reversed_reads: []u32) -> bool {
+    mut pending = pending0
+    mut i: u64 = 0
+    loop {
+        if i >= reversed_reads.len { break }
+        if pending_top_vreg(pending) != reversed_reads[i] { return false }
+        pending = pending_pop(pending)
+        i++
+    }
+    true
+}
+
+/**
+ * pending_pop_n — `pending` with its own top `n` entries removed (a no-op
+ * past-the-end `n` clamps to emptying `pending`; mirrors `u32_stack_pop_n`).
+ *
+ * @param []PendingItem pending0  the simulated pending stack to shrink
+ * @param u64 n  how many trailing entries to remove
+ * @return []PendingItem  `pending0` minus its last `n` entries
+ * @since #389 C1-5
+ */
+fn pending_pop_n(pending0: []PendingItem, n: u64) -> []PendingItem {
+    mut pending = pending0
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        pending = pending_pop(pending)
+        i++
+    }
+    pending
+}
+
+/**
  * resolve_inst_operands — match one instruction's WHOLE operand list against
  * `pending`, as a single contiguous-suffix run (§5 condition 3, LIFO):
  * `reversed_reads` is that instruction's own operand VRegs in REVERSE push
- * order (the last-pushed operand first). Walk it against `pending`'s own
- * top: a match pops silently and the scan continues; the FIRST mismatch
- * stops the scan entirely — wasm's own left-to-right operand-push order
- * means every operand from that point on (the mismatched one AND every
- * operand still to come in the reverse scan, i.e. every operand EARLIER in
- * push order) will be a fresh `local.get`, which physically PUSHES on top
- * of whatever `pending` still holds — burying it beyond reach. So on a
- * mismatch, whatever remains in `pending` is cancelled in ONE shot
- * (`cancel_all_pending`) rather than dug through one entry at a time (an
- * earlier, unsound draft of this pass tried "cancel the top, retry the same
- * target," which wrongly let a value ride the stack into the WRONG operand
- * position whenever an instruction's own operands were not read in their
- * own production order — a real correctness bug this shape closes).
+ * order (the last-pushed operand first). This is an ALL-OR-NOTHING test
+ * (`pending_matches_all`, checked BEFORE any popping): when EVERY operand
+ * matches, in order, pop them all — every one of them rides the stack. On
+ * ANY mismatch — including a PARTIAL one, where some PREFIX of the reverse
+ * scan already matched — cancel EVERY entry in the ORIGINAL `pending0` in
+ * one shot (`cancel_all_pending`), not just what is still left after the
+ * partial pops. A partial "pop the matches, cancel only what remains" draft
+ * of this pass was UNSOUND: it let the already-matched (now-popped) entries
+ * keep riding the stack while the mismatched (and earlier-in-push-order)
+ * operands fell back to a fresh `local.get` — and that fresh `local.get`
+ * physically pushes ON TOP of the still-riding value, inverting the two
+ * operands' relative stack order. For a non-commutative op (`ISub`,
+ * `IDivS`/`IDivU`, the shifts, EVERY comparison) this silently computed
+ * `b - a` instead of `a - b` — a real, reproduced miscompile this
+ * all-or-nothing shape closes (mirrors `sc_use_operands`'s own identical
+ * fix on the emission side).
  *
  * @param []PendingItem pending0  the simulated pending stack
  * @param ElideTable table0  the decision table so far
@@ -2804,20 +2857,10 @@ type PendingFlush = struct {
  * @since #389 C1-5
  */
 fn resolve_inst_operands(pending0: []PendingItem, table0: ElideTable, reversed_reads: []u32) -> PendingFlush {
-    mut pending = pending0
-    mut matching = true
-    mut i: u64 = 0
-    loop {
-        if i >= reversed_reads.len { break }
-        if matching && pending_top_vreg(pending) == reversed_reads[i] {
-            pending = pending_pop(pending)
-        } else {
-            matching = false
-        }
-        i++
+    if pending_matches_all(pending0, reversed_reads) {
+        return PendingFlush { pending = pending_pop_n(pending0, reversed_reads.len); table = table0 }
     }
-    if matching { return PendingFlush { pending = pending; table = table0 } }
-    PendingFlush { pending = teko::list::empty(); table = cancel_all_pending(pending, table0) }
+    PendingFlush { pending = teko::list::empty(); table = cancel_all_pending(pending0, table0) }
 }
 
 /**
