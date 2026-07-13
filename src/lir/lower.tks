@@ -1874,13 +1874,21 @@ fn close_loop_body(ctx: LowerCtx, head: u32, names: []str, defer_base: u64) -> L
  * close_loop — the context immediately after a loop statement: positioned
  * in the exit block with `exit_env` (every promoted name now reading the
  * exit block's OWN param — the value whichever `break` was taken carried),
- * the loop's OWN growth (rodata/lifted/enums/layouts/defers, from lowering
- * its body) carried forward, and its OWN loop-target restored to what it
- * was BEFORE the loop (the loop's break/continue target does not survive
- * past it, A1-2, #382).
+ * the loop's OWN growth (rodata/lifted/enums/layouts, from lowering its
+ * body) carried forward, and BOTH its OWN loop-target AND its OWN defer
+ * stack restored to what they were BEFORE the loop (A1-2, #382; the C1-6
+ * audit's PR #553 review finding extends the loop_targets restore to
+ * `defers`, the sibling side-carried field: every defer the body registered
+ * ALREADY fired, once per iteration/break/continue, via `close_loop_body`/
+ * `lower_break`/`lower_continue`'s own `replay_defers` calls — carrying
+ * `body_done.defers` forward instead would leave those SAME entries
+ * pending, so a later scope exit's `replay_defers(…, 0)` would fire them a
+ * SECOND time).
  *
- * @param LowerCtx outer  the context as it stood BEFORE the loop (its
- *                        `.loop_targets` is what gets restored)
+ * @param LowerCtx outer  the context as it stood BEFORE the loop's BODY
+ *                        (after its `init`, so an init-registered defer
+ *                        survives too) — its `.loop_targets`/`.defers` are
+ *                        what get restored
  * @param LowerCtx body_done  the context after the loop's body (and its
  *                            fall-through close) finished lowering
  * @param u32 exit_block  the loop's exit block id (the new current block)
@@ -1891,7 +1899,7 @@ fn close_loop(outer: LowerCtx, body_done: LowerCtx, exit_block: u32, exit_env: L
     LowerCtx {
         func = body_done.func; block_id = exit_block; env = exit_env
         layouts = body_done.layouts; rodata = body_done.rodata; enums = body_done.enums; lifted = body_done.lifted
-        defers = body_done.defers; loop_targets = outer.loop_targets
+        defers = outer.defers; loop_targets = outer.loop_targets
     }
 }
 
@@ -1929,7 +1937,7 @@ fn lower_loop(ctx: LowerCtx, l: checker::TLoopStmt) -> LowerStmtOut | error {
     let body_seed = ctx_with_loops(ctx_with(ictx, entered, headb.block_id, head_seed.env), teko::list::push(ictx.loop_targets, target))
     let body_done = match lower_block(body_seed, l.body) { LowerCtx as c => c; error as err => return err }
     let closed = match close_loop_body(body_done, headb.block_id, head_seed.names, defer_base) { LowerCtx as c => c; error as err => return err }
-    LowerStmtOut { ctx = close_loop(ctx, closed, exitb.block_id, exit_seed.env); terminated = false }
+    LowerStmtOut { ctx = close_loop(ictx, closed, exitb.block_id, exit_seed.env); terminated = false }
 }
 
 /** ctx_goto — switch the context to emit into `block_id` (already allocated), keeping the
@@ -1944,6 +1952,66 @@ fn ctx_goto(ctx: LowerCtx, block_id: u32) -> LowerCtx {
 fn close_arm_to(ctx: LowerCtx, target: u32, args: []u32, line: u32, col: u32) -> LFunc {
     if block_terminated(ctx.func, ctx.block_id) { return ctx.func }
     append_inst(ctx.func, ctx.block_id, jump_inst(target, args, line, col))
+}
+
+/**
+ * ClosedArm — the outcome of `close_arm_replaying_defers`: the arm's own
+ * closed function (the merge jump appended, or unchanged when the arm
+ * already terminated) + the context a caller resumes lowering FROM (its
+ * `.defers` reset to the arm's PRE-ENTRY stack — see
+ * `close_arm_replaying_defers`'s own doc for why).
+ */
+pub type ClosedArm = struct { ctx: LowerCtx; func: LFunc }
+
+/**
+ * close_arm_replaying_defers — close a lowered if/match arm CORRECTLY
+ * scoped for its OWN defers: fire every defer the arm itself registered
+ * since entering it (LIFO, from `pre_arm_defers.len`) AFTER the arm's tail
+ * value/effects are already captured, mirroring the C backend's
+ * `emit_branch_value` (`codegen.tks:3376-3400`, which fires a branch's own
+ * defers right after its tail lands in `sink`, never letting them leak past
+ * the branch), THEN reset the pending-defer stack back to `pre_arm_defers`
+ * before jumping to `target`.
+ *
+ * Without the reset, `ctx_with`'s field-copy (the SAME mechanism the C1-6
+ * audit's rodata fix relies on) would carry the arm's own defer
+ * registrations past the merge, where a later function-exit
+ * `replay_defers(…, 0)` (`:3659`) would fire them a SECOND time —
+ * UNCONDITIONALLY, even for an arm whose branch never ran at runtime (PR
+ * #553 review finding: `if cond { defer { print("A") } }; print("B")`
+ * called with `cond=false` must print only "B", never "A"). Arrays are
+ * value types in Teko, so reusing the untouched `pre_arm_defers` slice is a
+ * free truncation — the SAME pattern `close_loop` uses to restore
+ * `loop_targets` (and, after this same audit, `defers` too — see
+ * `close_loop`'s own doc).
+ *
+ * A terminated arm (an early `return`/`break`/`continue` already fired
+ * every defer ITS OWN scope owns, from ITS OWN base — `lower_return`/
+ * `lower_break`/`lower_continue`) never reaches `target` at all: this
+ * function skips the replay for it (mirroring `close_arm_to`'s own
+ * terminated-block no-op) but STILL resets `.defers`, since whatever the
+ * arm registered before terminating must not leak into a sibling arm or
+ * the merge either — that arm's control never reaches them.
+ *
+ * @param LowerCtx ctx  the context after lowering the arm's own body
+ * @param []checker::TDeferStmt pre_arm_defers  the defer stack as it stood
+ *                                               BEFORE the arm (its `.len`
+ *                                               is the replay base, and the
+ *                                               slice itself is what gets
+ *                                               restored)
+ * @param u32 target  the merge block id
+ * @param []u32 args  the merge jump's block-args
+ * @param u32 line  the source line to stamp the replayed defers/jump with
+ * @param u32 col  the source column to stamp the replayed defers/jump with
+ * @return ClosedArm | error  the closed arm + the resume context, or a
+ *                             NAMED internal error when a pending defer
+ *                             body fails to lower
+ */
+fn close_arm_replaying_defers(ctx: LowerCtx, pre_arm_defers: []checker::TDeferStmt, target: u32, args: []u32, line: u32, col: u32) -> ClosedArm | error {
+    if block_terminated(ctx.func, ctx.block_id) { return ClosedArm { ctx = ctx_with_defers(ctx, pre_arm_defers); func = ctx.func } }
+    let replayed = match replay_defers(ctx, pre_arm_defers.len) { LowerCtx as c => c; error as err => return err }
+    let reset = ctx_with_defers(replayed, pre_arm_defers)
+    ClosedArm { ctx = reset; func = close_arm_to(reset, target, args, line, col) }
 }
 
 /** LowerBlockValue — the outcome of lowering a value-producing if-expression arm's
@@ -2011,7 +2079,10 @@ fn lower_if_expr(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr) -> Lower
     `block_id`/`env` and copies every other field (rodata, lifted closures, …) from its FIRST
     argument, so sourcing either point from `ctx` would SILENTLY DROP whatever an arm interned
     (a genuine miscompile: a `global_addr` relocation against a symbol whose definition never
-    reached the module — the SAME class of bug `lower_coalesce` had, C1-6 audit). */
+    reached the module — the SAME class of bug `lower_coalesce` had, C1-6 audit). Each arm
+    closes via `close_arm_replaying_defers` (not the bare `close_arm_to`), so a `defer` EITHER
+    arm registers fires only on ITS OWN branch, never leaking into the other arm or past the
+    merge (PR #553 review finding). */
 fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vreg: u32) -> Lowered | error {
     let thenb = alloc_block(ctx.func)
     let elseb = alloc_block(thenb.func)
@@ -2019,18 +2090,20 @@ fn lower_if_stmt(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vre
     let br = branch_inst(cond_vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), e.line, e.col)
     let ctx1 = ctx_append(ctx_with(ctx, mergeblk.func, ctx.block_id, ctx.env), br)
     let then_done = match lower_block(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerCtx as c => c; error as err => return err }
-    let then_func = close_arm_to(then_done, mergeblk.block_id, teko::list::empty(), e.line, e.col)
-    let else_ctx = ctx_with(then_done, then_func, elseb.block_id, ctx.env)
+    let then_closed = match close_arm_replaying_defers(then_done, ctx1.defers, mergeblk.block_id, teko::list::empty(), e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    let else_ctx = ctx_with(then_closed.ctx, then_closed.func, elseb.block_id, ctx.env)
     let else_done = if f.has_else { match lower_block(else_ctx, f.else_blk) { LowerCtx as c => c; error as err => return err } } else { else_ctx }
-    let else_func = close_arm_to(else_done, mergeblk.block_id, teko::list::empty(), e.line, e.col)
-    Lowered { ctx = ctx_with(else_done, else_func, mergeblk.block_id, ctx.env); vreg = 0 }
+    let else_closed = match close_arm_replaying_defers(else_done, ctx1.defers, mergeblk.block_id, teko::list::empty(), e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    Lowered { ctx = ctx_with(else_closed.ctx, else_closed.func, mergeblk.block_id, ctx.env); vreg = 0 }
 }
 
 /** lower_if_value — the value-producing shape: both arms' TAIL values become the merge
     block's single block-arg (the if-expression's result VReg). An if-without-else used as a
     value is out of the N1 subset (mirrors emit_if_value's own honest-stop). Mirrors
     `lower_if_stmt`'s own arm-threading discipline: `else_ctx` and the final merged context
-    are built from `then_val.ctx`/`else_val.ctx`, never the pre-branch `ctx` (C1-6 audit). */
+    are built from `then_val.ctx`/`else_val.ctx`, never the pre-branch `ctx` (C1-6 audit); each
+    arm closes via `close_arm_replaying_defers` so its OWN defers never leak into the other arm
+    or past the merge (PR #553 review finding). */
 fn lower_if_value(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vreg: u32) -> Lowered | error {
     if !f.has_else { return error { message = "native backend N1: if-without-else used as a value not yet lowered (N2)" } }
     let thenb = alloc_block(ctx.func)
@@ -2041,12 +2114,12 @@ fn lower_if_value(ctx: LowerCtx, e: checker::TExpr, f: checker::TIfExpr, cond_vr
     let ctx1 = ctx_append(ctx_with(ctx, mp.func, ctx.block_id, ctx.env), br)
     let then_val = match lower_block_value(ctx_goto(ctx1, thenb.block_id), f.then_blk) { LowerBlockValue as x => x; error as err => return err }
     let then_args = teko::list::push(teko::list::empty(), then_val.vreg)
-    let then_func = close_arm_to(then_val.ctx, mergeblk.block_id, then_args, e.line, e.col)
-    let else_ctx = ctx_with(then_val.ctx, then_func, elseb.block_id, ctx.env)
+    let then_closed = match close_arm_replaying_defers(then_val.ctx, ctx1.defers, mergeblk.block_id, then_args, e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    let else_ctx = ctx_with(then_closed.ctx, then_closed.func, elseb.block_id, ctx.env)
     let else_val = match lower_block_value(else_ctx, f.else_blk) { LowerBlockValue as x => x; error as err => return err }
     let else_args = teko::list::push(teko::list::empty(), else_val.vreg)
-    let else_func = close_arm_to(else_val.ctx, mergeblk.block_id, else_args, e.line, e.col)
-    Lowered { ctx = ctx_with(else_val.ctx, else_func, mergeblk.block_id, ctx.env); vreg = mp.vreg }
+    let else_closed = match close_arm_replaying_defers(else_val.ctx, ctx1.defers, mergeblk.block_id, else_args, e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    Lowered { ctx = ctx_with(else_closed.ctx, else_closed.func, mergeblk.block_id, ctx.env); vreg = mp.vreg }
 }
 
 /** unwrap_optional — the inner `T` of an `Optional<T>`; any other type is already unwrapped
@@ -2793,14 +2866,17 @@ fn lower_match_guard(ctx: LowerCtx, arm: checker::TArm, next_block: u32) -> Matc
  * BODY-threaded context), never the incoming `ctx` — `ctx_with` copies
  * rodata/lifted-closures from its first argument, so sourcing from `ctx`
  * would drop whatever the arm's test/guard/body interned (the SAME class
- * of bug `lower_coalesce`/`lower_if_value` had, C1-6 audit).
+ * of bug `lower_coalesce`/`lower_if_value` had, C1-6 audit). Closes via
+ * `close_arm_replaying_defers` (not the bare `close_arm_to`), so a `defer`
+ * this arm registers fires only on ITS OWN match, never leaking into a
+ * sibling arm or past the merge (PR #553 review finding).
  */
 fn lower_match_arm_value(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj, merge_id: u32) -> LowerCtx | error {
     let step = match lower_match_arm_entry(ctx, e, arm, subj) { MatchArmEntry as x => x; error as err => return err }
     let bv = match lower_block_value(step.ctx, arm.body) { LowerBlockValue as x => x; error as err => return err }
     let args = teko::list::push(teko::list::empty(), bv.vreg)
-    let closed = close_arm_to(bv.ctx, merge_id, args, e.line, e.col)
-    ctx_with(bv.ctx, closed, step.next_block, ctx.env)
+    let closed = match close_arm_replaying_defers(bv.ctx, ctx.defers, merge_id, args, e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    ctx_with(closed.ctx, closed.func, step.next_block, ctx.env)
 }
 
 /**
@@ -2883,13 +2959,17 @@ fn lower_match_value(ctx: LowerCtx, e: checker::TExpr, m: checker::TMatchExpr, s
  *           post-body context, which carries this arm's rodata and
  *           lifted-closure growth), never the stale pre-arm `ctx` — otherwise
  *           `lower_match_arms_stmt`'s fold would drop each arm's growth in
- *           turn, mirroring the `lower_coalesce` fix.
+ *           turn, mirroring the `lower_coalesce` fix. Closes via
+ *           `close_arm_replaying_defers` (not the bare `close_arm_to`), so a
+ *           `defer` this arm registers fires only on ITS OWN match, never
+ *           leaking into a sibling arm or past the merge (PR #553 review
+ *           finding).
  */
 fn lower_match_arm_stmt(ctx: LowerCtx, e: checker::TExpr, arm: checker::TArm, subj: MatchSubj, merge_id: u32) -> LowerCtx | error {
     let step = match lower_match_arm_entry(ctx, e, arm, subj) { MatchArmEntry as x => x; error as err => return err }
     let done = match lower_block(step.ctx, arm.body) { LowerCtx as c => c; error as err => return err }
-    let closed = close_arm_to(done, merge_id, teko::list::empty(), e.line, e.col)
-    ctx_with(done, closed, step.next_block, ctx.env)
+    let closed = match close_arm_replaying_defers(done, ctx.defers, merge_id, teko::list::empty(), e.line, e.col) { ClosedArm as c => c; error as err => return err }
+    ctx_with(closed.ctx, closed.func, step.next_block, ctx.env)
 }
 
 /**
