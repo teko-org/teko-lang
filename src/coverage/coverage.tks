@@ -1,0 +1,578 @@
+use teko::checker
+use teko::parser
+
+/**
+ * A branch-coverage SITE — one `if` (2 outcomes: then/else) or `match` (arms.len outcomes)
+ * in a walked production-function body. The native run marks the taken outcome of each site
+ * (cov_branch); the report statically enumerates every site and queries cov_branch_hit per
+ * outcome to derive taken/total. Formerly part of the retired interpreter; the walk is engine-independent.
+ */
+type BranchSite = struct {
+    /**
+     * The 1-based source line of the branching expression.
+     */
+    line: u32
+    /**
+     * The source column of the branching expression (disambiguates two sites on one line).
+     */
+    col: u32
+    /**
+     * The number of outcomes: 2 for an `if`, `arms.len` for a `match`.
+     */
+    n: u64
+}
+
+/**
+ * The accumulated coverage walk over one function: the branch SITES it contains plus the set of
+ * DISTINCT executable source lines it touches. One walk feeds the line metric, the branch metric,
+ * and the Cobertura `<line>` elements.
+ */
+type CovWalk = struct {
+    /**
+     * The branch sites (if/match) discovered in walk order.
+     */
+    sites: []BranchSite
+    /**
+     * The distinct executable source lines discovered in walk order.
+     */
+    lines: []u32
+}
+
+/**
+ * Construct an empty coverage-walk accumulator (no sites, no lines).
+ *
+ * @return  a `CovWalk` with empty `sites` and `lines`
+ */
+fn cov_walk_empty() -> CovWalk { CovWalk { sites = teko::list::empty(); lines = teko::list::empty() } }
+
+/**
+ * Add `line` to the walk's distinct-line set. Line 0 (unpositioned) is skipped; a function has few
+ * lines, so linear dedup is adequate.
+ *
+ * @param w     the accumulated coverage-walk state
+ * @param line  the source line to register (0 = ignore)
+ * @return      `w` with `line` present in its distinct-line set
+ */
+fn cov_addline(w: CovWalk, line: u32) -> CovWalk {
+    if line == 0 { return w }
+    mut i = 0
+    loop { if i >= w.lines.len { break }; if w.lines[i] == line { return w }; i = i + 1 }
+    CovWalk { sites = w.sites; lines = teko::list::push(w.lines, line) }
+}
+
+/**
+ * Append one branch site to the walk.
+ *
+ * @param w     the accumulated coverage-walk state
+ * @param line  the branching expression's source line
+ * @param col   the branching expression's source column
+ * @param n     the number of outcomes (2 for `if`, arms.len for `match`)
+ * @return      `w` with the new `BranchSite` pushed onto `sites`
+ */
+fn cov_addsite(w: CovWalk, line: u32, col: u32, n: u64) -> CovWalk {
+    CovWalk { sites = teko::list::push(w.sites, BranchSite { line = line; col = col; n = n }); lines = w.lines }
+}
+
+/**
+ * Recurse an EXPR, collecting its source line (line coverage) and every nested if/match site
+ * (branch coverage) into `w`. ONE walk feeds both the line and branch metrics and the Cobertura
+ * report. Leaves (number/var/strlit/bytelit/boollit/nulllit/pathexpr) add only their own line.
+ *
+ * @param e  the expression to walk
+ * @param w  the accumulated coverage-walk state
+ * @return   `w` with every reachable line/branch site this expression contributes registered
+ */
+fn cov_walk_expr(e: checker::TExpr, w: CovWalk) -> CovWalk {
+    let w0 = cov_addline(w, e.line)
+    match e.kind {
+        checker::TIfExpr as f => {
+            let a1 = cov_addsite(w0, e.line, e.col, 2)
+            let a2 = cov_walk_expr(f.cond, a1)
+            let a3 = cov_walk_block(f.then_blk, a2)
+            if f.has_else { cov_walk_block(f.else_blk, a3) } else { a3 }
+        }
+        checker::TMatchExpr as m => {
+            let a1 = cov_addsite(w0, e.line, e.col, m.arms.len)
+            mut a = cov_walk_expr(m.subject, a1)
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                if m.arms[i].has_when { a = cov_walk_expr(m.arms[i].guard, a) }
+                a = cov_walk_block(m.arms[i].body, a)
+                i++
+            }
+            a
+        }
+        checker::TBinary as b => cov_walk_expr(b.right, cov_walk_expr(b.left, w0))
+        checker::TUnary as u => cov_walk_expr(u.operand, w0)
+        checker::TCompare as c => {
+            mut a = cov_walk_expr(c.first, w0)
+            mut i = 0
+            loop { if i >= c.rest.len { break }; a = cov_walk_expr(c.rest[i].operand, a); i++ }
+            a
+        }
+        checker::TCall as c => {
+            mut a = w0
+            mut i = 0
+            loop { if i >= c.args.len { break }; a = cov_walk_expr(c.args[i], a); i++ }
+            a
+        }
+        checker::TCast as c => cov_walk_expr(c.expr, w0)
+        checker::TFieldAccess as fa => cov_walk_expr(fa.receiver, w0)
+        checker::TSafeFieldAccess as sfa => cov_walk_expr(sfa.receiver, w0)
+        checker::TCoalesce as co => cov_walk_expr(co.right, cov_walk_expr(co.left, w0))
+        checker::TIndex as ix => cov_walk_expr(ix.index, cov_walk_expr(ix.receiver, w0))
+        checker::TStructInit as si => {
+            mut a = w0
+            mut i = 0
+            loop { if i >= si.field_vals.len { break }; a = cov_walk_expr(si.field_vals[i], a); i++ }
+            a
+        }
+        checker::TInterp as in => {
+            mut a = w0
+            mut i = 0
+            loop {
+                if i >= in.holes.len { break }
+                a = cov_walk_expr(in.holes[i], a)
+                if i < in.specs.len {
+                    match in.specs[i].kind {
+                        checker::TFSpecDynamic as fd => {
+                            mut k = 0
+                            loop { if k >= fd.args.len { break }; a = cov_walk_expr(fd.args[k], a); k++ }
+                        }
+                        _ => { }
+                    }
+                }
+                i++
+            }
+            a
+        }
+        checker::TInExpr as ie => {
+            mut a = cov_walk_expr(ie.lhs, w0)
+            mut i = 0
+            loop { if i >= ie.elems.len { break }; a = cov_walk_expr(ie.elems[i], a); i++ }
+            a
+        }
+        checker::TArrayLit as al => {
+            mut a = w0
+            mut i = 0
+            loop { if i >= al.elements.len { break }; a = cov_walk_expr(al.elements[i].expr, a); i++ }
+            a
+        }
+        _ => w0
+    }
+}
+
+/**
+ * The static full-program coverage-line pre-registration walk over ONE statement, mirroring the
+ * set of lines native codegen marks inline as it emits each statement (`emit_cov_lines`/
+ * `stmt_cov_lines`). `TLoopStmt` and `TAdoptStmt` both descend into their body via `cov_walk_block`
+ * — native emits every body statement through `emit_stmt` too (for `adopt`, via `emit_adopt` ->
+ * `emit_block`), so both bodies must be walked here for native parity. A field-assignment's LHS
+ * receiver (#88) is executable too, so it is walked as well. `TDeferStmt`/`TBreakStmt`/
+ * `TContinueStmt` carry no directly-walked expression of their own.
+ *
+ * @param s  the statement to walk
+ * @param w  the accumulated coverage-walk state
+ * @return   `w` with every reachable line/branch site this statement contributes registered
+ */
+fn cov_walk_stmt(s: checker::TStatement, w: CovWalk) -> CovWalk {
+    match s {
+        checker::TBinding as b => cov_walk_expr(b.value, w)
+        checker::TAssign as a => { let w2 = cov_walk_expr(a.value, w); match a.kind { parser::AssignKind::Field => cov_walk_expr(a.target, w2); _ => w2 } }
+        checker::TReturn as r => if r.has_value { cov_walk_expr(r.value, w) } else { w }
+        checker::TLoopStmt as l => cov_walk_block(l.body, cov_walk_block(l.init, w))
+        checker::TExprStmt as x => cov_walk_expr(x.expr, w)
+        checker::TAdoptStmt as ad => cov_walk_block(ad.body, w)
+        _ => w
+    }
+}
+
+/**
+ * Walk every statement of a block, threading the coverage-walk accumulator through in order.
+ *
+ * @param stmts  the block's statements
+ * @param w      the accumulated coverage-walk state
+ * @return       `w` with the whole block's lines/branch sites registered
+ */
+fn cov_walk_block(stmts: []checker::TStatement, w: CovWalk) -> CovWalk {
+    mut a = w
+    mut i = 0
+    loop { if i >= stmts.len { break }; a = cov_walk_stmt(stmts[i], a); i++ }
+    a
+}
+
+/**
+ * Format a Cobertura rate decimal ("0.000".."1.0") from covered/total. A zero denominator is
+ * vacuously "1.0"; a full or over-full ratio clamps to "1.0"; otherwise the three-digit
+ * per-mille fraction is zero-padded.
+ *
+ * @param cov  the covered count (numerator)
+ * @param val  the total count (denominator)
+ * @return     the rate as a Cobertura decimal string
+ */
+fn cov_rate_str(cov: u64, val: u64) -> str {
+    if val == 0 { return "1.0" }
+    let m = cov * 1000 / val
+    if m >= 1000 { return "1.0" }
+    mut fs = teko::str::u64_to_str(m)
+    loop { if fs.len >= 3 { break }; fs = teko::str::concat("0", fs) }
+    teko::str::concat("0.", fs)
+}
+
+/**
+ * Branch taken/total over the sites that sit on one source line (a line may host more than one
+ * if/match).
+ */
+type LineBr = struct {
+    /**
+     * The number of taken outcomes across this line's sites.
+     */
+    taken: u64
+    /**
+     * The total number of outcomes across this line's sites.
+     */
+    total: u64
+}
+
+/**
+ * Tally the branch taken/total for the sites on a single source line of one function.
+ *
+ * @param sites   the function's walked branch sites
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @param ln      the source line whose sites are tallied
+ * @return        a `LineBr` with the taken and total outcome counts on `ln`
+ */
+fn cov_line_branch(sites: []BranchSite, fn_idx: u64, ln: u32) -> LineBr {
+    mut taken: u64 = 0; mut total: u64 = 0
+    mut s = 0
+    loop {
+        if s >= sites.len { break }
+        if sites[s].line == ln {
+            mut o: u64 = 0
+            loop { if o >= sites[s].n { break }; if teko::cov_branch_hit(fn_idx, sites[s].line, sites[s].col, o) { taken = taken + 1 }; o = o + 1 }
+            total = total + sites[s].n
+        }
+        s = s + 1
+    }
+    LineBr { taken = taken; total = total }
+}
+
+/**
+ * Tally one production function's LINE coverage: how many of its distinct executable lines were
+ * hit versus how many exist. The denominator is the walk's `lines.len`; the numerator counts the
+ * lines for which `cov_line_hit` is true for this function index.
+ *
+ * @param w       the function's walked coverage sites and distinct executable lines
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @return        a CovCount whose `cov` is the hit-line count and `val` the total line count
+ */
+fn cov_fn_line_tally(w: CovWalk, fn_idx: u64) -> CovCount {
+    mut cov: u64 = 0
+    mut k = 0
+    loop {
+        if k >= w.lines.len { break }
+        if teko::cov_line_hit(fn_idx, w.lines[k]) { cov = cov + 1 }
+        k = k + 1
+    }
+    CovCount { cov = cov; val = w.lines.len }
+}
+
+/**
+ * Tally one production function's BRANCH coverage: how many condition outcomes were taken versus
+ * how many outcomes exist across every if/match site in the function.
+ *
+ * @param w       the function's walked coverage sites and distinct executable lines
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @return        a CovCount whose `cov` is the taken-outcome count and `val` the total outcomes
+ */
+fn cov_fn_branch_tally(w: CovWalk, fn_idx: u64) -> CovCount {
+    mut cov: u64 = 0
+    mut val: u64 = 0
+    mut s = 0
+    loop {
+        if s >= w.sites.len { break }
+        mut o: u64 = 0
+        loop {
+            if o >= w.sites[s].n { break }
+            if teko::cov_branch_hit(fn_idx, w.sites[s].line, w.sites[s].col, o) { cov = cov + 1 }
+            o = o + 1
+        }
+        val = val + w.sites[s].n
+        s = s + 1
+    }
+    CovCount { cov = cov; val = val }
+}
+
+/**
+ * Append one Cobertura `<line …/>` element per distinct executable line of a production function
+ * onto the copy-grow byte buffer, in walk order. A line that hosts an if/match additionally
+ * carries its condition-coverage percentage. The buffer is threaded linearly (append_fo frees the
+ * superseded backing on grow), so accumulation stays O(total) rather than the O(N²) retention that
+ * repeated `str::concat` would incur.
+ *
+ * @param buf     the copy-grow byte buffer being built
+ * @param w       the function's walked coverage sites and distinct executable lines
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @return        the buffer with this function's `<line>` elements appended
+ */
+fn cov_emit_lines(buf: []byte, w: CovWalk, fn_idx: u64) -> []byte {
+    mut b = buf
+    mut k = 0
+    loop {
+        if k >= w.lines.len { break }
+        let ln = w.lines[k]
+        let lhit: u64 = if teko::cov_line_hit(fn_idx, ln) { 1 to u64 } else { 0 to u64 }
+        let lb = cov_line_branch(w.sites, fn_idx, ln)
+        if lb.total > 0 {
+            let pct = lb.taken * 100 / lb.total
+            b = teko::mem::append_fo(b, $"          <line number='{ln}' hits='{lhit}' branch='true' condition-coverage='{pct}% ({lb.taken}/{lb.total})'/>\n")
+        } else {
+            b = teko::mem::append_fo(b, $"          <line number='{ln}' hits='{lhit}'/>\n")
+        }
+        k = k + 1
+    }
+    b
+}
+
+/**
+ * Append one production function's complete Cobertura `<class>` block onto the copy-grow byte
+ * buffer: the class header (line/branch rates from the supplied tallies), its single-method
+ * `<methods>` summary, and its `<lines>` (via cov_emit_lines). Attributes are single-quoted (valid
+ * XML) so no `"`-escaping is needed. The class name is namespace-qualified when the function has a
+ * namespace, otherwise the bare name.
+ *
+ * @param buf     the copy-grow byte buffer being built
+ * @param f       the production function whose class block is emitted
+ * @param fn_idx  the program-item index of the function (the coverage sink key)
+ * @param w       the function's walked coverage sites and distinct executable lines
+ * @param lt      the function's line tally (cov = hit lines, val = total lines)
+ * @param bt      the function's branch tally (cov = taken outcomes, val = total outcomes)
+ * @param fnhit   1 when the function itself was executed at least once, else 0
+ * @return        the buffer with this function's `<class>` block appended
+ */
+fn cov_emit_class(buf: []byte, f: checker::TFunction, fn_idx: u64, w: CovWalk, lt: CovCount, bt: CovCount, fnhit: u64) -> []byte {
+    let cname = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
+    let lrate = cov_rate_str(lt.cov, lt.val)
+    let brate = cov_rate_str(bt.cov, bt.val)
+    mut b = teko::mem::append_fo(buf, $"      <class name='{cname}' filename='{f.file}' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n")
+    b = teko::mem::append_fo(b, $"        <methods><method name='{f.name}' signature='()V' line-rate='{lrate}' branch-rate='{brate}'><lines><line number='{f.line}' hits='{fnhit}'/></lines></method></methods>\n")
+    b = teko::mem::append_fo(b, "        <lines>\n")
+    b = cov_emit_lines(b, w, fn_idx)
+    teko::mem::append_fo(b, "        </lines>\n      </class>\n")
+}
+
+/**
+ * Build a Cobertura XML coverage report from the LAST run's marks — one `<class>` per production
+ * function (its filename is the function's source file). Each class's `<lines>` are the real
+ * executable lines (every line with an evaluated expression, hit via cov_line_hit); a line that
+ * hosts an if/match also carries its branch condition-coverage. The coverage machinery itself
+ * (`teko::coverage`) is self-excluded, exactly as the retired VM was, so the report never measures
+ * its own reporting code.
+ *
+ * The whole report accumulates into a copy-grow `[]byte` buffer via teko::mem::append_fo (the
+ * codegen's emitter mechanism): each append frees the superseded backing on grow, so the report
+ * costs O(final-size) memory instead of the O(N²) arena retention that repeated str::concat
+ * incurred — every intermediate prefix stayed live, ballooning to tens of GB on the compiler
+ * itself (#468). The `body` buffer holds every class, then the header/footer (which need the
+ * whole-program aggregate rates) wrap it into `out`, converted to a str exactly once at return.
+ *
+ * @param prog  the fully-typed program whose production functions are reported
+ * @return      the complete Cobertura XML document as a str
+ */
+exp fn cov_cobertura(prog: checker::TProgram) -> str {
+    mut body: []byte = teko::list::empty()
+    mut lines_cov: u64 = 0; mut lines_val: u64 = 0
+    mut br_cov: u64 = 0; mut br_val: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if !f.is_test && f.namespace != "teko::coverage" {
+                    let w = cov_walk_block(f.body, cov_walk_empty())
+                    let lt = cov_fn_line_tally(w, i to u64)
+                    let bt = cov_fn_branch_tally(w, i to u64)
+                    lines_cov = lines_cov + lt.cov; lines_val = lines_val + lt.val
+                    br_cov = br_cov + bt.cov; br_val = br_val + bt.val
+                    let fnhit: u64 = if teko::cov_is_marked(i to u64) { 1 to u64 } else { 0 to u64 }
+                    body = cov_emit_class(body, f, i to u64, w, lt, bt, fnhit)
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    let lrate = cov_rate_str(lines_cov, lines_val)
+    let brate = cov_rate_str(br_cov, br_val)
+    mut out: []byte = teko::list::empty()
+    out = teko::mem::append_fo(out, "<?xml version='1.0' ?>\n")
+    out = teko::mem::append_fo(out, $"<coverage line-rate='{lrate}' branch-rate='{brate}' lines-covered='{lines_cov}' lines-valid='{lines_val}' branches-covered='{br_cov}' branches-valid='{br_val}' complexity='0' version='teko' timestamp='0'>\n")
+    out = teko::mem::append_fo(out, "  <sources><source>.</source></sources>\n  <packages>\n")
+    out = teko::mem::append_fo(out, $"    <package name='teko' line-rate='{lrate}' branch-rate='{brate}' complexity='0'>\n      <classes>\n")
+    out = teko::mem::append_fo(out, str(body))
+    out = teko::mem::append_fo(out, "      </classes>\n    </package>\n  </packages>\n</coverage>\n")
+    str(out)
+}
+
+/**
+ * Union a child test binary's dumped `.tkcov` into THIS process's coverage sinks, so the
+ * engine-independent static walk (functions_coverage/line_coverage/branch_coverage) reads the
+ * native gate's coverage exactly as it once read the VM's in-process marks. Backed by teko_rt.c's
+ * `tk_cov_merge` (the #168 cross-process protocol).
+ *
+ * @param path  the child's dumped `.tkcov` file path
+ * @return      true on a successful merge
+ */
+exp extern fn cov_merge(path: str) -> bool = "tk_cov_merge" from "teko_rt"
+
+/**
+ * A coverage count — covered / valid (numerator / denominator) for one metric. `cov_pct` rounds
+ * DOWN; an empty denominator is vacuously 100% (no code → nothing to cover).
+ */
+type CovCount = struct {
+    /**
+     * The covered count (numerator).
+     */
+    cov: u64
+    /**
+     * The valid/total count (denominator).
+     */
+    val: u64
+}
+
+/**
+ * The integer percentage of a coverage count, rounded down. An empty denominator is 100%.
+ *
+ * @param c  the covered/valid coverage count
+ * @return   the percentage in [0, 100]
+ */
+fn cov_pct(c: CovCount) -> u64 { if c.val == 0 { 100 } else { c.cov * 100 / c.val } }
+
+/**
+ * The FUNCTIONS metric — distinct production functions executed over total production functions
+ * (the cov-mark sink).
+ *
+ * @param prog  the fully-typed program
+ * @return      a CovCount whose `cov` is distinct hit functions and `val` the production-fn total
+ */
+exp fn functions_coverage(prog: checker::TProgram) -> CovCount {
+    CovCount { cov = teko::cov_distinct(); val = count_prod_fns(prog) }
+}
+
+/**
+ * The LINES metric — distinct executable lines hit over total executable lines, aggregated across
+ * every production function. The coverage machinery itself (`teko::coverage`) is self-excluded.
+ *
+ * @param prog  the fully-typed program
+ * @return      a CovCount whose `cov` is hit lines and `val` the total executable lines
+ */
+exp fn line_coverage(prog: checker::TProgram) -> CovCount {
+    mut cov: u64 = 0; mut val: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if !f.is_test && f.namespace != "teko::coverage" {
+                    let w = cov_walk_block(f.body, cov_walk_empty())
+                    mut k = 0
+                    loop {
+                        if k >= w.lines.len { break }
+                        val = val + 1
+                        if teko::cov_line_hit(i to u64, w.lines[k]) { cov = cov + 1 }
+                        k = k + 1
+                    }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    CovCount { cov = cov; val = val }
+}
+
+/**
+ * The BRANCHES metric — taken outcomes over total outcomes across every production function's
+ * if/match sites. The coverage machinery itself (`teko::coverage`) is self-excluded.
+ *
+ * @param prog  the fully-typed program
+ * @return      a CovCount whose `cov` is taken outcomes and `val` the total outcomes
+ */
+exp fn branch_coverage(prog: checker::TProgram) -> CovCount {
+    mut cov: u64 = 0; mut val: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if !f.is_test && f.namespace != "teko::coverage" {
+                    let w = cov_walk_block(f.body, cov_walk_empty())
+                    mut s = 0
+                    loop {
+                        if s >= w.sites.len { break }
+                        mut o: u64 = 0
+                        loop {
+                            if o >= w.sites[s].n { break }
+                            if teko::cov_branch_hit(i to u64, w.sites[s].line, w.sites[s].col, o) { cov = cov + 1 }
+                            o = o + 1
+                        }
+                        val = val + w.sites[s].n
+                        s = s + 1
+                    }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    CovCount { cov = cov; val = val }
+}
+
+/**
+ * The BRANCH-coverage percentage — the D4 gate's `branches` floor reads this.
+ *
+ * @param prog  the fully-typed program
+ * @return      the branch-coverage percentage in [0, 100]
+ */
+exp fn branch_coverage_pct(prog: checker::TProgram) -> u64 { cov_pct(branch_coverage(prog)) }
+
+/**
+ * The LINE-coverage percentage — the D4 gate's `lines` floor reads this.
+ *
+ * @param prog  the fully-typed program
+ * @return      the line-coverage percentage in [0, 100]
+ */
+exp fn line_coverage_pct(prog: checker::TProgram) -> u64 { cov_pct(line_coverage(prog)) }
+
+/**
+ * The coverage DENOMINATOR — the count of production (non-`#test`) functions. The coverage
+ * machinery itself (`teko::coverage`) is excluded: those functions implement the report/walk and
+ * only run under `--coverage`, so counting them would permanently depress the floors — the same
+ * self-exclusion the retired interpreter carried.
+ *
+ * @param prog  the fully-typed program
+ * @return      the number of production functions counted toward the floors
+ */
+fn count_prod_fns(prog: checker::TProgram) -> u64 {
+    mut n: u64 = 0
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => { if !f.is_test && f.namespace != "teko::coverage" { n = n + 1 } }
+            _ => { }
+        }
+        i++
+    }
+    n
+}
+
+/**
+ * The FUNCTION-coverage percentage — the D4 gate's `functions` floor reads this. 100 when there
+ * are no production functions (vacuously covered).
+ *
+ * @param prog  the fully-typed program
+ * @return      the function-coverage percentage in [0, 100]
+ */
+exp fn coverage_pct(prog: checker::TProgram) -> u64 { cov_pct(functions_coverage(prog)) }
