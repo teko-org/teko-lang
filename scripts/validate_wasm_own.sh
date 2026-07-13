@@ -47,15 +47,29 @@
 #   TEKO=<self-hosted-teko>   (default: ./bin/teko — MUST carry emit_native's wasm tail)
 #   BUILDER=<seed-teko>       (default: ./build/teko then `teko` on PATH) — self-hosts
 #                             ./bin/teko when it is missing
+#   REQUIRE_WASM_ENGINE=1     (default: unset) — issue #389 C1-8c keystone seam. The dev-
+#                             laptop default (unset) keeps the honest-skip below: a missing
+#                             wasm-validate/wasmtime degrades the gate rather than failing
+#                             the build. CI's wasm leg PROVISIONS both engines and sets this
+#                             so a broken/absent provisioning step is a HARD FAILURE instead
+#                             of a silently-green skip — the whole point of the keystone is
+#                             that #389 never closes on a vacuously-passing leg.
 
 set -u
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+require_engine="${REQUIRE_WASM_ENGINE:-0}"
+
 have_validate=1
 command -v wasm-validate >/dev/null 2>&1 || have_validate=0
 have_wasmtime=1
 command -v wasmtime >/dev/null 2>&1 || have_wasmtime=0
+
+if [[ "$require_engine" -eq 1 && ( "$have_validate" -eq 0 || "$have_wasmtime" -eq 0 ) ]]; then
+    echo "validate_wasm_own: REQUIRE_WASM_ENGINE=1 but wasm-validate=$have_validate wasmtime=$have_wasmtime — failing closed (this mode never honest-skips)" >&2
+    exit 2
+fi
 
 if [[ "$have_validate" -eq 0 && "$have_wasmtime" -eq 0 ]]; then
     echo "validate_wasm_own: skipped — neither wasm-validate (WABT) nor wasmtime found on PATH; install one to check the own-wasm modules"
@@ -117,6 +131,32 @@ fixture_root="$script_dir/examples/regressions"
 # "wasm32-wasi" via `target_of`'s own fallback) so this one fixture alone builds under
 # TEKO_TARGET=wasm64-wasi and its own-wasm leg runs with wasmtime's `-W memory64=y`/
 # wasm-validate's `--enable-memory64` (the memory64 proposal is NOT on by default).
+#
+# Three of the five §14.1/§12.2 FIX-1/FIX-2 engine-level control-flow proofs (#389
+# C1-8b) join the corpus here: `wasm_if_both_diverge` proves FIX-1(b) (an if/else whose
+# both arms diverge has no merge block, so neither arm gets an arm label); `wasm_break_in_if`
+# proves FIX-1(c) (a break nested in an if inside a loop still gets its single-predecessor
+# loop-exit labeled unconditionally); `wasm_labeled_break` proves #520 (a labeled break
+# resolves to a multi-level `br N` at the right scope depth). All three are PLAIN `loop {
+# }` shapes (no range/`for` head) — verified own-wasm(wasmtime) == C-native.
+#
+# `wasm_loop_count` (FIX-2) and `wasm_continue_step` (§11.5) are AUTHORED on disk
+# (examples/regressions/wasm_loop_count, .../wasm_continue_step — same verbatim §14.1
+# shapes) but DELIBERATELY WITHHELD from CORPUS: C1-8b's local verification (own-wasm
+# under wasmtime vs the C-native oracle) surfaced a REAL, previously-undetected own-wasm
+# defect, NOT a fixture-authoring mistake — reproduced independently on the pre-existing,
+# unrelated `loop_range` fixture (own-native ALSO honest-stops on the identical shape today
+# with regalloc's own NAMED "a loop back-edge needs live-range holes" deferral, #6.2/A3-loop
+# — but own-WASM does not share that guard, since §3.1 skips regalloc entirely for wasm
+# locals, so it silently EMITS A VALID-BUT-WRONG module instead of honest-stopping). The
+# extensible/range-for `loop mut i in a..b { … }` desugar's per-iteration loop variable
+# never gets threaded back through the loop's own back-edge state in the wasm stackifier
+# (own-wasm's counter freezes at its initial value while the accumulator still updates,
+# reproduced independent of `continue` — see the PR report for the disassembled repro).
+# Manual C-style loops (`mut i = 0; loop { …; i = i + 1 }`, no range head) are UNAFFECTED.
+# Silently adding these two here (or fabricating a "known-wrong" soft pass) would bury a
+# genuine miscompilation under a green gate — REPORTED up for its own bugfix crumb; this
+# crumb stays fixtures/shell/YAML-only and ships only the three verified-correct additions.
 CORPUS=(
     own_exit_zero
     own_exit_code
@@ -128,6 +168,9 @@ CORPUS=(
     wasm_panic_hook
     wasm_defer_arm_scope
     wasm64_arith_exit
+    wasm_if_both_diverge
+    wasm_break_in_if
+    wasm_labeled_break
 )
 KIND=(
     exit
@@ -139,6 +182,9 @@ KIND=(
     print
     trap
     print
+    exit
+    exit
+    exit
     exit
 )
 TARGET=(
@@ -152,6 +198,9 @@ TARGET=(
     wasm32-wasi
     wasm32-wasi
     wasm64-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
 )
 
 kind_of() {
