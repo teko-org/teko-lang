@@ -1,0 +1,1253 @@
+use teko::lir
+
+/**
+ * SelCtxRiscv — the RISC-V instruction selector's threaded state, mirroring
+ * arm64's `SelCtx` (`isel_arm64.tks:132`) with an `MFuncRiscv`-typed
+ * in-progress machine function. It carries the neutral `class_of` side-table
+ * (`VInfoTable`, reused verbatim from `isel_arm64.tks:31`), the next fresh
+ * scratch VReg id (seeded past the source `LFunc`'s own `next_vreg` so a future
+ * F/D staging temporary never collides with a LIR-numbered VReg — B2-3 selects
+ * every integer/control/memory case without one, so the seed rides unused), and
+ * the RPO/reachability block cursor (`cur_block`/`next_block`) the split-edge
+ * blocks are numbered from. RISC-V is three-address load-store, so the shape is
+ * the arm64 one, NOT x86's two-address `SelCtxX86`.
+ *
+ * @since #387 B2-3
+ */
+type SelCtxRiscv = struct {
+    /**
+     * func — the RISC-V machine function built so far.
+     */
+    func: MFuncRiscv
+    /**
+     * vinfo — the neutral `class_of` side-table for every VReg selected so far.
+     */
+    vinfo: VInfoTable
+    /**
+     * next_scratch — the next fresh scratch VReg id the selector may hand out
+     * (seeded from the source function's `next_vreg`; unused in B2-3's scratch-
+     * free integer/control/memory selection, reserved for the F/D slice).
+     */
+    next_scratch: u32
+    /**
+     * cur_block — the machine-block id `selctx_riscv_emit` currently appends to.
+     */
+    cur_block: u32
+    /**
+     * next_block — the next fresh machine-block id `selctx_riscv_new_block` hands
+     * out for a split edge block (seeded past the highest `LBlock` id so an edge
+     * block never collides with a mirror block).
+     */
+    next_block: u32
+}
+
+/**
+ * selctx_riscv_emit — append `inst` to the selector's current machine block,
+ * returning the advanced context.
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param MInstRiscv inst  the instruction to append
+ * @return SelCtxRiscv  the advanced context
+ */
+fn selctx_riscv_emit(ctx: SelCtxRiscv, inst: MInstRiscv) -> SelCtxRiscv {
+    SelCtxRiscv { func = append_minst_riscv(ctx.func, ctx.cur_block, inst); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
+}
+
+/**
+ * selctx_riscv_switch — retarget the context so subsequent `selctx_riscv_emit`s
+ * append to machine block `block_id` (used when selection moves from one
+ * `LBlock`'s mirror to the next, or into a freshly-split edge block).
+ *
+ * @param SelCtxRiscv ctx  the context to retarget
+ * @param u32 block_id  the machine-block id to emit into next
+ * @return SelCtxRiscv  the retargeted context
+ */
+fn selctx_riscv_switch(ctx: SelCtxRiscv, block_id: u32) -> SelCtxRiscv {
+    SelCtxRiscv { func = ctx.func; vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = block_id; next_block = ctx.next_block }
+}
+
+/**
+ * FreshBlockRiscv — a freshly-allocated machine block (its id) plus the advanced
+ * context that reserved it and appended the empty block to the function.
+ *
+ * @since #387 B2-3
+ */
+type FreshBlockRiscv = struct {
+    /**
+     * ctx — the context with the block reserved and appended.
+     */
+    ctx: SelCtxRiscv
+    /**
+     * id — the reserved machine-block id.
+     */
+    id: u32
+}
+
+/**
+ * selctx_riscv_new_block — append a fresh empty machine block (no params — a
+ * split edge block carries its merge values as edge moves, never as block
+ * params) and hand back its id. The context's emit target is left unchanged;
+ * call `selctx_riscv_switch` to start emitting into it.
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @return FreshBlockRiscv  the advanced context + the reserved block id
+ */
+fn selctx_riscv_new_block(ctx: SelCtxRiscv) -> FreshBlockRiscv {
+    let id = ctx.next_block
+    let blk = MBlockRiscv { id = id; params = teko::list::empty(); insts = teko::list::empty() }
+    let advanced = SelCtxRiscv { func = append_block_riscv(ctx.func, blk); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = id + 1 }
+    FreshBlockRiscv { ctx = advanced; id = id }
+}
+
+/**
+ * selctx_riscv_set_vinfo — record `reg_class`/`wide` for VReg `id` in the
+ * context's side-table, returning the advanced context.
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param u32 id  the VReg id being recorded
+ * @param MRegClass reg_class  its register file
+ * @param bool wide  its width flag
+ * @return SelCtxRiscv  the advanced context
+ */
+fn selctx_riscv_set_vinfo(ctx: SelCtxRiscv, id: u32, reg_class: MRegClass, wide: bool) -> SelCtxRiscv {
+    SelCtxRiscv { func = ctx.func; vinfo = vinfo_set(ctx.vinfo, id, reg_class, wide); next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
+}
+
+/**
+ * selctx_riscv_set_block_param — refine mirror block `block_id`'s parameter at
+ * `index` to `reg` in the context's function (the class becomes known when the
+ * feeding edge move is selected).
+ *
+ * @param SelCtxRiscv ctx  the context to update
+ * @param u32 block_id  the target block
+ * @param u32 index  the parameter position
+ * @param MReg reg  the refined parameter register
+ * @return SelCtxRiscv  the updated context
+ */
+fn selctx_riscv_set_block_param(ctx: SelCtxRiscv, block_id: u32, index: u32, reg: MReg) -> SelCtxRiscv {
+    SelCtxRiscv { func = set_block_param_riscv(ctx.func, block_id, index, reg); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
+}
+
+/**
+ * riscv_zero_reg — the hardwired zero register `x0` (GPR id 0), used explicitly
+ * as `neg`'s minuend (`sub rd, x0, rs`) and as the compare-against operand of a
+ * boolean branch (`bne rs, x0, target`). It is reserved (never allocated), so
+ * naming it as a physical operand is safe.
+ *
+ * @return MReg  the physical `x0` register
+ */
+fn riscv_zero_reg() -> MReg {
+    preg(0, MRegClass::GPR)
+}
+
+/**
+ * riscv_gpr_result — the LP64D integer result register `a0` (GPR id 10). By
+ * decision D-A (§3), `a0` IS the first integer argument register, so the return
+ * pin and the call-result read share this one register — the ABI descriptor is
+ * the single source of truth (unlike x86, whose result RAX differs from arg0
+ * RDI).
+ *
+ * @return MReg  the physical `a0` (integer result) register
+ */
+fn riscv_gpr_result() -> MReg {
+    arg_reg(riscv64_lp64d(), MRegClass::GPR, 0).reg
+}
+
+/**
+ * mv_riscv — a register-to-register copy `dst = src`, expressed as the RISC-V
+ * `mv` pseudo-instruction `addi rd, rs, 0`. RISC-V has no dedicated move opcode
+ * (the `MInstRiscv` alphabet carries none), so every copy — parameter reads,
+ * return/argument pins, call-result reads, edge moves, and the identity
+ * extend/truncate — routes through this full-XLEN `addi`-by-zero, matching the
+ * LIR interpreter's identity-carrier semantics for those copies.
+ *
+ * @param MReg dst  the destination register
+ * @param MReg src  the source register
+ * @return MInstRiscv  the `addi dst, src, #0` copy instruction
+ */
+fn mv_riscv(dst: MReg, src: MReg) -> MInstRiscv {
+    alu_i_riscv(MAluOpRiscv::Addi, dst, src, 0 to i32)
+}
+
+/**
+ * min_i32_riscv — `i32::MIN` as an i128, computed as `-(2^31)` so no literal
+ * names the boundary value directly.
+ *
+ * @return i128  i32::MIN
+ */
+fn min_i32_riscv() -> i128 {
+    -(2147483648 to i128)
+}
+
+/**
+ * max_i32_riscv — `i32::MAX` as an i128.
+ *
+ * @return i128  i32::MAX
+ */
+fn max_i32_riscv() -> i128 {
+    2147483647 to i128
+}
+
+/**
+ * fits_imm12_riscv — true iff `v` fits the signed 12-bit immediate window
+ * ([-2048, 2047]) an `addi`/`li`/`sltiu` or a frame/field displacement carries
+ * directly. A value outside it needs a `lui`+`addi` pair (a 32-bit constant) or
+ * the `B2-bigimm` honest-stop (a 64-bit one).
+ *
+ * @param i128 v  the value to check
+ * @return bool  whether `v` fits a signed 12-bit immediate
+ */
+fn fits_imm12_riscv(v: i128) -> bool {
+    v >= -(2048 to i128) && v <= (2047 to i128)
+}
+
+/**
+ * fits_i32_riscv — true iff `v` fits the signed 32-bit range, the precondition
+ * a `lui`+`addi` constant materialization requires: a wider literal needs the
+ * multi-instruction `li` behind the `B2-bigimm` honest-stop.
+ *
+ * @param i128 v  the value to check
+ * @return bool  whether `v` fits an i32
+ */
+fn fits_i32_riscv(v: i128) -> bool {
+    v >= min_i32_riscv() && v <= max_i32_riscv()
+}
+
+/**
+ * lo12_of_bits_riscv — the low 12 bits of a 32-bit pattern read as a signed
+ * 12-bit immediate ([-2048, 2047]): the `addi` half of a `lui`+`addi` pair. A
+ * low half whose bit 11 is set encodes a negative addend (the `lui` half is
+ * pre-incremented to compensate — see `emit_lui_addi_riscv`), so it is folded
+ * below zero by subtracting 4096.
+ *
+ * @param u64 bits  the 32-bit two's-complement constant pattern
+ * @return i32  its low 12 bits as a signed immediate
+ */
+fn lo12_of_bits_riscv(bits: u64) -> i32 {
+    let lo_raw = (bits & (4095 to u64)) to u32
+    if lo_raw >= (2048 to u32) { (lo_raw to i32) - (4096 to i32) } else { lo_raw to i32 }
+}
+
+/**
+ * emit_lui_addi_riscv — the two-instruction 32-bit constant materialization
+ * `lui rd, hi20 ; addi rd, rd, lo12`. The high 20 bits are taken with the
+ * standard round-to-nearest correction (`(bits + 0x800) >> 12`) so the signed
+ * `addi` low half reconstructs the exact value, and both halves are computed in
+ * `u64` (never casting a negative through `to u32`) — `bits` is already the
+ * value's 32-bit two's-complement pattern (`u64_bits_of` masked to 32 bits),
+ * so the arithmetic stays non-negative throughout. `hi20` is the raw U-type
+ * field the CPU sign-extends; `lo12` is the signed `addi` immediate.
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param MReg dst  the destination register
+ * @param i128 val  the 32-bit-range literal to materialize
+ * @return SelCtxRiscv  the advanced context (two instructions emitted)
+ */
+fn emit_lui_addi_riscv(ctx: SelCtxRiscv, dst: MReg, val: i128) -> SelCtxRiscv {
+    let bits = u64_bits_of(val) & mask32_u64()
+    let hi20 = (((bits + (2048 to u64)) >> (12 to u64)) & (1048575 to u64)) to u32
+    let lo12 = lo12_of_bits_riscv(bits)
+    let ctx1 = selctx_riscv_emit(ctx, lui_riscv(dst, hi20))
+    selctx_riscv_emit(ctx1, alu_i_riscv(MAluOpRiscv::Addi, dst, dst, lo12))
+}
+
+/**
+ * materialize_const_riscv — materialize the integer literal `val` into `dst`:
+ * a single `li` (`addi rd, x0, imm12`) when it fits the signed 12-bit window,
+ * a `lui`+`addi` pair when it fits 32 bits, otherwise the named `B2-bigimm`
+ * honest-stop (a 64-bit immediate needs the multi-instruction `li` sequence —
+ * a REAL RISC-V limit, unlike x86's near-N/A `movabs`; deferred to 0.3.1). The
+ * i128-beyond-64-bit case is subsumed by the same stop.
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param MReg dst  the destination register
+ * @param i128 val  the literal value to materialize
+ * @return SelCtxRiscv | error  the advanced context, or the `B2-bigimm` stop
+ * @throws  when `val` exceeds the 32-bit `lui`+`addi` reach (`B2-bigimm`)
+ */
+fn materialize_const_riscv(ctx: SelCtxRiscv, dst: MReg, val: i128) -> SelCtxRiscv | error {
+    if fits_imm12_riscv(val) {
+        return selctx_riscv_emit(ctx, li_riscv(dst, val to i32))
+    }
+    if fits_i32_riscv(val) {
+        return emit_lui_addi_riscv(ctx, dst, val)
+    }
+    error { message = "isel riscv64: B2-bigimm — a 64-bit integer constant beyond lui+addi needs the multi-instruction li sequence (a REAL RISC-V imm12 limit, unlike x86 movabs), the 64-bit-immediate honest-stop (0.3.1)" }
+}
+
+/**
+ * select_const_int_riscv — the `LConstInt` selection: materialize its value into
+ * a 64-bit GPR (B2-3 defaults every untyped constant to the widest, no-loss form
+ * — matching `LConstInt.val`'s own i128 carrier — since the LIR carries no
+ * per-value width for a bare constant).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LConstInt c  the constant op
+ * @return SelCtxRiscv | error  the advanced context, or `materialize_const_riscv`'s
+ *                              propagated `B2-bigimm` stop
+ * @throws  the propagated `B2-bigimm` honest-stop for a 64-bit literal
+ */
+fn select_const_int_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, c: lir::LConstInt) -> SelCtxRiscv | error {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    materialize_const_riscv(ctx1, dst, c.val)
+}
+
+/**
+ * select_const_float_riscv — the `LConstFloat` selection: an f32/f64 literal
+ * needs an F/D-extension load (`fmv`/`fld` from a rodata pool), so this is the
+ * `B2-fp` honest-stop (0.3.1). Mirrors x86's `select_const_float_x86`.
+ *
+ * @param SelCtxRiscv ctx0  the context (unused — the op honest-stops)
+ * @param lir::LInst inst  the enclosing instruction (unused)
+ * @param lir::LConstFloat c  the constant op (unused)
+ * @return SelCtxRiscv | error  always the `B2-fp` honest-stop
+ * @throws  always — the F/D float family is deferred (`B2-fp`)
+ */
+fn select_const_float_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, c: lir::LConstFloat) -> SelCtxRiscv | error {
+    error { message = "isel riscv64: B2-fp — an f32/f64 constant needs an F/D-extension load (fld/fmv), the float honest-stop (0.3.1)" }
+}
+
+/**
+ * select_alu_riscv — the three-address register-register `MAluRRiscv` selection
+ * shared by every integer arithmetic/bitwise/shift/mul/div `LBinOp` case.
+ * RISC-V is three-address (`op rd, rs1, rs2`), so — UNLIKE x86 (B1-3's
+ * copy-at-def) — the result register is written directly with NO preparatory
+ * copy; this is the arm64 `select_alu` shape (`isel_arm64.tks:599`). `wide`
+ * selects the RV64 width at encode (the base `OP` form for 64-bit, the `OP-32`
+ * `*w` form for 32-bit), so it is recorded on the instruction, not resolved
+ * here; both operands of a checker-typed binop already share one width.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param MAluOpRiscv op  which RISC-V ALU mnemonic to emit
+ * @param u32 a  the first-operand VReg (rs1)
+ * @param u32 b  the second-operand VReg (rs2)
+ * @param bool wide  true for the 64-bit base form, false for the 32-bit `*w` form
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_alu_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, op: MAluOpRiscv, a: u32, b: u32, wide: bool) -> SelCtxRiscv {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    selctx_riscv_emit(ctx1, alu_r_riscv(op, wide, dst, vreg(a, MRegClass::GPR), vreg(b, MRegClass::GPR)))
+}
+
+/**
+ * select_rem_riscv — `IRemS`/`IRemU`'s selection: a SINGLE native `rem`/`remu`
+ * instruction. RISC-V's M-extension provides the remainder directly (unlike
+ * arm64, which synthesizes it as `SDIV`+`MSUB` — `select_rem` at
+ * `isel_arm64.tks:619` — and unlike x86's fixed-reg `idiv` sequence), so this is
+ * the same one-instruction path as any other ALU op: no scratch register, no
+ * clobber, no call model.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param MAluOpRiscv op  `Rem` (signed) or `Remu` (unsigned)
+ * @param u32 a  the dividend VReg (rs1)
+ * @param u32 b  the divisor VReg (rs2)
+ * @param bool wide  true for the 64-bit `rem`, false for the 32-bit `remw`
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_rem_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, op: MAluOpRiscv, a: u32, b: u32, wide: bool) -> SelCtxRiscv {
+    select_alu_riscv(ctx0, inst, op, a, b, wide)
+}
+
+/**
+ * emit_slt_riscv — a single `slt`/`sltu rd, x, y` set-less-than into `dst` (the
+ * boolean value-compare primitive for the strictly-less-than conditions; a
+ * greater-than reuses it with the operands swapped by the caller).
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param MReg dst  the 0/1 destination register
+ * @param MReg x  the first compared register (rs1)
+ * @param MReg y  the second compared register (rs2)
+ * @param bool is_unsigned  true for `sltu`, false for the signed `slt`
+ * @return SelCtxRiscv  the advanced context
+ */
+fn emit_slt_riscv(ctx: SelCtxRiscv, dst: MReg, x: MReg, y: MReg, is_unsigned: bool) -> SelCtxRiscv {
+    selctx_riscv_emit(ctx, slt_riscv(dst, x, y, is_unsigned))
+}
+
+/**
+ * emit_slt_inv_riscv — a `slt`/`sltu` followed by `xori rd, rd, 1`, the
+ * complemented set-less-than the greater-or-equal / less-or-equal conditions
+ * build on (`GE`/`HS` invert `a<b`; `LE`/`LS` invert the swapped `b<a`).
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param MReg dst  the 0/1 destination register
+ * @param MReg x  the first compared register (rs1)
+ * @param MReg y  the second compared register (rs2)
+ * @param bool is_unsigned  true for `sltu`, false for the signed `slt`
+ * @return SelCtxRiscv  the advanced context (two instructions emitted)
+ */
+fn emit_slt_inv_riscv(ctx: SelCtxRiscv, dst: MReg, x: MReg, y: MReg, is_unsigned: bool) -> SelCtxRiscv {
+    let ctx1 = selctx_riscv_emit(ctx, slt_riscv(dst, x, y, is_unsigned))
+    selctx_riscv_emit(ctx1, alu_i_riscv(MAluOpRiscv::Xori, dst, dst, 1 to i32))
+}
+
+/**
+ * emit_eq_riscv — the equality value-compare `sub rd, a, b ; sltiu rd, rd, 1`:
+ * the difference is zero iff the operands are equal, and `sltiu rd, rd, 1`
+ * (unsigned `rd < 1`) maps zero to 1 and every other value to 0. The `sub` is
+ * the full 64-bit form — the zero-test is width-independent on canonical
+ * values.
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param MReg dst  the 0/1 destination register
+ * @param MReg a  the first compared register
+ * @param MReg b  the second compared register
+ * @return SelCtxRiscv  the advanced context (two instructions emitted)
+ */
+fn emit_eq_riscv(ctx: SelCtxRiscv, dst: MReg, a: MReg, b: MReg) -> SelCtxRiscv {
+    let ctx1 = selctx_riscv_emit(ctx, alu_r_riscv(MAluOpRiscv::Sub, true, dst, a, b))
+    selctx_riscv_emit(ctx1, alu_i_riscv(MAluOpRiscv::Sltiu, dst, dst, 1 to i32))
+}
+
+/**
+ * emit_ne_riscv — the inequality value-compare `sub rd, a, b ; sltu rd, x0, rd`:
+ * the difference is nonzero iff the operands differ, and `sltu rd, x0, rd`
+ * (unsigned `0 < rd`) maps every nonzero value to 1 and zero to 0.
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param MReg dst  the 0/1 destination register
+ * @param MReg a  the first compared register
+ * @param MReg b  the second compared register
+ * @return SelCtxRiscv  the advanced context (two instructions emitted)
+ */
+fn emit_ne_riscv(ctx: SelCtxRiscv, dst: MReg, a: MReg, b: MReg) -> SelCtxRiscv {
+    let ctx1 = selctx_riscv_emit(ctx, alu_r_riscv(MAluOpRiscv::Sub, true, dst, a, b))
+    selctx_riscv_emit(ctx1, slt_riscv(dst, riscv_zero_reg(), dst, true))
+}
+
+/**
+ * select_icmp_riscv — an integer compare `LBinOp` used as a plain VALUE (not
+ * fused into a branch): RISC-V has no `setcc` and no flags register, so a 0/1
+ * boolean is built from a short `slt`/`sltu`/`xori`/`sub`/`sltiu` sequence keyed
+ * on the abstract condition (§4.4). The strictly-less conditions are one `slt`;
+ * the swapped-order ones (`GT`/`HI`) swap operands; the `≥`/`≤` ones append an
+ * `xori`; equality/inequality difference then normalise via `sltiu`/`sltu`. The
+ * result is recorded narrow (like arm64's boolean convention); the branch form
+ * is instead a single fused `MBranchRiscv` (`select_fused_branch_riscv`).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param MCond cond  the abstract condition the source opcode picks
+ * @param u32 a  the first compared VReg
+ * @param u32 b  the second compared VReg
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_icmp_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, cond: MCond, a: u32, b: u32) -> SelCtxRiscv {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, false)
+    let va = vreg(a, MRegClass::GPR)
+    let vb = vreg(b, MRegClass::GPR)
+    match cond {
+        EQ => emit_eq_riscv(ctx1, dst, va, vb)
+        NE => emit_ne_riscv(ctx1, dst, va, vb)
+        LT => emit_slt_riscv(ctx1, dst, va, vb, false)
+        LO => emit_slt_riscv(ctx1, dst, va, vb, true)
+        GT => emit_slt_riscv(ctx1, dst, vb, va, false)
+        HI => emit_slt_riscv(ctx1, dst, vb, va, true)
+        GE => emit_slt_inv_riscv(ctx1, dst, va, vb, false)
+        HS => emit_slt_inv_riscv(ctx1, dst, va, vb, true)
+        LE => emit_slt_inv_riscv(ctx1, dst, vb, va, false)
+        LS => emit_slt_inv_riscv(ctx1, dst, vb, va, true)
+    }
+}
+
+/**
+ * bin_fp_stop_riscv — the shared `B2-fp` honest-stop the float `LBinOp` cases
+ * (`FAdd`/`FSub`/`FMul`/`FDiv`, and the float compares) route through: the F/D
+ * arithmetic/compare family is deferred to 0.3.1.
+ *
+ * @return SelCtxRiscv | error  always the `B2-fp` honest-stop
+ * @throws  always — the F/D float family is deferred (`B2-fp`)
+ */
+fn bin_fp_stop_riscv() -> SelCtxRiscv | error {
+    error { message = "isel riscv64: B2-fp — an F/D float arithmetic/compare op needs the F/D extension, the float honest-stop (0.3.1)" }
+}
+
+/**
+ * select_bin_riscv — the `LBin` dispatch: one three-address `MAluRRiscv`
+ * selection per integer arithmetic/bitwise/shift case, the native one-
+ * instruction `div`/`divu`/`rem`/`remu` for division/remainder, a value-compare
+ * sequence for a non-fused integer compare, and the `B2-fp` stop for the float
+ * family (the `_` arm, which — every integer opcode being explicit above —
+ * catches exactly the ten F/D `LBinOp` cases). A compare fused into a branch
+ * (`is_fused_compare`) emits nothing at
+ * its own site — the branch re-derives it as one `MBranchRiscv`. `wide` is read
+ * from the first operand's already-recorded `class_of` entry (an SSA guarantee).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function (the fusion test reads its uses)
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LBin b  the binary op
+ * @return SelCtxRiscv | error  the advanced context, or the `B2-fp` stop
+ * @throws  the `B2-fp` honest-stop for a float arithmetic/compare op
+ */
+fn select_bin_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, inst: lir::LInst, b: lir::LBin) -> SelCtxRiscv | error {
+    if cmp_kind_of(b.op).is_cmp && is_fused_compare(f, inst.result) {
+        return ctx0
+    }
+    let a_info = vinfo_get(ctx0.vinfo, b.a)
+    match b.op {
+        lir::LBinOp::IAdd => select_alu_riscv(ctx0, inst, MAluOpRiscv::Add, b.a, b.b, a_info.wide)
+        lir::LBinOp::ISub => select_alu_riscv(ctx0, inst, MAluOpRiscv::Sub, b.a, b.b, a_info.wide)
+        lir::LBinOp::IMul => select_alu_riscv(ctx0, inst, MAluOpRiscv::Mul, b.a, b.b, a_info.wide)
+        lir::LBinOp::IDivS => select_alu_riscv(ctx0, inst, MAluOpRiscv::Div, b.a, b.b, a_info.wide)
+        lir::LBinOp::IDivU => select_alu_riscv(ctx0, inst, MAluOpRiscv::Divu, b.a, b.b, a_info.wide)
+        lir::LBinOp::IRemS => select_rem_riscv(ctx0, inst, MAluOpRiscv::Rem, b.a, b.b, a_info.wide)
+        lir::LBinOp::IRemU => select_rem_riscv(ctx0, inst, MAluOpRiscv::Remu, b.a, b.b, a_info.wide)
+        lir::LBinOp::IAnd => select_alu_riscv(ctx0, inst, MAluOpRiscv::And, b.a, b.b, a_info.wide)
+        lir::LBinOp::IOr => select_alu_riscv(ctx0, inst, MAluOpRiscv::Or, b.a, b.b, a_info.wide)
+        lir::LBinOp::IXor => select_alu_riscv(ctx0, inst, MAluOpRiscv::Xor, b.a, b.b, a_info.wide)
+        lir::LBinOp::IShl => select_alu_riscv(ctx0, inst, MAluOpRiscv::Sll, b.a, b.b, a_info.wide)
+        lir::LBinOp::IShrS => select_alu_riscv(ctx0, inst, MAluOpRiscv::Sra, b.a, b.b, a_info.wide)
+        lir::LBinOp::IShrU => select_alu_riscv(ctx0, inst, MAluOpRiscv::Srl, b.a, b.b, a_info.wide)
+        lir::LBinOp::ICmpEq => select_icmp_riscv(ctx0, inst, MCond::EQ, b.a, b.b)
+        lir::LBinOp::ICmpNe => select_icmp_riscv(ctx0, inst, MCond::NE, b.a, b.b)
+        lir::LBinOp::ICmpLtS => select_icmp_riscv(ctx0, inst, MCond::LT, b.a, b.b)
+        lir::LBinOp::ICmpLtU => select_icmp_riscv(ctx0, inst, MCond::LO, b.a, b.b)
+        lir::LBinOp::ICmpLeS => select_icmp_riscv(ctx0, inst, MCond::LE, b.a, b.b)
+        lir::LBinOp::ICmpLeU => select_icmp_riscv(ctx0, inst, MCond::LS, b.a, b.b)
+        lir::LBinOp::ICmpGtS => select_icmp_riscv(ctx0, inst, MCond::GT, b.a, b.b)
+        lir::LBinOp::ICmpGtU => select_icmp_riscv(ctx0, inst, MCond::HI, b.a, b.b)
+        lir::LBinOp::ICmpGeS => select_icmp_riscv(ctx0, inst, MCond::GE, b.a, b.b)
+        lir::LBinOp::ICmpGeU => select_icmp_riscv(ctx0, inst, MCond::HS, b.a, b.b)
+        _ => bin_fp_stop_riscv()
+    }
+}
+
+/**
+ * select_ineg_riscv — the `INeg` selection: `neg rd, rs = sub rd, x0, rs`, the
+ * three-address negate against the hardwired zero register.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param bool wide  true for the 64-bit `sub`, false for the 32-bit `subw`
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_ineg_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, a: u32, wide: bool) -> SelCtxRiscv {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    selctx_riscv_emit(ctx1, alu_r_riscv(MAluOpRiscv::Sub, wide, dst, riscv_zero_reg(), vreg(a, MRegClass::GPR)))
+}
+
+/**
+ * select_inot_riscv — the `INot` selection: `not rd, rs = xori rd, rs, -1`, the
+ * register-immediate complement.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param bool wide  the recorded width flag of the result
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_inot_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, a: u32, wide: bool) -> SelCtxRiscv {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    selctx_riscv_emit(ctx1, alu_i_riscv(MAluOpRiscv::Xori, dst, vreg(a, MRegClass::GPR), -(1 to i32)))
+}
+
+/**
+ * select_identity_mov_riscv — the `Trunc`/`ZExt`/`SExt` selection: a plain
+ * `mv rd, rs` (`addi rd, rs, 0`) register-to-register copy. The LIR carries no
+ * per-value width for these and its interpreter oracle treats all three as the
+ * identity over its carrier, so a bit-preserving full-XLEN copy is the honest
+ * match — a real narrowing extend is selected once a value crosses a typed
+ * memory boundary (`LLoad`'s own `ty`). The recorded width mirrors arm64:
+ * `Trunc` records narrow, the extends inherit the source width.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param u32 a  the operand VReg
+ * @param bool wide  the width to record for the result
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_identity_mov_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, a: u32, wide: bool) -> SelCtxRiscv {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    selctx_riscv_emit(ctx1, mv_riscv(dst, vreg(a, MRegClass::GPR)))
+}
+
+/**
+ * un_fp_stop_riscv — the shared `B2-fp` honest-stop the float unary `LUnOp`
+ * cases (`FNeg`/`IToF`/`FToI`/`FToF`) route through: the F/D negate/convert
+ * family is deferred to 0.3.1.
+ *
+ * @return SelCtxRiscv | error  always the `B2-fp` honest-stop
+ * @throws  always — the F/D float family is deferred (`B2-fp`)
+ */
+fn un_fp_stop_riscv() -> SelCtxRiscv | error {
+    error { message = "isel riscv64: B2-fp — an F/D float negate/convert op needs the F/D extension, the float honest-stop (0.3.1)" }
+}
+
+/**
+ * select_un_riscv — the `LUn` dispatch: the three-address integer negate, the
+ * register-immediate complement, the identity move for the extend/truncate ops,
+ * and the `B2-fp` honest-stop for the float negate/convert family.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LUn u  the unary op
+ * @return SelCtxRiscv | error  the advanced context, or the `B2-fp` stop
+ * @throws  the `B2-fp` honest-stop for a float negate/convert op
+ */
+fn select_un_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, u: lir::LUn) -> SelCtxRiscv | error {
+    let a_info = vinfo_get(ctx0.vinfo, u.a)
+    match u.op {
+        lir::LUnOp::INeg => select_ineg_riscv(ctx0, inst, u.a, a_info.wide)
+        lir::LUnOp::INot => select_inot_riscv(ctx0, inst, u.a, a_info.wide)
+        lir::LUnOp::Trunc => select_identity_mov_riscv(ctx0, inst, u.a, false)
+        lir::LUnOp::ZExt => select_identity_mov_riscv(ctx0, inst, u.a, a_info.wide)
+        lir::LUnOp::SExt => select_identity_mov_riscv(ctx0, inst, u.a, a_info.wide)
+        _ => un_fp_stop_riscv()
+    }
+}
+
+/**
+ * select_param_riscv — the `LParam` selection: copy the LP64D integer argument
+ * register for the parameter's GPR-class index (`a0..a7`, read through
+ * `arg_reg(riscv64_lp64d(), ...)` — the arg ids are `x10..x17`, NOT the encoding
+ * order) into the parameter's VReg via `mv`. A float-class parameter needs an
+ * `fa*` register (the `B2-fp` stop), an i128 parameter a register-pair slot (the
+ * i128-inherited stop), and a parameter past the 8-register window the LP64D
+ * stack-arg slot (the `B2-args` stop).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function (its `param_types`)
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LParam p  the parameter op
+ * @return SelCtxRiscv | error  the advanced context, or a NAMED honest-stop
+ * @throws  an out-of-range index (internal), an `i128` param, a float param
+ *          (`B2-fp`), or a past-`a7` param (`B2-args`)
+ */
+fn select_param_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, inst: lir::LInst, p: lir::LParam) -> SelCtxRiscv | error {
+    if (p.index to u64) >= f.param_types.len {
+        return error { message = "isel riscv64: param index out of range (internal)" }
+    }
+    let ty = f.param_types[p.index to u64]
+    if ltype_is_i128(ty) {
+        return error { message = "isel riscv64: an i128 parameter needs a register-pair ABI slot (the i128-inherited stop)" }
+    }
+    if mregclass_of_ltype(ty) == MRegClass::FPR {
+        return error { message = "isel riscv64: B2-fp — a float parameter arrives in an fa* register via an F/D move, the float honest-stop (0.3.1)" }
+    }
+    let class_index = gpr_index_before(f.param_types, p.index)
+    let slot = arg_reg(riscv64_lp64d(), MRegClass::GPR, class_index)
+    if !slot.ok {
+        return error { message = "isel riscv64: B2-args — more than 8 integer arguments needs the LP64D stack-arg slot (0.3.1)" }
+    }
+    let wide = ltype_is_wide(ty)
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    selctx_riscv_emit(ctx1, mv_riscv(dst, slot.reg))
+}
+
+/**
+ * select_ret_riscv — the `LRet` selection: for a value-carrying return, pin the
+ * returned VReg into the LP64D integer result register `a0` (which IS arg0 — D-A,
+ * unlike x86's separate RAX) via `mv`, then emit `ret`; a void return emits
+ * `ret` alone. A float return pins `fa0` via an F/D move (the `B2-fp` stop).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LRet r  the return op
+ * @return SelCtxRiscv | error  the advanced context, or the `B2-fp` stop
+ * @throws  the `B2-fp` honest-stop for a float return value
+ */
+fn select_ret_riscv(ctx0: SelCtxRiscv, r: lir::LRet) -> SelCtxRiscv | error {
+    if !r.has_value {
+        return selctx_riscv_emit(ctx0, ret_riscv())
+    }
+    let info = vinfo_get(ctx0.vinfo, r.value)
+    if info.reg_class == MRegClass::FPR {
+        return error { message = "isel riscv64: B2-fp — a float return pins fa0 via an F/D move, the float honest-stop (0.3.1)" }
+    }
+    let ctx1 = selctx_riscv_emit(ctx0, mv_riscv(riscv_gpr_result(), vreg(r.value, MRegClass::GPR)))
+    selctx_riscv_emit(ctx1, ret_riscv())
+}
+
+/**
+ * emit_edge_moves_riscv — the parallel-copy of `args` into the block params of
+ * `target`, emitted into the current block just before the branch/jump. A plain
+ * sequential copy is correct by construction: a block param is always a FRESH
+ * VReg (from `add_block_param`), disjoint from every edge arg, so no source is
+ * also a destination and no cycle can arise. Each move refines the target
+ * param's register class and records the param's `class_of`. A float-class edge
+ * value needs an `fa*` move (the `B2-fp` stop).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function (for the target's params)
+ * @param u32 target  the destination block id
+ * @param []u32 args  the block-args this edge supplies, positionally
+ * @return SelCtxRiscv | error  the advanced context, or a NAMED honest-stop
+ * @throws  an arg/param count mismatch (internal) or a float edge value (`B2-fp`)
+ */
+fn emit_edge_moves_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, target: u32, args: []u32) -> SelCtxRiscv | error {
+    let params = block_params_of(f, target)
+    if params.len != args.len {
+        return error { message = "isel riscv64: edge arg count does not match target block param count (internal)" }
+    }
+    mut ctx = ctx0
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        let src = args[i]
+        let src_info = vinfo_get(ctx.vinfo, src)
+        if src_info.reg_class == MRegClass::FPR {
+            return error { message = "isel riscv64: B2-fp — a float block-arg edge move needs an F/D move, the float honest-stop (0.3.1)" }
+        }
+        let dst = vreg(params[i], MRegClass::GPR)
+        let ctx_a = selctx_riscv_emit(ctx, mv_riscv(dst, vreg(src, MRegClass::GPR)))
+        let ctx_b = selctx_riscv_set_block_param(ctx_a, target, i to u32, dst)
+        ctx = selctx_riscv_set_vinfo(ctx_b, params[i], MRegClass::GPR, src_info.wide)
+        i++
+    }
+    ctx
+}
+
+/**
+ * select_jump_riscv — the `LJump` selection: the parallel-copy of its block-args
+ * into the target's params, then an unconditional `jal x0, target` (the explicit
+ * terminator form the reachability-aware regalloc expects — no fall-through).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function
+ * @param lir::LJump j  the jump op
+ * @return SelCtxRiscv | error  the advanced context, or a propagated error
+ * @throws  the propagated `emit_edge_moves_riscv` error
+ */
+fn select_jump_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, j: lir::LJump) -> SelCtxRiscv | error {
+    let ctx1 = match emit_edge_moves_riscv(ctx0, f, j.target, j.args) { SelCtxRiscv as c => c; error as e => return e }
+    selctx_riscv_emit(ctx1, jal_riscv(j.target))
+}
+
+/**
+ * EdgeResRiscv — a resolved branch edge: the block the branch actually targets
+ * (the real block for an empty-arg edge, or a freshly-split edge block that
+ * performs the moves then jumps on), plus the advanced context.
+ *
+ * @since #387 B2-3
+ */
+type EdgeResRiscv = struct {
+    /**
+     * ctx — the advanced context (edge block appended when one was split).
+     */
+    ctx: SelCtxRiscv
+    /**
+     * block — the machine-block id the branch transfers control to.
+     */
+    block: u32
+}
+
+/**
+ * resolve_edge_riscv — the landing block for one branch edge. A fused
+ * compare-and-branch cannot carry moves, so an edge that supplies block-args is
+ * split into its own block (the moves, then `jal` to the real target) and the
+ * branch targets that edge block; an empty-arg edge branches straight to its
+ * target (the fast path the corpus hits in practice). The current emit target is
+ * restored before returning.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function
+ * @param u32 target  the edge's real destination block
+ * @param []u32 args  the block-args the edge supplies (empty for the fast path)
+ * @return EdgeResRiscv | error  the landing block + advanced context, or an error
+ * @throws  the propagated `emit_edge_moves_riscv` error
+ */
+fn resolve_edge_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, target: u32, args: []u32) -> EdgeResRiscv | error {
+    if args.len == 0 {
+        return EdgeResRiscv { ctx = ctx0; block = target }
+    }
+    let saved = ctx0.cur_block
+    let fb = selctx_riscv_new_block(ctx0)
+    let ctx_in = selctx_riscv_switch(fb.ctx, fb.id)
+    let ctx_moved = match emit_edge_moves_riscv(ctx_in, f, target, args) { SelCtxRiscv as c => c; error as e => return e }
+    let ctx_end = selctx_riscv_emit(ctx_moved, jal_riscv(target))
+    let ctx_back = selctx_riscv_switch(ctx_end, saved)
+    EdgeResRiscv { ctx = ctx_back; block = fb.id }
+}
+
+/**
+ * select_fused_branch_riscv — the taken-edge selection when the branch condition
+ * is a compare fused into this branch: a SINGLE fused `MBranchRiscv` over the
+ * compare's operands and condition (RISC-V branches ARE compare-and-branch, so
+ * no separate compare and no flags register — simpler than both x86's `cmp`+`jcc`
+ * and arm64's `cmp`+`b.cond`). A fused FLOAT compare needs the F/D extension (the
+ * `B2-fp` stop).
+ *
+ * @param SelCtxRiscv ctx1  the context to extend (edges already resolved)
+ * @param DefCmp dc  the resolved compare definition (opcode + operands)
+ * @param u32 taken  the machine-block id taken when the compare holds
+ * @return SelCtxRiscv | error  the advanced context, or the `B2-fp` stop
+ * @throws  the `B2-fp` honest-stop for a fused float compare
+ */
+fn select_fused_branch_riscv(ctx1: SelCtxRiscv, dc: DefCmp, taken: u32) -> SelCtxRiscv | error {
+    let ck = cmp_kind_of(dc.op)
+    if ck.is_float {
+        return error { message = "isel riscv64: B2-fp — a fused float compare needs an F/D compare + branch, the float honest-stop (0.3.1)" }
+    }
+    selctx_riscv_emit(ctx1, branch_riscv(ck.cond, vreg(dc.a, MRegClass::GPR), vreg(dc.bb, MRegClass::GPR), taken))
+}
+
+/**
+ * select_boolean_branch_riscv — the taken-edge selection for a generic boolean
+ * condition (a value NOT produced by a fused compare): a boolean register is
+ * nonzero iff true, so `bne cond, x0, taken` (a fused compare-and-branch against
+ * the hardwired zero register) takes the edge — no materialized zero and no
+ * separate test, unlike x86's `mov`+`cmp`+`jne`.
+ *
+ * @param SelCtxRiscv ctx1  the context to extend (edges already resolved)
+ * @param u32 cond  the boolean condition VReg
+ * @param u32 taken  the machine-block id taken when `cond` is nonzero
+ * @return SelCtxRiscv | error  the advanced context (never errors — the union
+ *                              matches `select_fused_branch_riscv` for the caller)
+ */
+fn select_boolean_branch_riscv(ctx1: SelCtxRiscv, cond: u32, taken: u32) -> SelCtxRiscv | error {
+    selctx_riscv_emit(ctx1, branch_riscv(MCond::NE, vreg(cond, MRegClass::GPR), riscv_zero_reg(), taken))
+}
+
+/**
+ * select_branch_riscv — the `LBranch` selection: resolve each edge to a landing
+ * block (splitting an arg-carrying edge), emit the fused conditional
+ * `MBranchRiscv` to the taken edge, then an unconditional `jal` to the else edge
+ * — the explicit pair form the reachability-aware regalloc expects (no
+ * fall-through; `block_successors` reads both targets). When the condition is a
+ * compare fused into this branch, emit one fused compare-branch; otherwise test
+ * the boolean condition against `x0`.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function
+ * @param lir::LBranch br  the branch op
+ * @return SelCtxRiscv | error  the advanced context, or a propagated error
+ * @throws  a propagated edge error or the `B2-fp` fused-float-compare stop
+ */
+fn select_branch_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, br: lir::LBranch) -> SelCtxRiscv | error {
+    let t_land = match resolve_edge_riscv(ctx0, f, br.t_target, br.t_args) { EdgeResRiscv as r => r; error as e => return e }
+    let f_land = match resolve_edge_riscv(t_land.ctx, f, br.f_target, br.f_args) { EdgeResRiscv as r => r; error as e => return e }
+    let ctx1 = f_land.ctx
+    let dc = find_cmp_def(f, br.cond)
+    let branched = if dc.found && is_fused_compare(f, br.cond) {
+        select_fused_branch_riscv(ctx1, dc, t_land.block)
+    } else {
+        select_boolean_branch_riscv(ctx1, br.cond, t_land.block)
+    }
+    let ctx2 = match branched { SelCtxRiscv as c => c; error as e => return e }
+    selctx_riscv_emit(ctx2, jal_riscv(f_land.block))
+}
+
+/**
+ * mem_size_riscv — the load/store transfer width for a machine class: B/H/W/D
+ * for the integer widths (and Ptr = D). A float access (F32/F64) needs an F/D
+ * move (the `B2-fp` stop), an i128 access a register-pair transfer (the
+ * i128-inherited stop), an f16 access has no single-register width, and a
+ * void-typed access is malformed.
+ *
+ * @param lir::LType t  the accessed value's machine class
+ * @return MMemSizeRiscv | error  the transfer width, or a NAMED honest-stop
+ * @throws  a float/f16 access (`B2-fp`/no-width), an i128 access, or a void access
+ */
+fn mem_size_riscv(t: lir::LType) -> MMemSizeRiscv | error {
+    match t {
+        lir::LType::I8 => MMemSizeRiscv::B
+        lir::LType::I16 => MMemSizeRiscv::H
+        lir::LType::I32 => MMemSizeRiscv::W
+        lir::LType::I64 => MMemSizeRiscv::D
+        lir::LType::Ptr => MMemSizeRiscv::D
+        lir::LType::F32 => error { message = "isel riscv64: B2-fp — an f32 memory access uses an F/D move, the float honest-stop (0.3.1)" }
+        lir::LType::F64 => error { message = "isel riscv64: B2-fp — an f64 memory access uses an F/D move, the float honest-stop (0.3.1)" }
+        lir::LType::I128 => error { message = "isel riscv64: an i128 memory access needs a register-pair transfer (the i128-inherited stop)" }
+        lir::LType::F16 => error { message = "isel riscv64: an f16 memory access has no single-register transfer width (0.3.1)" }
+        lir::LType::Void => error { message = "isel riscv64: a void-typed memory access is malformed (internal)" }
+    }
+}
+
+/**
+ * select_alloca_riscv — the `LAlloca` selection: reserve a frame slot (its index
+ * is the current frame length) and materialize its address with
+ * `MFrameAddrRiscv`; the encoder resolves the slot to an `addi rd, sp, off`
+ * (§6.5). The address is a Ptr (wide GPR).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LAlloca a  the alloca op (its byte-size/alignment shape)
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_alloca_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, a: lir::LAlloca) -> SelCtxRiscv {
+    let slot = ctx0.func.frame.len to u32
+    let ctx1 = SelCtxRiscv { func = append_frame_riscv(ctx0.func, a); vinfo = ctx0.vinfo; next_scratch = ctx0.next_scratch; cur_block = ctx0.cur_block; next_block = ctx0.next_block }
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx2 = selctx_riscv_set_vinfo(ctx1, inst.result, MRegClass::GPR, true)
+    selctx_riscv_emit(ctx2, frame_addr_riscv(dst, slot))
+}
+
+/**
+ * select_field_addr_riscv — the `LFieldAddr` selection: `addi rd, base, #offset`
+ * (a Ptr result). RISC-V's `addi` immediate is only 12 bits, so a field offset
+ * beyond the signed 12-bit window needs a materialized offset add — the
+ * `B2-bigimm` honest-stop (a REAL RISC-V limit, unlike x86's 32-bit displacement
+ * that covers 2 GB). The fold of the offset into a following `MMem` displacement
+ * is deferred so B2's golden dumps stay 1:1.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LFieldAddr fa  the field-address op
+ * @return SelCtxRiscv | error  the advanced context, or the `B2-bigimm` stop
+ * @throws  the `B2-bigimm` honest-stop for a field offset beyond imm12
+ */
+fn select_field_addr_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, fa: lir::LFieldAddr) -> SelCtxRiscv | error {
+    if !fits_imm12_riscv(fa.offset to i128) {
+        return error { message = "isel riscv64: B2-bigimm — a struct field offset beyond the addi imm12 window needs a materialized offset add, the imm12 honest-stop (0.3.1)" }
+    }
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    selctx_riscv_emit(ctx1, alu_i_riscv(MAluOpRiscv::Addi, dst, vreg(fa.base, MRegClass::GPR), fa.offset to i32))
+}
+
+/**
+ * select_load_riscv — the `LLoad` selection: `MLoadRiscv{size, sign=false, dst,
+ * off(addr)}`, width from the loaded `ty`. Loads zero-extend (`sign=false`, the
+ * `lbu`/`lhu`/`lwu` forms): a narrow value's own producing `Trunc`/`ZExt`/`SExt`
+ * chain already fixed its class, so the load itself does not re-sign (mirrors
+ * arm64's `select_load`). The loaded value is always a GPR — a float width has
+ * already honest-stopped in `mem_size_riscv`.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LLoad l  the load op
+ * @return SelCtxRiscv | error  the advanced context, or a propagated width error
+ * @throws  the propagated `mem_size_riscv` honest-stop
+ */
+fn select_load_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, l: lir::LLoad) -> SelCtxRiscv | error {
+    let size = match mem_size_riscv(l.ty) { MMemSizeRiscv as s => s; error as e => return e }
+    let wide = ltype_is_wide(l.ty)
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    selctx_riscv_emit(ctx1, load_riscv(size, false, dst, MMem { base = vreg(l.addr, MRegClass::GPR); offset = 0 to i32 }))
+}
+
+/**
+ * select_store_riscv — the `LStore` selection: `MStoreRiscv{size, value,
+ * off(addr)}`, width from the stored `ty`. No result VReg. The stored value is
+ * always a GPR — a float width has already honest-stopped in `mem_size_riscv`.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LStore s  the store op
+ * @return SelCtxRiscv | error  the advanced context, or a propagated width error
+ * @throws  the propagated `mem_size_riscv` honest-stop
+ */
+fn select_store_riscv(ctx0: SelCtxRiscv, s: lir::LStore) -> SelCtxRiscv | error {
+    let size = match mem_size_riscv(s.ty) { MMemSizeRiscv as sz => sz; error as e => return e }
+    selctx_riscv_emit(ctx0, store_riscv(size, vreg(s.value, MRegClass::GPR), MMem { base = vreg(s.addr, MRegClass::GPR); offset = 0 to i32 }))
+}
+
+/**
+ * select_lla_riscv — the shared `MLlaRiscv` PC-relative address materialization
+ * (`auipc rd, %pcrel_hi(sym) ; addi rd, rd, %pcrel_lo(label)`, the arm64
+ * `ADRP`+`ADD` / x86 `lea rip` analog): isel emits one `MLlaRiscv{dst, sym}`;
+ * the encoder expands it to the two instructions, the paired
+ * `R_RISCV_PCREL_HI20`/`R_RISCV_PCREL_LO12_I` relocations, and a synthesized
+ * local `.text` label (§4.5). RISC-V has a single PC-relative addressing
+ * mechanism, so — unlike x86's per-kind `lea rip` — this case carries no
+ * relocation-kind choice; the writable `.data`/`.bss` absolute path (`R_RISCV_64`)
+ * is the encoder's `B2-globals` stop, which N2 never reaches (it lowers no
+ * `LGlobal`).
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param str symbol  the symbol whose address is materialized
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_lla_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, symbol: str) -> SelCtxRiscv {
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    selctx_riscv_emit(ctx1, lla_riscv(dst, symbol))
+}
+
+/**
+ * select_global_addr_riscv — the `LGlobalAddr` selection: the `MLlaRiscv`
+ * `auipc`+`addi` PC-relative pair for a rodata/global symbol.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LGlobalAddr g  the global-address op
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_global_addr_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, g: lir::LGlobalAddr) -> SelCtxRiscv {
+    select_lla_riscv(ctx0, inst, g.symbol)
+}
+
+/**
+ * select_func_addr_riscv — the `LFuncAddr` selection: the same `MLlaRiscv`
+ * `auipc`+`addi` pair as a global address, for a function symbol.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LFuncAddr fa  the function-address op
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_func_addr_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, fa: lir::LFuncAddr) -> SelCtxRiscv {
+    select_lla_riscv(ctx0, inst, fa.symbol)
+}
+
+/**
+ * PinnedArgsRiscv — the outcome of lowering a call's arguments into their LP64D
+ * argument registers: the advanced context + the pinned physical registers (the
+ * `uses` the `MCallRiscv`/`MCallIndRiscv` records for the shared regalloc's
+ * liveness).
+ *
+ * @since #387 B2-3
+ */
+type PinnedArgsRiscv = struct {
+    /**
+     * ctx — the context with every argument pinned into its ABI register.
+     */
+    ctx: SelCtxRiscv
+    /**
+     * uses — the physical argument registers pinned, in argument order.
+     */
+    uses: []MReg
+}
+
+/**
+ * pin_args_riscv — lower each argument into its LP64D integer slot: pin it with
+ * a `mv` into the physical register `arg_reg(riscv64_lp64d(), GPR, n)` names
+ * (`a0..a7`), collecting the physregs as the call's `uses`. A float-class
+ * argument needs an `fa*` move (the `B2-fp` stop), an argument past the
+ * 8-register window the LP64D stack-arg slot (the `B2-args` stop), and a variadic
+ * call the register/stack split for its tail (also `B2-args`) — `LCall` carries
+ * no fixed arity, so both honest-stop.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param []u32 args  the argument VRegs, in declaration order
+ * @param bool variadic  whether the call is variadic (honest-stops here)
+ * @return PinnedArgsRiscv | error  the pinned args, or a NAMED honest-stop
+ * @throws  a variadic call or a past-`a7` arg (`B2-args`), or a float arg (`B2-fp`)
+ */
+fn pin_args_riscv(ctx0: SelCtxRiscv, args: []u32, variadic: bool) -> PinnedArgsRiscv | error {
+    if variadic {
+        return error { message = "isel riscv64: B2-args — a variadic call needs the LP64D register/stack split for its tail; LCall carries no arity (0.3.1)" }
+    }
+    mut ctx = ctx0
+    mut uses: []MReg = teko::list::empty()
+    mut gpr_n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        let a = args[i]
+        let info = vinfo_get(ctx.vinfo, a)
+        if info.reg_class == MRegClass::FPR {
+            return error { message = "isel riscv64: B2-fp — a float call argument arrives in an fa* register via an F/D move, the float honest-stop (0.3.1)" }
+        }
+        let slot = arg_reg(riscv64_lp64d(), MRegClass::GPR, gpr_n)
+        if !slot.ok {
+            return error { message = "isel riscv64: B2-args — more than 8 integer arguments needs the LP64D stack-arg slot (0.3.1)" }
+        }
+        ctx = selctx_riscv_emit(ctx, mv_riscv(slot.reg, vreg(a, MRegClass::GPR)))
+        uses = teko::list::push(uses, slot.reg)
+        gpr_n++
+        i++
+    }
+    PinnedArgsRiscv { ctx = ctx; uses = uses }
+}
+
+/**
+ * select_call_result_riscv — after a call, move its result out of the LP64D
+ * result register `a0` into the result VReg (when the call produces one). The
+ * result class is taken as GPR (`a0`): `LInst` carries no result type, so a
+ * float-returning call (`fa0`) is a documented limitation until the LIR records
+ * a call's result type.
+ *
+ * @param SelCtxRiscv ctx0  the post-call context to extend
+ * @param lir::LInst inst  the call instruction (its result VReg + `has_result`)
+ * @param MReg ret_reg  the ABI result register the call wrote (`a0`)
+ * @return SelCtxRiscv  the advanced context
+ */
+fn select_call_result_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, ret_reg: MReg) -> SelCtxRiscv {
+    if !inst.has_result {
+        return ctx0
+    }
+    let dst = vreg(inst.result, MRegClass::GPR)
+    let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    selctx_riscv_emit(ctx1, mv_riscv(dst, ret_reg))
+}
+
+/**
+ * select_call_riscv — the `LCall` selection: lower the arguments into their
+ * LP64D registers (`pin_args_riscv`), emit `MCallRiscv{sym, uses, ret_reg,
+ * has_result, variadic}` (the `auipc`+`jalr` call macro + one `R_RISCV_CALL_PLT`
+ * reloc), then move the result out of `a0` if the call produces one.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LCall c  the call op
+ * @return SelCtxRiscv | error  the advanced context, or a propagated error
+ * @throws  the propagated `pin_args_riscv` honest-stop
+ */
+fn select_call_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, c: lir::LCall) -> SelCtxRiscv | error {
+    let pinned = match pin_args_riscv(ctx0, c.args, c.variadic) { PinnedArgsRiscv as p => p; error as e => return e }
+    let ret_reg = riscv_gpr_result()
+    let ctx1 = selctx_riscv_emit(pinned.ctx, call_riscv(c.symbol, pinned.uses, ret_reg, inst.has_result, c.variadic))
+    select_call_result_riscv(ctx1, inst, ret_reg)
+}
+
+/**
+ * select_call_indirect_riscv — the `LCallIndirect` selection: identical argument
+ * lowering, then `MCallIndRiscv{target, uses, ret_reg, has_result}` (a
+ * `jalr ra, 0(rs)` through the target Ptr VReg), then the result move.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LInst inst  the enclosing instruction (its result VReg)
+ * @param lir::LCallIndirect ci  the indirect-call op
+ * @return SelCtxRiscv | error  the advanced context, or a propagated error
+ * @throws  the propagated `pin_args_riscv` honest-stop
+ */
+fn select_call_indirect_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, ci: lir::LCallIndirect) -> SelCtxRiscv | error {
+    let pinned = match pin_args_riscv(ctx0, ci.args, ci.variadic) { PinnedArgsRiscv as p => p; error as e => return e }
+    let ret_reg = riscv_gpr_result()
+    let ctx1 = selctx_riscv_emit(pinned.ctx, call_ind_riscv(vreg(ci.target, MRegClass::GPR), pinned.uses, ret_reg, inst.has_result))
+    select_call_result_riscv(ctx1, inst, ret_reg)
+}
+
+/**
+ * select_inst_riscv — the per-`LOp` dispatch: the whole `LOp` frontier selects
+ * — constants, integer arithmetic/bitwise/shift/compare (`LBin`), unary
+ * (`LUn`), parameters/returns, control flow (`LJump`/`LBranch`), memory
+ * (`LAlloca`/`LFieldAddr`/`LLoad`/`LStore`/`LGlobalAddr`/`LFuncAddr`), and calls
+ * (`LCall`/`LCallIndirect`). The float family and the over-window/64-bit-immediate
+ * cases surface their NAMED honest-stops.
+ *
+ * @param SelCtxRiscv ctx  the context to extend
+ * @param lir::LFunc f  the enclosing function (`LParam`/the fusion test need it)
+ * @param lir::LInst inst  the instruction to select
+ * @return SelCtxRiscv | error  the advanced context, or a propagated/named error
+ * @throws  any selected op's propagated honest-stop
+ */
+fn select_inst_riscv(ctx: SelCtxRiscv, f: lir::LFunc, inst: lir::LInst) -> SelCtxRiscv | error {
+    match inst.op {
+        lir::LConstInt as c => select_const_int_riscv(ctx, inst, c)
+        lir::LConstFloat as c => select_const_float_riscv(ctx, inst, c)
+        lir::LBin as b => select_bin_riscv(ctx, f, inst, b)
+        lir::LUn as u => select_un_riscv(ctx, inst, u)
+        lir::LParam as p => select_param_riscv(ctx, f, inst, p)
+        lir::LRet as r => select_ret_riscv(ctx, r)
+        lir::LJump as j => select_jump_riscv(ctx, f, j)
+        lir::LBranch as br => select_branch_riscv(ctx, f, br)
+        lir::LAlloca as a => select_alloca_riscv(ctx, inst, a)
+        lir::LFieldAddr as fa => select_field_addr_riscv(ctx, inst, fa)
+        lir::LLoad as l => select_load_riscv(ctx, inst, l)
+        lir::LStore as s => select_store_riscv(ctx, s)
+        lir::LGlobalAddr as g => select_global_addr_riscv(ctx, inst, g)
+        lir::LCallIndirect as ci => select_call_indirect_riscv(ctx, inst, ci)
+        lir::LFuncAddr as fa => select_func_addr_riscv(ctx, inst, fa)
+        lir::LCall as c => select_call_riscv(ctx, inst, c)
+    }
+}
+
+/**
+ * select_insts_riscv — select every instruction of `insts`, in order, threading
+ * the context forward and short-circuiting on the first error.
+ *
+ * @param SelCtxRiscv ctx0  the context to extend
+ * @param lir::LFunc f  the enclosing function
+ * @param []lir::LInst insts  the instruction stream to select
+ * @return SelCtxRiscv | error  the fully-advanced context, or the first error
+ * @throws  the first instruction's propagated honest-stop
+ */
+fn select_insts_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, insts: []lir::LInst) -> SelCtxRiscv | error {
+    mut ctx = ctx0
+    mut i: u64 = 0
+    loop {
+        if i >= insts.len { break }
+        let stepped = match select_inst_riscv(ctx, f, insts[i]) { SelCtxRiscv as c => c; error as e => return e }
+        ctx = stepped
+        i++
+    }
+    ctx
+}
+
+/**
+ * build_mirror_blocks_riscv — an `MFuncRiscv` with one empty machine block per
+ * `LBlock`, same id + (provisionally-classed) params, in source order. Selection
+ * then fills each block's instructions and splits edge blocks in past them.
+ *
+ * @param lir::LFunc f  the function whose block skeleton is mirrored
+ * @return MFuncRiscv  the empty-bodied mirror function
+ */
+fn build_mirror_blocks_riscv(f: lir::LFunc) -> MFuncRiscv {
+    mut blocks: []MBlockRiscv = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let lb = f.blocks[i]
+        blocks = teko::list::push(blocks, MBlockRiscv { id = lb.id; params = provisional_params(lb.params); insts = teko::list::empty() })
+        i++
+    }
+    MFuncRiscv { symbol = f.symbol; blocks = blocks; frame = teko::list::empty() }
+}
+
+/**
+ * select_all_blocks_riscv — select every `LBlock` of `f` in order, retargeting
+ * the emit cursor to each block's mirror before selecting its instructions. The
+ * `match` is bound to a `let` first (not assigned directly) because the VM does
+ * not execute a `return` inside a `match` used as a reassignment's RHS — the
+ * let-then-assign shape is the one both engines run (the shared #443/#455-era
+ * gate lesson, mirrored from `select_all_blocks` at `isel_arm64.tks`).
+ *
+ * @param SelCtxRiscv ctx0  the initial context (targeting the entry block)
+ * @param lir::LFunc f  the function to select
+ * @return SelCtxRiscv | error  the fully-advanced context, or the first error
+ * @throws  the first block's propagated honest-stop
+ */
+fn select_all_blocks_riscv(ctx0: SelCtxRiscv, f: lir::LFunc) -> SelCtxRiscv | error {
+    mut ctx = ctx0
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let lb = f.blocks[i]
+        let switched = selctx_riscv_switch(ctx, lb.id)
+        let stepped = match select_insts_riscv(switched, f, lb.insts) { SelCtxRiscv as c => c; error as e => return e }
+        ctx = stepped
+        i++
+    }
+    ctx
+}
+
+/**
+ * select_lfunc_riscv — select one `LFunc` into an `MFuncRiscv`: build the mirror
+ * block skeleton, then select every block's instructions (the full control-flow
+ * set — jumps, branches, and their split edge blocks). `next_scratch` seeds past
+ * the source function's `next_vreg`.
+ *
+ * @param lir::LFunc f  the function to select
+ * @return MFuncRiscv | error  the selected function, or a propagated error
+ * @throws  any instruction's propagated honest-stop
+ */
+pub fn select_lfunc_riscv(f: lir::LFunc) -> MFuncRiscv | error {
+    let ctx0 = SelCtxRiscv { func = build_mirror_blocks_riscv(f); vinfo = vinfo_empty(); next_scratch = f.next_vreg; cur_block = 0; next_block = max_block_id(f) + 1 }
+    let done = match select_all_blocks_riscv(ctx0, f) { SelCtxRiscv as c => c; error as e => return e }
+    done.func
+}
+
+/**
+ * select_module_riscv — select every function of `m` into an `MModuleRiscv`,
+ * carrying its rodata/globals/layouts tables through UNCHANGED (isel never
+ * touches their bytes — that is the encoder's job).
+ *
+ * @param lir::LModule m  the module to select
+ * @return MModuleRiscv | error  the selected module, or the first error
+ * @throws  the first function's propagated honest-stop
+ */
+pub fn select_module_riscv(m: lir::LModule) -> MModuleRiscv | error {
+    mut out = MModuleRiscv { funcs = teko::list::empty(); rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        let mf = match select_lfunc_riscv(m.funcs[i]) { MFuncRiscv as x => x; error as e => return e }
+        out = add_mfunc_riscv(out, mf)
+        i++
+    }
+    out
+}

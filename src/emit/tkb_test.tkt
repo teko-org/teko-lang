@@ -237,14 +237,15 @@ fn tkb_roundtrip_ifexpr() {
 
 #test
 fn tkb_roundtrip_loop_stmts() {
-    // C7.16: `if true { loop outer { a = 1; break; continue outer } }` — TLoopStmt/TAssign/TBreak/TContinue.
     let cond = checker::TExpr { kind = checker::TBoolLit { value = true }; type = boolty(); line = 0; col = 0 }
     mut body: []checker::TStatement = teko::list::empty()
     body = teko::list::push(body, checker::TAssign { kind = parser::AssignKind::Simple; name = "a"; op = lexer::TokenKind::Assign; bound = i64ty(); value = tnum(1); deref = false; target = checker::no_texpr() })
     body = teko::list::push(body, checker::TBreakStmt { label = "" })
-    body = teko::list::push(body, checker::TContinueStmt { label = "outer" })
+    body = teko::list::push(body, checker::TContinueStmt { label = "OUTER" })
+    mut linit: []checker::TStatement = teko::list::empty()
+    linit = teko::list::push(linit, checker::TBinding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "_hi" }; bound = i64ty(); value = tnum(5) })
     mut thenb: []checker::TStatement = teko::list::empty()
-    thenb = teko::list::push(thenb, checker::TLoopStmt { label = "outer"; body = body })
+    thenb = teko::list::push(thenb, checker::TLoopStmt { label = "OUTER"; init = linit; body = body })
     let iff = checker::TExpr { kind = checker::TIfExpr { cond = cond; then_blk = thenb; has_else = false; else_blk = teko::list::empty() }; type = i64ty(); line = 0; col = 0 }
     match deserialize(serialize(iff)) {
         checker::TExpr as got => match got.kind {
@@ -253,11 +254,13 @@ fn tkb_roundtrip_loop_stmts() {
                 teko::assert::is_true(f.then_blk.len == 1)
                 match f.then_blk[0] {
                     checker::TLoopStmt as l => {
-                        teko::assert::is_true(l.label == "outer")
+                        teko::assert::is_true(l.label == "OUTER")
+                        teko::assert::is_true(l.init.len == 1)
+                        match l.init[0] { checker::TBinding as bd => match bd.target { parser::SimpleName as sn => teko::assert::is_true(sn.name == "_hi"); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
                         teko::assert::is_true(l.body.len == 3)
                         match l.body[0] { checker::TAssign as a => { teko::assert::is_true(a.name == "a"); teko::assert::is_true(a.op == lexer::TokenKind::Assign) }; _ => teko::assert::is_true(false) }
                         match l.body[1] { checker::TBreakStmt as b => teko::assert::is_true(b.label == ""); _ => teko::assert::is_true(false) }
-                        match l.body[2] { checker::TContinueStmt as c => teko::assert::is_true(c.label == "outer"); _ => teko::assert::is_true(false) }
+                        match l.body[2] { checker::TContinueStmt as c => teko::assert::is_true(c.label == "OUTER"); _ => teko::assert::is_true(false) }
                     }
                     _ => teko::assert::is_true(false)
                 }

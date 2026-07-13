@@ -907,6 +907,175 @@ fn ex_even_callee_saved_zero_sub_layout() {
 }
 
 /**
+ * fx_exit_call — a direct `call tk_exit` machine instruction (no result, no
+ * pinned arg uses), the Win64/SysV keystone-exit fixture used to exercise the
+ * shadow-space frame delta and the `func_makes_call_x86` gate.
+ *
+ * @return MInstX86  the direct-call instruction
+ */
+fn fx_exit_call() -> MInstX86 {
+    call_x86("tk_exit", teko::list::empty(), ex_p(0), false, false)
+}
+
+/**
+ * fx_win_layout_of — `compute_frame_layout_x86` under `win64()` for a function
+ * built from a frame table and a single-block stream (the Win64 frame-delta
+ * logic-test shorthand — the sibling of `fx_layout_of`, which uses `sysv64()`).
+ *
+ * @param []lir::LAlloca frame  the frame-slot table
+ * @param []MInstX86 insts  the block's instructions (scanned for calls + callee-saved)
+ * @return FrameLayoutX86  the resolved Win64 frame layout
+ */
+fn fx_win_layout_of(frame: []lir::LAlloca, insts: []MInstX86) -> FrameLayoutX86 {
+    compute_frame_layout_x86(win64(), fx_1block_func("main", insts, frame))
+}
+
+#test
+/**
+ * ex_win64_call_frame_reserves_shadow — a Win64 `main` making a `call tk_exit`
+ * (no slots, no callee-saved) is FRAMED: the 32-byte shadow space folds into the
+ * `sub rsp` region (`size==32`), so the prologue is `push rbp` + `mov rbp,rsp` +
+ * `sub rsp,0x20`. The Win64-vs-SysV frame difference the shadow field introduces
+ * (§4.2/§4.3).
+ *
+ * @return void
+ */
+fn ex_win64_call_frame_reserves_shadow() {
+    let fl = fx_win_layout_of(fx_no_frame(), fx_i1(fx_exit_call()))
+    teko::assert::is_true(fl.size == (32 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+    teko::assert::is_true(fl.saved_fpr.len == 0)
+    teko::assert::is_true(fl.slot_offsets.len == 0)
+    teko::assert::is_true(fx_prologue_hex(fl) == "554889e54883ec20")
+}
+
+#test
+/**
+ * ex_sysv_call_frame_byte_identical — THE GUARDRAIL: the SAME calling `main`
+ * under `sysv64()` (`shadow_space == 0`) reserves NO shadow space and stays
+ * frameless (`size==0`, empty prologue) — byte-identical to the pre-shadow-field
+ * SysV frame (the `ex_func_frameless_call_reloc` `e800000000` shape). A 0 shadow
+ * space adds zero bytes and shifts no offset (§2.2/§3.1 FIXPOINT guardrail).
+ *
+ * @return void
+ */
+fn ex_sysv_call_frame_byte_identical() {
+    let fl = fx_layout_of(fx_no_frame(), fx_i1(fx_exit_call()))
+    teko::assert::is_true(fl.size == (0 to u32))
+    teko::assert::is_true(fl.slot_offsets.len == 0)
+    teko::assert::is_true(fx_prologue_hex(fl) == "")
+}
+
+#test
+/**
+ * ex_sysv_framed_prologue_byte_identical — THE GUARDRAIL (framed case): a `sysv64`
+ * function with one callee-saved GPR (RBX) plus an 8-byte slot routes through
+ * `compute_frame_layout_x86` and emits the UNCHANGED prologue `push rbp` +
+ * `mov rbp,rsp` + `sub rsp,0x18` (=24) + `push rbx`, with the slot shifted up only
+ * by the 8-byte push region (RSP+8) — no shadow bytes, proving the field addition
+ * is behavior-preserving for a real framed SysV function.
+ *
+ * @return void
+ */
+fn ex_sysv_framed_prologue_byte_identical() {
+    let insts = fx_i2(mov_x86(ex_p(3), ex_p(0), true), ret_x86())
+    let fl = fx_layout_of(fx_alloca_frame(8 to u32, 8 to u32), insts)
+    teko::assert::is_true(fl.size == (24 to u32))
+    teko::assert::is_true(fl.slot_offsets[0] == (8 to u32))
+    teko::assert::is_true(fx_prologue_hex(fl) == "554889e54883ec1853")
+}
+
+#test
+/**
+ * ex_win64_leaf_no_shadow — a Win64 LEAF (a caller-saved move then `ret`, no call,
+ * no slots) reserves NO shadow space and stays frameless (`size==0`), proving the
+ * `func_makes_call_x86` gate: a leaf function owes the callee no shadow region
+ * (§4.2).
+ *
+ * @return void
+ */
+fn ex_win64_leaf_no_shadow() {
+    let fl = fx_win_layout_of(fx_no_frame(), fx_i2(mov_x86(ex_p(0), ex_p(1), true), ret_x86()))
+    teko::assert::is_true(fl.size == (0 to u32))
+    teko::assert::is_true(fl.saved_gpr.len == 0)
+    teko::assert::is_true(fl.slot_offsets.len == 0)
+    teko::assert::is_true(fx_prologue_hex(fl) == "")
+}
+
+#test
+/**
+ * ex_win64_slot_shifted_above_shadow — a Win64 function with an 8-byte slot AND a
+ * call: the slot region (16, the 16-rounded one-slot size) plus the 32-byte
+ * shadow region size the `sub rsp` to 48, and the slot offset shifts UP by the
+ * shadow bytes to RSP+32 (the slot lives ABOVE the [rsp+0..32] shadow region,
+ * §4.2).
+ *
+ * @return void
+ */
+fn ex_win64_slot_shifted_above_shadow() {
+    let insts = fx_i2(frame_addr_x86(ex_p(0), 0 to u32), fx_exit_call())
+    let fl = fx_win_layout_of(fx_alloca_frame(8 to u32, 8 to u32), insts)
+    teko::assert::is_true(fl.size == (48 to u32))
+    teko::assert::is_true(fl.slot_offsets.len == 1)
+    teko::assert::is_true(fl.slot_offsets[0] == (32 to u32))
+    teko::assert::is_true(fx_prologue_hex(fl) == "554889e54883ec30")
+}
+
+#test
+/**
+ * ex_func_makes_call_x86_detects_direct — `func_makes_call_x86` is true for a
+ * function containing a direct `call` (the `MCallX86` shadow-space trigger).
+ *
+ * @return void
+ */
+fn ex_func_makes_call_x86_detects_direct() {
+    let f = fx_1block_func("main", fx_i1(fx_exit_call()), fx_no_frame())
+    teko::assert::is_true(func_makes_call_x86(f))
+}
+
+#test
+/**
+ * ex_func_makes_call_x86_detects_indirect — `func_makes_call_x86` is true for a
+ * function containing an indirect `call r/m64` (the `MCallIndX86` arm of the
+ * per-instruction call predicate).
+ *
+ * @return void
+ */
+fn ex_func_makes_call_x86_detects_indirect() {
+    let ind = call_ind_x86(ex_p(0), teko::list::empty(), ex_p(0), false)
+    let f = fx_1block_func("main", fx_i1(ind), fx_no_frame())
+    teko::assert::is_true(func_makes_call_x86(f))
+}
+
+#test
+/**
+ * ex_func_makes_call_x86_leaf_false — `func_makes_call_x86` is false for a leaf
+ * function whose only instructions are a move and a `ret` (no call), so a Win64
+ * leaf reserves no shadow space.
+ *
+ * @return void
+ */
+fn ex_func_makes_call_x86_leaf_false() {
+    let f = fx_1block_func("main", fx_i2(mov_x86(ex_p(0), ex_p(1), true), ret_x86()), fx_no_frame())
+    teko::assert::is_true(!func_makes_call_x86(f))
+}
+
+#test
+/**
+ * ex_win64_callee_saved_xmm_honest_stops — a frame carrying a callee-saved XMM in
+ * `saved_fpr` (Win64 preserves XMM6-15) raises the named `B3-xmm-callee-saved`
+ * honest-stop at prologue emission rather than mis-emitting a GPR `push` for an
+ * XMM (the `movaps` spill path is unimplemented; the integer corpus allocates no
+ * XMM, §2.2/§7).
+ *
+ * @return void
+ */
+fn ex_win64_callee_saved_xmm_honest_stops() {
+    let fl = FrameLayoutX86 { size = 16 to u32; saved_gpr = fx_none_u32(); saved_fpr = fx_u1(6 to u32); slot_offsets = fx_none_u32() }
+    teko::assert::str_contains(fx_prologue_stop(fl), "B3-xmm-callee-saved")
+}
+
+/**
  * fx_func_hex — the hex of `f`'s `encode_func_x86` byte image under `sysv64()`,
  * or `<err>` on an unexpected honest-stop.
  *

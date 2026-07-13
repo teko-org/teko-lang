@@ -3466,17 +3466,7 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
                 _ => { let sv = eval_stmt_value(x.expr, env); Stepped { env = sv.env; value = sv.value } }
             }
         }
-        checker::TLoopStmt as l => {
-            // while(1){…} with break/continue. run_loop returns the OUTER env after the last
-            // iteration (so outer-`mut` updates survive the loop — the functional twin of the C's
-            // in-place env). A NORMAL completion CONTINUES the block (Stepped); a return / labeled
-            // break-or-continue to an enclosing loop EXITS (Exit, carrying the loop's outer env).
-            let lo = run_loop(l.label, l.body, env)
-            match lo.flow {
-                Normal => Stepped { env = lo.env; value = null }
-                _ => Exit { flow = lo.flow; env = lo.env }
-            }
-        }
+        checker::TLoopStmt as l => exec_loop(l, env)
         checker::TBreakStmt as b => Exit { flow = Break { label = b.label }; env = env }
         checker::TContinueStmt as c => Exit { flow = Continue { label = c.label }; env = env }
         // (C7.18) A defer statement registers the block; it executes LIFO at function exit.
@@ -3484,6 +3474,44 @@ pub fn exec_stmt(s: checker::TStatement, env: Venv) -> Step {
         // Panic does NOT drain deferred blocks.
         checker::TDeferStmt as d => Stepped { env = push_defer(env, d.body); value = null }
         checker::TAdoptStmt as a => exec_adopt(a, env)
+    }
+}
+
+/**
+ * exec_loop_init — run a loop's `init` preamble once, threading the env so its bindings
+ * (counter / bound / `_first` / `_it`) are appended and visible to the loop body. `init` is
+ * always straight-line bindings/assigns (never break/continue/return), so its flow is ignored
+ * (#517).
+ *
+ * @param init  the loop's run-once preamble statements
+ * @param env  the enclosing VM environment
+ * @return Venv  the environment with the preamble's bindings appended
+ */
+fn exec_loop_init(init: []checker::TStatement, env: Venv) -> Venv {
+    exec_block(init, env).env
+}
+
+/**
+ * exec_loop — run a `[LABEL:] loop [head] { … }`: execute the loop-scoped `init` preamble ONCE
+ * (its bindings stay loop-private, appended ABOVE the caller's slots and dropped when the loop
+ * ends — the base/pop pattern of `exec_adopt`), then iterate `body` with those bindings in scope.
+ * `run_loop` returns the OUTER env after the last iteration (so an outer `mut` updated inside the
+ * loop survives). A NORMAL completion CONTINUES the block (Stepped); a return / labeled
+ * break-or-continue to an enclosing loop EXITS (Exit). For an empty `init` the pop is a no-op, so
+ * an infinite/while loop behaves exactly as before (#517).
+ *
+ * @param l  the typed loop statement (label + init + body)
+ * @param env  the enclosing VM environment
+ * @return Step  Stepped on normal completion (loop-locals dropped), or Exit on return/labeled escape
+ */
+fn exec_loop(l: checker::TLoopStmt, env: Venv) -> Step {
+    let base = env.slots.len
+    let ienv = exec_loop_init(l.init, env)
+    let lo = run_loop(l.label, l.body, ienv)
+    let popped = Venv { slots = loop_outer(lo.env.slots, base); prog = lo.env.prog; defers = lo.env.defers; cells = lo.env.cells; di_cache = lo.env.di_cache }
+    match lo.flow {
+        Normal => Stepped { env = popped; value = null }
+        _ => Exit { flow = lo.flow; env = popped }
     }
 }
 
@@ -3891,7 +3919,7 @@ fn cov_walk_stmt(s: checker::TStatement, w: CovWalk) -> CovWalk {
         checker::TBinding as b => cov_walk_expr(b.value, w)
         checker::TAssign as a => { let w2 = cov_walk_expr(a.value, w); match a.kind { parser::AssignKind::Field => cov_walk_expr(a.target, w2); _ => w2 } }   // (#88) the FIELD LHS receiver is executable too
         checker::TReturn as r => if r.has_value { cov_walk_expr(r.value, w) } else { w }
-        checker::TLoopStmt as l => cov_walk_block(l.body, w)
+        checker::TLoopStmt as l => cov_walk_block(l.body, cov_walk_block(l.init, w))
         checker::TExprStmt as x => cov_walk_expr(x.expr, w)
         checker::TAdoptStmt as ad => cov_walk_block(ad.body, w)
         _ => w

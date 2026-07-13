@@ -1,0 +1,1880 @@
+/**
+ * EncWordRiscv — one RISC-V instruction's encoding outcome: its base 32-bit
+ * word plus an optional pending fixup. A position-independent instruction
+ * resolves to just `word` (`has_branch`/`has_reloc` false). An intra-function
+ * branch carries a branch fixup — its target machine-block id and which
+ * displacement field (0 = B-type imm[12:1], 1 = J-type imm[20:1]) the fixed-32
+ * word-patch pass scrambles in once every block's word offset is known (§6.3).
+ * A symbol reference carries a `RelocKindRiscv` on a placeholder word (the
+ * immediate the linker patches left zero). The RISC-V analog of arm64's
+ * `EncWord` — byte-identical STRUCTURE, RISC-V reloc kinds — NOT the
+ * byte-granular x86 `EncInstX86` (RISC-V is fixed 32-bit, the arm64 word model).
+ *
+ * @since #387 B2-5
+ */
+pub type EncWordRiscv = struct {
+    /**
+     * word — the base 32-bit encoding (register/funct fields filled; the
+     * branch/reloc immediate field left zero until patched).
+     */
+    word: u32
+    /**
+     * has_branch — true iff an intra-function displacement must be scrambled in
+     * by the B2-6 word-patch pass.
+     */
+    has_branch: bool
+    /**
+     * branch_form — which displacement field the patch pass fills: 0 = B-type
+     * imm[12:1] (±4 KiB), 1 = J-type imm[20:1] (±1 MiB). Sizes the range check.
+     */
+    branch_form: u32
+    /**
+     * target — the destination machine-block id (meaningful when `has_branch`).
+     */
+    target: u32
+    /**
+     * has_reloc — true iff this word owes a symbol relocation the B2-6 module
+     * assembly turns into a `RelocRiscv` record.
+     */
+    has_reloc: bool
+    /**
+     * reloc_sym — the relocation's target symbol name (meaningful when
+     * `has_reloc`).
+     */
+    reloc_sym: str
+    /**
+     * reloc_kind — which RISC-V relocation this word owes (`Call`/`PcRelHi20`/
+     * `PcRelLo12`/…), meaningful when `has_reloc`.
+     */
+    reloc_kind: RelocKindRiscv
+}
+
+/**
+ * plain_word_riscv — an `EncWordRiscv` for a position-independent instruction:
+ * the base word with no branch fixup and no relocation.
+ *
+ * @param u32 w  the fully-encoded instruction word
+ * @return EncWordRiscv  the word with both fixup flags clear
+ */
+fn plain_word_riscv(w: u32) -> EncWordRiscv {
+    EncWordRiscv {
+        word = w
+        has_branch = false
+        branch_form = 0 to u32
+        target = 0 to u32
+        has_reloc = false
+        reloc_sym = ""
+        reloc_kind = RelocKindRiscv::Call
+    }
+}
+
+/**
+ * branch_word_riscv — an `EncWordRiscv` for an intra-function branch: the base
+ * word (its scrambled displacement field still zero) plus the destination block
+ * id and which displacement field the B2-6 word-patch pass fills (0 = B-type,
+ * 1 = J-type).
+ *
+ * @param u32 w  the base word (register/funct fields filled, displacement zero)
+ * @param u32 target  the destination machine-block id
+ * @param u32 form  the displacement field selector (0 = B-type, 1 = J-type)
+ * @return EncWordRiscv  the word flagged for branch patching
+ */
+fn branch_word_riscv(w: u32, target: u32, form: u32) -> EncWordRiscv {
+    EncWordRiscv {
+        word = w
+        has_branch = true
+        branch_form = form
+        target = target
+        has_reloc = false
+        reloc_sym = ""
+        reloc_kind = RelocKindRiscv::Call
+    }
+}
+
+/**
+ * reloc_word_riscv — an `EncWordRiscv` for a symbol reference: the placeholder
+ * word (the immediate the linker patches left zero) plus the target symbol and
+ * the relocation kind the B2-6 module assembly turns into a `RelocRiscv`
+ * record. The B2-6 `auipc`+`jalr` call macro and `auipc`+`addi` address pair
+ * compose their reloc-bearing `auipc` word through this constructor.
+ *
+ * @param u32 w  the placeholder word (register fields filled, immediate zero)
+ * @param str sym  the target symbol's already-final name
+ * @param RelocKindRiscv kind  which relocation this word owes
+ * @return EncWordRiscv  the word flagged for symbol relocation
+ */
+fn reloc_word_riscv(w: u32, sym: str, kind: RelocKindRiscv) -> EncWordRiscv {
+    EncWordRiscv {
+        word = w
+        has_branch = false
+        branch_form = 0 to u32
+        target = 0 to u32
+        has_reloc = true
+        reloc_sym = sym
+        reloc_kind = kind
+    }
+}
+
+/**
+ * riscv_reloc_type — the numeric `R_RISCV_*` relocation type for a
+ * `RelocKindRiscv`, fed to the reused ELF writer (B2-7): `R_RISCV_CALL_PLT`(19),
+ * `R_RISCV_PCREL_HI20`(23), `R_RISCV_PCREL_LO12_I`(24), `R_RISCV_BRANCH`(16),
+ * `R_RISCV_JAL`(17), `R_RISCV_64`(2). `Branch`/`Jal`/`Abs64` are unreached by
+ * the MVP (intra-function branches patch directly; globals hit `B2-globals`)
+ * and are covered by a direct unit test on hand-built input.
+ *
+ * @param RelocKindRiscv kind  the relocation kind
+ * @return u32  the `Elf64_Rela` `r_info` type field
+ */
+fn riscv_reloc_type(kind: RelocKindRiscv) -> u32 {
+    match kind {
+        Call => 19 to u32
+        PcRelHi20 => 23 to u32
+        PcRelLo12 => 24 to u32
+        Branch => 16 to u32
+        Jal => 17 to u32
+        Abs64 => 2 to u32
+    }
+}
+
+/**
+ * enc_reg_riscv — a physical `MReg`'s 5-bit ISA register field: its `id`
+ * directly (x0..x31 for GPR, f0..f31 for FPR), masked to five bits. RISC-V
+ * register ids ARE the ISA numbers (the LP64D descriptor convention), so no
+ * per-register remap happens here (mirrors arm64's `enc_reg`).
+ *
+ * @param MReg r  a physical register (B2-5 runs post-regalloc)
+ * @return u32  the register id in a 5-bit field
+ */
+fn enc_reg_riscv(r: MReg) -> u32 {
+    r.id & (0x1F to u32)
+}
+
+/**
+ * r_type_word_riscv — assemble an R-type word:
+ * `funct7[31:25] | rs2[24:20] | rs1[19:15] | funct3[14:12] | rd[11:7] |
+ * opcode[6:0]`. Each field is masked to its width so a stray high bit never
+ * bleeds across fields.
+ *
+ * @param u32 funct7  the 7-bit function-7 field
+ * @param u32 rs2  the second source register (5 bits)
+ * @param u32 rs1  the first source register (5 bits)
+ * @param u32 funct3  the 3-bit function-3 field
+ * @param u32 rd  the destination register (5 bits)
+ * @param u32 opcode  the 7-bit opcode
+ * @return u32  the assembled R-type word
+ */
+fn r_type_word_riscv(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
+    ((funct7 & (0x7F to u32)) << (25 to u32)) | ((rs2 & (0x1F to u32)) << (20 to u32)) | ((rs1 & (0x1F to u32)) << (15 to u32)) | ((funct3 & (0x7 to u32)) << (12 to u32)) | ((rd & (0x1F to u32)) << (7 to u32)) | (opcode & (0x7F to u32))
+}
+
+/**
+ * i_type_word_riscv — assemble an I-type word:
+ * `imm[11:0][31:20] | rs1[19:15] | funct3[14:12] | rd[11:7] | opcode[6:0]`.
+ * `imm12` is already the 12-bit two's-complement field (from
+ * `imm12_field_riscv`), masked here for safety.
+ *
+ * @param u32 imm12  the 12-bit immediate field
+ * @param u32 rs1  the source register (5 bits)
+ * @param u32 funct3  the 3-bit function-3 field
+ * @param u32 rd  the destination register (5 bits)
+ * @param u32 opcode  the 7-bit opcode
+ * @return u32  the assembled I-type word
+ */
+fn i_type_word_riscv(imm12: u32, rs1: u32, funct3: u32, rd: u32, opcode: u32) -> u32 {
+    ((imm12 & (0xFFF to u32)) << (20 to u32)) | ((rs1 & (0x1F to u32)) << (15 to u32)) | ((funct3 & (0x7 to u32)) << (12 to u32)) | ((rd & (0x1F to u32)) << (7 to u32)) | (opcode & (0x7F to u32))
+}
+
+/**
+ * s_type_word_riscv — assemble an S-type store word:
+ * `imm[11:5][31:25] | rs2[24:20] | rs1[19:15] | funct3[14:12] | imm[4:0][11:7] |
+ * opcode[6:0]`. The 12-bit immediate is SPLIT into two contiguous runs (bits
+ * 11:5 high, 4:0 low) — a common encoding mistake, pinned by the frame-store
+ * goldens.
+ *
+ * @param u32 imm12  the 12-bit immediate field (already two's-complement)
+ * @param u32 rs2  the stored-value register (5 bits)
+ * @param u32 rs1  the base register (5 bits)
+ * @param u32 funct3  the 3-bit width field
+ * @param u32 opcode  the 7-bit opcode
+ * @return u32  the assembled S-type word
+ */
+fn s_type_word_riscv(imm12: u32, rs2: u32, rs1: u32, funct3: u32, opcode: u32) -> u32 {
+    let hi = (imm12 >> (5 to u32)) & (0x7F to u32)
+    let lo = imm12 & (0x1F to u32)
+    (hi << (25 to u32)) | ((rs2 & (0x1F to u32)) << (20 to u32)) | ((rs1 & (0x1F to u32)) << (15 to u32)) | ((funct3 & (0x7 to u32)) << (12 to u32)) | (lo << (7 to u32)) | (opcode & (0x7F to u32))
+}
+
+/**
+ * u_type_word_riscv — assemble a U-type word: `imm[31:12][31:12] | rd[11:7] |
+ * opcode[6:0]`. The 20-bit immediate is placed directly (no scramble); `imm20`
+ * is the raw bits-[31:12] field.
+ *
+ * @param u32 imm20  the 20-bit upper immediate
+ * @param u32 rd  the destination register (5 bits)
+ * @param u32 opcode  the 7-bit opcode
+ * @return u32  the assembled U-type word
+ */
+fn u_type_word_riscv(imm20: u32, rd: u32, opcode: u32) -> u32 {
+    ((imm20 & (0xFFFFF to u32)) << (12 to u32)) | ((rd & (0x1F to u32)) << (7 to u32)) | (opcode & (0x7F to u32))
+}
+
+/**
+ * b_type_base_word_riscv — assemble a B-type branch's PLACEHOLDER word: the
+ * register/funct/opcode fields with the scrambled immediate left entirely zero.
+ * The B2-6 word-patch pass ORs in `btype_scramble` once the displacement is
+ * known (§6.3).
+ *
+ * @param u32 rs2  the second compared register (5 bits, post-swap)
+ * @param u32 rs1  the first compared register (5 bits, post-swap)
+ * @param u32 funct3  the 3-bit condition field
+ * @param u32 opcode  the 7-bit opcode (BRANCH = 0x63)
+ * @return u32  the placeholder B-type word (immediate zero)
+ */
+fn b_type_base_word_riscv(rs2: u32, rs1: u32, funct3: u32, opcode: u32) -> u32 {
+    ((rs2 & (0x1F to u32)) << (20 to u32)) | ((rs1 & (0x1F to u32)) << (15 to u32)) | ((funct3 & (0x7 to u32)) << (12 to u32)) | (opcode & (0x7F to u32))
+}
+
+/**
+ * j_type_base_word_riscv — assemble a J-type jump's PLACEHOLDER word: the `rd`
+ * and opcode fields with the scrambled immediate left entirely zero. The B2-6
+ * word-patch pass ORs in `jtype_scramble` once the displacement is known
+ * (§6.3).
+ *
+ * @param u32 rd  the link register (5 bits; x0 for `MJalRiscv`)
+ * @param u32 opcode  the 7-bit opcode (JAL = 0x6F)
+ * @return u32  the placeholder J-type word (immediate zero)
+ */
+fn j_type_base_word_riscv(rd: u32, opcode: u32) -> u32 {
+    ((rd & (0x1F to u32)) << (7 to u32)) | (opcode & (0x7F to u32))
+}
+
+/**
+ * honest_fp_riscv — the named honest-stop the F/D float family raises: an
+ * FPR-class load/store (`fld`/`fsd`) reaches the integer encoder before the
+ * F/D extension lands. Mirrors x86's `honest_fp_x86` / arm64's `honest_fp`;
+ * deferred to 0.3.1 (§9, `B2-fp`).
+ *
+ * @return error  the `B2-fp` named honest-stop
+ */
+fn honest_fp_riscv() -> error {
+    error { message = "B2-fp: float-op / FPR encoding deferred to 0.3.1 (F/D encodings in the B2 crumb-plan appendix)" }
+}
+
+/**
+ * honest_bigimm_riscv — the named honest-stop for an immediate outside the
+ * signed 12-bit window (`[-2048, 2047]`) an I-type/S-type field can hold: a
+ * 32-bit literal needs the `lui`+`addi` pair (isel's job) and a 64-bit literal
+ * the multi-instruction `li`. A REAL RISC-V limit (imm12 is only 12 bits),
+ * deferred to 0.3.1 (§9, `B2-bigimm`).
+ *
+ * @return error  the `B2-bigimm` named honest-stop
+ */
+fn honest_bigimm_riscv() -> error {
+    error { message = "B2-bigimm: immediate out of the signed imm12 window ([-2048, 2047]) — needs lui+addi / multi-instruction li (0.3.1)" }
+}
+
+/**
+ * honest_alu_form_riscv — the internal-invariant guard for an `MAluOpRiscv`
+ * reaching the wrong register/immediate encoder: an immediate-only op
+ * (`Addi`/`Xori`/`Sltiu`) in a register-register `MAluRRiscv`, or a
+ * register-register op in a register-immediate `MAluIRiscv`. isel never selects
+ * these crossed forms, so this is a malformed-IR guard, not a language limit.
+ *
+ * @return error  the `B2-aluform` internal-invariant stop
+ */
+fn honest_alu_form_riscv() -> error {
+    error { message = "B2-aluform: an ALU op reached the wrong register/immediate encoder (internal invariant — isel never selects it)" }
+}
+
+/**
+ * honest_call_riscv — the B2-6 slice-boundary stop for `MCallRiscv`: the
+ * `auipc ra, 0 ; jalr ra, 0(ra)` call macro (with its single `Call`
+ * relocation) is a TWO-word expansion assembled by the B2-6 emit pass
+ * (`encode_module_riscv`), not this single-word core. B2-5 ships the verified
+ * word primitives (`reloc_word_riscv`, the `auipc`/`jalr` encoders,
+ * `riscv_reloc_type`) the B2-6 pass composes.
+ *
+ * @return error  the B2-6 call-pair deferral stop
+ */
+fn honest_call_riscv() -> error {
+    error { message = "B2-6: the auipc+jalr call macro (Call reloc) is a two-word expansion assembled by the B2-6 emit pass (encode_module_riscv)" }
+}
+
+/**
+ * honest_lla_riscv — the B2-6/B2-7 slice-boundary stop for `MLlaRiscv`: the
+ * `auipc rd, %pcrel_hi ; addi rd, rd, %pcrel_lo` address pair, its paired
+ * `PcRelHi20`/`PcRelLo12` relocations, and the synthesized module-local
+ * `.Lpcrel_hiN` label are assembled by the B2-6/B2-7 module encoder (§7.2) —
+ * the label's per-module counter is only known there, so this single-word core
+ * defers it.
+ *
+ * @return error  the B2-6 address-pair deferral stop
+ */
+fn honest_lla_riscv() -> error {
+    error { message = "B2-6: the auipc+addi PC-relative address pair (PcRelHi20/PcRelLo12 + the synthesized .Lpcrel label) is assembled by the B2-6/B2-7 module encoder" }
+}
+
+/**
+ * honest_frame_riscv — the B2-6 slice-boundary stop for `MFrameAddrRiscv`: the
+ * `addi rd, sp, off` frame-slot address needs the `FrameLayoutRiscv` side-table
+ * (the slot's `sp` displacement) the B2-6 frame pass computes (§6.5), so this
+ * single-word core defers it.
+ *
+ * @return error  the B2-6 frame-slot deferral stop
+ */
+fn honest_frame_riscv() -> error {
+    error { message = "B2-6: the frame-slot addi rd,sp,off is resolved via FrameLayoutRiscv in the B2-6 frame pass" }
+}
+
+/**
+ * imm12_field_riscv — the signed 12-bit two's-complement field for an I-type/
+ * S-type immediate, range-checked to `[-2048, 2047]` (else `B2-bigimm`). Routes
+ * through the neutral `twos_field`, so a NEGATIVE immediate never hits a
+ * panicking `to u32` cast — the two's-complement bits are computed by masking.
+ *
+ * @param i32 imm  the signed source immediate
+ * @return u32 | error  the 12-bit field, or the `B2-bigimm` honest-stop
+ */
+fn imm12_field_riscv(imm: i32) -> u32 | error {
+    let v = imm to i64
+    let lo = (0 to i64) - (2048 to i64)
+    if v < lo { return honest_bigimm_riscv() }
+    if v > (2047 to i64) { return honest_bigimm_riscv() }
+    twos_field(v, 12 to u32)
+}
+
+/**
+ * AluRDescRiscv — the R-type encoding descriptor of one register-register ALU
+ * mnemonic: its `funct7`/`funct3` fields plus whether an RV64 32-bit `OP-32`
+ * `*w` form exists (`addw`/`subw`/…/`remuw` do; the bitwise `and`/`or`/`xor` do
+ * NOT — the base op already handles all widths).
+ *
+ * @since #387 B2-5
+ */
+type AluRDescRiscv = struct {
+    /**
+     * funct7 — the 7-bit function-7 field (0x00 base, 0x20 sub/sra, 0x01 M-ext).
+     */
+    funct7: u32
+    /**
+     * funct3 — the 3-bit function-3 field selecting the mnemonic within the op
+     * class.
+     */
+    funct3: u32
+    /**
+     * has_w — true iff an RV64 `OP-32` `*w` form exists for this op (false for
+     * `and`/`or`/`xor`, which have no width variant).
+     */
+    has_w: bool
+}
+
+/**
+ * alu_r_desc_riscv — the `AluRDescRiscv` for a register-register `MAluOpRiscv`. The
+ * immediate-only ops (`Addi`/`Xori`/`Sltiu`) never select an `MAluRRiscv`, so
+ * they raise the `B2-aluform` internal-invariant guard.
+ *
+ * @param MAluOpRiscv op  the register-register ALU op
+ * @return AluRDescRiscv | error  its encoding descriptor, or `B2-aluform`
+ */
+fn alu_r_desc_riscv(op: MAluOpRiscv) -> AluRDescRiscv | error {
+    match op {
+        Add => AluRDescRiscv { funct7 = 0x00 to u32; funct3 = 0 to u32; has_w = true }
+        Sub => AluRDescRiscv { funct7 = 0x20 to u32; funct3 = 0 to u32; has_w = true }
+        Sll => AluRDescRiscv { funct7 = 0x00 to u32; funct3 = 1 to u32; has_w = true }
+        Srl => AluRDescRiscv { funct7 = 0x00 to u32; funct3 = 5 to u32; has_w = true }
+        Sra => AluRDescRiscv { funct7 = 0x20 to u32; funct3 = 5 to u32; has_w = true }
+        Xor => AluRDescRiscv { funct7 = 0x00 to u32; funct3 = 4 to u32; has_w = false }
+        Or => AluRDescRiscv { funct7 = 0x00 to u32; funct3 = 6 to u32; has_w = false }
+        And => AluRDescRiscv { funct7 = 0x00 to u32; funct3 = 7 to u32; has_w = false }
+        Mul => AluRDescRiscv { funct7 = 0x01 to u32; funct3 = 0 to u32; has_w = true }
+        Div => AluRDescRiscv { funct7 = 0x01 to u32; funct3 = 4 to u32; has_w = true }
+        Divu => AluRDescRiscv { funct7 = 0x01 to u32; funct3 = 5 to u32; has_w = true }
+        Rem => AluRDescRiscv { funct7 = 0x01 to u32; funct3 = 6 to u32; has_w = true }
+        Remu => AluRDescRiscv { funct7 = 0x01 to u32; funct3 = 7 to u32; has_w = true }
+        _ => honest_alu_form_riscv()
+    }
+}
+
+/**
+ * alu_r_opcode_riscv — the R-type opcode for a register-register ALU op given
+ * its width: the base `OP` (0x33) for the 64-bit form, the `OP-32` (0x3B) `*w`
+ * form for the 32-bit result when the op HAS a `*w` variant, and the base
+ * `OP` (0x33) unconditionally for `and`/`or`/`xor` (no 32-bit form exists — the
+ * base op already yields the correct 32-bit result, so isel's `wide=false` on
+ * these lowers to the base `and`/`or`/`xor`).
+ *
+ * @param bool has_w  whether the op has an RV64 `*w` form
+ * @param bool wide  true for the 64-bit base form, false for the 32-bit form
+ * @return u32  the 7-bit opcode (0x33 or 0x3B)
+ */
+fn alu_r_opcode_riscv(has_w: bool, wide: bool) -> u32 {
+    if wide { return 0x33 to u32 }
+    if has_w { return 0x3B to u32 }
+    0x33 to u32
+}
+
+/**
+ * alu_i_funct3_riscv — the I-type `funct3` for a register-immediate ALU op:
+ * `addi`(0), `xori`(4), `sltiu`(3). Any register-register op reaching the
+ * immediate encoder raises the `B2-aluform` internal-invariant guard.
+ *
+ * @param MAluOpRiscv op  the register-immediate ALU op
+ * @return u32 | error  the 3-bit funct3, or `B2-aluform`
+ */
+fn alu_i_funct3_riscv(op: MAluOpRiscv) -> u32 | error {
+    match op {
+        Addi => 0 to u32
+        Xori => 4 to u32
+        Sltiu => 3 to u32
+        _ => honest_alu_form_riscv()
+    }
+}
+
+/**
+ * load_funct3_riscv — the I-type `funct3` for a load width + sign: the
+ * sign-extending narrow forms `lb`(0)/`lh`(1)/`lw`(2), the zero-extending forms
+ * `lbu`(4)/`lhu`(5)/`lwu`(6), and the full-width `ld`(3, sign-agnostic).
+ *
+ * @param MMemSizeRiscv size  the access width
+ * @param bool sign  true for the sign-extending narrow form
+ * @return u32  the 3-bit load funct3
+ */
+fn load_funct3_riscv(size: MMemSizeRiscv, sign: bool) -> u32 {
+    match size {
+        D => 3 to u32
+        B => if sign { 0 to u32 } else { 4 to u32 }
+        H => if sign { 1 to u32 } else { 5 to u32 }
+        W => if sign { 2 to u32 } else { 6 to u32 }
+    }
+}
+
+/**
+ * store_funct3_riscv — the S-type `funct3` for a store width: `sb`(0)/`sh`(1)/
+ * `sw`(2)/`sd`(3). Stores never sign-extend, so no sign parameter.
+ *
+ * @param MMemSizeRiscv size  the access width
+ * @return u32  the 3-bit store funct3
+ */
+fn store_funct3_riscv(size: MMemSizeRiscv) -> u32 {
+    match size { B => 0 to u32; H => 1 to u32; W => 2 to u32; D => 3 to u32 }
+}
+
+/**
+ * branch_funct3_riscv — the B-type `funct3` for an `MCond`: the six direct
+ * conditions `beq`(0)/`bne`(1)/`blt`(4)/`bge`(5)/`bltu`(6)/`bgeu`(7), plus the
+ * four order-only conditions (`GT`/`LE`/`HI`/`LS`) which reuse the
+ * `blt`/`bge`/`bltu`/`bgeu` funct3 with the two operands swapped
+ * (`branch_swaps_riscv`).
+ *
+ * @param MCond c  the condition code
+ * @return u32  the 3-bit branch funct3
+ */
+fn branch_funct3_riscv(c: MCond) -> u32 {
+    match c {
+        EQ => 0 to u32
+        NE => 1 to u32
+        LT => 4 to u32
+        GE => 5 to u32
+        LO => 6 to u32
+        HS => 7 to u32
+        GT => 4 to u32
+        LE => 5 to u32
+        HI => 6 to u32
+        LS => 7 to u32
+    }
+}
+
+/**
+ * encode_li_riscv — a small-immediate load `dst = imm` as `addi rd, x0, imm12`
+ * (rs1 = x0, the hardwired zero). The immediate is range-checked (else
+ * `B2-bigimm`).
+ *
+ * @param MLiRiscv i  the instruction (destination physical)
+ * @return EncWordRiscv | error  the encoded word, or `B2-bigimm`
+ */
+fn encode_li_riscv(i: MLiRiscv) -> EncWordRiscv | error {
+    let imm = match imm12_field_riscv(i.imm) { u32 as v => v; error as e => return e }
+    plain_word_riscv(i_type_word_riscv(imm, 0 to u32, 0 to u32, enc_reg_riscv(i.dst), 0x13 to u32))
+}
+
+/**
+ * encode_lui_riscv — an upper-immediate `lui rd, imm20` (U-type, LUI = 0x37).
+ *
+ * @param MLuiRiscv i  the instruction (destination physical)
+ * @return EncWordRiscv  the encoded word
+ */
+fn encode_lui_riscv(i: MLuiRiscv) -> EncWordRiscv {
+    plain_word_riscv(u_type_word_riscv(i.imm, enc_reg_riscv(i.dst), 0x37 to u32))
+}
+
+/**
+ * encode_auipc_riscv — a PC-relative upper-immediate `auipc rd, imm20` (U-type,
+ * AUIPC = 0x17), the bare un-relocated form.
+ *
+ * @param MAuipcRiscv i  the instruction (destination physical)
+ * @return EncWordRiscv  the encoded word
+ */
+fn encode_auipc_riscv(i: MAuipcRiscv) -> EncWordRiscv {
+    plain_word_riscv(u_type_word_riscv(i.imm, enc_reg_riscv(i.dst), 0x17 to u32))
+}
+
+/**
+ * encode_alu_r_riscv — a three-address register-register ALU op
+ * (`add`/`sub`/…/`remu`, base `OP` or `OP-32` `*w` per `wide`). An FPR operand
+ * reaches the `B2-fp` stop; an immediate-only op reaches `B2-aluform`.
+ *
+ * @param MAluRRiscv i  the instruction (operands physical)
+ * @return EncWordRiscv | error  the encoded word, or a named stop
+ */
+fn encode_alu_r_riscv(i: MAluRRiscv) -> EncWordRiscv | error {
+    if i.dst.reg_class == MRegClass::FPR { return honest_fp_riscv() }
+    let desc = match alu_r_desc_riscv(i.op) { AluRDescRiscv as d => d; error as e => return e }
+    let opcode = alu_r_opcode_riscv(desc.has_w, i.wide)
+    plain_word_riscv(r_type_word_riscv(desc.funct7, enc_reg_riscv(i.b), enc_reg_riscv(i.a), desc.funct3, enc_reg_riscv(i.dst), opcode))
+}
+
+/**
+ * encode_alu_i_riscv — a register-immediate12 ALU op (`addi`/`xori`/`sltiu`,
+ * OP-IMM = 0x13). The immediate is range-checked (`B2-bigimm`); a
+ * register-register op reaches `B2-aluform`.
+ *
+ * @param MAluIRiscv i  the instruction (operands physical)
+ * @return EncWordRiscv | error  the encoded word, or a named stop
+ */
+fn encode_alu_i_riscv(i: MAluIRiscv) -> EncWordRiscv | error {
+    let funct3 = match alu_i_funct3_riscv(i.op) { u32 as f => f; error as e => return e }
+    let imm = match imm12_field_riscv(i.imm) { u32 as v => v; error as e => return e }
+    plain_word_riscv(i_type_word_riscv(imm, enc_reg_riscv(i.a), funct3, enc_reg_riscv(i.dst), 0x13 to u32))
+}
+
+/**
+ * encode_slt_riscv — a set-less-than `slt`/`sltu rd, a, b` (R-type, funct7 = 0,
+ * funct3 = 2 signed / 3 unsigned, OP = 0x33).
+ *
+ * @param MSltRiscv i  the instruction (operands physical)
+ * @return EncWordRiscv  the encoded word
+ */
+fn encode_slt_riscv(i: MSltRiscv) -> EncWordRiscv {
+    let funct3 = if i.is_unsigned { 3 to u32 } else { 2 to u32 }
+    plain_word_riscv(r_type_word_riscv(0 to u32, enc_reg_riscv(i.b), enc_reg_riscv(i.a), funct3, enc_reg_riscv(i.dst), 0x33 to u32))
+}
+
+/**
+ * encode_load_riscv — a load `ld`/`lw`/`lh`/`lb`/`lbu`/`lhu`/`lwu rd, off(rs1)`
+ * (I-type, LOAD = 0x03). An FPR destination reaches `B2-fp`; an offset outside
+ * the imm12 window reaches `B2-bigimm`.
+ *
+ * @param MLoadRiscv i  the instruction (operands physical)
+ * @return EncWordRiscv | error  the encoded word, or a named stop
+ */
+fn encode_load_riscv(i: MLoadRiscv) -> EncWordRiscv | error {
+    if i.dst.reg_class == MRegClass::FPR { return honest_fp_riscv() }
+    let imm = match imm12_field_riscv(i.mem.offset) { u32 as v => v; error as e => return e }
+    plain_word_riscv(i_type_word_riscv(imm, enc_reg_riscv(i.mem.base), load_funct3_riscv(i.size, i.sign), enc_reg_riscv(i.dst), 0x03 to u32))
+}
+
+/**
+ * encode_store_riscv — a store `sd`/`sw`/`sh`/`sb rs2, off(rs1)` (S-type,
+ * STORE = 0x23). An FPR source reaches `B2-fp`; an offset outside the imm12
+ * window reaches `B2-bigimm`.
+ *
+ * @param MStoreRiscv i  the instruction (operands physical)
+ * @return EncWordRiscv | error  the encoded word, or a named stop
+ */
+fn encode_store_riscv(i: MStoreRiscv) -> EncWordRiscv | error {
+    if i.src.reg_class == MRegClass::FPR { return honest_fp_riscv() }
+    let imm = match imm12_field_riscv(i.mem.offset) { u32 as v => v; error as e => return e }
+    plain_word_riscv(s_type_word_riscv(imm, enc_reg_riscv(i.src), enc_reg_riscv(i.mem.base), store_funct3_riscv(i.size), 0x23 to u32))
+}
+
+/**
+ * encode_branch_riscv — a fused compare-and-branch `beq`/`bne`/`blt`/`bge`/
+ * `bltu`/`bgeu rs1, rs2, block` (B-type, BRANCH = 0x63), a placeholder word
+ * (scrambled displacement zero) flagged for the B2-6 word-patch pass (form 0).
+ * The four order-only conditions swap operands (`branch_swaps_riscv`).
+ *
+ * @param MBranchRiscv i  the instruction (operands physical)
+ * @return EncWordRiscv  the branch-flagged placeholder word
+ */
+fn encode_branch_riscv(i: MBranchRiscv) -> EncWordRiscv {
+    let swap = branch_swaps_riscv(i.cond)
+    let rs1 = if swap { enc_reg_riscv(i.b) } else { enc_reg_riscv(i.a) }
+    let rs2 = if swap { enc_reg_riscv(i.a) } else { enc_reg_riscv(i.b) }
+    let base = b_type_base_word_riscv(rs2, rs1, branch_funct3_riscv(i.cond), 0x63 to u32)
+    branch_word_riscv(base, i.target, 0 to u32)
+}
+
+/**
+ * encode_jal_riscv — an unconditional branch `jal x0, block` (J-type, JAL =
+ * 0x6F, link discarded to x0), a placeholder word (scrambled displacement zero)
+ * flagged for the B2-6 word-patch pass (form 1).
+ *
+ * @param MJalRiscv i  the instruction
+ * @return EncWordRiscv  the branch-flagged placeholder word
+ */
+fn encode_jal_riscv(i: MJalRiscv) -> EncWordRiscv {
+    branch_word_riscv(j_type_base_word_riscv(0 to u32, 0x6F to u32), i.target, 1 to u32)
+}
+
+/**
+ * encode_jalr_riscv — an indirect jump-and-link `jalr rd, off(rs1)` (I-type,
+ * JALR = 0x67, funct3 = 0). The offset is range-checked (`B2-bigimm`).
+ *
+ * @param MJalrRiscv i  the instruction (operands physical)
+ * @return EncWordRiscv | error  the encoded word, or `B2-bigimm`
+ */
+fn encode_jalr_riscv(i: MJalrRiscv) -> EncWordRiscv | error {
+    let imm = match imm12_field_riscv(i.offset) { u32 as v => v; error as e => return e }
+    plain_word_riscv(i_type_word_riscv(imm, enc_reg_riscv(i.base), 0 to u32, enc_reg_riscv(i.dst), 0x67 to u32))
+}
+
+/**
+ * encode_call_ind_riscv — an indirect call `jalr ra, 0(rs1)` through a register
+ * holding the callee's address (I-type, JALR = 0x67, rd = ra = x1, offset 0).
+ *
+ * @param MCallIndRiscv i  the instruction (target physical)
+ * @return EncWordRiscv  the encoded word
+ */
+fn encode_call_ind_riscv(i: MCallIndRiscv) -> EncWordRiscv {
+    plain_word_riscv(i_type_word_riscv(0 to u32, enc_reg_riscv(i.target), 0 to u32, 1 to u32, 0x67 to u32))
+}
+
+/**
+ * encode_ret_riscv — a return terminator `ret` = `jalr x0, 0(ra)`, the bare
+ * `0x00008067` word. The epilogue that precedes it is prepended by the B2-6
+ * frame pass; this core emits only the RET itself (the arm64 `encode_ret`
+ * precedent).
+ *
+ * @return EncWordRiscv  the RET word
+ */
+fn encode_ret_riscv() -> EncWordRiscv {
+    plain_word_riscv(0x00008067 to u32)
+}
+
+/**
+ * btype_scramble — scatter a 13-bit two's-complement branch displacement into
+ * the RISC-V B-type immediate fields (the notorious bit-permutation):
+ * imm[12] → word[31], imm[10:5] → word[30:25], imm[4:1] → word[11:8],
+ * imm[11] → word[7]. `v13` is `twos_field(disp_bytes, 13)` — the sign-extended
+ * byte displacement (imm[0] is always 0 for a 2-byte-aligned target). All
+ * arithmetic stays in `u32`; the negative case is already folded into `v13`'s
+ * two's-complement bits, so no panicking negative cast occurs. Assembler-
+ * verified against `clang`/`objdump` for positive, negative, and boundary
+ * offsets. The B2-6 word-patch pass ORs the result into
+ * `b_type_base_word_riscv`.
+ *
+ * @param u32 v13  the 13-bit two's-complement displacement (`twos_field(., 13)`)
+ * @return u32  the OR-mask contributing the scrambled immediate to the B-type word
+ */
+fn btype_scramble(v13: u32) -> u32 {
+    let b12 = (v13 >> (12 to u32)) & (0x1 to u32)
+    let b11 = (v13 >> (11 to u32)) & (0x1 to u32)
+    let b10_5 = (v13 >> (5 to u32)) & (0x3F to u32)
+    let b4_1 = (v13 >> (1 to u32)) & (0xF to u32)
+    (b12 << (31 to u32)) | (b10_5 << (25 to u32)) | (b4_1 << (8 to u32)) | (b11 << (7 to u32))
+}
+
+/**
+ * jtype_scramble — scatter a 21-bit two's-complement jump displacement into the
+ * RISC-V J-type immediate fields (`jal`): imm[20] → word[31],
+ * imm[10:1] → word[30:21], imm[11] → word[20], imm[19:12] → word[19:12]. `v21`
+ * is `twos_field(disp_bytes, 21)` (imm[0] always 0). Same `u32`-only,
+ * no-negative-cast discipline as `btype_scramble`; assembler-verified for
+ * forward, backward, and boundary offsets. The B2-6 word-patch pass ORs the
+ * result into `j_type_base_word_riscv`.
+ *
+ * @param u32 v21  the 21-bit two's-complement displacement (`twos_field(., 21)`)
+ * @return u32  the OR-mask contributing the scrambled immediate to the J-type word
+ */
+fn jtype_scramble(v21: u32) -> u32 {
+    let j20 = (v21 >> (20 to u32)) & (0x1 to u32)
+    let j10_1 = (v21 >> (1 to u32)) & (0x3FF to u32)
+    let j11 = (v21 >> (11 to u32)) & (0x1 to u32)
+    let j19_12 = (v21 >> (12 to u32)) & (0xFF to u32)
+    (j20 << (31 to u32)) | (j10_1 << (21 to u32)) | (j11 << (20 to u32)) | (j19_12 << (12 to u32))
+}
+
+/**
+ * encode_inst_word_riscv — encode one fully-physical `MInstRiscv` to its
+ * `EncWordRiscv`, a TOTAL per-case match over the 16-case variant mirroring
+ * `print_minst_riscv`'s dispatch. The position-independent integer/control/
+ * memory subset (`MLiRiscv`/`MLuiRiscv`/`MAuipcRiscv`/`MAluRRiscv`/`MAluIRiscv`/
+ * `MSltRiscv`/`MLoadRiscv`/`MStoreRiscv`/`MJalrRiscv`/`MCallIndRiscv`/
+ * `MRetRiscv`) encodes fully; the branches (`MBranchRiscv`/`MJalRiscv`) return
+ * placeholder words flagged for the B2-6 word-patch pass; the float family and
+ * big immediates return their NAMED honest-stops (`B2-fp`/`B2-bigimm`). The
+ * multi-word/frame cases (`MCallRiscv` auipc+jalr pair, `MLlaRiscv` auipc+addi
+ * pair + label, `MFrameAddrRiscv` frame-slot address) are assembled by the B2-6
+ * emit pass (§6.3/§6.5/§7.2) and return their B2-6 slice-boundary stops here.
+ *
+ * @param MInstRiscv inst  the instruction to encode (all operands physical)
+ * @return EncWordRiscv | error  the encoding, or a named stop
+ */
+pub fn encode_inst_word_riscv(inst: MInstRiscv) -> EncWordRiscv | error {
+    match inst {
+        MLiRiscv as x => encode_li_riscv(x)
+        MLuiRiscv as x => encode_lui_riscv(x)
+        MAuipcRiscv as x => encode_auipc_riscv(x)
+        MAluRRiscv as x => encode_alu_r_riscv(x)
+        MAluIRiscv as x => encode_alu_i_riscv(x)
+        MSltRiscv as x => encode_slt_riscv(x)
+        MLoadRiscv as x => encode_load_riscv(x)
+        MStoreRiscv as x => encode_store_riscv(x)
+        MBranchRiscv as x => encode_branch_riscv(x)
+        MJalRiscv as x => encode_jal_riscv(x)
+        MJalrRiscv as x => encode_jalr_riscv(x)
+        MCallIndRiscv as x => encode_call_ind_riscv(x)
+        MRetRiscv => encode_ret_riscv()
+        MCallRiscv => honest_call_riscv()
+        MLlaRiscv => honest_lla_riscv()
+        MFrameAddrRiscv => honest_frame_riscv()
+    }
+}
+
+/**
+ * FrameLayoutRiscv — the resolved stack frame of one RISC-V function: its total
+ * 16-aligned byte size, the ordered callee-saved registers to save/restore
+ * (re-derived by scanning the physical function, not carried by `MFuncRiscv`),
+ * and the `sp`-relative byte offset of every `MFuncRiscv.frame` slot. A pure
+ * side-table the encoder reads; the block stream is never rewritten (so the B2
+ * interp oracle, which models frame slots directly and has no `sp`, stays valid
+ * on the pre-encode `MFuncRiscv`). A `size` of 0 marks a frameless function (no
+ * prologue/epilogue) — the `exit(n)` keystone `main`. The RISC-V analog of
+ * arm64's `FrameLayout` (identical STRUCTURE, RISC-V register conventions).
+ *
+ * @since #387 B2-6
+ */
+pub type FrameLayoutRiscv = struct {
+    /**
+     * size — the total frame size in bytes, rounded up to 16 (RISC-V ABI `sp`
+     * 16-alignment); 0 for a frameless function.
+     */
+    size: u32
+    /**
+     * saved_gpr — the callee-saved GPR ids to `sd`/`ld` (s0/ra handled
+     * separately in the top 16 bytes), ascending for a deterministic prologue
+     * (M.2). Never contains s0 (id 8, the frame pointer) or ra (id 1, saved as
+     * the special top-of-frame register), which are excluded by the scan.
+     */
+    saved_gpr: []u32
+    /**
+     * saved_fpr — the callee-saved FPR ids to save/restore, ascending. A
+     * non-empty list needs `fsd`/`fld` (the F/D extension), which is the
+     * `B2-fp` honest-stop until 0.3.1 — the prologue/epilogue raise it.
+     */
+    saved_fpr: []u32
+    /**
+     * slot_offsets — the `sp`-relative byte offset of each `MFuncRiscv.frame`
+     * entry, in frame order; `MFrameAddrRiscv{slot}` resolves to
+     * `addi dst, sp, #slot_offsets[slot]`. Each entry honors its `LAlloca`
+     * alignment, so mixed-size/mixed-align frames (structs/arrays/spills) map
+     * correctly.
+     */
+    slot_offsets: []u32
+}
+
+/**
+ * scan_inst_saved_riscv — fold one RISC-V instruction's def and use registers
+ * into the callee-saved partition, via `inst_regs_riscv` (the same def/use
+ * decomposition regalloc reads — the emitted instructions ARE the source of
+ * truth) and the neutral `consider_reg` (reused from the arm64 encoder, which
+ * ignores caller-saved / non-allocatable registers).
+ *
+ * @param AbiDescriptor abi  the register file (callee-saved partition)
+ * @param Saved acc0  the partition so far
+ * @param MInstRiscv inst  the physical instruction to scan
+ * @return Saved  the partition with `inst`'s registers folded in
+ */
+fn scan_inst_saved_riscv(abi: AbiDescriptor, acc0: Saved, inst: MInstRiscv) -> Saved {
+    let ir = inst_regs_riscv(inst)
+    mut acc = acc0
+    if ir.has_def {
+        acc = consider_reg(abi, acc, ir.def_reg)
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ir.uses.len { break }
+        acc = consider_reg(abi, acc, ir.uses[i])
+        i++
+    }
+    acc
+}
+
+/**
+ * scan_block_saved_riscv — fold one block's instruction stream into the
+ * callee-saved partition.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param Saved acc0  the partition so far
+ * @param MBlockRiscv b  the block to scan
+ * @return Saved  the partition with `b`'s registers folded in
+ */
+fn scan_block_saved_riscv(abi: AbiDescriptor, acc0: Saved, b: MBlockRiscv) -> Saved {
+    mut acc = acc0
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        acc = scan_inst_saved_riscv(abi, acc, b.insts[i])
+        i++
+    }
+    acc
+}
+
+/**
+ * collect_callee_saved_riscv — re-derive the callee-saved save-set of a physical
+ * RISC-V function by scanning every block's def/use registers (§6.5).
+ * `MFuncRiscv` does not carry `used_callee_saved` (regalloc drops it), so B2
+ * recomputes it — the A4/B1 precedent. s0 (id 8, the frame pointer) and ra
+ * (id 1, caller-saved but saved specially) are never allocatable/callee-saved,
+ * so the scan excludes them; the prologue saves them unconditionally in a
+ * framed function.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MFuncRiscv f  the fully-physical function
+ * @return Saved  the ascending, duplicate-free callee-saved GPR/FPR ids used
+ */
+fn collect_callee_saved_riscv(abi: AbiDescriptor, f: MFuncRiscv) -> Saved {
+    mut acc = Saved { gpr = teko::list::empty(); fpr = teko::list::empty() }
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        acc = scan_block_saved_riscv(abi, acc, f.blocks[i])
+        i++
+    }
+    acc
+}
+
+/**
+ * inst_is_ret_riscv — whether a RISC-V instruction is the return terminator
+ * (`MRetRiscv`, which the epilogue precedes).
+ *
+ * @param MInstRiscv inst  the instruction
+ * @return bool  true iff `inst` is `MRetRiscv`
+ */
+fn inst_is_ret_riscv(inst: MInstRiscv) -> bool {
+    match inst {
+        MRetRiscv => true
+        _ => false
+    }
+}
+
+/**
+ * block_any_call_riscv — whether any instruction in `b` is a call (clobbers ra),
+ * read from the `inst_regs_riscv` decomposition so the definition stays
+ * single-sourced.
+ *
+ * @param MBlockRiscv b  the block to scan
+ * @return bool  true iff `b` contains a call
+ */
+fn block_any_call_riscv(b: MBlockRiscv) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        if inst_regs_riscv(b.insts[i]).is_call { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * block_any_ret_riscv — whether any instruction in `b` is the return terminator.
+ *
+ * @param MBlockRiscv b  the block to scan
+ * @return bool  true iff `b` contains an `MRetRiscv`
+ */
+fn block_any_ret_riscv(b: MBlockRiscv) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= b.insts.len { break }
+        if inst_is_ret_riscv(b.insts[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * func_any_call_riscv — whether the function makes any call.
+ *
+ * @param MFuncRiscv f  the function to scan
+ * @return bool  true iff any block contains a call
+ */
+fn func_any_call_riscv(f: MFuncRiscv) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if block_any_call_riscv(f.blocks[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * func_any_ret_riscv — whether the function has a reachable return terminator.
+ *
+ * @param MFuncRiscv f  the function to scan
+ * @return bool  true iff any block contains an `MRetRiscv`
+ */
+fn func_any_ret_riscv(f: MFuncRiscv) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if block_any_ret_riscv(f.blocks[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * needs_ra_save_riscv — whether ra (x1) must be preserved across the function
+ * body: true only when the function BOTH makes a call (any `jal`/`jalr`
+ * overwrites ra) AND can return (so the clobbered ra would be read by the final
+ * `ret`). ra is caller-saved in the RISC-V ABI, so — like arm64's LR — the
+ * register allocator never colours a value into it; the frame's SPECIAL ra-save
+ * (the top-of-frame `sd ra` the framed prologue always emits) is what preserves
+ * it across calls (§6.5, the B2-1 finding). A leaf function, or the `exit(n)`-
+ * terminated virtual-`main` (a call but no `MRetRiscv`), needs no ra save — the
+ * frameless first-light case.
+ *
+ * @param MFuncRiscv f  the fully-physical function
+ * @return bool  true iff the framed prologue's ra-save is load-bearing
+ */
+fn needs_ra_save_riscv(f: MFuncRiscv) -> bool {
+    func_any_call_riscv(f) && func_any_ret_riscv(f)
+}
+
+/**
+ * compute_frame_layout_riscv — build a RISC-V function's `FrameLayoutRiscv`:
+ * re-derive the callee-saved save-set (§6.5), lay out the frame slots honoring
+ * each `LAlloca`'s alignment, and size the whole frame to a 16-byte multiple
+ * (0 when frameless). Reuses the neutral `frame_total_size` (each callee-saved
+ * register is an 8-byte `sd`/`ld` and the top-of-frame s0/ra pair is 16 bytes —
+ * identical arithmetic to arm64's FP/LR frame) and `compute_slot_offsets`. A
+ * pure side-table pass — it does NOT mutate the block stream, so the B2 interp
+ * oracle stays valid on the pre-encode `MFuncRiscv`. Offsets that outrun the
+ * `addi` imm12 window are caught at emission time (`B2-bigframe`), not here.
+ *
+ * @param AbiDescriptor abi  the register file (callee-saved partition)
+ * @param MFuncRiscv f  the fully-physical function
+ * @return FrameLayoutRiscv  the resolved frame side-table
+ */
+pub fn compute_frame_layout_riscv(abi: AbiDescriptor, f: MFuncRiscv) -> FrameLayoutRiscv {
+    let saved = collect_callee_saved_riscv(abi, f)
+    let slots = compute_slot_offsets(f.frame)
+    let size = frame_total_size(slots.slots_size, saved, needs_ra_save_riscv(f))
+    FrameLayoutRiscv {
+        size = size
+        saved_gpr = saved.gpr
+        saved_fpr = saved.fpr
+        slot_offsets = slots.offsets
+    }
+}
+
+/**
+ * slot_offset_riscv — the `sp`-relative byte offset of frame slot `slot` under
+ * `layout`, the concrete displacement `MFrameAddrRiscv{slot}` resolves to (an
+ * `addi` from `sp`). A direct lookup into the alignment-honoring per-slot map.
+ *
+ * @param FrameLayoutRiscv layout  the resolved frame
+ * @param u32 slot  the frame-slot index (a valid `MFuncRiscv.frame` index)
+ * @return u32  the `sp`-relative byte offset
+ */
+pub fn slot_offset_riscv(layout: FrameLayoutRiscv, slot: u32) -> u32 {
+    layout.slot_offsets[slot to u64]
+}
+
+/**
+ * honest_bigframe_riscv — the named honest-stop for a frame larger than the
+ * `addi` imm12 window: the prologue's `addi s0, sp, N` (and the slot-address
+ * `addi rd, sp, off`) place `N`/`off` directly in a signed 12-bit field, so a
+ * frame past 2047 bytes needs a materialized offset (a temp + add sequence). A
+ * REAL RISC-V limit (imm12 is only 12 bits), unlike the near-N/A x86
+ * `B1-bigframe` (imm32 covers 2 GB); deferred to a fast-follow (§9,
+ * `B2-bigframe`).
+ *
+ * @return error  the `B2-bigframe` named honest-stop
+ */
+fn honest_bigframe_riscv() -> error {
+    error { message = "B2-bigframe: frame larger than the addi imm12 window (2047 bytes) — needs a materialized offset (0.3.1)" }
+}
+
+/**
+ * addi_word_riscv — assemble an `addi rd, rs1, imm12` word (I-type, OP-IMM =
+ * 0x13, funct3 = 0), the frame's stack-claim / stack-release / frame-pointer /
+ * slot-address instruction. `imm12` is the already-two's-complement 12-bit
+ * field (the caller passes a positive offset directly or a `twos_field` of a
+ * negative claim).
+ *
+ * @param u32 rd  the destination register id
+ * @param u32 rs1  the source register id
+ * @param u32 imm12  the 12-bit immediate field (already two's-complement)
+ * @return u32  the encoded `addi` word
+ */
+fn addi_word_riscv(rd: u32, rs1: u32, imm12: u32) -> u32 {
+    i_type_word_riscv(imm12, rs1, 0 to u32, rd, 0x13 to u32)
+}
+
+/**
+ * sd_sp_word_riscv — assemble an `sd rs2, off(sp)` word (S-type, STORE = 0x23,
+ * funct3 = 3, rs1 = sp = x2), one callee-saved / ra / s0 save. `off` is a
+ * positive frame offset (< 2048 by the `frame_fits_riscv` guard), so it drops
+ * into the split S-type field directly.
+ *
+ * @param u32 rs2  the register id to store
+ * @param u32 off  the positive `sp`-relative byte offset
+ * @return u32  the encoded `sd` word
+ */
+fn sd_sp_word_riscv(rs2: u32, off: u32) -> u32 {
+    s_type_word_riscv(off, rs2, 2 to u32, 3 to u32, 0x23 to u32)
+}
+
+/**
+ * ld_sp_word_riscv — assemble an `ld rd, off(sp)` word (I-type, LOAD = 0x03,
+ * funct3 = 3, rs1 = sp = x2), the epilogue restore counterpart of
+ * `sd_sp_word_riscv`.
+ *
+ * @param u32 rd  the register id to load
+ * @param u32 off  the positive `sp`-relative byte offset
+ * @return u32  the encoded `ld` word
+ */
+fn ld_sp_word_riscv(rd: u32, off: u32) -> u32 {
+    i_type_word_riscv(off, 2 to u32, 3 to u32, rd, 0x03 to u32)
+}
+
+/**
+ * frame_fits_riscv — whether the frame's largest positive immediate (the size
+ * `N` in `addi s0, sp, N`) fits the signed 12-bit `addi` field. When it does,
+ * every smaller slot/save offset (all `< N`) and the negated stack claim (`-N`,
+ * within `[-2048, 0)`) fit too, so this single check guards the whole prologue,
+ * epilogue, and every frame-slot address against `B2-bigframe`.
+ *
+ * @param FrameLayoutRiscv layout  the resolved frame (size > 0)
+ * @return bool  true iff the frame's offsets are all `addi`/`sd`/`ld`-encodable
+ */
+fn frame_fits_riscv(layout: FrameLayoutRiscv) -> bool {
+    layout.size <= (2047 to u32)
+}
+
+/**
+ * callee_base_offset_riscv — the `sp` byte offset of the first callee-saved GPR,
+ * placed directly below the s0/ra pair (which sits in the top 16 bytes), so any
+ * 16-alignment padding falls between the slot region and this save area
+ * (mirrors arm64's `callee_base_offset`). Only GPRs are counted — a non-empty
+ * FPR save-set raises `B2-fp` before this is reached.
+ *
+ * @param FrameLayoutRiscv layout  the resolved frame (size > 0, no saved FPRs)
+ * @return u32  the `sp` offset of the first callee-saved GPR
+ */
+fn callee_base_offset_riscv(layout: FrameLayoutRiscv) -> u32 {
+    let n = (layout.saved_gpr.len to u32)
+    (layout.size - (16 to u32)) - (n * (8 to u32))
+}
+
+/**
+ * emit_frame_gpr_saves_riscv — append the save (or restore) words for the
+ * callee-saved GPR list, one `sd`/`ld` per id at consecutive 8-byte offsets
+ * starting at `base` (RISC-V has no store-pair, so each register is a single
+ * memory op — simpler than arm64's STP/LDP packing).
+ *
+ * @param []u32 words0  the word buffer to extend
+ * @param []u32 ids  the ascending callee-saved GPR ids
+ * @param u32 base  the `sp` byte offset of the first id
+ * @param bool is_store  true for saves (prologue), false for restores (epilogue)
+ * @return []u32  `words0` followed by the class's save/restore words
+ */
+fn emit_frame_gpr_saves_riscv(words0: []u32, ids: []u32, base: u32, is_store: bool) -> []u32 {
+    mut words = words0
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        let off = base + ((i to u32) * (8 to u32))
+        let w = if is_store { sd_sp_word_riscv(ids[i], off) } else { ld_sp_word_riscv(ids[i], off) }
+        words = teko::list::push(words, w)
+        i++
+    }
+    words
+}
+
+/**
+ * emit_prologue_riscv — the function's entry sequence, or an empty list for a
+ * frameless function: `addi sp, sp, -N` ; `sd ra, (N-8)(sp)` ;
+ * `sd s0, (N-16)(sp)` ; `addi s0, sp, N` (set the frame pointer) ; then one
+ * `sd` per callee-saved GPR. ra and s0 are saved unconditionally in a framed
+ * function (the special top-of-frame save, §6.5) — they are excluded from the
+ * scanned save-set. A non-empty FPR save-set raises `B2-fp` (`fsd`); a frame
+ * past the imm12 window raises `B2-bigframe`.
+ *
+ * @param FrameLayoutRiscv layout  the resolved frame
+ * @return []u32 | error  the prologue words, or a named honest-stop
+ */
+pub fn emit_prologue_riscv(layout: FrameLayoutRiscv) -> []u32 | error {
+    if layout.size == (0 to u32) {
+        let none: []u32 = teko::list::empty()
+        return none
+    }
+    if layout.saved_fpr.len > (0 to u64) { return honest_fp_riscv() }
+    if !frame_fits_riscv(layout) { return honest_bigframe_riscv() }
+    let claim = twos_field((0 to i64) - (layout.size to i64), 12 to u32)
+    mut words: []u32 = teko::list::empty()
+    words = teko::list::push(words, addi_word_riscv(2 to u32, 2 to u32, claim))
+    words = teko::list::push(words, sd_sp_word_riscv(1 to u32, layout.size - (8 to u32)))
+    words = teko::list::push(words, sd_sp_word_riscv(8 to u32, layout.size - (16 to u32)))
+    words = teko::list::push(words, addi_word_riscv(8 to u32, 2 to u32, layout.size))
+    emit_frame_gpr_saves_riscv(words, layout.saved_gpr, callee_base_offset_riscv(layout), true)
+}
+
+/**
+ * emit_epilogue_riscv — the function's frame-teardown sequence (LIFO), or an
+ * empty list for a frameless function: restore each callee-saved GPR (`ld`) ;
+ * `ld s0, (N-16)(sp)` ; `ld ra, (N-8)(sp)` ; `addi sp, sp, N`. The `ret`
+ * (`jalr x0, 0(ra)`) itself is the `MRetRiscv` encoding (`encode_ret_riscv`),
+ * which the function-encode layer emits immediately after these words. A
+ * non-empty FPR save-set raises `B2-fp`; a frame past the imm12 window raises
+ * `B2-bigframe`.
+ *
+ * @param FrameLayoutRiscv layout  the resolved frame
+ * @return []u32 | error  the teardown words (ret excluded), or a named honest-stop
+ */
+pub fn emit_epilogue_riscv(layout: FrameLayoutRiscv) -> []u32 | error {
+    if layout.size == (0 to u32) {
+        let none: []u32 = teko::list::empty()
+        return none
+    }
+    if layout.saved_fpr.len > (0 to u64) { return honest_fp_riscv() }
+    if !frame_fits_riscv(layout) { return honest_bigframe_riscv() }
+    mut words: []u32 = emit_frame_gpr_saves_riscv(teko::list::empty(), layout.saved_gpr, callee_base_offset_riscv(layout), false)
+    words = teko::list::push(words, ld_sp_word_riscv(8 to u32, layout.size - (16 to u32)))
+    words = teko::list::push(words, ld_sp_word_riscv(1 to u32, layout.size - (8 to u32)))
+    words = teko::list::push(words, addi_word_riscv(2 to u32, 2 to u32, layout.size))
+    words
+}
+
+/**
+ * encode_frame_addr_riscv — resolve `MFrameAddrRiscv{dst, slot}` to
+ * `addi dst, sp, #slot_offset_riscv(layout, slot)`, the B2-6 replacement for
+ * the B2-5 `honest_frame_riscv` slice-boundary stop. A slot offset beyond the
+ * signed 12-bit `addi` field raises `B2-bigframe`.
+ *
+ * @param FrameLayoutRiscv layout  the function's resolved frame
+ * @param MFrameAddrRiscv i  the frame-slot address instruction (operand physical)
+ * @return EncWordRiscv | error  the encoded `addi`, or the `B2-bigframe` stop
+ */
+fn encode_frame_addr_riscv(layout: FrameLayoutRiscv, i: MFrameAddrRiscv) -> EncWordRiscv | error {
+    let off = slot_offset_riscv(layout, i.slot)
+    if off > (2047 to u32) { return honest_bigframe_riscv() }
+    plain_word_riscv(addi_word_riscv(enc_reg_riscv(i.dst), 2 to u32, off))
+}
+
+/**
+ * RelocRiscv — one symbol relocation the reused ELF writer (B2-7) turns into an
+ * `Elf64_Rela` entry: the byte offset within the module `.text` image
+ * (module-rebased at assembly) where the fixup applies, the target symbol's
+ * already-final name, which `RelocKindRiscv` field it patches, and the explicit
+ * `r_addend`. The encoder emits `addend = 0` for every case (`Call`/`PcRelHi20`/
+ * `PcRelLo12`); the writer folds a rodata target's `.rodata` byte offset onto
+ * the `PcRelHi20` base at object-assembly (the ELF section-symbol idiom). The
+ * RISC-V analog of arm64's `Reloc` / x86's `RelocX86` (carrying the addend
+ * `.rela` needs), RISC-V reloc kinds.
+ *
+ * @since #387 B2-6
+ */
+pub type RelocRiscv = struct {
+    /**
+     * offset — the byte offset of the relocated instruction word, relative to
+     * this function's `.text` base (word index times 4), module-rebased at
+     * module assembly.
+     */
+    offset: u32
+    /**
+     * sym — the target symbol's final name (a `Call`/`PcRelHi20` names the
+     * runtime/callee/rodata target; a `PcRelLo12` names the synthesized
+     * `.Lpcrel_hiN` local label, §7.2).
+     */
+    sym: str
+    /**
+     * kind — which RISC-V relocation this word owes (`Call`/`PcRelHi20`/
+     * `PcRelLo12`).
+     */
+    kind: RelocKindRiscv
+    /**
+     * addend — the `r_addend`; 0 at the encoder for every RISC-V case, with a
+     * rodata `PcRelHi20` target's `.rodata` offset folded on by the writer.
+     */
+    addend: i64
+}
+
+/**
+ * EncodedFuncRiscv — one RISC-V function lowered to machine words: its
+ * already-final symbol, its `.text` words in layout order (prologue ++ every
+ * block's encoded instructions ++ the epilogue+`ret` expansion, with
+ * intra-function branch displacements scrambled in), its function-relative
+ * symbol relocations, and the synthesized `.Lpcrel_hiN` local labels the
+ * `MLlaRiscv` address pairs define (their offsets function-relative, rebased at
+ * module assembly). The function's byte size is `words.len * 4`. The RISC-V
+ * analog of arm64's `EncodedFunc`, extended with the per-pcrel-pair labels the
+ * RISC-V PAIR relocation requires (§7.2).
+ *
+ * @since #387 B2-6
+ */
+pub type EncodedFuncRiscv = struct {
+    /**
+     * symbol — the function's already-final (mangled) symbol.
+     */
+    symbol: str
+    /**
+     * words — the encoded instruction stream, in layout order (u32 words,
+     * flattened little-endian by the module writer).
+     */
+    words: []u32
+    /**
+     * relocs — the symbol relocations, offsets relative to this function's
+     * `.text` base.
+     */
+    relocs: []RelocRiscv
+    /**
+     * labels — the synthesized `.Lpcrel_hiN` local `.text` labels (one per
+     * `MLlaRiscv`), each defined at its `auipc`'s function-relative byte offset
+     * (§7.2); rebased into the module symbol table at assembly.
+     */
+    labels: []Symbol
+}
+
+/**
+ * BlockOffsetRiscv — one machine block's starting word index in the function's
+ * emitted RISC-V stream, keyed by the block's id. The branch-patch pass looks a
+ * displacement target up here; ids are non-topological, so a keyed lookup (not a
+ * positional index) is required (the arm64 `BlockOffset` precedent).
+ *
+ * @since #387 B2-6
+ */
+type BlockOffsetRiscv = struct {
+    /**
+     * id — the machine block's id (an `MBranchRiscv`/`MJalRiscv` target).
+     */
+    id: u32
+    /**
+     * word — the block's starting word index in the emitted stream.
+     */
+    word: u32
+}
+
+/**
+ * honest_farbranch_riscv — the named honest-stop for a branch displacement that
+ * does not fit its instruction field (B-type = ±4 KiB, J-type = ±1 MiB). Real
+ * functions are tiny, so this is an internal-invariant guard — reached only by a
+ * pathological (constructed) input, NEVER silently mis-encoded. The scramble
+ * functions do not range-check, so this guard is B2-6's responsibility (§6.3,
+ * `B2-farbranch`, mirrors `A4-farbranch`).
+ *
+ * @return error  the `B2-farbranch` named honest-stop
+ */
+fn honest_farbranch_riscv() -> error {
+    error { message = "B2-farbranch: branch displacement out of the B-type (+-4KiB) / J-type (+-1MiB) field range (internal invariant — real functions are tiny)" }
+}
+
+/**
+ * honest_badblock_riscv — the named honest-stop for a branch whose target block
+ * id is absent from the function's block set. An internal-invariant guard:
+ * isel/regalloc only emit branches to real blocks, so a miss means a malformed
+ * `MFuncRiscv`, caught here rather than encoded to a wrong displacement.
+ *
+ * @return error  the `B2-badblock` named honest-stop
+ */
+fn honest_badblock_riscv() -> error {
+    error { message = "B2-badblock: branch target block id not found in the function (internal invariant)" }
+}
+
+/**
+ * btype_fits_riscv — whether a byte displacement fits the signed 13-bit B-type
+ * branch field (`[-4096, 4094]`, even — imm[0] is implicit 0). ±4 KiB.
+ *
+ * @param i64 disp_bytes  the target-minus-here displacement in bytes
+ * @return bool  true iff it is encodable in the B-type immediate
+ */
+fn btype_fits_riscv(disp_bytes: i64) -> bool {
+    (disp_bytes >= ((0 to i64) - (4096 to i64))) && (disp_bytes <= (4094 to i64))
+}
+
+/**
+ * jtype_fits_riscv — whether a byte displacement fits the signed 21-bit J-type
+ * jump field (`[-1048576, 1048574]`, even — imm[0] is implicit 0). ±1 MiB.
+ *
+ * @param i64 disp_bytes  the target-minus-here displacement in bytes
+ * @return bool  true iff it is encodable in the J-type immediate
+ */
+fn jtype_fits_riscv(disp_bytes: i64) -> bool {
+    (disp_bytes >= ((0 to i64) - (1048576 to i64))) && (disp_bytes <= (1048574 to i64))
+}
+
+/**
+ * branch_scramble_field_riscv — the OR-mask a resolved intra-function branch
+ * contributes to its placeholder word: for form 0 (B-type) the `btype_scramble`
+ * of the 13-bit two's-complement byte displacement; for form 1 (J-type) the
+ * `jtype_scramble` of the 21-bit displacement. RANGE-CHECKS first — the
+ * scramble functions do NOT (§6.3) — raising `B2-farbranch` on overflow so a
+ * far branch is never silently encoded to a wrong target.
+ *
+ * @param i64 disp_bytes  the target-minus-here displacement in bytes (even)
+ * @param u32 form  the displacement field selector (0 = B-type, 1 = J-type)
+ * @return u32 | error  the scrambled OR-mask, or the `B2-farbranch` honest-stop
+ */
+fn branch_scramble_field_riscv(disp_bytes: i64, form: u32) -> u32 | error {
+    if form == (0 to u32) {
+        if !btype_fits_riscv(disp_bytes) { return honest_farbranch_riscv() }
+        return btype_scramble(twos_field(disp_bytes, 13 to u32))
+    }
+    if !jtype_fits_riscv(disp_bytes) { return honest_farbranch_riscv() }
+    jtype_scramble(twos_field(disp_bytes, 21 to u32))
+}
+
+/**
+ * lookup_block_offset_riscv — the starting word index of the block whose id is
+ * `id`, or the `B2-badblock` honest-stop when no such block was emitted. A linear
+ * scan of the (tiny) per-function offset table, since block ids are
+ * non-topological.
+ *
+ * @param []BlockOffsetRiscv offsets  the recorded per-block starting word indices
+ * @param u32 id  the target block id
+ * @return u32 | error  the block's starting word index, or `B2-badblock`
+ */
+fn lookup_block_offset_riscv(offsets: []BlockOffsetRiscv, id: u32) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= offsets.len { break }
+        let bo = offsets[i]
+        if bo.id == id { return bo.word }
+        i++
+    }
+    honest_badblock_riscv()
+}
+
+/**
+ * resolve_word_riscv — the final u32 of one emitted `EncWordRiscv`: a
+ * position-independent or symbol-reference word is returned as-is (the reloc
+ * placeholder stays zero; the linker patches it), a branch word gets its
+ * displacement scrambled in from the recorded block offsets
+ * (`disp_bytes = (target_word - here) * 4`, RISC-V branch offsets are BYTE
+ * displacements from the branch itself). A missing target or an out-of-field
+ * displacement raises a named honest-stop.
+ *
+ * @param EncWordRiscv ew  the emitted word
+ * @param u32 here  this word's own index in the function's stream
+ * @param []BlockOffsetRiscv offsets  the recorded per-block starting word indices
+ * @return u32 | error  the resolved word, or a named honest-stop
+ */
+fn resolve_word_riscv(ew: EncWordRiscv, here: u32, offsets: []BlockOffsetRiscv) -> u32 | error {
+    if !ew.has_branch { return ew.word }
+    let target_word = match lookup_block_offset_riscv(offsets, ew.target) { u32 as v => v; error as e => return e }
+    let disp_bytes = ((target_word to i64) - (here to i64)) * (4 to i64)
+    let field = match branch_scramble_field_riscv(disp_bytes, ew.branch_form) { u32 as v => v; error as e => return e }
+    ew.word | field
+}
+
+/**
+ * FuncEmitRiscv — the running emit-pass accumulator of one RISC-V function: the
+ * `EncWordRiscv` stream so far, the synthesized `.Lpcrel_hiN` labels so far
+ * (function-relative offsets), and the MODULE-wide label counter threaded
+ * through (so `.Lpcrel_hi0`, `.Lpcrel_hi1`, … stay file-unique — the LO12 reloc
+ * resolves its pair by label NAME, §7.2).
+ *
+ * @since #387 B2-6
+ */
+type FuncEmitRiscv = struct {
+    /**
+     * words — the emitted `EncWordRiscv` stream (prologue ++ blocks so far).
+     */
+    words: []EncWordRiscv
+    /**
+     * labels — the synthesized pcrel labels so far (function-relative offsets).
+     */
+    labels: []Symbol
+    /**
+     * label_ctr — the next module-wide `.Lpcrel_hiN` counter value.
+     */
+    label_ctr: u32
+}
+
+/**
+ * push_word_riscv — append one `EncWordRiscv` to the emit accumulator (labels
+ * and counter unchanged).
+ *
+ * @param FuncEmitRiscv acc  the emit accumulator
+ * @param EncWordRiscv ew  the word to append
+ * @return FuncEmitRiscv  the accumulator with `ew` appended
+ */
+fn push_word_riscv(acc: FuncEmitRiscv, ew: EncWordRiscv) -> FuncEmitRiscv {
+    FuncEmitRiscv { words = teko::list::push(acc.words, ew); labels = acc.labels; label_ctr = acc.label_ctr }
+}
+
+/**
+ * push_plain_words_riscv — append each raw instruction word of `ws` to the emit
+ * accumulator as a position-independent `plain_word_riscv` (the prologue/
+ * epilogue expansion carries no branch or reloc fixup).
+ *
+ * @param FuncEmitRiscv acc  the emit accumulator
+ * @param []u32 ws  the raw instruction words to append
+ * @return FuncEmitRiscv  the accumulator with each word wrapped and appended
+ */
+fn push_plain_words_riscv(acc: FuncEmitRiscv, ws: []u32) -> FuncEmitRiscv {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= ws.len { break }
+        out = push_word_riscv(out, plain_word_riscv(ws[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * emit_call_riscv — expand `MCallRiscv` to the two-word call macro
+ * `auipc ra, 0 ; jalr ra, 0(ra)` plus its ONE `Call` (`R_RISCV_CALL_PLT`)
+ * relocation on the `auipc` (the linker fills BOTH instructions from the single
+ * reloc, targeting the callee directly — NO synthesized label, unlike the data
+ * address pair, §7.2). ra = x1.
+ *
+ * @param FuncEmitRiscv acc  the emit accumulator
+ * @param MCallRiscv i  the direct-call instruction
+ * @return FuncEmitRiscv  the accumulator with the auipc+jalr pair appended
+ */
+fn emit_call_riscv(acc: FuncEmitRiscv, i: MCallRiscv) -> FuncEmitRiscv {
+    let auipc = reloc_word_riscv(u_type_word_riscv(0 to u32, 1 to u32, 0x17 to u32), i.sym, RelocKindRiscv::Call)
+    let jalr = plain_word_riscv(i_type_word_riscv(0 to u32, 1 to u32, 0 to u32, 1 to u32, 0x67 to u32))
+    push_word_riscv(push_word_riscv(acc, auipc), jalr)
+}
+
+/**
+ * emit_lla_riscv — expand `MLlaRiscv` to the two-word address pair
+ * `auipc rd, %pcrel_hi(sym) ; addi rd, rd, %pcrel_lo(label)` plus the PAIRED
+ * relocations and the synthesized file-local `.Lpcrel_hiN` label (§7.2): the
+ * HI20 (`R_RISCV_PCREL_HI20`) on the `auipc` targets the REAL symbol; the LO12
+ * (`R_RISCV_PCREL_LO12_I`) on the `addi` targets the synthesized label, which is
+ * defined at the `auipc`'s address (the linker re-finds the HI20 there to
+ * recompute the pairing). The label counter is module-wide (file-unique names).
+ *
+ * @param FuncEmitRiscv acc  the emit accumulator
+ * @param MLlaRiscv i  the PC-relative address-materialization instruction
+ * @return FuncEmitRiscv  the accumulator with the pair, the two relocs' words, and the label appended
+ */
+fn emit_lla_riscv(acc: FuncEmitRiscv, i: MLlaRiscv) -> FuncEmitRiscv {
+    let rd = enc_reg_riscv(i.dst)
+    let label_name = teko::str::concat(".Lpcrel_hi", teko::u64_to_str(acc.label_ctr to u64))
+    let hi_off = (acc.words.len to u32) * (4 to u32)
+    let auipc = reloc_word_riscv(u_type_word_riscv(0 to u32, rd, 0x17 to u32), i.sym, RelocKindRiscv::PcRelHi20)
+    let addi = reloc_word_riscv(i_type_word_riscv(0 to u32, rd, 0 to u32, rd, 0x13 to u32), label_name, RelocKindRiscv::PcRelLo12)
+    let label = Symbol { name = label_name; defined = true; sect = 1 to u8; offset = hi_off; local = true }
+    let words2 = teko::list::push(teko::list::push(acc.words, auipc), addi)
+    let labels2 = teko::list::push(acc.labels, label)
+    FuncEmitRiscv { words = words2; labels = labels2; label_ctr = acc.label_ctr + (1 to u32) }
+}
+
+/**
+ * encode_ret_seq_riscv — expand `MRetRiscv` to the frame epilogue words followed
+ * by the `ret` word (the B2-5 core left `MRet` bare, §6.5). A frame past the
+ * imm12 window propagates the `B2-bigframe` stop from the epilogue.
+ *
+ * @param FrameLayoutRiscv layout  the enclosing function's resolved frame
+ * @param FuncEmitRiscv acc  the emit accumulator
+ * @return FuncEmitRiscv | error  the accumulator with epilogue+ret appended, or a stop
+ */
+fn encode_ret_seq_riscv(layout: FrameLayoutRiscv, acc: FuncEmitRiscv) -> FuncEmitRiscv | error {
+    let epi = match emit_epilogue_riscv(layout) { []u32 as w => w; error as e => return e }
+    push_word_riscv(push_plain_words_riscv(acc, epi), encode_ret_riscv())
+}
+
+/**
+ * encode_frame_addr_push_riscv — resolve one `MFrameAddrRiscv` through `layout`
+ * to `addi rd, sp, #off` and append it (propagating `B2-bigframe`).
+ *
+ * @param FrameLayoutRiscv layout  the enclosing function's resolved frame
+ * @param FuncEmitRiscv acc  the emit accumulator
+ * @param MFrameAddrRiscv x  the frame-slot address instruction
+ * @return FuncEmitRiscv | error  the accumulator with the `addi` appended, or a stop
+ */
+fn encode_frame_addr_push_riscv(layout: FrameLayoutRiscv, acc: FuncEmitRiscv, x: MFrameAddrRiscv) -> FuncEmitRiscv | error {
+    let ew = match encode_frame_addr_riscv(layout, x) { EncWordRiscv as v => v; error as e => return e }
+    push_word_riscv(acc, ew)
+}
+
+/**
+ * encode_single_push_riscv — encode one single-word instruction via the B2-5
+ * `encode_inst_word_riscv` and append it (propagating any named honest-stop).
+ *
+ * @param FuncEmitRiscv acc  the emit accumulator
+ * @param MInstRiscv inst  the single-word instruction
+ * @return FuncEmitRiscv | error  the accumulator with the word appended, or a stop
+ */
+fn encode_single_push_riscv(acc: FuncEmitRiscv, inst: MInstRiscv) -> FuncEmitRiscv | error {
+    let ew = match encode_inst_word_riscv(inst) { EncWordRiscv as v => v; error as e => return e }
+    push_word_riscv(acc, ew)
+}
+
+/**
+ * encode_one_riscv — append one instruction's `EncWordRiscv`(s) to the emit
+ * accumulator: an `MRetRiscv` expands to the epilogue + `ret`; an
+ * `MFrameAddrRiscv` resolves through `layout` to `addi rd, sp, #off`; an
+ * `MCallRiscv` / `MLlaRiscv` expands to its two-word macro/pair (+ relocs, + the
+ * pcrel label); every other instruction encodes to its single `EncWordRiscv`.
+ * Each arm delegates to a helper (no block-valued match arm), mirroring arm64's
+ * `encode_one` shape. Any named honest-stop propagates out.
+ *
+ * @param FrameLayoutRiscv layout  the enclosing function's resolved frame
+ * @param FuncEmitRiscv acc  the emit accumulator
+ * @param MInstRiscv inst  the instruction to encode
+ * @return FuncEmitRiscv | error  the extended accumulator, or a named honest-stop
+ */
+fn encode_one_riscv(layout: FrameLayoutRiscv, acc: FuncEmitRiscv, inst: MInstRiscv) -> FuncEmitRiscv | error {
+    match inst {
+        MRetRiscv => encode_ret_seq_riscv(layout, acc)
+        MFrameAddrRiscv as x => encode_frame_addr_push_riscv(layout, acc, x)
+        MCallRiscv as x => emit_call_riscv(acc, x)
+        MLlaRiscv as x => emit_lla_riscv(acc, x)
+        _ => encode_single_push_riscv(acc, inst)
+    }
+}
+
+/**
+ * encode_block_words_riscv — append every instruction of one block to the emit
+ * accumulator, in order, expanding the multi-word cases as `encode_one_riscv`
+ * does. Any named honest-stop propagates out.
+ *
+ * @param FrameLayoutRiscv layout  the enclosing function's resolved frame
+ * @param FuncEmitRiscv acc0  the emit accumulator
+ * @param MBlockRiscv blk  the block whose instructions to encode
+ * @return FuncEmitRiscv | error  the extended accumulator, or a named honest-stop
+ */
+fn encode_block_words_riscv(layout: FrameLayoutRiscv, acc0: FuncEmitRiscv, blk: MBlockRiscv) -> FuncEmitRiscv | error {
+    mut acc = acc0
+    mut i: u64 = 0
+    loop {
+        if i >= blk.insts.len { break }
+        let next = match encode_one_riscv(layout, acc, blk.insts[i]) { FuncEmitRiscv as a => a; error as e => return e }
+        acc = next
+        i++
+    }
+    acc
+}
+
+/**
+ * finalize_func_riscv — the patch pass: resolve every emitted `EncWordRiscv` to
+ * its final word (scrambling branch displacements in from the recorded block
+ * offsets) and collect one `RelocRiscv` per symbol-reference word (its offset
+ * the word index times 4, `addend = 0`). Produces the `EncodedFuncRiscv`
+ * hand-off (with the synthesized pcrel labels) to the B2-7 ELF writer. RISC-V is
+ * fixed-width, so word indices are stable through the resolve pass — no branch
+ * relaxation, like arm64.
+ *
+ * @param str symbol  the function's already-final symbol
+ * @param FuncEmitRiscv acc  the emit accumulator (words, labels, counter)
+ * @param []BlockOffsetRiscv offsets  the recorded per-block starting word indices
+ * @return EncodedFuncRiscv | error  the encoded function, or a named honest-stop
+ */
+fn finalize_func_riscv(symbol: str, acc: FuncEmitRiscv, offsets: []BlockOffsetRiscv) -> EncodedFuncRiscv | error {
+    mut out_words: []u32 = teko::list::empty()
+    mut relocs: []RelocRiscv = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= acc.words.len { break }
+        let ew = acc.words[i]
+        let w = match resolve_word_riscv(ew, i to u32, offsets) { u32 as v => v; error as e => return e }
+        out_words = teko::list::push(out_words, w)
+        if ew.has_reloc {
+            relocs = teko::list::push(relocs, RelocRiscv { offset = (i to u32) * (4 to u32); sym = ew.reloc_sym; kind = ew.reloc_kind; addend = 0 to i64 })
+        }
+        i++
+    }
+    EncodedFuncRiscv { symbol = symbol; words = out_words; relocs = relocs; labels = acc.labels }
+}
+
+/**
+ * FuncEncOutRiscv — the result of encoding one function: the `EncodedFuncRiscv`
+ * plus the advanced module-wide `.Lpcrel_hiN` counter the NEXT function
+ * continues from (so labels stay file-unique across the whole module).
+ *
+ * @since #387 B2-6
+ */
+type FuncEncOutRiscv = struct {
+    /**
+     * func — the encoded function (words, relocs, pcrel labels).
+     */
+    func: EncodedFuncRiscv
+    /**
+     * next_label — the module-wide pcrel-label counter after this function.
+     */
+    next_label: u32
+}
+
+/**
+ * encode_func_riscv — lower one fully-coloured `MFuncRiscv` to an
+ * `EncodedFuncRiscv`: compute its frame layout (§6.5), prepend the prologue,
+ * encode every block in `f.blocks` order recording each block's starting word
+ * index in a `BlockOffsetRiscv` map, expand `MFrameAddrRiscv`/`MRetRiscv`/
+ * `MCallRiscv`/`MLlaRiscv`, then scramble intra-function branch displacements
+ * in from the recorded offsets and collect the symbol relocations. Threads the
+ * module-wide pcrel-label counter through so `.Lpcrel_hiN` names stay
+ * file-unique. Any instruction's named honest-stop propagates out unchanged.
+ *
+ * @param AbiDescriptor abi  the register file (for the callee-saved save-set)
+ * @param MFuncRiscv f  the fully-physical function
+ * @param u32 label0  the module-wide pcrel-label counter to start from
+ * @return FuncEncOutRiscv | error  the encoded function + next counter, or a stop
+ */
+pub fn encode_func_riscv(abi: AbiDescriptor, f: MFuncRiscv, label0: u32) -> FuncEncOutRiscv | error {
+    let layout = compute_frame_layout_riscv(abi, f)
+    let pro_words = match emit_prologue_riscv(layout) { []u32 as w => w; error as e => return e }
+    mut acc = push_plain_words_riscv(FuncEmitRiscv { words = teko::list::empty(); labels = teko::list::empty(); label_ctr = label0 }, pro_words)
+    mut offsets: []BlockOffsetRiscv = teko::list::empty()
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let blk = f.blocks[bi]
+        offsets = teko::list::push(offsets, BlockOffsetRiscv { id = blk.id; word = acc.words.len to u32 })
+        let next = match encode_block_words_riscv(layout, acc, blk) { FuncEmitRiscv as a => a; error as e => return e }
+        acc = next
+        bi++
+    }
+    let ef = match finalize_func_riscv(f.symbol, acc, offsets) { EncodedFuncRiscv as v => v; error as e => return e }
+    FuncEncOutRiscv { func = ef; next_label = acc.label_ctr }
+}
+
+/**
+ * EncodedModuleRiscv — the whole RISC-V program lowered to section images + a
+ * flat symbol table: the concatenated `.text` bytes, the `.rodata` bytes, the
+ * local-then-global-then-undefined symbol list (rodata locals + pcrel-label
+ * locals, then function globals, then undefined externs), and the module-rebased
+ * relocations. The B2-7 ELF writer (a neutral generalization of B1's
+ * `emit_elf`) turns this into an `ET_REL` object; no RISC-V knowledge remains
+ * past this boundary. The RISC-V analog of arm64's `EncodedModule` /
+ * `EncodedModuleX86`.
+ *
+ * @since #387 B2-6
+ */
+pub type EncodedModuleRiscv = struct {
+    /**
+     * text — the `.text` section image (all functions concatenated, each
+     * function's words flattened little-endian).
+     */
+    text: []byte
+    /**
+     * rodata — the `.rodata` section image (interned rodata bytes concatenated).
+     */
+    rodata: []byte
+    /**
+     * symbols — the symbol table, local-then-global-then-undefined: rodata
+     * locals + the `.Lpcrel_hiN` `.text` label locals, then one global per
+     * function, then one undefined entry per externally-referenced symbol.
+     */
+    symbols: []Symbol
+    /**
+     * relocs — every relocation, `.text`-section-relative (module-rebased), in
+     * emission order.
+     */
+    relocs: []RelocRiscv
+}
+
+/**
+ * honest_globals_riscv — the named honest-stop for a module carrying top-level
+ * data globals: the `.data`/`.bss` sections + their `R_RISCV_64` data relocs are
+ * not emitted by B2 (the N2 subset lowers no `LGlobal`, so this is unreached by
+ * the keystone corpus), closed when lowering starts emitting globals (§9,
+ * `B2-globals`).
+ *
+ * @return error  the `B2-globals` named honest-stop
+ */
+fn honest_globals_riscv() -> error {
+    error { message = "B2-globals: .data/.bss + R_RISCV_64 data relocs deferred (the N2 subset lowers no LGlobal)" }
+}
+
+/**
+ * rebase_relocs_riscv — append each function-relative `RelocRiscv` of `relocs`
+ * to `acc` with its byte offset shifted by `base` (the function's `.text`
+ * base), so the module reloc offset points at the instruction word in the
+ * concatenated image (the addend and kind ride through unchanged).
+ *
+ * @param []RelocRiscv acc  the running module reloc list
+ * @param []RelocRiscv relocs  one function's function-relative relocations
+ * @param u32 base  the function's `.text` base byte offset
+ * @return []RelocRiscv  `acc` followed by the rebased relocations
+ */
+fn rebase_relocs_riscv(acc: []RelocRiscv, relocs: []RelocRiscv, base: u32) -> []RelocRiscv {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let r = relocs[i]
+        out = teko::list::push(out, RelocRiscv { offset = r.offset + base; sym = r.sym; kind = r.kind; addend = r.addend })
+        i++
+    }
+    out
+}
+
+/**
+ * rebase_labels_riscv — append each function-relative pcrel `.Lpcrel_hiN`
+ * `Symbol` of `labels` to `acc` with its `.text` offset shifted by `base`, so
+ * the module label sits at the `auipc`'s byte offset in the concatenated image
+ * (its name/binding/section ride through unchanged).
+ *
+ * @param []Symbol acc  the running module label list
+ * @param []Symbol labels  one function's function-relative pcrel labels
+ * @param u32 base  the function's `.text` base byte offset
+ * @return []Symbol  `acc` followed by the rebased labels
+ */
+fn rebase_labels_riscv(acc: []Symbol, labels: []Symbol, base: u32) -> []Symbol {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= labels.len { break }
+        let s = labels[i]
+        out = teko::list::push(out, Symbol { name = s.name; defined = s.defined; sect = s.sect; offset = s.offset + base; local = s.local })
+        i++
+    }
+    out
+}
+
+/**
+ * ModuleTextRiscv — the running `.text` assembly of the module: the concatenated
+ * byte image, the module-rebased relocations, the defined function symbols, the
+ * module-rebased pcrel `.text` labels, the current base (the next function's
+ * `.text` byte offset), and the threaded module-wide pcrel-label counter.
+ *
+ * @since #387 B2-6
+ */
+type ModuleTextRiscv = struct {
+    /**
+     * text — the concatenated `.text` bytes so far.
+     */
+    text: []byte
+    /**
+     * relocs — the module-rebased relocations so far.
+     */
+    relocs: []RelocRiscv
+    /**
+     * syms — one defined GLOBAL `.text` symbol per function encoded so far.
+     */
+    syms: []Symbol
+    /**
+     * labels — the module-rebased `.Lpcrel_hiN` `.text` label locals so far.
+     */
+    labels: []Symbol
+    /**
+     * base — the next function's `.text` base byte offset (the current image
+     * length).
+     */
+    base: u32
+    /**
+     * label_ctr — the next module-wide `.Lpcrel_hiN` counter value.
+     */
+    label_ctr: u32
+}
+
+/**
+ * empty_module_text_riscv — the seed `ModuleTextRiscv`: empty image, no
+ * relocations, no symbols, no labels, base 0, counter 0.
+ *
+ * @return ModuleTextRiscv  the seed accumulator
+ */
+fn empty_module_text_riscv() -> ModuleTextRiscv {
+    ModuleTextRiscv { text = teko::list::empty(); relocs = teko::list::empty(); syms = teko::list::empty(); labels = teko::list::empty(); base = 0 to u32; label_ctr = 0 to u32 }
+}
+
+/**
+ * fold_func_into_text_riscv — encode one function and fold it into the running
+ * module `.text`: record its GLOBAL defined symbol at the current base (section
+ * 1, `.text` — a function must stay globally visible so the C runtime's crt and
+ * other objects can call it), append its words as little-endian bytes, rebase
+ * its relocs and pcrel labels by the base, and advance the base by the
+ * function's byte length (`words.len * 4`) and the pcrel-label counter. Any
+ * named honest-stop from `encode_func_riscv` propagates out.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param ModuleTextRiscv acc  the running `.text` assembly
+ * @param MFuncRiscv f  the fully-physical function to encode
+ * @return ModuleTextRiscv | error  the extended assembly, or a named honest-stop
+ */
+fn fold_func_into_text_riscv(abi: AbiDescriptor, acc: ModuleTextRiscv, f: MFuncRiscv) -> ModuleTextRiscv | error {
+    let out = match encode_func_riscv(abi, f, acc.label_ctr) { FuncEncOutRiscv as x => x; error as e => return e }
+    let ef = out.func
+    let sym = Symbol { name = ef.symbol; defined = true; sect = 1 to u8; offset = acc.base; local = false }
+    let text = append_words_le(acc.text, ef.words)
+    let relocs = rebase_relocs_riscv(acc.relocs, ef.relocs, acc.base)
+    let labels = rebase_labels_riscv(acc.labels, ef.labels, acc.base)
+    let syms = teko::list::push(acc.syms, sym)
+    let base = acc.base + ((ef.words.len to u32) * (4 to u32))
+    ModuleTextRiscv { text = text; relocs = relocs; syms = syms; labels = labels; base = base; label_ctr = out.next_label }
+}
+
+/**
+ * encode_functions_riscv — fold every function of the module into one
+ * `ModuleTextRiscv` (concatenated `.text` image + rebased relocations + one
+ * defined symbol per function + rebased pcrel labels). Any function's named
+ * honest-stop propagates out.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param []MFuncRiscv funcs  the module's fully-physical functions
+ * @return ModuleTextRiscv | error  the assembled `.text`, or a named honest-stop
+ */
+fn encode_functions_riscv(abi: AbiDescriptor, funcs: []MFuncRiscv) -> ModuleTextRiscv | error {
+    mut acc = empty_module_text_riscv()
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        let next = match fold_func_into_text_riscv(abi, acc, funcs[i]) { ModuleTextRiscv as x => x; error as e => return e }
+        acc = next
+        i++
+    }
+    acc
+}
+
+/**
+ * collect_undefined_riscv — one undefined `Symbol` per relocation target not
+ * defined in `defined` and not already collected (dedup'd, in first-reference
+ * order): the `tk_*` runtime symbols and any not-yet-emitted callee. The
+ * synthesized `.Lpcrel_hiN` labels are IN `defined`, so a `PcRelLo12`'s label
+ * target is never mistaken for an undefined extern.
+ *
+ * @param []Symbol defined  the module's defined symbols (functions + rodata + pcrel labels)
+ * @param []RelocRiscv relocs  the module's relocations
+ * @return []Symbol  the undefined symbols, deduplicated
+ */
+fn collect_undefined_riscv(defined: []Symbol, relocs: []RelocRiscv) -> []Symbol {
+    mut undef: []Symbol = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let name = relocs[i].sym
+        let known = name_in_symbols(defined, name) || name_in_symbols(undef, name)
+        if !known {
+            undef = teko::list::push(undef, Symbol { name = name; defined = false; sect = 0 to u8; offset = 0 to u32; local = false })
+        }
+        i++
+    }
+    undef
+}
+
+/**
+ * encode_module_riscv — encode every `MFuncRiscv` of `m`, concatenate their
+ * `.text` words into the module image and REBASE each function's reloc/label
+ * offsets by its `.text` base, intern the rodata bytes into `.rodata`, and build
+ * the symbol table in the ELF-required LOCAL-then-GLOBAL-then-UNDEFINED order:
+ * one file-local entry per rodata entry, one file-local `.Lpcrel_hiN` entry per
+ * `MLlaRiscv` address pair (§7.2), one globally-visible entry per function, then
+ * one undefined entry per externally-referenced symbol not defined in-module. A
+ * module carrying data globals raises the `B2-globals` honest-stop (the N2
+ * subset lowers none); any function's encode honest-stop propagates out
+ * unchanged. Produces the `EncodedModuleRiscv` the B2-7 ELF writer consumes.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MModuleRiscv m  the fully-coloured module
+ * @return EncodedModuleRiscv | error  the section images + symbols + relocs, or a
+ *                                      named honest-stop
+ */
+pub fn encode_module_riscv(abi: AbiDescriptor, m: MModuleRiscv) -> EncodedModuleRiscv | error {
+    if m.globals.len > (0 to u64) { return honest_globals_riscv() }
+    let mt = match encode_functions_riscv(abi, m.funcs) { ModuleTextRiscv as x => x; error as e => return e }
+    let rod = encode_rodata(m.rodata)
+    let local_defined = concat_symbols(rod.syms, mt.labels)
+    let defined = concat_symbols(local_defined, mt.syms)
+    let undef = collect_undefined_riscv(defined, mt.relocs)
+    let symbols = concat_symbols(defined, undef)
+    EncodedModuleRiscv { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+}

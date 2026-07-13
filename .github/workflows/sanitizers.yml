@@ -29,20 +29,56 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      run: ${{ steps.filter.outputs.run }}
+      run: ${{ steps.decide.outputs.run }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
         with:
+          list-files: shell
           filters: |
             run:
               - 'src/**'
               - 'tests/**'
+              - 'examples/regressions/**'
               - 'scripts/ci_cc_wrap.sh'
               - 'scripts/ci_provision_teko.sh'
+              - 'scripts/diff_c_own.sh'
+              - 'scripts/check_coff.sh'
               - '.github/workflows/sanitizers.yml'
               - '.github/lsan-suppressions.txt'
+
+      # Docs-only guard (owner ruling 2026-07-11): the src/** glob also matches Markdown
+      # living inside the source tree (e.g. src/checker/capability_audit.md), so a pure-doc
+      # edit would otherwise run the sanitizer lanes. Skip only when EVERY matched file is
+      # *.md — any non-Markdown match forces the full run, so a real source change can never
+      # be hidden from the gate. `paths-ignore` on the trigger is NOT used: the `gate` job is
+      # a REQUIRED check and skipping the workflow would leave it never reported (PR hangs).
+      - name: Decide (skip when the change is Markdown-only)
+        id: decide
+        shell: bash
+        env:
+          MATCHED: ${{ steps.filter.outputs.run }}
+          FILES: ${{ steps.filter.outputs.run_files }}
+        run: |
+          if [ "$MATCHED" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No allowlisted path changed — nothing to gate."
+            exit 0
+          fi
+          run=false
+          for f in $FILES; do
+            case "$f" in
+              *.md) ;;                 # Markdown — does not, by itself, force a run
+              *)    run=true ;;        # any non-Markdown match forces the full gate
+            esac
+          done
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ "$run" = "true" ]; then
+            echo "Non-Markdown changes present — running the full gate."
+          else
+            echo "Markdown-only change under the allowlisted paths — skipping the heavy gate."
+          fi
 
   # ── ASan + UBSan + LSan (default computed-goto dispatch) ────────────────────
   # LSan is enabled on THIS lane only (issue #54): detect_leaks=1 with a suppressions
@@ -228,7 +264,7 @@ jobs:
           fi
           echo "TSan smoke passed: build + run race-clean, exit code 5 as expected."
 
-  # ── Windows self-host smoke ───────────────────────────────────────────────────
+  # ── Windows self-host smoke + the own==C Windows differential ────────────────
   # The ONLY per-PR lane that self-builds gen-1 on Windows (build-test only runs the
   # seed's VM gate; diff-vm-native is linux+macos; release rebuilds Windows only at
   # release time). ONE gate run on gen-1 is enough: the compiler is single-threaded and
@@ -236,8 +272,21 @@ jobs:
   # stress hunted a long-fixed intermittent hang and cost ~16 min per PR (owner ruling
   # 2026-07-04). RE-EXPAND to a real stress N× as S8 concurrency primitives land (same
   # trigger as the TSan full-suite re-expansion).
+  #
+  # issue #388 B3-4: after gen1 builds, this lane also runs the Windows x86_64
+  # C-vs-own differential (scripts/diff_c_own.sh, host-detected via the MSYS/MINGW/
+  # CYGWIN `uname` branch): each exit(n) fixture is built TWICE by gen1 — once via
+  # the default C backend, once via TEKO_BACKEND=native TEKO_TARGET=x86_64-windows
+  # (the B3 own AOT backend: x86 isel/regalloc under win64() -> emit_coff) — both
+  # linked NATIVELY on this runner (TEKO_CC=cc, the same clang the pre-existing
+  # C-backend Windows build already resolves), both RUN NATIVELY (the PE executes
+  # directly on its own target OS — no emulator, unlike the riscv64-qemu lane), and
+  # asserted own_exit == C_exit. check_coff.sh cross-checks the emitted .o with the
+  # runner's LLVM tools. own_print_exit stays a KNOWN-STOP (the shared println
+  # LIR-builtin gap, target-independent — R-4). A red differential here gates the
+  # merge (main-integrity law).
   windows-selfhost:
-    name: Windows self-host smoke (gen-1)
+    name: Windows self-host smoke (gen-1) + own==C differential
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: windows-latest
@@ -258,6 +307,12 @@ jobs:
       - name: Build gen1 (seed compiles the PR sources — compile-only smoke)
         shell: bash
         run: teko . -o bin --no-verify
+
+      - name: Windows x86_64 C-vs-own differential (own AOT backend == C backend, native PE execution)
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+        run: ./scripts/diff_c_own.sh
 
 
   # ── gate: aggregates all sanitizer + stress results ──────────────────────────
