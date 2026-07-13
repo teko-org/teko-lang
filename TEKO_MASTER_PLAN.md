@@ -21,7 +21,16 @@
 > model + `unsafe` (by type) + `adopt` (epic **#340**, base `docs/design/memory-unsafe-backend-remodel.md`);
 > **0.2** = own AOT backend + linker (VM retirement begins there); **0.3** = concurrency (`Intent<T>`,
 > async/await, threading); **0.4+** = the remaining backlog (the phases/rounds below, mapped onto
-> waves). When the backlog is empty → **`1.0.0.0` = LTS**. The `alpha` line (`0.0.1.x`) is pre-remodel.
+> waves). ~~When the backlog is empty → **`1.0.0.0` = LTS**~~ — **SUPERSEDED by the STS ruling below.** The `alpha` line (`0.0.1.x`) is pre-remodel.
+>
+> **⚖️ RULING 2026-07-13 — STS BEFORE LTS (owner):** the owner is not ready to freeze a 1.0. When the
+> pre-evolution backlog empties, the line closes as an **STS release** (short-term support), NOT
+> `1.0.0.0`. The post-STS window then runs the **EVOLUTIONS** — dynamic wasm modules #530 (Model 1:
+> grant/leadbox/hot-swap), WASI FFI #535 (Model 2), `#leadbox` #534, the cross-language contract SDKs,
+> the browser playground #509, native-lib emission + source generators + FFI-bindings #440/#441/#506 —
+> plus a **future-work survey**, and only after that does **`1.0.0.0` = LTS** cut. The #234 W15 final
+> sweep stays the LAST gate before the LTS (unchanged); each wave still closes with its own W15 sweep
+> + final bump (the 0.3.0 close reconfirmed by the owner 2026-07-13).
 > The phase/round structure below is the DETAILED work; the waves are how it ships.
 >
 > This is the single, ordered execution sequence for ALL open teko-lang work. It consolidates:
