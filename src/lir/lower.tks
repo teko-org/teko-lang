@@ -1851,15 +1851,16 @@ fn close_loop(outer: LowerCtx, body_done: LowerCtx, exit_block: u32, exit_env: L
  *                               lower
  */
 fn lower_loop(ctx: LowerCtx, l: checker::TLoopStmt) -> LowerStmtOut | error {
-    let headb = alloc_block(ctx.func)
+    let ictx = match lower_block(ctx, l.init) { LowerCtx as c => c; error as err => return err }
+    let headb = alloc_block(ictx.func)
     let exitb = alloc_block(headb.func)
-    let head_seed = promote_env(exitb.func, headb.block_id, ctx.env)
-    let exit_seed = promote_env(head_seed.func, exitb.block_id, ctx.env)
-    let entry_args = env_scalar_vregs(ctx.env)
-    let entered = append_inst(exit_seed.func, ctx.block_id, jump_inst(headb.block_id, entry_args, 0, 0))
-    let defer_base = ctx.defers.len
+    let head_seed = promote_env(exitb.func, headb.block_id, ictx.env)
+    let exit_seed = promote_env(head_seed.func, exitb.block_id, ictx.env)
+    let entry_args = env_scalar_vregs(ictx.env)
+    let entered = append_inst(exit_seed.func, ictx.block_id, jump_inst(headb.block_id, entry_args, 0, 0))
+    let defer_base = ictx.defers.len
     let target = LoopTargets { label = l.label; head = headb.block_id; exit = exitb.block_id; defer_base = defer_base; names = head_seed.names }
-    let body_seed = ctx_with_loops(ctx_with(ctx, entered, headb.block_id, head_seed.env), teko::list::push(ctx.loop_targets, target))
+    let body_seed = ctx_with_loops(ctx_with(ictx, entered, headb.block_id, head_seed.env), teko::list::push(ictx.loop_targets, target))
     let body_done = match lower_block(body_seed, l.body) { LowerCtx as c => c; error as err => return err }
     let closed = match close_loop_body(body_done, headb.block_id, head_seed.names, defer_base) { LowerCtx as c => c; error as err => return err }
     LowerStmtOut { ctx = close_loop(ctx, closed, exitb.block_id, exit_seed.env); terminated = false }
