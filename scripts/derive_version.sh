@@ -114,7 +114,7 @@ esac
 # The published tag/release carries a `v` prefix (git convention: `git tag v1.2.3`), while
 # teko.tkp's `version` and `teko --version` stay the bare number (`git --version` → 2.43.0).
 # So this derived TAG is `v<version>[-<suffix>]`; the binary's --version (built from teko.tkp
-# RAW in CMakeLists/run_cc) is `<version>[-<suffix>]` — the tag minus the `v`.
+# RAW via project.tks's build_cc_argv/run_cc) is `<version>[-<suffix>]` — the tag minus the `v`.
 TAG="v$VERSION"
 if [ -n "$SUFFIX" ]; then
   TAG="$TAG-$SUFFIX"

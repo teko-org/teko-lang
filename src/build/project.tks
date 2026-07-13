@@ -18,7 +18,7 @@ use teko::checker
 use teko::codegen
 use teko::emit
 use teko::compress
-use teko::vm
+use teko::coverage
 
 // =========================================================================
 // project_dir_of — mirror main.c::project_dir_of. Resolve a project ARGUMENT to its
@@ -1253,15 +1253,15 @@ fn build_ungated(dir: str, out_dir: str) -> i32 {
  *  first failing floor's `fail` status (BLOCKED — the build stops here). Extracted from run_gate
  *  so each floor check is one guard clause instead of three nested arms. */
 fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
-    let fcov = vm::coverage_pct(fe.prog)
+    let fcov = coverage::coverage_pct(fe.prog)
     if fcov < fe.manifest.cov_functions {
         return fail(dir, $"function coverage {fcov}% is below the {fe.manifest.cov_functions}% floor ([coverage] functions) — add tests")
     }
-    let lcov = vm::line_coverage_pct(fe.prog)
+    let lcov = coverage::line_coverage_pct(fe.prog)
     if lcov < fe.manifest.cov_lines {
         return fail(dir, $"line coverage {lcov}% is below the {fe.manifest.cov_lines}% floor ([coverage] lines) — add tests")
     }
-    let bcov = vm::branch_coverage_pct(fe.prog)
+    let bcov = coverage::branch_coverage_pct(fe.prog)
     if bcov < fe.manifest.cov_branches {
         return fail(dir, $"branch coverage {bcov}% is below the {fe.manifest.cov_branches}% floor ([coverage] branches) — add tests")
     }
@@ -1269,12 +1269,12 @@ fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
 }
 
 /** report_native_coverage — print the three engine-independent coverage metrics (function/line/branch)
- *  the native gate populated, so the native and VM lanes are directly comparable in CI logs (#265
- *  Track A parity). Uses the exported percentage wrappers (vm::*_coverage_pct). */
+ *  the native gate populated (#265 Track A). Uses the exported percentage wrappers
+ *  (coverage::*_coverage_pct). */
 fn report_native_coverage(prog: checker::TProgram) {
-    let fcov = vm::coverage_pct(prog)
-    let lcov = vm::line_coverage_pct(prog)
-    let bcov = vm::branch_coverage_pct(prog)
+    let fcov = coverage::coverage_pct(prog)
+    let lcov = coverage::line_coverage_pct(prog)
+    let bcov = coverage::branch_coverage_pct(prog)
     teko::io::println($"teko: coverage {fcov}% functions")
     teko::io::println($"teko: coverage {lcov}% lines")
     teko::io::println($"teko: coverage {bcov}% branches")
@@ -1286,8 +1286,8 @@ fn report_native_coverage(prog: checker::TProgram) {
  *  and — cov ALWAYS on for the gate, to feed the floors — merge the child's dumped `.tkcov` into
  *  this process's coverage sinks. Under TestCov each PRODUCTION fn body carries `tk_cov_line_at`/
  *  `tk_cov_branch_at` interior marks (#265 Track A), so the merged sinks populate ALL THREE metrics —
- *  the engine-independent static walk (vm::*_coverage_pct) reads them exactly as it read the VM's
- *  in-process marks. Replaces the 15.6 s VM interpret of the test bodies with a sub-second native run. */
+ *  the engine-independent static walk (coverage::*_coverage_pct) reads them exactly as it read the
+ *  VM's in-process marks. Replaces the 15.6 s VM interpret of the test bodies with a sub-second native run. */
 fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
     let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
     match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
@@ -1305,12 +1305,12 @@ fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest)
     mut argv: []str = teko::list::push(teko::list::empty(), binp)
     let trc = teko::process::run(argv)
     if trc != 0 { return trc }
-    let _ = vm::cov_merge(covfile)
+    let _ = coverage::cov_merge(covfile)
     0
 }
 
 /** The `--coverage` output path ("<out_dir>/cobertura.xml", creating `out_dir` first) when
- *  `gen_cov` is set, else "" (vm::run_tests_cov treats an empty path as "don't write"). */
+ *  `gen_cov` is set, else "" (an empty path means "don't write" to the caller). */
 fn cobertura_path_of(out_dir: str, gen_cov: bool) -> str {
     if !gen_cov { return "" }
     let _ = teko::fs::mkdir(out_dir)
@@ -1347,7 +1347,7 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
     let gate_rc = coverage_gate_result(dir, fe)
     if gate_rc != 0 { return gate_rc }
     if gen_cov {
-        let xml = vm::cov_cobertura(fe.prog)
+        let xml = coverage::cov_cobertura(fe.prog)
         let cov_path = cobertura_path_of(out_dir, gen_cov)
         match teko::io::write_file(cov_path, xml) { error => { }; null => { } }
         teko::io::println(teko::str::concat("teko: wrote coverage report ", cov_path))
@@ -1583,7 +1583,7 @@ fn test_project(dir: str, gen_cov: bool) -> i32 {
     let trc = run_native_gate(dir, "bin", fe.prog, fe.manifest)
     if trc != 0 { return trc }
     if gen_cov {
-        let xml = vm::cov_cobertura(fe.prog)
+        let xml = coverage::cov_cobertura(fe.prog)
         match teko::io::write_file("cobertura.xml", xml) { error as e => return fail(dir, e.message); null => { } }
         teko::io::println("teko: wrote coverage report cobertura.xml")
     }
