@@ -302,6 +302,15 @@ pub type WasmModule = struct {
      */
     mem_min_pages: u32
     /**
+     * mem_is64 — whether the module's one linear memory is `memory64` (the
+     * wasm64 switch, #389 C1-7, `backend-wasm.md` §6): `false` (the default,
+     * wasm32) encodes the memory-section limits with the classic 32-bit
+     * flags/widths; `true` sets the `is64` limits flag bit and encodes the
+     * page count as a 64-bit width, for a module whose `ptr<>` values are
+     * uniformly `i64` (no wasm32 checked narrow).
+     */
+    mem_is64: bool
+    /**
      * exports — the module's exports (e.g. `"main"`); empty when nothing is
      * exported.
      */
@@ -401,15 +410,24 @@ fn wasm_function_section(funcs: []WasmFunc) -> []byte {
 /**
  * wasm_memory_section — the memory section's payload for the module's single
  * linear memory: the ULEB128 memory count (always `1`, since a memory
- * section is only framed when `mem_min_pages > 0`), the limits flag (`0x00`
- * — min only, no max), then the ULEB128 initial page count.
+ * section is only framed when `mem_min_pages > 0`), the limits flag, then
+ * the ULEB128 initial page count. **The wasm64 switch (#389 C1-7,
+ * `backend-wasm.md` §6):** `is64 = false` (the default) encodes the classic
+ * wasm32 limits flag (`0x00` — min only, no max); `is64 = true` sets the
+ * `memory64` proposal's own flag bit (`0x04` — min only, 64-bit indices), so
+ * every memory instruction addressing this memory takes an `i64` address
+ * (matching `wasm_valtype(Ptr, true) = i64`'s own register-space width).
+ * The page count itself is encoded identically either way — LEB128 already
+ * handles the wider `u64` range `min_pages` is typed as.
  *
  * @param u32 min_pages  the initial linear-memory size, in 64 KiB pages
+ * @param bool is64  whether the memory is `memory64` (wasm64) rather than
+ *                   the classic 32-bit memory
  * @return []byte  the memory-section payload (unframed)
  */
-fn wasm_memory_section(min_pages: u32) -> []byte {
+fn wasm_memory_section(min_pages: u32, is64: bool) -> []byte {
     mut b = emit_uleb128(teko::list::empty(), 1 to u64)
-    b = teko::list::push(b, 0x00 to byte)
+    b = teko::list::push(b, if is64 { 0x04 to byte } else { 0x00 to byte })
     emit_uleb128(b, min_pages to u64)
 }
 
@@ -685,7 +703,7 @@ pub fn emit_wasm(m: WasmModule) -> []byte {
         b = wasm_section(b, 3 to byte, wasm_function_section(m.funcs))
     }
     if m.mem_min_pages > (0 to u32) {
-        b = wasm_section(b, 5 to byte, wasm_memory_section(m.mem_min_pages))
+        b = wasm_section(b, 5 to byte, wasm_memory_section(m.mem_min_pages, m.mem_is64))
     }
     if m.globals.len > (0 to u64) {
         b = wasm_section(b, 6 to byte, wasm_global_section(m.globals))

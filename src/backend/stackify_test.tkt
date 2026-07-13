@@ -62,23 +62,41 @@ fn sft_i128_beyond_i64() -> i128 {
  * @return void
  */
 fn sft_vt_ok_and_sft_mem_ok_default_on_error() {
-    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I128)) == (0 to u8))
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I128, false)) == (0 to u8))
     let m = sft_mem_ok(wasm_mem_op(lir::LType::I128))
     teko::assert::is_true(m.load_op == (0 to byte) && m.store_op == (0 to byte) && m.align == (0 to u32) && m.valtype == (0 to u8))
 }
 
 #test
 /**
- * wasm_valtype_maps_every_narrow_int_and_ptr_to_i32 — `I8`/`I16`/`I32`/`Ptr`
- * all collapse to the wasm `i32` valtype (`backend-c1-wasm.md` §1.1).
+ * wasm_valtype_maps_every_narrow_int_and_ptr_to_i32_on_wasm32 — `I8`/`I16`/
+ * `I32`/`Ptr` (`ptr64 = false`, the default) all collapse to the wasm `i32`
+ * valtype (`backend-c1-wasm.md` §1.1).
  *
  * @return void
  */
-fn wasm_valtype_maps_every_narrow_int_and_ptr_to_i32() {
-    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I8)) == wasm_vt_i32())
-    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I16)) == wasm_vt_i32())
-    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I32)) == wasm_vt_i32())
-    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::Ptr)) == wasm_vt_i32())
+fn wasm_valtype_maps_every_narrow_int_and_ptr_to_i32_on_wasm32() {
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I8, false)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I16, false)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I32, false)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::Ptr, false)) == wasm_vt_i32())
+}
+
+#test
+/**
+ * wasm_valtype_ptr_follows_the_ptr64_switch — the wasm64 switch (#389 C1-7,
+ * `backend-wasm.md` §6): `Ptr` maps to `i32` when `ptr64 = false` (wasm32,
+ * re-asserted here) and `i64` when `ptr64 = true` (wasm64 — the uniform
+ * 64-bit `ptr<>` model needs no narrowing). Every OTHER machine class is
+ * `ptr64`-independent (I8/I16/I32/I64/F32/F64 never move between calls).
+ *
+ * @return void
+ */
+fn wasm_valtype_ptr_follows_the_ptr64_switch() {
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::Ptr, false)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::Ptr, true)) == wasm_vt_i64())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I32, true)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I64, true)) == wasm_vt_i64())
 }
 
 #test
@@ -89,7 +107,7 @@ fn wasm_valtype_maps_every_narrow_int_and_ptr_to_i32() {
  * @return void
  */
 fn wasm_valtype_maps_i64_to_i64() {
-    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I64)) == wasm_vt_i64())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I64, false)) == wasm_vt_i64())
 }
 
 #test
@@ -100,8 +118,8 @@ fn wasm_valtype_maps_i64_to_i64() {
  * @return void
  */
 fn wasm_valtype_maps_f32_and_f64_directly() {
-    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::F32)) == wasm_vt_f32())
-    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::F64)) == wasm_vt_f64())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::F32, false)) == wasm_vt_f32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::F64, false)) == wasm_vt_f64())
 }
 
 #test
@@ -112,15 +130,15 @@ fn wasm_valtype_maps_f32_and_f64_directly() {
  * @return void
  */
 fn wasm_valtype_i128_f16_void_are_named_stops() {
-    match wasm_valtype(lir::LType::I128) {
+    match wasm_valtype(lir::LType::I128, false) {
         u8 => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-i128")
     }
-    match wasm_valtype(lir::LType::F16) {
+    match wasm_valtype(lir::LType::F16, false) {
         u8 => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-f16")
     }
-    match wasm_valtype(lir::LType::Void) {
+    match wasm_valtype(lir::LType::Void, false) {
         u8 => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "Void")
     }
@@ -142,16 +160,30 @@ fn wasm_mem_op_i8_i16_zero_extend_into_the_i32_family() {
 
 #test
 /**
- * wasm_mem_op_i32_and_ptr_share_the_natural_i32_access — `I32` and `Ptr`
- * (wasm32's address width) share the exact same memory-access shape.
+ * wasm_mem_op_i32_natural_access — `I32`'s own natural-width memory access.
  *
  * @return void
  */
-fn wasm_mem_op_i32_and_ptr_share_the_natural_i32_access() {
+fn wasm_mem_op_i32_natural_access() {
     let i32m = sft_mem_ok(wasm_mem_op(lir::LType::I32))
     teko::assert::is_true(i32m.load_op == (0x28 to byte) && i32m.store_op == (0x36 to byte) && i32m.align == (2 to u32) && i32m.valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * wasm_mem_op_ptr_is_always_the_i64_on_disk_shape — `Ptr`'s memory access is
+ * ALWAYS `i64` (8 bytes), matching `ltype_size(Ptr) = 8` (`lir.tks:465`) —
+ * REGARDLESS of `ptr64` (#389 C1-7, `backend-wasm.md` §6): the on-disk
+ * width is the uniform 64-bit `ptr<>` model; what differs between wasm32/
+ * wasm64 is the checked narrow / plain widen `stackify_load`/`stackify_
+ * store` apply at the REGISTER boundary on wasm32, vs the identity on
+ * wasm64 — `wasm_mem_op` itself makes no `ptr64` distinction.
+ *
+ * @return void
+ */
+fn wasm_mem_op_ptr_is_always_the_i64_on_disk_shape() {
     let ptrm = sft_mem_ok(wasm_mem_op(lir::LType::Ptr))
-    teko::assert::is_true(ptrm.load_op == (0x28 to byte) && ptrm.store_op == (0x36 to byte) && ptrm.align == (2 to u32) && ptrm.valtype == wasm_vt_i32())
+    teko::assert::is_true(ptrm.load_op == (0x29 to byte) && ptrm.store_op == (0x37 to byte) && ptrm.align == (3 to u32) && ptrm.valtype == wasm_vt_i64())
 }
 
 #test
@@ -559,7 +591,7 @@ fn sft_one_i32_param(sym: str) -> lir::LFunc {
 fn stackify_param_reads_its_own_local_index() {
     let f = sft_one_i32_param("teko__test__p")
     let inst = lir::param_inst(0, 0, 0, 0)
-    let out = match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 0 }) { StackifyCtx as x => x; error => return }
+    let out = match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 0 }, false) { StackifyCtx as x => x; error => return }
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte]))
     teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
 }
@@ -574,7 +606,7 @@ fn stackify_param_reads_its_own_local_index() {
 fn stackify_param_index_out_of_range_is_a_named_error() {
     let f = sft_one_i32_param("teko__test__p2")
     let inst = lir::param_inst(0, 5, 0, 0)
-    match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 5 }) {
+    match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 5 }, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "out of range")
     }
@@ -590,7 +622,7 @@ fn stackify_param_index_out_of_range_is_a_named_error() {
 fn stackify_param_i128_propagates_the_c1_i128_stop() {
     let f = lir::new_func("teko__test__pi128", 1, teko::list::push(teko::list::empty(), lir::LType::I128), lir::LType::Void)
     let inst = lir::param_inst(0, 0, 0, 0)
-    match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 0 }) {
+    match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 0 }, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-i128")
     }
@@ -644,7 +676,7 @@ fn stackify_field_addr_computes_base_plus_offset() {
  */
 fn stackify_load_i32_matches_design_doc_golden() {
     let inst = lir::load_inst(1, 0, lir::LType::I32, 0, 0)
-    let out = match stackify_load(sft_ctx0(), inst, lir::LLoad { addr = 0; ty = lir::LType::I32 }) { StackifyCtx as x => x; error => return }
+    let out = match stackify_load(sft_ctx0(), inst, lir::LLoad { addr = 0; ty = lir::LType::I32 }, false, wasm_symtab_empty()) { StackifyCtx as x => x; error => return }
     let want = [0x20 to byte, 0x00 to byte, 0x28 to byte, 0x02 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte]
     teko::assert::is_true(wasm_bytes_eq(out.body, want))
     teko::assert::is_true(wvt_get(out.vtypes, 1) == wasm_vt_i32())
@@ -658,7 +690,7 @@ fn stackify_load_i32_matches_design_doc_golden() {
  */
 fn stackify_load_i128_propagates_the_c1_i128_stop() {
     let inst = lir::load_inst(1, 0, lir::LType::I128, 0, 0)
-    match stackify_load(sft_ctx0(), inst, lir::LLoad { addr = 0; ty = lir::LType::I128 }) {
+    match stackify_load(sft_ctx0(), inst, lir::LLoad { addr = 0; ty = lir::LType::I128 }, false, wasm_symtab_empty()) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-i128")
     }
@@ -672,7 +704,7 @@ fn stackify_load_i128_propagates_the_c1_i128_stop() {
  * @return void
  */
 fn stackify_store_i64_matches_expected_bytes() {
-    let out = match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::I64 }) { StackifyCtx as x => x; error => return }
+    let out = match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::I64 }, false) { StackifyCtx as x => x; error => return }
     let want = [0x20 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x37 to byte, 0x03 to byte, 0x00 to byte]
     teko::assert::is_true(wasm_bytes_eq(out.body, want))
 }
@@ -684,10 +716,138 @@ fn stackify_store_i64_matches_expected_bytes() {
  * @return void
  */
 fn stackify_store_f16_propagates_the_c1_f16_stop() {
-    match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::F16 }) {
+    match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::F16 }, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-f16")
     }
+}
+
+/**
+ * sft_panic_symtab — a `WasmSymbolTable` with `tk_panic_str` registered at
+ * funcidx `5` — `stackify_narrow_ptr_load`'s own resolver fixture (#389
+ * C1-7).
+ *
+ * @return WasmSymbolTable  the table
+ */
+fn sft_panic_symtab() -> WasmSymbolTable {
+    wasm_symtab_add(wasm_symtab_empty(), "tk_panic_str", WasmCallTarget { func_index = 5 to u32; ret_type = lir::LType::Void })
+}
+
+/**
+ * sft_ctx_scratch_at — a fresh `StackifyCtx` exactly like `sft_ctx0`, except
+ * its `next_scratch` starts at `n` — used by the checked-narrow tests so the
+ * reserved scratch local (`sc_alloc_scratch`) never collides with the
+ * instruction's own `addr`/`result` VRegs (a real function always seeds
+ * `next_scratch` at `f.next_vreg`, past every real VReg; this fixture
+ * mirrors that for a hand-built, real-function-free unit test).
+ *
+ * @param u32 n  the starting scratch id
+ * @return StackifyCtx  the empty context, scratch allocation starting at `n`
+ */
+fn sft_ctx_scratch_at(n: u32) -> StackifyCtx {
+    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = n; has_frame = false; frame_base = 0 to u32; slots = wst_empty(); elide = et_empty(); pending = teko::list::empty() }
+}
+
+#test
+/**
+ * stackify_load_ptr_wasm32_checked_narrows — the wasm32 (`ptr64 = false`)
+ * `Ptr`-typed `LLoad` (#389 C1-7, `backend-wasm.md` §6): `local.get addr;
+ * i64.load align=3,off=0` (the on-disk shape is ALWAYS `i64`, `wasm_mem_
+ * op`), then the checked-narrow tail (`stackify_narrow_ptr_load`, hand-
+ * traced): `local.tee $scratch; i64.const 2^32; i64.ge_u; if (then i32.const
+ * msg_addr; i32.const msg_len; call $panic; unreachable); local.get
+ * $scratch; i32.wrap_i64`, and finally `local.set $result` (the result's
+ * own valtype is `i32`, matching `wasm_valtype(Ptr, false)`).
+ *
+ * @return void
+ */
+fn stackify_load_ptr_wasm32_checked_narrows() {
+    let inst = lir::load_inst(1, 0, lir::LType::Ptr, 0, 0)
+    let ctx0 = sft_ctx_scratch_at(2 to u32)
+    let out = match stackify_load(ctx0, inst, lir::LLoad { addr = 0; ty = lir::LType::Ptr }, false, sft_panic_symtab()) { StackifyCtx as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte,
+        0x29 to byte, 0x03 to byte, 0x00 to byte,
+        0x22 to byte, 0x02 to byte,
+        0x42 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x10 to byte,
+        0x5A to byte,
+        0x04 to byte, 0x40 to byte,
+        0x41 to byte, 0x10 to byte,
+        0x41 to byte, 0x2A to byte,
+        0x10 to byte, 0x05 to byte,
+        0x00 to byte,
+        0x0B to byte,
+        0x20 to byte, 0x02 to byte,
+        0xA7 to byte,
+        0x21 to byte, 0x01 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(wvt_get(out.vtypes, 1) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_load_ptr_wasm32_needs_tk_panic_str_registered — the checked-
+ * narrow call site propagates `wasm_resolve_call`'s own "unresolved call
+ * symbol" error when `tk_panic_str` is not registered — the narrow path
+ * never silently skips the panic hook.
+ *
+ * @return void
+ */
+fn stackify_load_ptr_wasm32_needs_tk_panic_str_registered() {
+    let inst = lir::load_inst(1, 0, lir::LType::Ptr, 0, 0)
+    match stackify_load(sft_ctx_scratch_at(2 to u32), inst, lir::LLoad { addr = 0; ty = lir::LType::Ptr }, false, wasm_symtab_empty()) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "tk_panic_str")
+    }
+}
+
+#test
+/**
+ * stackify_load_ptr_wasm64_is_a_plain_i64_load — on wasm64 (`ptr64 = true`),
+ * `Ptr` needs NO checked narrow at all: `local.get addr; i64.load
+ * align=3,off=0; local.set $result` — byte-identical to any other `i64`
+ * load, and the result's own valtype is `i64` (`wasm_valtype(Ptr, true)`).
+ *
+ * @return void
+ */
+fn stackify_load_ptr_wasm64_is_a_plain_i64_load() {
+    let inst = lir::load_inst(1, 0, lir::LType::Ptr, 0, 0)
+    let out = match stackify_load(sft_ctx0(), inst, lir::LLoad { addr = 0; ty = lir::LType::Ptr }, true, wasm_symtab_empty()) { StackifyCtx as x => x; error => return }
+    let want = [0x20 to byte, 0x00 to byte, 0x29 to byte, 0x03 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(wvt_get(out.vtypes, 1) == wasm_vt_i64())
+}
+
+#test
+/**
+ * stackify_store_ptr_wasm32_widens_before_storing — the wasm32 (`ptr64 =
+ * false`) `Ptr`-typed `LStore` (#389 C1-7, §6): the `i32` register value is
+ * `i64.extend_i32_u`-widened (always lossless — an in-range wasm32 address
+ * is never negative) before the `i64.store` (the on-disk shape is ALWAYS
+ * `i64`): `local.get addr; local.get value; i64.extend_i32_u; i64.store
+ * align=3,off=0`.
+ *
+ * @return void
+ */
+fn stackify_store_ptr_wasm32_widens_before_storing() {
+    let out = match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::Ptr }, false) { StackifyCtx as x => x; error => return }
+    let want = [0x20 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0xAD to byte, 0x37 to byte, 0x03 to byte, 0x00 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * stackify_store_ptr_wasm64_needs_no_widen — on wasm64 (`ptr64 = true`), the
+ * `i64`-valued register already matches the `i64` on-disk shape: `local.get
+ * addr; local.get value; i64.store align=3,off=0` — no extend.
+ *
+ * @return void
+ */
+fn stackify_store_ptr_wasm64_needs_no_widen() {
+    let out = match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::Ptr }, true) { StackifyCtx as x => x; error => return }
+    let want = [0x20 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x37 to byte, 0x03 to byte, 0x00 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
 }
 
 /**
@@ -750,7 +910,7 @@ fn stackify_call_void_matches_design_doc_golden() {
     let symbols = wasm_symtab_add(wasm_symtab_empty(), "tk_exit", sft_void_target())
     let args = teko::list::push(teko::list::empty(), 0 to u32)
     let inst = lir::void_call_inst("tk_exit", args, false, 0, 0)
-    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "tk_exit"; args = args; variadic = false }) { StackifyCtx as x => x; error => return }
+    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "tk_exit"; args = args; variadic = false }, false) { StackifyCtx as x => x; error => return }
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x00 to byte, 0x10 to byte, 0x03 to byte]))
 }
 
@@ -764,7 +924,7 @@ fn stackify_call_void_matches_design_doc_golden() {
 fn stackify_call_captures_a_value_result() {
     let symbols = wasm_symtab_add(wasm_symtab_empty(), "teko__demo__f", sft_i32_target())
     let inst = lir::call_inst(9, "teko__demo__f", teko::list::empty(), false, 0, 0)
-    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__f"; args = teko::list::empty(); variadic = false }) { StackifyCtx as x => x; error => return }
+    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__f"; args = teko::list::empty(); variadic = false }, false) { StackifyCtx as x => x; error => return }
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x10 to byte, 0x05 to byte, 0x21 to byte, 0x09 to byte]))
     teko::assert::is_true(wvt_get(out.vtypes, 9) == wasm_vt_i32())
 }
@@ -780,7 +940,7 @@ fn stackify_call_captures_a_value_result() {
 fn stackify_call_drops_a_discarded_value_result() {
     let symbols = wasm_symtab_add(wasm_symtab_empty(), "teko__demo__f", sft_i32_target())
     let inst = lir::void_call_inst("teko__demo__f", teko::list::empty(), false, 0, 0)
-    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__f"; args = teko::list::empty(); variadic = false }) { StackifyCtx as x => x; error => return }
+    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__f"; args = teko::list::empty(); variadic = false }, false) { StackifyCtx as x => x; error => return }
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x10 to byte, 0x05 to byte, 0x1A to byte]))
 }
 
@@ -793,7 +953,7 @@ fn stackify_call_drops_a_discarded_value_result() {
  */
 fn stackify_call_unresolved_symbol_is_a_named_error() {
     let inst = lir::void_call_inst("teko__missing__f", teko::list::empty(), false, 0, 0)
-    match stackify_call(sft_ctx0(), wasm_symtab_empty(), inst, lir::LCall { symbol = "teko__missing__f"; args = teko::list::empty(); variadic = false }) {
+    match stackify_call(sft_ctx0(), wasm_symtab_empty(), inst, lir::LCall { symbol = "teko__missing__f"; args = teko::list::empty(); variadic = false }, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "unresolved call symbol")
     }
@@ -809,7 +969,7 @@ fn stackify_call_unresolved_symbol_is_a_named_error() {
 fn stackify_call_i128_return_propagates_the_c1_i128_stop() {
     let symbols = wasm_symtab_add(wasm_symtab_empty(), "teko__demo__big", sft_i128_target())
     let inst = lir::void_call_inst("teko__demo__big", teko::list::empty(), false, 0, 0)
-    match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__big"; args = teko::list::empty(); variadic = false }) {
+    match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__big"; args = teko::list::empty(); variadic = false }, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-i128")
     }
@@ -836,12 +996,12 @@ fn sft_empty_func() -> lir::LFunc {
  */
 fn stackify_inst_jump_and_branch_are_internal_misuse() {
     let jump = lir::jump_inst(1, teko::list::empty(), 0, 0)
-    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), jump) {
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), jump, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "internal misuse")
     }
     let branch = lir::branch_inst(0, 1, teko::list::empty(), 2, teko::list::empty(), 0, 0)
-    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), branch) {
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), branch, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "internal misuse")
     }
@@ -859,7 +1019,7 @@ fn stackify_inst_jump_and_branch_are_internal_misuse() {
 fn stackify_inst_global_addr_matches_design_doc_golden() {
     let symbols = wasm_symtab_add_data(wasm_symtab_empty(), "teko__rodata__0", 100 to u32)
     let global_addr = lir::global_addr_inst(0, "teko__rodata__0", 0, 0)
-    let out = match stackify_inst(sft_ctx0(), sft_empty_func(), symbols, global_addr) { StackifyCtx as x => x; error => return }
+    let out = match stackify_inst(sft_ctx0(), sft_empty_func(), symbols, global_addr, false) { StackifyCtx as x => x; error => return }
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x41 to byte, 0xE4 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte]))
     teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
 }
@@ -873,7 +1033,7 @@ fn stackify_inst_global_addr_matches_design_doc_golden() {
  */
 fn stackify_inst_global_addr_unresolved_symbol_is_a_named_error() {
     let global_addr = lir::global_addr_inst(0, "teko__rodata__missing", 0, 0)
-    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), global_addr) {
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), global_addr, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "unresolved data symbol")
     }
@@ -900,7 +1060,7 @@ fn stackify_inst_alloca_dispatches_to_stackify_alloca() {
         pending = teko::list::empty()
     }
     let alloca = lir::alloca_inst(0, 8, 8, 0, 0)
-    let out = match stackify_inst(seeded, sft_empty_func(), wasm_symtab_empty(), alloca) { StackifyCtx as x => x; error => return }
+    let out = match stackify_inst(seeded, sft_empty_func(), wasm_symtab_empty(), alloca, false) { StackifyCtx as x => x; error => return }
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x09 to byte, 0x41 to byte, 0x10 to byte, 0x6A to byte, 0x21 to byte, 0x00 to byte]))
     teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
 }
@@ -914,12 +1074,12 @@ fn stackify_inst_alloca_dispatches_to_stackify_alloca() {
  */
 fn stackify_inst_call_indirect_and_func_addr_are_the_c1_4_5_stop() {
     let call_indirect = lir::void_call_indirect_inst(0, teko::list::empty(), false, 0, 0)
-    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), call_indirect) {
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), call_indirect, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-callindirect")
     }
     let func_addr = lir::func_addr_inst(0, "teko__demo__f", 0, 0)
-    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), func_addr) {
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), func_addr, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-funcaddr")
     }
@@ -942,7 +1102,7 @@ fn stackify_func_two_block_straight_fallthrough_needs_no_br() {
     let r0 = lir::alloc_vreg(f)
     f = lir::append_inst(r0.func, b1.block_id, lir::const_int_inst(r0.vreg, 7 to i128, 0, 0))
     f = lir::append_inst(f, b1.block_id, lir::ret_inst(r0.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     /* r0's one use (the ret, same block b1) rides the stack (§5 C1-5) — the
      * `local.set 0; local.get 0` round-trip the pre-peephole baseline paid
      * is gone. */
@@ -967,7 +1127,7 @@ fn stackify_func_straight_line_add_matches_golden_bytes() {
     let r = lir::alloc_vreg(f)
     f = lir::append_inst(r.func, 0, lir::bin_inst(r.vreg, lir::LBinOp::IAdd, 0, 1, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_inst(r.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     /* Every value here — both params AND the add's own result — is
      * single-use, same-block, and consumed in LIFO order: the whole
      * ALL-LOCALS baseline's `local.set`/`local.get` traffic rides the stack
@@ -993,7 +1153,7 @@ fn stackify_func_straight_line_add_matches_golden_bytes() {
 fn stackify_func_no_locals_when_no_non_param_vregs() {
     mut f = lir::new_func("teko__test__void", 0, teko::list::empty(), lir::LType::Void)
     f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     teko::assert::is_true(out.local_groups.len == 0)
     teko::assert::is_true(wasm_bytes_eq(out.body, [0x0F to byte, 0x0B to byte]))
 }
@@ -1012,7 +1172,7 @@ fn stackify_func_local_groups_merge_consecutive_same_type() {
     let r1 = lir::alloc_vreg(f)
     f = lir::append_inst(r1.func, 0, lir::const_int_inst(r1.vreg, 2 to i128, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     teko::assert::is_true(out.local_groups.len == 1)
     teko::assert::is_true(out.local_groups[0].count == (2 to u32))
     teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
@@ -1034,7 +1194,7 @@ fn stackify_func_local_groups_split_on_a_type_change() {
     let r2 = lir::alloc_vreg(f)
     f = lir::append_inst(r2.func, 0, lir::const_int_inst(r2.vreg, 2 to i128, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     teko::assert::is_true(out.local_groups.len == 3)
     teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
     teko::assert::is_true(out.local_groups[1].valtype == wasm_vt_i64())
@@ -1066,34 +1226,34 @@ fn wvt_get_defaults_to_i32_when_unset() {
 fn stackify_inst_dispatches_every_remaining_straight_line_case() {
     let f = sft_empty_func()
     let float_inst = lir::const_float_inst(0, 0x3FF0000000000000 to u64, 0, 0)
-    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), float_inst) {
+    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), float_inst, false) {
         StackifyCtx => { }
         error => teko::assert::is_true(false)
     }
     let un_ctx = sc_set_vtype(sft_ctx0(), 0, wasm_vt_i32())
     let un_inst = lir::un_inst(1, lir::LUnOp::INeg, 0, 0, 0)
-    match stackify_inst(un_ctx, f, wasm_symtab_empty(), un_inst) {
+    match stackify_inst(un_ctx, f, wasm_symtab_empty(), un_inst, false) {
         StackifyCtx => { }
         error => teko::assert::is_true(false)
     }
     let field_addr_inst = lir::field_addr_inst(1, 0, 4, 0, 0)
-    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), field_addr_inst) {
+    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), field_addr_inst, false) {
         StackifyCtx => { }
         error => teko::assert::is_true(false)
     }
     let load_inst = lir::load_inst(1, 0, lir::LType::I32, 0, 0)
-    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), load_inst) {
+    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), load_inst, false) {
         StackifyCtx => { }
         error => teko::assert::is_true(false)
     }
     let store_inst = lir::store_inst(0, 1, lir::LType::I32, 0, 0)
-    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), store_inst) {
+    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), store_inst, false) {
         StackifyCtx => { }
         error => teko::assert::is_true(false)
     }
     let call_symbols = wasm_symtab_add(wasm_symtab_empty(), "tk_exit", sft_void_target())
     let call_inst = lir::void_call_inst("tk_exit", teko::list::empty(), false, 0, 0)
-    match stackify_inst(sft_ctx0(), f, call_symbols, call_inst) {
+    match stackify_inst(sft_ctx0(), f, call_symbols, call_inst, false) {
         StackifyCtx => { }
         error => teko::assert::is_true(false)
     }
@@ -1114,7 +1274,7 @@ fn stackify_func_propagates_a_mid_stream_instruction_error() {
     f = lir::append_inst(r0.func, 0, lir::const_int_inst(r0.vreg, 0 to i128, 0, 0))
     f = lir::append_inst(f, 0, lir::void_call_indirect_inst(r0.vreg, teko::list::empty(), false, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-callindirect")
     }
@@ -1153,7 +1313,7 @@ fn stackify_func_if_else_diamond_matches_wat2wasm_golden() {
     let else_args = teko::list::push(teko::list::empty(), r_else.vreg)
     f = lir::append_inst(f, elseb.block_id, lir::jump_inst(mergeb.block_id, else_args, 0, 0))
     f = lir::append_inst(f, mergeb.block_id, lir::ret_inst(mp.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     /* param 0 (the branch's own `cond`) is single-use, same-block (block 0)
      * — it rides the stack straight into the `if` (§5's own ALWAYS-STACK
      * fused-compare case), dropping its `local.set 0`/`local.get 0`
@@ -1205,7 +1365,7 @@ fn stackify_func_loop_with_two_breaks_matches_wat2wasm_golden() {
     let r9 = lir::alloc_vreg(f)
     f = lir::append_inst(r9.func, exitb.block_id, lir::const_int_inst(r9.vreg, 9 to i128, 0, 0))
     f = lir::append_inst(f, exitb.block_id, lir::ret_inst(r9.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
         0x20 to byte, 0x01 to byte, 0x21 to byte, 0x01 to byte,
@@ -1272,7 +1432,7 @@ fn stackify_func_nested_if_matches_wat2wasm_golden() {
     f = lir::append_inst(r30.func, else30.block_id, lir::const_int_inst(r30.vreg, 30 to i128, 0, 0))
     f = lir::append_inst(f, else30.block_id, lir::jump_inst(outer_merge.block_id, teko::list::push(teko::list::empty(), r30.vreg), 0, 0))
     f = lir::append_inst(f, outer_merge.block_id, lir::ret_inst(omp.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     /* param 0's ONE use (the OUTER branch's `cond`) is in block 0 — the
      * SAME block it is defined in — so it rides the stack (§5), dropping
      * its self-copy AND the separate `local.get` the `if` used to need.
@@ -1345,7 +1505,7 @@ fn stackify_func_match_three_arm_chain_matches_wat2wasm_golden() {
     f = lir::append_inst(r300.func, arm2.block_id, lir::const_int_inst(r300.vreg, 300 to i128, 0, 0))
     f = lir::append_inst(f, arm2.block_id, lir::jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), r300.vreg), 0, 0))
     f = lir::append_inst(f, mergeb.block_id, lir::ret_inst(mp.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     /* Each guard's own `cmp*` (the `ICmpEq` result) is single-use,
      * same-block, LIFO — it rides the stack, dropping its own `local.set`/
      * `local.get` traffic (the fused compare feeding `if` directly). Each
@@ -1416,7 +1576,7 @@ fn stackify_func_loop_swap_block_args_matches_wat2wasm_golden() {
     let back_args = teko::list::push(teko::list::push(teko::list::empty(), pb.vreg), pa.vreg)
     f = lir::append_inst(f, headb.block_id, lir::branch_inst(0, exitb.block_id, teko::list::empty(), headb.block_id, back_args, 0, 0))
     f = lir::append_inst(f, exitb.block_id, lir::ret_inst(pa.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
         0x20 to byte, 0x01 to byte, 0x21 to byte, 0x01 to byte,
@@ -1474,7 +1634,7 @@ fn stackify_func_irreducible_scc_is_the_c1_irreducible_stop() {
     f = lir::append_inst(b2.func, 0, lir::branch_inst(0, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
     f = lir::append_inst(f, b1.block_id, lir::jump_inst(b2.block_id, teko::list::empty(), 0, 0))
     f = lir::append_inst(f, b2.block_id, lir::jump_inst(b1.block_id, teko::list::empty(), 0, 0))
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-irreducible")
     }
@@ -1502,7 +1662,7 @@ fn stackify_func_loop_with_two_fresh_exits_is_the_c1_irreducible_stop() {
     f = lir::append_inst(f, chk.block_id, lir::branch_inst(0, exit_b.block_id, teko::list::empty(), header.block_id, teko::list::empty(), 0, 0))
     f = lir::append_inst(f, exit_a.block_id, lir::ret_void_inst(0, 0))
     f = lir::append_inst(f, exit_b.block_id, lir::ret_void_inst(0, 0))
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-irreducible")
     }
@@ -1525,7 +1685,7 @@ fn stackify_func_loop_with_no_break_has_no_exit_wrap() {
     let headb = lir::alloc_block(f)
     f = lir::append_inst(headb.func, 0, lir::jump_inst(headb.block_id, teko::list::empty(), 0, 0))
     f = lir::append_inst(f, headb.block_id, lir::jump_inst(headb.block_id, teko::list::empty(), 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [0x03 to byte, 0x40 to byte, 0x0C to byte, 0x00 to byte, 0x0B to byte, 0x0B to byte]
     teko::assert::is_true(wasm_bytes_eq(out.body, want))
     teko::assert::is_true(out.local_groups.len == 0)
@@ -1561,7 +1721,7 @@ fn stackify_func_block_without_a_real_terminator_is_an_internal_error() {
     mut f = lir::new_func("teko__test__no_term", 0, teko::list::empty(), lir::LType::Void)
     let r0 = lir::alloc_vreg(f)
     f = lir::append_inst(r0.func, 0, lir::const_int_inst(r0.vreg, 1 to i128, 0, 0))
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "must end in LRet/LJump/LBranch")
     }
@@ -1578,7 +1738,7 @@ fn stackify_func_block_without_a_real_terminator_is_an_internal_error() {
  */
 fn stackify_func_empty_block_has_no_terminator_is_an_internal_error() {
     let f = lir::new_func("teko__test__empty_block", 0, teko::list::empty(), lir::LType::Void)
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "has no terminator")
     }
@@ -1669,7 +1829,7 @@ fn wasm_scope_stack_pop_on_empty_stays_empty() {
  */
 fn stackify_inst_ret_is_internal_misuse() {
     let r = lir::ret_void_inst(0, 0)
-    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), r) {
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), r, false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "internal misuse")
     }
@@ -1721,7 +1881,7 @@ fn stackify_control_rejects_a_function_with_no_blocks() {
         symbol = "teko__test__no_blocks"; n_params = 0 to u32; param_types = teko::list::empty()
         ret_type = lir::LType::Void; blocks = teko::list::empty(); next_vreg = 0 to u32
     }
-    match stackify_control(f, wasm_symtab_empty()) {
+    match stackify_control(f, wasm_symtab_empty(), false) {
         StackifyCtx => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "no blocks")
     }
@@ -1742,7 +1902,7 @@ fn stackify_func_jump_arity_mismatch_propagates_the_named_error() {
     let hp = lir::add_block_param(headb.func, headb.block_id)
     f = lir::append_inst(hp.func, 0, lir::jump_inst(headb.block_id, teko::list::empty(), 0, 0))
     f = lir::append_inst(f, headb.block_id, lir::ret_void_inst(0, 0))
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "arity mismatch")
     }
@@ -1764,7 +1924,7 @@ fn stackify_func_branch_then_arm_arity_mismatch_propagates_the_named_error() {
     f = lir::append_inst(elseb.func, 0, lir::branch_inst(0, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
     f = lir::append_inst(f, thenb.block_id, lir::ret_void_inst(0, 0))
     f = lir::append_inst(f, elseb.block_id, lir::ret_void_inst(0, 0))
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "arity mismatch")
     }
@@ -1787,7 +1947,7 @@ fn stackify_func_branch_else_arm_arity_mismatch_propagates_the_named_error() {
     f = lir::append_inst(ep.func, 0, lir::branch_inst(0, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
     f = lir::append_inst(f, thenb.block_id, lir::ret_void_inst(0, 0))
     f = lir::append_inst(f, elseb.block_id, lir::ret_void_inst(0, 0))
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "arity mismatch")
     }
@@ -1812,7 +1972,7 @@ fn stackify_func_loop_back_edge_arity_mismatch_propagates_through_render_loop() 
     f = lir::append_inst(exitb.func, 0, lir::jump_inst(headb.block_id, entry_args, 0, 0))
     f = lir::append_inst(f, headb.block_id, lir::branch_inst(hp.vreg, exitb.block_id, teko::list::empty(), headb.block_id, teko::list::empty(), 0, 0))
     f = lir::append_inst(f, exitb.block_id, lir::ret_void_inst(0, 0))
-    match stackify_func(f, wasm_symtab_empty()) {
+    match stackify_func(f, wasm_symtab_empty(), false) {
         WasmFuncBody => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "arity mismatch")
     }
@@ -1915,7 +2075,7 @@ fn stackify_func_single_alloca_matches_wat2wasm_reference() {
     let r0 = lir::alloc_vreg(f)
     f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 8, 8, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_inst(r0.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     /* r0 (the alloca's own address) is single-use, same-block (its ONLY
      * use is the immediately-following `ret`) — it rides the stack (§5),
      * dropping its `local.set 0`/`local.get 0` round-trip. The scratch
@@ -1947,7 +2107,7 @@ fn stackify_func_unaligned_alloca_skips_the_align_down_mask() {
     let r0 = lir::alloc_vreg(f)
     f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 3, 1, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x23 to byte, 0x00 to byte, 0x41 to byte, 0x03 to byte, 0x6B to byte, 0x22 to byte, 0x01 to byte, 0x24 to byte,
         0x00 to byte, 0x20 to byte, 0x01 to byte, 0x41 to byte, 0x00 to byte, 0x6A to byte, 0x21 to byte, 0x00 to byte,
@@ -1974,7 +2134,7 @@ fn stackify_func_two_allocas_matches_wat2wasm_reference() {
     let r1 = lir::alloc_vreg(f)
     f = lir::append_inst(r1.func, 0, lir::alloca_inst(r1.vreg, 8, 8, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x23 to byte, 0x00 to byte, 0x41 to byte, 0x10 to byte, 0x6B to byte, 0x41 to byte, 0x78 to byte, 0x71 to byte,
         0x22 to byte, 0x02 to byte, 0x24 to byte, 0x00 to byte, 0x20 to byte, 0x02 to byte, 0x41 to byte, 0x00 to byte,
@@ -2184,7 +2344,7 @@ fn register_program_symbols_resolves_tk_exit_and_every_func() {
  * @return void
  */
 fn func_type_of_translates_params_and_a_nonvoid_result() {
-    let t = match wasm_func_type_of(sft_main_func()) { WasmFuncType as x => x; error => return }
+    let t = match wasm_func_type_of(sft_main_func(), false) { WasmFuncType as x => x; error => return }
     teko::assert::is_true(t.params.len == (0 to u64))
     teko::assert::is_true(t.results.len == (1 to u64))
     teko::assert::is_true(t.results[0] == (wasm_vt_i32() to byte))
@@ -2199,7 +2359,7 @@ fn func_type_of_translates_params_and_a_nonvoid_result() {
  * @return void
  */
 fn func_type_of_a_void_function_has_no_results() {
-    let t = match wasm_func_type_of(sft_empty_func()) { WasmFuncType as x => x; error => return }
+    let t = match wasm_func_type_of(sft_empty_func(), false) { WasmFuncType as x => x; error => return }
     teko::assert::is_true(t.results.len == (0 to u64))
 }
 
@@ -2212,11 +2372,11 @@ fn func_type_of_a_void_function_has_no_results() {
  * @return void
  */
 fn func_type_of_propagates_the_i128_stop_on_either_side() {
-    match wasm_func_type_of(sft_i128_param_func()) {
+    match wasm_func_type_of(sft_i128_param_func(), false) {
         WasmFuncType => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-i128")
     }
-    match wasm_func_type_of(sft_i128_ret_func()) {
+    match wasm_func_type_of(sft_i128_ret_func(), false) {
         WasmFuncType => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-i128")
     }
@@ -2232,7 +2392,7 @@ fn func_type_of_propagates_the_i128_stop_on_either_side() {
  */
 fn build_program_types_appends_wasi_then_one_per_func() {
     let wasi = wasm_wasi_import_set()
-    let types = match wasm_build_program_types(wasi, [sft_main_func()]) { []WasmFuncType as x => x; error => return }
+    let types = match wasm_build_program_types(wasi, [sft_main_func()], false) { []WasmFuncType as x => x; error => return }
     teko::assert::is_true(types.len == (3 to u64))
     teko::assert::is_true(types[2].results.len == (1 to u64))
 }
@@ -2246,7 +2406,7 @@ fn build_program_types_appends_wasi_then_one_per_func() {
  */
 fn build_program_types_propagates_a_func_type_of_stop() {
     let wasi = wasm_wasi_import_set()
-    match wasm_build_program_types(wasi, [sft_i128_ret_func()]) {
+    match wasm_build_program_types(wasi, [sft_i128_ret_func()], false) {
         []WasmFuncType => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-i128")
     }
@@ -2266,7 +2426,7 @@ fn build_program_types_propagates_a_func_type_of_stop() {
 fn build_program_funcs_packages_a_self_contained_func() {
     let wasi = wasm_wasi_import_set()
     let symtab = wasm_register_program_symbols(wasi, [sft_main_func()])
-    let funcs = match wasm_build_program_funcs(wasi, [sft_main_func()], symtab) { []WasmFunc as x => x; error => return }
+    let funcs = match wasm_build_program_funcs(wasi, [sft_main_func()], symtab, false) { []WasmFunc as x => x; error => return }
     teko::assert::is_true(funcs.len == (1 to u64))
     let f = funcs[0]
     teko::assert::is_true(f.type_index == (2 to u32))
@@ -2283,7 +2443,7 @@ fn build_program_funcs_packages_a_self_contained_func() {
  */
 fn build_program_funcs_propagates_a_stackify_func_stop() {
     let wasi = wasm_wasi_import_set()
-    match wasm_build_program_funcs(wasi, [sft_i128_ret_func()], wasm_symtab_empty()) {
+    match wasm_build_program_funcs(wasi, [sft_i128_ret_func()], wasm_symtab_empty(), false) {
         []WasmFunc => teko::assert::is_true(false)
         error => { }
     }
@@ -2465,7 +2625,7 @@ fn program_memory_plan_with_a_frame_adds_the_sp_global() {
  */
 fn assemble_program_own_exit_zero_shape_exports_start() {
     let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
-    let m = match wasm_assemble_program(lmod) { WasmModule as x => x; error => return }
+    let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
     teko::assert::is_true(m.exports.len == (2 to u64))
     teko::assert::is_true(m.exports[0].name == "_start")
     teko::assert::is_true(m.exports[0].index == (8 to u32))
@@ -2477,6 +2637,86 @@ fn assemble_program_own_exit_zero_shape_exports_start() {
     teko::assert::is_true(start.body[start.body.len - 1] == (0x0B to byte))
     teko::assert::is_true(m.types.len == (5 to u64))
     teko::assert::is_true(m.imports.len == (2 to u64))
+    teko::assert::is_true(!m.mem_is64)
+}
+
+#test
+/**
+ * assemble_program_wasm64_omits_the_io_panic_trampolines — the SAME
+ * `own_exit_zero` shape, assembled for wasm64 (#389 C1-7, `backend-wasm.md`
+ * §6): `mem_is64` is `true`, and the `fd_write`-based io/panic trampolines
+ * (WASI preview1's own `i32`-address-only ABI, a genuine ecosystem wall
+ * against `memory64`) are OMITTED — `funcs` is `[main, _start]` (two
+ * entries, not seven), `types` carries the WASI pair + `main`'s own +
+ * `_start`'s own (four, not five — no shared io type), and `_start`'s own
+ * funcidx lands immediately after `main` (no io funcs in between). The
+ * import set itself (`proc_exit`+`fd_write`) is unchanged — an unused
+ * `fd_write` import is harmless; only its CALLING trampoline bodies would
+ * have mismatched the `memory64` address width.
+ *
+ * @return void
+ */
+fn assemble_program_wasm64_omits_the_io_panic_trampolines() {
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod, true) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.mem_is64)
+    teko::assert::is_true(m.funcs.len == (2 to u64))
+    teko::assert::is_true(m.types.len == (4 to u64))
+    teko::assert::is_true(m.imports.len == (2 to u64))
+    teko::assert::is_true(m.exports[0].name == "_start")
+    teko::assert::is_true(m.exports[0].index == (3 to u32))
+}
+
+#test
+/**
+ * assemble_program_wasm64_rejects_a_frame_bearing_program — the wasm64
+ * scope guard (#389 C1-7): a function with an `LAlloca` (`wasm_program_
+ * has_any_frame`) names the `C1-wasm64-scope` honest-stop when `ptr64` —
+ * the shadow-stack `$sp`/`LFieldAddr`/`LAlloca` sites still compute in
+ * `i32` unconditionally, so a `memory64` module built from this program
+ * would be invalid; fail loud instead (M.3).
+ *
+ * @return void
+ */
+fn assemble_program_wasm64_rejects_a_frame_bearing_program() {
+    let lmod = lir::LModule { funcs = [sft_alloca_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, true) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-wasm64-scope")
+    }
+}
+
+#test
+/**
+ * assemble_program_wasm64_rejects_a_rodata_bearing_program — the SAME
+ * wasm64 scope guard, triggered by non-empty `LModule.rodata` (`LGlobalAddr`
+ * still computes in `i32`).
+ *
+ * @return void
+ */
+fn assemble_program_wasm64_rejects_a_rodata_bearing_program() {
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, true) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-wasm64-scope")
+    }
+}
+
+#test
+/**
+ * assemble_program_wasm64_rejects_a_ptr_signature — the SAME wasm64 scope
+ * guard, triggered by a function whose own signature names `Ptr`
+ * (`wasm_program_uses_ptr` — `sft_rodata_func`'s `Ptr`-returning `main`).
+ *
+ * @return void
+ */
+fn assemble_program_wasm64_rejects_a_ptr_signature() {
+    let lmod = lir::LModule { funcs = [sft_rodata_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, true) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-wasm64-scope")
+    }
 }
 
 /**
@@ -2506,7 +2746,7 @@ fn sft_rodata_func() -> lir::LFunc {
 fn assemble_program_resolves_rodata_symbols_before_stackifying() {
     let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
     let lmod = lir::LModule { funcs = [sft_rodata_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
-    let m = match wasm_assemble_program(lmod) { WasmModule as x => x; error => return }
+    let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
     teko::assert::is_true(m.data.len == (1 to u64))
     teko::assert::is_true(m.data[0].offset == wasm_rodata_base())
 }
@@ -2521,7 +2761,7 @@ fn assemble_program_resolves_rodata_symbols_before_stackifying() {
  */
 fn assemble_program_rejects_top_level_globals() {
     let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = [lir::LGlobal { symbol = "teko__g__x"; ty = lir::LType::I32; bytes = teko::list::empty() }]; layouts = teko::list::empty() }
-    match wasm_assemble_program(lmod) {
+    match wasm_assemble_program(lmod, false) {
         WasmModule => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-globals")
     }
@@ -2537,7 +2777,7 @@ fn assemble_program_rejects_top_level_globals() {
  */
 fn assemble_program_propagates_a_func_type_stop() {
     let lmod = lir::LModule { funcs = [sft_i128_ret_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
-    match wasm_assemble_program(lmod) {
+    match wasm_assemble_program(lmod, false) {
         WasmModule => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "C1-i128")
     }
@@ -2555,7 +2795,7 @@ fn assemble_program_propagates_a_func_type_stop() {
  */
 fn assemble_program_with_no_main_is_a_named_internal_error() {
     let lmod = lir::LModule { funcs = [sft_alloca_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
-    match wasm_assemble_program(lmod) {
+    match wasm_assemble_program(lmod, false) {
         WasmModule => teko::assert::is_true(false)
         error as e => teko::assert::str_contains(e.message, "no `main` entry function found")
     }
@@ -2754,7 +2994,7 @@ fn stackify_func_load_across_a_call_stays_in_a_local() {
     f = lir::append_inst(f, 0, lir::void_call_inst("tk_nop", teko::list::empty(), false, 0, 0))
     f = lir::append_inst(f, 0, lir::ret_inst(v.vreg, 0, 0))
     let symbols = wasm_symtab_add(wasm_symtab_empty(), "tk_nop", sft_void_target())
-    let out = match stackify_func(f, symbols) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, symbols, false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x20 to byte, 0x00 to byte,
         0x28 to byte, 0x02 to byte, 0x00 to byte,
@@ -2791,7 +3031,7 @@ fn stackify_func_tee_persists_a_value_also_fed_across_an_edge() {
     let r5 = lir::alloc_vreg(f)
     f = lir::append_inst(r5.func, elseb.block_id, lir::const_int_inst(r5.vreg, 5 to i128, 0, 0))
     f = lir::append_inst(f, elseb.block_id, lir::ret_inst(r5.vreg, 0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x20 to byte, 0x00 to byte, 0x22 to byte, 0x00 to byte,
         0x04 to byte, 0x40 to byte,
@@ -2896,7 +3136,7 @@ fn sft_bp_via_block_param(op: lir::LBinOp, const_val: i128) -> lir::LFunc {
  */
 fn stackify_func_non_commutative_sub_keeps_the_correct_operand_order() {
     let f = sft_bp_via_block_param(lir::LBinOp::ISub, 7 to i128)
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
@@ -2919,7 +3159,7 @@ fn stackify_func_non_commutative_sub_keeps_the_correct_operand_order() {
  */
 fn stackify_func_non_commutative_compare_keeps_the_correct_operand_order() {
     let f = sft_bp_via_block_param(lir::LBinOp::ICmpLtS, 7 to i128)
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
@@ -2955,7 +3195,7 @@ fn stackify_func_store_with_normal_addr_and_a_would_be_drop_value() {
     f = lir::append_inst(cval.func, b1.block_id, lir::const_int_inst(cval.vreg, 42 to i128, 0, 0))
     f = lir::append_inst(f, b1.block_id, lir::store_inst(addr.vreg, cval.vreg, lir::LType::I32, 0, 0))
     f = lir::append_inst(f, b1.block_id, lir::ret_void_inst(0, 0))
-    let out = match stackify_func(f, wasm_symtab_empty()) { WasmFuncBody as x => x; error => return }
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
     let want = [
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
         0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,

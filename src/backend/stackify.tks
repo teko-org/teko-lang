@@ -40,19 +40,28 @@ fn wasm_vt_f64() -> u8 {
 
 /**
  * wasm_valtype — the wasm value-type byte an `LType` machine class maps to
- * (`backend-c1-wasm.md` §1.1): the sub-32 integer widths and `Ptr` collapse
- * to `i32`, `I64` maps to `i64`, `F32`/`F64` map directly. `I128` and `F16`
- * have no wasm value type at all — the two NAMED honest-stops `C1-i128`
- * (shared with A2's own i128 route) and `C1-f16` (matching the register
- * targets' own f16 gap). `Void` is a valueless machine class (never a real
- * operand), so it also has no valtype byte — an internal-error arm, distinct
- * from the two design-named stops, exercised directly by a unit test rather
- * than reachable through valid lowering.
+ * under target pointer width `ptr64` (`backend-c1-wasm.md` §1.1/§6, the
+ * wasm32/wasm64 switch, #389 C1-7): the sub-32 integer widths collapse to
+ * `i32`, `I64` maps to `i64`, `F32`/`F64` map directly, and `Ptr` follows
+ * `ptr64` — `i32` on wasm32 (`ptr64 = false`, the default — every memory
+ * access takes a native i32 address, §6's checked narrow applies at every
+ * `Ptr`-typed memory op) or `i64` on wasm64 (`ptr64 = true` — the uniform
+ * 64-bit `ptr<>` model needs no narrowing at all, `ltype_size(Ptr) = 8`
+ * already matches). `I128` and `F16` have no wasm value type at all — the
+ * two NAMED honest-stops `C1-i128` (shared with A2's own i128 route) and
+ * `C1-f16` (matching the register targets' own f16 gap). `Void` is a
+ * valueless machine class (never a real operand), so it also has no valtype
+ * byte — an internal-error arm, distinct from the two design-named stops,
+ * exercised directly by a unit test rather than reachable through valid
+ * lowering.
  *
  * @param LType t  the machine class to map
+ * @param bool ptr64  the target pointer width (`false` = wasm32, the
+ *                    default; `true` = wasm64)
  * @return u8 | error  the wasm valtype byte, or a named honest-stop
+ * @since #389 C1-7 (the `ptr64` parameter; the mapping itself is C1-1)
  */
-pub fn wasm_valtype(t: lir::LType) -> u8 | error {
+pub fn wasm_valtype(t: lir::LType, ptr64: bool) -> u8 | error {
     match t {
         lir::LType::I8 => wasm_vt_i32()
         lir::LType::I16 => wasm_vt_i32()
@@ -62,7 +71,7 @@ pub fn wasm_valtype(t: lir::LType) -> u8 | error {
         lir::LType::F16 => error { message = "stackify: C1-f16 — wasm has no native f16 valtype, deferred (matches the register targets' f16 gap)" }
         lir::LType::F32 => wasm_vt_f32()
         lir::LType::F64 => wasm_vt_f64()
-        lir::LType::Ptr => wasm_vt_i32()
+        lir::LType::Ptr => if ptr64 { wasm_vt_i64() } else { wasm_vt_i32() }
         lir::LType::Void => error { message = "stackify: wasm_valtype — a Void machine class has no wasm value type (internal)" }
     }
 }
@@ -1428,12 +1437,19 @@ type WasmMemOp = struct {
 
 /**
  * wasm_mem_op — the load/store opcode pair + alignment + valtype for one
- * `LType`'s memory access (`backend-c1-wasm.md` §4.4). `I8`/`I16` load
- * zero-extending (`i32.load8_u`/`i32.load16_u`) into the shared `i32` family
- * their valtype already collapses to; `I32`/`Ptr` share the natural `i32`
- * load/store; `I64`/`F32`/`F64` each get their own natural-width op. `I128`/
- * `F16` are the same two named honest-stops `wasm_valtype` names; `Void` is
- * the same internal-error arm.
+ * `LType`'s NATURAL, ON-DISK memory access (`backend-c1-wasm.md` §4.4/§6).
+ * `I8`/`I16` load zero-extending (`i32.load8_u`/`i32.load16_u`) into the
+ * shared `i32` family their valtype already collapses to; `I32` gets its own
+ * natural `i32` load/store; `I64`/`F32`/`F64` each get their own natural-
+ * width op. **`Ptr` ALWAYS stores/loads as `i64` (8 bytes), matching
+ * `ltype_size(Ptr) = 8` (`lir.tks:465`) — REGARDLESS of `ptr64`** (#389
+ * C1-7): the on-disk width is the uniform 64-bit `ptr<>` model (§2-C, §6);
+ * what differs between wasm32/wasm64 is what happens to the loaded/stored
+ * value at the REGISTER boundary (the checked narrow / plain widen
+ * `stackify_load`/`stackify_store` apply on wasm32, vs the identity on
+ * wasm64) — a target-independent decision this table does not need to make.
+ * `I128`/`F16` are the same two named honest-stops `wasm_valtype` names;
+ * `Void` is the same internal-error arm.
  *
  * @param LType t  the accessed machine class
  * @return WasmMemOp | error  the resolved memory-access shape, or a named
@@ -1445,13 +1461,64 @@ fn wasm_mem_op(t: lir::LType) -> WasmMemOp | error {
         lir::LType::I16 => WasmMemOp { load_op = 0x2F to byte; store_op = 0x3B to byte; align = 1 to u32; valtype = wasm_vt_i32() }
         lir::LType::I32 => WasmMemOp { load_op = 0x28 to byte; store_op = 0x36 to byte; align = 2 to u32; valtype = wasm_vt_i32() }
         lir::LType::I64 => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vt_i64() }
-        lir::LType::Ptr => WasmMemOp { load_op = 0x28 to byte; store_op = 0x36 to byte; align = 2 to u32; valtype = wasm_vt_i32() }
+        lir::LType::Ptr => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vt_i64() }
         lir::LType::F32 => WasmMemOp { load_op = 0x2A to byte; store_op = 0x38 to byte; align = 2 to u32; valtype = wasm_vt_f32() }
         lir::LType::F64 => WasmMemOp { load_op = 0x2B to byte; store_op = 0x39 to byte; align = 3 to u32; valtype = wasm_vt_f64() }
         lir::LType::I128 => error { message = "stackify: C1-i128 — an i128 memory access has no wasm valtype, deferred (shared with A2's i128 route)" }
         lir::LType::F16 => error { message = "stackify: C1-f16 — an f16 memory access has no wasm valtype, deferred (matches the register targets' f16 gap)" }
         lir::LType::Void => error { message = "stackify: a void-typed memory access is malformed (internal)" }
     }
+}
+
+/**
+ * wasm_narrow_threshold — the wasm32 checked-narrow's own boundary: `2^32`
+ * as a signed `i64` (`backend-wasm.md` §6) — the smallest 64-bit address
+ * value a wasm32 linear-memory access can NOT represent as an `i32`. Built
+ * from arithmetic (never a huge literal, mirroring `sft_i128_beyond_i64`'s
+ * own "never write the giant literal" discipline) so the threshold is
+ * self-evidently exact.
+ *
+ * @return i64  `4294967296` (`2^32`)
+ */
+fn wasm_narrow_threshold() -> i64 {
+    let half = 65536 to i64
+    half * half
+}
+
+/**
+ * stackify_narrow_ptr_load — the wasm32 checked-narrow tail of a `Ptr`-typed
+ * `LLoad` (`backend-wasm.md` §6, #389 C1-7): given the just-loaded `i64`
+ * address already on the operand stack, `local.tee` it into a fresh scratch
+ * (`sc_alloc_scratch` — the value must survive both the comparison AND the
+ * eventual wrap), test `addr >= 2^32` (`i64.ge_u`, `wasm_narrow_threshold`);
+ * on overflow, `sc_open_if` a VOID-signature `if` (§3.3 — every scope stays
+ * empty-stack at its boundary) whose `then` arm calls the `tk_panic_str`
+ * host-hook trampoline with the fixed overflow message (`wasm_narrow_msg_
+ * addr`/`_len`) then `unreachable` TRAPS the instance (§8's "observe, then
+ * trap" shape, M.1 — never a silent `i32.wrap_i64`); otherwise (no `else`)
+ * fall straight to `sc_close_scope`'s `end`, `local.get` the scratch back,
+ * and `i32.wrap_i64` the in-range value down to the wasm32 register width
+ * (`wasm_valtype(Ptr, false) = i32`, §3.2).
+ *
+ * @param StackifyCtx ctx0  the context to extend (the `i64` address value
+ *                          already pushed by the caller's own `i64.load`)
+ * @param u32 panic_ix  the `tk_panic_str` trampoline's own funcidx
+ * @return StackifyCtx  the advanced context, the narrowed `i32` value left
+ *                       on the operand stack
+ */
+fn stackify_narrow_ptr_load(ctx0: StackifyCtx, panic_ix: u32) -> StackifyCtx {
+    let alloc = sc_alloc_scratch(ctx0, wasm_vt_i64())
+    let ctx1 = sc_local_tee(alloc.ctx, alloc.id)
+    let ctx2 = sc_sleb(sc_byte(ctx1, 0x42 to byte), wasm_narrow_threshold())
+    let ctx3 = sc_byte(ctx2, 0x5A to byte)
+    let ctx4 = sc_open_if(ctx3)
+    let ctx5 = sc_sleb(sc_byte(ctx4, 0x41 to byte), wasm_narrow_msg_addr() to i64)
+    let ctx6 = sc_sleb(sc_byte(ctx5, 0x41 to byte), wasm_narrow_msg_len() to i64)
+    let ctx7 = sc_uleb(sc_byte(ctx6, 0x10 to byte), panic_ix to u64)
+    let ctx8 = sc_byte(ctx7, 0x00 to byte)
+    let ctx9 = sc_close_scope(ctx8)
+    let ctx10 = sc_local_get(ctx9, alloc.id)
+    sc_byte(ctx10, 0xA7 to byte)
 }
 
 /**
@@ -1784,15 +1851,17 @@ fn stackify_un(ctx0: StackifyCtx, inst: lir::LInst, u: lir::LUn) -> StackifyCtx 
  * @param LFunc f  the enclosing function (its `param_types`)
  * @param LInst inst  the enclosing instruction (its result VReg)
  * @param LParam p  the parameter op
+ * @param bool ptr64  the target pointer width (`wasm_valtype`'s own switch,
+ *                    #389 C1-7)
  * @return StackifyCtx | error  the advanced context, or a NAMED error when
  *                              `p.index` is out of range (internal), or
  *                              `wasm_valtype`'s propagated honest-stop
  */
-fn stackify_param(ctx0: StackifyCtx, f: lir::LFunc, inst: lir::LInst, p: lir::LParam) -> StackifyCtx | error {
+fn stackify_param(ctx0: StackifyCtx, f: lir::LFunc, inst: lir::LInst, p: lir::LParam, ptr64: bool) -> StackifyCtx | error {
     if (p.index to u64) >= f.param_types.len {
         return error { message = "stackify: param index out of range (internal)" }
     }
-    let vt = match wasm_valtype(f.param_types[p.index to u64]) { u8 as v => v; error as e => return e }
+    let vt = match wasm_valtype(f.param_types[p.index to u64], ptr64) { u8 as v => v; error as e => return e }
     let ctx1 = sc_local_get(ctx0, p.index)
     sc_def_result(ctx1, inst.result, vt)
 }
@@ -1863,19 +1932,36 @@ fn stackify_alloca(ctx0: StackifyCtx, inst: lir::LInst) -> StackifyCtx {
  * stackify_load — the `LLoad` lowering: `local.get $addr; <ty>.load
  * align,0; local.set $r` (`wasm_mem_op` resolves the opcode/alignment/
  * valtype from `l.ty`). The offset is always `0` — any static field offset
- * already rode a preceding `LFieldAddr` into the address.
+ * already rode a preceding `LFieldAddr` into the address. **`Ptr`-typed on
+ * wasm32 (`!ptr64`) is the ONE exception (#389 C1-7, `backend-wasm.md`
+ * §6):** the on-disk access is still the natural `i64.load` (`wasm_mem_op`'s
+ * uniform 8-byte `Ptr` shape), but the loaded value is then CHECKED-narrowed
+ * to `i32` (`stackify_narrow_ptr_load`, panicking via the `tk_panic_str`
+ * host hook on overflow) before landing in the result's local — matching
+ * `wasm_valtype(Ptr, false) = i32`'s own register-space width. On wasm64
+ * (`ptr64`) `Ptr` needs no special case at all: `mem.valtype` is already
+ * `i64`, identical to any other `i64` load.
  *
  * @param StackifyCtx ctx0  the context to extend
  * @param LInst inst  the enclosing instruction (its result VReg)
  * @param LLoad l  the load op
- * @return StackifyCtx | error  the advanced context, or `wasm_mem_op`'s
- *                              propagated honest-stop
+ * @param bool ptr64  the target pointer width (#389 C1-7)
+ * @param WasmSymbolTable symbols  the call-target resolver (`tk_panic_str`'s
+ *                                 own funcidx, needed only on the wasm32
+ *                                 `Ptr` narrow path)
+ * @return StackifyCtx | error  the advanced context, or `wasm_mem_op`'s (or
+ *                              the panic symbol's) propagated honest-stop
  */
-fn stackify_load(ctx0: StackifyCtx, inst: lir::LInst, l: lir::LLoad) -> StackifyCtx | error {
+fn stackify_load(ctx0: StackifyCtx, inst: lir::LInst, l: lir::LLoad, ptr64: bool, symbols: WasmSymbolTable) -> StackifyCtx | error {
     let mem = match wasm_mem_op(l.ty) { WasmMemOp as m => m; error as e => return e }
     let ctx1 = sc_use_operand(ctx0, l.addr)
     let ctx2 = sc_byte(ctx1, mem.load_op)
     let ctx3 = sc_memarg(ctx2, mem.align, 0 to u32)
+    if l.ty == lir::LType::Ptr && !ptr64 {
+        let panic_target = match wasm_resolve_call(symbols, "tk_panic_str") { WasmCallTarget as t => t; error as e => return e }
+        let narrowed = stackify_narrow_ptr_load(ctx3, panic_target.func_index)
+        return sc_def_result(narrowed, inst.result, wasm_vt_i32())
+    }
     sc_def_result(ctx3, inst.result, mem.valtype)
 }
 
@@ -1886,15 +1972,28 @@ fn stackify_load(ctx0: StackifyCtx, inst: lir::LInst, l: lir::LLoad) -> Stackify
  * register file from the stored ty", reading through to the value operand
  * rather than trusting its own recorded valtype) — a well-formed-LIR
  * precondition: `s.value`'s own actual local already agrees with `s.ty`'s
- * implied width.
+ * implied width. **`Ptr`-typed on wasm32 (`!ptr64`) is the ONE exception**
+ * (#389 C1-7, `backend-wasm.md` §6): the register-space value is `i32`
+ * (`wasm_valtype(Ptr, false)`), but the on-disk shape is the uniform 8-byte
+ * `Ptr` (`wasm_mem_op`), so the `i32` value is `i64.extend_i32_u`-widened
+ * (always lossless — an in-range wasm32 address is never negative) before
+ * the `i64.store`. On wasm64 (`ptr64`) the value is already `i64`; no widen
+ * is needed.
  *
  * @param StackifyCtx ctx0  the context to extend
  * @param LStore s  the store op
+ * @param bool ptr64  the target pointer width (#389 C1-7)
  * @return StackifyCtx | error  the advanced context, or `wasm_mem_op`'s
  *                              propagated honest-stop
  */
-fn stackify_store(ctx0: StackifyCtx, s: lir::LStore) -> StackifyCtx | error {
+fn stackify_store(ctx0: StackifyCtx, s: lir::LStore, ptr64: bool) -> StackifyCtx | error {
     let mem = match wasm_mem_op(s.ty) { WasmMemOp as m => m; error as e => return e }
+    if s.ty == lir::LType::Ptr && !ptr64 {
+        let ctx1 = sc_use_operands(ctx0, [s.addr, s.value])
+        let ctx2 = sc_byte(ctx1, 0xAD to byte)
+        let ctx3 = sc_byte(ctx2, mem.store_op)
+        return sc_memarg(ctx3, mem.align, 0 to u32)
+    }
     let ctx2 = sc_use_operands(ctx0, [s.addr, s.value])
     let ctx3 = sc_byte(ctx2, mem.store_op)
     sc_memarg(ctx3, mem.align, 0 to u32)
@@ -2047,18 +2146,20 @@ fn wasm_resolve_data(t: WasmSymbolTable, symbol: str) -> u32 | error {
  * @param LInst inst  the enclosing instruction (its result VReg, and
  *                     whether the caller captures the result)
  * @param LCall c  the call op
+ * @param bool ptr64  the target pointer width (`wasm_valtype`'s own switch,
+ *                    #389 C1-7)
  * @return StackifyCtx | error  the advanced context, or a propagated
  *                              honest-stop (an unresolved symbol, or the
  *                              callee's own `C1-i128`/`C1-f16` return type)
  */
-fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, c: lir::LCall) -> StackifyCtx | error {
+fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, c: lir::LCall, ptr64: bool) -> StackifyCtx | error {
     let target = match wasm_resolve_call(symbols, c.symbol) { WasmCallTarget as t => t; error as e => return e }
     let staged = sc_use_operands(ctx0, c.args)
     let ctx = sc_uleb(sc_byte(staged, 0x10 to byte), target.func_index to u64)
     if target.ret_type == lir::LType::Void {
         return ctx
     }
-    let vt = match wasm_valtype(target.ret_type) { u8 as v => v; error as e => return e }
+    let vt = match wasm_valtype(target.ret_type, ptr64) { u8 as v => v; error as e => return e }
     if inst.has_result {
         return sc_def_result(ctx, inst.result, vt)
     }
@@ -2107,27 +2208,29 @@ fn stackify_global_addr(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::
  * @param WasmSymbolTable symbols  the call-target/data-symbol resolver
  *                                 (`LCall`/`LGlobalAddr`)
  * @param LInst inst  the instruction to lower
+ * @param bool ptr64  the target pointer width (`LParam`/`LLoad`/`LStore`/
+ *                    `LCall`'s own `Ptr`-typed sites, #389 C1-7)
  * @return StackifyCtx | error  the advanced context, or a propagated/named
  *                              honest-stop
  */
-fn stackify_inst(ctx: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, inst: lir::LInst) -> StackifyCtx | error {
+fn stackify_inst(ctx: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, inst: lir::LInst, ptr64: bool) -> StackifyCtx | error {
     match inst.op {
         lir::LConstInt as c => stackify_const_int(ctx, inst, c)
         lir::LConstFloat as c => stackify_const_float(ctx, inst, c)
         lir::LBin as b => stackify_bin(ctx, inst, b)
         lir::LUn as u => stackify_un(ctx, inst, u)
-        lir::LParam as p => stackify_param(ctx, f, inst, p)
+        lir::LParam as p => stackify_param(ctx, f, inst, p, ptr64)
         lir::LRet => error { message = "stackify: a return terminator must be rendered by stackify_control's terminator dispatch (render_terminator), not the per-instruction stackify_inst — internal misuse" }
         lir::LJump => error { message = "stackify: a jump terminator must be rendered by stackify_control's terminator dispatch (render_jump_terminator), not the per-instruction stackify_inst — internal misuse" }
         lir::LBranch => error { message = "stackify: a branch terminator must be rendered by stackify_control's terminator dispatch (render_branch_terminator), not the per-instruction stackify_inst — internal misuse" }
         lir::LAlloca => stackify_alloca(ctx, inst)
         lir::LFieldAddr as fa => stackify_field_addr(ctx, inst, fa)
-        lir::LLoad as l => stackify_load(ctx, inst, l)
-        lir::LStore as s => stackify_store(ctx, s)
+        lir::LLoad as l => stackify_load(ctx, inst, l, ptr64, symbols)
+        lir::LStore as s => stackify_store(ctx, s, ptr64)
         lir::LGlobalAddr as g => stackify_global_addr(ctx, symbols, inst, g)
         lir::LCallIndirect => error { message = "stackify: C1-callindirect — an indirect call needs the wasm funcref table, not yet implemented (C1-4/C1-5)" }
         lir::LFuncAddr => error { message = "stackify: C1-funcaddr — a function-value address needs the wasm funcref table, not yet implemented (C1-4/C1-5)" }
-        lir::LCall as c => stackify_call(ctx, symbols, inst, c)
+        lir::LCall as c => stackify_call(ctx, symbols, inst, c, ptr64)
     }
 }
 
@@ -2139,15 +2242,16 @@ fn stackify_inst(ctx: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, inst
  * @param LFunc f  the enclosing function
  * @param WasmSymbolTable symbols  the call-target resolver
  * @param []LInst insts  the instruction stream to lower
+ * @param bool ptr64  the target pointer width (#389 C1-7)
  * @return StackifyCtx | error  the fully-advanced context, or the first
  *                              propagated error
  */
-fn stackify_insts(ctx0: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, insts: []lir::LInst) -> StackifyCtx | error {
+fn stackify_insts(ctx0: StackifyCtx, f: lir::LFunc, symbols: WasmSymbolTable, insts: []lir::LInst, ptr64: bool) -> StackifyCtx | error {
     mut ctx = ctx0
     mut i: u64 = 0
     loop {
         if i >= insts.len { break }
-        let stepped = match stackify_inst(ctx, f, symbols, insts[i]) { StackifyCtx as c => c; error as e => return e }
+        let stepped = match stackify_inst(ctx, f, symbols, insts[i], ptr64) { StackifyCtx as c => c; error as e => return e }
         ctx = stepped
         i++
     }
@@ -3812,7 +3916,7 @@ fn edge_stop_matches(stop: EdgeStop, b: u32) -> bool {
  * RenderEnv — the read-only environment threaded through the whole
  * recursive region renderer: the LIR function (straight-line lowering
  * needs its `param_types`), its positionally-indexed blocks, the call-
- * target resolver, and its whole CFG analysis.
+ * target resolver, its whole CFG analysis, and the target pointer width.
  */
 type RenderEnv = struct {
     /**
@@ -3831,6 +3935,12 @@ type RenderEnv = struct {
      * cfg — the function's whole CFG analysis.
      */
     cfg: CfgInfo
+    /**
+     * ptr64 — the target pointer width (`false` = wasm32, the default;
+     * `true` = wasm64) — `LParam`/`LLoad`/`LStore`/`LCall`'s own `Ptr`-typed
+     * sites read this (#389 C1-7).
+     */
+    ptr64: bool
 }
 
 /**
@@ -4045,7 +4155,7 @@ fn render_straight(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, b: u32) ->
     if blk.insts.len == 0 {
         return error { message = "stackify: a block with no instructions has no terminator (internal)" }
     }
-    let stepped = match stackify_insts(ctx0, env.func, env.symbols, all_but_last(blk.insts)) { StackifyCtx as c => c; error as e => return e }
+    let stepped = match stackify_insts(ctx0, env.func, env.symbols, all_but_last(blk.insts), env.ptr64) { StackifyCtx as c => c; error as e => return e }
     render_terminator(stepped, env, stop, b, blk.insts[blk.insts.len - 1])
 }
 
@@ -4138,13 +4248,15 @@ fn render_region(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, b: u32) -> S
  * @param LFunc f  the function to lower (its `blocks` a reducible CFG)
  * @param WasmSymbolTable symbols  the call-target/data-symbol resolver
  *                                 (`LCall`/`LGlobalAddr`)
+ * @param bool ptr64  the target pointer width (`false` = wasm32, the
+ *                    default; #389 C1-7)
  * @return StackifyCtx | error  the fully-rendered context (its `body` NOT
  *                              yet closed by the function's own trailing
  *                              `end`), or a NAMED honest-stop
  *
  * @since #389 C1-3
  */
-pub fn stackify_control(f: lir::LFunc, symbols: WasmSymbolTable) -> StackifyCtx | error {
+pub fn stackify_control(f: lir::LFunc, symbols: WasmSymbolTable, ptr64: bool) -> StackifyCtx | error {
     if f.blocks.len == 0 {
         return error { message = "stackify: a function with no blocks has no entry (internal)" }
     }
@@ -4154,7 +4266,7 @@ pub fn stackify_control(f: lir::LFunc, symbols: WasmSymbolTable) -> StackifyCtx 
     if is_cfg_irreducible(cfg) {
         return err_irreducible("a multi-entry loop (a back-edge whose target does not dominate its source)")
     }
-    let env = RenderEnv { func = f; blocks = blocks; symbols = symbols; cfg = cfg }
+    let env = RenderEnv { func = f; blocks = blocks; symbols = symbols; cfg = cfg; ptr64 = ptr64 }
     let seed = StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = f.next_vreg; has_frame = false; frame_base = 0 to u32; slots = wst_empty(); elide = compute_func_elide(f); pending = teko::list::empty() }
     let allocas = collect_alloca_insts(f)
     let ctx0 = if allocas.len == 0 { seed } else { emit_frame_prologue(seed, compute_wasm_frame_layout(allocas)) }
@@ -4237,12 +4349,14 @@ pub type WasmFuncBody = struct {
  *
  * @param LFunc f  the function to lower
  * @param WasmSymbolTable calls  the call-target resolver (`LCall`)
+ * @param bool ptr64  the target pointer width (`false` = wasm32, the
+ *                    default; #389 C1-7)
  * @return WasmFuncBody | error  the lowered payload, or a propagated/named
  *                               honest-stop (`C1-irreducible`, an
  *                               instruction's own stop, or an internal error)
  */
-pub fn stackify_func(f: lir::LFunc, calls: WasmSymbolTable) -> WasmFuncBody | error {
-    let done = match stackify_control(f, calls) { StackifyCtx as c => c; error as e => return e }
+pub fn stackify_func(f: lir::LFunc, calls: WasmSymbolTable, ptr64: bool) -> WasmFuncBody | error {
+    let done = match stackify_control(f, calls, ptr64) { StackifyCtx as c => c; error as e => return e }
     let body = teko::list::push(done.body, 0x0B to byte)
     let groups = wasm_local_groups_of(done.vtypes, f.n_params, done.next_scratch)
     WasmFuncBody { local_groups = groups; body = body }
@@ -4408,16 +4522,61 @@ fn wasm_io_scratch_bytes() -> u32 {
 }
 
 /**
+ * wasm_narrow_msg_bytes — the fixed, compiler-owned ASCII message
+ * `stackify_narrow_ptr_load`'s panic call reports to the host (§6/§8, #389
+ * C1-7): the message string's raw UTF-8 bytes (never a `LModule.rodata`
+ * entry — the message exists regardless of what the PROGRAM interns, so it
+ * is reserved memory exactly like the io scratch region, not user rodata).
+ *
+ * @return []byte  the overflow message's raw ASCII bytes
+ */
+fn wasm_narrow_msg_bytes() -> []byte {
+    let s = "wasm32: pointer address overflow (>= 2^32)"
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        out = teko::list::push(out, s[i])
+        i++
+    }
+    out
+}
+
+/**
+ * wasm_narrow_msg_addr — the fixed linear-memory offset
+ * `wasm_narrow_msg_bytes` is placed at: right after the io/panic
+ * trampolines' own scratch region (`wasm_io_scratch_bytes`), mirroring
+ * `wasm_rodata_base`'s own "reserved infrastructure region, then the
+ * program's own data" placement rule.
+ *
+ * @return u32  the overflow message's own linear-memory offset
+ */
+fn wasm_narrow_msg_addr() -> u32 {
+    wasm_io_scratch_bytes()
+}
+
+/**
+ * wasm_narrow_msg_len — `wasm_narrow_msg_bytes`'s own byte length, as the
+ * `len` argument `stackify_narrow_ptr_load`'s `tk_panic_str` call pushes.
+ *
+ * @return u32  the overflow message's own byte length
+ */
+fn wasm_narrow_msg_len() -> u32 {
+    wasm_narrow_msg_bytes().len to u32
+}
+
+/**
  * wasm_rodata_base — the fixed linear-memory offset the program's rodata
  * starts at (§6.1's "rodata at a fixed low base"): right after the
- * io/panic trampolines' own scratch region (`wasm_io_scratch_bytes`), so no
- * real datum ever lands at the null address and no rodata byte ever
- * aliases the scratch iovec/newline buffer.
+ * io/panic trampolines' own scratch region (`wasm_io_scratch_bytes`) AND
+ * the reserved checked-narrow overflow message (`wasm_narrow_msg_bytes`,
+ * #389 C1-7), 8-byte aligned so no real datum ever lands at the null
+ * address and no rodata byte ever aliases either reserved region.
  *
  * @return u32  the rodata region's own base offset
  */
 fn wasm_rodata_base() -> u32 {
-    wasm_io_scratch_bytes()
+    wasm_align_up(wasm_narrow_msg_addr() + wasm_narrow_msg_len(), 8 to u32)
 }
 
 /**
@@ -4515,19 +4674,19 @@ fn wasm_register_program_symbols(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -
  * @return WasmFuncType | error  the translated signature, or a propagated
  *                               honest-stop
  */
-fn wasm_func_type_of(f: lir::LFunc) -> WasmFuncType | error {
+fn wasm_func_type_of(f: lir::LFunc, ptr64: bool) -> WasmFuncType | error {
     mut params: []byte = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= f.param_types.len { break }
-        let vt = match wasm_valtype(f.param_types[i]) { u8 as v => v; error as e => return e }
+        let vt = match wasm_valtype(f.param_types[i], ptr64) { u8 as v => v; error as e => return e }
         params = teko::list::push(params, vt to byte)
         i++
     }
     if f.ret_type == lir::LType::Void {
         return WasmFuncType { params = params; results = teko::list::empty() }
     }
-    let rvt = match wasm_valtype(f.ret_type) { u8 as v => v; error as e => return e }
+    let rvt = match wasm_valtype(f.ret_type, ptr64) { u8 as v => v; error as e => return e }
     WasmFuncType { params = params; results = [rvt to byte] }
 }
 
@@ -4541,15 +4700,16 @@ fn wasm_func_type_of(f: lir::LFunc) -> WasmFuncType | error {
  *
  * @param WasmWasiImportSet wasi  the WASI import set (its own two types)
  * @param []LFunc funcs  the module's defined functions
+ * @param bool ptr64  the target pointer width (#389 C1-7)
  * @return []WasmFuncType | error  the type table, or a propagated
  *                                 `wasm_func_type_of` honest-stop
  */
-fn wasm_build_program_types(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -> []WasmFuncType | error {
+fn wasm_build_program_types(wasi: WasmWasiImportSet, funcs: []lir::LFunc, ptr64: bool) -> []WasmFuncType | error {
     mut types = wasi.types
     mut i: u64 = 0
     loop {
         if i >= funcs.len { break }
-        let t = match wasm_func_type_of(funcs[i]) { WasmFuncType as x => x; error as e => return e }
+        let t = match wasm_func_type_of(funcs[i], ptr64) { WasmFuncType as x => x; error as e => return e }
         types = teko::list::push(types, t)
         i++
     }
@@ -4569,16 +4729,17 @@ fn wasm_build_program_types(wasi: WasmWasiImportSet, funcs: []lir::LFunc) -> []W
  * @param WasmWasiImportSet wasi  the WASI import set (its own import count)
  * @param []LFunc funcs  the module's defined functions
  * @param WasmSymbolTable symtab  the whole-program call-target resolver
+ * @param bool ptr64  the target pointer width (#389 C1-7)
  * @return []WasmFunc | error  the defined-function code entries, or a
  *                             propagated `stackify_func` honest-stop
  */
-fn wasm_build_program_funcs(wasi: WasmWasiImportSet, funcs: []lir::LFunc, symtab: WasmSymbolTable) -> []WasmFunc | error {
+fn wasm_build_program_funcs(wasi: WasmWasiImportSet, funcs: []lir::LFunc, symtab: WasmSymbolTable, ptr64: bool) -> []WasmFunc | error {
     mut out: []WasmFunc = teko::list::empty()
     let import_count = wasi.imports.len
     mut i: u64 = 0
     loop {
         if i >= funcs.len { break }
-        let body = match stackify_func(funcs[i], symtab) { WasmFuncBody as x => x; error as e => return e }
+        let body = match stackify_func(funcs[i], symtab, ptr64) { WasmFuncBody as x => x; error as e => return e }
         let type_index = (import_count + i) to u32
         out = teko::list::push(out, WasmFunc { type_index = type_index; local_groups = body.local_groups; body = body.body })
         i++
@@ -4977,6 +5138,49 @@ fn wasm_program_has_any_frame(funcs: []lir::LFunc) -> bool {
 }
 
 /**
+ * func_signature_has_ptr — whether `f`'s own signature (any parameter, or
+ * its return) names the `Ptr` machine class.
+ *
+ * @param LFunc f  the function to inspect
+ * @return bool  `true` iff `f` has a `Ptr`-typed parameter or return
+ */
+fn func_signature_has_ptr(f: lir::LFunc) -> bool {
+    if f.ret_type == lir::LType::Ptr {
+        return true
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= f.param_types.len { break }
+        if f.param_types[i] == lir::LType::Ptr { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * wasm_program_uses_ptr — a best-effort scan for whether ANY function in
+ * `funcs` names `Ptr` in its own signature (`func_signature_has_ptr`) — one
+ * of the three triggers `wasm_assemble_program`'s wasm64 scope guard tests
+ * (#389 C1-7, alongside `wasm_program_has_any_frame`/non-empty rodata). NOT
+ * an exhaustive instruction-level scan (it does not walk every `LFieldAddr`/
+ * `LGlobalAddr`/`Ptr`-typed `LLoad`/`LStore` site) — a genuinely thorough
+ * scan is a wider follow-up; this catches the common case (a `Ptr`-typed
+ * parameter or return, e.g. the `sft_rodata_func`-style shape) cheaply.
+ *
+ * @param []LFunc funcs  the module's defined functions
+ * @return bool  `true` iff some function's own signature names `Ptr`
+ */
+fn wasm_program_uses_ptr(funcs: []lir::LFunc) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        if func_signature_has_ptr(funcs[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
  * WasmMemoryPlan — the module's whole linear-memory layout decision (§6.1):
  * the laid-out rodata (`wasm_layout_rodata`), the module's own globals
  * (the `SP` global, present only when `wasm_program_has_any_frame`), and
@@ -5082,6 +5286,21 @@ fn wasm_memory_export() -> WasmExport {
 }
 
 /**
+ * wasm_scope_stop_wasm64 — the NAMED `C1-wasm64-scope` honest-stop (#389
+ * C1-7): today's wasm64 arm only supports the alloca-free, rodata-free,
+ * `Ptr`-signature-free program subset — `LFieldAddr`/`LAlloca`/`LGlobalAddr`
+ * and the shadow-stack `$sp` global still compute in `i32` unconditionally
+ * (§6.1's frame/rodata plumbing is not YET `ptr64`-threaded, a scoped
+ * follow-up), which would silently mismatch an `i64`-indexed `memory64`
+ * module. Fail loud (M.3) rather than emit an invalid module.
+ *
+ * @return error  the named `C1-wasm64-scope` honest-stop
+ */
+fn wasm_scope_stop_wasm64() -> error {
+    error { message = "stackify: C1-wasm64-scope — wasm64 today only supports a program with no LAlloca, no rodata, and no Ptr-typed signature (LFieldAddr/LAlloca/LGlobalAddr/$sp still compute in i32; threading ptr64 through them is a scoped follow-up)" }
+}
+
+/**
  * wasm_assemble_program — the whole own-backend wasm module assembler
  * (C1-5's "link/dispatch" job every earlier slice deferred here,
  * `backend-c1-wasm.md` §5.2/§9): the program's rodata laid out FIRST and
@@ -5105,31 +5324,50 @@ fn wasm_memory_export() -> WasmExport {
  * any per-function honest-stop unchanged (`C1-i128`/`C1-f16`/
  * `C1-irreducible`/an unresolved call/data symbol).
  *
+ * **The wasm64 switch (#389 C1-7, §6).** When `ptr64`, the program is first
+ * checked against `wasm_scope_stop_wasm64`'s own supported subset (no
+ * alloca, no rodata, no `Ptr`-typed signature — `wasm_program_has_any_
+ * frame`/`lmod.rodata`/`wasm_program_uses_ptr`); the io/panic trampolines
+ * (`fd_write`-based — WASI preview1's own ABI is `i32`-address-only, a
+ * genuine ecosystem wall against `memory64`, not a Teko gap) are OMITTED
+ * entirely rather than emitted invalid — a wasm64 program calling `print`/
+ * `panic` cleanly fails at `wasm_resolve_call`'s existing "unresolved call
+ * symbol" error. `proc_exit` (an address-free exit CODE parameter) stays
+ * imported either way. The module's own memory section flips to
+ * `memory64` (`WasmModule.mem_is64`, `objfile_wasm.tks`).
+ *
  * @param LModule lmod  the whole lowered program
+ * @param bool ptr64  the target pointer width (`false` = wasm32, the
+ *                    default; `true` = wasm64, #389 C1-7)
  * @return WasmModule | error  the assembled module, ready for `emit_wasm`,
  *                             or a propagated/named honest-stop
  */
-pub fn wasm_assemble_program(lmod: lir::LModule) -> WasmModule | error {
+pub fn wasm_assemble_program(lmod: lir::LModule, ptr64: bool) -> WasmModule | error {
     if lmod.globals.len > (0 to u64) {
         return wasm_honest_globals()
+    }
+    let has_io = !ptr64
+    if ptr64 && (wasm_program_has_any_frame(lmod.funcs) || lmod.rodata.len > (0 to u64) || wasm_program_uses_ptr(lmod.funcs)) {
+        return wasm_scope_stop_wasm64()
     }
     let wasi = wasm_wasi_import_set()
     let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
     let io_base_index = wasm_io_base_index(wasi, lmod)
-    let program_symtab = wasm_register_io_symbols(wasm_register_program_symbols(wasi, lmod.funcs), io_base_index)
+    let program_symtab_base = wasm_register_program_symbols(wasi, lmod.funcs)
+    let program_symtab = if has_io { wasm_register_io_symbols(program_symtab_base, io_base_index) } else { program_symtab_base }
     let symtab = wasm_symtab_add_rodata(program_symtab, rodata)
-    let types = match wasm_build_program_types(wasi, lmod.funcs) { []WasmFuncType as t => t; error as e => return e }
-    let funcs = match wasm_build_program_funcs(wasi, lmod.funcs, symtab) { []WasmFunc as f => f; error as e => return e }
+    let types = match wasm_build_program_types(wasi, lmod.funcs, ptr64) { []WasmFuncType as t => t; error as e => return e }
+    let funcs = match wasm_build_program_funcs(wasi, lmod.funcs, symtab, ptr64) { []WasmFunc as f => f; error as e => return e }
     let io_type_index = types.len to u32
     let io_type = WasmFuncType { params = [0x7F to byte, 0x7F to byte]; results = teko::list::empty() }
-    let types_with_io = teko::list::push(types, io_type)
-    let io_panic = wasm_synth_io_panic_funcs(io_type_index, wasi.fd_write_index)
-    let funcs_with_io = append_wasm_funcs(funcs, io_panic.funcs)
+    let types_with_io = if has_io { teko::list::push(types, io_type) } else { types }
+    let io_panic_funcs: []WasmFunc = if has_io { wasm_synth_io_panic_funcs(io_type_index, wasi.fd_write_index).funcs } else { teko::list::empty() }
+    let funcs_with_io = append_wasm_funcs(funcs, io_panic_funcs)
     let main_index = match wasm_find_main_index(wasi, lmod.funcs) { u32 as x => x; error as e => return e }
     let main_ret = match wasm_find_main_ret(lmod.funcs) { lir::LType as x => x; error as e => return e }
     let start_type_index = types_with_io.len to u32
     let start = match wasm_synth_start(start_type_index, main_index, wasi.proc_exit_index, main_ret) { WasmFunc as s => s; error as e => return e }
-    let start_index = io_base_index + (io_panic.funcs.len to u32)
+    let start_index = io_base_index + (io_panic_funcs.len to u32)
     let plan = wasm_program_memory_plan(lmod, rodata)
     WasmModule {
         types = teko::list::push(types_with_io, WasmFuncType { params = teko::list::empty(); results = teko::list::empty() })
@@ -5138,6 +5376,7 @@ pub fn wasm_assemble_program(lmod: lir::LModule) -> WasmModule | error {
         globals = plan.globals
         data = wasm_program_data_segments(plan.rodata)
         mem_min_pages = plan.mem_min_pages
+        mem_is64 = ptr64
         exports = [WasmExport { name = "_start"; kind = 0x00 to byte; index = start_index }, wasm_memory_export()]
     }
 }

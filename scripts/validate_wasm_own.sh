@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# scripts/validate_wasm_own.sh — the own-wasm-backend end-to-end gate (issue #389 C1-5/C1-6).
+# scripts/validate_wasm_own.sh — the own-wasm-backend end-to-end gate (issue #389 C1-5/C1-6/C1-7).
 #
 # The own AOT backend's wasm32-wasi target (TEKO_BACKEND=native TEKO_TARGET=wasm32-wasi)
 # emits a FINISHED, SELF-CONTAINED `.wasm` module directly (docs/design/backend-wasm.md
 # §1.2 — the module IMPORTS its runtime via WASI imports; there is NO relocatable-object
 # + external-linker step). Two independent checks, each own-committed and each honest-
 # skipped alone when its own tool is absent (never silently fabricating a pass):
+#
+# C1-7 adds the wasm64 switch (§6): one corpus fixture (`wasm64_arith_exit`) builds
+# under TEKO_TARGET=wasm64-wasi instead (the per-fixture TARGET array, `target_of`) —
+# its own-wasm leg passes wasmtime's `-W memory64=y` and wasm-validate's own
+# `--enable-memory64` (the memory64 proposal is not enabled by default in either tool).
 #
 #   1. STRUCTURAL — `wasm-validate` (WABT) accepts the emitted module (C1-5).
 #   2. EXECUTING  — `wasmtime run` actually RUNS it (C1-6, the leg #1's own header
@@ -107,7 +112,11 @@ fixture_root="$script_dir/examples/regressions"
 # wasm_defer_arm_scope (PR #553 review finding) is `print`-kind ON PURPOSE: a leaked
 # then-arm `defer` firing unconditionally past the if's merge is a STDOUT divergence
 # ("AB" vs the C-native oracle's "B"), not an exit-code one — the exact shape a bare
-# `exit`-kind fixture would silently miss.
+# `exit`-kind fixture would silently miss. `wasm64_arith_exit` (#389 C1-7, backend-
+# wasm.md §6) is the wasm64-switch proof — TARGET is a THIRD parallel array (default
+# "wasm32-wasi" via `target_of`'s own fallback) so this one fixture alone builds under
+# TEKO_TARGET=wasm64-wasi and its own-wasm leg runs with wasmtime's `-W memory64=y`/
+# wasm-validate's `--enable-memory64` (the memory64 proposal is NOT on by default).
 CORPUS=(
     own_exit_zero
     own_exit_code
@@ -118,6 +127,7 @@ CORPUS=(
     wasm_print_exit
     wasm_panic_hook
     wasm_defer_arm_scope
+    wasm64_arith_exit
 )
 KIND=(
     exit
@@ -129,6 +139,19 @@ KIND=(
     print
     trap
     print
+    exit
+)
+TARGET=(
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm64-wasi
 )
 
 kind_of() {
@@ -137,6 +160,18 @@ kind_of() {
         if [[ "${CORPUS[$i]}" == "$n" ]]; then printf '%s' "${KIND[$i]}"; return 0; fi
     done
     printf 'exit'
+}
+
+# target_of — the `TEKO_TARGET` value fixture `n` builds under: `TARGET`'s own entry
+# when `n` is a known corpus name, else the wasm32-wasi default (a fixture passed on the
+# command line, outside the named corpus, still gets a sane default rather than an
+# empty/invalid target).
+target_of() {
+    local n="$1" i
+    for i in "${!CORPUS[@]}"; do
+        if [[ "${CORPUS[$i]}" == "$n" ]]; then printf '%s' "${TARGET[$i]}"; return 0; fi
+    done
+    printf 'wasm32-wasi'
 }
 
 fixtures=()
@@ -158,9 +193,10 @@ echo
 # check_execution — the C1-6 wasmtime leg for one already-validated fixture: build +
 # run the C-native oracle, run own-wasm under `wasmtime run`, then compare per `kind`
 # (`exit`/`print` — exact; `trap` — nonzero-only). Prints PASS/FAIL itself and returns
-# non-zero on failure so the caller can bump its own counters.
+# non-zero on failure so the caller can bump its own counters. `target`'s own wasm64
+# arm (#389 C1-7) passes `-W memory64=y` — the memory64 proposal is not on by default.
 check_execution() {
-    local name="$1" proj="$2" wasmp="$3" kind="$4"
+    local name="$1" proj="$2" wasmp="$3" kind="$4" target="$5"
     local cout="$work/$name-c"
     ( unset TEKO_BACKEND; "$teko_abs" build "$proj" -o "$cout" ) >"$work/$name.cbuild" 2>&1
     if [[ $? -ne 0 ]]; then
@@ -170,7 +206,11 @@ check_execution() {
     fi
     "$cout/$name" >"$work/$name.cout" 2>&1
     local c_exit=$?
-    wasmtime run "$wasmp" >"$work/$name.wout" 2>"$work/$name.werr"
+    if [[ "$target" == "wasm64-wasi" ]]; then
+        wasmtime run -W memory64=y "$wasmp" >"$work/$name.wout" 2>"$work/$name.werr"
+    else
+        wasmtime run "$wasmp" >"$work/$name.wout" 2>"$work/$name.werr"
+    fi
     local w_exit=$?
     if [[ "$kind" == "trap" ]]; then
         if [[ "$w_exit" -eq 0 ]]; then
@@ -196,13 +236,14 @@ check_execution() {
 for proj in "${fixtures[@]}"; do
     name="$(basename "$proj")"
     oout="$work/$name-wasm"
+    target="$(target_of "$name")"
 
-    env TEKO_BACKEND=native TEKO_TARGET=wasm32-wasi "$teko_abs" build "$proj" -o "$oout" >"$work/$name.wbuild" 2>&1
+    env TEKO_BACKEND=native TEKO_TARGET="$target" "$teko_abs" build "$proj" -o "$oout" >"$work/$name.wbuild" 2>&1
     build_rc=$?
 
     if [[ "$build_rc" -ne 0 ]]; then
         fail=$((fail + 1)); failed_names+=("$name")
-        printf 'FAIL  %-16s own-wasm build failed (TEKO_BACKEND=native TEKO_TARGET=wasm32-wasi)\n' "$name"
+        printf 'FAIL  %-16s own-wasm build failed (TEKO_BACKEND=native TEKO_TARGET=%s)\n' "$name" "$target"
         tail -8 "$work/$name.wbuild" | sed 's/^/      | /'
         continue
     fi
@@ -223,17 +264,19 @@ for proj in "${fixtures[@]}"; do
 
     ok=1
     if [[ "$have_validate" -eq 1 ]]; then
-        if ! wasm-validate "$wasmp" >"$work/$name.validate" 2>&1; then
+        validate_flags=()
+        [[ "$target" == "wasm64-wasi" ]] && validate_flags+=(--enable-memory64)
+        if ! wasm-validate "${validate_flags[@]}" "$wasmp" >"$work/$name.validate" 2>&1; then
             fail=$((fail + 1)); failed_names+=("$name")
             printf 'FAIL  %-16s wasm-validate rejected the emitted %s.wasm\n' "$name" "$name"
             tail -8 "$work/$name.validate" | sed 's/^/      | /'
             ok=0
         else
-            printf 'PASS  %-16s own-wasm module wasm-validate-clean\n' "$name"
+            printf 'PASS  %-16s own-wasm module wasm-validate-clean (target=%s)\n' "$name" "$target"
         fi
     fi
     if [[ "$ok" -eq 1 && "$have_wasmtime" -eq 1 ]]; then
-        if ! check_execution "$name" "$proj" "$wasmp" "$(kind_of "$name")"; then
+        if ! check_execution "$name" "$proj" "$wasmp" "$(kind_of "$name")" "$target"; then
             fail=$((fail + 1)); failed_names+=("$name")
             ok=0
         fi
