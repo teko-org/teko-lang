@@ -4,16 +4,15 @@
 # (TEKO_SOURCE.md + TEKO_CHECKER.md): every fenced code block was moved into its
 # own file under src/. Two coexisting layers live here:
 #   * .tks / .tkt — the canonical Teko source (lexer→parser→checker→emit), the
-#     real language; a future Teko toolchain compiles these.
+#     real language; the Teko toolchain (the downloaded release seed) compiles these.
 #   * .h / .c     — the C23 bootstrap mirror of the same algorithms.
 #
-# NOTE (M.4 — do not build on the incomplete): the C mirror is NOT yet a complete,
-# linkable program — the pipeline (read→lex→parse→check→codegen) is not wired, there
-# is no main, and the parser C mirror is partial (headers). (The lexer C mirror is
-# now materialized — token.h/lexer.h/lexer.c — and compiles clean.) This file
-# establishes the PROJECT STRUCTURE; it is
-# intentionally not expected to compile/link as-is. Targets are listed so the tree is
-# navigable and ready to be wired incrementally.
+# NOTE (M.4 — do not build on the incomplete): the C mirror is a frozen front-end
+# COMPILE-REGRESSION GUARD, not a runnable program. Since #524 (VM retirement) the
+# vestigial C-bootstrap `teko` executable (main.c + src/driver.c, which #include'd
+# vm/vm.h) is retired: the compiler seed is the downloaded release (CI never invokes
+# cmake). What remains is the `teko_bootstrap` STATIC library — archiving it guards the
+# C front-end mirror against compile regressions.
 
 cmake_minimum_required(VERSION 3.20)
 project(teko_bootstrap LANGUAGES C)
@@ -33,8 +32,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 set(TEKO_TEXT_SOURCES
     src/text/text.c)
 
-# teko::assert — the C seed of assert.tks (the injected testing assertions). Shared by the
-# VM (linked via the lib) and generated programs (driver.c hands it to the host cc).
+# teko::assert — the C seed of assert.tks (the injected testing assertions), archived
+# into the front-end guard library alongside the rest of the C mirror.
 set(TEKO_ASSERT_SOURCES
     src/assert/assert.c)
 
@@ -91,16 +90,10 @@ set(TEKO_EMIT_SOURCES
 set(TEKO_CODEGEN_SOURCES
     src/codegen/codegen.c)
 
-# --- Eixo D: the VM / interpreter — the test/debug execution engine (Stage-1) ---
-# Tree-walks the checked typed tree directly (no .tkb, no codegen); mirrors codegen
-# semantics. `teko run` executes a program on it; D2 will run tests on it.
-set(TEKO_VM_SOURCES
-    src/vm/vm.c)
-
-# The bootstrap mirror as one static library. The whole C front-end + checker + emit
-# compiles (F0 done); the default build now archives it, guarding the mirror against
-# compile regressions. It is not yet linked into an executable — the driver (F1) will
-# link `teko` against it once the pipeline is wired.
+# The bootstrap mirror as one static library — the frozen front-end COMPILE-REGRESSION
+# GUARD. The whole C front-end + checker + emit + codegen compiles (F0 done); the default
+# build archives it. It is not linked into an executable: since #524 the compiler seed is
+# the downloaded release, so the C-bootstrap `teko` exe (and the VM's vm.c) are retired.
 add_library(teko_bootstrap STATIC
     ${TEKO_TEXT_SOURCES}
     ${TEKO_ASSERT_SOURCES}
@@ -109,86 +102,4 @@ add_library(teko_bootstrap STATIC
     ${TEKO_PARSER_SOURCES}
     ${TEKO_CHECKER_SOURCES}
     ${TEKO_EMIT_SOURCES}
-    ${TEKO_CODEGEN_SOURCES}
-    ${TEKO_VM_SOURCES})
-
-# --- F1: the driver — path-to-first-binary -----------------------------------
-# `teko` is now the REAL driver: read -> lex -> parse -> reconcile -> check, wired in
-# src/driver.c and linked against the bootstrap mirror library. (Codegen/emit is F2;
-# success here means the front-end pipeline ran and the program type-checked.)
-# The VM (`teko run`) calls the execution-runtime symbols (tk_print/tk_panic_*/
-# teko__assert__*), so the compiler binary itself links teko_rt.c — the same source the
-# driver also hands to the host cc for generated programs. It is kept an EXE source (not in
-# the lib) so it is never double-linked into the generated programs the driver builds.
-add_executable(teko main.c src/driver.c src/runtime/teko_rt.c src/win32_int128_builtins.c)
-target_link_libraries(teko PRIVATE teko_bootstrap)
-# vm.c calls floor() via the f64 arithmetic path; Linux requires explicit -lm linkage.
-if(UNIX AND NOT APPLE)
-    target_link_libraries(teko PRIVATE m)
-endif()
-# src/win32_int128_builtins.c provides __divti3/__udivti3/__modti3/__umodti3/
-# __floattidf/__floatuntidf/__fixdfti/__fixunsdfti — the compiler-rt builtins
-# needed for __int128 arithmetic on Windows. Clang on MSVC ABI does not
-# auto-link these; the file is all-#ifdef _WIN32 so it is a no-op on POSIX.
-# The VM interpreter uses deep C recursion when running the Teko parser/lexer during
-# `teko test` (each Teko function call adds ~4 C frames; parsing 66 files × recursive
-# descent easily exceeds the default 8MB main-thread stack). Set to 64MB to give enough room.
-if(APPLE)
-    target_link_options(teko PRIVATE "-Wl,-stack_size,0x4000000")
-elseif(WIN32)
-    # lld-link /STACK:reserve — 64 MB, matching Linux/macOS.  Without this the
-    # 1 MB Windows default overflows mid-test and the process exits with code 1.
-    target_link_options(teko PRIVATE "-Wl,/STACK:67108864")
-elseif(UNIX)
-    target_link_options(teko PRIVATE "-Wl,-z,stacksize=67108864")
-endif()
-
-# F3: the generated programs link the minimal execution runtime (libteko_rt).
-# teko needs the runtime's location to pass -I and the runtime source to the host cc.
-target_compile_definitions(teko PRIVATE
-    TK_RT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/runtime"
-    TK_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src")
-
-# --- CLI --version: embed the RAW teko.tkp version as a compile-time constant ----------------
-# The manifest (teko.tkp) is the SINGLE SOURCE OF TRUTH for the version (memory:
-# teko-release-versioning-rule). Parse its `version` + `suffix` at CONFIGURE time and define
-# TEKO_VERSION_STRING = "<version>[-<suffix>]" (RAW — no "4th field = published gen" release
-# substitution; that lives only in scripts/derive_version.sh / release.yml, untouched here).
-# tk_rt_version() (teko_rt.c) reads this define; main.c / main.tks print it for `--version`.
-# The self-hosted build mirrors this via run_cc's -DTEKO_VERSION_STRING (driver.c / project.tks),
-# so the bootstrap and self-host binaries embed byte-identically. teko_rt.c is a source of the
-# `teko` executable, so a target-level define reaches its compilation.
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/teko.tkp" _teko_tkp_contents)
-# `version = "A.B.C.D"` — first match wins; tolerate spaces around `=` and quotes.
-string(REGEX MATCH "\n[ \t]*version[ \t]*=[ \t]*\"([^\"]*)\"" _tkp_ver_match "\n${_teko_tkp_contents}")
-set(TEKO_MANIFEST_VERSION "${CMAKE_MATCH_1}")
-# `suffix = "…"` — may be empty (a stable release) or absent.
-string(REGEX MATCH "\n[ \t]*suffix[ \t]*=[ \t]*\"([^\"]*)\"" _tkp_suf_match "\n${_teko_tkp_contents}")
-set(TEKO_MANIFEST_SUFFIX "${CMAKE_MATCH_1}")
-if(NOT TEKO_MANIFEST_VERSION)
-    message(FATAL_ERROR "CMake: could not read `version` from teko.tkp (needed for TEKO_VERSION_STRING)")
-endif()
-if(TEKO_MANIFEST_SUFFIX)
-    set(TEKO_VERSION_STRING "${TEKO_MANIFEST_VERSION}-${TEKO_MANIFEST_SUFFIX}")
-else()
-    set(TEKO_VERSION_STRING "${TEKO_MANIFEST_VERSION}")
-endif()
-message(STATUS "teko: TEKO_VERSION_STRING = ${TEKO_VERSION_STRING} (from teko.tkp)")
-target_compile_definitions(teko PRIVATE
-    TEKO_VERSION_STRING=${TEKO_VERSION_STRING})
-
-# --- SELF-HOST: the native build of teko's OWN corpus — THE end-to-end validation ----------
-# `teko build .` runs the full pipeline (read → lex → parse → check → native codegen → cc link),
-# emitting ./bin/teko. This is the gating proof: if this fails, the native backend is not coherent,
-# so nothing downstream is guaranteed. Run it with:  cmake --build build --target selfhost
-# (equivalently, by hand:  ./build/teko build .  from the project root → ./bin/teko).
-add_custom_target(selfhost
-    # The self-build runs the D4 test gate like any other build (`--no-test` is no longer honored —
-    # a release must run its tests). The compiler's own `.tkt` corpus is VM-runnable and passes in
-    # both vm.c (build/teko) and vm.tks (bin/teko). (See TEKO_MASTER_PLAN.md Phase 7 D4.)
-    COMMAND $<TARGET_FILE:teko> build ${CMAKE_CURRENT_SOURCE_DIR}
-    DEPENDS teko
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "self-host: native build of teko's own corpus -> ./bin/teko (THE validation gate)"
-    USES_TERMINAL
-    VERBATIM)
+    ${TEKO_CODEGEN_SOURCES})
