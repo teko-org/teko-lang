@@ -2270,6 +2270,21 @@ fn sft_alloca_func() -> lir::LFunc {
 }
 
 /**
+ * sft_ptr_load_func — a `Void`-returning `LFunc` with ONE `Ptr`-typed
+ * parameter, ONE `Ptr`-typed `LLoad` off it, then `ret` — the `wasm_
+ * program_has_ptr_load` / `wasm_assemble_program`'s checked-narrow-panic-
+ * message reachability gate "some function loads a `Ptr`" fixture (#389
+ * C1-7 review finding #1).
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_ptr_load_func() -> lir::LFunc {
+    let insts = [lir::param_inst(0, 0, 0, 0), lir::load_inst(1, 0, lir::LType::Ptr, 0, 0), lir::ret_void_inst(0, 0)]
+    let block = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    lir::LFunc { symbol = "teko__test__ptrload"; n_params = 1 to u32; param_types = [lir::LType::Ptr]; ret_type = lir::LType::Void; blocks = [block]; next_vreg = 2 to u32 }
+}
+
+/**
  * sft_i128_ret_func — a `Void`-param, `I128`-returning `LFunc` — `wasm_
  * func_type_of`'s own honest-stop (`C1-i128`) fixture, its return side.
  *
@@ -2546,6 +2561,32 @@ fn program_has_any_frame_false_with_no_alloca_anywhere() {
 
 #test
 /**
+ * program_has_ptr_load_true_when_some_func_loads_a_ptr — a two-function
+ * list, `main` first (no `Ptr`-typed `LLoad`) then `sft_ptr_load_func` —
+ * `true` overall (#389 C1-7 review finding #1, the checked-narrow-panic-
+ * message reachability gate).
+ *
+ * @return void
+ */
+fn program_has_ptr_load_true_when_some_func_loads_a_ptr() {
+    teko::assert::is_true(wasm_program_has_ptr_load([sft_main_func(), sft_ptr_load_func()]))
+}
+
+#test
+/**
+ * program_has_ptr_load_false_with_no_ptr_load_anywhere — neither `sft_main_
+ * func` nor `sft_alloca_func` contains a `Ptr`-typed `LLoad` (an `LAlloca`
+ * site is a `Ptr`-VALUED result, never a `Ptr`-typed LOAD, so `sft_alloca_
+ * func` does not itself trip this scan).
+ *
+ * @return void
+ */
+fn program_has_ptr_load_false_with_no_ptr_load_anywhere() {
+    teko::assert::is_true(!wasm_program_has_ptr_load([sft_main_func(), sft_alloca_func()]))
+}
+
+#test
+/**
  * program_data_segments_omits_an_empty_rodata_layout — a rodata layout
  * with zero interned bytes yields NO data segment at all (not one framed
  * empty segment).
@@ -2570,6 +2611,61 @@ fn program_data_segments_keeps_a_nonempty_rodata_layout() {
     let segs = wasm_program_data_segments(layout)
     teko::assert::is_true(segs.len == (1 to u64))
     teko::assert::is_true(segs[0].offset == (8 to u32))
+}
+
+#test
+/**
+ * narrow_msg_segment_carries_the_reserved_message_at_its_own_fixed_addr —
+ * `wasm_narrow_msg_segment`'s own offset/bytes match `wasm_narrow_msg_addr`/
+ * `_bytes` exactly (#389 C1-7 review finding #1 — the segment the trap's
+ * own `fd_write` needs actually present at the address `tk_panic_str`'s
+ * call site hands it).
+ *
+ * @return void
+ */
+fn narrow_msg_segment_carries_the_reserved_message_at_its_own_fixed_addr() {
+    let seg = wasm_narrow_msg_segment()
+    teko::assert::is_true(seg.offset == wasm_narrow_msg_addr())
+    teko::assert::is_true(wasm_bytes_eq(seg.bytes, wasm_narrow_msg_bytes()))
+}
+
+#test
+/**
+ * program_narrow_msg_segments_empty_on_wasm64 — the wasm64 gate: even a
+ * program with a `Ptr`-typed `LLoad` gets NO narrow-message segment when
+ * `ptr64` (the checked narrow is elided entirely on wasm64, §6).
+ *
+ * @return void
+ */
+fn program_narrow_msg_segments_empty_on_wasm64() {
+    teko::assert::is_true(wasm_program_narrow_msg_segments([sft_ptr_load_func()], true).len == (0 to u64))
+}
+
+#test
+/**
+ * program_narrow_msg_segments_empty_with_no_ptr_load — a wasm32 program
+ * with no `Ptr`-typed `LLoad` anywhere gets NO narrow-message segment (a
+ * dead segment would otherwise sit at offset `16` unreachably).
+ *
+ * @return void
+ */
+fn program_narrow_msg_segments_empty_with_no_ptr_load() {
+    teko::assert::is_true(wasm_program_narrow_msg_segments([sft_main_func()], false).len == (0 to u64))
+}
+
+#test
+/**
+ * program_narrow_msg_segments_present_when_reachable_on_wasm32 — a wasm32
+ * program with a `Ptr`-typed `LLoad` gets EXACTLY the reserved message
+ * segment, at `wasm_narrow_msg_addr`.
+ *
+ * @return void
+ */
+fn program_narrow_msg_segments_present_when_reachable_on_wasm32() {
+    let segs = wasm_program_narrow_msg_segments([sft_ptr_load_func()], false)
+    teko::assert::is_true(segs.len == (1 to u64))
+    teko::assert::is_true(segs[0].offset == wasm_narrow_msg_addr())
+    teko::assert::is_true(wasm_bytes_eq(segs[0].bytes, wasm_narrow_msg_bytes()))
 }
 
 #test
@@ -2749,6 +2845,45 @@ fn assemble_program_resolves_rodata_symbols_before_stackifying() {
     let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
     teko::assert::is_true(m.data.len == (1 to u64))
     teko::assert::is_true(m.data[0].offset == wasm_rodata_base())
+}
+
+#test
+/**
+ * assemble_program_wasm32_emits_the_narrow_msg_segment_when_reachable — a
+ * wasm32 program with a `Ptr`-typed `LLoad` (`sft_ptr_load_func`, alongside
+ * `sft_main_func`'s own `main`) gets the reserved narrow-message segment in
+ * its own data section, at `wasm_narrow_msg_addr` (#389 C1-7 review finding
+ * #1 — before this fix `m.data` never carried it at all, so a trap through
+ * `tk_panic_str` printed 42 NUL bytes instead of the structured message).
+ *
+ * @return void
+ */
+fn assemble_program_wasm32_emits_the_narrow_msg_segment_when_reachable() {
+    let lmod = lir::LModule { funcs = [sft_main_func(), sft_ptr_load_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.data.len == (1 to u64))
+    teko::assert::is_true(m.data[0].offset == wasm_narrow_msg_addr())
+    teko::assert::is_true(wasm_bytes_eq(m.data[0].bytes, wasm_narrow_msg_bytes()))
+}
+
+#test
+/**
+ * assemble_program_wasm32_orders_the_narrow_msg_segment_before_rodata — a
+ * program that BOTH loads a `Ptr` value AND interns rodata gets TWO data
+ * segments: the reserved narrow-message segment first (offset `wasm_
+ * narrow_msg_addr`), the program's own rodata second (offset `wasm_rodata_
+ * base`) — the append order `wasm_assemble_program`'s own `data` field
+ * builds (#389 C1-7 review finding #1).
+ *
+ * @return void
+ */
+fn assemble_program_wasm32_orders_the_narrow_msg_segment_before_rodata() {
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let lmod = lir::LModule { funcs = [sft_main_func(), sft_ptr_load_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.data.len == (2 to u64))
+    teko::assert::is_true(m.data[0].offset == wasm_narrow_msg_addr())
+    teko::assert::is_true(m.data[1].offset == wasm_rodata_base())
 }
 
 #test

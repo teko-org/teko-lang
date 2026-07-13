@@ -4566,6 +4566,21 @@ fn wasm_narrow_msg_len() -> u32 {
 }
 
 /**
+ * wasm_narrow_msg_segment — the checked-narrow panic message's own active
+ * data segment (#389 C1-7 review finding #1, `backend-wasm.md` §6/§8's
+ * "observe, then trap" contract): `wasm_narrow_msg_bytes` placed at `wasm_
+ * narrow_msg_addr` — the SAME address `stackify_narrow_ptr_load`'s
+ * `tk_panic_str` call already hands the host. Without this segment linear
+ * memory stays zero-initialized at that address, so the trap's own
+ * `fd_write` would report 42 NUL bytes instead of the structured message.
+ *
+ * @return WasmDataSegment  the reserved overflow-message segment
+ */
+fn wasm_narrow_msg_segment() -> WasmDataSegment {
+    WasmDataSegment { offset = wasm_narrow_msg_addr(); bytes = wasm_narrow_msg_bytes() }
+}
+
+/**
  * wasm_rodata_base — the fixed linear-memory offset the program's rodata
  * starts at (§6.1's "rodata at a fixed low base"): right after the
  * io/panic trampolines' own scratch region (`wasm_io_scratch_bytes`) AND
@@ -5138,6 +5153,68 @@ fn wasm_program_has_any_frame(funcs: []lir::LFunc) -> bool {
 }
 
 /**
+ * inst_is_ptr_load — whether `inst` is an `LLoad` whose own machine class is
+ * `Ptr` (`stackify_load`'s own wasm32 checked-narrow trigger, #389 C1-7
+ * review finding #1) — `wasm_program_has_ptr_load`'s own per-instruction
+ * predicate, mirroring `inst_is_alloca`'s shape over a different op.
+ *
+ * @param LInst inst  the instruction to test
+ * @return bool  true iff `inst.op` is an `LLoad` of `Ptr`
+ */
+fn inst_is_ptr_load(inst: lir::LInst) -> bool {
+    match inst.op {
+        lir::LLoad as l => l.ty == lir::LType::Ptr
+        _ => false
+    }
+}
+
+/**
+ * func_has_ptr_load — whether `f` contains at least one `Ptr`-typed `LLoad`
+ * anywhere in its own blocks (`inst_is_ptr_load`'s own per-function scan,
+ * mirroring `collect_alloca_insts`' block/instruction walk shape).
+ *
+ * @param LFunc f  the function to scan
+ * @return bool  true iff some instruction in `f` is a `Ptr`-typed `LLoad`
+ */
+fn func_has_ptr_load(f: lir::LFunc) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let insts = f.blocks[bi].insts
+        mut ii: u64 = 0
+        loop {
+            if ii >= insts.len { break }
+            if inst_is_ptr_load(insts[ii]) { return true }
+            ii++
+        }
+        bi++
+    }
+    false
+}
+
+/**
+ * wasm_program_has_ptr_load — does ANY function in `funcs` contain at least
+ * one `Ptr`-typed `LLoad` (the wasm32 checked-narrow's own reachability
+ * test, #389 C1-7 review finding #1): the checked-narrow panic message's
+ * own data segment (`wasm_narrow_msg_segment`) is only ever emitted when
+ * this is `true` — a program that never loads a `Ptr` value never
+ * stackifies `stackify_narrow_ptr_load` (`stackify_load`'s own guard), so
+ * the message would otherwise be a dead data segment.
+ *
+ * @param []LFunc funcs  the module's defined functions
+ * @return bool  true iff some function has at least one `Ptr`-typed `LLoad`
+ */
+fn wasm_program_has_ptr_load(funcs: []lir::LFunc) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        if func_has_ptr_load(funcs[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
  * func_signature_has_ptr — whether `f`'s own signature (any parameter, or
  * its return) names the `Ptr` machine class.
  *
@@ -5254,6 +5331,45 @@ fn wasm_program_data_segments(rodata: WasmRodataLayout) -> []WasmDataSegment {
 }
 
 /**
+ * append_wasm_data_segments — every entry of `src` appended onto `segs`, in
+ * order (`[]WasmDataSegment` has no built-in concat; mirrors `append_wasm_
+ * funcs`'s own shape over a different element type).
+ *
+ * @param []WasmDataSegment segs  the list to extend
+ * @param []WasmDataSegment src  the entries to append
+ * @return []WasmDataSegment  `segs` followed by `src`
+ */
+fn append_wasm_data_segments(segs: []WasmDataSegment, src: []WasmDataSegment) -> []WasmDataSegment {
+    mut out = segs
+    mut i: u64 = 0
+    loop {
+        if i >= src.len { break }
+        out = teko::list::push(out, src[i])
+        i++
+    }
+    out
+}
+
+/**
+ * wasm_program_narrow_msg_segments — the checked-narrow panic message's own
+ * data segment, gated to the program that can actually reach it (#389 C1-7
+ * review finding #1): empty on wasm64 (`ptr64` — the checked narrow is
+ * elided entirely, §6) or when no function loads a `Ptr` value (`wasm_
+ * program_has_ptr_load`) — never a dead segment in a module whose narrow
+ * path can never trap through it.
+ *
+ * @param []LFunc funcs  the module's defined functions
+ * @param bool ptr64  the target pointer width (#389 C1-7)
+ * @return []WasmDataSegment  zero or one data segment
+ */
+fn wasm_program_narrow_msg_segments(funcs: []lir::LFunc, ptr64: bool) -> []WasmDataSegment {
+    if ptr64 || !wasm_program_has_ptr_load(funcs) {
+        return teko::list::empty()
+    }
+    [wasm_narrow_msg_segment()]
+}
+
+/**
  * wasm_io_base_index — the first io/panic trampoline's own absolute funcidx
  * (`wasm_synth_io_panic_funcs`'s fixed `print, println, eprint, eprintln,
  * panic_str` order starts here): right after every `LModule.funcs` entry,
@@ -5324,6 +5440,16 @@ fn wasm_scope_stop_wasm64() -> error {
  * any per-function honest-stop unchanged (`C1-i128`/`C1-f16`/
  * `C1-irreducible`/an unresolved call/data symbol).
  *
+ * **The checked-narrow panic message (#389 C1-7 review finding #1,
+ * `backend-wasm.md` §6/§8).** The module's own data section is the
+ * checked-narrow panic message's own segment (`wasm_program_narrow_msg_
+ * segments` — reserved at `wasm_narrow_msg_addr`, gated to a wasm32 program
+ * that actually loads a `Ptr` value, `wasm_program_has_ptr_load`) FOLLOWED
+ * by the program's own rodata (`wasm_program_data_segments`) — without it,
+ * a trap through `stackify_narrow_ptr_load`'s `tk_panic_str` call would
+ * report 42 NUL bytes (zero-initialized linear memory) instead of the
+ * structured overflow message.
+ *
  * **The wasm64 switch (#389 C1-7, §6).** When `ptr64`, the program is first
  * checked against `wasm_scope_stop_wasm64`'s own supported subset (no
  * alloca, no rodata, no `Ptr`-typed signature — `wasm_program_has_any_
@@ -5374,7 +5500,7 @@ pub fn wasm_assemble_program(lmod: lir::LModule, ptr64: bool) -> WasmModule | er
         imports = wasi.imports
         funcs = teko::list::push(funcs_with_io, start)
         globals = plan.globals
-        data = wasm_program_data_segments(plan.rodata)
+        data = append_wasm_data_segments(wasm_program_narrow_msg_segments(lmod.funcs, ptr64), wasm_program_data_segments(plan.rodata))
         mem_min_pages = plan.mem_min_pages
         mem_is64 = ptr64
         exports = [WasmExport { name = "_start"; kind = 0x00 to byte; index = start_index }, wasm_memory_export()]
