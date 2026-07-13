@@ -50,10 +50,10 @@
 
 ## Governing constraints (hold throughout every phase)
 
-- **SUPREME RULE** — zero `.c`/`.h` ↔ `.tks` misalignment. Every C change is mirrored to its Teko twin.
-- **Differential equivalence** — VM (`teko run`) == native (`teko build`) on every validated change.
+- **RULED SUPERSEDED 2026-07-13 (#524 crumb 5):** the previous SUPREME RULE (zero `.c`/`.h` ↔ `.tks` misalignment, every C change mirrored to Teko twin) is retired. The frozen C bootstrap (`0.0.1.3-bootstrap` tag) is archived in git history; `teko_rt.c` (runtime seam) is maintained; native is the sole execution engine (#524 VM retirement, 2026-07-13).
+- **Native is the sole execution engine** — the VM is retired; all execution paths are native (AOT). `teko run` = native debug build-and-exec. `teko test .` = native test gate. The release binary seeds all CI.
 - **Laws M.0–M.5** (`TEKO_CONSTITUTION.md`) govern all design rulings; tensions → tribunal, not guesswork.
-- **Commit at green checkpoints** — build green + regressions `match_pattern_bindings==5` / `optionals==6`.
+- **Commit at green checkpoints** — build green + regressions from the current native gate.
 - **DRY-LAST RULING (legislator)** — the whole-codebase DRY refactor is the FINAL phase. Every other open
   item lands first, so DRY sweeps settled code, not a moving target.
 
