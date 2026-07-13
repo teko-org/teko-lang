@@ -53,6 +53,7 @@ fn wt_empty_module() -> WasmModule {
         globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
+        mem_is64 = false
         exports = teko::list::empty()
     }
 }
@@ -73,6 +74,7 @@ fn wt_empty_main_module() -> WasmModule {
         globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
+        mem_is64 = false
         exports = [WasmExport { name = "main"; kind = 0x00 to byte; index = 0 to u32 }]
     }
 }
@@ -92,6 +94,7 @@ fn wt_import_only_module() -> WasmModule {
         globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
+        mem_is64 = false
         exports = teko::list::empty()
     }
 }
@@ -110,6 +113,27 @@ fn wt_memory_only_module() -> WasmModule {
         globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 1 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_memory64_only_module — `wt_memory_only_module`'s wasm64 twin (#389
+ * C1-7, `backend-wasm.md` §6): the SAME one-page memory, but `mem_is64 =
+ * true` — the memory-section `is64` limits flag bit distinguishes it.
+ *
+ * @return WasmModule  the memory64-only module
+ */
+fn wt_memory64_only_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 1 to u32
+        mem_is64 = true
         exports = teko::list::empty()
     }
 }
@@ -129,6 +153,30 @@ fn wt_data_segment_module() -> WasmModule {
         globals = teko::list::empty()
         data = [WasmDataSegment { offset = 0 to u32; bytes = [0x68 to byte, 0x69 to byte] }]
         mem_min_pages = 1 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_narrow_msg_and_rodata_module — a 1-page memory plus TWO active data
+ * segments: the checked-narrow panic message (`wasm_narrow_msg_bytes`) at
+ * its own fixed offset (`wasm_narrow_msg_addr`), followed by a small rodata
+ * segment at offset `64` — the exact shape `wasm_assemble_program` emits
+ * for a wasm32 program whose narrow path is reachable (#389 C1-7 review
+ * finding #1).
+ *
+ * @return WasmModule  the two-segment module
+ */
+fn wt_narrow_msg_and_rodata_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = [WasmDataSegment { offset = wasm_narrow_msg_addr(); bytes = wasm_narrow_msg_bytes() }, WasmDataSegment { offset = 64 to u32; bytes = [0x68 to byte, 0x69 to byte] }]
+        mem_min_pages = 1 to u32
+        mem_is64 = false
         exports = teko::list::empty()
     }
 }
@@ -148,6 +196,7 @@ fn wt_locals_func_module() -> WasmModule {
         globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
+        mem_is64 = false
         exports = [WasmExport { name = "f"; kind = 0x00 to byte; index = 0 to u32 }]
     }
 }
@@ -171,6 +220,7 @@ fn wt_kitchen_sink_module() -> WasmModule {
         globals = teko::list::empty()
         data = [WasmDataSegment { offset = 0 to u32; bytes = [0x78 to byte] }]
         mem_min_pages = 1 to u32
+        mem_is64 = false
         exports = [WasmExport { name = "main"; kind = 0x00 to byte; index = 1 to u32 }]
     }
 }
@@ -191,6 +241,7 @@ fn wt_sp_global_module() -> WasmModule {
         globals = [WasmGlobal { valtype = 0x7F to u8; mutable = true; init = 1024 to i64 }]
         data = teko::list::empty()
         mem_min_pages = 0 to u32
+        mem_is64 = false
         exports = teko::list::empty()
     }
 }
@@ -213,6 +264,7 @@ fn wt_wasi_import_module() -> WasmModule {
         globals = teko::list::empty()
         data = teko::list::empty()
         mem_min_pages = 0 to u32
+        mem_is64 = false
         exports = teko::list::empty()
     }
 }
@@ -387,6 +439,25 @@ fn memory_section_matches_wat2wasm_reference() {
 
 #test
 /**
+ * memory64_section_sets_the_is64_limits_flag — the wasm64 switch (#389
+ * C1-7, `backend-wasm.md` §6): the SAME one-page memory as `wt_memory_only_
+ * module`, but `mem_is64 = true` flips the limits flag byte from `0x00`
+ * (min-only, 32-bit) to `0x04` (min-only, `memory64`) — everything else
+ * (the memory count, the page count) is byte-identical.
+ *
+ * @return void
+ */
+fn memory64_section_sets_the_is64_limits_flag() {
+    let got = emit_wasm(wt_memory64_only_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x05 to byte, 0x03 to byte, 0x01 to byte, 0x04 to byte, 0x01 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
  * data_section_matches_wat2wasm_reference — a memory-plus-one-data-segment
  * module (the active-segment `i32.const` offset-expression shape),
  * byte-for-byte identical to `wat2wasm`.
@@ -399,6 +470,37 @@ fn data_section_matches_wat2wasm_reference() {
         0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
         0x05 to byte, 0x03 to byte, 0x01 to byte, 0x00 to byte, 0x01 to byte, 0x0B to byte, 0x08 to byte, 0x01 to byte,
         0x00 to byte, 0x41 to byte, 0x00 to byte, 0x0B to byte, 0x02 to byte, 0x68 to byte, 0x69 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * narrow_msg_data_segment_matches_the_traced_golden — the checked-narrow
+ * panic message's own active data segment (offset `16`, `41 10 0B` init
+ * expr, ULEB128 length `42`, then its 42 raw ASCII bytes), followed by the
+ * rodata segment at offset `64` (`41 C0 00 0B` — `64`'s own SLEB128 form
+ * needs a continuation byte, `sleb128_continuation_boundary_and_doc_
+ * golden`'s same shape), byte-for-byte (#389 C1-7 review finding #1 —
+ * before this fix the message was never placed in linear memory at all, so
+ * a trap through `tk_panic_str` printed 42 NUL bytes instead).
+ *
+ * @return void
+ */
+fn narrow_msg_data_segment_matches_the_traced_golden() {
+    let got = emit_wasm(wt_narrow_msg_and_rodata_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x05 to byte, 0x03 to byte, 0x01 to byte, 0x00 to byte, 0x01 to byte,
+        0x0B to byte, 0x38 to byte, 0x02 to byte,
+        0x00 to byte, 0x41 to byte, 0x10 to byte, 0x0B to byte, 0x2A to byte,
+        0x77 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x33 to byte, 0x32 to byte, 0x3A to byte, 0x20 to byte,
+        0x70 to byte, 0x6F to byte, 0x69 to byte, 0x6E to byte, 0x74 to byte, 0x65 to byte, 0x72 to byte, 0x20 to byte,
+        0x61 to byte, 0x64 to byte, 0x64 to byte, 0x72 to byte, 0x65 to byte, 0x73 to byte, 0x73 to byte, 0x20 to byte,
+        0x6F to byte, 0x76 to byte, 0x65 to byte, 0x72 to byte, 0x66 to byte, 0x6C to byte, 0x6F to byte, 0x77 to byte,
+        0x20 to byte, 0x28 to byte, 0x3E to byte, 0x3D to byte, 0x20 to byte, 0x32 to byte, 0x5E to byte, 0x33 to byte,
+        0x32 to byte, 0x29 to byte,
+        0x00 to byte, 0x41 to byte, 0xC0 to byte, 0x00 to byte, 0x0B to byte, 0x02 to byte, 0x68 to byte, 0x69 to byte
     ]
     teko::assert::is_true(wasm_bytes_eq(got, want))
 }
@@ -482,6 +584,7 @@ fn global_section_const_global_clears_the_mutable_flag() {
         globals = [WasmGlobal { valtype = 0x7F to u8; mutable = false; init = 0 to i64 }]
         data = teko::list::empty()
         mem_min_pages = 0 to u32
+        mem_is64 = false
         exports = teko::list::empty()
     }
     let got = emit_wasm(m)

@@ -669,6 +669,7 @@ lands at C1-8.
 | `C1-fp` | C1-2 | FP-op parity check against the wasm FP opcodes (regular; Appendix table) — folded into C1-2 as it is 1:1 | 0.3.1 if any gap found |
 | `C1-simd` | later cluster | `v128` / SIMD lowering | later (not on the LTS path) |
 | `C1-bigmem` | C1-7 | wasm32 address ≥ 2^32 → PANIC (the checked narrow, §6); a genuine >4 GB module needs the wasm64 switch | 0.3.1 (wasm64 arm) |
+| `C1-wasm64-scope` | C1-7 | the wasm64 arm's own SUPPORTED subset today: no `LAlloca` (the shadow-stack `$sp`/`LFieldAddr`/`LAlloca` sites still compute in `i32` unconditionally), no rodata (`LGlobalAddr` likewise), no `Ptr`-typed signature — `wasm_assemble_program`'s own scope guard fails loud (M.3) rather than emit an invalid `memory64` module; a wasm64 program calling `print`/`panic` also fails cleanly (`wasm_resolve_call`'s existing "unresolved call symbol" error) since the `fd_write`-based io/panic trampolines — WASI preview1's own `i32`-address-only ABI, a genuine ecosystem wall against `memory64` — are omitted for `ptr64` | a follow-up threads `ptr64` through `LFieldAddr`/`LAlloca`/`LGlobalAddr`/`$sp` |
 | browser `fs`/`process` | C1-6 | no VFS/process in a browser sandbox — the import is not wired, the builtin honest-stops at runtime (§7) | never (no equivalent; M.3) |
 | WasmGC | — | GC value types — arena-in-linear-memory is THE model (§2-B) | out of scope (Appendix, "if ever") |
 | own wasm linker | — | none needed — the module is self-contained; WASI links `teko_rt.wasm` via `wasm-ld` (§11.4) | Phase E is ELF/Mach-O/COFF only |
