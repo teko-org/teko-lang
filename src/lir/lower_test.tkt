@@ -843,6 +843,46 @@ fn lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch() {
     teko::assert::str_contains(text, "  #B4:\n    jump #B1()")
 }
 
+/**
+ * lwt_defer_inside_match_value_arm_fires_only_on_that_arms_own_branch — PR
+ * #553 follow-up nit: the VALUE-producing (`lower_match_arm_value`) mirror
+ * of `lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch`: `let
+ * s=1; return match x { 1 => { defer { s = s + 100 }; s } _ => s }` — the
+ * `defer` registers ONLY inside arm0's own body, before its own tail value
+ * `s`. Arm0's own body block (`#B2`) must fire it — LIFO, from the
+ * defer-delta base THIS arm itself started at — AFTER its tail value is
+ * read (so the merge still receives the PRE-defer `s`, `%1`) but BEFORE its
+ * jump to the merge; the wildcard arm's own body (`#B4`, reached through
+ * its own pass-through entry `#B3`, which never registers a defer) just
+ * jumps its own tail value straight to the merge; the merge block (`#B1`)
+ * must carry NOTHING but the plain `ret` of its own block-arg — proving
+ * arm0's own defer registration was reset off the pending-defer stack
+ * before the merge, never replayed a second time there (the value-producing
+ * sibling of `close_arm_replaying_defers`'s `lower_match_arm_stmt` fix).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_match_value_arm_fires_only_on_that_arms_own_branch() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let arm0_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_defer(defer_body)), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64)))
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), arm0_body)
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_ret(match_expr))
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("match_value_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B2:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B1(%1)")
+    teko::assert::str_contains(text, "  #B3:\n    jump #B4()")
+    teko::assert::str_contains(text, "  #B4:\n    jump #B1(%1)")
+    teko::assert::str_contains(text, "  #B1(%2):\n    ret %2\n}")
+}
+
 #test
 /**
  * lwt_match_stmt_arm_keeps_its_own_interned_rodata — a STATEMENT-position
@@ -1638,6 +1678,77 @@ fn lwt_lowers_continue_jumps_back_to_the_loop_head() {
 }
 
 /**
+ * lwt_defer_inside_loop_body_fires_each_fallthrough_iteration_never_survives_past_exit
+ * — PR #553 follow-up nit: `let s=1; loop { defer { s = s + 100 } };
+ * return s` — the loop's body NEVER breaks, so every trip through it closes
+ * via `close_loop_body`'s OWN fall-through replay (not `lower_break`'s):
+ * the loop head (`#B1`) fires the body's pending defer — LIFO, from the
+ * defer-delta base the BODY itself started at — immediately before its
+ * implicit back-edge jump to itself, once per (baked-in, static)
+ * iteration. `close_loop`'s OWN `.defers` restore (to whatever the defer
+ * stack was BEFORE the loop — here, empty) means the exit block (`#B2`,
+ * the function's tail here) carries NOTHING but the plain `ret` of its own
+ * block-arg: the exact leak `close_loop`'s `defers = outer.defers` fixes
+ * (PR #553 review finding) — carrying `body_done.defers` forward instead
+ * would leave the ALREADY-fired entry pending, so the tail `return`'s own
+ * `replay_defers(ctx, 0)` would fire it a SECOND time there.
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_loop_body_fires_each_fallthrough_iteration_never_survives_past_exit() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let loop_body = teko::list::push(teko::list::empty(), lwt_defer(defer_body))
+    let tail_ret = lwt_ret(lwt_var("s", checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_loop("", loop_body)), tail_ret)
+    let f = lwt_fn("loop_iter_scoped", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1(%1):\n    %3 = const 100\n    %4 = iadd %1, %3\n    jump #B1(%4)")
+    teko::assert::str_contains(text, "  #B2(%2):\n    ret %2\n}")
+}
+
+/**
+ * lwt_defer_inside_loop_body_fires_via_break_and_the_enclosing_defer_still_fires_after_the_loop_exits
+ * — PR #553 follow-up nit: `let s=1; defer { s = s + 1 }; loop { defer { s
+ * = s + 100 }; break }; return s` — TWO defers, at TWO different scopes:
+ * one registered BEFORE the loop (the enclosing FUNCTION scope), one
+ * registered INSIDE the loop's own body. The `break` fires ONLY the loop's
+ * OWN defer — LIFO, from the loop's `defer_base` (the defer-stack depth the
+ * BODY itself started at, which already SITS ABOVE the enclosing defer, so
+ * `lower_break`'s `replay_defers(ctx, target.defer_base)` never re-fires
+ * it) — immediately before its jump to the exit block (`#B1`, the loop
+ * head; `#B2`, the exit). `close_loop`'s OWN `.defers` restore (to what the
+ * stack was BEFORE the loop — the enclosing defer ALONE, still pending)
+ * means the exit block still carries the OUTER defer, correctly fired
+ * ONLY ONCE there by the tail `return`'s own `replay_defers(ctx, 0)` — NOT
+ * a second copy of the loop's OWN already-fired defer (the exact leak
+ * `close_loop`'s `defers = outer.defers` fixes, PR #553 review finding:
+ * carrying `body_done.defers` forward instead would leave the loop's own
+ * ALREADY-fired entry pending too, so the tail's replay would fire BOTH a
+ * second time).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_loop_body_fires_via_break_and_the_enclosing_defer_still_fires_after_the_loop_exits() {
+    let s_plus_1 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64)
+    let outer_defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_1, checker::PrimKind::I64))
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let loop_defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let loop_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_defer(loop_defer_body)), lwt_break(""))
+    let tail_ret = lwt_ret(lwt_var("s", checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(outer_defer_body)), lwt_loop("", loop_body)), tail_ret)
+    let f = lwt_fn("loop_break_scoped", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B0:\n    %0 = const 1\n    jump #B1(%0)")
+    teko::assert::str_contains(text, "  #B1(%1):\n    %3 = const 100\n    %4 = iadd %1, %3\n    jump #B2(%4)")
+    teko::assert::str_contains(text, "  #B2(%2):\n    %5 = const 1\n    %6 = iadd %2, %5\n    ret %6\n}")
+}
+
+/**
  * lwt_lowers_defer_fires_before_the_return_value_reads_it — A1-2, #382:
  * `let s=1; defer { s = s + 100 }; return s` registers the defer inline
  * (emitting nothing) and fires it — LIFO, here just the one entry — BEFORE
@@ -1764,6 +1875,77 @@ fn lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch() {
     teko::assert::str_contains(text, "  #B1:\n    %4 = const 100\n    %5 = iadd %1, %4\n    jump #B3()")
     teko::assert::str_contains(text, "  #B2:\n    jump #B3()")
     teko::assert::str_contains(text, "  #B3:\n    ret %1\n}")
+}
+
+/**
+ * lwt_defer_inside_else_arm_fires_only_on_that_arms_own_branch — PR #553
+ * follow-up nit: the ELSE-arm mirror of
+ * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`: `let s=1; if
+ * x>0 { } else { defer { s = s + 100 } }; return s` — the `defer` registers
+ * ONLY inside the ELSE arm, never the empty THEN arm. The THEN arm (`#B1`,
+ * empty — no statements at all) just jumps straight to the merge; the ELSE
+ * arm (`#B2`) must fire it — LIFO, from the defer-delta base THIS arm
+ * itself started at — as part of ITS OWN close, immediately before its jump
+ * to the merge; the merge/tail block (`#B3`) must contain NOTHING but the
+ * plain `ret %1` — proving the ELSE arm's own defer registration was reset
+ * off the pending-defer stack before the merge, never replayed a second
+ * time there (`close_arm_replaying_defers` scopes EITHER arm identically,
+ * not just the THEN side).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_else_arm_fires_only_on_that_arms_own_branch() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let cond = lwt_cmp(lwt_var("x", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Gt, lwt_num_i64(0 to i128))))
+    let else_blk = teko::list::push(teko::list::empty(), lwt_defer(defer_body))
+    let ifstmt = lwt_if_stmt(cond, teko::list::empty(), true, else_blk)
+    let tail_ret = lwt_ret(lwt_var("s", checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), tail_ret)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("else_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1:\n    jump #B3()")
+    teko::assert::str_contains(text, "  #B2:\n    %4 = const 100\n    %5 = iadd %1, %4\n    jump #B3()")
+    teko::assert::str_contains(text, "  #B3:\n    ret %1\n}")
+}
+
+/**
+ * lwt_defer_inside_if_value_then_arm_fires_only_on_that_arms_own_branch —
+ * PR #553 follow-up nit: the VALUE-producing (`lower_if_value`) shape of
+ * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`: `let s=1;
+ * return if x>0 { defer { s = s + 100 }; s } else { s }` — the `defer`
+ * registers ONLY inside the THEN arm, before its own tail value `s`. The
+ * THEN arm (`#B1`) must fire it — LIFO, from the defer-delta base THIS arm
+ * itself started at — AFTER its tail value is read (so the merge still
+ * receives the PRE-defer `s`, `%1`) but BEFORE its jump to the merge; the
+ * ELSE arm (`#B2`, which never registers a defer) just jumps its own tail
+ * value straight to the merge; the merge block (`#B3`) must carry NOTHING
+ * but the plain `ret` of its own block-arg — proving the THEN arm's own
+ * defer registration was reset off the pending-defer stack before the
+ * merge, never replayed a second time there (the value-producing sibling of
+ * `close_arm_replaying_defers`'s `lower_if_stmt` fix).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_if_value_then_arm_fires_only_on_that_arms_own_branch() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let cond = lwt_cmp(lwt_var("x", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Gt, lwt_num_i64(0 to i128))))
+    let then_blk = teko::list::push(teko::list::push(teko::list::empty(), lwt_defer(defer_body)), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64)))
+    let else_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64)))
+    let ifexpr = lwt_if_value(cond, then_blk, else_blk, checker::PrimKind::I64)
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_ret(ifexpr))
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("if_value_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B3(%1)")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%1)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4\n}")
 }
 
 /**
