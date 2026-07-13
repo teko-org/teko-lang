@@ -1,0 +1,918 @@
+use teko::parser
+
+/**
+ * (SP-1a, #389/#498 the safety-spine PURE-QUERY spike) Does the type `t` TRANSITIVELY reach a
+ * `Reference` — through struct/class/trait fields, a type alias, a `variant`'s members, a
+ * collection element, an optional's inner, or a function type's params/return — such that a
+ * by-value copy of a `t` would copy a POINTER (the ref-transparent-model §7 soundness hole: copying
+ * a `Holder { r: Ref<int> }` copies `r`, not the pointee)? A purely TYPE-STRUCTURAL walk, NOT a
+ * points-to analysis. Nominal recursion is bounded by `visited` (a type name visited twice on the
+ * same path contributes no new edge), so the walk terminates; the type universe is finite per
+ * compilation. An unresolvable `Named` (an unregistered name) conservatively answers `true` (the
+ * safe over-reject direction — mirrors `escaping_value_leaks_ref`'s honest-stop).
+ *
+ * Consulted NOWHERE yet (SP-1 is a pure, unwired fact) — fixpoint is preserved by construction.
+ *
+ * @param t        the resolved type under test
+ * @param table    the program's type table (to resolve a `Named` type's own field/alias shape)
+ * @param visited  the nominal type names already entered on this path (recursion guard)
+ * @return         true iff a by-value copy of `t` carries at least one live `Reference` edge
+ * @see            docs/design/safety-spine.md §B2.1(a); docs/design/ref-transparent-model.md §7
+ * @since          0.3.1.0-beta (#389 SP-1)
+ */
+pub fn type_reaches_ref(t: Type, table: TypeTable, visited: []str) -> bool {
+    match t {
+        Reference => true
+        Slice as s => type_reaches_ref(s.element, table, visited)
+        Optional as o => type_reaches_ref(o.inner, table, visited)
+        Variant as v => types_reach_ref(v.members, table, visited)
+        Func as f => func_type_reaches_ref(f, table, visited)
+        Named as n => named_type_reaches_ref(n, table, visited)
+        _ => false
+    }
+}
+
+/**
+ * Any-of `type_reaches_ref` over a type list (a `Variant`'s members or a `Func`'s params) —
+ * short-circuits on the first reaching member.
+ *
+ * @param xs       the type list
+ * @param table    the program's type table
+ * @param visited  the recursion guard, threaded unchanged into each member
+ * @return         true iff any element of `xs` reaches a `Reference`
+ */
+fn types_reach_ref(xs: []Type, table: TypeTable, visited: []str) -> bool {
+    mut i = 0
+    loop {
+        if i >= xs.len { break }
+        if type_reaches_ref(xs[i], table, visited) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * Does a function TYPE `f` reach a `Reference` through its return type or any parameter type? A
+ * function value's captured ENVIRONMENT is not represented in `Func` (it is a call signature, not
+ * an env struct) — that opacity is handled separately by `fn_borrow_summary`'s capture walk, which
+ * treats every `Func`-typed value as inherently opaque regardless of what this structural check
+ * finds. This check only sees what the SIGNATURE itself states (e.g. `() -> Ref<T>`).
+ *
+ * @param f        the function type
+ * @param table    the program's type table
+ * @param visited  the recursion guard
+ * @return         true iff `f`'s return or any parameter reaches a `Reference`
+ */
+fn func_type_reaches_ref(f: Func, table: TypeTable, visited: []str) -> bool {
+    if type_reaches_ref(f.ret, table, visited) { return true }
+    types_reach_ref(f.params, table, visited)
+}
+
+/**
+ * Does a `Named` type (a user struct/class/trait/alias/variant/enum/flags/extern/interface) reach a
+ * `Reference`? Guards against infinite recursion on a self-referential type (`visited` already
+ * contains `n.name` ⇒ no NEW edge, stop). An unregistered name (a lookup miss) conservatively
+ * answers `true` — unresolvable, over-reject.
+ *
+ * @param n        the named type
+ * @param table    the program's type table
+ * @param visited  the recursion guard so far
+ * @return         true iff `n`'s declaration transitively reaches a `Reference`
+ */
+fn named_type_reaches_ref(n: Named, table: TypeTable, visited: []str) -> bool {
+    if str_set_has(visited, n.name) { return false }
+    match type_table_find(table, n.name, "") {
+        parser::TypeDecl as td => type_decl_reaches_ref(td, table, teko::list::push(visited, n.name))
+        error => true
+    }
+}
+
+/**
+ * Dispatch the reachability walk over a `TypeDecl`'s body by kind: a struct/class walks its
+ * (base-chain-folded) field views; a trait walks its own fields; an alias/variant-union walks its
+ * aliased/unioned type expression; an enum/flags carries no data (`false`); an extern/interface type
+ * is opaque/non-instantiable and conservatively answers `true`.
+ *
+ * @param td       the type declaration
+ * @param table    the program's type table
+ * @param visited  the recursion guard (already extended with `td.name` by the caller)
+ * @return         true iff `td`'s body transitively reaches a `Reference`
+ */
+fn type_decl_reaches_ref(td: parser::TypeDecl, table: TypeTable, visited: []str) -> bool {
+    match td.body {
+        parser::StructBody => field_view_list_reaches_ref(deriver_field_view(td.name, table), table, visited)
+        parser::ClassBody => field_view_list_reaches_ref(deriver_field_view(td.name, table), table, visited)
+        parser::TraitBody as tb => fields_reach_ref(tb.fields, table, visited, type_ns_of(table, td.name))
+        parser::AliasBody as ab => type_expr_reaches_ref(ab.alias, table, visited, type_ns_of(table, td.name))
+        parser::VariantBody as vb => type_expr_reaches_ref(vb.type_expr, table, visited, type_ns_of(table, td.name))
+        parser::EnumBody => false
+        parser::FlagsBody => false
+        parser::ExternBody => true
+        parser::InterfaceBody => true
+    }
+}
+
+/**
+ * Resolve a syntactic type expression (an alias's RHS or a `variant`'s union) in `owner_ns`, then
+ * walk the resolved type for reachability. A resolution failure conservatively answers `true`.
+ *
+ * @param te       the syntactic type expression
+ * @param table    the program's type table
+ * @param visited  the recursion guard
+ * @param owner_ns the declaring namespace the expression was written in
+ * @return         true iff the resolved type reaches a `Reference`
+ */
+fn type_expr_reaches_ref(te: parser::TypeExpr, table: TypeTable, visited: []str, owner_ns: str) -> bool {
+    match resolve_type(te, table, owner_ns) {
+        Type as t => type_reaches_ref(t, table, visited)
+        error => true
+    }
+}
+
+/**
+ * Resolve a raw field list (a trait's own fields — a struct/class instead goes through
+ * `deriver_field_view`, which already folds a class's base chain) in `owner_ns`, then walk the
+ * resulting field views for reachability.
+ *
+ * @param fields   the unresolved field declarations
+ * @param table    the program's type table
+ * @param visited  the recursion guard
+ * @param owner_ns the declaring namespace the fields were written in
+ * @return         true iff any resolved field reaches a `Reference`
+ */
+fn fields_reach_ref(fields: []parser::Field, table: TypeTable, visited: []str, owner_ns: str) -> bool {
+    field_view_list_reaches_ref(resolve_field_views(fields, table, owner_ns), table, visited)
+}
+
+/**
+ * Unwrap a `[]FieldView | error` (as `deriver_field_view`/`resolve_field_views` return) and walk it
+ * for reachability; a resolution error conservatively answers `true`.
+ *
+ * @param fv       the resolved field views, or the error that resolving them produced
+ * @param table    the program's type table
+ * @param visited  the recursion guard
+ * @return         true iff `fv` is a view list with at least one reaching field
+ */
+fn field_view_list_reaches_ref(fv: []FieldView | error, table: TypeTable, visited: []str) -> bool {
+    match fv {
+        []FieldView as views => any_field_view_reaches_ref(views, table, visited)
+        error => true
+    }
+}
+
+/**
+ * Any-of `type_reaches_ref` over a struct/class/trait's resolved field views.
+ *
+ * @param views    the resolved field views
+ * @param table    the program's type table
+ * @param visited  the recursion guard
+ * @return         true iff any field's type reaches a `Reference`
+ */
+fn any_field_view_reaches_ref(views: []FieldView, table: TypeTable, visited: []str) -> bool {
+    mut i = 0
+    loop {
+        if i >= views.len { break }
+        if type_reaches_ref(views[i].type, table, visited) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * Is `t` a function (closure) type? A `Func`-typed value is OPAQUE to the structural reachability
+ * walk (its captured environment is invisible in the `Func` type — §B2.2 slice 1b's "higher-order
+ * opacity"), so `fn_borrow_summary` treats it as a potential borrow vehicle regardless of what
+ * `type_reaches_ref` finds in its bare signature.
+ *
+ * @param t  the type under test
+ * @return   true iff `t` is a `Func`
+ */
+fn type_is_func(t: Type) -> bool {
+    match t { Func => true; _ => false }
+}
+
+/**
+ * (SP-1b, #389/#498) The per-function BORROW SUMMARY: which of `f`'s parameters the RETURN VALUE
+ * (transitively) borrows. This is lifetime-elision-LITE — the ONE fact past the #330 one-hop escape
+ * ceiling that the compiler's own iterator/stream stdlib forces (28 `src/iter`/`src/io` functions
+ * return a closure capturing a `Ref`/closure parameter). It is NOT a named-lifetime system and NOT
+ * whole-program: a single bitmask per function, computed from `f`'s body in one bottom-up pass,
+ * consumed exactly ONE hop deep at each call site (by a future caller-side gate — not SP-1).
+ *
+ * @field returns_borrow_of  the 0-based parameter indices the return value borrows
+ * @field returns_all        true ⇒ un-summarizable: treat the return as borrowing every param (over-reject)
+ * @see   docs/design/safety-spine.md §B2.1(b)
+ * @since 0.3.1.0-beta (#389 SP-1)
+ */
+pub type BorrowSummary = struct { returns_borrow_of: []u32; returns_all: bool }
+
+/**
+ * A bottom-up environment of already-computed callee summaries, keyed by the callee's qualified
+ * name (`qualify(namespace, bare_name)`) — the DRIVER (not SP-1 itself) is responsible for ordering
+ * a program's functions so a callee is summarized before its callers, falling back to `returns_all`
+ * for a not-yet-summarized / recursive callee (a single monotone widening, never a full fixpoint).
+ * Parallel arrays, mirroring the `str_set_*`/`Cell` parallel-list idiom the checker already uses
+ * for small, function-scale collections.
+ *
+ * @field keys  the qualified callee names already summarized
+ * @field sums  the matching summaries, parallel to `keys` by index
+ * @since 0.3.1.0-beta (#389 SP-1)
+ */
+pub type BorrowSummaryEnv = struct { keys: []str; sums: []BorrowSummary }
+
+/**
+ * The empty borrow-summary environment — the starting point for a bottom-up driver, and what a
+ * single-function (or leaf-function) summary needs when no callee has been summarized yet.
+ *
+ * @return an environment with no summarized callees
+ * @since 0.3.1.0-beta (#389 SP-1)
+ */
+pub fn borrow_summary_env_empty() -> BorrowSummaryEnv {
+    BorrowSummaryEnv { keys = teko::list::empty(); sums = teko::list::empty() }
+}
+
+/**
+ * Record `sum` as the summary of the function named `name` in namespace `ns`, returning the grown
+ * environment (a driver builds one call at a time as it summarizes a program bottom-up).
+ *
+ * @param env   the environment so far
+ * @param ns    the function's declaring namespace ("" = top-level)
+ * @param name  the function's bare name
+ * @param sum   its computed summary
+ * @return      the environment with `name` (qualified by `ns`) bound to `sum`
+ * @since 0.3.1.0-beta (#389 SP-1)
+ */
+pub fn borrow_summary_env_insert(env: BorrowSummaryEnv, ns: str, name: str, sum: BorrowSummary) -> BorrowSummaryEnv {
+    BorrowSummaryEnv { keys = teko::list::push(env.keys, qualify(ns, name)); sums = teko::list::push(env.sums, sum) }
+}
+
+/**
+ * Look up an already-summarized callee's `BorrowSummary` by its qualified key, or `null` when it is
+ * not (yet) known (a forward reference, an unsummarized dependency, or a genuinely external callee).
+ *
+ * @param env  the environment
+ * @param key  the qualified callee name (`qualify(ns, name)`)
+ * @return     the callee's summary, or `null` if absent
+ */
+fn borrow_summary_env_find(env: BorrowSummaryEnv, key: str) -> BorrowSummary? {
+    mut i = 0
+    loop {
+        if i >= env.keys.len { break }
+        if env.keys[i] == key { return env.sums[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * One top-level `let`/`mut` LOCAL binding recorded while summarizing a function — a name-to-defining-
+ * value map used to resolve a bare local read (e.g. the `it` in `let it: T = () => {…}; it`) back to
+ * the expression that defines it. Scanned ONE level (the function's own top-level statements only —
+ * a nested block's binding is out of scope at the point a later top-level statement reads it, so this
+ * matches real lexical scoping, not just a simplification). A later `TAssign` to the same name is
+ * NOT tracked (the recorded value stays the ORIGINAL binding) — this can only widen the summary
+ * (a return that is actually reassigned to something non-borrowing still gets recorded as borrowing
+ * the original's roots), never narrow it, so it stays on the safe over-reject side; documented bound.
+ *
+ * @field name   the bound local's name
+ * @field value  the typed expression it was bound to
+ */
+type LocalDef = struct { name: str; value: TExpr }
+
+/**
+ * The resolution context threaded through one function's borrow-summary walk: its own parameter
+ * names (by position, so a resolved name maps back to a 0-based index), its top-level local
+ * definitions (`LocalDef`, for the one-hop `let`-alias resolution), and the bottom-up environment of
+ * already-known callee summaries (for the call-composition case).
+ *
+ * @field param_names  `f.params[i].name`, in order
+ * @field locals       the function's top-level `let`/`mut` bindings
+ * @field env          already-summarized callees
+ */
+type BorrowCtx = struct { param_names: []str; locals: []LocalDef; env: BorrowSummaryEnv }
+
+/**
+ * The accumulator a single expression's borrow-resolution produces: either a precise set of
+ * borrowed parameter indices, or the `all` over-reject widening (mutually exclusive — `idxs` is
+ * always empty when `all` is true).
+ *
+ * @field idxs  the borrowed parameter indices (deduped; meaningless when `all` is true)
+ * @field all   true ⇒ the widened "borrows every param" fallback
+ */
+type BorrowAcc = struct { idxs: []u32; all: bool }
+
+/**
+ * The empty accumulator — "this value borrows none of `f`'s parameters" (the identity element for
+ * `union_borrow`).
+ *
+ * @return an accumulator with no borrowed indices and no widening
+ */
+fn no_borrow() -> BorrowAcc {
+    BorrowAcc { idxs = teko::list::empty(); all = false }
+}
+
+/**
+ * The accumulator naming exactly one borrowed parameter index.
+ *
+ * @param idx  the borrowed parameter's 0-based index
+ * @return     an accumulator borrowing only `idx`
+ */
+fn single_borrow(idx: u32) -> BorrowAcc {
+    BorrowAcc { idxs = teko::list::push(teko::list::empty(), idx); all = false }
+}
+
+/**
+ * The widened accumulator — "this value's borrow could not be resolved to specific parameters;
+ * treat it as borrowing EVERY parameter" (the safe over-reject fallback the design mandates for an
+ * unresolvable local root, a self-referential alias chain, an unknown/closure call, or a recursive
+ * callee).
+ *
+ * @return an accumulator with `all = true`
+ */
+fn widen_borrow() -> BorrowAcc {
+    BorrowAcc { idxs = teko::list::empty(); all = true }
+}
+
+/**
+ * The union (join) of two borrow accumulators from sibling escaping positions (two `return`s, or two
+ * captures of the same closure): widened if EITHER side is widened, else the deduped union of both
+ * index sets. Monotone — the result is never more precise than either input.
+ *
+ * @param a  the first accumulator
+ * @param b  the second accumulator
+ * @return   the union of `a` and `b`
+ */
+fn union_borrow(a: BorrowAcc, b: BorrowAcc) -> BorrowAcc {
+    if a.all || b.all { return widen_borrow() }
+    BorrowAcc { idxs = union_idx_list(a.idxs, b.idxs); all = false }
+}
+
+/**
+ * The deduped union of two `u32` index lists (linear — a function's parameter count is tiny).
+ *
+ * @param a  the first list
+ * @param b  the second list
+ * @return   `a` extended with every element of `b` not already present
+ */
+fn union_idx_list(a: []u32, b: []u32) -> []u32 {
+    mut out = a
+    mut i = 0
+    loop {
+        if i >= b.len { break }
+        if !u32_list_has(out, b[i]) { out = teko::list::push(out, b[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * Linear membership test for a `u32` index list.
+ *
+ * @param xs  the list
+ * @param v   the value sought
+ * @return    true iff `v` occurs in `xs`
+ */
+fn u32_list_has(xs: []u32, v: u32) -> bool {
+    mut i = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == v { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * The fallback for a value this walk does not specifically model (a binary/unary/compare/cast/field/
+ * index/interp/literal/…): widen when its TYPE could still carry a reachable `Reference` or is
+ * itself opaque (`Func`-typed — a value of function type could be a closure smuggling a borrow no
+ * structural check sees), else it borrows nothing (a plain scalar/aggregate value cannot dangle).
+ *
+ * @param t      the value's resolved type
+ * @param table  the program's type table
+ * @return       the fallback accumulator for a value of type `t`
+ */
+fn borrow_fallback(t: Type, table: TypeTable) -> BorrowAcc {
+    if type_reaches_ref(t, table, teko::list::empty()) { return widen_borrow() }
+    if type_is_func(t) { return widen_borrow() }
+    no_borrow()
+}
+
+/**
+ * Does `e`'s value transitively capture/contain one of `ctx`'s own parameters — the one-hop
+ * bottom-up borrow-summary walk (§B2.1(b))? Dispatches by expression shape: a bare local resolves
+ * through a param-name match or ONE hop of `let`-alias chasing; a closure literal unions its capture
+ * list; a call composes the CALLEE's own summary onto this call's arguments (bottom-up); an
+ * aggregate/array literal unions its component values; anything else falls back to
+ * `borrow_fallback` on its own type.
+ *
+ * @param e      the typed expression to resolve
+ * @param ctx    the enclosing function's resolution context
+ * @param chain  the local names already entered on this alias-resolution path (cycle guard)
+ * @param table  the program's type table
+ * @return       the borrow contribution of `e`
+ */
+fn resolve_borrow(e: TExpr, ctx: BorrowCtx, chain: []str, table: TypeTable) -> BorrowAcc {
+    match e.kind {
+        TVar as v => resolve_var_borrow(v, e.type, ctx, chain, table)
+        TLambda as lam => resolve_captures_borrow(lam.captures, ctx, chain, table)
+        TCall as call => resolve_call_borrow(call, e.type, ctx, chain, table)
+        TStructInit as si => resolve_expr_list_borrow(si.field_vals, ctx, chain, table)
+        TArrayLit as al => resolve_expr_list_borrow(array_lit_values(al), ctx, chain, table)
+        _ => borrow_fallback(e.type, table)
+    }
+}
+
+/**
+ * Resolve a bare variable read: a call-target function VALUE (`v.is_func`) borrows nothing (it names
+ * a function, not a parameter); a name matching one of `ctx`'s own parameters resolves via
+ * `param_borrow`; a name matching a top-level local chases one more hop through its defining value;
+ * anything else (a free/global/unresolvable name) falls back on its observed type.
+ *
+ * @param v      the variable read
+ * @param t      its resolved type (from the enclosing `TExpr`)
+ * @param ctx    the resolution context
+ * @param chain  the alias-resolution cycle guard
+ * @param table  the program's type table
+ * @return       the borrow contribution of reading `v`
+ */
+fn resolve_var_borrow(v: TVar, t: Type, ctx: BorrowCtx, chain: []str, table: TypeTable) -> BorrowAcc {
+    if v.is_func { return no_borrow() }
+    let pidx = str_list_index(ctx.param_names, v.name)
+    if pidx >= 0 { return param_borrow(pidx to u32, t, table) }
+    match local_def_find(ctx.locals, v.name) {
+        TExpr as value => resolve_local_borrow(v.name, value, ctx, chain, table)
+        null => borrow_fallback(t, table)
+    }
+}
+
+/**
+ * A read of parameter index `idx` (observed type `t`) contributes exactly that index IFF the
+ * parameter could carry a reachable borrow: its type transitively reaches a `Reference`, or it is
+ * itself `Func`-typed (an opaque incoming closure — §B2.2 slice 1b's higher-order case). A plain
+ * scalar/aggregate parameter (no ref, not a closure) contributes nothing — marking it would be
+ * harmless but adds no lifetime-relevant information.
+ *
+ * @param idx    the parameter's 0-based index
+ * @param t      the parameter's observed type
+ * @param table  the program's type table
+ * @return       `single_borrow(idx)` when relevant, else `no_borrow()`
+ */
+fn param_borrow(idx: u32, t: Type, table: TypeTable) -> BorrowAcc {
+    if type_reaches_ref(t, table, teko::list::empty()) || type_is_func(t) {
+        return single_borrow(idx)
+    }
+    no_borrow()
+}
+
+/**
+ * Chase one more hop through a local's defining value — UNLESS `name` already occurs on `chain` (a
+ * self-referential / cyclic local), in which case the root is unresolvable and the walk widens (the
+ * safe direction; a genuinely cyclic definition cannot type-check as a normal value binding, but the
+ * guard keeps this PURE query total and terminating regardless).
+ *
+ * @param name   the local's name (about to be pushed onto `chain`)
+ * @param value  its defining expression
+ * @param ctx    the resolution context
+ * @param chain  the alias-resolution cycle guard so far
+ * @param table  the program's type table
+ * @return       the borrow contribution of the local's defining value, or `widen_borrow()` on a cycle
+ */
+fn resolve_local_borrow(name: str, value: TExpr, ctx: BorrowCtx, chain: []str, table: TypeTable) -> BorrowAcc {
+    if str_set_has(chain, name) { return widen_borrow() }
+    resolve_borrow(value, ctx, teko::list::push(chain, name), table)
+}
+
+/**
+ * Union the borrow contribution of every captured variable in a closure literal's capture list — a
+ * capture is resolved exactly like a bare variable read of the same name/type (`resolve_var_borrow`
+ * via a synthetic `TVar`), so a captured PARAM (Reference or opaque `Func`) marks its index and a
+ * captured LOCAL chases its one-hop alias the same way a direct tail read would.
+ *
+ * @param caps   the closure's captures
+ * @param ctx    the resolution context
+ * @param chain  the alias-resolution cycle guard
+ * @param table  the program's type table
+ * @return       the union of every capture's borrow contribution
+ */
+fn resolve_captures_borrow(caps: []TCapture, ctx: BorrowCtx, chain: []str, table: TypeTable) -> BorrowAcc {
+    mut acc = no_borrow()
+    mut i = 0
+    loop {
+        if i >= caps.len { break }
+        acc = union_borrow(acc, resolve_borrow(capture_as_var(caps[i]), ctx, chain, table))
+        i++
+    }
+    acc
+}
+
+/**
+ * Wrap a `TCapture` as the synthetic bare-variable-read `TExpr` `resolve_borrow` expects, so capture
+ * resolution reuses the exact same TVar/param/local logic a direct read would.
+ *
+ * @param c  the capture
+ * @return   a `TVar` typed expression reading `c.name` at `c.type`
+ */
+fn capture_as_var(c: TCapture) -> TExpr {
+    TExpr { kind = TVar { name = c.name; is_func = false; func_ns = "" }; type = c.type; line = 0; col = 0 }
+}
+
+/**
+ * Resolve a call in an escaping position: a call THROUGH a local closure VALUE (`is_closure_call`)
+ * names no statically-known callee, so it falls back on the call's own result type; a call to a
+ * NAMED function looks up its summary in `ctx.env` and, when found, composes it onto this call's
+ * arguments (`compose_call_borrow`) — an unsummarized callee (not yet known / a genuine external)
+ * falls back on the result type too, the same conservative default a recursive callee's caller sees
+ * before the driver has widened it explicitly.
+ *
+ * @param call         the call
+ * @param result_type  the call's own resolved result type (from the enclosing `TExpr`)
+ * @param ctx          the resolution context
+ * @param chain        the alias-resolution cycle guard
+ * @param table        the program's type table
+ * @return             the borrow contribution of the call's result
+ */
+fn resolve_call_borrow(call: TCall, result_type: Type, ctx: BorrowCtx, chain: []str, table: TypeTable) -> BorrowAcc {
+    if call.is_closure_call { return borrow_fallback(result_type, table) }
+    match borrow_summary_env_find(ctx.env, call_target_key(call)) {
+        BorrowSummary as callee => compose_call_borrow(call, callee, ctx, chain, table)
+        null => borrow_fallback(result_type, table)
+    }
+}
+
+/**
+ * Map a known callee's `returns_borrow_of` onto this call's actual arguments (the bottom-up
+ * composition, §B2.1(b)): a `returns_all` callee widens the caller's contribution too; otherwise
+ * union, over each borrowed callee parameter index, the borrow contribution of the ARGUMENT actually
+ * passed there (so a caller passing one of ITS OWN params through inherits that param's index).
+ *
+ * @param call    the call
+ * @param callee  the callee's own summary
+ * @param ctx     the resolution context
+ * @param chain   the alias-resolution cycle guard
+ * @param table   the program's type table
+ * @return        the composed borrow contribution
+ */
+fn compose_call_borrow(call: TCall, callee: BorrowSummary, ctx: BorrowCtx, chain: []str, table: TypeTable) -> BorrowAcc {
+    if callee.returns_all { return widen_borrow() }
+    mut acc = no_borrow()
+    mut i = 0
+    loop {
+        if i >= callee.returns_borrow_of.len { break }
+        let argi = callee.returns_borrow_of[i] to u64
+        if argi < call.args.len {
+            acc = union_borrow(acc, resolve_borrow(call.args[argi], ctx, chain, table))
+        }
+        i++
+    }
+    acc
+}
+
+/**
+ * The qualified lookup key for a call's static target: its resolved namespace + the callee path's
+ * last segment (the bare function name). Meaningless (and never consulted) for a closure call.
+ *
+ * @param c  the call
+ * @return   `qualify(c.call_ns, <bare callee name>)`
+ */
+fn call_target_key(c: TCall) -> str {
+    qualify(c.call_ns, call_last_segment(c.callee))
+}
+
+/**
+ * The last path segment of a call's callee — the bare function name a qualified or bare reference
+ * ultimately names. `""` for a (never-occurring) empty path.
+ *
+ * @param p  the callee path
+ * @return   its last segment's name, or `""` if `p` has no segments
+ */
+fn call_last_segment(p: parser::Path) -> str {
+    if p.segments.len == 0 { return "" }
+    p.segments[p.segments.len - 1].name
+}
+
+/**
+ * Union the borrow contribution of every element of an expression list (a struct-init's field
+ * values, or an array literal's elements) — any one reaching a parameter makes the WHOLE aggregate
+ * borrow it, since a struct-init/array-lit escapes as one value.
+ *
+ * @param vals   the component expressions
+ * @param ctx    the resolution context
+ * @param chain  the alias-resolution cycle guard
+ * @param table  the program's type table
+ * @return       the union of every element's borrow contribution
+ */
+fn resolve_expr_list_borrow(vals: []TExpr, ctx: BorrowCtx, chain: []str, table: TypeTable) -> BorrowAcc {
+    mut acc = no_borrow()
+    mut i = 0
+    loop {
+        if i >= vals.len { break }
+        acc = union_borrow(acc, resolve_borrow(vals[i], ctx, chain, table))
+        i++
+    }
+    acc
+}
+
+/**
+ * Project an array literal's elements down to their bare typed expressions (dropping the
+ * spread/is_spread tag — irrelevant to borrow resolution, which only cares about each element's
+ * own value).
+ *
+ * @param al  the typed array literal
+ * @return    `al.elements[i].expr`, in order
+ */
+fn array_lit_values(al: TArrayLit) -> []TExpr {
+    mut out: []TExpr = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= al.elements.len { break }
+        out = teko::list::push(out, al.elements[i].expr)
+        i++
+    }
+    out
+}
+
+/**
+ * Collect every ESCAPING/RETURN-VALUE candidate expression of a statement block: every `TReturn`'s
+ * value (wherever nested — a `return` always escapes, mirroring `escape.tks`'s `mark_stmt`), plus,
+ * when `tail` is true, the block's TRAILING value-bearing expr-statement (the implicit return).
+ * Descends into `if`/`match` branch bodies (as further tail blocks when in tail position, else only
+ * hunting for a nested `return`) and into loop/defer/adopt bodies (never in tail position — their
+ * own trailing value is not returned, but an explicit `return` inside one still is). A `TLambda`'s
+ * body is NEVER descended into (its `return`s target the closure, not this function — mirrors the
+ * spine's own shallow-closure-body bound).
+ *
+ * @param body  the statement block
+ * @param tail  true iff this block's trailing value is this function's implicit return
+ * @param acc   the escaping expressions collected so far
+ * @return      `acc` extended with this block's escaping expressions
+ */
+fn collect_escaping_values(body: []TStatement, tail: bool, acc: []TExpr) -> []TExpr {
+    mut out = acc
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        let is_last = i + 1 == body.len
+        out = collect_from_stmt(body[i], tail && is_last, out)
+        i++
+    }
+    out
+}
+
+/**
+ * Collect the escaping expressions named by one statement. `TReturn` always contributes (any
+ * position); a `TExprStmt` contributes only in `is_tail` position (else it is only scanned for a
+ * NESTED `return`); a `TBinding`/`TAssign`'s RHS is never itself a return candidate, but is still
+ * scanned for a nested `return` inside an `if`/`match` RHS; loop/defer/adopt bodies recurse with
+ * `tail = false`.
+ *
+ * @param s        the statement
+ * @param is_tail  true iff `s` is the last statement of a tail block
+ * @param acc      the escaping expressions collected so far
+ * @return         `acc` extended with `s`'s escaping expressions
+ */
+fn collect_from_stmt(s: TStatement, is_tail: bool, acc: []TExpr) -> []TExpr {
+    match s {
+        TReturn as r => if r.has_value { collect_from_expr_tail(r.value, acc) } else { acc }
+        TExprStmt as es => if is_tail { collect_from_expr_tail(es.expr, acc) } else { collect_nested_returns_expr(es.expr, acc) }
+        TBinding as b => collect_nested_returns_expr(b.value, acc)
+        TAssign as a => collect_nested_returns_expr(a.value, acc)
+        TLoopStmt as l => collect_escaping_values(l.body, false, collect_escaping_values(l.init, false, acc))
+        TDeferStmt as d => collect_escaping_values(d.body, false, acc)
+        TAdoptStmt as ad => collect_escaping_values(ad.body, false, acc)
+        TBreakStmt => acc
+        TContinueStmt => acc
+    }
+}
+
+/**
+ * Collect the escaping-value candidate(s) an expression IN TAIL POSITION contributes: an `if`/
+ * `match` is not itself one opaque candidate — it is DECOMPOSED into its own branch bodies (each a
+ * further tail block, mirroring `escape.tks`'s `mark_expr` treatment of the same nodes), so a
+ * `return if c { a } else { b }` yields `a` and `b` as two separate candidates. Any other expression
+ * is a leaf candidate, pushed as-is.
+ *
+ * @param e    the expression in tail position
+ * @param acc  the escaping expressions collected so far
+ * @return     `acc` extended with `e`'s tail candidate(s)
+ */
+fn collect_from_expr_tail(e: TExpr, acc: []TExpr) -> []TExpr {
+    match e.kind {
+        TIfExpr as f => collect_escaping_values(f.else_blk, true, collect_escaping_values(f.then_blk, true, acc))
+        TMatchExpr as m => collect_tail_match(m, acc)
+        _ => teko::list::push(acc, e)
+    }
+}
+
+/**
+ * Collect the tail candidates of every arm body of a `match` expression itself in tail position.
+ *
+ * @param m    the match expression
+ * @param acc  the escaping expressions collected so far
+ * @return     `acc` extended with every arm's tail candidate(s)
+ */
+fn collect_tail_match(m: TMatchExpr, acc: []TExpr) -> []TExpr {
+    mut out = acc
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        out = collect_escaping_values(m.arms[i].body, true, out)
+        i++
+    }
+    out
+}
+
+/**
+ * Hunt a NON-tail expression for a nested `return` (the only way a `return` can hide inside an
+ * expression tree, since only `TIfExpr`/`TMatchExpr` carry statement blocks): descend into either's
+ * branch bodies with `tail = false` (their own trailing value is not itself a return here — only an
+ * EXPLICIT `return` within counts). Any other expression shape carries no statement block, so it is
+ * a no-op.
+ *
+ * @param e    the non-tail expression
+ * @param acc  the escaping expressions collected so far
+ * @return     `acc` extended with any nested `return`'s value
+ */
+fn collect_nested_returns_expr(e: TExpr, acc: []TExpr) -> []TExpr {
+    match e.kind {
+        TIfExpr as f => collect_escaping_values(f.else_blk, false, collect_escaping_values(f.then_blk, false, acc))
+        TMatchExpr as m => collect_nested_returns_match(m, acc)
+        _ => acc
+    }
+}
+
+/**
+ * Hunt every arm body of a non-tail `match` expression for a nested `return`.
+ *
+ * @param m    the match expression
+ * @param acc  the escaping expressions collected so far
+ * @return     `acc` extended with any nested `return`'s value
+ */
+fn collect_nested_returns_match(m: TMatchExpr, acc: []TExpr) -> []TExpr {
+    mut out = acc
+    mut i = 0
+    loop {
+        if i >= m.arms.len { break }
+        out = collect_escaping_values(m.arms[i].body, false, out)
+        i++
+    }
+    out
+}
+
+/**
+ * Collect `f`'s own PARAMETER names, in declaration order (index `i` names parameter `i`).
+ *
+ * @param params  the function's parameters
+ * @return        `params[i].name`, in order
+ */
+fn param_name_list(params: []parser::Param) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= params.len { break }
+        out = teko::list::push(out, params[i].name)
+        i++
+    }
+    out
+}
+
+/**
+ * The 0-based index of `name` in `xs`, or -1 when absent.
+ *
+ * @param xs    the name list
+ * @param name  the name sought
+ * @return      its index, or -1
+ */
+fn str_list_index(xs: []str, name: str) -> i64 {
+    mut i = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == name { return i to i64 }
+        i++
+    }
+    -1
+}
+
+/**
+ * Collect `f`'s TOP-LEVEL `let`/`mut` local definitions (a nested block's binding is out of scope by
+ * the time a later top-level statement could read it, so this is exact, not just bounded).
+ *
+ * @param body  the function's typed statement block
+ * @return      one `LocalDef` per top-level simple-name binding, in order
+ */
+fn collect_locals(body: []TStatement) -> []LocalDef {
+    mut out: []LocalDef = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= body.len { break }
+        out = collect_local_from_stmt(body[i], out)
+        i++
+    }
+    out
+}
+
+/**
+ * Record a `TBinding`'s local definition (a `TAssign`/other statement contributes none — see
+ * `LocalDef`'s own doc for why a later reassignment is not tracked).
+ *
+ * @param s    the statement
+ * @param acc  the local definitions collected so far
+ * @return     `acc`, plus `s`'s local definition when `s` is a `TBinding`
+ */
+fn collect_local_from_stmt(s: TStatement, acc: []LocalDef) -> []LocalDef {
+    match s {
+        TBinding as b => bind_local(b, acc)
+        _ => acc
+    }
+}
+
+/**
+ * Record a binding's target name and value as a `LocalDef` (a destructure pattern names no single
+ * local, so it is skipped — its constituent names are unresolvable and fall back conservatively at
+ * their own read sites).
+ *
+ * @param b    the binding
+ * @param acc  the local definitions collected so far
+ * @return     `acc` with `b`'s definition appended (when it binds a simple name)
+ */
+fn bind_local(b: TBinding, acc: []LocalDef) -> []LocalDef {
+    match b.target {
+        parser::SimpleName as sn => teko::list::push(acc, LocalDef { name = sn.name; value = b.value })
+        parser::DestructurePattern => acc
+    }
+}
+
+/**
+ * Look up a top-level local's defining value by name, or `null` when `name` is not a locally-defined
+ * binding.
+ *
+ * @param locals  the function's local definitions
+ * @param name    the name sought
+ * @return        its defining expression, or `null`
+ */
+fn local_def_find(locals: []LocalDef, name: str) -> TExpr? {
+    mut i = 0
+    loop {
+        if i >= locals.len { break }
+        if locals[i].name == name { return locals[i].value }
+        i++
+    }
+    null
+}
+
+/**
+ * Build the resolution context for summarizing `f`: its parameter names, its top-level locals, and
+ * the bottom-up callee environment the driver has built so far.
+ *
+ * @param f           the function being summarized
+ * @param callee_sum  the already-known callee summaries
+ * @return            `f`'s resolution context
+ */
+fn borrow_ctx_of(f: TFunction, callee_sum: BorrowSummaryEnv) -> BorrowCtx {
+    BorrowCtx { param_names = param_name_list(f.params); locals = collect_locals(f.body); env = callee_sum }
+}
+
+/**
+ * Union the borrow contribution of every escaping candidate expression into one accumulator.
+ *
+ * @param vals   the escaping candidate expressions
+ * @param ctx    the resolution context
+ * @param table  the program's type table
+ * @return       the union of every candidate's borrow contribution
+ */
+fn fold_escaping_borrow(vals: []TExpr, ctx: BorrowCtx, table: TypeTable) -> BorrowAcc {
+    mut acc = no_borrow()
+    mut i = 0
+    loop {
+        if i >= vals.len { break }
+        acc = union_borrow(acc, resolve_borrow(vals[i], ctx, teko::list::empty(), table))
+        i++
+    }
+    acc
+}
+
+/**
+ * (SP-1b entry point) Compute `f`'s `BorrowSummary`: collect every escaping/return-value candidate
+ * expression of `f`'s body, resolve each one's borrow contribution against `f`'s own parameters (via
+ * the one-hop local-alias chase, the closure-capture union, and the bottom-up call composition), and
+ * union the results. A function with an empty body (e.g. an `extern fn`) trivially borrows nothing —
+ * its FFI boundary is a distinct, separately-gated surface (the Marshall open case), not modeled
+ * here.
+ *
+ * Deliberately takes `table: TypeTable` (a refinement of the design doc's 2-argument illustrative
+ * signature): `type_reaches_ref` needs it to resolve a `Named` parameter's own field shape, so a
+ * genuinely faithful implementation cannot omit it.
+ *
+ * @param f           the typed function to summarize
+ * @param table       the program's type table
+ * @param callee_sum  the bottom-up environment of already-summarized callees
+ * @return            `f`'s borrow summary
+ * @see   docs/design/safety-spine.md §B2.1(b)
+ * @since 0.3.1.0-beta (#389 SP-1)
+ */
+pub fn fn_borrow_summary(f: TFunction, table: TypeTable, callee_sum: BorrowSummaryEnv) -> BorrowSummary {
+    let ctx = borrow_ctx_of(f, callee_sum)
+    let escaping = collect_escaping_values(f.body, true, teko::list::empty())
+    let acc = fold_escaping_borrow(escaping, ctx, table)
+    BorrowSummary { returns_borrow_of = acc.idxs; returns_all = acc.all }
+}

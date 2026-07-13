@@ -1,0 +1,1366 @@
+/**
+ * rvenc_pg — a physical GPR operand with the given RISC-V register id (a
+ * golden-vector fixture shorthand; B2-5 runs post-regalloc, so every operand is
+ * physical). Prefixed `rvenc_` to avoid the shared `teko::backend` namespace's
+ * arm64/x86 test-helper names (the x86 `ex_` precedent).
+ *
+ * @param u32 id  the RISC-V register number (x0..x31)
+ * @return MReg  the physical GPR operand
+ */
+fn rvenc_pg(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * rvenc_pf — a physical FPR operand with the given RISC-V register id (the `B2-fp`
+ * stop fixture: an FPR load/store/ALU operand).
+ *
+ * @param u32 id  the RISC-V float register number (f0..f31)
+ * @return MReg  the physical FPR operand
+ */
+fn rvenc_pf(id: u32) -> MReg {
+    preg(id, MRegClass::FPR)
+}
+
+/**
+ * rvenc_mem — a base-plus-displacement12 memory operand `off(base)`.
+ *
+ * @param u32 base_id  the base register id (x0..x31)
+ * @param i32 off  the signed 12-bit displacement
+ * @return MMem  the memory operand
+ */
+fn rvenc_mem(base_id: u32, off: i32) -> MMem {
+    MMem { base = rvenc_pg(base_id); offset = off }
+}
+
+/**
+ * rvenc_bad_word — the sentinel `EncWordRiscv` (`word = 0xFFFFFFFF`) an unexpected
+ * honest-stop falls back to, so a golden word assertion fails loudly rather than
+ * aborting the test.
+ *
+ * @return EncWordRiscv  the all-ones sentinel word
+ */
+fn rvenc_bad_word() -> EncWordRiscv {
+    EncWordRiscv {
+        word = 0xFFFFFFFF to u32
+        has_branch = false
+        branch_form = 0 to u32
+        target = 0 to u32
+        has_reloc = false
+        reloc_sym = "<error>"
+        reloc_kind = RelocKindRiscv::Call
+    }
+}
+
+/**
+ * rvenc_enc — encode `inst`, unwrapping the success case and falling back to the
+ * `rvenc_bad_word` sentinel on an unexpected honest-stop.
+ *
+ * @param MInstRiscv inst  the instruction to encode
+ * @return EncWordRiscv  the encoded word, or the sentinel on error
+ */
+fn rvenc_enc(inst: MInstRiscv) -> EncWordRiscv {
+    match encode_inst_word_riscv(inst) {
+        EncWordRiscv as x => x
+        error as e => rvenc_bad_word()
+    }
+}
+
+/**
+ * rvenc_stop — the honest-stop message `inst` produces, or `<ok>` when it encodes
+ * successfully.
+ *
+ * @param MInstRiscv inst  the instruction to encode
+ * @return str  the error message, or `<ok>` when it encodes
+ */
+fn rvenc_stop(inst: MInstRiscv) -> str {
+    match encode_inst_word_riscv(inst) {
+        EncWordRiscv as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rvenc_assert_word — assert that `inst` encodes to the exact 32-bit `expected`
+ * word (the position-independent golden-vector check, assembler-cross-checked).
+ *
+ * @param MInstRiscv inst  the instruction to encode
+ * @param u32 expected  the known-good RISC-V instruction word
+ * @return void
+ */
+fn rvenc_assert_word(inst: MInstRiscv, expected: u32) {
+    teko::assert::is_true(rvenc_enc(inst).word == expected)
+}
+
+/**
+ * rvenc_assert_stop — assert that `inst` honest-stops with a message containing the
+ * named token (`B2-fp`/`B2-bigimm`/`B2-aluform`/`B2-6`).
+ *
+ * @param MInstRiscv inst  the instruction to encode
+ * @param str name  the named-stop token expected in the message
+ * @return void
+ */
+fn rvenc_assert_stop(inst: MInstRiscv, name: str) {
+    teko::assert::str_contains(rvenc_stop(inst), name)
+}
+
+/**
+ * rvenc_btype_full — the FULL B-type word an assembled branch produces at byte
+ * displacement `disp`: the placeholder `base` OR the scrambled two's-complement
+ * displacement (`btype_scramble` over `twos_field`), the exact composition the
+ * B2-6 word-patch pass performs. Lets a golden assert the scramble against the
+ * assembler.
+ *
+ * @param u32 base  the placeholder B-type word (immediate zero)
+ * @param i64 disp  the byte displacement (target - here)
+ * @return u32  the full B-type word
+ */
+fn rvenc_btype_full(base: u32, disp: i64) -> u32 {
+    base | btype_scramble(twos_field(disp, 13 to u32))
+}
+
+/**
+ * rvenc_jtype_full — the FULL J-type word an assembled `jal` produces at byte
+ * displacement `disp`: the placeholder `base` OR the scrambled two's-complement
+ * displacement (`jtype_scramble` over `twos_field`).
+ *
+ * @param u32 base  the placeholder J-type word (immediate zero)
+ * @param i64 disp  the byte displacement (target - here)
+ * @return u32  the full J-type word
+ */
+fn rvenc_jtype_full(base: u32, disp: i64) -> u32 {
+    base | jtype_scramble(twos_field(disp, 21 to u32))
+}
+
+/**
+ * rvenc_alu_r — a register-register ALU instruction fixture (`dst=a0, a=a1, b=a2`).
+ *
+ * @param MAluOpRiscv op  the ALU op
+ * @param bool wide  the width flag
+ * @return MInstRiscv  the built instruction
+ */
+fn rvenc_alu_r(op: MAluOpRiscv, wide: bool) -> MInstRiscv {
+    alu_r_riscv(op, wide, rvenc_pg(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32))
+}
+
+#test
+/**
+ * rvenc_encodes_r_type_base — the 64-bit `OP` (0x33) register-register ALU words
+ * for `add`/`sub`/`sll`/`xor`/`srl`/`sra`/`or`/`and` (a0, a1, a2), each
+ * assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_r_type_base() {
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Add, true), 0x00C58533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sub, true), 0x40C58533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sll, true), 0x00C59533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Xor, true), 0x00C5C533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Srl, true), 0x00C5D533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sra, true), 0x40C5D533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Or, true), 0x00C5E533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::And, true), 0x00C5F533 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_m_extension — the M-extension `mul`/`div`/`divu`/`rem`/`remu` words
+ * (funct7 = 0x01), each a SINGLE native instruction (the RISC-V div/rem
+ * simplification), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_m_extension() {
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Mul, true), 0x02C58533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Div, true), 0x02C5C533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Divu, true), 0x02C5D533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Rem, true), 0x02C5E533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Remu, true), 0x02C5F533 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_op32_w_forms — the RV64 `OP-32` (0x3B) 32-bit `*w` words
+ * (`addw`/`subw`/`sllw`/`srlw`/`sraw`/`mulw`/`divw`/`divuw`/`remw`/`remuw`),
+ * selected by `wide=false`, assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_op32_w_forms() {
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Add, false), 0x00C5853B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sub, false), 0x40C5853B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sll, false), 0x00C5953B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Srl, false), 0x00C5D53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Sra, false), 0x40C5D53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Mul, false), 0x02C5853B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Div, false), 0x02C5C53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Divu, false), 0x02C5D53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Rem, false), 0x02C5E53B to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Remu, false), 0x02C5F53B to u32)
+}
+
+#test
+/**
+ * rvenc_bitwise_ops_ignore_wide — `and`/`or`/`xor` have NO `OP-32` `*w` form, so a
+ * `wide=false` selection lowers to the SAME base (0x33) word as `wide=true` (the
+ * base op already yields the correct 32-bit result). Guards the encoder against
+ * emitting a nonexistent `andw`/`orw`/`xorw` for isel's 32-bit bitwise output.
+ *
+ * @return void
+ */
+fn rvenc_bitwise_ops_ignore_wide() {
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::And, false), 0x00C5F533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Or, false), 0x00C5E533 to u32)
+    rvenc_assert_word(rvenc_alu_r(MAluOpRiscv::Xor, false), 0x00C5C533 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_slt — the set-less-than `slt`(funct3=2)/`sltu`(funct3=3) words
+ * (a0, a1, a2), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_slt() {
+    rvenc_assert_word(slt_riscv(rvenc_pg(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32), false), 0x00C5A533 to u32)
+    rvenc_assert_word(slt_riscv(rvenc_pg(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32), true), 0x00C5B533 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_i_type_alu — the `li` (`addi rd, x0, imm`), `addi`/`xori`/`sltiu`
+ * register-immediate words, including a NEGATIVE immediate (`addi a0,a1,-100`
+ * and `xori a0,a1,-1`, exercising the masked two's-complement field with no
+ * panicking cast), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_i_type_alu() {
+    rvenc_assert_word(li_riscv(rvenc_pg(10 to u32), 42 to i32), 0x02A00513 to u32)
+    rvenc_assert_word(alu_i_riscv(MAluOpRiscv::Addi, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 100 to i32), 0x06458513 to u32)
+    rvenc_assert_word(alu_i_riscv(MAluOpRiscv::Addi, rvenc_pg(10 to u32), rvenc_pg(11 to u32), (0 to i32) - (100 to i32)), 0xF9C58513 to u32)
+    rvenc_assert_word(alu_i_riscv(MAluOpRiscv::Xori, rvenc_pg(10 to u32), rvenc_pg(11 to u32), (0 to i32) - (1 to i32)), 0xFFF5C513 to u32)
+    rvenc_assert_word(alu_i_riscv(MAluOpRiscv::Sltiu, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 1 to i32), 0x0015B513 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_loads — every load width/sign form (`ld`/`lw`/`lwu`/`lh`/`lhu`/`lb`/
+ * `lbu`) plus a NEGATIVE offset (`ld a0,-8(sp)`), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_loads() {
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::D, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 8 to i32)), 0x00813503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::W, true, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 4 to i32)), 0x00412503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::W, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 4 to i32)), 0x00416503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::H, true, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 2 to i32)), 0x00211503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::H, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 2 to i32)), 0x00215503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::B, true, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 1 to i32)), 0x00110503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::B, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 1 to i32)), 0x00114503 to u32)
+    rvenc_assert_word(load_riscv(MMemSizeRiscv::D, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, (0 to i32) - (8 to i32))), 0xFF813503 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_stores — every store width (`sd`/`sw`/`sh`/`sb`) plus a NEGATIVE
+ * offset (`sd a1,-8(sp)`), exercising the S-type SPLIT immediate (imm[11:5] /
+ * imm[4:0]), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_stores() {
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::D, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 8 to i32)), 0x00B13423 to u32)
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::W, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 4 to i32)), 0x00B12223 to u32)
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::H, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 2 to i32)), 0x00B11123 to u32)
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::B, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 1 to i32)), 0x00B100A3 to u32)
+    rvenc_assert_word(store_riscv(MMemSizeRiscv::D, rvenc_pg(11 to u32), rvenc_mem(2 to u32, (0 to i32) - (8 to i32))), 0xFEB13C23 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_u_type — `lui`/`auipc` U-type words (immediate placed directly, no
+ * scramble), including `auipc ra, 0` (the reloc-free base of the B2-6 call
+ * macro), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_u_type() {
+    rvenc_assert_word(lui_riscv(rvenc_pg(10 to u32), 0x12345 to u32), 0x12345537 to u32)
+    rvenc_assert_word(auipc_riscv(rvenc_pg(10 to u32), 0x12345 to u32), 0x12345517 to u32)
+    rvenc_assert_word(auipc_riscv(rvenc_pg(1 to u32), 0 to u32), 0x00000097 to u32)
+}
+
+#test
+/**
+ * rvenc_encodes_control_words — the single-word control forms: `jalr a0, 0(a1)`,
+ * the `MCallIndRiscv` `jalr ra, 0(a1)`, and `ret` (`jalr x0, 0(ra)` =
+ * 0x00008067), assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_encodes_control_words() {
+    rvenc_assert_word(jalr_riscv(rvenc_pg(10 to u32), rvenc_pg(11 to u32), 0 to i32), 0x00058567 to u32)
+    rvenc_assert_word(call_ind_riscv(rvenc_pg(11 to u32), teko::list::empty(), rvenc_pg(10 to u32), false), 0x000580E7 to u32)
+    rvenc_assert_word(ret_riscv(), 0x00008067 to u32)
+}
+
+#test
+/**
+ * rvenc_branch_placeholder_flags — a fused compare-branch encodes to its base word
+ * (scrambled displacement ZERO) flagged `has_branch`, `branch_form=0`, and the
+ * target block id; the immediate field is patched later by B2-6.
+ *
+ * @return void
+ */
+fn rvenc_branch_placeholder_flags() {
+    let w = rvenc_enc(branch_riscv(MCond::EQ, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 7 to u32))
+    teko::assert::is_true(w.word == (0x00B50063 to u32))
+    teko::assert::is_true(w.has_branch)
+    teko::assert::is_true(w.branch_form == (0 to u32))
+    teko::assert::is_true(w.target == (7 to u32))
+    teko::assert::is_false(w.has_reloc)
+}
+
+/**
+ * rvenc_branch_word — the placeholder base word `branch_riscv(cond, a0, a1, 5)`
+ * encodes to (the scrambled displacement is zero, so `word` IS the base). Lets a
+ * golden pin every condition's funct3 + operand-swap through the encoder.
+ *
+ * @param MCond cond  the branch condition
+ * @return u32  the placeholder B-type word
+ */
+fn rvenc_branch_word(cond: MCond) -> u32 {
+    rvenc_enc(branch_riscv(cond, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 5 to u32)).word
+}
+
+#test
+/**
+ * rvenc_encodes_every_branch_condition — the placeholder B-type base word for
+ * ALL ten `MCond` conditions through the encoder: the six direct forms
+ * (`beq`/`bne`/`blt`/`bge`/`bltu`/`bgeu`) and the four order-only forms
+ * (`GT`/`LE`/`HI`/`LS`) which reuse `blt`/`bge`/`bltu`/`bgeu` with the operands
+ * SWAPPED (rs1/rs2 exchanged), each cross-checked against a self-branch
+ * (disp = 0) assembled word.
+ *
+ * @return void
+ */
+fn rvenc_encodes_every_branch_condition() {
+    teko::assert::is_true(rvenc_branch_word(MCond::EQ) == (0x00B50063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::NE) == (0x00B51063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::LT) == (0x00B54063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::GE) == (0x00B55063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::LO) == (0x00B56063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::HS) == (0x00B57063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::GT) == (0x00A5C063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::LE) == (0x00A5D063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::HI) == (0x00A5E063 to u32))
+    teko::assert::is_true(rvenc_branch_word(MCond::LS) == (0x00A5F063 to u32))
+}
+
+#test
+/**
+ * rvenc_jal_placeholder_flags — an unconditional `jal x0, block` encodes to its
+ * base word (0x6F, scrambled displacement ZERO) flagged `has_branch`,
+ * `branch_form=1`, and the target block id.
+ *
+ * @return void
+ */
+fn rvenc_jal_placeholder_flags() {
+    let w = rvenc_enc(jal_riscv(9 to u32))
+    teko::assert::is_true(w.word == (0x0000006F to u32))
+    teko::assert::is_true(w.has_branch)
+    teko::assert::is_true(w.branch_form == (1 to u32))
+    teko::assert::is_true(w.target == (9 to u32))
+}
+
+#test
+/**
+ * rvenc_btype_scramble_all_conditions — the B-type displacement scramble for ALL
+ * six branch conditions at a forward offset, each cross-checked against the
+ * exact `clang`/`objdump` full word (base placeholder OR the scrambled
+ * displacement).
+ *
+ * @return void
+ */
+fn rvenc_btype_scramble_all_conditions() {
+    teko::assert::is_true(rvenc_btype_full(0x00B50063 to u32, 32 to i64) == (0x02B50063 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B51063 to u32, 28 to i64) == (0x00B51E63 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B54063 to u32, 24 to i64) == (0x00B54C63 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B55063 to u32, 20 to i64) == (0x00B55A63 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B56063 to u32, 16 to i64) == (0x00B56863 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B57063 to u32, 12 to i64) == (0x00B57663 to u32))
+}
+
+#test
+/**
+ * rvenc_btype_scramble_negative_and_boundary — the B-type scramble for a NEGATIVE
+ * (backward) displacement — exercising the `twos_field` two's-complement path
+ * with NO panicking negative cast — and the near-±4 KiB boundary offsets, each
+ * cross-checked against the assembler.
+ *
+ * @return void
+ */
+fn rvenc_btype_scramble_negative_and_boundary() {
+    teko::assert::is_true(rvenc_btype_full(0x00D60063 to u32, (0 to i64) - (32 to i64)) == (0xFED600E3 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B50063 to u32, 4064 to i64) == (0x7EB500E3 to u32))
+    teko::assert::is_true(rvenc_btype_full(0x00B55063 to u32, (0 to i64) - (4064 to i64)) == (0x82B55063 to u32))
+}
+
+#test
+/**
+ * rvenc_jtype_scramble_goldens — the J-type displacement scramble for a forward
+ * offset (rd = x0), a large backward offset with rd = ra (exercising both the
+ * negative two's-complement path AND a non-zero `rd` base), and another large
+ * backward offset (rd = x0), each cross-checked against `clang`/`objdump`.
+ *
+ * @return void
+ */
+fn rvenc_jtype_scramble_goldens() {
+    teko::assert::is_true(rvenc_jtype_full(0x0000006F to u32, 24 to i64) == (0x0180006F to u32))
+    teko::assert::is_true(rvenc_jtype_full(0x000000EF to u32, (0 to i64) - (6132 to i64)) == (0x80DFE0EF to u32))
+    teko::assert::is_true(rvenc_jtype_full(0x0000006F to u32, (0 to i64) - (6152 to i64)) == (0xFF8FE06F to u32))
+}
+
+#test
+/**
+ * rvenc_reloc_word_primitive — `reloc_word_riscv` builds the reloc-flagged
+ * placeholder word the B2-6 emit pass composes into the call/address pairs: the
+ * base word preserved, `has_reloc` set, the `Call` kind and symbol carried.
+ * Exercises the `auipc ra, 0` (0x00000097) placeholder the call macro relocates.
+ *
+ * @return void
+ */
+fn rvenc_reloc_word_primitive() {
+    let w = reloc_word_riscv(0x00000097 to u32, "tk_exit", RelocKindRiscv::Call)
+    teko::assert::is_true(w.word == (0x00000097 to u32))
+    teko::assert::is_true(w.has_reloc)
+    teko::assert::is_false(w.has_branch)
+    teko::assert::str_contains(w.reloc_sym, "tk_exit")
+    let is_call = match w.reloc_kind { Call => true; _ => false }
+    teko::assert::is_true(is_call)
+}
+
+#test
+/**
+ * rvenc_reloc_type_numeric_map — `riscv_reloc_type` maps each `RelocKindRiscv` to
+ * its numeric `R_RISCV_*` type: Call=19, PcRelHi20=23, PcRelLo12=24, Branch=16,
+ * Jal=17, Abs64=2 (the values the reused ELF writer emits into `r_info`).
+ *
+ * @return void
+ */
+fn rvenc_reloc_type_numeric_map() {
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::Call) == (19 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::PcRelHi20) == (23 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::PcRelLo12) == (24 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::Branch) == (16 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::Jal) == (17 to u32))
+    teko::assert::is_true(riscv_reloc_type(RelocKindRiscv::Abs64) == (2 to u32))
+}
+
+#test
+/**
+ * rvenc_fp_honest_stop — an FPR-class load, store, or ALU operand raises the
+ * `B2-fp` named honest-stop (the F/D family is deferred to 0.3.1).
+ *
+ * @return void
+ */
+fn rvenc_fp_honest_stop() {
+    rvenc_assert_stop(load_riscv(MMemSizeRiscv::D, false, rvenc_pf(10 to u32), rvenc_mem(2 to u32, 0 to i32)), "B2-fp")
+    rvenc_assert_stop(store_riscv(MMemSizeRiscv::D, rvenc_pf(11 to u32), rvenc_mem(2 to u32, 0 to i32)), "B2-fp")
+    rvenc_assert_stop(alu_r_riscv(MAluOpRiscv::Add, true, rvenc_pf(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32)), "B2-fp")
+}
+
+#test
+/**
+ * rvenc_bigimm_honest_stop — an immediate outside the signed imm12 window
+ * (`[-2048, 2047]`) raises `B2-bigimm` from the `li`, `addi`, load, store, and
+ * `jalr` immediate paths; the window boundaries (2047 / -2048) encode fine.
+ *
+ * @return void
+ */
+fn rvenc_bigimm_honest_stop() {
+    rvenc_assert_stop(li_riscv(rvenc_pg(10 to u32), 2048 to i32), "B2-bigimm")
+    rvenc_assert_stop(li_riscv(rvenc_pg(10 to u32), (0 to i32) - (2049 to i32)), "B2-bigimm")
+    rvenc_assert_stop(alu_i_riscv(MAluOpRiscv::Addi, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 4096 to i32), "B2-bigimm")
+    rvenc_assert_stop(load_riscv(MMemSizeRiscv::D, false, rvenc_pg(10 to u32), rvenc_mem(2 to u32, 2048 to i32)), "B2-bigimm")
+    rvenc_assert_stop(store_riscv(MMemSizeRiscv::D, rvenc_pg(11 to u32), rvenc_mem(2 to u32, 3000 to i32)), "B2-bigimm")
+    rvenc_assert_stop(jalr_riscv(rvenc_pg(10 to u32), rvenc_pg(11 to u32), 5000 to i32), "B2-bigimm")
+    teko::assert::is_true(rvenc_stop(li_riscv(rvenc_pg(10 to u32), 2047 to i32)) == "<ok>")
+    teko::assert::is_true(rvenc_stop(li_riscv(rvenc_pg(10 to u32), (0 to i32) - (2048 to i32))) == "<ok>")
+}
+
+#test
+/**
+ * rvenc_aluform_internal_invariant — the crossed register/immediate ALU forms an
+ * `MAluOpRiscv` can name but isel never selects (an immediate-only op in a
+ * register-register `MAluRRiscv`, a register-register op in a register-immediate
+ * `MAluIRiscv`) raise the `B2-aluform` internal-invariant guard.
+ *
+ * @return void
+ */
+fn rvenc_aluform_internal_invariant() {
+    rvenc_assert_stop(alu_r_riscv(MAluOpRiscv::Addi, true, rvenc_pg(10 to u32), rvenc_pg(11 to u32), rvenc_pg(12 to u32)), "B2-aluform")
+    rvenc_assert_stop(alu_i_riscv(MAluOpRiscv::Add, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 0 to i32), "B2-aluform")
+}
+
+#test
+/**
+ * rvenc_b2_6_deferred_cases — the multi-word/frame cases the B2-6 emit pass
+ * assembles (`MCallRiscv` auipc+jalr pair, `MLlaRiscv` auipc+addi pair + label,
+ * `MFrameAddrRiscv` frame-slot address) return their `B2-6` slice-boundary stops
+ * from this single-word core.
+ *
+ * @return void
+ */
+fn rvenc_b2_6_deferred_cases() {
+    rvenc_assert_stop(call_riscv("tk_exit", teko::list::empty(), rvenc_pg(10 to u32), false, false), "B2-6")
+    rvenc_assert_stop(lla_riscv(rvenc_pg(10 to u32), "some_data"), "B2-6")
+    rvenc_assert_stop(frame_addr_riscv(rvenc_pg(10 to u32), 0 to u32), "B2-6")
+}
+
+/**
+ * rvenc_slot — an 8-byte, 8-aligned frame slot (the canonical GPR spill), the
+ * `LAlloca` a frame-layout fixture reserves.
+ *
+ * @return lir::LAlloca  the spill slot reservation
+ */
+fn rvenc_slot() -> lir::LAlloca {
+    lir::LAlloca { bytes = 8 to u32; align = 8 to u32 }
+}
+
+/**
+ * rvenc_slots_func — a function with `n` reserved 8-byte spill slots and a bare
+ * `ret` (no calls, no callee-saved registers): a slots-only frame, the
+ * `few spills` / `many spills` frame-layout fixture.
+ *
+ * @param u64 n  the number of spill slots to reserve
+ * @return MFuncRiscv  the slots-only function
+ */
+fn rvenc_slots_func(n: u64) -> MFuncRiscv {
+    mut f = new_mfunc_riscv("slots")
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        f = append_frame_riscv(f, rvenc_slot())
+        i++
+    }
+    append_minst_riscv(f, 0 to u32, ret_riscv())
+}
+
+/**
+ * rvenc_leaf_func — a leaf function `li a0, 5 ; ret`: no calls, no callee-saved
+ * registers, no frame slots — the FRAMELESS layout fixture (size 0, empty
+ * prologue).
+ *
+ * @return MFuncRiscv  the frameless leaf function
+ */
+fn rvenc_leaf_func() -> MFuncRiscv {
+    let f = append_minst_riscv(new_mfunc_riscv("leaf"), 0 to u32, li_riscv(rvenc_pg(10 to u32), 5 to i32))
+    append_minst_riscv(f, 0 to u32, ret_riscv())
+}
+
+/**
+ * rvenc_call_func — a call-frame function `add s1, s1, a0 ; call tk_thing ;
+ * ret`: it uses the callee-saved s1 (so the scan re-derives one saved GPR) AND
+ * both calls and returns (so the special ra-save is load-bearing), the
+ * `call-frame with ra` frame-layout fixture.
+ *
+ * @return MFuncRiscv  the call-frame function
+ */
+fn rvenc_call_func() -> MFuncRiscv {
+    let f0 = append_minst_riscv(new_mfunc_riscv("caller"), 0 to u32, alu_r_riscv(MAluOpRiscv::Add, true, rvenc_pg(9 to u32), rvenc_pg(9 to u32), rvenc_pg(10 to u32)))
+    let f1 = append_minst_riscv(f0, 0 to u32, call_riscv("tk_thing", teko::list::empty(), rvenc_pg(10 to u32), true, false))
+    append_minst_riscv(f1, 0 to u32, ret_riscv())
+}
+
+/**
+ * rvenc_layout — the resolved `FrameLayoutRiscv` of `f` under the LP64D register
+ * file.
+ *
+ * @param MFuncRiscv f  the function to lay out
+ * @return FrameLayoutRiscv  the resolved frame side-table
+ */
+fn rvenc_layout(f: MFuncRiscv) -> FrameLayoutRiscv {
+    compute_frame_layout_riscv(riscv64_lp64d(), f)
+}
+
+/**
+ * rvenc_prologue — the prologue words of `f`, or the empty list on an unexpected
+ * honest-stop.
+ *
+ * @param MFuncRiscv f  the function whose prologue to emit
+ * @return []u32  the prologue words
+ */
+fn rvenc_prologue(f: MFuncRiscv) -> []u32 {
+    match emit_prologue_riscv(rvenc_layout(f)) {
+        []u32 as w => w
+        error as e => teko::list::empty()
+    }
+}
+
+/**
+ * rvenc_epilogue — the epilogue words of `f` (the `ret` excluded), or the empty
+ * list on an unexpected honest-stop.
+ *
+ * @param MFuncRiscv f  the function whose epilogue to emit
+ * @return []u32  the epilogue words
+ */
+fn rvenc_epilogue(f: MFuncRiscv) -> []u32 {
+    match emit_epilogue_riscv(rvenc_layout(f)) {
+        []u32 as w => w
+        error as e => teko::list::empty()
+    }
+}
+
+#test
+/**
+ * rvenc_frame_layout_frameless — a leaf `li a0,5 ; ret` needs NO frame: size 0,
+ * no saved registers, no slots (the frameless `exit(n)`-style keystone).
+ *
+ * @return void
+ */
+fn rvenc_frame_layout_frameless() {
+    let layout = rvenc_layout(rvenc_leaf_func())
+    teko::assert::is_true(layout.size == (0 to u32))
+    teko::assert::is_true(layout.saved_gpr.len == (0 to u64))
+    teko::assert::is_true(layout.saved_fpr.len == (0 to u64))
+    teko::assert::is_true(layout.slot_offsets.len == (0 to u64))
+}
+
+#test
+/**
+ * rvenc_frame_layout_slots — a two-slot frame is 16-aligned to 32 bytes (16 for
+ * the slot region + 16 for the always-saved s0/ra pair), with the slots at `sp`
+ * offsets 0 and 8 and no scanned callee-saved registers.
+ *
+ * @return void
+ */
+fn rvenc_frame_layout_slots() {
+    let layout = rvenc_layout(rvenc_slots_func(2 to u64))
+    teko::assert::is_true(layout.size == (32 to u32))
+    teko::assert::is_true(layout.saved_gpr.len == (0 to u64))
+    teko::assert::is_true(layout.slot_offsets.len == (2 to u64))
+    teko::assert::is_true(layout.slot_offsets[0 to u64] == (0 to u32))
+    teko::assert::is_true(layout.slot_offsets[1 to u64] == (8 to u32))
+}
+
+#test
+/**
+ * rvenc_frame_layout_many_slots — a five-slot frame: the 40-byte slot region
+ * rounds to 48, plus 16 for s0/ra = 64, with the slots at ascending 8-byte `sp`
+ * offsets (0, 8, 16, 24, 32).
+ *
+ * @return void
+ */
+fn rvenc_frame_layout_many_slots() {
+    let layout = rvenc_layout(rvenc_slots_func(5 to u64))
+    teko::assert::is_true(layout.size == (64 to u32))
+    teko::assert::is_true(layout.slot_offsets.len == (5 to u64))
+    teko::assert::is_true(layout.slot_offsets[0 to u64] == (0 to u32))
+    teko::assert::is_true(layout.slot_offsets[4 to u64] == (32 to u32))
+}
+
+#test
+/**
+ * rvenc_frame_layout_call_ra — a call-frame that uses the callee-saved s1 AND
+ * both calls and returns: the scan re-derives exactly one saved GPR (s1 = id 9),
+ * and the frame is 32 bytes (8 for s1 + 16 for s0/ra, rounded to 32).
+ *
+ * @return void
+ */
+fn rvenc_frame_layout_call_ra() {
+    let layout = rvenc_layout(rvenc_call_func())
+    teko::assert::is_true(layout.size == (32 to u32))
+    teko::assert::is_true(layout.saved_gpr.len == (1 to u64))
+    teko::assert::is_true(layout.saved_gpr[0 to u64] == (9 to u32))
+    teko::assert::is_true(needs_ra_save_riscv(rvenc_call_func()))
+}
+
+#test
+/**
+ * rvenc_leaf_needs_no_ra_save — a function that returns but makes NO call needs
+ * no ra-save (its ra is never clobbered), so `needs_ra_save_riscv` is false and
+ * it stays frameless.
+ *
+ * @return void
+ */
+fn rvenc_leaf_needs_no_ra_save() {
+    teko::assert::is_false(needs_ra_save_riscv(rvenc_leaf_func()))
+}
+
+#test
+/**
+ * rvenc_prologue_call_frame — the call-frame prologue words: `addi sp,sp,-32` ;
+ * `sd ra,24(sp)` ; `sd s0,16(sp)` ; `addi s0,sp,32` ; `sd s1,8(sp)`, each
+ * cross-checked against `zig cc -target riscv64 -mcpu=generic_rv64` + objdump.
+ *
+ * @return void
+ */
+fn rvenc_prologue_call_frame() {
+    let w = rvenc_prologue(rvenc_call_func())
+    teko::assert::is_true(w.len == (5 to u64))
+    teko::assert::is_true(w[0 to u64] == (0xFE010113 to u32))
+    teko::assert::is_true(w[1 to u64] == (0x00113C23 to u32))
+    teko::assert::is_true(w[2 to u64] == (0x00813823 to u32))
+    teko::assert::is_true(w[3 to u64] == (0x02010413 to u32))
+    teko::assert::is_true(w[4 to u64] == (0x00913423 to u32))
+}
+
+#test
+/**
+ * rvenc_epilogue_call_frame — the call-frame epilogue words (LIFO, `ret`
+ * excluded): `ld s1,8(sp)` ; `ld s0,16(sp)` ; `ld ra,24(sp)` ; `addi sp,sp,32`,
+ * each assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_epilogue_call_frame() {
+    let w = rvenc_epilogue(rvenc_call_func())
+    teko::assert::is_true(w.len == (4 to u64))
+    teko::assert::is_true(w[0 to u64] == (0x00813483 to u32))
+    teko::assert::is_true(w[1 to u64] == (0x01013403 to u32))
+    teko::assert::is_true(w[2 to u64] == (0x01813083 to u32))
+    teko::assert::is_true(w[3 to u64] == (0x02010113 to u32))
+}
+
+#test
+/**
+ * rvenc_prologue_slots_only — a slots-only frame still saves s0/ra unconditionally
+ * (a framed function always reserves the top 16 bytes), so its prologue is the
+ * four-word `addi sp,sp,-32` ; `sd ra,24(sp)` ; `sd s0,16(sp)` ; `addi s0,sp,32`
+ * with NO callee-saved store.
+ *
+ * @return void
+ */
+fn rvenc_prologue_slots_only() {
+    let w = rvenc_prologue(rvenc_slots_func(2 to u64))
+    teko::assert::is_true(w.len == (4 to u64))
+    teko::assert::is_true(w[0 to u64] == (0xFE010113 to u32))
+    teko::assert::is_true(w[1 to u64] == (0x00113C23 to u32))
+    teko::assert::is_true(w[2 to u64] == (0x00813823 to u32))
+    teko::assert::is_true(w[3 to u64] == (0x02010413 to u32))
+}
+
+#test
+/**
+ * rvenc_frameless_prologue_empty — a frameless leaf emits an EMPTY prologue and
+ * epilogue (no stack manipulation).
+ *
+ * @return void
+ */
+fn rvenc_frameless_prologue_empty() {
+    teko::assert::is_true(rvenc_prologue(rvenc_leaf_func()).len == (0 to u64))
+    teko::assert::is_true(rvenc_epilogue(rvenc_leaf_func()).len == (0 to u64))
+}
+
+#test
+/**
+ * rvenc_bigframe_honest_stop — a frame past the `addi` imm12 window (a
+ * 4096-byte slot → a 4112-byte frame) raises `B2-bigframe` from the prologue AND
+ * a slot-address `MFrameAddrRiscv` past the window; a frame at the 2047-byte
+ * boundary encodes fine.
+ *
+ * @return void
+ */
+fn rvenc_bigframe_honest_stop() {
+    let big = append_minst_riscv(append_frame_riscv(new_mfunc_riscv("big"), lir::LAlloca { bytes = 4096 to u32; align = 8 to u32 }), 0 to u32, ret_riscv())
+    let stop = match emit_prologue_riscv(rvenc_layout(big)) {
+        []u32 as w => "<ok>"
+        error as e => e.message
+    }
+    teko::assert::str_contains(stop, "B2-bigframe")
+}
+
+/**
+ * rvenc_fpr_callee_func — a function whose only instruction defines fs0
+ * (`rvenc_pf(8)`, id 8 — callee-saved per `riscv64_lp64d`'s `fpr_allocatable`,
+ * `abi_riscv64.tks:60-64`): an `MLoadRiscv{dst=fs0}` (the frame-layout scan
+ * reads `inst_regs_riscv`'s def/use table directly, independent of the
+ * single-word encoder's own FPR rejection). The scan folds fs0 into
+ * `saved_fpr`, which ALONE forces `frame_total_size` to frame the function
+ * (`n_saved >= 1`), so `layout.size > 0` — past the `size == 0` frameless guard
+ * — reaching the LIVE `saved_fpr.len > 0` honest-stop in both
+ * `emit_prologue_riscv` and `emit_epilogue_riscv`.
+ *
+ * @return MFuncRiscv  the callee-saved-FPR fixture
+ */
+fn rvenc_fpr_callee_func() -> MFuncRiscv {
+    append_minst_riscv(new_mfunc_riscv("fprcallee"), 0 to u32, load_riscv(MMemSizeRiscv::D, false, rvenc_pf(8 to u32), rvenc_mem(2 to u32, 0 to i32)))
+}
+
+#test
+/**
+ * rvenc_fpr_callee_saved_honest_stop — a callee-saved FPR (fs0) in the scanned
+ * save-set is a LIVE reachable case (fs0-fs11/id 8,9,18-27 ARE callee-saved
+ * allocatable FPRs, `abi_riscv64.tks:53-63`), NOT an unreachable arm: the frame
+ * layout records `saved_fpr = [8]` with `size > 0`, and BOTH
+ * `emit_prologue_riscv` and `emit_epilogue_riscv` raise `B2-fp` (the F/D
+ * `fsd`/`fld` save/restore family is deferred to 0.3.1) rather than silently
+ * skipping the callee-saved FPR save.
+ *
+ * @return void
+ */
+fn rvenc_fpr_callee_saved_honest_stop() {
+    let layout = rvenc_layout(rvenc_fpr_callee_func())
+    teko::assert::is_true(layout.saved_fpr.len == (1 to u64))
+    teko::assert::is_true(layout.saved_fpr[0 to u64] == (8 to u32))
+    teko::assert::is_true(layout.size > (0 to u32))
+    let pro_stop = match emit_prologue_riscv(layout) { []u32 as w => "<ok>"; error as e => e.message }
+    let epi_stop = match emit_epilogue_riscv(layout) { []u32 as w => "<ok>"; error as e => e.message }
+    teko::assert::str_contains(pro_stop, "B2-fp")
+    teko::assert::str_contains(epi_stop, "B2-fp")
+}
+
+/**
+ * rvenc_encode_func — encode `f` under the LP64D register file (label counter 0),
+ * unwrapping the success case to its `EncodedFuncRiscv` and falling back to an
+ * empty encoding on an unexpected honest-stop.
+ *
+ * @param MFuncRiscv f  the function to encode
+ * @return EncodedFuncRiscv  the encoded function, or an empty stand-in on error
+ */
+fn rvenc_encode_func(f: MFuncRiscv) -> EncodedFuncRiscv {
+    match encode_func_riscv(riscv64_lp64d(), f, 0 to u32) {
+        FuncEncOutRiscv as o => o.func
+        error as e => EncodedFuncRiscv { symbol = "<error>"; words = teko::list::empty(); relocs = teko::list::empty(); labels = teko::list::empty() }
+    }
+}
+
+/**
+ * rvenc_slot_addr_word — the resolved `MFrameAddrRiscv{a0, slot}` word for a
+ * two-slot frame: reserve two slots, append the frame-address instruction, and
+ * read the final emitted word (the frame `addi`, after the four prologue words).
+ *
+ * @param u32 slot  the frame-slot index
+ * @return u32  the resolved `addi a0, sp, #off` word
+ */
+fn rvenc_slot_addr_word(slot: u32) -> u32 {
+    let f0 = append_frame_riscv(append_frame_riscv(new_mfunc_riscv("fa"), rvenc_slot()), rvenc_slot())
+    let f1 = append_minst_riscv(f0, 0 to u32, frame_addr_riscv(rvenc_pg(10 to u32), slot))
+    let ef = rvenc_encode_func(f1)
+    ef.words[ef.words.len - (1 to u64)]
+}
+
+#test
+/**
+ * rvenc_frame_addr_resolves — `MFrameAddrRiscv` resolves to `addi a0, sp, #off`:
+ * slot 0 → `addi a0, sp, 0` (0x00010513), slot 1 → `addi a0, sp, 8`
+ * (0x00810513), reading the alignment-honoring slot offsets.
+ *
+ * @return void
+ */
+fn rvenc_frame_addr_resolves() {
+    teko::assert::is_true(rvenc_slot_addr_word(0 to u32) == (0x00010513 to u32))
+    teko::assert::is_true(rvenc_slot_addr_word(1 to u32) == (0x00810513 to u32))
+}
+
+/**
+ * rvenc_branch_func — a two-block frameless function exercising both branch
+ * directions: block 0 `beq a1,a2,#M1` (FORWARD, +4 bytes) and block 1
+ * `addi a0,a0,1 ; jal #M0` (BACKWARD, -8 bytes). No calls/returns → frameless,
+ * so block 0 starts at word 0 and the displacements are exact.
+ *
+ * @return MFuncRiscv  the two-block branch function
+ */
+fn rvenc_branch_func() -> MFuncRiscv {
+    let f0 = append_minst_riscv(new_mfunc_riscv("br"), 0 to u32, branch_riscv(MCond::EQ, rvenc_pg(11 to u32), rvenc_pg(12 to u32), 1 to u32))
+    let f1 = append_block_riscv(f0, MBlockRiscv { id = 1 to u32; params = teko::list::empty(); insts = teko::list::empty() })
+    let f2 = append_minst_riscv(f1, 1 to u32, alu_i_riscv(MAluOpRiscv::Addi, rvenc_pg(10 to u32), rvenc_pg(10 to u32), 1 to i32))
+    append_minst_riscv(f2, 1 to u32, jal_riscv(0 to u32))
+}
+
+#test
+/**
+ * rvenc_branch_patch_forward_backward — the two-block function's branch
+ * displacements are scrambled in from the recorded block offsets: the FORWARD
+ * `beq` (disp +4 → 0x00C58263), the middle `addi` (0x00150513), and the
+ * BACKWARD `jal` (disp -8 → 0xFF9FF06F, the two's-complement path), each
+ * assembler-cross-checked.
+ *
+ * @return void
+ */
+fn rvenc_branch_patch_forward_backward() {
+    let ef = rvenc_encode_func(rvenc_branch_func())
+    teko::assert::is_true(ef.words.len == (3 to u64))
+    teko::assert::is_true(ef.words[0 to u64] == (0x00C58263 to u32))
+    teko::assert::is_true(ef.words[1 to u64] == (0x00150513 to u32))
+    teko::assert::is_true(ef.words[2 to u64] == (0xFF9FF06F to u32))
+}
+
+/**
+ * rvenc_scramble_stop — the honest-stop message the branch scramble produces for
+ * a byte displacement `disp` under `form` (0 = B-type, 1 = J-type), or `<ok>`
+ * when it fits the field.
+ *
+ * @param i64 disp  the byte displacement
+ * @param u32 form  the field selector (0 = B-type, 1 = J-type)
+ * @return str  the error message, or `<ok>` when in range
+ */
+fn rvenc_scramble_stop(disp: i64, form: u32) -> str {
+    match branch_scramble_field_riscv(disp, form) {
+        u32 as v => "<ok>"
+        error as e => e.message
+    }
+}
+
+#test
+/**
+ * rvenc_farbranch_guard — the B2-6 range guard the scramble functions lack: a
+ * B-type displacement past ±4 KiB and a J-type past ±1 MiB raise `B2-farbranch`
+ * rather than silently encoding a wrong target, while the exact even boundaries
+ * (±4094 B / ±1048574 J) encode fine.
+ *
+ * @return void
+ */
+fn rvenc_farbranch_guard() {
+    teko::assert::is_true(rvenc_scramble_stop(4094 to i64, 0 to u32) == "<ok>")
+    teko::assert::is_true(rvenc_scramble_stop((0 to i64) - (4096 to i64), 0 to u32) == "<ok>")
+    teko::assert::str_contains(rvenc_scramble_stop(4096 to i64, 0 to u32), "B2-farbranch")
+    teko::assert::str_contains(rvenc_scramble_stop((0 to i64) - (4098 to i64), 0 to u32), "B2-farbranch")
+    teko::assert::is_true(rvenc_scramble_stop(1048574 to i64, 1 to u32) == "<ok>")
+    teko::assert::str_contains(rvenc_scramble_stop(1048576 to i64, 1 to u32), "B2-farbranch")
+}
+
+/**
+ * rvenc_call_only_func — a frameless `li a0,0 ; call tk_exit` (no `ret`): the
+ * `exit(n)` keystone shape whose only reloc is the `Call` on the `auipc`.
+ *
+ * @return MFuncRiscv  the call-only function
+ */
+fn rvenc_call_only_func() -> MFuncRiscv {
+    let f = append_minst_riscv(new_mfunc_riscv("main"), 0 to u32, li_riscv(rvenc_pg(10 to u32), 0 to i32))
+    append_minst_riscv(f, 0 to u32, call_riscv("tk_exit", teko::list::empty(), rvenc_pg(10 to u32), false, false))
+}
+
+#test
+/**
+ * rvenc_call_macro_expansion — `MCallRiscv` expands to the two-word macro
+ * `auipc ra,0` (0x00000097) + `jalr ra,0(ra)` (0x000080E7) and records ONE
+ * `Call` (R_RISCV_CALL_PLT = 19) relocation on the `auipc`, offset 4 (past the
+ * `li a0,0`), addend 0 — the assembler-verified exit-corpus call path.
+ *
+ * @return void
+ */
+fn rvenc_call_macro_expansion() {
+    let ef = rvenc_encode_func(rvenc_call_only_func())
+    teko::assert::is_true(ef.words.len == (3 to u64))
+    teko::assert::is_true(ef.words[0 to u64] == (0x00000513 to u32))
+    teko::assert::is_true(ef.words[1 to u64] == (0x00000097 to u32))
+    teko::assert::is_true(ef.words[2 to u64] == (0x000080E7 to u32))
+    teko::assert::is_true(ef.relocs.len == (1 to u64))
+    teko::assert::is_true(ef.relocs[0 to u64].offset == (4 to u32))
+    teko::assert::str_contains(ef.relocs[0 to u64].sym, "tk_exit")
+    teko::assert::is_true(riscv_reloc_type(ef.relocs[0 to u64].kind) == (19 to u32))
+    teko::assert::is_true(ef.relocs[0 to u64].addend == (0 to i64))
+    teko::assert::is_true(ef.labels.len == (0 to u64))
+}
+
+/**
+ * rvenc_lla_func — a frameless `lla a0, mydata ; ret`: the PC-relative data
+ * address pair whose HI20/LO12 relocations + synthesized `.Lpcrel_hi0` label the
+ * B2-6 emit pass produces.
+ *
+ * @return MFuncRiscv  the address-materialization function
+ */
+fn rvenc_lla_func() -> MFuncRiscv {
+    let f = append_minst_riscv(new_mfunc_riscv("loadaddr"), 0 to u32, lla_riscv(rvenc_pg(10 to u32), "mydata"))
+    append_minst_riscv(f, 0 to u32, ret_riscv())
+}
+
+#test
+/**
+ * rvenc_lla_pair_words — `MLlaRiscv` expands to `auipc a0,0` (0x00000517) +
+ * `addi a0,a0,0` (0x00050513), the reloc-placeholder pair (immediates zero,
+ * assembler-verified), followed by the frameless `ret`.
+ *
+ * @return void
+ */
+fn rvenc_lla_pair_words() {
+    let ef = rvenc_encode_func(rvenc_lla_func())
+    teko::assert::is_true(ef.words.len == (3 to u64))
+    teko::assert::is_true(ef.words[0 to u64] == (0x00000517 to u32))
+    teko::assert::is_true(ef.words[1 to u64] == (0x00050513 to u32))
+    teko::assert::is_true(ef.words[2 to u64] == (0x00008067 to u32))
+}
+
+#test
+/**
+ * rvenc_lla_pair_relocs — the PAIR relocation the RISC-V data address needs: the
+ * HI20 (R_RISCV_PCREL_HI20 = 23) on the `auipc` targets the REAL symbol
+ * (`mydata`, offset 0); the LO12 (R_RISCV_PCREL_LO12_I = 24) on the `addi`
+ * targets the synthesized `.Lpcrel_hi0` local label (offset 4) — NOT the real
+ * target (§7.2). Both addends 0.
+ *
+ * @return void
+ */
+fn rvenc_lla_pair_relocs() {
+    let ef = rvenc_encode_func(rvenc_lla_func())
+    teko::assert::is_true(ef.relocs.len == (2 to u64))
+    teko::assert::is_true(ef.relocs[0 to u64].offset == (0 to u32))
+    teko::assert::str_contains(ef.relocs[0 to u64].sym, "mydata")
+    teko::assert::is_true(riscv_reloc_type(ef.relocs[0 to u64].kind) == (23 to u32))
+    teko::assert::is_true(ef.relocs[1 to u64].offset == (4 to u32))
+    teko::assert::str_contains(ef.relocs[1 to u64].sym, ".Lpcrel_hi0")
+    teko::assert::is_true(riscv_reloc_type(ef.relocs[1 to u64].kind) == (24 to u32))
+    teko::assert::is_true(ef.relocs[1 to u64].addend == (0 to i64))
+}
+
+#test
+/**
+ * rvenc_lla_synthesized_label — the `.Lpcrel_hi0` label the address pair
+ * synthesizes is a DEFINED, file-LOCAL `.text` (section 1) symbol at the
+ * `auipc`'s byte offset (0), the linker's pairing anchor (§7.2).
+ *
+ * @return void
+ */
+fn rvenc_lla_synthesized_label() {
+    let ef = rvenc_encode_func(rvenc_lla_func())
+    teko::assert::is_true(ef.labels.len == (1 to u64))
+    let lbl = ef.labels[0 to u64]
+    teko::assert::str_contains(lbl.name, ".Lpcrel_hi0")
+    teko::assert::is_true(lbl.defined)
+    teko::assert::is_true(lbl.local)
+    teko::assert::is_true(lbl.sect == (1 to u8))
+    teko::assert::is_true(lbl.offset == (0 to u32))
+}
+
+#test
+/**
+ * rvenc_module_call_symbols — a one-function `exit(n)` module: the `.text` is the
+ * 12-byte `li`+`auipc`+`jalr` image, the symbol table is `main` (defined GLOBAL,
+ * section 1) then `tk_exit` (undefined), and the single `Call` reloc is
+ * module-rebased to offset 4.
+ *
+ * @return void
+ */
+fn rvenc_module_call_symbols() {
+    let m = add_mfunc_riscv(empty_mmodule_riscv(), rvenc_call_only_func())
+    let enc = match encode_module_riscv(riscv64_lp64d(), m) {
+        EncodedModuleRiscv as x => x
+        error as e => EncodedModuleRiscv { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
+    }
+    teko::assert::is_true(enc.text.len == (12 to u64))
+    teko::assert::is_true(enc.symbols.len == (2 to u64))
+    teko::assert::str_contains(enc.symbols[0 to u64].name, "main")
+    teko::assert::is_true(enc.symbols[0 to u64].defined)
+    teko::assert::is_false(enc.symbols[0 to u64].local)
+    teko::assert::is_true(enc.symbols[0 to u64].sect == (1 to u8))
+    teko::assert::str_contains(enc.symbols[1 to u64].name, "tk_exit")
+    teko::assert::is_false(enc.symbols[1 to u64].defined)
+    teko::assert::is_true(enc.relocs.len == (1 to u64))
+    teko::assert::is_true(enc.relocs[0 to u64].offset == (4 to u32))
+}
+
+#test
+/**
+ * rvenc_module_pcrel_label_local — a module with two address-pair functions gets
+ * FILE-UNIQUE pcrel labels (`.Lpcrel_hi0`, `.Lpcrel_hi1`) placed among the
+ * LOCALS (before the global function symbols), each rebased to its own function's
+ * `.text` base — the module-wide counter threaded across functions (§7.2).
+ *
+ * @return void
+ */
+fn rvenc_module_pcrel_label_local() {
+    let m0 = add_mfunc_riscv(empty_mmodule_riscv(), rvenc_lla_func())
+    let m1 = add_mfunc_riscv(m0, rvenc_lla_func())
+    let enc = match encode_module_riscv(riscv64_lp64d(), m1) {
+        EncodedModuleRiscv as x => x
+        error as e => EncodedModuleRiscv { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
+    }
+    teko::assert::str_contains(enc.symbols[0 to u64].name, ".Lpcrel_hi0")
+    teko::assert::is_true(enc.symbols[0 to u64].local)
+    teko::assert::is_true(enc.symbols[0 to u64].offset == (0 to u32))
+    teko::assert::str_contains(enc.symbols[1 to u64].name, ".Lpcrel_hi1")
+    teko::assert::is_true(enc.symbols[1 to u64].local)
+    teko::assert::is_true(enc.symbols[1 to u64].offset == (12 to u32))
+}
+
+/**
+ * rvenc_badblock_stop — the honest-stop message a branch to a NONEXISTENT block
+ * id produces (or `<ok>` when it resolves), exercising the internal-invariant
+ * guard.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_badblock_stop() -> str {
+    let f = append_minst_riscv(new_mfunc_riscv("bad"), 0 to u32, jal_riscv(99 to u32))
+    match encode_func_riscv(riscv64_lp64d(), f, 0 to u32) {
+        FuncEncOutRiscv as o => "<ok>"
+        error as e => e.message
+    }
+}
+
+#test
+/**
+ * rvenc_badblock_internal_invariant — a branch whose target block id is absent
+ * from the function raises the `B2-badblock` internal-invariant guard (a
+ * malformed `MFuncRiscv`, caught rather than mis-encoded).
+ *
+ * @return void
+ */
+fn rvenc_badblock_internal_invariant() {
+    teko::assert::str_contains(rvenc_badblock_stop(), "B2-badblock")
+}
+
+/**
+ * rvenc_func_stop — the honest-stop message encoding `f` through the full
+ * `encode_func_riscv` pass produces, or `<ok>` when it encodes.
+ *
+ * @param MFuncRiscv f  the function to encode
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_func_stop(f: MFuncRiscv) -> str {
+    match encode_func_riscv(riscv64_lp64d(), f, 0 to u32) {
+        FuncEncOutRiscv as o => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rvenc_fp_load_func — a frameless function whose only instruction is an FPR
+ * load (`fld fa0, 0(sp)`): the `B2-fp` honest-stop propagates from the
+ * single-word encoder up through the B2-6 emit pass (fa0 is caller-saved, so the
+ * frame stays empty and the stop comes from the load, not the prologue).
+ *
+ * @return MFuncRiscv  the FP-load function
+ */
+fn rvenc_fp_load_func() -> MFuncRiscv {
+    append_minst_riscv(new_mfunc_riscv("fp"), 0 to u32, load_riscv(MMemSizeRiscv::D, false, rvenc_pf(10 to u32), rvenc_mem(2 to u32, 0 to i32)))
+}
+
+/**
+ * rvenc_bigframe_func — a function reserving a 4096-byte slot (a 4112-byte frame,
+ * past the `addi` imm12 window): `encode_func_riscv`'s prologue emission
+ * propagates `B2-bigframe`.
+ *
+ * @return MFuncRiscv  the oversized-frame function
+ */
+fn rvenc_bigframe_func() -> MFuncRiscv {
+    append_minst_riscv(append_frame_riscv(new_mfunc_riscv("big"), lir::LAlloca { bytes = 4096 to u32; align = 8 to u32 }), 0 to u32, ret_riscv())
+}
+
+#test
+/**
+ * rvenc_func_pass_propagates_stops — a single-word honest-stop (an FPR load →
+ * `B2-fp`) and an oversized frame (→ `B2-bigframe`) both propagate out of the
+ * full `encode_func_riscv` emit pass rather than being swallowed.
+ *
+ * @return void
+ */
+fn rvenc_func_pass_propagates_stops() {
+    teko::assert::str_contains(rvenc_func_stop(rvenc_fp_load_func()), "B2-fp")
+    teko::assert::str_contains(rvenc_func_stop(rvenc_bigframe_func()), "B2-bigframe")
+}
+
+/**
+ * rvenc_module_stop — the honest-stop message encoding `m` through the full
+ * `encode_module_riscv` pass produces, or `<ok>` when it encodes.
+ *
+ * @param MModuleRiscv m  the module to encode
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_module_stop(m: MModuleRiscv) -> str {
+    match encode_module_riscv(riscv64_lp64d(), m) {
+        EncodedModuleRiscv as x => "<ok>"
+        error as e => e.message
+    }
+}
+
+#test
+/**
+ * rvenc_module_pass_propagates_function_stop — a function's honest-stop (an FPR
+ * load → `B2-fp`) propagates out of the whole-module `encode_module_riscv` pass.
+ *
+ * @return void
+ */
+fn rvenc_module_pass_propagates_function_stop() {
+    let m = MModuleRiscv { funcs = teko::list::push(teko::list::empty(), rvenc_fp_load_func()); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    teko::assert::str_contains(rvenc_module_stop(m), "B2-fp")
+}
+
+#test
+/**
+ * rvenc_module_globals_honest_stop — a module carrying a top-level data global
+ * raises the `B2-globals` honest-stop (the `.data`/`.bss` sections are deferred;
+ * the N2 subset lowers none).
+ *
+ * @return void
+ */
+fn rvenc_module_globals_honest_stop() {
+    let g = lir::LGlobal { symbol = "gv"; ty = lir::LType::I32; bytes = teko::list::empty() }
+    let m = MModuleRiscv { funcs = teko::list::empty(); rodata = teko::list::empty(); globals = teko::list::push(teko::list::empty(), g); layouts = teko::list::empty() }
+    teko::assert::str_contains(rvenc_module_stop(m), "B2-globals")
+}
+
+/**
+ * rvenc_frame_addr_bigframe_stop — the honest-stop `encode_frame_addr_riscv`
+ * produces for a slot offset beyond the signed 12-bit `addi` field (a crafted
+ * `FrameLayoutRiscv` with a 3000-byte slot offset), the defensive guard the real
+ * `frame_fits_riscv` prologue check normally forecloses.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_frame_addr_bigframe_stop() -> str {
+    let layout = FrameLayoutRiscv { size = 3008 to u32; saved_gpr = teko::list::empty(); saved_fpr = teko::list::empty(); slot_offsets = teko::list::push(teko::list::empty(), 3000 to u32) }
+    match encode_frame_addr_riscv(layout, MFrameAddrRiscv { dst = rvenc_pg(10 to u32); slot = 0 to u32 }) {
+        EncWordRiscv as v => "<ok>"
+        error as e => e.message
+    }
+}
+
+#test
+/**
+ * rvenc_frame_addr_bigframe — a frame-slot address beyond the `addi` imm12 field
+ * raises `B2-bigframe` directly from `encode_frame_addr_riscv` (the slot-address
+ * arm of the big-frame limit).
+ *
+ * @return void
+ */
+fn rvenc_frame_addr_bigframe() {
+    teko::assert::str_contains(rvenc_frame_addr_bigframe_stop(), "B2-bigframe")
+}
+
+/**
+ * rvenc_big_layout — a crafted `FrameLayoutRiscv` whose size and single slot
+ * offset both exceed the `addi` imm12 window, forcing the frame-emission
+ * honest-stops the normal `frame_fits_riscv` prologue guard forecloses.
+ *
+ * @return FrameLayoutRiscv  the oversized frame side-table
+ */
+fn rvenc_big_layout() -> FrameLayoutRiscv {
+    FrameLayoutRiscv { size = 3008 to u32; saved_gpr = teko::list::empty(); saved_fpr = teko::list::empty(); slot_offsets = teko::list::push(teko::list::empty(), 3000 to u32) }
+}
+
+/**
+ * rvenc_empty_emit — a seed `FuncEmitRiscv` accumulator (empty words/labels,
+ * counter 0), the input the emit-pass helpers extend.
+ *
+ * @return FuncEmitRiscv  the seed accumulator
+ */
+fn rvenc_empty_emit() -> FuncEmitRiscv {
+    FuncEmitRiscv { words = teko::list::empty(); labels = teko::list::empty(); label_ctr = 0 to u32 }
+}
+
+/**
+ * rvenc_ret_seq_stop — the honest-stop `encode_ret_seq_riscv` propagates when the
+ * epilogue overflows the `addi` window, or `<ok>` on success.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_ret_seq_stop() -> str {
+    match encode_ret_seq_riscv(rvenc_big_layout(), rvenc_empty_emit()) {
+        FuncEmitRiscv as a => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rvenc_frame_addr_push_stop — the honest-stop `encode_frame_addr_push_riscv`
+ * propagates when the slot address overflows the `addi` window, or `<ok>`.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_frame_addr_push_stop() -> str {
+    match encode_frame_addr_push_riscv(rvenc_big_layout(), rvenc_empty_emit(), MFrameAddrRiscv { dst = rvenc_pg(10 to u32); slot = 0 to u32 }) {
+        FuncEmitRiscv as a => "<ok>"
+        error as e => e.message
+    }
+}
+
+/**
+ * rvenc_resolve_word_stop — the honest-stop `resolve_word_riscv` propagates when a
+ * branch target sits past the B-type field: a `beq` whose target block is 2000
+ * words away (8000 bytes > ±4 KiB), or `<ok>`.
+ *
+ * @return str  the error message, or `<ok>`
+ */
+fn rvenc_resolve_word_stop() -> str {
+    let ew = rvenc_enc(branch_riscv(MCond::EQ, rvenc_pg(10 to u32), rvenc_pg(11 to u32), 1 to u32))
+    let offsets = teko::list::push(teko::list::empty(), BlockOffsetRiscv { id = 1 to u32; word = 2000 to u32 })
+    match resolve_word_riscv(ew, 0 to u32, offsets) {
+        u32 as v => "<ok>"
+        error as e => e.message
+    }
+}
+
+#test
+/**
+ * rvenc_emit_helpers_propagate_stops — the emit-pass wrapper helpers propagate
+ * their underlying honest-stops rather than swallowing them: the epilogue
+ * (`encode_ret_seq_riscv` → `B2-bigframe`), the frame-slot address
+ * (`encode_frame_addr_push_riscv` → `B2-bigframe`), and the branch resolve
+ * (`resolve_word_riscv` → `B2-farbranch`) each surface the stop the normal
+ * pipeline's earlier guards foreclose.
+ *
+ * @return void
+ */
+fn rvenc_emit_helpers_propagate_stops() {
+    teko::assert::str_contains(rvenc_ret_seq_stop(), "B2-bigframe")
+    teko::assert::str_contains(rvenc_frame_addr_push_stop(), "B2-bigframe")
+    teko::assert::str_contains(rvenc_resolve_word_stop(), "B2-farbranch")
+}
+
+#test
+/**
+ * rvenc_encode_func_splices_frame_around_body — the headline B2-6 deliverable:
+ * a FRAMED function ending in `MRetRiscv` encodes to ONE concatenated stream —
+ * the prologue at the FRONT (5 words), the block body in the middle (`add
+ * s1,s1,a0` then the `call tk_thing` `auipc`+`jalr` pair), and the epilogue+
+ * `ret` at the END (4+1 words) — 13 words total, EVERY word assembler-
+ * cross-checked (the prologue/epilogue words match
+ * `rvenc_prologue_call_frame`/`rvenc_epilogue_call_frame`, the `add`/`auipc`/
+ * `jalr`/`ret` words match the `zig cc -mcpu=generic_rv64` oracle). The single
+ * `Call` reloc sits at its function-relative byte offset (24, past the
+ * prologue+`add`), targeting `tk_thing` — not swallowed by the piecewise
+ * prologue/epilogue-only checks.
+ *
+ * @return void
+ */
+fn rvenc_encode_func_splices_frame_around_body() {
+    let ef = rvenc_encode_func(rvenc_call_func())
+    teko::assert::is_true(ef.words.len == (13 to u64))
+    teko::assert::is_true(ef.words[0 to u64] == (0xFE010113 to u32))
+    teko::assert::is_true(ef.words[1 to u64] == (0x00113C23 to u32))
+    teko::assert::is_true(ef.words[2 to u64] == (0x00813823 to u32))
+    teko::assert::is_true(ef.words[3 to u64] == (0x02010413 to u32))
+    teko::assert::is_true(ef.words[4 to u64] == (0x00913423 to u32))
+    teko::assert::is_true(ef.words[5 to u64] == (0x00A484B3 to u32))
+    teko::assert::is_true(ef.words[6 to u64] == (0x00000097 to u32))
+    teko::assert::is_true(ef.words[7 to u64] == (0x000080E7 to u32))
+    teko::assert::is_true(ef.words[8 to u64] == (0x00813483 to u32))
+    teko::assert::is_true(ef.words[9 to u64] == (0x01013403 to u32))
+    teko::assert::is_true(ef.words[10 to u64] == (0x01813083 to u32))
+    teko::assert::is_true(ef.words[11 to u64] == (0x02010113 to u32))
+    teko::assert::is_true(ef.words[12 to u64] == (0x00008067 to u32))
+    teko::assert::is_true(ef.relocs.len == (1 to u64))
+    teko::assert::is_true(ef.relocs[0 to u64].offset == (24 to u32))
+    teko::assert::str_contains(ef.relocs[0 to u64].sym, "tk_thing")
+}
+
+#test
+/**
+ * rvenc_module_rebases_reloc_at_nonzero_base — a two-function module rebases the
+ * SECOND function's `Call` reloc offset by the FIRST function's `.text` byte
+ * length: the frameless `main` (`rvenc_call_only_func`, 3 words = 12 bytes)
+ * precedes the framed `caller` (`rvenc_call_func`, 13 words), so `caller`'s
+ * reloc (function-relative offset 24) lands at MODULE offset 12+24=36 — the
+ * nonzero-base rebase arithmetic `fold_func_into_text_riscv` performs, only
+ * exercised at base 0 by the single-function module tests.
+ *
+ * @return void
+ */
+fn rvenc_module_rebases_reloc_at_nonzero_base() {
+    let m0 = add_mfunc_riscv(empty_mmodule_riscv(), rvenc_call_only_func())
+    let m1 = add_mfunc_riscv(m0, rvenc_call_func())
+    let enc = match encode_module_riscv(riscv64_lp64d(), m1) {
+        EncodedModuleRiscv as x => x
+        error as e => EncodedModuleRiscv { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
+    }
+    teko::assert::is_true(enc.text.len == (64 to u64))
+    teko::assert::is_true(enc.relocs.len == (2 to u64))
+    teko::assert::is_true(enc.relocs[0 to u64].offset == (4 to u32))
+    teko::assert::str_contains(enc.relocs[0 to u64].sym, "tk_exit")
+    teko::assert::is_true(enc.relocs[1 to u64].offset == (36 to u32))
+    teko::assert::str_contains(enc.relocs[1 to u64].sym, "tk_thing")
+}

@@ -1,0 +1,200 @@
+/**
+ * rvo_pg — a physical GPR operand with the given RISC-V register id (the RISC-V
+ * ELF-writer fixture shorthand; B2 runs post-regalloc, so every operand is
+ * physical). Prefixed `rvo_` to avoid the shared `teko::backend` namespace's
+ * arm64/x86/riscv encoder test-helper names.
+ *
+ * @param u32 id  the RISC-V register number (x0..x31)
+ * @return MReg  the physical GPR operand
+ */
+fn rvo_pg(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * rvo_u32_at — the little-endian u32 read from `bytes` at byte index `i` (the
+ * golden-object field reader).
+ *
+ * @param []byte bytes  the object bytes
+ * @param u64 i  the field's byte offset
+ * @return u32  the little-endian u32 at `i`
+ */
+fn rvo_u32_at(bytes: []byte, i: u64) -> u32 {
+    (bytes[i] to u32) | ((bytes[i + (1 to u64)] to u32) << (8 to u32)) | ((bytes[i + (2 to u64)] to u32) << (16 to u32)) | ((bytes[i + (3 to u64)] to u32) << (24 to u32))
+}
+
+/**
+ * rvo_u16_at — the little-endian u16 read from `bytes` at byte index `i` (the
+ * `Elf64_Ehdr`/`Elf64_Sym` 16-bit-field reader).
+ *
+ * @param []byte bytes  the object bytes
+ * @param u64 i  the field's byte offset
+ * @return u32  the little-endian u16 at `i`
+ */
+fn rvo_u16_at(bytes: []byte, i: u64) -> u32 {
+    (bytes[i] to u32) | ((bytes[i + (1 to u64)] to u32) << (8 to u32))
+}
+
+/**
+ * rvo_exit_module — the keystone RISC-V `exit`-shape: a single frameless `main`
+ * of `li a0,0 ; call tk_exit` (no `ret`), no rodata — the smallest module
+ * carrying a text image, a defined global function, an undefined extern, and one
+ * `R_RISCV_CALL_PLT` relocation (the exit-corpus call path, §7.2).
+ *
+ * @return MModuleRiscv  the one-function module
+ */
+fn rvo_exit_module() -> MModuleRiscv {
+    let f0 = append_minst_riscv(new_mfunc_riscv("main"), 0 to u32, li_riscv(rvo_pg(10 to u32), 0 to i32))
+    let f1 = append_minst_riscv(f0, 0 to u32, call_riscv("tk_exit", teko::list::empty(), rvo_pg(10 to u32), false, false))
+    add_mfunc_riscv(empty_mmodule_riscv(), f1)
+}
+
+/**
+ * rvo_lla_module — a frameless `loadaddr` of `lla a0, mydata ; ret`: the
+ * PC-relative data-address pair whose HI20/LO12 relocations + synthesized
+ * `.Lpcrel_hi0` `.text`-local label exercise the shared writer's neutral
+ * section-1 local pass (§7.2) — the ONE structural capability B2-7 adds.
+ *
+ * @return MModuleRiscv  the one-function address-materialization module
+ */
+fn rvo_lla_module() -> MModuleRiscv {
+    let f0 = append_minst_riscv(new_mfunc_riscv("loadaddr"), 0 to u32, lla_riscv(rvo_pg(10 to u32), "mydata"))
+    let f1 = append_minst_riscv(f0, 0 to u32, ret_riscv())
+    add_mfunc_riscv(empty_mmodule_riscv(), f1)
+}
+
+/**
+ * rvo_object_of — encode `m` under `riscv64_lp64d()` and assemble its riscv64 ELF
+ * object via `emit_elf_riscv`, or an empty buffer on an unexpected honest-stop
+ * (so a golden length/byte assertion fails loudly rather than aborting the run).
+ *
+ * @param MModuleRiscv m  the module to encode + emit
+ * @return []byte  the riscv64 ELF object bytes, or empty on error
+ */
+fn rvo_object_of(m: MModuleRiscv) -> []byte {
+    match encode_module_riscv(riscv64_lp64d(), m) {
+        EncodedModuleRiscv as x => emit_elf_riscv(x)
+        error as e => teko::list::empty()
+    }
+}
+
+#test
+/**
+ * rvelf_header_is_riscv64_lp64d — the `Elf64_Ehdr` of the `exit` object: the
+ * `\x7fELF` magic, ELFCLASS64 / ELFDATA2LSB / EV_CURRENT `e_ident`,
+ * `e_type = ET_REL`(1), `e_machine = EM_RISCV`(243), `e_flags =
+ * EF_RISCV_FLOAT_ABI_DOUBLE`(0x0004 — the RV64 LP64D hard-float ABI, the ONE
+ * flag byte x86 leaves 0), `e_shoff = 248`, `e_ehsize = 64`, `e_shentsize = 64`,
+ * `e_shnum = 7`, `e_shstrndx = 5`. The whole object is 696 bytes.
+ *
+ * @return void
+ */
+fn rvelf_header_is_riscv64_lp64d() {
+    let obj = rvo_object_of(rvo_exit_module())
+    teko::assert::is_true(obj.len == (696 to u64))
+    teko::assert::is_true(obj[0] == (0x7F to byte))
+    teko::assert::is_true(obj[1] == (0x45 to byte))
+    teko::assert::is_true(obj[2] == (0x4C to byte))
+    teko::assert::is_true(obj[3] == (0x46 to byte))
+    teko::assert::is_true(obj[4] == (2 to byte))
+    teko::assert::is_true(obj[5] == (1 to byte))
+    teko::assert::is_true(obj[6] == (1 to byte))
+    teko::assert::is_true(rvo_u16_at(obj, 16 to u64) == (1 to u32))
+    teko::assert::is_true(rvo_u16_at(obj, 18 to u64) == (243 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 40 to u64) == (248 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 48 to u64) == (0x0004 to u32))
+    teko::assert::is_true(rvo_u16_at(obj, 52 to u64) == (64 to u32))
+    teko::assert::is_true(rvo_u16_at(obj, 58 to u64) == (64 to u32))
+    teko::assert::is_true(rvo_u16_at(obj, 60 to u64) == (7 to u32))
+    teko::assert::is_true(rvo_u16_at(obj, 62 to u64) == (5 to u32))
+}
+
+#test
+/**
+ * rvelf_text_symtab_and_call_reloc — the `exit` object's `.text` image is the
+ * 12-byte `li a0,0`(0x00000513) + `auipc ra,0`(0x00000097) + `jalr ra,0(ra)`
+ * (0x000080E7) call-macro at file offset 64; the `.symtab` (at 80) holds the
+ * reserved null symbol, then `main` as `GLOBAL|FUNC` (`st_info = 0x12`,
+ * `st_shndx = 1`, section-relative `st_value = 0`), then `tk_exit` as
+ * `GLOBAL|NOTYPE` (`0x10`, `st_shndx = 0`); the single `.rela.text` entry (at
+ * 224) is `R_RISCV_CALL_PLT`(19) against symbol index 2 (`tk_exit`) at
+ * `r_offset = 4` with addend 0 (the call-macro reloc carries no label, §7.2).
+ *
+ * @return void
+ */
+fn rvelf_text_symtab_and_call_reloc() {
+    let obj = rvo_object_of(rvo_exit_module())
+    teko::assert::is_true(rvo_u32_at(obj, 64 to u64) == (0x00000513 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 68 to u64) == (0x00000097 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 72 to u64) == (0x000080E7 to u32))
+    teko::assert::is_true(obj[108] == (0x12 to byte))
+    teko::assert::is_true(rvo_u16_at(obj, 110 to u64) == (1 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 112 to u64) == (0 to u32))
+    teko::assert::is_true(obj[132] == (0x10 to byte))
+    teko::assert::is_true(rvo_u16_at(obj, 134 to u64) == (0 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 224 to u64) == (4 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 232 to u64) == (19 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 236 to u64) == (2 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 240 to u64) == (0 to u32))
+}
+
+#test
+/**
+ * rvelf_symtab_first_global_is_one — the `exit` object's `.symtab` section header
+ * (`e_shoff = 248`, header index 3 at 248 + 3*64 = 440, `sh_info` at +44 = 484)
+ * pins `.symtab.sh_info = 1` (first-global): the reserved null symbol is the sole
+ * local, so the global `main` is at index 1. An off-by-one here makes `ld` reject
+ * the object.
+ *
+ * @return void
+ */
+fn rvelf_symtab_first_global_is_one() {
+    let obj = rvo_object_of(rvo_exit_module())
+    teko::assert::is_true(rvo_u32_at(obj, 484 to u64) == (1 to u32))
+}
+
+#test
+/**
+ * rvelf_pcrel_pair_local_in_symtab — the `lla` object's `.Lpcrel_hi0` synthesized
+ * `.text` label lands in the LOCAL block of the `.symtab` (at 80) as an
+ * `STB_LOCAL|STT_NOTYPE` section-1 symbol (`st_info = 0x00`, `st_shndx = 1`,
+ * section-relative `st_value = 0`) BEFORE the global `loadaddr` — the ONE neutral
+ * structural capability B2-7 adds to the reused writer, inert for x86 (§7.2). The
+ * `.symtab.sh_info` (first-global, `e_shoff = 312`, header index 3 at 312 + 3*64
+ * = 504, `sh_info` at +44 = 548) is 2, so the one local `.Lpcrel_hi0` sorts ahead
+ * of the two globals.
+ *
+ * @return void
+ */
+fn rvelf_pcrel_pair_local_in_symtab() {
+    let obj = rvo_object_of(rvo_lla_module())
+    teko::assert::is_true(obj[108] == (0x00 to byte))
+    teko::assert::is_true(rvo_u16_at(obj, 110 to u64) == (1 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 112 to u64) == (0 to u32))
+    teko::assert::is_true(obj[132] == (0x12 to byte))
+    teko::assert::is_true(rvo_u16_at(obj, 134 to u64) == (1 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 548 to u64) == (2 to u32))
+}
+
+#test
+/**
+ * rvelf_pcrel_pair_hi20_lo12_relocs — the `lla` object's PAIR relocation: the
+ * HI20 (`R_RISCV_PCREL_HI20`(23), at 264) targets the REAL symbol `mydata`
+ * (undefined extern, index 3) at `r_offset = 0`; the LO12
+ * (`R_RISCV_PCREL_LO12_I`(24), at 288) targets the synthesized `.Lpcrel_hi0`
+ * `.text`-local label (index 1) at `r_offset = 4` — NOT the real target — so the
+ * linker re-finds the HI20 pairing at that label (§7.2). Both addends 0.
+ *
+ * @return void
+ */
+fn rvelf_pcrel_pair_hi20_lo12_relocs() {
+    let obj = rvo_object_of(rvo_lla_module())
+    teko::assert::is_true(rvo_u32_at(obj, 264 to u64) == (0 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 272 to u64) == (23 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 276 to u64) == (3 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 280 to u64) == (0 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 288 to u64) == (4 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 296 to u64) == (24 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 300 to u64) == (1 to u32))
+    teko::assert::is_true(rvo_u32_at(obj, 304 to u64) == (0 to u32))
+}

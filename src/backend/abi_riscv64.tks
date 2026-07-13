@@ -1,0 +1,107 @@
+/**
+ * riscv_gpr_arg_seq — the RISC-V LP64D integer argument registers in call
+ * order: a0..a7 (x10..x17). The ids follow the standard RISC-V register
+ * numbering (x0=zero..x31), so `arg_reg` hands isel the physical id the
+ * encoder's rd/rs1/rs2 field consumes directly. The run is contiguous, but it
+ * is spelled through this helper to mirror `sysv_gpr_arg_seq`'s shape and to
+ * anchor the LP64D fact that index 0 (a0/x10) is ALSO the integer RESULT
+ * register — pinned by isel at the return site (D-A), unlike x86's separate
+ * result register.
+ *
+ * @return []u32  the eight integer argument register ids (a0..a7), in order
+ */
+fn riscv_gpr_arg_seq() -> []u32 {
+    push_range(teko::list::empty(), 10, 17)
+}
+
+/**
+ * riscv_gpr_allocatable — the ordered GPR pool the linear scan draws from,
+ * caller-saved first then callee-saved (so short values take scratch-cheap
+ * caller-saved registers before forcing a callee-save prologue spill). The
+ * caller-saved allocatable run is t0..t2 (5,6,7), a0..a7 (10..17), t3 (28) —
+ * every caller-saved GPR except the reserved spill scratch t4/t5/t6. The
+ * callee-saved allocatable run is s1 (9), s2..s11 (18..27) — every callee-saved
+ * GPR except s0 (8, the frame pointer). x0(zero)/x1(ra)/x2(sp)/x3(gp)/x4(tp) are
+ * reserved and never appear.
+ *
+ * @return []u32  the ordered allocatable GPR ids, caller-saved before callee-saved
+ */
+fn riscv_gpr_allocatable() -> []u32 {
+    let caller = teko::list::push(push_range(push_range(teko::list::empty(), 5, 7), 10, 17), 28)
+    let with_s1 = teko::list::push(caller, 9)
+    push_range(with_s1, 18, 27)
+}
+
+/**
+ * riscv_gpr_caller_saved — the GPR set a call clobbers, so a value live across a
+ * call point may not occupy any of them: ra (1), t0..t2 (5,6,7), a0..a7
+ * (10..17), t3..t6 (28..31). This is the full clobber set — it includes ra (the
+ * return address, overwritten by any `jal`) and the spill-scratch registers
+ * t4/t5/t6 (they too are caller-saved), unlike `riscv_gpr_allocatable`, which
+ * excludes both. sp(2)/s0..s11(8..9,18..27) are callee-saved and therefore
+ * absent.
+ *
+ * @return []u32  the caller-saved (call-clobbered) GPR ids
+ */
+fn riscv_gpr_caller_saved() -> []u32 {
+    let with_ra = push_range(teko::list::empty(), 1, 1)
+    let with_t0_t2 = push_range(with_ra, 5, 7)
+    push_range(push_range(with_t0_t2, 10, 17), 28, 31)
+}
+
+/**
+ * riscv_fpr_allocatable — the ordered FPR pool the scan draws from, caller-saved
+ * first then callee-saved: ft0..ft7 (0..7), fa0..fa7 (10..17), ft8..ft9 (28,29)
+ * — every caller-saved FPR except the reserved spill scratch ft10/ft11 — then
+ * fs0..fs1 (8,9), fs2..fs11 (18..27), the callee-saved FPRs.
+ *
+ * @return []u32  the ordered allocatable FPR ids, caller-saved before callee-saved
+ */
+fn riscv_fpr_allocatable() -> []u32 {
+    let caller = push_range(push_range(push_range(teko::list::empty(), 0, 7), 10, 17), 28, 29)
+    let with_fs0_fs1 = push_range(caller, 8, 9)
+    push_range(with_fs0_fs1, 18, 27)
+}
+
+/**
+ * riscv_fpr_caller_saved — the FPR set a call clobbers: ft0..ft7 (0..7),
+ * fa0..fa7 (10..17), ft8..ft11 (28..31). Includes the spill-scratch ft10/ft11
+ * (caller-saved too). fs0..fs11 (8,9,18..27) are callee-saved and absent.
+ *
+ * @return []u32  the caller-saved (call-clobbered) FPR ids
+ */
+fn riscv_fpr_caller_saved() -> []u32 {
+    push_range(push_range(push_range(teko::list::empty(), 0, 7), 10, 17), 28, 31)
+}
+
+/**
+ * riscv64_lp64d — the concrete RISC-V RV64G LP64D (riscv64 Linux/ELF) register-
+ * file descriptor: a0..a7 (x10..x17) integer arguments (index 0 = a0, which is
+ * ALSO the integer result — D-A, unlike x86), fa0..fa7 (f10..f17) float
+ * arguments (index 0 = fa0, the float result), s0..s11 (x8..x9, x18..x27)
+ * callee-saved plus ra (x1) and sp (x2), everything else caller-saved. The
+ * allocatable pools list caller-saved first (scratch-cheap short values before a
+ * callee-save prologue spill), excluding x0(zero)/x1(ra)/x2(sp)/x3(gp)/x4(tp)/
+ * x8(fp) — the hardwired/reserved/frame registers — and the reserved spill
+ * scratch t4/t5/t6 (GPR) / ft10/ft11 (FPR). Register ids are the RISC-V register
+ * numbers (x0..x31, f0..f31), so the encoder's rd/rs1/rs2 fields are the id
+ * directly. Clones aapcs64's SHAPE with an LP64D partition — the whole cost of a
+ * new ABI (Phase B, §2.2 of the architecture doc).
+ *
+ * @return AbiDescriptor  the RISC-V LP64D register file
+ */
+pub fn riscv64_lp64d() -> AbiDescriptor {
+    AbiDescriptor {
+        gpr_arg = riscv_gpr_arg_seq()
+        fpr_arg = push_range(teko::list::empty(), 10, 17)
+        gpr_allocatable = riscv_gpr_allocatable()
+        fpr_allocatable = riscv_fpr_allocatable()
+        gpr_caller_saved = riscv_gpr_caller_saved()
+        fpr_caller_saved = riscv_fpr_caller_saved()
+        gpr_spill_scratch = push_range(teko::list::empty(), 29, 31)
+        fpr_spill_scratch = push_range(teko::list::empty(), 30, 31)
+        spill_slot_bytes = 8
+        spill_slot_align = 8
+        shadow_space = 0 to u32
+    }
+}

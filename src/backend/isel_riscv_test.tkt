@@ -1,0 +1,903 @@
+use teko::lir
+
+/**
+ * rat_i128 — the i128 carrier for a small integer literal in the RISC-V isel
+ * fixtures (mirrors `isel_x86_64_test.tkt`'s `xat_i128`).
+ *
+ * @param i64 v  the literal value
+ * @return i128  its i128 carrier
+ */
+fn rat_i128(v: i64) -> i128 {
+    v to i128
+}
+
+/**
+ * rat_bin — append `%r = op a, b` to `f0`, returning the advanced function plus
+ * the fresh result VReg (a fixture-building shorthand).
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param lir::LBinOp op  the binary op
+ * @param u32 a  the first operand VReg
+ * @param u32 b  the second operand VReg
+ * @return lir::FreshVReg  the advanced function + the result VReg
+ */
+fn rat_bin(f0: lir::LFunc, op: lir::LBinOp, a: u32, b: u32) -> lir::FreshVReg {
+    let r = lir::alloc_vreg(f0)
+    lir::FreshVReg { func = lir::append_inst(r.func, 0, lir::bin_inst(r.vreg, op, a, b, 0, 0)); vreg = r.vreg }
+}
+
+/**
+ * rat_un — append `%r = op a` to `f0`, returning the advanced function plus the
+ * fresh result VReg.
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param lir::LUnOp op  the unary op
+ * @param u32 a  the operand VReg
+ * @return lir::FreshVReg  the advanced function + the result VReg
+ */
+fn rat_un(f0: lir::LFunc, op: lir::LUnOp, a: u32) -> lir::FreshVReg {
+    let r = lir::alloc_vreg(f0)
+    lir::FreshVReg { func = lir::append_inst(r.func, 0, lir::un_inst(r.vreg, op, a, 0, 0)); vreg = r.vreg }
+}
+
+/**
+ * rat_const — append `%r = const val` to `f0`, returning the advanced function
+ * plus the fresh result VReg.
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param i64 val  the literal value
+ * @return lir::FreshVReg  the advanced function + the result VReg
+ */
+fn rat_const(f0: lir::LFunc, val: i64) -> lir::FreshVReg {
+    let r = lir::alloc_vreg(f0)
+    lir::FreshVReg { func = lir::append_inst(r.func, 0, lir::const_int_inst(r.vreg, rat_i128(val), 0, 0)); vreg = r.vreg }
+}
+
+/**
+ * rat_ret — append `ret value` to `f0`.
+ *
+ * @param lir::LFunc f0  the function to extend
+ * @param u32 value  the returned VReg
+ * @return lir::LFunc  the advanced function
+ */
+fn rat_ret(f0: lir::LFunc, value: u32) -> lir::LFunc {
+    lir::append_inst(f0, 0, lir::ret_inst(value, 0, 0))
+}
+
+/**
+ * rat_two_i64_params — a fresh 2-param (I64, I64) -> I64 function named `sym`,
+ * its entry block already carrying both `LParam` instructions.
+ *
+ * @param str sym  the function's symbol
+ * @return lir::LFunc  the seeded function
+ */
+fn rat_two_i64_params(sym: str) -> lir::LFunc {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), lir::LType::I64), lir::LType::I64)
+    mut f = lir::new_func(sym, 2, ptypes, lir::LType::I64)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    lir::append_inst(f, 0, lir::param_inst(1, 1, 0, 0))
+}
+
+/**
+ * rat_one_i64_param — a fresh 1-param (I64) -> I64 function named `sym`, its
+ * entry block already carrying the single `LParam`.
+ *
+ * @param str sym  the function's symbol
+ * @return lir::LFunc  the seeded function
+ */
+fn rat_one_i64_param(sym: str) -> lir::LFunc {
+    let ptypes = teko::list::push(teko::list::empty(), lir::LType::I64)
+    mut f = lir::new_func(sym, 1, ptypes, lir::LType::I64)
+    lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+}
+
+/**
+ * rat_main_ret — a zero-param `main` seed (the straight-line fixture base).
+ *
+ * @return lir::LFunc  the seeded, empty-bodied function
+ */
+fn rat_main_ret() -> lir::LFunc {
+    lir::new_func("main", 0, teko::list::empty(), lir::LType::I32)
+}
+
+/**
+ * rat_dump — select `f` for RISC-V and render the machine module as text (the
+ * golden-dump fixtures assert against key lines of this); "" on a selection
+ * error.
+ *
+ * @param lir::LFunc f  the function to select and print
+ * @return str  the rendered machine text ("" on a selection error)
+ */
+fn rat_dump(f: lir::LFunc) -> str {
+    let mf = match select_lfunc_riscv(f) { MFuncRiscv as x => x; error => return "" }
+    minst_print_riscv(add_mfunc_riscv(empty_mmodule_riscv(), mf))
+}
+
+/**
+ * rat_bare_ctx — a bare single-block `SelCtxRiscv` seed for the direct-call unit
+ * tests (the honest-stops unreachable through a normal fixture, because their
+ * float source instruction stops selection first).
+ *
+ * @param str sym  the machine function's symbol
+ * @return SelCtxRiscv  the seeded context
+ */
+fn rat_bare_ctx(sym: str) -> SelCtxRiscv {
+    SelCtxRiscv { func = new_mfunc_riscv(sym); vinfo = vinfo_empty(); next_scratch = 0; cur_block = 0; next_block = 1 }
+}
+
+/**
+ * rat_one_param_func — a single-parameter function of machine class `ty` (its
+ * own return type too), its param read via `LParam` and returned directly — the
+ * coverage sweep for `select_param_riscv`'s GPR path and its float/i128 stops.
+ *
+ * @param lir::LType ty  the parameter's (and return's) machine class
+ * @return lir::LFunc  the built function
+ */
+fn rat_one_param_func(ty: lir::LType) -> lir::LFunc {
+    let ptypes = teko::list::push(teko::list::empty(), ty)
+    mut f = lir::new_func("teko__demo__one_param", 1, ptypes, ty)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    rat_ret(f, 0)
+}
+
+/**
+ * rat_select_succeeds — whether `select_lfunc_riscv(f)` selects without error.
+ *
+ * @param lir::LFunc f  the function to select
+ * @return bool  whether selection succeeded
+ */
+fn rat_select_succeeds(f: lir::LFunc) -> bool {
+    match select_lfunc_riscv(f) { MFuncRiscv => true; error => false }
+}
+
+/**
+ * rat_load_ty_succeeds — whether an `alloca`+`load ty`+`ret` function selects
+ * for RISC-V (the coverage sweep over `mem_size_riscv`'s every arm).
+ *
+ * @param lir::LType ty  the loaded machine class
+ * @return bool  whether selection succeeded
+ */
+fn rat_load_ty_succeeds(ty: lir::LType) -> bool {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let ld = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(ld.func, 0, lir::alloca_inst(base.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::load_inst(ld.vreg, base.vreg, ty, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(ld.vreg, 0, 0))
+    match select_lfunc_riscv(s2) { MFuncRiscv => true; error => false }
+}
+
+/**
+ * rat_cmp_dump — a 2-param function whose only body is `%2 = op %0, %1` then
+ * `ret %2` (the compare is NOT fused — a `ret` is no branch — so it lowers as a
+ * value), selected and rendered. The per-condition value-compare golden reads
+ * this.
+ *
+ * @param lir::LBinOp op  the compare opcode
+ * @return str  the rendered machine text
+ */
+fn rat_cmp_dump(op: lir::LBinOp) -> str {
+    let f = rat_two_i64_params("teko__demo__cmp")
+    let r = rat_bin(f, op, 0, 1)
+    rat_dump(rat_ret(r.func, r.vreg))
+}
+
+/**
+ * rat_n_i64_params — a `main`-like function with `n` `I64` parameters, each read
+ * via `LParam`, returning the first (the LP64D GPR-window-overflow fixture: 8
+ * fill a0..a7, the 9th needs the stack slot).
+ *
+ * @param u32 n  how many parameters to build
+ * @return lir::LFunc  the built function
+ */
+fn rat_n_i64_params(n: u32) -> lir::LFunc {
+    mut ptypes: []lir::LType = teko::list::empty()
+    mut k: u32 = 0
+    loop {
+        if k >= n { break }
+        ptypes = teko::list::push(ptypes, lir::LType::I64)
+        k++
+    }
+    mut f = lir::new_func("teko__demo__many", n, ptypes, lir::LType::I64)
+    mut i: u32 = 0
+    loop {
+        if i >= n { break }
+        f = lir::append_inst(f, 0, lir::param_inst(i, i, 0, 0))
+        i++
+    }
+    rat_ret(f, 0)
+}
+
+/**
+ * rat_call_n_args — a `main` calling `tk_sink` with `n` integer arguments (each
+ * a fresh const), the LP64D call-window-overflow fixture (9 arguments exceed the
+ * 8-register integer window).
+ *
+ * @param u32 n  how many integer arguments to pass
+ * @return lir::LFunc  the built function
+ */
+fn rat_call_n_args(n: u32) -> lir::LFunc {
+    mut f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    mut args: []u32 = teko::list::empty()
+    mut i: u32 = 0
+    loop {
+        if i >= n { break }
+        let r = lir::alloc_vreg(f)
+        f = lir::append_inst(r.func, 0, lir::const_int_inst(r.vreg, 1 to i128, 0, 0))
+        args = teko::list::push(args, r.vreg)
+        i++
+    }
+    f = lir::append_inst(f, 0, lir::void_call_inst("tk_sink", args, false, 0, 0))
+    lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+}
+
+#test
+fn rat_two_param_add_is_three_address_no_copy() {
+    let f = rat_two_i64_params("teko__demo__add")
+    let r = rat_bin(f, lir::LBinOp::IAdd, 0, 1)
+    let text = rat_dump(rat_ret(r.func, r.vreg))
+    teko::assert::str_contains(text, "func @teko__demo__add {")
+    teko::assert::str_contains(text, "addi %0, %p10, #0")
+    teko::assert::str_contains(text, "addi %1, %p11, #0")
+    teko::assert::str_contains(text, "add %2, %0, %1")
+    teko::assert::str_contains(text, "addi %p10, %2, #0")
+    teko::assert::str_contains(text, "ret")
+}
+
+#test
+fn rat_every_integer_alu_is_one_native_instruction() {
+    let f = rat_two_i64_params("teko__demo__alu")
+    let add = rat_bin(f, lir::LBinOp::IAdd, 0, 1)
+    let sub = rat_bin(add.func, lir::LBinOp::ISub, 0, 1)
+    let mul = rat_bin(sub.func, lir::LBinOp::IMul, 0, 1)
+    let and = rat_bin(mul.func, lir::LBinOp::IAnd, 0, 1)
+    let orr = rat_bin(and.func, lir::LBinOp::IOr, 0, 1)
+    let xor = rat_bin(orr.func, lir::LBinOp::IXor, 0, 1)
+    let shl = rat_bin(xor.func, lir::LBinOp::IShl, 0, 1)
+    let shrs = rat_bin(shl.func, lir::LBinOp::IShrS, 0, 1)
+    let shru = rat_bin(shrs.func, lir::LBinOp::IShrU, 0, 1)
+    let text = rat_dump(rat_ret(shru.func, add.vreg))
+    teko::assert::str_contains(text, "add %2, %0, %1")
+    teko::assert::str_contains(text, "sub %3, %0, %1")
+    teko::assert::str_contains(text, "mul %4, %0, %1")
+    teko::assert::str_contains(text, "and %5, %0, %1")
+    teko::assert::str_contains(text, "or %6, %0, %1")
+    teko::assert::str_contains(text, "xor %7, %0, %1")
+    teko::assert::str_contains(text, "sll %8, %0, %1")
+    teko::assert::str_contains(text, "sra %9, %0, %1")
+    teko::assert::str_contains(text, "srl %10, %0, %1")
+}
+
+#test
+fn rat_div_and_rem_are_native_m_extension() {
+    let f = rat_two_i64_params("teko__demo__divrem")
+    let divs = rat_bin(f, lir::LBinOp::IDivS, 0, 1)
+    let divu = rat_bin(divs.func, lir::LBinOp::IDivU, 0, 1)
+    let rems = rat_bin(divu.func, lir::LBinOp::IRemS, 0, 1)
+    let remu = rat_bin(rems.func, lir::LBinOp::IRemU, 0, 1)
+    let text = rat_dump(rat_ret(remu.func, divs.vreg))
+    teko::assert::str_contains(text, "div %2, %0, %1")
+    teko::assert::str_contains(text, "divu %3, %0, %1")
+    teko::assert::str_contains(text, "rem %4, %0, %1")
+    teko::assert::str_contains(text, "remu %5, %0, %1")
+}
+
+#test
+fn rat_small_const_is_single_li() {
+    let c = rat_const(rat_main_ret(), 42)
+    teko::assert::str_contains(rat_dump(rat_ret(c.func, c.vreg)), "li %0, #42")
+}
+
+#test
+fn rat_thirty_two_bit_const_is_lui_addi_pair() {
+    let c = rat_const(rat_main_ret(), 74565)
+    let text = rat_dump(rat_ret(c.func, c.vreg))
+    teko::assert::str_contains(text, "lui %0, #18")
+    teko::assert::str_contains(text, "addi %0, %0, #837")
+}
+
+#test
+fn rat_const_with_negative_low_half_pre_increments_lui() {
+    let c = rat_const(rat_main_ret(), 4095)
+    let text = rat_dump(rat_ret(c.func, c.vreg))
+    teko::assert::str_contains(text, "lui %0, #1")
+    teko::assert::str_contains(text, "addi %0, %0, #-1")
+}
+
+#test
+fn rat_negative_thirty_two_bit_const_is_lui_addi_pair() {
+    let c = rat_const(rat_main_ret(), -74565)
+    let text = rat_dump(rat_ret(c.func, c.vreg))
+    teko::assert::str_contains(text, "lui %0, #1048558")
+    teko::assert::str_contains(text, "addi %0, %0, #-837")
+}
+
+#test
+fn rat_sixty_four_bit_const_honest_stops_b2_bigimm() {
+    let c = rat_const(rat_main_ret(), 4294967296)
+    match select_lfunc_riscv(rat_ret(c.func, c.vreg)) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-bigimm")
+    }
+}
+
+#test
+fn rat_large_negative_const_honest_stops_b2_bigimm() {
+    let c = rat_const(rat_main_ret(), -4294967296)
+    match select_lfunc_riscv(rat_ret(c.func, c.vreg)) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-bigimm")
+    }
+}
+
+#test
+fn rat_value_compares_lower_per_condition() {
+    teko::assert::str_contains(rat_cmp_dump(lir::LBinOp::ICmpLtS), "slt %2, %0, %1")
+    teko::assert::str_contains(rat_cmp_dump(lir::LBinOp::ICmpLtU), "sltu %2, %0, %1")
+    teko::assert::str_contains(rat_cmp_dump(lir::LBinOp::ICmpGtS), "slt %2, %1, %0")
+    teko::assert::str_contains(rat_cmp_dump(lir::LBinOp::ICmpGtU), "sltu %2, %1, %0")
+    let ges = rat_cmp_dump(lir::LBinOp::ICmpGeS)
+    teko::assert::str_contains(ges, "slt %2, %0, %1")
+    teko::assert::str_contains(ges, "xori %2, %2, #1")
+    let geu = rat_cmp_dump(lir::LBinOp::ICmpGeU)
+    teko::assert::str_contains(geu, "sltu %2, %0, %1")
+    teko::assert::str_contains(geu, "xori %2, %2, #1")
+    let les = rat_cmp_dump(lir::LBinOp::ICmpLeS)
+    teko::assert::str_contains(les, "slt %2, %1, %0")
+    teko::assert::str_contains(les, "xori %2, %2, #1")
+    let leu = rat_cmp_dump(lir::LBinOp::ICmpLeU)
+    teko::assert::str_contains(leu, "sltu %2, %1, %0")
+    teko::assert::str_contains(leu, "xori %2, %2, #1")
+    let eq = rat_cmp_dump(lir::LBinOp::ICmpEq)
+    teko::assert::str_contains(eq, "sub %2, %0, %1")
+    teko::assert::str_contains(eq, "sltiu %2, %2, #1")
+    let ne = rat_cmp_dump(lir::LBinOp::ICmpNe)
+    teko::assert::str_contains(ne, "sub %2, %0, %1")
+    teko::assert::str_contains(ne, "sltu %2, %p0, %2")
+}
+
+#test
+fn rat_negate_is_sub_from_zero() {
+    let f = rat_one_i64_param("teko__demo__neg")
+    let r = rat_un(f, lir::LUnOp::INeg, 0)
+    teko::assert::str_contains(rat_dump(rat_ret(r.func, r.vreg)), "sub %1, %p0, %0")
+}
+
+#test
+fn rat_complement_is_xori_minus_one() {
+    let f = rat_one_i64_param("teko__demo__not")
+    let r = rat_un(f, lir::LUnOp::INot, 0)
+    teko::assert::str_contains(rat_dump(rat_ret(r.func, r.vreg)), "xori %1, %0, #-1")
+}
+
+#test
+fn rat_extend_and_truncate_are_identity_moves() {
+    let ft = rat_one_i64_param("teko__demo__trunc")
+    let rt = rat_un(ft, lir::LUnOp::Trunc, 0)
+    teko::assert::str_contains(rat_dump(rat_ret(rt.func, rt.vreg)), "addi %1, %0, #0")
+    let fz = rat_one_i64_param("teko__demo__zext")
+    let rz = rat_un(fz, lir::LUnOp::ZExt, 0)
+    teko::assert::str_contains(rat_dump(rat_ret(rz.func, rz.vreg)), "addi %1, %0, #0")
+    let fs = rat_one_i64_param("teko__demo__sext")
+    let rs = rat_un(fs, lir::LUnOp::SExt, 0)
+    teko::assert::str_contains(rat_dump(rat_ret(rs.func, rs.vreg)), "addi %1, %0, #0")
+}
+
+#test
+fn rat_void_ret_selects_bare_ret() {
+    let f = lir::append_inst(rat_main_ret(), 0, lir::ret_void_inst(0, 0))
+    teko::assert::str_contains(rat_dump(f), "ret")
+}
+
+#test
+fn rat_param_covers_scalar_gpr_classes_and_float_stops() {
+    teko::assert::is_true(rat_select_succeeds(rat_one_param_func(lir::LType::I8)))
+    teko::assert::is_true(rat_select_succeeds(rat_one_param_func(lir::LType::I16)))
+    teko::assert::is_true(rat_select_succeeds(rat_one_param_func(lir::LType::I32)))
+    teko::assert::is_true(rat_select_succeeds(rat_one_param_func(lir::LType::I64)))
+    teko::assert::is_true(rat_select_succeeds(rat_one_param_func(lir::LType::Ptr)))
+    teko::assert::is_true(rat_select_succeeds(rat_one_param_func(lir::LType::Void)))
+    teko::assert::is_true(!rat_select_succeeds(rat_one_param_func(lir::LType::F16)))
+    teko::assert::is_true(!rat_select_succeeds(rat_one_param_func(lir::LType::F32)))
+    teko::assert::is_true(!rat_select_succeeds(rat_one_param_func(lir::LType::F64)))
+    teko::assert::is_true(!rat_select_succeeds(rat_one_param_func(lir::LType::I128)))
+}
+
+#test
+fn rat_float_param_names_b2_fp() {
+    match select_lfunc_riscv(rat_one_param_func(lir::LType::F64)) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_i128_param_honest_stops() {
+    match select_lfunc_riscv(rat_one_param_func(lir::LType::I128)) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "register-pair ABI slot")
+    }
+}
+
+#test
+fn rat_ninth_gpr_param_honest_stops_b2_args() {
+    match select_lfunc_riscv(rat_n_i64_params(9)) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-args")
+    }
+}
+
+#test
+fn rat_eight_gpr_params_select() {
+    teko::assert::is_true(rat_select_succeeds(rat_n_i64_params(8)))
+}
+
+#test
+fn rat_param_index_out_of_range_honest_stops() {
+    let f = rat_main_ret()
+    let r = lir::alloc_vreg(f)
+    let f2 = lir::append_inst(r.func, 0, lir::param_inst(r.vreg, 3, 0, 0))
+    match select_lfunc_riscv(rat_ret(f2, 0)) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "param index out of range")
+    }
+}
+
+#test
+fn rat_float_ret_names_b2_fp() {
+    let ctx = selctx_riscv_set_vinfo(rat_bare_ctx("main"), 0, MRegClass::FPR, true)
+    match select_ret_riscv(ctx, lir::LRet { has_value = true; value = 0 }) {
+        SelCtxRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_const_float_honest_stops_b2_fp() {
+    let f = rat_main_ret()
+    let r = lir::alloc_vreg(f)
+    let f2 = lir::append_inst(r.func, 0, lir::const_float_inst(r.vreg, 4607182418800017408 to u64, 0, 0))
+    match select_lfunc_riscv(rat_ret(f2, r.vreg)) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_float_bin_honest_stops() {
+    let ctx = rat_bare_ctx("main")
+    let f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let inst = lir::bin_inst(5, lir::LBinOp::FAdd, 0, 1, 0, 0)
+    match select_bin_riscv(ctx, f, inst, lir::LBin { op = lir::LBinOp::FAdd; a = 0; b = 1 }) {
+        SelCtxRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_float_compare_value_honest_stops() {
+    let ctx = rat_bare_ctx("main")
+    let f = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let inst = lir::bin_inst(5, lir::LBinOp::FCmpEq, 0, 1, 0, 0)
+    match select_bin_riscv(ctx, f, inst, lir::LBin { op = lir::LBinOp::FCmpEq; a = 0; b = 1 }) {
+        SelCtxRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_float_un_honest_stops() {
+    let ctx = rat_bare_ctx("main")
+    let inst = lir::un_inst(5, lir::LUnOp::FNeg, 0, 0, 0)
+    match select_un_riscv(ctx, inst, lir::LUn { op = lir::LUnOp::FNeg; a = 0 }) {
+        SelCtxRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_convert_ops_honest_stop() {
+    let ctx = rat_bare_ctx("main")
+    let inst = lir::un_inst(5, lir::LUnOp::IToF, 0, 0, 0)
+    match select_un_riscv(ctx, inst, lir::LUn { op = lir::LUnOp::FToF; a = 0 }) {
+        SelCtxRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_alloca_reserves_frame_slot() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::alloca_inst(v.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::ret_inst(v.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(s1), "addi %0, sp, [frame #0]")
+}
+
+#test
+fn rat_field_addr_is_single_addi() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let fa = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(fa.func, 0, lir::alloca_inst(base.vreg, 16, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::field_addr_inst(fa.vreg, base.vreg, 8, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(fa.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(s2), "addi %1, %0, #8")
+}
+
+#test
+fn rat_field_addr_beyond_imm12_honest_stops_b2_bigimm() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let fa = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(fa.func, 0, lir::alloca_inst(base.vreg, 8192, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::field_addr_inst(fa.vreg, base.vreg, 4096, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(fa.vreg, 0, 0))
+    match select_lfunc_riscv(s2) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-bigimm")
+    }
+}
+
+#test
+fn rat_load_i64_is_doubleword() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let ld = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(ld.func, 0, lir::alloca_inst(base.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::load_inst(ld.vreg, base.vreg, lir::LType::I64, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(ld.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(s2), "ld %1, 0(%0)")
+}
+
+#test
+fn rat_narrow_loads_zero_extend() {
+    let fb = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(fb)
+    let lb = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(lb.func, 0, lir::alloca_inst(base.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::load_inst(lb.vreg, base.vreg, lir::LType::I8, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(lb.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(s2), "lbu %1, 0(%0)")
+    let fw = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let wbase = lir::alloc_vreg(fw)
+    let lw = lir::alloc_vreg(wbase.func)
+    let w0 = lir::append_inst(lw.func, 0, lir::alloca_inst(wbase.vreg, 8, 8, 0, 0))
+    let w1 = lir::append_inst(w0, 0, lir::load_inst(lw.vreg, wbase.vreg, lir::LType::I32, 0, 0))
+    let w2 = lir::append_inst(w1, 0, lir::ret_inst(lw.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(w2), "lwu %1, 0(%0)")
+}
+
+#test
+fn rat_store_i64_is_doubleword() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let val = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(val.func, 0, lir::alloca_inst(base.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::alloca_inst(val.vreg, 8, 8, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::store_inst(base.vreg, val.vreg, lir::LType::I64, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::ret_inst(base.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(s3), "sd %1, 0(%0)")
+}
+
+#test
+fn rat_store_float_names_b2_fp() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let base = lir::alloc_vreg(f0)
+    let val = lir::alloc_vreg(base.func)
+    let s0 = lir::append_inst(val.func, 0, lir::alloca_inst(base.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::alloca_inst(val.vreg, 8, 8, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::store_inst(base.vreg, val.vreg, lir::LType::F64, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::ret_inst(base.vreg, 0, 0))
+    match select_lfunc_riscv(s3) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_mem_size_covers_every_transfer_class() {
+    teko::assert::is_true(rat_load_ty_succeeds(lir::LType::I8))
+    teko::assert::is_true(rat_load_ty_succeeds(lir::LType::I16))
+    teko::assert::is_true(rat_load_ty_succeeds(lir::LType::I32))
+    teko::assert::is_true(rat_load_ty_succeeds(lir::LType::I64))
+    teko::assert::is_true(rat_load_ty_succeeds(lir::LType::Ptr))
+    teko::assert::is_true(!rat_load_ty_succeeds(lir::LType::F32))
+    teko::assert::is_true(!rat_load_ty_succeeds(lir::LType::F64))
+    teko::assert::is_true(!rat_load_ty_succeeds(lir::LType::F16))
+    teko::assert::is_true(!rat_load_ty_succeeds(lir::LType::I128))
+    teko::assert::is_true(!rat_load_ty_succeeds(lir::LType::Void))
+}
+
+#test
+fn rat_global_addr_is_single_lla() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::global_addr_inst(v.vreg, ".Lstr0", 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::ret_inst(v.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(s1), "lla %0, @.Lstr0")
+}
+
+#test
+fn rat_func_addr_is_single_lla() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::func_addr_inst(v.vreg, "teko__demo__f", 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::ret_inst(v.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(s1), "lla %0, @teko__demo__f")
+}
+
+#test
+fn rat_call_pins_a0_and_emits_call() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::const_int_inst(v.vreg, 42 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_inst("tk_exit", teko::list::push(teko::list::empty(), v.vreg), false, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(v.vreg, 0, 0))
+    let text = rat_dump(s2)
+    teko::assert::str_contains(text, "addi %p10, %0, #0")
+    teko::assert::str_contains(text, "call @tk_exit(%p10)")
+}
+
+#test
+fn rat_call_with_result_moves_a0_out() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let r = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(r.func, 0, lir::call_inst(r.vreg, "teko__demo__f", teko::list::empty(), false, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::ret_inst(r.vreg, 0, 0))
+    let text = rat_dump(s1)
+    teko::assert::str_contains(text, "call @teko__demo__f() -> %p10")
+    teko::assert::str_contains(text, "addi %0, %p10, #0")
+}
+
+#test
+fn rat_call_indirect_is_call_through_target() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let t = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(t.func, 0, lir::alloca_inst(t.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_indirect_inst(t.vreg, teko::list::empty(), false, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(t.vreg, 0, 0))
+    teko::assert::str_contains(rat_dump(s2), "call.indirect %0()")
+}
+
+#test
+fn rat_variadic_call_honest_stops() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let v = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(v.func, 0, lir::const_int_inst(v.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_inst("tk_printf", teko::list::push(teko::list::empty(), v.vreg), true, 0, 0))
+    match select_lfunc_riscv(s1) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-args")
+    }
+}
+
+#test
+fn rat_variadic_indirect_call_propagates() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let t = lir::alloc_vreg(f0)
+    let s0 = lir::append_inst(t.func, 0, lir::alloca_inst(t.vreg, 8, 8, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::void_call_indirect_inst(t.vreg, teko::list::empty(), true, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::ret_inst(t.vreg, 0, 0))
+    match select_lfunc_riscv(s2) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-args")
+    }
+}
+
+#test
+fn rat_call_within_window_selects() {
+    teko::assert::is_true(rat_select_succeeds(rat_call_n_args(8)))
+}
+
+#test
+fn rat_call_past_window_honest_stops() {
+    match select_lfunc_riscv(rat_call_n_args(9)) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-args")
+    }
+}
+
+#test
+fn rat_float_call_arg_names_b2_fp() {
+    let ctx = selctx_riscv_set_vinfo(rat_bare_ctx("main"), 0, MRegClass::FPR, true)
+    match pin_args_riscv(ctx, teko::list::push(teko::list::empty(), 0 to u32), false) {
+        PinnedArgsRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_jump_emits_edge_move_and_jal() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let v0 = lir::alloc_vreg(b1.func)
+    let bp = lir::add_block_param(v0.func, b1.block_id)
+    let s0 = lir::append_inst(bp.func, 0, lir::const_int_inst(v0.vreg, 7 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::jump_inst(b1.block_id, teko::list::push(teko::list::empty(), v0.vreg), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    let text = rat_dump(s2)
+    teko::assert::str_contains(text, "#M1(%1")
+    teko::assert::str_contains(text, "addi %1, %0, #0")
+    teko::assert::str_contains(text, "jal x0, #M1")
+}
+
+#test
+fn rat_jump_arg_count_mismatch_honest_stops() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let bp = lir::add_block_param(b1.func, b1.block_id)
+    let s0 = lir::append_inst(bp.func, 0, lir::jump_inst(b1.block_id, teko::list::empty(), 0, 0))
+    let s1 = lir::append_inst(s0, b1.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    match select_lfunc_riscv(s1) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "does not match")
+    }
+}
+
+#test
+fn rat_fused_compare_branch_is_one_branch_then_jal() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let v3 = lir::alloc_vreg(v2.func)
+    let v4 = lir::alloc_vreg(v3.func)
+    let s0 = lir::append_inst(v4.func, 0, lir::const_int_inst(v0.vreg, 5 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(v1.vreg, 3 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::bin_inst(v2.vreg, lir::LBinOp::ICmpGtS, v0.vreg, v1.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::branch_inst(v2.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s4 = lir::append_inst(s3, b1.block_id, lir::const_int_inst(v3.vreg, 1 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b1.block_id, lir::ret_inst(v3.vreg, 0, 0))
+    let s6 = lir::append_inst(s5, b2.block_id, lir::const_int_inst(v4.vreg, 2 to i128, 0, 0))
+    let s7 = lir::append_inst(s6, b2.block_id, lir::ret_inst(v4.vreg, 0, 0))
+    let text = rat_dump(s7)
+    teko::assert::str_contains(text, "blt %1, %0, #M1")
+    teko::assert::str_contains(text, "jal x0, #M2")
+}
+
+#test
+fn rat_generic_boolean_branch_tests_against_zero() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let s0 = lir::append_inst(v2.func, 0, lir::const_int_inst(v0.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::const_int_inst(v1.vreg, 10 to i128, 0, 0))
+    let s3 = lir::append_inst(s2, b1.block_id, lir::ret_inst(v1.vreg, 0, 0))
+    let s4 = lir::append_inst(s3, b2.block_id, lir::const_int_inst(v2.vreg, 20 to i128, 0, 0))
+    let s5 = lir::append_inst(s4, b2.block_id, lir::ret_inst(v2.vreg, 0, 0))
+    let text = rat_dump(s5)
+    teko::assert::str_contains(text, "bne %0, %p0, #M1")
+    teko::assert::str_contains(text, "jal x0, #M2")
+}
+
+#test
+fn rat_unfused_compare_branch_tests_the_value() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let v1 = lir::alloc_vreg(v0.func)
+    let v2 = lir::alloc_vreg(v1.func)
+    let bp = lir::add_block_param(v2.func, b1.block_id)
+    let s0 = lir::append_inst(bp.func, 0, lir::const_int_inst(v0.vreg, 5 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::const_int_inst(v1.vreg, 3 to i128, 0, 0))
+    let s2 = lir::append_inst(s1, 0, lir::bin_inst(v2.vreg, lir::LBinOp::ICmpGtS, v0.vreg, v1.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, 0, lir::branch_inst(v2.vreg, b1.block_id, teko::list::push(teko::list::empty(), v2.vreg), b2.block_id, teko::list::empty(), 0, 0))
+    let s4 = lir::append_inst(s3, b1.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    let s5 = lir::append_inst(s4, b2.block_id, lir::ret_inst(v2.vreg, 0, 0))
+    let text = rat_dump(s5)
+    teko::assert::str_contains(text, "slt %2, %1, %0")
+    teko::assert::str_contains(text, "bne %2, %p0, #M3")
+}
+
+#test
+fn rat_branch_with_edge_args_splits_edge_block() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let bp = lir::add_block_param(v0.func, b1.block_id)
+    let s0 = lir::append_inst(bp.func, 0, lir::const_int_inst(v0.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::push(teko::list::empty(), v0.vreg), b2.block_id, teko::list::empty(), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(bp.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, b2.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    let text = rat_dump(s3)
+    teko::assert::str_contains(text, "bne %0, %p0, #M3")
+    teko::assert::str_contains(text, "jal x0, #M1")
+}
+
+#test
+fn rat_branch_taken_edge_mismatch_propagates() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let s0 = lir::append_inst(v0.func, 0, lir::const_int_inst(v0.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::push(teko::list::empty(), v0.vreg), b2.block_id, teko::list::empty(), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, b2.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    match select_lfunc_riscv(s3) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "does not match")
+    }
+}
+
+#test
+fn rat_branch_else_edge_mismatch_propagates() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let b2 = lir::alloc_block(b1.func)
+    let v0 = lir::alloc_vreg(b2.func)
+    let s0 = lir::append_inst(v0.func, 0, lir::const_int_inst(v0.vreg, 1 to i128, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(v0.vreg, b1.block_id, teko::list::empty(), b2.block_id, teko::list::push(teko::list::empty(), v0.vreg), 0, 0))
+    let s2 = lir::append_inst(s1, b1.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    let s3 = lir::append_inst(s2, b2.block_id, lir::ret_inst(v0.vreg, 0, 0))
+    match select_lfunc_riscv(s3) {
+        MFuncRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "does not match")
+    }
+}
+
+#test
+fn rat_branch_on_fused_float_compare_propagates() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let s0 = lir::append_inst(f0, 0, lir::bin_inst(0, lir::LBinOp::FCmpEq, 1, 2, 0, 0))
+    let s1 = lir::append_inst(s0, 0, lir::branch_inst(0, 1, teko::list::empty(), 2, teko::list::empty(), 0, 0))
+    let br = lir::LBranch { cond = 0; t_target = 1; t_args = teko::list::empty(); f_target = 2; f_args = teko::list::empty() }
+    match select_branch_riscv(rat_bare_ctx("main"), s1, br) {
+        SelCtxRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_fused_float_compare_branch_names_b2_fp() {
+    let ctx = rat_bare_ctx("main")
+    let dc = DefCmp { found = true; op = lir::LBinOp::FCmpEq; a = 0; bb = 1 }
+    match select_fused_branch_riscv(ctx, dc, 0) {
+        SelCtxRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_edge_move_of_float_value_names_b2_fp() {
+    let f0 = lir::new_func("main", 0, teko::list::empty(), lir::LType::I64)
+    let b1 = lir::alloc_block(f0)
+    let bp = lir::add_block_param(b1.func, b1.block_id)
+    let ctx = selctx_riscv_set_vinfo(rat_bare_ctx("main"), 0, MRegClass::FPR, true)
+    match emit_edge_moves_riscv(ctx, bp.func, b1.block_id, teko::list::push(teko::list::empty(), 0 to u32)) {
+        SelCtxRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-fp")
+    }
+}
+
+#test
+fn rat_module_selects_every_function() {
+    let f = rat_two_i64_params("teko__demo__add")
+    let r = rat_bin(f, lir::LBinOp::IAdd, 0, 1)
+    let done = rat_ret(r.func, r.vreg)
+    let m = lir::LModule { funcs = teko::list::push(teko::list::empty(), done); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match select_module_riscv(m) {
+        MModuleRiscv as mm => teko::assert::str_contains(minst_print_riscv(mm), "add %2, %0, %1")
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+fn rat_module_propagates_first_error() {
+    let c = rat_const(rat_main_ret(), 4294967296)
+    let bad = rat_ret(c.func, c.vreg)
+    let m = lir::LModule { funcs = teko::list::push(teko::list::empty(), bad); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match select_module_riscv(m) {
+        MModuleRiscv => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "B2-bigimm")
+    }
+}
