@@ -2443,7 +2443,7 @@ fn program_memory_plan_with_a_frame_adds_the_sp_global() {
     let plan = wasm_program_memory_plan(lmod, rodata)
     teko::assert::is_true(plan.globals.len == (1 to u64))
     teko::assert::is_true(plan.globals[0].mutable)
-    teko::assert::is_true(plan.globals[0].init == ((8 to i64) + (65536 to i64)))
+    teko::assert::is_true(plan.globals[0].init == ((wasm_rodata_base() to i64) + (65536 to i64)))
     teko::assert::is_true(plan.mem_min_pages == (2 to u32))
 }
 
@@ -2451,26 +2451,31 @@ fn program_memory_plan_with_a_frame_adds_the_sp_global() {
 /**
  * assemble_program_own_exit_zero_shape_exports_start — the `own_exit_zero`
  * corpus fixture's own shape (`main` only, no rodata, no alloca): the
- * assembled module exports EXACTLY `"_start"` (the owner's own C1-5
- * invariant) at the synthesized entry's own function index (past the two
- * WASI imports and the one defined `main`), its `funcs` list is
- * `[main, _start]` (two entries, the last closed by the code-entry `end`),
- * and the type table carries the WASI pair plus one entry per defined
- * function.
+ * assembled module exports `"_start"` (the owner's own C1-5 invariant) at
+ * the synthesized entry's own function index (past the two WASI imports,
+ * the one defined `main`, and the five C1-6 io/panic trampolines
+ * `wasm_assemble_program` always appends) PLUS `"memory"` (the C1-6
+ * wasmtime-execution requirement, `wasm_memory_export`), its `funcs` list
+ * is `[main, print, println, eprint, eprintln, panic_str, _start]` (seven
+ * entries, the last closed by the code-entry `end`), and the type table
+ * carries the WASI pair, one entry per defined function, the shared
+ * io/panic type, and `_start`'s own.
  *
  * @return void
  */
 fn assemble_program_own_exit_zero_shape_exports_start() {
     let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
     let m = match wasm_assemble_program(lmod) { WasmModule as x => x; error => return }
-    teko::assert::is_true(m.exports.len == (1 to u64))
+    teko::assert::is_true(m.exports.len == (2 to u64))
     teko::assert::is_true(m.exports[0].name == "_start")
-    teko::assert::is_true(m.exports[0].index == (3 to u32))
-    teko::assert::is_true(m.funcs.len == (2 to u64))
-    let start = m.funcs[1]
+    teko::assert::is_true(m.exports[0].index == (8 to u32))
+    teko::assert::is_true(m.exports[1].name == "memory")
+    teko::assert::is_true(m.exports[1].index == (0 to u32))
+    teko::assert::is_true(m.funcs.len == (7 to u64))
+    let start = m.funcs[6]
     teko::assert::is_true(start.body.len > (0 to u64))
     teko::assert::is_true(start.body[start.body.len - 1] == (0x0B to byte))
-    teko::assert::is_true(m.types.len == (4 to u64))
+    teko::assert::is_true(m.types.len == (5 to u64))
     teko::assert::is_true(m.imports.len == (2 to u64))
 }
 

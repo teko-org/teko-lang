@@ -5065,6 +5065,23 @@ fn wasm_io_base_index(wasi: WasmWasiImportSet, lmod: lir::LModule) -> u32 {
 }
 
 /**
+ * wasm_memory_export — the module's own `"memory"` export (kind `0x02`,
+ * index `0` — the module's ONE linear memory, §5.2, always declared since
+ * `mem_min_pages` floors at 1 page): every WASI host (wasmtime included)
+ * requires a command module to export its memory so host-implemented WASI
+ * imports (`fd_write`, …) can read/write it — omitting it fails
+ * instantiation with "missing required memory export" even for a module
+ * that never calls `fd_write` itself (the C1-6 wasmtime execution proof
+ * surfaced this — every prior C1-1..C1-5 slice only ran `wasm-validate`,
+ * a structural check the missing export does not fail).
+ *
+ * @return WasmExport  the `"memory"` export entry
+ */
+fn wasm_memory_export() -> WasmExport {
+    WasmExport { name = "memory"; kind = 0x02 to byte; index = 0 to u32 }
+}
+
+/**
  * wasm_assemble_program — the whole own-backend wasm module assembler
  * (C1-5's "link/dispatch" job every earlier slice deferred here,
  * `backend-c1-wasm.md` §5.2/§9): the program's rodata laid out FIRST and
@@ -5077,14 +5094,16 @@ fn wasm_io_base_index(wasi: WasmWasiImportSet, lmod: lir::LModule) -> u32 {
  * entry stackified in place (`wasm_build_program_funcs`), the WASI import
  * set wired in (`wasm_wasi_import_set`), the trampolines themselves
  * appended (`wasm_synth_io_panic_funcs`, §7/§8), the synthesized `_start`
- * command entry point appended LAST and EXPORTED (the owner's own C1-5
- * invariant — a wasm command module MUST export `_start`, §9's doc,
- * `wasm_synth_start`), and the whole program's linear memory sized around
- * the ALREADY-LAID-OUT rodata (`wasm_program_memory_plan`). Returns the
- * NAMED `C1-globals` honest-stop when `lmod.globals` is non-empty (mirrors
- * A4-4's own guard, `wasm_honest_globals`) before touching anything else,
- * and propagates any per-function honest-stop unchanged
- * (`C1-i128`/`C1-f16`/`C1-irreducible`/an unresolved call/data symbol).
+ * command entry point appended LAST and EXPORTED alongside `"memory"` (the
+ * owner's own C1-5 invariant — a wasm command module MUST export
+ * `_start`, §9's doc, `wasm_synth_start` — PLUS the C1-6 "memory" export
+ * every WASI host needs, `wasm_memory_export`), and the whole program's
+ * linear memory sized around the ALREADY-LAID-OUT rodata
+ * (`wasm_program_memory_plan`). Returns the NAMED `C1-globals` honest-stop
+ * when `lmod.globals` is non-empty (mirrors A4-4's own guard,
+ * `wasm_honest_globals`) before touching anything else, and propagates
+ * any per-function honest-stop unchanged (`C1-i128`/`C1-f16`/
+ * `C1-irreducible`/an unresolved call/data symbol).
  *
  * @param LModule lmod  the whole lowered program
  * @return WasmModule | error  the assembled module, ready for `emit_wasm`,
@@ -5119,6 +5138,6 @@ pub fn wasm_assemble_program(lmod: lir::LModule) -> WasmModule | error {
         globals = plan.globals
         data = wasm_program_data_segments(plan.rodata)
         mem_min_pages = plan.mem_min_pages
-        exports = [WasmExport { name = "_start"; kind = 0x00 to byte; index = start_index }]
+        exports = [WasmExport { name = "_start"; kind = 0x00 to byte; index = start_index }, wasm_memory_export()]
     }
 }
