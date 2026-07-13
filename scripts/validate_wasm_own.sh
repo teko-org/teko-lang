@@ -97,13 +97,17 @@ if [[ ! -x "$teko_abs" ]]; then
 fi
 
 fixture_root="$script_dir/examples/regressions"
-# The exit(n)/arithmetic/control-flow corpus (mirroring diff_c_own.sh) plus the two C1-6
-# proof fixtures. KIND is a parallel array (no `declare -A` — macOS ships bash 3.2, no
-# associative arrays, mirroring diff_c_own.sh's own KNOWN_STOP/KNOWN_STOP_ERR shape):
+# The exit(n)/arithmetic/control-flow corpus (mirroring diff_c_own.sh) plus the C1-6 proof
+# fixtures. KIND is a parallel array (no `declare -A` — macOS ships bash 3.2, no associative
+# arrays, mirroring diff_c_own.sh's own KNOWN_STOP/KNOWN_STOP_ERR shape):
 #   exit  — compare own-wasm's wasmtime exit code against the C-native oracle's, exactly.
 #   print — exit code AND stdout compared against the C-native oracle, exactly.
 #   trap  — own-wasm's wasmtime exit is asserted NONZERO only (a wasm trap and native's
 #           SIGABRT are different termination mechanisms — never byte-compared, §8).
+# wasm_defer_arm_scope (PR #553 review finding) is `print`-kind ON PURPOSE: a leaked
+# then-arm `defer` firing unconditionally past the if's merge is a STDOUT divergence
+# ("AB" vs the C-native oracle's "B"), not an exit-code one — the exact shape a bare
+# `exit`-kind fixture would silently miss.
 CORPUS=(
     own_exit_zero
     own_exit_code
@@ -113,6 +117,7 @@ CORPUS=(
     own_match_exit
     wasm_print_exit
     wasm_panic_hook
+    wasm_defer_arm_scope
 )
 KIND=(
     exit
@@ -123,6 +128,7 @@ KIND=(
     exit
     print
     trap
+    print
 )
 
 kind_of() {
