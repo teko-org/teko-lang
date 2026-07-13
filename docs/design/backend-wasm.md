@@ -562,7 +562,7 @@ fixture panics via the hook, a large-pointer fixture runs on wasm64. This is the
 
 A Teko wasm module runs in one of two modes, decided by the loading contract — NOT by two different
 compilers (the same `emit_wasm_module` emits both; the mode is which import namespace the module
-declares + which host wires it). Both are ratified 2026-07-12.
+declares + which host wires it). Both are ratified 2026-07-12. **Consumption-side design:** the Teko-native capability-import mode is **Model 1** (#530) and the WASI-interop mode is **Model 2** (#535); see those issues for runtime capability semantics and permission boundaries.
 
 **(interop) Standard WASI ABI.** When the module is consumed by another language / a standard host,
 it speaks the WASI preview1 ABI: it exports `_start` (or the named function exports) and imports the
