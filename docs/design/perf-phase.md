@@ -135,3 +135,14 @@ that is the use-after-free proof for Boundary A.
 * The **optimization axis** (rulings (b)/(c)) and **test thread isolation**
   (ruling (d)) are separate phases; this record only fixes their relationship to
   the four perf fixes.
+* **Test-execution remodel — a SECOND bottleneck, deferred (owner 2026-07-14:
+  "vamos ter que pensar … pois é outro gargalo", not now).** Beyond ruling (d)'s
+  thread isolation, the *shape* of how the suite runs is itself a latency source:
+  the self-hosted `teko test .` re-runs the whole corpus serially, and it was
+  heavy enough to blow the Windows self-host cap — so that lane now drops test
+  execution and only builds gen1 + a `--version` smoke (`sanitizers.yml`,
+  `ci-gates.md`), with the authoritative suite on the Linux/macOS lanes. When we
+  return to it: parallelize/isolate the run onto a thread (ruling (d)), stop
+  carrying the test AST alongside the source load, and re-add the Windows test run
+  once the compiler-speed work brings the build time down. Sequenced **after** the
+  four perf fixes + the -O2 seed land; no design committed here yet.
