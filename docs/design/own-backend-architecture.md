@@ -93,6 +93,14 @@ all targets. The LIR-dump (`src/lir/lir_print.tks`, deterministic, floats as exa
 
 ### 2.4 C-backend retire criteria
 
+> **SUPERSEDED IN PART 2026-07-14 (owner ruling — D38 / `docs/design/backend-default-inversion.md`).**
+> The clause below that treated "C-native stays the trusted DEFAULT until retirement" was an
+> integrator-pinned recommendation, not an owner ruling. The **default codegen backend is now
+> `Backend::Native`**; C is opt-in via `--backend=c`, **pinned** on every self-host / release /
+> fixpoint / C-reference site until criterion (2) below is green. The retire CRITERIA (1)(2)(3) are
+> unchanged and still gate deleting `tk_emit_c`; only the DEFAULT moved. Criterion (2) is honored,
+> not violated — it becomes the explicit `--backend=c` pin-list (that doc §4, the retire ladder).
+
 `tk_emit_c` retires only when **all** hold (decision collected at N8, #225): (1) own-native
 passes the full 3-way gate on every target for K consecutive green releases; (2) the own backend
 self-hosts (gen1==gen2==gen3 byte-identical through the own path, the fixpoint bar); (3) the
@@ -200,6 +208,16 @@ covers the promised matrix). It shares the reachability model with the packaging
 
 ### 3.7 Slotting beside the C-emit path (the backend-selection flag)
 
+> **UPDATED 2026-07-14 (owner ruling — D38 / `docs/design/backend-default-inversion.md`).** The
+> flag landed as D1/#390: `backend_of` (`project.tks`) resolves `--backend={c,native}` into
+> `Manifest.backend`, `emit_binary`/`backend` (`project.tks:685`) dispatches on `m.backend`. The
+> **default is now `Backend::Native`** (was `Backend::C`); `--backend=c` opts out to the trusted C
+> path, which the compiler's own self-host / release / fixpoint / C-reference sites pin explicitly
+> (that doc §2, the pin-site audit). The temporary `TEKO_BACKEND` env seam is **retired** (M.5);
+> `TEKO_TARGET` (own-backend ISA/OS) stays orthogonal. The paragraph below ("The default stays
+> `Backend::C` until retirement") is **SUPERSEDED** — the flag is no longer FIXPOINT-preserving *by
+> default*; the fixpoint is preserved by the explicit `--backend=c` pins instead.
+
 The selection point is **`backend(...)` in `src/build/project.tks:465`** (and the twin
 `backend(...)` in `src/driver.tks:172`). Today the `Artifact::Binary` arm unconditionally calls
 `codegen::tk_emit_c` → `run_cc` (`:515-529`). N7 (#225) adds a `--backend={c,native}` flag threaded
@@ -227,9 +245,12 @@ fn emit_binary(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
 ```
 
 `emit_c_native` is the current body of `backend()` (lines `:515-534`, extracted verbatim);
-`emit_native` runs `lir::lower` → isel → regalloc → encode → objfile → M-linker. The default stays
+`emit_native` runs `lir::lower` → isel → regalloc → encode → objfile → M-linker. ~~The default stays
 `Backend::C` until retirement (§2.4), so the flag is purely additive and FIXPOINT-preserving until
-flipped.
+flipped.~~ **SUPERSEDED 2026-07-14 (D38):** the default is now `Backend::Native`; the fixpoint is
+preserved by pinning `--backend=c` on every self-host / release / fixpoint site (see
+`docs/design/backend-default-inversion.md` §2), until the own self-host fixpoint clears §2.4
+criterion (2), at which point the pins drop per that doc's retire ladder (§4).
 
 ---
 
