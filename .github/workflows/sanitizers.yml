@@ -1,13 +1,27 @@
 name: Sanitizers & Stress
 
-# CI runs on PULL REQUESTS ONLY (cost: a green PR already proved main; the post-merge push
-# would just re-run it). Branch protection gates merges on these checks; the release trusts
-# main and does not re-validate. chore/reboot stays listed for PRs into it (#54).
+# Two-tier memory/UB gating (owner ruling 2026-07-14 — see docs/design/ci-gates.md).
+#
+#   LIGHT gate (protects the SEED, runs on EVERY lane PR): the native self-host under
+#   TEKO_MEM_PARANOID — teko's OWN arena oracle (poison-on-free + never-reuse). No clang,
+#   no ASan shadow memory, ~one native self-host of wall-clock. This is what a lane PR
+#   must pass so the seed it feeds the next crumb is memory-clean.
+#
+#   HEAVY gate (audits MAIN, runs ONLY on merge to main): the full ASan+UBSan(+LSan-by-name)
+#   default-dispatch lane. It is the ~24-min lane that surfaced the historical root UBs; it is
+#   NOT worth paying on every lane PR now that the C mirror is gone and the light gate guards
+#   the seed. Its single trigger is main: it runs as a REQUIRED check on PRs INTO main (the
+#   umbrella -> main integration merge) and re-runs on push to main as a post-merge audit.
+#   No nightly, no schedule, no auto-issue (owner ruling: "Único gatilho passa a ser merge na main").
+#
+# CI runs on PULL REQUESTS + the two integration pushes (remodel seed-cut, main merge). Branch
+# protection gates merges on the aggregators below; the release trusts main and does not re-validate.
+# chore/reboot stays listed for PRs into it (#54).
 on:
   pull_request:
     branches: [main, master, chore/reboot, 'remodel/**']
   push:
-    branches: ['remodel/**']
+    branches: [main, 'remodel/**']
     paths-ignore: ['**.md', 'docs/**']
 
 # Restrict default token scope for all jobs in this workflow.
@@ -34,15 +48,69 @@ jobs:
               - '.github/workflows/sanitizers.yml'
               - '.github/lsan-suppressions.txt'
 
-  # ── ASan + UBSan + LSan (default computed-goto dispatch) ────────────────────
-  # LSan is enabled on THIS lane only (issue #54): detect_leaks=1 with a suppressions
-  # file (.github/lsan-suppressions.txt) covering the documented M.5 process-lifetime
-  # allocations (deliberately never freed by us; reclaimed by the OS at exit). Any
-  # OTHER leak fails the lane.
+  # ── LIGHT gate: TEKO_MEM_PARANOID native self-host (SEED protector) ───────────
+  # Runs on EVERY relevant PR/push. TEKO_MEM_PARANOID is teko's OWN arena oracle (teko_rt.c
+  # #148 Level-2): a runtime getenv that POISONS every freed arena block and NEVER reuses it,
+  # so any use-after-free or arena-reuse-after-free in the compiler's OWN C aborts loud. We
+  # build gen1 natively (the seed compiles the PR sources) and then RUN gen1 over the whole
+  # project with the oracle armed — the self-host compile exercises the full front-end + native
+  # backend arena traffic. No clang, no ASan/LSan shadow memory: this is deliberately the CHEAP
+  # gate, sized to run on every lane PR so the seed it produces is memory-clean. The HEAVY
+  # ASan+UBSan audit of the emitted C + runtime seam is the main-only lane below.
+  mem-paranoid:
+    name: Memory paranoid (native self-host)
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision teko from the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64
+
+      - name: Build gen1 (seed compiles the PR sources)
+        run: teko . -o bin
+
+      # Run the gate on gen1 with the arena oracle armed. Any poison-touch / reuse aborts loud.
+      - name: Run the gate on gen1 (TEKO_MEM_PARANOID)
+        env:
+          TEKO_MEM_PARANOID: '1'
+        run: ./bin/teko . -o gen2-mp
+
+      # Widen the corpus of language constructs exercised under the oracle: native-build every
+      # regressions fixture with gen1 while paranoid poisoning is armed.
+      - name: Native-build regressions fixtures (TEKO_MEM_PARANOID)
+        env:
+          TEKO_MEM_PARANOID: '1'
+        run: |
+          out="$(mktemp -d)"
+          for proj in examples/regressions/*/; do
+            ls "$proj"*.tkp >/dev/null 2>&1 || continue
+            if [ -f "${proj}EXPECT_COMPILE_FAIL" ]; then echo "== skip ${proj} (EXPECT_COMPILE_FAIL — negative fixture, nothing to build)"; continue; fi
+            echo "== teko build $proj"
+            ./bin/teko build "$proj" -o "$out/$(basename "$proj")"
+          done
+
+  # ── HEAVY gate: ASan + UBSan + LSan (default computed-goto dispatch) — MAIN ONLY ─
+  # Trigger is MAIN, and only main: this job runs when the PR targets main (base_ref == main)
+  # OR on push to main (ref == refs/heads/main). It is SKIPPED on lane/remodel PRs and remodel
+  # pushes — the light mem-paranoid gate above guards those. This is the ~24-min lane and it is
+  # only paid at the seed/release boundary (the umbrella -> main merge), per owner ruling.
+  #
+  # LSan is enabled on THIS lane only (issue #54): detect_leaks with a suppressions file
+  # (.github/lsan-suppressions.txt) covering the documented M.5 process-lifetime allocations
+  # (deliberately never freed by us; reclaimed by the OS at exit). Any OTHER leak fails the lane.
   asan-default:
     name: ASan+UBSan+LSan / default dispatch
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: needs.changes.outputs.run == 'true' && (github.base_ref == 'main' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -87,15 +155,14 @@ jobs:
       # (VM→native default for `teko . -o bin`) is independent of this lane. The #323 ASan caps stay:
       # they bound the lane's ASan footprint on the 7 GB runner.
       #
-      # LSan (detect_leaks) is OFF here BY CONSTRUCTION. Unlike the VM gate — whose test runner does a
-      # per-#test arena rewind (tk_arena_push/pop) so LSan sees only leaks BEYOND the rewound set — the
-      # native gate compiles + runs the whole corpus in ONE process with NO rewind, so the arena's
-      # process-lifetime allocations (front-end discovery strings via dsc_walk, per-test crypto buffers)
-      # are all held to exit by the S0 arena discipline and reclaimed by the OS. LSan cannot distinguish
-      # that deliberate hold from a real leak on this lane (it flagged ~132 KB of exactly those holds,
-      # NONE from the alignment change), so it is not a meaningful oracle here. LSan's meaningful home is
-      # a per-test-rewound run — the nightly VM lane. This lane's job is ASan + UBSan on the production
-      # native path, which is what surfaced the UBs above.
+      # LSan (detect_leaks) is OFF here BY CONSTRUCTION. Unlike a per-#test-rewound run — which sees
+      # only leaks BEYOND the rewound set — the native gate compiles + runs the whole corpus in ONE
+      # process with NO rewind, so the arena's process-lifetime allocations (front-end discovery
+      # strings via dsc_walk, per-test crypto buffers) are all held to exit by the S0 arena discipline
+      # and reclaimed by the OS. LSan cannot distinguish that deliberate hold from a real leak on this
+      # lane (it flagged ~132 KB of exactly those holds, NONE from the alignment change), so it is not
+      # a meaningful oracle here. This lane's job is ASan + UBSan on the production native path, which
+      # is what surfaced the UBs above.
       - name: Run the gate on gen1 (native, ASan + UBSan)
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=0:quarantine_size_mb=64:malloc_context_size=5
@@ -125,17 +192,17 @@ jobs:
 
   # ── TSan (Thread Sanitizer): BUILD + SMOKE ────────────────────────────────────
   # TSan runs build + smoke while the codebase is single-threaded (TSan finds no races
-  # without threads; ASan+UBSan run the full suite). RESTORE the full `teko test .`
-  # gate under TSan INCREMENTALLY as the concurrency surface lands — async/await,
-  # routines, teko::threading::run, parallelism, channels, teko::sync (S8/ASYNC,
-  # ROUND 5). Mandatory checklist item on every concurrency PR.
+  # without threads; the mem-paranoid + main ASan lanes run the full suite). RESTORE the
+  # full `teko test .` gate under TSan INCREMENTALLY as the concurrency surface lands —
+  # async/await, routines, teko::threading::run, parallelism, channels, teko::sync
+  # (S8/ASYNC, ROUND 5). Mandatory checklist item on every concurrency PR.
   #
   # Rationale (user-ratified, supersedes issue #127's full-suite-under-TSan approach):
   # the test path is 100% SINGLE-THREADED today — ZERO pthread/thread/atomic/spawn in
   # src/ (verified by grep). With no threads, TSan has no race to find: running the full
   # 614-test suite under `-fsanitize=thread` produces NO additional coverage over the
-  # ASan+UBSan lanes (which DO run the full suite and pass) and only exposes the suite
-  # to environmental flake — the intermittent exit-143 (silent SIGTERM) that blocked
+  # other lanes (which DO run the full suite and pass) and only exposes the suite to
+  # environmental flake — the intermittent exit-143 (silent SIGTERM) that blocked
   # unrelated PRs (#125, #126) was a RESOURCE/SLOWNESS kill on the slowest lane, never a
   # data race or deadlock (the suite completes cleanly and deterministically both locally
   # and on healthy runners). This is NOT a quarantine and loses NO real coverage: right-
@@ -255,25 +322,28 @@ jobs:
           .\bin\teko.exe test . --coverage
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-  # ── gate: aggregates all sanitizer + stress results ──────────────────────────
+  # ── gate: LIGHT aggregator — the SEED protector (required on lanes + remodel + main) ─
+  # Aggregates the lane-PR suite: mem-paranoid + tsan + windows-selfhost. This is the
+  # required check for lane/remodel PRs (and it also runs on PRs into main). It NEVER
+  # depends on the heavy asan-default lane, so lane PRs never wait on it.
   gate:
     name: Sanitizer gate
     runs-on: ubuntu-latest
-    needs: [changes, asan-default, tsan, windows-selfhost]
+    needs: [changes, mem-paranoid, tsan, windows-selfhost]
     if: always()
     permissions: {}
 
     steps:
       - name: Evaluate results
         run: |
-          ASAN_DEFAULT="${{ needs.asan-default.result }}"
+          MEM_PARANOID="${{ needs.mem-paranoid.result }}"
           TSAN="${{ needs.tsan.result }}"
           WINDOWS_SELFHOST="${{ needs.windows-selfhost.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
-          echo "changes.run    = $CHANGES"
-          echo "asan-default   = $ASAN_DEFAULT"
-          echo "tsan           = $TSAN"
+          echo "changes.run      = $CHANGES"
+          echo "mem-paranoid     = $MEM_PARANOID"
+          echo "tsan             = $TSAN"
           echo "windows-selfhost = $WINDOWS_SELFHOST"
 
           if [ "$CHANGES" != "true" ]; then
@@ -282,16 +352,52 @@ jobs:
           fi
 
           FAILED=0
-          for RESULT in "$ASAN_DEFAULT" "$TSAN" "$WINDOWS_SELFHOST"; do
+          for RESULT in "$MEM_PARANOID" "$TSAN" "$WINDOWS_SELFHOST"; do
             if [ "$RESULT" = "failure" ] || [ "$RESULT" = "cancelled" ]; then
               FAILED=1
             fi
           done
 
           if [ "$FAILED" = "1" ]; then
-            echo "ERROR: one or more sanitizer/stress jobs failed or were cancelled."
+            echo "ERROR: one or more light-gate jobs failed or were cancelled."
             exit 1
           fi
 
-          echo "Sanitizer gate passed."
+          echo "Sanitizer gate (light) passed."
+          exit 0
+
+  # ── gate: HEAVY aggregator — the MAIN audit (required on main ONLY) ────────────
+  # Aggregates the main-only asan-default lane. On lane/remodel PRs asan-default is SKIPPED,
+  # so this aggregator passes (a skipped dependency is neither failure nor cancelled) and is
+  # harmless if left un-required there. On PRs into main it enforces the heavy ASan+UBSan lane
+  # — make THIS the required check on the main ruleset (see docs/design/ci-gates.md).
+  heavy-gate:
+    name: Heavy sanitizer gate (main)
+    runs-on: ubuntu-latest
+    needs: [changes, asan-default]
+    if: always()
+    permissions: {}
+
+    steps:
+      - name: Evaluate results
+        run: |
+          ASAN_DEFAULT="${{ needs.asan-default.result }}"
+          CHANGES="${{ needs.changes.outputs.run }}"
+
+          echo "changes.run  = $CHANGES"
+          echo "asan-default = $ASAN_DEFAULT   (skipped on non-main contexts by design)"
+
+          if [ "$CHANGES" != "true" ]; then
+            echo "No relevant files changed — heavy gate passes."
+            exit 0
+          fi
+
+          # A skipped asan-default (lane/remodel context) is NOT a failure — the heavy lane
+          # only runs on main. Only a real failure/cancellation of the lane fails this gate.
+          if [ "$ASAN_DEFAULT" = "failure" ] || [ "$ASAN_DEFAULT" = "cancelled" ]; then
+            echo "ERROR: the heavy ASan+UBSan lane failed or was cancelled."
+            exit 1
+          fi
+
+          echo "Heavy sanitizer gate passed."
           exit 0
