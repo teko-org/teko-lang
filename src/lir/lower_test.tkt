@@ -475,19 +475,23 @@ fn lwt_if_stmt_non_mutating_arm_keeps_zero_param_merge() {
 
 #test
 /**
- * lwt_if_stmt_shadowed_scalar_excluded_from_merge — #389 F1 review round 1,
- * Finding 2(i): the then arm's OWN `mut x = 99; x = x + 1` SHADOWS the
- * enclosing `x` with a fresh, block-scoped local and reassigns THAT, never
- * the enclosing scalar. `reassigned_scalars`'s shadow-exclusion guard
- * (`collect_bound_stmts`) must drop `x` from the threaded set entirely, even
- * though a `TAssign` named `x` is plainly present in the arm — the merge
- * keeps its ZERO-scalar-param shape (`#B3:`, no `(%…)`), and the read past
- * the merge sees the UNCHANGED pre-branch VReg (`ret %0`), proving the outer
- * `x` is genuinely untouched, never corrupted by the shadow's own value.
+ * lwt_if_stmt_shadowed_scalar_threads_pre_branch_value — #389 F1b item 3: the
+ * then arm's OWN `mut x = 99; x = x + 1` SHADOWS the enclosing `x` with a
+ * fresh, block-scoped local (appended at a HIGHER index) and reassigns THAT,
+ * never the enclosing scalar. Under enclosing-IDENTITY threading `x` is now
+ * threaded (the coarse across-all-arms shadow exclusion is gone), but
+ * `arm_scalar_args` reads the enclosing scalar at its fixed pre-branch INDEX,
+ * which the shadow left untouched — so the merge gains a one-scalar `x` param
+ * whose EVERY incoming edge carries the pre-branch VReg (`jump #B3(%0)` on the
+ * then arm AND the else pass-through), a no-op phi. The read past the merge
+ * sees the merge param (`#B3(%4): ret %4`) whose value is still the untouched
+ * `1` — the outer `x` is never corrupted by the shadow's own value. This
+ * one-param no-op merge REPLACES F1's zero-param exclusion shape; the exit
+ * behaviour is identical.
  *
  * @return void
  */
-fn lwt_if_stmt_shadowed_scalar_excluded_from_merge() {
+fn lwt_if_stmt_shadowed_scalar_threads_pre_branch_value() {
     let one = lwt_num_i64(1 to i128)
     let two = lwt_num_i64(2 to i128)
     let cond = lwt_cmp(one, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, two)))
@@ -499,31 +503,31 @@ fn lwt_if_stmt_shadowed_scalar_excluded_from_merge() {
     let f = lwt_fn("shadow_no_leak", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
-    teko::assert::is_true(!teko::str::contains(text, "#B3(%"))
-    teko::assert::str_contains(text, "  #B3:\n    ret %0")
+    teko::assert::str_contains(text, "jump #B3(%0)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4")
 }
 
 #test
 /**
- * lwt_match_stmt_pattern_binding_excludes_one_name_but_still_threads_another
- * — #389 F1 review round 1, Finding 2(ii), BOTH directions in one proof: a
- * match subject `k` whose FIRST arm pattern-binds its own value under `x`
- * (`A as x`, no further statements), and whose SECOND (wildcard) arm
- * reassigns BOTH `x` and `y`. `x` is a genuine reassigned candidate (the
- * wildcard arm assigns it) but collides with the first arm's OWN pattern
- * binding — `reassigned_scalars_for_match`'s guard
- * (`collect_match_pattern_bound_names`) must EXCLUDE it, so the merge
- * carries exactly ONE scalar param, for `y` alone (`#B1(%3):`). The first
- * arm's own closing jump — despite locally shadowing `x` via its pattern
- * bind — must still resolve `y` to its UNTOUCHED value (`jump #B1(%2)`,
- * `y`'s original VReg, never confused by the `x` shadow in the SAME env);
- * the wildcard arm's closing jump must carry `y`'s NEWLY reassigned VReg
- * (`jump #B1(%5)`), proving the excluded name (`x`) does not also suppress
- * the genuinely-safe one (`y`).
+ * lwt_match_stmt_threads_both_the_reassigned_and_the_pattern_shadowed_name —
+ * #389 F1b item 3: a match subject `k` whose FIRST arm pattern-binds its own
+ * value under `x` (`A as x`, no further statements), and whose SECOND
+ * (wildcard) arm reassigns BOTH `x` and `y`. Under enclosing-IDENTITY
+ * threading BOTH `x` and `y` are threaded (the former across-all-arms pattern
+ * exclusion is gone), so the merge carries TWO scalar params in `env` order
+ * (`#B1(%3, %4):`, `x` = `%3`, `y` = `%4`). The pattern arm appends its `A as
+ * x` bind at a HIGHER index than the enclosing `x`, so `arm_scalar_args` reads
+ * both scalars at their untouched pre-branch indices and its closing jump
+ * carries pre-branch `x` and pre-branch `y` (`jump #B1(%1, %2)`); the wildcard
+ * arm reassigns both in place, so its closing jump carries the reassigned
+ * VRegs (`jump #B1(%5, %6)`). The read past the merge sums the two params
+ * (`ret %7`). This UPDATE fixes the latent wildcard-path miscompile the old
+ * one-param golden enshrined: `x`'s reassignment on the wildcard path was
+ * silently dropped when a SIBLING arm's pattern shadowed the name.
  *
  * @return void
  */
-fn lwt_match_stmt_pattern_binding_excludes_one_name_but_still_threads_another() {
+fn lwt_match_stmt_threads_both_the_reassigned_and_the_pattern_shadowed_name() {
     let subject = lwt_var("k", checker::PrimKind::I64)
     let arm0 = lwt_arm(lwt_bind_pattern("A", "x"), teko::list::empty())
     let arm1_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(99 to i128), checker::PrimKind::I64)), lwt_simple_assign("y", lexer::TokenKind::Assign, lwt_num_i64(20 to i128), checker::PrimKind::I64))
@@ -536,10 +540,82 @@ fn lwt_match_stmt_pattern_binding_excludes_one_name_but_still_threads_another() 
     let f = lwt_fn("shadow_and_clean_reassign", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
     let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
     let text = print_lmodule(add_func(empty_module(), lf))
-    teko::assert::str_contains(text, "#B1(%3):")
-    teko::assert::str_contains(text, "jump #B1(%2)")
+    teko::assert::str_contains(text, "#B1(%3, %4):")
+    teko::assert::str_contains(text, "jump #B1(%1, %2)")
+    teko::assert::str_contains(text, "jump #B1(%5, %6)")
+    teko::assert::str_contains(text, "ret %7")
+}
+
+#test
+/**
+ * lwt_if_stmt_reassign_then_shadow_threads_the_pre_shadow_enclosing_value —
+ * #389 F1b item 3, the HARD case at the LIR level: an if-STATEMENT arm that
+ * REASSIGNS the enclosing `x`, THEN shadows it, THEN reassigns the shadow
+ * (`x = 3; mut x = 99; x = x + 1`). The enclosing `x`'s last value before it
+ * goes out of view is `3`: `x = 3` updates its pre-branch INDEX in place
+ * (`%5`); `mut x = 99` appends a shadow at a HIGHER index (`%6`); `x = x + 1`
+ * updates the SHADOW's index (`%8`), never the enclosing one. `arm_scalar_args`
+ * reads the enclosing scalar at its fixed pre-branch index, so the arm's
+ * closing jump carries the `x = 3` VReg (`jump #B3(%5)`), NEVER the shadow's
+ * final `%8`. The else pass-through carries the pre-branch VReg (`jump
+ * #B3(%0)`) and the read past the merge is the merge param (`#B3(%4): ret %4`).
+ *
+ * @return void
+ */
+fn lwt_if_stmt_reassign_then_shadow_threads_the_pre_shadow_enclosing_value() {
+    let one = lwt_num_i64(1 to i128)
+    let two = lwt_num_i64(2 to i128)
+    let cond = lwt_cmp(one, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, two)))
+    let reassign_enclosing = lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(3 to i128), checker::PrimKind::I64)
+    let shadow_bind: checker::TStatement = checker::TBinding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "x" }; bound = lwt_prim(checker::PrimKind::I64); value = lwt_num_i64(99 to i128) }
+    let shadow_bump = lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64), checker::PrimKind::I64)
+    let then_blk = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), reassign_enclosing), shadow_bind), shadow_bump)
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("reassign_then_shadow", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%5 = const 3")
+    teko::assert::str_contains(text, "jump #B3(%5)")
+    teko::assert::is_true(!teko::str::contains(text, "jump #B3(%8)"))
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4")
+}
+
+#test
+/**
+ * lwt_match_arm_reassign_vs_shadow_threads_per_arm — #389 F1b item 3, per-arm
+ * value selection in one proof: `match k { 1 => { x = 5 }; _ => { mut x = 99;
+ * x = x + 1 } }` over an enclosing `mut x = 1`. Both arms feed the SAME
+ * one-scalar `x` merge param (`#B1(%2):`), each supplying its own enclosing-`x`
+ * value read at the fixed pre-branch index: the `1` arm reassigns the
+ * enclosing `x` in place, so its closing jump carries the reassigned VReg
+ * (`jump #B1(%5)`, the `x = 5` value); the wildcard arm only shadows `x`
+ * (appended at a higher index) and reassigns the shadow, so its closing jump
+ * carries the untouched pre-branch VReg (`jump #B1(%1)`), NEVER the shadow's
+ * `%8`. The read past the merge is the merge param (`ret %2`).
+ *
+ * @return void
+ */
+fn lwt_match_arm_reassign_vs_shadow_threads_per_arm() {
+    let subject = lwt_var("k", checker::PrimKind::I64)
+    let arm0_body = teko::list::push(teko::list::empty(), lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(5 to i128), checker::PrimKind::I64))
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), arm0_body)
+    let shadow_bind: checker::TStatement = checker::TBinding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "x" }; bound = lwt_prim(checker::PrimKind::I64); value = lwt_num_i64(99 to i128) }
+    let shadow_bump = lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64), checker::PrimKind::I64)
+    let arm1_body = teko::list::push(teko::list::push(teko::list::empty(), shadow_bind), shadow_bump)
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), arm1_body)
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_stmt = checker::TExpr { kind = checker::TMatchExpr { subject = subject; arms = arms }; type = checker::Void { }; line = 0; col = 0 }
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(match_stmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let params = teko::list::push(teko::list::empty(), lwt_param("k", "i64"))
+    let f = lwt_fn("per_arm_select", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "#B1(%2):")
     teko::assert::str_contains(text, "jump #B1(%5)")
-    teko::assert::str_contains(text, "ret %6")
+    teko::assert::str_contains(text, "jump #B1(%1)")
+    teko::assert::is_true(!teko::str::contains(text, "jump #B1(%8)"))
+    teko::assert::str_contains(text, "ret %2")
 }
 
 #test
