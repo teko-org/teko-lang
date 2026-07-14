@@ -43,16 +43,26 @@ Job `asan-default` (check name **`ASan+UBSan+LSan / default dispatch`**), aggreg
 
 - Body unchanged (the proven ASan+UBSan native-path audit; LSan off-by-construction, as its long
   in-file comment explains).
-- **Trigger changed** to main-only:
-  `if: needs.changes.outputs.run == 'true' && (github.base_ref == 'main' || github.ref == 'refs/heads/main')`.
-  It runs as a **required check on PRs into `main`** (the umbrella → main integration merge — the
-  seed/release boundary) and **re-runs on push to `main`** as a post-merge audit.
-- On lane/remodel PRs and remodel pushes it is **skipped** — a skipped dependency is neither
-  `failure` nor `cancelled`, so the `Heavy sanitizer gate (main)` aggregator passes harmlessly
-  there and blocks nothing.
+- **Trigger changed** to the **merge to main, and only that** — a pure post-merge audit:
+  `if: needs.changes.outputs.run == 'true' && github.ref == 'refs/heads/main'`.
+  It runs **ONLY on push to `main`** (the push that lands the umbrella → main integration merge —
+  the seed/release boundary). It does **NOT** run on any PR — not on lane/remodel PRs, and
+  **not on the umbrella → `main` PR** either (owner clarification 2026-07-14: *"rodar somente em
+  merge na main, não em PR para main"*).
+- On **every** PR (lane, remodel, and the umbrella → `main` PR) and on remodel pushes it is
+  **skipped** — a skipped dependency is neither `failure` nor `cancelled`, so the
+  `Heavy sanitizer gate (main)` aggregator passes harmlessly (green-by-skip) there and blocks
+  nothing. The aggregator can therefore stay a required check on the rulesets without ever gating
+  a PR; its real work happens on the post-merge `main` push.
 
-**Single trigger = merge to main.** No nightly, no cron schedule, no auto-issue — the owner
-explicitly rejected the daily-00h variant in favor of *"Único gatilho passa a ser merge na main"*.
+**Single trigger = merge to main (the push).** No nightly, no cron schedule, no auto-issue, and
+**no PR-into-main gate** — the owner explicitly rejected the daily-00h variant AND the PR-into-main
+trigger in favor of *"Único gatilho passa a ser merge na main"*.
+
+> **Trade-off (accepted).** Because the heavy audit is now strictly post-merge, a UB it would catch
+> lands on `main` first and is flagged only by the `main` push run, not blocked before merge. The
+> owner accepts this: the light `TEKO_MEM_PARANOID` seed-gate already guards every lane PR, and the
+> heavy ASan/UBSan sweep is a release-boundary audit, not a per-PR gate.
 
 ## Why this is safe
 
