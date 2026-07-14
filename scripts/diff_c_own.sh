@@ -196,7 +196,15 @@ CORPUS=(
     own_sub_exit
     own_if_exit
     own_match_exit
+    own_logical_not
     own_print_exit
+    own_loop_range_native
+    own_loop_nested_range
+    own_defer_arm_write_propagates
+    own_value_if_rhs_reassign
+    own_match_arm_reassign_vs_shadow
+    own_if_value_rhs_shadow_then_outer_reassign
+    own_match_reassign_then_shadow
 )
 
 # ── KNOWN-STOP list ────────────────────────────────────────────────────────────────────
@@ -211,25 +219,32 @@ CORPUS=(
 #   the irrefutable-`_` dead fallback block (unreachable source counted as a retreat);
 #   `has_back_edge` is now reachability-aware, `match` allocates and runs (own == C == 42).
 #
-# own_print_exit — `teko::io::println` has NO builtin mapping in the LIR lowering
-#   (`src/lir/lower.tks`), unlike the C backend's codegen.tks (which special-cases the
-#   bare-name `println` call to the runtime symbol `tk_println`, `codegen.tks:2290`).
-#   The own pipeline therefore lowers the call as an ordinary cross-module call and
-#   mangles the WRONG external symbol (`println` instead of `tk_println`) — every own
-#   pass (isel/regalloc/encode/emit_{macho,elf}) succeeds and writes a well-formed `.o`
-#   (the `check_*` script passes it), but the SYSTEM LINKER then rejects the executable
-#   link with an undefined-symbol error (Mach-O "Undefined symbols ... _println" /
-#   ELF "undefined reference to `println'") — a linker-surfaced gap, not a compiler
-#   `fail()` diagnostic. The KNOWN_STOP_ERR substring is the bare `println` so it matches
-#   BOTH linkers (Mach-O's `_`-prefixed form contains it; ELF carries no `_` prefix,
-#   objfile_elf.tks:44). A REPORTED adjacent finding (LIR's builtin-call surface is
-#   narrower than codegen's): closes when LIR gains a builtin table mirroring
-#   codegen.tks's io/str/mem builtin dispatch.
+# own_print_exit — the ORIGINAL stop (`teko::io::println` mangled to the wrong external
+#   symbol, a linker-surfaced undefined-`println` failure) is CLOSED (#389 C1-6):
+#   `call_symbol` (`src/lir/lower.tks`) now maps the io group (`print`/`println`/
+#   `eprint`/`eprintln`/`write`/`ewrite`) to their `tk_*` runtime twins, mirroring
+#   codegen.tks's own bare-name builtin dispatch (`codegen.tks:2289-2297`), and lowers
+#   their lone `str` argument through its (ptr, len) FAT pair (`lower_fat_expr`) so the
+#   two-eightbyte `tk_str`-by-value AAPCS64/SysV ABI is reproduced exactly (a lone
+#   struct-by-value argument decomposes to two consecutive registers — no isel/regalloc
+#   change needed). This fixture's OWN message is a STRING INTERPOLATION
+#   (`$"answer={6*7}!"`), and `lower_fat_expr`'s CLOSED fat-pointer-producer set does
+#   NOT (yet) include a call result — `tk_str_concat`/`tk_i64_to_str`'s OWN return-value
+#   ABI (a `tk_str` returned in two registers, X0:X1/RAX:RDX) is a SEPARATE, wider,
+#   PRE-EXISTING gap (A1-4, #382 — `lower_interp`'s own doc: "closes the LOWERING
+#   honest-stop only") that `lower_fat_expr` already names explicitly ("a call result …
+#   honest-stops … a later phase, N2") — REPORTED up, not this crumb's scope (fixing it
+#   needs a wider LCall multi-register-return threading, well beyond a builtin-dispatch
+#   fix). So the fixture NOW compiler-honest-stops one step later, with a DIFFERENT,
+#   NAMED signature: `lower_fat_expr`'s own "fat-pointer receiver `string interpolation`
+#   not yet lowered (N2)" — a COMPILER diagnostic, not a linker failure. The
+#   KNOWN_STOP_ERR substring below matches THIS new signature.
+#
 declare -a KNOWN_STOP=(
     own_print_exit
 )
 declare -a KNOWN_STOP_ERR=(
-    "println"
+    "fat-pointer receiver"
 )
 
 known_stop_index_of() {
