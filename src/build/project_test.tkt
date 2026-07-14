@@ -177,3 +177,85 @@ fn target_from_name_maps_every_browser_alias() {
     teko::assert::is_true(target_matches("browser", NativeTarget::Wasm32Browser))
 }
 
+/**
+ * args_of — build a `[]str` CLI argument vector from up to three tokens, dropping any that is "" so
+ * a test can pass fewer than three. The shared fixture for the optimization-flag parse tests below.
+ *
+ * @param a  the first token (dropped when "")
+ * @param b  the second token (dropped when "")
+ * @param c  the third token (dropped when "")
+ * @return   the assembled argument vector
+ */
+fn args_of(a: str, b: str, c: str) -> []str {
+    mut v: []str = teko::list::empty()
+    if a != "" { v = teko::list::push(v, a) }
+    if b != "" { v = teko::list::push(v, b) }
+    if c != "" { v = teko::list::push(v, c) }
+    v
+}
+
+#test
+/**
+ * opt_level_of_defaults_to_zero — with NO optimization flag on the line the resolved level is 0
+ * (the dev/CI default: no `-O`, byte-identical to the historic release line — the FIXPOINT floor).
+ *
+ * @return void
+ */
+fn opt_level_of_defaults_to_zero() {
+    teko::assert::is_true(opt_level_of(args_of(".", "-o", "bin")) == 0)
+    teko::assert::is_true(opt_level_of(args_of(".", "--no-verify", "")) == 0)
+}
+
+#test
+/**
+ * opt_level_of_release_and_opt_select_two — `--release` and `--opt=2` both resolve to level 2 (the
+ * release seed profile that appends `-O2`), while `--opt=1` resolves to 1 and `--opt=0` back to 0.
+ *
+ * @return void
+ */
+fn opt_level_of_release_and_opt_select_two() {
+    teko::assert::is_true(opt_level_of(args_of(".", "--release", "")) == 2)
+    teko::assert::is_true(opt_level_of(args_of(".", "--opt=2", "")) == 2)
+    teko::assert::is_true(opt_level_of(args_of(".", "--opt=1", "")) == 1)
+    teko::assert::is_true(opt_level_of(args_of(".", "--opt=0", "")) == 0)
+}
+
+#test
+/**
+ * opt_level_of_last_flag_wins — a later `--opt=` overrides an earlier `--release`, and a malformed
+ * suffix falls back to the fully-optimized level 2 rather than silently disabling optimization.
+ *
+ * @return void
+ */
+fn opt_level_of_last_flag_wins() {
+    teko::assert::is_true(opt_level_of(args_of("--release", "--opt=0", ".")) == 0)
+    teko::assert::is_true(opt_level_of(args_of("--opt=9", ".", "")) == 2)
+}
+
+#test
+/**
+ * opt_cc_flag_maps_levels_to_flags — level 0 emits NO flag (""), level 1 `-O1`, level 2 `-O2`, and
+ * an out-of-range level clamps to `-O2` — the exact strings `build_cc_argv` appends to the cc line.
+ *
+ * @return void
+ */
+fn opt_cc_flag_maps_levels_to_flags() {
+    teko::assert::is_true(opt_cc_flag(0) == "")
+    teko::assert::is_true(opt_cc_flag(1) == "-O1")
+    teko::assert::is_true(opt_cc_flag(2) == "-O2")
+    teko::assert::is_true(opt_cc_flag(3) == "-O2")
+}
+
+#test
+/**
+ * project_arg_of_skips_optimization_flags — `--release` and `--opt=<n>` are recognized build flags,
+ * so `project_arg_of` steps over them and still finds the project positional after them.
+ *
+ * @return void
+ */
+fn project_arg_of_skips_optimization_flags() {
+    teko::assert::is_true(project_arg_of(args_of("--release", ".", ""), 0) == ".")
+    teko::assert::is_true(project_arg_of(args_of("--opt=2", ".", ""), 0) == ".")
+    teko::assert::is_true(project_arg_of(args_of(".", "--release", ""), 0) == ".")
+}
+

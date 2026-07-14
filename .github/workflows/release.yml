@@ -131,6 +131,13 @@ jobs:
       # self-hosted chain of THIS tag, not by the previous release's seed — and gen2==gen3
       # byte-identity is asserted here as the release's own FIXPOINT gate (owner ruling
       # 2026-07-10, from B1 on).
+      #
+      # Deliberately NOT `--release`: this leg only needs the byte-identical `out/teko.c`
+      # (the gen binaries are discarded — the SHIPPED Linux artifacts are cross-compiled from
+      # that teko.c by `zig cc` below, which is hard-pinned to `-O0` because zig `-O2`
+      # miscompiles the emitted C, the #283 HALT). The `-O2` release-seed win (owner ruling
+      # 2026-07-14) therefore lands on the native-cc macOS/Windows seeds; the Linux seed stays
+      # `-O0` until that residual UB is fixed or the linux-x86_64 release uses native gcc `-O2`.
       - name: Emit the portable teko.c (gen3 of 3, no gate)
         run: |
           set -eu
@@ -202,15 +209,23 @@ jobs:
       # release's fixpoint gate (owner ruling 2026-07-10, from B1 on). `shell: bash` on
       # all platforms: the seed is added to $GITHUB_PATH as a POSIX path, which only
       # bash resolves on Windows.
+      #
+      # `--release` on all three generations builds every link at `-O2` (owner ruling
+      # 2026-07-14): the published macOS/Windows seed is compiled optimized once here, so
+      # everyone downstream gets a compiler that RUNS ~1.30x faster (the diagnostic measured
+      # 168.7s → 129.6s at -O2), paying the heavier cc cost (~+33s) only at release. Applying
+      # it to the whole chain SELF-PROVES the -O2 binary: gen1(-O2) builds gen2, gen2(-O2)
+      # builds out, so any -O2 problem fails the build loudly instead of shipping. -O2 emits
+      # BYTE-IDENTICAL teko.c (proven by cmp), so the gen2==gen3 fixpoint below is unchanged.
       - name: Build the release binary (gen3 of 3, no gate)
         shell: bash
         run: |
           set -eu
           BIN=teko; [ "${{ matrix.ostype }}" = "windows" ] && BIN=teko.exe
           mkdir -p gen1 gen2 out
-          teko . -o gen1 --no-verify
-          "./gen1/$BIN" . -o gen2 --no-verify
-          "./gen2/$BIN" . -o out --no-verify
+          teko . -o gen1 --no-verify --release
+          "./gen1/$BIN" . -o gen2 --no-verify --release
+          "./gen2/$BIN" . -o out --no-verify --release
           cmp gen2/teko.c out/teko.c && echo "fixpoint OK: gen2.c == gen3.c ($(wc -c < out/teko.c) bytes)"
 
       - name: Package
