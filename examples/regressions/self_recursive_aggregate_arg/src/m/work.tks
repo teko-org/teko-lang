@@ -1,0 +1,48 @@
+/**
+ * A recursively-shaped aggregate: a node with a depth and a slice of child nodes. Its `kids`
+ * back-edge makes the by-value C representation carry a boxed pointer, exactly the aggregate shape
+ * that made `deepest` a #283 miscompile trigger before the `noinline` emission.
+ */
+type Nest = struct {
+    /** this node's own depth value, surfaced as the program exit code. */
+    depth: i64
+    /** the child nodes; empty for a leaf (the recursion's base case). */
+    kids: []Nest
+}
+
+/**
+ * The depth of the left spine's deepest leaf, found by DIRECT self-recursion on a by-value `Nest`.
+ * This is the #283 shape: a self-recursive function with a by-value aggregate parameter. Codegen
+ * emits it `__attribute__((noinline))` so LLVM cannot inline-then-tail-recursion-eliminate it into a
+ * caller and clobber the caller's argument buffer.
+ *
+ * @param n  the subtree to descend
+ * @return   the depth carried by the deepest left-spine leaf
+ */
+fn deepest(n: Nest) -> i64 {
+    if n.kids.len == 0 { n.depth } else { deepest(n.kids[0]) }
+}
+
+/**
+ * Return the ORIGINAL node `n` (never the sentinel) after calling the self-recursive `deepest` on it.
+ * The call-then-reuse of `n` is what surfaced #283: an inlined `deepest` whose tail-recursion loop
+ * overwrote `n`'s storage made this return a clobbered node under `-O2`. The `d > 1000000` guard is
+ * unreachable for the fixture's input, so the result is always `n`.
+ *
+ * @param n  the node to measure and then return unchanged
+ * @return   `n` itself (a clobbered `n` would change the program's exit code)
+ */
+fn keep_original(n: Nest) -> Nest {
+    let d = deepest(n)
+    if d > 1000000 { Nest { depth = 0; kids = teko::list::empty() } } else { n }
+}
+
+/**
+ * Build a leaf `Nest` at the given depth (no children).
+ *
+ * @param depth  the leaf's depth value
+ * @return       a childless `Nest` carrying `depth`
+ */
+fn make(depth: i64) -> Nest {
+    Nest { depth = depth; kids = teko::list::empty() }
+}
