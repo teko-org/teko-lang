@@ -47,6 +47,73 @@ pub fn lenv_bind_fat(env: LEnv, name: str, ptr: u32, len: u32) -> LEnv {
     }
 }
 
+/**
+ * lenv_newest_index — the index of the NEWEST binding of `name` in `env`
+ * (scanning newest-first, so a shadow's index wins), or `env.names.len` when
+ * `name` is unbound. The shared index primitive for reassign-in-place
+ * (`lenv_reassign`) and the merge machinery's pre-branch index capture
+ * (`merge_scalar_indices`) (#389 F1b item 3).
+ *
+ * @param LEnv env  the env to scan
+ * @param str name  the local name to locate
+ * @return u64  the newest matching index, or `env.names.len` when unbound
+ */
+fn lenv_newest_index(env: LEnv, name: str) -> u64 {
+    mut i: u64 = env.names.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        if env.names[i] == name { return i }
+    }
+    env.names.len
+}
+
+/**
+ * list_set_u32 — `xs` with the element at `idx` replaced by `v`, every other
+ * element passed through unchanged; `xs` is returned untouched when `idx` is
+ * out of range (a caller invariant break the reassign path never hits, since
+ * the index comes from `lenv_newest_index`) (#389 F1b item 3).
+ *
+ * @param []u32 xs  the source list
+ * @param u64 idx  the index to overwrite
+ * @param u32 v  the replacement value
+ * @return []u32  `xs` with position `idx` set to `v`
+ */
+fn list_set_u32(xs: []u32, idx: u64, v: u32) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i == idx { out = teko::list::push(out, v) } else { out = teko::list::push(out, xs[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * lenv_reassign — rebind the NEWEST binding of `name` to `vreg` IN PLACE (the
+ * SSA-lite reassignment update), preserving that slot's fat-pointer side-table
+ * (`has_len`/`len_vregs`) and, crucially, its POSITION — so the binding keeps
+ * its pre-branch INDEX and the merge machinery can read the enclosing scalar's
+ * current value at that fixed index regardless of any shadow appended after it
+ * (#389 F1b item 3). Behaviour-preserving for every `lenv_lookup`: the newest
+ * `name` is still at its original index, now carrying `vreg`, so a name-keyed
+ * newest-first read returns the SAME VReg it would after the old append — the
+ * only difference is that no DUPLICATE `name` entry is left behind. Falls back
+ * to `lenv_bind` when `name` is unbound (a checker invariant break — an assign
+ * to an undeclared local never reaches lowering).
+ *
+ * @param LEnv env  the env whose newest `name` binding is updated
+ * @param str name  the reassigned local's name
+ * @param u32 vreg  the reassignment's fresh result VReg
+ * @return LEnv  `env` with the newest `name` slot's VReg replaced in place
+ */
+pub fn lenv_reassign(env: LEnv, name: str, vreg: u32) -> LEnv {
+    let idx = lenv_newest_index(env, name)
+    if idx == env.names.len { return lenv_bind(env, name, vreg) }
+    LEnv { names = env.names; vregs = list_set_u32(env.vregs, idx, vreg); len_vregs = env.len_vregs; has_len = env.has_len }
+}
+
 /** LLookup — the result of an LEnv lookup: whether the name was bound + its VReg. */
 pub type LLookup = struct { found: bool; vreg: u32 }
 
@@ -481,6 +548,22 @@ fn ctx_bind(ctx: LowerCtx, name: str, vreg: u32) -> LowerCtx {
     binding (A1-4, #382). */
 fn ctx_bind_fat(ctx: LowerCtx, name: str, ptr: u32, len: u32) -> LowerCtx {
     ctx_with(ctx, ctx.func, ctx.block_id, lenv_bind_fat(ctx.env, name, ptr, len))
+}
+
+/**
+ * ctx_reassign — the `ctx_bind` mirror for a reassignment: update the newest
+ * `name` binding's VReg IN PLACE (`lenv_reassign`) rather than appending a
+ * shadow, so the enclosing scalar keeps its pre-branch index for the merge
+ * machinery (#389 F1b item 3). The ONLY reassignment carrier — every other
+ * bind site is a fresh lexical binding and stays on `ctx_bind`.
+ *
+ * @param LowerCtx ctx  the context whose local env is updated
+ * @param str name  the reassigned local's name
+ * @param u32 vreg  the reassignment's fresh result VReg
+ * @return LowerCtx  the context with `name`'s newest binding rebound in place
+ */
+fn ctx_reassign(ctx: LowerCtx, name: str, vreg: u32) -> LowerCtx {
+    ctx_with(ctx, ctx.func, ctx.block_id, lenv_reassign(ctx.env, name, vreg))
 }
 
 /** lower_expr — lower a typed expression to LIR, returning the VReg carrying its value.
@@ -4322,7 +4405,7 @@ fn lower_assign(ctx: LowerCtx, a: checker::TAssign) -> LowerStmtOut | error {
 fn lower_assign_simple(ctx: LowerCtx, a: checker::TAssign) -> LowerStmtOut | error {
     if a.op == lexer::TokenKind::Assign {
         let vo = match lower_expr(ctx, a.value) { Lowered as x => x; error as err => return err }
-        return LowerStmtOut { ctx = ctx_bind(vo.ctx, a.name, vo.vreg); terminated = false }
+        return LowerStmtOut { ctx = ctx_reassign(vo.ctx, a.name, vo.vreg); terminated = false }
     }
     let cur = lenv_lookup(ctx.env, a.name)
     if !cur.found { return error { message = teko::str::concat("native backend N1: unbound local `", a.name, "` (internal)") } }
@@ -4332,7 +4415,7 @@ fn lower_assign_simple(ctx: LowerCtx, a: checker::TAssign) -> LowerStmtOut | err
     let op = match lbinop_of(plain, k) { LBinOp as o => o; error as err => return err }
     let r = ctx_alloc(vo.ctx)
     let inst = bin_inst(r.vreg, op, cur.vreg, vo.vreg, a.value.line, a.value.col)
-    LowerStmtOut { ctx = ctx_bind(ctx_append(r.ctx, inst), a.name, r.vreg); terminated = false }
+    LowerStmtOut { ctx = ctx_reassign(ctx_append(r.ctx, inst), a.name, r.vreg); terminated = false }
 }
 
 /** lower_assign_field — `recv.field = e` / `recv.field op= e`: lower the receiver to its
