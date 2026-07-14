@@ -14,6 +14,8 @@ source: TEKO_CONSTITUTION.md, TEKO_LEGISLATION.md, TEKO_MASTER_PLAN.md (wave con
 
 **Issues-100%:** every open item must ship complete; no deferrers ("future wave"); tensions → law-first ruling + tribunal.
 
+**Resolve-in-same-task / don't-ask (2026-07-13):** an error found now is fixed now; a future-planned piece the task needs is pulled forward. This is LAW-decided, not an owner call — never ask the owner to choose fix-now-vs-defer or whether a disproportionate rework is "in scope" (asking is itself the violation). Owner-decision tensions = product taste or law-vs-law ONLY.
+
 **100%-coverage-on-delta:** new/altered code covers all branches + lines; arm inalcanzaable only if listed with reason.
 
 **Main-integrity/never-merge-on-snapshot:** all checks `completed + success` before merge; `gh pr merge`, not direct push.
