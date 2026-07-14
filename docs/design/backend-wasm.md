@@ -906,6 +906,35 @@ compares at the stop on both sides.
 > C1-5, reworked … the wasm64 switch at C1-7"). C1-8 therefore adds **NO compiler code** — it is a
 > corpus-broadening + CI-gating + fixpoint-confirming + doc-reconciling crumb that turns the already-
 > working artifact into a ratified, gated keystone and CLOSES #389.
+>
+> **SUPERSEDED (2026-07-14, owner "fix fully, any size"):** This pre-implementation finding was
+> falsified during grounding on execution. Closing #389 honestly required **SIX real own-backend
+> compiler fixes** (see §14.0.1). The overall structure stands; the details are reconciled below.
+
+### 14.0.1 Reconciliation — what C1-8 actually cost
+
+The pre-implementation claim "C1-8 adds NO compiler code" was falsified during grounding on execution.
+Closing #389 honestly required **SIX real own-backend compiler fixes**, each separately proven
+(own==C differential + wasm-under-wasmtime + fixpoint):
+- **F1** (#561) — LIR if/match merge-scalar-drop: a `mut` scalar reassigned in an arm was dropped at
+  the merge. `src/lir/lower.tks`.
+- **F1c** (#562) — `!` (logical-not) lowered to bitwise `INot` (nonzero for both bool values) → every
+  `if !cond` mis-branched on both own backends; now `ICmpEq(operand,0)`. The range-`for` desugar was
+  the first own-backend code to use `!`. `src/lir/lower.tks`.
+- **F2** (#563) — own-native regalloc §6.2 loop-liveness extension across all three allocators
+  (arm64/x86/riscv): removed the loop honest-stop, widen header-live intervals to the latch.
+  own-native now compiles loops. `src/backend/regalloc*.tks`.
+- **F1b** (#564) — defer-write-propagation (statement-arm scalar sampled post-`replay_defers`) +
+  value-if/match RHS reassignment threading. `src/lir/lower.tks`.
+- **item 3** (#566) — scope-aware `lenv` (reassign-in-place + index-identity), replacing F1's coarse
+  across-all-arms shadow-exclusion; residual NONE; fat-local reassign falls back to append
+  (honest-stop preserved). `src/lir/lower.tks`.
+
+**Misdiagnosis note:** The "stackifier gap" hypothesis for the loop failure was a MISDIAGNOSIS (the
+stackifier was correct; the root was the `!`-lowering bug, F1c).
+
+**Now green:** The loop fixtures (`wasm_loop_count`→6, `wasm_continue_step`→6) now pass under wasmtime,
+and the own==C native differential now compiles loops on all three native backends.
 
 ### 14.0 Reality reconciliation — three §-supersedes (law-first, recorded, NO HALT)
 
@@ -1135,7 +1164,7 @@ exit(s)
   wasm differential leg green in CI. **Serial after C1-8b**, and **blocked on the wasmtime/WABT
   provisioning decision** (§14.2).
 
-- **C1-8d · fixpoint + full-gate keystone ritual + close #389.** Confirm the whole ritual on the lane:
+- **C1-8d · fixpoint + full-gate keystone ritual + close #389 (reached-pending-close).** Confirm the whole ritual on the lane:
   the native test gate (#265, `run_gate_native`) green, `diff_c_own.sh` green (C-native == own-native,
   register targets), the new `validate_wasm_own` wasm leg green (own-wasm == C-native), and
   **fixpoint gen2 == gen3 byte-identical** (Q4 — the wasm arm is unreachable on the default path, so
