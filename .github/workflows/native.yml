@@ -202,7 +202,10 @@ jobs:
   # cross-check for the retired VM==native harness (issue #524): the VM shared the
   # front-end with native but not codegen, so it protected little there while its
   # wrapper-descent bug (VM-only) cost real false-failures — see
-  # docs/design/vm-retirement.md §3.
+  # docs/design/vm-retirement.md §3. The linux-x86_64 leg additionally runs the wasm
+  # differential (issue #389 C1-8c, the keystone ritual point): own-wasm(wasmtime) ==
+  # C-native over scripts/validate_wasm_own.sh's corpus, REQUIRED (not honest-skipped —
+  # both engines are provisioned in this job, so their absence is a real failure).
   gen1-checks:
     needs: changes
     if: needs.changes.outputs.run == 'true'
@@ -303,6 +306,57 @@ jobs:
         env:
           TEKO: ./bin/teko
         run: ./scripts/diff_c_own.sh
+
+      # ── wasm differential (issue #389 C1-8c — THE KEYSTONE RITUAL POINT) ──
+      # Provisions wasmtime (pinned official release tarball, the SAME pinned-download
+      # shape as release-cross-smoke's zig step below) and WABT's `wasm-validate` (apt,
+      # pinned to the runner image's resolved package build), then runs the full
+      # own-wasm(wasmtime) == C-native differential (scripts/validate_wasm_own.sh) on
+      # gen1 (which carries emit_native_wasm, C1-5/6/7). Linux-x86_64 only: the wasmtime
+      # asset below and `apt-get install` are both linux-x86_64-shaped, and provisioning a
+      # second engine pair for macOS-arm64 is out of this crumb's scope (named blocker B-1,
+      # backend-wasm.md §14.2) — that lane's own host-specific gates already honest-skip
+      # the same way in the C-vs-own differential step above.
+      - name: Install wasmtime (official pinned tarball)
+        if: matrix.label == 'linux-x86_64'
+        env:
+          WASMTIME_VERSION: "46.0.1"
+        run: |
+          set -eu
+          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz" | tar -xJ
+          echo "$PWD/wasmtime-v${WASMTIME_VERSION}-x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Install wabt (WABT, apt, pinned)
+        if: matrix.label == 'linux-x86_64'
+        env:
+          WABT_APT_VERSION: "1.0.34+dsfg2+~cs1.0.32-1ubuntu2"
+        run: |
+          set -eu
+          sudo apt-get update -y
+          sudo apt-get install -y "wabt=${WABT_APT_VERSION}"
+
+      # Fail-closed, not skip-closed (issue #389 B-1): a broken/no-op provisioning step
+      # (PATH not exported, wrong arch asset, apt pin drift) must break THIS step, before
+      # validate_wasm_own.sh ever gets a chance to (mis)report a pass.
+      - name: Assert wasm engines are actually on PATH
+        if: matrix.label == 'linux-x86_64'
+        run: |
+          set -eu
+          command -v wasmtime
+          command -v wasm-validate
+          wasmtime --version
+          wasm-validate --version
+
+      # REQUIRE_WASM_ENGINE=1 (validate_wasm_own.sh) turns the dev-laptop honest-skip into
+      # a hard failure: CI provisioned both engines above, so an absent/broken engine here
+      # is a real regression, never a silently-green skip — the keystone's whole point.
+      - name: wasm differential (own-wasm(wasmtime) == C-native, on gen1 — issue #389 keystone)
+        if: matrix.label == 'linux-x86_64'
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+          REQUIRE_WASM_ENGINE: "1"
+        run: ./scripts/validate_wasm_own.sh
 
   # ── release cross-compile smoke: the EXACT zig-cross the release runs, compile-only ──
   # release.yml is tag-triggered, so its Linux cross-compile went unvalidated in PR CI — a
