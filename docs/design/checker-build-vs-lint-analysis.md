@@ -342,9 +342,32 @@ let s: a::Secret = a::Secret { x = 1 }
 
 ---
 
-## 7. Perguntas em aberto para o dono (recomendação + trade-off; estilo DECISION_LOG)
+## 7. Decisões — TODAS RATIFICADAS (owner 2026-07-14)
 
-*Q1 (unused-local build-gate) está RESOLVIDA pelo ruling 0.4 — relaxar. Registrada, não reaberta.*
+> **Convergência fechada (owner 2026-07-14).** As oito questões abaixo foram todas ratificadas pelo
+> dono nesta data; a recomendação do integrador foi aceita em cada uma (as duas que ele problematizou
+> — Q3 e Q4 — foram fechadas após a rodada de contra-argumento). Registro datado/atribuído; nenhuma
+> reaberta. Isto FECHA o desenho no nível de ANÁLISE — a implementação ainda depende de aprovação
+> explícita do dono (este documento não altera código).
+>
+> - **Q1 — unused-local: RELAXAR** (ruling 0.4). Não falha mais o build; supersede MASTER_PLAN:186.
+> - **Q2 — `UseGraph` único** servindo lint/linker-DCE/PGO. **RATIFICADO.** Sem risco de perf: sai do
+>   caminho quente do build (relaxado) → custo no build = **zero**; o grafo é pago pelos consumidores.
+> - **Q3 — duas portas sobre UM motor. RATIFICADO.** LSP (inner loop, incremental por-arquivo) = a
+>   superfície MAIS performática pro dev interativo; CLI/`.tkb` (outer loop, CI/auditoria) = batch.
+>   Sequência: motor + porta **CLI in-process primeiro** (barato, reusa o typed-tree do build),
+>   desenhado incremental-friendly; **LSP** como a superfície interativa definitiva depois.
+> - **Q4 — MANTER privacidade ESSENCIAL (E). RATIFICADO** ("ok em manter a segurança de
+>   encapsulamento"). Privacidade ≠ unused: é acesso-ilegal (aresta VIVA) que o DCE NÃO recupera —
+>   o DCE só mata o não-referenciado. Payoff de perf nulo, contrato real preservado. Ressalva load-
+>   bearing: auditar em `resolve.tks` se "ref bare a outra ns" é pré-requisito de RESOLUÇÃO (por
+>   corretude, não perf) antes de qualquer toque.
+> - **Q5 — SIM**: tirar a liveness whole-program do build é pré-requisito do incremental content-signed.
+> - **Q6 — SIM**: dormentes (`revalidate`, `borrow`) → lint opt-in; `borrow` também input de DCE/PGO.
+> - **Q7 — SIM**: `exhaustive` permanece E enquanto o codegen não emitir trap de arm-default.
+> - **Q8 — JUNTO**: de-quadratizar no consumidor (lint/linker), não no build (que deixa de rodá-la).
+
+O texto abaixo é a fundamentação de cada recomendação, agora ACEITA (não mais aberta):
 
 **Q2. A alcançabilidade deve ser refatorada de `error?` para um `UseGraph` (§3.2) servindo os três
 consumidores, ou cada consumidor reimplementa seu próprio walk?**
