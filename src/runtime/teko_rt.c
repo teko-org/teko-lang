@@ -584,6 +584,83 @@ int64_t tk_str_cmp(tk_str a, tk_str b) {
     return 0;
 }
 
+// =========================================================================
+// (enabling primitive — staged off; no compiler source calls this yet) HEAP-BACKED STRING
+// INTERN TABLE — a per-pass memoization cache for codegen's repeated string-builders (e.g. an
+// inline variant's C type name, today rebuilt byte-identically at every use site). Deliberately
+// backed by plain malloc/free, NEVER the arena: a codegen pass may straddle an arena rewind
+// (tk_arena_pop / tk_arena_commit above), and a cached tk_str viewing a since-freed arena chunk
+// would dangle. tk_intern_reset frees every entry so a repeated compiler invocation (or a
+// per-#test rewind) never lets one compilation's cached strings leak into the next.
+// =========================================================================
+typedef struct tk_intern_entry {
+    tk_byte *key; size_t key_len;
+    tk_byte *val; size_t val_len;
+    struct tk_intern_entry *next;
+} tk_intern_entry;
+#define TK_INTERN_BUCKETS 1024   // power of two — bucket = hash & (N-1)
+static tk_intern_entry *tk_intern_table[TK_INTERN_BUCKETS];
+
+// tk_intern_find — the bucket chain entry whose key equals `key`, or NULL. Shared by get/put so
+// the equal-key scan (hash bucket + length + memcmp) has exactly one definition.
+static tk_intern_entry *tk_intern_find(size_t bucket, tk_str key) {
+    for (tk_intern_entry *e = tk_intern_table[bucket]; e != NULL; e = e->next) {
+        if (e->key_len == key.len && (key.len == 0 || memcmp(e->key, key.ptr, key.len) == 0)) return e;
+    }
+    return NULL;
+}
+
+// tk_intern_dup — a fresh heap copy of `s` (>=1 byte, so an empty value never shares tk_alloc's
+// NULL-for-zero convention with a real miss). OOM panics (M.1).
+static tk_byte *tk_intern_dup(tk_str s) {
+    tk_byte *b = malloc(s.len ? s.len : 1);
+    if (b == NULL) tk_panic("out of memory (intern)");
+    if (s.len) memcpy(b, s.ptr, s.len);
+    return b;
+}
+
+// tk_intern_get returns a FRESH, INDEPENDENT copy of the cached value — never a view into the
+// table's own entry. A view would dangle the instant a LATER tk_intern_put overwrites (or
+// tk_intern_reset frees) that same entry, breaking Teko's str value-semantics contract (a
+// returned str's lifetime is never tied to some other call's future). The copy costs one hash
+// lookup + one memcpy, still far cheaper than the caller's original rebuild-from-scratch loop.
+tk_str tk_intern_get(tk_str key) {
+    size_t h = (size_t)(tk_str_hash(key) & (TK_INTERN_BUCKETS - 1));
+    tk_intern_entry *e = tk_intern_find(h, key);
+    if (e == NULL) return (tk_str){ NULL, 0 };
+    tk_str cached = { e->val, e->val_len };
+    return (tk_str){ tk_intern_dup(cached), e->val_len };
+}
+
+tk_str tk_intern_put(tk_str key, tk_str value) {
+    size_t h = (size_t)(tk_str_hash(key) & (TK_INTERN_BUCKETS - 1));
+    tk_intern_entry *e = tk_intern_find(h, key);
+    if (e != NULL) {
+        free(e->val);
+        e->val = tk_intern_dup(value); e->val_len = value.len;
+        return value;
+    }
+    tk_intern_entry *ne = malloc(sizeof *ne);
+    if (ne == NULL) tk_panic("out of memory (intern)");
+    ne->key = tk_intern_dup(key); ne->key_len = key.len;
+    ne->val = tk_intern_dup(value); ne->val_len = value.len;
+    ne->next = tk_intern_table[h];
+    tk_intern_table[h] = ne;
+    return value;
+}
+
+void tk_intern_reset(void) {
+    for (int i = 0; i < TK_INTERN_BUCKETS; i += 1) {
+        tk_intern_entry *e = tk_intern_table[i];
+        while (e != NULL) {
+            tk_intern_entry *next = e->next;
+            free(e->key); free(e->val); free(e);
+            e = next;
+        }
+        tk_intern_table[i] = NULL;
+    }
+}
+
 // tk_str_slice — the bytes [start, end) as a ZERO-COPY VIEW into the parent str (#148). SAFE
 // because a Teko `str` is IMMUTABLE and its buffer is never individually freed (arena/root or
 // malloc'd-and-retained; mem::free frees only []T slice buffers, and str() snapshots its input),
@@ -1283,6 +1360,17 @@ void tk_arena_pop(void) {
         if (tk_obs_on == 1 && m.chunk->used > m.used) tk_obs_rewind_bytes += m.chunk->used - m.used;   // partial-chunk rewind
         m.chunk->used = m.used;
     }
+}
+
+// (enabling primitive — staged off; no compiler source calls this yet) tk_arena_commit — the
+// Boundary-A counterpart to tk_arena_pop: discard the top mark WITHOUT rewinding, so every
+// allocation made since the matching tk_arena_push stays live, folded into the (now-current) mark
+// below it. Mirrors tk_arena_pop's depth bookkeeping exactly (an over-deep push that saved no mark
+// commits just as cheaply as it would have rewound) but touches neither chunks nor the free-list —
+// nothing here was ever freed, so there is nothing to purge.
+void tk_arena_commit(void) {
+    if (tk_arena_msp <= 0) return;
+    tk_arena_msp -= 1;
 }
 
 void tk_print(tk_str s) {
@@ -2167,6 +2255,32 @@ void *tk_slice_push_fo(const void *ptr, uint64_t len, const void *elem, uint64_t
         tk_free_block((void *)old, old_bytes);
     }
     return buf;
+}
+
+// (enabling primitive — staged off; no compiler source calls this yet) tk_slice_with_cap_r —
+// allocate a FRESH, len-0 buffer sized for `cap` elements of `esz` bytes in `region`, and register
+// it as that region's live push-cache TAIL (len 0, the given cap) so the very first
+// tk_slice_push/tk_slice_push_fo append onto the returned slice hits the O(1) in-place path
+// instead of copy-growing from empty — the point of pre-sizing a builder whose final length is
+// known up-front. Mirrors tk_slice_push_r's own cache-registration (the same size-aware eviction:
+// an incumbent with a larger footprint keeps its slot). A `cap` of 0 still allocates 1 element's
+// worth so the returned pointer is never NULL (mirrors tk_alloc's n->1 convention).
+void *tk_slice_with_cap_r(uint64_t esz, uint64_t cap, tk_region *region) {
+    uint64_t alloc_cap = cap ? cap : 1;
+    void *buf = (region == tk_g_root) ? tk_alloc(alloc_cap * esz) : tk_region_alloc(region, alloc_cap * esz);
+    unsigned hb = tk_push_slot(buf);
+    if (tk_push_cache[hb].ptr == NULL || tk_push_cache[hb].cap * tk_push_cache[hb].esz <= alloc_cap * esz) {
+        tk_push_cache[hb].ptr = buf; tk_push_cache[hb].len = 0;
+        tk_push_cache[hb].cap = alloc_cap; tk_push_cache[hb].esz = esz;
+        tk_push_cache[hb].region = region; tk_push_cache[hb].region_gen = region->gen;
+    }
+    return buf;
+}
+
+// tk_slice_with_cap — the default root-region lowering, mirroring tk_slice_push over
+// tk_slice_push_r.
+void *tk_slice_with_cap(uint64_t esz, uint64_t cap) {
+    return tk_slice_with_cap_r(esz, cap, tk_region_root());
 }
 
 // (mem::free ruling 2026-07-03) tk_free_block — PARK an explicitly freed root-arena block on the

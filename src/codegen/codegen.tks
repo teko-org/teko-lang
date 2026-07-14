@@ -1926,6 +1926,52 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
 }
 
 /**
+ * emit_list_with_cap — `teko::list::with_cap(n)` (enabling primitive — staged off; no compiler
+ * source calls this yet). Requires the call's OWN `.type` to already be a concrete slice: like
+ * `emit_list_empty`, an un-annotated sentinel reaching here is an honest codegen error rather than
+ * a guess. Lowers to a GNU statement-expression that allocates a len-0, `n`-capacity buffer via
+ * `tk_slice_with_cap`/`tk_slice_with_cap_r` (routed by `frame`, mirroring `emit_list_push`'s root-
+ * vs-frame selector) and wraps the fresh pointer in the slice struct literal.
+ *
+ * @param buf       the output buffer to append to
+ * @param prog      the typed program (for emit_type)
+ * @param e         the call's own typed expr (carries the concretized slice type)
+ * @param c         the call node (`c.args[0]` is the `u64` capacity)
+ * @param escaping  the escaping-binding set threaded through nested expr emission
+ * @param regions   the open S1 region stack
+ * @param fn_body   the enclosing function's statements (for nested expr emission)
+ * @param dctx      the defer context threaded through nested expr emission
+ * @param frame     `""` for the root region; else a frame region variable name
+ * @return          the emitted C, or `error` on a context-less sentinel / malformed call
+ */
+fn emit_list_with_cap(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx, frame: str) -> []byte | error {
+    let elem = match e.type {
+        checker::Slice as sl => match sl.element {
+            checker::Void => return error { message = "codegen: teko::list::with_cap() needs a known slice type from context (annotate the binding)" }
+            _ => sl.element
+        }
+        _ => return error { message = "codegen: teko::list::with_cap() needs a known slice type from context (annotate the binding)" }
+    }
+    if c.args.len != 1 { return error { message = "codegen: teko::list::with_cap result has the wrong arity (internal)" } }
+    let is_r = frame.len > 0
+    let wN = $"_wp{buf.len}"
+    mut out = cb(buf, "({ ")
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, " *"); out = cb(out, wN); out = cb(out, " = (")
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, if is_r { " *)tk_slice_with_cap_r(sizeof(" } else { " *)tk_slice_with_cap(sizeof(" })
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, "), (uint64_t)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, c.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, ")")
+    if is_r { out = cb(out, ", "); out = cb(out, frame) }
+    out = cb(out, "); (")
+    out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, "){ .ptr = "); out = cb(out, wN); out = cb(out, ", .len = 0 }; })")
+    out
+}
+
+/**
  * C7.19 (#169 D0) — `teko::mem::buf_ptr(len)` lowers to a direct arena bump-allocation:
  * `(uint8_t *)tk_region_alloc(<enclosing region>, (size_t)(len))`. Reuses whichever S1 region is
  * open at the call site (a block region, else the function frame, else the process root — the
@@ -2156,7 +2202,10 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             // self-append `xs = push(xs, …)` is emitted directly by emit_assign with `_tkfr`.
             return emit_list_push(buf, prog, e, c, escaping, regions, fn_body, dctx, if is_pushfo { "@fo" } else { "" })
         }
-        return error { message = "codegen: this teko::list builtin not yet supported (only empty/push — fixed+copy)" }
+        if llast == "with_cap" {
+            return emit_list_with_cap(buf, prog, e, c, escaping, regions, fn_body, dctx, "")
+        }
+        return error { message = "codegen: this teko::list builtin not yet supported (only empty/push/with_cap — fixed+copy)" }
     }
     // teko::mem::free(x) — manual dealloc (the checker proved x is a mutable heap variable).
     if p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" && p.segments[p.segments.len - 1].name == "free" {
@@ -2322,6 +2371,10 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             else if last == "cov_line_hit" { builtin = "tk_cov_line_hit"; has_builtin = true }   // (u64,u32) -> bool
             else if last == "arena_push" { builtin = "tk_arena_push"; has_builtin = true }   // (#109 test-gate memory) () -> void
             else if last == "arena_pop" { builtin = "tk_arena_pop"; has_builtin = true }   // () -> void
+            else if last == "arena_commit" { builtin = "tk_arena_commit"; has_builtin = true }
+            else if last == "intern_get" { builtin = "tk_intern_get"; has_builtin = true }
+            else if last == "intern_put" { builtin = "tk_intern_put"; has_builtin = true }
+            else if last == "intern_reset" { builtin = "tk_intern_reset"; has_builtin = true }
             // diverging runtime panic helpers (the corpus calls these by bare name)
             else if last == "panic_div0" { builtin = "tk_panic_div0"; has_builtin = true }
             else if last == "panic_oob" { builtin = "tk_panic_oob"; has_builtin = true }
