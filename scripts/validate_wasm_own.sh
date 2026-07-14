@@ -174,6 +174,15 @@ fixture_root="$script_dir/examples/regressions"
 # (unrelated to scalar merge-threading), exposed because no prior wasm-corpus fixture combined
 # a variant CONSTRUCTION with a pattern-bind arm. REPORTED alongside the F1c stackifier finding
 # above; also out of this crumb's scope.
+#
+# `own_match_arm_reassign_vs_shadow` (6), `own_if_value_rhs_shadow_then_outer_reassign` (7) and
+# `own_match_reassign_then_shadow` (3) join with F1b item 3 (#389, §6.2 — the across-all-arms
+# over-exclusion fix). Enclosing-IDENTITY threading (`arm_scalar_args` reads each arm's jump-arg
+# at the threaded name's fixed PRE-BRANCH index) drops the coarse shadow exclusion: a legitimately
+# reassigned enclosing scalar is threaded even when a SIBLING arm shadows the name, and the
+# reassign-then-shadow hard case threads the pre-shadow enclosing value. All three run plain
+# if/match merges (no struct/variant field-store), so own-wasm(wasmtime) == C-native on exit
+# 6/7/3 respectively.
 CORPUS=(
     own_exit_zero
     own_exit_code
@@ -195,6 +204,9 @@ CORPUS=(
     wasm_continue_step
     own_defer_arm_write_propagates
     own_value_if_rhs_reassign
+    own_match_arm_reassign_vs_shadow
+    own_if_value_rhs_shadow_then_outer_reassign
+    own_match_reassign_then_shadow
 )
 KIND=(
     exit
@@ -206,6 +218,9 @@ KIND=(
     print
     trap
     print
+    exit
+    exit
+    exit
     exit
     exit
     exit
@@ -229,6 +244,9 @@ TARGET=(
     wasm32-wasi
     wasm32-wasi
     wasm64-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
     wasm32-wasi
     wasm32-wasi
     wasm32-wasi
