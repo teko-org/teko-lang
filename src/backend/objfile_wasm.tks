@@ -1,0 +1,721 @@
+/**
+ * emit_uleb128 — append `v` to `buf` as unsigned LEB128 (7 bits per group,
+ * low group first, the continuation bit set on every emitted byte but the
+ * last): the wasm size/index/count encoding primitive, paralleling A4's
+ * `emit_u32_le` little-endian byte idiom (`backend-a4-encoder.md` §2.1). All
+ * bit-slicing stays in `u64` arithmetic; only the final `& 0x7F` narrows a
+ * group to a `byte` (the VM byte-width anchoring gotcha — never widen a
+ * `byte` mid-expression).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param u64 v  the value to encode
+ * @return []byte  `buf` followed by v's ULEB128 bytes
+ */
+pub fn emit_uleb128(buf: []byte, v: u64) -> []byte {
+    mut b = buf
+    mut x = v
+    loop {
+        let low = x & (0x7F to u64)
+        x = x >> (7 to u64)
+        if x == (0 to u64) {
+            b = teko::list::push(b, low to byte)
+            break
+        }
+        b = teko::list::push(b, (low | (0x80 to u64)) to byte)
+    }
+    b
+}
+
+/**
+ * emit_sleb128 — append `v` to `buf` as signed LEB128 (7 bits per group, low
+ * group first; a group terminates the encoding once its sign bit (bit 6)
+ * already matches the remaining sign-extended value — an all-0s tail for a
+ * non-negative remainder, an all-1s tail for a negative one): the wasm
+ * `i32.const`/`i64.const` immediate and signed-field encoding. Distinct from
+ * `emit_uleb128` because the termination test is sign-aware; `>>` on `i64` is
+ * an arithmetic (sign-extending) shift, so the loop always reaches one of the
+ * two termination arms.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param i64 v  the signed value to encode
+ * @return []byte  `buf` followed by v's SLEB128 bytes
+ */
+pub fn emit_sleb128(buf: []byte, v: i64) -> []byte {
+    mut b = buf
+    mut x = v
+    loop {
+        let low = x & (0x7F to i64)
+        x = x >> (7 to i64)
+        let done_nonneg = (x == (0 to i64)) && ((low & (0x40 to i64)) == (0 to i64))
+        let done_neg = (x == (-1 to i64)) && ((low & (0x40 to i64)) != (0 to i64))
+        if done_nonneg || done_neg {
+            b = teko::list::push(b, low to byte)
+            break
+        }
+        b = teko::list::push(b, (low | (0x80 to i64)) to byte)
+    }
+    b
+}
+
+/**
+ * wasm_preamble — the fixed 8-byte wasm module header: the magic number
+ * `\0asm` (`00 61 73 6D`) followed by version 1 as a little-endian `u32`
+ * (`01 00 00 00`). Every `emit_wasm` output starts with these bytes.
+ *
+ * @return []byte  the 8-byte preamble
+ */
+fn wasm_preamble() -> []byte {
+    mut b: []byte = teko::list::empty()
+    b = teko::list::push(b, 0x00 to byte)
+    b = teko::list::push(b, 0x61 to byte)
+    b = teko::list::push(b, 0x73 to byte)
+    b = teko::list::push(b, 0x6D to byte)
+    b = teko::list::push(b, 0x01 to byte)
+    b = teko::list::push(b, 0x00 to byte)
+    b = teko::list::push(b, 0x00 to byte)
+    teko::list::push(b, 0x00 to byte)
+}
+
+/**
+ * wasm_section — frame one wasm section: its `id` byte, the ULEB128 byte
+ * length of `payload`, then `payload` itself (the `id ++ uleb128(size) ++
+ * payload` shape every known wasm section shares). The caller decides
+ * whether a section is present at all — an empty module part never calls
+ * this, so no zero-length section is ever framed.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param byte id  the section id (1 = type, 2 = import, 3 = function, 5 =
+ *                 memory, 7 = export, 10 = code, 11 = data)
+ * @param []byte payload  the section's already-assembled body bytes
+ * @return []byte  `buf` followed by the framed section
+ */
+fn wasm_section(buf: []byte, id: byte, payload: []byte) -> []byte {
+    mut b = teko::list::push(buf, id)
+    b = emit_uleb128(b, payload.len)
+    append_bytes(b, payload)
+}
+
+/**
+ * WasmFuncType — one entry of the module's type section: a `(params) ->
+ * (results)` function signature, each side a vector of wasm value-type bytes
+ * (`0x7F` i32 / `0x7E` i64 / `0x7D` f32 / `0x7C` f64). The MVP never carries
+ * more than one result (no multi-value, `backend-c1-wasm.md` §4.3).
+ *
+ * @since #389 C1-1
+ */
+pub type WasmFuncType = struct {
+    /**
+     * params — the parameter value-type bytes, in signature order.
+     */
+    params: []byte
+    /**
+     * results — the result value-type bytes (at most one in the MVP).
+     */
+    results: []byte
+}
+
+/**
+ * WasmImport — one entry of the module's import section: a host-provided
+ * function the module calls but does not define, named by its two-part
+ * `(module, field)` path (e.g. `("wasi_snapshot_preview1", "proc_exit")`) and
+ * typed by an index into the module's type section. The MVP imports only
+ * functions (the wasm import `kind` byte is always `0x00`); table/memory/
+ * global imports are not modeled.
+ *
+ * @since #389 C1-1
+ */
+pub type WasmImport = struct {
+    /**
+     * module — the import's host module name (the first name component).
+     */
+    module: str
+    /**
+     * field — the import's field name within `module` (the second name
+     * component).
+     */
+    field: str
+    /**
+     * type_index — the index into the module's type section for this
+     * import's `(params) -> (results)` shape.
+     */
+    type_index: u32
+}
+
+/**
+ * WasmExport — one entry of the module's export section: a name the host can
+ * look up, naming an index in one of the wasm index spaces by `kind` (`0x00`
+ * function / `0x01` table / `0x02` memory / `0x03` global — the MVP only ever
+ * exports functions).
+ *
+ * @since #389 C1-1
+ */
+pub type WasmExport = struct {
+    /**
+     * name — the exported name (e.g. `"main"`).
+     */
+    name: str
+    /**
+     * kind — the wasm export-kind byte (`0x00` for a function export).
+     */
+    kind: byte
+    /**
+     * index — the index into the `kind`'s index space (a function index for
+     * a function export).
+     */
+    index: u32
+}
+
+/**
+ * WasmLocalGroup — a run of consecutive locals of one value type in a code
+ * entry's local declarations (wasm compresses a function's non-parameter
+ * locals into `(count, valtype)` runs rather than listing each one).
+ *
+ * @since #389 C1-1
+ */
+pub type WasmLocalGroup = struct {
+    /**
+     * count — how many consecutive locals share this valtype.
+     */
+    count: u32
+    /**
+     * valtype — the shared wasm value-type byte.
+     */
+    valtype: u8
+}
+
+/**
+ * WasmFunc — one function's code-section entry: the index into the module's
+ * type section for its `(params) -> (results)` shape, its non-parameter
+ * local declarations (`WasmLocalGroup` runs, after the params), and its
+ * already-assembled instruction body bytes (terminated by the code-entry
+ * `end`, `0x0B`). In C1-1 the body is supplied verbatim (no LIR, no
+ * stackifier yet, `backend-c1-wasm.md` §13); C1-2 grows a lowerer that
+ * produces it from an `LFunc`.
+ *
+ * @since #389 C1-1
+ */
+pub type WasmFunc = struct {
+    /**
+     * type_index — the index into the module's type section for this
+     * function's signature.
+     */
+    type_index: u32
+    /**
+     * local_groups — the non-parameter locals, as run-length `(count,
+     * valtype)` groups in local-index order.
+     */
+    local_groups: []WasmLocalGroup
+    /**
+     * body — the function body bytes, ending with the code-entry `end`
+     * (`0x0B`).
+     */
+    body: []byte
+}
+
+/**
+ * WasmDataSegment — one active data-section entry: a run of bytes placed at
+ * a fixed linear-memory offset (memory index 0, the module's only memory)
+ * when the module is instantiated.
+ *
+ * @since #389 C1-1
+ */
+pub type WasmDataSegment = struct {
+    /**
+     * offset — the linear-memory byte offset the segment is placed at (the
+     * `i32.const offset` initializer expression).
+     */
+    offset: u32
+    /**
+     * bytes — the segment's raw byte content.
+     */
+    bytes: []byte
+}
+
+/**
+ * WasmGlobal — one entry of the module's global section: a typed,
+ * optionally-mutable global with a constant initializer. The MVP's only
+ * global is the shadow-stack `SP` pointer (`backend-c1-wasm.md` §6.1) — a
+ * mutable `i32` — so `wasm_append_global`'s initializer expression is always
+ * `i32.const`; a future non-`i32` global widens it.
+ *
+ * @since #389 C1-4
+ */
+pub type WasmGlobal = struct {
+    /**
+     * valtype — the global's wasm value-type byte.
+     */
+    valtype: u8
+    /**
+     * mutable — whether the global can be written (`global.set`); the
+     * shadow-stack `SP` global is always mutable.
+     */
+    mutable: bool
+    /**
+     * init — the constant initializer value, encoded as a signed LEB128
+     * `i32.const` immediate (§6.1's "`SP`, mutable `i32`, init = top of the
+     * reserved stack region").
+     */
+    init: i64
+}
+
+/**
+ * WasmModule — the whole program lowered to wasm: the interned function
+ * signatures, the host imports, the defined functions, the module's own
+ * globals, the linear-memory data segments, the initial linear-memory size,
+ * and the export set. `emit_wasm` serializes it to a self-contained module.
+ * The wasm analog of `EncodedModule` (`backend-a4-encoder.md`), but
+ * self-describing — wasm references are index-based (funcidx/dataaddr), not
+ * section-relative relocations resolved by a linker.
+ *
+ * @since #389 C1-1
+ */
+pub type WasmModule = struct {
+    /**
+     * types — the interned function signatures (the type section); empty
+     * when the module defines and imports nothing.
+     */
+    types: []WasmFuncType
+    /**
+     * imports — the host-provided functions the module calls but does not
+     * define; empty when the module is fully self-contained.
+     */
+    imports: []WasmImport
+    /**
+     * funcs — the defined functions, in module order (the function and code
+     * sections share this order).
+     */
+    funcs: []WasmFunc
+    /**
+     * globals — the module's own globals (the global section, `C1-4`);
+     * empty when the module declares none (e.g. a function that never
+     * `alloca`s needs no shadow-stack `SP`).
+     */
+    globals: []WasmGlobal
+    /**
+     * data — the linear-memory data segments (the data section); empty when
+     * the module has no rodata.
+     */
+    data: []WasmDataSegment
+    /**
+     * mem_min_pages — the initial linear-memory size in 64 KiB pages; `0`
+     * omits the memory section entirely (no memory declared).
+     */
+    mem_min_pages: u32
+    /**
+     * mem_is64 — whether the module's one linear memory is `memory64` (the
+     * wasm64 switch, #389 C1-7, `backend-wasm.md` §6): `false` (the default,
+     * wasm32) encodes the memory-section limits with the classic 32-bit
+     * flags/widths; `true` sets the `is64` limits flag bit and encodes the
+     * page count as a 64-bit width, for a module whose `ptr<>` values are
+     * uniformly `i64` (no wasm32 checked narrow).
+     */
+    mem_is64: bool
+    /**
+     * exports — the module's exports (e.g. `"main"`); empty when nothing is
+     * exported.
+     */
+    exports: []WasmExport
+}
+
+/**
+ * wasm_append_functype — append one type-section entry: the function-type
+ * form byte (`0x60`), the parameter value-type vector, then the result
+ * value-type vector (§5.2's type-section entry shape).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param WasmFuncType t  the function signature to encode
+ * @return []byte  `buf` followed by the encoded signature
+ */
+fn wasm_append_functype(buf: []byte, t: WasmFuncType) -> []byte {
+    mut b = teko::list::push(buf, 0x60 to byte)
+    b = emit_uleb128(b, t.params.len)
+    b = append_bytes(b, t.params)
+    b = emit_uleb128(b, t.results.len)
+    append_bytes(b, t.results)
+}
+
+/**
+ * wasm_type_section — the type section's payload: the ULEB128 entry count
+ * followed by each signature's encoded bytes, in `types` order.
+ *
+ * @param []WasmFuncType types  the module's interned function signatures
+ * @return []byte  the type-section payload (unframed)
+ */
+fn wasm_type_section(types: []WasmFuncType) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), types.len)
+    mut i: u64 = 0
+    loop {
+        if i >= types.len { break }
+        b = wasm_append_functype(b, types[i])
+        i++
+    }
+    b
+}
+
+/**
+ * wasm_append_import — append one import-section entry: the two-part name
+ * (each a ULEB128 length then its raw bytes), the `kind` byte (always `0x00`
+ * — function — in the MVP), then the ULEB128 type-section index.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param WasmImport imp  the import to encode
+ * @return []byte  `buf` followed by the encoded import
+ */
+fn wasm_append_import(buf: []byte, imp: WasmImport) -> []byte {
+    mut b = emit_uleb128(buf, imp.module.len)
+    b = emit_str_bytes(b, imp.module)
+    b = emit_uleb128(b, imp.field.len)
+    b = emit_str_bytes(b, imp.field)
+    b = teko::list::push(b, 0x00 to byte)
+    emit_uleb128(b, imp.type_index to u64)
+}
+
+/**
+ * wasm_import_section — the import section's payload: the ULEB128 entry
+ * count followed by each import's encoded bytes, in `imports` order.
+ *
+ * @param []WasmImport imports  the module's host imports
+ * @return []byte  the import-section payload (unframed)
+ */
+fn wasm_import_section(imports: []WasmImport) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), imports.len)
+    mut i: u64 = 0
+    loop {
+        if i >= imports.len { break }
+        b = wasm_append_import(b, imports[i])
+        i++
+    }
+    b
+}
+
+/**
+ * wasm_function_section — the function section's payload: the ULEB128 entry
+ * count followed by each defined function's ULEB128 type-section index, in
+ * `funcs` order (the code section, §5.2, shares this same order).
+ *
+ * @param []WasmFunc funcs  the module's defined functions
+ * @return []byte  the function-section payload (unframed)
+ */
+fn wasm_function_section(funcs: []WasmFunc) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), funcs.len)
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        b = emit_uleb128(b, funcs[i].type_index to u64)
+        i++
+    }
+    b
+}
+
+/**
+ * wasm_memory_section — the memory section's payload for the module's single
+ * linear memory: the ULEB128 memory count (always `1`, since a memory
+ * section is only framed when `mem_min_pages > 0`), the limits flag, then
+ * the ULEB128 initial page count. **The wasm64 switch (#389 C1-7,
+ * `backend-wasm.md` §6):** `is64 = false` (the default) encodes the classic
+ * wasm32 limits flag (`0x00` — min only, no max); `is64 = true` sets the
+ * `memory64` proposal's own flag bit (`0x04` — min only, 64-bit indices), so
+ * every memory instruction addressing this memory takes an `i64` address
+ * (matching `wasm_valtype(Ptr, true) = i64`'s own register-space width).
+ * The page count itself is encoded identically either way — LEB128 already
+ * handles the wider `u64` range `min_pages` is typed as.
+ *
+ * @param u32 min_pages  the initial linear-memory size, in 64 KiB pages
+ * @param bool is64  whether the memory is `memory64` (wasm64) rather than
+ *                   the classic 32-bit memory
+ * @return []byte  the memory-section payload (unframed)
+ */
+fn wasm_memory_section(min_pages: u32, is64: bool) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), 1 to u64)
+    b = teko::list::push(b, if is64 { 0x04 to byte } else { 0x00 to byte })
+    emit_uleb128(b, min_pages to u64)
+}
+
+/**
+ * wasm_append_global — append one global-section entry: the valtype byte,
+ * the mutability flag byte (`0x01` mutable / `0x00` const), then its
+ * `i32.const init; end` initializer expression (the MVP's only global — the
+ * shadow-stack `SP` pointer — is always `i32`, §6.1).
+ *
+ * @param []byte buf  the buffer to extend
+ * @param WasmGlobal g  the global to encode
+ * @return []byte  `buf` followed by the encoded global
+ */
+fn wasm_append_global(buf: []byte, g: WasmGlobal) -> []byte {
+    mut b = teko::list::push(buf, g.valtype to byte)
+    b = teko::list::push(b, if g.mutable { 0x01 to byte } else { 0x00 to byte })
+    b = teko::list::push(b, 0x41 to byte)
+    b = emit_sleb128(b, g.init)
+    teko::list::push(b, 0x0B to byte)
+}
+
+/**
+ * wasm_global_section — the global section's payload: the ULEB128 entry
+ * count followed by each global's encoded bytes, in `globals` order.
+ *
+ * @param []WasmGlobal globals  the module's globals
+ * @return []byte  the global-section payload (unframed)
+ */
+fn wasm_global_section(globals: []WasmGlobal) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), globals.len)
+    mut i: u64 = 0
+    loop {
+        if i >= globals.len { break }
+        b = wasm_append_global(b, globals[i])
+        i++
+    }
+    b
+}
+
+/**
+ * wasm_wasi_module — the WASI preview1 host module name every import in the
+ * MVP's runtime-binding set names (`backend-c1-wasm.md` §6.2), mirroring
+ * wasi-sdk's own generated imports.
+ *
+ * @return str  the WASI host module name
+ */
+fn wasm_wasi_module() -> str {
+    "wasi_snapshot_preview1"
+}
+
+/**
+ * WasmWasiImportSet — the MVP's whole WASI runtime-import binding
+ * (`backend-c1-wasm.md` §6.2): the two host functions the `exit(n)`/`print`
+ * corpus needs (`proc_exit`, `fd_write`), each function type interned FIRST
+ * (so a module built from this set alone numbers them funcidx `0`/`1`, ahead
+ * of any defined function — the wasm core spec's shared function index
+ * space, imports before definitions), and their resolved funcidx for wiring
+ * a `WasmSymbolTable` (`stackify.tks`'s `wasm_symtab_add`).
+ *
+ * **The C1-6 capability firewall (`backend-wasm.md` §7).** This set IS the
+ * module's whole import section (`wasm_assemble_program` sets
+ * `WasmModule.imports = wasi.imports` verbatim, nothing else) — `proc_exit`
+ * and `fd_write` are the ONLY capabilities any own-wasm module can ever
+ * exercise today. No import = no capability: there is no fs/process/clock
+ * import anywhere in the own backend, so no lowered program can touch a
+ * filesystem or spawn a process from inside the sandbox, structurally, not
+ * by convention — the module's import section IS the grant, and a builtin
+ * needing one the own backend never lowers (there is no fs/process LIR
+ * lowering at all) simply cannot be expressed. This is the SAME firewall
+ * §7 ascribes to the browser variant's missing `fs`/`process` JS imports
+ * (honest-stop table, §10) — the WASI-interop module already embodies it
+ * by having nothing wider to import.
+ *
+ * @since #389 C1-4
+ */
+pub type WasmWasiImportSet = struct {
+    /**
+     * types — the two interned WASI function signatures, in `imports`
+     * order.
+     */
+    types: []WasmFuncType
+    /**
+     * imports — the two WASI import-section entries (`proc_exit` then
+     * `fd_write`).
+     */
+    imports: []WasmImport
+    /**
+     * proc_exit_index — `proc_exit`'s module-wide function index.
+     */
+    proc_exit_index: u32
+    /**
+     * fd_write_index — `fd_write`'s module-wide function index.
+     */
+    fd_write_index: u32
+}
+
+/**
+ * wasm_wasi_import_set — build the MVP's WASI import binding: `proc_exit
+ * (param i32)` (`exit(n)`'s `tk_exit`, §6.2) and `fd_write (param i32 i32
+ * i32 i32) (result i32)` (`print`'s `tk_println`, the `R-1` sequencing
+ * note) — both imported from `wasm_wasi_module()`, numbered `0`/`1`.
+ *
+ * @return WasmWasiImportSet  the two interned types + imports + their
+ *                             resolved funcidx
+ */
+pub fn wasm_wasi_import_set() -> WasmWasiImportSet {
+    let i32vt = 0x7F to byte
+    let proc_exit_type = WasmFuncType { params = [i32vt]; results = teko::list::empty() }
+    let fd_write_type = WasmFuncType { params = [i32vt, i32vt, i32vt, i32vt]; results = [i32vt] }
+    let proc_exit_import = WasmImport { module = wasm_wasi_module(); field = "proc_exit"; type_index = 0 to u32 }
+    let fd_write_import = WasmImport { module = wasm_wasi_module(); field = "fd_write"; type_index = 1 to u32 }
+    WasmWasiImportSet {
+        types = [proc_exit_type, fd_write_type]
+        imports = [proc_exit_import, fd_write_import]
+        proc_exit_index = 0 to u32
+        fd_write_index = 1 to u32
+    }
+}
+
+/**
+ * wasm_append_export — append one export-section entry: the name (a ULEB128
+ * length then its raw bytes), the `kind` byte, then the ULEB128 index into
+ * that kind's index space.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param WasmExport ex  the export to encode
+ * @return []byte  `buf` followed by the encoded export
+ */
+fn wasm_append_export(buf: []byte, ex: WasmExport) -> []byte {
+    mut b = emit_uleb128(buf, ex.name.len)
+    b = emit_str_bytes(b, ex.name)
+    b = teko::list::push(b, ex.kind)
+    emit_uleb128(b, ex.index to u64)
+}
+
+/**
+ * wasm_export_section — the export section's payload: the ULEB128 entry
+ * count followed by each export's encoded bytes, in `exports` order.
+ *
+ * @param []WasmExport exports  the module's exports
+ * @return []byte  the export-section payload (unframed)
+ */
+fn wasm_export_section(exports: []WasmExport) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), exports.len)
+    mut i: u64 = 0
+    loop {
+        if i >= exports.len { break }
+        b = wasm_append_export(b, exports[i])
+        i++
+    }
+    b
+}
+
+/**
+ * wasm_local_decls — a code entry's local declarations: the ULEB128 group
+ * count followed by each `(count, valtype)` run, in `groups` order (the
+ * run-length-compressed non-parameter locals, §4.1).
+ *
+ * @param []WasmLocalGroup groups  the function's non-parameter local groups
+ * @return []byte  the local-declarations bytes
+ */
+fn wasm_local_decls(groups: []WasmLocalGroup) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), groups.len)
+    mut i: u64 = 0
+    loop {
+        if i >= groups.len { break }
+        b = emit_uleb128(b, groups[i].count to u64)
+        b = teko::list::push(b, groups[i].valtype to byte)
+        i++
+    }
+    b
+}
+
+/**
+ * wasm_code_entry — one code-section entry's bytes, unsized: the local
+ * declarations (`wasm_local_decls`) followed by the function's instruction
+ * body. The caller prefixes this with its ULEB128 byte length (`wasm_code_
+ * section`), since a code entry is itself length-prefixed in the section.
+ *
+ * @param WasmFunc f  the function to encode
+ * @return []byte  the entry's local declarations followed by its body
+ */
+fn wasm_code_entry(f: WasmFunc) -> []byte {
+    append_bytes(wasm_local_decls(f.local_groups), f.body)
+}
+
+/**
+ * wasm_code_section — the code section's payload: the ULEB128 function count
+ * followed by each function's ULEB128 entry-byte-length then its entry bytes
+ * (`wasm_code_entry`), in `funcs` order (matching `wasm_function_section`'s
+ * order).
+ *
+ * @param []WasmFunc funcs  the module's defined functions
+ * @return []byte  the code-section payload (unframed)
+ */
+fn wasm_code_section(funcs: []WasmFunc) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), funcs.len)
+    mut i: u64 = 0
+    loop {
+        if i >= funcs.len { break }
+        let entry = wasm_code_entry(funcs[i])
+        b = emit_uleb128(b, entry.len)
+        b = append_bytes(b, entry)
+        i++
+    }
+    b
+}
+
+/**
+ * wasm_append_data_segment — append one active data-section entry: the
+ * segment flag (`0x00` — active, memory index 0), the `i32.const offset`
+ * initializer expression (`0x41` then the SLEB128 offset then `end`,
+ * `0x0B`), the ULEB128 byte length, then the raw segment bytes.
+ *
+ * @param []byte buf  the buffer to extend
+ * @param WasmDataSegment seg  the data segment to encode
+ * @return []byte  `buf` followed by the encoded segment
+ */
+fn wasm_append_data_segment(buf: []byte, seg: WasmDataSegment) -> []byte {
+    mut b = teko::list::push(buf, 0x00 to byte)
+    b = teko::list::push(b, 0x41 to byte)
+    b = emit_sleb128(b, seg.offset to i64)
+    b = teko::list::push(b, 0x0B to byte)
+    b = emit_uleb128(b, seg.bytes.len)
+    append_bytes(b, seg.bytes)
+}
+
+/**
+ * wasm_data_section — the data section's payload: the ULEB128 segment count
+ * followed by each segment's encoded bytes, in `data` order.
+ *
+ * @param []WasmDataSegment data  the module's data segments
+ * @return []byte  the data-section payload (unframed)
+ */
+fn wasm_data_section(data: []WasmDataSegment) -> []byte {
+    mut b = emit_uleb128(teko::list::empty(), data.len)
+    mut i: u64 = 0
+    loop {
+        if i >= data.len { break }
+        b = wasm_append_data_segment(b, data[i])
+        i++
+    }
+    b
+}
+
+/**
+ * emit_wasm — serialize a `WasmModule` to the finished, SELF-CONTAINED wasm
+ * module bytes (`backend-wasm.md` §1.2 — the wasm path emits a module that
+ * IMPORTS its runtime via WASI imports; there is NO relocatable-object +
+ * external-linker step for a single-module emit): the 8-byte preamble
+ * (`wasm_preamble`) then every non-empty section, framed (`wasm_section`) in
+ * ascending id order — type (1), import (2), function (3), memory (5),
+ * global (6), export (7), code (10), data (11) — the section-id ordering the
+ * wasm spec requires (`backend-c1-wasm.md` §5.2). A part with nothing to say
+ * (an empty list, or `mem_min_pages == 0`) omits its section entirely rather
+ * than framing a zero-length one. Parallels `emit_macho`/`emit_elf` (a
+ * per-format module writer); the module already embeds its linear memory,
+ * the `_start` export, and its active data, so the emitted bytes ARE the
+ * runnable artifact `emit_native_wasm` writes directly.
+ *
+ * @param WasmModule m  the module to serialize
+ * @return []byte  the finished, self-contained wasm module bytes
+ */
+pub fn emit_wasm(m: WasmModule) -> []byte {
+    mut b = wasm_preamble()
+    if m.types.len > (0 to u64) {
+        b = wasm_section(b, 1 to byte, wasm_type_section(m.types))
+    }
+    if m.imports.len > (0 to u64) {
+        b = wasm_section(b, 2 to byte, wasm_import_section(m.imports))
+    }
+    if m.funcs.len > (0 to u64) {
+        b = wasm_section(b, 3 to byte, wasm_function_section(m.funcs))
+    }
+    if m.mem_min_pages > (0 to u32) {
+        b = wasm_section(b, 5 to byte, wasm_memory_section(m.mem_min_pages, m.mem_is64))
+    }
+    if m.globals.len > (0 to u64) {
+        b = wasm_section(b, 6 to byte, wasm_global_section(m.globals))
+    }
+    if m.exports.len > (0 to u64) {
+        b = wasm_section(b, 7 to byte, wasm_export_section(m.exports))
+    }
+    if m.funcs.len > (0 to u64) {
+        b = wasm_section(b, 10 to byte, wasm_code_section(m.funcs))
+    }
+    if m.data.len > (0 to u64) {
+        b = wasm_section(b, 11 to byte, wasm_data_section(m.data))
+    }
+    b
+}

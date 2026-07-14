@@ -207,11 +207,32 @@ fn lwt_lbinop_of_rejects_non_arithmetic() {
     teko::assert::is_true(match lbinop_of(lexer::TokenKind::Amp, checker::PrimKind::I64) { LBinOp => false; error => true })
 }
 
+/**
+ * lwt_lunop_of_picks_negation_family — lunop_of maps `-` to INeg/FNeg by family.
+ * `!` (Bang) is deliberately NOT mapped here: it is intercepted in lower_unary and
+ * lowered to a logical `operand == 0` (F1c fix, #389), so lunop_of returns an error for
+ * it rather than the old bitwise LUnOp::INot (which miscompiled `!` on the own backend).
+ */
 #test
 fn lwt_lunop_of_picks_negation_family() {
     teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Minus, checker::PrimKind::I64, LUnOp::INeg))
     teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Minus, checker::PrimKind::F64, LUnOp::FNeg))
-    teko::assert::is_true(lwt_unop_is(lexer::TokenKind::Bang, checker::PrimKind::Bool, LUnOp::INot))
+    teko::assert::is_true(match lunop_of(lexer::TokenKind::Bang, checker::PrimKind::Bool) { LUnOp => false; error => true })
+}
+
+/**
+ * lwt_lowers_logical_not_to_icmpeq_zero — `!` lowers to a LOGICAL-not: a `const 0`
+ * then an `icmpeq operand, 0` (F1c fix, #389), NOT a bitwise `inot`. The operand here is
+ * `1 < 2` (%2 = icmplts %0, %1); the not then emits %3 = const 0 and %4 = icmpeq %2, %3.
+ */
+#test
+fn lwt_lowers_logical_not_to_icmpeq_zero() {
+    let cond = lwt_cmp(lwt_num_i64(1 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, lwt_num_i64(2 to i128))))
+    let e = lwt_unary(lexer::TokenKind::Bang, cond, checker::PrimKind::Bool)
+    let text = lwt_lower_expr_text(e)
+    teko::assert::str_contains(text, "%3 = const 0")
+    teko::assert::str_contains(text, "%4 = icmpeq %2, %3")
+    teko::assert::is_true(!teko::str::contains(text, "inot"))
 }
 
 #test
@@ -327,6 +348,277 @@ fn lwt_lowers_if_stmt_without_else_via_branch_and_merge() {
 }
 
 #test
+/**
+ * lwt_if_stmt_then_arm_keeps_its_own_interned_rodata — an else-less
+ * if-statement whose THEN arm interns a fresh rodata entry (a `println`
+ * call's string literal). Regression for a genuine miscompile: prior to the
+ * C1-6 audit, `lower_if_stmt`'s no-else `else_ctx`/final context were built
+ * from the PRE-BRANCH `ctx`, so `ctx_with`'s field-copy silently DROPPED the
+ * THEN arm's own rodata growth even though nothing in the else side ever ran
+ * — the same class of bug `lower_coalesce` had. Asserts the rodata entry AND
+ * the call survive past the merge.
+ *
+ * @return void
+ */
+fn lwt_if_stmt_then_arm_keeps_its_own_interned_rodata() {
+    let a = lwt_var("a", checker::PrimKind::I64)
+    let b = lwt_var("b", checker::PrimKind::I64)
+    let cond = lwt_cmp(a, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, b)))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_str_call1("println", "only-in-then")))
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("a", "i64")), lwt_param("b", "i64"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(ifstmt)), lwt_ret(b))
+    let f = lwt_fn("announce", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_println(")
+}
+
+#test
+/**
+ * lwt_if_stmt_reassigned_scalar_threads_a_merge_param — the #389 F1 ROOT
+ * proof at the LIR level: an else-less if-STATEMENT whose then arm
+ * RE-ASSIGNS an enclosing scalar (`if 1 < 2 { x = 5 }`) must thread that
+ * scalar through the merge as a block-param. Asserts the merge `#B3` gained a
+ * param (`#B3(%4)`), the then arm's jump carries the REASSIGNED VReg
+ * (`jump #B3(%5)`, the `x = 5` value), the else pass-through carries the
+ * PRE-branch VReg (`jump #B3(%0)`, the `let x = 0` value), and the read past
+ * the merge sees the merge param (`ret %4`) — before F1 the rebind was
+ * dropped and `x` froze at its stale pre-branch VReg.
+ *
+ * @return void
+ */
+fn lwt_if_stmt_reassigned_scalar_threads_a_merge_param() {
+    let one = lwt_num_i64(1 to i128)
+    let two = lwt_num_i64(2 to i128)
+    let cond = lwt_cmp(one, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, two)))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(5 to i128), checker::PrimKind::I64))
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(0 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("bump", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "branch %3, #B1(), #B2()")
+    teko::assert::str_contains(text, "jump #B3(%5)")
+    teko::assert::str_contains(text, "jump #B3(%0)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4")
+}
+
+#test
+/**
+ * lwt_if_stmt_value_if_rhs_reassign_threads_the_outer_merge — the #389 F1b
+ * item 2 proof at the LIR level: a `mut` scalar reassigned INSIDE a
+ * value-position `if` that is the RHS of a `let` binding in an OUTER
+ * statement-`if` arm must ALSO thread through the OUTER merge, not just the
+ * inner value-if's own. `if 1 == 1 { let y = if 1 == 1 { x = 5; x } else { 0
+ * } }; return x` — the inner value-if threads `x` through its OWN merge
+ * (`#B6(%8, %9)`, value param `%8` + scalar `%9`), so past the binding `x`
+ * reads `%9`; the OUTER statement merge must carry `x` too or the read past
+ * the outer `if` freezes at the stale pre-branch `x` (`%0`). F1b's
+ * `collect_reassigned_stmt` `TBinding` case descends into the binding's
+ * value-position `if`/`match` RHS, so the reassigned-scalar scan SEES `x` and
+ * the outer merge gains its param (`#B3(%4)`). Asserts the inner arms feed the
+ * inner merge (`#B4`/`#B5` → `#B6`), the outer then-arm (which ENDS in the
+ * inner merge block `#B6`) closes carrying the POST-inner `x` (`jump
+ * #B3(%9)`), the outer else pass-through carries the PRE-branch `x` (`#B2` →
+ * `jump #B3(%0)`), and the read past the outer merge sees the merge param
+ * (`#B3(%4): ret %4`). Before F1b the outer merge carried ZERO params and
+ * `return x` read the stale `%0`.
+ *
+ * @return void
+ */
+fn lwt_if_stmt_value_if_rhs_reassign_threads_the_outer_merge() {
+    let inner_cond = lwt_cmp(lwt_num_i64(1 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::EqEq, lwt_num_i64(1 to i128))))
+    let inner_then = teko::list::push(teko::list::push(teko::list::empty(), lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(5 to i128), checker::PrimKind::I64)), lwt_exprstmt(lwt_var("x", checker::PrimKind::I64)))
+    let inner_else = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128)))
+    let inner_if = lwt_if_value(inner_cond, inner_then, inner_else, checker::PrimKind::I64)
+    let outer_then = teko::list::push(teko::list::empty(), lwt_bind("y", inner_if, checker::PrimKind::I64))
+    let outer_cond = lwt_cmp(lwt_num_i64(1 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::EqEq, lwt_num_i64(1 to i128))))
+    let ifstmt = lwt_if_stmt(outer_cond, outer_then, false, teko::list::empty())
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("nested_value_if_rhs", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B4:\n    %10 = const 5\n    jump #B6(%10, %10)")
+    teko::assert::str_contains(text, "  #B5:\n    %11 = const 0\n    jump #B6(%11, %0)")
+    teko::assert::str_contains(text, "  #B6(%8, %9):\n    jump #B3(%9)")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%0)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4")
+}
+
+#test
+/**
+ * lwt_if_stmt_non_mutating_arm_keeps_zero_param_merge — the byte-identical
+ * guard for #389 F1: an if-STATEMENT whose then arm mutates NO enclosing
+ * scalar (a bare read `if 1 < 2 { x }`) must keep its CURRENT zero-param
+ * merge — `reassigned_scalars` is reassigned-ONLY, never promote-all, so the
+ * existing acyclic corpus stays unchanged. Asserts the merge `#B3` carries no
+ * param (`#B3:` with a bare `jump #B3()`) and reads `x` at its unchanged
+ * pre-branch VReg (`ret %0`).
+ *
+ * @return void
+ */
+fn lwt_if_stmt_non_mutating_arm_keeps_zero_param_merge() {
+    let one = lwt_num_i64(1 to i128)
+    let two = lwt_num_i64(2 to i128)
+    let cond = lwt_cmp(one, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, two)))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_var("x", checker::PrimKind::I64)))
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(0 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("keep", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "jump #B3()")
+    teko::assert::str_contains(text, "  #B3:\n    ret %0")
+}
+
+#test
+/**
+ * lwt_if_stmt_shadowed_scalar_threads_pre_branch_value — #389 F1b item 3: the
+ * then arm's OWN `mut x = 99; x = x + 1` SHADOWS the enclosing `x` with a
+ * fresh, block-scoped local (appended at a HIGHER index) and reassigns THAT,
+ * never the enclosing scalar. Under enclosing-IDENTITY threading `x` is now
+ * threaded (the coarse across-all-arms shadow exclusion is gone), but
+ * `arm_scalar_args` reads the enclosing scalar at its fixed pre-branch INDEX,
+ * which the shadow left untouched — so the merge gains a one-scalar `x` param
+ * whose EVERY incoming edge carries the pre-branch VReg (`jump #B3(%0)` on the
+ * then arm AND the else pass-through), a no-op phi. The read past the merge
+ * sees the merge param (`#B3(%4): ret %4`) whose value is still the untouched
+ * `1` — the outer `x` is never corrupted by the shadow's own value. This
+ * one-param no-op merge REPLACES F1's zero-param exclusion shape; the exit
+ * behaviour is identical.
+ *
+ * @return void
+ */
+fn lwt_if_stmt_shadowed_scalar_threads_pre_branch_value() {
+    let one = lwt_num_i64(1 to i128)
+    let two = lwt_num_i64(2 to i128)
+    let cond = lwt_cmp(one, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, two)))
+    let shadow_bind: checker::TStatement = checker::TBinding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "x" }; bound = lwt_prim(checker::PrimKind::I64); value = lwt_num_i64(99 to i128) }
+    let shadow_bump = lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64), checker::PrimKind::I64)
+    let then_blk = teko::list::push(teko::list::push(teko::list::empty(), shadow_bind), shadow_bump)
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("shadow_no_leak", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "jump #B3(%0)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4")
+}
+
+#test
+/**
+ * lwt_match_stmt_threads_both_the_reassigned_and_the_pattern_shadowed_name —
+ * #389 F1b item 3: a match subject `k` whose FIRST arm pattern-binds its own
+ * value under `x` (`A as x`, no further statements), and whose SECOND
+ * (wildcard) arm reassigns BOTH `x` and `y`. Under enclosing-IDENTITY
+ * threading BOTH `x` and `y` are threaded (the former across-all-arms pattern
+ * exclusion is gone), so the merge carries TWO scalar params in `env` order
+ * (`#B1(%3, %4):`, `x` = `%3`, `y` = `%4`). The pattern arm appends its `A as
+ * x` bind at a HIGHER index than the enclosing `x`, so `arm_scalar_args` reads
+ * both scalars at their untouched pre-branch indices and its closing jump
+ * carries pre-branch `x` and pre-branch `y` (`jump #B1(%1, %2)`); the wildcard
+ * arm reassigns both in place, so its closing jump carries the reassigned
+ * VRegs (`jump #B1(%5, %6)`). The read past the merge sums the two params
+ * (`ret %7`). This UPDATE fixes the latent wildcard-path miscompile the old
+ * one-param golden enshrined: `x`'s reassignment on the wildcard path was
+ * silently dropped when a SIBLING arm's pattern shadowed the name.
+ *
+ * @return void
+ */
+fn lwt_match_stmt_threads_both_the_reassigned_and_the_pattern_shadowed_name() {
+    let subject = lwt_var("k", checker::PrimKind::I64)
+    let arm0 = lwt_arm(lwt_bind_pattern("A", "x"), teko::list::empty())
+    let arm1_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(99 to i128), checker::PrimKind::I64)), lwt_simple_assign("y", lexer::TokenKind::Assign, lwt_num_i64(20 to i128), checker::PrimKind::I64))
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), arm1_body)
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_stmt = checker::TExpr { kind = checker::TMatchExpr { subject = subject; arms = arms }; type = checker::Void { }; line = 0; col = 0 }
+    let tail = lwt_ret(lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_var("y", checker::PrimKind::I64), checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_bind("y", lwt_num_i64(10 to i128), checker::PrimKind::I64)), lwt_exprstmt(match_stmt)), tail)
+    let params = teko::list::push(teko::list::empty(), lwt_param("k", "i64"))
+    let f = lwt_fn("shadow_and_clean_reassign", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "#B1(%3, %4):")
+    teko::assert::str_contains(text, "jump #B1(%1, %2)")
+    teko::assert::str_contains(text, "jump #B1(%5, %6)")
+    teko::assert::str_contains(text, "ret %7")
+}
+
+#test
+/**
+ * lwt_if_stmt_reassign_then_shadow_threads_the_pre_shadow_enclosing_value —
+ * #389 F1b item 3, the HARD case at the LIR level: an if-STATEMENT arm that
+ * REASSIGNS the enclosing `x`, THEN shadows it, THEN reassigns the shadow
+ * (`x = 3; mut x = 99; x = x + 1`). The enclosing `x`'s last value before it
+ * goes out of view is `3`: `x = 3` updates its pre-branch INDEX in place
+ * (`%5`); `mut x = 99` appends a shadow at a HIGHER index (`%6`); `x = x + 1`
+ * updates the SHADOW's index (`%8`), never the enclosing one. `arm_scalar_args`
+ * reads the enclosing scalar at its fixed pre-branch index, so the arm's
+ * closing jump carries the `x = 3` VReg (`jump #B3(%5)`), NEVER the shadow's
+ * final `%8`. The else pass-through carries the pre-branch VReg (`jump
+ * #B3(%0)`) and the read past the merge is the merge param (`#B3(%4): ret %4`).
+ *
+ * @return void
+ */
+fn lwt_if_stmt_reassign_then_shadow_threads_the_pre_shadow_enclosing_value() {
+    let one = lwt_num_i64(1 to i128)
+    let two = lwt_num_i64(2 to i128)
+    let cond = lwt_cmp(one, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, two)))
+    let reassign_enclosing = lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(3 to i128), checker::PrimKind::I64)
+    let shadow_bind: checker::TStatement = checker::TBinding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "x" }; bound = lwt_prim(checker::PrimKind::I64); value = lwt_num_i64(99 to i128) }
+    let shadow_bump = lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64), checker::PrimKind::I64)
+    let then_blk = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), reassign_enclosing), shadow_bind), shadow_bump)
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, then_blk)
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let f = lwt_fn("reassign_then_shadow", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "%5 = const 3")
+    teko::assert::str_contains(text, "jump #B3(%5)")
+    teko::assert::is_true(!teko::str::contains(text, "jump #B3(%8)"))
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4")
+}
+
+#test
+/**
+ * lwt_match_arm_reassign_vs_shadow_threads_per_arm — #389 F1b item 3, per-arm
+ * value selection in one proof: `match k { 1 => { x = 5 }; _ => { mut x = 99;
+ * x = x + 1 } }` over an enclosing `mut x = 1`. Both arms feed the SAME
+ * one-scalar `x` merge param (`#B1(%2):`), each supplying its own enclosing-`x`
+ * value read at the fixed pre-branch index: the `1` arm reassigns the
+ * enclosing `x` in place, so its closing jump carries the reassigned VReg
+ * (`jump #B1(%5)`, the `x = 5` value); the wildcard arm only shadows `x`
+ * (appended at a higher index) and reassigns the shadow, so its closing jump
+ * carries the untouched pre-branch VReg (`jump #B1(%1)`), NEVER the shadow's
+ * `%8`. The read past the merge is the merge param (`ret %2`).
+ *
+ * @return void
+ */
+fn lwt_match_arm_reassign_vs_shadow_threads_per_arm() {
+    let subject = lwt_var("k", checker::PrimKind::I64)
+    let arm0_body = teko::list::push(teko::list::empty(), lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_num_i64(5 to i128), checker::PrimKind::I64))
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), arm0_body)
+    let shadow_bind: checker::TStatement = checker::TBinding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "x" }; bound = lwt_prim(checker::PrimKind::I64); value = lwt_num_i64(99 to i128) }
+    let shadow_bump = lwt_simple_assign("x", lexer::TokenKind::Assign, lwt_bin(lexer::TokenKind::Plus, lwt_var("x", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64), checker::PrimKind::I64)
+    let arm1_body = teko::list::push(teko::list::push(teko::list::empty(), shadow_bind), shadow_bump)
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), arm1_body)
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_stmt = checker::TExpr { kind = checker::TMatchExpr { subject = subject; arms = arms }; type = checker::Void { }; line = 0; col = 0 }
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("x", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(match_stmt)), lwt_ret(lwt_var("x", checker::PrimKind::I64)))
+    let params = teko::list::push(teko::list::empty(), lwt_param("k", "i64"))
+    let f = lwt_fn("per_arm_select", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "#B1(%2):")
+    teko::assert::str_contains(text, "jump #B1(%5)")
+    teko::assert::str_contains(text, "jump #B1(%1)")
+    teko::assert::is_true(!teko::str::contains(text, "jump #B1(%8)"))
+    teko::assert::str_contains(text, "ret %2")
+}
+
+#test
 fn lwt_lowers_if_expr_merges_with_a_block_arg() {
     let x = lwt_var("x", checker::PrimKind::I64)
     let y = lwt_var("y", checker::PrimKind::I64)
@@ -346,6 +638,35 @@ fn lwt_lowers_if_expr_merges_with_a_block_arg() {
 }
 
 #test
+/**
+ * lwt_if_value_then_arm_keeps_its_own_interned_rodata — a value-producing
+ * if-expression whose THEN arm interns a fresh rodata entry (a `println`
+ * call's string literal) as an EFFECT statement before its own tail value.
+ * Regression for the same C1-6 miscompile class as `lower_coalesce`'s: prior
+ * to the audit, `lower_if_value`'s `else_ctx`/final context were built from
+ * the PRE-BRANCH `ctx`, dropping the THEN arm's rodata growth even though
+ * the ELSE arm never ran. Asserts the rodata entry AND the call survive past
+ * the merge.
+ *
+ * @return void
+ */
+fn lwt_if_value_then_arm_keeps_its_own_interned_rodata() {
+    let x = lwt_var("x", checker::PrimKind::I64)
+    let y = lwt_var("y", checker::PrimKind::I64)
+    let cond = lwt_cmp(x, teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, y)))
+    let then_blk = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_str_call1("println", "only-in-then"))), lwt_exprstmt(x))
+    let else_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(y))
+    let ifexpr = lwt_if_value(cond, then_blk, else_blk, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::push(teko::list::empty(), lwt_param("x", "i64")), lwt_param("y", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(ifexpr))
+    let f = lwt_fn("announce_pick", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_println(")
+}
+
+#test
 fn lwt_honest_stop_on_if_without_else_as_a_value() {
     let cond = lwt_cmp(lwt_num_i64(1 to i128), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Lt, lwt_num_i64(2 to i128))))
     let then_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(1 to i128)))
@@ -357,6 +678,67 @@ fn lwt_honest_stop_on_if_without_else_as_a_value() {
 fn lwt_lowers_exit_builtin_to_tk_exit() {
     let call = lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), lwt_num_i64(42 to i128)), checker::Void { })
     teko::assert::str_contains(lwt_lower_expr_text(call), "call @tk_exit(%0)")
+}
+
+/** lwt_str_call1 — a builtin call node taking ONE str-literal `text` argument, callee
+    `name` (bare, addressable) — the shape every C1-6 io/panic builtin test shares. */
+fn lwt_str_call1(name: str, text: str) -> checker::TExpr {
+    lwt_call(lwt_path1(name), "", teko::list::push(teko::list::empty(), lwt_strlit(text)), checker::Void { })
+}
+
+#test
+fn lwt_lowers_println_builtin_to_tk_println_fat_pair() {
+    teko::assert::str_contains(lwt_lower_expr_text(lwt_str_call1("println", "hi")), "call @tk_println(%0, %1)")
+}
+
+#test
+fn lwt_lowers_print_builtin_to_tk_print_fat_pair() {
+    teko::assert::str_contains(lwt_lower_expr_text(lwt_str_call1("print", "hi")), "call @tk_print(%0, %1)")
+}
+
+#test
+fn lwt_lowers_eprint_builtin_to_tk_eprint_fat_pair() {
+    teko::assert::str_contains(lwt_lower_expr_text(lwt_str_call1("eprint", "hi")), "call @tk_eprint(%0, %1)")
+}
+
+#test
+fn lwt_lowers_eprintln_builtin_to_tk_eprintln_fat_pair() {
+    teko::assert::str_contains(lwt_lower_expr_text(lwt_str_call1("eprintln", "hi")), "call @tk_eprintln(%0, %1)")
+}
+
+#test
+fn lwt_lowers_write_builtin_to_tk_write_fat_pair() {
+    teko::assert::str_contains(lwt_lower_expr_text(lwt_str_call1("write", "hi")), "call @tk_write(%0, %1)")
+}
+
+#test
+fn lwt_lowers_ewrite_builtin_to_tk_ewrite_fat_pair() {
+    teko::assert::str_contains(lwt_lower_expr_text(lwt_str_call1("ewrite", "hi")), "call @tk_ewrite(%0, %1)")
+}
+
+#test
+fn lwt_lowers_panic_builtin_to_tk_panic_str_fat_pair() {
+    teko::assert::str_contains(lwt_lower_expr_text(lwt_str_call1("panic", "boom")), "call @tk_panic_str(%0, %1)")
+}
+
+#test
+fn lwt_println_arity_mismatch_honest_stops() {
+    let args = teko::list::push(teko::list::push(teko::list::empty(), lwt_strlit("a")), lwt_strlit("b"))
+    let call = lwt_call(lwt_path1("println"), "", args, checker::Void { })
+    teko::assert::str_contains(lwt_lower_expr_text(call), "expects exactly one str argument")
+}
+
+#test
+fn lwt_println_of_a_non_fat_producer_honest_stops() {
+    let inner = lwt_call(lwt_path1("mk_str"), "teko::demo", teko::list::empty(), checker::Str { })
+    let call = lwt_call(lwt_path1("println"), "", teko::list::push(teko::list::empty(), inner), checker::Void { })
+    teko::assert::str_contains(lwt_lower_expr_text(call), "not yet lowered (N2)")
+}
+
+#test
+fn lwt_user_call_with_str_arg_is_not_treated_as_str_arg_builtin() {
+    let call = lwt_call(lwt_path1("greet"), "teko::demo", teko::list::push(teko::list::empty(), lwt_strlit("hi")), checker::Void { })
+    teko::assert::str_contains(lwt_lower_expr_text(call), "call @teko__demo__greet(%0)")
 }
 
 #test
@@ -563,6 +945,36 @@ fn lwt_lowers_match_value_scalar_arms_via_icmpeq() {
 }
 
 #test
+/**
+ * lwt_match_value_arm_keeps_its_own_interned_rodata — a value-producing
+ * `match` whose FIRST arm interns a fresh rodata entry (a `println` call's
+ * string literal) as an EFFECT statement before its own tail value; its
+ * other arms never run it. Regression for the same C1-6 miscompile class as
+ * `lower_coalesce`'s, spanning both `lower_match_arm_value` (the per-arm
+ * fold step) and `lower_match_value` (the final fallback-block context):
+ * either one sourcing its returned/final context from a stale pre-arm `ctx`
+ * would silently DROP the arm's rodata growth. Asserts the rodata entry AND
+ * the call survive past the merge.
+ *
+ * @return void
+ */
+fn lwt_match_value_arm_keeps_its_own_interned_rodata() {
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let arm0_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_str_call1("println", "only-in-arm0"))), lwt_exprstmt(lwt_num_i64(10 to i128)))
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), arm0_body)
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(match_expr))
+    let f = lwt_fn("announce_pick2", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_println(")
+}
+
+#test
 fn lwt_lowers_match_enum_member_pattern_via_registered_ordinal() {
     let subject = lwt_typed_var("c", checker::Named { name = "Color" })
     let arm0 = lwt_arm(lwt_bind_pattern("Red", ""), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(10 to i128))))
@@ -655,6 +1067,129 @@ fn lwt_lowers_match_statement_merges_with_zero_block_args() {
     teko::assert::str_contains(text, "call @teko__demo__track(")
     teko::assert::is_true(!teko::str::contains(text, "#B1(%"))
     teko::assert::str_contains(text, "jump #B1()")
+}
+
+/**
+ * lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch — PR #553
+ * review finding, `match`'s own shape (mirrors
+ * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`'s if-shape
+ * proof), UPDATED for #389 F1b item 1 (defer-write propagation): `let s=1;
+ * match x { 1 => { defer { s = s + 100 } }; _ => {} }; return s` — the `defer`
+ * registers ONLY inside arm0's own body. Arm0's own block (`#B2`) fires it —
+ * LIFO, from the defer-delta base THIS arm itself started at — as part of ITS
+ * OWN close, immediately before its jump to the merge (`#B1`).
+ *
+ * `s` is now THREADED through the merge as a block-param (`#B1(%2)`): the
+ * `defer`'s reassignment of the enclosing `s` is a Simple `TAssign` the
+ * reassigned-scalar scan reaches through the defer body (`collect_reassigned_
+ * stmt`'s re-added `TDeferStmt` descent), and `close_arm_replaying_defers`
+ * re-samples arm0's closing scalar arg from its POST-replay env, so arm0 jumps
+ * `#B1(%6)` — its POST-defer `s` (`%6 = iadd %1, %5`). The wildcard arm (`#B4`,
+ * no defer) jumps its own untouched `s`, `#B1(%1)`, and the tail reads the
+ * merge param, `ret %2`. Before F1b the merge carried ZERO params and the tail
+ * read the STALE pre-defer `s` (`ret %1`) — the OLD golden shape encoded that
+ * same-class silent merge-drop; the arm block still holds the single `iadd`
+ * (the defer is never replayed a second time at the merge, `close_arm_
+ * replaying_defers`'s original PR #553 fix).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), teko::list::push(teko::list::empty(), lwt_defer(defer_body)))
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::empty())
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_stmt = checker::TExpr { kind = checker::TMatchExpr { subject = subject; arms = arms }; type = checker::Void { }; line = 0; col = 0 }
+    let tail_ret = lwt_ret(lwt_var("s", checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(match_stmt)), tail_ret)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("match_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1(%2):\n    ret %2\n  #B2:")
+    teko::assert::str_contains(text, "  #B2:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B1(%6)")
+    teko::assert::str_contains(text, "  #B4:\n    jump #B1(%1)")
+}
+
+/**
+ * lwt_defer_inside_match_value_arm_fires_only_on_that_arms_own_branch — PR
+ * #553 follow-up nit, UPDATED for #389 F1b item 1: the VALUE-producing
+ * (`lower_match_arm_value`) mirror of
+ * `lwt_defer_inside_match_arm_fires_only_on_that_arms_own_branch`: `let s=1;
+ * return match x { 1 => { defer { s = s + 100 }; s } _ => s }` — the `defer`
+ * registers ONLY inside arm0's own body, before its own tail value `s`. Arm0's
+ * own body block (`#B2`) fires it — LIFO, from the defer-delta base THIS arm
+ * itself started at — AFTER its tail value is read but BEFORE its jump.
+ *
+ * The merge now carries TWO params, `#B1(%2, %3)`: the FIRST (`%2`) is the
+ * match RESULT value, the SECOND (`%3`) the threaded enclosing scalar `s`
+ * (F1b re-adds the `TDeferStmt` descent, so the defer's `s = s + 100` is seen
+ * by the reassigned-scalar scan). CRITICALLY the VALUE arg stays PRE-defer: the
+ * tail `s` (`%1`) is captured before the defer replays, so arm0 jumps
+ * `#B1(%1, %7)` — value `%1` (pre-defer) THEN scalar `%7` (post-defer `s`,
+ * `%7 = iadd %1, %6`); `close_arm_replaying_defers` re-samples only the SCALAR
+ * arg from the post-replay env, never the value. The wildcard arm (`#B4`, via
+ * its pass-through `#B3`, no defer) jumps `#B1(%1, %1)`; the tail returns the
+ * VALUE param, `ret %2`. Before F1b the merge carried only the value param
+ * (`#B1(%2)`) and jumped `#B1(%1)` — the OLD golden shape dropped `s` at the
+ * merge; the arm block still holds its single `iadd` (defer never replayed
+ * twice). `#B1` is allocated BEFORE either arm (mirrors `lower_match_value`'s
+ * own `mergeb`-first shape), so it prints immediately followed by `#B2`'s own
+ * header, never a trailing `}` (that closes the function after the
+ * LAST-allocated block, the dead-code fallback past the last arm).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_match_value_arm_fires_only_on_that_arms_own_branch() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let arm0_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_defer(defer_body)), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64)))
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), arm0_body)
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_expr = lwt_match_value(subject, arms, checker::PrimKind::I64)
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_ret(match_expr))
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("match_value_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B2:\n    %6 = const 100\n    %7 = iadd %1, %6\n    jump #B1(%1, %7)")
+    teko::assert::str_contains(text, "  #B3:\n    jump #B4()")
+    teko::assert::str_contains(text, "  #B4:\n    jump #B1(%1, %1)")
+    teko::assert::str_contains(text, "  #B1(%2, %3):\n    ret %2\n  #B2:")
+}
+
+#test
+/**
+ * lwt_match_stmt_arm_keeps_its_own_interned_rodata — a STATEMENT-position
+ * `match` whose FIRST arm interns a fresh rodata entry (a `println` call's
+ * string literal); its wildcard fallback arm never runs it. Regression for
+ * the same C1-6 miscompile class as `lower_coalesce`'s, spanning both
+ * `lower_match_arm_stmt` (the per-arm fold step) and `lower_match_stmt` (the
+ * final merge context): either one sourcing its returned/final context from
+ * a stale pre-arm `ctx` would silently DROP the arm's rodata growth. Asserts
+ * the rodata entry AND the call survive past the merge.
+ *
+ * @return void
+ */
+fn lwt_match_stmt_arm_keeps_its_own_interned_rodata() {
+    let subject = lwt_var("x", checker::PrimKind::I64)
+    let arm0 = lwt_arm(lwt_int_pattern(1 to i128), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_str_call1("println", "only-in-arm0"))))
+    let arm1 = lwt_arm(lwt_wildcard_pattern(), teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_num_i64(0 to i128))))
+    let arms = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let match_stmt = checker::TExpr { kind = checker::TMatchExpr { subject = subject; arms = arms }; type = checker::Void { }; line = 0; col = 0 }
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_exprstmt(match_stmt)), lwt_ret(lwt_num_i64(0 to i128)))
+    let f = lwt_fn("announce_match_stmt", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_println(")
 }
 
 #test
@@ -956,6 +1491,35 @@ fn lwt_lowers_coalesce_via_branch_and_merge() {
     teko::assert::str_contains(text, "  #B1:\n    jump #B3(%0)")
     teko::assert::str_contains(text, "  #B2:\n    %2 = const 42\n    jump #B3(%2)")
     teko::assert::str_contains(text, "  #B3(%1):\n    ret %1")
+}
+
+#test
+/**
+ * lwt_coalesce_rhs_call_keeps_its_own_interned_rodata — `x ?? panic(str)`
+ * (C1-6's `wasm_panic_hook` shape): the RHS interns a FRESH rodata entry
+ * (`panic`'s string literal argument) that did not exist before the RHS was
+ * lowered. Regression for a genuine miscompile: `lower_coalesce`'s final
+ * merged context used to be built from the PRE-RHS context (`ctx1`), so
+ * `ctx_with`'s field-copy silently DROPPED the RHS's own rodata growth —
+ * the caller still emitted a `global_addr` relocation against `.Lstr0`, but
+ * its definition never reached the module (an own-native "undefined
+ * reference to `.Lstr0`" linker failure / an own-wasm "unresolved data
+ * symbol" honest-stop, neither a lowering-time error). Asserts the rodata
+ * entry AND the call survive the merge.
+ *
+ * @return void
+ */
+fn lwt_coalesce_rhs_call_keeps_its_own_interned_rodata() {
+    let x = lwt_optional_var("x", checker::PrimKind::I64)
+    let panic_call = lwt_str_call1("panic", "boom")
+    let co = lwt_coalesce(x, panic_call, lwt_prim(checker::PrimKind::I64))
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let body = teko::list::push(teko::list::empty(), lwt_ret(co))
+    let f = lwt_fn("pick_or_panic", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as r => r; error as err => return }
+    let text = print_lmodule(with_rodata(add_func(empty_module(), lf.func), lf.rodata))
+    teko::assert::str_contains(text, "rodata .Lstr0:")
+    teko::assert::str_contains(text, "call @tk_panic_str(")
 }
 
 /** lwt_named_opt_var — a `TVar` of `Named?` type — the safe-field-access receiver shape
@@ -1395,6 +1959,77 @@ fn lwt_lowers_continue_jumps_back_to_the_loop_head() {
 }
 
 /**
+ * lwt_defer_inside_loop_body_fires_each_fallthrough_iteration_never_survives_past_exit
+ * — PR #553 follow-up nit: `let s=1; loop { defer { s = s + 100 } };
+ * return s` — the loop's body NEVER breaks, so every trip through it closes
+ * via `close_loop_body`'s OWN fall-through replay (not `lower_break`'s):
+ * the loop head (`#B1`) fires the body's pending defer — LIFO, from the
+ * defer-delta base the BODY itself started at — immediately before its
+ * implicit back-edge jump to itself, once per (baked-in, static)
+ * iteration. `close_loop`'s OWN `.defers` restore (to whatever the defer
+ * stack was BEFORE the loop — here, empty) means the exit block (`#B2`,
+ * the function's tail here) carries NOTHING but the plain `ret` of its own
+ * block-arg: the exact leak `close_loop`'s `defers = outer.defers` fixes
+ * (PR #553 review finding) — carrying `body_done.defers` forward instead
+ * would leave the ALREADY-fired entry pending, so the tail `return`'s own
+ * `replay_defers(ctx, 0)` would fire it a SECOND time there.
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_loop_body_fires_each_fallthrough_iteration_never_survives_past_exit() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let loop_body = teko::list::push(teko::list::empty(), lwt_defer(defer_body))
+    let tail_ret = lwt_ret(lwt_var("s", checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_loop("", loop_body)), tail_ret)
+    let f = lwt_fn("loop_iter_scoped", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1(%1):\n    %3 = const 100\n    %4 = iadd %1, %3\n    jump #B1(%4)")
+    teko::assert::str_contains(text, "  #B2(%2):\n    ret %2\n}")
+}
+
+/**
+ * lwt_defer_inside_loop_body_fires_via_break_and_the_enclosing_defer_still_fires_after_the_loop_exits
+ * — PR #553 follow-up nit: `let s=1; defer { s = s + 1 }; loop { defer { s
+ * = s + 100 }; break }; return s` — TWO defers, at TWO different scopes:
+ * one registered BEFORE the loop (the enclosing FUNCTION scope), one
+ * registered INSIDE the loop's own body. The `break` fires ONLY the loop's
+ * OWN defer — LIFO, from the loop's `defer_base` (the defer-stack depth the
+ * BODY itself started at, which already SITS ABOVE the enclosing defer, so
+ * `lower_break`'s `replay_defers(ctx, target.defer_base)` never re-fires
+ * it) — immediately before its jump to the exit block (`#B1`, the loop
+ * head; `#B2`, the exit). `close_loop`'s OWN `.defers` restore (to what the
+ * stack was BEFORE the loop — the enclosing defer ALONE, still pending)
+ * means the exit block still carries the OUTER defer, correctly fired
+ * ONLY ONCE there by the tail `return`'s own `replay_defers(ctx, 0)` — NOT
+ * a second copy of the loop's OWN already-fired defer (the exact leak
+ * `close_loop`'s `defers = outer.defers` fixes, PR #553 review finding:
+ * carrying `body_done.defers` forward instead would leave the loop's own
+ * ALREADY-fired entry pending too, so the tail's replay would fire BOTH a
+ * second time).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_loop_body_fires_via_break_and_the_enclosing_defer_still_fires_after_the_loop_exits() {
+    let s_plus_1 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64)
+    let outer_defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_1, checker::PrimKind::I64))
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let loop_defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let loop_body = teko::list::push(teko::list::push(teko::list::empty(), lwt_defer(loop_defer_body)), lwt_break(""))
+    let tail_ret = lwt_ret(lwt_var("s", checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_defer(outer_defer_body)), lwt_loop("", loop_body)), tail_ret)
+    let f = lwt_fn("loop_break_scoped", "teko::demo", teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B0:\n    %0 = const 1\n    jump #B1(%0)")
+    teko::assert::str_contains(text, "  #B1(%1):\n    %3 = const 100\n    %4 = iadd %1, %3\n    jump #B2(%4)")
+    teko::assert::str_contains(text, "  #B2(%2):\n    %5 = const 1\n    %6 = iadd %2, %5\n    ret %6\n}")
+}
+
+/**
  * lwt_lowers_defer_fires_before_the_return_value_reads_it — A1-2, #382:
  * `let s=1; defer { s = s + 100 }; return s` registers the defer inline
  * (emitting nothing) and fires it — LIFO, here just the one entry — BEFORE
@@ -1489,6 +2124,127 @@ fn lwt_lowers_a_defer_fires_independently_on_each_of_two_return_paths() {
 }
 
 /**
+ * lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch — PR #553
+ * review finding, UPDATED for #389 F1b item 1 (defer-write propagation):
+ * `let s=1; if x>0 { defer { s = s + 100 } }; return s` — the `defer`
+ * registers ONLY inside the THEN arm, never before the `if`. The THEN arm
+ * (`#B1`) fires it — LIFO, from the defer-delta base this arm itself started
+ * at — as part of ITS OWN close, immediately before its jump to the merge.
+ *
+ * `s` is now THREADED through the merge as a block-param (`#B3(%4)`): F1b
+ * re-adds the `TDeferStmt` descent so the defer's `s = s + 100` is seen, and
+ * `close_arm_replaying_defers` re-samples the THEN arm's scalar arg from its
+ * POST-replay env, so THEN jumps `#B3(%6)` — its POST-defer `s` (`%6 = iadd
+ * %1, %5`). The ELSE arm (`#B2`, the implicit pass-through — no `else` block)
+ * never runs the defer, so it jumps its own untouched `s`, `#B3(%1)`, and the
+ * tail reads the merge param, `ret %4`. Before F1b the merge carried ZERO
+ * params and the tail read the STALE pre-defer `s` (`ret %1`) — the OLD golden
+ * shape encoded that same-class silent merge-drop; the arm block still holds
+ * the single `iadd` and `#B3` never carries a stray one (the defer is never
+ * replayed a second time at the merge, `close_arm_replaying_defers`'s original
+ * PR #553 fix, unconditional-fire regardless of branch).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let cond = lwt_cmp(lwt_var("x", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Gt, lwt_num_i64(0 to i128))))
+    let then_blk = teko::list::push(teko::list::empty(), lwt_defer(defer_body))
+    let ifstmt = lwt_if_stmt(cond, then_blk, false, teko::list::empty())
+    let tail_ret = lwt_ret(lwt_var("s", checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), tail_ret)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B3(%6)")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%1)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4\n}")
+}
+
+/**
+ * lwt_defer_inside_else_arm_fires_only_on_that_arms_own_branch — PR #553
+ * follow-up nit, UPDATED for #389 F1b item 1: the ELSE-arm mirror of
+ * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`: `let s=1; if
+ * x>0 { } else { defer { s = s + 100 } }; return s` — the `defer` registers
+ * ONLY inside the ELSE arm, never the empty THEN arm. The THEN arm (`#B1`,
+ * empty) jumps its own untouched `s` straight to the merge, `#B3(%1)`; the
+ * ELSE arm (`#B2`) fires the defer — LIFO, from the defer-delta base THIS arm
+ * itself started at — as part of ITS OWN close, then jumps its POST-defer `s`,
+ * `#B3(%6)` (`%6 = iadd %1, %5`), `close_arm_replaying_defers` re-sampling the
+ * scalar arg from its post-replay env. `s` is THREADED as the merge param
+ * `#B3(%4)` and the tail reads it, `ret %4` — proving the ELSE arm's defer
+ * write reaches the merge (F1b's `TDeferStmt` descent scopes EITHER arm
+ * identically, not just the THEN side). Before F1b the merge carried ZERO
+ * params and the tail read the STALE pre-defer `s` (`ret %1`) — the OLD golden
+ * shape encoded that same-class silent merge-drop; the defer is still never
+ * replayed a second time at the merge (its original PR #553 scope fix).
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_else_arm_fires_only_on_that_arms_own_branch() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let cond = lwt_cmp(lwt_var("x", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Gt, lwt_num_i64(0 to i128))))
+    let else_blk = teko::list::push(teko::list::empty(), lwt_defer(defer_body))
+    let ifstmt = lwt_if_stmt(cond, teko::list::empty(), true, else_blk)
+    let tail_ret = lwt_ret(lwt_var("s", checker::PrimKind::I64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_exprstmt(ifstmt)), tail_ret)
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("else_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1:\n    jump #B3(%1)")
+    teko::assert::str_contains(text, "  #B2:\n    %5 = const 100\n    %6 = iadd %1, %5\n    jump #B3(%6)")
+    teko::assert::str_contains(text, "  #B3(%4):\n    ret %4\n}")
+}
+
+/**
+ * lwt_defer_inside_if_value_then_arm_fires_only_on_that_arms_own_branch —
+ * PR #553 follow-up nit, UPDATED for #389 F1b item 1: the VALUE-producing
+ * (`lower_if_value`) shape of
+ * `lwt_defer_inside_if_arm_fires_only_on_that_arms_own_branch`: `let s=1;
+ * return if x>0 { defer { s = s + 100 }; s } else { s }` — the `defer`
+ * registers ONLY inside the THEN arm, before its own tail value `s`. The THEN
+ * arm (`#B1`) fires it — LIFO, from the defer-delta base THIS arm itself
+ * started at — AFTER its tail value is read but BEFORE its jump.
+ *
+ * The merge now carries TWO params, `#B3(%4, %5)`: the FIRST (`%4`) is the
+ * if-expression RESULT value, the SECOND (`%5`) the threaded enclosing scalar
+ * `s` (F1b's `TDeferStmt` descent sees the defer's `s = s + 100`). CRITICALLY
+ * the VALUE arg stays PRE-defer: the tail `s` (`%1`) is captured before the
+ * defer replays, so the THEN arm jumps `#B3(%1, %7)` — value `%1` (pre-defer)
+ * THEN scalar `%7` (post-defer `s`, `%7 = iadd %1, %6`); `close_arm_replaying_
+ * defers` re-samples only the SCALAR arg from the post-replay env, never the
+ * value. The ELSE arm (`#B2`, no defer) jumps `#B3(%1, %1)`; the tail returns
+ * the VALUE param, `ret %4`. Before F1b the merge carried only the value param
+ * (`#B3(%4)`) and jumped `#B3(%1)` — the OLD golden shape dropped `s` at the
+ * merge; the defer is still never replayed a second time there.
+ *
+ * @return void
+ */
+#test
+fn lwt_defer_inside_if_value_then_arm_fires_only_on_that_arms_own_branch() {
+    let s_plus_100 = lwt_bin(lexer::TokenKind::Plus, lwt_var("s", checker::PrimKind::I64), lwt_num_i64(100 to i128), checker::PrimKind::I64)
+    let defer_body = teko::list::push(teko::list::empty(), lwt_simple_assign("s", lexer::TokenKind::Assign, s_plus_100, checker::PrimKind::I64))
+    let cond = lwt_cmp(lwt_var("x", checker::PrimKind::I64), teko::list::push(teko::list::empty(), lwt_cmp_term(lexer::TokenKind::Gt, lwt_num_i64(0 to i128))))
+    let then_blk = teko::list::push(teko::list::push(teko::list::empty(), lwt_defer(defer_body)), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64)))
+    let else_blk = teko::list::push(teko::list::empty(), lwt_exprstmt(lwt_var("s", checker::PrimKind::I64)))
+    let ifexpr = lwt_if_value(cond, then_blk, else_blk, checker::PrimKind::I64)
+    let body = teko::list::push(teko::list::push(teko::list::empty(), lwt_bind("s", lwt_num_i64(1 to i128), checker::PrimKind::I64)), lwt_ret(ifexpr))
+    let params = teko::list::push(teko::list::empty(), lwt_param("x", "i64"))
+    let f = lwt_fn("if_value_arm_scoped", "teko::demo", params, checker::Prim { kind = checker::PrimKind::I64 }, body)
+    let lf = match lower_function(f) { LoweredFunction as x => x.func; error as err => return }
+    let text = print_lmodule(add_func(empty_module(), lf))
+    teko::assert::str_contains(text, "  #B1:\n    %6 = const 100\n    %7 = iadd %1, %6\n    jump #B3(%1, %7)")
+    teko::assert::str_contains(text, "  #B2:\n    jump #B3(%1, %1)")
+    teko::assert::str_contains(text, "  #B3(%4, %5):\n    ret %4\n}")
+}
+
+/**
  * lwt_lowers_loop_leaves_a_fat_local_unpromoted — A1-2, #382: `let s = "hi";
  * loop { break }; exit(s.len)` — `s` is the ONLY name live at the loop's
  * entry, but it is a FAT (str) binding, so `promote_env` leaves it
@@ -1508,6 +2264,34 @@ fn lwt_lowers_loop_leaves_a_fat_local_unpromoted() {
     let text = print_lmodule(m)
     teko::assert::str_contains(text, "%1 = const 2")
     teko::assert::str_contains(text, "    jump #B1()\n  #B1:\n    jump #B2()\n  #B2:\n    call @tk_exit(%1)")
+}
+
+#test
+/**
+ * lwt_fat_local_reassign_honest_stops_on_later_fat_use — #389 F1b item 3
+ * review finding 1: `let s = "hello"; s = "hi"; return s.len` must HONEST-STOP,
+ * NOT silently return the STALE pre-reassignment length. `lower_assign_simple`'s
+ * `=` path always lowers the RHS through the plain (scalar) `lower_expr`, so a
+ * reassignment of a fat-typed name only ever supplies a fresh PTR VReg, never a
+ * fresh length — `lenv_reassign` must therefore NEVER update a fat binding's
+ * `vregs` slot in place (that would pair the NEW ptr with the OLD `len_vregs`
+ * entry, a silent stale-length miscompile); it falls back to the pre-item3
+ * append (a fresh SCALAR entry, `has_len=false`), so `lenv_lookup_fat`'s
+ * newest-first scan for `s` hits that scalar entry and reports `has_len=false`,
+ * and `lower_len_field` -> `lower_fat_expr` -> `lower_var_fat` honest-stops with
+ * the SAME NAMED error a fat reassignment produced before item-3 ever touched
+ * `lenv_reassign` — refusing the program instead of returning a wrong answer.
+ *
+ * @return void
+ */
+fn lwt_fat_local_reassign_honest_stops_on_later_fat_use() {
+    let s_bind = lwt_bind_typed("s", lwt_strlit("hello"), checker::Str { })
+    let reassign = lwt_simple_assign("s", lexer::TokenKind::Assign, lwt_strlit("hi"), checker::PrimKind::I64)
+    let len_access = lwt_field_access(lwt_typed_var("s", checker::Str { }), "len", lwt_prim(checker::PrimKind::U64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), s_bind), reassign), lwt_ret(len_access))
+    let f = lwt_fn("fat_reassign_then_len", "teko::demo", teko::list::empty(), lwt_prim(checker::PrimKind::U64), body)
+    let out = match lower_function(f) { LoweredFunction => "ok"; error as e => e.message }
+    teko::assert::str_contains(out, "`s` is not a fat-pointer local")
 }
 
 /**
