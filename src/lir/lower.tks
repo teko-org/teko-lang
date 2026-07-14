@@ -91,26 +91,43 @@ fn list_set_u32(xs: []u32, idx: u64, v: u32) -> []u32 {
 }
 
 /**
- * lenv_reassign — rebind the NEWEST binding of `name` to `vreg` IN PLACE (the
- * SSA-lite reassignment update), preserving that slot's fat-pointer side-table
- * (`has_len`/`len_vregs`) and, crucially, its POSITION — so the binding keeps
- * its pre-branch INDEX and the merge machinery can read the enclosing scalar's
+ * lenv_reassign — rebind the NEWEST binding of `name` to `vreg`. For a SCALAR
+ * (`!has_len`) newest binding this updates IN PLACE (the SSA-lite reassignment
+ * update), preserving the slot's POSITION — so the binding keeps its
+ * pre-branch INDEX and the merge machinery can read the enclosing scalar's
  * current value at that fixed index regardless of any shadow appended after it
  * (#389 F1b item 3). Behaviour-preserving for every `lenv_lookup`: the newest
  * `name` is still at its original index, now carrying `vreg`, so a name-keyed
  * newest-first read returns the SAME VReg it would after the old append — the
- * only difference is that no DUPLICATE `name` entry is left behind. Falls back
- * to `lenv_bind` when `name` is unbound (a checker invariant break — an assign
- * to an undeclared local never reaches lowering).
+ * only difference is that no DUPLICATE `name` entry is left behind.
+ *
+ * For a FAT (`has_len`) newest binding, in-place update is WRONG: it would
+ * overwrite the ptr VReg while PRESERVING the old `len_vregs`/`has_len` slot,
+ * so a later fat use (`s.len`, or passing `s` on) would silently read the
+ * STALE pre-reassignment length — a miscompile item-3's index-identity
+ * threading never needed in the first place, since `reassigned_scalars`
+ * already filters merge candidates to `!has_len` (a fat local is NEVER
+ * threaded through a scalar merge, #389 F1b item 3 review). So a fat newest
+ * binding instead falls back to the OLD append behavior (`lenv_bind`, a fresh
+ * SCALAR entry with `has_len=false`): this restores the EXACT pre-item3
+ * posture — `lenv_lookup_fat`'s newest-first scan hits that fresh scalar
+ * entry first and reports `has_len=false`, so `lower_var_fat`/`lower_len_field`
+ * honest-stop on the reassigned name exactly as they did before item-3,
+ * refusing the program instead of silently returning a stale length.
+ *
+ * Also falls back to `lenv_bind` when `name` is unbound (a checker invariant
+ * break — an assign to an undeclared local never reaches lowering).
  *
  * @param LEnv env  the env whose newest `name` binding is updated
  * @param str name  the reassigned local's name
  * @param u32 vreg  the reassignment's fresh result VReg
- * @return LEnv  `env` with the newest `name` slot's VReg replaced in place
+ * @return LEnv  `env` with the newest `name` slot updated in place (scalar) or
+ *              a fresh scalar entry appended (fat or unbound)
  */
 pub fn lenv_reassign(env: LEnv, name: str, vreg: u32) -> LEnv {
     let idx = lenv_newest_index(env, name)
     if idx == env.names.len { return lenv_bind(env, name, vreg) }
+    if env.has_len[idx] { return lenv_bind(env, name, vreg) }
     LEnv { names = env.names; vregs = list_set_u32(env.vregs, idx, vreg); len_vregs = env.len_vregs; has_len = env.has_len }
 }
 

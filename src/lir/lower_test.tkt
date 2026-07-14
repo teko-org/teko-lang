@@ -2266,6 +2266,34 @@ fn lwt_lowers_loop_leaves_a_fat_local_unpromoted() {
     teko::assert::str_contains(text, "    jump #B1()\n  #B1:\n    jump #B2()\n  #B2:\n    call @tk_exit(%1)")
 }
 
+#test
+/**
+ * lwt_fat_local_reassign_honest_stops_on_later_fat_use — #389 F1b item 3
+ * review finding 1: `let s = "hello"; s = "hi"; return s.len` must HONEST-STOP,
+ * NOT silently return the STALE pre-reassignment length. `lower_assign_simple`'s
+ * `=` path always lowers the RHS through the plain (scalar) `lower_expr`, so a
+ * reassignment of a fat-typed name only ever supplies a fresh PTR VReg, never a
+ * fresh length — `lenv_reassign` must therefore NEVER update a fat binding's
+ * `vregs` slot in place (that would pair the NEW ptr with the OLD `len_vregs`
+ * entry, a silent stale-length miscompile); it falls back to the pre-item3
+ * append (a fresh SCALAR entry, `has_len=false`), so `lenv_lookup_fat`'s
+ * newest-first scan for `s` hits that scalar entry and reports `has_len=false`,
+ * and `lower_len_field` -> `lower_fat_expr` -> `lower_var_fat` honest-stops with
+ * the SAME NAMED error a fat reassignment produced before item-3 ever touched
+ * `lenv_reassign` — refusing the program instead of returning a wrong answer.
+ *
+ * @return void
+ */
+fn lwt_fat_local_reassign_honest_stops_on_later_fat_use() {
+    let s_bind = lwt_bind_typed("s", lwt_strlit("hello"), checker::Str { })
+    let reassign = lwt_simple_assign("s", lexer::TokenKind::Assign, lwt_strlit("hi"), checker::PrimKind::I64)
+    let len_access = lwt_field_access(lwt_typed_var("s", checker::Str { }), "len", lwt_prim(checker::PrimKind::U64))
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), s_bind), reassign), lwt_ret(len_access))
+    let f = lwt_fn("fat_reassign_then_len", "teko::demo", teko::list::empty(), lwt_prim(checker::PrimKind::U64), body)
+    let out = match lower_function(f) { LoweredFunction => "ok"; error as e => e.message }
+    teko::assert::str_contains(out, "`s` is not a fat-pointer local")
+}
+
 /**
  * lwt_honest_stop_on_break_outside_a_loop — a bare `break` with no
  * enclosing `loop` on its lowering path is a checker invariant break
