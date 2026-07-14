@@ -48,21 +48,21 @@ jobs:
               - '.github/workflows/sanitizers.yml'
               - '.github/lsan-suppressions.txt'
 
-  # ── LIGHT gate: TEKO_MEM_PARANOID native self-host (SEED protector) ───────────
-  # Runs on EVERY relevant PR/push. TEKO_MEM_PARANOID is teko's OWN arena oracle (teko_rt.c
-  # #148 Level-2): a runtime getenv that POISONS every freed arena block and NEVER reuses it,
-  # so any use-after-free or arena-reuse-after-free in the compiler's OWN C aborts loud. We
-  # build gen1 natively (the seed compiles the PR sources) and then RUN gen1 over the whole
-  # project with the oracle armed — the self-host compile exercises the full front-end + native
-  # backend arena traffic. No clang, no ASan/LSan shadow memory: this is deliberately the CHEAP
-  # gate, sized to run on every lane PR so the seed it produces is memory-clean. The HEAVY
-  # ASan+UBSan audit of the emitted C + runtime seam is the main-only lane below.
+  # ── HEAVY gate: TEKO_MEM_PARANOID native self-host — MAIN ONLY ────────────────
+  # TEKO_MEM_PARANOID is teko's OWN arena oracle (teko_rt.c #148 Level-2): a runtime getenv that
+  # POISONS every freed arena block and NEVER reuses it, so any use-after-free / arena-reuse-after-
+  # free in the compiler's OWN C aborts loud. Because never-reuse disables the arena free-list, the
+  # full self-host under the oracle is HEAVY (~18-20 min on the backend-wave code: ~7 min build +
+  # ~11 min oracle run) — too heavy to pay on every lane PR (owner ruling 2026-07-14: it "wrecks
+  # the CI"). So it moves to the MAIN-only heavy tier alongside the ASan lane: it runs when the PR
+  # targets main (base_ref == main) OR on push to main, and is SKIPPED on lane/remodel PRs. The
+  # memory audit therefore lands at the seed/release boundary (umbrella -> main), not per lane PR.
   mem-paranoid:
     name: Memory paranoid (native self-host)
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: needs.changes.outputs.run == 'true' && (github.base_ref == 'main' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
 
@@ -298,7 +298,13 @@ jobs:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: windows-latest
-    timeout-minutes: 10
+    # Headroom: the backend-wave self-host on the Windows runner is ~11 min for the gen1 BUILD alone,
+    # plus ~3.5 min for `teko test . --coverage` = ~15 min total (the 10- then 15-min caps both
+    # guillotined it right at the finish — it COMPLETES, it is not a hang). 25 min gives real slack
+    # until the compiler-speed work lands (the durable fix). Owner ruling 2026-07-14. Kept on the
+    # lane light tier (not moved main-only like mem-paranoid) BECAUSE it guards the Windows-specific
+    # codegen (emit_native_win / PE-COFF) this wave actively develops.
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -323,26 +329,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # ── gate: LIGHT aggregator — the SEED protector (required on lanes + remodel + main) ─
-  # Aggregates the lane-PR suite: mem-paranoid + tsan + windows-selfhost. This is the
-  # required check for lane/remodel PRs (and it also runs on PRs into main). It NEVER
-  # depends on the heavy asan-default lane, so lane PRs never wait on it.
+  # Aggregates the lane-PR suite: tsan + windows-selfhost. This is the required check for
+  # lane/remodel PRs (and it also runs on PRs into main). It NEVER depends on the heavy
+  # asan-default / mem-paranoid lanes, so lane PRs never wait on them (owner ruling 2026-07-14:
+  # TEKO_MEM_PARANOID's never-reuse self-host is ~18-20 min — too heavy for every lane PR, so it
+  # moved to the main-only heavy gate below).
   gate:
     name: Sanitizer gate
     runs-on: ubuntu-latest
-    needs: [changes, mem-paranoid, tsan, windows-selfhost]
+    needs: [changes, tsan, windows-selfhost]
     if: always()
     permissions: {}
 
     steps:
       - name: Evaluate results
         run: |
-          MEM_PARANOID="${{ needs.mem-paranoid.result }}"
           TSAN="${{ needs.tsan.result }}"
           WINDOWS_SELFHOST="${{ needs.windows-selfhost.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
           echo "changes.run      = $CHANGES"
-          echo "mem-paranoid     = $MEM_PARANOID"
           echo "tsan             = $TSAN"
           echo "windows-selfhost = $WINDOWS_SELFHOST"
 
@@ -352,7 +358,7 @@ jobs:
           fi
 
           FAILED=0
-          for RESULT in "$MEM_PARANOID" "$TSAN" "$WINDOWS_SELFHOST"; do
+          for RESULT in "$TSAN" "$WINDOWS_SELFHOST"; do
             if [ "$RESULT" = "failure" ] || [ "$RESULT" = "cancelled" ]; then
               FAILED=1
             fi
@@ -367,14 +373,15 @@ jobs:
           exit 0
 
   # ── gate: HEAVY aggregator — the MAIN audit (required on main ONLY) ────────────
-  # Aggregates the main-only asan-default lane. On lane/remodel PRs asan-default is SKIPPED,
-  # so this aggregator passes (a skipped dependency is neither failure nor cancelled) and is
-  # harmless if left un-required there. On PRs into main it enforces the heavy ASan+UBSan lane
-  # — make THIS the required check on the main ruleset (see docs/design/ci-gates.md).
+  # Aggregates the main-only heavy lanes: asan-default (ASan+UBSan) AND mem-paranoid
+  # (TEKO_MEM_PARANOID never-reuse self-host). On lane/remodel PRs both are SKIPPED, so this
+  # aggregator passes (a skipped dependency is neither failure nor cancelled) and is harmless if
+  # left un-required there. On PRs into main it enforces both heavy lanes — THIS is the required
+  # check on the main ruleset (see docs/design/ci-gates.md).
   heavy-gate:
     name: Heavy sanitizer gate (main)
     runs-on: ubuntu-latest
-    needs: [changes, asan-default]
+    needs: [changes, asan-default, mem-paranoid]
     if: always()
     permissions: {}
 
@@ -382,20 +389,29 @@ jobs:
       - name: Evaluate results
         run: |
           ASAN_DEFAULT="${{ needs.asan-default.result }}"
+          MEM_PARANOID="${{ needs.mem-paranoid.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
           echo "changes.run  = $CHANGES"
           echo "asan-default = $ASAN_DEFAULT   (skipped on non-main contexts by design)"
+          echo "mem-paranoid = $MEM_PARANOID   (skipped on non-main contexts by design)"
 
           if [ "$CHANGES" != "true" ]; then
             echo "No relevant files changed — heavy gate passes."
             exit 0
           fi
 
-          # A skipped asan-default (lane/remodel context) is NOT a failure — the heavy lane
-          # only runs on main. Only a real failure/cancellation of the lane fails this gate.
-          if [ "$ASAN_DEFAULT" = "failure" ] || [ "$ASAN_DEFAULT" = "cancelled" ]; then
-            echo "ERROR: the heavy ASan+UBSan lane failed or was cancelled."
+          # A skipped lane (lane/remodel context) is NOT a failure — the heavy lanes only run on
+          # main. Only a real failure/cancellation of a lane fails this gate.
+          FAILED=0
+          for RESULT in "$ASAN_DEFAULT" "$MEM_PARANOID"; do
+            if [ "$RESULT" = "failure" ] || [ "$RESULT" = "cancelled" ]; then
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" = "1" ]; then
+            echo "ERROR: a heavy sanitizer lane (ASan / mem-paranoid) failed or was cancelled."
             exit 1
           fi
 
