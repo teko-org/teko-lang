@@ -669,6 +669,7 @@ lands at C1-8.
 | `C1-fp` | C1-2 | FP-op parity check against the wasm FP opcodes (regular; Appendix table) — folded into C1-2 as it is 1:1 | 0.3.1 if any gap found |
 | `C1-simd` | later cluster | `v128` / SIMD lowering | later (not on the LTS path) |
 | `C1-bigmem` | C1-7 | wasm32 address ≥ 2^32 → PANIC (the checked narrow, §6); a genuine >4 GB module needs the wasm64 switch | 0.3.1 (wasm64 arm) |
+| `C1-wasm64-scope` | C1-7 | the wasm64 arm's own SUPPORTED subset today: no `LAlloca` (the shadow-stack `$sp`/`LFieldAddr`/`LAlloca` sites still compute in `i32` unconditionally), no rodata (`LGlobalAddr` likewise), no `Ptr`-typed signature — `wasm_assemble_program`'s own scope guard fails loud (M.3) rather than emit an invalid `memory64` module; a wasm64 program calling `print`/`panic` also fails cleanly (`wasm_resolve_call`'s existing "unresolved call symbol" error) since the `fd_write`-based io/panic trampolines — WASI preview1's own `i32`-address-only ABI, a genuine ecosystem wall against `memory64` — are omitted for `ptr64` | a follow-up threads `ptr64` through `LFieldAddr`/`LAlloca`/`LGlobalAddr`/`$sp` |
 | browser `fs`/`process` | C1-6 | no VFS/process in a browser sandbox — the import is not wired, the builtin honest-stops at runtime (§7) | never (no equivalent; M.3) |
 | WasmGC | — | GC value types — arena-in-linear-memory is THE model (§2-B) | out of scope (Appendix, "if ever") |
 | own wasm linker | — | none needed — the module is self-contained; WASI links `teko_rt.wasm` via `wasm-ld` (§11.4) | Phase E is ELF/Mach-O/COFF only |
@@ -890,3 +891,318 @@ cluster, off the LTS path. WasmGC is out of scope — the arena-in-linear-memory
 memory model; a WasmGC re-target would fork it and is revisited only "if ever". Each fast-follow is
 mechanical: the enum is closed, the map widens at one site, and a fixture that reaches the stop today
 compares at the stop on both sides.
+
+---
+
+## 14. C1-8 sub-decomposition (the keystone destrincha) — grounded on the SHIPPED lane
+
+> **Scope of this section.** A sub-slicing of the last crumb, produced **after** C1-1..C1-7 landed
+> and merged (`fix/issue-389-wasm`, head `c0cad13`). It is grounded on the CODE now on the lane, not on
+> the pre-implementation §13 sketch — and that grounding materially **shrinks and re-shapes** C1-8. The
+> single most important finding: **the emit_native wasm dispatch arm, the whole `wasm_assemble_program
+> → emit_wasm → write .wasm` pipeline, the self-contained WASI module, and the own-wasm==C-native
+> differential harness (`scripts/validate_wasm_own.sh`) ALL already landed as part of C1-5/C1-6/C1-7**
+> (the harness's own header reads "issue #389 C1-5/C1-6/C1-7"; `emit_native_wasm`'s doc reads "#389
+> C1-5, reworked … the wasm64 switch at C1-7"). C1-8 therefore adds **NO compiler code** — it is a
+> corpus-broadening + CI-gating + fixpoint-confirming + doc-reconciling crumb that turns the already-
+> working artifact into a ratified, gated keystone and CLOSES #389.
+>
+> **SUPERSEDED (2026-07-14, owner "fix fully, any size"):** This pre-implementation finding was
+> falsified during grounding on execution. Closing #389 honestly required **SIX real own-backend
+> compiler fixes** (see §14.0.1). The overall structure stands; the details are reconciled below.
+
+### 14.0.1 Reconciliation — what C1-8 actually cost
+
+The pre-implementation claim "C1-8 adds NO compiler code" was falsified during grounding on execution.
+Closing #389 honestly required **SIX real own-backend compiler fixes**, each separately proven
+(own==C differential + wasm-under-wasmtime + fixpoint):
+- **F1** (#561) — LIR if/match merge-scalar-drop: a `mut` scalar reassigned in an arm was dropped at
+  the merge. `src/lir/lower.tks`.
+- **F1c** (#562) — `!` (logical-not) lowered to bitwise `INot` (nonzero for both bool values) → every
+  `if !cond` mis-branched on both own backends; now `ICmpEq(operand,0)`. The range-`for` desugar was
+  the first own-backend code to use `!`. `src/lir/lower.tks`.
+- **F2** (#563) — own-native regalloc §6.2 loop-liveness extension across all three allocators
+  (arm64/x86/riscv): removed the loop honest-stop, widen header-live intervals to the latch.
+  own-native now compiles loops. `src/backend/regalloc*.tks`.
+- **F1b** (#564) — defer-write-propagation (statement-arm scalar sampled post-`replay_defers`) +
+  value-if/match RHS reassignment threading. `src/lir/lower.tks`.
+- **item 3** (#566) — scope-aware `lenv` (reassign-in-place + index-identity), replacing F1's coarse
+  across-all-arms shadow-exclusion; residual NONE; fat-local reassign falls back to append
+  (honest-stop preserved). `src/lir/lower.tks`.
+
+**Misdiagnosis note:** The "stackifier gap" hypothesis for the loop failure was a MISDIAGNOSIS (the
+stackifier was correct; the root was the `!`-lowering bug, F1c).
+
+**Now green:** The loop fixtures (`wasm_loop_count`→6, `wasm_continue_step`→6) now pass under wasmtime,
+and the own==C native differential now compiles loops on all three native backends.
+
+### 14.0 Reality reconciliation — three §-supersedes (law-first, recorded, NO HALT)
+
+The §13 sketch predates both the implementation and two ratified laws it now collides with. Each
+tension resolves law-first to the newer/ratified fact; none is a genuine unresolved tension, so none
+HALTs.
+
+- **S-1 · The seam is `TEKO_BACKEND=native` + `TEKO_TARGET=wasm32-wasi`, NOT a new `TEKO_BACKEND=wasm`
+  (supersedes §0/§13's "temporary `TEKO_BACKEND=wasm` env seam").** The shipped path reuses the
+  EXISTING own-backend seam (`native_backend_selected`, `project.tks:719`, `TEKO_BACKEND=="native"`)
+  plus the `TEKO_TARGET` triple resolver (`target_from_name`, `project.tks:763` — `wasm32-wasi`/`wasm`/
+  `wasi` → `NativeTarget::Wasm32Wasi`, `wasm64-wasi` → `Wasm64Wasi`, `wasm32-browser` → `Wasm32Browser`)
+  and a new arm in `emit_native`'s target `match` (`project.tks:870-872` →
+  `emit_native_wasm(…, browser, ptr64)`). **Law-first (M.5 — one way to do it):** the own backend
+  already HAD a target-dispatch seam; a second parallel `TEKO_BACKEND=wasm` env var would be a
+  redundant selector for a state (`which own target`) `TEKO_TARGET` already names. Reusing it is
+  strictly better for FIXPOINT (S-4/§14.Q4 — zero new default-path branches). D1/#390's real
+  `--backend`/`--target` flag supersedes BOTH env seams later.
+- **S-2 · There is NO `wasm-ld`, NO relocatable object, and NO `teko_rt.c` wasm port (supersedes §11.4
+  and the §13 "wasm variant of `src/runtime/teko_rt`" file line).** `objfile_wasm.tks` emits a FINAL,
+  self-contained module whose ENTIRE import section is the two WASI preview1 functions `proc_exit` +
+  `fd_write` (`wasm_wasi_import_set`, `objfile_wasm.tks:482+`). Everything the corpus calls is
+  **synthesized as wasm functions inside the module**: `tk_exit` resolves DIRECTLY to the `proc_exit`
+  import (`stackify.tks:4655`); `tk_write`/`tk_ewrite`/`tk_println`/`tk_panic_str` are synthesized
+  fd_write trampolines over a fixed linear-memory scratch region (`wasm_io_iov_base_addr`/
+  `wasm_io_nwritten_addr`/`wasm_io_scratch_bytes`, `stackify.tks:4463-4526`); `_start` is synthesized
+  (`stackify.tks:4710+`); the arena/rodata live in the module's own linear memory
+  (`wasm_program_memory_plan`, arena sizing deferred to #453's `#arena_size`). **Law-first (M.4 — the
+  cheapest honest path):** a single-module emit that imports all its capabilities needs no external
+  linker AT ALL; §11.4's "`wasm-ld` links `teko_rt.wasm`" was the cc-as-linker analogue for a
+  relocatable-object shape that the ratified §1.2 self-contained-module decision never produced. §11.4
+  itself already flagged this ("superseded by no external linker being needed"). The §8 host `panic`
+  IMPORT is likewise superseded by the synthesized `tk_panic_str` fd_write-then-`unreachable`
+  trampoline (still fail-loud: observe via fd_write to the host, then trap).
+- **S-3 · The keystone differential is own-wasm(wasmtime) == C-native ONLY — there is no `interp`/VM
+  leg (supersedes §12/§12.4's "== interp" and the §12.3 "both-engine gate", and the §13 "wasm leg of
+  `scripts/diff_vm_native.sh`").** The VM was **retired (issue #524, `docs/design/vm-retirement.md`)**;
+  `scripts/diff_vm_native.sh` no longer exists on the lane (only `native_regressions.sh`'s CWD check
+  survived it), and the test gate runs **natively only** (#265, `run_gate_native`, `project.tks:1355`).
+  **Law-first:** the later, ratified #524/#265 win over the pre-#524 §12 sketch. C-native is the single
+  trusted oracle, and the three-way "own-wasm == C-native == interp" collapses to the two-way
+  "own-wasm == C-native"; transitivity through `diff_c_own.sh` (C-native == own-**native**, register
+  targets) still yields the full own-wasm == C-native == own-native chain over the shared `own_*`
+  fixtures, so nothing is lost. The keystone harness is `scripts/validate_wasm_own.sh` (already on the
+  lane), not a wasm leg of a retired script.
+
+### 14.Q · The four de-risking questions, resolved against the shipped lane
+
+- **Q1 — the teko_rt→wasm port (was flagged "highest risk"): RESOLVED — there is NO port; it is off
+  the critical path entirely.** `teko_rt.c`/`.h` are never compiled to, linked into, or imported by a
+  wasm module. Its host dependencies (`mmap`/`sbrk` arena, `write`/`read`, `exit`, `clock`, libc,
+  threads) are all IRRELEVANT to the wasm path because the wasm backend **re-implements the exact
+  subset the corpus needs as synthesized wasm**, not as ported C: arena/rodata = the module's own
+  linear memory (a fixed `mem_min_pages` reserve today; `memory.grow` + real `#arena_size` sizing is
+  #453, NOT a C1-8 blocker for the exit/print corpus); `exit` = `tk_exit`→`proc_exit` import; `write`
+  = the `fd_write` trampolines; `clock`/`read`/threads = never lowered, so structurally unreachable
+  (the §7 capability firewall: no import ⇒ no capability). The **smallest working subset** for the
+  exit-code + stdout corpus is therefore exactly {`proc_exit`, one `fd_write` trampoline family, the
+  linear-memory scratch+arena reserve, the synthesized `_start`} — and it is **already built and
+  differentially green** (C1-6/C1-7). **Load-bearing (must keep working):** those synthesized
+  trampolines + the linear-memory layout. **Scoped honest-stops (already NAMED, M.3):** `C1-globals`
+  (top-level `LGlobal` data, `stackify.tks:4459`), `C1-i128`/`C1-f16`/`C1-simd`, `C1-wasm64-scope`
+  (the alloca-free/rodata-free/`Ptr`-signature-free wasm64 subset), and browser `fs`/`process`. None
+  of these is exercised by the C1-8 keystone corpus.
+- **Q2 — the wasm-ld link (§11.4): RESOLVED — `wasm-ld` is NOT in the path at all.** `objfile_wasm`
+  emits a FINAL module (imports + synthesized `_start`), never a relocatable object with a linking
+  section; the C1-1..C1-7 emit was always a single self-contained module, and C1-8 keeps it that way
+  (S-2). There is no object-file+linker step to reconcile — the emitted bytes ARE the runnable
+  artifact. wasm-ld/wasi-libc availability is therefore **NOT** a C1-8 dependency (this removes the
+  §13-implied wasi-libc-in-CI blocker entirely).
+- **Q3 — the differential corpus: the keystone uses `validate_wasm_own.sh`'s OWN corpus, a
+  purpose-built superset of the shared `own_*` fixtures, NOT `diff_c_own.sh`'s verbatim.** Today
+  `validate_wasm_own`'s `CORPUS` = the six shared exit/arith/control fixtures `own_exit_zero`/
+  `own_exit_code`/`own_arith_exit`/`own_sub_exit`/`own_if_exit`/`own_match_exit` (the SAME dirs
+  `diff_c_own` compares C-vs-own-native, giving the transitive chain) **plus** wasm-specific proof
+  fixtures `wasm_print_exit` (a string LITERAL, dodging the `own_print_exit` interpolation N2 gap that
+  is a KNOWN_STOP in `diff_c_own`), `wasm_panic_hook` (`trap`-kind), `wasm_defer_arm_scope`
+  (`print`-kind stdout), and `wasm64_arith_exit` (`wasm64-wasi` target). It deliberately does NOT
+  reuse `diff_c_own`'s corpus verbatim (it swaps the print fixture and adds trap/defer/wasm64). **The
+  gap C1-8b closes:** the §12.2 FIX-1/FIX-2 *engine-level* loop/control fixtures (`wasm_if_both_diverge`,
+  `wasm_loop_count`, `wasm_break_in_if`, `wasm_labeled_break`, `wasm_continue_step`) are proven today
+  only at the GOLDEN byte level (`stackify_test.tkt`) and at C-vs-own-**native** level (`diff_c_own`
+  over the `loop_*` dirs) — NOT executing under a real wasm engine. The keystone must prove FIX-1/FIX-2
+  run correctly under wasmtime == C-native, so C1-8b adds those five as `wasm_*` exit-code fixtures to
+  `validate_wasm_own`'s corpus.
+- **Q4 — FIXPOINT preservation: the default (C) path is byte-identical because the wasm arm is
+  UNREACHABLE without the env seam.** `emit_native` is called ONLY inside the
+  `if native_backend_selected()` gate (`project.tks:686`, `native_backend_selected` = `TEKO_BACKEND
+  == "native"`, `:719`); the wasm arm is nested one level deeper, inside `emit_native`'s
+  `match native_target()` and only for `TEKO_TARGET ∈ {wasm32-wasi, wasm64-wasi, wasm32-browser}`
+  (`:865-872`). With NO env set (the compiler compiling itself, and every default user build),
+  `native_backend_selected()` is `false`, `emit_native` is never entered, and not one byte of the C
+  codegen path changes — so **gen2 == gen3 holds by construction** (the fixpoint gate in
+  `release.yml`/`sanitizers.yml` is untouched). This is the S-1 dividend: because the seam is the
+  pre-existing `TEKO_BACKEND=native` + `TEKO_TARGET` and NOT a new env var, C1-8 adds **zero** new
+  branches to the default path.
+
+### 14.1 The ordered sub-crumb sequence (each independently gate-able)
+
+```
+C1-7 (done) ─▶ C1-8a ─▶ C1-8b ─▶ C1-8c ─▶ C1-8d   [#389 CLOSES]
+               doc/     engine    CI wasm   fixpoint +
+               decision loop/ctl  gate +    full-gate
+               record   fixtures  wasmtime  keystone
+               (this §) (+corpus) provision ritual + close
+```
+
+- **C1-8a · doc + decision record (design-only; this §14).** Ratify S-1/S-2/S-3 in the doc so the
+  code and the spec agree before the gate lands. **Files touched:** `docs/design/backend-wasm.md`
+  (this section). **Seams/signatures added:** none (design-only). **Regression fixtures:** none.
+  **Ritual point:** doc review on the design PR; no gate. **Serial, FIRST** (it is the map the rest
+  follow; it also honestly records that C1-8 ships no compiler code).
+
+- **C1-8b · the FIX-1/FIX-2 engine-level differential fixtures (+ corpus wiring).** Add the five
+  §12.2 control-flow fixtures as `examples/regressions/wasm_*` projects, each a tiny exit-code program
+  whose value the stackifier's FIX-1 (labeling) / FIX-2 (natural-loop extent) must reconstruct
+  correctly to produce a valid module, then append them (with `KIND=exit`, `TARGET=wasm32-wasi`) to
+  `validate_wasm_own.sh`'s parallel `CORPUS`/`KIND`/`TARGET` arrays. **Files touched:**
+  `examples/regressions/wasm_if_both_diverge/`, `.../wasm_loop_count/`, `.../wasm_break_in_if/`,
+  `.../wasm_labeled_break/`, `.../wasm_continue_step/` (each `<name>.tkp` + `src/main.tks`);
+  `scripts/validate_wasm_own.sh` (the three arrays only — no logic change). **Seams/signatures
+  added:** none in Teko (product code already lowers these shapes; these are fixtures). The fixture
+  program shapes (copy verbatim; each is a whole `src/main.tks` — a trailing loose `exit(n)` IS the
+  program's exit code):
+
+```teko
+/**
+ * wasm_if_both_diverge — FIX-1(b) proof: an `if`/`else` whose BOTH arms diverge
+ * (each `exit`s) has no merge block; the stackifier must emit inline `then`/`else`
+ * arms with NO arm label (a naive "≥2 forward preds" rule mislabels the arm blocks
+ * and produces an invalid module). Exit code is the taken arm's constant, compared
+ * own-wasm(wasmtime) == C-native.
+ *
+ * @return never  the process exits from whichever arm runs (k is a compile-time 1)
+ */
+let k = 1
+if k > 0 { exit(1) } else { exit(2) }
+```
+
+```teko
+/**
+ * wasm_loop_count — FIX-2 proof: a counting `loop` entered UNCONDITIONALLY. The
+ * loop's `end` must close after the NATURAL-LOOP BODY, not the (larger) dominance
+ * subtree; otherwise the exit block is swallowed inside the `loop` and the module
+ * is mis-scoped. `sum(0..4) = 6`, compared own-wasm(wasmtime) == C-native.
+ *
+ * @return never  exits with the accumulated sum
+ */
+mut s = 0
+loop mut i in 0..4 { s = s + i }
+exit(s)
+```
+
+```teko
+/**
+ * wasm_break_in_if — FIX-1(c) proof: a `break` nested inside an `if` inside a
+ * `loop`. The single-predecessor loop-exit target must be labeled UNCONDITIONALLY
+ * (its break edge is a `br` out of the loop scope, never a fall-through), so the
+ * `br $break` names a live label. Exits with the counter value at break.
+ *
+ * @return never  exits with the loop counter captured at the break
+ */
+mut r = 0
+loop {
+    if r >= 3 { break }
+    r = r + 1
+}
+exit(r)
+```
+
+```teko
+/**
+ * wasm_labeled_break — #520 proof: a labeled `break OUTER` from an inner loop
+ * resolves to a MULTI-LEVEL `br N` at the correct scope depth (outer loop's
+ * wrapping `block`). Exits with the value set before the labeled break.
+ *
+ * @return never  exits with the sentinel set just before `break OUTER`
+ */
+mut r = 0
+OUTER: loop {
+    loop {
+        r = 7
+        break OUTER
+    }
+}
+exit(r)
+```
+
+```teko
+/**
+ * wasm_continue_step — §11.5 proof: the extensible-loop `continue` must RUN THE
+ * STEP (the desugar places the guarded step at the body top); a `br $cont` that
+ * lands at the loop head advances the counter for free. Skips odd i, sums evens
+ * of 0..6 → 0+2+4 = 6. A desugar regression (step not run on continue) would
+ * infinite-loop or mis-sum — the ONLY thing that catches it (backends are
+ * invisible to this property).
+ *
+ * @return never  exits with the sum of the even counters
+ */
+mut s = 0
+loop mut i in 0..6 {
+    if i % 2 == 1 { continue }
+    s = s + i
+}
+exit(s)
+```
+
+  **Regression fixtures → expected exit (own-wasm(wasmtime) == C-native, both legs):**
+  `wasm_if_both_diverge`→`1`; `wasm_loop_count`→`6`; `wasm_break_in_if`→`3`; `wasm_labeled_break`→`7`;
+  `wasm_continue_step`→`6`. Each also passes `wasm-validate` (structural, honest-skipped when WABT
+  absent). **Ritual point:** `scripts/validate_wasm_own.sh` green LOCALLY over the broadened corpus
+  with wasmtime present — this is the gate that proves the two correctness fixes execute on a real
+  engine. **Serial after C1-8a** (touches the corpus arrays the next crumb gates in CI).
+
+- **C1-8c · the CI wasm differential leg (THE KEYSTONE RITUAL POINT).** Add a job/step to
+  `.github/workflows/native.yml` (the Linux x86-64 `gen1 checks` lane, beside the existing
+  `C-vs-own differential` step at `:301`) that **provisions wasmtime** (pinned official tarball) **and
+  WABT** (`wabt` via apt, for `wasm-validate`), builds gen1 (the PR compiler, which carries
+  `emit_native_wasm`), and runs `./scripts/validate_wasm_own.sh`. The harness already HONEST-SKIPS
+  (exit 0, named reason) per-tool when a tool is absent (`validate_wasm_own.sh:55-69`), and already
+  keys on `emit_native_wasm`'s exclusive `"(own backend)"` marker + the on-disk `.wasm` (its F1(a)
+  blind-spot guard), so the CI step is a thin provision-then-invoke — mirroring `diff_c_own`'s
+  host-gated invocation and A4's macOS-only differential skip. **Files touched:**
+  `.github/workflows/native.yml` (one install step + one run step; optionally the same in
+  `sanitizers.yml`). **Seams/signatures added:** none. **Regression fixtures:** the whole
+  `validate_wasm_own` corpus (from C1-8b) now runs in CI. **Ritual point:** THIS IS THE KEYSTONE — the
+  wasm differential leg green in CI. **Serial after C1-8b**, and **blocked on the wasmtime/WABT
+  provisioning decision** (§14.2).
+
+- **C1-8d · fixpoint + full-gate keystone ritual + close #389 (reached-pending-close).** Confirm the whole ritual on the lane:
+  the native test gate (#265, `run_gate_native`) green, `diff_c_own.sh` green (C-native == own-native,
+  register targets), the new `validate_wasm_own` wasm leg green (own-wasm == C-native), and
+  **fixpoint gen2 == gen3 byte-identical** (Q4 — the wasm arm is unreachable on the default path, so
+  this is preserved by construction; re-run the `release.yml`/`sanitizers.yml` fixpoint gate to prove
+  it). Verify **100% coverage on C1-8's new code** — which is fixtures + CI YAML + this doc, carrying
+  NO new Teko product lines, so the obligation is discharged by the already-covered `emit_native_wasm`/
+  `wasm_assemble_program` landed under C1-5/6/7 (call this out in the PR). **Files touched:** none (a
+  verification crumb; a CHANGELOG/issue-close note only). **Ritual point:** the FULL gate — native
+  gate + both differentials + fixpoint — green; **#389 CLOSES here.** **Serial, LAST.**
+
+### 14.2 Named blocker + design-ahead
+
+- **BLOCKER B-1 · wasmtime (and WABT) availability in CI.** Today NO workflow provisions wasmtime or
+  `wasm-validate` (audited: `native.yml`/`sanitizers.yml`/`release.yml` install only cc/clang/zig/
+  qemu/riscv-gcc). Wired as-is, C1-8c's leg would HONEST-SKIP (exit 0) forever and the keystone would
+  close #389 on a *vacuously* green leg — not a real gate. **What unblocks it:** add a wasmtime install
+  step (the official release tarball is deterministic and offline-cacheable, the same pattern
+  `native.yml`'s zig step already uses; WABT via `apt-get install -y wabt`). This is a genuine external
+  dependency but **resolvable, not a HALT** — it is the load-bearing decision of C1-8c. **Design-ahead
+  (everything that does NOT need B-1 is deliverable now):** C1-8a (this doc), C1-8b (the fixtures +
+  corpus arrays — they gate on a *local* wasmtime, which the implementer has), and the *authoring* of
+  C1-8c's YAML against `validate_wasm_own.sh`'s already-frozen interface are all buildable today; only
+  C1-8c's *green CI run* waits on the provisioning step actually fetching wasmtime. **Fallback if CI
+  cannot fetch wasmtime** (proxy/network): run the wasm leg in the release lane or a dedicated runner
+  that has it, and keep the honest-skip with its named reason in the default lane so the gate is
+  transparently deferred, never silently faked (M.3).
+
+### 14.3 Dispatch order + parallelism
+
+- **Order:** `C1-8a → C1-8b → C1-8c → C1-8d`, essentially **serial** — b feeds c feeds d, and a is the
+  map they follow.
+- **Parallelism:** the only safe overlap is authoring b and c at once (disjoint files:
+  `examples/regressions/wasm_*` + `scripts/validate_wasm_own.sh` arrays for b, `.github/workflows/*`
+  for c), since c's YAML can be written against `validate_wasm_own`'s frozen interface before b's
+  fixtures are green — but c cannot be MERGED/validated until b's corpus passes locally, so the
+  effective merge order stays b-before-c.
+- **No serial-core contention:** unusually for a keystone, **C1-8 touches NO `.tks` compiler code** (the
+  emitter, the dispatch arm, and the harness all landed in C1-5/6/7). There is no core-file serial
+  constraint at all — the entire crumb is fixtures + one CI step + doc + a verification pass. This is
+  the direct, honest consequence of the §14.0 finding, and it is why C1-8 is the lowest-risk crumb of
+  the whole C1 lane despite being the one that closes #389.

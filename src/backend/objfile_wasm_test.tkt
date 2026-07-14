@@ -1,0 +1,625 @@
+/**
+ * wasm_bytes_eq — true iff `a` and `b` have the same length and equal bytes at
+ * every index (the golden-byte comparison every test below builds on).
+ *
+ * @param []byte a  the first buffer
+ * @param []byte b  the second buffer
+ * @return bool  true iff `a` and `b` are byte-for-byte identical
+ */
+fn wasm_bytes_eq(a: []byte, b: []byte) -> bool {
+    if a.len != b.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * wt_preamble_bytes — the fixed 8-byte wasm module preamble, reproduced here
+ * (independent of `wasm_preamble`) as the ground truth every module golden
+ * starts with.
+ *
+ * @return []byte  the 8-byte preamble
+ */
+fn wt_preamble_bytes() -> []byte {
+    [0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte]
+}
+
+/**
+ * wt_void_functype — the `() -> ()` function signature (no params, no
+ * results), the only shape the fixtures below need.
+ *
+ * @return WasmFuncType  the void/void signature
+ */
+fn wt_void_functype() -> WasmFuncType {
+    WasmFuncType { params = teko::list::empty(); results = teko::list::empty() }
+}
+
+/**
+ * wt_empty_module — a `WasmModule` with every part empty: no types, imports,
+ * functions, data, memory, or exports. `emit_wasm` on this is just the
+ * preamble (every section-presence check is false).
+ *
+ * @return WasmModule  the all-empty module
+ */
+fn wt_empty_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_empty_main_module — the C1-1 keystone fixture: one `() -> ()` type, one
+ * function of that type whose body is just `end` (does nothing), exported as
+ * `"main"`. Matches `wat2wasm` on `(module (type (func)) (func (type 0))
+ * (export "main" (func 0)))` byte for byte.
+ *
+ * @return WasmModule  the empty-`main` module
+ */
+fn wt_empty_main_module() -> WasmModule {
+    WasmModule {
+        types = [wt_void_functype()]
+        imports = teko::list::empty()
+        funcs = [WasmFunc { type_index = 0 to u32; local_groups = teko::list::empty(); body = [0x0B to byte] }]
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        mem_is64 = false
+        exports = [WasmExport { name = "main"; kind = 0x00 to byte; index = 0 to u32 }]
+    }
+}
+
+/**
+ * wt_import_only_module — one `() -> ()` type and one import of it
+ * (`wasi_snapshot_preview1.proc_exit`), no defined functions. Matches
+ * `wat2wasm` on the equivalent `(import …)`-only module.
+ *
+ * @return WasmModule  the import-only module
+ */
+fn wt_import_only_module() -> WasmModule {
+    WasmModule {
+        types = [wt_void_functype()]
+        imports = [WasmImport { module = "wasi_snapshot_preview1"; field = "proc_exit"; type_index = 0 to u32 }]
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_memory_only_module — a module declaring one 1-page linear memory and
+ * nothing else. Matches `wat2wasm` on `(module (memory 1))`.
+ *
+ * @return WasmModule  the memory-only module
+ */
+fn wt_memory_only_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 1 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_memory64_only_module — `wt_memory_only_module`'s wasm64 twin (#389
+ * C1-7, `backend-wasm.md` §6): the SAME one-page memory, but `mem_is64 =
+ * true` — the memory-section `is64` limits flag bit distinguishes it.
+ *
+ * @return WasmModule  the memory64-only module
+ */
+fn wt_memory64_only_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 1 to u32
+        mem_is64 = true
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_data_segment_module — a 1-page memory plus one active data segment
+ * (`"hi"` at offset 0). Matches `wat2wasm` on `(module (memory 1) (data
+ * (i32.const 0) "hi"))`.
+ *
+ * @return WasmModule  the data-segment module
+ */
+fn wt_data_segment_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = [WasmDataSegment { offset = 0 to u32; bytes = [0x68 to byte, 0x69 to byte] }]
+        mem_min_pages = 1 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_narrow_msg_and_rodata_module — a 1-page memory plus TWO active data
+ * segments: the checked-narrow panic message (`wasm_narrow_msg_bytes`) at
+ * its own fixed offset (`wasm_narrow_msg_addr`), followed by a small rodata
+ * segment at offset `64` — the exact shape `wasm_assemble_program` emits
+ * for a wasm32 program whose narrow path is reachable (#389 C1-7 review
+ * finding #1).
+ *
+ * @return WasmModule  the two-segment module
+ */
+fn wt_narrow_msg_and_rodata_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = [WasmDataSegment { offset = wasm_narrow_msg_addr(); bytes = wasm_narrow_msg_bytes() }, WasmDataSegment { offset = 64 to u32; bytes = [0x68 to byte, 0x69 to byte] }]
+        mem_min_pages = 1 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_locals_func_module — one `() -> ()` type and one function of that type
+ * declaring two `i32` locals (a single run-length group) and an empty body,
+ * exported as `"f"`. Matches `wat2wasm` on `(func (local i32 i32))`.
+ *
+ * @return WasmModule  the two-i32-locals module
+ */
+fn wt_locals_func_module() -> WasmModule {
+    WasmModule {
+        types = [wt_void_functype()]
+        imports = teko::list::empty()
+        funcs = [WasmFunc { type_index = 0 to u32; local_groups = [WasmLocalGroup { count = 2 to u32; valtype = 0x7F to u8 }]; body = [0x0B to byte] }]
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        mem_is64 = false
+        exports = [WasmExport { name = "f"; kind = 0x00 to byte; index = 0 to u32 }]
+    }
+}
+
+/**
+ * wt_kitchen_sink_module — every C1-1 section present at once: one type, one
+ * import (`env.tk_exit`), one defined function calling it (function index 1,
+ * after the import at index 0), a 1-page memory, an export of the defined
+ * function as `"main"`, and a one-byte data segment. Proves the ascending
+ * section-id ordering (type/import/function/memory/export/code/data) across
+ * every implemented section at once. Matches `wat2wasm` on the equivalent
+ * hand-written `.wat`.
+ *
+ * @return WasmModule  the all-sections-present module
+ */
+fn wt_kitchen_sink_module() -> WasmModule {
+    WasmModule {
+        types = [wt_void_functype()]
+        imports = [WasmImport { module = "env"; field = "tk_exit"; type_index = 0 to u32 }]
+        funcs = [WasmFunc { type_index = 0 to u32; local_groups = teko::list::empty(); body = [0x10 to byte, 0x00 to byte, 0x0B to byte] }]
+        globals = teko::list::empty()
+        data = [WasmDataSegment { offset = 0 to u32; bytes = [0x78 to byte] }]
+        mem_min_pages = 1 to u32
+        mem_is64 = false
+        exports = [WasmExport { name = "main"; kind = 0x00 to byte; index = 1 to u32 }]
+    }
+}
+
+/**
+ * wt_sp_global_module — a module declaring one mutable `i32` global
+ * initialized to `1024` (the shadow-stack `SP` shape, `backend-c1-wasm.md`
+ * §6.1). Matches `wat2wasm` on `(module (global (mut i32) (i32.const
+ * 1024)))`.
+ *
+ * @return WasmModule  the SP-global-only module
+ */
+fn wt_sp_global_module() -> WasmModule {
+    WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = [WasmGlobal { valtype = 0x7F to u8; mutable = true; init = 1024 to i64 }]
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+/**
+ * wt_wasi_import_module — a module carrying exactly `wasm_wasi_import_set`'s
+ * own two interned types + two imports and nothing else. Matches `wat2wasm`
+ * on `(module (import "wasi_snapshot_preview1" "proc_exit" (func (param
+ * i32))) (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32
+ * i32 i32) (result i32))))`.
+ *
+ * @return WasmModule  the WASI-import-set-only module
+ */
+fn wt_wasi_import_module() -> WasmModule {
+    let wasi = wasm_wasi_import_set()
+    WasmModule {
+        types = wasi.types
+        imports = wasi.imports
+        funcs = teko::list::empty()
+        globals = teko::list::empty()
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+}
+
+#test
+/**
+ * uleb128_terminates_without_continuation_at_the_7bit_boundary — `0` and `127`
+ * (the largest value that fits one ULEB128 group) both emit a single byte
+ * with no continuation bit set, covering the loop's immediate-termination arm.
+ *
+ * @return void
+ */
+fn uleb128_terminates_without_continuation_at_the_7bit_boundary() {
+    teko::assert::is_true(wasm_bytes_eq(emit_uleb128(teko::list::empty(), 0 to u64), [0x00 to byte]))
+    teko::assert::is_true(wasm_bytes_eq(emit_uleb128(teko::list::empty(), 127 to u64), [0x7F to byte]))
+}
+
+#test
+/**
+ * uleb128_continuation_boundary_and_doc_golden — `128` (the smallest value
+ * needing a second group) covers the loop's continuation arm; `624485` is the
+ * design doc's worked golden (`E5 8E 26`), covering a third group.
+ *
+ * @return void
+ */
+fn uleb128_continuation_boundary_and_doc_golden() {
+    teko::assert::is_true(wasm_bytes_eq(emit_uleb128(teko::list::empty(), 128 to u64), [0x80 to byte, 0x01 to byte]))
+    teko::assert::is_true(wasm_bytes_eq(emit_uleb128(teko::list::empty(), 624485 to u64), [0xE5 to byte, 0x8E to byte, 0x26 to byte]))
+}
+
+/**
+ * wt_u64_max — `u64::MAX` (`0xFFFFFFFFFFFFFFFF`), built from small shifts and
+ * an underflow-free subtraction rather than written as a single hex literal:
+ * a bare integer literal outside `i64`'s range defaults to `i64` at its own
+ * leaf (`checker::type_number`) before a surrounding `to u64` ever applies,
+ * which mis-evaluates at both engines (a REPORTED adjacent finding, out of
+ * C1-1's scope) — so the extreme-width golden below builds its operand
+ * arithmetically instead of hitting that gap.
+ *
+ * @return u64  `18446744073709551615`
+ */
+fn wt_u64_max() -> u64 {
+    let top_bit: u64 = (1 to u64) << (63 to u64)
+    top_bit | (top_bit - (1 to u64))
+}
+
+#test
+/**
+ * uleb128_u64_max_is_ten_full_groups — `u64::MAX` needs the maximum ten
+ * ULEB128 groups (nine continuation bytes then a final `0x01`), proving the
+ * loop terminates at the extreme width.
+ *
+ * @return void
+ */
+fn uleb128_u64_max_is_ten_full_groups() {
+    let got = emit_uleb128(teko::list::empty(), wt_u64_max())
+    let want = [0xFF to byte, 0xFF to byte, 0xFF to byte, 0xFF to byte, 0xFF to byte, 0xFF to byte, 0xFF to byte, 0xFF to byte, 0xFF to byte, 0x01 to byte]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * sleb128_terminates_on_a_matching_sign_bit_immediately — `0`/`63` (bit 6
+ * already clear) and `-1` (bit 6 already set) each terminate in one group,
+ * covering both immediate-termination arms (`done_nonneg`, `done_neg`).
+ *
+ * @return void
+ */
+fn sleb128_terminates_on_a_matching_sign_bit_immediately() {
+    teko::assert::is_true(wasm_bytes_eq(emit_sleb128(teko::list::empty(), 0 to i64), [0x00 to byte]))
+    teko::assert::is_true(wasm_bytes_eq(emit_sleb128(teko::list::empty(), 63 to i64), [0x3F to byte]))
+    teko::assert::is_true(wasm_bytes_eq(emit_sleb128(teko::list::empty(), -1 to i64), [0x7F to byte]))
+}
+
+#test
+/**
+ * sleb128_continuation_boundary_and_doc_golden — `64` (a non-negative value
+ * whose 7th bit would be mistaken for a sign bit) needs a continuation group
+ * before terminating; `-123456` is the design doc's worked golden (`C0 BB
+ * 78`), continuing twice before terminating on the negative arm.
+ *
+ * @return void
+ */
+fn sleb128_continuation_boundary_and_doc_golden() {
+    teko::assert::is_true(wasm_bytes_eq(emit_sleb128(teko::list::empty(), 64 to i64), [0xC0 to byte, 0x00 to byte]))
+    let got = emit_sleb128(teko::list::empty(), -123456 to i64)
+    teko::assert::is_true(wasm_bytes_eq(got, [0xC0 to byte, 0xBB to byte, 0x78 to byte]))
+}
+
+#test
+/**
+ * leb128_functions_extend_rather_than_replace_buf — both `emit_uleb128` and
+ * `emit_sleb128` append to a non-empty `buf` rather than discarding it.
+ *
+ * @return void
+ */
+fn leb128_functions_extend_rather_than_replace_buf() {
+    let prefix = [0xAA to byte]
+    teko::assert::is_true(wasm_bytes_eq(emit_uleb128(prefix, 1 to u64), [0xAA to byte, 0x01 to byte]))
+    teko::assert::is_true(wasm_bytes_eq(emit_sleb128(prefix, 1 to i64), [0xAA to byte, 0x01 to byte]))
+}
+
+#test
+/**
+ * empty_module_is_just_the_preamble — a `WasmModule` with every part empty
+ * emits only the 8-byte preamble: every section-presence branch in
+ * `emit_wasm` takes its false arm.
+ *
+ * @return void
+ */
+fn empty_module_is_just_the_preamble() {
+    teko::assert::is_true(wasm_bytes_eq(emit_wasm(wt_empty_module()), wt_preamble_bytes()))
+}
+
+#test
+/**
+ * empty_main_module_matches_wat2wasm_reference — the C1-1 keystone: the
+ * preamble plus the type/function/export/code sections in ascending id
+ * order, byte-for-byte identical to `wat2wasm`'s output for the same module
+ * (`wasm-validate`d in the PR's local verification).
+ *
+ * @return void
+ */
+fn empty_main_module_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_empty_main_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x01 to byte, 0x04 to byte, 0x01 to byte, 0x60 to byte, 0x00 to byte, 0x00 to byte, 0x03 to byte, 0x02 to byte,
+        0x01 to byte, 0x00 to byte, 0x07 to byte, 0x08 to byte, 0x01 to byte, 0x04 to byte, 0x6D to byte, 0x61 to byte,
+        0x69 to byte, 0x6E to byte, 0x00 to byte, 0x00 to byte, 0x0A to byte, 0x04 to byte, 0x01 to byte, 0x02 to byte,
+        0x00 to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * import_section_matches_wat2wasm_reference — a type-plus-import-only module
+ * (the `kind=func` import shape), byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn import_section_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_import_only_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x01 to byte, 0x04 to byte, 0x01 to byte, 0x60 to byte, 0x00 to byte, 0x00 to byte, 0x02 to byte, 0x24 to byte,
+        0x01 to byte, 0x16 to byte, 0x77 to byte, 0x61 to byte, 0x73 to byte, 0x69 to byte, 0x5F to byte, 0x73 to byte,
+        0x6E to byte, 0x61 to byte, 0x70 to byte, 0x73 to byte, 0x68 to byte, 0x6F to byte, 0x74 to byte, 0x5F to byte,
+        0x70 to byte, 0x72 to byte, 0x65 to byte, 0x76 to byte, 0x69 to byte, 0x65 to byte, 0x77 to byte, 0x31 to byte,
+        0x09 to byte, 0x70 to byte, 0x72 to byte, 0x6F to byte, 0x63 to byte, 0x5F to byte, 0x65 to byte, 0x78 to byte,
+        0x69 to byte, 0x74 to byte, 0x00 to byte, 0x00 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * memory_section_matches_wat2wasm_reference — a memory-only module (the
+ * limits-with-no-max shape), byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn memory_section_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_memory_only_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x05 to byte, 0x03 to byte, 0x01 to byte, 0x00 to byte, 0x01 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * memory64_section_sets_the_is64_limits_flag — the wasm64 switch (#389
+ * C1-7, `backend-wasm.md` §6): the SAME one-page memory as `wt_memory_only_
+ * module`, but `mem_is64 = true` flips the limits flag byte from `0x00`
+ * (min-only, 32-bit) to `0x04` (min-only, `memory64`) — everything else
+ * (the memory count, the page count) is byte-identical.
+ *
+ * @return void
+ */
+fn memory64_section_sets_the_is64_limits_flag() {
+    let got = emit_wasm(wt_memory64_only_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x05 to byte, 0x03 to byte, 0x01 to byte, 0x04 to byte, 0x01 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * data_section_matches_wat2wasm_reference — a memory-plus-one-data-segment
+ * module (the active-segment `i32.const` offset-expression shape),
+ * byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn data_section_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_data_segment_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x05 to byte, 0x03 to byte, 0x01 to byte, 0x00 to byte, 0x01 to byte, 0x0B to byte, 0x08 to byte, 0x01 to byte,
+        0x00 to byte, 0x41 to byte, 0x00 to byte, 0x0B to byte, 0x02 to byte, 0x68 to byte, 0x69 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * narrow_msg_data_segment_matches_the_traced_golden — the checked-narrow
+ * panic message's own active data segment (offset `16`, `41 10 0B` init
+ * expr, ULEB128 length `42`, then its 42 raw ASCII bytes), followed by the
+ * rodata segment at offset `64` (`41 C0 00 0B` — `64`'s own SLEB128 form
+ * needs a continuation byte, `sleb128_continuation_boundary_and_doc_
+ * golden`'s same shape), byte-for-byte (#389 C1-7 review finding #1 —
+ * before this fix the message was never placed in linear memory at all, so
+ * a trap through `tk_panic_str` printed 42 NUL bytes instead).
+ *
+ * @return void
+ */
+fn narrow_msg_data_segment_matches_the_traced_golden() {
+    let got = emit_wasm(wt_narrow_msg_and_rodata_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x05 to byte, 0x03 to byte, 0x01 to byte, 0x00 to byte, 0x01 to byte,
+        0x0B to byte, 0x38 to byte, 0x02 to byte,
+        0x00 to byte, 0x41 to byte, 0x10 to byte, 0x0B to byte, 0x2A to byte,
+        0x77 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x33 to byte, 0x32 to byte, 0x3A to byte, 0x20 to byte,
+        0x70 to byte, 0x6F to byte, 0x69 to byte, 0x6E to byte, 0x74 to byte, 0x65 to byte, 0x72 to byte, 0x20 to byte,
+        0x61 to byte, 0x64 to byte, 0x64 to byte, 0x72 to byte, 0x65 to byte, 0x73 to byte, 0x73 to byte, 0x20 to byte,
+        0x6F to byte, 0x76 to byte, 0x65 to byte, 0x72 to byte, 0x66 to byte, 0x6C to byte, 0x6F to byte, 0x77 to byte,
+        0x20 to byte, 0x28 to byte, 0x3E to byte, 0x3D to byte, 0x20 to byte, 0x32 to byte, 0x5E to byte, 0x33 to byte,
+        0x32 to byte, 0x29 to byte,
+        0x00 to byte, 0x41 to byte, 0xC0 to byte, 0x00 to byte, 0x0B to byte, 0x02 to byte, 0x68 to byte, 0x69 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * code_entry_local_groups_match_wat2wasm_reference — a function with a
+ * two-`i32` local group (the run-length `(count, valtype)` code-entry local
+ * declaration shape), byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn code_entry_local_groups_match_wat2wasm_reference() {
+    let got = emit_wasm(wt_locals_func_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x01 to byte, 0x04 to byte, 0x01 to byte, 0x60 to byte, 0x00 to byte, 0x00 to byte, 0x03 to byte, 0x02 to byte,
+        0x01 to byte, 0x00 to byte, 0x07 to byte, 0x05 to byte, 0x01 to byte, 0x01 to byte, 0x66 to byte, 0x00 to byte,
+        0x00 to byte, 0x0A to byte, 0x06 to byte, 0x01 to byte, 0x04 to byte, 0x01 to byte, 0x02 to byte, 0x7F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * every_section_together_matches_wat2wasm_reference — the kitchen-sink
+ * module exercises every C1-1 section (type/import/function/memory/export/
+ * code/data) at once, proving the ascending section-id framing order,
+ * byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn every_section_together_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_kitchen_sink_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x01 to byte, 0x04 to byte, 0x01 to byte, 0x60 to byte, 0x00 to byte, 0x00 to byte, 0x02 to byte, 0x0F to byte,
+        0x01 to byte, 0x03 to byte, 0x65 to byte, 0x6E to byte, 0x76 to byte, 0x07 to byte, 0x74 to byte, 0x6B to byte,
+        0x5F to byte, 0x65 to byte, 0x78 to byte, 0x69 to byte, 0x74 to byte, 0x00 to byte, 0x00 to byte, 0x03 to byte,
+        0x02 to byte, 0x01 to byte, 0x00 to byte, 0x05 to byte, 0x03 to byte, 0x01 to byte, 0x00 to byte, 0x01 to byte,
+        0x07 to byte, 0x08 to byte, 0x01 to byte, 0x04 to byte, 0x6D to byte, 0x61 to byte, 0x69 to byte, 0x6E to byte,
+        0x00 to byte, 0x01 to byte, 0x0A to byte, 0x06 to byte, 0x01 to byte, 0x04 to byte, 0x00 to byte, 0x10 to byte,
+        0x00 to byte, 0x0B to byte, 0x0B to byte, 0x07 to byte, 0x01 to byte, 0x00 to byte, 0x41 to byte, 0x00 to byte,
+        0x0B to byte, 0x01 to byte, 0x78 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * global_section_matches_wat2wasm_reference — a single mutable `i32` global
+ * initialized to `1024` (the shadow-stack `SP` shape), byte-for-byte
+ * identical to `wat2wasm` (`06 07 01 7F 01 41 80 08 0B`).
+ *
+ * @return void
+ */
+fn global_section_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_sp_global_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x06 to byte, 0x07 to byte, 0x01 to byte, 0x7F to byte, 0x01 to byte, 0x41 to byte, 0x80 to byte, 0x08 to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * global_section_const_global_clears_the_mutable_flag — a non-mutable
+ * global emits the `0x00` (const) mutability byte instead of `0x01`,
+ * covering `wasm_append_global`'s other arm.
+ *
+ * @return void
+ */
+fn global_section_const_global_clears_the_mutable_flag() {
+    let m = WasmModule {
+        types = teko::list::empty()
+        imports = teko::list::empty()
+        funcs = teko::list::empty()
+        globals = [WasmGlobal { valtype = 0x7F to u8; mutable = false; init = 0 to i64 }]
+        data = teko::list::empty()
+        mem_min_pages = 0 to u32
+        mem_is64 = false
+        exports = teko::list::empty()
+    }
+    let got = emit_wasm(m)
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x06 to byte, 0x06 to byte, 0x01 to byte, 0x7F to byte, 0x00 to byte, 0x41 to byte, 0x00 to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+}
+
+#test
+/**
+ * wasi_import_set_matches_wat2wasm_reference — `wasm_wasi_import_set`'s own
+ * two types + two imports, byte-for-byte identical to `wat2wasm` on the
+ * equivalent hand-written `.wat` (§6.2's `proc_exit`/`fd_write` shapes).
+ *
+ * @return void
+ */
+fn wasi_import_set_matches_wat2wasm_reference() {
+    let got = emit_wasm(wt_wasi_import_module())
+    let want = [
+        0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte, 0x01 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x01 to byte, 0x0D to byte, 0x02 to byte, 0x60 to byte, 0x01 to byte, 0x7F to byte, 0x00 to byte, 0x60 to byte,
+        0x04 to byte, 0x7F to byte, 0x7F to byte, 0x7F to byte, 0x7F to byte, 0x01 to byte, 0x7F to byte, 0x02 to byte,
+        0x46 to byte, 0x02 to byte, 0x16 to byte, 0x77 to byte, 0x61 to byte, 0x73 to byte, 0x69 to byte, 0x5F to byte,
+        0x73 to byte, 0x6E to byte, 0x61 to byte, 0x70 to byte, 0x73 to byte, 0x68 to byte, 0x6F to byte, 0x74 to byte,
+        0x5F to byte, 0x70 to byte, 0x72 to byte, 0x65 to byte, 0x76 to byte, 0x69 to byte, 0x65 to byte, 0x77 to byte,
+        0x31 to byte, 0x09 to byte, 0x70 to byte, 0x72 to byte, 0x6F to byte, 0x63 to byte, 0x5F to byte, 0x65 to byte,
+        0x78 to byte, 0x69 to byte, 0x74 to byte, 0x00 to byte, 0x00 to byte, 0x16 to byte, 0x77 to byte, 0x61 to byte,
+        0x73 to byte, 0x69 to byte, 0x5F to byte, 0x73 to byte, 0x6E to byte, 0x61 to byte, 0x70 to byte, 0x73 to byte,
+        0x68 to byte, 0x6F to byte, 0x74 to byte, 0x5F to byte, 0x70 to byte, 0x72 to byte, 0x65 to byte, 0x76 to byte,
+        0x69 to byte, 0x65 to byte, 0x77 to byte, 0x31 to byte, 0x08 to byte, 0x66 to byte, 0x64 to byte, 0x5F to byte,
+        0x77 to byte, 0x72 to byte, 0x69 to byte, 0x74 to byte, 0x65 to byte, 0x00 to byte, 0x01 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(got, want))
+    teko::assert::is_true(wt_wasi_import_module().imports[0].type_index == wasm_wasi_import_set().proc_exit_index)
+    teko::assert::is_true(wasm_wasi_import_set().fd_write_index == (1 to u32))
+}

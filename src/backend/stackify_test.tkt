@@ -1,0 +1,3564 @@
+use teko::lir
+
+/**
+ * sft_ctx0 — a fresh `StackifyCtx` with an empty body, no VRegs recorded,
+ * and no shadow-stack frame (the fixture every lowering-function test
+ * starts from).
+ *
+ * @return StackifyCtx  the empty context
+ */
+fn sft_ctx0() -> StackifyCtx {
+    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = 0 to u32; has_frame = false; frame_base = 0 to u32; slots = wst_empty(); elide = et_empty(); pending = teko::list::empty() }
+}
+
+/**
+ * sft_vt_ok — unwrap a `wasm_valtype`/similar `u8 | error` result, defaulting
+ * to `0` (a valtype byte no real case produces) on the error arm so an
+ * unexpected honest-stop fails the caller's equality assertion instead of
+ * the test silently passing.
+ *
+ * @param u8 | error r  the result to unwrap
+ * @return u8  the wrapped valtype, or `0` on error
+ */
+fn sft_vt_ok(r: u8 | error) -> u8 {
+    match r {
+        u8 as v => v
+        error => 0 to u8
+    }
+}
+
+/**
+ * sft_mem_ok — unwrap a `wasm_mem_op` result, defaulting every field to `0`
+ * on the error arm (mirrors `sft_vt_ok`'s fail-by-mismatch design).
+ *
+ * @param WasmMemOp | error r  the result to unwrap
+ * @return WasmMemOp  the wrapped memory-op shape, or an all-zero placeholder
+ */
+fn sft_mem_ok(r: WasmMemOp | error) -> WasmMemOp {
+    match r {
+        WasmMemOp as m => m
+        error => WasmMemOp { load_op = 0 to byte; store_op = 0 to byte; align = 0 to u32; valtype = 0 to u8 }
+    }
+}
+
+/**
+ * sft_i128_beyond_i64 — `2^64` as an i128, built from arithmetic (never a
+ * single huge literal — the same parser-range workaround
+ * `isel_arm64_test.tkt`'s `iat_i128` family avoids), the smallest value that
+ * overflows `fits_i64` and so triggers the `C1-i128` constant honest-stop.
+ *
+ * @return i128  `2^64`
+ */
+fn sft_i128_beyond_i64() -> i128 {
+    let half = 4294967296 to i128
+    half * half
+}
+
+#test
+/**
+ * sft_vt_ok_and_sft_mem_ok_default_on_error — the two unwrap helpers' own
+ * error arm, exercised directly rather than left as dead fixture code.
+ *
+ * @return void
+ */
+fn sft_vt_ok_and_sft_mem_ok_default_on_error() {
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I128, false)) == (0 to u8))
+    let m = sft_mem_ok(wasm_mem_op(lir::LType::I128))
+    teko::assert::is_true(m.load_op == (0 to byte) && m.store_op == (0 to byte) && m.align == (0 to u32) && m.valtype == (0 to u8))
+}
+
+#test
+/**
+ * wasm_valtype_maps_every_narrow_int_and_ptr_to_i32_on_wasm32 — `I8`/`I16`/
+ * `I32`/`Ptr` (`ptr64 = false`, the default) all collapse to the wasm `i32`
+ * valtype (`backend-c1-wasm.md` §1.1).
+ *
+ * @return void
+ */
+fn wasm_valtype_maps_every_narrow_int_and_ptr_to_i32_on_wasm32() {
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I8, false)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I16, false)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I32, false)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::Ptr, false)) == wasm_vt_i32())
+}
+
+#test
+/**
+ * wasm_valtype_ptr_follows_the_ptr64_switch — the wasm64 switch (#389 C1-7,
+ * `backend-wasm.md` §6): `Ptr` maps to `i32` when `ptr64 = false` (wasm32,
+ * re-asserted here) and `i64` when `ptr64 = true` (wasm64 — the uniform
+ * 64-bit `ptr<>` model needs no narrowing). Every OTHER machine class is
+ * `ptr64`-independent (I8/I16/I32/I64/F32/F64 never move between calls).
+ *
+ * @return void
+ */
+fn wasm_valtype_ptr_follows_the_ptr64_switch() {
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::Ptr, false)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::Ptr, true)) == wasm_vt_i64())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I32, true)) == wasm_vt_i32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I64, true)) == wasm_vt_i64())
+}
+
+#test
+/**
+ * wasm_valtype_maps_i64_to_i64 — the one machine class that maps to the wasm
+ * `i64` valtype.
+ *
+ * @return void
+ */
+fn wasm_valtype_maps_i64_to_i64() {
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::I64, false)) == wasm_vt_i64())
+}
+
+#test
+/**
+ * wasm_valtype_maps_f32_and_f64_directly — the two float machine classes map
+ * to their own-width wasm valtype.
+ *
+ * @return void
+ */
+fn wasm_valtype_maps_f32_and_f64_directly() {
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::F32, false)) == wasm_vt_f32())
+    teko::assert::is_true(sft_vt_ok(wasm_valtype(lir::LType::F64, false)) == wasm_vt_f64())
+}
+
+#test
+/**
+ * wasm_valtype_i128_f16_void_are_named_stops — the two design-named
+ * honest-stops (`C1-i128`, `C1-f16`) plus the internal `Void` arm.
+ *
+ * @return void
+ */
+fn wasm_valtype_i128_f16_void_are_named_stops() {
+    match wasm_valtype(lir::LType::I128, false) {
+        u8 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+    match wasm_valtype(lir::LType::F16, false) {
+        u8 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-f16")
+    }
+    match wasm_valtype(lir::LType::Void, false) {
+        u8 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "Void")
+    }
+}
+
+#test
+/**
+ * wasm_mem_op_i8_i16_zero_extend_into_the_i32_family — the two sub-32 loads
+ * zero-extend (`i32.load8_u`/`i32.load16_u`) at their natural alignment.
+ *
+ * @return void
+ */
+fn wasm_mem_op_i8_i16_zero_extend_into_the_i32_family() {
+    let i8m = sft_mem_ok(wasm_mem_op(lir::LType::I8))
+    teko::assert::is_true(i8m.load_op == (0x2D to byte) && i8m.store_op == (0x3A to byte) && i8m.align == (0 to u32) && i8m.valtype == wasm_vt_i32())
+    let i16m = sft_mem_ok(wasm_mem_op(lir::LType::I16))
+    teko::assert::is_true(i16m.load_op == (0x2F to byte) && i16m.store_op == (0x3B to byte) && i16m.align == (1 to u32) && i16m.valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * wasm_mem_op_i32_natural_access — `I32`'s own natural-width memory access.
+ *
+ * @return void
+ */
+fn wasm_mem_op_i32_natural_access() {
+    let i32m = sft_mem_ok(wasm_mem_op(lir::LType::I32))
+    teko::assert::is_true(i32m.load_op == (0x28 to byte) && i32m.store_op == (0x36 to byte) && i32m.align == (2 to u32) && i32m.valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * wasm_mem_op_ptr_is_always_the_i64_on_disk_shape — `Ptr`'s memory access is
+ * ALWAYS `i64` (8 bytes), matching `ltype_size(Ptr) = 8` (`lir.tks:465`) —
+ * REGARDLESS of `ptr64` (#389 C1-7, `backend-wasm.md` §6): the on-disk
+ * width is the uniform 64-bit `ptr<>` model; what differs between wasm32/
+ * wasm64 is the checked narrow / plain widen `stackify_load`/`stackify_
+ * store` apply at the REGISTER boundary on wasm32, vs the identity on
+ * wasm64 — `wasm_mem_op` itself makes no `ptr64` distinction.
+ *
+ * @return void
+ */
+fn wasm_mem_op_ptr_is_always_the_i64_on_disk_shape() {
+    let ptrm = sft_mem_ok(wasm_mem_op(lir::LType::Ptr))
+    teko::assert::is_true(ptrm.load_op == (0x29 to byte) && ptrm.store_op == (0x37 to byte) && ptrm.align == (3 to u32) && ptrm.valtype == wasm_vt_i64())
+}
+
+#test
+/**
+ * wasm_mem_op_i64_f32_f64_use_their_own_natural_access — the three
+ * naturally-8/4-byte-aligned machine classes each get their own load/store
+ * opcode pair.
+ *
+ * @return void
+ */
+fn wasm_mem_op_i64_f32_f64_use_their_own_natural_access() {
+    let i64m = sft_mem_ok(wasm_mem_op(lir::LType::I64))
+    teko::assert::is_true(i64m.load_op == (0x29 to byte) && i64m.store_op == (0x37 to byte) && i64m.align == (3 to u32) && i64m.valtype == wasm_vt_i64())
+    let f32m = sft_mem_ok(wasm_mem_op(lir::LType::F32))
+    teko::assert::is_true(f32m.load_op == (0x2A to byte) && f32m.store_op == (0x38 to byte) && f32m.align == (2 to u32) && f32m.valtype == wasm_vt_f32())
+    let f64m = sft_mem_ok(wasm_mem_op(lir::LType::F64))
+    teko::assert::is_true(f64m.load_op == (0x2B to byte) && f64m.store_op == (0x39 to byte) && f64m.align == (3 to u32) && f64m.valtype == wasm_vt_f64())
+}
+
+#test
+/**
+ * wasm_mem_op_i128_f16_void_are_named_stops — the same three honest-stop
+ * arms as `wasm_valtype`, reachable through the memory-access table too.
+ *
+ * @return void
+ */
+fn wasm_mem_op_i128_f16_void_are_named_stops() {
+    match wasm_mem_op(lir::LType::I128) {
+        WasmMemOp => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+    match wasm_mem_op(lir::LType::F16) {
+        WasmMemOp => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-f16")
+    }
+    match wasm_mem_op(lir::LType::Void) {
+        WasmMemOp => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "malformed")
+    }
+}
+
+#test
+/**
+ * stackify_const_int_forty_two_matches_design_doc_golden — the design doc's
+ * own worked example (§12.1): `LConstInt{42} -> i32.const 42` (`41 2A`).
+ *
+ * @return void
+ */
+fn stackify_const_int_forty_two_matches_design_doc_golden() {
+    let inst = lir::const_int_inst(0, 42 to i128, 0, 0)
+    let out = match stackify_const_int(sft_ctx0(), inst, lir::LConstInt { val = 42 to i128 }) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x41 to byte, 0x2A to byte, 0x21 to byte, 0x00 to byte]))
+    teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_const_int_beyond_i32_uses_the_i64_form — a value that does not
+ * fit i32 but fits i64 picks the wider `i64.const` opcode + wasm valtype.
+ *
+ * @return void
+ */
+fn stackify_const_int_beyond_i32_uses_the_i64_form() {
+    let val = 5000000000 to i128
+    let inst = lir::const_int_inst(1, val, 0, 0)
+    let out = match stackify_const_int(sft_ctx0(), inst, lir::LConstInt { val = val }) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x42 to byte, 0x80 to byte, 0xE4 to byte, 0x97 to byte, 0xD0 to byte, 0x12 to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(out.vtypes, 1) == wasm_vt_i64())
+}
+
+#test
+/**
+ * stackify_const_int_beyond_i64_is_the_c1_i128_stop — a value beyond the i64
+ * range names the `C1-i128` honest-stop rather than silently truncating.
+ *
+ * @return void
+ */
+fn stackify_const_int_beyond_i64_is_the_c1_i128_stop() {
+    let val = sft_i128_beyond_i64()
+    let inst = lir::const_int_inst(0, val, 0, 0)
+    match stackify_const_int(sft_ctx0(), inst, lir::LConstInt { val = val }) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * stackify_const_float_emits_raw_le_bits_for_one_point_zero — `f64.const`
+ * carries the RAW little-endian IEEE754 bit pattern, not LEB128
+ * (`1.0`'s bit pattern `0x3FF0000000000000`).
+ *
+ * @return void
+ */
+fn stackify_const_float_emits_raw_le_bits_for_one_point_zero() {
+    let bits = 0x3FF0000000000000 to u64
+    let inst = lir::const_float_inst(2, bits, 0, 0)
+    let out = stackify_const_float(sft_ctx0(), inst, lir::LConstFloat { bits = bits })
+    let want = [
+        0x44 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte, 0x00 to byte,
+        0x00 to byte, 0x00 to byte, 0xF0 to byte, 0x3F to byte, 0x21 to byte, 0x02 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(wvt_get(out.vtypes, 2) == wasm_vt_f64())
+}
+
+#test
+/**
+ * binop_info_integer_arithmetic_opcodes_by_width — the seven arithmetic
+ * `LBinOp` cases, narrow (`i32`) and wide (`i64`) forms.
+ *
+ * @return void
+ */
+fn binop_info_integer_arithmetic_opcodes_by_width() {
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IAdd, false).opcode == (0x6A to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IAdd, true).opcode == (0x7C to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ISub, false).opcode == (0x6B to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ISub, true).opcode == (0x7D to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IMul, false).opcode == (0x6C to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IMul, true).opcode == (0x7E to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IDivS, false).opcode == (0x6D to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IDivS, true).opcode == (0x7F to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IDivU, false).opcode == (0x6E to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IDivU, true).opcode == (0x80 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IRemS, false).opcode == (0x6F to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IRemS, true).opcode == (0x81 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IRemU, false).opcode == (0x70 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IRemU, true).opcode == (0x82 to byte))
+    teko::assert::is_true(!wasm_binop_info(lir::LBinOp::IAdd, false).is_cmp)
+}
+
+#test
+/**
+ * binop_info_integer_bitwise_and_shift_opcodes_by_width — the six
+ * bitwise/shift `LBinOp` cases, narrow and wide forms.
+ *
+ * @return void
+ */
+fn binop_info_integer_bitwise_and_shift_opcodes_by_width() {
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IAnd, false).opcode == (0x71 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IAnd, true).opcode == (0x83 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IOr, false).opcode == (0x72 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IOr, true).opcode == (0x84 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IXor, false).opcode == (0x73 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IXor, true).opcode == (0x85 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IShl, false).opcode == (0x74 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IShl, true).opcode == (0x86 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IShrS, false).opcode == (0x75 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IShrS, true).opcode == (0x87 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IShrU, false).opcode == (0x76 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::IShrU, true).opcode == (0x88 to byte))
+}
+
+#test
+/**
+ * binop_info_integer_compare_opcodes_are_i32_regardless_of_width — the ten
+ * integer-compare `LBinOp` cases, each classified `is_cmp`.
+ *
+ * @return void
+ */
+fn binop_info_integer_compare_opcodes_are_i32_regardless_of_width() {
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpEq, false).opcode == (0x46 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpEq, true).opcode == (0x51 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpNe, false).opcode == (0x47 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpNe, true).opcode == (0x52 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpLtS, false).opcode == (0x48 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpLtS, true).opcode == (0x53 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpLtU, false).opcode == (0x49 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpLtU, true).opcode == (0x54 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpLeS, false).opcode == (0x4C to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpLeS, true).opcode == (0x57 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpLeU, false).opcode == (0x4D to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpLeU, true).opcode == (0x58 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGtS, false).opcode == (0x4A to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGtS, true).opcode == (0x55 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGtU, false).opcode == (0x4B to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGtU, true).opcode == (0x56 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGeS, false).opcode == (0x4E to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGeS, true).opcode == (0x59 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGeU, false).opcode == (0x4F to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGeU, true).opcode == (0x5A to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpEq, false).is_cmp)
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::ICmpGeU, true).is_cmp)
+}
+
+#test
+/**
+ * binop_info_float_arithmetic_opcodes_by_width — the four float-arithmetic
+ * `LBinOp` cases, narrow (`f32`) and wide (`f64`) forms.
+ *
+ * @return void
+ */
+fn binop_info_float_arithmetic_opcodes_by_width() {
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FAdd, false).opcode == (0x92 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FAdd, true).opcode == (0xA0 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FSub, false).opcode == (0x93 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FSub, true).opcode == (0xA1 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FMul, false).opcode == (0x94 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FMul, true).opcode == (0xA2 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FDiv, false).opcode == (0x95 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FDiv, true).opcode == (0xA3 to byte))
+    teko::assert::is_true(!wasm_binop_info(lir::LBinOp::FAdd, false).is_cmp)
+}
+
+#test
+/**
+ * binop_info_float_compare_opcodes_are_i32_regardless_of_width — the six
+ * float-compare `LBinOp` cases, each classified `is_cmp`.
+ *
+ * @return void
+ */
+fn binop_info_float_compare_opcodes_are_i32_regardless_of_width() {
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpEq, false).opcode == (0x5B to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpEq, true).opcode == (0x61 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpNe, false).opcode == (0x5C to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpNe, true).opcode == (0x62 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpLt, false).opcode == (0x5D to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpLt, true).opcode == (0x63 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpLe, false).opcode == (0x5F to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpLe, true).opcode == (0x65 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpGt, false).opcode == (0x5E to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpGt, true).opcode == (0x64 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpGe, false).opcode == (0x60 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpGe, true).opcode == (0x66 to byte))
+    teko::assert::is_true(wasm_binop_info(lir::LBinOp::FCmpEq, false).is_cmp)
+}
+
+#test
+/**
+ * stackify_bin_arithmetic_inherits_operand_a_type — the design doc's own
+ * `IAdd` worked example (§4.4), and the result's wasm valtype inherited
+ * from operand `a` (here `i64`, so the wide opcode `0x7C` is selected).
+ *
+ * @return void
+ */
+fn stackify_bin_arithmetic_inherits_operand_a_type() {
+    let ctx0 = sc_set_vtype(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i64()), 1, wasm_vt_i64())
+    let inst = lir::bin_inst(2, lir::LBinOp::IAdd, 0, 1, 0, 0)
+    let out = stackify_bin(ctx0, inst, lir::LBin { op = lir::LBinOp::IAdd; a = 0; b = 1 })
+    let want = [0x20 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x7C to byte, 0x21 to byte, 0x02 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(wvt_get(out.vtypes, 2) == wasm_vt_i64())
+}
+
+#test
+/**
+ * stackify_bin_compare_result_is_always_i32 — a compare over `i64` operands
+ * still records an `i32` result valtype (mirrors `isel_arm64.tks`'s own
+ * always-narrow compare result).
+ *
+ * @return void
+ */
+fn stackify_bin_compare_result_is_always_i32() {
+    let ctx0 = sc_set_vtype(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i64()), 1, wasm_vt_i64())
+    let inst = lir::bin_inst(2, lir::LBinOp::ICmpLtS, 0, 1, 0, 0)
+    let out = stackify_bin(ctx0, inst, lir::LBin { op = lir::LBinOp::ICmpLtS; a = 0; b = 1 })
+    teko::assert::is_true(wvt_get(out.vtypes, 2) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_ineg_narrow_and_wide — `INeg` renders as `0 - a` at both widths
+ * (`backend-c1-wasm.md` §4.4's worked example).
+ *
+ * @return void
+ */
+fn stackify_ineg_narrow_and_wide() {
+    let narrow_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i32()), lir::un_inst(1, lir::LUnOp::INeg, 0, 0, 0), lir::LUn { op = lir::LUnOp::INeg; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(narrow_out.body, [0x41 to byte, 0x00 to byte, 0x20 to byte, 0x00 to byte, 0x6B to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(narrow_out.vtypes, 1) == wasm_vt_i32())
+    let wide_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i64()), lir::un_inst(1, lir::LUnOp::INeg, 0, 0, 0), lir::LUn { op = lir::LUnOp::INeg; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(wide_out.body, [0x42 to byte, 0x00 to byte, 0x20 to byte, 0x00 to byte, 0x7D to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(wide_out.vtypes, 1) == wasm_vt_i64())
+}
+
+#test
+/**
+ * stackify_inot_narrow_and_wide — `INot` renders as `a XOR -1` at both
+ * widths (`backend-c1-wasm.md` §4.4's worked example).
+ *
+ * @return void
+ */
+fn stackify_inot_narrow_and_wide() {
+    let narrow_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i32()), lir::un_inst(1, lir::LUnOp::INot, 0, 0, 0), lir::LUn { op = lir::LUnOp::INot; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(narrow_out.body, [0x41 to byte, 0x7F to byte, 0x20 to byte, 0x00 to byte, 0x73 to byte, 0x21 to byte, 0x01 to byte]))
+    let wide_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i64()), lir::un_inst(1, lir::LUnOp::INot, 0, 0, 0), lir::LUn { op = lir::LUnOp::INot; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(wide_out.body, [0x42 to byte, 0x7F to byte, 0x20 to byte, 0x00 to byte, 0x85 to byte, 0x21 to byte, 0x01 to byte]))
+}
+
+#test
+/**
+ * stackify_fneg_narrow_and_wide — `FNeg` selects `f32.neg`/`f64.neg` by
+ * operand width.
+ *
+ * @return void
+ */
+fn stackify_fneg_narrow_and_wide() {
+    let narrow_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_f32()), lir::un_inst(1, lir::LUnOp::FNeg, 0, 0, 0), lir::LUn { op = lir::LUnOp::FNeg; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(narrow_out.body, [0x20 to byte, 0x00 to byte, 0x8C to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(narrow_out.vtypes, 1) == wasm_vt_f32())
+    let wide_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_f64()), lir::un_inst(1, lir::LUnOp::FNeg, 0, 0, 0), lir::LUn { op = lir::LUnOp::FNeg; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(wide_out.body, [0x20 to byte, 0x00 to byte, 0x9A to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(wide_out.vtypes, 1) == wasm_vt_f64())
+}
+
+#test
+/**
+ * stackify_trunc_from_i32_is_identity_from_i64_wraps — `Trunc` always
+ * yields `i32`; an already-`i32` operand is a plain copy, an `i64` operand
+ * needs the real `i32.wrap_i64`.
+ *
+ * @return void
+ */
+fn stackify_trunc_from_i32_is_identity_from_i64_wraps() {
+    let from32 = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i32()), lir::un_inst(1, lir::LUnOp::Trunc, 0, 0, 0), lir::LUn { op = lir::LUnOp::Trunc; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(from32.body, [0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(from32.vtypes, 1) == wasm_vt_i32())
+    let from64 = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i64()), lir::un_inst(1, lir::LUnOp::Trunc, 0, 0, 0), lir::LUn { op = lir::LUnOp::Trunc; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(from64.body, [0x20 to byte, 0x00 to byte, 0xA7 to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(from64.vtypes, 1) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_zext_and_sext_are_identity_at_operand_width — `ZExt`/`SExt` both
+ * lower to a plain local-to-local copy at the operand's own width (the LIR
+ * carries no further per-value width information, mirroring
+ * `isel_arm64.tks`'s own `select_identity_mov` treatment).
+ *
+ * @return void
+ */
+fn stackify_zext_and_sext_are_identity_at_operand_width() {
+    let zext_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i32()), lir::un_inst(1, lir::LUnOp::ZExt, 0, 0, 0), lir::LUn { op = lir::LUnOp::ZExt; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(zext_out.body, [0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(zext_out.vtypes, 1) == wasm_vt_i32())
+    let sext_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i64()), lir::un_inst(1, lir::LUnOp::SExt, 0, 0, 0), lir::LUn { op = lir::LUnOp::SExt; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(sext_out.body, [0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(sext_out.vtypes, 1) == wasm_vt_i64())
+}
+
+#test
+/**
+ * stackify_itof_from_i32_and_i64 — `IToF` always yields `f64`, its source
+ * opcode selected by the operand's own integer width.
+ *
+ * @return void
+ */
+fn stackify_itof_from_i32_and_i64() {
+    let from32 = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i32()), lir::un_inst(1, lir::LUnOp::IToF, 0, 0, 0), lir::LUn { op = lir::LUnOp::IToF; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(from32.body, [0x20 to byte, 0x00 to byte, 0xB7 to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(from32.vtypes, 1) == wasm_vt_f64())
+    let from64 = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_i64()), lir::un_inst(1, lir::LUnOp::IToF, 0, 0, 0), lir::LUn { op = lir::LUnOp::IToF; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(from64.body, [0x20 to byte, 0x00 to byte, 0xB9 to byte, 0x21 to byte, 0x01 to byte]))
+}
+
+#test
+/**
+ * stackify_ftoi_from_f32_and_f64 — `FToI` always yields `i32`, its source
+ * opcode selected by the operand's own float width.
+ *
+ * @return void
+ */
+fn stackify_ftoi_from_f32_and_f64() {
+    let from32 = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_f32()), lir::un_inst(1, lir::LUnOp::FToI, 0, 0, 0), lir::LUn { op = lir::LUnOp::FToI; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(from32.body, [0x20 to byte, 0x00 to byte, 0xA8 to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(from32.vtypes, 1) == wasm_vt_i32())
+    let from64 = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_f64()), lir::un_inst(1, lir::LUnOp::FToI, 0, 0, 0), lir::LUn { op = lir::LUnOp::FToI; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(from64.body, [0x20 to byte, 0x00 to byte, 0xAA to byte, 0x21 to byte, 0x01 to byte]))
+}
+
+#test
+/**
+ * stackify_ftof_demotes_from_f64_promotes_from_f32 — `FToF` is the one case
+ * whose result width is the OPPOSITE of the operand's.
+ *
+ * @return void
+ */
+fn stackify_ftof_demotes_from_f64_promotes_from_f32() {
+    let demote_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_f64()), lir::un_inst(1, lir::LUnOp::FToF, 0, 0, 0), lir::LUn { op = lir::LUnOp::FToF; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(demote_out.body, [0x20 to byte, 0x00 to byte, 0xB6 to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(demote_out.vtypes, 1) == wasm_vt_f32())
+    let promote_out = stackify_un(sc_set_vtype(sft_ctx0(), 0, wasm_vt_f32()), lir::un_inst(1, lir::LUnOp::FToF, 0, 0, 0), lir::LUn { op = lir::LUnOp::FToF; a = 0 })
+    teko::assert::is_true(wasm_bytes_eq(promote_out.body, [0x20 to byte, 0x00 to byte, 0xBB to byte, 0x21 to byte, 0x01 to byte]))
+    teko::assert::is_true(wvt_get(promote_out.vtypes, 1) == wasm_vt_f64())
+}
+
+/**
+ * sft_one_i32_param — a fresh 1-param (`I32`) -> `I32` function named `sym`.
+ *
+ * @param str sym  the function's symbol
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_one_i32_param(sym: str) -> lir::LFunc {
+    lir::new_func(sym, 1, teko::list::push(teko::list::empty(), lir::LType::I32), lir::LType::I32)
+}
+
+#test
+/**
+ * stackify_param_reads_its_own_local_index — `LParam{index}` always defines
+ * VReg `index`, so the copy is redundant-but-correct: `local.get $index;
+ * local.set $index`.
+ *
+ * @return void
+ */
+fn stackify_param_reads_its_own_local_index() {
+    let f = sft_one_i32_param("teko__test__p")
+    let inst = lir::param_inst(0, 0, 0, 0)
+    let out = match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 0 }, false) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte]))
+    teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_param_index_out_of_range_is_a_named_error — an internal-only
+ * defensive bound check.
+ *
+ * @return void
+ */
+fn stackify_param_index_out_of_range_is_a_named_error() {
+    let f = sft_one_i32_param("teko__test__p2")
+    let inst = lir::param_inst(0, 5, 0, 0)
+    match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 5 }, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "out of range")
+    }
+}
+
+#test
+/**
+ * stackify_param_i128_propagates_the_c1_i128_stop — an `I128` parameter
+ * type propagates `wasm_valtype`'s honest-stop.
+ *
+ * @return void
+ */
+fn stackify_param_i128_propagates_the_c1_i128_stop() {
+    let f = lir::new_func("teko__test__pi128", 1, teko::list::push(teko::list::empty(), lir::LType::I128), lir::LType::Void)
+    let inst = lir::param_inst(0, 0, 0, 0)
+    match stackify_param(sft_ctx0(), f, inst, lir::LParam { index = 0 }, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * stackify_ret_with_value_pushes_then_returns — a value-carrying `LRet`.
+ *
+ * @return void
+ */
+fn stackify_ret_with_value_pushes_then_returns() {
+    let ctx0 = sc_set_vtype(sft_ctx0(), 3, wasm_vt_i32())
+    let out = stackify_ret(ctx0, lir::LRet { has_value = true; value = 3 })
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x03 to byte, 0x0F to byte]))
+}
+
+#test
+/**
+ * stackify_ret_void_just_returns — a void `LRet`.
+ *
+ * @return void
+ */
+fn stackify_ret_void_just_returns() {
+    let out = stackify_ret(sft_ctx0(), lir::LRet { has_value = false; value = 0 })
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x0F to byte]))
+}
+
+#test
+/**
+ * stackify_field_addr_computes_base_plus_offset — `local.get base; i32.const
+ * offset; i32.add; local.set r`.
+ *
+ * @return void
+ */
+fn stackify_field_addr_computes_base_plus_offset() {
+    let inst = lir::field_addr_inst(1, 0, 8, 0, 0)
+    let out = stackify_field_addr(sft_ctx0(), inst, lir::LFieldAddr { base = 0; offset = 8 })
+    let want = [0x20 to byte, 0x00 to byte, 0x41 to byte, 0x08 to byte, 0x6A to byte, 0x21 to byte, 0x01 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(wvt_get(out.vtypes, 1) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_load_i32_matches_design_doc_golden — the design doc's own worked
+ * example (§12.1): `LLoad{I32} -> local.get addr; i32.load align,off;
+ * local.set r`.
+ *
+ * @return void
+ */
+fn stackify_load_i32_matches_design_doc_golden() {
+    let inst = lir::load_inst(1, 0, lir::LType::I32, 0, 0)
+    let out = match stackify_load(sft_ctx0(), inst, lir::LLoad { addr = 0; ty = lir::LType::I32 }, false, wasm_symtab_empty()) { StackifyCtx as x => x; error => return }
+    let want = [0x20 to byte, 0x00 to byte, 0x28 to byte, 0x02 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(wvt_get(out.vtypes, 1) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_load_i128_propagates_the_c1_i128_stop.
+ *
+ * @return void
+ */
+fn stackify_load_i128_propagates_the_c1_i128_stop() {
+    let inst = lir::load_inst(1, 0, lir::LType::I128, 0, 0)
+    match stackify_load(sft_ctx0(), inst, lir::LLoad { addr = 0; ty = lir::LType::I128 }, false, wasm_symtab_empty()) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * stackify_store_i64_matches_expected_bytes — `local.get addr; local.get
+ * value; i64.store align,off`.
+ *
+ * @return void
+ */
+fn stackify_store_i64_matches_expected_bytes() {
+    let out = match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::I64 }, false) { StackifyCtx as x => x; error => return }
+    let want = [0x20 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x37 to byte, 0x03 to byte, 0x00 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * stackify_store_f16_propagates_the_c1_f16_stop.
+ *
+ * @return void
+ */
+fn stackify_store_f16_propagates_the_c1_f16_stop() {
+    match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::F16 }, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-f16")
+    }
+}
+
+/**
+ * sft_panic_symtab — a `WasmSymbolTable` with `tk_panic_str` registered at
+ * funcidx `5` — `stackify_narrow_ptr_load`'s own resolver fixture (#389
+ * C1-7).
+ *
+ * @return WasmSymbolTable  the table
+ */
+fn sft_panic_symtab() -> WasmSymbolTable {
+    wasm_symtab_add(wasm_symtab_empty(), "tk_panic_str", WasmCallTarget { func_index = 5 to u32; ret_type = lir::LType::Void })
+}
+
+/**
+ * sft_ctx_scratch_at — a fresh `StackifyCtx` exactly like `sft_ctx0`, except
+ * its `next_scratch` starts at `n` — used by the checked-narrow tests so the
+ * reserved scratch local (`sc_alloc_scratch`) never collides with the
+ * instruction's own `addr`/`result` VRegs (a real function always seeds
+ * `next_scratch` at `f.next_vreg`, past every real VReg; this fixture
+ * mirrors that for a hand-built, real-function-free unit test).
+ *
+ * @param u32 n  the starting scratch id
+ * @return StackifyCtx  the empty context, scratch allocation starting at `n`
+ */
+fn sft_ctx_scratch_at(n: u32) -> StackifyCtx {
+    StackifyCtx { body = teko::list::empty(); vtypes = wvt_empty(); scopes = teko::list::empty(); next_scratch = n; has_frame = false; frame_base = 0 to u32; slots = wst_empty(); elide = et_empty(); pending = teko::list::empty() }
+}
+
+#test
+/**
+ * stackify_load_ptr_wasm32_checked_narrows — the wasm32 (`ptr64 = false`)
+ * `Ptr`-typed `LLoad` (#389 C1-7, `backend-wasm.md` §6): `local.get addr;
+ * i64.load align=3,off=0` (the on-disk shape is ALWAYS `i64`, `wasm_mem_
+ * op`), then the checked-narrow tail (`stackify_narrow_ptr_load`, hand-
+ * traced): `local.tee $scratch; i64.const 2^32; i64.ge_u; if (then i32.const
+ * msg_addr; i32.const msg_len; call $panic; unreachable); local.get
+ * $scratch; i32.wrap_i64`, and finally `local.set $result` (the result's
+ * own valtype is `i32`, matching `wasm_valtype(Ptr, false)`).
+ *
+ * @return void
+ */
+fn stackify_load_ptr_wasm32_checked_narrows() {
+    let inst = lir::load_inst(1, 0, lir::LType::Ptr, 0, 0)
+    let ctx0 = sft_ctx_scratch_at(2 to u32)
+    let out = match stackify_load(ctx0, inst, lir::LLoad { addr = 0; ty = lir::LType::Ptr }, false, sft_panic_symtab()) { StackifyCtx as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte,
+        0x29 to byte, 0x03 to byte, 0x00 to byte,
+        0x22 to byte, 0x02 to byte,
+        0x42 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x80 to byte, 0x10 to byte,
+        0x5A to byte,
+        0x04 to byte, 0x40 to byte,
+        0x41 to byte, 0x10 to byte,
+        0x41 to byte, 0x2A to byte,
+        0x10 to byte, 0x05 to byte,
+        0x00 to byte,
+        0x0B to byte,
+        0x20 to byte, 0x02 to byte,
+        0xA7 to byte,
+        0x21 to byte, 0x01 to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(wvt_get(out.vtypes, 1) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_load_ptr_wasm32_needs_tk_panic_str_registered — the checked-
+ * narrow call site propagates `wasm_resolve_call`'s own "unresolved call
+ * symbol" error when `tk_panic_str` is not registered — the narrow path
+ * never silently skips the panic hook.
+ *
+ * @return void
+ */
+fn stackify_load_ptr_wasm32_needs_tk_panic_str_registered() {
+    let inst = lir::load_inst(1, 0, lir::LType::Ptr, 0, 0)
+    match stackify_load(sft_ctx_scratch_at(2 to u32), inst, lir::LLoad { addr = 0; ty = lir::LType::Ptr }, false, wasm_symtab_empty()) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "tk_panic_str")
+    }
+}
+
+#test
+/**
+ * stackify_load_ptr_wasm64_is_a_plain_i64_load — on wasm64 (`ptr64 = true`),
+ * `Ptr` needs NO checked narrow at all: `local.get addr; i64.load
+ * align=3,off=0; local.set $result` — byte-identical to any other `i64`
+ * load, and the result's own valtype is `i64` (`wasm_valtype(Ptr, true)`).
+ *
+ * @return void
+ */
+fn stackify_load_ptr_wasm64_is_a_plain_i64_load() {
+    let inst = lir::load_inst(1, 0, lir::LType::Ptr, 0, 0)
+    let out = match stackify_load(sft_ctx0(), inst, lir::LLoad { addr = 0; ty = lir::LType::Ptr }, true, wasm_symtab_empty()) { StackifyCtx as x => x; error => return }
+    let want = [0x20 to byte, 0x00 to byte, 0x29 to byte, 0x03 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(wvt_get(out.vtypes, 1) == wasm_vt_i64())
+}
+
+#test
+/**
+ * stackify_store_ptr_wasm32_widens_before_storing — the wasm32 (`ptr64 =
+ * false`) `Ptr`-typed `LStore` (#389 C1-7, §6): the `i32` register value is
+ * `i64.extend_i32_u`-widened (always lossless — an in-range wasm32 address
+ * is never negative) before the `i64.store` (the on-disk shape is ALWAYS
+ * `i64`): `local.get addr; local.get value; i64.extend_i32_u; i64.store
+ * align=3,off=0`.
+ *
+ * @return void
+ */
+fn stackify_store_ptr_wasm32_widens_before_storing() {
+    let out = match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::Ptr }, false) { StackifyCtx as x => x; error => return }
+    let want = [0x20 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0xAD to byte, 0x37 to byte, 0x03 to byte, 0x00 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * stackify_store_ptr_wasm64_needs_no_widen — on wasm64 (`ptr64 = true`), the
+ * `i64`-valued register already matches the `i64` on-disk shape: `local.get
+ * addr; local.get value; i64.store align=3,off=0` — no extend.
+ *
+ * @return void
+ */
+fn stackify_store_ptr_wasm64_needs_no_widen() {
+    let out = match stackify_store(sft_ctx0(), lir::LStore { addr = 0; value = 1; ty = lir::LType::Ptr }, true) { StackifyCtx as x => x; error => return }
+    let want = [0x20 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x37 to byte, 0x03 to byte, 0x00 to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+/**
+ * sft_void_target — a `WasmCallTarget` for a `Void`-returning callee at
+ * funcidx `3`.
+ *
+ * @return WasmCallTarget  the target
+ */
+fn sft_void_target() -> WasmCallTarget {
+    WasmCallTarget { func_index = 3 to u32; ret_type = lir::LType::Void }
+}
+
+/**
+ * sft_i32_target — a `WasmCallTarget` for an `I32`-returning callee at
+ * funcidx `5`.
+ *
+ * @return WasmCallTarget  the target
+ */
+fn sft_i32_target() -> WasmCallTarget {
+    WasmCallTarget { func_index = 5 to u32; ret_type = lir::LType::I32 }
+}
+
+/**
+ * sft_i128_target — a `WasmCallTarget` for an `I128`-returning callee (a
+ * genuinely unrepresentable wasm return type, at funcidx `7`).
+ *
+ * @return WasmCallTarget  the target
+ */
+fn sft_i128_target() -> WasmCallTarget {
+    WasmCallTarget { func_index = 7 to u32; ret_type = lir::LType::I128 }
+}
+
+#test
+/**
+ * wasm_symtab_add_then_resolve_round_trips — the resolver table's basic
+ * register/lookup contract.
+ *
+ * @return void
+ */
+fn wasm_symtab_add_then_resolve_round_trips() {
+    let t = wasm_symtab_add(wasm_symtab_empty(), "tk_exit", sft_void_target())
+    match wasm_resolve_call(t, "tk_exit") {
+        WasmCallTarget as target => teko::assert::is_true(target.func_index == (3 to u32))
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * stackify_call_void_matches_design_doc_golden — the design doc's own
+ * worked example (§12.1): `LCall{tk_exit} -> local.get arg; call funcidx`.
+ * The `call` opcode lands at body index `2`, its minimal-width ULEB128
+ * funcidx operand (`3`, the callee's final absolute index) at index `3` —
+ * the module is self-contained (`backend-wasm.md` §1.2), so the operand is
+ * baked directly with no relocation recorded.
+ *
+ * @return void
+ */
+fn stackify_call_void_matches_design_doc_golden() {
+    let symbols = wasm_symtab_add(wasm_symtab_empty(), "tk_exit", sft_void_target())
+    let args = teko::list::push(teko::list::empty(), 0 to u32)
+    let inst = lir::void_call_inst("tk_exit", args, false, 0, 0)
+    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "tk_exit"; args = args; variadic = false }, false) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x00 to byte, 0x10 to byte, 0x03 to byte]))
+}
+
+#test
+/**
+ * stackify_call_captures_a_value_result — a value-returning callee whose
+ * caller captures the result into its own local.
+ *
+ * @return void
+ */
+fn stackify_call_captures_a_value_result() {
+    let symbols = wasm_symtab_add(wasm_symtab_empty(), "teko__demo__f", sft_i32_target())
+    let inst = lir::call_inst(9, "teko__demo__f", teko::list::empty(), false, 0, 0)
+    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__f"; args = teko::list::empty(); variadic = false }, false) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x10 to byte, 0x05 to byte, 0x21 to byte, 0x09 to byte]))
+    teko::assert::is_true(wvt_get(out.vtypes, 9) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_call_drops_a_discarded_value_result — a value-returning callee
+ * called at statement level (the result unused) drops it to keep the
+ * operand stack balanced.
+ *
+ * @return void
+ */
+fn stackify_call_drops_a_discarded_value_result() {
+    let symbols = wasm_symtab_add(wasm_symtab_empty(), "teko__demo__f", sft_i32_target())
+    let inst = lir::void_call_inst("teko__demo__f", teko::list::empty(), false, 0, 0)
+    let out = match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__f"; args = teko::list::empty(); variadic = false }, false) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x10 to byte, 0x05 to byte, 0x1A to byte]))
+}
+
+#test
+/**
+ * stackify_call_unresolved_symbol_is_a_named_error — a symbol the caller
+ * never registered.
+ *
+ * @return void
+ */
+fn stackify_call_unresolved_symbol_is_a_named_error() {
+    let inst = lir::void_call_inst("teko__missing__f", teko::list::empty(), false, 0, 0)
+    match stackify_call(sft_ctx0(), wasm_symtab_empty(), inst, lir::LCall { symbol = "teko__missing__f"; args = teko::list::empty(); variadic = false }, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "unresolved call symbol")
+    }
+}
+
+#test
+/**
+ * stackify_call_i128_return_propagates_the_c1_i128_stop — a callee whose
+ * return type has no wasm valtype.
+ *
+ * @return void
+ */
+fn stackify_call_i128_return_propagates_the_c1_i128_stop() {
+    let symbols = wasm_symtab_add(wasm_symtab_empty(), "teko__demo__big", sft_i128_target())
+    let inst = lir::void_call_inst("teko__demo__big", teko::list::empty(), false, 0, 0)
+    match stackify_call(sft_ctx0(), symbols, inst, lir::LCall { symbol = "teko__demo__big"; args = teko::list::empty(); variadic = false }, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+/**
+ * sft_empty_func — a fresh 0-param, `Void`-returning function (a throwaway
+ * `f`/dispatch fixture for ops that never read it).
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_empty_func() -> lir::LFunc {
+    lir::new_func("teko__test__dispatch", 0, teko::list::empty(), lir::LType::Void)
+}
+
+#test
+/**
+ * stackify_inst_jump_and_branch_are_internal_misuse — terminators are now
+ * handled by `stackify_control`'s own terminator dispatch (C1-3); reaching
+ * `LJump`/`LBranch` through the per-instruction `stackify_inst` is a
+ * caller misuse, not a design gap.
+ *
+ * @return void
+ */
+fn stackify_inst_jump_and_branch_are_internal_misuse() {
+    let jump = lir::jump_inst(1, teko::list::empty(), 0, 0)
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), jump, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "internal misuse")
+    }
+    let branch = lir::branch_inst(0, 1, teko::list::empty(), 2, teko::list::empty(), 0, 0)
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), branch, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "internal misuse")
+    }
+}
+
+#test
+/**
+ * stackify_inst_global_addr_matches_design_doc_golden — `LGlobalAddr`
+ * dispatched through `stackify_inst`, resolving via a registered data
+ * symbol: `i32.const 100; local.set 0` (`41 E4 00 21 00`, §12.1's own
+ * `LGlobalAddr -> i32.const dataaddr` shape).
+ *
+ * @return void
+ */
+fn stackify_inst_global_addr_matches_design_doc_golden() {
+    let symbols = wasm_symtab_add_data(wasm_symtab_empty(), "teko__rodata__0", 100 to u32)
+    let global_addr = lir::global_addr_inst(0, "teko__rodata__0", 0, 0)
+    let out = match stackify_inst(sft_ctx0(), sft_empty_func(), symbols, global_addr, false) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x41 to byte, 0xE4 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte]))
+    teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_inst_global_addr_unresolved_symbol_is_a_named_error — a rodata
+ * symbol the caller never registered.
+ *
+ * @return void
+ */
+fn stackify_inst_global_addr_unresolved_symbol_is_a_named_error() {
+    let global_addr = lir::global_addr_inst(0, "teko__rodata__missing", 0, 0)
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), global_addr, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "unresolved data symbol")
+    }
+}
+
+#test
+/**
+ * stackify_inst_alloca_dispatches_to_stackify_alloca — `LAlloca` reads its
+ * own precomputed slot offset from a manually-seeded frame (`frame_base=9`,
+ * slot offset `16`): `local.get 9; i32.const 16; i32.add; local.set 0`.
+ *
+ * @return void
+ */
+fn stackify_inst_alloca_dispatches_to_stackify_alloca() {
+    let seeded = StackifyCtx {
+        body = teko::list::empty()
+        vtypes = wvt_empty()
+        scopes = teko::list::empty()
+        next_scratch = 10 to u32
+        has_frame = true
+        frame_base = 9 to u32
+        slots = wst_set(wst_empty(), 0, 16 to u32)
+        elide = et_empty()
+        pending = teko::list::empty()
+    }
+    let alloca = lir::alloca_inst(0, 8, 8, 0, 0)
+    let out = match stackify_inst(seeded, sft_empty_func(), wasm_symtab_empty(), alloca, false) { StackifyCtx as x => x; error => return }
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x20 to byte, 0x09 to byte, 0x41 to byte, 0x10 to byte, 0x6A to byte, 0x21 to byte, 0x00 to byte]))
+    teko::assert::is_true(wvt_get(out.vtypes, 0) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_inst_call_indirect_and_func_addr_are_the_c1_4_5_stop — the wasm
+ * funcref table is out of C1-2's scope.
+ *
+ * @return void
+ */
+fn stackify_inst_call_indirect_and_func_addr_are_the_c1_4_5_stop() {
+    let call_indirect = lir::void_call_indirect_inst(0, teko::list::empty(), false, 0, 0)
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), call_indirect, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-callindirect")
+    }
+    let func_addr = lir::func_addr_inst(0, "teko__demo__f", 0, 0)
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), func_addr, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-funcaddr")
+    }
+}
+
+#test
+/**
+ * stackify_func_two_block_straight_fallthrough_needs_no_br — a bare
+ * `jump` into the very next block needs no `br` at all (the plain
+ * tail-continue case, C1-3's simplest multi-block shape — the former
+ * `C1-3-required` stop is gone, `stackify_func` now accepts this).
+ *
+ * @return void
+ */
+fn stackify_func_two_block_straight_fallthrough_needs_no_br() {
+    mut f = lir::new_func("teko__test__multi", 0, teko::list::empty(), lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::jump_inst(1, teko::list::empty(), 0, 0))
+    let b1 = lir::alloc_block(f)
+    f = b1.func
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, b1.block_id, lir::const_int_inst(r0.vreg, 7 to i128, 0, 0))
+    f = lir::append_inst(f, b1.block_id, lir::ret_inst(r0.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    /* r0's one use (the ret, same block b1) rides the stack (§5 C1-5) — the
+     * `local.set 0; local.get 0` round-trip the pre-peephole baseline paid
+     * is gone. */
+    let want = [0x41 to byte, 0x07 to byte, 0x0F to byte, 0x0B to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_straight_line_add_matches_golden_bytes — the design doc's
+ * own end-to-end shape: `fn add(a, b) { a + b }`, byte-for-byte.
+ *
+ * @return void
+ */
+fn stackify_func_straight_line_add_matches_golden_bytes() {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), lir::LType::I32), lir::LType::I32)
+    mut f = lir::new_func("teko__demo__add", 2, ptypes, lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    f = lir::append_inst(f, 0, lir::param_inst(1, 1, 0, 0))
+    let r = lir::alloc_vreg(f)
+    f = lir::append_inst(r.func, 0, lir::bin_inst(r.vreg, lir::LBinOp::IAdd, 0, 1, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(r.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    /* Every value here — both params AND the add's own result — is
+     * single-use, same-block, and consumed in LIFO order: the whole
+     * ALL-LOCALS baseline's `local.set`/`local.get` traffic rides the stack
+     * instead (§5 C1-5's own "straight-line arith" golden). */
+    let want_body = [
+        0x20 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x6A to byte,
+        0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want_body))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (1 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_no_locals_when_no_non_param_vregs — a body that defines no
+ * VReg beyond its params declares zero locals.
+ *
+ * @return void
+ */
+fn stackify_func_no_locals_when_no_non_param_vregs() {
+    mut f = lir::new_func("teko__test__void", 0, teko::list::empty(), lir::LType::Void)
+    f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    teko::assert::is_true(out.local_groups.len == 0)
+    teko::assert::is_true(wasm_bytes_eq(out.body, [0x0F to byte, 0x0B to byte]))
+}
+
+#test
+/**
+ * stackify_func_local_groups_merge_consecutive_same_type — two
+ * consecutive `i32` locals compress into one run-length group.
+ *
+ * @return void
+ */
+fn stackify_func_local_groups_merge_consecutive_same_type() {
+    mut f = lir::new_func("teko__test__same", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::const_int_inst(r0.vreg, 1 to i128, 0, 0))
+    let r1 = lir::alloc_vreg(f)
+    f = lir::append_inst(r1.func, 0, lir::const_int_inst(r1.vreg, 2 to i128, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (2 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_local_groups_split_on_a_type_change — an `i32`/`i64`/`i32`
+ * VReg sequence run-length-splits into three groups.
+ *
+ * @return void
+ */
+fn stackify_func_local_groups_split_on_a_type_change() {
+    mut f = lir::new_func("teko__test__mixed", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::const_int_inst(r0.vreg, 1 to i128, 0, 0))
+    let r1 = lir::alloc_vreg(f)
+    f = lir::append_inst(r1.func, 0, lir::const_int_inst(r1.vreg, 5000000000 to i128, 0, 0))
+    let r2 = lir::alloc_vreg(f)
+    f = lir::append_inst(r2.func, 0, lir::const_int_inst(r2.vreg, 2 to i128, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    teko::assert::is_true(out.local_groups.len == 3)
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+    teko::assert::is_true(out.local_groups[1].valtype == wasm_vt_i64())
+    teko::assert::is_true(out.local_groups[2].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * wvt_get_defaults_to_i32_when_unset — the defensive out-of-range default
+ * (never reached from valid, def-before-use SSA input, but named and tested
+ * directly).
+ *
+ * @return void
+ */
+fn wvt_get_defaults_to_i32_when_unset() {
+    teko::assert::is_true(wvt_get(wvt_empty(), 0) == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_inst_dispatches_every_remaining_straight_line_case —
+ * `LConstFloat`/`LUn`/`LFieldAddr`/`LLoad`/`LStore`/`LCall` through the
+ * TOP-LEVEL `stackify_inst` dispatcher itself (their own lowering functions
+ * are covered directly by the dedicated tests above; this exercises the
+ * dispatch match arm that routes to each).
+ *
+ * @return void
+ */
+fn stackify_inst_dispatches_every_remaining_straight_line_case() {
+    let f = sft_empty_func()
+    let float_inst = lir::const_float_inst(0, 0x3FF0000000000000 to u64, 0, 0)
+    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), float_inst, false) {
+        StackifyCtx => { }
+        error => teko::assert::is_true(false)
+    }
+    let un_ctx = sc_set_vtype(sft_ctx0(), 0, wasm_vt_i32())
+    let un_inst = lir::un_inst(1, lir::LUnOp::INeg, 0, 0, 0)
+    match stackify_inst(un_ctx, f, wasm_symtab_empty(), un_inst, false) {
+        StackifyCtx => { }
+        error => teko::assert::is_true(false)
+    }
+    let field_addr_inst = lir::field_addr_inst(1, 0, 4, 0, 0)
+    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), field_addr_inst, false) {
+        StackifyCtx => { }
+        error => teko::assert::is_true(false)
+    }
+    let load_inst = lir::load_inst(1, 0, lir::LType::I32, 0, 0)
+    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), load_inst, false) {
+        StackifyCtx => { }
+        error => teko::assert::is_true(false)
+    }
+    let store_inst = lir::store_inst(0, 1, lir::LType::I32, 0, 0)
+    match stackify_inst(sft_ctx0(), f, wasm_symtab_empty(), store_inst, false) {
+        StackifyCtx => { }
+        error => teko::assert::is_true(false)
+    }
+    let call_symbols = wasm_symtab_add(wasm_symtab_empty(), "tk_exit", sft_void_target())
+    let call_inst = lir::void_call_inst("tk_exit", teko::list::empty(), false, 0, 0)
+    match stackify_inst(sft_ctx0(), f, call_symbols, call_inst, false) {
+        StackifyCtx => { }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * stackify_func_propagates_a_mid_stream_instruction_error — a later
+ * instruction's own honest-stop short-circuits `stackify_insts` and
+ * propagates through `stackify_func` unchanged, rather than lowering the
+ * rest of the stream regardless.
+ *
+ * @return void
+ */
+fn stackify_func_propagates_a_mid_stream_instruction_error() {
+    mut f = lir::new_func("teko__test__callind_mid", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::const_int_inst(r0.vreg, 0 to i128, 0, 0))
+    f = lir::append_inst(f, 0, lir::void_call_indirect_inst(r0.vreg, teko::list::empty(), false, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-callindirect")
+    }
+}
+
+/* ==========================================================================
+ * C1-3 — CFGStackify golden-byte fixtures, each cross-checked byte-for-byte
+ * against a hand-written `.wat` compiled by `wat2wasm` (never invented).
+ * ========================================================================== */
+
+#test
+/**
+ * stackify_func_if_else_diamond_matches_wat2wasm_golden — `let x = if cond
+ * {1} else {2}; return x`: the CFGStackify if/else diamond (§3.3), its
+ * merge's block-arg crossing both edges as a local copy (§4.3). Golden
+ * bytes cross-checked against a hand-written `.wat` compiled by `wat2wasm`
+ * (`wasm-validate`-clean).
+ *
+ * @return void
+ */
+fn stackify_func_if_else_diamond_matches_wat2wasm_golden() {
+    let ptypes = teko::list::push(teko::list::empty(), lir::LType::I32)
+    mut f = lir::new_func("teko__test__if_else", 1, ptypes, lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    let thenb = lir::alloc_block(f)
+    let elseb = lir::alloc_block(thenb.func)
+    let mergeb = lir::alloc_block(elseb.func)
+    let mp = lir::add_block_param(mergeb.func, mergeb.block_id)
+    f = lir::append_inst(mp.func, 0, lir::branch_inst(0, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
+    let r_then = lir::alloc_vreg(f)
+    f = lir::append_inst(r_then.func, thenb.block_id, lir::const_int_inst(r_then.vreg, 1 to i128, 0, 0))
+    let then_args = teko::list::push(teko::list::empty(), r_then.vreg)
+    f = lir::append_inst(f, thenb.block_id, lir::jump_inst(mergeb.block_id, then_args, 0, 0))
+    let r_else = lir::alloc_vreg(f)
+    f = lir::append_inst(r_else.func, elseb.block_id, lir::const_int_inst(r_else.vreg, 2 to i128, 0, 0))
+    let else_args = teko::list::push(teko::list::empty(), r_else.vreg)
+    f = lir::append_inst(f, elseb.block_id, lir::jump_inst(mergeb.block_id, else_args, 0, 0))
+    f = lir::append_inst(f, mergeb.block_id, lir::ret_inst(mp.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    /* param 0 (the branch's own `cond`) is single-use, same-block (block 0)
+     * — it rides the stack straight into the `if` (§5's own ALWAYS-STACK
+     * fused-compare case), dropping its `local.set 0`/`local.get 0`
+     * round-trip. `r_then`/`r_else` stay in locals: each one's ONLY use is
+     * an edge-copy argument (FORCED-LOCAL, §5), not a computational
+     * consumer. */
+    let want = [
+        0x20 to byte, 0x00 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x41 to byte, 0x01 to byte, 0x21 to byte, 0x02 to byte, 0x20 to byte, 0x02 to byte, 0x21 to byte, 0x01 to byte,
+        0x05 to byte,
+        0x41 to byte, 0x02 to byte, 0x21 to byte, 0x03 to byte, 0x20 to byte, 0x03 to byte, 0x21 to byte, 0x01 to byte,
+        0x0B to byte,
+        0x20 to byte, 0x01 to byte, 0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (3 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_loop_with_two_breaks_matches_wat2wasm_golden — a loop whose
+ * header checks `condA` (breaking to `exitb`) and, when false, falls to a
+ * second guard checking `condB` (ALSO breaking to the SAME `exitb`, else
+ * the back-edge `continue`): `exitb` has TWO predecessors, so its
+ * dominator is the header itself — exactly the shape that (without the
+ * `merge_target_of` scope-exclusion fix, §3.3) would be misidentified as
+ * an ordinary if/else "new merge" and rendered inline instead of via the
+ * loop's own wrapping `block`. Proves the fix: both breaks correctly `br`
+ * out to the wrapping block; the continue correctly `br`s to the loop.
+ * Golden bytes cross-checked against a hand-written `.wat`.
+ *
+ * @return void
+ */
+fn stackify_func_loop_with_two_breaks_matches_wat2wasm_golden() {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), lir::LType::I32), lir::LType::I32)
+    mut f = lir::new_func("teko__test__loop_break", 2, ptypes, lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    f = lir::append_inst(f, 0, lir::param_inst(1, 1, 0, 0))
+    let headb = lir::alloc_block(f)
+    let chk2 = lir::alloc_block(headb.func)
+    let exitb = lir::alloc_block(chk2.func)
+    f = lir::append_inst(exitb.func, 0, lir::jump_inst(headb.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, headb.block_id, lir::branch_inst(0, exitb.block_id, teko::list::empty(), chk2.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, chk2.block_id, lir::branch_inst(1, exitb.block_id, teko::list::empty(), headb.block_id, teko::list::empty(), 0, 0))
+    let r9 = lir::alloc_vreg(f)
+    f = lir::append_inst(r9.func, exitb.block_id, lir::const_int_inst(r9.vreg, 9 to i128, 0, 0))
+    f = lir::append_inst(f, exitb.block_id, lir::ret_inst(r9.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x01 to byte, 0x21 to byte, 0x01 to byte,
+        0x02 to byte, 0x40 to byte,
+        0x03 to byte, 0x40 to byte,
+        0x20 to byte, 0x00 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x0C to byte, 0x02 to byte,
+        0x05 to byte,
+        0x20 to byte, 0x01 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x0C to byte, 0x03 to byte,
+        0x05 to byte,
+        0x0C to byte, 0x02 to byte,
+        0x0B to byte,
+        0x0B to byte,
+        0x0B to byte,
+        0x0B to byte,
+        0x41 to byte, 0x09 to byte,
+        0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (1 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_nested_if_matches_wat2wasm_golden —
+ * `if a { if b { 10 } else { 20 } } else { 30 }`: a nested if/else whose
+ * inner merge's own continuation renders INSIDE the outer `then` arm (the
+ * inner merge is only reachable that way), while the outer merge still
+ * renders exactly once after the outer `if`/`else`/`end` — `merge_target_
+ * of` correctly attributes each merge to its OWN nearest branch. Golden
+ * bytes cross-checked against a hand-written `.wat`.
+ *
+ * @return void
+ */
+fn stackify_func_nested_if_matches_wat2wasm_golden() {
+    let ptypes = teko::list::push(teko::list::push(teko::list::empty(), lir::LType::I32), lir::LType::I32)
+    mut f = lir::new_func("teko__test__nested_if", 2, ptypes, lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    f = lir::append_inst(f, 0, lir::param_inst(1, 1, 0, 0))
+    let inner_if = lir::alloc_block(f)
+    let inner_then = lir::alloc_block(inner_if.func)
+    let inner_else = lir::alloc_block(inner_then.func)
+    let inner_merge = lir::alloc_block(inner_else.func)
+    let imp = lir::add_block_param(inner_merge.func, inner_merge.block_id)
+    let else30 = lir::alloc_block(imp.func)
+    let outer_merge = lir::alloc_block(else30.func)
+    let omp = lir::add_block_param(outer_merge.func, outer_merge.block_id)
+    f = lir::append_inst(omp.func, 0, lir::branch_inst(0, inner_if.block_id, teko::list::empty(), else30.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, inner_if.block_id, lir::branch_inst(1, inner_then.block_id, teko::list::empty(), inner_else.block_id, teko::list::empty(), 0, 0))
+    let r10 = lir::alloc_vreg(f)
+    f = lir::append_inst(r10.func, inner_then.block_id, lir::const_int_inst(r10.vreg, 10 to i128, 0, 0))
+    f = lir::append_inst(f, inner_then.block_id, lir::jump_inst(inner_merge.block_id, teko::list::push(teko::list::empty(), r10.vreg), 0, 0))
+    let r20 = lir::alloc_vreg(f)
+    f = lir::append_inst(r20.func, inner_else.block_id, lir::const_int_inst(r20.vreg, 20 to i128, 0, 0))
+    f = lir::append_inst(f, inner_else.block_id, lir::jump_inst(inner_merge.block_id, teko::list::push(teko::list::empty(), r20.vreg), 0, 0))
+    f = lir::append_inst(f, inner_merge.block_id, lir::jump_inst(outer_merge.block_id, teko::list::push(teko::list::empty(), imp.vreg), 0, 0))
+    let r30 = lir::alloc_vreg(f)
+    f = lir::append_inst(r30.func, else30.block_id, lir::const_int_inst(r30.vreg, 30 to i128, 0, 0))
+    f = lir::append_inst(f, else30.block_id, lir::jump_inst(outer_merge.block_id, teko::list::push(teko::list::empty(), r30.vreg), 0, 0))
+    f = lir::append_inst(f, outer_merge.block_id, lir::ret_inst(omp.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    /* param 0's ONE use (the OUTER branch's `cond`) is in block 0 — the
+     * SAME block it is defined in — so it rides the stack (§5), dropping
+     * its self-copy AND the separate `local.get` the `if` used to need.
+     * param 1's ONE use (the INNER branch's `cond`) is in a DIFFERENT
+     * block (`inner_if`) than its own def (block 0) — cross-block, so it
+     * stays a normal local exactly as before. */
+    let want = [
+        0x20 to byte, 0x00 to byte,
+        0x20 to byte, 0x01 to byte, 0x21 to byte, 0x01 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x20 to byte, 0x01 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x41 to byte, 0x0A to byte, 0x21 to byte, 0x04 to byte, 0x20 to byte, 0x04 to byte, 0x21 to byte, 0x02 to byte,
+        0x05 to byte,
+        0x41 to byte, 0x14 to byte, 0x21 to byte, 0x05 to byte, 0x20 to byte, 0x05 to byte, 0x21 to byte, 0x02 to byte,
+        0x0B to byte,
+        0x20 to byte, 0x02 to byte, 0x21 to byte, 0x03 to byte,
+        0x05 to byte,
+        0x41 to byte, 0x1E to byte, 0x21 to byte, 0x06 to byte, 0x20 to byte, 0x06 to byte, 0x21 to byte, 0x03 to byte,
+        0x0B to byte,
+        0x20 to byte, 0x03 to byte, 0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (5 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_match_three_arm_chain_matches_wat2wasm_golden —
+ * `match k { 0 => 100; 1 => 200; _ => 300 }`: the guard-chain cascade
+ * `lower_match_*` builds (§3.1), rendered as the MVP's nested if/else guard
+ * chain (design doc §3.3 step 4 — `br_table` is the deferred
+ * `C1-brtable-opt`). The shared final merge is dominated by the FIRST
+ * guard (`merge_target_of` correctly attributes it there even though it is
+ * reached two guards deep). Golden bytes cross-checked against a
+ * hand-written `.wat`.
+ *
+ * @return void
+ */
+fn stackify_func_match_three_arm_chain_matches_wat2wasm_golden() {
+    let ptypes = teko::list::push(teko::list::empty(), lir::LType::I32)
+    mut f = lir::new_func("teko__test__match_chain", 1, ptypes, lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    let guard1 = lir::alloc_block(f)
+    let arm0 = lir::alloc_block(guard1.func)
+    let arm1 = lir::alloc_block(arm0.func)
+    let arm2 = lir::alloc_block(arm1.func)
+    let mergeb = lir::alloc_block(arm2.func)
+    let mp = lir::add_block_param(mergeb.func, mergeb.block_id)
+    let c0 = lir::alloc_vreg(mp.func)
+    f = lir::append_inst(c0.func, 0, lir::const_int_inst(c0.vreg, 0 to i128, 0, 0))
+    let cmp0 = lir::alloc_vreg(f)
+    f = lir::append_inst(cmp0.func, 0, lir::bin_inst(cmp0.vreg, lir::LBinOp::ICmpEq, 0, c0.vreg, 0, 0))
+    f = lir::append_inst(f, 0, lir::branch_inst(cmp0.vreg, arm0.block_id, teko::list::empty(), guard1.block_id, teko::list::empty(), 0, 0))
+    let c1 = lir::alloc_vreg(f)
+    f = lir::append_inst(c1.func, guard1.block_id, lir::const_int_inst(c1.vreg, 1 to i128, 0, 0))
+    let cmp1 = lir::alloc_vreg(f)
+    f = lir::append_inst(cmp1.func, guard1.block_id, lir::bin_inst(cmp1.vreg, lir::LBinOp::ICmpEq, 0, c1.vreg, 0, 0))
+    f = lir::append_inst(f, guard1.block_id, lir::branch_inst(cmp1.vreg, arm1.block_id, teko::list::empty(), arm2.block_id, teko::list::empty(), 0, 0))
+    let r100 = lir::alloc_vreg(f)
+    f = lir::append_inst(r100.func, arm0.block_id, lir::const_int_inst(r100.vreg, 100 to i128, 0, 0))
+    f = lir::append_inst(f, arm0.block_id, lir::jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), r100.vreg), 0, 0))
+    let r200 = lir::alloc_vreg(f)
+    f = lir::append_inst(r200.func, arm1.block_id, lir::const_int_inst(r200.vreg, 200 to i128, 0, 0))
+    f = lir::append_inst(f, arm1.block_id, lir::jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), r200.vreg), 0, 0))
+    let r300 = lir::alloc_vreg(f)
+    f = lir::append_inst(r300.func, arm2.block_id, lir::const_int_inst(r300.vreg, 300 to i128, 0, 0))
+    f = lir::append_inst(f, arm2.block_id, lir::jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), r300.vreg), 0, 0))
+    f = lir::append_inst(f, mergeb.block_id, lir::ret_inst(mp.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    /* Each guard's own `cmp*` (the `ICmpEq` result) is single-use,
+     * same-block, LIFO — it rides the stack, dropping its own `local.set`/
+     * `local.get` traffic (the fused compare feeding `if` directly). Each
+     * guard's own `c*` constant does NOT also elide, even though it is
+     * ALSO single-use/same-block: `k` (the match scrutinee) is used TWICE,
+     * once per guard, in TWO DIFFERENT blocks — cross-block, so `k` itself
+     * stays an ordinary local — and `resolve_inst_operands`' own
+     * ALL-OR-NOTHING rule (§5 condition 3) means `cmp*`'s two-operand
+     * `eq` can only ride ITS OWN operands off the stack as a matched PAIR;
+     * since `k` never rides (cross-block), `c*` is forced back to a local
+     * too rather than partially riding alone — a partial ride would
+     * silently invert `cmp*`'s two operands relative to each other on the
+     * real wasm stack (the miscompile this all-or-nothing rule closes;
+     * `eq` is symmetric, so an EARLIER, buggy version of this fixture
+     * happened to still assert a byte-correct-looking golden with `c*`
+     * wrongly eliding — this is the corrected, order-honest shape). Each
+     * arm's own `r100`/`r200`/`r300` stays a local too — its one use is an
+     * edge-copy argument into `mergeb`, not a computational consumer. */
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x41 to byte, 0x00 to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x00 to byte, 0x20 to byte, 0x02 to byte, 0x46 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x41 to byte, 0xE4 to byte, 0x00 to byte, 0x21 to byte, 0x06 to byte, 0x20 to byte, 0x06 to byte, 0x21 to byte, 0x01 to byte,
+        0x05 to byte,
+        0x41 to byte, 0x01 to byte, 0x21 to byte, 0x04 to byte,
+        0x20 to byte, 0x00 to byte, 0x20 to byte, 0x04 to byte, 0x46 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x41 to byte, 0xC8 to byte, 0x01 to byte, 0x21 to byte, 0x07 to byte, 0x20 to byte, 0x07 to byte, 0x21 to byte, 0x01 to byte,
+        0x05 to byte,
+        0x41 to byte, 0xAC to byte, 0x02 to byte, 0x21 to byte, 0x08 to byte, 0x20 to byte, 0x08 to byte, 0x21 to byte, 0x01 to byte,
+        0x0B to byte,
+        0x0B to byte,
+        0x20 to byte, 0x01 to byte, 0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (8 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_loop_swap_block_args_matches_wat2wasm_golden — a
+ * single-block loop whose back-edge feeds `[pb, pa]` into params `[pa,
+ * pb]` (a genuine swap): sequential `local.set`s would corrupt it (the
+ * second copy would read `pa`'s ALREADY-overwritten value), so `emit_edge_
+ * copies`' 2-param path must stage both sources into scratch locals FIRST
+ * (§4.3) — proves the parallel-copy fix, not just its 1-param fast path
+ * (already exercised by every merge above). Golden bytes cross-checked
+ * against a hand-written `.wat`.
+ *
+ * @return void
+ */
+fn stackify_func_loop_swap_block_args_matches_wat2wasm_golden() {
+    let ptypes = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), lir::LType::I32), lir::LType::I32), lir::LType::I32)
+    mut f = lir::new_func("teko__test__swap_loop", 3, ptypes, lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    f = lir::append_inst(f, 0, lir::param_inst(1, 1, 0, 0))
+    f = lir::append_inst(f, 0, lir::param_inst(2, 2, 0, 0))
+    let headb = lir::alloc_block(f)
+    let pa = lir::add_block_param(headb.func, headb.block_id)
+    let pb = lir::add_block_param(pa.func, headb.block_id)
+    let exitb = lir::alloc_block(pb.func)
+    let entry_args = teko::list::push(teko::list::push(teko::list::empty(), 1 to u32), 2 to u32)
+    f = lir::append_inst(exitb.func, 0, lir::jump_inst(headb.block_id, entry_args, 0, 0))
+    let back_args = teko::list::push(teko::list::push(teko::list::empty(), pb.vreg), pa.vreg)
+    f = lir::append_inst(f, headb.block_id, lir::branch_inst(0, exitb.block_id, teko::list::empty(), headb.block_id, back_args, 0, 0))
+    f = lir::append_inst(f, exitb.block_id, lir::ret_inst(pa.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x01 to byte, 0x21 to byte, 0x01 to byte,
+        0x20 to byte, 0x02 to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x01 to byte, 0x21 to byte, 0x05 to byte,
+        0x20 to byte, 0x02 to byte, 0x21 to byte, 0x06 to byte,
+        0x20 to byte, 0x05 to byte, 0x21 to byte, 0x03 to byte,
+        0x20 to byte, 0x06 to byte, 0x21 to byte, 0x04 to byte,
+        0x02 to byte, 0x40 to byte,
+        0x03 to byte, 0x40 to byte,
+        0x20 to byte, 0x00 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x0C to byte, 0x02 to byte,
+        0x05 to byte,
+        0x20 to byte, 0x04 to byte, 0x21 to byte, 0x07 to byte,
+        0x20 to byte, 0x03 to byte, 0x21 to byte, 0x08 to byte,
+        0x20 to byte, 0x07 to byte, 0x21 to byte, 0x03 to byte,
+        0x20 to byte, 0x08 to byte, 0x21 to byte, 0x04 to byte,
+        0x0C to byte, 0x01 to byte,
+        0x0B to byte,
+        0x0B to byte,
+        0x0B to byte,
+        0x20 to byte, 0x03 to byte, 0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (6 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+/* ==========================================================================
+ * C1-3 — the `C1-irreducible` honest-stop, and the smaller defensive/
+ * internal-error arms the 100%-coverage ruling's "unreachable arm justified
+ * in the PR" exception does NOT need here, since every one below is
+ * DIRECTLY testable via a fabricated `LFunc` or a direct call — this file's
+ * own established style (`wvt_get_defaults_to_i32_when_unset`).
+ * ========================================================================== */
+
+#test
+/**
+ * stackify_func_irreducible_scc_is_the_c1_irreducible_stop — a fabricated
+ * 2-block mutual cycle (`entry` branches to both; each jumps to the
+ * other) has no single-header natural loop — a back-edge whose target does
+ * NOT dominate its source, the Hecht-Ullman irreducibility test
+ * (`is_cfg_irreducible`, §3.4). Unreachable from structured Teko source
+ * (§3.1); exercised here directly, by construction, for coverage.
+ *
+ * @return void
+ */
+fn stackify_func_irreducible_scc_is_the_c1_irreducible_stop() {
+    mut f = lir::new_func("teko__test__scc", 0, teko::list::empty(), lir::LType::Void)
+    let b1 = lir::alloc_block(f)
+    let b2 = lir::alloc_block(b1.func)
+    f = lir::append_inst(b2.func, 0, lir::branch_inst(0, b1.block_id, teko::list::empty(), b2.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, b1.block_id, lir::jump_inst(b2.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, b2.block_id, lir::jump_inst(b1.block_id, teko::list::empty(), 0, 0))
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-irreducible")
+    }
+}
+
+#test
+/**
+ * stackify_func_loop_with_two_fresh_exits_is_the_c1_irreducible_stop — a
+ * fabricated single-header loop whose two branches each name a DIFFERENT
+ * fresh block outside the loop body (never producible by `lower_loop`,
+ * whose every `break` targets the SAME `exitb`, §3.3): `render_loop`'s own
+ * `relevant.len > 1` belt-and-suspenders check, distinct from the
+ * function-wide SCC test above. Exercised here directly for coverage.
+ *
+ * @return void
+ */
+fn stackify_func_loop_with_two_fresh_exits_is_the_c1_irreducible_stop() {
+    mut f = lir::new_func("teko__test__multi_exit", 0, teko::list::empty(), lir::LType::Void)
+    let header = lir::alloc_block(f)
+    let chk = lir::alloc_block(header.func)
+    let exit_a = lir::alloc_block(chk.func)
+    let exit_b = lir::alloc_block(exit_a.func)
+    f = lir::append_inst(exit_b.func, 0, lir::jump_inst(header.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, header.block_id, lir::branch_inst(0, exit_a.block_id, teko::list::empty(), chk.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, chk.block_id, lir::branch_inst(0, exit_b.block_id, teko::list::empty(), header.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, exit_a.block_id, lir::ret_void_inst(0, 0))
+    f = lir::append_inst(f, exit_b.block_id, lir::ret_void_inst(0, 0))
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-irreducible")
+    }
+}
+
+#test
+/**
+ * stackify_func_loop_with_no_break_has_no_exit_wrap — a loop whose ONLY
+ * edge is its own back-edge (no `break` anywhere: `filter_relevant_exits`
+ * finds zero exit targets) renders `loop … end` with NO wrapping `block`
+ * at all — the `has_exit = false` branch of `render_loop`, distinct from
+ * every other fixture above (all of which DO have a wrapping block).
+ * `wasm-validate`-clean per a hand-written `.wat` (an infinite loop is
+ * valid wasm).
+ *
+ * @return void
+ */
+fn stackify_func_loop_with_no_break_has_no_exit_wrap() {
+    mut f = lir::new_func("teko__test__inf_loop", 0, teko::list::empty(), lir::LType::Void)
+    let headb = lir::alloc_block(f)
+    f = lir::append_inst(headb.func, 0, lir::jump_inst(headb.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, headb.block_id, lir::jump_inst(headb.block_id, teko::list::empty(), 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [0x03 to byte, 0x40 to byte, 0x0C to byte, 0x00 to byte, 0x0B to byte, 0x0B to byte]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 0)
+}
+
+#test
+/**
+ * emit_edge_copies_arity_mismatch_is_a_named_error — an internal-only
+ * defensive bound check: a target's param count must match the edge's own
+ * argument count.
+ *
+ * @return void
+ */
+fn emit_edge_copies_arity_mismatch_is_a_named_error() {
+    let params = teko::list::push(teko::list::empty(), 0 to u32)
+    match emit_edge_copies(sft_ctx0(), params, teko::list::empty()) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "arity mismatch")
+    }
+}
+
+#test
+/**
+ * stackify_func_block_without_a_real_terminator_is_an_internal_error — a
+ * block whose last instruction is neither `LRet`/`LJump`/`LBranch` (here, a
+ * bare `LConstInt`) is malformed; `render_terminator`'s dispatch is total
+ * over the three real terminator ops, so this is a NAMED internal error,
+ * not a silent mis-render.
+ *
+ * @return void
+ */
+fn stackify_func_block_without_a_real_terminator_is_an_internal_error() {
+    mut f = lir::new_func("teko__test__no_term", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::const_int_inst(r0.vreg, 1 to i128, 0, 0))
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "must end in LRet/LJump/LBranch")
+    }
+}
+
+#test
+/**
+ * stackify_func_empty_block_has_no_terminator_is_an_internal_error — a
+ * function whose entry block never received a single instruction (a
+ * malformed `LFunc`, never produced by `lower_program`) is a NAMED
+ * internal error, not an out-of-bounds read.
+ *
+ * @return void
+ */
+fn stackify_func_empty_block_has_no_terminator_is_an_internal_error() {
+    let f = lir::new_func("teko__test__empty_block", 0, teko::list::empty(), lir::LType::Void)
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "has no terminator")
+    }
+}
+
+#test
+/**
+ * filter_relevant_exits_excludes_already_open_and_stop_matches — an exit
+ * target already open as an ancestor scope, and one equal to the caller's
+ * own `stop`, are BOTH excluded (neither needs THIS loop's own wrap); a
+ * genuinely fresh target survives the filter.
+ *
+ * @return void
+ */
+fn filter_relevant_exits_excludes_already_open_and_stop_matches() {
+    let scopes = wasm_scope_stack_push(teko::list::empty(), wasm_scope_kind_block(), 5 to u32)
+    let exits = teko::list::push(teko::list::push(teko::list::empty(), 5 to u32), 9 to u32)
+    let excluded = filter_relevant_exits(exits, scopes, edge_stop_at(9 to u32))
+    teko::assert::is_true(excluded.len == 0)
+    let survives = filter_relevant_exits(teko::list::push(teko::list::empty(), 7 to u32), teko::list::empty(), edge_stop_none())
+    teko::assert::is_true(survives.len == 1)
+    teko::assert::is_true(survives[0] == (7 to u32))
+}
+
+#test
+/**
+ * u32_table_get_defaults_to_zero_when_out_of_range — the defensive
+ * out-of-range default (never reached from a table sized to the function's
+ * own block count).
+ *
+ * @return void
+ */
+fn u32_table_get_defaults_to_zero_when_out_of_range() {
+    teko::assert::is_true(u32_table_get(teko::list::empty(), 5 to u32) == (0 to u32))
+}
+
+#test
+/**
+ * u32_pos_defaults_to_order_len_when_absent — the defensive "absent target
+ * sorts last" default (never reached: every id this file queries `u32_pos`
+ * with comes from a block the RPO order itself was built from, or one of
+ * its own reachable successors).
+ *
+ * @return void
+ */
+fn u32_pos_defaults_to_order_len_when_absent() {
+    let order = teko::list::push(teko::list::empty(), 0 to u32)
+    teko::assert::is_true(u32_pos(order, 9 to u32) == (order.len to u32))
+}
+
+#test
+/**
+ * first_processed_pred_returns_not_found_when_none_processed — the
+ * fixpoint seed-search's own empty case (provably unreachable from any
+ * block reachable from `entry` in a real RPO-ordered sweep, since RPO
+ * guarantees a forward predecessor always precedes it in the SAME pass;
+ * exercised directly, by construction, for coverage).
+ *
+ * @return void
+ */
+fn first_processed_pred_returns_not_found_when_none_processed() {
+    let idom = idom_table_init(2, 0 to u32)
+    let ps = teko::list::push(teko::list::empty(), 1 to u32)
+    let r = first_processed_pred(ps, idom)
+    teko::assert::is_true(!r.found)
+}
+
+#test
+/**
+ * wasm_scope_stack_pop_on_empty_stays_empty — the defensive "nothing to
+ * close" default (never reached: `sc_close_scope` only ever follows a
+ * matching `sc_open_*`).
+ *
+ * @return void
+ */
+fn wasm_scope_stack_pop_on_empty_stays_empty() {
+    teko::assert::is_true(wasm_scope_stack_pop(teko::list::empty()).len == 0)
+}
+
+#test
+/**
+ * stackify_inst_ret_is_internal_misuse — a return terminator is now ALSO
+ * routed exclusively through `render_terminator` (mirroring `LJump`/
+ * `LBranch`); reaching it through the per-instruction `stackify_inst` is a
+ * caller misuse.
+ *
+ * @return void
+ */
+fn stackify_inst_ret_is_internal_misuse() {
+    let r = lir::ret_void_inst(0, 0)
+    match stackify_inst(sft_ctx0(), sft_empty_func(), wasm_symtab_empty(), r, false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "internal misuse")
+    }
+}
+
+#test
+/**
+ * lir_block_search_defaults_to_first_block_when_id_absent — the defensive
+ * fallback for a malformed `LFunc` whose block ids skip a value (never
+ * produced by `alloc_block`'s own dense-id contract; exercised directly, by
+ * construction, since this file's own style does not blind-trust that
+ * contract, §3.2).
+ *
+ * @return void
+ */
+fn lir_block_search_defaults_to_first_block_when_id_absent() {
+    let b0 = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = teko::list::empty() }
+    let b5 = lir::LBlock { id = 5 to u32; params = teko::list::empty(); insts = teko::list::empty() }
+    let f = lir::LFunc {
+        symbol = "teko__test__gappy"; n_params = 0 to u32; param_types = teko::list::empty()
+        ret_type = lir::LType::Void; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b5); next_vreg = 0 to u32
+    }
+    let found = lir_block_search(f, 1 to u32)
+    teko::assert::is_true(found.id == (0 to u32))
+}
+
+#test
+/**
+ * all_but_last_of_empty_list_is_empty — the empty-input ternary arm
+ * (`render_straight` never calls this with an empty block, having already
+ * guarded that case itself; exercised directly for coverage).
+ *
+ * @return void
+ */
+fn all_but_last_of_empty_list_is_empty() {
+    teko::assert::is_true(all_but_last(teko::list::empty()).len == 0)
+}
+
+#test
+/**
+ * stackify_control_rejects_a_function_with_no_blocks — a malformed `LFunc`
+ * (never produced by `new_func`, which always seeds one block) is a NAMED
+ * internal error rather than an out-of-bounds read of `f.blocks[0]`.
+ *
+ * @return void
+ */
+fn stackify_control_rejects_a_function_with_no_blocks() {
+    let f = lir::LFunc {
+        symbol = "teko__test__no_blocks"; n_params = 0 to u32; param_types = teko::list::empty()
+        ret_type = lir::LType::Void; blocks = teko::list::empty(); next_vreg = 0 to u32
+    }
+    match stackify_control(f, wasm_symtab_empty(), false) {
+        StackifyCtx => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "no blocks")
+    }
+}
+
+#test
+/**
+ * stackify_func_jump_arity_mismatch_propagates_the_named_error — a `jump`
+ * into a block declaring one param, carrying zero args: `render_edge`'s
+ * `emit_edge_copies` error propagates through `render_jump_terminator`
+ * unchanged.
+ *
+ * @return void
+ */
+fn stackify_func_jump_arity_mismatch_propagates_the_named_error() {
+    mut f = lir::new_func("teko__test__jump_arity", 0, teko::list::empty(), lir::LType::Void)
+    let headb = lir::alloc_block(f)
+    let hp = lir::add_block_param(headb.func, headb.block_id)
+    f = lir::append_inst(hp.func, 0, lir::jump_inst(headb.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, headb.block_id, lir::ret_void_inst(0, 0))
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "arity mismatch")
+    }
+}
+
+#test
+/**
+ * stackify_func_branch_then_arm_arity_mismatch_propagates_the_named_error
+ * — an `if`'s THEN edge with a param/arg arity mismatch propagates through
+ * `render_arm` and `render_branch_terminator`'s own `then_done` match.
+ *
+ * @return void
+ */
+fn stackify_func_branch_then_arm_arity_mismatch_propagates_the_named_error() {
+    mut f = lir::new_func("teko__test__branch_then_arity", 0, teko::list::empty(), lir::LType::Void)
+    let thenb = lir::alloc_block(f)
+    let tp = lir::add_block_param(thenb.func, thenb.block_id)
+    let elseb = lir::alloc_block(tp.func)
+    f = lir::append_inst(elseb.func, 0, lir::branch_inst(0, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, thenb.block_id, lir::ret_void_inst(0, 0))
+    f = lir::append_inst(f, elseb.block_id, lir::ret_void_inst(0, 0))
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "arity mismatch")
+    }
+}
+
+#test
+/**
+ * stackify_func_branch_else_arm_arity_mismatch_propagates_the_named_error
+ * — an `if`'s ELSE edge with a param/arg arity mismatch propagates through
+ * `render_branch_terminator`'s own SECOND (`else_done`) match, distinct
+ * from the THEN-arm arity test above.
+ *
+ * @return void
+ */
+fn stackify_func_branch_else_arm_arity_mismatch_propagates_the_named_error() {
+    mut f = lir::new_func("teko__test__branch_else_arity", 0, teko::list::empty(), lir::LType::Void)
+    let thenb = lir::alloc_block(f)
+    let elseb = lir::alloc_block(thenb.func)
+    let ep = lir::add_block_param(elseb.func, elseb.block_id)
+    f = lir::append_inst(ep.func, 0, lir::branch_inst(0, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, thenb.block_id, lir::ret_void_inst(0, 0))
+    f = lir::append_inst(f, elseb.block_id, lir::ret_void_inst(0, 0))
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "arity mismatch")
+    }
+}
+
+#test
+/**
+ * stackify_func_loop_back_edge_arity_mismatch_propagates_through_render_
+ * loop — a loop whose back-edge carries the wrong arg count: the error
+ * propagates all the way out through `render_loop`'s own `body_done` match
+ * (distinct from the plain if/else arity tests above, which never enter a
+ * loop at all).
+ *
+ * @return void
+ */
+fn stackify_func_loop_back_edge_arity_mismatch_propagates_through_render_loop() {
+    mut f = lir::new_func("teko__test__loop_back_arity", 0, teko::list::empty(), lir::LType::Void)
+    let headb = lir::alloc_block(f)
+    let hp = lir::add_block_param(headb.func, headb.block_id)
+    let exitb = lir::alloc_block(hp.func)
+    let entry_args = teko::list::push(teko::list::empty(), 0 to u32)
+    f = lir::append_inst(exitb.func, 0, lir::jump_inst(headb.block_id, entry_args, 0, 0))
+    f = lir::append_inst(f, headb.block_id, lir::branch_inst(hp.vreg, exitb.block_id, teko::list::empty(), headb.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, exitb.block_id, lir::ret_void_inst(0, 0))
+    match stackify_func(f, wasm_symtab_empty(), false) {
+        WasmFuncBody => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "arity mismatch")
+    }
+}
+
+#test
+/**
+ * wst_get_defaults_to_zero_when_unset — the defensive out-of-range default
+ * (never reached from valid input — every `LAlloca` is pre-scanned into the
+ * table before its own lowering).
+ *
+ * @return void
+ */
+fn wst_get_defaults_to_zero_when_unset() {
+    teko::assert::is_true(wst_get(wst_empty(), 3) == (0 to u32))
+}
+
+#test
+/**
+ * alloca_of_non_alloca_is_an_all_zero_placeholder — `alloca_of`'s own
+ * defensive fallback arm, exercised directly on a non-`LAlloca` instruction
+ * (never reached from `collect_alloca_insts`'s own pre-filtered callers).
+ *
+ * @return void
+ */
+fn alloca_of_non_alloca_is_an_all_zero_placeholder() {
+    let a = alloca_of(lir::ret_void_inst(0, 0))
+    teko::assert::is_true(a.bytes == (0 to u32))
+    teko::assert::is_true(a.align == (1 to u32))
+}
+
+#test
+/**
+ * compute_wasm_frame_layout_single_alloca — one `LAlloca{bytes=8,align=8}`
+ * gets offset `0`, and the frame's own size/alignment match it exactly.
+ *
+ * @return void
+ */
+fn compute_wasm_frame_layout_single_alloca() {
+    let inst = lir::alloca_inst(0, 8, 8, 0, 0)
+    let layout = compute_wasm_frame_layout([inst])
+    teko::assert::is_true(wst_get(layout.slots, 0) == (0 to u32))
+    teko::assert::is_true(layout.frame_size == (8 to u32))
+    teko::assert::is_true(layout.frame_align == (8 to u32))
+}
+
+#test
+/**
+ * compute_wasm_frame_layout_packs_two_allocas_with_padding — a `bytes=4,
+ * align=4` slot followed by a `bytes=8,align=8` slot: the second slot is
+ * padded up to offset `8` (its own alignment), and the frame's own
+ * alignment/size follow the WIDER slot.
+ *
+ * @return void
+ */
+fn compute_wasm_frame_layout_packs_two_allocas_with_padding() {
+    let a = lir::alloca_inst(0, 4, 4, 0, 0)
+    let b = lir::alloca_inst(1, 8, 8, 0, 0)
+    let layout = compute_wasm_frame_layout([a, b])
+    teko::assert::is_true(wst_get(layout.slots, 0) == (0 to u32))
+    teko::assert::is_true(wst_get(layout.slots, 1) == (8 to u32))
+    teko::assert::is_true(layout.frame_size == (16 to u32))
+    teko::assert::is_true(layout.frame_align == (8 to u32))
+}
+
+#test
+/**
+ * collect_alloca_insts_finds_every_alloca_in_block_order — a two-block
+ * function with one `LAlloca` per block: both are found, in block order.
+ *
+ * @return void
+ */
+fn collect_alloca_insts_finds_every_alloca_in_block_order() {
+    mut f = lir::new_func("teko__test__collect_alloca", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 4, 4, 0, 0))
+    f = lir::append_inst(f, 0, lir::jump_inst(1, teko::list::empty(), 0, 0))
+    let b1 = lir::alloc_block(f)
+    f = b1.func
+    let r1 = lir::alloc_vreg(f)
+    f = lir::append_inst(r1.func, b1.block_id, lir::alloca_inst(r1.vreg, 8, 8, 0, 0))
+    f = lir::append_inst(f, b1.block_id, lir::ret_void_inst(0, 0))
+    let found = collect_alloca_insts(f)
+    teko::assert::is_true(found.len == 2)
+    teko::assert::is_true(found[0].result == r0.vreg)
+    teko::assert::is_true(found[1].result == r1.vreg)
+}
+
+#test
+/**
+ * stackify_func_single_alloca_matches_wat2wasm_reference — `fn f() -> i32 {
+ * alloca(8, align=8) }`: the shadow-stack prologue, the `LAlloca` site's own
+ * offset-`0` address computation, and the epilogue-before-`return`, all
+ * byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn stackify_func_single_alloca_matches_wat2wasm_reference() {
+    mut f = lir::new_func("teko__test__single_alloca", 0, teko::list::empty(), lir::LType::I32)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 8, 8, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(r0.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    /* r0 (the alloca's own address) is single-use, same-block (its ONLY
+     * use is the immediately-following `ret`) — it rides the stack (§5),
+     * dropping its `local.set 0`/`local.get 0` round-trip. The scratch
+     * `frame_base` local (index `1`) is untouched by the peephole — it is
+     * not an LIR VReg. */
+    let want = [
+        0x23 to byte, 0x00 to byte, 0x41 to byte, 0x08 to byte, 0x6B to byte, 0x41 to byte, 0x78 to byte, 0x71 to byte,
+        0x22 to byte, 0x01 to byte, 0x24 to byte, 0x00 to byte, 0x20 to byte, 0x01 to byte, 0x41 to byte, 0x00 to byte,
+        0x6A to byte, 0x20 to byte, 0x01 to byte, 0x24 to byte, 0x00 to byte,
+        0x0F to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (2 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+#test
+/**
+ * stackify_func_unaligned_alloca_skips_the_align_down_mask — a single
+ * `bytes=3, align=1` alloca needs no `i32.and` mask in its prologue (`align
+ * <= 1` is a no-op, `wasm_align_down_i32`'s other arm), byte-for-byte
+ * identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn stackify_func_unaligned_alloca_skips_the_align_down_mask() {
+    mut f = lir::new_func("teko__test__unaligned_alloca", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 3, 1, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x23 to byte, 0x00 to byte, 0x41 to byte, 0x03 to byte, 0x6B to byte, 0x22 to byte, 0x01 to byte, 0x24 to byte,
+        0x00 to byte, 0x20 to byte, 0x01 to byte, 0x41 to byte, 0x00 to byte, 0x6A to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x01 to byte, 0x24 to byte, 0x00 to byte, 0x0F to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (2 to u32))
+}
+
+#test
+/**
+ * stackify_func_two_allocas_matches_wat2wasm_reference — two allocas
+ * (`bytes=4,align=4` then `bytes=8,align=8`) in one function: ONE prologue
+ * bump for the whole `frame_size=16` frame, each site its own fixed offset
+ * (`0`/`8`), byte-for-byte identical to `wat2wasm`.
+ *
+ * @return void
+ */
+fn stackify_func_two_allocas_matches_wat2wasm_reference() {
+    mut f = lir::new_func("teko__test__two_allocas", 0, teko::list::empty(), lir::LType::Void)
+    let r0 = lir::alloc_vreg(f)
+    f = lir::append_inst(r0.func, 0, lir::alloca_inst(r0.vreg, 4, 4, 0, 0))
+    let r1 = lir::alloc_vreg(f)
+    f = lir::append_inst(r1.func, 0, lir::alloca_inst(r1.vreg, 8, 8, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x23 to byte, 0x00 to byte, 0x41 to byte, 0x10 to byte, 0x6B to byte, 0x41 to byte, 0x78 to byte, 0x71 to byte,
+        0x22 to byte, 0x02 to byte, 0x24 to byte, 0x00 to byte, 0x20 to byte, 0x02 to byte, 0x41 to byte, 0x00 to byte,
+        0x6A to byte, 0x21 to byte, 0x00 to byte, 0x20 to byte, 0x02 to byte, 0x41 to byte, 0x08 to byte, 0x6A to byte,
+        0x21 to byte, 0x01 to byte, 0x20 to byte, 0x02 to byte, 0x24 to byte, 0x00 to byte, 0x0F to byte, 0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+    teko::assert::is_true(out.local_groups.len == 1)
+    teko::assert::is_true(out.local_groups[0].count == (3 to u32))
+    teko::assert::is_true(out.local_groups[0].valtype == wasm_vt_i32())
+}
+
+/**
+ * srt_rodata — one `LRodata` entry (`symbol`, `bytes`), the fixture
+ * `wasm_layout_rodata`'s own tests build from.
+ *
+ * @param str symbol  the entry's symbol
+ * @param []byte bytes  its raw byte content
+ * @return lir::LRodata  the entry
+ */
+fn srt_rodata(symbol: str, bytes: []byte) -> lir::LRodata {
+    lir::LRodata { symbol = symbol; bytes = bytes }
+}
+
+#test
+/**
+ * wasm_layout_rodata_places_entries_back_to_back — two entries (`"hi"` then
+ * `"!"`) starting at base `0`: contiguous offsets, no padding, and `end` one
+ * past the last byte.
+ *
+ * @return void
+ */
+fn wasm_layout_rodata_places_entries_back_to_back() {
+    let rodata = [srt_rodata("s0", [0x68 to byte, 0x69 to byte]), srt_rodata("s1", [0x21 to byte])]
+    let layout = wasm_layout_rodata(rodata, 0 to u32)
+    teko::assert::is_true(layout.segment.offset == (0 to u32))
+    teko::assert::is_true(wasm_bytes_eq(layout.segment.bytes, [0x68 to byte, 0x69 to byte, 0x21 to byte]))
+    teko::assert::is_true(layout.symbols.len == 2)
+    teko::assert::is_true(layout.symbols[0] == "s0" && layout.symbols[1] == "s1")
+    teko::assert::is_true(layout.offsets[0] == (0 to u32) && layout.offsets[1] == (2 to u32))
+    teko::assert::is_true(layout.end == (3 to u32))
+}
+
+#test
+/**
+ * wasm_layout_rodata_honors_a_nonzero_base — the same two entries, but
+ * placed starting at base `100` (the caller's own memory-plan choice).
+ *
+ * @return void
+ */
+fn wasm_layout_rodata_honors_a_nonzero_base() {
+    let rodata = [srt_rodata("s0", [0x68 to byte, 0x69 to byte])]
+    let layout = wasm_layout_rodata(rodata, 100 to u32)
+    teko::assert::is_true(layout.segment.offset == (100 to u32))
+    teko::assert::is_true(layout.offsets[0] == (100 to u32))
+    teko::assert::is_true(layout.end == (102 to u32))
+}
+
+#test
+/**
+ * wasm_symtab_add_rodata_registers_every_entry — a laid-out rodata table
+ * registers ALL of its own symbols into a `WasmSymbolTable` in one call,
+ * each resolving to its own offset.
+ *
+ * @return void
+ */
+fn wasm_symtab_add_rodata_registers_every_entry() {
+    let rodata = [srt_rodata("s0", [0x68 to byte, 0x69 to byte]), srt_rodata("s1", [0x21 to byte])]
+    let layout = wasm_layout_rodata(rodata, 0 to u32)
+    let symbols = wasm_symtab_add_rodata(wasm_symtab_empty(), layout)
+    match wasm_resolve_data(symbols, "s0") { u32 as o => teko::assert::is_true(o == (0 to u32)); error => teko::assert::is_true(false) }
+    match wasm_resolve_data(symbols, "s1") { u32 as o => teko::assert::is_true(o == (2 to u32)); error => teko::assert::is_true(false) }
+}
+
+#test
+/**
+ * wasm_honest_globals_names_c1_globals — the module-level `LGlobal` stop's
+ * own message.
+ *
+ * @return void
+ */
+fn wasm_honest_globals_names_c1_globals() {
+    teko::assert::str_contains(wasm_honest_globals().message, "C1-globals")
+}
+
+#test
+/**
+ * wasm_sp_global_is_a_mutable_i32 — `wasm_sp_global`'s own builder shape:
+ * always `i32`, always mutable, carrying the caller's own `init` through
+ * unchanged.
+ *
+ * @return void
+ */
+fn wasm_sp_global_is_a_mutable_i32() {
+    let g = wasm_sp_global(1024 to i64)
+    teko::assert::is_true(g.valtype == wasm_vt_i32())
+    teko::assert::is_true(g.mutable)
+    teko::assert::is_true(g.init == (1024 to i64))
+    teko::assert::is_true(wasm_sp_global_index() == (0 to u32))
+}
+
+/**
+ * sft_main_func — a minimal `"main"` `LFunc` (`i32`-returning, 0 params):
+ * `%0 = const 0; call tk_exit(%0); ret %0` — the `own_exit_zero` fixture's
+ * own shape (a call the program-wide symbol table always resolves,
+ * `"tk_exit"`). The first fixture of the C1-5 `wasm_assemble_program`
+ * suite below — the whole-module assembler that emits a self-contained
+ * wasm module (`backend-wasm.md` §1.2, `backend-c1-wasm.md` §9).
+ *
+ * @return lir::LFunc  the seeded `main` function
+ */
+fn sft_main_func() -> lir::LFunc {
+    let insts = [
+        lir::const_int_inst(0, 0, 0, 0),
+        lir::void_call_inst("tk_exit", [0 to u32], false, 0, 0),
+        lir::ret_inst(0, 0, 0)
+    ]
+    let block = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    lir::LFunc { symbol = "main"; n_params = 0 to u32; param_types = teko::list::empty(); ret_type = lir::LType::I32; blocks = [block]; next_vreg = 1 to u32 }
+}
+
+/**
+ * sft_alloca_func — a `Void`-returning `LFunc` with ONE `LAlloca` (`8`
+ * bytes, `8`-aligned) then `ret` — the `wasm_program_has_any_frame` /
+ * `wasm_program_memory_plan` "needs a shadow-stack frame" fixture.
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_alloca_func() -> lir::LFunc {
+    let insts = [lir::alloca_inst(0, 8, 8, 0, 0), lir::ret_inst(0, 0, 0)]
+    let block = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    lir::LFunc { symbol = "teko__test__alloca"; n_params = 0 to u32; param_types = teko::list::empty(); ret_type = lir::LType::Void; blocks = [block]; next_vreg = 1 to u32 }
+}
+
+/**
+ * sft_ptr_load_func — a `Void`-returning `LFunc` with ONE `Ptr`-typed
+ * parameter, ONE `Ptr`-typed `LLoad` off it, then `ret` — the `wasm_
+ * program_has_ptr_load` / `wasm_assemble_program`'s checked-narrow-panic-
+ * message reachability gate "some function loads a `Ptr`" fixture (#389
+ * C1-7 review finding #1).
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_ptr_load_func() -> lir::LFunc {
+    let insts = [lir::param_inst(0, 0, 0, 0), lir::load_inst(1, 0, lir::LType::Ptr, 0, 0), lir::ret_void_inst(0, 0)]
+    let block = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    lir::LFunc { symbol = "teko__test__ptrload"; n_params = 1 to u32; param_types = [lir::LType::Ptr]; ret_type = lir::LType::Void; blocks = [block]; next_vreg = 2 to u32 }
+}
+
+/**
+ * sft_i128_ret_func — a `Void`-param, `I128`-returning `LFunc` — `wasm_
+ * func_type_of`'s own honest-stop (`C1-i128`) fixture, its return side.
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_i128_ret_func() -> lir::LFunc {
+    lir::new_func("teko__test__i128ret", 0, teko::list::empty(), lir::LType::I128)
+}
+
+/**
+ * sft_i128_param_func — an `I128`-param, `Void`-returning `LFunc` —
+ * `wasm_func_type_of`'s own honest-stop (`C1-i128`) fixture, its param
+ * side.
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_i128_param_func() -> lir::LFunc {
+    lir::new_func("teko__test__i128param", 1, [lir::LType::I128], lir::LType::Void)
+}
+
+#test
+/**
+ * mem_pages_for_floors_at_one_page_and_rounds_up — `0` still requests one
+ * page (the never-zero floor); a value exactly on a page boundary needs
+ * exactly that many pages; one byte OVER a boundary rounds up to the NEXT
+ * page.
+ *
+ * @return void
+ */
+fn mem_pages_for_floors_at_one_page_and_rounds_up() {
+    teko::assert::is_true(wasm_mem_pages_for(0 to u32) == (1 to u32))
+    teko::assert::is_true(wasm_mem_pages_for(65536 to u32) == (1 to u32))
+    teko::assert::is_true(wasm_mem_pages_for(65537 to u32) == (2 to u32))
+}
+
+#test
+/**
+ * program_func_index_shifts_by_the_import_count — a defined function at
+ * position `2`, with `2` host imports ahead of it, resolves to absolute
+ * index `4`.
+ *
+ * @return void
+ */
+fn program_func_index_shifts_by_the_import_count() {
+    teko::assert::is_true(wasm_program_func_index(2 to u64, 2 to u64) == (4 to u32))
+}
+
+#test
+/**
+ * register_program_symbols_resolves_tk_exit_and_every_func — `"tk_exit"`
+ * resolves DIRECTLY to the WASI `proc_exit` import's own index; `"main"`
+ * resolves to its own absolute index (past the two WASI imports).
+ *
+ * @return void
+ */
+fn register_program_symbols_resolves_tk_exit_and_every_func() {
+    let wasi = wasm_wasi_import_set()
+    let t = wasm_register_program_symbols(wasi, [sft_main_func()])
+    let exit_target = match wasm_resolve_call(t, "tk_exit") { WasmCallTarget as x => x; error => return }
+    teko::assert::is_true(exit_target.func_index == wasi.proc_exit_index)
+    teko::assert::is_true(exit_target.ret_type == lir::LType::Void)
+    let main_target = match wasm_resolve_call(t, "main") { WasmCallTarget as x => x; error => return }
+    teko::assert::is_true(main_target.func_index == (2 to u32))
+    teko::assert::is_true(main_target.ret_type == lir::LType::I32)
+}
+
+#test
+/**
+ * func_type_of_translates_params_and_a_nonvoid_result — `sft_main_func`'s
+ * own `() -> i32` signature translates to no params + one `i32` result.
+ *
+ * @return void
+ */
+fn func_type_of_translates_params_and_a_nonvoid_result() {
+    let t = match wasm_func_type_of(sft_main_func(), false) { WasmFuncType as x => x; error => return }
+    teko::assert::is_true(t.params.len == (0 to u64))
+    teko::assert::is_true(t.results.len == (1 to u64))
+    teko::assert::is_true(t.results[0] == (wasm_vt_i32() to byte))
+}
+
+#test
+/**
+ * func_type_of_a_void_function_has_no_results — `sft_empty_func`'s own
+ * `() -> void` signature translates to zero results (the MVP's no-multi-
+ * value shape, §4.3).
+ *
+ * @return void
+ */
+fn func_type_of_a_void_function_has_no_results() {
+    let t = match wasm_func_type_of(sft_empty_func(), false) { WasmFuncType as x => x; error => return }
+    teko::assert::is_true(t.results.len == (0 to u64))
+}
+
+#test
+/**
+ * func_type_of_propagates_the_i128_stop_on_either_side — an `I128` PARAM
+ * and an `I128` RESULT both propagate `wasm_valtype`'s own `C1-i128`
+ * honest-stop.
+ *
+ * @return void
+ */
+fn func_type_of_propagates_the_i128_stop_on_either_side() {
+    match wasm_func_type_of(sft_i128_param_func(), false) {
+        WasmFuncType => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+    match wasm_func_type_of(sft_i128_ret_func(), false) {
+        WasmFuncType => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * build_program_types_appends_wasi_then_one_per_func — the WASI import
+ * set's own two types come first, then one entry for `sft_main_func`,
+ * totaling three.
+ *
+ * @return void
+ */
+fn build_program_types_appends_wasi_then_one_per_func() {
+    let wasi = wasm_wasi_import_set()
+    let types = match wasm_build_program_types(wasi, [sft_main_func()], false) { []WasmFuncType as x => x; error => return }
+    teko::assert::is_true(types.len == (3 to u64))
+    teko::assert::is_true(types[2].results.len == (1 to u64))
+}
+
+#test
+/**
+ * build_program_types_propagates_a_func_type_of_stop — a function whose
+ * own signature honest-stops propagates out of the whole type table build.
+ *
+ * @return void
+ */
+fn build_program_types_propagates_a_func_type_of_stop() {
+    let wasi = wasm_wasi_import_set()
+    match wasm_build_program_types(wasi, [sft_i128_ret_func()], false) {
+        []WasmFuncType => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * build_program_funcs_packages_a_self_contained_func — `sft_main_func`
+ * stackifies into ONE packaged `WasmFunc` at its interned `type_index` (past
+ * the two WASI imports), its body carrying the compact, already-final
+ * call-site funcidx operands and terminated by the code-entry `end` (`0x0B`)
+ * — no relocation table, no operand widening (`backend-wasm.md` §1.2's
+ * self-contained module).
+ *
+ * @return void
+ */
+fn build_program_funcs_packages_a_self_contained_func() {
+    let wasi = wasm_wasi_import_set()
+    let symtab = wasm_register_program_symbols(wasi, [sft_main_func()])
+    let funcs = match wasm_build_program_funcs(wasi, [sft_main_func()], symtab, false) { []WasmFunc as x => x; error => return }
+    teko::assert::is_true(funcs.len == (1 to u64))
+    let f = funcs[0]
+    teko::assert::is_true(f.type_index == (2 to u32))
+    teko::assert::is_true(f.body.len > (0 to u64))
+    teko::assert::is_true(f.body[f.body.len - 1] == (0x0B to byte))
+}
+
+#test
+/**
+ * build_program_funcs_propagates_a_stackify_func_stop — a function whose
+ * own body honest-stops propagates out of the whole per-function build.
+ *
+ * @return void
+ */
+fn build_program_funcs_propagates_a_stackify_func_stop() {
+    let wasi = wasm_wasi_import_set()
+    match wasm_build_program_funcs(wasi, [sft_i128_ret_func()], wasm_symtab_empty(), false) {
+        []WasmFunc => teko::assert::is_true(false)
+        error => { }
+    }
+}
+
+#test
+/**
+ * find_main_index_locates_main_past_the_imports — `sft_main_func` is the
+ * ONLY function, so it resolves to `wasi.imports.len` (right past every
+ * host import).
+ *
+ * @return void
+ */
+fn find_main_index_locates_main_past_the_imports() {
+    let wasi = wasm_wasi_import_set()
+    let idx = match wasm_find_main_index(wasi, [sft_main_func()]) { u32 as x => x; error => return }
+    teko::assert::is_true(idx == (wasi.imports.len to u32))
+}
+
+#test
+/**
+ * find_main_index_missing_main_is_a_named_internal_error — a function list
+ * with no `"main"` symbol is the genuine internal-misuse guard (`emit_
+ * native_wasm` never reaches this for a real binary artifact).
+ *
+ * @return void
+ */
+fn find_main_index_missing_main_is_a_named_internal_error() {
+    let wasi = wasm_wasi_import_set()
+    match wasm_find_main_index(wasi, [sft_empty_func()]) {
+        u32 => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "no `main` entry function found")
+    }
+}
+
+#test
+/**
+ * synth_start_i32_main_forwards_the_result_to_proc_exit — an `i32`-returning
+ * `main`: `call $main` (compact funcidx `7`) leaves the exit code on the
+ * stack, then `call $proc_exit` (compact funcidx `0`) then `end`. The module
+ * is self-contained (`backend-wasm.md` §1.2), so the funcidx operands are
+ * minimal-width and no relocation is recorded.
+ *
+ * @return void
+ */
+fn synth_start_i32_main_forwards_the_result_to_proc_exit() {
+    let f = match wasm_synth_start(9 to u32, 7 to u32, 0 to u32, lir::LType::I32) { WasmFunc as x => x; error => return }
+    teko::assert::is_true(f.type_index == (9 to u32))
+    let want = [
+        0x10 to byte, 0x07 to byte,
+        0x10 to byte, 0x00 to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(f.body, want))
+}
+
+#test
+/**
+ * synth_start_void_main_pushes_a_default_exit_code — a `Void`-returning
+ * `main` leaves NOTHING on the stack, so `_start` pushes a literal `i32.
+ * const 0` (`0x41 0x00`) between `call $main` and `call $proc_exit` — the
+ * standard WASI "exit 0 on clean fall-through" `_start` shape that keeps
+ * `proc_exit`'s `i32` argument balanced instead of underflowing the operand
+ * stack (`backend-wasm.md` finding 4).
+ *
+ * @return void
+ */
+fn synth_start_void_main_pushes_a_default_exit_code() {
+    let f = match wasm_synth_start(9 to u32, 7 to u32, 0 to u32, lir::LType::Void) { WasmFunc as x => x; error => return }
+    let want = [
+        0x10 to byte, 0x07 to byte,
+        0x41 to byte, 0x00 to byte,
+        0x10 to byte, 0x00 to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(f.body, want))
+}
+
+#test
+/**
+ * program_has_any_frame_true_when_some_func_has_an_alloca — a two-function
+ * list, `main` first (no alloca) then `sft_alloca_func` — `true` overall.
+ *
+ * @return void
+ */
+fn program_has_any_frame_true_when_some_func_has_an_alloca() {
+    teko::assert::is_true(wasm_program_has_any_frame([sft_main_func(), sft_alloca_func()]))
+}
+
+#test
+/**
+ * program_has_any_frame_false_with_no_alloca_anywhere — neither
+ * `sft_main_func` nor `sft_empty_func` has an `LAlloca`.
+ *
+ * @return void
+ */
+fn program_has_any_frame_false_with_no_alloca_anywhere() {
+    teko::assert::is_true(!wasm_program_has_any_frame([sft_main_func(), sft_empty_func()]))
+}
+
+#test
+/**
+ * program_has_ptr_load_true_when_some_func_loads_a_ptr — a two-function
+ * list, `main` first (no `Ptr`-typed `LLoad`) then `sft_ptr_load_func` —
+ * `true` overall (#389 C1-7 review finding #1, the checked-narrow-panic-
+ * message reachability gate).
+ *
+ * @return void
+ */
+fn program_has_ptr_load_true_when_some_func_loads_a_ptr() {
+    teko::assert::is_true(wasm_program_has_ptr_load([sft_main_func(), sft_ptr_load_func()]))
+}
+
+#test
+/**
+ * program_has_ptr_load_false_with_no_ptr_load_anywhere — neither `sft_main_
+ * func` nor `sft_alloca_func` contains a `Ptr`-typed `LLoad` (an `LAlloca`
+ * site is a `Ptr`-VALUED result, never a `Ptr`-typed LOAD, so `sft_alloca_
+ * func` does not itself trip this scan).
+ *
+ * @return void
+ */
+fn program_has_ptr_load_false_with_no_ptr_load_anywhere() {
+    teko::assert::is_true(!wasm_program_has_ptr_load([sft_main_func(), sft_alloca_func()]))
+}
+
+#test
+/**
+ * program_data_segments_omits_an_empty_rodata_layout — a rodata layout
+ * with zero interned bytes yields NO data segment at all (not one framed
+ * empty segment).
+ *
+ * @return void
+ */
+fn program_data_segments_omits_an_empty_rodata_layout() {
+    let layout = wasm_layout_rodata(teko::list::empty(), 8 to u32)
+    teko::assert::is_true(wasm_program_data_segments(layout).len == (0 to u64))
+}
+
+#test
+/**
+ * program_data_segments_keeps_a_nonempty_rodata_layout — a rodata layout
+ * with at least one interned entry yields exactly one data segment.
+ *
+ * @return void
+ */
+fn program_data_segments_keeps_a_nonempty_rodata_layout() {
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let layout = wasm_layout_rodata(rodata, 8 to u32)
+    let segs = wasm_program_data_segments(layout)
+    teko::assert::is_true(segs.len == (1 to u64))
+    teko::assert::is_true(segs[0].offset == (8 to u32))
+}
+
+#test
+/**
+ * narrow_msg_segment_carries_the_reserved_message_at_its_own_fixed_addr —
+ * `wasm_narrow_msg_segment`'s own offset/bytes match `wasm_narrow_msg_addr`/
+ * `_bytes` exactly (#389 C1-7 review finding #1 — the segment the trap's
+ * own `fd_write` needs actually present at the address `tk_panic_str`'s
+ * call site hands it).
+ *
+ * @return void
+ */
+fn narrow_msg_segment_carries_the_reserved_message_at_its_own_fixed_addr() {
+    let seg = wasm_narrow_msg_segment()
+    teko::assert::is_true(seg.offset == wasm_narrow_msg_addr())
+    teko::assert::is_true(wasm_bytes_eq(seg.bytes, wasm_narrow_msg_bytes()))
+}
+
+#test
+/**
+ * program_narrow_msg_segments_empty_on_wasm64 — the wasm64 gate: even a
+ * program with a `Ptr`-typed `LLoad` gets NO narrow-message segment when
+ * `ptr64` (the checked narrow is elided entirely on wasm64, §6).
+ *
+ * @return void
+ */
+fn program_narrow_msg_segments_empty_on_wasm64() {
+    teko::assert::is_true(wasm_program_narrow_msg_segments([sft_ptr_load_func()], true).len == (0 to u64))
+}
+
+#test
+/**
+ * program_narrow_msg_segments_empty_with_no_ptr_load — a wasm32 program
+ * with no `Ptr`-typed `LLoad` anywhere gets NO narrow-message segment (a
+ * dead segment would otherwise sit at offset `16` unreachably).
+ *
+ * @return void
+ */
+fn program_narrow_msg_segments_empty_with_no_ptr_load() {
+    teko::assert::is_true(wasm_program_narrow_msg_segments([sft_main_func()], false).len == (0 to u64))
+}
+
+#test
+/**
+ * program_narrow_msg_segments_present_when_reachable_on_wasm32 — a wasm32
+ * program with a `Ptr`-typed `LLoad` gets EXACTLY the reserved message
+ * segment, at `wasm_narrow_msg_addr`.
+ *
+ * @return void
+ */
+fn program_narrow_msg_segments_present_when_reachable_on_wasm32() {
+    let segs = wasm_program_narrow_msg_segments([sft_ptr_load_func()], false)
+    teko::assert::is_true(segs.len == (1 to u64))
+    teko::assert::is_true(segs[0].offset == wasm_narrow_msg_addr())
+    teko::assert::is_true(wasm_bytes_eq(segs[0].bytes, wasm_narrow_msg_bytes()))
+}
+
+#test
+/**
+ * program_memory_plan_with_no_frame_and_no_rodata_needs_no_globals — a
+ * program with neither rodata nor an `LAlloca` anywhere gets NO globals and
+ * the one-page floor.
+ *
+ * @return void
+ */
+fn program_memory_plan_with_no_frame_and_no_rodata_needs_no_globals() {
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let plan = wasm_program_memory_plan(lmod, rodata)
+    teko::assert::is_true(plan.globals.len == (0 to u64))
+    teko::assert::is_true(plan.mem_min_pages == (1 to u32))
+}
+
+#test
+/**
+ * program_memory_plan_with_a_frame_adds_the_sp_global — a program with
+ * SOME `LAlloca` gets exactly one `SP` global, initialized past the
+ * (8-byte-aligned) rodata region's own end plus the fixed stack-region
+ * size.
+ *
+ * @return void
+ */
+fn program_memory_plan_with_a_frame_adds_the_sp_global() {
+    let lmod = lir::LModule { funcs = [sft_alloca_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let plan = wasm_program_memory_plan(lmod, rodata)
+    teko::assert::is_true(plan.globals.len == (1 to u64))
+    teko::assert::is_true(plan.globals[0].mutable)
+    teko::assert::is_true(plan.globals[0].init == ((wasm_rodata_base() to i64) + (65536 to i64)))
+    teko::assert::is_true(plan.mem_min_pages == (2 to u32))
+}
+
+#test
+/**
+ * assemble_program_own_exit_zero_shape_exports_start — the `own_exit_zero`
+ * corpus fixture's own shape (`main` only, no rodata, no alloca): the
+ * assembled module exports `"_start"` (the owner's own C1-5 invariant) at
+ * the synthesized entry's own function index (past the two WASI imports,
+ * the one defined `main`, and the five C1-6 io/panic trampolines
+ * `wasm_assemble_program` always appends) PLUS `"memory"` (the C1-6
+ * wasmtime-execution requirement, `wasm_memory_export`), its `funcs` list
+ * is `[main, print, println, eprint, eprintln, panic_str, _start]` (seven
+ * entries, the last closed by the code-entry `end`), and the type table
+ * carries the WASI pair, one entry per defined function, the shared
+ * io/panic type, and `_start`'s own.
+ *
+ * @return void
+ */
+fn assemble_program_own_exit_zero_shape_exports_start() {
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.exports.len == (2 to u64))
+    teko::assert::is_true(m.exports[0].name == "_start")
+    teko::assert::is_true(m.exports[0].index == (8 to u32))
+    teko::assert::is_true(m.exports[1].name == "memory")
+    teko::assert::is_true(m.exports[1].index == (0 to u32))
+    teko::assert::is_true(m.funcs.len == (7 to u64))
+    let start = m.funcs[6]
+    teko::assert::is_true(start.body.len > (0 to u64))
+    teko::assert::is_true(start.body[start.body.len - 1] == (0x0B to byte))
+    teko::assert::is_true(m.types.len == (5 to u64))
+    teko::assert::is_true(m.imports.len == (2 to u64))
+    teko::assert::is_true(!m.mem_is64)
+}
+
+#test
+/**
+ * assemble_program_wasm64_omits_the_io_panic_trampolines — the SAME
+ * `own_exit_zero` shape, assembled for wasm64 (#389 C1-7, `backend-wasm.md`
+ * §6): `mem_is64` is `true`, and the `fd_write`-based io/panic trampolines
+ * (WASI preview1's own `i32`-address-only ABI, a genuine ecosystem wall
+ * against `memory64`) are OMITTED — `funcs` is `[main, _start]` (two
+ * entries, not seven), `types` carries the WASI pair + `main`'s own +
+ * `_start`'s own (four, not five — no shared io type), and `_start`'s own
+ * funcidx lands immediately after `main` (no io funcs in between). The
+ * import set itself (`proc_exit`+`fd_write`) is unchanged — an unused
+ * `fd_write` import is harmless; only its CALLING trampoline bodies would
+ * have mismatched the `memory64` address width.
+ *
+ * @return void
+ */
+fn assemble_program_wasm64_omits_the_io_panic_trampolines() {
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod, true) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.mem_is64)
+    teko::assert::is_true(m.funcs.len == (2 to u64))
+    teko::assert::is_true(m.types.len == (4 to u64))
+    teko::assert::is_true(m.imports.len == (2 to u64))
+    teko::assert::is_true(m.exports[0].name == "_start")
+    teko::assert::is_true(m.exports[0].index == (3 to u32))
+}
+
+#test
+/**
+ * assemble_program_wasm64_rejects_a_frame_bearing_program — the wasm64
+ * scope guard (#389 C1-7): a function with an `LAlloca` (`wasm_program_
+ * has_any_frame`) names the `C1-wasm64-scope` honest-stop when `ptr64` —
+ * the shadow-stack `$sp`/`LFieldAddr`/`LAlloca` sites still compute in
+ * `i32` unconditionally, so a `memory64` module built from this program
+ * would be invalid; fail loud instead (M.3).
+ *
+ * @return void
+ */
+fn assemble_program_wasm64_rejects_a_frame_bearing_program() {
+    let lmod = lir::LModule { funcs = [sft_alloca_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, true) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-wasm64-scope")
+    }
+}
+
+#test
+/**
+ * assemble_program_wasm64_rejects_a_rodata_bearing_program — the SAME
+ * wasm64 scope guard, triggered by non-empty `LModule.rodata` (`LGlobalAddr`
+ * still computes in `i32`).
+ *
+ * @return void
+ */
+fn assemble_program_wasm64_rejects_a_rodata_bearing_program() {
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, true) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-wasm64-scope")
+    }
+}
+
+#test
+/**
+ * assemble_program_wasm64_rejects_a_ptr_signature — the SAME wasm64 scope
+ * guard, triggered by a function whose own signature names `Ptr`
+ * (`wasm_program_uses_ptr` — `sft_rodata_func`'s `Ptr`-returning `main`).
+ *
+ * @return void
+ */
+fn assemble_program_wasm64_rejects_a_ptr_signature() {
+    let lmod = lir::LModule { funcs = [sft_rodata_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, true) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-wasm64-scope")
+    }
+}
+
+/**
+ * sft_rodata_func — a `Ptr`-returning `"main"` `LFunc` that resolves ONE
+ * rodata symbol (`LGlobalAddr`) — the ordering regression this fixture
+ * guards: `wasm_assemble_program` must lay out + register rodata BEFORE
+ * stackifying ANY function, or this `LGlobalAddr` site fails to resolve.
+ *
+ * @return lir::LFunc  the seeded function
+ */
+fn sft_rodata_func() -> lir::LFunc {
+    let insts = [lir::global_addr_inst(0, "teko__rodata__0", 0, 0), lir::ret_inst(0, 0, 0)]
+    let block = lir::LBlock { id = 0 to u32; params = teko::list::empty(); insts = insts }
+    lir::LFunc { symbol = "main"; n_params = 0 to u32; param_types = teko::list::empty(); ret_type = lir::LType::Ptr; blocks = [block]; next_vreg = 1 to u32 }
+}
+
+#test
+/**
+ * assemble_program_resolves_rodata_symbols_before_stackifying — a program
+ * whose only function reads a rodata symbol (`LGlobalAddr`) assembles
+ * cleanly, AND the module's own data section places it at `wasm_rodata_
+ * base` — proving `wasm_assemble_program` lays rodata out (and registers
+ * it into the symbol table) BEFORE stackifying `main`, not after.
+ *
+ * @return void
+ */
+fn assemble_program_resolves_rodata_symbols_before_stackifying() {
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let lmod = lir::LModule { funcs = [sft_rodata_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.data.len == (1 to u64))
+    teko::assert::is_true(m.data[0].offset == wasm_rodata_base())
+}
+
+#test
+/**
+ * assemble_program_wasm32_emits_the_narrow_msg_segment_when_reachable — a
+ * wasm32 program with a `Ptr`-typed `LLoad` (`sft_ptr_load_func`, alongside
+ * `sft_main_func`'s own `main`) gets the reserved narrow-message segment in
+ * its own data section, at `wasm_narrow_msg_addr` (#389 C1-7 review finding
+ * #1 — before this fix `m.data` never carried it at all, so a trap through
+ * `tk_panic_str` printed 42 NUL bytes instead of the structured message).
+ *
+ * @return void
+ */
+fn assemble_program_wasm32_emits_the_narrow_msg_segment_when_reachable() {
+    let lmod = lir::LModule { funcs = [sft_main_func(), sft_ptr_load_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.data.len == (1 to u64))
+    teko::assert::is_true(m.data[0].offset == wasm_narrow_msg_addr())
+    teko::assert::is_true(wasm_bytes_eq(m.data[0].bytes, wasm_narrow_msg_bytes()))
+}
+
+#test
+/**
+ * assemble_program_wasm32_orders_the_narrow_msg_segment_before_rodata — a
+ * program that BOTH loads a `Ptr` value AND interns rodata gets TWO data
+ * segments: the reserved narrow-message segment first (offset `wasm_
+ * narrow_msg_addr`), the program's own rodata second (offset `wasm_rodata_
+ * base`) — the append order `wasm_assemble_program`'s own `data` field
+ * builds (#389 C1-7 review finding #1).
+ *
+ * @return void
+ */
+fn assemble_program_wasm32_orders_the_narrow_msg_segment_before_rodata() {
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let lmod = lir::LModule { funcs = [sft_main_func(), sft_ptr_load_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+    let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
+    teko::assert::is_true(m.data.len == (2 to u64))
+    teko::assert::is_true(m.data[0].offset == wasm_narrow_msg_addr())
+    teko::assert::is_true(m.data[1].offset == wasm_rodata_base())
+}
+
+#test
+/**
+ * assemble_program_rejects_top_level_globals — `LModule.globals` non-empty
+ * is the NAMED `C1-globals` honest-stop (mirrors A4-4), checked BEFORE any
+ * function is even stackified.
+ *
+ * @return void
+ */
+fn assemble_program_rejects_top_level_globals() {
+    let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = teko::list::empty(); globals = [lir::LGlobal { symbol = "teko__g__x"; ty = lir::LType::I32; bytes = teko::list::empty() }]; layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, false) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-globals")
+    }
+}
+
+#test
+/**
+ * assemble_program_propagates_a_func_type_stop — a program whose only
+ * function's own signature honest-stops (`C1-i128`) propagates out of the
+ * whole assembly, before `wasm_find_main_index` is even reached.
+ *
+ * @return void
+ */
+fn assemble_program_propagates_a_func_type_stop() {
+    let lmod = lir::LModule { funcs = [sft_i128_ret_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, false) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-i128")
+    }
+}
+
+#test
+/**
+ * assemble_program_with_no_main_is_a_named_internal_error — a program with
+ * no `"main"` symbol (but an otherwise WELL-FORMED function — `sft_alloca_
+ * func`, unlike `sft_empty_func`'s own terminator-less throwaway block,
+ * which fails stackification itself before `wasm_find_main_index` is even
+ * reached) propagates `wasm_find_main_index`'s own NAMED internal error.
+ *
+ * @return void
+ */
+fn assemble_program_with_no_main_is_a_named_internal_error() {
+    let lmod = lir::LModule { funcs = [sft_alloca_func()]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match wasm_assemble_program(lmod, false) {
+        WasmModule => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "no `main` entry function found")
+    }
+}
+
+/* ==========================================================================
+ * C1-5 — the value-stack peephole: `elide_candidate_kind`'s own per-
+ * condition coverage (single-use/same-block -> Drop, multi-use -> Normal,
+ * cross-block -> Normal, edge-only -> Normal, block-param -> Normal,
+ * dead -> Normal, computational+edge -> Tee), the LIFO/barrier simulation's
+ * own unit tests, and end-to-end golden fixtures (§5, `backend-wasm.md`).
+ * ========================================================================== */
+
+#test
+/**
+ * elide_candidate_kind_drop_on_single_same_block_computational_use — the
+ * baseline positive case: exactly one use, computational, same block.
+ *
+ * @return void
+ */
+fn elide_candidate_kind_drop_on_single_same_block_computational_use() {
+    let info = uit_record_use(uit_empty(), 0, 0, false)
+    teko::assert::is_true(elide_candidate_kind(info, 0, 0) == elide_kind_drop())
+}
+
+#test
+/**
+ * elide_candidate_kind_normal_on_multi_use — three same-block computational
+ * uses stay Normal (beyond the `Drop`/`Tee` shape entirely).
+ *
+ * @return void
+ */
+fn elide_candidate_kind_normal_on_multi_use() {
+    let t1 = uit_record_use(uit_empty(), 0, 0, false)
+    let t2 = uit_record_use(t1, 0, 0, false)
+    let info = uit_record_use(t2, 0, 0, false)
+    teko::assert::is_true(elide_candidate_kind(info, 0, 0) == elide_kind_normal())
+}
+
+#test
+/**
+ * elide_candidate_kind_normal_on_cross_block_use — a single use in a
+ * DIFFERENT block than the def stays Normal (§5's own SAME-BLOCK
+ * condition).
+ *
+ * @return void
+ */
+fn elide_candidate_kind_normal_on_cross_block_use() {
+    let info = uit_record_use(uit_empty(), 0, 7 to u32, false)
+    teko::assert::is_true(elide_candidate_kind(info, 0, 0) == elide_kind_normal())
+}
+
+#test
+/**
+ * elide_candidate_kind_normal_on_edge_only_single_use — a single use that
+ * is a cross-block edge-copy argument (not computational) stays Normal
+ * (§5's own FORCED-LOCAL "block-args" rule).
+ *
+ * @return void
+ */
+fn elide_candidate_kind_normal_on_edge_only_single_use() {
+    let info = uit_record_use(uit_empty(), 0, 0, true)
+    teko::assert::is_true(elide_candidate_kind(info, 0, 0) == elide_kind_normal())
+}
+
+#test
+/**
+ * elide_candidate_kind_tee_on_computational_plus_edge_same_block — exactly
+ * two uses, one computational + one edge-copy argument, BOTH in the def's
+ * own block: the "must ALSO persist to a local" `Tee` case.
+ *
+ * @return void
+ */
+fn elide_candidate_kind_tee_on_computational_plus_edge_same_block() {
+    let t1 = uit_record_use(uit_empty(), 0, 0, false)
+    let info = uit_record_use(t1, 0, 0, true)
+    teko::assert::is_true(elide_candidate_kind(info, 0, 0) == elide_kind_tee())
+}
+
+#test
+/**
+ * elide_candidate_kind_normal_on_two_computational_uses — two uses that are
+ * BOTH computational (neither is an edge argument) do not fit the `Tee`
+ * shape — stays Normal.
+ *
+ * @return void
+ */
+fn elide_candidate_kind_normal_on_two_computational_uses() {
+    let t1 = uit_record_use(uit_empty(), 0, 0, false)
+    let info = uit_record_use(t1, 0, 0, false)
+    teko::assert::is_true(elide_candidate_kind(info, 0, 0) == elide_kind_normal())
+}
+
+#test
+/**
+ * elide_candidate_kind_normal_on_block_param_regardless_of_use_count — a
+ * block-param is FORCED-LOCAL even with exactly one same-block
+ * computational use (§5).
+ *
+ * @return void
+ */
+fn elide_candidate_kind_normal_on_block_param_regardless_of_use_count() {
+    let t1 = uit_record_use(uit_empty(), 0, 0, false)
+    let info = uit_mark_param(t1, 0)
+    teko::assert::is_true(elide_candidate_kind(info, 0, 0) == elide_kind_normal())
+}
+
+#test
+/**
+ * elide_candidate_kind_normal_on_a_dead_value — a VReg never used at all
+ * (count `0`) is the default Normal arm (harmless — its own `local.set` is
+ * simply never read).
+ *
+ * @return void
+ */
+fn elide_candidate_kind_normal_on_a_dead_value() {
+    teko::assert::is_true(elide_candidate_kind(uit_empty(), 0, 0) == elide_kind_normal())
+}
+
+#test
+/**
+ * resolve_inst_operands_non_lifo_order_cancels_the_whole_pending_stack — a
+ * two-operand instruction whose OWN operand order does not match its
+ * operands' own production order (§5 condition 3, LIFO): `pending = [older,
+ * newer]` but the instruction wants to read `[newer, older]` — the very
+ * FIRST (reverse-order) check already mismatches, so NEITHER value may ride
+ * the stack; both are cancelled in one shot rather than an unsound "dig
+ * through the top and retry" shape (which would wrongly let a value ride
+ * into the WRONG operand position).
+ *
+ * @return void
+ */
+fn resolve_inst_operands_non_lifo_order_cancels_the_whole_pending_stack() {
+    let table0 = et_set(et_set(et_empty(), 10 to u32, elide_kind_drop()), 11 to u32, elide_kind_drop())
+    let pending = teko::list::push(teko::list::push(teko::list::empty(), PendingItem { vreg = 10 to u32; is_load = false }), PendingItem { vreg = 11 to u32; is_load = false })
+    let result = resolve_inst_operands(pending, table0, [10 to u32, 11 to u32])
+    teko::assert::is_true(result.pending.len == 0)
+    teko::assert::is_true(et_get(result.table, 10 to u32) == elide_kind_normal())
+    teko::assert::is_true(et_get(result.table, 11 to u32) == elide_kind_normal())
+}
+
+#test
+/**
+ * resolve_inst_operands_matching_lifo_order_survives_untouched — the SOUND
+ * counterpart: `pending = [older, newer]`, the instruction's own
+ * reverse-push-order reads are `[newer, older]` (its LAST-pushed operand
+ * checked first) — both match, in order, and neither entry is cancelled.
+ *
+ * @return void
+ */
+fn resolve_inst_operands_matching_lifo_order_survives_untouched() {
+    let table0 = et_set(et_set(et_empty(), 10 to u32, elide_kind_drop()), 11 to u32, elide_kind_drop())
+    let pending = teko::list::push(teko::list::push(teko::list::empty(), PendingItem { vreg = 10 to u32; is_load = false }), PendingItem { vreg = 11 to u32; is_load = false })
+    let result = resolve_inst_operands(pending, table0, [11 to u32, 10 to u32])
+    teko::assert::is_true(result.pending.len == 0)
+    teko::assert::is_true(et_get(result.table, 10 to u32) == elide_kind_drop())
+    teko::assert::is_true(et_get(result.table, 11 to u32) == elide_kind_drop())
+}
+
+#test
+/**
+ * cancel_pending_loads_forces_a_load_off_the_stack_across_a_barrier — the
+ * §5 condition-4 hazard: a pending `LLoad` result is downgraded to Normal
+ * at a barrier; a pending NON-load survives it untouched (`inst_is_load`'s
+ * own doc — only a load result is hazarded by a call/store).
+ *
+ * @return void
+ */
+fn cancel_pending_loads_forces_a_load_off_the_stack_across_a_barrier() {
+    let table0 = et_set(et_set(et_empty(), 20 to u32, elide_kind_drop()), 21 to u32, elide_kind_drop())
+    let pending = teko::list::push(teko::list::push(teko::list::empty(), PendingItem { vreg = 20 to u32; is_load = true }), PendingItem { vreg = 21 to u32; is_load = false })
+    let flushed = cancel_pending_loads(pending, table0)
+    teko::assert::is_true(flushed.pending.len == 1)
+    teko::assert::is_true(flushed.pending[0].vreg == (21 to u32))
+    teko::assert::is_true(et_get(flushed.table, 20 to u32) == elide_kind_normal())
+    teko::assert::is_true(et_get(flushed.table, 21 to u32) == elide_kind_drop())
+}
+
+#test
+/**
+ * stackify_func_load_across_a_call_stays_in_a_local — the barrier golden
+ * (§5 condition 4): `v = load(addr); call tk_nop(); return v` — `v`'s one
+ * use (the `ret`) is same-block and would otherwise be single-use-eligible,
+ * but the intervening `call` forces it off the stack; `addr` (the load's
+ * OWN single-use, same-block operand, defined immediately before it with no
+ * barrier in between) still elides normally.
+ *
+ * @return void
+ */
+fn stackify_func_load_across_a_call_stays_in_a_local() {
+    let ptypes = teko::list::push(teko::list::empty(), lir::LType::I32)
+    mut f = lir::new_func("teko__test__load_barrier", 1, ptypes, lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    let v = lir::alloc_vreg(f)
+    f = lir::append_inst(v.func, 0, lir::load_inst(v.vreg, 0, lir::LType::I32, 0, 0))
+    f = lir::append_inst(f, 0, lir::void_call_inst("tk_nop", teko::list::empty(), false, 0, 0))
+    f = lir::append_inst(f, 0, lir::ret_inst(v.vreg, 0, 0))
+    let symbols = wasm_symtab_add(wasm_symtab_empty(), "tk_nop", sft_void_target())
+    let out = match stackify_func(f, symbols, false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte,
+        0x28 to byte, 0x02 to byte, 0x00 to byte,
+        0x21 to byte, 0x01 to byte,
+        0x10 to byte, 0x03 to byte,
+        0x20 to byte, 0x01 to byte, 0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * stackify_func_tee_persists_a_value_also_fed_across_an_edge — the `Tee`
+ * golden (§5): a branch's own `cond` is ALSO the very block-arg it feeds
+ * into its `then` target — exactly two uses, one computational (the `cond`
+ * read, fused straight off the stack into the `if`) and one edge-copy
+ * argument, both in block 0. `local.tee` writes the local (for the edge
+ * copy to read back out) WHILE ALSO leaving the value on the stack for the
+ * branch's own `if`.
+ *
+ * @return void
+ */
+fn stackify_func_tee_persists_a_value_also_fed_across_an_edge() {
+    let ptypes = teko::list::push(teko::list::empty(), lir::LType::I32)
+    mut f = lir::new_func("teko__test__tee_persist", 1, ptypes, lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    let thenb = lir::alloc_block(f)
+    let tp = lir::add_block_param(thenb.func, thenb.block_id)
+    let elseb = lir::alloc_block(tp.func)
+    let then_args = teko::list::push(teko::list::empty(), 0 to u32)
+    f = lir::append_inst(elseb.func, 0, lir::branch_inst(0, thenb.block_id, then_args, elseb.block_id, teko::list::empty(), 0, 0))
+    f = lir::append_inst(f, thenb.block_id, lir::ret_inst(tp.vreg, 0, 0))
+    let r5 = lir::alloc_vreg(f)
+    f = lir::append_inst(r5.func, elseb.block_id, lir::const_int_inst(r5.vreg, 5 to i128, 0, 0))
+    f = lir::append_inst(f, elseb.block_id, lir::ret_inst(r5.vreg, 0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x22 to byte, 0x00 to byte,
+        0x04 to byte, 0x40 to byte,
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
+        0x20 to byte, 0x01 to byte, 0x0F to byte,
+        0x05 to byte,
+        0x41 to byte, 0x05 to byte,
+        0x0F to byte,
+        0x0B to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * wasm_synth_start_rejects_a_non_i32_non_void_main_ret — the defensive
+ * NAMED `C1-main-ret` honest-stop (a riders fix, `#389` C1-5 dispatch
+ * re-review): `wasm_synth_start` only knows the virtual-main ABI's own
+ * `I32`/`Void` return shapes; anything else would feed `proc_exit` a
+ * type-mismatched operand rather than silently miscompiling.
+ *
+ * @return void
+ */
+fn wasm_synth_start_rejects_a_non_i32_non_void_main_ret() {
+    match wasm_synth_start(0 to u32, 0 to u32, 0 to u32, lir::LType::I64) {
+        WasmFunc => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "C1-main-ret")
+    }
+}
+
+/* ==========================================================================
+ * C1-5 — the adversarial-review fix (PR #546): `resolve_inst_operands`'s
+ * own PARTIAL-match branch (a real, reproduced miscompile — a pop-as-you-go
+ * scan that only cancelled what was STILL pending on a mismatch left
+ * ALREADY-POPPED top matches wrongly riding the stack, inverting a
+ * non-commutative op's operand order) is now ALL-OR-NOTHING, and
+ * `sc_use_operands` mirrors the same rule on the emission side.
+ * ========================================================================== */
+
+#test
+/**
+ * resolve_inst_operands_partial_match_cancels_the_whole_pending_stack — the
+ * exact shape the adversarial review reproduced end-to-end: `pending =
+ * [c]` (one entry, tentatively `Drop`), an instruction whose own reversed
+ * reads are `[c, bp]` — the LAST-pushed operand (`c`) matches `pending`'s
+ * top, but the operand BEFORE it (`bp`) is not pending at all (it is
+ * `Normal`, multi-use). The old "pop the matches, cancel only what's left"
+ * shape left `c` wrongly `Drop` (already popped, so never revisited by the
+ * cancellation step) — the fix cancels `c` too, over the ORIGINAL pending,
+ * because a PARTIAL ride is exactly as unsound as a total mismatch.
+ *
+ * @return void
+ */
+fn resolve_inst_operands_partial_match_cancels_the_whole_pending_stack() {
+    let table0 = et_set(et_empty(), 10 to u32, elide_kind_drop())
+    let pending = teko::list::push(teko::list::empty(), PendingItem { vreg = 10 to u32; is_load = false })
+    let result = resolve_inst_operands(pending, table0, [10 to u32, 99 to u32])
+    teko::assert::is_true(result.pending.len == 0)
+    teko::assert::is_true(et_get(result.table, 10 to u32) == elide_kind_normal())
+}
+
+/**
+ * sft_bp_via_block_param — a 2-block, 1-param `LFunc` whose param reaches a
+ * SECOND block purely as that block's own incoming block-arg (`bp`) — a
+ * block-param is FORCED-LOCAL regardless of use count (§5), so `bp` is
+ * `Normal` with NO extra "give it a second use" fixture noise. `op(bp,
+ * const)` (built by the caller) is the fixture's own operand pair: `bp`
+ * (`Normal`, never pending) paired with a FRESH single-use constant (a
+ * `Drop` CANDIDATE the fix must downgrade back to `Normal`, since `bp`
+ * itself can never ride).
+ *
+ * @param lir::LBinOp op  the binary op `bp op const_val` computes
+ * @param i128 const_val  the second operand's own constant value
+ * @return lir::LFunc  the seeded function (its own `ret`'s value is the
+ *                      op's own result)
+ */
+fn sft_bp_via_block_param(op: lir::LBinOp, const_val: i128) -> lir::LFunc {
+    mut f = lir::new_func("teko__test__bp_op_const", 1, [lir::LType::I32], lir::LType::I32)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    let b1 = lir::alloc_block(f)
+    let bp = lir::add_block_param(b1.func, b1.block_id)
+    let entry_args = teko::list::push(teko::list::empty(), 0 to u32)
+    f = lir::append_inst(bp.func, 0, lir::jump_inst(b1.block_id, entry_args, 0, 0))
+    let c = lir::alloc_vreg(f)
+    f = lir::append_inst(c.func, b1.block_id, lir::const_int_inst(c.vreg, const_val, 0, 0))
+    let r = lir::alloc_vreg(f)
+    f = lir::append_inst(r.func, b1.block_id, lir::bin_inst(r.vreg, op, bp.vreg, c.vreg, 0, 0))
+    lir::append_inst(f, b1.block_id, lir::ret_inst(r.vreg, 0, 0))
+}
+
+#test
+/**
+ * stackify_func_non_commutative_sub_keeps_the_correct_operand_order — the
+ * adversarial review's own repro, end to end: `bp - 7`. Before the fix this
+ * emitted `i32.const 7; local.get bp; i32.sub` (`7 - bp`, WRONG); the fix
+ * forces BOTH operands off the stack (`bp` was never eligible; `7`'s
+ * partial ride is now correctly cancelled too), so the ALL-LOCALS order is
+ * preserved: `local.get bp; i32.const 7; i32.sub` (`bp - 7`, CORRECT).
+ *
+ * @return void
+ */
+fn stackify_func_non_commutative_sub_keeps_the_correct_operand_order() {
+    let f = sft_bp_via_block_param(lir::LBinOp::ISub, 7 to i128)
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
+        0x41 to byte, 0x07 to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x01 to byte, 0x20 to byte, 0x02 to byte, 0x6B to byte,
+        0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * stackify_func_non_commutative_compare_keeps_the_correct_operand_order —
+ * the comparison-family repro: `bp < 7` (`ICmpLtS`). Every comparison is
+ * non-commutative the SAME way `ISub` is; the fix's own all-or-nothing rule
+ * applies identically: `local.get bp; i32.const 7; i32.lt_s`.
+ *
+ * @return void
+ */
+fn stackify_func_non_commutative_compare_keeps_the_correct_operand_order() {
+    let f = sft_bp_via_block_param(lir::LBinOp::ICmpLtS, 7 to i128)
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
+        0x41 to byte, 0x07 to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x01 to byte, 0x20 to byte, 0x02 to byte, 0x48 to byte,
+        0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * stackify_func_store_with_normal_addr_and_a_would_be_drop_value — an
+ * `LStore` golden: `addr` is a block-param (`Normal`, never pending) and
+ * `value` is a single-use constant that would (buggily) partially ride the
+ * stack alone. The fix forces `value` back to a local too — `local.get
+ * addr; local.get value; i32.store` — never `i32.const N` left riding into
+ * a store whose OWN address operand comes from a DIFFERENT, unrelated
+ * local.get, which would silently store the WRONG value at the WRONG
+ * moment relative to the address.
+ *
+ * @return void
+ */
+fn stackify_func_store_with_normal_addr_and_a_would_be_drop_value() {
+    mut f = lir::new_func("teko__test__store_normal_addr", 1, [lir::LType::I32], lir::LType::Void)
+    f = lir::append_inst(f, 0, lir::param_inst(0, 0, 0, 0))
+    let b1 = lir::alloc_block(f)
+    let addr = lir::add_block_param(b1.func, b1.block_id)
+    let entry_args = teko::list::push(teko::list::empty(), 0 to u32)
+    f = lir::append_inst(addr.func, 0, lir::jump_inst(b1.block_id, entry_args, 0, 0))
+    let cval = lir::alloc_vreg(f)
+    f = lir::append_inst(cval.func, b1.block_id, lir::const_int_inst(cval.vreg, 42 to i128, 0, 0))
+    f = lir::append_inst(f, b1.block_id, lir::store_inst(addr.vreg, cval.vreg, lir::LType::I32, 0, 0))
+    f = lir::append_inst(f, b1.block_id, lir::ret_void_inst(0, 0))
+    let out = match stackify_func(f, wasm_symtab_empty(), false) { WasmFuncBody as x => x; error => return }
+    let want = [
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x00 to byte,
+        0x20 to byte, 0x00 to byte, 0x21 to byte, 0x01 to byte,
+        0x41 to byte, 0x2A to byte, 0x21 to byte, 0x02 to byte,
+        0x20 to byte, 0x01 to byte, 0x20 to byte, 0x02 to byte,
+        0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x0F to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(out.body, want))
+}
+
+#test
+/**
+ * wasm_synth_io_write_print_no_newline_golden — `wasm_synth_io_write(fd=1,
+ * newline=false, …)` (C1-6, the `tk_print`/`tk_write` trampoline body): store
+ * `(ptr, len)` into the scratch iovec, ONE `fd_write(1, …)` call + `drop`, no
+ * newline tail.
+ *
+ * @return void
+ */
+fn wasm_synth_io_write_print_no_newline_golden() {
+    let f = wasm_synth_io_write(1 to u32, false, 5 to u32, 1 to u32)
+    teko::assert::is_true(f.type_index == (5 to u32))
+    let want = [
+        0x41 to byte, 0x00 to byte, 0x20 to byte, 0x00 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x04 to byte, 0x20 to byte, 0x01 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x01 to byte, 0x41 to byte, 0x00 to byte, 0x41 to byte, 0x01 to byte, 0x41 to byte, 0x08 to byte,
+        0x10 to byte, 0x01 to byte, 0x1A to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(f.body, want))
+}
+
+#test
+/**
+ * wasm_synth_io_write_println_newline_golden — `wasm_synth_io_write(fd=1,
+ * newline=true, …)` (C1-6, the `tk_println` trampoline body): the same
+ * `(ptr, len)`-then-`fd_write` prefix as `tk_print`, followed by the
+ * trailing-newline tail (`wasm_io_write_newline` — stage `0x0A`, point the
+ * scratch iovec at it, a SECOND `fd_write`).
+ *
+ * @return void
+ */
+fn wasm_synth_io_write_println_newline_golden() {
+    let f = wasm_synth_io_write(1 to u32, true, 5 to u32, 1 to u32)
+    let want = [
+        0x41 to byte, 0x00 to byte, 0x20 to byte, 0x00 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x04 to byte, 0x20 to byte, 0x01 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x01 to byte, 0x41 to byte, 0x00 to byte, 0x41 to byte, 0x01 to byte, 0x41 to byte, 0x08 to byte,
+        0x10 to byte, 0x01 to byte, 0x1A to byte,
+        0x41 to byte, 0x0C to byte, 0x41 to byte, 0x0A to byte, 0x3A to byte, 0x00 to byte, 0x00 to byte,
+        0x41 to byte, 0x00 to byte, 0x41 to byte, 0x0C to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x04 to byte, 0x41 to byte, 0x01 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x01 to byte, 0x41 to byte, 0x00 to byte, 0x41 to byte, 0x01 to byte, 0x41 to byte, 0x08 to byte,
+        0x10 to byte, 0x01 to byte, 0x1A to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(f.body, want))
+}
+
+#test
+/**
+ * wasm_synth_io_write_eprint_uses_fd_2 — `wasm_synth_io_write(fd=2,
+ * newline=false, …)` (C1-6, the `tk_eprint`/`tk_ewrite` trampoline body):
+ * identical shape to `tk_print`'s golden except the `fd_write` FD immediate
+ * is `2` (stderr) not `1`.
+ *
+ * @return void
+ */
+fn wasm_synth_io_write_eprint_uses_fd_2() {
+    let f = wasm_synth_io_write(2 to u32, false, 5 to u32, 1 to u32)
+    let want = [
+        0x41 to byte, 0x00 to byte, 0x20 to byte, 0x00 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x04 to byte, 0x20 to byte, 0x01 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x02 to byte, 0x41 to byte, 0x00 to byte, 0x41 to byte, 0x01 to byte, 0x41 to byte, 0x08 to byte,
+        0x10 to byte, 0x01 to byte, 0x1A to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(f.body, want))
+}
+
+#test
+/**
+ * wasm_synth_panic_str_golden — `wasm_synth_panic_str` (§8, C1-6): the same
+ * `(ptr, len)`-store prefix, ONE `fd_write(2, …)` (stderr) call + `drop`
+ * (§8 step 1 — the host OBSERVES the structured message), then `unreachable`
+ * (`0x00`, §8 step 2 — TRAP, never recover) instead of a normal fall-through
+ * `end`.
+ *
+ * @return void
+ */
+fn wasm_synth_panic_str_golden() {
+    let f = wasm_synth_panic_str(5 to u32, 1 to u32)
+    teko::assert::is_true(f.type_index == (5 to u32))
+    let want = [
+        0x41 to byte, 0x00 to byte, 0x20 to byte, 0x00 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x04 to byte, 0x20 to byte, 0x01 to byte, 0x36 to byte, 0x02 to byte, 0x00 to byte,
+        0x41 to byte, 0x02 to byte, 0x41 to byte, 0x00 to byte, 0x41 to byte, 0x01 to byte, 0x41 to byte, 0x08 to byte,
+        0x10 to byte, 0x01 to byte, 0x1A to byte,
+        0x00 to byte,
+        0x0B to byte
+    ]
+    teko::assert::is_true(wasm_bytes_eq(f.body, want))
+}
+
+#test
+/**
+ * wasm_synth_io_panic_funcs_builds_five_funcs_sharing_one_type — the fixed
+ * `print, println, eprint, eprintln, panic_str` order (C1-6), every entry
+ * sharing the ONE `(i32, i32) -> ()` type index passed in.
+ *
+ * @return void
+ */
+fn wasm_synth_io_panic_funcs_builds_five_funcs_sharing_one_type() {
+    let out = wasm_synth_io_panic_funcs(5 to u32, 1 to u32)
+    teko::assert::is_true(out.funcs.len == (5 to u64))
+    teko::assert::is_true(out.funcs[0].type_index == (5 to u32))
+    teko::assert::is_true(out.funcs[1].type_index == (5 to u32))
+    teko::assert::is_true(out.funcs[2].type_index == (5 to u32))
+    teko::assert::is_true(out.funcs[3].type_index == (5 to u32))
+    teko::assert::is_true(out.funcs[4].type_index == (5 to u32))
+    teko::assert::is_true(println_body_carries_the_newline_tail_print_does_not(out))
+    teko::assert::is_true(panic_body_ends_in_unreachable_not_a_bare_end(out))
+}
+
+/**
+ * println_body_carries_the_newline_tail_print_does_not — `println`'s body
+ * (position `1`) is strictly longer than `print`'s (position `0`) — the
+ * ONLY structural difference `wasm_synth_io_write`'s `newline` flag makes
+ * (the trailing-newline tail, `wasm_io_write_newline`).
+ *
+ * @param WasmIoPanicFuncs out  the five synthesized trampolines
+ * @return bool  true iff `println`'s body is longer than `print`'s
+ */
+fn println_body_carries_the_newline_tail_print_does_not(out: WasmIoPanicFuncs) -> bool {
+    out.funcs[1].body.len > out.funcs[0].body.len
+}
+
+/**
+ * panic_body_ends_in_unreachable_not_a_bare_end — `panic_str`'s body
+ * (position `4`) ends in `unreachable end` (`0x00 0x0B`), not a bare `end`
+ * (§8's observe-then-trap shape, never a normal fall-through).
+ *
+ * @param WasmIoPanicFuncs out  the five synthesized trampolines
+ * @return bool  true iff the second-to-last body byte is `unreachable`
+ */
+fn panic_body_ends_in_unreachable_not_a_bare_end(out: WasmIoPanicFuncs) -> bool {
+    let panic_body = out.funcs[4].body
+    panic_body[panic_body.len - (2 to u64)] == (0x00 to byte)
+}
+
+#test
+/**
+ * wasm_register_io_symbols_resolves_the_seven_runtime_symbols — `tk_print`/
+ * `tk_write` and `tk_eprint`/`tk_ewrite` share a funcidx pair
+ * (`teko_rt.c:1300-1303`'s own identical bodies); `tk_println`/`tk_eprintln`
+ * get their own; `tk_panic_str` closes the set at `base+4` — every one
+ * `Void`-returning (C1-6, §8).
+ *
+ * @return void
+ */
+fn wasm_register_io_symbols_resolves_the_seven_runtime_symbols() {
+    let t = wasm_register_io_symbols(wasm_symtab_empty(), 10 to u32)
+    let print_t = match wasm_resolve_call(t, "tk_print") { WasmCallTarget as x => x; error => return }
+    let write_t = match wasm_resolve_call(t, "tk_write") { WasmCallTarget as x => x; error => return }
+    let println_t = match wasm_resolve_call(t, "tk_println") { WasmCallTarget as x => x; error => return }
+    let eprint_t = match wasm_resolve_call(t, "tk_eprint") { WasmCallTarget as x => x; error => return }
+    let ewrite_t = match wasm_resolve_call(t, "tk_ewrite") { WasmCallTarget as x => x; error => return }
+    let eprintln_t = match wasm_resolve_call(t, "tk_eprintln") { WasmCallTarget as x => x; error => return }
+    let panic_t = match wasm_resolve_call(t, "tk_panic_str") { WasmCallTarget as x => x; error => return }
+    teko::assert::is_true(print_t.func_index == (10 to u32))
+    teko::assert::is_true(write_t.func_index == (10 to u32))
+    teko::assert::is_true(println_t.func_index == (11 to u32))
+    teko::assert::is_true(eprint_t.func_index == (12 to u32))
+    teko::assert::is_true(ewrite_t.func_index == (12 to u32))
+    teko::assert::is_true(eprintln_t.func_index == (13 to u32))
+    teko::assert::is_true(panic_t.func_index == (14 to u32))
+    teko::assert::is_true(print_t.ret_type == lir::LType::Void)
+}
+
+#test
+/**
+ * wasm_register_io_symbols_leaves_an_unregistered_symbol_unresolved — the
+ * table only ever grows by exactly the seven io/panic entries; any other
+ * symbol still honest-stops (`wasm_resolve_call`'s own "the caller must
+ * register it" NAMED error).
+ *
+ * @return void
+ */
+fn wasm_register_io_symbols_leaves_an_unregistered_symbol_unresolved() {
+    let t = wasm_register_io_symbols(wasm_symtab_empty(), 10 to u32)
+    match wasm_resolve_call(t, "tk_str_concat") {
+        WasmCallTarget => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "unresolved call symbol")
+    }
+}
+
+#test
+/**
+ * append_wasm_funcs_concatenates_in_order — `[]WasmFunc` has no built-in
+ * concat (mirrors `encode_arm64.tks`'s `append_bytes` over a different
+ * element type, C1-6): `append_wasm_funcs` appends every `src` entry after
+ * `funcs`, in order.
+ *
+ * @return void
+ */
+fn append_wasm_funcs_concatenates_in_order() {
+    let a = WasmFunc { type_index = 1 to u32; local_groups = teko::list::empty(); body = teko::list::empty() }
+    let b = WasmFunc { type_index = 2 to u32; local_groups = teko::list::empty(); body = teko::list::empty() }
+    let c = WasmFunc { type_index = 3 to u32; local_groups = teko::list::empty(); body = teko::list::empty() }
+    let out = append_wasm_funcs([a], [b, c])
+    teko::assert::is_true(out.len == (3 to u64))
+    teko::assert::is_true(out[0].type_index == (1 to u32))
+    teko::assert::is_true(out[1].type_index == (2 to u32))
+    teko::assert::is_true(out[2].type_index == (3 to u32))
+}
+
+#test
+/**
+ * wasm_io_base_index_follows_the_program_funcs — the first io/panic
+ * trampoline's own funcidx sits right after every `LModule.funcs` entry, in
+ * the shared import-then-defined index space (C1-6).
+ *
+ * @return void
+ */
+fn wasm_io_base_index_follows_the_program_funcs() {
+    let wasi = wasm_wasi_import_set()
+    let lmod = lir::add_func(lir::add_func(lir::empty_module(), sft_main_func()), sft_empty_func())
+    teko::assert::is_true(wasm_io_base_index(wasi, lmod) == (4 to u32))
+}
