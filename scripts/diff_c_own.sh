@@ -196,7 +196,15 @@ CORPUS=(
     own_sub_exit
     own_if_exit
     own_match_exit
+    own_logical_not
     own_print_exit
+    own_loop_range_native
+    own_loop_nested_range
+    own_defer_arm_write_propagates
+    own_value_if_rhs_reassign
+    own_match_arm_reassign_vs_shadow
+    own_if_value_rhs_shadow_then_outer_reassign
+    own_match_reassign_then_shadow
 )
 
 # ── KNOWN-STOP list ────────────────────────────────────────────────────────────────────

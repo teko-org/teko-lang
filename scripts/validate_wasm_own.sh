@@ -47,15 +47,29 @@
 #   TEKO=<self-hosted-teko>   (default: ./bin/teko — MUST carry emit_native's wasm tail)
 #   BUILDER=<seed-teko>       (default: ./build/teko then `teko` on PATH) — self-hosts
 #                             ./bin/teko when it is missing
+#   REQUIRE_WASM_ENGINE=1     (default: unset) — issue #389 C1-8c keystone seam. The dev-
+#                             laptop default (unset) keeps the honest-skip below: a missing
+#                             wasm-validate/wasmtime degrades the gate rather than failing
+#                             the build. CI's wasm leg PROVISIONS both engines and sets this
+#                             so a broken/absent provisioning step is a HARD FAILURE instead
+#                             of a silently-green skip — the whole point of the keystone is
+#                             that #389 never closes on a vacuously-passing leg.
 
 set -u
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+require_engine="${REQUIRE_WASM_ENGINE:-0}"
+
 have_validate=1
 command -v wasm-validate >/dev/null 2>&1 || have_validate=0
 have_wasmtime=1
 command -v wasmtime >/dev/null 2>&1 || have_wasmtime=0
+
+if [[ "$require_engine" -eq 1 && ( "$have_validate" -eq 0 || "$have_wasmtime" -eq 0 ) ]]; then
+    echo "validate_wasm_own: REQUIRE_WASM_ENGINE=1 but wasm-validate=$have_validate wasmtime=$have_wasmtime — failing closed (this mode never honest-skips)" >&2
+    exit 2
+fi
 
 if [[ "$have_validate" -eq 0 && "$have_wasmtime" -eq 0 ]]; then
     echo "validate_wasm_own: skipped — neither wasm-validate (WABT) nor wasmtime found on PATH; install one to check the own-wasm modules"
@@ -117,6 +131,58 @@ fixture_root="$script_dir/examples/regressions"
 # "wasm32-wasi" via `target_of`'s own fallback) so this one fixture alone builds under
 # TEKO_TARGET=wasm64-wasi and its own-wasm leg runs with wasmtime's `-W memory64=y`/
 # wasm-validate's `--enable-memory64` (the memory64 proposal is NOT on by default).
+#
+# Three of the five §14.1/§12.2 FIX-1/FIX-2 engine-level control-flow proofs (#389 C1-8b)
+# join the corpus here: `wasm_if_both_diverge` proves FIX-1(b) (an if/else whose both arms
+# diverge has no merge block, so neither arm gets an arm label); `wasm_break_in_if` proves
+# FIX-1(c) (a break nested in an if inside a loop still gets its single-predecessor loop-exit
+# labeled unconditionally); `wasm_labeled_break` proves #520 (a labeled break resolves to a
+# multi-level `br N` at the right scope depth). All three are PLAIN `loop { }` shapes (no
+# range/`for` head) — verified own-wasm(wasmtime) == C-native.
+#
+# `own_if_reassign_exit` joins the corpus as F1's (#389) own-wasm proof: `mut x = 0; if 1 == 1
+# { x = 5 }; exit(x)` -> 5, own-wasm(wasmtime) == C-native, EMPIRICALLY VERIFIED (self-hosted
+# build + wasmtime run). `own_if_mut_shadow_no_leak` joins as F1's review round 1, Finding 2(i)
+# proof: `mut x = 1; if 1 == 1 { mut x = 99; x = x + 1 }; exit(x)` -> 1, ALSO EMPIRICALLY
+# VERIFIED own-wasm(wasmtime) == C-native. Both prove the LIR-level merge-scalar fix
+# (`reassigned_scalars`/`collect_bound_stmts`, `src/lir/lower.tks`) is correct for the own-wasm
+# backend on a NON-LOOP if/match merge.
+#
+# `wasm_loop_count` (FIX-2, sum(0..4) = 6) and `wasm_continue_step` (§11.5, sum of the even i
+# in 0..6 = 6) join the corpus with the F1c fix (#389). F1c RETARGETS the earlier "stackifier
+# gap" diagnosis, which was WRONG: `src/backend/stackify.tks` is correct and untouched. The
+# real root was in the SHARED LIR — `src/lir/lower.tks` lowered `!` (logical-not) to the
+# BITWISE one's-complement (LUnOp::INot), and for a bool operand `!1 = 0xFFFFFFFE` / `!0 =
+# 0xFFFFFFFF` are BOTH nonzero, so a conditional branch (tests nonzero) took the then-arm for
+# `!true` AND `!false` alike. The range-`for` desugar (`src/parser/loop_head.tks`: `if !_first
+# { i += 1 }` and `if !(i < _hi) { break }`) therefore broke on iteration 1 -> exit 0. F1c
+# lowers `!` to a LOGICAL not (`operand == 0`), so these loops now iterate correctly and
+# own-wasm(wasmtime) == C-native == 6. `own_logical_not` joins as the DIRECT proof of `!` on
+# both own backends (the first own-backend fixture to exercise `!` at all).
+#
+# `own_logical_not` (F1c, #389): `mut b = true; if !b { exit(1) }; if !(1 < 2) { exit(2) };
+# if !(2 < 1) { exit(7) }; exit(0)` -> 7. `!true` (both `!b` and `!(1<2)`) is false so exit(1)
+# and exit(2) are SKIPPED; `!(2<1)` = `!false` is TRUE so exit(7) FIRES. The old bitwise-INot
+# would have fired exit(1) first. own-wasm(wasmtime) == C-native on exit 7.
+#
+# `own_match_pattern_binding_no_collision` (F1's review round 1, Finding 2(ii) proof — a
+# `Shape` variant's `Circle as x` arm collides by name with the enclosing `x` a sibling arm
+# reassigns) is verified own-native == C-native == 1 via `scripts/diff_c_own.sh` (EMPIRICALLY
+# RE-VERIFIED), but is WITHHELD from THIS (wasm) corpus: its own-wasm build's `.wasm` fails
+# `wasm-validate` with a genuine engine rejection ("type mismatch in i64.store, expected [i32,
+# i64] but got [i32, i32]") — a SEPARATE, pre-existing own-wasm struct/variant field-store gap
+# (unrelated to scalar merge-threading), exposed because no prior wasm-corpus fixture combined
+# a variant CONSTRUCTION with a pattern-bind arm. REPORTED alongside the F1c stackifier finding
+# above; also out of this crumb's scope.
+#
+# `own_match_arm_reassign_vs_shadow` (6), `own_if_value_rhs_shadow_then_outer_reassign` (7) and
+# `own_match_reassign_then_shadow` (3) join with F1b item 3 (#389, §6.2 — the across-all-arms
+# over-exclusion fix). Enclosing-IDENTITY threading (`arm_scalar_args` reads each arm's jump-arg
+# at the threaded name's fixed PRE-BRANCH index) drops the coarse shadow exclusion: a legitimately
+# reassigned enclosing scalar is threaded even when a SIBLING arm shadows the name, and the
+# reassign-then-shadow hard case threads the pre-shadow enclosing value. All three run plain
+# if/match merges (no struct/variant field-store), so own-wasm(wasmtime) == C-native on exit
+# 6/7/3 respectively.
 CORPUS=(
     own_exit_zero
     own_exit_code
@@ -128,6 +194,19 @@ CORPUS=(
     wasm_panic_hook
     wasm_defer_arm_scope
     wasm64_arith_exit
+    wasm_if_both_diverge
+    wasm_break_in_if
+    wasm_labeled_break
+    own_if_reassign_exit
+    own_if_mut_shadow_no_leak
+    own_logical_not
+    wasm_loop_count
+    wasm_continue_step
+    own_defer_arm_write_propagates
+    own_value_if_rhs_reassign
+    own_match_arm_reassign_vs_shadow
+    own_if_value_rhs_shadow_then_outer_reassign
+    own_match_reassign_then_shadow
 )
 KIND=(
     exit
@@ -139,6 +218,19 @@ KIND=(
     print
     trap
     print
+    exit
+    exit
+    exit
+    exit
+    exit
+    exit
+    exit
+    exit
+    exit
+    exit
+    exit
+    exit
+    exit
     exit
 )
 TARGET=(
@@ -152,6 +244,19 @@ TARGET=(
     wasm32-wasi
     wasm32-wasi
     wasm64-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
+    wasm32-wasi
 )
 
 kind_of() {
