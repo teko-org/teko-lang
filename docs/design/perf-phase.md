@@ -54,10 +54,42 @@ later, principled change replaces.
   bolted on after.
 * **(d) `owner 2026-07-14`** — tests are to be **isolated/parallelized onto a
   thread**, not removed.
+* **(e) `owner 2026-07-14` — PGO is the capstone optimizer; this phase only
+  UNBLOCKS LATENCY.** The manual fixes here (`-O2` seed, `with_cap`, arena
+  scoping) exist to make the compiler usable NOW. The genuine, durable
+  optimization is **PGO**: a real profile of the *compiler's own execution* that,
+  where the profiler shows a bottleneck, will **increase arena region size/depth**
+  or **turn hot points `unsafe`** (skip checks that are hot AND provably safe) —
+  data-driven, "almost like an SQL query analyzer suggesting and applying
+  bottleneck fixes." Ties to ruling (c): the own backend/linker carries the PGO
+  stage from day one.
+* **(f) `owner 2026-07-14` — keep `emit`/`concat` AS-IS; do NOT stream the emit to
+  disk and do NOT change `concat`.** Today's bottleneck is `malloc` (small-string
+  churn); once the C backend dies it **migrates to arena-resize**, and PGO (ruling
+  e) tunes that genuinely. Streaming the ~8 MB emit to a file would trim only the
+  emit peak (~8-16 MB of a 0.5-1.8 GB peak) and is not worth the churn.
+* **(g) `owner 2026-07-14` — the string interner is NOT wired.** The enabling PR
+  ships the interner *intrinsic* staged-off (harmless, available), but the hot
+  path (`cg_variant_typename_str`) is **NOT routed through it** — it is exactly the
+  `malloc`/string churn PGO owns (ruling e/f), and a review found the current
+  interner returns permanent libc-heap copies that could *raise* peak RSS vs the
+  reclaimable arena it replaces. The manual apply-work is **`with_cap` + arena
+  scoping ONLY**.
 
-Consequence for this phase: fixes #1-#3 (DURABLE) target the unoptimized dev/CI
-path that ruling (a) budgets; fix #4 (`-O2` interim) is subsumed by the
-optimization axis of rulings (b)/(c) and should not be entrenched.
+Consequence for this phase: the DURABLE manual fixes narrow to **`with_cap`
+(pre-size hot list-builders) + arena scoping (Boundary A)**, which target the
+unoptimized dev/CI path ruling (a) budgets. `-O2` (fix #4) is an interim CI
+stopgap subsumed by the optimization axis of rulings (b)/(c) — and is itself
+gated on the emitted-C UB **#283** (`zig -O2` miscompile) before the Linux/CI seed
+can be `-O2`. The interner (fix #3) is dropped from manual wiring per ruling (g).
+All heavier string/`malloc`/arena-resize tuning is deferred to PGO (ruling e).
+
+### Bootstrap sequencing (seed-chain)
+The manual fixes need compiler intrinsics the released seed lacks (`with_cap`,
+`tk_arena_commit`), so they cannot be *used* in `src/**` until a seed that HAS
+them is released. Order: **enabling PR** (intrinsics staged off, proven via
+gen1-built fixtures) -> **seed refresh** -> **apply-PRs** (`with_cap` at the hot
+sites; arena Boundary-A rewind). This is the standard per-merge seed chain.
 
 ## 4. Native honest-stop — blocker for the default -> native inversion
 
