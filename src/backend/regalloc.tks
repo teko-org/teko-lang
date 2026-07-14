@@ -596,35 +596,86 @@ fn terminator_target(inst: MInst) -> TargetOpt {
 }
 
 /**
- * has_back_edge — whether any terminator on an ENTRY-REACHABLE block is a
- * RETREATING edge in RPO (`pos(target) <= pos(source)`): the exact loop test on
- * a reducible CFG (§3). An acyclic nested `if`/`match` has no retreating edge
- * among its reachable blocks, so it no longer false-positives — including a
- * `match` whose irrefutable final arm leaves its defensive fallback UNREACHABLE
- * (that dead block lands LAST in the numbering, so its forward jump to the
- * merge would otherwise look like a retreat; `reachable` excludes it, A4-6
- * #385). A real `loop` latch→header edge retreats between two reachable blocks
- * and still honest-stops (A3-loop deferral, §6.2). Replaces the
- * allocation-order id proxy (#443).
+ * NaturalLoop — one natural loop described by two program points over the linear
+ * numbering (§6.2): `header_pt`, the first point of the loop-header block (the
+ * retreating edge's target), and `latch_pt`, the point of the retreating branch
+ * itself (the loop's highest body point in RPO). The §6.2 replacement for the
+ * old bare back-edge boolean: it DESCRIBES each loop's span so `extend_over_loops` can
+ * widen a header-live interval across the whole body. A value live at `header_pt`
+ * must stay live to `latch_pt` — the next iteration re-enters at the header.
  *
- * @param []NumberedInst stream  the numbered stream
+ * @since #389 F2
+ */
+type NaturalLoop = struct {
+    /**
+     * header_pt — the first program point of the loop-header block (the
+     * retreating edge's target); the value's live-at-header boundary.
+     */
+    header_pt: u32
+    /**
+     * latch_pt — the program point of the retreating branch (the latch block's
+     * terminator, the loop's highest body point in RPO); the widen target.
+     */
+    latch_pt: u32
+}
+
+/**
+ * block_first_point — the smallest program point of any instruction in block
+ * `block_id`, or 0 when the block has no instruction in `stream`. The stream is
+ * RPO-numbered, so this is the block's entry point (its live-in boundary), used
+ * as a loop header's `header_pt`.
+ *
+ * @param []NumberedInst stream  the RPO-numbered stream
+ * @param u32 block_id  the block whose first point to find
+ * @return u32  the block's smallest program point (0 if absent)
+ */
+fn block_first_point(stream: []NumberedInst, block_id: u32) -> u32 {
+    mut have: bool = false
+    mut best: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.block_id == block_id {
+            if !have || ni.point < best { best = ni.point; have = true }
+        }
+        i++
+    }
+    best
+}
+
+/**
+ * natural_loops — every natural loop of the reachable CFG, one per retreating
+ * (loop back-)edge (§6.2, the §3 replacement for the old bare back-edge bool
+ * `has_back_edge` once returned). A terminator on an ENTRY-REACHABLE block
+ * whose target does not follow it in RPO (`pos(target) <= pos(source)`) is a
+ * retreating edge; its target is the loop header (`header_pt =
+ * block_first_point(target)`) and its source-branch point the latch
+ * (`latch_pt`). Dead-block sources are excluded (a dead edge is not a loop,
+ * A4-6 #385) and acyclic `if`/`match` nesting has no retreating edge, so the
+ * result is empty for the acyclic subset.
+ *
+ * @param []NumberedInst stream  the RPO-numbered stream
  * @param []u32 order  the RPO block-id order
  * @param []u32 reachable  the entry-reachable block ids (dead-block sources are
- *                         excluded — a dead edge is not a loop, §6.2)
- * @return bool  true iff a retreating (back-)edge leaves a reachable block
+ *                         excluded — a dead edge is not a loop)
+ * @return []NaturalLoop  one loop span per retreating edge
  */
-fn has_back_edge(stream: []NumberedInst, order: []u32, reachable: []u32) -> bool {
+fn natural_loops(stream: []NumberedInst, order: []u32, reachable: []u32) -> []NaturalLoop {
+    mut out: []NaturalLoop = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= stream.len { break }
         let ni = stream[i]
         let t = terminator_target(ni.inst)
         if t.has && u32_in(reachable, ni.block_id) {
-            if block_pos(order, t.target) <= block_pos(order, ni.block_id) { return true }
+            if block_pos(order, t.target) <= block_pos(order, ni.block_id) {
+                out = teko::list::push(out, NaturalLoop { header_pt = block_first_point(stream, t.target); latch_pt = ni.point })
+            }
         }
         i++
     }
-    false
+    out
 }
 
 /**
@@ -854,21 +905,84 @@ fn phys_intervals(events: []RegEvent, r: MReg, stream: []NumberedInst, call_poin
 }
 
 /**
+ * extend_interval_over_loops — widen one interval's `end` so it covers every
+ * natural loop it is live at the header of (§6.2): for each loop whose value is
+ * defined before the header (`start < header_pt`) and still live at it
+ * (`end >= header_pt`), the `end` grows to at least the loop's `latch_pt`, so the
+ * value survives the whole body across the back-edge. Contiguous and
+ * conservative: only `end` grows, and `crosses_call` is recomputed over the
+ * widened range. An interval not live at any loop header is returned unchanged.
+ *
+ * @param LiveInterval iv  the naive [def, last-use] interval
+ * @param []NaturalLoop loops  the function's natural loops
+ * @param []u32 call_points  the call points (to recompute `crosses_call`)
+ * @return LiveInterval  the interval with `end` widened over its header-live loops
+ */
+fn extend_interval_over_loops(iv: LiveInterval, loops: []NaturalLoop, call_points: []u32) -> LiveInterval {
+    mut new_end: u32 = iv.end
+    mut i: u64 = 0
+    loop {
+        if i >= loops.len { break }
+        let lp = loops[i]
+        if iv.start < lp.header_pt && iv.end >= lp.header_pt {
+            if lp.latch_pt > new_end { new_end = lp.latch_pt }
+        }
+        i++
+    }
+    if new_end == iv.end { return iv }
+    LiveInterval {
+        reg_id = iv.reg_id
+        reg_class = iv.reg_class
+        start = iv.start
+        end = new_end
+        is_fixed = iv.is_fixed
+        crosses_call = crosses_a_call(call_points, iv.start, new_end)
+    }
+}
+
+/**
+ * extend_over_loops — the §6.2 loop-liveness extension: widen every interval
+ * that is live at a loop header to reach at least that loop's latch, closing the
+ * one correctness gap the contiguous-interval model has for loops (a value
+ * defined before/at a header and last-used mid-body would otherwise be truncated
+ * mid-body, letting a later-in-body value steal its register and clobber it for
+ * the next iteration). Needs no new interval representation — `LiveInterval`
+ * stays a single `[start, end]`; only `end` grows. Replaces the loop back-edge
+ * honest-stop (the A3-loop deferral, §6.2). True lifetime holes remain a
+ * deferred QUALITY follow-up, never a correctness need here.
+ *
+ * @param []LiveInterval virt  the naive virtual intervals
+ * @param []NaturalLoop loops  the function's natural loops
+ * @param []u32 call_points  the call points (to recompute `crosses_call`)
+ * @return []LiveInterval  the intervals with header-live ends widened to the latch
+ */
+fn extend_over_loops(virt: []LiveInterval, loops: []NaturalLoop, call_points: []u32) -> []LiveInterval {
+    mut out: []LiveInterval = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= virt.len { break }
+        out = teko::list::push(out, extend_interval_over_loops(virt[i], loops, call_points))
+        i++
+    }
+    out
+}
+
+/**
  * compute_intervals — the §3.2 liveness pass: one walk of the RPO-numbered
  * stream driven by the §1.1 def/use table, producing the virtual intervals to
- * color and the fixed pin intervals to block. Honest-stops on a real loop
- * back-edge (§6.2, the A3-loop follow-up), detected by RPO position among the
- * ENTRY-REACHABLE blocks (#443; dead-block edges excluded, A4-6 #385).
+ * color and the fixed pin intervals to block. Range-numbered by RPO position
+ * among the ENTRY-REACHABLE blocks (#443; dead-block edges excluded, A4-6 #385).
+ * The naive `[def, last-use]` virtual intervals are then widened over every
+ * natural loop by `extend_over_loops` (§6.2), so a value live at a loop header
+ * survives the whole body across the back-edge — the loops the honest-stop once
+ * refused now allocate correctly.
  *
  * @param []NumberedInst stream  the RPO-numbered instruction stream
- * @param []u32 order  the RPO block-id order (for the back-edge test)
- * @param []u32 reachable  the entry-reachable block ids (for the back-edge test)
- * @return IntervalSet | error  the computed intervals, or the back-edge stop
+ * @param []u32 order  the RPO block-id order (for the natural-loop test)
+ * @param []u32 reachable  the entry-reachable block ids (for the natural-loop test)
+ * @return IntervalSet | error  the computed intervals
  */
 fn compute_intervals(stream: []NumberedInst, order: []u32, reachable: []u32) -> IntervalSet | error {
-    if has_back_edge(stream, order, reachable) {
-        return error { message = "regalloc: a loop back-edge needs live-range holes over the strict linear numbering — deferred to the A3-loop follow-up (§6.2)" }
-    }
     let events = collect_events(stream)
     let regs = distinct_regs(events)
     let cps = call_points_of(stream)
@@ -891,6 +1005,7 @@ fn compute_intervals(stream: []NumberedInst, order: []u32, reachable: []u32) -> 
         }
         i++
     }
+    virt = extend_over_loops(virt, natural_loops(stream, order, reachable), cps)
     IntervalSet { virt = virt; fixed = fixed; call_points = cps }
 }
 
@@ -1836,12 +1951,15 @@ pub fn all_physical(f: MFunc) -> bool {
 
 /**
  * regalloc_func — allocate one function end-to-end: RPO-order, number, compute
- * intervals, scan, rewrite. Returns a NAMED honest-stop error on a real loop
- * back-edge (§6.2, via `compute_intervals`) or on an FPR-value spill (A3 lowers
- * GPR spills only). The RPO order is computed once and threaded so the
- * numbering and the back-edge test share one topological linearization (#443);
- * the entry-reachable set is threaded beside it so the back-edge test ignores
- * dead-block edges (a `match`'s unreachable fallback, A4-6 #385).
+ * intervals, scan, rewrite. A real `loop` back-edge now ALLOCATES (§6.2 LANDED,
+ * #389 F2): `compute_intervals` widens every interval live at a loop header to
+ * reach its latch (`extend_over_loops`), so a loop-carried value survives the
+ * whole body across the back-edge. Still returns a NAMED honest-stop error on an
+ * FPR-value spill (A3 lowers GPR spills only). The RPO order is computed once
+ * and threaded so the numbering and the natural-loop detection share one
+ * topological linearization (#443); the entry-reachable set is threaded beside
+ * it so a dead-block edge (a `match`'s unreachable fallback, A4-6 #385) is never
+ * mistaken for a loop.
  *
  * @param AbiDescriptor abi  the register file
  * @param MFunc f  the selected function (virtual MRegs + ABI pins)

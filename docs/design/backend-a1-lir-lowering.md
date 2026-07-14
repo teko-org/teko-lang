@@ -437,3 +437,357 @@ does not flag the new `LOp` cases as a frozen-enum violation.
 Every construct in §1.2 has a concrete lowering above; every new op has a print + interp + fixture
 plan; the sequencing respects the memory-before-match / memory-before-dispatch dependencies. **A1 does
 not HALT.**
+
+## 6. Merge blocks must thread scalar RE-ASSIGNMENTS (#389 A3-loop root, 2026-07-13)
+
+**Pinned root of the range-`for` back-edge miscompile.** The bug reported as "the range-loop
+back-edge fails to thread the counter increment" is NOT in either backend's edge-copy emission —
+it is an A1 **merge-lowering** defect shared by both own backends (own-native inherits it too; it is
+merely MASKED there by the §6.2 loop honest-stop firing first). A `mut` scalar RE-ASSIGNED inside an
+`if`/`match` arm (`lower_assign_simple` rebinds `env[name]` to a fresh SSA-lite VReg) is **dropped at
+the merge**: `lower_if_stmt`/`lower_if_value`/`lower_match_*` allocate the merge block with only the
+value block-arg (zero for a statement `if`), and rebuild the post-merge context from the PRE-branch
+`ctx.env`. The arm-local rebind never reaches a merge block-param, so after the merge the name reads
+its stale pre-branch VReg.
+
+The range-`for` desugar `loop mut i in a..b { … }` makes this load-bearing: the per-iteration STEP
+is emitted as a guarded `if !first { i = i + 1 }` at the body top (so `continue` re-runs it). The
+increment IS computed, but the `if`-merge drops the `i` rebind, so the loop back-edge
+(`close_loop_body` → `jump_args_for_names(env, names)`) carries the stale header `i` — the counter
+freezes. Manual loops with a TOP-LEVEL `i = i + 1` are unaffected (the rebind is in the body env the
+back-edge reads). Proof (own-wasm, wasmtime): `if 1==1 { x=5 }; exit(x)` → exit 0 (C-oracle 5);
+`loop { …; if 1==1 { i = i+1 } }` → infinite loop (frozen `i`); the same increment top-level → exit 6.
+
+**Fix (A1, one site-family, backend-agnostic).** At each statement-bearing merge — `lower_if_stmt`,
+`lower_if_value`, and the `match` statement/value merges — thread the scalars an arm re-assigns,
+mirroring `promote_env`/`jump_args_for_names` (the SAME machinery loop headers already use):
+
+```teko
+/**
+ * reassigned_scalars — the enclosing-scope SCALAR names some arm of this
+ * branch re-assigns (`TAssign`, `AssignKind::Simple`), so the merge must
+ * carry them as block-params. A static pre-scan of the arm statement blocks
+ * against `env` — computed BEFORE lowering, so the merge params can be
+ * allocated up front and each arm's closing jump can supply them. An arm
+ * with no such assignment contributes nothing, so an `if`/`match` that
+ * mutates no enclosing scalar keeps its CURRENT zero-scalar-param merge
+ * (no LIR change, no regression risk for the existing acyclic corpus).
+ *
+ * @param []checker::TStatement arms  every arm's statement block, flattened
+ * @param LEnv env  the pre-branch scalar environment (the promotable names)
+ * @return []str  the distinct enclosing scalar names re-assigned in any arm
+ */
+fn reassigned_scalars(arms: []checker::TStatement, env: LEnv) -> []str { … }
+```
+
+Each merge then adds one block-param per reassigned name (after any existing value param), every
+arm's closing jump appends `jump_args_for_names(arm_env, names)`, and the post-merge env maps each
+reassigned name to its new merge param. **No backend change is required:** the wasm stackifier's
+`emit_edge_copies` (§4.3 parallel-copy) and the native isel's `emit_edge_moves` already thread
+multi-param FORWARD merges (this is why the loop-carried accumulator `s` — a top-level rebind — has
+always threaded correctly). A forward merge param has an ordinary forward interval, so it does NOT
+trip the §6.2 loop honest-stop.
+
+**Minimality vs. promote-all.** Promoting EVERY enclosing scalar at every merge (as loop headers do)
+is also correct but adds redundant self-copies and register pressure to every `if`, changing the LIR
+of the existing GREEN acyclic corpus (regression surface). The reassigned-only pre-scan keeps every
+mutation-free `if`/`match` byte-identical and touches only branches that actually mutate — the
+smallest correct, lowest-regression fix. **This is the load-bearing keystone fix: with it, own-wasm
+== C-native on `wasm_loop_count`/`wasm_continue_step` (exit 6) with ZERO stackifier change.**
+
+## 6.1 F1b — the SAME-CLASS merge-drop residuals F1's review surfaced (#389, 2026-07-13)
+
+F1 fixed the plain-`if c { x = 5 }` case, but its adversarial review found three MORE arm-merge sites
+that dropped an enclosing scalar the SAME way — each a latent SILENT miscompile (own-backend != C).
+Two are TRACTABLE and fixed here; the third needs a scope-aware `lenv` rework and is routed to the
+architect.
+
+**Item 1 — defer-write-propagation (FIXED).** A `defer { s = s + 100 }` inside an if/match STATEMENT
+arm reassigns the enclosing `mut s`, but the arm's closing jump-args were sampled from its env BEFORE
+`close_arm_replaying_defers` replayed the defer (which mutates `s`), so the merge received the
+PRE-defer `s`. Proof: `mut s=1; match x { 1 => { defer { s = s+100 } }; _ => {} }; exit(s)` → C 101,
+own (pre-F1b) 1. Fix: `close_arm_replaying_defers` now takes the reassigned `names` and re-samples
+their jump-args from the POST-`replay_defers` env, appended AFTER the arm's PRE-replay `value_args`
+(the value block-arg stays pre-defer — a VALUE arm's merge value must remain the pre-defer tail, per
+the `lwt_defer_inside_*_value_arm` goldens). The `TDeferStmt` descent F1 removed from the
+reassigned-scalar scan (a half-fix that would have minted a stale param) is RE-ADDED, now a real fix
+because the args are sampled post-replay. Fixture: `own_defer_arm_write_propagates` (exit 101).
+
+**Item 2 — value-if / value-match RHS reassignment (FIXED).** `if outer { let y = if inner { x = 5;
+x } else { 0 } }; exit(x)` dropped `x = 5` at the OUTER statement merge: the reassigned-scalar scan
+had no `TBinding` case and did not descend a value-position if/match RHS, so the outer merge never
+saw `x` (the inner value-if threads `x` through its OWN merge, but the outer merge past the binding
+must carry it too). Proof: C 5, own (pre-F1b) 1. Fix: `collect_reassigned_stmt` gains a `TBinding`
+case that descends the binding's value-position `if`/`match` RHS (`collect_reassigned_value_expr`);
+the shadow-exclusion `collect_bound_stmt` gains the symmetric RHS descent so a shadow inside the same
+RHS is still excluded. Fixture: `own_value_if_rhs_reassign` (exit 5).
+
+**Item 3 — across-all-arms over-exclusion (ROUTED TO ARCHITECT).** F1's shadow-exclusion guard is
+across-ALL-arms: if a name is legitimately reassigned as the enclosing scalar in one arm BUT shadowed
+in another, it is excluded for BOTH, so the legitimate arm reverts to the drop. Proof: `mut x=1;
+match k { A => { x = 5 }; _ => { mut x=99; x=x+1 } }; exit(x)` → on the A path C 5, own 1.
+
+*Assessment.* A PER-ARM fix — thread the name for ALL arms, but have a SHADOWING arm supply the
+ENCLOSING binding's PRE-branch VReg (skipping its own shadow) instead of excluding the name globally
+— is *partially* tractable and strictly non-regressing (it fixes the shadow-ONLY arm and leaves the
+shadow arm's own merge-arg exactly as today). BUT it is NOT a complete fix: an arm that reassigns the
+enclosing scalar BEFORE shadowing it (`_ => { x = 3; mut x = 99; … }`) needs the enclosing's LAST
+pre-shadow VReg, which an append-only newest-first `lenv` cannot recover without scope markers — that
+residual stays a silent stale-read. It also INVERTS F1's shadow-exclusion model (Finding 2), changing
+the currently-GREEN shadow goldens (`lwt_if_stmt_shadowed_scalar_excluded_from_merge`,
+`own_if_mut_shadow_no_leak`) from zero-param to threaded merges, and bloats the per-arm arg threading
+that items 1+2 already grow. A COMPLETE, sound fix requires a scope-aware `lenv` (the reviewer's own
+judgment). Rather than land an incomplete fix that destabilizes the merge model alongside items 1+2,
+item 3 is reported for architect routing.
+
+## 6.2 F1b item 3 — the across-all-arms over-exclusion: the enclosing-identity fix (#389, 2026-07-13)
+
+**Status:** DESIGN (doc-only), owner-ruled fix-now before #389 closes. Branch
+`design/389-f1b-item3-across-arms` off `fix/issue-389-c1-8-keystone@a1c8572`; implementation PRs land
+into `fix/issue-389-c1-8-keystone`. This is the LAST same-class merge-drop residual; it eliminates the
+`_ => { x = 3; mut x = 99; … }` reassign-then-shadow hard case the F1b review flagged unrecoverable.
+
+### 6.2.1 Root, restated as an IDENTITY problem
+
+Item 3 is not really "over-exclusion" — that is the symptom. The root is that F1's merge threading
+keys each arm's jump-arg by NAME, resolved newest-first (`jump_args_for_names` → `lenv_lookup`). When
+an arm shadows a threaded name (`mut x = 99`, or a pattern `A as x`), newest-first resolves the arm's
+closing jump-arg to the SHADOW's VReg, not the enclosing scalar's — a miscompile. F1 defended against
+this the only way a name-keyed model can: EXCLUDE any name shadowed in ANY arm
+(`collect_bound_stmts`/`collect_match_pattern_bound_names`/`exclude_names`). That exclusion is
+across-ALL-arms and coarse: a name legitimately reassigned as the ENCLOSING scalar in one arm but
+shadowed in another is excluded for BOTH, reverting the legitimate arm to the merge-drop.
+
+The clean fix keys each arm's jump-arg by the enclosing binding's IDENTITY, not its name. Then a
+shadow is simply a different identity the merge ignores — no exclusion is needed at all, and the
+threading decision can safely OVER-approximate (thread every reassigned pre-branch scalar), because a
+name no arm reassigns-at-enclosing threads its pre-branch VReg on every edge — a no-op phi, never a
+miscompile.
+
+### 6.2.2 Chosen mechanism (evaluated against the three routed options)
+
+The routing offered (a) scope-DEPTH markers on `lenv`, (b) a per-arm pre-branch env SNAPSHOT, and
+(c) binding-IDENTITY keys. The chosen mechanism is **(c), realized as pre-branch-INDEX identity made
+recoverable by reassign-in-place** — the smallest change that is also COMPLETE:
+
+1. **Reassign-in-place (SSA-lite reassignment updates the enclosing binding's current VReg, instead of
+   appending a duplicate `lenv` entry).** `lower_assign_simple` is the ONLY reassignment site (the
+   `=` path at `lower.tks:4325`, the `op=` path at `:4335`); every other `ctx_bind`/`lenv_bind`
+   (`lower_binding` `:1659`, the pattern binds `:3375/:3403/:3476`, lambda `:1499/:1529`, promote/rebind
+   `:1787/:2355`, params `:4516`) is a FRESH lexical binding and correctly keeps appending. Switching
+   only that one site so `x = e` REBINDS the newest `x` entry's VReg in place — rather than pushing a
+   second `x` entry — is **behavior-preserving for every existing lookup**: `lenv_lookup`/
+   `lenv_lookup_fat` are newest-first, and after an in-place update the newest `x` is at its original
+   index carrying the new VReg, so every read returns the SAME VReg it does today. The ONLY structural
+   effect is that a reassigned scalar no longer leaves a DUPLICATE `lenv` entry. That matters solely to
+   the two functions that read `lenv` POSITIONALLY: `promote_env` (loop heads) allocates one param per
+   scalar ENTRY, and index-keyed arm args (below) read a specific slot. `add_merge_scalar_params` is
+   per-NAME (deduped), so `if`/`match` merges are unaffected regardless.
+
+2. **Index-identity: each threaded name's merge-arg per arm is read from the arm-end env at the name's
+   PRE-BRANCH INDEX**, not by newest-first name. The pre-branch env (`ctx.env` at the merge site) holds
+   each threaded enclosing scalar exactly once, at a fixed index `j`. Every arm is lowered starting from
+   `ctx.env` and thereafter only APPENDS (shadows, pattern binds, `let`/`mut`) or UPDATES-IN-PLACE
+   (reassignments) — it never shrinks or reorders indices `0..pre_branch_len`. So `arm_env.vregs[j]` is
+   always the enclosing binding's current value at the arm's close: the reassigned VReg if the arm
+   reassigned the enclosing scalar, the untouched pre-branch VReg if it only shadowed it (the shadow
+   sits at a HIGHER index the read ignores), and correct even THROUGH a nested inner merge (which
+   rebuilds the env in order via `rebind_scalars`, preserving index `j` while updating its VReg to the
+   inner merge param).
+
+3. **Drop the coarse exclusion; over-thread safely.** `reassigned_scalars` loses its
+   `!contains_str(bound, …)` term; `reassigned_scalars_for_match` collapses to
+   `reassigned_scalars(match_arm_stmts(arms), env)` (no pattern exclusion). A name is threaded whenever
+   ANY arm has a simple `TAssign` to it AND it is a pre-branch scalar. Index-identity makes this
+   provably safe (§6.2.1). The shadow-exclusion helpers become dead and are removed:
+   `collect_bound_stmts`/`collect_bound_stmt`/`collect_bound_value_expr`/`collect_bound_expr_stmt`/
+   `collect_bound_if`/`collect_bound_match`, `pattern_bound_names`/`collect_alt_pattern_names`/
+   `collect_match_pattern_bound_names`, `bind_target_names`, `exclude_names`, and `append_all_str`
+   if no other caller remains (grep before deleting; `append_all_u32` stays — item 1 uses it).
+
+**Why not (a) scope-depth or (b) snapshot.** (a) needs a NEW `lenv` field (a depth per binding) AND a
+threaded depth counter, and still cannot by itself distinguish "reassigned the enclosing x" from "only
+shadowed x" without reassign-in-place — depth alone tells you WHERE a binding lives, not whether the
+enclosing one's VALUE moved. (b) a pre-branch snapshot recovers the pre-branch value for a shadowing
+arm but CANNOT recover the enclosing scalar's LAST pre-shadow value in the reassign-THEN-shadow arm
+(`x = 3; mut x = 99; …`) — it would thread the pre-branch value (wrong) where the answer is `3`. Only
+tracking the enclosing binding's evolving value THROUGH the shadow (reassign-in-place) solves the hard
+case, and index-identity is the read side of exactly that. (c) as a stable-ID FIELD would also work but
+costs a new `ids: []u32` slice on `LEnv` plus id-preservation plumbing through `rebind_scalars`/
+`promote_env`; index-identity needs neither — the pre-branch position IS the stable id, for free.
+
+### 6.2.3 The per-arm value-selection rule
+
+For a threaded name `n` at pre-branch index `j`, each arm supplies `arm_env.vregs[j]`. That single rule
+yields, by construction:
+
+| The arm… | `arm_env.vregs[j]` holds | threads | correct? |
+|----------|--------------------------|---------|----------|
+| reassigns the enclosing `n` (no shadow) | the reassigned VReg | new value | yes |
+| only shadows `n` (`mut`/pattern) | the untouched pre-branch VReg (shadow is at a higher index) | pre-branch | yes |
+| does neither | the untouched pre-branch VReg | pre-branch | yes |
+| reassigns enclosing `n`, THEN shadows (`n = 3; mut n = 99; …`) | the LAST pre-shadow reassigned VReg (`3`) — the shadow appended a new index; the later `n = …` in-place-updates the SHADOW's index, never `j` | `3` | **yes — the hard case** |
+| shadows `n`, THEN reassigns the shadow (`mut n = 99; n = n+1`) | the untouched pre-branch VReg | pre-branch | yes |
+
+The reassign-then-shadow hard case is ELIMINATED, not a residual: `n = 3` in-place-updates index `j`
+to VReg(3); `mut n = 99` appends `n` at a new index `k > j`; the later shadow reassignment updates `k`,
+leaving `j` at VReg(3); the merge reads `j` → `3`. This is precisely the C behavior (the enclosing
+`n`'s last value before it goes out of view is `3`).
+
+### 6.2.4 Exact type / signature changes (all Teko, full-Javadoc; implementer copies verbatim)
+
+`LEnv` is UNCHANGED (no new field). New/changed function shapes:
+
+```teko
+/**
+ * lenv_reassign — rebind the NEWEST binding of `name` to `vreg` IN PLACE (the
+ * SSA-lite reassignment update), preserving that slot's fat-pointer side-table
+ * (`has_len`/`len_vregs`) and, crucially, its POSITION — so the binding keeps
+ * its pre-branch INDEX and the merge machinery can read the enclosing scalar's
+ * current value at that fixed index regardless of any shadow appended after it
+ * (#389 F1b item 3). Behaviour-preserving for every `lenv_lookup`: the newest
+ * `name` is still at its original index, now carrying `vreg`, so a name-keyed
+ * newest-first read returns the SAME VReg it would after the old append — the
+ * only difference is that no DUPLICATE `name` entry is left behind. Falls back
+ * to `lenv_bind` when `name` is unbound (a checker invariant break — an assign
+ * to an undeclared local never reaches lowering).
+ *
+ * @param LEnv env  the env whose newest `name` binding is updated
+ * @param str name  the reassigned local's name
+ * @param u32 vreg  the reassignment's fresh result VReg
+ * @return LEnv  `env` with the newest `name` slot's VReg replaced in place
+ */
+pub fn lenv_reassign(env: LEnv, name: str, vreg: u32) -> LEnv { … }
+```
+
+`lower_assign_simple` (`lower.tks:4322`) swaps its two `ctx_bind` calls for a `ctx_reassign` wrapper
+over `lenv_reassign` (both the `=` path `:4325` and the `op=` path `:4335`). `lower_binding` and the
+pattern binds are UNTOUCHED (they must keep appending — that IS the shadow).
+
+```teko
+/**
+ * merge_scalar_indices — the pre-branch INDEX of each threaded name in `env`
+ * (its newest occurrence), in `names` order — computed ONCE at a merge site
+ * from the PRE-BRANCH env so every arm reads its enclosing scalar's value from
+ * the same fixed slot, immune to any shadow the arm appends (#389 F1b item 3).
+ *
+ * @param LEnv env  the pre-branch env (each threaded name occurs once)
+ * @param []str names  the threaded scalar names, in merge-param order
+ * @return []u64  each name's pre-branch index, in the SAME order as `names`
+ */
+fn merge_scalar_indices(env: LEnv, names: []str) -> []u64 { … }
+
+/**
+ * arm_scalar_args — one jump-arg per threaded scalar, read from `arm_env` at the
+ * fixed pre-branch `indices` — the ENCLOSING binding's current value at the
+ * arm's close (reassigned if the arm reassigned it, pre-branch if the arm only
+ * shadowed it), REPLACING `jump_args_for_names`'s newest-first name lookup for
+ * if/match arm merges (#389 F1b item 3). Loops keep `jump_args_for_names` (their
+ * back-edge threads ALL promoted scalars by name, no enclosing-vs-shadow split).
+ *
+ * @param LEnv arm_env  the arm-end env (indices 0..pre_branch_len unchanged in position)
+ * @param []u64 indices  the threaded scalars' pre-branch indices, in param order
+ * @return []u32  each index's current VReg, in the SAME order as `indices`
+ */
+fn arm_scalar_args(arm_env: LEnv, indices: []u64) -> []u32 { … }
+```
+
+`close_arm_replaying_defers` (`:2697`) swaps its `names: []str` param for `indices: []u64` and computes
+`append_all_u32(value_args, arm_scalar_args(replayed.env, indices))` — still POST-`replay_defers`, so
+item 1's defer-write propagation composes unchanged (a `defer { s = s + 100 }` in-place-updates `s` at
+its index; the post-replay index read sees the post-defer value). The four arm-lowering fns
+(`lower_if_stmt` `:2782`, `lower_if_value` `:2811`, `lower_match_arm_stmt` `:3691`,
+`lower_match_arm_value` `:3585`) compute `let indices = merge_scalar_indices(ctx.env, names)` alongside
+`names` and pass `indices` down; the statement/value merge fallthroughs (`lower_match_stmt` `:3754`,
+`lower_match_value` `:3657`) swap `jump_args_for_names(chain.env, names)` for
+`arm_scalar_args(chain.env, indices)` (the fallthrough env restored to pre-branch preserves the same
+indices). `reassigned_scalars` (`:2257`) drops its `bound`/exclusion term;
+`reassigned_scalars_for_match` (`:2307`) becomes a one-liner delegating to it.
+
+### 6.2.5 Composition with F1 / F1b (traced, and the regressions that stay green)
+
+- **F1's own fixtures stay green.** `own_if_reassign_exit` (`x = 5` at top level): index-in-place, arm
+  reads index 0 → `%5`, else → `%0`; identical single-param merge (golden
+  `lwt_if_stmt_reassigned_scalar_threads_a_merge_param` UNCHANGED). `own_if_mut_shadow_no_leak`
+  (`mut x=99; x=x+1`, pure shadow): now threaded, but the then arm's `x=x+1` updates the SHADOW's index,
+  index 0 stays `%0`, both edges carry `%0`, `ret` reads the merge param = `%0` → exit 1 UNCHANGED (the
+  golden `lwt_if_stmt_shadowed_scalar_excluded_from_merge` MOVES from zero-param to a no-op one-param
+  merge — an internal-golden update, exit code identical). `own_match_pattern_binding_no_collision`
+  (Circle path, `Circle as x` empty body): index 0 untouched → merge carries pre-branch → exit 1
+  UNCHANGED; the previously-latent Square path (`Square => { x = 5 }`) is now CORRECT (was silently
+  dropped) — proven by a new fixture.
+- **F1b item 1 (defer) composes.** `own_defer_arm_write_propagates`: `arm_scalar_args` reads POST-replay,
+  the defer's in-place update to `s` is seen → exit 101 UNCHANGED.
+- **F1b item 2 (value-if RHS) composes.** `own_value_if_rhs_reassign` and its golden
+  `lwt_if_stmt_value_if_rhs_reassign_threads_the_outer_merge` are byte-identical under the new mechanism
+  (traced: inner value-if threads `x` through its own merge → outer-arm index 0 = inner merge param
+  `%9` → outer merge `jump #B3(%9)`; the F1b NIT — `let x = 99` shadowing inside the RHS — is fixed as a
+  CONSEQUENCE, since the enclosing `x = 7` reassigns index 0 while the inner `let x` lives at a higher
+  index). This is the exact shape the review flagged; it needs no separate handling.
+- **`lwt_if_stmt_non_mutating_arm_keeps_zero_param_merge` stays green** (no assign → `names` empty →
+  zero-param merge, byte-identical).
+
+### 6.2.6 Regression fixtures (own == C, both VM-oracle exit and own-native/own-wasm binary)
+
+New `examples/regressions/` binary fixtures (kind = "binary", `scripts/validate_wasm_own.sh`,
+own-native/own-wasm exit == C-native exit):
+
+1. `own_match_arm_reassign_vs_shadow` — shape (1). `mut x = 1; match k { 1 => { x = 5 }; _ => { mut x =
+   99; x = x + 1 } }; exit(x)`. Two variants: `k = 1` → exit **5** (the arm that reassigns the enclosing
+   `x`, the previously-dropped path), `k = 0` → exit **1** (the shadow-only arm threads pre-branch).
+2. `own_if_value_rhs_shadow_then_outer_reassign` — shape (2), the F1b NIT. `mut x = 1; if 1 == 1 { let y
+   = if 1 == 1 { let x = 99; x } else { 0 }; x = 7 }; exit(x + y - y)` → exit **7** (inner value-if
+   RHS shadows `x` via `let x = 99`; the outer arm's `x = 7` reassigns the enclosing `x`; pre-fix this
+   dropped `x = 7`, giving 1).
+3. `own_match_reassign_then_shadow` — the hard case. `mut x = 1; match k { 1 => { x = 3; mut x = 99; x =
+   x + 1 }; _ => { } }; exit(x)`, `k = 1` → exit **3** (the enclosing `x`'s last value is `3`, before
+   the shadow; own must equal C = 3, NOT the shadow's 100 and NOT the pre-branch 1).
+
+Golden LIR-dump fixtures in `src/lir/lower_test.tkt`:
+
+- UPDATE `lwt_if_stmt_shadowed_scalar_excluded_from_merge` → `…_threads_pre_branch_value`: assert the
+  merge now carries an `x` param whose every incoming edge is the pre-branch VReg (`jump #B3(%0)` on
+  both), and the read past the merge is the merge param (`ret %4`) — value still `1`.
+- UPDATE `lwt_match_stmt_pattern_binding_excludes_one_name_but_still_threads_another` →
+  `…_threads_both_the_reassigned_and_the_pattern_shadowed_name`: assert TWO scalar params (`x`, `y`);
+  the pattern arm (`A as x`, empty) carries pre-branch `x` and pre-branch `y`; the wildcard arm carries
+  reassigned `x` and reassigned `y` (this update fixes the latent wildcard-path miscompile the old
+  golden enshrined).
+- ADD `lwt_if_stmt_reassign_then_shadow_threads_the_pre_shadow_enclosing_value`: the hard case at LIR
+  level — the merge `x` param's arm edge carries the `x = 3` VReg, never the `mut x = 99`/`x = x + 1`
+  shadow VRegs.
+- ADD `lwt_match_arm_reassign_vs_shadow_threads_per_arm`: arm A's closing jump carries the reassigned
+  VReg; the shadow arm's closing jump carries the pre-branch VReg — per-arm selection, one param.
+
+### 6.2.7 Ritual points
+
+Doc-only design PR: no ritual gate beyond a clean build (it emits no code). The IMPLEMENTATION carries
+the gate. Split into two crumbs, each a ritual point (full gate — VM gate · paranoid · differential
+(LIR-interp-vs-VM over the runnable subset AND own-vs-C binary for the new regressions) · fixpoint) at
+its merge into `fix/issue-389-c1-8-keystone`:
+
+- **Crumb 1 (reassign-in-place, pure refactor):** add `lenv_reassign`; switch `lower_assign_simple`'s
+  two sites to it. Nothing else changes — exclusion and name-keyed jump-args stay. Gate proves the
+  ENTIRE existing golden + regression suite is byte-identical (no golden depended on reassignment
+  leaving a duplicate `lenv` entry — confirmed by inspection: the only positional reader that could
+  shrink is `promote_env`, and no existing golden has a reassign-then-nested-`loop` shape). This is the
+  bisection anchor: if anything moves, it moves HERE, in isolation.
+- **Crumb 2 (index-identity threading + drop exclusion):** add `merge_scalar_indices`/`arm_scalar_args`;
+  thread `indices` through `close_arm_replaying_defers` and the four arm-lowering fns + the two
+  fallthroughs; drop the exclusion term in `reassigned_scalars`/`reassigned_scalars_for_match`; remove
+  the now-dead shadow-exclusion helpers; update the two goldens; add the two new goldens; add the three
+  binary regressions. Gate proves item 3 fixed with own == C on all three shapes and no F1/F1b
+  regression.
+
+### 6.2.8 FIXPOINT safety, residual, law check
+
+- **FIXPOINT-safe.** `lower.tks` is own-backend-only (TAST → in-memory LIR consumed by isel; no `.tkb`/
+  wire format — §1.3, §5.4). The change is deterministic, so the self-hosted rebuild is stable; the
+  existing GREEN corpus's emitted LIR is byte-identical except the two intentionally-updated goldens
+  (whose exit-code behavior is unchanged). Fixpoint (self-compilation stability) holds.
+- **Residual: NONE.** The reassign-then-shadow hard case is eliminated (§6.2.3). Over-threading a
+  pure-shadow name is a no-op phi, never a miscompile. No same-class merge-drop shape remains open.
+- **Law check (no HALT).** M.1/M.3 honesty preserved (every construct still lowers or honest-stops;
+  `lenv_reassign` falls back safely). Smallest-safe-steps satisfied by the two-crumb split. Full-Javadoc
+  on every new/changed declaration. Seed-safe: no new language feature, no wire change, `LEnv` shape
+  unchanged. Nothing HALTs — this closes item 3 and, with it, the F1 keystone's last core defect.
