@@ -350,15 +350,34 @@ fn type_compare(c: parser::Compare, env: Env, table: TypeTable) -> TExpr | error
     TExpr { kind = TCompare { first = first; rest = terms }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
 }
 
-// teko::list::empty / teko::list::push — GENERIC builtins (no `.tks` module), special-cased
-// like print/assert. Recognized by the LAST-2 path segments `list::empty` / `list::push`,
-// rooted at `teko` (or bare `list::*`). The element type is INFERRED (B.8/Slice):
-//   * empty()    -> []<sentinel> (Slice whose element is the Void marker) — unifies with any slice
-//   * push(s, x) -> []typeof(x); `s` must be a slice (sentinel or matching element)
-// Returns the typed TExpr, `error`, or NotListBuiltin (a non-list path → try the ordinary call).
-// (The C twin uses a `bool handled` + out-param; Teko has no out-params, so the tri-state is a
-// 3-member variant — `T? | error` is illegal: a variant member may not be nullable.)
-type NotListBuiltin = struct { }   // marker: the call is not a teko::list::* builtin
+/**
+ * Marker: the call is not a `teko::list::*` builtin — `type_list_builtin` falls back so its
+ * caller resolves the call through the ordinary path.
+ */
+type NotListBuiltin = struct { }
+
+/**
+ * The GENERIC `teko::list::*` builtins that have no `.tks` module of their own (like
+ * print/assert): `empty()`, `push(s, x)`, and `with_cap(n)`. Recognized by the LAST-2 path
+ * segments (`list::empty` / `list::push` / `list::with_cap`), rooted at `teko` (or bare
+ * `list::*`). The element type is INFERRED (B.8/Slice):
+ *   - `empty()` -> `[]<sentinel>` (a `Slice` whose element is the `Void` marker, unifying with
+ *     any concrete slice);
+ *   - `push(s, x)` -> `[]typeof(x)`; `s` must be a slice (sentinel or a matching element);
+ *   - `with_cap(n)` -> `[]<sentinel>`, exactly like `empty()`, but the runtime buffer is
+ *     pre-sized for `n` elements (an enabling primitive — staged off; no compiler source calls
+ *     it yet).
+ * The C twin instead uses a `bool handled` out-param; Teko has no out-params, so the tri-state
+ * result here is a 3-member variant (`T? | error` is illegal — a variant member may not be
+ * nullable).
+ *
+ * @param c      the raw call node
+ * @param env    the typing environment
+ * @param table  the folded type table
+ * @return       the typed `TExpr` for a recognized `list::*` builtin, `NotListBuiltin` when the
+ *               call is not one of these (the caller falls back to ordinary resolution), or
+ *               `error` on a malformed call (wrong arity, a non-slice base, or a mismatched item)
+ */
 fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | NotListBuiltin | error {
     if c.callee.segments.len < 2 { return NotListBuiltin { } }
     let last = c.callee.segments[c.callee.segments.len - 1].name
@@ -397,6 +416,17 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
         let base = match elem { Void => TExpr { kind = s.kind; type = Slice { element = result_elem }; line = s.line; col = s.col }; _ => s }
         mut args = teko::list::push(teko::list::push(teko::list::empty(), base), x)
         TExpr { kind = TCall { callee = c.callee; args = args; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Slice { element = result_elem }; line = 0; col = 0 }
+    } else if last == "with_cap" {
+        if c.args.len != 1 { return error { message = "teko::list::with_cap expects one argument (the initial capacity, a `u64`)" } }
+        let n = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
+        let cap_t = Prim { kind = PrimKind::U64 }
+        mut n_typed = n
+        if !type_eq(n.type, cap_t) {
+            if !literal_adopts(n, cap_t) { return error { message = $"teko::list::with_cap's argument must be a `u64` — got `{type_render(n.type)}`" } }
+            n_typed = TExpr { kind = n.kind; type = cap_t; line = n.line; col = n.col }
+        }
+        let wargs = teko::list::push(teko::list::empty(), n_typed)
+        TExpr { kind = TCall { callee = c.callee; args = wargs; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Slice { element = Void { } }; line = 0; col = 0 }
     } else {
         NotListBuiltin { }
     }
