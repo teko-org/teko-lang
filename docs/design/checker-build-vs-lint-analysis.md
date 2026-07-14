@@ -412,6 +412,31 @@ urgência, pois relaxar remove o passe do caminho crítico.
 
 ---
 
+## 8. Nota de follow-up — modo dry-run / check-only (owner 2026-07-14)
+
+> **Owner 2026-07-14 (nota, construção nova — depois):** implementar um **modo dry-run** — o
+> compilador roda **sem gerar nada** (sem `.o`/`.tkb`/binário/link), **só saída de console**.
+
+Encaixe arquitetural (por que a nota pertence a este estudo):
+- Um dry-run é, por definição, uma execução **front-end-only**: `parse → check (passes E) → [análises
+  realocadas: lint] → reporta no console → PARA antes do `emit`/`run_cc`/link`. É o `--noEmit` /
+  `check-only` clássico (estilo `tsc --noEmit` / `cargo check`).
+- É o **lar natural do `teko lint`** (Q3): as análises realocadas (unused via `UseGraph`, dormentes)
+  rodam exatamente neste modo, sem pagar codegen+emit+link. `teko lint` pode ser este modo com o
+  `UseGraph` ligado; `teko check` pode ser o mesmo com só os passes E de solidez.
+- É também a **superfície de medição** que os dois diagnósticos de perf usaram (o front-end isolado do
+  emit) — ou seja, o modo já existe "de fato" no harness de profiling; falta expô-lo como flag de 1ª
+  classe (`teko build --dry-run` / `teko check`).
+- Ponto de implementação (INFERÊNCIA, a confirmar no código): o dispatch de artefato em
+  `project.tks` (`backend`/`build_debug_binary`) é onde o dry-run corta — roda `frontend_body` e
+  para antes de `tk_emit_c`/`run_cc` (backend C) e antes de `lower_program`/emit (native). Custo
+  baixo: um curto-circuito no driver, não um subsistema.
+
+Sequência: **construção nova → depois** (com o `teko lint`/`UseGraph`); registrado aqui para não se
+perder. Não altera o ruling 0.4 nem os movimentos de agora.
+
+---
+
 ## Apêndice — mapa de dependência de produtos (quem lê o quê)
 
 - **TAST (`.type`)** ← typing (10) → codegen, VM, `.tkb`, monomorph. **E.**
