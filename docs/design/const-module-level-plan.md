@@ -38,6 +38,37 @@ Author: architect. Implementer executes the crumb sequence in order.
 4. Some families become `enum` or `flags`, not scalar `const`.
 5. Behavior-preserving, proven by **fixpoint gen2==gen3** + both-engine (VM +
    native) tests + 100% coverage of the delta.
+6. **Three placements** (owner clarification 2026-07-15, from the issue body): `const`
+   is placement-polymorphic — LOCAL, MODULE, and TYPE-MEMBER. See §0.1.
+
+---
+
+## 0.1 Three placements of `const` (owner clarification 2026-07-15)
+
+`const` exists at three sites. All three take `pub` / `exp` / private visibility.
+The MODULE and TYPE-MEMBER placements are compile-time constants and **share one
+`consteval.tks` (grammar `is_const_expr`, allowlist, cycle/order) and one inliner**;
+only the PARSE SITE and the RESOLUTION PATH differ. LOCAL is a distinct, pre-existing
+runtime binding and is untouched.
+
+| Placement | Site | Semantics | Resolution | Status |
+|---|---|---|---|---|
+| **Local** | inside a block/fn body (`BindKind::Const`, `parse_stmt.tks:166`) | a block-scoped **immutable binding** (deep-`let`); MAY bind a runtime value; has a scope/arena | bare name in scope | **EXISTS — unchanged** (§0.2) |
+| **Module** | top-level `Decl`/`ItemKind` | a **compile-time** const-expr; no scope, no arena; scalar inlined / aggregate → rodata | bare name (top-level) | NEW — §3, §4.1–4.9 |
+| **Type-member** | inside a `struct`/`class` body, peer to fields/methods | **static / type-level** (NOT per-instance, NO layout slot); const-eval identical to module, inlined | `TypeName::NAME` (qualified) | NEW — §3.6, §4.10 |
+
+### 0.2 Reconciliation with the existing LOCAL `const`
+
+The LOCAL `const` (`BindKind::Const`) stays exactly as it is: a block-scoped
+immutable binding that may hold a runtime value, treated as non-escaping by
+`escape.tks:341,587`. It does **not** flow through `consteval`/the inliner. The
+shared keyword is intentional and law-consistent: a local HAS a lexical scope
+(hence may evaluate a runtime expression in it), while a module/member const is
+comp-time (no scope to evaluate in, so it is restricted to `is_const_expr`).
+`parse_decl` (top-level) and the type-body parser dispatch `const` to the NEW
+`ConstDecl` path; `parse_stmt` (statement position) keeps dispatching `const` to the
+existing local `Binding`. No ambiguity — the three are distinguished purely by parse
+position.
 
 ---
 
@@ -219,6 +250,87 @@ visibility error.
   `name: str`, `namespace: str`, `ty: Type`, `init: TExpr`, `vis`, doc, line/col —
   every component (`Type`, `TExpr`) already has a codec, so the new case is a
   struct-of-existing-codecs. Add encode/decode arms mirroring the `TFunction` case.
+  A TYPE-MEMBER const rides along inside the owning `TypeDecl`'s codec (a new
+  `consts` list on the struct/class body, §4.10), so a `pub`/`exp` member const
+  crosses modules with its type.
+
+### D6 · TYPE-MEMBER const (owner clarification 2026-07-15) — static, `TypeName::NAME`, inlined
+
+A `const` declared inside a `struct`/`class` body, peer to fields and methods, is a
+**static (type-level) constant** — NOT a per-instance field. Design, law-first:
+
+- **Grammar (§4.10):** the type-body parser (`parse_fields` / `parse_class_fields`)
+  gains a third member branch: after the optional doc + `pub`/`exp` peel, a `const`
+  token parses a `ConstDecl` member (the SAME node as a module const, reusing
+  `parse_const_decl`). Interleaves freely with fields/methods. `struct`, `class`, and
+  `abstract class` bodies accept it; a `trait` accepts it and FOLDS it into each
+  deriver like a field; an **`interface` REJECTS it** (interfaces are pure signature
+  contracts and carry no statics — `ast.tks:282`, unchanged).
+- **Semantics:** const-eval is identical to a module const (`is_const_expr`, same
+  tiers, same allowlist). It occupies **NO slot in the struct layout** (`LStructLayout`
+  is unchanged; a member const never widens `sizeof(T)`). It is inlined (scalar) or
+  rodata-materialized (Tier-A aggregate) exactly like a module const — the owning
+  type is only its NAMESPACE for resolution.
+- **Access path:** `TypeName::NAME` (qualified, like an enum member `Enum::Member`).
+  Anchored in the existing `type_path_expr` (`typer.tks:2283`): today it resolves a
+  two-segment path to an ENUM member (`EnumBody`, `:2298`); the new arm — tried
+  before the enum arm — asks "does the leading type have a member const named by the
+  last segment (walking its base chain)?" and, if so, resolves to that const's
+  checked initializer (then the inliner substitutes it). Inside the type's own
+  methods, the qualified `TypeName::NAME` (or `Self::NAME` where the `self`/`Self`
+  alias from the OOP work exists) is used — bare `NAME` is NOT introduced (avoids
+  collision with fields/locals; consistent with enum members always being qualified).
+- **Inheritance / OOP (ratified law-first):**
+  - **Inherited (by NAME lookup, not by dispatch):** a `pub`/`exp` member const on a
+    base IS reachable through a subclass path — `Sub::NAME` resolves by walking from
+    `Sub` up its base chain (mirroring `effective_class_methods`) to the base's
+    declaration. It is a compile-time, path-qualified lookup convenience, NOT a
+    vtable/virtual entry (a member const has no `this`, no runtime identity).
+  - **Shadowing = static hiding, ALLOWED:** a subclass MAY redeclare `const NAME`;
+    `Sub::NAME` then resolves to the subclass's, `Base::NAME` to the base's. Because
+    resolution is by EXPLICIT qualified path and inlined at compile time, there is no
+    dispatch ambiguity — each `T::NAME` binds unambiguously to the nearest
+    declaration walking from `T`. This is name hiding, NOT `override` (there is
+    nothing dynamic to override); the `override` keyword remains method-only and a
+    `const` bearing it is a parse error.
+  - **Interfaces / abstract:** an interface cannot declare a member const (rejected,
+    above). An abstract class CAN (a member const is a concrete value, never an
+    abstract requirement). A member const is never part of interface conformance.
+  - **Rationale:** this is exactly C#/Java static-const semantics (accessible via the
+    subclass name, belongs to the declarer, hideable-not-overridable), reached here
+    with ZERO new dispatch machinery because every resolution is a compile-time
+    qualified-path lookup that the inliner erases. Passes all laws; smallest safe
+    step.
+- **Visibility:** `Visibility { Private; Pub; Exp }` (`ast.tks:186`), reusing the
+  field/method peel (`parse_class_fields` already peels `pub`/`exp` at `:421`).
+  `Private` = usable only within the declaring module; `Pub` = cross-module namespace
+  use; `Exp` = exported in the `.tkh` public ABI. Same rules as methods.
+
+### D7 · naming convention (owner 2026-07-15) — `UPPER_SNAKE_CASE`, STYLE not grammar
+
+- **The LANGUAGE imposes NO case.** The parser/checker accept ANY valid identifier
+  for a const (module, member, or local) — lowercase, camelCase, anything the normal
+  identifier rules allow. There is **no grammar rule and no checker rule** enforcing
+  case; `parse_const_decl` / the member branch / the resolver treat a const name as a
+  plain identifier. This is a hard constraint on the implementation: do NOT add a
+  case check.
+- **Our SOURCE convention (W15 style, enforced by the canonicalizer/skill, not the
+  compiler):** a real constant is `UPPER_SNAKE_CASE` — `ZIP_METHOD_STORE`,
+  `ADLER32_MODULUS`, `BLOCK_TYPE_STORED`, `MASK_ALL_U64`, `SHF_ALLOC`. Applies to
+  module consts, member consts, and a LOCAL const that is a genuine compile-time
+  constant. A local `const` that merely names a runtime immutable value keeps
+  ordinary lowercase (it is not a "constant" in the W15 sense).
+- **Enums are `PascalCase` type + `PascalCase` members**, per the repo's existing
+  convention (`ast.tks:186` `Visibility { Private; Pub; Exp }`, `minst.tks:11`
+  `MRegClass { GPR; FPR }` — acronyms uppercased). So the migrated families are
+  `enum BlockType { Stored; Fixed; Dynamic }`, `enum WasmScopeKind { Block; Loop; If }`,
+  `enum ElideKind { Normal; Drop; Tee }`, `enum EdgeResult { Stop; Branch; More }`,
+  `enum WasmVType { I32; I64; F32; F64 }`, `enum ZipMethod { Store; Deflate }` —
+  members are PascalCase, NOT `UPPER_SNAKE`.
+- **Flags members** follow the external spec's own names, which for C-ABI flag sets
+  are already `UPPER_SNAKE` (`flags ElfSectionFlags { SHF_ALLOC; SHF_EXECINSTR; … }`),
+  consistent with the const convention. (No `flags` decl exists in the tree yet — this
+  plan introduces the first, so the convention is set here.)
 
 ---
 
@@ -434,6 +546,57 @@ rewrites uses to (`LGlobalAddr`).
 
 Add `TConstDecl` encode/decode arms alongside the `TFunction` case (a
 struct-of-existing-codecs: `str`, `Type`, `TExpr`, `Visibility`, `bool`, `u32`).
+The `TypeDecl` codec gains the `consts` list on the struct/class body (§4.10).
+
+### 4.10 Type-member const (parser + typer)
+
+`StructBody` / `ClassBody` / `TraitBody` widen with a `consts: []ConstDecl` list
+(peer to `fields`/`methods`); `ParsedStructBody` (the parser's carrier) gains the
+same. `parse_fields` / `parse_class_fields` gain the third member branch.
+
+```teko
+/**
+ * parse_type_member_const — parse a `[pub|exp] const NAME: Type = <const-expr>`
+ * member inside a struct/class/trait body, reached from the member loop after the
+ * doc + visibility peel when the next token is `const` (#594, owner clarification
+ * 2026-07-15). Delegates the `const …` grammar to `parse_const_decl` (the same node
+ * a module const uses), so the two placements never diverge. A member const is
+ * static/type-level: it takes no layout slot and is resolved by `TypeName::NAME`.
+ *
+ * @param tokens  the token stream
+ * @param pos     the index of the `const` keyword (after the peeled doc/visibility)
+ * @param vis     the visibility peeled by the member loop
+ * @return        the parsed member ConstDecl and the index past its initializer
+ * @throws        a located error on a missing name / `: Type` / `=` / bad initializer
+ * @since #594
+ */
+fn parse_type_member_const(tokens: []lexer::Token, pos: u64, vis: Visibility) -> Parsed<ConstDecl> | error
+
+/**
+ * find_member_const — resolve `TypeName::NAME` to its member const's checked
+ * initializer, walking `TypeName`'s base chain (a subclass inherits a base's member
+ * const by name; a nearer declaration shadows a farther one — static hiding, D6).
+ * Returns null when no member const named `seg` exists on the type or its bases (so
+ * `type_path_expr` falls through to the enum-member / module-static arms).
+ *
+ * @param owner  the resolved leading type (struct/class/abstract)
+ * @param seg    the last path segment (the member const's name)
+ * @param table  the type table (to follow the base chain + read each body's consts)
+ * @return       the member const's typed initializer, or null when not found
+ * @since #594
+ */
+fn find_member_const(owner: parser::TypeDecl, seg: str, table: TypeTable) -> TExpr?
+```
+
+Wire `find_member_const` into `type_path_expr` (`typer.tks:2283`) as the FIRST arm
+for a two-segment path — before the `EnumBody` arm (`:2298`) — so a member const
+takes precedence over an equally-named enum member only when the leading path is a
+struct/class (they are disjoint type kinds, so no real conflict). Type-checking a
+member const's initializer reuses `type_const_decl` (§4.6) with the owning type's
+namespace + a `Self`-aware environment; validation reuses `is_const_expr`. An
+`interface`/`flags`/`enum`/`alias`/`extern` body carrying a `const` member is a
+located parse-or-check error ("a `const` member is only allowed in a struct, class,
+or trait body").
 
 ---
 
@@ -659,14 +822,19 @@ decides. The `*_empty()` factories are never touched (they are not constants).
 ### 7.3 W15 rule text (paste into agent + skill)
 
 > **W15 · No magic values.** Every domain-meaningful literal is named. A single
-> scalar → `const NAME: T = <const-expr>` (module-level, comp-time, no arena). A
-> closed integer tag family → `enum`. A bitmask ORed from independent bits →
-> `flags`. A large immutable aggregate read repeatedly → an aggregate `const`
-> (rodata). Exempt only `0`/`1` identity/step and a one-off opcode byte inside a
-> documented ISA-encoder table. A literal that is non-trivial AND appears ≥2× OR
-> encodes an external-format constant (file magic, ABI number, section flag) MUST
-> be named. Never migrate a per-call *factory* that seeds fresh mutable state
-> (`*_empty()`) into a shared const — that aliases state and breaks value semantics.
+> scalar → `const UPPER_SNAKE_CASE: T = <const-expr>` (module, member, or
+> genuinely-constant local; comp-time, no arena). A closed integer tag family →
+> `enum PascalCase { PascalMember; … }` (per the repo's enum convention). A bitmask
+> ORed from independent bits → `flags` (members keep the external spec's names, e.g.
+> `SHF_ALLOC`). A large immutable aggregate read repeatedly → an aggregate `const`
+> (rodata). **Case is a STYLE convention of our source, NOT a language rule — the
+> compiler accepts any valid identifier; this rule is enforced by the canonicalizer,
+> never by the parser/checker.** Exempt only `0`/`1` identity/step and a one-off
+> opcode byte inside a documented ISA-encoder table. A literal that is non-trivial
+> AND appears ≥2× OR encodes an external-format constant (file magic, ABI number,
+> section flag) MUST be named. Never migrate a per-call *factory* that seeds fresh
+> mutable state (`*_empty()`) into a shared const — that aliases state and breaks
+> value semantics.
 
 ---
 
@@ -675,22 +843,45 @@ decides. The `*_empty()` factories are never touched (they are not constants).
 Each crumb is independently gate-able. The **ritual point** is where the FULL gate
 (both engines + `.tkt` + fixpoint gen2==gen3 + 100% delta coverage) must pass.
 Bootstrap-seed rule: `const` must be usable by the corpus only *after* it lands in
-the seed — so the FEATURE crumbs (1–7) land and become part of the released seed
-BEFORE the MIGRATION crumbs (8+) and the RULING-2 encoder sweep (S*) may use
+the seed — so the FEATURE crumbs (1–8) land and become part of the released seed
+BEFORE the MIGRATION crumbs (9+) and the RULING-2 encoder sweep (S*) may use
 `const`/`enum`/`flags` in the compiler's own source. The Tier-B backend phase
 (T-B*) is a separate, later track needed only for pointer-bearing aggregates.
 
-**Phase map:** Feature = crumbs 1–7 (RITUAL + seed release after 7) · Migration =
-8–11 · RULING-2 encoder sweep = S1–S6 · Tier-B backend + ABI-descriptor migration =
+**Phase map:** Feature = crumbs 1–8 (crumb 7 = TYPE-MEMBER const) · Migration =
+9–11 · RULING-2 encoder sweep = S1–S6 · Tier-B backend + ABI-descriptor migration =
 T-B1–T-B6.
 
-### Crumb 1 — parser: `ConstDecl` AST + `parse_const_decl` + wiring
+**Seed-bump points (owner 2026-07-15 — multiple bumps expected; bootstrap is
+incremental).** The seed (`teko.tkp`) advances SEVERAL times so later crumbs may use
+what earlier crumbs added. The D36 per-merge `-beta` mechanism already tags a seed
+per merge; the CAPABILITY-GATING bumps — the ones that unlock a feature for the
+corpus's OWN source — are:
+- **BUMP #1 — after Crumb 8 (🔑):** the three `const` placements + `enum`/`flags` +
+  Tier-A aggregate rodata + the `.tkb` codec are in the seed. This UNLOCKS the
+  migration (9–11) and the S* sweep to spell `const`/`enum`/`flags` anywhere in the
+  compiler source. The single most important bump.
+- **BUMP #2 — rolling, across Crumbs 9–11 + S1–S6:** each migration/sweep merge tags
+  its own `-beta` (D36) so the ever-growing use of `const`/`enum`/`flags` in
+  `src/` stays self-hosting; these are mechanism bumps, not new capabilities.
+- **BUMP #3 — after Crumb T-B5 (🔑):** the data→data relocation capability is in the
+  seed. This UNLOCKS Crumb T-B6 (migrating pointer-bearing aggregates — ABI
+  descriptors — to rodata consts the compiler's own source then uses). Tier-B may
+  itself need >1 intermediate bump (T-B1 reloc model → T-B2/3 writers → T-B4 wasm →
+  T-B5 VM) if a later T-B crumb's source uses an earlier one's capability.
+
+Lane→umbrella promotion stays "as early as possible" (owner); the internal seed
+bumps are the mechanism for making each increment available to the corpus.
+
+### Crumb 1 — parser: MODULE `ConstDecl` AST + `parse_const_decl` + wiring
 - **Shapes:** §4.1 `ConstDecl` type; `Decl`/`ItemKind` widen; §4.2
-  `parse_const_decl`; `parse_decl` arm; `with_outer_doc` gains a `ConstDecl` arm.
+  `parse_const_decl`; `parse_decl` arm (reuses the EXISTING `pub`/`exp` peel at
+  `parse_decl.tks:884–888`, so a module const takes `pub` OR `exp` for free);
+  `with_outer_doc` gains a `ConstDecl` arm.
 - **Fixtures (parser tests, `.tkt`):** parse `const A: i64 = 1` (ok); `pub const B:
-  u8 = ~(0 to u8)` (ok); `const C = 1` → error (missing type); `const D: i64` →
-  error (missing `=`); `const E: i64 = 1` at LOCAL scope still parses as the
-  existing local binding (no regression).
+  u8 = ~(0 to u8)` (ok); `exp const C: u32 = 0x78` (ok — `exp` accepted); `const D =
+  1` → error (missing type); `const E: i64` → error (missing `=`); `const F: i64 =
+  1` at LOCAL scope still parses as the existing local binding (no regression).
 - **Ritual:** full gate. Exit codes: valid programs compile-clean; each malformed
   case exits with the parser's error code (VM and native identical — parse is
   pre-backend so both engines share it).
@@ -741,25 +932,51 @@ T-B1–T-B6.
 - **Ritual:** full gate. **Aggregate keystone** — proves the "→ rodata" end-state
   with zero backend change for Tier A.
 
-### Crumb 7 — `.tkb` codec (C7.16) `TConstDecl` + cross-module `pub const`
-- **Shapes:** §4.9 encode/decode arms; `seed_from_dep` surfaces `pub const`s.
-- **Fixtures:** module `m1` exports `pub const P: u32 = 0x78`; `m2` uses `m1::P` →
-  compiles, both engines (scalar inlined in `m2`); a `pub const A: MReg = …`
-  aggregate re-materializes ONE rodata entry per consuming module; a non-`pub` const
-  used cross-module → visibility error.
-- **Ritual:** full gate. **RITUAL POINT — end of FEATURE phase.** After this passes
-  and is released, `const`/`enum`/`flags` (+ Tier-A aggregate rodata) are in the
-  bootstrap seed; migration + the encoder sweep may now use them in compiler source.
+### Crumb 7 — TYPE-MEMBER const (owner clarification): type-body parse + `TypeName::NAME` resolution
+- **Shapes (§4.10, D6):** widen `StructBody`/`ClassBody`/`TraitBody` + `ParsedStructBody`
+  with `consts: []ConstDecl`; `parse_type_member_const` + the third member branch in
+  `parse_fields`/`parse_class_fields` (reject `const` in interface/enum/flags/alias/
+  extern bodies); `find_member_const` (base-chain walk) wired as the first two-segment
+  arm in `type_path_expr` (`typer.tks:2283`); reuse `type_const_decl` + `is_const_expr`
+  + the inliner for the member's initializer. NO `LStructLayout` change (a member const
+  takes no slot).
+- **Fixtures (both-engine):** `type P = struct { x: i64; pub const ORIGIN_X: i64 = 0 }`
+  → `P::ORIGIN_X` reads 0, `sizeof(P)` unchanged (assert layout identical to a
+  const-less `P`); a subclass `Sub` of a base with `pub const K` resolves `Sub::K` to
+  the base value (inherited); `Sub` redeclaring `const K` → `Sub::K` shadows,
+  `Base::K` still the base's; `const` in an `interface` body → located error; a
+  `private const` used from another module → visibility error; an aggregate member
+  const `const R: MReg = preg(0, MRegClass::GPR)` materializes ONE rodata entry.
+- **Ritual:** full gate. Layout-invariance + inheritance/shadowing are the acceptance
+  bars.
 
-### Crumb 8 — migrate scalar + Tier-A-aggregate const families (6.1, 6.4)
+### Crumb 8 — `.tkb` codec (C7.16) `TConstDecl` (module + member) + cross-module `pub`/`exp`
+- **Shapes:** §4.9 encode/decode arms (module const as a `TItem`; member const inside
+  the `TypeDecl` body's `consts` list); `seed_from_dep` surfaces `pub`/`exp` module +
+  member consts.
+- **Fixtures:** module `m1` exports `pub const P: u32 = 0x78` and `type T = struct {
+  exp const Q: u32 = 9 }`; `m2` uses `m1::P` and `m1::T::Q` → compiles, both engines
+  (scalar inlined in `m2`); a `pub const A: MReg = …` aggregate re-materializes ONE
+  rodata entry per consuming module; a non-`pub`/`exp` const used cross-module →
+  visibility error.
+- **Ritual:** full gate. **RITUAL POINT + 🔑 SEED BUMP #1 — end of FEATURE phase.**
+  After this passes and the seed is bumped, all three `const` placements (+
+  `enum`/`flags` + Tier-A aggregate rodata) are in the bootstrap seed; migration +
+  the encoder sweep may now spell them in compiler source.
+
+### Crumb 9 — migrate scalar + Tier-A-aggregate const families (6.1, 6.4)
 - **Step:** replace each 6.1 scalar fn and each 6.4 Tier-A aggregate fn with
-  `pub const …`; update call sites `X()` → `X`. File-by-file (math, compress, lir,
-  io, isel_arm64 i128 trio, `gzip_magic`, `ret_inst`, `rax_x86`/register consts).
+  `pub const UPPER_SNAKE: T = …`; update call sites `x()` → `X`. Names go
+  `UPPER_SNAKE_CASE` per D7/W15 (`u8_max` → `U8_MAX`, `adler32_modulus` →
+  `ADLER32_MODULUS`, `gzip_magic` → `GZIP_MAGIC`, `ret_inst` → `RET_INST`, `rax_x86`
+  → `RAX_X86`). File-by-file (math, compress, lir, io, isel_arm64 i128 trio, gzip,
+  minst, register consts).
 - **Fixtures:** existing per-module tests keep their exit codes; a golden asserts the
   migrated value equals the old fn's value (both engines).
-- **Ritual:** full gate per file batch (fixpoint gen2==gen3 is the real proof).
+- **Ritual:** full gate per file batch (fixpoint gen2==gen3 is the real proof). Each
+  merge tags a `-beta` (rolling BUMP #2).
 
-### Crumb 9 — migrate enum families (6.2)
+### Crumb 10 — migrate enum families (6.2)
 - **Step:** introduce `enum BlockType/WasmScopeKind/ElideKind/EdgeResult/WasmVType/
   ZipMethod`; replace the tag fns; route wire-byte emission through a single
   `match`-driven `_wire` helper so emitted bytes are byte-identical.
@@ -767,18 +984,18 @@ T-B1–T-B6.
   (proves wire compatibility); both engines.
 - **Ritual:** full gate. Wire-byte identity is the acceptance bar.
 
-### Crumb 10 — migrate flags families + file magic (6.3)
+### Crumb 11 — migrate flags families + file magic (6.3)
 - **Step:** `flags ElfSectionFlags/ElfSymInfo/MachoSectionAttr`; named file-magic
   consts. Object-writer golden byte tests must be byte-identical.
 - **Fixtures:** ELF/Mach-O/COFF/wasm object golden tests unchanged; both engines.
 - **Ritual:** full gate.
 
 ### Crumbs S1–S6 — RULING-2 ISA-encoder + writer magic-value sweep (file-by-file)
-Sequenced AFTER crumb 7 (feature in seed). Each file is one crumb; the acceptance
+Sequenced AFTER crumb 8 (feature in seed). Each file is one crumb; the acceptance
 bar is **frozen machine/object bytes + fixpoint gen2==gen3** — not one emitted byte
 may change. Recurring opcode/mask/field literals → `const`/`enum`/`flags` per W15.
 - **S1** `src/backend/stackify.tks` (109 hits): wasm opcode `enum`, LEB masks →
-  `const`, value-type already via `WasmVType` (crumb 9).
+  `const`, value-type already via `WasmVType` (crumb 10).
 - **S2** `src/backend/encode_x86_64.tks` (90): ModRM/REX field masks → `const`,
   opcode families → an `enum`/named table.
 - **S3** `src/backend/encode_arm64.tks` (66): field masks/shifts → `const`.
@@ -804,12 +1021,15 @@ relocation absent today (§5.1), then migrates the ABI descriptors.
 - **T-B4** wasm: compute+write intra-data i32 offsets in the active data segment
   (`objfile_wasm.tks:640`) — no reloc, but new emit-time resolution.
 - **T-B5** VM (`lir_interp.tks:527`): resolve a rodata-INTERNAL pointer field to its
-  target rodata base at typed load.
-- **T-B6** migrate the ABI descriptors (`sysv64`/`aapcs64`/`riscv64_lp64d`/`win64`)
-  and any other pointer-bearing aggregate to rodata consts.
-- **Fixtures:** `const D: AbiDescriptor = aapcs64_descriptor` emits ONE rodata blob
-  with data relocs to its `[]u32` leaf arrays; both engines read identical register
-  lists; all object goldens updated once, then frozen.
+  target rodata base at typed load. **🔑 SEED BUMP #3 after T-B5** — the data-reloc
+  capability is now in the seed; T-B6's source may use pointer-bearing aggregate
+  consts. (T-B1..T-B5 may each tag an intermediate `-beta` if a later T-B crumb's
+  source uses an earlier one's capability.)
+- **T-B6** migrate the ABI descriptors (`SYSV64`/`AAPCS64`/`RISCV64_LP64D`/`WIN64`,
+  `UPPER_SNAKE` per D7) and any other pointer-bearing aggregate to rodata consts.
+- **Fixtures:** `const AAPCS64: AbiDescriptor = …` emits ONE rodata blob with data
+  relocs to its `[]u32` leaf arrays; both engines read identical register lists; all
+  object goldens updated once, then frozen.
 - **Ritual:** full gate per crumb; regalloc golden tests (they consume the ABI
   descriptors) must be byte-identical after T-B6.
 
@@ -861,9 +1081,15 @@ No genuine unresolved tension → no HALT.
 - `src/lir/lower.tks` — `TConstDecl` arm: scalar no-op (inlined upstream) + **Tier-A
   aggregate rodata materialization** (layout serializer + typed `LGlobalAddr` load).
 - `.tkb` codec (C7.16) — `TConstDecl` encode/decode.
-- migration (crumbs 8–10): `src/math/*`, `src/compress/*`, `src/backend/stackify.tks`,
-  `src/backend/objfile_*.tks`, `src/backend/isel_*.tks`, `src/lir/lir_interp.tks`,
-  `src/io/stream.tks`, `src/backend/minst.tks`, `src/compress/gzip.tks`.
+- `src/parser/ast.tks` + `src/parser/parse_decl.tks` (crumb 7) — widen
+  `StructBody`/`ClassBody`/`TraitBody`/`ParsedStructBody` with `consts`;
+  `parse_type_member_const` + the member-loop branch.
+- `src/checker/typer.tks` (crumb 7) — `find_member_const` + the `type_path_expr`
+  two-segment arm for `TypeName::NAME`.
+- migration (crumbs 9–11), names `UPPER_SNAKE`: `src/math/*`, `src/compress/*`,
+  `src/backend/stackify.tks`, `src/backend/objfile_*.tks`, `src/backend/isel_*.tks`,
+  `src/lir/lir_interp.tks`, `src/io/stream.tks`, `src/backend/minst.tks`,
+  `src/compress/gzip.tks`.
 - RULING-2 sweep (crumbs S1–S6): `encode_x86_64.tks`, `encode_arm64.tks`,
   `encode_riscv.tks`, `stackify.tks`, `objfile_*.tks` — frozen bytes.
 - **Feature + Tier A: ZERO backend encoder/writer changes, ZERO C twins.**
@@ -871,12 +1097,22 @@ No genuine unresolved tension → no HALT.
   encoders (reloc section tag), ELF/Mach-O/COFF writers (data-section relocs), wasm
   data emitter, VM `lir_interp.tks`.
 
-## 11. Note on bootstrap ordering
+## 11. Note on bootstrap ordering — MULTIPLE seed bumps (owner 2026-07-15)
 
-Crumbs 1–7 are the FEATURE (scalars inline + Tier-A aggregates → rodata + cross-
-module codec) and must be **released into the bootstrap seed** before crumbs 8+ and
-the S* sweep may spell `const`/`enum`/`flags` in the compiler's own `.tks` sources
-(the corpus must not use a feature not yet in its seed). Sequence the PRs so the
-feature ships and the seed advances, then migrate, then sweep. The Tier-B backend
-track (T-B*) can run in parallel with migration/sweep since it adds a NEW capability
-(data-reloc) rather than depending on the migrated sources.
+The seed advances SEVERAL times; a single end-of-phase bump is NOT required. The
+corpus must never use a feature not yet in its seed, so the capability-gating bumps
+sequence the work:
+
+- Crumbs 1–8 are the FEATURE (three placements + `enum`/`flags` + Tier-A aggregate
+  rodata + codec). **🔑 SEED BUMP #1 after crumb 8** lets crumbs 9+ and the S* sweep
+  spell `const`/`enum`/`flags` in `src/`.
+- Crumbs 9–11 + S1–S6 each tag a rolling `-beta` (D36 per-merge) so the growing use
+  of the feature in the compiler's own source stays self-hosting (BUMP #2, rolling).
+- The Tier-B track (T-B*) adds a NEW capability (data→data reloc). **🔑 SEED BUMP #3
+  after T-B5** lets T-B6 migrate pointer-bearing aggregates the compiler source then
+  uses. T-B may need >1 intermediate bump internally.
+
+Tier-B can run in parallel with migration/sweep (it adds capability, not a
+dependency on migrated sources). Lane→umbrella promotion stays "as early as
+possible" (owner); the internal seed bumps make each increment available to the
+corpus incrementally.
