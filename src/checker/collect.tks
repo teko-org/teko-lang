@@ -42,6 +42,41 @@ fn reject_unsafe_signature_contagion(fn_name: str, fn_unsafe: bool, t: Type, tab
     error { message = $"safe fn '{fn_name}' names unsafe type in its signature — mark it `unsafe fn` or take/return only safe types (§2: only safe types cross the boundary)" }
 }
 
+/**
+ * const_type_located — position a type-resolution error at the const declaration's own line/col
+ * when it arrived unlocated (line 0), so `const K: Unknown = …` reports at the `const` keyword
+ * rather than at the program root (#594 crumb 2).
+ *
+ * @param e   the error `resolve_type` returned for `cd.ty`
+ * @param cd  the const declaration whose declared type failed to resolve
+ * @return    `e` positioned at the const's own line/col when it carried none
+ * @since #594
+ */
+fn const_type_located(e: error, cd: parser::ConstDecl) -> error {
+    if e.line != 0 { return e }
+    teko::error::err_loc(e, cd.line, cd.col)
+}
+
+/**
+ * collect_const_sig — resolve a module-level ConstDecl's declared type and return it, so the pass-1
+ * collector can bind the const's name to that type before pass-2 types any initializer (#594 crumb
+ * 2). Mirrors `func_type`'s role for functions: SIGNATURE only — the initializer is neither
+ * evaluated nor validated here (that is crumb 3/4). A const carries no type-params, so `cd.ty`
+ * resolves against the program's `table` directly.
+ *
+ * @param cd      the parsed const declaration
+ * @param table   the program's type table (to resolve `cd.ty`)
+ * @param ref_ns  the namespace the const is declared in (the referencing ns for `cd.ty`)
+ * @return        the const's resolved value type, or a located error on an unknown type
+ * @since #594
+ */
+fn collect_const_sig(cd: parser::ConstDecl, table: TypeTable, ref_ns: str) -> Type | error {
+    match resolve_type(cd.ty, table, ref_ns) {
+        Type as t => t
+        error as e => const_type_located(e, cd)
+    }
+}
+
 fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error {
     let tbl = type_param_table(f.type_params, f.type_constraints, "", table)   // (S4) the fn's generic type-params, opaque, in scope
     mut params: []Type = teko::list::empty()
@@ -197,6 +232,13 @@ fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
                     error as e => return e
                 }
                 env = define_fn(env, f.name, ft, items[i].namespace)   // #41: carry the fn's ns
+            }
+            parser::ConstDecl as cd => {
+                let ct = match collect_const_sig(cd, table, items[i].namespace) {
+                    Type as t => t
+                    error as e => return e
+                }
+                env = define_const(env, cd.name, ct, items[i].namespace)
             }
             parser::TypeDecl as td => {
                 match td.body {

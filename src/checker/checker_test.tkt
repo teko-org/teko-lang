@@ -296,6 +296,38 @@ fn types_function_and_program() {
     match tp.items[0] { TFunction as ff => teko::assert::is_true(prim_is(ff.return_type, PrimKind::U32)); _ => teko::assert::is_true(false) }
 }
 
+/** collects_const_forward_ref_resolves_in_pass1 — a fn body that reads a `const` declared LATER in
+    the file type-checks: pass-1 collect resolves the const's declared type and binds its name, so
+    the forward reference resolves before pass-2 (#594 crumb 2, collect_const_sig + define_const). */
+#test
+fn collects_const_forward_ref_resolves_in_pass1() {
+    let uses_k = mk_fn("uses_k", named_t("i64"), one_stmt(e_var("K")))
+    let k = parser::ConstDecl { name = "K"; ty = named_t("i64"); init = e_num(1); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 2; col = 1 }
+    let fn_item = parser::Item { content = uses_k; namespace = ""; file = "" }
+    let const_item = parser::Item { content = k; namespace = ""; file = "" }
+    let items: []parser::Item = teko::list::push(teko::list::push(teko::list::empty(), fn_item), const_item)
+    let table = collect_types(items)
+    let env = match collect_funcs(items, table) { Env as e => e; error => { teko::assert::is_true(false); return } }
+    let kb = match lookup_binding(env, "K") { ValBinding as b => b; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(prim_is(kb.type, PrimKind::I64))
+    teko::assert::is_true(kb.is_const)
+    match type_function(uses_k, env, table) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** collects_const_unknown_type_is_located_error — a `const` whose declared type names no known type
+    yields an error positioned at the const's own line/col, not a silent success (#594 crumb 2). */
+#test
+fn collects_const_unknown_type_is_located_error() {
+    let bad = parser::ConstDecl { name = "B"; ty = named_t("Nonexistent"); init = e_num(1); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 7; col = 3 }
+    match collect_const_sig(bad, empty_table(), "") {
+        Type => teko::assert::is_true(false)
+        error as e => {
+            teko::assert::is_true(e.line == 7)
+            teko::assert::is_true(e.col == 3)
+        }
+    }
+}
+
 // REGRESSION (self-hosted cross-file top-level fn call): a top-level function declared in a
 // namespace (a non-main source file) called UNQUALIFIED from a LOOSE top-level statement (the
 // virtual-main / main.tks) in the SAME namespace. type_program must set the threaded scope's

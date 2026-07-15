@@ -2,13 +2,25 @@
 
 use teko::parser
 
-// a value binding: a name, its type, and (for a top-level FUNCTION) the DEFINING namespace —
-// "" for locals/params/match-binds — used by namespace-aware CALL resolution (#41).
+/**
+ * ValBinding — one value binding in the checker environment: a name, its resolved type, whether it
+ * is a `mut` local, its declaring namespace (top-level fns/consts only), and whether it names a
+ * module-level `const`. The namespace drives namespace-aware CALL resolution (#41); `is_const`
+ * distinguishes a `const` reference from an ordinary value so a forward reference resolves in pass-1
+ * and the crumb-5 inliner can find it (#594).
+ *
+ * @param name      the bound identifier
+ * @param type      the binding's resolved value type
+ * @param is_mut    true ONLY for a `mut` local; let/const/params/match-bindings are false (B.21)
+ * @param ns        the declaring namespace of a top-level fn/const; "" for locals/params (#41)
+ * @param is_const  true iff this names a module-level `const` (#594 crumb 2)
+ */
 type ValBinding = struct {
     name: str
     type: Type
-    is_mut: bool   // (B.21): true ONLY for a `mut` local; let/const/params/match-bindings = false
-    ns: str   // (#41) declaring namespace of a top-level fn; "" for locals
+    is_mut: bool
+    ns: str
+    is_const: bool
 }
 
 // the environment: a FLAT list of bindings PLUS the namespace currently being type-checked, so an
@@ -95,12 +107,29 @@ pub fn with_owner(env: Env, owner: str) -> Env { Env { base = env.base; bindings
 // define a LOCAL name (append). `is_mut`: a `mut` binding passes true; everything else false (B.21).
 // Locals carry no namespace ("").
 pub fn define(env: Env, name: str, t: Type, is_mut: bool) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = "" }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = ""; is_const = false }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
 }
 
 // (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace.
 pub fn define_fn(env: Env, name: str, t: Type, ns: str) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = false }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
+}
+
+/**
+ * define_const — bind a module-level `const` name to its resolved type in the pass-1 environment so
+ * a forward reference (another const, or a fn body naming a const declared later in the file)
+ * resolves before pass-2 types the initializer (#594 crumb 2). Reuses the value-binding path with
+ * `is_const = true`, carrying the const's declaring namespace, mirroring `define_fn`.
+ *
+ * @param env   the pass-1 environment being accumulated
+ * @param name  the constant's identifier
+ * @param t     the constant's resolved value type
+ * @param ns    the namespace the const is declared in
+ * @return      `env` extended with the const binding
+ * @since #594
+ */
+pub fn define_const(env: Env, name: str, t: Type, ns: str) -> Env {
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = true }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
 }
 
 // a binding is mutable iff declared `mut` (Let and Const are immutable — B.21).
