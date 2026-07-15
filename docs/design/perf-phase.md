@@ -159,6 +159,12 @@ that is the use-after-free proof for Boundary A.
     total M is known after project enumeration). **(b) tests** — the runner shows `N/M tests`
     as each `#test` runs (lands with the per-test timers). Caveat: `\r`-in-place needs a TTY;
     CI logs (non-TTY) get a newline/periodic form or a final summary. No design committed.
+  * **Per-phase start/end markers + elapsed (owner 2026-07-15).** Each pipeline phase
+    (lexer → parser → checker → monomorph → codegen/emit → cc → link) prints a START and an
+    END marker with the elapsed time — so you can SEE where a build is (and where it STOPS:
+    the native honest-stop shows as e.g. `checker ✓ … codegen ✗`). This surfaces the per-phase
+    timing the diagnostics measured (checker ~76%) in every normal build, no instrumentation.
+    Phase-level (vs the item-level `N/M` counters above). Same non-TTY caveat.
 * **Post-linker: per-OS ABI / platform optimization — a SEPARATE round, deferred
   (owner 2026-07-15).** Owner hypothesis: we are not yet exploiting the best ABI each
   OS can provide to maximize performance; grounded in the observed per-OS divergence
