@@ -97,7 +97,7 @@ fn project_frontend(dir: str) -> Frontend | error { project_frontend_sel(dir, fa
 fn project_frontend_sel(dir: str, include_tests: bool) -> Frontend | error {
     // Enter the project root so relative source paths resolve (the contained host edge).
     match teko::env::chdir(dir) { error => return error { message = "cannot enter project directory" }; null => { } }   // error? — null = success
-    frontend_body(include_tests, false)
+    frontend_body(include_tests, false, output_is_tty(false))
 }
 
 // (C7.1f) #os conditional compilation — the TARGET OS for guard selection: derived from the
@@ -232,12 +232,84 @@ fn load_deps_program(m: Manifest) -> checker::TProgram | error {
     checker::TProgram { items = all_items }
 }
 
-// frontend_body — the front-end AFTER the chdir (manifest → discover → assemble → check),
-// operating in the CURRENT directory. Split out so the D4 gate can retry it WITHOUT tests after a
-// test-assembly failure, on the SAME chdir (no second `teko::env::chdir`, which would fail for a
-// relative project dir already entered). `quiet` suppresses the file-map print (the gate's retry
-// already printed it on the failed first attempt).
-fn frontend_body(include_tests: bool, quiet: bool) -> Frontend | error {
+/**
+ * Build the `checker` phase's per-item progress hook (BUILD-OUTPUT OBSERVABILITY):
+ * on each tick, record the latest `(done, total)` into `last`/`total_cell` (read
+ * back once `type_program_with_deps_pre_mono` returns, for the settle line — the
+ * actual total can differ slightly from the pre-check item count once trait
+ * derivations fold) and render the live "N/M items" counter.
+ *
+ * @param phase       the checker phase handle from `phase_begin`
+ * @param last        the caller's tick counter, updated to the latest `done`
+ * @param total_cell  the caller's total-item counter, updated to the latest `total`
+ * @return            the `ProgressFn` closure to pass to `type_program_with_deps_pre_mono`
+ */
+fn checker_tick_fn(phase: Phase, last: Ref<u64>, total_cell: Ref<u64>) -> checker::ProgressFn {
+    (n: u64, m: u64) => {
+        last.value = n
+        total_cell.value = m
+        phase_tick(phase, count_unit_text(n, m, "items"))
+    }
+}
+
+/**
+ * Run the checker + monomorphization phases over `selected` (with `dep_prog`'s
+ * signatures pre-seeded), reporting BOTH as their own timed `teko build`
+ * observability phases: `checker` ticks a live "N/M items" counter as
+ * `type_program_with_deps_pre_mono` types each top-level item; `monomorph` settles
+ * once with the resulting instance count (its fixpoint queue has no cheap upfront
+ * total, so it renders as a count-up rather than a running "N/M" — see
+ * `count_only_text`). Extracted from `frontend_body` to keep that function flat.
+ *
+ * @param selected  the OS-pruned, un-typed merged program
+ * @param dep_prog  the already-typed dependency program (empty when depless)
+ * @param report    print the phase lines (`false` for a silent/retry pass)
+ * @param tty       render the phases' in-place `\r` updates
+ * @return          the fully checked and monomorphized program, or the first error
+ */
+fn checked_program_of(selected: parser::Program, dep_prog: checker::TProgram, report: bool, tty: bool) -> checker::TProgram | error {
+    let visible = report && tty
+    let checker_phase = phase_begin("checker", count_unit_text(0, selected.items.len, "items"), visible)
+    mut last: u64 = 0
+    mut total_cell: u64 = selected.items.len
+    let on_item = checker_tick_fn(checker_phase, last, total_cell)
+    let pre = match checker::type_program_with_deps_pre_mono(selected, dep_prog, on_item) {
+        checker::PreMono as p => p
+        error as e => {
+            if report { phase_end_fail(checker_phase, count_unit_text(last, total_cell, "items"), e.message) }
+            return e
+        }
+    }
+    if report { phase_end_ok(checker_phase, count_unit_text(total_cell, total_cell, "items")) }
+
+    let mono_phase = phase_begin("monomorph", count_only_text(0, "instances"), visible)
+    let checked = match checker::monomorphize(pre.prog, pre.table) {
+        checker::TProgram as c => c
+        error as e => {
+            if report { phase_end_fail(mono_phase, count_only_text(0, "instances"), e.message) }
+            return e
+        }
+    }
+    let instances = if checked.items.len > pre.prog.items.len { checked.items.len - pre.prog.items.len } else { 0 }
+    if report { phase_end_ok(mono_phase, count_unit_text(instances, instances, "instances")) }
+    checked
+}
+
+/**
+ * The front-end AFTER the chdir (manifest -> discover -> assemble -> check),
+ * operating in the CURRENT directory. Split out so the D4 gate can retry it
+ * WITHOUT tests after a test-assembly failure, on the SAME chdir (no second
+ * `teko::env::chdir`, which would fail for a relative project dir already
+ * entered).
+ *
+ * @param include_tests  assemble the `.tkt` test files into the merged program too
+ * @param quiet          suppress the observability output (the gate's retry already
+ *                       reported it on the failed first attempt)
+ * @param tty            render the `lexer`/`parser`/`checker`/`monomorph` phases'
+ *                       in-place `\r` updates (BUILD-OUTPUT OBSERVABILITY)
+ * @return               the checked program and manifest, or the first error
+ */
+fn frontend_body(include_tests: bool, quiet: bool, tty: bool) -> Frontend | error {
     // --- find + read + parse the manifest (the single <name>.tkp at the root — A1) ---
     let mname = match find_manifest() { str as n => n; error as e => return e }
     let mtext = match teko::io::read_file(mname) { str as s => s; error => return error { message = "cannot read .tkp manifest" } }
@@ -264,20 +336,14 @@ fn frontend_body(include_tests: bool, quiet: bool) -> Frontend | error {
     }
     match check_main_file_rule(m.artifact, has_main) { Artifact => { }; error as e => return e }
 
-    // --- report the discovered file → namespace map (the project's surface) ---
-    if !quiet { teko::io::println(teko::str::concat("teko: project '", m.name, teko::str::concat("' (source=", m.source, ")"))) }
-    mut fi: u64 = 0
-    loop {
-        if quiet { break }
-        if fi >= files.len { break }
-        let f = files[fi]
-        teko::io::println(teko::str::concat("  ", f.path, teko::str::concat("\t-> ", f.namespace)))
-        fi++
+    if !quiet {
+        teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
+        teko::io::eprintln(teko::str::concat("project '", m.name, teko::str::concat("' (source=", m.source, ")")))
     }
 
     // --- assemble: read+parse every file, MERGE into ONE program (A3) ---
     // assemble bakes file:line:col into the message, so report with an empty path (W-loc).
-    let program = match assemble_sel(files, include_tests) { parser::Program as p => p; error as e => return e }
+    let program = match assemble_sel(files, include_tests, !quiet, tty) { parser::Program as p => p; error as e => return e }
 
     // --- C7.1f: keep only the target OS's `#os("…")` function variants (conditional compilation) ---
     let selected = prune_os(program, target_os(m))
@@ -288,10 +354,7 @@ fn frontend_body(include_tests: bool, quiet: bool) -> Frontend | error {
     // and reference dep types. m.deps is empty when there is no [dependencies] section → no-op.
     let dep_prog = match load_deps_program(m) { checker::TProgram as p => p; error as e => return e }
 
-    // --- check the WHOLE merged program (M.1 — whole program checked together) ---
-    // With deps: use type_program_with_deps to inject dep signatures before type-checking.
-    // Without deps: falls back to the standard type_program (dep_prog.items is empty).
-    let checked = match checker::type_program_with_deps(selected, dep_prog) { checker::TProgram as c => c; error as e => return e }
+    let checked = match checked_program_of(selected, dep_prog, !quiet, tty) { checker::TProgram as c => c; error as e => return e }
 
     Frontend { prog = checked; manifest = m }
 }
@@ -711,9 +774,13 @@ fn plist_xml(m: Manifest) -> str {
  * @param prog     the checked, typed program
  * @param m        the resolved manifest
  * @param opt      the cc optimization level for the C-backend link (0 = default, 2 = release seed)
+ * @param tty      render the `codegen`/`emit C`/`cc` phases' in-place `\r` updates
+ *                 (BUILD-OUTPUT OBSERVABILITY; the library/package honest-stop and
+ *                 packaging paths below are unaffected — only the default binary
+ *                 path is instrumented)
  * @return         0 on a successful build, else the failing status
  */
-fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest, opt: i32) -> i32 {
+fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest, opt: i32, tty: bool) -> i32 {
     // (C7.1m) artifact-kind dispatch. Binary → the native executable backend below. The library kinds
     // are HONEST STOPS until their increments land (M.3 — no fake artifact): static/shared = native
     // lib output (ar / -shared); package = a `.tkl` ZIP of .tkh+.tkb+.tsym, which needs the PROGRAM-
@@ -766,20 +833,33 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
     if native_backend_selected() {
         return emit_native(dir, stem, out_dir, prog, m)
     }
-    let emitted = match codegen::tk_emit_c(prog) { str as s => s; error as e => return fail(dir, e.message) }
+    let codegen_phase = phase_begin("codegen", count_unit_text(0, prog.items.len, "items"), tty)
+    let emitted = match codegen::tk_emit_c(prog) {
+        str as s => s
+        error as e => {
+            phase_end_fail(codegen_phase, count_unit_text(0, prog.items.len, "items"), e.message)
+            return fail(dir, e.message)
+        }
+    }
+    phase_end_ok(codegen_phase, count_unit_text(prog.items.len, prog.items.len, "items"))
     // C7.1k — append the build-metadata C so every binary carries its identity (what(1)/strings).
     let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(m.name, m.version, m.suffix, m.description))
     let od = strip_trailing_slash(out_dir)
     match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
     let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))
     let binp = teko::str::concat(od, "/", stem)
+    let emit_phase = phase_begin("emit C", cfile, tty)
     match teko::io::write_file(cfile, csrc) {
-        error as e => return fail(dir, e.message)
+        error as e => { phase_end_fail(emit_phase, cfile, e.message); return fail(dir, e.message) }
         null => { }   // error? — null = success
     }
+    phase_end_ok(emit_phase, teko::str::concat(cfile, teko::str::concat(" ", size_text(csrc.len))))
+    let cc_phase = phase_begin("cc", binp, tty)
     if run_cc(cfile, binp, m, prog, opt) != 0 {
+        phase_end_fail(cc_phase, binp, "cc failed to build the generated C")
         return fail(dir, "cc failed to build the generated C")
     }
+    phase_end_ok(cc_phase, binp)
     // E3 — write the symbol map beside the binary (best-effort; a write error never fails the build —
     // the .tsym is debug metadata for the E4 native stack-trace, not the artifact).
     match teko::io::write_file(teko::str::concat(binp, ".tsym"), codegen::tk_emit_tsym(prog)) { error => { }; null => { } }
@@ -1205,11 +1285,11 @@ fn abs_path_of(path: str, cwd: str) -> str {
 // `<base>/runtime/teko_rt.h` exists (the in-tree layout, then a bundled-install layout).
 fn probe_rt_dir(base: str) -> bool {
     match teko::io::read_file(teko::str::concat(base, "/src/runtime/teko_rt.h")) {
-        str => { let _ = teko::env::set_var("TK_RT_DIR", teko::str::concat(base, "/src/runtime")); return true }
+        str => { teko::env::set_var("TK_RT_DIR", teko::str::concat(base, "/src/runtime")); return true }
         error => { }
     }
     match teko::io::read_file(teko::str::concat(base, "/runtime/teko_rt.h")) {
-        str => { let _ = teko::env::set_var("TK_RT_DIR", teko::str::concat(base, "/runtime")); return true }
+        str => { teko::env::set_var("TK_RT_DIR", teko::str::concat(base, "/runtime")); return true }
         error => { }
     }
     false
@@ -1280,7 +1360,7 @@ fn ensure_rt_dir_abs() {
     }
 
     if cwd.len > 0 && probe_rt_dir(cwd) { return }
-    let _ = probe_share_rt_dir()
+    if probe_share_rt_dir() { return }
 }
 
 /** compile_project — the `teko build <dir>` entry with every default: the D4 gate ON, no coverage
@@ -1292,7 +1372,7 @@ fn ensure_rt_dir_abs() {
  *  @param out_dir  the build output directory (`-o`, default "bin")
  *  @return         0 on a fully gated, successfully built release, else the failing status
  *  @since #265 */
-fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false, 0) }
+fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false, 0, false) }
 
 // (#148) report_peak — the compiler prints its own memory cost at the end of a successful build
 // (peak RSS via teko::mem::peak_rss; 0 = unavailable on this host → print suppressed).
@@ -1324,12 +1404,29 @@ fn strip_tests(prog: checker::TProgram) -> checker::TProgram {
     checker::TProgram { items = kept }
 }
 
-/** Hand `prog` to the backend at optimization level `opt` and, on success, report the build's peak
- *  memory cost (#148). The shared tail of every build path once its program is final: no tests
- *  present, the `--no-verify` escape hatch, and the gate's own release rebuild. */
-fn codegen_and_report(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest, opt: i32) -> i32 {
-    let rc = backend(dir, m.name, out_dir, prog, m, opt)
-    if rc == 0 { report_peak() }
+/**
+ * Print the BUILD-OUTPUT OBSERVABILITY closing line: the built artifact's path and
+ * the TOTAL wall time since `start` (front-end + backend combined) — the summary
+ * the phase list settles into.
+ *
+ * @param binp   the built artifact path
+ * @param start  when the build began, before the front-end ran
+ */
+fn report_build_done(binp: str, start: i128) {
+    teko::io::eprintln(teko::str::concat("built ", binp, teko::str::concat("   ", teko::str::concat(elapsed_str(start), "s"))))
+}
+
+/** Hand `prog` to the backend at optimization level `opt` and, on success, report the closing
+ *  `built <path> <elapsed>` line (measured since `start`) and the build's peak memory cost
+ *  (#148). The shared tail of every build path once its program is final: no tests present,
+ *  the `--no-verify` escape hatch, and the gate's own release rebuild. `tty` selects the
+ *  backend's in-place `\r` phase updates (BUILD-OUTPUT OBSERVABILITY). */
+fn codegen_and_report(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest, opt: i32, tty: bool, start: i128) -> i32 {
+    let rc = backend(dir, m.name, out_dir, prog, m, opt, tty)
+    if rc == 0 {
+        report_build_done(teko::str::concat(strip_trailing_slash(out_dir), "/", m.name), start)
+        report_peak()
+    }
     rc
 }
 
@@ -1338,9 +1435,9 @@ fn codegen_and_report(dir: str, out_dir: str, prog: checker::TProgram, m: Manife
  *  opted out of re-verification — e.g. a self-host release chain re-proving the fixpoint on gen-2,
  *  where the `.tkt` gate outcome is already known deterministic from gen-1. This is the path
  *  `release.yml` drives with `--no-verify --release`, so the published seed links at `-O2`. */
-fn build_ungated(dir: str, out_dir: str, opt: i32) -> i32 {
-    let fe = match frontend_body(false, false) { Frontend as f => f; error as e => return fail(dir, e.message) }
-    codegen_and_report(dir, out_dir, fe.prog, fe.manifest, opt)
+fn build_ungated(dir: str, out_dir: str, opt: i32, tty: bool, start: i128) -> i32 {
+    let fe = match frontend_body(false, false, tty) { Frontend as f => f; error as e => return fail(dir, e.message) }
+    codegen_and_report(dir, out_dir, fe.prog, fe.manifest, opt, tty, start)
 }
 
 /** Check the D4 coverage floors (from the `.tkp` [coverage] section; default 80/80/80) against
@@ -1401,7 +1498,7 @@ fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest)
     mut argv: []str = teko::list::push(teko::list::empty(), binp)
     let trc = teko::process::run(argv)
     if trc != 0 { return trc }
-    let _ = coverage::cov_merge(covfile)
+    coverage::cov_merge(covfile)
     0
 }
 
@@ -1409,16 +1506,16 @@ fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest)
  *  `gen_cov` is set, else "" (an empty path means "don't write" to the caller). */
 fn cobertura_path_of(out_dir: str, gen_cov: bool) -> str {
     if !gen_cov { return "" }
-    let _ = teko::fs::mkdir(out_dir)
+    teko::fs::mkdir(out_dir)
     teko::str::concat(out_dir, "/cobertura.xml")
 }
 
 /** (#151) Re-front-end WITHOUT the `.tkt` files for the RELEASE program (`quiet` = the file map
  *  was already printed by the gate's first pass), strip any surviving `#test` functions by
  *  provenance, and hand the clean program to the backend at optimization level `opt`. */
-fn release_build_of(dir: str, out_dir: str, opt: i32) -> i32 {
-    let rel = match frontend_body(false, true) { Frontend as f => f; error as e => return fail(dir, e.message) }
-    codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest, opt)
+fn release_build_of(dir: str, out_dir: str, opt: i32, tty: bool, start: i128) -> i32 {
+    let rel = match frontend_body(false, true, tty) { Frontend as f => f; error as e => return fail(dir, e.message) }
+    codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest, opt, tty, start)
 }
 
 /** run_gate_native — the D4 test-gate body run NATIVELY (the DEFAULT since #168): run every `#test`
@@ -1435,9 +1532,11 @@ fn release_build_of(dir: str, out_dir: str, opt: i32) -> i32 {
  *  @param gen_cov  write a Cobertura report (`--coverage`) from the merged native sinks
  *  @param fe       the already-assembled front-end product (checked program + manifest)
  *  @param opt      the cc optimization level for the RELEASE rebuild (the gate binary stays opt 0)
+ *  @param tty      render the release rebuild's backend phases' in-place `\r` updates
+ *  @param start    when the build began (the closing `built <path> <elapsed>` line's baseline)
  *  @return         0 when every test passes, every floor is met, and the release build succeeds
  *  @since #265 */
-fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32) -> i32 {
+fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32, tty: bool, start: i128) -> i32 {
     let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest)
     if trc != 0 { return trc }
     report_native_coverage(fe.prog)
@@ -1449,7 +1548,7 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32
         match teko::io::write_file(cov_path, xml) { error => { }; null => { } }
         teko::io::println(teko::str::concat("teko: wrote coverage report ", cov_path))
     }
-    release_build_of(dir, out_dir, opt)
+    release_build_of(dir, out_dir, opt, tty, start)
 }
 
 /**
@@ -1461,15 +1560,17 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32
  * @param gen_cov  `--coverage` — write the Cobertura report
  * @param fe       the front-end result assembled WITH the `.tkt` tests
  * @param opt      the cc optimization level for the release rebuild (0 = default, 2 = release seed)
+ * @param tty      render the release rebuild's backend phases' in-place `\r` updates
+ * @param start    when the build began (the closing `built <path> <elapsed>` line's baseline)
  * @return         0 when the gate passes and the release build succeeds, else the failing status
  */
-fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32) -> i32 {
-    run_gate_native(dir, out_dir, gen_cov, fe, opt)
+fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32, tty: bool, start: i128) -> i32 {
+    run_gate_native(dir, out_dir, gen_cov, fe, opt, tty, start)
 }
 
 /** No `#test` functions at all: ignore the gate, build the production program straight from the
  *  already-assembled `fe` (no test code present to strip or verify) at optimization level `opt`. */
-fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend, opt: i32) -> i32 { codegen_and_report(dir, out_dir, fe.prog, fe.manifest, opt) }
+fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend, opt: i32, tty: bool, start: i128) -> i32 { codegen_and_report(dir, out_dir, fe.prog, fe.manifest, opt, tty, start) }
 
 /** compile_project_g — the build with the D4 TEST GATE (ON BY DEFAULT; `--no-test` is IGNORED for a
  *  build — a release MUST run its tests). Assemble WITH the `.tkt` tests, run them on the NATIVE gate
@@ -1486,20 +1587,23 @@ fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend, opt: i32) -> i32
  *  @param gen_cov      write a Cobertura report (`--coverage`)
  *  @param no_verify    skip the gate entirely (`--no-verify`, #249 lever A)
  *  @param opt          the cc optimization level (`--release`/`--opt=<n>`; 0 = dev/CI default, 2 = release seed)
+ *  @param no_tty       `--no-tty` — force the plain, non-interactive observability output even on a terminal
  *  @return             0 on a fully gated, successfully built release, else the failing status
  *  @since #265 */
-fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, opt: i32) -> i32 {
+fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, opt: i32, no_tty: bool) -> i32 {
     ensure_rt_dir_abs()
     match teko::env::chdir(dir) { error => return fail(dir, "cannot enter project directory"); null => { } }
+    let tty = output_is_tty(no_tty)
+    let start = now_ns()
     if no_verify {
-        return build_ungated(dir, out_dir, opt)
+        return build_ungated(dir, out_dir, opt, tty, start)
     }
-    match frontend_body(true, false) {
+    match frontend_body(true, false, tty) {
         Frontend as fe => {
             if !has_tests(fe.prog) {
-                return build_no_tests_present(dir, out_dir, fe, opt)
+                return build_no_tests_present(dir, out_dir, fe, opt, tty, start)
             }
-            run_gate(dir, out_dir, gen_cov, fe, opt)
+            run_gate(dir, out_dir, gen_cov, fe, opt, tty, start)
         }
         error as e => return fail(dir, e.message)
     }
@@ -1562,12 +1666,33 @@ fn no_verify_of(args: []str) -> bool {
     false
 }
 
+/**
+ * does `--no-tty` appear in the args? (BUILD-OUTPUT OBSERVABILITY.) FORCES the plain,
+ * non-interactive phase output (no `\r` in-place updates, one settled line per phase)
+ * even when stdout IS a real terminal — a manual override of `output_is_tty`'s
+ * env-based auto-detection, for a dev who wants clean diagnostic output to capture
+ * or paste. Overrides win: `--no-tty` present -> always plain, regardless of `CI`/`TERM`.
+ *
+ * @param args  the full CLI argument vector
+ * @return      true iff `--no-tty` appears anywhere in `args`
+ */
+fn no_tty_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--no-tty" { return true }
+        i = i + 1
+    }
+    false
+}
+
 /** project_arg_of — the FIRST non-flag positional (the project) from `start`, or "" if none (the
  *  caller reports). Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored),
- *  `--no-verify` (#249 lever A), `--native-gate` (#265, now an inert no-op), `--release` and
- *  `--opt=<n>` (the optimization axis) — every recognized build flag — so none of them is mistaken
- *  for the project. `--vm-gate` was removed outright with the VM (#524, M3): a stray `--vm-gate` now
- *  falls through as an unknown positional, the honest "not a project" signal that the VM is gone.
+ *  `--no-verify` (#249 lever A), `--native-gate` (#265, now an inert no-op), `--release`,
+ *  `--opt=<n>` (the optimization axis), and `--no-tty` (BUILD-OUTPUT OBSERVABILITY) — every
+ *  recognized build flag — so none of them is mistaken for the project. `--vm-gate` was removed
+ *  outright with the VM (#524, M3): a stray `--vm-gate` now falls through as an unknown
+ *  positional, the honest "not a project" signal that the VM is gone.
  *
  *  @param args   the full CLI argument vector
  *  @param start  the index to begin scanning from (2 for a subcommand, 1 for a bare project)
@@ -1582,6 +1707,7 @@ fn project_arg_of(args: []str, start: u64) -> str {
         else if args[i] == "--no-verify" { i = i + 1 }
         else if args[i] == "--native-gate" { i = i + 1 }
         else if args[i] == "--release" { i = i + 1 }
+        else if args[i] == "--no-tty" { i = i + 1 }
         else if opt_arg_has_prefix(args[i]) { i = i + 1 }
         else { return args[i] }
     }
