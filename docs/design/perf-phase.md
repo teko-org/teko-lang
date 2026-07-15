@@ -146,6 +146,12 @@ that is the use-after-free proof for Boundary A.
   carrying the test AST alongside the source load, and re-add the Windows test run
   once the compiler-speed work brings the build time down. Sequenced **after** the
   four perf fixes + the -O2 seed land; no design committed here yet.
+  * **Per-test timers (owner 2026-07-15) — lands WITH the parallelization + AST-isolation.**
+    Instrument the test runner to time each `#test` individually and report the per-test
+    wall-time. Gives the missing fine-grained distribution (which tests are slow), lets us
+    tell *loading the AST* apart from *executing*, and feeds the scheduler (run the long
+    tests first / balance across threads). Not a standalone change — it comes in the same
+    round as isolating the tests off the main-AST load and parallelizing the run.
 * **Post-linker: per-OS ABI / platform optimization — a SEPARATE round, deferred
   (owner 2026-07-15).** Owner hypothesis: we are not yet exploiting the best ABI each
   OS can provide to maximize performance; grounded in the observed per-OS divergence
