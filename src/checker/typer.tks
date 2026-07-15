@@ -4263,12 +4263,75 @@ fn surface_at(file: str, item_line: u32, item_col: u32, inner: error) -> error {
     teko::error::err_typed(positioned, inner.expected, inner.actual)   // preserve expected/actual (C1.8)
 }
 
-// C7.10 — THE DEP-AWARE TYPED ENTRY POINT. Same as type_program but pre-seeds the
-// collection environment from an already-typed dep TProgram before collecting and typing
-// the project. The dep's items are NOT re-typed; only their signatures enter scope so
-// the project's code can call dep functions and reference dep types.
-// dep_prog.items is empty when there are no deps → degrades silently to type_program behavior.
+/**
+ * A per-item progress hook, invoked `(done, total)` after each top-level item is
+ * typed. Lets a caller (the `teko build` observability layer, `teko::build`) report
+ * a live "N/M items" counter for the checker phase without the checker depending on
+ * anything outside itself — the caller supplies the closure; the checker only ever
+ * calls it.
+ *
+ * @param done   how many top-level items have been typed so far
+ * @param total  the total top-level item count for this program
+ */
+pub type ProgressFn = (u64, u64) -> void
+
+/**
+ * `type_program_with_deps`'s result BEFORE monomorphization: the checked program
+ * (still carrying its generic templates) plus the resolved `TypeTable`
+ * `monomorphize` needs. Exposed so the build driver can time and report
+ * monomorphization as its OWN phase, instead of it running silently inside
+ * `type_program_with_deps`.
+ */
+pub type PreMono = struct {
+    /** the checked program, before monomorphization */
+    prog: TProgram
+    /** the resolved type table, as `monomorphize` expects it */
+    table: TypeTable
+}
+
+/**
+ * The no-op `ProgressFn` `type_program_with_deps` passes to
+ * `type_program_with_deps_pre_mono` when its caller wants no per-item progress
+ * reporting (the original, pre-observability contract).
+ *
+ * @param done   how many top-level items have been typed so far (ignored)
+ * @param total  the total top-level item count (ignored)
+ */
+fn no_item_progress(done: u64, total: u64) -> void { }
+
+/**
+ * The DEP-AWARE TYPED ENTRY POINT (C7.10). Same as `type_program` but pre-seeds the
+ * collection environment from an already-typed dep `TProgram` before collecting and
+ * typing the project, then MONOMORPHIZES the result (S4b) — a thin wrapper over
+ * `type_program_with_deps_pre_mono` with no progress reporting, preserving this
+ * function's original contract for its non-observability callers. The dep's items
+ * are NOT re-typed; only their signatures enter scope so the project's code can
+ * call dep functions and reference dep types. `dep_prog.items` is empty when there
+ * are no deps -> degrades silently to `type_program`'s behavior.
+ *
+ * @param raw_program  the merged, un-typed program (project items only)
+ * @param dep_prog     the already-typed dependency program (empty when depless)
+ * @return             the fully checked and monomorphized program
+ * @throws             the first collection/typing/monomorphization error
+ */
 pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) -> TProgram | error {
+    let pre = match type_program_with_deps_pre_mono(raw_program, dep_prog, no_item_progress) { PreMono as p => p; error as e => return e }
+    monomorphize(pre.prog, pre.table)
+}
+
+/**
+ * `type_program_with_deps`, split just BEFORE monomorphization (see `PreMono`) and
+ * instrumented with a per-item progress hook (see `ProgressFn`) — the entry point
+ * the build driver uses to report the `checker` phase's live "N/M items" counter
+ * and time monomorphization as its own separate phase.
+ *
+ * @param raw_program  the merged, un-typed program (project items only)
+ * @param dep_prog     the already-typed dependency program (empty when depless)
+ * @param on_item      called `(done, total)` after each top-level item is typed
+ * @return             the checked program (pre-monomorphization) and its type table
+ * @throws             the first collection/typing error
+ */
+pub fn type_program_with_deps_pre_mono(raw_program: parser::Program, dep_prog: TProgram, on_item: ProgressFn) -> PreMono | error {
     // (TR0) FOLD trait derivations first — PROJECT-LOCAL only (a dep's traits don't fold here:
     // the .tkb codec does not carry trait bodies — the same method-serialization gap as
     // struct/class methods — so a dep trait name in an `&`-list surfaces as the conformance
@@ -4339,6 +4402,7 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
             }
         }
         i++
+        on_item(i to u64, program.items.len to u64)
     }
     let lc = check_labels(mainbody, teko::list::empty(), false, teko::list::empty())
     if lc.failed { return error { message = lc.message } }
@@ -4358,8 +4422,9 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
         pi++
     }
     let tp = TProgram { items = all_items }
-    // (S4b) MONOMORPHIZE the full (dep + project) tree — see type_program. No-op when no generics.
-    match monomorphize(tp, types) { TProgram as mp => mp; error as e => return e }
+    // (S4b) the caller MONOMORPHIZES the full (dep + project) tree as its own phase — see
+    // `type_program_with_deps` and `PreMono`. No-op (in `monomorphize` itself) when no generics.
+    PreMono { prog = tp; table = types }
 }
 
 // THE TYPED ENTRY POINT: pass 1 (collect top-level names) + pass 2 (type each item).
