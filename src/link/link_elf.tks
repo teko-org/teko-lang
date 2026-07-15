@@ -1,0 +1,167 @@
+/**
+ * own_text_section_index — the neutral `LinkObject.sections` index the own ELF encoder's
+ * `.text` image lands at (always index 0 — `elf_to_link_sections` emits `.text` first, mirroring
+ * `objfile_elf.tks`'s fixed `[.text, .rodata]` layout).
+ *
+ * @return u32  the `.text` section's index
+ */
+fn own_text_section_index() -> u32 {
+    0 to u32
+}
+
+/**
+ * own_rodata_section_index — the neutral `LinkObject.sections` index the own ELF encoder's
+ * `.rodata` image lands at (always index 1, immediately after `.text`).
+ *
+ * @return u32  the `.rodata` section's index
+ */
+fn own_rodata_section_index() -> u32 {
+    1 to u32
+}
+
+/**
+ * own_link_sec_index — map an own-emitted `Symbol.sect` (1 = `.text`, 2 = `.rodata`, 0 =
+ * undefined) to its neutral `LinkObject.sections` index. An undefined symbol's `sect` is
+ * meaningless (`LinkSym.sec` is documented as significant only when `defined`), so it falls
+ * through to the `.text` index without affecting correctness.
+ *
+ * @param u8 sect  the own encoder's 1-based section id
+ * @return u32  the neutral section index
+ */
+fn own_link_sec_index(sect: u8) -> u32 {
+    if sect == (2 to u8) { return own_rodata_section_index() }
+    own_text_section_index()
+}
+
+/**
+ * own_sym_binding — the neutral `SymBinding` for an own-emitted `Symbol`: `Local` when the
+ * symbol is file-local, else `Global`. The own encoder never produces a `Weak` symbol.
+ *
+ * @param bool local  the own encoder's `Symbol.local` flag
+ * @return SymBinding  `SymBinding::Local` or `SymBinding::Global`
+ */
+fn own_sym_binding(local: bool) -> SymBinding {
+    if local { return SymBinding::Local }
+    SymBinding::Global
+}
+
+/**
+ * own_sym_exported — whether an own-emitted `Symbol` is a --prune-dead reachability root beyond
+ * the entry point: true for every DEFINED, non-local symbol (a `GLOBAL|FUNC` the own encoder
+ * makes visible to other objects), false for a file-local definition (private to this object)
+ * and false for an undefined reference (nothing to keep alive here).
+ *
+ * @param Symbol sym  the own encoder's neutral symbol
+ * @return bool  true iff `sym` is a defined, globally-visible definition
+ */
+fn own_sym_exported(sym: teko::backend::Symbol) -> bool {
+    sym.defined && !sym.local
+}
+
+/**
+ * elf_to_link_sym — lift one own-emitted `Symbol` into the neutral `LinkSym`: the name and
+ * `defined` flag ride through unchanged, `local` becomes a `SymBinding`, `sect` becomes the
+ * neutral section index, and `exported` is derived per `own_sym_exported`.
+ *
+ * @param Symbol sym  the own encoder's neutral symbol
+ * @return LinkSym  the equivalent `LinkSym`
+ */
+fn elf_to_link_sym(sym: teko::backend::Symbol) -> LinkSym {
+    LinkSym {
+        name = sym.name
+        defined = sym.defined
+        binding = own_sym_binding(sym.local)
+        sec = own_link_sec_index(sym.sect)
+        offset = sym.offset
+        exported = own_sym_exported(sym)
+    }
+}
+
+/**
+ * elf_to_link_symbols — lift every own-emitted `Symbol` of `symbols` into a `LinkSym`, preserving
+ * order (the own encoder's local-then-global-then-undefined ordering is not a requirement of the
+ * neutral model, but preserving it costs nothing and eases diffing against the source object).
+ *
+ * @param []Symbol symbols  the own encoder's neutral symbol list
+ * @return []LinkSym  the equivalent `LinkSym` list, in the same order
+ */
+fn elf_to_link_symbols(symbols: []teko::backend::Symbol) -> []LinkSym {
+    mut out: []LinkSym = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        out = teko::list::push(out, elf_to_link_sym(symbols[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * elf_to_link_reloc — lift one own-emitted `ElfRelocReq` into the neutral `LinkReloc`: every
+ * own-object relocation patches a `.text`-relative field (`objfile_elf.tks`'s
+ * `ElfRelocReq.offset` doc), so `sec` is always the `.text` section index; the offset, target
+ * symbol name, numeric type, and addend ride through unchanged.
+ *
+ * @param ElfRelocReq r  the own encoder's neutral relocation request
+ * @return LinkReloc  the equivalent `LinkReloc`
+ */
+fn elf_to_link_reloc(r: teko::backend::ElfRelocReq) -> LinkReloc {
+    LinkReloc {
+        sec = own_text_section_index()
+        offset = r.offset
+        sym = r.sym
+        rtype = r.rtype
+        addend = r.addend
+    }
+}
+
+/**
+ * elf_to_link_relocs — lift every own-emitted `ElfRelocReq` of `relocs` into a `LinkReloc`,
+ * preserving emission order.
+ *
+ * @param []ElfRelocReq relocs  the own encoder's neutral relocation requests
+ * @return []LinkReloc  the equivalent `LinkReloc` list, in the same order
+ */
+fn elf_to_link_relocs(relocs: []teko::backend::ElfRelocReq) -> []LinkReloc {
+    mut out: []LinkReloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        out = teko::list::push(out, elf_to_link_reloc(relocs[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * elf_to_link_sections — the own-emitted object's two fixed section images, in the same
+ * `[.text, .rodata]` order `objfile_elf.tks`'s `emit_elf_object` always writes (a `.rodata`
+ * header is emitted even when empty), so `own_text_section_index`/`own_rodata_section_index`
+ * stay valid regardless of whether either section is empty.
+ *
+ * @param ElfObject obj  the own ISA-agnostic ELF object
+ * @return []LinkSection  the `[.text, .rodata]` neutral section list
+ */
+fn elf_to_link_sections(obj: teko::backend::ElfObject) -> []LinkSection {
+    let text = LinkSection { kind = LinkSecKind::Text; name = ".text"; sh_flags = 0x6 to u64; bytes = obj.text; size = obj.text.len }
+    let rodata = LinkSection { kind = LinkSecKind::Rodata; name = ".rodata"; sh_flags = 0x2 to u64; bytes = obj.rodata; size = obj.rodata.len }
+    [text, rodata]
+}
+
+/**
+ * elf_to_link_object — ingest an own-emitted ElfObject into the neutral model (in-memory, no
+ * disk round-trip): the ElfObject value taken before emit_elf_object serializes it.
+ *
+ * @param obj  the own ISA-agnostic ELF object (objfile_elf.tks:795)
+ * @return     the neutral LinkObject
+ */
+pub fn elf_to_link_object(obj: teko::backend::ElfObject) -> LinkObject {
+    LinkObject {
+        e_machine = obj.e_machine
+        e_flags = obj.e_flags
+        origin = "<own>"
+        sections = elf_to_link_sections(obj)
+        symbols = elf_to_link_symbols(obj.symbols)
+        relocs = elf_to_link_relocs(obj.relocs)
+    }
+}
