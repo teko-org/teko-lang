@@ -146,3 +146,19 @@ that is the use-after-free proof for Boundary A.
   carrying the test AST alongside the source load, and re-add the Windows test run
   once the compiler-speed work brings the build time down. Sequenced **after** the
   four perf fixes + the -O2 seed land; no design committed here yet.
+* **Post-linker: per-OS ABI / platform optimization — a SEPARATE round, deferred
+  (owner 2026-07-15).** Owner hypothesis: we are not yet exploiting the best ABI each
+  OS can provide to maximize performance; grounded in the observed per-OS divergence
+  in the test/build times (historically macOS fastest, then Ubuntu, then Windows —
+  the gap has since shifted). Because teko owns its native backend (instruction
+  selection, register allocation, calling conventions) **and** its own linker, it
+  CONTROLS the ABI it emits — so post-Phase-E there is a real lever: per-target
+  calling conventions (SysV / Win64 / AAPCS64), TLS model, syscall-vs-libc, allocator
+  / page size, alignment & vectorization ABIs. **Caveat (integrator-pinned):** part of
+  the *current* divergence is measurement artifact, not ABI — different CI runner
+  hardware (macOS Apple-silicon vs slow Windows runners) and the fact that the
+  *shipping* path is still the C backend via the host `cc` (each OS's `cc` makes its
+  own ABI choices), NOT the own native path (which honest-stops today). So this
+  optimization targets the OWN native path once it is complete and IS the shipping
+  path — genuinely **post-linker (Phase E+)**, and it feeds / is fed by PGO (the ABI
+  shape is an input to the profiler). No design committed here yet.
