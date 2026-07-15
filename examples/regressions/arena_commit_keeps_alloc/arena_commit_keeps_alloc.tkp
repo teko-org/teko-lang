@@ -1,0 +1,27 @@
+# Regression (enabling primitive — perf(enabling) PR): `teko::arena_commit()`, the Boundary-A
+# counterpart to the existing `teko::arena_pop()` test-gate checkpoint/rewind — it discards the
+# top mark WITHOUT rewinding, so allocations made since the matching `teko::arena_push()` stay
+# live. Builds `[10, 20, 30]` DURING an open push/commit span, reads it back after the commit
+# (proving the data was never reclaimed), then makes a further, unrelated allocation to prove the
+# root region is still fully functional afterward. Exit code 61 (10 + 20 + 30 + 1).
+#
+# The FULL commit-vs-pop bump-position CONTRAST — that `arena_pop` actually rewinds the bump
+# offset while `arena_commit` does not — is proven at the C level by
+# `scripts/tk_arena_commit_test.c` (mirrors `region_drop_subtree_test.c`'s own rationale: Teko has
+# no raw-pointer surface, and asserting "pop's freed span is gone" from Teko would mean reading
+# freed memory — undefined behavior, not a sound regression). This fixture is the safe, Teko-level
+# half: commit's data-preservation contract, provable without ever touching freed memory.
+#
+# `teko::arena_commit` is a NEW checker + codegen builtin this PR ADDS but never calls from
+# `src/**` (STAGED OFF — the released seed's checker does not recognize it, the bootstrap wall).
+# This fixture is therefore compiled by gen1 (the just-built self-hosted compiler), never the
+# released seed directly — mirrors the `arena_manual_ok` convention (a regression fixture is its
+# own standalone project):
+#   teko . -o bin              # the seed compiles the PR sources -> bin/teko (gen1)
+#   ./bin/teko build examples/regressions/arena_commit_keeps_alloc -o /tmp/commit_bin
+#   /tmp/commit_bin/arena_commit_keeps_alloc; echo "exit: $?"   # -> exit: 61
+name = "arena_commit_keeps_alloc"
+source = "src"
+
+[artifact]
+kind = "binary"
