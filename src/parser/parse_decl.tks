@@ -2,6 +2,29 @@
 
 use teko::lexer
 
+/**
+ * parse_discard_param — parse a `_` DISCARD parameter (owner refinement 2026-07-15): a parameter
+ * that occupies the ABI slot but binds no name and allocates nothing. It carries NO type annotation
+ * (`_`, never `_: T`) — its type is resolved BY POSITION from the interface/base signature the
+ * function implements or overrides; the CHECKER both fills that type and enforces that a discard
+ * parameter appears only in an implementing/overriding signature. Repetition (`x, _, _, p`) is
+ * allowed: each `_` is a separate comma-separated token. Emitted as a Param named "_" — a name the
+ * lexer can never produce for a real identifier, so the checker recognizes it unambiguously.
+ *
+ * @param tokens   the token stream
+ * @param pos      the index of the `_` (Underscore) token
+ * @param params   the parameters accumulated so far
+ * @return         `params` with the discard Param appended, and the index just past the `_`
+ * @throws         when a type annotation follows the `_` (`_: T` is invalid for a discard param)
+ */
+fn parse_discard_param(tokens: []lexer::Token, pos: u64, params: []Param) -> ParsedList<Param> | error {
+    if is_kind_at(tokens, pos + 1, lexer::TokenKind::Colon) {
+        return err_at(tokens, pos + 1, "a `_` discard parameter takes no type annotation — its type is fixed by position from the interface/base signature being implemented or overridden")
+    }
+    let out = teko::list::push(params, Param { name = "_"; has_type = false; type_ann = no_type(); is_params = false; has_default = false; default_expr = no_expr() })
+    ParsedList<Param> { items = out; next = pos + 1 }
+}
+
 // `( name: T, name: T, … )` — comma-separated params; empty `()` allowed; params are
 // immutable (B.21). `pos` is at `(`. `allow_untyped_first` (OOP A1, 2026-07-01) — true ONLY
 // for a struct method's param list: the 1st param may be a bare name with NO `: type` (the
@@ -17,6 +40,15 @@ fn parse_params(tokens: []lexer::Token, pos: u64, allow_untyped_first: bool) -> 
         return ParsedList<Param> { items = params; next = p + 1 }
     }
     loop {
+        if is_kind_at(tokens, p, lexer::TokenKind::Underscore) {
+            let dp = match parse_discard_param(tokens, p, params) { ParsedList<Param> as x => x; error as e => return e }
+            params = dp.items
+            first = false
+            p = dp.next
+            if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
+            p = p + 1
+            continue
+        }
         // `params` — a CONTEXTUAL variadic-parameter modifier (2026-07-01), like `from` in the
         // `extern` position: NOT a reserved word (295+ existing uses as a plain identifier/field
         // name across the corpus), so it only triggers when `params` is immediately followed by

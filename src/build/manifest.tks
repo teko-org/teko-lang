@@ -7,6 +7,16 @@
 // for `.tkp`, not full TOML.
 
 /**
+ * The code-generation backend a build lowers through. `C` emits C and links it with the
+ * host `cc` (the trusted default, byte-identical across generations — FIXPOINT-preserving);
+ * `Native` opts into Teko's own AOT backend + M-linker (`lir::lower` → isel → regalloc →
+ * encode → objfile → link). Selected by the `--backend={c,native}` CLI flag, with the
+ * `TEKO_BACKEND` env as a lower-precedence fallback (D1/#390, own-backend-architecture §3.7).
+ * The default is `C`, so a flagless build stays on the trusted path.
+ */
+type Backend = enum { C; Native }
+
+/**
  * The parsed manifest. `artifact` reuses the enum from tkp_rule.tks (same namespace, bare
  * reference). deps/aliases are simple string lists in the seed (M.5 — richer dependency
  * records are evolution).
@@ -40,6 +50,12 @@ pub type Manifest = struct {
     target: str   // [extern] target — a cross target triple for `-target` ("" = host)
     sysroot: str   // [extern] sysroot — `--sysroot` for cross builds ("" = none)
     freestanding: bool   // [extern] freestanding — drop the implicit libc (`-nostdlib`); default false
+    /**
+     * The resolved code-generation backend (`C` default, `Native` for the own AOT path).
+     * NOT a `.tkp` key: it is stamped from the `--backend` CLI flag / `TEKO_BACKEND` env by
+     * `backend_of` + `with_backend` after the front-end parses the manifest (D1/#390).
+     */
+    backend: Backend
 }
 
 // parse_manifest — read a `.tkp` source into a Manifest, or fail honestly (M.3 — no
@@ -360,5 +376,20 @@ fn parse_manifest(src: str) -> Manifest | error {
     if !have_name { return error { message = "manifest missing required field 'name'" } }
     if !have_source { return error { message = "manifest missing required field 'source'" } }
 
-    Manifest { name = name; artifact = artifact; source = source; deps = deps; aliases = aliases; version = version; suffix = suffix; description = description; platforms = platforms; cov_functions = cov_functions; cov_lines = cov_lines; cov_branches = cov_branches; link_flags = link_flags; link_lib_name = link_lib_name; os_lib_os = os_lib_os; os_lib_flag = os_lib_flag; os_lib_name = os_lib_name; cc = cc; target = target; sysroot = sysroot; freestanding = freestanding }
+    Manifest { name = name; artifact = artifact; source = source; deps = deps; aliases = aliases; version = version; suffix = suffix; description = description; platforms = platforms; cov_functions = cov_functions; cov_lines = cov_lines; cov_branches = cov_branches; link_flags = link_flags; link_lib_name = link_lib_name; os_lib_os = os_lib_os; os_lib_flag = os_lib_flag; os_lib_name = os_lib_name; cc = cc; target = target; sysroot = sysroot; freestanding = freestanding; backend = Backend::C }
+}
+
+/**
+ * with_backend — a copy of `m` with its code-generation `backend` set to `b`, every other
+ * field carried through unchanged. The CLI `--backend` resolver (`backend_of`, project.tks)
+ * stamps the resolved selection onto the front-end's manifest with this before the artifact
+ * dispatch reads `m.backend`; `parse_manifest` itself never sets a non-default backend, so the
+ * manifest reader stays a pure `.tkp` → `Manifest` function (D1/#390).
+ *
+ * @param m  the manifest to copy
+ * @param b  the resolved backend selection to stamp on the copy
+ * @return   a new `Manifest` identical to `m` except for `backend = b`
+ */
+fn with_backend(m: Manifest, b: Backend) -> Manifest {
+    Manifest { name = m.name; artifact = m.artifact; source = m.source; deps = m.deps; aliases = m.aliases; version = m.version; suffix = m.suffix; description = m.description; platforms = m.platforms; cov_functions = m.cov_functions; cov_lines = m.cov_lines; cov_branches = m.cov_branches; link_flags = m.link_flags; link_lib_name = m.link_lib_name; os_lib_os = m.os_lib_os; os_lib_flag = m.os_lib_flag; os_lib_name = m.os_lib_name; cc = m.cc; target = m.target; sysroot = m.sysroot; freestanding = m.freestanding; backend = b }
 }
