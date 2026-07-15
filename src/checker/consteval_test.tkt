@@ -221,3 +221,59 @@ fn allowlist_rejects_other() {
     teko::assert::is_false(is_const_allowlisted_callee(path1("foo")))
     teko::assert::is_false(is_const_allowlisted_callee(path2("teko", "malloc")))
 }
+
+/**
+ * c_ref — an `i64` bare-name reference typed expression (a Tier-3 const reference in a fixture).
+ *
+ * @param name  the referenced const's name
+ * @return      the typed variable reference
+ */
+fn c_ref(name: str) -> TExpr { te(TVar { name = name; is_func = false; func_ns = "" }, i64t()) }
+
+/**
+ * c_const — a private `i64` module-level TConstDecl named `name` with initializer `init`, for the
+ * dependency-order fixtures.
+ *
+ * @param name  the constant's name
+ * @param init  its typed initializer
+ * @return      the typed constant declaration
+ */
+fn c_const(name: str, init: TExpr) -> TConstDecl {
+    TConstDecl { name = name; namespace = "teko::checker"; ty = i64t(); init = init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+}
+
+/**
+ * const_dep_order_orders_dep_before_dependent — `const B = A + 1; const A = 1` orders A ahead of B
+ * (a Tier-3 reference makes B depend on A), even though B is declared first.
+ */
+#test
+fn const_dep_order_orders_dep_before_dependent() {
+    let a = c_const("A", c_num(1))
+    let b = c_const("B", te(TBinary { op = lexer::TokenKind::Plus; left = c_ref("A"); right = c_num(1) }, i64t()))
+    mut consts: []TConstDecl = teko::list::push(teko::list::empty(), b)
+    consts = teko::list::push(consts, a)
+    match const_dep_order(consts) {
+        []TConstDecl as ordered => {
+            teko::assert::is_true(ordered.len == 2)
+            teko::assert::is_true(ordered[0].name == "A")
+            teko::assert::is_true(ordered[1].name == "B")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * const_dep_order_reports_cycle — `const A = B; const B = A` is a reference cycle: `const_dep_order`
+ * returns a located error rather than an order.
+ */
+#test
+fn const_dep_order_reports_cycle() {
+    let a = c_const("A", c_ref("B"))
+    let b = c_const("B", c_ref("A"))
+    mut consts: []TConstDecl = teko::list::push(teko::list::empty(), a)
+    consts = teko::list::push(consts, b)
+    match const_dep_order(consts) {
+        []TConstDecl => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}

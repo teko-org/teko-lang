@@ -328,6 +328,47 @@ fn collects_const_unknown_type_is_located_error() {
     }
 }
 
+/** type_const_u8_out_of_range_errors — `const A: u8 = 300` fails typing: the initializer does not
+    fit the declared narrow width, so `type_const_decl` returns a range/type error (#594 crumb 4). */
+#test
+fn type_const_u8_out_of_range_errors() {
+    let cd = parser::ConstDecl { name = "A"; ty = named_t("u8"); init = e_num(300); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    match type_const_decl(cd, empty_env(), empty_table()) {
+        TConstDecl => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+/** type_const_i64_ok — `const A: i64 = 1` types successfully to a TConstDecl carrying the resolved
+    i64 value type and a typed initializer usable as a value (#594 crumb 4). */
+#test
+fn type_const_i64_ok() {
+    let cd = parser::ConstDecl { name = "A"; ty = named_t("i64"); init = e_num(1); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    match type_const_decl(cd, empty_env(), empty_table()) {
+        TConstDecl as tc => {
+            teko::assert::is_true(tc.name == "A")
+            teko::assert::is_true(prim_is(tc.ty, PrimKind::I64))
+            teko::assert::is_true(prim_is(tc.init.type, PrimKind::I64))
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/** type_const_i128_cast_coerces — `const A: i128 = 0 to i128` coerces via the explicit cast: the
+    initializer types as i128 and the const adopts that value type (#594 crumb 4). */
+#test
+fn type_const_i128_cast_coerces() {
+    let init = ek(parser::Cast { expr = e_num(0); target = named_t("i128") })
+    let cd = parser::ConstDecl { name = "A"; ty = named_t("i128"); init = init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    match type_const_decl(cd, empty_env(), empty_table()) {
+        TConstDecl as tc => {
+            teko::assert::is_true(prim_is(tc.ty, PrimKind::I128))
+            match tc.init.kind { TCast => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 // REGRESSION (self-hosted cross-file top-level fn call): a top-level function declared in a
 // namespace (a non-main source file) called UNQUALIFIED from a LOOSE top-level statement (the
 // virtual-main / main.tks) in the SAME namespace. type_program must set the threaded scope's
