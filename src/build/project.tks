@@ -456,6 +456,73 @@ fn resolve_cc(m: Manifest) -> str {
 }
 
 /**
+ * opt_cc_flag — the portable cc optimization flag for an optimization `level`, or
+ * "" for level 0. Level 0 (the DEV/CI default) emits NO flag so the link line stays
+ * byte-identical to the historic `-O0` release line (the FIXPOINT is preserved);
+ * level 1/2 emit `-O1`/`-O2`, which both gcc and clang accept (deliberately NOT
+ * `-march=native`, which is not portable for a released seed).
+ *
+ * @param level  the requested optimization level (0, 1 or 2; >2 is clamped to `-O2`)
+ * @return       "-O1"/"-O2" for level 1/2, else "" (no flag) for level 0
+ */
+fn opt_cc_flag(level: i32) -> str {
+    if level >= 2 { return "-O2" }
+    if level == 1 { return "-O1" }
+    ""
+}
+
+/**
+ * opt_arg_has_prefix — does `a` begin with the `--opt=` selector prefix (so the
+ * remainder is the requested level)? A 6-byte prefix, guarded on length so the
+ * slice never runs past the string.
+ *
+ * @param a  a single CLI argument token
+ * @return   true iff `a` is a `--opt=<n>` form
+ */
+fn opt_arg_has_prefix(a: str) -> bool {
+    a.len > 6 && teko::str::slice_to(a, 6) == "--opt="
+}
+
+/**
+ * opt_level_of_value — map the text after `--opt=` to an optimization level: "0" →
+ * 0, "1" → 1, and every other value (including "2") → 2, so an out-of-range or
+ * malformed suffix resolves to the fully-optimized release level rather than
+ * silently disabling optimization.
+ *
+ * @param v  the substring after `--opt=`
+ * @return   0 for "0", 1 for "1", else 2
+ */
+fn opt_level_of_value(v: str) -> i32 {
+    if v == "0" { return 0 }
+    if v == "1" { return 1 }
+    2
+}
+
+/**
+ * opt_level_of — resolve the requested cc optimization level from the build flags.
+ * `--release` selects level 2 (the release seed profile); `--opt=<0|1|2>` selects
+ * that explicit level; with neither flag the level is 0 (the DEV/CI default — no
+ * `-O`, fast to PRODUCE, byte-identical to the historic release line). The last
+ * matching flag on the line wins, so an explicit `--opt=` can override an earlier
+ * `--release`.
+ *
+ * @param args  the full CLI argument vector
+ * @return      the resolved optimization level (0 by default; 2 for `--release`)
+ */
+fn opt_level_of(args: []str) -> i32 {
+    mut i: u64 = 0
+    mut level: i32 = 0
+    loop {
+        if i >= args.len { break }
+        let a = args[i]
+        if a == "--release" { level = 2 }
+        else if opt_arg_has_prefix(a) { level = opt_level_of_value(teko::str::slice_from(a, 6)) }
+        i = i + 1
+    }
+    level
+}
+
+/**
  * build_cc_argv — assemble the host-`cc` command line that turns one input file
  * (`input`, a generated `.c` for the C backend or an own-backend `.o`) into the
  * native `binary`, in full parity with `driver.c::run_cc` (M.5, reuse the host
@@ -475,19 +542,26 @@ fn resolve_cc(m: Manifest) -> str {
  * `link_object` (an own-backend `.o` input) so both link the SAME way — the only
  * difference is the input file, keeping the two paths from drifting. When `debug`
  * is set it also appends the DEBUG profile flag `-g` (emit DWARF so the E4 native
- * stack trace resolves against the `.tsym` map); optimization stays OFF and
- * assertions ON either way (the pipeline's single profile is already `-O0` with
- * `assert.c` linked and nothing defining NDEBUG), so `debug=false` is byte-identical
- * to today's release link line and the FIXPOINT is preserved.
+ * stack trace resolves against the `.tsym` map). Optimization is an AXIS of the
+ * build, not a global: `opt` 0 (the DEV/CI DEFAULT) emits NO `-O` flag — the line
+ * is byte-identical to the historic `-O0` release line, so the FIXPOINT (gen2 ==
+ * gen3) is preserved untouched — while `opt` 1/2 appends `-O1`/`-O2` (the portable
+ * gcc+clang spelling; never `-march=native`, which is not portable for a released
+ * seed). The published seed is built ONCE at `opt` 2 in `release.yml` (a diagnostic
+ * proved the same emitted `teko.c` recompiled at `-O2` self-hosts 1.30x faster,
+ * 168.7s → 129.6s, and `cmp` showed `-O0` and `-O2` emit BYTE-IDENTICAL C — the
+ * speed changes, the emitted output does not), so everyone downstream gets a fast
+ * compiler. Assertions stay ON at every level (nothing defines NDEBUG).
  *
  * @param input   the input path — a generated `.c` (C backend) or a `.o` (own backend)
  * @param binary  the output native executable path
  * @param m       the resolved manifest (cc override, version, cross knobs, libs)
  * @param prog    the checked program (for extern-reachability of the link flags)
  * @param debug   append the debug profile flag (`-g`); false = today's byte-identical release line
+ * @param opt     the cc optimization level: 0 (default) emits no `-O` flag, 1/2 appends `-O1`/`-O2`
  * @return        the full `cc` argument vector, ready for `teko::process::run`
  */
-fn build_cc_argv(input: str, binary: str, m: Manifest, prog: checker::TProgram, debug: bool) -> []str {
+fn build_cc_argv(input: str, binary: str, m: Manifest, prog: checker::TProgram, debug: bool, opt: i32) -> []str {
     let rt = rt_dir()
     let asrt = assert_dir(rt)
     let cc = resolve_cc(m)
@@ -498,6 +572,8 @@ fn build_cc_argv(input: str, binary: str, m: Manifest, prog: checker::TProgram, 
     argv = teko::list::push(argv, "-w")
     argv = teko::list::push(argv, if is_clang { "-ferror-limit=0" } else { "-fmax-errors=0" })
     if debug { argv = teko::list::push(argv, "-g") }
+    let oflag = opt_cc_flag(opt)
+    if oflag.len > 0 { argv = teko::list::push(argv, oflag) }
     let verval = if m.suffix.len > 0 { teko::str::concat(teko::str::concat(m.version, "-"), m.suffix) } else { m.version }
     argv = teko::list::push(argv, teko::str::concat("-DTEKO_VERSION_STRING=", verval))
     if m.target.len > 0 { argv = teko::list::push(teko::list::push(argv, "-target"), m.target) }
@@ -552,10 +628,11 @@ fn append_macos_plist_flag(argv: []str, binary: str, m: Manifest, tos: str) -> [
  * @param binary  the output native executable path
  * @param m       the resolved manifest
  * @param prog    the checked program (extern-reachability)
+ * @param opt     the cc optimization level (0 = default/no `-O`, 2 = release seed)
  * @return        the `cc` process exit code (0 on success)
  */
-fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
-    teko::process::run(build_cc_argv(cfile, binary, m, prog, false))
+fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram, opt: i32) -> i32 {
+    teko::process::run(build_cc_argv(cfile, binary, m, prog, false, opt))
 }
 
 /**
@@ -572,7 +649,7 @@ fn run_cc(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 
  * @return        the `cc` process exit code (0 on success)
  */
 fn run_cc_debug(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
-    teko::process::run(build_cc_argv(cfile, binary, m, prog, true))
+    teko::process::run(build_cc_argv(cfile, binary, m, prog, true, 0))
 }
 
 /**
@@ -583,7 +660,10 @@ fn run_cc_debug(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -
  * links against the same C-built `teko_rt`/`assert` runtime (resolving `_tk_exit`,
  * `_tk_set_args`, `_tk_region_*`) and inherits the same `[extern.libs]` flags +
  * macOS `__info_plist` parity for free. Toolchain independence (dropping `cc` for
- * the own linker) is Phase E/#226; this bootstrap links through `cc`.
+ * the own linker) is Phase E/#226; this bootstrap links through `cc`. Passes opt
+ * level 0: the own backend emits its machine code directly, so `cc -O` would only
+ * touch the runtime `.c` seed sources on the link line — the C backend (`run_cc`)
+ * is the path the release seed optimizes.
  *
  * @param objfile  the own-backend Mach-O `.o` (from `emit_macho` + `write_file_bytes`)
  * @param binary   the output native executable path
@@ -592,7 +672,7 @@ fn run_cc_debug(cfile: str, binary: str, m: Manifest, prog: checker::TProgram) -
  * @return         the `cc` process exit code (0 on success)
  */
 fn link_object(objfile: str, binary: str, m: Manifest, prog: checker::TProgram) -> i32 {
-    teko::process::run(build_cc_argv(objfile, binary, m, prog, false))
+    teko::process::run(build_cc_argv(objfile, binary, m, prog, false, 0))
 }
 
 // (C7.1k) plist_xml — a minimal macOS Info.plist carrying the project's identity, embedded into the
@@ -630,9 +710,10 @@ fn plist_xml(m: Manifest) -> str {
  * @param out_dir  the build output directory (`-o`, default "bin")
  * @param prog     the checked, typed program
  * @param m        the resolved manifest
+ * @param opt      the cc optimization level for the C-backend link (0 = default, 2 = release seed)
  * @return         0 on a successful build, else the failing status
  */
-fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest, opt: i32) -> i32 {
     // (C7.1m) artifact-kind dispatch. Binary → the native executable backend below. The library kinds
     // are HONEST STOPS until their increments land (M.3 — no fake artifact): static/shared = native
     // lib output (ar / -shared); package = a `.tkl` ZIP of .tkh+.tkb+.tsym, which needs the PROGRAM-
@@ -696,7 +777,7 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
         error as e => return fail(dir, e.message)
         null => { }   // error? — null = success
     }
-    if run_cc(cfile, binp, m, prog) != 0 {
+    if run_cc(cfile, binp, m, prog, opt) != 0 {
         return fail(dir, "cc failed to build the generated C")
     }
     // E3 — write the symbol map beside the binary (best-effort; a write error never fails the build —
@@ -1203,14 +1284,15 @@ fn ensure_rt_dir_abs() {
 }
 
 /** compile_project — the `teko build <dir>` entry with every default: the D4 gate ON, no coverage
- *  report, no `--no-verify`, and the NATIVE gate (the default since #168). Delegates to
- *  compile_project_g. Mirrors driver.c::tk_compile_project (the C seed's VM-only entry).
+ *  report, no `--no-verify`, optimization OFF (the dev/CI default level 0), and the NATIVE gate (the
+ *  default since #168). Delegates to compile_project_g. Mirrors driver.c::tk_compile_project (the C
+ *  seed's VM-only entry).
  *
  *  @param dir      the project directory
  *  @param out_dir  the build output directory (`-o`, default "bin")
  *  @return         0 on a fully gated, successfully built release, else the failing status
  *  @since #265 */
-fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false) }
+fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false, 0) }
 
 // (#148) report_peak — the compiler prints its own memory cost at the end of a successful build
 // (peak RSS via teko::mem::peak_rss; 0 = unavailable on this host → print suppressed).
@@ -1242,22 +1324,23 @@ fn strip_tests(prog: checker::TProgram) -> checker::TProgram {
     checker::TProgram { items = kept }
 }
 
-/** Hand `prog` to the backend and, on success, report the build's peak memory cost (#148). The
- *  shared tail of every build path once its program is final: no tests present, the
- *  `--no-verify` escape hatch, and the gate's own release rebuild. */
-fn codegen_and_report(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
-    let rc = backend(dir, m.name, out_dir, prog, m)
+/** Hand `prog` to the backend at optimization level `opt` and, on success, report the build's peak
+ *  memory cost (#148). The shared tail of every build path once its program is final: no tests
+ *  present, the `--no-verify` escape hatch, and the gate's own release rebuild. */
+fn codegen_and_report(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest, opt: i32) -> i32 {
+    let rc = backend(dir, m.name, out_dir, prog, m, opt)
     if rc == 0 { report_peak() }
     rc
 }
 
-/** Assemble WITHOUT the `.tkt` tests and codegen straight away, skipping the D4 gate entirely
- *  (issue #249 lever A: `--no-verify`). Used only when the caller has explicitly opted out of
- *  re-verification — e.g. a self-host release chain re-proving the fixpoint on gen-2, where the
- *  `.tkt` gate outcome is already known deterministic from gen-1. */
-fn build_ungated(dir: str, out_dir: str) -> i32 {
+/** Assemble WITHOUT the `.tkt` tests and codegen straight away at optimization level `opt`, skipping
+ *  the D4 gate entirely (issue #249 lever A: `--no-verify`). Used only when the caller has explicitly
+ *  opted out of re-verification — e.g. a self-host release chain re-proving the fixpoint on gen-2,
+ *  where the `.tkt` gate outcome is already known deterministic from gen-1. This is the path
+ *  `release.yml` drives with `--no-verify --release`, so the published seed links at `-O2`. */
+fn build_ungated(dir: str, out_dir: str, opt: i32) -> i32 {
     let fe = match frontend_body(false, false) { Frontend as f => f; error as e => return fail(dir, e.message) }
-    codegen_and_report(dir, out_dir, fe.prog, fe.manifest)
+    codegen_and_report(dir, out_dir, fe.prog, fe.manifest, opt)
 }
 
 /** Check the D4 coverage floors (from the `.tkp` [coverage] section; default 80/80/80) against
@@ -1293,8 +1376,9 @@ fn report_native_coverage(prog: checker::TProgram) {
 }
 
 /** run_native_gate — (#265, lever D of #249) the D4 test gate run NATIVELY: emit a test-profile C
- *  translation unit whose `main()` calls each `#test` in order, compile it with the SAME `run_cc`
- *  the build uses, run the resulting binary (a failed assert panics → non-zero exit, fail-fast M.1),
+ *  translation unit whose `main()` calls each `#test` in order, compile it with `run_cc` at opt 0
+ *  (the gate binary is a throwaway — kept fast to PRODUCE regardless of the release build's opt level),
+ *  run the resulting binary (a failed assert panics → non-zero exit, fail-fast M.1),
  *  and — cov ALWAYS on for the gate, to feed the floors — merge the child's dumped `.tkcov` into
  *  this process's coverage sinks. Under TestCov each PRODUCTION fn body carries `tk_cov_line_at`/
  *  `tk_cov_branch_at` interior marks (#265 Track A), so the merged sinks populate ALL THREE metrics —
@@ -1310,7 +1394,7 @@ fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest)
     let emitted = match codegen::tk_emit_c_test(prog, true) { str as s => s; error as e => return fail(dir, e.message) }
     let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(m.name, m.version, m.suffix, m.description))
     match teko::io::write_file(cfile, csrc) { error as e => return fail(dir, e.message); null => { } }
-    if run_cc(cfile, binp, m, prog) != 0 {
+    if run_cc(cfile, binp, m, prog, 0) != 0 {
         return fail(dir, "cc failed to build the native test gate")
     }
     match teko::env::set_var("TEKO_TKCOV", covfile) { error => { }; null => { } }
@@ -1331,10 +1415,10 @@ fn cobertura_path_of(out_dir: str, gen_cov: bool) -> str {
 
 /** (#151) Re-front-end WITHOUT the `.tkt` files for the RELEASE program (`quiet` = the file map
  *  was already printed by the gate's first pass), strip any surviving `#test` functions by
- *  provenance, and hand the clean program to the backend. */
-fn release_build_of(dir: str, out_dir: str) -> i32 {
+ *  provenance, and hand the clean program to the backend at optimization level `opt`. */
+fn release_build_of(dir: str, out_dir: str, opt: i32) -> i32 {
     let rel = match frontend_body(false, true) { Frontend as f => f; error as e => return fail(dir, e.message) }
-    codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest)
+    codegen_and_report(dir, out_dir, strip_tests(rel.prog), rel.manifest, opt)
 }
 
 /** run_gate_native — the D4 test-gate body run NATIVELY (the DEFAULT since #168): run every `#test`
@@ -1350,9 +1434,10 @@ fn release_build_of(dir: str, out_dir: str) -> i32 {
  *  @param out_dir  the build output directory (the test TU + binary + .tkcov land under it)
  *  @param gen_cov  write a Cobertura report (`--coverage`) from the merged native sinks
  *  @param fe       the already-assembled front-end product (checked program + manifest)
+ *  @param opt      the cc optimization level for the RELEASE rebuild (the gate binary stays opt 0)
  *  @return         0 when every test passes, every floor is met, and the release build succeeds
  *  @since #265 */
-fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
+fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32) -> i32 {
     let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest)
     if trc != 0 { return trc }
     report_native_coverage(fe.prog)
@@ -1364,7 +1449,7 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
         match teko::io::write_file(cov_path, xml) { error => { }; null => { } }
         teko::io::println(teko::str::concat("teko: wrote coverage report ", cov_path))
     }
-    release_build_of(dir, out_dir)
+    release_build_of(dir, out_dir, opt)
 }
 
 /**
@@ -1375,15 +1460,16 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
  * @param out_dir  the output directory (default "bin")
  * @param gen_cov  `--coverage` — write the Cobertura report
  * @param fe       the front-end result assembled WITH the `.tkt` tests
+ * @param opt      the cc optimization level for the release rebuild (0 = default, 2 = release seed)
  * @return         0 when the gate passes and the release build succeeds, else the failing status
  */
-fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend) -> i32 {
-    run_gate_native(dir, out_dir, gen_cov, fe)
+fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32) -> i32 {
+    run_gate_native(dir, out_dir, gen_cov, fe, opt)
 }
 
 /** No `#test` functions at all: ignore the gate, build the production program straight from the
- *  already-assembled `fe` (no test code present to strip or verify). */
-fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend) -> i32 { codegen_and_report(dir, out_dir, fe.prog, fe.manifest) }
+ *  already-assembled `fe` (no test code present to strip or verify) at optimization level `opt`. */
+fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend, opt: i32) -> i32 { codegen_and_report(dir, out_dir, fe.prog, fe.manifest, opt) }
 
 /** compile_project_g — the build with the D4 TEST GATE (ON BY DEFAULT; `--no-test` is IGNORED for a
  *  build — a release MUST run its tests). Assemble WITH the `.tkt` tests, run them on the NATIVE gate
@@ -1399,20 +1485,21 @@ fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend) -> i32 { codegen
  *  @param out_dir      the build output directory (`-o`, default "bin")
  *  @param gen_cov      write a Cobertura report (`--coverage`)
  *  @param no_verify    skip the gate entirely (`--no-verify`, #249 lever A)
+ *  @param opt          the cc optimization level (`--release`/`--opt=<n>`; 0 = dev/CI default, 2 = release seed)
  *  @return             0 on a fully gated, successfully built release, else the failing status
  *  @since #265 */
-fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool) -> i32 {
+fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, opt: i32) -> i32 {
     ensure_rt_dir_abs()
     match teko::env::chdir(dir) { error => return fail(dir, "cannot enter project directory"); null => { } }
     if no_verify {
-        return build_ungated(dir, out_dir)
+        return build_ungated(dir, out_dir, opt)
     }
     match frontend_body(true, false) {
         Frontend as fe => {
             if !has_tests(fe.prog) {
-                return build_no_tests_present(dir, out_dir, fe)
+                return build_no_tests_present(dir, out_dir, fe, opt)
             }
-            run_gate(dir, out_dir, gen_cov, fe)
+            run_gate(dir, out_dir, gen_cov, fe, opt)
         }
         error as e => return fail(dir, e.message)
     }
@@ -1477,10 +1564,10 @@ fn no_verify_of(args: []str) -> bool {
 
 /** project_arg_of — the FIRST non-flag positional (the project) from `start`, or "" if none (the
  *  caller reports). Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored),
- *  `--no-verify` (#249 lever A), and `--native-gate` (#265, now an inert no-op) — every recognized
- *  build flag — so none of them is mistaken for the project. `--vm-gate` was removed outright with
- *  the VM (#524, M3): a stray `--vm-gate` now falls through as an unknown positional, the honest
- *  "not a project" signal that the VM is gone.
+ *  `--no-verify` (#249 lever A), `--native-gate` (#265, now an inert no-op), `--release` and
+ *  `--opt=<n>` (the optimization axis) — every recognized build flag — so none of them is mistaken
+ *  for the project. `--vm-gate` was removed outright with the VM (#524, M3): a stray `--vm-gate` now
+ *  falls through as an unknown positional, the honest "not a project" signal that the VM is gone.
  *
  *  @param args   the full CLI argument vector
  *  @param start  the index to begin scanning from (2 for a subcommand, 1 for a bare project)
@@ -1494,6 +1581,8 @@ fn project_arg_of(args: []str, start: u64) -> str {
         else if args[i] == "--no-test" { i = i + 1 }
         else if args[i] == "--no-verify" { i = i + 1 }
         else if args[i] == "--native-gate" { i = i + 1 }
+        else if args[i] == "--release" { i = i + 1 }
+        else if opt_arg_has_prefix(args[i]) { i = i + 1 }
         else { return args[i] }
     }
     ""
