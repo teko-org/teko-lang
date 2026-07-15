@@ -17,12 +17,36 @@
 >
 > **⚖️ RULING — RELEASE WAVES (remodel, the `beta` line):** delivery proceeds in **waves**, one per
 > `0.X` version, each finalizing a coherent subset via an umbrella PR + sub-PRs (never committing to
-> `main`; each wave gets its own W15 sweep + doc-sync pre-launch). The sequence: **0.1** = memory
-> model + `unsafe` (by type) + `adopt` (epic **#340**, base `docs/design/memory-unsafe-backend-remodel.md`);
-> **0.2** = own AOT backend + linker (VM retirement begins there); **0.3** = concurrency (`Intent<T>`,
-> async/await, threading); **0.4+** = the remaining backlog (the phases/rounds below, mapped onto
-> waves). When the backlog is empty → **`1.0.0.0` = LTS**. The `alpha` line (`0.0.1.x`) is pre-remodel.
-> The phase/round structure below is the DETAILED work; the waves are how it ships.
+> `main`; each wave gets its own W15 sweep + doc-sync pre-launch). A **wave is a large, fully-RESOLVED
+> body of work — never a ripple** (owner decree 2026-07-09: *"as ondas não são marolas … elas têm que
+> ser resolvidas; para marolas temos as sub-sub"*); small increments are sub-sub-PRs, and **nothing
+> ships incomplete / with deferrers** — a blocker "only possible in a later wave" is an architecture
+> design failure, to be anticipated and resolved in the issue that needs it. The sequence: **0.1** =
+> memory model + `unsafe` (by type) + `adopt` (epic **#340**, base `docs/design/memory-unsafe-backend-remodel.md`);
+> **0.2** = `unsafe`-by-type re-tag (RawBuf/Arena); **0.3.0.x** = own AOT backend + linker — the
+> end-to-end STRUCTURE (A1–E, #382–#394) with named honest-stops; **0.3.1 (Onda de Segurança)** =
+> backend COMPLETION + debt-reckoning + the **memory-safety spine** (a PATCH of the 0.3 line, so the
+> backend epic **#395 stays OPEN until 100%**): resolve **everything incomplete** — bugs
+> (#301/#352/#412/#416/…), backend completeness (i128 register-pair #222, FPR-spill, `loop` back-edges,
+> splitting, has_back_edge #443), stdlib partials (#163/#184/#189/#194) — AND land the safety spine
+> (transparent `Ref<T>` #498/#497, the `ref` keyword, type-system fixes, the extensible-`loop`
+> recovery #517); **0.3.2 (Onda de Perf & Tooling)** = performance & test infrastructure kept OFF the
+> safety road (arena sizing/PGO #453/#476, threading #456, test clustering #442/#471/#472/#473, coverage
+> #475, profiling #479/#480, static slices #461, grouped attributes #477); **0.4** = the remaining
+> backlog (concurrency `Intent<T>` #164, SlotMap #338, packaging, tooling — the phases/rounds below).
+> All of the backend, incl. the A4\* encoder slices, completes **within 0.3** (0.3.0 structure + 0.3.1
+> completion). ~~When the backlog is empty → **`1.0.0.0` = LTS**~~ — **SUPERSEDED by the STS ruling
+> below.** The `alpha` line (`0.0.1.x`) is pre-remodel. The phase/round structure below is the DETAILED
+> work; the waves are how it ships.
+>
+> **⚖️ RULING 2026-07-13 — STS BEFORE LTS (owner):** the owner is not ready to freeze a 1.0. When the
+> pre-evolution backlog empties, the line closes as an **STS release** (short-term support), NOT
+> `1.0.0.0`. The post-STS window then runs the **EVOLUTIONS** — dynamic wasm modules #530 (Model 1:
+> grant/leadbox/hot-swap), WASI FFI #535 (Model 2), `#leadbox` #534, the cross-language contract SDKs,
+> the browser playground #509, native-lib emission + source generators + FFI-bindings #440/#441/#506 —
+> plus a **future-work survey**, and only after that does **`1.0.0.0` = LTS** cut. The #234 W15 final
+> sweep stays the LAST gate before the LTS (unchanged); each wave still closes with its own W15 sweep
+> + final bump (the 0.3.0 close reconfirmed by the owner 2026-07-13).
 >
 > This is the single, ordered execution sequence for ALL open teko-lang work. It consolidates:
 > the legislator's session critiques/directives, and every not-yet-done item mined from
@@ -36,10 +60,10 @@
 
 ## Governing constraints (hold throughout every phase)
 
-- **SUPREME RULE** — zero `.c`/`.h` ↔ `.tks` misalignment. Every C change is mirrored to its Teko twin.
-- **Differential equivalence** — VM (`teko run`) == native (`teko build`) on every validated change.
+- **RULED SUPERSEDED 2026-07-13 (#524 crumb 5):** the previous SUPREME RULE (zero `.c`/`.h` ↔ `.tks` misalignment, every C change mirrored to Teko twin) is retired. The frozen C bootstrap (`0.0.1.3-bootstrap` tag) is archived in git history; `teko_rt.c` (runtime seam) is maintained; native is the sole execution engine (#524 VM retirement, 2026-07-13).
+- **Native is the sole execution engine** — the VM is retired; all execution paths are native (AOT). `teko run` = native debug build-and-exec. `teko test .` = native test gate. The release binary seeds all CI.
 - **Laws M.0–M.5** (`TEKO_CONSTITUTION.md`) govern all design rulings; tensions → tribunal, not guesswork.
-- **Commit at green checkpoints** — build green + regressions `match_pattern_bindings==5` / `optionals==6`.
+- **Commit at green checkpoints** — build green + regressions from the current native gate.
 - **DRY-LAST RULING (legislator)** — the whole-codebase DRY refactor is the FINAL phase. Every other open
   item lands first, so DRY sweeps settled code, not a moving target.
 
@@ -764,6 +788,55 @@ TRAITS(schema), doc-comments`), so it must precede that WEB unit, independent of
 **🟡 ROUND N — Native object-file backend (INDEPENDENT of the OOP/DI/async critical path; not gated by ROUND 1–6, runs in parallel from whenever staffed).** Added to the ROUND list 2026-07-01 — previously only existed as prose under C3 (`TEKO_ROADMAP_INDEPENDENCE.md`) and the now-stale `⏸️ DEFERRED` bucket below, disconnected from the live tracker; this entry is the fix. **Full plan:** `TEKO_ROADMAP_NATIVE_BACKEND.md`. Scope: replace `tk_emit_c` (C-text codegen) with a backend that emits native object bytes directly (ELF/Mach-O/COFF) + **WebAssembly, BOTH environments — WASI and Browser** (scope widened same-day per user request; browser gets a thin JS-import glue for `env`/`io`/`exit`, honest-stop at runtime for `fs`/`process` since a browser sandbox has no equivalent — no virtual filesystem invented), for the 8 targets: the 6 already validated in `.github/workflows/native.yml` + 2 new Wasm CI jobs (WASI, Browser). Sub-phases N1–N8 (N6 splits into sibling N6a/WASI + N6b/Browser, sharing the same program object and `stackify_wasm`/`obj_wasm`, differing only in which `teko_rt.wasm` variant links in). **Status:** plan only (PR #42, docs/native-codegen-roadmap), zero code written. **Confirmed touching `src/codegen/*` in parallel:** ROUND 2's PR #39 already added `TK_BODY_CLASS` handling to `emit_type_decl` (CLASS struct-layout emission, data-model only) — this is a real overlap in the SAME FILE (not a design conflict, since it's additive struct-layout logic vs. a brand-new sibling backend under `src/codegen/native/`), but whoever starts ROUND N execution must rebase past ROUND 2's codegen commits, not assume the file is untouched.
 
 **Sequence:** GATE → **ROUND 0 (strings, START HERE)** → then the OOP/DI/async chain. **Critical path of that chain:** A1 → CLASS/IF → C2 → D3/D2 → **ROUND 3.5 (NP-OOP + TR0–TR3)** → DI → S8 → ROUND 6. W11 constraints join at D2; collections gate `env` and feed async types; ROUND 3.5's TR3 gates ROUND 4's `Map<K: Hashable & Eq>` key constraint. ROUND 0 is technically independent (only needs the GATE) but is sequenced FIRST by choice — get strings done and out of the way. **ROUND N (native backend) is orthogonal to this whole sequence** — it depends on nothing above and nothing above depends on it; it can start/pause any time relative to ROUND 1–6, staffing permitting. **The LIBRARY TRACKS below (PR #80 suite) are ALSO orthogonal to ROUND 1–6** for their pure-Teko halves (STDLIB_CORE, MATH, DEVTOOLS, most of NET_CRYPTO) — startable now, independent staffing — while their compiler-touching halves (LIB-KEYSTONES in ROUND 4, DB/WEB's socket-dependent units) slot into the rounds as noted in the LIBRARY TRACKS section. **Widest parallelism:** Rounds 1, 3, 4, the async sub-parts in Round 5, ROUND N, and the LIBRARY TRACKS' startable-now units, all throughout.
+
+---
+
+## WAVE 0.3 ROADMAP — Safety spine (0.3.1) & Performance (0.3.2)
+
+**Overview:** The 0.3 line delivers the own AOT backend (0.3.0 structure + 0.3.1 completion per Phase 6 preamble). 0.3.1 focuses on the **Safety spine** — protecting Teko's memory and type safety with the `ref` keyword, transparent `Ref<T>` semantics, and conservative rejection rules across 6 amendments (A1–A6, SP-0 through SP-6). 0.3.2 defers all performance & tooling optimizations (arena sizing, profiling, threading, test infrastructure) to a separate focused wave, keeping the safety road uncluttered.
+
+### 0.3.1.0-beta — Onda de Segurança (Safety spine)
+
+**Goal:** Formalize Teko's memory-safe reference protocol and close type-system gaps that could degrade safety.
+
+**Keystones:**
+- **#498** — `Ref<T>` transparency + `ref` keyword + Marshall protection (requires `mut`, auto-copy on `let` binding).
+  - Design: PR #507 `docs/design/safety-spine.md` (crumbs SP-0 through SP-6).
+  - Phases: SP-0 (surface `ref`) → SP-1 (facts + pure fn guard) → SP-2 (A4 encoder + A3 regalloc) → SP-3 (A1 LIR, KEYSTONE) → SP-4 (A2 isel) → SP-5 (A5 linker) → SP-6 (A6 native completion).
+  - Delivers transparent reference semantics to both VM and native, uniform type checking, honest-stops where unsafe features are genuinely incomplete.
+
+- **#497** — Remove redundant `-> void` return annotation (internal `Void` type stays).
+  - Simplifies syntax and strengthens the principle that omitted returns mean void.
+  - Affects parser, checker, codegen, VM, `.tks` mirrors.
+
+- **#501–#503** — Type-system and codegen fixes:
+  - **#501:** literal integers > i64::MAX fitting into unsigned casts (checker+codegen parity, both engines).
+  - **#502:** extern function parameters accepting `struct`/`enum` by value (FFI completeness, C7.1a carve-out).
+  - **#503:** `ptr<void>` in parameters emitting invalid C; bare ptr to work around.
+
+**Exit criteria:** Ref transparency thread through all engines · `-> void` removed · type casts unified · extern FFI accepts all value types · build green + VM==native on full regression suite.
+
+---
+
+### 0.3.2.0-beta — Onda de Perf & Tooling (Deferred optimizations)
+
+**Goal:** Optimize arena allocation, memory profiling, test parallelization, and compiler tooling without impacting the memory-safety spine.
+
+**Moved from 0.3.1:**
+- **#453** — `#arena_size(N)` pre-sizing directive (arena non-unsafe, per-function, including child scopes).
+- **#476** — `#arena_depth(N)` — share arena across callees up to depth N (less setup, better locality).
+- **#475** — Coverage collection as disk signal only (zero in-memory allocation during run); XML/Cobertura transform after.
+- **#479** — `teko profile` profiler tool (static + dynamic) suggesting `#arena_size`/`#arena_depth` to devs.
+- **#480** — PGO arena pre-sizing — pré-linker auto-assigns size+depth from profiler report; manual > PGO > default.
+- **#456** — `teko::threading` + `teko::sync` antecipated (split from #164, shipped in 0.3.1.x patch-point, not wait for 0.4).
+- **#442** — Run isolated tests — single test or test scope selector (both VM + native gate).
+- **#471** — `#test_panic("msg")` + `#test_exit(N)` — assert divergence without interrupting run.
+- **#472** — Parallel tests by default (per-process) + `#serial_group("name")` for non-parallel suites.
+- **#473** — `teko::process` expanded — `run_captured`, `spawn`/`wait`/`run_pool` (test-cluster infra, anticipates 0.4's process surface).
+- **#477** — Grouped attributes `#[attr1, attr2(1,2,3)]` — pure desugaring into stacked decorators.
+- **#461** — Static slice initialization — literal/const-rooted accumulation via push-chains to rodata.
+
+**Exit criteria:** All arena directives gated + profiled · test runner clustered + parallel · coverage decoupled from memory · process/threading surfaces begin · static slices land.
 
 ---
 
