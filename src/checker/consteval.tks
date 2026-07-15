@@ -294,3 +294,219 @@ fn is_const_expr(e: TExpr, table: TypeTable, env: Env) -> error? {
         _ => reject_form(e)
     }
 }
+
+/**
+ * ConstDepState — the accumulator threaded through the const dependency-order DFS (#594 crumb 4):
+ * the consts emitted so far in dependency order, the finished set, and the current DFS path (the
+ * visiting-set). A name re-entered while still on `onpath` is a reference cycle.
+ *
+ * @field ordered  the consts already emitted, dependencies before dependents
+ * @field done     the names whose subtree is fully ordered (never revisited)
+ * @field onpath   the names on the current DFS path (the visiting-set for cycle detection)
+ */
+type ConstDepState = struct { ordered: []TConstDecl; done: []str; onpath: []str }
+
+/**
+ * const_name_in — true iff `s` occurs in `xs` (a linear scan over the small const-name sets the
+ * dependency DFS threads) (#594 crumb 4).
+ *
+ * @param xs  the set of names to scan
+ * @param s   the name sought
+ * @return    whether `s` is present in `xs`
+ * @since #594
+ */
+fn const_name_in(xs: []str, s: str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == s { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * collect_const_names — the names of every module-level const in `consts`, preserving declaration
+ * order (the DFS seed set and the reference-edge filter) (#594 crumb 4).
+ *
+ * @param consts  the program's module-level consts
+ * @return        their names in declaration order
+ * @since #594
+ */
+fn collect_const_names(consts: []TConstDecl) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        out = teko::list::push(out, consts[i].name)
+        i++
+    }
+    out
+}
+
+/**
+ * find_const_by_name — the const in `consts` whose name is `name`, or null when none (defensive: a
+ * dependency name is always drawn from the const set, so the null arm is unreachable in practice)
+ * (#594 crumb 4).
+ *
+ * @param consts  the program's module-level consts
+ * @param name    the const name to resolve
+ * @return        the matching TConstDecl, or null when absent
+ * @since #594
+ */
+fn find_const_by_name(consts: []TConstDecl, name: str) -> TConstDecl? {
+    mut i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        if consts[i].name == name { return consts[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * const_dep_refs_list — accumulate every Tier-3 const reference in `xs` onto `acc`, in order (#594
+ * crumb 4). Shared by the aggregate (Tier 4) and allowlisted-call (Tier 5) arms of `const_dep_refs`.
+ *
+ * @param xs     the sub-expressions to scan in order
+ * @param names  the const-name set (only a name in this set becomes an edge)
+ * @param acc    the references collected so far (deduplicated)
+ * @return       `acc` grown with every fresh const reference found in `xs`
+ * @since #594
+ */
+fn const_dep_refs_list(xs: []TExpr, names: []str, acc: []str) -> []str {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out = const_dep_refs(xs[i], names, out)
+        i++
+    }
+    out
+}
+
+/**
+ * const_dep_refs — the Tier-3 dependency edges of a const initializer: every bare-name reference in
+ * `e` that resolves to another module-level const (a name in `names`), collected without duplicates
+ * (#594 crumb 4). Recurses structurally over the same const-legal expression shapes `is_const_expr`
+ * admits; an enum/flags member is a `TPathExpr` (not a `TVar`) and contributes no const edge.
+ *
+ * @param e      the typed const initializer (or a sub-expression of one)
+ * @param names  the module-level const-name set
+ * @param acc    the references collected so far (deduplicated)
+ * @return       `acc` grown with every fresh const reference reachable from `e`
+ * @since #594
+ */
+fn const_dep_refs(e: TExpr, names: []str, acc: []str) -> []str {
+    match e.kind {
+        TVar as v => if const_name_in(names, v.name) && !const_name_in(acc, v.name) { teko::list::push(acc, v.name) } else { acc }
+        TCast as c => const_dep_refs(c.expr, names, acc)
+        TUnary as u => const_dep_refs(u.operand, names, acc)
+        TBinary as b => const_dep_refs(b.right, names, const_dep_refs(b.left, names, acc))
+        TArrayLit as a => const_dep_refs_array(a, names, acc)
+        TStructInit as s => const_dep_refs_list(s.field_vals, names, acc)
+        TCall as c => const_dep_refs_list(c.args, names, acc)
+        _ => acc
+    }
+}
+
+/**
+ * const_dep_refs_array — the Tier-3 references in an array/slice literal (Tier 4): every element's
+ * own references, in order (#594 crumb 4).
+ *
+ * @param a      the typed array literal
+ * @param names  the module-level const-name set
+ * @param acc    the references collected so far (deduplicated)
+ * @return       `acc` grown with every fresh const reference in `a`'s elements
+ * @since #594
+ */
+fn const_dep_refs_array(a: TArrayLit, names: []str, acc: []str) -> []str {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        out = const_dep_refs(a.elements[i].expr, names, out)
+        i++
+    }
+    out
+}
+
+/**
+ * const_cycle_error — a located error naming a constant reference cycle, rendering the current DFS
+ * path with the re-entered name appended (`constant cycle: A → B → A`), positioned at the re-entered
+ * const's declaration (#594 crumb 4).
+ *
+ * @param name    the name re-entered while still on the DFS path (the back-edge target)
+ * @param onpath  the DFS path leading to the back-edge
+ * @param consts  the program's consts (to position the error at `name`'s declaration)
+ * @return        the located cycle error
+ * @since #594
+ */
+fn const_cycle_error(name: str, onpath: []str, consts: []TConstDecl) -> error {
+    mut path = ""
+    mut i: u64 = 0
+    loop {
+        if i >= onpath.len { break }
+        path = if i == 0 { onpath[i] } else { $"{path} → {onpath[i]}" }
+        i++
+    }
+    let full = if onpath.len == 0 { name } else { $"{path} → {name}" }
+    let msg = $"constant cycle: {full} (#594)"
+    match find_const_by_name(consts, name) {
+        TConstDecl as cd => teko::error::err_loc(error { message = msg }, cd.line, cd.col)
+        null => error { message = msg }
+    }
+}
+
+/**
+ * const_dep_visit — a single DFS step: order `name`'s dependency subtree ahead of `name` itself, or
+ * report a cycle (#594 crumb 4). A finished name is a no-op; a name already on the current path is a
+ * back-edge (`const_cycle_error`); otherwise `name` is pushed onto the path, each of its Tier-3
+ * references is visited (deps first), then `name` is emitted and marked done and popped from the
+ * path.
+ *
+ * @param name    the const to visit
+ * @param consts  the program's module-level consts
+ * @param names   the const-name set (the edge filter)
+ * @param st      the DFS accumulator entering this step
+ * @return        the accumulator after `name`'s subtree is ordered, or a located cycle error
+ * @throws        a located `constant cycle` error when `name` re-enters the current DFS path
+ * @since #594
+ */
+fn const_dep_visit(name: str, consts: []TConstDecl, names: []str, st: ConstDepState) -> ConstDepState | error {
+    if const_name_in(st.done, name) { return st }
+    if const_name_in(st.onpath, name) { return const_cycle_error(name, st.onpath, consts) }
+    let cd = match find_const_by_name(consts, name) { TConstDecl as x => x; null => return st }
+    mut cur = ConstDepState { ordered = st.ordered; done = st.done; onpath = teko::list::push(st.onpath, name) }
+    let refs = const_dep_refs(cd.init, names, teko::list::empty())
+    mut i: u64 = 0
+    loop {
+        if i >= refs.len { break }
+        cur = match const_dep_visit(refs[i], consts, names, cur) { ConstDepState as x => x; error as e => return e }
+        i++
+    }
+    ConstDepState { ordered = teko::list::push(cur.ordered, cd); done = teko::list::push(cur.done, name); onpath = st.onpath }
+}
+
+/**
+ * const_dep_order — topologically order the program's module-level consts by their Tier-3 references
+ * so an inlining pass never substitutes an unresolved const, and a reference cycle is reported as a
+ * located error (#594 crumb 4). A visiting-set DFS from each declaration; a name re-entered on the
+ * current path is the cycle. Does NOT fold numerically — ordering is over AST references only.
+ *
+ * @param consts  every module-level TConstDecl in the program
+ * @return        the consts in dependency order (dependencies first), or a located cycle error
+ * @throws        a `constant cycle` error naming the offending path when the references form a cycle
+ * @since #594
+ */
+fn const_dep_order(consts: []TConstDecl) -> []TConstDecl | error {
+    let names = collect_const_names(consts)
+    mut st = ConstDepState { ordered = teko::list::empty(); done = teko::list::empty(); onpath = teko::list::empty() }
+    mut i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        st = match const_dep_visit(consts[i].name, consts, names, st) { ConstDepState as x => x; error as e => return e }
+        i++
+    }
+    st.ordered
+}
