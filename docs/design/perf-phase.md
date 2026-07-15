@@ -165,6 +165,24 @@ that is the use-after-free proof for Boundary A.
     the native honest-stop shows as e.g. `checker ✓ … codegen ✗`). This surfaces the per-phase
     timing the diagnostics measured (checker ~76%) in every normal build, no instrumentation.
     Phase-level (vs the item-level `N/M` counters above). Same non-TTY caveat.
+  * **TTY detection + `--no-tty` (owner 2026-07-15).** The `\r`/color/banner "elegant"
+    output is gated on stdout being a real terminal. The RELIABLE test is `isatty(stdout)`
+    — the env heuristic (`CI`/`TERM`) mis-reads a piped / redirected / docker-without-tty
+    stdout as a TTY (TERM stays set when piped). `isatty` is a NEW runtime seam → bootstrap
+    wall → **stage `tk_isatty` (staged-off intrinsic → seed cut → use)** like `with_cap`; PR1
+    ships an interim env heuristic isolated in ONE swappable function. Plus a **`--no-tty`
+    flag** (owner) that FORCES plain output even on a terminal — for the dev to capture clean
+    diagnostic output; override wins over detection. (`--no-tty` ships in PR1; the isatty
+    upgrade + elegant format follow with the staged seam.)
+  * **Mascot banner (owner 2026-07-15, ratified).** Print the teko mascot as colored
+    **half-block** (`▀`) terminal art at the top of **any command's** output, **suppressed
+    when `--no-tty` OR stdout is not a TTY** (same gate as the elegant output). Source = the
+    **transparent** `docs/brand/mascot.svg` (no background — the bird takes the terminal bg),
+    both **40-col** (compact, ~20 rows — the per-command banner) and **80-col** (~40 rows —
+    `--version` / bare-`teko` splash) approved. Generation recipe (deterministic, reproduce at
+    implementation time): rasterize the SVG (e.g. `cairosvg mascot.svg -> 1024²` PNG) then
+    `chafa -c full --symbols block --size <40|80> <png>`. Lands with the isatty/elegant-TTY
+    round (after PR1 + the staged `tk_isatty`), behind the TTY gate. No design committed beyond this.
 * **Post-linker: per-OS ABI / platform optimization — a SEPARATE round, deferred
   (owner 2026-07-15).** Owner hypothesis: we are not yet exploiting the best ABI each
   OS can provide to maximize performance; grounded in the observed per-OS divergence
