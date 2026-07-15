@@ -165,3 +165,888 @@ pub fn elf_to_link_object(obj: teko::backend::ElfObject) -> LinkObject {
         relocs = elf_to_link_relocs(obj.relocs)
     }
 }
+
+/**
+ * elf_read_u8 — read one byte from `bytes` at `off`, bound-checked so a truncated or
+ * malformed ELF image yields a named parse error instead of a runtime index panic.
+ *
+ * @param bytes  the object image
+ * @param off    the byte offset to read
+ * @return       the byte at `off`
+ * @throws       when `off` is at or past `bytes.len` (a truncated image)
+ */
+fn elf_read_u8(bytes: []byte, off: u64) -> byte | error {
+    if off >= bytes.len { return error { message = "link_elf: truncated ELF (byte read past end)" } }
+    bytes[off]
+}
+
+/**
+ * elf_read_u16 — read a little-endian 16-bit field from `bytes` at `off`, widened to
+ * `u32` (the inverse of the writer's `emit_u16_le_elf`).
+ *
+ * @param bytes  the object image
+ * @param off    the field's byte offset
+ * @return       the 16-bit field, widened to `u32`
+ * @throws       when the 2-byte field runs past `bytes.len`
+ */
+fn elf_read_u16(bytes: []byte, off: u64) -> u32 | error {
+    let b0 = match elf_read_u8(bytes, off) { byte as x => x; error as e => return e }
+    let b1 = match elf_read_u8(bytes, off + 1) { byte as x => x; error as e => return e }
+    (b0 to u32) | ((b1 to u32) << (8 to u32))
+}
+
+/**
+ * elf_read_u32 — read a little-endian 32-bit field from `bytes` at `off` (the inverse
+ * of the writer's `emit_u32_le`).
+ *
+ * @param bytes  the object image
+ * @param off    the field's byte offset
+ * @return       the 32-bit field
+ * @throws       when the 4-byte field runs past `bytes.len`
+ */
+fn elf_read_u32(bytes: []byte, off: u64) -> u32 | error {
+    let b0 = match elf_read_u8(bytes, off) { byte as x => x; error as e => return e }
+    let b1 = match elf_read_u8(bytes, off + 1) { byte as x => x; error as e => return e }
+    let b2 = match elf_read_u8(bytes, off + 2) { byte as x => x; error as e => return e }
+    let b3 = match elf_read_u8(bytes, off + 3) { byte as x => x; error as e => return e }
+    (b0 to u32) | ((b1 to u32) << (8 to u32)) | ((b2 to u32) << (16 to u32)) | ((b3 to u32) << (24 to u32))
+}
+
+/**
+ * elf_read_u64 — read a little-endian 64-bit field from `bytes` at `off` (the inverse
+ * of the writer's `emit_u64_le`), as two little-endian 32-bit halves.
+ *
+ * @param bytes  the object image
+ * @param off    the field's byte offset
+ * @return       the 64-bit field
+ * @throws       when the 8-byte field runs past `bytes.len`
+ */
+fn elf_read_u64(bytes: []byte, off: u64) -> u64 | error {
+    let lo = match elf_read_u32(bytes, off) { u32 as x => x; error as e => return e }
+    let hi = match elf_read_u32(bytes, off + 4) { u32 as x => x; error as e => return e }
+    (lo to u64) | ((hi to u64) << (32 to u64))
+}
+
+/**
+ * elf_i64_from_bits — reinterpret a `u64` two's-complement bit pattern as the `i64` it
+ * encodes (the inverse of the writer's `push_imm64_x86`, which lays a signed addend
+ * out as its raw bit pattern). Mirrors `teko::math`'s `i64_from_u64_bits` derivation: a
+ * clear sign bit maps directly; a set sign bit is folded through `teko::math::i64_min`
+ * so the subtraction never traps.
+ *
+ * @param bits  the 64-bit two's-complement pattern
+ * @return      the `i64` value `bits` encodes
+ */
+fn elf_i64_from_bits(bits: u64) -> i64 {
+    let sign_bit: u64 = (1 to u64) << (63 to u64)
+    if bits < sign_bit { return bits to i64 }
+    (bits - sign_bit) to i64 + teko::math::i64_min()
+}
+
+/**
+ * elf_read_i64 — read a little-endian 64-bit two's-complement field (an `Elf64_Rela`
+ * `r_addend`) from `bytes` at `off`.
+ *
+ * @param bytes  the object image
+ * @param off    the field's byte offset
+ * @return       the signed 64-bit field
+ * @throws       when the 8-byte field runs past `bytes.len`
+ */
+fn elf_read_i64(bytes: []byte, off: u64) -> i64 | error {
+    let bits = match elf_read_u64(bytes, off) { u64 as x => x; error as e => return e }
+    elf_i64_from_bits(bits)
+}
+
+/**
+ * elf_u32_from_u64 — narrow a `u64` field value to `u32`, honest-stopping instead of
+ * silently truncating when the value does not fit (a defensive check against a
+ * corrupt or hostile ELF image whose section/symbol offsets exceed the neutral
+ * model's 32-bit fields).
+ *
+ * @param v  the 64-bit value to narrow
+ * @return   `v` narrowed to `u32`
+ * @throws   when `v` exceeds `u32::MAX`
+ */
+fn elf_u32_from_u64(v: u64) -> u32 | error {
+    if v > (0xFFFFFFFF to u64) { return error { message = "link_elf: a 32-bit field's value exceeds u32 range" } }
+    v to u32
+}
+
+/**
+ * ElfHeader — the `Elf64_Ehdr` fields `parse_elf_object` needs past validation: the
+ * machine id, ABI flags, and the section-header-table location/count/string-index.
+ *
+ * @since #392 L1-2
+ */
+type ElfHeader = struct {
+    /** machine — the `e_machine` (already validated against the supported set). */
+    machine: u32
+    /** e_flags — the `e_flags` (ISA ABI flags, carried through unchanged). */
+    e_flags: u32
+    /** shoff — the `e_shoff` (the section-header table's file offset). */
+    shoff: u64
+    /** shnum — the `e_shnum` (the section-header table's entry count). */
+    shnum: u32
+    /** shstrndx — the `e_shstrndx` (the `.shstrtab` section's header index). */
+    shstrndx: u32
+}
+
+/**
+ * elf_machine_supported — whether `m` is one of the `e_machine` ids E1 supports:
+ * `EM_X86_64`(62), `EM_RISCV`(243), or `EM_AARCH64`(183) (the L1-0 arm64 precursor's
+ * machine id, accepted here even though this crumb's own writer never emits it).
+ *
+ * @param m  the candidate `e_machine`
+ * @return   true iff `m` is a supported machine id
+ */
+fn elf_machine_supported(m: u32) -> bool {
+    m == (62 to u32) || m == (243 to u32) || m == (183 to u32)
+}
+
+/**
+ * elf_parse_header — validate and parse the 64-byte `Elf64_Ehdr`: the `\x7fELF` magic,
+ * `ELFCLASS64`, `e_type == ET_REL`, and a supported `e_machine` are each a NAMED
+ * honest-stop on failure (owner req #2, M.3) — an executable/shared object, a bad
+ * magic, or an unsupported machine/class never silently mis-parses.
+ *
+ * @param bytes  the object image
+ * @return       the validated header fields
+ * @throws       when the image is truncated, the magic is wrong, the class is not
+ *               `ELFCLASS64`, `e_type != ET_REL`, or `e_machine` is unsupported
+ */
+fn elf_parse_header(bytes: []byte) -> ElfHeader | error {
+    if bytes.len < (64 to u64) { return error { message = "link_elf: truncated ELF header" } }
+    if bytes[0] != (0x7F to byte) || bytes[1] != b'E' || bytes[2] != b'L' || bytes[3] != b'F' {
+        return error { message = "link_elf: bad ELF magic" }
+    }
+    if bytes[4] != (2 to byte) { return error { message = "link_elf: unsupported ELF class (ELFCLASS64 required)" } }
+    let e_type = match elf_read_u16(bytes, 16) { u32 as x => x; error as e => return e }
+    if e_type != (1 to u32) { return error { message = "link_elf: not a relocatable object (ET_REL required)" } }
+    let e_machine = match elf_read_u16(bytes, 18) { u32 as x => x; error as e => return e }
+    if !elf_machine_supported(e_machine) { return error { message = "link_elf: unsupported e_machine" } }
+    let e_flags = match elf_read_u32(bytes, 48) { u32 as x => x; error as e => return e }
+    let e_shoff = match elf_read_u64(bytes, 40) { u64 as x => x; error as e => return e }
+    let e_shnum = match elf_read_u16(bytes, 60) { u32 as x => x; error as e => return e }
+    let e_shstrndx = match elf_read_u16(bytes, 62) { u32 as x => x; error as e => return e }
+    ElfHeader { machine = e_machine; e_flags = e_flags; shoff = e_shoff; shnum = e_shnum; shstrndx = e_shstrndx }
+}
+
+/**
+ * RawShdr — one parsed `Elf64_Shdr`, the fields `parse_elf_object` needs: the
+ * `.shstrtab` name offset, the section type, the `SHF_*` flags, the section's file
+ * offset/size, and the two link fields (`sh_link`/`sh_info`, whose meaning depends on
+ * `sh_type` — the linked `.strtab` for `.symtab`, the target section + linked symtab
+ * for `.rela.*`), plus the fixed per-entry size (`sh_entsize`).
+ *
+ * @since #392 L1-2
+ */
+type RawShdr = struct {
+    /** name_off — the `sh_name` (a byte offset into `.shstrtab`). */
+    name_off: u32
+    /** sh_type — the section type (0 NULL, 1 PROGBITS, 2 SYMTAB, 3 STRTAB, 4 RELA, 8 NOBITS). */
+    sh_type: u32
+    /** sh_flags — the `SHF_*` bitset. */
+    sh_flags: u64
+    /** sh_offset — the section's file offset (meaningless for `SHT_NOBITS`). */
+    sh_offset: u64
+    /** sh_size — the section's byte size. */
+    sh_size: u64
+    /** sh_link — `.symtab`'s linked `.strtab` index, or `.rela.*`'s linked symtab index. */
+    sh_link: u32
+    /** sh_info — `.rela.*`'s target section index (unused for `.symtab`). */
+    sh_info: u32
+    /** sh_entsize — the fixed per-entry size (24 for both `Elf64_Sym` and `Elf64_Rela`). */
+    sh_entsize: u64
+}
+
+/**
+ * elf_read_shdr — parse one 64-byte `Elf64_Shdr` at `off` (mirrors `emit_elf_shdr`'s
+ * field order: name, type, flags, addr [skipped — always zero in a relocatable
+ * object], offset, size, link, info, addralign [skipped], entsize).
+ *
+ * @param bytes  the object image
+ * @param off    the section header's byte offset
+ * @return       the parsed section header
+ * @throws       when any field runs past `bytes.len`
+ */
+fn elf_read_shdr(bytes: []byte, off: u64) -> RawShdr | error {
+    let name_off = match elf_read_u32(bytes, off) { u32 as x => x; error as e => return e }
+    let sh_type = match elf_read_u32(bytes, off + 4) { u32 as x => x; error as e => return e }
+    let sh_flags = match elf_read_u64(bytes, off + 8) { u64 as x => x; error as e => return e }
+    let sh_offset = match elf_read_u64(bytes, off + 24) { u64 as x => x; error as e => return e }
+    let sh_size = match elf_read_u64(bytes, off + 32) { u64 as x => x; error as e => return e }
+    let sh_link = match elf_read_u32(bytes, off + 40) { u32 as x => x; error as e => return e }
+    let sh_info = match elf_read_u32(bytes, off + 44) { u32 as x => x; error as e => return e }
+    let sh_entsize = match elf_read_u64(bytes, off + 56) { u64 as x => x; error as e => return e }
+    RawShdr { name_off = name_off; sh_type = sh_type; sh_flags = sh_flags; sh_offset = sh_offset; sh_size = sh_size; sh_link = sh_link; sh_info = sh_info; sh_entsize = sh_entsize }
+}
+
+/**
+ * elf_read_shdrs — parse the `shnum`-entry section-header table starting at `shoff`
+ * (each entry a fixed 64 bytes, per `ELFCLASS64`).
+ *
+ * @param bytes  the object image
+ * @param shoff  the table's file offset (`Elf64_Ehdr.e_shoff`)
+ * @param shnum  the table's entry count (`Elf64_Ehdr.e_shnum`)
+ * @return       the parsed section headers, in table order
+ * @throws       when any entry runs past `bytes.len`
+ */
+fn elf_read_shdrs(bytes: []byte, shoff: u64, shnum: u32) -> []RawShdr | error {
+    mut out: []RawShdr = teko::list::empty()
+    mut i: u32 = 0
+    loop {
+        if i >= shnum { break }
+        let off = shoff + ((i to u64) * (64 to u64))
+        let sh = match elf_read_shdr(bytes, off) { RawShdr as x => x; error as e => return e }
+        out = teko::list::push(out, sh)
+        i++
+    }
+    out
+}
+
+/**
+ * elf_slice — copy the byte range `bytes[off, off+len)` into a fresh `[]byte` (Teko
+ * slices have no native sub-slice operator — mirrors `teko::encoding::base64`'s
+ * `bytes_slice_view`, bound-checked here so an out-of-range section/table offset is a
+ * named parse error rather than a runtime panic).
+ *
+ * @param bytes  the source image
+ * @param off    the range's inclusive start offset
+ * @param len    the range's byte length
+ * @return       a fresh `[]byte` holding the requested range
+ * @throws       when `off + len` runs past `bytes.len`
+ */
+fn elf_slice(bytes: []byte, off: u64, len: u64) -> []byte | error {
+    if off + len > bytes.len { return error { message = "link_elf: section/table range runs past end of file" } }
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= len { break }
+        out = teko::list::push(out, bytes[off + i])
+        i++
+    }
+    out
+}
+
+/**
+ * elf_cstr_at — read a NUL-terminated name from `table` (a `.strtab`/`.shstrtab`
+ * image) starting at byte offset `off`. Offset 0 (the reserved leading NUL every ELF
+ * string table carries) is handled like any other offset — it scans zero bytes and
+ * returns the empty name.
+ *
+ * @param table  the string-table image
+ * @param off    the name's starting byte offset
+ * @return       the name, excluding the terminating NUL
+ * @throws       when `off` is past `table.len`, or no NUL terminates the name before
+ *               the table ends
+ */
+fn elf_cstr_at(table: []byte, off: u64) -> str | error {
+    if off > table.len { return error { message = "link_elf: string offset past end of table" } }
+    mut out: []byte = teko::list::empty()
+    mut i = off
+    loop {
+        if i >= table.len { return error { message = "link_elf: unterminated string in table" } }
+        let b = table[i]
+        if b == (0 to byte) { return str(out) }
+        out = teko::list::push(out, b)
+        i++
+    }
+    error { message = "link_elf: unreachable string scan" }
+}
+
+/**
+ * NamedShdr — one section header paired with its resolved `.shstrtab` name (the
+ * pairing every later pass — ALLOC filtering, kind classification, symtab/rela
+ * discovery — keys off of).
+ *
+ * @since #392 L1-2
+ */
+type NamedShdr = struct {
+    /** idx — the section's index in the section-header table. */
+    idx: u32
+    /** name — the resolved `.shstrtab` name. */
+    name: str
+    /** hdr — the parsed section header. */
+    hdr: RawShdr
+}
+
+/**
+ * elf_name_shdrs — resolve every section header's `.shstrtab` name, pairing it with
+ * its table index.
+ *
+ * @param shdrs     the parsed section headers
+ * @param shstrtab  the `.shstrtab` image
+ * @return          each header paired with its resolved name, in table order
+ * @throws          when a `sh_name` offset is malformed (`elf_cstr_at`'s errors)
+ */
+fn elf_name_shdrs(shdrs: []RawShdr, shstrtab: []byte) -> []NamedShdr | error {
+    mut out: []NamedShdr = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= shdrs.len { break }
+        let h = shdrs[i]
+        let nm = match elf_cstr_at(shstrtab, h.name_off to u64) { str as s => s; error as e => return e }
+        out = teko::list::push(out, NamedShdr { idx = i to u32; name = nm; hdr = h })
+        i++
+    }
+    out
+}
+
+/**
+ * elf_str_starts_with — whether `s` begins with the literal prefix `p` (mirrors
+ * `teko::build`'s `mf_starts_with`; no builtin `teko::str` prefix-test exists).
+ *
+ * @param s  the string to test
+ * @param p  the candidate prefix
+ * @return   true iff `s`'s first `p.len` bytes equal `p`
+ */
+fn elf_str_starts_with(s: str, p: str) -> bool {
+    if s.len < p.len { return false }
+    teko::str::slice_to(s, p.len) == p
+}
+
+/**
+ * elf_classify_kind — the `LinkSecKind` a section's name (and, for `SHT_NOBITS`, its
+ * type) drives: `.text`(.*) → Text, `.rodata`(.*) → Rodata, `.data`(.*) → Data,
+ * `SHT_NOBITS` or `.bss`(.*) → Bss, `.init_array`/`.fini_array` → the matching array
+ * kind, anything else → Other (a foreign section carried verbatim, placed by its
+ * flags — L1-1's doc).
+ *
+ * @param name       the section's resolved name
+ * @param is_nobits  true iff the section's `sh_type` is `SHT_NOBITS` (a `.bss`)
+ * @return           the classified `LinkSecKind`
+ */
+fn elf_classify_kind(name: str, is_nobits: bool) -> LinkSecKind {
+    if name == ".text" || elf_str_starts_with(name, ".text.") { return LinkSecKind::Text }
+    if name == ".rodata" || elf_str_starts_with(name, ".rodata.") { return LinkSecKind::Rodata }
+    if name == ".data" || elf_str_starts_with(name, ".data.") { return LinkSecKind::Data }
+    if is_nobits || name == ".bss" || elf_str_starts_with(name, ".bss.") { return LinkSecKind::Bss }
+    if name == ".init_array" { return LinkSecKind::InitArray }
+    if name == ".fini_array" { return LinkSecKind::FiniArray }
+    LinkSecKind::Other
+}
+
+/**
+ * elf_shdr_is_compressed — whether `h` carries `SHF_COMPRESSED`(0x800): an unsupported
+ * construct this parser honest-stops on rather than mis-reading compressed bytes as
+ * plain section data (owner req #2, M.3).
+ *
+ * @param h  the section header to test
+ * @return   true iff `SHF_COMPRESSED` is set
+ */
+fn elf_shdr_is_compressed(h: RawShdr) -> bool {
+    (h.sh_flags & (0x800 to u64)) != (0 to u64)
+}
+
+/**
+ * AllocSec — one `SHF_ALLOC` section paired with its ORIGINAL section-header index
+ * (needed to resolve a symbol's `st_shndx` / a relocation's `sh_info` target back to
+ * this filtered list's position — `LinkObject.sections`' actual index space).
+ *
+ * @since #392 L1-2
+ */
+type AllocSec = struct {
+    /** shdr_idx — the section's index in the FULL section-header table. */
+    shdr_idx: u32
+    /** sec — the neutral `LinkSection` built from it. */
+    sec: LinkSection
+}
+
+/**
+ * elf_alloc_sections — filter `named` to its `SHF_ALLOC` sections (the ones
+ * `LinkObject.sections` carries — `.text`/`.rodata`/`.data`/`.bss`/init-fini arrays/
+ * foreign `Other` sections), each paired with its original header index. A
+ * `SHT_NOBITS` (`.bss`) section carries no file bytes; every other kind copies its
+ * `[sh_offset, sh_offset+sh_size)` file range.
+ *
+ * @param bytes  the object image (for non-`NOBITS` section data)
+ * @param named  every section header, resolved-named
+ * @return       the `SHF_ALLOC` sections, in header order, each paired with its
+ *               original header index
+ * @throws       when an ALLOC section is `SHF_COMPRESSED` (M.3), or its data range
+ *               runs past `bytes.len`
+ */
+fn elf_alloc_sections(bytes: []byte, named: []NamedShdr) -> []AllocSec | error {
+    mut out: []AllocSec = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= named.len { break }
+        let n = named[i]
+        let h = n.hdr
+        let is_alloc = (h.sh_flags & (0x2 to u64)) != (0 to u64)
+        if !is_alloc { i++; continue }
+        if elf_shdr_is_compressed(h) { return error { message = "link_elf: compressed section unsupported" } }
+        let is_nobits = h.sh_type == (8 to u32)
+        let data = if is_nobits { teko::list::empty() } else { match elf_slice(bytes, h.sh_offset, h.sh_size) { []byte as b => b; error as e => return e } }
+        let kind = elf_classify_kind(n.name, is_nobits)
+        let sec = LinkSection { kind = kind; name = n.name; sh_flags = h.sh_flags; bytes = data; size = h.sh_size }
+        out = teko::list::push(out, AllocSec { shdr_idx = n.idx; sec = sec })
+        i++
+    }
+    out
+}
+
+/**
+ * elf_sections_of — the plain `[]LinkSection` list of `allocs`, in order (the
+ * `LinkObject.sections` field's final shape).
+ *
+ * @param allocs  the `SHF_ALLOC` sections, paired with their header index
+ * @return        each `AllocSec.sec`, in order
+ */
+fn elf_sections_of(allocs: []AllocSec) -> []LinkSection {
+    mut out: []LinkSection = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= allocs.len { break }
+        out = teko::list::push(out, allocs[i].sec)
+        i++
+    }
+    out
+}
+
+/**
+ * elf_alloc_pos_of — the `LinkObject.sections` index of the `SHF_ALLOC` section whose
+ * original header index is `shndx`, or `0` when absent (a permissive fallback for a
+ * symbol's `st_shndx` — an undefined symbol's section index is never meaningful,
+ * mirroring the own adapter's `own_link_sec_index` fallthrough).
+ *
+ * @param allocs  the `SHF_ALLOC` sections, paired with their header index
+ * @param shndx   the original section-header index to resolve
+ * @return        `allocs`' matching position, or `0` when `shndx` is not an ALLOC
+ *                section
+ */
+fn elf_alloc_pos_of(allocs: []AllocSec, shndx: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= allocs.len { break }
+        if allocs[i].shdr_idx == shndx { return i to u32 }
+        i++
+    }
+    0 to u32
+}
+
+/**
+ * elf_alloc_pos_or_error — the `LinkObject.sections` index of the `SHF_ALLOC` section
+ * whose original header index is `shndx`, honest-stopping when absent (a relocation
+ * whose target section is not tracked would silently patch nothing — M.3 forbids
+ * that).
+ *
+ * @param allocs  the `SHF_ALLOC` sections, paired with their header index
+ * @param shndx   the original section-header index to resolve (a `.rela.*`'s
+ *                `sh_info`)
+ * @return        `allocs`' matching position
+ * @throws        when `shndx` names no tracked `SHF_ALLOC` section
+ */
+fn elf_alloc_pos_or_error(allocs: []AllocSec, shndx: u32) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= allocs.len { break }
+        if allocs[i].shdr_idx == shndx { return i to u32 }
+        i++
+    }
+    error { message = "link_elf: relocation targets a non-allocated or unknown section" }
+}
+
+/**
+ * elf_sym_bind — the `STB_*` bind field of an `Elf64_Sym.st_info` byte (the high
+ * nibble).
+ *
+ * @param info  the `st_info` byte, widened to `u32`
+ * @return      the bind field (0 `LOCAL`, 1 `GLOBAL`, 2 `WEAK`)
+ */
+fn elf_sym_bind(info: u32) -> u32 {
+    info >> (4 to u32)
+}
+
+/**
+ * elf_sym_type — the `STT_*` type field of an `Elf64_Sym.st_info` byte (the low
+ * nibble).
+ *
+ * @param info  the `st_info` byte, widened to `u32`
+ * @return      the type field (e.g. 3 `STT_SECTION`)
+ */
+fn elf_sym_type(info: u32) -> u32 {
+    info & (0xF to u32)
+}
+
+/**
+ * elf_sym_is_section_type — whether `info` names an `STT_SECTION` symbol: the
+ * anonymous per-section symbol the ELF writer collapses every rodata-local reference
+ * onto (`objfile_elf.tks`'s `elf_has_rodata_section`/`elf_rodata_secsym_index`). It
+ * carries no name of its own and is not a `LinkObject.symbols` entry — only a
+ * relocation's numeric target.
+ *
+ * @param info  the `st_info` byte, widened to `u32`
+ * @return      true iff `info`'s type field is `STT_SECTION`(3)
+ */
+fn elf_sym_is_section_type(info: u32) -> bool {
+    elf_sym_type(info) == (3 to u32)
+}
+
+/**
+ * elf_sym_binding_of — the neutral `SymBinding` for an `STB_*` bind field: `Local`(0),
+ * `Weak`(2), else `Global` (covers `STB_GLOBAL`(1) and any other producer-specific
+ * value, treated as globally visible).
+ *
+ * @param bind  the bind field (`elf_sym_bind`'s result)
+ * @return      the neutral `SymBinding`
+ */
+fn elf_sym_binding_of(bind: u32) -> SymBinding {
+    if bind == (0 to u32) { return SymBinding::Local }
+    if bind == (2 to u32) { return SymBinding::Weak }
+    SymBinding::Global
+}
+
+/**
+ * elf_binding_is_local — whether `b` is `SymBinding::Local` (the sole binding a
+ * `--prune-dead` root can never be — L1-1's `LinkSym.exported` doc).
+ *
+ * @param b  the binding to test
+ * @return   true iff `b == Local`
+ */
+fn elf_binding_is_local(b: SymBinding) -> bool {
+    match b {
+        Local => true
+        Global => false
+        Weak => false
+    }
+}
+
+/**
+ * ElfSymRaw — one parsed `Elf64_Sym`, before neutral-model translation: its resolved
+ * `.strtab` name (empty for the null/section symbols), its `st_info` bind/type byte,
+ * its `st_shndx`, and its `st_value`.
+ *
+ * @since #392 L1-2
+ */
+type ElfSymRaw = struct {
+    /** name — the resolved `.strtab` name (empty for the reserved null/section
+     * symbols). */
+    name: str
+    /** info — the `st_info` byte, widened to `u32`. */
+    info: u32
+    /** shndx — the `st_shndx` (0 `SHN_UNDEF` for an undefined reference). */
+    shndx: u32
+    /** value — the `st_value` (a defined symbol's section-relative offset). */
+    value: u64
+}
+
+/**
+ * elf_read_sym_raw — parse one 24-byte `Elf64_Sym` at `off` (mirrors
+ * `emit_elf_one_sym`'s field order: name, info, other [skipped — always zero], shndx,
+ * value, size [skipped — unset in the writer's MVP]).
+ *
+ * @param bytes   the object image
+ * @param strtab  the `.strtab` image (for the symbol's name)
+ * @param off     the symbol entry's byte offset
+ * @return        the parsed symbol
+ * @throws        when a field runs past `bytes.len`, or `st_name` is malformed
+ */
+fn elf_read_sym_raw(bytes: []byte, strtab: []byte, off: u64) -> ElfSymRaw | error {
+    let name_off = match elf_read_u32(bytes, off) { u32 as x => x; error as e => return e }
+    let info_byte = match elf_read_u8(bytes, off + 4) { byte as x => x; error as e => return e }
+    let shndx = match elf_read_u16(bytes, off + 6) { u32 as x => x; error as e => return e }
+    let value = match elf_read_u64(bytes, off + 8) { u64 as x => x; error as e => return e }
+    let name = if name_off == (0 to u32) { "" } else { match elf_cstr_at(strtab, name_off to u64) { str as s => s; error as e => return e } }
+    ElfSymRaw { name = name; info = info_byte to u32; shndx = shndx; value = value }
+}
+
+/**
+ * elf_link_sym_of — translate one `ElfSymRaw` into a neutral `LinkSym`: `defined` is
+ * `st_shndx != SHN_UNDEF`, `sec` resolves through `elf_alloc_pos_of` (meaningful only
+ * when defined), `binding` maps the `st_info` bind field, `offset` narrows
+ * `st_value`, and `exported` is `defined && !Local` (mirrors `own_sym_exported`'s "a
+ * --prune-dead root beyond the entry point" contract).
+ *
+ * @param raw     the parsed `Elf64_Sym`
+ * @param allocs  the `SHF_ALLOC` sections (for `sec` resolution)
+ * @return        the equivalent `LinkSym`
+ * @throws        when `st_value` exceeds `u32::MAX`
+ */
+fn elf_link_sym_of(raw: ElfSymRaw, allocs: []AllocSec) -> LinkSym | error {
+    let defined = raw.shndx != (0 to u32)
+    let sec = if defined { elf_alloc_pos_of(allocs, raw.shndx) } else { 0 to u32 }
+    let binding = elf_sym_binding_of(elf_sym_bind(raw.info))
+    let offset = match elf_u32_from_u64(raw.value) { u32 as x => x; error as e => return e }
+    let exported = defined && !elf_binding_is_local(binding)
+    LinkSym { name = raw.name; defined = defined; binding = binding; sec = sec; offset = offset; exported = exported }
+}
+
+/**
+ * elf_no_shdr — the zeroed placeholder `RawShdr` `elf_find_symtab` returns when no
+ * `.symtab` exists (never read — every accessor is gated behind `SymtabInfo.present`).
+ *
+ * @return the zero-valued `RawShdr`
+ */
+fn elf_no_shdr() -> RawShdr {
+    RawShdr { name_off = 0 to u32; sh_type = 0 to u32; sh_flags = 0 to u64; sh_offset = 0 to u64; sh_size = 0 to u64; sh_link = 0 to u32; sh_info = 0 to u32; sh_entsize = 0 to u64 }
+}
+
+/**
+ * SymtabInfo — the located `.symtab` section (or its absence — a valid object may
+ * carry no symbols): its header-table index, its parsed header, and whether one was
+ * found at all.
+ *
+ * @since #392 L1-2
+ */
+type SymtabInfo = struct {
+    /** idx — the `.symtab` section's header-table index (meaningless when
+     * `!present`). */
+    idx: u32
+    /** hdr — the `.symtab` section header (meaningless when `!present`). */
+    hdr: RawShdr
+    /** present — true iff some section carries `SHT_SYMTAB`. */
+    present: bool
+}
+
+/**
+ * elf_find_symtab — locate the object's `.symtab` (the first `SHT_SYMTAB` section).
+ * This crumb assumes a SINGLE symbol table, matching every corpus/own object and
+ * every musl `crt*.o`/`libc.a` member; a second `SHT_SYMTAB` is simply not searched
+ * for.
+ *
+ * @param named  every section header, resolved-named
+ * @return       the located `.symtab`, or `present = false` when none exists
+ */
+fn elf_find_symtab(named: []NamedShdr) -> SymtabInfo {
+    mut i: u64 = 0
+    loop {
+        if i >= named.len { break }
+        let h = named[i].hdr
+        if h.sh_type == (2 to u32) { return SymtabInfo { idx = named[i].idx; hdr = h; present = true } }
+        i++
+    }
+    SymtabInfo { idx = 0 to u32; hdr = elf_no_shdr(); present = false }
+}
+
+/**
+ * elf_symtab_strtab — resolve `.symtab`'s linked `.strtab` image via its `sh_link`, or
+ * an empty table when no `.symtab` exists.
+ *
+ * @param bytes  the object image
+ * @param named  every section header, resolved-named
+ * @param si     the located `.symtab`
+ * @return       the `.strtab` image (empty when `!si.present`)
+ * @throws       when `si.hdr.sh_link` names no section, or the `.strtab` range runs
+ *               past `bytes.len`
+ */
+fn elf_symtab_strtab(bytes: []byte, named: []NamedShdr, si: SymtabInfo) -> []byte | error {
+    if !si.present { return teko::list::empty() }
+    let link_idx = si.hdr.sh_link to u64
+    if link_idx >= named.len { return error { message = "link_elf: symtab sh_link out of range" } }
+    let strtab_hdr = named[link_idx].hdr
+    match elf_slice(bytes, strtab_hdr.sh_offset, strtab_hdr.sh_size) { []byte as b => b; error as e => return e }
+}
+
+/**
+ * SymParse — the result of walking `.symtab`: the neutral `LinkSym` list (skipping
+ * the reserved null entry and every `STT_SECTION` symbol) and the RAW per-index name
+ * table (every entry, unfiltered) relocations resolve their target symbol name
+ * against.
+ *
+ * @since #392 L1-2
+ */
+type SymParse = struct {
+    /** syms — the neutral symbol list (`LinkObject.symbols`). */
+    syms: []LinkSym
+    /** raw_names — every `.symtab` entry's name, at its ORIGINAL index (including the
+     * null entry and section symbols, both empty-named). */
+    raw_names: []str
+}
+
+/**
+ * elf_read_all_symbols — walk every `.symtab` entry: record its name at its raw index
+ * (for relocation lookups) always, but emit a `LinkSym` only for a real, nameable
+ * symbol — the reserved null entry (index 0) and any `STT_SECTION` symbol are
+ * structural, not `LinkObject.symbols` members (mirrors the own writer's collapsing:
+ * `objfile_elf.tks`'s `.rodata` section symbol represents every rodata-local
+ * reference, never a per-name entry).
+ *
+ * @param bytes   the object image
+ * @param si      the located `.symtab`
+ * @param strtab  the resolved `.strtab` image
+ * @param allocs  the `SHF_ALLOC` sections (for each symbol's `sec` resolution)
+ * @return        the neutral symbols plus the raw per-index name table
+ * @throws        when `.symtab`'s entry size/count is malformed, or any entry fails
+ *                to parse
+ */
+fn elf_read_all_symbols(bytes: []byte, si: SymtabInfo, strtab: []byte, allocs: []AllocSec) -> SymParse | error {
+    if !si.present { return SymParse { syms = teko::list::empty(); raw_names = teko::list::empty() } }
+    if si.hdr.sh_entsize != (24 to u64) { return error { message = "link_elf: unsupported symtab entry size" } }
+    if si.hdr.sh_size % (24 to u64) != (0 to u64) { return error { message = "link_elf: malformed symtab size" } }
+    let count = si.hdr.sh_size / (24 to u64)
+    mut syms: []LinkSym = teko::list::empty()
+    mut raw_names: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= count { break }
+        let off = si.hdr.sh_offset + i * (24 to u64)
+        let raw = match elf_read_sym_raw(bytes, strtab, off) { ElfSymRaw as x => x; error as e => return e }
+        raw_names = teko::list::push(raw_names, raw.name)
+        let skip = i == (0 to u64) || elf_sym_is_section_type(raw.info)
+        if !skip {
+            let ls = match elf_link_sym_of(raw, allocs) { LinkSym as x => x; error as e => return e }
+            syms = teko::list::push(syms, ls)
+        }
+        i++
+    }
+    SymParse { syms = syms; raw_names = raw_names }
+}
+
+/**
+ * ElfRelaRaw — one parsed `Elf64_Rela`: the patched field's section-relative
+ * `r_offset`, the target symbol-table index and numeric type unpacked from `r_info`,
+ * and the signed `r_addend`.
+ *
+ * @since #392 L1-2
+ */
+type ElfRelaRaw = struct {
+    /** r_offset — the patched field's section-relative byte offset. */
+    r_offset: u64
+    /** symidx — the target symbol-table index (`r_info`'s high 32 bits). */
+    symidx: u32
+    /** rtype — the numeric `R_<arch>_*` type (`r_info`'s low 32 bits). */
+    rtype: u32
+    /** addend — the signed `r_addend`. */
+    addend: i64
+}
+
+/**
+ * elf_read_rela_raw — parse one 24-byte `Elf64_Rela` at `off` (mirrors
+ * `emit_elf_relas`'s field order: offset, packed info, addend).
+ *
+ * @param bytes  the object image
+ * @param off    the relocation entry's byte offset
+ * @return       the parsed relocation
+ * @throws       when a field runs past `bytes.len`
+ */
+fn elf_read_rela_raw(bytes: []byte, off: u64) -> ElfRelaRaw | error {
+    let r_offset = match elf_read_u64(bytes, off) { u64 as x => x; error as e => return e }
+    let r_info = match elf_read_u64(bytes, off + 8) { u64 as x => x; error as e => return e }
+    let r_addend = match elf_read_i64(bytes, off + 16) { i64 as x => x; error as e => return e }
+    let symidx = (r_info >> (32 to u64)) to u32
+    let rtype = (r_info & (0xFFFFFFFF to u64)) to u32
+    ElfRelaRaw { r_offset = r_offset; symidx = symidx; rtype = rtype; addend = r_addend }
+}
+
+/**
+ * elf_read_one_rela_section — parse every entry of one `.rela.*` section into a
+ * `LinkReloc`, resolving the target section (`sh_info`) through `allocs` and the
+ * target symbol name through `raw_names`.
+ *
+ * @param bytes      the object image
+ * @param h          the `.rela.*` section header
+ * @param allocs     the `SHF_ALLOC` sections (for target-section resolution)
+ * @param raw_names  the raw per-index symbol name table (`SymParse.raw_names`)
+ * @return           the section's relocations, in table order
+ * @throws           when the entry size/count is malformed, `sh_info` names no
+ *                    tracked `SHF_ALLOC` section, a symbol index is out of range, or
+ *                    `r_offset` exceeds `u32::MAX`
+ */
+fn elf_read_one_rela_section(bytes: []byte, h: RawShdr, allocs: []AllocSec, raw_names: []str) -> []LinkReloc | error {
+    if h.sh_entsize != (24 to u64) { return error { message = "link_elf: unsupported rela entry size" } }
+    if h.sh_size % (24 to u64) != (0 to u64) { return error { message = "link_elf: malformed rela section size" } }
+    let target_sec = match elf_alloc_pos_or_error(allocs, h.sh_info) { u32 as x => x; error as e => return e }
+    let count = h.sh_size / (24 to u64)
+    mut out: []LinkReloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= count { break }
+        let off = h.sh_offset + i * (24 to u64)
+        let raw = match elf_read_rela_raw(bytes, off) { ElfRelaRaw as x => x; error as e => return e }
+        if (raw.symidx to u64) >= raw_names.len { return error { message = "link_elf: relocation symbol index out of range" } }
+        let field_off = match elf_u32_from_u64(raw.r_offset) { u32 as x => x; error as e => return e }
+        out = teko::list::push(out, LinkReloc { sec = target_sec; offset = field_off; sym = raw_names[raw.symidx to u64]; rtype = raw.rtype; addend = raw.addend })
+        i++
+    }
+    out
+}
+
+/**
+ * elf_append_relocs — append every element of `b` onto `a` (relocation-list
+ * concatenation across `.rela.*` sections; mirrors `teko::build::discover`'s
+ * `dsc_append`).
+ *
+ * @param a  the accumulated relocations so far
+ * @param b  the relocations to append
+ * @return   `a` followed by `b`, in order
+ */
+fn elf_append_relocs(a: []LinkReloc, b: []LinkReloc) -> []LinkReloc {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * elf_read_all_relocs — parse every `SHT_RELA` section into `LinkReloc`s. A
+ * `.rela.*` section requires a symbol table (`si.present`) and must link (`sh_link`)
+ * to THE located `.symtab` — a mismatch is a named honest-stop rather than a silent
+ * mis-resolution against the wrong table. `SHT_REL` (implicit-addend) sections are
+ * out of this crumb's scope (§2.3 lists only `.rela.*` for the corpus this parser
+ * covers today).
+ *
+ * @param bytes      the object image
+ * @param named      every section header, resolved-named
+ * @param allocs     the `SHF_ALLOC` sections (for target-section resolution)
+ * @param si         the located `.symtab`
+ * @param raw_names  the raw per-index symbol name table (`SymParse.raw_names`)
+ * @return           every relocation, in section-then-entry order
+ * @throws           when a `.rela.*` section exists with no symbol table, links to a
+ *                    symbol table other than `si`, or fails `elf_read_one_rela_section`
+ */
+fn elf_read_all_relocs(bytes: []byte, named: []NamedShdr, allocs: []AllocSec, si: SymtabInfo, raw_names: []str) -> []LinkReloc | error {
+    mut out: []LinkReloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= named.len { break }
+        let h = named[i].hdr
+        if h.sh_type != (4 to u32) { i++; continue }
+        if !si.present { return error { message = "link_elf: relocation section with no symbol table" } }
+        if h.sh_link != si.idx { return error { message = "link_elf: relocation section references an unexpected symbol table" } }
+        let more = match elf_read_one_rela_section(bytes, h, allocs, raw_names) { []LinkReloc as r => r; error as e => return e }
+        out = elf_append_relocs(out, more)
+        i++
+    }
+    out
+}
+
+/**
+ * parse_elf_object — parse a relocatable ELF64 object from raw bytes into the neutral
+ * model. Validates `e_ident`/`e_type == ET_REL`/`e_machine` first (`elf_parse_header`);
+ * lifts every `SHF_ALLOC` section, the symbol table (binding + section + value,
+ * skipping the null entry and any anonymous `STT_SECTION` symbol), and every
+ * `.rela.*` table. A malformed header, a non-`ET_REL` type, an unsupported machine/
+ * class, or a compressed/unsupported section is a NAMED error (owner req #2, M.3).
+ * Testable today over in-memory bytes (e.g. `emit_elf_object`'s output) — no disk
+ * read required to exercise it.
+ *
+ * @param bytes   the object file image
+ * @param origin  the source path (diagnostics)
+ * @return        the `LinkObject`, or a named parse error
+ */
+pub fn parse_elf_object(bytes: []byte, origin: str) -> LinkObject | error {
+    let hdr = match elf_parse_header(bytes) { ElfHeader as h => h; error as e => return e }
+    let shdrs = match elf_read_shdrs(bytes, hdr.shoff, hdr.shnum) { []RawShdr as s => s; error as e => return e }
+    if (hdr.shstrndx to u64) >= shdrs.len { return error { message = "link_elf: e_shstrndx out of range" } }
+    let shstrtab_hdr = shdrs[hdr.shstrndx to u64]
+    let shstrtab = match elf_slice(bytes, shstrtab_hdr.sh_offset, shstrtab_hdr.sh_size) { []byte as b => b; error as e => return e }
+    let named = match elf_name_shdrs(shdrs, shstrtab) { []NamedShdr as n => n; error as e => return e }
+    let allocs = match elf_alloc_sections(bytes, named) { []AllocSec as a => a; error as e => return e }
+    let si = elf_find_symtab(named)
+    let strtab = match elf_symtab_strtab(bytes, named, si) { []byte as b => b; error as e => return e }
+    let symparse = match elf_read_all_symbols(bytes, si, strtab, allocs) { SymParse as x => x; error as e => return e }
+    let relocs = match elf_read_all_relocs(bytes, named, allocs, si, symparse.raw_names) { []LinkReloc as r => r; error as e => return e }
+    LinkObject {
+        e_machine = hdr.machine
+        e_flags = hdr.e_flags
+        origin = origin
+        sections = elf_sections_of(allocs)
+        symbols = symparse.syms
+        relocs = relocs
+    }
+}
