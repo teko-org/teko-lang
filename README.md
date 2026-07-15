@@ -11,7 +11,7 @@
 
 <img src="docs/brand/mascot.svg" alt="The Teko mascot — a baby guará (scarlet ibis)" width="280"/>
 
-*Meet our mascot: a baby **guará** (scarlet ibis), a bird endemic to Brazil.*
+*Meet **Guri**, our mascot: a baby **guará** (scarlet ibis), a bird endemic to Brazil.*
 
 </div>
 
@@ -146,7 +146,7 @@ Contributions are welcome — but read **[CONTRIBUTING.md](CONTRIBUTING.md)** fi
 <img src="docs/brand/mascot-pastel.svg" width="140" alt="pastel edition"/>
 </p>
 
-The Teko mascot is a baby **guará** (*Eudocimus ruber*, the scarlet ibis) — one of Brazil's most striking endemic birds. All assets, palettes and usage rules are in the [brand guide](docs/brand/README.md).
+The Teko mascot is **Guri** — a baby **guará** (*Eudocimus ruber*, the scarlet ibis), one of Brazil's most striking endemic birds. *Guri* is southern-Brazilian Portuguese for "little kid", a warm nod to the fledgling and an echo of *gua*rá. All assets, palettes and usage rules are in the [brand guide](docs/brand/README.md).
 
 ## License
 

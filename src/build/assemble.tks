@@ -83,51 +83,113 @@ fn asm_parse(path: str, tokens: []lexer::Token) -> []parser::Item | error {
     }
 }
 
-// .tks mirror of assemble.c::tk_assemble — read → lex → parse → reconcile → MERGE every file's
-// items into ONE program (M.1 — the whole program is seen before it is resolved). A `.tkt` test
-// is NOT production source (it carries `#test` attributes the module grammar rejects) — skip it.
-// Every merged item is re-stamped with its SourceFile's namespace (codegen provenance) AND file
-// path (W-loc-2 — the checker's file:line:col diagnostics). Per-file lex/parse errors are
-// prefixed with the file path → "path:line:col: text".
-fn assemble(files: []SourceFile) -> parser::Program | error {
-    assemble_sel(files, false)
+/**
+ * How many of `files` are ELIGIBLE for lex/parse under `include_tests` — every file
+ * except a `.tkt` test excluded from a production build/run. `assemble_sel`'s
+ * `lexer`/`parser` observability phases use this as their known-upfront total (a
+ * skipped `.tkt` never enters either phase's count).
+ *
+ * @param files          the discovered project file set
+ * @param include_tests  true to count `.tkt` files too (the `teko test` path)
+ * @return               the number of files `assemble_sel` will actually lex/parse
+ */
+fn eligible_file_count(files: []SourceFile, include_tests: bool) -> u64 {
+    mut n: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        if include_tests || !teko::str::ends_with(files[i].path, ".tkt") { n = n + 1 }
+        i = i + 1
+    }
+    n
 }
 
-// assemble_sel — the assembly core with a `include_tests` selector. `false` (the production
-// build/run path) SKIPS every `.tkt` test file. `true` (the `teko test` path — D2) INCLUDES
-// them, so their `#test` functions enter the merged program for the VM runner. `.tkt` files
-// parse as ordinary modules (parse_module → parse_decl now consumes the `#test` attribute).
-fn assemble_sel(files: []SourceFile, include_tests: bool) -> parser::Program | error {
+/**
+ * The `.tks` mirror of `assemble.c::tk_assemble`, run SILENTLY (no build-observability
+ * output) — for callers that only want the merged program, not the `teko build`
+ * phase reporting.
+ *
+ * @param files  the discovered project file set
+ * @return       the merged program, or the first lex/parse error
+ */
+fn assemble(files: []SourceFile) -> parser::Program | error {
+    assemble_sel(files, false, false, false)
+}
+
+/**
+ * The assembly core: read -> lex -> parse -> reconcile -> MERGE every eligible
+ * file's items into ONE program (M.1 — the whole program is seen before it is
+ * resolved). A `.tkt` test is NOT production source (it carries `#test` attributes
+ * the module grammar rejects) unless `include_tests` says otherwise (the `teko
+ * test` path, D2). Every merged item is re-stamped with its SourceFile's namespace
+ * (codegen provenance) AND file path (W-loc-2 — the checker's file:line:col
+ * diagnostics). Per-file lex/parse errors are prefixed with the file path ->
+ * "path:line:col: text".
+ *
+ * Reports the `lexer`/`parser` BUILD-OUTPUT OBSERVABILITY phases when `report` is
+ * set, replacing the historical one-line-per-file wall: each phase ticks its own
+ * "N/M files" counter as files are processed and settles with the elapsed time — a
+ * lex failure settles `lexer` failed; a parse failure settles `parser` failed (the
+ * prior files having already lexed/parsed cleanly).
+ *
+ * @param files          the discovered project file set
+ * @param include_tests  `false` (production build/run) skips every `.tkt`; `true`
+ *                       (`teko test`) includes them so `#test` functions enter scope
+ * @param report         print the `lexer`/`parser` phase lines (`false` for an
+ *                       already-reported retry pass, or a silent caller)
+ * @param tty            render the phases' in-place `\r` updates (irrelevant when
+ *                       `report` is `false`)
+ * @return               the merged program, or the first lex/parse error
+ */
+fn assemble_sel(files: []SourceFile, include_tests: bool, report: bool, tty: bool) -> parser::Program | error {
     mut merged: []parser::Item = teko::list::empty()
+    let total = eligible_file_count(files, include_tests)
+    let visible = report && tty
+    let lex_phase = phase_begin("lexer", count_unit_text(0, total, "files"), visible)
+    let parse_phase = phase_begin("parser", count_unit_text(0, total, "files"), visible)
+    mut lexed: u64 = 0
+    mut parsed: u64 = 0
     mut i: u64 = 0
     loop {
         if i >= files.len { break }
         let sf = files[i]
         if teko::str::ends_with(sf.path, ".tkt") && !include_tests {
-            // a test file — excluded from a production build/run (included only by `teko test`).
-        } else {
-            let src = match teko::io::read_file(sf.path) { str as s => s; error as e => return e }
-            mut tokens = match lexer::tokenize(src) {
-                []lexer::Token as t => t
-                error as e => return error { message = teko::str::concat(sf.path, ":", e.message) }
-            }
-            let one = match asm_parse(sf.path, tokens) {
-                []parser::Item as items => items
-                error as e => return error { message = teko::str::concat(sf.path, ":", e.message) }
-            }
-            // (#148 R1) the token buffer dies with this file's parse — the AST holds SOURCE views,
-            // never token references — so free it for the NEXT file's tokenize to reuse (the
-            // free-list's ideal case: the same size class recurs file after file).
-            teko::mem::free(tokens)
-            // merge, stamping every item with this file's namespace + path (A3 provenance + W-loc-2).
-            mut k: u64 = 0
-            loop {
-                if k >= one.len { break }
-                merged = teko::list::push(merged, parser::Item { content = one[k].content; namespace = sf.namespace; file = sf.path })
-                k = k + 1
+            i = i + 1
+            continue
+        }
+        let src = match teko::io::read_file(sf.path) { str as s => s; error as e => return e }
+        mut tokens = match lexer::tokenize(src) {
+            []lexer::Token as t => t
+            error as e => {
+                let msg = teko::str::concat(sf.path, ":", e.message)
+                if report { phase_end_fail(lex_phase, count_unit_text(lexed, total, "files"), msg) }
+                return error { message = msg }
             }
         }
+        lexed = lexed + 1
+        phase_tick(lex_phase, count_unit_text(lexed, total, "files"))
+        let one = match asm_parse(sf.path, tokens) {
+            []parser::Item as items => items
+            error as e => {
+                let msg = teko::str::concat(sf.path, ":", e.message)
+                if report { phase_end_fail(parse_phase, count_unit_text(parsed, total, "files"), msg) }
+                return error { message = msg }
+            }
+        }
+        parsed = parsed + 1
+        phase_tick(parse_phase, count_unit_text(parsed, total, "files"))
+        teko::mem::free(tokens)
+        mut k: u64 = 0
+        loop {
+            if k >= one.len { break }
+            merged = teko::list::push(merged, parser::Item { content = one[k].content; namespace = sf.namespace; file = sf.path })
+            k = k + 1
+        }
         i = i + 1
+    }
+    if report {
+        phase_end_ok(lex_phase, count_unit_text(lexed, total, "files"))
+        phase_end_ok(parse_phase, count_unit_text(parsed, total, "files"))
     }
     parser::Program { items = merged }
 }

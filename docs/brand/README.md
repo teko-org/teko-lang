@@ -1,6 +1,6 @@
 # Teko brand guide
 
-The Teko mascot is a **baby guará** (*Eudocimus ruber*, the scarlet ibis), a bird endemic to Brazil. The canonical artwork is [`../teko.svg`](../teko.svg) (the vectorization of the original [`../teko.jpeg`](../teko.jpeg)); every asset here is derived from it, so the mascot is identical everywhere.
+The Teko mascot is **Guri** — a **baby guará** (*Eudocimus ruber*, the scarlet ibis), a bird endemic to Brazil. *Guri* is southern-Brazilian Portuguese for "little kid": a warm name for the fledgling and an echo of *gua*rá. The canonical artwork is [`../teko.svg`](../teko.svg) (the vectorization of the original [`../teko.jpeg`](../teko.jpeg)); every asset here is derived from it, so the mascot is identical everywhere.
 
 ## Assets
 

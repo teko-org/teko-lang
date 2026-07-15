@@ -154,6 +154,11 @@ tk_region *tk_region_root(void);                // the process root region (lazy
 // it allocated in between. Balanced push/pop; used by the test-gate runner to bound per-test memory.
 void       tk_arena_push(void);                 // save the root region's current bump position
 void       tk_arena_pop(void);                  // free every root-region chunk allocated since the matching push
+// (enabling primitive — staged off; no compiler source calls this yet) tk_arena_commit — discard
+// the top mark WITHOUT rewinding, so every allocation made since the matching tk_arena_push is
+// folded permanently into the (now-current) mark below it. The Boundary-A counterpart to
+// tk_arena_pop: a scope that turned out to ESCAPE commits its allocations instead of losing them.
+void       tk_arena_commit(void);               // discard the top mark, keeping its allocations
 // tk_region_register — bind `type_id` → `instance` in `r`'s OWN table (never an ancestor's; a
 // second registration of the same type_id in the same region OVERWRITES — the compiler is
 // expected to enforce true duplicate-registration errors at a higher DI layer; this is just the
@@ -270,6 +275,25 @@ uint64_t tk_str_hash(tk_str s);
 // (TR3) tk_str_cmp — lexicographic byte compare (unsigned): -1 (a < b) / 0 (equal) / 1 (a > b);
 // the shorter str is the lesser when one is a prefix of the other. No allocation.
 int64_t tk_str_cmp(tk_str a, tk_str b);
+// (enabling primitive — staged off; no compiler source calls this yet) a HEAP-BACKED (never
+// arena-backed) string intern table, keyed and valued by content (not by identity): a memoization
+// cache for codegen's repeated string-builders (e.g. a variant's C type name, rebuilt identically
+// at every use site today). Heap-only BY DESIGN — an arena-backed cache would dangle across the
+// coming Boundary-A rewind (tk_arena_pop / tk_arena_commit); a libc block never does.
+//
+// tk_intern_get — a FRESH, INDEPENDENT copy of the value cached for `key` (never a view into the
+// table's own entry — a view would dangle the instant a later tk_intern_put/tk_intern_reset
+// overwrites or frees that entry, breaking Teko's str value-semantics contract), or the empty str
+// ({NULL,0}) on a miss. Safe as a miss sentinel because every real cache value here (a
+// synthesized type name) is non-empty.
+tk_str tk_intern_get(tk_str key);
+// tk_intern_put — cache `value` under `key` (both copied into fresh heap blocks the table owns),
+// overwriting any prior entry for an equal key; returns `value` UNCHANGED so a call composes as
+// `tk_intern_put(key, computed)` inline. OOM panics (M.1).
+tk_str tk_intern_put(tk_str key, tk_str value);
+// tk_intern_reset — free every cached entry. The per-pass boundary: call before a fresh
+// compilation pass that must not observe a PRIOR pass's cached strings.
+void   tk_intern_reset(void);
 // tk_str_slice — the substring bytes [start, end) as a fresh owned str. An out-of-range slice
 // (start > end, or end > s.len) PANICS (M.1, parity with the VM's bounds check). The empty
 // slice (start == end) is a valid empty str (1-byte buffer so ptr is never NULL+stale len).
@@ -504,6 +528,17 @@ void *tk_slice_push_r(const void *ptr, uint64_t len, const void *elem, uint64_t 
 // (#148 S2 Level-2) free-old-on-grow variant — for a self-append whose chain the checker PROVED
 // linear: on a copy-grow the old buffer is PARKED on the free-list for reuse (realloc parity).
 void *tk_slice_push_fo(const void *ptr, uint64_t len, const void *elem, uint64_t esz, uint64_t *out_len);
+// (enabling primitive — staged off; no compiler source calls this yet) tk_slice_with_cap_r —
+// allocate a FRESH, len-0 buffer sized for `cap` elements of `esz` bytes in `region`, and register
+// it as that region's live push-cache tail — so the very FIRST tk_slice_push/tk_slice_push_fo
+// append onto the returned slice takes the O(1) in-place path instead of copy-growing from empty.
+// The lowering of a future `teko::list::with_cap(cap)` whose final length is known up-front (the
+// #148 R3b fix — a builder that pre-sizes never pays the 1->2->4->8… doubling ladder at all). A
+// `cap` of 0 still yields a distinct non-NULL pointer (mirrors tk_alloc's n->1 convention).
+void *tk_slice_with_cap_r(uint64_t esz, uint64_t cap, tk_region *region);
+// tk_slice_with_cap — the default root-region lowering (unchanged contract), mirroring
+// tk_slice_push over tk_slice_push_r.
+void *tk_slice_with_cap(uint64_t esz, uint64_t cap);
 // (#148 R2) bulk byte-append with free-old-on-grow BY DECREE (the linear cb emitter chain) — one
 // memcpy per fragment; the old buffer parks for reuse the moment a grow replaces it.
 void *tk_append_bytes_fo(const void *ptr, uint64_t len, const void *src, uint64_t n, uint64_t *out_len);
