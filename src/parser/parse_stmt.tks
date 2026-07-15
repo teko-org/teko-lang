@@ -49,6 +49,9 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | erro
     if is_kind_at(tokens, pos, lexer::TokenKind::Let) || is_kind_at(tokens, pos, lexer::TokenKind::Mut) || is_kind_at(tokens, pos, lexer::TokenKind::Const) {
         return parse_binding(tokens, pos)
     }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Underscore) && is_kind_at(tokens, pos + 1, lexer::TokenKind::Assign) {
+        return parse_discard_assign(tokens, pos)
+    }
     if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && is_assign_op(tokens, pos + 1) {
         return parse_assign(tokens, pos)
     }
@@ -177,13 +180,30 @@ fn parse_bind_target(tokens: []lexer::Token, pos: u64) -> Parsed<BindTarget> | e
         let names = match parse_field_names(tokens, pos) { ParsedList<str> as x => x; error as e => return e }
         return Parsed<BindTarget> { node = DestructurePattern { names = names.items }; next = names.next }
     }
-    // `let _ = expr` — DISCARD binding: evaluate the value for effect, bind nothing. A SIMPLE
-    // target named "_" (the wildcard); codegen lowers it to `(void)(expr);` (no C variable, so
-    // repeated `let _` never collides), and it is never read. (B.21 — explicit ignore.)
-    if !is_name_at(tokens, pos) && !is_kind_at(tokens, pos, lexer::TokenKind::Underscore) {
-        return err_at(tokens, pos, "expected a name, `_`, or `{ … }` after `let`/`mut`/`const`")
+    if is_kind_at(tokens, pos, lexer::TokenKind::Underscore) {
+        return err_at(tokens, pos, "`_` is the write-only discard and cannot be a `let`/`mut`/`const` target — drop the keyword and write `_ = expr` to evaluate an expression and discard its result")
+    }
+    if !is_name_at(tokens, pos) {
+        return err_at(tokens, pos, "expected a name or `{ … }` after `let`/`mut`/`const`")
     }
     Parsed<BindTarget> { node = SimpleName { name = tokens[pos].text }; next = pos + 1 }
+}
+
+/**
+ * parse_discard_assign — parse the write-only discard-assign statement `_ = expr` (owner ruling
+ * 2026-07-15): evaluate `expr` for its side effect and drop the result, binding nothing. The node
+ * reuses the SimpleName "_" binding, which codegen lowers to `(void)(expr);`. Only a plain `=`
+ * reaches here (the caller checks for it); a compound `_ += …` never matches, since the discard
+ * carries no value to read-modify-write.
+ *
+ * @param tokens  the token stream
+ * @param pos     the index of the leading `_` (Underscore) token
+ * @return        the parsed discard Binding and the index past the value, or a parse error
+ * @throws        when the discarded expression fails to parse
+ */
+fn parse_discard_assign(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
+    let dv = match parse_expr(tokens, pos + 2) { Parsed<Expr> as x => x; error as e => return e }
+    Parsed<Statement> { node = Binding { kind = BindKind::Let; target = SimpleName { name = "_" }; has_type = false; type_ann = no_type(); value = dv.node }; next = dv.next }
 }
 
 // `name op= value` (B.4 — assignment is statement-only). Simple-name target; the op
