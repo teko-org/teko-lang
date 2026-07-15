@@ -2662,6 +2662,7 @@ fn check_must_free_params(f: parser::Function, tbl: TypeTable, ns: str, body: []
     mut i = 0
     loop {
         if i >= f.params.len { break }
+        if !f.params[i].has_type && f.params[i].name == "_" { i++; continue }
         let pt = match resolve_type(f.params[i].type_ann, tbl, ns) { Type as t => t; error as e => return e }
         match pt {
             Named as nm => {
@@ -3715,6 +3716,161 @@ fn teko_rt_type_ok(t: Type) -> bool {
 }
 
 /**
+ * params_have_discard — does any parameter in `ps` denote the write-only DISCARD `_` (owner
+ * refinement 2026-07-15)? A discard parameter has no type and the reserved name "_" — a name the
+ * lexer can never mint for a real identifier, so the test is unambiguous.
+ *
+ * @param ps  the parameter list
+ * @return    true iff at least one parameter is a `_` discard
+ */
+fn params_have_discard(ps: []parser::Param) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= ps.len { break }
+        if !ps[i].has_type && ps[i].name == "_" { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * method_named — the first method in `ms` whose name equals `name`, or null when none matches. Used
+ * to locate the base/interface method that GOVERNS a `_` discard parameter's type by position.
+ *
+ * @param ms    the method list to scan
+ * @param name  the method name to find
+ * @return      the matching method, or null
+ */
+fn method_named(ms: []parser::Function, name: str) -> parser::Function? {
+    mut i: u64 = 0
+    loop {
+        if i >= ms.len { break }
+        if ms[i].name == name { return ms[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * type_implements_list — the interface `implements` list of the type named `name` (a class or a
+ * struct), or an empty list when the type is neither, is unknown, or lists no interfaces.
+ *
+ * @param name    the enclosing type name
+ * @param ref_ns  the referencing namespace for the type-table lookup
+ * @param table   the folded type table
+ * @return        the type's `implements` names, or an empty list
+ */
+fn type_implements_list(name: str, ref_ns: str, table: TypeTable) -> []str {
+    match type_table_find(table, name, ref_ns) {
+        parser::TypeDecl as td => match td.body {
+            parser::ClassBody as cb => cb.implements
+            parser::StructBody as sb => sb.implements
+            _ => teko::list::empty()
+        }
+        error => teko::list::empty()
+    }
+}
+
+/**
+ * find_interface_method — the interface-required method named `name` provided by any interface in
+ * `impls`, or null when none provides it. Mirrors check_one_interface's resolution (find_interface_decl
+ * then effective_interface_methods), so the governing signature seen here is exactly the one the
+ * conformance check validated.
+ *
+ * @param impls   the type's `implements` interface names
+ * @param name    the method name to find
+ * @param table   the folded type table
+ * @param ref_ns  the conforming type's namespace (interface lookups resolve here)
+ * @return        the matching interface method, or null
+ */
+fn find_interface_method(impls: []str, name: str, table: TypeTable, ref_ns: str) -> parser::Function? {
+    mut i: u64 = 0
+    loop {
+        if i >= impls.len { break }
+        match find_interface_decl(impls[i], table, ref_ns) {
+            IfaceHit as h => match h.decl.body {
+                parser::InterfaceBody as ib => match effective_interface_methods(ib, h.ns, table, teko::list::push(teko::list::empty(), qualify(h.ns, name_last_segment(h.decl.name)))) {
+                    []parser::Function as ms => match method_named(ms, name) { parser::Function as m => return m; null => { } }
+                    error => { }
+                }
+                _ => { }
+            }
+            error => { }
+        }
+        i++
+    }
+    null
+}
+
+/**
+ * discard_governing_sig — the base/interface method whose signature dictates the TYPES of a `_`
+ * discard parameter in method `f` of type `struct_name` (owner refinement 2026-07-15): the base
+ * class's same-named method (when `f` overrides) or a same-named method of an interface the type
+ * implements. Null when `f` neither overrides nor implements a same-named method — the caller then
+ * rejects the discard parameter as illegal in a self-owned signature.
+ *
+ * @param f            the method being typed
+ * @param struct_name  the enclosing type name (bare or canonical)
+ * @param ref_ns       the enclosing type's namespace
+ * @param table        the folded type table
+ * @return             the governing base/interface method, or null when none matches
+ */
+fn discard_governing_sig(f: parser::Function, struct_name: str, ref_ns: str, table: TypeTable) -> parser::Function? {
+    match type_table_find(table, struct_name, ref_ns) {
+        parser::TypeDecl as td => match td.body {
+            parser::ClassBody as cb => {
+                if cb.has_base {
+                    match find_class_body(cb.base_name, table) {
+                        parser::ClassBody as bcb => match effective_class_methods(bcb, table) {
+                            []parser::Function as ms => match method_named(ms, f.name) { parser::Function as m => return m; null => { } }
+                            error => { }
+                        }
+                        error => { }
+                    }
+                }
+            }
+            _ => { }
+        }
+        error => { }
+    }
+    find_interface_method(type_implements_list(struct_name, ref_ns, table), f.name, table, ref_ns)
+}
+
+/**
+ * discard_param_name — the synthesized C-visible name for the `_` discard parameter at position
+ * `idx`: unique per position so multiple `_` params never collide in the emitted C signature, while
+ * the body can never name it (a discard read is a compile error).
+ *
+ * @param idx  the parameter's positional index
+ * @return     a per-position throwaway parameter name
+ */
+fn discard_param_name(idx: u64) -> str { $"_tk_discard_{idx}" }
+
+/**
+ * discard_param_type — the resolved type of the `_` discard parameter at position `idx`, taken BY
+ * POSITION from the governing base/interface signature `gov`. A null `gov` is the GATE: a `_`
+ * discard parameter is only legal in an implementing/overriding signature.
+ *
+ * @param gov     the governing base/interface method, or null
+ * @param idx     the discard parameter's positional index
+ * @param table   the folded type table
+ * @param ref_ns  the conforming type's namespace (the governing param type resolves here, matching
+ *                the conformance check's own resolution namespace)
+ * @return        the resolved discard-parameter type
+ * @throws        when `gov` is null (a discard param in a self-owned signature), when `idx` has no
+ *                matching governing slot, or when the governing param type fails to resolve
+ */
+fn discard_param_type(gov: parser::Function?, idx: u64, table: TypeTable, ref_ns: str) -> Type | error {
+    match gov {
+        parser::Function as g => {
+            if idx >= g.params.len { return error { message = "a `_` discard parameter has no matching slot in the implemented/overridden signature" } }
+            resolve_type(g.params[idx].type_ann, table, ref_ns)
+        }
+        null => error { message = "a `_` discard parameter is only allowed when implementing an interface method or overriding a base method — a plain function must name its parameters" }
+    }
+}
+
+/**
  * (OOP A1, 2026-07-01) Type-check a struct/class METHOD's BODY. Mirrors type_function, except the
  * RECEIVER param (`has_type=false`, only ever index 0) binds to `Named{struct_name}` instead of going
  * through resolve_type (its type is implicit, never written by the user). (#254) The method's
@@ -3755,10 +3911,17 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     // parsing) must be REWRITTEN to a real Named(struct_name) TypeExpr before it ever reaches
     // codegen, or emit_function_sig recurses on an empty path (M.1 crash). Every other param's
     // type_ann is already meaningful from parsing and passes through unchanged.
+    let discard_gov: parser::Function? = if params_have_discard(f.params) { discard_governing_sig(f, struct_name, env.cur_ns, table) } else { null }
     mut fixed_params: []parser::Param = teko::list::empty()
-    mut i = 0
+    mut i: u64 = 0
     loop {
         if i >= f.params.len { break }
+        if !f.params[i].has_type && f.params[i].name == "_" {
+            let dpt = match discard_param_type(discard_gov, i, tbl, env.cur_ns) { Type as t => t; error as e => return e }
+            fixed_params = teko::list::push(fixed_params, parser::Param { name = discard_param_name(i); has_type = true; type_ann = type_to_texpr(dpt); is_params = false; has_default = false; default_expr = parser::no_expr() })
+            i++
+            continue
+        }
         let pt = if !f.params[i].has_type {
             Named { name = qualify(env.cur_ns, struct_name) }   // (#109 W3) canonical: the method's own ns qualifies its receiver type
         } else {
@@ -4114,6 +4277,9 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     mut i = 0
     loop {
         if i >= f.params.len { break }
+        if !f.params[i].has_type && f.params[i].name == "_" {
+            return error { message = "a `_` discard parameter is only allowed when implementing an interface method or overriding a base method — a plain function must name its parameters" }
+        }
         let pt = match resolve_type(f.params[i].type_ann, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
         if f.is_extern {
             if is_teko_rt {
