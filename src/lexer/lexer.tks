@@ -258,19 +258,36 @@ fn read_ident(source: str, pos: u64) -> Scan {
     Scan { token = Token { kind = TokenKind::Ident; text = slice(source, pos, p); line = 0; col = 0 }; next = p }
 }
 
-// a run of `_` then a letter/digit is ONE identifier (`_foo`, `__bar`); a `_` not so
-// followed is the wildcard token (emitted one at a time — the parser rejects a run).
-fn read_underscore(source: str, pos: u64) -> Scan {
+/**
+ * read_underscore — lex a token that starts with `_`, enforcing the write-only discard rules
+ * (owner ruling 2026-07-15). A run of underscores immediately followed by a LETTER is an
+ * ordinary identifier (`_foo`, `__bar`, `_x_1`), read whole from the first underscore. A PURE
+ * run of underscores is the discard: a single `_` is the `Underscore` token; two or more in a
+ * row (`__`, `___`) are rejected outright. A run of underscores followed by a DIGIT carries no
+ * letter, so it matches neither the identifier grammar `[_]*[a-zA-Z]+[a-zA-Z0-9_]*` nor the
+ * lone discard, and is likewise rejected.
+ *
+ * @param source  the whole source text
+ * @param pos     the byte offset of the leading `_`
+ * @return        the `Scan` for the identifier, or the single `Underscore` token
+ * @throws        when the run is two-or-more pure underscores (`__`), or an underscore run is
+ *                immediately followed by a digit (a letterless, non-identifier token)
+ */
+fn read_underscore(source: str, pos: u64) -> Scan | error {
     mut p = pos
     loop {
         if p >= source.len { break }
         if source[p] != b'_' { break }
         p++
     }
-    if p < source.len {
-        if is_alpha(source[p]) || is_digit(source[p]) {
-            return read_ident(source, pos)   // reads from the first `_`
-        }
+    if p < source.len && is_alpha(source[p]) {
+        return read_ident(source, pos)
+    }
+    if p < source.len && is_digit(source[p]) {
+        return scan_err_at(source, pos, "`_` is the write-only discard; an identifier cannot begin with an underscore run followed by a digit")
+    }
+    if p - pos >= 2 {
+        return scan_err_at(source, pos, "`_` is the write-only discard; two or more underscores in a row (`__`) are not a valid token")
     }
     sym(source, pos, 1, TokenKind::Underscore)
 }
