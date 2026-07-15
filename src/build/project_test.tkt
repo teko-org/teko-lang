@@ -298,3 +298,34 @@ fn project_arg_of_skips_backend_flag() {
     teko::assert::is_true(project_arg_of(args_of("--backend=native", "proj", ""), 0) == "proj")
     teko::assert::is_true(project_arg_of(args_of("--backend", "native", "proj"), 0) == "proj")
 }
+
+#test
+/**
+ * backend_of_incomplete_or_unknown_flag_falls_through — a `--backend` with no following value (it
+ * was the last token) or an UNKNOWN value neither matches nor consumes a selection, so resolution
+ * falls through to the default `Backend::C` (no `TEKO_BACKEND` in the test env). Covers the
+ * short-circuit false side of `i + 1 < args.len` and the unknown-value inner branches. D1/#390.
+ *
+ * @return void
+ */
+fn backend_of_incomplete_or_unknown_flag_falls_through() {
+    teko::assert::is_true(backend_of(args_of("--backend", "", ""), 0) == Backend::C)
+    teko::assert::is_true(backend_of(args_of("--backend", "wat", ""), 0) == Backend::C)
+}
+
+#test
+/**
+ * backend_of_env_fallback_when_flag_absent — with NO `--backend` flag, resolution defers to the
+ * `TEKO_BACKEND` env: `native` selects the own backend. A present flag still WINS over the env.
+ * Resets `TEKO_BACKEND` to empty at the end so later tests see the default (the single-process test
+ * runner shares env). Covers the `native_backend_selected()` true branch of `backend_of`. D1/#390.
+ *
+ * @return void
+ */
+fn backend_of_env_fallback_when_flag_absent() {
+    match teko::env::set_var("TEKO_BACKEND", "native") { error => teko::assert::is_true(false); null => { } }
+    teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::Native)
+    teko::assert::is_true(backend_of(args_of("--backend=c", "", ""), 0) == Backend::C)
+    match teko::env::set_var("TEKO_BACKEND", "") { error => { }; null => { } }
+    teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::C)
+}
