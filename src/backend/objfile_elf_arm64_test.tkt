@@ -1,0 +1,202 @@
+use teko::lir
+
+/**
+ * ael_p — a physical GPR operand with the given AArch64 ISA id (the arm64
+ * ELF-writer fixture shorthand; A4 runs post-regalloc, so every operand is
+ * physical). Prefixed `ael_` to avoid the shared `teko::backend` namespace's
+ * x86/riscv encoder test-helper names.
+ *
+ * @param u32 id  the AArch64 register number (x0..x30)
+ * @return MReg  the physical GPR operand
+ */
+fn ael_p(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * ael_u32_at — the little-endian u32 read from `bytes` at byte index `i` (the
+ * golden-object field reader).
+ *
+ * @param []byte bytes  the object bytes
+ * @param u64 i  the field's byte offset
+ * @return u32  the little-endian u32 at `i`
+ */
+fn ael_u32_at(bytes: []byte, i: u64) -> u32 {
+    (bytes[i] to u32) | ((bytes[i + (1 to u64)] to u32) << (8 to u32)) | ((bytes[i + (2 to u64)] to u32) << (16 to u32)) | ((bytes[i + (3 to u64)] to u32) << (24 to u32))
+}
+
+/**
+ * ael_u16_at — the little-endian u16 read from `bytes` at byte index `i` (the
+ * `Elf64_Ehdr`/`Elf64_Sym` 16-bit-field reader).
+ *
+ * @param []byte bytes  the object bytes
+ * @param u64 i  the field's byte offset
+ * @return u32  the little-endian u16 at `i`
+ */
+fn ael_u16_at(bytes: []byte, i: u64) -> u32 {
+    (bytes[i] to u32) | ((bytes[i + (1 to u64)] to u32) << (8 to u32))
+}
+
+/**
+ * ael_exit_module — the keystone arm64 `exit`-shape: a single frameless
+ * `main` of `movz x0,#0 ; bl tk_exit` (no `ret`), no rodata — the smallest
+ * module carrying a text image, a defined global function, an undefined
+ * extern, and one `Call` (`R_AARCH64_CALL26`) relocation (the exit-corpus
+ * call path).
+ *
+ * @return MModule  the one-function module
+ */
+fn ael_exit_module() -> MModule {
+    let f0 = append_minst(new_mfunc("main"), 0 to u32, movz_inst(true, ael_p(0 to u32), 0 to u32, 0 to u32))
+    let f1 = append_minst(f0, 0 to u32, call_inst("tk_exit", teko::list::empty(), ael_p(0 to u32), false, false))
+    add_mfunc(empty_mmodule(), f1)
+}
+
+/**
+ * ael_rodata_of — a one-entry rodata table with the given symbol and bytes,
+ * the `.rodata` fixture shorthand.
+ *
+ * @param str sym  the rodata symbol
+ * @param []byte bs  the rodata bytes
+ * @return []lir::LRodata  the one-entry rodata table
+ */
+fn ael_rodata_of(sym: str, bs: []byte) -> []lir::LRodata {
+    teko::list::push(teko::list::empty(), lir::LRodata { symbol = sym; bytes = bs })
+}
+
+/**
+ * ael_pcrel_module — a frameless `loadaddr` of `adrp x0, mydata ; add x0,
+ * x0, :lo12:mydata ; ret`: the ADRP/ADD-lo page-address pair whose PAGE21/
+ * PAGEOFF12 relocations target a defined `.rodata` datum — exercising the
+ * shared writer's `.rodata` `STT_SECTION`-symbol fold (the rodata-hit path
+ * every ISA adapter shares).
+ *
+ * @return MModule  the one-function address-materialization module
+ */
+fn ael_pcrel_module() -> MModule {
+    let f0 = append_minst(new_mfunc("loadaddr"), 0 to u32, adrp_inst(ael_p(0 to u32), "mydata", MRelocKind::PageHi))
+    let f1 = append_minst(f0, 0 to u32, add_lo_inst(ael_p(0 to u32), ael_p(0 to u32), "mydata", MRelocKind::PageLo))
+    let f2 = append_minst(f1, 0 to u32, ret_inst())
+    let rodata = ael_rodata_of("mydata", [0x68 to byte, 0x69 to byte])
+    let funcs = teko::list::push(teko::list::empty(), f2)
+    MModule { funcs = funcs; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+/**
+ * ael_object_of — encode `m` under `aapcs64()` and assemble its arm64 ELF
+ * object via `emit_elf_arm64`, or an empty buffer on an unexpected
+ * honest-stop (so a golden length/byte assertion fails loudly rather than
+ * aborting the run).
+ *
+ * @param MModule m  the module to encode + emit
+ * @return []byte  the arm64 ELF object bytes, or empty on error
+ */
+fn ael_object_of(m: MModule) -> []byte {
+    match encode_module(aapcs64(), m) {
+        EncodedModule as x => emit_elf_arm64(x)
+        error as e => teko::list::empty()
+    }
+}
+
+#test
+/**
+ * ael_header_is_aarch64_elf_rel — the `Elf64_Ehdr` of the `exit` object: the
+ * `\x7fELF` magic, ELFCLASS64 / ELFDATA2LSB / EV_CURRENT `e_ident`,
+ * `e_type = ET_REL`(1), `e_machine = EM_AARCH64`(183), `e_flags = 0` (AArch64
+ * carries no ABI flag byte the way RV64 LP64D does), `e_shoff = 240`,
+ * `e_ehsize = 64`, `e_shentsize = 64`, `e_shnum = 7`, `e_shstrndx = 5`. The
+ * whole object is 688 bytes.
+ *
+ * @return void
+ */
+fn ael_header_is_aarch64_elf_rel() {
+    let obj = ael_object_of(ael_exit_module())
+    teko::assert::is_true(obj.len == (688 to u64))
+    teko::assert::is_true(obj[0] == (0x7F to byte))
+    teko::assert::is_true(obj[1] == (0x45 to byte))
+    teko::assert::is_true(obj[2] == (0x4C to byte))
+    teko::assert::is_true(obj[3] == (0x46 to byte))
+    teko::assert::is_true(obj[4] == (2 to byte))
+    teko::assert::is_true(obj[5] == (1 to byte))
+    teko::assert::is_true(obj[6] == (1 to byte))
+    teko::assert::is_true(ael_u16_at(obj, 16 to u64) == (1 to u32))
+    teko::assert::is_true(ael_u16_at(obj, 18 to u64) == (183 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 40 to u64) == (240 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 48 to u64) == (0 to u32))
+    teko::assert::is_true(ael_u16_at(obj, 52 to u64) == (64 to u32))
+    teko::assert::is_true(ael_u16_at(obj, 58 to u64) == (64 to u32))
+    teko::assert::is_true(ael_u16_at(obj, 60 to u64) == (7 to u32))
+    teko::assert::is_true(ael_u16_at(obj, 62 to u64) == (5 to u32))
+}
+
+#test
+/**
+ * ael_text_symtab_and_call_reloc — the `exit` object's `.text` image is the
+ * 8-byte `movz x0,#0`(0xD2800000) + `bl tk_exit`(0x94000000 placeholder) at
+ * file offset 64; the `.symtab` (at 72) holds the reserved null symbol, then
+ * `main` as `GLOBAL|FUNC` (`st_info = 0x12`, `st_shndx = 1`, section-relative
+ * `st_value = 0`), then `tk_exit` as `GLOBAL|NOTYPE` (`0x10`, `st_shndx = 0`);
+ * the single `.rela.text` entry (at 216) is `R_AARCH64_CALL26`(283) against
+ * symbol index 2 (`tk_exit`) at `r_offset = 4` with addend 0 (the arm64
+ * `Reloc` carries no label, so the base addend is always 0).
+ *
+ * @return void
+ */
+fn ael_text_symtab_and_call_reloc() {
+    let obj = ael_object_of(ael_exit_module())
+    teko::assert::is_true(ael_u32_at(obj, 64 to u64) == (0xD2800000 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 68 to u64) == (0x94000000 to u32))
+    teko::assert::is_true(obj[100] == (0x12 to byte))
+    teko::assert::is_true(ael_u16_at(obj, 102 to u64) == (1 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 104 to u64) == (0 to u32))
+    teko::assert::is_true(obj[124] == (0x10 to byte))
+    teko::assert::is_true(ael_u16_at(obj, 126 to u64) == (0 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 216 to u64) == (4 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 224 to u64) == (283 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 228 to u64) == (2 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 232 to u64) == (0 to u32))
+}
+
+#test
+/**
+ * ael_symtab_first_global_is_one — the `exit` object's `.symtab` section
+ * header (`e_shoff = 240`, header index 3 at 240 + 3*64 = 432, `sh_info` at
+ * +44 = 476) pins `.symtab.sh_info = 1` (first-global): the reserved null
+ * symbol is the sole local, so the global `main` is at index 1. An
+ * off-by-one here makes `ld` reject the object.
+ *
+ * @return void
+ */
+fn ael_symtab_first_global_is_one() {
+    let obj = ael_object_of(ael_exit_module())
+    teko::assert::is_true(ael_u32_at(obj, 476 to u64) == (1 to u32))
+}
+
+#test
+/**
+ * ael_pcrel_pair_rodata_relocs — the `loadaddr` object's PAGE21/PAGEOFF12
+ * pair both target the SAME defined `.rodata` datum (`mydata`), so the
+ * shared writer re-points BOTH at the `.rodata` `STT_SECTION` symbol (index 1
+ * — null=0, rodata-section=1, `loadaddr`=2, no undefined symbol survives):
+ * the PAGE21 (`R_AARCH64_ADR_PREL_PG_HI21`(275), at 224) at `r_offset = 0`,
+ * the PAGEOFF12 (`R_AARCH64_ADD_ABS_LO12_NC`(277), at 248) at `r_offset = 4`,
+ * both addend 0 (the rodata datum sits at `.rodata` offset 0). The
+ * `.symtab.sh_info` (first-global, `e_shoff = 272`, header index 3 at
+ * 272 + 3*64 = 464, `sh_info` at +44 = 508) is 2, so the one local
+ * `.rodata`-section symbol sorts ahead of the sole global `loadaddr`.
+ *
+ * @return void
+ */
+fn ael_pcrel_pair_rodata_relocs() {
+    let obj = ael_object_of(ael_pcrel_module())
+    teko::assert::is_true(obj.len == (720 to u64))
+    teko::assert::is_true(ael_u32_at(obj, 508 to u64) == (2 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 224 to u64) == (0 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 232 to u64) == (275 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 236 to u64) == (1 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 240 to u64) == (0 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 248 to u64) == (4 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 256 to u64) == (277 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 260 to u64) == (1 to u32))
+    teko::assert::is_true(ael_u32_at(obj, 264 to u64) == (0 to u32))
+}
