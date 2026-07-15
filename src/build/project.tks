@@ -470,20 +470,22 @@ fn teko_cc_env() -> str {
 /**
  * default_cc_for_target — the cross-compiler that links the own object for a
  * non-host `NativeTarget` when neither the manifest `cc` nor the `TEKO_CC` seam
- * pins one (#387 B2-8, D-D): `riscv64-linux-gnu-gcc` for `Riscv64Linux` (it
- * compiles the C `teko_rt`/`assert` runtime FOR riscv and links it with the own
- * riscv `.o` into a qemu-runnable executable) and `x86_64-w64-mingw32-gcc` for
- * `X8664Windows` (the MinGW cross-cc that links the own PE/COFF `.o` into a
- * Windows executable). The `Arm64Macho` and `X8664Linux` arms return the host
- * `"cc"` — the default build's link line is byte-unchanged, because an unset
- * `TEKO_TARGET` resolves to `Arm64Macho` → `"cc"` exactly as the pre-B2 `else`
- * branch did. `Wasm32Wasi`/`Wasm64Wasi`/`Wasm32Browser` also return the host
- * `"cc"`, but NEVER actually reach a `cc` invocation: `emit_native`'s own
- * dispatch routes a wasm target straight to `emit_native_wasm`, which writes
- * the finished, self-contained `.wasm` module directly (`backend-wasm.md`
- * §1.2 — no C compilation, no separate link step) — these arms exist only so
- * the match stays exhaustive over the whole `NativeTarget` enum. D1/#390's
- * real `--target` supersedes this env-derived default.
+ * pins one (#387 B2-8, D-D; `Arm64Linux` at #392 E1 L1-0): `riscv64-linux-gnu-gcc`
+ * for `Riscv64Linux` (it compiles the C `teko_rt`/`assert` runtime FOR riscv and
+ * links it with the own riscv `.o` into a qemu-runnable executable),
+ * `aarch64-linux-gnu-gcc` for `Arm64Linux` (the SAME shape, for the arm64-linux
+ * ELF `.o`), and `x86_64-w64-mingw32-gcc` for `X8664Windows` (the MinGW cross-cc
+ * that links the own PE/COFF `.o` into a Windows executable). The `Arm64Macho`
+ * and `X8664Linux` arms return the host `"cc"` — the default build's link line
+ * is byte-unchanged, because an unset `TEKO_TARGET` resolves to `Arm64Macho` →
+ * `"cc"` exactly as the pre-B2 `else` branch did. `Wasm32Wasi`/`Wasm64Wasi`/
+ * `Wasm32Browser` also return the host `"cc"`, but NEVER actually reach a `cc`
+ * invocation: `emit_native`'s own dispatch routes a wasm target straight to
+ * `emit_native_wasm`, which writes the finished, self-contained `.wasm` module
+ * directly (`backend-wasm.md` §1.2 — no C compilation, no separate link step) —
+ * these arms exist only so the match stays exhaustive over the whole
+ * `NativeTarget` enum. D1/#390's real `--target` supersedes this env-derived
+ * default.
  *
  * @param t  the resolved own-backend target
  * @return   the compiler command for `t`
@@ -491,6 +493,7 @@ fn teko_cc_env() -> str {
 fn default_cc_for_target(t: NativeTarget) -> str {
     match t {
         NativeTarget::Riscv64Linux => "riscv64-linux-gnu-gcc"
+        NativeTarget::Arm64Linux => "aarch64-linux-gnu-gcc"
         NativeTarget::X8664Windows => "x86_64-w64-mingw32-gcc"
         NativeTarget::X8664Linux => "cc"
         NativeTarget::Arm64Macho => "cc"
@@ -916,40 +919,46 @@ fn backend_of(args: []str, start: u64) -> Backend {
 /**
  * NativeTarget — which own-AOT-backend target the temporary `TEKO_TARGET` env
  * seam selects (D-D, #386 B1-8; #387 B2-8; #388 B3-4; the wasm variants at
- * #389 C1-5/C1-7): the default `Arm64Macho` (the A4 reference — arm64 machine
- * code in a Mach-O object), `X8664Linux` (x86-64 SysV machine code in an ELF
- * object), `Riscv64Linux` (RISC-V RV64GC/LP64D machine code in an ELF
- * object), `X8664Windows` (x86-64 Win64 machine code — the SAME x86 ISA as
- * `X8664Linux`, differing only in the ABI register file and PE/COFF object
- * format), `Wasm32Wasi` (a WASI command module — the `exit(n)`/arithmetic/
- * control-flow corpus this slice targets, `backend-c1-wasm.md` §8),
- * `Wasm64Wasi` (the SAME WASI command module shape, but `memory64` + a
- * uniform `i64` `Ptr` — the wasm64 switch, §6, C1-7 — scoped to the alloca-
- * free/rodata-free/`Ptr`-signature-free subset today, `wasm_scope_stop_
- * wasm64`), or `Wasm32Browser` (the SAME emitted module, a JS-import runtime
- * binding instead of WASI — its full wiring is a later slice; reaching it
- * here is a NAMED stop for now, §9). Targets are named by OS, not by object
- * format (ruling #390): the format (ELF/Mach-O/COFF) is a consequence of the
- * OS, so `x86_64-linux`, `riscv64-linux`, and `x86_64-windows` — not
- * `x86_64-elf`/`riscv64-elf`/`x86_64-coff`/`x86_64-win`/`x86_64-pe` — are
- * canonical. The seam mirrors `TEKO_BACKEND` and is read only when the own
- * backend is already active; D1/#390 supersedes it with the real `--target`
- * manifest flag.
+ * #389 C1-5/C1-7; `Arm64Linux` at #392 E1 L1-0): the default `Arm64Macho` (the
+ * A4 reference — arm64 machine code in a Mach-O object), `X8664Linux` (x86-64
+ * SysV machine code in an ELF object), `Riscv64Linux` (RISC-V RV64GC/LP64D
+ * machine code in an ELF object), `X8664Windows` (x86-64 Win64 machine code —
+ * the SAME x86 ISA as `X8664Linux`, differing only in the ABI register file
+ * and PE/COFF object format), `Wasm32Wasi` (a WASI command module — the
+ * `exit(n)`/arithmetic/control-flow corpus this slice targets,
+ * `backend-c1-wasm.md` §8), `Wasm64Wasi` (the SAME WASI command module shape,
+ * but `memory64` + a uniform `i64` `Ptr` — the wasm64 switch, §6, C1-7 —
+ * scoped to the alloca-free/rodata-free/`Ptr`-signature-free subset today,
+ * `wasm_scope_stop_wasm64`), `Wasm32Browser` (the SAME emitted module, a
+ * JS-import runtime binding instead of WASI — its full wiring is a later
+ * slice; reaching it here is a NAMED stop for now, §9), or `Arm64Linux` (the
+ * SAME arm64 AAPCS64 machine code as `Arm64Macho`, wrapped in an ELF `ET_REL`
+ * object instead of Mach-O — the arm64→ELF backend precursor the E1 musl-
+ * static arm64 arch (row 2) is gated on, `e1-elf-linker-plan.md` L1-0).
+ * Targets are named by OS, not by object format (ruling #390): the format
+ * (ELF/Mach-O/COFF) is a consequence of the OS, so `x86_64-linux`,
+ * `riscv64-linux`, `arm64-linux`, and `x86_64-windows` — not
+ * `x86_64-elf`/`riscv64-elf`/`arm64-elf`/`x86_64-coff`/`x86_64-win`/
+ * `x86_64-pe` — are canonical. The seam mirrors `TEKO_BACKEND` and is read
+ * only when the own backend is already active; D1/#390 supersedes it with the
+ * real `--target` manifest flag.
  */
-type NativeTarget = enum { Arm64Macho; X8664Linux; Riscv64Linux; X8664Windows; Wasm32Wasi; Wasm64Wasi; Wasm32Browser }
+type NativeTarget = enum { Arm64Macho; X8664Linux; Riscv64Linux; X8664Windows; Wasm32Wasi; Wasm64Wasi; Wasm32Browser; Arm64Linux }
 
 /**
  * target_from_name — map a raw `TEKO_TARGET` value to a `NativeTarget`:
  * `x86_64-linux` selects the x86-64 SysV/ELF pipeline, `riscv64-linux` the
- * RISC-V LP64D/ELF pipeline, `x86_64-windows` the x86-64 Win64/PE-COFF
+ * RISC-V LP64D/ELF pipeline, `arm64-linux` the arm64 AAPCS64/ELF pipeline
+ * (#392 E1 L1-0 — the SAME arm64 machine code as the default `Arm64Macho`,
+ * an ELF object instead of Mach-O), `x86_64-windows` the x86-64 Win64/PE-COFF
  * pipeline (all canonical, OS-based per ruling #390; `x86_64-elf`/
- * `riscv64-elf`/`x86_64-coff`/`x86_64-win`/`x86_64-pe` are accepted as
- * deprecated format-named aliases), `wasm32-wasi`/`wasm32`/`wasm`/`wasi`
- * select the WASI wasm32 target (#389 C1-5), `wasm64-wasi`/`wasm64` select
- * the wasm64 target (#389 C1-7, §6), and `wasm32-browser`/`wasm-browser`/
- * `browser` select the Browser variant. Every other value — including
- * `arm64-macos`, an empty string, or a typo — falls back to the default
- * `Arm64Macho`, so an unrecognized target never silently mis-lowers.
+ * `riscv64-elf`/`arm64-elf`/`x86_64-coff`/`x86_64-win`/`x86_64-pe` are
+ * accepted as deprecated format-named aliases), `wasm32-wasi`/`wasm32`/
+ * `wasm`/`wasi` select the WASI wasm32 target (#389 C1-5), `wasm64-wasi`/
+ * `wasm64` select the wasm64 target (#389 C1-7, §6), and `wasm32-browser`/
+ * `wasm-browser`/`browser` select the Browser variant. Every other value —
+ * including `arm64-macos`, an empty string, or a typo — falls back to the
+ * default `Arm64Macho`, so an unrecognized target never silently mis-lowers.
  *
  * @param name  the raw `TEKO_TARGET` environment value
  * @return      the selected own-backend target
@@ -959,6 +968,8 @@ fn target_from_name(name: str) -> NativeTarget {
     if name == "x86_64-elf" { return NativeTarget::X8664Linux }
     if name == "riscv64-linux" { return NativeTarget::Riscv64Linux }
     if name == "riscv64-elf" { return NativeTarget::Riscv64Linux }
+    if name == "arm64-linux" { return NativeTarget::Arm64Linux }
+    if name == "arm64-elf" { return NativeTarget::Arm64Linux }
     if name == "x86_64-windows" { return NativeTarget::X8664Windows }
     if name == "x86_64-win" { return NativeTarget::X8664Windows }
     if name == "x86_64-pe" { return NativeTarget::X8664Windows }
@@ -1026,24 +1037,27 @@ fn mkdir_p(dir: str) -> error? {
 
 /**
  * emit_native — the own-AOT-backend driver (the #385 A4-5 KEYSTONE, extended for
- * x86-64 at #386 B1-8, RISC-V at #387 B2-8 and Windows at #388 B3-4): lower the
- * checked program to target-independent LIR, then dispatch on `native_target()` to
- * the per-ISA tail — arm64 `MInst`/AAPCS64/Mach-O (the default, byte-unchanged A4
- * path), x86-64 `MInstX86`/SysV/ELF (the B1 path, `TEKO_TARGET=x86_64-linux`),
- * RISC-V `MInstRiscv`/LP64D/ELF (the B2 path, `TEKO_TARGET=riscv64-linux`), or
- * x86-64 `MInstX86`/Win64/PE-COFF (the B3 path, `TEKO_TARGET=x86_64-windows` — the
- * SAME x86 ISA as the Linux path, differing only in the `win64` register file and
- * the `emit_coff` object format). Each tail selects instructions, allocates
- * registers,
- * encodes machine bytes, wraps them in the target object format, writes the `.o`,
- * and links it into a native executable against the C-built `teko_rt`/`assert`
- * runtime via `cc`-as-linker (`link_object`, the D-C bootstrap). Any pipeline
- * pass's NAMED honest-stop (`A4-fp`/`B1-fp`/`B1-args`/…) propagates out unchanged
- * as a `fail`, so an unsupported program stops identically to any other backend
- * diagnostic (M.3 — never a fabricated artifact) and the C-vs-own differential
- * compares at the stop, not a fake value. Reached only when `m.backend ==
- * Backend::Native` (the resolved `--backend` selection, D1/#390 — the CLI flag
- * primary, `TEKO_BACKEND` env fallback); the default C path is untouched.
+ * x86-64 at #386 B1-8, RISC-V at #387 B2-8, Windows at #388 B3-4, and arm64/ELF
+ * at #392 E1 L1-0): lower the checked program to target-independent LIR, then
+ * dispatch on `native_target()` to the per-ISA tail — arm64 `MInst`/AAPCS64/
+ * Mach-O (the default, byte-unchanged A4 path), x86-64 `MInstX86`/SysV/ELF (the
+ * B1 path, `TEKO_TARGET=x86_64-linux`), RISC-V `MInstRiscv`/LP64D/ELF (the B2
+ * path, `TEKO_TARGET=riscv64-linux`), x86-64 `MInstX86`/Win64/PE-COFF (the B3
+ * path, `TEKO_TARGET=x86_64-windows` — the SAME x86 ISA as the Linux path,
+ * differing only in the `win64` register file and the `emit_coff` object
+ * format), or arm64 `MInst`/AAPCS64/ELF (the L1-0 path, `TEKO_TARGET=arm64-linux`
+ * — the SAME arm64 ISA/ABI as the default Mach-O path, differing only in the
+ * object container). Each tail selects instructions, allocates registers,
+ * encodes machine bytes, wraps them in the target object format, writes the
+ * `.o`, and links it into a native executable against the C-built
+ * `teko_rt`/`assert` runtime via `cc`-as-linker (`link_object`, the D-C
+ * bootstrap). Any pipeline pass's NAMED honest-stop (`A4-fp`/`B1-fp`/`B1-args`/
+ * …) propagates out unchanged as a `fail`, so an unsupported program stops
+ * identically to any other backend diagnostic (M.3 — never a fabricated
+ * artifact) and the C-vs-own differential compares at the stop, not a fake
+ * value. Reached only when `m.backend == Backend::Native` (the resolved
+ * `--backend` selection, D1/#390 — the CLI flag primary, `TEKO_BACKEND` env
+ * fallback); the default C path is untouched.
  *
  * @param dir      the project directory (for diagnostics)
  * @param stem     the output artifact name (the manifest `name`)
@@ -1061,6 +1075,7 @@ fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
         NativeTarget::Riscv64Linux => emit_native_riscv(dir, od, stem, lmod, prog, m)
         NativeTarget::X8664Windows => emit_native_win(dir, od, stem, lmod, prog, m)
         NativeTarget::Arm64Macho => emit_native_arm64(dir, od, stem, lmod, prog, m)
+        NativeTarget::Arm64Linux => emit_native_arm64_elf(dir, od, stem, lmod, prog, m)
         NativeTarget::Wasm32Wasi => emit_native_wasm(dir, od, stem, lmod, prog, m, false, false)
         NativeTarget::Wasm64Wasi => emit_native_wasm(dir, od, stem, lmod, prog, m, false, true)
         NativeTarget::Wasm32Browser => emit_native_wasm(dir, od, stem, lmod, prog, m, true, false)
@@ -1173,6 +1188,39 @@ fn emit_native_riscv(dir: str, od: str, stem: str, lmod: teko::lir::LModule, pro
     let col = match teko::backend::regalloc_module_riscv(teko::backend::riscv64_lp64d(), sel) { teko::backend::MModuleRiscv as x => x; error as e => return fail(dir, e.message) }
     let enc = match teko::backend::encode_module_riscv(teko::backend::riscv64_lp64d(), col) { teko::backend::EncodedModuleRiscv as x => x; error as e => return fail(dir, e.message) }
     finish_native_object(dir, od, stem, teko::backend::emit_elf_riscv(enc), prog, m)
+}
+
+/**
+ * emit_native_arm64_elf — the arm64/ELF own-backend tail (issue #392 E1 L1-0,
+ * the arm64→ELF backend precursor): select arm64 `MInst` from the lowered
+ * module and allocate registers under the SAME AAPCS64 register file
+ * (`aapcs64`) as the default Mach-O path — the arm64 ISA and its ABI are
+ * unchanged, only the OBJECT CONTAINER differs — encode to arm64 machine
+ * words, wrap them in an `ET_REL` ELF64 object (`emit_elf_arm64` → the shared
+ * `emit_elf_object`), and hand the bytes to `finish_native_object` (write
+ * `.o` + `cc`-link + `.tsym` + success marker). Reached only via
+ * `TEKO_TARGET=arm64-linux`; the emitted `.o` is an arm64-linux object, so
+ * `cc`-as-linker (`aarch64-linux-gnu-gcc`, `default_cc_for_target`) produces
+ * a runnable arm64-linux executable when the cross toolchain is present, and
+ * a host lacking it still writes the `.o` for the byte / well-formedness
+ * cross-check (`check_elf.sh`). This crumb is object EMISSION only — the
+ * arm64 musl-static OWN link (relocation application, entry point, archive
+ * pull) is E1's L1-13, gated on this precursor plus the linker core
+ * (L1-1..L1-9).
+ *
+ * @param dir   the project directory (for diagnostics)
+ * @param od    the slash-stripped output directory (already created)
+ * @param stem  the output artifact name (the manifest `name`)
+ * @param lmod  the target-independent lowered module
+ * @param prog  the checked program (extern-reachability, `.tsym`)
+ * @param m     the resolved manifest (link knobs)
+ * @return      0 on a successful build+link, else the failing status
+ */
+fn emit_native_arm64_elf(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+    let sel = match teko::backend::select_module(lmod) { teko::backend::MModule as x => x; error as e => return fail(dir, e.message) }
+    let col = match teko::backend::regalloc_module(teko::backend::aapcs64(), sel) { teko::backend::MModule as x => x; error as e => return fail(dir, e.message) }
+    let enc = match teko::backend::encode_module(teko::backend::aapcs64(), col) { teko::backend::EncodedModule as x => x; error as e => return fail(dir, e.message) }
+    finish_native_object(dir, od, stem, teko::backend::emit_elf_arm64(enc), prog, m)
 }
 
 /**

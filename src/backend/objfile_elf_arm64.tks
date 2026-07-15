@@ -1,0 +1,75 @@
+/**
+ * arm64_reloc_type — the numeric `R_AARCH64_*` relocation type for an
+ * `MRelocKind`, fed to the reused ELF writer (L1-0): `R_AARCH64_CALL26`(283)
+ * for `Call` (the BL branch26 fixup), `R_AARCH64_ADR_PREL_PG_HI21`(275) for
+ * `PageHi` (the ADRP page fixup), `R_AARCH64_ADD_ABS_LO12_NC`(277) for
+ * `PageLo` (the ADD low-12 page-offset fixup) — the exact ELF counterpart of
+ * the Mach-O `ARM64_RELOC_*` mapping `objfile_macho.tks:200` already ships.
+ * `MRelocKind` carries no data-relocation variant today (a top-level data
+ * global is the `A4-globals` honest-stop, raised before any `MRelocKind` is
+ * produced for one), so this match stays exhaustive over the three kinds the
+ * arm64 encoder actually emits.
+ *
+ * @param MRelocKind kind  the relocation kind
+ * @return u32  the `Elf64_Rela` `r_info` type field
+ */
+fn arm64_reloc_type(kind: MRelocKind) -> u32 {
+    match kind {
+        Call => 283 to u32
+        PageHi => 275 to u32
+        PageLo => 277 to u32
+    }
+}
+
+/**
+ * arm64_reloc_reqs — lower every `Reloc` of `enc` to a neutral `ElfRelocReq`,
+ * mapping the arm64 `kind` to its numeric `R_AARCH64_*` type via
+ * `arm64_reloc_type` (the ONLY arm64 knowledge the adapter injects). The
+ * offset and target name ride through unchanged with a base addend of 0 (the
+ * arm64 `Reloc` carries no addend field — Mach-O needs none, and every ELF
+ * addend the arm64 lane owes is a rodata offset the shared writer folds on);
+ * the shared writer folds a rodata target's `.rodata` offset onto that base
+ * and resolves the name to a symbol index.
+ *
+ * @param EncodedModule enc  the arm64 module (relocations)
+ * @return []ElfRelocReq  the neutral relocation requests, in emission order
+ */
+fn arm64_reloc_reqs(enc: EncodedModule) -> []ElfRelocReq {
+    mut out: []ElfRelocReq = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= enc.relocs.len { break }
+        let r = enc.relocs[i]
+        out = teko::list::push(out, ElfRelocReq { offset = r.offset; sym = r.sym; rtype = arm64_reloc_type(r.kind); addend = 0 to i64 })
+        i++
+    }
+    out
+}
+
+/**
+ * emit_elf_arm64 — the arm64 ELF adapter (L1-0, the symmetric twin of
+ * riscv64's `emit_elf_riscv`): map the arm64 `EncodedModule` to a neutral
+ * `ElfObject` (`e_machine`=EM_AARCH64(183), `e_flags`=0 — AArch64 has no ABI
+ * flag byte the way RV64 LP64D does, each `Reloc` lowered to an `ElfRelocReq`
+ * via `arm64_reloc_type`) and hand it to the shared `emit_elf_object`. The
+ * neutral symbol list is already in the local-then-global-then-undefined
+ * order `encode_module` builds; every other ELF fact (section-relative
+ * `st_value`, `.text`-relative `r_offset`, the local-then-global partition +
+ * `.symtab.sh_info`, the `.rodata` section-symbol fold) is the reused x86/
+ * riscv writer's, unchanged. This is object EMISSION only — the arm64 musl
+ * static link (relocation application, entry point, archive pull) is E1's
+ * L1-13, gated on this crumb plus the linker core (L1-1..L1-9).
+ *
+ * @param EncodedModule enc  the section images + symbols + relocations
+ * @return []byte  the arm64 ELF64 object file bytes
+ */
+pub fn emit_elf_arm64(enc: EncodedModule) -> []byte {
+    emit_elf_object(ElfObject {
+        e_machine = 183 to u32
+        e_flags = 0 to u32
+        text = enc.text
+        rodata = enc.rodata
+        symbols = enc.symbols
+        relocs = arm64_reloc_reqs(enc)
+    })
+}
