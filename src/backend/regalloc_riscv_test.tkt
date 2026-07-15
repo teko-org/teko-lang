@@ -1,0 +1,935 @@
+/**
+ * rr_v — a virtual GPR register operand (a B2-4 RISC-V regalloc-test shorthand).
+ *
+ * @param u32 id  the virtual register id
+ * @return MReg  the virtual GPR register
+ */
+fn rr_v(id: u32) -> MReg {
+    vreg(id, MRegClass::GPR)
+}
+
+/**
+ * rr_vf — a virtual FPR register operand (for the FPR-spill honest-stop).
+ *
+ * @param u32 id  the virtual register id
+ * @return MReg  the virtual FPR register
+ */
+fn rr_vf(id: u32) -> MReg {
+    vreg(id, MRegClass::FPR)
+}
+
+/**
+ * rr_p — a physical GPR register operand (an LP64D pin; the id is the RISC-V
+ * register number, e.g. 10 = a0, 5 = t0, 9 = s1).
+ *
+ * @param u32 id  the physical register id (RISC-V register number)
+ * @return MReg  the physical GPR register
+ */
+fn rr_p(id: u32) -> MReg {
+    preg(id, MRegClass::GPR)
+}
+
+/**
+ * rr_mem — a base-plus-displacement12 memory operand.
+ *
+ * @param MReg base  the base register
+ * @param i32 offset  the byte displacement
+ * @return MMem  the memory operand
+ */
+fn rr_mem(base: MReg, offset: i32) -> MMem {
+    MMem { base = base; offset = offset }
+}
+
+/**
+ * rr_mov — the isel-shaped identity copy `addi dst, src, #0` (`mv_riscv`), the
+ * move RISC-V isel plants at argument, result, and call-result pins. Modelling
+ * the fixtures' moves as `MAluIRiscv(Addi, .. , 0)` keeps them faithful to isel
+ * output.
+ *
+ * @param MReg dst  the destination register
+ * @param MReg src  the source register
+ * @return MInstRiscv  the `addi dst, src, #0` copy
+ */
+fn rr_mov(dst: MReg, src: MReg) -> MInstRiscv {
+    alu_i_riscv(MAluOpRiscv::Addi, dst, src, 0 to i32)
+}
+
+/**
+ * rr_func — a single-block `MFuncRiscv` named "main" with the given instruction
+ * stream (an interval/rewrite-test fixture shorthand).
+ *
+ * @param []MInstRiscv insts  the block's instructions
+ * @return MFuncRiscv  the built function
+ */
+fn rr_func(insts: []MInstRiscv) -> MFuncRiscv {
+    let b = MBlockRiscv { id = 0; params = teko::list::empty(); insts = insts }
+    MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::empty(), b); frame = teko::list::empty() }
+}
+
+/**
+ * rr_named_func — a single-block `MFuncRiscv` with the given symbol + stream.
+ *
+ * @param str sym  the function symbol
+ * @param []MInstRiscv insts  the block's instructions
+ * @return MFuncRiscv  the function
+ */
+fn rr_named_func(sym: str, insts: []MInstRiscv) -> MFuncRiscv {
+    let b = MBlockRiscv { id = 0; params = teko::list::empty(); insts = insts }
+    MFuncRiscv { symbol = sym; blocks = teko::list::push(teko::list::empty(), b); frame = teko::list::empty() }
+}
+
+/**
+ * rr_module_of — a single-function `MModuleRiscv` (empty rodata/globals/layouts).
+ *
+ * @param MFuncRiscv f  the function
+ * @return MModuleRiscv  the wrapping module
+ */
+fn rr_module_of(f: MFuncRiscv) -> MModuleRiscv {
+    MModuleRiscv { funcs = teko::list::push(teko::list::empty(), f); rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
+}
+
+/**
+ * rr_number — `number_insts_riscv` over `f`'s RPO block order (the call the
+ * numbering + back-edge passes take), wrapped so fixtures stay terse.
+ *
+ * @param MFuncRiscv f  the function to number
+ * @return []NumberedInstRiscv  the RPO-numbered stream
+ */
+fn rr_number(f: MFuncRiscv) -> []NumberedInstRiscv {
+    number_insts_riscv(f, rpo_block_order_riscv(f))
+}
+
+/**
+ * rr_intervals — `compute_intervals_riscv` over `f`'s RPO-numbered stream,
+ * computing the order once and threading it to both the numbering and the
+ * back-edge test.
+ *
+ * @param MFuncRiscv f  the function to analyze
+ * @return IntervalSet | error  the intervals, or a back-edge honest-stop
+ */
+fn rr_intervals(f: MFuncRiscv) -> IntervalSet | error {
+    let o = rpo_block_order_riscv(f)
+    compute_intervals_riscv(number_insts_riscv(f, o), o, reachable_blocks_riscv(f))
+}
+
+/**
+ * rr_phys — the physreg `vreg_id` was assigned, or the sentinel 100000 if it
+ * was spilled or absent.
+ *
+ * @param ScanResult scan  the scan result
+ * @param u32 vreg_id  the virtual register
+ * @return u32  its physreg, or 100000
+ */
+fn rr_phys(scan: ScanResult, vreg_id: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= scan.assignments.len { break }
+        let got = match scan.assignments[i] {
+            InReg as r => if r.vreg_id == vreg_id { r.phys } else { 100000 to u32 }
+            Spilled => 100000 to u32
+        }
+        if got != 100000 to u32 { return got }
+        i++
+    }
+    100000 to u32
+}
+
+/**
+ * rr_spilled — whether `vreg_id` was spilled.
+ *
+ * @param ScanResult scan  the scan result
+ * @param u32 vreg_id  the virtual register
+ * @return bool  true iff spilled
+ */
+fn rr_spilled(scan: ScanResult, vreg_id: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= scan.assignments.len { break }
+        let sp = match scan.assignments[i] {
+            Spilled as s => s.vreg_id == vreg_id
+            InReg => false
+        }
+        if sp { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * rr_iv_has — whether `list` contains an interval with exactly `reg_id`/`start`/
+ * `end`.
+ *
+ * @param []LiveInterval list  the intervals to search
+ * @param u32 reg_id  the register id to match
+ * @param u32 start  the start point to match
+ * @param u32 end  the end point to match
+ * @return bool  true iff such an interval is present
+ */
+fn rr_iv_has(list: []LiveInterval, reg_id: u32, start: u32, end: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        let iv = list[i]
+        if iv.reg_id == reg_id && iv.start == start && iv.end == end { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * rr_iv_crosses — whether `list` has an interval for `reg_id` marked
+ * `crosses_call`.
+ *
+ * @param []LiveInterval list  the intervals to search
+ * @param u32 reg_id  the register id to match
+ * @return bool  true iff a matching interval crosses a call
+ */
+fn rr_iv_crosses(list: []LiveInterval, reg_id: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        let iv = list[i]
+        if iv.reg_id == reg_id && iv.crosses_call { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * rr_inst_all_phys — whether every operand of one RISC-V instruction is physical
+ * (via `inst_regs_riscv`).
+ *
+ * @param MInstRiscv inst  the instruction
+ * @return bool  true iff fully physical
+ */
+fn rr_inst_all_phys(inst: MInstRiscv) -> bool {
+    let ir = inst_regs_riscv(inst)
+    if ir.has_def {
+        if !ir.def_reg.is_phys { return false }
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ir.uses.len { break }
+        if !ir.uses[i].is_phys { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * rr_is_frame_addr — whether `inst` is an `MFrameAddrRiscv`.
+ *
+ * @param MInstRiscv inst  the instruction
+ * @return bool  true iff MFrameAddrRiscv
+ */
+fn rr_is_frame_addr(inst: MInstRiscv) -> bool {
+    match inst { MFrameAddrRiscv => true; _ => false }
+}
+
+/**
+ * rr_is_load — whether `inst` is an `MLoadRiscv`.
+ *
+ * @param MInstRiscv inst  the instruction
+ * @return bool  true iff MLoadRiscv
+ */
+fn rr_is_load(inst: MInstRiscv) -> bool {
+    match inst { MLoadRiscv => true; _ => false }
+}
+
+/**
+ * rr_is_store — whether `inst` is an `MStoreRiscv`.
+ *
+ * @param MInstRiscv inst  the instruction
+ * @return bool  true iff MStoreRiscv
+ */
+fn rr_is_store(inst: MInstRiscv) -> bool {
+    match inst { MStoreRiscv => true; _ => false }
+}
+
+/**
+ * rr_sr — a `ScanResult` from a list of assignments (no callee-saved used).
+ *
+ * @param []RegAssignment a  the assignments
+ * @return ScanResult  the scan result
+ */
+fn rr_sr(a: []RegAssignment) -> ScanResult {
+    ScanResult { assignments = a; used_callee_saved = teko::list::empty() }
+}
+
+/**
+ * rr_full_subst — a table mapping virtual ids `0..n-1` to a physical GPR (for
+ * the `map_minst_riscv` coverage test; every operand becomes physical).
+ *
+ * @param u32 n  the id count
+ * @return []SubstEntry  the substitution table
+ */
+fn rr_full_subst(n: u32) -> []SubstEntry {
+    mut t: []SubstEntry = teko::list::empty()
+    mut k: u32 = 0
+    loop {
+        if k >= n { break }
+        t = teko::list::push(t, SubstEntry { vid = k; to = rr_p(9) })
+        k = k + 1
+    }
+    t
+}
+
+/**
+ * rr_all_kinds — one instruction of every `MInstRiscv` case (unique virtual ids
+ * `0..26`), for the `inst_regs_riscv`/`map_minst_riscv` coverage tests.
+ *
+ * @return []MInstRiscv  the 16-instruction stream
+ */
+fn rr_all_kinds() -> []MInstRiscv {
+    mut xs: []MInstRiscv = teko::list::empty()
+    xs = teko::list::push(xs, li_riscv(rr_v(0), 1 to i32))
+    xs = teko::list::push(xs, lui_riscv(rr_v(1), 1 to u32))
+    xs = teko::list::push(xs, auipc_riscv(rr_v(2), 1 to u32))
+    xs = teko::list::push(xs, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(3), rr_v(4), rr_v(5)))
+    xs = teko::list::push(xs, alu_i_riscv(MAluOpRiscv::Addi, rr_v(6), rr_v(7), 0 to i32))
+    xs = teko::list::push(xs, slt_riscv(rr_v(8), rr_v(9), rr_v(10), false))
+    xs = teko::list::push(xs, load_riscv(MMemSizeRiscv::D, false, rr_v(11), rr_mem(rr_v(12), 0 to i32)))
+    xs = teko::list::push(xs, store_riscv(MMemSizeRiscv::D, rr_v(13), rr_mem(rr_v(14), 0 to i32)))
+    xs = teko::list::push(xs, branch_riscv(MCond::EQ, rr_v(15), rr_v(16), 0 to u32))
+    xs = teko::list::push(xs, jal_riscv(0 to u32))
+    xs = teko::list::push(xs, jalr_riscv(rr_v(17), rr_v(18), 0 to i32))
+    xs = teko::list::push(xs, call_riscv("f", two_regs(rr_v(19), rr_v(20)), rr_v(21), true, false))
+    xs = teko::list::push(xs, call_ind_riscv(rr_v(22), one_reg(rr_v(23)), rr_v(24), true))
+    xs = teko::list::push(xs, lla_riscv(rr_v(25), "s"))
+    xs = teko::list::push(xs, frame_addr_riscv(rr_v(26), 0 to u32))
+    xs = teko::list::push(xs, ret_riscv())
+    xs
+}
+
+#test
+fn rr_inst_regs_covers_every_minst_case() {
+    let g0 = rr_v(0)
+    let g1 = rr_v(1)
+    let mem = rr_mem(rr_v(0), 0 to i32)
+    let noargs: []MReg = teko::list::empty()
+    teko::assert::is_true(inst_regs_riscv(li_riscv(g0, 1 to i32)).has_def)
+    teko::assert::is_true(inst_regs_riscv(li_riscv(g0, 1 to i32)).uses.len == 0 to u64)
+    teko::assert::is_true(inst_regs_riscv(lui_riscv(g0, 1 to u32)).has_def)
+    teko::assert::is_true(inst_regs_riscv(auipc_riscv(g0, 1 to u32)).has_def)
+    teko::assert::is_true(inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Add, true, g0, g1, rr_v(2))).uses.len == 2 to u64)
+    teko::assert::is_true(!inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Add, true, g0, g1, rr_v(2))).is_call)
+    teko::assert::is_true(inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Div, true, g0, g1, rr_v(2))).uses.len == 2 to u64)
+    teko::assert::is_true(!inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Div, true, g0, g1, rr_v(2))).is_call)
+    teko::assert::is_true(inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Rem, true, g0, g1, rr_v(2))).has_def)
+    teko::assert::is_true(inst_regs_riscv(alu_i_riscv(MAluOpRiscv::Addi, g0, g1, 0 to i32)).uses.len == 1 to u64)
+    teko::assert::is_true(inst_regs_riscv(slt_riscv(g0, g1, rr_v(2), false)).uses.len == 2 to u64)
+    teko::assert::is_true(inst_regs_riscv(load_riscv(MMemSizeRiscv::D, false, g0, mem)).has_def)
+    teko::assert::is_true(inst_regs_riscv(load_riscv(MMemSizeRiscv::D, false, g0, mem)).uses.len == 1 to u64)
+    teko::assert::is_true(!inst_regs_riscv(store_riscv(MMemSizeRiscv::D, g0, mem)).has_def)
+    teko::assert::is_true(inst_regs_riscv(store_riscv(MMemSizeRiscv::D, g0, mem)).uses.len == 2 to u64)
+    teko::assert::is_true(!inst_regs_riscv(branch_riscv(MCond::EQ, g0, g1, 0 to u32)).has_def)
+    teko::assert::is_true(inst_regs_riscv(branch_riscv(MCond::EQ, g0, g1, 0 to u32)).uses.len == 2 to u64)
+    teko::assert::is_true(!inst_regs_riscv(jal_riscv(0 to u32)).has_def)
+    teko::assert::is_true(inst_regs_riscv(jal_riscv(0 to u32)).uses.len == 0 to u64)
+    teko::assert::is_true(inst_regs_riscv(jalr_riscv(g0, g1, 0 to i32)).has_def)
+    teko::assert::is_true(inst_regs_riscv(jalr_riscv(g0, g1, 0 to i32)).uses.len == 1 to u64)
+    teko::assert::is_true(inst_regs_riscv(call_riscv("f", one_reg(rr_p(10)), rr_p(10), true, false)).is_call)
+    teko::assert::is_true(inst_regs_riscv(call_riscv("f", noargs, rr_p(10), false, false)).has_def == false)
+    teko::assert::is_true(inst_regs_riscv(call_ind_riscv(g0, noargs, rr_p(10), true)).is_call)
+    teko::assert::is_true(inst_regs_riscv(call_ind_riscv(g0, noargs, rr_p(10), false)).uses.len == 1 to u64)
+    teko::assert::is_true(inst_regs_riscv(lla_riscv(g0, "s")).has_def)
+    teko::assert::is_true(inst_regs_riscv(lla_riscv(g0, "s")).uses.len == 0 to u64)
+    teko::assert::is_true(inst_regs_riscv(frame_addr_riscv(g0, 0 to u32)).has_def)
+    teko::assert::is_true(!inst_regs_riscv(ret_riscv()).has_def)
+    teko::assert::is_true(inst_regs_riscv(ret_riscv()).uses.len == 0 to u64)
+}
+
+#test
+fn rr_alu_dst_is_a_pure_def_not_a_use() {
+    let ir = inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Add, true, rr_v(2), rr_v(0), rr_v(1)))
+    teko::assert::is_true(ir.has_def)
+    teko::assert::is_true(ir.def_reg.id == 2 to u32)
+    teko::assert::is_true(ir.uses.len == 2 to u64)
+    teko::assert::is_true(ir.uses[0].id == 0 to u32)
+    teko::assert::is_true(ir.uses[1].id == 1 to u32)
+    teko::assert::is_true(!ir.is_call)
+}
+
+#test
+fn rr_map_minst_covers_every_case() {
+    let kinds = rr_all_kinds()
+    let table = rr_full_subst(27 to u32)
+    teko::assert::is_true(kinds.len == 16 to u64)
+    mut i: u64 = 0
+    loop {
+        if i >= kinds.len { break }
+        teko::assert::is_true(rr_inst_all_phys(map_minst_riscv(kinds[i], table)))
+        i++
+    }
+}
+
+#test
+fn rr_map_minst_leaves_unmapped_virtuals() {
+    let m0 = map_minst_riscv(alu_r_riscv(MAluOpRiscv::Add, true, rr_v(0), rr_v(1), rr_v(2)), teko::list::empty())
+    teko::assert::is_true(!rr_inst_all_phys(m0))
+}
+
+#test
+fn rr_number_insts_flattens_in_block_order() {
+    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), li_riscv(rr_v(0), 1 to i32)) }
+    let b1 = MBlockRiscv { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), ret_riscv()) }
+    let f = MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
+    let stream = rr_number(f)
+    teko::assert::is_true(stream.len == 2 to u64)
+    teko::assert::is_true(stream[0].point == 0)
+    teko::assert::is_true(stream[0].block_id == 0)
+    teko::assert::is_true(stream[1].point == 1)
+    teko::assert::is_true(stream[1].block_id == 1)
+}
+
+/**
+ * rr_entry_param_add_fixture — `mov v0=a0; mov v1=a1; add v2,v0,v1; mov a0=v2;
+ * ret` — the clean three-address add of two LP64D-argument-pinned values. UNLIKE
+ * x86 (which needed a preparatory `mov v2=v0` copy for its destructive
+ * two-address add), RISC-V writes the sum directly into a fresh `v2`. The arg
+ * pins (a0/a1) are USED before any def (entry-live from point 0) and the result
+ * pin (a0) is defined with no later use (extended to the terminator).
+ *
+ * @return []MInstRiscv  the fixture stream
+ */
+fn rr_entry_param_add_fixture() -> []MInstRiscv {
+    mut insts: []MInstRiscv = teko::list::empty()
+    insts = teko::list::push(insts, rr_mov(rr_v(0), rr_p(10)))
+    insts = teko::list::push(insts, rr_mov(rr_v(1), rr_p(11)))
+    insts = teko::list::push(insts, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(2), rr_v(0), rr_v(1)))
+    insts = teko::list::push(insts, rr_mov(rr_p(10), rr_v(2)))
+    insts = teko::list::push(insts, ret_riscv())
+    insts
+}
+
+#test
+fn rr_entry_live_pins_and_result_pin_intervals() {
+    let iset = match rr_intervals(rr_func(rr_entry_param_add_fixture())) { IntervalSet as s => s; error => return }
+    teko::assert::is_true(rr_iv_has(iset.virt, 0, 0, 2))
+    teko::assert::is_true(rr_iv_has(iset.virt, 1, 1, 2))
+    teko::assert::is_true(rr_iv_has(iset.virt, 2, 2, 3))
+    teko::assert::is_true(rr_iv_has(iset.fixed, 10, 0, 0))
+    teko::assert::is_true(rr_iv_has(iset.fixed, 11, 0, 1))
+    teko::assert::is_true(rr_iv_has(iset.fixed, 10, 3, 4))
+}
+
+#test
+fn rr_result_pin_without_terminator_is_not_extended() {
+    let insts = teko::list::push(teko::list::empty(), li_riscv(rr_p(10), 5 to i32))
+    let iset = match rr_intervals(rr_func(insts)) { IntervalSet as s => s; error => return }
+    teko::assert::is_true(rr_iv_has(iset.fixed, 10, 0, 0))
+}
+
+/**
+ * rr_double_phys_def_fixture — `li a0=#1; mov v0=a0; li a0=#2; mov a1=a0; ret` —
+ * a0 is DEFINED twice with a use between, so its pin splits into two intervals
+ * (`[0,1]` and `[2,3]`), exercising the physreg-redefinition split in
+ * `phys_intervals_riscv`.
+ *
+ * @return []MInstRiscv  the fixture stream
+ */
+fn rr_double_phys_def_fixture() -> []MInstRiscv {
+    mut insts: []MInstRiscv = teko::list::empty()
+    insts = teko::list::push(insts, li_riscv(rr_p(10), 1 to i32))
+    insts = teko::list::push(insts, rr_mov(rr_v(0), rr_p(10)))
+    insts = teko::list::push(insts, li_riscv(rr_p(10), 2 to i32))
+    insts = teko::list::push(insts, rr_mov(rr_p(11), rr_p(10)))
+    insts = teko::list::push(insts, ret_riscv())
+    insts
+}
+
+#test
+fn rr_repeated_physical_def_splits_into_two_pins() {
+    let iset = match rr_intervals(rr_func(rr_double_phys_def_fixture())) { IntervalSet as s => s; error => return }
+    teko::assert::is_true(rr_iv_has(iset.fixed, 10, 0, 1))
+    teko::assert::is_true(rr_iv_has(iset.fixed, 10, 2, 3))
+}
+
+#test
+fn rr_spill_scratch_is_t4_t5_t6() {
+    let abi = riscv64_lp64d()
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0 to u32).id == 29 to u32)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 1 to u32).id == 30 to u32)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 2 to u32).id == 31 to u32)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0 to u32).is_phys)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0 to u32).id == 30 to u32)
+    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 1 to u32).id == 31 to u32)
+}
+
+/**
+ * rr_disjoint_reuse_fixture — `li v0=#1; mov v2=v0; li v1=#2; add v3,v1,v2;
+ * mov a0=v3; ret`. `v0` (`[0,1]`) ends before `v1` (`[2,3]`) begins, so the two
+ * disjoint values may share one physreg — the register-reuse property.
+ *
+ * @return []MInstRiscv  the fixture stream
+ */
+fn rr_disjoint_reuse_fixture() -> []MInstRiscv {
+    mut insts: []MInstRiscv = teko::list::empty()
+    insts = teko::list::push(insts, li_riscv(rr_v(0), 1 to i32))
+    insts = teko::list::push(insts, rr_mov(rr_v(2), rr_v(0)))
+    insts = teko::list::push(insts, li_riscv(rr_v(1), 2 to i32))
+    insts = teko::list::push(insts, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(3), rr_v(1), rr_v(2)))
+    insts = teko::list::push(insts, rr_mov(rr_p(10), rr_v(3)))
+    insts = teko::list::push(insts, ret_riscv())
+    insts
+}
+
+#test
+fn rr_disjoint_intervals_reuse_a_register() {
+    let f = rr_func(rr_disjoint_reuse_fixture())
+    let iset = match rr_intervals(f) { IntervalSet as s => s; error => return }
+    let scan = linear_scan(riscv64_lp64d(), iset)
+    teko::assert::is_true(rr_phys(scan, 0) != 100000 to u32)
+    teko::assert::is_true(rr_phys(scan, 1) != 100000 to u32)
+    teko::assert::is_true(rr_phys(scan, 0) == rr_phys(scan, 1))
+    let cf = match regalloc_func_riscv(riscv64_lp64d(), f) { MFuncRiscv as g => g; error => return }
+    teko::assert::is_true(all_physical_riscv(cf))
+    teko::assert::is_true(!all_physical_riscv(f))
+}
+
+/**
+ * rr_overlap_distinct_fixture — `li v0=#1; li v1=#2; li v2=#3; add v3,v1,v2;
+ * add v4,v0,v3; mov a0=v4; ret`. `v0`, `v1`, `v2` are all simultaneously live at
+ * the first `add`, so the scan must give them THREE distinct physregs — the
+ * no-overlap invariant the interp-equivalence relies on structurally.
+ *
+ * @return []MInstRiscv  the fixture stream
+ */
+fn rr_overlap_distinct_fixture() -> []MInstRiscv {
+    mut insts: []MInstRiscv = teko::list::empty()
+    insts = teko::list::push(insts, li_riscv(rr_v(0), 1 to i32))
+    insts = teko::list::push(insts, li_riscv(rr_v(1), 2 to i32))
+    insts = teko::list::push(insts, li_riscv(rr_v(2), 3 to i32))
+    insts = teko::list::push(insts, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(3), rr_v(1), rr_v(2)))
+    insts = teko::list::push(insts, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(4), rr_v(0), rr_v(3)))
+    insts = teko::list::push(insts, rr_mov(rr_p(10), rr_v(4)))
+    insts = teko::list::push(insts, ret_riscv())
+    insts
+}
+
+#test
+fn rr_overlapping_values_get_distinct_registers() {
+    let f = rr_func(rr_overlap_distinct_fixture())
+    let iset = match rr_intervals(f) { IntervalSet as s => s; error => return }
+    let scan = linear_scan(riscv64_lp64d(), iset)
+    let p0 = rr_phys(scan, 0)
+    let p1 = rr_phys(scan, 1)
+    let p2 = rr_phys(scan, 2)
+    teko::assert::is_true(p0 != 100000 to u32)
+    teko::assert::is_true(p0 != p1)
+    teko::assert::is_true(p1 != p2)
+    teko::assert::is_true(p0 != p2)
+    let cf = match regalloc_func_riscv(riscv64_lp64d(), f) { MFuncRiscv as g => g; error => return }
+    teko::assert::is_true(all_physical_riscv(cf))
+}
+
+/**
+ * rr_call_cross_fixture — `li v0=#5; call tk_x; mov a0=v0; ret` — `v0` is live
+ * across the call and must be marked `crosses_call`, then land callee-saved.
+ *
+ * @return []MInstRiscv  the fixture stream
+ */
+fn rr_call_cross_fixture() -> []MInstRiscv {
+    mut insts: []MInstRiscv = teko::list::empty()
+    insts = teko::list::push(insts, li_riscv(rr_v(0), 5 to i32))
+    insts = teko::list::push(insts, call_riscv("tk_x", teko::list::empty(), rr_p(10), false, false))
+    insts = teko::list::push(insts, rr_mov(rr_p(10), rr_v(0)))
+    insts = teko::list::push(insts, ret_riscv())
+    insts
+}
+
+#test
+fn rr_value_crossing_a_call_is_marked_and_callee_saved() {
+    let f = rr_func(rr_call_cross_fixture())
+    let iset = match rr_intervals(f) { IntervalSet as s => s; error => return }
+    teko::assert::is_true(rr_iv_crosses(iset.virt, 0))
+    let scan = linear_scan(riscv64_lp64d(), iset)
+    let p = rr_phys(scan, 0)
+    teko::assert::is_true(p != 100000 to u32)
+    teko::assert::is_true(is_callee_saved(riscv64_lp64d(), rr_p(p)))
+    teko::assert::is_true(!is_caller_saved(riscv64_lp64d(), rr_p(p)))
+}
+
+/**
+ * rr_div_cross_fixture — `li v10=#6; li v11=#2; li v12=#100; div v13=v10/v11;
+ * add v14,v12,v13; mov a0=v14; ret`. `v12` is live across the native `div`
+ * (`MAluRRiscv(Div)`), but — UNLIKE x86's `MDivSeqX86` — a RISC-V divide is NOT
+ * a call, so `v12` does NOT cross a call point and may take a caller-saved
+ * register. This is the headline RISC-V regalloc simplification.
+ *
+ * @return []MInstRiscv  the fixture stream
+ */
+fn rr_div_cross_fixture() -> []MInstRiscv {
+    mut insts: []MInstRiscv = teko::list::empty()
+    insts = teko::list::push(insts, li_riscv(rr_v(10), 6 to i32))
+    insts = teko::list::push(insts, li_riscv(rr_v(11), 2 to i32))
+    insts = teko::list::push(insts, li_riscv(rr_v(12), 100 to i32))
+    insts = teko::list::push(insts, alu_r_riscv(MAluOpRiscv::Div, true, rr_v(13), rr_v(10), rr_v(11)))
+    insts = teko::list::push(insts, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(14), rr_v(12), rr_v(13)))
+    insts = teko::list::push(insts, rr_mov(rr_p(10), rr_v(14)))
+    insts = teko::list::push(insts, ret_riscv())
+    insts
+}
+
+#test
+fn rr_div_is_not_a_call_no_crossing_and_caller_saved_ok() {
+    let f = rr_func(rr_div_cross_fixture())
+    let o = rpo_block_order_riscv(f)
+    let stream = number_insts_riscv(f, o)
+    teko::assert::is_true(call_points_of_riscv(stream).len == 0 to u64)
+    let iset = match rr_intervals(f) { IntervalSet as s => s; error => return }
+    teko::assert::is_true(!rr_iv_crosses(iset.virt, 12))
+    let scan = linear_scan(riscv64_lp64d(), iset)
+    let p12 = rr_phys(scan, 12)
+    teko::assert::is_true(p12 != 100000 to u32)
+    teko::assert::is_true(is_caller_saved(riscv64_lp64d(), rr_p(p12)))
+    let cf = match regalloc_func_riscv(riscv64_lp64d(), f) { MFuncRiscv as g => g; error => return }
+    teko::assert::is_true(all_physical_riscv(cf))
+}
+
+#test
+fn rr_rewrite_inreg_physical_and_dedup() {
+    let a0: RegAssignment = InReg { vreg_id = 0 to u32; phys = 9 to u32 }
+    let sr = rr_sr(teko::list::push(teko::list::empty(), a0))
+    let out = rewrite_inst_riscv(riscv64_lp64d(), sr, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(0), rr_v(0), rr_v(0)), 0 to u32)
+    teko::assert::is_true(out.len == 1 to u64)
+    teko::assert::is_true(rr_inst_all_phys(out[0]))
+}
+
+#test
+fn rr_rewrite_physical_use_passes_through() {
+    let a0: RegAssignment = InReg { vreg_id = 20 to u32; phys = 12 to u32 }
+    let sr = rr_sr(teko::list::push(teko::list::empty(), a0))
+    let out = rewrite_inst_riscv(riscv64_lp64d(), sr, store_riscv(MMemSizeRiscv::D, rr_v(20), rr_mem(rr_p(2), 0 to i32)), 0 to u32)
+    teko::assert::is_true(out.len == 1 to u64)
+    teko::assert::is_true(rr_inst_all_phys(out[0]))
+}
+
+#test
+fn rr_rewrite_spilled_use_reloads() {
+    let a0: RegAssignment = Spilled { vreg_id = 0 to u32; slot = 0 to u32 }
+    let a2: RegAssignment = InReg { vreg_id = 2 to u32; phys = 12 to u32 }
+    let sr = rr_sr(teko::list::push(teko::list::push(teko::list::empty(), a0), a2))
+    let out = rewrite_inst_riscv(riscv64_lp64d(), sr, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(2), rr_v(2), rr_v(0)), 0 to u32)
+    teko::assert::is_true(out.len == 3 to u64)
+    teko::assert::is_true(rr_is_frame_addr(out[0]))
+    teko::assert::is_true(rr_is_load(out[1]))
+    teko::assert::is_true(rr_inst_all_phys(out[2]))
+}
+
+#test
+fn rr_rewrite_spilled_def_stores() {
+    let a2: RegAssignment = Spilled { vreg_id = 2 to u32; slot = 0 to u32 }
+    let sr = rr_sr(teko::list::push(teko::list::empty(), a2))
+    let out = rewrite_inst_riscv(riscv64_lp64d(), sr, li_riscv(rr_v(2), 5 to i32), 0 to u32)
+    teko::assert::is_true(out.len == 3 to u64)
+    teko::assert::is_true(rr_inst_all_phys(out[0]))
+    teko::assert::is_true(rr_is_frame_addr(out[1]))
+    teko::assert::is_true(rr_is_store(out[2]))
+}
+
+#test
+fn rr_rewrite_no_assignment_passes_through() {
+    let out = rewrite_inst_riscv(riscv64_lp64d(), rr_sr(teko::list::empty()), li_riscv(rr_v(2), 5 to i32), 0 to u32)
+    teko::assert::is_true(out.len == 1 to u64)
+    teko::assert::is_true(!rr_inst_all_phys(out[0]))
+}
+
+#test
+fn rr_all_physical_detects_virtuals() {
+    let def_virtual = rr_named_func("main", teko::list::push(teko::list::empty(), li_riscv(rr_v(0), 1 to i32)))
+    teko::assert::is_true(!all_physical_riscv(def_virtual))
+    let use_virtual = rr_named_func("main", teko::list::push(teko::list::empty(), rr_mov(rr_p(10), rr_v(0))))
+    teko::assert::is_true(!all_physical_riscv(use_virtual))
+    let phys = rr_named_func("main", teko::list::push(teko::list::empty(), rr_mov(rr_p(10), rr_p(11))))
+    teko::assert::is_true(all_physical_riscv(phys))
+}
+
+/**
+ * rr_spill_abi — a tiny GPR register file (allocatable t0/t1; spill scratch
+ * t4/t5) that forces a spill under three-value pressure; no caller-saved so
+ * `crosses_call` filtering does not interfere.
+ *
+ * @return AbiDescriptor  the tiny descriptor
+ */
+fn rr_spill_abi() -> AbiDescriptor {
+    AbiDescriptor {
+        gpr_arg = push_range(teko::list::empty(), 10, 10)
+        fpr_arg = teko::list::empty()
+        gpr_allocatable = push_range(teko::list::empty(), 5, 6)
+        fpr_allocatable = teko::list::empty()
+        gpr_caller_saved = teko::list::empty()
+        fpr_caller_saved = teko::list::empty()
+        gpr_spill_scratch = push_range(teko::list::empty(), 29, 30)
+        fpr_spill_scratch = teko::list::empty()
+        spill_slot_bytes = 8
+        spill_slot_align = 8
+        shadow_space = 0 to u32
+    }
+}
+
+/**
+ * rr_spill_fixture — `li v0=#3; v1=#5; v2=#7; add v3,v0,v1; add v4,v3,v2;
+ * mov a0=v4; ret`; three values overlap under `rr_spill_abi`'s two allocatable
+ * registers, forcing a GPR spill.
+ *
+ * @return []MInstRiscv  the fixture stream
+ */
+fn rr_spill_fixture() -> []MInstRiscv {
+    mut insts: []MInstRiscv = teko::list::empty()
+    insts = teko::list::push(insts, li_riscv(rr_v(0), 3 to i32))
+    insts = teko::list::push(insts, li_riscv(rr_v(1), 5 to i32))
+    insts = teko::list::push(insts, li_riscv(rr_v(2), 7 to i32))
+    insts = teko::list::push(insts, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(3), rr_v(0), rr_v(1)))
+    insts = teko::list::push(insts, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(4), rr_v(3), rr_v(2)))
+    insts = teko::list::push(insts, rr_mov(rr_p(10), rr_v(4)))
+    insts = teko::list::push(insts, ret_riscv())
+    insts
+}
+
+#test
+fn rr_regalloc_gpr_spill_all_physical_and_frame_grows() {
+    let f = rr_func(rr_spill_fixture())
+    let iset = match rr_intervals(f) { IntervalSet as s => s; error => return }
+    let scan = linear_scan(rr_spill_abi(), iset)
+    teko::assert::is_true(rr_spilled(scan, 0) || rr_spilled(scan, 1) || rr_spilled(scan, 2))
+    let cf = match regalloc_func_riscv(rr_spill_abi(), f) { MFuncRiscv as g => g; error => return }
+    teko::assert::is_true(all_physical_riscv(cf))
+    teko::assert::is_true(cf.frame.len > 0 to u64)
+}
+
+/**
+ * rr_fpr_spill_abi — a register file with a single FPR (ft0) so any function
+ * with FPR pressure spills an FPR value (the inherited A3 honest-stop); ample
+ * GPRs so only the FPRs spill.
+ *
+ * @return AbiDescriptor  the descriptor
+ */
+fn rr_fpr_spill_abi() -> AbiDescriptor {
+    AbiDescriptor {
+        gpr_arg = push_range(teko::list::empty(), 10, 10)
+        fpr_arg = teko::list::empty()
+        gpr_allocatable = push_range(teko::list::empty(), 5, 8)
+        fpr_allocatable = push_range(teko::list::empty(), 0, 0)
+        gpr_caller_saved = teko::list::empty()
+        fpr_caller_saved = teko::list::empty()
+        gpr_spill_scratch = push_range(teko::list::empty(), 29, 30)
+        fpr_spill_scratch = push_range(teko::list::empty(), 30, 31)
+        spill_slot_bytes = 8
+        spill_slot_align = 8
+        shadow_space = 0 to u32
+    }
+}
+
+/**
+ * rr_fpr_spill_fixture — two FPR values live at once (loaded from `[t0]`, then
+ * both stored), forcing an FPR spill under `rr_fpr_spill_abi`. Constructed to
+ * exercise the FPR honest-stop; isel never emits FPR values for B2 (the float
+ * family is the `B2-fp` stop), so this is a hand-built pressure case.
+ *
+ * @return []MInstRiscv  the fixture stream
+ */
+fn rr_fpr_spill_fixture() -> []MInstRiscv {
+    let mem = rr_mem(rr_p(5), 0 to i32)
+    mut insts: []MInstRiscv = teko::list::empty()
+    insts = teko::list::push(insts, load_riscv(MMemSizeRiscv::D, false, rr_vf(10), mem))
+    insts = teko::list::push(insts, load_riscv(MMemSizeRiscv::D, false, rr_vf(11), mem))
+    insts = teko::list::push(insts, store_riscv(MMemSizeRiscv::D, rr_vf(10), mem))
+    insts = teko::list::push(insts, store_riscv(MMemSizeRiscv::D, rr_vf(11), mem))
+    insts = teko::list::push(insts, ret_riscv())
+    insts
+}
+
+#test
+fn rr_regalloc_fpr_spill_honest_stops() {
+    let f = rr_func(rr_fpr_spill_fixture())
+    let is_err = match regalloc_func_riscv(rr_fpr_spill_abi(), f) {
+        MFuncRiscv => false
+        error => true
+    }
+    teko::assert::is_true(is_err)
+}
+
+#test
+fn rr_regalloc_module_carries_tables_and_propagates() {
+    let f1 = rr_named_func("a", rr_entry_param_add_fixture())
+    let f2 = rr_named_func("b", rr_entry_param_add_fixture())
+    let funcs = teko::list::push(teko::list::push(teko::list::empty(), f1), f2)
+    let rodata = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "r0"; bytes = teko::list::empty() })
+    let m = MModuleRiscv { funcs = funcs; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+    let cm = match regalloc_module_riscv(riscv64_lp64d(), m) {
+        MModuleRiscv as x => x
+        error => return
+    }
+    teko::assert::is_true(cm.funcs.len == 2 to u64)
+    teko::assert::is_true(cm.rodata.len == 1 to u64)
+    let bad = rr_module_of(rr_named_func("main", rr_fpr_spill_fixture()))
+    let is_err = match regalloc_module_riscv(rr_fpr_spill_abi(), bad) {
+        MModuleRiscv => false
+        error => true
+    }
+    teko::assert::is_true(is_err)
+}
+
+#test
+fn rr_regalloc_func_two_block_loop_allocates() {
+    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(1 to u32)) }
+    let b1 = MBlockRiscv { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(0 to u32)) }
+    let f = MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
+    let ok = match regalloc_func_riscv(riscv64_lp64d(), f) {
+        MFuncRiscv => true
+        error => false
+    }
+    teko::assert::is_true(ok)
+}
+
+/**
+ * rr_natural_loops_riscv_two_block_loop_golden — the RISC-V mirror of the
+ * neutral `natural_loops` golden (#389 F2 review NIT 3): a two-block loop
+ * (`b0: jal b1`; `b1: jal b0`) numbers `b0`'s instruction at point 0 and `b1`'s
+ * at point 1, so the retreating edge (`b1`'s jump back to `b0`) yields exactly
+ * one `NaturalLoop{header_pt=0, latch_pt=1}`.
+ */
+#test
+fn rr_natural_loops_riscv_two_block_loop_golden() {
+    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(1 to u32)) }
+    let b1 = MBlockRiscv { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(0 to u32)) }
+    let f = MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
+    let o = rpo_block_order_riscv(f)
+    let stream = number_insts_riscv(f, o)
+    let loops = natural_loops_riscv(stream, o, reachable_blocks_riscv(f))
+    teko::assert::is_true(loops.len == (1 to u64))
+    teko::assert::is_true(loops[0].header_pt == (0 to u32))
+    teko::assert::is_true(loops[0].latch_pt == (1 to u32))
+}
+
+/**
+ * rr_diamond_fixture — an acyclic id-inverted diamond mirroring isel output: the
+ * MERGE block has id 1 (lowest) but is targeted by the arm blocks id 2/3, and
+ * `v10` is defined in the arms and used in the merge — the numbering inversion
+ * the #443 RPO fix handles. B0 compares `v0` with itself and branches on EQ via
+ * a fused `MBranchRiscv`, then a trailing `MJalRiscv` to the fall-through arm.
+ *
+ * @return MFuncRiscv  the diamond function
+ */
+fn rr_diamond_fixture() -> MFuncRiscv {
+    mut i0: []MInstRiscv = teko::list::empty()
+    i0 = teko::list::push(i0, li_riscv(rr_v(0), 1 to i32))
+    i0 = teko::list::push(i0, branch_riscv(MCond::EQ, rr_v(0), rr_v(0), 3 to u32))
+    i0 = teko::list::push(i0, jal_riscv(2 to u32))
+    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = i0 }
+    mut i1: []MInstRiscv = teko::list::empty()
+    i1 = teko::list::push(i1, rr_mov(rr_p(10), rr_v(10)))
+    i1 = teko::list::push(i1, ret_riscv())
+    let b1 = MBlockRiscv { id = 1; params = teko::list::push(teko::list::empty(), rr_v(10)); insts = i1 }
+    mut i2: []MInstRiscv = teko::list::empty()
+    i2 = teko::list::push(i2, li_riscv(rr_v(1), 42 to i32))
+    i2 = teko::list::push(i2, rr_mov(rr_v(10), rr_v(1)))
+    i2 = teko::list::push(i2, jal_riscv(1 to u32))
+    let b2 = MBlockRiscv { id = 2; params = teko::list::empty(); insts = i2 }
+    mut i3: []MInstRiscv = teko::list::empty()
+    i3 = teko::list::push(i3, li_riscv(rr_v(2), 99 to i32))
+    i3 = teko::list::push(i3, rr_mov(rr_v(10), rr_v(2)))
+    i3 = teko::list::push(i3, jal_riscv(1 to u32))
+    let b3 = MBlockRiscv { id = 3; params = teko::list::empty(); insts = i3 }
+    mut blocks: []MBlockRiscv = teko::list::empty()
+    blocks = teko::list::push(blocks, b0)
+    blocks = teko::list::push(blocks, b1)
+    blocks = teko::list::push(blocks, b2)
+    blocks = teko::list::push(blocks, b3)
+    MFuncRiscv { symbol = "main"; blocks = blocks; frame = teko::list::empty() }
+}
+
+#test
+fn rr_rpo_order_ranks_merge_after_arms() {
+    let order = rpo_block_order_riscv(rr_diamond_fixture())
+    teko::assert::is_true(order.len == 4 to u64)
+    teko::assert::is_true(order[0] == 0 to u32)
+    teko::assert::is_true(block_pos(order, 1 to u32) > block_pos(order, 2 to u32))
+    teko::assert::is_true(block_pos(order, 1 to u32) > block_pos(order, 3 to u32))
+}
+
+#test
+fn rr_rpo_numbering_places_arms_before_merge() {
+    let stream = rr_number(rr_diamond_fixture())
+    mut max_b2: u32 = 0 to u32
+    mut min_b1: u32 = 1000000 to u32
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.block_id == 2 to u32 { max_b2 = ni.point }
+        if ni.block_id == 1 to u32 {
+            if ni.point < min_b1 { min_b1 = ni.point }
+        }
+        i++
+    }
+    teko::assert::is_true(max_b2 < min_b1)
+}
+
+#test
+fn rr_regalloc_diamond_allocates_all_physical() {
+    let f = rr_diamond_fixture()
+    teko::assert::is_true(!all_physical_riscv(f))
+    let cf = match regalloc_func_riscv(riscv64_lp64d(), f) { MFuncRiscv as g => g; error => return }
+    teko::assert::is_true(all_physical_riscv(cf))
+}
+
+/**
+ * rr_dead_block_fixture — a reachable leaf (`mov a0=v0; ret`) plus an
+ * UNREACHABLE block id 7 whose `jal 0` retreats to the entry. The dead edge must
+ * NOT count as a loop back-edge (the #455 reachability lesson), so allocation
+ * succeeds even though block 7 lands last in the numbering and jumps backward.
+ *
+ * @return MFuncRiscv  the function with a dead retreating block
+ */
+fn rr_dead_block_fixture() -> MFuncRiscv {
+    mut i0: []MInstRiscv = teko::list::empty()
+    i0 = teko::list::push(i0, li_riscv(rr_v(0), 5 to i32))
+    i0 = teko::list::push(i0, rr_mov(rr_p(10), rr_v(0)))
+    i0 = teko::list::push(i0, ret_riscv())
+    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = i0 }
+    let b7 = MBlockRiscv { id = 7; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(0 to u32)) }
+    MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b7); frame = teko::list::empty() }
+}
+
+#test
+fn rr_dead_block_excluded_and_allocation_succeeds() {
+    let f = rr_dead_block_fixture()
+    teko::assert::is_false(u32_in(reachable_blocks_riscv(f), 7 to u32))
+    teko::assert::is_true(u32_in(rpo_block_order_riscv(f), 7 to u32))
+    let cf = match regalloc_func_riscv(riscv64_lp64d(), f) { MFuncRiscv as g => g; error => return }
+    teko::assert::is_true(all_physical_riscv(cf))
+}
+
+#test
+fn rr_rpo_defensive_paths() {
+    teko::assert::is_true(block_insts_of_riscv(rr_func(teko::list::push(teko::list::empty(), ret_riscv())), 99 to u32).len == 0 to u64)
+    let empty_f = MFuncRiscv { symbol = "main"; blocks = teko::list::empty(); frame = teko::list::empty() }
+    teko::assert::is_true(rpo_block_order_riscv(empty_f).len == 0 to u64)
+    teko::assert::is_true(reachable_blocks_riscv(empty_f).len == 0 to u64)
+    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), ret_riscv()) }
+    let b9 = MBlockRiscv { id = 9; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), ret_riscv()) }
+    let f2 = MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b9); frame = teko::list::empty() }
+    let ord2 = rpo_block_order_riscv(f2)
+    teko::assert::is_true(ord2.len == 2 to u64)
+    teko::assert::is_true(u32_in(ord2, 9 to u32))
+}
+
+#test
+fn rr_three_address_rewrite_prints_all_physical_golden() {
+    let insts = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
+        li_riscv(rr_v(0), 5 to i32)),
+        li_riscv(rr_v(1), 7 to i32)),
+        alu_r_riscv(MAluOpRiscv::Add, true, rr_v(2), rr_v(0), rr_v(1))),
+        rr_mov(rr_p(10), rr_v(2))),
+        ret_riscv())
+    let cf = match regalloc_func_riscv(riscv64_lp64d(), rr_func(insts)) { MFuncRiscv as g => g; error => return }
+    let text = minst_print_riscv(rr_module_of(cf))
+    teko::assert::is_true(all_physical_riscv(cf))
+    teko::assert::str_contains(text, "li %p5, #5")
+    teko::assert::str_contains(text, "li %p6, #7")
+    teko::assert::str_contains(text, "add %p7, %p5, %p6")
+    teko::assert::str_contains(text, "addi %p10, %p7, #0")
+    teko::assert::str_contains(text, "ret")
+}

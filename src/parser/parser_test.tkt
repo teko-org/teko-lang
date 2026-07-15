@@ -871,10 +871,168 @@ fn parses_loop_break_continue() {
     }
 }
 
+/** rejects_malformed_loop — a while-head with no body brace, and an unclosed infinite body, both
+    fail to parse (#517: `loop x` is now a while-condition `x` that then wants a `{`). */
 #test
 fn rejects_malformed_loop() {
-    teko::assert::is_true(stmt_errors("loop x"))   // no `{` after loop
-    teko::assert::is_true(stmt_errors("loop {"))   // unclosed loop body
+    teko::assert::is_true(stmt_errors("loop x"))
+    teko::assert::is_true(stmt_errors("loop {"))
+}
+
+/** parses_prefix_label — `OUTER: loop { break OUTER }` parses to a labeled `LoopStmt` (#517 prefix
+    label), empty `init`, whose body is a single `break OUTER`. */
+#test
+fn parses_prefix_label() {
+    match stmt_of("OUTER: loop { break OUTER }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.label == "OUTER")
+            teko::assert::is_true(l.init.len == 0)
+            teko::assert::is_true(l.body.len == 1)
+            match l.body[0] { BreakStmt as b => teko::assert::is_true(b.label == "OUTER"); _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** parses_while_head — `loop n < 3 { }` folds the condition into the body as a leading
+    `if !(n < 3) { break }` (#517 while-head), leaving `init` empty and `label` unset. */
+#test
+fn parses_while_head() {
+    match stmt_of("loop n < 3 { }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.label == "")
+            teko::assert::is_true(l.init.len == 0)
+            teko::assert::is_true(l.body.len == 1)
+            match l.body[0] { ExprStmt as es => match es.expr.kind { IfExpr => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** parses_bare_ident_while_head — `loop ready { }` treats `ready` as a boolean while-condition, NOT
+    a label (labels are the prefix form only) (#517). */
+#test
+fn parses_bare_ident_while_head() {
+    match stmt_of("loop ready { }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.label == "")
+            teko::assert::is_true(l.body.len == 1)
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** parses_range_head — `loop mut i in 0..3 { s = s + i }` desugars to a 3-statement `init`
+    (counter, `_hi`, `_first`) and a body folded with the guarded step + guard (#517 range). */
+#test
+fn parses_range_head() {
+    match stmt_of("loop mut i in 0..3 { s = s + i }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.label == "")
+            teko::assert::is_true(l.init.len == 3)
+            match l.init[0] { Binding as b => match b.target { SimpleName as sn => teko::assert::is_true(sn.name == "i"); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+            teko::assert::is_true(l.body.len == 4)
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** parses_range_head_inclusive — `loop mut i in 0..=3 { }` parses as an inclusive range (same
+    desugar shape as the exclusive form) (#517). */
+#test
+fn parses_range_head_inclusive() {
+    match stmt_of("loop mut i in 0..=3 { }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.init.len == 3)
+            teko::assert::is_true(l.body.len == 3)
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** rejects_range_destructure — a destructure target on a range (`loop mut { x } in 0..3`) is
+    rejected: a range yields a single value, not a struct (#517). */
+#test
+fn rejects_range_destructure() {
+    teko::assert::is_true(stmt_errors("loop mut { x } in 0..3 { }"))
+}
+
+/** rejects_loop_binding_no_separator — a `mut`-headed loop with neither `in` nor a 3-part `=` after
+    the binding target is rejected (#517). */
+#test
+fn rejects_loop_binding_no_separator() {
+    teko::assert::is_true(stmt_errors("loop mut i 5 { }"))
+}
+
+/** parses_foreach_head — `loop mut x in it { s = s + x }` desugars to a 1-statement `init`
+    (`mut _it = it`) and a 1-statement body (the `match _it() { … }` pull) (#517 for-each). */
+#test
+fn parses_foreach_head() {
+    match stmt_of("loop mut x in it { s = s + x }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.init.len == 1)
+            teko::assert::is_true(l.body.len == 1)
+            match l.body[0] { ExprStmt as es => match es.expr.kind { MatchExpr as me => teko::assert::is_true(me.arms.len == 2); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** parses_foreach_destructure_head — `loop mut { index; value } in it { }` expands the destructure
+    to per-field `mut` copies inside the pull arm; `init` is `mut _it = it` (#517, §5.5). */
+#test
+fn parses_foreach_destructure_head() {
+    match stmt_of("loop mut { index; value } in it { use_it() }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.init.len == 1)
+            teko::assert::is_true(l.body.len == 1)
+            match l.body[0] { ExprStmt as es => match es.expr.kind { MatchExpr as me => teko::assert::is_true(me.arms.len == 2); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** parses_three_part_head — `loop mut i = 0; i < 4; i++ { }` desugars to a 2-statement `init`
+    (counter, `_first`) and a body folded with the guarded step + condition guard (#517 3-part). */
+#test
+fn parses_three_part_head() {
+    match stmt_of("loop mut i = 0; i < 4; i++ { s = s + i }") {
+        LoopStmt as l => {
+            teko::assert::is_true(l.init.len == 2)
+            match l.init[0] { Binding as b => match b.target { SimpleName as sn => teko::assert::is_true(sn.name == "i"); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+            teko::assert::is_true(l.body.len == 4)
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/** rejects_three_part_missing_semicolon — a 3-part head missing the `;` after the init is rejected
+    (#517). */
+#test
+fn rejects_three_part_missing_semicolon() {
+    teko::assert::is_true(stmt_errors("loop mut i = 0 i < 4; i++ { }"))
+}
+
+/** rejects_loop_head_missing_body_brace — each `mut`-head form (range, 3-part cond/step, for-each)
+    requires a `{` body; the missing-brace and missing-cond-`;` diagnostics all reject (#517). */
+#test
+fn rejects_loop_head_missing_body_brace() {
+    teko::assert::is_true(stmt_errors("loop mut i in 0..3 x"))
+    teko::assert::is_true(stmt_errors("loop mut i = 0; i < 4 x { }"))
+    teko::assert::is_true(stmt_errors("loop mut i = 0; i < 4; i++ x"))
+    teko::assert::is_true(stmt_errors("loop mut x in it y"))
+}
+
+/** parses_underscore_as_underscore_discard — `_ as _` is a bindingless wildcard (≡ `_`, discard-as-
+    discard is coherent, not a contradiction); `_ as 5` (a non-name after `as`) is rejected the same
+    way it always was (#517). */
+#test
+fn parses_underscore_as_underscore_discard() {
+    match expr_of("match o { _ as _ => 0 }") {
+        MatchExpr as me => match me.arms[0].pattern { WildcardPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+        _ => teko::assert::is_true(false)
+    }
+    teko::assert::is_true(expr_errors("match o { _ as 5 => 0 }"))
 }
 
 // appended to parser_test.tkt — P4e if/match-expression tests (reuses expr_of).
@@ -914,6 +1072,67 @@ fn rejects_malformed_if_match() {
     teko::assert::is_true(expr_errors("if c { a } else"))   // `else` with no block/if
     teko::assert::is_true(expr_errors("match x a"))   // no `{` after subject
     teko::assert::is_true(expr_errors("match x { }"))   // a match needs at least one arm
+}
+
+/** rejects_underscore_as_name — `_ as x` (a discard bound to a name) is a semantic contradiction
+    (owner ruling, #517): `_` says "discard this value", `as x` says "capture it as x" — you cannot
+    re-capture what you discarded. The parser rejects it OUTRIGHT, regardless of subject/context. */
+#test
+fn rejects_underscore_as_name() {
+    teko::assert::is_true(expr_errors("match o { _ as x => x }"))
+    teko::assert::is_true(expr_errors("match o { null => 0; _ as x => x }"))
+}
+
+/** rejects_underscore_declarations — the write-only discard `_` (owner ruling 2026-07-15) may NOT
+    carry a declarative keyword or a type: `let _`, `mut _`, `const _`, and `_: T` targets are hard
+    parse errors. The valid way to evaluate an expression for effect and drop its result is the
+    keyword-less discard-assign `_ = expr`. */
+#test
+fn rejects_underscore_declarations() {
+    teko::assert::is_true(stmt_errors("let _ = 1"))
+    teko::assert::is_true(stmt_errors("mut _ = 1"))
+    teko::assert::is_true(stmt_errors("const _ = 1"))
+    teko::assert::is_true(stmt_errors("let _: i32 = 1"))
+    teko::assert::is_true(stmt_errors("loop mut _ in xs { }"))
+}
+
+/** rejects_underscore_read_positions — `_` is WRITE-ONLY: every R-value / read appearance is a hard
+    parse error (owner ruling 2026-07-15). A bare read, an arithmetic/unary operand, a field/index
+    receiver, a call argument, an array element, a compound-assign target, and a `return _` are all
+    rejected — `_` carries no value. The pure-underscore-run lexer errors (`__`, `_1`) also surface
+    here as parse-time failures. */
+#test
+fn rejects_underscore_read_positions() {
+    teko::assert::is_true(expr_errors("_"))
+    teko::assert::is_true(expr_errors("_ + 1"))
+    teko::assert::is_true(expr_errors("-_"))
+    teko::assert::is_true(expr_errors("_.field"))
+    teko::assert::is_true(expr_errors("_[0]"))
+    teko::assert::is_true(expr_errors("[_]"))
+    teko::assert::is_true(expr_errors("f(_)"))
+    teko::assert::is_true(expr_errors("concat(a, _)"))
+    teko::assert::is_true(expr_errors("__"))
+    teko::assert::is_true(expr_errors("_1"))
+    teko::assert::is_true(stmt_errors("y = _"))
+    teko::assert::is_true(stmt_errors("_ += 1"))
+    teko::assert::is_true(stmt_errors("return _"))
+}
+
+/** parses_discard_assign — the keyword-less `_ = expr` is the ONE valid discard: it evaluates `expr`
+    for its side effect and binds nothing, lowering to a SimpleName "_" Binding (codegen emits
+    `(void)(expr);`). Underscore-plus-letter identifiers (`_foo`, `__bar`) remain ordinary reads. */
+#test
+fn parses_discard_assign() {
+    teko::assert::is_false(stmt_errors("_ = side()"))
+    match stmt_of("_ = side()") {
+        Binding as b => {
+            teko::assert::is_true(b.kind == BindKind::Let)
+            match b.target { SimpleName as sn => teko::assert::is_true(sn.name == "_"); _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    match expr_of("_foo") { Var as v => teko::assert::is_true(v.name == "_foo"); _ => teko::assert::is_true(false) }
+    match expr_of("__bar") { Var as v => teko::assert::is_true(v.name == "__bar"); _ => teko::assert::is_true(false) }
 }
 
 // appended to parser_test.tkt — R-main-b main-file tests.
@@ -973,6 +1192,26 @@ fn func_of(source: str) -> Function | error {
 fn func_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_function(toks, 0, false, "", false, false) { Parsed<Decl> => false; error => true }
+}
+
+/** parses_discard_parameter — the parser ACCEPTS a `_` discard parameter (the CHECKER, not the
+    parser, gates it to interface impls / base overrides), including two `_` in a row; each is a
+    Param named "_" with no type. A `_: T` discard parameter (a type on the discard) is a parse
+    error (owner refinement 2026-07-15). */
+#test
+fn parses_discard_parameter() {
+    match func_of("fn f(x: i64, _, _, p: i64) -> i64 { x }") {
+        Function as f => {
+            teko::assert::is_true(f.params.len == 4)
+            teko::assert::is_true(f.params[1].name == "_")
+            teko::assert::is_false(f.params[1].has_type)
+            teko::assert::is_true(f.params[2].name == "_")
+            teko::assert::is_false(f.params[2].has_type)
+            teko::assert::is_true(f.params[3].name == "p")
+        }
+        _ => teko::assert::is_true(false)
+    }
+    teko::assert::is_true(func_errors("fn f(_: i64) -> i64 { 0 }"))
 }
 
 #test

@@ -1,0 +1,913 @@
+/**
+ * NumberedInstX86 — one `MInstX86` tagged with its linear program point and its
+ * source block id, the x86 mirror of the neutral `NumberedInst` (which wraps an
+ * arm64 `MInst`). The coordinate system every x86 liveness pass indexes by:
+ * points are dense and increase in RPO block order. Only the wrapped
+ * instruction type is ISA-specific — the interval/scan machinery it feeds is
+ * register-abstract and single-sourced (§5.1 of the B1 plan).
+ *
+ * @since #386 B1-4
+ */
+type NumberedInstX86 = struct {
+    /**
+     * point — the instruction's linear program point (0-based, RPO block order).
+     */
+    point: u32
+    /**
+     * block_id — the `MBlockX86` this instruction was flattened from.
+     */
+    block_id: u32
+    /**
+     * inst — the x86 machine instruction at this point.
+     */
+    inst: MInstX86
+}
+
+/**
+ * shift_count_reg_x86 — the physical RCX register (GPR id 1), whose low byte
+ * `CL` a variable shift's count is pinned into before `shl`/`shr`/`sar dst, cl`
+ * (isel's `select_shift_x86`, §4.1). `inst_regs_x86` reports this as an implicit
+ * USE of the shift so the shifted destination's live range overlaps the RCX pin
+ * and the scan keeps the destination off RCX.
+ *
+ * @return MReg  the physical RCX register (GPR id 1)
+ */
+fn shift_count_reg_x86() -> MReg {
+    preg(1, MRegClass::GPR)
+}
+
+/**
+ * inst_regs_x86 — decompose one `MInstX86` into its def/use registers, the x86
+ * mirror of the neutral `inst_regs` over the 19-case `MInstX86` variant
+ * (`minst_x86.tks:490`). Feeds the SAME register-abstract interval/scan core the
+ * arm64 walk feeds, so the def/use table is the single source of truth both
+ * `compute_intervals_x86` and `rewrite_inst_x86` read. Three x86-specific shapes
+ * the table encodes:
+ *
+ * The two-address read-modify-write ops (`MAluRmX86`/`MImulX86`/`MShiftX86`/
+ * `MNegX86`/`MNotX86`) report `dst` as BOTH a def and a use (the `MMovK`
+ * precedent, `regalloc.tks:421`), because isel seeded `dst` with the left
+ * operand via a preceding `MMovX86` copy (§4.2). `MShiftX86` additionally uses
+ * the CL-pinned count register (RCX) so the shifted destination stays off RCX.
+ *
+ * `MDivSeqX86` reports `ir_call(dst, true, [a, b])` — `is_call = true` (the
+ * corrected §4.4 contract, from the B1-3 adversarial review). The frozen
+ * `InstRegs` carries a single `def_reg` and no clobber list, so the divide's
+ * RAX + RDX clobbers cannot be expressed as two fixed defs; and at regalloc time
+ * the stream holds ONLY the `MDivSeqX86` macro (isel emits `mov rax, a` / `cqo` /
+ * `idiv` / `mov dst, rax` at encode, B1-5, so there are no explicit RAX/RDX pin
+ * instructions to build fixed intervals from). Modelling the divide as a call
+ * makes every value live ACROSS it avoid the whole caller-saved set (RAX + RDX
+ * included); the DIVISOR `b` is itself protected because its last use IS the
+ * divide point and `crosses_call` uses the `(start, end]` boundary (end == the
+ * call point counts as crossing), so `b` also avoids RAX/RDX. Sound, mildly
+ * pessimistic; a fixed-clobber refinement is a named 0.3.1 item.
+ *
+ * @param MInstX86 inst  the instruction to decompose
+ * @return InstRegs  its def/use decomposition (the neutral `InstRegs`, reused)
+ */
+fn inst_regs_x86(inst: MInstX86) -> InstRegs {
+    match inst {
+        MMovImmX86 as x => ir_def(x.dst)
+        MMovX86 as x => ir_def_use(x.dst, one_reg(x.src))
+        MAluRmX86 as x => ir_def_use(x.dst, two_regs(x.dst, x.src))
+        MImulX86 as x => ir_def_use(x.dst, two_regs(x.dst, x.src))
+        MDivSeqX86 as x => ir_call(x.dst, true, two_regs(x.a, x.b))
+        MShiftX86 as x => ir_def_use(x.dst, two_regs(x.dst, shift_count_reg_x86()))
+        MCmpX86 as x => ir_use(two_regs(x.a, x.b))
+        MSetccX86 as x => ir_def(x.dst)
+        MJccX86 => ir_none()
+        MNegX86 as x => ir_def_use(x.dst, one_reg(x.dst))
+        MNotX86 as x => ir_def_use(x.dst, one_reg(x.dst))
+        MLoadX86 as x => ir_def_use(x.dst, one_reg(x.mem.base))
+        MStoreX86 as x => ir_use(two_regs(x.src, x.mem.base))
+        MFrameAddrX86 as x => ir_def(x.dst)
+        MLeaRipX86 as x => ir_def(x.dst)
+        MJmpX86 => ir_none()
+        MCallX86 as x => ir_call(x.ret_reg, x.has_result, x.uses)
+        MCallIndX86 as x => ir_call(x.ret_reg, x.has_result, cons_reg(x.target, x.uses))
+        MRetX86 => ir_none()
+    }
+}
+
+/**
+ * is_terminator_x86 — whether `inst` ends a block: an `MRetX86`, an
+ * unconditional `MJmpX86`, or a conditional `MJccX86` (the x86 mirror of the
+ * neutral `is_terminator`).
+ *
+ * @param MInstX86 inst  the instruction
+ * @return bool  true iff it is a terminator
+ */
+fn is_terminator_x86(inst: MInstX86) -> bool {
+    match inst {
+        MRetX86 => true
+        MJmpX86 => true
+        MJccX86 => true
+        _ => false
+    }
+}
+
+/**
+ * terminator_target_x86 — the machine-block a branch/jump transfers to
+ * (`MJmpX86`/`MJccX86`), or `has = false` for any other instruction (the x86
+ * mirror of the neutral `terminator_target`; `MRetX86` names no target). Reuses
+ * the neutral `TargetOpt`.
+ *
+ * @param MInstX86 inst  the instruction
+ * @return TargetOpt  its branch target, or none
+ */
+fn terminator_target_x86(inst: MInstX86) -> TargetOpt {
+    match inst {
+        MJmpX86 as x => TargetOpt { has = true; target = x.target }
+        MJccX86 as x => TargetOpt { has = true; target = x.target }
+        _ => TargetOpt { has = false; target = 0 }
+    }
+}
+
+/**
+ * block_insts_of_x86 — the instruction list of `f`'s block with id `id`, or the
+ * empty list if no such block (a defensive default; every real target names a
+ * present block). The x86 mirror of the neutral `block_insts_of`.
+ *
+ * @param MFuncX86 f  the function to search
+ * @param u32 id  the block id
+ * @return []MInstX86  the block's instructions, or empty
+ */
+fn block_insts_of_x86(f: MFuncX86, id: u32) -> []MInstX86 {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id == id { return f.blocks[i].insts }
+        i++
+    }
+    teko::list::empty()
+}
+
+/**
+ * block_successors_x86 — the CFG successors of `f`'s block `id`: every distinct
+ * terminator target in the block (`MJccX86` taken edge plus a trailing
+ * unconditional `MJmpX86`), collected in instruction order for a deterministic
+ * RPO. The x86 mirror of the neutral `block_successors`. Reuses `add_unique_u32`.
+ *
+ * @param MFuncX86 f  the function
+ * @param u32 id  the block whose successors to enumerate
+ * @return []u32  the distinct successor block ids, in terminator order
+ */
+fn block_successors_x86(f: MFuncX86, id: u32) -> []u32 {
+    let insts = block_insts_of_x86(f, id)
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= insts.len { break }
+        let t = terminator_target_x86(insts[i])
+        if t.has { out = add_unique_u32(out, t.target) }
+        i++
+    }
+    out
+}
+
+/**
+ * rpo_visit_x86 — the post-order DFS step over `MFuncX86`'s CFG: enter `id`
+ * (once), recurse into every successor in order, then append `id` to the
+ * post-order. Threads the visited set + accumulator functionally so no block is
+ * entered twice. The x86 mirror of the neutral `rpo_visit`; reuses the neutral
+ * `RpoState`.
+ *
+ * @param MFuncX86 f  the function whose CFG is walked
+ * @param u32 id  the block id to visit
+ * @param RpoState st  the visited set + post-order so far
+ * @return RpoState  the updated visited set + post-order
+ */
+fn rpo_visit_x86(f: MFuncX86, id: u32, st: RpoState) -> RpoState {
+    if u32_in(st.visited, id) { return st }
+    let succs = block_successors_x86(f, id)
+    mut cur = RpoState { visited = teko::list::push(st.visited, id); post = st.post }
+    mut i: u64 = 0
+    loop {
+        if i >= succs.len { break }
+        cur = rpo_visit_x86(f, succs[i], cur)
+        i++
+    }
+    RpoState { visited = cur.visited; post = teko::list::push(cur.post, id) }
+}
+
+/**
+ * append_unvisited_x86 — `order` extended with any of `f`'s block ids not
+ * already present, in block-list order, so the numbering stays TOTAL: an
+ * unreachable block still receives program points (no vreg is left un-numbered).
+ * The x86 mirror of the neutral `append_unvisited`.
+ *
+ * @param MFuncX86 f  the function
+ * @param []u32 order  the reachable-block order so far
+ * @return []u32  the order extended with any unreachable block ids
+ */
+fn append_unvisited_x86(f: MFuncX86, order: []u32) -> []u32 {
+    mut out = order
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let bid = f.blocks[i].id
+        if !u32_in(out, bid) { out = teko::list::push(out, bid) }
+        i++
+    }
+    out
+}
+
+/**
+ * rpo_block_order_x86 — the reverse-post-order block-id sequence of `f`, entry
+ * first: a topological linearization of the acyclic CFG so every def precedes
+ * all its uses (the #443 RPO lesson, mirrored). Unreachable blocks are appended
+ * last so the order covers every block. The x86 mirror of the neutral
+ * `rpo_block_order`; reuses `reverse_u32`.
+ *
+ * @param MFuncX86 f  the selected function
+ * @return []u32  the RPO block-id order (entry first)
+ */
+fn rpo_block_order_x86(f: MFuncX86) -> []u32 {
+    if f.blocks.len == 0 { return teko::list::empty() }
+    let entry = f.blocks[0].id
+    let st = rpo_visit_x86(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() })
+    append_unvisited_x86(f, reverse_u32(st.post))
+}
+
+/**
+ * reachable_blocks_x86 — the block ids reachable from `f`'s entry, via the same
+ * post-order DFS `rpo_block_order_x86` walks. A block absent from this set is
+ * dead code (a `match`'s defensive fallback past an irrefutable final arm, which
+ * no branch targets); the back-edge test uses this set to EXCLUDE dead-block
+ * edges, since a dead block cannot form a loop the allocator must model (the
+ * #455 reachability lesson, mirrored). The x86 mirror of the neutral
+ * `reachable_blocks`.
+ *
+ * @param MFuncX86 f  the selected function
+ * @return []u32  the entry-reachable block ids (the DFS-visited set)
+ */
+fn reachable_blocks_x86(f: MFuncX86) -> []u32 {
+    if f.blocks.len == 0 { return teko::list::empty() }
+    let entry = f.blocks[0].id
+    rpo_visit_x86(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() }).visited
+}
+
+/**
+ * number_insts_x86 — flatten `f`'s blocks into one linearly-numbered
+ * instruction stream in RPO block order, so every later pass (interval
+ * computation, the scan, the rewrite) indexes liveness by these dense points.
+ * The x86 mirror of the neutral `number_insts`, producing `NumberedInstX86`.
+ *
+ * @param MFuncX86 f  the selected function
+ * @param []u32 order  the RPO block-id order (from `rpo_block_order_x86`)
+ * @return []NumberedInstX86  the flattened, RPO-numbered stream
+ */
+fn number_insts_x86(f: MFuncX86, order: []u32) -> []NumberedInstX86 {
+    mut out: []NumberedInstX86 = teko::list::empty()
+    mut p: u32 = 0
+    mut bi: u64 = 0
+    loop {
+        if bi >= order.len { break }
+        let bid = order[bi]
+        let insts = block_insts_of_x86(f, bid)
+        mut ii: u64 = 0
+        loop {
+            if ii >= insts.len { break }
+            out = teko::list::push(out, NumberedInstX86 { point = p; block_id = bid; inst = insts[ii] })
+            p = p + 1
+            ii++
+        }
+        bi++
+    }
+    out
+}
+
+/**
+ * collect_events_x86 — the raw def/use touches of the whole x86 stream, in
+ * program order (a def before its uses at a shared point). The x86 mirror of the
+ * neutral `collect_events`, driven by `inst_regs_x86`; builds the neutral
+ * register-abstract `RegEvent` the interval passes consume.
+ *
+ * @param []NumberedInstX86 stream  the numbered stream
+ * @return []RegEvent  every register touch
+ */
+fn collect_events_x86(stream: []NumberedInstX86) -> []RegEvent {
+    mut out: []RegEvent = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        let ir = inst_regs_x86(ni.inst)
+        if ir.has_def {
+            out = teko::list::push(out, RegEvent { reg = ir.def_reg; point = ni.point; is_def = true })
+        }
+        mut u: u64 = 0
+        loop {
+            if u >= ir.uses.len { break }
+            out = teko::list::push(out, RegEvent { reg = ir.uses[u]; point = ni.point; is_def = false })
+            u++
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * call_points_of_x86 — the program points of every call (including a
+ * `MDivSeqX86`, which reports `is_call` per the corrected §4.4 contract), the
+ * clobber boundaries a `crosses_call` interval avoids caller-saved registers
+ * over. The x86 mirror of the neutral `call_points_of`, driven by
+ * `inst_regs_x86`.
+ *
+ * @param []NumberedInstX86 stream  the numbered stream
+ * @return []u32  the call points
+ */
+fn call_points_of_x86(stream: []NumberedInstX86) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        if inst_regs_x86(stream[i].inst).is_call { out = teko::list::push(out, stream[i].point) }
+        i++
+    }
+    out
+}
+
+/**
+ * next_terminator_point_x86 — the smallest point at-or-after `from` whose
+ * instruction is a terminator (the result-pin extension target), or `from` if
+ * none follows. The x86 mirror of the neutral `next_terminator_point`, driven by
+ * `is_terminator_x86`.
+ *
+ * @param []NumberedInstX86 stream  the numbered stream
+ * @param u32 from  the def point to extend from
+ * @return u32  the terminator point, or `from`
+ */
+fn next_terminator_point_x86(stream: []NumberedInstX86, from: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.point >= from && is_terminator_x86(ni.inst) { return ni.point }
+        i++
+    }
+    from
+}
+
+/**
+ * finalize_pin_x86 — close a physical pin interval, applying the result-pin
+ * extension: a def-started pin with no later use (its `end` equals its `start`)
+ * is extended to the next terminator so a result pin lives to the `ret`. The x86
+ * mirror of the neutral `finalize_pin`; reuses the neutral `mk_interval`.
+ *
+ * @param MReg r  the physical register
+ * @param u32 start  the pin's def/entry point
+ * @param u32 end  the pin's last use
+ * @param bool def_started  whether the pin was opened by a def
+ * @param []NumberedInstX86 stream  the numbered stream (for pin extension)
+ * @param []u32 call_points  the call points (for `crosses_call`)
+ * @return LiveInterval  the finalized pin interval
+ */
+fn finalize_pin_x86(r: MReg, start: u32, end: u32, def_started: bool, stream: []NumberedInstX86, call_points: []u32) -> LiveInterval {
+    let real_end = if def_started && end == start {
+        let term = next_terminator_point_x86(stream, start)
+        if term > end { term } else { end }
+    } else {
+        end
+    }
+    mk_interval(r, start, real_end, true, call_points)
+}
+
+/**
+ * phys_intervals_x86 — a physical register's pin intervals: a physreg is reused
+ * (an arg pin at entry, a result/CL/RCX pin at a use), so a def STARTS a fresh
+ * interval, a use before any def is entry-live from point 0, and a def-started
+ * pin with no later use is a result pin extended to its terminator. The x86
+ * mirror of the neutral `phys_intervals`; reuses `reg_eq` and closes each
+ * interval through `finalize_pin_x86`.
+ *
+ * @param []RegEvent events  every register touch (in program order)
+ * @param MReg r  the physical register
+ * @param []NumberedInstX86 stream  the numbered stream (for pin extension)
+ * @param []u32 call_points  the call points (for `crosses_call`)
+ * @return []LiveInterval  its one-or-more pin intervals
+ */
+fn phys_intervals_x86(events: []RegEvent, r: MReg, stream: []NumberedInstX86, call_points: []u32) -> []LiveInterval {
+    mut out: []LiveInterval = teko::list::empty()
+    mut have_open: bool = false
+    mut def_started: bool = false
+    mut cur_start: u32 = 0
+    mut cur_end: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= events.len { break }
+        let e = events[i]
+        if reg_eq(e.reg, r) {
+            if e.is_def {
+                if have_open { out = teko::list::push(out, finalize_pin_x86(r, cur_start, cur_end, def_started, stream, call_points)) }
+                cur_start = e.point
+                cur_end = e.point
+                have_open = true
+                def_started = true
+            } else {
+                if have_open {
+                    if e.point > cur_end { cur_end = e.point }
+                } else {
+                    cur_start = 0
+                    cur_end = e.point
+                    have_open = true
+                    def_started = false
+                }
+            }
+        }
+        i++
+    }
+    if have_open { out = teko::list::push(out, finalize_pin_x86(r, cur_start, cur_end, def_started, stream, call_points)) }
+    out
+}
+
+/**
+ * block_first_point_x86 — the smallest program point of any instruction in
+ * block `block_id` of the x86 stream, or 0 when absent. The stream is
+ * RPO-numbered, so this is the block's entry point (a loop header's `header_pt`).
+ * The x86 mirror of the neutral `block_first_point`.
+ *
+ * @param []NumberedInstX86 stream  the RPO-numbered stream
+ * @param u32 block_id  the block whose first point to find
+ * @return u32  the block's smallest program point (0 if absent)
+ */
+fn block_first_point_x86(stream: []NumberedInstX86, block_id: u32) -> u32 {
+    mut have: bool = false
+    mut best: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.block_id == block_id {
+            if !have || ni.point < best { best = ni.point; have = true }
+        }
+        i++
+    }
+    best
+}
+
+/**
+ * natural_loops_x86 — every natural loop of the reachable x86 CFG, one per
+ * retreating (loop back-)edge (`pos(target) <= pos(source)` on an entry-reachable
+ * source): its target is the loop header and its source-branch point the latch.
+ * Dead-block sources are excluded (a dead edge is not a loop) and acyclic
+ * `if`/`match` nesting has no retreating edge, so the result is empty for the
+ * acyclic subset. The x86 mirror of the neutral `natural_loops`; feeds the
+ * shared `extend_over_loops`, superseding the back-edge honest-stop bool.
+ *
+ * @param []NumberedInstX86 stream  the RPO-numbered stream
+ * @param []u32 order  the RPO block-id order
+ * @param []u32 reachable  the entry-reachable block ids
+ * @return []NaturalLoop  one loop span per retreating edge
+ */
+fn natural_loops_x86(stream: []NumberedInstX86, order: []u32, reachable: []u32) -> []NaturalLoop {
+    mut out: []NaturalLoop = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        let t = terminator_target_x86(ni.inst)
+        if t.has && u32_in(reachable, ni.block_id) {
+            if block_pos(order, t.target) <= block_pos(order, ni.block_id) {
+                out = teko::list::push(out, NaturalLoop { header_pt = block_first_point_x86(stream, t.target); latch_pt = ni.point })
+            }
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * compute_intervals_x86 — the liveness pass over the x86 stream: one walk driven
+ * by `inst_regs_x86`, producing the virtual intervals to color and the fixed pin
+ * intervals to block (both the register-abstract `LiveInterval`, reused). The
+ * ISA-specific walk (events, call points, natural loops, pin extension) is
+ * mirrored; the register-abstract processing (`distinct_regs`, `virt_interval`,
+ * `extend_over_loops`) is reused so the subtle interval logic stays
+ * single-sourced. The naive virtual intervals are widened over every natural
+ * loop (§6.2), so header-live values survive the body across the back-edge — the
+ * loops the honest-stop once refused now allocate. The x86 mirror of the neutral
+ * `compute_intervals`.
+ *
+ * @param []NumberedInstX86 stream  the RPO-numbered instruction stream
+ * @param []u32 order  the RPO block-id order (for the natural-loop test)
+ * @param []u32 reachable  the entry-reachable block ids (for the natural-loop test)
+ * @return IntervalSet | error  the computed intervals
+ */
+fn compute_intervals_x86(stream: []NumberedInstX86, order: []u32, reachable: []u32) -> IntervalSet | error {
+    let events = collect_events_x86(stream)
+    let regs = distinct_regs(events)
+    let cps = call_points_of_x86(stream)
+    mut virt: []LiveInterval = teko::list::empty()
+    mut fixed: []LiveInterval = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= regs.len { break }
+        let r = regs[i]
+        if r.is_phys {
+            let pins = phys_intervals_x86(events, r, stream, cps)
+            mut j: u64 = 0
+            loop {
+                if j >= pins.len { break }
+                fixed = teko::list::push(fixed, pins[j])
+                j++
+            }
+        } else {
+            virt = teko::list::push(virt, virt_interval(events, r, cps))
+        }
+        i++
+    }
+    virt = extend_over_loops(virt, natural_loops_x86(stream, order, reachable), cps)
+    IntervalSet { virt = virt; fixed = fixed; call_points = cps }
+}
+
+/**
+ * map_minst_x86 — a copy of `inst` with every `MReg` field replaced through
+ * `table` (a flat per-case reconstruction over the 19-case variant, mirroring
+ * `inst_regs_x86`'s dispatch, and the neutral `map_minst_regs`). `MCallX86`/
+ * `MCallIndX86` map their `uses` element-wise, their `ret_reg`, and (indirect)
+ * their `target`. This is the single point the x86 machine-IR's register-field
+ * shape is walked for rewriting — a missed case would leak a virtual register
+ * into the output, which `all_physical_x86` catches. Reuses the neutral
+ * `subst_find`/`map_regs_list` (register-abstract) and the x86 constructors.
+ *
+ * @param MInstX86 inst  the instruction to rewrite
+ * @param []SubstEntry table  the substitution table
+ * @return MInstX86  the rewritten instruction
+ */
+fn map_minst_x86(inst: MInstX86, table: []SubstEntry) -> MInstX86 {
+    match inst {
+        MMovImmX86 as x => movimm_x86(subst_find(table, x.dst), x.imm64, x.wide)
+        MMovX86 as x => mov_x86(subst_find(table, x.dst), subst_find(table, x.src), x.wide)
+        MAluRmX86 as x => alu_rm_x86(x.op, subst_find(table, x.dst), subst_find(table, x.src), x.wide)
+        MImulX86 as x => imul_x86(subst_find(table, x.dst), subst_find(table, x.src), x.wide)
+        MDivSeqX86 as x => divseq_x86(subst_find(table, x.dst), subst_find(table, x.a), subst_find(table, x.b), x.is_signed, x.is_rem, x.wide)
+        MShiftX86 as x => shift_x86(x.op, subst_find(table, x.dst), x.wide)
+        MCmpX86 as x => cmp_x86(subst_find(table, x.a), subst_find(table, x.b), x.wide)
+        MSetccX86 as x => setcc_x86(subst_find(table, x.dst), x.cond)
+        MJccX86 as x => jcc_x86(x.cond, x.target)
+        MNegX86 as x => neg_x86(subst_find(table, x.dst), x.wide)
+        MNotX86 as x => not_x86(subst_find(table, x.dst), x.wide)
+        MLoadX86 as x => load_x86(x.size, x.sign, subst_find(table, x.dst), MMem { base = subst_find(table, x.mem.base); offset = x.mem.offset })
+        MStoreX86 as x => store_x86(x.size, subst_find(table, x.src), MMem { base = subst_find(table, x.mem.base); offset = x.mem.offset })
+        MFrameAddrX86 as x => frame_addr_x86(subst_find(table, x.dst), x.slot)
+        MLeaRipX86 as x => lea_rip_x86(subst_find(table, x.dst), x.sym, x.kind)
+        MJmpX86 as x => jmp_x86(x.target)
+        MCallX86 as x => call_x86(x.sym, map_regs_list(x.uses, table), subst_find(table, x.ret_reg), x.has_result, x.variadic)
+        MCallIndX86 as x => call_ind_x86(subst_find(table, x.target), map_regs_list(x.uses, table), subst_find(table, x.ret_reg), x.has_result)
+        MRetX86 => ret_x86()
+    }
+}
+
+/**
+ * minst_x86_single — a one-element x86 instruction list (the x86 mirror of the
+ * neutral `minst_single`).
+ *
+ * @param MInstX86 x  the instruction
+ * @return []MInstX86  the singleton list
+ */
+fn minst_x86_single(x: MInstX86) -> []MInstX86 {
+    teko::list::push(teko::list::empty(), x)
+}
+
+/**
+ * minst_x86_cat — `a` followed by every element of `b` (the x86 mirror of the
+ * neutral `minst_cat`).
+ *
+ * @param []MInstX86 a  the prefix list
+ * @param []MInstX86 b  the suffix list
+ * @return []MInstX86  the concatenation
+ */
+fn minst_x86_cat(a: []MInstX86, b: []MInstX86) -> []MInstX86 {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * emit_gpr_reload_x86 — the two-instruction GPR spill reload into `sv`: compute
+ * the slot address into `sv` (`lea sv, [frame slot]`), then load the slot's
+ * qword into `sv` (base == dst is legal). Both the address and the value live in
+ * `sv`. The x86 mirror of the neutral `emit_gpr_reload`, over `frame_addr_x86`/
+ * `load_x86`.
+ *
+ * @param MReg sv  the GPR scratch to reload into
+ * @param u32 slot  the absolute frame slot
+ * @return []MInstX86  the reload sequence
+ */
+fn emit_gpr_reload_x86(sv: MReg, slot: u32) -> []MInstX86 {
+    let fa = frame_addr_x86(sv, slot)
+    let ld = load_x86(MMemSizeX86::Q, false, sv, MMem { base = sv; offset = 0 to i32 })
+    teko::list::push(minst_x86_single(fa), ld)
+}
+
+/**
+ * emit_gpr_store_x86 — the two-instruction GPR spill store of the value already
+ * in `dsv`: compute the slot address into a distinct scratch `asv`, then store
+ * `dsv`'s qword to `[asv]`. The x86 mirror of the neutral `emit_gpr_store`, over
+ * `frame_addr_x86`/`store_x86`.
+ *
+ * @param MReg dsv  the GPR scratch holding the value to store
+ * @param MReg asv  a distinct GPR scratch for the slot address
+ * @param u32 slot  the absolute frame slot
+ * @return []MInstX86  the store sequence
+ */
+fn emit_gpr_store_x86(dsv: MReg, asv: MReg, slot: u32) -> []MInstX86 {
+    let fa = frame_addr_x86(asv, slot)
+    let st = store_x86(MMemSizeX86::Q, dsv, MMem { base = asv; offset = 0 to i32 })
+    teko::list::push(minst_x86_single(fa), st)
+}
+
+/**
+ * UseAccX86 — the fold state while substituting an x86 instruction's use
+ * operands: the substitution table, the accumulated reload sequence (as
+ * `MInstX86`), and the next reload-scratch index. The x86 mirror of the neutral
+ * `UseAcc` (whose `reloads` are arm64 `MInst`, so the type is mirrored, not
+ * reused).
+ *
+ * @since #386 B1-4
+ */
+type UseAccX86 = struct {
+    /**
+     * table — the substitution entries so far.
+     */
+    table: []SubstEntry
+    /**
+     * reloads — the reload instructions so far (emitted before the inst).
+     */
+    reloads: []MInstX86
+    /**
+     * nth — the next spill-reload scratch index.
+     */
+    nth: u32
+}
+
+/**
+ * add_use_subst_x86 — the substitution table extended for one instruction
+ * operand use `u`: a physical pin or an already-mapped id is left as-is; an
+ * `InReg` use maps to its color; a `Spilled` GPR use draws the next reload
+ * scratch, whose reload is appended. FPR spills are ruled out upstream
+ * (`detect_fpr_spill_x86`), so the scratch is always GPR. The x86 mirror of the
+ * neutral `add_use_subst`; reuses `subst_has`/`assign_lookup`/`spill_scratch`.
+ *
+ * @param AbiDescriptor abi  the register file (for spill scratch)
+ * @param ScanResult sr  the allocation
+ * @param MReg u  the use operand
+ * @param u32 frame_base  the first spill frame slot index
+ * @param UseAccX86 acc  the table/reloads/counter so far
+ * @return UseAccX86  the updated accumulator
+ */
+fn add_use_subst_x86(abi: AbiDescriptor, sr: ScanResult, u: MReg, frame_base: u32, acc: UseAccX86) -> UseAccX86 {
+    if u.is_phys { return acc }
+    if subst_has(acc.table, u.id) { return acc }
+    let la = assign_lookup(sr, u.id)
+    if !la.found { return acc }
+    if la.is_spill {
+        let sv = spill_scratch(abi, MRegClass::GPR, acc.nth)
+        let reloads2 = minst_x86_cat(acc.reloads, emit_gpr_reload_x86(sv, frame_base + la.slot))
+        let table2 = teko::list::push(acc.table, SubstEntry { vid = u.id; to = sv })
+        return UseAccX86 { table = table2; reloads = reloads2; nth = acc.nth + 1 }
+    }
+    let table3 = teko::list::push(acc.table, SubstEntry { vid = u.id; to = preg(la.phys, u.reg_class) })
+    UseAccX86 { table = table3; reloads = acc.reloads; nth = acc.nth }
+}
+
+/**
+ * rewrite_inst_x86 — expand one instruction into its final physical sequence:
+ * the reloads for its spilled uses, the register-substituted instruction, and
+ * the store for a spilled def. Non-spilled operands map to their `InReg`
+ * physreg; physical pins pass through. Assumes GPR-only spills (guaranteed by
+ * `regalloc_func_x86`'s `detect_fpr_spill_x86` pre-check). The x86 mirror of the
+ * neutral `rewrite_inst`.
+ *
+ * @param AbiDescriptor abi  the register file (for spill scratch)
+ * @param ScanResult sr  the allocation
+ * @param MInstX86 inst  the instruction to rewrite
+ * @param u32 frame_base  the first spill frame slot index
+ * @return []MInstX86  the reloads ++ the rewritten instruction ++ the store
+ */
+fn rewrite_inst_x86(abi: AbiDescriptor, sr: ScanResult, inst: MInstX86, frame_base: u32) -> []MInstX86 {
+    let ir = inst_regs_x86(inst)
+    mut acc = UseAccX86 { table = teko::list::empty(); reloads = teko::list::empty(); nth = 0 to u32 }
+    mut ui: u64 = 0
+    loop {
+        if ui >= ir.uses.len { break }
+        acc = add_use_subst_x86(abi, sr, ir.uses[ui], frame_base, acc)
+        ui++
+    }
+    mut table = acc.table
+    mut stores: []MInstX86 = teko::list::empty()
+    if ir.has_def {
+        let d = ir.def_reg
+        if !d.is_phys {
+            let la = assign_lookup(sr, d.id)
+            if la.found {
+                if la.is_spill {
+                    let dsv = spill_scratch(abi, MRegClass::GPR, 0 to u32)
+                    let asv = spill_scratch(abi, MRegClass::GPR, 1 to u32)
+                    if !subst_has(table, d.id) {
+                        table = teko::list::push(table, SubstEntry { vid = d.id; to = dsv })
+                    }
+                    stores = emit_gpr_store_x86(dsv, asv, frame_base + la.slot)
+                } else {
+                    if !subst_has(table, d.id) {
+                        table = teko::list::push(table, SubstEntry { vid = d.id; to = preg(la.phys, d.reg_class) })
+                    }
+                }
+            }
+        }
+    }
+    let mapped = map_minst_x86(inst, table)
+    minst_x86_cat(minst_x86_cat(acc.reloads, minst_x86_single(mapped)), stores)
+}
+
+/**
+ * rewrite_block_x86 — one block with every instruction rewritten and flattened;
+ * block params are carried through unchanged (they are merge metadata, not an
+ * executed operand). The x86 mirror of the neutral `rewrite_block`.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param ScanResult sr  the allocation
+ * @param MBlockX86 b  the block to rewrite
+ * @param u32 frame_base  the first spill frame slot index
+ * @return MBlockX86  the rewritten block
+ */
+fn rewrite_block_x86(abi: AbiDescriptor, sr: ScanResult, b: MBlockX86, frame_base: u32) -> MBlockX86 {
+    mut insts: []MInstX86 = teko::list::empty()
+    mut ii: u64 = 0
+    loop {
+        if ii >= b.insts.len { break }
+        insts = minst_x86_cat(insts, rewrite_inst_x86(abi, sr, b.insts[ii], frame_base))
+        ii++
+    }
+    MBlockX86 { id = b.id; params = b.params; insts = insts }
+}
+
+/**
+ * rewrite_func_x86 — rebuild every block from its rewritten instruction
+ * sequences and finalize the frame (one spill slot per `Spilled`), yielding an
+ * `MFuncX86` whose every operand is physical. The x86 mirror of the neutral
+ * `rewrite_func`; reuses `count_spills`/`append_spill_slots`.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MFuncX86 f  the selected function
+ * @param ScanResult sr  the allocation
+ * @return MFuncX86  the fully-colored function
+ */
+fn rewrite_func_x86(abi: AbiDescriptor, f: MFuncX86, sr: ScanResult) -> MFuncX86 {
+    let frame_base = f.frame.len to u32
+    let frame = append_spill_slots(abi, f.frame, count_spills(sr))
+    mut blocks: []MBlockX86 = teko::list::empty()
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        blocks = teko::list::push(blocks, rewrite_block_x86(abi, sr, f.blocks[bi], frame_base))
+        bi++
+    }
+    MFuncX86 { symbol = f.symbol; blocks = blocks; frame = frame }
+}
+
+/**
+ * all_physical_x86 — whether every `MInstX86` operand of `f` is a physical
+ * register (the all-physical invariant: no virtual register survived the
+ * rewrite). Block params are metadata, not executed operands, and are not
+ * checked. The x86 mirror of the neutral `all_physical`, driven by
+ * `inst_regs_x86`.
+ *
+ * @param MFuncX86 f  the colored function
+ * @return bool  true iff fully physical
+ */
+pub fn all_physical_x86(f: MFuncX86) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            let ir = inst_regs_x86(b.insts[ii])
+            if ir.has_def {
+                if !ir.def_reg.is_phys { return false }
+            }
+            mut ui: u64 = 0
+            loop {
+                if ui >= ir.uses.len { break }
+                if !ir.uses[ui].is_phys { return false }
+                ui++
+            }
+            ii++
+        }
+        bi++
+    }
+    true
+}
+
+/**
+ * inst_has_fpr_spill_x86 — whether any operand of `inst` is an FPR spill. The
+ * x86 mirror of the neutral `inst_has_fpr_spill`, driven by `inst_regs_x86`;
+ * reuses the register-abstract `reg_is_fpr_spill`.
+ *
+ * @param ScanResult sr  the allocation
+ * @param MInstX86 inst  the instruction to scan
+ * @return bool  true iff an FPR spill operand is present
+ */
+fn inst_has_fpr_spill_x86(sr: ScanResult, inst: MInstX86) -> bool {
+    let ir = inst_regs_x86(inst)
+    if ir.has_def {
+        if reg_is_fpr_spill(sr, ir.def_reg) { return true }
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ir.uses.len { break }
+        if reg_is_fpr_spill(sr, ir.uses[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * detect_fpr_spill_x86 — whether allocating `f` under `sr` spills any FPR value.
+ * B1 lowers GPR spills only (like A3); an FPR spill is a NAMED honest-stop
+ * (`regalloc_func_x86` returns an error), inherited from A3's `A3-fpr-spill`.
+ * The x86 mirror of the neutral `detect_fpr_spill`.
+ *
+ * @param ScanResult sr  the allocation
+ * @param MFuncX86 f  the function
+ * @return bool  true iff any FPR value is spilled
+ */
+fn detect_fpr_spill_x86(sr: ScanResult, f: MFuncX86) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            if inst_has_fpr_spill_x86(sr, b.insts[ii]) { return true }
+            ii++
+        }
+        bi++
+    }
+    false
+}
+
+/**
+ * regalloc_func_x86 — allocate one x86 function end-to-end: RPO-order, number,
+ * compute intervals, scan (the SHARED `linear_scan`), rewrite. A real `loop`
+ * back-edge now ALLOCATES (§6.2 LANDED, #389 F2): `compute_intervals_x86` widens
+ * every interval live at a loop header to reach its latch (the shared
+ * `extend_over_loops`), so a loop-carried value survives the whole body across
+ * the back-edge. Still returns a NAMED honest-stop on an FPR-value spill (B1
+ * lowers GPR spills only). The RPO order is computed once and threaded so the
+ * numbering and the natural-loop detection share one linearization (#443); the
+ * entry-reachable set is threaded beside it so a dead-block edge is never
+ * mistaken for a loop (#455). The x86 mirror of the neutral `regalloc_func`.
+ *
+ * @param AbiDescriptor abi  the register file (`sysv64()`)
+ * @param MFuncX86 f  the selected function (virtual MRegs + SysV pins)
+ * @return MFuncX86 | error  the fully-colored function, or a named honest-stop
+ */
+pub fn regalloc_func_x86(abi: AbiDescriptor, f: MFuncX86) -> MFuncX86 | error {
+    let order = rpo_block_order_x86(f)
+    let numbered = number_insts_x86(f, order)
+    let ivals = match compute_intervals_x86(numbered, order, reachable_blocks_x86(f)) {
+        IntervalSet as s => s
+        error as e => return e
+    }
+    let sr = linear_scan(abi, ivals)
+    if detect_fpr_spill_x86(sr, f) {
+        return error { message = "regalloc x86-64: FPR-value spill not yet supported (B1 lowers GPR spills only; the inherited A3-fpr-spill deferral)" }
+    }
+    rewrite_func_x86(abi, f, sr)
+}
+
+/**
+ * regalloc_module_x86 — allocate every function of `m`, carrying the rodata /
+ * globals / layouts tables through unchanged (B1 touches only registers +
+ * frame, exactly as `select_module_x86` carries them). The x86 mirror of the
+ * neutral `regalloc_module`.
+ *
+ * @param AbiDescriptor abi  the register file to allocate from (`sysv64()`)
+ * @param MModuleX86 m  the selected module
+ * @return MModuleX86 | error  the colored module, or the first function's error
+ */
+pub fn regalloc_module_x86(abi: AbiDescriptor, m: MModuleX86) -> MModuleX86 | error {
+    mut funcs: []MFuncX86 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        let rf = match regalloc_func_x86(abi, m.funcs[i]) {
+            MFuncX86 as g => g
+            error as e => return e
+        }
+        funcs = teko::list::push(funcs, rf)
+        i++
+    }
+    MModuleX86 { funcs = funcs; rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+}

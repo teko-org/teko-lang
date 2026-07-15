@@ -1926,6 +1926,52 @@ fn emit_list_push(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: ch
 }
 
 /**
+ * emit_list_with_cap — `teko::list::with_cap(n)` (enabling primitive — staged off; no compiler
+ * source calls this yet). Requires the call's OWN `.type` to already be a concrete slice: like
+ * `emit_list_empty`, an un-annotated sentinel reaching here is an honest codegen error rather than
+ * a guess. Lowers to a GNU statement-expression that allocates a len-0, `n`-capacity buffer via
+ * `tk_slice_with_cap`/`tk_slice_with_cap_r` (routed by `frame`, mirroring `emit_list_push`'s root-
+ * vs-frame selector) and wraps the fresh pointer in the slice struct literal.
+ *
+ * @param buf       the output buffer to append to
+ * @param prog      the typed program (for emit_type)
+ * @param e         the call's own typed expr (carries the concretized slice type)
+ * @param c         the call node (`c.args[0]` is the `u64` capacity)
+ * @param escaping  the escaping-binding set threaded through nested expr emission
+ * @param regions   the open S1 region stack
+ * @param fn_body   the enclosing function's statements (for nested expr emission)
+ * @param dctx      the defer context threaded through nested expr emission
+ * @param frame     `""` for the root region; else a frame region variable name
+ * @return          the emitted C, or `error` on a context-less sentinel / malformed call
+ */
+fn emit_list_with_cap(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCall, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx, frame: str) -> []byte | error {
+    let elem = match e.type {
+        checker::Slice as sl => match sl.element {
+            checker::Void => return error { message = "codegen: teko::list::with_cap() needs a known slice type from context (annotate the binding)" }
+            _ => sl.element
+        }
+        _ => return error { message = "codegen: teko::list::with_cap() needs a known slice type from context (annotate the binding)" }
+    }
+    if c.args.len != 1 { return error { message = "codegen: teko::list::with_cap result has the wrong arity (internal)" } }
+    let is_r = frame.len > 0
+    let wN = $"_wp{buf.len}"
+    mut out = cb(buf, "({ ")
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, " *"); out = cb(out, wN); out = cb(out, " = (")
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, if is_r { " *)tk_slice_with_cap_r(sizeof(" } else { " *)tk_slice_with_cap(sizeof(" })
+    out = match emit_type(out, prog, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, "), (uint64_t)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, c.args[0], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, ")")
+    if is_r { out = cb(out, ", "); out = cb(out, frame) }
+    out = cb(out, "); (")
+    out = match cg_slice_typename(out, elem) { []byte as o => o; error as err => return err }
+    out = cb(out, "){ .ptr = "); out = cb(out, wN); out = cb(out, ", .len = 0 }; })")
+    out
+}
+
+/**
  * C7.19 (#169 D0) — `teko::mem::buf_ptr(len)` lowers to a direct arena bump-allocation:
  * `(uint8_t *)tk_region_alloc(<enclosing region>, (size_t)(len))`. Reuses whichever S1 region is
  * open at the call site (a block region, else the function frame, else the process root — the
@@ -2156,7 +2202,10 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             // self-append `xs = push(xs, …)` is emitted directly by emit_assign with `_tkfr`.
             return emit_list_push(buf, prog, e, c, escaping, regions, fn_body, dctx, if is_pushfo { "@fo" } else { "" })
         }
-        return error { message = "codegen: this teko::list builtin not yet supported (only empty/push — fixed+copy)" }
+        if llast == "with_cap" {
+            return emit_list_with_cap(buf, prog, e, c, escaping, regions, fn_body, dctx, "")
+        }
+        return error { message = "codegen: this teko::list builtin not yet supported (only empty/push/with_cap — fixed+copy)" }
     }
     // teko::mem::free(x) — manual dealloc (the checker proved x is a mutable heap variable).
     if p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" && p.segments[p.segments.len - 1].name == "free" {
@@ -2322,6 +2371,10 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             else if last == "cov_line_hit" { builtin = "tk_cov_line_hit"; has_builtin = true }   // (u64,u32) -> bool
             else if last == "arena_push" { builtin = "tk_arena_push"; has_builtin = true }   // (#109 test-gate memory) () -> void
             else if last == "arena_pop" { builtin = "tk_arena_pop"; has_builtin = true }   // () -> void
+            else if last == "arena_commit" { builtin = "tk_arena_commit"; has_builtin = true }
+            else if last == "intern_get" { builtin = "tk_intern_get"; has_builtin = true }
+            else if last == "intern_put" { builtin = "tk_intern_put"; has_builtin = true }
+            else if last == "intern_reset" { builtin = "tk_intern_reset"; has_builtin = true }
             // diverging runtime panic helpers (the corpus calls these by bare name)
             else if last == "panic_div0" { builtin = "tk_panic_div0"; has_builtin = true }
             else if last == "panic_oob" { builtin = "tk_panic_oob"; has_builtin = true }
@@ -5805,12 +5858,61 @@ fn emit_return(buf: []byte, prog: checker::TProgram, r: checker::TReturn, in_mai
     cb(out, ";\n")
 }
 
-// emit_loop — a TLoopStmt -> `while (1) { … }`, nesting one indent level deeper. A LABELED loop
-// (M.5) gets a continue-target `tk_lbl_<NAME>_cont: ;` at the TOP of its body (so `continue L`
-// lowers to `goto tk_lbl_<NAME>_cont;`, re-running the body == the next while(1) iteration) and a
-// break-target `tk_lbl_<NAME>_break: ;` AFTER the loop (so `break L` lowers to `goto …_break;`).
-// A bare loop is unchanged. (C: TK_TSTMT_LOOP branch; C grew the inner indent with snprintf.)
+/**
+ * emit_loop — a TLoopStmt. When `init` is EMPTY (infinite / while loop), this emits the bare
+ * `while (1) { … }` unchanged (byte-identical to pre-#517). When `init` is non-empty (range /
+ * 3-part / for-each), the loop is wrapped in a `{ … }` C scope so the run-once preamble bindings
+ * (`i` / `_hi` / `_first` / `_it`) live loop-locally and do NOT leak past the loop, then the
+ * `while (1)` loop is emitted one indent deeper. The loop MECHANISM itself (continue-target,
+ * break-target, region, defers) is emitted by `emit_loop_while` and is UNTOUCHED (#517).
+ *
+ * @param buf the output byte buffer
+ * @param l the typed loop node (label + init + body)
+ * @param in_main whether this loop is emitted inside `main`
+ * @param prog the whole typed program
+ * @param ret_type the enclosing function's return type
+ * @param indent the current indentation string
+ * @param frame the enclosing region-frame expression
+ * @param escaping the names whose values escape the current frame
+ * @param regions the active region-frame stack
+ * @param fn_body the enclosing function's body (for block-local analysis)
+ * @param dctx the defer context
+ * @return the buffer with the loop emitted, or a codegen error
+ */
 fn emit_loop(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    if l.init.len == 0 { return emit_loop_while(buf, l, in_main, prog, ret_type, indent, frame, escaping, regions, fn_body, dctx) }
+    mut out = cb(buf, indent)
+    out = cb(out, "{\n")
+    let inner = cb_indent_deeper(indent)
+    out = match emit_block(out, l.init, in_main, prog, ret_type, inner, escaping, regions, fn_body, dctx, teko::list::empty(), false) { []byte as o => o; error as err => return err }
+    out = match emit_loop_while(out, l, in_main, prog, ret_type, inner, frame, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, indent)
+    out = cb(out, "}\n")
+    out
+}
+
+/**
+ * emit_loop_while — emit a TLoopStmt's `while (1) { … }` core (the #517-UNTOUCHED loop mechanism).
+ * A LABELED loop (M.5) gets a continue-target `tk_lbl_<NAME>_cont: ;` at the TOP of its body (so
+ * `continue L` lowers to `goto tk_lbl_<NAME>_cont;`, re-running the body == the next while(1)
+ * iteration) and a break-target `tk_lbl_<NAME>_break: ;` AFTER the loop (so `break L` lowers to
+ * `goto …_break;`). A bare loop is unchanged. (C: TK_TSTMT_LOOP branch; C grew the inner indent
+ * with snprintf.)
+ *
+ * @param buf the output byte buffer
+ * @param l the typed loop node (label + body; `init` already emitted by the caller)
+ * @param in_main whether this loop is emitted inside `main`
+ * @param prog the whole typed program
+ * @param ret_type the enclosing function's return type
+ * @param indent the current indentation string
+ * @param frame the enclosing region-frame expression
+ * @param escaping the names whose values escape the current frame
+ * @param regions the active region-frame stack
+ * @param fn_body the enclosing function's body (for block-local analysis)
+ * @param dctx the defer context
+ * @return the buffer with the while-loop emitted, or a codegen error
+ */
+fn emit_loop_while(buf: []byte, l: checker::TLoopStmt, in_main: bool, prog: checker::TProgram, ret_type: checker::Type, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let labeled = l.label.len > 0
     mut out = cb(buf, indent)
     out = cb(out, "while (1) {\n")
@@ -6129,6 +6231,138 @@ fn emit_adopt(buf: []byte, a: checker::TAdoptStmt, in_main: bool, prog: checker:
 // A top-level function -> a C function.
 // ---------------------------------------------------------------------------
 
+/**
+ * Whether typed expression `e` (or any sub-expression) makes a DIRECT self-recursive call to the
+ * function identified by `ns`/`name`. Mirrors `cg_collect_expr_opts`'s full-body traversal; a
+ * `TCall` matches when its resolved target namespace (`call_ns`) and last callee path segment equal
+ * `ns`/`name` — each namespace holds exactly one function per name, so the pair identifies it. A
+ * closure or interface-dispatch call carries no static target name and never matches (its target is
+ * a runtime value / vtable slot). Leaf expressions hold no call and answer false.
+ *
+ * @param e     the typed expression to scan
+ * @param ns    the enclosing function's declaring namespace (matched against `TCall.call_ns`)
+ * @param name  the enclosing function's bare name (matched against the callee's last path segment)
+ * @return      true iff a direct self-recursive call appears anywhere within `e`
+ */
+fn cg_expr_calls_self(e: checker::TExpr, ns: str, name: str) -> bool {
+    match e.kind {
+        checker::TCall as c => {
+            if !c.is_closure_call && !c.is_iface_dispatch && c.call_ns == ns && cg_path_last(c.callee) == name { return true }
+            mut i = 0
+            loop { if i >= c.args.len { break }; if cg_expr_calls_self(c.args[i], ns, name) { return true }; i++ }
+            false
+        }
+        checker::TBinary as b => cg_expr_calls_self(b.left, ns, name) || cg_expr_calls_self(b.right, ns, name)
+        checker::TUnary as u => cg_expr_calls_self(u.operand, ns, name)
+        checker::TCompare as c => {
+            if cg_expr_calls_self(c.first, ns, name) { return true }
+            mut i = 0
+            loop { if i >= c.rest.len { break }; if cg_expr_calls_self(c.rest[i].operand, ns, name) { return true }; i++ }
+            false
+        }
+        checker::TIfExpr as f => cg_expr_calls_self(f.cond, ns, name) || cg_block_calls_self(f.then_blk, ns, name) || cg_block_calls_self(f.else_blk, ns, name)
+        checker::TMatchExpr as m => {
+            if cg_expr_calls_self(m.subject, ns, name) { return true }
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                if m.arms[i].has_when && cg_expr_calls_self(m.arms[i].guard, ns, name) { return true }
+                if cg_block_calls_self(m.arms[i].body, ns, name) { return true }
+                i++
+            }
+            false
+        }
+        checker::TCast as c => cg_expr_calls_self(c.expr, ns, name)
+        checker::TFieldAccess as fa => cg_expr_calls_self(fa.receiver, ns, name)
+        checker::TSafeFieldAccess as sfa => cg_expr_calls_self(sfa.receiver, ns, name)
+        checker::TCoalesce as co => cg_expr_calls_self(co.left, ns, name) || cg_expr_calls_self(co.right, ns, name)
+        checker::TStructInit as si => {
+            mut i = 0
+            loop { if i >= si.field_vals.len { break }; if cg_expr_calls_self(si.field_vals[i], ns, name) { return true }; i++ }
+            false
+        }
+        checker::TIndex as ix => cg_expr_calls_self(ix.receiver, ns, name) || cg_expr_calls_self(ix.index, ns, name)
+        checker::TInterp as ip => {
+            mut i = 0
+            loop {
+                if i >= ip.holes.len { break }
+                if cg_expr_calls_self(ip.holes[i], ns, name) { return true }
+                if i < ip.specs.len {
+                    match ip.specs[i].kind {
+                        checker::TFSpecDynamic as fd => {
+                            mut k = 0
+                            loop { if k >= fd.args.len { break }; if cg_expr_calls_self(fd.args[k], ns, name) { return true }; k++ }
+                        }
+                        _ => { }
+                    }
+                }
+                i++
+            }
+            false
+        }
+        checker::TInExpr as ie => {
+            if cg_expr_calls_self(ie.lhs, ns, name) { return true }
+            mut i = 0
+            loop { if i >= ie.elems.len { break }; if cg_expr_calls_self(ie.elems[i], ns, name) { return true }; i++ }
+            false
+        }
+        checker::TArrayLit as al => {
+            mut i = 0
+            loop { if i >= al.elements.len { break }; if cg_expr_calls_self(al.elements[i].expr, ns, name) { return true }; i++ }
+            false
+        }
+        checker::TLambda as lam => cg_block_calls_self(lam.body, ns, name)
+        _ => false
+    }
+}
+
+/**
+ * Whether any statement in `stmts` (or a nested block) makes a direct self-recursive call to the
+ * function identified by `ns`/`name`. Mirrors `cg_collect_block_opts`'s statement traversal.
+ *
+ * @param stmts  the typed statement block to scan
+ * @param ns     the enclosing function's declaring namespace
+ * @param name   the enclosing function's bare name
+ * @return       true iff a direct self-recursive call appears anywhere within the block
+ */
+fn cg_block_calls_self(stmts: []checker::TStatement, ns: str, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= stmts.len { break }
+        match stmts[i] {
+            checker::TBinding as b => if cg_expr_calls_self(b.value, ns, name) { return true }
+            checker::TAssign as a => { if cg_expr_calls_self(a.value, ns, name) { return true }; match a.kind { parser::AssignKind::Field => if cg_expr_calls_self(a.target, ns, name) { return true }; _ => { } } }
+            checker::TReturn as r => if r.has_value && cg_expr_calls_self(r.value, ns, name) { return true }
+            checker::TLoopStmt as l => { if cg_block_calls_self(l.init, ns, name) { return true }; if cg_block_calls_self(l.body, ns, name) { return true } }
+            checker::TExprStmt as es => if cg_expr_calls_self(es.expr, ns, name) { return true }
+            checker::TDeferStmt as d => if cg_block_calls_self(d.body, ns, name) { return true }
+            checker::TAdoptStmt as a => if cg_block_calls_self(a.body, ns, name) { return true }
+            _ => { }
+        }
+        i++
+    }
+    false
+}
+
+/**
+ * Whether `f` is DIRECTLY self-recursive — its body contains a call to itself. Such a function must
+ * be emitted `__attribute__((noinline))`: LLVM (clang / zig cc, the release toolchain) miscompiles
+ * an inlined self-recursive function that takes a by-value aggregate parameter. On inlining it into
+ * a caller, LLVM elides the by-value argument copy, then Tail-Recursion-Elimination rewrites the
+ * inlined self-recursion into a loop that OVERWRITES that parameter's storage — which aliases the
+ * caller's live argument. The caller then reads the clobbered argument (issue #283: `type_join`
+ * returned its slice argument's ELEMENT type instead of the slice, so the checker rejected a valid
+ * program only under `-O2`). gcc compiles the same C correctly; the fix keeps the emitted C
+ * self-recursion out of the inliner, closing the miscompile on every toolchain.
+ *
+ * @param f  the typed function
+ * @return   true iff `f` (non-extern) calls itself directly
+ */
+fn cg_fn_is_self_recursive(f: checker::TFunction) -> bool {
+    if f.is_extern { return false }
+    cg_block_calls_self(f.body, f.namespace, f.name)
+}
+
 // emit_function — a TFunction -> a C function definition.
 // (C: `emit_function`.)
 // emit_function_sig — the return type + name + params up to the `)` (no body). Shared by the
@@ -6137,6 +6371,7 @@ fn emit_adopt(buf: []byte, a: checker::TAdoptStmt, in_main: bool, prog: checker:
 // (C: `emit_function_sig`.)
 fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction) -> []byte | error {
     mut out = buf
+    if cg_fn_is_self_recursive(f) { out = cb(out, "__attribute__((noinline)) ") }
     if f.is_extern { out = cb(out, "extern ") }   // C7.1a: a foreign prototype (no body)
     out = match emit_type(out, prog, f.return_type) { []byte as o => o; error as err => return err }
     out = cb(out, " ")
@@ -6850,7 +7085,7 @@ fn cg_collect_block_opts(set: CgTypeSet, stmts: []checker::TStatement) -> CgType
             // bare `T` (widened) — mirrors the TBinding arm collecting b.bound.
             checker::TAssign as a => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); match a.kind { parser::AssignKind::Field => s = cg_collect_expr_opts(s, a.target); _ => { } } }   // (#88) the FIELD LHS receiver may carry optional types too
             checker::TReturn as r => { if r.has_value { s = cg_collect_expr_opts(s, r.value) } }
-            checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.body) }
+            checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.init); s = cg_collect_block_opts(s, l.body) }
             checker::TExprStmt as es => { s = cg_collect_expr_opts(s, es.expr) }
             checker::TDeferStmt as d => { s = cg_collect_block_opts(s, d.body) }
             checker::TAdoptStmt as a => { s = cg_collect_block_opts(s, a.body) }
@@ -7625,7 +7860,7 @@ fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStateme
         checker::TBinding as b => checker::TBinding { kind = b.kind; target = b.target; bound = b.bound; value = cg_lift_expr(b.value, acc) }
         checker::TAssign as a => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = match a.kind { parser::AssignKind::Field => cg_lift_expr(a.target, acc); _ => a.target } }   // (#88) lift lambdas in the FIELD LHS receiver too
         checker::TReturn as r => checker::TReturn { has_value = r.has_value; value = if r.has_value { cg_lift_expr(r.value, acc) } else { r.value } }
-        checker::TLoopStmt as l => checker::TLoopStmt { label = l.label; body = cg_lift_block(l.body, acc) }
+        checker::TLoopStmt as l => checker::TLoopStmt { label = l.label; init = cg_lift_block(l.init, acc); body = cg_lift_block(l.body, acc) }
         checker::TExprStmt as es => checker::TExprStmt { expr = cg_lift_expr(es.expr, acc) }
         checker::TDeferStmt as d => checker::TDeferStmt { body = cg_lift_block(d.body, acc) }
         checker::TAdoptStmt as a => checker::TAdoptStmt { name = a.name; body = cg_lift_block(a.body, acc) }
@@ -8486,14 +8721,32 @@ fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte 
     b
 }
 
-/** emit_test_call — one test invocation in the native gate: `print("test <label> ... ")`, then the
-    mangled test symbol call, then `println("ok")`. The label is `namespace::name` (or bare `name`),
-    matching run_tests_cov's label exactly. Under `cov` the body's lines/branches are attributed to
-    this test via `tk_cov_enter(idx)`/`tk_cov_leave` (the same brackets the VM runner uses). (#265) */
+/**
+ * Emits one native-gate test invocation, mirroring the VM's `run_tests_cov` per-test body exactly:
+ * `print("test <label> ... ")`, the mangled test symbol call, then `println("ok")`. The label is
+ * `namespace::name` (or bare `name`), matching `run_tests_cov`'s label. Under `cov` the body's
+ * lines/branches are attributed to this test via `tk_cov_enter(idx)`/`tk_cov_leave` (the same
+ * brackets the VM runner uses).
+ *
+ * (#469) Each invocation is wrapped in a `tk_arena_push()` / `tk_arena_pop()` checkpoint — the port
+ * of the #109 test-gate memory bound to native. The push precedes the print and the pop follows the
+ * `println("ok")`, so the whole per-test span (label prints, the test's transient allocations) is
+ * bulk-freed after each test instead of accumulating in the never-dropped root region across the
+ * ~1500-test run. The coverage sinks (`tk_cov_*`) are libc-heap, so the marks recorded inside the
+ * span survive the pop — the cov brackets nest strictly inside the arena brackets, exactly as the
+ * VM runner orders them (arena_push … cov_enter … body … cov_leave … arena_pop).
+ *
+ * @param buf  the output byte buffer to append the emitted C to
+ * @param f    the `#test` function being invoked (its namespace + name form the label and symbol)
+ * @param idx  the `prog.items` coverage id passed to `tk_cov_enter` under `cov`
+ * @param cov  whether `CgMode::TestCov` is active (emit the `tk_cov_enter`/`tk_cov_leave` brackets)
+ * @return     the buffer with this test's invocation appended
+ */
 fn emit_test_call(buf: []byte, f: checker::TFunction, idx: u64, cov: bool) -> []byte {
     let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
     let head = teko::str::concat("test ", label, " ... ")
-    mut b = cb(buf, "    tk_print((tk_str){ (const tk_byte *)\"")
+    mut b = cb(buf, "    tk_arena_push();\n")
+    b = cb(b, "    tk_print((tk_str){ (const tk_byte *)\"")
     b = cb_cstr_escaped(b, head)
     b = cb(b, "\", ")
     b = cb_u128_digits(b, head.len to u128)
@@ -8503,16 +8756,18 @@ fn emit_test_call(buf: []byte, f: checker::TFunction, idx: u64, cov: bool) -> []
     b = cb(b, "();\n")
     if cov { b = cb(b, "    tk_cov_leave();\n") }
     b = cb(b, "    tk_println((tk_str){ (const tk_byte *)\"ok\", 2 });\n")
+    b = cb(b, "    tk_arena_pop();\n")
     b
 }
 
 /** emit_function_mode — emit a function body, adding the `tk_cov_mark(idx)` entry prologue under
-    `TestCov` for each PRODUCTION (non-test, non-`teko::vm`) function so function-level coverage is
-    populated natively — the marks the VM does in eval_call. Under Program/TestPlain this is exactly
-    emit_function (no prologue → byte-identical). (#265) */
+    `TestCov` for each PRODUCTION (non-test, non-`teko::coverage`) function so function-level coverage
+    is populated natively — the mark the native gate records on entry. Under Program/TestPlain this is
+    exactly emit_function (no prologue → byte-identical). The coverage subsystem (`teko::coverage`) is
+    self-excluded so it never measures its own reporting code. (#265) */
 fn emit_function_mode(buf: []byte, prog: checker::TProgram, f: checker::TFunction, mode: CgMode) -> []byte | error {
     if mode != CgMode::TestCov { return emit_function(buf, prog, f) }
-    if f.is_test || f.namespace == "teko::vm" { return emit_function(buf, prog, f) }
+    if f.is_test || f.namespace == "teko::coverage" { return emit_function(buf, prog, f) }
     emit_function_cov(buf, prog, f, fn_items_index(prog, f) to i64)
 }
 

@@ -1,0 +1,245 @@
+/**
+ * AbiDescriptor — the target register-file + calling-convention facts the
+ * shared linear-scan core reads: the argument/result registers, the
+ * caller/callee-saved partition per register class, the ordered allocatable
+ * pool the scan draws from, and the reserved spill-scratch registers the
+ * rewrite reloads through. Register ids are ISA numbers in the `MReg`
+ * convention (x0..x30/SP=31 for GPR, v0..v31 for FPR — `minst.tks:22`). Every
+ * id list is iterated in its stored order, so allocation is deterministic
+ * (M.2) and cloning this struct with a different partition is the whole cost
+ * of a new ABI (Phase B).
+ *
+ * @since #384 A3-1
+ */
+pub type AbiDescriptor = struct {
+    /**
+     * gpr_arg — the GPR argument/return registers, in order (AAPCS64 x0..x7).
+     * Index 0 is also the GPR result register.
+     */
+    gpr_arg: []u32
+    /**
+     * fpr_arg — the FPR argument/return registers, in order (AAPCS64 v0..v7).
+     * Index 0 is also the FPR result register.
+     */
+    fpr_arg: []u32
+    /**
+     * gpr_allocatable — the GPR pool the scan assigns from, caller-saved
+     * first then callee-saved (so short values take scratch-cheap
+     * caller-saved before forcing a callee-save), excluding FP/LR/SP/the
+     * platform register and the spill scratch (AAPCS64: x0..x14 then
+     * x19..x28).
+     */
+    gpr_allocatable: []u32
+    /**
+     * fpr_allocatable — the FPR pool the scan assigns from, caller-saved
+     * first then callee-saved, excluding the spill scratch (AAPCS64: v0..v7,
+     * v16..v29 then v8..v15).
+     */
+    fpr_allocatable: []u32
+    /**
+     * gpr_caller_saved — the GPR set a call clobbers (AAPCS64 x0..x18); a
+     * value live across a call must avoid these (§1.3).
+     */
+    gpr_caller_saved: []u32
+    /**
+     * fpr_caller_saved — the FPR set a call clobbers (AAPCS64 v0..v7,
+     * v16..v31; only the low 64 bits of v8..v15 are callee-saved).
+     */
+    fpr_caller_saved: []u32
+    /**
+     * gpr_spill_scratch — GPR registers reserved OUT of the allocatable pool
+     * for the spill reload/store micro-sequences (AAPCS64 x15,x16,x17 —
+     * IP0/IP1 plus one, all caller-saved so reserving them costs no prologue
+     * save). Sized to the max simultaneous spilled operands of one
+     * instruction (MMSub's three uses, §1.1).
+     */
+    gpr_spill_scratch: []u32
+    /**
+     * fpr_spill_scratch — FPR registers reserved for FPR spill reload/store
+     * (AAPCS64 v30,v31 — max two simultaneous FPR uses, MFAlu).
+     */
+    fpr_spill_scratch: []u32
+    /**
+     * spill_slot_bytes — the byte size of one spill slot (8: a whole X or D
+     * register; the value is stored full-width, never masked, matching the
+     * size-agnostic interp §1.4).
+     */
+    spill_slot_bytes: u32
+    /**
+     * spill_slot_align — the alignment of one spill slot (8).
+     */
+    spill_slot_align: u32
+    /**
+     * shadow_space — the caller-reserved stack area, in bytes, every callee owns
+     * to spill its register arguments (Win64: 32; AAPCS64/SysV/LP64D: 0 — they
+     * have no shadow space). `compute_frame_layout_x86` adds this to the frame of
+     * a function that makes a call (`func_makes_call_x86`), reserving the
+     * outgoing-argument region at the bottom of the frame; a 0 leaves every other
+     * ABI's frame output byte-identical (FIXPOINT). The one frame-convention fact
+     * the register-id lists cannot express (§2.2, D-C).
+     */
+    shadow_space: u32
+}
+
+/**
+ * ArgReg — the physical argument/result register resolved for a per-class
+ * argument position, or `ok=false` past the 8-register window. The
+ * `aapcs64` descriptor's mirror of isel's `ParamSlot`
+ * (`isel_arm64.tks:980`).
+ *
+ * @since #384 A3-1
+ */
+pub type ArgReg = struct {
+    /**
+     * ok — true iff the requested index names one of the first 8 argument
+     * registers of its class.
+     */
+    ok: bool
+    /**
+     * reg — the resolved physical argument/result register (meaningful only
+     * when `ok` is true).
+     */
+    reg: MReg
+}
+
+/**
+ * push_range — append the inclusive integer range `[lo, hi]` to `xs`, one
+ * id at a time in ascending order. Every contiguous register-id run in
+ * `aapcs64` (§2.2) is assembled from this, so a run of ids never needs
+ * typing out by hand (and so cannot be mistyped).
+ *
+ * @param []u32 xs  the array to extend
+ * @param u32 lo  the first id to append (inclusive)
+ * @param u32 hi  the last id to append (inclusive)
+ * @return []u32  `xs` followed by `lo, lo+1, ..., hi`
+ */
+fn push_range(xs: []u32, lo: u32, hi: u32) -> []u32 {
+    mut result = xs
+    mut i = lo
+    loop {
+        if i > hi { break }
+        result = teko::list::push(result, i)
+        i++
+    }
+    result
+}
+
+/**
+ * contains_u32 — whether `target` occurs anywhere in `xs`, a linear
+ * membership scan over the small (at most 32-entry) register-id lists the
+ * descriptor stores.
+ *
+ * @param []u32 xs  the array to search
+ * @param u32 target  the id to look for
+ * @return bool  true iff `target` is one of `xs`'s elements
+ */
+fn contains_u32(xs: []u32, target: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == target { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * aapcs64 — the concrete AAPCS64 (AArch64) register-file descriptor: x0..x7/
+ * v0..v7 arguments, x19..x28 + v8..v15(low) callee-saved, x0..x18 + v0..v7 +
+ * v16..v31 caller-saved, x15..x17/v30..v31 reserved spill scratch. The
+ * reference-target descriptor (`own-backend-architecture.md` §2.2); Phase B
+ * clones its shape with a different partition.
+ *
+ * @return AbiDescriptor  the AAPCS64 register file
+ */
+pub fn aapcs64() -> AbiDescriptor {
+    AbiDescriptor {
+        gpr_arg = push_range(teko::list::empty(), 0, 7)
+        fpr_arg = push_range(teko::list::empty(), 0, 7)
+        gpr_allocatable = push_range(push_range(teko::list::empty(), 0, 14), 19, 28)
+        fpr_allocatable = push_range(push_range(push_range(teko::list::empty(), 0, 7), 16, 29), 8, 15)
+        gpr_caller_saved = push_range(teko::list::empty(), 0, 18)
+        fpr_caller_saved = push_range(push_range(teko::list::empty(), 0, 7), 16, 31)
+        gpr_spill_scratch = push_range(teko::list::empty(), 15, 17)
+        fpr_spill_scratch = push_range(teko::list::empty(), 30, 31)
+        spill_slot_bytes = 8
+        spill_slot_align = 8
+        shadow_space = 0 to u32
+    }
+}
+
+/**
+ * arg_reg — the physical argument/result register for per-class position
+ * `index` (x0..x7 / v0..v7), or `ok=false` past the 8-register window — the
+ * descriptor mirror of isel's `param_slot` (`isel_arm64.tks:1000`).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MRegClass reg_class  which register file the argument lives in
+ * @param u32 index  the per-class argument position
+ * @return ArgReg  the resolved physical register, or `ok=false`
+ */
+pub fn arg_reg(abi: AbiDescriptor, reg_class: MRegClass, index: u32) -> ArgReg {
+    let regs = if reg_class == MRegClass::FPR { abi.fpr_arg } else { abi.gpr_arg }
+    if (index to u64) >= regs.len {
+        return ArgReg { ok = false; reg = preg(0, reg_class) }
+    }
+    ArgReg { ok = true; reg = preg(regs[index to u64], reg_class) }
+}
+
+/**
+ * allocatable_pool — the ordered allocatable register ids for `reg_class`
+ * (GPR: `gpr_allocatable`; FPR: `fpr_allocatable`), the pool the linear-scan
+ * core draws a free register from, in its deterministic try-order.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MRegClass reg_class  which register file to enumerate
+ * @return []u32  the ordered allocatable ISA register ids
+ */
+pub fn allocatable_pool(abi: AbiDescriptor, reg_class: MRegClass) -> []u32 {
+    if reg_class == MRegClass::FPR { abi.fpr_allocatable } else { abi.gpr_allocatable }
+}
+
+/**
+ * is_caller_saved — whether physical register `r` is clobbered by a call, so
+ * a value live across a call point may not occupy it (§1.3).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MReg r  a physical register (is_phys must be true)
+ * @return bool  true iff `r` is caller-saved in `r`'s class
+ */
+pub fn is_caller_saved(abi: AbiDescriptor, r: MReg) -> bool {
+    let saved = if r.reg_class == MRegClass::FPR { abi.fpr_caller_saved } else { abi.gpr_caller_saved }
+    contains_u32(saved, r.id)
+}
+
+/**
+ * is_callee_saved — whether physical register `r` is preserved across a call,
+ * so a value live across a call point may safely occupy it (the complement of
+ * `is_caller_saved` over the class's saved registers; FP/LR/SP are neither
+ * allocatable nor reported here).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MReg r  a physical register (is_phys must be true)
+ * @return bool  true iff `r` is callee-saved in `r`'s class
+ */
+pub fn is_callee_saved(abi: AbiDescriptor, r: MReg) -> bool {
+    if !contains_u32(allocatable_pool(abi, r.reg_class), r.id) {
+        return false
+    }
+    !is_caller_saved(abi, r)
+}
+
+/**
+ * spill_scratch — the `nth` reserved spill-scratch register of `reg_class`
+ * (GPR: `gpr_spill_scratch`; FPR: `fpr_spill_scratch`), the physical register
+ * the rewrite reloads a spilled operand into (§3.4).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MRegClass reg_class  which register file the scratch lives in
+ * @param u32 nth  the scratch index (0-based, < the class's reserved count)
+ * @return MReg  the physical scratch register
+ */
+pub fn spill_scratch(abi: AbiDescriptor, reg_class: MRegClass, nth: u32) -> MReg {
+    let scratch = if reg_class == MRegClass::FPR { abi.fpr_spill_scratch } else { abi.gpr_spill_scratch }
+    preg(scratch[nth to u64], reg_class)
+}

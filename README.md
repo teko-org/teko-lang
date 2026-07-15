@@ -11,7 +11,7 @@
 
 <img src="docs/brand/mascot.svg" alt="The Teko mascot — a baby guará (scarlet ibis)" width="280"/>
 
-*Meet our mascot: a baby **guará** (scarlet ibis), a bird endemic to Brazil.*
+*Meet **Guri**, our mascot: a baby **guará** (scarlet ibis), a bird endemic to Brazil.*
 
 </div>
 
@@ -21,8 +21,8 @@
 
 Teko is a compiled, statically-typed programming language with a **fully self-hosting compiler**: the compiler is written in Teko itself and compiles its own source tree to a working native binary — and that binary rebuilds itself to a byte-identical fixpoint (generation 2 == generation 3).
 
-- **All-native output.** `teko build` lowers your program to C and hands it to the host C compiler — no runtime VM, no GC, no interpreter in production binaries. (C is the current lowering target; an own AOT backend is the 0.2 direction, not yet shipped.)
-- **A VM for development.** `teko run` executes the same checked program on a tree-walking VM for fast iteration and debugging; VM and native results are kept behaviorally identical by the project's differential-equivalence gate.
+- **All-native output.** `teko build` lowers your program to C and hands it to the host C compiler — no runtime VM, no GC, no interpreter in production binaries. (C is the current lowering target; an own AOT backend is the 0.3 direction, not yet shipped.)
+- **Native debug iteration.** `teko run` compiles the same checked program natively under `-O0` and executes it immediately in-process — fast, native debugging with full optimization choice via `-O` flags.
 - **Tests are part of the build.** `teko build` runs your `#test` functions **before** codegen; failing tests or a coverage floor below the manifest's threshold **bar the release**. Coverage can be exported as Cobertura XML (`--coverage`).
 - **Errors are values.** Functions return `T | error`; the `?` family (`T?`, `?.`, `??`) handles absence. There is no `null` outside `T?`, no exceptions, no `never`.
 - **Automatic memory without a GC — with opt-in layers.** Arena regions are the invisible default: allocation and deallocation are compiler-managed, no GC, no borrow-checker ceremony (an *inferred* points-to/uniqueness fact — the "spine", under construction — is what makes stored borrows and manual `mem::free` sound; it is not a borrow checker you write to). On top ship two opt-in layers: `adopt { }` for cyclic or long-lived data (bulk-dropped at the block's brace), and `unsafe` — a **type/function modifier** (full risk ownership by type, not a block scope) — for explicit raw allocation. No `malloc`/`free` in safe code; raw allocation is explicit and contained behind `unsafe`.
@@ -85,9 +85,9 @@ Programs have a *virtual main*: top-level statements in `main.tks` are the entry
 
 ### Prerequisites
 
-- **CMake ≥ 3.20**
-- A **C23-capable compiler** (clang on macOS/Linux; clang with lld on Windows)
-- A host `cc` on `PATH` (used by `teko build` to link generated programs)
+- **A released Teko binary** (for bootstrapping; see `scripts/fetch_teko.sh`)
+- A **C23-capable compiler** (clang on macOS/Linux; clang with lld on Windows) — used by `teko build` to link generated programs
+- A host `cc` on `PATH`
 
 ### Build the compiler
 
@@ -95,20 +95,18 @@ Programs have a *virtual main*: top-level statements in `main.tks` are the entry
 git clone https://github.com/schivei/teko-lang.git
 cd teko-lang
 
-cmake -B build
-cmake --build build            # → build/teko  (the C bootstrap compiler)
-
-cmake --build build --target selfhost   # → bin/teko (Teko compiled by itself — THE validation gate)
+./scripts/fetch_teko.sh          # Download the latest released Teko binary
+./.teko/teko . -o bin            # Compile the project with the seed → bin/teko (self-hosted binary)
 ```
 
-Full technical instructions (targets, gates, troubleshooting): **[docs/BUILDING.md](docs/BUILDING.md)**.
+Full technical instructions (CI models, targets, gates, troubleshooting): **[docs/BUILDING.md](docs/BUILDING.md)**.
 
 ### Use it
 
 ```sh
-./bin/teko build .            # compile the project in ./ to a native binary
-./bin/teko run .              # run it on the development VM
-./bin/teko test .             # run the project's #test functions
+./bin/teko build .            # compile and link the project to a native binary
+./bin/teko run .              # debug build and run the project natively (like cargo run)
+./bin/teko test .             # run the project's #test functions natively
 ./bin/teko build . -o out     # choose the output directory
 ./bin/teko test . --coverage  # emit a Cobertura coverage report
 ```
@@ -119,10 +117,10 @@ A project is any directory with a `*.tkp` manifest (TOML) and a source tree — 
 
 | Path | What lives there |
 |---|---|
-| `src/` | The compiler, in Teko (`.tks`, canonical) **and** its C23 bootstrap mirror (`.c`/`.h`) — kept in lockstep by the project's SUPREME RULE |
-| `src/lexer/ · parser/ · checker/ · codegen/ · vm/ · emit/` | The pipeline stages: lex → parse → type-check → (native C emission \| VM execution) → `.tkb`/`.tkh`/`.tkl` artifacts |
+| `src/` | The compiler, in Teko (`.tks`, canonical) — self-hosted, 100% Teko source |
+| `src/lexer/ · parser/ · checker/ · codegen/ · emit/` | The pipeline stages: lex → parse → type-check → native C emission (own AOT backend + C backend) → `.tkb`/`.tkh`/`.tkl` artifacts |
 | `src/runtime/teko_rt.{h,c}` | The minimal execution runtime linked into generated programs |
-| `examples/` | Smoke and regression programs, each verified VM == native |
+| `examples/` | Smoke and regression programs, each verified on native |
 | `docs/brand/` | Mascot, logo and icon assets ([brand guide](docs/brand/README.md)) |
 | `TEKO_*.md` | The language's design record: constitution, legislation, master plan, roadmaps |
 
@@ -137,7 +135,7 @@ A project is any directory with a `*.tkp` manifest (TOML) and a source tree — 
 
 ## Contributing
 
-Contributions are welcome — but read **[CONTRIBUTING.md](CONTRIBUTING.md)** first: this project has unusual invariants (the C↔Teko twin-mirroring SUPREME RULE and a dual-engine verification gate) that every change must respect.
+Contributions are welcome — but read **[CONTRIBUTING.md](CONTRIBUTING.md)** first: this project has strong quality standards (W15 doc-comment style, 100% coverage on the delta, native-only verification) that every change must respect.
 
 ## The mascot
 
@@ -148,7 +146,7 @@ Contributions are welcome — but read **[CONTRIBUTING.md](CONTRIBUTING.md)** fi
 <img src="docs/brand/mascot-pastel.svg" width="140" alt="pastel edition"/>
 </p>
 
-The Teko mascot is a baby **guará** (*Eudocimus ruber*, the scarlet ibis) — one of Brazil's most striking endemic birds. All assets, palettes and usage rules are in the [brand guide](docs/brand/README.md).
+The Teko mascot is **Guri** — a baby **guará** (*Eudocimus ruber*, the scarlet ibis), one of Brazil's most striking endemic birds. *Guri* is southern-Brazilian Portuguese for "little kid", a warm nod to the fledgling and an echo of *gua*rá. All assets, palettes and usage rules are in the [brand guide](docs/brand/README.md).
 
 ## License
 

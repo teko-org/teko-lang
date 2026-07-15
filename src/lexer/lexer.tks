@@ -82,6 +82,49 @@ fn is_ident_continue(c: byte) -> bool {
     is_alpha(c) || is_digit(c) || c == b'_'
 }
 
+/**
+ * is_upper_uc — is `c` an ASCII upper-case letter (`[A-Z]`)? The lead-character class of an
+ * UPPER_SNAKE loop label (#517).
+ *
+ * @param c  the byte to classify
+ * @return   true iff `c` lies in `A`..`Z`
+ */
+fn is_upper_uc(c: byte) -> bool {
+    c >= b'A' && c <= b'Z'
+}
+
+/**
+ * is_upper_snake_continue — is `c` a legal NON-lead UPPER_SNAKE character (`[A-Z0-9_]`)? The
+ * tail-character class of an UPPER_SNAKE loop label (#517).
+ *
+ * @param c  the byte to classify
+ * @return   true iff `c` is an upper-case letter, a digit, or an underscore
+ */
+fn is_upper_snake_continue(c: byte) -> bool {
+    is_upper_uc(c) || is_digit(c) || c == b'_'
+}
+
+/**
+ * is_upper_snake — does `text` match the UPPER_SNAKE identifier grammar `[A-Z][A-Z0-9_]*`, the
+ * ONLY legal loop-label form (#517)? An empty string is rejected; the first byte must be an
+ * upper-case letter and every following byte an upper-case letter, digit, or underscore. A
+ * lower-case letter, a leading underscore or digit, and any other byte all fail.
+ *
+ * @param text  the candidate label text
+ * @return      true iff `text` is a non-empty UPPER_SNAKE identifier
+ */
+pub fn is_upper_snake(text: str) -> bool {
+    if text.len == 0 { return false }
+    if !is_upper_uc(text[0]) { return false }
+    mut i: u64 = 1
+    loop {
+        if i >= text.len { break }
+        if !is_upper_snake_continue(text[i]) { return false }
+        i++
+    }
+    true
+}
+
 // --- whitespace & comments (pure: take pos, return the new pos) ---
 
 // skip spaces/tabs/CR — NOT newlines (a newline is a significant token, B.26).
@@ -215,19 +258,36 @@ fn read_ident(source: str, pos: u64) -> Scan {
     Scan { token = Token { kind = TokenKind::Ident; text = slice(source, pos, p); line = 0; col = 0 }; next = p }
 }
 
-// a run of `_` then a letter/digit is ONE identifier (`_foo`, `__bar`); a `_` not so
-// followed is the wildcard token (emitted one at a time — the parser rejects a run).
-fn read_underscore(source: str, pos: u64) -> Scan {
+/**
+ * read_underscore — lex a token that starts with `_`, enforcing the write-only discard rules
+ * (owner ruling 2026-07-15). A run of underscores immediately followed by a LETTER is an
+ * ordinary identifier (`_foo`, `__bar`, `_x_1`), read whole from the first underscore. A PURE
+ * run of underscores is the discard: a single `_` is the `Underscore` token; two or more in a
+ * row (`__`, `___`) are rejected outright. A run of underscores followed by a DIGIT carries no
+ * letter, so it matches neither the identifier grammar `[_]*[a-zA-Z]+[a-zA-Z0-9_]*` nor the
+ * lone discard, and is likewise rejected.
+ *
+ * @param source  the whole source text
+ * @param pos     the byte offset of the leading `_`
+ * @return        the `Scan` for the identifier, or the single `Underscore` token
+ * @throws        when the run is two-or-more pure underscores (`__`), or an underscore run is
+ *                immediately followed by a digit (a letterless, non-identifier token)
+ */
+fn read_underscore(source: str, pos: u64) -> Scan | error {
     mut p = pos
     loop {
         if p >= source.len { break }
         if source[p] != b'_' { break }
         p++
     }
-    if p < source.len {
-        if is_alpha(source[p]) || is_digit(source[p]) {
-            return read_ident(source, pos)   // reads from the first `_`
-        }
+    if p < source.len && is_alpha(source[p]) {
+        return read_ident(source, pos)
+    }
+    if p < source.len && is_digit(source[p]) {
+        return scan_err_at(source, pos, "`_` is the write-only discard; an identifier cannot begin with an underscore run followed by a digit")
+    }
+    if p - pos >= 2 {
+        return scan_err_at(source, pos, "`_` is the write-only discard; two or more underscores in a row (`__`) are not a valid token")
     }
     sym(source, pos, 1, TokenKind::Underscore)
 }

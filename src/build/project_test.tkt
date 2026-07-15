@@ -1,0 +1,331 @@
+/**
+ * abs_path_of leaves an already-absolute POSIX path untouched and joins a relative one onto
+ * `cwd` with a '/', exactly as the pre-B3-6 single-arm helper did.
+ */
+#test
+fn pt_abs_path_posix_is_byte_identical() {
+    teko::assert::is_true(abs_path_of("/already/abs", "/cwd") == "/already/abs")
+    teko::assert::is_true(abs_path_of("rel", "/cwd") == "/cwd/rel")
+    teko::assert::is_true(abs_path_of("rel/deeper", "/cwd") == "/cwd/rel/deeper")
+}
+
+/**
+ * abs_path_of returns "" for an empty `path`, and for a relative `path` with no `cwd` to
+ * anchor it — the two "neither input is usable" guards.
+ */
+#test
+fn pt_abs_path_empty_inputs() {
+    teko::assert::is_true(abs_path_of("", "/cwd") == "")
+    teko::assert::is_true(abs_path_of("rel", "") == "")
+}
+
+/**
+ * abs_path_of recognises a Windows drive-letter path as already absolute — with either a
+ * forward-slash or a backslash after the drive, and with an upper- or lower-case drive letter —
+ * returning it as-is instead of concatenating garbage onto `cwd`.
+ */
+#test
+fn pt_abs_path_windows_drive_is_absolute() {
+    teko::assert::is_true(abs_path_of("C:/Users/x/teko.exe", "/cwd") == "C:/Users/x/teko.exe")
+    teko::assert::is_true(abs_path_of("C:\\Users\\x", "/cwd") == "C:\\Users\\x")
+    teko::assert::is_true(abs_path_of("d:/lower/drive", "/cwd") == "d:/lower/drive")
+}
+
+/**
+ * abs_path_of recognises a `\\host\share` UNC path as already absolute and returns it as-is.
+ */
+#test
+fn pt_abs_path_windows_unc_is_absolute() {
+    teko::assert::is_true(abs_path_of("\\\\host\\share", "/cwd") == "\\\\host\\share")
+}
+
+/**
+ * abs_path_of treats non-absolute shapes that merely resemble Windows prefixes as RELATIVE: a
+ * one-byte path, a `<letter><non-colon>` pair, a `<non-letter>:` pair, and a lone leading
+ * backslash all fail the drive/UNC guards and get joined onto `cwd`.
+ */
+#test
+fn pt_abs_path_windows_lookalikes_are_relative() {
+    teko::assert::is_true(abs_path_of("a", "/cwd") == "/cwd/a")
+    teko::assert::is_true(abs_path_of("ab", "/cwd") == "/cwd/ab")
+    teko::assert::is_true(abs_path_of("1:x", "/cwd") == "/cwd/1:x")
+    teko::assert::is_true(abs_path_of("\\a", "/cwd") == "/cwd/\\a")
+}
+
+/**
+ * dirname_of splits a POSIX path at the last '/' and returns "." for a separator-less name —
+ * byte-identical to the '/'-only original.
+ */
+#test
+fn pt_dirname_posix_is_byte_identical() {
+    teko::assert::is_true(dirname_of("/a/b/c") == "/a/b")
+    teko::assert::is_true(dirname_of("file") == ".")
+}
+
+/**
+ * dirname_of splits a Windows path at the rightmost separator, honouring both '\' and '/'
+ * drive-letter forms.
+ */
+#test
+fn pt_dirname_windows_splits_at_last_separator() {
+    teko::assert::is_true(dirname_of("C:\\a\\b\\teko.exe") == "C:\\a\\b")
+    teko::assert::is_true(dirname_of("C:/a/b/teko.exe") == "C:/a/b")
+    teko::assert::is_true(dirname_of("C:\\only") == "C:")
+}
+
+/**
+ * dirname_of on a mixed-separator path splits at whichever separator is rightmost, covering both
+ * the `'\' after the last '/'` and the `'/' after the last '\'` orderings.
+ */
+#test
+fn pt_dirname_mixed_separators_take_rightmost() {
+    teko::assert::is_true(dirname_of("a/b\\c") == "a/b")
+    teko::assert::is_true(dirname_of("a\\b/c") == "a\\b")
+}
+
+/**
+ * is_ascii_alpha classifies ASCII letters (upper and lower) as true and every non-letter byte
+ * (digits, punctuation) as false — the drive-letter guard's full truth table.
+ */
+#test
+fn pt_is_ascii_alpha_truth_table() {
+    teko::assert::is_true(is_ascii_alpha(b'A'))
+    teko::assert::is_true(is_ascii_alpha(b'Z'))
+    teko::assert::is_true(is_ascii_alpha(b'a'))
+    teko::assert::is_true(is_ascii_alpha(b'z'))
+    teko::assert::is_false(is_ascii_alpha(b'5'))
+    teko::assert::is_false(is_ascii_alpha(b':'))
+}
+
+/**
+ * target_matches — is `target_from_name(name)`'s own result `want`? The
+ * shared assertion body every `target_from_name` golden below reduces to
+ * (`NativeTarget` has no `Eq`-by-value assert helper, so this compares by
+ * hand via `match`).
+ *
+ * @param str name  the raw `TEKO_TARGET` value to map
+ * @param NativeTarget want  the expected mapped target
+ * @return bool  `true` iff `target_from_name(name) == want`
+ */
+fn target_matches(name: str, want: NativeTarget) -> bool {
+    match target_from_name(name) {
+        NativeTarget::Arm64Macho => want == NativeTarget::Arm64Macho
+        NativeTarget::X8664Linux => want == NativeTarget::X8664Linux
+        NativeTarget::Riscv64Linux => want == NativeTarget::Riscv64Linux
+        NativeTarget::X8664Windows => want == NativeTarget::X8664Windows
+        NativeTarget::Wasm32Wasi => want == NativeTarget::Wasm32Wasi
+        NativeTarget::Wasm64Wasi => want == NativeTarget::Wasm64Wasi
+        NativeTarget::Wasm32Browser => want == NativeTarget::Wasm32Browser
+    }
+}
+
+#test
+/**
+ * target_from_name_still_maps_the_pre_existing_targets — a non-regression
+ * check on the ENUM extension (#389 C1-5 adds two arms to `NativeTarget`):
+ * the pre-existing `x86_64-linux`/`x86_64-elf` mappings, an unrecognized
+ * string, and the empty string all still resolve exactly as before.
+ *
+ * @return void
+ */
+fn target_from_name_still_maps_the_pre_existing_targets() {
+    teko::assert::is_true(target_matches("x86_64-linux", NativeTarget::X8664Linux))
+    teko::assert::is_true(target_matches("x86_64-elf", NativeTarget::X8664Linux))
+    teko::assert::is_true(target_matches("arm64-macos", NativeTarget::Arm64Macho))
+    teko::assert::is_true(target_matches("", NativeTarget::Arm64Macho))
+    teko::assert::is_true(target_matches("bogus-target", NativeTarget::Arm64Macho))
+}
+
+#test
+/**
+ * target_from_name_maps_every_wasi_alias — `wasm32-wasi`/`wasm32`/`wasm`/
+ * `wasi` all select `Wasm32Wasi` (#389 C1-5).
+ *
+ * @return void
+ */
+fn target_from_name_maps_every_wasi_alias() {
+    teko::assert::is_true(target_matches("wasm32-wasi", NativeTarget::Wasm32Wasi))
+    teko::assert::is_true(target_matches("wasm32", NativeTarget::Wasm32Wasi))
+    teko::assert::is_true(target_matches("wasm", NativeTarget::Wasm32Wasi))
+    teko::assert::is_true(target_matches("wasi", NativeTarget::Wasm32Wasi))
+}
+
+#test
+/**
+ * target_from_name_maps_every_wasm64_alias — `wasm64-wasi`/`wasm64` both
+ * select `Wasm64Wasi` (#389 C1-7, the wasm64 switch, §6) — distinct from
+ * every wasm32 alias above.
+ *
+ * @return void
+ */
+fn target_from_name_maps_every_wasm64_alias() {
+    teko::assert::is_true(target_matches("wasm64-wasi", NativeTarget::Wasm64Wasi))
+    teko::assert::is_true(target_matches("wasm64", NativeTarget::Wasm64Wasi))
+}
+
+#test
+/**
+ * target_from_name_maps_every_browser_alias — `wasm32-browser`/`wasm-
+ * browser`/`browser` all select `Wasm32Browser` (#389 C1-5; its own JS-
+ * import runtime binding is N6b territory, a later slice).
+ *
+ * @return void
+ */
+fn target_from_name_maps_every_browser_alias() {
+    teko::assert::is_true(target_matches("wasm32-browser", NativeTarget::Wasm32Browser))
+    teko::assert::is_true(target_matches("wasm-browser", NativeTarget::Wasm32Browser))
+    teko::assert::is_true(target_matches("browser", NativeTarget::Wasm32Browser))
+}
+
+/**
+ * args_of — build a `[]str` CLI argument vector from up to three tokens, dropping any that is "" so
+ * a test can pass fewer than three. The shared fixture for the optimization-flag parse tests below.
+ *
+ * @param a  the first token (dropped when "")
+ * @param b  the second token (dropped when "")
+ * @param c  the third token (dropped when "")
+ * @return   the assembled argument vector
+ */
+fn args_of(a: str, b: str, c: str) -> []str {
+    mut v: []str = teko::list::empty()
+    if a != "" { v = teko::list::push(v, a) }
+    if b != "" { v = teko::list::push(v, b) }
+    if c != "" { v = teko::list::push(v, c) }
+    v
+}
+
+#test
+/**
+ * opt_level_of_defaults_to_zero — with NO optimization flag on the line the resolved level is 0
+ * (the dev/CI default: no `-O`, byte-identical to the historic release line — the FIXPOINT floor).
+ *
+ * @return void
+ */
+fn opt_level_of_defaults_to_zero() {
+    teko::assert::is_true(opt_level_of(args_of(".", "-o", "bin")) == 0)
+    teko::assert::is_true(opt_level_of(args_of(".", "--no-verify", "")) == 0)
+}
+
+#test
+/**
+ * opt_level_of_release_and_opt_select_two — `--release` and `--opt=2` both resolve to level 2 (the
+ * release seed profile that appends `-O2`), while `--opt=1` resolves to 1 and `--opt=0` back to 0.
+ *
+ * @return void
+ */
+fn opt_level_of_release_and_opt_select_two() {
+    teko::assert::is_true(opt_level_of(args_of(".", "--release", "")) == 2)
+    teko::assert::is_true(opt_level_of(args_of(".", "--opt=2", "")) == 2)
+    teko::assert::is_true(opt_level_of(args_of(".", "--opt=1", "")) == 1)
+    teko::assert::is_true(opt_level_of(args_of(".", "--opt=0", "")) == 0)
+}
+
+#test
+/**
+ * opt_level_of_last_flag_wins — a later `--opt=` overrides an earlier `--release`, and a malformed
+ * suffix falls back to the fully-optimized level 2 rather than silently disabling optimization.
+ *
+ * @return void
+ */
+fn opt_level_of_last_flag_wins() {
+    teko::assert::is_true(opt_level_of(args_of("--release", "--opt=0", ".")) == 0)
+    teko::assert::is_true(opt_level_of(args_of("--opt=9", ".", "")) == 2)
+}
+
+#test
+/**
+ * opt_cc_flag_maps_levels_to_flags — level 0 emits NO flag (""), level 1 `-O1`, level 2 `-O2`, and
+ * an out-of-range level clamps to `-O2` — the exact strings `build_cc_argv` appends to the cc line.
+ *
+ * @return void
+ */
+fn opt_cc_flag_maps_levels_to_flags() {
+    teko::assert::is_true(opt_cc_flag(0) == "")
+    teko::assert::is_true(opt_cc_flag(1) == "-O1")
+    teko::assert::is_true(opt_cc_flag(2) == "-O2")
+    teko::assert::is_true(opt_cc_flag(3) == "-O2")
+}
+
+#test
+/**
+ * project_arg_of_skips_optimization_flags — `--release` and `--opt=<n>` are recognized build flags,
+ * so `project_arg_of` steps over them and still finds the project positional after them.
+ *
+ * @return void
+ */
+fn project_arg_of_skips_optimization_flags() {
+    teko::assert::is_true(project_arg_of(args_of("--release", ".", ""), 0) == ".")
+    teko::assert::is_true(project_arg_of(args_of("--opt=2", ".", ""), 0) == ".")
+    teko::assert::is_true(project_arg_of(args_of(".", "--release", ""), 0) == ".")
+}
+
+
+#test
+/**
+ * backend_of_defaults_to_c — with NO `--backend` flag on the line (and no `TEKO_BACKEND=native`
+ * in the test env) the resolved backend is `Backend::C`, the trusted default that keeps a flagless
+ * build byte-identical (FIXPOINT). D1/#390.
+ *
+ * @return void
+ */
+fn backend_of_defaults_to_c() {
+    teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::C)
+    teko::assert::is_true(backend_of(args_of("build", ".", ""), 0) == Backend::C)
+}
+
+#test
+/**
+ * backend_of_flag_wins_every_spelling — the `--backend` flag resolves in both the single-token
+ * `--backend=<v>` and two-token `--backend <v>` forms, for both `native` and `c`. D1/#390.
+ *
+ * @return void
+ */
+fn backend_of_flag_wins_every_spelling() {
+    teko::assert::is_true(backend_of(args_of("--backend=native", "", ""), 0) == Backend::Native)
+    teko::assert::is_true(backend_of(args_of("--backend=c", "", ""), 0) == Backend::C)
+    teko::assert::is_true(backend_of(args_of("--backend", "native", ""), 0) == Backend::Native)
+    teko::assert::is_true(backend_of(args_of("--backend", "c", ""), 0) == Backend::C)
+}
+
+#test
+/**
+ * project_arg_of_skips_backend_flag — `project_arg_of` skips `--backend` and its value in BOTH
+ * spellings, so the project positional is still found, not the flag or its argument. D1/#390.
+ *
+ * @return void
+ */
+fn project_arg_of_skips_backend_flag() {
+    teko::assert::is_true(project_arg_of(args_of("--backend=native", "proj", ""), 0) == "proj")
+    teko::assert::is_true(project_arg_of(args_of("--backend", "native", "proj"), 0) == "proj")
+}
+
+#test
+/**
+ * backend_of_incomplete_or_unknown_flag_falls_through — a `--backend` with no following value (it
+ * was the last token) or an UNKNOWN value neither matches nor consumes a selection, so resolution
+ * falls through to the default `Backend::C` (no `TEKO_BACKEND` in the test env). Covers the
+ * short-circuit false side of `i + 1 < args.len` and the unknown-value inner branches. D1/#390.
+ *
+ * @return void
+ */
+fn backend_of_incomplete_or_unknown_flag_falls_through() {
+    teko::assert::is_true(backend_of(args_of("--backend", "", ""), 0) == Backend::C)
+    teko::assert::is_true(backend_of(args_of("--backend", "wat", ""), 0) == Backend::C)
+}
+
+#test
+/**
+ * backend_of_env_fallback_when_flag_absent — with NO `--backend` flag, resolution defers to the
+ * `TEKO_BACKEND` env: `native` selects the own backend. A present flag still WINS over the env.
+ * Resets `TEKO_BACKEND` to empty at the end so later tests see the default (the single-process test
+ * runner shares env). Covers the `native_backend_selected()` true branch of `backend_of`. D1/#390.
+ *
+ * @return void
+ */
+fn backend_of_env_fallback_when_flag_absent() {
+    match teko::env::set_var("TEKO_BACKEND", "native") { error => teko::assert::is_true(false); null => { } }
+    teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::Native)
+    teko::assert::is_true(backend_of(args_of("--backend=c", "", ""), 0) == Backend::C)
+    match teko::env::set_var("TEKO_BACKEND", "") { error => { }; null => { } }
+    teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::C)
+}

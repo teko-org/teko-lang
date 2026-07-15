@@ -126,8 +126,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/ci_provision_teko.sh linux-x86_64-glibc
 
-      - name: Emit the portable teko.c (one gen, no gate)
-        run: teko . -o out --no-verify
+      # Three self-host generations, all `--no-verify` (CI already gated this commit):
+      # seed→gen1→gen2→gen3. The PUBLISHED artifact is gen3 — the binary produced by the
+      # self-hosted chain of THIS tag, not by the previous release's seed — and gen2==gen3
+      # byte-identity is asserted here as the release's own FIXPOINT gate (owner ruling
+      # 2026-07-10, from B1 on).
+      #
+      # Deliberately NOT `--release`: this leg only needs the byte-identical `out/teko.c`
+      # (the gen binaries are discarded — the SHIPPED Linux artifacts are cross-compiled from
+      # that teko.c by `zig cc` below). The `zig cc` step now builds Linux at `-O2` too: both
+      # x86_64 UBs that used to force `-O0` are fixed (#283's uninitialized temp + #577's
+      # noinline closing the `-O1`/`-O2` false `argument type mismatch`), VERIFIED 2026-07-15 —
+      # zig `-O0`/`-O1`/`-O2` all self-host with byte-identical `teko.c`. So the `-O2` seed-speed
+      # win (owner ruling 2026-07-14) now lands on the Linux seed as well; the x86_64 cross-smoke
+      # RUNS the artifact so any regression re-reddens. See scripts/cross_compile_linux.sh.
+      - name: Emit the portable teko.c (gen3 of 3, no gate)
+        run: |
+          set -eu
+          mkdir -p gen1 gen2 out
+          teko . -o gen1 --no-verify
+          ./gen1/teko . -o gen2 --no-verify
+          ./gen2/teko . -o out --no-verify
+          cmp gen2/teko.c out/teko.c && echo "fixpoint OK: gen2.c == gen3.c ($(wc -c < out/teko.c) bytes)"
 
       # Cross-compile out/teko.c into all six Linux artifacts and package each. The exact same
       # script (scripts/cross_compile_linux.sh) runs as a compile-only SMOKE in native.yml on
@@ -186,12 +206,29 @@ jobs:
           LABEL: ${{ matrix.label }}
         run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      # ONE generation, no gate (`--no-verify`) — CI already verified this commit.
-      # `shell: bash` on all platforms: the seed is added to $GITHUB_PATH as a POSIX path,
-      # which only bash resolves on Windows.
-      - name: Build the release binary (one gen, no gate)
+      # Three self-host generations, all `--no-verify` — the PUBLISHED binary is gen3
+      # (built by THIS tag's own self-hosted chain), with gen2==gen3 asserted as the
+      # release's fixpoint gate (owner ruling 2026-07-10, from B1 on). `shell: bash` on
+      # all platforms: the seed is added to $GITHUB_PATH as a POSIX path, which only
+      # bash resolves on Windows.
+      #
+      # `--release` on all three generations builds every link at `-O2` (owner ruling
+      # 2026-07-14): the published macOS/Windows seed is compiled optimized once here, so
+      # everyone downstream gets a compiler that RUNS ~1.30x faster (the diagnostic measured
+      # 168.7s → 129.6s at -O2), paying the heavier cc cost (~+33s) only at release. Applying
+      # it to the whole chain SELF-PROVES the -O2 binary: gen1(-O2) builds gen2, gen2(-O2)
+      # builds out, so any -O2 problem fails the build loudly instead of shipping. -O2 emits
+      # BYTE-IDENTICAL teko.c (proven by cmp), so the gen2==gen3 fixpoint below is unchanged.
+      - name: Build the release binary (gen3 of 3, no gate)
         shell: bash
-        run: teko . -o out --no-verify
+        run: |
+          set -eu
+          BIN=teko; [ "${{ matrix.ostype }}" = "windows" ] && BIN=teko.exe
+          mkdir -p gen1 gen2 out
+          teko . -o gen1 --no-verify --release
+          "./gen1/$BIN" . -o gen2 --no-verify --release
+          "./gen2/$BIN" . -o out --no-verify --release
+          cmp gen2/teko.c out/teko.c && echo "fixpoint OK: gen2.c == gen3.c ($(wc -c < out/teko.c) bytes)"
 
       - name: Package
         shell: bash

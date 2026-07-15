@@ -51,6 +51,9 @@ fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error
     mut i = 0
     loop {
         if i >= f.params.len { break }
+        if !f.params[i].has_type && f.params[i].name == "_" {
+            return error { message = "a `_` discard parameter is only allowed when implementing an interface method or overriding a base method — a plain function must name its parameters" }
+        }
         let pt = match resolve_type(f.params[i].type_ann, tbl, ref_ns) {
             Type as t => t
             error as e => return e
@@ -144,10 +147,13 @@ fn method_func_type(f: parser::Function, struct_name: str, table: TypeTable, ref
     mut param_names: []str = teko::list::empty()
     mut defaults: []parser::Expr = teko::list::empty()
     mut n_required: u64 = f.params.len
+    let disc_gov: parser::Function? = if params_have_discard(f.params) { discard_governing_sig(f, struct_name, ref_ns, table) } else { null }
     mut i = 0
     loop {
         if i >= f.params.len { break }
-        let pt = if !f.params[i].has_type {
+        let pt = if !f.params[i].has_type && f.params[i].name == "_" {
+            match discard_param_type(disc_gov, i to u64, tbl, ref_ns) { Type as t => t; error as e => return e }
+        } else if !f.params[i].has_type {
             Named { name = receiver_canonical_name(struct_name, ref_ns, table) }
         } else {
             match resolve_type(f.params[i].type_ann, tbl, ref_ns) { Type as t => t; error as e => return e }
@@ -776,8 +782,13 @@ fn method_sig_matches(req: parser::Function, impl_m: parser::Function, table: Ty
     mut k: u64 = 0
     loop {
         if rstart + k >= req.params.len { break }
+        let ip = impl_m.params[istart + k]
+        if !ip.has_type && ip.name == "_" {
+            k++
+            continue
+        }
         let rt = match resolve_type(req.params[rstart + k].type_ann, table, ref_ns) { Type as t => t; error => return false }   // (#109 W2) source-ref types resolve in the conforming type's namespace
-        let it = match resolve_type(impl_m.params[istart + k].type_ann, table, ref_ns) { Type as t => t; error => return false }   // (#109 W2) source-ref types resolve in the conforming type's namespace
+        let it = match resolve_type(ip.type_ann, table, ref_ns) { Type as t => t; error => return false }
         if !type_eq(rt, it) { return false }
         k++
     }

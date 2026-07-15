@@ -1,0 +1,2004 @@
+/**
+ * NumberedInst — one `MInst` tagged with its linear program point and its
+ * source block id: the coordinate system every liveness pass indexes by
+ * (§3.1). Points are dense and increase in block order.
+ *
+ * @since #384 A3-2
+ */
+pub type NumberedInst = struct {
+    /**
+     * point — the instruction's linear program point (0-based, block order).
+     */
+    point: u32
+    /**
+     * block_id — the `MBlock` this instruction was flattened from.
+     */
+    block_id: u32
+    /**
+     * inst — the machine instruction at this point.
+     */
+    inst: MInst
+}
+
+/**
+ * u32_in — whether `list` contains `x`.
+ *
+ * @param []u32 list  the list to search
+ * @param u32 x  the value to find
+ * @return bool  true iff `x` is present
+ */
+fn u32_in(list: []u32, x: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        if list[i] == x { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * reverse_u32 — `list` reversed (post-order becomes reverse-post-order).
+ *
+ * @param []u32 list  the list to reverse
+ * @return []u32  the reversed list
+ */
+fn reverse_u32(list: []u32) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = list.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        out = teko::list::push(out, list[i])
+    }
+    out
+}
+
+/**
+ * block_insts_of — the instruction list of `f`'s block with id `id`, or the
+ * empty list if no such block (a defensive default; every real target names a
+ * present block).
+ *
+ * @param MFunc f  the function to search
+ * @param u32 id  the block id
+ * @return []MInst  the block's instructions, or empty
+ */
+fn block_insts_of(f: MFunc, id: u32) -> []MInst {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id == id { return f.blocks[i].insts }
+        i++
+    }
+    teko::list::empty()
+}
+
+/**
+ * block_successors — the CFG successors of `f`'s block `id`: every distinct
+ * terminator target in the block (a block ends in up to two terminators — a
+ * conditional `MBranchCond`/`MCbz` plus a trailing unconditional `MBranch`).
+ * Collected in instruction order for a deterministic RPO (M.2).
+ *
+ * @param MFunc f  the function
+ * @param u32 id  the block whose successors to enumerate
+ * @return []u32  the distinct successor block ids, in terminator order
+ */
+fn block_successors(f: MFunc, id: u32) -> []u32 {
+    let insts = block_insts_of(f, id)
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= insts.len { break }
+        let t = terminator_target(insts[i])
+        if t.has { out = add_unique_u32(out, t.target) }
+        i++
+    }
+    out
+}
+
+/**
+ * RpoState — the fold state of the post-order DFS: the ids already visited and
+ * the post-order accumulator (a block is appended after all its successors).
+ *
+ * @since #443
+ */
+type RpoState = struct {
+    /**
+     * visited — the block ids the DFS has already entered.
+     */
+    visited: []u32
+    /**
+     * post — the post-order sequence so far (reversed to RPO by the driver).
+     */
+    post: []u32
+}
+
+/**
+ * rpo_visit — the post-order DFS step: enter `id` (once), recurse into every
+ * successor in order, then append `id` to the post-order. Threads the visited
+ * set + accumulator functionally so no block is entered twice (the recursion
+ * is bounded by CFG nesting depth, small for structured control flow).
+ *
+ * @param MFunc f  the function whose CFG is walked
+ * @param u32 id  the block id to visit
+ * @param RpoState st  the visited set + post-order so far
+ * @return RpoState  the updated visited set + post-order
+ */
+fn rpo_visit(f: MFunc, id: u32, st: RpoState) -> RpoState {
+    if u32_in(st.visited, id) { return st }
+    let succs = block_successors(f, id)
+    mut cur = RpoState { visited = teko::list::push(st.visited, id); post = st.post }
+    mut i: u64 = 0
+    loop {
+        if i >= succs.len { break }
+        cur = rpo_visit(f, succs[i], cur)
+        i++
+    }
+    RpoState { visited = cur.visited; post = teko::list::push(cur.post, id) }
+}
+
+/**
+ * append_unvisited — `order` extended with any of `f`'s block ids not already
+ * present, in block-list order. Keeps the numbering TOTAL: an unreachable
+ * block (never reached from entry) still receives program points so no vreg is
+ * left un-numbered. Reachable functions are unchanged.
+ *
+ * @param MFunc f  the function
+ * @param []u32 order  the reachable-block order so far
+ * @return []u32  the order extended with any unreachable block ids
+ */
+fn append_unvisited(f: MFunc, order: []u32) -> []u32 {
+    mut out = order
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let bid = f.blocks[i].id
+        if !u32_in(out, bid) { out = teko::list::push(out, bid) }
+        i++
+    }
+    out
+}
+
+/**
+ * rpo_block_order — the reverse-post-order block-id sequence of `f`, entry
+ * first: a topological linearization of the acyclic CFG (a real `loop`
+ * back-edge is the one retreating edge, detected by position, §3). The
+ * numbering + back-edge coordinate the allocator indexes by, replacing the
+ * allocation-order id proxy (#443). Unreachable blocks are appended last so
+ * the order covers every block.
+ *
+ * @param MFunc f  the selected function
+ * @return []u32  the RPO block-id order (entry first)
+ */
+fn rpo_block_order(f: MFunc) -> []u32 {
+    if f.blocks.len == 0 { return teko::list::empty() }
+    let entry = f.blocks[0].id
+    let st = rpo_visit(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() })
+    append_unvisited(f, reverse_u32(st.post))
+}
+
+/**
+ * reachable_blocks — the block ids reachable from `f`'s entry, via the same
+ * post-order DFS `rpo_block_order` walks (§3). A block absent from this set is
+ * dead code — for example a `match`'s defensive fallback block past an
+ * irrefutable final arm, which no branch targets because the last pattern test
+ * jumps unconditionally into its own body. `append_unvisited` still numbers
+ * such a block (keeping the numbering TOTAL), placing it LAST; the back-edge
+ * test uses this set to EXCLUDE its edges, since a dead block cannot form a
+ * loop the allocator must model (A4-6, #385 — the acyclic false-positive the
+ * `if` fix #443 did not cover for `match`).
+ *
+ * @param MFunc f  the selected function
+ * @return []u32  the entry-reachable block ids (the DFS-visited set)
+ */
+fn reachable_blocks(f: MFunc) -> []u32 {
+    if f.blocks.len == 0 { return teko::list::empty() }
+    let entry = f.blocks[0].id
+    rpo_visit(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() }).visited
+}
+
+/**
+ * block_pos — the position of block id `id` in the RPO `order` (its liveness
+ * rank), or `order.len` if absent (a defensive default — an absent target
+ * looks like the last position, never a spurious back-edge).
+ *
+ * @param []u32 order  the RPO block-id order
+ * @param u32 id  the block id to rank
+ * @return u32  the 0-based RPO position, or `order.len`
+ */
+fn block_pos(order: []u32, id: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= order.len { break }
+        if order[i] == id { return i to u32 }
+        i++
+    }
+    order.len to u32
+}
+
+/**
+ * number_insts — flatten `f`'s blocks into one linearly-numbered instruction
+ * stream in RPO block order (§3.1). RPO is a topological order of the acyclic
+ * CFG, so every def precedes all its uses — the inversion the allocation-order
+ * flattening produced for a nested `if`/`match` merge is gone (#443). Every
+ * later pass (interval computation, the scan, the rewrite) indexes liveness by
+ * these points.
+ *
+ * @param MFunc f  the selected function
+ * @param []u32 order  the RPO block-id order (from `rpo_block_order`)
+ * @return []NumberedInst  the flattened, RPO-numbered stream
+ */
+fn number_insts(f: MFunc, order: []u32) -> []NumberedInst {
+    mut out: []NumberedInst = teko::list::empty()
+    mut p: u32 = 0
+    mut bi: u64 = 0
+    loop {
+        if bi >= order.len { break }
+        let bid = order[bi]
+        let insts = block_insts_of(f, bid)
+        mut ii: u64 = 0
+        loop {
+            if ii >= insts.len { break }
+            out = teko::list::push(out, NumberedInst { point = p; block_id = bid; inst = insts[ii] })
+            p = p + 1
+            ii++
+        }
+        bi++
+    }
+    out
+}
+
+/**
+ * InstRegs — the def/use decomposition of one `MInst` (§1.1): its optional
+ * defined register, the registers it uses, and whether it is a call (which
+ * clobbers the caller-saved set). This is the single source of truth both
+ * interval computation and the rewrite read, so the def/use table lives in
+ * ONE place (M.5).
+ *
+ * @since #384 A3-2
+ */
+pub type InstRegs = struct {
+    /**
+     * has_def — true iff the instruction writes a register (`def_reg`).
+     */
+    has_def: bool
+    /**
+     * def_reg — the defined register (meaningful only when `has_def`).
+     */
+    def_reg: MReg
+    /**
+     * uses — every register the instruction reads, in operand order.
+     */
+    uses: []MReg
+    /**
+     * is_call — true for `MCall`/`MCallIndirect` (clobbers caller-saved).
+     */
+    is_call: bool
+}
+
+/**
+ * ir_dummy — the placeholder `def_reg` for a no-def decomposition (never read
+ * when `has_def` is false).
+ *
+ * @return MReg  an arbitrary physical register
+ */
+fn ir_dummy() -> MReg {
+    preg(0, MRegClass::GPR)
+}
+
+/**
+ * one_reg — a single-register use list.
+ *
+ * @param MReg a  the register
+ * @return []MReg  the one-element list
+ */
+fn one_reg(a: MReg) -> []MReg {
+    teko::list::push(teko::list::empty(), a)
+}
+
+/**
+ * two_regs — a two-register use list, in order.
+ *
+ * @param MReg a  the first register
+ * @param MReg b  the second register
+ * @return []MReg  the two-element list
+ */
+fn two_regs(a: MReg, b: MReg) -> []MReg {
+    teko::list::push(one_reg(a), b)
+}
+
+/**
+ * three_regs — a three-register use list, in order (the `MMSub` case).
+ *
+ * @param MReg a  the first register
+ * @param MReg b  the second register
+ * @param MReg c  the third register
+ * @return []MReg  the three-element list
+ */
+fn three_regs(a: MReg, b: MReg, c: MReg) -> []MReg {
+    teko::list::push(two_regs(a, b), c)
+}
+
+/**
+ * cons_reg — `a` prepended to `rest` (the `MCallIndirect` target-plus-args
+ * use list).
+ *
+ * @param MReg a  the register to prepend
+ * @param []MReg rest  the tail
+ * @return []MReg  `a` followed by every element of `rest`
+ */
+fn cons_reg(a: MReg, rest: []MReg) -> []MReg {
+    mut out = one_reg(a)
+    mut i: u64 = 0
+    loop {
+        if i >= rest.len { break }
+        out = teko::list::push(out, rest[i])
+        i++
+    }
+    out
+}
+
+/**
+ * ir_def — a define-only decomposition (a fresh materialization / address).
+ *
+ * @param MReg d  the defined register
+ * @return InstRegs  `{has_def, def_reg=d, no uses}`
+ */
+fn ir_def(d: MReg) -> InstRegs {
+    InstRegs { has_def = true; def_reg = d; uses = teko::list::empty(); is_call = false }
+}
+
+/**
+ * ir_def_use — a define-and-use decomposition.
+ *
+ * @param MReg d  the defined register
+ * @param []MReg us  the used registers
+ * @return InstRegs  `{has_def, def_reg=d, uses=us}`
+ */
+fn ir_def_use(d: MReg, us: []MReg) -> InstRegs {
+    InstRegs { has_def = true; def_reg = d; uses = us; is_call = false }
+}
+
+/**
+ * ir_use — a use-only decomposition (a store / compare / conditional test).
+ *
+ * @param []MReg us  the used registers
+ * @return InstRegs  `{no def, uses=us}`
+ */
+fn ir_use(us: []MReg) -> InstRegs {
+    InstRegs { has_def = false; def_reg = ir_dummy(); uses = us; is_call = false }
+}
+
+/**
+ * ir_none — an empty decomposition (a terminator with no register operand).
+ *
+ * @return InstRegs  `{no def, no uses}`
+ */
+fn ir_none() -> InstRegs {
+    InstRegs { has_def = false; def_reg = ir_dummy(); uses = teko::list::empty(); is_call = false }
+}
+
+/**
+ * ir_call — a call decomposition: the pinned arg physregs are `uses`, the
+ * result register is a def iff the call produces one, and `is_call` marks the
+ * caller-saved clobber.
+ *
+ * @param MReg ret  the result register
+ * @param bool has_result  whether the call defines `ret`
+ * @param []MReg us  the pinned argument physregs
+ * @return InstRegs  the call decomposition
+ */
+fn ir_call(ret: MReg, has_result: bool, us: []MReg) -> InstRegs {
+    InstRegs { has_def = has_result; def_reg = ret; uses = us; is_call = true }
+}
+
+/**
+ * inst_regs — decompose one `MInst` into its def/use registers per the §1.1
+ * table. A flat per-case match over the 29-case `MInst` variant
+ * (`minst.tks:787`). Two subtleties the table encodes: `MMovK` is
+ * read-modify-write (its `dst` is BOTH a use and a def — `minst.tks:406`), and
+ * `MRet` carries no operand (its returned value was pre-pinned to x0/v0 by a
+ * preceding move, so the pin's interval is extended to the terminator by
+ * `compute_intervals`, not reported here).
+ *
+ * @param MInst inst  the instruction to decompose
+ * @return InstRegs  its def/use decomposition
+ */
+pub fn inst_regs(inst: MInst) -> InstRegs {
+    match inst {
+        MAlu as x => ir_def_use(x.dst, two_regs(x.a, x.b))
+        MAluImm as x => ir_def_use(x.dst, one_reg(x.a))
+        MMSub as x => ir_def_use(x.dst, three_regs(x.a, x.b, x.c))
+        MNeg as x => ir_def_use(x.dst, one_reg(x.a))
+        MMvn as x => ir_def_use(x.dst, one_reg(x.a))
+        MFAlu as x => ir_def_use(x.dst, two_regs(x.a, x.b))
+        MFNeg as x => ir_def_use(x.dst, one_reg(x.a))
+        MCmp as x => ir_use(two_regs(x.a, x.b))
+        MCmpImm as x => ir_use(one_reg(x.a))
+        MFCmp as x => ir_use(two_regs(x.a, x.b))
+        MCSet as x => ir_def(x.dst)
+        MMovZ as x => ir_def(x.dst)
+        MMovK as x => ir_def_use(x.dst, one_reg(x.dst))
+        MMovN as x => ir_def(x.dst)
+        MFMov as x => ir_def_use(x.dst, one_reg(x.src))
+        MMov as x => ir_def_use(x.dst, one_reg(x.src))
+        MExt as x => ir_def_use(x.dst, one_reg(x.a))
+        MCvt as x => ir_def_use(x.dst, one_reg(x.a))
+        MLoad as x => ir_def_use(x.dst, one_reg(x.mem.base))
+        MStore as x => ir_use(two_regs(x.src, x.mem.base))
+        MFrameAddr as x => ir_def(x.dst)
+        MAdrp as x => ir_def(x.dst)
+        MAddLo as x => ir_def_use(x.dst, one_reg(x.a))
+        MBranch => ir_none()
+        MBranchCond => ir_none()
+        MCbz as x => ir_use(one_reg(x.a))
+        MCall as x => ir_call(x.ret_reg, x.has_result, x.uses)
+        MCallIndirect as x => ir_call(x.ret_reg, x.has_result, cons_reg(x.target, x.uses))
+        MRet => ir_none()
+    }
+}
+
+/**
+ * LiveInterval — one value's live range over the linear numbering (§3.2): the
+ * virtual value (or physical pin) `reg_id` in `reg_class`, live from `start`
+ * to `end`, `is_fixed` for a pre-colored pin, `crosses_call` iff a call point
+ * lies in `(start, end]`.
+ *
+ * @since #384 A3-2
+ */
+pub type LiveInterval = struct {
+    /**
+     * reg_id — the virtual id being colored, or the pinned physical id.
+     */
+    reg_id: u32
+    /**
+     * reg_class — which register file the value lives in.
+     */
+    reg_class: MRegClass
+    /**
+     * start — the program point of the value's def (a pin: its def or entry).
+     */
+    start: u32
+    /**
+     * end — the last-use point (a result pin: extended to the terminator).
+     */
+    end: u32
+    /**
+     * is_fixed — true for a pre-colored physical pin the allocator must not
+     * recolor.
+     */
+    is_fixed: bool
+    /**
+     * crosses_call — true iff a call point lies in `(start, end]`.
+     */
+    crosses_call: bool
+}
+
+/**
+ * IntervalSet — the computed intervals for one function: the virtual
+ * intervals to color, the fixed physical pin intervals to block, and the call
+ * points (a `crosses_call` value must avoid the caller-saved set).
+ *
+ * @since #384 A3-2
+ */
+pub type IntervalSet = struct {
+    /**
+     * virt — the virtual intervals the scan colors.
+     */
+    virt: []LiveInterval
+    /**
+     * fixed — the physical pin intervals the scan blocks.
+     */
+    fixed: []LiveInterval
+    /**
+     * call_points — the program points of every `MCall`/`MCallIndirect`.
+     */
+    call_points: []u32
+}
+
+/**
+ * RegEvent — one register touch (the register, the point, and whether it is a
+ * def): the raw material `compute_intervals` groups by register.
+ *
+ * @since #384 A3-2
+ */
+type RegEvent = struct {
+    /**
+     * reg — the register touched.
+     */
+    reg: MReg
+    /**
+     * point — the program point of the touch.
+     */
+    point: u32
+    /**
+     * is_def — true iff this touch defines (writes) the register.
+     */
+    is_def: bool
+}
+
+/**
+ * reg_eq — whether two `MReg`s name the same register (id + class +
+ * physical-ness): a virtual and a physical register can share an id.
+ *
+ * @param MReg a  the first register
+ * @param MReg b  the second register
+ * @return bool  true iff they are the same register
+ */
+fn reg_eq(a: MReg, b: MReg) -> bool {
+    a.id == b.id && a.is_phys == b.is_phys && a.reg_class == b.reg_class
+}
+
+/**
+ * reg_in — whether `list` already contains a register equal to `r`.
+ *
+ * @param []MReg list  the registers seen so far
+ * @param MReg r  the register to find
+ * @return bool  true iff `r` is present
+ */
+fn reg_in(list: []MReg, r: MReg) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        if reg_eq(list[i], r) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * is_terminator — whether `inst` ends a block (`MRet` or a branch).
+ *
+ * @param MInst inst  the instruction
+ * @return bool  true iff it is a terminator
+ */
+fn is_terminator(inst: MInst) -> bool {
+    match inst {
+        MRet => true
+        MBranch => true
+        MBranchCond => true
+        MCbz => true
+        _ => false
+    }
+}
+
+/**
+ * TargetOpt — a terminator's branch target, or `has=false` for a
+ * non-branching instruction.
+ *
+ * @since #384 A3-2
+ */
+type TargetOpt = struct {
+    /**
+     * has — true iff the instruction is a branch/jump.
+     */
+    has: bool
+    /**
+     * target — the destination machine-block id (meaningful when `has`).
+     */
+    target: u32
+}
+
+/**
+ * terminator_target — the machine-block a branch/jump transfers to, or
+ * `has=false` if `inst` is not a branch.
+ *
+ * @param MInst inst  the instruction
+ * @return TargetOpt  its branch target, or none
+ */
+fn terminator_target(inst: MInst) -> TargetOpt {
+    match inst {
+        MBranch as x => TargetOpt { has = true; target = x.target }
+        MBranchCond as x => TargetOpt { has = true; target = x.target }
+        MCbz as x => TargetOpt { has = true; target = x.target }
+        _ => TargetOpt { has = false; target = 0 }
+    }
+}
+
+/**
+ * NaturalLoop — one natural loop described by two program points over the linear
+ * numbering (§6.2): `header_pt`, the first point of the loop-header block (the
+ * retreating edge's target), and `latch_pt`, the point of the retreating branch
+ * itself (the loop's highest body point in RPO). The §6.2 replacement for the
+ * old bare back-edge boolean: it DESCRIBES each loop's span so `extend_over_loops` can
+ * widen a header-live interval across the whole body. A value live at `header_pt`
+ * must stay live to `latch_pt` — the next iteration re-enters at the header.
+ *
+ * @since #389 F2
+ */
+type NaturalLoop = struct {
+    /**
+     * header_pt — the first program point of the loop-header block (the
+     * retreating edge's target); the value's live-at-header boundary.
+     */
+    header_pt: u32
+    /**
+     * latch_pt — the program point of the retreating branch (the latch block's
+     * terminator, the loop's highest body point in RPO); the widen target.
+     */
+    latch_pt: u32
+}
+
+/**
+ * block_first_point — the smallest program point of any instruction in block
+ * `block_id`, or 0 when the block has no instruction in `stream`. The stream is
+ * RPO-numbered, so this is the block's entry point (its live-in boundary), used
+ * as a loop header's `header_pt`.
+ *
+ * @param []NumberedInst stream  the RPO-numbered stream
+ * @param u32 block_id  the block whose first point to find
+ * @return u32  the block's smallest program point (0 if absent)
+ */
+fn block_first_point(stream: []NumberedInst, block_id: u32) -> u32 {
+    mut have: bool = false
+    mut best: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.block_id == block_id {
+            if !have || ni.point < best { best = ni.point; have = true }
+        }
+        i++
+    }
+    best
+}
+
+/**
+ * natural_loops — every natural loop of the reachable CFG, one per retreating
+ * (loop back-)edge (§6.2, the §3 replacement for the old bare back-edge bool
+ * `has_back_edge` once returned). A terminator on an ENTRY-REACHABLE block
+ * whose target does not follow it in RPO (`pos(target) <= pos(source)`) is a
+ * retreating edge; its target is the loop header (`header_pt =
+ * block_first_point(target)`) and its source-branch point the latch
+ * (`latch_pt`). Dead-block sources are excluded (a dead edge is not a loop,
+ * A4-6 #385) and acyclic `if`/`match` nesting has no retreating edge, so the
+ * result is empty for the acyclic subset.
+ *
+ * @param []NumberedInst stream  the RPO-numbered stream
+ * @param []u32 order  the RPO block-id order
+ * @param []u32 reachable  the entry-reachable block ids (dead-block sources are
+ *                         excluded — a dead edge is not a loop)
+ * @return []NaturalLoop  one loop span per retreating edge
+ */
+fn natural_loops(stream: []NumberedInst, order: []u32, reachable: []u32) -> []NaturalLoop {
+    mut out: []NaturalLoop = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        let t = terminator_target(ni.inst)
+        if t.has && u32_in(reachable, ni.block_id) {
+            if block_pos(order, t.target) <= block_pos(order, ni.block_id) {
+                out = teko::list::push(out, NaturalLoop { header_pt = block_first_point(stream, t.target); latch_pt = ni.point })
+            }
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * next_terminator_point — the smallest point at-or-after `from` whose
+ * instruction is a terminator (the result-pin extension target, §1.2), or
+ * `from` if none follows.
+ *
+ * @param []NumberedInst stream  the numbered stream
+ * @param u32 from  the def point to extend from
+ * @return u32  the terminator point, or `from`
+ */
+fn next_terminator_point(stream: []NumberedInst, from: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.point >= from && is_terminator(ni.inst) { return ni.point }
+        i++
+    }
+    from
+}
+
+/**
+ * collect_events — the raw def/use touches of the whole stream, in program
+ * order (a def before its uses at a shared point).
+ *
+ * @param []NumberedInst stream  the numbered stream
+ * @return []RegEvent  every register touch
+ */
+fn collect_events(stream: []NumberedInst) -> []RegEvent {
+    mut out: []RegEvent = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        let ir = inst_regs(ni.inst)
+        if ir.has_def {
+            out = teko::list::push(out, RegEvent { reg = ir.def_reg; point = ni.point; is_def = true })
+        }
+        mut u: u64 = 0
+        loop {
+            if u >= ir.uses.len { break }
+            out = teko::list::push(out, RegEvent { reg = ir.uses[u]; point = ni.point; is_def = false })
+            u++
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * distinct_regs — the registers touched, one representative each.
+ *
+ * @param []RegEvent events  the register touches
+ * @return []MReg  the distinct registers
+ */
+fn distinct_regs(events: []RegEvent) -> []MReg {
+    mut out: []MReg = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= events.len { break }
+        let r = events[i].reg
+        if !reg_in(out, r) { out = teko::list::push(out, r) }
+        i++
+    }
+    out
+}
+
+/**
+ * call_points_of — the program points of every call, the clobber boundaries a
+ * `crosses_call` interval avoids caller-saved registers over.
+ *
+ * @param []NumberedInst stream  the numbered stream
+ * @return []u32  the call points
+ */
+fn call_points_of(stream: []NumberedInst) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        if inst_regs(stream[i].inst).is_call { out = teko::list::push(out, stream[i].point) }
+        i++
+    }
+    out
+}
+
+/**
+ * crosses_a_call — whether any call point lies in `(start, end]`.
+ *
+ * @param []u32 call_points  the call points
+ * @param u32 start  the interval start
+ * @param u32 end  the interval end
+ * @return bool  true iff a call point lies in `(start, end]`
+ */
+fn crosses_a_call(call_points: []u32, start: u32, end: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= call_points.len { break }
+        let cp = call_points[i]
+        if cp > start && cp <= end { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * mk_interval — assemble a `LiveInterval` and mark its `crosses_call`.
+ *
+ * @param MReg r  the register
+ * @param u32 start  the def point
+ * @param u32 end  the last-use point
+ * @param bool is_fixed  whether it is a physical pin
+ * @param []u32 call_points  the call points (for `crosses_call`)
+ * @return LiveInterval  the assembled interval
+ */
+fn mk_interval(r: MReg, start: u32, end: u32, is_fixed: bool, call_points: []u32) -> LiveInterval {
+    LiveInterval {
+        reg_id = r.id
+        reg_class = r.reg_class
+        start = start
+        end = end
+        is_fixed = is_fixed
+        crosses_call = crosses_a_call(call_points, start, end)
+    }
+}
+
+/**
+ * virt_interval — a virtual register's single `[def, last-use]` interval. The
+ * SSA-lite form gives one logical def; the earliest def point is `start` (so
+ * an `MMovK` RMW follow-up on the same vreg extends, not restarts) and the
+ * last touch is `end`.
+ *
+ * @param []RegEvent events  every register touch
+ * @param MReg r  the virtual register
+ * @param []u32 call_points  the call points (for `crosses_call`)
+ * @return LiveInterval  its interval
+ */
+fn virt_interval(events: []RegEvent, r: MReg, call_points: []u32) -> LiveInterval {
+    mut have_def: bool = false
+    mut start: u32 = 0
+    mut end: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= events.len { break }
+        let e = events[i]
+        if reg_eq(e.reg, r) {
+            if e.point > end { end = e.point }
+            if e.is_def {
+                if !have_def || e.point < start { start = e.point }
+                have_def = true
+            }
+        }
+        i++
+    }
+    if !have_def { start = end }
+    mk_interval(r, start, end, false, call_points)
+}
+
+/**
+ * finalize_pin — close a physical pin interval, applying the §1.2 result-pin
+ * extension: a def-started pin with no later use (its `end` equals its
+ * `start`) is extended to the next terminator so a result pin lives to the
+ * `RET`.
+ *
+ * @param MReg r  the physical register
+ * @param u32 start  the pin's def/entry point
+ * @param u32 end  the pin's last use
+ * @param bool def_started  whether the pin was opened by a def
+ * @param []NumberedInst stream  the numbered stream
+ * @param []u32 call_points  the call points (for `crosses_call`)
+ * @return LiveInterval  the finalized pin interval
+ */
+fn finalize_pin(r: MReg, start: u32, end: u32, def_started: bool, stream: []NumberedInst, call_points: []u32) -> LiveInterval {
+    let real_end = if def_started && end == start {
+        let term = next_terminator_point(stream, start)
+        if term > end { term } else { end }
+    } else {
+        end
+    }
+    mk_interval(r, start, real_end, true, call_points)
+}
+
+/**
+ * phys_intervals — a physical register's pin intervals (§1.3): a physreg is
+ * reused (an arg pin at entry, a result pin at exit), so a def STARTS a fresh
+ * interval, a use before any def is entry-live from point 0, and a def-started
+ * pin with no later use is a result pin extended to its block terminator.
+ *
+ * @param []RegEvent events  every register touch (in program order)
+ * @param MReg r  the physical register
+ * @param []NumberedInst stream  the numbered stream (for pin extension)
+ * @param []u32 call_points  the call points (for `crosses_call`)
+ * @return []LiveInterval  its one-or-more pin intervals
+ */
+fn phys_intervals(events: []RegEvent, r: MReg, stream: []NumberedInst, call_points: []u32) -> []LiveInterval {
+    mut out: []LiveInterval = teko::list::empty()
+    mut have_open: bool = false
+    mut def_started: bool = false
+    mut cur_start: u32 = 0
+    mut cur_end: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= events.len { break }
+        let e = events[i]
+        if reg_eq(e.reg, r) {
+            if e.is_def {
+                if have_open { out = teko::list::push(out, finalize_pin(r, cur_start, cur_end, def_started, stream, call_points)) }
+                cur_start = e.point
+                cur_end = e.point
+                have_open = true
+                def_started = true
+            } else {
+                if have_open {
+                    if e.point > cur_end { cur_end = e.point }
+                } else {
+                    cur_start = 0
+                    cur_end = e.point
+                    have_open = true
+                    def_started = false
+                }
+            }
+        }
+        i++
+    }
+    if have_open { out = teko::list::push(out, finalize_pin(r, cur_start, cur_end, def_started, stream, call_points)) }
+    out
+}
+
+/**
+ * extend_interval_over_loops — widen one interval's `end` so it covers every
+ * natural loop it is live at the header of (§6.2): for each loop whose value is
+ * defined before the header (`start < header_pt`) and still live at it
+ * (`end >= header_pt`), the `end` grows to at least the loop's `latch_pt`, so the
+ * value survives the whole body across the back-edge. Contiguous and
+ * conservative: only `end` grows, and `crosses_call` is recomputed over the
+ * widened range. An interval not live at any loop header is returned unchanged.
+ *
+ * @param LiveInterval iv  the naive [def, last-use] interval
+ * @param []NaturalLoop loops  the function's natural loops
+ * @param []u32 call_points  the call points (to recompute `crosses_call`)
+ * @return LiveInterval  the interval with `end` widened over its header-live loops
+ */
+fn extend_interval_over_loops(iv: LiveInterval, loops: []NaturalLoop, call_points: []u32) -> LiveInterval {
+    mut new_end: u32 = iv.end
+    mut i: u64 = 0
+    loop {
+        if i >= loops.len { break }
+        let lp = loops[i]
+        if iv.start < lp.header_pt && iv.end >= lp.header_pt {
+            if lp.latch_pt > new_end { new_end = lp.latch_pt }
+        }
+        i++
+    }
+    if new_end == iv.end { return iv }
+    LiveInterval {
+        reg_id = iv.reg_id
+        reg_class = iv.reg_class
+        start = iv.start
+        end = new_end
+        is_fixed = iv.is_fixed
+        crosses_call = crosses_a_call(call_points, iv.start, new_end)
+    }
+}
+
+/**
+ * extend_over_loops — the §6.2 loop-liveness extension: widen every interval
+ * that is live at a loop header to reach at least that loop's latch, closing the
+ * one correctness gap the contiguous-interval model has for loops (a value
+ * defined before/at a header and last-used mid-body would otherwise be truncated
+ * mid-body, letting a later-in-body value steal its register and clobber it for
+ * the next iteration). Needs no new interval representation — `LiveInterval`
+ * stays a single `[start, end]`; only `end` grows. Replaces the loop back-edge
+ * honest-stop (the A3-loop deferral, §6.2). True lifetime holes remain a
+ * deferred QUALITY follow-up, never a correctness need here.
+ *
+ * @param []LiveInterval virt  the naive virtual intervals
+ * @param []NaturalLoop loops  the function's natural loops
+ * @param []u32 call_points  the call points (to recompute `crosses_call`)
+ * @return []LiveInterval  the intervals with header-live ends widened to the latch
+ */
+fn extend_over_loops(virt: []LiveInterval, loops: []NaturalLoop, call_points: []u32) -> []LiveInterval {
+    mut out: []LiveInterval = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= virt.len { break }
+        out = teko::list::push(out, extend_interval_over_loops(virt[i], loops, call_points))
+        i++
+    }
+    out
+}
+
+/**
+ * compute_intervals — the §3.2 liveness pass: one walk of the RPO-numbered
+ * stream driven by the §1.1 def/use table, producing the virtual intervals to
+ * color and the fixed pin intervals to block. Range-numbered by RPO position
+ * among the ENTRY-REACHABLE blocks (#443; dead-block edges excluded, A4-6 #385).
+ * The naive `[def, last-use]` virtual intervals are then widened over every
+ * natural loop by `extend_over_loops` (§6.2), so a value live at a loop header
+ * survives the whole body across the back-edge — the loops the honest-stop once
+ * refused now allocate correctly.
+ *
+ * @param []NumberedInst stream  the RPO-numbered instruction stream
+ * @param []u32 order  the RPO block-id order (for the natural-loop test)
+ * @param []u32 reachable  the entry-reachable block ids (for the natural-loop test)
+ * @return IntervalSet | error  the computed intervals
+ */
+fn compute_intervals(stream: []NumberedInst, order: []u32, reachable: []u32) -> IntervalSet | error {
+    let events = collect_events(stream)
+    let regs = distinct_regs(events)
+    let cps = call_points_of(stream)
+    mut virt: []LiveInterval = teko::list::empty()
+    mut fixed: []LiveInterval = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= regs.len { break }
+        let r = regs[i]
+        if r.is_phys {
+            let pins = phys_intervals(events, r, stream, cps)
+            mut j: u64 = 0
+            loop {
+                if j >= pins.len { break }
+                fixed = teko::list::push(fixed, pins[j])
+                j++
+            }
+        } else {
+            virt = teko::list::push(virt, virt_interval(events, r, cps))
+        }
+        i++
+    }
+    virt = extend_over_loops(virt, natural_loops(stream, order, reachable), cps)
+    IntervalSet { virt = virt; fixed = fixed; call_points = cps }
+}
+
+/**
+ * InReg — a virtual register assigned to a physical register.
+ *
+ * @since #384 A3-3
+ */
+pub type InReg = struct {
+    /**
+     * vreg_id — the virtual register colored.
+     */
+    vreg_id: u32
+    /**
+     * phys — the physical register id it was assigned.
+     */
+    phys: u32
+}
+
+/**
+ * Spilled — a virtual register spilled to a frame slot (register pressure
+ * exceeded its class's pool).
+ *
+ * @since #384 A3-3
+ */
+pub type Spilled = struct {
+    /**
+     * vreg_id — the virtual register spilled.
+     */
+    vreg_id: u32
+    /**
+     * slot — the spill-slot index (A3-4 finalizes it to a frame offset).
+     */
+    slot: u32
+}
+
+/**
+ * RegAssignment — the allocation outcome for one virtual register: kept
+ * `InReg` or `Spilled` to the stack.
+ *
+ * @since #384 A3-3
+ */
+pub type RegAssignment = variant InReg | Spilled
+
+/**
+ * ScanResult — the linear-scan output: one assignment per virtual interval,
+ * plus the callee-saved registers the scan used (A4 saves/restores them).
+ *
+ * @since #384 A3-3
+ */
+pub type ScanResult = struct {
+    /**
+     * assignments — one `RegAssignment` per virtual interval.
+     */
+    assignments: []RegAssignment
+    /**
+     * used_callee_saved — the callee-saved physregs the scan assigned.
+     */
+    used_callee_saved: []u32
+}
+
+/**
+ * ActiveEntry — a currently-assigned virtual interval in the scan's active
+ * set: its vreg, the physreg it holds, its end point, and its class.
+ *
+ * @since #384 A3-3
+ */
+type ActiveEntry = struct {
+    /**
+     * vreg_id — the active virtual register.
+     */
+    vreg_id: u32
+    /**
+     * phys — the physical register it holds.
+     */
+    phys: u32
+    /**
+     * end — the interval's end point (when it frees the register).
+     */
+    end: u32
+    /**
+     * reg_class — the register file it lives in.
+     */
+    reg_class: MRegClass
+}
+
+/**
+ * interval_before — the start-order comparator (tie-break by `reg_id` for a
+ * deterministic scan, M.2): true iff `a` sorts strictly before `b`.
+ *
+ * @param LiveInterval a  the first interval
+ * @param LiveInterval b  the second interval
+ * @return bool  true iff `a` precedes `b`
+ */
+fn interval_before(a: LiveInterval, b: LiveInterval) -> bool {
+    if a.start != b.start { a.start < b.start } else { a.reg_id < b.reg_id }
+}
+
+/**
+ * sort_by_start — the virtual intervals in start order (an insertion sort;
+ * deterministic tie-break by `reg_id`).
+ *
+ * @param []LiveInterval virt  the virtual intervals
+ * @return []LiveInterval  the start-sorted intervals
+ */
+fn sort_by_start(virt: []LiveInterval) -> []LiveInterval {
+    mut out: []LiveInterval = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= virt.len { break }
+        let v = virt[i]
+        mut ins: []LiveInterval = teko::list::empty()
+        mut placed: bool = false
+        mut j: u64 = 0
+        loop {
+            if j >= out.len { break }
+            let o = out[j]
+            if !placed && interval_before(v, o) {
+                ins = teko::list::push(ins, v)
+                placed = true
+            }
+            ins = teko::list::push(ins, o)
+            j++
+        }
+        if !placed { ins = teko::list::push(ins, v) }
+        out = ins
+        i++
+    }
+    out
+}
+
+/**
+ * expire_active — the active entries still live at `point` (drop those whose
+ * `end` is before it, freeing their physregs).
+ *
+ * @param []ActiveEntry active  the active set
+ * @param u32 point  the current interval's start
+ * @return []ActiveEntry  the surviving active entries
+ */
+fn expire_active(active: []ActiveEntry, point: u32) -> []ActiveEntry {
+    mut out: []ActiveEntry = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= active.len { break }
+        if active[i].end >= point { out = teko::list::push(out, active[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * ranges_overlap — whether `[s1,e1]` and `[s2,e2]` share any point.
+ *
+ * @param u32 s1  the first start
+ * @param u32 e1  the first end
+ * @param u32 s2  the second start
+ * @param u32 e2  the second end
+ * @return bool  true iff they overlap
+ */
+fn ranges_overlap(s1: u32, e1: u32, s2: u32, e2: u32) -> bool {
+    s1 <= e2 && s2 <= e1
+}
+
+/**
+ * phys_held — whether an active entry currently holds physreg `phys` in
+ * `reg_class`.
+ *
+ * @param []ActiveEntry active  the active set
+ * @param u32 phys  the physreg id
+ * @param MRegClass reg_class  the register class
+ * @return bool  true iff held
+ */
+fn phys_held(active: []ActiveEntry, phys: u32, reg_class: MRegClass) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= active.len { break }
+        if active[i].phys == phys && active[i].reg_class == reg_class { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * phys_fixed_overlap — whether any fixed pin interval on physreg `phys` in
+ * `reg_class` overlaps `[start, end]` (a pre-colored region the allocator must
+ * not reuse).
+ *
+ * @param []LiveInterval fixed  the fixed pin intervals
+ * @param u32 phys  the physreg id
+ * @param MRegClass reg_class  the register class
+ * @param u32 start  the candidate interval start
+ * @param u32 end  the candidate interval end
+ * @return bool  true iff a fixed pin overlaps
+ */
+fn phys_fixed_overlap(fixed: []LiveInterval, phys: u32, reg_class: MRegClass, start: u32, end: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= fixed.len { break }
+        let fx = fixed[i]
+        if fx.reg_id == phys && fx.reg_class == reg_class && ranges_overlap(fx.start, fx.end, start, end) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * candidate_pool — the physregs `v` may take: from `allocatable_pool` in its
+ * fixed order, excluding those held by an active entry, blocked by an
+ * overlapping fixed pin, or (when `v` crosses a call) caller-saved (§3.3).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param LiveInterval v  the interval to color
+ * @param []ActiveEntry active  the active set
+ * @param []LiveInterval fixed  the fixed pin intervals
+ * @return []u32  the ordered candidate physreg ids
+ */
+fn candidate_pool(abi: AbiDescriptor, v: LiveInterval, active: []ActiveEntry, fixed: []LiveInterval) -> []u32 {
+    let pool = allocatable_pool(abi, v.reg_class)
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= pool.len { break }
+        let p = pool[i]
+        let free = !phys_held(active, p, v.reg_class) && !phys_fixed_overlap(fixed, p, v.reg_class, v.start, v.end)
+        let call_ok = !v.crosses_call || !is_caller_saved(abi, preg(p, v.reg_class))
+        if free && call_ok { out = teko::list::push(out, p) }
+        i++
+    }
+    out
+}
+
+/**
+ * FurthestActive — the active entry with the largest `end` in a class (the
+ * furthest-next-use spill victim), or `found=false`.
+ *
+ * @since #384 A3-3
+ */
+type FurthestActive = struct {
+    /**
+     * found — whether an active entry of the class exists.
+     */
+    found: bool
+    /**
+     * vreg_id — the victim's virtual register.
+     */
+    vreg_id: u32
+    /**
+     * phys — the physreg it holds (freed if it loses the spill compare).
+     */
+    phys: u32
+    /**
+     * end — its end point (the furthest next use).
+     */
+    end: u32
+}
+
+/**
+ * furthest_active — the active entry of class `reg_class` with the largest
+ * `end` (the furthest-next-use spill candidate), or `found=false`.
+ *
+ * @param []ActiveEntry active  the active set
+ * @param MRegClass reg_class  the register class
+ * @return FurthestActive  the furthest entry, or none
+ */
+fn furthest_active(active: []ActiveEntry, reg_class: MRegClass) -> FurthestActive {
+    mut best = FurthestActive { found = false; vreg_id = 0; phys = 0; end = 0 }
+    mut i: u64 = 0
+    loop {
+        if i >= active.len { break }
+        let a = active[i]
+        if a.reg_class == reg_class {
+            if !best.found || a.end > best.end {
+                best = FurthestActive { found = true; vreg_id = a.vreg_id; phys = a.phys; end = a.end }
+            }
+        }
+        i++
+    }
+    best
+}
+
+/**
+ * remove_active — the active set with the entry for `vreg_id` removed.
+ *
+ * @param []ActiveEntry active  the active set
+ * @param u32 vreg_id  the vreg whose entry to drop
+ * @return []ActiveEntry  the reduced active set
+ */
+fn remove_active(active: []ActiveEntry, vreg_id: u32) -> []ActiveEntry {
+    mut out: []ActiveEntry = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= active.len { break }
+        if active[i].vreg_id != vreg_id { out = teko::list::push(out, active[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * mark_spilled — the assignment list with `vreg_id`'s `InReg` replaced by a
+ * `Spilled{slot}` (the furthest-next-use victim loses its register).
+ *
+ * @param []RegAssignment assignments  the assignments so far
+ * @param u32 vreg_id  the victim vreg
+ * @param u32 slot  its new spill slot
+ * @return []RegAssignment  the updated assignments
+ */
+fn mark_spilled(assignments: []RegAssignment, vreg_id: u32, slot: u32) -> []RegAssignment {
+    mut out: []RegAssignment = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= assignments.len { break }
+        let a = assignments[i]
+        let repl = match a {
+            InReg as r => if r.vreg_id == vreg_id { Spilled { vreg_id = vreg_id; slot = slot } } else { a }
+            Spilled => a
+        }
+        out = teko::list::push(out, repl)
+        i++
+    }
+    out
+}
+
+/**
+ * add_unique_u32 — `list` with `x` appended iff not already present.
+ *
+ * @param []u32 list  the list
+ * @param u32 x  the value to add
+ * @return []u32  the (possibly extended) list
+ */
+fn add_unique_u32(list: []u32, x: u32) -> []u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        if list[i] == x { return list }
+        i++
+    }
+    teko::list::push(list, x)
+}
+
+/**
+ * linear_scan — the §3.3 Poletto–Sarkar linear scan extended for fixed pin
+ * intervals and call clobbers: the virtual intervals are colored in start
+ * order, expiring the active set at each start, choosing the first candidate
+ * physreg (free of active + fixed-pin overlap, callee-saved if the value
+ * crosses a call), and on register pressure spilling the furthest-next-use.
+ *
+ * @param AbiDescriptor abi  the register file the scan colors from
+ * @param IntervalSet ivals  the computed intervals (A3-2)
+ * @return ScanResult  the per-vreg assignments + the callee-saved used
+ */
+fn linear_scan(abi: AbiDescriptor, ivals: IntervalSet) -> ScanResult {
+    let sorted = sort_by_start(ivals.virt)
+    mut active: []ActiveEntry = teko::list::empty()
+    mut assignments: []RegAssignment = teko::list::empty()
+    mut used_callee: []u32 = teko::list::empty()
+    mut next_slot: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        let v = sorted[i]
+        active = expire_active(active, v.start)
+        let cand = candidate_pool(abi, v, active, ivals.fixed)
+        if cand.len > 0 {
+            let phys = cand[0]
+            active = teko::list::push(active, ActiveEntry { vreg_id = v.reg_id; phys = phys; end = v.end; reg_class = v.reg_class })
+            assignments = teko::list::push(assignments, InReg { vreg_id = v.reg_id; phys = phys })
+            if is_callee_saved(abi, preg(phys, v.reg_class)) { used_callee = add_unique_u32(used_callee, phys) }
+        } else {
+            let far = furthest_active(active, v.reg_class)
+            if far.found && far.end > v.end {
+                let slot = next_slot
+                next_slot = next_slot + 1
+                assignments = mark_spilled(assignments, far.vreg_id, slot)
+                active = remove_active(active, far.vreg_id)
+                active = teko::list::push(active, ActiveEntry { vreg_id = v.reg_id; phys = far.phys; end = v.end; reg_class = v.reg_class })
+                assignments = teko::list::push(assignments, InReg { vreg_id = v.reg_id; phys = far.phys })
+                if is_callee_saved(abi, preg(far.phys, v.reg_class)) { used_callee = add_unique_u32(used_callee, far.phys) }
+            } else {
+                let slot = next_slot
+                next_slot = next_slot + 1
+                assignments = teko::list::push(assignments, Spilled { vreg_id = v.reg_id; slot = slot })
+            }
+        }
+        i++
+    }
+    ScanResult { assignments = assignments; used_callee_saved = used_callee }
+}
+
+/**
+ * AssignLookup — the assignment outcome for a queried virtual register
+ * (option-struct, M.2): `found` is false when the id has no interval;
+ * otherwise `is_spill` selects between `phys` (an `InReg` color) and `slot`
+ * (a `Spilled` frame slot).
+ *
+ * @since #384 A3-4
+ */
+pub type AssignLookup = struct {
+    /**
+     * found — true iff the queried id has an assignment.
+     */
+    found: bool
+    /**
+     * is_spill — true iff the assignment is a `Spilled` (read `slot`).
+     */
+    is_spill: bool
+    /**
+     * phys — the assigned physical register id (when `!is_spill`).
+     */
+    phys: u32
+    /**
+     * slot — the spill-relative frame slot (when `is_spill`).
+     */
+    slot: u32
+}
+
+/**
+ * al_none — the not-found `AssignLookup`.
+ *
+ * @return AssignLookup  found=false
+ */
+fn al_none() -> AssignLookup {
+    AssignLookup { found = false; is_spill = false; phys = 0 to u32; slot = 0 to u32 }
+}
+
+/**
+ * in_lookup — the `AssignLookup` for an `InReg` assignment `r` if it names
+ * `vreg_id`, else not-found.
+ *
+ * @param InReg r  the candidate in-register assignment
+ * @param u32 vreg_id  the queried id
+ * @return AssignLookup  the hit, or found=false
+ */
+fn in_lookup(r: InReg, vreg_id: u32) -> AssignLookup {
+    if r.vreg_id == vreg_id {
+        AssignLookup { found = true; is_spill = false; phys = r.phys; slot = 0 to u32 }
+    } else {
+        al_none()
+    }
+}
+
+/**
+ * sp_lookup — the `AssignLookup` for a `Spilled` assignment `s` if it names
+ * `vreg_id`, else not-found.
+ *
+ * @param Spilled s  the candidate spilled assignment
+ * @param u32 vreg_id  the queried id
+ * @return AssignLookup  the hit, or found=false
+ */
+fn sp_lookup(s: Spilled, vreg_id: u32) -> AssignLookup {
+    if s.vreg_id == vreg_id {
+        AssignLookup { found = true; is_spill = true; phys = 0 to u32; slot = s.slot }
+    } else {
+        al_none()
+    }
+}
+
+/**
+ * assign_lookup — the `RegAssignment` for virtual id `vreg_id`, flattened into
+ * an `AssignLookup` (found=false when no interval named it). Vreg ids are
+ * unique across register classes (isel draws every vreg from one counter), so
+ * the id alone keys the assignment.
+ *
+ * @param ScanResult sr  the linear-scan output
+ * @param u32 vreg_id  the virtual register to resolve
+ * @return AssignLookup  the assignment, or found=false
+ */
+pub fn assign_lookup(sr: ScanResult, vreg_id: u32) -> AssignLookup {
+    mut i: u64 = 0
+    loop {
+        if i >= sr.assignments.len { break }
+        let a = sr.assignments[i]
+        let hit = match a {
+            InReg as r => in_lookup(r, vreg_id)
+            Spilled as s => sp_lookup(s, vreg_id)
+        }
+        if hit.found { return hit }
+        i++
+    }
+    al_none()
+}
+
+/**
+ * SubstEntry — one virtual-register substitution for the rewrite: the virtual
+ * id `vid` becomes the physical register `to` (a color, a spill reload
+ * scratch, or a spill def scratch).
+ *
+ * @since #384 A3-4
+ */
+pub type SubstEntry = struct {
+    /**
+     * vid — the virtual register id being replaced.
+     */
+    vid: u32
+    /**
+     * to — the physical register it maps to.
+     */
+    to: MReg
+}
+
+/**
+ * subst_has — whether `table` already substitutes virtual id `vid`.
+ *
+ * @param []SubstEntry table  the substitution table
+ * @param u32 vid  the virtual id to test
+ * @return bool  true iff already present
+ */
+fn subst_has(table: []SubstEntry, vid: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        if table[i].vid == vid { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * subst_find — `r` mapped through `table`: a physical pin passes through
+ * unchanged; a virtual register resolves to its table entry, or (defensively,
+ * for a register with no interval) to itself.
+ *
+ * @param []SubstEntry table  the substitution table
+ * @param MReg r  the register to map
+ * @return MReg  the substituted register
+ */
+fn subst_find(table: []SubstEntry, r: MReg) -> MReg {
+    if r.is_phys { return r }
+    mut i: u64 = 0
+    loop {
+        if i >= table.len { break }
+        let e = table[i]
+        if e.vid == r.id { return e.to }
+        i++
+    }
+    r
+}
+
+/**
+ * map_regs_list — element-wise substitution of an `MReg` list (an `MCall`/
+ * `MCallIndirect` `uses` list).
+ *
+ * @param []MReg list  the register list
+ * @param []SubstEntry table  the substitution table
+ * @return []MReg  the substituted list
+ */
+fn map_regs_list(list: []MReg, table: []SubstEntry) -> []MReg {
+    mut out: []MReg = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        out = teko::list::push(out, subst_find(table, list[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * map_minst_regs — a copy of `inst` with every `MReg` field replaced through
+ * `table` (a flat per-case reconstruction over the 29-case variant, mirroring
+ * `inst_regs`'s dispatch). `MCall`/`MCallIndirect` map their `uses`
+ * element-wise, their `ret_reg`, and (indirect) their `target`. This is the
+ * single point where the machine-IR's register-field shape is walked for
+ * rewriting — a missed case would leak a virtual register into the output,
+ * which the all-physical invariant test catches.
+ *
+ * @param MInst inst  the instruction to rewrite
+ * @param []SubstEntry table  the substitution table
+ * @return MInst  the rewritten instruction
+ */
+pub fn map_minst_regs(inst: MInst, table: []SubstEntry) -> MInst {
+    match inst {
+        MAlu as x => MAlu { op = x.op; wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a); b = subst_find(table, x.b) }
+        MAluImm as x => MAluImm { op = x.op; wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a); imm = x.imm }
+        MMSub as x => MMSub { wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a); b = subst_find(table, x.b); c = subst_find(table, x.c) }
+        MNeg as x => MNeg { wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MMvn as x => MMvn { wide = x.wide; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MFAlu as x => MFAlu { op = x.op; dbl = x.dbl; dst = subst_find(table, x.dst); a = subst_find(table, x.a); b = subst_find(table, x.b) }
+        MFNeg as x => MFNeg { dbl = x.dbl; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MCmp as x => MCmp { wide = x.wide; a = subst_find(table, x.a); b = subst_find(table, x.b) }
+        MCmpImm as x => MCmpImm { wide = x.wide; a = subst_find(table, x.a); imm = x.imm }
+        MFCmp as x => MFCmp { dbl = x.dbl; a = subst_find(table, x.a); b = subst_find(table, x.b) }
+        MCSet as x => MCSet { wide = x.wide; dst = subst_find(table, x.dst); cond = x.cond }
+        MMovZ as x => MMovZ { wide = x.wide; dst = subst_find(table, x.dst); imm16 = x.imm16; shift = x.shift }
+        MMovK as x => MMovK { wide = x.wide; dst = subst_find(table, x.dst); imm16 = x.imm16; shift = x.shift }
+        MMovN as x => MMovN { wide = x.wide; dst = subst_find(table, x.dst); imm16 = x.imm16; shift = x.shift }
+        MFMov as x => MFMov { dbl = x.dbl; dst = subst_find(table, x.dst); src = subst_find(table, x.src) }
+        MMov as x => MMov { wide = x.wide; dst = subst_find(table, x.dst); src = subst_find(table, x.src) }
+        MExt as x => MExt { op = x.op; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MCvt as x => MCvt { op = x.op; dst = subst_find(table, x.dst); a = subst_find(table, x.a) }
+        MLoad as x => MLoad { size = x.size; sign = x.sign; dst = subst_find(table, x.dst); mem = MMem { base = subst_find(table, x.mem.base); offset = x.mem.offset } }
+        MStore as x => MStore { size = x.size; src = subst_find(table, x.src); mem = MMem { base = subst_find(table, x.mem.base); offset = x.mem.offset } }
+        MFrameAddr as x => MFrameAddr { dst = subst_find(table, x.dst); slot = x.slot }
+        MAdrp as x => MAdrp { dst = subst_find(table, x.dst); sym = x.sym; kind = x.kind }
+        MAddLo as x => MAddLo { dst = subst_find(table, x.dst); a = subst_find(table, x.a); sym = x.sym; kind = x.kind }
+        MBranch as x => MBranch { target = x.target }
+        MBranchCond as x => MBranchCond { cond = x.cond; target = x.target }
+        MCbz as x => MCbz { wide = x.wide; zero = x.zero; a = subst_find(table, x.a); target = x.target }
+        MCall as x => MCall { sym = x.sym; uses = map_regs_list(x.uses, table); ret_reg = subst_find(table, x.ret_reg); has_result = x.has_result; variadic = x.variadic }
+        MCallIndirect as x => MCallIndirect { target = subst_find(table, x.target); uses = map_regs_list(x.uses, table); ret_reg = subst_find(table, x.ret_reg); has_result = x.has_result }
+        MRet => MRet { }
+    }
+}
+
+/**
+ * minst_single — a one-element instruction list.
+ *
+ * @param MInst x  the instruction
+ * @return []MInst  the singleton list
+ */
+fn minst_single(x: MInst) -> []MInst {
+    teko::list::push(teko::list::empty(), x)
+}
+
+/**
+ * minst_cat — `a` followed by every element of `b`.
+ *
+ * @param []MInst a  the prefix list
+ * @param []MInst b  the suffix list
+ * @return []MInst  the concatenation
+ */
+fn minst_cat(a: []MInst, b: []MInst) -> []MInst {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * emit_gpr_reload — the two-instruction GPR spill reload into `sv`: compute the
+ * slot address into `sv`, then load the slot value into `sv` (base==dst is
+ * legal, §1.4). Both the address and the value live in `sv`.
+ *
+ * @param MReg sv  the GPR scratch to reload into
+ * @param u32 slot  the absolute frame slot
+ * @return []MInst  the reload sequence
+ */
+fn emit_gpr_reload(sv: MReg, slot: u32) -> []MInst {
+    let fa = frame_addr_inst(sv, slot)
+    let ld = load_inst(MMemSize::X, false, sv, MMem { base = sv; offset = 0 to i32 })
+    teko::list::push(minst_single(fa), ld)
+}
+
+/**
+ * emit_gpr_store — the two-instruction GPR spill store of the value already in
+ * `dsv`: compute the slot address into a distinct scratch `asv`, then store
+ * `dsv` to `[asv]`.
+ *
+ * @param MReg dsv  the GPR scratch holding the value to store
+ * @param MReg asv  a distinct GPR scratch for the slot address
+ * @param u32 slot  the absolute frame slot
+ * @return []MInst  the store sequence
+ */
+fn emit_gpr_store(dsv: MReg, asv: MReg, slot: u32) -> []MInst {
+    let fa = frame_addr_inst(asv, slot)
+    let st = store_inst(MMemSize::X, dsv, MMem { base = asv; offset = 0 to i32 })
+    teko::list::push(minst_single(fa), st)
+}
+
+/**
+ * add_use_subst — the substitution table extended for one instruction operand
+ * use `u`: a physical pin or an already-mapped id is left as-is; an `InReg`
+ * use maps to its color; a `Spilled` GPR use draws the next reload scratch
+ * (`nth`), whose reload is appended to `reloads`. Returns the grown table, the
+ * grown reloads, and the advanced scratch counter via `UseAcc`. FPR spills are
+ * ruled out upstream (`detect_fpr_spill`), so the scratch is always GPR.
+ *
+ * @param AbiDescriptor abi  the register file (for spill scratch)
+ * @param ScanResult sr  the allocation
+ * @param MReg u  the use operand
+ * @param u32 frame_base  the first spill frame slot index
+ * @param UseAcc acc  the table/reloads/counter so far
+ * @return UseAcc  the updated accumulator
+ */
+fn add_use_subst(abi: AbiDescriptor, sr: ScanResult, u: MReg, frame_base: u32, acc: UseAcc) -> UseAcc {
+    if u.is_phys { return acc }
+    if subst_has(acc.table, u.id) { return acc }
+    let la = assign_lookup(sr, u.id)
+    if !la.found { return acc }
+    if la.is_spill {
+        let sv = spill_scratch(abi, MRegClass::GPR, acc.nth)
+        let reloads2 = minst_cat(acc.reloads, emit_gpr_reload(sv, frame_base + la.slot))
+        let table2 = teko::list::push(acc.table, SubstEntry { vid = u.id; to = sv })
+        return UseAcc { table = table2; reloads = reloads2; nth = acc.nth + 1 }
+    }
+    let table3 = teko::list::push(acc.table, SubstEntry { vid = u.id; to = preg(la.phys, u.reg_class) })
+    UseAcc { table = table3; reloads = acc.reloads; nth = acc.nth }
+}
+
+/**
+ * UseAcc — the fold state while substituting an instruction's use operands:
+ * the substitution table, the accumulated reload sequence, and the next
+ * reload-scratch index.
+ *
+ * @since #384 A3-4
+ */
+type UseAcc = struct {
+    /**
+     * table — the substitution entries so far.
+     */
+    table: []SubstEntry
+    /**
+     * reloads — the reload instructions so far (emitted before the inst).
+     */
+    reloads: []MInst
+    /**
+     * nth — the next spill-reload scratch index.
+     */
+    nth: u32
+}
+
+/**
+ * rewrite_inst — expand one instruction into its final physical sequence: the
+ * reloads for its spilled uses, the register-substituted instruction, and the
+ * store for a spilled def (§3.4). Non-spilled operands map to their `InReg`
+ * physreg; physical pins pass through. Assumes GPR-only spills (guaranteed by
+ * `regalloc_func`'s `detect_fpr_spill` pre-check).
+ *
+ * @param AbiDescriptor abi  the register file (for spill scratch)
+ * @param ScanResult sr  the allocation
+ * @param MInst inst  the instruction to rewrite
+ * @param u32 frame_base  the first spill frame slot index
+ * @return []MInst  the reloads ++ the rewritten instruction ++ the store
+ */
+pub fn rewrite_inst(abi: AbiDescriptor, sr: ScanResult, inst: MInst, frame_base: u32) -> []MInst {
+    let ir = inst_regs(inst)
+    mut acc = UseAcc { table = teko::list::empty(); reloads = teko::list::empty(); nth = 0 to u32 }
+    mut ui: u64 = 0
+    loop {
+        if ui >= ir.uses.len { break }
+        acc = add_use_subst(abi, sr, ir.uses[ui], frame_base, acc)
+        ui++
+    }
+    mut table = acc.table
+    mut stores: []MInst = teko::list::empty()
+    if ir.has_def {
+        let d = ir.def_reg
+        if !d.is_phys {
+            let la = assign_lookup(sr, d.id)
+            if la.found {
+                if la.is_spill {
+                    let dsv = spill_scratch(abi, MRegClass::GPR, 0 to u32)
+                    let asv = spill_scratch(abi, MRegClass::GPR, 1 to u32)
+                    if !subst_has(table, d.id) {
+                        table = teko::list::push(table, SubstEntry { vid = d.id; to = dsv })
+                    }
+                    stores = emit_gpr_store(dsv, asv, frame_base + la.slot)
+                } else {
+                    if !subst_has(table, d.id) {
+                        table = teko::list::push(table, SubstEntry { vid = d.id; to = preg(la.phys, d.reg_class) })
+                    }
+                }
+            }
+        }
+    }
+    let mapped = map_minst_regs(inst, table)
+    minst_cat(minst_cat(acc.reloads, minst_single(mapped)), stores)
+}
+
+/**
+ * count_spills — the number of `Spilled` assignments (one fresh frame slot
+ * each) in `sr`.
+ *
+ * @param ScanResult sr  the allocation
+ * @return u32  the spill count
+ */
+fn count_spills(sr: ScanResult) -> u32 {
+    mut n: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= sr.assignments.len { break }
+        let is_sp = match sr.assignments[i] { InReg => false; Spilled => true }
+        if is_sp { n = n + 1 }
+        i++
+    }
+    n
+}
+
+/**
+ * reg_is_fpr_spill — whether the virtual register `r` is spilled in `sr` AND
+ * lives in the FPR class (the case A3 honest-stops).
+ *
+ * @param ScanResult sr  the allocation
+ * @param MReg r  the register to test
+ * @return bool  true iff an FPR spill
+ */
+fn reg_is_fpr_spill(sr: ScanResult, r: MReg) -> bool {
+    if r.is_phys { return false }
+    if r.reg_class != MRegClass::FPR { return false }
+    let la = assign_lookup(sr, r.id)
+    la.found && la.is_spill
+}
+
+/**
+ * inst_has_fpr_spill — whether any operand of `inst` is an FPR spill.
+ *
+ * @param ScanResult sr  the allocation
+ * @param MInst inst  the instruction to scan
+ * @return bool  true iff an FPR spill operand is present
+ */
+fn inst_has_fpr_spill(sr: ScanResult, inst: MInst) -> bool {
+    let ir = inst_regs(inst)
+    if ir.has_def {
+        if reg_is_fpr_spill(sr, ir.def_reg) { return true }
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ir.uses.len { break }
+        if reg_is_fpr_spill(sr, ir.uses[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * detect_fpr_spill — whether allocating `f` under `sr` spills any FPR value.
+ * A3 lowers GPR spills only; an FPR spill is a NAMED honest-stop
+ * (`regalloc_func` returns an error), deferred to a follow-up.
+ *
+ * @param ScanResult sr  the allocation
+ * @param MFunc f  the function
+ * @return bool  true iff any FPR value is spilled
+ */
+fn detect_fpr_spill(sr: ScanResult, f: MFunc) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            if inst_has_fpr_spill(sr, b.insts[ii]) { return true }
+            ii++
+        }
+        bi++
+    }
+    false
+}
+
+/**
+ * append_spill_slots — `f.frame` extended by one `LAlloca` per `Spilled`
+ * assignment (§3.5); each spill slot reuses the ABI's slot size/alignment. The
+ * returned frame's new entries occupy indices `f.frame.len ..` — the absolute
+ * slot the reload/store `MFrameAddr` references.
+ *
+ * @param AbiDescriptor abi  the register file (for slot size/align)
+ * @param []lir::LAlloca frame  the function's existing frame table
+ * @param u32 spills  the spill count
+ * @return []lir::LAlloca  the extended frame table
+ */
+fn append_spill_slots(abi: AbiDescriptor, frame: []lir::LAlloca, spills: u32) -> []lir::LAlloca {
+    mut out = frame
+    mut i: u32 = 0
+    loop {
+        if i >= spills { break }
+        out = teko::list::push(out, lir::LAlloca { bytes = abi.spill_slot_bytes; align = abi.spill_slot_align })
+        i = i + 1
+    }
+    out
+}
+
+/**
+ * rewrite_block — one block with every instruction rewritten and flattened;
+ * block params are carried through unchanged (they are merge metadata, not an
+ * executed operand — the edge moves in the stream carry the values).
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param ScanResult sr  the allocation
+ * @param MBlock b  the block to rewrite
+ * @param u32 frame_base  the first spill frame slot index
+ * @return MBlock  the rewritten block
+ */
+fn rewrite_block(abi: AbiDescriptor, sr: ScanResult, b: MBlock, frame_base: u32) -> MBlock {
+    mut insts: []MInst = teko::list::empty()
+    mut ii: u64 = 0
+    loop {
+        if ii >= b.insts.len { break }
+        insts = minst_cat(insts, rewrite_inst(abi, sr, b.insts[ii], frame_base))
+        ii++
+    }
+    MBlock { id = b.id; params = b.params; insts = insts }
+}
+
+/**
+ * rewrite_func — rebuild every block from its rewritten instruction sequences
+ * and finalize the frame (§3.5), yielding an `MFunc` whose every `MInst`
+ * operand is physical.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MFunc f  the selected function
+ * @param ScanResult sr  the allocation
+ * @return MFunc  the fully-colored function
+ */
+fn rewrite_func(abi: AbiDescriptor, f: MFunc, sr: ScanResult) -> MFunc {
+    let frame_base = f.frame.len to u32
+    let frame = append_spill_slots(abi, f.frame, count_spills(sr))
+    mut blocks: []MBlock = teko::list::empty()
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        blocks = teko::list::push(blocks, rewrite_block(abi, sr, f.blocks[bi], frame_base))
+        bi++
+    }
+    MFunc { symbol = f.symbol; blocks = blocks; frame = frame }
+}
+
+/**
+ * all_physical — whether every `MInst` operand of `f` is a physical register
+ * (the §4.1 all-physical invariant: no virtual register survived the rewrite).
+ * Block params are metadata, not executed operands, and are not checked.
+ *
+ * @param MFunc f  the colored function
+ * @return bool  true iff fully physical
+ */
+pub fn all_physical(f: MFunc) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            let ir = inst_regs(b.insts[ii])
+            if ir.has_def {
+                if !ir.def_reg.is_phys { return false }
+            }
+            mut ui: u64 = 0
+            loop {
+                if ui >= ir.uses.len { break }
+                if !ir.uses[ui].is_phys { return false }
+                ui++
+            }
+            ii++
+        }
+        bi++
+    }
+    true
+}
+
+/**
+ * regalloc_func — allocate one function end-to-end: RPO-order, number, compute
+ * intervals, scan, rewrite. A real `loop` back-edge now ALLOCATES (§6.2 LANDED,
+ * #389 F2): `compute_intervals` widens every interval live at a loop header to
+ * reach its latch (`extend_over_loops`), so a loop-carried value survives the
+ * whole body across the back-edge. Still returns a NAMED honest-stop error on an
+ * FPR-value spill (A3 lowers GPR spills only). The RPO order is computed once
+ * and threaded so the numbering and the natural-loop detection share one
+ * topological linearization (#443); the entry-reachable set is threaded beside
+ * it so a dead-block edge (a `match`'s unreachable fallback, A4-6 #385) is never
+ * mistaken for a loop.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MFunc f  the selected function (virtual MRegs + ABI pins)
+ * @return MFunc | error  the fully-colored function, or a named honest-stop
+ */
+pub fn regalloc_func(abi: AbiDescriptor, f: MFunc) -> MFunc | error {
+    let order = rpo_block_order(f)
+    let numbered = number_insts(f, order)
+    let ivals = match compute_intervals(numbered, order, reachable_blocks(f)) {
+        IntervalSet as s => s
+        error as e => return e
+    }
+    let sr = linear_scan(abi, ivals)
+    if detect_fpr_spill(sr, f) {
+        return error { message = "regalloc: FPR-value spill not yet supported (A3 lowers GPR spills only; own-backend FPR-spill deferral)" }
+    }
+    rewrite_func(abi, f, sr)
+}
+
+/**
+ * regalloc_module — allocate every function of `m`, carrying the rodata /
+ * globals / layouts tables through unchanged (A3 touches only registers +
+ * frame, exactly as `select_module` carries them).
+ *
+ * @param AbiDescriptor abi  the register file to allocate from
+ * @param MModule m  the selected module
+ * @return MModule | error  the colored module, or the first function's error
+ */
+pub fn regalloc_module(abi: AbiDescriptor, m: MModule) -> MModule | error {
+    mut funcs: []MFunc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        let rf = match regalloc_func(abi, m.funcs[i]) {
+            MFunc as g => g
+            error as e => return e
+        }
+        funcs = teko::list::push(funcs, rf)
+        i++
+    }
+    MModule { funcs = funcs; rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+}

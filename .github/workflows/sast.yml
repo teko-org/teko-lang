@@ -5,7 +5,7 @@ name: SAST Gate
 # main and does not re-validate. chore/reboot stays listed for PRs into it (#54).
 on:
   pull_request:
-    branches: [main, master, chore/reboot, 'remodel/**']
+    branches: [main, master, chore/reboot, 'remodel/**', 'fix/issue-*']
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
@@ -16,18 +16,50 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      run: ${{ steps.filter.outputs.run }}
+      run: ${{ steps.decide.outputs.run }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
         with:
+          list-files: shell
           filters: |
             run:
               - 'src/runtime/**'
               - 'src/assert/**'
               - '.github/workflows/sast.yml'
               - '.github/sast-baseline.txt'
+
+      # Docs-only guard (owner ruling 2026-07-11): src/runtime/** & src/assert/** also match
+      # Markdown inside those trees, so a pure-doc edit would otherwise run clang-tidy. Skip only
+      # when EVERY matched file is *.md — any non-Markdown match forces the full run, so a real
+      # source change can never be hidden. `paths-ignore` on the trigger is NOT used: the `gate`
+      # job is a REQUIRED check and skipping the workflow would leave it never reported (PR hangs).
+      - name: Decide (skip when the change is Markdown-only)
+        id: decide
+        shell: bash
+        env:
+          MATCHED: ${{ steps.filter.outputs.run }}
+          FILES: ${{ steps.filter.outputs.run_files }}
+        run: |
+          if [ "$MATCHED" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No allowlisted path changed — nothing to gate."
+            exit 0
+          fi
+          run=false
+          for f in $FILES; do
+            case "$f" in
+              *.md) ;;                 # Markdown — does not, by itself, force a run
+              *)    run=true ;;        # any non-Markdown match forces the full gate
+            esac
+          done
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ "$run" = "true" ]; then
+            echo "Non-Markdown changes present — running the full gate."
+          else
+            echo "Markdown-only change under the allowlisted paths — skipping the heavy gate."
+          fi
 
   # ── clang-tidy audit ─────────────────────────────────────────────────────────
   clang-tidy-audit:

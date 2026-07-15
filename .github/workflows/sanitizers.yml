@@ -10,6 +10,9 @@ name: Sanitizers & Stress
 #   HEAVY gate (audits MAIN, runs ONLY on merge to main): the full ASan+UBSan(+LSan-by-name)
 #   default-dispatch lane. It is the ~24-min lane that surfaced the historical root UBs; it is
 #   NOT worth paying on every lane PR now that the C mirror is gone and the light gate guards
+#   the seed. Its SINGLE trigger is the MERGE to main: it runs ONLY on push to main
+#   (github.ref == refs/heads/main) as a post-merge audit. It does NOT run on PRs — not even
+#   on the umbrella -> main PR (base_ref == main); there the aggregator passes green-by-skip.
 #   the seed. Its single trigger is main: it runs as a REQUIRED check on PRs INTO main (the
 #   umbrella -> main integration merge) and re-runs on push to main as a post-merge audit.
 #   No nightly, no schedule, no auto-issue (owner ruling: "Único gatilho passa a ser merge na main").
@@ -54,13 +57,13 @@ jobs:
   # free in the compiler's OWN C aborts loud. Because never-reuse disables the arena free-list, the
   # full self-host under the oracle is HEAVY (~18-20 min on the backend-wave code: ~7 min build +
   # ~11 min oracle run) — too heavy to pay on every lane PR (owner ruling 2026-07-14: it "wrecks
-  # the CI"). So it moves to the MAIN-only heavy tier alongside the ASan lane: it runs when the PR
-  # targets main (base_ref == main) OR on push to main, and is SKIPPED on lane/remodel PRs. The
-  # memory audit therefore lands at the seed/release boundary (umbrella -> main), not per lane PR.
+  # the CI"). So it moves to the MAIN-only heavy tier alongside the ASan lane: it runs ONLY on push
+  # to main (the merge), and is SKIPPED on ALL PRs — lane, remodel, AND the umbrella -> main PR. The
+  # memory audit therefore lands right after the seed/release boundary (the merge to main), not on any PR.
   mem-paranoid:
     name: Memory paranoid (native self-host)
     needs: changes
-    if: needs.changes.outputs.run == 'true' && (github.base_ref == 'main' || github.ref == 'refs/heads/main')
+    if: needs.changes.outputs.run == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -99,10 +102,10 @@ jobs:
           done
 
   # ── HEAVY gate: ASan + UBSan + LSan (default computed-goto dispatch) — MAIN ONLY ─
-  # Trigger is MAIN, and only main: this job runs when the PR targets main (base_ref == main)
-  # OR on push to main (ref == refs/heads/main). It is SKIPPED on lane/remodel PRs and remodel
-  # pushes — the light mem-paranoid gate above guards those. This is the ~24-min lane and it is
-  # only paid at the seed/release boundary (the umbrella -> main merge), per owner ruling.
+  # Trigger is the MERGE to main, and only that: this job runs ONLY on push to main
+  # (ref == refs/heads/main). It is SKIPPED on ALL PRs (lane, remodel, AND the umbrella -> main PR)
+  # and on remodel pushes — the light mem-paranoid gate guards those. This is the ~24-min lane and it
+  # is only paid right after the seed/release boundary (the push that lands the umbrella on main), per owner ruling.
   #
   # LSan is enabled on THIS lane only (issue #54): detect_leaks with a suppressions file
   # (.github/lsan-suppressions.txt) covering the documented M.5 process-lifetime allocations
@@ -110,7 +113,7 @@ jobs:
   asan-default:
     name: ASan+UBSan+LSan / default dispatch
     needs: changes
-    if: needs.changes.outputs.run == 'true' && (github.base_ref == 'main' || github.ref == 'refs/heads/main')
+    if: needs.changes.outputs.run == 'true' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -288,24 +291,23 @@ jobs:
   # ── Windows self-host smoke ───────────────────────────────────────────────────
   # The ONLY per-PR lane that self-builds gen-1 on Windows (build-test only runs the
   # seed's VM gate; diff-vm-native is linux+macos; release rebuilds Windows only at
-  # release time). ONE gate run on gen-1 is enough: the compiler is single-threaded and
-  # deterministic, so N identical sequential runs add no coverage — the historical 20×
-  # stress hunted a long-fixed intermittent hang and cost ~16 min per PR (owner ruling
-  # 2026-07-04). RE-EXPAND to a real stress N× as S8 concurrency primitives land (same
-  # trigger as the TSan full-suite re-expansion).
+  # release time). It proves gen-1 SELF-BUILDS on Windows and the produced binary RUNS;
+  # test EXECUTION is off here for now (owner ruling 2026-07-14 — the build is too slow to
+  # also run the suite under the cap) and lives on the Linux/macOS lanes until the compiler-
+  # speed work lands. RE-ADD the Windows test run (and a real stress N×) as the build time
+  # drops / S8 concurrency primitives land (same trigger as the TSan full-suite re-expansion).
   windows-selfhost:
     name: Windows self-host smoke (gen-1)
     needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: windows-latest
     # The gen1 BUILD alone is ~11 min on the Windows runner (the slow-compiler perf problem the perf
-    # phase is fixing). With the full `teko test . --coverage` gate on top (~8 min under coverage
-    # instrumentation) the job hit ~20 min and the cap guillotined it. Coverage is a LINUX concern
-    # (measured on native.yml + the coverage ruleset), so it is REDUNDANT here — drop `--coverage`
-    # and run `teko test .` (full Windows correctness test, no coverage overhead) → the job fits the
-    # 20-min cap. Kept on the lane light tier (not main-only) BECAUSE it guards the Windows-specific
-    # codegen (emit_native_win / PE-COFF) this wave develops. The durable fix for the ~11-min build is
-    # the compiler-speed work (-O2 seed + churn/arena). Owner ruling 2026-07-14 (cap stays 20).
+    # phase is fixing). The full `teko test .` self-host on top of that blew both the 20- and (mid-
+    # suite) 30-min caps, so per owner ruling 2026-07-14 the Windows lane DROPS test execution for now
+    # and only proves gen1 self-builds + the binary runs (version smoke). Tests come back to Windows
+    # once the compiler-speed work (-O2 seed + churn/arena) brings the build time down. With just the
+    # build + smoke, 20 min is ample. Kept on the lane light tier (not main-only) BECAUSE it guards the
+    # Windows-specific codegen (emit_native_win / PE-COFF) this wave develops.
     timeout-minutes: 20
     permissions:
       contents: read
@@ -324,10 +326,15 @@ jobs:
         shell: bash
         run: teko . -o bin
 
-      - name: Run the gate on gen1
+      # Tests are NOT run on Windows for now (owner ruling 2026-07-14): the full `teko test .`
+      # self-host on top of the ~11-min gen1 build blew the cap. Until the compiler-speed work
+      # brings the build time down, this lane only proves gen1 SELF-BUILDS on Windows (the step
+      # above) and that the produced binary RUNS (the version smoke below). The authoritative
+      # test suite runs on the Linux/macOS lanes.
+      - name: Smoke — gen1 binary runs
         shell: pwsh
         run: |
-          .\bin\teko.exe test .
+          .\bin\teko.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # ── gate: LIGHT aggregator — the SEED protector (required on lanes + remodel + main) ─

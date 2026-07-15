@@ -1,0 +1,86 @@
+/**
+ * sysv_gpr_arg_seq — the SysV AMD64 integer argument registers in call order:
+ * RDI(7), RSI(6), RDX(2), RCX(1), R8(8), R9(9). The ids follow the x86
+ * instruction-encoding numbering (RAX=0,RCX=1,RDX=2,RBX=3,RSP=4,RBP=5,RSI=6,
+ * RDI=7,R8..R15=8..15), so `arg_reg` hands isel the physical id the encoder's
+ * ModRM/REG field consumes directly. The sequence is NOT a contiguous run, so
+ * it is spelled id-by-id rather than via `push_range`. The integer RESULT
+ * register is RAX(0), pinned by isel at the return site (D-A), not read from
+ * this list — this list is purely the ARGUMENT order.
+ *
+ * @return []u32  the six integer argument register ids, in order
+ */
+fn sysv_gpr_arg_seq() -> []u32 {
+    mut xs: []u32 = teko::list::empty()
+    xs = teko::list::push(xs, 7)
+    xs = teko::list::push(xs, 6)
+    xs = teko::list::push(xs, 2)
+    xs = teko::list::push(xs, 1)
+    xs = teko::list::push(xs, 8)
+    xs = teko::list::push(xs, 9)
+    xs
+}
+
+/**
+ * sysv_gpr_allocatable — the ordered GPR pool the linear scan draws from,
+ * caller-saved first then callee-saved (so short values take scratch-cheap
+ * caller-saved registers before forcing a callee-save prologue spill). The
+ * caller-saved allocatable run is RAX(0),RCX(1),RDX(2),RSI(6),RDI(7),R8(8),
+ * R9(9) — every caller-saved GPR except the reserved spill scratch R10/R11.
+ * The callee-saved allocatable run is RBX(3),R12(12),R13(13),R14(14),R15(15) —
+ * every callee-saved GPR except RBP(5), which (with RSP(4)) is a reserved frame
+ * register and never allocated.
+ *
+ * @return []u32  the ordered allocatable GPR ids, caller-saved before callee-saved
+ */
+fn sysv_gpr_allocatable() -> []u32 {
+    let caller = push_range(push_range(teko::list::empty(), 0, 2), 6, 9)
+    let with_rbx = teko::list::push(caller, 3)
+    push_range(with_rbx, 12, 15)
+}
+
+/**
+ * sysv_gpr_caller_saved — the GPR set a call clobbers, so a value live across a
+ * call point may not occupy any of them: RAX(0),RCX(1),RDX(2),RSI(6),RDI(7),
+ * R8(8),R9(9),R10(10),R11(11). This is the full clobber set — it includes the
+ * spill-scratch registers R10/R11 (they too are caller-saved), unlike
+ * `sysv_gpr_allocatable`, which excludes them. RBX(3),RBP(5),R12..R15 are
+ * callee-saved and therefore absent.
+ *
+ * @return []u32  the caller-saved (call-clobbered) GPR ids
+ */
+fn sysv_gpr_caller_saved() -> []u32 {
+    push_range(push_range(teko::list::empty(), 0, 2), 6, 11)
+}
+
+/**
+ * sysv64 — the concrete System V AMD64 (x86-64 Linux/ELF) register-file
+ * descriptor: RDI/RSI/RDX/RCX/R8/R9 integer arguments (integer result RAX,
+ * pinned separately at the return site — D-A), XMM0..XMM7 float arguments
+ * (index 0 = XMM0, which is also the float result), RBX/RBP/R12..R15 callee-
+ * saved, everything else caller-saved. The allocatable pools list caller-saved
+ * first (scratch-cheap short values before a callee-save), excluding RSP/RBP
+ * (the frame registers) and the reserved spill scratch R10/R11 (GPR) /
+ * XMM14/XMM15 (FPR). Register ids follow the x86 instruction-encoding order
+ * (RAX=0,RCX=1,RDX=2,RBX=3,RSP=4,RBP=5,RSI=6,RDI=7,R8..R15=8..15), so the
+ * encoder's ModRM/REG field is the id directly. Clones `aapcs64`'s SHAPE with a
+ * SysV partition — the whole cost of a new ABI (Phase B, §2.2 of the
+ * architecture doc).
+ *
+ * @return AbiDescriptor  the SysV AMD64 register file
+ */
+pub fn sysv64() -> AbiDescriptor {
+    AbiDescriptor {
+        gpr_arg = sysv_gpr_arg_seq()
+        fpr_arg = push_range(teko::list::empty(), 0, 7)
+        gpr_allocatable = sysv_gpr_allocatable()
+        fpr_allocatable = push_range(teko::list::empty(), 0, 13)
+        gpr_caller_saved = sysv_gpr_caller_saved()
+        fpr_caller_saved = push_range(teko::list::empty(), 0, 15)
+        gpr_spill_scratch = push_range(teko::list::empty(), 10, 11)
+        fpr_spill_scratch = push_range(teko::list::empty(), 14, 15)
+        spill_slot_bytes = 8
+        spill_slot_align = 8
+        shadow_space = 0 to u32
+    }
+}

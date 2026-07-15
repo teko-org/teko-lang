@@ -72,7 +72,7 @@ fn lam_collect_stmt(s: parser::Statement, refs: Ref<[]str>, bound: Ref<[]str>) -
         }
         parser::Assign as a => { lam_collect_expr(a.value, refs, bound); match a.kind { parser::AssignKind::Field => lam_collect_expr(a.target, refs, bound); _ => { } } }   // (#88) a closure writing `obj.f = …` captures the receiver's free vars
         parser::Return as r => if r.has_value { lam_collect_expr(r.value, refs, bound) } else { }
-        parser::LoopStmt as l => lam_collect_block(l.body, refs, bound)
+        parser::LoopStmt as l => { lam_collect_block(l.init, refs, bound); lam_collect_block(l.body, refs, bound) }
         parser::ExprStmt as es => lam_collect_expr(es.expr, refs, bound)
         parser::DeferStmt as d => lam_collect_block(d.body, refs, bound)
         parser::AdoptStmt as a => lam_collect_block(a.body, refs, bound)
@@ -350,15 +350,34 @@ fn type_compare(c: parser::Compare, env: Env, table: TypeTable) -> TExpr | error
     TExpr { kind = TCompare { first = first; rest = terms }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
 }
 
-// teko::list::empty / teko::list::push — GENERIC builtins (no `.tks` module), special-cased
-// like print/assert. Recognized by the LAST-2 path segments `list::empty` / `list::push`,
-// rooted at `teko` (or bare `list::*`). The element type is INFERRED (B.8/Slice):
-//   * empty()    -> []<sentinel> (Slice whose element is the Void marker) — unifies with any slice
-//   * push(s, x) -> []typeof(x); `s` must be a slice (sentinel or matching element)
-// Returns the typed TExpr, `error`, or NotListBuiltin (a non-list path → try the ordinary call).
-// (The C twin uses a `bool handled` + out-param; Teko has no out-params, so the tri-state is a
-// 3-member variant — `T? | error` is illegal: a variant member may not be nullable.)
-type NotListBuiltin = struct { }   // marker: the call is not a teko::list::* builtin
+/**
+ * Marker: the call is not a `teko::list::*` builtin — `type_list_builtin` falls back so its
+ * caller resolves the call through the ordinary path.
+ */
+type NotListBuiltin = struct { }
+
+/**
+ * The GENERIC `teko::list::*` builtins that have no `.tks` module of their own (like
+ * print/assert): `empty()`, `push(s, x)`, and `with_cap(n)`. Recognized by the LAST-2 path
+ * segments (`list::empty` / `list::push` / `list::with_cap`), rooted at `teko` (or bare
+ * `list::*`). The element type is INFERRED (B.8/Slice):
+ *   - `empty()` -> `[]<sentinel>` (a `Slice` whose element is the `Void` marker, unifying with
+ *     any concrete slice);
+ *   - `push(s, x)` -> `[]typeof(x)`; `s` must be a slice (sentinel or a matching element);
+ *   - `with_cap(n)` -> `[]<sentinel>`, exactly like `empty()`, but the runtime buffer is
+ *     pre-sized for `n` elements (an enabling primitive — staged off; no compiler source calls
+ *     it yet).
+ * The C twin instead uses a `bool handled` out-param; Teko has no out-params, so the tri-state
+ * result here is a 3-member variant (`T? | error` is illegal — a variant member may not be
+ * nullable).
+ *
+ * @param c      the raw call node
+ * @param env    the typing environment
+ * @param table  the folded type table
+ * @return       the typed `TExpr` for a recognized `list::*` builtin, `NotListBuiltin` when the
+ *               call is not one of these (the caller falls back to ordinary resolution), or
+ *               `error` on a malformed call (wrong arity, a non-slice base, or a mismatched item)
+ */
 fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | NotListBuiltin | error {
     if c.callee.segments.len < 2 { return NotListBuiltin { } }
     let last = c.callee.segments[c.callee.segments.len - 1].name
@@ -397,6 +416,17 @@ fn type_list_builtin(c: parser::Call, env: Env, table: TypeTable) -> TExpr | Not
         let base = match elem { Void => TExpr { kind = s.kind; type = Slice { element = result_elem }; line = s.line; col = s.col }; _ => s }
         mut args = teko::list::push(teko::list::push(teko::list::empty(), base), x)
         TExpr { kind = TCall { callee = c.callee; args = args; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Slice { element = result_elem }; line = 0; col = 0 }
+    } else if last == "with_cap" {
+        if c.args.len != 1 { return error { message = "teko::list::with_cap expects one argument (the initial capacity, a `u64`)" } }
+        let n = match type_expr(c.args[0], env, table) { TExpr as te => te; error as e => return e }
+        let cap_t = Prim { kind = PrimKind::U64 }
+        mut n_typed = n
+        if !type_eq(n.type, cap_t) {
+            if !literal_adopts(n, cap_t) { return error { message = $"teko::list::with_cap's argument must be a `u64` — got `{type_render(n.type)}`" } }
+            n_typed = TExpr { kind = n.kind; type = cap_t; line = n.line; col = n.col }
+        }
+        let wargs = teko::list::push(teko::list::empty(), n_typed)
+        TExpr { kind = TCall { callee = c.callee; args = wargs; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Slice { element = Void { } }; line = 0; col = 0 }
     } else {
         NotListBuiltin { }
     }
@@ -1220,7 +1250,7 @@ fn value_fits(v: i128, k: PrimKind) -> bool {
 // is accepted into ANY float width — precision/range loss of float CONSTANTS is permissive for
 // now (the runtime/codegen rounding-loss note in §5 still applies). Tightening f16/f32 over-range
 // to a compile error is deferred (no fail-early for float consts yet).
-fn float_fits(v: f64, k: PrimKind) -> bool { let _ = v; prim_is_float(k) }
+fn float_fits(v: f64, k: PrimKind) -> bool { prim_is_float(k) }
 
 // is `from -> to` a DEFINED conversion? Any integer↔integer is (the loss is runtime/codegen's,
 // not a type error — B). Only genuinely-undefined conversions are rejected: Bool, and crossing
@@ -1245,8 +1275,8 @@ fn cast_kind(t: Type) -> PrimKind | error {
 // Reused by the counter-validation (E6-2) — ONE source of truth (M.5).
 fn cast_check(from: Type, to: Type) -> error? {
     if type_eq(from, to) { return null }   // same type — a no-op
-    let _ = match cast_kind(from) { PrimKind as k => k; error as e => return e }
-    let _ = match cast_kind(to) { PrimKind as k => k; error as e => return e }
+    match cast_kind(from) { PrimKind => { }; error as e => return e }
+    match cast_kind(to) { PrimKind => { }; error as e => return e }
     null   // any numeric/byte → any numeric/byte is defined (B; byte AS u8)
 }
 
@@ -1526,6 +1556,159 @@ fn safe_nav_match(recv: TExpr, inner_name: str, binder: str, armv: TExpr) -> TEx
     pbody = teko::list::push(pbody, TExprStmt { expr = armv })
     arms = teko::list::push(arms, TArm { pattern = bindp; has_when = false; guard = guard_ph; body = pbody })
     TExpr { kind = TMatchExpr { subject = recv; arms = arms }; type = result; line = 0; col = 0 }
+}
+
+/**
+ * is_foreach_elem_placeholder — is `p` the for-each loop-head desugar's element-bind placeholder
+ * (§5.4)? `loop mut x in <it> { … }` desugars (`parser::loop_head.tks`) to `match _it() { null =>
+ * break; <placeholder> => { … } }`, where `<placeholder>` is a `BindPattern` with an EMPTY
+ * `type_name` — an internal marker reachable ONLY from the parser's own for-each desugar, never
+ * from user source (a literal `_ as x` is now a parse-time error: `_` is a discard, `as x` a
+ * capture — a semantic contradiction, owner ruling). `resolve_foreach_arm`, BEFORE any
+ * pattern-matching/exhaustiveness/codegen ever sees a for-each match's arms, rewrites this
+ * placeholder into a REAL `T as x` bind (T = the iterator's resolved element type) — the SAME
+ * sound, pre-existing named-bind mechanism `Foo as v` already uses, so VM/native/LIR need NO
+ * special case.
+ *
+ * @param p  the arm pattern to classify
+ * @return   true iff `p` is the for-each placeholder
+ */
+fn is_foreach_elem_placeholder(p: parser::Pattern) -> bool {
+    match p {
+        parser::BindPattern as bp => bp.type_name.segments.len == 0 && !bp.is_slice && bp.has_binding
+        _ => false
+    }
+}
+
+/**
+ * elem_type_name — the RUNTIME-facing BARE name of a for-each iterator's element type `t` — the
+ * SAME bare, unqualified spelling VM's `bind_case_name`/`val_type_matches` and codegen's
+ * `cg_path_last`/`cg_emit_case_key_str` already compare against for an ordinary `Foo as v` bind
+ * (mirrors the "#109 W3 bare-vs-bare" convention throughout match.tks/vm.tks/codegen.tks — the
+ * runtime never carries a namespace). Handles the realistic element-type shapes (prim, byte, char,
+ * str, a named struct/class/enum); every other `Type` case is a clean, named internal error (not
+ * yet supported by the for-each desugar).
+ *
+ * @param t  the iterator's resolved element type (`_it`'s `T?` with `null` stripped)
+ * @return   the bare runtime name string, or an error for an unnameable element type
+ */
+fn elem_type_name(t: Type) -> str | error {
+    match t {
+        Prim as p => prim_name(p.kind)
+        Byte => "byte"
+        Char => "char"
+        Str => "str"
+        Named as n => name_last_segment(n.name)
+        _ => error { message = "internal: a for-each iterator's element type must be a nameable type (prim/byte/char/str/named) — this shape is not yet supported" }
+    }
+}
+
+/**
+ * optional_inner_or_self — the Optional-stripped inner of `t` (or `t` itself when it is not an
+ * Optional). A DEDICATED, single-purpose function (not inlined) so every caller shares ONE
+ * extraction point.
+ *
+ * @param t  the type to strip
+ * @return   `t`'s Optional inner, or `t` unchanged
+ */
+fn optional_inner_or_self(t: Type) -> Type {
+    match t { Optional as o => o.inner; _ => t }
+}
+
+/**
+ * resolve_foreach_arm — the SYNTACTIC completion one match arm needs for `exhaustive`'s coverage
+ * check ONLY: when `a.pattern` is the for-each placeholder, rewrite it into a `BindPattern` carrying
+ * a non-empty `type_name` (so `present_case_covered` recognizes it as covering the present case,
+ * exactly like it already does for `Foo as v`); every other arm (the `null => break` arm, and any
+ * ordinary user arm) passes through unchanged. This rewrite is NEVER re-resolved via `resolve_named`
+ * (see `type_foreach_elem_arm` for the actual TYPED binding, which bypasses name-resolution — the
+ * element type may live outside the match's own referencing namespace, exactly the reason the
+ * existing `?.` desugar's `safe_nav_match` ALSO bypasses it).
+ *
+ * @param a        the syntactic match arm
+ * @param subject  the match's subject type (an Optional when this is a for-each pull)
+ * @return         the (possibly rewritten) arm, or an error when the element type is unnameable
+ */
+fn resolve_foreach_arm(a: parser::Arm, subject: Type) -> parser::Arm | error {
+    if !is_foreach_elem_placeholder(a.pattern) { return a }
+    let bp = match a.pattern { parser::BindPattern as b => b; _ => return a }
+    let inner = optional_inner_or_self(subject)
+    let tn = match elem_type_name(inner) { str as s => s; error as e => return e }
+    let segs = teko::list::push(teko::list::empty(), parser::Segment { name = tn })
+    let real = parser::BindPattern { type_name = parser::Path { segments = segs }; has_binding = bp.has_binding; binding = bp.binding; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    parser::Arm { pattern = real; has_when = a.has_when; guard = a.guard; body = a.body }
+}
+
+/**
+ * resolve_foreach_placeholders — complete every arm of a match's arm list (`resolve_foreach_arm`,
+ * applied in order) — used ONLY to build the arm list `exhaustive` checks coverage against. A no-op
+ * (returns `arms` unchanged) for any match that carries no placeholder.
+ *
+ * @param arms     the syntactic match arm list
+ * @param subject  the match's subject type
+ * @return         the (possibly rewritten) arm list, or the first arm's completion error
+ */
+fn resolve_foreach_placeholders(arms: []parser::Arm, subject: Type) -> []parser::Arm | error {
+    mut out: []parser::Arm = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= arms.len { break }
+        let ra = match resolve_foreach_arm(arms[i], subject) { parser::Arm as a => a; error as e => return e }
+        out = teko::list::push(out, ra)
+        i++
+    }
+    out
+}
+
+/**
+ * type_foreach_elem_arm — TYPE the for-each pull's element-bind placeholder arm DIRECTLY, bypassing
+ * `check_pattern`'s name-based type-RESOLUTION (`bind_pattern_type`/`resolve_named`'s bare-path rule
+ * requires the SAME referencing namespace as the type's own declaration — the element type may live
+ * elsewhere; the SAME reason the existing `?.` desugar's `safe_nav_match` ALSO builds its `TArm`
+ * directly instead of going through `check_pattern`). Extracts the placeholder's `BindPattern` and
+ * the element type in ONE function (mirrors `resolve_foreach_arm`'s shape), binds the element name
+ * directly to the ALREADY-KNOWN type (no re-derivation needed — it came straight from `_it`'s
+ * resolved return type), types the body against that binding, and the emitted `TArm.pattern`
+ * carries a REAL, bare-named `BindPattern` (`elem_type_name`) — so VM's `pat_match`/codegen's
+ * `emit_pat_binds` see an ORDINARY named bind and need no special case (#517, §5.4.1).
+ *
+ * @param a        the syntactic placeholder arm
+ * @param subject  the match's subject type (an Optional; its inner is the element type T)
+ * @param env      the enclosing type environment
+ * @param table    the type table
+ * @return         the typed arm, or an error when the pattern is not the expected placeholder
+ *                 shape, T is not a nameable element type, or the guard is non-bool
+ */
+fn type_foreach_elem_arm(a: parser::Arm, subject: Type, env: Env, table: TypeTable) -> TArm | error {
+    let bp = match a.pattern { parser::BindPattern as b => b; _ => return error { message = "internal: for-each placeholder must be a BindPattern" } }
+    let inner = optional_inner_or_self(subject)
+    let tn = match elem_type_name(inner) { str as s => s; error as e => return e }
+    let e2 = define(env, bp.binding, inner, false)
+    let body = match type_block(a.body, e2, table) { TypedBlock as bk => bk; error as err => return err }
+    mut guard = TExpr { kind = TNumber { is_float = false; value = 0; fval = 0.0 }; type = Void { }; line = 0; col = 0 }
+    if a.has_when {
+        let g = match type_expr(a.guard, e2, table) { TExpr as te => te; error as err => return err }
+        if !is_bool(g.type) { return error { message = "a `when` guard must be a bool" } }
+        guard = g
+    }
+    let segs = teko::list::push(teko::list::empty(), parser::Segment { name = tn })
+    let real = parser::BindPattern { type_name = parser::Path { segments = segs }; has_binding = bp.has_binding; binding = bp.binding; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    TArm { pattern = real; has_when = a.has_when; guard = guard; body = body.stmts }
+}
+
+/**
+ * type_match_arm — type ONE match arm, routing the for-each desugar's placeholder arm through the
+ * bypass (`type_foreach_elem_arm`) and every other arm through the ordinary, unmodified `type_arm`.
+ *
+ * @param a        the syntactic match arm
+ * @param subject  the match's subject type
+ * @param env      the enclosing type environment
+ * @param table    the type table
+ * @return         the typed arm, or an error
+ */
+fn type_match_arm(a: parser::Arm, subject: Type, env: Env, table: TypeTable) -> TArm | error {
+    if is_foreach_elem_placeholder(a.pattern) { return type_foreach_elem_arm(a, subject, env, table) }
+    type_arm(a, subject, env, table)
 }
 
 // validate a `?.` receiver: must be a NON-sentinel optional; enrich the disjoint-domain
@@ -2479,6 +2662,7 @@ fn check_must_free_params(f: parser::Function, tbl: TypeTable, ns: str, body: []
     mut i = 0
     loop {
         if i >= f.params.len { break }
+        if !f.params[i].has_type && f.params[i].name == "_" { i++; continue }
         let pt = match resolve_type(f.params[i].type_ann, tbl, ns) { Type as t => t; error as e => return e }
         match pt {
             Named as nm => {
@@ -2723,7 +2907,7 @@ fn type_match(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | error
     mut i = 0
     loop {
         if i >= m.arms.len { break }
-        let ai = match type_arm(m.arms[i], s.type, env, table) { TArm as a => a; error as e => return e }
+        let ai = match type_match_arm(m.arms[i], s.type, env, table) { TArm as a => a; error as e => return e }
         arms = teko::list::push(arms, ai)
         if !tblock_diverges(ai.body) {
             let t = tblock_type(ai.body)
@@ -2732,7 +2916,8 @@ fn type_match(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | error
         }
         i++
     }
-    if !exhaustive(m.arms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
+    let rarms = match resolve_foreach_placeholders(m.arms, s.type) { []parser::Arm as a => a; error as e => return e }
+    if !exhaustive(rarms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
     let result = if have_type { first } else { Void { } }   // all arms diverge → void
     TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = result; line = 0; col = 0 }
 }
@@ -2744,11 +2929,12 @@ fn type_match_stmt(m: parser::MatchExpr, env: Env, table: TypeTable) -> TExpr | 
     mut i = 0
     loop {
         if i >= m.arms.len { break }
-        let ai = match type_arm(m.arms[i], s.type, env, table) { TArm as a => a; error as e => return e }
+        let ai = match type_match_arm(m.arms[i], s.type, env, table) { TArm as a => a; error as e => return e }
         arms = teko::list::push(arms, ai)
         i++
     }
-    if !exhaustive(m.arms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
+    let rarms = match resolve_foreach_placeholders(m.arms, s.type) { []parser::Arm as a => a; error as e => return e }
+    if !exhaustive(rarms, s.type, table, env.cur_ns) { return error { message = "non-exhaustive `match` (cover all cases or add `_`)" } }
     TExpr { kind = TMatchExpr { subject = s; arms = arms }; type = Void { }; line = 0; col = 0 }
 }
 
@@ -3032,9 +3218,21 @@ fn type_return(r: parser::Return, env: Env, table: TypeTable) -> TypedStmt | err
     TypedStmt { node = TReturn { has_value = r.has_value; value = v }; env = env }   // value gated by has_value (B.20); the return-type match is enforced by type_function's check_returns (C5)
 }
 
+/**
+ * type_loop — type a `[LABEL:] loop [head] { … }` (#517). The head is already desugared: `init`
+ * is typed in a LOOP-PRIVATE child scope so its bindings (counter / bound / `_first` / `_it`) do
+ * NOT leak past the loop, then `body` is typed in that same scope (so the body reads the preamble).
+ * The env returned is the CALLER's env — every loop-local binding (init AND body) is dropped.
+ *
+ * @param l the surface loop node (label + init + body)
+ * @param env the enclosing type environment
+ * @param table the type table
+ * @return the typed loop statement paired with the UNCHANGED outer env, or a type error
+ */
 fn type_loop(l: parser::LoopStmt, env: Env, table: TypeTable) -> TypedStmt | error {
-    let tb = match type_block(l.body, env, table) { TypedBlock as bk => bk; error as e => return e }
-    TypedStmt { node = TLoopStmt { label = l.label; body = tb.stmts }; env = env }   // body bindings stay block-local; label carried (M.5)
+    let ib = match type_block(l.init, env, table) { TypedBlock as bk => bk; error as e => return e }
+    let bb = match type_block(l.body, ib.env, table) { TypedBlock as bk => bk; error as e => return e }
+    TypedStmt { node = TLoopStmt { label = l.label; init = ib.stmts; body = bb.stmts }; env = env }
 }
 
 fn type_exprstmt(es: parser::ExprStmt, env: Env, table: TypeTable) -> TypedStmt | error {
@@ -3413,8 +3611,9 @@ fn check_labels_inexpr(e: TExpr, scope: []str, in_loop: bool, seen: []str) -> La
 /**
  * check_labels — validate every `break`/`continue` in `stmts` against its enclosing loop
  * structure: a bare `break`/`continue` must be inside SOME loop (`in_loop`); a labeled one must
- * name a loop currently in `scope`; a `loop NAME { }` label must be unique among its enclosing
- * siblings (`seen`, dedup-checked via `lbl_enclosing`). `adopt { }` is an ORDINARY block, not a
+ * name a loop currently in `scope`; a `LABEL: loop { }` label must be UPPER_SNAKE (#517) and unique
+ * among its enclosing siblings (`seen`, dedup-checked via `lbl_enclosing`). `adopt { }` is an
+ * ORDINARY block, not a
  * loop — it introduces NO label frame and does not reset `in_loop`, so a bare `break`/`continue`
  * inside still targets the enclosing loop (or is rejected when there is none), and a labeled one
  * still resolves against the SAME enclosing `scope` (mirrors codegen's region-stack crossing
@@ -3435,6 +3634,7 @@ fn check_labels(stmts: []TStatement, scope: []str, in_loop: bool, seen: []str) -
         match stmts[i] {
             TLoopStmt as l => {
                 if l.label.len > 0 {
+                    if !lexer::is_upper_snake(l.label) { return LabelCheck { failed = true; message = "loop label must be UPPER_SNAKE"; seen = acc } }
                     if lbl_enclosing(acc, l.label) { return LabelCheck { failed = true; message = "duplicate loop label within the same body"; seen = acc } }
                     acc = teko::list::push(acc, l.label)
                 }
@@ -3516,6 +3716,161 @@ fn teko_rt_type_ok(t: Type) -> bool {
 }
 
 /**
+ * params_have_discard — does any parameter in `ps` denote the write-only DISCARD `_` (owner
+ * refinement 2026-07-15)? A discard parameter has no type and the reserved name "_" — a name the
+ * lexer can never mint for a real identifier, so the test is unambiguous.
+ *
+ * @param ps  the parameter list
+ * @return    true iff at least one parameter is a `_` discard
+ */
+fn params_have_discard(ps: []parser::Param) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= ps.len { break }
+        if !ps[i].has_type && ps[i].name == "_" { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * method_named — the first method in `ms` whose name equals `name`, or null when none matches. Used
+ * to locate the base/interface method that GOVERNS a `_` discard parameter's type by position.
+ *
+ * @param ms    the method list to scan
+ * @param name  the method name to find
+ * @return      the matching method, or null
+ */
+fn method_named(ms: []parser::Function, name: str) -> parser::Function? {
+    mut i: u64 = 0
+    loop {
+        if i >= ms.len { break }
+        if ms[i].name == name { return ms[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * type_implements_list — the interface `implements` list of the type named `name` (a class or a
+ * struct), or an empty list when the type is neither, is unknown, or lists no interfaces.
+ *
+ * @param name    the enclosing type name
+ * @param ref_ns  the referencing namespace for the type-table lookup
+ * @param table   the folded type table
+ * @return        the type's `implements` names, or an empty list
+ */
+fn type_implements_list(name: str, ref_ns: str, table: TypeTable) -> []str {
+    match type_table_find(table, name, ref_ns) {
+        parser::TypeDecl as td => match td.body {
+            parser::ClassBody as cb => cb.implements
+            parser::StructBody as sb => sb.implements
+            _ => teko::list::empty()
+        }
+        error => teko::list::empty()
+    }
+}
+
+/**
+ * find_interface_method — the interface-required method named `name` provided by any interface in
+ * `impls`, or null when none provides it. Mirrors check_one_interface's resolution (find_interface_decl
+ * then effective_interface_methods), so the governing signature seen here is exactly the one the
+ * conformance check validated.
+ *
+ * @param impls   the type's `implements` interface names
+ * @param name    the method name to find
+ * @param table   the folded type table
+ * @param ref_ns  the conforming type's namespace (interface lookups resolve here)
+ * @return        the matching interface method, or null
+ */
+fn find_interface_method(impls: []str, name: str, table: TypeTable, ref_ns: str) -> parser::Function? {
+    mut i: u64 = 0
+    loop {
+        if i >= impls.len { break }
+        match find_interface_decl(impls[i], table, ref_ns) {
+            IfaceHit as h => match h.decl.body {
+                parser::InterfaceBody as ib => match effective_interface_methods(ib, h.ns, table, teko::list::push(teko::list::empty(), qualify(h.ns, name_last_segment(h.decl.name)))) {
+                    []parser::Function as ms => match method_named(ms, name) { parser::Function as m => return m; null => { } }
+                    error => { }
+                }
+                _ => { }
+            }
+            error => { }
+        }
+        i++
+    }
+    null
+}
+
+/**
+ * discard_governing_sig — the base/interface method whose signature dictates the TYPES of a `_`
+ * discard parameter in method `f` of type `struct_name` (owner refinement 2026-07-15): the base
+ * class's same-named method (when `f` overrides) or a same-named method of an interface the type
+ * implements. Null when `f` neither overrides nor implements a same-named method — the caller then
+ * rejects the discard parameter as illegal in a self-owned signature.
+ *
+ * @param f            the method being typed
+ * @param struct_name  the enclosing type name (bare or canonical)
+ * @param ref_ns       the enclosing type's namespace
+ * @param table        the folded type table
+ * @return             the governing base/interface method, or null when none matches
+ */
+fn discard_governing_sig(f: parser::Function, struct_name: str, ref_ns: str, table: TypeTable) -> parser::Function? {
+    match type_table_find(table, struct_name, ref_ns) {
+        parser::TypeDecl as td => match td.body {
+            parser::ClassBody as cb => {
+                if cb.has_base {
+                    match find_class_body(cb.base_name, table) {
+                        parser::ClassBody as bcb => match effective_class_methods(bcb, table) {
+                            []parser::Function as ms => match method_named(ms, f.name) { parser::Function as m => return m; null => { } }
+                            error => { }
+                        }
+                        error => { }
+                    }
+                }
+            }
+            _ => { }
+        }
+        error => { }
+    }
+    find_interface_method(type_implements_list(struct_name, ref_ns, table), f.name, table, ref_ns)
+}
+
+/**
+ * discard_param_name — the synthesized C-visible name for the `_` discard parameter at position
+ * `idx`: unique per position so multiple `_` params never collide in the emitted C signature, while
+ * the body can never name it (a discard read is a compile error).
+ *
+ * @param idx  the parameter's positional index
+ * @return     a per-position throwaway parameter name
+ */
+fn discard_param_name(idx: u64) -> str { $"_tk_discard_{idx}" }
+
+/**
+ * discard_param_type — the resolved type of the `_` discard parameter at position `idx`, taken BY
+ * POSITION from the governing base/interface signature `gov`. A null `gov` is the GATE: a `_`
+ * discard parameter is only legal in an implementing/overriding signature.
+ *
+ * @param gov     the governing base/interface method, or null
+ * @param idx     the discard parameter's positional index
+ * @param table   the folded type table
+ * @param ref_ns  the conforming type's namespace (the governing param type resolves here, matching
+ *                the conformance check's own resolution namespace)
+ * @return        the resolved discard-parameter type
+ * @throws        when `gov` is null (a discard param in a self-owned signature), when `idx` has no
+ *                matching governing slot, or when the governing param type fails to resolve
+ */
+fn discard_param_type(gov: parser::Function?, idx: u64, table: TypeTable, ref_ns: str) -> Type | error {
+    match gov {
+        parser::Function as g => {
+            if idx >= g.params.len { return error { message = "a `_` discard parameter has no matching slot in the implemented/overridden signature" } }
+            resolve_type(g.params[idx].type_ann, table, ref_ns)
+        }
+        null => error { message = "a `_` discard parameter is only allowed when implementing an interface method or overriding a base method — a plain function must name its parameters" }
+    }
+}
+
+/**
  * (OOP A1, 2026-07-01) Type-check a struct/class METHOD's BODY. Mirrors type_function, except the
  * RECEIVER param (`has_type=false`, only ever index 0) binds to `Named{struct_name}` instead of going
  * through resolve_type (its type is implicit, never written by the user). (#254) The method's
@@ -3556,10 +3911,17 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     // parsing) must be REWRITTEN to a real Named(struct_name) TypeExpr before it ever reaches
     // codegen, or emit_function_sig recurses on an empty path (M.1 crash). Every other param's
     // type_ann is already meaningful from parsing and passes through unchanged.
+    let discard_gov: parser::Function? = if params_have_discard(f.params) { discard_governing_sig(f, struct_name, env.cur_ns, table) } else { null }
     mut fixed_params: []parser::Param = teko::list::empty()
-    mut i = 0
+    mut i: u64 = 0
     loop {
         if i >= f.params.len { break }
+        if !f.params[i].has_type && f.params[i].name == "_" {
+            let dpt = match discard_param_type(discard_gov, i, tbl, env.cur_ns) { Type as t => t; error as e => return e }
+            fixed_params = teko::list::push(fixed_params, parser::Param { name = discard_param_name(i); has_type = true; type_ann = type_to_texpr(dpt); is_params = false; has_default = false; default_expr = parser::no_expr() })
+            i++
+            continue
+        }
         let pt = if !f.params[i].has_type {
             Named { name = qualify(env.cur_ns, struct_name) }   // (#109 W3) canonical: the method's own ns qualifies its receiver type
         } else {
@@ -3717,7 +4079,7 @@ fn stmt_has_free(s: TStatement) -> bool {
         TBinding as b => expr_has_free(b.value)
         TAssign as a => expr_has_free(a.value)
         TReturn as r => if r.has_value { expr_has_free(r.value) } else { false }
-        TLoopStmt as l => stmts_have_free(l.body)
+        TLoopStmt as l => stmts_have_free(l.init) || stmts_have_free(l.body)
         TDeferStmt as d => stmts_have_free(d.body)
         TAdoptStmt as a => stmts_have_free(a.body)
         TBreakStmt => false
@@ -3797,7 +4159,7 @@ fn check_ref_storability_stmt(s: TStatement, spine: Spine) -> error? {
     match s {
         TBinding as b => match check_ref_bind_storable(b, spine) { error as e => return e; null => check_ref_storability_expr(b.value, spine) }
         TAssign as a => match check_ref_assign_storable(a, spine) { error as e => return e; null => check_ref_storability_expr(a.value, spine) }
-        TLoopStmt as l => check_ref_storability_block(l.body, spine)
+        TLoopStmt as l => match check_ref_storability_block(l.init, spine) { error as e => return e; null => check_ref_storability_block(l.body, spine) }
         TDeferStmt as d => check_ref_storability_block(d.body, spine)
         TAdoptStmt as a => check_ref_storability_block(a.body, spine)
         TReturn as r => if r.has_value { check_ref_storability_expr(r.value, spine) } else { null }
@@ -3915,6 +4277,9 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     mut i = 0
     loop {
         if i >= f.params.len { break }
+        if !f.params[i].has_type && f.params[i].name == "_" {
+            return error { message = "a `_` discard parameter is only allowed when implementing an interface method or overriding a base method — a plain function must name its parameters" }
+        }
         let pt = match resolve_type(f.params[i].type_ann, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
         if f.is_extern {
             if is_teko_rt {
@@ -4064,12 +4429,75 @@ fn surface_at(file: str, item_line: u32, item_col: u32, inner: error) -> error {
     teko::error::err_typed(positioned, inner.expected, inner.actual)   // preserve expected/actual (C1.8)
 }
 
-// C7.10 — THE DEP-AWARE TYPED ENTRY POINT. Same as type_program but pre-seeds the
-// collection environment from an already-typed dep TProgram before collecting and typing
-// the project. The dep's items are NOT re-typed; only their signatures enter scope so
-// the project's code can call dep functions and reference dep types.
-// dep_prog.items is empty when there are no deps → degrades silently to type_program behavior.
+/**
+ * A per-item progress hook, invoked `(done, total)` after each top-level item is
+ * typed. Lets a caller (the `teko build` observability layer, `teko::build`) report
+ * a live "N/M items" counter for the checker phase without the checker depending on
+ * anything outside itself — the caller supplies the closure; the checker only ever
+ * calls it.
+ *
+ * @param done   how many top-level items have been typed so far
+ * @param total  the total top-level item count for this program
+ */
+pub type ProgressFn = (u64, u64) -> void
+
+/**
+ * `type_program_with_deps`'s result BEFORE monomorphization: the checked program
+ * (still carrying its generic templates) plus the resolved `TypeTable`
+ * `monomorphize` needs. Exposed so the build driver can time and report
+ * monomorphization as its OWN phase, instead of it running silently inside
+ * `type_program_with_deps`.
+ */
+pub type PreMono = struct {
+    /** the checked program, before monomorphization */
+    prog: TProgram
+    /** the resolved type table, as `monomorphize` expects it */
+    table: TypeTable
+}
+
+/**
+ * The no-op `ProgressFn` `type_program_with_deps` passes to
+ * `type_program_with_deps_pre_mono` when its caller wants no per-item progress
+ * reporting (the original, pre-observability contract).
+ *
+ * @param done   how many top-level items have been typed so far (ignored)
+ * @param total  the total top-level item count (ignored)
+ */
+fn no_item_progress(done: u64, total: u64) -> void { }
+
+/**
+ * The DEP-AWARE TYPED ENTRY POINT (C7.10). Same as `type_program` but pre-seeds the
+ * collection environment from an already-typed dep `TProgram` before collecting and
+ * typing the project, then MONOMORPHIZES the result (S4b) — a thin wrapper over
+ * `type_program_with_deps_pre_mono` with no progress reporting, preserving this
+ * function's original contract for its non-observability callers. The dep's items
+ * are NOT re-typed; only their signatures enter scope so the project's code can
+ * call dep functions and reference dep types. `dep_prog.items` is empty when there
+ * are no deps -> degrades silently to `type_program`'s behavior.
+ *
+ * @param raw_program  the merged, un-typed program (project items only)
+ * @param dep_prog     the already-typed dependency program (empty when depless)
+ * @return             the fully checked and monomorphized program
+ * @throws             the first collection/typing/monomorphization error
+ */
 pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) -> TProgram | error {
+    let pre = match type_program_with_deps_pre_mono(raw_program, dep_prog, no_item_progress) { PreMono as p => p; error as e => return e }
+    monomorphize(pre.prog, pre.table)
+}
+
+/**
+ * `type_program_with_deps`, split just BEFORE monomorphization (see `PreMono`) and
+ * instrumented with a per-item progress hook (see `ProgressFn`) — the entry point
+ * the build driver uses to report the `checker` phase's live "N/M items" counter
+ * and time monomorphization as its own separate phase.
+ *
+ * @param raw_program  the merged, un-typed program (project items only)
+ * @param dep_prog     the already-typed dependency program (empty when depless)
+ * @param on_item      called `(done, total)` after each top-level item is typed
+ * @return             the checked program (pre-monomorphization) and its type table
+ * @throws             the first collection/typing error
+ */
+pub fn type_program_with_deps_pre_mono(raw_program: parser::Program, dep_prog: TProgram, on_item: ProgressFn) -> PreMono | error {
     // (TR0) FOLD trait derivations first — PROJECT-LOCAL only (a dep's traits don't fold here:
     // the .tkb codec does not carry trait bodies — the same method-serialization gap as
     // struct/class methods — so a dep trait name in an `&`-list surfaces as the conformance
@@ -4140,6 +4568,7 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
             }
         }
         i++
+        on_item(i to u64, program.items.len to u64)
     }
     let lc = check_labels(mainbody, teko::list::empty(), false, teko::list::empty())
     if lc.failed { return error { message = lc.message } }
@@ -4159,9 +4588,7 @@ pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) 
         pi++
     }
     let tp = TProgram { items = all_items }
-    match analyze_program(tp) { null => { }; error as e => return e }
-    // (S4b) MONOMORPHIZE the full (dep + project) tree — see type_program. No-op when no generics.
-    match monomorphize(tp, types) { TProgram as mp => mp; error as e => return e }
+    PreMono { prog = tp; table = types }
 }
 
 // THE TYPED ENTRY POINT: pass 1 (collect top-level names) + pass 2 (type each item).
@@ -4247,12 +4674,5 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
     let lc = check_labels(mainbody, teko::list::empty(), false, teko::list::empty())   // W5-cf-2: validate labels in the virtual-main
     if lc.failed { return error { message = lc.message } }
     let tp = TProgram { items = items }
-    // Phase 5 — init analysis: unused-local ERROR + unused-private-fn WARNING (initanalysis.tks).
-    // Runs last, over the fully typed program; prints warnings, returns the first hard error.
-    match analyze_program(tp) { null => { }; error as e => return e }
-    // (S4b) MONOMORPHIZE — stamp concrete copies of generic fns + rewrite generic calls, so
-    // codegen/VM/tests receive a tree with only concrete functions. No-op (byte-identical) when
-    // the program has no generic function. Runs AFTER analyze so the original generic fn + its
-    // call are seen by init analysis (no false unused-private-fn warning).
     match monomorphize(tp, types) { TProgram as mp => mp; error as e => return e }
 }

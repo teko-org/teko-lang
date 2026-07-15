@@ -1,0 +1,52 @@
+/**
+ * riscv_reloc_reqs — lower every `RelocRiscv` of `enc` to a neutral `ElfRelocReq`,
+ * mapping the RISC-V `kind` to its numeric `R_RISCV_*` type via `riscv_reloc_type`
+ * (the ONLY RISC-V knowledge the adapter injects): `Call`→R_RISCV_CALL_PLT(19),
+ * `PcRelHi20`→R_RISCV_PCREL_HI20(23), `PcRelLo12`→R_RISCV_PCREL_LO12_I(24),
+ * `Branch`→R_RISCV_BRANCH(16), `Jal`→R_RISCV_JAL(17), `Abs64`→R_RISCV_64(2). The
+ * offset, target name, and base addend ride through unchanged; the shared writer
+ * folds a rodata `PcRelHi20` target's `.rodata` offset onto the addend, resolves a
+ * `PcRelLo12`'s `.Lpcrel_hiN` label to its `.text`-local symbol index, and
+ * resolves every other name to its symbol index.
+ *
+ * @param EncodedModuleRiscv enc  the RISC-V module (relocations)
+ * @return []ElfRelocReq  the neutral relocation requests, in emission order
+ */
+fn riscv_reloc_reqs(enc: EncodedModuleRiscv) -> []ElfRelocReq {
+    mut out: []ElfRelocReq = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= enc.relocs.len { break }
+        let r = enc.relocs[i]
+        out = teko::list::push(out, ElfRelocReq { offset = r.offset; sym = r.sym; rtype = riscv_reloc_type(r.kind); addend = r.addend })
+        i++
+    }
+    out
+}
+
+/**
+ * emit_elf_riscv — the riscv64 ELF adapter (the symmetric twin of x86's
+ * `emit_elf`): map the `EncodedModuleRiscv` to a neutral `ElfObject`
+ * (`e_machine`=EM_RISCV(243), `e_flags`=EF_RISCV_FLOAT_ABI_DOUBLE(0x0004) for the
+ * RV64 LP64D hard-float ABI, each `RelocRiscv` lowered to an `ElfRelocReq` via
+ * `riscv_reloc_type`) and hand it to the shared `emit_elf_object`. The neutral
+ * symbol list already carries the `.Lpcrel_hiN` `.text`-local labels the
+ * `MLlaRiscv` pcrel pairs synthesize (§7.2), which the shared writer emits as
+ * `STB_LOCAL|STT_NOTYPE` section-1 symbols; every other ELF fact (section-relative
+ * `st_value`, `.text`-relative `r_offset`, the local-then-global partition +
+ * `.symtab.sh_info`) is the reused x86 writer's, unchanged. `e_machine`/`e_flags`
+ * and the numeric reloc types are the ONLY ISA-varying inputs (§7.1).
+ *
+ * @param EncodedModuleRiscv enc  the section images + symbols + relocations
+ * @return []byte  the riscv64 ELF64 object file bytes
+ */
+pub fn emit_elf_riscv(enc: EncodedModuleRiscv) -> []byte {
+    emit_elf_object(ElfObject {
+        e_machine = 243 to u32
+        e_flags = 0x0004 to u32
+        text = enc.text
+        rodata = enc.rodata
+        symbols = enc.symbols
+        relocs = riscv_reloc_reqs(enc)
+    })
+}

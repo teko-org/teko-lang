@@ -4,13 +4,12 @@
 
 ## Checklist (project invariants — see CONTRIBUTING.md)
 
-- [ ] **Base branch is `main`** (the active development line)
-- [ ] **SUPREME RULE**: every `.c`/`.h` change is mirrored in its `.tks` twin (and vice versa)
-- [ ] Verified with the C bootstrap: `./build/teko build . -o bin` (test gate green)
-- [ ] Verified self-hosted: `./bin/teko build . -o /tmp/gen2` (test gate green)
-- [ ] Generated C byte-identical between engines (after gensym normalization); gen-2 == gen-3
+- [ ] **Base branch is `main`** (or active remodel umbrella if during a wave)
+- [ ] **Native engine only** (VM retired #524): all code in Teko (`.tks`), no C bootstrap
+- [ ] **Seed from released binary**: `./scripts/fetch_teko.sh && ./.teko/teko . -o bin` (test gate green)
+- [ ] Fixpoint: gen-1 rebuilds itself byte-identical (gen-2 == gen-1 after re-compile)
+- [ ] **Coverage of new code:** at least 100% coverage on the delta
 - [ ] New behavior covered by a regression example (`examples/regressions/…`) and/or `.tkt` tests
-- [ ] VM == native on the affected behavior
 
 ## Design rulings
 

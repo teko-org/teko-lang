@@ -25,7 +25,7 @@ fn one_stmt(e: parser::Expr) -> []parser::Statement { teko::list::push(teko::lis
     pushed value's type; #265's native gate cc-compiles these test bodies for the first time). */
 fn ret_stmt(e: parser::Expr) -> parser::Statement { parser::Return { has_value = true; value = e } }
 /** loop_stmt — a `loop { body }` statement widened to the `Statement` variant (see ret_stmt). */
-fn loop_stmt(body: []parser::Statement) -> parser::Statement { parser::LoopStmt { label = ""; body = body } }
+fn loop_stmt(body: []parser::Statement) -> parser::Statement { parser::LoopStmt { label = ""; init = teko::list::empty(); body = body } }
 fn path1(name: str) -> parser::Path { parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = name }) } }
 fn named_t(name: str) -> parser::TypeExpr { parser::NamedType { path = path1(name); args = teko::list::empty() } }
 
@@ -231,6 +231,55 @@ fn mk_fn(name: str, ret: parser::TypeExpr, body: []parser::Statement) -> parser:
     let p = parser::Param { name = "x"; has_type = true; type_ann = named_t("u32"); is_params = false; has_default = false; default_expr = e_num(0) }
     let params = teko::list::push(teko::list::empty(), p)
     parser::Function { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = ret; body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+}
+
+/** type_function_with_loop_body — a `Ref`-param function whose body contains a `loop { break }`
+    types cleanly and drives the ref-storability walker over the loop node (its guard descends the
+    body only for a Ref-carrying/free-carrying function, #517). */
+#test
+fn type_function_with_loop_body() {
+    let ref_ann: parser::TypeExpr = parser::NamedType { path = path1("Ref"); args = teko::list::push(teko::list::empty(), named_t("i64")) }
+    let rp = parser::Param { name = "r"; has_type = true; type_ann = ref_ann; is_params = false; has_default = false; default_expr = e_num(0) }
+    let params = teko::list::push(teko::list::empty(), rp)
+    let brk: []parser::Statement = teko::list::push(teko::list::empty(), parser::BreakStmt { label = "" })
+    mut body: []parser::Statement = teko::list::push(teko::list::empty(), loop_stmt(brk))
+    body = teko::list::push(body, st(e_num(0)))
+    let f = parser::Function { name = "looper"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = params; has_return = true; return_type = named_t("i64"); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; has_inject = false; injects = teko::list::empty(); is_unsafe = false }
+    match type_function(f, empty_env(), empty_table()) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** lam_collect_descends_loop_init — the closure free-variable collector walks a loop's `init` (and
+    body): a var read in the init is collected as a free reference (#517). */
+#test
+fn lam_collect_descends_loop_init() {
+    mut refs: []str = teko::list::empty()
+    mut bound: []str = teko::list::empty()
+    let ib: parser::Statement = parser::Binding { kind = parser::BindKind::Mut; target = parser::SimpleName { name = "_hi" }; has_type = false; type_ann = named_t("void"); value = e_var("n") }
+    let init: []parser::Statement = teko::list::push(teko::list::empty(), ib)
+    let brk: []parser::Statement = teko::list::push(teko::list::empty(), parser::BreakStmt { label = "" })
+    let loopnode: parser::Statement = parser::LoopStmt { label = ""; init = init; body = brk }
+    let stmts: []parser::Statement = teko::list::push(teko::list::empty(), loopnode)
+    lam_collect_block(stmts, refs, bound)
+    mut found = false
+    mut i = 0
+    loop {
+        if i >= refs.len { break }
+        if refs[i] == "n" { found = true }
+        i++
+    }
+    teko::assert::is_true(found)
+}
+
+/** chain_stats_descends_loop_init — the self-append-chain escape analysis walks a loop's `init` (and
+    body) for the named chain (#517). */
+#test
+fn chain_stats_descends_loop_init() {
+    let init: []TStatement = teko::list::push(teko::list::empty(), t_let("_hi", tnum(3)))
+    let brk: []TStatement = teko::list::push(teko::list::empty(), TBreakStmt { label = "" })
+    let loopnode: TStatement = TLoopStmt { label = ""; init = init; body = brk }
+    let stmts: []TStatement = teko::list::push(teko::list::empty(), loopnode)
+    let cs = chain_stats_block(stmts, "x")
+    teko::assert::is_true(cs.self_appends == 0)
 }
 
 #test
@@ -659,7 +708,7 @@ fn color_enum_table() -> TypeTable {
 // ---------------------------------------------------------------------------
 #test
 fn checker_basic_predicates() {
-    let _ = i16t()   // cover the unused i16t() helper
+    i16t()
     // is_float
     teko::assert::is_true(is_float(Prim { kind = PrimKind::F64 }))
     teko::assert::is_true(is_float(Prim { kind = PrimKind::F32 }))
@@ -745,6 +794,73 @@ fn checker_enum_and_optional_patterns() {
     mut opt_arms: []parser::Arm = teko::list::push(teko::list::empty(), null_arm)
     opt_arms = teko::list::push(opt_arms, bind_arm)
     teko::assert::is_true(exhaustive(opt_arms, opt_i64, empty_table(), ""))
+}
+
+/** foreach_placeholder_resolves_to_real_named_bind — resolve_foreach_arm completes the for-each
+    desugar's placeholder (an empty-type_name BindPattern, unreachable from user source since `_ as
+    x` is a parse error) into a REAL `T as x` bind — the pre-existing named-bind mechanism, unchanged
+    (#517). A non-placeholder arm (the `null => break` arm, or an ordinary user pattern) passes
+    through resolve_foreach_arm untouched, and resolve_foreach_placeholders restores an unmodified
+    exhaustive()'s view of the completed arm list to the SAME shape an ordinary, hand-written
+    `null => …; i64 as x => …` match already achieves. */
+#test
+fn foreach_placeholder_resolves_to_real_named_bind() {
+    let opt_i64 = Optional { inner = i64t() }
+    let placeholder = parser::BindPattern { type_name = parser::Path { segments = teko::list::empty() }; has_binding = true; binding = "_tk_elem_L1C1"; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    let resolved = match resolve_foreach_arm(arm_of(placeholder), opt_i64) { parser::Arm as a => a; error => { teko::assert::is_true(false); return } }
+    match resolved.pattern {
+        parser::BindPattern as bp => {
+            teko::assert::is_true(bp.type_name.segments.len == 1)
+            teko::assert::is_true(bp.type_name.segments[0].name == "i64")
+            teko::assert::is_true(bp.has_binding)
+            teko::assert::is_true(bp.binding == "_tk_elem_L1C1")
+        }
+        _ => teko::assert::is_true(false)
+    }
+    let null_a = arm_of(parser::NullPattern { })
+    let null_out = match resolve_foreach_arm(null_a, opt_i64) { parser::Arm as a => a; error => { teko::assert::is_true(false); return } }
+    match null_out.pattern { parser::NullPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    mut placeholder_arms: []parser::Arm = teko::list::push(teko::list::empty(), null_a)
+    placeholder_arms = teko::list::push(placeholder_arms, arm_of(placeholder))
+    let rarms = match resolve_foreach_placeholders(placeholder_arms, opt_i64) { []parser::Arm as a => a; error => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(exhaustive(rarms, opt_i64, empty_table(), ""))
+}
+
+/** foreach_elem_arm_typing_and_dispatch — type_match_arm routes a placeholder arm through
+    type_foreach_elem_arm (binds the element directly, types the body against it, honors/rejects a
+    `when` guard exactly like an ordinary arm) and routes any other arm through the unmodified
+    type_arm (#517). */
+#test
+fn foreach_elem_arm_typing_and_dispatch() {
+    let opt_i64 = Optional { inner = i64t() }
+    let placeholder = parser::BindPattern { type_name = parser::Path { segments = teko::list::empty() }; has_binding = true; binding = "_tk_elem_L2C2"; is_slice = false; slice_type = null; type_args = teko::list::empty() }
+    let ph_arm = parser::Arm { pattern = placeholder; has_when = false; guard = e_num(0); body = one_stmt(e_var("_tk_elem_L2C2")) }
+    let typed = match type_match_arm(ph_arm, opt_i64, empty_env(), empty_table()) { TArm as a => a; error => { teko::assert::is_true(false); return } }
+    match typed.pattern { parser::BindPattern as bp => teko::assert::is_true(bp.type_name.segments[0].name == "i64"); _ => teko::assert::is_true(false) }
+    teko::assert::is_true(typed.body.len == 1)
+    let ph_guarded = parser::Arm { pattern = placeholder; has_when = true; guard = ek(parser::BoolLit { value = true }); body = one_stmt(e_var("_tk_elem_L2C2")) }
+    match type_match_arm(ph_guarded, opt_i64, empty_env(), empty_table()) { TArm => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let ph_bad_guard = parser::Arm { pattern = placeholder; has_when = true; guard = e_num(1); body = one_stmt(e_var("_tk_elem_L2C2")) }
+    match type_match_arm(ph_bad_guard, opt_i64, empty_env(), empty_table()) { TArm => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    match type_match_arm(arm_of(parser::WildcardPattern { }), i64t(), empty_env(), empty_table()) { TArm => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/** elem_type_name_covers_all_shapes — every realistic for-each element type resolves to its bare
+    runtime name (byte/char/str/a named struct's own last segment); an unnameable shape (`void`, a
+    representative non-nameable case reaching the wildcard arm) is a clean internal error (#517).
+    Deliberately does NOT probe `Slice`/`Optional`/`Reference` as a DIRECT `elem_type_name`
+    argument — a documented, PRE-EXISTING VM-only interpreter divergence (unrelated to this
+    function's own logic; confirmed present on the unmodified pre-#517 `checker::Type` match
+    machinery too) crashes when one of those single-recursive-field `Type` cases is passed as a
+    match subject; `void`/`byte`/`char`/`str` and a named struct are unaffected and exercise the
+    SAME wildcard arm any other unhandled case would. */
+#test
+fn elem_type_name_covers_all_shapes() {
+    match elem_type_name(Byte { }) { str as s => teko::assert::is_true(s == "byte"); error => teko::assert::is_true(false) }
+    match elem_type_name(Char { }) { str as s => teko::assert::is_true(s == "char"); error => teko::assert::is_true(false) }
+    match elem_type_name(Str { }) { str as s => teko::assert::is_true(s == "str"); error => teko::assert::is_true(false) }
+    match elem_type_name(Named { name = "loop_foreach_destructure::Pair" }) { str as s => teko::assert::is_true(s == "Pair"); error => teko::assert::is_true(false) }
+    match elem_type_name(Void { }) { str => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +1003,20 @@ fn checker_label_surface() {
     let e = error { message = "test error" }
     let surfaced = surface_at("test.tks", 3, 7, e)
     teko::assert::is_true(teko::str::contains(surfaced.message, "test.tks"))
+}
+
+/** loop_label_must_be_upper_snake — check_labels rejects a lowercase loop label with the
+    UPPER_SNAKE diagnostic and accepts an UPPER_SNAKE one (#517 checker-enforced format). */
+#test
+fn loop_label_must_be_upper_snake() {
+    let empty_body: []TStatement = teko::list::empty()
+    let bad = teko::list::push(teko::list::empty(), TLoopStmt { label = "outer"; init = teko::list::empty(); body = empty_body })
+    let rbad = check_labels(bad, teko::list::empty(), false, teko::list::empty())
+    teko::assert::is_true(rbad.failed)
+    teko::assert::is_true(teko::str::contains(rbad.message, "UPPER_SNAKE"))
+    let good = teko::list::push(teko::list::empty(), TLoopStmt { label = "OUTER"; init = teko::list::empty(); body = empty_body })
+    let rgood = check_labels(good, teko::list::empty(), false, teko::list::empty())
+    teko::assert::is_false(rgood.failed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1606,7 +1736,7 @@ fn mono_walk_covers_node_kinds() {
     body = teko::list::push(body, texpr_stmt(genstamp))
     mut loopbody: []TStatement = teko::list::push(teko::list::empty(), TBreakStmt { label = "" })
     loopbody = teko::list::push(loopbody, TContinueStmt { label = "" })
-    body = teko::list::push(body, TLoopStmt { label = ""; body = loopbody })
+    body = teko::list::push(body, TLoopStmt { label = ""; init = teko::list::empty(); body = loopbody })
     body = teko::list::push(body, TDeferStmt { body = teko::list::push(teko::list::empty(), texpr_stmt(tnum(0))) })
     body = teko::list::push(body, treturn(tnum(0)))
 
@@ -1765,7 +1895,7 @@ fn block_local_read_only_inside_block_is_block_local() {
     mut loopbody: []TStatement = teko::list::push(teko::list::empty(), binding)
     loopbody = teko::list::push(loopbody, t_let("g", t_field_i64("n", "val")))   // let g = n.val (scalar copy)
     loopbody = teko::list::push(loopbody, TBreakStmt { label = "" })
-    let loopstmt = TLoopStmt { label = ""; body = loopbody }
+    let loopstmt = TLoopStmt { label = ""; init = teko::list::empty(); body = loopbody }
     mut body: []TStatement = teko::list::push(teko::list::empty(), t_let("t", t_node_init(tnum(0))))
     body = teko::list::push(body, loopstmt)
     body = teko::list::push(body, treturn(t_field_i64("t", "val")))
@@ -1783,7 +1913,7 @@ fn block_local_read_outside_block_is_not_block_local() {
     mut loopbody: []TStatement = teko::list::push(teko::list::empty(), binding)
     loopbody = teko::list::push(loopbody, t_let("g", t_field_i64("n", "val")))
     loopbody = teko::list::push(loopbody, TBreakStmt { label = "" })
-    let loopstmt = TLoopStmt { label = ""; body = loopbody }
+    let loopstmt = TLoopStmt { label = ""; init = teko::list::empty(); body = loopbody }
     mut body: []TStatement = teko::list::push(teko::list::empty(), loopstmt)
     body = teko::list::push(body, treturn(t_field_i64("n", "val")))   // reads `n` OUTSIDE the loop
     let f = plainfn("f", i64t(), body)
@@ -1800,7 +1930,7 @@ fn block_local_assigned_to_outer_var_is_not_block_local() {
     mut loopbody: []TStatement = teko::list::push(teko::list::empty(), cur)
     loopbody = teko::list::push(loopbody, TAssign { kind = parser::AssignKind::Simple; name = "acc"; op = lexer::TokenKind::Assign; bound = Named { name = "Node" }; value = tvar("cur", Named { name = "Node" }); deref = false; target = no_texpr() })
     loopbody = teko::list::push(loopbody, TBreakStmt { label = "" })
-    let loopstmt = TLoopStmt { label = ""; body = loopbody }
+    let loopstmt = TLoopStmt { label = ""; init = teko::list::empty(); body = loopbody }
     mut body: []TStatement = teko::list::push(teko::list::empty(), t_let("acc", t_node_init(tnum(0))))
     body = teko::list::push(body, loopstmt)
     body = teko::list::push(body, treturn(t_field_i64("acc", "val")))

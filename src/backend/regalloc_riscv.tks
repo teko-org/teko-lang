@@ -1,0 +1,903 @@
+/**
+ * NumberedInstRiscv — one `MInstRiscv` tagged with its linear program point and
+ * its source block id, the RISC-V mirror of the neutral `NumberedInst` (which
+ * wraps an arm64 `MInst`) and of `NumberedInstX86`. The coordinate system every
+ * RISC-V liveness pass indexes by: points are dense and increase in RPO block
+ * order. Only the wrapped instruction type is ISA-specific — the interval/scan
+ * machinery it feeds is register-abstract and single-sourced (§5.1).
+ *
+ * @since #387 B2-4
+ */
+type NumberedInstRiscv = struct {
+    /**
+     * point — the instruction's linear program point (0-based, RPO block order).
+     */
+    point: u32
+    /**
+     * block_id — the `MBlockRiscv` this instruction was flattened from.
+     */
+    block_id: u32
+    /**
+     * inst — the RISC-V machine instruction at this point.
+     */
+    inst: MInstRiscv
+}
+
+/**
+ * inst_regs_riscv — decompose one `MInstRiscv` into its def/use registers, the
+ * RISC-V mirror of the neutral `inst_regs` over the 16-case `MInstRiscv` variant
+ * (`minst_riscv.tks:442`). Feeds the SAME register-abstract interval/scan core
+ * the arm64 and x86 walks feed, so the def/use table is the single source of
+ * truth both `compute_intervals_riscv` and `rewrite_inst_riscv` read.
+ *
+ * RISC-V is the SIMPLEST of the three shells, because its isel is clean
+ * three-address: the register-register ALU ops (`MAluRRiscv`), the
+ * register-immediate ops (`MAluIRiscv`), and the set-less-than (`MSltRiscv`) all
+ * report the CLEAN `ir_def_use(dst, [srcs])` — the destination is a pure def,
+ * NOT also a use, so there is NO x86-style two-address `ir_def_use(dst, [dst,
+ * src])` tie. The M-extension division/remainder (`Div`/`Divu`/`Rem`/`Remu`)
+ * ride the ordinary three-register `MAluRRiscv` case, so — UNLIKE x86's
+ * `MDivSeqX86`, which reports `ir_call` to model the fixed `RAX`/`RDX` clobber —
+ * a RISC-V divide is NOT modelled as a call: it is a plain three-address def
+ * with no fixed register and no clobber.
+ *
+ * `MCallRiscv`/`MCallIndRiscv` report `ir_call` (the standard call-clobber
+ * contract, so a value live across the call avoids caller-saved a0-a7/t0-t6);
+ * `MLiRiscv`/`MLuiRiscv`/`MAuipcRiscv`/`MLlaRiscv`/`MFrameAddrRiscv` report a
+ * plain def; `MStoreRiscv`/`MBranchRiscv` report uses-only (no def);
+ * `MJalRiscv`/`MRetRiscv` touch no allocatable register.
+ *
+ * @param MInstRiscv inst  the instruction to decompose
+ * @return InstRegs  its def/use decomposition (the neutral `InstRegs`, reused)
+ */
+fn inst_regs_riscv(inst: MInstRiscv) -> InstRegs {
+    match inst {
+        MLiRiscv as x => ir_def(x.dst)
+        MLuiRiscv as x => ir_def(x.dst)
+        MAuipcRiscv as x => ir_def(x.dst)
+        MAluRRiscv as x => ir_def_use(x.dst, two_regs(x.a, x.b))
+        MAluIRiscv as x => ir_def_use(x.dst, one_reg(x.a))
+        MSltRiscv as x => ir_def_use(x.dst, two_regs(x.a, x.b))
+        MLoadRiscv as x => ir_def_use(x.dst, one_reg(x.mem.base))
+        MStoreRiscv as x => ir_use(two_regs(x.src, x.mem.base))
+        MBranchRiscv as x => ir_use(two_regs(x.a, x.b))
+        MJalRiscv => ir_none()
+        MJalrRiscv as x => ir_def_use(x.dst, one_reg(x.base))
+        MCallRiscv as x => ir_call(x.ret_reg, x.has_result, x.uses)
+        MCallIndRiscv as x => ir_call(x.ret_reg, x.has_result, cons_reg(x.target, x.uses))
+        MLlaRiscv as x => ir_def(x.dst)
+        MFrameAddrRiscv as x => ir_def(x.dst)
+        MRetRiscv => ir_none()
+    }
+}
+
+/**
+ * is_terminator_riscv — whether `inst` ends a block: an `MRetRiscv`, an
+ * unconditional `MJalRiscv`, or a fused conditional `MBranchRiscv` (the RISC-V
+ * mirror of the neutral `is_terminator`). An `MJalrRiscv` is an indirect jump
+ * with no static target and never terminates an isel block, so it is not counted
+ * here.
+ *
+ * @param MInstRiscv inst  the instruction
+ * @return bool  true iff it is a terminator
+ */
+fn is_terminator_riscv(inst: MInstRiscv) -> bool {
+    match inst {
+        MRetRiscv => true
+        MJalRiscv => true
+        MBranchRiscv => true
+        _ => false
+    }
+}
+
+/**
+ * terminator_target_riscv — the machine-block a branch/jump transfers to
+ * (`MBranchRiscv` taken edge / `MJalRiscv` unconditional edge), or `has = false`
+ * for any other instruction (the RISC-V mirror of the neutral
+ * `terminator_target`; `MRetRiscv` names no target). Reuses the neutral
+ * `TargetOpt`.
+ *
+ * @param MInstRiscv inst  the instruction
+ * @return TargetOpt  its branch target, or none
+ */
+fn terminator_target_riscv(inst: MInstRiscv) -> TargetOpt {
+    match inst {
+        MBranchRiscv as x => TargetOpt { has = true; target = x.target }
+        MJalRiscv as x => TargetOpt { has = true; target = x.target }
+        _ => TargetOpt { has = false; target = 0 }
+    }
+}
+
+/**
+ * block_insts_of_riscv — the instruction list of `f`'s block with id `id`, or
+ * the empty list if no such block (a defensive default; every real target names
+ * a present block). The RISC-V mirror of the neutral `block_insts_of`.
+ *
+ * @param MFuncRiscv f  the function to search
+ * @param u32 id  the block id
+ * @return []MInstRiscv  the block's instructions, or empty
+ */
+fn block_insts_of_riscv(f: MFuncRiscv, id: u32) -> []MInstRiscv {
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        if f.blocks[i].id == id { return f.blocks[i].insts }
+        i++
+    }
+    teko::list::empty()
+}
+
+/**
+ * block_successors_riscv — the CFG successors of `f`'s block `id`: every
+ * distinct terminator target in the block (`MBranchRiscv` taken edge plus a
+ * trailing unconditional `MJalRiscv`), collected in instruction order for a
+ * deterministic RPO. The RISC-V mirror of the neutral `block_successors`. Reuses
+ * `add_unique_u32`.
+ *
+ * @param MFuncRiscv f  the function
+ * @param u32 id  the block whose successors to enumerate
+ * @return []u32  the distinct successor block ids, in terminator order
+ */
+fn block_successors_riscv(f: MFuncRiscv, id: u32) -> []u32 {
+    let insts = block_insts_of_riscv(f, id)
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= insts.len { break }
+        let t = terminator_target_riscv(insts[i])
+        if t.has { out = add_unique_u32(out, t.target) }
+        i++
+    }
+    out
+}
+
+/**
+ * rpo_visit_riscv — the post-order DFS step over `MFuncRiscv`'s CFG: enter `id`
+ * (once), recurse into every successor in order, then append `id` to the
+ * post-order. Threads the visited set + accumulator functionally so no block is
+ * entered twice. The RISC-V mirror of the neutral `rpo_visit`; reuses the
+ * neutral `RpoState`.
+ *
+ * @param MFuncRiscv f  the function whose CFG is walked
+ * @param u32 id  the block id to visit
+ * @param RpoState st  the visited set + post-order so far
+ * @return RpoState  the updated visited set + post-order
+ */
+fn rpo_visit_riscv(f: MFuncRiscv, id: u32, st: RpoState) -> RpoState {
+    if u32_in(st.visited, id) { return st }
+    let succs = block_successors_riscv(f, id)
+    mut cur = RpoState { visited = teko::list::push(st.visited, id); post = st.post }
+    mut i: u64 = 0
+    loop {
+        if i >= succs.len { break }
+        cur = rpo_visit_riscv(f, succs[i], cur)
+        i++
+    }
+    RpoState { visited = cur.visited; post = teko::list::push(cur.post, id) }
+}
+
+/**
+ * append_unvisited_riscv — `order` extended with any of `f`'s block ids not
+ * already present, in block-list order, so the numbering stays TOTAL: an
+ * unreachable block still receives program points (no vreg is left un-numbered).
+ * The RISC-V mirror of the neutral `append_unvisited`.
+ *
+ * @param MFuncRiscv f  the function
+ * @param []u32 order  the reachable-block order so far
+ * @return []u32  the order extended with any unreachable block ids
+ */
+fn append_unvisited_riscv(f: MFuncRiscv, order: []u32) -> []u32 {
+    mut out = order
+    mut i: u64 = 0
+    loop {
+        if i >= f.blocks.len { break }
+        let bid = f.blocks[i].id
+        if !u32_in(out, bid) { out = teko::list::push(out, bid) }
+        i++
+    }
+    out
+}
+
+/**
+ * rpo_block_order_riscv — the reverse-post-order block-id sequence of `f`, entry
+ * first: a topological linearization of the acyclic CFG so every def precedes
+ * all its uses (the #443 RPO lesson, mirrored). Unreachable blocks are appended
+ * last so the order covers every block. The RISC-V mirror of the neutral
+ * `rpo_block_order`; reuses `reverse_u32`.
+ *
+ * @param MFuncRiscv f  the selected function
+ * @return []u32  the RPO block-id order (entry first)
+ */
+fn rpo_block_order_riscv(f: MFuncRiscv) -> []u32 {
+    if f.blocks.len == 0 { return teko::list::empty() }
+    let entry = f.blocks[0].id
+    let st = rpo_visit_riscv(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() })
+    append_unvisited_riscv(f, reverse_u32(st.post))
+}
+
+/**
+ * reachable_blocks_riscv — the block ids reachable from `f`'s entry, via the
+ * same post-order DFS `rpo_block_order_riscv` walks. A block absent from this set
+ * is dead code (a `match`'s defensive fallback past an irrefutable final arm,
+ * which no branch targets); the back-edge test uses this set to EXCLUDE
+ * dead-block edges, since a dead block cannot form a loop the allocator must
+ * model (the #455 reachability lesson, mirrored). The RISC-V mirror of the
+ * neutral `reachable_blocks`.
+ *
+ * @param MFuncRiscv f  the selected function
+ * @return []u32  the entry-reachable block ids (the DFS-visited set)
+ */
+fn reachable_blocks_riscv(f: MFuncRiscv) -> []u32 {
+    if f.blocks.len == 0 { return teko::list::empty() }
+    let entry = f.blocks[0].id
+    rpo_visit_riscv(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() }).visited
+}
+
+/**
+ * number_insts_riscv — flatten `f`'s blocks into one linearly-numbered
+ * instruction stream in RPO block order, so every later pass (interval
+ * computation, the scan, the rewrite) indexes liveness by these dense points.
+ * The RISC-V mirror of the neutral `number_insts`, producing `NumberedInstRiscv`.
+ *
+ * @param MFuncRiscv f  the selected function
+ * @param []u32 order  the RPO block-id order (from `rpo_block_order_riscv`)
+ * @return []NumberedInstRiscv  the flattened, RPO-numbered stream
+ */
+fn number_insts_riscv(f: MFuncRiscv, order: []u32) -> []NumberedInstRiscv {
+    mut out: []NumberedInstRiscv = teko::list::empty()
+    mut p: u32 = 0
+    mut bi: u64 = 0
+    loop {
+        if bi >= order.len { break }
+        let bid = order[bi]
+        let insts = block_insts_of_riscv(f, bid)
+        mut ii: u64 = 0
+        loop {
+            if ii >= insts.len { break }
+            out = teko::list::push(out, NumberedInstRiscv { point = p; block_id = bid; inst = insts[ii] })
+            p = p + 1
+            ii++
+        }
+        bi++
+    }
+    out
+}
+
+/**
+ * collect_events_riscv — the raw def/use touches of the whole RISC-V stream, in
+ * program order (a def before its uses at a shared point). The RISC-V mirror of
+ * the neutral `collect_events`, driven by `inst_regs_riscv`; builds the neutral
+ * register-abstract `RegEvent` the interval passes consume.
+ *
+ * @param []NumberedInstRiscv stream  the numbered stream
+ * @return []RegEvent  every register touch
+ */
+fn collect_events_riscv(stream: []NumberedInstRiscv) -> []RegEvent {
+    mut out: []RegEvent = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        let ir = inst_regs_riscv(ni.inst)
+        if ir.has_def {
+            out = teko::list::push(out, RegEvent { reg = ir.def_reg; point = ni.point; is_def = true })
+        }
+        mut u: u64 = 0
+        loop {
+            if u >= ir.uses.len { break }
+            out = teko::list::push(out, RegEvent { reg = ir.uses[u]; point = ni.point; is_def = false })
+            u++
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * call_points_of_riscv — the program points of every call
+ * (`MCallRiscv`/`MCallIndRiscv`), the clobber boundaries a `crosses_call`
+ * interval avoids caller-saved registers over. UNLIKE x86 (whose `MDivSeqX86`
+ * also reports `is_call`), a RISC-V divide is an ordinary three-address def and
+ * is NOT a call point. The RISC-V mirror of the neutral `call_points_of`, driven
+ * by `inst_regs_riscv`.
+ *
+ * @param []NumberedInstRiscv stream  the numbered stream
+ * @return []u32  the call points
+ */
+fn call_points_of_riscv(stream: []NumberedInstRiscv) -> []u32 {
+    mut out: []u32 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        if inst_regs_riscv(stream[i].inst).is_call { out = teko::list::push(out, stream[i].point) }
+        i++
+    }
+    out
+}
+
+/**
+ * next_terminator_point_riscv — the smallest point at-or-after `from` whose
+ * instruction is a terminator (the result-pin extension target), or `from` if
+ * none follows. The RISC-V mirror of the neutral `next_terminator_point`, driven
+ * by `is_terminator_riscv`.
+ *
+ * @param []NumberedInstRiscv stream  the numbered stream
+ * @param u32 from  the def point to extend from
+ * @return u32  the terminator point, or `from`
+ */
+fn next_terminator_point_riscv(stream: []NumberedInstRiscv, from: u32) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.point >= from && is_terminator_riscv(ni.inst) { return ni.point }
+        i++
+    }
+    from
+}
+
+/**
+ * finalize_pin_riscv — close a physical pin interval, applying the result-pin
+ * extension: a def-started pin with no later use (its `end` equals its `start`)
+ * is extended to the next terminator so a result pin (the `a0` an
+ * `addi a0, v, 0` seeds before `ret`) lives to the `ret`. The RISC-V mirror of
+ * the neutral `finalize_pin`; reuses the neutral `mk_interval`.
+ *
+ * @param MReg r  the physical register
+ * @param u32 start  the pin's def/entry point
+ * @param u32 end  the pin's last use
+ * @param bool def_started  whether the pin was opened by a def
+ * @param []NumberedInstRiscv stream  the numbered stream (for pin extension)
+ * @param []u32 call_points  the call points (for `crosses_call`)
+ * @return LiveInterval  the finalized pin interval
+ */
+fn finalize_pin_riscv(r: MReg, start: u32, end: u32, def_started: bool, stream: []NumberedInstRiscv, call_points: []u32) -> LiveInterval {
+    let real_end = if def_started && end == start {
+        let term = next_terminator_point_riscv(stream, start)
+        if term > end { term } else { end }
+    } else {
+        end
+    }
+    mk_interval(r, start, real_end, true, call_points)
+}
+
+/**
+ * phys_intervals_riscv — a physical register's pin intervals: a physreg is
+ * reused (an arg pin at entry, a result pin at a use), so a def STARTS a fresh
+ * interval, a use before any def is entry-live from point 0, and a def-started
+ * pin with no later use is a result pin extended to its terminator. The RISC-V
+ * mirror of the neutral `phys_intervals`; reuses `reg_eq` and closes each
+ * interval through `finalize_pin_riscv`.
+ *
+ * @param []RegEvent events  every register touch (in program order)
+ * @param MReg r  the physical register
+ * @param []NumberedInstRiscv stream  the numbered stream (for pin extension)
+ * @param []u32 call_points  the call points (for `crosses_call`)
+ * @return []LiveInterval  its one-or-more pin intervals
+ */
+fn phys_intervals_riscv(events: []RegEvent, r: MReg, stream: []NumberedInstRiscv, call_points: []u32) -> []LiveInterval {
+    mut out: []LiveInterval = teko::list::empty()
+    mut have_open: bool = false
+    mut def_started: bool = false
+    mut cur_start: u32 = 0
+    mut cur_end: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= events.len { break }
+        let e = events[i]
+        if reg_eq(e.reg, r) {
+            if e.is_def {
+                if have_open { out = teko::list::push(out, finalize_pin_riscv(r, cur_start, cur_end, def_started, stream, call_points)) }
+                cur_start = e.point
+                cur_end = e.point
+                have_open = true
+                def_started = true
+            } else {
+                if have_open {
+                    if e.point > cur_end { cur_end = e.point }
+                } else {
+                    cur_start = 0
+                    cur_end = e.point
+                    have_open = true
+                    def_started = false
+                }
+            }
+        }
+        i++
+    }
+    if have_open { out = teko::list::push(out, finalize_pin_riscv(r, cur_start, cur_end, def_started, stream, call_points)) }
+    out
+}
+
+/**
+ * block_first_point_riscv — the smallest program point of any instruction in
+ * block `block_id` of the RISC-V stream, or 0 when absent. The stream is
+ * RPO-numbered, so this is the block's entry point (a loop header's `header_pt`).
+ * The RISC-V mirror of the neutral `block_first_point`.
+ *
+ * @param []NumberedInstRiscv stream  the RPO-numbered stream
+ * @param u32 block_id  the block whose first point to find
+ * @return u32  the block's smallest program point (0 if absent)
+ */
+fn block_first_point_riscv(stream: []NumberedInstRiscv, block_id: u32) -> u32 {
+    mut have: bool = false
+    mut best: u32 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        if ni.block_id == block_id {
+            if !have || ni.point < best { best = ni.point; have = true }
+        }
+        i++
+    }
+    best
+}
+
+/**
+ * natural_loops_riscv — every natural loop of the reachable RISC-V CFG, one per
+ * retreating (loop back-)edge (`pos(target) <= pos(source)` on an entry-reachable
+ * source): its target is the loop header and its source-branch point the latch.
+ * Dead-block sources are excluded (a dead edge is not a loop) and acyclic
+ * `if`/`match` nesting has no retreating edge, so the result is empty for the
+ * acyclic subset. The RISC-V mirror of the neutral `natural_loops`; feeds the
+ * shared `extend_over_loops`, superseding the back-edge honest-stop bool.
+ *
+ * @param []NumberedInstRiscv stream  the RPO-numbered stream
+ * @param []u32 order  the RPO block-id order
+ * @param []u32 reachable  the entry-reachable block ids
+ * @return []NaturalLoop  one loop span per retreating edge
+ */
+fn natural_loops_riscv(stream: []NumberedInstRiscv, order: []u32, reachable: []u32) -> []NaturalLoop {
+    mut out: []NaturalLoop = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stream.len { break }
+        let ni = stream[i]
+        let t = terminator_target_riscv(ni.inst)
+        if t.has && u32_in(reachable, ni.block_id) {
+            if block_pos(order, t.target) <= block_pos(order, ni.block_id) {
+                out = teko::list::push(out, NaturalLoop { header_pt = block_first_point_riscv(stream, t.target); latch_pt = ni.point })
+            }
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * compute_intervals_riscv — the liveness pass over the RISC-V stream: one walk
+ * driven by `inst_regs_riscv`, producing the virtual intervals to color and the
+ * fixed pin intervals to block (both the register-abstract `LiveInterval`,
+ * reused). The ISA-specific walk (events, call points, natural loops, pin
+ * extension) is mirrored; the register-abstract processing (`distinct_regs`,
+ * `virt_interval`, `extend_over_loops`) is reused so the subtle interval logic
+ * stays single-sourced. The naive virtual intervals are widened over every
+ * natural loop (§6.2), so header-live values survive the body across the
+ * back-edge — the loops the honest-stop once refused now allocate. The RISC-V
+ * mirror of the neutral `compute_intervals`.
+ *
+ * @param []NumberedInstRiscv stream  the RPO-numbered instruction stream
+ * @param []u32 order  the RPO block-id order (for the natural-loop test)
+ * @param []u32 reachable  the entry-reachable block ids (for the natural-loop test)
+ * @return IntervalSet | error  the computed intervals
+ */
+fn compute_intervals_riscv(stream: []NumberedInstRiscv, order: []u32, reachable: []u32) -> IntervalSet | error {
+    let events = collect_events_riscv(stream)
+    let regs = distinct_regs(events)
+    let cps = call_points_of_riscv(stream)
+    mut virt: []LiveInterval = teko::list::empty()
+    mut fixed: []LiveInterval = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= regs.len { break }
+        let r = regs[i]
+        if r.is_phys {
+            let pins = phys_intervals_riscv(events, r, stream, cps)
+            mut j: u64 = 0
+            loop {
+                if j >= pins.len { break }
+                fixed = teko::list::push(fixed, pins[j])
+                j++
+            }
+        } else {
+            virt = teko::list::push(virt, virt_interval(events, r, cps))
+        }
+        i++
+    }
+    virt = extend_over_loops(virt, natural_loops_riscv(stream, order, reachable), cps)
+    IntervalSet { virt = virt; fixed = fixed; call_points = cps }
+}
+
+/**
+ * map_minst_riscv — a copy of `inst` with every `MReg` field replaced through
+ * `table` (a flat per-case reconstruction over the 16-case variant, mirroring
+ * `inst_regs_riscv`'s dispatch, and the neutral `map_minst_regs`). `MCallRiscv`/
+ * `MCallIndRiscv` map their `uses` element-wise, their `ret_reg`, and (indirect)
+ * their `target`. This is the single point the RISC-V machine-IR's
+ * register-field shape is walked for rewriting — a missed case would leak a
+ * virtual register into the output, which `all_physical_riscv` catches. Reuses
+ * the neutral `subst_find`/`map_regs_list` (register-abstract) and the RISC-V
+ * constructors.
+ *
+ * @param MInstRiscv inst  the instruction to rewrite
+ * @param []SubstEntry table  the substitution table
+ * @return MInstRiscv  the rewritten instruction
+ */
+fn map_minst_riscv(inst: MInstRiscv, table: []SubstEntry) -> MInstRiscv {
+    match inst {
+        MLiRiscv as x => li_riscv(subst_find(table, x.dst), x.imm)
+        MLuiRiscv as x => lui_riscv(subst_find(table, x.dst), x.imm)
+        MAuipcRiscv as x => auipc_riscv(subst_find(table, x.dst), x.imm)
+        MAluRRiscv as x => alu_r_riscv(x.op, x.wide, subst_find(table, x.dst), subst_find(table, x.a), subst_find(table, x.b))
+        MAluIRiscv as x => alu_i_riscv(x.op, subst_find(table, x.dst), subst_find(table, x.a), x.imm)
+        MSltRiscv as x => slt_riscv(subst_find(table, x.dst), subst_find(table, x.a), subst_find(table, x.b), x.is_unsigned)
+        MLoadRiscv as x => load_riscv(x.size, x.sign, subst_find(table, x.dst), MMem { base = subst_find(table, x.mem.base); offset = x.mem.offset })
+        MStoreRiscv as x => store_riscv(x.size, subst_find(table, x.src), MMem { base = subst_find(table, x.mem.base); offset = x.mem.offset })
+        MBranchRiscv as x => branch_riscv(x.cond, subst_find(table, x.a), subst_find(table, x.b), x.target)
+        MJalRiscv as x => jal_riscv(x.target)
+        MJalrRiscv as x => jalr_riscv(subst_find(table, x.dst), subst_find(table, x.base), x.offset)
+        MCallRiscv as x => call_riscv(x.sym, map_regs_list(x.uses, table), subst_find(table, x.ret_reg), x.has_result, x.variadic)
+        MCallIndRiscv as x => call_ind_riscv(subst_find(table, x.target), map_regs_list(x.uses, table), subst_find(table, x.ret_reg), x.has_result)
+        MLlaRiscv as x => lla_riscv(subst_find(table, x.dst), x.sym)
+        MFrameAddrRiscv as x => frame_addr_riscv(subst_find(table, x.dst), x.slot)
+        MRetRiscv => ret_riscv()
+    }
+}
+
+/**
+ * minst_riscv_single — a one-element RISC-V instruction list (the RISC-V mirror
+ * of the neutral `minst_single`).
+ *
+ * @param MInstRiscv x  the instruction
+ * @return []MInstRiscv  the singleton list
+ */
+fn minst_riscv_single(x: MInstRiscv) -> []MInstRiscv {
+    teko::list::push(teko::list::empty(), x)
+}
+
+/**
+ * minst_riscv_cat — `a` followed by every element of `b` (the RISC-V mirror of
+ * the neutral `minst_cat`).
+ *
+ * @param []MInstRiscv a  the prefix list
+ * @param []MInstRiscv b  the suffix list
+ * @return []MInstRiscv  the concatenation
+ */
+fn minst_riscv_cat(a: []MInstRiscv, b: []MInstRiscv) -> []MInstRiscv {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * emit_gpr_reload_riscv — the two-instruction GPR spill reload into `sv`:
+ * compute the slot address into `sv` (`addi sv, sp, off` via `MFrameAddrRiscv`),
+ * then load the slot's doubleword into `sv` (base == dst is legal). Both the
+ * address and the value live in `sv`. RISC-V's only addressing mode is
+ * base+imm12, so — like x86 — the symbolic frame slot is materialized into a
+ * register first, then dereferenced. The RISC-V mirror of the neutral
+ * `emit_gpr_reload`, over `frame_addr_riscv`/`load_riscv`.
+ *
+ * @param MReg sv  the GPR scratch to reload into
+ * @param u32 slot  the absolute frame slot
+ * @return []MInstRiscv  the reload sequence
+ */
+fn emit_gpr_reload_riscv(sv: MReg, slot: u32) -> []MInstRiscv {
+    let fa = frame_addr_riscv(sv, slot)
+    let ld = load_riscv(MMemSizeRiscv::D, false, sv, MMem { base = sv; offset = 0 to i32 })
+    teko::list::push(minst_riscv_single(fa), ld)
+}
+
+/**
+ * emit_gpr_store_riscv — the two-instruction GPR spill store of the value
+ * already in `dsv`: compute the slot address into a distinct scratch `asv`
+ * (`addi asv, sp, off`), then store `dsv`'s doubleword to `0(asv)` (`sd`). The
+ * RISC-V mirror of the neutral `emit_gpr_store`, over
+ * `frame_addr_riscv`/`store_riscv`.
+ *
+ * @param MReg dsv  the GPR scratch holding the value to store
+ * @param MReg asv  a distinct GPR scratch for the slot address
+ * @param u32 slot  the absolute frame slot
+ * @return []MInstRiscv  the store sequence
+ */
+fn emit_gpr_store_riscv(dsv: MReg, asv: MReg, slot: u32) -> []MInstRiscv {
+    let fa = frame_addr_riscv(asv, slot)
+    let st = store_riscv(MMemSizeRiscv::D, dsv, MMem { base = asv; offset = 0 to i32 })
+    teko::list::push(minst_riscv_single(fa), st)
+}
+
+/**
+ * UseAccRiscv — the fold state while substituting a RISC-V instruction's use
+ * operands: the substitution table, the accumulated reload sequence (as
+ * `MInstRiscv`), and the next reload-scratch index. The RISC-V mirror of the
+ * neutral `UseAcc` (whose `reloads` are arm64 `MInst`, so the type is mirrored,
+ * not reused).
+ *
+ * @since #387 B2-4
+ */
+type UseAccRiscv = struct {
+    /**
+     * table — the substitution entries so far.
+     */
+    table: []SubstEntry
+    /**
+     * reloads — the reload instructions so far (emitted before the inst).
+     */
+    reloads: []MInstRiscv
+    /**
+     * nth — the next spill-reload scratch index.
+     */
+    nth: u32
+}
+
+/**
+ * add_use_subst_riscv — the substitution table extended for one instruction
+ * operand use `u`: a physical pin or an already-mapped id is left as-is; an
+ * `InReg` use maps to its color; a `Spilled` GPR use draws the next reload
+ * scratch (t4/t5/t6), whose reload is appended. FPR spills are ruled out
+ * upstream (`detect_fpr_spill_riscv`), so the scratch is always GPR. The RISC-V
+ * mirror of the neutral `add_use_subst`; reuses
+ * `subst_has`/`assign_lookup`/`spill_scratch`.
+ *
+ * @param AbiDescriptor abi  the register file (for spill scratch)
+ * @param ScanResult sr  the allocation
+ * @param MReg u  the use operand
+ * @param u32 frame_base  the first spill frame slot index
+ * @param UseAccRiscv acc  the table/reloads/counter so far
+ * @return UseAccRiscv  the updated accumulator
+ */
+fn add_use_subst_riscv(abi: AbiDescriptor, sr: ScanResult, u: MReg, frame_base: u32, acc: UseAccRiscv) -> UseAccRiscv {
+    if u.is_phys { return acc }
+    if subst_has(acc.table, u.id) { return acc }
+    let la = assign_lookup(sr, u.id)
+    if !la.found { return acc }
+    if la.is_spill {
+        let sv = spill_scratch(abi, MRegClass::GPR, acc.nth)
+        let reloads2 = minst_riscv_cat(acc.reloads, emit_gpr_reload_riscv(sv, frame_base + la.slot))
+        let table2 = teko::list::push(acc.table, SubstEntry { vid = u.id; to = sv })
+        return UseAccRiscv { table = table2; reloads = reloads2; nth = acc.nth + 1 }
+    }
+    let table3 = teko::list::push(acc.table, SubstEntry { vid = u.id; to = preg(la.phys, u.reg_class) })
+    UseAccRiscv { table = table3; reloads = acc.reloads; nth = acc.nth }
+}
+
+/**
+ * rewrite_inst_riscv — expand one instruction into its final physical sequence:
+ * the reloads for its spilled uses, the register-substituted instruction, and
+ * the store for a spilled def. Non-spilled operands map to their `InReg`
+ * physreg; physical pins pass through. Assumes GPR-only spills (guaranteed by
+ * `regalloc_func_riscv`'s `detect_fpr_spill_riscv` pre-check). The RISC-V mirror
+ * of the neutral `rewrite_inst`.
+ *
+ * @param AbiDescriptor abi  the register file (for spill scratch)
+ * @param ScanResult sr  the allocation
+ * @param MInstRiscv inst  the instruction to rewrite
+ * @param u32 frame_base  the first spill frame slot index
+ * @return []MInstRiscv  the reloads ++ the rewritten instruction ++ the store
+ */
+fn rewrite_inst_riscv(abi: AbiDescriptor, sr: ScanResult, inst: MInstRiscv, frame_base: u32) -> []MInstRiscv {
+    let ir = inst_regs_riscv(inst)
+    mut acc = UseAccRiscv { table = teko::list::empty(); reloads = teko::list::empty(); nth = 0 to u32 }
+    mut ui: u64 = 0
+    loop {
+        if ui >= ir.uses.len { break }
+        acc = add_use_subst_riscv(abi, sr, ir.uses[ui], frame_base, acc)
+        ui++
+    }
+    mut table = acc.table
+    mut stores: []MInstRiscv = teko::list::empty()
+    if ir.has_def {
+        let d = ir.def_reg
+        if !d.is_phys {
+            let la = assign_lookup(sr, d.id)
+            if la.found {
+                if la.is_spill {
+                    let dsv = spill_scratch(abi, MRegClass::GPR, 0 to u32)
+                    let asv = spill_scratch(abi, MRegClass::GPR, 1 to u32)
+                    if !subst_has(table, d.id) {
+                        table = teko::list::push(table, SubstEntry { vid = d.id; to = dsv })
+                    }
+                    stores = emit_gpr_store_riscv(dsv, asv, frame_base + la.slot)
+                } else {
+                    if !subst_has(table, d.id) {
+                        table = teko::list::push(table, SubstEntry { vid = d.id; to = preg(la.phys, d.reg_class) })
+                    }
+                }
+            }
+        }
+    }
+    let mapped = map_minst_riscv(inst, table)
+    minst_riscv_cat(minst_riscv_cat(acc.reloads, minst_riscv_single(mapped)), stores)
+}
+
+/**
+ * rewrite_block_riscv — one block with every instruction rewritten and
+ * flattened; block params are carried through unchanged (they are merge
+ * metadata, not an executed operand). The RISC-V mirror of the neutral
+ * `rewrite_block`.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param ScanResult sr  the allocation
+ * @param MBlockRiscv b  the block to rewrite
+ * @param u32 frame_base  the first spill frame slot index
+ * @return MBlockRiscv  the rewritten block
+ */
+fn rewrite_block_riscv(abi: AbiDescriptor, sr: ScanResult, b: MBlockRiscv, frame_base: u32) -> MBlockRiscv {
+    mut insts: []MInstRiscv = teko::list::empty()
+    mut ii: u64 = 0
+    loop {
+        if ii >= b.insts.len { break }
+        insts = minst_riscv_cat(insts, rewrite_inst_riscv(abi, sr, b.insts[ii], frame_base))
+        ii++
+    }
+    MBlockRiscv { id = b.id; params = b.params; insts = insts }
+}
+
+/**
+ * rewrite_func_riscv — rebuild every block from its rewritten instruction
+ * sequences and finalize the frame (one spill slot per `Spilled`), yielding an
+ * `MFuncRiscv` whose every operand is physical. The RISC-V mirror of the neutral
+ * `rewrite_func`; reuses `count_spills`/`append_spill_slots`.
+ *
+ * @param AbiDescriptor abi  the register file
+ * @param MFuncRiscv f  the selected function
+ * @param ScanResult sr  the allocation
+ * @return MFuncRiscv  the fully-colored function
+ */
+fn rewrite_func_riscv(abi: AbiDescriptor, f: MFuncRiscv, sr: ScanResult) -> MFuncRiscv {
+    let frame_base = f.frame.len to u32
+    let frame = append_spill_slots(abi, f.frame, count_spills(sr))
+    mut blocks: []MBlockRiscv = teko::list::empty()
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        blocks = teko::list::push(blocks, rewrite_block_riscv(abi, sr, f.blocks[bi], frame_base))
+        bi++
+    }
+    MFuncRiscv { symbol = f.symbol; blocks = blocks; frame = frame }
+}
+
+/**
+ * all_physical_riscv — whether every `MInstRiscv` operand of `f` is a physical
+ * register (the all-physical invariant: no virtual register survived the
+ * rewrite). Block params are metadata, not executed operands, and are not
+ * checked. The RISC-V mirror of the neutral `all_physical`, driven by
+ * `inst_regs_riscv`.
+ *
+ * @param MFuncRiscv f  the colored function
+ * @return bool  true iff fully physical
+ */
+pub fn all_physical_riscv(f: MFuncRiscv) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            let ir = inst_regs_riscv(b.insts[ii])
+            if ir.has_def {
+                if !ir.def_reg.is_phys { return false }
+            }
+            mut ui: u64 = 0
+            loop {
+                if ui >= ir.uses.len { break }
+                if !ir.uses[ui].is_phys { return false }
+                ui++
+            }
+            ii++
+        }
+        bi++
+    }
+    true
+}
+
+/**
+ * inst_has_fpr_spill_riscv — whether any operand of `inst` is an FPR spill. The
+ * RISC-V mirror of the neutral `inst_has_fpr_spill`, driven by
+ * `inst_regs_riscv`; reuses the register-abstract `reg_is_fpr_spill`.
+ *
+ * @param ScanResult sr  the allocation
+ * @param MInstRiscv inst  the instruction to scan
+ * @return bool  true iff an FPR spill operand is present
+ */
+fn inst_has_fpr_spill_riscv(sr: ScanResult, inst: MInstRiscv) -> bool {
+    let ir = inst_regs_riscv(inst)
+    if ir.has_def {
+        if reg_is_fpr_spill(sr, ir.def_reg) { return true }
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= ir.uses.len { break }
+        if reg_is_fpr_spill(sr, ir.uses[i]) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * detect_fpr_spill_riscv — whether allocating `f` under `sr` spills any FPR
+ * value. B2 lowers GPR spills only (like A3 and B1); an FPR spill is a NAMED
+ * honest-stop (`regalloc_func_riscv` returns an error), inherited from A3's
+ * `A3-fpr-spill`. The RISC-V mirror of the neutral `detect_fpr_spill`.
+ *
+ * @param ScanResult sr  the allocation
+ * @param MFuncRiscv f  the function
+ * @return bool  true iff any FPR value is spilled
+ */
+fn detect_fpr_spill_riscv(sr: ScanResult, f: MFuncRiscv) -> bool {
+    mut bi: u64 = 0
+    loop {
+        if bi >= f.blocks.len { break }
+        let b = f.blocks[bi]
+        mut ii: u64 = 0
+        loop {
+            if ii >= b.insts.len { break }
+            if inst_has_fpr_spill_riscv(sr, b.insts[ii]) { return true }
+            ii++
+        }
+        bi++
+    }
+    false
+}
+
+/**
+ * regalloc_func_riscv — allocate one RISC-V function end-to-end: RPO-order,
+ * number, compute intervals, scan (the SHARED `linear_scan`), rewrite. A real
+ * `loop` back-edge now ALLOCATES (§6.2 LANDED, #389 F2): `compute_intervals_riscv`
+ * widens every interval live at a loop header to reach its latch (the shared
+ * `extend_over_loops`), so a loop-carried value survives the whole body across
+ * the back-edge. Still returns a NAMED honest-stop on an FPR-value spill (B2
+ * lowers GPR spills only). The RPO order is computed once and threaded so the
+ * numbering and the natural-loop detection share one linearization (#443); the
+ * entry-reachable set is threaded beside it so a dead-block edge is never
+ * mistaken for a loop (#455). The RISC-V mirror of the neutral `regalloc_func`.
+ *
+ * @param AbiDescriptor abi  the register file (`riscv64_lp64d()`)
+ * @param MFuncRiscv f  the selected function (virtual MRegs + LP64D pins)
+ * @return MFuncRiscv | error  the fully-colored function, or a named honest-stop
+ */
+pub fn regalloc_func_riscv(abi: AbiDescriptor, f: MFuncRiscv) -> MFuncRiscv | error {
+    let order = rpo_block_order_riscv(f)
+    let numbered = number_insts_riscv(f, order)
+    let ivals = match compute_intervals_riscv(numbered, order, reachable_blocks_riscv(f)) {
+        IntervalSet as s => s
+        error as e => return e
+    }
+    let sr = linear_scan(abi, ivals)
+    if detect_fpr_spill_riscv(sr, f) {
+        return error { message = "regalloc riscv64: FPR-value spill not yet supported (B2 lowers GPR spills only; the inherited A3-fpr-spill deferral)" }
+    }
+    rewrite_func_riscv(abi, f, sr)
+}
+
+/**
+ * regalloc_module_riscv — allocate every function of `m`, carrying the rodata /
+ * globals / layouts tables through unchanged (B2 touches only registers +
+ * frame, exactly as `select_module_riscv` carries them). The RISC-V mirror of
+ * the neutral `regalloc_module`.
+ *
+ * @param AbiDescriptor abi  the register file to allocate from (`riscv64_lp64d()`)
+ * @param MModuleRiscv m  the selected module
+ * @return MModuleRiscv | error  the colored module, or the first function's error
+ */
+pub fn regalloc_module_riscv(abi: AbiDescriptor, m: MModuleRiscv) -> MModuleRiscv | error {
+    mut funcs: []MFuncRiscv = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.funcs.len { break }
+        let rf = match regalloc_func_riscv(abi, m.funcs[i]) {
+            MFuncRiscv as g => g
+            error as e => return e
+        }
+        funcs = teko::list::push(funcs, rf)
+        i++
+    }
+    MModuleRiscv { funcs = funcs; rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+}

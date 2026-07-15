@@ -1,21 +1,18 @@
 name: Native Build & Test
 
-# CI runs on PULL REQUESTS (the per-PR gate) plus a nightly SCHEDULE (the VM-regression lane).
+# CI runs on PULL REQUESTS (the per-PR gate) plus PUSHES to remodel/** integration branches.
 # Branch protection requires the PR checks green before a PR can merge, so every commit that
 # reaches main was already 100% green — re-running the full suite on the post-merge push would
 # only duplicate that work and burn pipeline minutes. The release trusts this and builds from a
 # main tag WITHOUT re-validating (see release.yml). chore/reboot stays listed so PRs targeting the
-# integration branch still get checks (#54). The `schedule:` trigger drives ONLY vm-gate-nightly
-# (#168): since the native gate became the default per-PR gate, the VM gate runs once nightly over
-# the full corpus to keep VM regressions caught without paying the ~1.5 GB VM-gate memory per PR.
+# integration branch still get checks (#54). The nightly VM-regression SCHEDULE trigger is retired
+# with the VM CI lane itself (issue #524) — native is now the sole engine, gated on every PR.
 on:
   pull_request:
-    branches: [main, master, chore/reboot, 'remodel/**']
+    branches: [main, master, chore/reboot, 'remodel/**', 'fix/issue-*']
   push:
     branches: ['remodel/**']
     paths-ignore: ['**.md', 'docs/**']
-  schedule:
-    - cron: '0 6 * * *'
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
@@ -23,27 +20,60 @@ permissions:
 
 jobs:
   # ── path filter ──────────────────────────────────────────────────────────────
-  # PR-only: the paths-filter needs a pull_request context. On the nightly `schedule`
-  # trigger this job is skipped, so every per-PR job (needs: changes) skips too, and
-  # only vm-gate-nightly (which does NOT need changes) runs.
+  # PR-only: the paths-filter needs a pull_request context, so this job — and every
+  # job that `needs: changes` — only runs on pull_request events.
   changes:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     outputs:
-      run: ${{ steps.filter.outputs.run }}
+      run: ${{ steps.decide.outputs.run }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
         with:
+          list-files: shell
           filters: |
             run:
               - 'src/**'
               - 'tests/**'
               - 'examples/**'
               - 'scripts/**'
-              - 'CMakeLists.txt'
               - '.github/workflows/native.yml'
+
+      # Docs-only guard (owner ruling 2026-07-11): the allowlist globs (src/**, tests/**, …)
+      # also match Markdown that lives INSIDE those trees (e.g. src/checker/capability_audit.md),
+      # so a pure-documentation edit would otherwise trigger the whole heavy gate. Skip only when
+      # EVERY matched file is *.md — any single non-Markdown match still forces the full run, so
+      # this can never hide a real source change from the gate (fail-safe: it can under-skip, never
+      # over-skip). A trigger-level `paths-ignore` is deliberately NOT used here: the `gate` job is
+      # a REQUIRED status check, and skipping the whole workflow would leave it never reported →
+      # the PR would hang "waiting for CI gate". The always-running gate + this filter is the fix.
+      - name: Decide (skip when the change is Markdown-only)
+        id: decide
+        shell: bash
+        env:
+          MATCHED: ${{ steps.filter.outputs.run }}
+          FILES: ${{ steps.filter.outputs.run_files }}
+        run: |
+          if [ "$MATCHED" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No allowlisted path changed — nothing to gate."
+            exit 0
+          fi
+          run=false
+          for f in $FILES; do
+            case "$f" in
+              *.md) ;;                 # Markdown — does not, by itself, force a run
+              *)    run=true ;;        # any non-Markdown match forces the full gate
+            esac
+          done
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ "$run" = "true" ]; then
+            echo "Non-Markdown changes present — running the full gate."
+          else
+            echo "Markdown-only change under the allowlisted paths — skipping the heavy gate."
+          fi
 
   # ── matrix: Linux x86_64 + arm64, macOS arm64, Windows x86_64 + arm64 ──────
   # NOTE: Windows uses Clang (not MSVC) because the project requires __int128 and
@@ -59,6 +89,7 @@ jobs:
         include:
           - os: ubuntu-latest
             label: linux-x86_64
+            full_gate: true
           - os: ubuntu-24.04-arm
             label: linux-arm64
           - os: macos-latest
@@ -66,9 +97,9 @@ jobs:
           - os: windows-latest
             label: windows-x86_64
           # DISABLED (owner ruling 2026-07-06, compile-time): windows-arm64 was the CI
-          # critical path (~16m run: 359s VM gate + 591s native gate). Commented out as a
-          # FUTURE-SUPPORT pendency — re-enable once the native gate is fast (#168/#265) and
-          # a faster arm64 Windows runner is available. Tracking: #304.
+          # critical path. Commented out as a FUTURE-SUPPORT pendency — re-enable once the
+          # native gate is fast (#168/#265) and a faster arm64 Windows runner is available.
+          # Tracking: #304.
           # - os: windows-11-arm
           #   label: windows-arm64
 
@@ -89,39 +120,40 @@ jobs:
           LABEL: ${{ matrix.label }}
         run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      # The self-build gate is now NATIVE by default (#168 memory-debt fix, owner "VM out of tests"
-      # ruling): `teko . -o bin` compiles the #test corpus to a binary, runs it in a CHILD process
-      # (a failed assert → non-zero exit bars this step), and enforces ALL THREE coverage floors
-      # (function/line/branch, #265 Track A) from the native run's merged marks. Because the tests
-      # run out-of-process, the compiler's own peak stays codegen-only (~940 MB here) instead of the
-      # VM gate's ~1.5 GB in-process functional-env balloon — the per-PR gate memory drop. This is
-      # ONE gate per platform (the historical VM+native double is gone); the VM gate moves to the
-      # scheduled `vm-gate-nightly` lane below. `--vm-gate` still forces the VM gate for local debug.
-      - name: Test gate (native — default since #168)
+      # The self-build gate is NATIVE (#168 memory-debt fix): `teko . -o bin` compiles the #test
+      # corpus to a binary, runs it in a CHILD process (a failed assert → non-zero exit bars this
+      # step), and enforces ALL THREE coverage floors (function/line/branch, #265 Track A) from
+      # the native run's merged marks. Because tests run out-of-process, the compiler's peak stays
+      # codegen-only (~940 MB). This is ONE gate per platform; native is the sole engine (VM
+      # retired, issue #524).
+      - name: Test gate (native on the primary; compile-only elsewhere — perf)
         shell: bash
-        run: teko . -o bin
+        run: |
+          if [ "${{ matrix.full_gate }}" = "true" ]; then
+            teko . -o bin
+          else
+            teko . -o bin --no-verify
+          fi
 
-      # fmt gate (issue #229 / #282): the corpus must be in `teko fmt`'s canonical shape.
-      # Runs the JUST-BUILT gen-1 (`./bin/teko`, from the "Test gate (native)" step above), NOT the
-      # released seed — gen-1 is built from THIS PR's sources, so it always carries the current
-      # `fmt --check` CLI AND parser. Using the seed instead choked on regression fixtures that
-      # exercise syntax newer than the seed (e.g. #285's doc-comment-before-field). .gitattributes
-      # pins `.tks`/`.tkt` to LF so the check is byte-stable on every platform. A non-canonical
-      # file reddens the merge — this keeps the corpus formatted going forward.
-      - name: fmt gate — the corpus must be canonical (issue #229)
-        shell: bash
-        run: ./bin/teko fmt --check .
+      # fmt gate REMOVED (owner ruling 2026-07-08): `teko fmt` is a DEV tool for canonical
+      # formatting, NOT a gate to bar code. The current fmt collapses hand-alignment, so it
+      # fights the W15 vertical-alignment target (deferred to #372) and blocked the 0.3 wave on
+      # pure formatting. Formatting stays covered by running `teko fmt` + the per-wave W15
+      # retrofit. Re-add a `fmt --check` gate only once #372 makes fmt align properly.
 
-  # ── RISC-V cross-compile + QEMU (BLOCKING — gated in the CI gate job) ─────────
+  # ── RISC-V own==C differential under QEMU (BLOCKING — gated in the CI gate job) ─
   riscv64-qemu:
     needs: changes
-    # DISABLED (owner ruling 2026-07-06, compile-time): running the FULL `test . --coverage`
-    # under qemu user-mode emulation was ~8-9m of the CI wall-clock (85% is emulated EXECUTION,
-    # not compiling). Commented out as a FUTURE-SUPPORT pendency — re-enable (flip to
-    # `needs.changes.outputs.run == 'true'`) when there is a real riscv64 runner (no qemu) or
-    # the native gate is fast enough to smoke riscv arch-correctness cheaply. Tracking: #305.
-    if: false
-    name: build-test / linux-riscv64 (qemu)
+    # RE-ENABLED + RE-SCOPED (issue #387 B2-8): the OLD lane ran the FULL `test . --coverage`
+    # under qemu user-mode (~8-9m, 85% emulated EXECUTION), so it was disabled (#305). B2-8
+    # replaces that with the FAST tiny exit(n) C-vs-own differential (seconds, not minutes):
+    # build gen1 (the PR compiler under test, which now carries the own riscv64 AOT backend),
+    # then run scripts/diff_c_own.sh in riscv mode — each exit(n) fixture built BOTH via the
+    # C backend cross-compiled for riscv AND via the own riscv pipeline (TEKO_TARGET=riscv64-linux),
+    # both cross-linked by riscv64-linux-gnu-gcc, both RUN under qemu-riscv64-static, asserting
+    # own_exit == C_exit. This proves own==C on riscv end-to-end without the full emulated gate.
+    if: needs.changes.outputs.run == 'true'
+    name: build-test / linux-riscv64 (qemu own==C differential)
     runs-on: ubuntu-latest
     continue-on-error: false
     permissions:
@@ -137,35 +169,46 @@ jobs:
           sudo apt-get install -y gcc-riscv64-linux-gnu qemu-user-static clang
 
       # riscv has no release binary asset, so it can't download a seed like the other
-      # platforms. But it MUST NOT cmake-build from the frozen C twins — those are frozen
-      # historical code (no-mirroring ruling) and diverge from the live `.tks` (e.g. they
-      # lack the #263 enum-vs-PrimKind fix), so a cmake build tests a STALE compiler and
-      # fails on current sources (LIR's `F32` LType tripped exactly that). Instead: seed
-      # the x86_64 released binary, have it EMIT the CURRENT compiler's C (gen-1), and
-      # cross-compile THAT for riscv — testing the same compiler the other platforms run.
+      # platforms. Seed the x86_64 released binary; it builds gen1 (the PR compiler under
+      # test) from THIS branch's src/, so gen1 carries the own riscv64 AOT backend
+      # (emit_native_riscv) — the C bootstrap / a cmake build from the frozen twins would
+      # NOT. The differential runs gen1, never the raw seed.
       - name: Provision teko (x86_64 released seed)
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/ci_provision_teko.sh linux-x86_64
 
-      - name: Emit the current compiler's C (gen-1, gate skipped here)
-        run: teko . -o gen1 --no-verify
+      - name: Build gen1 (the PR compiler under test — carries emit_native_riscv)
+        run: teko . -o bin --no-verify
 
-      - name: Cross-compile gen-1's teko.c for riscv64 (static)
-        run: |
-          riscv64-linux-gnu-gcc -std=c2x -w -static -Isrc/runtime -Isrc/assert \
-            gen1/teko.c src/runtime/teko_rt.c src/assert/assert.c -lm -o teko-riscv
+      # The fast riscv own==C differential: TEKO_DIFF_TARGET=riscv64-linux selects the riscv
+      # lane in diff_c_own.sh (NOT uname — this host is x86_64). Per exit(n) fixture it builds
+      # the C-riscv binary (C backend + TEKO_CC=riscv64-linux-gnu-gcc) and the own-riscv binary
+      # (TEKO_BACKEND=native TEKO_TARGET=riscv64-linux + cross-gcc-as-linker), runs BOTH under
+      # qemu-riscv64-static, and asserts identical exit code + stdout, plus check_elf.sh (riscv
+      # binutils) well-formedness on the own .o. own_print_exit stays a KNOWN-STOP (the shared
+      # println LIR-builtin gap, target-independent).
+      - name: RISC-V C-vs-own differential under QEMU (own AOT backend == C backend, on gen1)
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+          TEKO_DIFF_TARGET: riscv64-linux
+        run: ./scripts/diff_c_own.sh
 
-      - name: Run the gate under QEMU user-mode
-        run: qemu-riscv64-static ./teko-riscv test . --coverage
-
-  # ── differential VM==native harness (issue #54) ──────────────────────────────
-  # Cross-runs every examples/regressions/* project through BOTH engines (`teko run`
-  # on the VM, `teko build` through the host cc + execute) and asserts identical exit
-  # codes and program stdout. This is the structural gate the audit divergences
-  # (#47/#48/#49/#50, the destructor gap) slipped past: `teko test .` only exercises
-  # the .tkt corpus and never feeds examples/regressions/* to a real cc.
-  diff-vm-native:
+  # ── gen1 checks: CLI surface and the own==C differential (issue #524) ──
+  # Builds gen1 (the PR's compiler under test) from the downloaded release seed, then runs
+  # CLI-surface smokes + the CWD-build-regression check (#64) + the own AOT backend == C
+  # backend differential. Test EXECUTION (`teko test .`) was moved to the isolated
+  # tests.yml (owner design 2026-07-15 — one test runner per OS, in parallel with these
+  # diagnostics), so it is NO LONGER run here. The own==C differential is the replacement
+  # cross-check for the retired VM==native harness (issue #524): the VM shared the
+  # front-end with native but not codegen, so it protected little there while its
+  # wrapper-descent bug (VM-only) cost real false-failures — see
+  # docs/design/vm-retirement.md §3. The linux-x86_64 leg additionally runs the wasm
+  # differential (issue #389 C1-8c, the keystone ritual point): own-wasm(wasmtime) ==
+  # C-native over scripts/validate_wasm_own.sh's corpus, REQUIRED (not honest-skipped —
+  # both engines are provisioned in this job, so their absence is a real failure).
+  gen1-checks:
     needs: changes
     if: needs.changes.outputs.run == 'true'
     strategy:
@@ -181,9 +224,14 @@ jobs:
             label: macos-arm64
             install_deps: ""
 
-    name: diff VM==native / ${{ matrix.os }}
+    # Budget kept at 45 min (issue #524 crumb 2). With the heavy `teko test .` self-test now
+    # moved OUT to tests.yml (owner design 2026-07-15), this job only builds gen1 once and runs
+    # the lighter CLI-surface smokes + own==C differential, so it comfortably fits the cap — the
+    # generous budget is retained as headroom for the single "Build gen1" native pass on the
+    # slower shared ubuntu-latest runner.
+    name: gen1 checks / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
 
@@ -191,7 +239,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The native side of the harness compiles the GENERATED C (+ the runtime seam
+      # The own==C differential compiles the GENERATED C (+ the runtime seam
       # teko_rt.c) with the host cc — so cc is still needed; the COMPILER itself is
       # the downloaded release, not a from-source build.
       - name: Install cc
@@ -216,9 +264,12 @@ jobs:
         shell: bash
         run: teko . -o bin
 
-      - name: gen1 self-test (the PR's compiler runs its own gate)
-        shell: bash
-        run: ./bin/teko test .
+      # NOTE (owner design 2026-07-15): the "gen1 self-test" step (`./bin/teko test .`) was
+      # MOVED OUT of this job into the isolated .github/workflows/tests.yml, which runs the
+      # suite once per OS (1 linux, 1 macOS, 1 windows) in PARALLEL with these diagnostics —
+      # "assim não precisa rodar testes nestes outros diagnósticos para nenhum SO ou Arch."
+      # This job now builds gen1 and validates the CLI surface + the own==C differential ONLY;
+      # test EXECUTION lives entirely in tests.yml.
 
       - name: CLI flags on gen1 (identical version string)
         shell: bash
@@ -232,11 +283,79 @@ jobs:
         shell: bash
         run: ./scripts/region_drop_subtree_test.sh
 
-      - name: Differential harness (VM == native over examples/regressions, on gen1)
+      # CWD-build-regression check (issue #64): `cd <project> && teko build .` — the exact
+      # invocation shape a real user takes — must exit 0 and produce a working binary, for
+      # both the seed compiler and the self-hosted gen1 binary it just built.
+      - name: CWD build regression check (issue #64, on gen1)
         shell: bash
         env:
           TEKO: ./bin/teko
-        run: ./scripts/diff_vm_native.sh
+        run: ./scripts/native_regressions.sh
+
+      # ── C-vs-own differential (issue #385 A4-5 arm64; issue #386 B1-8 x86-64) ──
+      # The own AOT backend (TEKO_BACKEND=native) links a real native executable via cc.
+      # This gate builds each exit(n) fixture with BOTH backends on gen1 (which carries
+      # emit_native, built from the PR sources) and asserts own-native exit == C-native
+      # exit, plus a host-tool well-formedness check on the real emitted .o. TWO executing
+      # lanes, host-selected: macOS-arm64 emits arm64 Mach-O (check_macho); linux-x86_64
+      # emits x86-64 ELF via TEKO_TARGET=x86_64-elf (check_elf) and RUNS the ELF — the
+      # executing x86 differential the macOS lane cannot host. Other hosts honest-skip.
+      - name: C-vs-own differential (own AOT backend == C backend, on gen1)
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+        run: ./scripts/diff_c_own.sh
+
+      # ── wasm differential (issue #389 C1-8c — THE KEYSTONE RITUAL POINT) ──
+      # Provisions wasmtime (pinned official release tarball, the SAME pinned-download
+      # shape as release-cross-smoke's zig step below) and WABT's `wasm-validate` (apt,
+      # pinned to the runner image's resolved package build), then runs the full
+      # own-wasm(wasmtime) == C-native differential (scripts/validate_wasm_own.sh) on
+      # gen1 (which carries emit_native_wasm, C1-5/6/7). Linux-x86_64 only: the wasmtime
+      # asset below and `apt-get install` are both linux-x86_64-shaped, and provisioning a
+      # second engine pair for macOS-arm64 is out of this crumb's scope (named blocker B-1,
+      # backend-wasm.md §14.2) — that lane's own host-specific gates already honest-skip
+      # the same way in the C-vs-own differential step above.
+      - name: Install wasmtime (official pinned tarball)
+        if: matrix.label == 'linux-x86_64'
+        env:
+          WASMTIME_VERSION: "46.0.1"
+        run: |
+          set -eu
+          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-x86_64-linux.tar.xz" | tar -xJ
+          echo "$PWD/wasmtime-v${WASMTIME_VERSION}-x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Install wabt (WABT, apt, pinned)
+        if: matrix.label == 'linux-x86_64'
+        env:
+          WABT_APT_VERSION: "1.0.34+dsfg2+~cs1.0.32-1ubuntu2"
+        run: |
+          set -eu
+          sudo apt-get update -y
+          sudo apt-get install -y "wabt=${WABT_APT_VERSION}"
+
+      # Fail-closed, not skip-closed (issue #389 B-1): a broken/no-op provisioning step
+      # (PATH not exported, wrong arch asset, apt pin drift) must break THIS step, before
+      # validate_wasm_own.sh ever gets a chance to (mis)report a pass.
+      - name: Assert wasm engines are actually on PATH
+        if: matrix.label == 'linux-x86_64'
+        run: |
+          set -eu
+          command -v wasmtime
+          command -v wasm-validate
+          wasmtime --version
+          wasm-validate --version
+
+      # REQUIRE_WASM_ENGINE=1 (validate_wasm_own.sh) turns the dev-laptop honest-skip into
+      # a hard failure: CI provisioned both engines above, so an absent/broken engine here
+      # is a real regression, never a silently-green skip — the keystone's whole point.
+      - name: wasm differential (own-wasm(wasmtime) == C-native, on gen1 — issue #389 keystone)
+        if: matrix.label == 'linux-x86_64'
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+          REQUIRE_WASM_ENGINE: "1"
+        run: ./scripts/validate_wasm_own.sh
 
   # ── release cross-compile smoke: the EXACT zig-cross the release runs, compile-only ──
   # release.yml is tag-triggered, so its Linux cross-compile went unvalidated in PR CI — a
@@ -293,44 +412,11 @@ jobs:
       - name: Run the x86_64-glibc cross artifact over the corpus (miscompile guard)
         run: ./gd-linux-x86_64-glibc/teko . -o /tmp/xrun --no-verify
 
-  # ── nightly VM-gate lane (#168 governance) ────────────────────────────────────
-  # Since the native gate became the DEFAULT per-PR gate (#168 memory-debt fix), the VM gate no
-  # longer runs on every PR — its ~1.5 GB in-process functional-env peak was the per-PR gate
-  # memory debt. But the VM is still the dev/debug/WASM engine and must not silently regress, so
-  # `teko test .` (the full #test corpus, VM-interpreted, all three coverage floors) runs once
-  # NIGHTLY over the whole corpus. This keeps VM==native parity honest at the gate level; the
-  # per-PR diff-vm-native job already proves VM==native RELEASE parity on every PR. Runs ONLY on
-  # the schedule trigger (not on PRs), so it adds ZERO per-PR wall-clock or memory.
-  vm-gate-nightly:
-    name: VM gate (nightly regression)
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Provision teko from the latest release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: ./scripts/ci_provision_teko.sh linux-x86_64
-
-      - name: Build gen1 (native default gate) so the VM lane tests THIS corpus
-        shell: bash
-        run: teko . -o bin
-
-      - name: VM gate over the full corpus (teko test .)
-        shell: bash
-        run: ./bin/teko test .
-
-  # ── gate: aggregates all build-test + riscv + differential + cross-smoke results ──
+  # ── gate: aggregates all build-test + riscv + gen1-checks + cross-smoke results ──
   gate:
     name: CI gate
     runs-on: ubuntu-latest
-    needs: [changes, build-test, riscv64-qemu, diff-vm-native, release-cross-smoke]
+    needs: [changes, build-test, riscv64-qemu, gen1-checks, release-cross-smoke]
     if: always()
     permissions: {}
 
@@ -339,14 +425,14 @@ jobs:
         run: |
           BUILD_RESULT="${{ needs.build-test.result }}"
           RISCV_RESULT="${{ needs.riscv64-qemu.result }}"
-          DIFF_RESULT="${{ needs.diff-vm-native.result }}"
+          GEN1_RESULT="${{ needs.gen1-checks.result }}"
           SMOKE_RESULT="${{ needs.release-cross-smoke.result }}"
           CHANGES="${{ needs.changes.outputs.run }}"
 
           echo "changes.run   = $CHANGES"
           echo "build-test    = $BUILD_RESULT"
           echo "riscv64-qemu  = $RISCV_RESULT"
-          echo "diff-vm-native = $DIFF_RESULT"
+          echo "gen1-checks   = $GEN1_RESULT"
           echo "release-cross-smoke = $SMOKE_RESULT"
 
           # If the paths filter said nothing relevant changed, everything skipped → OK
@@ -361,15 +447,18 @@ jobs:
             exit 1
           fi
 
-          # diff-vm-native must be success — a divergence between the engines gates
-          if [ "$DIFF_RESULT" = "failure" ] || [ "$DIFF_RESULT" = "cancelled" ]; then
-            echo "ERROR: diff-vm-native $DIFF_RESULT"
+          # gen1-checks must be success — gen1's own gate, CLI surface, the CWD-build
+          # regression check (#64), and the own==C differential are all folded into this
+          # job; any failure there gates the merge.
+          if [ "$GEN1_RESULT" = "failure" ] || [ "$GEN1_RESULT" = "cancelled" ]; then
+            echo "ERROR: gen1-checks $GEN1_RESULT"
             exit 1
           fi
 
           # riscv64-qemu is BLOCKING (main-integrity law: green means green everywhere).
-          # It seeds from the released x86_64 binary and cross-compiles the current
-          # compiler's emitted C (issue #276), so a failure is a real regression, not
+          # It seeds from the released x86_64 binary, builds gen1 (the PR compiler carrying
+          # the own riscv64 AOT backend), and runs the exit(n) own==C differential under
+          # qemu-riscv64-static (issue #387 B2-8), so a failure is a real regression, not
           # infra noise — a red riscv gates the merge and, downstream, the release.
           if [ "$RISCV_RESULT" = "failure" ] || [ "$RISCV_RESULT" = "cancelled" ]; then
             echo "ERROR: riscv64-qemu $RISCV_RESULT"

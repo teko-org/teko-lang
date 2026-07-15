@@ -15,16 +15,11 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | erro
         let v = match parse_expr(tokens, after) { Parsed<Expr> as x => x; error as e => return e }
         return Parsed<Statement> { node = Return { has_value = true; value = v.node }; next = v.next }
     }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && is_kind_at(tokens, pos + 1, lexer::TokenKind::Colon) && is_kind_at(tokens, pos + 2, lexer::TokenKind::Loop) {
+        return parse_loop(tokens, pos + 2, tokens[pos].text)
+    }
     if is_kind_at(tokens, pos, lexer::TokenKind::Loop) {
-        // optional label: `loop NAME { … }` (an IDENT right after `loop`, before the brace)
-        mut label = ""
-        mut lbrace = pos + 1
-        if is_kind_at(tokens, pos + 1, lexer::TokenKind::Ident) { label = tokens[pos + 1].text; lbrace = pos + 2 }
-        if !is_kind_at(tokens, lbrace, lexer::TokenKind::LBrace) {
-            return err_at(tokens, lbrace, "expected '{' after `loop`")
-        }
-        let blk = match parse_block(tokens, lbrace) { ParsedList<Statement> as x => x; error as e => return e }
-        return Parsed<Statement> { node = LoopStmt { label = label; body = blk.items }; next = blk.next }
+        return parse_loop(tokens, pos, "")
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Break) {
         // optional label on the SAME line: `break NAME` (a separator would tokenize between)
@@ -53,6 +48,9 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | erro
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Let) || is_kind_at(tokens, pos, lexer::TokenKind::Mut) || is_kind_at(tokens, pos, lexer::TokenKind::Const) {
         return parse_binding(tokens, pos)
+    }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Underscore) && is_kind_at(tokens, pos + 1, lexer::TokenKind::Assign) {
+        return parse_discard_assign(tokens, pos)
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && is_assign_op(tokens, pos + 1) {
         return parse_assign(tokens, pos)
@@ -100,7 +98,7 @@ fn is_adopt_head(tokens: []lexer::Token, pos: u64) -> bool {
 
 /**
  * parse_adopt — parse a contextual `adopt [name] { stmts }` at `pos` (the `adopt` ident). An
- * optional bound name (an ident before the `{`, mirroring the `loop NAME {` label) is captured;
+ * optional bound name (an ident before the `{`, the same `adopt NAME {` suffix shape) is captured;
  * a mandatory block then follows, reusing parse_block. Unlike `defer`, the body may contain
  * `return`/`break`/`continue` and nested `adopt` — no rejection here.
  *
@@ -182,13 +180,30 @@ fn parse_bind_target(tokens: []lexer::Token, pos: u64) -> Parsed<BindTarget> | e
         let names = match parse_field_names(tokens, pos) { ParsedList<str> as x => x; error as e => return e }
         return Parsed<BindTarget> { node = DestructurePattern { names = names.items }; next = names.next }
     }
-    // `let _ = expr` — DISCARD binding: evaluate the value for effect, bind nothing. A SIMPLE
-    // target named "_" (the wildcard); codegen lowers it to `(void)(expr);` (no C variable, so
-    // repeated `let _` never collides), and it is never read. (B.21 — explicit ignore.)
-    if !is_name_at(tokens, pos) && !is_kind_at(tokens, pos, lexer::TokenKind::Underscore) {
-        return err_at(tokens, pos, "expected a name, `_`, or `{ … }` after `let`/`mut`/`const`")
+    if is_kind_at(tokens, pos, lexer::TokenKind::Underscore) {
+        return err_at(tokens, pos, "`_` is the write-only discard and cannot be a `let`/`mut`/`const` target — drop the keyword and write `_ = expr` to evaluate an expression and discard its result")
+    }
+    if !is_name_at(tokens, pos) {
+        return err_at(tokens, pos, "expected a name or `{ … }` after `let`/`mut`/`const`")
     }
     Parsed<BindTarget> { node = SimpleName { name = tokens[pos].text }; next = pos + 1 }
+}
+
+/**
+ * parse_discard_assign — parse the write-only discard-assign statement `_ = expr` (owner ruling
+ * 2026-07-15): evaluate `expr` for its side effect and drop the result, binding nothing. The node
+ * reuses the SimpleName "_" binding, which codegen lowers to `(void)(expr);`. Only a plain `=`
+ * reaches here (the caller checks for it); a compound `_ += …` never matches, since the discard
+ * carries no value to read-modify-write.
+ *
+ * @param tokens  the token stream
+ * @param pos     the index of the leading `_` (Underscore) token
+ * @return        the parsed discard Binding and the index past the value, or a parse error
+ * @throws        when the discarded expression fails to parse
+ */
+fn parse_discard_assign(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
+    let dv = match parse_expr(tokens, pos + 2) { Parsed<Expr> as x => x; error as e => return e }
+    Parsed<Statement> { node = Binding { kind = BindKind::Let; target = SimpleName { name = "_" }; has_type = false; type_ann = no_type(); value = dv.node }; next = dv.next }
 }
 
 // `name op= value` (B.4 — assignment is statement-only). Simple-name target; the op
@@ -200,8 +215,3 @@ fn parse_assign(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
     Parsed<Statement> { node = Assign { kind = AssignKind::Simple; name = name; op = op; value = v.node; deref = false; target = no_expr() }; next = v.next }
 }
 
-// (added to parse_statement, P4d; labels — M.5)
-//   loop [NAME] { body } → LoopStmt { label = NAME?, body = <block> }   (reuses parse_block)
-//   break [NAME]         → BreakStmt { label = NAME? }
-//   continue [NAME]      → ContinueStmt { label = NAME? }
-// (label empty "" = unlabeled / innermost loop)
