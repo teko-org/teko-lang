@@ -30,6 +30,7 @@ If a canonicalization would change emitted output, a test result, or the fixpoin
 3. **Best practices, applied for real.** SOLID (single-responsibility, small focused units), KISS (delete cleverness), YAGNI (drop speculative generality), 12-Factor where it touches config/env seams. Name things well.
 4. **Split large files.** A file grown unbounded is split into cohesive modules (same namespace) along responsibility lines — desirable, not merely allowed. Keep the public surface identical.
 5. **Coverage of the delta = 100%.** Add `.tkt` tests for any new/changed line/branch left uncovered by the retrofit itself.
+6. **No magic values (D39, owner 2026-07-15).** Every domain-meaningful literal is named: a single scalar → `const NAME: T = <const-expr>` (comp-time, no arena — never a nullary `fn` returning a constant, which opens a region per call); a closed integer tag family → `enum`; a bitmask ORed from independent bits → `flags`; a large immutable aggregate read repeatedly → an aggregate `const` (rodata). Threshold: a non-trivial literal (not `0`/`1`) appearing ≥2× OR encoding an external-format constant (file magic, ABI number, section flag) MUST be named. Keep emitted bytes byte-identical (a `match`-driven `_wire` helper for serialized tags; prove with fixpoint + object goldens). Never migrate a `*_empty()` fresh-mutable-state factory into a shared const. `const` placements: module-level, class/struct member (`Tipo::NAME`, static), local — each accepts `pub`/`exp`. See the skill's "No magic values" section.
 
 ## Standing laws
 
