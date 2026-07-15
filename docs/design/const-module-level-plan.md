@@ -1,7 +1,19 @@
 # Module-level `const` — design + crumb plan (#594)
 
-Status: PROPOSED (architect plan; owner ruling 2026-07-15). Lane: `remodel/backend-build`.
+Status: RATIFIED (owner 2026-07-15, with two rulings). Lane:
+`fix/issue-594-const-module-level` (base `remodel/backend-build`).
 Author: architect. Implementer executes the crumb sequence in order.
+
+> **Owner rulings 2026-07-15 (folded in):**
+> - **RULING 1 — aggregates → RODATA at the feature baseline** (not the earlier
+>   two-phase inline-then-rodata). This surfaced the data→data relocation
+>   constraint (§5.1): Tier A (flat-POD / `[]byte`, the whole ~50) is zero-backend;
+>   Tier B (pointer-bearing, e.g. ABI descriptors) needs a data-reloc backend phase
+>   (§8 T-B*). Verdict on "backend intocado?": **yes for Tier A / the ~50; no for
+>   Tier B.**
+> - **RULING 2 — the ~300-literal ISA-encoder magic-value sweep is IN #594**
+>   (crumbs S1–S6), sequenced after the feature reaches the seed, each file gated by
+>   frozen-byte goldens + fixpoint.
 
 > GitHub access was disabled for this session, so the issue #594 body could not be
 > read directly. This plan is written against the **owner brief as relayed by the
@@ -130,35 +142,45 @@ Everything above is validated by a single predicate `is_const_expr(TExpr) -> err
 in the new `consteval` module (§3.5). Anything else in a const initializer is a
 type error with a located message.
 
-### D2 · scalar INLINE vs `LGlobal` → **INLINE (owner-aligned)**
+### D2 · scalar INLINE + aggregate → RODATA at baseline (owner RULING 1, 2026-07-15)
 
 A **scalar** const (any primitive-typed const: the int/float/bool/byte/char
 families) is **inlined at every use site** as the equivalent typed literal. No
-`LGlobal`, no rodata, no reloc, no arena — a `mov imm`. This is the owner's
-explicit lean and eliminates all backend risk.
+`LGlobal`, no rodata, no reloc, no arena — a `mov imm`. This is unchanged.
 
-An **immutable aggregate** const (`[]byte`, struct, variant) is materialized. Two
-sub-options were considered:
+An **immutable aggregate** const (`[]byte`, struct, variant) is **materialized in
+rodata directly at the feature baseline** — the owner REJECTED the two-phase
+inline-then-rodata plan and wants the end-state now. This requires a **rodata
+layout serializer** (serialize a typed aggregate ConstValue into bytes per its
+`LStructLayout`) plus a **typed load via `LGlobalAddr`** (read fields with
+`LFieldAddr` + `LLoad` off the rodata pointer). Both are lowering-side.
 
-- **(a) rodata materialization** (owner's stated "agregados imutáveis → rodata"):
-  a single static image + `LGlobalAddr`, reusing the string-literal path. One copy,
-  no per-use arena/construction — the true optimization.
-- **(b) inline the aggregate literal** at each use site (re-construct in place,
-  exactly what the old nullary fn did per call).
+**But whether this stays "zero backend" depends on the aggregate's SHAPE, because
+the whole reloc model is `.text`-relative (verified §5.1). Two tiers:**
 
-**Ratification:** ship **(b) inline** as the #594 baseline for aggregates, and
-schedule **(a) rodata** as a fast-follow optimization crumb (§6, C-agg-2) *gated by
-the same fixpoint proof*. Reason (law-first, smallest-safe-step): (b) is strictly
-behavior-preserving (an aggregate const inlined == the old fn's per-call
-construction, byte-for-byte, so gen2==gen3 is trivially provable) and touches **zero
-backend files**. (a) is the better end-state (kills the per-use construction arena
-too) but requires a rodata layout serializer for non-`[]byte` structs and a
-`LGlobalAddr`-typed-value load path; doing it under the same PR risks the fixpoint.
-The owner's "→ rodata" intent is honored as the very next crumb, not dropped.
+- **Tier A — self-contained rodata blob (NO internal pointer):** every field is a
+  scalar / enum / bool, OR the aggregate is `[]byte` / `str` (bytes in rodata, the
+  `{ptr,len}` header built at the USE site exactly as string literals already do).
+  The rodata image holds no pointer, so nothing inside rodata must be relocated —
+  the only reference is the existing **text→rodata** load. **ZERO backend change.**
+  The rodata layout serializer + typed `LFieldAddr`/`LLoad` reads are the new work,
+  all in lowering. Covers the ENTIRE owner ~50 inventory (§6). Ships in the feature
+  phase.
+- **Tier B — pointer/slice-bearing aggregate:** a field is a slice (`[]T`) or a
+  pointer, so the rodata image contains a pointer that must hold the address of
+  ANOTHER rodata datum → a **data→data relocation whose patch site is INSIDE the
+  data section**. That relocation **does not exist** in any writer/encoder/VM
+  (§5.1 verdict). This tier BREAKS "zero backend" and becomes a dedicated backend
+  phase (§8 crumbs T-B*). The flagship Tier-B consts are the ABI descriptors
+  (`sysv64`/`aapcs64`/`riscv64_lp64d`/`win64` — eight `[]u32` slice fields each,
+  `abi_aapcs64.tks:14`). **None of the owner's ~50 anemic-const sites are Tier B**
+  — they are all Tier A — so the ~50 migrate with zero backend change; Tier B is
+  only reached when the pointer-bearing aggregate FACTORIES are also converted.
 
-> Net: **all** consts eliminate the *definition-side* nullary-fn arena immediately.
-> Aggregates additionally lose their *use-side* construction arena when C-agg-2
-> lands. Scalars have no use-side cost at all from crumb one.
+> Net: scalars have zero use-side cost; Tier-A aggregates lose BOTH the
+> definition-side nullary-fn arena AND (via a single shared rodata image + typed
+> load) the per-use construction arena, with zero backend change; Tier-B aggregates
+> reach the same end-state only after the data-reloc backend crumbs land.
 
 ### D3 · evaluation order + cycle detection
 
@@ -415,21 +437,60 @@ struct-of-existing-codecs: `str`, `Type`, `TExpr`, `Visibility`, `bool`, `u32`).
 
 ---
 
-## 5. Backend impact — NONE (the whole point)
+## 5. Backend impact — Tier A NONE, Tier B REAL (the honest verdict)
 
-| Backend / writer | honest-stop | changes for #594 baseline | changes for C-agg-2 |
+### 5.1 Data→data relocation — the load-bearing verdict
+
+**A relocation whose PATCH SITE is inside the data (rodata) section does NOT exist
+in this compiler.** Evidence (verified this session):
+
+- **x86_64 (`encode_x86_64.tks:1310`):** `RelocX86.offset` is "relative to this
+  function's `.text` base"; `EncodedModuleX86.relocs` are "every relocation,
+  `.text`-section-relative". A rodata reference is a **text→rodata** `Pc32`/`Abs64`
+  whose patch site is in `.text`, with the rodata byte offset folded into the
+  addend. Nothing patches a field inside rodata.
+- **ELF writer (`objfile_elf.tks:455`):** the section-header set is exactly
+  `["", ".text", ".rodata", ".symtab", ".strtab", ".shstrtab", ".rela.text"]`.
+  There is **`.rela.text` but no `.rela.rodata`** — the object cannot carry a
+  relocation applied inside `.rodata`.
+- **COFF (`objfile_coff.tks:387`):** `coff_apply_rodata_addends` folds each rodata
+  reloc's `.rdata` target offset **into the `.text` patch site** — again text→rodata.
+- **Mach-O:** same text-section-relative reloc model.
+- **wasm (`objfile_wasm.tks:216/640`):** rodata is an **active data segment at a
+  fixed, emit-time-known linear-memory offset** — so an intra-data pointer would be
+  a compile-time i32 constant (no classic reloc), but the data emitter must
+  COMPUTE and WRITE it (a real, if reloc-free, change).
+
+**Consequence:** string literals work because the pointer into rodata is computed
+in CODE at the use site (a text→rodata reference) and the rodata blob is flat bytes
+with no internal pointer. Any const whose rodata image must itself contain a
+pointer (a slice/pointer field) needs a reloc the toolchain cannot emit.
+
+### 5.2 Impact table
+
+| Backend / writer | honest-stop (gates `m.globals` only) | Tier A (scalar + flat-POD + `[]byte`) | Tier B (pointer/slice-bearing) |
 |---|---|---|---|
-| C twin (frozen) | — | none | none |
-| x86_64 (`encode_x86_64.tks`) | `honest_globals_x86` (`:1495`, gates `m.globals`) | none (scalars inline; aggregates inline) | none (uses `m.rodata`, already emitted) |
-| arm64 (`encode_arm64.tks`) | `honest_globals`/`A4-globals` (`:1858`) | none | none |
-| riscv64 (`encode_riscv.tks`) | `honest_globals_riscv` (`:1684`) | none | none |
-| wasm (`stackify.tks`) | `wasm_honest_globals`/`C1-globals` (`:4458`) | none | none |
-| ELF/Mach-O/COFF/wasm writers | — | none | none |
-| LIR interp (VM) | — | none | none (rodata read path exists: `lir_interp.tks:206/527`) |
+| C backend (`--backend=c`) | — | none (emit `static const` + reference; strings already do) | data-init pointer resolvable in C init, but see VM/native — sequence with them |
+| x86_64 (`encode_x86_64.tks`) | `honest_globals_x86` (`:1495`) | none (text→rodata load exists) | **widen `RelocX86` with a patch-site SECTION tag + emit data-section relocs** |
+| arm64 (`encode_arm64.tks`) | `honest_globals`/`A4-globals` (`:1858`) | none | **same: data-section reloc emission** |
+| riscv64 (`encode_riscv.tks`) | `honest_globals_riscv` (`:1684`) | none | **same** |
+| wasm (`stackify.tks`/`objfile_wasm.tks`) | `wasm_honest_globals`/`C1-globals` (`:4458`) | none | **compute+write intra-data i32 offsets in the data segment (no reloc, but new)** |
+| ELF writer | — | none | **new `.rela.rodata` section + rela emission** |
+| Mach-O writer | — | none | **new rodata-section (local) relocations** |
+| COFF writer | — | none | **new `.rdata` relocations (patch site in `.rdata`)** |
+| LIR interp (VM) | — | none (typed load off `LGlobalAddr` reuses `LFieldAddr`/`LLoad`; `lir_interp.tks:206/527`) | **resolve a rodata-INTERNAL pointer field to its target rodata base at load** |
 
-No honest-stop is touched, because we never populate `m.globals`. `m.rodata`
-(already flowing through every backend + the VM) is the only data path used, and
-only in the C-agg-2 follow-up.
+**Tier A: no honest-stop is touched (we never populate `m.globals`) and no backend
+file changes.** The only Tier-A validation risk is that `LFieldAddr` must accept a
+rodata-`LGlobalAddr` base across the 4 encoders + VM — expected to already hold
+(it is base+offset), asserted in the Tier-A fixtures.
+
+**Tier B: NOT zero-backend.** It is a dedicated phase touching the 3 native
+encoders (patch-site section tag), the ELF/Mach-O/COFF writers (a data-section
+relocation), the wasm data emitter (emit-time offsets), and the VM (rodata-internal
+pointer resolution). Sequenced in §8 (crumbs T-B1..T-B5), gated by the same
+fixpoint + golden bytes. **Only needed to convert pointer-bearing aggregate
+factories (ABI descriptors); the owner's ~50 do not require it.**
 
 ---
 
@@ -494,13 +555,31 @@ consts" becomes **N consts + M enums + K flags**.
 > the *source spelling* (`SHF_ALLOC | SHF_EXECINSTR` instead of `0x6`), not the
 > lowered bytes. Prove with fixpoint + the object-writer golden tests.
 
-### 6.4 → rodata aggregate (C-agg-2)
+### 6.4 → rodata aggregate — Tier A (feature phase, ZERO backend)
 
-- `src/compress/gzip.tks:16` `gzip_magic -> []byte { [0x1F, 0x8B] }` → aggregate
-  const; baseline inlines the 2-byte array literal, C-agg-2 interns it in rodata.
-- `src/backend/minst.tks:1257` `ret_inst -> MInst { MRet {} }`,
-  `src/backend/isel_x86_64.tks:155` `rax_x86 -> MReg { preg(0, GPR) }` (Tier 5) →
-  aggregate/struct consts; baseline inlines the literal/constructor.
+All owner-cited aggregates are **Tier A** (self-contained rodata blob, no internal
+pointer): they materialize in `m.rodata` at the feature baseline (D2, RULING 1).
+
+- `src/compress/gzip.tks:16` `gzip_magic -> []byte { [0x1F, 0x8B] }` → the 2 bytes
+  live in rodata; the `{ptr,len}` header is built at the use site (the string-literal
+  mechanism). Tier A.
+- `src/backend/minst.tks:1257` `ret_inst -> MInst { MRet {} }` → an empty variant,
+  a zero-size (or tag-only) blob. Tier A.
+- `src/backend/isel_x86_64.tks:155` `rax_x86 -> MReg { preg(0, GPR) }` (Tier-5 grammar) →
+  `MReg { id: u32; reg_class: enum; is_phys: bool }` is **flat POD** (no pointer) →
+  serialized to a fixed byte image in rodata, read via `LFieldAddr`+`LLoad`. Tier A.
+
+### 6.5b → rodata aggregate — Tier B (needs data-reloc backend phase, §8 T-B*)
+
+**Not in the owner's ~50.** Only reached if the pointer-bearing aggregate factories
+are converted:
+
+- `src/backend/abi_{sysv64,aapcs64,riscv64,win64}.tks` ABI descriptors — eight
+  `[]u32` slice fields (`abi_aapcs64.tks:14`). Full rodata materialization needs a
+  data→data reloc (§5.1) → deferred behind crumbs T-B1..T-B5, OR legitimately stay
+  `fn` (a genuine pointer-bearing aggregate whose per-call construction is honest
+  until data-relocs exist). Recommend: **convert after T-B lands**; until then they
+  stay `fn` with a `// #594 Tier-B: awaits data-reloc` doc-note.
 
 ### 6.5 → STAYS `fn` (justified exceptions)
 
@@ -514,10 +593,10 @@ consts" becomes **N consts + M enums + K flags**.
   owner's "convert TUDO" targets *constant* returns; a factory that seeds fresh
   mutable state is a different category and correctly stays a fn.
 - `nan()`/`inf()` are Tier-5 consts (allowlisted `f64_from_bits`) → migrate.
-- The ABI descriptors (`sysv64`, `aapcs64`, `riscv64_lp64d`, `win64`) are large
-  immutable structs read many times → **excellent aggregate-const candidates**
-  (C-agg-2 rodata), but MAY stay fn at baseline if their struct literal is large;
-  classify per implementer judgement, defaulting to const.
+- The ABI descriptors (`sysv64`, `aapcs64`, `riscv64_lp64d`, `win64`) are
+  **pointer-bearing aggregates (Tier B, §6.5b)** — they are NOT in the owner's ~50
+  and require the data-reloc backend phase (§8 T-B*) before they can be rodata
+  consts. Until then they stay `fn` (honest per-call construction).
 
 > Deliverable for the implementer: before crumb 1, produce the FROZEN exact list
 > (grep output) annotated with the 6.1–6.5 bucket per line, and get it into the PR
@@ -560,15 +639,22 @@ Hex-literal-with-cast density (proxy for magic values), by file:
   section flags, symbol info) → `const`/`flags`/`enum` per 6.3.
 - `src/compress/compress.tks` — 12 (ZIP/adler constants) → per 6.1/6.2.
 
-This is a **program-wide retrofit**, far larger than #594's ~50 fns. Recommendation
-(law-first, smallest-safe-step): **#594 delivers the `const`/`enum`/`flags` feature
-+ migrates the ~50 nullary-fn constants + the object-writer file-magic/section-flag
-families (6.3), which are the highest-value, most external-contract-sensitive magic
-values.** The ISA-opcode retrofit (encoders) is REPORTED UP as a large follow-on
-retrofit for the w15-retrofit skill to sweep file-by-file under the new rule — it
-is out of #594's proposal boundary and must not be smuggled in (regression surface
-on the frozen-bytes encoders). This keeps #594 at 100% of its stated scope while
-honoring the new rule for the parts that belong to it.
+This is a **program-wide retrofit**. Owner **RULING 2 (2026-07-15): it enters #594
+in full** — "em meio ao código também, feito por inteiro aqui." So #594 delivers,
+in order: (1) the `const`/`enum`/`flags` feature; (2) the ~50 nullary-fn constants +
+the object-writer file-magic/section-flag families (6.3); (3) **a file-by-file sweep
+of the ISA encoders** `encode_x86_64.tks` (90 hits), `encode_arm64.tks` (66),
+`encode_riscv.tks` (52), `stackify.tks` (109), plus the object writers, turning each
+recurring opcode / mask / field constant into `const`/`enum`/`flags` per the W15
+rule. The sweep is sequenced AFTER the feature reaches the bootstrap seed (crumbs
+1–7) so the encoders may spell `const`/`enum`/`flags`, and each file is its own
+crumb with **frozen-byte golden + fixpoint gen2==gen3 as the per-file acceptance
+bar** — the emitted machine bytes must not change by a single byte.
+
+Exempted even under RULING 2: a genuinely one-off opcode byte that appears exactly
+once in a documented per-instruction encoder table (naming it adds indirection
+without removing a magic value); the ≥2×-OR-external-format threshold (§7.1)
+decides. The `*_empty()` factories are never touched (they are not constants).
 
 ### 7.3 W15 rule text (paste into agent + skill)
 
@@ -589,9 +675,14 @@ honoring the new rule for the parts that belong to it.
 Each crumb is independently gate-able. The **ritual point** is where the FULL gate
 (both engines + `.tkt` + fixpoint gen2==gen3 + 100% delta coverage) must pass.
 Bootstrap-seed rule: `const` must be usable by the corpus only *after* it lands in
-the seed — so the FEATURE crumbs (1–6) land and become part of the released seed
-BEFORE the MIGRATION crumbs (7+) may use `const`/`enum`/`flags` in the compiler's
-own source.
+the seed — so the FEATURE crumbs (1–7) land and become part of the released seed
+BEFORE the MIGRATION crumbs (8+) and the RULING-2 encoder sweep (S*) may use
+`const`/`enum`/`flags` in the compiler's own source. The Tier-B backend phase
+(T-B*) is a separate, later track needed only for pointer-bearing aggregates.
+
+**Phase map:** Feature = crumbs 1–7 (RITUAL + seed release after 7) · Migration =
+8–11 · RULING-2 encoder sweep = S1–S6 · Tier-B backend + ABI-descriptor migration =
+T-B1–T-B6.
 
 ### Crumb 1 — parser: `ConstDecl` AST + `parse_const_decl` + wiring
 - **Shapes:** §4.1 `ConstDecl` type; `Decl`/`ItemKind` widen; §4.2
@@ -625,33 +716,50 @@ own source.
   0 to i128`).
 - **Ritual:** full gate.
 
-### Crumb 5 — inliner `inline_consts` + pipeline placement
-- **Shapes:** §4.7 `inline_consts`; call it in the checker pipeline after
-  `monomorphize`, before lowering; `lower_item` defensive `TConstDecl` no-op (§4.8).
-- **Fixtures (both-engine):** a program `const K: i64 = 41; fn main() { print(K + 1)
-  }` prints 42 on VM AND native; the lowered LIR contains NO reference to `K` and NO
-  `LGlobal` (assert `m.globals.len == 0`); nested `const B = A + 1; const A = 1;
-  … B` folds fully.
-- **Ritual:** full gate + explicit `m.globals.len == 0` assertion (proves no
-  honest-stop is reachable). **This is the behavior-preservation keystone.**
+### Crumb 5 — inliner `inline_consts` (SCALARS) + pipeline placement
+- **Shapes:** §4.7 `inline_consts` (scalar arm); call it in the checker pipeline
+  after `monomorphize`, before lowering; `lower_item` defensive `TConstDecl` no-op.
+- **Fixtures (both-engine):** `const K: i64 = 41; fn main() { print(K + 1) }` prints
+  42 on VM AND native; the lowered LIR contains NO reference to `K` and NO `LGlobal`
+  (assert `m.globals.len == 0`); nested `const B = A + 1; const A = 1; … B` folds.
+- **Ritual:** full gate + `m.globals.len == 0` assertion. Scalar keystone.
 
-### Crumb 6 — `.tkb` codec (C7.16) `TConstDecl` + cross-module `pub const`
+### Crumb 6 — Tier-A aggregate → RODATA (owner RULING 1): layout serializer + typed load
+- **Shapes:** a new `rodata layout serializer` (serialize a typed flat-POD aggregate
+  ConstValue to bytes per its `LStructLayout`; `[]byte`/`str` reuse the string
+  intern path); `lower_item` `TConstDecl` arm materializes a Tier-A aggregate via
+  `intern_rodata` and rewrites uses to a typed `LGlobalAddr` read (`LFieldAddr` +
+  `LLoad`, or a struct-copy from the rodata base into a caller slot when the value
+  is passed by value). `inline_consts` routes aggregate references to the rodata
+  symbol instead of substituting a literal.
+- **Fixtures (both-engine):** `const M: MReg = preg(0, MRegClass::GPR)` referenced
+  N times emits **ONE** rodata entry, all uses read identical bytes on VM AND
+  native; `gzip_magic: []byte` → 2 bytes in rodata, header at use, byte-identical;
+  `ret_inst: MInst = MRet {}` round-trips; assert `m.globals.len == 0` still holds
+  (rodata, NOT globals — no honest-stop reachable); assert `LFieldAddr` accepts an
+  `LGlobalAddr` base on all 4 encoders + VM (the sole Tier-A backend risk).
+- **Ritual:** full gate. **Aggregate keystone** — proves the "→ rodata" end-state
+  with zero backend change for Tier A.
+
+### Crumb 7 — `.tkb` codec (C7.16) `TConstDecl` + cross-module `pub const`
 - **Shapes:** §4.9 encode/decode arms; `seed_from_dep` surfaces `pub const`s.
 - **Fixtures:** module `m1` exports `pub const P: u32 = 0x78`; `m2` uses `m1::P` →
-  compiles, both engines, inlined in `m2` (assert no cross-module data symbol); a
-  non-`pub` const used cross-module → visibility error.
+  compiles, both engines (scalar inlined in `m2`); a `pub const A: MReg = …`
+  aggregate re-materializes ONE rodata entry per consuming module; a non-`pub` const
+  used cross-module → visibility error.
 - **Ritual:** full gate. **RITUAL POINT — end of FEATURE phase.** After this passes
-  and is released, `const`/`enum`/`flags` are in the bootstrap seed; migration
-  crumbs may now use them in compiler source.
+  and is released, `const`/`enum`/`flags` (+ Tier-A aggregate rodata) are in the
+  bootstrap seed; migration + the encoder sweep may now use them in compiler source.
 
-### Crumb 7 — migrate scalar-const families (6.1)
-- **Step:** replace each 6.1 nullary fn with `pub const …`; update call sites `X()`
-  → `X`. Do it file-by-file (math, compress, lir, io, isel_arm64 i128 trio).
-- **Fixtures:** existing tests for each module keep their exit codes; add a golden
-  that the migrated value equals the old fn's value (both engines).
+### Crumb 8 — migrate scalar + Tier-A-aggregate const families (6.1, 6.4)
+- **Step:** replace each 6.1 scalar fn and each 6.4 Tier-A aggregate fn with
+  `pub const …`; update call sites `X()` → `X`. File-by-file (math, compress, lir,
+  io, isel_arm64 i128 trio, `gzip_magic`, `ret_inst`, `rax_x86`/register consts).
+- **Fixtures:** existing per-module tests keep their exit codes; a golden asserts the
+  migrated value equals the old fn's value (both engines).
 - **Ritual:** full gate per file batch (fixpoint gen2==gen3 is the real proof).
 
-### Crumb 8 — migrate enum families (6.2)
+### Crumb 9 — migrate enum families (6.2)
 - **Step:** introduce `enum BlockType/WasmScopeKind/ElideKind/EdgeResult/WasmVType/
   ZipMethod`; replace the tag fns; route wire-byte emission through a single
   `match`-driven `_wire` helper so emitted bytes are byte-identical.
@@ -659,21 +767,51 @@ own source.
   (proves wire compatibility); both engines.
 - **Ritual:** full gate. Wire-byte identity is the acceptance bar.
 
-### Crumb 9 — migrate flags families + file magic (6.3)
+### Crumb 10 — migrate flags families + file magic (6.3)
 - **Step:** `flags ElfSectionFlags/ElfSymInfo/MachoSectionAttr`; named file-magic
   consts. Object-writer golden byte tests must be byte-identical.
 - **Fixtures:** ELF/Mach-O/COFF/wasm object golden tests unchanged; both engines.
 - **Ritual:** full gate.
 
-### Crumb 10 (C-agg-2, optional fast-follow) — aggregate consts → rodata
-- **Step:** the `lower_item` `TConstDecl` arm interns aggregate consts into
-  `m.rodata` (reuse `intern_rodata`) and rewrites uses to `LGlobalAddr`; `[]byte`
-  first (`gzip_magic`), then struct consts (needs a rodata layout serializer +
-  a typed-value load off `LGlobalAddr`).
-- **Fixtures:** `gzip_magic` emits ONE rodata entry, referenced N times; both
-  engines read identical bytes; `m.globals.len == 0` still holds (rodata, not
-  globals).
-- **Ritual:** full gate. Separable PR if it risks the fixpoint.
+### Crumbs S1–S6 — RULING-2 ISA-encoder + writer magic-value sweep (file-by-file)
+Sequenced AFTER crumb 7 (feature in seed). Each file is one crumb; the acceptance
+bar is **frozen machine/object bytes + fixpoint gen2==gen3** — not one emitted byte
+may change. Recurring opcode/mask/field literals → `const`/`enum`/`flags` per W15.
+- **S1** `src/backend/stackify.tks` (109 hits): wasm opcode `enum`, LEB masks →
+  `const`, value-type already via `WasmVType` (crumb 9).
+- **S2** `src/backend/encode_x86_64.tks` (90): ModRM/REX field masks → `const`,
+  opcode families → an `enum`/named table.
+- **S3** `src/backend/encode_arm64.tks` (66): field masks/shifts → `const`.
+- **S4** `src/backend/encode_riscv.tks` (52): funct/opcode fields → `enum`/`const`.
+- **S5** `src/backend/objfile_{elf,macho,coff,wasm}.tks` residual (header fields,
+  alignments) → `const`/`flags` (the file-magic/section-flag families already done
+  in crumb 10; S5 mops up the rest).
+- **S6** remaining `src/compress/*`, `src/crypto/*`, `src/encoding/*` magic literals.
+- **Fixtures (each S*):** the file's existing golden byte tests + a fixpoint run;
+  add a golden ONLY if a constant had no prior byte-level coverage.
+- **Ritual:** full gate per file. Byte-identity is non-negotiable.
+
+### Crumbs T-B1–T-B6 — Tier-B pointer-bearing aggregate → rodata (data-reloc phase)
+A SEPARATE, LATER track (not required by the owner's ~50). Delivers the data→data
+relocation absent today (§5.1), then migrates the ABI descriptors.
+- **T-B1** widen the reloc model: add a patch-site SECTION tag to `RelocX86` /
+  arm64/riscv `Reloc` (today `.text`-only, `encode_x86_64.tks:1310`); the LIR carries
+  a data-section relocation entry for a rodata-internal pointer field.
+- **T-B2** ELF writer: emit a `.rela.rodata` section (add to the section set at
+  `objfile_elf.tks:455`) + its relas.
+- **T-B3** Mach-O + COFF writers: emit rodata-section (`.rdata`) local relocations
+  whose patch site is inside the data section.
+- **T-B4** wasm: compute+write intra-data i32 offsets in the active data segment
+  (`objfile_wasm.tks:640`) — no reloc, but new emit-time resolution.
+- **T-B5** VM (`lir_interp.tks:527`): resolve a rodata-INTERNAL pointer field to its
+  target rodata base at typed load.
+- **T-B6** migrate the ABI descriptors (`sysv64`/`aapcs64`/`riscv64_lp64d`/`win64`)
+  and any other pointer-bearing aggregate to rodata consts.
+- **Fixtures:** `const D: AbiDescriptor = aapcs64_descriptor` emits ONE rodata blob
+  with data relocs to its `[]u32` leaf arrays; both engines read identical register
+  lists; all object goldens updated once, then frozen.
+- **Ritual:** full gate per crumb; regalloc golden tests (they consume the ABI
+  descriptors) must be byte-identical after T-B6.
 
 ---
 
@@ -688,15 +826,20 @@ own source.
    explicit allowlist is less principled than a purity analyzer. *Resolution:*
    ship the allowlist (closed, tiny, reversible; DECISION_LOG); a future `const fn`
    marker supersedes it. Passes all laws; smallest safe step.
-3. **Scope creep from "no magic values" (owner #2).** The full program has 1000s of
-   magic literals (encoders alone: ~300). *Resolution (law-first, issues-are-100%):*
-   #594 delivers the feature + the ~50 nullary consts + object-writer families
-   (6.3); the ISA-encoder sweep is REPORTED UP as a separate w15-retrofit lane, not
-   folded into #594. This keeps #594 at exactly its proposal boundary.
-4. **Aggregate baseline (inline) is not the owner's stated end-state (rodata).**
-   *Resolution:* not a tension — baseline inline is behavior-preserving and
-   backend-free; C-agg-2 delivers the rodata end-state next, gated by the same
-   fixpoint. The owner's "→ rodata" is honored, sequenced for safety.
+3. **Scope of "no magic values" (owner RULING 2).** The ISA encoders hold ~300
+   magic literals over frozen-byte code. *Resolution:* per RULING 2 the sweep is IN
+   #594 (crumbs S1–S6), sequenced after the feature reaches the seed, each file
+   gated by frozen-byte goldens + fixpoint so not one emitted byte moves. This is the
+   dominant regression surface of #594 — the byte-identity bar is the mitigation.
+4. **Data→data relocation does not exist (§5.1) — the RULING-1 hard constraint.**
+   Materializing a pointer-bearing aggregate (ABI descriptors) fully in rodata needs
+   a relocation whose patch site is inside the data section; no writer/encoder/VM
+   emits one. *Resolution:* TIER the aggregates. Tier A (flat-POD / `[]byte`, the
+   entire owner ~50) ships in the feature phase with **zero backend change**. Tier B
+   (pointer-bearing) is a separate backend track (crumbs T-B1–T-B6) that first BUILDS
+   the data-reloc across ELF/Mach-O/COFF/wasm/VM, then migrates. This is the honest
+   answer to "backend fica intocado ou não": **intocado para Tier A / os ~50;
+   TOCADO (3 encoders + 3 writers + wasm emit + VM) para Tier B.**
 5. **`*_empty()` factory misclassification.** Converting a fresh-mutable-seed
    factory to a shared const aliases state → NOT behavior-preserving. *Resolution:*
    6.5 explicitly excludes them; the W15 rule text names the trap.
@@ -715,16 +858,25 @@ No genuine unresolved tension → no HALT.
 - `src/checker/typer.tks` — `type_const_decl` + `type_item` arm.
 - `src/checker/tast.tks` — `TConstDecl`, widen `TItem`.
 - checker pipeline driver — call `inline_consts` after `monomorphize`.
-- `src/lir/lower.tks` — defensive `TConstDecl` no-op arm (+ C-agg-2 rodata later).
+- `src/lir/lower.tks` — `TConstDecl` arm: scalar no-op (inlined upstream) + **Tier-A
+  aggregate rodata materialization** (layout serializer + typed `LGlobalAddr` load).
 - `.tkb` codec (C7.16) — `TConstDecl` encode/decode.
-- migration: `src/math/*`, `src/compress/*`, `src/backend/stackify.tks`,
+- migration (crumbs 8–10): `src/math/*`, `src/compress/*`, `src/backend/stackify.tks`,
   `src/backend/objfile_*.tks`, `src/backend/isel_*.tks`, `src/lir/lir_interp.tks`,
-  `src/io/stream.tks` (crumbs 7–9).
-- ZERO backend encoder files, ZERO C twins.
+  `src/io/stream.tks`, `src/backend/minst.tks`, `src/compress/gzip.tks`.
+- RULING-2 sweep (crumbs S1–S6): `encode_x86_64.tks`, `encode_arm64.tks`,
+  `encode_riscv.tks`, `stackify.tks`, `objfile_*.tks` — frozen bytes.
+- **Feature + Tier A: ZERO backend encoder/writer changes, ZERO C twins.**
+- **Tier B ONLY (crumbs T-B1–T-B6, pointer-bearing aggregates):** the 3 native
+  encoders (reloc section tag), ELF/Mach-O/COFF writers (data-section relocs), wasm
+  data emitter, VM `lir_interp.tks`.
 
 ## 11. Note on bootstrap ordering
 
-Crumbs 1–6 are the FEATURE and must be **released into the bootstrap seed** before
-crumbs 7+ may spell `const`/`enum`/`flags` in the compiler's own `.tks` sources
+Crumbs 1–7 are the FEATURE (scalars inline + Tier-A aggregates → rodata + cross-
+module codec) and must be **released into the bootstrap seed** before crumbs 8+ and
+the S* sweep may spell `const`/`enum`/`flags` in the compiler's own `.tks` sources
 (the corpus must not use a feature not yet in its seed). Sequence the PRs so the
-feature ships and the seed advances, then migrate.
+feature ships and the seed advances, then migrate, then sweep. The Tier-B backend
+track (T-B*) can run in parallel with migration/sweep since it adds a NEW capability
+(data-reloc) rather than depending on the migrated sources.
