@@ -295,11 +295,20 @@ fn checked_program_of(selected: parser::Program, dep_prog: checker::TProgram, re
     checked
 }
 
-// frontend_body — the front-end AFTER the chdir (manifest → discover → assemble → check),
-// operating in the CURRENT directory. Split out so the D4 gate can retry it WITHOUT tests after a
-// test-assembly failure, on the SAME chdir (no second `teko::env::chdir`, which would fail for a
-// relative project dir already entered). `quiet` suppresses the observability output (the gate's
-// retry already reported it on the failed first attempt); `tty` selects in-place `\r` phase updates.
+/**
+ * The front-end AFTER the chdir (manifest -> discover -> assemble -> check),
+ * operating in the CURRENT directory. Split out so the D4 gate can retry it
+ * WITHOUT tests after a test-assembly failure, on the SAME chdir (no second
+ * `teko::env::chdir`, which would fail for a relative project dir already
+ * entered).
+ *
+ * @param include_tests  assemble the `.tkt` test files into the merged program too
+ * @param quiet          suppress the observability output (the gate's retry already
+ *                       reported it on the failed first attempt)
+ * @param tty            render the `lexer`/`parser`/`checker`/`monomorph` phases'
+ *                       in-place `\r` updates (BUILD-OUTPUT OBSERVABILITY)
+ * @return               the checked program and manifest, or the first error
+ */
 fn frontend_body(include_tests: bool, quiet: bool, tty: bool) -> Frontend | error {
     // --- find + read + parse the manifest (the single <name>.tkp at the root — A1) ---
     let mname = match find_manifest() { str as n => n; error as e => return e }
@@ -327,9 +336,6 @@ fn frontend_body(include_tests: bool, quiet: bool, tty: bool) -> Frontend | erro
     }
     match check_main_file_rule(m.artifact, has_main) { Artifact => { }; error as e => return e }
 
-    // --- BUILD-OUTPUT OBSERVABILITY (M.3 — see WHERE a build is): the version banner + the
-    // project header. The per-file wall this used to print is superseded by the `lexer`/
-    // `parser` phase counters `assemble_sel` reports below.
     if !quiet {
         teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
         teko::io::eprintln(teko::str::concat("project '", m.name, teko::str::concat("' (source=", m.source, ")")))
@@ -348,7 +354,6 @@ fn frontend_body(include_tests: bool, quiet: bool, tty: bool) -> Frontend | erro
     // and reference dep types. m.deps is empty when there is no [dependencies] section → no-op.
     let dep_prog = match load_deps_program(m) { checker::TProgram as p => p; error as e => return e }
 
-    // --- check + monomorphize the WHOLE merged program (M.1), reporting both as their own phases ---
     let checked = match checked_program_of(selected, dep_prog, !quiet, tty) { checker::TProgram as c => c; error as e => return e }
 
     Frontend { prog = checked; manifest = m }
