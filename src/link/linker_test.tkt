@@ -1,0 +1,178 @@
+/**
+ * lt_two_symbol_object — the L1-1 gating fixture's own `ElfObject`: a defined `.text` function
+ * `main` at section-relative offset 0, an undefined extern `tk_exit`, a one-byte `.text` image,
+ * and one `Plt32`-shaped relocation (`rtype` 4, `R_X86_64_PLT32`) at `.text` offset 1 targeting
+ * `tk_exit` with addend -4 — the minimal two-symbol shape the plan names for the model
+ * round-trip.
+ *
+ * @return teko::backend::ElfObject  the two-symbol own object
+ */
+fn lt_two_symbol_object() -> teko::backend::ElfObject {
+    let main_sym = teko::backend::Symbol { name = "main"; defined = true; sect = 1 to u8; offset = 0 to u32; local = false }
+    let undef_sym = teko::backend::Symbol { name = "tk_exit"; defined = false; sect = 0 to u8; offset = 0 to u32; local = false }
+    let reloc = teko::backend::ElfRelocReq { offset = 1 to u32; sym = "tk_exit"; rtype = 4 to u32; addend = (0 to i64) - (4 to i64) }
+    teko::backend::ElfObject {
+        e_machine = 62 to u32
+        e_flags = 0 to u32
+        text = [0xE8 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
+        rodata = teko::list::empty()
+        symbols = [main_sym, undef_sym]
+        relocs = [reloc]
+    }
+}
+
+/**
+ * lt_rodata_local_object — a riscv64 own `ElfObject` carrying a single file-local `.rodata`
+ * datum (`sect` 2, `local` true) and no relocations: exercises the `.rodata`-section mapping and
+ * the `Local` binding branch the two-symbol fixture does not reach.
+ *
+ * @return teko::backend::ElfObject  the rodata-local-only own object
+ */
+fn lt_rodata_local_object() -> teko::backend::ElfObject {
+    let rodata_sym = teko::backend::Symbol { name = "s0"; defined = true; sect = 2 to u8; offset = 3 to u32; local = true }
+    teko::backend::ElfObject {
+        e_machine = 243 to u32
+        e_flags = 0x0004 to u32
+        text = teko::list::empty()
+        rodata = [0x41 to byte]
+        symbols = [rodata_sym]
+        relocs = teko::list::empty()
+    }
+}
+
+/**
+ * lt_empty_object — an own `ElfObject` with no text, no rodata, no symbols, and no relocations:
+ * the degenerate base case exercising the zero-iteration path of every lifting loop in
+ * `elf_to_link_object`.
+ *
+ * @return teko::backend::ElfObject  the empty own object
+ */
+fn lt_empty_object() -> teko::backend::ElfObject {
+    teko::backend::ElfObject {
+        e_machine = 62 to u32
+        e_flags = 0 to u32
+        text = teko::list::empty()
+        rodata = teko::list::empty()
+        symbols = teko::list::empty()
+        relocs = teko::list::empty()
+    }
+}
+
+#test
+/**
+ * elf_to_link_object_maps_machine_flags_and_origin — the two-symbol fixture's `e_machine`/
+ * `e_flags` ride through unchanged and `origin` is the own-object marker `"<own>"`.
+ *
+ * @return void
+ */
+fn elf_to_link_object_maps_machine_flags_and_origin() {
+    let lo = elf_to_link_object(lt_two_symbol_object())
+    teko::assert::is_true(lo.e_machine == (62 to u32))
+    teko::assert::is_true(lo.e_flags == (0 to u32))
+    teko::assert::is_true(lo.origin == "<own>")
+}
+
+#test
+/**
+ * elf_to_link_object_maps_sections — the two-symbol fixture's sections are `[.text, .rodata]`
+ * in that order, each carrying its kind, name, and byte image.
+ *
+ * @return void
+ */
+fn elf_to_link_object_maps_sections() {
+    let lo = elf_to_link_object(lt_two_symbol_object())
+    teko::assert::is_true(lo.sections.len == (2 to u64))
+    teko::assert::is_true(lo.sections[0].kind == LinkSecKind::Text)
+    teko::assert::is_true(lo.sections[0].name == ".text")
+    teko::assert::is_true(lo.sections[0].bytes.len == (5 to u64))
+    teko::assert::is_true(lo.sections[0].size == (5 to u64))
+    teko::assert::is_true(lo.sections[1].kind == LinkSecKind::Rodata)
+    teko::assert::is_true(lo.sections[1].name == ".rodata")
+    teko::assert::is_true(lo.sections[1].bytes.len == (0 to u64))
+    teko::assert::is_true(lo.sections[1].size == (0 to u64))
+}
+
+#test
+/**
+ * elf_to_link_object_maps_defined_global_symbol — the fixture's defined `main` symbol maps to a
+ * `Global`-bound, `.text`-section (index 0), exported `LinkSym` at offset 0.
+ *
+ * @return void
+ */
+fn elf_to_link_object_maps_defined_global_symbol() {
+    let lo = elf_to_link_object(lt_two_symbol_object())
+    let s = lo.symbols[0]
+    teko::assert::is_true(s.name == "main")
+    teko::assert::is_true(s.defined == true)
+    teko::assert::is_true(s.binding == SymBinding::Global)
+    teko::assert::is_true(s.sec == (0 to u32))
+    teko::assert::is_true(s.offset == (0 to u32))
+    teko::assert::is_true(s.exported == true)
+}
+
+#test
+/**
+ * elf_to_link_object_maps_undefined_symbol — the fixture's undefined `tk_exit` reference maps to
+ * `defined = false`, `Global` binding, and `exported = false` (nothing to keep alive here).
+ *
+ * @return void
+ */
+fn elf_to_link_object_maps_undefined_symbol() {
+    let lo = elf_to_link_object(lt_two_symbol_object())
+    let s = lo.symbols[1]
+    teko::assert::is_true(s.name == "tk_exit")
+    teko::assert::is_true(s.defined == false)
+    teko::assert::is_true(s.binding == SymBinding::Global)
+    teko::assert::is_true(s.exported == false)
+}
+
+#test
+/**
+ * elf_to_link_object_maps_relocation — the fixture's lone relocation maps to a `.text`-section
+ * (index 0) `LinkReloc` carrying the same offset, target name, numeric type, and addend.
+ *
+ * @return void
+ */
+fn elf_to_link_object_maps_relocation() {
+    let lo = elf_to_link_object(lt_two_symbol_object())
+    teko::assert::is_true(lo.relocs.len == (1 to u64))
+    let r = lo.relocs[0]
+    teko::assert::is_true(r.sec == (0 to u32))
+    teko::assert::is_true(r.offset == (1 to u32))
+    teko::assert::is_true(r.sym == "tk_exit")
+    teko::assert::is_true(r.rtype == (4 to u32))
+    teko::assert::is_true(r.addend == ((0 to i64) - (4 to i64)))
+}
+
+#test
+/**
+ * elf_to_link_object_maps_local_rodata_symbol_to_rodata_section — a file-local `.rodata` symbol
+ * maps to `Local` binding, the `.rodata` section index (1), and `exported = false` (private to
+ * its object); the riscv64 `e_machine`/`e_flags` ride through unchanged.
+ *
+ * @return void
+ */
+fn elf_to_link_object_maps_local_rodata_symbol_to_rodata_section() {
+    let lo = elf_to_link_object(lt_rodata_local_object())
+    teko::assert::is_true(lo.e_machine == (243 to u32))
+    teko::assert::is_true(lo.e_flags == (0x0004 to u32))
+    let s = lo.symbols[0]
+    teko::assert::is_true(s.binding == SymBinding::Local)
+    teko::assert::is_true(s.sec == (1 to u32))
+    teko::assert::is_true(s.offset == (3 to u32))
+    teko::assert::is_true(s.exported == false)
+}
+
+#test
+/**
+ * elf_to_link_object_handles_empty_object — an own object with no symbols and no relocations
+ * still yields the fixed `[.text, .rodata]` sections and empty symbol/reloc lists.
+ *
+ * @return void
+ */
+fn elf_to_link_object_handles_empty_object() {
+    let lo = elf_to_link_object(lt_empty_object())
+    teko::assert::is_true(lo.symbols.len == (0 to u64))
+    teko::assert::is_true(lo.relocs.len == (0 to u64))
+    teko::assert::is_true(lo.sections.len == (2 to u64))
+}

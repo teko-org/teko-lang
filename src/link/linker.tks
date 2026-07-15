@@ -1,0 +1,144 @@
+/**
+ * LinkSecKind — the section classes E1 lays out: Text (R+X), Rodata (R), Data (RW), Bss (RW,
+ * no file bytes), InitArray/FiniArray (RW, order-preserving), Other (a named section carried
+ * verbatim for a foreign object — placed by flags, never interpreted).
+ *
+ * @since #392 L1-1
+ */
+pub type LinkSecKind = enum { Text; Rodata; Data; Bss; InitArray; FiniArray; Other }
+
+/**
+ * LinkSection — one input section image: its kind, its ELF name (foreign sections keep their
+ * name for --prune-dead + merge keying), the SHF flags (alloc/exec/write/merge), the bytes
+ * (empty for Bss), and the in-memory size.
+ *
+ * @since #392 L1-1
+ */
+pub type LinkSection = struct {
+    /**
+     * kind — the section class driving segment placement.
+     */
+    kind: LinkSecKind
+    /**
+     * name — the ELF section name (e.g. ".text", ".rodata.str1.1").
+     */
+    name: str
+    /**
+     * flags — the SHF_* bitset (SHF_ALLOC/EXECINSTR/WRITE/MERGE/STRINGS).
+     */
+    flags: u64
+    /**
+     * bytes — the section image (empty for Bss).
+     */
+    bytes: []byte
+    /**
+     * size — the in-memory size (== bytes.len except Bss).
+     */
+    size: u64
+}
+
+/**
+ * SymBinding — ELF symbol binding: Local (private), Global (strong), Weak (yields to a strong
+ * definition; an unresolved weak resolves to 0, never an error).
+ *
+ * @since #392 L1-1
+ */
+pub type SymBinding = enum { Local; Global; Weak }
+
+/**
+ * LinkSym — a symbol in the neutral table: name, whether THIS object defines it, its binding
+ * (Local/Global/Weak — weak loses to a strong global, never a duplicate error), the defining
+ * section index within its object, the in-section offset, and whether it is exported (a
+ * --prune-dead root beyond the entry point).
+ *
+ * @since #392 L1-1
+ */
+pub type LinkSym = struct {
+    /**
+     * name — the final (unprefixed) symbol name.
+     */
+    name: str
+    /**
+     * defined — true iff the owning object defines it.
+     */
+    defined: bool
+    /**
+     * binding — Local | Global | Weak.
+     */
+    binding: SymBinding
+    /**
+     * sec — the defining section's index within its object (meaningful when defined).
+     */
+    sec: u32
+    /**
+     * offset — the definition's byte offset within that section.
+     */
+    offset: u32
+    /**
+     * exported — true iff a --prune-dead reachability root (entry or an exported global).
+     */
+    exported: bool
+}
+
+/**
+ * LinkReloc — one relocation: the patched field's offset within its object's section `sec`,
+ * the target symbol name, the numeric R_<arch>_* type, and the addend.
+ *
+ * @since #392 L1-1
+ */
+pub type LinkReloc = struct {
+    /**
+     * sec — the index of the section whose bytes hold the patched field.
+     */
+    sec: u32
+    /**
+     * offset — the field offset within that section.
+     */
+    offset: u32
+    /**
+     * sym — the target symbol name (resolved at L1-3).
+     */
+    sym: str
+    /**
+     * rtype — the numeric R_<arch>_* code (arch-dispatched at L1-6/L1-12).
+     */
+    rtype: u32
+    /**
+     * addend — the r_addend.
+     */
+    addend: i64
+}
+
+/**
+ * LinkObject — one relocatable input: its machine id, its sections, its symbols, and its
+ * relocations. Built by elf_to_link_object (in-memory own object), parse_elf_object (a disk
+ * `.o`, L1-2), or an archive member (L1-4).
+ *
+ * @since #392 L1-1
+ */
+pub type LinkObject = struct {
+    /**
+     * e_machine — 62 (x86-64) or 243 (riscv); the whole link must agree.
+     */
+    e_machine: u32
+    /**
+     * e_flags — 0 (x86-64) or 0x0004 (RV64 LP64D).
+     */
+    e_flags: u32
+    /**
+     * origin — the input's provenance (a path or "<own>"), for diagnostics.
+     */
+    origin: str
+    /**
+     * sections — the object's section images.
+     */
+    sections: []LinkSection
+    /**
+     * symbols — the object's symbol table.
+     */
+    symbols: []LinkSym
+    /**
+     * relocs — the object's relocations.
+     */
+    relocs: []LinkReloc
+}
