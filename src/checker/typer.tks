@@ -4391,6 +4391,45 @@ fn type_struct_methods(td: parser::TypeDecl, item_ns: str, file: str, env: Env, 
     out
 }
 
+/**
+ * type_const_decl — pass-2 typing for a module-level constant (#594 crumb 4): resolve the declared
+ * type, type the initializer against it (adopting a fitting bare literal to the declared narrow
+ * width exactly as `type_binding` does, so `const K: u8 = 300` reports an out-of-range error while
+ * `const K: u8 = 1` narrows the leaf), then gate the checked initializer through `is_const_expr`
+ * (the D1 grammar). The returned TConstDecl carries the checked initializer the inliner substitutes
+ * at each use site; its `namespace` is seeded from `env.cur_ns` and re-stamped by `type_item` from
+ * the item's provenance.
+ *
+ * @param cd     the parsed const declaration
+ * @param env    the pass-2 environment (top-level names — including sibling consts — bound)
+ * @param table  the program's type table
+ * @return       the typed constant, or a located error on a type mismatch, an out-of-range literal,
+ *               a `void`/element-less initializer, or a non-const initializer form
+ * @throws       a type-mismatch error (expected the declared type, found the initializer's) when the
+ *               initializer neither is assignable to nor adopts the declared type; the `is_const_expr`
+ *               error naming the offending form when the initializer is not a legal const-expr
+ * @since #594
+ */
+fn type_const_decl(cd: parser::ConstDecl, env: Env, table: TypeTable) -> TConstDecl | error {
+    let at = match resolve_type(cd.ty, table, env.cur_ns) { Type as t => t; error as e => return e }
+    mut v = match type_value_expected(cd.init, at, env, table) { TExpr as te => te; error as e => return e }
+    if type_is_void(v.type) { return error { message = "a const initializer cannot be a `void` expression — it yields no value (M.1)" } }
+    if !assignable_to(v.type, at, table) {
+        match annotated_literal_ok(cd.init, at) {
+            null => v = retype_literal(v, at)
+            error as e => return teko::error::err_typed(e, type_render(at), type_render(v.type))
+        }
+    }
+    let at_is_sentinel_slice = match at { Slice as bs => match bs.element { Void => true; _ => false }; _ => false }
+    if at_is_sentinel_slice {
+        return error { message = "a const of an element-less slice type needs a concrete element (e.g. `const XS: []u8 = …`)" }
+    }
+    let v_is_sentinel_slice = match v.type { Slice as vs => match vs.element { Void => true; _ => false }; _ => false }
+    if v_is_sentinel_slice { v = TExpr { kind = v.kind; type = at; line = v.line; col = v.col } }
+    match is_const_expr(v, table, env) { error as e => return e; null => { } }
+    TConstDecl { name = cd.name; namespace = env.cur_ns; ty = at; init = v; vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col }
+}
+
 fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
     match item.content {
         parser::Function as f => {
@@ -4412,7 +4451,10 @@ fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
             let ts = match type_statement(s, env, table) { TypedStmt as x => x; error as e => return e }
             ts.node
         }
-        parser::ConstDecl => error { message = "const item: typer typing is crumb 4 (#594)" }
+        parser::ConstDecl as cd => {
+            let ti = match type_const_decl(cd, env, table) { TConstDecl as x => x; error as e => return e }
+            TConstDecl { name = ti.name; namespace = item.namespace; ty = ti.ty; init = ti.init; vis = ti.vis; has_doc = ti.has_doc; doc = ti.doc; line = cd.line; col = cd.col }
+        }
     }
 }
 
@@ -4539,6 +4581,7 @@ pub fn type_program_with_deps_pre_mono(raw_program: parser::Program, dep_prog: T
         match it.content {
             parser::Function as f => { line = f.line; col = f.col }
             parser::TypeDecl as td => { line = td.line; col = td.col }
+            parser::ConstDecl as cd => { line = cd.line; col = cd.col }
             _ => { }
         }
         match it.content {
@@ -4633,6 +4676,7 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
         match it.content {
             parser::Function as f => { line = f.line; col = f.col }
             parser::TypeDecl as td => { line = td.line; col = td.col }
+            parser::ConstDecl as cd => { line = cd.line; col = cd.col }
             _ => { }
         }
         // a loose top-level Statement is typed directly so its node also feeds the virtual-main's
