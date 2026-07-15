@@ -6,20 +6,21 @@
 # A successful cross-COMPILE is NOT by itself a correctness argument: `zig cc` differs from the
 # native clang/gcc that built every release <= v0.0.1.21 in two ways that the emitted teko.c's
 # latent undefined behaviour makes fatal, and BOTH must be neutralised here:
-#   1. `-O0` (not `-O1`/`-O2`) — at any optimizing level zig EXPLOITS residual UB into a MISCOMPILE
-#      (the checker mis-resolves a call and rejects the compiler's own valid source, x86_64-only).
-#      #283 removed ONE such UB (the uninitialized match-as-value result temp, now `= {0}`), which
-#      cleared all `-Wsometimes-uninitialized`, but a SECOND x86_64 UB survives: the cross-run of
-#      the `-O1`/`-O2` x86_64 artifact over the corpus still emits a false `argument type mismatch`
-#      at src/checker/match.tks:228 (and `-fno-strict-aliasing` does not cure it). Until that
-#      residual UB is found and fixed at the source, the release stays at `-O0` (which self-builds
-#      the corpus to exit 0). See the #283 HALT report.
+#   1. `-O2` (release optimization — the seed-speed win, owner ruling). HISTORY: zig USED to exploit
+#      residual UB into a MISCOMPILE at any optimizing level (the checker mis-resolved a call and
+#      rejected the compiler's own valid source, x86_64-only). #283 removed ONE such UB (the
+#      uninitialized match-as-value result temp, now `= {0}`); the SECOND x86_64 UB (a false
+#      `argument type mismatch` at src/checker/match.tks:228 under `-O1`/`-O2`) was closed by #577's
+#      `__attribute__((noinline))` on self-recursive functions (same LLVM inline+TRE class). VERIFIED
+#      2026-07-15: zig `-O0`/`-O1`/`-O2` all self-host the corpus to exit 0, byte-identical emitted
+#      teko.c, zero false errors — so Linux now ships at `-O2`. The x86_64 smoke (below) RUNS the
+#      artifact, so any future miscompile re-reddens loudly instead of shipping.
 #   2. `-fno-sanitize=undefined` — zig cc enables UBSan TRAPS by default (native cc does not), so
 #      the one boundary INT64_MIN-negation in the checker's int_fits range-check aborts the
 #      process the moment it type-checks any `i64` literal near the low bound. Disabling the trap
 #      restores the native cc behaviour (the UB itself is benign here: the compared bound is
 #      correct once the negation is allowed to wrap).
-# With both, `zig cc -O0 -fno-sanitize=undefined` self-builds the whole corpus to exit 0.
+# With both, `zig cc -O2 -fno-sanitize=undefined` self-builds the whole corpus to exit 0.
 # Correctness over the marginal speed of a transient bootstrap tool run a handful of times per
 # release. The `file` architecture assertion still guards a wrong-arch/failed compile; the
 # release-cross-smoke job (native.yml) additionally RUNS the x86_64 artifact so a future
@@ -67,7 +68,7 @@ build_one() {
     rm -rf "$gd"; mkdir -p "$gd"
     extra=""
     [ "$static" = "1" ] && extra="-static"
-    zig cc -target "$triple" -std=c2x -w -O0 -fno-sanitize=undefined \
+    zig cc -target "$triple" -std=c2x -w -O2 -fno-sanitize=undefined \
         "-DTEKO_VERSION_STRING=$TEKO_VERSION_STRING" $extra \
         -I"$SRC/runtime" -I"$SRC/assert" \
         "$TEKO_C" "$SRC/runtime/teko_rt.c" "$SRC/assert/assert.c" -lm \

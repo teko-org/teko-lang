@@ -195,10 +195,12 @@ jobs:
           TEKO_DIFF_TARGET: riscv64-linux
         run: ./scripts/diff_c_own.sh
 
-  # ── gen1 checks: self-test, CLI surface, and the own==C differential (issue #524) ──
+  # ── gen1 checks: CLI surface and the own==C differential (issue #524) ──
   # Builds gen1 (the PR's compiler under test) from the downloaded release seed, then runs
-  # its own gate + CLI-surface smokes + the CWD-build-regression check (#64) + the own AOT
-  # backend == C backend differential. The own==C differential is the replacement
+  # CLI-surface smokes + the CWD-build-regression check (#64) + the own AOT backend == C
+  # backend differential. Test EXECUTION (`teko test .`) was moved to the isolated
+  # tests.yml (owner design 2026-07-15 — one test runner per OS, in parallel with these
+  # diagnostics), so it is NO LONGER run here. The own==C differential is the replacement
   # cross-check for the retired VM==native harness (issue #524): the VM shared the
   # front-end with native but not codegen, so it protected little there while its
   # wrapper-descent bug (VM-only) cost real false-failures — see
@@ -222,17 +224,11 @@ jobs:
             label: macos-arm64
             install_deps: ""
 
-    # Budget raised 20 → 45 min (issue #524 crumb 2). `teko test` is now the NATIVE gate
-    # (docs/design/vm-retirement.md §2.1): "gen1 self-test" below runs a full front-end
-    # pass PLUS a real codegen+compile+run of the whole self-hosted corpus's test-profile
-    # TU (~17 MB of generated C, #test count in the thousands) — the SAME heavy pass
-    # "Build gen1" below already pays once. The previous VM-interpreted `teko test .` was
-    # wall-clock-cheap (even though memory-heavier); the native replacement is NOT a hang
-    # (verified via a Linux/arm64 Docker repro: the command completes in ~6 minutes
-    # there) — it is a genuine throughput increase that no longer fits the old 20-minute
-    # budget on the slower shared ubuntu-latest runner: this job was ALREADY at 15m29s of
-    # the 20-minute cap before this repoint (build-test's own equivalent full-D4-gate
-    # step has no timeout cap and already needs ~9 minutes there).
+    # Budget kept at 45 min (issue #524 crumb 2). With the heavy `teko test .` self-test now
+    # moved OUT to tests.yml (owner design 2026-07-15), this job only builds gen1 once and runs
+    # the lighter CLI-surface smokes + own==C differential, so it comfortably fits the cap — the
+    # generous budget is retained as headroom for the single "Build gen1" native pass on the
+    # slower shared ubuntu-latest runner.
     name: gen1 checks / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -268,9 +264,12 @@ jobs:
         shell: bash
         run: teko . -o bin
 
-      - name: gen1 self-test (the PR's compiler runs its own gate)
-        shell: bash
-        run: ./bin/teko test .
+      # NOTE (owner design 2026-07-15): the "gen1 self-test" step (`./bin/teko test .`) was
+      # MOVED OUT of this job into the isolated .github/workflows/tests.yml, which runs the
+      # suite once per OS (1 linux, 1 macOS, 1 windows) in PARALLEL with these diagnostics —
+      # "assim não precisa rodar testes nestes outros diagnósticos para nenhum SO ou Arch."
+      # This job now builds gen1 and validates the CLI surface + the own==C differential ONLY;
+      # test EXECUTION lives entirely in tests.yml.
 
       - name: CLI flags on gen1 (identical version string)
         shell: bash

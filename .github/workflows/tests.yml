@@ -1,0 +1,211 @@
+name: Tests
+
+# ISOLATED test-execution workflow (owner design 2026-07-15): the `teko test .` self-test suite
+# runs HERE — one runner per OS (1 linux, 1 macOS, 1 windows), in PARALLEL with the other tracks
+# (native.yml, sanitizers.yml). Owner's words: "criar em cada ambiente (um por SO: 1 mac, 1 linux
+# e 1 windows) testes em um yml separado, para fugir dos gargalos e que roda em paralelo com as
+# outras trilhas, assim não precisa rodar testes nestes outros diagnósticos para nenhum SO ou
+# Arch." The other workflows' diagnostic jobs therefore NO LONGER run `teko test .` for any OS/arch
+# (native.yml's gen1-checks self-test step was removed when this workflow was added).
+#
+# CI runs on PULL REQUESTS (the per-PR gate) plus PUSHES to main + remodel/** integration branches.
+on:
+  pull_request:
+    branches: [main, master, chore/reboot, 'remodel/**']
+  push:
+    branches: [main, 'remodel/**']
+    paths-ignore: ['**.md', 'docs/**']
+
+# Restrict default token scope for all jobs in this workflow.
+permissions:
+  contents: read
+
+jobs:
+  # ── path filter ──────────────────────────────────────────────────────────────
+  # Skips the heavy test suite when nothing relevant changed (e.g. docs-only PRs). The
+  # markdown-only guard mirrors native.yml: the allowlist globs (src/**, tests/**, …) also
+  # match Markdown inside those trees, so skip only when EVERY matched file is *.md — any
+  # single non-Markdown match still forces the full run (fail-safe: can under-skip, never
+  # over-skip). The gate job always runs so a required check is always reported.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          list-files: shell
+          filters: |
+            run:
+              - 'src/**'
+              - 'tests/**'
+              - 'examples/**'
+              - 'scripts/**'
+              - '.github/workflows/tests.yml'
+
+      - name: Decide (skip when the change is Markdown-only)
+        id: decide
+        shell: bash
+        env:
+          MATCHED: ${{ steps.filter.outputs.run }}
+          FILES: ${{ steps.filter.outputs.run_files }}
+        run: |
+          if [ "$MATCHED" != "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No allowlisted path changed — nothing to test."
+            exit 0
+          fi
+          run=false
+          for f in $FILES; do
+            case "$f" in
+              *.md) ;;                 # Markdown — does not, by itself, force a run
+              *)    run=true ;;        # any non-Markdown match forces the full suite
+            esac
+          done
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          if [ "$run" = "true" ]; then
+            echo "Non-Markdown changes present — running the test suite."
+          else
+            echo "Markdown-only change under the allowlisted paths — skipping the suite."
+          fi
+
+  # ── test / linux ─────────────────────────────────────────────────────────────
+  # Provision the released seed, build gen1 (the PR's compiler under test — the seed compiles
+  # the PR corpus into bin/teko), then run gen1's own full test suite (`teko test .`). This is
+  # the SAME heavy native pass gen1-checks used to run; it now lives here so it parallels the
+  # diagnostics instead of blocking them. 45-min budget matches the former gen1-checks cap.
+  test-linux:
+    name: test / linux
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision teko from the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh linux-x86_64
+
+      - name: Build gen1 (released seed compiles the PR corpus → bin/teko)
+        shell: bash
+        run: teko . -o bin
+
+      - name: gen1 self-test (the PR's compiler runs its own gate)
+        shell: bash
+        run: ./bin/teko test .
+
+  # ── test / macos ─────────────────────────────────────────────────────────────
+  test-macos:
+    name: test / macos
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision teko from the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh macos-arm64
+
+      - name: Build gen1 (released seed compiles the PR corpus → bin/teko)
+        shell: bash
+        run: teko . -o bin
+
+      - name: gen1 self-test (the PR's compiler runs its own gate)
+        shell: bash
+        run: ./bin/teko test .
+
+  # ── test / windows ───────────────────────────────────────────────────────────
+  # The owner's "1 per OS" design explicitly includes Windows. HISTORICAL CAVEAT: the Windows
+  # gen1 BUILD alone is ~11 min on the shared runner, and the previous attempt to also run the
+  # full `teko test .` on top of it blew both the 20- and 30-min caps (owner ruling 2026-07-14 —
+  # sanitizers.yml's windows-selfhost only builds + `--version` smokes). This job is WIRED per the
+  # new design with a generous cap so CI can reveal the ACTUAL duration now that tests run on their
+  # own isolated runner (no other diagnostic work competing on this box). If it still exceeds the
+  # cap it may need the same build-time relief the perf phase is bringing to the other lanes — do
+  # NOT silently drop it; the owner wants one test runner per OS.
+  test-windows:
+    name: test / windows
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision teko from the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci_provision_teko.sh windows-x86_64
+
+      - name: Build gen1 (released seed compiles the PR corpus → bin/teko)
+        shell: bash
+        run: teko . -o bin
+
+      - name: gen1 self-test (the PR's compiler runs its own gate)
+        shell: pwsh
+        run: |
+          .\bin\teko.exe test .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # ── test suite gate: aggregates the three per-OS test runners ──────────────────
+  # Stable required-check name for the branch ruleset. Passes when every test job succeeded or
+  # was skipped (docs-only PR); fails if any failed or was cancelled. Mirrors the aggregator
+  # pattern in native.yml (`CI gate`) and sanitizers.yml (`Sanitizer gate`).
+  test-suite-gate:
+    name: Test suite gate
+    runs-on: ubuntu-latest
+    needs: [changes, test-linux, test-macos, test-windows]
+    if: always()
+    permissions: {}
+    steps:
+      - name: Evaluate results
+        run: |
+          LINUX="${{ needs.test-linux.result }}"
+          MACOS="${{ needs.test-macos.result }}"
+          WINDOWS="${{ needs.test-windows.result }}"
+          CHANGES="${{ needs.changes.outputs.run }}"
+
+          echo "changes.run   = $CHANGES"
+          echo "test / linux  = $LINUX"
+          echo "test / macos  = $MACOS"
+          echo "test / windows = $WINDOWS"
+
+          # If the paths filter said nothing relevant changed, everything skipped → OK
+          if [ "$CHANGES" != "true" ]; then
+            echo "No relevant files changed — test suite gate passes."
+            exit 0
+          fi
+
+          FAILED=0
+          for RESULT in "$LINUX" "$MACOS" "$WINDOWS"; do
+            if [ "$RESULT" = "failure" ] || [ "$RESULT" = "cancelled" ]; then
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" = "1" ]; then
+            echo "ERROR: one or more per-OS test runners failed or were cancelled."
+            exit 1
+          fi
+
+          echo "Test suite gate passed."
+          exit 0

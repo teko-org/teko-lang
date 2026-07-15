@@ -1,0 +1,234 @@
+/**
+ * src/build/progress.tks   (namespace 'teko::build')
+ *
+ * BUILD-OUTPUT OBSERVABILITY — the per-phase progress reporter `teko build` (and the
+ * bare-project invocation) uses in place of the historical one-line-per-file wall.
+ * Every phase (lexer, parser, checker, monomorph, codegen, emit C, cc) prints a START,
+ * an in-place `\r`-updating counter WHILE the phase works (on a TTY only), and a SETTLE
+ * line carrying the elapsed time and a `✓`/`✗` mark. All output goes to stderr — the C
+ * standard library never buffers stderr, so a `\r` update is visible immediately with no
+ * new runtime seam (stdout, by contrast, is block- or line-buffered and would need an
+ * `fflush` primitive this compiler's released seed does not expose).
+ */
+
+/**
+ * Whether the build's phase output should render as an interactive TTY (in-place `\r`
+ * updates) rather than one settled line per phase (CI/log-safe, no `\r`).
+ *
+ * INTERIM ENV HEURISTIC — isolated here as the ONE place to swap for a real
+ * `isatty(stdout)` once that runtime seam is staged (a new C-twin FFI is out of scope
+ * for this change). Until then: `no_tty` (the CLI `--no-tty` override) always wins and
+ * forces the plain form; else a non-empty `CI` variable, or an empty/`"dumb"` `TERM`,
+ * is treated as non-interactive (piped, redirected, or a CI runner); anything else is
+ * treated as a real terminal.
+ *
+ * @param no_tty  the `--no-tty` CLI override (forces the plain, non-interactive form)
+ * @return        true iff the build should render in-place `\r`-updating phase lines
+ */
+pub fn output_is_tty(no_tty: bool) -> bool {
+    if no_tty { return false }
+    let ci = match teko::env::var("CI") { str as v => v; error => "" }
+    if ci.len > 0 { return false }
+    let term = match teko::env::var("TERM") { str as v => v; error => "" }
+    if term.len == 0 { return false }
+    term != "dumb"
+}
+
+/**
+ * One in-flight build phase: its label, start time, and whether it renders live
+ * `\r`-updating text (`visible`) or settles silently until its one final line.
+ *
+ * @field label    the fixed-width-padded phase name ("lexer", "checker", "cc", ...)
+ * @field start    when the phase began, as nanoseconds since the Unix epoch (see
+ *                 `now_ns` — plain `i128` rather than `teko::time::DateTime`, whose
+ *                 struct wrapper cannot round-trip through a stored local/field)
+ * @field visible  true iff this phase should print in-place `\r` updates while it runs
+ */
+pub type Phase = struct {
+    label: str
+    start: i128
+    visible: bool
+}
+
+/**
+ * The current wall-clock time as nanoseconds since the Unix epoch. Chains
+ * `teko::time::datetime_now()` straight into `datetime_to_unix_ns` in ONE expression
+ * (never binding the intermediate `DateTime` to a local) because storing that
+ * struct in a Teko-level local or field does not round-trip through codegen's
+ * extern-struct marshalling — the plain `i128` it unwraps to has no such gap.
+ *
+ * @return nanoseconds since the Unix epoch
+ */
+fn now_ns() -> i128 {
+    teko::time::datetime_to_unix_ns(teko::time::datetime_now())
+}
+
+/**
+ * `s` right-padded with spaces to at least `width` bytes — column alignment for the
+ * phase label / counter fields.
+ *
+ * @param s      the text to pad
+ * @param width  the minimum output width
+ * @return       `s`, followed by enough spaces to reach `width`
+ */
+fn pad_right(s: str, width: u64) -> str {
+    mut out = s
+    loop {
+        if out.len >= width { break }
+        out = teko::str::concat(out, " ")
+    }
+    out
+}
+
+/**
+ * `s` left-padded with spaces to at least `width` bytes — right-aligning the elapsed
+ * time column.
+ *
+ * @param s      the text to pad
+ * @param width  the minimum output width
+ * @return       enough leading spaces to reach `width`, followed by `s`
+ */
+fn pad_left(s: str, width: u64) -> str {
+    mut out = s
+    loop {
+        if out.len >= width { break }
+        out = teko::str::concat(" ", out)
+    }
+    out
+}
+
+/**
+ * The wall time elapsed since `start` (nanoseconds since the epoch, see `now_ns`),
+ * rendered to one decimal place of seconds ("42.1", no unit suffix — the caller
+ * appends "s"). A negative span (a clock that moved backward) floors to zero
+ * rather than rendering a negative time.
+ *
+ * @param start  the phase's recorded start time, in nanoseconds since the epoch
+ * @return       the elapsed seconds, one decimal place, as decimal text
+ */
+fn elapsed_str(start: i128) -> str {
+    let ns = now_ns() - start
+    let ns_u = if ns < 0 { 0 to u64 } else { ns to u64 }
+    let tenths = ns_u / 100000000
+    $"{tenths / 10}.{tenths % 10}"
+}
+
+/**
+ * The "N/M unit" counter text for a phase whose total is known up front
+ * (`"122/122 files"`, `"789/789 items"`).
+ *
+ * @param count  how many units are done so far
+ * @param total  the known total unit count
+ * @param unit   the unit name ("files", "items", "instances", ...)
+ * @return       the rendered counter text
+ */
+pub fn count_unit_text(count: u64, total: u64, unit: str) -> str {
+    $"{count}/{total} {unit}"
+}
+
+/**
+ * The "N unit" count-up text for a phase whose total is NOT cheaply known up front
+ * (monomorphization's fixpoint queue, whose size only settles once the phase ends) —
+ * the spinner/count-up fallback the observability shape calls for in that case.
+ *
+ * @param count  how many units have been produced so far
+ * @param unit   the unit name
+ * @return       the rendered count-up text
+ */
+pub fn count_only_text(count: u64, unit: str) -> str {
+    $"{count} {unit}"
+}
+
+/**
+ * The "(N.N MB)" text for a byte size (the emit-C phase's generated-file size).
+ *
+ * @param bytes  the size in bytes
+ * @return       the size rendered to one decimal place of megabytes, parenthesized
+ */
+pub fn size_text(bytes: u64) -> str {
+    let tenths = bytes * 10 / 1048576
+    $"({tenths / 10}.{tenths % 10} MB)"
+}
+
+/**
+ * The mid-phase line: the padded label followed by the current counter text, with
+ * no elapsed time or mark yet (the phase is still running).
+ *
+ * @param label  the phase name
+ * @param text   the current counter/detail text
+ * @return       the rendered mid-phase line, un-terminated (no trailing newline)
+ */
+fn mid_line(label: str, text: str) -> str {
+    teko::str::concat("  ", teko::str::concat(pad_right(label, 11), pad_right(text, 24)))
+}
+
+/**
+ * The settled line: the padded label, the final counter/detail text, the elapsed
+ * time, the `✓`/`✗` mark, and — on a failure — the diagnostic message.
+ *
+ * @param label    the phase name
+ * @param text     the final counter/detail text
+ * @param start    the phase's start time, in nanoseconds since the epoch (for the elapsed column)
+ * @param mark     "✓" (success) or "✗" (failure)
+ * @param message  the failure diagnostic, or "" on success
+ * @return         the rendered settle line, un-terminated (no trailing newline)
+ */
+fn settle_line(label: str, text: str, start: i128, mark: str, message: str) -> str {
+    let elapsed = teko::str::concat(pad_left(elapsed_str(start), 6), "s")
+    let head = teko::str::concat("  ", teko::str::concat(pad_right(label, 11), teko::str::concat(pad_right(text, 24), teko::str::concat(elapsed, teko::str::concat("  ", mark)))))
+    if message == "" { head } else { teko::str::concat(head, teko::str::concat("  ", message)) }
+}
+
+/**
+ * Begin a phase: record its start time and, on a visible (TTY, non-`--no-tty`, non-CI)
+ * run, print its initial mid-phase line so the label appears immediately even before
+ * the first tick.
+ *
+ * @param label    the phase name ("lexer", "checker", "cc", ...)
+ * @param initial  the starting counter/detail text (typically the zero count)
+ * @param visible  true iff this phase renders in-place `\r` updates
+ * @return         the `Phase` handle for `phase_tick`/`phase_end_ok`/`phase_end_fail`
+ */
+pub fn phase_begin(label: str, initial: str, visible: bool) -> Phase {
+    if visible { teko::io::eprint(mid_line(label, initial)) }
+    Phase { label = label; start = now_ns(); visible = visible }
+}
+
+/**
+ * Update a running phase's in-place counter. A no-op when `p` is not visible (a
+ * non-TTY/CI run settles once at the end — never mid-phase, so a `\r` never lands
+ * in a log file).
+ *
+ * @param p     the phase handle from `phase_begin`
+ * @param text  the current counter/detail text
+ */
+pub fn phase_tick(p: Phase, text: str) -> void {
+    if !p.visible { return }
+    teko::io::eprint(teko::str::concat("\r", mid_line(p.label, text)))
+}
+
+/**
+ * Settle a phase as SUCCESSFUL: the final counter/detail text, elapsed time, and a
+ * `✓`. On a visible run this overwrites the last in-place line; either way it ends
+ * with a single newline (flushed immediately — stderr is never buffered).
+ *
+ * @param p     the phase handle from `phase_begin`
+ * @param text  the final counter/detail text
+ */
+pub fn phase_end_ok(p: Phase, text: str) -> void {
+    let prefix = if p.visible { "\r" } else { "" }
+    teko::io::eprintln(teko::str::concat(prefix, settle_line(p.label, text, p.start, "✓", "")))
+}
+
+/**
+ * Settle a phase as FAILED: the counter/detail text at the point of failure, elapsed
+ * time, a `✗`, and the diagnostic message — so WHERE a build stopped is obvious.
+ *
+ * @param p        the phase handle from `phase_begin`
+ * @param text     the counter/detail text at the point of failure
+ * @param message  the failure diagnostic
+ */
+pub fn phase_end_fail(p: Phase, text: str, message: str) -> void {
+    let prefix = if p.visible { "\r" } else { "" }
+    teko::io::eprintln(teko::str::concat(prefix, settle_line(p.label, text, p.start, "✗", message)))
+}
