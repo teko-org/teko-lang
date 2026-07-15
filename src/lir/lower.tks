@@ -4829,9 +4829,45 @@ fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layo
     match it {
         checker::TFunction as f => lower_item_function(m, loose, f, layouts, enums, lifted)
         checker::TStatement as s => LowerItemOut { module = m; loose = teko::list::push(loose, s); lifted = lifted }
-        checker::TConstDecl => error { message = "const item: lowering is crumb 5 (#594)" }
+        checker::TConstDecl as cd => lower_const_item(m, loose, cd, lifted)
         _ => LowerItemOut { module = m; loose = loose; lifted = lifted }
     }
+}
+
+/**
+ * const_decl_is_scalar — true iff a residual TConstDecl's declared type is SCALAR (a primitive
+ * int/float/bool, a `byte`, or a `char`), the family the crumb-5 inliner substitutes at every use
+ * site and drops from the program (#594 crumb 5). Mirrors the checker's `is_scalar_const_type`; kept
+ * local so the lowering stays self-contained.
+ *
+ * @param t  the residual const's resolved value type
+ * @return   whether `t` is a scalar (inline-at-use) const type
+ */
+fn const_decl_is_scalar(t: checker::Type) -> bool {
+    match t {
+        checker::Prim => true
+        checker::Byte => true
+        checker::Char => true
+        _ => false
+    }
+}
+
+/**
+ * lower_const_item — fold a residual TConstDecl. A SCALAR const is a defensive NO-OP: the crumb-5
+ * inliner (`inline_consts`, run after monomorphize) substitutes every scalar-const use and drops the
+ * declaration, so lowering emits no `LFunc`, no `LGlobal`, and never reaches a globals honest-stop for
+ * a scalar-only program. An AGGREGATE const (slice/struct/variant) is not yet materialized — it stops
+ * honestly at crumb 6 (#594).
+ *
+ * @param m       the module accumulated so far
+ * @param loose   the loose top-level statements accumulated so far
+ * @param cd      the residual typed const declaration
+ * @param lifted  the whole-program lifted closure/thunk-function table
+ * @return        the module unchanged for a scalar const; the crumb-6 honest-stop for an aggregate
+ */
+fn lower_const_item(m: LModule, loose: []checker::TStatement, cd: checker::TConstDecl, lifted: []LFunc) -> LowerItemOut | error {
+    if const_decl_is_scalar(cd.ty) { return LowerItemOut { module = m; loose = loose; lifted = lifted } }
+    error { message = "const item: aggregate lowering is crumb 6 (#594)" }
 }
 
 /**

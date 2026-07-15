@@ -510,3 +510,454 @@ fn const_dep_order(consts: []TConstDecl) -> []TConstDecl | error {
     }
     st.ordered
 }
+
+/**
+ * is_scalar_const_type — true iff `t` is a SCALAR const type (a primitive int/float/bool, a `byte`,
+ * or a `char`) — the family the crumb-5 inliner substitutes at every use site as a `mov imm` (#594
+ * crumb 5). A `str`, slice, struct, or variant is an AGGREGATE (crumb 6): it is NOT inlined here — its
+ * TConstDecl passes through to lowering unchanged. Kept minimal: only the flat immediate-representable
+ * primitives inline.
+ *
+ * @param t  the const's resolved value type
+ * @return   whether `t` is a scalar (inline-at-use) const type
+ * @since #594
+ */
+fn is_scalar_const_type(t: Type) -> bool {
+    match t {
+        Prim => true
+        Byte => true
+        Char => true
+        _ => false
+    }
+}
+
+/**
+ * ScalarConstMap — the crumb-5 substitution table: PARALLEL lists of every scalar module-level
+ * const's name and its fully-collapsed checked initializer (nested const references already
+ * substituted, in dependency order), so a `TVar` use is rewritten by a single name lookup (#594 crumb
+ * 5).
+ *
+ * @field names  the scalar consts' names, in dependency order (dependencies first)
+ * @field inits  PARALLEL to `names` — each const's collapsed checked initializer
+ */
+type ScalarConstMap = struct { names: []str; inits: []TExpr }
+
+/**
+ * scalar_const_init — the collapsed initializer for the scalar const named `name`, or null when
+ * `name` is not a scalar module-level const (a local, a function, or an aggregate const) (#594 crumb
+ * 5). A linear scan over the small const set the program declares.
+ *
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @param name   the referenced name
+ * @return       the const's collapsed initializer, or null when `name` is not a scalar const
+ * @since #594
+ */
+fn scalar_const_init(names: []str, inits: []TExpr, name: str) -> TExpr? {
+    mut i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        if names[i] == name { return inits[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * collect_module_consts — every module-level TConstDecl on the program's item surface, in
+ * declaration order (the inliner's dependency-graph and drop set) (#594 crumb 5).
+ *
+ * @param items  the typed program's top-level items
+ * @return       the module-level constants, in declaration order
+ * @since #594
+ */
+fn collect_module_consts(items: []TItem) -> []TConstDecl {
+    mut out: []TConstDecl = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        match items[i] {
+            TConstDecl as cd => out = teko::list::push(out, cd)
+            _ => { }
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * build_scalar_map — build the crumb-5 substitution table from the dependency-ordered consts (#594
+ * crumb 5). Walked in dependency order so a scalar const's initializer is collapsed against the
+ * ALREADY-collapsed initializers of the consts it references before it is itself added — nested
+ * references (`const B = A + 1; const A = 1`) fully collapse. An aggregate const contributes no
+ * entry (it is not inlined at crumb 5).
+ *
+ * @param ordered  the module-level consts in dependency order (from `const_dep_order`)
+ * @return         the scalar consts' names + collapsed initializers
+ * @since #594
+ */
+fn build_scalar_map(ordered: []TConstDecl) -> ScalarConstMap {
+    mut names: []str = teko::list::empty()
+    mut inits: []TExpr = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= ordered.len { break }
+        let cd = ordered[i]
+        if is_scalar_const_type(cd.ty) {
+            let collapsed = inline_rw_expr(cd.init, names, inits)
+            names = teko::list::push(names, cd.name)
+            inits = teko::list::push(inits, collapsed)
+        }
+        i++
+    }
+    ScalarConstMap { names = names; inits = inits }
+}
+
+/**
+ * inline_rw_fspec — rewrite an interpolation-hole format spec, substituting scalar-const references
+ * inside a dynamic (`:[…]`) spec's argument expressions; a none/static spec is returned unchanged
+ * (#594 crumb 5).
+ *
+ * @param sp     the format spec to rewrite
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the spec with scalar-const references substituted in its dynamic args
+ * @since #594
+ */
+fn inline_rw_fspec(sp: TFSpec, names: []str, inits: []TExpr) -> TFSpec {
+    match sp.kind {
+        TFSpecDynamic as fd => {
+            mut args: []TExpr = teko::list::empty()
+            mut k: u64 = 0
+            loop {
+                if k >= fd.args.len { break }
+                args = teko::list::push(args, inline_rw_expr(fd.args[k], names, inits))
+                k++
+            }
+            TFSpec { kind = TFSpecDynamic { args = args } }
+        }
+        _ => sp
+    }
+}
+
+/**
+ * inline_rw_exprs — rewrite every expression in `xs`, substituting scalar-const references, in order
+ * (#594 crumb 5). Shared by the call/array/struct/in arms of `inline_rw_expr`.
+ *
+ * @param xs     the expressions to rewrite
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the rewritten expressions, in order
+ * @since #594
+ */
+fn inline_rw_exprs(xs: []TExpr, names: []str, inits: []TExpr) -> []TExpr {
+    mut out: []TExpr = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out = teko::list::push(out, inline_rw_expr(xs[i], names, inits))
+        i++
+    }
+    out
+}
+
+/**
+ * inline_rw_expr — rewrite one typed expression, replacing every `TVar` that names a scalar
+ * module-level const with a clone of that const's collapsed checked initializer, recursing TOTALLY
+ * into every child (#594 crumb 5). A leaf that is not a const reference (and every non-`TVar` leaf)
+ * is returned unchanged; the substituted initializer is already fully collapsed, so it is spliced in
+ * without a further walk. TOTAL over every `TExprKind` — a missed case would silently leave a const
+ * reference for lowering to trip on.
+ *
+ * @param e      the typed expression to rewrite
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the expression with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_expr(e: TExpr, names: []str, inits: []TExpr) -> TExpr {
+    match e.kind {
+        TNumber => e
+        TStrLit => e
+        TByteLit => e
+        TCharLit => e
+        TBoolLit => e
+        TNullLit => e
+        TPathExpr => e
+        TVar as v => inline_rw_var(v, e, names, inits)
+        TBinary as b => TExpr { kind = TBinary { op = b.op; left = inline_rw_expr(b.left, names, inits); right = inline_rw_expr(b.right, names, inits) }; type = e.type; line = e.line; col = e.col }
+        TUnary as u => TExpr { kind = TUnary { op = u.op; operand = inline_rw_expr(u.operand, names, inits) }; type = e.type; line = e.line; col = e.col }
+        TCompare as c => inline_rw_compare(c, e, names, inits)
+        TCall as cl => TExpr { kind = TCall { callee = cl.callee; args = inline_rw_exprs(cl.args, names, inits); call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = e.type; line = e.line; col = e.col }
+        TIfExpr as f => TExpr { kind = TIfExpr { cond = inline_rw_expr(f.cond, names, inits); then_blk = inline_rw_block(f.then_blk, names, inits); has_else = f.has_else; else_blk = inline_rw_block(f.else_blk, names, inits) }; type = e.type; line = e.line; col = e.col }
+        TMatchExpr as m => inline_rw_match(m, e, names, inits)
+        TCast as c => TExpr { kind = TCast { expr = inline_rw_expr(c.expr, names, inits) }; type = e.type; line = e.line; col = e.col }
+        TFieldAccess as fa => TExpr { kind = TFieldAccess { receiver = inline_rw_expr(fa.receiver, names, inits); field = fa.field }; type = e.type; line = e.line; col = e.col }
+        TSafeFieldAccess as sfa => TExpr { kind = TSafeFieldAccess { receiver = inline_rw_expr(sfa.receiver, names, inits); field = sfa.field }; type = e.type; line = e.line; col = e.col }
+        TCoalesce as co => TExpr { kind = TCoalesce { left = inline_rw_expr(co.left, names, inits); right = inline_rw_expr(co.right, names, inits) }; type = e.type; line = e.line; col = e.col }
+        TStructInit as si => TExpr { kind = TStructInit { field_names = si.field_names; field_vals = inline_rw_exprs(si.field_vals, names, inits) }; type = e.type; line = e.line; col = e.col }
+        TIndex as ix => TExpr { kind = TIndex { receiver = inline_rw_expr(ix.receiver, names, inits); index = inline_rw_expr(ix.index, names, inits) }; type = e.type; line = e.line; col = e.col }
+        TInterp as in => inline_rw_interp(in, e, names, inits)
+        TInExpr as n => TExpr { kind = TInExpr { lhs = inline_rw_expr(n.lhs, names, inits); elems = inline_rw_exprs(n.elems, names, inits) }; type = e.type; line = e.line; col = e.col }
+        TArrayLit as a => inline_rw_array(a, e, names, inits)
+        TLambda as lam => TExpr { kind = TLambda { params = lam.params; body = inline_rw_block(lam.body, names, inits); captures = lam.captures; ret = lam.ret; lift_id = lam.lift_id }; type = e.type; line = e.line; col = e.col }
+    }
+}
+
+/**
+ * inline_rw_var — rewrite a bare-name reference: a `TVar` that names a scalar module-level const is
+ * replaced by a clone of that const's collapsed checked initializer; any other `TVar` (a local, a
+ * function reference, an aggregate const) is returned unchanged (#594 crumb 5). A function-value
+ * reference (`is_func`) is never a const and is left intact.
+ *
+ * @param v      the typed variable reference
+ * @param e      the enclosing typed expression (returned unchanged when `v` is not a scalar const)
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the substituted initializer, or `e` unchanged
+ * @since #594
+ */
+fn inline_rw_var(v: TVar, e: TExpr, names: []str, inits: []TExpr) -> TExpr {
+    if v.is_func { return e }
+    match scalar_const_init(names, inits, v.name) {
+        TExpr as sub => sub
+        null => e
+    }
+}
+
+/**
+ * inline_rw_compare — rewrite a comparison chain, substituting scalar-const references in its first
+ * operand and every subsequent term (#594 crumb 5).
+ *
+ * @param c      the typed comparison expression
+ * @param e      the enclosing typed expression (for its type/position)
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the comparison with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_compare(c: TCompare, e: TExpr, names: []str, inits: []TExpr) -> TExpr {
+    mut terms: []TCmpTerm = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= c.rest.len { break }
+        terms = teko::list::push(terms, TCmpTerm { op = c.rest[i].op; operand = inline_rw_expr(c.rest[i].operand, names, inits) })
+        i++
+    }
+    TExpr { kind = TCompare { first = inline_rw_expr(c.first, names, inits); rest = terms }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * inline_rw_match — rewrite a match expression, substituting scalar-const references in its subject
+ * and every arm's guard + body (#594 crumb 5).
+ *
+ * @param m      the typed match expression
+ * @param e      the enclosing typed expression (for its type/position)
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the match with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_match(m: TMatchExpr, e: TExpr, names: []str, inits: []TExpr) -> TExpr {
+    mut arms: []TArm = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.arms.len { break }
+        arms = teko::list::push(arms, inline_rw_arm(m.arms[i], names, inits))
+        i++
+    }
+    TExpr { kind = TMatchExpr { subject = inline_rw_expr(m.subject, names, inits); arms = arms }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * inline_rw_arm — rewrite one match arm, substituting scalar-const references in its guard (when
+ * present) and its body block; the pattern is syntactic and carries no const reference (#594 crumb
+ * 5).
+ *
+ * @param arm    the typed match arm
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the arm with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_arm(arm: TArm, names: []str, inits: []TExpr) -> TArm {
+    let guard = if arm.has_when { inline_rw_expr(arm.guard, names, inits) } else { arm.guard }
+    TArm { pattern = arm.pattern; has_when = arm.has_when; guard = guard; body = inline_rw_block(arm.body, names, inits) }
+}
+
+/**
+ * inline_rw_interp — rewrite a string interpolation, substituting scalar-const references in every
+ * hole expression and every dynamic format spec (#594 crumb 5).
+ *
+ * @param in     the typed interpolation expression
+ * @param e      the enclosing typed expression (for its type/position)
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the interpolation with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_interp(in: TInterp, e: TExpr, names: []str, inits: []TExpr) -> TExpr {
+    mut holes: []TExpr = teko::list::empty()
+    mut specs: []TFSpec = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= in.holes.len { break }
+        holes = teko::list::push(holes, inline_rw_expr(in.holes[i], names, inits))
+        if i < in.specs.len { specs = teko::list::push(specs, inline_rw_fspec(in.specs[i], names, inits)) }
+        i++
+    }
+    TExpr { kind = TInterp { pieces = in.pieces; holes = holes; specs = specs }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * inline_rw_array — rewrite an array/slice literal, substituting scalar-const references in every
+ * element (a spread element's sub-slice expression included) (#594 crumb 5).
+ *
+ * @param a      the typed array literal
+ * @param e      the enclosing typed expression (for its type/position)
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the array literal with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_array(a: TArrayLit, e: TExpr, names: []str, inits: []TExpr) -> TExpr {
+    mut elems: []TArrayElem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        elems = teko::list::push(elems, TArrayElem { is_spread = a.elements[i].is_spread; expr = inline_rw_expr(a.elements[i].expr, names, inits) })
+        i++
+    }
+    TExpr { kind = TArrayLit { elements = elems }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * inline_rw_block — rewrite a statement block, substituting scalar-const references in each statement
+ * (#594 crumb 5).
+ *
+ * @param stmts  the typed statement block
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the block with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_block(stmts: []TStatement, names: []str, inits: []TExpr) -> []TStatement {
+    mut out: []TStatement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stmts.len { break }
+        out = teko::list::push(out, inline_rw_stmt(stmts[i], names, inits))
+        i++
+    }
+    out
+}
+
+/**
+ * inline_rw_stmt — rewrite one typed statement, substituting scalar-const references in every
+ * expression and nested block it carries (#594 crumb 5). TOTAL over every `TStatement` case; a
+ * value-less `return`/`break`/`continue` is returned unchanged.
+ *
+ * @param st     the typed statement to rewrite
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the statement with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_stmt(st: TStatement, names: []str, inits: []TExpr) -> TStatement {
+    match st {
+        TBinding as b => TBinding { kind = b.kind; target = b.target; bound = b.bound; value = inline_rw_expr(b.value, names, inits) }
+        TAssign as a => inline_rw_assign(a, names, inits)
+        TReturn as r => if r.has_value { TReturn { has_value = true; value = inline_rw_expr(r.value, names, inits) } } else { st }
+        TLoopStmt as l => TLoopStmt { label = l.label; init = inline_rw_block(l.init, names, inits); body = inline_rw_block(l.body, names, inits) }
+        TBreakStmt => st
+        TContinueStmt => st
+        TExprStmt as es => TExprStmt { expr = inline_rw_expr(es.expr, names, inits) }
+        TDeferStmt as d => TDeferStmt { body = inline_rw_block(d.body, names, inits) }
+        TAdoptStmt as a => TAdoptStmt { name = a.name; body = inline_rw_block(a.body, names, inits) }
+    }
+}
+
+/**
+ * inline_rw_assign — rewrite an assignment, substituting scalar-const references in its value and, for
+ * a field target, in the typed LHS field-access expression (#594 crumb 5). A simple/ref-deref target
+ * carries no rewritable expression, so its sentinel `target` is preserved unchanged.
+ *
+ * @param a      the typed assignment
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the assignment with scalar-const references substituted
+ * @since #594
+ */
+fn inline_rw_assign(a: TAssign, names: []str, inits: []TExpr) -> TStatement {
+    let value = inline_rw_expr(a.value, names, inits)
+    match a.kind {
+        parser::AssignKind::Field => TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = value; deref = a.deref; target = inline_rw_expr(a.target, names, inits) }
+        _ => TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = value; deref = a.deref; target = a.target }
+    }
+}
+
+/**
+ * rewrite_function — rewrite a top-level function's body, substituting every scalar module-level const
+ * reference with a clone of the const's collapsed checked initializer (#594 crumb 5). Signature,
+ * visibility, and metadata are preserved; only the body is walked.
+ *
+ * @param f      the typed function
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       the function with scalar-const references substituted in its body
+ * @since #594
+ */
+fn rewrite_function(f: TFunction, names: []str, inits: []TExpr) -> TFunction {
+    TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = f.return_type; body = inline_rw_block(f.body, names, inits); vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib }
+}
+
+/**
+ * inline_place_item — fold one program item into the rewritten item list: a function's body is walked
+ * for const references; a loose statement is walked; a SCALAR const declaration is DROPPED (it emits
+ * no code — no fn body, no arena); an aggregate const declaration and every type/use declaration pass
+ * through unchanged (#594 crumb 5). An aggregate const is left for lowering (crumb 6).
+ *
+ * @param out    the rewritten items accumulated so far
+ * @param it     the program item to fold
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       `out` grown with `it`'s rewritten form (or unchanged when `it` is a dropped scalar const)
+ * @since #594
+ */
+fn inline_place_item(out: []TItem, it: TItem, names: []str, inits: []TExpr) -> []TItem {
+    match it {
+        TFunction as f => teko::list::push(out, rewrite_function(f, names, inits))
+        TConstDecl as cd => if is_scalar_const_type(cd.ty) { out } else { teko::list::push(out, it) }
+        TStatement as s => teko::list::push(out, inline_rw_stmt(s, names, inits))
+        _ => teko::list::push(out, it)
+    }
+}
+
+/**
+ * inline_consts — rewrite the typed program, replacing every reference to a scalar module-level
+ * constant with a clone of that constant's checked initializer, in dependency order so nested const
+ * references collapse fully (#594 crumb 5). The scalar TConstDecl items are then dropped from the
+ * program (they emit no code — no fn body, no arena, no global). An AGGREGATE const is NOT inlined
+ * here — its TConstDecl passes through to lowering (crumb 6). Runs in the checker pipeline AFTER
+ * `monomorphize` and BEFORE lowering, so lowering sees no scalar const reference and never reaches a
+ * globals honest-stop for a scalar-only program.
+ *
+ * @param prog  the fully typed, monomorphized program
+ * @return      the program with scalar const references substituted and scalar const decls removed
+ * @throws      a located error when the module-level consts form a reference cycle (`const_dep_order`)
+ * @since #594
+ */
+pub fn inline_consts(prog: TProgram) -> TProgram | error {
+    let consts = collect_module_consts(prog.items)
+    if consts.len == 0 { return prog }
+    let ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
+    let smap = build_scalar_map(ordered)
+    mut out: []TItem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        out = inline_place_item(out, prog.items[i], smap.names, smap.inits)
+        i++
+    }
+    TProgram { items = out }
+}

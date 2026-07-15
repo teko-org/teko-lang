@@ -788,6 +788,31 @@ fn lwt_virtual_main_falls_through_to_return_zero() {
     teko::assert::str_contains(text, "const 0")
 }
 
+/** lwt_const — a private scalar i64 module-level TConstDecl (#594 crumb-5 keystone fixture). */
+fn lwt_const(name: str, init: checker::TExpr) -> checker::TItem {
+    checker::TConstDecl { name = name; namespace = ""; ty = lwt_prim(checker::PrimKind::I64); init = init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+}
+
+/**
+ * lwt_scalar_const_inlines_and_leaves_no_global — the crumb-5 SCALAR keystone (#594): a
+ * `const K: i64 = 41` used as `exit(K + 1)` inlines to the literal 41 through `inline_consts`, so the
+ * lowered module carries NO reference to `K` and NO `LGlobal` (`m.globals.len == 0`) — proving the
+ * globals honest-stop is never reachable for a scalar-only program.
+ */
+#test
+fn lwt_scalar_const_inlines_and_leaves_no_global() {
+    let use_expr = lwt_bin(lexer::TokenKind::Plus, lwt_var("K", checker::PrimKind::I64), lwt_num_i64(1 to i128), checker::PrimKind::I64)
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, lwt_const("K", lwt_num_i64(41 to i128)))
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), use_expr), checker::Void { }))))
+    let inlined = match checker::inline_consts(checker::TProgram { items = items }) { checker::TProgram as p => p; error as err => { teko::assert::is_true(false); return } }
+    let m = match lower_program(inlined) { LModule as x => x; error as err => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(m.globals.len == 0)
+    let text = print_lmodule(m)
+    teko::assert::is_true(!teko::str::contains(text, "K"))
+    teko::assert::str_contains(text, "const 41")
+}
+
 /**
  * lwt_virtual_main_fires_a_defer_before_its_own_fall_through — A1-2,
  * #382: a top-level `defer { … }` with no further loose statements after

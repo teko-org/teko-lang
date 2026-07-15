@@ -277,3 +277,161 @@ fn const_dep_order_reports_cycle() {
         error => teko::assert::is_true(true)
     }
 }
+
+/**
+ * c_bin — an `i64` binary-operator typed expression over two operands (a Tier-2 const initializer /
+ * a use-site arithmetic expression for the inliner fixtures).
+ *
+ * @param op  the binary operator token kind
+ * @param l   the left operand
+ * @param r   the right operand
+ * @return    the typed binary expression
+ */
+fn c_bin(op: lexer::TokenKind, l: TExpr, r: TExpr) -> TExpr {
+    te(TBinary { op = op; left = l; right = r }, i64t())
+}
+
+/**
+ * c_ret — a value-returning typed statement (`return e`), the body shape the inliner walks.
+ *
+ * @param e  the returned typed expression
+ * @return   the typed return statement
+ */
+fn c_ret(e: TExpr) -> TStatement { TReturn { has_value = true; value = e } }
+
+/**
+ * c_fn — a private nullary `i64` module-level TFunction named `name` with body `body`, for the
+ * inliner fixtures (its body is walked for scalar-const references).
+ *
+ * @param name  the function's name
+ * @param body  its typed statement block
+ * @return      the typed function
+ */
+fn c_fn(name: str, body: []TStatement) -> TFunction {
+    TFunction { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::empty(); return_type = i64t(); body = body; vis = parser::Visibility::Private; has_doc = false; doc = ""; namespace = "teko::checker"; file = ""; line = 0; col = 0; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+}
+
+/**
+ * count_const_items — the number of residual module-level TConstDecl items in `prog` (the inliner
+ * must drop every SCALAR const; an aggregate const survives).
+ *
+ * @param prog  the program to scan
+ * @return      the count of TConstDecl items remaining
+ */
+fn count_const_items(prog: TProgram) -> u64 {
+    mut n: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TConstDecl => n = n + 1
+            _ => { }
+        }
+        i++
+    }
+    n
+}
+
+/**
+ * first_fn_return — the value of the first function's first `return` statement in `prog`, or null
+ * when there is no such statement (the inliner fixtures inspect a single-return function body).
+ *
+ * @param prog  the program to scan
+ * @return      the returned typed expression, or null
+ */
+fn first_fn_return(prog: TProgram) -> TExpr? {
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TFunction as f => if f.body.len > 0 { match f.body[0] { TReturn as r => return r.value; _ => { } } }
+            _ => { }
+        }
+        i++
+    }
+    null
+}
+
+/**
+ * inline_left_number_is — assert the first function's returned expression is a binary whose LEFT
+ * operand is the integer literal `want` (proving a scalar-const reference collapsed to its literal).
+ *
+ * @param prog  the inlined program
+ * @param want  the expected left-operand literal value
+ */
+fn inline_left_number_is(prog: TProgram, want: i128) {
+    match first_fn_return(prog) {
+        TExpr as rv => match rv.kind {
+            TBinary as b => match b.left.kind {
+                TNumber as num => teko::assert::is_true(num.value == want)
+                _ => teko::assert::is_true(false)
+            }
+            _ => teko::assert::is_true(false)
+        }
+        null => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * inline_consts_substitutes_scalar_and_drops_decl — `const K: i64 = 41` used as `K + 1`: the inliner
+ * substitutes `K` with the literal `41` and drops the scalar TConstDecl (no residual const item).
+ */
+#test
+fn inline_consts_substitutes_scalar_and_drops_decl() {
+    let k = c_const("K", c_num(41))
+    mut body: []TStatement = teko::list::empty()
+    body = teko::list::push(body, c_ret(c_bin(lexer::TokenKind::Plus, c_ref("K"), c_num(1))))
+    mut items: []TItem = teko::list::empty()
+    items = teko::list::push(items, k)
+    items = teko::list::push(items, c_fn("f", body))
+    match inline_consts(TProgram { items = items }) {
+        TProgram as out => {
+            teko::assert::is_true(count_const_items(out) == 0)
+            inline_left_number_is(out, 41)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * inline_consts_collapses_nested_scalar_refs — `const B = A + 1; const A = 1` used as `return B`:
+ * dependency-order inlining collapses `B` fully to `1 + 1` (no residual `TVar` for A or B), even
+ * though B is declared before A.
+ */
+#test
+fn inline_consts_collapses_nested_scalar_refs() {
+    let a = c_const("A", c_num(1))
+    let b = c_const("B", c_bin(lexer::TokenKind::Plus, c_ref("A"), c_num(1)))
+    mut body: []TStatement = teko::list::empty()
+    body = teko::list::push(body, c_ret(c_ref("B")))
+    mut items: []TItem = teko::list::empty()
+    items = teko::list::push(items, b)
+    items = teko::list::push(items, a)
+    items = teko::list::push(items, c_fn("f", body))
+    match inline_consts(TProgram { items = items }) {
+        TProgram as out => {
+            teko::assert::is_true(count_const_items(out) == 0)
+            inline_left_number_is(out, 1)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * inline_consts_keeps_aggregate_const — a `[]byte` const is an AGGREGATE (crumb 6): the inliner does
+ * NOT drop it; its TConstDecl survives for lowering.
+ */
+#test
+fn inline_consts_keeps_aggregate_const() {
+    let byteslice = Slice { element = Byte { } }
+    mut elems: []TArrayElem = teko::list::empty()
+    elems = teko::list::push(elems, TArrayElem { is_spread = false; expr = te(TByteLit { value = 31 to byte }, Byte { }) })
+    let arr = te(TArrayLit { elements = elems }, byteslice)
+    let agg = TConstDecl { name = "MAGIC"; namespace = "teko::checker"; ty = byteslice; init = arr; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    mut items: []TItem = teko::list::empty()
+    items = teko::list::push(items, agg)
+    match inline_consts(TProgram { items = items }) {
+        TProgram as out => teko::assert::is_true(count_const_items(out) == 1)
+        error => teko::assert::is_true(false)
+    }
+}
