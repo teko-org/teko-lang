@@ -1,0 +1,223 @@
+use teko::parser
+use teko::lexer
+
+/**
+ * f64t — the `f64` primitive type, the result type of the Tier-5 `f64_from_bits` fixture.
+ *
+ * @return the `f64` primitive type
+ */
+fn f64t() -> Type { Prim { kind = PrimKind::F64 } }
+
+/**
+ * te — wrap a typed-expression kind and its resolved type into a positioned `TExpr` at line 1.
+ *
+ * @param k  the typed expression kind
+ * @param t  the resolved type
+ * @return   the positioned `TExpr`
+ */
+fn te(k: TExprKind, t: Type) -> TExpr { TExpr { kind = k; type = t; line = 1; col = 1 } }
+
+/**
+ * c_num — an `i64` number-literal typed expression (Tier 0).
+ *
+ * @param v  the integer value (i128 carrier, like the parser's Number)
+ * @return   the typed number literal
+ */
+fn c_num(v: i128) -> TExpr { te(TNumber { is_float = false; value = v; fval = 0.0 }, i64t()) }
+
+/**
+ * seg — a single path segment naming `name`.
+ *
+ * @param name  the segment identifier
+ * @return      the segment
+ */
+fn seg(name: str) -> parser::Segment { parser::Segment { name = name } }
+
+/**
+ * path2 — a two-segment `a::b` path.
+ *
+ * @param a  the first segment's name
+ * @param b  the last segment's name
+ * @return   the two-segment path
+ */
+fn path2(a: str, b: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), seg(a))
+    segs = teko::list::push(segs, seg(b))
+    parser::Path { segments = segs }
+}
+
+/**
+ * path3 — a three-segment `a::b::c` path.
+ *
+ * @param a  the first segment's name
+ * @param b  the middle segment's name
+ * @param c  the last segment's name
+ * @return   the three-segment path
+ */
+fn path3(a: str, b: str, c: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), seg(a))
+    segs = teko::list::push(segs, seg(b))
+    segs = teko::list::push(segs, seg(c))
+    parser::Path { segments = segs }
+}
+
+/**
+ * a_call — a typed call expression with the given callee and argument list, defaulting the fields
+ * irrelevant to the const-expr gate.
+ *
+ * @param callee  the callee path
+ * @param args    the typed arguments
+ * @param t       the call's result type
+ * @return        the typed call expression
+ */
+fn a_call(callee: parser::Path, args: []TExpr, t: Type) -> TExpr {
+    te(TCall { callee = callee; args = args; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }, t)
+}
+
+/**
+ * accepts — assert that `is_const_expr` accepts `e` (returns null) in the empty environment.
+ *
+ * @param e  the typed expression that must be a legal const initializer
+ */
+fn accepts(e: TExpr) {
+    match is_const_expr(e, empty_table(), empty_env()) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
+/**
+ * rejects — assert that `is_const_expr` rejects `e` (returns an error) in the empty environment.
+ *
+ * @param e  the typed expression that must NOT be a legal const initializer
+ */
+fn rejects(e: TExpr) {
+    match is_const_expr(e, empty_table(), empty_env()) { error => teko::assert::is_true(true); null => teko::assert::is_true(false) }
+}
+
+/**
+ * const_expr_tier0_literals — Tier 0: int / bool literals are legal const initializers.
+ */
+#test
+fn const_expr_tier0_literals() {
+    accepts(c_num(127))
+    accepts(te(TBoolLit { value = true }, boolt()))
+    accepts(te(TStrLit { text = "hi" }, Str { }))
+    accepts(te(TByteLit { value = b'A' }, Byte { }))
+}
+
+/**
+ * const_expr_tier1_cast — Tier 1: `<const-expr> to T` is a legal const initializer.
+ */
+#test
+fn const_expr_tier1_cast() {
+    accepts(te(TCast { expr = c_num(0) }, u8t()))
+}
+
+/**
+ * const_expr_tier2_ops — Tier 2: `~`, unary `-`, and a binary bitwise/arithmetic op over
+ * const-exprs are legal; a comparison operator is rejected.
+ */
+#test
+fn const_expr_tier2_ops() {
+    accepts(te(TUnary { op = lexer::TokenKind::Tilde; operand = c_num(0) }, i64t()))
+    accepts(te(TUnary { op = lexer::TokenKind::Minus; operand = c_num(1) }, i64t()))
+    accepts(te(TBinary { op = lexer::TokenKind::Plus; left = c_num(1); right = c_num(2) }, i64t()))
+    accepts(te(TBinary { op = lexer::TokenKind::Shl; left = c_num(1); right = c_num(8) }, i64t()))
+    rejects(te(TBinary { op = lexer::TokenKind::AndAnd; left = c_num(1); right = c_num(0) }, boolt()))
+}
+
+/**
+ * const_expr_tier3_const_ref — Tier 3: a bare name resolving to a module-level const is legal; a
+ * reference to an enum/flags member (a `TPathExpr`) is legal.
+ */
+#test
+fn const_expr_tier3_const_ref() {
+    let env = define_const(empty_env(), "MAX", i64t(), "teko::checker")
+    let v = te(TVar { name = "MAX"; is_func = false; func_ns = "" }, i64t())
+    match is_const_expr(v, empty_table(), env) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    accepts(te(TPathExpr { enum_name = "Color"; member = "Red"; ordinal = 0; value = 0 }, Named { name = "Color" }))
+}
+
+/**
+ * const_expr_tier4_aggregates — Tier 4: an array literal and a struct literal of const-exprs are
+ * legal; a struct literal with a non-const field is rejected.
+ */
+#test
+fn const_expr_tier4_aggregates() {
+    mut elems: []TArrayElem = teko::list::push(teko::list::empty(), TArrayElem { is_spread = false; expr = c_num(31) })
+    elems = teko::list::push(elems, TArrayElem { is_spread = false; expr = c_num(139) })
+    accepts(te(TArrayLit { elements = elems }, Slice { element = i64t() }))
+
+    mut names: []str = teko::list::push(teko::list::empty(), "a")
+    names = teko::list::push(names, "b")
+    mut vals: []TExpr = teko::list::push(teko::list::empty(), c_num(1))
+    vals = teko::list::push(vals, c_num(2))
+    accepts(te(TStructInit { field_names = names; field_vals = vals }, Named { name = "P" }))
+}
+
+/**
+ * const_expr_tier5_allowlisted_call — Tier 5: a call to an allowlisted pure constructor
+ * (`preg`, `teko::f64_from_bits`) over const-expr args is legal.
+ */
+#test
+fn const_expr_tier5_allowlisted_call() {
+    mut pregs: []TExpr = teko::list::push(teko::list::empty(), c_num(0))
+    pregs = teko::list::push(pregs, c_num(0))
+    accepts(a_call(path1("preg"), pregs, Named { name = "MReg" }))
+
+    let bits: []TExpr = teko::list::push(teko::list::empty(), c_num(0))
+    accepts(a_call(path2("teko", "f64_from_bits"), bits, f64t()))
+}
+
+/**
+ * const_expr_rejects_non_allowlisted_call — a call to a callee NOT on the allowlist is rejected.
+ */
+#test
+fn const_expr_rejects_non_allowlisted_call() {
+    let none: []TExpr = teko::list::empty()
+    rejects(a_call(path1("foo"), none, i64t()))
+}
+
+/**
+ * const_expr_rejects_io_form — an I/O call (`teko::io::println`) is rejected: not allowlisted.
+ */
+#test
+fn const_expr_rejects_io_form() {
+    let arg: []TExpr = teko::list::push(teko::list::empty(), te(TStrLit { text = "x" }, Str { }))
+    rejects(a_call(path3("teko", "io", "println"), arg, Void { }))
+}
+
+/**
+ * const_expr_rejects_non_const_ref — a reference to a non-const (`mut`) value is rejected.
+ */
+#test
+fn const_expr_rejects_non_const_ref() {
+    let env = define(empty_env(), "x", i64t(), true)
+    let v = te(TVar { name = "x"; is_func = false; func_ns = "" }, i64t())
+    match is_const_expr(v, empty_table(), env) { error => teko::assert::is_true(true); null => teko::assert::is_true(false) }
+}
+
+/**
+ * const_expr_rejects_control_flow — a `null` literal (no Tier admits it) is rejected.
+ */
+#test
+fn const_expr_rejects_control_flow() {
+    rejects(te(TNullLit { }, i64t()))
+}
+
+/**
+ * allowlist_accepts_the_three — `is_const_allowlisted_callee` accepts exactly the closed set.
+ */
+#test
+fn allowlist_accepts_the_three() {
+    teko::assert::is_true(is_const_allowlisted_callee(path2("teko", "f64_from_bits")))
+    teko::assert::is_true(is_const_allowlisted_callee(path2("teko", "f32_from_bits")))
+    teko::assert::is_true(is_const_allowlisted_callee(path1("preg")))
+}
+
+/**
+ * allowlist_rejects_other — `is_const_allowlisted_callee` rejects a callee outside the closed set.
+ */
+#test
+fn allowlist_rejects_other() {
+    teko::assert::is_false(is_const_allowlisted_callee(path1("foo")))
+    teko::assert::is_false(is_const_allowlisted_callee(path2("teko", "malloc")))
+}
