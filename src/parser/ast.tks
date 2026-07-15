@@ -347,8 +347,34 @@ pub type UseDecl = struct {
     names: []str
 }
 
+/**
+ * ConstDecl — a module-level named compile-time constant `const NAME: Type = init`
+ * (#594). Distinct from the local `BindKind::Const` binding (`parse_stmt.tks`): a
+ * ConstDecl is a top-level Decl with visibility, a mandatory type annotation, and a
+ * const-expr initializer (validated by `teko::checker::is_const_expr`). It carries
+ * no scope and opens no arena — the checker inlines it (scalars) or the backend
+ * materializes it in rodata (aggregates, C-agg-2).
+ *
+ * @param name    the constant's identifier
+ * @param ty      the mandatory declared type annotation
+ * @param init    the const-expr initializer
+ * @param vis     Pub/Exp/private, mirroring a function's
+ * @param has_doc whether a doc-comment was attached
+ * @param doc     the attached doc-comment text (valid iff has_doc)
+ * @param line    the `const` keyword's source line
+ * @param col     the `const` keyword's source column
+ * @since #594
+ */
+pub type ConstDecl = struct { name: str; ty: TypeExpr; init: Expr; vis: Visibility; has_doc: bool; doc: str; line: u32; col: u32 }
+
 // --- R-main: a `.tks` file is a MAIN (executable entry) or a MODULE. ---
-pub type Decl = variant Function | TypeDecl   // a top-level declaration (a module's content)
+/**
+ * A top-level declaration — a module's content: a `fn` (Function), a `type`/`flags`
+ * (TypeDecl), or a module-level `const` (ConstDecl, #594).
+ *
+ * @since #594 widened with ConstDecl (was `Function | TypeDecl`).
+ */
+pub type Decl = variant Function | TypeDecl | ConstDecl
 pub type MainFile = struct { uses: []UseDecl; body: []Statement }   // main.tks: the `use` header + the VIRTUAL MAIN's body (statements only — no type/fn decls)
 pub type Module = struct { uses: []UseDecl; decls: []Decl }   // a module: the `use` header + declarations (no loose statements)
 type File = variant MainFile | Module   // a `.tks` is exactly one; the file's role decides (main.tks ⇔ an executable `.tkp`)
@@ -358,6 +384,13 @@ type File = variant MainFile | Module   // a `.tks` is exactly one; the file's r
 //     them into this `Program` of `Item`s, which the checker (collect/typer) consumes.
 //     Each `Item` is a tagged payload (the C union) PLUS the namespace it came from (A3
 //     provenance for codegen name-mangling; resolution/typing IGNORE it). ---
-pub type ItemKind = variant UseDecl | Statement | Function | TypeDecl   // the C tk_item tag+union, as a Teko variant
+/**
+ * The C `tk_item` tag+union, as a Teko variant — a flattened top-level item's
+ * payload: a `use`, a loose statement (main files), a `fn`, a `type`/`flags`, or a
+ * module-level `const` (ConstDecl, #594).
+ *
+ * @since #594 widened with ConstDecl (was `UseDecl | Statement | Function | TypeDecl`).
+ */
+pub type ItemKind = variant UseDecl | Statement | Function | TypeDecl | ConstDecl
 pub type Item = struct { content: ItemKind; namespace: str; file: str }   // a flattened top-level item + its source namespace (A3) + source file (W-loc-2: assemble tags it so a flattened-program error resolves to file:line:col; empty on the single-file compile/run path)
 pub type Program = struct { items: []Item }   // the flat item list the checker consumes
