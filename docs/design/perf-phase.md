@@ -152,6 +152,13 @@ that is the use-after-free proof for Boundary A.
     tell *loading the AST* apart from *executing*, and feeds the scheduler (run the long
     tests first / balance across threads). Not a standalone change — it comes in the same
     round as isolating the tests off the main-AST load and parallelizing the run.
+  * **Output UX — inline "N of M" progress counters (owner 2026-07-15).** Two points, both
+    "em linha" (a single line updated in place with `\r`, for visual progress instead of a
+    scrolling wall): **(a) files** — the loader today prints ONE line PER FILE
+    (`src/… -> teko::…`, hundreds of lines); replace with a compact `N/M files` counter (the
+    total M is known after project enumeration). **(b) tests** — the runner shows `N/M tests`
+    as each `#test` runs (lands with the per-test timers). Caveat: `\r`-in-place needs a TTY;
+    CI logs (non-TTY) get a newline/periodic form or a final summary. No design committed.
 * **Post-linker: per-OS ABI / platform optimization — a SEPARATE round, deferred
   (owner 2026-07-15).** Owner hypothesis: we are not yet exploiting the best ABI each
   OS can provide to maximize performance; grounded in the observed per-OS divergence
