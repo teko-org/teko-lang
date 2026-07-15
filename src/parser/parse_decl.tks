@@ -856,8 +856,47 @@ fn with_outer_doc(node: Decl, has_doc: bool, doc: str) -> Decl {
     match node {
         Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = true; doc = doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects; is_unsafe = f.is_unsafe }
         TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+        ConstDecl as cd => ConstDecl { name = cd.name; ty = cd.ty; init = cd.init; vis = cd.vis; has_doc = true; doc = doc; line = cd.line; col = cd.col }
         _ => node
     }
+}
+
+/**
+ * parse_const_decl — parse a module-level `const NAME: Type = <const-expr>` (#594),
+ * reached from `parse_decl` after the optional doc/`pub`/`exp` peel. The type
+ * annotation is MANDATORY at module scope (unlike a local `const`, whose type may
+ * infer): a public constant's type is part of its contract. The initializer is
+ * parsed as a full expression here and validated as a const-expr later, in the
+ * checker (`is_const_expr`), so parse errors stay syntactic.
+ *
+ * @param tokens  the full token stream
+ * @param start   the index of the `const` keyword
+ * @param vis     the visibility peeled by `parse_decl`
+ * @return        the parsed ConstDecl and the index just past its initializer
+ * @throws        a located error on a missing name, a missing `: Type`, a missing
+ *                `=`, or an ill-formed initializer expression
+ * @since #594
+ */
+fn parse_const_decl(tokens: []lexer::Token, start: u64, vis: Visibility) -> Parsed<Decl> | error {
+    let kw_line: u32 = tokens[start].line
+    let kw_col: u32 = tokens[start].col
+    mut p = start + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
+        return err_at(tokens, p, "expected a constant name after `const`")
+    }
+    let name = tokens[p].text
+    p = p + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Colon) {
+        return err_at(tokens, p, "expected ':' and a type — a module-level `const` must declare its type")
+    }
+    let ty = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
+    p = ty.next
+    if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
+        return err_at(tokens, p, "expected `=` and an initializer for a `const`")
+    }
+    let init = match parse_expr(tokens, p + 1) { Parsed<Expr> as x => x; error as e => return e }
+    let cd = ConstDecl { name = name; ty = ty.node; init = init.node; vis = vis; has_doc = false; doc = ""; line = kw_line; col = kw_col }
+    Parsed<Decl> { node = cd; next = init.next }
 }
 
 /**
@@ -881,9 +920,12 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     let start = attrs.next
     mut k = start
     if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
+    mut vis = Visibility::Private
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) {
+        vis = Visibility::Pub
         k = k + 1
     } else if is_kind_at(tokens, k, lexer::TokenKind::Exp) {
+        vis = Visibility::Exp
         k = k + 1
     }
     mut saw_extern = false
@@ -902,6 +944,14 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Flags) {
         let d = match parse_flags_decl_with_attrs(tokens, start, k, attrs) { Parsed<Decl> as x => x; error as e => return e }
+        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
+    }
+    if is_kind_at(tokens, k, lexer::TokenKind::Const) {
+        if saw_extern { return err_at(tokens, k, "expected `fn` or `type` after `extern`") }
+        match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => { } }
+        if attrs.di_kind != DiKind::None { return err_at(tokens, k, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may not precede a `const`") }
+        if attrs.must_free { return err_at(tokens, k, "`#must_free` may not precede a `const`") }
+        let d = match parse_const_decl(tokens, k, vis) { Parsed<Decl> as x => x; error as e => return e }
         return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
     }
     if saw_extern {
