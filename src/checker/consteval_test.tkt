@@ -540,13 +540,17 @@ fn return_is_array_lit(prog: TProgram) {
 }
 
 /**
- * inline_aggregate_consts_substitutes_and_drops_decl — the C-backend leg of crumb 6 (#594): a
- * `[]byte` const used as a bare reference is SUBSTITUTED by a clone of its array-literal initializer
- * and its TConstDecl is DROPPED (no residual const item), so the C backend materializes the value at
- * the use site rather than needing a static initializer for a runtime-allocated slice.
+ * inline_aggregate_consts_substitutes_and_keeps_residual_decl — the C-backend leg of crumb 6 (#594): a
+ * `[]byte` const used as a bare reference is SUBSTITUTED by a clone of its array-literal initializer;
+ * its `TConstDecl` is KEPT as a no-op residual item (#594 c9 finding), not dropped — `tk_emit_c_mode`'s
+ * item loop and `emit_program_main` both already treat any `TConstDecl` as a total no-op, and keeping
+ * the item preserves the program's per-index identity against the pre-aggregate-inline program
+ * `coverage::line_coverage`/`branch_coverage` walk (dropping it shifted every later function's
+ * `fn_items_index` out of sync with the coverage walk, corrupting coverage for the rest of the
+ * program).
  */
 #test
-fn inline_aggregate_consts_substitutes_and_drops_decl() {
+fn inline_aggregate_consts_substitutes_and_keeps_residual_decl() {
     let byteslice = Slice { element = Byte { } }
     mut elems: []TArrayElem = teko::list::empty()
     elems = teko::list::push(elems, TArrayElem { is_spread = false; expr = te(TByteLit { value = 31 to byte }, Byte { }) })
@@ -559,7 +563,7 @@ fn inline_aggregate_consts_substitutes_and_drops_decl() {
     items = teko::list::push(items, c_fn("f", body))
     match inline_aggregate_consts(TProgram { items = items }) {
         TProgram as out => {
-            teko::assert::is_true(count_const_items(out) == 0)
+            teko::assert::is_true(count_const_items(out) == 1)
             return_is_array_lit(out)
         }
         error => teko::assert::is_true(false)

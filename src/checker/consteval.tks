@@ -1123,23 +1123,28 @@ fn build_aggregate_map(ordered: []TConstDecl) -> ScalarConstMap {
 /**
  * inline_place_item_agg — fold one program item into the rewritten list, INLINING aggregate consts
  * (the C-backend leg of #594 crumb 6): a function body / loose statement has every aggregate-const
- * reference substituted by a clone of that const's collapsed initializer, and the aggregate const
- * DECLARATION is dropped. Unlike the LIR path (which materializes ONE shared rodata entry), the C
- * backend emits an aggregate value as a self-contained statement-expression, so a per-use clone is
- * both correct (the value is read-only) and the only form a C `static const` initializer cannot take
- * for a runtime-allocated slice. A residual scalar const (there should be none post-`inline_consts`)
- * passes through unchanged.
+ * reference substituted by a clone of that const's collapsed initializer. The aggregate const
+ * DECLARATION itself is KEPT as a residual, no-op item (`tk_emit_c_mode`'s item loop and
+ * `emit_program_main` both already treat every `TConstDecl` as a total no-op, emitting nothing for
+ * it) rather than dropped, so `prog.items` keeps the SAME length and per-index identity as the
+ * pre-aggregate-inline program the caller also hands to `coverage::line_coverage`/`branch_coverage`
+ * (both walk `fe.prog` by raw item index — #594 c9 finding: dropping the item here shifted every
+ * later function's `fn_items_index` out of sync with the coverage walk's indices, corrupting
+ * line/branch coverage for the whole remainder of the program). Unlike the LIR path (which
+ * materializes ONE shared rodata entry), the C backend emits an aggregate value as a self-contained
+ * statement-expression, so a per-use clone is both correct (the value is read-only) and the only
+ * form a C `static const` initializer cannot take for a runtime-allocated slice. A residual scalar
+ * const (there should be none post-`inline_consts`) passes through unchanged, same as an aggregate.
  *
  * @param out  the rewritten items accumulated so far
  * @param it   the program item to fold
  * @param map  the aggregate substitution table (parallel names/nss/inits)
- * @return     `out` grown with `it`'s rewritten form (or unchanged when `it` is a dropped aggregate const)
+ * @return     `out` grown with `it`'s rewritten form (every item is kept, none dropped)
  * @since #594
  */
 fn inline_place_item_agg(out: []TItem, it: TItem, map: ScalarConstMap) -> []TItem {
     match it {
         TFunction as f => teko::list::push(out, rewrite_function(f, map))
-        TConstDecl as cd => if is_scalar_const_type(cd.ty) { teko::list::push(out, it) } else { out }
         TStatement as s => teko::list::push(out, inline_rw_stmt(s, map))
         _ => teko::list::push(out, it)
     }
@@ -1148,16 +1153,20 @@ fn inline_place_item_agg(out: []TItem, it: TItem, map: ScalarConstMap) -> []TIte
 /**
  * inline_aggregate_consts — the C-BACKEND-ONLY companion to `inline_consts` (#594 crumb 6): substitute
  * every reference to a module-level AGGREGATE const with a clone of its checked initializer (in
- * dependency order) and drop the aggregate const declarations. The C backend emits an aggregate value
- * as a self-contained expression, so inlining each use is correct and side-steps needing a C
- * static-initializer for a runtime-allocated `[]T`. The LIR/native + VM path does NOT run this pass —
- * it materializes ONE shared rodata entry per aggregate const instead (`lower_program`'s
- * `intern_aggregate_consts`), so the two backends diverge in mechanism but agree in value. A
- * const-free program (the self-host itself) is returned unchanged, so the C-emission fixpoint is
- * byte-identical.
+ * dependency order). The aggregate const DECLARATION itself is KEPT as a no-op residual item (#594
+ * c9 finding) rather than dropped, so `prog.items` keeps the SAME length/per-index identity as the
+ * caller's pre-aggregate-inline program — the program `coverage::line_coverage`/`branch_coverage` walk
+ * by raw item index; dropping the item here shifted every later function's `fn_items_index` out of
+ * sync with that walk, corrupting line/branch coverage for the whole remainder of the program. The C
+ * backend emits an aggregate value as a self-contained expression, so inlining each use is correct and
+ * side-steps needing a C static-initializer for a runtime-allocated `[]T`. The LIR/native + VM path
+ * does NOT run this pass — it materializes ONE shared rodata entry per aggregate const instead
+ * (`lower_program`'s `intern_aggregate_consts`), so the two backends diverge in mechanism but agree in
+ * value. A const-free program (the self-host itself) is returned unchanged, so the C-emission
+ * fixpoint is byte-identical.
  *
  * @param prog  the fully typed, monomorphized, scalar-inlined program (what the C backend emits)
- * @return      the program with aggregate const references substituted and aggregate const decls removed
+ * @return      the program with aggregate const references substituted, every item kept (none dropped)
  * @throws      a located error when the module-level consts form a reference cycle (`const_dep_order`)
  * @since #594
  */
