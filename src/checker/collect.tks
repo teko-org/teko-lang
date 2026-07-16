@@ -1878,7 +1878,52 @@ fn seed_from_dep(dep: TProgram, table: TypeTable, env: Env) -> Collected | error
         }
         j++
     }
-    Collected { types = t; env = e }
+    Collected { types = t; env = seed_dep_consts(e, dep) }
+}
+
+/**
+ * seed_dep_consts — Pass 3 of `seed_from_dep` (#594 crumb 8): surface the dep's EXPORTED module-level
+ * consts into the seed environment. A `pub`/`exp` const is bound by name (like a function) so a
+ * consumer's bare reference resolves and `is_const = true` lets it seed a project const's own
+ * initializer; a `private` dep const is NOT bound, which IS the cross-module visibility gate for a
+ * module-level const. A hoisted MEMBER const rides its own mangled symbol here too — harmless, since
+ * `Type::NAME` resolution binds through the dep TypeDecl's `consts` list, not this env entry.
+ *
+ * @param env  the seed environment after fn signatures (Pass 2)
+ * @param dep  the already-typed dependency program
+ * @return     `env` extended with the dep's exported module consts bound by name
+ * @since #594
+ */
+fn seed_dep_consts(env: Env, dep: TProgram) -> Env {
+    mut e = env
+    mut k: u64 = 0
+    loop {
+        if k >= dep.items.len { break }
+        match dep.items[k] {
+            TConstDecl as c => if dep_const_is_exported(c) { e = define_const(e, c.name, c.ty, c.namespace) }
+            _ => { }
+        }
+        k++
+    }
+    e
+}
+
+/**
+ * dep_const_is_exported — true iff a dep `TConstDecl`'s visibility is `pub` or `exp`, the surface a
+ * consuming module may reach (#594 crumb 8). A `private` dep const (a surviving aggregate in the
+ * `.tkb`) is NOT surfaced by `seed_from_dep`, which IS the cross-module visibility gate for a
+ * module-level const — a consumer that names it fails to resolve, the usual visibility error.
+ *
+ * @param c  the typed dep const declaration
+ * @return   whether the const is part of the dep's public (cross-module) surface
+ * @since #594
+ */
+fn dep_const_is_exported(c: TConstDecl) -> bool {
+    match c.vis {
+        parser::Visibility::Private => false
+        parser::Visibility::Pub => true
+        parser::Visibility::Exp => true
+    }
 }
 
 // dep_item_ns — extract the namespace string from a TItem. TFunction carries it directly;

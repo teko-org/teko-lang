@@ -369,6 +369,66 @@ fn type_const_i128_cast_coerces() {
     }
 }
 
+/**
+ * A typed dep `TProgram` carrying a single module-level `const P: i64 = 120` (namespace "m1") at a
+ * given visibility — the shape a built dependency serializes into its `.tkb` and `type_program_with_deps`
+ * consumes through `seed_from_dep` (#594 crumb 8).
+ *
+ * @param name  the const's name
+ * @param vis   the const's visibility (Pub/Exp are the exported surface; Private is module-local)
+ * @return      a one-item typed dep program
+ */
+fn dep_prog_with_const(name: str, vis: parser::Visibility) -> TProgram {
+    let init = TExpr { kind = TNumber { is_float = false; value = 120; fval = 0.0 }; type = Prim { kind = PrimKind::I64 }; line = 0; col = 0 }
+    let cd = TConstDecl { name = name; namespace = "m1"; ty = Prim { kind = PrimKind::I64 }; init = init; vis = vis; has_doc = false; doc = ""; line = 1; col = 1 }
+    TProgram { items = teko::list::push(teko::list::empty(), cd) }
+}
+
+/** seed_from_dep_surfaces_pub_module_const — a consuming module resolves a dep's `pub` module const
+    by name AND inlines its serialized initializer: `type_program_with_deps` seeds the dep's exported
+    const (`seed_from_dep`), types the consumer's reference, then `inline_consts` substitutes the
+    value (120) — no cross-module data symbol (#594 crumb 8). */
+#test
+fn seed_from_dep_surfaces_pub_module_const() {
+    let uses_p = mk_fn("uses_p", named_t("i64"), one_stmt(e_var("P")))
+    let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = uses_p; namespace = "m2"; file = "m2.tks" })
+    match type_program_with_deps(parser::Program { items = items }, dep_prog_with_const("P", parser::Visibility::Pub)) {
+        TProgram as tp => {
+            mut found = false
+            mut i: u64 = 0
+            loop {
+                if i >= tp.items.len { break }
+                match tp.items[i] {
+                    TFunction as f => if f.name == "uses_p" {
+                        found = true
+                        match f.body[0] {
+                            TExprStmt as es => match es.expr.kind { TNumber as n => teko::assert::is_true(n.value == 120); _ => teko::assert::is_true(false) }
+                            _ => teko::assert::is_true(false)
+                        }
+                    }
+                    _ => { }
+                }
+                i++
+            }
+            teko::assert::is_true(found)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/** seed_from_dep_hides_private_module_const — a dep's `private` module const is NOT surfaced by
+    `seed_from_dep`, so a consumer that names it fails to resolve: the cross-module visibility gate for
+    a module-level const (#594 crumb 8). */
+#test
+fn seed_from_dep_hides_private_module_const() {
+    let uses_p = mk_fn("uses_p", named_t("i64"), one_stmt(e_var("P")))
+    let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = uses_p; namespace = "m2"; file = "m2.tks" })
+    match type_program_with_deps(parser::Program { items = items }, dep_prog_with_const("P", parser::Visibility::Private)) {
+        TProgram => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
 // REGRESSION (self-hosted cross-file top-level fn call): a top-level function declared in a
 // namespace (a non-main source file) called UNQUALIFIED from a LOOSE top-level statement (the
 // virtual-main / main.tks) in the SAME namespace. type_program must set the threaded scope's

@@ -939,23 +939,61 @@ fn rewrite_const_init(cd: TConstDecl, names: []str, inits: []TExpr) -> TConstDec
 }
 
 /**
+ * const_is_exported — true iff a const's visibility is `pub` or `exp`, the surface a consuming module
+ * may reach cross-module (#594 crumb 8). An exported SCALAR const survives `inline_consts` (rewritten,
+ * a lowering no-op) so its typed initializer rides the owning module's `.tkb` for the consumer to
+ * inline; a `private` scalar is dropped, having been inlined at every same-module use.
+ *
+ * @param cd  the typed const declaration
+ * @return    whether the const is part of the module's public (cross-module) surface
+ * @since #594
+ */
+fn const_is_exported(cd: TConstDecl) -> bool {
+    match cd.vis {
+        parser::Visibility::Private => false
+        parser::Visibility::Pub => true
+        parser::Visibility::Exp => true
+    }
+}
+
+/**
+ * inline_scalar_const_item — fold a SCALAR const declaration: a `private` scalar is DROPPED (it emits
+ * no code — inlined at every same-module use), while a `pub`/`exp` scalar SURVIVES (its initializer's
+ * nested scalar references collapsed by `rewrite_const_init`) so the const's value rides the module's
+ * `.tkb` and a consuming module inlines it identically (#594 crumb 8). A surviving scalar is a
+ * lowering/codegen no-op in every backend, exactly like an aggregate const's declaration.
+ *
+ * @param out    the rewritten items accumulated so far
+ * @param cd     the scalar const declaration to fold
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       `out` unchanged (private) or grown with the collapsed exported scalar const
+ * @since #594
+ */
+fn inline_scalar_const_item(out: []TItem, cd: TConstDecl, names: []str, inits: []TExpr) -> []TItem {
+    if const_is_exported(cd) { return teko::list::push(out, rewrite_const_init(cd, names, inits)) }
+    out
+}
+
+/**
  * inline_place_item — fold one program item into the rewritten item list: a function's body is walked
- * for scalar-const references; a loose statement is walked; a SCALAR const declaration is DROPPED (it
- * emits no code — no fn body, no arena); an aggregate const declaration survives (its initializer's
- * scalar references substituted, `rewrite_const_init`) for crumb-6 rodata materialization; every
- * type/use declaration passes through unchanged (#594 crumb 5).
+ * for scalar-const references; a loose statement is walked; a `private` SCALAR const declaration is
+ * DROPPED (it emits no code — no fn body, no arena) while a `pub`/`exp` scalar SURVIVES for `.tkb`
+ * export (crumb 8); an aggregate const declaration survives (its initializer's scalar references
+ * substituted, `rewrite_const_init`) for crumb-6 rodata materialization; every type/use declaration
+ * passes through unchanged (#594 crumb 5).
  *
  * @param out    the rewritten items accumulated so far
  * @param it     the program item to fold
  * @param names  the scalar-const names (PARALLEL to `inits`)
  * @param inits  the collapsed checked initializers
- * @return       `out` grown with `it`'s rewritten form (or unchanged when `it` is a dropped scalar const)
+ * @return       `out` grown with `it`'s rewritten form (or unchanged when `it` is a dropped private scalar const)
  * @since #594
  */
 fn inline_place_item(out: []TItem, it: TItem, names: []str, inits: []TExpr) -> []TItem {
     match it {
         TFunction as f => teko::list::push(out, rewrite_function(f, names, inits))
-        TConstDecl as cd => if is_scalar_const_type(cd.ty) { out } else { teko::list::push(out, rewrite_const_init(cd, names, inits)) }
+        TConstDecl as cd => if is_scalar_const_type(cd.ty) { inline_scalar_const_item(out, cd, names, inits) } else { teko::list::push(out, rewrite_const_init(cd, names, inits)) }
         TStatement as s => teko::list::push(out, inline_rw_stmt(s, names, inits))
         _ => teko::list::push(out, it)
     }
