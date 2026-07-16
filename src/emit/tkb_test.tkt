@@ -320,6 +320,111 @@ fn tkb_roundtrip_program() {
 }
 
 /**
+ * A module-level `TConstDecl` TItem (#594 crumb 8) round-trips through `serialize_program`: name,
+ * declaring namespace, value type, typed initializer, visibility, and position all survive, so a
+ * `pub`/`exp` module const's value crosses a `.tkb` for a consuming module to inline identically.
+ */
+#test
+fn tkb_roundtrip_module_const() {
+    let cd = checker::TConstDecl { name = "P"; namespace = "m1"; ty = i64ty(); init = tnum(120); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 4; col = 1 }
+    let items: []checker::TItem = teko::list::push(teko::list::empty(), cd)
+    let prog = checker::TProgram { items = items }
+    match deserialize_program(serialize_program(prog)) {
+        checker::TProgram as got => {
+            teko::assert::is_true(got.items.len == 1)
+            match got.items[0] {
+                checker::TConstDecl as c => {
+                    teko::assert::is_true(c.name == "P")
+                    teko::assert::is_true(c.namespace == "m1")
+                    teko::assert::is_true(c.vis == parser::Visibility::Pub)
+                    match c.ty { checker::Prim as p => teko::assert::is_true(p.kind == checker::PrimKind::I64); _ => teko::assert::is_true(false) }
+                    match c.init.kind { checker::TNumber as n => teko::assert::is_true(n.value == 120); _ => teko::assert::is_true(false) }
+                }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * A struct `TypeDecl` whose body carries a static member `const` (#594 crumb 8, §4.10) round-trips:
+ * the `consts` list survives with each member const's name, declared type, and visibility, so a
+ * `pub`/`exp` member const crosses a `.tkb` with its owning type for cross-module `Type::NAME` reach.
+ */
+#test
+fn tkb_roundtrip_member_const_struct() {
+    let fld = parser::Field { name = "x"; type_ann = nt("i64"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+    let consts: []parser::ConstDecl = teko::list::push(teko::list::empty(), member_const("ORIGIN", 9, parser::Visibility::Pub))
+    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = teko::list::empty(); implements = teko::list::empty(); consts = consts }
+    let td = parser::TypeDecl { name = "Point"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+    let items: []checker::TItem = teko::list::push(teko::list::empty(), td)
+    match deserialize_program(serialize_program(checker::TProgram { items = items })) {
+        checker::TProgram as got => {
+            teko::assert::is_true(got.items.len == 1)
+            match got.items[0] {
+                parser::TypeDecl as d => match d.body {
+                    parser::StructBody as s => {
+                        teko::assert::is_true(s.fields.len == 1)
+                        teko::assert::is_true(s.consts.len == 1)
+                        teko::assert::is_true(s.consts[0].name == "ORIGIN")
+                        teko::assert::is_true(s.consts[0].vis == parser::Visibility::Pub)
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * A class and a trait `TypeDecl` each carrying static member consts (#594 crumb 8, §4.10) round-trip:
+ * the `consts` list survives on both the `ClassBody` and the `TraitBody`, in declaration order.
+ */
+#test
+fn tkb_roundtrip_member_const_class_trait() {
+    let cconsts: []parser::ConstDecl = teko::list::push(teko::list::push(teko::list::empty(), member_const("CAP", 30, parser::Visibility::Pub)), member_const("HIDDEN", 1, parser::Visibility::Private))
+    let cbody = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty(); consts = cconsts }
+    let ctd = parser::TypeDecl { name = "Vault"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = cbody; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+    let tconsts: []parser::ConstDecl = teko::list::push(teko::list::empty(), member_const("ROLE", 2, parser::Visibility::Exp))
+    let tbody = parser::TraitBody { fields = teko::list::empty(); methods = teko::list::empty(); consts = tconsts }
+    let ttd = parser::TypeDecl { name = "Roled"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = tbody; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 2; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+    mut items: []checker::TItem = teko::list::push(teko::list::empty(), ctd)
+    items = teko::list::push(items, ttd)
+    match deserialize_program(serialize_program(checker::TProgram { items = items })) {
+        checker::TProgram as got => {
+            teko::assert::is_true(got.items.len == 2)
+            match got.items[0] {
+                parser::TypeDecl as d => match d.body {
+                    parser::ClassBody as c => {
+                        teko::assert::is_true(c.consts.len == 2)
+                        teko::assert::is_true(c.consts[0].name == "CAP")
+                        teko::assert::is_true(c.consts[1].name == "HIDDEN")
+                        teko::assert::is_true(c.consts[1].vis == parser::Visibility::Private)
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                _ => teko::assert::is_true(false)
+            }
+            match got.items[1] {
+                parser::TypeDecl as d => match d.body {
+                    parser::TraitBody as tb => {
+                        teko::assert::is_true(tb.consts.len == 1)
+                        teko::assert::is_true(tb.consts[0].name == "ROLE")
+                        teko::assert::is_true(tb.consts[0].vis == parser::Visibility::Exp)
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
  * An aliased `use a::b as c` (S1, #335) round-trips through the `.tkb` codec: `has_alias`/`alias`
  * survive and the grouped-names list stays empty.
  */
@@ -826,13 +931,31 @@ fn bytes_equal(a: []byte, b: []byte) -> bool {
     true
 }
 
-/** (#165 C7) a generic struct `type Box<T: Ord> = struct { v: T }` carrying two methods
-    [get, set] and one implements ("Named") — exercises type_params + constraints + method order. */
+/**
+ * A static type-member `const` declaration for the codec fixtures (#594 crumb 8): a `[vis] const
+ * NAME: u8 = <val>` peer to a struct/class body's fields and methods. Its `init` is a bare literal —
+ * the body codec does not serialize a member const's initializer (the value rides the hoisted
+ * module-level TConstDecl), so a read-back member const carries `no_expr()`.
+ *
+ * @param name  the member const's name
+ * @param val   the initializer literal's value
+ * @param vis   the member const's visibility
+ * @return      the parsed member const declaration
+ */
+fn member_const(name: str, val: i128, vis: parser::Visibility) -> parser::ConstDecl {
+    let lit = parser::Expr { kind = parser::Number { is_float = false; value = val; fval = 0.0 }; line = 0; col = 0 }
+    parser::ConstDecl { name = name; ty = nt("u8"); init = lit; vis = vis; has_doc = false; doc = ""; line = 3; col = 5 }
+}
+
+/** (#165 C7) a generic struct `type Box<T: Ord> = struct { v: T; exp const TAG: u8 = 7 }` carrying two
+    methods [get, set], one implements ("Named"), and one static member const — exercises type_params +
+    constraints + method order + the §4.10 `consts` list (#594 crumb 8). */
 fn rich_generic_struct() -> parser::TypeDecl {
     let fld = parser::Field { name = "v"; type_ann = nt("T"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
     mut methods: []parser::Function = teko::list::push(teko::list::empty(), method_sig("get"))
     methods = teko::list::push(methods, method_sig("set"))
-    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = methods; implements = teko::list::push(teko::list::empty(), "Named"); consts = teko::list::empty() }
+    let consts: []parser::ConstDecl = teko::list::push(teko::list::empty(), member_const("TAG", 7, parser::Visibility::Exp))
+    let body = parser::StructBody { fields = teko::list::push(teko::list::empty(), fld); methods = methods; implements = teko::list::push(teko::list::empty(), "Named"); consts = consts }
     let tcons: []parser::ConstraintExpr = teko::list::push(teko::list::empty(), parser::ConstraintAtom { name = "Ord" })
     parser::TypeDecl { name = "Box"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = tcons; body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
 }
@@ -867,14 +990,23 @@ fn rich_generic_fn() -> checker::TFunction {
     checker::TFunction { name = "pick"; type_params = teko::list::push(teko::list::empty(), "T"); type_constraints = tcons; params = teko::list::push(teko::list::empty(), prm); return_type = named_ty("T"); body = body; vis = parser::Visibility::Pub; has_doc = false; doc = ""; namespace = "m"; file = "m.tks"; line = 1; col = 1; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
 }
 
-/** (#165 C7) a RICH TProgram: a `use`, a generic struct with methods + implements, an interface
-    (vtable order), and a generic fn whose typed body carries a match + defer. */
+/** (#594 crumb 8) a module-level `exp const LIMIT: i64 = 255` TItem — a struct-of-existing-codecs
+    (name, namespace, value type, typed initializer, vis, doc, line/col) whose typed initializer rides
+    the `.tkb` in full so a consuming module inlines it identically. */
+fn rich_module_const() -> checker::TConstDecl {
+    checker::TConstDecl { name = "LIMIT"; namespace = "m"; ty = i64ty(); init = tnum(255); vis = parser::Visibility::Exp; has_doc = false; doc = ""; line = 9; col = 1 }
+}
+
+/** (#165 C7) a RICH TProgram: a `use`, a generic struct with methods + implements + a static member
+    const, an interface (vtable order), a generic fn whose typed body carries a match + defer, and a
+    module-level const TItem (#594 crumb 8). */
 fn rich_program() -> checker::TProgram {
     let upath = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }) }
     mut items: []checker::TItem = teko::list::push(teko::list::empty(), parser::UseDecl { path = upath; has_alias = false; alias = ""; names = teko::list::empty() })
     items = teko::list::push(items, rich_generic_struct())
     items = teko::list::push(items, rich_interface())
     items = teko::list::push(items, rich_generic_fn())
+    items = teko::list::push(items, rich_module_const())
     checker::TProgram { items = items }
 }
 

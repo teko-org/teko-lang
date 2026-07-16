@@ -211,16 +211,43 @@ fn collect_fields(t: StrTable, xs: []parser::Field) -> StrTable {
     loop { if i >= xs.len { break }; tab = collect_typeexpr(st_intern(tab, xs[i].name).table, xs[i].type_ann); i++ }
     tab
 }
-/** (#165 C5) collect a StructBody's fields + methods + implements strings. */
+/**
+ * Intern the SIGNATURE strings of one static type-member `ConstDecl` (#594 crumb 8): its name,
+ * declared-type annotation, and doc-comment. The initializer expression is NOT collected — like a
+ * parameter's default it does not ride the body codec; the member const's VALUE travels instead on
+ * the hoisted module-level `TConstDecl` TItem (a full typed `TExpr`).
+ *
+ * @param t   the string table so far
+ * @param cd  the member const declaration to collect from
+ * @return    `t` with the const's name/type/doc strings interned
+ */
+fn collect_constdecl(t: StrTable, cd: parser::ConstDecl) -> StrTable {
+    collect_typeexpr(st_intern(st_intern(t, cd.name).table, cd.doc).table, cd.ty)
+}
+/**
+ * Intern the strings of a type body's `consts` list (#594 crumb 8): the static member const surface
+ * a struct/class/trait carries, in declaration order, mirroring `write_constdecls`.
+ *
+ * @param t   the string table so far
+ * @param xs  the member const declarations to collect from
+ * @return    `t` with every member const's signature strings interned
+ */
+fn collect_constdecls(t: StrTable, xs: []parser::ConstDecl) -> StrTable {
+    mut tab = t
+    mut i = 0
+    loop { if i >= xs.len { break }; tab = collect_constdecl(tab, xs[i]); i++ }
+    tab
+}
+/** (#165 C5) collect a StructBody's fields + methods + implements + member consts strings. */
 fn collect_struct_body(t: StrTable, s: parser::StructBody) -> StrTable {
-    collect_pieces(collect_functions(collect_fields(t, s.fields), s.methods), s.implements)
+    collect_constdecls(collect_pieces(collect_functions(collect_fields(t, s.fields), s.methods), s.implements), s.consts)
 }
 
-/** (#165 C5) collect a ClassBody's base names + implements + fields + methods strings. */
+/** (#165 C5) collect a ClassBody's base names + implements + fields + methods + member consts strings. */
 fn collect_class_body(t: StrTable, c: parser::ClassBody) -> StrTable {
     let bases = st_intern(st_intern(t, c.base_name).table, c.base_binding_name).table
     let impls = collect_pieces(bases, c.implements)
-    collect_functions(collect_fields(impls, c.fields), c.methods)
+    collect_constdecls(collect_functions(collect_fields(impls, c.fields), c.methods), c.consts)
 }
 
 fn collect_typebody(t: StrTable, tb: parser::TypeBody) -> StrTable {
@@ -233,7 +260,7 @@ fn collect_typebody(t: StrTable, tb: parser::TypeBody) -> StrTable {
         parser::ExternBody => t
         parser::ClassBody as c => collect_class_body(t, c)
         parser::InterfaceBody as ib => collect_functions(collect_pieces(t, ib.extends), ib.methods)
-        parser::TraitBody as trb => collect_functions(collect_fields(t, trb.fields), trb.methods)
+        parser::TraitBody as trb => collect_constdecls(collect_functions(collect_fields(t, trb.fields), trb.methods), trb.consts)
     }
 }
 /** (#165 C2) collect a ConstraintExpr's atom names (mirrors write_constraint). */
@@ -311,13 +338,27 @@ fn collect_titems(t: StrTable, xs: []checker::TItem) -> StrTable {
     loop { if i >= xs.len { break }; tab = collect_titem(tab, xs[i]); i++ }
     tab
 }
+/**
+ * Intern the strings of a module-level `TConstDecl` TItem (#594 crumb 8): its name, declaring
+ * namespace, and doc, plus every string in its resolved value type and typed initializer. Mirrors
+ * `write_tconstdecl`, so a `pub`/`exp` module const's typed initializer survives the `.tkb` round
+ * trip and a consuming module inlines it identically.
+ *
+ * @param t   the string table so far
+ * @param c   the typed module const to collect from
+ * @return    `t` with the const's name/namespace/doc + type + initializer strings interned
+ */
+fn collect_tconstdecl(t: StrTable, c: checker::TConstDecl) -> StrTable {
+    let named = st_intern(st_intern(st_intern(t, c.name).table, c.namespace).table, c.doc).table
+    collect_strings(collect_type_strings(named, c.ty), c.init)
+}
 fn collect_titem(t: StrTable, it: checker::TItem) -> StrTable {
     match it {
         checker::TFunction as f => collect_tfunction(t, f)
         parser::TypeDecl as d => collect_typedecl(t, d)
         parser::UseDecl as u => collect_usedecl(t, u)
         checker::TStatement as s => collect_tstatement(t, s)
-        checker::TConstDecl => t
+        checker::TConstDecl as c => collect_tconstdecl(t, c)
     }
 }
 fn collect_program(t: StrTable, prog: checker::TProgram) -> StrTable { collect_titems(t, prog.items) }

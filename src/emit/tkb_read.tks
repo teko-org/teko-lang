@@ -170,6 +170,9 @@ type RTypeBody = struct { r: Reader; value: parser::TypeBody }
 type RTypeDecl = struct { r: Reader; value: parser::TypeDecl }
 type RUseDecl = struct { r: Reader; value: parser::UseDecl }
 type RTFunction = struct { r: Reader; value: checker::TFunction }
+type RConstDecl = struct { r: Reader; value: parser::ConstDecl }
+type RConstDecls = struct { r: Reader; value: []parser::ConstDecl }
+type RTConstDecl = struct { r: Reader; value: checker::TConstDecl }
 type RTItem = struct { r: Reader; value: checker::TItem }
 type RProgram = struct { r: Reader; value: checker::TProgram }
 type RPExpr = struct { r: Reader; value: parser::Expr }   // (C7.16) match framing
@@ -602,6 +605,35 @@ fn read_fields(r: Reader, table: []str) -> RFields | error {
     }
     RFields { r = rr; value = xs }
 }
+/**
+ * Read one static type-member `ConstDecl` SIGNATURE: inverse of `write_constdecl` (#594 crumb 8) —
+ * name + type_ann + vis + has_doc + doc + line + col. The initializer was not serialized (the body
+ * codec carries signatures only; the value rides the hoisted module-level `TConstDecl` TItem), so it
+ * reconstructs as `parser::no_expr()`, exactly as `read_params` stubs a dropped default.
+ *
+ * @param Reader r  the reader cursor at the member const's first field
+ * @param []str table  the interned string table
+ * @return RConstDecl | error  the decoded member const plus the advanced cursor
+ */
+fn read_constdecl(r: Reader, table: []str) -> RConstDecl | error {
+    let nm = match tkb_read_str(r, table) { RStr as x => x; error as e => return e }
+    let ty = match read_typeexpr(nm.r, table) { RTypeExpr as x => x; error as e => return e }
+    let vis = match read_u8(ty.r) { RByte as x => x; error as e => return e }
+    let hd = match read_u8(vis.r) { RByte as x => x; error as e => return e }
+    let doc = match tkb_read_str(hd.r, table) { RStr as x => x; error as e => return e }
+    let ln = match read_u32(doc.r) { RU32 as x => x; error as e => return e }
+    let cl = match read_u32(ln.r) { RU32 as x => x; error as e => return e }
+    RConstDecl { r = cl.r; value = parser::ConstDecl { name = nm.value; ty = ty.value; init = parser::no_expr(); vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value; line = ln.value; col = cl.value } }
+}
+/** a type body's `consts` list: inverse of `write_constdecls` (#594 crumb 8) — u64 count + each. */
+fn read_constdecls(r: Reader, table: []str) -> RConstDecls | error {
+    let n = match read_u64(r) { RU64 as x => x; error as e => return e }
+    mut rr = n.r
+    mut xs: []parser::ConstDecl = teko::list::empty()
+    mut i = 0
+    loop { if i >= n.value { break }; let c = match read_constdecl(rr, table) { RConstDecl as x => x; error as e => return e }; xs = teko::list::push(xs, c.value); rr = c.r; i++ }
+    RConstDecls { r = rr; value = xs }
+}
 fn read_strs(r: Reader, table: []str) -> RStrs | error {
     let n = match read_u64(r) { RU64 as x => x; error as e => return e }
     mut rr = n.r
@@ -695,7 +727,8 @@ fn read_typebody(r: Reader, table: []str) -> RTypeBody | error {
         let fs = match read_fields(tag.r, table) { RFields as x => x; error as e => return e }
         let ms = match read_functions(fs.r, table) { RFunctions as x => x; error as e => return e }
         let im = match read_strs(ms.r, table) { RStrs as x => x; error as e => return e }
-        return RTypeBody { r = im.r; value = parser::StructBody { fields = fs.value; methods = ms.value; implements = im.value; consts = teko::list::empty() } }
+        let cs = match read_constdecls(im.r, table) { RConstDecls as x => x; error as e => return e }
+        return RTypeBody { r = cs.r; value = parser::StructBody { fields = fs.value; methods = ms.value; implements = im.value; consts = cs.value } }
     }
     if tag.value == 1 { let ms = match read_strs(tag.r, table) { RStrs as x => x; error as e => return e }; return RTypeBody { r = ms.r; value = parser::EnumBody { members = ms.value } } }
     if tag.value == 2 { let te = match read_typeexpr(tag.r, table) { RTypeExpr as x => x; error as e => return e }; return RTypeBody { r = te.r; value = parser::VariantBody { type_expr = te.value } } }
@@ -730,10 +763,11 @@ fn read_typebody(r: Reader, table: []str) -> RTypeBody | error {
         let im = match read_strs(bbn.r, table) { RStrs as x => x; error as e => return e }
         let fs = match read_fields(im.r, table) { RFields as x => x; error as e => return e }
         let ms = match read_functions(fs.r, table) { RFunctions as x => x; error as e => return e }
-        return RTypeBody { r = ms.r; value = parser::ClassBody {
+        let cs = match read_constdecls(ms.r, table) { RConstDecls as x => x; error as e => return e }
+        return RTypeBody { r = cs.r; value = parser::ClassBody {
                 kind = ck.value to parser::ClassKind; has_base = hb.value != 0; base_name = bn.value
                 has_base_binding = hbb.value != 0; base_binding_name = bbn.value
-                implements = im.value; fields = fs.value; methods = ms.value; consts = teko::list::empty()
+                implements = im.value; fields = fs.value; methods = ms.value; consts = cs.value
         } }
     }
     if tag.value == 7 {
@@ -744,7 +778,8 @@ fn read_typebody(r: Reader, table: []str) -> RTypeBody | error {
     if tag.value == 8 {
         let fs = match read_fields(tag.r, table) { RFields as x => x; error as e => return e }
         let ms = match read_functions(fs.r, table) { RFunctions as x => x; error as e => return e }
-        return RTypeBody { r = ms.r; value = parser::TraitBody { fields = fs.value; methods = ms.value; consts = teko::list::empty() } }
+        let cs = match read_constdecls(ms.r, table) { RConstDecls as x => x; error as e => return e }
+        return RTypeBody { r = cs.r; value = parser::TraitBody { fields = fs.value; methods = ms.value; consts = cs.value } }
     }
     error { message = "bad typebody tag in .tkb" }
 }
@@ -809,12 +844,34 @@ fn read_tfunction(r: Reader, table: []str) -> RTFunction | error {
     let fr = match tkb_read_str(cs.r, table) { RStr as x => x; error as e => return e }
     RTFunction { r = fr.r; value = checker::TFunction { name = nm.value; type_params = tp.value; type_constraints = tc.value; params = ps.value; return_type = rt.value; body = bd.value; vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value; namespace = ns.value; file = fl.value; line = ln.value; col = cl.value; is_test = it.value != 0; is_extern = ie.value != 0; c_symbol = cs.value; from_lib = fr.value } }
 }
+/**
+ * Read a module-level `TConstDecl` TItem: inverse of `write_tconstdecl` (#594 crumb 8) — name +
+ * namespace + value type + typed initializer + vis + has_doc + doc + line + col. The initializer
+ * rides in full (unlike a body member const), so a consuming module inlines the value identically.
+ *
+ * @param Reader r  the reader cursor at the const's first field (past the TItem tag)
+ * @param []str table  the interned string table
+ * @return RTConstDecl | error  the decoded module const plus the advanced cursor
+ */
+fn read_tconstdecl(r: Reader, table: []str) -> RTConstDecl | error {
+    let nm = match tkb_read_str(r, table) { RStr as x => x; error as e => return e }
+    let ns = match tkb_read_str(nm.r, table) { RStr as x => x; error as e => return e }
+    let ty = match read_type(ns.r, table) { RType as x => x; error as e => return e }
+    let init = match read_texpr(ty.r, table) { RTExpr as x => x; error as e => return e }
+    let vis = match read_u8(init.r) { RByte as x => x; error as e => return e }
+    let hd = match read_u8(vis.r) { RByte as x => x; error as e => return e }
+    let doc = match tkb_read_str(hd.r, table) { RStr as x => x; error as e => return e }
+    let ln = match read_u32(doc.r) { RU32 as x => x; error as e => return e }
+    let cl = match read_u32(ln.r) { RU32 as x => x; error as e => return e }
+    RTConstDecl { r = cl.r; value = checker::TConstDecl { name = nm.value; namespace = ns.value; ty = ty.value; init = init.value; vis = vis.value to parser::Visibility; has_doc = hd.value != 0; doc = doc.value; line = ln.value; col = cl.value } }
+}
 fn read_titem(r: Reader, table: []str) -> RTItem | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 { let f = match read_tfunction(tag.r, table) { RTFunction as x => x; error as e => return e }; return RTItem { r = f.r; value = f.value } }
     if tag.value == 1 { let d = match read_typedecl(tag.r, table) { RTypeDecl as x => x; error as e => return e }; return RTItem { r = d.r; value = d.value } }
     if tag.value == 2 { let u = match read_usedecl(tag.r, table) { RUseDecl as x => x; error as e => return e }; return RTItem { r = u.r; value = u.value } }
     if tag.value == 3 { let s = match read_tstatement(tag.r, table) { RTStmt as x => x; error as e => return e }; return RTItem { r = s.r; value = s.value } }
+    if tag.value == 4 { let c = match read_tconstdecl(tag.r, table) { RTConstDecl as x => x; error as e => return e }; return RTItem { r = c.r; value = c.value } }
     error { message = "bad titem tag in .tkb" }
 }
 fn read_program(r: Reader, table: []str) -> RProgram | error {

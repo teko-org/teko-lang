@@ -364,12 +364,41 @@ fn write_fields(buf: []byte, t: StrTable, xs: []parser::Field) -> []byte {
 /** (#165 C5) a class-kind's ordinal byte — Sealed/Abstract/Virtual → 0/1/2 (the enum→int cast). */
 fn class_kind_byte(k: parser::ClassKind) -> byte { k to byte }
 
-/** (#165 C5) a StructBody: fields + methods + implements (all now ride — full fidelity). */
-fn write_struct_body(buf: []byte, t: StrTable, s: parser::StructBody) -> []byte {
-    write_strs(write_functions(write_fields(write_u8(buf, 0), t, s.fields), t, s.methods), t, s.implements)
+/**
+ * Serialize one static type-member `ConstDecl` SIGNATURE (#594 crumb 8): name (interned) +
+ * declared-type annotation (TypeExpr) + vis (u8) + has_doc (u8) + doc (interned) + line + col. The
+ * initializer is NOT written — like a parameter's default it does not ride the body codec; the
+ * member const's VALUE travels on the hoisted module-level `TConstDecl` TItem instead, so the
+ * consuming module resolves `Type::NAME` by this signature and inlines the value from the TItem.
+ *
+ * @param buf  the output buffer to append to
+ * @param t    the string table (name/doc already interned by `collect_constdecl`)
+ * @param cd   the member const declaration to serialize
+ * @return     `buf` with the member const's signature appended
+ */
+fn write_constdecl(buf: []byte, t: StrTable, cd: parser::ConstDecl) -> []byte {
+    mut b = write_typeexpr(write_u32(buf, st_find(t, cd.name)), t, cd.ty)
+    b = write_u8(b, vis_byte(cd.vis))
+    b = write_u8(b, (if cd.has_doc { 1 } else { 0 }) to byte)
+    b = write_u32(b, st_find(t, cd.doc))
+    b = write_u32(b, cd.line to u32)
+    write_u32(b, cd.col to u32)
 }
 
-/** (#165 C5) a ClassBody: kind + base + binding + implements + fields + methods (all ride). */
+/** a type body's `consts` list (#594 crumb 8): u64 count + each member const signature. */
+fn write_constdecls(buf: []byte, t: StrTable, xs: []parser::ConstDecl) -> []byte {
+    mut b = write_u64(buf, xs.len to u64)
+    mut i = 0
+    loop { if i >= xs.len { break }; b = write_constdecl(b, t, xs[i]); i++ }
+    b
+}
+
+/** (#165 C5) a StructBody: fields + methods + implements + member consts (all now ride — full fidelity). */
+fn write_struct_body(buf: []byte, t: StrTable, s: parser::StructBody) -> []byte {
+    write_constdecls(write_strs(write_functions(write_fields(write_u8(buf, 0), t, s.fields), t, s.methods), t, s.implements), t, s.consts)
+}
+
+/** (#165 C5) a ClassBody: kind + base + binding + implements + fields + methods + member consts (all ride). */
 fn write_class_body(buf: []byte, t: StrTable, c: parser::ClassBody) -> []byte {
     mut b = write_u8(write_u8(buf, 6), class_kind_byte(c.kind))
     b = write_u8(b, (if c.has_base { 1 } else { 0 }) to byte)
@@ -378,7 +407,8 @@ fn write_class_body(buf: []byte, t: StrTable, c: parser::ClassBody) -> []byte {
     b = write_u32(b, st_find(t, c.base_binding_name))
     b = write_strs(b, t, c.implements)
     b = write_fields(b, t, c.fields)
-    write_functions(b, t, c.methods)
+    b = write_functions(b, t, c.methods)
+    write_constdecls(b, t, c.consts)
 }
 
 /** a TypeBody: u8 tag + payload. StructBody(0)/EnumBody(1)/VariantBody(2)/AliasBody(3)/ExternBody(4)/
@@ -394,7 +424,7 @@ fn write_typebody(buf: []byte, t: StrTable, tb: parser::TypeBody) -> []byte {
         parser::FlagsBody as f => write_flags_body(buf, t, f)
         parser::ClassBody as c => write_class_body(buf, t, c)
         parser::InterfaceBody as ib => write_functions(write_strs(write_u8(buf, 7), t, ib.extends), t, ib.methods)
-        parser::TraitBody as trb => write_functions(write_fields(write_u8(buf, 8), t, trb.fields), t, trb.methods)
+        parser::TraitBody as trb => write_constdecls(write_functions(write_fields(write_u8(buf, 8), t, trb.fields), t, trb.methods), t, trb.consts)
     }
 }
 
@@ -508,14 +538,44 @@ fn write_tfunction(buf: []byte, t: StrTable, f: checker::TFunction) -> []byte {
     write_u32(b, st_find(t, f.from_lib))
 }
 
-// a TItem: u8 tag — TFunction(0) | TypeDecl(1) | UseDecl(2) | TStatement(3).
+/**
+ * Serialize a module-level `TConstDecl` TItem (#594 crumb 8): name + namespace (interned) +
+ * value type + typed initializer + vis (u8) + has_doc (u8) + doc + line + col — a
+ * struct-of-existing-codecs mirroring `write_tfunction`. The typed initializer rides in full so a
+ * consuming module inlines a `pub`/`exp` const identically, with no cross-module data symbol.
+ *
+ * @param buf  the output buffer to append to
+ * @param t    the string table (all const strings interned by `collect_tconstdecl`)
+ * @param c    the typed module const to serialize
+ * @return     `buf` with the module const appended
+ */
+fn write_tconstdecl(buf: []byte, t: StrTable, c: checker::TConstDecl) -> []byte {
+    mut b = write_u32(write_u32(buf, st_find(t, c.name)), st_find(t, c.namespace))
+    b = write_type(b, t, c.ty)
+    b = write_texpr(b, t, c.init)
+    b = write_u8(b, vis_byte(c.vis))
+    b = write_u8(b, (if c.has_doc { 1 } else { 0 }) to byte)
+    b = write_u32(b, st_find(t, c.doc))
+    b = write_u32(b, c.line to u32)
+    write_u32(b, c.col to u32)
+}
+
+/**
+ * Serialize one `TItem` behind its u8 discriminant tag — TFunction(0) | TypeDecl(1) | UseDecl(2) |
+ * TStatement(3) | TConstDecl(4). `read_titem` decodes the tag to pick the matching reader.
+ *
+ * @param buf  the output buffer to append to
+ * @param t    the string table (item strings already interned)
+ * @param it   the typed item to serialize
+ * @return     `buf` with the tag byte + the item's payload appended
+ */
 fn write_titem(buf: []byte, t: StrTable, it: checker::TItem) -> []byte {
     match it {
         checker::TFunction as f => write_tfunction(write_u8(buf, 0), t, f)
         parser::TypeDecl as d => write_typedecl(write_u8(buf, 1), t, d)
         parser::UseDecl as u => write_usedecl(write_u8(buf, 2), t, u)
         checker::TStatement as s => write_tstatement(write_u8(buf, 3), t, s)
-        checker::TConstDecl => buf
+        checker::TConstDecl as c => write_tconstdecl(write_u8(buf, 4), t, c)
     }
 }
 
