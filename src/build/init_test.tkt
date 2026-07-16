@@ -1,0 +1,296 @@
+/**
+ * init_args_of — build a `[]str` CLI argument vector from up to three tokens,
+ * dropping any that is "" so a test can pass fewer than three (mirrors
+ * help_test.tkt's own `help_args_of` fixture, scoped to `init_target_of`).
+ *
+ * @param a  the first token (dropped when "")
+ * @param b  the second token (dropped when "")
+ * @param c  the third token (dropped when "")
+ * @return   the assembled argument vector
+ */
+fn init_args_of(a: str, b: str, c: str) -> []str {
+    mut v: []str = teko::list::empty()
+    if a != "" { v = teko::list::push(v, a) }
+    if b != "" { v = teko::list::push(v, b) }
+    if c != "" { v = teko::list::push(v, c) }
+    v
+}
+
+/**
+ * is_valid_root_name_accepts_legal_identifiers — plain letters, digits after the
+ * first byte, and a leading underscore are all legal project root names.
+ *
+ * @return void
+ */
+#test
+fn is_valid_root_name_accepts_legal_identifiers() {
+    teko::assert::is_true(is_valid_root_name("app"))
+    teko::assert::is_true(is_valid_root_name("my_app123"))
+    teko::assert::is_true(is_valid_root_name("_private"))
+}
+
+/**
+ * is_valid_root_name_rejects_illegal_names — empty, the reserved "teko" root, a
+ * leading digit, and punctuation (`::`, spaces) are all rejected.
+ *
+ * @return void
+ */
+#test
+fn is_valid_root_name_rejects_illegal_names() {
+    teko::assert::is_false(is_valid_root_name(""))
+    teko::assert::is_false(is_valid_root_name("teko"))
+    teko::assert::is_false(is_valid_root_name("1abc"))
+    teko::assert::is_false(is_valid_root_name("a::b"))
+    teko::assert::is_false(is_valid_root_name("has space"))
+}
+
+/**
+ * is_valid_artifact_kind_truth_table — the four recognized kinds pass; anything
+ * else (including "") is rejected.
+ *
+ * @return void
+ */
+#test
+fn is_valid_artifact_kind_truth_table() {
+    teko::assert::is_true(is_valid_artifact_kind("binary"))
+    teko::assert::is_true(is_valid_artifact_kind("static"))
+    teko::assert::is_true(is_valid_artifact_kind("shared"))
+    teko::assert::is_true(is_valid_artifact_kind("package"))
+    teko::assert::is_false(is_valid_artifact_kind("library"))
+    teko::assert::is_false(is_valid_artifact_kind(""))
+}
+
+/**
+ * strip_trailing_slashes_trims_every_trailing_slash — trailing `/` runs are fully
+ * removed; a path with none, or an all-slash path, are handled too.
+ *
+ * @return void
+ */
+#test
+fn strip_trailing_slashes_trims_every_trailing_slash() {
+    teko::assert::is_true(strip_trailing_slashes("a/b//") == "a/b")
+    teko::assert::is_true(strip_trailing_slashes("noslash") == "noslash")
+    teko::assert::is_true(strip_trailing_slashes("") == "")
+    teko::assert::is_true(strip_trailing_slashes("/") == "")
+}
+
+/**
+ * basename_of_nested_and_bare_paths — the last segment of a multi-level path, a
+ * bare name unchanged, a trailing-slash path, and the "app" fallback for an
+ * empty/all-slash path.
+ *
+ * @return void
+ */
+#test
+fn basename_of_nested_and_bare_paths() {
+    teko::assert::is_true(basename("a/b/c") == "c")
+    teko::assert::is_true(basename("single") == "single")
+    teko::assert::is_true(basename("a/b/") == "b")
+    teko::assert::is_true(basename("") == "app")
+    teko::assert::is_true(basename("/") == "app")
+}
+
+/**
+ * sanitize_ident_replaces_illegal_bytes — punctuation/space bytes become `_`; a
+ * leading digit gets a `_` prefix; an empty name falls back to "app"; an already
+ * legal identifier passes through unchanged.
+ *
+ * @return void
+ */
+#test
+fn sanitize_ident_replaces_illegal_bytes() {
+    teko::assert::is_true(sanitize_ident("my-app") == "my_app")
+    teko::assert::is_true(sanitize_ident("my app!") == "my_app_")
+    teko::assert::is_true(sanitize_ident("123abc") == "_123abc")
+    teko::assert::is_true(sanitize_ident("") == "app")
+    teko::assert::is_true(sanitize_ident("already_legal") == "already_legal")
+}
+
+/**
+ * default_project_name_of_explicit_target — an explicit, non-"."/non-"" target
+ * yields the sanitized basename of THAT target, never the current directory.
+ *
+ * @return void
+ */
+#test
+fn default_project_name_of_explicit_target() {
+    teko::assert::is_true(default_project_name("my-explicit-dir") == "my_explicit_dir")
+}
+
+/**
+ * default_project_name_of_cwd_target — the "." and "" targets (no directory
+ * argument) both resolve through the current-directory fallback and always yield
+ * a legal root name.
+ *
+ * @return void
+ */
+#test
+fn default_project_name_of_cwd_target() {
+    teko::assert::is_true(is_valid_root_name(default_project_name(".")))
+    teko::assert::is_true(is_valid_root_name(default_project_name("")))
+}
+
+/**
+ * join_path_variants — "."/"" join to the bare name; a plain directory joins with
+ * one `/`; a trailing-slash directory never doubles the separator.
+ *
+ * @return void
+ */
+#test
+fn join_path_variants() {
+    teko::assert::is_true(join_path(".", "teko.tkp") == "teko.tkp")
+    teko::assert::is_true(join_path("", "teko.tkp") == "teko.tkp")
+    teko::assert::is_true(join_path("dir", "x") == "dir/x")
+    teko::assert::is_true(join_path("dir/", "x") == "dir/x")
+}
+
+/**
+ * assert_manifest_round_trip — render a manifest for (`kind`, `wants`) and assert
+ * it parses back to the expected name/source/artifact/coverage-floor. The shared
+ * body of `render_manifest_round_trips_every_artifact_kind`'s four cases.
+ *
+ * @param kind   the artifact-kind text to render
+ * @param wants  the `Artifact` enum value `kind` is expected to parse back to
+ */
+fn assert_manifest_round_trip(kind: str, wants: Artifact) {
+    match parse_manifest(render_manifest("app", kind, "src", "")) {
+        Manifest as m => {
+            teko::assert::is_true(m.name == "app")
+            teko::assert::is_true(m.source == "src")
+            teko::assert::is_true(m.artifact == wants)
+            teko::assert::is_true(m.cov_functions == 0)
+            teko::assert::is_true(m.cov_lines == 0)
+            teko::assert::is_true(m.cov_branches == 0)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * render_manifest_round_trips_every_artifact_kind — the generated `.tkp` text
+ * parses back (via `parse_manifest`) to the same name/source/kind for all four
+ * artifact kinds, and always carries the permissive 0/0/0 coverage floor.
+ *
+ * @return void
+ */
+#test
+fn render_manifest_round_trips_every_artifact_kind() {
+    assert_manifest_round_trip("binary", Artifact::Binary)
+    assert_manifest_round_trip("static", Artifact::Static)
+    assert_manifest_round_trip("shared", Artifact::Shared)
+    assert_manifest_round_trip("package", Artifact::Package)
+}
+
+/**
+ * render_manifest_omits_empty_description_but_keeps_a_real_one — an empty
+ * description writes no `description` key at all; a non-empty one round-trips
+ * verbatim.
+ *
+ * @return void
+ */
+#test
+fn render_manifest_omits_empty_description_but_keeps_a_real_one() {
+    match parse_manifest(render_manifest("app", "binary", "src", "")) {
+        Manifest as m => teko::assert::is_true(m.description == "")
+        error => teko::assert::is_true(false)
+    }
+    match parse_manifest(render_manifest("app", "binary", "src", "a demo app")) {
+        Manifest as m => teko::assert::is_true(m.description == "a demo app")
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * lib_stub_source_names_the_stub_function — the library stub's generated source
+ * carries the project name in its greeting and declares a public `hello`.
+ *
+ * @return void
+ */
+#test
+fn lib_stub_source_names_the_stub_function() {
+    let src = lib_stub_source("mylib")
+    teko::assert::str_contains(src, "pub fn hello() -> str")
+    teko::assert::str_contains(src, "hello from mylib")
+}
+
+/**
+ * write_binary_stub_writes_once_then_leaves_an_existing_file_alone — a fresh
+ * `main.tks` carries the greeting; a SECOND call, after the file already exists
+ * (even with unrelated content), leaves it untouched (never overwrites). Runs
+ * against a scratch directory OUTSIDE `src/` (so the project's own source
+ * discovery never sees it), cleaned up via `teko::fs::remove_file` afterward.
+ *
+ * @return void
+ */
+#test
+fn write_binary_stub_writes_once_then_leaves_an_existing_file_alone() {
+    let dir = "init_test_scratch_bin"
+    match teko::fs::mkdir(dir) { error => teko::assert::is_true(false); null => { } }
+    let path = teko::str::concat(dir, "/main.tks")
+    match write_binary_stub(dir, "sampleapp") { error => teko::assert::is_true(false); null => { } }
+    match teko::io::read_file(path) {
+        str as s => teko::assert::str_contains(s, "hello from sampleapp")
+        error => teko::assert::is_true(false)
+    }
+    match teko::io::write_file(path, "sentinel") { error => teko::assert::is_true(false); null => { } }
+    match write_binary_stub(dir, "sampleapp") { error => teko::assert::is_true(false); null => { } }
+    match teko::io::read_file(path) {
+        str as s => teko::assert::is_true(s == "sentinel")
+        error => teko::assert::is_true(false)
+    }
+    match teko::fs::remove_file(path) { error => { }; null => { } }
+}
+
+/**
+ * write_stub_dispatches_on_artifact_kind — "binary" writes `main.tks`
+ * (`write_binary_stub`); every other kind writes `<name>.tks`
+ * (`write_lib_stub`). Same scratch-directory/cleanup discipline as the binary
+ * stub test.
+ *
+ * @return void
+ */
+#test
+fn write_stub_dispatches_on_artifact_kind() {
+    let dir = "init_test_scratch_lib"
+    match teko::fs::mkdir(dir) { error => teko::assert::is_true(false); null => { } }
+    match write_stub(dir, "toolbelt", "binary") { error => teko::assert::is_true(false); null => { } }
+    let main_path = teko::str::concat(dir, "/main.tks")
+    match teko::io::read_file(main_path) { str => { }; error => teko::assert::is_true(false) }
+    match teko::fs::remove_file(main_path) { error => { }; null => { } }
+    match write_stub(dir, "toolbelt", "package") { error => teko::assert::is_true(false); null => { } }
+    let lib_path = teko::str::concat(dir, "/toolbelt.tks")
+    match teko::io::read_file(lib_path) {
+        str as s => teko::assert::str_contains(s, "hello from toolbelt")
+        error => teko::assert::is_true(false)
+    }
+    match teko::io::write_file(lib_path, "sentinel") { error => teko::assert::is_true(false); null => { } }
+    match write_stub(dir, "toolbelt", "package") { error => teko::assert::is_true(false); null => { } }
+    match teko::io::read_file(lib_path) {
+        str as s => teko::assert::is_true(s == "sentinel")
+        error => teko::assert::is_true(false)
+    }
+    match teko::fs::remove_file(lib_path) { error => { }; null => { } }
+}
+
+/**
+ * report_success_runs_without_crashing — `report_success` is a straight-line
+ * printer (no branches); calling it once exercises its whole body.
+ *
+ * @return void
+ */
+#test
+fn report_success_runs_without_crashing() {
+    report_success("myproj", "myproj/teko.tkp", "myproj")
+}
+
+/**
+ * init_target_of_defaults_to_cwd — with no third token the target is "."; with
+ * one given, it is `args[2]` verbatim.
+ *
+ * @return void
+ */
+#test
+fn init_target_of_defaults_to_cwd() {
+    teko::assert::is_true(init_target_of(init_args_of("teko", "init", "")) == ".")
+    teko::assert::is_true(init_target_of(init_args_of("teko", "init", "myproj")) == "myproj")
+}

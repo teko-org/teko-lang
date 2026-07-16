@@ -1,0 +1,366 @@
+/**
+ * src/build/init.tks (namespace 'teko::build')
+ *
+ * The `teko init [dir]` CLI surface: an interactive scaffolder that asks a handful
+ * of questions (project name, artifact kind, source directory, description) and
+ * writes a fresh `teko.tkp` manifest + the source tree + a minimal stub, so a new
+ * project has something `teko build` can compile on its very first invocation. A
+ * SIBLING of `project.tks`'s manifest/build orchestration (same namespace, same
+ * file); it reuses `mkdir_p` and `fail` from `project.tks` rather than duplicating
+ * them. Every prompt honors an EMPTY answer (a bare Enter) OR a genuine EOF (no
+ * TTY / an exhausted pipe) as "use the default" — `teko::io::read_line()` already
+ * returns "" for both cases, so a single empty-string check covers the whole
+ * non-interactive fallback (issue owner: no separate `stdin_eof()` branch needed).
+ */
+
+/**
+ * is_ident_start_byte — is `c` a legal FIRST byte of a Teko identifier (an ASCII
+ * letter or `_`)? Mirrors the lexer's identifier-start class, restricted to the
+ * ASCII root-name alphabet `teko init` accepts.
+ *
+ * @param c  a single byte from a candidate identifier
+ * @return   true iff `c` may open an identifier
+ */
+fn is_ident_start_byte(c: byte) -> bool {
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_'
+}
+
+/**
+ * is_ident_byte — is `c` a legal CONTINUATION byte of a Teko identifier (an ASCII
+ * letter, digit, or `_`)? Mirrors the lexer's identifier-continue class.
+ *
+ * @param c  a single byte from a candidate identifier
+ * @return   true iff `c` may continue an identifier
+ */
+fn is_ident_byte(c: byte) -> bool {
+    is_ident_start_byte(c) || (c >= b'0' && c <= b'9')
+}
+
+/**
+ * is_valid_root_name — is `name` a legal Teko project ROOT name: non-empty, a
+ * legal identifier (no `::`, no spaces, no punctuation beyond `_`), and not the
+ * reserved `teko` root (manifest.tks: "no user project may claim it")?
+ *
+ * @param name  the candidate project root name
+ * @return      true iff `name` may be written as `name = "…"` in a fresh manifest
+ */
+fn is_valid_root_name(name: str) -> bool {
+    if name.len == 0 { return false }
+    if name == "teko" { return false }
+    if !is_ident_start_byte(name[0]) { return false }
+    mut i: u64 = 1
+    loop {
+        if i >= name.len { break }
+        if !is_ident_byte(name[i]) { return false }
+        i = i + 1
+    }
+    true
+}
+
+/**
+ * is_valid_artifact_kind — is `kind` one of the four `[artifact] kind` values
+ * `parse_manifest` recognizes (manifest.tks C7.1m)?
+ *
+ * @param kind  the candidate artifact-kind answer
+ * @return      true iff `kind` is "binary", "static", "shared", or "package"
+ */
+fn is_valid_artifact_kind(kind: str) -> bool {
+    kind == "binary" || kind == "static" || kind == "shared" || kind == "package"
+}
+
+/**
+ * strip_trailing_slashes — `path` with every trailing `/` removed (e.g. `"a/b//"`
+ * -> `"a/b"`), so `basename`/`join_path` never double a separator.
+ *
+ * @param path  the path to trim
+ * @return      `path` with no trailing `/`
+ */
+fn strip_trailing_slashes(path: str) -> str {
+    mut end = path.len
+    loop {
+        if end == 0 { break }
+        if path[end - 1] != b'/' { break }
+        end = end - 1
+    }
+    teko::str::slice_to(path, end)
+}
+
+/**
+ * basename — the last path segment of `path` (after trimming trailing `/`), or
+ * "app" for an empty/all-slash path. Used to derive the default project name from
+ * the `teko init` target directory.
+ *
+ * @param path  the path to take the last segment of
+ * @return      the segment after the rightmost `/`, or the whole trimmed path when
+ *              it carries no separator
+ */
+fn basename(path: str) -> str {
+    let trimmed = strip_trailing_slashes(path)
+    if trimmed.len == 0 { return "app" }
+    match teko::str::last_index_of(trimmed, "/") {
+        u64 as i => teko::str::slice_from(trimmed, i + 1)
+        error => trimmed
+    }
+}
+
+/**
+ * sanitize_ident_byte — `c` unchanged when it is a legal identifier-continuation
+ * byte, else `_`. The per-byte step of `sanitize_ident`.
+ *
+ * @param c  a single byte from a candidate default name
+ * @return   `c` itself or the `_` replacement
+ */
+fn sanitize_ident_byte(c: byte) -> byte {
+    if is_ident_byte(c) { return c }
+    b'_'
+}
+
+/**
+ * sanitize_ident — coerce `name` into a legal Teko identifier: every byte that is
+ * not a legal continuation becomes `_`, and a leading digit gets a `_` prefix (a
+ * leading non-identifier byte already became `_` by the same rule, so only the
+ * digit case needs a second pass). Used ONLY to make a derived DEFAULT (a
+ * directory basename, which may contain `-`/`.`/spaces) presentable as a project
+ * name; an explicit user answer is validated as-is by `is_valid_root_name`; never
+ * silently sanitized.
+ *
+ * @param name  the raw basename to coerce
+ * @return      a legal identifier derived from `name`, or "app" when `name` is empty
+ */
+fn sanitize_ident(name: str) -> str {
+    if name.len == 0 { return "app" }
+    mut bytes: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= name.len { break }
+        bytes = teko::list::push(bytes, sanitize_ident_byte(name[i]))
+        i = i + 1
+    }
+    let cleaned = str_of_bytes(bytes)
+    if is_ident_start_byte(cleaned[0]) { return cleaned }
+    teko::str::concat("_", cleaned)
+}
+
+/**
+ * default_project_name — the DEFAULT project name offered for the "Project name"
+ * prompt: `sanitize_ident(basename(target))` for an explicit `target`, else
+ * `sanitize_ident(basename(cwd))` for the current directory when `target` is "."
+ * or "" (the bare `teko init` / `teko init .` forms) — falling back to the
+ * generic "app" for the (host-edge, practically unreachable in a live process)
+ * case where `teko::env::cwd()` itself fails to read the current directory.
+ *
+ * @param target  the resolved `teko init` target directory
+ * @return        a legal identifier default name
+ */
+fn default_project_name(target: str) -> str {
+    if target != "." && target != "" { return sanitize_ident(basename(target)) }
+    match teko::env::cwd() {
+        str as c => sanitize_ident(basename(c))
+        error => "app"
+    }
+}
+
+/**
+ * join_path — `dir/name`, or plain `name` when `dir` is "." or "" (the CURRENT
+ * directory — no point prefixing a self-referential segment). Trims `dir`'s
+ * trailing `/` first so the join never doubles the separator.
+ *
+ * @param dir   the directory to join onto (a `teko init` target, possibly "."/"")
+ * @param name  the file/subdirectory name to append
+ * @return      the joined path
+ */
+fn join_path(dir: str, name: str) -> str {
+    if dir == "." || dir == "" { return name }
+    teko::str::concat(strip_trailing_slashes(dir), "/", name)
+}
+
+/**
+ * prompt_line — print `"<label> [<default_value>]:"` to stdout and read one answer
+ * line from stdin. An empty answer — whether a bare Enter or stdin hitting real
+ * EOF (`teko::io::read_line()` returns "" for both) — resolves to `default_value`,
+ * so a non-interactive/piped invocation with too few answer lines silently falls
+ * back to the defaults for every remaining question instead of hanging.
+ *
+ * @param label          the question text (WITHOUT the trailing `[default]:`)
+ * @param default_value  the value used for an empty/EOF answer
+ * @return               the user's answer, or `default_value`
+ */
+fn prompt_line(label: str, default_value: str) -> str {
+    teko::io::println(teko::str::concat(label, " [", default_value, "]:"))
+    let answer = teko::io::read_line()
+    if answer == "" { return default_value }
+    answer
+}
+
+/**
+ * ask_name — prompt for the project root name (default: `default_project_name`
+ * of `target`), validated by `is_valid_root_name`.
+ *
+ * @param target  the resolved `teko init` target directory (for the default)
+ * @return        the validated project name, or an error describing why the
+ *                answer is not a legal root name
+ */
+fn ask_name(target: str) -> str | error {
+    let answer = prompt_line("Project name", default_project_name(target))
+    if is_valid_root_name(answer) { return answer }
+    error { message = teko::str::concat("invalid project name '", answer, "': must start with a letter or '_', contain only letters/digits/'_', and not be the reserved 'teko'") }
+}
+
+/**
+ * ask_kind — prompt for the artifact kind (default "binary"), validated by
+ * `is_valid_artifact_kind`.
+ *
+ * @return  the validated artifact kind, or an error describing the accepted set
+ */
+fn ask_kind() -> str | error {
+    let answer = prompt_line("Artifact kind (binary/static/shared/package)", "binary")
+    if is_valid_artifact_kind(answer) { return answer }
+    error { message = teko::str::concat("invalid artifact kind '", answer, "': expected one of binary/static/shared/package") }
+}
+
+/**
+ * render_manifest — the `.tkp` TOML text for a freshly scaffolded project: the
+ * required `name`/`source` root keys (parse_manifest's two mandatory fields), the
+ * optional `description`, an explicit `[artifact] kind` (spelled out even for the
+ * "binary" default, matching this repo's own `teko.tkp` style), and a permissive
+ * `[coverage]` floor of 0/0/0 — a brand-new scaffold has no `.tkt` tests yet, so
+ * the D4 80%-default floors would fail its very first `teko build`; the floors are
+ * meant to be raised as the project grows real tests.
+ *
+ * @param name         the validated project root name
+ * @param kind         the validated artifact kind
+ * @param source       the source-root directory name (e.g. "src")
+ * @param description  the optional one-line description ("" to omit the key)
+ * @return             the `.tkp` manifest text, ready to write verbatim
+ */
+fn render_manifest(name: str, kind: str, source: str, description: str) -> str {
+    let header = teko::str::concat("name = \"", name, "\"\nsource = \"", source, "\"\n")
+    let with_description = if description == "" { header } else { teko::str::concat(header, "description = \"", description, "\"\n") }
+    teko::str::concat(with_description, "\n[artifact]\nkind = \"", kind, "\"\n\n[coverage]\nfunctions = 0\nlines = 0\nbranches = 0\n")
+}
+
+/**
+ * lib_stub_source — the starter `.tks` content for a library-kind scaffold
+ * (`static`/`shared`/`package`): one documented `pub fn hello() -> str` the new
+ * project can replace with its own API.
+ *
+ * @param name  the project root name (echoed in the doc comment and greeting)
+ * @return      the stub `.tks` source text
+ */
+fn lib_stub_source(name: str) -> str {
+    teko::str::concat(
+        "/**\n",
+        " * hello — a starter exported function for the \"", name, "\" library. Replace\n",
+        " * with your own API.\n",
+        " *\n",
+        " * @return a friendly greeting\n",
+        " */\n",
+        "pub fn hello() -> str {\n",
+        "    \"hello from ", name, "\"\n",
+        "}\n")
+}
+
+/**
+ * write_binary_stub — write `<source_dir>/main.tks` with a minimal, valid
+ * virtual-main body (a single `teko::io::println` call), UNLESS a `main.tks`
+ * already exists there — an existing source file is never overwritten.
+ *
+ * @param source_dir  the project's source-root directory (already created)
+ * @param name        the project root name (echoed in the greeting)
+ * @return            an `error` on a write failure, else `null`
+ */
+fn write_binary_stub(source_dir: str, name: str) -> error? {
+    let path = join_path(source_dir, "main.tks")
+    match teko::io::read_file(path) { str => return null; error => { } }
+    teko::io::write_file(path, teko::str::concat("teko::io::println(\"hello from ", name, "\")\n"))
+}
+
+/**
+ * write_lib_stub — write `<source_dir>/<name>.tks` with `lib_stub_source`'s
+ * starter content, UNLESS that file already exists there — an existing source
+ * file is never overwritten.
+ *
+ * @param source_dir  the project's source-root directory (already created)
+ * @param name        the project root name (also the stub file's stem)
+ * @return            an `error` on a write failure, else `null`
+ */
+fn write_lib_stub(source_dir: str, name: str) -> error? {
+    let path = join_path(source_dir, teko::str::concat(name, ".tks"))
+    match teko::io::read_file(path) { str => return null; error => { } }
+    teko::io::write_file(path, lib_stub_source(name))
+}
+
+/**
+ * write_stub — write the artifact-appropriate starter source file: `main.tks` for
+ * a `binary` scaffold (`write_binary_stub`), else a `<name>.tks` library stub
+ * (`write_lib_stub`) for `static`/`shared`/`package`.
+ *
+ * @param source_dir  the project's source-root directory (already created)
+ * @param name        the project root name
+ * @param kind        the validated artifact kind
+ * @return            an `error` on a write failure, else `null`
+ */
+fn write_stub(source_dir: str, name: str, kind: str) -> error? {
+    if kind == "binary" { return write_binary_stub(source_dir, name) }
+    write_lib_stub(source_dir, name)
+}
+
+/**
+ * init_target_of — the `teko init [dir]` target directory: `args[2]` when given
+ * (`args[0]` the program, `args[1]` "init"), else "." (the current directory).
+ *
+ * @param args  the full CLI argument vector
+ * @return      the resolved target directory
+ */
+fn init_target_of(args: []str) -> str {
+    if args.len >= 3 { return args[2] }
+    "."
+}
+
+/**
+ * report_success — print what `init_run` created and the suggested next command,
+ * to stdout (a normal, successful CLI result — unlike `fail`'s stderr diagnostics).
+ *
+ * @param target         the initialized project directory
+ * @param manifest_path  the written `teko.tkp` path
+ * @param name           the project root name
+ */
+fn report_success(target: str, manifest_path: str, name: str) {
+    teko::io::println(teko::str::concat("created ", manifest_path))
+    teko::io::println(teko::str::concat("project '", name, "' initialized at ", target))
+    teko::io::println(teko::str::concat("next: teko build ", target))
+}
+
+/**
+ * init_run — the `teko init [dir]` entry point (dispatched from `main.tks`):
+ * resolve the target directory (creating it if missing, `mkdir_p`), refuse to
+ * overwrite an existing `teko.tkp` (an honest, localized error — M.3), ask the
+ * four scaffold questions (name/kind/source/description, each defaulting on an
+ * empty/EOF answer), write the manifest, create the source directory, and write
+ * the artifact-appropriate stub (never overwriting an existing source file).
+ *
+ * @param args  the full CLI argument vector (`args[2]`, if present, is the target)
+ * @return      0 on a successful scaffold, else the failing status (`fail`'s 1)
+ */
+fn init_run(args: []str) -> i32 {
+    let target = init_target_of(args)
+    match mkdir_p(target) { error as e => return fail(target, e.message); null => { } }
+    let manifest_path = join_path(target, "teko.tkp")
+    match teko::io::read_file(manifest_path) {
+        str => return fail(target, teko::str::concat("project already initialized at ", target, "; edit teko.tkp or remove it"))
+        error => { }
+    }
+    let name = match ask_name(target) { str as n => n; error as e => return fail(target, e.message) }
+    let kind = match ask_kind() { str as k => k; error as e => return fail(target, e.message) }
+    let source = prompt_line("Source directory", "src")
+    let description = prompt_line("Description", "")
+    match teko::io::write_file(manifest_path, render_manifest(name, kind, source, description)) {
+        error as e => return fail(target, e.message)
+        null => { }
+    }
+    let source_dir = join_path(target, source)
+    match mkdir_p(source_dir) { error as e => return fail(target, e.message); null => { } }
+    match write_stub(source_dir, name, kind) { error as e => return fail(target, e.message); null => { } }
+    report_success(target, manifest_path, name)
+    0
+}
