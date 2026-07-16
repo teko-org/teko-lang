@@ -1192,7 +1192,7 @@ fn encode_divseq_x86(i: MDivSeqX86) -> EncInstX86 {
  * @return EncInstX86  the encoded instruction
  */
 fn encode_shift_x86(i: MShiftX86) -> EncInstX86 {
-    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, 0xD3 to u32, shift_ext_x86(i.op), i.dst))
+    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, X86_OP_SHIFT_CL, shift_ext_x86(i.op), i.dst))
 }
 
 /**
@@ -1203,7 +1203,7 @@ fn encode_shift_x86(i: MShiftX86) -> EncInstX86 {
  * @return EncInstX86  the encoded instruction
  */
 fn encode_cmp_x86(i: MCmpX86) -> EncInstX86 {
-    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, false, 0x39 to u32, i.b, i.a))
+    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, false, X86_OP_CMP_RM_R, i.b, i.a))
 }
 
 /**
@@ -1217,17 +1217,17 @@ fn encode_cmp_x86(i: MCmpX86) -> EncInstX86 {
  */
 fn encode_setcc_x86(i: MSetccX86) -> EncInstX86 {
     let cc = cond_cc_x86(i.cond)
-    let force = i.dst.id >= (0x4 to u32)
+    let force = i.dst.id >= X86_BYTE_REG_MIN_ID
     let dst_ext = reg_ext_x86(i.dst)
     let dst_low3 = reg_low3_x86(i.dst)
     mut b = if force { push_rex_forced_x86(teko::list::empty(), false, false, false, dst_ext) } else { teko::list::empty() }
-    b = push_byte_x86(b, 0x0F to u32)
-    b = push_byte_x86(b, (0x90 to u32) + cc)
-    b = push_byte_x86(b, modrm_x86(3 to u32, 0 to u32, dst_low3))
+    b = push_byte_x86(b, X86_OP_TWO_BYTE_ESCAPE)
+    b = push_byte_x86(b, X86_OP_SETCC_BASE + cc)
+    b = push_byte_x86(b, modrm_x86(MODRM_MOD_REGISTER, 0 to u32, dst_low3))
     if force { b = push_rex_forced_x86(b, false, dst_ext, false, dst_ext) }
-    b = push_byte_x86(b, 0x0F to u32)
-    b = push_byte_x86(b, 0xB6 to u32)
-    plain_inst_x86(push_byte_x86(b, modrm_x86(3 to u32, dst_low3, dst_low3)))
+    b = push_byte_x86(b, X86_OP_TWO_BYTE_ESCAPE)
+    b = push_byte_x86(b, X86_OP_MOVZX_R32_RM8)
+    plain_inst_x86(push_byte_x86(b, modrm_x86(MODRM_MOD_REGISTER, dst_low3, dst_low3)))
 }
 
 /**
@@ -1237,7 +1237,7 @@ fn encode_setcc_x86(i: MSetccX86) -> EncInstX86 {
  * @return EncInstX86  the encoded instruction
  */
 fn encode_neg_x86(i: MNegX86) -> EncInstX86 {
-    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, 0xF7 to u32, 0x3 to u32, i.dst))
+    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, X86_OP_GRP3_F7, X86_EXT_NEG, i.dst))
 }
 
 /**
@@ -1247,7 +1247,7 @@ fn encode_neg_x86(i: MNegX86) -> EncInstX86 {
  * @return EncInstX86  the encoded instruction
  */
 fn encode_not_x86(i: MNotX86) -> EncInstX86 {
-    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, 0xF7 to u32, 0x2 to u32, i.dst))
+    plain_inst_x86(emit_rm_ext_x86(teko::list::empty(), i.wide, X86_OP_GRP3_F7, X86_EXT_NOT, i.dst))
 }
 
 /**
@@ -1289,9 +1289,9 @@ fn encode_store_x86(i: MStoreX86) -> EncInstX86 | error {
  */
 fn encode_frame_addr_x86(layout: FrameLayoutX86, i: MFrameAddrX86) -> EncInstX86 {
     let off = layout.slot_offsets[i.slot to u64]
-    let mem = MMem { base = preg(4 to u32, MRegClass::GPR); offset = off to i32 }
+    let mem = MMem { base = preg(X86_REG_RSP_ID, MRegClass::GPR); offset = off to i32 }
     mut b = push_rex_x86(teko::list::empty(), true, reg_ext_x86(i.dst), false, reg_ext_x86(mem.base))
-    b = push_byte_x86(b, 0x8D to u32)
+    b = push_byte_x86(b, X86_OP_LEA)
     plain_inst_x86(push_mem_operand_x86(b, reg_low3_x86(i.dst), mem))
 }
 
@@ -1306,8 +1306,8 @@ fn encode_frame_addr_x86(layout: FrameLayoutX86, i: MFrameAddrX86) -> EncInstX86
  */
 fn encode_lea_rip_x86(i: MLeaRipX86) -> EncInstX86 {
     mut b = push_rex_forced_x86(teko::list::empty(), true, reg_ext_x86(i.dst), false, false)
-    b = push_byte_x86(b, 0x8D to u32)
-    b = push_byte_x86(b, modrm_x86(0 to u32, reg_low3_x86(i.dst), 0x5 to u32))
+    b = push_byte_x86(b, X86_OP_LEA)
+    b = push_byte_x86(b, modrm_x86(MODRM_MOD_INDIRECT, reg_low3_x86(i.dst), MODRM_RM_RIP_RELATIVE))
     let field_off = b.len to u32
     reloc_inst_x86(emit_u32_le(b, 0 to u32), field_off, i.sym, i.kind)
 }
@@ -1320,7 +1320,7 @@ fn encode_lea_rip_x86(i: MLeaRipX86) -> EncInstX86 {
  * @return EncInstX86  the branch-flagged placeholder instruction
  */
 fn encode_jmp_x86(i: MJmpX86) -> EncInstX86 {
-    mut b = push_byte_x86(teko::list::empty(), 0xE9 to u32)
+    mut b = push_byte_x86(teko::list::empty(), X86_OP_JMP_REL32)
     let field_off = b.len to u32
     branch_inst_x86(emit_u32_le(b, 0 to u32), field_off, i.target)
 }
@@ -1334,8 +1334,8 @@ fn encode_jmp_x86(i: MJmpX86) -> EncInstX86 {
  * @return EncInstX86  the branch-flagged placeholder instruction
  */
 fn encode_jcc_x86(i: MJccX86) -> EncInstX86 {
-    mut b = push_byte_x86(teko::list::empty(), 0x0F to u32)
-    b = push_byte_x86(b, (0x80 to u32) + cond_cc_x86(i.cond))
+    mut b = push_byte_x86(teko::list::empty(), X86_OP_TWO_BYTE_ESCAPE)
+    b = push_byte_x86(b, X86_OP_JCC_BASE + cond_cc_x86(i.cond))
     let field_off = b.len to u32
     branch_inst_x86(emit_u32_le(b, 0 to u32), field_off, i.target)
 }
@@ -1349,7 +1349,7 @@ fn encode_jcc_x86(i: MJccX86) -> EncInstX86 {
  * @return EncInstX86  the reloc-flagged placeholder instruction
  */
 fn encode_call_x86(i: MCallX86) -> EncInstX86 {
-    mut b = push_byte_x86(teko::list::empty(), 0xE8 to u32)
+    mut b = push_byte_x86(teko::list::empty(), X86_OP_CALL_REL32)
     let field_off = b.len to u32
     reloc_inst_x86(emit_u32_le(b, 0 to u32), field_off, i.sym, RelocKindX86::Plt32)
 }
@@ -1363,8 +1363,8 @@ fn encode_call_x86(i: MCallX86) -> EncInstX86 {
  */
 fn encode_call_ind_x86(i: MCallIndX86) -> EncInstX86 {
     mut b = push_rex_x86(teko::list::empty(), false, false, false, reg_ext_x86(i.target))
-    b = push_byte_x86(b, 0xFF to u32)
-    plain_inst_x86(push_byte_x86(b, modrm_x86(3 to u32, 0x2 to u32, reg_low3_x86(i.target))))
+    b = push_byte_x86(b, X86_OP_GRP5_FF)
+    plain_inst_x86(push_byte_x86(b, modrm_x86(MODRM_MOD_REGISTER, X86_EXT_CALL_IND, reg_low3_x86(i.target))))
 }
 
 /**
@@ -1375,7 +1375,7 @@ fn encode_call_ind_x86(i: MCallIndX86) -> EncInstX86 {
  * @return EncInstX86  the `ret` instruction
  */
 fn encode_ret_x86() -> EncInstX86 {
-    plain_inst_x86(push_byte_x86(teko::list::empty(), 0xC3 to u32))
+    plain_inst_x86(push_byte_x86(teko::list::empty(), X86_OP_RET))
 }
 
 /**
