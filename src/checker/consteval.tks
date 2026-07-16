@@ -922,10 +922,28 @@ fn rewrite_function(f: TFunction, names: []str, inits: []TExpr) -> TFunction {
 }
 
 /**
+ * rewrite_const_init — a copy of the aggregate const declaration `cd` with every scalar-const
+ * reference INSIDE its initializer substituted by that scalar's collapsed value (#594). A surviving
+ * aggregate const (crumb 6 materializes it in rodata, or the C backend inlines it) can reference a
+ * scalar const in a field/element (`const M: Point = Point { x = ORIGIN_X }`); inlining the scalar
+ * here means the aggregate's initializer is a pure aggregate-of-literals both backends can serialize.
+ *
+ * @param cd     the aggregate const declaration
+ * @param names  the scalar-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       `cd` with scalar-const references substituted in its initializer
+ * @since #594
+ */
+fn rewrite_const_init(cd: TConstDecl, names: []str, inits: []TExpr) -> TConstDecl {
+    TConstDecl { name = cd.name; namespace = cd.namespace; ty = cd.ty; init = inline_rw_expr(cd.init, names, inits); vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col }
+}
+
+/**
  * inline_place_item — fold one program item into the rewritten item list: a function's body is walked
- * for const references; a loose statement is walked; a SCALAR const declaration is DROPPED (it emits
- * no code — no fn body, no arena); an aggregate const declaration and every type/use declaration pass
- * through unchanged (#594 crumb 5). An aggregate const is left for lowering (crumb 6).
+ * for scalar-const references; a loose statement is walked; a SCALAR const declaration is DROPPED (it
+ * emits no code — no fn body, no arena); an aggregate const declaration survives (its initializer's
+ * scalar references substituted, `rewrite_const_init`) for crumb-6 rodata materialization; every
+ * type/use declaration passes through unchanged (#594 crumb 5).
  *
  * @param out    the rewritten items accumulated so far
  * @param it     the program item to fold
@@ -937,7 +955,7 @@ fn rewrite_function(f: TFunction, names: []str, inits: []TExpr) -> TFunction {
 fn inline_place_item(out: []TItem, it: TItem, names: []str, inits: []TExpr) -> []TItem {
     match it {
         TFunction as f => teko::list::push(out, rewrite_function(f, names, inits))
-        TConstDecl as cd => if is_scalar_const_type(cd.ty) { out } else { teko::list::push(out, it) }
+        TConstDecl as cd => if is_scalar_const_type(cd.ty) { out } else { teko::list::push(out, rewrite_const_init(cd, names, inits)) }
         TStatement as s => teko::list::push(out, inline_rw_stmt(s, names, inits))
         _ => teko::list::push(out, it)
     }
@@ -967,6 +985,93 @@ pub fn inline_consts(prog: TProgram) -> TProgram | error {
     loop {
         if i >= prog.items.len { break }
         out = inline_place_item(out, prog.items[i], smap.names, smap.inits)
+        i++
+    }
+    TProgram { items = out }
+}
+
+/**
+ * build_aggregate_map — the AGGREGATE substitution table from the dependency-ordered consts (#594
+ * crumb 6, C-backend leg): the mirror of `build_scalar_map` for the NON-scalar family. Each aggregate
+ * const's initializer is collapsed against the already-collapsed initializers of the aggregate consts
+ * it references before it is itself added, so a nested aggregate reference (`const B = [..A..]; const
+ * A = [..]`) fully collapses in dependency order. A scalar const contributes no entry (scalars were
+ * already inlined + dropped by `inline_consts`).
+ *
+ * @param ordered  the module-level consts in dependency order (from `const_dep_order`)
+ * @return         the aggregate consts' names + collapsed initializers
+ * @since #594
+ */
+fn build_aggregate_map(ordered: []TConstDecl) -> ScalarConstMap {
+    mut names: []str = teko::list::empty()
+    mut inits: []TExpr = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= ordered.len { break }
+        let cd = ordered[i]
+        if !is_scalar_const_type(cd.ty) {
+            let collapsed = inline_rw_expr(cd.init, names, inits)
+            names = teko::list::push(names, cd.name)
+            inits = teko::list::push(inits, collapsed)
+        }
+        i++
+    }
+    ScalarConstMap { names = names; inits = inits }
+}
+
+/**
+ * inline_place_item_agg — fold one program item into the rewritten list, INLINING aggregate consts
+ * (the C-backend leg of #594 crumb 6): a function body / loose statement has every aggregate-const
+ * reference substituted by a clone of that const's collapsed initializer, and the aggregate const
+ * DECLARATION is dropped. Unlike the LIR path (which materializes ONE shared rodata entry), the C
+ * backend emits an aggregate value as a self-contained statement-expression, so a per-use clone is
+ * both correct (the value is read-only) and the only form a C `static const` initializer cannot take
+ * for a runtime-allocated slice. A residual scalar const (there should be none post-`inline_consts`)
+ * passes through unchanged.
+ *
+ * @param out    the rewritten items accumulated so far
+ * @param it     the program item to fold
+ * @param names  the aggregate-const names (PARALLEL to `inits`)
+ * @param inits  the collapsed checked initializers
+ * @return       `out` grown with `it`'s rewritten form (or unchanged when `it` is a dropped aggregate const)
+ * @since #594
+ */
+fn inline_place_item_agg(out: []TItem, it: TItem, names: []str, inits: []TExpr) -> []TItem {
+    match it {
+        TFunction as f => teko::list::push(out, rewrite_function(f, names, inits))
+        TConstDecl as cd => if is_scalar_const_type(cd.ty) { teko::list::push(out, it) } else { out }
+        TStatement as s => teko::list::push(out, inline_rw_stmt(s, names, inits))
+        _ => teko::list::push(out, it)
+    }
+}
+
+/**
+ * inline_aggregate_consts — the C-BACKEND-ONLY companion to `inline_consts` (#594 crumb 6): substitute
+ * every reference to a module-level AGGREGATE const with a clone of its checked initializer (in
+ * dependency order) and drop the aggregate const declarations. The C backend emits an aggregate value
+ * as a self-contained expression, so inlining each use is correct and side-steps needing a C
+ * static-initializer for a runtime-allocated `[]T`. The LIR/native + VM path does NOT run this pass —
+ * it materializes ONE shared rodata entry per aggregate const instead (`lower_program`'s
+ * `intern_aggregate_consts`), so the two backends diverge in mechanism but agree in value. A
+ * const-free program (the self-host itself) is returned unchanged, so the C-emission fixpoint is
+ * byte-identical.
+ *
+ * @param prog  the fully typed, monomorphized, scalar-inlined program (what the C backend emits)
+ * @return      the program with aggregate const references substituted and aggregate const decls removed
+ * @throws      a located error when the module-level consts form a reference cycle (`const_dep_order`)
+ * @since #594
+ */
+pub fn inline_aggregate_consts(prog: TProgram) -> TProgram | error {
+    let consts = collect_module_consts(prog.items)
+    if consts.len == 0 { return prog }
+    let ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
+    let amap = build_aggregate_map(ordered)
+    if amap.names.len == 0 { return prog }
+    mut out: []TItem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        out = inline_place_item_agg(out, prog.items[i], amap.names, amap.inits)
         i++
     }
     TProgram { items = out }

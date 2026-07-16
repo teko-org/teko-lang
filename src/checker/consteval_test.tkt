@@ -435,3 +435,43 @@ fn inline_consts_keeps_aggregate_const() {
         error => teko::assert::is_true(false)
     }
 }
+
+/**
+ * return_is_array_lit — assert the first function's returned expression is an array literal (proving
+ * an aggregate-const reference was substituted by its `[]T` initializer, #594 crumb 6, C-backend leg).
+ *
+ * @param prog  the inlined program
+ */
+fn return_is_array_lit(prog: TProgram) {
+    match first_fn_return(prog) {
+        TExpr as rv => match rv.kind { TArrayLit => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+        null => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * inline_aggregate_consts_substitutes_and_drops_decl — the C-backend leg of crumb 6 (#594): a
+ * `[]byte` const used as a bare reference is SUBSTITUTED by a clone of its array-literal initializer
+ * and its TConstDecl is DROPPED (no residual const item), so the C backend materializes the value at
+ * the use site rather than needing a static initializer for a runtime-allocated slice.
+ */
+#test
+fn inline_aggregate_consts_substitutes_and_drops_decl() {
+    let byteslice = Slice { element = Byte { } }
+    mut elems: []TArrayElem = teko::list::empty()
+    elems = teko::list::push(elems, TArrayElem { is_spread = false; expr = te(TByteLit { value = 31 to byte }, Byte { }) })
+    let arr = te(TArrayLit { elements = elems }, byteslice)
+    let agg = TConstDecl { name = "MAGIC"; namespace = "teko::checker"; ty = byteslice; init = arr; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    mut body: []TStatement = teko::list::empty()
+    body = teko::list::push(body, c_ret(te(TVar { name = "MAGIC"; is_func = false; func_ns = "" }, byteslice)))
+    mut items: []TItem = teko::list::empty()
+    items = teko::list::push(items, agg)
+    items = teko::list::push(items, c_fn("f", body))
+    match inline_aggregate_consts(TProgram { items = items }) {
+        TProgram as out => {
+            teko::assert::is_true(count_const_items(out) == 0)
+            return_is_array_lit(out)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
