@@ -99,6 +99,625 @@ type MemForm = struct {
 }
 
 /**
+ * ARM64_BYTE_MASK — the low-8-bits mask `emit_u32_le` runs each of a word's four
+ * bytes through before narrowing to `byte`. The first of this file's whole W15
+ * sweep (crumb S3) of named AArch64 instruction-field masks/shifts and
+ * opcode-word constants below: each is named `ARM64_<ROLE>` (a bit mask/shift)
+ * or `ARM64_<MNEMONIC>[_<FORM>]` (a fixed-width 32-bit instruction template),
+ * and its value is EXACTLY the encoding bit pattern the corpus's golden hex
+ * vectors (`encode_arm64_test.tkt`) already pin — only the SOURCE SPELLING
+ * changes; every emitted word stays identical (those goldens prove it).
+ */
+const ARM64_BYTE_MASK: u32 = 0xFF to u32
+
+/**
+ * ARM64_RN_SHIFT — the bit position of the `Rn` first-source/base register
+ * field (bits 5-9), shared by every register-field template (`enc_rn`) and by
+ * every SP-relative memory/frame instruction below, which places the fixed
+ * register id `ARM64_SP_ID` at this same field.
+ */
+const ARM64_RN_SHIFT: u32 = 5 to u32
+
+/**
+ * ARM64_RM_SHIFT — the bit position of the `Rm` second-source register field
+ * (bits 16-20), `enc_rm`'s field placement.
+ */
+const ARM64_RM_SHIFT: u32 = 16 to u32
+
+/**
+ * ARM64_REG2_SHIFT — the bit position of a template's second/accumulator
+ * register field (bits 10-14): `Ra` in the MADD/MSUB 3-register-plus-
+ * accumulator form (`enc_ra`), and `Rt2` in the STP/LDP register-pair form
+ * (`stp_gpr`/`ldp_gpr`/`stp_fpr`/`ldp_fpr`) — the same bit slot, two families.
+ */
+const ARM64_REG2_SHIFT: u32 = 10 to u32
+
+/**
+ * ARM64_IMM12_SHIFT — the bit position of a 12-bit scaled/unscaled immediate
+ * field (bits 10-21): the ADD/SUB/CMP immediate form and every LDR/STR/STP/LDP
+ * unsigned-offset form below place their immediate here.
+ */
+const ARM64_IMM12_SHIFT: u32 = 10 to u32
+
+/**
+ * ARM64_IMM7_SHIFT — the bit position of the STP/LDP signed 7-bit scaled
+ * immediate field (bits 15-21).
+ */
+const ARM64_IMM7_SHIFT: u32 = 15 to u32
+
+/**
+ * ARM64_COND_SHIFT — the bit position of CSET's inverted-condition field
+ * (bits 12-15), the CSINC encoding `encode_cset` builds.
+ */
+const ARM64_COND_SHIFT: u32 = 12 to u32
+
+/**
+ * ARM64_MOVI_LANE_BITS — the width in bits of one MOVZ/MOVK/MOVN 16-bit
+ * immediate lane, the divisor `encode_movi` uses to turn a bit `shift`
+ * (0/16/32/48) into the `hw` lane-selector field.
+ */
+const ARM64_MOVI_LANE_BITS: u32 = 16 to u32
+
+/**
+ * ARM64_MOVI_HW_SHIFT — the bit position of the MOVZ/MOVK/MOVN 16-bit-lane
+ * selector field `hw` (bits 21-22), `encode_movi`'s `shift/16` placement.
+ */
+const ARM64_MOVI_HW_SHIFT: u32 = 21 to u32
+
+/**
+ * ARM64_MOVI_IMM16_SHIFT — the bit position of the MOVZ/MOVK/MOVN 16-bit
+ * immediate lane (bits 5-20), `encode_movi`'s `imm16` placement.
+ */
+const ARM64_MOVI_IMM16_SHIFT: u32 = 5 to u32
+
+/**
+ * ARM64_BCOND_IMM19_SHIFT — the bit position of the B.cond/CBZ/CBNZ signed
+ * 19-bit displacement field (bits 5-23), `branch_disp_field`'s form-1
+ * placement.
+ */
+const ARM64_BCOND_IMM19_SHIFT: u32 = 5 to u32
+
+/**
+ * ARM64_SF_SHIFT — the bit position of the `sf` (64-bit operand size) flag
+ * (bit 31), `sf_bit`'s field placement.
+ */
+const ARM64_SF_SHIFT: u32 = 31 to u32
+
+/**
+ * ARM64_IMM16_MASK — the 16-bit width mask of the MOVZ/MOVK/MOVN immediate
+ * lane, `encode_movi`'s `imm16 & ARM64_IMM16_MASK`.
+ */
+const ARM64_IMM16_MASK: u32 = 0xFFFF to u32
+
+/**
+ * ARM64_IMM12_MASK — the 12-bit width mask of a scaled/unscaled immediate
+ * field, applied before every `ARM64_IMM12_SHIFT` placement below.
+ */
+const ARM64_IMM12_MASK: u32 = 0xFFF to u32
+
+/**
+ * ARM64_IMM7_MASK — the 7-bit width mask of the STP/LDP scaled immediate
+ * field, applied before every `ARM64_IMM7_SHIFT` placement.
+ */
+const ARM64_IMM7_MASK: u32 = 0x7F to u32
+
+/**
+ * ARM64_COND_MASK — the 4-bit width mask of an AArch64 condition field
+ * (`cond_code`'s range), applied in `encode_cset`/`encode_branch_cond`.
+ */
+const ARM64_COND_MASK: u32 = 0xF to u32
+
+/**
+ * ARM64_IMM12_MAX — the largest signed-immediate magnitude (`i64`) the inline
+ * 12-bit ADD/SUB/CMP field can hold before the sign/negative-swap decomposition
+ * (`encode_alu_imm`/`encode_cmp_imm`); a magnitude past this raises
+ * `A4-bigimm`.
+ */
+const ARM64_IMM12_MAX: i64 = 4095 to i64
+
+/**
+ * ARM64_IMM12_FIELD_MAX — the largest already-scaled/unsigned 12-bit field
+ * value (`u32`) the inline immediate can hold (`scaled_offset`'s load/store
+ * offset, `encode_frame_addr`'s slot offset); past this the caller raises its
+ * named honest-stop (`A4-ldur`/`A4-bigframe`).
+ */
+const ARM64_IMM12_FIELD_MAX: u32 = 4095 to u32
+
+/**
+ * ARM64_IMM7_MAX_POS — the largest non-negative STP/LDP scaled pair offset
+ * (`frame_fits`'s bound): the frame layout never produces a negative pair
+ * offset, so this alone guards the signed 7-bit field's positive half.
+ */
+const ARM64_IMM7_MAX_POS: u32 = 63 to u32
+
+/**
+ * ARM64_IMM26_BITS — the field width of the unconditional-branch (B)
+ * displacement, `twos_field`'s form-0 width (`branch_disp_field`).
+ */
+const ARM64_IMM26_BITS: u32 = 26 to u32
+
+/**
+ * ARM64_IMM19_BITS — the field width of the B.cond/CBZ/CBNZ displacement,
+ * `twos_field`'s form-1 width (`branch_disp_field`).
+ */
+const ARM64_IMM19_BITS: u32 = 19 to u32
+
+/**
+ * ARM64_IMM26_MAX — the largest positive word-displacement the signed 26-bit
+ * B field holds (`imm26_fits`'s upper bound, `2^25 - 1`).
+ */
+const ARM64_IMM26_MAX: i64 = 33554431 to i64
+
+/**
+ * ARM64_IMM26_MIN_MAGNITUDE — the magnitude of the smallest (most negative)
+ * word-displacement the signed 26-bit B field holds (`imm26_fits`'s lower
+ * bound magnitude, `2^25`).
+ */
+const ARM64_IMM26_MIN_MAGNITUDE: i64 = 33554432 to i64
+
+/**
+ * ARM64_IMM19_MAX — the largest positive word-displacement the signed 19-bit
+ * B.cond/CBZ field holds (`imm19_fits`'s upper bound, `2^18 - 1`).
+ */
+const ARM64_IMM19_MAX: i64 = 262143 to i64
+
+/**
+ * ARM64_IMM19_MIN_MAGNITUDE — the magnitude of the smallest (most negative)
+ * word-displacement the signed 19-bit B.cond/CBZ field holds (`imm19_fits`'s
+ * lower bound magnitude, `2^18`).
+ */
+const ARM64_IMM19_MIN_MAGNITUDE: i64 = 262144 to i64
+
+/**
+ * ARM64_FP_ID — the frame-pointer register's 5-bit ISA id (x29), the fixed
+ * `Rt`/`Rd` the prologue/epilogue save/restore and FP-setup words carry.
+ */
+const ARM64_FP_ID: u32 = 29 to u32
+
+/**
+ * ARM64_LR_ID — the link-register's 5-bit ISA id (x30), the fixed `Rt2` the
+ * prologue/epilogue FP/LR pair save/restore carries.
+ */
+const ARM64_LR_ID: u32 = 30 to u32
+
+/**
+ * ARM64_SP_ID — the stack-pointer's 5-bit ISA id (31 in the SP-context
+ * instruction forms below), the fixed `Rn`/`Rd` every SP-relative frame
+ * instruction carries.
+ */
+const ARM64_SP_ID: u32 = 31 to u32
+
+/**
+ * ARM64_STACK_ALIGN — the AAPCS64 stack byte alignment (16), every
+ * `align_up`/frame-size rounding step's alignment argument.
+ */
+const ARM64_STACK_ALIGN: u32 = 16 to u32
+
+/**
+ * ARM64_FP_LR_BYTES — the byte size of the saved FP/LR pair (16), reserved at
+ * the top of every non-frameless function's frame.
+ */
+const ARM64_FP_LR_BYTES: u32 = 16 to u32
+
+/**
+ * ARM64_REG_BYTES — the byte width of one GPR/FPR slot (8), the STP/LDP/
+ * STR/LDR scaled-offset divisor and the callee-saved area's per-register
+ * stride.
+ */
+const ARM64_REG_BYTES: u32 = 8 to u32
+
+/**
+ * ARM64_WORD_BYTES — the byte size of one fixed-width AArch64 instruction
+ * word (4), the word-index-to-byte-offset multiplier (`finalize_func`'s reloc
+ * offset, `fold_func_into_text`'s base advance).
+ */
+const ARM64_WORD_BYTES: u32 = 4 to u32
+
+/**
+ * ARM64_SCALE_B — the byte-access scale of the `B` (byte) memory width (1),
+ * shared by `load_form`/`store_form`.
+ */
+const ARM64_SCALE_B: u32 = 1 to u32
+
+/**
+ * ARM64_SCALE_H — the byte-access scale of the `H` (halfword) memory width
+ * (2), shared by `load_form`/`store_form`.
+ */
+const ARM64_SCALE_H: u32 = 2 to u32
+
+/**
+ * ARM64_SCALE_W — the byte-access scale of the `W` (word) memory width (4),
+ * shared by `load_form`/`store_form`.
+ */
+const ARM64_SCALE_W: u32 = 4 to u32
+
+/**
+ * ARM64_SCALE_X — the byte-access scale of the `X` (doubleword) memory width
+ * (8), shared by `load_form`/`store_form`.
+ */
+const ARM64_SCALE_X: u32 = 8 to u32
+
+/**
+ * ARM64_COND_EQ — the AArch64 4-bit condition field for `MCond::EQ`.
+ */
+const ARM64_COND_EQ: u32 = 0 to u32
+
+/**
+ * ARM64_COND_NE — the AArch64 4-bit condition field for `MCond::NE`.
+ */
+const ARM64_COND_NE: u32 = 1 to u32
+
+/**
+ * ARM64_COND_HS — the AArch64 4-bit condition field for `MCond::HS`.
+ */
+const ARM64_COND_HS: u32 = 2 to u32
+
+/**
+ * ARM64_COND_LO — the AArch64 4-bit condition field for `MCond::LO`.
+ */
+const ARM64_COND_LO: u32 = 3 to u32
+
+/**
+ * ARM64_COND_HI — the AArch64 4-bit condition field for `MCond::HI`.
+ */
+const ARM64_COND_HI: u32 = 8 to u32
+
+/**
+ * ARM64_COND_LS — the AArch64 4-bit condition field for `MCond::LS`.
+ */
+const ARM64_COND_LS: u32 = 9 to u32
+
+/**
+ * ARM64_COND_GE — the AArch64 4-bit condition field for `MCond::GE`.
+ */
+const ARM64_COND_GE: u32 = 10 to u32
+
+/**
+ * ARM64_COND_LT — the AArch64 4-bit condition field for `MCond::LT`.
+ */
+const ARM64_COND_LT: u32 = 11 to u32
+
+/**
+ * ARM64_COND_GT — the AArch64 4-bit condition field for `MCond::GT`.
+ */
+const ARM64_COND_GT: u32 = 12 to u32
+
+/**
+ * ARM64_COND_LE — the AArch64 4-bit condition field for `MCond::LE`.
+ */
+const ARM64_COND_LE: u32 = 13 to u32
+
+/**
+ * ARM64_ADD_REG — the bit-31-clear (32-bit) ADD register-register template
+ * (`alu_reg_base`'s `Add` arm).
+ */
+const ARM64_ADD_REG: u32 = 0x0B000000 to u32
+
+/**
+ * ARM64_SUB_REG — the bit-31-clear (32-bit) SUB register-register template
+ * (`alu_reg_base`'s `Sub` arm).
+ */
+const ARM64_SUB_REG: u32 = 0x4B000000 to u32
+
+/**
+ * ARM64_MADD_REG — the bit-31-clear (32-bit) MADD template with `Ra=XZR`
+ * baked in (`alu_reg_base`'s `Mul` arm).
+ */
+const ARM64_MADD_REG: u32 = 0x1B007C00 to u32
+
+/**
+ * ARM64_SDIV_REG — the bit-31-clear (32-bit) SDIV template (`alu_reg_base`'s
+ * `Sdiv` arm).
+ */
+const ARM64_SDIV_REG: u32 = 0x1AC00C00 to u32
+
+/**
+ * ARM64_UDIV_REG — the bit-31-clear (32-bit) UDIV template (`alu_reg_base`'s
+ * `Udiv` arm).
+ */
+const ARM64_UDIV_REG: u32 = 0x1AC00800 to u32
+
+/**
+ * ARM64_AND_REG — the bit-31-clear (32-bit) AND register-register template
+ * (`alu_reg_base`'s `And` arm).
+ */
+const ARM64_AND_REG: u32 = 0x0A000000 to u32
+
+/**
+ * ARM64_ORR_REG — the bit-31-clear (32-bit) ORR register-register template
+ * (`alu_reg_base`'s `Orr` arm).
+ */
+const ARM64_ORR_REG: u32 = 0x2A000000 to u32
+
+/**
+ * ARM64_EOR_REG — the bit-31-clear (32-bit) EOR register-register template
+ * (`alu_reg_base`'s `Eor` arm).
+ */
+const ARM64_EOR_REG: u32 = 0x4A000000 to u32
+
+/**
+ * ARM64_LSLV_REG — the bit-31-clear (32-bit) LSLV (variable left-shift)
+ * template (`alu_reg_base`'s `Lsl` arm).
+ */
+const ARM64_LSLV_REG: u32 = 0x1AC02000 to u32
+
+/**
+ * ARM64_ASRV_REG — the bit-31-clear (32-bit) ASRV (variable arithmetic
+ * right-shift) template (`alu_reg_base`'s `Asr` arm).
+ */
+const ARM64_ASRV_REG: u32 = 0x1AC02800 to u32
+
+/**
+ * ARM64_LSRV_REG — the bit-31-clear (32-bit) LSRV (variable logical
+ * right-shift) template (`alu_reg_base`'s `Lsr` arm).
+ */
+const ARM64_LSRV_REG: u32 = 0x1AC02400 to u32
+
+/**
+ * ARM64_ADD_IMM_BASE — the bit-31-clear (32-bit) ADD-immediate template
+ * (`add_sub_imm_base`'s add-form arm).
+ */
+const ARM64_ADD_IMM_BASE: u32 = 0x11000000 to u32
+
+/**
+ * ARM64_SUB_IMM_BASE — the bit-31-clear (32-bit) SUB-immediate template
+ * (`add_sub_imm_base`'s sub-form arm).
+ */
+const ARM64_SUB_IMM_BASE: u32 = 0x51000000 to u32
+
+/**
+ * ARM64_ADD_IMM64_BASE — the sf-set (64-bit) ADD-immediate template with
+ * `Rd`/`Rn`/immediate all zero: the SP-arithmetic (`add_sp_imm_word`) and
+ * ADD-lo12 relocation-placeholder (`encode_add_lo`) shape, always 64-bit (no
+ * `sf_bit` OR needed).
+ */
+const ARM64_ADD_IMM64_BASE: u32 = 0x91000000 to u32
+
+/**
+ * ARM64_SUB_IMM64_BASE — the sf-set (64-bit) SUB-immediate template with
+ * `Rd`/`Rn`/immediate all zero: the SP-claim shape (`sub_sp_imm_word`), always
+ * 64-bit.
+ */
+const ARM64_SUB_IMM64_BASE: u32 = 0xD1000000 to u32
+
+/**
+ * ARM64_SXTB — the full SBFM template for SXTB (`ext_base`'s `Sxtb` arm,
+ * immr/imms already placed).
+ */
+const ARM64_SXTB: u32 = 0x93401C00 to u32
+
+/**
+ * ARM64_SXTH — the full SBFM template for SXTH (`ext_base`'s `Sxth` arm).
+ */
+const ARM64_SXTH: u32 = 0x93403C00 to u32
+
+/**
+ * ARM64_SXTW — the full SBFM template for SXTW (`ext_base`'s `Sxtw` arm).
+ */
+const ARM64_SXTW: u32 = 0x93407C00 to u32
+
+/**
+ * ARM64_UXTB — the full UBFM template for UXTB (`ext_base`'s `Uxtb` arm).
+ */
+const ARM64_UXTB: u32 = 0x53001C00 to u32
+
+/**
+ * ARM64_UXTH — the full UBFM template for UXTH (`ext_base`'s `Uxth` arm).
+ */
+const ARM64_UXTH: u32 = 0x53003C00 to u32
+
+/**
+ * ARM64_UXTW — the full UBFM template for UXTW (`ext_base`'s `Uxtw` arm, the
+ * zero-extending 32-into-64 form).
+ */
+const ARM64_UXTW: u32 = 0xD3407C00 to u32
+
+/**
+ * ARM64_LDRSB — the sign-extending byte-load template (`load_form`'s `B`
+ * signed arm).
+ */
+const ARM64_LDRSB: u32 = 0x39800000 to u32
+
+/**
+ * ARM64_LDRB — the zero-extending byte-load template (`load_form`'s `B`
+ * unsigned arm).
+ */
+const ARM64_LDRB: u32 = 0x39400000 to u32
+
+/**
+ * ARM64_LDRSH — the sign-extending halfword-load template (`load_form`'s `H`
+ * signed arm).
+ */
+const ARM64_LDRSH: u32 = 0x79800000 to u32
+
+/**
+ * ARM64_LDRH — the zero-extending halfword-load template (`load_form`'s `H`
+ * unsigned arm).
+ */
+const ARM64_LDRH: u32 = 0x79400000 to u32
+
+/**
+ * ARM64_LDRSW — the sign-extending word-load template (`load_form`'s `W`
+ * signed arm).
+ */
+const ARM64_LDRSW: u32 = 0xB9800000 to u32
+
+/**
+ * ARM64_LDR_W — the plain 32-bit word-load template (`load_form`'s `W`
+ * unsigned arm).
+ */
+const ARM64_LDR_W: u32 = 0xB9400000 to u32
+
+/**
+ * ARM64_LDR_X — the plain 64-bit doubleword-load template, shared by
+ * `load_form`'s `X` arm and `ldr_gpr_sp`'s frame-restore shape (the same
+ * unsigned-offset LDR encoding).
+ */
+const ARM64_LDR_X: u32 = 0xF9400000 to u32
+
+/**
+ * ARM64_STRB — the byte-store template (`store_form`'s `B` arm).
+ */
+const ARM64_STRB: u32 = 0x39000000 to u32
+
+/**
+ * ARM64_STRH — the halfword-store template (`store_form`'s `H` arm).
+ */
+const ARM64_STRH: u32 = 0x79000000 to u32
+
+/**
+ * ARM64_STR_W — the 32-bit word-store template (`store_form`'s `W` arm).
+ */
+const ARM64_STR_W: u32 = 0xB9000000 to u32
+
+/**
+ * ARM64_STR_X — the 64-bit doubleword-store template, shared by
+ * `store_form`'s `X` arm and `str_gpr_sp`'s frame-save shape (the same
+ * unsigned-offset STR encoding).
+ */
+const ARM64_STR_X: u32 = 0xF9000000 to u32
+
+/**
+ * ARM64_MSUB_REG — the bit-31-clear (32-bit) MSUB template (`encode_msub`'s
+ * `dst = c - a*b` shape).
+ */
+const ARM64_MSUB_REG: u32 = 0x1B008000 to u32
+
+/**
+ * ARM64_NEG_REG — the bit-31-clear (32-bit) NEG-as-SUB-from-XZR template
+ * (`encode_neg`, `Rn=XZR` baked in).
+ */
+const ARM64_NEG_REG: u32 = 0x4B0003E0 to u32
+
+/**
+ * ARM64_MVN_REG — the bit-31-clear (32-bit) MVN-as-ORN-from-XZR template
+ * (`encode_mvn`, `Rn=XZR` and the ORN N-bit baked in).
+ */
+const ARM64_MVN_REG: u32 = 0x2A2003E0 to u32
+
+/**
+ * ARM64_CMP_REG — the bit-31-clear (32-bit) CMP-as-SUBS-into-XZR template
+ * (`encode_cmp`, `Rd=XZR` baked in).
+ */
+const ARM64_CMP_REG: u32 = 0x6B00001F to u32
+
+/**
+ * ARM64_CMP_IMM_BASE — the bit-31-clear (32-bit) CMP-immediate-as-SUBS-imm-
+ * into-XZR template (`encode_cmp_imm`, `Rd=XZR` baked in).
+ */
+const ARM64_CMP_IMM_BASE: u32 = 0x7100001F to u32
+
+/**
+ * ARM64_CSET_REG — the bit-31-clear (32-bit) CSET-as-CSINC-from-XZR template
+ * (`encode_cset`, `Rn=Rm=XZR` baked in).
+ */
+const ARM64_CSET_REG: u32 = 0x1A9F07E0 to u32
+
+/**
+ * ARM64_MOVZ — the bit-31-clear (32-bit) MOVZ template (`encode_movz`).
+ */
+const ARM64_MOVZ: u32 = 0x52800000 to u32
+
+/**
+ * ARM64_MOVK — the bit-31-clear (32-bit) MOVK template (`encode_movk`).
+ */
+const ARM64_MOVK: u32 = 0x72800000 to u32
+
+/**
+ * ARM64_MOVN — the bit-31-clear (32-bit) MOVN template (`encode_movn`).
+ */
+const ARM64_MOVN: u32 = 0x12800000 to u32
+
+/**
+ * ARM64_MOV_REG — the bit-31-clear (32-bit) MOV-as-ORR-from-XZR template
+ * (`encode_mov`, `Rn=XZR` baked in).
+ */
+const ARM64_MOV_REG: u32 = 0x2A0003E0 to u32
+
+/**
+ * ARM64_B — the unconditional-branch (B) placeholder template, its imm26
+ * field left zero for `A4-3` patching (`encode_branch`).
+ */
+const ARM64_B: u32 = 0x14000000 to u32
+
+/**
+ * ARM64_BCOND — the conditional-branch (B.cond) placeholder template, its
+ * condition field zero and imm19 field left zero for `A4-3` patching
+ * (`encode_branch_cond`).
+ */
+const ARM64_BCOND: u32 = 0x54000000 to u32
+
+/**
+ * ARM64_CBZ — the compare-and-branch-if-zero placeholder template
+ * (`encode_cbz`'s zero arm).
+ */
+const ARM64_CBZ: u32 = 0x34000000 to u32
+
+/**
+ * ARM64_CBNZ — the compare-and-branch-if-nonzero placeholder template
+ * (`encode_cbz`'s nonzero arm).
+ */
+const ARM64_CBNZ: u32 = 0x35000000 to u32
+
+/**
+ * ARM64_BL — the direct-call (BL) placeholder template, flagged for a `Call`
+ * relocation (`encode_call`).
+ */
+const ARM64_BL: u32 = 0x94000000 to u32
+
+/**
+ * ARM64_BLR — the indirect-call (BLR) template (`encode_call_indirect`).
+ */
+const ARM64_BLR: u32 = 0xD63F0000 to u32
+
+/**
+ * ARM64_ADRP — the page-high-address (ADRP) placeholder template, flagged for
+ * a PAGE21 relocation (`encode_adrp`).
+ */
+const ARM64_ADRP: u32 = 0x90000000 to u32
+
+/**
+ * ARM64_RET — the bare return (RET) word (`encode_ret`).
+ */
+const ARM64_RET: u32 = 0xD65F03C0 to u32
+
+/**
+ * ARM64_STP_GPR64 — the 64-bit GPR store-pair (STP) template, `Rn=SP` baked
+ * in (`stp_gpr`).
+ */
+const ARM64_STP_GPR64: u32 = 0xA9000000 to u32
+
+/**
+ * ARM64_LDP_GPR64 — the 64-bit GPR load-pair (LDP) template, `Rn=SP` baked in
+ * (`ldp_gpr`).
+ */
+const ARM64_LDP_GPR64: u32 = 0xA9400000 to u32
+
+/**
+ * ARM64_STP_FPR64 — the 64-bit FPR store-pair (STP) template, `Rn=SP` baked
+ * in (`stp_fpr`).
+ */
+const ARM64_STP_FPR64: u32 = 0x6D000000 to u32
+
+/**
+ * ARM64_LDP_FPR64 — the 64-bit FPR load-pair (LDP) template, `Rn=SP` baked in
+ * (`ldp_fpr`).
+ */
+const ARM64_LDP_FPR64: u32 = 0x6D400000 to u32
+
+/**
+ * ARM64_STR_FPR64 — the 64-bit FPR unsigned-offset store (STR) template,
+ * `Rn=SP` baked in (`str_fpr_sp`).
+ */
+const ARM64_STR_FPR64: u32 = 0xFD000000 to u32
+
+/**
+ * ARM64_LDR_FPR64 — the 64-bit FPR unsigned-offset load (LDR) template,
+ * `Rn=SP` baked in (`ldr_fpr_sp`).
+ */
+const ARM64_LDR_FPR64: u32 = 0xFD400000 to u32
+
+/**
  * plain_word — an `EncWord` for a position-independent instruction: just the
  * finished 32-bit word, with no branch displacement and no symbol relocation
  * pending. The reloc/branch fields carry inert defaults.
@@ -173,10 +792,10 @@ fn reloc_word(w: u32, sym: str, kind: MRelocKind) -> EncWord {
  * @return []byte  `buf` followed by w's four little-endian bytes
  */
 pub fn emit_u32_le(buf: []byte, w: u32) -> []byte {
-    mut b = teko::list::push(buf, (w & (0xFF to u32)) to byte)
-    b = teko::list::push(b, ((w >> (8 to u32)) & (0xFF to u32)) to byte)
-    b = teko::list::push(b, ((w >> (16 to u32)) & (0xFF to u32)) to byte)
-    teko::list::push(b, ((w >> (24 to u32)) & (0xFF to u32)) to byte)
+    mut b = teko::list::push(buf, (w & ARM64_BYTE_MASK) to byte)
+    b = teko::list::push(b, ((w >> (8 to u32)) & ARM64_BYTE_MASK) to byte)
+    b = teko::list::push(b, ((w >> (16 to u32)) & ARM64_BYTE_MASK) to byte)
+    teko::list::push(b, ((w >> (24 to u32)) & ARM64_BYTE_MASK) to byte)
 }
 
 /**
@@ -211,7 +830,7 @@ fn enc_rd(r: MReg) -> u32 {
  * @return u32  the register id placed in bits 5-9
  */
 fn enc_rn(r: MReg) -> u32 {
-    enc_reg(r) << (5 to u32)
+    enc_reg(r) << ARM64_RN_SHIFT
 }
 
 /**
@@ -222,7 +841,7 @@ fn enc_rn(r: MReg) -> u32 {
  * @return u32  the register id placed in bits 16-20
  */
 fn enc_rm(r: MReg) -> u32 {
-    enc_reg(r) << (16 to u32)
+    enc_reg(r) << ARM64_RM_SHIFT
 }
 
 /**
@@ -233,7 +852,7 @@ fn enc_rm(r: MReg) -> u32 {
  * @return u32  the register id placed in bits 10-14
  */
 fn enc_ra(r: MReg) -> u32 {
-    enc_reg(r) << (10 to u32)
+    enc_reg(r) << ARM64_REG2_SHIFT
 }
 
 /**
@@ -245,7 +864,7 @@ fn enc_ra(r: MReg) -> u32 {
  * @return u32  `1 << 31` when wide, else 0
  */
 fn sf_bit(wide: bool) -> u32 {
-    if wide { (1 to u32) << (31 to u32) } else { 0 to u32 }
+    if wide { (1 to u32) << ARM64_SF_SHIFT } else { 0 to u32 }
 }
 
 /**
@@ -257,16 +876,16 @@ fn sf_bit(wide: bool) -> u32 {
  */
 fn cond_code(c: MCond) -> u32 {
     match c {
-        EQ => 0 to u32
-        NE => 1 to u32
-        LT => 11 to u32
-        LE => 13 to u32
-        GT => 12 to u32
-        GE => 10 to u32
-        LO => 3 to u32
-        LS => 9 to u32
-        HI => 8 to u32
-        HS => 2 to u32
+        EQ => ARM64_COND_EQ
+        NE => ARM64_COND_NE
+        LT => ARM64_COND_LT
+        LE => ARM64_COND_LE
+        GT => ARM64_COND_GT
+        GE => ARM64_COND_GE
+        LO => ARM64_COND_LO
+        LS => ARM64_COND_LS
+        HI => ARM64_COND_HI
+        HS => ARM64_COND_HS
     }
 }
 
@@ -330,17 +949,17 @@ fn honest_bigframe() -> error {
  */
 fn alu_reg_base(op: MAluOp) -> u32 {
     match op {
-        Add => 0x0B000000 to u32
-        Sub => 0x4B000000 to u32
-        Mul => 0x1B007C00 to u32
-        Sdiv => 0x1AC00C00 to u32
-        Udiv => 0x1AC00800 to u32
-        And => 0x0A000000 to u32
-        Orr => 0x2A000000 to u32
-        Eor => 0x4A000000 to u32
-        Lsl => 0x1AC02000 to u32
-        Asr => 0x1AC02800 to u32
-        Lsr => 0x1AC02400 to u32
+        Add => ARM64_ADD_REG
+        Sub => ARM64_SUB_REG
+        Mul => ARM64_MADD_REG
+        Sdiv => ARM64_SDIV_REG
+        Udiv => ARM64_UDIV_REG
+        And => ARM64_AND_REG
+        Orr => ARM64_ORR_REG
+        Eor => ARM64_EOR_REG
+        Lsl => ARM64_LSLV_REG
+        Asr => ARM64_ASRV_REG
+        Lsr => ARM64_LSRV_REG
     }
 }
 
@@ -356,8 +975,8 @@ fn alu_reg_base(op: MAluOp) -> u32 {
  */
 fn add_sub_imm_base(op: MAluOp, negative: bool) -> u32 | error {
     match op {
-        Add => if negative { 0x51000000 to u32 } else { 0x11000000 to u32 }
-        Sub => if negative { 0x11000000 to u32 } else { 0x51000000 to u32 }
+        Add => if negative { ARM64_SUB_IMM_BASE } else { ARM64_ADD_IMM_BASE }
+        Sub => if negative { ARM64_ADD_IMM_BASE } else { ARM64_SUB_IMM_BASE }
         _ => honest_bigimm()
     }
 }
@@ -373,12 +992,12 @@ fn add_sub_imm_base(op: MAluOp, negative: bool) -> u32 | error {
  */
 fn ext_base(op: MExtOp) -> u32 {
     match op {
-        Sxtb => 0x93401C00 to u32
-        Sxth => 0x93403C00 to u32
-        Sxtw => 0x93407C00 to u32
-        Uxtb => 0x53001C00 to u32
-        Uxth => 0x53003C00 to u32
-        Uxtw => 0xD3407C00 to u32
+        Sxtb => ARM64_SXTB
+        Sxth => ARM64_SXTH
+        Sxtw => ARM64_SXTW
+        Uxtb => ARM64_UXTB
+        Uxth => ARM64_UXTH
+        Uxtw => ARM64_UXTW
     }
 }
 
@@ -394,10 +1013,10 @@ fn ext_base(op: MExtOp) -> u32 {
  */
 fn load_form(size: MMemSize, sign: bool) -> MemForm | error {
     match size {
-        B => MemForm { base = if sign { 0x39800000 to u32 } else { 0x39400000 to u32 }; scale = 1 to u32 }
-        H => MemForm { base = if sign { 0x79800000 to u32 } else { 0x79400000 to u32 }; scale = 2 to u32 }
-        W => MemForm { base = if sign { 0xB9800000 to u32 } else { 0xB9400000 to u32 }; scale = 4 to u32 }
-        X => MemForm { base = 0xF9400000 to u32; scale = 8 to u32 }
+        B => MemForm { base = if sign { ARM64_LDRSB } else { ARM64_LDRB }; scale = ARM64_SCALE_B }
+        H => MemForm { base = if sign { ARM64_LDRSH } else { ARM64_LDRH }; scale = ARM64_SCALE_H }
+        W => MemForm { base = if sign { ARM64_LDRSW } else { ARM64_LDR_W }; scale = ARM64_SCALE_W }
+        X => MemForm { base = ARM64_LDR_X; scale = ARM64_SCALE_X }
         S => honest_fp()
         D => honest_fp()
     }
@@ -413,10 +1032,10 @@ fn load_form(size: MMemSize, sign: bool) -> MemForm | error {
  */
 fn store_form(size: MMemSize) -> MemForm | error {
     match size {
-        B => MemForm { base = 0x39000000 to u32; scale = 1 to u32 }
-        H => MemForm { base = 0x79000000 to u32; scale = 2 to u32 }
-        W => MemForm { base = 0xB9000000 to u32; scale = 4 to u32 }
-        X => MemForm { base = 0xF9000000 to u32; scale = 8 to u32 }
+        B => MemForm { base = ARM64_STRB; scale = ARM64_SCALE_B }
+        H => MemForm { base = ARM64_STRH; scale = ARM64_SCALE_H }
+        W => MemForm { base = ARM64_STR_W; scale = ARM64_SCALE_W }
+        X => MemForm { base = ARM64_STR_X; scale = ARM64_SCALE_X }
         S => honest_fp()
         D => honest_fp()
     }
@@ -437,7 +1056,7 @@ fn scaled_offset(offset: i32, scale: u32) -> u32 | error {
     let uoff = offset to u32
     if (uoff % scale) != (0 to u32) { return honest_ldur() }
     let imm = uoff / scale
-    if imm > (4095 to u32) { return honest_ldur() }
+    if imm > ARM64_IMM12_FIELD_MAX { return honest_ldur() }
     imm
 }
 
@@ -460,14 +1079,14 @@ fn encode_alu(i: MAlu) -> EncWord {
  * @return EncWord | error  the encoded word, or a named honest-stop
  */
 fn encode_alu_imm(i: MAluImm) -> EncWord | error {
-    let hi = 4095 to i64
+    let hi = ARM64_IMM12_MAX
     let lo = (0 to i64) - hi
     if i.imm > hi { return honest_bigimm() }
     if i.imm < lo { return honest_bigimm() }
     let neg = i.imm < (0 to i64)
     let base = match add_sub_imm_base(i.op, neg) { u32 as b => b; error as e => return e }
     let mag = if neg { (0 to i64) - i.imm } else { i.imm }
-    let field = ((mag to u32) & (0xFFF to u32)) << (10 to u32)
+    let field = ((mag to u32) & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT
     plain_word(base | sf_bit(i.wide) | field | enc_rn(i.a) | enc_rd(i.dst))
 }
 
@@ -479,8 +1098,7 @@ fn encode_alu_imm(i: MAluImm) -> EncWord | error {
  * @return EncWord  the encoded word
  */
 fn encode_msub(i: MMSub) -> EncWord {
-    let base = 0x1B008000 to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.b) | enc_ra(i.c) | enc_rn(i.a) | enc_rd(i.dst))
+    plain_word(ARM64_MSUB_REG | sf_bit(i.wide) | enc_rm(i.b) | enc_ra(i.c) | enc_rn(i.a) | enc_rd(i.dst))
 }
 
 /**
@@ -491,8 +1109,7 @@ fn encode_msub(i: MMSub) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_neg(i: MNeg) -> EncWord {
-    let base = 0x4B0003E0 to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
+    plain_word(ARM64_NEG_REG | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
 }
 
 /**
@@ -503,8 +1120,7 @@ fn encode_neg(i: MNeg) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_mvn(i: MMvn) -> EncWord {
-    let base = 0x2A2003E0 to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
+    plain_word(ARM64_MVN_REG | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
 }
 
 /**
@@ -515,8 +1131,7 @@ fn encode_mvn(i: MMvn) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_cmp(i: MCmp) -> EncWord {
-    let base = 0x6B00001F to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.b) | enc_rn(i.a))
+    plain_word(ARM64_CMP_REG | sf_bit(i.wide) | enc_rm(i.b) | enc_rn(i.a))
 }
 
 /**
@@ -528,12 +1143,11 @@ fn encode_cmp(i: MCmp) -> EncWord {
  * @return EncWord | error  the encoded word, or the `A4-bigimm` honest-stop
  */
 fn encode_cmp_imm(i: MCmpImm) -> EncWord | error {
-    let hi = 4095 to i64
+    let hi = ARM64_IMM12_MAX
     if i.imm > hi { return honest_bigimm() }
     if i.imm < (0 to i64) { return honest_bigimm() }
-    let base = 0x7100001F to u32
-    let field = ((i.imm to u32) & (0xFFF to u32)) << (10 to u32)
-    plain_word(base | sf_bit(i.wide) | field | enc_rn(i.a))
+    let field = ((i.imm to u32) & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT
+    plain_word(ARM64_CMP_IMM_BASE | sf_bit(i.wide) | field | enc_rn(i.a))
 }
 
 /**
@@ -545,9 +1159,8 @@ fn encode_cmp_imm(i: MCmpImm) -> EncWord | error {
  * @return EncWord  the encoded word
  */
 fn encode_cset(i: MCSet) -> EncWord {
-    let base = 0x1A9F07E0 to u32
-    let field = ((cond_code(i.cond) ^ (1 to u32)) & (0xF to u32)) << (12 to u32)
-    plain_word(base | sf_bit(i.wide) | field | enc_rd(i.dst))
+    let field = ((cond_code(i.cond) ^ (1 to u32)) & ARM64_COND_MASK) << ARM64_COND_SHIFT
+    plain_word(ARM64_CSET_REG | sf_bit(i.wide) | field | enc_rd(i.dst))
 }
 
 /**
@@ -562,8 +1175,8 @@ fn encode_cset(i: MCSet) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_movi(base: u32, wide: bool, dst: MReg, imm16: u32, shift: u32) -> EncWord {
-    let hw = (shift / (16 to u32)) << (21 to u32)
-    let imm = (imm16 & (0xFFFF to u32)) << (5 to u32)
+    let hw = (shift / ARM64_MOVI_LANE_BITS) << ARM64_MOVI_HW_SHIFT
+    let imm = (imm16 & ARM64_IMM16_MASK) << ARM64_MOVI_IMM16_SHIFT
     plain_word(base | sf_bit(wide) | hw | imm | enc_rd(dst))
 }
 
@@ -574,7 +1187,7 @@ fn encode_movi(base: u32, wide: bool, dst: MReg, imm16: u32, shift: u32) -> EncW
  * @return EncWord  the encoded word
  */
 fn encode_movz(i: MMovZ) -> EncWord {
-    encode_movi(0x52800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+    encode_movi(ARM64_MOVZ, i.wide, i.dst, i.imm16, i.shift)
 }
 
 /**
@@ -585,7 +1198,7 @@ fn encode_movz(i: MMovZ) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_movk(i: MMovK) -> EncWord {
-    encode_movi(0x72800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+    encode_movi(ARM64_MOVK, i.wide, i.dst, i.imm16, i.shift)
 }
 
 /**
@@ -595,7 +1208,7 @@ fn encode_movk(i: MMovK) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_movn(i: MMovN) -> EncWord {
-    encode_movi(0x12800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+    encode_movi(ARM64_MOVN, i.wide, i.dst, i.imm16, i.shift)
 }
 
 /**
@@ -606,8 +1219,7 @@ fn encode_movn(i: MMovN) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_mov(i: MMov) -> EncWord {
-    let base = 0x2A0003E0 to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.src) | enc_rd(i.dst))
+    plain_word(ARM64_MOV_REG | sf_bit(i.wide) | enc_rm(i.src) | enc_rd(i.dst))
 }
 
 /**
@@ -632,7 +1244,7 @@ fn encode_ext(i: MExt) -> EncWord {
 fn encode_load(i: MLoad) -> EncWord | error {
     let form = match load_form(i.size, i.sign) { MemForm as f => f; error as e => return e }
     let imm = match scaled_offset(i.mem.offset, form.scale) { u32 as v => v; error as e => return e }
-    let field = (imm & (0xFFF to u32)) << (10 to u32)
+    let field = (imm & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT
     plain_word(form.base | field | enc_rn(i.mem.base) | enc_rd(i.dst))
 }
 
@@ -647,7 +1259,7 @@ fn encode_load(i: MLoad) -> EncWord | error {
 fn encode_store(i: MStore) -> EncWord | error {
     let form = match store_form(i.size) { MemForm as f => f; error as e => return e }
     let imm = match scaled_offset(i.mem.offset, form.scale) { u32 as v => v; error as e => return e }
-    let field = (imm & (0xFFF to u32)) << (10 to u32)
+    let field = (imm & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT
     plain_word(form.base | field | enc_rn(i.mem.base) | enc_rd(i.src))
 }
 
@@ -659,8 +1271,7 @@ fn encode_store(i: MStore) -> EncWord | error {
  * @return EncWord  the branch-flagged placeholder word
  */
 fn encode_branch(i: MBranch) -> EncWord {
-    let base = 0x14000000 to u32
-    branch_word(base, i.target, 0 to u32)
+    branch_word(ARM64_B, i.target, 0 to u32)
 }
 
 /**
@@ -672,8 +1283,7 @@ fn encode_branch(i: MBranch) -> EncWord {
  * @return EncWord  the branch-flagged placeholder word
  */
 fn encode_branch_cond(i: MBranchCond) -> EncWord {
-    let base = 0x54000000 to u32
-    let w = base | (cond_code(i.cond) & (0xF to u32))
+    let w = ARM64_BCOND | (cond_code(i.cond) & ARM64_COND_MASK)
     branch_word(w, i.target, 1 to u32)
 }
 
@@ -686,7 +1296,7 @@ fn encode_branch_cond(i: MBranchCond) -> EncWord {
  * @return EncWord  the branch-flagged placeholder word
  */
 fn encode_cbz(i: MCbz) -> EncWord {
-    let base = if i.zero { 0x34000000 to u32 } else { 0x35000000 to u32 }
+    let base = if i.zero { ARM64_CBZ } else { ARM64_CBNZ }
     let w = base | sf_bit(i.wide) | enc_rd(i.a)
     branch_word(w, i.target, 1 to u32)
 }
@@ -700,8 +1310,7 @@ fn encode_cbz(i: MCbz) -> EncWord {
  * @return EncWord  the reloc-flagged placeholder word
  */
 fn encode_call(i: MCall) -> EncWord {
-    let base = 0x94000000 to u32
-    reloc_word(base, i.sym, MRelocKind::Call)
+    reloc_word(ARM64_BL, i.sym, MRelocKind::Call)
 }
 
 /**
@@ -712,8 +1321,7 @@ fn encode_call(i: MCall) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_call_indirect(i: MCallIndirect) -> EncWord {
-    let base = 0xD63F0000 to u32
-    plain_word(base | enc_rn(i.target))
+    plain_word(ARM64_BLR | enc_rn(i.target))
 }
 
 /**
@@ -725,8 +1333,7 @@ fn encode_call_indirect(i: MCallIndirect) -> EncWord {
  * @return EncWord  the reloc-flagged placeholder word
  */
 fn encode_adrp(i: MAdrp) -> EncWord {
-    let base = 0x90000000 to u32
-    reloc_word(base | enc_rd(i.dst), i.sym, i.kind)
+    reloc_word(ARM64_ADRP | enc_rd(i.dst), i.sym, i.kind)
 }
 
 /**
@@ -738,8 +1345,7 @@ fn encode_adrp(i: MAdrp) -> EncWord {
  * @return EncWord  the reloc-flagged placeholder word
  */
 fn encode_add_lo(i: MAddLo) -> EncWord {
-    let base = 0x91000000 to u32
-    reloc_word(base | enc_rn(i.a) | enc_rd(i.dst), i.sym, i.kind)
+    reloc_word(ARM64_ADD_IMM64_BASE | enc_rn(i.a) | enc_rd(i.dst), i.sym, i.kind)
 }
 
 /**
@@ -750,7 +1356,7 @@ fn encode_add_lo(i: MAddLo) -> EncWord {
  * @return EncWord  the RET word
  */
 fn encode_ret() -> EncWord {
-    plain_word(0xD65F03C0 to u32)
+    plain_word(ARM64_RET)
 }
 
 /**
@@ -941,7 +1547,7 @@ fn compute_slot_offsets(frame: []lir::LAlloca) -> SlotLayout {
         running = at + la.bytes
         i++
     }
-    SlotLayout { offsets = offsets; slots_size = align_up(running, 16 to u32) }
+    SlotLayout { offsets = offsets; slots_size = align_up(running, ARM64_STACK_ALIGN) }
 }
 
 /**
@@ -1061,7 +1667,7 @@ fn frame_total_size(slots_size: u32, saved: Saved, lr_save: bool) -> u32 {
     let n_saved = (saved.gpr.len + saved.fpr.len) to u32
     let framed = (slots_size > (0 to u32)) || (n_saved > (0 to u32)) || lr_save
     if !framed { return 0 to u32 }
-    align_up(slots_size + (n_saved * (8 to u32)) + (16 to u32), 16 to u32)
+    align_up(slots_size + (n_saved * ARM64_REG_BYTES) + ARM64_FP_LR_BYTES, ARM64_STACK_ALIGN)
 }
 
 /**
@@ -1109,7 +1715,7 @@ pub fn slot_offset(layout: FrameLayout, slot: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn sub_sp_imm_word(imm12: u32) -> u32 {
-    (0xD1000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | (31 to u32)
+    ARM64_SUB_IMM64_BASE | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ARM64_SP_ID
 }
 
 /**
@@ -1122,7 +1728,7 @@ fn sub_sp_imm_word(imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn add_sp_imm_word(dst_id: u32, imm12: u32) -> u32 {
-    (0x91000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | dst_id
+    ARM64_ADD_IMM64_BASE | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | dst_id
 }
 
 /**
@@ -1135,7 +1741,7 @@ fn add_sp_imm_word(dst_id: u32, imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn stp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
-    (0xA9000000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_STP_GPR64 | ((imm7 & ARM64_IMM7_MASK) << ARM64_IMM7_SHIFT) | (rb << ARM64_REG2_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1148,7 +1754,7 @@ fn stp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn ldp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
-    (0xA9400000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_LDP_GPR64 | ((imm7 & ARM64_IMM7_MASK) << ARM64_IMM7_SHIFT) | (rb << ARM64_REG2_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1160,7 +1766,7 @@ fn ldp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn str_gpr_sp(ra: u32, imm12: u32) -> u32 {
-    (0xF9000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_STR_X | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1172,7 +1778,7 @@ fn str_gpr_sp(ra: u32, imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn ldr_gpr_sp(ra: u32, imm12: u32) -> u32 {
-    (0xF9400000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_LDR_X | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1185,7 +1791,7 @@ fn ldr_gpr_sp(ra: u32, imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn stp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
-    (0x6D000000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_STP_FPR64 | ((imm7 & ARM64_IMM7_MASK) << ARM64_IMM7_SHIFT) | (rb << ARM64_REG2_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1198,7 +1804,7 @@ fn stp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn ldp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
-    (0x6D400000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_LDP_FPR64 | ((imm7 & ARM64_IMM7_MASK) << ARM64_IMM7_SHIFT) | (rb << ARM64_REG2_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1210,7 +1816,7 @@ fn ldp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn str_fpr_sp(ra: u32, imm12: u32) -> u32 {
-    (0xFD000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_STR_FPR64 | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1222,7 +1828,7 @@ fn str_fpr_sp(ra: u32, imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn ldr_fpr_sp(ra: u32, imm12: u32) -> u32 {
-    (0xFD400000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_LDR_FPR64 | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1283,13 +1889,13 @@ fn emit_frame_mem(words0: []u32, ids: []u32, base: u32, is_fpr: bool, is_store: 
     mut i: u64 = 0
     loop {
         if i >= ids.len { break }
-        let off = base + ((i to u32) * (8 to u32))
+        let off = base + ((i to u32) * ARM64_REG_BYTES)
         let has_pair = (i + 1) < ids.len
         if has_pair {
-            words = teko::list::push(words, pair_frame_word(ids[i], ids[i + 1], off / (8 to u32), is_fpr, is_store))
+            words = teko::list::push(words, pair_frame_word(ids[i], ids[i + 1], off / ARM64_REG_BYTES, is_fpr, is_store))
             i = i + 2
         } else {
-            words = teko::list::push(words, single_frame_word(ids[i], off / (8 to u32), is_fpr, is_store))
+            words = teko::list::push(words, single_frame_word(ids[i], off / ARM64_REG_BYTES, is_fpr, is_store))
             i = i + 1
         }
     }
@@ -1306,7 +1912,7 @@ fn emit_frame_mem(words0: []u32, ids: []u32, base: u32, is_fpr: bool, is_store: 
  */
 fn callee_base_offset(layout: FrameLayout) -> u32 {
     let n = (layout.saved_gpr.len + layout.saved_fpr.len) to u32
-    (layout.size - (16 to u32)) - (n * (8 to u32))
+    (layout.size - ARM64_FP_LR_BYTES) - (n * ARM64_REG_BYTES)
 }
 
 /**
@@ -1321,7 +1927,7 @@ fn callee_base_offset(layout: FrameLayout) -> u32 {
 fn emit_callee_area(words0: []u32, layout: FrameLayout, is_store: bool) -> []u32 {
     let base = callee_base_offset(layout)
     let after_gpr = emit_frame_mem(words0, layout.saved_gpr, base, false, is_store)
-    let fpr_base = base + ((layout.saved_gpr.len to u32) * (8 to u32))
+    let fpr_base = base + ((layout.saved_gpr.len to u32) * ARM64_REG_BYTES)
     emit_frame_mem(after_gpr, layout.saved_fpr, fpr_base, true, is_store)
 }
 
@@ -1335,7 +1941,7 @@ fn emit_callee_area(words0: []u32, layout: FrameLayout, is_store: bool) -> []u32
  * @return bool  true iff the frame's offsets are all encodable
  */
 fn frame_fits(layout: FrameLayout) -> bool {
-    ((layout.size - (16 to u32)) / (8 to u32)) <= (63 to u32)
+    ((layout.size - ARM64_FP_LR_BYTES) / ARM64_REG_BYTES) <= ARM64_IMM7_MAX_POS
 }
 
 /**
@@ -1353,11 +1959,11 @@ pub fn emit_prologue(layout: FrameLayout) -> []u32 | error {
         return none
     }
     if !frame_fits(layout) { return honest_bigframe() }
-    let top = layout.size - (16 to u32)
+    let top = layout.size - ARM64_FP_LR_BYTES
     mut words: []u32 = teko::list::empty()
     words = teko::list::push(words, sub_sp_imm_word(layout.size))
-    words = teko::list::push(words, stp_gpr(29 to u32, 30 to u32, top / (8 to u32)))
-    words = teko::list::push(words, add_sp_imm_word(29 to u32, top))
+    words = teko::list::push(words, stp_gpr(ARM64_FP_ID, ARM64_LR_ID, top / ARM64_REG_BYTES))
+    words = teko::list::push(words, add_sp_imm_word(ARM64_FP_ID, top))
     emit_callee_area(words, layout, true)
 }
 
@@ -1377,10 +1983,10 @@ pub fn emit_epilogue(layout: FrameLayout) -> []u32 | error {
         return none
     }
     if !frame_fits(layout) { return honest_bigframe() }
-    let top = layout.size - (16 to u32)
+    let top = layout.size - ARM64_FP_LR_BYTES
     mut words: []u32 = emit_callee_area(teko::list::empty(), layout, false)
-    words = teko::list::push(words, ldp_gpr(29 to u32, 30 to u32, top / (8 to u32)))
-    words = teko::list::push(words, add_sp_imm_word(31 to u32, layout.size))
+    words = teko::list::push(words, ldp_gpr(ARM64_FP_ID, ARM64_LR_ID, top / ARM64_REG_BYTES))
+    words = teko::list::push(words, add_sp_imm_word(ARM64_SP_ID, layout.size))
     words
 }
 
@@ -1396,7 +2002,7 @@ pub fn emit_epilogue(layout: FrameLayout) -> []u32 | error {
  */
 fn encode_frame_addr(layout: FrameLayout, i: MFrameAddr) -> EncWord | error {
     let off = slot_offset(layout, i.slot)
-    if off > (4095 to u32) { return honest_bigframe() }
+    if off > ARM64_IMM12_FIELD_MAX { return honest_bigframe() }
     plain_word(add_sp_imm_word(enc_reg(i.dst), off))
 }
 
@@ -1552,7 +2158,7 @@ fn honest_badblock() -> error {
  * @return bool  true iff it is encodable in imm26
  */
 fn imm26_fits(disp_words: i64) -> bool {
-    (disp_words >= ((0 to i64) - (33554432 to i64))) && (disp_words <= (33554431 to i64))
+    (disp_words >= ((0 to i64) - ARM64_IMM26_MIN_MAGNITUDE)) && (disp_words <= ARM64_IMM26_MAX)
 }
 
 /**
@@ -1563,7 +2169,7 @@ fn imm26_fits(disp_words: i64) -> bool {
  * @return bool  true iff it is encodable in imm19
  */
 fn imm19_fits(disp_words: i64) -> bool {
-    (disp_words >= ((0 to i64) - (262144 to i64))) && (disp_words <= (262143 to i64))
+    (disp_words >= ((0 to i64) - ARM64_IMM19_MIN_MAGNITUDE)) && (disp_words <= ARM64_IMM19_MAX)
 }
 
 /**
@@ -1601,10 +2207,10 @@ fn twos_field(disp_words: i64, bits: u32) -> u32 {
 fn branch_disp_field(disp_words: i64, form: u32) -> u32 | error {
     if form == (0 to u32) {
         if !imm26_fits(disp_words) { return honest_farbranch() }
-        return twos_field(disp_words, 26 to u32)
+        return twos_field(disp_words, ARM64_IMM26_BITS)
     }
     if !imm19_fits(disp_words) { return honest_farbranch() }
-    twos_field(disp_words, 19 to u32) << (5 to u32)
+    twos_field(disp_words, ARM64_IMM19_BITS) << ARM64_BCOND_IMM19_SHIFT
 }
 
 /**
@@ -1731,7 +2337,7 @@ fn finalize_func(symbol: str, words: []EncWord, offsets: []BlockOffset) -> Encod
         let w = match resolve_word(ew, i to u32, offsets) { u32 as v => v; error as e => return e }
         out_words = teko::list::push(out_words, w)
         if ew.has_reloc {
-            relocs = teko::list::push(relocs, Reloc { offset = (i to u32) * (4 to u32); sym = ew.reloc_sym; kind = ew.reloc_kind })
+            relocs = teko::list::push(relocs, Reloc { offset = (i to u32) * ARM64_WORD_BYTES; sym = ew.reloc_sym; kind = ew.reloc_kind })
         }
         i++
     }
@@ -1958,7 +2564,7 @@ fn fold_func_into_text(abi: AbiDescriptor, acc: ModuleText, f: MFunc) -> ModuleT
     let text = append_words_le(acc.text, ef.words)
     let relocs = rebase_relocs(acc.relocs, ef.relocs, acc.base)
     let syms = teko::list::push(acc.syms, sym)
-    let base = acc.base + ((ef.words.len to u32) * (4 to u32))
+    let base = acc.base + ((ef.words.len to u32) * ARM64_WORD_BYTES)
     ModuleText { text = text; relocs = relocs; syms = syms; base = base }
 }
 
