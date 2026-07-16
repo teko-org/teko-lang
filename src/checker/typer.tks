@@ -2359,9 +2359,16 @@ fn member_const_visible(hit: MemberConstHit, table: TypeTable, ref_ns: str) -> e
  * 7): a `TVar` bound to the hoisted const's program-unique name (the same name `type_type_member_consts`
  * emits, keyed on the PATH's leading type — the hoist re-materializes an inherited const once per
  * owning type, exactly like an inherited method is re-emitted per class), typed with the const's
- * declared type. The inliner then substitutes a scalar's value or the aggregate's rodata address.
- * Returns null when no such member const exists, so `type_path_expr` falls through to the enum-member
- * arm.
+ * declared type. `func_ns` is stamped to `owner_ns` — the SAME namespace `type_type_member_consts`
+ * stamps its hoisted `TConstDecl.namespace` with (both derive from the type's own declaring
+ * namespace) — so the c8b `(name, namespace)`-keyed scalar/aggregate inliner's ref key matches the
+ * hoisted const's key and actually substitutes it. An empty `func_ns` here (the regression a
+ * positive-fixture e2e build exposed) matches the hoist ONLY at the root namespace ("" == ""); any
+ * type declared in a non-root namespace then never substitutes, so the reference survives to codegen
+ * as the raw `sym` (a `"Type::NAME"`-shaped string embedding `::`) emitted verbatim as a C
+ * identifier — invalid syntax the C compiler rejects. The inliner then substitutes a scalar's value
+ * or the aggregate's rodata address. Returns null when no such member const exists, so
+ * `type_path_expr` falls through to the enum-member arm.
  *
  * @param owner  the resolved leading type (struct/class/abstract/trait)
  * @param seg    the last path segment (the member const's name)
@@ -2374,7 +2381,7 @@ fn find_member_const(owner: parser::TypeDecl, seg: str, table: TypeTable) -> TEx
     let owner_ns = type_ns_of(table, owner.name)
     let rty = match resolve_type(hit.cd.ty, table, owner_ns) { Type as t => t; error => return null }
     let sym = member_const_symbol(qualify(owner_ns, owner.name), seg)
-    TExpr { kind = TVar { name = sym; is_func = false; func_ns = "" }; type = rty; line = 0; col = 0 }
+    TExpr { kind = TVar { name = sym; is_func = false; func_ns = owner_ns }; type = rty; line = 0; col = 0 }
 }
 
 /**

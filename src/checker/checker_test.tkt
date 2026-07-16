@@ -370,6 +370,109 @@ fn type_program_with_deps_resolves_const_forward_ref() {
     }
 }
 
+/**
+ * ctt_struct_with_const — a minimal struct `TypeDecl` named `name` declaring exactly ONE static
+ * member const (`const_name: i64 = value`), used to drive `Type::NAME` resolution through the REAL
+ * build path without any unrelated field/method noise.
+ *
+ * @param name        the struct's bare name
+ * @param const_name  the member const's name
+ * @param value       the member const's `i64` initializer value
+ * @return            a member-less-field struct `TypeDecl` carrying that one const
+ */
+fn ctt_struct_with_const(name: str, const_name: str, value: i128) -> parser::TypeDecl {
+    let cd = parser::ConstDecl { name = const_name; ty = named_t("i64"); init = e_num(value); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+    let consts: []parser::ConstDecl = teko::list::push(teko::list::empty(), cd)
+    parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::StructBody { fields = teko::list::empty(); methods = teko::list::empty(); implements = teko::list::empty(); consts = consts }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+}
+
+/**
+ * type_program_with_deps_inlines_member_const — the REAL build path (`type_program_with_deps`, which
+ * runs `type_type_member_consts` (the hoist) then `inline_consts` (the substitution)) resolves
+ * `Point::ORIGIN_X` and SUBSTITUTES its value, leaving no `TVar` naming the hoisted symbol — the
+ * regression the CI positive-runner caught (#594): `find_member_const` stamped `func_ns = ""` while
+ * the hoist stamps its `TConstDecl.namespace` to the type's OWN declaring namespace, so the c8b
+ * `(name, namespace)`-keyed inliner's ref key never matched the hoisted const's key and the raw
+ * `member_const_symbol`-shaped name (containing `::`) survived to codegen as an invalid C identifier.
+ * `func_ns` must equal `owner_ns` — the SAME namespace `type_type_member_consts` hoists under.
+ */
+#test
+fn type_program_with_deps_inlines_member_const() {
+    let point = ctt_struct_with_const("Point", "ORIGIN_X", 7)
+    let uses_origin = mk_fn("uses_origin", named_t("i64"), one_stmt(e_path2("Point", "ORIGIN_X")))
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, parser::Item { content = point; namespace = "app"; file = "app.tks" })
+    items = teko::list::push(items, parser::Item { content = uses_origin; namespace = "app"; file = "app.tks" })
+    let empty_dep = TProgram { items = teko::list::empty() }
+    match type_program_with_deps(parser::Program { items = items }, empty_dep) {
+        TProgram as tp => {
+            mut found = false
+            mut i: u64 = 0
+            loop {
+                if i >= tp.items.len { break }
+                match tp.items[i] {
+                    TFunction as f => if f.name == "uses_origin" {
+                        found = true
+                        match f.body[0] {
+                            TExprStmt as es => match es.expr.kind { TNumber as n => teko::assert::is_true(n.value == 7); _ => teko::assert::is_true(false) }
+                            _ => teko::assert::is_true(false)
+                        }
+                    }
+                    _ => { }
+                }
+                i++
+            }
+            teko::assert::is_true(found)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * type_program_with_deps_inlines_inherited_member_const — the inheritance leg of the SAME regression:
+ * `Sub` (a `class Base`, ABSTRACT base) declares NO member const of its own, so `Sub::K` resolves
+ * through the base chain to `Base`'s `K`, and the hoist RE-MATERIALIZES it under `Sub`'s OWN name
+ * (`type_type_member_consts` re-emits a class's EFFECTIVE — base-inherited — consts per owning class,
+ * mirroring how an inherited method is re-emitted). `find_member_const`'s `owner` is `Sub` (the
+ * resolved leading type), so `owner_ns` must be `Sub`'s OWN declaring namespace for the ref to key
+ * onto `Sub`'s re-materialized hoist entry, not `Base`'s.
+ */
+#test
+fn type_program_with_deps_inlines_inherited_member_const() {
+    let base_k = parser::ConstDecl { name = "K"; ty = named_t("i64"); init = e_num(5); vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+    let base_consts: []parser::ConstDecl = teko::list::push(teko::list::empty(), base_k)
+    let base = parser::TypeDecl { name = "Base"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Abstract; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty(); consts = base_consts }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+    let sub = parser::TypeDecl { name = "Sub"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = true; base_name = "Base"; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty(); consts = teko::list::empty() }; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+    let uses_sub_k = mk_fn("uses_sub_k", named_t("i64"), one_stmt(e_path2("Sub", "K")))
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, parser::Item { content = base; namespace = "app"; file = "app.tks" })
+    items = teko::list::push(items, parser::Item { content = sub; namespace = "app"; file = "app.tks" })
+    items = teko::list::push(items, parser::Item { content = uses_sub_k; namespace = "app"; file = "app.tks" })
+    let empty_dep = TProgram { items = teko::list::empty() }
+    match type_program_with_deps(parser::Program { items = items }, empty_dep) {
+        TProgram as tp => {
+            mut found = false
+            mut i: u64 = 0
+            loop {
+                if i >= tp.items.len { break }
+                match tp.items[i] {
+                    TFunction as f => if f.name == "uses_sub_k" {
+                        found = true
+                        match f.body[0] {
+                            TExprStmt as es => match es.expr.kind { TNumber as n => teko::assert::is_true(n.value == 5); _ => teko::assert::is_true(false) }
+                            _ => teko::assert::is_true(false)
+                        }
+                    }
+                    _ => { }
+                }
+                i++
+            }
+            teko::assert::is_true(found)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 /** collects_const_unknown_type_is_located_error — a `const` whose declared type names no known type
     yields an error positioned at the const's own line/col, not a silent success (#594 crumb 2). */
 #test
