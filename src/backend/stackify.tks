@@ -3902,6 +3902,21 @@ type RenderEnv = struct {
 }
 
 /**
+ * EdgeResultKind — the three shapes `render_edge` can resolve an edge to:
+ * `Stop` (the edge reached the caller's own `stop` target — nothing more to
+ * render on this path, the caller renders `target` itself once, after its
+ * own scope closes), `Branch` (the edge's target is an open scope — a `br`
+ * was emitted, a `continue`, a `break`, or a labelled skip past several
+ * enclosing scopes at once), or `More` (the edge's target is neither `stop`
+ * nor already open — the caller must keep rendering by recursing into it
+ * directly, the straight-line "this is simply the next block" fallthrough
+ * case). Named `EdgeResultKind` (not `EdgeResult`) to stay distinct from the
+ * `EdgeResult` struct below, whose `kind` field it types. Purely an internal
+ * control-flow tag — never serialized — so no wire mapping is needed.
+ */
+pub type EdgeResultKind = enum { Stop; Branch; More }
+
+/**
  * EdgeResult — one edge's fully-resolved outcome (`render_edge`): the
  * advanced context (its block-arg copies already emitted) and which of the
  * three shapes it took.
@@ -3909,51 +3924,17 @@ type RenderEnv = struct {
 type EdgeResult = struct {
     /**
      * ctx — the context advanced past the edge's own block-arg copies (and
-     * its `br`, when `kind` is `edge_result_branch()`).
+     * its `br`, when `kind` is `EdgeResultKind::Branch`).
      */
     ctx: StackifyCtx
     /**
-     * kind — `edge_result_stop()` / `edge_result_branch()` /
-     * `edge_result_more()`.
+     * kind — the edge's resolved `EdgeResultKind`.
      */
-    kind: u8
+    kind: EdgeResultKind
     /**
      * target — the edge's own target block id.
      */
     target: u32
-}
-
-/**
- * edge_result_stop — the edge reached the caller's own `stop` target:
- * nothing more to render on this path (the caller renders `target` itself,
- * once, after its own scope closes).
- *
- * @return u8  the "stop" edge-result tag
- */
-fn edge_result_stop() -> u8 {
-    0 to u8
-}
-
-/**
- * edge_result_branch — the edge's target is an open scope: a `br` was
- * emitted (a `continue`, a `break`, or a labelled skip past several
- * enclosing scopes at once).
- *
- * @return u8  the "branch" edge-result tag
- */
-fn edge_result_branch() -> u8 {
-    1 to u8
-}
-
-/**
- * edge_result_more — the edge's target is neither `stop` nor already open:
- * the caller must keep rendering by recursing into it directly (the
- * straight-line "this is simply the next block" fallthrough case).
- *
- * @return u8  the "more" edge-result tag
- */
-fn edge_result_more() -> u8 {
-    2 to u8
 }
 
 /**
@@ -3974,13 +3955,13 @@ fn render_edge(ctx0: StackifyCtx, env: RenderEnv, target: u32, args: []u32, stop
     let params = env.blocks[target to u64].params
     let copied = match emit_edge_copies(ctx0, params, args) { StackifyCtx as c => c; error as e => return e }
     if edge_stop_matches(stop, target) {
-        return EdgeResult { ctx = copied; kind = edge_result_stop(); target = target }
+        return EdgeResult { ctx = copied; kind = EdgeResultKind::Stop; target = target }
     }
     let sd = wasm_scope_stack_depth_of(copied.scopes, target)
     if sd.found {
-        return EdgeResult { ctx = sc_br(copied, sd.depth); kind = edge_result_branch(); target = target }
+        return EdgeResult { ctx = sc_br(copied, sd.depth); kind = EdgeResultKind::Branch; target = target }
     }
-    EdgeResult { ctx = copied; kind = edge_result_more(); target = target }
+    EdgeResult { ctx = copied; kind = EdgeResultKind::More; target = target }
 }
 
 /**
@@ -3997,7 +3978,7 @@ fn render_edge(ctx0: StackifyCtx, env: RenderEnv, target: u32, args: []u32, stop
  */
 fn render_arm(ctx0: StackifyCtx, env: RenderEnv, target: u32, args: []u32, stop: EdgeStop) -> StackifyCtx | error {
     let er = match render_edge(ctx0, env, target, args, stop) { EdgeResult as r => r; error as e => return e }
-    if er.kind == edge_result_more() {
+    if er.kind == EdgeResultKind::More {
         return render_region(er.ctx, env, stop, er.target)
     }
     er.ctx
@@ -4035,7 +4016,7 @@ fn all_but_last(insts: []lir::LInst) -> []lir::LInst {
  */
 fn render_jump_terminator(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, j: lir::LJump) -> StackifyCtx | error {
     let er = match render_edge(ctx0, env, j.target, j.args, stop) { EdgeResult as r => r; error as e => return e }
-    if er.kind == edge_result_more() {
+    if er.kind == EdgeResultKind::More {
         return render_region(er.ctx, env, stop, er.target)
     }
     er.ctx
