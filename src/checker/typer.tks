@@ -2285,53 +2285,68 @@ fn member_const_symbol(type_canonical: str, member: str) -> str {
 }
 
 /**
- * resolve_member_const_decl — the nearest static member const named `seg` reachable from `owner`,
- * walking the base chain (a subclass inherits a base's member const by name; a nearer declaration
- * shadows a farther one — static hiding, D6) (#594 crumb 7). Returns null when no member const named
- * `seg` exists on the type or its bases. Struct/trait bodies read their own consts; a class reads its
- * EFFECTIVE (own + inherited-not-shadowed) set; any other body kind carries none.
+ * MemberConstHit — a resolved static member const TOGETHER WITH the type whose OWN body actually
+ * declares it (#594 crumb 7 visibility fix). Walking a subclass's base chain can resolve a const
+ * declared several levels up (`Sub::SECRET` reaching a `Base`-declared const); `private` reach must
+ * gate on THAT declaring type's namespace, never the path's leading (possibly-derived) type's — a
+ * private base const must not leak cross-namespace through an unrelated subclass's name.
  *
- * @param owner  the resolved leading type (struct/class/abstract/trait)
+ * @param cd         the resolved member const declaration
+ * @param declaring  the type whose OWN body declares `cd` (the nearest one — shadowing wins)
+ */
+type MemberConstHit = struct { cd: parser::ConstDecl; declaring: parser::TypeDecl }
+
+/**
+ * resolve_member_const_hit — the nearest static member const named `seg` reachable from `owner`,
+ * walking the base chain (a subclass inherits a base's member const by name; a nearer declaration
+ * shadows a farther one — static hiding, D6) (#594 crumb 7), together with the type that ACTUALLY
+ * declares it. Checks `owner`'s OWN consts FIRST (struct/class/trait bodies alike — shadowing), only
+ * recursing into a class's base when its own body declares no such name. Returns null when no member
+ * const named `seg` exists on the type or its bases.
+ *
+ * @param owner  the type to resolve from (struct/class/abstract/trait)
  * @param seg    the last path segment (the member const's name)
- * @param table  the type table (to follow the base chain + read each body's consts)
- * @return       the resolved member const declaration, or null when not found
+ * @param table  the type table (to follow a class's base chain)
+ * @return       the resolved const plus its actual declaring type, or null when not found
  * @since #594
  */
-fn resolve_member_const_decl(owner: parser::TypeDecl, seg: str, table: TypeTable) -> parser::ConstDecl? {
-    let eff = match owner.body {
-        parser::ClassBody as cb => match effective_class_consts(cb, table) { []parser::ConstDecl as c => c; error => return null }
-        parser::StructBody as sb => sb.consts
-        parser::TraitBody as tb => tb.consts
-        _ => return null
-    }
+fn resolve_member_const_hit(owner: parser::TypeDecl, seg: str, table: TypeTable) -> MemberConstHit? {
+    let own = body_consts(owner.body)
     mut i: u64 = 0
     loop {
-        if i >= eff.len { break }
-        if eff[i].name == seg { return eff[i] }
+        if i >= own.len { break }
+        if own[i].name == seg { return MemberConstHit { cd = own[i]; declaring = owner } }
         i++
     }
-    null
+    match owner.body {
+        parser::ClassBody as cb => {
+            if !cb.has_base { return null }
+            let base_decl = match type_table_find(table, cb.base_name, "") { parser::TypeDecl as td => td; error => return null }
+            resolve_member_const_hit(base_decl, seg, table)
+        }
+        _ => null
+    }
 }
 
 /**
  * member_const_visible — enforce a static member const's reach at a `TypeName::NAME` use site (#594
- * crumb 7): a `Private` member const is reachable ONLY from its declaring module (namespace); `Pub`
- * and `Exp` reach across namespaces (the `Exp` public-ABI distinction is exercised cross-module at
- * crumb 8). Mirrors the field/method visibility rules.
+ * crumb 7): a `Private` member const is reachable ONLY from its DECLARING module's namespace — NEVER
+ * the path's leading type's namespace, so `Sub::SECRET` (a private const declared on a `Base` in a
+ * different namespace) is rejected even though `Sub` inherits the name. `Pub`/`Exp` reach across
+ * namespaces (the `Exp` public-ABI distinction is exercised cross-module at crumb 8).
  *
- * @param mcd     the resolved member const declaration
- * @param owner   the type declaration that owns (or inherits) it
- * @param table   the type table (to read the owner's namespace)
+ * @param hit     the resolved member const + its actual declaring type
+ * @param table   the type table (to read the declaring type's namespace)
  * @param ref_ns  the namespace the `TypeName::NAME` reference is written in
  * @return        null when the access is allowed, else a located visibility error
  * @since #594
  */
-fn member_const_visible(mcd: parser::ConstDecl, owner: parser::TypeDecl, table: TypeTable, ref_ns: str) -> error? {
-    match mcd.vis {
+fn member_const_visible(hit: MemberConstHit, table: TypeTable, ref_ns: str) -> error? {
+    match hit.cd.vis {
         parser::Visibility::Private => {
-            let owner_ns = type_ns_of(table, owner.name)
-            if owner_ns != ref_ns {
-                return teko::error::err_loc(error { message = $"member const `{mcd.name}` is private to `{owner.name}` — mark it `pub`/`exp` to use it from another module" }, mcd.line, mcd.col)
+            let decl_ns = type_ns_of(table, hit.declaring.name)
+            if decl_ns != ref_ns {
+                return teko::error::err_loc(error { message = $"member const `{hit.cd.name}` is private to `{hit.declaring.name}` — mark it `pub`/`exp` to use it from another module" }, hit.cd.line, hit.cd.col)
             }
             null
         }
@@ -2342,9 +2357,11 @@ fn member_const_visible(mcd: parser::ConstDecl, owner: parser::TypeDecl, table: 
 /**
  * find_member_const — resolve `TypeName::NAME` to a REFERENCE to its static member const (#594 crumb
  * 7): a `TVar` bound to the hoisted const's program-unique name (the same name `type_type_member_consts`
- * emits), typed with the const's declared type. The inliner then substitutes a scalar's value or the
- * aggregate's rodata address. Returns null when no such member const exists, so `type_path_expr`
- * falls through to the enum-member arm.
+ * emits, keyed on the PATH's leading type — the hoist re-materializes an inherited const once per
+ * owning type, exactly like an inherited method is re-emitted per class), typed with the const's
+ * declared type. The inliner then substitutes a scalar's value or the aggregate's rodata address.
+ * Returns null when no such member const exists, so `type_path_expr` falls through to the enum-member
+ * arm.
  *
  * @param owner  the resolved leading type (struct/class/abstract/trait)
  * @param seg    the last path segment (the member const's name)
@@ -2353,9 +2370,9 @@ fn member_const_visible(mcd: parser::ConstDecl, owner: parser::TypeDecl, table: 
  * @since #594
  */
 fn find_member_const(owner: parser::TypeDecl, seg: str, table: TypeTable) -> TExpr? {
-    let cd = match resolve_member_const_decl(owner, seg, table) { parser::ConstDecl as c => c; null => return null }
+    let hit = match resolve_member_const_hit(owner, seg, table) { MemberConstHit as h => h; null => return null }
     let owner_ns = type_ns_of(table, owner.name)
-    let rty = match resolve_type(cd.ty, table, owner_ns) { Type as t => t; error => return null }
+    let rty = match resolve_type(hit.cd.ty, table, owner_ns) { Type as t => t; error => return null }
     let sym = member_const_symbol(qualify(owner_ns, owner.name), seg)
     TExpr { kind = TVar { name = sym; is_func = false; func_ns = "" }; type = rty; line = 0; col = 0 }
 }
@@ -2386,9 +2403,9 @@ fn type_path_expr(pe: parser::PathExpr, table: TypeTable, ref_ns: str) -> TExpr 
     let et = match resolve_named(parser::Path { segments = segs }, table, ref_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the expression's enclosing namespace
     let tname = match et { Named as n => n.name; _ => return error { message = "`Type::Member` requires a named enum or flags type" } }
     let decl = match type_table_find(table, tname, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
-    match resolve_member_const_decl(decl, member, table) {
-        parser::ConstDecl as mcd => {
-            match member_const_visible(mcd, decl, table, ref_ns) { error as e => return e; null => { } }
+    match resolve_member_const_hit(decl, member, table) {
+        MemberConstHit as hit => {
+            match member_const_visible(hit, table, ref_ns) { error as e => return e; null => { } }
             match find_member_const(decl, member, table) { TExpr as mref => return mref; null => { } }
         }
         null => { }
