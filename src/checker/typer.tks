@@ -1411,6 +1411,24 @@ fn is_char_decode_target(t: Type) -> bool {
     }
 }
 
+/**
+ * is_flags_wire_cast — E8 (#594 crumb 11): is `from -> to` a flags ↔ integer WIRE
+ * cast? A flags value's raw bit pattern → an integer (an object-writer
+ * `sh_flags`/`Characteristics` field needs the combined mask as a plain `uN`), or
+ * an integer → a flags value. `cast_check` is prim-only, so `type_cast` handles
+ * this pair directly — mirroring E7's enum-ordinal cast. Any OTHER flags cast
+ * stays rejected by `cast_check`.
+ *
+ * @param from   the cast's source type
+ * @param to     the cast's target type
+ * @param table  the type table (to detect a flags-declared Named type)
+ * @return       true iff the pair is a flags↔integer wire cast
+ */
+fn is_flags_wire_cast(from: Type, to: Type, table: TypeTable) -> bool {
+    (is_flags_named(from, table) && is_int_cast_end(to)) ||
+    (is_int_cast_end(from) && is_flags_named(to, table))
+}
+
 fn type_cast(c: parser::Cast, env: Env, table: TypeTable) -> TExpr | error {
     let inner = match type_expr(c.expr, env, table) { TExpr as te => te; error as e => return e }
     if type_is_void(inner.type) { return error { message = "a `void` expression cannot be cast (M.1)" } }
@@ -1433,7 +1451,8 @@ fn type_cast(c: parser::Cast, env: Env, table: TypeTable) -> TExpr | error {
     // target. Any OTHER enum cast stays rejected by cast_check. (Mirrors expr.c type_cast's e7.)
     let e7 = (is_enum_named(inner.type, table) && is_int_cast_end(target)) ||
     (is_int_cast_end(inner.type) && is_enum_named(target, table))
-    if !e7 {
+    let e8 = is_flags_wire_cast(inner.type, target, table)
+    if !e7 && !e8 {
         match cast_check(inner.type, target) { null => { }; error as e => return e }
     }
     match const_range_check(c.expr, target) { null => { }; error as e => return e }

@@ -3223,14 +3223,91 @@ fn flags_unknown_method_is_error() {
     }
 }
 
+/**
+ * flags_wrong_arg_type_is_error — `has()` called with an `i64` (not the same
+ * flags type as the receiver) must fail.
+ */
 #test
 fn flags_wrong_arg_type_is_error() {
-    // has() called with an i64 (not the same flags type) -- must fail.
     let call = perm_method_call("has", e_num(1))
     let items = teko::list::push(teko::list::push(teko::list::empty(), perm_item()), parser::Item { content = perm_bind_p(); namespace = ""; file = "" })
     let items2 = teko::list::push(items, parser::Item { content = call; namespace = ""; file = "" })
     match type_program(parser::Program { items = items2 }) {
-        TProgram => teko::assert::is_true(false)   // must fail
+        TProgram => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+/**
+ * perm_cast_to_u32 — build `Perm::<member> to u32` as a loose top-level
+ * statement, exercising the E8 flags→integer wire cast (#594 crumb 11).
+ *
+ * @param member  the flags member name (`"Read"`/`"Write"`)
+ * @return        the cast expression, wrapped as a statement
+ */
+fn perm_cast_to_u32(member: str) -> parser::Statement {
+    st(ek(parser::Cast { expr = perm_member(member); target = named_t("u32") }))
+}
+
+/**
+ * perm_cast_from_u32 — build `1 to Perm` as a loose top-level statement,
+ * exercising the E8 integer→flags wire cast (#594 crumb 11).
+ *
+ * @return  the cast expression, wrapped as a statement
+ */
+fn perm_cast_from_u32() -> parser::Statement {
+    st(ek(parser::Cast { expr = e_num(1); target = named_t("Perm") }))
+}
+
+/**
+ * perm_cast_to_bool — build `Perm::Read to bool` as a loose top-level
+ * statement: neither the E7 enum-ordinal nor the E8 flags-wire cast pair
+ * covers a flags→bool target, so this must stay a compile error.
+ *
+ * @return  the cast expression, wrapped as a statement
+ */
+fn perm_cast_to_bool() -> parser::Statement {
+    st(ek(parser::Cast { expr = perm_member("Read"); target = named_t("bool") }))
+}
+
+/**
+ * flags_to_int_cast_type_checks — E8 (#594 crumb 11): a flags value casts to
+ * its raw integer wire value.
+ */
+#test
+fn flags_to_int_cast_type_checks() {
+    let items = teko::list::push(teko::list::empty(), perm_item())
+    let items2 = teko::list::push(items, parser::Item { content = perm_cast_to_u32("Read"); namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(true)
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * int_to_flags_cast_type_checks — E8 (#594 crumb 11): an integer literal casts
+ * to a flags-typed value.
+ */
+#test
+fn int_to_flags_cast_type_checks() {
+    let items = teko::list::push(teko::list::empty(), perm_item())
+    let items2 = teko::list::push(items, parser::Item { content = perm_cast_from_u32(); namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(true)
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * flags_to_bool_cast_is_error — a flags value cast to `bool` matches neither
+ * E7 nor E8 and stays rejected by `cast_check`.
+ */
+#test
+fn flags_to_bool_cast_is_error() {
+    let items = teko::list::push(teko::list::empty(), perm_item())
+    let items2 = teko::list::push(items, parser::Item { content = perm_cast_to_bool(); namespace = ""; file = "" })
+    match type_program(parser::Program { items = items2 }) {
+        TProgram => teko::assert::is_true(false)
         error => teko::assert::is_true(true)
     }
 }
