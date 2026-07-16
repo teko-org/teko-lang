@@ -1,41 +1,34 @@
 use teko::lir
 
 /**
- * wasm_vt_i32 — the `i32` wasm value-type byte (`0x7F`), the valtype every
- * sub-32 integer width (`I8`/`I16`/`I32`) and `Ptr` collapse to in wasm32
- * (`backend-c1-wasm.md` §1.1).
- *
- * @return u8  the `i32` valtype byte
+ * WasmVType — the four wasm value types `stackify` ever produces: `I32`
+ * (the valtype every sub-32 integer width — `I8`/`I16`/`I32` — and `Ptr`
+ * collapse to in wasm32, `backend-c1-wasm.md` §1.1), `I64`, `F32`, `F64`.
+ * The declaration ordinal (0,1,2,3) does NOT match the wasm binary format's
+ * own value-type bytes (`0x7F`/`0x7E`/`0x7D`/`0x7C`), so every internal
+ * comparison/dispatch uses this enum directly — `wasm_vtype_wire` is the
+ * single translation point that produces the raw wire byte.
  */
-fn wasm_vt_i32() -> u8 {
-    0x7F to u8
-}
+pub type WasmVType = enum { I32; I64; F32; F64 }
 
 /**
- * wasm_vt_i64 — the `i64` wasm value-type byte (`0x7E`).
+ * wasm_vtype_wire — the wasm binary value-type byte (`backend-c1-wasm.md`
+ * §1.1) a `WasmVType` tag encodes to: `I32` → `0x7F`, `I64` → `0x7E`, `F32`
+ * → `0x7D`, `F64` → `0x7C`. The single wire-mapping function for this
+ * family (§594 crumb 10's `_wire` convention) — every other site in this
+ * file operates on the `WasmVType` tag, or on the already-produced wire
+ * byte threaded through `WasmVTypeTable`/`WasmMemOp`/`WasmLocalGroup`.
  *
- * @return u8  the `i64` valtype byte
+ * @param v  the value-type tag
+ * @return   the wasm value-type byte
  */
-fn wasm_vt_i64() -> u8 {
-    0x7E to u8
-}
-
-/**
- * wasm_vt_f32 — the `f32` wasm value-type byte (`0x7D`).
- *
- * @return u8  the `f32` valtype byte
- */
-fn wasm_vt_f32() -> u8 {
-    0x7D to u8
-}
-
-/**
- * wasm_vt_f64 — the `f64` wasm value-type byte (`0x7C`).
- *
- * @return u8  the `f64` valtype byte
- */
-fn wasm_vt_f64() -> u8 {
-    0x7C to u8
+fn wasm_vtype_wire(v: WasmVType) -> u8 {
+    match v {
+        I32 => 0x7F to u8
+        I64 => 0x7E to u8
+        F32 => 0x7D to u8
+        F64 => 0x7C to u8
+    }
 }
 
 /**
@@ -63,15 +56,15 @@ fn wasm_vt_f64() -> u8 {
  */
 pub fn wasm_valtype(t: lir::LType, ptr64: bool) -> u8 | error {
     match t {
-        lir::LType::I8 => wasm_vt_i32()
-        lir::LType::I16 => wasm_vt_i32()
-        lir::LType::I32 => wasm_vt_i32()
-        lir::LType::I64 => wasm_vt_i64()
+        lir::LType::I8 => wasm_vtype_wire(WasmVType::I32)
+        lir::LType::I16 => wasm_vtype_wire(WasmVType::I32)
+        lir::LType::I32 => wasm_vtype_wire(WasmVType::I32)
+        lir::LType::I64 => wasm_vtype_wire(WasmVType::I64)
         lir::LType::I128 => error { message = "stackify: C1-i128 — wasm has no native i128 valtype, deferred (shared with A2's i128 route, backend-a4-encoder.md §6.3)" }
         lir::LType::F16 => error { message = "stackify: C1-f16 — wasm has no native f16 valtype, deferred (matches the register targets' f16 gap)" }
-        lir::LType::F32 => wasm_vt_f32()
-        lir::LType::F64 => wasm_vt_f64()
-        lir::LType::Ptr => if ptr64 { wasm_vt_i64() } else { wasm_vt_i32() }
+        lir::LType::F32 => wasm_vtype_wire(WasmVType::F32)
+        lir::LType::F64 => wasm_vtype_wire(WasmVType::F64)
+        lir::LType::Ptr => if ptr64 { wasm_vtype_wire(WasmVType::I64) } else { wasm_vtype_wire(WasmVType::I32) }
         lir::LType::Void => error { message = "stackify: wasm_valtype — a Void machine class has no wasm value type (internal)" }
     }
 }
@@ -118,7 +111,7 @@ fn wvt_grow(t: WasmVTypeTable, n: u64) -> WasmVTypeTable {
     mut vts = t.vtypes
     loop {
         if vts.len >= n { break }
-        vts = teko::list::push(vts, wasm_vt_i32())
+        vts = teko::list::push(vts, wasm_vtype_wire(WasmVType::I32))
     }
     WasmVTypeTable { vtypes = vts }
 }
@@ -157,7 +150,7 @@ fn wvt_set(t0: WasmVTypeTable, id: u32, vt: u8) -> WasmVTypeTable {
  */
 fn wvt_get(t: WasmVTypeTable, id: u32) -> u8 {
     let i = id to u64
-    if i >= t.vtypes.len { return wasm_vt_i32() }
+    if i >= t.vtypes.len { return wasm_vtype_wire(WasmVType::I32) }
     t.vtypes[i]
 }
 
@@ -827,7 +820,7 @@ pub fn wasm_sp_global_index() -> u32 {
  * @return WasmGlobal  the `SP` global declaration
  */
 pub fn wasm_sp_global(init: i64) -> WasmGlobal {
-    WasmGlobal { valtype = wasm_vt_i32(); mutable = true; init = init }
+    WasmGlobal { valtype = wasm_vtype_wire(WasmVType::I32); mutable = true; init = init }
 }
 
 /**
@@ -1172,7 +1165,7 @@ fn compute_wasm_frame_layout(allocas: []lir::LInst) -> WasmFrameLayout {
  * @return StackifyCtx  the advanced, frame-recording context
  */
 fn emit_frame_prologue(ctx0: StackifyCtx, layout: WasmFrameLayout) -> StackifyCtx {
-    let reserved = sc_alloc_scratch(ctx0, wasm_vt_i32())
+    let reserved = sc_alloc_scratch(ctx0, wasm_vtype_wire(WasmVType::I32))
     let ctx1 = sc_global_get(reserved.ctx, wasm_sp_global_index())
     let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), layout.frame_size to i64)
     let ctx3 = sc_byte(ctx2, 0x6B to byte)
@@ -1415,13 +1408,13 @@ type WasmMemOp = struct {
  */
 fn wasm_mem_op(t: lir::LType) -> WasmMemOp | error {
     match t {
-        lir::LType::I8 => WasmMemOp { load_op = 0x2D to byte; store_op = 0x3A to byte; align = 0 to u32; valtype = wasm_vt_i32() }
-        lir::LType::I16 => WasmMemOp { load_op = 0x2F to byte; store_op = 0x3B to byte; align = 1 to u32; valtype = wasm_vt_i32() }
-        lir::LType::I32 => WasmMemOp { load_op = 0x28 to byte; store_op = 0x36 to byte; align = 2 to u32; valtype = wasm_vt_i32() }
-        lir::LType::I64 => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vt_i64() }
-        lir::LType::Ptr => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vt_i64() }
-        lir::LType::F32 => WasmMemOp { load_op = 0x2A to byte; store_op = 0x38 to byte; align = 2 to u32; valtype = wasm_vt_f32() }
-        lir::LType::F64 => WasmMemOp { load_op = 0x2B to byte; store_op = 0x39 to byte; align = 3 to u32; valtype = wasm_vt_f64() }
+        lir::LType::I8 => WasmMemOp { load_op = 0x2D to byte; store_op = 0x3A to byte; align = 0 to u32; valtype = wasm_vtype_wire(WasmVType::I32) }
+        lir::LType::I16 => WasmMemOp { load_op = 0x2F to byte; store_op = 0x3B to byte; align = 1 to u32; valtype = wasm_vtype_wire(WasmVType::I32) }
+        lir::LType::I32 => WasmMemOp { load_op = 0x28 to byte; store_op = 0x36 to byte; align = 2 to u32; valtype = wasm_vtype_wire(WasmVType::I32) }
+        lir::LType::I64 => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vtype_wire(WasmVType::I64) }
+        lir::LType::Ptr => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vtype_wire(WasmVType::I64) }
+        lir::LType::F32 => WasmMemOp { load_op = 0x2A to byte; store_op = 0x38 to byte; align = 2 to u32; valtype = wasm_vtype_wire(WasmVType::F32) }
+        lir::LType::F64 => WasmMemOp { load_op = 0x2B to byte; store_op = 0x39 to byte; align = 3 to u32; valtype = wasm_vtype_wire(WasmVType::F64) }
         lir::LType::I128 => error { message = "stackify: C1-i128 — an i128 memory access has no wasm valtype, deferred (shared with A2's i128 route)" }
         lir::LType::F16 => error { message = "stackify: C1-f16 — an f16 memory access has no wasm valtype, deferred (matches the register targets' f16 gap)" }
         lir::LType::Void => error { message = "stackify: a void-typed memory access is malformed (internal)" }
@@ -1465,7 +1458,7 @@ fn wasm_narrow_threshold() -> i64 {
  *                       on the operand stack
  */
 fn stackify_narrow_ptr_load(ctx0: StackifyCtx, panic_ix: u32) -> StackifyCtx {
-    let alloc = sc_alloc_scratch(ctx0, wasm_vt_i64())
+    let alloc = sc_alloc_scratch(ctx0, wasm_vtype_wire(WasmVType::I64))
     let ctx1 = sc_local_tee(alloc.ctx, alloc.id)
     let ctx2 = sc_sleb(sc_byte(ctx1, 0x42 to byte), wasm_narrow_threshold())
     let ctx3 = sc_byte(ctx2, 0x5A to byte)
@@ -1497,7 +1490,7 @@ fn stackify_const_int(ctx0: StackifyCtx, inst: lir::LInst, c: lir::LConstInt) ->
     }
     let narrow = stackify_fits_i32(c.val)
     let op = if narrow { 0x41 to byte } else { 0x42 to byte }
-    let vt = if narrow { wasm_vt_i32() } else { wasm_vt_i64() }
+    let vt = if narrow { wasm_vtype_wire(WasmVType::I32) } else { wasm_vtype_wire(WasmVType::I64) }
     let ctx1 = sc_sleb(sc_byte(ctx0, op), c.val to i64)
     sc_def_result(ctx1, inst.result, vt)
 }
@@ -1516,7 +1509,7 @@ fn stackify_const_int(ctx0: StackifyCtx, inst: lir::LInst, c: lir::LConstInt) ->
  */
 fn stackify_const_float(ctx0: StackifyCtx, inst: lir::LInst, c: lir::LConstFloat) -> StackifyCtx {
     let ctx1 = sc_f64_bits(sc_byte(ctx0, 0x44 to byte), c.bits)
-    sc_def_result(ctx1, inst.result, wasm_vt_f64())
+    sc_def_result(ctx1, inst.result, wasm_vtype_wire(WasmVType::F64))
 }
 
 /**
@@ -1606,11 +1599,11 @@ fn wasm_binop_info(op: lir::LBinOp, wide: bool) -> WasmBinOpInfo {
  */
 fn stackify_bin(ctx0: StackifyCtx, inst: lir::LInst, b: lir::LBin) -> StackifyCtx {
     let a_vt = wvt_get(ctx0.vtypes, b.a)
-    let wide = a_vt == wasm_vt_i64() || a_vt == wasm_vt_f64()
+    let wide = a_vt == wasm_vtype_wire(WasmVType::I64) || a_vt == wasm_vtype_wire(WasmVType::F64)
     let info = wasm_binop_info(b.op, wide)
     let ctx2 = sc_use_operands(ctx0, [b.a, b.b])
     let ctx3 = sc_byte(ctx2, info.opcode)
-    let dst_vt = if info.is_cmp { wasm_vt_i32() } else { a_vt }
+    let dst_vt = if info.is_cmp { wasm_vtype_wire(WasmVType::I32) } else { a_vt }
     sc_def_result(ctx3, inst.result, dst_vt)
 }
 
@@ -1628,7 +1621,7 @@ fn stackify_bin(ctx0: StackifyCtx, inst: lir::LInst, b: lir::LBin) -> StackifyCt
  * @return StackifyCtx  the advanced context
  */
 fn stackify_ineg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let wide = a_vt == wasm_vt_i64()
+    let wide = a_vt == wasm_vtype_wire(WasmVType::I64)
     let const_op = if wide { 0x42 to byte } else { 0x41 to byte }
     let sub_op = if wide { 0x7D to byte } else { 0x6B to byte }
     let ctx1 = sc_sleb(sc_byte(ctx0, const_op), 0 to i64)
@@ -1649,7 +1642,7 @@ fn stackify_ineg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  * @return StackifyCtx  the advanced context
  */
 fn stackify_inot(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let wide = a_vt == wasm_vt_i64()
+    let wide = a_vt == wasm_vtype_wire(WasmVType::I64)
     let const_op = if wide { 0x42 to byte } else { 0x41 to byte }
     let xor_op = if wide { 0x85 to byte } else { 0x73 to byte }
     let ctx1 = sc_sleb(sc_byte(ctx0, const_op), -1 to i64)
@@ -1669,7 +1662,7 @@ fn stackify_inot(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  * @return StackifyCtx  the advanced context
  */
 fn stackify_fneg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let op = if a_vt == wasm_vt_f64() { 0x9A to byte } else { 0x8C to byte }
+    let op = if a_vt == wasm_vtype_wire(WasmVType::F64) { 0x9A to byte } else { 0x8C to byte }
     let ctx1 = sc_byte(sc_use_operand(ctx0, a), op)
     sc_def_result(ctx1, inst.result, a_vt)
 }
@@ -1689,8 +1682,8 @@ fn stackify_fneg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  */
 fn stackify_trunc(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
     let ctx1 = sc_use_operand(ctx0, a)
-    let ctx2 = if a_vt == wasm_vt_i64() { sc_byte(ctx1, 0xA7 to byte) } else { ctx1 }
-    sc_def_result(ctx2, inst.result, wasm_vt_i32())
+    let ctx2 = if a_vt == wasm_vtype_wire(WasmVType::I64) { sc_byte(ctx1, 0xA7 to byte) } else { ctx1 }
+    sc_def_result(ctx2, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -1726,9 +1719,9 @@ fn stackify_identity(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> S
  * @return StackifyCtx  the advanced context
  */
 fn stackify_itof(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let op = if a_vt == wasm_vt_i64() { 0xB9 to byte } else { 0xB7 to byte }
+    let op = if a_vt == wasm_vtype_wire(WasmVType::I64) { 0xB9 to byte } else { 0xB7 to byte }
     let ctx1 = sc_byte(sc_use_operand(ctx0, a), op)
-    sc_def_result(ctx1, inst.result, wasm_vt_f64())
+    sc_def_result(ctx1, inst.result, wasm_vtype_wire(WasmVType::F64))
 }
 
 /**
@@ -1744,9 +1737,9 @@ fn stackify_itof(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  * @return StackifyCtx  the advanced context
  */
 fn stackify_ftoi(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let op = if a_vt == wasm_vt_f64() { 0xAA to byte } else { 0xA8 to byte }
+    let op = if a_vt == wasm_vtype_wire(WasmVType::F64) { 0xAA to byte } else { 0xA8 to byte }
     let ctx1 = sc_byte(sc_use_operand(ctx0, a), op)
-    sc_def_result(ctx1, inst.result, wasm_vt_i32())
+    sc_def_result(ctx1, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -1763,9 +1756,9 @@ fn stackify_ftoi(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  * @return StackifyCtx  the advanced context
  */
 fn stackify_ftof(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let demote = a_vt == wasm_vt_f64()
+    let demote = a_vt == wasm_vtype_wire(WasmVType::F64)
     let op = if demote { 0xB6 to byte } else { 0xBB to byte }
-    let dst_vt = if demote { wasm_vt_f32() } else { wasm_vt_f64() }
+    let dst_vt = if demote { wasm_vtype_wire(WasmVType::F32) } else { wasm_vtype_wire(WasmVType::F64) }
     let ctx1 = sc_byte(sc_use_operand(ctx0, a), op)
     sc_def_result(ctx1, inst.result, dst_vt)
 }
@@ -1860,7 +1853,7 @@ fn stackify_field_addr(ctx0: StackifyCtx, inst: lir::LInst, fa: lir::LFieldAddr)
     let ctx1 = sc_use_operand(ctx0, fa.base)
     let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), fa.offset to i64)
     let ctx3 = sc_byte(ctx2, 0x6A to byte)
-    sc_def_result(ctx3, inst.result, wasm_vt_i32())
+    sc_def_result(ctx3, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -1883,7 +1876,7 @@ fn stackify_alloca(ctx0: StackifyCtx, inst: lir::LInst) -> StackifyCtx {
     let ctx1 = sc_local_get(ctx0, ctx0.frame_base)
     let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), off to i64)
     let ctx3 = sc_byte(ctx2, 0x6A to byte)
-    sc_def_result(ctx3, inst.result, wasm_vt_i32())
+    sc_def_result(ctx3, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -1918,7 +1911,7 @@ fn stackify_load(ctx0: StackifyCtx, inst: lir::LInst, l: lir::LLoad, ptr64: bool
     if l.ty == lir::LType::Ptr && !ptr64 {
         let panic_target = match wasm_resolve_call(symbols, "tk_panic_str") { WasmCallTarget as t => t; error as e => return e }
         let narrowed = stackify_narrow_ptr_load(ctx3, panic_target.func_index)
-        return sc_def_result(narrowed, inst.result, wasm_vt_i32())
+        return sc_def_result(narrowed, inst.result, wasm_vtype_wire(WasmVType::I32))
     }
     sc_def_result(ctx3, inst.result, mem.valtype)
 }
@@ -2142,7 +2135,7 @@ fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, 
 fn stackify_global_addr(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, g: lir::LGlobalAddr) -> StackifyCtx | error {
     let off = match wasm_resolve_data(symbols, g.symbol) { u32 as o => o; error as e => return e }
     let ctx1 = sc_sleb(sc_byte(ctx0, 0x41 to byte), off to i64)
-    sc_def_result(ctx1, inst.result, wasm_vt_i32())
+    sc_def_result(ctx1, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -5248,7 +5241,7 @@ fn wasm_program_memory_plan(lmod: lir::LModule, rodata: WasmRodataLayout) -> Was
         return WasmMemoryPlan { rodata = rodata; globals = teko::list::empty(); mem_min_pages = wasm_mem_pages_for(rodata_top) }
     }
     let sp_init = rodata_top + wasm_stack_region_bytes()
-    let sp_global = WasmGlobal { valtype = wasm_vt_i32(); mutable = true; init = sp_init to i64 }
+    let sp_global = WasmGlobal { valtype = wasm_vtype_wire(WasmVType::I32); mutable = true; init = sp_init to i64 }
     WasmMemoryPlan { rodata = rodata; globals = [sp_global]; mem_min_pages = wasm_mem_pages_for(sp_init) }
 }
 
