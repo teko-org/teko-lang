@@ -633,7 +633,7 @@ pointer (a slice/pointer field) needs a reloc the toolchain cannot emit.
 
 | Backend / writer | honest-stop (gates `m.globals` only) | Tier A (scalar + flat-POD + `[]byte`) | Tier B (pointer/slice-bearing) |
 |---|---|---|---|
-| C backend (`--backend=c`) | — | none (emit `static const` + reference; strings already do) | data-init pointer resolvable in C init, but see VM/native — sequence with them |
+| C backend (`--backend=c`) | — | none (INLINE-AT-USE: `inline_aggregate_consts` substitutes a clone of the checked initializer at every use; the decl stays a no-op residual — NOT a `static const`, since a runtime-allocated `[]T`/aggregate has no C static initializer, #607) | data-init pointer resolvable in C init, but see VM/native — sequence with them |
 | x86_64 (`encode_x86_64.tks`) | `honest_globals_x86` (`:1495`) | none (text→rodata load exists) | **widen `RelocX86` with a patch-site SECTION tag + emit data-section relocs** |
 | arm64 (`encode_arm64.tks`) | `honest_globals`/`A4-globals` (`:1858`) | none | **same: data-section reloc emission** |
 | riscv64 (`encode_riscv.tks`) | `honest_globals_riscv` (`:1684`) | none | **same** |
