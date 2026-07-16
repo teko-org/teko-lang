@@ -173,12 +173,11 @@ fn wvt_get(t: WasmVTypeTable, id: u32) -> u8 {
  */
 pub type WasmScope = struct {
     /**
-     * kind — `wasm_scope_kind_block()` (label at its `end`, a forward
-     * exit), `wasm_scope_kind_loop()` (label at its start, a back-edge/
-     * continue), or `wasm_scope_kind_if()` (a structural diamond, never a
-     * `br` target — it only occupies a depth slot).
+     * kind — `Block` (label at its `end`, a forward exit), `Loop` (label at
+     * its start, a back-edge/continue), or `If` (a structural diamond,
+     * never a `br` target — it only occupies a depth slot).
      */
-    kind: u8
+    kind: WasmScopeKind
     /**
      * label_block — the LIR block id this scope's label targets
      * (meaningful for `block`/`loop`; unused, always `0`, for `if`).
@@ -187,45 +186,25 @@ pub type WasmScope = struct {
 }
 
 /**
- * wasm_scope_kind_block — the `WasmScope.kind` tag for an `if`-free forward
- * label scope (a wrapped loop exit, or a `br` skip-ahead target).
- *
- * @return u8  the `block` scope-kind tag
+ * WasmScopeKind — the tag `WasmScope.kind` carries: `Block` (an `if`-free
+ * forward label scope — a wrapped loop exit, or a `br` skip-ahead target),
+ * `Loop` (a loop scope; a `br` to it is the back-edge/continue), or `If` (an
+ * `if`/`else` structural diamond — it occupies a depth slot but is never a
+ * `br` target, its own fallthrough IS the merge). Purely an internal
+ * control-flow tag — never serialized to wasm bytes — so no wire mapping is
+ * needed.
  */
-fn wasm_scope_kind_block() -> u8 {
-    0 to u8
-}
-
-/**
- * wasm_scope_kind_loop — the `WasmScope.kind` tag for a loop scope (a `br`
- * to it is the back-edge/continue).
- *
- * @return u8  the `loop` scope-kind tag
- */
-fn wasm_scope_kind_loop() -> u8 {
-    1 to u8
-}
-
-/**
- * wasm_scope_kind_if — the `WasmScope.kind` tag for an `if`/`else`
- * structural diamond: it occupies a depth slot but is never a `br` target
- * (its own fallthrough IS the merge).
- *
- * @return u8  the `if` scope-kind tag
- */
-fn wasm_scope_kind_if() -> u8 {
-    2 to u8
-}
+pub type WasmScopeKind = enum { Block; Loop; If }
 
 /**
  * wasm_scope_stack_push — open a new scope on top of `scopes`.
  *
  * @param []WasmScope scopes  the scope stack to extend
- * @param u8 kind  the new scope's kind (`wasm_scope_kind_*`)
+ * @param WasmScopeKind kind  the new scope's kind
  * @param u32 label_block  the new scope's label target (unused for `if`)
  * @return []WasmScope  the extended stack, the new scope innermost
  */
-fn wasm_scope_stack_push(scopes: []WasmScope, kind: u8, label_block: u32) -> []WasmScope {
+fn wasm_scope_stack_push(scopes: []WasmScope, kind: WasmScopeKind, label_block: u32) -> []WasmScope {
     teko::list::push(scopes, WasmScope { kind = kind; label_block = label_block })
 }
 
@@ -280,7 +259,7 @@ fn wasm_scope_stack_depth_of(scopes: []WasmScope, label_block: u32) -> ScopeDept
     loop {
         if i >= scopes.len { break }
         let s = scopes[i]
-        let is_label = s.kind == wasm_scope_kind_block() || s.kind == wasm_scope_kind_loop()
+        let is_label = s.kind == WasmScopeKind::Block || s.kind == WasmScopeKind::Loop
         if is_label && s.label_block == label_block {
             return ScopeDepthResult { found = true; depth = ((scopes.len - 1) - i) to u32 }
         }
@@ -945,7 +924,7 @@ fn wasm_blocktype_void() -> byte {
  */
 fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x02 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_block(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, WasmScopeKind::Block, label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
 }
 
 /**
@@ -959,7 +938,7 @@ fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
  */
 fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x03 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_loop(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, WasmScopeKind::Loop, label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
 }
 
 /**
@@ -973,7 +952,7 @@ fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
  */
 fn sc_open_if(ctx: StackifyCtx) -> StackifyCtx {
     let opened = sc_byte(sc_byte(ctx, 0x04 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_if(), 0 to u32); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, WasmScopeKind::If, 0 to u32); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
 }
 
 /**
