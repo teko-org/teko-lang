@@ -429,6 +429,80 @@ fn seed_from_dep_hides_private_module_const() {
     }
 }
 
+/**
+ * inline_uses_project_const_over_same_name_dep_const — the c8b dep↔project collision: a dep exports
+ * `pub const P` (value 120, namespace "m1") AND the project declares its OWN `const P` (value 9,
+ * namespace "app"). A bare `P` in the project resolves (tail-first) to the project const, so
+ * `type_var` stamps `func_ns = "app"`; the `(name, namespace)`-keyed inliner must therefore
+ * substitute 9 (the project value), NOT 120 (the dep value the OLD name-only inliner returned as the
+ * first hit). Guards the silent cross-module miscompile (#594 crumb 8b).
+ */
+#test
+fn inline_uses_project_const_over_same_name_dep_const() {
+    let uses_p = mk_fn("uses_p", named_t("i64"), one_stmt(e_var("P")))
+    let proj_p = parser::ConstDecl { name = "P"; ty = named_t("i64"); init = e_num(9); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    let const_item = parser::Item { content = proj_p; namespace = "app"; file = "app.tks" }
+    let fn_item = parser::Item { content = uses_p; namespace = "app"; file = "app.tks" }
+    let items = teko::list::push(teko::list::push(teko::list::empty(), const_item), fn_item)
+    match type_program_with_deps(parser::Program { items = items }, dep_prog_with_const("P", parser::Visibility::Pub)) {
+        TProgram as tp => {
+            mut found = false
+            mut i: u64 = 0
+            loop {
+                if i >= tp.items.len { break }
+                match tp.items[i] {
+                    TFunction as f => if f.name == "uses_p" {
+                        found = true
+                        match f.body[0] {
+                            TExprStmt as es => match es.expr.kind { TNumber as n => teko::assert::is_true(n.value == 9); _ => teko::assert::is_true(false) }
+                            _ => teko::assert::is_true(false)
+                        }
+                    }
+                    _ => { }
+                }
+                i++
+            }
+            teko::assert::is_true(found)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * inline_falls_back_to_dep_const_when_project_has_none — the symmetric c8b case: the project has NO
+ * `P`, so a bare `P` in the project (namespace "app") resolves to the dep's exported `pub const P`
+ * (value 120, namespace "m1") and `type_var` stamps `func_ns = "m1"`. The `(name, namespace)`-keyed
+ * inliner still surfaces the dep value 120 — the keying only DISAMBIGUATES a real duplicate; a single
+ * candidate is matched by its own namespace exactly as before (#594 crumb 8b).
+ */
+#test
+fn inline_falls_back_to_dep_const_when_project_has_none() {
+    let uses_p = mk_fn("uses_p", named_t("i64"), one_stmt(e_var("P")))
+    let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = uses_p; namespace = "app"; file = "app.tks" })
+    match type_program_with_deps(parser::Program { items = items }, dep_prog_with_const("P", parser::Visibility::Pub)) {
+        TProgram as tp => {
+            mut found = false
+            mut i: u64 = 0
+            loop {
+                if i >= tp.items.len { break }
+                match tp.items[i] {
+                    TFunction as f => if f.name == "uses_p" {
+                        found = true
+                        match f.body[0] {
+                            TExprStmt as es => match es.expr.kind { TNumber as n => teko::assert::is_true(n.value == 120); _ => teko::assert::is_true(false) }
+                            _ => teko::assert::is_true(false)
+                        }
+                    }
+                    _ => { }
+                }
+                i++
+            }
+            teko::assert::is_true(found)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 // REGRESSION (self-hosted cross-file top-level fn call): a top-level function declared in a
 // namespace (a non-main source file) called UNQUALIFIED from a LOOSE top-level statement (the
 // virtual-main / main.tks) in the SAME namespace. type_program must set the threaded scope's
