@@ -569,3 +569,63 @@ fn inline_aggregate_consts_substitutes_and_keeps_residual_decl() {
         error => teko::assert::is_true(false)
     }
 }
+
+/**
+ * assert_variant_widen — assert the first function's returned expression is the #630 widening node: a
+ * `TCast` typed as the reference's VARIANT type (`Op`) whose wrapped child keeps the case-MEMBER type
+ * (`RetC`). Proves the const inliner preserved the reference's variant type (so the C backend derives
+ * `TK_TAG_OP_*` tags) while the member survives on the child (so codegen still wraps the case).
+ *
+ * @param prog  the aggregate-inlined program
+ */
+fn assert_variant_widen(prog: TProgram) {
+    match first_fn_return(prog) {
+        TExpr as rv => {
+            teko::assert::is_true(type_name_is(rv.type, "Op"))
+            match rv.kind {
+                TCast as ct => teko::assert::is_true(type_name_is(ct.expr.type, "RetC"))
+                _ => teko::assert::is_true(false)
+            }
+        }
+        null => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * type_name_is — is `t` the Named type whose name equals `name`? Used by the #630 widen assertion to
+ * distinguish the reference's variant type from the initializer's case-member type.
+ *
+ * @param t     the resolved type to inspect
+ * @param name  the Named type name to compare against
+ * @return      true iff `t` is a `Named` with that exact name
+ */
+fn type_name_is(t: Type, name: str) -> bool {
+    match t { Named as nm => nm.name == name; _ => false }
+}
+
+/**
+ * inline_aggregate_consts_widens_variant_const_to_reference_type — the #630 fix: a VARIANT const
+ * (`const R: Op = RetC { }`, its checked initializer typed as the case member `RetC`) used as a bare
+ * reference is SUBSTITUTED by a widening `TCast` typed as `Op`, wrapping the member construction —
+ * NOT by a bare `RetC`-typed node. Without the widen the C backend re-derives the match tags from the
+ * member struct (`TK_TAG_RETC_*`, `.tag` on a fieldless struct) and the generated C fails to compile.
+ */
+#test
+fn inline_aggregate_consts_widens_variant_const_to_reference_type() {
+    let opty = Named { name = "Op" }
+    let retc = Named { name = "RetC" }
+    let ctor = te(TStructInit { field_names = teko::list::empty(); field_vals = teko::list::empty() }, retc)
+    let agg = TConstDecl { name = "R"; namespace = "teko::checker"; ty = opty; init = ctor; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    mut body: []TStatement = teko::list::empty()
+    body = teko::list::push(body, c_ret(te(TVar { name = "R"; is_func = false; func_ns = "teko::checker" }, opty)))
+    mut items: []TItem = teko::list::empty()
+    items = teko::list::push(items, agg)
+    items = teko::list::push(items, c_fn("f", body))
+    match inline_aggregate_consts(TProgram { items = items }) {
+        TProgram as out => {
+            teko::assert::is_true(count_const_items(out) == 1)
+            assert_variant_widen(out)
+        }
+        error => teko::assert::is_true(false)
+    }
+}

@@ -801,15 +801,41 @@ fn inline_rw_expr(e: TExpr, map: ScalarConstMap) -> TExpr {
  * @param v    the reference node
  * @param e    the original expression (returned when `v` is not a matching scalar const)
  * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the substituted initializer, or `e` unchanged
+ * @return     the substituted initializer (widened to the reference's type when needed), or `e` unchanged
  * @since #594
  */
 fn inline_rw_var(v: TVar, e: TExpr, map: ScalarConstMap) -> TExpr {
     if v.is_func { return e }
     match scalar_const_init(map, v.name, v.func_ns) {
-        TExpr as sub => sub
+        TExpr as sub => widen_inlined_const(e, sub)
         null => e
     }
+}
+
+/**
+ * widen_inlined_const — reconcile the type of a const's collapsed initializer `sub` with the type the
+ * type-checker resolved for the reference site `e` before splicing it in (#630). A VARIANT-typed const
+ * (`const R: SomeVariant = SomeMember { }`) is checked with its initializer typed as the CASE MEMBER
+ * (`SomeMember`), not the declared variant — so a bare splice would drop the variant type of the
+ * reference and leave a member-typed node behind. In a match-subject position the C backend then
+ * re-derives the case tags from the member struct (which has neither a `tag` nor the variant's case
+ * constants) and the generated C fails to compile; in an argument position the member is only saved by
+ * the call site's own `emit_as` widening. Both are fixed the same way: when the reference type differs
+ * from the initializer type, wrap the member construction in a widening node (`TCast` to the reference
+ * type) whose `.type` is the variant (so tag derivation is correct everywhere) while the member type
+ * survives on the wrapped child (so codegen's `emit_as`/`emit_variant_wrap` still identifies the case and
+ * emits `.tag = TK_TAG_<Variant>_<Member>`). A same-typed initializer (every scalar/struct/array const)
+ * is spliced unchanged, so the pass is a no-op for the self-host (whose consts are never a match subject),
+ * preserving the C-emission fixpoint.
+ *
+ * @param e    the reference-site expression, carrying the type the checker resolved for the const use
+ * @param sub  the const's collapsed, checked initializer (the case-member construction for a variant const)
+ * @return     `sub` unchanged when its type already matches, else `sub` wrapped in a widening node typed as `e.type`
+ * @since #630
+ */
+fn widen_inlined_const(e: TExpr, sub: TExpr) -> TExpr {
+    if type_eq(e.type, sub.type) { return sub }
+    TExpr { kind = TCast { expr = sub }; type = e.type; line = e.line; col = e.col }
 }
 
 /**

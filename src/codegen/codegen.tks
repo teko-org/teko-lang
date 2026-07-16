@@ -1754,6 +1754,26 @@ fn emit_compare(buf: []byte, prog: checker::TProgram, c: checker::TCompare, esca
     cb(out, ")")
 }
 
+/**
+ * cg_cast_target_is_variant — does a cast node's target type `t` name a variant (an inline `A | B` or a
+ * declared variant)? A cast whose target is a variant is never a user `x to T` — the checker restricts
+ * `to` to numeric/char/bool — so it can only be the synthetic widening node the const inliner
+ * (`widen_inlined_const`, #630) wraps a variant const's case-member initializer in, and emit_cast routes
+ * it through emit_as to wrap the member into the variant's tag+union representation.
+ *
+ * @param prog  the typed program, to resolve a declared Named target to its variant decl
+ * @param t     the cast's target type (the cast node's resolved `.type`)
+ * @return      true iff `t` is an inline or declared variant
+ * @since #630
+ */
+fn cg_cast_target_is_variant(prog: checker::TProgram, t: checker::Type) -> bool {
+    match t {
+        checker::Variant => true
+        checker::Named as nm => cg_named_is_variant(prog, nm.name)
+        _ => false
+    }
+}
+
 // emit_cast — a TCast. F3 (M.1): a narrowing `x to T` is range-checked at runtime via
 // tk_to_<dst>_<carrier> and PANICS if the value doesn't fit T. Widening / same-type
 // casts where no loss is possible emit the plain C cast (no needless guard). Single-eval:
@@ -1762,6 +1782,7 @@ fn emit_compare(buf: []byte, prog: checker::TProgram, c: checker::TCompare, esca
 // (C: TK_TEXPR_CAST branch.)
 fn emit_cast(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCast, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let inner = c.expr
+    if cg_cast_target_is_variant(prog, e.type) { return emit_as(buf, prog, e.type, inner, escaping, regions, fn_body, dctx) }
     // Extract source/dest prims when both sides are primitive (else: a plain C cast).
     let dst_opt = match e.type { checker::Prim as p => p.kind; _ => checker::PrimKind::Bool }
     let src_opt = match inner.type { checker::Prim as p => p.kind; _ => checker::PrimKind::Bool }
