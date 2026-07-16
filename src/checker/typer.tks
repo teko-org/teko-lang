@@ -2268,6 +2268,115 @@ fn type_array_lit(a: parser::ArrayLit, env: Env, table: TypeTable) -> TExpr | er
     TExpr { kind = TArrayLit { elements = final_elems }; type = Slice { element = et }; line = 0; col = 0 }
 }
 
+/**
+ * member_const_symbol — the deterministic internal name a type-member const is hoisted under and a
+ * `TypeName::NAME` reference resolves to (#594 crumb 7): the owning type's CANONICAL name joined to
+ * the member by `::`. The hoist pass (`type_type_member_consts`) and the resolver (`find_member_const`)
+ * both compute it from the SAME canonical type name, so a scalar reference matches the inliner's
+ * substitution table and an aggregate reference matches the interned rodata symbol.
+ *
+ * @param type_canonical  the owning type's canonical (`ns::Name`) identity
+ * @param member          the member const's own name
+ * @return                the hoisted const's program-unique name
+ * @since #594
+ */
+fn member_const_symbol(type_canonical: str, member: str) -> str {
+    teko::str::concat(type_canonical, teko::str::concat("::", member))
+}
+
+/**
+ * MemberConstHit — a resolved static member const TOGETHER WITH the type whose OWN body actually
+ * declares it (#594 crumb 7 visibility fix). Walking a subclass's base chain can resolve a const
+ * declared several levels up (`Sub::SECRET` reaching a `Base`-declared const); `private` reach must
+ * gate on THAT declaring type's namespace, never the path's leading (possibly-derived) type's — a
+ * private base const must not leak cross-namespace through an unrelated subclass's name.
+ *
+ * @param cd         the resolved member const declaration
+ * @param declaring  the type whose OWN body declares `cd` (the nearest one — shadowing wins)
+ */
+type MemberConstHit = struct { cd: parser::ConstDecl; declaring: parser::TypeDecl }
+
+/**
+ * resolve_member_const_hit — the nearest static member const named `seg` reachable from `owner`,
+ * walking the base chain (a subclass inherits a base's member const by name; a nearer declaration
+ * shadows a farther one — static hiding, D6) (#594 crumb 7), together with the type that ACTUALLY
+ * declares it. Checks `owner`'s OWN consts FIRST (struct/class/trait bodies alike — shadowing), only
+ * recursing into a class's base when its own body declares no such name. Returns null when no member
+ * const named `seg` exists on the type or its bases.
+ *
+ * @param owner  the type to resolve from (struct/class/abstract/trait)
+ * @param seg    the last path segment (the member const's name)
+ * @param table  the type table (to follow a class's base chain)
+ * @return       the resolved const plus its actual declaring type, or null when not found
+ * @since #594
+ */
+fn resolve_member_const_hit(owner: parser::TypeDecl, seg: str, table: TypeTable) -> MemberConstHit? {
+    let own = body_consts(owner.body)
+    mut i: u64 = 0
+    loop {
+        if i >= own.len { break }
+        if own[i].name == seg { return MemberConstHit { cd = own[i]; declaring = owner } }
+        i++
+    }
+    match owner.body {
+        parser::ClassBody as cb => {
+            if !cb.has_base { return null }
+            let base_decl = match type_table_find(table, cb.base_name, "") { parser::TypeDecl as td => td; error => return null }
+            resolve_member_const_hit(base_decl, seg, table)
+        }
+        _ => null
+    }
+}
+
+/**
+ * member_const_visible — enforce a static member const's reach at a `TypeName::NAME` use site (#594
+ * crumb 7): a `Private` member const is reachable ONLY from its DECLARING module's namespace — NEVER
+ * the path's leading type's namespace, so `Sub::SECRET` (a private const declared on a `Base` in a
+ * different namespace) is rejected even though `Sub` inherits the name. `Pub`/`Exp` reach across
+ * namespaces (the `Exp` public-ABI distinction is exercised cross-module at crumb 8).
+ *
+ * @param hit     the resolved member const + its actual declaring type
+ * @param table   the type table (to read the declaring type's namespace)
+ * @param ref_ns  the namespace the `TypeName::NAME` reference is written in
+ * @return        null when the access is allowed, else a located visibility error
+ * @since #594
+ */
+fn member_const_visible(hit: MemberConstHit, table: TypeTable, ref_ns: str) -> error? {
+    match hit.cd.vis {
+        parser::Visibility::Private => {
+            let decl_ns = type_ns_of(table, hit.declaring.name)
+            if decl_ns != ref_ns {
+                return teko::error::err_loc(error { message = $"member const `{hit.cd.name}` is private to `{hit.declaring.name}` — mark it `pub`/`exp` to use it from another module" }, hit.cd.line, hit.cd.col)
+            }
+            null
+        }
+        _ => null
+    }
+}
+
+/**
+ * find_member_const — resolve `TypeName::NAME` to a REFERENCE to its static member const (#594 crumb
+ * 7): a `TVar` bound to the hoisted const's program-unique name (the same name `type_type_member_consts`
+ * emits, keyed on the PATH's leading type — the hoist re-materializes an inherited const once per
+ * owning type, exactly like an inherited method is re-emitted per class), typed with the const's
+ * declared type. The inliner then substitutes a scalar's value or the aggregate's rodata address.
+ * Returns null when no such member const exists, so `type_path_expr` falls through to the enum-member
+ * arm.
+ *
+ * @param owner  the resolved leading type (struct/class/abstract/trait)
+ * @param seg    the last path segment (the member const's name)
+ * @param table  the type table (to follow the base chain + read each body's consts)
+ * @return       the typed reference to the member const, or null when not found
+ * @since #594
+ */
+fn find_member_const(owner: parser::TypeDecl, seg: str, table: TypeTable) -> TExpr? {
+    let hit = match resolve_member_const_hit(owner, seg, table) { MemberConstHit as h => h; null => return null }
+    let owner_ns = type_ns_of(table, owner.name)
+    let rty = match resolve_type(hit.cd.ty, table, owner_ns) { Type as t => t; error => return null }
+    let sym = member_const_symbol(qualify(owner_ns, owner.name), seg)
+    TExpr { kind = TVar { name = sym; is_func = false; func_ns = "" }; type = rty; line = 0; col = 0 }
+}
+
 // ---- the expression dispatch (the evolved check_expr) ----
 // `Enum::Member` as a VALUE — the enum type (path minus the member) resolved to an `enum` decl,
 // the member checked, the node typed NAMED(enum) carrying enum name + member ORDINAL (so both
@@ -2294,6 +2403,13 @@ fn type_path_expr(pe: parser::PathExpr, table: TypeTable, ref_ns: str) -> TExpr 
     let et = match resolve_named(parser::Path { segments = segs }, table, ref_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the expression's enclosing namespace
     let tname = match et { Named as n => n.name; _ => return error { message = "`Type::Member` requires a named enum or flags type" } }
     let decl = match type_table_find(table, tname, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
+    match resolve_member_const_hit(decl, member, table) {
+        MemberConstHit as hit => {
+            match member_const_visible(hit, table, ref_ns) { error as e => return e; null => { } }
+            match find_member_const(decl, member, table) { TExpr as mref => return mref; null => { } }
+        }
+        null => { }
+    }
     match decl.body {
         parser::EnumBody as eb => {
             mut j: u64 = 0
@@ -4392,6 +4508,44 @@ fn type_struct_methods(td: parser::TypeDecl, item_ns: str, file: str, env: Env, 
 }
 
 /**
+ * type_type_member_consts — HOIST a struct/class/trait's EFFECTIVE static member consts into
+ * module-level `TConstDecl` items (#594 crumb 7), so the very same inliner + rodata machinery a
+ * module const uses carries a member const too — the owning type is only the NAMESPACE of resolution
+ * (no layout slot). Each is typed by `type_const_decl` (identical const-eval to a module const) and
+ * emitted under its program-unique `member_const_symbol` name; a `TypeName::NAME` reference
+ * (`find_member_const`) binds to that same name. A class contributes its inherited-not-shadowed base
+ * consts too (mirroring how its inherited methods are re-emitted per owning class).
+ *
+ * @param td       the type declaration whose member consts are hoisted
+ * @param item_ns  the type's declaring namespace (its canonical qualifier)
+ * @param file     the type's source file (for located error surfacing)
+ * @param env      the pass-2 environment (namespace-scoped to the type's module)
+ * @param table    the program's type table
+ * @return         one `TConstDecl` TItem per effective member const, or a located error
+ * @throws         a type/const-expr error in a member const's initializer, surfaced at its position
+ * @since #594
+ */
+fn type_type_member_consts(td: parser::TypeDecl, item_ns: str, file: str, env: Env, table: TypeTable) -> []TItem | error {
+    let eff = match td.body {
+        parser::ClassBody as cb => match effective_class_consts(cb, table) { []parser::ConstDecl as c => c; error as e => return e }
+        parser::StructBody as sb => sb.consts
+        parser::TraitBody as tb => tb.consts
+        _ => teko::list::empty()
+    }
+    let type_canonical = qualify(item_ns, td.name)
+    mut out: []TItem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= eff.len { break }
+        let cd = eff[i]
+        let ti = match type_const_decl(cd, env, table) { TConstDecl as x => x; error as e => return surface_at(file, cd.line, cd.col, e) }
+        out = teko::list::push(out, TConstDecl { name = member_const_symbol(type_canonical, cd.name); namespace = item_ns; ty = ti.ty; init = ti.init; vis = ti.vis; has_doc = ti.has_doc; doc = ti.doc; line = cd.line; col = cd.col })
+        i++
+    }
+    out
+}
+
+/**
  * type_const_decl — pass-2 typing for a module-level constant (#594 crumb 4): resolve the declared
  * type, type the initializer against it (adopting a fitting bare literal to the declared narrow
  * width exactly as `type_binding` does, so `const K: u8 = 300` reports an out-of-range error while
@@ -4607,6 +4761,9 @@ pub fn type_program_with_deps_pre_mono(raw_program: parser::Program, dep_prog: T
                         let mitems = match type_struct_methods(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
                         mut mi2 = 0
                         loop { if mi2 >= mitems.len { break }; items = teko::list::push(items, mitems[mi2]); mi2++ }
+                        let citems = match type_type_member_consts(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
+                        mut ci2 = 0
+                        loop { if ci2 >= citems.len { break }; items = teko::list::push(items, citems[ci2]); ci2++ }
                     }
                     _ => { }
                 }
@@ -4710,6 +4867,9 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
                         let mitems = match type_struct_methods(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
                         mut mi2 = 0
                         loop { if mi2 >= mitems.len { break }; items = teko::list::push(items, mitems[mi2]); mi2++ }
+                        let citems = match type_type_member_consts(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
+                        mut ci2 = 0
+                        loop { if ci2 >= citems.len { break }; items = teko::list::push(items, citems[ci2]); ci2++ }
                     }
                     _ => { }
                 }
