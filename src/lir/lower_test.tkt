@@ -814,6 +814,36 @@ fn lwt_scalar_const_inlines_and_leaves_no_global() {
 }
 
 /**
+ * lwt_agg_slice_const_materializes_one_rodata_entry — the crumb-6 Tier-A aggregate keystone (#594):
+ * a `const NUMS: []i64 = [10, 20]` referenced TWICE (`NUMS[0] + NUMS[1]`) interns EXACTLY ONE rodata
+ * entry (`.Lconst_NUMS`, its two i64 elements little-endian at the indexer's stride), every use
+ * resolves to that entry's `global_addr`, and `m.globals.len == 0` still holds — the aggregate lives
+ * in rodata, never a global, so no globals honest-stop is reachable.
+ *
+ * @return void
+ */
+#test
+fn lwt_agg_slice_const_materializes_one_rodata_entry() {
+    let elems = teko::list::push(teko::list::push(teko::list::empty(), lwt_num_i64(10 to i128)), lwt_num_i64(20 to i128))
+    let slice_ty = checker::Slice { element = lwt_prim(checker::PrimKind::I64) }
+    let cd: checker::TItem = checker::TConstDecl { name = "NUMS"; namespace = ""; ty = slice_ty; init = lwt_array_lit(elems, checker::PrimKind::I64); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let use0 = lwt_index(lwt_typed_var("NUMS", slice_ty), lwt_num_i64(0 to i128), lwt_prim(checker::PrimKind::I64))
+    let use1 = lwt_index(lwt_typed_var("NUMS", slice_ty), lwt_num_i64(1 to i128), lwt_prim(checker::PrimKind::I64))
+    let sum = lwt_bin(lexer::TokenKind::Plus, use0, use1, checker::PrimKind::I64)
+    mut items: []checker::TItem = teko::list::push(teko::list::empty(), cd)
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), sum), checker::Void { }))))
+    let inlined = match checker::inline_consts(checker::TProgram { items = items }) { checker::TProgram as p => p; error as err => { teko::assert::is_true(false); return } }
+    let m = match lower_program(inlined) { LModule as x => x; error as err => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(m.globals.len == 0)
+    teko::assert::is_true(m.rodata.len == 1)
+    teko::assert::is_true(m.rodata[0].symbol == ".Lconst_NUMS")
+    teko::assert::is_true(m.rodata[0].bytes.len == 16)
+    teko::assert::is_true(m.rodata[0].bytes[0] == (10 to byte))
+    teko::assert::is_true(m.rodata[0].bytes[8] == (20 to byte))
+    teko::assert::str_contains(print_lmodule(m), "global_addr @.Lconst_NUMS")
+}
+
+/**
  * lwt_virtual_main_fires_a_defer_before_its_own_fall_through — A1-2,
  * #382: a top-level `defer { … }` with no further loose statements after
  * it must fire before `close_virtual_main`'s own implicit `const 0; ret`

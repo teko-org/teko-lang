@@ -628,14 +628,67 @@ fn lower_number(ctx: LowerCtx, e: checker::TExpr, n: checker::TNumber) -> Lowere
     Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
 }
 
-/** lower_var — a local variable reference -> the VReg it already lives in (no instruction;
-    an SSA-lite value IS the var). A bare fn-as-value (`is_func`) instead builds a closure
-    literal wrapping the referenced top-level function (A1-7, #382 — `lower_fn_value`). */
+/**
+ * lower_var — a local variable reference -> the VReg it already lives in (no instruction; an
+ * SSA-lite value IS the var). A bare fn-as-value (`is_func`) instead builds a closure literal
+ * wrapping the referenced top-level function (A1-7, #382 — `lower_fn_value`). A name that is NOT a
+ * local and NOT a function resolves to a module-level AGGREGATE const materialized in rodata
+ * (`lower_program` interned its bytes up front, #594 crumb 6): the value is the address of that
+ * rodata symbol (`LGlobalAddr`), exactly as a struct/slice value is its base address.
+ *
+ * @param ctx  the lowering context to append the reference's instructions into
+ * @param e    the variable-reference expression (carries its source position)
+ * @param v    the typed variable node (name + fn-as-value marker)
+ * @return     the appended context plus the VReg the value lives in
+ * @throws     when the name is neither a bound local, a fn value, nor an interned aggregate const
+ */
 fn lower_var(ctx: LowerCtx, e: checker::TExpr, v: checker::TVar) -> Lowered | error {
     if v.is_func { return lower_fn_value(ctx, e, v) }
     let hit = lenv_lookup(ctx.env, v.name)
-    if !hit.found { return error { message = teko::str::concat("native backend N1: unbound local `", v.name, "` (internal)") } }
-    Lowered { ctx = ctx; vreg = hit.vreg }
+    if hit.found { return Lowered { ctx = ctx; vreg = hit.vreg } }
+    match find_const_rodata(ctx.rodata, v.name) {
+        LRodata as r => lower_const_addr(ctx, r.symbol, e.line, e.col)
+        null => error { message = teko::str::concat("native backend N1: unbound local `", v.name, "` (internal)") }
+    }
+}
+
+/**
+ * lower_const_addr — the address of a module-level aggregate const's rodata symbol as a Ptr VReg
+ * (`%r = global_addr @<symbol>`), the value an aggregate-const reference lowers to (#594 crumb 6). A
+ * struct/variant const's "value" is this base address (field access reads through it, exactly like a
+ * `TStructInit`); a str/slice const collapses to this ptr in scalar position (its length arrives via
+ * the fat path, `lower_const_fat`).
+ *
+ * @param ctx     the lowering context to append into
+ * @param symbol  the const's already-interned rodata symbol
+ * @param line    the reference's source line
+ * @param col     the reference's source column
+ * @return        the appended context plus the base-address VReg
+ */
+fn lower_const_addr(ctx: LowerCtx, symbol: str, line: u32, col: u32) -> Lowered {
+    let r = ctx_alloc(ctx)
+    Lowered { ctx = ctx_append(r.ctx, global_addr_inst(r.vreg, symbol, line, col)); vreg = r.vreg }
+}
+
+/**
+ * find_const_rodata — the rodata entry that materializes the module-level aggregate const named
+ * `name`, or null when no such const was interned (`lower_program` interns each aggregate const under
+ * the deterministic `const_rodata_symbol(name)` symbol, #594 crumb 6). The lookup keys on that
+ * symbol, so it never collides with a string-literal `.Lstr<N>` entry.
+ *
+ * @param rodata  the module's interned-rodata table
+ * @param name    the referenced const's name
+ * @return        the matching LRodata entry, or null
+ */
+fn find_const_rodata(rodata: []LRodata, name: str) -> LRodata? {
+    let sym = const_rodata_symbol(name)
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        if rodata[i].symbol == sym { return rodata[i] }
+        i++
+    }
+    null
 }
 
 /** lower_binary — lower left then right, then emit the LBin chosen by the RESULT's
@@ -3717,19 +3770,89 @@ pub fn lower_fat_expr(ctx: LowerCtx, e: checker::TExpr) -> LoweredFat | error {
     match e.kind {
         checker::TStrLit as s => lower_str_lit_fat(ctx, e, s)
         checker::TArrayLit as al => lower_array_lit_fat(ctx, e, al)
-        checker::TVar as v => lower_var_fat(ctx, v)
+        checker::TVar as v => lower_var_fat(ctx, e, v)
         _ => error { message = teko::str::concat("native backend N1: fat-pointer receiver `", texpr_kind_name(e), "` not yet lowered (N2)") }
     }
 }
 
-/** lower_var_fat — a local variable reference resolved through the FAT env (A1-4, #382); a
-    name bound via the plain scalar `lenv_bind` (no length recorded) is an invariant break —
-    the checker only types a str/slice VAR this way when a `let` bound it, and `lower_binding`
-    always uses `lenv_bind_fat` for a fat-typed value. */
-fn lower_var_fat(ctx: LowerCtx, v: checker::TVar) -> LoweredFat | error {
+/**
+ * lower_var_fat — a str/slice variable reference to its (ptr, len) fat pair (A1-4, #382). A local
+ * bound via `lenv_bind_fat` (a `let` of str/slice type) resolves through the FAT env; a name that is
+ * NOT a fat local resolves to a module-level str/slice AGGREGATE const materialized in rodata (#594
+ * crumb 6), whose ptr is its rodata symbol and whose len is derived from the interned byte count.
+ *
+ * @param ctx  the lowering context
+ * @param e    the fat-valued reference expression (carries its str/slice type + source position)
+ * @param v    the typed variable node (the referenced name)
+ * @return     the (ptr, len) fat pair
+ * @throws     when the name is neither a fat local nor an interned str/slice aggregate const
+ */
+fn lower_var_fat(ctx: LowerCtx, e: checker::TExpr, v: checker::TVar) -> LoweredFat | error {
     let hit = lenv_lookup_fat(ctx.env, v.name)
-    if !hit.found || !hit.has_len { return error { message = teko::str::concat("native backend N1: `", v.name, "` is not a fat-pointer local (internal)") } }
-    LoweredFat { ctx = ctx; ptr = hit.ptr; len = hit.len }
+    if hit.found && hit.has_len { return LoweredFat { ctx = ctx; ptr = hit.ptr; len = hit.len } }
+    match find_const_rodata(ctx.rodata, v.name) {
+        LRodata as r => lower_const_fat(ctx, e, r)
+        null => error { message = teko::str::concat("native backend N1: `", v.name, "` is not a fat-pointer local (internal)") }
+    }
+}
+
+/**
+ * lower_const_fat — a module-level str/slice aggregate const's (ptr, len) fat pair (#594 crumb 6):
+ * the ptr is the address of its interned rodata symbol (`LGlobalAddr`) and the len is its element
+ * count, derived from the interned byte count and the value's own type — a `str` counts its raw UTF-8
+ * bytes (stride 1), a `[]T` counts elements at the SAME element stride the indexer uses
+ * (`ltype_of(element)`), so a `.len` read and a `[i]` read agree.
+ *
+ * @param ctx  the lowering context to append into
+ * @param e    the fat-valued reference expression (its str/slice type + source position)
+ * @param r    the const's interned rodata entry (symbol + raw bytes)
+ * @return     the (ptr, len) fat pair
+ * @throws     when the reference's type is not a str/slice (an interned aggregate never is otherwise)
+ */
+fn lower_const_fat(ctx: LowerCtx, e: checker::TExpr, r: LRodata) -> LoweredFat | error {
+    let n = match const_fat_len(e.type, r.bytes.len to u32) { u32 as x => x; error as err => return err }
+    let ptr = ctx_alloc(ctx)
+    let with_ptr = ctx_append(ptr.ctx, global_addr_inst(ptr.vreg, r.symbol, e.line, e.col))
+    let lenr = ctx_alloc(with_ptr)
+    let with_len = ctx_append(lenr.ctx, const_int_inst(lenr.vreg, n to i128, e.line, e.col))
+    LoweredFat { ctx = with_len; ptr = ptr.vreg; len = lenr.vreg }
+}
+
+/**
+ * const_fat_len — the element count of a materialized str/slice aggregate const from its interned
+ * byte length and its type (#594 crumb 6): a `str` is `byte_len` raw bytes (stride 1); a `[]T` is
+ * `byte_len / stride` where `stride = ltype_size(ltype_of(element))`, the EXACT stride
+ * `lower_index_slice` folds an index against — so the length and the indexing agree byte-for-byte on
+ * both engines.
+ *
+ * @param t         the const's resolved value type (`Str` or `Slice`)
+ * @param byte_len  the interned rodata blob's byte length
+ * @return          the element count the fat pair's len half carries
+ * @throws          when `t` is neither a str nor a slice (unreachable for an interned aggregate)
+ */
+fn const_fat_len(t: checker::Type, byte_len: u32) -> u32 | error {
+    match t {
+        checker::Str => byte_len
+        checker::Slice as s => const_slice_len(s.element, byte_len)
+        _ => error { message = "native backend N1: aggregate const fat receiver is not a str/slice (internal)" }
+    }
+}
+
+/**
+ * const_slice_len — a materialized `[]T` const's element count: `byte_len / stride`, with the element
+ * stride taken from `ltype_of(element)` so it matches `lower_index_slice` (#594 crumb 6). A
+ * zero-stride element (a `void`-classed type) never reaches here — the serializer rejects it — so the
+ * division is always exact.
+ *
+ * @param element   the slice's element type
+ * @param byte_len  the interned rodata blob's byte length
+ * @return          the element count
+ * @throws          when the element's machine stride is zero (unreachable — rejected at serialize)
+ */
+fn const_slice_len(element: checker::Type, byte_len: u32) -> u32 | error {
+    let stride = ltype_size(ltype_of(element))
+    if stride == 0 { return error { message = "native backend N1: aggregate const slice has a zero-stride element (internal)" } }
+    byte_len / stride
 }
 
 /** rodata_symbol — the deterministic symbol for the Nth interned rodata entry — an
@@ -4513,8 +4636,470 @@ fn param_ltypes(params: []parser::Param) -> []LType {
 }
 
 /**
+ * const_rodata_symbol — the deterministic rodata symbol a module-level AGGREGATE const materializes
+ * under (#594 crumb 6): `.Lconst_<name>`. The `.Lconst_` prefix never collides with a string
+ * literal's `.Lstr<N>` symbol, and a reference site re-derives the exact same name from the const's
+ * name alone (`find_const_rodata`), so no per-const symbol table needs threading through lowering.
+ *
+ * @param name  the const's declared name
+ * @return      its rodata symbol
+ */
+fn const_rodata_symbol(name: str) -> str {
+    teko::str::concat(".Lconst_", name)
+}
+
+/**
+ * ltype_is_ptr — true iff a machine class is the pointer class (`Ptr`), the shape a struct field's
+ * layout takes when the field is itself pointer/slice-bearing (a `str`, `[]T`, `char`, nested Named,
+ * or `ptr<T>`) — the Tier-B signal the aggregate serializer rejects (#594 crumb 6).
+ *
+ * @param t  the machine class
+ * @return   whether it is the pointer class
+ */
+fn ltype_is_ptr(t: LType) -> bool {
+    match t { Ptr => true; _ => false }
+}
+
+/**
+ * ltype_is_float — true iff a machine class is an IEEE float class (`F16`/`F32`/`F64`) (#594 crumb
+ * 6). The Tier-A serializer materializes integer/bool/byte fields only; a float field is a documented
+ * Tier-A follow-up and honest-stops.
+ *
+ * @param t  the machine class
+ * @return   whether it is a float class
+ */
+fn ltype_is_float(t: LType) -> bool {
+    match t { F16 => true; F32 => true; F64 => true; _ => false }
+}
+
+/**
+ * lo_byte — the little-endian byte of `v` at bit offset `shift` (a multiple of 8): shift right, take
+ * the low 8 bits (#594 crumb 6). Truncating through `u64` yields the correct two's-complement byte
+ * for a negative `v` (e.g. `~0` serializes to `0xFF`), matching how the backend stores a scalar.
+ *
+ * @param v      the i128 value being serialized
+ * @param shift  the bit offset of the wanted byte (0, 8, 16, …)
+ * @return       the extracted byte
+ */
+fn lo_byte(v: i128, shift: i128) -> byte {
+    (((v >> shift) to u64) & (0xFF to u64)) to byte
+}
+
+/**
+ * serialize_le — the little-endian byte image of the i128 value `v` in `nbytes` bytes (#594 crumb
+ * 6). A field/element wider than its value truncates to its declared width, exactly as a machine
+ * store of that width would.
+ *
+ * @param v       the folded scalar value
+ * @param nbytes  the target width in bytes (the machine class's size)
+ * @return        the little-endian byte image
+ */
+fn serialize_le(v: i128, nbytes: u32) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut k: u32 = 0
+    loop {
+        if k >= nbytes { break }
+        out = teko::list::push(out, lo_byte(v, (k * 8) to i128))
+        k++
+    }
+    out
+}
+
+/**
+ * const_fold_unary — fold a const unary operator over an already-folded operand (#594 crumb 6): unary
+ * `-` (negation) or `~` (bitwise complement, computed as the two's-complement identity `-v - 1` so the
+ * fold uses ONLY i128 `+`/`-`, the sole i128 arithmetic the native backend lowers today — `*`/`/` are
+ * deferred to an i128 helper, see `isel_arm64.tks` §6.3). The result is the widest integer carrier and
+ * truncates to the field's width at serialization.
+ *
+ * @param op  the unary operator token kind
+ * @param v   the folded operand value
+ * @return    the folded result
+ * @throws    when `op` is not a const-admissible unary operator
+ */
+fn const_fold_unary(op: lexer::TokenKind, v: i128) -> i128 | error {
+    match op {
+        lexer::TokenKind::Tilde => ((0 to i128) - v) - (1 to i128)
+        lexer::TokenKind::Minus => (0 to i128) - v
+        _ => error { message = "const aggregate: non-const unary operator in initializer (#594)" }
+    }
+}
+
+/**
+ * const_fold_binary — fold a const binary operator over two already-folded operands (#594 crumb 6).
+ * Only `+` and `-` fold here: they are the i128 arithmetic the native self-build definitely lowers
+ * (`lir_print.tks` performs `*`/`/`/`%` on a u128 magnitude precisely because signed i128
+ * multiply/divide/shift are deferred to a helper-call, `isel_arm64.tks` §6.3). The remaining
+ * const-grammar operators (`* / % & | ^ << >>`) are a documented Tier-A follow-up — they honest-stop
+ * rather than emit an i128 op the backend cannot yet materialize (the required Tier-A shapes use
+ * literal/cast fields, no arithmetic).
+ *
+ * @param op  the binary operator token kind
+ * @param a   the folded left operand
+ * @param b   the folded right operand
+ * @return    the folded result
+ * @throws    for any operator beyond `+`/`-` (a Tier-A const-fold follow-up)
+ */
+fn const_fold_binary(op: lexer::TokenKind, a: i128, b: i128) -> i128 | error {
+    match op {
+        lexer::TokenKind::Plus => a + b
+        lexer::TokenKind::Minus => a - b
+        _ => error { message = "const aggregate: const-fold of this operator (only `+`/`-` today) is a Tier-A follow-up (#594)" }
+    }
+}
+
+/**
+ * const_fold_int — fold a scalar (integer/bool/byte) const initializer expression to its i128 value
+ * (#594 crumb 6): a numeric/byte/bool literal, a cast (representation-preserving here — the target
+ * width truncates only at serialization), or a unary/binary arithmetic tree over such leaves. A
+ * FLOAT value, a `char` (fat runtime image), an enum-member path, or a nested const reference is a
+ * documented Tier-A follow-up and honest-stops (the required Tier-A shapes use integer/bool/byte
+ * literal fields directly).
+ *
+ * @param e  the field/element initializer expression
+ * @return   the folded i128 value
+ * @throws   when `e` is a float, a char, or a form beyond the integer const-fold subset
+ */
+fn const_fold_int(e: checker::TExpr) -> i128 | error {
+    match e.kind {
+        checker::TNumber as n => if n.is_float { error { message = "const aggregate: float value materialization is a Tier-A follow-up (#594)" } } else { n.value }
+        checker::TByteLit as b => b.value to i128
+        checker::TBoolLit as bo => if bo.value { 1 to i128 } else { 0 to i128 }
+        checker::TCharLit => error { message = "const aggregate: char value is fat (Tier-B, T-B) (#594)" }
+        checker::TCast as c => const_fold_int(c.expr)
+        checker::TUnary as u => const_fold_unary_expr(u)
+        checker::TBinary as b => const_fold_binary_expr(b)
+        _ => error { message = teko::str::concat("const aggregate: unsupported initializer form `", texpr_kind_name(e), "` (Tier-A follow-up / Tier-B, T-B) (#594)") }
+    }
+}
+
+/**
+ * const_fold_unary_expr — fold a unary const initializer subtree: fold the operand, then apply the
+ * operator (#594 crumb 6).
+ *
+ * @param u  the typed unary expression
+ * @return   the folded i128 value
+ * @throws   when the operand or the operator is outside the integer const-fold subset
+ */
+fn const_fold_unary_expr(u: checker::TUnary) -> i128 | error {
+    let v = match const_fold_int(u.operand) { i128 as x => x; error as e => return e }
+    const_fold_unary(u.op, v)
+}
+
+/**
+ * const_fold_binary_expr — fold a binary const initializer subtree: fold both operands, then apply
+ * the operator (#594 crumb 6).
+ *
+ * @param b  the typed binary expression
+ * @return   the folded i128 value
+ * @throws   when an operand or the operator is outside the integer const-fold subset
+ */
+fn const_fold_binary_expr(b: checker::TBinary) -> i128 | error {
+    let a = match const_fold_int(b.left) { i128 as x => x; error as e => return e }
+    let c = match const_fold_int(b.right) { i128 as x => x; error as e => return e }
+    const_fold_binary(b.op, a, c)
+}
+
+/**
+ * const_is_flat_scalar — true iff a slice element type is a flat, non-pointer scalar the aggregate
+ * serializer can materialize (#594 crumb 6): a primitive (int/float/bool) or a `byte`. A `char`
+ * (fat), a nested slice/str, or a named aggregate is pointer-bearing (Tier-B, T-B) and rejected.
+ *
+ * @param t  the slice element type
+ * @return   whether it is a materializable flat scalar
+ */
+fn const_is_flat_scalar(t: checker::Type) -> bool {
+    match t {
+        checker::Prim => true
+        checker::Byte => true
+        _ => false
+    }
+}
+
+/**
+ * zeros_bytes — an all-zero byte buffer of length `n` (#594 crumb 6): the struct-blob canvas a flat
+ * POD const overwrites at each field's layout offset, so padding bytes stay zero.
+ *
+ * @param n  the buffer length
+ * @return   `n` zero bytes
+ */
+fn zeros_bytes(n: u64) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = teko::list::push(out, 0 to byte)
+        i++
+    }
+    out
+}
+
+/**
+ * append_bytes — the concatenation of two byte buffers (#594 crumb 6): the slice serializer grows the
+ * blob one element image at a time.
+ *
+ * @param a  the buffer accumulated so far
+ * @param b  the bytes to append
+ * @return   `a` followed by `b`
+ */
+fn append_bytes(a: []byte, b: []byte) -> []byte {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * write_bytes_at — a copy of `buf` with `src` overwriting the window `[off, off + src.len)` (#594
+ * crumb 6): the struct serializer places each field's little-endian image at its layout offset while
+ * leaving padding zero. The window is always in bounds (a field's offset+size never exceeds the
+ * struct's size), so out-of-range source indices never occur.
+ *
+ * @param buf  the buffer being filled (length = the struct's size)
+ * @param off  the field's byte offset
+ * @param src  the field's little-endian image
+ * @return     `buf` with `src` written at `off`
+ */
+fn write_bytes_at(buf: []byte, off: u64, src: []byte) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= buf.len { break }
+        let within = i >= off && i < off + src.len
+        out = teko::list::push(out, if within { src[i - off] } else { buf[i] })
+        i++
+    }
+    out
+}
+
+/**
+ * const_str_bytes — the rodata image of a `str` aggregate const: its raw UTF-8 bytes (#594 crumb 6).
+ * The initializer must be a string literal (the only const-legal `str` producer); anything else
+ * honest-stops.
+ *
+ * @param init  the const's checked initializer
+ * @return      the UTF-8 byte image
+ * @throws      when the initializer is not a string literal
+ */
+fn const_str_bytes(init: checker::TExpr) -> []byte | error {
+    match init.kind {
+        checker::TStrLit as s => str_to_bytes(s.text)
+        _ => error { message = "const str: initializer is not a string literal (Tier-A follow-up) (#594)" }
+    }
+}
+
+/**
+ * const_array_bytes — the rodata image of a `[]T` flat-scalar array literal: each element folded to
+ * its i128 value and serialized at the SAME element stride the indexer uses (`ltype_of(element)`), so
+ * a later `[i]`/`.len` read agrees byte-for-byte on both engines (#594 crumb 6). A spread element is
+ * not statically materializable and honest-stops.
+ *
+ * @param element  the slice's element type
+ * @param a        the typed array literal
+ * @return         the concatenated element images
+ * @throws         when an element is a spread or is not a foldable flat scalar
+ */
+fn const_array_bytes(element: checker::Type, a: checker::TArrayLit) -> []byte | error {
+    let stride = ltype_size(ltype_of(element))
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        if a.elements[i].is_spread { return error { message = "const slice: spread element not statically materializable (#594)" } }
+        let v = match const_fold_int(a.elements[i].expr) { i128 as x => x; error as e => return e }
+        out = append_bytes(out, serialize_le(v, stride))
+        i++
+    }
+    out
+}
+
+/**
+ * const_slice_bytes — the rodata image of a `[]T` aggregate const (#594 crumb 6): reject a
+ * pointer-bearing element (Tier-B, T-B), else materialize the array literal via `const_array_bytes`.
+ *
+ * @param element  the slice's element type
+ * @param init     the const's checked initializer
+ * @return         the slice's byte image
+ * @throws         when the element is pointer-bearing (Tier-B) or the initializer is not an array literal
+ */
+fn const_slice_bytes(element: checker::Type, init: checker::TExpr) -> []byte | error {
+    if !const_is_flat_scalar(element) { return error { message = "const aggregate: slice element is pointer/slice-bearing -> Tier-B (T-B), not crumb 6 (#594)" } }
+    match init.kind {
+        checker::TArrayLit as a => const_array_bytes(element, a)
+        _ => error { message = "const slice: initializer is not an array literal (Tier-A follow-up) (#594)" }
+    }
+}
+
+/**
+ * struct_init_value — the initializer expression a `TStructInit` binds to the field named `field`
+ * (#594 crumb 6). The checker guarantees a flat struct const names every field, so a miss is an
+ * invariant break, not a user error.
+ *
+ * @param si     the typed struct-literal initializer
+ * @param field  the layout field's name
+ * @return       the value expression bound to `field`
+ * @throws       when the initializer binds no such field (internal invariant break)
+ */
+fn struct_init_value(si: checker::TStructInit, field: str) -> checker::TExpr | error {
+    mut i: u64 = 0
+    loop {
+        if i >= si.field_names.len { break }
+        if si.field_names[i] == field { return si.field_vals[i] }
+        i++
+    }
+    error { message = teko::str::concat("const struct: initializer binds no field `", field, "` (internal)") }
+}
+
+/**
+ * const_struct_field_bytes — the little-endian image of one flat struct field, folding its
+ * initializer to its layout width (#594 crumb 6): reject a pointer-bearing field (Tier-B, T-B) and a
+ * float field (a documented Tier-A follow-up), else serialize the folded integer/bool/byte value.
+ *
+ * @param layout  the struct's resolved layout (for the field's machine class + size)
+ * @param si      the struct-literal initializer (source of each field's value)
+ * @param j       the layout field index being serialized
+ * @return        the field's little-endian byte image
+ * @throws        when the field is pointer-bearing, a float, or its value is not foldable
+ */
+fn const_struct_field_bytes(layout: LStructLayout, si: checker::TStructInit, j: u64) -> []byte | error {
+    let lt = layout.field_types[j]
+    if ltype_is_ptr(lt) { return error { message = teko::str::concat("const aggregate: field `", layout.field_names[j], "` is pointer/slice-bearing -> Tier-B (T-B), not crumb 6 (#594)") } }
+    if ltype_is_float(lt) { return error { message = teko::str::concat("const aggregate: float field `", layout.field_names[j], "` materialization is a Tier-A follow-up (#594)") } }
+    let vexpr = match struct_init_value(si, layout.field_names[j]) { checker::TExpr as x => x; error as e => return e }
+    let v = match const_fold_int(vexpr) { i128 as x => x; error as e => return e }
+    serialize_le(v, ltype_size(lt))
+}
+
+/**
+ * const_struct_blob — the rodata image of a flat struct aggregate const (#594 crumb 6): a
+ * zero-filled buffer of the struct's size with each field's little-endian value written at its layout
+ * offset (declared order, natural alignment), so padding stays zero and a later `.field` read (an
+ * `LFieldAddr` at the layout offset + `LLoad`) recovers the exact value on both engines.
+ *
+ * @param layout  the struct's resolved layout (size + per-field offset/class)
+ * @param si      the typed struct-literal initializer
+ * @return        the struct's byte image (length = `layout.size`)
+ * @throws        when any field is pointer-bearing (Tier-B), a float, or not foldable
+ */
+fn const_struct_blob(layout: LStructLayout, si: checker::TStructInit) -> []byte | error {
+    mut buf = zeros_bytes(layout.size to u64)
+    mut j: u64 = 0
+    loop {
+        if j >= layout.field_names.len { break }
+        let fb = match const_struct_field_bytes(layout, si, j) { []byte as x => x; error as e => return e }
+        buf = write_bytes_at(buf, layout.field_offsets[j] to u64, fb)
+        j++
+    }
+    buf
+}
+
+/**
+ * const_struct_bytes — the rodata image of a `Named` struct aggregate const (#594 crumb 6): resolve
+ * its registered layout and materialize its struct-literal initializer via `const_struct_blob`.
+ *
+ * @param name     the struct type's canonical name
+ * @param init     the const's checked initializer
+ * @param layouts  the program's struct-layout table
+ * @return         the struct's byte image
+ * @throws         when the layout is unknown, the initializer is not a struct literal, or a field is Tier-B
+ */
+fn const_struct_bytes(name: str, init: checker::TExpr, layouts: []LStructLayout) -> []byte | error {
+    let layout = match find_struct_layout(layouts, name) { LStructLayout as l => l; error as e => return e }
+    match init.kind {
+        checker::TStructInit as si => const_struct_blob(layout, si)
+        _ => error { message = "const struct: initializer is not a struct literal (Tier-A follow-up) (#594)" }
+    }
+}
+
+/**
+ * serialize_const — the rodata byte image of a Tier-A aggregate const, dispatched on its resolved
+ * value type (#594 crumb 6): a `str` (raw UTF-8), a flat-scalar `[]T`, or a flat-POD struct. A
+ * `variant` const (an empty-case tag image) is a documented Tier-A follow-up; any pointer/slice-
+ * bearing aggregate is Tier-B (T-B) and honest-stops — the sole materialization boundary this crumb
+ * enforces.
+ *
+ * @param cd       the residual typed const declaration (its type + checked initializer)
+ * @param layouts  the program's struct-layout table
+ * @return         the const's rodata byte image
+ * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ */
+fn serialize_const(cd: checker::TConstDecl, layouts: []LStructLayout) -> []byte | error {
+    match cd.ty {
+        checker::Str => const_str_bytes(cd.init)
+        checker::Slice as s => const_slice_bytes(s.element, cd.init)
+        checker::Named as n => const_struct_bytes(n.name, cd.init, layouts)
+        checker::Variant => error { message = "const aggregate: variant (empty-case tag) materialization is a Tier-A follow-up (#594)" }
+        _ => error { message = "const aggregate: pointer/slice-bearing value is Tier-B (T-B), not crumb 6 (#594)" }
+    }
+}
+
+/**
+ * intern_aggregate_const_decl — materialize one residual TConstDecl into rodata when it is a Tier-A
+ * aggregate (#594 crumb 6): a scalar const (already inlined + dropped by `inline_consts`) is a
+ * defensive skip; an aggregate const is serialized to bytes and appended to the module's rodata under
+ * its deterministic `const_rodata_symbol`, referenced from every use site via `find_const_rodata`.
+ *
+ * @param m        the module accumulated so far
+ * @param cd       the residual typed const declaration
+ * @param layouts  the program's struct-layout table
+ * @return         the module with the const's rodata entry appended (unchanged for a scalar const)
+ * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ */
+fn intern_aggregate_const_decl(m: LModule, cd: checker::TConstDecl, layouts: []LStructLayout) -> LModule | error {
+    if const_decl_is_scalar(cd.ty) { return m }
+    let bytes = match serialize_const(cd, layouts) { []byte as b => b; error as e => return e }
+    add_rodata(m, LRodata { symbol = const_rodata_symbol(cd.name); bytes = bytes })
+}
+
+/**
+ * intern_aggregate_const_item — fold one program item into the module's rodata: an aggregate
+ * TConstDecl interns its byte image, every other item is a no-op (#594 crumb 6).
+ *
+ * @param m        the module accumulated so far
+ * @param it       the program item to fold
+ * @param layouts  the program's struct-layout table
+ * @return         the module with `it`'s rodata contribution (unchanged for a non-const item)
+ * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ */
+fn intern_aggregate_const_item(m: LModule, it: checker::TItem, layouts: []LStructLayout) -> LModule | error {
+    match it {
+        checker::TConstDecl as cd => intern_aggregate_const_decl(m, cd, layouts)
+        _ => m
+    }
+}
+
+/**
+ * intern_aggregate_consts — intern every Tier-A aggregate const's byte image into the module's rodata
+ * BEFORE any function lowers (#594 crumb 6), so each const gets ONE rodata entry, at a stable symbol,
+ * that every reference site (function body OR virtual main) resolves against `m.rodata`. `m.globals`
+ * stays empty — an aggregate const lives in rodata, never in a global, so no globals honest-stop is
+ * reachable.
+ *
+ * @param m        the module (layouts registered, rodata still empty)
+ * @param items    the typed program's top-level items
+ * @param layouts  the program's struct-layout table
+ * @return         the module with one rodata entry per Tier-A aggregate const
+ * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ */
+fn intern_aggregate_consts(m: LModule, items: []checker::TItem, layouts: []LStructLayout) -> LModule | error {
+    mut cur = m
+    mut i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        cur = match intern_aggregate_const_item(cur, items[i], layouts) { LModule as x => x; error as e => return e }
+        i++
+    }
+    cur
+}
+
+/**
  * lower_program — the module entry: register every declared struct's layout
- * (A1-3, #382), collect every declared enum's members (A1-5, #382), lower every
+ * (A1-3, #382), collect every declared enum's members (A1-5, #382), intern every
+ * Tier-A aggregate const's byte image into rodata (#594 crumb 6), lower every
  * top-level function, and gather the loose top-level statements into a
  * synthesized `main` (the VIRTUAL-MAIN the C backend also builds), returning
  * `int 0` if the statements fall through. Type/use declarations otherwise carry
@@ -4529,7 +5114,7 @@ fn param_ltypes(params: []parser::Param) -> []LType {
 pub fn lower_program(prog: checker::TProgram) -> LModule | error {
     let layouts = collect_struct_layouts(prog)
     let enums = collect_enums(prog)
-    mut m = register_layouts(empty_module(), layouts)
+    mut m = match intern_aggregate_consts(register_layouts(empty_module(), layouts), prog.items, layouts) { LModule as x => x; error as e => return e }
     mut loose: []checker::TStatement = teko::list::empty()
     mut lifted: []LFunc = teko::list::empty()
     mut i: u64 = 0
@@ -4863,21 +5448,21 @@ fn const_decl_is_scalar(t: checker::Type) -> bool {
 }
 
 /**
- * lower_const_item — fold a residual TConstDecl. A SCALAR const is a defensive NO-OP: the crumb-5
- * inliner (`inline_consts`, run after monomorphize) substitutes every scalar-const use and drops the
- * declaration, so lowering emits no `LFunc`, no `LGlobal`, and never reaches a globals honest-stop for
- * a scalar-only program. An AGGREGATE const (slice/struct/variant) is not yet materialized — it stops
- * honestly at crumb 6 (#594).
+ * lower_const_item — fold a residual TConstDecl in the item loop: a NO-OP for BOTH families (#594
+ * crumb 6). A SCALAR const was inlined at every use and dropped by `inline_consts` (post-monomorphize)
+ * — it emits no `LFunc`, no `LGlobal`. An AGGREGATE (Tier-A) const's byte image was already interned
+ * into rodata by `intern_aggregate_consts`, BEFORE any function lowered, and every use resolves to
+ * that rodata symbol — so the declaration itself contributes no further code here. `m.globals` stays
+ * empty for either family (rodata, never a global), so no globals honest-stop is reachable.
  *
  * @param m       the module accumulated so far
  * @param loose   the loose top-level statements accumulated so far
- * @param cd      the residual typed const declaration
+ * @param cd      the residual typed const declaration (unused — kept for the item-fold shape)
  * @param lifted  the whole-program lifted closure/thunk-function table
- * @return        the module unchanged for a scalar const; the crumb-6 honest-stop for an aggregate
+ * @return        the module unchanged (const decls emit no per-item code)
  */
 fn lower_const_item(m: LModule, loose: []checker::TStatement, cd: checker::TConstDecl, lifted: []LFunc) -> LowerItemOut | error {
-    if const_decl_is_scalar(cd.ty) { return LowerItemOut { module = m; loose = loose; lifted = lifted } }
-    error { message = "const item: aggregate lowering is crumb 6 (#594)" }
+    LowerItemOut { module = m; loose = loose; lifted = lifted }
 }
 
 /**

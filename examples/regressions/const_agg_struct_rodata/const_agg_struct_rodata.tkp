@@ -1,0 +1,21 @@
+# Regression: #594 crumb 6 — a Tier-A flat-POD struct aggregate const materialized in rodata.
+#
+# `type Meta = struct { tag: u8; code: i32; flag: bool }` is flat POD (no pointer/slice field), so
+# `const M: Meta = Meta { tag = 3, code = 100, flag = true }` interns ONE `.Lconst_M` rodata blob at
+# its natural-alignment layout (tag@0, code@4, flag@8, size 12). It is read in THREE places (meta_tag,
+# meta_code, the final `.flag` read), each a field load (`LFieldAddr` at the layout offset + `LLoad`)
+# off the SAME rodata base. `m.globals` stays empty. Both engines recover identical field values:
+#   meta_tag()  = 3
+#   meta_code() = 100   (a four-byte field at offset 4 — exercises the layout offset)
+#   M.flag      = true (branched via `if M.flag`, not a bool cast) -> 1
+#   3 + 100 + 1 = 104
+#
+# Both engines must agree: `teko run` exit == compiled-binary exit == 104.
+#   teko run   examples/regressions/const_agg_struct_rodata   # VM   -> exit 104
+#   teko build examples/regressions/const_agg_struct_rodata && \
+#     ./examples/regressions/const_agg_struct_rodata/const_agg_struct_rodata   # native -> exit 104
+name = "const_agg_struct_rodata"
+source = "src"
+
+[artifact]
+kind = "binary"
