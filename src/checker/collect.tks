@@ -526,6 +526,50 @@ pub fn effective_class_methods(cb: parser::ClassBody, table: TypeTable) -> []par
     out
 }
 
+/**
+ * effective_class_consts — a class's EFFECTIVE static member consts (#594 crumb 7): its OWN consts,
+ * plus every base-chain const whose name it does NOT redeclare (a nearer declaration SHADOWS a
+ * farther one — static hiding, D6). Mirrors `effective_class_methods` for the const surface, so
+ * `Sub::K` reaches a base's `pub`/`exp` member const by name while a redeclared `Sub::K` hides it.
+ *
+ * @param cb     the class body
+ * @param table  the type table (to follow the base chain)
+ * @return       the effective member consts (own first, then non-shadowed inherited), or an error
+ * @throws       when a base class cannot be resolved
+ * @since #594
+ */
+pub fn effective_class_consts(cb: parser::ClassBody, table: TypeTable) -> []parser::ConstDecl | error {
+    mut out = cb.consts
+    if cb.has_base {
+        let base_cb = match find_class_body(cb.base_name, table) { parser::ClassBody as b => b; error as e => return e }
+        let base_consts = match effective_class_consts(base_cb, table) { []parser::ConstDecl as c => c; error as e => return e }
+        mut i: u64 = 0
+        loop {
+            if i >= base_consts.len { break }
+            if !consts_have_name(out, base_consts[i].name) { out = teko::list::push(out, base_consts[i]) }
+            i++
+        }
+    }
+    out
+}
+
+/**
+ * body_consts — the static member consts declared on a struct/class/trait body (#594 crumb 7); any
+ * other body kind (enum/flags/variant/alias/extern/interface) carries none.
+ *
+ * @param body  the type body
+ * @return      its member consts, or an empty list for a body kind that cannot declare them
+ * @since #594
+ */
+pub fn body_consts(body: parser::TypeBody) -> []parser::ConstDecl {
+    match body {
+        parser::StructBody as sb => sb.consts
+        parser::ClassBody as cb => cb.consts
+        parser::TraitBody as tb => tb.consts
+        _ => teko::list::empty()
+    }
+}
+
 // (W10b.CLASS residual — intern visibility) is `class_name` the same as, or a (transitive)
 // SUBCLASS of, `ancestor_name`? Used to decide whether an `intern` (subclass-visible) member is
 // reachable from `class_name`'s own code.
