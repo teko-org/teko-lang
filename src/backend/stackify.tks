@@ -417,8 +417,8 @@ type StackifyCtx = struct {
     /**
      * elide — the whole-function value-stack peephole decision table (§5,
      * `compute_func_elide`), built ONCE ahead of lowering and read-only
-     * thereafter: each VReg's final `elide_kind_*` tag. Defaults to an empty
-     * table (every VReg reads as `elide_kind_normal()`) for every caller
+     * thereafter: each VReg's final `ElideKind` tag. Defaults to an empty
+     * table (every VReg reads as `ElideKind::Normal`) for every caller
      * that never populates it — the ALL-LOCALS baseline every fine-grained
      * per-instruction test in `stackify_test.tkt` still exercises directly.
      *
@@ -530,50 +530,29 @@ fn sc_local_tee(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
 }
 
 /**
- * elide_kind_normal — the value-stack peephole's own `ElideTable` tag for
- * the ALL-LOCALS baseline (§5): `local.set` at def, `local.get` at every
- * use — unchanged from the pre-C1-5 shape. The DEFAULT tag every unset
- * `ElideTable` position reads as.
+ * ElideKind — the value-stack peephole's own `ElideTable` tag: `Normal` (the
+ * ALL-LOCALS baseline, §5 — `local.set` at def, `local.get` at every use,
+ * unchanged from the pre-C1-5 shape; the DEFAULT tag every unset
+ * `ElideTable` position reads as), `Drop` (a value fully riding the operand
+ * stack — §5's SINGLE-USE + SAME-BLOCK + LIFO + NO-BARRIER case — NEITHER
+ * `local.set` at def NOR `local.get` at its one confirmed use), or `Tee` (a
+ * value that rides the operand stack into its one confirmed in-block
+ * computational use WHILE ALSO persisting to a local for a separate
+ * edge-copy use — §5's "`local.tee` where the value must ALSO persist to a
+ * local" case). Purely an internal decision tag — never serialized to wasm
+ * bytes — so no wire mapping is needed.
  *
- * @return u8  the `Normal` tag
  * @since #389 C1-5
  */
-fn elide_kind_normal() -> u8 {
-    0 to u8
-}
-
-/**
- * elide_kind_drop — the `ElideTable` tag for a value fully riding the
- * operand stack (§5's SINGLE-USE + SAME-BLOCK + LIFO + NO-BARRIER case):
- * NEITHER `local.set` at def NOR `local.get` at its one confirmed use.
- *
- * @return u8  the `Drop` tag
- * @since #389 C1-5
- */
-fn elide_kind_drop() -> u8 {
-    1 to u8
-}
-
-/**
- * elide_kind_tee — the `ElideTable` tag for a value that rides the operand
- * stack into its one confirmed in-block computational use WHILE ALSO
- * persisting to a local for a separate edge-copy use (§5's "`local.tee`
- * where the value must ALSO persist to a local" case).
- *
- * @return u8  the `Tee` tag
- * @since #389 C1-5
- */
-fn elide_kind_tee() -> u8 {
-    2 to u8
-}
+pub type ElideKind = enum { Normal; Drop; Tee }
 
 /**
  * ElideTable — the whole-function value-stack peephole decision table (§5):
- * each VReg's final `elide_kind_*` tag, densely indexed by VReg id exactly
+ * each VReg's final `ElideKind` tag, densely indexed by VReg id exactly
  * like `WasmVTypeTable`/`WasmSlotTable` (PARALLELED rather than reused,
  * §1.3's own discipline — a decision tag is not a valtype byte or a frame
  * offset). Built ONCE, ahead of lowering, by `compute_func_elide`; every
- * unset position defaults to `elide_kind_normal()`, so a caller that never
+ * unset position defaults to `ElideKind::Normal`, so a caller that never
  * builds one (every fine-grained per-instruction unit test in
  * `stackify_test.tkt`) transparently keeps exercising the ALL-LOCALS
  * baseline.
@@ -582,15 +561,15 @@ fn elide_kind_tee() -> u8 {
  */
 type ElideTable = struct {
     /**
-     * kinds — each recorded VReg's final `elide_kind_*` tag, positionally
+     * kinds — each recorded VReg's final `ElideKind` tag, positionally
      * indexed by VReg id.
      */
-    kinds: []u8
+    kinds: []ElideKind
 }
 
 /**
  * et_empty — a decision table with no VRegs recorded yet (every position
- * defaults to `elide_kind_normal()`).
+ * defaults to `ElideKind::Normal`).
  *
  * @return ElideTable  the empty table
  * @since #389 C1-5
@@ -600,7 +579,7 @@ fn et_empty() -> ElideTable {
 }
 
 /**
- * et_grow — pad `t` with placeholder `elide_kind_normal()` entries until it
+ * et_grow — pad `t` with placeholder `ElideKind::Normal` entries until it
  * holds at least `n` positions (mirrors `wvt_grow`).
  *
  * @param ElideTable t  the table to pad
@@ -612,7 +591,7 @@ fn et_grow(t: ElideTable, n: u64) -> ElideTable {
     mut ks = t.kinds
     loop {
         if ks.len >= n { break }
-        ks = teko::list::push(ks, elide_kind_normal())
+        ks = teko::list::push(ks, ElideKind::Normal)
     }
     ElideTable { kinds = ks }
 }
@@ -623,13 +602,13 @@ fn et_grow(t: ElideTable, n: u64) -> ElideTable {
  *
  * @param ElideTable t0  the table to update
  * @param u32 id  the VReg id being recorded
- * @param u8 kind  its final `elide_kind_*` tag
+ * @param ElideKind kind  its final decision tag
  * @return ElideTable  the updated table
  * @since #389 C1-5
  */
-fn et_set(t0: ElideTable, id: u32, kind: u8) -> ElideTable {
+fn et_set(t0: ElideTable, id: u32, kind: ElideKind) -> ElideTable {
     let grown = et_grow(t0, (id to u64) + 1)
-    mut out: []u8 = teko::list::empty()
+    mut out: []ElideKind = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= grown.kinds.len { break }
@@ -640,17 +619,17 @@ fn et_set(t0: ElideTable, id: u32, kind: u8) -> ElideTable {
 }
 
 /**
- * et_get — the recorded decision for VReg `id`, or `elide_kind_normal()`
- * when `id` was never recorded (mirrors `wvt_get`).
+ * et_get — the recorded decision for VReg `id`, or `ElideKind::Normal` when
+ * `id` was never recorded (mirrors `wvt_get`).
  *
  * @param ElideTable t  the table to read
  * @param u32 id  the VReg id to look up
- * @return u8  its recorded (or default) `elide_kind_*` tag
+ * @return ElideKind  its recorded (or default) decision tag
  * @since #389 C1-5
  */
-fn et_get(t: ElideTable, id: u32) -> u8 {
+fn et_get(t: ElideTable, id: u32) -> ElideKind {
     let i = id to u64
-    if i >= t.kinds.len { return elide_kind_normal() }
+    if i >= t.kinds.len { return ElideKind::Normal }
     t.kinds[i]
 }
 
@@ -815,10 +794,10 @@ fn sc_use_operand(ctx0: StackifyCtx, vreg: u32) -> StackifyCtx {
 fn sc_def_result(ctx0: StackifyCtx, vreg: u32, vt: u8) -> StackifyCtx {
     let kind = et_get(ctx0.elide, vreg)
     let typed = sc_set_vtype(ctx0, vreg, vt)
-    if kind == elide_kind_drop() {
+    if kind == ElideKind::Drop {
         return StackifyCtx { body = typed.body; vtypes = typed.vtypes; scopes = typed.scopes; next_scratch = typed.next_scratch; has_frame = typed.has_frame; frame_base = typed.frame_base; slots = typed.slots; elide = typed.elide; pending = teko::list::push(typed.pending, vreg) }
     }
-    if kind == elide_kind_tee() {
+    if kind == ElideKind::Tee {
         let teed = sc_local_tee(typed, vreg)
         return StackifyCtx { body = teed.body; vtypes = teed.vtypes; scopes = teed.scopes; next_scratch = teed.next_scratch; has_frame = teed.has_frame; frame_base = teed.frame_base; slots = teed.slots; elide = teed.elide; pending = teko::list::push(teed.pending, vreg) }
     }
@@ -2705,16 +2684,16 @@ fn collect_use_info(f: lir::LFunc) -> UseInfoTable {
  * @param UseInfoTable use_info  the whole-function use analysis
  * @param u32 owner_block  the block `v` is defined in
  * @param u32 v  the VReg to classify
- * @return u8  the tentative `elide_kind_*` tag
+ * @return ElideKind  the tentative decision tag
  * @since #389 C1-5
  */
-fn elide_candidate_kind(use_info: UseInfoTable, owner_block: u32, v: u32) -> u8 {
-    if uit_is_param(use_info, v) { return elide_kind_normal() }
+fn elide_candidate_kind(use_info: UseInfoTable, owner_block: u32, v: u32) -> ElideKind {
+    if uit_is_param(use_info, v) { return ElideKind::Normal }
     let n = uit_count(use_info, v)
     if n == (1 to u32) {
         let site = uit_site_a(use_info, v)
-        if uit_site_block(site) == owner_block && !uit_site_is_edge(site) { return elide_kind_drop() }
-        return elide_kind_normal()
+        if uit_site_block(site) == owner_block && !uit_site_is_edge(site) { return ElideKind::Drop }
+        return ElideKind::Normal
     }
     if n == (2 to u32) {
         let sa = uit_site_a(use_info, v)
@@ -2723,11 +2702,11 @@ fn elide_candidate_kind(use_info: UseInfoTable, owner_block: u32, v: u32) -> u8 
         let a_edge = uit_site_block(sa) == owner_block && uit_site_is_edge(sa)
         let b_comp = uit_site_block(sb) == owner_block && !uit_site_is_edge(sb)
         let b_edge = uit_site_block(sb) == owner_block && uit_site_is_edge(sb)
-        if a_comp && b_edge { return elide_kind_tee() }
-        if b_comp && a_edge { return elide_kind_tee() }
-        return elide_kind_normal()
+        if a_comp && b_edge { return ElideKind::Tee }
+        if b_comp && a_edge { return ElideKind::Tee }
+        return ElideKind::Normal
     }
-    elide_kind_normal()
+    ElideKind::Normal
 }
 
 /**
@@ -2859,7 +2838,7 @@ type PendingFlush = struct {
     pending: []PendingItem
     /**
      * table — the decision table, with any newly-cancelled entries
-     * downgraded to `elide_kind_normal()`.
+     * downgraded to `ElideKind::Normal`.
      */
     table: ElideTable
 }
@@ -2949,7 +2928,7 @@ fn resolve_inst_operands(pending0: []PendingItem, table0: ElideTable, reversed_r
 /**
  * cancel_pending_loads — the §5 condition-4 barrier step (`inst_is_barrier`):
  * downgrade every `is_load` entry currently in `pending` to
- * `elide_kind_normal()` and drop it, leaving every non-load entry in place
+ * `ElideKind::Normal` and drop it, leaving every non-load entry in place
  * (a plain computed value safely survives on the real wasm stack across a
  * call/store — only a load result is hazarded, `inst_is_load`'s own doc).
  *
@@ -2966,7 +2945,7 @@ fn cancel_pending_loads(pending: []PendingItem, table0: ElideTable) -> PendingFl
         if i >= pending.len { break }
         let item = pending[i]
         if item.is_load {
-            table = et_set(table, item.vreg, elide_kind_normal())
+            table = et_set(table, item.vreg, ElideKind::Normal)
         } else {
             out = teko::list::push(out, item)
         }
@@ -2977,7 +2956,7 @@ fn cancel_pending_loads(pending: []PendingItem, table0: ElideTable) -> PendingFl
 
 /**
  * cancel_all_pending — downgrade every entry still in `pending` to
- * `elide_kind_normal()` (the defensive end-of-block flush, §3.3's own
+ * `ElideKind::Normal` (the defensive end-of-block flush, §3.3's own
  * "the operand stack is empty at every label boundary" invariant): should
  * never actually find anything, given a correctly-computed `use_info`
  * (every same-block single/double use is, by construction, reachable
@@ -2995,7 +2974,7 @@ fn cancel_all_pending(pending: []PendingItem, table0: ElideTable) -> ElideTable 
     mut i: u64 = 0
     loop {
         if i >= pending.len { break }
-        table = et_set(table, pending[i].vreg, elide_kind_normal())
+        table = et_set(table, pending[i].vreg, ElideKind::Normal)
         i++
     }
     table
@@ -3047,7 +3026,7 @@ fn compute_block_elide(block: lir::LBlock, use_info: UseInfoTable, table0: Elide
         if inst.has_result {
             let kind = elide_candidate_kind(use_info, block.id, inst.result)
             table = et_set(table, inst.result, kind)
-            if kind != elide_kind_normal() {
+            if kind != ElideKind::Normal {
                 pending = teko::list::push(pending, PendingItem { vreg = inst.result; is_load = inst_is_load(inst) })
             }
         }
