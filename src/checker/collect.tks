@@ -407,12 +407,12 @@ pub fn canon_class_bases(program: parser::Program) -> parser::Program {
                     parser::ClassBody as cb => {
                         if cb.has_base || cb.implements.len > 0 {
                             let cbase = if cb.has_base { canon_ref_name(cb.base_name, table, it.namespace) } else { cb.base_name }
-                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cbase; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = canon_ref_list(cb.implements, table, it.namespace); fields = cb.fields; methods = cb.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cbase; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = canon_ref_list(cb.implements, table, it.namespace); fields = cb.fields; methods = cb.methods; consts = cb.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
                         }
                     }
                     parser::StructBody as sb => {
                         if sb.implements.len > 0 {
-                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = sb.methods; implements = canon_ref_list(sb.implements, table, it.namespace) }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = sb.methods; implements = canon_ref_list(sb.implements, table, it.namespace); consts = sb.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
                         }
                     }
                     parser::InterfaceBody as ifb => {
@@ -1052,7 +1052,7 @@ type TraitDerive = struct { type_name: str; trait_name: str }
  * recognized by `is_structural_trait` (a closed set) BEFORE the trait/interface probe.
  */
 type SplitImpls = struct { traits: []str; ifaces: []str; structural: []str }
-type FoldedMembers = struct { fields: []parser::Field; methods: []parser::Function }
+type FoldedMembers = struct { fields: []parser::Field; methods: []parser::Function; consts: []parser::ConstDecl }
 
 fn split_trait_derives(implements: []str, table: TypeTable, ref_ns: str) -> SplitImpls {
     mut traits: []str = teko::list::empty()
@@ -1088,6 +1088,20 @@ fn methods_have_name(methods: []parser::Function, name: str) -> bool {
     false
 }
 
+/**
+ * (TR3, #594 crumb 7) does `consts` already declare a member const named `name`? Used to reject a
+ * trait member const that would collide with the deriver's own (or an earlier co-derived trait's).
+ *
+ * @param consts  the member consts accumulated so far
+ * @param name    the candidate member const name
+ * @return        true iff a member const of that name already exists
+ */
+fn consts_have_name(consts: []parser::ConstDecl, name: str) -> bool {
+    mut i: u64 = 0
+    loop { if i >= consts.len { break }; if consts[i].name == name { return true }; i++ }
+    false
+}
+
 // fold `trait_names`' members into ONE deriver. Fields APPEND after the deriver's own — a name
 // collision (with the deriver's own fields or an earlier trait's) is a COMPILE ERROR (fields
 // cannot be overridden — rename or don't co-derive). A trait method WITH a body folds in UNLESS
@@ -1098,9 +1112,10 @@ fn methods_have_name(methods: []parser::Function, name: str) -> bool {
 // field's visibility obeys the DERIVER's kind (`into_class`: struct = public value data, class =
 // encapsulated/private); a folded method is `pub` (the bundle's methods are its public surface,
 // and a class needs `pub` methods to satisfy interfaces through them).
-fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: []parser::Function, trait_names: []str, table: TypeTable, into_class: bool) -> FoldedMembers | error {
+fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: []parser::Function, own_consts: []parser::ConstDecl, trait_names: []str, table: TypeTable, into_class: bool) -> FoldedMembers | error {
     mut fields = own_fields
     mut methods = own_methods
+    mut consts = own_consts
     mut i: u64 = 0
     loop {
         if i >= trait_names.len { break }
@@ -1123,6 +1138,16 @@ fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: 
             fields = teko::list::push(fields, parser::Field { name = tf.name; type_ann = tf.type_ann; vis = fvis; is_intern = false; has_doc = tf.has_doc; doc = tf.doc })
             fi++
         }
+        mut ci: u64 = 0
+        loop {
+            if ci >= tb.consts.len { break }
+            let tc = tb.consts[ci]
+            if consts_have_name(consts, tc.name) {
+                return error { message = $"trait '{tname}' const '{tc.name}' collides with an existing member const on '{type_name}' — rename it or do not co-derive" }
+            }
+            consts = teko::list::push(consts, tc)
+            ci++
+        }
         mut mi: u64 = 0
         loop {
             if mi >= tb.methods.len { break }
@@ -1141,7 +1166,7 @@ fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: 
         }
         i++
     }
-    FoldedMembers { fields = fields; methods = methods }
+    FoldedMembers { fields = fields; methods = methods; consts = consts }
 }
 
 // the bodyless-REQUIREMENT check, against the FOLDED table: for each recorded (deriver, trait)
@@ -1289,16 +1314,16 @@ fn fold_user_traits(program: parser::Program, table: TypeTable) -> UserFoldResul
                 parser::StructBody as sb => {
                     let split = split_trait_derives(sb.implements, table, it.namespace)
                     if split.traits.len > 0 {
-                        let fm = match fold_trait_members(td.name, sb.fields, sb.methods, split.traits, table, false) { FoldedMembers as f => f; error as e => return e }
-                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = sb.implements }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+                        let fm = match fold_trait_members(td.name, sb.fields, sb.methods, sb.consts, split.traits, table, false) { FoldedMembers as f => f; error as e => return e }
+                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = sb.implements; consts = fm.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
                         derives = record_user_trait_derives(derives, td.name, split.traits)
                     }
                 }
                 parser::ClassBody as cb => {
                     let split = split_trait_derives(cb.implements, table, it.namespace)
                     if split.traits.len > 0 {
-                        let fm = match fold_trait_members(td.name, cb.fields, cb.methods, split.traits, table, true) { FoldedMembers as f => f; error as e => return e }
-                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = fm.fields; methods = fm.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+                        let fm = match fold_trait_members(td.name, cb.fields, cb.methods, cb.consts, split.traits, table, true) { FoldedMembers as f => f; error as e => return e }
+                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = fm.fields; methods = fm.methods; consts = fm.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
                         derives = record_user_trait_derives(derives, td.name, split.traits)
                     }
                 }
@@ -1338,7 +1363,7 @@ fn record_user_trait_derives(derives: []TraitDerive, td_name: str, traits: []str
  * @return the rewritten `TypeDecl`
  */
 fn struct_with_methods(td: parser::TypeDecl, sb: parser::StructBody, extra: []parser::Function) -> parser::TypeDecl {
-    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = append_methods(sb.methods, extra); implements = sb.implements }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = append_methods(sb.methods, extra); implements = sb.implements; consts = sb.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
 }
 
 /**
@@ -1351,7 +1376,7 @@ fn struct_with_methods(td: parser::TypeDecl, sb: parser::StructBody, extra: []pa
  * @return the rewritten `TypeDecl`
  */
 fn class_with_methods(td: parser::TypeDecl, cb: parser::ClassBody, extra: []parser::Function) -> parser::TypeDecl {
-    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = cb.fields; methods = append_methods(cb.methods, extra) }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = cb.fields; methods = append_methods(cb.methods, extra); consts = cb.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
 }
 
 /**
