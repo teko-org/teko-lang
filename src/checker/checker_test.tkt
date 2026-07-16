@@ -316,6 +316,51 @@ fn collects_const_forward_ref_resolves_in_pass1() {
     match type_function(uses_k, env, table) { TFunction => teko::assert::is_true(true); error => teko::assert::is_true(false) }
 }
 
+/**
+ * type_program_with_deps_resolves_const_forward_ref — the REAL CLI build path
+ * (`checked_program_of` → `type_program_with_deps` → `collect_with_seed`) binds EVERY module-level
+ * const's name in pass-1 before any initializer is typed, so a const whose initializer FORWARD-
+ * references a const declared LATER in the file resolves, and the dependency-ordered inliner folds
+ * it. `const B: i64 = A + 1` sits ABOVE `const A: i64 = 1`; `uses_b` reads `B`, and the checked
+ * program inlines `B` to 2 (#594 crumb 2). The with-deps companion of
+ * `collects_const_forward_ref_resolves_in_pass1` (which only exercised `type_program`/`collect_funcs`);
+ * the dep program is EMPTY — the single-project path every `teko build` takes.
+ */
+#test
+fn type_program_with_deps_resolves_const_forward_ref() {
+    let b_init = ek(parser::Binary { op = lexer::TokenKind::Plus; left = e_var("A"); right = e_num(1) })
+    let b = parser::ConstDecl { name = "B"; ty = named_t("i64"); init = b_init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    let a = parser::ConstDecl { name = "A"; ty = named_t("i64"); init = e_num(1); vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 2; col = 1 }
+    let uses_b = mk_fn("uses_b", named_t("i64"), one_stmt(e_var("B")))
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, parser::Item { content = b; namespace = ""; file = "app.tks" })
+    items = teko::list::push(items, parser::Item { content = a; namespace = ""; file = "app.tks" })
+    items = teko::list::push(items, parser::Item { content = uses_b; namespace = ""; file = "app.tks" })
+    let empty_dep = TProgram { items = teko::list::empty() }
+    match type_program_with_deps(parser::Program { items = items }, empty_dep) {
+        TProgram as tp => {
+            mut found = false
+            mut i: u64 = 0
+            loop {
+                if i >= tp.items.len { break }
+                match tp.items[i] {
+                    TFunction as f => if f.name == "uses_b" {
+                        found = true
+                        match f.body[0] {
+                            TExprStmt as es => match es.expr.kind { TNumber as n => teko::assert::is_true(n.value == 2); _ => teko::assert::is_true(false) }
+                            _ => teko::assert::is_true(false)
+                        }
+                    }
+                    _ => { }
+                }
+                i++
+            }
+            teko::assert::is_true(found)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
 /** collects_const_unknown_type_is_located_error — a `const` whose declared type names no known type
     yields an error positioned at the const's own line/col, not a silent success (#594 crumb 2). */
 #test
