@@ -1107,17 +1107,17 @@ fn shift_ext_x86(op: MShiftOpX86) -> u32 {
 fn encode_movimm_x86(i: MMovImmX86) -> EncInstX86 {
     if !i.wide {
         mut b = push_rex_x86(teko::list::empty(), false, false, false, reg_ext_x86(i.dst))
-        b = push_byte_x86(b, (0xB8 to u32) + reg_low3_x86(i.dst))
+        b = push_byte_x86(b, X86_OP_MOV_R_IMM + reg_low3_x86(i.dst))
         return plain_inst_x86(push_imm32_x86(b, i.imm64))
     }
     if fits_i32_x86(i.imm64) {
         mut b = push_rex_x86(teko::list::empty(), true, false, false, reg_ext_x86(i.dst))
-        b = push_byte_x86(b, 0xC7 to u32)
-        b = push_byte_x86(b, modrm_x86(3 to u32, 0 to u32, reg_low3_x86(i.dst)))
+        b = push_byte_x86(b, X86_OP_MOV_RM_IMM32)
+        b = push_byte_x86(b, modrm_x86(MODRM_MOD_REGISTER, 0 to u32, reg_low3_x86(i.dst)))
         return plain_inst_x86(push_imm32_x86(b, i.imm64))
     }
     mut b = push_rex_x86(teko::list::empty(), true, false, false, reg_ext_x86(i.dst))
-    b = push_byte_x86(b, (0xB8 to u32) + reg_low3_x86(i.dst))
+    b = push_byte_x86(b, X86_OP_MOV_R_IMM + reg_low3_x86(i.dst))
     plain_inst_x86(push_imm64_x86(b, i.imm64))
 }
 
@@ -1129,7 +1129,7 @@ fn encode_movimm_x86(i: MMovImmX86) -> EncInstX86 {
  * @return EncInstX86  the encoded instruction
  */
 fn encode_mov_x86(i: MMovX86) -> EncInstX86 {
-    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, false, 0x89 to u32, i.src, i.dst))
+    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, false, X86_OP_MOV_RM_R, i.src, i.dst))
 }
 
 /**
@@ -1153,7 +1153,7 @@ fn encode_alu_rm_x86(i: MAluRmX86) -> EncInstX86 {
  * @return EncInstX86  the encoded instruction
  */
 fn encode_imul_x86(i: MImulX86) -> EncInstX86 {
-    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, true, 0xAF to u32, i.dst, i.src))
+    plain_inst_x86(emit_rr_x86(teko::list::empty(), i.wide, true, X86_OP_IMUL_R_RM, i.dst, i.src))
 }
 
 /**
@@ -1167,20 +1167,20 @@ fn encode_imul_x86(i: MImulX86) -> EncInstX86 {
  * @return EncInstX86  the encoded instruction sequence
  */
 fn encode_divseq_x86(i: MDivSeqX86) -> EncInstX86 {
-    let rax = preg(0 to u32, MRegClass::GPR)
-    let rdx = preg(2 to u32, MRegClass::GPR)
-    mut b = emit_rr_x86(teko::list::empty(), i.wide, false, 0x89 to u32, i.a, rax)
+    let rax = preg(X86_REG_RAX_ID, MRegClass::GPR)
+    let rdx = preg(X86_REG_RDX_ID, MRegClass::GPR)
+    mut b = emit_rr_x86(teko::list::empty(), i.wide, false, X86_OP_MOV_RM_R, i.a, rax)
     if i.is_signed {
-        if i.wide { b = push_byte_x86(b, 0x48 to u32) }
-        b = push_byte_x86(b, 0x99 to u32)
+        if i.wide { b = push_byte_x86(b, REX_W_PREFIX) }
+        b = push_byte_x86(b, X86_OP_CQO)
     } else {
-        b = push_byte_x86(b, 0x31 to u32)
-        b = push_byte_x86(b, 0xD2 to u32)
+        b = push_byte_x86(b, X86_OP_XOR_RM_R)
+        b = push_byte_x86(b, modrm_x86(MODRM_MOD_REGISTER, X86_REG_RDX_ID, X86_REG_RDX_ID))
     }
-    let ext_field = if i.is_signed { 0x7 to u32 } else { 0x6 to u32 }
-    b = emit_rm_ext_x86(b, i.wide, 0xF7 to u32, ext_field, i.b)
+    let ext_field = if i.is_signed { X86_EXT_IDIV } else { X86_EXT_DIV }
+    b = emit_rm_ext_x86(b, i.wide, X86_OP_GRP3_F7, ext_field, i.b)
     let srcreg = if i.is_rem { rdx } else { rax }
-    plain_inst_x86(emit_rr_x86(b, i.wide, false, 0x89 to u32, srcreg, i.dst))
+    plain_inst_x86(emit_rr_x86(b, i.wide, false, X86_OP_MOV_RM_R, srcreg, i.dst))
 }
 
 /**
