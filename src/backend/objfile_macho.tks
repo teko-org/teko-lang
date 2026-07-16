@@ -347,6 +347,13 @@ fn compute_macho_layout(enc: EncodedModule, strtab_size: u32) -> MachoLayout {
 }
 
 /**
+ * MACHO_MAGIC_64 — the Mach-O `mach_header_64.magic` file-magic (`MH_MAGIC_64`,
+ * `0xFEEDFACF`), identifying a 64-bit, native-endian Mach-O object to every
+ * Mach-O-aware tool (`ld`, `otool`, the kernel loader).
+ */
+const MACHO_MAGIC_64: u32 = 0xFEEDFACF
+
+/**
  * emit_header — the `mach_header_64` (32 bytes): magic `0xFEEDFACF`, cputype
  * `CPU_TYPE_ARM64` (0x0100000C), cpusubtype 0, filetype `MH_OBJECT` (1), the
  * four load commands, `sizeofcmds`, flags 0, reserved 0.
@@ -356,7 +363,7 @@ fn compute_macho_layout(enc: EncodedModule, strtab_size: u32) -> MachoLayout {
  * @return []byte  `buf` followed by the 32-byte header
  */
 fn emit_header(buf: []byte, lay: MachoLayout) -> []byte {
-    mut b = emit_u32_le(buf, 0xFEEDFACF to u32)
+    mut b = emit_u32_le(buf, MACHO_MAGIC_64)
     b = emit_u32_le(b, 0x0100000C to u32)
     b = emit_u32_le(b, 0 to u32)
     b = emit_u32_le(b, 1 to u32)
@@ -399,6 +406,23 @@ fn emit_section(buf: []byte, sectname: str, segname: str, addr: u32, size: u32, 
 }
 
 /**
+ * S_ATTR_PURE_INSTRUCTIONS — the Mach-O `section_64.flags` attribute bit (bit
+ * 31, `0x80000000`) marking a section as containing only CPU instructions, no
+ * data references.
+ */
+const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x80000000
+
+/**
+ * S_ATTR_SOME_INSTRUCTIONS — the Mach-O `section_64.flags` attribute bit (bit
+ * 10, `0x00000400`) marking a section as containing at least some CPU
+ * instructions. Combined with `S_ATTR_PURE_INSTRUCTIONS` for `__text`; the two
+ * bits sit 21 positions apart — too sparse for a sequential `flags` bitmask
+ * (which auto-assigns `1 << position` starting at bit 0) — so both are plain
+ * `const`s ORed at the call site (#594 crumb 11).
+ */
+const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x00000400
+
+/**
  * emit_segment — the single `LC_SEGMENT_64` load command (empty segment name)
  * and its sections: `__text` (pure-instructions, carrying the relocations) and,
  * when rodata is present, `__const`. The segment's `filesize` spans the
@@ -423,7 +447,7 @@ fn emit_segment(buf: []byte, lay: MachoLayout) -> []byte {
     b = emit_u32_le(b, lay.nsects)
     b = emit_u32_le(b, 0 to u32)
     let text_reloff = if lay.nreloc > (0 to u32) { lay.reloc_offset } else { 0 to u32 }
-    b = emit_section(b, "__text", "__TEXT", 0 to u32, lay.text_size, lay.text_offset, 2 to u32, text_reloff, lay.nreloc, 0x80000400 to u32)
+    b = emit_section(b, "__text", "__TEXT", 0 to u32, lay.text_size, lay.text_offset, 2 to u32, text_reloff, lay.nreloc, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)
     if lay.nsects > (1 to u32) {
         b = emit_section(b, "__const", "__TEXT", lay.text_size, lay.const_size, lay.const_offset, 0 to u32, 0 to u32, 0 to u32, 0 to u32)
     }
@@ -539,6 +563,45 @@ fn section_addr(sect: u8, text_size: u32) -> u32 {
 }
 
 /**
+ * MachoSymType — an `nlist_64` symbol's classification, driving its `n_type`
+ * byte through `macho_symtype_wire`: a defined, file-local symbol (`N_SECT`),
+ * a defined, externally-visible symbol (`N_SECT | N_EXT`), or an undefined
+ * external reference (`N_UNDF | N_EXT`). The wire byte (`0x0E`/`0x0F`/`0x01`)
+ * does not match the enum's declaration ordinal — `macho_symtype_wire` is the
+ * single emit-site mapping, mirroring #594 crumb 10's enum-wire pattern.
+ */
+type MachoSymType = enum { Undefined; DefinedLocal; DefinedGlobal }
+
+/**
+ * macho_symtype_wire — the `nlist_64.n_type` byte for a `MachoSymType`:
+ * `N_UNDF | N_EXT` (`0x01`) for `Undefined`, `N_SECT` (`0x0E`) for
+ * `DefinedLocal`, `N_SECT | N_EXT` (`0x0F`) for `DefinedGlobal`.
+ *
+ * @param t  the symbol's classification
+ * @return   the wire `n_type` byte
+ */
+fn macho_symtype_wire(t: MachoSymType) -> u32 {
+    match t {
+        Undefined => 0x01 to u32
+        DefinedLocal => 0x0E to u32
+        DefinedGlobal => 0x0F to u32
+    }
+}
+
+/**
+ * macho_sym_type — classify a neutral `Symbol` into its `MachoSymType`: an
+ * undefined reference, a defined file-local symbol, or a defined
+ * externally-visible symbol.
+ *
+ * @param s  the symbol to classify
+ * @return   the symbol's `MachoSymType`
+ */
+fn macho_sym_type(s: Symbol) -> MachoSymType {
+    if !s.defined { return MachoSymType::Undefined }
+    if s.local { MachoSymType::DefinedLocal } else { MachoSymType::DefinedGlobal }
+}
+
+/**
  * emit_one_symbol — one `nlist_64` (16 bytes): the `n_strx` name offset, then
  * the type/section/value triple — a defined symbol is `N_SECT` (0x0E), plus
  * `N_EXT` (making it `0x0F`) unless `local`, in its section at its ABSOLUTE
@@ -554,12 +617,10 @@ fn section_addr(sect: u8, text_size: u32) -> u32 {
  */
 fn emit_one_symbol(buf: []byte, s: Symbol, strx: u32, text_size: u32) -> []byte {
     mut b = emit_u32_le(buf, strx)
+    b = emit_u8_field(b, macho_symtype_wire(macho_sym_type(s)))
     if s.defined {
-        let ntype = if s.local { 0x0E to u32 } else { 0x0F to u32 }
-        b = emit_u8_field(b, ntype)
         b = emit_u8_field(b, s.sect to u32)
     } else {
-        b = emit_u8_field(b, 0x01 to u32)
         b = emit_u8_field(b, 0 to u32)
     }
     b = teko::list::push(b, 0 to byte)
