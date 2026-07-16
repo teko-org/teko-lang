@@ -41,21 +41,54 @@
 
 // --- constants -----------------------------------------------------------------------
 
-pub fn pi() -> f64 { 3.14159265358979323846 }
-pub fn tau() -> f64 { 6.28318530717958647692 }   // 2*pi, kept as its own literal (no reliance on `*` folding order)
-pub fn e() -> f64 { 2.71828182845904523536 }
-pub fn sqrt2() -> f64 { 1.41421356237309504880 }
-pub fn ln2() -> f64 { 0.69314718055994530942 }
-pub fn ln10() -> f64 { 2.30258509299404568402 }
+/**
+ * `PI` — the ratio of a circle's circumference to its diameter.
+ */
+pub const PI: f64 = 3.14159265358979323846
 
-// IEEE-754 binary64 layout (used by inf/nan/classification/copysign below):
-//   bit 63       sign
-//   bits 62..52  exponent (11 bits; all-ones = 0x7FF marks inf/nan)
-//   bits 51..0   mantissa (52 bits; zero mantissa + all-ones exponent = infinity;
-//                nonzero mantissa + all-ones exponent = NaN)
-fn exponent_mask() -> u64 { 0x7FF0000000000000 }
-fn mantissa_mask() -> u64 { 0x000FFFFFFFFFFFFF }
-fn sign_mask() -> u64 { 0x8000000000000000 }
+/**
+ * tau — `2 * PI`, kept as its own literal (not folded from `PI`) so the value
+ * does not depend on `*` folding order.
+ */
+pub fn tau() -> f64 { 6.28318530717958647692 }
+
+/**
+ * `E` — Euler's number, the base of the natural logarithm.
+ */
+pub const E: f64 = 2.71828182845904523536
+
+/**
+ * `SQRT2` — the square root of 2.
+ */
+pub const SQRT2: f64 = 1.41421356237309504880
+
+/**
+ * `LN2` — the natural logarithm of 2.
+ */
+pub const LN2: f64 = 0.69314718055994530942
+
+/**
+ * `LN10` — the natural logarithm of 10.
+ */
+pub const LN10: f64 = 2.30258509299404568402
+
+/**
+ * `EXPONENT_MASK` — the IEEE-754 binary64 exponent field (bits 62..52, 11
+ * bits; all-ones = `0x7FF` marks inf/nan).
+ */
+const EXPONENT_MASK: u64 = 0x7FF0000000000000
+
+/**
+ * `MANTISSA_MASK` — the IEEE-754 binary64 mantissa field (bits 51..0, 52
+ * bits; zero mantissa + all-ones exponent = infinity, nonzero mantissa +
+ * all-ones exponent = NaN).
+ */
+const MANTISSA_MASK: u64 = 0x000FFFFFFFFFFFFF
+
+/**
+ * `SIGN_MASK` — the IEEE-754 binary64 sign bit (bit 63).
+ */
+const SIGN_MASK: u64 = 0x8000000000000000
 
 // inf() — positive IEEE-754 infinity (exponent all-ones, mantissa zero, sign clear).
 pub fn inf() -> f64 { teko::f64_from_bits(0x7FF0000000000000) }
@@ -73,7 +106,7 @@ pub fn nan() -> f64 { teko::f64_from_bits(0x7FF8000000000000) }
 // to implement float comparison against NaN.
 pub fn is_nan(v: f64) -> bool {
     let bits = teko::f64_bits(v)
-    (bits & exponent_mask()) == exponent_mask() && (bits & mantissa_mask()) != 0
+    (bits & EXPONENT_MASK) == EXPONENT_MASK && (bits & MANTISSA_MASK) != 0
 }
 
 // is_inf — true iff `v`'s bit pattern has an all-ones exponent and a zero mantissa
@@ -81,19 +114,19 @@ pub fn is_nan(v: f64) -> bool {
 // since the roadmap only asks for a plain classifier).
 pub fn is_inf(v: f64) -> bool {
     let bits = teko::f64_bits(v)
-    (bits & exponent_mask()) == exponent_mask() && (bits & mantissa_mask()) == 0
+    (bits & EXPONENT_MASK) == EXPONENT_MASK && (bits & MANTISSA_MASK) == 0
 }
 
 // is_finite — neither NaN nor infinite (the exponent field is not all-ones).
 pub fn is_finite(v: f64) -> bool {
-    (teko::f64_bits(v) & exponent_mask()) != exponent_mask()
+    (teko::f64_bits(v) & EXPONENT_MASK) != EXPONENT_MASK
 }
 
 // is_normal — finite, nonzero, AND not a subnormal (denormal): the exponent field is
 // neither all-zero (zero/subnormal) nor all-ones (inf/nan).
 pub fn is_normal(v: f64) -> bool {
-    let exp_bits = teko::f64_bits(v) & exponent_mask()
-    exp_bits != 0 && exp_bits != exponent_mask()
+    let exp_bits = teko::f64_bits(v) & EXPONENT_MASK
+    exp_bits != 0 && exp_bits != EXPONENT_MASK
 }
 
 // --- abs / sign / copysign --------------------------------------------------------------
@@ -116,7 +149,7 @@ pub fn abs_i64(v: i64) -> i64 | error {
 // bit still set), while the bit-clear returns +0.0 for -0.0, +inf for -inf, and a NaN
 // (sign cleared, same payload) for NaN — exactly fabs.
 pub fn abs_f64(v: f64) -> f64 {
-    teko::f64_from_bits(teko::f64_bits(v) & ~sign_mask())
+    teko::f64_from_bits(teko::f64_bits(v) & ~SIGN_MASK)
 }
 
 // sign — returns -1 / 0 / 1 (i64) for an i64 input's algebraic sign.
@@ -140,8 +173,8 @@ pub fn sign_f64(v: f64) -> f64 {
 // copysign semantics; a bit-level operation, not `if signed_value < 0`, so it also
 // handles a signed zero / NaN `signed_value` correctly).
 pub fn copysign_f64(magnitude: f64, signed_value: f64) -> f64 {
-    let mag_bits = teko::f64_bits(magnitude) & ~sign_mask()
-    let sign_bit = teko::f64_bits(signed_value) & sign_mask()
+    let mag_bits = teko::f64_bits(magnitude) & ~SIGN_MASK
+    let sign_bit = teko::f64_bits(signed_value) & SIGN_MASK
     teko::f64_from_bits(mag_bits | sign_bit)
 }
 
@@ -223,7 +256,7 @@ pub fn lcm(a: i64, b: i64) -> i64 | error {
         error as e => return e
     }
     let scaled = a / g
-    if scaled != 0 && b > i64_max() / scaled { return error { message = "math::lcm: result overflows i64" } }
+    if scaled != 0 && b > I64_MAX / scaled { return error { message = "math::lcm: result overflows i64" } }
     scaled * b
 }
 
