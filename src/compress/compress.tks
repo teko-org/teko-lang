@@ -167,19 +167,24 @@ fn zip_str(buf: []byte, s: str) -> []byte {
 fn zip_fixed_dos_date() -> u32 { 0x5A21 }
 
 /**
- * ZIP local/central-directory compression-method code: no compression, entry bytes
- * stored verbatim.
- *
- * @return  `0`
+ * ZipMethod — the PKZIP local/central-directory compression-method tag: `Store` (no
+ * compression, entry bytes verbatim) or `Deflate` (RFC 1951). The format's own method
+ * codes (`0`/`8`) do not match the enum's declaration ordinal (`Store`=0, `Deflate`=1),
+ * so `zip_method_wire` is the single translation point between the tag and its
+ * on-disk `u16` code.
  */
-fn zip_method_store() -> u32 { 0 }
+pub type ZipMethod = enum { Store; Deflate }
 
 /**
- * ZIP local/central-directory compression-method code: DEFLATE (RFC 1951).
+ * zip_method_wire — the PKZIP on-disk method code (RFC-external, the ZIP spec's own
+ * numbering) a `ZipMethod` tag encodes to: `Store` → `0`, `Deflate` → `8`.
  *
- * @return  `8`
+ * @param m  the ZIP compression-method tag
+ * @return   the on-disk method code
  */
-fn zip_method_deflate() -> u32 { 8 }
+fn zip_method_wire(m: ZipMethod) -> u32 {
+    match m { Store => 0; Deflate => 8 }
+}
 
 /**
  * One bookkeeping record collected while writing local file headers, consumed when
@@ -194,7 +199,7 @@ type ZipCDEntry = struct {
     uncompressed_size: u32
     /** The size of the entry's data as stored in the archive, in bytes (== `uncompressed_size` for STORE). */
     compressed_size: u32
-    /** The compression method (`zip_method_store()` or `zip_method_deflate()`). */
+    /** The on-disk compression-method code (`zip_method_wire` of the entry's `ZipMethod`). */
     method: u32
     /** The byte offset of this entry's local file header from the start of the archive. */
     offset: u32
@@ -255,7 +260,8 @@ fn zip_extract(data: []byte, pos: u64, len: u64) -> []byte {
 /**
  * Decode one entry's data, dispatching on its ZIP compression method.
  *
- * @param method       the ZIP compression-method code (0 = STORE, 8 = DEFLATE)
+ * @param method       the on-disk ZIP compression-method code, as read from the archive
+ *                     (`zip_method_wire(ZipMethod::Store)` = STORE, `zip_method_wire(ZipMethod::Deflate)` = DEFLATE)
  * @param stored_bytes the entry's on-disk bytes (compressed, per `method`)
  * @return             the entry's original (uncompressed) bytes, or an `error` for an
  *                     unsupported method or malformed DEFLATE stream
@@ -263,8 +269,8 @@ fn zip_extract(data: []byte, pos: u64, len: u64) -> []byte {
  *                      is malformed
  */
 fn zip_decode_entry(method: u32, stored_bytes: []byte) -> []byte | error {
-    if method == zip_method_store() { return stored_bytes }
-    if method == zip_method_deflate() {
+    if method == zip_method_wire(ZipMethod::Store) { return stored_bytes }
+    if method == zip_method_wire(ZipMethod::Deflate) {
         return match teko::compress::inflate(stored_bytes) {
             []byte as out => out
             error as e => e
@@ -329,13 +335,12 @@ pub fn read_zip(data: []byte) -> []ZipEntry | error {
  * Compress `data` under the given ZIP method (STORE = pass through verbatim, DEFLATE =
  * `teko::compress::deflate`).
  *
- * @param method  the ZIP compression-method code (0 = STORE, 8 = DEFLATE)
+ * @param method  the ZIP compression-method tag
  * @param data    the entry's uncompressed bytes
  * @return        the entry's on-disk bytes under `method`
  */
-fn zip_encode_entry(method: u32, data: []byte) -> []byte {
-    if method == zip_method_deflate() { return teko::compress::deflate(data) }
-    data
+fn zip_encode_entry(method: ZipMethod, data: []byte) -> []byte {
+    match method { Deflate => teko::compress::deflate(data); Store => data }
 }
 
 /**
@@ -343,10 +348,11 @@ fn zip_encode_entry(method: u32, data: []byte) -> []byte {
  * record) from a list of entries, using ONE compression method for every entry.
  *
  * @param entries  the archive members to write, in the order they will appear on disk
- * @param method   the ZIP compression-method code applied to every entry (0 = STORE, 8 = DEFLATE)
+ * @param method   the ZIP compression-method tag applied to every entry
  * @return         the complete archive bytes
  */
-fn write_zip_entries(entries: []ZipEntry, method: u32) -> []byte {
+fn write_zip_entries(entries: []ZipEntry, method: ZipMethod) -> []byte {
+    let wire = zip_method_wire(method)
     mut buf: []byte = teko::list::empty()
     mut cd: []ZipCDEntry = teko::list::empty()
 
@@ -366,7 +372,7 @@ fn write_zip_entries(entries: []ZipEntry, method: u32) -> []byte {
         buf = teko::list::push(buf, 0x04 to byte)
         buf = zip_u16(buf, 20)
         buf = zip_u16(buf, 0)
-        buf = zip_u16(buf, method)
+        buf = zip_u16(buf, wire)
         buf = zip_u16(buf, 0)
         buf = zip_u16(buf, zip_fixed_dos_date())
         buf = zip_u32(buf, crc)
@@ -377,7 +383,7 @@ fn write_zip_entries(entries: []ZipEntry, method: u32) -> []byte {
         buf = zip_str(buf, entry.name)
         buf = zip_bytes(buf, stored_bytes)
 
-        cd = teko::list::push(cd, ZipCDEntry { name = entry.name; crc32 = crc; uncompressed_size = uncompressed_size; compressed_size = compressed_size; method = method; offset = off })
+        cd = teko::list::push(cd, ZipCDEntry { name = entry.name; crc32 = crc; uncompressed_size = uncompressed_size; compressed_size = compressed_size; method = wire; offset = off })
         i++
     }
 
@@ -438,7 +444,7 @@ fn write_zip_entries(entries: []ZipEntry, method: u32) -> []byte {
  * @return         the complete archive bytes
  */
 pub fn write_zip(entries: []ZipEntry) -> []byte {
-    write_zip_entries(entries, zip_method_store())
+    write_zip_entries(entries, ZipMethod::Store)
 }
 
 /**
@@ -449,5 +455,5 @@ pub fn write_zip(entries: []ZipEntry) -> []byte {
  * @return         the complete archive bytes
  */
 pub fn write_zip_deflate(entries: []ZipEntry) -> []byte {
-    write_zip_entries(entries, zip_method_deflate())
+    write_zip_entries(entries, ZipMethod::Deflate)
 }
