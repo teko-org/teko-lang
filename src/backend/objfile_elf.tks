@@ -65,6 +65,50 @@ fn build_elf_strtab(names: []str) -> ElfStrtab {
 }
 
 /**
+ * STB_LOCAL — the ELF `st_info` bind field value for a file-local symbol,
+ * visible only within this object.
+ */
+const STB_LOCAL: u8 = 0
+
+/**
+ * STB_GLOBAL — the ELF `st_info` bind field value for a globally-visible
+ * symbol, linkable from other objects.
+ */
+const STB_GLOBAL: u8 = 1
+
+/**
+ * STT_NOTYPE — the ELF `st_info` type field value for a symbol with no type:
+ * the reserved null symbol and every undefined extern reference.
+ */
+const STT_NOTYPE: u8 = 0
+
+/**
+ * STT_FUNC — the ELF `st_info` type field value for a function symbol.
+ */
+const STT_FUNC: u8 = 2
+
+/**
+ * STT_SECTION — the ELF `st_info` type field value for a section symbol: the
+ * single `.rodata` section symbol every rodata relocation targets.
+ */
+const STT_SECTION: u8 = 3
+
+/**
+ * st_info — pack an `Elf64_Sym.st_info` byte from its bind and type sub-fields:
+ * `(bind << 4) | stt`. `st_info` is a COMPOSED field (two adjacent sub-fields
+ * shifted into one byte), not an OR of independent bits, so a `flags` bitmask
+ * would misrepresent it — this is a plain helper over the `STB_*`/`STT_*`
+ * constants (#594 crumb 11).
+ *
+ * @param bind  the bind sub-field (`STB_LOCAL`/`STB_GLOBAL`)
+ * @param stt   the type sub-field (`STT_NOTYPE`/`STT_FUNC`/`STT_SECTION`)
+ * @return      the packed `st_info` byte
+ */
+fn st_info(bind: u8, stt: u8) -> u8 {
+    (bind << 4) | stt
+}
+
+/**
  * ElfSym — one resolved `Elf64_Sym` in the object's final symbol-table order
  * (local-then-global): its name (interned into `.strtab`), its `st_info`
  * bind/type byte, its `st_shndx` section index, and its `st_value`. For a
@@ -83,9 +127,10 @@ type ElfSym = struct {
      */
     name: str
     /**
-     * info — the `st_info` byte, `(bind << 4) | type`: `0x00` null, `0x03`
-     * LOCAL|SECTION (rodata), `0x12` GLOBAL|FUNC (defined function), `0x10`
-     * GLOBAL|NOTYPE (undefined extern).
+     * info — the `st_info` byte, packed by `st_info(bind, stt)`: `st_info(STB_LOCAL,
+     * STT_NOTYPE)` (`0x00`) null, `st_info(STB_LOCAL, STT_SECTION)` (`0x03`) LOCAL|SECTION
+     * (rodata), `st_info(STB_GLOBAL, STT_FUNC)` (`0x12`) GLOBAL|FUNC (defined function),
+     * `st_info(STB_GLOBAL, STT_NOTYPE)` (`0x10`) GLOBAL|NOTYPE (undefined extern).
      */
     info: u32
     /**
@@ -143,7 +188,7 @@ fn elf_append_text_locals(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
         if i >= symbols.len { break }
         let s = symbols[i]
         if s.defined && s.local && s.sect == (1 to u8) {
-            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x00 to u32; shndx = 1 to u32; value = s.offset })
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = st_info(STB_LOCAL, STT_NOTYPE) to u32; shndx = 1 to u32; value = s.offset })
         }
         i++
     }
@@ -168,7 +213,7 @@ fn elf_append_globals(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
         if i >= symbols.len { break }
         let s = symbols[i]
         if s.defined && !s.local {
-            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x12 to u32; shndx = 1 to u32; value = s.offset })
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = st_info(STB_GLOBAL, STT_FUNC) to u32; shndx = 1 to u32; value = s.offset })
         }
         i++
     }
@@ -192,7 +237,7 @@ fn elf_append_undefined(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
         if i >= symbols.len { break }
         let s = symbols[i]
         if !s.defined {
-            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x10 to u32; shndx = 0 to u32; value = 0 to u32 })
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = st_info(STB_GLOBAL, STT_NOTYPE) to u32; shndx = 0 to u32; value = 0 to u32 })
         }
         i++
     }
@@ -217,7 +262,7 @@ fn elf_append_undefined(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
 fn elf_build_symbols(symbols: []Symbol) -> []ElfSym {
     mut out: []ElfSym = teko::list::push(teko::list::empty(), ElfSym { name = ""; info = 0 to u32; shndx = 0 to u32; value = 0 to u32 })
     if elf_has_rodata_section(symbols) {
-        out = teko::list::push(out, ElfSym { name = ""; info = 0x03 to u32; shndx = 2 to u32; value = 0 to u32 })
+        out = teko::list::push(out, ElfSym { name = ""; info = st_info(STB_LOCAL, STT_SECTION) to u32; shndx = 2 to u32; value = 0 to u32 })
     }
     out = elf_append_text_locals(out, symbols)
     out = elf_append_globals(out, symbols)
@@ -300,7 +345,7 @@ fn elf_rodata_secsym_index(syms: []ElfSym) -> u32 {
     mut i: u64 = 0
     loop {
         if i >= syms.len { break }
-        if syms[i].info == (0x03 to u32) && syms[i].shndx == (2 to u32) { return i to u32 }
+        if syms[i].info == (st_info(STB_LOCAL, STT_SECTION) to u32) && syms[i].shndx == (2 to u32) { return i to u32 }
         i++
     }
     syms.len to u32
@@ -584,6 +629,14 @@ fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, strtab_len: u32, s
 }
 
 /**
+ * ELF_MAGIC — the `Elf64_Ehdr.e_ident` file-magic bytes (`\x7fELF`), identifying
+ * the file as an ELF object to every ELF-aware tool (`ld`, `readelf`, the kernel
+ * loader). A Tier-A aggregate const (#594 crumb 11), mirroring `GZIP_MAGIC`'s
+ * pattern — read once into `emit_elf_header` by index.
+ */
+const ELF_MAGIC: []byte = [0x7F to byte, 0x45 to byte, 0x4C to byte, 0x46 to byte]
+
+/**
  * emit_elf_header — the 64-byte `Elf64_Ehdr`: the `e_ident` magic (`\x7fELF` +
  * ELFCLASS64 + ELFDATA2LSB + EV_CURRENT + ELFOSABI_SYSV + 8 pad bytes), then
  * `e_type = ET_REL`(1), the supplied `e_machine` (EM_X86_64=62 / EM_RISCV=243),
@@ -600,10 +653,11 @@ fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, strtab_len: u32, s
  * @return []byte  `buf` followed by the 64-byte Ehdr
  */
 fn emit_elf_header(buf: []byte, lay: ElfLayout, e_machine: u32, e_flags: u32) -> []byte {
-    mut b = teko::list::push(buf, 0x7F to byte)
-    b = teko::list::push(b, 0x45 to byte)
-    b = teko::list::push(b, 0x4C to byte)
-    b = teko::list::push(b, 0x46 to byte)
+    let magic = ELF_MAGIC
+    mut b = teko::list::push(buf, magic[0])
+    b = teko::list::push(b, magic[1])
+    b = teko::list::push(b, magic[2])
+    b = teko::list::push(b, magic[3])
     b = teko::list::push(b, 2 to byte)
     b = teko::list::push(b, 1 to byte)
     b = teko::list::push(b, 1 to byte)
@@ -660,6 +714,43 @@ fn emit_elf_shdr(buf: []byte, name_off: u32, sh_type: u32, sh_flags: u32, sh_off
 }
 
 /**
+ * SHF_WRITE — the `Elf64_Shdr.sh_flags` bit (bit 0, `0x1`) marking a section as
+ * writable at load time. Not combined at any call site today; named alongside
+ * `SHF_ALLOC`/`SHF_EXECINSTR` for a complete, spec-faithful family.
+ */
+const SHF_WRITE: u32 = 0x1
+
+/**
+ * SHF_ALLOC — the `Elf64_Shdr.sh_flags` bit (bit 1, `0x2`) marking a section as
+ * occupying memory during process execution (set on `.text` and `.rodata`).
+ */
+const SHF_ALLOC: u32 = 0x2
+
+/**
+ * SHF_EXECINSTR — the `Elf64_Shdr.sh_flags` bit (bit 2, `0x4`) marking a
+ * section as containing executable machine instructions (set on `.text`,
+ * combined with `SHF_ALLOC`).
+ *
+ * A `flags` bitmask (rather than these plain `const`s) is the more faithful
+ * spelling of this OR-of-independent-bits family, but the `flags`→integer wire
+ * cast a byte-emitting call site needs (#594 crumb 11's checker addition,
+ * `typer.tks` E8) has not yet shipped in a released seed — the project's
+ * bootstrap-seed rule (`docs/design/const-module-level-plan.md` §8) requires a
+ * checker feature to land in a released seed BEFORE the corpus may spell it.
+ * A follow-on crumb converts this family to `flags ElfSectionFlags` once such a
+ * seed exists; until then these stay plain named `const`s (the "mapeamento no
+ * emit site" fallback), ORed directly at each call site.
+ */
+const SHF_EXECINSTR: u32 = 0x4
+
+/**
+ * SHF_INFO_LINK — the `Elf64_Shdr.sh_flags` bit (bit 6, `0x40`) marking a
+ * section's `sh_info` as another section index rather than a plain count (set
+ * on `.rela.text`, whose `sh_info` names `.text`).
+ */
+const SHF_INFO_LINK: u32 = 0x40
+
+/**
  * emit_elf_shdrs — the seven section headers in table order: the null header,
  * then `.text` (PROGBITS, ALLOC|EXECINSTR, align 16), `.rodata` (PROGBITS,
  * ALLOC, align 8), `.symtab` (SYMTAB, `sh_link` → `.strtab`(4), `sh_info` =
@@ -675,12 +766,12 @@ fn emit_elf_shdr(buf: []byte, name_off: u32, sh_type: u32, sh_flags: u32, sh_off
  */
 fn emit_elf_shdrs(buf: []byte, lay: ElfLayout, shname: []u32) -> []byte {
     mut b = emit_elf_shdr(buf, shname[0], 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32)
-    b = emit_elf_shdr(b, shname[1], 1 to u32, 0x6 to u32, lay.text_offset, lay.text_size, 0 to u32, 0 to u32, 16 to u32, 0 to u32)
-    b = emit_elf_shdr(b, shname[2], 1 to u32, 0x2 to u32, lay.rodata_offset, lay.rodata_size, 0 to u32, 0 to u32, 8 to u32, 0 to u32)
+    b = emit_elf_shdr(b, shname[1], 1 to u32, SHF_ALLOC | SHF_EXECINSTR, lay.text_offset, lay.text_size, 0 to u32, 0 to u32, 16 to u32, 0 to u32)
+    b = emit_elf_shdr(b, shname[2], 1 to u32, SHF_ALLOC, lay.rodata_offset, lay.rodata_size, 0 to u32, 0 to u32, 8 to u32, 0 to u32)
     b = emit_elf_shdr(b, shname[3], 2 to u32, 0 to u32, lay.symtab_offset, lay.symtab_size, 4 to u32, lay.first_global, 8 to u32, 24 to u32)
     b = emit_elf_shdr(b, shname[4], 3 to u32, 0 to u32, lay.strtab_offset, lay.strtab_size, 0 to u32, 0 to u32, 1 to u32, 0 to u32)
     b = emit_elf_shdr(b, shname[5], 3 to u32, 0 to u32, lay.shstrtab_offset, lay.shstrtab_size, 0 to u32, 0 to u32, 1 to u32, 0 to u32)
-    emit_elf_shdr(b, shname[6], 4 to u32, 0x40 to u32, lay.rela_offset, lay.rela_size, 3 to u32, 1 to u32, 8 to u32, 24 to u32)
+    emit_elf_shdr(b, shname[6], 4 to u32, SHF_INFO_LINK, lay.rela_offset, lay.rela_size, 3 to u32, 1 to u32, 8 to u32, 24 to u32)
 }
 
 /**
