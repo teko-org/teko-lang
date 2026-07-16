@@ -10,6 +10,8 @@ fn ek(k: parser::ExprKind) -> parser::Expr { parser::Expr { kind = k; line = 0; 
 fn e_num(v: i128) -> parser::Expr { ek(parser::Number { is_float = false; value = v; fval = 0.0 }) }
 fn e_var(name: str) -> parser::Expr { ek(parser::Var { name = name }) }
 fn e_str(t: str) -> parser::Expr { ek(parser::StrLit { text = t }) }
+/** e_path2 — a two-segment path expression `a::b` (a namespace-qualified value or `Type::Member`). */
+fn e_path2(a: str, b: str) -> parser::Expr { ek(parser::PathExpr { path = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = a }), parser::Segment { name = b }) } }) }
 // DEFARGS (2026-07-01) — an all-positional arg_names array of length n, for tests unrelated to named-call.
 fn pos_names(n: u64) -> []str {
     mut out: []str = teko::list::empty()
@@ -382,6 +384,67 @@ fn dep_prog_with_const(name: str, vis: parser::Visibility) -> TProgram {
     let init = TExpr { kind = TNumber { is_float = false; value = 120; fval = 0.0 }; type = Prim { kind = PrimKind::I64 }; line = 0; col = 0 }
     let cd = TConstDecl { name = name; namespace = "m1"; ty = Prim { kind = PrimKind::I64 }; init = init; vis = vis; has_doc = false; doc = ""; line = 1; col = 1 }
     TProgram { items = teko::list::push(teko::list::empty(), cd) }
+}
+
+/**
+ * A typed dep `TProgram` (namespace "m1") carrying BOTH a `pub const P: i64 = 5` and a
+ * `pub fn twice(x: i64) -> i64` — the surface a namespace-qualified reference `m1::P` (a value) or
+ * `m1::twice` (a fn-value) resolves against after `seed_from_dep` (#594 crumb 8c, issue #613). The
+ * fn body is empty: `seed_from_dep` registers only the SIGNATURE (params + return), never the body.
+ *
+ * @return a two-item typed dep program (a const + a fn)
+ */
+fn dep_prog_const_and_fn() -> TProgram {
+    let init = TExpr { kind = TNumber { is_float = false; value = 5; fval = 0.0 }; type = Prim { kind = PrimKind::I64 }; line = 0; col = 0 }
+    let cd = TConstDecl { name = "P"; namespace = "m1"; ty = Prim { kind = PrimKind::I64 }; init = init; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+    let px = parser::Param { name = "x"; has_type = true; type_ann = named_t("i64"); is_params = false; has_default = false; default_expr = e_num(0) }
+    let twice = TFunction { name = "twice"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); params = teko::list::push(teko::list::empty(), px); return_type = Prim { kind = PrimKind::I64 }; body = teko::list::empty(); vis = parser::Visibility::Pub; has_doc = false; doc = ""; namespace = "m1"; file = "m1.tks"; line = 1; col = 1; is_test = false; is_extern = false; c_symbol = ""; from_lib = "" }
+    mut items: []TItem = teko::list::push(teko::list::empty(), cd)
+    items = teko::list::push(items, twice)
+    TProgram { items = items }
+}
+
+/**
+ * seed_from_dep_qualified_value_const_and_fn — the c8c namespace-qualified VALUE path (issue #613): a
+ * consumer (namespace "app") references `m1::twice` (a fn-value bound to a local) and `m1::P` (a
+ * value). Both resolve through the namespace-value fallback of `type_path_expr`; the fn-value `TVar`
+ * carries `is_func = true` and `func_ns = "m1"` (its OWN declaring namespace), and the const `m1::P`
+ * inlines to 5 because the emitted `func_ns` exactly matches the c8b `(name, namespace)`-keyed scalar
+ * inliner. Proves both the fn-value stamp and the qualified-const substitution (#594 crumb 8c).
+ */
+#test
+fn seed_from_dep_qualified_value_const_and_fn() {
+    let bind_tw: parser::Statement = parser::Binding { kind = parser::BindKind::Let; target = parser::SimpleName { name = "tw" }; has_type = false; type_ann = named_t("void"); value = e_path2("m1", "twice") }
+    mut body: []parser::Statement = teko::list::push(teko::list::empty(), bind_tw)
+    body = teko::list::push(body, st(e_path2("m1", "P")))
+    let uses = mk_fn("uses_qualified", named_t("i64"), body)
+    let items: []parser::Item = teko::list::push(teko::list::empty(), parser::Item { content = uses; namespace = "app"; file = "app.tks" })
+    match type_program_with_deps(parser::Program { items = items }, dep_prog_const_and_fn()) {
+        TProgram as tp => {
+            mut found = false
+            mut i: u64 = 0
+            loop {
+                if i >= tp.items.len { break }
+                match tp.items[i] {
+                    TFunction as fnc => if fnc.name == "uses_qualified" {
+                        found = true
+                        match fnc.body[0] {
+                            TBinding as tb => match tb.value.kind { TVar as vv => teko::assert::is_true(vv.is_func && vv.func_ns == "m1"); _ => teko::assert::is_true(false) }
+                            _ => teko::assert::is_true(false)
+                        }
+                        match fnc.body[1] {
+                            TExprStmt as es => match es.expr.kind { TNumber as n => teko::assert::is_true(n.value == 5); _ => teko::assert::is_true(false) }
+                            _ => teko::assert::is_true(false)
+                        }
+                    }
+                    _ => { }
+                }
+                i++
+            }
+            teko::assert::is_true(found)
+        }
+        error => teko::assert::is_true(false)
+    }
 }
 
 /** seed_from_dep_surfaces_pub_module_const — a consuming module resolves a dep's `pub` module const
@@ -1147,7 +1210,7 @@ fn checker_type_path_expr() {
     let ct = color_enum_table()
     let segs: []parser::Segment = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "Color" }), parser::Segment { name = "RED" })
     let pe = parser::PathExpr { path = parser::Path { segments = segs } }
-    let per = match type_path_expr(pe, ct, "") { TExpr as te => te; error => { teko::assert::is_true(false); return } }   // (#109 W1) ref_ns = "" in the test
+    let per = match type_path_expr(pe, ct, empty_env()) { TExpr as te => te; error => { teko::assert::is_true(false); return } }
     match per.type { Named as n => teko::assert::is_true(n.name == "Color"); _ => teko::assert::is_true(false) }
 }
 

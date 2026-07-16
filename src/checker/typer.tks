@@ -2377,35 +2377,98 @@ fn find_member_const(owner: parser::TypeDecl, seg: str, table: TypeTable) -> TEx
     TExpr { kind = TVar { name = sym; is_func = false; func_ns = "" }; type = rty; line = 0; col = 0 }
 }
 
-// ---- the expression dispatch (the evolved check_expr) ----
-// `Enum::Member` as a VALUE — the enum type (path minus the member) resolved to an `enum` decl,
-// the member checked, the node typed NAMED(enum) carrying enum name + member ORDINAL (so both
-// backends lower without re-lookup). C twin: type_path_expr in expr.c.
-// (C8.3, ported 2026-07-01 alongside type_flags_method to unblock its self-host testing — see
-// expr.c::type_path_expr) `Type::Member` as a VALUE: an ENUM member (ordinal = declaration
-// index) OR a FLAGS member (ordinal = the BIT INDEX, i.e. the member's power-of-2 position, not
-// its value). (#50) The node also carries the RESOLVED member `value` (enum: the ordinal;
-// flags: `1 << ordinal`) so the VM reads it instead of recomputing (native codegen's pre-emitted
-// constants already encode it). The .tks side previously supported ONLY enum; flags fell through
-// to the enum-only error, a self-host divergence from expr.c.
-// (#109 W1) `ref_ns` = the namespace the `Type::Member` expression is written in; unused until W2.
-fn type_path_expr(pe: parser::PathExpr, table: TypeTable, ref_ns: str) -> TExpr | error {
+/**
+ * ns_value_visible — enforce a namespace-qualified value's cross-module reach (#594 crumb 8c, issue
+ * #613): a `private` module-level const is reachable ONLY from its OWN declaring namespace, so
+ * `ns::NAME` naming a private const from a DIFFERENT namespace is a located visibility error — the
+ * qualified spelling never widens a private const's reach (the module-level twin of
+ * `member_const_visible`, D4/D6). A `pub`/`exp` value reaches across namespaces, and a reference from
+ * the const's own namespace is allowed. A dep's private const never reaches here — it is not seeded
+ * across the module boundary (`seed_dep_consts`), so it fails to resolve first.
+ *
+ * @param b       the resolved value binding
+ * @param ref_ns  the namespace the `ns::NAME` reference is written in
+ * @return        null when the access is allowed, else a visibility error (located at the use site by
+ *                the `type_expr` wrapper)
+ * @since #594
+ */
+fn ns_value_visible(b: ValBinding, ref_ns: str) -> error? {
+    match b.vis {
+        parser::Visibility::Private => {
+            if b.ns != ref_ns {
+                return error { message = $"const `{b.name}` is private to `{b.ns}` — mark it `pub`/`exp` to use it from another module" }
+            }
+            null
+        }
+        _ => null
+    }
+}
+
+/**
+ * type_ns_qualified_value — the namespace-qualified VALUE fallback of `type_path_expr`, reached only
+ * when the path's leading qualifier does NOT resolve as a type, so `ns::NAME` names a module-level
+ * value — a `pub`/`exp` const or a top-level fn-value declared in namespace `ns` — rather than a
+ * `Type::Member`. Emits the SAME `TVar` a bare reference produces, stamping `func_ns` with the value's
+ * OWN full declaring namespace (`b.ns`, which the short written qualifier selects by the ends-with
+ * rule) — never the short qualifier — so the c8b `(name, namespace)`-keyed scalar inliner substitutes
+ * a qualified const identically and a qualified fn-value lowers to its `tk_closure` mangle. A name
+ * that resolves as NEITHER a type nor a value
+ * surfaces the ORIGINAL type-resolution error `type_err` (backward-compatible with the pre-#613
+ * `unknown type` diagnostic) (#594 crumb 8c, issue #613).
+ *
+ * @param pe        the parsed path expression
+ * @param member    the path's last segment (the value's bare name)
+ * @param type_err  the type-resolution error to surface when no value binding matches either
+ * @param env       the type-checking environment (value bindings + `cur_ns`)
+ * @return          the typed value reference, or a located error
+ * @throws          a visibility error for a `private` cross-namespace const, else `type_err`
+ * @since #594
+ */
+fn type_ns_qualified_value(pe: parser::PathExpr, member: str, type_err: error, env: Env) -> TExpr | error {
+    let qualifier = path_qualifier(pe.path, pe.path.segments.len - 1)
+    let b = match lookup_value_in_ns(env, member, qualifier) { ValBinding as vb => vb; error => return type_err }
+    match ns_value_visible(b, env.cur_ns) { error as e => return e; null => { } }
+    let is_fn = b.ns.len > 0 && (match b.type { Func => true; _ => false })
+    TExpr { kind = TVar { name = member; is_func = is_fn; func_ns = b.ns }; type = b.type; line = 0; col = 0 }
+}
+
+/**
+ * type_path_expr — type a two-segment path used as a VALUE. Resolution order: (1) a member const
+ * `Owner::NAME` when the leading path resolves to a struct/class/abstract/trait type (walks the base
+ * chain); (2) an enum member `E::M` (value = its declaration ordinal); (3) a flags member `E::M`
+ * (value = `1 << ordinal`, the bit index); (4) a namespace-qualified value `ns::NAME` — a `pub`/`exp`
+ * module const or a top-level fn-value in module `ns` — reached only when the leading qualifier is NOT
+ * a type (`type_ns_qualified_value`). Each backend lowers the enum/flags node without re-lookup (it
+ * carries the resolved member `value`), and the namespace arm reuses the bare-reference `TVar` shape
+ * so the const inliner and closure mangler need no qualified-specific path (#50, #594 crumb 8c).
+ *
+ * @param pe     the parsed path expression
+ * @param table  the type table (enum/flags/member-const resolution)
+ * @param env    the type-checking environment (value-binding lookup + the reference's `cur_ns`)
+ * @return       the typed value reference, or a located error
+ * @throws       when the path names no reachable member const, enum/flags member, or namespace value
+ * @since #50
+ */
+fn type_path_expr(pe: parser::PathExpr, table: TypeTable, env: Env) -> TExpr | error {
     let p = pe.path
     if p.segments.len < 2 { return error { message = "a path expression must name an enum or flags member (`Type::Member`)" } }
     let member = p.segments[p.segments.len - 1].name
-    mut segs: []parser::Segment = teko::list::empty()   // the type = the path minus its last segment
+    mut segs: []parser::Segment = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= p.segments.len - 1 { break }
         segs = teko::list::push(segs, p.segments[i])
         i++
     }
-    let et = match resolve_named(parser::Path { segments = segs }, table, ref_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the expression's enclosing namespace
+    let et = match resolve_named(parser::Path { segments = segs }, table, env.cur_ns) {
+        Type as t => t
+        error as e => return type_ns_qualified_value(pe, member, e, env)
+    }
     let tname = match et { Named as n => n.name; _ => return error { message = "`Type::Member` requires a named enum or flags type" } }
-    let decl = match type_table_find(table, tname, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
+    let decl = match type_table_find(table, tname, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }
     match resolve_member_const_hit(decl, member, table) {
         MemberConstHit as hit => {
-            match member_const_visible(hit, table, ref_ns) { error as e => return e; null => { } }
+            match member_const_visible(hit, table, env.cur_ns) { error as e => return e; null => { } }
             match find_member_const(decl, member, table) { TExpr as mref => return mref; null => { } }
         }
         null => { }
@@ -2468,7 +2531,7 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
                 error => type_method_call(mc, env, table)   // let it re-type and surface the real error
             }
         }
-        parser::PathExpr as pe => type_path_expr(pe, table, env.cur_ns)   // Enum::Member as a value   (#109 W1) ref_ns = the enclosing namespace
+        parser::PathExpr as pe => type_path_expr(pe, table, env)
         parser::StructLit as sl => type_struct_lit(sl, Void { }, env, table)   // W4a (no expected type in expr position)
         parser::Index as ix => type_index(ix, env, table)   // W5-idx
         parser::Interp as in => type_interp(in, env, table)   // $"…{expr}…"

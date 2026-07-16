@@ -14,6 +14,9 @@ use teko::parser
  * @param is_mut    true ONLY for a `mut` local; let/const/params/match-bindings are false (B.21)
  * @param ns        the declaring namespace of a top-level fn/const; "" for locals/params (#41)
  * @param is_const  true iff this names a module-level `const` (#594 crumb 2)
+ * @param vis       the declaring visibility of a top-level `const` — gates a namespace-qualified
+ *                  value reference `ns::NAME` across namespaces (`Pub` for locals/params/fns, which
+ *                  this arm never visibility-gates) (#594 crumb 8c, issue #613)
  */
 type ValBinding = struct {
     name: str
@@ -21,6 +24,7 @@ type ValBinding = struct {
     is_mut: bool
     ns: str
     is_const: bool
+    vis: parser::Visibility
 }
 
 // the environment: a FLAT list of bindings PLUS the namespace currently being type-checked, so an
@@ -107,12 +111,12 @@ pub fn with_owner(env: Env, owner: str) -> Env { Env { base = env.base; bindings
 // define a LOCAL name (append). `is_mut`: a `mut` binding passes true; everything else false (B.21).
 // Locals carry no namespace ("").
 pub fn define(env: Env, name: str, t: Type, is_mut: bool) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = ""; is_const = false }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = ""; is_const = false; vis = parser::Visibility::Pub }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
 }
 
 // (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace.
 pub fn define_fn(env: Env, name: str, t: Type, ns: str) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = false }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = false; vis = parser::Visibility::Pub }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
 }
 
 /**
@@ -125,11 +129,13 @@ pub fn define_fn(env: Env, name: str, t: Type, ns: str) -> Env {
  * @param name  the constant's identifier
  * @param t     the constant's resolved value type
  * @param ns    the namespace the const is declared in
+ * @param vis   the const's declaring visibility — gates a cross-namespace `ns::NAME` reference to a
+ *              `private` const (#594 crumb 8c, issue #613)
  * @return      `env` extended with the const binding
  * @since #594
  */
-pub fn define_const(env: Env, name: str, t: Type, ns: str) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = true }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
+pub fn define_const(env: Env, name: str, t: Type, ns: str, vis: parser::Visibility) -> Env {
+    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = true; vis = vis }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe }
 }
 
 // a binding is mutable iff declared `mut` (Let and Const are immutable — B.21).
@@ -150,6 +156,40 @@ fn lookup_binding(env: Env, name: str) -> ValBinding | error {
         if env.base[j].name == name { return env.base[j] }
     }
     error { message = $"undefined name: {name}" }
+}
+
+/**
+ * lookup_value_in_ns — the value binding named `name` whose declaring namespace satisfies the
+ * qualifier `ns`, or an error when none exists. Unlike `lookup_binding` (name-only, tail-first), this
+ * filters by BOTH the name AND the namespace — the resolver for a namespace-qualified value spelling
+ * `ns::name` (#594 crumb 8c, issue #613). The namespace test is `qualifier_selects_ns` (the SAME
+ * ends-with rule `lookup_call` applies to a qualified callee), so the SHORT written qualifier `m1`
+ * matches a binding declared in the project-rooted namespace `proj::m1`. The MATCHED binding's FULL
+ * namespace (`b.ns`) is what the caller stamps onto `TVar.func_ns` — never the short qualifier — so
+ * the c8b `(name, namespace)`-keyed scalar inliner (which keys on the const's OWN full namespace)
+ * substitutes a qualified const identically to a bare one. Scans the mutable bindings innermost-first,
+ * then the sealed globals (a dep's exported const/fn is a global).
+ *
+ * @param env   the type-checking environment
+ * @param name  the value's bare name (the path's last segment)
+ * @param ns    the written qualifier namespace (the path minus its last segment)
+ * @return      the matching binding, or an "unknown value: ns::name" error
+ * @since #594
+ */
+fn lookup_value_in_ns(env: Env, name: str, ns: str) -> ValBinding | error {
+    mut i = env.bindings.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        if env.bindings[i].name == name && qualifier_selects_ns(env.bindings[i].ns, ns) { return env.bindings[i] }
+    }
+    mut j = env.base.len
+    loop {
+        if j == 0 { break }
+        j = j - 1
+        if env.base[j].name == name && qualifier_selects_ns(env.base[j].ns, ns) { return env.base[j] }
+    }
+    error { message = $"unknown value: {ns}::{name}" }
 }
 
 // the type of a name — the common case; a thin wrapper so existing callers are unchanged.
