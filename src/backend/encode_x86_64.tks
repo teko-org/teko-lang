@@ -646,9 +646,11 @@ const X86_BITS_PER_BYTE: u32 = 8 to u32
 /**
  * X86_REL32_FIELD_BYTES — the byte width of a `rel32` field (4): the constant
  * `reloc_addend_x86` negates for the `Plt32`/`Pc32` PC-relative addend
- * (relative to the END of the field, per `R_X86_64_PLT32`/`PC32`), and the
- * same field width `patch_branches_x86` adds to a fixup's `field_off` when
- * computing an intra-function branch displacement from that same field end.
+ * (relative to the END of the field, per `R_X86_64_PLT32`/`PC32`), the same
+ * field width `patch_branches_x86` adds to a fixup's `field_off` when
+ * computing an intra-function branch displacement from that same field end,
+ * and (cast to `u32`) the span `write_u32_le_at` overwrites at a patched
+ * offset.
  */
 const X86_REL32_FIELD_BYTES: i64 = 4 to i64
 
@@ -1532,7 +1534,7 @@ fn shift_slot_offsets_x86(offsets: []u32, delta: u32) -> []u32 {
 fn frame_sub_size_x86(slots_size: u32, n_saved: u32) -> u32 {
     let framed = (slots_size > (0 to u32)) || (n_saved > (0 to u32))
     if !framed { return 0 to u32 }
-    align_up(slots_size + (n_saved * (8 to u32)), 16 to u32) - (n_saved * (8 to u32))
+    align_up(slots_size + (n_saved * X86_GPR_BYTES), X86_STACK_ALIGN) - (n_saved * X86_GPR_BYTES)
 }
 
 /**
@@ -1637,7 +1639,7 @@ pub fn compute_frame_layout_x86(abi: AbiDescriptor, f: MFuncX86) -> FrameLayoutX
     let n_saved = (saved.gpr.len + saved.fpr.len) to u32
     let shadow = shadow_bytes_x86(abi, f)
     let size = frame_sub_size_x86(slots.slots_size + shadow, n_saved)
-    let slot_offsets = shift_slot_offsets_x86(slots.offsets, (n_saved * (8 to u32)) + shadow)
+    let slot_offsets = shift_slot_offsets_x86(slots.offsets, (n_saved * X86_GPR_BYTES) + shadow)
     FrameLayoutX86 {
         size = size
         saved_gpr = saved.gpr
@@ -1682,8 +1684,8 @@ fn honest_bigframe_x86() -> error {
  * @return []byte  `buf` followed by the three prologue bytes
  */
 fn emit_mov_rbp_rsp_x86(buf: []byte) -> []byte {
-    let b = push_byte_x86(buf, 0x48 to u32)
-    push_byte_x86(push_byte_x86(b, 0x89 to u32), 0xE5 to u32)
+    let b = push_byte_x86(buf, REX_W_PREFIX)
+    push_byte_x86(push_byte_x86(b, X86_OP_MOV_RM_R), X86_MODRM_MOV_RBP_RSP)
 }
 
 /**
@@ -1695,8 +1697,8 @@ fn emit_mov_rbp_rsp_x86(buf: []byte) -> []byte {
  * @return []byte  `buf` followed by the push encoding
  */
 fn emit_push_reg_x86(buf: []byte, id: u32) -> []byte {
-    let b = if (id & (0x8 to u32)) != (0 to u32) { push_byte_x86(buf, 0x41 to u32) } else { buf }
-    push_byte_x86(b, (0x50 to u32) + (id & (0x7 to u32)))
+    let b = if (id & X86_REG_HIGH_BIT) != (0 to u32) { push_byte_x86(buf, REX_B_PREFIX) } else { buf }
+    push_byte_x86(b, X86_OP_PUSH_R64 + (id & X86_FIELD3_MASK))
 }
 
 /**
@@ -1709,8 +1711,8 @@ fn emit_push_reg_x86(buf: []byte, id: u32) -> []byte {
  * @return []byte  `buf` followed by the pop encoding
  */
 fn emit_pop_reg_x86(buf: []byte, id: u32) -> []byte {
-    let b = if (id & (0x8 to u32)) != (0 to u32) { push_byte_x86(buf, 0x41 to u32) } else { buf }
-    push_byte_x86(b, (0x58 to u32) + (id & (0x7 to u32)))
+    let b = if (id & X86_REG_HIGH_BIT) != (0 to u32) { push_byte_x86(buf, REX_B_PREFIX) } else { buf }
+    push_byte_x86(b, X86_OP_POP_R64 + (id & X86_FIELD3_MASK))
 }
 
 /**
@@ -1726,12 +1728,12 @@ fn emit_pop_reg_x86(buf: []byte, id: u32) -> []byte {
  */
 fn emit_sub_rsp_x86(buf: []byte, amount: u32) -> []byte | error {
     if amount == (0 to u32) { return buf }
-    if amount < (128 to u32) {
-        let b = push_byte_x86(push_byte_x86(push_byte_x86(buf, 0x48 to u32), 0x83 to u32), 0xEC to u32)
+    if amount < X86_SUB_RSP_IMM8_MAX {
+        let b = push_byte_x86(push_byte_x86(push_byte_x86(buf, REX_W_PREFIX), X86_OP_GRP1_IMM8), X86_MODRM_SUB_RSP)
         return push_byte_x86(b, amount)
     }
-    if amount > (2147483647 to u32) { return honest_bigframe_x86() }
-    let b = push_byte_x86(push_byte_x86(push_byte_x86(buf, 0x48 to u32), 0x81 to u32), 0xEC to u32)
+    if amount > (X86_IMM32_MAX to u32) { return honest_bigframe_x86() }
+    let b = push_byte_x86(push_byte_x86(push_byte_x86(buf, REX_W_PREFIX), X86_OP_GRP1_IMM32), X86_MODRM_SUB_RSP)
     emit_u32_le(b, amount)
 }
 
@@ -1792,7 +1794,7 @@ pub fn emit_prologue_x86(layout: FrameLayoutX86) -> []byte | error {
         return none
     }
     if layout.saved_fpr.len > (0 to u64) { return honest_xmm_callee_saved_x86() }
-    let after_rbp = emit_mov_rbp_rsp_x86(emit_push_reg_x86(teko::list::empty(), 5 to u32))
+    let after_rbp = emit_mov_rbp_rsp_x86(emit_push_reg_x86(teko::list::empty(), X86_REG_RBP_ID))
     let after_sub = match emit_sub_rsp_x86(after_rbp, layout.size) { []byte as w => w; error as e => return e }
     emit_saved_pushes_x86(after_sub, layout)
 }
@@ -1821,7 +1823,7 @@ fn emit_epilogue_x86(layout: FrameLayoutX86) -> []byte {
         i = i - (1 to u64)
         b = emit_pop_reg_x86(b, layout.saved_gpr[i])
     }
-    push_byte_x86(b, 0xC9 to u32)
+    push_byte_x86(b, X86_OP_LEAVE)
 }
 
 /**
@@ -2042,8 +2044,8 @@ fn honest_globals_x86() -> error {
  */
 fn reloc_addend_x86(kind: RelocKindX86) -> i64 {
     match kind {
-        Plt32 => (0 to i64) - (4 to i64)
-        Pc32 => (0 to i64) - (4 to i64)
+        Plt32 => (0 to i64) - X86_REL32_FIELD_BYTES
+        Pc32 => (0 to i64) - X86_REL32_FIELD_BYTES
         Abs64 => 0 to i64
     }
 }
@@ -2058,7 +2060,7 @@ fn reloc_addend_x86(kind: RelocKindX86) -> i64 {
  * @return byte  the selected byte
  */
 fn byte_of_u32_le(value: u32, k: u32) -> byte {
-    ((value >> (k * (8 to u32))) & (0xFF to u32)) to byte
+    ((value >> (k * X86_BITS_PER_BYTE)) & X86_BYTE_MASK) to byte
 }
 
 /**
@@ -2078,7 +2080,7 @@ fn write_u32_le_at(buf: []byte, offset: u32, value: u32) -> []byte {
     loop {
         if i >= buf.len { break }
         let idx = i to u32
-        let within = (idx >= offset) && (idx < (offset + (4 to u32)))
+        let within = (idx >= offset) && (idx < (offset + (X86_REL32_FIELD_BYTES to u32)))
         let b = if within { byte_of_u32_le(value, idx - offset) } else { buf[i] }
         out = teko::list::push(out, b)
         i++
@@ -2213,9 +2215,9 @@ fn patch_branches_x86(raw: []byte, fixups: []BranchFixupX86, offsets: []BlockOff
         if i >= fixups.len { break }
         let fx = fixups[i]
         let target_off = match lookup_block_offset_x86(offsets, fx.target) { u32 as v => v; error as e => return e }
-        let disp = (target_off to i64) - ((fx.field_off to i64) + (4 to i64))
+        let disp = (target_off to i64) - ((fx.field_off to i64) + X86_REL32_FIELD_BYTES)
         if !fits_i32_x86(disp) { return honest_farbranch_x86() }
-        let field = (disp & (0xFFFFFFFF to i64)) to u32
+        let field = (disp & X86_LOW32_MASK) to u32
         buf = write_u32_le_at(buf, fx.field_off, field)
         i++
     }
