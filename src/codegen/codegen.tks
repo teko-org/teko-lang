@@ -8224,10 +8224,30 @@ fn cg_pair_is_iface_vtable(cd: parser::TypeDecl, idd: parser::TypeDecl, vt_table
 }
 
 /**
+ * Is type decl `cd` an `abstract class` — inheritable but NOT directly instantiable (its abstract
+ * methods carry no body, so they are stamped to no `TFunction`)? An abstract class therefore has no
+ * emittable self-vtable: every slot is a not-yet-implemented abstract method (`cg_pair_is_base_vtable`
+ * excludes its self-pair for exactly this reason). A `virtual`/`Sealed` class answers false.
+ *
+ * @param cd  the candidate class decl
+ * @return    true iff `cd` is a `ClassKind::Abstract` class
+ * @since #594 (member-const cross-ns abstract-base codegen fix)
+ */
+fn cg_class_is_abstract(cd: parser::TypeDecl) -> bool {
+    match cd.body {
+        parser::ClassBody as cb => match cb.kind { parser::ClassKind::Abstract => true; _ => false }
+        _ => false
+    }
+}
+
+/**
  * Does class decl `cd` provide a per-(class, base) POLYMORPHIC-BASE vtable for type decl `idd`?
- * True when `idd` is a polymorphic (non-sealed) base class AND `cd` IS-A `idd` (itself included, so
- * a directly-instantiable virtual base gets its own self-vtable). Factored so the three vtable-
- * emission phases apply the SAME gate.
+ * True when `idd` is a polymorphic (non-sealed) base class AND either `cd` STRICTLY subclasses `idd`,
+ * or `cd` IS `idd` AND `idd` is directly instantiable (a `virtual` base's own self-vtable). An
+ * `abstract` base's self-pair is EXCLUDED: it is never instantiated, and its abstract-method slots
+ * resolve to no stamped function — emitting it would fail codegen with a phantom "missing vtable
+ * method's stamped function" (the concrete subclass's `tk_vt_<Sub>_<Base>` carries the real slots).
+ * Factored so the three vtable-emission phases apply the SAME gate.
  *
  * @param prog  the whole typed program (polymorphic-base + subclass-reachability oracles)
  * @param cd    the candidate vtable-owning class decl
@@ -8237,7 +8257,8 @@ fn cg_pair_is_iface_vtable(cd: parser::TypeDecl, idd: parser::TypeDecl, vt_table
  */
 fn cg_pair_is_base_vtable(prog: checker::TProgram, cd: parser::TypeDecl, idd: parser::TypeDecl) -> bool {
     let idd_is_poly_base = cg_is_polymorphic_base(prog, idd.name)
-    let cd_is_a = cd.name == idd.name || cg_subclass_reaches(prog, cd.name, idd.name, 64)
+    let cd_is_instantiable_self = cd.name == idd.name && !cg_class_is_abstract(cd)
+    let cd_is_a = cd_is_instantiable_self || cg_subclass_reaches(prog, cd.name, idd.name, 64)
     idd_is_poly_base && cd_is_a
 }
 

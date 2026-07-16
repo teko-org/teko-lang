@@ -1664,3 +1664,72 @@ fn cgt_region_ops() {
     teko::assert::is_true(teko::str::contains(free_out, "tk_region_drop_subtree"))
     teko::assert::is_true(teko::str::contains(free_out, ".region"))
 }
+
+/**
+ * cgt_class_decl — a minimal `parser::TypeDecl` naming a class of a given `ClassKind`, optionally
+ * extending a bare base, with NO members. It carries exactly the surface the polymorphic-base vtable
+ * gate (`cg_pair_is_base_vtable`) inspects — the class kind (`cg_is_polymorphic_base` /
+ * `cg_class_is_abstract`) and the base chain (`cg_subclass_reaches`) — so a self-vtable-eligibility
+ * test needs no methods, fields, or consts.
+ *
+ * @param name       the class's bare name
+ * @param kind       the class's `ClassKind` (Sealed / Abstract / Virtual)
+ * @param has_base   whether the class extends a base
+ * @param base_name  the extended base's bare name (consulted only when `has_base`)
+ * @return           a member-less class `parser::TypeDecl`
+ */
+fn cgt_class_decl(name: str, kind: parser::ClassKind, has_base: bool, base_name: str) -> parser::TypeDecl {
+    parser::TypeDecl {
+        name = name
+        type_params = teko::list::empty()
+        type_constraints = teko::list::empty()
+        body = parser::ClassBody {
+            kind = kind
+            has_base = has_base
+            base_name = base_name
+            has_base_binding = false
+            base_binding_name = ""
+            implements = teko::list::empty()
+            fields = teko::list::empty()
+            methods = teko::list::empty()
+            consts = teko::list::empty()
+        }
+        vis = parser::Visibility::Pub
+        has_doc = false
+        doc = ""
+        line = 0; col = 0
+        di_kind = parser::DiKind::None
+        has_di_key = false
+        di_key = ""
+        is_unsafe = false
+        must_free = false
+    }
+}
+
+/**
+ * cgt_vtable_pair_gate_excludes_abstract_self — the polymorphic-base vtable gate skips an ABSTRACT
+ * base's own self-pair (its abstract methods stamp to no function, so a self-vtable is unemittable),
+ * while STILL emitting a concrete subclass's `tk_vt_<Sub>_<Base>` AND a directly-instantiable
+ * `virtual` base's own self-vtable (#594, member-const cross-ns abstract-base codegen fix). This is
+ * the regression that member_const_cross_ns_pub_inherit exposed: codegen failed with a phantom
+ * "missing a vtable method's stamped function" on the abstract base's self-pair.
+ */
+#test
+fn cgt_vtable_pair_gate_excludes_abstract_self() {
+    let base = cgt_class_decl("Base", parser::ClassKind::Abstract, false, "")
+    let sub = cgt_class_decl("Sub", parser::ClassKind::Sealed, true, "Base")
+    let vbase = cgt_class_decl("VBase", parser::ClassKind::Virtual, false, "")
+    mut items: []checker::TItem = teko::list::empty()
+    items = teko::list::push(items, base)
+    items = teko::list::push(items, sub)
+    items = teko::list::push(items, vbase)
+    let prog = checker::TProgram { items = items }
+
+    teko::assert::is_true(cg_class_is_abstract(base))
+    teko::assert::is_true(!cg_class_is_abstract(sub))
+    teko::assert::is_true(!cg_class_is_abstract(vbase))
+
+    teko::assert::is_true(!cg_pair_is_base_vtable(prog, base, base))
+    teko::assert::is_true(cg_pair_is_base_vtable(prog, sub, base))
+    teko::assert::is_true(cg_pair_is_base_vtable(prog, vbase, vbase))
+}
