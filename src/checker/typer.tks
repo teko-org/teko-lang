@@ -2285,18 +2285,16 @@ fn member_const_symbol(type_canonical: str, member: str) -> str {
 }
 
 /**
- * find_member_const — resolve `TypeName::NAME` to a reference to its static member const, walking the
- * owning type's base chain (a subclass inherits a base's `pub`/`exp` member const by name; a nearer
- * declaration shadows a farther one — static hiding, D6) (#594 crumb 7). Returns null when no member
- * const named `seg` exists on the type or its bases, so `type_path_expr` falls through to the
- * enum-member arm. The reference is a `TVar` bound to the hoisted const's program-unique name (the
- * same name `type_type_member_consts` emits), typed with the const's declared type; the inliner then
- * substitutes a scalar's value or the aggregate's rodata address.
+ * resolve_member_const_decl — the nearest static member const named `seg` reachable from `owner`,
+ * walking the base chain (a subclass inherits a base's member const by name; a nearer declaration
+ * shadows a farther one — static hiding, D6) (#594 crumb 7). Returns null when no member const named
+ * `seg` exists on the type or its bases. Struct/trait bodies read their own consts; a class reads its
+ * EFFECTIVE (own + inherited-not-shadowed) set; any other body kind carries none.
  *
  * @param owner  the resolved leading type (struct/class/abstract/trait)
  * @param seg    the last path segment (the member const's name)
  * @param table  the type table (to follow the base chain + read each body's consts)
- * @return       the reference to the member const, or null when not found
+ * @return       the resolved member const declaration, or null when not found
  * @since #594
  */
 fn resolve_member_const_decl(owner: parser::TypeDecl, seg: str, table: TypeTable) -> parser::ConstDecl? {
@@ -2341,6 +2339,19 @@ fn member_const_visible(mcd: parser::ConstDecl, owner: parser::TypeDecl, table: 
     }
 }
 
+/**
+ * find_member_const — resolve `TypeName::NAME` to a REFERENCE to its static member const (#594 crumb
+ * 7): a `TVar` bound to the hoisted const's program-unique name (the same name `type_type_member_consts`
+ * emits), typed with the const's declared type. The inliner then substitutes a scalar's value or the
+ * aggregate's rodata address. Returns null when no such member const exists, so `type_path_expr`
+ * falls through to the enum-member arm.
+ *
+ * @param owner  the resolved leading type (struct/class/abstract/trait)
+ * @param seg    the last path segment (the member const's name)
+ * @param table  the type table (to follow the base chain + read each body's consts)
+ * @return       the typed reference to the member const, or null when not found
+ * @since #594
+ */
 fn find_member_const(owner: parser::TypeDecl, seg: str, table: TypeTable) -> TExpr? {
     let cd = match resolve_member_const_decl(owner, seg, table) { parser::ConstDecl as c => c; null => return null }
     let owner_ns = type_ns_of(table, owner.name)
