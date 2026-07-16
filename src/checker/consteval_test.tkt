@@ -223,12 +223,16 @@ fn allowlist_rejects_other() {
 }
 
 /**
- * c_ref — an `i64` bare-name reference typed expression (a Tier-3 const reference in a fixture).
+ * c_ref — an `i64` bare-name reference typed expression (a Tier-3 const reference in a fixture),
+ * stamped with `func_ns = ns` — the SAME namespace `type_var` would have resolved the reference to
+ * (#594 crumb 8b), so the dependency-graph and inliner fixtures key on a real `(name, ns)` pair
+ * rather than an empty sentinel namespace.
  *
  * @param name  the referenced const's name
+ * @param ns    the namespace the reference resolves to (the referenced const's declaring namespace)
  * @return      the typed variable reference
  */
-fn c_ref(name: str) -> TExpr { te(TVar { name = name; is_func = false; func_ns = "" }, i64t()) }
+fn c_ref(name: str, ns: str) -> TExpr { te(TVar { name = name; is_func = false; func_ns = ns }, i64t()) }
 
 /**
  * c_const — a private `i64` module-level TConstDecl named `name` with initializer `init`, for the
@@ -249,7 +253,7 @@ fn c_const(name: str, init: TExpr) -> TConstDecl {
 #test
 fn const_dep_order_orders_dep_before_dependent() {
     let a = c_const("A", c_num(1))
-    let b = c_const("B", te(TBinary { op = lexer::TokenKind::Plus; left = c_ref("A"); right = c_num(1) }, i64t()))
+    let b = c_const("B", te(TBinary { op = lexer::TokenKind::Plus; left = c_ref("A", "teko::checker"); right = c_num(1) }, i64t()))
     mut consts: []TConstDecl = teko::list::push(teko::list::empty(), b)
     consts = teko::list::push(consts, a)
     match const_dep_order(consts) {
@@ -268,8 +272,94 @@ fn const_dep_order_orders_dep_before_dependent() {
  */
 #test
 fn const_dep_order_reports_cycle() {
-    let a = c_const("A", c_ref("B"))
-    let b = c_const("B", c_ref("A"))
+    let a = c_const("A", c_ref("B", "teko::checker"))
+    let b = c_const("B", c_ref("A", "teko::checker"))
+    mut consts: []TConstDecl = teko::list::push(teko::list::empty(), a)
+    consts = teko::list::push(consts, b)
+    match const_dep_order(consts) {
+        []TConstDecl => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
+
+/**
+ * ns_const — a module-level `TConstDecl` declared in namespace `ns` (the dep/project dependency-graph
+ * collision fixtures, #594 crumb 4/8b, finding 2).
+ *
+ * @param name  the constant's name
+ * @param ns    its declaring namespace
+ * @param init  its typed initializer
+ * @return      the typed constant declaration
+ */
+fn ns_const(name: str, ns: str, init: TExpr) -> TConstDecl {
+    TConstDecl { name = name; namespace = ns; ty = i64t(); init = init; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 1; col = 1 }
+}
+
+/**
+ * const_dep_order_keeps_dep_and_project_const_distinct — a dep const `X` (ns "m1", no refs) and a
+ * PROJECT const also named `X` (ns "app", referencing the dep's own `X`) are DISTINCT
+ * dependency-graph nodes: name-only keying marked the project's `X` "done" the instant the dep's
+ * same-named `X` finished, silently DROPPING it from the topological order without ever visiting it
+ * (neither ordered nor reported as an error); `(name, namespace)`-keying orders BOTH (#594 crumb
+ * 4/8b, finding 2).
+ */
+#test
+fn const_dep_order_keeps_dep_and_project_const_distinct() {
+    let dep_x = ns_const("X", "m1", c_num(5))
+    let proj_x = ns_const("X", "app", c_ref("X", "m1"))
+    mut consts: []TConstDecl = teko::list::push(teko::list::empty(), dep_x)
+    consts = teko::list::push(consts, proj_x)
+    match const_dep_order(consts) {
+        []TConstDecl as ordered => {
+            teko::assert::is_true(ordered.len == 2)
+            teko::assert::is_true(ordered[0].namespace == "m1")
+            teko::assert::is_true(ordered[1].namespace == "app")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * const_dep_order_rejects_false_cycle_from_conflated_names — the dep/project collision the reviewer
+ * flagged: a dep `pub const A = B` + `pub const B = 5` (both ns "m1") and a project `const B = A` (ns
+ * "app", falling back to the dep's exported `A`). Name-only keying conflated the dep's `B` and the
+ * project's `B` into ONE node, manufacturing a FALSE cycle `B → A → B` out of two edges that in
+ * reality point at two DIFFERENT `B` declarations (`project B(app) → dep A(m1) → dep B(m1)`, a plain
+ * DAG). `(name, namespace)`-keying orders all three consts with no cycle (#594 crumb 4/8b, finding
+ * 2). The project item is listed FIRST here (an ordering `const_dep_order` must handle correctly
+ * regardless of the caller's assembly order, not just the dep-first order the real pipeline happens
+ * to use).
+ */
+#test
+fn const_dep_order_rejects_false_cycle_from_conflated_names() {
+    let dep_a = ns_const("A", "m1", c_ref("B", "m1"))
+    let dep_b = ns_const("B", "m1", c_num(5))
+    let proj_b = ns_const("B", "app", c_ref("A", "m1"))
+    mut consts: []TConstDecl = teko::list::push(teko::list::empty(), proj_b)
+    consts = teko::list::push(consts, dep_a)
+    consts = teko::list::push(consts, dep_b)
+    match const_dep_order(consts) {
+        []TConstDecl as ordered => {
+            teko::assert::is_true(ordered.len == 3)
+            teko::assert::is_true(ordered[0].namespace == "m1" && ordered[0].name == "B")
+            teko::assert::is_true(ordered[1].namespace == "m1" && ordered[1].name == "A")
+            teko::assert::is_true(ordered[2].namespace == "app" && ordered[2].name == "B")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * const_dep_order_reports_genuine_cycle_within_dep_namespace — a genuine reference cycle entirely
+ * WITHIN one namespace (`m1::A = B; m1::B = A`) is still correctly reported after the `(name,
+ * namespace)` keying change — the fix disambiguates cross-namespace name collisions, it does not mask
+ * a real same-namespace cycle. Exercises the qualified `ns::name` cycle-message rendering (#594 crumb
+ * 4/8b).
+ */
+#test
+fn const_dep_order_reports_genuine_cycle_within_dep_namespace() {
+    let a = ns_const("A", "m1", c_ref("B", "m1"))
+    let b = ns_const("B", "m1", c_ref("A", "m1"))
     mut consts: []TConstDecl = teko::list::push(teko::list::empty(), a)
     consts = teko::list::push(consts, b)
     match const_dep_order(consts) {
@@ -380,7 +470,7 @@ fn inline_left_number_is(prog: TProgram, want: i128) {
 fn inline_consts_substitutes_scalar_and_drops_decl() {
     let k = c_const("K", c_num(41))
     mut body: []TStatement = teko::list::empty()
-    body = teko::list::push(body, c_ret(c_bin(lexer::TokenKind::Plus, c_ref("K"), c_num(1))))
+    body = teko::list::push(body, c_ret(c_bin(lexer::TokenKind::Plus, c_ref("K", "teko::checker"), c_num(1))))
     mut items: []TItem = teko::list::empty()
     items = teko::list::push(items, k)
     items = teko::list::push(items, c_fn("f", body))
@@ -401,9 +491,9 @@ fn inline_consts_substitutes_scalar_and_drops_decl() {
 #test
 fn inline_consts_collapses_nested_scalar_refs() {
     let a = c_const("A", c_num(1))
-    let b = c_const("B", c_bin(lexer::TokenKind::Plus, c_ref("A"), c_num(1)))
+    let b = c_const("B", c_bin(lexer::TokenKind::Plus, c_ref("A", "teko::checker"), c_num(1)))
     mut body: []TStatement = teko::list::empty()
-    body = teko::list::push(body, c_ret(c_ref("B")))
+    body = teko::list::push(body, c_ret(c_ref("B", "teko::checker")))
     mut items: []TItem = teko::list::empty()
     items = teko::list::push(items, b)
     items = teko::list::push(items, a)
@@ -463,7 +553,7 @@ fn inline_aggregate_consts_substitutes_and_drops_decl() {
     let arr = te(TArrayLit { elements = elems }, byteslice)
     let agg = TConstDecl { name = "MAGIC"; namespace = "teko::checker"; ty = byteslice; init = arr; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
     mut body: []TStatement = teko::list::empty()
-    body = teko::list::push(body, c_ret(te(TVar { name = "MAGIC"; is_func = false; func_ns = "" }, byteslice)))
+    body = teko::list::push(body, c_ret(te(TVar { name = "MAGIC"; is_func = false; func_ns = "teko::checker" }, byteslice)))
     mut items: []TItem = teko::list::empty()
     items = teko::list::push(items, agg)
     items = teko::list::push(items, c_fn("f", body))

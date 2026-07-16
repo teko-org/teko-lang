@@ -1741,17 +1741,22 @@ fn collect(program: parser::Program) -> Collected | error {
 }
 
 /**
- * C7.10 — collect with a pre-seeded (table, env). Adds the project's type decls on top of
- * the seeded table, then adds the project's function signatures on top of the seeded env.
+ * collect_with_seed — C7.10: collect with a pre-seeded (table, env). Adds the project's type decls
+ * on top of the seeded table, then adds the project's function signatures AND module-level const
+ * bindings on top of the seeded env (mirroring `collect_funcs`'s own `ConstDecl` arm, #594 crumb
+ * 8b) — without the const arm, a project's own `const` was never bound into `env` when a dep was
+ * present (the dep-seeded `env` only carried the dep's EXPORTED consts via `seed_dep_consts`), so a
+ * bare reference always resolved to a same-name dep const even when the project declared its own.
  * Used by `type_program_with_deps` to inject dep items before type-checking the project.
  *
  * (U2 #333 F1) Same early-stamp ordering as `collect()` — `instantiate_types` runs BEFORE
  * `validate_type_decls`/`func_type` so a project-written `Box<Raw>` (dep or project generic)
  * is already stamped, and its unsafe-carrying is visible to the field/signature gates.
  *
- * @param parser::Program program  the project's parsed program (dep items are NOT re-typed, only seeded)
- * @param Collected seed  the dep-derived (table, env) to extend
- * @return Collected | error  the collected type table + environment, project items layered on the seed
+ * @param program  the project's parsed program (dep items are NOT re-typed, only seeded)
+ * @param seed     the dep-derived (table, env) to extend
+ * @return         the collected type table + environment, project items layered on the seed
+ * @since #594
  */
 fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | error {
     // Augment the table with the project's type decls (dep types already in seed.types).
@@ -1781,6 +1786,13 @@ fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | e
                     error as e => return e
                 }
                 env = define_fn(env, f.name, ft, program.items[j].namespace)
+            }
+            parser::ConstDecl as cd => {
+                let ct = match collect_const_sig(cd, table, program.items[j].namespace) {
+                    Type as t => t
+                    error as e => return e
+                }
+                env = define_const(env, cd.name, ct, program.items[j].namespace)
             }
             parser::TypeDecl as td => {
                 match td.body {   // (OOP A1) mirror collect_funcs' struct-method registration
