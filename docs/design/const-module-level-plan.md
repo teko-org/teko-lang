@@ -963,6 +963,13 @@ bumps are the mechanism for making each increment available to the corpus.
   After this passes and the seed is bumped, all three `const` placements (+
   `enum`/`flags` + Tier-A aggregate rodata) are in the bootstrap seed; migration +
   the encoder sweep may now spell them in compiler source.
+- **PRE-BUMP sub-sequence (c8b…c8e) — MANDATORY before SEED BUMP #1.** The c8
+  reviewer found four failures that embark in the seed if unfixed (a silent
+  dep↔project const miscompile, the missing `m1::P` value path #613, no E2E
+  cross-module both-engine proof, no `EXPECT_COMPILE_FAIL` CI assertion #610). Owner
+  rule 2026-07-16: fixed NOW, nothing deferred. Full ordered plan (type signatures,
+  fixtures, gates, dispatch order): **`docs/design/const-crumb8-preseed-subsequence.md`**.
+  The 🔑 bump waits for all four legs green.
 
 ### Crumb 9 — migrate scalar + Tier-A-aggregate const families (6.1, 6.4)
 - **Step:** replace each 6.1 scalar fn and each 6.4 Tier-A aggregate fn with
