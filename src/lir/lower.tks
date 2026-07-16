@@ -5016,23 +5016,129 @@ fn const_struct_bytes(name: str, init: checker::TExpr, layouts: []LStructLayout)
 }
 
 /**
+ * const_variant_tag_bytes — the little-endian I32 tag image of an EMPTY-CASE variant member (#594
+ * crumb 9b): the case's declared index serialized at the variant runtime image's `tag@0` slot (§5.3),
+ * with no payload. An initializer that binds payload fields is a non-empty case whose payload
+ * serialization is a further follow-up and honest-stops (the `MRet {}`/`MRetRiscv {}` targets §6.4
+ * requires are all payload-free empty cases).
+ *
+ * @param si     the member's struct-literal initializer (must bind no field for an empty case)
+ * @param index  the member's declared index (its runtime tag)
+ * @return       the 4-byte little-endian tag image
+ * @throws       when the initializer binds any payload field (a non-empty case)
+ */
+fn const_variant_tag_bytes(si: checker::TStructInit, index: u32) -> []byte | error {
+    if si.field_names.len > 0 { return error { message = "const variant: non-empty payload case materialization is a Tier-A follow-up (#594)" } }
+    serialize_le(index to i128, ltype_size(LType::I32))
+}
+
+/**
+ * find_variant_info — the registered variant whose name's last segment matches `name`'s (#594 crumb
+ * 9b), or null when `name` is not a declared variant. A const's declared type resolves to a QUALIFIED
+ * `Named` (`ns::Op`) while `collect_variants` stores the DECLARED spelling (`Op`), so the match is by
+ * last segment — the same bare-vs-qualified reconciliation `lower_variant_case_test` uses on case
+ * names.
+ *
+ * @param variants  the program's variant table
+ * @param name      the const's declared type name (possibly qualified)
+ * @return          the matching variant info, or null
+ */
+fn find_variant_info(variants: []LEnumInfo, name: str) -> LEnumInfo? {
+    let bare = checker::name_last_segment(name)
+    mut i: u64 = 0
+    loop {
+        if i >= variants.len { break }
+        if checker::name_last_segment(variants[i].name) == bare { return variants[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * variant_member_index — the declared index (runtime tag) of the case `case_name` among `members`
+ * (#594 crumb 9b): a last-segment match, so a qualified initializer type (`ns::RetC`) resolves against
+ * the declared member spelling (`RetC`). The index equals the ordinal `lower_variant_case_test`
+ * compares the loaded `tag@0` against, so the interned image and the match agree.
+ *
+ * @param members    the variant's declared member case names, in tag order
+ * @param case_name  the constructed member's name (possibly qualified)
+ * @return           the member's declared index (its tag)
+ * @throws           when `case_name` is not a member of `members` (an internal invariant break)
+ */
+fn variant_member_index(members: []str, case_name: str) -> u32 | error {
+    let bare = checker::name_last_segment(case_name)
+    mut i: u64 = 0
+    loop {
+        if i >= members.len { break }
+        if checker::name_last_segment(members[i]) == bare { return i to u32 }
+        i++
+    }
+    error { message = teko::str::concat("const variant: case `", case_name, "` is not a declared member (internal) (#594)") }
+}
+
+/**
+ * const_variant_bytes — the rodata image of an EMPTY-CASE variant aggregate const (#594 crumb 9b):
+ * the constructed member's declared tag as a little-endian I32 at offset 0 (the `tag@0` half of the
+ * variant runtime image, §5.3), with no payload. The initializer's own type names the member being
+ * constructed; its index among the variant's declared members (`variants`) is the tag a later `match`
+ * compares against (`lower_variant_case_test`), so both engines agree on the case byte-for-byte. A
+ * member carrying payload fields honest-stops (payload materialization is a further follow-up beyond
+ * the payload-free `MRet {}`/`MRetRiscv {}` §6.4 targets).
+ *
+ * @param info  the const's declared variant (its member case names, in tag order)
+ * @param init  the const's checked initializer (an empty-case member construction)
+ * @return      the 4-byte little-endian tag image
+ * @throws      when the initializer is not an empty member construction, or names no member
+ */
+fn const_variant_bytes(info: LEnumInfo, init: checker::TExpr) -> []byte | error {
+    let case_name = match named_type_name(init.type) { str as s => s; error as e => return e }
+    let index = match variant_member_index(info.members, case_name) { u32 as x => x; error as e => return e }
+    match init.kind {
+        checker::TStructInit as si => const_variant_tag_bytes(si, index)
+        _ => error { message = "const variant: initializer is not a member construction (Tier-A follow-up) (#594)" }
+    }
+}
+
+/**
+ * const_named_bytes — the rodata image of a `Named`-typed aggregate const (#594 crumb 6/9b): a
+ * declared `variant` materializes its empty-case tag (`const_variant_bytes`), any other `Named` is a
+ * flat-POD struct (`const_struct_bytes`). A `variant`-typed const's declared type resolves to a
+ * nominal `Named`, so this dispatch — variant table first, struct layout otherwise — is where the two
+ * families part.
+ *
+ * @param name     the const's declared type name (possibly qualified)
+ * @param init     the const's checked initializer
+ * @param layouts  the program's struct-layout table
+ * @param variants the program's variant table
+ * @return         the const's rodata byte image
+ * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ */
+fn const_named_bytes(name: str, init: checker::TExpr, layouts: []LStructLayout, variants: []LEnumInfo) -> []byte | error {
+    match find_variant_info(variants, name) {
+        LEnumInfo as info => const_variant_bytes(info, init)
+        null => const_struct_bytes(name, init, layouts)
+    }
+}
+
+/**
  * serialize_const — the rodata byte image of a Tier-A aggregate const, dispatched on its resolved
- * value type (#594 crumb 6): a `str` (raw UTF-8), a flat-scalar `[]T`, or a flat-POD struct. A
- * `variant` const (an empty-case tag image) is a documented Tier-A follow-up; any pointer/slice-
+ * value type (#594 crumb 6): a `str` (raw UTF-8), a flat-scalar `[]T`, a flat-POD struct, or an
+ * empty-case `variant` (its tag image, #594 crumb 9b). A `variant` const's declared type resolves to
+ * a nominal `Named`, so `const_named_bytes` splits the struct/variant families. Any pointer/slice-
  * bearing aggregate is Tier-B (T-B) and honest-stops — the sole materialization boundary this crumb
  * enforces.
  *
  * @param cd       the residual typed const declaration (its type + checked initializer)
  * @param layouts  the program's struct-layout table
+ * @param variants the program's variant table
  * @return         the const's rodata byte image
  * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
  */
-fn serialize_const(cd: checker::TConstDecl, layouts: []LStructLayout) -> []byte | error {
+fn serialize_const(cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo) -> []byte | error {
     match cd.ty {
         checker::Str => const_str_bytes(cd.init)
         checker::Slice as s => const_slice_bytes(s.element, cd.init)
-        checker::Named as n => const_struct_bytes(n.name, cd.init, layouts)
-        checker::Variant => error { message = "const aggregate: variant (empty-case tag) materialization is a Tier-A follow-up (#594)" }
+        checker::Named as n => const_named_bytes(n.name, cd.init, layouts, variants)
         _ => error { message = "const aggregate: pointer/slice-bearing value is Tier-B (T-B), not crumb 6 (#594)" }
     }
 }
@@ -5046,12 +5152,13 @@ fn serialize_const(cd: checker::TConstDecl, layouts: []LStructLayout) -> []byte 
  * @param m        the module accumulated so far
  * @param cd       the residual typed const declaration
  * @param layouts  the program's struct-layout table
+ * @param variants the program's variant table
  * @return         the module with the const's rodata entry appended (unchanged for a scalar const)
  * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
  */
-fn intern_aggregate_const_decl(m: LModule, cd: checker::TConstDecl, layouts: []LStructLayout) -> LModule | error {
+fn intern_aggregate_const_decl(m: LModule, cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo) -> LModule | error {
     if const_decl_is_scalar(cd.ty) { return m }
-    let bytes = match serialize_const(cd, layouts) { []byte as b => b; error as e => return e }
+    let bytes = match serialize_const(cd, layouts, variants) { []byte as b => b; error as e => return e }
     add_rodata(m, LRodata { symbol = const_rodata_symbol(cd.name); bytes = bytes })
 }
 
@@ -5062,12 +5169,13 @@ fn intern_aggregate_const_decl(m: LModule, cd: checker::TConstDecl, layouts: []L
  * @param m        the module accumulated so far
  * @param it       the program item to fold
  * @param layouts  the program's struct-layout table
+ * @param variants the program's variant table
  * @return         the module with `it`'s rodata contribution (unchanged for a non-const item)
  * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
  */
-fn intern_aggregate_const_item(m: LModule, it: checker::TItem, layouts: []LStructLayout) -> LModule | error {
+fn intern_aggregate_const_item(m: LModule, it: checker::TItem, layouts: []LStructLayout, variants: []LEnumInfo) -> LModule | error {
     match it {
-        checker::TConstDecl as cd => intern_aggregate_const_decl(m, cd, layouts)
+        checker::TConstDecl as cd => intern_aggregate_const_decl(m, cd, layouts, variants)
         _ => m
     }
 }
@@ -5082,15 +5190,16 @@ fn intern_aggregate_const_item(m: LModule, it: checker::TItem, layouts: []LStruc
  * @param m        the module (layouts registered, rodata still empty)
  * @param items    the typed program's top-level items
  * @param layouts  the program's struct-layout table
+ * @param variants the program's variant table
  * @return         the module with one rodata entry per Tier-A aggregate const
  * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
  */
-fn intern_aggregate_consts(m: LModule, items: []checker::TItem, layouts: []LStructLayout) -> LModule | error {
+fn intern_aggregate_consts(m: LModule, items: []checker::TItem, layouts: []LStructLayout, variants: []LEnumInfo) -> LModule | error {
     mut cur = m
     mut i: u64 = 0
     loop {
         if i >= items.len { break }
-        cur = match intern_aggregate_const_item(cur, items[i], layouts) { LModule as x => x; error as e => return e }
+        cur = match intern_aggregate_const_item(cur, items[i], layouts, variants) { LModule as x => x; error as e => return e }
         i++
     }
     cur
@@ -5114,7 +5223,8 @@ fn intern_aggregate_consts(m: LModule, items: []checker::TItem, layouts: []LStru
 pub fn lower_program(prog: checker::TProgram) -> LModule | error {
     let layouts = collect_struct_layouts(prog)
     let enums = collect_enums(prog)
-    mut m = match intern_aggregate_consts(register_layouts(empty_module(), layouts), prog.items, layouts) { LModule as x => x; error as e => return e }
+    let variants = collect_variants(prog)
+    mut m = match intern_aggregate_consts(register_layouts(empty_module(), layouts), prog.items, layouts, variants) { LModule as x => x; error as e => return e }
     mut loose: []checker::TStatement = teko::list::empty()
     mut lifted: []LFunc = teko::list::empty()
     mut i: u64 = 0
@@ -5387,6 +5497,110 @@ fn collect_enum_decl(acc: []LEnumInfo, td: parser::TypeDecl) -> []LEnumInfo {
         parser::EnumBody as eb => teko::list::push(acc, LEnumInfo { name = td.name; members = eb.members })
         _ => acc
     }
+}
+
+/**
+ * collect_variants — the name + declared member spellings of every `variant` type declaration in
+ * `prog`, in program order (#594 crumb 9b). A `variant`-typed const's declared type resolves to a
+ * NOMINAL `Named` (resolve_named keeps user types nominal), never an expanded `Variant`, so the
+ * empty-case aggregate-const serializer needs the member ORDERING recovered here: the constructed
+ * case's INDEX in this list is the runtime tag a later `match` compares against
+ * (`lower_variant_case_test`). Reuses the `LEnumInfo {name, members}` shape — for the tag's purpose a
+ * variant is a named family whose member ordinals are their declared indices. A non-variant type
+ * declaration contributes no entry.
+ *
+ * @param prog  the whole typed program to scan
+ * @return      every declared variant's name + member spellings, in program order
+ */
+fn collect_variants(prog: checker::TProgram) -> []LEnumInfo {
+    mut out: []LEnumInfo = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        out = collect_variant_item(out, prog.items[i])
+        i++
+    }
+    out
+}
+
+/**
+ * collect_variant_item — accumulate `it`'s variant info onto `acc`, unchanged for every other item
+ * kind (#594 crumb 9b).
+ *
+ * @param acc  the variant table accumulated so far
+ * @param it   the program item to fold
+ * @return     `acc`, with `it`'s variant info appended when applicable
+ */
+fn collect_variant_item(acc: []LEnumInfo, it: checker::TItem) -> []LEnumInfo {
+    match it {
+        parser::TypeDecl as td => collect_variant_decl(acc, td)
+        _ => acc
+    }
+}
+
+/**
+ * collect_variant_decl — accumulate `td`'s member list onto `acc` when its body is a `VariantBody`;
+ * unchanged for any other type-declaration shape (struct/class/enum/…) (#594 crumb 9b). The member
+ * spellings come from the variant body's union type-expr, in source order.
+ *
+ * @param acc  the variant table accumulated so far
+ * @param td   the type declaration to fold
+ * @return     `acc`, with `td`'s variant info appended when applicable
+ */
+fn collect_variant_decl(acc: []LEnumInfo, td: parser::TypeDecl) -> []LEnumInfo {
+    match td.body {
+        parser::VariantBody as vb => teko::list::push(acc, LEnumInfo { name = td.name; members = variant_member_names(vb.type_expr) })
+        _ => acc
+    }
+}
+
+/**
+ * variant_member_names — the member spellings of a variant body's union type-expr, in source order
+ * (#594 crumb 9b): each member is a `NamedType` whose path's last segment names the case. A
+ * non-union body (a variant always parses as a two-or-more union) yields no members.
+ *
+ * @param te  the variant body's type-expr (a union of member types)
+ * @return    the member case names, in declared order
+ */
+fn variant_member_names(te: parser::TypeExpr) -> []str {
+    match te {
+        parser::UnionType as ut => union_member_names(ut.members)
+        _ => teko::list::empty()
+    }
+}
+
+/**
+ * union_member_names — the last-segment name of each `NamedType` member of a union type-expr, in
+ * order (#594 crumb 9b); a non-named member (unreachable for a well-formed variant of nominal cases)
+ * contributes nothing.
+ *
+ * @param members  the union's member type-exprs
+ * @return         each named member's case name, in order
+ */
+fn union_member_names(members: []parser::TypeExpr) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= members.len { break }
+        match members[i] {
+            parser::NamedType as nt => out = teko::list::push(out, type_path_last_name(nt.path))
+            _ => { }
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * type_path_last_name — the last segment's name of a type-path (`a::B` -> `B`), or the empty string
+ * for a segment-less path (an internal invariant break the caller never produces) (#594 crumb 9b).
+ *
+ * @param p  the type path
+ * @return   the path's last segment name
+ */
+fn type_path_last_name(p: parser::Path) -> str {
+    if p.segments.len == 0 { return "" }
+    p.segments[p.segments.len - 1].name
 }
 
 /** LowerItemOut — the module + accumulated loose statements + the WHOLE-PROGRAM

@@ -844,6 +844,61 @@ fn lwt_agg_slice_const_materializes_one_rodata_entry() {
 }
 
 /**
+ * lwt_variant_decl — a `variant <name> = M0 | M1 | …` TypeDecl, wrapped as a `checker::TItem` (#594
+ * crumb 9b). The member names become the variant body's union of `NamedType` members, in order, so
+ * `collect_variants` recovers the tag ORDER an empty-case aggregate-const serialization needs.
+ *
+ * @param name     the variant type's name
+ * @param members  the member case names, in declared (tag) order
+ * @return         the variant type declaration, as a program item
+ */
+fn lwt_variant_decl(name: str, members: []str) -> checker::TItem {
+    mut mtes: []parser::TypeExpr = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= members.len { break }
+        mtes = teko::list::push(mtes, lwt_named_te(members[i]))
+        i++
+    }
+    parser::TypeDecl {
+        name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty()
+        body = parser::VariantBody { type_expr = parser::UnionType { members = mtes } }
+        vis = parser::Visibility::Pub; has_doc = false; doc = ""
+        line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""
+        is_unsafe = false; must_free = false
+    }
+}
+
+/**
+ * lwt_agg_empty_variant_const_interns_its_tag_image — the crumb-9b Tier-A empty-case variant keystone
+ * (#594): a `const R: Op = RetC { }` over `variant Op = RetA | RetB | RetC` interns EXACTLY ONE rodata
+ * entry (`.Lconst_R`) whose bytes are the constructed member's declared tag — `RetC` is the third
+ * member, so the 4-byte little-endian I32 image is `[2, 0, 0, 0]` (the `tag@0` half of the variant
+ * runtime image, no payload). `m.globals.len == 0` still holds. Directly validates `serialize_const`'s
+ * variant arm (the tag `lower_variant_case_test` later compares against), independent of the own
+ * backend's downstream match dispatch.
+ *
+ * @return void
+ */
+#test
+fn lwt_agg_empty_variant_const_interns_its_tag_image() {
+    let members = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "RetA"), "RetB"), "RetC")
+    mut items: []checker::TItem = teko::list::push(teko::list::empty(), lwt_variant_decl("Op", members))
+    let init = lwt_struct_init("RetC", teko::list::empty(), teko::list::empty())
+    let cd: checker::TItem = checker::TConstDecl { name = "R"; namespace = ""; ty = checker::Named { name = "Op" }; init = init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    items = teko::list::push(items, cd)
+    let m = match lower_program(checker::TProgram { items = items }) { LModule as x => x; error as err => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(m.globals.len == 0)
+    teko::assert::is_true(m.rodata.len == 1)
+    teko::assert::is_true(m.rodata[0].symbol == ".Lconst_R")
+    teko::assert::is_true(m.rodata[0].bytes.len == 4)
+    teko::assert::is_true(m.rodata[0].bytes[0] == (2 to byte))
+    teko::assert::is_true(m.rodata[0].bytes[1] == (0 to byte))
+    teko::assert::is_true(m.rodata[0].bytes[2] == (0 to byte))
+    teko::assert::is_true(m.rodata[0].bytes[3] == (0 to byte))
+}
+
+/**
  * lwt_virtual_main_fires_a_defer_before_its_own_fall_through — A1-2,
  * #382: a top-level `defer { … }` with no further loose statements after
  * it must fire before `close_virtual_main`'s own implicit `const 0; ret`
