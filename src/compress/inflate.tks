@@ -647,25 +647,12 @@ fn inflate_dynamic_block(state: InflateState) -> InflateState | error {
 }
 
 /**
- * The DEFLATE block-type code for a stored (uncompressed) block (RFC 1951 §3.2.3).
- *
- * @return  `0`
+ * The DEFLATE `BTYPE` tag (RFC 1951 §3.2.3): `Stored` (uncompressed, code `0`), `Fixed`
+ * (fixed-Huffman, code `1`), or `Dynamic` (dynamic-Huffman, code `2`). The declaration
+ * order fixes the ordinal to the on-the-wire `BTYPE` code, so `btype to BlockType`
+ * reproduces the wire value directly — no separate wire-mapping helper is needed.
  */
-fn block_type_stored() -> u32 { 0 }
-
-/**
- * The DEFLATE block-type code for a fixed-Huffman block.
- *
- * @return  `1`
- */
-fn block_type_fixed() -> u32 { 1 }
-
-/**
- * The DEFLATE block-type code for a dynamic-Huffman block.
- *
- * @return  `2`
- */
-fn block_type_dynamic() -> u32 { 2 }
+pub type BlockType = enum { Stored; Fixed; Dynamic }
 
 /**
  * The result of decoding one DEFLATE block: the advanced state plus whether it was the
@@ -694,19 +681,21 @@ fn inflate_one_block(state: InflateState) -> BlockResult | error {
     let btype = type_step.value
     let body_state = InflateState { reader = type_step.next; output = state.output }
 
-    if btype == block_type_stored() {
-        let next = match inflate_stored_block(body_state) { InflateState as s => s; error as e => return e }
-        return BlockResult { state = next; is_final = is_final }
+    match btype to BlockType {
+        Stored => {
+            let next = match inflate_stored_block(body_state) { InflateState as s => s; error as e => return e }
+            BlockResult { state = next; is_final = is_final }
+        }
+        Fixed => {
+            let next = match inflate_fixed_block(body_state) { InflateState as s => s; error as e => return e }
+            BlockResult { state = next; is_final = is_final }
+        }
+        Dynamic => {
+            let next = match inflate_dynamic_block(body_state) { InflateState as s => s; error as e => return e }
+            BlockResult { state = next; is_final = is_final }
+        }
+        _ => error { message = "inflate: reserved block type (BTYPE 3)" }
     }
-    if btype == block_type_fixed() {
-        let next = match inflate_fixed_block(body_state) { InflateState as s => s; error as e => return e }
-        return BlockResult { state = next; is_final = is_final }
-    }
-    if btype == block_type_dynamic() {
-        let next = match inflate_dynamic_block(body_state) { InflateState as s => s; error as e => return e }
-        return BlockResult { state = next; is_final = is_final }
-    }
-    error { message = "inflate: reserved block type (BTYPE 3)" }
 }
 
 /**
