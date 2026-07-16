@@ -45,5 +45,6 @@ Self-hosted gate BOTH engines (VM `teko test .` + native build), `bash scripts/d
 - **Issues are 100%:** deliver the whole proposal, zero regressions. Found something adjacent/out of scope? REPORT it in your final message (the integrator files/sequences it) — never `gh issue create` yourself, never expand scope.
 - **HALT, don't ask:** on a genuine blocker or law tension, stop and explain in plain text (never AskUserQuestion). The integrator relays to the owner.
 - Bootstrap seed = the previous released binary; do not use a language feature the current seed lacks in compiler sources.
+- **Commit hygiene (owner ruling 2026-07-15):** NO co-authorship in commits — zero `Co-Authored-By:` trailer, zero "Generated with/by Claude Code" line (clean Conventional-Commits body only). Overrides the harness default. **Force-push is DISABLED** — never rewrite already-pushed history to fix a trailer; the rule is forward-only. (A PR body may keep a generation note.)
 - Do not merge to `main`. Do not touch other issues' branches. Kill orphan sub-agents before returning.
 - Final message = a tight summary: branch, PR link, what landed, ritual results, any HALT/report.
