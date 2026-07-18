@@ -625,7 +625,7 @@ cobertura (on/off), e linkar o delta como objeto separado via símbolos external
 
 ---
 
-## Onda: throughput do emissor (produtor 22× mais lento que o cc)
+## Onda AL — alocação & throughput do build (NÃO confundir com a Fase E) (produtor 22× mais lento que o cc)
 
 Dados do owner (CI real, fork, macOS, crumbs 1-3): `emit test` = 17.7 MB em 201.1s
 (**~88 KB/s**); `cc test` compila os MESMOS 17.7 MB em 9.0s → o consumidor é **22× mais
@@ -676,7 +676,7 @@ capacidade** (sem cache compartilhado, sem witness, sem inanição) → amortiza
 e uma chamada por fragmento sem probe. **Mesmos bytes emitidos** (a ordem/conteúdo dos appends
 é idêntica) → fixpoint intacto.
 
-- **E1 — MEDIR (risco zero, sem mudança de produto).** A infra #148 já tem os contadores:
+- **AL1 — MEDIR (risco zero, sem mudança de produto).** A infra #148 já tem os contadores:
   `tk_obs_miss[why]`/`tk_obs_miss_big[why]` (`teko_rt.c:2132-2138`) classificam POR QUE o
   in-place falhou (0=sem ptr, 1=ptr colidiu/despejado, 2=len, 3=cap exausto, 4=outro) e
   `tk_obs_push2` atribui os grows caros. Rodar um gate com obs ligada CONFIRMA se a tempestade
@@ -684,17 +684,17 @@ e uma chamada por fragmento sem probe. **Mesmos bytes emitidos** (a ordem/conte�
   também o crumb 1 (START/settle em `codegen`/`emit C`/`cc`) para separar codegen-vs-cc. É a
   ferramenta que decide o tamanho do ganho.
 
-- **E2 — Robustez do runtime (seed C mantido, byte-preservador) — ALAVANCA PRINCIPAL.**
+- **AL2 — Robustez do runtime (seed C mantido, byte-preservador) — ALAVANCA PRINCIPAL.**
   Garantir que os poucos buffers multi-MB (a saída do emissor / writers) mantenham
   amortizado-O(1) INDEPENDENTE do cache global: p.ex. um registro dedicado para builders
   grandes, OU capacidade carregada de forma robusta, de modo que `tk_append_bytes_fo`/
   `tk_slice_push` NUNCA degradem para copy-grow total repetido do buffer grande.
   `src/runtime/teko_rt.c` é o **seed C MANTIDO** (edição permitida pela lei). Bytes de saída
   INALTERADOS → **fixpoint preservado (gen2.c==gen3.c + `cmp` local)**. Se a tempestade for
-  confirmada (E1), esta é a alavanca de ORDEM DE GRANDEZA (ver ganho abaixo). Guarda: gate de
+  confirmada (AL1), esta é a alavanca de ORDEM DE GRANDEZA (ver ganho abaixo). Guarda: gate de
   659 testes + TEKO_MEM_PARANOID + fixpoint.
 
-- **E3 — Builder explícito (mais fundo, opcional se E2 bastar).** Introduzir um valor
+- **AL3 — Builder explícito (mais fundo, opcional se AL2 bastar).** Introduzir um valor
   `Builder` `{ptr,len,cap}` na superfície (`teko::mem`), SAFE (backed por primitivo de runtime,
   NÃO derivado de RawBuf — evita a contágio unsafe U2/#333), que baixa para um append de
   runtime robusto (sem cache global, sem probe por fragmento). Threadar pelos `cb`/`cb_byte`/
@@ -702,32 +702,32 @@ e uma chamada por fragmento sem probe. **Mesmos bytes emitidos** (a ordem/conte�
   native. Remove o CONSTANTE por-fragmento residual (probe de 5 campos + ponte). Diff mecânico
   GRANDE (assinaturas `buf: []byte` em centenas de emit fns); bytes preservados por construção.
 
-- **E4 — Paridade native.** Aplicar E2/E3 aos `objfile_*`/`encode_*`/`tkb_buf`
+- **AL4 — Paridade native.** Aplicar AL2/E3 aos `objfile_*`/`encode_*`/`tkb_buf`
   (`list::push` byte-a-byte → builder/append robusto). Fecha o "mesmo vale para native" do
   owner; `cmp` dos goldens de `.o`/`.wasm` como ritual.
 
 ### Ganho honesto
 
-- **SE a tempestade (why==1) domina** (o que os 88 KB/s ⇒ superlinear indicam), E2 restaura
+- **SE a tempestade (why==1) domina** (o que os 88 KB/s ⇒ superlinear indicam), AL2 restaura
   amortizado-linear real: 17.7 MB ≈ 35 MB de memcpy + overhead por fragmento. Mesmo a 50-100
   MB/s efetivos (com overhead de call sob o seed), ~0.2-0.4s de cópia ⇒ **de 201s para poucos
   segundos ⇒ ~50-100×.** Pico de memória (#148): remover o churn de copy-grow derruba a
   free-list inchada ⇒ pico cai em direção ao piso (TAST do mono + 1 buffer de saída ~2× final).
-- **SE o constante por-fragmento domina** (call+probe), E2 ajuda menos e E3 (remover o probe)
-  dá ~2-5×. **E1 decide qual.** Os 88 KB/s pesam fortemente para o primeiro caso.
+- **SE o constante por-fragmento domina** (call+probe), AL2 ajuda menos e AL3 (remover o probe)
+  dá ~2-5×. **AL1 decide qual.** Os 88 KB/s pesam fortemente para o primeiro caso.
 
 ### Composição e PRIORIDADE (codegen já provado 85-93% do custo)
 
-1. **THROUGHPUT (E1 medir → E2 runtime) — PRIORIDADE MÁXIMA.** Maior ROI, MENOR risco
+1. **THROUGHPUT (AL1 medir → AL2 runtime) — PRIORIDADE MÁXIMA.** Maior ROI, MENOR risco
    (byte-preservador, runtime-only), vale para C E native, ataca direto os 85-93%. Se E2
    restaurar MB/s, 17.7 MB viram ~segundos e o problema some.
 - **base+delta** (seção anterior): reduz o VOLUME emitido; é ORTOGONAL ao throughput (emitir
    menos × emitir mais rápido MULTIPLICAM). Mas é estrutural + re-baseline do golden `gen2.c` +
    nó de indexação de cobertura + só C-release → **DEPOIS do throughput** (e possivelmente
-   DESNECESSÁRIO se E2 já traz MB/s: 17.7 MB a 5 MB/s = 3.5s).
+   DESNECESSÁRIO se AL2 já traz MB/s: 17.7 MB a 5 MB/s = 3.5s).
 - **heartbeat (crumb 5)** é OBSERVABILIDADE, não velocidade: o crumb 1 (START/settle) já
    des-muta a fase; o heartbeat fino é nice-to-have de MENOR urgência quando o emit já é rápido.
-- Ordem recomendada: **E1 → E2 (headline) → medir de novo → (se preciso) E3/E4 → base+delta só
+- Ordem recomendada: **AL1 → AL2 (headline) → medir de novo → (se preciso) AL3/E4 → base+delta só
    se ainda valer.** Tudo INDEPENDENTE do const wave (não toca const-eval).
 
 ### Riscos
@@ -844,14 +844,14 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
 - Risco: baixo PORQUE não fiado no default. Independe do const wave.
 
 ### Onda própria (pós-observabilidade, NÃO um crumb de stderr)
-- **Throughput do emissor (E1→E2→E3/E4):** ver seção "Onda: throughput do emissor".
+- **Throughput do emissor (AL1→AL2→AL3/AL4):** ver seção "Onda: throughput do emissor".
   **PRIORIDADE MÁXIMA das ondas** — byte-preservador, vale C E native, ataca os 85-93% do
-  custo. E1 (medir com obs #148 + crumb 1) → E2 (robustez do runtime, seed C mantido,
-  potencial ~50-100×) → E3/E4 (builder explícito + writers native). Ritual: fixpoint + `cmp`.
+  custo. AL1 (medir com obs #148 + crumb 1) → AL2 (robustez do runtime, seed C mantido,
+  potencial ~50-100×) → AL3/E4 (builder explícito + writers native). Ritual: fixpoint + `cmp`.
 - **C base compartilhado + delta (.h + link):** ver seção "Proposta do owner". Dedup de
   CODEGEN (produção emitida 1×), ortogonal a 3/4b (dedup de front-end) e ao throughput (emitir
   menos × mais rápido). Gated na medição do crumb 1; **DEPOIS do throughput** (pode ficar
-  desnecessário se E2 trouxer MB/s). Custo: macros de cov + re-baseline do golden `gen2.c` + nó
+  desnecessário se AL2 trouxer MB/s). Custo: macros de cov + re-baseline do golden `gen2.c` + nó
   de indexação da cobertura. Ponte para o modelo dois-objetos do 0.4.
 
 **Pontos rituais (gate cheio deve passar):** fim do crumb 5 (fixpoint após tocar codegen),
@@ -930,3 +930,30 @@ suporte a const, fonte ainda sem uso) → aa32910/0.3.0.23 (bump #2) → branch`
 Cada degrau `teko build . --no-verify` (~3min); degraus preservados como
 binários (`seeds/teko-0.3.0.NN`). Procedimento canônico para agents validarem
 a umbrella localmente.
+
+### Nota de nomenclatura e ordem (ruling do owner, 2026-07-18)
+
+Esta onda chamava-se "E1-E4" em rascunhos — COLIDIA com a **Fase E** do projeto
+(o LINKER PRÓPRIO, issues/PRs já fechados na antecipação da main). São coisas
+distintas: a Fase E entrega independência de toolchain e NÃO resolve o
+problema de alocação — pelo contrário, um linker construído sobre os padrões
+atuais (rebind de `push`, alocações por byte) HERDA o trap. Lei de ordem:
+**a onda AL precede a Fase E como pré-requisito.**
+
+### AL5 — lifetime por fase do pipeline (a terceira perna, ruling do owner)
+
+Além do append amortizado (AL2/AL3), o PIPELINE retém tudo até o fim (região
+root): tokens vivos após o parse, AST viva após o check, TAST viva após o
+codegen, e as gerações velhas de cada array crescido — o pico de ~1.8 GB é
+esse rastro. AL5 = regiões por estágio do build: ao entrar na fase N+1, os
+intermediários da fase N morrem (o modelo de um pipeline de dados real:
+consome, produz, LIBERA). Reduz pico de memória e pressão de alocador; o
+desenho fino (fronteiras de região × o que atravessa fases, ex.: interns de
+string) é o design-ahead da onda.
+
+### Critério de aceitação (ruling do owner)
+
+Codebase de mesmo tamanho: **teko builda mais rápido que rustc.** Baseline
+2026-07-18 (CI real): emit test 17.6 MB — 201s (macOS) / 307s (Windows) /
+520s (ubuntu); gate completo 5-12 min por OS. Meta pós-AL: segundos de teko +
+o tempo do cc.
