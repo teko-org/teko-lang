@@ -3,9 +3,14 @@
  *
  * BUILD-OUTPUT OBSERVABILITY — the per-phase progress reporter `teko build` (and the
  * bare-project invocation) uses in place of the historical one-line-per-file wall.
- * Every phase (lexer, parser, checker, monomorph, codegen, emit C, cc) prints a START,
- * an in-place `\r`-updating counter WHILE the phase works (on a TTY only), and a SETTLE
- * line carrying the elapsed time and a `✓`/`✗` mark. All output goes to stderr — the C
+ * Every phase (lexer, parser, checker, monomorph, codegen, emit C, cc — plus the test
+ * gate's `emit test`/`cc test` and the release `rebuild`) ANNOUNCES itself at its START
+ * and settles with the elapsed time and a `✓`/`✗` mark. The `Report` mode decides the
+ * shape: `Tty` overwrites a single in-place line with a `\r`-updating counter WHILE the
+ * phase works; `Plain` (CI/pipe/redirect) prints a full START line AND a full settle
+ * line — no `\r` (which would smear a log), but the phase is visible the instant it
+ * begins, so a long phase is never a silent gap between two settled lines; `Quiet`
+ * prints nothing (an already-reported retry pass). All output goes to stderr — the C
  * standard library never buffers stderr, so a `\r` update is visible immediately with no
  * new runtime seam (stdout, by contrast, is block- or line-buffered and would need an
  * `fflush` primitive this compiler's released seed does not expose).
@@ -35,19 +40,50 @@ pub fn output_is_tty(no_tty: bool) -> bool {
 }
 
 /**
- * One in-flight build phase: its label, start time, and whether it renders live
- * `\r`-updating text (`visible`) or settles silently until its one final line.
+ * How a build phase renders its progress. THREE states, made explicit so a phase
+ * can announce itself the moment it BEGINS on a non-interactive log — not only
+ * settle at its END (the "silent gap" a CI reader saw between phases before this
+ * distinction existed: a long phase was invisible while it ran):
  *
- * @field label    the fixed-width-padded phase name ("lexer", "checker", "cc", ...)
- * @field start    when the phase began, as nanoseconds since the Unix epoch (see
- *                 `now_ns` — plain `i128` rather than `teko::time::DateTime`, whose
- *                 struct wrapper cannot round-trip through a stored local/field)
- * @field visible  true iff this phase should print in-place `\r` updates while it runs
+ *   - `Tty`   — an interactive terminal: a mid-phase line the `\r`-updating counter
+ *               overwrites in place, settling with elapsed time + `✓`/`✗`.
+ *   - `Plain` — a non-interactive log (CI, a pipe, a redirect): a plain START line
+ *               at `phase_begin` AND a plain settle line at `phase_end` — no `\r`
+ *               (which would smear a log), no mid-phase ticks, but the phase is
+ *               visible the instant it starts, so a long phase is never a silent gap.
+ *   - `Quiet` — no output at all (a silent/retry pass whose lines were already
+ *               reported, e.g. the release rebuild's re-run of the front-end).
+ */
+pub type Report = enum { Tty; Plain; Quiet }
+
+/**
+ * Resolve the phase-render mode from the two axes the callers already carry: `quiet`
+ * (this pass should print nothing — a retry/already-reported run) always wins as
+ * `Quiet`; otherwise a real terminal renders `Tty` (in-place `\r` updates) and a
+ * non-interactive destination renders `Plain` (START + settle lines, no `\r`).
+ *
+ * @param quiet  suppress ALL output for this pass (the caller's `!report`)
+ * @param tty    render in-place `\r` updates (from `output_is_tty`)
+ * @return       the resolved `Report` mode
+ */
+pub fn report_mode(quiet: bool, tty: bool) -> Report {
+    if quiet { return Report::Quiet }
+    if tty { Report::Tty } else { Report::Plain }
+}
+
+/**
+ * One in-flight build phase: its label, start time, and how it renders (`mode`).
+ *
+ * @field label  the fixed-width-padded phase name ("lexer", "checker", "cc", ...)
+ * @field start  when the phase began, as nanoseconds since the Unix epoch (see
+ *               `now_ns` — plain `i128` rather than `teko::time::DateTime`, whose
+ *               struct wrapper cannot round-trip through a stored local/field)
+ * @field mode   how this phase renders its progress (`Tty`/`Plain`/`Quiet`)
  */
 pub type Phase = struct {
     label: str
     start: i128
-    visible: bool
+    mode: Report
 }
 
 /**
@@ -180,55 +216,68 @@ fn settle_line(label: str, text: str, start: i128, mark: str, message: str) -> s
 }
 
 /**
- * Begin a phase: record its start time and, on a visible (TTY, non-`--no-tty`, non-CI)
- * run, print its initial mid-phase line so the label appears immediately even before
- * the first tick.
+ * Begin a phase: record its start time and ANNOUNCE it, so the label appears the
+ * instant the phase starts (never a silent gap). On `Tty` this is the initial
+ * mid-phase line the first `\r` tick will overwrite in place; on `Plain` (a CI/log
+ * destination) it is a full, newline-terminated START line — the key line that turns
+ * a long silent phase into a visible "started … / settled …" pair. `Quiet` prints
+ * nothing (a retry/already-reported pass).
  *
  * @param label    the phase name ("lexer", "checker", "cc", ...)
  * @param initial  the starting counter/detail text (typically the zero count)
- * @param visible  true iff this phase renders in-place `\r` updates
+ * @param mode     how this phase renders (`Tty`/`Plain`/`Quiet`)
  * @return         the `Phase` handle for `phase_tick`/`phase_end_ok`/`phase_end_fail`
  */
-pub fn phase_begin(label: str, initial: str, visible: bool) -> Phase {
-    if visible { teko::io::eprint(mid_line(label, initial)) }
-    Phase { label = label; start = now_ns(); visible = visible }
+pub fn phase_begin(label: str, initial: str, mode: Report) -> Phase {
+    match mode {
+        Report::Tty => teko::io::eprint(mid_line(label, initial))       // overwritten by the first `\r` tick
+        Report::Plain => teko::io::eprintln(mid_line(label, initial))   // a full START line — no `\r`
+        Report::Quiet => { }
+    }
+    Phase { label = label; start = now_ns(); mode = mode }
 }
 
 /**
- * Update a running phase's in-place counter. A no-op when `p` is not visible (a
- * non-TTY/CI run settles once at the end — never mid-phase, so a `\r` never lands
- * in a log file).
+ * Update a running phase's in-place counter. Only `Tty` ticks: a `Plain` run has
+ * already printed its START line and settles once at the end (a `\r` would smear a
+ * log file), and a `Quiet` run prints nothing.
  *
  * @param p     the phase handle from `phase_begin`
  * @param text  the current counter/detail text
  */
 pub fn phase_tick(p: Phase, text: str) -> void {
-    if !p.visible { return }
+    if p.mode != Report::Tty { return }
     teko::io::eprint(teko::str::concat("\r", mid_line(p.label, text)))
 }
 
 /**
  * Settle a phase as SUCCESSFUL: the final counter/detail text, elapsed time, and a
- * `✓`. On a visible run this overwrites the last in-place line; either way it ends
- * with a single newline (flushed immediately — stderr is never buffered).
+ * `✓`. On `Tty` this overwrites the last in-place line (`\r` prefix); on `Plain` it
+ * is a plain settle line following the START line `phase_begin` already printed;
+ * `Quiet` prints nothing. Non-quiet output ends with a single newline (flushed
+ * immediately — stderr is never buffered).
  *
  * @param p     the phase handle from `phase_begin`
  * @param text  the final counter/detail text
  */
 pub fn phase_end_ok(p: Phase, text: str) -> void {
-    let prefix = if p.visible { "\r" } else { "" }
+    if p.mode == Report::Quiet { return }
+    let prefix = if p.mode == Report::Tty { "\r" } else { "" }
     teko::io::eprintln(teko::str::concat(prefix, settle_line(p.label, text, p.start, "✓", "")))
 }
 
 /**
  * Settle a phase as FAILED: the counter/detail text at the point of failure, elapsed
- * time, a `✗`, and the diagnostic message — so WHERE a build stopped is obvious.
+ * time, a `✗`, and the diagnostic message — so WHERE a build stopped is obvious. On
+ * `Tty` the `\r` overwrites the last in-place line; on `Plain` it follows the START
+ * line; `Quiet` prints nothing.
  *
  * @param p        the phase handle from `phase_begin`
  * @param text     the counter/detail text at the point of failure
  * @param message  the failure diagnostic
  */
 pub fn phase_end_fail(p: Phase, text: str, message: str) -> void {
-    let prefix = if p.visible { "\r" } else { "" }
+    if p.mode == Report::Quiet { return }
+    let prefix = if p.mode == Report::Tty { "\r" } else { "" }
     teko::io::eprintln(teko::str::concat(prefix, settle_line(p.label, text, p.start, "✗", message)))
 }

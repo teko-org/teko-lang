@@ -4,10 +4,10 @@
 
 **A self-hosting, all-native programming language — safe by construction, tested by default.**
 
-[![Native Build & Test](https://github.com/schivei/teko-lang/actions/workflows/native.yml/badge.svg)](https://github.com/schivei/teko-lang/actions/workflows/native.yml)
-[![Sanitizers & Stress](https://github.com/schivei/teko-lang/actions/workflows/sanitizers.yml/badge.svg)](https://github.com/schivei/teko-lang/actions/workflows/sanitizers.yml)
-[![SAST Gate](https://github.com/schivei/teko-lang/actions/workflows/sast.yml/badge.svg)](https://github.com/schivei/teko-lang/actions/workflows/sast.yml)
-[![CodeQL](https://github.com/schivei/teko-lang/actions/workflows/codeql.yml/badge.svg)](https://github.com/schivei/teko-lang/actions/workflows/codeql.yml)
+[![Native Build & Test](https://github.com/teko-org/teko-lang/actions/workflows/native.yml/badge.svg)](https://github.com/teko-org/teko-lang/actions/workflows/native.yml)
+[![Sanitizers & Stress](https://github.com/teko-org/teko-lang/actions/workflows/sanitizers.yml/badge.svg)](https://github.com/teko-org/teko-lang/actions/workflows/sanitizers.yml)
+[![SAST Gate](https://github.com/teko-org/teko-lang/actions/workflows/sast.yml/badge.svg)](https://github.com/teko-org/teko-lang/actions/workflows/sast.yml)
+[![CodeQL](https://github.com/teko-org/teko-lang/actions/workflows/codeql.yml/badge.svg)](https://github.com/teko-org/teko-lang/actions/workflows/codeql.yml)
 
 <img src="docs/brand/mascot.svg" alt="The Teko mascot — a baby guará (scarlet ibis)" width="280"/>
 
@@ -92,7 +92,7 @@ Programs have a *virtual main*: top-level statements in `main.tks` are the entry
 ### Build the compiler
 
 ```sh
-git clone https://github.com/schivei/teko-lang.git
+git clone https://github.com/teko-org/teko-lang.git
 cd teko-lang
 
 ./scripts/fetch_teko.sh          # Download the latest released Teko binary
