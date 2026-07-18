@@ -9,14 +9,14 @@
  * @return []byte  `buf` followed by v's eight little-endian bytes
  */
 fn emit_u64_le(buf: []byte, v: u64) -> []byte {
-    mut b = teko::list::push(buf, (v & (0xFF to u64)) to byte)
-    b = teko::list::push(b, ((v >> (8 to u64)) & (0xFF to u64)) to byte)
-    b = teko::list::push(b, ((v >> (16 to u64)) & (0xFF to u64)) to byte)
-    b = teko::list::push(b, ((v >> (24 to u64)) & (0xFF to u64)) to byte)
-    b = teko::list::push(b, ((v >> (32 to u64)) & (0xFF to u64)) to byte)
-    b = teko::list::push(b, ((v >> (40 to u64)) & (0xFF to u64)) to byte)
-    b = teko::list::push(b, ((v >> (48 to u64)) & (0xFF to u64)) to byte)
-    teko::list::push(b, ((v >> (56 to u64)) & (0xFF to u64)) to byte)
+    mut b = teko::list::push(buf, (v & MACHO_BYTE_MASK_64) to byte)
+    b = teko::list::push(b, ((v >> (8 to u64)) & MACHO_BYTE_MASK_64) to byte)
+    b = teko::list::push(b, ((v >> (16 to u64)) & MACHO_BYTE_MASK_64) to byte)
+    b = teko::list::push(b, ((v >> (24 to u64)) & MACHO_BYTE_MASK_64) to byte)
+    b = teko::list::push(b, ((v >> (32 to u64)) & MACHO_BYTE_MASK_64) to byte)
+    b = teko::list::push(b, ((v >> (40 to u64)) & MACHO_BYTE_MASK_64) to byte)
+    b = teko::list::push(b, ((v >> (48 to u64)) & MACHO_BYTE_MASK_64) to byte)
+    teko::list::push(b, ((v >> (56 to u64)) & MACHO_BYTE_MASK_64) to byte)
 }
 
 /**
@@ -68,7 +68,7 @@ fn emit_fixed16(buf: []byte, s: str) -> []byte {
  * @return []byte  `buf` followed by v's low byte
  */
 fn emit_u8_field(buf: []byte, v: u32) -> []byte {
-    teko::list::push(buf, (v & (0xFF to u32)) to byte)
+    teko::list::push(buf, (v & MACHO_BYTE_MASK) to byte)
 }
 
 /**
@@ -123,7 +123,7 @@ fn build_strtab(symbols: []Symbol) -> StrTab {
     loop {
         if i >= symbols.len { break }
         strx = teko::list::push(strx, bytes.len to u32)
-        bytes = teko::list::push(bytes, 0x5F to byte)
+        bytes = teko::list::push(bytes, MACHO_SYM_UNDERSCORE)
         bytes = emit_str_bytes(bytes, symbols[i].name)
         bytes = teko::list::push(bytes, 0 to byte)
         i++
@@ -354,6 +354,74 @@ fn compute_macho_layout(enc: EncodedModule, strtab_size: u32) -> MachoLayout {
 const MACHO_MAGIC_64: u32 = 0xFEEDFACF
 
 /**
+ * MACHO_CPU_TYPE_ARM64 — the `mach_header_64.cputype` for arm64:
+ * `CPU_ARCH_ABI64 (0x01000000) | CPU_TYPE_ARM (12)`.
+ */
+const MACHO_CPU_TYPE_ARM64: u32 = 0x0100000C to u32
+
+/**
+ * MACHO_LC_SEGMENT_64 — the `LC_SEGMENT_64` load-command type: the single
+ * unnamed segment carrying `__text`/`__const` in this relocatable object.
+ */
+const MACHO_LC_SEGMENT_64: u32 = 0x19 to u32
+
+/**
+ * MACHO_LC_BUILD_VERSION — the `LC_BUILD_VERSION` load-command type: the
+ * platform/minos/sdk stamp `ld` requires of a modern object.
+ */
+const MACHO_LC_BUILD_VERSION: u32 = 0x32 to u32
+
+/**
+ * MACHO_LC_DYSYMTAB — the `LC_DYSYMTAB` load-command type: the symbol-table
+ * partition (local/extdef/undef ranges) the static linker consumes.
+ */
+const MACHO_LC_DYSYMTAB: u32 = 0x0B to u32
+
+/**
+ * MACHO_VERSION_11_0 — macOS 11.0.0 in the `LC_BUILD_VERSION` packed
+ * `xxxx.yy.zz` encoding (`0x000B0000`): the `minos` AND `sdk` floor this
+ * backend stamps (the first arm64 macOS).
+ */
+const MACHO_VERSION_11_0: u32 = 0x000B0000 to u32
+
+/**
+ * MACHO_SYM_UNDERSCORE — the ASCII `_` byte prefixed to every symbol name in
+ * the Mach-O string table (the platform's C-symbol decoration; ELF carries no
+ * such prefix).
+ */
+const MACHO_SYM_UNDERSCORE: byte = 0x5F to byte
+
+/**
+ * MACHO_NTYPE_UNDF_EXT — the `nlist_64.n_type` for an undefined external
+ * reference: `N_UNDF | N_EXT` (0x01).
+ */
+const MACHO_NTYPE_UNDF_EXT: u32 = 0x01 to u32
+
+/**
+ * MACHO_NTYPE_SECT — the `nlist_64.n_type` for a defined, file-local symbol:
+ * `N_SECT` (0x0E) without `N_EXT`.
+ */
+const MACHO_NTYPE_SECT: u32 = 0x0E to u32
+
+/**
+ * MACHO_NTYPE_SECT_EXT — the `nlist_64.n_type` for a defined, externally
+ * visible symbol: `N_SECT | N_EXT` (0x0F).
+ */
+const MACHO_NTYPE_SECT_EXT: u32 = 0x0F to u32
+
+/**
+ * MACHO_BYTE_MASK — the low-byte mask (u32 lanes) the little-endian field
+ * serializers apply per lane, narrowing each slice to one `byte`.
+ */
+const MACHO_BYTE_MASK: u32 = 0xFF to u32
+
+/**
+ * MACHO_BYTE_MASK_64 — the u64-typed low-byte mask of `emit_u64_le`'s eight
+ * lanes (same value as `MACHO_BYTE_MASK`; typed for u64 arithmetic).
+ */
+const MACHO_BYTE_MASK_64: u64 = 0xFF to u64
+
+/**
  * emit_header — the `mach_header_64` (32 bytes): magic `0xFEEDFACF`, cputype
  * `CPU_TYPE_ARM64` (0x0100000C), cpusubtype 0, filetype `MH_OBJECT` (1), the
  * four load commands, `sizeofcmds`, flags 0, reserved 0.
@@ -364,7 +432,7 @@ const MACHO_MAGIC_64: u32 = 0xFEEDFACF
  */
 fn emit_header(buf: []byte, lay: MachoLayout) -> []byte {
     mut b = emit_u32_le(buf, MACHO_MAGIC_64)
-    b = emit_u32_le(b, 0x0100000C to u32)
+    b = emit_u32_le(b, MACHO_CPU_TYPE_ARM64)
     b = emit_u32_le(b, 0 to u32)
     b = emit_u32_le(b, 1 to u32)
     b = emit_u32_le(b, 4 to u32)
@@ -435,7 +503,7 @@ const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x00000400
 fn emit_segment(buf: []byte, lay: MachoLayout) -> []byte {
     let seg_cmdsize = (72 to u32) + (lay.nsects * (80 to u32))
     let data_size = lay.text_size + lay.const_size
-    mut b = emit_u32_le(buf, 0x19 to u32)
+    mut b = emit_u32_le(buf, MACHO_LC_SEGMENT_64)
     b = emit_u32_le(b, seg_cmdsize)
     b = emit_fixed16(b, "")
     b = emit_u64_le(b, 0 to u64)
@@ -464,11 +532,11 @@ fn emit_segment(buf: []byte, lay: MachoLayout) -> []byte {
  * @return []byte  `buf` followed by the 24-byte build-version command
  */
 fn emit_build_version(buf: []byte) -> []byte {
-    mut b = emit_u32_le(buf, 0x32 to u32)
+    mut b = emit_u32_le(buf, MACHO_LC_BUILD_VERSION)
     b = emit_u32_le(b, 24 to u32)
     b = emit_u32_le(b, 1 to u32)
-    b = emit_u32_le(b, 0x000B0000 to u32)
-    b = emit_u32_le(b, 0x000B0000 to u32)
+    b = emit_u32_le(b, MACHO_VERSION_11_0)
+    b = emit_u32_le(b, MACHO_VERSION_11_0)
     emit_u32_le(b, 0 to u32)
 }
 
@@ -502,7 +570,7 @@ fn emit_symtab_cmd(buf: []byte, lay: MachoLayout) -> []byte {
  */
 fn emit_dysymtab_cmd(buf: []byte, lay: MachoLayout) -> []byte {
     let nextdef = lay.ndef - lay.nlocal
-    mut b = emit_u32_le(buf, 0x0B to u32)
+    mut b = emit_u32_le(buf, MACHO_LC_DYSYMTAB)
     b = emit_u32_le(b, 80 to u32)
     b = emit_u32_le(b, 0 to u32)
     b = emit_u32_le(b, lay.nlocal)
@@ -582,9 +650,9 @@ type MachoSymType = enum { Undefined; DefinedLocal; DefinedGlobal }
  */
 fn macho_symtype_wire(t: MachoSymType) -> u32 {
     match t {
-        Undefined => 0x01 to u32
-        DefinedLocal => 0x0E to u32
-        DefinedGlobal => 0x0F to u32
+        Undefined => MACHO_NTYPE_UNDF_EXT
+        DefinedLocal => MACHO_NTYPE_SECT
+        DefinedGlobal => MACHO_NTYPE_SECT_EXT
     }
 }
 

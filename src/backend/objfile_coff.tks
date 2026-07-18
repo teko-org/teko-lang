@@ -13,9 +13,61 @@
  * @return []byte  `buf` followed by v's two little-endian low bytes
  */
 fn emit_u16_le_coff(buf: []byte, v: u32) -> []byte {
-    mut b = teko::list::push(buf, (v & (0xFF to u32)) to byte)
-    teko::list::push(b, ((v >> (8 to u32)) & (0xFF to u32)) to byte)
+    mut b = teko::list::push(buf, (v & COFF_BYTE_MASK) to byte)
+    teko::list::push(b, ((v >> (8 to u32)) & COFF_BYTE_MASK) to byte)
 }
+
+/**
+ * COFF_BYTE_MASK — the low-byte mask the little-endian field serializers apply
+ * per lane (`(v >> lane) & 0xFF`), narrowing each half to one `byte`.
+ */
+const COFF_BYTE_MASK: u32 = 0xFF to u32
+
+/**
+ * IMAGE_FILE_MACHINE_AMD64 — the COFF file-header `Machine` value identifying
+ * an x86-64 (AMD64) object.
+ */
+const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664 to u32
+
+/**
+ * IMAGE_REL_AMD64_REL32 — the AMD64 COFF relocation `Type` for a 32-bit
+ * PC-relative reference (the `Plt32`/`Pc32` kinds both lower to it: COFF has no
+ * PLT — a direct rel32 to the symbol serves both).
+ */
+const IMAGE_REL_AMD64_REL32: u32 = 0x0004 to u32
+
+/**
+ * IMAGE_REL_AMD64_ADDR64 — the AMD64 COFF relocation `Type` for an absolute
+ * 64-bit address (the `Abs64` kind).
+ */
+const IMAGE_REL_AMD64_ADDR64: u32 = 0x0001 to u32
+
+/**
+ * COFF_SYM_TYPE_FUNCTION — the symbol-table `Type` field for a function:
+ * `IMAGE_SYM_DTYPE_FUNCTION` shifted into the complex-type nibble
+ * (`DTYPE_FUNCTION << 4` = 0x20); data/undefined symbols carry 0.
+ */
+const COFF_SYM_TYPE_FUNCTION: u32 = 0x20 to u32
+
+/**
+ * IMAGE_SYM_CLASS_EXTERNAL — the symbol-table `StorageClass` for an external
+ * (linker-visible) symbol — every defined global and undefined import here.
+ */
+const IMAGE_SYM_CLASS_EXTERNAL: u32 = 2 to u32
+
+/**
+ * COFF_TEXT_CHARACTERISTICS — the `.text` section `Characteristics`:
+ * `IMAGE_SCN_CNT_CODE | IMAGE_SCN_ALIGN_16BYTES | IMAGE_SCN_MEM_EXECUTE |
+ * IMAGE_SCN_MEM_READ` (0x00000020 | 0x00500000 | 0x20000000 | 0x40000000).
+ */
+const COFF_TEXT_CHARACTERISTICS: u32 = 0x60500020 to u32
+
+/**
+ * COFF_RDATA_CHARACTERISTICS — the `.rdata` section `Characteristics`:
+ * `IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_ALIGN_8BYTES |
+ * IMAGE_SCN_MEM_READ` (0x00000040 | 0x00400000 | 0x40000000).
+ */
+const COFF_RDATA_CHARACTERISTICS: u32 = 0x40400040 to u32
 
 /**
  * emit_zeros_coff — append exactly `n` zero bytes to `buf` (the fixed-width
@@ -120,7 +172,7 @@ fn coff_append_globals(out: []CoffSymbol, symbols: []Symbol) -> []CoffSymbol {
         if i >= symbols.len { break }
         let s = symbols[i]
         if s.defined && !s.local {
-            acc = teko::list::push(acc, CoffSymbol { name = s.name; value = s.offset; section_number = 1 to u32; sym_type = 0x20 to u32; storage_class = 2 to u32 })
+            acc = teko::list::push(acc, CoffSymbol { name = s.name; value = s.offset; section_number = 1 to u32; sym_type = COFF_SYM_TYPE_FUNCTION; storage_class = IMAGE_SYM_CLASS_EXTERNAL })
         }
         i++
     }
@@ -288,9 +340,9 @@ fn coff_rodata_secsym_index(syms: []CoffSymbol) -> u32 {
  */
 fn coff_reloc_type(kind: RelocKindX86) -> u32 {
     match kind {
-        Plt32 => 0x0004 to u32
-        Pc32 => 0x0004 to u32
-        Abs64 => 0x0001 to u32
+        Plt32 => IMAGE_REL_AMD64_REL32
+        Pc32 => IMAGE_REL_AMD64_REL32
+        Abs64 => IMAGE_REL_AMD64_ADDR64
     }
 }
 
@@ -490,7 +542,7 @@ fn compute_coff_layout(enc: EncodedModuleX86, num_symbols: u32, num_relocs: u32)
  * @return []byte  `buf` followed by the 20-byte file header
  */
 fn emit_coff_header(buf: []byte, lay: CoffLayout) -> []byte {
-    mut b = emit_u16_le_coff(buf, 0x8664 to u32)
+    mut b = emit_u16_le_coff(buf, IMAGE_FILE_MACHINE_AMD64)
     b = emit_u16_le_coff(b, lay.num_sections)
     b = emit_u32_le(b, 0 to u32)
     b = emit_u32_le(b, lay.symtab_offset)
@@ -540,9 +592,9 @@ fn emit_coff_section(buf: []byte, name: str, raw_size: u32, raw_ptr: u32, reloc_
  */
 fn emit_coff_sections(buf: []byte, lay: CoffLayout) -> []byte {
     let text_reloc_ptr = if lay.num_relocs > (0 to u32) { lay.reloc_offset } else { 0 to u32 }
-    mut b = emit_coff_section(buf, ".text", lay.text_size, lay.text_offset, text_reloc_ptr, lay.num_relocs, 0x60500020 to u32)
+    mut b = emit_coff_section(buf, ".text", lay.text_size, lay.text_offset, text_reloc_ptr, lay.num_relocs, COFF_TEXT_CHARACTERISTICS)
     if lay.num_sections > (1 to u32) {
-        b = emit_coff_section(b, ".rdata", lay.rdata_size, lay.rdata_offset, 0 to u32, 0 to u32, 0x40400040 to u32)
+        b = emit_coff_section(b, ".rdata", lay.rdata_size, lay.rdata_offset, 0 to u32, 0 to u32, COFF_RDATA_CHARACTERISTICS)
     }
     b
 }

@@ -15,13 +15,13 @@ pub fn emit_uleb128(buf: []byte, v: u64) -> []byte {
     mut b = buf
     mut x = v
     loop {
-        let low = x & (0x7F to u64)
+        let low = x & WASM_LEB_PAYLOAD_MASK
         x = x >> (7 to u64)
         if x == (0 to u64) {
             b = teko::list::push(b, low to byte)
             break
         }
-        b = teko::list::push(b, (low | (0x80 to u64)) to byte)
+        b = teko::list::push(b, (low | WASM_LEB_CONTINUE) to byte)
     }
     b
 }
@@ -44,15 +44,15 @@ pub fn emit_sleb128(buf: []byte, v: i64) -> []byte {
     mut b = buf
     mut x = v
     loop {
-        let low = x & (0x7F to i64)
+        let low = x & WASM_SLEB_PAYLOAD_MASK
         x = x >> (7 to i64)
-        let done_nonneg = (x == (0 to i64)) && ((low & (0x40 to i64)) == (0 to i64))
-        let done_neg = (x == (-1 to i64)) && ((low & (0x40 to i64)) != (0 to i64))
+        let done_nonneg = (x == (0 to i64)) && ((low & WASM_SLEB_SIGN_BIT) == (0 to i64))
+        let done_neg = (x == (-1 to i64)) && ((low & WASM_SLEB_SIGN_BIT) != (0 to i64))
         if done_nonneg || done_neg {
             b = teko::list::push(b, low to byte)
             break
         }
-        b = teko::list::push(b, (low | (0x80 to i64)) to byte)
+        b = teko::list::push(b, (low | WASM_SLEB_CONTINUE) to byte)
     }
     b
 }
@@ -63,6 +63,104 @@ pub fn emit_sleb128(buf: []byte, v: i64) -> []byte {
  * loader.
  */
 const WASM_MAGIC: []byte = [0x00 to byte, 0x61 to byte, 0x73 to byte, 0x6D to byte]
+
+/**
+ * WASM_VERSION_1 — the wasm binary-format version's meaningful byte: the
+ * preamble carries version 1 as the little-endian u32 `01 00 00 00` (the three
+ * zero bytes are the word's padding, not independent values).
+ */
+const WASM_VERSION_1: byte = 0x01 to byte
+
+/**
+ * WASM_LEB_PAYLOAD_MASK — the 7 payload bits of one LEB128 group (`x & 0x7F`),
+ * u64-typed for the unsigned encoder's arithmetic.
+ */
+const WASM_LEB_PAYLOAD_MASK: u64 = 0x7F to u64
+
+/**
+ * WASM_LEB_CONTINUE — the LEB128 continuation bit (`0x80`) ORed onto every
+ * non-final group, u64-typed for the unsigned encoder.
+ */
+const WASM_LEB_CONTINUE: u64 = 0x80 to u64
+
+/**
+ * WASM_SLEB_PAYLOAD_MASK — the signed encoder's 7-bit payload mask
+ * (i64-typed twin of `WASM_LEB_PAYLOAD_MASK`).
+ */
+const WASM_SLEB_PAYLOAD_MASK: i64 = 0x7F to i64
+
+/**
+ * WASM_SLEB_CONTINUE — the signed encoder's continuation bit (i64-typed twin
+ * of `WASM_LEB_CONTINUE`).
+ */
+const WASM_SLEB_CONTINUE: i64 = 0x80 to i64
+
+/**
+ * WASM_SLEB_SIGN_BIT — bit 6 of an SLEB128 group (`0x40`): the sign witness
+ * that decides whether a terminal group still needs one more group to
+ * disambiguate the value's sign.
+ */
+const WASM_SLEB_SIGN_BIT: i64 = 0x40 to i64
+
+/**
+ * WASM_FUNCTYPE_TAG — the type-section functype tag byte (`0x60`) heading
+ * every `params -> results` signature entry.
+ */
+const WASM_FUNCTYPE_TAG: byte = 0x60 to byte
+
+/**
+ * WASM_IMPORT_KIND_FUNC — the import-section kind byte for a function import
+ * (`0x00`; tables/memories/globals are 0x01/0x02/0x03).
+ */
+const WASM_IMPORT_KIND_FUNC: byte = 0x00 to byte
+
+/**
+ * WASM_LIMITS_MIN_ONLY — the limits flags byte for a min-only 32-bit memory
+ * (`0x00`: no max, not shared, not memory64).
+ */
+const WASM_LIMITS_MIN_ONLY: byte = 0x00 to byte
+
+/**
+ * WASM_LIMITS_MIN_ONLY_MEM64 — the limits flags byte for a min-only
+ * `memory64` linear memory (`0x04`: the memory64 bit, §6 wasm64).
+ */
+const WASM_LIMITS_MIN_ONLY_MEM64: byte = 0x04 to byte
+
+/**
+ * WASM_GLOBAL_MUTABLE — the global-section mutability byte for a mutable
+ * global (`0x01`; the shadow-stack SP).
+ */
+const WASM_GLOBAL_MUTABLE: byte = 0x01 to byte
+
+/**
+ * WASM_GLOBAL_IMMUTABLE — the global-section mutability byte for an immutable
+ * global (`0x00`).
+ */
+const WASM_GLOBAL_IMMUTABLE: byte = 0x00 to byte
+
+/**
+ * WASM_OP_I32_CONST — the `i32.const` opcode (`0x41`): the initializer
+ * expressions' only instruction here.
+ */
+const WASM_OP_I32_CONST: byte = 0x41 to byte
+
+/**
+ * WASM_OP_END — the `end` opcode (`0x0B`) terminating every initializer
+ * expression (and function body).
+ */
+const WASM_OP_END: byte = 0x0B to byte
+
+/**
+ * WASM_VALTYPE_I32 — the `i32` value-type byte (`0x7F`) of the type section's
+ * signature vectors.
+ */
+const WASM_VALTYPE_I32: byte = 0x7F to byte
+
+/**
+ * WASM_DATA_ACTIVE_MEM0 — the data-section segment flags byte for an ACTIVE
+ * segment in memory 0 (`0x00`), whose offset follows as an init expression.
+ */
+const WASM_DATA_ACTIVE_MEM0: byte = 0x00 to byte
 
 /**
  * wasm_preamble — the fixed 8-byte wasm module header: `WASM_MAGIC` followed by
@@ -77,10 +175,10 @@ fn wasm_preamble() -> []byte {
     b = teko::list::push(b, magic[1])
     b = teko::list::push(b, magic[2])
     b = teko::list::push(b, magic[3])
-    b = teko::list::push(b, 0x01 to byte)
-    b = teko::list::push(b, 0x00 to byte)
-    b = teko::list::push(b, 0x00 to byte)
-    teko::list::push(b, 0x00 to byte)
+    b = teko::list::push(b, WASM_VERSION_1)
+    b = teko::list::push(b, 0 to byte)
+    b = teko::list::push(b, 0 to byte)
+    teko::list::push(b, 0 to byte)
 }
 
 /**
@@ -334,7 +432,7 @@ pub type WasmModule = struct {
  * @return []byte  `buf` followed by the encoded signature
  */
 fn wasm_append_functype(buf: []byte, t: WasmFuncType) -> []byte {
-    mut b = teko::list::push(buf, 0x60 to byte)
+    mut b = teko::list::push(buf, WASM_FUNCTYPE_TAG)
     b = emit_uleb128(b, t.params.len)
     b = append_bytes(b, t.params)
     b = emit_uleb128(b, t.results.len)
@@ -373,7 +471,7 @@ fn wasm_append_import(buf: []byte, imp: WasmImport) -> []byte {
     b = emit_str_bytes(b, imp.module)
     b = emit_uleb128(b, imp.field.len)
     b = emit_str_bytes(b, imp.field)
-    b = teko::list::push(b, 0x00 to byte)
+    b = teko::list::push(b, WASM_IMPORT_KIND_FUNC)
     emit_uleb128(b, imp.type_index to u64)
 }
 
@@ -434,7 +532,7 @@ fn wasm_function_section(funcs: []WasmFunc) -> []byte {
  */
 fn wasm_memory_section(min_pages: u32, is64: bool) -> []byte {
     mut b = emit_uleb128(teko::list::empty(), 1 to u64)
-    b = teko::list::push(b, if is64 { 0x04 to byte } else { 0x00 to byte })
+    b = teko::list::push(b, if is64 { WASM_LIMITS_MIN_ONLY_MEM64 } else { WASM_LIMITS_MIN_ONLY })
     emit_uleb128(b, min_pages to u64)
 }
 
@@ -450,10 +548,10 @@ fn wasm_memory_section(min_pages: u32, is64: bool) -> []byte {
  */
 fn wasm_append_global(buf: []byte, g: WasmGlobal) -> []byte {
     mut b = teko::list::push(buf, g.valtype to byte)
-    b = teko::list::push(b, if g.mutable { 0x01 to byte } else { 0x00 to byte })
-    b = teko::list::push(b, 0x41 to byte)
+    b = teko::list::push(b, if g.mutable { WASM_GLOBAL_MUTABLE } else { WASM_GLOBAL_IMMUTABLE })
+    b = teko::list::push(b, WASM_OP_I32_CONST)
     b = emit_sleb128(b, g.init)
-    teko::list::push(b, 0x0B to byte)
+    teko::list::push(b, WASM_OP_END)
 }
 
 /**
@@ -541,7 +639,7 @@ pub type WasmWasiImportSet = struct {
  *                             resolved funcidx
  */
 pub fn wasm_wasi_import_set() -> WasmWasiImportSet {
-    let i32vt = 0x7F to byte
+    let i32vt = WASM_VALTYPE_I32
     let proc_exit_type = WasmFuncType { params = [i32vt]; results = teko::list::empty() }
     let fd_write_type = WasmFuncType { params = [i32vt, i32vt, i32vt, i32vt]; results = [i32vt] }
     let proc_exit_import = WasmImport { module = wasm_wasi_module(); field = "proc_exit"; type_index = 0 to u32 }
@@ -654,10 +752,10 @@ fn wasm_code_section(funcs: []WasmFunc) -> []byte {
  * @return []byte  `buf` followed by the encoded segment
  */
 fn wasm_append_data_segment(buf: []byte, seg: WasmDataSegment) -> []byte {
-    mut b = teko::list::push(buf, 0x00 to byte)
-    b = teko::list::push(b, 0x41 to byte)
+    mut b = teko::list::push(buf, WASM_DATA_ACTIVE_MEM0)
+    b = teko::list::push(b, WASM_OP_I32_CONST)
     b = emit_sleb128(b, seg.offset to i64)
-    b = teko::list::push(b, 0x0B to byte)
+    b = teko::list::push(b, WASM_OP_END)
     b = emit_uleb128(b, seg.bytes.len)
     append_bytes(b, seg.bytes)
 }
