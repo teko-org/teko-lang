@@ -2611,6 +2611,16 @@ type ModuleRodata = struct {
      * syms — one defined `__const` symbol per rodata entry (section 2).
      */
     syms: []Symbol
+    /**
+     * relocs — the rodata-INTERNAL pointer relocations of every entry, REBASED to the
+     * concatenated `__const` image (each `LDataReloc.offset` becomes blob-base +
+     * field-offset; #594 T-B5). A NEUTRAL carrier (LIR-level, shared by the three
+     * encoders — this struct is namespace-shared): each `encode_module*` converts an
+     * entry to its own ISA reloc type with kind `Abs64` and `sect = Rodata`. EMPTY in
+     * every real compile until T-B6 (`serialize_const` honest-stops pointer-bearing
+     * aggregates), keeping every emitted object byte-identical.
+     */
+    relocs: []lir::LDataReloc
 }
 
 /**
@@ -2632,40 +2642,6 @@ fn append_bytes(buf: []byte, src: []byte) -> []byte {
 }
 
 /**
- * honest_data_reloc — the named honest-stop for a rodata-INTERNAL pointer relocation
- * (#594 T-B1): a Tier-B aggregate const whose rodata image contains a pointer needs a
- * data→data relocation the object writers/VM cannot emit until T-B2..T-B5. No const
- * produces one yet (`serialize_const` honest-stops pointer-bearing aggregates
- * upstream), so this never fires in T-B1 — it is the placed seam T-B2 replaces with
- * real `.rela.rodata` emission.
- *
- * @return  the located Tier-B honest-stop error
- * @since #594 T-B1
- */
-fn honest_data_reloc() -> error {
-    error { message = "rodata-internal pointer relocation: emission lands in T-B2..T-B5 (#594 T-B)" }
-}
-
-/**
- * rodata_has_internal_relocs — whether any entry of `rodata` carries a non-empty
- * internal-pointer relocation list (#594 T-B1). Always false today; the guard that
- * makes `encode_rodata` honest-stop the moment a Tier-B const starts producing them.
- *
- * @param rodata  the module's interned rodata table
- * @return        true iff some entry has an `LDataReloc`
- * @since #594 T-B1
- */
-fn rodata_has_internal_relocs(rodata: []lir::LRodata) -> bool {
-    mut i: u64 = 0
-    loop {
-        if i >= rodata.len { break }
-        if rodata[i].relocs.len > (0 to u64) { return true }
-        i++
-    }
-    false
-}
-
-/**
  * encode_rodata — build the `__const` image and its defined symbols: each
  * `LRodata` entry is placed at the running byte offset with a defined, FILE-
  * LOCAL section-2 symbol (the ADRP/ADD-lo relocations in `__text` resolve to it
@@ -2676,21 +2652,27 @@ fn rodata_has_internal_relocs(rodata: []lir::LRodata) -> bool {
  * @param []lir::LRodata rodata  the module's interned rodata table
  * @return ModuleRodata  the `__const` image + its defined symbols
  */
-fn encode_rodata(rodata: []lir::LRodata) -> ModuleRodata | error {
-    if rodata_has_internal_relocs(rodata) { return honest_data_reloc() }
+fn encode_rodata(rodata: []lir::LRodata) -> ModuleRodata {
     mut bytes: []byte = teko::list::empty()
     mut syms: []Symbol = teko::list::empty()
+    mut relocs: []lir::LDataReloc = teko::list::empty()
     mut off: u32 = 0
     mut i: u64 = 0
     loop {
         if i >= rodata.len { break }
         let rd = rodata[i]
         syms = teko::list::push(syms, Symbol { name = rd.symbol; defined = true; sect = 2 to u8; offset = off; local = true })
+        mut j: u64 = 0
+        loop {
+            if j >= rd.relocs.len { break }
+            relocs = teko::list::push(relocs, lir::data_reloc(off + rd.relocs[j].offset, rd.relocs[j].target))
+            j++
+        }
         bytes = append_bytes(bytes, rd.bytes)
         off = off + (rd.bytes.len to u32)
         i++
     }
-    ModuleRodata { bytes = bytes; syms = syms }
+    ModuleRodata { bytes = bytes; syms = syms; relocs = relocs }
 }
 
 /**
@@ -2756,6 +2738,48 @@ fn concat_symbols(a: []Symbol, b: []Symbol) -> []Symbol {
 }
 
 /**
+ * rodata_relocs_arm64 — convert the NEUTRAL rebased `ModuleRodata.relocs` into arm64
+ * `Reloc` rows (#594 T-B5): each rodata-internal pointer becomes an `Abs64`
+ * (ARM64_RELOC_UNSIGNED, r_length 3) relocation whose patch site is
+ * `__const`-relative (`sect = Rodata`), targeting the datum's own local symbol.
+ * Empty in every real compile until T-B6.
+ *
+ * @param []lir::LDataReloc rs  the rebased neutral rodata relocations
+ * @return []Reloc  the `Rodata`-tagged arm64 relocation rows
+ */
+fn rodata_relocs_arm64(rs: []lir::LDataReloc) -> []Reloc {
+    mut out: []Reloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= rs.len { break }
+        out = teko::list::push(out, Reloc { offset = rs[i].offset; sym = rs[i].target; kind = MRelocKind::Abs64; sect = RelocSect::Rodata })
+        i++
+    }
+    out
+}
+
+/**
+ * append_relocs_arm64 — concatenate two relocation lists (text-partition first, then the
+ * rodata-internal rows; #594 T-B5), preserving each list's emission order. The
+ * module keeps ONE `.sect`-tagged list (the T-B1..T-B3 model); the writers
+ * partition by `RelocSect`.
+ *
+ * @param a  the `__text`/`.text` relocations, in emission order
+ * @param b  the rodata-internal relocations, in emission order
+ * @return   `a` followed by `b`
+ */
+fn append_relocs_arm64(a: []Reloc, b: []Reloc) -> []Reloc {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
  * encode_module — encode every `MFunc` of `m`, concatenate their `__text` words
  * into the module image and REBASE each function's reloc offsets by its `__text`
  * base, intern the rodata bytes into `__const`, and build the symbol table in
@@ -2774,9 +2798,9 @@ fn concat_symbols(a: []Symbol, b: []Symbol) -> []Symbol {
 pub fn encode_module(abi: AbiDescriptor, m: MModule) -> EncodedModule | error {
     if m.globals.len > (0 to u64) { return honest_globals() }
     let mt = match encode_functions(abi, m.funcs) { ModuleText as x => x; error as e => return e }
-    let rod = match encode_rodata(m.rodata) { ModuleRodata as x => x; error as e => return e }
+    let rod = encode_rodata(m.rodata)
     let defined = concat_symbols(rod.syms, mt.syms)
     let undef = collect_undefined(defined, mt.relocs)
     let symbols = concat_symbols(defined, undef)
-    EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+    EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = append_relocs_arm64(mt.relocs, rodata_relocs_arm64(rod.relocs)) }
 }

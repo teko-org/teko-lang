@@ -2410,6 +2410,48 @@ fn collect_undefined_x86(defined: []Symbol, relocs: []RelocX86) -> []Symbol {
 }
 
 /**
+ * rodata_relocs_x86 — convert the NEUTRAL rebased `ModuleRodata.relocs` into x86
+ * `RelocX86` rows (#594 T-B5): each rodata-internal pointer becomes an `Abs64`
+ * (R_X86_64_64 / IMAGE_REL_AMD64_ADDR64) relocation whose patch site is
+ * `.rodata`-relative (`sect = Rodata`, addend 0), targeting the datum's own local
+ * symbol. Empty in every real compile until T-B6.
+ *
+ * @param []lir::LDataReloc rs  the rebased neutral rodata relocations
+ * @return []RelocX86  the `Rodata`-tagged x86 relocation rows
+ */
+fn rodata_relocs_x86(rs: []lir::LDataReloc) -> []RelocX86 {
+    mut out: []RelocX86 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= rs.len { break }
+        out = teko::list::push(out, RelocX86 { offset = rs[i].offset; sym = rs[i].target; kind = RelocKindX86::Abs64; addend = 0 to i64; sect = RelocSect::Rodata })
+        i++
+    }
+    out
+}
+
+/**
+ * append_relocs_x86 — concatenate two relocation lists (text-partition first, then the
+ * rodata-internal rows; #594 T-B5), preserving each list's emission order. The
+ * module keeps ONE `.sect`-tagged list (the T-B1..T-B3 model); the writers
+ * partition by `RelocSect`.
+ *
+ * @param a  the `__text`/`.text` relocations, in emission order
+ * @param b  the rodata-internal relocations, in emission order
+ * @return   `a` followed by `b`
+ */
+fn append_relocs_x86(a: []RelocX86, b: []RelocX86) -> []RelocX86 {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
  * encode_module_x86 — encode every `MFuncX86` of `m`, concatenate their `.text`
  * bytes into the module image and REBASE each function's reloc offsets by its
  * `.text` base, intern the rodata bytes (the neutral `encode_rodata`, which is
@@ -2429,9 +2471,9 @@ fn collect_undefined_x86(defined: []Symbol, relocs: []RelocX86) -> []Symbol {
 pub fn encode_module_x86(abi: AbiDescriptor, m: MModuleX86) -> EncodedModuleX86 | error {
     if m.globals.len > (0 to u64) { return honest_globals_x86() }
     let mt = match encode_functions_x86(abi, m.funcs) { ModuleTextX86 as x => x; error as e => return e }
-    let rod = match encode_rodata(m.rodata) { ModuleRodata as x => x; error as e => return e }
+    let rod = encode_rodata(m.rodata)
     let defined = concat_symbols(rod.syms, mt.syms)
     let undef = collect_undefined_x86(defined, mt.relocs)
     let symbols = concat_symbols(defined, undef)
-    EncodedModuleX86 { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+    EncodedModuleX86 { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = append_relocs_x86(mt.relocs, rodata_relocs_x86(rod.relocs)) }
 }

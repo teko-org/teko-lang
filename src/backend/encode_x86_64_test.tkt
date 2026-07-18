@@ -1494,16 +1494,26 @@ fn ex_module_propagates_function_stop() {
 }
 
 /**
- * T-B1: a rodata entry carrying an internal-pointer relocation makes
- * `encode_module_x86` honest-stop (the data→data reloc only lands in T-B2..T-B5).
+ * T-B5 (inverte a fixture T-B1): o encoder x86 agora PRODUZ a relocation
+ * `Abs64`/`Rodata` re-baseada para um ponteiro rodata-interno (gate consumidor
+ * aberto; o produtor `serialize_const` segue sendo o único gate até T-B6).
  */
 #test
-fn tb1_x86_data_reloc_honest_stops() {
-    let rod = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "k"; bytes = teko::list::push(teko::list::empty(), 0 to byte); relocs = teko::list::push(teko::list::empty(), lir::data_reloc(0 to u32, "other")) })
+fn tb1_x86_data_reloc_now_produces() {
+    let rod = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "k"; bytes = teko::list::push(teko::list::empty(), 0 to byte); relocs = teko::list::push(teko::list::empty(), lir::data_reloc(0 to u32, "k")) })
     let f = fx_1block_func("main", fx_i1(ret_x86()), fx_no_frame())
     let m = MModuleX86 { funcs = teko::list::push(teko::list::empty(), f); rodata = rod; globals = teko::list::empty(); layouts = teko::list::empty() }
     match encode_module_x86(sysv64(), m) {
-        EncodedModuleX86 => teko::assert::is_true(false)
-        error as e => teko::assert::str_contains(e.message, "T-B")
+        EncodedModuleX86 as em => {
+            mut found = false
+            mut i: u64 = 0
+            loop {
+                if i >= em.relocs.len { break }
+                if em.relocs[i].sect == RelocSect::Rodata { found = true; teko::assert::is_true(em.relocs[i].sym == "k") }
+                i++
+            }
+            teko::assert::is_true(found)
+        }
+        error => teko::assert::is_true(false)
     }
 }

@@ -2476,6 +2476,48 @@ fn collect_undefined_riscv(defined: []Symbol, relocs: []RelocRiscv) -> []Symbol 
 }
 
 /**
+ * rodata_relocs_riscv — convert the NEUTRAL rebased `ModuleRodata.relocs` into riscv
+ * `RelocRiscv` rows (#594 T-B5): each rodata-internal pointer becomes an `Abs64`
+ * (R_RISCV_64) relocation whose patch site is `.rodata`-relative (`sect = Rodata`,
+ * addend 0), targeting the datum's own local symbol. Empty in every real compile
+ * until T-B6.
+ *
+ * @param []lir::LDataReloc rs  the rebased neutral rodata relocations
+ * @return []RelocRiscv  the `Rodata`-tagged riscv relocation rows
+ */
+fn rodata_relocs_riscv(rs: []lir::LDataReloc) -> []RelocRiscv {
+    mut out: []RelocRiscv = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= rs.len { break }
+        out = teko::list::push(out, RelocRiscv { offset = rs[i].offset; sym = rs[i].target; kind = RelocKindRiscv::Abs64; addend = 0 to i64; sect = RelocSect::Rodata })
+        i++
+    }
+    out
+}
+
+/**
+ * append_relocs_riscv — concatenate two relocation lists (text-partition first, then the
+ * rodata-internal rows; #594 T-B5), preserving each list's emission order. The
+ * module keeps ONE `.sect`-tagged list (the T-B1..T-B3 model); the writers
+ * partition by `RelocSect`.
+ *
+ * @param a  the `__text`/`.text` relocations, in emission order
+ * @param b  the rodata-internal relocations, in emission order
+ * @return   `a` followed by `b`
+ */
+fn append_relocs_riscv(a: []RelocRiscv, b: []RelocRiscv) -> []RelocRiscv {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
  * encode_module_riscv — encode every `MFuncRiscv` of `m`, concatenate their
  * `.text` words into the module image and REBASE each function's reloc/label
  * offsets by its `.text` base, intern the rodata bytes into `.rodata`, and build
@@ -2495,10 +2537,10 @@ fn collect_undefined_riscv(defined: []Symbol, relocs: []RelocRiscv) -> []Symbol 
 pub fn encode_module_riscv(abi: AbiDescriptor, m: MModuleRiscv) -> EncodedModuleRiscv | error {
     if m.globals.len > (0 to u64) { return honest_globals_riscv() }
     let mt = match encode_functions_riscv(abi, m.funcs) { ModuleTextRiscv as x => x; error as e => return e }
-    let rod = match encode_rodata(m.rodata) { ModuleRodata as x => x; error as e => return e }
+    let rod = encode_rodata(m.rodata)
     let local_defined = concat_symbols(rod.syms, mt.labels)
     let defined = concat_symbols(local_defined, mt.syms)
     let undef = collect_undefined_riscv(defined, mt.relocs)
     let symbols = concat_symbols(defined, undef)
-    EncodedModuleRiscv { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+    EncodedModuleRiscv { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = append_relocs_riscv(mt.relocs, rodata_relocs_riscv(rod.relocs)) }
 }
