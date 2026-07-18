@@ -625,6 +625,124 @@ cobertura (on/off), e linkar o delta como objeto separado via símbolos external
 
 ---
 
+## Onda: throughput do emissor (produtor 22× mais lento que o cc)
+
+Dados do owner (CI real, fork, macOS, crumbs 1-3): `emit test` = 17.7 MB em 201.1s
+(**~88 KB/s**); `cc test` compila os MESMOS 17.7 MB em 9.0s → o consumidor é **22× mais
+rápido que o produtor**. Local: codegen release 8 MB em 124.3s (~65 KB/s). Pico 1.8 GB para
+8-17 MB de texto. O gargalo é o EMISSOR, e vale para C E native.
+
+### Provas de código (hipótese "concat imutável → quadrático": REFINADA)
+
+1. **Caminho quente C `cb`** (`codegen.tks:148-150`) → `teko::mem::append_fo` → runtime
+   `tk_append_bytes_fo` (`teko_rt.c:2178`). O crescimento é **GEOMÉTRICO** (`cap = len < 4 ? 8
+   : len*2`, `teko_rt.c:2192`) COM fast-path in-place via um **cache GLOBAL de ponteiros**
+   `tk_push_cache` (`teko_rt.c:2092`, `TK_PUSH_HASH_SIZE = 1<<16 = 65536` slots single-probe,
+   hash do ponteiro `teko_rt.c:2093-2095`). **→ NÃO é quadrático INGÊNUO** (a hipótese literal
+   é refutada; o #148 fez trabalho pesado aqui).
+   **PORÉM a amortização é FRÁGIL:** o in-place só ocorre se o witness (ptr+len+esz+region+gen)
+   bater (`teko_rt.c:2180-2189`), e o re-cache após um copy-grow só acontece se o slot estiver
+   vazio OU o incumbente for MENOR (`teko_rt.c:2205`, despejo por tamanho). Se o buffer de
+   saída multi-MB (o MAIOR do processo) colidir de hash com outro buffer vivo grande (ex.: as
+   listas do TAST de `mono(com_testes)`) que ocupe seu slot, ele **NÃO é cacheado** → o próximo
+   `cb` falha o witness → **copy-grow COMPLETO de len bytes** → e pode não recachear →
+   **CADA append vira uma cópia total = O(n²).** É a mesma classe do "11.5 GB fix / clobber
+   2300×" que os comentários #148 descrevem (`teko_rt.c:2155-2160`).
+   **Aritmética confirma superlinearidade:** 17.7 MB em ~1-2M fragmentos a ~1µs/append (call +
+   ponte statement-expr + probe de 5 campos) daria ~1-2s; **201s ⇒ ~100-200× ⇒ a cauda
+   quadrática (tempestade de copy-grow) está ATIVA e domina.** O pico 1.8 GB é consistente com
+   o churn de copy-grows na free-list + o TAST de `mono(com_testes)` residente (honesto: o pico
+   é dos DOIS, não só do emissor).
+
+2. **Writers native — PIORES** (owner: "o mesmo vale para native"). `objfile_macho.tks:12-19`,
+   `encode_*`, e o codec `tkb_buf.tks:6-13` constroem bytes **UM BYTE POR VEZ** via
+   `teko::list::push` → `tk_slice_push` (`teko_rt.c:2216`, região ROOT, **SEM free-old**) →
+   mesma fragilidade de cache + overhead MÁXIMO (uma chamada de função POR BYTE) + TODOS os
+   degraus geométricos retidos no root (churn de memória sem free). Pior que o caminho C.
+
+3. **`concat`/interp** (`codegen.tks:2319`, `$"..."`) dobram via `tk_str_concat`
+   (`teko_rt.c:139`) — cada fold aloca buffer fresco e COPIA o acumulado → O(k²) em peças por
+   chamada (k pequeno por chamada, mas pervasivo). Não é o dominante, mas soma.
+
+4. **RawBuf NÃO é builder** (`mem/unsafe/rawbuf.tks`): só `rawbuf_alloc(len)` (FIXO, sem
+   capacidade extra), `rawbuf_read`→`[]byte` (cópia), `rawbuf_len`. **Falta:** um campo `cap`,
+   `reserve`, append amortizado, e um `to_str`/`to_bytes` barato (view sem cópia). Um builder
+   real exige API unsafe nova (ou primitivo de runtime).
+
+### Design (onda "emitter throughput", comportamento-preservador)
+
+Substituir a amortização dependente-de-cache-global por um builder que **CARREGA a própria
+capacidade** (sem cache compartilhado, sem witness, sem inanição) → amortizado-O(1) GARANTIDO
+e uma chamada por fragmento sem probe. **Mesmos bytes emitidos** (a ordem/conteúdo dos appends
+é idêntica) → fixpoint intacto.
+
+- **E1 — MEDIR (risco zero, sem mudança de produto).** A infra #148 já tem os contadores:
+  `tk_obs_miss[why]`/`tk_obs_miss_big[why]` (`teko_rt.c:2132-2138`) classificam POR QUE o
+  in-place falhou (0=sem ptr, 1=ptr colidiu/despejado, 2=len, 3=cap exausto, 4=outro) e
+  `tk_obs_push2` atribui os grows caros. Rodar um gate com obs ligada CONFIRMA se a tempestade
+  é dominada por `why==1` (colisão/despejo — a inanição do cache) vs `why==3` (cap real). Usar
+  também o crumb 1 (START/settle em `codegen`/`emit C`/`cc`) para separar codegen-vs-cc. É a
+  ferramenta que decide o tamanho do ganho.
+
+- **E2 — Robustez do runtime (seed C mantido, byte-preservador) — ALAVANCA PRINCIPAL.**
+  Garantir que os poucos buffers multi-MB (a saída do emissor / writers) mantenham
+  amortizado-O(1) INDEPENDENTE do cache global: p.ex. um registro dedicado para builders
+  grandes, OU capacidade carregada de forma robusta, de modo que `tk_append_bytes_fo`/
+  `tk_slice_push` NUNCA degradem para copy-grow total repetido do buffer grande.
+  `src/runtime/teko_rt.c` é o **seed C MANTIDO** (edição permitida pela lei). Bytes de saída
+  INALTERADOS → **fixpoint preservado (gen2.c==gen3.c + `cmp` local)**. Se a tempestade for
+  confirmada (E1), esta é a alavanca de ORDEM DE GRANDEZA (ver ganho abaixo). Guarda: gate de
+  659 testes + TEKO_MEM_PARANOID + fixpoint.
+
+- **E3 — Builder explícito (mais fundo, opcional se E2 bastar).** Introduzir um valor
+  `Builder` `{ptr,len,cap}` na superfície (`teko::mem`), SAFE (backed por primitivo de runtime,
+  NÃO derivado de RawBuf — evita a contágio unsafe U2/#333), que baixa para um append de
+  runtime robusto (sem cache global, sem probe por fragmento). Threadar pelos `cb`/`cb_byte`/
+  `cb_i64`… do emissor (`[]byte`→`Builder`) e pelos `write_u*`/`list::push` quentes dos writers
+  native. Remove o CONSTANTE por-fragmento residual (probe de 5 campos + ponte). Diff mecânico
+  GRANDE (assinaturas `buf: []byte` em centenas de emit fns); bytes preservados por construção.
+
+- **E4 — Paridade native.** Aplicar E2/E3 aos `objfile_*`/`encode_*`/`tkb_buf`
+  (`list::push` byte-a-byte → builder/append robusto). Fecha o "mesmo vale para native" do
+  owner; `cmp` dos goldens de `.o`/`.wasm` como ritual.
+
+### Ganho honesto
+
+- **SE a tempestade (why==1) domina** (o que os 88 KB/s ⇒ superlinear indicam), E2 restaura
+  amortizado-linear real: 17.7 MB ≈ 35 MB de memcpy + overhead por fragmento. Mesmo a 50-100
+  MB/s efetivos (com overhead de call sob o seed), ~0.2-0.4s de cópia ⇒ **de 201s para poucos
+  segundos ⇒ ~50-100×.** Pico de memória (#148): remover o churn de copy-grow derruba a
+  free-list inchada ⇒ pico cai em direção ao piso (TAST do mono + 1 buffer de saída ~2× final).
+- **SE o constante por-fragmento domina** (call+probe), E2 ajuda menos e E3 (remover o probe)
+  dá ~2-5×. **E1 decide qual.** Os 88 KB/s pesam fortemente para o primeiro caso.
+
+### Composição e PRIORIDADE (codegen já provado 85-93% do custo)
+
+1. **THROUGHPUT (E1 medir → E2 runtime) — PRIORIDADE MÁXIMA.** Maior ROI, MENOR risco
+   (byte-preservador, runtime-only), vale para C E native, ataca direto os 85-93%. Se E2
+   restaurar MB/s, 17.7 MB viram ~segundos e o problema some.
+- **base+delta** (seção anterior): reduz o VOLUME emitido; é ORTOGONAL ao throughput (emitir
+   menos × emitir mais rápido MULTIPLICAM). Mas é estrutural + re-baseline do golden `gen2.c` +
+   nó de indexação de cobertura + só C-release → **DEPOIS do throughput** (e possivelmente
+   DESNECESSÁRIO se E2 já traz MB/s: 17.7 MB a 5 MB/s = 3.5s).
+- **heartbeat (crumb 5)** é OBSERVABILIDADE, não velocidade: o crumb 1 (START/settle) já
+   des-muta a fase; o heartbeat fino é nice-to-have de MENOR urgência quando o emit já é rápido.
+- Ordem recomendada: **E1 → E2 (headline) → medir de novo → (se preciso) E3/E4 → base+delta só
+   se ainda valer.** Tudo INDEPENDENTE do const wave (não toca const-eval).
+
+### Riscos
+
+- **E2** edita `teko_rt.c` (seed mantido): PERIGO = mudar bytes de saída. Mitiga: o append é
+  byte-idêntico (só a bookkeeping de capacidade muda); ritual = fixpoint `gen2.c==gen3.c` +
+  `cmp` local + gate 659 + `TEKO_MEM_PARANOID` (a rede do #148).
+- **E3** (`[]byte`→`Builder`): churn de assinaturas + risco de um alias romper o decreto de
+  cadeia LINEAR (o mesmo invariante que `append_fo`/`push_fo` já exigem). Evitar contágio unsafe
+  (Builder SAFE, não RawBuf). Regressão por crumb: fixpoint + `cmp`.
+- **E4** native: muda memória/perf dos writers, não os bytes; `cmp` dos goldens `.o`/`.wasm`.
+- Todos independentes do const wave.
+
+---
+
 ## C. SEQUÊNCIA DE CRUMBS (menor risco → maior)
 
 Legenda risco: **baixo** = só stderr; **estrutural** = assinatura/CLI/codegen. Todos
@@ -726,11 +844,15 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
 - Risco: baixo PORQUE não fiado no default. Independe do const wave.
 
 ### Onda própria (pós-observabilidade, NÃO um crumb de stderr)
+- **Throughput do emissor (E1→E2→E3/E4):** ver seção "Onda: throughput do emissor".
+  **PRIORIDADE MÁXIMA das ondas** — byte-preservador, vale C E native, ataca os 85-93% do
+  custo. E1 (medir com obs #148 + crumb 1) → E2 (robustez do runtime, seed C mantido,
+  potencial ~50-100×) → E3/E4 (builder explícito + writers native). Ritual: fixpoint + `cmp`.
 - **C base compartilhado + delta (.h + link):** ver seção "Proposta do owner". Dedup de
-  CODEGEN (produção emitida 1×), ortogonal a 3/4b (dedup de front-end). Gated na medição do
-  split codegen-vs-cc pelo crumb 1. Custo: macros de cov no emissor + re-baseline do golden
-  `gen2.c` + nó de indexação da cobertura. Ponte para o modelo dois-objetos do 0.4. Só agendar
-  se o crumb 1 provar codegen dominante.
+  CODEGEN (produção emitida 1×), ortogonal a 3/4b (dedup de front-end) e ao throughput (emitir
+  menos × mais rápido). Gated na medição do crumb 1; **DEPOIS do throughput** (pode ficar
+  desnecessário se E2 trouxer MB/s). Custo: macros de cov + re-baseline do golden `gen2.c` + nó
+  de indexação da cobertura. Ponte para o modelo dois-objetos do 0.4.
 
 **Pontos rituais (gate cheio deve passar):** fim do crumb 5 (fixpoint após tocar codegen),
 fim do crumb 6 (CLI + goldens de help), fim do crumb 7 (`diff_c_own`/native regressions),
