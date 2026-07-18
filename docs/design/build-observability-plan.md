@@ -314,11 +314,15 @@ inspecionável / semente de um futuro incremental atrás de flag OFF-by-default.
 reestruturação do gate — produzir o programa sem-testes UMA vez e derivar a visão de teste
 por cima — que toca o checker e é maior que "observabilidade"; fora do escopo desta issue.)
 
-### B3. Gap 2 concreto (sem `.tkc`)
+### B3. Gap 2 concreto — ELIMINAR o re-front-end (decisão do owner)
 
-Bracket `rebuild` em `release_build_of` (rascunho, `project.tks:1557-1560`), em `Plain`
-anuncia START antes do re-front-end quiet e assenta ao ficar pronto — mais o heartbeat §B4.
-Não elimina o re-parse (decisão §B2), mas mata a MUDEZ.
+O owner REJEITOU o bracket paliativo ("não há sentido em recarregar o front"). A análise
+completa das abordagens (a)/(b)/(c) está na seção **"Gap 2 — eliminação do re-front-end"**
+abaixo. Resumo: **(a) reusar o AST parseado é PROVÁVEL e seguro (ship); (b) prune pós-mono é
+REFUTADO (quebra o fixpoint por reordenação de instâncias compartilhadas); (c) reusar o check
+é o maior ganho mas depende de uma invariância do checker validada só pelo gate de fixpoint do
+CI.** O bracket sai; entra o reuso de AST (a) + observabilidade honesta (o check+mono de
+release vira trabalho REPORTADO de verdade, não um "retry quiet").
 
 ### B4. HEARTBEAT — viabilidade honesta
 
@@ -374,6 +378,137 @@ backend pela ausência de output. Nenhuma dessas fases altera os bytes do `.o`/b
 
 ---
 
+## Gap 2 — eliminação do re-front-end (aprofundamento, decisão do owner)
+
+### Fatos do código que governam a prova
+
+1. **O FIXPOINT só restringe o programa de RELEASE.** `gen2.c==gen3.c` compara o C do
+   BINÁRIO de release (`mono(sem_testes)` → `tk_emit_c` → o `teko`). O programa do GATE
+   (`<name>-tktest.c`, `run_native_gate`, `project.tks:1524-1543`) é DESCARTÁVEL: compila,
+   roda, some. **Os bytes do gate NÃO entram no fixpoint.** Isto abre espaço: o gate pode
+   ter qualquer forma/ordem contanto que rode os testes.
+2. **Ordem da saída de `monomorphize`** (`checker/monomorph.tks:1147-1249`):
+   - Fase 1 (1164-1193): percorre `prog.items` EM ORDEM; itens não-genéricos vão para
+     `kept` nessa ordem; templates genéricos são DROPADOS; instâncias-semente entram na
+     `queue` na ordem de descoberta (ordem de item).
+   - Fase 2 (1199-1233): consome `queue` em FIFO (`qi` de 0), estampa cada instância e a
+     ANEXA a `kept` — logo a POSIÇÃO de uma instância em `kept` = quando é descoberta na
+     fila.
+   → **A ordem final de `kept` é sensível à ordem de descoberta.**
+3. **`assemble_sel` itera a MESMA lista `files` para `include_tests` true/false**
+   (`assemble.tks:145-190`); a ÚNICA diferença é o skip `if ends_with(.tkt) && !include_tests`
+   (linha 157). Itens não-`.tkt` são produzidos em ordem/conteúdo IDÊNTICOS nos dois modos.
+4. **`parser::Item` carrega `.file`** (`parser/ast.tks:411`) — dá para filtrar por
+   PROCEDÊNCIA de arquivo com exatidão. `TFunction` também carrega `file`
+   (`monomorph.tks:1175`).
+5. **`#test` NÃO são roots de alcançabilidade** (`reachability.tks:193-206`): `entry_roots`
+   coleta só statements soltos (virtual-main) e funções `exp`. Uma `#test` não é raiz e
+   nenhum código de produção a chama.
+
+### (a) Reusar o AST PARSEADO — **PROVÁVEL, seguro. RECOMENDADO (baseline).**
+
+Ideia: separar PARSE de CHECK+MONO. Parsear a árvore UMA vez (com `.tkt`), derivar release e
+gate da MESMA árvore:
+- `parsed_all = assemble_sel(files, include_tests=true, …)` (parse único).
+- `parsed_prod = filter_tkt(parsed_all)` — remove itens cujo `.file` termina em `.tkt`.
+- gate    = `check+mono(parsed_all)`   (hoje = `fe.prog` do pass 1).
+- release = `check+mono(parsed_prod)`  (hoje = `frontend_body(false, true, …).prog`).
+
+**Prova de fixpoint.** Por (Fato 3+4), `filter_tkt(parsed_all)` é a lista de `parser::Item`
+não-`.tkt` na MESMA ordem/conteúdo que `assemble_sel(files, include_tests=false)`. Ou seja,
+`parsed_prod` ≡ o programa parseado que o `release_build_of` de hoje re-parseia. Como
+`check+mono` é função determinística da entrada, `check+mono(parsed_prod)` produz o MESMO
+`TProgram` que hoje → `tk_emit_c` idêntico → **binário de release byte-idêntico. FIXPOINT
+PRESERVADO.** Nenhuma suposição sobre o checker; só o determinismo do lex/parse (já assumido
+em todo o pipeline).
+
+**Ganho.** Elimina re-lex + re-parse do corpus inteiro no Gap 2. Pelo shape do código, o
+front-end custa lex + parse + **check (dominante)** + mono; (a) remove a fatia lex+parse
+(estimo ~20-40% do Gap 2, dependente do corpus — não mensurável sem profiling, honesto).
+Ainda roda check+mono de produção duas vezes.
+
+**Custo/risco.** Baixo/estrutural-leve. Refatorar `frontend_body` em `frontend_parse`
+(manifest→discover→assemble→`parser::Program`+`Manifest`) e `frontend_check`
+(prune_os→load_deps→`checked_program_of`→`Frontend`). Um novo `filter_tkt(parser::Program)`.
+Rewire `compile_project_g`/`run_gate`/`release_build_of`.
+
+**Bônus de observabilidade:** o check+mono de release deixa de ser um "retry quiet já
+reportado" e passa a ser trabalho LEGÍTIMO e distinto (produção-apenas) → pode REPORTAR
+`checker`/`monomorph` de verdade (suprimindo só o banner duplicado). O Gap 2 deixa de ser
+mudo SEM bracket artificial.
+
+### (b) Prune por alcançabilidade pós-mono — **REFUTADO. Não usar.**
+
+Ideia: derivar `mono(sem_testes)` de `mono(com_testes)` removendo itens/instâncias
+alcançáveis SÓ de entry points de teste (em vez do `strip_tests` que só tira `is_test`).
+
+Há walker (`close_reachable`/`entry_roots`, `reachability.tks`), e `#test` não são roots
+(Fato 5) — então em tese daria pra identificar itens test-only. MAS **a prova de
+byte-identidade FALHA por ORDEM** (Fato 2):
+
+**Contraexemplo concreto (instância compartilhada reordenada).**
+- Produção: `main` chama `foo<Bar>` no item de posição 10.
+- Teste `aaa_test.tkt` (ordena antes no walk) tem `#test` que também chama `foo<Bar>`,
+  descoberto na posição 0.
+- `mono(com_testes)`: a `queue` recebe `foo$Bar` PRIMEIRO (descoberta pelo teste) → estampada
+  cedo → aparece cedo em `kept`.
+- `mono(sem_testes)`: `foo$Bar` é descoberta só por `main` → estampada na posição de `main`.
+- `foo$Bar` é COMPARTILHADA (alcançável da produção), então o prune a MANTÉM — porém na
+  POSIÇÃO ERRADA. `tk_emit_c` emite funções em ordem de item → **C em ordem diferente →
+  bytes diferentes → FIXPOINT QUEBRA.**
+
+O prune conserta o CONJUNTO mas não a ORDEM das instâncias compartilhadas, que a presença de
+testes já perturbou ANTES do prune. Refutado. (O contraexemplo 1 do §B2 — instância só de
+teste — o prune resolveria; o de ORDEM não.)
+
+### (c) Reusar o CHECK (filtrar itens tipados antes de um mono de produção) — **maior ganho, seguro SÓ sob invariância validada pelo gate de fixpoint do CI.**
+
+Ideia (c-final): checar a árvore COMPLETA (produção+testes) UMA vez → `pre_all` (PreMono).
+- gate    = `mono(pre_all.prog)` (com testes; descartável).
+- release = `mono(filter_tkt(pre_all.prog), table)` — mono sobre itens tipados de PRODUÇÃO só.
+
+**Por que NÃO recai no (b):** aqui filtramos ANTES do mono. O mono de release constrói sua
+`queue` SÓ dos corpos de produção, em ordem de produção → mesma ordem de
+`mono(check(sem_testes))`. O problema de ordem do (b) não ocorre.
+
+**O que resta provar (invariância do checker):** que os ITENS TIPADOS DE PRODUÇÃO
+(pré-mono) são idênticos quer o check tenha visto os testes ou não. Argumento a favor:
+namespaces isolam testes; corpos de produção não referenciam testes (Fato 5); resolução de
+nome em corpos de produção resolve para alvos de produção mesmo com assinaturas de teste
+extras no ambiente. Riscos residuais NÃO elimináveis estaticamente por mim:
+- resolução global de overload/trait cruzando namespaces (um impl de teste mudaria a escolha
+  num corpo de produção?);
+- a `table` passada ao mono é dobrada COM testes; entradas de tipo-decl de teste extras
+  poderiam, por colisão de nome, mudar o stamping de uma instância de produção.
+
+Ambos são "quase certamente seguros" mas não os PROVO no papel. **Como a validação é só no CI
+(seed local não builda), o gate de fixpoint É o validador exato:** se
+`gen2.c==gen3.c` E `gen2.c` continua idêntico ao `gen2.c` pré-mudança, a invariância vale.
+Recomendação: implementar (c-final) como crumb SEPARADO, gated no fixpoint — se regredir o
+golden do `gen2.c` no CI, reverter para (a).
+
+**Ganho.** Elimina re-lex+re-parse+re-check de produção; sobra só um segundo `mono`. Remove a
+fatia dominante (check) → estimo ~60-70% do Gap 2. É o que melhor atende "não recarregar o
+front".
+
+**Custo/risco.** Estrutural + risco de fixpoint (invariância). Precisa `filter_tkt` em nível
+de `TItem` (procedência em TFunction/TypeDecl/TStatement/ConstDecl — auditar que todos
+carregam `file`; TFunction carrega, `monomorph.tks:1175`).
+
+### Veredito
+
+1. **(a) preserva o fixpoint COM PROVA** (determinismo de parse + Fatos 3/4) — SHIP.
+2. **(b) REFUTADO** (contraexemplo de ordem).
+3. **(c-final)** é o maior ganho e o que o owner quer, mas a segurança do fixpoint depende de
+   invariância do checker que só o gate de fixpoint do CI confirma — SHIP como follow-up
+   gated, com reversão automática para (a) se o golden regredir.
+
+Sequência: (a) primeiro (ganho garantido, mudez do Gap 2 resolvida honestamente), depois
+(c-final) atrás do gate de fixpoint. NENHUM caso força manter o bracket — ele foi
+substituído por (a).
+
+---
+
 ## C. SEQUÊNCIA DE CRUMBS (menor risco → maior)
 
 Legenda risco: **baixo** = só stderr; **estrutural** = assinatura/CLI/codegen. Todos
@@ -400,19 +535,45 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
 - Regressão: fixture com `#test`, `CI=1`, `teko test` → stderr contém `cc test` START.
 - Risco: baixo. Independe do const wave.
 
-### Crumb 3 — Instrumentar Gap 2 bracket (baixo) — FECHA a MUDEZ do Gap 2
-- Arquivos: `src/build/project.tks` (`release_build_of` bracket `rebuild`, `Plain` START).
-- Regressão: build gated com `CI=1` → stderr contém `rebuild …` START entre o output dos
-  testes e as fases do backend.
-- Risco: baixo. Não elimina o re-parse (§B2). Independe do const wave.
+### Crumb 3 — Gap 2: reusar o AST parseado (abordagem (a)) — ELIMINA o re-lex/re-parse + mata a mudez
+- SUBSTITUI o bracket paliativo (rejeitado pelo owner).
+- Arquivos: `src/build/project.tks` (split de `frontend_body` em `frontend_parse` +
+  `frontend_check`; novo `filter_tkt(parser::Program) -> parser::Program`; rewire de
+  `compile_project_g`/`run_gate`/`run_gate_native`/`release_build_of` para parsear UMA vez e
+  derivar gate=`check(parsed_all)` e release=`check(filter_tkt(parsed_all))`).
+- Assinaturas novas:
+  - `fn frontend_parse(include_tests: bool, cfg: ReportCfg) -> ParsedFront | error`
+    (`ParsedFront = struct { parsed: parser::Program; manifest: Manifest }`).
+  - `fn frontend_check(pf: ParsedFront, cfg: ReportCfg) -> Frontend | error`.
+  - `fn filter_tkt(p: parser::Program) -> parser::Program` (dropa itens com `.file`
+    terminando em `.tkt`; procedência exata, `ast.tks:411`).
+- **Prova de fixpoint** (§"Gap 2", (a)): `filter_tkt(parse(with tests))` ≡ `parse(without
+  tests)` (Fatos 3/4) → release byte-idêntico. Ponto ritual: **gate de fixpoint do CI**
+  (`gen2.c==gen3.c` e golden do `gen2.c` inalterado).
+- Observabilidade: o `frontend_check` de release passa a REPORTAR `checker`/`monomorph` de
+  verdade (não mais quiet), suprimindo só o banner duplicado. Regressão `.tkt` + build gated
+  com `CI=1` → stderr mostra a fase `checker` da produção entre os testes e o backend.
+- Risco: estrutural-leve; fixpoint PROVADO. Independe do const wave.
 
-### Crumb 4 — Heartbeat do checker no re-front-end (estrutural leve)
-- Arquivos: `src/build/project.tks` (`checked_program_of`/`frontend_body` aceitam um
-  heartbeat `ProgressFn` mesmo em pass quiet; `run` só se `heartbeat_on`).
+### Crumb 4 — Heartbeat do checker/mono (estrutural leve)
+- Arquivos: `src/build/project.tks` (`checked_program_of` aceita heartbeat `ProgressFn`;
+  emite só se `heartbeat_on(cfg, quiet_pass)`).
 - Novo: `checker_heartbeat_fn(phase, cfg) -> checker::ProgressFn` (tick por N itens / ~1 s).
-- Regressão: `verbose`+`CI=1` → múltiplas linhas de heartbeat do `rebuild`/`checker`.
-- Risco: estrutural (assinatura). Depende do crumb 6 para o eixo `verbose`? Não — pode usar
-  um bool `heartbeat` provisório e migrar para `ReportCfg` no crumb 6. Independe do const wave.
+- Após o crumb 3, o check+mono de release já reporta; o heartbeat cobre corpos longos em
+  `Plain`+`verbose`.
+- Regressão: `--verbose`+`CI=1` → múltiplas linhas de heartbeat de `checker`.
+- Risco: estrutural (assinatura). Pode usar bool provisório e migrar a `ReportCfg` no crumb 6.
+  Independe do const wave.
+
+### Crumb 4b — Gap 2 agressivo: reusar o CHECK (abordagem (c-final)) — FOLLOW-UP gated no fixpoint
+- Só entra se o gate de fixpoint do CI confirmar a invariância (§"Gap 2", (c)).
+- Arquivos: `src/build/project.tks` — checar a árvore completa UMA vez (`pre_all`), gate=
+  `mono(pre_all.prog)`, release=`mono(filter_tkt_titem(pre_all.prog), table)`.
+- Novo: `filter_tkt_titem(prog: checker::TProgram) -> checker::TProgram` (procedência em
+  nível de `TItem`; auditar `file` em TypeDecl/TStatement/ConstDecl).
+- **Risco de FIXPOINT (invariância do checker) — reversão automática para o estado do crumb 3
+  se o golden do `gen2.c` regredir no CI.** Ponto ritual: gate de fixpoint.
+- Ganho: remove a fatia dominante (check) do Gap 2. Independe do const wave.
 
 ### Crumb 5 — Heartbeat do codegen (estrutural, toca codegen)
 - Arquivos: `src/codegen/codegen.tks` (`tk_emit_c_report` + `on_item` no loop de corpos de
@@ -476,7 +637,14 @@ fim do crumb 8 (provar que default não emite `.tkc`).
    traz `.tkt` + depende do gate do CI para o teste real; não confiar em build local.
 
 ## Blocked / pendências reportadas (não viram issues novas)
-- Eliminação do Gap 2 pela RAIZ (produzir o programa sem-testes uma vez e derivar a visão de
-  teste) é reestruturação do gate/checker, fora de "observabilidade" — REPORTADO ao owner.
+- Eliminação do Gap 2 pela RAIZ agora está EM ESCOPO: (a) reuso de AST parseado (provado,
+  crumb 3) + (c-final) reuso de check (crumb 4b, gated no fixpoint). O bracket paliativo foi
+  DESCARTADO por decisão do owner.
+- (c-final) depende de uma INVARIÂNCIA do checker (itens tipados de produção idênticos com/sem
+  testes) que só o gate de fixpoint do CI confirma — não provável estaticamente aqui.
 - Heartbeat DURANTE o `cc`/linker externo exige spawn assíncrono + poll (inexistente) —
   REPORTADO; mitigação é a START-line pré-`cc`.
+- Checagem INCREMENTAL de testes sobre uma base de produção já checada (pra evitar o 2º mono
+  de produção no gate) esbarra no mecanismo de dep, que trata a base como pré-monomorfizada e
+  não instancia genéricos com novos argumentos de tipo — exigiria cirurgia no checker, fora de
+  escopo. REPORTADO.
