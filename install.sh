@@ -12,7 +12,7 @@
 # an honest error listing the assets that DO exist — never a silent from-source build.
 #
 # Quick start:
-#   curl -fsSL https://raw.githubusercontent.com/schivei/teko-lang/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/teko-org/teko-lang/main/install.sh | sh
 #
 # Options:
 #   --version <tag>      install a specific release tag (default: latest)
@@ -27,7 +27,7 @@
 # POSIX sh only — no bashisms. Safe to pipe from curl.
 set -eu
 
-REPO="schivei/teko-lang"
+REPO="teko-org/teko-lang"
 REPO_URL="https://github.com/${REPO}"
 RAW_BRANCH="main"
 

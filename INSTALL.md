@@ -14,7 +14,7 @@ a Homebrew tap. Both are covered below, along with a few platform notes.
 One-liner:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/schivei/teko-lang/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/teko-org/teko-lang/main/install.sh | sh
 ```
 
 `install.sh` is a **from-release installer only** — it is not a toolchain. With no

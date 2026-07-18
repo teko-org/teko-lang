@@ -1,3 +1,54 @@
+use teko::parser
+
+/**
+ * A minimal `parser::Item` fixture for the `filter_tkt` provenance tests: a bare
+ * `use teko::lexer` item stamped with the given source `file` (the content is
+ * irrelevant to `filter_tkt`, which looks only at provenance).
+ *
+ * @param file  the provenance path to stamp on the item
+ * @return      the fixture item
+ */
+fn pt_item_from(file: str) -> parser::Item {
+    let upath = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }), parser::Segment { name = "lexer" }) }
+    let u = parser::UseDecl { path = upath; has_alias = false; alias = ""; names = teko::list::empty() }
+    parser::Item { content = u; namespace = ""; file = file }
+}
+
+/**
+ * `filter_tkt` drops exactly the items whose provenance is a `.tkt` file and keeps
+ * everything else IN ORDER — the property the parse-once gated build relies on
+ * (`filter_tkt(parse(with tests))` ≡ `parse(without tests)`, so the release program
+ * is byte-identical to the historical re-parsed one and the FIXPOINT holds).
+ */
+#test
+fn pt_filter_tkt_drops_test_provenance_in_order() {
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, pt_item_from("src/a.tks"))
+    items = teko::list::push(items, pt_item_from("src/a_test.tkt"))
+    items = teko::list::push(items, pt_item_from("src/b.tks"))
+    items = teko::list::push(items, pt_item_from("main.tks"))
+    let got = filter_tkt(parser::Program { items = items })
+    teko::assert::is_true(got.items.len == 3)
+    teko::assert::is_true(got.items[0].file == "src/a.tks")
+    teko::assert::is_true(got.items[1].file == "src/b.tks")
+    teko::assert::is_true(got.items[2].file == "main.tks")
+}
+
+/**
+ * `filter_tkt` on a program with NO `.tkt` items is the identity (same length, same
+ * order) — the no-tests project takes the same path with zero effect.
+ */
+#test
+fn pt_filter_tkt_no_tkt_is_identity() {
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, pt_item_from("src/a.tks"))
+    items = teko::list::push(items, pt_item_from("main.tks"))
+    let got = filter_tkt(parser::Program { items = items })
+    teko::assert::is_true(got.items.len == 2)
+    teko::assert::is_true(got.items[0].file == "src/a.tks")
+    teko::assert::is_true(got.items[1].file == "main.tks")
+}
+
 /**
  * abs_path_of leaves an already-absolute POSIX path untouched and joins a relative one onto
  * `cwd` with a '/', exactly as the pre-B3-6 single-arm helper did.

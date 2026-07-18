@@ -268,54 +268,69 @@ fn checker_tick_fn(phase: Phase, last: Ref<u64>, total_cell: Ref<u64>) -> checke
  * @return          the fully checked and monomorphized program, or the first error
  */
 fn checked_program_of(selected: parser::Program, dep_prog: checker::TProgram, report: bool, tty: bool) -> checker::TProgram | error {
-    let visible = report && tty
-    let checker_phase = phase_begin("checker", count_unit_text(0, selected.items.len, "items"), visible)
+    let mode = report_mode(!report, tty)
+    let checker_phase = phase_begin("checker", count_unit_text(0, selected.items.len, "items"), mode)
     mut last: u64 = 0
     mut total_cell: u64 = selected.items.len
     let on_item = checker_tick_fn(checker_phase, last, total_cell)
     let pre = match checker::type_program_with_deps_pre_mono(selected, dep_prog, on_item) {
         checker::PreMono as p => p
         error as e => {
-            if report { phase_end_fail(checker_phase, count_unit_text(last, total_cell, "items"), e.message) }
+            phase_end_fail(checker_phase, count_unit_text(last, total_cell, "items"), e.message)   // no-op when Quiet
             return e
         }
     }
-    if report { phase_end_ok(checker_phase, count_unit_text(total_cell, total_cell, "items")) }
+    phase_end_ok(checker_phase, count_unit_text(total_cell, total_cell, "items"))   // no-op when Quiet
 
-    let mono_phase = phase_begin("monomorph", count_only_text(0, "instances"), visible)
+    let mono_phase = phase_begin("monomorph", count_only_text(0, "instances"), mode)
     let checked = match checker::monomorphize(pre.prog, pre.table) {
         checker::TProgram as c => c
         error as e => {
-            if report { phase_end_fail(mono_phase, count_only_text(0, "instances"), e.message) }
+            phase_end_fail(mono_phase, count_only_text(0, "instances"), e.message)   // no-op when Quiet
             return e
         }
     }
     let instances = if checked.items.len > pre.prog.items.len { checked.items.len - pre.prog.items.len } else { 0 }
-    if report { phase_end_ok(mono_phase, count_unit_text(instances, instances, "instances")) }
+    phase_end_ok(mono_phase, count_unit_text(instances, instances, "instances"))   // no-op when Quiet
     match checker::inline_consts(checked) {
         checker::TProgram as inlined => inlined
         error as e => {
-            if report { phase_end_fail(mono_phase, count_only_text(0, "instances"), e.message) }
+            phase_end_fail(mono_phase, count_only_text(0, "instances"), e.message)   // no-op when Quiet
             return e
         }
     }
 }
 
 /**
- * The front-end AFTER the chdir (manifest -> discover -> assemble -> check),
- * operating in the CURRENT directory. Split out so the D4 gate can retry it
- * WITHOUT tests after a test-assembly failure, on the SAME chdir (no second
- * `teko::env::chdir`, which would fail for a relative project dir already
- * entered).
+ * The PARSED front-end product — the manifest plus the merged, un-typed program, the
+ * output of `frontend_parse` and the input of `frontend_check`. Splitting the two
+ * lets the gated build PARSE THE TREE ONCE and derive BOTH the gate program (with
+ * `.tkt` tests) and the release program (`filter_tkt`) from the same parse, instead
+ * of re-lexing/re-parsing the whole corpus for the release rebuild (the historical
+ * silent re-front-end).
+ *
+ * @field parsed    the merged, OS-unpruned, un-typed program (with or without `.tkt`
+ *                  items, per the `include_tests` the parse ran with)
+ * @field manifest  the parsed project manifest
+ */
+type ParsedFront = struct {
+    parsed: parser::Program
+    manifest: Manifest
+}
+
+/**
+ * The PARSE half of the front-end (manifest -> discover -> assemble), operating in
+ * the CURRENT directory (the caller has already chdir'd). Reads and parses the
+ * manifest, discovers the source tree, injects the project-root `main.tks`, checks
+ * the A4 main-file rule, prints the build banner, and assembles every eligible file
+ * into ONE merged (un-typed) program.
  *
  * @param include_tests  assemble the `.tkt` test files into the merged program too
- * @param quiet          suppress the observability output (the gate's retry already
- *                       reported it on the failed first attempt)
- * @param tty            render the `lexer`/`parser`/`checker`/`monomorph` phases'
- *                       in-place `\r` updates (BUILD-OUTPUT OBSERVABILITY)
- * @return               the checked program and manifest, or the first error
+ * @param quiet          suppress the banner and the `lexer`/`parser` phase output
+ * @param tty            render the phases' in-place `\r` updates
+ * @return               the parsed program and manifest, or the first error
  */
-fn frontend_body(include_tests: bool, quiet: bool, tty: bool) -> Frontend | error {
+fn frontend_parse(include_tests: bool, quiet: bool, tty: bool) -> ParsedFront | error {
     // --- find + read + parse the manifest (the single <name>.tkp at the root — A1) ---
     let mname = match find_manifest() { str as n => n; error as e => return e }
     let mtext = match teko::io::read_file(mname) { str as s => s; error => return error { message = "cannot read .tkp manifest" } }
@@ -351,18 +366,75 @@ fn frontend_body(include_tests: bool, quiet: bool, tty: bool) -> Frontend | erro
     // assemble bakes file:line:col into the message, so report with an empty path (W-loc).
     let program = match assemble_sel(files, include_tests, !quiet, tty) { parser::Program as p => p; error as e => return e }
 
+    ParsedFront { parsed = program; manifest = m }
+}
+
+/**
+ * The CHECK half of the front-end (prune-os -> load-deps -> check+monomorphize) over
+ * an already-parsed program. Deterministic in its input: two calls over the same
+ * `ParsedFront` produce the same checked program — the property the parse-once gated
+ * build relies on (the release program is `frontend_check(filter_tkt(parse))`,
+ * byte-equivalent to the historical re-parsed release front-end).
+ *
+ * @param pf     the parsed program and manifest from `frontend_parse`
+ * @param quiet  suppress the `checker`/`monomorph` phase output
+ * @param tty    render the phases' in-place `\r` updates
+ * @return       the checked program and manifest, or the first error
+ */
+fn frontend_check(pf: ParsedFront, quiet: bool, tty: bool) -> Frontend | error {
     // --- C7.1f: keep only the target OS's `#os("…")` function variants (conditional compilation) ---
-    let selected = prune_os(program, target_os(m))
+    let selected = prune_os(pf.parsed, target_os(pf.manifest))
 
     // --- C7.10: load dep .tkl packages and prepend their typed items before type-checking ---
     // The dep's TProgram items carry their own namespaces (set when they were originally checked);
     // we pre-seed the collection environment with them so the project's code can call dep functions
     // and reference dep types. m.deps is empty when there is no [dependencies] section → no-op.
-    let dep_prog = match load_deps_program(m) { checker::TProgram as p => p; error as e => return e }
+    let dep_prog = match load_deps_program(pf.manifest) { checker::TProgram as p => p; error as e => return e }
 
     let checked = match checked_program_of(selected, dep_prog, !quiet, tty) { checker::TProgram as c => c; error as e => return e }
 
-    Frontend { prog = checked; manifest = m }
+    Frontend { prog = checked; manifest = pf.manifest }
+}
+
+/**
+ * The front-end AFTER the chdir (manifest -> discover -> assemble -> check),
+ * operating in the CURRENT directory — `frontend_parse` chained into
+ * `frontend_check`, for the single-pass callers (`teko run`, `teko test`,
+ * `--no-verify`) that need no parse reuse.
+ *
+ * @param include_tests  assemble the `.tkt` test files into the merged program too
+ * @param quiet          suppress the observability output
+ * @param tty            render the `lexer`/`parser`/`checker`/`monomorph` phases'
+ *                       in-place `\r` updates (BUILD-OUTPUT OBSERVABILITY)
+ * @return               the checked program and manifest, or the first error
+ */
+fn frontend_body(include_tests: bool, quiet: bool, tty: bool) -> Frontend | error {
+    let pf = match frontend_parse(include_tests, quiet, tty) { ParsedFront as x => x; error as e => return e }
+    frontend_check(pf, quiet, tty)
+}
+
+/**
+ * The PRODUCTION view of a parsed program: every item whose provenance is a `.tkt`
+ * test file is dropped, everything else passes through IN ORDER. Because
+ * `assemble_sel` walks the same file list with and without tests — the only
+ * difference being the `.tkt` skip — `filter_tkt(parse(with tests))` is
+ * item-for-item identical to `parse(without tests)`: same items, same order, same
+ * content. That equivalence is what lets the gated build parse ONCE and derive the
+ * release program from the gate's parse without re-reading the tree (the FIXPOINT
+ * is untouched — the release program is byte-identical to the re-parsed one).
+ *
+ * @param p  the merged program parsed WITH `.tkt` tests
+ * @return   the same program with every `.tkt`-provenance item removed
+ */
+fn filter_tkt(p: parser::Program) -> parser::Program {
+    mut kept: []parser::Item = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= p.items.len { break }
+        if !teko::str::ends_with(p.items[i].file, ".tkt") { kept = teko::list::push(kept, p.items[i]) }
+        i = i + 1
+    }
+    parser::Program { items = kept }
 }
 
 // =========================================================================
@@ -839,7 +911,8 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
     if m.backend == Backend::Native {
         return emit_native(dir, stem, out_dir, prog, m)
     }
-    let codegen_phase = phase_begin("codegen", count_unit_text(0, prog.items.len, "items"), tty)
+    let mode = report_mode(false, tty)   // the backend always reports (Tty on a terminal, Plain on a CI/log)
+    let codegen_phase = phase_begin("codegen", count_unit_text(0, prog.items.len, "items"), mode)
     let emitted = match codegen::tk_emit_c(prog) {
         str as s => s
         error as e => {
@@ -854,13 +927,13 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
     match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
     let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))
     let binp = teko::str::concat(od, "/", stem)
-    let emit_phase = phase_begin("emit C", cfile, tty)
+    let emit_phase = phase_begin("emit C", cfile, mode)
     match teko::io::write_file(cfile, csrc) {
         error as e => { phase_end_fail(emit_phase, cfile, e.message); return fail(dir, e.message) }
         null => { }   // error? — null = success
     }
     phase_end_ok(emit_phase, teko::str::concat(cfile, teko::str::concat(" ", size_text(csrc.len))))
-    let cc_phase = phase_begin("cc", binp, tty)
+    let cc_phase = phase_begin("cc", binp, mode)
     if run_cc(cfile, binp, m, prog, opt) != 0 {
         phase_end_fail(cc_phase, binp, "cc failed to build the generated C")
         return fail(dir, "cc failed to build the generated C")
@@ -1521,19 +1594,33 @@ fn report_native_coverage(prog: checker::TProgram) {
  *  `tk_cov_branch_at` interior marks (#265 Track A), so the merged sinks populate ALL THREE metrics —
  *  the engine-independent static walk (coverage::*_coverage_pct) reads them exactly as it read the
  *  VM's in-process marks. Replaces the 15.6 s VM interpret of the test bodies with a sub-second native run. */
-fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest, tty: bool) -> i32 {
+    let mode = report_mode(false, tty)   // BUILD-OUTPUT OBSERVABILITY: the gate's emit+cc were the front->test silent gap
     let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
     match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
     let stem = teko::str::concat(m.name, "-tktest")
     let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))
     let binp = teko::str::concat(od, "/", stem)
     let covfile = teko::str::concat(od, "/", teko::str::concat(stem, ".tkcov"))
-    let emitted = match codegen::tk_emit_c_test(prog, true) { str as s => s; error as e => return fail(dir, e.message) }
+    // emit the test-profile C (the front->test gap's first silent step — now a visible phase).
+    let emit_phase = phase_begin("emit test", cfile, mode)
+    let emitted = match codegen::tk_emit_c_test(prog, true) {
+        str as s => s
+        error as e => { phase_end_fail(emit_phase, cfile, e.message); return fail(dir, e.message) }
+    }
     let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(m.name, m.version, m.suffix, m.description))
-    match teko::io::write_file(cfile, csrc) { error as e => return fail(dir, e.message); null => { } }
+    match teko::io::write_file(cfile, csrc) {
+        error as e => { phase_end_fail(emit_phase, cfile, e.message); return fail(dir, e.message) }
+        null => { }
+    }
+    phase_end_ok(emit_phase, teko::str::concat(cfile, teko::str::concat(" ", size_text(csrc.len))))
+    // compile the gate binary with the host cc (the front->test gap's slow silent step — now a visible phase).
+    let cc_phase = phase_begin("cc test", binp, mode)
     if run_cc(cfile, binp, m, prog, 0) != 0 {
+        phase_end_fail(cc_phase, binp, "cc failed to build the native test gate")
         return fail(dir, "cc failed to build the native test gate")
     }
+    phase_end_ok(cc_phase, binp)
     match teko::env::set_var("TEKO_TKCOV", covfile) { error => { }; null => { } }
     mut argv: []str = teko::list::push(teko::list::empty(), binp)
     let trc = teko::process::run(argv)
@@ -1550,12 +1637,17 @@ fn cobertura_path_of(out_dir: str, gen_cov: bool) -> str {
     teko::str::concat(out_dir, "/cobertura.xml")
 }
 
-/** (#151) Re-front-end WITHOUT the `.tkt` files for the RELEASE program (`quiet` = the file map
- *  was already printed by the gate's first pass), strip any surviving `#test` functions by
- *  provenance, and hand the clean program to the backend at optimization level `opt`. `backend`
- *  is the resolved `--backend` selection, stamped onto the re-parsed manifest before codegen (D1/#390). */
-fn release_build_of(dir: str, out_dir: str, opt: i32, tty: bool, start: i128, backend: Backend) -> i32 {
-    let rel = match frontend_body(false, true, tty) { Frontend as f => f; error as e => return fail(dir, e.message) }
+/** (#151) The RELEASE program build, WITHOUT re-loading the front: derive the production
+ *  parse from the gate's ALREADY-PARSED tree (`filter_tkt(pf.parsed)` — item-for-item
+ *  identical to a fresh no-tests parse, see `filter_tkt`), run check+monomorph over it as
+ *  REPORTED work (the `checker`/`monomorph` phases print for real — this is legitimate,
+ *  distinct production-only work, not a silent retry; only the banner, printed once by
+ *  `frontend_parse`, is not repeated), strip any surviving `#test` functions by provenance,
+ *  and hand the clean program to the backend at optimization level `opt`. `backend` is the
+ *  resolved `--backend` selection, stamped onto the manifest before codegen (D1/#390). */
+fn release_build_of(dir: str, out_dir: str, opt: i32, tty: bool, start: i128, backend: Backend, pf: ParsedFront) -> i32 {
+    let pf_prod = ParsedFront { parsed = filter_tkt(pf.parsed); manifest = pf.manifest }
+    let rel = match frontend_check(pf_prod, false, tty) { Frontend as f => f; error as e => return fail(dir, e.message) }
     codegen_and_report(dir, out_dir, strip_tests(rel.prog), with_backend(rel.manifest, backend), opt, tty, start)
 }
 
@@ -1572,14 +1664,16 @@ fn release_build_of(dir: str, out_dir: str, opt: i32, tty: bool, start: i128, ba
  *  @param out_dir  the build output directory (the test TU + binary + .tkcov land under it)
  *  @param gen_cov  write a Cobertura report (`--coverage`) from the merged native sinks
  *  @param fe       the already-assembled front-end product (checked program + manifest)
+ *  @param pf       the gate's PARSED tree (release derives from it via `filter_tkt` —
+ *                  no re-parse)
  *  @param opt      the cc optimization level for the RELEASE rebuild (the gate binary stays opt 0)
  *  @param tty      render the release rebuild's backend phases' in-place `\r` updates
  *  @param start    when the build began (the closing `built <path> <elapsed>` line's baseline)
  *  @param backend  the resolved code-generation backend (`--backend`, default `Backend::C`)
  *  @return         0 when every test passes, every floor is met, and the release build succeeds
  *  @since #265 */
-fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32, tty: bool, start: i128, backend: Backend) -> i32 {
-    let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest)
+fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, pf: ParsedFront, opt: i32, tty: bool, start: i128, backend: Backend) -> i32 {
+    let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest, tty)
     if trc != 0 { return trc }
     report_native_coverage(fe.prog)
     let gate_rc = coverage_gate_result(dir, fe)
@@ -1590,7 +1684,7 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32
         match teko::io::write_file(cov_path, xml) { error => { }; null => { } }
         teko::io::println(teko::str::concat("teko: wrote coverage report ", cov_path))
     }
-    release_build_of(dir, out_dir, opt, tty, start, backend)
+    release_build_of(dir, out_dir, opt, tty, start, backend, pf)
 }
 
 /**
@@ -1601,14 +1695,15 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32
  * @param out_dir  the output directory (default "bin")
  * @param gen_cov  `--coverage` — write the Cobertura report
  * @param fe       the front-end result assembled WITH the `.tkt` tests
+ * @param pf       the gate's parsed tree (the release program derives from it, no re-parse)
  * @param opt      the cc optimization level for the release rebuild (0 = default, 2 = release seed)
  * @param tty      render the release rebuild's backend phases' in-place `\r` updates
  * @param start    when the build began (the closing `built <path> <elapsed>` line's baseline)
  * @param backend  the resolved code-generation backend (`--backend`, default `Backend::C`)
  * @return         0 when the gate passes and the release build succeeds, else the failing status
  */
-fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, opt: i32, tty: bool, start: i128, backend: Backend) -> i32 {
-    run_gate_native(dir, out_dir, gen_cov, fe, opt, tty, start, backend)
+fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, pf: ParsedFront, opt: i32, tty: bool, start: i128, backend: Backend) -> i32 {
+    run_gate_native(dir, out_dir, gen_cov, fe, pf, opt, tty, start, backend)
 }
 
 /** No `#test` functions at all: ignore the gate, build the production program straight from the
@@ -1643,12 +1738,15 @@ fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, opt
     if no_verify {
         return build_ungated(dir, out_dir, opt, tty, start, backend)
     }
-    match frontend_body(true, false, tty) {
+    // PARSE ONCE: the gate checks the tree WITH tests; the release program later derives
+    // from the SAME parse via `filter_tkt` (release_build_of) — no second lex/parse pass.
+    let pf = match frontend_parse(true, false, tty) { ParsedFront as x => x; error as e => return fail(dir, e.message) }
+    match frontend_check(pf, false, tty) {
         Frontend as fe => {
             if !has_tests(fe.prog) {
                 return build_no_tests_present(dir, out_dir, fe, opt, tty, start, backend)
             }
-            run_gate(dir, out_dir, gen_cov, fe, opt, tty, start, backend)
+            run_gate(dir, out_dir, gen_cov, fe, pf, opt, tty, start, backend)
         }
         error as e => return fail(dir, e.message)
     }
@@ -1856,7 +1954,7 @@ fn run_project(dir: str, backend: Backend) -> i32 {
 fn test_project(dir: str, gen_cov: bool) -> i32 {
     ensure_rt_dir_abs()
     let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
-    let trc = run_native_gate(dir, "bin", fe.prog, fe.manifest)
+    let trc = run_native_gate(dir, "bin", fe.prog, fe.manifest, output_is_tty(false))
     if trc != 0 { return trc }
     if gen_cov {
         let xml = coverage::cov_cobertura(fe.prog)

@@ -15,11 +15,11 @@
 #
 # Env:     TEKO_DEST — install dir (default ./.teko, per-worktree so parallel agents /
 #                      worktrees do not clobber each other's compiler).
-#          TEKO_REPO — owner/repo (default schivei/teko-lang).
+#          TEKO_REPO — owner/repo (default teko-org/teko-lang).
 # Requires: gh (authenticated), tar or unzip.
 set -eu
 
-REPO="${TEKO_REPO:-schivei/teko-lang}"
+REPO="${TEKO_REPO:-teko-org/teko-lang}"
 DEST="${TEKO_DEST:-.teko}"
 
 os="$(uname -s)"
