@@ -904,10 +904,46 @@ fn transfer_stmt(s: TStatement, cells: []Cell, us: []Unique) -> []Unique {
  * @return []Unique  the axis with this binding's alias (if any) joined to `UsShared`
  */
 fn transfer_binding(b: TBinding, cells: []Cell, us: []Unique) -> []Unique {
-    if !rhs_is_alias_source(b.value) { return us }
+    let src = binding_alias_src_name(b.value)
+    if src == "" { return us }
     match b.target {
-        parser::SimpleName as sn => mark_alias_shared(cells, us, sn.name, alias_src_name(b.value))
+        parser::SimpleName as sn => mark_alias_shared(cells, us, sn.name, src)
         parser::DestructurePattern => us
+    }
+}
+
+/**
+ * The aliased SOURCE name a binding's RHS threads into the unique-vs-shared transfer: the borrowed
+ * local `x` of an explicit `&x` (`TBorrow`) — a stored ref-bind `mut y = &x` ALIASES its referent,
+ * so a live borrow marks `x` shared and the exclusive-mut authorization `is_unique_at` reflects it
+ * (F1.3) — else the bare non-scalar local of an alias-source `let y = x`. "" when the RHS aliases
+ * no single local (a scalar copy, a fresh value, a non-lvalue borrow).
+ *
+ * @param TExpr v  the typed binding RHS
+ * @return str  the aliased source local name, or "" when the RHS names none
+ */
+fn binding_alias_src_name(v: TExpr) -> str {
+    let borrowed = borrow_referent_name(v)
+    if borrowed != "" { return borrowed }
+    if !rhs_is_alias_source(v) { return "" }
+    alias_src_name(v)
+}
+
+/**
+ * The borrowed referent name of an explicit `&x` safe-borrow expression: the bare `TVar` operand's
+ * name, or "" when the operand is not a bare local (a non-lvalue borrow names no single referent).
+ * The one syntactic `&x` site a local ref-bind reads (F1.3 L2a).
+ *
+ * @param TExpr e  the typed expression
+ * @return str  the borrowed local's name, or "" when `e` is not a bare-local borrow
+ */
+fn borrow_referent_name(e: TExpr) -> str {
+    match e.kind {
+        TBorrow as tb => match tb.operand.kind {
+            TVar as v => v.name
+            _ => ""
+        }
+        _ => ""
     }
 }
 
@@ -1366,8 +1402,50 @@ fn bf_transfer_binding(b: TBinding, cells: []Cell, bf: []BorrowedFrom) -> []Borr
             parser::SimpleName as sn => bf_inherit_at(cells, bf, sn.name, v.name)
             parser::DestructurePattern => bf
         }
+        TBorrow as tb => bf_seed_borrow(cells, bf, b.target, tb)
         _ => bf
     }
+}
+
+/**
+ * The bf-seed for a local ref-bind `mut y = &x` (F1.3 L2a): the borrow handle `y` gets `bf[y] :=
+ * BfLocal(x)` by DEFINITE ASSIGNMENT at this single syntactic `&x` site — it borrows the LOCAL
+ * referent `x` directly (never a join). A non-bare-local borrow operand, or a destructure target,
+ * names no single ref/referent pair, so `bf` is left unchanged (the gate then reads `BfNone` and
+ * conservatively rejects).
+ *
+ * @param []Cell cells  the cell universe
+ * @param []BorrowedFrom bf  the borrowed-from axis so far
+ * @param parser::BindTarget target  the ref-bind's target
+ * @param TBorrow tb  the `&x` borrow value
+ * @return []BorrowedFrom  the axis with the borrow handle's `BfLocal` seeded (or unchanged)
+ */
+fn bf_seed_borrow(cells: []Cell, bf: []BorrowedFrom, target: parser::BindTarget, tb: TBorrow) -> []BorrowedFrom {
+    match tb.operand.kind {
+        TVar as v => match target {
+            parser::SimpleName as sn => bf_seed_local_at(cells, bf, sn.name, v.name)
+            parser::DestructurePattern => bf
+        }
+        _ => bf
+    }
+}
+
+/**
+ * Write `bf[dst] := BfLocal(referent)` when the destination local `dst` is a cell in this function's
+ * universe; otherwise leave `bf` unchanged. Unlike `bf_inherit_at` (which COPIES the source cell's
+ * `bf`), this SEEDS a fresh `BfLocal` naming the borrowed referent directly — the `&x` borrow site's
+ * single definite assignment.
+ *
+ * @param []Cell cells  the cell universe
+ * @param []BorrowedFrom bf  the borrowed-from axis so far
+ * @param str dst  the ref-bind handle's target name
+ * @param str referent  the borrowed local's name
+ * @return []BorrowedFrom  the axis with `dst` borrowing `referent` as `BfLocal` (or unchanged)
+ */
+fn bf_seed_local_at(cells: []Cell, bf: []BorrowedFrom, dst: str, referent: str) -> []BorrowedFrom {
+    let di = cell_index(cells, dst, "")
+    if di < 0 { return bf }
+    set_bf(bf, di to u32, BfLocal { id = BfLocalId { name = referent } })
 }
 
 /**

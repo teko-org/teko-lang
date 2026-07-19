@@ -4472,19 +4472,39 @@ fn check_ref_assign_storable(a: TAssign, spine: Spine) -> error? {
 }
 
 /**
+ * The referent NAME a local ref-bind's RHS names: the borrowed local `x` of an explicit `&x`
+ * (`TBorrow` — the F1.3 borrow site) whose operand is a bare `TVar`, else the aliased source of a
+ * bare `Reference`-param read (`alias_src_name`). "" when the RHS names no single referent (an
+ * `if`/`match`/call/non-lvalue borrow), yielding a conservative `cell_of == -1` reject.
+ *
+ * @param TExpr value  the ref-bind's typed RHS
+ * @return str  the referent local's name, or "" when the RHS names none
+ */
+fn ref_bind_referent_name(value: TExpr) -> str {
+    match value.kind {
+        TBorrow as tb => match tb.operand.kind {
+            TVar as v => v.name
+            _ => ""
+        }
+        _ => alias_src_name(value)
+    }
+}
+
+/**
  * The core spine query for one ref-to-local site: ADMIT iff `ref_target_outlives(borrow = the storage
- * local's cell, referent = the RHS source cell)` holds. The bf-inherit writer set `bf[borrow] =
- * BfParam` so the tag is meaningful; an un-nameable RHS or an un-found cell (`cell_of == -1`) is a
- * conservative reject with the UNCHANGED R5 diagnostic (no fixture drift).
+ * local's cell, referent = the RHS source cell)` holds. The bf writer set `bf[borrow]` to `BfParam`
+ * (a `Reference`-param alias `let r = p`) or `BfLocal` (an explicit `&x` borrow, F1.3) so the tag is
+ * meaningful; an un-nameable RHS or an un-found cell (`cell_of == -1`) is a conservative reject with
+ * the UNCHANGED R5 diagnostic (no fixture drift).
  *
  * @param Spine spine  the function's spine fact
  * @param str target  the ref-to-local binding/assign's storage local name
- * @param TExpr value  the RHS expression (its bare-`TVar` name is the referent)
+ * @param TExpr value  the RHS expression (its borrowed / aliased local name is the referent)
  * @return error?  null when the borrow provably outlives, else the R5 reject error
  */
 fn ref_borrow_or_error(spine: Spine, target: str, value: TExpr) -> error? {
     let borrow = cell_of(spine, target)
-    let referent = cell_of(spine, alias_src_name(value))
+    let referent = cell_of(spine, ref_bind_referent_name(value))
     if borrow >= 0 {
         if referent >= 0 {
             if ref_target_outlives(spine, borrow to u32, referent to u32) { return null }
