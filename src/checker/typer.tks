@@ -1411,6 +1411,24 @@ fn is_char_decode_target(t: Type) -> bool {
     }
 }
 
+/**
+ * is_flags_wire_cast — E8 (#594 crumb 11): is `from -> to` a flags ↔ integer WIRE
+ * cast? A flags value's raw bit pattern → an integer (an object-writer
+ * `sh_flags`/`Characteristics` field needs the combined mask as a plain `uN`), or
+ * an integer → a flags value. `cast_check` is prim-only, so `type_cast` handles
+ * this pair directly — mirroring E7's enum-ordinal cast. Any OTHER flags cast
+ * stays rejected by `cast_check`.
+ *
+ * @param from   the cast's source type
+ * @param to     the cast's target type
+ * @param table  the type table (to detect a flags-declared Named type)
+ * @return       true iff the pair is a flags↔integer wire cast
+ */
+fn is_flags_wire_cast(from: Type, to: Type, table: TypeTable) -> bool {
+    (is_flags_named(from, table) && is_int_cast_end(to)) ||
+    (is_int_cast_end(from) && is_flags_named(to, table))
+}
+
 fn type_cast(c: parser::Cast, env: Env, table: TypeTable) -> TExpr | error {
     let inner = match type_expr(c.expr, env, table) { TExpr as te => te; error as e => return e }
     if type_is_void(inner.type) { return error { message = "a `void` expression cannot be cast (M.1)" } }
@@ -1433,7 +1451,8 @@ fn type_cast(c: parser::Cast, env: Env, table: TypeTable) -> TExpr | error {
     // target. Any OTHER enum cast stays rejected by cast_check. (Mirrors expr.c type_cast's e7.)
     let e7 = (is_enum_named(inner.type, table) && is_int_cast_end(target)) ||
     (is_int_cast_end(inner.type) && is_enum_named(target, table))
-    if !e7 {
+    let e8 = is_flags_wire_cast(inner.type, target, table)
+    if !e7 && !e8 {
         match cast_check(inner.type, target) { null => { }; error as e => return e }
     }
     match const_range_check(c.expr, target) { null => { }; error as e => return e }
@@ -2268,32 +2287,218 @@ fn type_array_lit(a: parser::ArrayLit, env: Env, table: TypeTable) -> TExpr | er
     TExpr { kind = TArrayLit { elements = final_elems }; type = Slice { element = et }; line = 0; col = 0 }
 }
 
-// ---- the expression dispatch (the evolved check_expr) ----
-// `Enum::Member` as a VALUE — the enum type (path minus the member) resolved to an `enum` decl,
-// the member checked, the node typed NAMED(enum) carrying enum name + member ORDINAL (so both
-// backends lower without re-lookup). C twin: type_path_expr in expr.c.
-// (C8.3, ported 2026-07-01 alongside type_flags_method to unblock its self-host testing — see
-// expr.c::type_path_expr) `Type::Member` as a VALUE: an ENUM member (ordinal = declaration
-// index) OR a FLAGS member (ordinal = the BIT INDEX, i.e. the member's power-of-2 position, not
-// its value). (#50) The node also carries the RESOLVED member `value` (enum: the ordinal;
-// flags: `1 << ordinal`) so the VM reads it instead of recomputing (native codegen's pre-emitted
-// constants already encode it). The .tks side previously supported ONLY enum; flags fell through
-// to the enum-only error, a self-host divergence from expr.c.
-// (#109 W1) `ref_ns` = the namespace the `Type::Member` expression is written in; unused until W2.
-fn type_path_expr(pe: parser::PathExpr, table: TypeTable, ref_ns: str) -> TExpr | error {
+/**
+ * member_const_symbol — the deterministic internal name a type-member const is hoisted under and a
+ * `TypeName::NAME` reference resolves to (#594 crumb 7): the owning type's CANONICAL name joined to
+ * the member by `::`. The hoist pass (`type_type_member_consts`) and the resolver (`find_member_const`)
+ * both compute it from the SAME canonical type name, so a scalar reference matches the inliner's
+ * substitution table and an aggregate reference matches the interned rodata symbol.
+ *
+ * @param type_canonical  the owning type's canonical (`ns::Name`) identity
+ * @param member          the member const's own name
+ * @return                the hoisted const's program-unique name
+ * @since #594
+ */
+fn member_const_symbol(type_canonical: str, member: str) -> str {
+    teko::str::concat(type_canonical, teko::str::concat("::", member))
+}
+
+/**
+ * MemberConstHit — a resolved static member const TOGETHER WITH the type whose OWN body actually
+ * declares it (#594 crumb 7 visibility fix). Walking a subclass's base chain can resolve a const
+ * declared several levels up (`Sub::SECRET` reaching a `Base`-declared const); `private` reach must
+ * gate on THAT declaring type's namespace, never the path's leading (possibly-derived) type's — a
+ * private base const must not leak cross-namespace through an unrelated subclass's name.
+ *
+ * @param cd         the resolved member const declaration
+ * @param declaring  the type whose OWN body declares `cd` (the nearest one — shadowing wins)
+ */
+type MemberConstHit = struct { cd: parser::ConstDecl; declaring: parser::TypeDecl }
+
+/**
+ * resolve_member_const_hit — the nearest static member const named `seg` reachable from `owner`,
+ * walking the base chain (a subclass inherits a base's member const by name; a nearer declaration
+ * shadows a farther one — static hiding, D6) (#594 crumb 7), together with the type that ACTUALLY
+ * declares it. Checks `owner`'s OWN consts FIRST (struct/class/trait bodies alike — shadowing), only
+ * recursing into a class's base when its own body declares no such name. Returns null when no member
+ * const named `seg` exists on the type or its bases.
+ *
+ * @param owner  the type to resolve from (struct/class/abstract/trait)
+ * @param seg    the last path segment (the member const's name)
+ * @param table  the type table (to follow a class's base chain)
+ * @return       the resolved const plus its actual declaring type, or null when not found
+ * @since #594
+ */
+fn resolve_member_const_hit(owner: parser::TypeDecl, seg: str, table: TypeTable) -> MemberConstHit? {
+    let own = body_consts(owner.body)
+    mut i: u64 = 0
+    loop {
+        if i >= own.len { break }
+        if own[i].name == seg { return MemberConstHit { cd = own[i]; declaring = owner } }
+        i++
+    }
+    match owner.body {
+        parser::ClassBody as cb => {
+            if !cb.has_base { return null }
+            let base_decl = match type_table_find(table, cb.base_name, "") { parser::TypeDecl as td => td; error => return null }
+            resolve_member_const_hit(base_decl, seg, table)
+        }
+        _ => null
+    }
+}
+
+/**
+ * member_const_visible — enforce a static member const's reach at a `TypeName::NAME` use site (#594
+ * crumb 7): a `Private` member const is reachable ONLY from its DECLARING module's namespace — NEVER
+ * the path's leading type's namespace, so `Sub::SECRET` (a private const declared on a `Base` in a
+ * different namespace) is rejected even though `Sub` inherits the name. `Pub`/`Exp` reach across
+ * namespaces (the `Exp` public-ABI distinction is exercised cross-module at crumb 8).
+ *
+ * @param hit     the resolved member const + its actual declaring type
+ * @param table   the type table (to read the declaring type's namespace)
+ * @param ref_ns  the namespace the `TypeName::NAME` reference is written in
+ * @return        null when the access is allowed, else a located visibility error
+ * @since #594
+ */
+fn member_const_visible(hit: MemberConstHit, table: TypeTable, ref_ns: str) -> error? {
+    match hit.cd.vis {
+        parser::Visibility::Private => {
+            let decl_ns = type_ns_of(table, hit.declaring.name)
+            if decl_ns != ref_ns {
+                return teko::error::err_loc(error { message = $"member const `{hit.cd.name}` is private to `{hit.declaring.name}` — mark it `pub`/`exp` to use it from another module" }, hit.cd.line, hit.cd.col)
+            }
+            null
+        }
+        _ => null
+    }
+}
+
+/**
+ * find_member_const — resolve `TypeName::NAME` to a REFERENCE to its static member const (#594 crumb
+ * 7): a `TVar` bound to the hoisted const's program-unique name (the same name `type_type_member_consts`
+ * emits, keyed on the PATH's leading type — the hoist re-materializes an inherited const once per
+ * owning type, exactly like an inherited method is re-emitted per class), typed with the const's
+ * declared type. `func_ns` is stamped to `owner_ns` — the SAME namespace `type_type_member_consts`
+ * stamps its hoisted `TConstDecl.namespace` with (both derive from the type's own declaring
+ * namespace) — so the c8b `(name, namespace)`-keyed scalar/aggregate inliner's ref key matches the
+ * hoisted const's key and actually substitutes it. An empty `func_ns` here (the regression a
+ * positive-fixture e2e build exposed) matches the hoist ONLY at the root namespace ("" == ""); any
+ * type declared in a non-root namespace then never substitutes, so the reference survives to codegen
+ * as the raw `sym` (a `"Type::NAME"`-shaped string embedding `::`) emitted verbatim as a C
+ * identifier — invalid syntax the C compiler rejects. The inliner then substitutes a scalar's value
+ * or the aggregate's rodata address. Returns null when no such member const exists, so
+ * `type_path_expr` falls through to the enum-member arm.
+ *
+ * @param owner  the resolved leading type (struct/class/abstract/trait)
+ * @param seg    the last path segment (the member const's name)
+ * @param table  the type table (to follow the base chain + read each body's consts)
+ * @return       the typed reference to the member const, or null when not found
+ * @since #594
+ */
+fn find_member_const(owner: parser::TypeDecl, seg: str, table: TypeTable) -> TExpr? {
+    let hit = match resolve_member_const_hit(owner, seg, table) { MemberConstHit as h => h; null => return null }
+    let owner_ns = type_ns_of(table, owner.name)
+    let rty = match resolve_type(hit.cd.ty, table, owner_ns) { Type as t => t; error => return null }
+    let sym = member_const_symbol(qualify(owner_ns, owner.name), seg)
+    TExpr { kind = TVar { name = sym; is_func = false; func_ns = owner_ns }; type = rty; line = 0; col = 0 }
+}
+
+/**
+ * ns_value_visible — enforce a namespace-qualified value's cross-module reach (#594 crumb 8c, issue
+ * #613): a `private` module-level const is reachable ONLY from its OWN declaring namespace, so
+ * `ns::NAME` naming a private const from a DIFFERENT namespace is a located visibility error — the
+ * qualified spelling never widens a private const's reach (the module-level twin of
+ * `member_const_visible`, D4/D6). A `pub`/`exp` value reaches across namespaces, and a reference from
+ * the const's own namespace is allowed. A dep's private const never reaches here — it is not seeded
+ * across the module boundary (`seed_dep_consts`), so it fails to resolve first.
+ *
+ * @param b       the resolved value binding
+ * @param ref_ns  the namespace the `ns::NAME` reference is written in
+ * @return        null when the access is allowed, else a visibility error (located at the use site by
+ *                the `type_expr` wrapper)
+ * @since #594
+ */
+fn ns_value_visible(b: ValBinding, ref_ns: str) -> error? {
+    match b.vis {
+        parser::Visibility::Private => {
+            if b.ns != ref_ns {
+                return error { message = $"const `{b.name}` is private to `{b.ns}` — mark it `pub`/`exp` to use it from another module" }
+            }
+            null
+        }
+        _ => null
+    }
+}
+
+/**
+ * type_ns_qualified_value — the namespace-qualified VALUE fallback of `type_path_expr`, reached only
+ * when the path's leading qualifier does NOT resolve as a type, so `ns::NAME` names a module-level
+ * value — a `pub`/`exp` const or a top-level fn-value declared in namespace `ns` — rather than a
+ * `Type::Member`. Emits the SAME `TVar` a bare reference produces, stamping `func_ns` with the value's
+ * OWN full declaring namespace (`b.ns`, which the short written qualifier selects by the ends-with
+ * rule) — never the short qualifier — so the c8b `(name, namespace)`-keyed scalar inliner substitutes
+ * a qualified const identically and a qualified fn-value lowers to its `tk_closure` mangle. A name
+ * that resolves as NEITHER a type nor a value
+ * surfaces the ORIGINAL type-resolution error `type_err` (backward-compatible with the pre-#613
+ * `unknown type` diagnostic) (#594 crumb 8c, issue #613).
+ *
+ * @param pe        the parsed path expression
+ * @param member    the path's last segment (the value's bare name)
+ * @param type_err  the type-resolution error to surface when no value binding matches either
+ * @param env       the type-checking environment (value bindings + `cur_ns`)
+ * @return          the typed value reference, or a located error
+ * @throws          a visibility error for a `private` cross-namespace const, else `type_err`
+ * @since #594
+ */
+fn type_ns_qualified_value(pe: parser::PathExpr, member: str, type_err: error, env: Env) -> TExpr | error {
+    let qualifier = path_qualifier(pe.path, pe.path.segments.len - 1)
+    let b = match lookup_value_in_ns(env, member, qualifier) { ValBinding as vb => vb; error => return type_err }
+    match ns_value_visible(b, env.cur_ns) { error as e => return e; null => { } }
+    let is_fn = b.ns.len > 0 && (match b.type { Func => true; _ => false })
+    TExpr { kind = TVar { name = member; is_func = is_fn; func_ns = b.ns }; type = b.type; line = 0; col = 0 }
+}
+
+/**
+ * type_path_expr — type a two-segment path used as a VALUE. Resolution order: (1) a member const
+ * `Owner::NAME` when the leading path resolves to a struct/class/abstract/trait type (walks the base
+ * chain); (2) an enum member `E::M` (value = its declaration ordinal); (3) a flags member `E::M`
+ * (value = `1 << ordinal`, the bit index); (4) a namespace-qualified value `ns::NAME` — a `pub`/`exp`
+ * module const or a top-level fn-value in module `ns` — reached only when the leading qualifier is NOT
+ * a type (`type_ns_qualified_value`). Each backend lowers the enum/flags node without re-lookup (it
+ * carries the resolved member `value`), and the namespace arm reuses the bare-reference `TVar` shape
+ * so the const inliner and closure mangler need no qualified-specific path (#50, #594 crumb 8c).
+ *
+ * @param pe     the parsed path expression
+ * @param table  the type table (enum/flags/member-const resolution)
+ * @param env    the type-checking environment (value-binding lookup + the reference's `cur_ns`)
+ * @return       the typed value reference, or a located error
+ * @throws       when the path names no reachable member const, enum/flags member, or namespace value
+ * @since #50
+ */
+fn type_path_expr(pe: parser::PathExpr, table: TypeTable, env: Env) -> TExpr | error {
     let p = pe.path
     if p.segments.len < 2 { return error { message = "a path expression must name an enum or flags member (`Type::Member`)" } }
     let member = p.segments[p.segments.len - 1].name
-    mut segs: []parser::Segment = teko::list::empty()   // the type = the path minus its last segment
+    mut segs: []parser::Segment = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= p.segments.len - 1 { break }
         segs = teko::list::push(segs, p.segments[i])
         i++
     }
-    let et = match resolve_named(parser::Path { segments = segs }, table, ref_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the expression's enclosing namespace
+    let et = match resolve_named(parser::Path { segments = segs }, table, env.cur_ns) {
+        Type as t => t
+        error as e => return type_ns_qualified_value(pe, member, e, env)
+    }
     let tname = match et { Named as n => n.name; _ => return error { message = "`Type::Member` requires a named enum or flags type" } }
-    let decl = match type_table_find(table, tname, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }   // (#109 W1) follow-up lookup of a resolved name — no referencing ns
+    let decl = match type_table_find(table, tname, "") { parser::TypeDecl as td => td; error => return error { message = $"unknown type in a `Type::Member` path: {tname}" } }
+    match resolve_member_const_hit(decl, member, table) {
+        MemberConstHit as hit => {
+            match member_const_visible(hit, table, env.cur_ns) { error as e => return e; null => { } }
+            match find_member_const(decl, member, table) { TExpr as mref => return mref; null => { } }
+        }
+        null => { }
+    }
     match decl.body {
         parser::EnumBody as eb => {
             mut j: u64 = 0
@@ -2352,7 +2557,7 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
                 error => type_method_call(mc, env, table)   // let it re-type and surface the real error
             }
         }
-        parser::PathExpr as pe => type_path_expr(pe, table, env.cur_ns)   // Enum::Member as a value   (#109 W1) ref_ns = the enclosing namespace
+        parser::PathExpr as pe => type_path_expr(pe, table, env)
         parser::StructLit as sl => type_struct_lit(sl, Void { }, env, table)   // W4a (no expected type in expr position)
         parser::Index as ix => type_index(ix, env, table)   // W5-idx
         parser::Interp as in => type_interp(in, env, table)   // $"…{expr}…"
@@ -4391,6 +4596,83 @@ fn type_struct_methods(td: parser::TypeDecl, item_ns: str, file: str, env: Env, 
     out
 }
 
+/**
+ * type_type_member_consts — HOIST a struct/class/trait's EFFECTIVE static member consts into
+ * module-level `TConstDecl` items (#594 crumb 7), so the very same inliner + rodata machinery a
+ * module const uses carries a member const too — the owning type is only the NAMESPACE of resolution
+ * (no layout slot). Each is typed by `type_const_decl` (identical const-eval to a module const) and
+ * emitted under its program-unique `member_const_symbol` name; a `TypeName::NAME` reference
+ * (`find_member_const`) binds to that same name. A class contributes its inherited-not-shadowed base
+ * consts too (mirroring how its inherited methods are re-emitted per owning class).
+ *
+ * @param td       the type declaration whose member consts are hoisted
+ * @param item_ns  the type's declaring namespace (its canonical qualifier)
+ * @param file     the type's source file (for located error surfacing)
+ * @param env      the pass-2 environment (namespace-scoped to the type's module)
+ * @param table    the program's type table
+ * @return         one `TConstDecl` TItem per effective member const, or a located error
+ * @throws         a type/const-expr error in a member const's initializer, surfaced at its position
+ * @since #594
+ */
+fn type_type_member_consts(td: parser::TypeDecl, item_ns: str, file: str, env: Env, table: TypeTable) -> []TItem | error {
+    let eff = match td.body {
+        parser::ClassBody as cb => match effective_class_consts(cb, table) { []parser::ConstDecl as c => c; error as e => return e }
+        parser::StructBody as sb => sb.consts
+        parser::TraitBody as tb => tb.consts
+        _ => teko::list::empty()
+    }
+    let type_canonical = qualify(item_ns, td.name)
+    mut out: []TItem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= eff.len { break }
+        let cd = eff[i]
+        let ti = match type_const_decl(cd, env, table) { TConstDecl as x => x; error as e => return surface_at(file, cd.line, cd.col, e) }
+        out = teko::list::push(out, TConstDecl { name = member_const_symbol(type_canonical, cd.name); namespace = item_ns; ty = ti.ty; init = ti.init; vis = ti.vis; has_doc = ti.has_doc; doc = ti.doc; line = cd.line; col = cd.col })
+        i++
+    }
+    out
+}
+
+/**
+ * type_const_decl — pass-2 typing for a module-level constant (#594 crumb 4): resolve the declared
+ * type, type the initializer against it (adopting a fitting bare literal to the declared narrow
+ * width exactly as `type_binding` does, so `const K: u8 = 300` reports an out-of-range error while
+ * `const K: u8 = 1` narrows the leaf), then gate the checked initializer through `is_const_expr`
+ * (the D1 grammar). The returned TConstDecl carries the checked initializer the inliner substitutes
+ * at each use site; its `namespace` is seeded from `env.cur_ns` and re-stamped by `type_item` from
+ * the item's provenance.
+ *
+ * @param cd     the parsed const declaration
+ * @param env    the pass-2 environment (top-level names — including sibling consts — bound)
+ * @param table  the program's type table
+ * @return       the typed constant, or a located error on a type mismatch, an out-of-range literal,
+ *               a `void`/element-less initializer, or a non-const initializer form
+ * @throws       a type-mismatch error (expected the declared type, found the initializer's) when the
+ *               initializer neither is assignable to nor adopts the declared type; the `is_const_expr`
+ *               error naming the offending form when the initializer is not a legal const-expr
+ * @since #594
+ */
+fn type_const_decl(cd: parser::ConstDecl, env: Env, table: TypeTable) -> TConstDecl | error {
+    let at = match resolve_type(cd.ty, table, env.cur_ns) { Type as t => t; error as e => return e }
+    mut v = match type_value_expected(cd.init, at, env, table) { TExpr as te => te; error as e => return e }
+    if type_is_void(v.type) { return error { message = "a const initializer cannot be a `void` expression — it yields no value (M.1)" } }
+    if !assignable_to(v.type, at, table) {
+        match annotated_literal_ok(cd.init, at) {
+            null => v = retype_literal(v, at)
+            error as e => return teko::error::err_typed(e, type_render(at), type_render(v.type))
+        }
+    }
+    let at_is_sentinel_slice = match at { Slice as bs => match bs.element { Void => true; _ => false }; _ => false }
+    if at_is_sentinel_slice {
+        return error { message = "a const of an element-less slice type needs a concrete element (e.g. `const XS: []u8 = …`)" }
+    }
+    let v_is_sentinel_slice = match v.type { Slice as vs => match vs.element { Void => true; _ => false }; _ => false }
+    if v_is_sentinel_slice { v = TExpr { kind = v.kind; type = at; line = v.line; col = v.col } }
+    match is_const_expr(v, table, env) { error as e => return e; null => { } }
+    TConstDecl { name = cd.name; namespace = env.cur_ns; ty = at; init = v; vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col }
+}
+
 fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
     match item.content {
         parser::Function as f => {
@@ -4411,6 +4693,10 @@ fn type_item(item: parser::Item, env: Env, table: TypeTable) -> TItem | error {
         parser::Statement as s => {
             let ts = match type_statement(s, env, table) { TypedStmt as x => x; error as e => return e }
             ts.node
+        }
+        parser::ConstDecl as cd => {
+            let ti = match type_const_decl(cd, env, table) { TConstDecl as x => x; error as e => return e }
+            TConstDecl { name = ti.name; namespace = item.namespace; ty = ti.ty; init = ti.init; vis = ti.vis; has_doc = ti.has_doc; doc = ti.doc; line = cd.line; col = cd.col }
         }
     }
 }
@@ -4482,7 +4768,8 @@ fn no_item_progress(done: u64, total: u64) -> void { }
  */
 pub fn type_program_with_deps(raw_program: parser::Program, dep_prog: TProgram) -> TProgram | error {
     let pre = match type_program_with_deps_pre_mono(raw_program, dep_prog, no_item_progress) { PreMono as p => p; error as e => return e }
-    monomorphize(pre.prog, pre.table)
+    let mono = match monomorphize(pre.prog, pre.table) { TProgram as mp => mp; error as e => return e }
+    inline_consts(mono)
 }
 
 /**
@@ -4538,6 +4825,7 @@ pub fn type_program_with_deps_pre_mono(raw_program: parser::Program, dep_prog: T
         match it.content {
             parser::Function as f => { line = f.line; col = f.col }
             parser::TypeDecl as td => { line = td.line; col = td.col }
+            parser::ConstDecl as cd => { line = cd.line; col = cd.col }
             _ => { }
         }
         match it.content {
@@ -4562,6 +4850,9 @@ pub fn type_program_with_deps_pre_mono(raw_program: parser::Program, dep_prog: T
                         let mitems = match type_struct_methods(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
                         mut mi2 = 0
                         loop { if mi2 >= mitems.len { break }; items = teko::list::push(items, mitems[mi2]); mi2++ }
+                        let citems = match type_type_member_consts(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
+                        mut ci2 = 0
+                        loop { if ci2 >= citems.len { break }; items = teko::list::push(items, citems[ci2]); ci2++ }
                     }
                     _ => { }
                 }
@@ -4632,6 +4923,7 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
         match it.content {
             parser::Function as f => { line = f.line; col = f.col }
             parser::TypeDecl as td => { line = td.line; col = td.col }
+            parser::ConstDecl as cd => { line = cd.line; col = cd.col }
             _ => { }
         }
         // a loose top-level Statement is typed directly so its node also feeds the virtual-main's
@@ -4664,6 +4956,9 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
                         let mitems = match type_struct_methods(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
                         mut mi2 = 0
                         loop { if mi2 >= mitems.len { break }; items = teko::list::push(items, mitems[mi2]); mi2++ }
+                        let citems = match type_type_member_consts(td, it.namespace, it.file, ienv, types) { []TItem as x => x; error as e => return e }
+                        mut ci2 = 0
+                        loop { if ci2 >= citems.len { break }; items = teko::list::push(items, citems[ci2]); ci2++ }
                     }
                     _ => { }
                 }
@@ -4674,5 +4969,6 @@ pub fn type_program(raw_program: parser::Program) -> TProgram | error {
     let lc = check_labels(mainbody, teko::list::empty(), false, teko::list::empty())   // W5-cf-2: validate labels in the virtual-main
     if lc.failed { return error { message = lc.message } }
     let tp = TProgram { items = items }
-    match monomorphize(tp, types) { TProgram as mp => mp; error as e => return e }
+    let mono = match monomorphize(tp, types) { TProgram as mp => mp; error as e => return e }
+    inline_consts(mono)
 }

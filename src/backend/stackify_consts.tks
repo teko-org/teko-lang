@@ -1,0 +1,629 @@
+/**
+ * The named wasm opcode/section constants for `stackify`: the wasm binary-
+ * format opcode, blocktype, export-kind, and mask constants the stackifier
+ * emits bodies from, plus the `WasmVType` value-type tag and its single
+ * wire-byte translation point, split out as a sibling of the same `backend`
+ * namespace. The golden-byte tests in `stackify.tks`'s test corpus pin
+ * every value.
+ */
+
+/**
+ * WasmVType — the four wasm value types `stackify` ever produces: `I32`
+ * (the valtype every sub-32 integer width — `I8`/`I16`/`I32` — and `Ptr`
+ * collapse to in wasm32, `backend-c1-wasm.md` §1.1), `I64`, `F32`, `F64`.
+ * The declaration ordinal (0,1,2,3) does NOT match the wasm binary format's
+ * own value-type bytes (`0x7F`/`0x7E`/`0x7D`/`0x7C`), so every internal
+ * comparison/dispatch uses this enum directly — `wasm_vtype_wire` is the
+ * single translation point that produces the raw wire byte.
+ */
+pub type WasmVType = enum { I32; I64; F32; F64 }
+
+/**
+ * wasm_vtype_wire — the wasm binary value-type byte (`backend-c1-wasm.md`
+ * §1.1) a `WasmVType` tag encodes to: `I32` → `0x7F`, `I64` → `0x7E`, `F32`
+ * → `0x7D`, `F64` → `0x7C`. The single wire-mapping function for this
+ * family (§594 crumb 10's `_wire` convention) — every other site in this
+ * file operates on the `WasmVType` tag, or on the already-produced wire
+ * byte threaded through `WasmVTypeTable`/`WasmMemOp`/`WasmLocalGroup`.
+ *
+ * @param v  the value-type tag
+ * @return   the wasm value-type byte
+ */
+fn wasm_vtype_wire(v: WasmVType) -> u8 {
+    match v {
+        I32 => 0x7F to u8
+        I64 => 0x7E to u8
+        F32 => 0x7D to u8
+        F64 => 0x7C to u8
+    }
+}
+
+/**
+ * WASM_OP_UNREACHABLE — the wasm `unreachable` opcode: traps the instance
+ * immediately (§8's "observe, then trap" shape, M.1). The first of this
+ * file's whole §7.3 W15 sweep (crumb S1) of named opcode/format-byte
+ * constants below: each is named `WASM_OP_<mnemonic>` (an instruction) or
+ * `WASM_<FORMAT>_<name>` (a structural byte that is not itself an
+ * instruction — a blocktype or an export-kind tag), and its value is EXACTLY
+ * the wasm binary-format byte the wasm core spec (or, for the two export
+ * kinds, the object-format `WasmExport.kind` convention already documented
+ * in `objfile_wasm.tks`) assigns it — only the SOURCE SPELLING changes;
+ * every emitted byte stays identical (fixpoint + the golden-byte tests below
+ * prove it).
+ */
+const WASM_OP_UNREACHABLE: byte = 0x00 to byte
+
+/**
+ * WASM_OP_BLOCK — the wasm `block` opcode (a forward-exit structured-control
+ * scope, §3.3).
+ */
+const WASM_OP_BLOCK: byte = 0x02 to byte
+
+/**
+ * WASM_OP_LOOP — the wasm `loop` opcode (a back-edge/continue structured-
+ * control scope, §3.3).
+ */
+const WASM_OP_LOOP: byte = 0x03 to byte
+
+/**
+ * WASM_OP_IF — the wasm `if` opcode (a structural diamond scope, §3.3).
+ */
+const WASM_OP_IF: byte = 0x04 to byte
+
+/**
+ * WASM_OP_ELSE — the wasm `else` opcode separating an `if`'s then-arm from
+ * its else-arm.
+ */
+const WASM_OP_ELSE: byte = 0x05 to byte
+
+/**
+ * WASM_OP_END — the wasm `end` opcode: closes the innermost open `block`/
+ * `loop`/`if` scope, or terminates a function's own code-entry body.
+ */
+const WASM_OP_END: byte = 0x0B to byte
+
+/**
+ * WASM_OP_BR — the wasm unconditional `br` opcode (a relative scope-depth
+ * branch, §3.3).
+ */
+const WASM_OP_BR: byte = 0x0C to byte
+
+/**
+ * WASM_OP_RETURN — the wasm `return` opcode: exits the current function,
+ * carrying its own result (if any) already on the operand stack.
+ */
+const WASM_OP_RETURN: byte = 0x0F to byte
+
+/**
+ * WASM_OP_CALL — the wasm `call` opcode (a direct call by function index).
+ */
+const WASM_OP_CALL: byte = 0x10 to byte
+
+/**
+ * WASM_OP_DROP — the wasm `drop` opcode: discards the top operand-stack
+ * value without binding it anywhere.
+ */
+const WASM_OP_DROP: byte = 0x1A to byte
+
+/**
+ * WASM_OP_LOCAL_GET — the wasm `local.get` opcode.
+ */
+const WASM_OP_LOCAL_GET: byte = 0x20 to byte
+
+/**
+ * WASM_OP_LOCAL_SET — the wasm `local.set` opcode.
+ */
+const WASM_OP_LOCAL_SET: byte = 0x21 to byte
+
+/**
+ * WASM_OP_LOCAL_TEE — the wasm `local.tee` opcode: sets the local like
+ * `local.set`, but leaves the value on the operand stack too.
+ */
+const WASM_OP_LOCAL_TEE: byte = 0x22 to byte
+
+/**
+ * WASM_OP_GLOBAL_GET — the wasm `global.get` opcode.
+ */
+const WASM_OP_GLOBAL_GET: byte = 0x23 to byte
+
+/**
+ * WASM_OP_GLOBAL_SET — the wasm `global.set` opcode.
+ */
+const WASM_OP_GLOBAL_SET: byte = 0x24 to byte
+
+/**
+ * WASM_OP_I32_LOAD — the wasm `i32.load` opcode (natural 4-byte alignment).
+ */
+const WASM_OP_I32_LOAD: byte = 0x28 to byte
+
+/**
+ * WASM_OP_I64_LOAD — the wasm `i64.load` opcode (natural 8-byte alignment).
+ */
+const WASM_OP_I64_LOAD: byte = 0x29 to byte
+
+/**
+ * WASM_OP_F32_LOAD — the wasm `f32.load` opcode.
+ */
+const WASM_OP_F32_LOAD: byte = 0x2A to byte
+
+/**
+ * WASM_OP_F64_LOAD — the wasm `f64.load` opcode.
+ */
+const WASM_OP_F64_LOAD: byte = 0x2B to byte
+
+/**
+ * WASM_OP_I32_LOAD8_S — the wasm `i32.load8_s` opcode: a byte-width load,
+ * zero-extended into the shared `i32` family (`wasm_mem_op`'s own
+ * "load zero-extending" convention — never a real sign-extend here).
+ */
+const WASM_OP_I32_LOAD8_S: byte = 0x2D to byte
+
+/**
+ * WASM_OP_I32_LOAD16_S — the wasm `i32.load16_s` opcode: a halfword-width
+ * load, zero-extended into the shared `i32` family (mirrors
+ * `WASM_OP_I32_LOAD8_S`'s own convention).
+ */
+const WASM_OP_I32_LOAD16_S: byte = 0x2F to byte
+
+/**
+ * WASM_OP_I32_STORE — the wasm `i32.store` opcode.
+ */
+const WASM_OP_I32_STORE: byte = 0x36 to byte
+
+/**
+ * WASM_OP_I64_STORE — the wasm `i64.store` opcode.
+ */
+const WASM_OP_I64_STORE: byte = 0x37 to byte
+
+/**
+ * WASM_OP_F32_STORE — the wasm `f32.store` opcode.
+ */
+const WASM_OP_F32_STORE: byte = 0x38 to byte
+
+/**
+ * WASM_OP_F64_STORE — the wasm `f64.store` opcode.
+ */
+const WASM_OP_F64_STORE: byte = 0x39 to byte
+
+/**
+ * WASM_OP_I32_STORE8 — the wasm `i32.store8` opcode (a byte-width store).
+ */
+const WASM_OP_I32_STORE8: byte = 0x3A to byte
+
+/**
+ * WASM_OP_I32_STORE16 — the wasm `i32.store16` opcode (a halfword-width
+ * store).
+ */
+const WASM_OP_I32_STORE16: byte = 0x3B to byte
+
+/**
+ * WASM_OP_I32_CONST — the wasm `i32.const` opcode (followed by a SLEB128
+ * immediate).
+ */
+const WASM_OP_I32_CONST: byte = 0x41 to byte
+
+/**
+ * WASM_OP_I64_CONST — the wasm `i64.const` opcode (followed by a SLEB128
+ * immediate).
+ */
+const WASM_OP_I64_CONST: byte = 0x42 to byte
+
+/**
+ * WASM_OP_F64_CONST — the wasm `f64.const` opcode (followed by the raw
+ * 8-byte little-endian IEEE754 binary64 pattern, NOT LEB128-encoded).
+ */
+const WASM_OP_F64_CONST: byte = 0x44 to byte
+
+/**
+ * WASM_OP_I32_EQ — the wasm `i32.eq` opcode.
+ */
+const WASM_OP_I32_EQ: byte = 0x46 to byte
+
+/**
+ * WASM_OP_I32_NE — the wasm `i32.ne` opcode.
+ */
+const WASM_OP_I32_NE: byte = 0x47 to byte
+
+/**
+ * WASM_OP_I32_LT_S — the wasm `i32.lt_s` opcode.
+ */
+const WASM_OP_I32_LT_S: byte = 0x48 to byte
+
+/**
+ * WASM_OP_I32_LT_U — the wasm `i32.lt_u` opcode.
+ */
+const WASM_OP_I32_LT_U: byte = 0x49 to byte
+
+/**
+ * WASM_OP_I32_GT_S — the wasm `i32.gt_s` opcode.
+ */
+const WASM_OP_I32_GT_S: byte = 0x4A to byte
+
+/**
+ * WASM_OP_I32_GT_U — the wasm `i32.gt_u` opcode.
+ */
+const WASM_OP_I32_GT_U: byte = 0x4B to byte
+
+/**
+ * WASM_OP_I32_LE_S — the wasm `i32.le_s` opcode.
+ */
+const WASM_OP_I32_LE_S: byte = 0x4C to byte
+
+/**
+ * WASM_OP_I32_LE_U — the wasm `i32.le_u` opcode.
+ */
+const WASM_OP_I32_LE_U: byte = 0x4D to byte
+
+/**
+ * WASM_OP_I32_GE_S — the wasm `i32.ge_s` opcode.
+ */
+const WASM_OP_I32_GE_S: byte = 0x4E to byte
+
+/**
+ * WASM_OP_I32_GE_U — the wasm `i32.ge_u` opcode.
+ */
+const WASM_OP_I32_GE_U: byte = 0x4F to byte
+
+/**
+ * WASM_OP_I64_EQ — the wasm `i64.eq` opcode.
+ */
+const WASM_OP_I64_EQ: byte = 0x51 to byte
+
+/**
+ * WASM_OP_I64_NE — the wasm `i64.ne` opcode.
+ */
+const WASM_OP_I64_NE: byte = 0x52 to byte
+
+/**
+ * WASM_OP_I64_LT_S — the wasm `i64.lt_s` opcode.
+ */
+const WASM_OP_I64_LT_S: byte = 0x53 to byte
+
+/**
+ * WASM_OP_I64_LT_U — the wasm `i64.lt_u` opcode.
+ */
+const WASM_OP_I64_LT_U: byte = 0x54 to byte
+
+/**
+ * WASM_OP_I64_GT_S — the wasm `i64.gt_s` opcode.
+ */
+const WASM_OP_I64_GT_S: byte = 0x55 to byte
+
+/**
+ * WASM_OP_I64_GT_U — the wasm `i64.gt_u` opcode.
+ */
+const WASM_OP_I64_GT_U: byte = 0x56 to byte
+
+/**
+ * WASM_OP_I64_LE_S — the wasm `i64.le_s` opcode.
+ */
+const WASM_OP_I64_LE_S: byte = 0x57 to byte
+
+/**
+ * WASM_OP_I64_LE_U — the wasm `i64.le_u` opcode.
+ */
+const WASM_OP_I64_LE_U: byte = 0x58 to byte
+
+/**
+ * WASM_OP_I64_GE_S — the wasm `i64.ge_s` opcode.
+ */
+const WASM_OP_I64_GE_S: byte = 0x59 to byte
+
+/**
+ * WASM_OP_I64_GE_U — the wasm `i64.ge_u` opcode.
+ */
+const WASM_OP_I64_GE_U: byte = 0x5A to byte
+
+/**
+ * WASM_OP_F32_EQ — the wasm `f32.eq` opcode.
+ */
+const WASM_OP_F32_EQ: byte = 0x5B to byte
+
+/**
+ * WASM_OP_F32_NE — the wasm `f32.ne` opcode.
+ */
+const WASM_OP_F32_NE: byte = 0x5C to byte
+
+/**
+ * WASM_OP_F32_LT — the wasm `f32.lt` opcode.
+ */
+const WASM_OP_F32_LT: byte = 0x5D to byte
+
+/**
+ * WASM_OP_F32_GT — the wasm `f32.gt` opcode.
+ */
+const WASM_OP_F32_GT: byte = 0x5E to byte
+
+/**
+ * WASM_OP_F32_LE — the wasm `f32.le` opcode.
+ */
+const WASM_OP_F32_LE: byte = 0x5F to byte
+
+/**
+ * WASM_OP_F32_GE — the wasm `f32.ge` opcode.
+ */
+const WASM_OP_F32_GE: byte = 0x60 to byte
+
+/**
+ * WASM_OP_F64_EQ — the wasm `f64.eq` opcode.
+ */
+const WASM_OP_F64_EQ: byte = 0x61 to byte
+
+/**
+ * WASM_OP_F64_NE — the wasm `f64.ne` opcode.
+ */
+const WASM_OP_F64_NE: byte = 0x62 to byte
+
+/**
+ * WASM_OP_F64_LT — the wasm `f64.lt` opcode.
+ */
+const WASM_OP_F64_LT: byte = 0x63 to byte
+
+/**
+ * WASM_OP_F64_GT — the wasm `f64.gt` opcode.
+ */
+const WASM_OP_F64_GT: byte = 0x64 to byte
+
+/**
+ * WASM_OP_F64_LE — the wasm `f64.le` opcode.
+ */
+const WASM_OP_F64_LE: byte = 0x65 to byte
+
+/**
+ * WASM_OP_F64_GE — the wasm `f64.ge` opcode.
+ */
+const WASM_OP_F64_GE: byte = 0x66 to byte
+
+/**
+ * WASM_OP_I32_ADD — the wasm `i32.add` opcode.
+ */
+const WASM_OP_I32_ADD: byte = 0x6A to byte
+
+/**
+ * WASM_OP_I32_SUB — the wasm `i32.sub` opcode.
+ */
+const WASM_OP_I32_SUB: byte = 0x6B to byte
+
+/**
+ * WASM_OP_I32_MUL — the wasm `i32.mul` opcode.
+ */
+const WASM_OP_I32_MUL: byte = 0x6C to byte
+
+/**
+ * WASM_OP_I32_DIV_S — the wasm `i32.div_s` opcode.
+ */
+const WASM_OP_I32_DIV_S: byte = 0x6D to byte
+
+/**
+ * WASM_OP_I32_DIV_U — the wasm `i32.div_u` opcode.
+ */
+const WASM_OP_I32_DIV_U: byte = 0x6E to byte
+
+/**
+ * WASM_OP_I32_REM_S — the wasm `i32.rem_s` opcode.
+ */
+const WASM_OP_I32_REM_S: byte = 0x6F to byte
+
+/**
+ * WASM_OP_I32_REM_U — the wasm `i32.rem_u` opcode.
+ */
+const WASM_OP_I32_REM_U: byte = 0x70 to byte
+
+/**
+ * WASM_OP_I32_AND — the wasm `i32.and` opcode.
+ */
+const WASM_OP_I32_AND: byte = 0x71 to byte
+
+/**
+ * WASM_OP_I32_OR — the wasm `i32.or` opcode.
+ */
+const WASM_OP_I32_OR: byte = 0x72 to byte
+
+/**
+ * WASM_OP_I32_XOR — the wasm `i32.xor` opcode.
+ */
+const WASM_OP_I32_XOR: byte = 0x73 to byte
+
+/**
+ * WASM_OP_I32_SHL — the wasm `i32.shl` opcode.
+ */
+const WASM_OP_I32_SHL: byte = 0x74 to byte
+
+/**
+ * WASM_OP_I32_SHR_S — the wasm `i32.shr_s` opcode.
+ */
+const WASM_OP_I32_SHR_S: byte = 0x75 to byte
+
+/**
+ * WASM_OP_I32_SHR_U — the wasm `i32.shr_u` opcode.
+ */
+const WASM_OP_I32_SHR_U: byte = 0x76 to byte
+
+/**
+ * WASM_OP_I64_ADD — the wasm `i64.add` opcode.
+ */
+const WASM_OP_I64_ADD: byte = 0x7C to byte
+
+/**
+ * WASM_OP_I64_SUB — the wasm `i64.sub` opcode.
+ */
+const WASM_OP_I64_SUB: byte = 0x7D to byte
+
+/**
+ * WASM_OP_I64_MUL — the wasm `i64.mul` opcode.
+ */
+const WASM_OP_I64_MUL: byte = 0x7E to byte
+
+/**
+ * WASM_OP_I64_DIV_S — the wasm `i64.div_s` opcode.
+ */
+const WASM_OP_I64_DIV_S: byte = 0x7F to byte
+
+/**
+ * WASM_OP_I64_DIV_U — the wasm `i64.div_u` opcode.
+ */
+const WASM_OP_I64_DIV_U: byte = 0x80 to byte
+
+/**
+ * WASM_OP_I64_REM_S — the wasm `i64.rem_s` opcode.
+ */
+const WASM_OP_I64_REM_S: byte = 0x81 to byte
+
+/**
+ * WASM_OP_I64_REM_U — the wasm `i64.rem_u` opcode.
+ */
+const WASM_OP_I64_REM_U: byte = 0x82 to byte
+
+/**
+ * WASM_OP_I64_AND — the wasm `i64.and` opcode.
+ */
+const WASM_OP_I64_AND: byte = 0x83 to byte
+
+/**
+ * WASM_OP_I64_OR — the wasm `i64.or` opcode.
+ */
+const WASM_OP_I64_OR: byte = 0x84 to byte
+
+/**
+ * WASM_OP_I64_XOR — the wasm `i64.xor` opcode.
+ */
+const WASM_OP_I64_XOR: byte = 0x85 to byte
+
+/**
+ * WASM_OP_I64_SHL — the wasm `i64.shl` opcode.
+ */
+const WASM_OP_I64_SHL: byte = 0x86 to byte
+
+/**
+ * WASM_OP_I64_SHR_S — the wasm `i64.shr_s` opcode.
+ */
+const WASM_OP_I64_SHR_S: byte = 0x87 to byte
+
+/**
+ * WASM_OP_I64_SHR_U — the wasm `i64.shr_u` opcode.
+ */
+const WASM_OP_I64_SHR_U: byte = 0x88 to byte
+
+/**
+ * WASM_OP_F32_NEG — the wasm `f32.neg` opcode.
+ */
+const WASM_OP_F32_NEG: byte = 0x8C to byte
+
+/**
+ * WASM_OP_F32_ADD — the wasm `f32.add` opcode.
+ */
+const WASM_OP_F32_ADD: byte = 0x92 to byte
+
+/**
+ * WASM_OP_F32_SUB — the wasm `f32.sub` opcode.
+ */
+const WASM_OP_F32_SUB: byte = 0x93 to byte
+
+/**
+ * WASM_OP_F32_MUL — the wasm `f32.mul` opcode.
+ */
+const WASM_OP_F32_MUL: byte = 0x94 to byte
+
+/**
+ * WASM_OP_F32_DIV — the wasm `f32.div` opcode.
+ */
+const WASM_OP_F32_DIV: byte = 0x95 to byte
+
+/**
+ * WASM_OP_F64_NEG — the wasm `f64.neg` opcode.
+ */
+const WASM_OP_F64_NEG: byte = 0x9A to byte
+
+/**
+ * WASM_OP_F64_ADD — the wasm `f64.add` opcode.
+ */
+const WASM_OP_F64_ADD: byte = 0xA0 to byte
+
+/**
+ * WASM_OP_F64_SUB — the wasm `f64.sub` opcode.
+ */
+const WASM_OP_F64_SUB: byte = 0xA1 to byte
+
+/**
+ * WASM_OP_F64_MUL — the wasm `f64.mul` opcode.
+ */
+const WASM_OP_F64_MUL: byte = 0xA2 to byte
+
+/**
+ * WASM_OP_F64_DIV — the wasm `f64.div` opcode.
+ */
+const WASM_OP_F64_DIV: byte = 0xA3 to byte
+
+/**
+ * WASM_OP_I32_WRAP_I64 — the wasm `i32.wrap_i64` opcode: narrows an `i64`
+ * to `i32` by truncating its high bits (the wasm32 checked-narrow's own
+ * final step, once the value is already known in-range).
+ */
+const WASM_OP_I32_WRAP_I64: byte = 0xA7 to byte
+
+/**
+ * WASM_OP_I32_TRUNC_F32_S — the wasm `i32.trunc_f32_s` opcode.
+ */
+const WASM_OP_I32_TRUNC_F32_S: byte = 0xA8 to byte
+
+/**
+ * WASM_OP_I32_TRUNC_F64_S — the wasm `i32.trunc_f64_s` opcode.
+ */
+const WASM_OP_I32_TRUNC_F64_S: byte = 0xAA to byte
+
+/**
+ * WASM_OP_I64_EXTEND_I32_U — the wasm `i64.extend_i32_u` opcode: widens an
+ * `i32` register-space `Ptr` value up to the uniform 8-byte on-disk `i64`
+ * shape (always lossless — an in-range wasm32 address is never negative).
+ */
+const WASM_OP_I64_EXTEND_I32_U: byte = 0xAD to byte
+
+/**
+ * WASM_OP_F32_DEMOTE_F64 — the wasm `f32.demote_f64` opcode.
+ */
+const WASM_OP_F32_DEMOTE_F64: byte = 0xB6 to byte
+
+/**
+ * WASM_OP_F64_CONVERT_I32_S — the wasm `f64.convert_i32_s` opcode.
+ */
+const WASM_OP_F64_CONVERT_I32_S: byte = 0xB7 to byte
+
+/**
+ * WASM_OP_F64_CONVERT_I64_S — the wasm `f64.convert_i64_s` opcode.
+ */
+const WASM_OP_F64_CONVERT_I64_S: byte = 0xB9 to byte
+
+/**
+ * WASM_OP_F64_PROMOTE_F32 — the wasm `f64.promote_f32` opcode.
+ */
+const WASM_OP_F64_PROMOTE_F32: byte = 0xBB to byte
+
+/**
+ * WASM_BLOCKTYPE_VOID — the wasm `[] -> []` blocktype byte every `block`/
+ * `loop`/`if` in the MVP carries (no construct ever needs a value-type or
+ * type-index blocktype, §3).
+ */
+const WASM_BLOCKTYPE_VOID: byte = 0x40 to byte
+
+/**
+ * WASM_EXPORT_KIND_FUNC — the wasm export-section `kind` byte naming a
+ * function-index-space export (`objfile_wasm.tks`'s own `WasmExport.kind`
+ * convention).
+ */
+const WASM_EXPORT_KIND_FUNC: byte = 0x00 to byte
+
+/**
+ * WASM_EXPORT_KIND_MEMORY — the wasm export-section `kind` byte naming a
+ * memory-index-space export (the module's own `"memory"` export,
+ * `wasm_memory_export`).
+ */
+const WASM_EXPORT_KIND_MEMORY: byte = 0x02 to byte
+
+/**
+ * WASM_U64_LOW32_MASK — the low-32-bits mask an `f64.const`'s raw IEEE754
+ * bit pattern is split against before each 32-bit little-endian half is
+ * emitted (`sc_f64_bits`): `bits & WASM_U64_LOW32_MASK` isolates the low
+ * word, `bits >> 32` (untouched — a shift by exactly half of 64 needs no
+ * separate name) the high one.
+ */
+const WASM_U64_LOW32_MASK: u64 = 0xFFFFFFFF to u64

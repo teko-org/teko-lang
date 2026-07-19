@@ -173,10 +173,10 @@ fn reloc_word(w: u32, sym: str, kind: MRelocKind) -> EncWord {
  * @return []byte  `buf` followed by w's four little-endian bytes
  */
 pub fn emit_u32_le(buf: []byte, w: u32) -> []byte {
-    mut b = teko::list::push(buf, (w & (0xFF to u32)) to byte)
-    b = teko::list::push(b, ((w >> (8 to u32)) & (0xFF to u32)) to byte)
-    b = teko::list::push(b, ((w >> (16 to u32)) & (0xFF to u32)) to byte)
-    teko::list::push(b, ((w >> (24 to u32)) & (0xFF to u32)) to byte)
+    mut b = teko::list::push(buf, (w & ARM64_BYTE_MASK) to byte)
+    b = teko::list::push(b, ((w >> ((1 to u32) * ARM64_BITS_PER_BYTE)) & ARM64_BYTE_MASK) to byte)
+    b = teko::list::push(b, ((w >> ((2 to u32) * ARM64_BITS_PER_BYTE)) & ARM64_BYTE_MASK) to byte)
+    teko::list::push(b, ((w >> ((3 to u32) * ARM64_BITS_PER_BYTE)) & ARM64_BYTE_MASK) to byte)
 }
 
 /**
@@ -211,7 +211,7 @@ fn enc_rd(r: MReg) -> u32 {
  * @return u32  the register id placed in bits 5-9
  */
 fn enc_rn(r: MReg) -> u32 {
-    enc_reg(r) << (5 to u32)
+    enc_reg(r) << ARM64_RN_SHIFT
 }
 
 /**
@@ -222,7 +222,7 @@ fn enc_rn(r: MReg) -> u32 {
  * @return u32  the register id placed in bits 16-20
  */
 fn enc_rm(r: MReg) -> u32 {
-    enc_reg(r) << (16 to u32)
+    enc_reg(r) << ARM64_RM_SHIFT
 }
 
 /**
@@ -233,7 +233,7 @@ fn enc_rm(r: MReg) -> u32 {
  * @return u32  the register id placed in bits 10-14
  */
 fn enc_ra(r: MReg) -> u32 {
-    enc_reg(r) << (10 to u32)
+    enc_reg(r) << ARM64_REG2_SHIFT
 }
 
 /**
@@ -245,7 +245,7 @@ fn enc_ra(r: MReg) -> u32 {
  * @return u32  `1 << 31` when wide, else 0
  */
 fn sf_bit(wide: bool) -> u32 {
-    if wide { (1 to u32) << (31 to u32) } else { 0 to u32 }
+    if wide { (1 to u32) << ARM64_SF_SHIFT } else { 0 to u32 }
 }
 
 /**
@@ -257,16 +257,16 @@ fn sf_bit(wide: bool) -> u32 {
  */
 fn cond_code(c: MCond) -> u32 {
     match c {
-        EQ => 0 to u32
-        NE => 1 to u32
-        LT => 11 to u32
-        LE => 13 to u32
-        GT => 12 to u32
-        GE => 10 to u32
-        LO => 3 to u32
-        LS => 9 to u32
-        HI => 8 to u32
-        HS => 2 to u32
+        EQ => ARM64_COND_EQ
+        NE => ARM64_COND_NE
+        LT => ARM64_COND_LT
+        LE => ARM64_COND_LE
+        GT => ARM64_COND_GT
+        GE => ARM64_COND_GE
+        LO => ARM64_COND_LO
+        LS => ARM64_COND_LS
+        HI => ARM64_COND_HI
+        HS => ARM64_COND_HS
     }
 }
 
@@ -330,17 +330,17 @@ fn honest_bigframe() -> error {
  */
 fn alu_reg_base(op: MAluOp) -> u32 {
     match op {
-        Add => 0x0B000000 to u32
-        Sub => 0x4B000000 to u32
-        Mul => 0x1B007C00 to u32
-        Sdiv => 0x1AC00C00 to u32
-        Udiv => 0x1AC00800 to u32
-        And => 0x0A000000 to u32
-        Orr => 0x2A000000 to u32
-        Eor => 0x4A000000 to u32
-        Lsl => 0x1AC02000 to u32
-        Asr => 0x1AC02800 to u32
-        Lsr => 0x1AC02400 to u32
+        Add => ARM64_ADD_REG
+        Sub => ARM64_SUB_REG
+        Mul => ARM64_MADD_REG
+        Sdiv => ARM64_SDIV_REG
+        Udiv => ARM64_UDIV_REG
+        And => ARM64_AND_REG
+        Orr => ARM64_ORR_REG
+        Eor => ARM64_EOR_REG
+        Lsl => ARM64_LSLV_REG
+        Asr => ARM64_ASRV_REG
+        Lsr => ARM64_LSRV_REG
     }
 }
 
@@ -356,8 +356,8 @@ fn alu_reg_base(op: MAluOp) -> u32 {
  */
 fn add_sub_imm_base(op: MAluOp, negative: bool) -> u32 | error {
     match op {
-        Add => if negative { 0x51000000 to u32 } else { 0x11000000 to u32 }
-        Sub => if negative { 0x11000000 to u32 } else { 0x51000000 to u32 }
+        Add => if negative { ARM64_SUB_IMM_BASE } else { ARM64_ADD_IMM_BASE }
+        Sub => if negative { ARM64_ADD_IMM_BASE } else { ARM64_SUB_IMM_BASE }
         _ => honest_bigimm()
     }
 }
@@ -373,12 +373,12 @@ fn add_sub_imm_base(op: MAluOp, negative: bool) -> u32 | error {
  */
 fn ext_base(op: MExtOp) -> u32 {
     match op {
-        Sxtb => 0x93401C00 to u32
-        Sxth => 0x93403C00 to u32
-        Sxtw => 0x93407C00 to u32
-        Uxtb => 0x53001C00 to u32
-        Uxth => 0x53003C00 to u32
-        Uxtw => 0xD3407C00 to u32
+        Sxtb => ARM64_SXTB
+        Sxth => ARM64_SXTH
+        Sxtw => ARM64_SXTW
+        Uxtb => ARM64_UXTB
+        Uxth => ARM64_UXTH
+        Uxtw => ARM64_UXTW
     }
 }
 
@@ -394,10 +394,10 @@ fn ext_base(op: MExtOp) -> u32 {
  */
 fn load_form(size: MMemSize, sign: bool) -> MemForm | error {
     match size {
-        B => MemForm { base = if sign { 0x39800000 to u32 } else { 0x39400000 to u32 }; scale = 1 to u32 }
-        H => MemForm { base = if sign { 0x79800000 to u32 } else { 0x79400000 to u32 }; scale = 2 to u32 }
-        W => MemForm { base = if sign { 0xB9800000 to u32 } else { 0xB9400000 to u32 }; scale = 4 to u32 }
-        X => MemForm { base = 0xF9400000 to u32; scale = 8 to u32 }
+        B => MemForm { base = if sign { ARM64_LDRSB } else { ARM64_LDRB }; scale = ARM64_SCALE_B }
+        H => MemForm { base = if sign { ARM64_LDRSH } else { ARM64_LDRH }; scale = ARM64_SCALE_H }
+        W => MemForm { base = if sign { ARM64_LDRSW } else { ARM64_LDR_W }; scale = ARM64_SCALE_W }
+        X => MemForm { base = ARM64_LDR_X; scale = ARM64_SCALE_X }
         S => honest_fp()
         D => honest_fp()
     }
@@ -413,10 +413,10 @@ fn load_form(size: MMemSize, sign: bool) -> MemForm | error {
  */
 fn store_form(size: MMemSize) -> MemForm | error {
     match size {
-        B => MemForm { base = 0x39000000 to u32; scale = 1 to u32 }
-        H => MemForm { base = 0x79000000 to u32; scale = 2 to u32 }
-        W => MemForm { base = 0xB9000000 to u32; scale = 4 to u32 }
-        X => MemForm { base = 0xF9000000 to u32; scale = 8 to u32 }
+        B => MemForm { base = ARM64_STRB; scale = ARM64_SCALE_B }
+        H => MemForm { base = ARM64_STRH; scale = ARM64_SCALE_H }
+        W => MemForm { base = ARM64_STR_W; scale = ARM64_SCALE_W }
+        X => MemForm { base = ARM64_STR_X; scale = ARM64_SCALE_X }
         S => honest_fp()
         D => honest_fp()
     }
@@ -437,7 +437,7 @@ fn scaled_offset(offset: i32, scale: u32) -> u32 | error {
     let uoff = offset to u32
     if (uoff % scale) != (0 to u32) { return honest_ldur() }
     let imm = uoff / scale
-    if imm > (4095 to u32) { return honest_ldur() }
+    if imm > ARM64_IMM12_FIELD_MAX { return honest_ldur() }
     imm
 }
 
@@ -460,14 +460,14 @@ fn encode_alu(i: MAlu) -> EncWord {
  * @return EncWord | error  the encoded word, or a named honest-stop
  */
 fn encode_alu_imm(i: MAluImm) -> EncWord | error {
-    let hi = 4095 to i64
+    let hi = ARM64_IMM12_MAX
     let lo = (0 to i64) - hi
     if i.imm > hi { return honest_bigimm() }
     if i.imm < lo { return honest_bigimm() }
     let neg = i.imm < (0 to i64)
     let base = match add_sub_imm_base(i.op, neg) { u32 as b => b; error as e => return e }
     let mag = if neg { (0 to i64) - i.imm } else { i.imm }
-    let field = ((mag to u32) & (0xFFF to u32)) << (10 to u32)
+    let field = ((mag to u32) & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT
     plain_word(base | sf_bit(i.wide) | field | enc_rn(i.a) | enc_rd(i.dst))
 }
 
@@ -479,8 +479,7 @@ fn encode_alu_imm(i: MAluImm) -> EncWord | error {
  * @return EncWord  the encoded word
  */
 fn encode_msub(i: MMSub) -> EncWord {
-    let base = 0x1B008000 to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.b) | enc_ra(i.c) | enc_rn(i.a) | enc_rd(i.dst))
+    plain_word(ARM64_MSUB_REG | sf_bit(i.wide) | enc_rm(i.b) | enc_ra(i.c) | enc_rn(i.a) | enc_rd(i.dst))
 }
 
 /**
@@ -491,8 +490,7 @@ fn encode_msub(i: MMSub) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_neg(i: MNeg) -> EncWord {
-    let base = 0x4B0003E0 to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
+    plain_word(ARM64_NEG_REG | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
 }
 
 /**
@@ -503,8 +501,7 @@ fn encode_neg(i: MNeg) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_mvn(i: MMvn) -> EncWord {
-    let base = 0x2A2003E0 to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
+    plain_word(ARM64_MVN_REG | sf_bit(i.wide) | enc_rm(i.a) | enc_rd(i.dst))
 }
 
 /**
@@ -515,8 +512,7 @@ fn encode_mvn(i: MMvn) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_cmp(i: MCmp) -> EncWord {
-    let base = 0x6B00001F to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.b) | enc_rn(i.a))
+    plain_word(ARM64_CMP_REG | sf_bit(i.wide) | enc_rm(i.b) | enc_rn(i.a))
 }
 
 /**
@@ -528,12 +524,11 @@ fn encode_cmp(i: MCmp) -> EncWord {
  * @return EncWord | error  the encoded word, or the `A4-bigimm` honest-stop
  */
 fn encode_cmp_imm(i: MCmpImm) -> EncWord | error {
-    let hi = 4095 to i64
+    let hi = ARM64_IMM12_MAX
     if i.imm > hi { return honest_bigimm() }
     if i.imm < (0 to i64) { return honest_bigimm() }
-    let base = 0x7100001F to u32
-    let field = ((i.imm to u32) & (0xFFF to u32)) << (10 to u32)
-    plain_word(base | sf_bit(i.wide) | field | enc_rn(i.a))
+    let field = ((i.imm to u32) & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT
+    plain_word(ARM64_CMP_IMM_BASE | sf_bit(i.wide) | field | enc_rn(i.a))
 }
 
 /**
@@ -545,9 +540,8 @@ fn encode_cmp_imm(i: MCmpImm) -> EncWord | error {
  * @return EncWord  the encoded word
  */
 fn encode_cset(i: MCSet) -> EncWord {
-    let base = 0x1A9F07E0 to u32
-    let field = ((cond_code(i.cond) ^ (1 to u32)) & (0xF to u32)) << (12 to u32)
-    plain_word(base | sf_bit(i.wide) | field | enc_rd(i.dst))
+    let field = ((cond_code(i.cond) ^ (1 to u32)) & ARM64_COND_MASK) << ARM64_COND_SHIFT
+    plain_word(ARM64_CSET_REG | sf_bit(i.wide) | field | enc_rd(i.dst))
 }
 
 /**
@@ -562,8 +556,8 @@ fn encode_cset(i: MCSet) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_movi(base: u32, wide: bool, dst: MReg, imm16: u32, shift: u32) -> EncWord {
-    let hw = (shift / (16 to u32)) << (21 to u32)
-    let imm = (imm16 & (0xFFFF to u32)) << (5 to u32)
+    let hw = (shift / ARM64_MOVI_LANE_BITS) << ARM64_MOVI_HW_SHIFT
+    let imm = (imm16 & ARM64_IMM16_MASK) << ARM64_MOVI_IMM16_SHIFT
     plain_word(base | sf_bit(wide) | hw | imm | enc_rd(dst))
 }
 
@@ -574,7 +568,7 @@ fn encode_movi(base: u32, wide: bool, dst: MReg, imm16: u32, shift: u32) -> EncW
  * @return EncWord  the encoded word
  */
 fn encode_movz(i: MMovZ) -> EncWord {
-    encode_movi(0x52800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+    encode_movi(ARM64_MOVZ, i.wide, i.dst, i.imm16, i.shift)
 }
 
 /**
@@ -585,7 +579,7 @@ fn encode_movz(i: MMovZ) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_movk(i: MMovK) -> EncWord {
-    encode_movi(0x72800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+    encode_movi(ARM64_MOVK, i.wide, i.dst, i.imm16, i.shift)
 }
 
 /**
@@ -595,7 +589,7 @@ fn encode_movk(i: MMovK) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_movn(i: MMovN) -> EncWord {
-    encode_movi(0x12800000 to u32, i.wide, i.dst, i.imm16, i.shift)
+    encode_movi(ARM64_MOVN, i.wide, i.dst, i.imm16, i.shift)
 }
 
 /**
@@ -606,8 +600,7 @@ fn encode_movn(i: MMovN) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_mov(i: MMov) -> EncWord {
-    let base = 0x2A0003E0 to u32
-    plain_word(base | sf_bit(i.wide) | enc_rm(i.src) | enc_rd(i.dst))
+    plain_word(ARM64_MOV_REG | sf_bit(i.wide) | enc_rm(i.src) | enc_rd(i.dst))
 }
 
 /**
@@ -632,7 +625,7 @@ fn encode_ext(i: MExt) -> EncWord {
 fn encode_load(i: MLoad) -> EncWord | error {
     let form = match load_form(i.size, i.sign) { MemForm as f => f; error as e => return e }
     let imm = match scaled_offset(i.mem.offset, form.scale) { u32 as v => v; error as e => return e }
-    let field = (imm & (0xFFF to u32)) << (10 to u32)
+    let field = (imm & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT
     plain_word(form.base | field | enc_rn(i.mem.base) | enc_rd(i.dst))
 }
 
@@ -647,7 +640,7 @@ fn encode_load(i: MLoad) -> EncWord | error {
 fn encode_store(i: MStore) -> EncWord | error {
     let form = match store_form(i.size) { MemForm as f => f; error as e => return e }
     let imm = match scaled_offset(i.mem.offset, form.scale) { u32 as v => v; error as e => return e }
-    let field = (imm & (0xFFF to u32)) << (10 to u32)
+    let field = (imm & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT
     plain_word(form.base | field | enc_rn(i.mem.base) | enc_rd(i.src))
 }
 
@@ -659,8 +652,7 @@ fn encode_store(i: MStore) -> EncWord | error {
  * @return EncWord  the branch-flagged placeholder word
  */
 fn encode_branch(i: MBranch) -> EncWord {
-    let base = 0x14000000 to u32
-    branch_word(base, i.target, 0 to u32)
+    branch_word(ARM64_B, i.target, 0 to u32)
 }
 
 /**
@@ -672,8 +664,7 @@ fn encode_branch(i: MBranch) -> EncWord {
  * @return EncWord  the branch-flagged placeholder word
  */
 fn encode_branch_cond(i: MBranchCond) -> EncWord {
-    let base = 0x54000000 to u32
-    let w = base | (cond_code(i.cond) & (0xF to u32))
+    let w = ARM64_BCOND | (cond_code(i.cond) & ARM64_COND_MASK)
     branch_word(w, i.target, 1 to u32)
 }
 
@@ -686,7 +677,7 @@ fn encode_branch_cond(i: MBranchCond) -> EncWord {
  * @return EncWord  the branch-flagged placeholder word
  */
 fn encode_cbz(i: MCbz) -> EncWord {
-    let base = if i.zero { 0x34000000 to u32 } else { 0x35000000 to u32 }
+    let base = if i.zero { ARM64_CBZ } else { ARM64_CBNZ }
     let w = base | sf_bit(i.wide) | enc_rd(i.a)
     branch_word(w, i.target, 1 to u32)
 }
@@ -700,8 +691,7 @@ fn encode_cbz(i: MCbz) -> EncWord {
  * @return EncWord  the reloc-flagged placeholder word
  */
 fn encode_call(i: MCall) -> EncWord {
-    let base = 0x94000000 to u32
-    reloc_word(base, i.sym, MRelocKind::Call)
+    reloc_word(ARM64_BL, i.sym, MRelocKind::Call)
 }
 
 /**
@@ -712,8 +702,7 @@ fn encode_call(i: MCall) -> EncWord {
  * @return EncWord  the encoded word
  */
 fn encode_call_indirect(i: MCallIndirect) -> EncWord {
-    let base = 0xD63F0000 to u32
-    plain_word(base | enc_rn(i.target))
+    plain_word(ARM64_BLR | enc_rn(i.target))
 }
 
 /**
@@ -725,8 +714,7 @@ fn encode_call_indirect(i: MCallIndirect) -> EncWord {
  * @return EncWord  the reloc-flagged placeholder word
  */
 fn encode_adrp(i: MAdrp) -> EncWord {
-    let base = 0x90000000 to u32
-    reloc_word(base | enc_rd(i.dst), i.sym, i.kind)
+    reloc_word(ARM64_ADRP | enc_rd(i.dst), i.sym, i.kind)
 }
 
 /**
@@ -738,8 +726,7 @@ fn encode_adrp(i: MAdrp) -> EncWord {
  * @return EncWord  the reloc-flagged placeholder word
  */
 fn encode_add_lo(i: MAddLo) -> EncWord {
-    let base = 0x91000000 to u32
-    reloc_word(base | enc_rn(i.a) | enc_rd(i.dst), i.sym, i.kind)
+    reloc_word(ARM64_ADD_IMM64_BASE | enc_rn(i.a) | enc_rd(i.dst), i.sym, i.kind)
 }
 
 /**
@@ -750,7 +737,7 @@ fn encode_add_lo(i: MAddLo) -> EncWord {
  * @return EncWord  the RET word
  */
 fn encode_ret() -> EncWord {
-    plain_word(0xD65F03C0 to u32)
+    plain_word(ARM64_RET)
 }
 
 /**
@@ -941,7 +928,7 @@ fn compute_slot_offsets(frame: []lir::LAlloca) -> SlotLayout {
         running = at + la.bytes
         i++
     }
-    SlotLayout { offsets = offsets; slots_size = align_up(running, 16 to u32) }
+    SlotLayout { offsets = offsets; slots_size = align_up(running, ARM64_STACK_ALIGN) }
 }
 
 /**
@@ -1061,7 +1048,7 @@ fn frame_total_size(slots_size: u32, saved: Saved, lr_save: bool) -> u32 {
     let n_saved = (saved.gpr.len + saved.fpr.len) to u32
     let framed = (slots_size > (0 to u32)) || (n_saved > (0 to u32)) || lr_save
     if !framed { return 0 to u32 }
-    align_up(slots_size + (n_saved * (8 to u32)) + (16 to u32), 16 to u32)
+    align_up(slots_size + (n_saved * ARM64_REG_BYTES) + ARM64_FP_LR_BYTES, ARM64_STACK_ALIGN)
 }
 
 /**
@@ -1109,7 +1096,7 @@ pub fn slot_offset(layout: FrameLayout, slot: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn sub_sp_imm_word(imm12: u32) -> u32 {
-    (0xD1000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | (31 to u32)
+    ARM64_SUB_IMM64_BASE | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ARM64_SP_ID
 }
 
 /**
@@ -1122,7 +1109,7 @@ fn sub_sp_imm_word(imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn add_sp_imm_word(dst_id: u32, imm12: u32) -> u32 {
-    (0x91000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | dst_id
+    ARM64_ADD_IMM64_BASE | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | dst_id
 }
 
 /**
@@ -1135,7 +1122,7 @@ fn add_sp_imm_word(dst_id: u32, imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn stp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
-    (0xA9000000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_STP_GPR64 | ((imm7 & ARM64_IMM7_MASK) << ARM64_IMM7_SHIFT) | (rb << ARM64_REG2_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1148,7 +1135,7 @@ fn stp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn ldp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
-    (0xA9400000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_LDP_GPR64 | ((imm7 & ARM64_IMM7_MASK) << ARM64_IMM7_SHIFT) | (rb << ARM64_REG2_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1160,7 +1147,7 @@ fn ldp_gpr(ra: u32, rb: u32, imm7: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn str_gpr_sp(ra: u32, imm12: u32) -> u32 {
-    (0xF9000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_STR_X | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1172,7 +1159,7 @@ fn str_gpr_sp(ra: u32, imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn ldr_gpr_sp(ra: u32, imm12: u32) -> u32 {
-    (0xF9400000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_LDR_X | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1185,7 +1172,7 @@ fn ldr_gpr_sp(ra: u32, imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn stp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
-    (0x6D000000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_STP_FPR64 | ((imm7 & ARM64_IMM7_MASK) << ARM64_IMM7_SHIFT) | (rb << ARM64_REG2_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1198,7 +1185,7 @@ fn stp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn ldp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
-    (0x6D400000 to u32) | ((imm7 & (0x7F to u32)) << (15 to u32)) | (rb << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_LDP_FPR64 | ((imm7 & ARM64_IMM7_MASK) << ARM64_IMM7_SHIFT) | (rb << ARM64_REG2_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1210,7 +1197,7 @@ fn ldp_fpr(ra: u32, rb: u32, imm7: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn str_fpr_sp(ra: u32, imm12: u32) -> u32 {
-    (0xFD000000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_STR_FPR64 | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1222,7 +1209,7 @@ fn str_fpr_sp(ra: u32, imm12: u32) -> u32 {
  * @return u32  the encoded instruction word
  */
 fn ldr_fpr_sp(ra: u32, imm12: u32) -> u32 {
-    (0xFD400000 to u32) | ((imm12 & (0xFFF to u32)) << (10 to u32)) | ((31 to u32) << (5 to u32)) | ra
+    ARM64_LDR_FPR64 | ((imm12 & ARM64_IMM12_MASK) << ARM64_IMM12_SHIFT) | (ARM64_SP_ID << ARM64_RN_SHIFT) | ra
 }
 
 /**
@@ -1283,13 +1270,13 @@ fn emit_frame_mem(words0: []u32, ids: []u32, base: u32, is_fpr: bool, is_store: 
     mut i: u64 = 0
     loop {
         if i >= ids.len { break }
-        let off = base + ((i to u32) * (8 to u32))
+        let off = base + ((i to u32) * ARM64_REG_BYTES)
         let has_pair = (i + 1) < ids.len
         if has_pair {
-            words = teko::list::push(words, pair_frame_word(ids[i], ids[i + 1], off / (8 to u32), is_fpr, is_store))
+            words = teko::list::push(words, pair_frame_word(ids[i], ids[i + 1], off / ARM64_REG_BYTES, is_fpr, is_store))
             i = i + 2
         } else {
-            words = teko::list::push(words, single_frame_word(ids[i], off / (8 to u32), is_fpr, is_store))
+            words = teko::list::push(words, single_frame_word(ids[i], off / ARM64_REG_BYTES, is_fpr, is_store))
             i = i + 1
         }
     }
@@ -1306,7 +1293,7 @@ fn emit_frame_mem(words0: []u32, ids: []u32, base: u32, is_fpr: bool, is_store: 
  */
 fn callee_base_offset(layout: FrameLayout) -> u32 {
     let n = (layout.saved_gpr.len + layout.saved_fpr.len) to u32
-    (layout.size - (16 to u32)) - (n * (8 to u32))
+    (layout.size - ARM64_FP_LR_BYTES) - (n * ARM64_REG_BYTES)
 }
 
 /**
@@ -1321,7 +1308,7 @@ fn callee_base_offset(layout: FrameLayout) -> u32 {
 fn emit_callee_area(words0: []u32, layout: FrameLayout, is_store: bool) -> []u32 {
     let base = callee_base_offset(layout)
     let after_gpr = emit_frame_mem(words0, layout.saved_gpr, base, false, is_store)
-    let fpr_base = base + ((layout.saved_gpr.len to u32) * (8 to u32))
+    let fpr_base = base + ((layout.saved_gpr.len to u32) * ARM64_REG_BYTES)
     emit_frame_mem(after_gpr, layout.saved_fpr, fpr_base, true, is_store)
 }
 
@@ -1335,7 +1322,7 @@ fn emit_callee_area(words0: []u32, layout: FrameLayout, is_store: bool) -> []u32
  * @return bool  true iff the frame's offsets are all encodable
  */
 fn frame_fits(layout: FrameLayout) -> bool {
-    ((layout.size - (16 to u32)) / (8 to u32)) <= (63 to u32)
+    ((layout.size - ARM64_FP_LR_BYTES) / ARM64_REG_BYTES) <= ARM64_IMM7_MAX_POS
 }
 
 /**
@@ -1353,11 +1340,11 @@ pub fn emit_prologue(layout: FrameLayout) -> []u32 | error {
         return none
     }
     if !frame_fits(layout) { return honest_bigframe() }
-    let top = layout.size - (16 to u32)
+    let top = layout.size - ARM64_FP_LR_BYTES
     mut words: []u32 = teko::list::empty()
     words = teko::list::push(words, sub_sp_imm_word(layout.size))
-    words = teko::list::push(words, stp_gpr(29 to u32, 30 to u32, top / (8 to u32)))
-    words = teko::list::push(words, add_sp_imm_word(29 to u32, top))
+    words = teko::list::push(words, stp_gpr(ARM64_FP_ID, ARM64_LR_ID, top / ARM64_REG_BYTES))
+    words = teko::list::push(words, add_sp_imm_word(ARM64_FP_ID, top))
     emit_callee_area(words, layout, true)
 }
 
@@ -1377,10 +1364,10 @@ pub fn emit_epilogue(layout: FrameLayout) -> []u32 | error {
         return none
     }
     if !frame_fits(layout) { return honest_bigframe() }
-    let top = layout.size - (16 to u32)
+    let top = layout.size - ARM64_FP_LR_BYTES
     mut words: []u32 = emit_callee_area(teko::list::empty(), layout, false)
-    words = teko::list::push(words, ldp_gpr(29 to u32, 30 to u32, top / (8 to u32)))
-    words = teko::list::push(words, add_sp_imm_word(31 to u32, layout.size))
+    words = teko::list::push(words, ldp_gpr(ARM64_FP_ID, ARM64_LR_ID, top / ARM64_REG_BYTES))
+    words = teko::list::push(words, add_sp_imm_word(ARM64_SP_ID, layout.size))
     words
 }
 
@@ -1396,7 +1383,7 @@ pub fn emit_epilogue(layout: FrameLayout) -> []u32 | error {
  */
 fn encode_frame_addr(layout: FrameLayout, i: MFrameAddr) -> EncWord | error {
     let off = slot_offset(layout, i.slot)
-    if off > (4095 to u32) { return honest_bigframe() }
+    if off > ARM64_IMM12_FIELD_MAX { return honest_bigframe() }
     plain_word(add_sp_imm_word(enc_reg(i.dst), off))
 }
 
@@ -1472,6 +1459,13 @@ pub type Reloc = struct {
      * BRANCH26).
      */
     kind: MRelocKind
+    /**
+     * sect — which section this relocation's patched field lives in (#594 T-B1):
+     * `Text` (the historical default — `offset` is `__text`-base-relative), or
+     * `Rodata` (a data→data pointer whose `offset` is rodata-base-relative,
+     * emitted only from T-B2 on). Every reloc the encoder builds today is `Text`.
+     */
+    sect: RelocSect
 }
 
 /**
@@ -1552,7 +1546,7 @@ fn honest_badblock() -> error {
  * @return bool  true iff it is encodable in imm26
  */
 fn imm26_fits(disp_words: i64) -> bool {
-    (disp_words >= ((0 to i64) - (33554432 to i64))) && (disp_words <= (33554431 to i64))
+    (disp_words >= ((0 to i64) - ARM64_IMM26_MIN_MAGNITUDE)) && (disp_words <= ARM64_IMM26_MAX)
 }
 
 /**
@@ -1563,7 +1557,7 @@ fn imm26_fits(disp_words: i64) -> bool {
  * @return bool  true iff it is encodable in imm19
  */
 fn imm19_fits(disp_words: i64) -> bool {
-    (disp_words >= ((0 to i64) - (262144 to i64))) && (disp_words <= (262143 to i64))
+    (disp_words >= ((0 to i64) - ARM64_IMM19_MIN_MAGNITUDE)) && (disp_words <= ARM64_IMM19_MAX)
 }
 
 /**
@@ -1601,10 +1595,10 @@ fn twos_field(disp_words: i64, bits: u32) -> u32 {
 fn branch_disp_field(disp_words: i64, form: u32) -> u32 | error {
     if form == (0 to u32) {
         if !imm26_fits(disp_words) { return honest_farbranch() }
-        return twos_field(disp_words, 26 to u32)
+        return twos_field(disp_words, ARM64_IMM26_BITS)
     }
     if !imm19_fits(disp_words) { return honest_farbranch() }
-    twos_field(disp_words, 19 to u32) << (5 to u32)
+    twos_field(disp_words, ARM64_IMM19_BITS) << ARM64_BCOND_IMM19_SHIFT
 }
 
 /**
@@ -1731,7 +1725,7 @@ fn finalize_func(symbol: str, words: []EncWord, offsets: []BlockOffset) -> Encod
         let w = match resolve_word(ew, i to u32, offsets) { u32 as v => v; error as e => return e }
         out_words = teko::list::push(out_words, w)
         if ew.has_reloc {
-            relocs = teko::list::push(relocs, Reloc { offset = (i to u32) * (4 to u32); sym = ew.reloc_sym; kind = ew.reloc_kind })
+            relocs = teko::list::push(relocs, Reloc { offset = (i to u32) * ARM64_WORD_BYTES; sym = ew.reloc_sym; kind = ew.reloc_kind; sect = RelocSect::Text })
         }
         i++
     }
@@ -1895,7 +1889,7 @@ fn rebase_relocs(acc: []Reloc, relocs: []Reloc, base: u32) -> []Reloc {
     loop {
         if i >= relocs.len { break }
         let r = relocs[i]
-        out = teko::list::push(out, Reloc { offset = r.offset + base; sym = r.sym; kind = r.kind })
+        out = teko::list::push(out, Reloc { offset = r.offset + base; sym = r.sym; kind = r.kind; sect = r.sect })
         i++
     }
     out
@@ -1958,7 +1952,7 @@ fn fold_func_into_text(abi: AbiDescriptor, acc: ModuleText, f: MFunc) -> ModuleT
     let text = append_words_le(acc.text, ef.words)
     let relocs = rebase_relocs(acc.relocs, ef.relocs, acc.base)
     let syms = teko::list::push(acc.syms, sym)
-    let base = acc.base + ((ef.words.len to u32) * (4 to u32))
+    let base = acc.base + ((ef.words.len to u32) * ARM64_WORD_BYTES)
     ModuleText { text = text; relocs = relocs; syms = syms; base = base }
 }
 
@@ -1998,6 +1992,16 @@ type ModuleRodata = struct {
      * syms — one defined `__const` symbol per rodata entry (section 2).
      */
     syms: []Symbol
+    /**
+     * relocs — the rodata-INTERNAL pointer relocations of every entry, REBASED to the
+     * concatenated `__const` image (each `LDataReloc.offset` becomes blob-base +
+     * field-offset; #594 T-B5). A NEUTRAL carrier (LIR-level, shared by the three
+     * encoders — this struct is namespace-shared): each `encode_module*` converts an
+     * entry to its own ISA reloc type with kind `Abs64` and `sect = Rodata`. EMPTY in
+     * every real compile until T-B6 (`serialize_const` honest-stops pointer-bearing
+     * aggregates), keeping every emitted object byte-identical.
+     */
+    relocs: []lir::LDataReloc
 }
 
 /**
@@ -2032,17 +2036,24 @@ fn append_bytes(buf: []byte, src: []byte) -> []byte {
 fn encode_rodata(rodata: []lir::LRodata) -> ModuleRodata {
     mut bytes: []byte = teko::list::empty()
     mut syms: []Symbol = teko::list::empty()
+    mut relocs: []lir::LDataReloc = teko::list::empty()
     mut off: u32 = 0
     mut i: u64 = 0
     loop {
         if i >= rodata.len { break }
         let rd = rodata[i]
         syms = teko::list::push(syms, Symbol { name = rd.symbol; defined = true; sect = 2 to u8; offset = off; local = true })
+        mut j: u64 = 0
+        loop {
+            if j >= rd.relocs.len { break }
+            relocs = teko::list::push(relocs, lir::data_reloc(off + rd.relocs[j].offset, rd.relocs[j].target))
+            j++
+        }
         bytes = append_bytes(bytes, rd.bytes)
         off = off + (rd.bytes.len to u32)
         i++
     }
-    ModuleRodata { bytes = bytes; syms = syms }
+    ModuleRodata { bytes = bytes; syms = syms; relocs = relocs }
 }
 
 /**
@@ -2108,6 +2119,48 @@ fn concat_symbols(a: []Symbol, b: []Symbol) -> []Symbol {
 }
 
 /**
+ * rodata_relocs_arm64 — convert the NEUTRAL rebased `ModuleRodata.relocs` into arm64
+ * `Reloc` rows (#594 T-B5): each rodata-internal pointer becomes an `Abs64`
+ * (ARM64_RELOC_UNSIGNED, r_length 3) relocation whose patch site is
+ * `__const`-relative (`sect = Rodata`), targeting the datum's own local symbol.
+ * Empty in every real compile until T-B6.
+ *
+ * @param []lir::LDataReloc rs  the rebased neutral rodata relocations
+ * @return []Reloc  the `Rodata`-tagged arm64 relocation rows
+ */
+fn rodata_relocs_arm64(rs: []lir::LDataReloc) -> []Reloc {
+    mut out: []Reloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= rs.len { break }
+        out = teko::list::push(out, Reloc { offset = rs[i].offset; sym = rs[i].target; kind = MRelocKind::Abs64; sect = RelocSect::Rodata })
+        i++
+    }
+    out
+}
+
+/**
+ * append_relocs_arm64 — concatenate two relocation lists (text-partition first, then the
+ * rodata-internal rows; #594 T-B5), preserving each list's emission order. The
+ * module keeps ONE `.sect`-tagged list (the T-B1..T-B3 model); the writers
+ * partition by `RelocSect`.
+ *
+ * @param a  the `__text`/`.text` relocations, in emission order
+ * @param b  the rodata-internal relocations, in emission order
+ * @return   `a` followed by `b`
+ */
+fn append_relocs_arm64(a: []Reloc, b: []Reloc) -> []Reloc {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
  * encode_module — encode every `MFunc` of `m`, concatenate their `__text` words
  * into the module image and REBASE each function's reloc offsets by its `__text`
  * base, intern the rodata bytes into `__const`, and build the symbol table in
@@ -2130,5 +2183,5 @@ pub fn encode_module(abi: AbiDescriptor, m: MModule) -> EncodedModule | error {
     let defined = concat_symbols(rod.syms, mt.syms)
     let undef = collect_undefined(defined, mt.relocs)
     let symbols = concat_symbols(defined, undef)
-    EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+    EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = append_relocs_arm64(mt.relocs, rodata_relocs_arm64(rod.relocs)) }
 }

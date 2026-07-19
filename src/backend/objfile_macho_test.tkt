@@ -71,7 +71,7 @@ fn mo_exit_module() -> MModule {
  * @return []byte  the Mach-O object bytes, or empty on error
  */
 fn mo_object_of(m: MModule) -> []byte {
-    match encode_module(aapcs64(), m) {
+    match encode_module(AAPCS64, m) {
         EncodedModule as x => emit_macho(x)
         error as e => teko::list::empty()
     }
@@ -207,8 +207,8 @@ fn symtab_defines_main_and_undefs_tk_exit() {
  */
 fn mo_rodata_module() -> MModule {
     let bytes = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), 0x68 to byte), 0x69 to byte), 0 to byte)
-    let rodata = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "s0"; bytes = bytes })
-    let funcs = teko::list::push(teko::list::empty(), mo_func("main", teko::list::push(teko::list::empty(), ret_inst())))
+    let rodata = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "s0"; bytes = bytes; relocs = teko::list::empty() })
+    let funcs = teko::list::push(teko::list::empty(), mo_func("main", teko::list::push(teko::list::empty(), RET_INST)))
     MModule { funcs = funcs; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
 }
 
@@ -303,6 +303,12 @@ fn reloc_kind_maps_to_arm64_types() {
     teko::assert::is_true(reloc_pcrel(MRelocKind::PageHi) == (1 to u32))
     teko::assert::is_true(reloc_pcrel(MRelocKind::PageLo) == (0 to u32))
     teko::assert::is_true(reloc_pcrel(MRelocKind::Call) == (1 to u32))
+    teko::assert::is_true(reloc_type_value(MRelocKind::Abs64) == (0 to u32))
+    teko::assert::is_true(reloc_pcrel(MRelocKind::Abs64) == (0 to u32))
+    teko::assert::is_true(reloc_length(MRelocKind::Abs64) == (3 to u32))
+    teko::assert::is_true(reloc_length(MRelocKind::Call) == (2 to u32))
+    teko::assert::is_true(reloc_length(MRelocKind::PageHi) == (2 to u32))
+    teko::assert::is_true(reloc_length(MRelocKind::PageLo) == (2 to u32))
 }
 
 #test
@@ -339,7 +345,7 @@ fn pad_to_mult_rounds_up() {
 fn mo_rodata_reloc_module() -> MModule {
     let insts = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), adrp_inst(mo_gpr(0), "s0", MRelocKind::PageHi)), add_lo_inst(mo_gpr(0), mo_gpr(0), "s0", MRelocKind::PageLo)), call_inst("tk_exit", mo_no_uses(), mo_gpr(0), false, false))
     let bytes = teko::list::push(teko::list::push(teko::list::empty(), 0x41 to byte), 0 to byte)
-    let rodata = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "s0"; bytes = bytes })
+    let rodata = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "s0"; bytes = bytes; relocs = teko::list::empty() })
     let funcs = teko::list::push(teko::list::empty(), mo_func("main", insts))
     MModule { funcs = funcs; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
 }
@@ -360,7 +366,7 @@ fn mo_rodata_reloc_module() -> MModule {
  * @return void
  */
 fn rodata_reloc_module_pins_symtab_and_page_relocs() {
-    let enc = match encode_module(aapcs64(), mo_rodata_reloc_module()) {
+    let enc = match encode_module(AAPCS64, mo_rodata_reloc_module()) {
         EncodedModule as x => x
         error as e => bad_enc()
     }
@@ -411,7 +417,7 @@ fn bad_enc() -> EncodedModule {
  * @return void
  */
 fn empty_module_emits_a_minimal_valid_object() {
-    let enc = match encode_module(aapcs64(), empty_mmodule()) {
+    let enc = match encode_module(AAPCS64, empty_mmodule()) {
         EncodedModule as x => x
         error as e => bad_enc()
     }
@@ -431,3 +437,68 @@ fn empty_module_emits_a_minimal_valid_object() {
     teko::assert::is_true(obj[312] == (0 to byte))
 }
 
+/**
+ * mo_rodata_ptr_enc — a hand-built `EncodedModule` with no functions and a 16-byte
+ * `__const` = an 8-byte pointer slot (offset 0) then the target datum `0x41` (offset
+ * 8), plus a single `Abs64`/`Rodata` relocation at `__const` offset 0 targeting the
+ * `target` local. Feeds `emit_macho` directly (`encode_module` honest-stops a
+ * rodata-internal pointer), pinning the `__const` relocation the T-B3 writer emits.
+ *
+ * @return EncodedModule  the hand-built rodata-internal-pointer module
+ */
+fn mo_rodata_ptr_enc() -> EncodedModule {
+    let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
+    let ptr = Symbol { name = "ptr"; defined = true; sect = 2 to u8; offset = 0 to u32; local = true }
+    let target = Symbol { name = "target"; defined = true; sect = 2 to u8; offset = 8 to u32; local = true }
+    let rr = Reloc { offset = 0 to u32; sym = "target"; kind = MRelocKind::Abs64; sect = RelocSect::Rodata }
+    EncodedModule { text = teko::list::empty(); rodata = rodata; symbols = [ptr, target]; relocs = [rr] }
+}
+
+/**
+ * T-B3: com um data→data reloc presente, o `__const` section_64 aponta a sua própria
+ * relocation table (reloff/nreloc) e a entrada UNSIGNED (r_length=3, extern, symnum
+ * do datum-alvo) sai contígua após a tabela (vazia) do `__text`; o slot in-place
+ * permanece 0 (o addend da UNSIGNED externa é 0).
+ */
+#test
+fn tb3_macho_const_reloc_emitted() {
+    let obj = emit_macho(mo_rodata_ptr_enc())
+    teko::assert::is_true(obj.len == 462)
+    teko::assert::is_true(mo_u32_at(obj, 96) == 2)
+    teko::assert::is_true(mo_u32_at(obj, 240) == 408)
+    teko::assert::is_true(mo_u32_at(obj, 244) == 1)
+    teko::assert::is_true(mo_u32_at(obj, 408) == 0)
+    teko::assert::is_true(mo_u32_at(obj, 412) == 0x0E000001)
+    teko::assert::is_true(obj[392] == (0 to byte))
+    teko::assert::is_true(obj[400] == (0x41 to byte))
+}
+
+/**
+ * T-B3: o MESMO objeto sem relocs colapsa ao formato histórico — `__const` com
+ * reloff/nreloc = 0 e nenhuma segunda tabela (byte-identidade do braço vazio).
+ */
+#test
+fn tb3_macho_no_relocs_collapses() {
+    let base = mo_rodata_ptr_enc()
+    let obj = emit_macho(EncodedModule { text = base.text; rodata = base.rodata; symbols = base.symbols; relocs = teko::list::empty() })
+    teko::assert::is_true(obj.len == 454)
+    teko::assert::is_true(mo_u32_at(obj, 240) == 0)
+    teko::assert::is_true(mo_u32_at(obj, 244) == 0)
+}
+
+/**
+ * T-B3 (§4.5): a partição por RelocSect separa text/rodata preservando a ordem, e
+ * uma lista só-Text produz partição rodata vazia.
+ */
+#test
+fn tb3_macho_partition_relocs_arms() {
+    let rt = Reloc { offset = 0 to u32; sym = "a"; kind = MRelocKind::Call; sect = RelocSect::Text }
+    let rr = Reloc { offset = 8 to u32; sym = "b"; kind = MRelocKind::Abs64; sect = RelocSect::Rodata }
+    let parts = macho_partition_relocs([rt, rr])
+    teko::assert::is_true(parts.text.len == 1)
+    teko::assert::is_true(parts.rodata.len == 1)
+    teko::assert::is_true(parts.text[0].sym == "a")
+    teko::assert::is_true(parts.rodata[0].sym == "b")
+    let only_text = macho_partition_relocs([rt])
+    teko::assert::is_true(only_text.rodata.len == 0)
+}

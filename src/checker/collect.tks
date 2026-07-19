@@ -42,6 +42,41 @@ fn reject_unsafe_signature_contagion(fn_name: str, fn_unsafe: bool, t: Type, tab
     error { message = $"safe fn '{fn_name}' names unsafe type in its signature — mark it `unsafe fn` or take/return only safe types (§2: only safe types cross the boundary)" }
 }
 
+/**
+ * const_type_located — position a type-resolution error at the const declaration's own line/col
+ * when it arrived unlocated (line 0), so `const K: Unknown = …` reports at the `const` keyword
+ * rather than at the program root (#594 crumb 2).
+ *
+ * @param e   the error `resolve_type` returned for `cd.ty`
+ * @param cd  the const declaration whose declared type failed to resolve
+ * @return    `e` positioned at the const's own line/col when it carried none
+ * @since #594
+ */
+fn const_type_located(e: error, cd: parser::ConstDecl) -> error {
+    if e.line != 0 { return e }
+    teko::error::err_loc(e, cd.line, cd.col)
+}
+
+/**
+ * collect_const_sig — resolve a module-level ConstDecl's declared type and return it, so the pass-1
+ * collector can bind the const's name to that type before pass-2 types any initializer (#594 crumb
+ * 2). Mirrors `func_type`'s role for functions: SIGNATURE only — the initializer is neither
+ * evaluated nor validated here (that is crumb 3/4). A const carries no type-params, so `cd.ty`
+ * resolves against the program's `table` directly.
+ *
+ * @param cd      the parsed const declaration
+ * @param table   the program's type table (to resolve `cd.ty`)
+ * @param ref_ns  the namespace the const is declared in (the referencing ns for `cd.ty`)
+ * @return        the const's resolved value type, or a located error on an unknown type
+ * @since #594
+ */
+fn collect_const_sig(cd: parser::ConstDecl, table: TypeTable, ref_ns: str) -> Type | error {
+    match resolve_type(cd.ty, table, ref_ns) {
+        Type as t => t
+        error as e => const_type_located(e, cd)
+    }
+}
+
 fn func_type(f: parser::Function, table: TypeTable, ref_ns: str) -> Type | error {
     let tbl = type_param_table(f.type_params, f.type_constraints, "", table)   // (S4) the fn's generic type-params, opaque, in scope
     mut params: []Type = teko::list::empty()
@@ -197,6 +232,13 @@ fn collect_funcs(items: []parser::Item, table: TypeTable) -> Env | error {
                     error as e => return e
                 }
                 env = define_fn(env, f.name, ft, items[i].namespace)   // #41: carry the fn's ns
+            }
+            parser::ConstDecl as cd => {
+                let ct = match collect_const_sig(cd, table, items[i].namespace) {
+                    Type as t => t
+                    error as e => return e
+                }
+                env = define_const(env, cd.name, ct, items[i].namespace, cd.vis)
             }
             parser::TypeDecl as td => {
                 match td.body {
@@ -365,12 +407,12 @@ pub fn canon_class_bases(program: parser::Program) -> parser::Program {
                     parser::ClassBody as cb => {
                         if cb.has_base || cb.implements.len > 0 {
                             let cbase = if cb.has_base { canon_ref_name(cb.base_name, table, it.namespace) } else { cb.base_name }
-                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cbase; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = canon_ref_list(cb.implements, table, it.namespace); fields = cb.fields; methods = cb.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cbase; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = canon_ref_list(cb.implements, table, it.namespace); fields = cb.fields; methods = cb.methods; consts = cb.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
                         }
                     }
                     parser::StructBody as sb => {
                         if sb.implements.len > 0 {
-                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = sb.methods; implements = canon_ref_list(sb.implements, table, it.namespace) }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+                            content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = sb.methods; implements = canon_ref_list(sb.implements, table, it.namespace); consts = sb.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
                         }
                     }
                     parser::InterfaceBody as ifb => {
@@ -482,6 +524,50 @@ pub fn effective_class_methods(cb: parser::ClassBody, table: TypeTable) -> []par
         k++
     }
     out
+}
+
+/**
+ * effective_class_consts — a class's EFFECTIVE static member consts (#594 crumb 7): its OWN consts,
+ * plus every base-chain const whose name it does NOT redeclare (a nearer declaration SHADOWS a
+ * farther one — static hiding, D6). Mirrors `effective_class_methods` for the const surface, so
+ * `Sub::K` reaches a base's `pub`/`exp` member const by name while a redeclared `Sub::K` hides it.
+ *
+ * @param cb     the class body
+ * @param table  the type table (to follow the base chain)
+ * @return       the effective member consts (own first, then non-shadowed inherited), or an error
+ * @throws       when a base class cannot be resolved
+ * @since #594
+ */
+pub fn effective_class_consts(cb: parser::ClassBody, table: TypeTable) -> []parser::ConstDecl | error {
+    mut out = cb.consts
+    if cb.has_base {
+        let base_cb = match find_class_body(cb.base_name, table) { parser::ClassBody as b => b; error as e => return e }
+        let base_consts = match effective_class_consts(base_cb, table) { []parser::ConstDecl as c => c; error as e => return e }
+        mut i: u64 = 0
+        loop {
+            if i >= base_consts.len { break }
+            if !consts_have_name(out, base_consts[i].name) { out = teko::list::push(out, base_consts[i]) }
+            i++
+        }
+    }
+    out
+}
+
+/**
+ * body_consts — the static member consts declared on a struct/class/trait body (#594 crumb 7); any
+ * other body kind (enum/flags/variant/alias/extern/interface) carries none.
+ *
+ * @param body  the type body
+ * @return      its member consts, or an empty list for a body kind that cannot declare them
+ * @since #594
+ */
+pub fn body_consts(body: parser::TypeBody) -> []parser::ConstDecl {
+    match body {
+        parser::StructBody as sb => sb.consts
+        parser::ClassBody as cb => cb.consts
+        parser::TraitBody as tb => tb.consts
+        _ => teko::list::empty()
+    }
 }
 
 // (W10b.CLASS residual — intern visibility) is `class_name` the same as, or a (transitive)
@@ -1010,7 +1096,7 @@ type TraitDerive = struct { type_name: str; trait_name: str }
  * recognized by `is_structural_trait` (a closed set) BEFORE the trait/interface probe.
  */
 type SplitImpls = struct { traits: []str; ifaces: []str; structural: []str }
-type FoldedMembers = struct { fields: []parser::Field; methods: []parser::Function }
+type FoldedMembers = struct { fields: []parser::Field; methods: []parser::Function; consts: []parser::ConstDecl }
 
 fn split_trait_derives(implements: []str, table: TypeTable, ref_ns: str) -> SplitImpls {
     mut traits: []str = teko::list::empty()
@@ -1046,6 +1132,20 @@ fn methods_have_name(methods: []parser::Function, name: str) -> bool {
     false
 }
 
+/**
+ * (TR3, #594 crumb 7) does `consts` already declare a member const named `name`? Used to reject a
+ * trait member const that would collide with the deriver's own (or an earlier co-derived trait's).
+ *
+ * @param consts  the member consts accumulated so far
+ * @param name    the candidate member const name
+ * @return        true iff a member const of that name already exists
+ */
+fn consts_have_name(consts: []parser::ConstDecl, name: str) -> bool {
+    mut i: u64 = 0
+    loop { if i >= consts.len { break }; if consts[i].name == name { return true }; i++ }
+    false
+}
+
 // fold `trait_names`' members into ONE deriver. Fields APPEND after the deriver's own — a name
 // collision (with the deriver's own fields or an earlier trait's) is a COMPILE ERROR (fields
 // cannot be overridden — rename or don't co-derive). A trait method WITH a body folds in UNLESS
@@ -1056,9 +1156,10 @@ fn methods_have_name(methods: []parser::Function, name: str) -> bool {
 // field's visibility obeys the DERIVER's kind (`into_class`: struct = public value data, class =
 // encapsulated/private); a folded method is `pub` (the bundle's methods are its public surface,
 // and a class needs `pub` methods to satisfy interfaces through them).
-fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: []parser::Function, trait_names: []str, table: TypeTable, into_class: bool) -> FoldedMembers | error {
+fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: []parser::Function, own_consts: []parser::ConstDecl, trait_names: []str, table: TypeTable, into_class: bool) -> FoldedMembers | error {
     mut fields = own_fields
     mut methods = own_methods
+    mut consts = own_consts
     mut i: u64 = 0
     loop {
         if i >= trait_names.len { break }
@@ -1081,6 +1182,16 @@ fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: 
             fields = teko::list::push(fields, parser::Field { name = tf.name; type_ann = tf.type_ann; vis = fvis; is_intern = false; has_doc = tf.has_doc; doc = tf.doc })
             fi++
         }
+        mut ci: u64 = 0
+        loop {
+            if ci >= tb.consts.len { break }
+            let tc = tb.consts[ci]
+            if consts_have_name(consts, tc.name) {
+                return error { message = $"trait '{tname}' const '{tc.name}' collides with an existing member const on '{type_name}' — rename it or do not co-derive" }
+            }
+            consts = teko::list::push(consts, tc)
+            ci++
+        }
         mut mi: u64 = 0
         loop {
             if mi >= tb.methods.len { break }
@@ -1099,7 +1210,7 @@ fn fold_trait_members(type_name: str, own_fields: []parser::Field, own_methods: 
         }
         i++
     }
-    FoldedMembers { fields = fields; methods = methods }
+    FoldedMembers { fields = fields; methods = methods; consts = consts }
 }
 
 // the bodyless-REQUIREMENT check, against the FOLDED table: for each recorded (deriver, trait)
@@ -1247,16 +1358,16 @@ fn fold_user_traits(program: parser::Program, table: TypeTable) -> UserFoldResul
                 parser::StructBody as sb => {
                     let split = split_trait_derives(sb.implements, table, it.namespace)
                     if split.traits.len > 0 {
-                        let fm = match fold_trait_members(td.name, sb.fields, sb.methods, split.traits, table, false) { FoldedMembers as f => f; error as e => return e }
-                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = sb.implements }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+                        let fm = match fold_trait_members(td.name, sb.fields, sb.methods, sb.consts, split.traits, table, false) { FoldedMembers as f => f; error as e => return e }
+                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = fm.fields; methods = fm.methods; implements = sb.implements; consts = fm.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
                         derives = record_user_trait_derives(derives, td.name, split.traits)
                     }
                 }
                 parser::ClassBody as cb => {
                     let split = split_trait_derives(cb.implements, table, it.namespace)
                     if split.traits.len > 0 {
-                        let fm = match fold_trait_members(td.name, cb.fields, cb.methods, split.traits, table, true) { FoldedMembers as f => f; error as e => return e }
-                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = fm.fields; methods = fm.methods }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+                        let fm = match fold_trait_members(td.name, cb.fields, cb.methods, cb.consts, split.traits, table, true) { FoldedMembers as f => f; error as e => return e }
+                        content = parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = fm.fields; methods = fm.methods; consts = fm.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
                         derives = record_user_trait_derives(derives, td.name, split.traits)
                     }
                 }
@@ -1296,7 +1407,7 @@ fn record_user_trait_derives(derives: []TraitDerive, td_name: str, traits: []str
  * @return the rewritten `TypeDecl`
  */
 fn struct_with_methods(td: parser::TypeDecl, sb: parser::StructBody, extra: []parser::Function) -> parser::TypeDecl {
-    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = append_methods(sb.methods, extra); implements = sb.implements }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::StructBody { fields = sb.fields; methods = append_methods(sb.methods, extra); implements = sb.implements; consts = sb.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
 }
 
 /**
@@ -1309,7 +1420,7 @@ fn struct_with_methods(td: parser::TypeDecl, sb: parser::StructBody, extra: []pa
  * @return the rewritten `TypeDecl`
  */
 fn class_with_methods(td: parser::TypeDecl, cb: parser::ClassBody, extra: []parser::Function) -> parser::TypeDecl {
-    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = cb.fields; methods = append_methods(cb.methods, extra) }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+    parser::TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = parser::ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = cb.fields; methods = append_methods(cb.methods, extra); consts = cb.consts }; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
 }
 
 /**
@@ -1630,17 +1741,22 @@ fn collect(program: parser::Program) -> Collected | error {
 }
 
 /**
- * C7.10 — collect with a pre-seeded (table, env). Adds the project's type decls on top of
- * the seeded table, then adds the project's function signatures on top of the seeded env.
+ * collect_with_seed — C7.10: collect with a pre-seeded (table, env). Adds the project's type decls
+ * on top of the seeded table, then adds the project's function signatures AND module-level const
+ * bindings on top of the seeded env (mirroring `collect_funcs`'s own `ConstDecl` arm, #594 crumb
+ * 8b) — without the const arm, a project's own `const` was never bound into `env` when a dep was
+ * present (the dep-seeded `env` only carried the dep's EXPORTED consts via `seed_dep_consts`), so a
+ * bare reference always resolved to a same-name dep const even when the project declared its own.
  * Used by `type_program_with_deps` to inject dep items before type-checking the project.
  *
  * (U2 #333 F1) Same early-stamp ordering as `collect()` — `instantiate_types` runs BEFORE
  * `validate_type_decls`/`func_type` so a project-written `Box<Raw>` (dep or project generic)
  * is already stamped, and its unsafe-carrying is visible to the field/signature gates.
  *
- * @param parser::Program program  the project's parsed program (dep items are NOT re-typed, only seeded)
- * @param Collected seed  the dep-derived (table, env) to extend
- * @return Collected | error  the collected type table + environment, project items layered on the seed
+ * @param program  the project's parsed program (dep items are NOT re-typed, only seeded)
+ * @param seed     the dep-derived (table, env) to extend
+ * @return         the collected type table + environment, project items layered on the seed
+ * @since #594
  */
 fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | error {
     // Augment the table with the project's type decls (dep types already in seed.types).
@@ -1670,6 +1786,13 @@ fn collect_with_seed(program: parser::Program, seed: Collected) -> Collected | e
                     error as e => return e
                 }
                 env = define_fn(env, f.name, ft, program.items[j].namespace)
+            }
+            parser::ConstDecl as cd => {
+                let ct = match collect_const_sig(cd, table, program.items[j].namespace) {
+                    Type as t => t
+                    error as e => return e
+                }
+                env = define_const(env, cd.name, ct, program.items[j].namespace, cd.vis)
             }
             parser::TypeDecl as td => {
                 match td.body {   // (OOP A1) mirror collect_funcs' struct-method registration
@@ -1767,7 +1890,52 @@ fn seed_from_dep(dep: TProgram, table: TypeTable, env: Env) -> Collected | error
         }
         j++
     }
-    Collected { types = t; env = e }
+    Collected { types = t; env = seed_dep_consts(e, dep) }
+}
+
+/**
+ * seed_dep_consts — Pass 3 of `seed_from_dep` (#594 crumb 8): surface the dep's EXPORTED module-level
+ * consts into the seed environment. A `pub`/`exp` const is bound by name (like a function) so a
+ * consumer's bare reference resolves and `is_const = true` lets it seed a project const's own
+ * initializer; a `private` dep const is NOT bound, which IS the cross-module visibility gate for a
+ * module-level const. A hoisted MEMBER const rides its own mangled symbol here too — harmless, since
+ * `Type::NAME` resolution binds through the dep TypeDecl's `consts` list, not this env entry.
+ *
+ * @param env  the seed environment after fn signatures (Pass 2)
+ * @param dep  the already-typed dependency program
+ * @return     `env` extended with the dep's exported module consts bound by name
+ * @since #594
+ */
+fn seed_dep_consts(env: Env, dep: TProgram) -> Env {
+    mut e = env
+    mut k: u64 = 0
+    loop {
+        if k >= dep.items.len { break }
+        match dep.items[k] {
+            TConstDecl as c => if dep_const_is_exported(c) { e = define_const(e, c.name, c.ty, c.namespace, c.vis) }
+            _ => { }
+        }
+        k++
+    }
+    e
+}
+
+/**
+ * dep_const_is_exported — true iff a dep `TConstDecl`'s visibility is `pub` or `exp`, the surface a
+ * consuming module may reach (#594 crumb 8). A `private` dep const (a surviving aggregate in the
+ * `.tkb`) is NOT surfaced by `seed_from_dep`, which IS the cross-module visibility gate for a
+ * module-level const — a consumer that names it fails to resolve, the usual visibility error.
+ *
+ * @param c  the typed dep const declaration
+ * @return   whether the const is part of the dep's public (cross-module) surface
+ * @since #594
+ */
+fn dep_const_is_exported(c: TConstDecl) -> bool {
+    match c.vis {
+        parser::Visibility::Private => false
+        parser::Visibility::Pub => true
+        parser::Visibility::Exp => true
+    }
 }
 
 // dep_item_ns — extract the namespace string from a TItem. TFunction carries it directly;
@@ -1780,5 +1948,6 @@ fn dep_item_ns(item: TItem) -> str {
         parser::TypeDecl => ""
         parser::UseDecl => ""
         TStatement => ""
+        TConstDecl as c => c.namespace
     }
 }

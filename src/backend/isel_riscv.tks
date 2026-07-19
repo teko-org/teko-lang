@@ -129,16 +129,13 @@ fn selctx_riscv_set_block_param(ctx: SelCtxRiscv, block_id: u32, index: u32, reg
 }
 
 /**
- * riscv_zero_reg — the hardwired zero register `x0` (GPR id 0), used explicitly
+ * RISCV_ZERO_REG — the hardwired zero register `x0` (GPR id 0), used explicitly
  * as `neg`'s minuend (`sub rd, x0, rs`) and as the compare-against operand of a
  * boolean branch (`bne rs, x0, target`). It is reserved (never allocated), so
- * naming it as a physical operand is safe.
- *
- * @return MReg  the physical `x0` register
+ * naming it as a physical operand is safe. A flat-POD `MReg` aggregate const
+ * (#594 crumb 9b).
  */
-fn riscv_zero_reg() -> MReg {
-    preg(0, MRegClass::GPR)
-}
+const RISCV_ZERO_REG: MReg = preg(0, MRegClass::GPR)
 
 /**
  * riscv_gpr_result — the LP64D integer result register `a0` (GPR id 10). By
@@ -150,7 +147,7 @@ fn riscv_zero_reg() -> MReg {
  * @return MReg  the physical `a0` (integer result) register
  */
 fn riscv_gpr_result() -> MReg {
-    arg_reg(riscv64_lp64d(), MRegClass::GPR, 0).reg
+    arg_reg(RISCV64_LP64D, MRegClass::GPR, 0).reg
 }
 
 /**
@@ -417,7 +414,7 @@ fn emit_eq_riscv(ctx: SelCtxRiscv, dst: MReg, a: MReg, b: MReg) -> SelCtxRiscv {
  */
 fn emit_ne_riscv(ctx: SelCtxRiscv, dst: MReg, a: MReg, b: MReg) -> SelCtxRiscv {
     let ctx1 = selctx_riscv_emit(ctx, alu_r_riscv(MAluOpRiscv::Sub, true, dst, a, b))
-    selctx_riscv_emit(ctx1, slt_riscv(dst, riscv_zero_reg(), dst, true))
+    selctx_riscv_emit(ctx1, slt_riscv(dst, RISCV_ZERO_REG, dst, true))
 }
 
 /**
@@ -532,7 +529,7 @@ fn select_bin_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, inst: lir::LInst, b: lir::
 fn select_ineg_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, a: u32, wide: bool) -> SelCtxRiscv {
     let dst = vreg(inst.result, MRegClass::GPR)
     let ctx1 = selctx_riscv_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
-    selctx_riscv_emit(ctx1, alu_r_riscv(MAluOpRiscv::Sub, wide, dst, riscv_zero_reg(), vreg(a, MRegClass::GPR)))
+    selctx_riscv_emit(ctx1, alu_r_riscv(MAluOpRiscv::Sub, wide, dst, RISCV_ZERO_REG, vreg(a, MRegClass::GPR)))
 }
 
 /**
@@ -610,7 +607,7 @@ fn select_un_riscv(ctx0: SelCtxRiscv, inst: lir::LInst, u: lir::LUn) -> SelCtxRi
 /**
  * select_param_riscv — the `LParam` selection: copy the LP64D integer argument
  * register for the parameter's GPR-class index (`a0..a7`, read through
- * `arg_reg(riscv64_lp64d(), ...)` — the arg ids are `x10..x17`, NOT the encoding
+ * `arg_reg(RISCV64_LP64D, ...)` — the arg ids are `x10..x17`, NOT the encoding
  * order) into the parameter's VReg via `mv`. A float-class parameter needs an
  * `fa*` register (the `B2-fp` stop), an i128 parameter a register-pair slot (the
  * i128-inherited stop), and a parameter past the 8-register window the LP64D
@@ -636,7 +633,7 @@ fn select_param_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, inst: lir::LInst, p: lir
         return error { message = "isel riscv64: B2-fp — a float parameter arrives in an fa* register via an F/D move, the float honest-stop (0.3.1)" }
     }
     let class_index = gpr_index_before(f.param_types, p.index)
-    let slot = arg_reg(riscv64_lp64d(), MRegClass::GPR, class_index)
+    let slot = arg_reg(RISCV64_LP64D, MRegClass::GPR, class_index)
     if !slot.ok {
         return error { message = "isel riscv64: B2-args — more than 8 integer arguments needs the LP64D stack-arg slot (0.3.1)" }
     }
@@ -659,14 +656,14 @@ fn select_param_riscv(ctx0: SelCtxRiscv, f: lir::LFunc, inst: lir::LInst, p: lir
  */
 fn select_ret_riscv(ctx0: SelCtxRiscv, r: lir::LRet) -> SelCtxRiscv | error {
     if !r.has_value {
-        return selctx_riscv_emit(ctx0, ret_riscv())
+        return selctx_riscv_emit(ctx0, RET_RISCV)
     }
     let info = vinfo_get(ctx0.vinfo, r.value)
     if info.reg_class == MRegClass::FPR {
         return error { message = "isel riscv64: B2-fp — a float return pins fa0 via an F/D move, the float honest-stop (0.3.1)" }
     }
     let ctx1 = selctx_riscv_emit(ctx0, mv_riscv(riscv_gpr_result(), vreg(r.value, MRegClass::GPR)))
-    selctx_riscv_emit(ctx1, ret_riscv())
+    selctx_riscv_emit(ctx1, RET_RISCV)
 }
 
 /**
@@ -806,7 +803,7 @@ fn select_fused_branch_riscv(ctx1: SelCtxRiscv, dc: DefCmp, taken: u32) -> SelCt
  *                              matches `select_fused_branch_riscv` for the caller)
  */
 fn select_boolean_branch_riscv(ctx1: SelCtxRiscv, cond: u32, taken: u32) -> SelCtxRiscv | error {
-    selctx_riscv_emit(ctx1, branch_riscv(MCond::NE, vreg(cond, MRegClass::GPR), riscv_zero_reg(), taken))
+    selctx_riscv_emit(ctx1, branch_riscv(MCond::NE, vreg(cond, MRegClass::GPR), RISCV_ZERO_REG, taken))
 }
 
 /**
@@ -1013,7 +1010,7 @@ type PinnedArgsRiscv = struct {
 
 /**
  * pin_args_riscv — lower each argument into its LP64D integer slot: pin it with
- * a `mv` into the physical register `arg_reg(riscv64_lp64d(), GPR, n)` names
+ * a `mv` into the physical register `arg_reg(RISCV64_LP64D, GPR, n)` names
  * (`a0..a7`), collecting the physregs as the call's `uses`. A float-class
  * argument needs an `fa*` move (the `B2-fp` stop), an argument past the
  * 8-register window the LP64D stack-arg slot (the `B2-args` stop), and a variadic
@@ -1041,7 +1038,7 @@ fn pin_args_riscv(ctx0: SelCtxRiscv, args: []u32, variadic: bool) -> PinnedArgsR
         if info.reg_class == MRegClass::FPR {
             return error { message = "isel riscv64: B2-fp — a float call argument arrives in an fa* register via an F/D move, the float honest-stop (0.3.1)" }
         }
-        let slot = arg_reg(riscv64_lp64d(), MRegClass::GPR, gpr_n)
+        let slot = arg_reg(RISCV64_LP64D, MRegClass::GPR, gpr_n)
         if !slot.ok {
             return error { message = "isel riscv64: B2-args — more than 8 integer arguments needs the LP64D stack-arg slot (0.3.1)" }
         }

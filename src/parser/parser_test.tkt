@@ -1497,6 +1497,81 @@ fn rejects_statements_in_module() {
     teko::assert::is_true(module_errors("f()"))   // a bare expression is a statement
 }
 
+/**
+ * A module-level `const NAME: Type = init` parses to a ConstDecl across the three
+ * visibility tiers, and a leading doc attaches through `with_outer_doc` (#594 crumb 1).
+ */
+#test
+fn parses_module_const() {
+    match module_of("const A: i64 = 1") {
+        Module as m => {
+            teko::assert::is_true(m.decls.len == 1)
+            match m.decls[0] {
+                ConstDecl as c => {
+                    teko::assert::is_true(c.name == "A")
+                    teko::assert::is_true(c.vis == Visibility::Private)
+                    teko::assert::is_false(c.has_doc)
+                }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    match module_of("pub const B: u8 = ~(0 to u8)") {
+        Module as m => {
+            teko::assert::is_true(m.decls.len == 1)
+            match m.decls[0] {
+                ConstDecl as c => { teko::assert::is_true(c.name == "B"); teko::assert::is_true(c.vis == Visibility::Pub) }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    match module_of("exp const C: u32 = 0x78") {
+        Module as m => {
+            match m.decls[0] {
+                ConstDecl as c => { teko::assert::is_true(c.name == "C"); teko::assert::is_true(c.vis == Visibility::Exp) }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    match module_of("/** the answer */\nconst K: i64 = 42") {
+        Module as m => {
+            match m.decls[0] {
+                ConstDecl as c => { teko::assert::is_true(c.has_doc); teko::assert::is_true(c.doc == "/** the answer */") }
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * A module-level `const` REQUIRES both a type annotation and an initializer; omitting
+ * either is a located parse error (#594 crumb 1).
+ */
+#test
+fn rejects_ill_formed_module_const() {
+    teko::assert::is_true(module_errors("const C = 1"))
+    teko::assert::is_true(module_errors("const D: i64"))
+}
+
+/**
+ * A `const` in STATEMENT position stays the pre-existing local binding — the module
+ * ConstDecl path must not regress a local `const` inside a function body (#594 crumb 1).
+ */
+#test
+fn local_const_still_parses_as_binding() {
+    match module_of("fn f() -> i64 { const F: i64 = 1; return F }") {
+        Module as m => {
+            teko::assert::is_true(m.decls.len == 1)
+            match m.decls[0] { Function as fn0 => teko::assert::is_true(fn0.name == "f"); _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
 // appended to parser_test.tkt — P6 end-to-end integration.
 
 #test

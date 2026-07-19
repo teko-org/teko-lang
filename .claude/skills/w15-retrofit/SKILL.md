@@ -32,6 +32,21 @@ Anything that would move emitted bytes, a test outcome, or the fixpoint is out o
 6. **Coverage → 100% of the delta.** Add `.tkt` tests for any new/changed line/branch the retrofit leaves uncovered.
 7. **Prove it.** Push to a `chore/…`/`w15/…` branch, draft sub-PR **into the lane branch**. Let the lane CI re-prove fixpoint + tests + coverage. Do NOT run the heavy self-host gate locally if it may exceed ~5 min.
 
+## W15 · No magic values (const / enum / flags) — owner 2026-07-15 (D39)
+
+Every domain-meaningful literal is named. A **magic value** is a bare literal carrying domain meaning at its use site — a mask, offset, size, index bound, tag, file magic, opcode, or section flag. Under W15 it becomes named:
+
+- a single semantic scalar → **`const NAME: T = <const-expr>`** (comp-time, **no arena** — never a nullary `fn X() -> T { <const> }`, which opens a lexical region per call);
+- a **closed integer tag family** → **`enum`** (e.g. block-type/scope-kind/value-type tags);
+- a **bitmask** ORed from independent bits → **`flags`** (e.g. ELF `SHF_ALLOC | SHF_EXECINSTR`);
+- a **large immutable aggregate** read repeatedly → an **aggregate `const`** (rodata).
+
+**Threshold:** a literal that is non-trivial (not `0`/`1`) AND appears ≥2× OR encodes an external-format constant (file magic, ABI number, section flag) MUST be named. Exempt only `0`/`1` identity/step and a one-off opcode byte inside a documented ISA-encoder table.
+
+**Invariants:** emitted bytes stay byte-identical — route a serialized tag through a single `match`-driven `_wire` helper; `flags`/`enum` migration changes the *source spelling*, never the lowered bytes (prove with fixpoint + object-writer goldens). **Never** migrate a per-call factory that seeds fresh mutable state (`*_empty()`) into a shared const — that aliases state and breaks value semantics.
+
+`const` valid placements: **module-level** (sibling of fns), **class/struct member** (`Tipo::NAME`, static/type-level), and **local** (block/function); each accepts `pub`/`exp`.
+
 ## Boundaries
 
 - **Teko-only.** No frozen C-twin edits (checker/codegen/vm/build `.c`); only `teko_rt.{c,h}`/assert seed for a genuine runtime reason (rare in a retrofit).

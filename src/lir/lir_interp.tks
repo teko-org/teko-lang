@@ -157,7 +157,8 @@ fn mem_store(m: MemStore, addr: i128, value: i128) -> MemStore | error {
 pub fn interp_lmodule(m: LModule, entry: str, args: []i128) -> i128 {
     let f = find_lfunc(m, entry)
     if !f.found { return -1 to i128 }
-    let r = interp_call(m, f.func, args, 0, seed_rodata(m))
+    let mem = match seed_rodata(m) { MemStore as x => x; error => return -1 to i128 }
+    let r = interp_call(m, f.func, args, 0, mem)
     if is_exit(r.result) { return r.result.value }
     if is_return(r.result) { return r.result.value }
     -1 to i128
@@ -168,7 +169,7 @@ pub fn interp_lmodule(m: LModule, entry: str, args: []i128) -> i128 {
     purely from `m.rodata` (a STATIC, never-mutated table), so no separate address-table
     needs threading through the interpreter: `LGlobalAddr` just re-derives its base address
     from `m` (already a parameter everywhere) on every read (A1-4, #382). */
-fn seed_rodata(m: LModule) -> MemStore {
+fn seed_rodata(m: LModule) -> MemStore | error {
     mut mem = empty_memstore()
     mut i: u64 = 0
     loop {
@@ -177,7 +178,72 @@ fn seed_rodata(m: LModule) -> MemStore {
         mem = store_bytes(al.mem, al.addr, m.rodata[i].bytes)
         i++
     }
-    mem
+    resolve_rodata_relocs(mem, m.rodata)
+}
+
+/**
+ * resolve_entry_relocs — grava, para uma única entrada rodata cujo blob começa na
+ * célula `base`, o endereço-alvo de cada uma das suas relocations internas de ponteiro
+ * na célula do slot correspondente (#594 T-B5). Para cada `LDataReloc { offset;
+ * target }` o valor gravado é `rodata_base_of(rodata, target).addr` — o índice de
+ * célula (o "endereço" na memória da VM) da primeira célula do datum-alvo — na célula
+ * `base + offset`, que é a célula que um `LLoad` subsequente do ponteiro lê. Um
+ * `target` que não nomeia nenhuma entrada rodata é um erro interno NOMEADO (não um skip
+ * silencioso): a lowering só emite um `LDataReloc` para um símbolo que ela mesma
+ * internou, então um miss é um bug de compilador (espelha o erro de alvo desconhecido
+ * do `wasm_data_addr_of`, T-B4). O slot de 8 bytes ocupa as células
+ * `[base+offset, base+offset+8)`; só a célula baixa recebe o endereço (a VM lê o
+ * ponteiro por um load de UMA célula), as altas permanecem zero.
+ *
+ * @param MemStore mem  a memória com os bytes já semeados
+ * @param []LRodata rodata  a tabela rodata inteira (para resolver o `target`)
+ * @param LRodata entry  a entrada cujas relocs se resolvem
+ * @param i128 base  a célula-base do blob de `entry` (a soma cumulativa de comprimentos)
+ * @return MemStore | error  a memória com os slots de ponteiro escritos, ou o erro
+ *                           nomeado de alvo desconhecido / escrita interna
+ */
+fn resolve_entry_relocs(mem: MemStore, rodata: []LRodata, entry: LRodata, base: i128) -> MemStore | error {
+    mut cur = mem
+    mut j: u64 = 0
+    loop {
+        if j >= entry.relocs.len { break }
+        let r = entry.relocs[j]
+        let hit = rodata_base_of(rodata, r.target)
+        if !hit.ok { return error { message = teko::str::concat("lir interp: rodata-internal pointer targets unknown rodata symbol @", r.target) } }
+        cur = match mem_store(cur, base + (r.offset to i128), hit.addr) { MemStore as m2 => m2; error as e => return e }
+        j++
+    }
+    cur
+}
+
+/**
+ * resolve_rodata_relocs — depois de `seed_rodata` ter posto cada blob rodata
+ * byte-por-célula, sobrescreve cada slot de ponteiro rodata-INTERNO com o endereço (o
+ * índice de célula) do datum-alvo (#594 T-B5). Percorre `rodata` re-derivando a base
+ * cumulativa de cada entrada — a MESMA soma que `seed_rodata`/`rodata_base_of` fazem,
+ * então concordam sempre — e delega a resolução dos slots daquela entrada a
+ * `resolve_entry_relocs`. É o análogo VM do `wasm_relocate_rodata` (T-B4) e das
+ * relocations `.rela.rodata`/`__const`/`.rdata` dos writers nativos (T-B2/T-B3): a
+ * relocation aplicada UMA vez na carga do módulo, custo zero por load. Toda entrada tem
+ * `relocs` VAZIO até T-B6 (o produtor `serialize_const` honest-stopa agregados
+ * pointer-bearing), então isto reescreve nada e a memória fica byte-idêntica.
+ *
+ * @param MemStore mem  a memória com os bytes já semeados por `seed_rodata`
+ * @param []LRodata rodata  a tabela rodata inteira, na ordem de semeadura
+ * @return MemStore | error  a memória com todos os slots de ponteiro resolvidos, ou o
+ *                           erro nomeado propagado
+ */
+fn resolve_rodata_relocs(mem: MemStore, rodata: []LRodata) -> MemStore | error {
+    mut cur = mem
+    mut base: i128 = 0 to i128
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        cur = match resolve_entry_relocs(cur, rodata, rodata[i], base) { MemStore as m2 => m2; error as e => return e }
+        base = base + (rodata[i].bytes.len to i128)
+        i++
+    }
+    cur
 }
 
 /** store_bytes — write each byte of `bytes` into its own cell starting at `base` (a
@@ -352,11 +418,13 @@ fn bind_params(rf: RegFile, params: []u32, args: []u32) -> RegFile | error {
     cur
 }
 
-/** block_step_budget — the max block transitions (jump/branch) a single call may take
-    before the interpreter honest-stops. A cyclic block graph (a future `loop` lowering gone
-    wrong, or an interp bug) would otherwise hang forever — the oracle must always
-    terminate. */
-fn block_step_budget() -> u32 { 200000 }
+/**
+ * `BLOCK_STEP_BUDGET` — the max block transitions (jump/branch) a single call
+ * may take before the interpreter honest-stops. A cyclic block graph (a
+ * future `loop` lowering gone wrong, or an interp bug) would otherwise hang
+ * forever — the oracle must always terminate.
+ */
+const BLOCK_STEP_BUDGET: u32 = 200000
 
 /** interp_blocks — run block `entry` in `f`, following LJump/LBranch to their targets
     (interp_block yields a GOTO outcome; this loop chases it) until a terminal outcome
@@ -369,7 +437,7 @@ fn interp_blocks(m: LModule, f: LFunc, entry: u32, rf0: RegFile, depth: u32, mem
     mut cur = entry
     mut steps: u32 = 0
     loop {
-        if steps > block_step_budget() { return istep_stop(ires_error("lir interp: block-step budget exceeded (possible infinite loop)"), rf, mem) }
+        if steps > BLOCK_STEP_BUDGET { return istep_stop(ires_error("lir interp: block-step budget exceeded (possible infinite loop)"), rf, mem) }
         let hit = find_lblock(f, cur)
         if !hit.found { return istep_stop(ires_error("lir interp: jump/branch to an unknown block (internal)"), rf, mem) }
         let step = interp_block(m, f, hit.block, rf, depth, mem)

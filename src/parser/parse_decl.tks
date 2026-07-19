@@ -350,8 +350,9 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
     mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
     mut fields: []Field = teko::list::empty()
     mut methods: []Function = teko::list::empty()
+    mut consts: []ConstDecl = teko::list::empty()
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
-        return ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+        return ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
     }
     loop {
         if struct_item_is_method(tokens, p) {
@@ -361,16 +362,22 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
             p = m.next
         } else {
             let fdoc = peel_leading_doc(tokens, p)
-            if !is_name_at(tokens, fdoc.next) {
-                return err_at(tokens, fdoc.next, "expected a field name or a method (`fn …`)")
+            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            if mcs.handled {
+                consts = mcs.consts
+                p = mcs.next
+            } else {
+                if !is_name_at(tokens, fdoc.next) {
+                    return err_at(tokens, fdoc.next, "expected a field name, a method (`fn …`), or a `const` member")
+                }
+                let name = tokens[fdoc.next].text
+                if !is_kind_at(tokens, fdoc.next + 1, lexer::TokenKind::Colon) {
+                    return err_at(tokens, fdoc.next + 1, "expected ':' after a field name")
+                }
+                let ty = match parse_type(tokens, fdoc.next + 2) { ParsedType as x => x; error as e => return e }
+                fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc })
+                p = ty.next
             }
-            let name = tokens[fdoc.next].text
-            if !is_kind_at(tokens, fdoc.next + 1, lexer::TokenKind::Colon) {
-                return err_at(tokens, fdoc.next + 1, "expected ':' after a field name")
-            }
-            let ty = match parse_type(tokens, fdoc.next + 2) { ParsedType as x => x; error as e => return e }
-            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc })
-            p = ty.next
         }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
         if !is_sep(tokens, p) {
@@ -379,7 +386,7 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
         p = skip_seps(tokens, p)
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
     }
-    ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+    ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
 }
 
 // (W10b.CLASS) is the member at `pos` a method (`fn …`, past any doc/vis/intern/dispatch
@@ -404,8 +411,9 @@ fn parse_class_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
     mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
     mut fields: []Field = teko::list::empty()
     mut methods: []Function = teko::list::empty()
+    mut consts: []ConstDecl = teko::list::empty()
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
-        return ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+        return ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
     }
     loop {
         if class_item_is_method(tokens, p) {
@@ -415,22 +423,28 @@ fn parse_class_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
             p = m.next
         } else {
             let fdoc = peel_leading_doc(tokens, p)
-            mut fp = fdoc.next
-            mut fvis = Visibility::Private
-            if is_kind_at(tokens, fp, lexer::TokenKind::Pub) { fvis = Visibility::Pub; fp = fp + 1 }
-            else if is_kind_at(tokens, fp, lexer::TokenKind::Exp) { fvis = Visibility::Exp; fp = fp + 1 }
-            mut fintern = false
-            if is_kind_at(tokens, fp, lexer::TokenKind::Intern) { fintern = true; fp = fp + 1 }
-            if !is_name_at(tokens, fp) {
-                return err_at(tokens, fp, "expected a field name or a method (`fn …`)")
+            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            if mcs.handled {
+                consts = mcs.consts
+                p = mcs.next
+            } else {
+                mut fp = fdoc.next
+                mut fvis = Visibility::Private
+                if is_kind_at(tokens, fp, lexer::TokenKind::Pub) { fvis = Visibility::Pub; fp = fp + 1 }
+                else if is_kind_at(tokens, fp, lexer::TokenKind::Exp) { fvis = Visibility::Exp; fp = fp + 1 }
+                mut fintern = false
+                if is_kind_at(tokens, fp, lexer::TokenKind::Intern) { fintern = true; fp = fp + 1 }
+                if !is_name_at(tokens, fp) {
+                    return err_at(tokens, fp, "expected a field name, a method (`fn …`), or a `const` member")
+                }
+                let name = tokens[fp].text
+                if !is_kind_at(tokens, fp + 1, lexer::TokenKind::Colon) {
+                    return err_at(tokens, fp + 1, "expected ':' after a field name")
+                }
+                let ty = match parse_type(tokens, fp + 2) { ParsedType as x => x; error as e => return e }
+                fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = fvis; is_intern = fintern; has_doc = fdoc.has_doc; doc = fdoc.doc })
+                p = ty.next
             }
-            let name = tokens[fp].text
-            if !is_kind_at(tokens, fp + 1, lexer::TokenKind::Colon) {
-                return err_at(tokens, fp + 1, "expected ':' after a field name")
-            }
-            let ty = match parse_type(tokens, fp + 2) { ParsedType as x => x; error as e => return e }
-            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = fvis; is_intern = fintern; has_doc = fdoc.has_doc; doc = fdoc.doc })
-            p = ty.next
         }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
         if !is_sep(tokens, p) {
@@ -439,7 +453,7 @@ fn parse_class_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
         p = skip_seps(tokens, p)
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
     }
-    ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+    ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
 }
 
 // `[abstract|virtual] class [Base[(binding)]] [& I1 & I2 …] { members }`. `pos` is at
@@ -490,7 +504,7 @@ fn parse_class_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | erro
     Parsed<TypeBody> { node = ClassBody {
             kind = kind; has_base = has_base; base_name = base_name
             has_base_binding = has_base_binding; base_binding_name = base_binding_name
-            implements = implements; fields = fs.fields; methods = fs.methods
+            implements = implements; fields = fs.fields; methods = fs.methods; consts = fs.consts
         }; next = fs.next }
 }
 
@@ -527,6 +541,9 @@ fn parse_interface_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | 
         return Parsed<TypeBody> { node = InterfaceBody { extends = ext.items; methods = methods }; next = p + 1 }
     }
     loop {
+        let idoc = peel_leading_doc(tokens, p)
+        let imc = peek_member_const(tokens, idoc.next)
+        if imc.is_const || imc.bad_override { return reject_const_member(tokens, imc.kw_pos) }
         let m = match parse_function(tokens, p, false, "", true, true) { Parsed<Decl> as x => x; error as e => return e }
         let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "an interface member must be a method signature (`fn …`)") }
         methods = teko::list::push(methods, mf)
@@ -547,8 +564,9 @@ fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
     mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
     mut fields: []Field = teko::list::empty()
     mut methods: []Function = teko::list::empty()
+    mut consts: []ConstDecl = teko::list::empty()
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
-        return ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+        return ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
     }
     loop {
         if struct_item_is_method(tokens, p) {
@@ -558,16 +576,22 @@ fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
             p = m.next
         } else {
             let fdoc = peel_leading_doc(tokens, p)
-            if !is_name_at(tokens, fdoc.next) {
-                return err_at(tokens, fdoc.next, "expected a field name or a method (`fn …`) in the trait body")
+            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            if mcs.handled {
+                consts = mcs.consts
+                p = mcs.next
+            } else {
+                if !is_name_at(tokens, fdoc.next) {
+                    return err_at(tokens, fdoc.next, "expected a field name, a method (`fn …`), or a `const` member in the trait body")
+                }
+                let name = tokens[fdoc.next].text
+                if !is_kind_at(tokens, fdoc.next + 1, lexer::TokenKind::Colon) {
+                    return err_at(tokens, fdoc.next + 1, "expected ':' after a field name")
+                }
+                let ty = match parse_type(tokens, fdoc.next + 2) { ParsedType as x => x; error as e => return e }
+                fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc })
+                p = ty.next
             }
-            let name = tokens[fdoc.next].text
-            if !is_kind_at(tokens, fdoc.next + 1, lexer::TokenKind::Colon) {
-                return err_at(tokens, fdoc.next + 1, "expected ':' after a field name")
-            }
-            let ty = match parse_type(tokens, fdoc.next + 2) { ParsedType as x => x; error as e => return e }
-            fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc })
-            p = ty.next
         }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
         if !is_sep(tokens, p) {
@@ -576,7 +600,7 @@ fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
         p = skip_seps(tokens, p)
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
     }
-    ParsedStructBody { fields = fields; methods = methods; next = p + 1 }
+    ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
 }
 
 // the body of a type declaration. `struct [I & …] { fields }`, `interface [I & …] { sigs }`,
@@ -596,7 +620,7 @@ fn parse_type_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error
     // declares NO derive-list of its own (no `trait A & B { }` — compose at the deriver instead).
     if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "trait" && is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
         let fs = match parse_trait_fields(tokens, pos + 1) { ParsedStructBody as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = TraitBody { fields = fs.fields; methods = fs.methods }; next = fs.next }
+        return Parsed<TypeBody> { node = TraitBody { fields = fs.fields; methods = fs.methods; consts = fs.consts }; next = fs.next }
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Struct) {
         // (W10b.IF) optional implements list `struct I1 & I2 { … }` between `struct` and `{`.
@@ -605,12 +629,13 @@ fn parse_type_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error
             return err_at(tokens, impls.next, "expected '{' after `struct` (or its interface list)")
         }
         let fs = match parse_fields(tokens, impls.next) { ParsedStructBody as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = StructBody { fields = fs.fields; methods = fs.methods; implements = impls.items }; next = fs.next }
+        return Parsed<TypeBody> { node = StructBody { fields = fs.fields; methods = fs.methods; implements = impls.items; consts = fs.consts }; next = fs.next }
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Enum) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
             return err_at(tokens, pos + 1, "expected '{' after `enum`")
         }
+        match reject_const_body_member(tokens, pos + 1) { error as e => return e; null => { } }
         let ms = match parse_field_names(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
         return Parsed<TypeBody> { node = EnumBody { members = ms.items }; next = ms.next }
     }
@@ -618,6 +643,7 @@ fn parse_type_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
             return err_at(tokens, pos + 1, "expected '{' after `flags`")
         }
+        match reject_const_body_member(tokens, pos + 1) { error as e => return e; null => { } }
         let ms = match parse_field_names(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
         return Parsed<TypeBody> { node = FlagsBody { members = ms.items; values = teko::list::empty() }; next = ms.next }
     }
@@ -856,8 +882,180 @@ fn with_outer_doc(node: Decl, has_doc: bool, doc: str) -> Decl {
     match node {
         Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = true; doc = doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects; is_unsafe = f.is_unsafe }
         TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
+        ConstDecl as cd => ConstDecl { name = cd.name; ty = cd.ty; init = cd.init; vis = cd.vis; has_doc = true; doc = doc; line = cd.line; col = cd.col }
         _ => node
     }
+}
+
+/**
+ * parse_const_decl — parse a module-level `const NAME: Type = <const-expr>` (#594),
+ * reached from `parse_decl` after the optional doc/`pub`/`exp` peel. The type
+ * annotation is MANDATORY at module scope (unlike a local `const`, whose type may
+ * infer): a public constant's type is part of its contract. The initializer is
+ * parsed as a full expression here and validated as a const-expr later, in the
+ * checker (`is_const_expr`), so parse errors stay syntactic.
+ *
+ * @param tokens  the full token stream
+ * @param start   the index of the `const` keyword
+ * @param vis     the visibility peeled by `parse_decl`
+ * @return        the parsed ConstDecl and the index just past its initializer
+ * @throws        a located error on a missing name, a missing `: Type`, a missing
+ *                `=`, or an ill-formed initializer expression
+ * @since #594
+ */
+fn parse_const_decl(tokens: []lexer::Token, start: u64, vis: Visibility) -> Parsed<Decl> | error {
+    let kw_line: u32 = tokens[start].line
+    let kw_col: u32 = tokens[start].col
+    mut p = start + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
+        return err_at(tokens, p, "expected a constant name after `const`")
+    }
+    let name = tokens[p].text
+    p = p + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Colon) {
+        return err_at(tokens, p, "expected ':' and a type — a module-level `const` must declare its type")
+    }
+    let ty = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
+    p = ty.next
+    if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
+        return err_at(tokens, p, "expected `=` and an initializer for a `const`")
+    }
+    let init = match parse_expr(tokens, p + 1) { Parsed<Expr> as x => x; error as e => return e }
+    let cd = ConstDecl { name = name; ty = ty.node; init = init.node; vis = vis; has_doc = false; doc = ""; line = kw_line; col = kw_col }
+    Parsed<Decl> { node = cd; next = init.next }
+}
+
+/**
+ * MemberConstPeek — the non-destructive lookahead a type-body member loop runs to decide whether the
+ * next member (after its leading doc was peeled) is a static `const` member (#594 crumb 7). It peels
+ * an OPTIONAL `pub`/`exp` visibility and reports the `const` keyword's position, so the caller can
+ * either delegate to `parse_type_member_const` or fall back to field/method parsing UNCHANGED (the
+ * peek never advances the caller's cursor). `bad_override` flags a `[pub|exp] override const …`, a
+ * parse error the caller surfaces (`override` is method-only).
+ *
+ * @param is_const     the next member is a `const` (delegate to `parse_type_member_const`)
+ * @param vis          the visibility peeled ahead of the `const` (Private when none)
+ * @param kw_pos       the index of the `const` keyword (or the `override` keyword when bad_override)
+ * @param bad_override an `override` illegally precedes the `const`
+ */
+type MemberConstPeek = struct { is_const: bool; vis: Visibility; kw_pos: u64; bad_override: bool }
+
+/**
+ * peek_member_const — decide, without moving the caller's cursor, whether the member at `pos` (past
+ * its already-peeled leading doc) is a static `const` member (#594 crumb 7). Peels an optional
+ * `pub`/`exp`, then classifies the following token: an `override const` is `bad_override`, a plain
+ * `const` is a member const, anything else is a field/method the caller parses as before.
+ *
+ * @param tokens  the token stream
+ * @param pos     the member's first token (after the leading doc was peeled)
+ * @return        the classification (is_const / bad_override / the peeled visibility + keyword index)
+ * @since #594
+ */
+fn peek_member_const(tokens: []lexer::Token, pos: u64) -> MemberConstPeek {
+    mut k = pos
+    mut vis = Visibility::Private
+    if is_kind_at(tokens, k, lexer::TokenKind::Pub) { vis = Visibility::Pub; k = k + 1 }
+    else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { vis = Visibility::Exp; k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Override) && is_kind_at(tokens, k + 1, lexer::TokenKind::Const) {
+        return MemberConstPeek { is_const = false; vis = vis; kw_pos = k; bad_override = true }
+    }
+    if is_kind_at(tokens, k, lexer::TokenKind::Const) {
+        return MemberConstPeek { is_const = true; vis = vis; kw_pos = k; bad_override = false }
+    }
+    MemberConstPeek { is_const = false; vis = vis; kw_pos = k; bad_override = false }
+}
+
+/**
+ * MemberConstStep — the outcome of one `try_parse_member_const` attempt inside a struct/class/trait
+ * member loop (#594 crumb 7). When `handled`, the member was a `const`: `consts` is the caller's
+ * list with the parsed ConstDecl pushed and `next` is the index past its initializer. When not
+ * handled, `consts` is returned UNCHANGED and `next` echoes the position the caller passed in, so
+ * the field/method fallback resumes exactly where the peek looked.
+ *
+ * @param handled the member was a `const` and was consumed
+ * @param consts  the caller's consts list (with the new ConstDecl pushed iff handled)
+ * @param next    the index past the const's initializer (or the caller's position iff not handled)
+ */
+type MemberConstStep = struct { handled: bool; consts: []ConstDecl; next: u64 }
+
+/**
+ * try_parse_member_const — the shared member-const step every struct/class/trait member loop runs
+ * (#594 crumb 7): peek via `peek_member_const`, surface the method-only-`override` error, and, when
+ * the member IS a `const`, delegate to `parse_type_member_const` and push the result onto the
+ * caller's consts list. A non-const member leaves the cursor and the list untouched, so the caller
+ * falls back to its own field parsing unchanged.
+ *
+ * @param tokens   the token stream
+ * @param pos      the member's first token (after the leading doc was peeled)
+ * @param has_doc  whether a leading doc-comment preceded the member
+ * @param doc      the leading doc-comment's text (valid iff has_doc)
+ * @param consts   the member loop's consts list so far
+ * @return         the step outcome (handled flag, updated consts, cursor to resume at)
+ * @throws         a located error on `override const` or a malformed member const
+ * @since #594
+ */
+fn try_parse_member_const(tokens: []lexer::Token, pos: u64, has_doc: bool, doc: str, consts: []ConstDecl) -> MemberConstStep | error {
+    let mc = peek_member_const(tokens, pos)
+    if mc.bad_override { return err_at(tokens, mc.kw_pos, "a `const` member may not carry `override` — `override` is method-only") }
+    if mc.is_const {
+        let cd = match parse_type_member_const(tokens, mc.kw_pos, mc.vis, has_doc, doc) { Parsed<ConstDecl> as x => x; error as e => return e }
+        return MemberConstStep { handled = true; consts = teko::list::push(consts, cd.node); next = cd.next }
+    }
+    MemberConstStep { handled = false; consts = consts; next = pos }
+}
+
+/**
+ * reject_const_member — the located error a body that carries no `consts` list (interface / enum /
+ * flags) raises when a `const` member appears in it (#594 crumb 7). A member const is static
+ * type-level state, which only a struct, class, or trait body owns.
+ *
+ * @param tokens  the token stream
+ * @param pos     the offending `const` keyword's index
+ * @return        the located parse error
+ * @since #594
+ */
+fn reject_const_member(tokens: []lexer::Token, pos: u64) -> error {
+    err_at(tokens, pos, "a `const` member is only allowed in a struct, class, or trait body")
+}
+
+/**
+ * reject_const_body_member — guard the name-only `enum`/`flags` member list (`parse_field_names`)
+ * against a `const` member (#594 crumb 7): those bodies carry no `consts` list, so a `const` at the
+ * first member position is the same located error the interface path raises. `brace_pos` is at the
+ * body's opening `{`.
+ *
+ * @param tokens     the token stream
+ * @param brace_pos  the index of the body's opening `{`
+ * @return           the located error when a `const` opens the member list, else null
+ * @since #594
+ */
+fn reject_const_body_member(tokens: []lexer::Token, brace_pos: u64) -> error? {
+    let fp = skip_seps(tokens, brace_pos + 1)
+    if is_kind_at(tokens, fp, lexer::TokenKind::Const) { return reject_const_member(tokens, fp) }
+    null
+}
+
+/**
+ * parse_type_member_const — parse a `[pub|exp] const NAME: Type = <const-expr>` member inside a
+ * struct/class/trait body (#594 crumb 7), DELEGATING the `const …` grammar to `parse_const_decl` so
+ * the type-member and module placements never diverge. The leading doc (peeled by the member loop) is
+ * threaded onto the returned ConstDecl; the visibility was peeled by `peek_member_const`. A member
+ * const is static/type-level — it takes no layout slot and is resolved by `TypeName::NAME`.
+ *
+ * @param tokens   the token stream
+ * @param pos      the index of the `const` keyword (after the peeled doc/visibility)
+ * @param vis      the visibility peeled by the member loop
+ * @param has_doc  whether a leading doc-comment preceded the member
+ * @param doc      the leading doc-comment's text (valid iff has_doc)
+ * @return         the parsed member ConstDecl and the index past its initializer
+ * @throws         a located error on a missing name / `: Type` / `=` / bad initializer
+ * @since #594
+ */
+fn parse_type_member_const(tokens: []lexer::Token, pos: u64, vis: Visibility, has_doc: bool, doc: str) -> Parsed<ConstDecl> | error {
+    let d = match parse_const_decl(tokens, pos, vis) { Parsed<Decl> as x => x; error as e => return e }
+    let base = match d.node { ConstDecl as c => c; _ => return err_at(tokens, pos, "internal: a member const must parse to a ConstDecl") }
+    let cd = ConstDecl { name = base.name; ty = base.ty; init = base.init; vis = base.vis; has_doc = has_doc; doc = doc; line = base.line; col = base.col }
+    Parsed<ConstDecl> { node = cd; next = d.next }
 }
 
 /**
@@ -881,9 +1079,12 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     let start = attrs.next
     mut k = start
     if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
+    mut vis = Visibility::Private
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) {
+        vis = Visibility::Pub
         k = k + 1
     } else if is_kind_at(tokens, k, lexer::TokenKind::Exp) {
+        vis = Visibility::Exp
         k = k + 1
     }
     mut saw_extern = false
@@ -902,6 +1103,14 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Flags) {
         let d = match parse_flags_decl_with_attrs(tokens, start, k, attrs) { Parsed<Decl> as x => x; error as e => return e }
+        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
+    }
+    if is_kind_at(tokens, k, lexer::TokenKind::Const) {
+        if saw_extern { return err_at(tokens, k, "expected `fn` or `type` after `extern`") }
+        match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => { } }
+        if attrs.di_kind != DiKind::None { return err_at(tokens, k, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may not precede a `const`") }
+        if attrs.must_free { return err_at(tokens, k, "`#must_free` may not precede a `const`") }
+        let d = match parse_const_decl(tokens, k, vis) { Parsed<Decl> as x => x; error as e => return e }
         return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
     }
     if saw_extern {

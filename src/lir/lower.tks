@@ -628,14 +628,67 @@ fn lower_number(ctx: LowerCtx, e: checker::TExpr, n: checker::TNumber) -> Lowere
     Lowered { ctx = ctx_append(r.ctx, inst); vreg = r.vreg }
 }
 
-/** lower_var — a local variable reference -> the VReg it already lives in (no instruction;
-    an SSA-lite value IS the var). A bare fn-as-value (`is_func`) instead builds a closure
-    literal wrapping the referenced top-level function (A1-7, #382 — `lower_fn_value`). */
+/**
+ * lower_var — a local variable reference -> the VReg it already lives in (no instruction; an
+ * SSA-lite value IS the var). A bare fn-as-value (`is_func`) instead builds a closure literal
+ * wrapping the referenced top-level function (A1-7, #382 — `lower_fn_value`). A name that is NOT a
+ * local and NOT a function resolves to a module-level AGGREGATE const materialized in rodata
+ * (`lower_program` interned its bytes up front, #594 crumb 6): the value is the address of that
+ * rodata symbol (`LGlobalAddr`), exactly as a struct/slice value is its base address.
+ *
+ * @param ctx  the lowering context to append the reference's instructions into
+ * @param e    the variable-reference expression (carries its source position)
+ * @param v    the typed variable node (name + fn-as-value marker)
+ * @return     the appended context plus the VReg the value lives in
+ * @throws     when the name is neither a bound local, a fn value, nor an interned aggregate const
+ */
 fn lower_var(ctx: LowerCtx, e: checker::TExpr, v: checker::TVar) -> Lowered | error {
     if v.is_func { return lower_fn_value(ctx, e, v) }
     let hit = lenv_lookup(ctx.env, v.name)
-    if !hit.found { return error { message = teko::str::concat("native backend N1: unbound local `", v.name, "` (internal)") } }
-    Lowered { ctx = ctx; vreg = hit.vreg }
+    if hit.found { return Lowered { ctx = ctx; vreg = hit.vreg } }
+    match find_const_rodata(ctx.rodata, v.name) {
+        LRodata as r => lower_const_addr(ctx, r.symbol, e.line, e.col)
+        null => error { message = teko::str::concat("native backend N1: unbound local `", v.name, "` (internal)") }
+    }
+}
+
+/**
+ * lower_const_addr — the address of a module-level aggregate const's rodata symbol as a Ptr VReg
+ * (`%r = global_addr @<symbol>`), the value an aggregate-const reference lowers to (#594 crumb 6). A
+ * struct/variant const's "value" is this base address (field access reads through it, exactly like a
+ * `TStructInit`); a str/slice const collapses to this ptr in scalar position (its length arrives via
+ * the fat path, `lower_const_fat`).
+ *
+ * @param ctx     the lowering context to append into
+ * @param symbol  the const's already-interned rodata symbol
+ * @param line    the reference's source line
+ * @param col     the reference's source column
+ * @return        the appended context plus the base-address VReg
+ */
+fn lower_const_addr(ctx: LowerCtx, symbol: str, line: u32, col: u32) -> Lowered {
+    let r = ctx_alloc(ctx)
+    Lowered { ctx = ctx_append(r.ctx, global_addr_inst(r.vreg, symbol, line, col)); vreg = r.vreg }
+}
+
+/**
+ * find_const_rodata — the rodata entry that materializes the module-level aggregate const named
+ * `name`, or null when no such const was interned (`lower_program` interns each aggregate const under
+ * the deterministic `const_rodata_symbol(name)` symbol, #594 crumb 6). The lookup keys on that
+ * symbol, so it never collides with a string-literal `.Lstr<N>` entry.
+ *
+ * @param rodata  the module's interned-rodata table
+ * @param name    the referenced const's name
+ * @return        the matching LRodata entry, or null
+ */
+fn find_const_rodata(rodata: []LRodata, name: str) -> LRodata? {
+    let sym = const_rodata_symbol(name)
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        if rodata[i].symbol == sym { return rodata[i] }
+        i++
+    }
+    null
 }
 
 /** lower_binary — lower left then right, then emit the LBin chosen by the RESULT's
@@ -3717,19 +3770,120 @@ pub fn lower_fat_expr(ctx: LowerCtx, e: checker::TExpr) -> LoweredFat | error {
     match e.kind {
         checker::TStrLit as s => lower_str_lit_fat(ctx, e, s)
         checker::TArrayLit as al => lower_array_lit_fat(ctx, e, al)
-        checker::TVar as v => lower_var_fat(ctx, v)
+        checker::TVar as v => lower_var_fat(ctx, e, v)
+        checker::TFieldAccess as fa => lower_fat_field(ctx, fa)
         _ => error { message = teko::str::concat("native backend N1: fat-pointer receiver `", texpr_kind_name(e), "` not yet lowered (N2)") }
     }
 }
 
-/** lower_var_fat — a local variable reference resolved through the FAT env (A1-4, #382); a
-    name bound via the plain scalar `lenv_bind` (no length recorded) is an invariant break —
-    the checker only types a str/slice VAR this way when a `let` bound it, and `lower_binding`
-    always uses `lenv_bind_fat` for a fat-typed value. */
-fn lower_var_fat(ctx: LowerCtx, v: checker::TVar) -> LoweredFat | error {
+/**
+ * lower_fat_field — the (ptr, len) pair of a `[]T`/`str` field of a struct receiver (#594 T-B6): lower
+ * the receiver to its base address, then read ptr = `LLoad(LFieldAddr(base, fieldoff))` (the `Ptr`
+ * class; in a rodata const the slot was relocated to the target array by T-B5/the writers) and len =
+ * `LLoad(LFieldAddr(base, fieldoff + POINTER_SIZE))` (`I64`, the inline element count). Matches the
+ * 16-byte fat-field layout (`layout_of_fields` via `field_layout_size`): ptr@fieldoff, len@fieldoff+8.
+ * This is the arm that lets both engines read an ABI-descriptor const's slice field (the C backend
+ * uses its own `.ptr`/`.len`).
+ *
+ * @param ctx  the lowering context
+ * @param fa   the field access (a struct receiver + a fat field name)
+ * @return     the (ptr, len) fat pair
+ * @throws     when the receiver is not a struct with a registered layout, or the field is unknown
+ * @since #594 T-B6
+ */
+fn lower_fat_field(ctx: LowerCtx, fa: checker::TFieldAccess) -> LoweredFat | error {
+    let ro = match lower_expr(ctx, fa.receiver) { Lowered as x => x; error as e => return e }
+    let name = match named_type_name(fa.receiver.type) { str as s => s; error as e => return e }
+    let layout = match find_struct_layout(ro.ctx.layouts, name) { LStructLayout as l => l; error as e => return e }
+    let off = match field_offset_of(layout, fa.field) { u32 as o => o; error as e => return e }
+    let pa = ctx_alloc(ro.ctx)
+    let with_pa = ctx_append(pa.ctx, field_addr_inst(pa.vreg, ro.vreg, off, fa.receiver.line, fa.receiver.col))
+    let pr = ctx_alloc(with_pa)
+    let with_pr = ctx_append(pr.ctx, load_inst(pr.vreg, pa.vreg, LType::Ptr, fa.receiver.line, fa.receiver.col))
+    let la = ctx_alloc(with_pr)
+    let with_la = ctx_append(la.ctx, field_addr_inst(la.vreg, ro.vreg, off + ltype_size(LType::Ptr), fa.receiver.line, fa.receiver.col))
+    let lr = ctx_alloc(with_la)
+    LoweredFat { ctx = ctx_append(lr.ctx, load_inst(lr.vreg, la.vreg, LType::I64, fa.receiver.line, fa.receiver.col)); ptr = pr.vreg; len = lr.vreg }
+}
+
+/**
+ * lower_var_fat — a str/slice variable reference to its (ptr, len) fat pair (A1-4, #382). A local
+ * bound via `lenv_bind_fat` (a `let` of str/slice type) resolves through the FAT env; a name that is
+ * NOT a fat local resolves to a module-level str/slice AGGREGATE const materialized in rodata (#594
+ * crumb 6), whose ptr is its rodata symbol and whose len is derived from the interned byte count.
+ *
+ * @param ctx  the lowering context
+ * @param e    the fat-valued reference expression (carries its str/slice type + source position)
+ * @param v    the typed variable node (the referenced name)
+ * @return     the (ptr, len) fat pair
+ * @throws     when the name is neither a fat local nor an interned str/slice aggregate const
+ */
+fn lower_var_fat(ctx: LowerCtx, e: checker::TExpr, v: checker::TVar) -> LoweredFat | error {
     let hit = lenv_lookup_fat(ctx.env, v.name)
-    if !hit.found || !hit.has_len { return error { message = teko::str::concat("native backend N1: `", v.name, "` is not a fat-pointer local (internal)") } }
-    LoweredFat { ctx = ctx; ptr = hit.ptr; len = hit.len }
+    if hit.found && hit.has_len { return LoweredFat { ctx = ctx; ptr = hit.ptr; len = hit.len } }
+    match find_const_rodata(ctx.rodata, v.name) {
+        LRodata as r => lower_const_fat(ctx, e, r)
+        null => error { message = teko::str::concat("native backend N1: `", v.name, "` is not a fat-pointer local (internal)") }
+    }
+}
+
+/**
+ * lower_const_fat — a module-level str/slice aggregate const's (ptr, len) fat pair (#594 crumb 6):
+ * the ptr is the address of its interned rodata symbol (`LGlobalAddr`) and the len is its element
+ * count, derived from the interned byte count and the value's own type — a `str` counts its raw UTF-8
+ * bytes (stride 1), a `[]T` counts elements at the SAME element stride the indexer uses
+ * (`ltype_of(element)`), so a `.len` read and a `[i]` read agree.
+ *
+ * @param ctx  the lowering context to append into
+ * @param e    the fat-valued reference expression (its str/slice type + source position)
+ * @param r    the const's interned rodata entry (symbol + raw bytes)
+ * @return     the (ptr, len) fat pair
+ * @throws     when the reference's type is not a str/slice (an interned aggregate never is otherwise)
+ */
+fn lower_const_fat(ctx: LowerCtx, e: checker::TExpr, r: LRodata) -> LoweredFat | error {
+    let n = match const_fat_len(e.type, r.bytes.len to u32) { u32 as x => x; error as err => return err }
+    let ptr = ctx_alloc(ctx)
+    let with_ptr = ctx_append(ptr.ctx, global_addr_inst(ptr.vreg, r.symbol, e.line, e.col))
+    let lenr = ctx_alloc(with_ptr)
+    let with_len = ctx_append(lenr.ctx, const_int_inst(lenr.vreg, n to i128, e.line, e.col))
+    LoweredFat { ctx = with_len; ptr = ptr.vreg; len = lenr.vreg }
+}
+
+/**
+ * const_fat_len — the element count of a materialized str/slice aggregate const from its interned
+ * byte length and its type (#594 crumb 6): a `str` is `byte_len` raw bytes (stride 1); a `[]T` is
+ * `byte_len / stride` where `stride = ltype_size(ltype_of(element))`, the EXACT stride
+ * `lower_index_slice` folds an index against — so the length and the indexing agree byte-for-byte on
+ * both engines.
+ *
+ * @param t         the const's resolved value type (`Str` or `Slice`)
+ * @param byte_len  the interned rodata blob's byte length
+ * @return          the element count the fat pair's len half carries
+ * @throws          when `t` is neither a str nor a slice (unreachable for an interned aggregate)
+ */
+fn const_fat_len(t: checker::Type, byte_len: u32) -> u32 | error {
+    match t {
+        checker::Str => byte_len
+        checker::Slice as s => const_slice_len(s.element, byte_len)
+        _ => error { message = "native backend N1: aggregate const fat receiver is not a str/slice (internal)" }
+    }
+}
+
+/**
+ * const_slice_len — a materialized `[]T` const's element count: `byte_len / stride`, with the element
+ * stride taken from `ltype_of(element)` so it matches `lower_index_slice` (#594 crumb 6). A
+ * zero-stride element (a `void`-classed type) never reaches here — the serializer rejects it — so the
+ * division is always exact.
+ *
+ * @param element   the slice's element type
+ * @param byte_len  the interned rodata blob's byte length
+ * @return          the element count
+ * @throws          when the element's machine stride is zero (unreachable — rejected at serialize)
+ */
+fn const_slice_len(element: checker::Type, byte_len: u32) -> u32 | error {
+    let stride = ltype_size(ltype_of(element))
+    if stride == 0 { return error { message = "native backend N1: aggregate const slice has a zero-stride element (internal)" } }
+    byte_len / stride
 }
 
 /** rodata_symbol — the deterministic symbol for the Nth interned rodata entry — an
@@ -3762,7 +3916,7 @@ pub type InternedRodata = struct { ctx: LowerCtx; symbol: str }
     lowering's correctness. */
 fn intern_rodata(ctx: LowerCtx, text: str) -> InternedRodata {
     let sym = rodata_symbol(ctx.rodata.len)
-    let entry = LRodata { symbol = sym; bytes = str_to_bytes(text) }
+    let entry = LRodata { symbol = sym; bytes = str_to_bytes(text); relocs = teko::list::empty() }
     InternedRodata { ctx = ctx_with_rodata(ctx, teko::list::push(ctx.rodata, entry)); symbol = sym }
 }
 
@@ -4514,7 +4668,8 @@ fn param_ltypes(params: []parser::Param) -> []LType {
 
 /**
  * lower_program — the module entry: register every declared struct's layout
- * (A1-3, #382), collect every declared enum's members (A1-5, #382), lower every
+ * (A1-3, #382), collect every declared enum's members (A1-5, #382), intern every
+ * Tier-A aggregate const's byte image into rodata (#594 crumb 6), lower every
  * top-level function, and gather the loose top-level statements into a
  * synthesized `main` (the VIRTUAL-MAIN the C backend also builds), returning
  * `int 0` if the statements fall through. Type/use declarations otherwise carry
@@ -4529,7 +4684,8 @@ fn param_ltypes(params: []parser::Param) -> []LType {
 pub fn lower_program(prog: checker::TProgram) -> LModule | error {
     let layouts = collect_struct_layouts(prog)
     let enums = collect_enums(prog)
-    mut m = register_layouts(empty_module(), layouts)
+    let variants = collect_variants(prog)
+    mut m = match intern_aggregate_consts(register_layouts(empty_module(), layouts), prog.items, layouts, variants) { LModule as x => x; error as e => return e }
     mut loose: []checker::TStatement = teko::list::empty()
     mut lifted: []LFunc = teko::list::empty()
     mut i: u64 = 0
@@ -4648,8 +4804,8 @@ fn layout_of_fields(name: str, fields: []parser::Field, known: []LStructLayout) 
         let nested = struct_layout_of_field(te, known)
         field_names = teko::list::push(field_names, fields[i].name)
         field_types = teko::list::push(field_types, ft)
-        field_sizes = teko::list::push(field_sizes, field_size_of(ft, nested))
-        field_aligns = teko::list::push(field_aligns, field_align_of(ft, nested))
+        field_sizes = teko::list::push(field_sizes, field_layout_size(te, ft, nested))
+        field_aligns = teko::list::push(field_aligns, field_layout_align(te, ft, nested))
         i++
     }
     layout_of_sized(name, field_names, field_types, field_sizes, field_aligns)
@@ -4753,6 +4909,71 @@ fn field_align_of(ft: LType, nested: LStructLayout?) -> u32 {
 }
 
 /**
+ * typeexpr_is_fat — true iff the syntactic annotation `te` is a fat-pointer type (a `[]T` slice or
+ * `str`), the field whose layout occupies 16 bytes `{ptr, len}` instead of the scalar fallback's
+ * 8-byte `Ptr` (#594 T-B6). A `char`/Named-by-value/`ptr<T>` is NOT fat (it is an 8-byte `Ptr` or a
+ * nested struct), so it does not match here.
+ *
+ * @param te  the field's syntactic type annotation
+ * @return    whether the field is a fat pointer (16 bytes {ptr, len})
+ * @since #594 T-B6
+ */
+fn typeexpr_is_fat(te: parser::TypeExpr) -> bool {
+    match te {
+        parser::SliceType => true
+        parser::NamedType as nt => named_single_segment_is(nt.path, "str")
+        _ => false
+    }
+}
+
+/**
+ * named_single_segment_is — true iff `p` is a single-segment path whose lone segment name equals
+ * `want` (#594 T-B6): the shape a bare `str` type annotation takes (`str`, not `a::str`).
+ *
+ * @param p     the path to inspect
+ * @param want  the segment name to match
+ * @return      whether `p` is the single segment `want`
+ * @since #594 T-B6
+ */
+fn named_single_segment_is(p: parser::Path, want: str) -> bool {
+    match single_segment_name(p) {
+        str as s => s == want
+        null => false
+    }
+}
+
+/**
+ * field_layout_size — a field's byte size, widening a fat-pointer field (`[]T`/`str`) to the 16-byte
+ * `{ptr, len}` image and otherwise deferring to `field_size_of` (#594 T-B6). The 16-byte width is the
+ * layout the aggregate-const serializer writes (`{ptr@off, len@off+8}`) and the reader loads.
+ *
+ * @param te      the field's syntactic type annotation (the fat-vs-scalar signal)
+ * @param ft      the field's machine class (`ltype_of_typeexpr`'s mapping)
+ * @param nested  the field's nested struct layout, when known
+ * @return        the field's byte size
+ * @since #594 T-B6
+ */
+fn field_layout_size(te: parser::TypeExpr, ft: LType, nested: LStructLayout?) -> u32 {
+    if typeexpr_is_fat(te) { return ltype_size(LType::Ptr) * (2 to u32) }
+    field_size_of(ft, nested)
+}
+
+/**
+ * field_layout_align — a field's byte alignment, pinning a fat-pointer field (`[]T`/`str`) to
+ * pointer alignment and otherwise deferring to `field_align_of` (#594 T-B6).
+ *
+ * @param te      the field's syntactic type annotation (the fat-vs-scalar signal)
+ * @param ft      the field's machine class (`ltype_of_typeexpr`'s mapping)
+ * @param nested  the field's nested struct layout, when known
+ * @return        the field's byte alignment
+ * @since #594 T-B6
+ */
+fn field_layout_align(te: parser::TypeExpr, ft: LType, nested: LStructLayout?) -> u32 {
+    if typeexpr_is_fat(te) { return ltype_align(LType::Ptr) }
+    field_align_of(ft, nested)
+}
+
+/**
  * collect_enums — the name + declared member list of every `enum` type
  * declaration in `prog`, in program order (A1-5, #382 — a `match` arm's bare
  * enum-member pattern resolves its ORDINAL through this table). A non-enum type
@@ -4829,8 +5050,55 @@ fn lower_item(m: LModule, loose: []checker::TStatement, it: checker::TItem, layo
     match it {
         checker::TFunction as f => lower_item_function(m, loose, f, layouts, enums, lifted)
         checker::TStatement as s => LowerItemOut { module = m; loose = teko::list::push(loose, s); lifted = lifted }
+        checker::TConstDecl as cd => lower_const_item(m, loose, cd, lifted)
         _ => LowerItemOut { module = m; loose = loose; lifted = lifted }
     }
+}
+
+/**
+ * const_decl_is_scalar — true iff a residual TConstDecl's declared type is SCALAR (a primitive
+ * int/float/bool, a `byte`, or a `char`), the family the crumb-5 inliner substitutes at every use
+ * site and drops from the program (#594 crumb 5). Mirrors the checker's `is_scalar_const_type`; kept
+ * local so the lowering stays self-contained.
+ *
+ * @param t  the residual const's resolved value type
+ * @return   whether `t` is a scalar (inline-at-use) const type
+ */
+fn const_decl_is_scalar(t: checker::Type) -> bool {
+    match t {
+        checker::Slice => false
+        checker::Str => false
+        checker::Optional => false
+        checker::Named => false
+        checker::Variant => false
+        checker::Func => false
+        checker::Error => false
+        checker::Void => false
+        checker::Ptr => false
+        checker::Uptr => false
+        checker::Reference => false
+        checker::Prim => true
+        checker::Byte => true
+        checker::Char => true
+    }
+}
+
+/**
+ * lower_const_item — fold a residual TConstDecl in the item loop: a NO-OP for BOTH families (#594
+ * crumb 6). A SCALAR const was inlined at every use and dropped by `inline_consts` (post-monomorphize)
+ * — it emits no `LFunc`, no `LGlobal`. An AGGREGATE (Tier-A) const's byte image was already interned
+ * into rodata by `intern_aggregate_consts`, BEFORE any function lowered, and every use resolves to
+ * that rodata symbol — so the declaration itself contributes no further code here. `m.globals` stays
+ * empty for either family (rodata, never a global), so no globals honest-stop is reachable.
+ *
+ * @param m       the module accumulated so far
+ * @param loose   the loose top-level statements accumulated so far
+ * @param cd      the residual typed const declaration (unused — kept for the item-fold shape)
+ * @param lifted  the whole-program lifted closure/thunk-function table
+ * @return        the module unchanged (const decls emit no per-item code)
+ */
+fn lower_const_item(m: LModule, loose: []checker::TStatement, cd: checker::TConstDecl, lifted: []LFunc) -> LowerItemOut | error {
+    LowerItemOut { module = m; loose = loose; lifted = lifted }
 }
 
 /**

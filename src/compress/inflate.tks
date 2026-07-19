@@ -130,12 +130,11 @@ type HuffTable = struct {
 }
 
 /**
- * The largest DEFLATE Huffman code length reachable (RFC 1951 caps literal/length and
- * distance codes at 15 bits; the code-length alphabet itself at 7).
- *
- * @return  `15`
+ * `MAX_HUFFMAN_BITS` — the largest DEFLATE Huffman code length reachable
+ * (RFC 1951 caps literal/length and distance codes at 15 bits; the
+ * code-length alphabet itself at 7).
  */
-fn max_huffman_bits() -> u32 { 15 }
+const MAX_HUFFMAN_BITS: u32 = 15
 
 /**
  * Count how many entries of `lengths` equal `len`.
@@ -162,14 +161,14 @@ fn count_symbols_of_length(lengths: []u32, len: u32) -> u32 {
  * @param lengths  the per-symbol code-length array (`0` = symbol unused)
  * @return         the fully-built `HuffTable`, or an `error` if the lengths do not form a
  *                 valid (over- or under-subscribed) canonical code
- * @throws         when the codes assigned would exceed `max_huffman_bits()` capacity at
+ * @throws         when the codes assigned would exceed `MAX_HUFFMAN_BITS` capacity at
  *                  some length (an over-subscribed code)
  */
 fn build_huffman(lengths: []u32) -> HuffTable | error {
     mut count: []u32 = teko::list::push(teko::list::empty(), 0 to u32)
     mut len: u32 = 1
     loop {
-        if len > max_huffman_bits() { break }
+        if len > MAX_HUFFMAN_BITS { break }
         count = teko::list::push(count, count_symbols_of_length(lengths, len))
         len++
     }
@@ -180,7 +179,7 @@ fn build_huffman(lengths: []u32) -> HuffTable | error {
     mut index: u32 = 0
     len = 1
     loop {
-        if len > max_huffman_bits() { break }
+        if len > MAX_HUFFMAN_BITS { break }
         code = (code + count[len - 1]) << 1
         first_code = teko::list::push(first_code, code)
         first_index = teko::list::push(first_index, index)
@@ -192,7 +191,7 @@ fn build_huffman(lengths: []u32) -> HuffTable | error {
     mut symbols_by_len: []u32 = teko::list::empty()
     len = 1
     loop {
-        if len > max_huffman_bits() { break }
+        if len > MAX_HUFFMAN_BITS { break }
         mut sym: u64 = 0
         loop {
             if sym >= lengths.len { break }
@@ -224,14 +223,14 @@ type SymbolResult = struct {
  * @param table  the Huffman table to decode against
  * @return       the decoded symbol and the advanced cursor, or an `error` on a malformed
  *               (unassigned) code or stream truncation
- * @throws       when no valid symbol is found within `max_huffman_bits()` bits
+ * @throws       when no valid symbol is found within `MAX_HUFFMAN_BITS` bits
  */
 fn decode_symbol(r: BitReader, table: HuffTable) -> SymbolResult | error {
     mut cur = r
     mut code: u32 = 0
     mut len: u32 = 1
     loop {
-        if len > max_huffman_bits() { return error { message = "inflate: invalid Huffman code" } }
+        if len > MAX_HUFFMAN_BITS { return error { message = "inflate: invalid Huffman code" } }
         let step = match read_bit(cur) { BitResult as b => b; error as e => return e }
         code = (code << 1) | step.bit
         cur = step.next
@@ -423,7 +422,7 @@ fn inflate_stored_block(state: InflateState) -> InflateState | error {
     if aligned.byte_pos + 4 > aligned.data.len { return error { message = "inflate: truncated stored-block header" } }
     let len = (aligned.data[aligned.byte_pos] to u64) | ((aligned.data[aligned.byte_pos + 1] to u64) << 8)
     let nlen = (aligned.data[aligned.byte_pos + 2] to u64) | ((aligned.data[aligned.byte_pos + 3] to u64) << 8)
-    if (nlen & 0xFFFF) != ((~len) & 0xFFFF) { return error { message = "inflate: stored-block NLEN check failed" } }
+    if (nlen & (DEFLATE_STORED_LEN_MASK to u64)) != ((~len) & (DEFLATE_STORED_LEN_MASK to u64)) { return error { message = "inflate: stored-block NLEN check failed" } }
 
     let data_start = aligned.byte_pos + 4
     if data_start + len > aligned.data.len { return error { message = "inflate: truncated stored-block data" } }
@@ -648,25 +647,12 @@ fn inflate_dynamic_block(state: InflateState) -> InflateState | error {
 }
 
 /**
- * The DEFLATE block-type code for a stored (uncompressed) block (RFC 1951 §3.2.3).
- *
- * @return  `0`
+ * The DEFLATE `BTYPE` tag (RFC 1951 §3.2.3): `Stored` (uncompressed, code `0`), `Fixed`
+ * (fixed-Huffman, code `1`), or `Dynamic` (dynamic-Huffman, code `2`). The declaration
+ * order fixes the ordinal to the on-the-wire `BTYPE` code, so `btype to BlockType`
+ * reproduces the wire value directly — no separate wire-mapping helper is needed.
  */
-fn block_type_stored() -> u32 { 0 }
-
-/**
- * The DEFLATE block-type code for a fixed-Huffman block.
- *
- * @return  `1`
- */
-fn block_type_fixed() -> u32 { 1 }
-
-/**
- * The DEFLATE block-type code for a dynamic-Huffman block.
- *
- * @return  `2`
- */
-fn block_type_dynamic() -> u32 { 2 }
+pub type BlockType = enum { Stored; Fixed; Dynamic }
 
 /**
  * The result of decoding one DEFLATE block: the advanced state plus whether it was the
@@ -695,19 +681,21 @@ fn inflate_one_block(state: InflateState) -> BlockResult | error {
     let btype = type_step.value
     let body_state = InflateState { reader = type_step.next; output = state.output }
 
-    if btype == block_type_stored() {
-        let next = match inflate_stored_block(body_state) { InflateState as s => s; error as e => return e }
-        return BlockResult { state = next; is_final = is_final }
+    match btype to BlockType {
+        Stored => {
+            let next = match inflate_stored_block(body_state) { InflateState as s => s; error as e => return e }
+            BlockResult { state = next; is_final = is_final }
+        }
+        Fixed => {
+            let next = match inflate_fixed_block(body_state) { InflateState as s => s; error as e => return e }
+            BlockResult { state = next; is_final = is_final }
+        }
+        Dynamic => {
+            let next = match inflate_dynamic_block(body_state) { InflateState as s => s; error as e => return e }
+            BlockResult { state = next; is_final = is_final }
+        }
+        _ => error { message = "inflate: reserved block type (BTYPE 3)" }
     }
-    if btype == block_type_fixed() {
-        let next = match inflate_fixed_block(body_state) { InflateState as s => s; error as e => return e }
-        return BlockResult { state = next; is_final = is_final }
-    }
-    if btype == block_type_dynamic() {
-        let next = match inflate_dynamic_block(body_state) { InflateState as s => s; error as e => return e }
-        return BlockResult { state = next; is_final = is_final }
-    }
-    error { message = "inflate: reserved block type (BTYPE 3)" }
 }
 
 /**

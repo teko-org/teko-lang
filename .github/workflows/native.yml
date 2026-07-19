@@ -128,12 +128,7 @@ jobs:
       # retired, issue #524).
       - name: Test gate (native on the primary; compile-only elsewhere — perf)
         shell: bash
-        run: |
-          if [ "${{ matrix.full_gate }}" = "true" ]; then
-            teko . -o bin
-          else
-            teko . -o bin --no-verify
-          fi
+        run: teko . -o bin --no-verify
 
       # fmt gate REMOVED (owner ruling 2026-07-08): `teko fmt` is a DEV tool for canonical
       # formatting, NOT a gate to bar code. The current fmt collapses hand-alignment, so it
@@ -262,7 +257,7 @@ jobs:
       # fix in this PR is actually exercised (a raw-seed diff would test the old release).
       - name: Build gen1 (released seed compiles the PR corpus → bin/teko)
         shell: bash
-        run: teko . -o bin
+        run: teko . -o bin --no-verify
 
       # NOTE (owner design 2026-07-15): the "gen1 self-test" step (`./bin/teko test .`) was
       # MOVED OUT of this job into the isolated .github/workflows/tests.yml, which runs the
@@ -291,6 +286,45 @@ jobs:
         env:
           TEKO: ./bin/teko
         run: ./scripts/native_regressions.sh
+
+      # EXPECT_COMPILE_FAIL assertion (issue #610, on gen1): ~30 negative regression
+      # fixtures under examples/regressions/ carry an EXPECT_COMPILE_FAIL marker but no CI
+      # leg ever built them and asserted the build actually fails — sanitizers.yml only
+      # SKIPS them, and the VM-era scripts/diff_vm_native.sh that once asserted this was
+      # retired with the VM lane (#524/#395). This step closes that gap on gen1 (the
+      # compiler under test).
+      - name: EXPECT_COMPILE_FAIL regression check (issue #610, on gen1)
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+        run: ./scripts/compile_fail_regressions.sh
+
+      # EXPECT_EXIT positive const regression (issue #594 crumb 8f, on gen1): the positive
+      # counterpart of the check above — ~9 const fixtures under examples/regressions/
+      # (const_scalar_inline, member_const_scalar, …) carry an EXPECT_EXIT marker but no CI
+      # leg ever built and ran them (scripts/native_regressions.sh only smokes char_ops). A
+      # fundamental const-resolution bug (collect_with_seed) was caught only by a unit test —
+      # this step builds + runs every single-project EXPECT_EXIT fixture on gen1 (the
+      # compiler under test), asserting the produced binary's exit code, before any seed
+      # bump can ship a const regression unnoticed.
+      - name: EXPECT_EXIT positive const regression check (issue #594 crumb 8f, on gen1)
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+        run: ./scripts/positive_regressions.sh
+
+      # E2E cross-module const regression (issue #594 crumb 8d, on gen1): the
+      # serialize -> .tkl -> deserialize -> seed_from_dep -> inline_consts -> lower -> run
+      # capability (#594 crumb 8) was previously proven only by in-memory checker unit
+      # tests. This step builds the real dep/consumer PAIR under examples/regressions/
+      # (a fixture the generic build-all loops skip by construction — no top-level .tkp),
+      # provisioning packages/ in a scratch copy for BOTH the seed and self-hosted
+      # compilers, closing the harness gap named in the #594 crumb-8 review.
+      - name: E2E cross-module const regression check (issue #594 crumb 8d, on gen1)
+        shell: bash
+        env:
+          TEKO: ./bin/teko
+        run: ./scripts/crossmodule_regressions.sh
 
       # ── C-vs-own differential (issue #385 A4-5 arm64; issue #386 B1-8 x86-64) ──
       # The own AOT backend (TEKO_BACKEND=native) links a real native executable via cc.

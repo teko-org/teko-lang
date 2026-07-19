@@ -429,7 +429,7 @@ fn iwt_bytes_of(s: str) -> []byte {
 /** iwt_one_rodata — a one-entry rodata table (the shape `lower_str_bytes_fat` interns —
     A1-4, #382). */
 fn iwt_one_rodata(symbol: str, text: str) -> []LRodata {
-    teko::list::push(teko::list::empty(), LRodata { symbol = symbol; bytes = iwt_bytes_of(text) })
+    teko::list::push(teko::list::empty(), LRodata { symbol = symbol; bytes = iwt_bytes_of(text); relocs = teko::list::empty() })
 }
 
 /** iwt_str_len_exit — F13: `exit("hello".len)` hand-built exactly as `lower_len_field`
@@ -1180,4 +1180,61 @@ fn iwt_defer_return_exit() -> LModule {
 #test
 fn iwt_f9_defer_observed_side_effect_via_return_value() {
     teko::assert::is_true(interp_lmodule(iwt_defer_return_exit(), "main", iwt_no_args()) == iwt_i128(101))
+}
+
+/**
+ * T-B5: a semeadura resolve um ponteiro rodata-interno — a célula do slot recebe o
+ * ÍNDICE DE CÉLULA do datum-alvo (o endereço na memória da VM), e um load naquela
+ * célula seguido de um load no endereço devolvido alcança o byte-alvo (deref
+ * end-to-end). O word alto do slot permanece zero.
+ */
+#test
+fn tb5_vm_resolves_internal_pointer() {
+    let slot = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
+    let p = LRodata { symbol = "p"; bytes = slot; relocs = teko::list::push(teko::list::empty(), data_reloc(0 to u32, "t")) }
+    let t = LRodata { symbol = "t"; bytes = iwt_bytes_of("A"); relocs = teko::list::empty() }
+    mut rodata: []LRodata = teko::list::empty()
+    rodata = teko::list::push(rodata, p)
+    rodata = teko::list::push(rodata, t)
+    let m = LModule { funcs = teko::list::empty(); rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
+    match seed_rodata(m) {
+        MemStore as mem => {
+            let slot_read = mem_load(mem, 0 to i128)
+            teko::assert::is_true(slot_read.ok)
+            teko::assert::is_true(slot_read.value == (8 to i128))
+            let hi_read = mem_load(mem, 1 to i128)
+            teko::assert::is_true(hi_read.ok)
+            teko::assert::is_true(hi_read.value == (0 to i128))
+            let target_read = mem_load(mem, 8 to i128)
+            teko::assert::is_true(target_read.ok)
+            teko::assert::is_true(target_read.value == (65 to i128))
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * T-B5: relocs vazio é identidade (o braço de toda compilação real) e alvo
+ * desconhecido é erro nomeado — a run inteira devolve o sentinela -1 via
+ * interp_lmodule, nunca um miscompile silencioso.
+ */
+#test
+fn tb5_vm_empty_identity_and_unknown_target() {
+    let a = LRodata { symbol = "a"; bytes = iwt_bytes_of("hi"); relocs = teko::list::empty() }
+    let m0 = LModule { funcs = teko::list::empty(); rodata = teko::list::push(teko::list::empty(), a); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match seed_rodata(m0) {
+        MemStore as mem => {
+            let a_read = mem_load(mem, 0 to i128)
+            teko::assert::is_true(a_read.ok)
+            teko::assert::is_true(a_read.value == (104 to i128))
+        }
+        error => teko::assert::is_true(false)
+    }
+    let bad = LRodata { symbol = "p"; bytes = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]; relocs = teko::list::push(teko::list::empty(), data_reloc(0 to u32, "nope")) }
+    let m1 = LModule { funcs = teko::list::empty(); rodata = teko::list::push(teko::list::empty(), bad); globals = teko::list::empty(); layouts = teko::list::empty() }
+    match seed_rodata(m1) {
+        MemStore => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "unknown rodata symbol")
+    }
+    teko::assert::is_true(interp_lmodule(m1, "main", teko::list::empty()) == ((0 to i128) - (1 to i128)))
 }

@@ -1,0 +1,634 @@
+/**
+ * The named ARM64 encoding constants for `encode_arm64`: the AArch64
+ * instruction-field masks/shifts and fixed-width opcode-word templates the
+ * encoder assembles words from, split out as a sibling of the same
+ * `backend` namespace. Each is named `ARM64_<ROLE>` (a bit mask/shift) or
+ * `ARM64_<MNEMONIC>[_<FORM>]` (a 32-bit instruction template); the golden
+ * hex vectors in `encode_arm64_test.tkt` pin every value.
+ */
+
+/**
+ * ARM64_BYTE_MASK — the low-8-bits mask `emit_u32_le` runs each of a word's four
+ * bytes through before narrowing to `byte`. The first of this file's whole W15
+ * sweep (crumb S3) of named AArch64 instruction-field masks/shifts and
+ * opcode-word constants below: each is named `ARM64_<ROLE>` (a bit mask/shift)
+ * or `ARM64_<MNEMONIC>[_<FORM>]` (a fixed-width 32-bit instruction template),
+ * and its value is EXACTLY the encoding bit pattern the corpus's golden hex
+ * vectors (`encode_arm64_test.tkt`) already pin — only the SOURCE SPELLING
+ * changes; every emitted word stays identical (those goldens prove it).
+ */
+const ARM64_BYTE_MASK: u32 = 0xFF to u32
+
+/**
+ * ARM64_BITS_PER_BYTE — the bit width of one byte: `emit_u32_le`'s shift-per-
+ * index step when slicing a word into its four little-endian bytes (the arm64
+ * mirror of `encode_x86_64.tks`'s `X86_BITS_PER_BYTE`).
+ */
+const ARM64_BITS_PER_BYTE: u32 = 8 to u32
+
+/**
+ * ARM64_RN_SHIFT — the bit position of the `Rn` first-source/base register
+ * field (bits 5-9), shared by every register-field template (`enc_rn`) and by
+ * every SP-relative memory/frame instruction below, which places the fixed
+ * register id `ARM64_SP_ID` at this same field.
+ */
+const ARM64_RN_SHIFT: u32 = 5 to u32
+
+/**
+ * ARM64_RM_SHIFT — the bit position of the `Rm` second-source register field
+ * (bits 16-20), `enc_rm`'s field placement.
+ */
+const ARM64_RM_SHIFT: u32 = 16 to u32
+
+/**
+ * ARM64_REG2_SHIFT — the bit position of a template's second/accumulator
+ * register field (bits 10-14): `Ra` in the MADD/MSUB 3-register-plus-
+ * accumulator form (`enc_ra`), and `Rt2` in the STP/LDP register-pair form
+ * (`stp_gpr`/`ldp_gpr`/`stp_fpr`/`ldp_fpr`) — the same bit slot, two families.
+ */
+const ARM64_REG2_SHIFT: u32 = 10 to u32
+
+/**
+ * ARM64_IMM12_SHIFT — the bit position of a 12-bit scaled/unscaled immediate
+ * field (bits 10-21): the ADD/SUB/CMP immediate form and every LDR/STR/STP/LDP
+ * unsigned-offset form below place their immediate here.
+ */
+const ARM64_IMM12_SHIFT: u32 = 10 to u32
+
+/**
+ * ARM64_IMM7_SHIFT — the bit position of the STP/LDP signed 7-bit scaled
+ * immediate field (bits 15-21).
+ */
+const ARM64_IMM7_SHIFT: u32 = 15 to u32
+
+/**
+ * ARM64_COND_SHIFT — the bit position of CSET's inverted-condition field
+ * (bits 12-15), the CSINC encoding `encode_cset` builds.
+ */
+const ARM64_COND_SHIFT: u32 = 12 to u32
+
+/**
+ * ARM64_MOVI_LANE_BITS — the width in bits of one MOVZ/MOVK/MOVN 16-bit
+ * immediate lane, the divisor `encode_movi` uses to turn a bit `shift`
+ * (0/16/32/48) into the `hw` lane-selector field.
+ */
+const ARM64_MOVI_LANE_BITS: u32 = 16 to u32
+
+/**
+ * ARM64_MOVI_HW_SHIFT — the bit position of the MOVZ/MOVK/MOVN 16-bit-lane
+ * selector field `hw` (bits 21-22), `encode_movi`'s `shift/16` placement.
+ */
+const ARM64_MOVI_HW_SHIFT: u32 = 21 to u32
+
+/**
+ * ARM64_MOVI_IMM16_SHIFT — the bit position of the MOVZ/MOVK/MOVN 16-bit
+ * immediate lane (bits 5-20), `encode_movi`'s `imm16` placement.
+ */
+const ARM64_MOVI_IMM16_SHIFT: u32 = 5 to u32
+
+/**
+ * ARM64_BCOND_IMM19_SHIFT — the bit position of the B.cond/CBZ/CBNZ signed
+ * 19-bit displacement field (bits 5-23), `branch_disp_field`'s form-1
+ * placement.
+ */
+const ARM64_BCOND_IMM19_SHIFT: u32 = 5 to u32
+
+/**
+ * ARM64_SF_SHIFT — the bit position of the `sf` (64-bit operand size) flag
+ * (bit 31), `sf_bit`'s field placement.
+ */
+const ARM64_SF_SHIFT: u32 = 31 to u32
+
+/**
+ * ARM64_IMM16_MASK — the 16-bit width mask of the MOVZ/MOVK/MOVN immediate
+ * lane, `encode_movi`'s `imm16 & ARM64_IMM16_MASK`.
+ */
+const ARM64_IMM16_MASK: u32 = 0xFFFF to u32
+
+/**
+ * ARM64_IMM12_MASK — the 12-bit width mask of a scaled/unscaled immediate
+ * field, applied before every `ARM64_IMM12_SHIFT` placement below.
+ */
+const ARM64_IMM12_MASK: u32 = 0xFFF to u32
+
+/**
+ * ARM64_IMM7_MASK — the 7-bit width mask of the STP/LDP scaled immediate
+ * field, applied before every `ARM64_IMM7_SHIFT` placement.
+ */
+const ARM64_IMM7_MASK: u32 = 0x7F to u32
+
+/**
+ * ARM64_COND_MASK — the 4-bit width mask of an AArch64 condition field
+ * (`cond_code`'s range), applied in `encode_cset`/`encode_branch_cond`.
+ */
+const ARM64_COND_MASK: u32 = 0xF to u32
+
+/**
+ * ARM64_IMM12_MAX — the largest signed-immediate magnitude (`i64`) the inline
+ * 12-bit ADD/SUB/CMP field can hold before the sign/negative-swap decomposition
+ * (`encode_alu_imm`/`encode_cmp_imm`); a magnitude past this raises
+ * `A4-bigimm`.
+ */
+const ARM64_IMM12_MAX: i64 = 4095 to i64
+
+/**
+ * ARM64_IMM12_FIELD_MAX — the largest already-scaled/unsigned 12-bit field
+ * value (`u32`) the inline immediate can hold (`scaled_offset`'s load/store
+ * offset, `encode_frame_addr`'s slot offset); past this the caller raises its
+ * named honest-stop (`A4-ldur`/`A4-bigframe`).
+ */
+const ARM64_IMM12_FIELD_MAX: u32 = 4095 to u32
+
+/**
+ * ARM64_IMM7_MAX_POS — the largest non-negative STP/LDP scaled pair offset
+ * (`frame_fits`'s bound): the frame layout never produces a negative pair
+ * offset, so this alone guards the signed 7-bit field's positive half.
+ */
+const ARM64_IMM7_MAX_POS: u32 = 63 to u32
+
+/**
+ * ARM64_IMM26_BITS — the field width of the unconditional-branch (B)
+ * displacement, `twos_field`'s form-0 width (`branch_disp_field`).
+ */
+const ARM64_IMM26_BITS: u32 = 26 to u32
+
+/**
+ * ARM64_IMM19_BITS — the field width of the B.cond/CBZ/CBNZ displacement,
+ * `twos_field`'s form-1 width (`branch_disp_field`).
+ */
+const ARM64_IMM19_BITS: u32 = 19 to u32
+
+/**
+ * ARM64_IMM26_MAX — the largest positive word-displacement the signed 26-bit
+ * B field holds (`imm26_fits`'s upper bound, `2^25 - 1`).
+ */
+const ARM64_IMM26_MAX: i64 = 33554431 to i64
+
+/**
+ * ARM64_IMM26_MIN_MAGNITUDE — the magnitude of the smallest (most negative)
+ * word-displacement the signed 26-bit B field holds (`imm26_fits`'s lower
+ * bound magnitude, `2^25`).
+ */
+const ARM64_IMM26_MIN_MAGNITUDE: i64 = 33554432 to i64
+
+/**
+ * ARM64_IMM19_MAX — the largest positive word-displacement the signed 19-bit
+ * B.cond/CBZ field holds (`imm19_fits`'s upper bound, `2^18 - 1`).
+ */
+const ARM64_IMM19_MAX: i64 = 262143 to i64
+
+/**
+ * ARM64_IMM19_MIN_MAGNITUDE — the magnitude of the smallest (most negative)
+ * word-displacement the signed 19-bit B.cond/CBZ field holds (`imm19_fits`'s
+ * lower bound magnitude, `2^18`).
+ */
+const ARM64_IMM19_MIN_MAGNITUDE: i64 = 262144 to i64
+
+/**
+ * ARM64_FP_ID — the frame-pointer register's 5-bit ISA id (x29), the fixed
+ * `Rt`/`Rd` the prologue/epilogue save/restore and FP-setup words carry.
+ */
+const ARM64_FP_ID: u32 = 29 to u32
+
+/**
+ * ARM64_LR_ID — the link-register's 5-bit ISA id (x30), the fixed `Rt2` the
+ * prologue/epilogue FP/LR pair save/restore carries.
+ */
+const ARM64_LR_ID: u32 = 30 to u32
+
+/**
+ * ARM64_SP_ID — the stack-pointer's 5-bit ISA id (31 in the SP-context
+ * instruction forms below), the fixed `Rn`/`Rd` every SP-relative frame
+ * instruction carries.
+ */
+const ARM64_SP_ID: u32 = 31 to u32
+
+/**
+ * ARM64_STACK_ALIGN — the AAPCS64 stack byte alignment (16), every
+ * `align_up`/frame-size rounding step's alignment argument.
+ */
+const ARM64_STACK_ALIGN: u32 = 16 to u32
+
+/**
+ * ARM64_FP_LR_BYTES — the byte size of the saved FP/LR pair (16), reserved at
+ * the top of every non-frameless function's frame.
+ */
+const ARM64_FP_LR_BYTES: u32 = 16 to u32
+
+/**
+ * ARM64_REG_BYTES — the byte width of one GPR/FPR slot (8), the STP/LDP/
+ * STR/LDR scaled-offset divisor and the callee-saved area's per-register
+ * stride.
+ */
+const ARM64_REG_BYTES: u32 = 8 to u32
+
+/**
+ * ARM64_WORD_BYTES — the byte size of one fixed-width AArch64 instruction
+ * word (4), the word-index-to-byte-offset multiplier (`finalize_func`'s reloc
+ * offset, `fold_func_into_text`'s base advance).
+ */
+const ARM64_WORD_BYTES: u32 = 4 to u32
+
+/**
+ * ARM64_SCALE_B — the byte-access scale of the `B` (byte) memory width (1),
+ * shared by `load_form`/`store_form`.
+ */
+const ARM64_SCALE_B: u32 = 1 to u32
+
+/**
+ * ARM64_SCALE_H — the byte-access scale of the `H` (halfword) memory width
+ * (2), shared by `load_form`/`store_form`.
+ */
+const ARM64_SCALE_H: u32 = 2 to u32
+
+/**
+ * ARM64_SCALE_W — the byte-access scale of the `W` (word) memory width (4),
+ * shared by `load_form`/`store_form`.
+ */
+const ARM64_SCALE_W: u32 = 4 to u32
+
+/**
+ * ARM64_SCALE_X — the byte-access scale of the `X` (doubleword) memory width
+ * (8), shared by `load_form`/`store_form`.
+ */
+const ARM64_SCALE_X: u32 = 8 to u32
+
+/**
+ * ARM64_COND_EQ — the AArch64 4-bit condition field for `MCond::EQ`.
+ */
+const ARM64_COND_EQ: u32 = 0 to u32
+
+/**
+ * ARM64_COND_NE — the AArch64 4-bit condition field for `MCond::NE`.
+ */
+const ARM64_COND_NE: u32 = 1 to u32
+
+/**
+ * ARM64_COND_HS — the AArch64 4-bit condition field for `MCond::HS`.
+ */
+const ARM64_COND_HS: u32 = 2 to u32
+
+/**
+ * ARM64_COND_LO — the AArch64 4-bit condition field for `MCond::LO`.
+ */
+const ARM64_COND_LO: u32 = 3 to u32
+
+/**
+ * ARM64_COND_HI — the AArch64 4-bit condition field for `MCond::HI`.
+ */
+const ARM64_COND_HI: u32 = 8 to u32
+
+/**
+ * ARM64_COND_LS — the AArch64 4-bit condition field for `MCond::LS`.
+ */
+const ARM64_COND_LS: u32 = 9 to u32
+
+/**
+ * ARM64_COND_GE — the AArch64 4-bit condition field for `MCond::GE`.
+ */
+const ARM64_COND_GE: u32 = 10 to u32
+
+/**
+ * ARM64_COND_LT — the AArch64 4-bit condition field for `MCond::LT`.
+ */
+const ARM64_COND_LT: u32 = 11 to u32
+
+/**
+ * ARM64_COND_GT — the AArch64 4-bit condition field for `MCond::GT`.
+ */
+const ARM64_COND_GT: u32 = 12 to u32
+
+/**
+ * ARM64_COND_LE — the AArch64 4-bit condition field for `MCond::LE`.
+ */
+const ARM64_COND_LE: u32 = 13 to u32
+
+/**
+ * ARM64_ADD_REG — the bit-31-clear (32-bit) ADD register-register template
+ * (`alu_reg_base`'s `Add` arm).
+ */
+const ARM64_ADD_REG: u32 = 0x0B000000 to u32
+
+/**
+ * ARM64_SUB_REG — the bit-31-clear (32-bit) SUB register-register template
+ * (`alu_reg_base`'s `Sub` arm).
+ */
+const ARM64_SUB_REG: u32 = 0x4B000000 to u32
+
+/**
+ * ARM64_MADD_REG — the bit-31-clear (32-bit) MADD template with `Ra=XZR`
+ * baked in (`alu_reg_base`'s `Mul` arm).
+ */
+const ARM64_MADD_REG: u32 = 0x1B007C00 to u32
+
+/**
+ * ARM64_SDIV_REG — the bit-31-clear (32-bit) SDIV template (`alu_reg_base`'s
+ * `Sdiv` arm).
+ */
+const ARM64_SDIV_REG: u32 = 0x1AC00C00 to u32
+
+/**
+ * ARM64_UDIV_REG — the bit-31-clear (32-bit) UDIV template (`alu_reg_base`'s
+ * `Udiv` arm).
+ */
+const ARM64_UDIV_REG: u32 = 0x1AC00800 to u32
+
+/**
+ * ARM64_AND_REG — the bit-31-clear (32-bit) AND register-register template
+ * (`alu_reg_base`'s `And` arm).
+ */
+const ARM64_AND_REG: u32 = 0x0A000000 to u32
+
+/**
+ * ARM64_ORR_REG — the bit-31-clear (32-bit) ORR register-register template
+ * (`alu_reg_base`'s `Orr` arm).
+ */
+const ARM64_ORR_REG: u32 = 0x2A000000 to u32
+
+/**
+ * ARM64_EOR_REG — the bit-31-clear (32-bit) EOR register-register template
+ * (`alu_reg_base`'s `Eor` arm).
+ */
+const ARM64_EOR_REG: u32 = 0x4A000000 to u32
+
+/**
+ * ARM64_LSLV_REG — the bit-31-clear (32-bit) LSLV (variable left-shift)
+ * template (`alu_reg_base`'s `Lsl` arm).
+ */
+const ARM64_LSLV_REG: u32 = 0x1AC02000 to u32
+
+/**
+ * ARM64_ASRV_REG — the bit-31-clear (32-bit) ASRV (variable arithmetic
+ * right-shift) template (`alu_reg_base`'s `Asr` arm).
+ */
+const ARM64_ASRV_REG: u32 = 0x1AC02800 to u32
+
+/**
+ * ARM64_LSRV_REG — the bit-31-clear (32-bit) LSRV (variable logical
+ * right-shift) template (`alu_reg_base`'s `Lsr` arm).
+ */
+const ARM64_LSRV_REG: u32 = 0x1AC02400 to u32
+
+/**
+ * ARM64_ADD_IMM_BASE — the bit-31-clear (32-bit) ADD-immediate template
+ * (`add_sub_imm_base`'s add-form arm).
+ */
+const ARM64_ADD_IMM_BASE: u32 = 0x11000000 to u32
+
+/**
+ * ARM64_SUB_IMM_BASE — the bit-31-clear (32-bit) SUB-immediate template
+ * (`add_sub_imm_base`'s sub-form arm).
+ */
+const ARM64_SUB_IMM_BASE: u32 = 0x51000000 to u32
+
+/**
+ * ARM64_ADD_IMM64_BASE — the sf-set (64-bit) ADD-immediate template with
+ * `Rd`/`Rn`/immediate all zero: the SP-arithmetic (`add_sp_imm_word`) and
+ * ADD-lo12 relocation-placeholder (`encode_add_lo`) shape, always 64-bit (no
+ * `sf_bit` OR needed).
+ */
+const ARM64_ADD_IMM64_BASE: u32 = 0x91000000 to u32
+
+/**
+ * ARM64_SUB_IMM64_BASE — the sf-set (64-bit) SUB-immediate template with
+ * `Rd`/`Rn`/immediate all zero: the SP-claim shape (`sub_sp_imm_word`), always
+ * 64-bit.
+ */
+const ARM64_SUB_IMM64_BASE: u32 = 0xD1000000 to u32
+
+/**
+ * ARM64_SXTB — the full SBFM template for SXTB (`ext_base`'s `Sxtb` arm,
+ * immr/imms already placed).
+ */
+const ARM64_SXTB: u32 = 0x93401C00 to u32
+
+/**
+ * ARM64_SXTH — the full SBFM template for SXTH (`ext_base`'s `Sxth` arm).
+ */
+const ARM64_SXTH: u32 = 0x93403C00 to u32
+
+/**
+ * ARM64_SXTW — the full SBFM template for SXTW (`ext_base`'s `Sxtw` arm).
+ */
+const ARM64_SXTW: u32 = 0x93407C00 to u32
+
+/**
+ * ARM64_UXTB — the full UBFM template for UXTB (`ext_base`'s `Uxtb` arm).
+ */
+const ARM64_UXTB: u32 = 0x53001C00 to u32
+
+/**
+ * ARM64_UXTH — the full UBFM template for UXTH (`ext_base`'s `Uxth` arm).
+ */
+const ARM64_UXTH: u32 = 0x53003C00 to u32
+
+/**
+ * ARM64_UXTW — the full UBFM template for UXTW (`ext_base`'s `Uxtw` arm, the
+ * zero-extending 32-into-64 form).
+ */
+const ARM64_UXTW: u32 = 0xD3407C00 to u32
+
+/**
+ * ARM64_LDRSB — the sign-extending byte-load template (`load_form`'s `B`
+ * signed arm).
+ */
+const ARM64_LDRSB: u32 = 0x39800000 to u32
+
+/**
+ * ARM64_LDRB — the zero-extending byte-load template (`load_form`'s `B`
+ * unsigned arm).
+ */
+const ARM64_LDRB: u32 = 0x39400000 to u32
+
+/**
+ * ARM64_LDRSH — the sign-extending halfword-load template (`load_form`'s `H`
+ * signed arm).
+ */
+const ARM64_LDRSH: u32 = 0x79800000 to u32
+
+/**
+ * ARM64_LDRH — the zero-extending halfword-load template (`load_form`'s `H`
+ * unsigned arm).
+ */
+const ARM64_LDRH: u32 = 0x79400000 to u32
+
+/**
+ * ARM64_LDRSW — the sign-extending word-load template (`load_form`'s `W`
+ * signed arm).
+ */
+const ARM64_LDRSW: u32 = 0xB9800000 to u32
+
+/**
+ * ARM64_LDR_W — the plain 32-bit word-load template (`load_form`'s `W`
+ * unsigned arm).
+ */
+const ARM64_LDR_W: u32 = 0xB9400000 to u32
+
+/**
+ * ARM64_LDR_X — the plain 64-bit doubleword-load template, shared by
+ * `load_form`'s `X` arm and `ldr_gpr_sp`'s frame-restore shape (the same
+ * unsigned-offset LDR encoding).
+ */
+const ARM64_LDR_X: u32 = 0xF9400000 to u32
+
+/**
+ * ARM64_STRB — the byte-store template (`store_form`'s `B` arm).
+ */
+const ARM64_STRB: u32 = 0x39000000 to u32
+
+/**
+ * ARM64_STRH — the halfword-store template (`store_form`'s `H` arm).
+ */
+const ARM64_STRH: u32 = 0x79000000 to u32
+
+/**
+ * ARM64_STR_W — the 32-bit word-store template (`store_form`'s `W` arm).
+ */
+const ARM64_STR_W: u32 = 0xB9000000 to u32
+
+/**
+ * ARM64_STR_X — the 64-bit doubleword-store template, shared by
+ * `store_form`'s `X` arm and `str_gpr_sp`'s frame-save shape (the same
+ * unsigned-offset STR encoding).
+ */
+const ARM64_STR_X: u32 = 0xF9000000 to u32
+
+/**
+ * ARM64_MSUB_REG — the bit-31-clear (32-bit) MSUB template (`encode_msub`'s
+ * `dst = c - a*b` shape).
+ */
+const ARM64_MSUB_REG: u32 = 0x1B008000 to u32
+
+/**
+ * ARM64_NEG_REG — the bit-31-clear (32-bit) NEG-as-SUB-from-XZR template
+ * (`encode_neg`, `Rn=XZR` baked in).
+ */
+const ARM64_NEG_REG: u32 = 0x4B0003E0 to u32
+
+/**
+ * ARM64_MVN_REG — the bit-31-clear (32-bit) MVN-as-ORN-from-XZR template
+ * (`encode_mvn`, `Rn=XZR` and the ORN N-bit baked in).
+ */
+const ARM64_MVN_REG: u32 = 0x2A2003E0 to u32
+
+/**
+ * ARM64_CMP_REG — the bit-31-clear (32-bit) CMP-as-SUBS-into-XZR template
+ * (`encode_cmp`, `Rd=XZR` baked in).
+ */
+const ARM64_CMP_REG: u32 = 0x6B00001F to u32
+
+/**
+ * ARM64_CMP_IMM_BASE — the bit-31-clear (32-bit) CMP-immediate-as-SUBS-imm-
+ * into-XZR template (`encode_cmp_imm`, `Rd=XZR` baked in).
+ */
+const ARM64_CMP_IMM_BASE: u32 = 0x7100001F to u32
+
+/**
+ * ARM64_CSET_REG — the bit-31-clear (32-bit) CSET-as-CSINC-from-XZR template
+ * (`encode_cset`, `Rn=Rm=XZR` baked in).
+ */
+const ARM64_CSET_REG: u32 = 0x1A9F07E0 to u32
+
+/**
+ * ARM64_MOVZ — the bit-31-clear (32-bit) MOVZ template (`encode_movz`).
+ */
+const ARM64_MOVZ: u32 = 0x52800000 to u32
+
+/**
+ * ARM64_MOVK — the bit-31-clear (32-bit) MOVK template (`encode_movk`).
+ */
+const ARM64_MOVK: u32 = 0x72800000 to u32
+
+/**
+ * ARM64_MOVN — the bit-31-clear (32-bit) MOVN template (`encode_movn`).
+ */
+const ARM64_MOVN: u32 = 0x12800000 to u32
+
+/**
+ * ARM64_MOV_REG — the bit-31-clear (32-bit) MOV-as-ORR-from-XZR template
+ * (`encode_mov`, `Rn=XZR` baked in).
+ */
+const ARM64_MOV_REG: u32 = 0x2A0003E0 to u32
+
+/**
+ * ARM64_B — the unconditional-branch (B) placeholder template, its imm26
+ * field left zero for `A4-3` patching (`encode_branch`).
+ */
+const ARM64_B: u32 = 0x14000000 to u32
+
+/**
+ * ARM64_BCOND — the conditional-branch (B.cond) placeholder template, its
+ * condition field zero and imm19 field left zero for `A4-3` patching
+ * (`encode_branch_cond`).
+ */
+const ARM64_BCOND: u32 = 0x54000000 to u32
+
+/**
+ * ARM64_CBZ — the compare-and-branch-if-zero placeholder template
+ * (`encode_cbz`'s zero arm).
+ */
+const ARM64_CBZ: u32 = 0x34000000 to u32
+
+/**
+ * ARM64_CBNZ — the compare-and-branch-if-nonzero placeholder template
+ * (`encode_cbz`'s nonzero arm).
+ */
+const ARM64_CBNZ: u32 = 0x35000000 to u32
+
+/**
+ * ARM64_BL — the direct-call (BL) placeholder template, flagged for a `Call`
+ * relocation (`encode_call`).
+ */
+const ARM64_BL: u32 = 0x94000000 to u32
+
+/**
+ * ARM64_BLR — the indirect-call (BLR) template (`encode_call_indirect`).
+ */
+const ARM64_BLR: u32 = 0xD63F0000 to u32
+
+/**
+ * ARM64_ADRP — the page-high-address (ADRP) placeholder template, flagged for
+ * a PAGE21 relocation (`encode_adrp`).
+ */
+const ARM64_ADRP: u32 = 0x90000000 to u32
+
+/**
+ * ARM64_RET — the bare return (RET) word (`encode_ret`).
+ */
+const ARM64_RET: u32 = 0xD65F03C0 to u32
+
+/**
+ * ARM64_STP_GPR64 — the 64-bit GPR store-pair (STP) template, `Rn=SP` baked
+ * in (`stp_gpr`).
+ */
+const ARM64_STP_GPR64: u32 = 0xA9000000 to u32
+
+/**
+ * ARM64_LDP_GPR64 — the 64-bit GPR load-pair (LDP) template, `Rn=SP` baked in
+ * (`ldp_gpr`).
+ */
+const ARM64_LDP_GPR64: u32 = 0xA9400000 to u32
+
+/**
+ * ARM64_STP_FPR64 — the 64-bit FPR store-pair (STP) template, `Rn=SP` baked
+ * in (`stp_fpr`).
+ */
+const ARM64_STP_FPR64: u32 = 0x6D000000 to u32
+
+/**
+ * ARM64_LDP_FPR64 — the 64-bit FPR load-pair (LDP) template, `Rn=SP` baked in
+ * (`ldp_fpr`).
+ */
+const ARM64_LDP_FPR64: u32 = 0x6D400000 to u32
+
+/**
+ * ARM64_STR_FPR64 — the 64-bit FPR unsigned-offset store (STR) template,
+ * `Rn=SP` baked in (`str_fpr_sp`).
+ */
+const ARM64_STR_FPR64: u32 = 0xFD000000 to u32
+
+/**
+ * ARM64_LDR_FPR64 — the 64-bit FPR unsigned-offset load (LDR) template,
+ * `Rn=SP` baked in (`ldr_fpr_sp`).
+ */
+const ARM64_LDR_FPR64: u32 = 0xFD400000 to u32

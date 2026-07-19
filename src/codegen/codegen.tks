@@ -583,6 +583,13 @@ fn cg_is_polymorphic_base(prog: checker::TProgram, name: str) -> bool {
     }
 }
 
+/**
+ * SUBCLASS_CHAIN_DEPTH_LIMIT — defensive cap on the subclass-chain hops `cg_subclass_reaches`
+ * will walk before giving up. 64 is far deeper than any real inheritance chain; the bound only
+ * exists so a cyclic/corrupt base chain terminates instead of recursing forever.
+ */
+const SUBCLASS_CHAIN_DEPTH_LIMIT: i64 = 64
+
 // (#98) does class `sub` reach ANCESTOR class `want` through the base chain (transitively)?
 // Codegen mirror of the checker's subclass_reaches — used to decide when a class value at a
 // base-typed slot is a STRICT-subclass upcast (needs the fat-pointer wrap). Hop-bounded.
@@ -1754,6 +1761,26 @@ fn emit_compare(buf: []byte, prog: checker::TProgram, c: checker::TCompare, esca
     cb(out, ")")
 }
 
+/**
+ * cg_cast_target_is_variant — does a cast node's target type `t` name a variant (an inline `A | B` or a
+ * declared variant)? A cast whose target is a variant is never a user `x to T` — the checker restricts
+ * `to` to numeric/char/bool — so it can only be the synthetic widening node the const inliner
+ * (`widen_inlined_const`, #630) wraps a variant const's case-member initializer in, and emit_cast routes
+ * it through emit_as to wrap the member into the variant's tag+union representation.
+ *
+ * @param prog  the typed program, to resolve a declared Named target to its variant decl
+ * @param t     the cast's target type (the cast node's resolved `.type`)
+ * @return      true iff `t` is an inline or declared variant
+ * @since #630
+ */
+fn cg_cast_target_is_variant(prog: checker::TProgram, t: checker::Type) -> bool {
+    match t {
+        checker::Variant => true
+        checker::Named as nm => cg_named_is_variant(prog, nm.name)
+        _ => false
+    }
+}
+
 // emit_cast — a TCast. F3 (M.1): a narrowing `x to T` is range-checked at runtime via
 // tk_to_<dst>_<carrier> and PANICS if the value doesn't fit T. Widening / same-type
 // casts where no loss is possible emit the plain C cast (no needless guard). Single-eval:
@@ -1762,6 +1789,7 @@ fn emit_compare(buf: []byte, prog: checker::TProgram, c: checker::TCompare, esca
 // (C: TK_TEXPR_CAST branch.)
 fn emit_cast(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: checker::TCast, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     let inner = c.expr
+    if cg_cast_target_is_variant(prog, e.type) { return emit_as(buf, prog, e.type, inner, escaping, regions, fn_body, dctx) }
     // Extract source/dest prims when both sides are primitive (else: a plain C cast).
     let dst_opt = match e.type { checker::Prim as p => p.kind; _ => checker::PrimKind::Bool }
     let src_opt = match inner.type { checker::Prim as p => p.kind; _ => checker::PrimKind::Bool }
@@ -4188,7 +4216,7 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                 match value.type {
                     checker::Named as bvn => {
                         if cg_is_class_named(prog, bvn.name) {
-                            let is_strict_sub = bvn.name != ben.name && cg_subclass_reaches(prog, bvn.name, ben.name, 64)
+                            let is_strict_sub = bvn.name != ben.name && cg_subclass_reaches(prog, bvn.name, ben.name, SUBCLASS_CHAIN_DEPTH_LIMIT)
                             let is_raw_self = bvn.name == ben.name && match value.kind { checker::TStructInit => true; _ => false }
                             if is_strict_sub || is_raw_self {
                                 mut bo = cb_tysym(cb(buf, "(tk_base_"), ben.name)
@@ -8224,10 +8252,30 @@ fn cg_pair_is_iface_vtable(cd: parser::TypeDecl, idd: parser::TypeDecl, vt_table
 }
 
 /**
+ * Is type decl `cd` an `abstract class` — inheritable but NOT directly instantiable (its abstract
+ * methods carry no body, so they are stamped to no `TFunction`)? An abstract class therefore has no
+ * emittable self-vtable: every slot is a not-yet-implemented abstract method (`cg_pair_is_base_vtable`
+ * excludes its self-pair for exactly this reason). A `virtual`/`Sealed` class answers false.
+ *
+ * @param cd  the candidate class decl
+ * @return    true iff `cd` is a `ClassKind::Abstract` class
+ * @since #594 (member-const cross-ns abstract-base codegen fix)
+ */
+fn cg_class_is_abstract(cd: parser::TypeDecl) -> bool {
+    match cd.body {
+        parser::ClassBody as cb => match cb.kind { parser::ClassKind::Abstract => true; _ => false }
+        _ => false
+    }
+}
+
+/**
  * Does class decl `cd` provide a per-(class, base) POLYMORPHIC-BASE vtable for type decl `idd`?
- * True when `idd` is a polymorphic (non-sealed) base class AND `cd` IS-A `idd` (itself included, so
- * a directly-instantiable virtual base gets its own self-vtable). Factored so the three vtable-
- * emission phases apply the SAME gate.
+ * True when `idd` is a polymorphic (non-sealed) base class AND either `cd` STRICTLY subclasses `idd`,
+ * or `cd` IS `idd` AND `idd` is directly instantiable (a `virtual` base's own self-vtable). An
+ * `abstract` base's self-pair is EXCLUDED: it is never instantiated, and its abstract-method slots
+ * resolve to no stamped function — emitting it would fail codegen with a phantom "missing vtable
+ * method's stamped function" (the concrete subclass's `tk_vt_<Sub>_<Base>` carries the real slots).
+ * Factored so the three vtable-emission phases apply the SAME gate.
  *
  * @param prog  the whole typed program (polymorphic-base + subclass-reachability oracles)
  * @param cd    the candidate vtable-owning class decl
@@ -8237,7 +8285,8 @@ fn cg_pair_is_iface_vtable(cd: parser::TypeDecl, idd: parser::TypeDecl, vt_table
  */
 fn cg_pair_is_base_vtable(prog: checker::TProgram, cd: parser::TypeDecl, idd: parser::TypeDecl) -> bool {
     let idd_is_poly_base = cg_is_polymorphic_base(prog, idd.name)
-    let cd_is_a = cd.name == idd.name || cg_subclass_reaches(prog, cd.name, idd.name, 64)
+    let cd_is_instantiable_self = cd.name == idd.name && !cg_class_is_abstract(cd)
+    let cd_is_a = cd_is_instantiable_self || cg_subclass_reaches(prog, cd.name, idd.name, SUBCLASS_CHAIN_DEPTH_LIMIT)
     idd_is_poly_base && cd_is_a
 }
 
@@ -8488,7 +8537,8 @@ pub fn tk_emit_c_test(prog0: checker::TProgram, cov: bool) -> str | error {
     differs: Program = the virtual-main (loose statements), TestPlain/TestCov = the native test gate.
     Under TestCov the production-fn prologues additionally emit `tk_cov_mark`. */
 fn tk_emit_c_mode(prog0: checker::TProgram, mode: CgMode) -> str | error {
-    let _lr = cg_lift_lambdas(prog0)   // (W10) stamp lambdas + synthesize lifted functions before emission
+    let prog_ag = match checker::inline_aggregate_consts(prog0) { checker::TProgram as p => p; error as e => return e }
+    let _lr = cg_lift_lambdas(prog_ag)
     let prog = _lr.prog
     let cap_lams = _lr.lams
     let di_reg = match cg_build_di_registry(prog) { checker::DiRegistry as r => r; error as e => return e }
@@ -8619,6 +8669,7 @@ fn tk_emit_c_mode(prog0: checker::TProgram, mode: CgMode) -> str | error {
             parser::TypeDecl => { }   // emitted in the type-decl passes above
             parser::UseDecl => { }   // imports are a no-op at the C level (M0)
             checker::TStatement => { }   // a loose Statement → virtual-main, second pass
+            checker::TConstDecl => { }
         }
         i++
     }
@@ -8666,6 +8717,7 @@ fn emit_program_main(buf: []byte, prog: checker::TProgram) -> []byte | error {
             checker::TFunction => { }   // handled in pass 1
             parser::TypeDecl => { }   // handled in the type-decl passes
             parser::UseDecl => { }   // no-op
+            checker::TConstDecl => { }
             checker::TStatement as s => {
                 // The virtual-main has no variant return slot (its tail value is the int exit
                 // code), so ret_type is void — emit_as never wraps for void.

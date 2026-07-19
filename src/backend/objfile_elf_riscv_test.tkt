@@ -59,12 +59,12 @@ fn rvo_exit_module() -> MModuleRiscv {
  */
 fn rvo_lla_module() -> MModuleRiscv {
     let f0 = append_minst_riscv(new_mfunc_riscv("loadaddr"), 0 to u32, lla_riscv(rvo_pg(10 to u32), "mydata"))
-    let f1 = append_minst_riscv(f0, 0 to u32, ret_riscv())
+    let f1 = append_minst_riscv(f0, 0 to u32, RET_RISCV)
     add_mfunc_riscv(empty_mmodule_riscv(), f1)
 }
 
 /**
- * rvo_object_of — encode `m` under `riscv64_lp64d()` and assemble its riscv64 ELF
+ * rvo_object_of — encode `m` under `RISCV64_LP64D` and assemble its riscv64 ELF
  * object via `emit_elf_riscv`, or an empty buffer on an unexpected honest-stop
  * (so a golden length/byte assertion fails loudly rather than aborting the run).
  *
@@ -72,7 +72,7 @@ fn rvo_lla_module() -> MModuleRiscv {
  * @return []byte  the riscv64 ELF object bytes, or empty on error
  */
 fn rvo_object_of(m: MModuleRiscv) -> []byte {
-    match encode_module_riscv(riscv64_lp64d(), m) {
+    match encode_module_riscv(RISCV64_LP64D, m) {
         EncodedModuleRiscv as x => emit_elf_riscv(x)
         error as e => teko::list::empty()
     }
@@ -197,4 +197,24 @@ fn rvelf_pcrel_pair_hi20_lo12_relocs() {
     teko::assert::is_true(rvo_u32_at(obj, 296 to u64) == (24 to u32))
     teko::assert::is_true(rvo_u32_at(obj, 300 to u64) == (1 to u32))
     teko::assert::is_true(rvo_u32_at(obj, 304 to u64) == (0 to u32))
+}
+
+/**
+ * T-B2 espelho riscv: o mesmo objeto de ponteiro data→data com e_machine/e_flags
+ * do rv64 e rtype R_RISCV_64 (2) — layout idêntico ao x86 (e_flags não muda
+ * tamanho), r_info baixo = 2.
+ */
+#test
+fn tb2_riscv_rela_rodata_emitted() {
+    let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
+    let ptr = Symbol { name = "ptr"; defined = true; sect = 2 to u8; offset = 0 to u32; local = true }
+    let target = Symbol { name = "target"; defined = true; sect = 2 to u8; offset = 8 to u32; local = true }
+    let rr = ElfRelocReq { offset = 0 to u32; sym = "target"; rtype = 2 to u32; addend = 0 to i64 }
+    let obj = emit_elf_object(ElfObject { e_machine = EM_RISCV; e_flags = EF_RISCV_FLOAT_ABI_DOUBLE; text = teko::list::empty(); rodata = rodata; symbols = [ptr, target]; relocs = teko::list::empty(); rodata_relocs = [rr] })
+    teko::assert::is_true(obj.len == 736)
+    teko::assert::is_true(el_u16_at(obj, 60) == 8)
+    teko::assert::is_true(el_u32_at(obj, 208) == 2)
+    teko::assert::is_true(el_u32_at(obj, 212) == 1)
+    teko::assert::is_true(el_u32_at(obj, 216) == 8)
+    teko::assert::is_true(el_u32_at(obj, 716) == 2)
 }

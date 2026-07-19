@@ -220,15 +220,19 @@ pub type Function = struct {
      */
     is_unsafe: bool
 }
-// (OOP A1, 2026-07-01) methods = interleaved `fn` decls in the struct body (unified method
-// model): each Function's 1st param has_type=false ⇒ an INSTANCE method (the receiver, name
-// free, by-value-copy immutable, type injected by the checker as the enclosing struct); no
-// untyped 1st param ⇒ STATIC (no receiver). Struct members (fields + methods) stay ALL PUBLIC.
-// (W10b.IF) `implements: []str` — the `struct I1 & I2 { … }` interface list (a struct MAY
-// implement interfaces, per the OOP design — it just cannot inherit / be inherited). Empty when the
-// struct declares none. Conformance (does the struct provide every method of each interface) is
-// checked by the checker exactly like a class's implements list.
-pub type StructBody = struct { fields: []Field; methods: []Function; implements: []str }
+/**
+ * StructBody — a `struct [I & …] { fields; methods; consts }` body (OOP A1). A struct's members
+ * (fields + methods) stay ALL PUBLIC. `implements` is the `struct I1 & I2 { … }` interface list,
+ * empty when the struct declares none.
+ *
+ * @param fields      the interleaved `name: T` fields, in source order
+ * @param methods     the interleaved `fn` decls — an untyped 1st param marks an INSTANCE method
+ *                    (the receiver), else a STATIC method
+ * @param implements  the interface names the struct conforms to (`& I1 & I2`), empty when none
+ * @param consts      the static type-member `const NAME: T = …` declarations (#594 crumb 7); each
+ *                    occupies NO layout slot and is resolved by `StructName::NAME`
+ */
+pub type StructBody = struct { fields: []Field; methods: []Function; implements: []str; consts: []ConstDecl }
 /**
  * One field of a struct/class/trait body.
  *
@@ -257,15 +261,23 @@ pub type ExternBody = struct { }   // `extern type Name` — an OPAQUE foreign h
 // instantiable, NOT inheritable) is the DEFAULT (bare `class`); `abstract class` = inheritable,
 // NOT instantiable; `virtual class` = instantiable AND inheritable.
 pub type ClassKind = enum { Sealed; Abstract; Virtual }
-// `type C = <kind> [Base] [(binding)] [& I1 & I2 …] { fields; methods }`. `has_base`/`base_name`/
-// `has_base_binding`/`base_binding_name` — AT MOST one base class (must itself be Abstract or
-// Virtual — enforced by the checker, not the parser); the binding name is how INSTANCE methods
-// reach the base object (`parent.set_name(…)`), omitted when base access isn't needed; there is
-// NO reserved `base` keyword (the binding is just a normal name chosen by the author).
-// `implements: []str` — the `& I1 & I2` list (interface names OR, until W10b.IF lands, ANY
-// nominal TypeDecl — trusted, not conformance-checked yet; mirrors how W11/S6 constraints accept
-// any TypeDecl kind via `constraint_atom_satisfied`'s exact-name fallback). Members (fields +
-// methods) are PRIVATE BY DEFAULT (`pub`/`intern` widen) — the inverse of struct's all-public.
+/**
+ * ClassBody — a `type C = <kind> [Base[(binding)]] [& I1 & I2 …] { fields; methods; consts }` body
+ * (W10b.CLASS). AT MOST one base class (itself Abstract or Virtual, enforced by the checker). Members
+ * (fields + methods) are PRIVATE BY DEFAULT (`pub`/`intern` widen) — the inverse of a struct.
+ *
+ * @param kind              SEALED (default), Abstract, or Virtual (see ClassKind)
+ * @param has_base          does this class extend a base class?
+ * @param base_name         the base class's name (valid iff has_base)
+ * @param has_base_binding  is a base-binding name declared (`Base(parent)`)?
+ * @param base_binding_name the name INSTANCE methods use to reach the base object (valid iff has_base_binding)
+ * @param implements        the `& I1 & I2` interface/derive list
+ * @param fields            the interleaved `name: T` fields, in source order
+ * @param methods           the interleaved `fn` decls (instance/static, per receiver shape)
+ * @param consts            the static type-member `const NAME: T = …` declarations (#594 crumb 7);
+ *                          each occupies NO layout slot and is resolved by `ClassName::NAME` (a
+ *                          subclass reaches a base's `pub`/`exp` member const by name)
+ */
 pub type ClassBody = struct {
     kind: ClassKind
     has_base: bool
@@ -275,6 +287,7 @@ pub type ClassBody = struct {
     implements: []str
     fields: []Field
     methods: []Function
+    consts: []ConstDecl
 }
 // (W10b.IF) an INTERFACE — a PURE SIGNATURE CONTRACT: `type X = interface [I1 & I2 …] { fn sig; … }`.
 // `extends: []str` — the interfaces this one extends (multiple inheritance; the `I1 & I2` list between
@@ -284,16 +297,19 @@ pub type ClassBody = struct {
 // signature. An interface has NO runtime representation yet (dynamic dispatch = ROUND 3); it is a
 // compile-time contract only, so codegen/VM emit nothing for it and reject it as a value type.
 pub type InterfaceBody = struct { extends: []str; methods: []Function }
-// (TR0, 2026-07-02) a TRAIT — a struct-shaped, NON-instantiable bundle of fields + methods that a
-// struct/class DERIVES (`type Post = struct Timestamped { … }` — the same `&`-list position as
-// interfaces). `fields` = provided members, folded into the deriver (reusing the class
-// field-flattening); `methods` = a method WITH a body is PROVIDED (overridable — a deriver-defined
-// method of the same name IS the override), a method WITHOUT a body is a REQUIREMENT the deriver
-// must satisfy (like interface conformance). The checker FOLDS derived traits into each deriver
-// before typing (fold_traits), so codegen/VM never see a trait in a value position; the decl
-// itself emits nothing (like InterfaceBody). Trait-typed VALUES + `<T: Trait>` constraints are
-// TR1 (honest stops until then).
-pub type TraitBody = struct { fields: []Field; methods: []Function }
+/**
+ * TraitBody — a `trait { fields; methods; consts }` body (TR0): a struct-shaped, NON-instantiable
+ * bundle a struct/class DERIVES (`type Post = struct Timestamped { … }`, the `&`-list position).
+ * The checker FOLDS derived traits into each deriver before typing (fold_traits), so codegen/VM
+ * never see a trait in a value position; the decl itself emits nothing (like InterfaceBody).
+ *
+ * @param fields   the provided members, folded into the deriver (class field-flattening)
+ * @param methods  a method WITH a body is PROVIDED (overridable); a bodyless one is a REQUIREMENT
+ *                 the deriver must satisfy (like interface conformance)
+ * @param consts   the static type-member `const NAME: T = …` declarations (#594 crumb 7); each
+ *                 folds into every deriver like a field, resolved by `DeriverName::NAME`
+ */
+pub type TraitBody = struct { fields: []Field; methods: []Function; consts: []ConstDecl }
 pub type TypeBody = variant StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody | InterfaceBody | TraitBody   // pub: TypeDecl.body surface + the .tkb codec (C7.16)
 pub type TypeDecl = struct {   // nominal (B.13)
     name: str
@@ -347,8 +363,34 @@ pub type UseDecl = struct {
     names: []str
 }
 
+/**
+ * ConstDecl — a module-level named compile-time constant `const NAME: Type = init`
+ * (#594). Distinct from the local `BindKind::Const` binding (`parse_stmt.tks`): a
+ * ConstDecl is a top-level Decl with visibility, a mandatory type annotation, and a
+ * const-expr initializer (validated by `teko::checker::is_const_expr`). It carries
+ * no scope and opens no arena — the checker inlines it (scalars) or the backend
+ * materializes it in rodata (aggregates, C-agg-2).
+ *
+ * @param name    the constant's identifier
+ * @param ty      the mandatory declared type annotation
+ * @param init    the const-expr initializer
+ * @param vis     Pub/Exp/private, mirroring a function's
+ * @param has_doc whether a doc-comment was attached
+ * @param doc     the attached doc-comment text (valid iff has_doc)
+ * @param line    the `const` keyword's source line
+ * @param col     the `const` keyword's source column
+ * @since #594
+ */
+pub type ConstDecl = struct { name: str; ty: TypeExpr; init: Expr; vis: Visibility; has_doc: bool; doc: str; line: u32; col: u32 }
+
 // --- R-main: a `.tks` file is a MAIN (executable entry) or a MODULE. ---
-pub type Decl = variant Function | TypeDecl   // a top-level declaration (a module's content)
+/**
+ * A top-level declaration — a module's content: a `fn` (Function), a `type`/`flags`
+ * (TypeDecl), or a module-level `const` (ConstDecl, #594).
+ *
+ * @since #594 widened with ConstDecl (was `Function | TypeDecl`).
+ */
+pub type Decl = variant Function | TypeDecl | ConstDecl
 pub type MainFile = struct { uses: []UseDecl; body: []Statement }   // main.tks: the `use` header + the VIRTUAL MAIN's body (statements only — no type/fn decls)
 pub type Module = struct { uses: []UseDecl; decls: []Decl }   // a module: the `use` header + declarations (no loose statements)
 type File = variant MainFile | Module   // a `.tks` is exactly one; the file's role decides (main.tks ⇔ an executable `.tkp`)
@@ -358,6 +400,13 @@ type File = variant MainFile | Module   // a `.tks` is exactly one; the file's r
 //     them into this `Program` of `Item`s, which the checker (collect/typer) consumes.
 //     Each `Item` is a tagged payload (the C union) PLUS the namespace it came from (A3
 //     provenance for codegen name-mangling; resolution/typing IGNORE it). ---
-pub type ItemKind = variant UseDecl | Statement | Function | TypeDecl   // the C tk_item tag+union, as a Teko variant
+/**
+ * The C `tk_item` tag+union, as a Teko variant — a flattened top-level item's
+ * payload: a `use`, a loose statement (main files), a `fn`, a `type`/`flags`, or a
+ * module-level `const` (ConstDecl, #594).
+ *
+ * @since #594 widened with ConstDecl (was `UseDecl | Statement | Function | TypeDecl`).
+ */
+pub type ItemKind = variant UseDecl | Statement | Function | TypeDecl | ConstDecl
 pub type Item = struct { content: ItemKind; namespace: str; file: str }   // a flattened top-level item + its source namespace (A3) + source file (W-loc-2: assemble tags it so a flattened-program error resolves to file:line:col; empty on the single-file compile/run path)
 pub type Program = struct { items: []Item }   // the flat item list the checker consumes

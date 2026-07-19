@@ -1,0 +1,25 @@
+# Regression: #630 — a variant aggregate const used DIRECTLY as a `match` subject.
+#
+# `type Op = variant RetA | RetB | RetC` (all payload-free members); `const R: Op = RetC { }` is an
+# empty-case variant aggregate const, and `main` matches it DIRECTLY: `match R { RetA => …; RetB => …;
+# RetC => … }`. RetC is the third member (tag 2), so the third arm wins:
+#   match R { RetA => 11; RetB => 22; RetC => 33 }  ->  exit(33)
+#
+# Before #630 the C backend's aggregate-const inliner (`inline_aggregate_consts`) spliced `R`'s checked
+# initializer typed as the CASE-MEMBER struct (`RetC`), discarding the reference's `Op` variant type.
+# The match then declared its subject temp as `tk_t_RetC` and spelled the arm tags off the member
+# (`TK_TAG_RETC_RETA`, and `.tag` on a struct with no `tag` field) — the generated C FAILED to compile
+# ("no member named 'tag'"). The fix keeps the reference's variant type on the inlined node
+# (`widen_inlined_const`), so the subject is `Op`, the tags are `TK_TAG_OP_*`, and the wrapped value
+# `(tk_t_Op){ .tag = TK_TAG_OP_RETC, … }` selects `RetC`.
+#
+# C-native + VM scoped (like const_agg_variant_rodata): the own backend's bare-case variant-match TAG
+# DISPATCH is a separate pre-existing gap (#629 — all arms of an empty-case variant match collapse to
+# the first arm, unrelated to consts), so this fixture is NOT part of the diff_c_own exit(n) corpus.
+#   teko build examples/regressions/const_variant_match_subject && \
+#     ./examples/regressions/const_variant_match_subject/const_variant_match_subject   # -> exit 33
+name = "const_variant_match_subject"
+source = "src"
+
+[artifact]
+kind = "binary"

@@ -9,8 +9,8 @@
  * @return []byte  `buf` followed by v's two little-endian bytes
  */
 fn emit_u16_le_elf(buf: []byte, v: u32) -> []byte {
-    mut b = teko::list::push(buf, (v & (0xFF to u32)) to byte)
-    teko::list::push(b, ((v >> (8 to u32)) & (0xFF to u32)) to byte)
+    mut b = teko::list::push(buf, (v & ELF_BYTE_MASK) to byte)
+    teko::list::push(b, ((v >> (8 to u32)) & ELF_BYTE_MASK) to byte)
 }
 
 /**
@@ -65,6 +65,75 @@ fn build_elf_strtab(names: []str) -> ElfStrtab {
 }
 
 /**
+ * EM_X86_64 — the `Elf64_Ehdr.e_machine` value identifying an x86-64 object
+ * (the SysV psABI machine number).
+ */
+const EM_X86_64: u32 = 62 to u32
+
+/**
+ * EM_RISCV — the `Elf64_Ehdr.e_machine` value identifying a RISC-V object
+ * (the RISC-V psABI machine number; the rv64 adapter's ISA-varying input).
+ */
+const EM_RISCV: u32 = 243 to u32
+
+/**
+ * EF_RISCV_FLOAT_ABI_DOUBLE — the RISC-V `Elf64_Ehdr.e_flags` bit declaring the
+ * LP64D hard-float double ABI (the RV64GC calling convention this backend
+ * targets); x86-64 objects carry `e_flags = 0` (no machine flags defined).
+ */
+const EF_RISCV_FLOAT_ABI_DOUBLE: u32 = 0x0004 to u32
+
+/**
+ * ELF_BYTE_MASK — the low-byte mask the little-endian field serializers apply
+ * per lane (`(v >> lane) & 0xFF`), narrowing each half/quarter to one `byte`.
+ */
+const ELF_BYTE_MASK: u32 = 0xFF to u32
+
+/**
+ * STB_LOCAL — the ELF `st_info` bind field value for a file-local symbol,
+ * visible only within this object.
+ */
+const STB_LOCAL: u8 = 0
+
+/**
+ * STB_GLOBAL — the ELF `st_info` bind field value for a globally-visible
+ * symbol, linkable from other objects.
+ */
+const STB_GLOBAL: u8 = 1
+
+/**
+ * STT_NOTYPE — the ELF `st_info` type field value for a symbol with no type:
+ * the reserved null symbol and every undefined extern reference.
+ */
+const STT_NOTYPE: u8 = 0
+
+/**
+ * STT_FUNC — the ELF `st_info` type field value for a function symbol.
+ */
+const STT_FUNC: u8 = 2
+
+/**
+ * STT_SECTION — the ELF `st_info` type field value for a section symbol: the
+ * single `.rodata` section symbol every rodata relocation targets.
+ */
+const STT_SECTION: u8 = 3
+
+/**
+ * st_info — pack an `Elf64_Sym.st_info` byte from its bind and type sub-fields:
+ * `(bind << 4) | stt`. `st_info` is a COMPOSED field (two adjacent sub-fields
+ * shifted into one byte), not an OR of independent bits, so a `flags` bitmask
+ * would misrepresent it — this is a plain helper over the `STB_*`/`STT_*`
+ * constants (#594 crumb 11).
+ *
+ * @param bind  the bind sub-field (`STB_LOCAL`/`STB_GLOBAL`)
+ * @param stt   the type sub-field (`STT_NOTYPE`/`STT_FUNC`/`STT_SECTION`)
+ * @return      the packed `st_info` byte
+ */
+fn st_info(bind: u8, stt: u8) -> u8 {
+    (bind << 4) | stt
+}
+
+/**
  * ElfSym — one resolved `Elf64_Sym` in the object's final symbol-table order
  * (local-then-global): its name (interned into `.strtab`), its `st_info`
  * bind/type byte, its `st_shndx` section index, and its `st_value`. For a
@@ -83,9 +152,10 @@ type ElfSym = struct {
      */
     name: str
     /**
-     * info — the `st_info` byte, `(bind << 4) | type`: `0x00` null, `0x03`
-     * LOCAL|SECTION (rodata), `0x12` GLOBAL|FUNC (defined function), `0x10`
-     * GLOBAL|NOTYPE (undefined extern).
+     * info — the `st_info` byte, packed by `st_info(bind, stt)`: `st_info(STB_LOCAL,
+     * STT_NOTYPE)` (`0x00`) null, `st_info(STB_LOCAL, STT_SECTION)` (`0x03`) LOCAL|SECTION
+     * (rodata), `st_info(STB_GLOBAL, STT_FUNC)` (`0x12`) GLOBAL|FUNC (defined function),
+     * `st_info(STB_GLOBAL, STT_NOTYPE)` (`0x10`) GLOBAL|NOTYPE (undefined extern).
      */
     info: u32
     /**
@@ -143,7 +213,7 @@ fn elf_append_text_locals(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
         if i >= symbols.len { break }
         let s = symbols[i]
         if s.defined && s.local && s.sect == (1 to u8) {
-            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x00 to u32; shndx = 1 to u32; value = s.offset })
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = st_info(STB_LOCAL, STT_NOTYPE) to u32; shndx = 1 to u32; value = s.offset })
         }
         i++
     }
@@ -168,7 +238,7 @@ fn elf_append_globals(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
         if i >= symbols.len { break }
         let s = symbols[i]
         if s.defined && !s.local {
-            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x12 to u32; shndx = 1 to u32; value = s.offset })
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = st_info(STB_GLOBAL, STT_FUNC) to u32; shndx = 1 to u32; value = s.offset })
         }
         i++
     }
@@ -192,7 +262,7 @@ fn elf_append_undefined(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
         if i >= symbols.len { break }
         let s = symbols[i]
         if !s.defined {
-            acc = teko::list::push(acc, ElfSym { name = s.name; info = 0x10 to u32; shndx = 0 to u32; value = 0 to u32 })
+            acc = teko::list::push(acc, ElfSym { name = s.name; info = st_info(STB_GLOBAL, STT_NOTYPE) to u32; shndx = 0 to u32; value = 0 to u32 })
         }
         i++
     }
@@ -217,7 +287,7 @@ fn elf_append_undefined(out: []ElfSym, symbols: []Symbol) -> []ElfSym {
 fn elf_build_symbols(symbols: []Symbol) -> []ElfSym {
     mut out: []ElfSym = teko::list::push(teko::list::empty(), ElfSym { name = ""; info = 0 to u32; shndx = 0 to u32; value = 0 to u32 })
     if elf_has_rodata_section(symbols) {
-        out = teko::list::push(out, ElfSym { name = ""; info = 0x03 to u32; shndx = 2 to u32; value = 0 to u32 })
+        out = teko::list::push(out, ElfSym { name = ""; info = st_info(STB_LOCAL, STT_SECTION) to u32; shndx = 2 to u32; value = 0 to u32 })
     }
     out = elf_append_text_locals(out, symbols)
     out = elf_append_globals(out, symbols)
@@ -300,7 +370,7 @@ fn elf_rodata_secsym_index(syms: []ElfSym) -> u32 {
     mut i: u64 = 0
     loop {
         if i >= syms.len { break }
-        if syms[i].info == (0x03 to u32) && syms[i].shndx == (2 to u32) { return i to u32 }
+        if syms[i].info == (st_info(STB_LOCAL, STT_SECTION) to u32) && syms[i].shndx == (2 to u32) { return i to u32 }
         i++
     }
     syms.len to u32
@@ -423,11 +493,53 @@ fn elf_build_relas(obj: ElfObject, syms: []ElfSym) -> []ElfRela {
     mut i: u64 = 0
     loop {
         if i >= obj.relocs.len { break }
-        let r = obj.relocs[i]
-        let hit = elf_rodata_hit(obj.symbols, r.sym)
-        let symidx = if hit.found { secidx } else { elf_symbol_index(syms, r.sym) }
-        let addend = if hit.found { r.addend + (hit.offset to i64) } else { r.addend }
-        out = teko::list::push(out, ElfRela { offset = r.offset; symidx = symidx; rtype = r.rtype; addend = addend })
+        out = teko::list::push(out, elf_resolve_rela(obj.relocs[i], obj.symbols, syms, secidx))
+        i++
+    }
+    out
+}
+
+/**
+ * elf_resolve_rela — resolve ONE neutral `ElfRelocReq` `r` into an `Elf64_Rela`
+ * row: a `.rodata`-local target (a defined section-2 local) re-points at the
+ * `.rodata` section symbol (`secidx`) with the datum's offset folded onto the
+ * addend; any other target takes its POST-partition symbol index. The numeric
+ * `rtype` and the section-base-relative `r.offset` ride through unchanged. The
+ * body shared by `.rela.text` and `.rela.rodata` (#594 T-B2).
+ *
+ * @param r        the neutral relocation request
+ * @param symbols  the object's neutral symbol list (for `elf_rodata_hit`)
+ * @param syms     the resolved symbol table (for target indices)
+ * @param secidx   the `.rodata` section symbol's table index
+ * @return         the resolved `Elf64_Rela` row
+ */
+fn elf_resolve_rela(r: ElfRelocReq, symbols: []Symbol, syms: []ElfSym, secidx: u32) -> ElfRela {
+    let hit = elf_rodata_hit(symbols, r.sym)
+    let symidx = if hit.found { secidx } else { elf_symbol_index(syms, r.sym) }
+    let addend = if hit.found { r.addend + (hit.offset to i64) } else { r.addend }
+    ElfRela { offset = r.offset; symidx = symidx; rtype = r.rtype; addend = addend }
+}
+
+/**
+ * elf_build_rodata_relas — resolve each `rodata_relocs` entry of `obj` into a
+ * `.rela.rodata` row: a data→data pointer whose target is a `.rodata`-local
+ * datum becomes R_X86_64_64/R_RISCV_64 against the `.rodata` section symbol with
+ * the target's offset folded onto the addend, its `r_offset` being the pointer
+ * slot's byte offset INSIDE `.rodata` (#594 T-B2). Empty today (T-B1's
+ * `encode_rodata` honest-stop keeps every producer out), so `.rela.rodata` is
+ * never emitted in a real compile.
+ *
+ * @param obj   the neutral object (`rodata_relocs` + symbols)
+ * @param syms  the resolved symbol table (for target indices)
+ * @return      the `.rela.rodata` rows, in emission order
+ */
+fn elf_build_rodata_relas(obj: ElfObject, syms: []ElfSym) -> []ElfRela {
+    let secidx = elf_rodata_secsym_index(syms)
+    mut out: []ElfRela = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= obj.rodata_relocs.len { break }
+        out = teko::list::push(out, elf_resolve_rela(obj.rodata_relocs[i], obj.symbols, syms, secidx))
         i++
     }
     out
@@ -445,15 +557,33 @@ fn elf_rela_info(symidx: u32, rtype: u32) -> u64 {
 }
 
 /**
- * elf_section_names — the seven section names, in section-header-table order
- * (`""` null, `.text`, `.rodata`, `.symtab`, `.strtab`, `.shstrtab`,
- * `.rela.text`), interned into `.shstrtab` to yield each header's `sh_name`.
+ * elf_section_names — the section names, in section-header-table order: the
+ * seven fixed names (`""` null, `.text`, `.rodata`, `.symtab`, `.strtab`,
+ * `.shstrtab`, `.rela.text`), plus an eighth `.rela.rodata` when rodata-internal
+ * relocations are present, interned into `.shstrtab` to yield each header's
+ * `sh_name`.
  *
+ * @param bool has_rodata_relocs  whether a `.rela.rodata` section is present
  * @return []str  the section names, in header order
  */
-fn elf_section_names() -> []str {
-    ["", ".text", ".rodata", ".symtab", ".strtab", ".shstrtab", ".rela.text"]
+fn elf_section_names(has_rodata_relocs: bool) -> []str {
+    let base = ["", ".text", ".rodata", ".symtab", ".strtab", ".shstrtab", ".rela.text"]
+    if has_rodata_relocs { return teko::list::push(base, ".rela.rodata") }
+    base
 }
+
+/**
+ * ELF64_SYM_SIZE — `sizeof(Elf64_Sym)`: the 24-byte size of one symbol-table
+ * entry, `.symtab`'s `sh_entsize` and the multiplier of its `sh_size`.
+ */
+const ELF64_SYM_SIZE: u32 = 24 to u32
+
+/**
+ * ELF64_RELA_SIZE — `sizeof(Elf64_Rela)`: the 24-byte size of one relocation
+ * entry, the `.rela.*` sections' `sh_entsize` and the multiplier of their
+ * `sh_size`.
+ */
+const ELF64_RELA_SIZE: u32 = 24 to u32
 
 /**
  * ElfLayout — the resolved file offsets, sizes, and counts of the object:
@@ -533,6 +663,27 @@ type ElfLayout = struct {
      * symbol.
      */
     first_global: u32
+    /**
+     * rela_rodata_offset — the 8-aligned file offset of `.rela.rodata` (right
+     * after `.rela.text`), or the 8-aligned end-of-`.rela.text` value when there
+     * is no rodata-internal relocation (nothing is emitted there) (#594 T-B2).
+     */
+    rela_rodata_offset: u32
+    /**
+     * rela_rodata_size — the byte size of `.rela.rodata` (`nrela_rodata * 24`);
+     * 0 when there is no rodata-internal relocation, keeping the object
+     * byte-identical to pre-T-B2 (#594 T-B2).
+     */
+    rela_rodata_size: u32
+    /**
+     * nrela_rodata — the `Elf64_Rela` count of `.rela.rodata` (0 today) (#594 T-B2).
+     */
+    nrela_rodata: u32
+    /**
+     * nsects — the section-header count (`e_shnum`): 7 without `.rela.rodata`,
+     * 8 with it (#594 T-B2). Derived from the section-name count.
+     */
+    nsects: u32
 }
 
 /**
@@ -546,23 +697,27 @@ type ElfLayout = struct {
  * @param ElfObject obj  the neutral object (for the `.text`/`.rodata` sizes)
  * @param u32 nsyms  the `Elf64_Sym` count
  * @param u32 nrela  the `Elf64_Rela` count
+ * @param u32 nrela_rodata  the `Elf64_Rela` count of `.rela.rodata`
  * @param u32 strtab_len  the pre-built `.strtab` byte size
  * @param u32 shstrtab_len  the pre-built `.shstrtab` byte size
  * @param u32 first_global  `.symtab`'s `sh_info`
+ * @param u32 nsects  the section-header count (`e_shnum`)
  * @return ElfLayout  the resolved offsets + sizes + counts
  */
-fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, strtab_len: u32, shstrtab_len: u32, first_global: u32) -> ElfLayout {
+fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, nrela_rodata: u32, strtab_len: u32, shstrtab_len: u32, first_global: u32, nsects: u32) -> ElfLayout {
     let text_offset = 64 to u32
     let text_size = obj.text.len to u32
     let rodata_offset = align_up(text_offset + text_size, 8 to u32)
     let rodata_size = obj.rodata.len to u32
     let symtab_offset = align_up(rodata_offset + rodata_size, 8 to u32)
-    let symtab_size = nsyms * (24 to u32)
+    let symtab_size = nsyms * ELF64_SYM_SIZE
     let strtab_offset = symtab_offset + symtab_size
     let shstrtab_offset = strtab_offset + strtab_len
     let rela_offset = align_up(shstrtab_offset + shstrtab_len, 8 to u32)
-    let rela_size = nrela * (24 to u32)
-    let shoff = align_up(rela_offset + rela_size, 8 to u32)
+    let rela_size = nrela * ELF64_RELA_SIZE
+    let rela_rodata_offset = align_up(rela_offset + rela_size, 8 to u32)
+    let rela_rodata_size = nrela_rodata * ELF64_RELA_SIZE
+    let shoff = align_up(rela_rodata_offset + rela_rodata_size, 8 to u32)
     ElfLayout {
         text_offset = text_offset
         text_size = text_size
@@ -576,6 +731,10 @@ fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, strtab_len: u32, s
         shstrtab_size = shstrtab_len
         rela_offset = rela_offset
         rela_size = rela_size
+        rela_rodata_offset = rela_rodata_offset
+        rela_rodata_size = rela_rodata_size
+        nrela_rodata = nrela_rodata
+        nsects = nsects
         shoff = shoff
         nsyms = nsyms
         nrela = nrela
@@ -584,26 +743,37 @@ fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, strtab_len: u32, s
 }
 
 /**
+ * ELF_MAGIC — the `Elf64_Ehdr.e_ident` file-magic bytes (`\x7fELF`), identifying
+ * the file as an ELF object to every ELF-aware tool (`ld`, `readelf`, the kernel
+ * loader). A Tier-A aggregate const (#594 crumb 11), mirroring `GZIP_MAGIC`'s
+ * pattern — read once into `emit_elf_header` by index.
+ */
+const ELF_MAGIC: []byte = [0x7F to byte, 0x45 to byte, 0x4C to byte, 0x46 to byte]
+
+/**
  * emit_elf_header — the 64-byte `Elf64_Ehdr`: the `e_ident` magic (`\x7fELF` +
  * ELFCLASS64 + ELFDATA2LSB + EV_CURRENT + ELFOSABI_SYSV + 8 pad bytes), then
  * `e_type = ET_REL`(1), the supplied `e_machine` (EM_X86_64=62 / EM_RISCV=243),
  * `e_version = 1`, zero `e_entry`/`e_phoff`, the computed `e_shoff`, the supplied
  * `e_flags` (0 for x86-64 / EF_RISCV_FLOAT_ABI_DOUBLE=0x0004 for RV64 LP64D),
- * `e_ehsize = 64`, zero program-header fields, `e_shentsize = 64`, `e_shnum = 7`,
- * and `e_shstrndx = 5` (`.shstrtab`). The `e_machine`/`e_flags` are the ONLY
- * ISA-varying bytes of the reused header (§7.1).
+ * `e_ehsize = 64`, zero program-header fields, `e_shentsize = 64`, `e_shnum =
+ * nsects` (7, or 8 with `.rela.rodata`), and `e_shstrndx = 5` (`.shstrtab`). The
+ * `e_machine`/`e_flags` are the ONLY ISA-varying bytes of the reused header
+ * (§7.1).
  *
  * @param []byte buf  the (empty) buffer to extend
  * @param ElfLayout lay  the resolved layout (for `e_shoff`)
  * @param u32 e_machine  the ELF `e_machine` (62=x86-64, 243=riscv)
  * @param u32 e_flags  the ELF `e_flags` (0=x86-64, 0x0004=RV64 LP64D hard-float)
+ * @param u32 nsects  the section-header count emitted as `e_shnum`
  * @return []byte  `buf` followed by the 64-byte Ehdr
  */
-fn emit_elf_header(buf: []byte, lay: ElfLayout, e_machine: u32, e_flags: u32) -> []byte {
-    mut b = teko::list::push(buf, 0x7F to byte)
-    b = teko::list::push(b, 0x45 to byte)
-    b = teko::list::push(b, 0x4C to byte)
-    b = teko::list::push(b, 0x46 to byte)
+fn emit_elf_header(buf: []byte, lay: ElfLayout, e_machine: u32, e_flags: u32, nsects: u32) -> []byte {
+    let magic = ELF_MAGIC
+    mut b = teko::list::push(buf, magic[0])
+    b = teko::list::push(b, magic[1])
+    b = teko::list::push(b, magic[2])
+    b = teko::list::push(b, magic[3])
     b = teko::list::push(b, 2 to byte)
     b = teko::list::push(b, 1 to byte)
     b = teko::list::push(b, 1 to byte)
@@ -625,7 +795,7 @@ fn emit_elf_header(buf: []byte, lay: ElfLayout, e_machine: u32, e_flags: u32) ->
     b = emit_u16_le_elf(b, 0 to u32)
     b = emit_u16_le_elf(b, 0 to u32)
     b = emit_u16_le_elf(b, 64 to u32)
-    b = emit_u16_le_elf(b, 7 to u32)
+    b = emit_u16_le_elf(b, nsects)
     emit_u16_le_elf(b, 5 to u32)
 }
 
@@ -660,6 +830,43 @@ fn emit_elf_shdr(buf: []byte, name_off: u32, sh_type: u32, sh_flags: u32, sh_off
 }
 
 /**
+ * SHF_WRITE — the `Elf64_Shdr.sh_flags` bit (bit 0, `0x1`) marking a section as
+ * writable at load time. Not combined at any call site today; named alongside
+ * `SHF_ALLOC`/`SHF_EXECINSTR` for a complete, spec-faithful family.
+ */
+const SHF_WRITE: u32 = 0x1
+
+/**
+ * SHF_ALLOC — the `Elf64_Shdr.sh_flags` bit (bit 1, `0x2`) marking a section as
+ * occupying memory during process execution (set on `.text` and `.rodata`).
+ */
+const SHF_ALLOC: u32 = 0x2
+
+/**
+ * SHF_EXECINSTR — the `Elf64_Shdr.sh_flags` bit (bit 2, `0x4`) marking a
+ * section as containing executable machine instructions (set on `.text`,
+ * combined with `SHF_ALLOC`).
+ *
+ * A `flags` bitmask (rather than these plain `const`s) is the more faithful
+ * spelling of this OR-of-independent-bits family, but the `flags`→integer wire
+ * cast a byte-emitting call site needs (#594 crumb 11's checker addition,
+ * `typer.tks` E8) has not yet shipped in a released seed — the project's
+ * bootstrap-seed rule (`docs/design/const-module-level-plan.md` §8) requires a
+ * checker feature to land in a released seed BEFORE the corpus may spell it.
+ * A follow-on crumb converts this family to `flags ElfSectionFlags` once such a
+ * seed exists; until then these stay plain named `const`s (the "mapeamento no
+ * emit site" fallback), ORed directly at each call site.
+ */
+const SHF_EXECINSTR: u32 = 0x4
+
+/**
+ * SHF_INFO_LINK — the `Elf64_Shdr.sh_flags` bit (bit 6, `0x40`) marking a
+ * section's `sh_info` as another section index rather than a plain count (set
+ * on `.rela.text`, whose `sh_info` names `.text`).
+ */
+const SHF_INFO_LINK: u32 = 0x40
+
+/**
  * emit_elf_shdrs — the seven section headers in table order: the null header,
  * then `.text` (PROGBITS, ALLOC|EXECINSTR, align 16), `.rodata` (PROGBITS,
  * ALLOC, align 8), `.symtab` (SYMTAB, `sh_link` → `.strtab`(4), `sh_info` =
@@ -675,12 +882,16 @@ fn emit_elf_shdr(buf: []byte, name_off: u32, sh_type: u32, sh_flags: u32, sh_off
  */
 fn emit_elf_shdrs(buf: []byte, lay: ElfLayout, shname: []u32) -> []byte {
     mut b = emit_elf_shdr(buf, shname[0], 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32)
-    b = emit_elf_shdr(b, shname[1], 1 to u32, 0x6 to u32, lay.text_offset, lay.text_size, 0 to u32, 0 to u32, 16 to u32, 0 to u32)
-    b = emit_elf_shdr(b, shname[2], 1 to u32, 0x2 to u32, lay.rodata_offset, lay.rodata_size, 0 to u32, 0 to u32, 8 to u32, 0 to u32)
-    b = emit_elf_shdr(b, shname[3], 2 to u32, 0 to u32, lay.symtab_offset, lay.symtab_size, 4 to u32, lay.first_global, 8 to u32, 24 to u32)
+    b = emit_elf_shdr(b, shname[1], 1 to u32, SHF_ALLOC | SHF_EXECINSTR, lay.text_offset, lay.text_size, 0 to u32, 0 to u32, 16 to u32, 0 to u32)
+    b = emit_elf_shdr(b, shname[2], 1 to u32, SHF_ALLOC, lay.rodata_offset, lay.rodata_size, 0 to u32, 0 to u32, 8 to u32, 0 to u32)
+    b = emit_elf_shdr(b, shname[3], 2 to u32, 0 to u32, lay.symtab_offset, lay.symtab_size, 4 to u32, lay.first_global, 8 to u32, ELF64_SYM_SIZE)
     b = emit_elf_shdr(b, shname[4], 3 to u32, 0 to u32, lay.strtab_offset, lay.strtab_size, 0 to u32, 0 to u32, 1 to u32, 0 to u32)
     b = emit_elf_shdr(b, shname[5], 3 to u32, 0 to u32, lay.shstrtab_offset, lay.shstrtab_size, 0 to u32, 0 to u32, 1 to u32, 0 to u32)
-    emit_elf_shdr(b, shname[6], 4 to u32, 0x40 to u32, lay.rela_offset, lay.rela_size, 3 to u32, 1 to u32, 8 to u32, 24 to u32)
+    b = emit_elf_shdr(b, shname[6], 4 to u32, SHF_INFO_LINK, lay.rela_offset, lay.rela_size, 3 to u32, 1 to u32, 8 to u32, ELF64_RELA_SIZE)
+    if shname.len > (7 to u64) {
+        b = emit_elf_shdr(b, shname[7], 4 to u32, SHF_INFO_LINK, lay.rela_rodata_offset, lay.rela_rodata_size, 3 to u32, 2 to u32, 8 to u32, ELF64_RELA_SIZE)
+    }
+    b
 }
 
 /**
@@ -761,7 +972,7 @@ fn emit_elf_relas(buf: []byte, relas: []ElfRela) -> []byte {
  */
 pub type ElfRelocReq = struct {
     /**
-     * offset — the patched field's `.text`-section-relative byte offset.
+     * offset — the patched field's byte offset of the relocated field, relative to the base of the section the relocation patches: `.text`-base-relative in `ElfObject.relocs`, `.rodata`-base-relative in `ElfObject.rodata_relocs` (#594 T-B2) — historically always `.text`.
      */
     offset: u32
     /**
@@ -819,6 +1030,19 @@ pub type ElfObject = struct {
      * order.
      */
     relocs: []ElfRelocReq
+    /**
+     * rodata_relocs — the relocations whose PATCH SITE lies INSIDE `.rodata` (a
+     * Tier-B const's data→data pointer; #594 T-B2), separated from the `.text`-
+     * relative `relocs` because each one's `offset` is `.rodata`-base-relative,
+     * not `.text`-base-relative. EMPTY in every real compile today (T-B1's
+     * `encode_rodata` honest-stop keeps every producer out), which keeps the
+     * object byte-identical and every golden intact; the per-ISA bridge populates
+     * it (partitioning the `Reloc*` by `RelocSect`) only once the T-B chain opens.
+     * Each entry resolves to one `.rela.rodata` row (R_X86_64_64 / R_RISCV_64
+     * against the `.rodata` section symbol, the target's offset folded onto the
+     * addend).
+     */
+    rodata_relocs: []ElfRelocReq
 }
 
 /**
@@ -838,14 +1062,17 @@ pub type ElfObject = struct {
  * @return []byte  the ELF64 object file bytes
  */
 pub fn emit_elf_object(obj: ElfObject) -> []byte {
+    let has_rr = obj.rodata_relocs.len > (0 to u64)
     let syms = elf_build_symbols(obj.symbols)
     let strtab = build_elf_strtab(elf_sym_names(syms))
-    let shstrtab = build_elf_strtab(elf_section_names())
+    let secnames = elf_section_names(has_rr)
+    let shstrtab = build_elf_strtab(secnames)
     let relas = elf_build_relas(obj, syms)
+    let rodata_relas = elf_build_rodata_relas(obj, syms)
     let first_global = elf_first_global_index(syms)
-    let lay = compute_elf_layout(obj, syms.len to u32, relas.len to u32, strtab.bytes.len to u32, shstrtab.bytes.len to u32, first_global)
+    let lay = compute_elf_layout(obj, syms.len to u32, relas.len to u32, rodata_relas.len to u32, strtab.bytes.len to u32, shstrtab.bytes.len to u32, first_global, secnames.len to u32)
     mut b: []byte = teko::list::empty()
-    b = emit_elf_header(b, lay, obj.e_machine, obj.e_flags)
+    b = emit_elf_header(b, lay, obj.e_machine, obj.e_flags, lay.nsects)
     b = append_bytes(b, obj.text)
     b = pad_to_mult(b, 8 to u32)
     b = append_bytes(b, obj.rodata)
@@ -855,6 +1082,10 @@ pub fn emit_elf_object(obj: ElfObject) -> []byte {
     b = append_bytes(b, shstrtab.bytes)
     b = pad_to_mult(b, 8 to u32)
     b = emit_elf_relas(b, relas)
+    if has_rr {
+        b = pad_to_mult(b, 8 to u32)
+        b = emit_elf_relas(b, rodata_relas)
+    }
     b = pad_to_mult(b, 8 to u32)
     emit_elf_shdrs(b, lay, shstrtab.strx)
 }
@@ -875,7 +1106,28 @@ fn x86_reloc_reqs(enc: EncodedModuleX86) -> []ElfRelocReq {
     loop {
         if i >= enc.relocs.len { break }
         let r = enc.relocs[i]
-        out = teko::list::push(out, ElfRelocReq { offset = r.offset; sym = r.sym; rtype = elf_reloc_type(r.kind); addend = r.addend })
+        if r.sect == RelocSect::Text { out = teko::list::push(out, ElfRelocReq { offset = r.offset; sym = r.sym; rtype = elf_reloc_type(r.kind); addend = r.addend }) }
+        i++
+    }
+    out
+}
+
+/**
+ * x86_rodata_reloc_reqs — the `.rodata`-partition twin of `x86_reloc_reqs` (#594
+ * T-B5): lower every `RelocX86` whose patch site is INSIDE `.rodata`
+ * (`sect == Rodata`) to a neutral `ElfRelocReq` for `.rela.rodata`. Empty in every
+ * real compile until T-B6.
+ *
+ * @param EncodedModuleX86 enc  the x86 module (relocations, `.sect`-tagged)
+ * @return []ElfRelocReq  the `.rodata`-relative relocation requests, in order
+ */
+fn x86_rodata_reloc_reqs(enc: EncodedModuleX86) -> []ElfRelocReq {
+    mut out: []ElfRelocReq = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= enc.relocs.len { break }
+        let r = enc.relocs[i]
+        if r.sect == RelocSect::Rodata { out = teko::list::push(out, ElfRelocReq { offset = r.offset; sym = r.sym; rtype = elf_reloc_type(r.kind); addend = r.addend }) }
         i++
     }
     out
@@ -896,11 +1148,12 @@ fn x86_reloc_reqs(enc: EncodedModuleX86) -> []ElfRelocReq {
  */
 pub fn emit_elf(enc: EncodedModuleX86) -> []byte {
     emit_elf_object(ElfObject {
-        e_machine = 62 to u32
+        e_machine = EM_X86_64
         e_flags = 0 to u32
         text = enc.text
         rodata = enc.rodata
         symbols = enc.symbols
         relocs = x86_reloc_reqs(enc)
+        rodata_relocs = x86_rodata_reloc_reqs(enc)
     })
 }

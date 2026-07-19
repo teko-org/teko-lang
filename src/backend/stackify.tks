@@ -1,44 +1,6 @@
 use teko::lir
 
 /**
- * wasm_vt_i32 — the `i32` wasm value-type byte (`0x7F`), the valtype every
- * sub-32 integer width (`I8`/`I16`/`I32`) and `Ptr` collapse to in wasm32
- * (`backend-c1-wasm.md` §1.1).
- *
- * @return u8  the `i32` valtype byte
- */
-fn wasm_vt_i32() -> u8 {
-    0x7F to u8
-}
-
-/**
- * wasm_vt_i64 — the `i64` wasm value-type byte (`0x7E`).
- *
- * @return u8  the `i64` valtype byte
- */
-fn wasm_vt_i64() -> u8 {
-    0x7E to u8
-}
-
-/**
- * wasm_vt_f32 — the `f32` wasm value-type byte (`0x7D`).
- *
- * @return u8  the `f32` valtype byte
- */
-fn wasm_vt_f32() -> u8 {
-    0x7D to u8
-}
-
-/**
- * wasm_vt_f64 — the `f64` wasm value-type byte (`0x7C`).
- *
- * @return u8  the `f64` valtype byte
- */
-fn wasm_vt_f64() -> u8 {
-    0x7C to u8
-}
-
-/**
  * wasm_valtype — the wasm value-type byte an `LType` machine class maps to
  * under target pointer width `ptr64` (`backend-c1-wasm.md` §1.1/§6, the
  * wasm32/wasm64 switch, #389 C1-7): the sub-32 integer widths collapse to
@@ -63,15 +25,15 @@ fn wasm_vt_f64() -> u8 {
  */
 pub fn wasm_valtype(t: lir::LType, ptr64: bool) -> u8 | error {
     match t {
-        lir::LType::I8 => wasm_vt_i32()
-        lir::LType::I16 => wasm_vt_i32()
-        lir::LType::I32 => wasm_vt_i32()
-        lir::LType::I64 => wasm_vt_i64()
+        lir::LType::I8 => wasm_vtype_wire(WasmVType::I32)
+        lir::LType::I16 => wasm_vtype_wire(WasmVType::I32)
+        lir::LType::I32 => wasm_vtype_wire(WasmVType::I32)
+        lir::LType::I64 => wasm_vtype_wire(WasmVType::I64)
         lir::LType::I128 => error { message = "stackify: C1-i128 — wasm has no native i128 valtype, deferred (shared with A2's i128 route, backend-a4-encoder.md §6.3)" }
         lir::LType::F16 => error { message = "stackify: C1-f16 — wasm has no native f16 valtype, deferred (matches the register targets' f16 gap)" }
-        lir::LType::F32 => wasm_vt_f32()
-        lir::LType::F64 => wasm_vt_f64()
-        lir::LType::Ptr => if ptr64 { wasm_vt_i64() } else { wasm_vt_i32() }
+        lir::LType::F32 => wasm_vtype_wire(WasmVType::F32)
+        lir::LType::F64 => wasm_vtype_wire(WasmVType::F64)
+        lir::LType::Ptr => if ptr64 { wasm_vtype_wire(WasmVType::I64) } else { wasm_vtype_wire(WasmVType::I32) }
         lir::LType::Void => error { message = "stackify: wasm_valtype — a Void machine class has no wasm value type (internal)" }
     }
 }
@@ -118,7 +80,7 @@ fn wvt_grow(t: WasmVTypeTable, n: u64) -> WasmVTypeTable {
     mut vts = t.vtypes
     loop {
         if vts.len >= n { break }
-        vts = teko::list::push(vts, wasm_vt_i32())
+        vts = teko::list::push(vts, wasm_vtype_wire(WasmVType::I32))
     }
     WasmVTypeTable { vtypes = vts }
 }
@@ -157,7 +119,7 @@ fn wvt_set(t0: WasmVTypeTable, id: u32, vt: u8) -> WasmVTypeTable {
  */
 fn wvt_get(t: WasmVTypeTable, id: u32) -> u8 {
     let i = id to u64
-    if i >= t.vtypes.len { return wasm_vt_i32() }
+    if i >= t.vtypes.len { return wasm_vtype_wire(WasmVType::I32) }
     t.vtypes[i]
 }
 
@@ -173,12 +135,11 @@ fn wvt_get(t: WasmVTypeTable, id: u32) -> u8 {
  */
 pub type WasmScope = struct {
     /**
-     * kind — `wasm_scope_kind_block()` (label at its `end`, a forward
-     * exit), `wasm_scope_kind_loop()` (label at its start, a back-edge/
-     * continue), or `wasm_scope_kind_if()` (a structural diamond, never a
-     * `br` target — it only occupies a depth slot).
+     * kind — `Block` (label at its `end`, a forward exit), `Loop` (label at
+     * its start, a back-edge/continue), or `If` (a structural diamond,
+     * never a `br` target — it only occupies a depth slot).
      */
-    kind: u8
+    kind: WasmScopeKind
     /**
      * label_block — the LIR block id this scope's label targets
      * (meaningful for `block`/`loop`; unused, always `0`, for `if`).
@@ -187,45 +148,25 @@ pub type WasmScope = struct {
 }
 
 /**
- * wasm_scope_kind_block — the `WasmScope.kind` tag for an `if`-free forward
- * label scope (a wrapped loop exit, or a `br` skip-ahead target).
- *
- * @return u8  the `block` scope-kind tag
+ * WasmScopeKind — the tag `WasmScope.kind` carries: `Block` (an `if`-free
+ * forward label scope — a wrapped loop exit, or a `br` skip-ahead target),
+ * `Loop` (a loop scope; a `br` to it is the back-edge/continue), or `If` (an
+ * `if`/`else` structural diamond — it occupies a depth slot but is never a
+ * `br` target, its own fallthrough IS the merge). Purely an internal
+ * control-flow tag — never serialized to wasm bytes — so no wire mapping is
+ * needed.
  */
-fn wasm_scope_kind_block() -> u8 {
-    0 to u8
-}
-
-/**
- * wasm_scope_kind_loop — the `WasmScope.kind` tag for a loop scope (a `br`
- * to it is the back-edge/continue).
- *
- * @return u8  the `loop` scope-kind tag
- */
-fn wasm_scope_kind_loop() -> u8 {
-    1 to u8
-}
-
-/**
- * wasm_scope_kind_if — the `WasmScope.kind` tag for an `if`/`else`
- * structural diamond: it occupies a depth slot but is never a `br` target
- * (its own fallthrough IS the merge).
- *
- * @return u8  the `if` scope-kind tag
- */
-fn wasm_scope_kind_if() -> u8 {
-    2 to u8
-}
+pub type WasmScopeKind = enum { Block; Loop; If }
 
 /**
  * wasm_scope_stack_push — open a new scope on top of `scopes`.
  *
  * @param []WasmScope scopes  the scope stack to extend
- * @param u8 kind  the new scope's kind (`wasm_scope_kind_*`)
+ * @param WasmScopeKind kind  the new scope's kind
  * @param u32 label_block  the new scope's label target (unused for `if`)
  * @return []WasmScope  the extended stack, the new scope innermost
  */
-fn wasm_scope_stack_push(scopes: []WasmScope, kind: u8, label_block: u32) -> []WasmScope {
+fn wasm_scope_stack_push(scopes: []WasmScope, kind: WasmScopeKind, label_block: u32) -> []WasmScope {
     teko::list::push(scopes, WasmScope { kind = kind; label_block = label_block })
 }
 
@@ -280,7 +221,7 @@ fn wasm_scope_stack_depth_of(scopes: []WasmScope, label_block: u32) -> ScopeDept
     loop {
         if i >= scopes.len { break }
         let s = scopes[i]
-        let is_label = s.kind == wasm_scope_kind_block() || s.kind == wasm_scope_kind_loop()
+        let is_label = s.kind == WasmScopeKind::Block || s.kind == WasmScopeKind::Loop
         if is_label && s.label_block == label_block {
             return ScopeDepthResult { found = true; depth = ((scopes.len - 1) - i) to u32 }
         }
@@ -438,8 +379,8 @@ type StackifyCtx = struct {
     /**
      * elide — the whole-function value-stack peephole decision table (§5,
      * `compute_func_elide`), built ONCE ahead of lowering and read-only
-     * thereafter: each VReg's final `elide_kind_*` tag. Defaults to an empty
-     * table (every VReg reads as `elide_kind_normal()`) for every caller
+     * thereafter: each VReg's final `ElideKind` tag. Defaults to an empty
+     * table (every VReg reads as `ElideKind::Normal`) for every caller
      * that never populates it — the ALL-LOCALS baseline every fine-grained
      * per-instruction test in `stackify_test.tkt` still exercises directly.
      *
@@ -505,7 +446,7 @@ fn sc_sleb(ctx: StackifyCtx, v: i64) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_f64_bits(ctx: StackifyCtx, bits: u64) -> StackifyCtx {
-    let lo = (bits & (0xFFFFFFFF to u64)) to u32
+    let lo = (bits & WASM_U64_LOW32_MASK) to u32
     let hi = (bits >> (32 to u64)) to u32
     StackifyCtx { body = emit_u32_le(emit_u32_le(ctx.body, lo), hi); vtypes = ctx.vtypes; scopes = ctx.scopes; next_scratch = ctx.next_scratch; has_frame = ctx.has_frame; frame_base = ctx.frame_base; slots = ctx.slots; elide = ctx.elide; pending = ctx.pending }
 }
@@ -522,7 +463,7 @@ fn sc_f64_bits(ctx: StackifyCtx, bits: u64) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_local_get(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
-    sc_uleb(sc_byte(ctx, 0x20 to byte), vreg to u64)
+    sc_uleb(sc_byte(ctx, WASM_OP_LOCAL_GET), vreg to u64)
 }
 
 /**
@@ -533,7 +474,7 @@ fn sc_local_get(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_local_set(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
-    sc_uleb(sc_byte(ctx, 0x21 to byte), vreg to u64)
+    sc_uleb(sc_byte(ctx, WASM_OP_LOCAL_SET), vreg to u64)
 }
 
 /**
@@ -547,54 +488,33 @@ fn sc_local_set(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_local_tee(ctx: StackifyCtx, vreg: u32) -> StackifyCtx {
-    sc_uleb(sc_byte(ctx, 0x22 to byte), vreg to u64)
+    sc_uleb(sc_byte(ctx, WASM_OP_LOCAL_TEE), vreg to u64)
 }
 
 /**
- * elide_kind_normal — the value-stack peephole's own `ElideTable` tag for
- * the ALL-LOCALS baseline (§5): `local.set` at def, `local.get` at every
- * use — unchanged from the pre-C1-5 shape. The DEFAULT tag every unset
- * `ElideTable` position reads as.
+ * ElideKind — the value-stack peephole's own `ElideTable` tag: `Normal` (the
+ * ALL-LOCALS baseline, §5 — `local.set` at def, `local.get` at every use,
+ * unchanged from the pre-C1-5 shape; the DEFAULT tag every unset
+ * `ElideTable` position reads as), `Drop` (a value fully riding the operand
+ * stack — §5's SINGLE-USE + SAME-BLOCK + LIFO + NO-BARRIER case — NEITHER
+ * `local.set` at def NOR `local.get` at its one confirmed use), or `Tee` (a
+ * value that rides the operand stack into its one confirmed in-block
+ * computational use WHILE ALSO persisting to a local for a separate
+ * edge-copy use — §5's "`local.tee` where the value must ALSO persist to a
+ * local" case). Purely an internal decision tag — never serialized to wasm
+ * bytes — so no wire mapping is needed.
  *
- * @return u8  the `Normal` tag
  * @since #389 C1-5
  */
-fn elide_kind_normal() -> u8 {
-    0 to u8
-}
-
-/**
- * elide_kind_drop — the `ElideTable` tag for a value fully riding the
- * operand stack (§5's SINGLE-USE + SAME-BLOCK + LIFO + NO-BARRIER case):
- * NEITHER `local.set` at def NOR `local.get` at its one confirmed use.
- *
- * @return u8  the `Drop` tag
- * @since #389 C1-5
- */
-fn elide_kind_drop() -> u8 {
-    1 to u8
-}
-
-/**
- * elide_kind_tee — the `ElideTable` tag for a value that rides the operand
- * stack into its one confirmed in-block computational use WHILE ALSO
- * persisting to a local for a separate edge-copy use (§5's "`local.tee`
- * where the value must ALSO persist to a local" case).
- *
- * @return u8  the `Tee` tag
- * @since #389 C1-5
- */
-fn elide_kind_tee() -> u8 {
-    2 to u8
-}
+pub type ElideKind = enum { Normal; Drop; Tee }
 
 /**
  * ElideTable — the whole-function value-stack peephole decision table (§5):
- * each VReg's final `elide_kind_*` tag, densely indexed by VReg id exactly
+ * each VReg's final `ElideKind` tag, densely indexed by VReg id exactly
  * like `WasmVTypeTable`/`WasmSlotTable` (PARALLELED rather than reused,
  * §1.3's own discipline — a decision tag is not a valtype byte or a frame
  * offset). Built ONCE, ahead of lowering, by `compute_func_elide`; every
- * unset position defaults to `elide_kind_normal()`, so a caller that never
+ * unset position defaults to `ElideKind::Normal`, so a caller that never
  * builds one (every fine-grained per-instruction unit test in
  * `stackify_test.tkt`) transparently keeps exercising the ALL-LOCALS
  * baseline.
@@ -603,15 +523,15 @@ fn elide_kind_tee() -> u8 {
  */
 type ElideTable = struct {
     /**
-     * kinds — each recorded VReg's final `elide_kind_*` tag, positionally
+     * kinds — each recorded VReg's final `ElideKind` tag, positionally
      * indexed by VReg id.
      */
-    kinds: []u8
+    kinds: []ElideKind
 }
 
 /**
  * et_empty — a decision table with no VRegs recorded yet (every position
- * defaults to `elide_kind_normal()`).
+ * defaults to `ElideKind::Normal`).
  *
  * @return ElideTable  the empty table
  * @since #389 C1-5
@@ -621,7 +541,7 @@ fn et_empty() -> ElideTable {
 }
 
 /**
- * et_grow — pad `t` with placeholder `elide_kind_normal()` entries until it
+ * et_grow — pad `t` with placeholder `ElideKind::Normal` entries until it
  * holds at least `n` positions (mirrors `wvt_grow`).
  *
  * @param ElideTable t  the table to pad
@@ -633,7 +553,7 @@ fn et_grow(t: ElideTable, n: u64) -> ElideTable {
     mut ks = t.kinds
     loop {
         if ks.len >= n { break }
-        ks = teko::list::push(ks, elide_kind_normal())
+        ks = teko::list::push(ks, ElideKind::Normal)
     }
     ElideTable { kinds = ks }
 }
@@ -644,13 +564,13 @@ fn et_grow(t: ElideTable, n: u64) -> ElideTable {
  *
  * @param ElideTable t0  the table to update
  * @param u32 id  the VReg id being recorded
- * @param u8 kind  its final `elide_kind_*` tag
+ * @param ElideKind kind  its final decision tag
  * @return ElideTable  the updated table
  * @since #389 C1-5
  */
-fn et_set(t0: ElideTable, id: u32, kind: u8) -> ElideTable {
+fn et_set(t0: ElideTable, id: u32, kind: ElideKind) -> ElideTable {
     let grown = et_grow(t0, (id to u64) + 1)
-    mut out: []u8 = teko::list::empty()
+    mut out: []ElideKind = teko::list::empty()
     mut i: u64 = 0
     loop {
         if i >= grown.kinds.len { break }
@@ -661,17 +581,17 @@ fn et_set(t0: ElideTable, id: u32, kind: u8) -> ElideTable {
 }
 
 /**
- * et_get — the recorded decision for VReg `id`, or `elide_kind_normal()`
- * when `id` was never recorded (mirrors `wvt_get`).
+ * et_get — the recorded decision for VReg `id`, or `ElideKind::Normal` when
+ * `id` was never recorded (mirrors `wvt_get`).
  *
  * @param ElideTable t  the table to read
  * @param u32 id  the VReg id to look up
- * @return u8  its recorded (or default) `elide_kind_*` tag
+ * @return ElideKind  its recorded (or default) decision tag
  * @since #389 C1-5
  */
-fn et_get(t: ElideTable, id: u32) -> u8 {
+fn et_get(t: ElideTable, id: u32) -> ElideKind {
     let i = id to u64
-    if i >= t.kinds.len { return elide_kind_normal() }
+    if i >= t.kinds.len { return ElideKind::Normal }
     t.kinds[i]
 }
 
@@ -836,10 +756,10 @@ fn sc_use_operand(ctx0: StackifyCtx, vreg: u32) -> StackifyCtx {
 fn sc_def_result(ctx0: StackifyCtx, vreg: u32, vt: u8) -> StackifyCtx {
     let kind = et_get(ctx0.elide, vreg)
     let typed = sc_set_vtype(ctx0, vreg, vt)
-    if kind == elide_kind_drop() {
+    if kind == ElideKind::Drop {
         return StackifyCtx { body = typed.body; vtypes = typed.vtypes; scopes = typed.scopes; next_scratch = typed.next_scratch; has_frame = typed.has_frame; frame_base = typed.frame_base; slots = typed.slots; elide = typed.elide; pending = teko::list::push(typed.pending, vreg) }
     }
-    if kind == elide_kind_tee() {
+    if kind == ElideKind::Tee {
         let teed = sc_local_tee(typed, vreg)
         return StackifyCtx { body = teed.body; vtypes = teed.vtypes; scopes = teed.scopes; next_scratch = teed.next_scratch; has_frame = teed.has_frame; frame_base = teed.frame_base; slots = teed.slots; elide = teed.elide; pending = teko::list::push(teed.pending, vreg) }
     }
@@ -869,7 +789,7 @@ pub fn wasm_sp_global_index() -> u32 {
  * @return WasmGlobal  the `SP` global declaration
  */
 pub fn wasm_sp_global(init: i64) -> WasmGlobal {
-    WasmGlobal { valtype = wasm_vt_i32(); mutable = true; init = init }
+    WasmGlobal { valtype = wasm_vtype_wire(WasmVType::I32); mutable = true; init = init }
 }
 
 /**
@@ -880,7 +800,7 @@ pub fn wasm_sp_global(init: i64) -> WasmGlobal {
  * @return StackifyCtx  the advanced context
  */
 fn sc_global_get(ctx: StackifyCtx, idx: u32) -> StackifyCtx {
-    sc_uleb(sc_byte(ctx, 0x23 to byte), idx to u64)
+    sc_uleb(sc_byte(ctx, WASM_OP_GLOBAL_GET), idx to u64)
 }
 
 /**
@@ -891,7 +811,7 @@ fn sc_global_get(ctx: StackifyCtx, idx: u32) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_global_set(ctx: StackifyCtx, idx: u32) -> StackifyCtx {
-    sc_uleb(sc_byte(ctx, 0x24 to byte), idx to u64)
+    sc_uleb(sc_byte(ctx, WASM_OP_GLOBAL_SET), idx to u64)
 }
 
 /**
@@ -931,7 +851,7 @@ fn sc_memarg(ctx: StackifyCtx, align: u32, offset: u32) -> StackifyCtx {
  * @return byte  the void blocktype byte
  */
 fn wasm_blocktype_void() -> byte {
-    0x40 to byte
+    WASM_BLOCKTYPE_VOID
 }
 
 /**
@@ -944,8 +864,8 @@ fn wasm_blocktype_void() -> byte {
  * @return StackifyCtx  the advanced, scope-extended context
  */
 fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
-    let opened = sc_byte(sc_byte(ctx, 0x02 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_block(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
+    let opened = sc_byte(sc_byte(ctx, WASM_OP_BLOCK), wasm_blocktype_void())
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, WasmScopeKind::Block, label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
 }
 
 /**
@@ -958,8 +878,8 @@ fn sc_open_block(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
  * @return StackifyCtx  the advanced, scope-extended context
  */
 fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
-    let opened = sc_byte(sc_byte(ctx, 0x03 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_loop(), label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
+    let opened = sc_byte(sc_byte(ctx, WASM_OP_LOOP), wasm_blocktype_void())
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, WasmScopeKind::Loop, label_block); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
 }
 
 /**
@@ -972,8 +892,8 @@ fn sc_open_loop(ctx: StackifyCtx, label_block: u32) -> StackifyCtx {
  * @return StackifyCtx  the advanced, scope-extended context
  */
 fn sc_open_if(ctx: StackifyCtx) -> StackifyCtx {
-    let opened = sc_byte(sc_byte(ctx, 0x04 to byte), wasm_blocktype_void())
-    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, wasm_scope_kind_if(), 0 to u32); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
+    let opened = sc_byte(sc_byte(ctx, WASM_OP_IF), wasm_blocktype_void())
+    StackifyCtx { body = opened.body; vtypes = opened.vtypes; scopes = wasm_scope_stack_push(opened.scopes, WasmScopeKind::If, 0 to u32); next_scratch = opened.next_scratch; has_frame = opened.has_frame; frame_base = opened.frame_base; slots = opened.slots; elide = opened.elide; pending = opened.pending }
 }
 
 /**
@@ -985,7 +905,7 @@ fn sc_open_if(ctx: StackifyCtx) -> StackifyCtx {
  * @return StackifyCtx  the advanced, scope-shrunk context
  */
 fn sc_close_scope(ctx: StackifyCtx) -> StackifyCtx {
-    let closed = sc_byte(ctx, 0x0B to byte)
+    let closed = sc_byte(ctx, WASM_OP_END)
     StackifyCtx { body = closed.body; vtypes = closed.vtypes; scopes = wasm_scope_stack_pop(closed.scopes); next_scratch = closed.next_scratch; has_frame = closed.has_frame; frame_base = closed.frame_base; slots = closed.slots; elide = closed.elide; pending = closed.pending }
 }
 
@@ -998,7 +918,7 @@ fn sc_close_scope(ctx: StackifyCtx) -> StackifyCtx {
  * @return StackifyCtx  the advanced context
  */
 fn sc_br(ctx: StackifyCtx, depth: u32) -> StackifyCtx {
-    sc_uleb(sc_byte(ctx, 0x0C to byte), depth to u64)
+    sc_uleb(sc_byte(ctx, WASM_OP_BR), depth to u64)
 }
 
 /**
@@ -1080,8 +1000,8 @@ fn wasm_align_up(x: u32, a: u32) -> u32 {
  */
 fn wasm_align_down_i32(ctx0: StackifyCtx, align: u32) -> StackifyCtx {
     if align <= 1 { return ctx0 }
-    let ctx1 = sc_sleb(sc_byte(ctx0, 0x41 to byte), -(align to i64))
-    sc_byte(ctx1, 0x71 to byte)
+    let ctx1 = sc_sleb(sc_byte(ctx0, WASM_OP_I32_CONST), -(align to i64))
+    sc_byte(ctx1, WASM_OP_I32_AND)
 }
 
 /**
@@ -1214,10 +1134,10 @@ fn compute_wasm_frame_layout(allocas: []lir::LInst) -> WasmFrameLayout {
  * @return StackifyCtx  the advanced, frame-recording context
  */
 fn emit_frame_prologue(ctx0: StackifyCtx, layout: WasmFrameLayout) -> StackifyCtx {
-    let reserved = sc_alloc_scratch(ctx0, wasm_vt_i32())
+    let reserved = sc_alloc_scratch(ctx0, wasm_vtype_wire(WasmVType::I32))
     let ctx1 = sc_global_get(reserved.ctx, wasm_sp_global_index())
-    let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), layout.frame_size to i64)
-    let ctx3 = sc_byte(ctx2, 0x6B to byte)
+    let ctx2 = sc_sleb(sc_byte(ctx1, WASM_OP_I32_CONST), layout.frame_size to i64)
+    let ctx3 = sc_byte(ctx2, WASM_OP_I32_SUB)
     let ctx4 = wasm_align_down_i32(ctx3, layout.frame_align)
     let ctx5 = sc_local_tee(ctx4, reserved.id)
     let ctx6 = sc_global_set(ctx5, wasm_sp_global_index())
@@ -1457,13 +1377,13 @@ type WasmMemOp = struct {
  */
 fn wasm_mem_op(t: lir::LType) -> WasmMemOp | error {
     match t {
-        lir::LType::I8 => WasmMemOp { load_op = 0x2D to byte; store_op = 0x3A to byte; align = 0 to u32; valtype = wasm_vt_i32() }
-        lir::LType::I16 => WasmMemOp { load_op = 0x2F to byte; store_op = 0x3B to byte; align = 1 to u32; valtype = wasm_vt_i32() }
-        lir::LType::I32 => WasmMemOp { load_op = 0x28 to byte; store_op = 0x36 to byte; align = 2 to u32; valtype = wasm_vt_i32() }
-        lir::LType::I64 => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vt_i64() }
-        lir::LType::Ptr => WasmMemOp { load_op = 0x29 to byte; store_op = 0x37 to byte; align = 3 to u32; valtype = wasm_vt_i64() }
-        lir::LType::F32 => WasmMemOp { load_op = 0x2A to byte; store_op = 0x38 to byte; align = 2 to u32; valtype = wasm_vt_f32() }
-        lir::LType::F64 => WasmMemOp { load_op = 0x2B to byte; store_op = 0x39 to byte; align = 3 to u32; valtype = wasm_vt_f64() }
+        lir::LType::I8 => WasmMemOp { load_op = WASM_OP_I32_LOAD8_S; store_op = WASM_OP_I32_STORE8; align = 0 to u32; valtype = wasm_vtype_wire(WasmVType::I32) }
+        lir::LType::I16 => WasmMemOp { load_op = WASM_OP_I32_LOAD16_S; store_op = WASM_OP_I32_STORE16; align = 1 to u32; valtype = wasm_vtype_wire(WasmVType::I32) }
+        lir::LType::I32 => WasmMemOp { load_op = WASM_OP_I32_LOAD; store_op = WASM_OP_I32_STORE; align = 2 to u32; valtype = wasm_vtype_wire(WasmVType::I32) }
+        lir::LType::I64 => WasmMemOp { load_op = WASM_OP_I64_LOAD; store_op = WASM_OP_I64_STORE; align = 3 to u32; valtype = wasm_vtype_wire(WasmVType::I64) }
+        lir::LType::Ptr => WasmMemOp { load_op = WASM_OP_I64_LOAD; store_op = WASM_OP_I64_STORE; align = 3 to u32; valtype = wasm_vtype_wire(WasmVType::I64) }
+        lir::LType::F32 => WasmMemOp { load_op = WASM_OP_F32_LOAD; store_op = WASM_OP_F32_STORE; align = 2 to u32; valtype = wasm_vtype_wire(WasmVType::F32) }
+        lir::LType::F64 => WasmMemOp { load_op = WASM_OP_F64_LOAD; store_op = WASM_OP_F64_STORE; align = 3 to u32; valtype = wasm_vtype_wire(WasmVType::F64) }
         lir::LType::I128 => error { message = "stackify: C1-i128 — an i128 memory access has no wasm valtype, deferred (shared with A2's i128 route)" }
         lir::LType::F16 => error { message = "stackify: C1-f16 — an f16 memory access has no wasm valtype, deferred (matches the register targets' f16 gap)" }
         lir::LType::Void => error { message = "stackify: a void-typed memory access is malformed (internal)" }
@@ -1507,18 +1427,18 @@ fn wasm_narrow_threshold() -> i64 {
  *                       on the operand stack
  */
 fn stackify_narrow_ptr_load(ctx0: StackifyCtx, panic_ix: u32) -> StackifyCtx {
-    let alloc = sc_alloc_scratch(ctx0, wasm_vt_i64())
+    let alloc = sc_alloc_scratch(ctx0, wasm_vtype_wire(WasmVType::I64))
     let ctx1 = sc_local_tee(alloc.ctx, alloc.id)
-    let ctx2 = sc_sleb(sc_byte(ctx1, 0x42 to byte), wasm_narrow_threshold())
-    let ctx3 = sc_byte(ctx2, 0x5A to byte)
+    let ctx2 = sc_sleb(sc_byte(ctx1, WASM_OP_I64_CONST), wasm_narrow_threshold())
+    let ctx3 = sc_byte(ctx2, WASM_OP_I64_GE_U)
     let ctx4 = sc_open_if(ctx3)
-    let ctx5 = sc_sleb(sc_byte(ctx4, 0x41 to byte), wasm_narrow_msg_addr() to i64)
-    let ctx6 = sc_sleb(sc_byte(ctx5, 0x41 to byte), wasm_narrow_msg_len() to i64)
-    let ctx7 = sc_uleb(sc_byte(ctx6, 0x10 to byte), panic_ix to u64)
-    let ctx8 = sc_byte(ctx7, 0x00 to byte)
+    let ctx5 = sc_sleb(sc_byte(ctx4, WASM_OP_I32_CONST), wasm_narrow_msg_addr() to i64)
+    let ctx6 = sc_sleb(sc_byte(ctx5, WASM_OP_I32_CONST), wasm_narrow_msg_len() to i64)
+    let ctx7 = sc_uleb(sc_byte(ctx6, WASM_OP_CALL), panic_ix to u64)
+    let ctx8 = sc_byte(ctx7, WASM_OP_UNREACHABLE)
     let ctx9 = sc_close_scope(ctx8)
     let ctx10 = sc_local_get(ctx9, alloc.id)
-    sc_byte(ctx10, 0xA7 to byte)
+    sc_byte(ctx10, WASM_OP_I32_WRAP_I64)
 }
 
 /**
@@ -1538,8 +1458,8 @@ fn stackify_const_int(ctx0: StackifyCtx, inst: lir::LInst, c: lir::LConstInt) ->
         return error { message = "stackify: C1-i128 — an integer constant beyond 64 bits needs register-pair materialization, deferred (shared with A2's i128 route, backend-a4-encoder.md §6.3)" }
     }
     let narrow = stackify_fits_i32(c.val)
-    let op = if narrow { 0x41 to byte } else { 0x42 to byte }
-    let vt = if narrow { wasm_vt_i32() } else { wasm_vt_i64() }
+    let op = if narrow { WASM_OP_I32_CONST } else { WASM_OP_I64_CONST }
+    let vt = if narrow { wasm_vtype_wire(WasmVType::I32) } else { wasm_vtype_wire(WasmVType::I64) }
     let ctx1 = sc_sleb(sc_byte(ctx0, op), c.val to i64)
     sc_def_result(ctx1, inst.result, vt)
 }
@@ -1557,8 +1477,8 @@ fn stackify_const_int(ctx0: StackifyCtx, inst: lir::LInst, c: lir::LConstInt) ->
  * @return StackifyCtx  the advanced context
  */
 fn stackify_const_float(ctx0: StackifyCtx, inst: lir::LInst, c: lir::LConstFloat) -> StackifyCtx {
-    let ctx1 = sc_f64_bits(sc_byte(ctx0, 0x44 to byte), c.bits)
-    sc_def_result(ctx1, inst.result, wasm_vt_f64())
+    let ctx1 = sc_f64_bits(sc_byte(ctx0, WASM_OP_F64_CONST), c.bits)
+    sc_def_result(ctx1, inst.result, wasm_vtype_wire(WasmVType::F64))
 }
 
 /**
@@ -1597,39 +1517,39 @@ type WasmBinOpInfo = struct {
  */
 fn wasm_binop_info(op: lir::LBinOp, wide: bool) -> WasmBinOpInfo {
     match op {
-        lir::LBinOp::IAdd => WasmBinOpInfo { opcode = if wide { 0x7C to byte } else { 0x6A to byte }; is_cmp = false }
-        lir::LBinOp::ISub => WasmBinOpInfo { opcode = if wide { 0x7D to byte } else { 0x6B to byte }; is_cmp = false }
-        lir::LBinOp::IMul => WasmBinOpInfo { opcode = if wide { 0x7E to byte } else { 0x6C to byte }; is_cmp = false }
-        lir::LBinOp::IDivS => WasmBinOpInfo { opcode = if wide { 0x7F to byte } else { 0x6D to byte }; is_cmp = false }
-        lir::LBinOp::IDivU => WasmBinOpInfo { opcode = if wide { 0x80 to byte } else { 0x6E to byte }; is_cmp = false }
-        lir::LBinOp::IRemS => WasmBinOpInfo { opcode = if wide { 0x81 to byte } else { 0x6F to byte }; is_cmp = false }
-        lir::LBinOp::IRemU => WasmBinOpInfo { opcode = if wide { 0x82 to byte } else { 0x70 to byte }; is_cmp = false }
-        lir::LBinOp::IAnd => WasmBinOpInfo { opcode = if wide { 0x83 to byte } else { 0x71 to byte }; is_cmp = false }
-        lir::LBinOp::IOr => WasmBinOpInfo { opcode = if wide { 0x84 to byte } else { 0x72 to byte }; is_cmp = false }
-        lir::LBinOp::IXor => WasmBinOpInfo { opcode = if wide { 0x85 to byte } else { 0x73 to byte }; is_cmp = false }
-        lir::LBinOp::IShl => WasmBinOpInfo { opcode = if wide { 0x86 to byte } else { 0x74 to byte }; is_cmp = false }
-        lir::LBinOp::IShrS => WasmBinOpInfo { opcode = if wide { 0x87 to byte } else { 0x75 to byte }; is_cmp = false }
-        lir::LBinOp::IShrU => WasmBinOpInfo { opcode = if wide { 0x88 to byte } else { 0x76 to byte }; is_cmp = false }
-        lir::LBinOp::ICmpEq => WasmBinOpInfo { opcode = if wide { 0x51 to byte } else { 0x46 to byte }; is_cmp = true }
-        lir::LBinOp::ICmpNe => WasmBinOpInfo { opcode = if wide { 0x52 to byte } else { 0x47 to byte }; is_cmp = true }
-        lir::LBinOp::ICmpLtS => WasmBinOpInfo { opcode = if wide { 0x53 to byte } else { 0x48 to byte }; is_cmp = true }
-        lir::LBinOp::ICmpLtU => WasmBinOpInfo { opcode = if wide { 0x54 to byte } else { 0x49 to byte }; is_cmp = true }
-        lir::LBinOp::ICmpLeS => WasmBinOpInfo { opcode = if wide { 0x57 to byte } else { 0x4C to byte }; is_cmp = true }
-        lir::LBinOp::ICmpLeU => WasmBinOpInfo { opcode = if wide { 0x58 to byte } else { 0x4D to byte }; is_cmp = true }
-        lir::LBinOp::ICmpGtS => WasmBinOpInfo { opcode = if wide { 0x55 to byte } else { 0x4A to byte }; is_cmp = true }
-        lir::LBinOp::ICmpGtU => WasmBinOpInfo { opcode = if wide { 0x56 to byte } else { 0x4B to byte }; is_cmp = true }
-        lir::LBinOp::ICmpGeS => WasmBinOpInfo { opcode = if wide { 0x59 to byte } else { 0x4E to byte }; is_cmp = true }
-        lir::LBinOp::ICmpGeU => WasmBinOpInfo { opcode = if wide { 0x5A to byte } else { 0x4F to byte }; is_cmp = true }
-        lir::LBinOp::FAdd => WasmBinOpInfo { opcode = if wide { 0xA0 to byte } else { 0x92 to byte }; is_cmp = false }
-        lir::LBinOp::FSub => WasmBinOpInfo { opcode = if wide { 0xA1 to byte } else { 0x93 to byte }; is_cmp = false }
-        lir::LBinOp::FMul => WasmBinOpInfo { opcode = if wide { 0xA2 to byte } else { 0x94 to byte }; is_cmp = false }
-        lir::LBinOp::FDiv => WasmBinOpInfo { opcode = if wide { 0xA3 to byte } else { 0x95 to byte }; is_cmp = false }
-        lir::LBinOp::FCmpEq => WasmBinOpInfo { opcode = if wide { 0x61 to byte } else { 0x5B to byte }; is_cmp = true }
-        lir::LBinOp::FCmpNe => WasmBinOpInfo { opcode = if wide { 0x62 to byte } else { 0x5C to byte }; is_cmp = true }
-        lir::LBinOp::FCmpLt => WasmBinOpInfo { opcode = if wide { 0x63 to byte } else { 0x5D to byte }; is_cmp = true }
-        lir::LBinOp::FCmpLe => WasmBinOpInfo { opcode = if wide { 0x65 to byte } else { 0x5F to byte }; is_cmp = true }
-        lir::LBinOp::FCmpGt => WasmBinOpInfo { opcode = if wide { 0x64 to byte } else { 0x5E to byte }; is_cmp = true }
-        lir::LBinOp::FCmpGe => WasmBinOpInfo { opcode = if wide { 0x66 to byte } else { 0x60 to byte }; is_cmp = true }
+        lir::LBinOp::IAdd => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_ADD } else { WASM_OP_I32_ADD }; is_cmp = false }
+        lir::LBinOp::ISub => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_SUB } else { WASM_OP_I32_SUB }; is_cmp = false }
+        lir::LBinOp::IMul => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_MUL } else { WASM_OP_I32_MUL }; is_cmp = false }
+        lir::LBinOp::IDivS => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_DIV_S } else { WASM_OP_I32_DIV_S }; is_cmp = false }
+        lir::LBinOp::IDivU => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_DIV_U } else { WASM_OP_I32_DIV_U }; is_cmp = false }
+        lir::LBinOp::IRemS => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_REM_S } else { WASM_OP_I32_REM_S }; is_cmp = false }
+        lir::LBinOp::IRemU => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_REM_U } else { WASM_OP_I32_REM_U }; is_cmp = false }
+        lir::LBinOp::IAnd => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_AND } else { WASM_OP_I32_AND }; is_cmp = false }
+        lir::LBinOp::IOr => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_OR } else { WASM_OP_I32_OR }; is_cmp = false }
+        lir::LBinOp::IXor => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_XOR } else { WASM_OP_I32_XOR }; is_cmp = false }
+        lir::LBinOp::IShl => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_SHL } else { WASM_OP_I32_SHL }; is_cmp = false }
+        lir::LBinOp::IShrS => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_SHR_S } else { WASM_OP_I32_SHR_S }; is_cmp = false }
+        lir::LBinOp::IShrU => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_SHR_U } else { WASM_OP_I32_SHR_U }; is_cmp = false }
+        lir::LBinOp::ICmpEq => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_EQ } else { WASM_OP_I32_EQ }; is_cmp = true }
+        lir::LBinOp::ICmpNe => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_NE } else { WASM_OP_I32_NE }; is_cmp = true }
+        lir::LBinOp::ICmpLtS => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_LT_S } else { WASM_OP_I32_LT_S }; is_cmp = true }
+        lir::LBinOp::ICmpLtU => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_LT_U } else { WASM_OP_I32_LT_U }; is_cmp = true }
+        lir::LBinOp::ICmpLeS => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_LE_S } else { WASM_OP_I32_LE_S }; is_cmp = true }
+        lir::LBinOp::ICmpLeU => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_LE_U } else { WASM_OP_I32_LE_U }; is_cmp = true }
+        lir::LBinOp::ICmpGtS => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_GT_S } else { WASM_OP_I32_GT_S }; is_cmp = true }
+        lir::LBinOp::ICmpGtU => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_GT_U } else { WASM_OP_I32_GT_U }; is_cmp = true }
+        lir::LBinOp::ICmpGeS => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_GE_S } else { WASM_OP_I32_GE_S }; is_cmp = true }
+        lir::LBinOp::ICmpGeU => WasmBinOpInfo { opcode = if wide { WASM_OP_I64_GE_U } else { WASM_OP_I32_GE_U }; is_cmp = true }
+        lir::LBinOp::FAdd => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_ADD } else { WASM_OP_F32_ADD }; is_cmp = false }
+        lir::LBinOp::FSub => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_SUB } else { WASM_OP_F32_SUB }; is_cmp = false }
+        lir::LBinOp::FMul => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_MUL } else { WASM_OP_F32_MUL }; is_cmp = false }
+        lir::LBinOp::FDiv => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_DIV } else { WASM_OP_F32_DIV }; is_cmp = false }
+        lir::LBinOp::FCmpEq => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_EQ } else { WASM_OP_F32_EQ }; is_cmp = true }
+        lir::LBinOp::FCmpNe => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_NE } else { WASM_OP_F32_NE }; is_cmp = true }
+        lir::LBinOp::FCmpLt => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_LT } else { WASM_OP_F32_LT }; is_cmp = true }
+        lir::LBinOp::FCmpLe => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_LE } else { WASM_OP_F32_LE }; is_cmp = true }
+        lir::LBinOp::FCmpGt => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_GT } else { WASM_OP_F32_GT }; is_cmp = true }
+        lir::LBinOp::FCmpGe => WasmBinOpInfo { opcode = if wide { WASM_OP_F64_GE } else { WASM_OP_F32_GE }; is_cmp = true }
     }
 }
 
@@ -1648,11 +1568,11 @@ fn wasm_binop_info(op: lir::LBinOp, wide: bool) -> WasmBinOpInfo {
  */
 fn stackify_bin(ctx0: StackifyCtx, inst: lir::LInst, b: lir::LBin) -> StackifyCtx {
     let a_vt = wvt_get(ctx0.vtypes, b.a)
-    let wide = a_vt == wasm_vt_i64() || a_vt == wasm_vt_f64()
+    let wide = a_vt == wasm_vtype_wire(WasmVType::I64) || a_vt == wasm_vtype_wire(WasmVType::F64)
     let info = wasm_binop_info(b.op, wide)
     let ctx2 = sc_use_operands(ctx0, [b.a, b.b])
     let ctx3 = sc_byte(ctx2, info.opcode)
-    let dst_vt = if info.is_cmp { wasm_vt_i32() } else { a_vt }
+    let dst_vt = if info.is_cmp { wasm_vtype_wire(WasmVType::I32) } else { a_vt }
     sc_def_result(ctx3, inst.result, dst_vt)
 }
 
@@ -1670,9 +1590,9 @@ fn stackify_bin(ctx0: StackifyCtx, inst: lir::LInst, b: lir::LBin) -> StackifyCt
  * @return StackifyCtx  the advanced context
  */
 fn stackify_ineg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let wide = a_vt == wasm_vt_i64()
-    let const_op = if wide { 0x42 to byte } else { 0x41 to byte }
-    let sub_op = if wide { 0x7D to byte } else { 0x6B to byte }
+    let wide = a_vt == wasm_vtype_wire(WasmVType::I64)
+    let const_op = if wide { WASM_OP_I64_CONST } else { WASM_OP_I32_CONST }
+    let sub_op = if wide { WASM_OP_I64_SUB } else { WASM_OP_I32_SUB }
     let ctx1 = sc_sleb(sc_byte(ctx0, const_op), 0 to i64)
     let ctx2 = sc_use_operand(ctx1, a)
     let ctx3 = sc_byte(ctx2, sub_op)
@@ -1691,9 +1611,9 @@ fn stackify_ineg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  * @return StackifyCtx  the advanced context
  */
 fn stackify_inot(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let wide = a_vt == wasm_vt_i64()
-    let const_op = if wide { 0x42 to byte } else { 0x41 to byte }
-    let xor_op = if wide { 0x85 to byte } else { 0x73 to byte }
+    let wide = a_vt == wasm_vtype_wire(WasmVType::I64)
+    let const_op = if wide { WASM_OP_I64_CONST } else { WASM_OP_I32_CONST }
+    let xor_op = if wide { WASM_OP_I64_XOR } else { WASM_OP_I32_XOR }
     let ctx1 = sc_sleb(sc_byte(ctx0, const_op), -1 to i64)
     let ctx2 = sc_use_operand(ctx1, a)
     let ctx3 = sc_byte(ctx2, xor_op)
@@ -1711,7 +1631,7 @@ fn stackify_inot(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  * @return StackifyCtx  the advanced context
  */
 fn stackify_fneg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let op = if a_vt == wasm_vt_f64() { 0x9A to byte } else { 0x8C to byte }
+    let op = if a_vt == wasm_vtype_wire(WasmVType::F64) { WASM_OP_F64_NEG } else { WASM_OP_F32_NEG }
     let ctx1 = sc_byte(sc_use_operand(ctx0, a), op)
     sc_def_result(ctx1, inst.result, a_vt)
 }
@@ -1731,8 +1651,8 @@ fn stackify_fneg(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  */
 fn stackify_trunc(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
     let ctx1 = sc_use_operand(ctx0, a)
-    let ctx2 = if a_vt == wasm_vt_i64() { sc_byte(ctx1, 0xA7 to byte) } else { ctx1 }
-    sc_def_result(ctx2, inst.result, wasm_vt_i32())
+    let ctx2 = if a_vt == wasm_vtype_wire(WasmVType::I64) { sc_byte(ctx1, WASM_OP_I32_WRAP_I64) } else { ctx1 }
+    sc_def_result(ctx2, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -1768,9 +1688,9 @@ fn stackify_identity(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> S
  * @return StackifyCtx  the advanced context
  */
 fn stackify_itof(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let op = if a_vt == wasm_vt_i64() { 0xB9 to byte } else { 0xB7 to byte }
+    let op = if a_vt == wasm_vtype_wire(WasmVType::I64) { WASM_OP_F64_CONVERT_I64_S } else { WASM_OP_F64_CONVERT_I32_S }
     let ctx1 = sc_byte(sc_use_operand(ctx0, a), op)
-    sc_def_result(ctx1, inst.result, wasm_vt_f64())
+    sc_def_result(ctx1, inst.result, wasm_vtype_wire(WasmVType::F64))
 }
 
 /**
@@ -1786,9 +1706,9 @@ fn stackify_itof(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  * @return StackifyCtx  the advanced context
  */
 fn stackify_ftoi(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let op = if a_vt == wasm_vt_f64() { 0xAA to byte } else { 0xA8 to byte }
+    let op = if a_vt == wasm_vtype_wire(WasmVType::F64) { WASM_OP_I32_TRUNC_F64_S } else { WASM_OP_I32_TRUNC_F32_S }
     let ctx1 = sc_byte(sc_use_operand(ctx0, a), op)
-    sc_def_result(ctx1, inst.result, wasm_vt_i32())
+    sc_def_result(ctx1, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -1805,9 +1725,9 @@ fn stackify_ftoi(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> Stack
  * @return StackifyCtx  the advanced context
  */
 fn stackify_ftof(ctx0: StackifyCtx, inst: lir::LInst, a: u32, a_vt: u8) -> StackifyCtx {
-    let demote = a_vt == wasm_vt_f64()
-    let op = if demote { 0xB6 to byte } else { 0xBB to byte }
-    let dst_vt = if demote { wasm_vt_f32() } else { wasm_vt_f64() }
+    let demote = a_vt == wasm_vtype_wire(WasmVType::F64)
+    let op = if demote { WASM_OP_F32_DEMOTE_F64 } else { WASM_OP_F64_PROMOTE_F32 }
+    let dst_vt = if demote { wasm_vtype_wire(WasmVType::F32) } else { wasm_vtype_wire(WasmVType::F64) }
     let ctx1 = sc_byte(sc_use_operand(ctx0, a), op)
     sc_def_result(ctx1, inst.result, dst_vt)
 }
@@ -1884,7 +1804,7 @@ fn stackify_param(ctx0: StackifyCtx, f: lir::LFunc, inst: lir::LInst, p: lir::LP
 fn stackify_ret(ctx0: StackifyCtx, r: lir::LRet) -> StackifyCtx {
     let restored = emit_frame_epilogue(ctx0)
     let ctx1 = if r.has_value { sc_use_operand(restored, r.value) } else { restored }
-    sc_byte(ctx1, 0x0F to byte)
+    sc_byte(ctx1, WASM_OP_RETURN)
 }
 
 /**
@@ -1900,9 +1820,9 @@ fn stackify_ret(ctx0: StackifyCtx, r: lir::LRet) -> StackifyCtx {
  */
 fn stackify_field_addr(ctx0: StackifyCtx, inst: lir::LInst, fa: lir::LFieldAddr) -> StackifyCtx {
     let ctx1 = sc_use_operand(ctx0, fa.base)
-    let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), fa.offset to i64)
-    let ctx3 = sc_byte(ctx2, 0x6A to byte)
-    sc_def_result(ctx3, inst.result, wasm_vt_i32())
+    let ctx2 = sc_sleb(sc_byte(ctx1, WASM_OP_I32_CONST), fa.offset to i64)
+    let ctx3 = sc_byte(ctx2, WASM_OP_I32_ADD)
+    sc_def_result(ctx3, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -1923,9 +1843,9 @@ fn stackify_field_addr(ctx0: StackifyCtx, inst: lir::LInst, fa: lir::LFieldAddr)
 fn stackify_alloca(ctx0: StackifyCtx, inst: lir::LInst) -> StackifyCtx {
     let off = wst_get(ctx0.slots, inst.result)
     let ctx1 = sc_local_get(ctx0, ctx0.frame_base)
-    let ctx2 = sc_sleb(sc_byte(ctx1, 0x41 to byte), off to i64)
-    let ctx3 = sc_byte(ctx2, 0x6A to byte)
-    sc_def_result(ctx3, inst.result, wasm_vt_i32())
+    let ctx2 = sc_sleb(sc_byte(ctx1, WASM_OP_I32_CONST), off to i64)
+    let ctx3 = sc_byte(ctx2, WASM_OP_I32_ADD)
+    sc_def_result(ctx3, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -1960,7 +1880,7 @@ fn stackify_load(ctx0: StackifyCtx, inst: lir::LInst, l: lir::LLoad, ptr64: bool
     if l.ty == lir::LType::Ptr && !ptr64 {
         let panic_target = match wasm_resolve_call(symbols, "tk_panic_str") { WasmCallTarget as t => t; error as e => return e }
         let narrowed = stackify_narrow_ptr_load(ctx3, panic_target.func_index)
-        return sc_def_result(narrowed, inst.result, wasm_vt_i32())
+        return sc_def_result(narrowed, inst.result, wasm_vtype_wire(WasmVType::I32))
     }
     sc_def_result(ctx3, inst.result, mem.valtype)
 }
@@ -1990,7 +1910,7 @@ fn stackify_store(ctx0: StackifyCtx, s: lir::LStore, ptr64: bool) -> StackifyCtx
     let mem = match wasm_mem_op(s.ty) { WasmMemOp as m => m; error as e => return e }
     if s.ty == lir::LType::Ptr && !ptr64 {
         let ctx1 = sc_use_operands(ctx0, [s.addr, s.value])
-        let ctx2 = sc_byte(ctx1, 0xAD to byte)
+        let ctx2 = sc_byte(ctx1, WASM_OP_I64_EXTEND_I32_U)
         let ctx3 = sc_byte(ctx2, mem.store_op)
         return sc_memarg(ctx3, mem.align, 0 to u32)
     }
@@ -2155,7 +2075,7 @@ fn wasm_resolve_data(t: WasmSymbolTable, symbol: str) -> u32 | error {
 fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, c: lir::LCall, ptr64: bool) -> StackifyCtx | error {
     let target = match wasm_resolve_call(symbols, c.symbol) { WasmCallTarget as t => t; error as e => return e }
     let staged = sc_use_operands(ctx0, c.args)
-    let ctx = sc_uleb(sc_byte(staged, 0x10 to byte), target.func_index to u64)
+    let ctx = sc_uleb(sc_byte(staged, WASM_OP_CALL), target.func_index to u64)
     if target.ret_type == lir::LType::Void {
         return ctx
     }
@@ -2163,7 +2083,7 @@ fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, 
     if inst.has_result {
         return sc_def_result(ctx, inst.result, vt)
     }
-    sc_byte(ctx, 0x1A to byte)
+    sc_byte(ctx, WASM_OP_DROP)
 }
 
 /**
@@ -2183,8 +2103,8 @@ fn stackify_call(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, 
  */
 fn stackify_global_addr(ctx0: StackifyCtx, symbols: WasmSymbolTable, inst: lir::LInst, g: lir::LGlobalAddr) -> StackifyCtx | error {
     let off = match wasm_resolve_data(symbols, g.symbol) { u32 as o => o; error as e => return e }
-    let ctx1 = sc_sleb(sc_byte(ctx0, 0x41 to byte), off to i64)
-    sc_def_result(ctx1, inst.result, wasm_vt_i32())
+    let ctx1 = sc_sleb(sc_byte(ctx0, WASM_OP_I32_CONST), off to i64)
+    sc_def_result(ctx1, inst.result, wasm_vtype_wire(WasmVType::I32))
 }
 
 /**
@@ -2726,16 +2646,16 @@ fn collect_use_info(f: lir::LFunc) -> UseInfoTable {
  * @param UseInfoTable use_info  the whole-function use analysis
  * @param u32 owner_block  the block `v` is defined in
  * @param u32 v  the VReg to classify
- * @return u8  the tentative `elide_kind_*` tag
+ * @return ElideKind  the tentative decision tag
  * @since #389 C1-5
  */
-fn elide_candidate_kind(use_info: UseInfoTable, owner_block: u32, v: u32) -> u8 {
-    if uit_is_param(use_info, v) { return elide_kind_normal() }
+fn elide_candidate_kind(use_info: UseInfoTable, owner_block: u32, v: u32) -> ElideKind {
+    if uit_is_param(use_info, v) { return ElideKind::Normal }
     let n = uit_count(use_info, v)
     if n == (1 to u32) {
         let site = uit_site_a(use_info, v)
-        if uit_site_block(site) == owner_block && !uit_site_is_edge(site) { return elide_kind_drop() }
-        return elide_kind_normal()
+        if uit_site_block(site) == owner_block && !uit_site_is_edge(site) { return ElideKind::Drop }
+        return ElideKind::Normal
     }
     if n == (2 to u32) {
         let sa = uit_site_a(use_info, v)
@@ -2744,11 +2664,11 @@ fn elide_candidate_kind(use_info: UseInfoTable, owner_block: u32, v: u32) -> u8 
         let a_edge = uit_site_block(sa) == owner_block && uit_site_is_edge(sa)
         let b_comp = uit_site_block(sb) == owner_block && !uit_site_is_edge(sb)
         let b_edge = uit_site_block(sb) == owner_block && uit_site_is_edge(sb)
-        if a_comp && b_edge { return elide_kind_tee() }
-        if b_comp && a_edge { return elide_kind_tee() }
-        return elide_kind_normal()
+        if a_comp && b_edge { return ElideKind::Tee }
+        if b_comp && a_edge { return ElideKind::Tee }
+        return ElideKind::Normal
     }
-    elide_kind_normal()
+    ElideKind::Normal
 }
 
 /**
@@ -2880,7 +2800,7 @@ type PendingFlush = struct {
     pending: []PendingItem
     /**
      * table — the decision table, with any newly-cancelled entries
-     * downgraded to `elide_kind_normal()`.
+     * downgraded to `ElideKind::Normal`.
      */
     table: ElideTable
 }
@@ -2970,7 +2890,7 @@ fn resolve_inst_operands(pending0: []PendingItem, table0: ElideTable, reversed_r
 /**
  * cancel_pending_loads — the §5 condition-4 barrier step (`inst_is_barrier`):
  * downgrade every `is_load` entry currently in `pending` to
- * `elide_kind_normal()` and drop it, leaving every non-load entry in place
+ * `ElideKind::Normal` and drop it, leaving every non-load entry in place
  * (a plain computed value safely survives on the real wasm stack across a
  * call/store — only a load result is hazarded, `inst_is_load`'s own doc).
  *
@@ -2987,7 +2907,7 @@ fn cancel_pending_loads(pending: []PendingItem, table0: ElideTable) -> PendingFl
         if i >= pending.len { break }
         let item = pending[i]
         if item.is_load {
-            table = et_set(table, item.vreg, elide_kind_normal())
+            table = et_set(table, item.vreg, ElideKind::Normal)
         } else {
             out = teko::list::push(out, item)
         }
@@ -2998,7 +2918,7 @@ fn cancel_pending_loads(pending: []PendingItem, table0: ElideTable) -> PendingFl
 
 /**
  * cancel_all_pending — downgrade every entry still in `pending` to
- * `elide_kind_normal()` (the defensive end-of-block flush, §3.3's own
+ * `ElideKind::Normal` (the defensive end-of-block flush, §3.3's own
  * "the operand stack is empty at every label boundary" invariant): should
  * never actually find anything, given a correctly-computed `use_info`
  * (every same-block single/double use is, by construction, reachable
@@ -3016,7 +2936,7 @@ fn cancel_all_pending(pending: []PendingItem, table0: ElideTable) -> ElideTable 
     mut i: u64 = 0
     loop {
         if i >= pending.len { break }
-        table = et_set(table, pending[i].vreg, elide_kind_normal())
+        table = et_set(table, pending[i].vreg, ElideKind::Normal)
         i++
     }
     table
@@ -3068,7 +2988,7 @@ fn compute_block_elide(block: lir::LBlock, use_info: UseInfoTable, table0: Elide
         if inst.has_result {
             let kind = elide_candidate_kind(use_info, block.id, inst.result)
             table = et_set(table, inst.result, kind)
-            if kind != elide_kind_normal() {
+            if kind != ElideKind::Normal {
                 pending = teko::list::push(pending, PendingItem { vreg = inst.result; is_load = inst_is_load(inst) })
             }
         }
@@ -3944,6 +3864,21 @@ type RenderEnv = struct {
 }
 
 /**
+ * EdgeResultKind — the three shapes `render_edge` can resolve an edge to:
+ * `Stop` (the edge reached the caller's own `stop` target — nothing more to
+ * render on this path, the caller renders `target` itself once, after its
+ * own scope closes), `Branch` (the edge's target is an open scope — a `br`
+ * was emitted, a `continue`, a `break`, or a labelled skip past several
+ * enclosing scopes at once), or `More` (the edge's target is neither `stop`
+ * nor already open — the caller must keep rendering by recursing into it
+ * directly, the straight-line "this is simply the next block" fallthrough
+ * case). Named `EdgeResultKind` (not `EdgeResult`) to stay distinct from the
+ * `EdgeResult` struct below, whose `kind` field it types. Purely an internal
+ * control-flow tag — never serialized — so no wire mapping is needed.
+ */
+pub type EdgeResultKind = enum { Stop; Branch; More }
+
+/**
  * EdgeResult — one edge's fully-resolved outcome (`render_edge`): the
  * advanced context (its block-arg copies already emitted) and which of the
  * three shapes it took.
@@ -3951,51 +3886,17 @@ type RenderEnv = struct {
 type EdgeResult = struct {
     /**
      * ctx — the context advanced past the edge's own block-arg copies (and
-     * its `br`, when `kind` is `edge_result_branch()`).
+     * its `br`, when `kind` is `EdgeResultKind::Branch`).
      */
     ctx: StackifyCtx
     /**
-     * kind — `edge_result_stop()` / `edge_result_branch()` /
-     * `edge_result_more()`.
+     * kind — the edge's resolved `EdgeResultKind`.
      */
-    kind: u8
+    kind: EdgeResultKind
     /**
      * target — the edge's own target block id.
      */
     target: u32
-}
-
-/**
- * edge_result_stop — the edge reached the caller's own `stop` target:
- * nothing more to render on this path (the caller renders `target` itself,
- * once, after its own scope closes).
- *
- * @return u8  the "stop" edge-result tag
- */
-fn edge_result_stop() -> u8 {
-    0 to u8
-}
-
-/**
- * edge_result_branch — the edge's target is an open scope: a `br` was
- * emitted (a `continue`, a `break`, or a labelled skip past several
- * enclosing scopes at once).
- *
- * @return u8  the "branch" edge-result tag
- */
-fn edge_result_branch() -> u8 {
-    1 to u8
-}
-
-/**
- * edge_result_more — the edge's target is neither `stop` nor already open:
- * the caller must keep rendering by recursing into it directly (the
- * straight-line "this is simply the next block" fallthrough case).
- *
- * @return u8  the "more" edge-result tag
- */
-fn edge_result_more() -> u8 {
-    2 to u8
 }
 
 /**
@@ -4016,13 +3917,13 @@ fn render_edge(ctx0: StackifyCtx, env: RenderEnv, target: u32, args: []u32, stop
     let params = env.blocks[target to u64].params
     let copied = match emit_edge_copies(ctx0, params, args) { StackifyCtx as c => c; error as e => return e }
     if edge_stop_matches(stop, target) {
-        return EdgeResult { ctx = copied; kind = edge_result_stop(); target = target }
+        return EdgeResult { ctx = copied; kind = EdgeResultKind::Stop; target = target }
     }
     let sd = wasm_scope_stack_depth_of(copied.scopes, target)
     if sd.found {
-        return EdgeResult { ctx = sc_br(copied, sd.depth); kind = edge_result_branch(); target = target }
+        return EdgeResult { ctx = sc_br(copied, sd.depth); kind = EdgeResultKind::Branch; target = target }
     }
-    EdgeResult { ctx = copied; kind = edge_result_more(); target = target }
+    EdgeResult { ctx = copied; kind = EdgeResultKind::More; target = target }
 }
 
 /**
@@ -4039,7 +3940,7 @@ fn render_edge(ctx0: StackifyCtx, env: RenderEnv, target: u32, args: []u32, stop
  */
 fn render_arm(ctx0: StackifyCtx, env: RenderEnv, target: u32, args: []u32, stop: EdgeStop) -> StackifyCtx | error {
     let er = match render_edge(ctx0, env, target, args, stop) { EdgeResult as r => r; error as e => return e }
-    if er.kind == edge_result_more() {
+    if er.kind == EdgeResultKind::More {
         return render_region(er.ctx, env, stop, er.target)
     }
     er.ctx
@@ -4077,7 +3978,7 @@ fn all_but_last(insts: []lir::LInst) -> []lir::LInst {
  */
 fn render_jump_terminator(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, j: lir::LJump) -> StackifyCtx | error {
     let er = match render_edge(ctx0, env, j.target, j.args, stop) { EdgeResult as r => r; error as e => return e }
-    if er.kind == edge_result_more() {
+    if er.kind == EdgeResultKind::More {
         return render_region(er.ctx, env, stop, er.target)
     }
     er.ctx
@@ -4107,7 +4008,7 @@ fn render_branch_terminator(ctx0: StackifyCtx, env: RenderEnv, stop: EdgeStop, b
     let inner_stop = if mr.found { edge_stop_at(mr.target) } else { stop }
     let opened = sc_open_if(sc_use_operand(ctx0, br.cond))
     let then_done = match render_arm(opened, env, br.t_target, br.t_args, inner_stop) { StackifyCtx as c => c; error as e => return e }
-    let mid = sc_byte(then_done, 0x05 to byte)
+    let mid = sc_byte(then_done, WASM_OP_ELSE)
     let else_done = match render_arm(mid, env, br.f_target, br.f_args, inner_stop) { StackifyCtx as c => c; error as e => return e }
     let closed = sc_close_scope(else_done)
     if mr.found {
@@ -4357,7 +4258,7 @@ pub type WasmFuncBody = struct {
  */
 pub fn stackify_func(f: lir::LFunc, calls: WasmSymbolTable, ptr64: bool) -> WasmFuncBody | error {
     let done = match stackify_control(f, calls, ptr64) { StackifyCtx as c => c; error as e => return e }
-    let body = teko::list::push(done.body, 0x0B to byte)
+    let body = teko::list::push(done.body, WASM_OP_END)
     let groups = wasm_local_groups_of(done.vtypes, f.n_params, done.next_scratch)
     WasmFuncBody { local_groups = groups; body = body }
 }
@@ -4422,6 +4323,75 @@ pub fn wasm_layout_rodata(rodata: []lir::LRodata, base: u32) -> WasmRodataLayout
         i++
     }
     WasmRodataLayout { segment = WasmDataSegment { offset = base; bytes = bytes }; symbols = symbols; offsets = offsets; end = off }
+}
+
+/**
+ * wasm_data_addr_of — o endereço ABSOLUTO de memória linear da entrada rodata cujo
+ * símbolo é `target`, buscado nas tabelas paralelas `symbols`/`offsets` de um layout
+ * de rodata (#594 T-B4). É a resolução do ALVO de um ponteiro data→data no wasm:
+ * como o data segment ativo fica numa base fixa e conhecida na emissão
+ * (`wasm_rodata_base`), o offset de cada entrada JÁ é o seu endereço absoluto final,
+ * então um ponteiro intra-data é uma constante i32 de compile-time — sem relocation,
+ * o endereço é gravado direto no slot. Devolve um erro NOMEADO (não um skip silencioso)
+ * quando nenhuma entrada carrega esse símbolo, mantendo o miscompile impossível.
+ *
+ * @param []str symbols  os símbolos das entradas laid-out, paralelo a `offsets`
+ * @param []u32 offsets  o endereço absoluto de memória linear de cada entrada
+ * @param str target  o símbolo da entrada referenciada
+ * @return u32 | error  o endereço absoluto do alvo, ou um erro nomeado
+ */
+fn wasm_data_addr_of(symbols: []str, offsets: []u32, target: str) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        if symbols[i] == target { return offsets[i] }
+        i++
+    }
+    error { message = $"stackify: rodata-internal pointer targets unknown rodata symbol '{target}' (#594 T-B4)" }
+}
+
+/**
+ * wasm_relocate_rodata — resolve as relocations INTERNAS de ponteiro de cada entrada
+ * rodata num layout já montado, devolvendo o layout com os bytes do seu data segment
+ * patcheados in-place (#594 T-B4). Para cada `LDataReloc { offset; target }` da
+ * entrada `i`, o endereço absoluto de `target` (`wasm_data_addr_of`) é escrito no slot
+ * de ponteiro no byte segment-relativo `(layout.offsets[i] - base) + offset`. O wasm
+ * NÃO tem linker e o data segment ativo fica numa base fixa conhecida na emissão
+ * (`wasm_rodata_base`), então um ponteiro intra-data é uma constante i32 de
+ * compile-time escrita direto no segment — o análogo wasm das relocations data→data
+ * `.rela.rodata`/`__const` dos writers nativos (T-B2/T-B3), emitido SEM registro de
+ * relocation. O slot de 8 bytes que o serializer Tier-B reserva é preenchido
+ * low-word-first: no wasm32 o endereço i32 ocupa os bytes [p, p+4) e o word alto
+ * [p+4, p+8) permanece zero (um endereço linear nunca excede 2^32). Toda entrada
+ * rodata que o compilador produz HOJE tem `relocs` VAZIO (o produtor `serialize_const`
+ * honest-stopa agregados pointer-bearing até T-B6), então isto devolve o layout
+ * byte-idêntico e todo golden wasm fica intacto. O arm wasm64 (i64) NÃO é implementado
+ * aqui: um programa wasm64 com rodata é honest-stopado a montante por
+ * `wasm_scope_stop_wasm64`, então o único arm alcançável é o write i32 do wasm32.
+ *
+ * @param WasmRodataLayout layout  o rodata laid-out (`wasm_layout_rodata`)
+ * @param []lir::LRodata rodata  as entradas na MESMA ordem (as suas relocs)
+ * @return WasmRodataLayout | error  o layout com os slots de ponteiro escritos, ou o
+ *                                   erro nomeado de alvo desconhecido propagado
+ */
+pub fn wasm_relocate_rodata(layout: WasmRodataLayout, rodata: []lir::LRodata) -> WasmRodataLayout | error {
+    let base = layout.segment.offset
+    mut buf = layout.segment.bytes
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        let entry_start = layout.offsets[i] - base
+        mut j: u64 = 0
+        loop {
+            if j >= rodata[i].relocs.len { break }
+            let rel = rodata[i].relocs[j]
+            let addr = match wasm_data_addr_of(layout.symbols, layout.offsets, rel.target) { u32 as a => a; error as e => return e }
+            buf = write_u32_le_at(buf, entry_start + rel.offset, addr)
+            j++
+        }
+        i++
+    }
+    WasmRodataLayout { segment = WasmDataSegment { offset = base; bytes = buf }; symbols = layout.symbols; offsets = layout.offsets; end = layout.end }
 }
 
 /**
@@ -4848,15 +4818,15 @@ fn wasm_synth_start(type_index: u32, main_index: u32, proc_exit_index: u32, main
         return error { message = "stackify: C1-main-ret — wasm_synth_start only knows the virtual-main ABI's own I32/Void return shapes; a differently-typed `main` would feed proc_exit a type-mismatched operand (internal, unreachable under lir::lower_virtual_main)" }
     }
     mut body: []byte = teko::list::empty()
-    body = teko::list::push(body, 0x10 to byte)
+    body = teko::list::push(body, WASM_OP_CALL)
     body = emit_uleb128(body, main_index to u64)
     if main_ret == lir::LType::Void {
-        body = teko::list::push(body, 0x41 to byte)
+        body = teko::list::push(body, WASM_OP_I32_CONST)
         body = emit_sleb128(body, 0 to i64)
     }
-    body = teko::list::push(body, 0x10 to byte)
+    body = teko::list::push(body, WASM_OP_CALL)
     body = emit_uleb128(body, proc_exit_index to u64)
-    body = teko::list::push(body, 0x0B to byte)
+    body = teko::list::push(body, WASM_OP_END)
     WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = body }
 }
 
@@ -4870,7 +4840,7 @@ fn wasm_synth_start(type_index: u32, main_index: u32, proc_exit_index: u32, main
  * @return []byte  `buf` followed by the encoded instruction
  */
 fn wasm_op_i32_const(buf: []byte, v: i64) -> []byte {
-    emit_sleb128(teko::list::push(buf, 0x41 to byte), v)
+    emit_sleb128(teko::list::push(buf, WASM_OP_I32_CONST), v)
 }
 
 /**
@@ -4882,7 +4852,7 @@ fn wasm_op_i32_const(buf: []byte, v: i64) -> []byte {
  * @return []byte  `buf` followed by the encoded instruction
  */
 fn wasm_op_local_get(buf: []byte, idx: u32) -> []byte {
-    emit_uleb128(teko::list::push(buf, 0x20 to byte), idx to u64)
+    emit_uleb128(teko::list::push(buf, WASM_OP_LOCAL_GET), idx to u64)
 }
 
 /**
@@ -4895,7 +4865,7 @@ fn wasm_op_local_get(buf: []byte, idx: u32) -> []byte {
  * @return []byte  `buf` followed by the encoded instruction
  */
 fn wasm_op_store32(buf: []byte) -> []byte {
-    let b = teko::list::push(buf, 0x36 to byte)
+    let b = teko::list::push(buf, WASM_OP_I32_STORE)
     let b2 = teko::list::push(b, 0x02 to byte)
     teko::list::push(b2, 0x00 to byte)
 }
@@ -4908,7 +4878,7 @@ fn wasm_op_store32(buf: []byte) -> []byte {
  * @return []byte  `buf` followed by the encoded instruction
  */
 fn wasm_op_store8(buf: []byte) -> []byte {
-    let b = teko::list::push(buf, 0x3A to byte)
+    let b = teko::list::push(buf, WASM_OP_I32_STORE8)
     let b2 = teko::list::push(b, 0x00 to byte)
     teko::list::push(b2, 0x00 to byte)
 }
@@ -4922,7 +4892,7 @@ fn wasm_op_store8(buf: []byte) -> []byte {
  * @return []byte  `buf` followed by the encoded instruction
  */
 fn wasm_op_call(buf: []byte, funcidx: u32) -> []byte {
-    emit_uleb128(teko::list::push(buf, 0x10 to byte), funcidx to u64)
+    emit_uleb128(teko::list::push(buf, WASM_OP_CALL), funcidx to u64)
 }
 
 /**
@@ -4932,7 +4902,7 @@ fn wasm_op_call(buf: []byte, funcidx: u32) -> []byte {
  * @return []byte  `buf` followed by the encoded instruction
  */
 fn wasm_op_drop(buf: []byte) -> []byte {
-    teko::list::push(buf, 0x1A to byte)
+    teko::list::push(buf, WASM_OP_DROP)
 }
 
 /**
@@ -5012,7 +4982,7 @@ fn wasm_synth_io_write(fd: u32, newline: bool, type_index: u32, fd_write_index: 
     let b5 = wasm_op_store32(b4)
     let b6 = wasm_emit_fd_write_call(b5, fd, fd_write_index)
     let body = if newline { wasm_io_write_newline(b6, fd, fd_write_index) } else { b6 }
-    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = teko::list::push(body, 0x0B to byte) }
+    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = teko::list::push(body, WASM_OP_END) }
 }
 
 /**
@@ -5040,8 +5010,8 @@ fn wasm_synth_panic_str(type_index: u32, fd_write_index: u32) -> WasmFunc {
     let b4 = wasm_op_local_get(b3, 1 to u32)
     let b5 = wasm_op_store32(b4)
     let b6 = wasm_emit_fd_write_call(b5, 2 to u32, fd_write_index)
-    let b7 = teko::list::push(b6, 0x00 to byte)
-    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = teko::list::push(b7, 0x0B to byte) }
+    let b7 = teko::list::push(b6, WASM_OP_UNREACHABLE)
+    WasmFunc { type_index = type_index; local_groups = teko::list::empty(); body = teko::list::push(b7, WASM_OP_END) }
 }
 
 /**
@@ -5309,7 +5279,7 @@ fn wasm_program_memory_plan(lmod: lir::LModule, rodata: WasmRodataLayout) -> Was
         return WasmMemoryPlan { rodata = rodata; globals = teko::list::empty(); mem_min_pages = wasm_mem_pages_for(rodata_top) }
     }
     let sp_init = rodata_top + wasm_stack_region_bytes()
-    let sp_global = WasmGlobal { valtype = wasm_vt_i32(); mutable = true; init = sp_init to i64 }
+    let sp_global = WasmGlobal { valtype = wasm_vtype_wire(WasmVType::I32); mutable = true; init = sp_init to i64 }
     WasmMemoryPlan { rodata = rodata; globals = [sp_global]; mem_min_pages = wasm_mem_pages_for(sp_init) }
 }
 
@@ -5398,7 +5368,7 @@ fn wasm_io_base_index(wasi: WasmWasiImportSet, lmod: lir::LModule) -> u32 {
  * @return WasmExport  the `"memory"` export entry
  */
 fn wasm_memory_export() -> WasmExport {
-    WasmExport { name = "memory"; kind = 0x02 to byte; index = 0 to u32 }
+    WasmExport { name = "memory"; kind = WASM_EXPORT_KIND_MEMORY; index = 0 to u32 }
 }
 
 /**
@@ -5477,7 +5447,8 @@ pub fn wasm_assemble_program(lmod: lir::LModule, ptr64: bool) -> WasmModule | er
         return wasm_scope_stop_wasm64()
     }
     let wasi = wasm_wasi_import_set()
-    let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let rodata0 = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let rodata = match wasm_relocate_rodata(rodata0, lmod.rodata) { WasmRodataLayout as x => x; error as e => return e }
     let io_base_index = wasm_io_base_index(wasi, lmod)
     let program_symtab_base = wasm_register_program_symbols(wasi, lmod.funcs)
     let program_symtab = if has_io { wasm_register_io_symbols(program_symtab_base, io_base_index) } else { program_symtab_base }
@@ -5485,7 +5456,8 @@ pub fn wasm_assemble_program(lmod: lir::LModule, ptr64: bool) -> WasmModule | er
     let types = match wasm_build_program_types(wasi, lmod.funcs, ptr64) { []WasmFuncType as t => t; error as e => return e }
     let funcs = match wasm_build_program_funcs(wasi, lmod.funcs, symtab, ptr64) { []WasmFunc as f => f; error as e => return e }
     let io_type_index = types.len to u32
-    let io_type = WasmFuncType { params = [0x7F to byte, 0x7F to byte]; results = teko::list::empty() }
+    let i32_valtype = wasm_vtype_wire(WasmVType::I32) to byte
+    let io_type = WasmFuncType { params = [i32_valtype, i32_valtype]; results = teko::list::empty() }
     let types_with_io = if has_io { teko::list::push(types, io_type) } else { types }
     let io_panic_funcs: []WasmFunc = if has_io { wasm_synth_io_panic_funcs(io_type_index, wasi.fd_write_index).funcs } else { teko::list::empty() }
     let funcs_with_io = append_wasm_funcs(funcs, io_panic_funcs)
@@ -5503,6 +5475,6 @@ pub fn wasm_assemble_program(lmod: lir::LModule, ptr64: bool) -> WasmModule | er
         data = append_wasm_data_segments(wasm_program_narrow_msg_segments(lmod.funcs, ptr64), wasm_program_data_segments(plan.rodata))
         mem_min_pages = plan.mem_min_pages
         mem_is64 = ptr64
-        exports = [WasmExport { name = "_start"; kind = 0x00 to byte; index = start_index }, wasm_memory_export()]
+        exports = [WasmExport { name = "_start"; kind = WASM_EXPORT_KIND_FUNC; index = start_index }, wasm_memory_export()]
     }
 }

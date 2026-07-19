@@ -143,30 +143,23 @@ fn selctx_x86_scratch(ctx: SelCtxX86, reg_class: MRegClass) -> FreshScratchX86 {
 }
 
 /**
- * rax_x86 — the physical RAX register (GPR id 0), the SysV integer RESULT
+ * RAX_X86 — the physical RAX register (GPR id 0), the SysV integer RESULT
  * register isel pins at a value return / call-result site. Distinct from the
  * first integer ARGUMENT register RDI(7): SysV's result register is not its
  * first argument register, unlike AAPCS64 where both are x0 (decision D-A,
  * §3 of the B1 plan), so the result is pinned to RAX directly here rather than
- * read from `arg_reg(...,0)`.
- *
- * @return MReg  the physical RAX register
+ * read from `arg_reg(...,0)`. A flat-POD `MReg` aggregate const (#594 crumb 9b).
  */
-fn rax_x86() -> MReg {
-    preg(0, MRegClass::GPR)
-}
+const RAX_X86: MReg = preg(0, MRegClass::GPR)
 
 /**
- * rcx_x86 — the physical RCX register (GPR id 1), whose low byte `CL` holds a
+ * RCX_X86 — the physical RCX register (GPR id 1), whose low byte `CL` holds a
  * variable shift count. A shift's count operand is moved into RCX before the
  * `shl`/`shr`/`sar dst, cl` (§4.1 of the B1 plan) so the shift instruction
- * itself names only the shifted destination.
- *
- * @return MReg  the physical RCX register
+ * itself names only the shifted destination. A flat-POD `MReg` aggregate const
+ * (#594 crumb 9b).
  */
-fn rcx_x86() -> MReg {
-    preg(1, MRegClass::GPR)
-}
+const RCX_X86: MReg = preg(1, MRegClass::GPR)
 
 /**
  * select_const_int_x86 — the `LConstInt` selection: one `mov r64, imm` (the
@@ -296,7 +289,7 @@ fn select_shift_x86(ctx0: SelCtxX86, inst: lir::LInst, op: MShiftOpX86, a: u32, 
     let dst = vreg(inst.result, MRegClass::GPR)
     let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
     let ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
-    let ctx3 = selctx_x86_emit(ctx2, mov_x86(rcx_x86(), vreg(b, MRegClass::GPR), wide))
+    let ctx3 = selctx_x86_emit(ctx2, mov_x86(RCX_X86, vreg(b, MRegClass::GPR), wide))
     selctx_x86_emit(ctx3, shift_x86(op, dst, wide))
 }
 
@@ -476,7 +469,7 @@ fn select_un_x86(ctx0: SelCtxX86, inst: lir::LInst, u: lir::LUn) -> SelCtxX86 | 
  * parameter's VReg. The `abi` descriptor is threaded from the emit driver, so
  * the SAME isel code receives arguments in SysV registers on x86-linux and in
  * the Win64 registers on x86_64-windows (the byte-identical SysV path passes
- * `sysv64()`, exactly the descriptor the old hardcode named). A float-class
+ * `SYSV64`, exactly the descriptor the old hardcode named). A float-class
  * parameter needs an XMM move (the `B1-fp` stop), an i128 parameter a
  * register-pair slot (the i128-inherited stop), and a parameter past the ABI's
  * integer-argument register window the stack-arg slot (the `B1-args` stop).
@@ -529,7 +522,7 @@ fn select_ret_x86(ctx0: SelCtxX86, r: lir::LRet) -> SelCtxX86 | error {
     if info.reg_class == MRegClass::FPR {
         return error { message = "isel x86-64: B1-fp — a float return pins XMM0 via an SSE move, the float honest-stop (0.3.1)" }
     }
-    let ctx1 = selctx_x86_emit(ctx0, mov_x86(rax_x86(), vreg(r.value, MRegClass::GPR), info.wide))
+    let ctx1 = selctx_x86_emit(ctx0, mov_x86(RAX_X86, vreg(r.value, MRegClass::GPR), info.wide))
     selctx_x86_emit(ctx1, ret_x86())
 }
 
@@ -953,7 +946,7 @@ fn select_call_result_x86(ctx0: SelCtxX86, inst: lir::LInst, ret_reg: MReg) -> S
  */
 fn select_call_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, c: lir::LCall) -> SelCtxX86 | error {
     let pinned = match pin_args_x86(abi, ctx0, c.args, c.variadic) { PinnedArgsX86 as p => p; error as e => return e }
-    let ret_reg = rax_x86()
+    let ret_reg = RAX_X86
     let ctx1 = selctx_x86_emit(pinned.ctx, call_x86(c.symbol, pinned.uses, ret_reg, inst.has_result, c.variadic))
     select_call_result_x86(ctx1, inst, ret_reg)
 }
@@ -971,7 +964,7 @@ fn select_call_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, c: lir
  */
 fn select_call_indirect_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, ci: lir::LCallIndirect) -> SelCtxX86 | error {
     let pinned = match pin_args_x86(abi, ctx0, ci.args, ci.variadic) { PinnedArgsX86 as p => p; error as e => return e }
-    let ret_reg = rax_x86()
+    let ret_reg = RAX_X86
     let ctx1 = selctx_x86_emit(pinned.ctx, call_ind_x86(vreg(ci.target, MRegClass::GPR), pinned.uses, ret_reg, inst.has_result))
     select_call_result_x86(ctx1, inst, ret_reg)
 }
@@ -1137,8 +1130,8 @@ pub fn select_lfunc_x86(abi: AbiDescriptor, f: lir::LFunc) -> MFuncX86 | error {
  * the target ABI, carrying its rodata/globals/layouts tables through UNCHANGED
  * (isel never touches their bytes — the encoder/ELF/COFF writer does). The
  * `abi` descriptor is threaded from the emit driver: `emit_native_x86` passes
- * `sysv64()` (the byte-identical x86-linux path) and `emit_native_win` passes
- * `win64()` (call/return arguments land in RCX/RDX/R8/R9).
+ * `SYSV64` (the byte-identical x86-linux path) and `emit_native_win` passes
+ * `WIN64` (call/return arguments land in RCX/RDX/R8/R9).
  *
  * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
  * @param lir::LModule m  the module to select
