@@ -1,11 +1,14 @@
 # AL Wave — Emit Throughput + Mutability/Borrow/Array Model (proof-first)
 
-Status: **PROPOSTA (design-ahead, NÃO ratificado).** Architect draft, 2026-07-19.
-A onda CRESCEU de "throughput do emit" para "throughput + modelo de
+Status: **RATIFICADO (owner, 2026-07-19).** A estrutura em três sub-ondas e o
+decision-set abaixo são owner-ruled e convergidos; este doc é a base de implementação
+da onda. A onda CRESCEU de "throughput do emit" para "throughput + modelo de
 mutabilidade/borrow/array". Reconciliada em três sub-ondas: **FUNDAÇÃO** (modelo de
-linguagem) → **THROUGHPUT** (consome a fundação) → **MIGRAÇÃO** (fonte). O owner ainda
-revisa provas, blast radius e a ponte de coexistência antes de qualquer implementação.
-No product code aqui; no version bump.
+linguagem) → **THROUGHPUT** (consome a fundação) → **MIGRAÇÃO** (fonte). Execução é
+proof-first: **AL1 (prova) roda ANTES de qualquer código de produto** e fecha os números
+(blast radius de runtime + censo das constantes disfarçadas). No product code neste doc;
+os crumbs bumpam sob seus próprios gates. Ordem: AL1 → AL0 (paralelo) → F1→F2→F3 →
+AL2→AL3→AL4→AL5 → AL6.
 
 Decision-set (owner rulings, 2026-07-19): CURA=`push(&x,v)` ref-push · `&x`=borrow mutável
 SEGURO (não unsafe) · exclusivo-XOR-shared · mutabilidade INFERIDA (sem `&mut`) · `let`=
