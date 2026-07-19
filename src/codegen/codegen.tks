@@ -5264,8 +5264,33 @@ fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
         // env = NULL and the lifted fn is `R(params)` (W10a-compatible call cast). A CAPTURING lambda
         // allocates its env struct and uses the env-first ABI (handled below).
         checker::TLambda as lam => emit_lambda(buf, prog, e, lam, escaping, regions, fn_body, dctx)
-        checker::TBorrow => error { message = "codegen: `&x` safe borrow lowering pending (AL wave F1.4)" }
+        checker::TBorrow as b => emit_borrow(buf, prog, ret_type, b, escaping, regions, fn_body, dctx)
     }
+}
+
+/**
+ * Lower a safe borrow `&x` (`TBorrow`, AL wave F1.4) to its C address-of form: emit `&` then the
+ * operand expression. This is byte-identical to the auto-ref `&` the call path already emits for a
+ * `Ref<T>` parameter (see `emit_call`) — a borrow just makes that address-of explicit as a
+ * first-class expression. The `Reference` type already lowers to `<T> *`, so a ref-bind local
+ * `mut y = &x` is a pointer initialized with `&x`, and any `y.value` read / write-through lowers
+ * through the existing RefDeref path. Zero new representation.
+ *
+ * @param buf      the code buffer being appended to
+ * @param prog     the typed program (namespaces + resolved function table)
+ * @param ret_type the enclosing function's return type, threaded to the operand emitter
+ * @param b        the typed borrow node (`&operand`)
+ * @param escaping the names escaping the current scope (region threading)
+ * @param regions  the live region frames
+ * @param fn_body  the enclosing function body statements
+ * @param dctx     the defer context
+ * @return         the buffer with `&<operand>` appended
+ * @throws         error propagated from emitting the borrow's operand expression
+ * @since 0.x (#AL/F1.4)
+ */
+fn emit_borrow(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b: checker::TBorrow, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let out = cb(buf, "&")
+    emit_expr_ctx(out, prog, ret_type, b.operand, escaping, regions, fn_body, dctx)
 }
 
 // (W10) the lifted C function name for a lambda with the given stamp id: `__tkclo_<id>`.
