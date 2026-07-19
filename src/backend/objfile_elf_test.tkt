@@ -45,7 +45,7 @@ fn el_no_frame() -> []lir::LAlloca {
 }
 
 /**
- * el_object_of — encode `m` under `sysv64()` and assemble its ELF object, or an
+ * el_object_of — encode `m` under `SYSV64` and assemble its ELF object, or an
  * empty buffer on an unexpected honest-stop (so a golden length/byte assertion
  * fails loudly rather than aborting the run).
  *
@@ -53,7 +53,7 @@ fn el_no_frame() -> []lir::LAlloca {
  * @return []byte  the ELF object bytes, or empty on error
  */
 fn el_object_of(m: MModuleX86) -> []byte {
-    match encode_module_x86(sysv64(), m) {
+    match encode_module_x86(SYSV64, m) {
         EncodedModuleX86 as x => emit_elf(x)
         error as e => teko::list::empty()
     }
@@ -206,7 +206,7 @@ fn el_rodata_module() -> MModuleX86 {
     let insts = [lea_rip_x86(el_p(0), "s0", RelocKindX86::Pc32), ret_x86()]
     let f = el_1block_func("main", insts, el_no_frame())
     let rbytes = [0x41 to byte, 0 to byte]
-    let rodata = [lir::LRodata { symbol = "s0"; bytes = rbytes }]
+    let rodata = [lir::LRodata { symbol = "s0"; bytes = rbytes; relocs = teko::list::empty() }]
     MModuleX86 { funcs = [f]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
 }
 
@@ -248,7 +248,7 @@ fn el_rodata_off_module() -> EncodedModuleX86 {
     let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte]
     let s1 = Symbol { name = "s1"; defined = true; sect = 2 to u8; offset = 8 to u32; local = true }
     let main = Symbol { name = "main"; defined = true; sect = 1 to u8; offset = 0 to u32; local = false }
-    let reloc = RelocX86 { offset = 3 to u32; sym = "s1"; kind = RelocKindX86::Pc32; addend = (0 to i64) - (4 to i64) }
+    let reloc = RelocX86 { offset = 3 to u32; sym = "s1"; kind = RelocKindX86::Pc32; addend = (0 to i64) - (4 to i64); sect = RelocSect::Text }
     EncodedModuleX86 { text = text; rodata = rodata; symbols = [s1, main]; relocs = [reloc] }
 }
 
@@ -285,7 +285,7 @@ fn el_abs64_module() -> EncodedModuleX86 {
     let text = [0x48 to byte, 0xB8 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0xC3 to byte]
     let main = Symbol { name = "main"; defined = true; sect = 1 to u8; offset = 0 to u32; local = false }
     let gv = Symbol { name = "gv"; defined = false; sect = 0 to u8; offset = 0 to u32; local = false }
-    let reloc = RelocX86 { offset = 2 to u32; sym = "gv"; kind = RelocKindX86::Abs64; addend = 0 to i64 }
+    let reloc = RelocX86 { offset = 2 to u32; sym = "gv"; kind = RelocKindX86::Abs64; addend = 0 to i64; sect = RelocSect::Text }
     EncodedModuleX86 { text = text; rodata = teko::list::empty(); symbols = [main, gv]; relocs = [reloc] }
 }
 
@@ -365,4 +365,79 @@ fn elf_empty_module_still_valid() {
     teko::assert::is_true(el_u16_at(obj, 60 to u64) == (7 to u32))
     teko::assert::is_true(el_u16_at(obj, 16 to u64) == (1 to u32))
     teko::assert::is_true(el_u32_at(obj, 40 to u64) == (obj.len to u32) - (448 to u32))
+}
+
+/**
+ * T-B2 fixture: um objeto rodata-only com UM ponteiro data→data — slot de 8 bytes
+ * em `.rodata[0]` apontando para o datum em `.rodata[8]` — exercita o caminho
+ * `has_rr=true` do writer à mão (nenhum produtor real existe até a cadeia T-B abrir).
+ */
+fn eo_rodata_ptr_object() -> ElfObject {
+    let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
+    let ptr = Symbol { name = "ptr"; defined = true; sect = 2 to u8; offset = 0 to u32; local = true }
+    let target = Symbol { name = "target"; defined = true; sect = 2 to u8; offset = 8 to u32; local = true }
+    let rr = ElfRelocReq { offset = 0 to u32; sym = "target"; rtype = 1 to u32; addend = 0 to i64 }
+    ElfObject { e_machine = EM_X86_64; e_flags = 0 to u32; text = teko::list::empty(); rodata = rodata; symbols = [ptr, target]; relocs = teko::list::empty(); rodata_relocs = [rr] }
+}
+
+/**
+ * T-B2: com um rodata-reloc presente, o objeto ganha a 8ª seção `.rela.rodata` —
+ * `e_shnum=8`, a linha Elf64_Rela (r_offset=0, rtype=R_X86_64_64, symidx=1 do
+ * símbolo de seção `.rodata`, addend=8 com o offset do alvo dobrado) e o 8º header
+ * (RELA, INFO_LINK, sh_link=3 `.symtab`, sh_info=2 `.rodata`, entsize 24). Os
+ * offsets são o layout derivado; `e_shstrndx` permanece 5.
+ */
+#test
+fn tb2_rela_rodata_emitted() {
+    let obj = emit_elf_object(eo_rodata_ptr_object())
+    teko::assert::is_true(obj.len == 736)
+    teko::assert::is_true(el_u16_at(obj, 60) == 8)
+    teko::assert::is_true(el_u16_at(obj, 62) == 5)
+    teko::assert::is_true(el_u32_at(obj, 40) == 224)
+    teko::assert::is_true(el_u32_at(obj, 200) == 0)
+    teko::assert::is_true(el_u32_at(obj, 208) == 1)
+    teko::assert::is_true(el_u32_at(obj, 212) == 1)
+    teko::assert::is_true(el_u32_at(obj, 216) == 8)
+    teko::assert::is_true(el_u32_at(obj, 672) == 52)
+    teko::assert::is_true(el_u32_at(obj, 676) == 4)
+    teko::assert::is_true(el_u32_at(obj, 680) == 0x40)
+    teko::assert::is_true(el_u32_at(obj, 696) == 200)
+    teko::assert::is_true(el_u32_at(obj, 704) == 24)
+    teko::assert::is_true(el_u32_at(obj, 712) == 3)
+    teko::assert::is_true(el_u32_at(obj, 716) == 2)
+    teko::assert::is_true(el_u32_at(obj, 728) == 24)
+}
+
+/**
+ * T-B2: o MESMO objeto sem rodata-relocs colapsa ao formato histórico — 7 seções,
+ * `e_shnum=7`, `e_shstrndx=5`, SHT de 7×64 bytes fechando o arquivo (nenhum 8º
+ * header) — a prova dedicada de byte-identidade do braço `has_rr=false`.
+ */
+#test
+fn tb2_no_rodata_relocs_is_seven_sections() {
+    let base = eo_rodata_ptr_object()
+    let obj7 = emit_elf_object(ElfObject { e_machine = base.e_machine; e_flags = base.e_flags; text = base.text; rodata = base.rodata; symbols = base.symbols; relocs = base.relocs; rodata_relocs = teko::list::empty() })
+    teko::assert::is_true(el_u16_at(obj7, 60) == 7)
+    teko::assert::is_true(el_u16_at(obj7, 62) == 5)
+    let shoff = el_u32_at(obj7, 40)
+    teko::assert::is_true(obj7.len == ((shoff + (7 to u32) * (64 to u32)) to u64))
+}
+
+/**
+ * T-B2 (§4.4): `elf_section_names` condicional — 7 nomes sem rodata-reloc, 8 com,
+ * e a 8ª é `.rela.rodata`; `elf_resolve_rela` no braço não-rodata mantém symidx e
+ * addend do request (miss do rodata-hit).
+ */
+#test
+fn tb2_section_names_and_resolve_rela_arms() {
+    teko::assert::is_true(elf_section_names(false).len == 7)
+    teko::assert::is_true(elf_section_names(true).len == 8)
+    teko::assert::is_true(elf_section_names(true)[7] == ".rela.rodata")
+    let fnsym = Symbol { name = "main"; defined = true; sect = 1 to u8; offset = 0 to u32; local = false }
+    let syms = elf_build_symbols(teko::list::push(teko::list::empty(), fnsym))
+    let req = ElfRelocReq { offset = 4 to u32; sym = "main"; rtype = 2 to u32; addend = 7 to i64; }
+    let row = elf_resolve_rela(req, teko::list::push(teko::list::empty(), fnsym), syms, 0 to u32)
+    teko::assert::is_true(row.symidx == elf_symbol_index(syms, "main"))
+    teko::assert::is_true(row.addend == (7 to i64))
+    teko::assert::is_true(row.rtype == (2 to u32))
 }

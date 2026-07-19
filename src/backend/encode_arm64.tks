@@ -2078,6 +2078,13 @@ pub type Reloc = struct {
      * BRANCH26).
      */
     kind: MRelocKind
+    /**
+     * sect — which section this relocation's patched field lives in (#594 T-B1):
+     * `Text` (the historical default — `offset` is `__text`-base-relative), or
+     * `Rodata` (a data→data pointer whose `offset` is rodata-base-relative,
+     * emitted only from T-B2 on). Every reloc the encoder builds today is `Text`.
+     */
+    sect: RelocSect
 }
 
 /**
@@ -2337,7 +2344,7 @@ fn finalize_func(symbol: str, words: []EncWord, offsets: []BlockOffset) -> Encod
         let w = match resolve_word(ew, i to u32, offsets) { u32 as v => v; error as e => return e }
         out_words = teko::list::push(out_words, w)
         if ew.has_reloc {
-            relocs = teko::list::push(relocs, Reloc { offset = (i to u32) * ARM64_WORD_BYTES; sym = ew.reloc_sym; kind = ew.reloc_kind })
+            relocs = teko::list::push(relocs, Reloc { offset = (i to u32) * ARM64_WORD_BYTES; sym = ew.reloc_sym; kind = ew.reloc_kind; sect = RelocSect::Text })
         }
         i++
     }
@@ -2501,7 +2508,7 @@ fn rebase_relocs(acc: []Reloc, relocs: []Reloc, base: u32) -> []Reloc {
     loop {
         if i >= relocs.len { break }
         let r = relocs[i]
-        out = teko::list::push(out, Reloc { offset = r.offset + base; sym = r.sym; kind = r.kind })
+        out = teko::list::push(out, Reloc { offset = r.offset + base; sym = r.sym; kind = r.kind; sect = r.sect })
         i++
     }
     out
@@ -2604,6 +2611,16 @@ type ModuleRodata = struct {
      * syms — one defined `__const` symbol per rodata entry (section 2).
      */
     syms: []Symbol
+    /**
+     * relocs — the rodata-INTERNAL pointer relocations of every entry, REBASED to the
+     * concatenated `__const` image (each `LDataReloc.offset` becomes blob-base +
+     * field-offset; #594 T-B5). A NEUTRAL carrier (LIR-level, shared by the three
+     * encoders — this struct is namespace-shared): each `encode_module*` converts an
+     * entry to its own ISA reloc type with kind `Abs64` and `sect = Rodata`. EMPTY in
+     * every real compile until T-B6 (`serialize_const` honest-stops pointer-bearing
+     * aggregates), keeping every emitted object byte-identical.
+     */
+    relocs: []lir::LDataReloc
 }
 
 /**
@@ -2638,17 +2655,24 @@ fn append_bytes(buf: []byte, src: []byte) -> []byte {
 fn encode_rodata(rodata: []lir::LRodata) -> ModuleRodata {
     mut bytes: []byte = teko::list::empty()
     mut syms: []Symbol = teko::list::empty()
+    mut relocs: []lir::LDataReloc = teko::list::empty()
     mut off: u32 = 0
     mut i: u64 = 0
     loop {
         if i >= rodata.len { break }
         let rd = rodata[i]
         syms = teko::list::push(syms, Symbol { name = rd.symbol; defined = true; sect = 2 to u8; offset = off; local = true })
+        mut j: u64 = 0
+        loop {
+            if j >= rd.relocs.len { break }
+            relocs = teko::list::push(relocs, lir::data_reloc(off + rd.relocs[j].offset, rd.relocs[j].target))
+            j++
+        }
         bytes = append_bytes(bytes, rd.bytes)
         off = off + (rd.bytes.len to u32)
         i++
     }
-    ModuleRodata { bytes = bytes; syms = syms }
+    ModuleRodata { bytes = bytes; syms = syms; relocs = relocs }
 }
 
 /**
@@ -2714,6 +2738,48 @@ fn concat_symbols(a: []Symbol, b: []Symbol) -> []Symbol {
 }
 
 /**
+ * rodata_relocs_arm64 — convert the NEUTRAL rebased `ModuleRodata.relocs` into arm64
+ * `Reloc` rows (#594 T-B5): each rodata-internal pointer becomes an `Abs64`
+ * (ARM64_RELOC_UNSIGNED, r_length 3) relocation whose patch site is
+ * `__const`-relative (`sect = Rodata`), targeting the datum's own local symbol.
+ * Empty in every real compile until T-B6.
+ *
+ * @param []lir::LDataReloc rs  the rebased neutral rodata relocations
+ * @return []Reloc  the `Rodata`-tagged arm64 relocation rows
+ */
+fn rodata_relocs_arm64(rs: []lir::LDataReloc) -> []Reloc {
+    mut out: []Reloc = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= rs.len { break }
+        out = teko::list::push(out, Reloc { offset = rs[i].offset; sym = rs[i].target; kind = MRelocKind::Abs64; sect = RelocSect::Rodata })
+        i++
+    }
+    out
+}
+
+/**
+ * append_relocs_arm64 — concatenate two relocation lists (text-partition first, then the
+ * rodata-internal rows; #594 T-B5), preserving each list's emission order. The
+ * module keeps ONE `.sect`-tagged list (the T-B1..T-B3 model); the writers
+ * partition by `RelocSect`.
+ *
+ * @param a  the `__text`/`.text` relocations, in emission order
+ * @param b  the rodata-internal relocations, in emission order
+ * @return   `a` followed by `b`
+ */
+fn append_relocs_arm64(a: []Reloc, b: []Reloc) -> []Reloc {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
  * encode_module — encode every `MFunc` of `m`, concatenate their `__text` words
  * into the module image and REBASE each function's reloc offsets by its `__text`
  * base, intern the rodata bytes into `__const`, and build the symbol table in
@@ -2736,5 +2802,5 @@ pub fn encode_module(abi: AbiDescriptor, m: MModule) -> EncodedModule | error {
     let defined = concat_symbols(rod.syms, mt.syms)
     let undef = collect_undefined(defined, mt.relocs)
     let symbols = concat_symbols(defined, undef)
-    EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+    EncodedModule { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = append_relocs_arm64(mt.relocs, rodata_relocs_arm64(rod.relocs)) }
 }

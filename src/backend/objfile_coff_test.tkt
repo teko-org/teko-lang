@@ -52,7 +52,7 @@ fn co_sym(name: str, defined: bool, local: bool, sect: u8, offset: u32) -> Symbo
  * @return RelocX86  the built relocation
  */
 fn co_reloc(offset: u32, sym: str, kind: RelocKindX86, addend: i64) -> RelocX86 {
-    RelocX86 { offset = offset; sym = sym; kind = kind; addend = addend }
+    RelocX86 { offset = offset; sym = sym; kind = kind; addend = addend; sect = RelocSect::Text }
 }
 
 /**
@@ -438,7 +438,7 @@ fn coff_secsym_index_sentinel() {
 #test
 /**
  * coff_win64_pipeline_structure — the FULL Win64 pipeline (select → regalloc under
- * `win64()` → encode → `emit_coff`) of a `main` calling `tk_exit(42)` yields a
+ * `WIN64` → encode → `emit_coff`) of a `main` calling `tk_exit(42)` yields a
  * well-formed COFF object: `Machine = 0x8664`, one section (no rodata), two symbols
  * (`main` + `tk_exit`), and one `REL32`(0x0004) relocation against `SymbolTableIndex
  * = 1` (`tk_exit`). Proves `emit_coff` consumes a real `EncodedModuleX86` from the
@@ -460,7 +460,7 @@ fn coff_win64_pipeline_structure() {
 /**
  * co_win64_object — run the real B3 pipeline on a `main` whose single block is one
  * `call tk_exit` (no return, the `exit`-shape) and assemble its COFF object: encode
- * the physical-register module under `win64()` (the shadow-space frame from B3-2)
+ * the physical-register module under `WIN64` (the shadow-space frame from B3-2)
  * and `emit_coff` the result, or an empty buffer on an unexpected honest-stop (so a
  * golden assertion fails loudly). Feeds physical registers straight to the encoder
  * — the B1/ELF `el_object_of` precedent, post-regalloc.
@@ -472,8 +472,80 @@ fn co_win64_object() -> []byte {
     let blk = MBlockX86 { id = 0 to u32; params = teko::list::empty(); insts = [call] }
     let f = MFuncX86 { symbol = "main"; blocks = [blk]; frame = teko::list::empty() }
     let m = MModuleX86 { funcs = [f]; rodata = teko::list::empty(); globals = teko::list::empty(); layouts = teko::list::empty() }
-    match encode_module_x86(win64(), m) {
+    match encode_module_x86(WIN64, m) {
         EncodedModuleX86 as x => emit_coff(x)
         error as e => teko::list::empty()
     }
+}
+
+/**
+ * co_rodata_ptr_module — a hand-built `EncodedModuleX86`: a 1-byte `ret` `.text`, a
+ * 16-byte `.rdata` (an 8-byte pointer slot at offset 0, the target datum `0x41` at
+ * offset 8), two section-2 rodata locals collapsing into the `.rdata` STATIC section
+ * symbol, and one `Abs64`/`Rodata` relocation at `.rdata` offset 0 targeting the
+ * `target` datum. Feeds `emit_coff` directly, pinning the `.rdata` relocation +
+ * 8-byte in-place fold the T-B3 writer emits.
+ *
+ * @return EncodedModuleX86  the hand-built rodata-internal-pointer module
+ */
+fn co_rodata_ptr_module() -> EncodedModuleX86 {
+    let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
+    let ptr = co_sym("ptr", true, true, 2 to u8, 0 to u32)
+    let target = co_sym("target", true, true, 2 to u8, 8 to u32)
+    let main = co_sym("main", true, false, 1 to u8, 0 to u32)
+    let rr = RelocX86 { offset = 0 to u32; sym = "target"; kind = RelocKindX86::Abs64; addend = 0 to i64; sect = RelocSect::Rodata }
+    EncodedModuleX86 { text = [0xC3 to byte]; rodata = rodata; symbols = [ptr, target, main]; relocs = [rr] }
+}
+
+/**
+ * T-B3: com um data→data reloc presente, o header `.rdata` aponta a sua própria
+ * relocation table (ADDR64 contra o símbolo de seção `.rdata`) e o offset do
+ * datum-alvo é dobrado in-place no word baixo do slot de 8 bytes.
+ */
+#test
+fn tb3_coff_rdata_reloc_emitted() {
+    let obj = emit_coff(co_rodata_ptr_module())
+    teko::assert::is_true(obj.len == 167)
+    teko::assert::is_true(co_u16_at(obj, 2) == 2)
+    teko::assert::is_true(co_u32_at(obj, 12) == 2)
+    teko::assert::is_true(co_u32_at(obj, 44) == 0)
+    teko::assert::is_true(co_u16_at(obj, 52) == 0)
+    teko::assert::is_true(co_u32_at(obj, 84) == 117)
+    teko::assert::is_true(co_u16_at(obj, 92) == 1)
+    teko::assert::is_true(co_u32_at(obj, 117) == 0)
+    teko::assert::is_true(co_u32_at(obj, 121) == 0)
+    teko::assert::is_true(co_u16_at(obj, 125) == 0x0001)
+    teko::assert::is_true(co_u32_at(obj, 101) == 8)
+    teko::assert::is_true(co_u32_at(obj, 105) == 0)
+    teko::assert::is_true(obj[109] == (0x41 to byte))
+}
+
+/**
+ * T-B3: o MESMO módulo sem relocs colapsa — `.rdata` com pointer/nreloc = 0, sem
+ * segunda tabela e sem fold (byte-identidade do braço vazio).
+ */
+#test
+fn tb3_coff_no_relocs_collapses() {
+    let base = co_rodata_ptr_module()
+    let obj = emit_coff(EncodedModuleX86 { text = base.text; rodata = base.rodata; symbols = base.symbols; relocs = teko::list::empty() })
+    teko::assert::is_true(obj.len == 157)
+    teko::assert::is_true(co_u32_at(obj, 84) == 0)
+    teko::assert::is_true(co_u16_at(obj, 92) == 0)
+}
+
+/**
+ * T-B3 (§4.5): a partição COFF separa por RelocSect e o fold in-place grava o word
+ * baixo do slot (8) deixando o alto em 0; sobre relocs vazia o .rdata volta intacto.
+ */
+#test
+fn tb3_coff_partition_and_fold_arms() {
+    let m = co_rodata_ptr_module()
+    let parts = coff_partition_relocs(m.relocs)
+    teko::assert::is_true(parts.text.len == 0)
+    teko::assert::is_true(parts.rdata.len == 1)
+    let folded = coff_apply_data_reloc_addends(m.rodata, m.symbols, parts.rdata)
+    teko::assert::is_true(folded[0] == (8 to byte))
+    teko::assert::is_true(folded[4] == (0 to byte))
+    let untouched = coff_apply_data_reloc_addends(m.rodata, m.symbols, teko::list::empty())
+    teko::assert::is_true(untouched[0] == (0 to byte))
 }

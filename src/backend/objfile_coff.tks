@@ -420,6 +420,76 @@ type CoffReloc = struct {
  * @param []RelocX86 relocs  the module-rebased relocations, in emission order
  * @return []CoffReloc  the resolved relocation rows, in emission order
  */
+/**
+ * CoffRelocParts — a `EncodedModuleX86`'s relocations split by patch-site section
+ * (#594 T-B3): `text` (`.text`-relative fixups) and `rdata` (`.rdata`-relative
+ * data→data pointers). The canonical seam, mirroring `MachoRelocParts` and ELF's
+ * bridge partition; `rdata` is EMPTY in every real compile.
+ *
+ * @since #594 T-B3
+ */
+type CoffRelocParts = struct {
+    /** text — the relocations whose patch site is in `.text` (`r.sect == Text`). */
+    text: []RelocX86
+    /** rdata — the relocations whose patch site is in `.rdata` (`r.sect == Rodata`). */
+    rdata: []RelocX86
+}
+
+/**
+ * coff_partition_relocs — split `relocs` into its `.text` and `.rdata` partitions by
+ * each reloc's `RelocSect` tag (#594 T-B3), preserving emission order within each.
+ * Today every reloc is `Text`, so `rdata` is empty and `.rdata` carries no
+ * relocation.
+ *
+ * @param []RelocX86 relocs  the module's relocations, `.sect`-tagged, in order
+ * @return CoffRelocParts  the `text` and `rdata` partitions
+ */
+fn coff_partition_relocs(relocs: []RelocX86) -> CoffRelocParts {
+    mut text: []RelocX86 = teko::list::empty()
+    mut rdata: []RelocX86 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let r = relocs[i]
+        match r.sect {
+            Text => { text = teko::list::push(text, r) }
+            Rodata => { rdata = teko::list::push(rdata, r) }
+        }
+        i++
+    }
+    CoffRelocParts { text = text; rdata = rdata }
+}
+
+/**
+ * coff_apply_data_reloc_addends — fold every rodata-INTERNAL relocation's target
+ * offset in-place into its 8-byte pointer slot inside `.rdata` (#594 T-B3; the COFF
+ * data→data analog of `coff_apply_rodata_addends`, which folds into `.text`). For
+ * each `RelocX86` whose target is a defined section-2 local, write that datum's
+ * `.rdata` byte offset as a little-endian `u32` at the reloc's `.rdata` offset (the
+ * low word; the high word stays 0 — a rodata offset never exceeds 32 bits, and the
+ * slot is zero-initialized). The relocation itself (built by `coff_build_relocs`)
+ * points at the `.rdata` STATIC section symbol, so the linker computes
+ * `section_base(.rdata) + in_place` = the target datum's absolute address. Returns
+ * `rodata` unchanged when no relocation is a rodata hit (the byte-identity path).
+ *
+ * @param []byte rodata  the `.rdata` section image (pointer slots zero-initialized)
+ * @param []Symbol symbols  the module's neutral symbol list (for rodata resolution)
+ * @param []RelocX86 relocs  the `.rdata` partition, in emission order
+ * @return []byte  `rodata` with each data reloc's target offset folded in-place
+ */
+fn coff_apply_data_reloc_addends(rodata: []byte, symbols: []Symbol, relocs: []RelocX86) -> []byte {
+    mut buf = rodata
+    mut i: u64 = 0
+    loop {
+        if i >= relocs.len { break }
+        let r = relocs[i]
+        let hit = coff_rodata_hit(symbols, r.sym)
+        if hit.found { buf = write_u32_le_at(buf, r.offset, hit.offset) }
+        i++
+    }
+    buf
+}
+
 fn coff_build_relocs(symbols: []Symbol, coffsyms: []CoffSymbol, relocs: []RelocX86) -> []CoffReloc {
     let secidx = coff_rodata_secsym_index(coffsyms)
     mut out: []CoffReloc = teko::list::empty()
@@ -489,6 +559,10 @@ type CoffLayout = struct {
     reloc_offset: u32
     /** num_relocs — the number of `.text` relocations. */
     num_relocs: u32
+    /** rdata_reloc_offset — the file offset of the `.rdata` relocation array (contiguous, after the `.text` array; #594 T-B3). */
+    rdata_reloc_offset: u32
+    /** num_rdata_relocs — the number of `.rdata` relocations (a data→data pointer each); 0 in every real compile, keeping the object byte-identical (#594 T-B3). */
+    num_rdata_relocs: u32
     /** symtab_offset — the file offset of the `IMAGE_SYMBOL` table (`PointerToSymbolTable`). */
     symtab_offset: u32
     /** num_symbols — the symbol-record count (`NumberOfSymbols`; 0 aux records in the MVP). */
@@ -509,14 +583,16 @@ type CoffLayout = struct {
  * @param u32 num_relocs  the pre-built `.text` relocation count
  * @return CoffLayout  the resolved offsets, sizes, and counts
  */
-fn compute_coff_layout(enc: EncodedModuleX86, num_symbols: u32, num_relocs: u32) -> CoffLayout {
+fn compute_coff_layout(enc: EncodedModuleX86, num_symbols: u32, num_text_relocs: u32, num_rdata_relocs: u32) -> CoffLayout {
     let num_sections = if enc.rodata.len > (0 to u64) { 2 to u32 } else { 1 to u32 }
     let text_size = enc.text.len to u32
     let text_offset = (20 to u32) + (num_sections * (40 to u32))
     let rdata_size = enc.rodata.len to u32
     let rdata_offset = text_offset + text_size
     let reloc_offset = rdata_offset + rdata_size
-    let symtab_offset = reloc_offset + (num_relocs * (10 to u32))
+    let text_reloc_end = reloc_offset + (num_text_relocs * (10 to u32))
+    let rdata_reloc_offset = text_reloc_end
+    let symtab_offset = rdata_reloc_offset + (num_rdata_relocs * (10 to u32))
     CoffLayout {
         num_sections = num_sections
         text_size = text_size
@@ -524,7 +600,9 @@ fn compute_coff_layout(enc: EncodedModuleX86, num_symbols: u32, num_relocs: u32)
         rdata_size = rdata_size
         rdata_offset = rdata_offset
         reloc_offset = reloc_offset
-        num_relocs = num_relocs
+        num_relocs = num_text_relocs
+        rdata_reloc_offset = rdata_reloc_offset
+        num_rdata_relocs = num_rdata_relocs
         symtab_offset = symtab_offset
         num_symbols = num_symbols
     }
@@ -594,7 +672,8 @@ fn emit_coff_sections(buf: []byte, lay: CoffLayout) -> []byte {
     let text_reloc_ptr = if lay.num_relocs > (0 to u32) { lay.reloc_offset } else { 0 to u32 }
     mut b = emit_coff_section(buf, ".text", lay.text_size, lay.text_offset, text_reloc_ptr, lay.num_relocs, COFF_TEXT_CHARACTERISTICS)
     if lay.num_sections > (1 to u32) {
-        b = emit_coff_section(b, ".rdata", lay.rdata_size, lay.rdata_offset, 0 to u32, 0 to u32, COFF_RDATA_CHARACTERISTICS)
+        let rdata_reloc_ptr = if lay.num_rdata_relocs > (0 to u32) { lay.rdata_reloc_offset } else { 0 to u32 }
+        b = emit_coff_section(b, ".rdata", lay.rdata_size, lay.rdata_offset, rdata_reloc_ptr, lay.num_rdata_relocs, COFF_RDATA_CHARACTERISTICS)
     }
     b
 }
@@ -706,17 +785,21 @@ fn emit_coff_relocs(buf: []byte, relocs: []CoffReloc) -> []byte {
  * @return []byte  the PE/COFF object file bytes
  */
 pub fn emit_coff(enc: EncodedModuleX86) -> []byte {
+    let parts = coff_partition_relocs(enc.relocs)
     let coffsyms = coff_build_symbols(enc.symbols)
     let strtab = build_coff_strtab(coffsyms)
-    let relocs = coff_build_relocs(enc.symbols, coffsyms, enc.relocs)
-    let patched_text = coff_apply_rodata_addends(enc.text, enc.symbols, enc.relocs)
-    let lay = compute_coff_layout(enc, coffsyms.len to u32, relocs.len to u32)
+    let text_relocs = coff_build_relocs(enc.symbols, coffsyms, parts.text)
+    let rdata_relocs = coff_build_relocs(enc.symbols, coffsyms, parts.rdata)
+    let patched_text = coff_apply_rodata_addends(enc.text, enc.symbols, parts.text)
+    let patched_rodata = coff_apply_data_reloc_addends(enc.rodata, enc.symbols, parts.rdata)
+    let lay = compute_coff_layout(enc, coffsyms.len to u32, text_relocs.len to u32, rdata_relocs.len to u32)
     mut b: []byte = teko::list::empty()
     b = emit_coff_header(b, lay)
     b = emit_coff_sections(b, lay)
     b = append_bytes(b, patched_text)
-    b = append_bytes(b, enc.rodata)
-    b = emit_coff_relocs(b, relocs)
+    b = append_bytes(b, patched_rodata)
+    b = emit_coff_relocs(b, text_relocs)
+    b = emit_coff_relocs(b, rdata_relocs)
     b = emit_coff_symtab(b, coffsyms, strtab)
     append_bytes(b, strtab.bytes)
 }
