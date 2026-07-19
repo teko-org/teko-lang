@@ -93,6 +93,7 @@ fn lam_collect_expr(e: parser::Expr, refs: Ref<[]str>, bound: Ref<[]str>) -> voi
         parser::SafeFieldAccess as sfa => lam_collect_expr(sfa.receiver, refs, bound)
         parser::Coalesce as co => { lam_collect_expr(co.left, refs, bound); lam_collect_expr(co.right, refs, bound) }
         parser::Cast as ct => lam_collect_expr(ct.expr, refs, bound)
+        parser::Borrow as b => lam_collect_expr(b.operand, refs, bound)   // &x — free reads transit through the borrowed operand (AL wave F1)
         parser::MethodCall as mc => { lam_collect_expr(mc.receiver, refs, bound); mut i = 0; loop { if i >= mc.args.len { break }; lam_collect_expr(mc.args[i], refs, bound); i++ } }
         parser::SafeMethodCall as smc => { lam_collect_expr(smc.receiver, refs, bound); mut i = 0; loop { if i >= smc.args.len { break }; lam_collect_expr(smc.args[i], refs, bound); i++ } }   // (NP-OOP, issue #116)
         parser::StructLit as sl => { mut i = 0; loop { if i >= sl.field_vals.len { break }; lam_collect_expr(sl.field_vals[i], refs, bound); i++ } }
@@ -2523,6 +2524,23 @@ fn type_path_expr(pe: parser::PathExpr, table: TypeTable, env: Env) -> TExpr | e
     }
 }
 
+/**
+ * type_borrow_expr — type the prefix `&x` safe-borrow expression (AL wave F1). STUB (F1.1):
+ * the `Borrow` node is parsed and threaded through the front-end, but real typing to
+ * `Reference<T>` (mutability inferred from the operand binding + the consuming position, and
+ * the `&(let)`-in-mutable-position rejection that auto-enforces F2) lands in F1.2. Until then
+ * a `&x` in source is a located error — but the corpus uses none, so this never fires and the
+ * front-end stays byte-identical (additive).
+ *
+ * @param b      the parsed borrow node
+ * @param env    the type environment
+ * @param table  the type table
+ * @return       the typed borrow (F1.2), or the not-yet-supported error (F1.1)
+ */
+fn type_borrow_expr(b: parser::Borrow, env: Env, table: TypeTable) -> TExpr | error {
+    error { message = "`&x` safe borrow is parsed but not yet type-checked (AL wave F1.2)" }
+}
+
 // (C1-POS) inner dispatch — the raw match over the untyped Expr's `kind`. The public type_expr
 // (below) wraps this to copy each node's source position onto the typed node. The dispatch's
 // TExpr constructions are built with line=0/col=0 (designated-init parity with the C twin); the
@@ -2564,6 +2582,7 @@ fn type_dispatch(e: parser::Expr, env: Env, table: TypeTable) -> TExpr | error {
         parser::InExpr as n => type_in(n, env, table)   // <expr> in [ … ] (Phase 2)
         parser::ArrayLit as a => type_array_lit(a, env, table)   // [ e0, e1, … ] (Increment B+)
         parser::Lambda as lam => type_lambda(lam, Void { }, env, table)   // (W10) no target here → un-annotated params error (ruling 3); a binding/call-arg threads the target
+        parser::Borrow as b => type_borrow_expr(b, env, table)   // &x safe borrow (AL wave F1)
     }
 }
 
