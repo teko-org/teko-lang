@@ -1,0 +1,1113 @@
+use teko::lexer
+use teko::parser
+
+/**
+ * ConstValue — the comptime value domain: the result of evaluating a provably-const
+ * expression subtree. An integer is stored as its raw two's-complement bit pattern in
+ * a `u128` PLUS its declared type, so every integer family (i8..i128 / u8..u128 /
+ * byte / char) re-emits and re-wraps exactly as the metal would; a float keeps its raw
+ * bits so formatting is byte-exact; a string/bytes keeps its bytes; an aggregate holds
+ * child ConstValues in order. This domain exists ONLY inside the fold — it never
+ * escapes to lowering (the fold reconstructs a literal TExpr from it via `literal_of`).
+ *
+ * @field kind  the value's case (int / float / bool / bytes / aggregate)
+ * @since #comptime-fold
+ */
+pub type ConstValue = struct { kind: ConstValueKind }
+
+/**
+ * ConstValueKind — the case of a ConstValue.
+ *
+ * @since #comptime-fold
+ */
+pub type ConstValueKind = variant CVInt | CVFloat | CVBool | CVBytes | CVAgg
+
+/**
+ * CVInt — an integer comptime value: the two's-complement bit pattern (`bits`) as it
+ * would sit in a register of `ty`, plus the declared integer type (so a fold knows the
+ * width for wrapping/overflow checks and re-emission).
+ *
+ * @field bits  the value's raw two's-complement bits, zero-extended into u128
+ * @field ty    the declared integer type (drives width, signedness, wrap/overflow)
+ * @since #comptime-fold
+ */
+pub type CVInt = struct { bits: u128; ty: Type }
+
+/**
+ * CVFloat — a float comptime value: the raw IEEE-754 bits (so re-emission and
+ * formatting are byte-exact and never route through the host locale — M.1) plus
+ * whether it is an f32 (32 significant bits in `bits`) or f64.
+ *
+ * @field bits   the raw IEEE-754 bits (f32 in the low 32)
+ * @field is_f32 true iff the value is an f32, false for f64
+ * @since #comptime-fold
+ */
+pub type CVFloat = struct { bits: u64; is_f32: bool }
+
+/**
+ * CVBool — a boolean comptime value.
+ *
+ * @field v  the boolean
+ * @since #comptime-fold
+ */
+pub type CVBool = struct { v: bool }
+
+/**
+ * CVBytes — a string / char / []byte comptime value: the raw UTF-8 (str/char) or raw
+ * (byte-slice) bytes, exactly as they would live in rodata.
+ *
+ * @field data  the raw bytes
+ * @since #comptime-fold
+ */
+pub type CVBytes = struct { data: []byte }
+
+/**
+ * CVAgg — an aggregate (array / struct / variant) comptime value: the child values in
+ * declaration order. Indexing (`TIndex`, Layer 1c) reads `elems[i]`; struct/array
+ * re-emission rebuilds the aggregate literal from the children.
+ *
+ * @field elems  the child comptime values, in order
+ * @since #comptime-fold
+ */
+pub type CVAgg = struct { elems: []ConstValue }
+
+/**
+ * IntInfo — the width/signedness a comptime integer op runs at: the number of value
+ * bits and whether the top bit is a sign bit. Derived from a `CVInt.ty` (a `Prim`
+ * integer or `byte`) by `int_info`; every wrap/overflow/re-emission decision reads it.
+ *
+ * @field width   the integer's bit width (8 / 16 / 32 / 64 / 128)
+ * @field is_signed  true iff the type is a signed integer (i8..i128), false for unsigned/byte
+ * @since #comptime-fold
+ */
+type IntInfo = struct { width: u32; is_signed: bool }
+
+/**
+ * cv_int — wrap a two's-complement bit pattern and its declared type into a ConstValue.
+ *
+ * @param bits  the value's raw two's-complement bits, zero-extended into u128
+ * @param ty    the declared integer type
+ * @return      the integer ConstValue
+ * @since #comptime-fold
+ */
+fn cv_int(bits: u128, ty: Type) -> ConstValue { ConstValue { kind = CVInt { bits = bits; ty = ty } } }
+
+/**
+ * cv_float — wrap raw IEEE-754 bits into a float ConstValue.
+ *
+ * @param bits    the raw IEEE-754 bits (f32 in the low 32)
+ * @param is_f32  true iff the value is an f32
+ * @return        the float ConstValue
+ * @since #comptime-fold
+ */
+fn cv_float(bits: u64, is_f32: bool) -> ConstValue { ConstValue { kind = CVFloat { bits = bits; is_f32 = is_f32 } } }
+
+/**
+ * cv_bool — wrap a boolean into a ConstValue.
+ *
+ * @param v  the boolean
+ * @return   the boolean ConstValue
+ * @since #comptime-fold
+ */
+fn cv_bool(v: bool) -> ConstValue { ConstValue { kind = CVBool { v = v } } }
+
+/**
+ * cv_bytes — wrap a raw byte sequence (a folded str/char) into a ConstValue.
+ *
+ * @param data  the raw bytes
+ * @return      the bytes ConstValue
+ * @since #comptime-fold
+ */
+fn cv_bytes(data: []byte) -> ConstValue { ConstValue { kind = CVBytes { data = data } } }
+
+/**
+ * width_mask — the low-`w`-bits mask (2^w - 1) as a u128, the ceiling of an unsigned
+ * value of width `w` and the modulus a width-`w` operation reduces modulo. Width 128 is
+ * the all-ones u128 (its `1 << 128` cannot be spelled), every other width builds the
+ * mask from a single in-range shift.
+ *
+ * @param w  the bit width (8 / 16 / 32 / 64 / 128)
+ * @return   the mask 2^w - 1 as a u128
+ * @since #comptime-fold
+ */
+fn width_mask(w: u32) -> u128 {
+    if w >= 128 { return ~(0 to u128) }
+    (1 to u128 << w) - 1
+}
+
+/**
+ * mask_to_width — reduce a u128 bit pattern to its low `w` bits, the two's-complement
+ * normalization every width-`w` result passes through before it becomes a `CVInt.bits`.
+ *
+ * @param bits  the unreduced bit pattern
+ * @param w     the target bit width
+ * @return      `bits` with every bit at or above position `w` cleared
+ * @since #comptime-fold
+ */
+fn mask_to_width(bits: u128, w: u32) -> u128 { bits & width_mask(w) }
+
+/**
+ * bit_set — is the bit at position `pos` set in `bits`? Used to read a value's sign bit
+ * (position width-1) during signed overflow and shift decisions.
+ *
+ * @param bits  the bit pattern to inspect
+ * @param pos   the bit position (0-based)
+ * @return      true iff bit `pos` is 1
+ * @since #comptime-fold
+ */
+fn bit_set(bits: u128, pos: u32) -> bool { ((bits >> pos) & (1 to u128)) == (1 to u128) }
+
+/**
+ * msb_value — 2^(w-1), the magnitude of the most-negative signed value of width `w` and
+ * the exclusive ceiling of a signed magnitude at that width.
+ *
+ * @param w  the bit width
+ * @return   2^(w-1) as a u128
+ * @since #comptime-fold
+ */
+fn msb_value(w: u32) -> u128 { 1 to u128 << (w - 1) }
+
+/**
+ * is_negative — does `bits` denote a negative value under `info`? False for every
+ * unsigned type; for a signed type it is the state of the sign bit (position width-1).
+ *
+ * @param bits  the value's bit pattern
+ * @param info  the value's width/signedness
+ * @return      true iff the value is a negative signed value
+ * @since #comptime-fold
+ */
+fn is_negative(bits: u128, info: IntInfo) -> bool { info.is_signed && bit_set(mask_to_width(bits, info.width), info.width - 1) }
+
+/**
+ * twos_neg — the width-`w` two's-complement negation of `x` (2^w - x mod 2^w), computed
+ * with in-range subtraction only (never an underflowing `0 - x`), so it is safe on every
+ * engine and for every width including 128.
+ *
+ * @param x  the value to negate (its low `w` bits are used)
+ * @param w  the bit width
+ * @return   the two's-complement negation, reduced to width `w`
+ * @since #comptime-fold
+ */
+fn twos_neg(x: u128, w: u32) -> u128 { mask_to_width((width_mask(w) - mask_to_width(x, w)) + (1 to u128), w) }
+
+/**
+ * magnitude — the unsigned magnitude of the value `bits` denotes under `info`: the value
+ * itself when non-negative, its two's-complement negation when negative. The signed
+ * multiply/divide paths run on magnitudes and re-apply the sign at the end.
+ *
+ * @param bits  the value's bit pattern
+ * @param info  the value's width/signedness
+ * @return      the absolute value as a u128
+ * @since #comptime-fold
+ */
+fn magnitude(bits: u128, info: IntInfo) -> u128 {
+    if is_negative(bits, info) { return twos_neg(bits, info.width) }
+    mask_to_width(bits, info.width)
+}
+
+/**
+ * is_min_bits — does `bits` denote the most-negative value of a signed type under
+ * `info` (bit pattern 2^(w-1))? The `MIN / -1` overflow and `-MIN` overflow guards test
+ * this; always false for an unsigned type.
+ *
+ * @param bits  the value's bit pattern
+ * @param info  the value's width/signedness
+ * @return      true iff the value is the signed minimum
+ * @since #comptime-fold
+ */
+fn is_min_bits(bits: u128, info: IntInfo) -> bool { info.is_signed && mask_to_width(bits, info.width) == msb_value(info.width) }
+
+/**
+ * is_all_ones — is every low bit of `bits` set at width `w` (the bit pattern of a signed
+ * `-1`)? The signed `MIN / -1` overflow guard tests the divisor with this.
+ *
+ * @param bits  the value's bit pattern
+ * @param w     the bit width
+ * @return      true iff the low `w` bits are all 1
+ * @since #comptime-fold
+ */
+fn is_all_ones(bits: u128, w: u32) -> bool { mask_to_width(bits, w) == width_mask(w) }
+
+/**
+ * int_info — classify a type as an integer width/signedness, or error when it is not an
+ * integer (a `Prim` integer drives its width/signedness; `byte` is 8-bit unsigned).
+ *
+ * @param t  the type to classify
+ * @return   the width/signedness, or an error when `t` is not an integer type
+ * @since #comptime-fold
+ */
+fn int_info(t: Type) -> IntInfo | error {
+    match t {
+        Prim as p => {
+            if !prim_is_int(p.kind) { return error { message = "comptime fold: type is not an integer" } }
+            IntInfo { width = prim_width(p.kind); is_signed = prim_is_signed(p.kind) }
+        }
+        Byte => IntInfo { width = 8; is_signed = false }
+        _ => error { message = "comptime fold: type is not an integer" }
+    }
+}
+
+/**
+ * signed_min_i128 — the minimum value of a signed type of width `w` as an i128 carrier
+ * (-2^(w-1)), the lower bound the literal range check compares against.
+ *
+ * @param w  the bit width
+ * @return   -2^(w-1) as an i128
+ * @since #comptime-fold
+ */
+fn signed_min_i128(w: u32) -> i128 {
+    let mx = (msb_value(w) - (1 to u128)) to i128
+    -(mx) - (1 to i128)
+}
+
+/**
+ * neg_literal_bits — the width-`w` two's-complement bit pattern of a NEGATIVE i128
+ * literal value, computed without ever negating i128-MIN directly (which would overflow):
+ * it forms the magnitude from `-(value + 1)` (always in range) and subtracts.
+ *
+ * @param value  the negative literal value (< 0, already range-checked)
+ * @param w      the target bit width
+ * @return       the value's two's-complement bits at width `w`
+ * @since #comptime-fold
+ */
+fn neg_literal_bits(value: i128, w: u32) -> u128 {
+    let k = (-(value + (1 to i128))) to u128
+    width_mask(w) - k
+}
+
+/**
+ * eval_const — evaluate a PROVABLY-const expression subtree (one already accepted by
+ * `is_const_expr`) to its ConstValue, matching the backend's arithmetic semantics
+ * EXACTLY (Layer 1a). Recurses over the Tier-0..5 grammar plus `TIndex` of a const
+ * aggregate at a const index (Layer 1c). An overflow, a ÷0, or an out-of-range cast on
+ * a constant is a LOCATED COMPILE ERROR, never a silent wrap (M.1; LEGISLATION:148) —
+ * a value the compiler can already see is out of range fails loudly at compile time.
+ * The caller MUST have proven `is_const_expr(e) == null` first; a non-const form here
+ * is an internal-error located at `e`.
+ *
+ * @param e      the typed, provably-const expression to evaluate
+ * @param table  the type table (to classify a callee / resolve a referenced type)
+ * @param env    the environment resolving a name to a const/binding + its value
+ * @return       the computed comptime value, or a located error (overflow / ÷0 /
+ *               out-of-range / a non-const form reaching this evaluator)
+ * @since #comptime-fold
+ */
+pub fn eval_const(e: TExpr, table: TypeTable, env: Env) -> ConstValue | error {
+    match e.kind {
+        TNumber as n => eval_number(n, e)
+        TBoolLit as b => cv_bool(b.value)
+        TByteLit as by => cv_int(by.value to u128, Byte { })
+        TCharLit as ch => cv_bytes(bytes_of_str(ch.bytes))
+        TStrLit as s => cv_bytes(bytes_of_str(s.text))
+        TCast as c => eval_cast_expr(c, e, table, env)
+        TUnary as u => eval_unary_expr(u, e, table, env)
+        TBinary as bi => eval_binary_expr(bi, e, table, env)
+        _ => const_form_error("this expression is not a Tier-0..2 scalar constant the comptime fold evaluates yet (#comptime-fold)", e)
+    }
+}
+
+/**
+ * eval_number — evaluate a numeric literal (Tier 0): a float routes to the float-literal
+ * encoder, an integer to the range-checked integer-literal encoder.
+ *
+ * @param n  the typed number literal
+ * @param e  the enclosing expression (its type is the literal's declared type; its
+ *           line/col position any error)
+ * @return   the literal's comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_number(n: TNumber, e: TExpr) -> ConstValue | error {
+    if n.is_float { return eval_float_literal(n.fval, e.type, e) }
+    eval_int_literal(n.value, e.type, e)
+}
+
+/**
+ * eval_int_literal — encode an integer literal `value` as its declared type `t`,
+ * erroring when `t` is not an integer or the value is out of range for it.
+ *
+ * @param value  the literal's integer value (i128 carrier)
+ * @param t      the literal's declared type
+ * @param e      the enclosing expression (positions any error)
+ * @return       the integer comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_int_literal(value: i128, t: Type, e: TExpr) -> ConstValue | error {
+    match int_info(t) {
+        error => return const_form_error("comptime fold: a non-integer type on an integer literal (#comptime-fold)", e)
+        IntInfo as info => encode_int_literal(value, info, t, e)
+    }
+}
+
+/**
+ * encode_int_literal — range-check `value` against the type `t` of width/signedness
+ * `info` and produce its two's-complement bits, erroring (M.1; LEGISLATION:148) when the
+ * literal is out of range for its type.
+ *
+ * @param value  the literal's integer value (i128 carrier)
+ * @param info   the type's width/signedness
+ * @param t      the literal's declared type
+ * @param e      the enclosing expression (positions any error)
+ * @return       the integer comptime value, or a located out-of-range error
+ * @since #comptime-fold
+ */
+fn encode_int_literal(value: i128, info: IntInfo, t: Type, e: TExpr) -> ConstValue | error {
+    if value < (0 to i128) {
+        if !info.is_signed { return const_form_error("negative literal is out of range for an unsigned type (#comptime-fold)", e) }
+        if value < signed_min_i128(info.width) { return const_form_error("integer literal is out of range for its type (#comptime-fold)", e) }
+        return cv_int(neg_literal_bits(value, info.width), t)
+    }
+    let uv = value to u128
+    let max = if info.is_signed { msb_value(info.width) - (1 to u128) } else { width_mask(info.width) }
+    if uv > max { return const_form_error("integer literal is out of range for its type (#comptime-fold)", e) }
+    cv_int(mask_to_width(uv, info.width), t)
+}
+
+/**
+ * eval_float_literal — encode a float literal from its f64 value into raw IEEE bits.
+ * Only f64 is folded today; an f32 (which needs the not-yet-exposed `f32_bits`
+ * primitive) and any non-float type are a located error.
+ *
+ * @param fval  the literal's f64 value
+ * @param t     the literal's declared type
+ * @param e     the enclosing expression (positions any error)
+ * @return      the float comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_float_literal(fval: f64, t: Type, e: TExpr) -> ConstValue | error {
+    match t {
+        Prim as p => {
+            if p.kind == PrimKind::F64 { return cv_float(teko::f64_bits(fval), false) }
+            const_form_error("comptime folding of this float width is not yet supported (only f64) (#comptime-fold)", e)
+        }
+        _ => const_form_error("comptime fold: a non-float type on a float literal (#comptime-fold)", e)
+    }
+}
+
+/**
+ * eval_cast_expr — evaluate a `to T` cast (Tier 1): fold the operand, then convert it to
+ * the cast's target type `e.type`, erroring on an out-of-range value (M.1).
+ *
+ * @param c      the typed cast node
+ * @param e      the enclosing expression (its type is the cast target; positions errors)
+ * @param table  the type table (forwarded to the operand fold)
+ * @param env    the environment (forwarded to the operand fold)
+ * @return       the converted comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_cast_expr(c: TCast, e: TExpr, table: TypeTable, env: Env) -> ConstValue | error {
+    match eval_const(c.expr, table, env) {
+        error as x => return x
+        ConstValue as v => apply_cast(v, e.type, e)
+    }
+}
+
+/**
+ * apply_cast — convert a folded value `v` to the target type `target`. The comptime fold
+ * supports integer and `byte` targets (int-to-int with an M.1 range check, and the sole
+ * `bool -> numeric` cast); a float target is a located error until the float-cast crumb.
+ *
+ * @param v       the folded operand value
+ * @param target  the cast's target type
+ * @param e       the enclosing expression (positions any error)
+ * @return        the converted comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn apply_cast(v: ConstValue, target: Type, e: TExpr) -> ConstValue | error {
+    match int_info(target) {
+        IntInfo as dst => cast_to_int(v, target, dst, e)
+        error => const_form_error("comptime fold: this cast target is not yet supported (#comptime-fold)", e)
+    }
+}
+
+/**
+ * cast_to_int — convert a folded value to an integer target of width/signedness `dst`.
+ * A CVInt re-ranges (int-to-int); a CVBool folds to 1/0 (the only `bool -> numeric`
+ * cast Teko allows); every other kind is a located error.
+ *
+ * @param v       the folded operand value
+ * @param target  the integer target type
+ * @param dst     the target's width/signedness
+ * @param e       the enclosing expression (positions any error)
+ * @return        the integer comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn cast_to_int(v: ConstValue, target: Type, dst: IntInfo, e: TExpr) -> ConstValue | error {
+    match v.kind {
+        CVInt as ci => cast_int_to_int(ci, target, dst, e)
+        CVBool as cb => cv_int(if cb.v { 1 to u128 } else { 0 to u128 }, target)
+        _ => const_form_error("comptime fold: cannot cast this constant kind to an integer (#comptime-fold)", e)
+    }
+}
+
+/**
+ * cast_int_to_int — re-range an integer value `ci` into the integer target `target` of
+ * width/signedness `dst`, erroring when the source is not an integer.
+ *
+ * @param ci      the source integer value
+ * @param target  the integer target type
+ * @param dst     the target's width/signedness
+ * @param e       the enclosing expression (positions any error)
+ * @return        the re-ranged integer value, or a located error
+ * @since #comptime-fold
+ */
+fn cast_int_to_int(ci: CVInt, target: Type, dst: IntInfo, e: TExpr) -> ConstValue | error {
+    match int_info(ci.ty) {
+        error as x => return x
+        IntInfo as src => cast_int_widths(ci.bits, src, target, dst, e)
+    }
+}
+
+/**
+ * cast_int_widths — the integer-to-integer range check + re-encode: a negative source
+ * fits only a signed target whose magnitude admits it; a non-negative source fits any
+ * target whose ceiling admits it. An out-of-range value is a located compile error,
+ * mirroring the runtime's trapping narrowing cast (M.1) rather than truncating.
+ *
+ * @param bits    the source value's bit pattern
+ * @param src     the source's width/signedness
+ * @param target  the integer target type
+ * @param dst     the target's width/signedness
+ * @param e       the enclosing expression (positions any error)
+ * @return        the re-encoded integer value, or a located out-of-range error
+ * @since #comptime-fold
+ */
+fn cast_int_widths(bits: u128, src: IntInfo, target: Type, dst: IntInfo, e: TExpr) -> ConstValue | error {
+    if is_negative(bits, src) {
+        if !dst.is_signed { return const_form_error("constant is out of range for the cast target (a negative value to an unsigned type) (#comptime-fold)", e) }
+        let m = twos_neg(bits, src.width)
+        if m > msb_value(dst.width) { return const_form_error("constant is out of range for the cast target (#comptime-fold)", e) }
+        return cv_int(twos_neg(m, dst.width), target)
+    }
+    let v = mask_to_width(bits, src.width)
+    if v > cast_max(dst) { return const_form_error("constant is out of range for the cast target (#comptime-fold)", e) }
+    cv_int(mask_to_width(v, dst.width), target)
+}
+
+/**
+ * cast_max — the largest non-negative value an integer target of width/signedness `dst`
+ * admits: its signed maximum 2^(w-1)-1, or its unsigned ceiling 2^w-1.
+ *
+ * @param dst  the target's width/signedness
+ * @return     the inclusive maximum as a u128
+ * @since #comptime-fold
+ */
+fn cast_max(dst: IntInfo) -> u128 {
+    if dst.is_signed { return msb_value(dst.width) - (1 to u128) }
+    width_mask(dst.width)
+}
+
+/**
+ * eval_unary_expr — evaluate a unary `~`/`-` expression (Tier 2): fold the operand, then
+ * apply the operator.
+ *
+ * @param u      the typed unary node
+ * @param e      the enclosing expression (positions any error)
+ * @param table  the type table (forwarded to the operand fold)
+ * @param env    the environment (forwarded to the operand fold)
+ * @return       the folded value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_unary_expr(u: TUnary, e: TExpr, table: TypeTable, env: Env) -> ConstValue | error {
+    match eval_const(u.operand, table, env) {
+        error as x => return x
+        ConstValue as v => apply_unary(u.op, v, e)
+    }
+}
+
+/**
+ * apply_unary — apply a unary operator to a folded value: integer `~`/`-` on a CVInt,
+ * `-` on a CVFloat; any other pairing is a located error.
+ *
+ * @param op  the unary operator token
+ * @param v   the folded operand value
+ * @param e   the enclosing expression (positions any error)
+ * @return    the folded value, or a located error
+ * @since #comptime-fold
+ */
+fn apply_unary(op: lexer::TokenKind, v: ConstValue, e: TExpr) -> ConstValue | error {
+    match v.kind {
+        CVInt as ci => int_unary(op, ci, e)
+        CVFloat as cf => apply_float_unary(op, cf, e)
+        _ => const_form_error("comptime fold: unsupported unary operator on this constant (#comptime-fold)", e)
+    }
+}
+
+/**
+ * int_unary — apply `~` (bitwise complement, masked to width) or unary `-` (negation) to
+ * an integer value.
+ *
+ * @param op  the unary operator token
+ * @param ci  the integer operand
+ * @param e   the enclosing expression (positions any error)
+ * @return    the folded integer value, or a located error
+ * @since #comptime-fold
+ */
+fn int_unary(op: lexer::TokenKind, ci: CVInt, e: TExpr) -> ConstValue | error {
+    match int_info(ci.ty) {
+        error as x => return x
+        IntInfo as info => int_unary_at(op, ci, info, e)
+    }
+}
+
+/**
+ * int_unary_at — apply an integer unary operator once the operand's width/signedness is
+ * known: `~` masks the complement to width, `-` negates with an M.1 overflow guard.
+ *
+ * @param op    the unary operator token
+ * @param ci    the integer operand (carries its type)
+ * @param info  the operand's width/signedness
+ * @param e     the enclosing expression (positions any error)
+ * @return      the folded integer value, or a located error
+ * @since #comptime-fold
+ */
+fn int_unary_at(op: lexer::TokenKind, ci: CVInt, info: IntInfo, e: TExpr) -> ConstValue | error {
+    let a = mask_to_width(ci.bits, info.width)
+    match op {
+        lexer::TokenKind::Tilde => cv_int(width_mask(info.width) ^ a, ci.ty)
+        lexer::TokenKind::Minus => int_negate(a, info, ci.ty, e)
+        _ => const_form_error("comptime fold: unsupported unary operator on an integer constant (#comptime-fold)", e)
+    }
+}
+
+/**
+ * int_negate — negate an integer value. Negating a signed MIN, or any non-zero unsigned
+ * value, is out of range and a located compile error (M.1); every other case is the
+ * exact two's-complement negation.
+ *
+ * @param a     the operand's bit pattern (masked to width)
+ * @param info  the operand's width/signedness
+ * @param ty    the operand's declared type (the result's type)
+ * @param e     the enclosing expression (positions any error)
+ * @return      the negated integer value, or a located out-of-range error
+ * @since #comptime-fold
+ */
+fn int_negate(a: u128, info: IntInfo, ty: Type, e: TExpr) -> ConstValue | error {
+    if !info.is_signed {
+        if mask_to_width(a, info.width) == (0 to u128) { return cv_int(0 to u128, ty) }
+        return const_form_error("negation of a non-zero unsigned constant is out of range (#comptime-fold)", e)
+    }
+    if is_min_bits(a, info) { return const_form_error("integer overflow negating a constant (a signed MIN has no positive) (#comptime-fold)", e) }
+    cv_int(twos_neg(a, info.width), ty)
+}
+
+/**
+ * apply_float_unary — apply a unary operator to a float value: only `-` (sign flip) is
+ * defined on a float; any other is a located error.
+ *
+ * @param op  the unary operator token
+ * @param cf  the float operand
+ * @param e   the enclosing expression (positions any error)
+ * @return    the folded float value, or a located error
+ * @since #comptime-fold
+ */
+fn apply_float_unary(op: lexer::TokenKind, cf: CVFloat, e: TExpr) -> ConstValue | error {
+    match op {
+        lexer::TokenKind::Minus => float_negate(cf, e)
+        _ => const_form_error("comptime fold: unsupported unary operator on a float constant (#comptime-fold)", e)
+    }
+}
+
+/**
+ * float_negate — negate an f64 value through its IEEE bits; an f32 is not yet folded.
+ *
+ * @param cf  the float operand
+ * @param e   the enclosing expression (positions any error)
+ * @return    the negated float value, or a located error
+ * @since #comptime-fold
+ */
+fn float_negate(cf: CVFloat, e: TExpr) -> ConstValue | error {
+    if cf.is_f32 { return const_form_error("comptime folding of f32 is not yet supported (#comptime-fold)", e) }
+    cv_float(teko::f64_bits(-(teko::f64_from_bits(cf.bits))), false)
+}
+
+/**
+ * eval_binary_expr — evaluate a binary `+ - * / % & | ^ << >>` expression (Tier 2): fold
+ * both operands, then apply the operator.
+ *
+ * @param bi     the typed binary node
+ * @param e      the enclosing expression (positions any error)
+ * @param table  the type table (forwarded to the operand folds)
+ * @param env    the environment (forwarded to the operand folds)
+ * @return       the folded value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_binary_expr(bi: TBinary, e: TExpr, table: TypeTable, env: Env) -> ConstValue | error {
+    match eval_const(bi.left, table, env) {
+        error as x => return x
+        ConstValue as lv => eval_binary_right(bi, lv, e, table, env)
+    }
+}
+
+/**
+ * eval_binary_right — the left operand of a binary op is folded; fold the right operand
+ * and apply the operator.
+ *
+ * @param bi     the typed binary node
+ * @param lv     the folded left value
+ * @param e      the enclosing expression (positions any error)
+ * @param table  the type table (forwarded to the right-operand fold)
+ * @param env    the environment (forwarded to the right-operand fold)
+ * @return       the folded value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_binary_right(bi: TBinary, lv: ConstValue, e: TExpr, table: TypeTable, env: Env) -> ConstValue | error {
+    match eval_const(bi.right, table, env) {
+        error as y => return y
+        ConstValue as rv => apply_binary(bi.op, lv, rv, e)
+    }
+}
+
+/**
+ * apply_binary — apply a binary operator to two folded operands, dispatching on their
+ * kinds: two integers to the integer op family, two f64 floats to the float op family.
+ * A mismatched or unsupported pairing is a located error.
+ *
+ * @param op  the binary operator token
+ * @param lv  the folded left value
+ * @param rv  the folded right value
+ * @param e   the enclosing expression (positions any error)
+ * @return    the folded value, or a located error
+ * @since #comptime-fold
+ */
+fn apply_binary(op: lexer::TokenKind, lv: ConstValue, rv: ConstValue, e: TExpr) -> ConstValue | error {
+    match lv.kind {
+        CVInt as li => apply_binary_int(op, li, rv, e)
+        CVFloat as lf => apply_binary_float(op, lf, rv, e)
+        _ => const_form_error("comptime fold: unsupported operand kind in a binary op (#comptime-fold)", e)
+    }
+}
+
+/**
+ * apply_binary_int — the left operand is an integer: require an integer right operand and
+ * dispatch to the integer op family.
+ *
+ * @param op  the binary operator token
+ * @param li  the folded left integer value
+ * @param rv  the folded right value
+ * @param e   the enclosing expression (positions any error)
+ * @return    the folded value, or a located error
+ * @since #comptime-fold
+ */
+fn apply_binary_int(op: lexer::TokenKind, li: CVInt, rv: ConstValue, e: TExpr) -> ConstValue | error {
+    match rv.kind {
+        CVInt as ri => int_binop(op, li, ri, e)
+        _ => const_form_error("comptime fold: mismatched operand kinds in a binary op (#comptime-fold)", e)
+    }
+}
+
+/**
+ * apply_binary_float — the left operand is a float: require a float right operand and
+ * dispatch to the float op family.
+ *
+ * @param op  the binary operator token
+ * @param lf  the folded left float value
+ * @param rv  the folded right value
+ * @param e   the enclosing expression (positions any error)
+ * @return    the folded value, or a located error
+ * @since #comptime-fold
+ */
+fn apply_binary_float(op: lexer::TokenKind, lf: CVFloat, rv: ConstValue, e: TExpr) -> ConstValue | error {
+    match rv.kind {
+        CVFloat as rf => float_binop(op, lf, rf, e)
+        _ => const_form_error("comptime fold: mismatched operand kinds in a binary op (#comptime-fold)", e)
+    }
+}
+
+/**
+ * int_binop — apply an integer binary operator, running at the LEFT operand's width and
+ * signedness (Teko requires both operands share that integer type; a shift reads its
+ * count from the right operand's value).
+ *
+ * @param op  the binary operator token
+ * @param la  the folded left integer value (carries the operation's type)
+ * @param ra  the folded right integer value
+ * @param e   the enclosing expression (positions any error)
+ * @return    the folded integer value, or a located error
+ * @since #comptime-fold
+ */
+fn int_binop(op: lexer::TokenKind, la: CVInt, ra: CVInt, e: TExpr) -> ConstValue | error {
+    match int_info(la.ty) {
+        error as x => return x
+        IntInfo as info => int_binop_dispatch(op, la, ra, info, e)
+    }
+}
+
+/**
+ * int_binop_dispatch — dispatch an integer binary operator to its arithmetic, bitwise, or
+ * shift handler once the operation's width/signedness `info` is known.
+ *
+ * @param op    the binary operator token
+ * @param la    the folded left integer value (carries the operation's type)
+ * @param ra    the folded right integer value
+ * @param info  the operation's width/signedness
+ * @param e     the enclosing expression (positions any error)
+ * @return      the folded integer value, or a located error
+ * @since #comptime-fold
+ */
+fn int_binop_dispatch(op: lexer::TokenKind, la: CVInt, ra: CVInt, info: IntInfo, e: TExpr) -> ConstValue | error {
+    let a = mask_to_width(la.bits, info.width)
+    let b = mask_to_width(ra.bits, info.width)
+    match op {
+        lexer::TokenKind::Plus => int_add(a, b, info, la.ty, e)
+        lexer::TokenKind::Minus => int_sub(a, b, info, la.ty, e)
+        lexer::TokenKind::Star => int_mul(a, b, info, la.ty, e)
+        lexer::TokenKind::Slash => int_divrem(true, a, b, info, la.ty, e)
+        lexer::TokenKind::Percent => int_divrem(false, a, b, info, la.ty, e)
+        lexer::TokenKind::Amp => cv_int(mask_to_width(a & b, info.width), la.ty)
+        lexer::TokenKind::Pipe => cv_int(mask_to_width(a | b, info.width), la.ty)
+        lexer::TokenKind::Caret => cv_int(mask_to_width(a ^ b, info.width), la.ty)
+        lexer::TokenKind::Shl => int_shift(true, la, ra, info, e)
+        lexer::TokenKind::Shr => int_shift(false, la, ra, info, e)
+        _ => const_form_error("comptime fold: unsupported binary operator on an integer constant (#comptime-fold)", e)
+    }
+}
+
+/**
+ * int_add — integer addition. The two's-complement sum is exact for the in-range case;
+ * an addition whose true result leaves the type's range is a located overflow error
+ * (M.1), never a silent wrap.
+ *
+ * @param a     the left operand's bit pattern (masked to width)
+ * @param b     the right operand's bit pattern (masked to width)
+ * @param info  the operation's width/signedness
+ * @param ty    the result's declared type
+ * @param e     the enclosing expression (positions any error)
+ * @return      the folded sum, or a located overflow error
+ * @since #comptime-fold
+ */
+fn int_add(a: u128, b: u128, info: IntInfo, ty: Type, e: TExpr) -> ConstValue | error {
+    let raw = a + b
+    let res = mask_to_width(raw, info.width)
+    if int_add_overflows(a, b, res, raw, info) { return const_form_error("integer overflow in a constant `+` (out of range for its type) (#comptime-fold)", e) }
+    cv_int(res, ty)
+}
+
+/**
+ * int_add_overflows — does the addition leave the type's range? Signed: both operands
+ * share a sign the result does not. Unsigned: a carry beyond the width (at width 128 a
+ * u128 carry-out, else a sum exceeding the width mask).
+ *
+ * @param a     the left operand's bit pattern
+ * @param b     the right operand's bit pattern
+ * @param res   the width-reduced sum
+ * @param raw   the un-reduced u128 sum
+ * @param info  the operation's width/signedness
+ * @return      true iff the addition overflows
+ * @since #comptime-fold
+ */
+fn int_add_overflows(a: u128, b: u128, res: u128, raw: u128, info: IntInfo) -> bool {
+    if info.is_signed {
+        let sa = bit_set(a, info.width - 1)
+        let sb = bit_set(b, info.width - 1)
+        let sr = bit_set(res, info.width - 1)
+        return (sa == sb) && (sr != sa)
+    }
+    if info.width >= 128 { return raw < a }
+    raw > width_mask(info.width)
+}
+
+/**
+ * int_sub — integer subtraction, computed as an addition of the two's-complement of the
+ * right operand (never an underflowing `a - b`), erroring on an out-of-range true result.
+ *
+ * @param a     the left operand's bit pattern (masked to width)
+ * @param b     the right operand's bit pattern (masked to width)
+ * @param info  the operation's width/signedness
+ * @param ty    the result's declared type
+ * @param e     the enclosing expression (positions any error)
+ * @return      the folded difference, or a located overflow error
+ * @since #comptime-fold
+ */
+fn int_sub(a: u128, b: u128, info: IntInfo, ty: Type, e: TExpr) -> ConstValue | error {
+    let res = mask_to_width(a + twos_neg(b, info.width), info.width)
+    if int_sub_overflows(a, b, res, info) { return const_form_error("integer overflow in a constant `-` (out of range for its type) (#comptime-fold)", e) }
+    cv_int(res, ty)
+}
+
+/**
+ * int_sub_overflows — does the subtraction leave the type's range? Signed: the operands'
+ * signs differ and the result's sign is not the minuend's. Unsigned: a borrow (`a < b`).
+ *
+ * @param a     the left operand's bit pattern
+ * @param b     the right operand's bit pattern
+ * @param res   the width-reduced difference
+ * @param info  the operation's width/signedness
+ * @return      true iff the subtraction overflows
+ * @since #comptime-fold
+ */
+fn int_sub_overflows(a: u128, b: u128, res: u128, info: IntInfo) -> bool {
+    if info.is_signed {
+        let sa = bit_set(a, info.width - 1)
+        let sb = bit_set(b, info.width - 1)
+        let sr = bit_set(res, info.width - 1)
+        return (sa != sb) && (sr != sa)
+    }
+    a < b
+}
+
+/**
+ * int_mul — integer multiplication. The two's-complement product's low bits are the exact
+ * in-range result; a product whose true value leaves the type's range is a located
+ * overflow error (M.1).
+ *
+ * @param a     the left operand's bit pattern (masked to width)
+ * @param b     the right operand's bit pattern (masked to width)
+ * @param info  the operation's width/signedness
+ * @param ty    the result's declared type
+ * @param e     the enclosing expression (positions any error)
+ * @return      the folded product, or a located overflow error
+ * @since #comptime-fold
+ */
+fn int_mul(a: u128, b: u128, info: IntInfo, ty: Type, e: TExpr) -> ConstValue | error {
+    let res = mask_to_width(a * b, info.width)
+    if int_mul_overflows(a, b, info) { return const_form_error("integer overflow in a constant `*` (out of range for its type) (#comptime-fold)", e) }
+    cv_int(res, ty)
+}
+
+/**
+ * int_mul_overflows — does the multiplication leave the type's range? It compares
+ * magnitudes: the product of the unsigned magnitudes must not carry out of u128 and must
+ * fit the type's magnitude ceiling (a signed result may reach 2^(w-1) only when the signs
+ * differ, i.e. the minimum).
+ *
+ * @param a     the left operand's bit pattern
+ * @param b     the right operand's bit pattern
+ * @param info  the operation's width/signedness
+ * @return      true iff the multiplication overflows
+ * @since #comptime-fold
+ */
+fn int_mul_overflows(a: u128, b: u128, info: IntInfo) -> bool {
+    if !info.is_signed { return unsigned_mul_overflows(a, b, info) }
+    signed_mul_overflows(a, b, info)
+}
+
+/**
+ * unsigned_mul_overflows — does an unsigned product leave the width? A u128 carry-out, or
+ * (below width 128) a product exceeding the width mask.
+ *
+ * @param a     the left operand's bit pattern
+ * @param b     the right operand's bit pattern
+ * @param info  the operation's width/signedness
+ * @return      true iff the unsigned product overflows
+ * @since #comptime-fold
+ */
+fn unsigned_mul_overflows(a: u128, b: u128, info: IntInfo) -> bool {
+    if mul_mag_overflows(a, b) { return true }
+    if info.width >= 128 { return false }
+    (a * b) > width_mask(info.width)
+}
+
+/**
+ * signed_mul_overflows — does a signed product leave the width? The magnitude product must
+ * not carry out of u128 nor exceed 2^(w-1); a magnitude of exactly 2^(w-1) is in range
+ * only when the signs differ (the type minimum).
+ *
+ * @param a     the left operand's bit pattern
+ * @param b     the right operand's bit pattern
+ * @param info  the operation's width/signedness
+ * @return      true iff the signed product overflows
+ * @since #comptime-fold
+ */
+fn signed_mul_overflows(a: u128, b: u128, info: IntInfo) -> bool {
+    let ua = magnitude(a, info)
+    let ub = magnitude(b, info)
+    if mul_mag_overflows(ua, ub) { return true }
+    let cap = msb_value(info.width)
+    let prod = ua * ub
+    if prod > cap { return true }
+    if prod == cap { return bit_set(a, info.width - 1) == bit_set(b, info.width - 1) }
+    false
+}
+
+/**
+ * mul_mag_overflows — does the unsigned product `x * y` carry out of the u128 carrier?
+ * Detected without a wider type: a non-zero `x` whose product divided back does not
+ * recover `y` overflowed.
+ *
+ * @param x  the first magnitude
+ * @param y  the second magnitude
+ * @return   true iff `x * y` exceeds u128
+ * @since #comptime-fold
+ */
+fn mul_mag_overflows(x: u128, y: u128) -> bool { x != (0 to u128) && ((x * y) / x != y) }
+
+/**
+ * int_divrem — integer division (`is_div`) or remainder. A zero divisor and the signed
+ * `MIN / -1` overflow are located compile errors (M.1, mirroring the runtime's trapping
+ * divide); otherwise the result is the trunc-toward-zero quotient or its remainder.
+ *
+ * @param is_div  true for `/`, false for `%`
+ * @param a       the dividend's bit pattern (masked to width)
+ * @param b       the divisor's bit pattern (masked to width)
+ * @param info    the operation's width/signedness
+ * @param ty      the result's declared type
+ * @param e       the enclosing expression (positions any error)
+ * @return        the folded quotient/remainder, or a located error
+ * @throws        a located error when the divisor is zero or a signed `MIN / -1` overflows
+ * @since #comptime-fold
+ */
+fn int_divrem(is_div: bool, a: u128, b: u128, info: IntInfo, ty: Type, e: TExpr) -> ConstValue | error {
+    if mask_to_width(b, info.width) == (0 to u128) { return divrem_zero_error(is_div, e) }
+    if info.is_signed && is_min_bits(a, info) && is_all_ones(b, info.width) { return const_form_error("integer overflow in a constant signed division (MIN / -1) (#comptime-fold)", e) }
+    if !info.is_signed { return cv_int(mask_to_width(if is_div { a / b } else { a % b }, info.width), ty) }
+    let ua = magnitude(a, info)
+    let ub = magnitude(b, info)
+    if is_div { return int_div_signed(ua, ub, a, b, info, ty) }
+    int_rem_signed(ua, ub, a, info, ty)
+}
+
+/**
+ * divrem_zero_error — the located compile error for a constant divide/remainder by zero.
+ *
+ * @param is_div  true for `/`, false for `%`
+ * @param e       the enclosing expression (positions the error)
+ * @return        the located error
+ * @since #comptime-fold
+ */
+fn divrem_zero_error(is_div: bool, e: TExpr) -> error {
+    if is_div { return const_form_error("division by zero in a constant (#comptime-fold)", e) }
+    const_form_error("remainder by zero in a constant (#comptime-fold)", e)
+}
+
+/**
+ * int_div_signed — the signed quotient from magnitudes: its magnitude is `ua / ub`, and
+ * it is negative when the operand signs differ (truncation toward zero).
+ *
+ * @param ua    the dividend's magnitude
+ * @param ub    the divisor's magnitude
+ * @param a     the dividend's bit pattern (for its sign)
+ * @param b     the divisor's bit pattern (for its sign)
+ * @param info  the operation's width/signedness
+ * @param ty    the result's declared type
+ * @return      the folded signed quotient
+ * @since #comptime-fold
+ */
+fn int_div_signed(ua: u128, ub: u128, a: u128, b: u128, info: IntInfo, ty: Type) -> ConstValue | error {
+    let uq = ua / ub
+    let neg = bit_set(a, info.width - 1) != bit_set(b, info.width - 1)
+    let res = if neg { twos_neg(uq, info.width) } else { uq }
+    cv_int(mask_to_width(res, info.width), ty)
+}
+
+/**
+ * int_rem_signed — the signed remainder from magnitudes: its magnitude is `ua % ub`, and
+ * it takes the dividend's sign (C truncation semantics).
+ *
+ * @param ua    the dividend's magnitude
+ * @param ub    the divisor's magnitude
+ * @param a     the dividend's bit pattern (for its sign)
+ * @param info  the operation's width/signedness
+ * @param ty    the result's declared type
+ * @return      the folded signed remainder
+ * @since #comptime-fold
+ */
+fn int_rem_signed(ua: u128, ub: u128, a: u128, info: IntInfo, ty: Type) -> ConstValue | error {
+    let ur = ua % ub
+    let neg = bit_set(a, info.width - 1)
+    let res = if neg { twos_neg(ur, info.width) } else { ur }
+    cv_int(mask_to_width(res, info.width), ty)
+}
+
+/**
+ * int_shift — a `<<` or `>>` at the LEFT operand's width, with the shift count taken from
+ * the right operand's value and masked by (width - 1) — the SAME defined-wrap the runtime
+ * shift helpers apply (the `teko_rt.h` tk_shl and tk_shr families), so an out-of-range
+ * count never traps and the comptime result matches the metal bit-for-bit. A signed
+ * right shift is arithmetic (sign-preserving).
+ *
+ * @param is_left  true for `<<`, false for `>>`
+ * @param la       the folded left value (carries width/type)
+ * @param ra       the folded right value (carries the count)
+ * @param info     the left operand's width/signedness
+ * @param e        the enclosing expression (positions any error)
+ * @return         the folded shifted value, or a located error
+ * @since #comptime-fold
+ */
+fn int_shift(is_left: bool, la: CVInt, ra: CVInt, info: IntInfo, e: TExpr) -> ConstValue | error {
+    let cnt = shift_count(ra.bits, info.width)
+    let a = mask_to_width(la.bits, info.width)
+    if is_left { return cv_int(mask_to_width(a << cnt, info.width), la.ty) }
+    if is_arith_shift(a, cnt, info) { return cv_int(arith_shr(a, cnt, info), la.ty) }
+    cv_int(mask_to_width(a >> cnt, info.width), la.ty)
+}
+
+/**
+ * shift_count — the effective shift amount: the count value's low log2(width) bits (the
+ * runtime's `count & (width - 1)` mask), always in `[0, width - 1]`.
+ *
+ * @param bits  the count operand's bit pattern
+ * @param w     the shifted value's bit width
+ * @return      the masked shift amount as a u32
+ * @since #comptime-fold
+ */
+fn shift_count(bits: u128, w: u32) -> u32 { (bits & ((w - 1) to u128)) to u32 }
+
+/**
+ * is_arith_shift — is this right-shift an arithmetic (sign-filling) one? Only when the
+ * type is signed, the value is negative, and the count is non-zero.
+ *
+ * @param a     the shifted value's bit pattern
+ * @param cnt   the shift amount
+ * @param info  the shifted value's width/signedness
+ * @return      true iff the shift must fill the vacated high bits with ones
+ * @since #comptime-fold
+ */
+fn is_arith_shift(a: u128, cnt: u32, info: IntInfo) -> bool { info.is_signed && cnt > 0 && bit_set(a, info.width - 1) }
+
+/**
+ * arith_shr — the arithmetic right-shift of a negative signed value: the logical shift
+ * with the `cnt` vacated high bits (within the width) filled with ones.
+ *
+ * @param a     the shifted value's bit pattern
+ * @param cnt   the shift amount (non-zero)
+ * @param info  the shifted value's width/signedness
+ * @return      the sign-preserving shifted bits, reduced to width
+ * @since #comptime-fold
+ */
+fn arith_shr(a: u128, cnt: u32, info: IntInfo) -> u128 {
+    let logical = a >> cnt
+    let fill = mask_to_width(width_mask(info.width) << (info.width - cnt), info.width)
+    mask_to_width(logical | fill, info.width)
+}
+
+/**
+ * float_binop — an f64 binary `+ - * /` through IEEE bits (mirroring the target's f64
+ * arithmetic). A `/` by zero is a located compile error (M.1, mirroring the runtime's
+ * trapping float divide); an f32 operand is not yet folded.
+ *
+ * @param op  the binary operator token
+ * @param lf  the folded left float value
+ * @param rf  the folded right float value
+ * @param e   the enclosing expression (positions any error)
+ * @return    the folded float value, or a located error
+ * @throws    a located error on a division by zero
+ * @since #comptime-fold
+ */
+fn float_binop(op: lexer::TokenKind, lf: CVFloat, rf: CVFloat, e: TExpr) -> ConstValue | error {
+    if lf.is_f32 || rf.is_f32 { return const_form_error("comptime folding of f32 is not yet supported (#comptime-fold)", e) }
+    let x = teko::f64_from_bits(lf.bits)
+    let y = teko::f64_from_bits(rf.bits)
+    match op {
+        lexer::TokenKind::Plus => cv_float(teko::f64_bits(x + y), false)
+        lexer::TokenKind::Minus => cv_float(teko::f64_bits(x - y), false)
+        lexer::TokenKind::Star => cv_float(teko::f64_bits(x * y), false)
+        lexer::TokenKind::Slash => float_div(x, y, e)
+        _ => const_form_error("comptime fold: unsupported binary operator on a float constant (#comptime-fold)", e)
+    }
+}
+
+/**
+ * float_div — an f64 division with a zero-divisor guard (mirroring the runtime's trapping
+ * float divide — M.1).
+ *
+ * @param x  the dividend
+ * @param y  the divisor
+ * @param e  the enclosing expression (positions any error)
+ * @return   the folded quotient, or a located divide-by-zero error
+ * @throws   a located error when the divisor is zero
+ * @since #comptime-fold
+ */
+fn float_div(x: f64, y: f64, e: TExpr) -> ConstValue | error {
+    if y == 0.0 { return const_form_error("float division by zero in a constant (#comptime-fold)", e) }
+    cv_float(teko::f64_bits(x / y), false)
+}

@@ -1,0 +1,299 @@
+use teko::parser
+use teko::lexer
+
+/**
+ * u16t — the `u16` primitive type, for the comptime-fold value matrix.
+ *
+ * @return the `u16` primitive type
+ */
+fn u16t() -> Type { Prim { kind = PrimKind::U16 } }
+
+/**
+ * u64t — the `u64` primitive type, for the comptime-fold value matrix.
+ *
+ * @return the `u64` primitive type
+ */
+fn u64t() -> Type { Prim { kind = PrimKind::U64 } }
+
+/**
+ * cf_num — an integer number-literal typed expression of type `t` carrying value `value`.
+ *
+ * @param value  the integer value (i128 carrier, like the parser's Number)
+ * @param t      the literal's declared type
+ * @return       the typed number literal
+ */
+fn cf_num(value: i128, t: Type) -> TExpr { te(TNumber { is_float = false; value = value; fval = 0.0 }, t) }
+
+/**
+ * cf_fnum — an `f64` number-literal typed expression carrying value `fval`.
+ *
+ * @param fval  the float value
+ * @return      the typed f64 number literal
+ */
+fn cf_fnum(fval: f64) -> TExpr { te(TNumber { is_float = true; value = 0 to i128; fval = fval }, f64t()) }
+
+/**
+ * cf_bin — a binary-operator typed expression of result type `t` over two operands.
+ *
+ * @param op  the binary operator token kind
+ * @param l   the left operand
+ * @param r   the right operand
+ * @param t   the result type
+ * @return    the typed binary expression
+ */
+fn cf_bin(op: lexer::TokenKind, l: TExpr, r: TExpr, t: Type) -> TExpr { te(TBinary { op = op; left = l; right = r }, t) }
+
+/**
+ * cf_un — a unary-operator typed expression of result type `t` over one operand.
+ *
+ * @param op  the unary operator token kind
+ * @param o   the operand
+ * @param t   the result type
+ * @return    the typed unary expression
+ */
+fn cf_un(op: lexer::TokenKind, o: TExpr, t: Type) -> TExpr { te(TUnary { op = op; operand = o }, t) }
+
+/**
+ * cf_cast — a `expr to t` cast typed expression (its `.type` is the cast target).
+ *
+ * @param e  the operand expression
+ * @param t  the cast target type
+ * @return   the typed cast expression
+ */
+fn cf_cast(e: TExpr, t: Type) -> TExpr { te(TCast { expr = e }, t) }
+
+/**
+ * cf_int_is — assert `eval_const` folds `e` to an integer value whose bits equal `want`.
+ *
+ * @param e     the const expression to fold
+ * @param want  the expected two's-complement bits
+ */
+fn cf_int_is(e: TExpr, want: u128) {
+    match eval_const(e, empty_table(), empty_env()) {
+        ConstValue as v => match v.kind {
+            CVInt as ci => teko::assert::is_true(ci.bits == want)
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * cf_bool_is — assert `eval_const` folds `e` to a boolean value equal to `want`.
+ *
+ * @param e     the const expression to fold
+ * @param want  the expected boolean
+ */
+fn cf_bool_is(e: TExpr, want: bool) {
+    match eval_const(e, empty_table(), empty_env()) {
+        ConstValue as v => match v.kind {
+            CVBool as cb => teko::assert::is_true(cb.v == want)
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * cf_float_is — assert `eval_const` folds `e` to an f64 value whose IEEE bits equal `want`.
+ *
+ * @param e     the const expression to fold
+ * @param want  the expected raw IEEE bits
+ */
+fn cf_float_is(e: TExpr, want: u64) {
+    match eval_const(e, empty_table(), empty_env()) {
+        ConstValue as v => match v.kind {
+            CVFloat as cf => teko::assert::is_true(cf.bits == want && !cf.is_f32)
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * cf_is_error — assert `eval_const` rejects `e` with a located error (overflow / ÷0 /
+ * out-of-range / unsupported form).
+ *
+ * @param e  the const expression that must fail to fold
+ */
+fn cf_is_error(e: TExpr) {
+    match eval_const(e, empty_table(), empty_env()) {
+        error => teko::assert::is_true(true)
+        ConstValue => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * fold_scalar_all_ones_u64 — the §8 fold-scalar case: `~(0 to u64)` folds to the u64
+ * all-ones literal (0xFFFFFFFFFFFFFFFF), the canonical mask constant.
+ */
+#test
+fn fold_scalar_all_ones_u64() {
+    let z = cf_cast(cf_num(0 to i128, i64t()), u64t())
+    cf_int_is(cf_un(lexer::TokenKind::Tilde, z, u64t()), (~(0 to u64)) to u128)
+}
+
+/**
+ * fold_int_family_edges — the min/max edge of each VM-safe integer family folds to its
+ * exact two's-complement bits (unsigned max via `~0`, signed min/max as literals).
+ */
+#test
+fn fold_int_family_edges() {
+    cf_int_is(cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u8t()), u8t()), 255 to u128)
+    cf_int_is(cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u16t()), u16t()), 65535 to u128)
+    cf_int_is(cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u32t()), u32t()), 4294967295 to u128)
+    cf_int_is(cf_num(127 to i128, i8t()), 127 to u128)
+    cf_int_is(cf_num(-128 to i128, i8t()), 128 to u128)
+    cf_int_is(cf_num(32767 to i128, i16t()), 32767 to u128)
+    cf_int_is(cf_num(-32768 to i128, i16t()), 32768 to u128)
+    cf_int_is(cf_num(2147483647 to i128, i32t()), 2147483647 to u128)
+    cf_int_is(cf_num(-2147483648 to i128, i32t()), 2147483648 to u128)
+}
+
+/**
+ * fold_byte_and_bool_literals — a byte literal folds to its 8-bit value; a bool literal
+ * folds to a CVBool.
+ */
+#test
+fn fold_byte_and_bool_literals() {
+    cf_int_is(te(TByteLit { value = 200 to byte }, bytet()), 200 to u128)
+    cf_bool_is(te(TBoolLit { value = true }, boolt()), true)
+    cf_bool_is(te(TBoolLit { value = false }, boolt()), false)
+}
+
+/**
+ * fold_bitwise_ops — `& | ^` and `~` fold to their masked results at u8 width.
+ */
+#test
+fn fold_bitwise_ops() {
+    cf_int_is(cf_bin(lexer::TokenKind::Amp, cf_num(255 to i128, u8t()), cf_num(15 to i128, u8t()), u8t()), 15 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Pipe, cf_num(240 to i128, u8t()), cf_num(15 to i128, u8t()), u8t()), 255 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Caret, cf_num(255 to i128, u8t()), cf_num(15 to i128, u8t()), u8t()), 240 to u128)
+    cf_int_is(cf_un(lexer::TokenKind::Tilde, cf_num(15 to i128, u8t()), u8t()), 240 to u128)
+}
+
+/**
+ * fold_shift_ops — `<<`/`>>` fold with the runtime's width-masked count (an out-of-range
+ * count wraps by `count & (width - 1)`, matching `teko_rt.h`), and a signed `>>` is
+ * arithmetic (sign-preserving).
+ */
+#test
+fn fold_shift_ops() {
+    cf_int_is(cf_bin(lexer::TokenKind::Shl, cf_num(1 to i128, u32t()), cf_num(8 to i128, u32t()), u32t()), 256 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Shl, cf_num(1 to i128, u8t()), cf_num(10 to i128, u8t()), u8t()), 4 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Shr, cf_num(255 to i128, u8t()), cf_num(1 to i128, u8t()), u8t()), 127 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Shr, cf_num(-128 to i128, i8t()), cf_num(1 to i128, i8t()), i8t()), 192 to u128)
+}
+
+/**
+ * fold_arith_ok — in-range `+ - * / %` fold to the exact value at u8 width.
+ */
+#test
+fn fold_arith_ok() {
+    cf_int_is(cf_bin(lexer::TokenKind::Plus, cf_num(100 to i128, u8t()), cf_num(50 to i128, u8t()), u8t()), 150 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Minus, cf_num(50 to i128, u8t()), cf_num(20 to i128, u8t()), u8t()), 30 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Star, cf_num(12 to i128, u8t()), cf_num(20 to i128, u8t()), u8t()), 240 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Slash, cf_num(10 to i128, u8t()), cf_num(3 to i128, u8t()), u8t()), 3 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Percent, cf_num(10 to i128, u8t()), cf_num(3 to i128, u8t()), u8t()), 1 to u128)
+}
+
+/**
+ * fold_signed_divrem — signed `/` truncates toward zero and `%` takes the dividend's
+ * sign, folding to the exact two's-complement bits (`-7 / 2 == -3`, `-7 % 2 == -1`).
+ */
+#test
+fn fold_signed_divrem() {
+    cf_int_is(cf_bin(lexer::TokenKind::Slash, cf_num(-7 to i128, i8t()), cf_num(2 to i128, i8t()), i8t()), 253 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Percent, cf_num(-7 to i128, i8t()), cf_num(2 to i128, i8t()), i8t()), 255 to u128)
+    cf_int_is(cf_bin(lexer::TokenKind::Star, cf_num(-3 to i128, i8t()), cf_num(-4 to i128, i8t()), i8t()), 12 to u128)
+}
+
+/**
+ * fold_overflow_const — the §8 fold-overflow-const case and its siblings: a provably-const
+ * arithmetic result out of its type's range is a compile error, never a silent wrap
+ * (`200 + 100` as u8, `127 + 1` as i8, `0 - 1` as u8, `128 * 2` as u8).
+ */
+#test
+fn fold_overflow_const() {
+    cf_is_error(cf_bin(lexer::TokenKind::Plus, cf_num(200 to i128, u8t()), cf_num(100 to i128, u8t()), u8t()))
+    cf_is_error(cf_bin(lexer::TokenKind::Plus, cf_num(127 to i128, i8t()), cf_num(1 to i128, i8t()), i8t()))
+    cf_is_error(cf_bin(lexer::TokenKind::Minus, cf_num(0 to i128, u8t()), cf_num(1 to i128, u8t()), u8t()))
+    cf_is_error(cf_bin(lexer::TokenKind::Star, cf_num(128 to i128, u8t()), cf_num(2 to i128, u8t()), u8t()))
+}
+
+/**
+ * fold_div0_const — the §8 fold-div0-const case: a constant divide/remainder by zero,
+ * including the nested `1 / (1 - 1)` shape, is a compile error.
+ */
+#test
+fn fold_div0_const() {
+    cf_is_error(cf_bin(lexer::TokenKind::Slash, cf_num(5 to i128, u8t()), cf_num(0 to i128, u8t()), u8t()))
+    cf_is_error(cf_bin(lexer::TokenKind::Percent, cf_num(5 to i128, u8t()), cf_num(0 to i128, u8t()), u8t()))
+    let denom = cf_bin(lexer::TokenKind::Minus, cf_num(1 to i128, u64t()), cf_num(1 to i128, u64t()), u64t())
+    cf_is_error(cf_bin(lexer::TokenKind::Slash, cf_num(1 to i128, u64t()), denom, u64t()))
+}
+
+/**
+ * fold_signed_min_div_overflow — the signed `MIN / -1` overflow (its true quotient has no
+ * representation) is a compile error.
+ */
+#test
+fn fold_signed_min_div_overflow() {
+    cf_is_error(cf_bin(lexer::TokenKind::Slash, cf_num(-128 to i128, i8t()), cf_num(-1 to i128, i8t()), i8t()))
+}
+
+/**
+ * fold_cast_ok — an in-range cast folds: `255 to u8`, a `bool` to `u8` (the only
+ * `bool -> numeric` cast), and a negative `i8` sign-extended to `i16`.
+ */
+#test
+fn fold_cast_ok() {
+    cf_int_is(cf_cast(cf_num(255 to i128, u16t()), u8t()), 255 to u128)
+    cf_int_is(cf_cast(te(TBoolLit { value = true }, boolt()), u8t()), 1 to u128)
+    cf_int_is(cf_cast(cf_num(-1 to i128, i8t()), i16t()), 65535 to u128)
+}
+
+/**
+ * fold_cast_out_of_range — an out-of-range constant cast is a compile error, mirroring the
+ * runtime's trapping narrowing cast (`300 to u8`, `-1 to u8`, `128 to i8`, `-129 to i8`).
+ */
+#test
+fn fold_cast_out_of_range() {
+    cf_is_error(cf_cast(cf_num(300 to i128, i64t()), u8t()))
+    cf_is_error(cf_cast(cf_num(-1 to i128, i64t()), u8t()))
+    cf_is_error(cf_cast(cf_num(128 to i128, i64t()), i8t()))
+    cf_is_error(cf_cast(cf_num(-129 to i128, i64t()), i8t()))
+}
+
+/**
+ * fold_negate — unary `-` folds a signed value, errors on a signed MIN (no positive) and
+ * on a non-zero unsigned value (out of range), and passes `-0` on an unsigned type.
+ */
+#test
+fn fold_negate() {
+    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(127 to i128, i8t()), i8t()), 129 to u128)
+    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(0 to i128, u8t()), u8t()), 0 to u128)
+    cf_is_error(cf_un(lexer::TokenKind::Minus, cf_num(-128 to i128, i8t()), i8t()))
+    cf_is_error(cf_un(lexer::TokenKind::Minus, cf_num(5 to i128, u8t()), u8t()))
+}
+
+/**
+ * fold_float_ops — f64 literals and `+ - * /` fold through IEEE bits (byte-exact vs
+ * `teko::f64_bits`), and a float divide by zero is a compile error.
+ */
+#test
+fn fold_float_ops() {
+    cf_float_is(cf_fnum(2.5), teko::f64_bits(2.5))
+    cf_float_is(cf_bin(lexer::TokenKind::Plus, cf_fnum(1.5), cf_fnum(2.5), f64t()), teko::f64_bits(4.0))
+    cf_float_is(cf_un(lexer::TokenKind::Minus, cf_fnum(2.5), f64t()), teko::f64_bits(-2.5))
+    cf_is_error(cf_bin(lexer::TokenKind::Slash, cf_fnum(1.0), cf_fnum(0.0), f64t()))
+}
+
+/**
+ * fold_rejects_nonscalar_form — a form outside the Tier-0..2 scalar subset (a `null`
+ * literal) is a located error, not a fold.
+ */
+#test
+fn fold_rejects_nonscalar_form() {
+    cf_is_error(te(TNullLit { }, i64t()))
+}
