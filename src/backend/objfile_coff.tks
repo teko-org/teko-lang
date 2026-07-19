@@ -70,6 +70,13 @@ const COFF_TEXT_CHARACTERISTICS: u32 = 0x60500020 to u32
 const COFF_RDATA_CHARACTERISTICS: u32 = 0x40400040 to u32
 
 /**
+ * COFF_RELOC_ENTRY_SIZE — the on-disk size of one `IMAGE_RELOCATION` record
+ * (PE/COFF spec: `VirtualAddress` u32 + `SymbolTableIndex` u32 + `Type` u16 =
+ * 10 bytes, packed — no padding).
+ */
+const COFF_RELOC_ENTRY_SIZE: u32 = 10 to u32
+
+/**
  * emit_zeros_coff — append exactly `n` zero bytes to `buf` (the fixed-width
  * padding of an 8-byte COFF `Name` field: a section name or an inline symbol name
  * shorter than 8 bytes is NUL-padded to the field width). `n` is small and
@@ -407,20 +414,6 @@ type CoffReloc = struct {
 }
 
 /**
- * coff_build_relocs — resolve every neutral `RelocX86` into an `IMAGE_RELOCATION`
- * row: a rodata target (a defined section-2 local) re-points at the `.rdata`
- * section symbol (its offset is folded in-place by `coff_apply_rodata_addends`,
- * NOT into a reloc field — COFF has none); any other target (a defined function or
- * an undefined extern) takes that symbol's table index. The `VirtualAddress` is
- * the encoder's module-rebased `.text`-relative field offset, unchanged; the
- * `RelocKindX86` maps through `coff_reloc_type` (the only COFF knowledge injected).
- *
- * @param []Symbol symbols  the module's neutral symbol list (for rodata resolution)
- * @param []CoffSymbol coffsyms  the resolved COFF symbol table (for target indices)
- * @param []RelocX86 relocs  the module-rebased relocations, in emission order
- * @return []CoffReloc  the resolved relocation rows, in emission order
- */
-/**
  * CoffRelocParts — a `EncodedModuleX86`'s relocations split by patch-site section
  * (#594 T-B3): `text` (`.text`-relative fixups) and `rdata` (`.rdata`-relative
  * data→data pointers). The canonical seam, mirroring `MachoRelocParts` and ELF's
@@ -490,6 +483,20 @@ fn coff_apply_data_reloc_addends(rodata: []byte, symbols: []Symbol, relocs: []Re
     buf
 }
 
+/**
+ * coff_build_relocs — resolve every neutral `RelocX86` into an `IMAGE_RELOCATION`
+ * row: a rodata target (a defined section-2 local) re-points at the `.rdata`
+ * section symbol (its offset is folded in-place by `coff_apply_rodata_addends`,
+ * NOT into a reloc field — COFF has none); any other target (a defined function or
+ * an undefined extern) takes that symbol's table index. The `VirtualAddress` is
+ * the encoder's module-rebased `.text`-relative field offset, unchanged; the
+ * `RelocKindX86` maps through `coff_reloc_type` (the only COFF knowledge injected).
+ *
+ * @param []Symbol symbols  the module's neutral symbol list (for rodata resolution)
+ * @param []CoffSymbol coffsyms  the resolved COFF symbol table (for target indices)
+ * @param []RelocX86 relocs  the module-rebased relocations, in emission order
+ * @return []CoffReloc  the resolved relocation rows, in emission order
+ */
 fn coff_build_relocs(symbols: []Symbol, coffsyms: []CoffSymbol, relocs: []RelocX86) -> []CoffReloc {
     let secidx = coff_rodata_secsym_index(coffsyms)
     mut out: []CoffReloc = teko::list::empty()
@@ -590,9 +597,9 @@ fn compute_coff_layout(enc: EncodedModuleX86, num_symbols: u32, num_text_relocs:
     let rdata_size = enc.rodata.len to u32
     let rdata_offset = text_offset + text_size
     let reloc_offset = rdata_offset + rdata_size
-    let text_reloc_end = reloc_offset + (num_text_relocs * (10 to u32))
+    let text_reloc_end = reloc_offset + (num_text_relocs * COFF_RELOC_ENTRY_SIZE)
     let rdata_reloc_offset = text_reloc_end
-    let symtab_offset = rdata_reloc_offset + (num_rdata_relocs * (10 to u32))
+    let symtab_offset = rdata_reloc_offset + (num_rdata_relocs * COFF_RELOC_ENTRY_SIZE)
     CoffLayout {
         num_sections = num_sections
         text_size = text_size

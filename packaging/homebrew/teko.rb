@@ -14,14 +14,14 @@
 # no binary-formula caveat and no code-signing / notarization needed for this pre-alpha
 # CLI tooling.
 #
-# The tap repository is schivei/homebrew-teko; this file is its Formula/teko.rb.
+# The tap repository is teko-org/homebrew-teko; this file is its Formula/teko.rb.
 class Teko < Formula
   desc "Self-hosted compiler for the Teko programming language (transpiles to C)"
-  homepage "https://github.com/schivei/teko-lang"
+  homepage "https://github.com/teko-org/teko-lang"
   # TODO(release): the tag + URL below are PLACEHOLDERS until 0.0.1.3-bootstrap ships.
   # The release pipeline (or a manual bump at first release) rewrites both `url` and
   # `sha256` to point at the published teko-bootstrap-src.tar.gz.
-  url "https://github.com/schivei/teko-lang/releases/download/0.0.1.3-bootstrap/teko-bootstrap-src.tar.gz"
+  url "https://github.com/teko-org/teko-lang/releases/download/0.0.1.3-bootstrap/teko-bootstrap-src.tar.gz"
   # TODO(release): filled by the release pipeline / manual bump at first release.
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license any_of: ["Apache-2.0", "MIT"]

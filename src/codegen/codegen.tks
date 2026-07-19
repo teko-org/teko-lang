@@ -583,6 +583,13 @@ fn cg_is_polymorphic_base(prog: checker::TProgram, name: str) -> bool {
     }
 }
 
+/**
+ * SUBCLASS_CHAIN_DEPTH_LIMIT — defensive cap on the subclass-chain hops `cg_subclass_reaches`
+ * will walk before giving up. 64 is far deeper than any real inheritance chain; the bound only
+ * exists so a cyclic/corrupt base chain terminates instead of recursing forever.
+ */
+const SUBCLASS_CHAIN_DEPTH_LIMIT: i64 = 64
+
 // (#98) does class `sub` reach ANCESTOR class `want` through the base chain (transitively)?
 // Codegen mirror of the checker's subclass_reaches — used to decide when a class value at a
 // base-typed slot is a STRICT-subclass upcast (needs the fat-pointer wrap). Hop-bounded.
@@ -4209,7 +4216,7 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                 match value.type {
                     checker::Named as bvn => {
                         if cg_is_class_named(prog, bvn.name) {
-                            let is_strict_sub = bvn.name != ben.name && cg_subclass_reaches(prog, bvn.name, ben.name, 64)
+                            let is_strict_sub = bvn.name != ben.name && cg_subclass_reaches(prog, bvn.name, ben.name, SUBCLASS_CHAIN_DEPTH_LIMIT)
                             let is_raw_self = bvn.name == ben.name && match value.kind { checker::TStructInit => true; _ => false }
                             if is_strict_sub || is_raw_self {
                                 mut bo = cb_tysym(cb(buf, "(tk_base_"), ben.name)
@@ -8279,7 +8286,7 @@ fn cg_class_is_abstract(cd: parser::TypeDecl) -> bool {
 fn cg_pair_is_base_vtable(prog: checker::TProgram, cd: parser::TypeDecl, idd: parser::TypeDecl) -> bool {
     let idd_is_poly_base = cg_is_polymorphic_base(prog, idd.name)
     let cd_is_instantiable_self = cd.name == idd.name && !cg_class_is_abstract(cd)
-    let cd_is_a = cd_is_instantiable_self || cg_subclass_reaches(prog, cd.name, idd.name, 64)
+    let cd_is_a = cd_is_instantiable_self || cg_subclass_reaches(prog, cd.name, idd.name, SUBCLASS_CHAIN_DEPTH_LIMIT)
     idd_is_poly_base && cd_is_a
 }
 

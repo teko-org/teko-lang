@@ -79,13 +79,13 @@ jobs:
         run: ./scripts/ci_provision_teko.sh linux-x86_64
 
       - name: Build gen1 (seed compiles the PR sources)
-        run: teko . -o bin
+        run: teko . -o bin --no-verify
 
       # Run the gate on gen1 with the arena oracle armed. Any poison-touch / reuse aborts loud.
       - name: Run the gate on gen1 (TEKO_MEM_PARANOID)
         env:
           TEKO_MEM_PARANOID: '1'
-        run: ./bin/teko . -o gen2-mp
+        run: ./bin/teko . -o gen2-mp --no-verify
 
       # Widen the corpus of language constructs exercised under the oracle: native-build every
       # regressions fixture with gen1 while paranoid poisoning is armed.
@@ -98,7 +98,7 @@ jobs:
             ls "$proj"*.tkp >/dev/null 2>&1 || continue
             if [ -f "${proj}EXPECT_COMPILE_FAIL" ]; then echo "== skip ${proj} (EXPECT_COMPILE_FAIL — negative fixture, nothing to build)"; continue; fi
             echo "== teko build $proj"
-            ./bin/teko build "$proj" -o "$out/$(basename "$proj")"
+            ./bin/teko build "$proj" -o "$out/$(basename "$proj")" --no-verify
           done
 
   # ── HEAVY gate: ASan + UBSan + LSan (default computed-goto dispatch) — MAIN ONLY ─
@@ -139,7 +139,7 @@ jobs:
       - name: Build gen1 under ASan + UBSan (cc wrapper)
         run: |
           sh scripts/ci_cc_wrap.sh "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          teko . -o bin
+          teko . -o bin --no-verify
 
       # This lane runs the NATIVE gate (`./bin/teko . -o gen2-asan`): the sanitized gen1 compiles the
       # whole project through the PRODUCTION native pipeline (front-end -> emitted C -> host cc ->
@@ -170,7 +170,7 @@ jobs:
         env:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=0:quarantine_size_mb=64:malloc_context_size=5
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ./bin/teko . -o gen2-asan
+        run: ./bin/teko . -o gen2-asan --no-verify
 
       # The native gate above already ASan-covers the whole native BUILD pipeline (tk_emit_c /
       # cg_lift_program / tk_emit_tsym / run_cc) — that heavy allocation traffic through the arena is
@@ -190,7 +190,7 @@ jobs:
             ls "$proj"*.tkp >/dev/null 2>&1 || continue
             if [ -f "${proj}EXPECT_COMPILE_FAIL" ]; then echo "== skip ${proj} (EXPECT_COMPILE_FAIL — negative fixture, nothing to sanitize)"; continue; fi
             echo "== teko build $proj"
-            ./bin/teko build "$proj" -o "$out/$(basename "$proj")"
+            ./bin/teko build "$proj" -o "$out/$(basename "$proj")" --no-verify
           done
 
   # ── TSan (Thread Sanitizer): BUILD + SMOKE ────────────────────────────────────
@@ -252,7 +252,7 @@ jobs:
       - name: Build gen1 under TSan (cc wrapper)
         run: |
           sh scripts/ci_cc_wrap.sh "-fsanitize=thread -fno-omit-frame-pointer -g"
-          teko . -o bin
+          teko . -o bin --no-verify
 
       # SMOKE (not the full suite — see the BUILD + SMOKE rationale above; RESTORE the
       # full `teko test .` gate under TSan as the concurrency surface lands). Build ONE
@@ -271,7 +271,7 @@ jobs:
           out="$(mktemp -d)"
           proj="examples/regressions/exit_success_path"   # tiny; deterministically exits 5
           echo "== teko build $proj (TSan)"
-          timeout --kill-after=30s 600s ./bin/teko build "$proj" -o "$out" | tee build.log
+          timeout --kill-after=30s 600s ./bin/teko build "$proj" -o "$out" --no-verify | tee build.log
           bin="$(sed -n 's/.*: built //p' build.log | tail -n1)"
           if [ -z "$bin" ] || [ ! -x "$bin" ]; then
             echo "ERROR: could not locate the built binary from the TSan build output." >&2
@@ -324,7 +324,7 @@ jobs:
 
       - name: Build gen1 (seed compiles the PR sources)
         shell: bash
-        run: teko . -o bin
+        run: teko . -o bin --no-verify
 
       # Tests are NOT run on Windows for now (owner ruling 2026-07-14): the full `teko test .`
       # self-host on top of the ~11-min gen1 build blew the cap. Until the compiler-speed work

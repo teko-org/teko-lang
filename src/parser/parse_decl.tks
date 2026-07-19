@@ -362,12 +362,10 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
             p = m.next
         } else {
             let fdoc = peel_leading_doc(tokens, p)
-            let mc = peek_member_const(tokens, fdoc.next)
-            if mc.bad_override { return err_at(tokens, mc.kw_pos, "a `const` member may not carry `override` — `override` is method-only") }
-            if mc.is_const {
-                let cd = match parse_type_member_const(tokens, mc.kw_pos, mc.vis, fdoc.has_doc, fdoc.doc) { Parsed<ConstDecl> as x => x; error as e => return e }
-                consts = teko::list::push(consts, cd.node)
-                p = cd.next
+            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            if mcs.handled {
+                consts = mcs.consts
+                p = mcs.next
             } else {
                 if !is_name_at(tokens, fdoc.next) {
                     return err_at(tokens, fdoc.next, "expected a field name, a method (`fn …`), or a `const` member")
@@ -425,12 +423,10 @@ fn parse_class_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
             p = m.next
         } else {
             let fdoc = peel_leading_doc(tokens, p)
-            let mc = peek_member_const(tokens, fdoc.next)
-            if mc.bad_override { return err_at(tokens, mc.kw_pos, "a `const` member may not carry `override` — `override` is method-only") }
-            if mc.is_const {
-                let cd = match parse_type_member_const(tokens, mc.kw_pos, mc.vis, fdoc.has_doc, fdoc.doc) { Parsed<ConstDecl> as x => x; error as e => return e }
-                consts = teko::list::push(consts, cd.node)
-                p = cd.next
+            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            if mcs.handled {
+                consts = mcs.consts
+                p = mcs.next
             } else {
                 mut fp = fdoc.next
                 mut fvis = Visibility::Private
@@ -580,12 +576,10 @@ fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
             p = m.next
         } else {
             let fdoc = peel_leading_doc(tokens, p)
-            let mc = peek_member_const(tokens, fdoc.next)
-            if mc.bad_override { return err_at(tokens, mc.kw_pos, "a `const` member may not carry `override` — `override` is method-only") }
-            if mc.is_const {
-                let cd = match parse_type_member_const(tokens, mc.kw_pos, mc.vis, fdoc.has_doc, fdoc.doc) { Parsed<ConstDecl> as x => x; error as e => return e }
-                consts = teko::list::push(consts, cd.node)
-                p = cd.next
+            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            if mcs.handled {
+                consts = mcs.consts
+                p = mcs.next
             } else {
                 if !is_name_at(tokens, fdoc.next) {
                     return err_at(tokens, fdoc.next, "expected a field name, a method (`fn …`), or a `const` member in the trait body")
@@ -969,6 +963,45 @@ fn peek_member_const(tokens: []lexer::Token, pos: u64) -> MemberConstPeek {
         return MemberConstPeek { is_const = true; vis = vis; kw_pos = k; bad_override = false }
     }
     MemberConstPeek { is_const = false; vis = vis; kw_pos = k; bad_override = false }
+}
+
+/**
+ * MemberConstStep — the outcome of one `try_parse_member_const` attempt inside a struct/class/trait
+ * member loop (#594 crumb 7). When `handled`, the member was a `const`: `consts` is the caller's
+ * list with the parsed ConstDecl pushed and `next` is the index past its initializer. When not
+ * handled, `consts` is returned UNCHANGED and `next` echoes the position the caller passed in, so
+ * the field/method fallback resumes exactly where the peek looked.
+ *
+ * @param handled the member was a `const` and was consumed
+ * @param consts  the caller's consts list (with the new ConstDecl pushed iff handled)
+ * @param next    the index past the const's initializer (or the caller's position iff not handled)
+ */
+type MemberConstStep = struct { handled: bool; consts: []ConstDecl; next: u64 }
+
+/**
+ * try_parse_member_const — the shared member-const step every struct/class/trait member loop runs
+ * (#594 crumb 7): peek via `peek_member_const`, surface the method-only-`override` error, and, when
+ * the member IS a `const`, delegate to `parse_type_member_const` and push the result onto the
+ * caller's consts list. A non-const member leaves the cursor and the list untouched, so the caller
+ * falls back to its own field parsing unchanged.
+ *
+ * @param tokens   the token stream
+ * @param pos      the member's first token (after the leading doc was peeled)
+ * @param has_doc  whether a leading doc-comment preceded the member
+ * @param doc      the leading doc-comment's text (valid iff has_doc)
+ * @param consts   the member loop's consts list so far
+ * @return         the step outcome (handled flag, updated consts, cursor to resume at)
+ * @throws         a located error on `override const` or a malformed member const
+ * @since #594
+ */
+fn try_parse_member_const(tokens: []lexer::Token, pos: u64, has_doc: bool, doc: str, consts: []ConstDecl) -> MemberConstStep | error {
+    let mc = peek_member_const(tokens, pos)
+    if mc.bad_override { return err_at(tokens, mc.kw_pos, "a `const` member may not carry `override` — `override` is method-only") }
+    if mc.is_const {
+        let cd = match parse_type_member_const(tokens, mc.kw_pos, mc.vis, has_doc, doc) { Parsed<ConstDecl> as x => x; error as e => return e }
+        return MemberConstStep { handled = true; consts = teko::list::push(consts, cd.node); next = cd.next }
+    }
+    MemberConstStep { handled = false; consts = consts; next = pos }
 }
 
 /**

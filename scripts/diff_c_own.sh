@@ -175,7 +175,7 @@ if [[ ! -x "$teko_abs" ]]; then
     fi
     if [[ -x "$builder_abs" ]]; then
         echo "diff_c_own: $TEKO not found — self-hosting via $builder_abs build $script_dir -o bin"
-        if ! "$builder_abs" build "$script_dir" -o "$script_dir/bin" >/tmp/teko-diffcown-selfhost.log 2>&1; then
+        if ! "$builder_abs" build "$script_dir" -o "$script_dir/bin" --no-verify >/tmp/teko-diffcown-selfhost.log 2>&1; then
             echo "diff_c_own: self-host build failed — see /tmp/teko-diffcown-selfhost.log" >&2
             tail -20 /tmp/teko-diffcown-selfhost.log | sed 's/^/      | /'
             exit 2
@@ -293,7 +293,7 @@ for proj in "${fixtures[@]}"; do
     cout="$work/$name-c"
     oout="$work/$name-own"
 
-    ( unset TEKO_BACKEND; env $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$cout" ) >"$work/$name.cbuild" 2>&1
+    ( unset TEKO_BACKEND; env $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$cout" --no-verify ) >"$work/$name.cbuild" 2>&1
     if [[ $? -ne 0 ]]; then
         fail=$((fail + 1)); failed_names+=("$name")
         printf 'FAIL  %-16s C-native build failed\n' "$name"
@@ -303,7 +303,7 @@ for proj in "${fixtures[@]}"; do
     $RUN_WRAP "$cout/$name" >"$work/$name.cout" 2>&1
     c_exit=$?
 
-    env TEKO_BACKEND=native $OWN_TARGET_ENV $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$oout" >"$work/$name.obuild" 2>&1
+    env TEKO_BACKEND=native $OWN_TARGET_ENV $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$oout" --no-verify >"$work/$name.obuild" 2>&1
     own_build_rc=$?
 
     if known_stop_index_of "$name" >/dev/null; then

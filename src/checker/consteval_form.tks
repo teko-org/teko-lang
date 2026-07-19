@@ -1,0 +1,301 @@
+use teko::parser
+use teko::lexer
+
+/**
+ * Validation of a const initializer's FORM (#594 D1 grammar gate, Tiers 0-5): the shape checks
+ * `is_const_expr` recurses through, split out as a sibling of the same `checker` namespace.
+ */
+
+/**
+ * const_form_error — build a located `error` blaming a const initializer's offending form at the
+ * expression's own source position, so a rejected const reports at `file:line:col` rather than at
+ * the program root (#594 crumb 3). Wraps `teko::error::err_loc`, the same positioning the typer and
+ * the pass-1 collector use.
+ *
+ * @param msg  the human-readable reason the form is not a legal const initializer
+ * @param e    the offending typed expression (its line/col position the message)
+ * @return     the message positioned at `e`'s line/col
+ * @since #594
+ */
+fn const_form_error(msg: str, e: TExpr) -> error {
+    teko::error::err_loc(error { message = msg }, e.line, e.col)
+}
+
+/**
+ * form_name — a short human name for a typed-expression kind, used to name the offending form in a
+ * const-initializer rejection (#594 crumb 3). Every non-const-legal `TExprKind` maps to a phrase so
+ * the error message points at the exact construct the author must remove.
+ *
+ * @param k  the typed expression kind being rejected
+ * @return   a short phrase naming the kind (e.g. "a string interpolation")
+ * @since #594
+ */
+fn form_name(k: TExprKind) -> str {
+    match k {
+        TNullLit => "a `null` literal"
+        TCompare => "a comparison"
+        TIfExpr => "an `if` expression"
+        TMatchExpr => "a `match` expression"
+        TFieldAccess => "a field access"
+        TSafeFieldAccess => "an optional field access"
+        TCoalesce => "a `??` coalesce"
+        TIndex => "an index expression"
+        TInterp => "a string interpolation"
+        TInExpr => "an `in` membership test"
+        TLambda => "a closure literal"
+        _ => "this expression"
+    }
+}
+
+/**
+ * reject_form — reject a typed expression that is not a legal const initializer, naming its form
+ * (#594 crumb 3). The single exit for every `TExprKind` the const grammar (Tiers 0–5) does not
+ * admit.
+ *
+ * @param e  the offending typed expression
+ * @return   a located error naming the offending form
+ * @since #594
+ */
+fn reject_form(e: TExpr) -> error {
+    const_form_error($"{form_name(e.kind)} is not allowed in a const initializer (#594)", e)
+}
+
+/**
+ * is_const_binary_op — true iff `op` is an arithmetic/bitwise binary operator admissible in a const
+ * initializer (Tier 2): `+ - * / % & | ^ << >>` (#594 crumb 3). A comparison / logical / assignment
+ * operator is NOT admissible (a const initializer is a value, not a predicate or a side effect).
+ *
+ * @param op  the binary operator token kind
+ * @return    whether the operator may appear over const-expr operands
+ * @since #594
+ */
+fn is_const_binary_op(op: lexer::TokenKind) -> bool {
+    match op {
+        lexer::TokenKind::Plus => true
+        lexer::TokenKind::Minus => true
+        lexer::TokenKind::Star => true
+        lexer::TokenKind::Slash => true
+        lexer::TokenKind::Percent => true
+        lexer::TokenKind::Amp => true
+        lexer::TokenKind::Pipe => true
+        lexer::TokenKind::Caret => true
+        lexer::TokenKind::Shl => true
+        lexer::TokenKind::Shr => true
+        _ => false
+    }
+}
+
+/**
+ * is_const_unary_op — true iff `op` is a unary operator admissible in a const initializer (Tier 2):
+ * bitwise complement `~` or arithmetic negation `-` (#594 crumb 3). Logical `!` is not admissible
+ * (a bool predicate, not a const scalar; Teko never matches on a bool either).
+ *
+ * @param op  the unary operator token kind
+ * @return    whether the operator may appear over a const-expr operand
+ * @since #594
+ */
+fn is_const_unary_op(op: lexer::TokenKind) -> bool {
+    match op {
+        lexer::TokenKind::Tilde => true
+        lexer::TokenKind::Minus => true
+        _ => false
+    }
+}
+
+/**
+ * path_str — join a resolved callee path's segments with `::` for an error message (#594 crumb 3).
+ *
+ * @param path  the callee path to render
+ * @return      the `::`-joined path text (empty for an empty path)
+ * @since #594
+ */
+fn path_str(path: parser::Path) -> str {
+    mut out = ""
+    mut i: u64 = 0
+    loop {
+        if i >= path.segments.len { break }
+        if i > 0 { out = $"{out}::" }
+        out = $"{out}{path.segments[i].name}"
+        i++
+    }
+    out
+}
+
+/**
+ * is_const_allowlisted_callee — true iff a call to `path` is permitted inside a const initializer
+ * (Tier 5): the CLOSED set `teko::f64_from_bits`, `teko::f32_from_bits`, and the `preg` register
+ * constructor (#594 crumb 3). This is a deliberately explicit allowlist, NOT a purity analysis —
+ * the set is tiny, reversible, and documented in the DECISION_LOG; a future `const fn` marker can
+ * supersede it. Any other callee (including I/O, allocation, or an ordinary user fn) is rejected.
+ *
+ * @param path  the resolved callee path
+ * @return      whether the callee may appear in a const initializer
+ * @since #594
+ */
+fn is_const_allowlisted_callee(path: parser::Path) -> bool {
+    let n = path.segments.len
+    if n == 1 { return path.segments[0].name == "preg" }
+    if n == 2 {
+        if path.segments[0].name != "teko" { return false }
+        let last = path.segments[1].name
+        return last == "f64_from_bits" || last == "f32_from_bits"
+    }
+    false
+}
+
+/**
+ * const_var_ok — validate a bare-name reference in a const initializer (Tier 3): legal only when
+ * `v` resolves to a module-level `const` binding (#594 crumb 3). A reference to a `mut`/`let` value,
+ * a function, or an undefined name is a located error. An enum/flags MEMBER reference is a
+ * `TPathExpr`, not a `TVar`, and is handled by `is_const_expr` directly.
+ *
+ * @param v    the typed variable reference
+ * @param e    the enclosing typed expression (for the error position)
+ * @param env  the environment resolving the name to a binding
+ * @return     null when `v` names a const, else a located error
+ * @since #594
+ */
+fn const_var_ok(v: TVar, e: TExpr, env: Env) -> error? {
+    match lookup_binding(env, v.name) {
+        ValBinding as b => if b.is_const { null } else { const_form_error($"reference to '{v.name}', which is not a module-level const, in a const initializer (#594)", e) }
+        error => const_form_error($"reference to undefined name '{v.name}' in a const initializer (#594)", e)
+    }
+}
+
+/**
+ * const_unary_ok — validate a unary expression in a const initializer (Tier 2): the operator must
+ * be admissible (`~` or `-`) and the operand must itself be a const-expr (#594 crumb 3).
+ *
+ * @param u      the typed unary expression
+ * @param e      the enclosing typed expression (for the error position)
+ * @param table  the type table (forwarded to the recursive check)
+ * @param env    the environment (forwarded to the recursive check)
+ * @return       null when both the operator and operand are const, else a located error
+ * @since #594
+ */
+fn const_unary_ok(u: TUnary, e: TExpr, table: TypeTable, env: Env) -> error? {
+    if !is_const_unary_op(u.op) { return const_form_error("a non-const unary operator in a const initializer (only `~` and unary `-` are allowed) (#594)", e) }
+    is_const_expr(u.operand, table, env)
+}
+
+/**
+ * const_binary_ok — validate a binary expression in a const initializer (Tier 2): the operator must
+ * be admissible (`+ - * / % & | ^ << >>`) and BOTH operands must themselves be const-exprs (#594
+ * crumb 3).
+ *
+ * @param b      the typed binary expression
+ * @param e      the enclosing typed expression (for the error position)
+ * @param table  the type table (forwarded to the recursive checks)
+ * @param env    the environment (forwarded to the recursive checks)
+ * @return       null when the operator and both operands are const, else a located error
+ * @since #594
+ */
+fn const_binary_ok(b: TBinary, e: TExpr, table: TypeTable, env: Env) -> error? {
+    if !is_const_binary_op(b.op) { return const_form_error("a non-const binary operator in a const initializer (only `+ - * / % & | ^ << >>` are allowed) (#594)", e) }
+    match is_const_expr(b.left, table, env) { error as x => return x; null => { } }
+    is_const_expr(b.right, table, env)
+}
+
+/**
+ * const_exprs_ok — validate that every expression in `xs` is a const-expr, returning the first
+ * located error or null when all are const (#594 crumb 3). Shared by the aggregate (Tier 4) and
+ * allowlisted-call (Tier 5) arms.
+ *
+ * @param xs     the typed sub-expressions to validate in order
+ * @param table  the type table (forwarded to each recursive check)
+ * @param env    the environment (forwarded to each recursive check)
+ * @return       null when every element is const, else the first located error
+ * @since #594
+ */
+fn const_exprs_ok(xs: []TExpr, table: TypeTable, env: Env) -> error? {
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        match is_const_expr(xs[i], table, env) { error as x => return x; null => { } }
+        i++
+    }
+    null
+}
+
+/**
+ * const_array_ok — validate an array/slice literal in a const initializer (Tier 4): every element
+ * (including a spread's sub-slice) must itself be a const-expr (#594 crumb 3).
+ *
+ * @param a      the typed array literal
+ * @param table  the type table (forwarded to each element check)
+ * @param env    the environment (forwarded to each element check)
+ * @return       null when every element is const, else the first located error
+ * @since #594
+ */
+fn const_array_ok(a: TArrayLit, table: TypeTable, env: Env) -> error? {
+    mut vals: []TExpr = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        vals = teko::list::push(vals, a.elements[i].expr)
+        i++
+    }
+    const_exprs_ok(vals, table, env)
+}
+
+/**
+ * const_call_ok — validate a call in a const initializer (Tier 5): the callee must be on the closed
+ * pure-constructor allowlist (`is_const_allowlisted_callee`) and every argument must itself be a
+ * const-expr (#594 crumb 3). Any non-allowlisted call (an ordinary fn, an I/O routine, an
+ * allocation) is a located error.
+ *
+ * @param c      the typed call expression
+ * @param e      the enclosing typed expression (for the error position)
+ * @param table  the type table (forwarded to each argument check)
+ * @param env    the environment (forwarded to each argument check)
+ * @return       null when the callee is allowlisted and every argument is const, else a located error
+ * @since #594
+ */
+fn const_call_ok(c: TCall, e: TExpr, table: TypeTable, env: Env) -> error? {
+    if !is_const_allowlisted_callee(c.callee) { return const_form_error($"call to '{path_str(c.callee)}' is not an allowlisted const constructor (#594)", e) }
+    const_exprs_ok(c.args, table, env)
+}
+
+/**
+ * is_const_expr — the D1 grammar gate: return null iff `e` is a legal const initializer (Tiers 0–5),
+ * else a located error naming the offending form (#594 crumb 3). Recurses structurally over the
+ * typed expression:
+ *
+ * - Tier 0 (literal): int / float / bool / byte / char / string literal.
+ * - Tier 1 (cast): `<const-expr> to T`.
+ * - Tier 2 (unary / binary / bitwise over const-exprs): `~`, unary `-`, and
+ *   `+ - * / % & | ^ << >>` with const-expr operands.
+ * - Tier 3 (reference): a bare name resolving to a module-level const, or an enum/flags member.
+ * - Tier 4 (aggregate literal): an array/slice or a struct/variant literal, every component const.
+ * - Tier 5 (allowlisted pure constructor): a call whose callee is on the closed allowlist
+ *   (`is_const_allowlisted_callee`), every argument const.
+ *
+ * A call to any other callee, a reference to a `mut`/`let`/function value, and any I/O or
+ * control-flow form is a type error with a located message. This gate does NOT fold numerically —
+ * the backend computes `~(0 to u64)` exactly as the migrated nullary fn did; the gate only decides
+ * legality.
+ *
+ * @param e      the typed initializer expression
+ * @param table  the type table (forwarded to each recursive check)
+ * @param env    the environment resolving a referenced name to a const/enum/flags binding
+ * @return       null when `e` is a legal const initializer, else a located error
+ * @since #594
+ */
+fn is_const_expr(e: TExpr, table: TypeTable, env: Env) -> error? {
+    match e.kind {
+        TNumber => null
+        TStrLit => null
+        TByteLit => null
+        TCharLit => null
+        TBoolLit => null
+        TPathExpr => null
+        TCast as c => is_const_expr(c.expr, table, env)
+        TUnary as u => const_unary_ok(u, e, table, env)
+        TBinary as b => const_binary_ok(b, e, table, env)
+        TVar as v => const_var_ok(v, e, env)
+        TArrayLit as a => const_array_ok(a, table, env)
+        TStructInit as s => const_exprs_ok(s.field_vals, table, env)
+        TCall as c => const_call_ok(c, e, table, env)
+        _ => reject_form(e)
+    }
+}
