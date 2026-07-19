@@ -26,6 +26,7 @@ downstream é cravado além do que AL1 provar/dimensionar.
 | # | Crumb | Sub-onda | Tamanho | Behavior | Ritual |
 |---|---|---|---|---|---|
 | **AL1** | Prova: instrumentação discriminante + censo (push-sites, let-mutantes, níveis) | proof | M | preserva (obs off = zero custo) | fixpoint + probe RODA em self-build, relatório máquina-legível + blast-radius medido |
+| **AL0** | **Const-ificação: build-and-return const → `const X=[...]` em rodata, ZERO construção** | MIGRAÇÃO (early, paralelo) | M (sem máquina nova) | muda C do compilador (runtime→rodata) | fixpoint por sub-lote + probe: copy-grow do site → 0 |
 | **F1** | **Borrow mutável seguro `&x`** (superfície do `ref`/spine já legislados) | FUNDAÇÃO | L | preserva alvo; muda C do próprio compilador | fixpoint verde; spine `is_unique_at` autoriza |
 | **F2** | `let` imutável PROFUNDO (aperto: sem index-write/grow de `let`) | FUNDAÇÃO | S/M | preserva (só 7 index-write hoje) | fixpoint + gate rejeita `grow(&let_x)` |
 | **F3** | Array/slice Model A: `[N]T` = `{ptr,len,cap}`, sem zero-fill, growable | FUNDAÇÃO | L | preserva alvo; muda rep interno | fixpoint + probe: cap-hits, zero MISS em tamanho conhecido |
@@ -35,8 +36,12 @@ downstream é cravado além do que AL1 provar/dimensionar.
 | **AL5** | Region-per-phase (arena por fase; dona da região onde `[N]T` soft aloca) | throughput | M/L | preserva | probe: reclaim-ratio ↑, RSS ↓, zero regressão |
 | **AL6** | Migração de fonte por nível: `mut []T=[]`+push / `[N]T` / `[...]` / `const` | MIGRAÇÃO | M mecânico (grande) | preserva alvo; muda C do compilador | fixpoint por sub-lote via PONTE de coexistência + probe |
 
-**Ordem:** AL1 → [F1 → F2 → F3] → AL2 → AL3 → AL4 → AL5 → AL6. A FUNDAÇÃO é pré-requisito
-do ref-push; AL6 migra os ~1383 push-sites para a cura, gradual pela ponte.
+**Ordem:** AL1 → **AL0 (const-ificação, EARLY, em PARALELO à fundação)** → [F1 → F2 → F3] →
+AL2 → AL3 → AL4 → AL5 → AL6. AL0 é o topo do espectro de migração (§8) mas roda cedo e em
+paralelo porque **não precisa de máquina nova** (literais + `const` T-B6 já no seed) e é o
+**provável maior speedup, mais barato** — a "dor real" do owner: eliminar o push que constrói
+constante em runtime. A FUNDAÇÃO é pré-requisito do ref-push; AL6 migra o resto dos ~1383
+push-sites, gradual pela ponte.
 
 **A hipótese-âncora (confirmada em file:line, §2) e A CURA.** O `push` do runtime já é
 amortizado; a doença é que `[]byte`/`[]T` é um valor `{ptr,len}` **sem `cap`**, então o
@@ -107,14 +112,16 @@ str-builder, mesmo modelo alvo `str`). AL1 RANKEIA; AL3 só ratifica se a favori
 ### 3.3 Censo (input do blast radius — AL1 CONTA, o owner VÊ o custo antes de implementar)
 
 AL1 emite, de um passo sobre a AST/TAST:
-1. **push-sites**: nº de `list::push`/`push_fo` e quantos na forma value-thread
-   `x = push(x, …)` (medido hoje: **~1383 sites, ~789 value-thread**, §7).
+1. **push-sites classificados pelos 4 níveis (§8)** — o **número-MANCHETE da prova é a
+   categoria "constante disfarçada"**: funções build-and-return const-ificáveis (AL0), a dor
+   real do owner. Depois: itens-conhecidos (→literal `[a,b,c]`), tamanho-conhecido (→`[N]T`),
+   genuinamente dinâmico (→ref-push). Total medido hoje: **~1383 push-sites, ~789
+   value-thread** (§7); AL1 quebra esse total por nível.
 2. **let-mutantes**: nº de `let` cujo conteúdo é mutado (index-write/grow) — o blast de F2
    (medido hoje: **apenas 7 index-writes** no compilador inteiro, §7).
-3. **níveis de conhecimento por site** (para AL6): tamanho conhecível estaticamente
-   (→`[N]T`) vs itens conhecíveis (→`[...]`/`const`) vs dinâmico (→ref-push).
-4. cruzar 1–3 com a atribuição RA1 do dump (`teko_rt.c:1089`) → quanto de custo cada
-   nível/site colhe (sweep-first onde AL1 atribui mais custo).
+3. cruzar 1–2 com a atribuição RA1 do dump (`teko_rt.c:1089`) → quanto de custo cada
+   nível/site colhe (sweep-first onde AL1 atribui mais custo; a fatia "constante disfarçada"
+   dita a prioridade de AL0).
 
 ### 3.4 Scaffolding que COMPILA HOJE (design-ahead) — contadores + dump de fase
 
@@ -305,7 +312,7 @@ teste identicamente antes e depois). Marcação por crumb:
   byte-idêntico): F1, F3, AL3, AL6 (níveis push/`[N]T`). Prova: golden do corpus-alvo + diff
   VM==native + fixpoint.
 - **Preserva tudo**: AL1, AL2, F2 (≤7 sites), AL4, AL5.
-- **Muda-bytes-com-justificativa-medida**: AL6 nível `const` (runtime→rodata) — probe: o
+- **Muda-bytes-com-justificativa-medida**: **AL0** const-ificação (runtime→rodata) — probe: o
   copy-grow daquele site → 0 no dump RA1.
 
 ---
@@ -328,22 +335,52 @@ o peso de custo por site.
 
 ---
 
-## 8. Sub-onda MIGRAÇÃO — AL6, por nível de conhecimento (M mecânico, grande)
+## 8. Migração de fonte por nível de conhecimento — AL0 (const, o topo) + AL6 (resto)
 
-| Nível | Conhecimento | Sintaxe | O que morre |
-|---|---|---|---|
-| dinâmico | nada (loop runtime, tamanho desconhecido) | `mut []T = []` + `push(&x, v)` | a CÓPIA (ref-push, cap no objeto) |
-| tamanho | sei o tamanho, não os itens | `mut [N]T = []` + índice/push | os copy-grows (cap=N semeado, zero MISS) |
-| itens | valores fixos | `[t1, t2, t3]` | a construção (um malloc dimensionado, `codegen.tks:2865-2887`) |
-| const | itens const-expr | `const X = [...]` | TUDO (rodata, zero construção — T-B6) |
+O owner: **o maior ganho NÃO é otimizar push — é ELIMINAR o push que constrói uma constante
+em runtime.** Por isso a const-ificação (AL0) é crumb de PRIMEIRA CLASSE e EARLY, não o rabo
+do AL6. Espectro de 4 níveis, do topo (mais ganho, mais barato) pra baixo:
 
-**Convenção W15 (a ratificar junto):** "sei o TAMANHO → `[N]T`; sei os ITENS → `[...]`;
-const → `const`; só o dinâmico usa `push(&x)`."
+| Nível | Conhecimento | Crumb | Sintaxe | O que morre |
+|---|---|---|---|---|
+| **const** | build-and-return const (nullary/args const, sem arg de runtime) | **AL0** | `const X = [...]` | **TUDO — rodata, construída ZERO vezes** (T-B6, já no seed) |
+| itens | valores fixos, não-const | AL6 | `[t1, t2, t3]` | a construção (um malloc dimensionado, `codegen.tks:2865-2887`) |
+| tamanho | sei o tamanho, não os itens | AL6 | `mut [N]T = []` + índice/push | os copy-grows (cap=N semeado, zero MISS) |
+| dinâmico | nada (loop runtime, tamanho desconhecido) | AL6 | `mut []T = []` + `push(&x, v)` | a CÓPIA (ref-push, cap no objeto) |
 
-Sequência: níveis itens/const já estão no seed → sweep em paralelo à FUNDAÇÃO. Níveis
-dinâmico/tamanho dependem de F1+F3+AL3 → entram DEPOIS. Cada sub-lote: fixpoint via ponte +
-probe (o site migrado some do dump RA1), sweep-first onde AL1 atribui mais custo. Estilo dos
-crumbs "byte-idêntico" S1–S4 de #594.
+### 8.1 AL0 — const-ificação (a dor real do owner). PRIMEIRA CLASSE, EARLY, PARALELO.
+
+**Padrão-alvo:** uma função que só CONSTRÓI-E-RETORNA um array fixo — nullary, ou com args
+const, resultado compile-time-constante, **sem depender de nenhum arg de runtime** — vira
+`const X = [...]` em rodata, **construída ZERO vezes** no processo. É o padrão das tabelas de
+ABI/opcode já migradas (backend `abi_*`/`encode_*`/`isel_*`); o owner afirma que **HÁ MUITO
+MAIS** escondido como "constante disfarçada" (build-and-return em `empty()+push`).
+
+- **Sem máquina nova**: literais + `const` agregada já funcionam no seed (T-B6). Por isso AL0
+  roda EM PARALELO à FUNDAÇÃO e ao AL1 — não espera F1/F3/AL3. **Provável MAIOR speedup, mais
+  barato.**
+- **Chamador que muta (owner-confirmado):** a const FICA. Quem precisa mutar faz `mut c =
+  CONSTANTE` — cópia eager da const pro `mut` (semântica de valor que JÁ existe) — e cresce
+  com `push(&c,…)`/`grow(&c,…)`. **Leitor comum referencia a const DIRETO (zero cópia); só
+  quem muta paga uma cópia**, uma vez, na materialização do `mut`.
+- **Produtor PARAMETRIZADO** (arg de runtime muda o array) → **CONTINUA função**, com literais
+  internos (`[a,b,c]` em vez de `empty()+push`). NÃO vira const única. AL0 NÃO toca esses — vão
+  para o nível "itens" do AL6.
+- Behavior: MUDA o C do compilador (construção em runtime → imagem em rodata) — justificado
+  pelo ganho MEDIDO (o copy-grow daquele site → 0 no dump RA1 de AL1). Ritual: fixpoint por
+  sub-lote + probe.
+
+### 8.2 AL6 — o resto (itens/tamanho/dinâmico)
+
+`empty()+push` de itens fixos não-const → literal `[a,b,c]` (rewrite simples, um malloc).
+Tamanho conhecido → `[N]T` (F3). Dinâmico → `push(&x)` (AL3). Níveis itens correm em paralelo
+à FUNDAÇÃO (literais já no seed); tamanho/dinâmico dependem de F1+F3+AL3 → entram DEPOIS.
+
+**Convenção W15 (a ratificar junto):** "const disfarçada → `const X=[...]`; sei os ITENS →
+`[...]`; sei o TAMANHO → `[N]T`; só o genuinamente dinâmico usa `push(&x)`."
+
+Cada sub-lote (AL0 e AL6): fixpoint via ponte + probe (o site migrado some do dump RA1),
+sweep-first onde AL1 atribui mais custo. Estilo dos crumbs "byte-idêntico" S1–S4 de #594.
 
 ---
 
@@ -388,8 +425,25 @@ baseline de AL1 como régua.
 ## 11. Sequência (inegociável)
 
 **AL1 (prova) SEMPRE primeiro — nenhum fix antes dos números (incl. o censo de blast
-radius).** Depois a FUNDAÇÃO (F1 borrow-seguro → F2 `let`-profundo → F3 `[N]T` cap/len), que
+radius, cujo número-manchete é a fatia "constante disfarçada").** **AL0 (const-ificação)
+arranca CEDO, em paralelo à FUNDAÇÃO** — não precisa de máquina nova e é o provável maior
+ganho. Depois a FUNDAÇÃO (F1 borrow-seguro → F2 `let`-profundo → F3 `[N]T` cap/len), que
 habilita o ref-push; depois THROUGHPUT (AL2 paliativo opcional → AL3 cura → AL4 writers → AL5
 lifetime); por fim MIGRAÇÃO (AL6, gradual pela ponte). Cada crumb: fixpoint + probe de tempo
-como ritual, baseline de AL1 como régua. Níveis itens/const de AL6 podem correr em paralelo à
+como ritual, baseline de AL1 como régua. AL0 e o nível itens de AL6 correm em paralelo à
 FUNDAÇÃO (não dependem do rep novo).
+
+---
+
+## 12. PROSPECÇÃO / exploração futura (PARKADO — NÃO nesta onda, NÃO nos crumbs)
+
+Registro para não perder, SEM design aqui. O owner PARKOU a questão da superfície de
+referência ("atacar em outra frente e refinar melhor"). Nesta onda, **F1 fica com `&x`
+(grafia A, dessugar para a `Reference` existente) e a superfície `ref`/`Reference`
+INALTERADA.**
+
+Ideia parkada: **unificar a superfície de referência nos sigils `&`/`*`** — ex. `mut *x: T`
+≡ `mut x: Reference<T>`, potencialmente aposentando o keyword `ref` e tirando `Ref<T>` da
+superfície. Relacionado ao "repensar `Ref<T>`" que o owner tem parado. **Toca a lei "sigils
+unsafe-only"** (hoje `*`/deref é território unsafe), então **pede design próprio, tipo
+keystone, DEPOIS da AL** — não é avaliado, não é quantificado, não mexe na lei nesta onda.
