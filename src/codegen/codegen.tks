@@ -4065,11 +4065,215 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
     return cb(o, "; })")
 }
 
-// cg_type_mangle_eq — do two resolved types mangle to the SAME generated C type name (→ same
-// C struct/typedef)? Renders both via the optional-mangle to scratch strings and compares.
-// (C: `cg_type_mangle_eq`.)
-fn cg_type_mangle_eq(a: checker::Type, c: checker::Type) -> bool {
-    cg_opt_key(a) == cg_opt_key(c)
+/**
+ * Report whether two resolved types produce the SAME generated C type name — the byte-free twin
+ * of the retired `cg_type_mangle_eq`, which built two throwaway mangle strings only to compare
+ * them (AL4a-2, following the `qualify_eq` precedent). It decides `mangle(a) == mangle(b)`
+ * byte-for-byte WITHOUT allocating, mirroring `cg_opt_mangle`/`cg_opt_key` exactly: a type whose
+ * mangle would error (an inline `Variant`, a `Void`-inner optional/slice, an unsupported shape)
+ * has the empty key `""`, so two such types compare equal and an erroring type never equals a
+ * well-formed one. This is MANGLE-equality, NOT `type_eq`: two DISTINCT types can share a C name
+ * (the #109 bare-last-segment case — `teko::io::Reader` and `teko::emit::Reader` both mangle to
+ * `Reader`), and this predicate returns true for them exactly as the string compare did.
+ *
+ * @param a  the first resolved type
+ * @param b  the second resolved type
+ * @return   true iff the two types mangle to the identical C type name
+ */
+fn cg_mangle_eq(a: checker::Type, b: checker::Type) -> bool {
+    let ea = cg_mangle_errors(a)
+    let eb = cg_mangle_errors(b)
+    if ea || eb { return ea && eb }
+    cg_mangle_bytes_eq(a, b)
+}
+
+/**
+ * Report whether a type's mangle would ERROR (making its `cg_opt_key` the empty string `""`),
+ * mirroring the error arms of `cg_opt_mangle` precisely: an inline `Variant` and any unsupported
+ * shape error, and an `Optional`/`Slice` errors when its inner/element is the `Void` sentinel or
+ * itself errors. Every leaf (`Prim`, `Byte`, `Char`, `Str`, `Error`, `Named`) mangles cleanly.
+ *
+ * @param t  the resolved type
+ * @return   true iff `cg_opt_mangle` would return an error for `t`
+ */
+fn cg_mangle_errors(t: checker::Type) -> bool {
+    match t {
+        checker::Prim => false
+        checker::Byte => false
+        checker::Char => false
+        checker::Str => false
+        checker::Error => false
+        checker::Named => false
+        checker::Optional as o => match o.inner {
+            checker::Void => true
+            _ => cg_mangle_errors(o.inner)
+        }
+        checker::Slice as sl => match sl.element {
+            checker::Void => true
+            _ => cg_mangle_errors(sl.element)
+        }
+        _ => true
+    }
+}
+
+/**
+ * Compare the mangles of two types already known to mangle cleanly, byte-for-byte and without
+ * allocating. `Optional` prepends `opt_`, `Slice` prepends `slice_`, and each recurses; a `Named`
+ * mangles to its bare last path segment; every other leaf mangles to a fixed literal. Because a
+ * `Named`'s arbitrary segment text can coincide with a composite's rendered form (`Named "opt_str"`
+ * and `str?` both yield `opt_str`), any comparison that touches a `Named` is routed through
+ * `cg_mangle_type_matches_name`, which folds the other side's WHOLE mangle against the segment
+ * bytes — giving true byte-identity with the old string compare, not a mere constructor match.
+ *
+ * @param a  the first resolved type (mangles cleanly)
+ * @param b  the second resolved type (mangles cleanly)
+ * @return   true iff `mangle(a)` equals `mangle(b)` byte-for-byte
+ */
+fn cg_mangle_bytes_eq(a: checker::Type, b: checker::Type) -> bool {
+    match a {
+        checker::Named as na => cg_mangle_type_matches_name(b, na.name)
+        checker::Optional as oa => match b {
+            checker::Named as nb => cg_mangle_type_matches_name(a, nb.name)
+            checker::Optional as ob => cg_mangle_bytes_eq(oa.inner, ob.inner)
+            _ => false
+        }
+        checker::Slice as sa => match b {
+            checker::Named as nb => cg_mangle_type_matches_name(a, nb.name)
+            checker::Slice as sb => cg_mangle_bytes_eq(sa.element, sb.element)
+            _ => false
+        }
+        _ => match b {
+            checker::Named as nb => cg_mangle_type_matches_name(a, nb.name)
+            checker::Optional => false
+            checker::Slice => false
+            _ => cg_leaf_literal_eq(a, b)
+        }
+    }
+}
+
+/**
+ * Compare two FIXED leaf types (`Prim`, `Byte`, `Char`, `Str`, `Error`) by their mangle literal.
+ * These literals are compile-time constants (no allocation) and never error, so the `str`
+ * comparison is a pure byte compare of two literals.
+ *
+ * @param a  the first fixed-leaf type
+ * @param b  the second fixed-leaf type
+ * @return   true iff both mangle to the same fixed literal
+ */
+fn cg_leaf_literal_eq(a: checker::Type, b: checker::Type) -> bool {
+    match cg_opt_mangle_str(a) {
+        str as sa => match cg_opt_mangle_str(b) { str as sb => sa == sb; error => false }
+        error => false
+    }
+}
+
+/**
+ * Report whether a cleanly-mangling type's full mangle equals the bare last segment of `name`,
+ * byte-for-byte and allocation-free. Walks `t` while advancing a cursor over `name`'s last
+ * `::`-segment: a match holds exactly when the walk consumes the segment to its end and no further.
+ *
+ * @param t     the resolved type whose mangle is folded against the segment
+ * @param name  the (possibly canonical) name whose bare last segment is the target text
+ * @return      true iff `mangle(t)` equals `name`'s last segment byte-for-byte
+ */
+fn cg_mangle_type_matches_name(t: checker::Type, name: str) -> bool {
+    let start = cg_name_last_segment_offset(name)
+    let end = cg_mangle_consume(t, name, start)
+    end >= 0 && (end to u64) == name.len
+}
+
+/**
+ * Advance an allocation-free cursor over `name` by matching the mangle of `t` against the bytes at
+ * `off`, returning the new offset or `-1` on any mismatch/overrun. `Optional` consumes `opt_` then
+ * recurses on its inner; `Slice` consumes `slice_` then recurses on its element; a `Named` matches
+ * its own bare last segment; every fixed leaf matches its literal. Mirrors the exact byte sequence
+ * `cg_opt_mangle` would emit.
+ *
+ * @param t     the cleanly-mangling type to consume
+ * @param name  the byte source the cursor walks
+ * @param off   the current cursor offset into `name`
+ * @return      the offset just past `mangle(t)`, or `-1` on mismatch
+ */
+fn cg_mangle_consume(t: checker::Type, name: str, off: u64) -> i64 {
+    match t {
+        checker::Optional as o => {
+            let o2 = cg_match_literal(name, off, "opt_")
+            if o2 < 0 { -1 } else { cg_mangle_consume(o.inner, name, o2 to u64) }
+        }
+        checker::Slice as sl => {
+            let o2 = cg_match_literal(name, off, "slice_")
+            if o2 < 0 { -1 } else { cg_mangle_consume(sl.element, name, o2 to u64) }
+        }
+        checker::Named as nm => cg_match_segment(name, off, nm.name)
+        _ => match cg_opt_mangle_str(t) {
+            str as lit => cg_match_literal(name, off, lit)
+            error => -1
+        }
+    }
+}
+
+/**
+ * Match the literal `lit` against `name` starting at `off`, returning `off + lit.len` on an exact
+ * byte match or `-1` on mismatch/overrun. Allocation-free.
+ *
+ * @param name  the byte source
+ * @param off   the cursor offset to match at
+ * @param lit   the literal expected at `off`
+ * @return      the offset just past `lit`, or `-1` if it does not match there
+ */
+fn cg_match_literal(name: str, off: u64, lit: str) -> i64 {
+    if off + lit.len > name.len { return -1 }
+    mut i: u64 = 0
+    loop {
+        if i >= lit.len { break }
+        if name[off + i] != lit[i] { return -1 }
+        i++
+    }
+    (off + lit.len) to i64
+}
+
+/**
+ * Match the bare last segment of `other` against `name` starting at `off`, returning the offset
+ * just past it on an exact byte match or `-1` otherwise. The `Named`-leaf twin of
+ * `cg_match_literal`: it compares the segment in place (from `other`'s last-segment offset)
+ * without materializing it.
+ *
+ * @param name   the byte source the cursor walks
+ * @param off    the cursor offset to match at
+ * @param other  the name whose bare last segment is the expected text
+ * @return       the offset just past the segment, or `-1` if it does not match there
+ */
+fn cg_match_segment(name: str, off: u64, other: str) -> i64 {
+    let s = cg_name_last_segment_offset(other)
+    let seglen = other.len - s
+    if off + seglen > name.len { return -1 }
+    mut i: u64 = 0
+    loop {
+        if i >= seglen { break }
+        if name[off + i] != other[s + i] { return -1 }
+        i++
+    }
+    (off + seglen) to i64
+}
+
+/**
+ * The byte offset at which `name`'s bare last `::`-segment begins — `0` for a bare name,
+ * `<last "::"> + 2` for a canonical `ns::Name`. The allocation-free offset form of
+ * `checker::name_last_segment` (which copies the segment out); mirrors its `::`-scan exactly so
+ * the two agree byte-for-byte.
+ *
+ * @param name  the (possibly canonical) name to scan
+ * @return      the offset where the bare last segment starts
+ */
+fn cg_name_last_segment_offset(name: str) -> u64 {
+    mut last_sep: i64 = -1
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= name.len { break }
+        if name[i] == b':' && name[i + 1] == b':' { last_sep = i to i64 }
+        i++
+    }
+    if last_sep < 0 { 0 } else { (last_sep to u64) + 2 }
 }
 
 // emit_as — emit `value` into a slot whose EXPECTED type is `expected`. When `expected` is
@@ -4164,7 +4368,7 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                     let concrete_diff = match value.type {
                         checker::Slice as svt => match svt.element {
                             checker::Void => false   // sentinel handled above
-                            _ => !cg_type_mangle_eq(sexp.element, svt.element)
+                            _ => !cg_mangle_eq(sexp.element, svt.element)
                         }
                         _ => false
                     }
@@ -4283,7 +4487,7 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
     // AND each arm's trailing value wraps into it (case → wider variant, via emit_stmt_value/
     // emit_arm_value → emit_as_r). Guarded on EVERY narrow member reaching `expected` (a true widen).
     let vt_is_variant = match value.type { checker::Variant => true; checker::Named as vn => cg_named_is_variant(prog, vn.name); _ => false }
-    if vt_is_variant && !cg_type_mangle_eq(value.type, expected) && cg_narrow_variant_widens_into(prog, value.type, expected) {
+    if vt_is_variant && !cg_mangle_eq(value.type, expected) && cg_narrow_variant_widens_into(prog, value.type, expected) {
         let widened = checker::TExpr { kind = value.kind; type = expected; line = value.line; col = value.col }
         match value.kind {
             checker::TIfExpr as f => return emit_if_value(buf, prog, ret_type, widened, f, escaping, regions, fn_body, dctx)
