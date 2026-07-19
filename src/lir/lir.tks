@@ -174,6 +174,55 @@ pub fn data_reloc(offset: u32, target: str) -> LDataReloc {
     by `LGlobalAddr` (A1-4, #382). */
 pub type LRodata = struct { symbol: str; bytes: []byte; relocs: []LDataReloc }
 
+/**
+ * ConstImage — the complete rodata materialization of ONE aggregate const (#594 T-B6): the bytes of
+ * the main blob, its internal pointer relocations (one per slice/pointer field, empty for a Tier-A
+ * flat aggregate), and the LEAF rodata entries its pointer slots reference (one target array per
+ * slice field; empty for Tier-A). A Tier-A aggregate (crumb 6) returns empty `relocs`/`leaves` and is
+ * byte-identical to the previous path; a Tier-B aggregate (an ABI descriptor) returns one reloc + one
+ * leaf per slice field.
+ *
+ * @since #594 T-B6
+ */
+pub type ConstImage = struct {
+    /**
+     * bytes — the main blob's bytes (pointer slots zero-init, `len`/scalars inline).
+     */
+    bytes: []byte
+    /**
+     * relocs — the blob's internal relocations (a pointer slot's byte offset -> the leaf's symbol).
+     */
+    relocs: []LDataReloc
+    /**
+     * leaves — the target arrays' rodata entries, to intern BEFORE the main blob.
+     */
+    leaves: []LRodata
+}
+
+/**
+ * FatFieldImage — the 16-byte image of one fat field (`[]T`/`str`) of an aggregate const, plus the
+ * relocation and leaf its pointer slot needs (#594 T-B6): the slot bytes (8 zero + the element count
+ * inline), the `LDataReloc` for the pointer slot, and the `LRodata` leaf of the target array. The
+ * producer writes `slot_bytes` at the field's blob offset and accumulates `reloc`/`leaf` into the
+ * owning `ConstImage`.
+ *
+ * @since #594 T-B6
+ */
+pub type FatFieldImage = struct {
+    /**
+     * slot_bytes — the field's 16-byte image (8 zero pointer bytes + the element count as 8 LE bytes).
+     */
+    slot_bytes: []byte
+    /**
+     * reloc — the pointer slot's relocation (offset within the blob -> the leaf symbol).
+     */
+    reloc: LDataReloc
+    /**
+     * leaf — the target array's rodata entry (its own symbol + flat-scalar bytes, empty relocs).
+     */
+    leaf: LRodata
+}
+
 /** LGlobal — one mutable/immutable top-level datum: its symbol, machine class, and
     initializer image. No A1-4 lowering produces one yet (top-level consts are a later
     construct); the field exists now so `LModule` widens only once (A1-4, #382). */

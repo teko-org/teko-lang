@@ -3771,8 +3771,39 @@ pub fn lower_fat_expr(ctx: LowerCtx, e: checker::TExpr) -> LoweredFat | error {
         checker::TStrLit as s => lower_str_lit_fat(ctx, e, s)
         checker::TArrayLit as al => lower_array_lit_fat(ctx, e, al)
         checker::TVar as v => lower_var_fat(ctx, e, v)
+        checker::TFieldAccess as fa => lower_fat_field(ctx, fa)
         _ => error { message = teko::str::concat("native backend N1: fat-pointer receiver `", texpr_kind_name(e), "` not yet lowered (N2)") }
     }
+}
+
+/**
+ * lower_fat_field — the (ptr, len) pair of a `[]T`/`str` field of a struct receiver (#594 T-B6): lower
+ * the receiver to its base address, then read ptr = `LLoad(LFieldAddr(base, fieldoff))` (the `Ptr`
+ * class; in a rodata const the slot was relocated to the target array by T-B5/the writers) and len =
+ * `LLoad(LFieldAddr(base, fieldoff + POINTER_SIZE))` (`I64`, the inline element count). Matches the
+ * 16-byte fat-field layout (`layout_of_fields` via `field_layout_size`): ptr@fieldoff, len@fieldoff+8.
+ * This is the arm that lets both engines read an ABI-descriptor const's slice field (the C backend
+ * uses its own `.ptr`/`.len`).
+ *
+ * @param ctx  the lowering context
+ * @param fa   the field access (a struct receiver + a fat field name)
+ * @return     the (ptr, len) fat pair
+ * @throws     when the receiver is not a struct with a registered layout, or the field is unknown
+ * @since #594 T-B6
+ */
+fn lower_fat_field(ctx: LowerCtx, fa: checker::TFieldAccess) -> LoweredFat | error {
+    let ro = match lower_expr(ctx, fa.receiver) { Lowered as x => x; error as e => return e }
+    let name = match named_type_name(fa.receiver.type) { str as s => s; error as e => return e }
+    let layout = match find_struct_layout(ro.ctx.layouts, name) { LStructLayout as l => l; error as e => return e }
+    let off = match field_offset_of(layout, fa.field) { u32 as o => o; error as e => return e }
+    let pa = ctx_alloc(ro.ctx)
+    let with_pa = ctx_append(pa.ctx, field_addr_inst(pa.vreg, ro.vreg, off, fa.receiver.line, fa.receiver.col))
+    let pr = ctx_alloc(with_pa)
+    let with_pr = ctx_append(pr.ctx, load_inst(pr.vreg, pa.vreg, LType::Ptr, fa.receiver.line, fa.receiver.col))
+    let la = ctx_alloc(with_pr)
+    let with_la = ctx_append(la.ctx, field_addr_inst(la.vreg, ro.vreg, off + ltype_size(LType::Ptr), fa.receiver.line, fa.receiver.col))
+    let lr = ctx_alloc(with_la)
+    LoweredFat { ctx = ctx_append(lr.ctx, load_inst(lr.vreg, la.vreg, LType::I64, fa.receiver.line, fa.receiver.col)); ptr = pr.vreg; len = lr.vreg }
 }
 
 /**
@@ -4649,6 +4680,25 @@ fn const_rodata_symbol(name: str) -> str {
 }
 
 /**
+ * const_leaf_symbol — the deterministic rodata symbol of the target array of the slice field
+ * `field_name` of the aggregate const `const_name` (#594 T-B6): `.Lconst_<const_name>.<field_name>`
+ * — a PURE FUNCTION of (const name, field name), NEVER of a global intern counter. The `.Lconst_`
+ * prefix never collides with a string literal's `.Lstr<N>` nor with the main blob `.Lconst_<const_
+ * name>` (the leaf carries one extra `.` + field). Since each `(const, field)` is unique and the name
+ * does not depend on traversal order, the same `.tks` always yields the same symbols, so
+ * `LDataReloc.target`, the VM's cumulative bases and the writers' rebased offsets stay identical
+ * across generations (fixpoint-safe).
+ *
+ * @param const_name  the owning aggregate const's name
+ * @param field_name  the slice field's name
+ * @return            the leaf's rodata symbol
+ * @since #594 T-B6
+ */
+fn const_leaf_symbol(const_name: str, field_name: str) -> str {
+    teko::str::concat(const_rodata_symbol(const_name), teko::str::concat(".", field_name))
+}
+
+/**
  * ltype_is_ptr — true iff a machine class is the pointer class (`Ptr`), the shape a struct field's
  * layout takes when the field is itself pointer/slice-bearing (a `str`, `[]T`, `char`, nested Named,
  * or `ptr<T>`) — the Tier-B signal the aggregate serializer rejects (#594 crumb 6).
@@ -4975,42 +5025,115 @@ fn const_struct_field_bytes(layout: LStructLayout, si: checker::TStructInit, j: 
 }
 
 /**
- * const_struct_blob — the rodata image of a flat struct aggregate const (#594 crumb 6): a
- * zero-filled buffer of the struct's size with each field's little-endian value written at its layout
- * offset (declared order, natural alignment), so padding stays zero and a later `.field` read (an
- * `LFieldAddr` at the layout offset + `LLoad`) recovers the exact value on both engines.
+ * const_fat_array_bytes — the flat-scalar rodata bytes of a fat field's target array (#594 T-B6): a
+ * `str` field's raw UTF-8 (`const_str_bytes`), a `[]T` field's element images at the indexer's stride
+ * (`const_slice_bytes`). The SAME stride a later `[i]` folds against and the same bytes a standalone
+ * slice const would intern, so the leaf and any read agree byte-for-byte.
  *
- * @param layout  the struct's resolved layout (size + per-field offset/class)
- * @param si      the typed struct-literal initializer
- * @return        the struct's byte image (length = `layout.size`)
- * @throws        when any field is pointer-bearing (Tier-B), a float, or not foldable
+ * @param field_ty  the field's checked type (`Str`/`Slice`)
+ * @param vexpr     the field's initializer (a string/array literal)
+ * @return          the target array's flat-scalar byte image
+ * @throws          when the field is not a str/slice (internal), or the initializer is not materializable
+ * @since #594 T-B6
  */
-fn const_struct_blob(layout: LStructLayout, si: checker::TStructInit) -> []byte | error {
-    mut buf = zeros_bytes(layout.size to u64)
-    mut j: u64 = 0
-    loop {
-        if j >= layout.field_names.len { break }
-        let fb = match const_struct_field_bytes(layout, si, j) { []byte as x => x; error as e => return e }
-        buf = write_bytes_at(buf, layout.field_offsets[j] to u64, fb)
-        j++
+fn const_fat_array_bytes(field_ty: checker::Type, vexpr: checker::TExpr) -> []byte | error {
+    match field_ty {
+        checker::Str => const_str_bytes(vexpr)
+        checker::Slice as s => const_slice_bytes(s.element, vexpr)
+        _ => error { message = "const aggregate: fat field is neither str nor slice (internal) (#594)" }
     }
-    buf
 }
 
 /**
- * const_struct_bytes — the rodata image of a `Named` struct aggregate const (#594 crumb 6): resolve
- * its registered layout and materialize its struct-literal initializer via `const_struct_blob`.
+ * const_fat_field — the 16-byte image of a fat field (`[]T`/`str`) of an aggregate const, with the
+ * pointer slot zero and the element count inline in the high slot (#594 T-B6): `{ slot_bytes = <8
+ * zero> ++ serialize_le(count, POINTER_SIZE), reloc = data_reloc(fieldoff, leaf_sym), leaf = LRodata{
+ * leaf_sym, array_bytes, relocs=[] } }`. `array_bytes` reuses `const_fat_array_bytes` (the SAME stride
+ * the indexer folds) and `count` is the element count (`const_fat_len`) — the SAME value
+ * `lower_len_field` returns, so a `.len` read agrees. The leaf symbol is `const_leaf_symbol(const_name,
+ * field_name)` (a pure function -> deterministic).
  *
- * @param name     the struct type's canonical name
- * @param init     the const's checked initializer
- * @param layouts  the program's struct-layout table
- * @return         the struct's byte image
- * @throws         when the layout is unknown, the initializer is not a struct literal, or a field is Tier-B
+ * @param const_name  the owning const's name (for the leaf symbol)
+ * @param field_name  the field's name (for the leaf symbol)
+ * @param fieldoff    the field's byte offset in the struct blob (the pointer slot's offset)
+ * @param field_ty    the field's checked type (`Slice`/`Str`)
+ * @param vexpr       the field's initializer (a string/array literal)
+ * @return            the 16-byte slot image, the relocation, and the leaf
+ * @throws            when the initializer is not materializable (non-literal, spread, or ptr element)
+ * @since #594 T-B6
  */
-fn const_struct_bytes(name: str, init: checker::TExpr, layouts: []LStructLayout) -> []byte | error {
+fn const_fat_field(const_name: str, field_name: str, fieldoff: u32, field_ty: checker::Type, vexpr: checker::TExpr) -> FatFieldImage | error {
+    let array_bytes = match const_fat_array_bytes(field_ty, vexpr) { []byte as x => x; error as e => return e }
+    let count = match const_fat_len(field_ty, array_bytes.len to u32) { u32 as c => c; error as e => return e }
+    let leaf_sym = const_leaf_symbol(const_name, field_name)
+    let ptr_size = ltype_size(LType::Ptr)
+    let slot = append_bytes(zeros_bytes(ptr_size to u64), serialize_le(count to i128, ptr_size))
+    FatFieldImage {
+        slot_bytes = slot
+        reloc = data_reloc(fieldoff, leaf_sym)
+        leaf = LRodata { symbol = leaf_sym; bytes = array_bytes; relocs = teko::list::empty() }
+    }
+}
+
+/**
+ * const_struct_blob — the complete rodata image of a struct aggregate const (#594 crumb 6 + T-B6): a
+ * zero-filled buffer of the struct's size with each SCALAR field's little-endian value written at its
+ * layout offset (declared order, natural alignment) and each FAT field (`[]T`/`str`) written as its
+ * 16-byte `{ptr=0, len=count}` slot plus a `LDataReloc` + a leaf `LRodata` (`const_fat_field`). Padding
+ * stays zero, so a later `.field`/`.len`/`[i]` read recovers the exact value on both engines. A flat
+ * Tier-A struct yields empty `relocs`/`leaves` (byte-identical to crumb 6); an ABI descriptor yields
+ * one reloc + one leaf per slice field.
+ *
+ * @param const_name  the owning const's name (for each fat field's deterministic leaf symbol)
+ * @param layout      the struct's resolved layout (size + per-field offset/class)
+ * @param si          the typed struct-literal initializer
+ * @return            the struct blob + its internal relocations + its leaf entries
+ * @throws            when a non-fat pointer field (Tier-B), a float field, or a non-foldable value occurs
+ * @since #594 crumb 6 + T-B6
+ */
+fn const_struct_blob(const_name: str, layout: LStructLayout, si: checker::TStructInit) -> ConstImage | error {
+    mut buf = zeros_bytes(layout.size to u64)
+    mut relocs: []LDataReloc = teko::list::empty()
+    mut leaves: []LRodata = teko::list::empty()
+    mut j: u64 = 0
+    loop {
+        if j >= layout.field_names.len { break }
+        let field_name = layout.field_names[j]
+        let fieldoff = layout.field_offsets[j]
+        let vexpr = match struct_init_value(si, field_name) { checker::TExpr as x => x; error as e => return e }
+        if is_fat_type(vexpr.type) {
+            let ffi = match const_fat_field(const_name, field_name, fieldoff, vexpr.type, vexpr) { FatFieldImage as x => x; error as e => return e }
+            buf = write_bytes_at(buf, fieldoff to u64, ffi.slot_bytes)
+            relocs = teko::list::push(relocs, ffi.reloc)
+            leaves = teko::list::push(leaves, ffi.leaf)
+        }
+        if !is_fat_type(vexpr.type) {
+            let fb = match const_struct_field_bytes(layout, si, j) { []byte as x => x; error as e => return e }
+            buf = write_bytes_at(buf, fieldoff to u64, fb)
+        }
+        j++
+    }
+    ConstImage { bytes = buf; relocs = relocs; leaves = leaves }
+}
+
+/**
+ * const_struct_bytes — the complete rodata image of a `Named` struct aggregate const (#594 crumb 6 +
+ * T-B6): resolve its registered layout and materialize its struct-literal initializer via
+ * `const_struct_blob`, threading the const's own name (for each fat field's deterministic leaf
+ * symbol).
+ *
+ * @param const_name  the const's declared name (for each fat field's leaf symbol)
+ * @param name        the struct type's canonical name
+ * @param init        the const's checked initializer
+ * @param layouts     the program's struct-layout table
+ * @return            the struct blob + its relocations + its leaves
+ * @throws            when the layout is unknown, the initializer is not a struct literal, or a field is Tier-B
+ * @since #594 crumb 6 + T-B6
+ */
+fn const_struct_bytes(const_name: str, name: str, init: checker::TExpr, layouts: []LStructLayout) -> ConstImage | error {
     let layout = match find_struct_layout(layouts, name) { LStructLayout as l => l; error as e => return e }
     match init.kind {
-        checker::TStructInit as si => const_struct_blob(layout, si)
+        checker::TStructInit as si => const_struct_blob(const_name, layout, si)
         _ => error { message = "const struct: initializer is not a struct literal (Tier-A follow-up) (#594)" }
     }
 }
@@ -5100,66 +5223,94 @@ fn const_variant_bytes(info: LEnumInfo, init: checker::TExpr) -> []byte | error 
 }
 
 /**
- * const_named_bytes — the rodata image of a `Named`-typed aggregate const (#594 crumb 6/9b): a
- * declared `variant` materializes its empty-case tag (`const_variant_bytes`), any other `Named` is a
- * flat-POD struct (`const_struct_bytes`). A `variant`-typed const's declared type resolves to a
+ * const_image_flat — a `ConstImage` wrapping a Tier-A flat byte image with EMPTY relocations and
+ * leaves (#594 T-B6): a `str`/`[]T`/variant-tag const carries no internal pointer, so it is
+ * byte-identical to the crumb-6 path.
+ *
+ * @param bytes  the flat rodata byte image
+ * @return       a `ConstImage` with `relocs`/`leaves` empty
+ * @since #594 T-B6
+ */
+fn const_image_flat(bytes: []byte) -> ConstImage {
+    ConstImage { bytes = bytes; relocs = teko::list::empty(); leaves = teko::list::empty() }
+}
+
+/**
+ * const_named_bytes — the complete rodata image of a `Named`-typed aggregate const (#594 crumb 6/9b +
+ * T-B6): a declared `variant` materializes its empty-case tag (`const_variant_bytes`, flat), any other
+ * `Named` is a struct materialized via `const_struct_bytes` (flat for a POD struct, or blob + relocs +
+ * leaves for a pointer-bearing descriptor). A `variant`-typed const's declared type resolves to a
  * nominal `Named`, so this dispatch — variant table first, struct layout otherwise — is where the two
  * families part.
  *
- * @param name     the const's declared type name (possibly qualified)
- * @param init     the const's checked initializer
- * @param layouts  the program's struct-layout table
- * @param variants the program's variant table
- * @return         the const's rodata byte image
- * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ * @param const_name  the const's declared name (for each fat field's leaf symbol)
+ * @param name        the const's declared type name (possibly qualified)
+ * @param init        the const's checked initializer
+ * @param layouts     the program's struct-layout table
+ * @param variants    the program's variant table
+ * @return            the const's complete rodata image
+ * @throws            a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ * @since #594 crumb 6/9b + T-B6
  */
-fn const_named_bytes(name: str, init: checker::TExpr, layouts: []LStructLayout, variants: []LEnumInfo) -> []byte | error {
+fn const_named_bytes(const_name: str, name: str, init: checker::TExpr, layouts: []LStructLayout, variants: []LEnumInfo) -> ConstImage | error {
     match find_variant_info(variants, name) {
-        LEnumInfo as info => const_variant_bytes(info, init)
-        null => const_struct_bytes(name, init, layouts)
+        LEnumInfo as info => match const_variant_bytes(info, init) { []byte as b => const_image_flat(b); error as e => return e }
+        null => const_struct_bytes(const_name, name, init, layouts)
     }
 }
 
 /**
- * serialize_const — the rodata byte image of a Tier-A aggregate const, dispatched on its resolved
- * value type (#594 crumb 6): a `str` (raw UTF-8), a flat-scalar `[]T`, a flat-POD struct, or an
- * empty-case `variant` (its tag image, #594 crumb 9b). A `variant` const's declared type resolves to
- * a nominal `Named`, so `const_named_bytes` splits the struct/variant families. Any pointer/slice-
- * bearing aggregate is Tier-B (T-B) and honest-stops — the sole materialization boundary this crumb
- * enforces.
+ * serialize_const — the complete rodata image of an aggregate const, dispatched on its resolved value
+ * type (#594 crumb 6 + T-B6): a `str` (raw UTF-8), a flat-scalar `[]T`, a flat-POD or pointer-bearing
+ * struct, or an empty-case `variant` (its tag image, #594 crumb 9b). A `str`/flat-`[]T`/flat-struct/
+ * variant returns its bytes with EMPTY `relocs`/`leaves` (byte-identical to crumb 6); a pointer-bearing
+ * struct (a slice/`str` field — the ABI descriptors) returns the blob with zeroed pointer slots, one
+ * `LDataReloc` per fat field, and each target array's leaf. The `_` arm (neither Str/Slice/Named) still
+ * honest-stops (no const in the corpus reaches it).
  *
- * @param cd       the residual typed const declaration (its type + checked initializer)
+ * @param cd       the residual typed const declaration (its name, type + checked initializer)
  * @param layouts  the program's struct-layout table
  * @param variants the program's variant table
- * @return         the const's rodata byte image
- * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ * @return         the const's complete rodata image (bytes + internal relocs + leaves)
+ * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate form
+ * @since #594 crumb 6 (bytes) + T-B6 (relocs + leaves)
  */
-fn serialize_const(cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo) -> []byte | error {
+fn serialize_const(cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo) -> ConstImage | error {
     match cd.ty {
-        checker::Str => const_str_bytes(cd.init)
-        checker::Slice as s => const_slice_bytes(s.element, cd.init)
-        checker::Named as n => const_named_bytes(n.name, cd.init, layouts, variants)
+        checker::Str => match const_str_bytes(cd.init) { []byte as b => const_image_flat(b); error as e => return e }
+        checker::Slice as s => match const_slice_bytes(s.element, cd.init) { []byte as b => const_image_flat(b); error as e => return e }
+        checker::Named as n => const_named_bytes(cd.name, n.name, cd.init, layouts, variants)
         _ => error { message = "const aggregate: pointer/slice-bearing value is Tier-B (T-B), not crumb 6 (#594)" }
     }
 }
 
 /**
- * intern_aggregate_const_decl — materialize one residual TConstDecl into rodata when it is a Tier-A
- * aggregate (#594 crumb 6): a scalar const (already inlined + dropped by `inline_consts`) is a
- * defensive skip; an aggregate const is serialized to bytes and appended to the module's rodata under
- * its deterministic `const_rodata_symbol`, referenced from every use site via `find_const_rodata`.
+ * intern_aggregate_const_decl — materialize one residual TConstDecl into rodata (#594 crumb 6 + T-B6):
+ * a scalar const (already inlined + dropped by `inline_consts`) is a defensive skip; a Tier-A aggregate
+ * interns ONE entry (empty relocs); a pointer-bearing aggregate (an ABI descriptor) interns first each
+ * target-array LEAF entry (in field order, deterministic symbols) and THEN the main blob with its
+ * `LDataReloc`s. The leaves-before-blob order is deterministic (declared field order), so the cumulative
+ * bases (VM) and rebased offsets (writers) stay stable across generations.
  *
  * @param m        the module accumulated so far
  * @param cd       the residual typed const declaration
  * @param layouts  the program's struct-layout table
  * @param variants the program's variant table
- * @return         the module with the const's rodata entry appended (unchanged for a scalar const)
+ * @return         the module with the const's leaves + blob appended (unchanged for a scalar const)
  * @throws         a Tier-A-follow-up / Tier-B (T-B) honest-stop for an unmaterializable aggregate
+ * @since #594 crumb 6 + T-B6
  */
 fn intern_aggregate_const_decl(m: LModule, cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo) -> LModule | error {
     if const_decl_is_scalar(cd.ty) { return m }
-    let bytes = match serialize_const(cd, layouts, variants) { []byte as b => b; error as e => return e }
-    add_rodata(m, LRodata { symbol = const_rodata_symbol(cd.name); bytes = bytes; relocs = teko::list::empty() })
+    let img = match serialize_const(cd, layouts, variants) { ConstImage as x => x; error as e => return e }
+    mut cur = m
+    mut i: u64 = 0
+    loop {
+        if i >= img.leaves.len { break }
+        cur = add_rodata(cur, img.leaves[i])
+        i++
+    }
+    add_rodata(cur, LRodata { symbol = const_rodata_symbol(cd.name); bytes = img.bytes; relocs = img.relocs })
 }
 
 /**
@@ -5343,8 +5494,8 @@ fn layout_of_fields(name: str, fields: []parser::Field, known: []LStructLayout) 
         let nested = struct_layout_of_field(te, known)
         field_names = teko::list::push(field_names, fields[i].name)
         field_types = teko::list::push(field_types, ft)
-        field_sizes = teko::list::push(field_sizes, field_size_of(ft, nested))
-        field_aligns = teko::list::push(field_aligns, field_align_of(ft, nested))
+        field_sizes = teko::list::push(field_sizes, field_layout_size(te, ft, nested))
+        field_aligns = teko::list::push(field_aligns, field_layout_align(te, ft, nested))
         i++
     }
     layout_of_sized(name, field_names, field_types, field_sizes, field_aligns)
@@ -5445,6 +5596,71 @@ fn field_align_of(ft: LType, nested: LStructLayout?) -> u32 {
         LStructLayout as l => l.align
         null => ltype_align(ft)
     }
+}
+
+/**
+ * typeexpr_is_fat — true iff the syntactic annotation `te` is a fat-pointer type (a `[]T` slice or
+ * `str`), the field whose layout occupies 16 bytes `{ptr, len}` instead of the scalar fallback's
+ * 8-byte `Ptr` (#594 T-B6). A `char`/Named-by-value/`ptr<T>` is NOT fat (it is an 8-byte `Ptr` or a
+ * nested struct), so it does not match here.
+ *
+ * @param te  the field's syntactic type annotation
+ * @return    whether the field is a fat pointer (16 bytes {ptr, len})
+ * @since #594 T-B6
+ */
+fn typeexpr_is_fat(te: parser::TypeExpr) -> bool {
+    match te {
+        parser::SliceType => true
+        parser::NamedType as nt => named_single_segment_is(nt.path, "str")
+        _ => false
+    }
+}
+
+/**
+ * named_single_segment_is — true iff `p` is a single-segment path whose lone segment name equals
+ * `want` (#594 T-B6): the shape a bare `str` type annotation takes (`str`, not `a::str`).
+ *
+ * @param p     the path to inspect
+ * @param want  the segment name to match
+ * @return      whether `p` is the single segment `want`
+ * @since #594 T-B6
+ */
+fn named_single_segment_is(p: parser::Path, want: str) -> bool {
+    match single_segment_name(p) {
+        str as s => s == want
+        null => false
+    }
+}
+
+/**
+ * field_layout_size — a field's byte size, widening a fat-pointer field (`[]T`/`str`) to the 16-byte
+ * `{ptr, len}` image and otherwise deferring to `field_size_of` (#594 T-B6). The 16-byte width is the
+ * layout the aggregate-const serializer writes (`{ptr@off, len@off+8}`) and the reader loads.
+ *
+ * @param te      the field's syntactic type annotation (the fat-vs-scalar signal)
+ * @param ft      the field's machine class (`ltype_of_typeexpr`'s mapping)
+ * @param nested  the field's nested struct layout, when known
+ * @return        the field's byte size
+ * @since #594 T-B6
+ */
+fn field_layout_size(te: parser::TypeExpr, ft: LType, nested: LStructLayout?) -> u32 {
+    if typeexpr_is_fat(te) { return ltype_size(LType::Ptr) * (2 to u32) }
+    field_size_of(ft, nested)
+}
+
+/**
+ * field_layout_align — a field's byte alignment, pinning a fat-pointer field (`[]T`/`str`) to
+ * pointer alignment and otherwise deferring to `field_align_of` (#594 T-B6).
+ *
+ * @param te      the field's syntactic type annotation (the fat-vs-scalar signal)
+ * @param ft      the field's machine class (`ltype_of_typeexpr`'s mapping)
+ * @param nested  the field's nested struct layout, when known
+ * @return        the field's byte alignment
+ * @since #594 T-B6
+ */
+fn field_layout_align(te: parser::TypeExpr, ft: LType, nested: LStructLayout?) -> u32 {
+    if typeexpr_is_fat(te) { return ltype_align(LType::Ptr) }
+    field_align_of(ft, nested)
 }
 
 /**
