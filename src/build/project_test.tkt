@@ -1,4 +1,5 @@
 use teko::parser
+use teko::checker
 
 /**
  * A minimal `parser::Item` fixture for the `filter_tkt` provenance tests: a bare
@@ -379,4 +380,87 @@ fn backend_of_env_fallback_when_flag_absent() {
     teko::assert::is_true(backend_of(args_of("--backend=c", "", ""), 0) == Backend::C)
     match teko::env::set_var("TEKO_BACKEND", "") { error => { }; null => { } }
     teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::C)
+}
+
+/**
+ * pt_ek — wrap a `parser::ExprKind` into a position-less `parser::Expr` (the checked-program
+ * fixtures below never assert on positions).
+ *
+ * @param k  the expression kind to wrap
+ * @return   the wrapped expression
+ */
+fn pt_ek(k: parser::ExprKind) -> parser::Expr { parser::Expr { kind = k; line = 0; col = 0 } }
+
+/**
+ * pt_num — an integer `parser::Number` literal expression.
+ *
+ * @param v  the literal value
+ * @return   the number expression
+ */
+fn pt_num(v: i128) -> parser::Expr { pt_ek(parser::Number { is_float = false; value = v; fval = 0.0 }) }
+
+/**
+ * pt_var — a bare-name `parser::Var` reference expression (how a module const is read).
+ *
+ * @param name  the referenced name
+ * @return      the variable-reference expression
+ */
+fn pt_var(name: str) -> parser::Expr { pt_ek(parser::Var { name = name }) }
+
+/**
+ * pt_i64_t — the named type expression `i64`, the fixtures' only const type.
+ *
+ * @return  the `i64` type expression
+ */
+fn pt_i64_t() -> parser::TypeExpr {
+    parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "i64" }) }; args = teko::list::empty() }
+}
+
+/**
+ * pt_const_item — a module-level `parser::ConstDecl` of type `i64` wrapped as a program `Item`
+ * with `.tks` provenance, the `checked_program_of` consteval-phase fixtures' building block.
+ *
+ * @param name  the constant's name
+ * @param init  its initializer expression
+ * @param line  its source line (distinct per fixture const so located errors differ)
+ * @return      the program item carrying the const
+ */
+fn pt_const_item(name: str, init: parser::Expr, line: u32) -> parser::Item {
+    let cd = parser::ConstDecl { name = name; ty = pt_i64_t(); init = init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = line; col = 1 }
+    parser::Item { content = cd; namespace = ""; file = "app.tks" }
+}
+
+/**
+ * pt_checked_program_of_settles_consteval_ok — `checked_program_of` (report=false, the Quiet path)
+ * runs a well-formed single-const program through checker → monomorph → consteval and returns the
+ * inlined `TProgram`: the `consteval` phase's ok arm settles (with `module_const_count`'s upfront
+ * total) and the scalar const is dropped from the item surface by `inline_consts`.
+ */
+#test
+fn pt_checked_program_of_settles_consteval_ok() {
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, pt_const_item("K", pt_num(1), 1))
+    let empty_dep = checker::TProgram { items = teko::list::empty() }
+    match checked_program_of(parser::Program { items = items }, empty_dep, false, false) {
+        checker::TProgram => teko::assert::is_true(true)
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * pt_checked_program_of_reports_consteval_cycle_under_own_phase — `const A = B; const B = A` is a
+ * reference cycle the checker and monomorph phases accept (pass-1 binds both names) and ONLY
+ * `inline_consts` rejects: `checked_program_of` must surface that error through the `consteval`
+ * phase's fail arm (its own label — NOT a re-ended `monomorph`) and return it to the caller.
+ */
+#test
+fn pt_checked_program_of_reports_consteval_cycle_under_own_phase() {
+    mut items: []parser::Item = teko::list::empty()
+    items = teko::list::push(items, pt_const_item("A", pt_var("B"), 1))
+    items = teko::list::push(items, pt_const_item("B", pt_var("A"), 2))
+    let empty_dep = checker::TProgram { items = teko::list::empty() }
+    match checked_program_of(parser::Program { items = items }, empty_dep, false, false) {
+        checker::TProgram => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
 }

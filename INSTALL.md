@@ -75,7 +75,7 @@ in this pre-alpha).
 ## Method 2 — Homebrew (macOS + Linux/Linuxbrew)
 
 ```sh
-brew tap schivei/teko
+brew tap teko-org/teko
 brew install teko
 ```
 
@@ -86,7 +86,7 @@ quarantined by Gatekeeper. Upgrades and uninstalls go through Homebrew as usual:
 ```sh
 brew upgrade teko
 brew uninstall teko
-brew untap schivei/teko
+brew untap teko-org/teko
 ```
 
 ## Building from source
@@ -129,4 +129,4 @@ checkout route, `cmake`.
 
 - Script install: `./install.sh --uninstall` (removes `teko` from the default prefixes,
   or from `--prefix <dir>` if you pass one).
-- Homebrew install: `brew uninstall teko` (and `brew untap schivei/teko` to drop the tap).
+- Homebrew install: `brew uninstall teko` (and `brew untap teko-org/teko` to drop the tap).

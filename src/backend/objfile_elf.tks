@@ -557,10 +557,13 @@ fn elf_rela_info(symidx: u32, rtype: u32) -> u64 {
 }
 
 /**
- * elf_section_names — the seven section names, in section-header-table order
- * (`""` null, `.text`, `.rodata`, `.symtab`, `.strtab`, `.shstrtab`,
- * `.rela.text`), interned into `.shstrtab` to yield each header's `sh_name`.
+ * elf_section_names — the section names, in section-header-table order: the
+ * seven fixed names (`""` null, `.text`, `.rodata`, `.symtab`, `.strtab`,
+ * `.shstrtab`, `.rela.text`), plus an eighth `.rela.rodata` when rodata-internal
+ * relocations are present, interned into `.shstrtab` to yield each header's
+ * `sh_name`.
  *
+ * @param bool has_rodata_relocs  whether a `.rela.rodata` section is present
  * @return []str  the section names, in header order
  */
 fn elf_section_names(has_rodata_relocs: bool) -> []str {
@@ -568,6 +571,19 @@ fn elf_section_names(has_rodata_relocs: bool) -> []str {
     if has_rodata_relocs { return teko::list::push(base, ".rela.rodata") }
     base
 }
+
+/**
+ * ELF64_SYM_SIZE — `sizeof(Elf64_Sym)`: the 24-byte size of one symbol-table
+ * entry, `.symtab`'s `sh_entsize` and the multiplier of its `sh_size`.
+ */
+const ELF64_SYM_SIZE: u32 = 24 to u32
+
+/**
+ * ELF64_RELA_SIZE — `sizeof(Elf64_Rela)`: the 24-byte size of one relocation
+ * entry, the `.rela.*` sections' `sh_entsize` and the multiplier of their
+ * `sh_size`.
+ */
+const ELF64_RELA_SIZE: u32 = 24 to u32
 
 /**
  * ElfLayout — the resolved file offsets, sizes, and counts of the object:
@@ -681,9 +697,11 @@ type ElfLayout = struct {
  * @param ElfObject obj  the neutral object (for the `.text`/`.rodata` sizes)
  * @param u32 nsyms  the `Elf64_Sym` count
  * @param u32 nrela  the `Elf64_Rela` count
+ * @param u32 nrela_rodata  the `Elf64_Rela` count of `.rela.rodata`
  * @param u32 strtab_len  the pre-built `.strtab` byte size
  * @param u32 shstrtab_len  the pre-built `.shstrtab` byte size
  * @param u32 first_global  `.symtab`'s `sh_info`
+ * @param u32 nsects  the section-header count (`e_shnum`)
  * @return ElfLayout  the resolved offsets + sizes + counts
  */
 fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, nrela_rodata: u32, strtab_len: u32, shstrtab_len: u32, first_global: u32, nsects: u32) -> ElfLayout {
@@ -692,13 +710,13 @@ fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, nrela_rodata: u32,
     let rodata_offset = align_up(text_offset + text_size, 8 to u32)
     let rodata_size = obj.rodata.len to u32
     let symtab_offset = align_up(rodata_offset + rodata_size, 8 to u32)
-    let symtab_size = nsyms * (24 to u32)
+    let symtab_size = nsyms * ELF64_SYM_SIZE
     let strtab_offset = symtab_offset + symtab_size
     let shstrtab_offset = strtab_offset + strtab_len
     let rela_offset = align_up(shstrtab_offset + shstrtab_len, 8 to u32)
-    let rela_size = nrela * (24 to u32)
+    let rela_size = nrela * ELF64_RELA_SIZE
     let rela_rodata_offset = align_up(rela_offset + rela_size, 8 to u32)
-    let rela_rodata_size = nrela_rodata * (24 to u32)
+    let rela_rodata_size = nrela_rodata * ELF64_RELA_SIZE
     let shoff = align_up(rela_rodata_offset + rela_rodata_size, 8 to u32)
     ElfLayout {
         text_offset = text_offset
@@ -738,14 +756,16 @@ const ELF_MAGIC: []byte = [0x7F to byte, 0x45 to byte, 0x4C to byte, 0x46 to byt
  * `e_type = ET_REL`(1), the supplied `e_machine` (EM_X86_64=62 / EM_RISCV=243),
  * `e_version = 1`, zero `e_entry`/`e_phoff`, the computed `e_shoff`, the supplied
  * `e_flags` (0 for x86-64 / EF_RISCV_FLOAT_ABI_DOUBLE=0x0004 for RV64 LP64D),
- * `e_ehsize = 64`, zero program-header fields, `e_shentsize = 64`, `e_shnum = 7`,
- * and `e_shstrndx = 5` (`.shstrtab`). The `e_machine`/`e_flags` are the ONLY
- * ISA-varying bytes of the reused header (§7.1).
+ * `e_ehsize = 64`, zero program-header fields, `e_shentsize = 64`, `e_shnum =
+ * nsects` (7, or 8 with `.rela.rodata`), and `e_shstrndx = 5` (`.shstrtab`). The
+ * `e_machine`/`e_flags` are the ONLY ISA-varying bytes of the reused header
+ * (§7.1).
  *
  * @param []byte buf  the (empty) buffer to extend
  * @param ElfLayout lay  the resolved layout (for `e_shoff`)
  * @param u32 e_machine  the ELF `e_machine` (62=x86-64, 243=riscv)
  * @param u32 e_flags  the ELF `e_flags` (0=x86-64, 0x0004=RV64 LP64D hard-float)
+ * @param u32 nsects  the section-header count emitted as `e_shnum`
  * @return []byte  `buf` followed by the 64-byte Ehdr
  */
 fn emit_elf_header(buf: []byte, lay: ElfLayout, e_machine: u32, e_flags: u32, nsects: u32) -> []byte {
@@ -864,12 +884,12 @@ fn emit_elf_shdrs(buf: []byte, lay: ElfLayout, shname: []u32) -> []byte {
     mut b = emit_elf_shdr(buf, shname[0], 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32, 0 to u32)
     b = emit_elf_shdr(b, shname[1], 1 to u32, SHF_ALLOC | SHF_EXECINSTR, lay.text_offset, lay.text_size, 0 to u32, 0 to u32, 16 to u32, 0 to u32)
     b = emit_elf_shdr(b, shname[2], 1 to u32, SHF_ALLOC, lay.rodata_offset, lay.rodata_size, 0 to u32, 0 to u32, 8 to u32, 0 to u32)
-    b = emit_elf_shdr(b, shname[3], 2 to u32, 0 to u32, lay.symtab_offset, lay.symtab_size, 4 to u32, lay.first_global, 8 to u32, 24 to u32)
+    b = emit_elf_shdr(b, shname[3], 2 to u32, 0 to u32, lay.symtab_offset, lay.symtab_size, 4 to u32, lay.first_global, 8 to u32, ELF64_SYM_SIZE)
     b = emit_elf_shdr(b, shname[4], 3 to u32, 0 to u32, lay.strtab_offset, lay.strtab_size, 0 to u32, 0 to u32, 1 to u32, 0 to u32)
     b = emit_elf_shdr(b, shname[5], 3 to u32, 0 to u32, lay.shstrtab_offset, lay.shstrtab_size, 0 to u32, 0 to u32, 1 to u32, 0 to u32)
-    b = emit_elf_shdr(b, shname[6], 4 to u32, SHF_INFO_LINK, lay.rela_offset, lay.rela_size, 3 to u32, 1 to u32, 8 to u32, 24 to u32)
+    b = emit_elf_shdr(b, shname[6], 4 to u32, SHF_INFO_LINK, lay.rela_offset, lay.rela_size, 3 to u32, 1 to u32, 8 to u32, ELF64_RELA_SIZE)
     if shname.len > (7 to u64) {
-        b = emit_elf_shdr(b, shname[7], 4 to u32, SHF_INFO_LINK, lay.rela_rodata_offset, lay.rela_rodata_size, 3 to u32, 2 to u32, 8 to u32, 24 to u32)
+        b = emit_elf_shdr(b, shname[7], 4 to u32, SHF_INFO_LINK, lay.rela_rodata_offset, lay.rela_rodata_size, 3 to u32, 2 to u32, 8 to u32, ELF64_RELA_SIZE)
     }
     b
 }
@@ -1129,7 +1149,7 @@ fn x86_rodata_reloc_reqs(enc: EncodedModuleX86) -> []ElfRelocReq {
 pub fn emit_elf(enc: EncodedModuleX86) -> []byte {
     emit_elf_object(ElfObject {
         e_machine = EM_X86_64
-        e_flags = 0 to u32   // x86-64 defines no e_flags bits
+        e_flags = 0 to u32
         text = enc.text
         rodata = enc.rodata
         symbols = enc.symbols

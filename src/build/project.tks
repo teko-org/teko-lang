@@ -253,13 +253,40 @@ fn checker_tick_fn(phase: Phase, last: Ref<u64>, total_cell: Ref<u64>) -> checke
 }
 
 /**
- * Run the checker + monomorphization phases over `selected` (with `dep_prog`'s
- * signatures pre-seeded), reporting BOTH as their own timed `teko build`
- * observability phases: `checker` ticks a live "N/M items" counter as
+ * module_const_count — the number of module-level `checker::TConstDecl` items on a typed
+ * program's item surface: the upfront total the `consteval` phase renders, since
+ * `inline_consts` visits exactly the module consts and the count is known before the
+ * pass runs (post-inline the scalar consts are dropped from the surface, so it must be
+ * taken BEFORE).
+ *
+ * @param prog  the typed program about to be const-inlined
+ * @return      the module-level const count
+ */
+fn module_const_count(prog: checker::TProgram) -> u64 {
+    mut n: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TConstDecl => { n++ }
+            _ => { }
+        }
+        i++
+    }
+    n
+}
+
+/**
+ * Run the checker, monomorphization, and const-inlining phases over `selected` (with
+ * `dep_prog`'s signatures pre-seeded), reporting ALL THREE as their own timed
+ * `teko build` observability phases: `checker` ticks a live "N/M items" counter as
  * `type_program_with_deps_pre_mono` types each top-level item; `monomorph` settles
  * once with the resulting instance count (its fixpoint queue has no cheap upfront
  * total, so it renders as a count-up rather than a running "N/M" — see
- * `count_only_text`). Extracted from `frontend_body` to keep that function flat.
+ * `count_only_text`); `consteval` settles with the module-const count
+ * (`module_const_count`), so an `inline_consts` failure (e.g. a const reference
+ * cycle) reports under its OWN label instead of re-ending the already-settled
+ * `monomorph` phase. Extracted from `frontend_body` to keep that function flat.
  *
  * @param selected  the OS-pruned, un-typed merged program
  * @param dep_prog  the already-typed dependency program (empty when depless)
@@ -276,26 +303,32 @@ fn checked_program_of(selected: parser::Program, dep_prog: checker::TProgram, re
     let pre = match checker::type_program_with_deps_pre_mono(selected, dep_prog, on_item) {
         checker::PreMono as p => p
         error as e => {
-            phase_end_fail(checker_phase, count_unit_text(last, total_cell, "items"), e.message)   // no-op when Quiet
+            phase_end_fail(checker_phase, count_unit_text(last, total_cell, "items"), e.message)
             return e
         }
     }
-    phase_end_ok(checker_phase, count_unit_text(total_cell, total_cell, "items"))   // no-op when Quiet
+    phase_end_ok(checker_phase, count_unit_text(total_cell, total_cell, "items"))
 
     let mono_phase = phase_begin("monomorph", count_only_text(0, "instances"), mode)
     let checked = match checker::monomorphize(pre.prog, pre.table) {
         checker::TProgram as c => c
         error as e => {
-            phase_end_fail(mono_phase, count_only_text(0, "instances"), e.message)   // no-op when Quiet
+            phase_end_fail(mono_phase, count_only_text(0, "instances"), e.message)
             return e
         }
     }
     let instances = if checked.items.len > pre.prog.items.len { checked.items.len - pre.prog.items.len } else { 0 }
-    phase_end_ok(mono_phase, count_unit_text(instances, instances, "instances"))   // no-op when Quiet
+    phase_end_ok(mono_phase, count_unit_text(instances, instances, "instances"))
+
+    let consts_total = module_const_count(checked)
+    let consteval_phase = phase_begin("consteval", count_unit_text(0, consts_total, "consts"), mode)
     match checker::inline_consts(checked) {
-        checker::TProgram as inlined => inlined
+        checker::TProgram as inlined => {
+            phase_end_ok(consteval_phase, count_unit_text(consts_total, consts_total, "consts"))
+            inlined
+        }
         error as e => {
-            phase_end_fail(mono_phase, count_only_text(0, "instances"), e.message)   // no-op when Quiet
+            phase_end_fail(consteval_phase, count_unit_text(0, consts_total, "consts"), e.message)
             return e
         }
     }
@@ -855,7 +888,9 @@ fn plist_xml(m: Manifest) -> str {
  * @param tty      render the `codegen`/`emit C`/`cc` phases' in-place `\r` updates
  *                 (BUILD-OUTPUT OBSERVABILITY; the library/package honest-stop and
  *                 packaging paths below are unaffected — only the default binary
- *                 path is instrumented)
+ *                 path is instrumented). The backend always reports — `tty` only
+ *                 selects the rendering (Tty on a terminal, Plain on a CI/log),
+ *                 never silence.
  * @return         0 on a successful build, else the failing status
  */
 fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest, opt: i32, tty: bool) -> i32 {
@@ -911,7 +946,7 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
     if m.backend == Backend::Native {
         return emit_native(dir, stem, out_dir, prog, m)
     }
-    let mode = report_mode(false, tty)   // the backend always reports (Tty on a terminal, Plain on a CI/log)
+    let mode = report_mode(false, tty)
     let codegen_phase = phase_begin("codegen", count_unit_text(0, prog.items.len, "items"), mode)
     let emitted = match codegen::tk_emit_c(prog) {
         str as s => s
@@ -1593,16 +1628,19 @@ fn report_native_coverage(prog: checker::TProgram) {
  *  this process's coverage sinks. Under TestCov each PRODUCTION fn body carries `tk_cov_line_at`/
  *  `tk_cov_branch_at` interior marks (#265 Track A), so the merged sinks populate ALL THREE metrics —
  *  the engine-independent static walk (coverage::*_coverage_pct) reads them exactly as it read the
- *  VM's in-process marks. Replaces the 15.6 s VM interpret of the test bodies with a sub-second native run. */
+ *  VM's in-process marks. Replaces the 15.6 s VM interpret of the test bodies with a sub-second native run.
+ *  BUILD-OUTPUT OBSERVABILITY: the gate's emit and cc steps used to be the silent gap between the
+ *  front-end and the test run; both now report as visible phases (`emit test` for the first silent step,
+ *  `cc test` for the slow one). The gate always reports — `tty` only selects the rendering (Tty on a
+ *  terminal, Plain on a CI/log), never silence. */
 fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest, tty: bool) -> i32 {
-    let mode = report_mode(false, tty)   // BUILD-OUTPUT OBSERVABILITY: the gate's emit+cc were the front->test silent gap
+    let mode = report_mode(false, tty)
     let od = if out_dir.len > 0 && out_dir[out_dir.len - 1] == b'/' { teko::str::slice_to(out_dir, out_dir.len - 1) } else { out_dir }
     match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
     let stem = teko::str::concat(m.name, "-tktest")
     let cfile = teko::str::concat(od, "/", teko::str::concat(stem, ".c"))
     let binp = teko::str::concat(od, "/", stem)
     let covfile = teko::str::concat(od, "/", teko::str::concat(stem, ".tkcov"))
-    // emit the test-profile C (the front->test gap's first silent step — now a visible phase).
     let emit_phase = phase_begin("emit test", cfile, mode)
     let emitted = match codegen::tk_emit_c_test(prog, true) {
         str as s => s
@@ -1614,7 +1652,6 @@ fn run_native_gate(dir: str, out_dir: str, prog: checker::TProgram, m: Manifest,
         null => { }
     }
     phase_end_ok(emit_phase, teko::str::concat(cfile, teko::str::concat(" ", size_text(csrc.len))))
-    // compile the gate binary with the host cc (the front->test gap's slow silent step — now a visible phase).
     let cc_phase = phase_begin("cc test", binp, mode)
     if run_cc(cfile, binp, m, prog, 0) != 0 {
         phase_end_fail(cc_phase, binp, "cc failed to build the native test gate")
@@ -1720,6 +1757,8 @@ fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend, opt: i32, tty: b
  *  lever A — `--no-verify`, build_ungated): a CI-only escape hatch for a self-host chain that has
  *  ALREADY proven the gate on an earlier generation and only needs the fixpoint (`gen2.c == gen3.c`),
  *  not a second full re-verification. `no_verify` changes NOTHING when false — the untouched default.
+ *  The front is PARSED ONCE: the gate checks the tree WITH tests, and the release program later
+ *  derives from the SAME parse via `filter_tkt` (`release_build_of`) — no second lex/parse pass.
  *
  *  @param dir          the project directory
  *  @param out_dir      the build output directory (`-o`, default "bin")
@@ -1738,8 +1777,6 @@ fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, opt
     if no_verify {
         return build_ungated(dir, out_dir, opt, tty, start, backend)
     }
-    // PARSE ONCE: the gate checks the tree WITH tests; the release program later derives
-    // from the SAME parse via `filter_tkt` (release_build_of) — no second lex/parse pass.
     let pf = match frontend_parse(true, false, tty) { ParsedFront as x => x; error as e => return fail(dir, e.message) }
     match frontend_check(pf, false, tty) {
         Frontend as fe => {

@@ -388,6 +388,8 @@ type MachoLayout = struct {
  *
  * @param EncodedModule enc  the section images + symbols + relocations
  * @param u32 strtab_size  the pre-built string-table byte size
+ * @param u32 nreloc_text  the number of __text relocation entries
+ * @param u32 nreloc_const  the number of __const relocation entries
  * @return MachoLayout  the resolved offsets + counts
  */
 fn compute_macho_layout(enc: EncodedModule, strtab_size: u32, nreloc_text: u32, nreloc_const: u32) -> MachoLayout {
@@ -401,9 +403,9 @@ fn compute_macho_layout(enc: EncodedModule, strtab_size: u32, nreloc_text: u32, 
     let seg_data_end = const_offset + const_size
     let nreloc = nreloc_text
     let reloc_offset = align_up(seg_data_end, 4 to u32)
-    let text_reloc_end = reloc_offset + (nreloc_text * (8 to u32))
+    let text_reloc_end = reloc_offset + (nreloc_text * MACHO_RELOC_ENTRY_SIZE)
     let const_reloc_offset = text_reloc_end
-    let reloc_end = const_reloc_offset + (nreloc_const * (8 to u32))
+    let reloc_end = const_reloc_offset + (nreloc_const * MACHO_RELOC_ENTRY_SIZE)
     let symtab_offset = align_up(reloc_end, 8 to u32)
     let nsyms = enc.symbols.len to u32
     let symtab_end = symtab_offset + (nsyms * (16 to u32))
@@ -429,6 +431,13 @@ fn compute_macho_layout(enc: EncodedModule, strtab_size: u32, nreloc_text: u32, 
         nundef = nsyms - ndef
     }
 }
+
+/**
+ * MACHO_RELOC_ENTRY_SIZE — `sizeof(relocation_info)` (8 bytes): the fixed
+ * external size of one relocation-table entry — a 4-byte `r_address` followed
+ * by the 4-byte packed bitfield word.
+ */
+const MACHO_RELOC_ENTRY_SIZE: u32 = 8 to u32
 
 /**
  * MACHO_MAGIC_64 — the Mach-O `mach_header_64.magic` file-magic (`MH_MAGIC_64`,
@@ -673,13 +682,17 @@ fn emit_dysymtab_cmd(buf: []byte, lay: MachoLayout) -> []byte {
 }
 
 /**
- * emit_reloc_table — the `__text` `relocation_info` array: one 8-byte entry per
- * relocation — the section-relative `r_address`, then the packed
- * `r_symbolnum | r_pcrel<<24 | r_length(2)<<25 | r_extern(1)<<27 | r_type<<28`.
- * Every A4 relocation is an external, long, symbol-indexed fixup.
+ * emit_reloc_table — one section's `relocation_info` array (the table is
+ * emitted per section: once for `__text`, once for `__const`): one 8-byte
+ * entry per relocation — the section-relative `r_address`, then the packed
+ * `r_symbolnum | r_pcrel<<24 | r_length<<25 | r_extern(1)<<27 | r_type<<28`.
+ * `r_length` varies per kind via `reloc_length(k)`: 2 (a 4-byte instruction
+ * word) for the instruction fixups, 3 (an 8-byte quad) for `Abs64`. Every
+ * relocation is an external, symbol-indexed fixup.
  *
  * @param []byte buf  the buffer to extend
- * @param EncodedModule enc  the module (relocations + symbol table for indices)
+ * @param []Reloc relocs  the section's relocations to emit
+ * @param []Symbol symbols  the symbol table, for `r_symbolnum` indices
  * @return []byte  `buf` followed by the relocation entries
  */
 fn emit_reloc_table(buf: []byte, relocs: []Reloc, symbols: []Symbol) -> []byte {

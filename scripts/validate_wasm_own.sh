@@ -102,7 +102,7 @@ if [[ ! -x "$teko_abs" ]]; then
     fi
     if [[ -x "$builder_abs" ]]; then
         echo "validate_wasm_own: $TEKO not found — self-hosting via $builder_abs build $script_dir -o bin"
-        if ! "$builder_abs" build "$script_dir" -o "$script_dir/bin" >/tmp/teko-valwasm-selfhost.log 2>&1; then
+        if ! "$builder_abs" build "$script_dir" -o "$script_dir/bin" --no-verify >/tmp/teko-valwasm-selfhost.log 2>&1; then
             echo "validate_wasm_own: self-host build failed — see /tmp/teko-valwasm-selfhost.log" >&2
             tail -20 /tmp/teko-valwasm-selfhost.log | sed 's/^/      | /'
             exit 2
@@ -303,7 +303,7 @@ echo
 check_execution() {
     local name="$1" proj="$2" wasmp="$3" kind="$4" target="$5"
     local cout="$work/$name-c"
-    ( unset TEKO_BACKEND; "$teko_abs" build "$proj" -o "$cout" ) >"$work/$name.cbuild" 2>&1
+    ( unset TEKO_BACKEND; "$teko_abs" build "$proj" -o "$cout" --no-verify ) >"$work/$name.cbuild" 2>&1
     if [[ $? -ne 0 ]]; then
         printf 'FAIL  %-16s C-native oracle build failed (wasmtime leg)\n' "$name"
         tail -8 "$work/$name.cbuild" | sed 's/^/      | /'
@@ -343,7 +343,7 @@ for proj in "${fixtures[@]}"; do
     oout="$work/$name-wasm"
     target="$(target_of "$name")"
 
-    env TEKO_BACKEND=native TEKO_TARGET="$target" "$teko_abs" build "$proj" -o "$oout" >"$work/$name.wbuild" 2>&1
+    env TEKO_BACKEND=native TEKO_TARGET="$target" "$teko_abs" build "$proj" -o "$oout" --no-verify >"$work/$name.wbuild" 2>&1
     build_rc=$?
 
     if [[ "$build_rc" -ne 0 ]]; then

@@ -1,0 +1,296 @@
+/**
+ * Dependency ordering of the module-level consts (#594 crumb 4/8b): the `(name, namespace)`-keyed
+ * visiting-set DFS that emits every const after its Tier-3 references, split out as a sibling of the
+ * same `checker` namespace.
+ */
+
+/**
+ * ConstKey — a module-level const's dependency-graph identity: its bare name paired with the
+ * namespace the type-checker resolved a reference to (`TVar.func_ns`) — the SAME pair the c8b-keyed
+ * inliner matches (#594 crumb 4/8b). Keying the dependency DFS on `(name, namespace)`, not the bare
+ * name alone, keeps a project const and a same-name dep const as DISTINCT graph nodes: name-only
+ * keying conflated the two into one node, which either silently dropped one of the pair from the
+ * topological order (`ordered`) or manufactured a false reference cycle out of two UNRELATED
+ * same-name consts' edges.
+ *
+ * @field name  the const's bare name
+ * @field ns    the const's declaring namespace
+ */
+type ConstKey = struct { name: str; ns: str }
+
+/**
+ * const_key_eq — true iff two `ConstKey`s name the SAME const: both the bare name and the declaring
+ * namespace match (#594 crumb 4/8b).
+ *
+ * @param a  the first key
+ * @param b  the second key
+ * @return   whether `a` and `b` identify the same const
+ * @since #594
+ */
+fn const_key_eq(a: ConstKey, b: ConstKey) -> bool {
+    a.name == b.name && a.ns == b.ns
+}
+
+/**
+ * const_decl_key — the dependency-graph identity of a typed const declaration: its bare name paired
+ * with its own declaring namespace (#594 crumb 4/8b).
+ *
+ * @param cd  the const declaration
+ * @return    its `(name, namespace)` key
+ * @since #594
+ */
+fn const_decl_key(cd: TConstDecl) -> ConstKey {
+    ConstKey { name = cd.name; ns = cd.namespace }
+}
+
+/**
+ * ConstDepState — the accumulator threaded through the const dependency-order DFS (#594 crumb 4/8b):
+ * the consts emitted so far in dependency order, the finished set, and the current DFS path (the
+ * visiting-set), each tracked by `ConstKey` so a project const and a same-name dep const are distinct
+ * nodes. A key re-entered while still on `onpath` is a reference cycle.
+ *
+ * @field ordered  the consts already emitted, dependencies before dependents
+ * @field done     the keys whose subtree is fully ordered (never revisited)
+ * @field onpath   the keys on the current DFS path (the visiting-set for cycle detection)
+ */
+type ConstDepState = struct { ordered: []TConstDecl; done: []ConstKey; onpath: []ConstKey }
+
+/**
+ * const_key_in — true iff `k` occurs in `xs` (a linear scan over the small const-key sets the
+ * dependency DFS threads) (#594 crumb 4/8b).
+ *
+ * @param xs  the set of keys to scan
+ * @param k   the key sought
+ * @return    whether `k` is present in `xs`
+ * @since #594
+ */
+fn const_key_in(xs: []ConstKey, k: ConstKey) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if const_key_eq(xs[i], k) { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * collect_const_keys — the dependency-graph identity of every module-level const in `consts`,
+ * preserving declaration order (the DFS seed set and the reference-edge filter) (#594 crumb 4/8b).
+ *
+ * @param consts  the program's module-level consts
+ * @return        their `(name, namespace)` keys in declaration order
+ * @since #594
+ */
+fn collect_const_keys(consts: []TConstDecl) -> []ConstKey {
+    mut out: []ConstKey = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        out = teko::list::push(out, const_decl_key(consts[i]))
+        i++
+    }
+    out
+}
+
+/**
+ * find_const_by_key — the const in `consts` whose `(name, namespace)` equals `k`, or null when none
+ * (defensive: a dependency key is always drawn from the const set, so the null arm is unreachable in
+ * practice) (#594 crumb 4/8b).
+ *
+ * @param consts  the program's module-level consts
+ * @param k       the const key to resolve
+ * @return        the matching TConstDecl, or null when absent
+ * @since #594
+ */
+fn find_const_by_key(consts: []TConstDecl, k: ConstKey) -> TConstDecl? {
+    mut i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        if const_key_eq(const_decl_key(consts[i]), k) { return consts[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * const_dep_refs_list — accumulate every Tier-3 const reference in `xs` onto `acc`, in order (#594
+ * crumb 4/8b). Shared by the aggregate (Tier 4) and allowlisted-call (Tier 5) arms of
+ * `const_dep_refs`.
+ *
+ * @param xs    the sub-expressions to scan in order
+ * @param keys  the const-key set (only a key in this set becomes an edge)
+ * @param acc   the references collected so far (deduplicated)
+ * @return      `acc` grown with every fresh const reference found in `xs`
+ * @since #594
+ */
+fn const_dep_refs_list(xs: []TExpr, keys: []ConstKey, acc: []ConstKey) -> []ConstKey {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out = const_dep_refs(xs[i], keys, out)
+        i++
+    }
+    out
+}
+
+/**
+ * const_dep_refs — the Tier-3 dependency edges of a const initializer: every bare-name reference in
+ * `e` that resolves to another module-level const — matched by `(name, namespace)` against
+ * `v.func_ns`, the SAME stamp the c8b-keyed inliner matches — collected without duplicates (#594
+ * crumb 4/8b). Recurses structurally over the same const-legal expression shapes `is_const_expr`
+ * admits; an enum/flags member is a `TPathExpr` (not a `TVar`) and contributes no const edge.
+ *
+ * @param e     the typed const initializer (or a sub-expression of one)
+ * @param keys  the module-level const-key set
+ * @param acc   the references collected so far (deduplicated)
+ * @return      `acc` grown with every fresh const reference reachable from `e`
+ * @since #594
+ */
+fn const_dep_refs(e: TExpr, keys: []ConstKey, acc: []ConstKey) -> []ConstKey {
+    match e.kind {
+        TVar as v => const_dep_refs_var(v, keys, acc)
+        TCast as c => const_dep_refs(c.expr, keys, acc)
+        TUnary as u => const_dep_refs(u.operand, keys, acc)
+        TBinary as b => const_dep_refs(b.right, keys, const_dep_refs(b.left, keys, acc))
+        TArrayLit as a => const_dep_refs_array(a, keys, acc)
+        TStructInit as s => const_dep_refs_list(s.field_vals, keys, acc)
+        TCall as c => const_dep_refs_list(c.args, keys, acc)
+        _ => acc
+    }
+}
+
+/**
+ * const_dep_refs_var — the Tier-3 edge (if any) a bare-name reference contributes: its `(name,
+ * func_ns)` key is added to `acc` when it names another module-level const and is not already
+ * present (#594 crumb 4/8b).
+ *
+ * @param v     the typed variable reference
+ * @param keys  the module-level const-key set
+ * @param acc   the references collected so far (deduplicated)
+ * @return      `acc`, grown with `v`'s key when it is a fresh const reference
+ * @since #594
+ */
+fn const_dep_refs_var(v: TVar, keys: []ConstKey, acc: []ConstKey) -> []ConstKey {
+    let k = ConstKey { name = v.name; ns = v.func_ns }
+    if const_key_in(keys, k) && !const_key_in(acc, k) { teko::list::push(acc, k) } else { acc }
+}
+
+/**
+ * const_dep_refs_array — the Tier-3 references in an array/slice literal (Tier 4): every element's
+ * own references, in order (#594 crumb 4/8b).
+ *
+ * @param a     the typed array literal
+ * @param keys  the module-level const-key set
+ * @param acc   the references collected so far (deduplicated)
+ * @return      `acc` grown with every fresh const reference in `a`'s elements
+ * @since #594
+ */
+fn const_dep_refs_array(a: TArrayLit, keys: []ConstKey, acc: []ConstKey) -> []ConstKey {
+    mut out = acc
+    mut i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        out = const_dep_refs(a.elements[i].expr, keys, out)
+        i++
+    }
+    out
+}
+
+/**
+ * const_key_display — a human-readable rendering of a `ConstKey` for a cycle message: the bare name
+ * alone when its namespace is empty (the common project-only case), else `ns::name` (#594 crumb
+ * 4/8b) — disambiguating a cycle path that crosses a same-name dep/project pair.
+ *
+ * @param k  the key to render
+ * @return   the key's display text
+ * @since #594
+ */
+fn const_key_display(k: ConstKey) -> str {
+    if k.ns == "" { k.name } else { $"{k.ns}::{k.name}" }
+}
+
+/**
+ * const_cycle_error — a located error naming a constant reference cycle, rendering the current DFS
+ * path with the re-entered key appended (`constant cycle: A → B → A`), positioned at the re-entered
+ * const's declaration (#594 crumb 4/8b).
+ *
+ * @param key     the key re-entered while still on the DFS path (the back-edge target)
+ * @param onpath  the DFS path leading to the back-edge
+ * @param consts  the program's consts (to position the error at the key's declaration)
+ * @return        the located cycle error
+ * @since #594
+ */
+fn const_cycle_error(key: ConstKey, onpath: []ConstKey, consts: []TConstDecl) -> error {
+    mut path = ""
+    mut i: u64 = 0
+    loop {
+        if i >= onpath.len { break }
+        path = if i == 0 { const_key_display(onpath[i]) } else { $"{path} → {const_key_display(onpath[i])}" }
+        i++
+    }
+    let full = if onpath.len == 0 { const_key_display(key) } else { $"{path} → {const_key_display(key)}" }
+    let msg = $"constant cycle: {full} (#594)"
+    match find_const_by_key(consts, key) {
+        TConstDecl as cd => teko::error::err_loc(error { message = msg }, cd.line, cd.col)
+        null => error { message = msg }
+    }
+}
+
+/**
+ * const_dep_visit — a single DFS step: order `key`'s dependency subtree ahead of `key` itself, or
+ * report a cycle (#594 crumb 4/8b). A finished key is a no-op; a key already on the current path is
+ * a back-edge (`const_cycle_error`); otherwise `key` is pushed onto the path, each of its Tier-3
+ * references is visited (deps first), then the const is emitted and marked done and popped from the
+ * path.
+ *
+ * @param key     the const key to visit
+ * @param consts  the program's module-level consts
+ * @param keys    the const-key set (the edge filter)
+ * @param st      the DFS accumulator entering this step
+ * @return        the accumulator after `key`'s subtree is ordered, or a located cycle error
+ * @throws        a located `constant cycle` error when `key` re-enters the current DFS path
+ * @since #594
+ */
+fn const_dep_visit(key: ConstKey, consts: []TConstDecl, keys: []ConstKey, st: ConstDepState) -> ConstDepState | error {
+    if const_key_in(st.done, key) { return st }
+    if const_key_in(st.onpath, key) { return const_cycle_error(key, st.onpath, consts) }
+    let cd = match find_const_by_key(consts, key) { TConstDecl as x => x; null => return st }
+    mut cur = ConstDepState { ordered = st.ordered; done = st.done; onpath = teko::list::push(st.onpath, key) }
+    let refs = const_dep_refs(cd.init, keys, teko::list::empty())
+    mut i: u64 = 0
+    loop {
+        if i >= refs.len { break }
+        cur = match const_dep_visit(refs[i], consts, keys, cur) { ConstDepState as x => x; error as e => return e }
+        i++
+    }
+    ConstDepState { ordered = teko::list::push(cur.ordered, cd); done = teko::list::push(cur.done, key); onpath = st.onpath }
+}
+
+/**
+ * const_dep_order — topologically order the program's module-level consts by their Tier-3 references
+ * so an inlining pass never substitutes an unresolved const, and a reference cycle is reported as a
+ * located error (#594 crumb 4/8b). A visiting-set DFS from each declaration, keyed by `(name,
+ * namespace)` — the SAME pair the c8b inliner matches via `TVar.func_ns` — so a project const and a
+ * same-name dep const are DISTINCT graph nodes: neither is silently dropped from the order (the OLD
+ * name-only DFS marked the second same-name decl "done" without ever emitting it) nor conflated into
+ * a false cycle out of two unrelated same-name consts' edges. Does NOT fold numerically — ordering is
+ * over AST references only.
+ *
+ * @param consts  every module-level TConstDecl in the program
+ * @return        the consts in dependency order (dependencies first), or a located cycle error
+ * @throws        a `constant cycle` error naming the offending path when the references form a cycle
+ * @since #594
+ */
+fn const_dep_order(consts: []TConstDecl) -> []TConstDecl | error {
+    let keys = collect_const_keys(consts)
+    mut st = ConstDepState { ordered = teko::list::empty(); done = teko::list::empty(); onpath = teko::list::empty() }
+    mut i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        st = match const_dep_visit(const_decl_key(consts[i]), consts, keys, st) { ConstDepState as x => x; error as e => return e }
+        i++
+    }
+    st.ordered
+}
