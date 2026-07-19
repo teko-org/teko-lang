@@ -4947,6 +4947,75 @@ pub fn wasm_layout_rodata(rodata: []lir::LRodata, base: u32) -> WasmRodataLayout
 }
 
 /**
+ * wasm_data_addr_of — o endereço ABSOLUTO de memória linear da entrada rodata cujo
+ * símbolo é `target`, buscado nas tabelas paralelas `symbols`/`offsets` de um layout
+ * de rodata (#594 T-B4). É a resolução do ALVO de um ponteiro data→data no wasm:
+ * como o data segment ativo fica numa base fixa e conhecida na emissão
+ * (`wasm_rodata_base`), o offset de cada entrada JÁ é o seu endereço absoluto final,
+ * então um ponteiro intra-data é uma constante i32 de compile-time — sem relocation,
+ * o endereço é gravado direto no slot. Devolve um erro NOMEADO (não um skip silencioso)
+ * quando nenhuma entrada carrega esse símbolo, mantendo o miscompile impossível.
+ *
+ * @param []str symbols  os símbolos das entradas laid-out, paralelo a `offsets`
+ * @param []u32 offsets  o endereço absoluto de memória linear de cada entrada
+ * @param str target  o símbolo da entrada referenciada
+ * @return u32 | error  o endereço absoluto do alvo, ou um erro nomeado
+ */
+fn wasm_data_addr_of(symbols: []str, offsets: []u32, target: str) -> u32 | error {
+    mut i: u64 = 0
+    loop {
+        if i >= symbols.len { break }
+        if symbols[i] == target { return offsets[i] }
+        i++
+    }
+    error { message = $"stackify: rodata-internal pointer targets unknown rodata symbol '{target}' (#594 T-B4)" }
+}
+
+/**
+ * wasm_relocate_rodata — resolve as relocations INTERNAS de ponteiro de cada entrada
+ * rodata num layout já montado, devolvendo o layout com os bytes do seu data segment
+ * patcheados in-place (#594 T-B4). Para cada `LDataReloc { offset; target }` da
+ * entrada `i`, o endereço absoluto de `target` (`wasm_data_addr_of`) é escrito no slot
+ * de ponteiro no byte segment-relativo `(layout.offsets[i] - base) + offset`. O wasm
+ * NÃO tem linker e o data segment ativo fica numa base fixa conhecida na emissão
+ * (`wasm_rodata_base`), então um ponteiro intra-data é uma constante i32 de
+ * compile-time escrita direto no segment — o análogo wasm das relocations data→data
+ * `.rela.rodata`/`__const` dos writers nativos (T-B2/T-B3), emitido SEM registro de
+ * relocation. O slot de 8 bytes que o serializer Tier-B reserva é preenchido
+ * low-word-first: no wasm32 o endereço i32 ocupa os bytes [p, p+4) e o word alto
+ * [p+4, p+8) permanece zero (um endereço linear nunca excede 2^32). Toda entrada
+ * rodata que o compilador produz HOJE tem `relocs` VAZIO (o produtor `serialize_const`
+ * honest-stopa agregados pointer-bearing até T-B6), então isto devolve o layout
+ * byte-idêntico e todo golden wasm fica intacto. O arm wasm64 (i64) NÃO é implementado
+ * aqui: um programa wasm64 com rodata é honest-stopado a montante por
+ * `wasm_scope_stop_wasm64`, então o único arm alcançável é o write i32 do wasm32.
+ *
+ * @param WasmRodataLayout layout  o rodata laid-out (`wasm_layout_rodata`)
+ * @param []lir::LRodata rodata  as entradas na MESMA ordem (as suas relocs)
+ * @return WasmRodataLayout | error  o layout com os slots de ponteiro escritos, ou o
+ *                                   erro nomeado de alvo desconhecido propagado
+ */
+pub fn wasm_relocate_rodata(layout: WasmRodataLayout, rodata: []lir::LRodata) -> WasmRodataLayout | error {
+    let base = layout.segment.offset
+    mut buf = layout.segment.bytes
+    mut i: u64 = 0
+    loop {
+        if i >= rodata.len { break }
+        let entry_start = layout.offsets[i] - base
+        mut j: u64 = 0
+        loop {
+            if j >= rodata[i].relocs.len { break }
+            let rel = rodata[i].relocs[j]
+            let addr = match wasm_data_addr_of(layout.symbols, layout.offsets, rel.target) { u32 as a => a; error as e => return e }
+            buf = write_u32_le_at(buf, entry_start + rel.offset, addr)
+            j++
+        }
+        i++
+    }
+    WasmRodataLayout { segment = WasmDataSegment { offset = base; bytes = buf }; symbols = layout.symbols; offsets = layout.offsets; end = layout.end }
+}
+
+/**
  * wasm_symtab_add_rodata — register every `WasmRodataLayout` entry's own
  * symbol/offset into `t` in one pass (`wasm_symtab_add_data`), so a caller
  * assembling a module registers a whole rodata table's worth of
@@ -5999,7 +6068,8 @@ pub fn wasm_assemble_program(lmod: lir::LModule, ptr64: bool) -> WasmModule | er
         return wasm_scope_stop_wasm64()
     }
     let wasi = wasm_wasi_import_set()
-    let rodata = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let rodata0 = wasm_layout_rodata(lmod.rodata, wasm_rodata_base())
+    let rodata = match wasm_relocate_rodata(rodata0, lmod.rodata) { WasmRodataLayout as x => x; error as e => return e }
     let io_base_index = wasm_io_base_index(wasi, lmod)
     let program_symtab_base = wasm_register_program_symbols(wasi, lmod.funcs)
     let program_symtab = if has_io { wasm_register_io_symbols(program_symtab_base, io_base_index) } else { program_symtab_base }

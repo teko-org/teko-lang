@@ -1818,6 +1818,13 @@ pub type RelocRiscv = struct {
      * rodata `PcRelHi20` target's `.rodata` offset folded on by the writer.
      */
     addend: i64
+    /**
+     * sect — which section this relocation's patched field lives in (#594 T-B1):
+     * `Text` (the historical default — `offset` is `.text`-base-relative), or
+     * `Rodata` (a data→data pointer whose `offset` is rodata-base-relative,
+     * emitted only from T-B2 on). Every reloc the encoder builds today is `Text`.
+     */
+    sect: RelocSect
 }
 
 /**
@@ -2196,7 +2203,7 @@ fn finalize_func_riscv(symbol: str, acc: FuncEmitRiscv, offsets: []BlockOffsetRi
         let w = match resolve_word_riscv(ew, i to u32, offsets) { u32 as v => v; error as e => return e }
         out_words = teko::list::push(out_words, w)
         if ew.has_reloc {
-            relocs = teko::list::push(relocs, RelocRiscv { offset = (i to u32) * RISCV_WORD_BYTES; sym = ew.reloc_sym; kind = ew.reloc_kind; addend = 0 to i64 })
+            relocs = teko::list::push(relocs, RelocRiscv { offset = (i to u32) * RISCV_WORD_BYTES; sym = ew.reloc_sym; kind = ew.reloc_kind; addend = 0 to i64; sect = RelocSect::Text })
         }
         i++
     }
@@ -2319,7 +2326,7 @@ fn rebase_relocs_riscv(acc: []RelocRiscv, relocs: []RelocRiscv, base: u32) -> []
     loop {
         if i >= relocs.len { break }
         let r = relocs[i]
-        out = teko::list::push(out, RelocRiscv { offset = r.offset + base; sym = r.sym; kind = r.kind; addend = r.addend })
+        out = teko::list::push(out, RelocRiscv { offset = r.offset + base; sym = r.sym; kind = r.kind; addend = r.addend; sect = r.sect })
         i++
     }
     out
@@ -2469,6 +2476,48 @@ fn collect_undefined_riscv(defined: []Symbol, relocs: []RelocRiscv) -> []Symbol 
 }
 
 /**
+ * rodata_relocs_riscv — convert the NEUTRAL rebased `ModuleRodata.relocs` into riscv
+ * `RelocRiscv` rows (#594 T-B5): each rodata-internal pointer becomes an `Abs64`
+ * (R_RISCV_64) relocation whose patch site is `.rodata`-relative (`sect = Rodata`,
+ * addend 0), targeting the datum's own local symbol. Empty in every real compile
+ * until T-B6.
+ *
+ * @param []lir::LDataReloc rs  the rebased neutral rodata relocations
+ * @return []RelocRiscv  the `Rodata`-tagged riscv relocation rows
+ */
+fn rodata_relocs_riscv(rs: []lir::LDataReloc) -> []RelocRiscv {
+    mut out: []RelocRiscv = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= rs.len { break }
+        out = teko::list::push(out, RelocRiscv { offset = rs[i].offset; sym = rs[i].target; kind = RelocKindRiscv::Abs64; addend = 0 to i64; sect = RelocSect::Rodata })
+        i++
+    }
+    out
+}
+
+/**
+ * append_relocs_riscv — concatenate two relocation lists (text-partition first, then the
+ * rodata-internal rows; #594 T-B5), preserving each list's emission order. The
+ * module keeps ONE `.sect`-tagged list (the T-B1..T-B3 model); the writers
+ * partition by `RelocSect`.
+ *
+ * @param a  the `__text`/`.text` relocations, in emission order
+ * @param b  the rodata-internal relocations, in emission order
+ * @return   `a` followed by `b`
+ */
+fn append_relocs_riscv(a: []RelocRiscv, b: []RelocRiscv) -> []RelocRiscv {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
  * encode_module_riscv — encode every `MFuncRiscv` of `m`, concatenate their
  * `.text` words into the module image and REBASE each function's reloc/label
  * offsets by its `.text` base, intern the rodata bytes into `.rodata`, and build
@@ -2493,5 +2542,5 @@ pub fn encode_module_riscv(abi: AbiDescriptor, m: MModuleRiscv) -> EncodedModule
     let defined = concat_symbols(local_defined, mt.syms)
     let undef = collect_undefined_riscv(defined, mt.relocs)
     let symbols = concat_symbols(defined, undef)
-    EncodedModuleRiscv { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = mt.relocs }
+    EncodedModuleRiscv { text = mt.text; rodata = rod.bytes; symbols = symbols; relocs = append_relocs_riscv(mt.relocs, rodata_relocs_riscv(rod.relocs)) }
 }

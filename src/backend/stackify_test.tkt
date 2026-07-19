@@ -2156,7 +2156,7 @@ fn stackify_func_two_allocas_matches_wat2wasm_reference() {
  * @return lir::LRodata  the entry
  */
 fn srt_rodata(symbol: str, bytes: []byte) -> lir::LRodata {
-    lir::LRodata { symbol = symbol; bytes = bytes }
+    lir::LRodata { symbol = symbol; bytes = bytes; relocs = teko::list::empty() }
 }
 
 #test
@@ -2606,7 +2606,7 @@ fn program_data_segments_omits_an_empty_rodata_layout() {
  * @return void
  */
 fn program_data_segments_keeps_a_nonempty_rodata_layout() {
-    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte]; relocs = teko::list::empty() }]
     let layout = wasm_layout_rodata(rodata, 8 to u32)
     let segs = wasm_program_data_segments(layout)
     teko::assert::is_true(segs.len == (1 to u64))
@@ -2791,7 +2791,7 @@ fn assemble_program_wasm64_rejects_a_frame_bearing_program() {
  * @return void
  */
 fn assemble_program_wasm64_rejects_a_rodata_bearing_program() {
-    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte]; relocs = teko::list::empty() }]
     let lmod = lir::LModule { funcs = [sft_main_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
     match wasm_assemble_program(lmod, true) {
         WasmModule => teko::assert::is_true(false)
@@ -2840,7 +2840,7 @@ fn sft_rodata_func() -> lir::LFunc {
  * @return void
  */
 fn assemble_program_resolves_rodata_symbols_before_stackifying() {
-    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte]; relocs = teko::list::empty() }]
     let lmod = lir::LModule { funcs = [sft_rodata_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
     let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
     teko::assert::is_true(m.data.len == (1 to u64))
@@ -2878,7 +2878,7 @@ fn assemble_program_wasm32_emits_the_narrow_msg_segment_when_reachable() {
  * @return void
  */
 fn assemble_program_wasm32_orders_the_narrow_msg_segment_before_rodata() {
-    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte] }]
+    let rodata = [lir::LRodata { symbol = "teko__rodata__0"; bytes = [0x68 to byte, 0x69 to byte]; relocs = teko::list::empty() }]
     let lmod = lir::LModule { funcs = [sft_main_func(), sft_ptr_load_func()]; rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
     let m = match wasm_assemble_program(lmod, false) { WasmModule as x => x; error => return }
     teko::assert::is_true(m.data.len == (2 to u64))
@@ -3561,4 +3561,69 @@ fn wasm_io_base_index_follows_the_program_funcs() {
     let wasi = wasm_wasi_import_set()
     let lmod = lir::add_func(lir::add_func(lir::empty_module(), sft_main_func()), sft_empty_func())
     teko::assert::is_true(wasm_io_base_index(wasi, lmod) == (4 to u32))
+}
+
+/**
+ * T-B4: um ponteiro rodata-interno é resolvido em EMIT-TIME — o endereço absoluto
+ * do alvo (base do segment + offset) é escrito i32-LE nos 4 bytes baixos do slot,
+ * word alto zero; symbols/offsets/end do layout ficam intactos.
+ */
+#test
+fn tb4_wasm_relocate_writes_absolute_addr() {
+    let slot = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
+    let p = lir::LRodata { symbol = "p"; bytes = slot; relocs = teko::list::push(teko::list::empty(), lir::data_reloc(0 to u32, "t")) }
+    let t = lir::LRodata { symbol = "t"; bytes = [0x41 to byte]; relocs = teko::list::empty() }
+    let rodata = [p, t]
+    let lay = wasm_layout_rodata(rodata, 1024 to u32)
+    match wasm_relocate_rodata(lay, rodata) {
+        WasmRodataLayout as rel => {
+            teko::assert::is_true(rel.segment.bytes[0] == (0x08 to byte))
+            teko::assert::is_true(rel.segment.bytes[1] == (0x04 to byte))
+            teko::assert::is_true(rel.segment.bytes[2] == (0 to byte))
+            teko::assert::is_true(rel.segment.bytes[3] == (0 to byte))
+            teko::assert::is_true(rel.segment.bytes[4] == (0 to byte))
+            teko::assert::is_true(rel.segment.bytes[8] == (0x41 to byte))
+            teko::assert::is_true(rel.end == lay.end)
+            teko::assert::is_true(rel.offsets[1] == (1032 to u32))
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * T-B4: entradas sem relocs são um no-op — o segment volta byte-idêntico (o braço
+ * de byte-identidade que TODA compilação real exercita hoje).
+ */
+#test
+fn tb4_wasm_relocate_empty_is_identity() {
+    let a = lir::LRodata { symbol = "a"; bytes = [0x68 to byte, 0x69 to byte]; relocs = teko::list::empty() }
+    let rodata = teko::list::push(teko::list::empty(), a)
+    let lay = wasm_layout_rodata(rodata, 1024 to u32)
+    match wasm_relocate_rodata(lay, rodata) {
+        WasmRodataLayout as rel => {
+            teko::assert::is_true(rel.segment.bytes.len == 2)
+            teko::assert::is_true(rel.segment.bytes[0] == (0x68 to byte))
+            teko::assert::is_true(rel.segment.bytes[1] == (0x69 to byte))
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * T-B4: alvo desconhecido é um erro NOMEADO (nunca um skip silencioso) — e o helper
+ * de resolução cobre os dois braços (hit devolve o endereço absoluto; miss erra).
+ */
+#test
+fn tb4_wasm_unknown_target_errors() {
+    let p = lir::LRodata { symbol = "p"; bytes = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]; relocs = teko::list::push(teko::list::empty(), lir::data_reloc(0 to u32, "nope")) }
+    let rodata = teko::list::push(teko::list::empty(), p)
+    let lay = wasm_layout_rodata(rodata, 1024 to u32)
+    match wasm_relocate_rodata(lay, rodata) {
+        WasmRodataLayout => teko::assert::is_true(false)
+        error as e => teko::assert::str_contains(e.message, "T-B4")
+    }
+    match wasm_data_addr_of(lay.symbols, lay.offsets, "p") {
+        u32 as a => teko::assert::is_true(a == (1024 to u32))
+        error => teko::assert::is_true(false)
+    }
 }

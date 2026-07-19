@@ -582,7 +582,7 @@ fn rvenc_call_func() -> MFuncRiscv {
  * @return FrameLayoutRiscv  the resolved frame side-table
  */
 fn rvenc_layout(f: MFuncRiscv) -> FrameLayoutRiscv {
-    compute_frame_layout_riscv(riscv64_lp64d(), f)
+    compute_frame_layout_riscv(RISCV64_LP64D, f)
 }
 
 /**
@@ -821,7 +821,7 @@ fn rvenc_fpr_callee_saved_honest_stop() {
  * @return EncodedFuncRiscv  the encoded function, or an empty stand-in on error
  */
 fn rvenc_encode_func(f: MFuncRiscv) -> EncodedFuncRiscv {
-    match encode_func_riscv(riscv64_lp64d(), f, 0 to u32) {
+    match encode_func_riscv(RISCV64_LP64D, f, 0 to u32) {
         FuncEncOutRiscv as o => o.func
         error as e => EncodedFuncRiscv { symbol = "<error>"; words = teko::list::empty(); relocs = teko::list::empty(); labels = teko::list::empty() }
     }
@@ -1036,7 +1036,7 @@ fn rvenc_lla_synthesized_label() {
  */
 fn rvenc_module_call_symbols() {
     let m = add_mfunc_riscv(empty_mmodule_riscv(), rvenc_call_only_func())
-    let enc = match encode_module_riscv(riscv64_lp64d(), m) {
+    let enc = match encode_module_riscv(RISCV64_LP64D, m) {
         EncodedModuleRiscv as x => x
         error as e => EncodedModuleRiscv { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
     }
@@ -1064,7 +1064,7 @@ fn rvenc_module_call_symbols() {
 fn rvenc_module_pcrel_label_local() {
     let m0 = add_mfunc_riscv(empty_mmodule_riscv(), rvenc_lla_func())
     let m1 = add_mfunc_riscv(m0, rvenc_lla_func())
-    let enc = match encode_module_riscv(riscv64_lp64d(), m1) {
+    let enc = match encode_module_riscv(RISCV64_LP64D, m1) {
         EncodedModuleRiscv as x => x
         error as e => EncodedModuleRiscv { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
     }
@@ -1085,7 +1085,7 @@ fn rvenc_module_pcrel_label_local() {
  */
 fn rvenc_badblock_stop() -> str {
     let f = append_minst_riscv(new_mfunc_riscv("bad"), 0 to u32, jal_riscv(99 to u32))
-    match encode_func_riscv(riscv64_lp64d(), f, 0 to u32) {
+    match encode_func_riscv(RISCV64_LP64D, f, 0 to u32) {
         FuncEncOutRiscv as o => "<ok>"
         error as e => e.message
     }
@@ -1111,7 +1111,7 @@ fn rvenc_badblock_internal_invariant() {
  * @return str  the error message, or `<ok>`
  */
 fn rvenc_func_stop(f: MFuncRiscv) -> str {
-    match encode_func_riscv(riscv64_lp64d(), f, 0 to u32) {
+    match encode_func_riscv(RISCV64_LP64D, f, 0 to u32) {
         FuncEncOutRiscv as o => "<ok>"
         error as e => e.message
     }
@@ -1161,7 +1161,7 @@ fn rvenc_func_pass_propagates_stops() {
  * @return str  the error message, or `<ok>`
  */
 fn rvenc_module_stop(m: MModuleRiscv) -> str {
-    match encode_module_riscv(riscv64_lp64d(), m) {
+    match encode_module_riscv(RISCV64_LP64D, m) {
         EncodedModuleRiscv as x => "<ok>"
         error as e => e.message
     }
@@ -1353,7 +1353,7 @@ fn rvenc_encode_func_splices_frame_around_body() {
 fn rvenc_module_rebases_reloc_at_nonzero_base() {
     let m0 = add_mfunc_riscv(empty_mmodule_riscv(), rvenc_call_only_func())
     let m1 = add_mfunc_riscv(m0, rvenc_call_func())
-    let enc = match encode_module_riscv(riscv64_lp64d(), m1) {
+    let enc = match encode_module_riscv(RISCV64_LP64D, m1) {
         EncodedModuleRiscv as x => x
         error as e => EncodedModuleRiscv { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
     }
@@ -1363,4 +1363,23 @@ fn rvenc_module_rebases_reloc_at_nonzero_base() {
     teko::assert::str_contains(enc.relocs[0 to u64].sym, "tk_exit")
     teko::assert::is_true(enc.relocs[1 to u64].offset == (36 to u32))
     teko::assert::str_contains(enc.relocs[1 to u64].sym, "tk_thing")
+}
+
+/**
+ * T-B5 (inverte a fixture T-B1): o encoder riscv agora PRODUZ a relocation
+ * `Abs64`/`Rodata` re-baseada (R_RISCV_64 no bridge ELF) para um ponteiro
+ * rodata-interno.
+ */
+#test
+fn tb1_riscv_data_reloc_now_produces() {
+    let rod = teko::list::push(teko::list::empty(), lir::LRodata { symbol = "k"; bytes = teko::list::push(teko::list::empty(), 0 to byte); relocs = teko::list::push(teko::list::empty(), lir::data_reloc(0 to u32, "k")) })
+    let m = MModuleRiscv { funcs = teko::list::empty(); rodata = rod; globals = teko::list::empty(); layouts = teko::list::empty() }
+    match encode_module_riscv(RISCV64_LP64D, m) {
+        EncodedModuleRiscv as em => {
+            teko::assert::is_true(em.relocs.len == 1)
+            teko::assert::is_true(em.relocs[0].sect == RelocSect::Rodata)
+            teko::assert::is_true(em.relocs[0].sym == "k")
+        }
+        error => teko::assert::is_true(false)
+    }
 }

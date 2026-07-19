@@ -837,6 +837,7 @@ fn lwt_agg_slice_const_materializes_one_rodata_entry() {
     teko::assert::is_true(m.globals.len == 0)
     teko::assert::is_true(m.rodata.len == 1)
     teko::assert::is_true(m.rodata[0].symbol == ".Lconst_NUMS")
+    teko::assert::is_true(m.rodata[0].relocs.len == 0)   // T-B1: rodata interned nunca carrega data-reloc hoje
     teko::assert::is_true(m.rodata[0].bytes.len == 16)
     teko::assert::is_true(m.rodata[0].bytes[0] == (10 to byte))
     teko::assert::is_true(m.rodata[0].bytes[8] == (20 to byte))
@@ -896,6 +897,148 @@ fn lwt_agg_empty_variant_const_interns_its_tag_image() {
     teko::assert::is_true(m.rodata[0].bytes[1] == (0 to byte))
     teko::assert::is_true(m.rodata[0].bytes[2] == (0 to byte))
     teko::assert::is_true(m.rodata[0].bytes[3] == (0 to byte))
+}
+
+/**
+ * lwt_slice_field — a struct `parser::Field` whose annotation is a `[]<elem>` slice — the fat-pointer
+ * field shape the T-B6 layout widens to 16 bytes and the producer materializes as `{ptr->leaf, len}`
+ * (#594 T-B6).
+ *
+ * @param name        the field's name
+ * @param elem_tname  the slice element type's bare name
+ * @return            the slice-typed struct field
+ */
+fn lwt_slice_field(name: str, elem_tname: str) -> parser::Field {
+    parser::Field { name = name; type_ann = parser::SliceType { element = lwt_named_te(elem_tname) }; vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
+}
+
+/**
+ * lwt_tb6_fat_field_widens_layout_to_sixteen_bytes — the T-B6 layout keystone (#594 §7.4): `struct S {
+ * xs: []u32; n: u32 }` lays `xs` (a fat field) at offset 0 spanning 16 bytes `{ptr, len}` and `n` at
+ * offset 16 (4 bytes), so the struct is size 24 (padded to its 8-byte alignment) — the widening the
+ * serializer writes and the reader loads agree on. The old `ltype_of_typeexpr`-only mapping collapsed
+ * `xs` to a bare 8-byte `Ptr`, under-sizing `S` to 12 and giving `n` no room for the len half.
+ *
+ * @return void
+ */
+#test
+fn lwt_tb6_fat_field_widens_layout_to_sixteen_bytes() {
+    let fields = lwt_two_fields(lwt_slice_field("xs", "u32"), lwt_field("n", "u32"))
+    let layout = layout_of_fields("S", fields, teko::list::empty())
+    teko::assert::is_true(layout.size == (24 to u32))
+    teko::assert::is_true(layout.align == (8 to u32))
+    teko::assert::is_true(layout.field_offsets[0] == (0 to u32))
+    teko::assert::is_true(layout.field_offsets[1] == (16 to u32))
+}
+
+/**
+ * lwt_tb6_producer_emits_leaf_reloc_and_inline_len — the T-B6 producer keystone (#594 §7.1/§7.2): a
+ * `const K: S = { xs = [10, 20]; n = 2 }` over `struct S { xs: []u32; n: u32 }` NO LONGER honest-stops
+ * (the pre-T-B6 gate rejected the slice field as Tier-B); `serialize_const` returns a `ConstImage` with
+ * ONE leaf `.Lconst_K.xs` (the two u32 elements little-endian, empty relocs), ONE `LDataReloc` at the
+ * `xs` slot offset 0 targeting that leaf, and a 24-byte blob whose pointer slot (0..8) is zero, whose
+ * inline len (@8) is the element count 2, and whose scalar `n` (@16) is 2. Serializing the SAME const
+ * twice yields identical bytes/reloc/leaf — the pure-function leaf symbol is deterministic
+ * (fixpoint-safe).
+ *
+ * @return void
+ */
+#test
+fn lwt_tb6_producer_emits_leaf_reloc_and_inline_len() {
+    let fields = lwt_two_fields(lwt_slice_field("xs", "u32"), lwt_field("n", "u32"))
+    let layout = layout_of_fields("S", fields, teko::list::empty())
+    let layouts = lwt_one_layout(layout)
+    let elems = teko::list::push(teko::list::push(teko::list::empty(), lwt_num(10 to i128, checker::PrimKind::U32)), lwt_num(20 to i128, checker::PrimKind::U32))
+    let xs_lit = lwt_array_lit(elems, checker::PrimKind::U32)
+    let n_val = lwt_num(2 to i128, checker::PrimKind::U32)
+    let fnames = teko::list::push(teko::list::push(teko::list::empty(), "xs"), "n")
+    let fvals = teko::list::push(teko::list::push(teko::list::empty(), xs_lit), n_val)
+    let si = lwt_struct_init("S", fnames, fvals)
+    let cd = checker::TConstDecl { name = "K"; namespace = ""; ty = checker::Named { name = "S" }; init = si; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let img = match serialize_const(cd, layouts, teko::list::empty()) { ConstImage as x => x; error as e => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(img.leaves.len == 1)
+    teko::assert::is_true(img.leaves[0].symbol == ".Lconst_K.xs")
+    teko::assert::is_true(img.leaves[0].relocs.len == 0)
+    teko::assert::is_true(img.leaves[0].bytes.len == 8)
+    teko::assert::is_true(img.leaves[0].bytes[0] == (10 to byte))
+    teko::assert::is_true(img.leaves[0].bytes[4] == (20 to byte))
+    teko::assert::is_true(img.relocs.len == 1)
+    teko::assert::is_true(img.relocs[0].offset == (0 to u32))
+    teko::assert::is_true(img.relocs[0].target == ".Lconst_K.xs")
+    teko::assert::is_true(img.bytes.len == 24)
+    teko::assert::is_true(img.bytes[0] == (0 to byte))
+    teko::assert::is_true(img.bytes[7] == (0 to byte))
+    teko::assert::is_true(img.bytes[8] == (2 to byte))
+    teko::assert::is_true(img.bytes[16] == (2 to byte))
+    let img2 = match serialize_const(cd, layouts, teko::list::empty()) { ConstImage as x => x; error as e => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(img2.leaves[0].symbol == img.leaves[0].symbol)
+    teko::assert::is_true(img2.relocs[0].offset == img.relocs[0].offset)
+    teko::assert::is_true(img2.relocs[0].target == img.relocs[0].target)
+    teko::assert::is_true(img2.bytes.len == img.bytes.len)
+}
+
+/**
+ * lwt_tb6_deref_reads_slice_field_through_reloc_on_the_vm — the T-B6 dual-engine deref keystone (#594
+ * §7.3/§7.5): a SOURCE program `struct S2 { xs: []i64; n: i64 }`, `const K2: S2 = { xs = [10, 20]; n =
+ * 2 }`, `exit(K2.xs[0])` lowers (producer emits the leaf + reloc, the reader reads the field's pointer
+ * slot) and runs on the VM to exit 10 — the interned pointer slot was resolved to the leaf array by
+ * `resolve_rodata_relocs` (T-B5) and dereferenced end-to-end. Proves the producer + T-B5 resolver +
+ * the index read agree at source level; `K2.xs[1]` and `K2.xs.len` (below) cover the sibling reads.
+ *
+ * @return void
+ */
+#test
+fn lwt_tb6_deref_reads_slice_field_through_reloc_on_the_vm() {
+    teko::assert::is_true(lwt_tb6_deref_exit(lwt_index(lwt_tb6_k2_xs(), lwt_num_i64(0 to i128), lwt_prim(checker::PrimKind::I64))) == (10 to i128))
+}
+
+/**
+ * lwt_tb6_deref_reads_second_element_and_len — the T-B6 sibling reads (#594 §7.3): `K2.xs[1]` derefs
+ * the second interned element (exit 20), and `K2.xs.len` reads the inline length half of the fat field
+ * through the new `lower_fat_field` reader (exit 2) — the two engines dereference the same target bytes.
+ *
+ * @return void
+ */
+#test
+fn lwt_tb6_deref_reads_second_element_and_len() {
+    teko::assert::is_true(lwt_tb6_deref_exit(lwt_index(lwt_tb6_k2_xs(), lwt_num_i64(1 to i128), lwt_prim(checker::PrimKind::I64))) == (20 to i128))
+    teko::assert::is_true(lwt_tb6_deref_exit(lwt_field_access(lwt_tb6_k2_xs(), "len", lwt_prim(checker::PrimKind::I64))) == (2 to i128))
+}
+
+/**
+ * lwt_tb6_k2_xs — the typed `K2.xs` fat-field access (`[]i64`) the T-B6 deref fixtures read through
+ * (#594 §7.3): a field access on the aggregate-const receiver `K2` of type `S2`.
+ *
+ * @return the typed `K2.xs` field-access expression
+ */
+fn lwt_tb6_k2_xs() -> checker::TExpr {
+    lwt_field_access(lwt_typed_var("K2", checker::Named { name = "S2" }), "xs", checker::Slice { element = lwt_prim(checker::PrimKind::I64) })
+}
+
+/**
+ * lwt_tb6_deref_exit — lower a program that binds `const K2: S2 = { xs = [10, 20]; n = 2 }` and runs
+ * `exit(<use>)` as its virtual main, then interpret it on the VM and return the exit code (#594 §7.3).
+ * The struct `S2` is declared first so its 16-byte fat-field layout is registered before the const
+ * interns.
+ *
+ * @param use_expr  the i64-typed expression the virtual main exits with (a `K2.xs[i]` or `K2.xs.len`)
+ * @return          the VM exit code of the lowered program
+ */
+fn lwt_tb6_deref_exit(use_expr: checker::TExpr) -> i128 {
+    let decl = lwt_struct_decl("S2", lwt_two_fields(lwt_slice_field("xs", "i64"), lwt_field("n", "i64")))
+    let elems = teko::list::push(teko::list::push(teko::list::empty(), lwt_num_i64(10 to i128)), lwt_num_i64(20 to i128))
+    let xs_lit = lwt_array_lit(elems, checker::PrimKind::I64)
+    let fnames = teko::list::push(teko::list::push(teko::list::empty(), "xs"), "n")
+    let fvals = teko::list::push(teko::list::push(teko::list::empty(), xs_lit), lwt_num_i64(2 to i128))
+    let si = lwt_struct_init("S2", fnames, fvals)
+    let cd: checker::TItem = checker::TConstDecl { name = "K2"; namespace = ""; ty = checker::Named { name = "S2" }; init = si; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 0; col = 0 }
+    let exit_call = lwt_call(lwt_path1("exit"), "", teko::list::push(teko::list::empty(), use_expr), checker::Void { })
+    mut items: []checker::TItem = teko::list::push(teko::list::empty(), decl)
+    items = teko::list::push(items, cd)
+    items = teko::list::push(items, lwt_item(lwt_exprstmt(exit_call)))
+    let m = match lower_program(checker::TProgram { items = items }) { LModule as x => x; error as err => { teko::assert::is_true(false); return (-99 to i128) } }
+    let no_args: []i128 = teko::list::empty()
+    interp_lmodule(m, "main", no_args)
 }
 
 /**
