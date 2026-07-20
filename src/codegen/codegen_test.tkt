@@ -810,7 +810,7 @@ fn cgt_loop_init_walkers() {
     let body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBreakStmt { label = "" })
     let loop_s: checker::TStatement = checker::TLoopStmt { label = ""; init = init; body = body }
     let stmts: []checker::TStatement = teko::list::push(cgt_empty_stmts(), loop_s)
-    let set0 = CgTypeSet { inners = teko::list::empty(); slices = teko::list::empty(); variants = teko::list::empty() }
+    let set0 = CgTypeSet { inners = teko::list::empty(); opt_keys = teko::list::empty(); slices = teko::list::empty(); slice_keys = teko::list::empty(); variants = teko::list::empty(); variant_keys = teko::list::empty() }
     let collected = cg_collect_block_opts(set0, stmts)
     teko::assert::is_true(collected.inners.len == 0)
     mut acc = StampAcc { next = 0; fns = teko::list::empty(); lams = teko::list::empty() }
@@ -1822,4 +1822,44 @@ fn cgt_mangle_eq() {
     teko::assert::is_false(cg_opt_key(opt_str) == cg_opt_key(opt_i64))
     teko::assert::is_true(cg_opt_key(variant_a) == cg_opt_key(variant_b))
     teko::assert::is_false(cg_opt_key(variant_a) == cg_opt_key(i32t))
+}
+
+/**
+ * cgt_dedup_key_cache — AL4a-3: `CgTypeSet` stores each registered type's mangled key at insertion
+ * so dedup scans READ the cached key instead of recomputing it. Proves the cache is faithful and
+ * the dedup relation is unchanged: (1) each parallel `*_keys` array stays exactly as long as its
+ * type array; (2) every cached key byte-equals the freshly recomputed key (`cg_opt_key` /
+ * `cg_variant_key`) — the identical string the scans compared before; (3) a mangle-equal duplicate
+ * still collapses (no growth) while a distinct type appends one entry alongside its key.
+ */
+#test
+fn cgt_dedup_key_cache() {
+    let strt: checker::Type = checker::Str { }
+    let i64t: checker::Type = checker::Prim { kind = checker::PrimKind::I64 }
+    let named_str: checker::Type = checker::Named { name = "str" }
+    mut set = CgTypeSet { inners = teko::list::empty(); opt_keys = teko::list::empty(); slices = teko::list::empty(); slice_keys = teko::list::empty(); variants = teko::list::empty(); variant_keys = teko::list::empty() }
+
+    set = cg_opt_set_add(set, strt)
+    set = cg_opt_set_add(set, i64t)
+    set = cg_opt_set_add(set, named_str)
+    teko::assert::is_true(set.inners.len == 2)
+    teko::assert::is_true(set.opt_keys.len == set.inners.len)
+    teko::assert::is_true(set.opt_keys[0] == cg_opt_key(set.inners[0]))
+    teko::assert::is_true(set.opt_keys[1] == cg_opt_key(set.inners[1]))
+
+    set = cg_slice_add(set, strt)
+    set = cg_slice_add(set, strt)
+    teko::assert::is_true(set.slices.len == 1)
+    teko::assert::is_true(set.slice_keys.len == set.slices.len)
+    teko::assert::is_true(set.slice_keys[0] == cg_opt_key(set.slices[0]))
+
+    mut va_members: []checker::Type = teko::list::empty()
+    va_members = teko::list::push(va_members, i64t)
+    va_members = teko::list::push(va_members, strt)
+    let variant_a: checker::Type = checker::Variant { members = va_members }
+    set = cg_variant_add(set, variant_a)
+    set = cg_variant_add(set, variant_a)
+    teko::assert::is_true(set.variants.len == 1)
+    teko::assert::is_true(set.variant_keys.len == set.variants.len)
+    teko::assert::is_true(set.variant_keys[0] == cg_variant_key(set.variants[0]))
 }

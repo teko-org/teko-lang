@@ -1,0 +1,22 @@
+# Regression: #comptime-fold CF3 — the Layer 1b STRICT GUARD (fixtures E/F, DECISION_LOG:391).
+#
+# A local binding that holds a RUNTIME value must NEVER be propagated/folded, even when it is
+# spelled with a const-looking literal. Three guarded shapes, each proven by the exit code:
+#   let x = opaque(40)   (E) a call result — not provably const, so `x` is never recorded
+#   let y = x + 2            a runtime leaf poisons the op-tree — `y` stays runtime (= 42)
+#   mut m: u64 = 0xFF   (F) a `mut` is never recorded even with a const literal initializer
+#   m = opaque(0)           reassigned to a runtime 0 at run time
+#   let z = m & 0x0F        `m` is runtime, so `z` is never folded (runtime m = 0 -> z = 0)
+# `exit(y + z)` is computed entirely at run time: 42 + 0 = 42. Were the guard broken and `m`
+# wrongly folded to its 0xFF initializer, `z` would fold to 15 and the program would exit 57
+# instead — so an exit of exactly 42 proves the runtime-valued bindings were left untouched.
+#
+# Both engines must agree: `teko run` exit == compiled-binary exit == 42.
+#   teko run   examples/regressions/comptime_fold_local_guard   # VM   -> exit 42
+#   teko build examples/regressions/comptime_fold_local_guard && \
+#     ./examples/regressions/comptime_fold_local_guard/comptime_fold_local_guard   # native -> exit 42
+name = "comptime_fold_local_guard"
+source = "src"
+
+[artifact]
+kind = "binary"

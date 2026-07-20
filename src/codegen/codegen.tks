@@ -2274,7 +2274,6 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
         if llast == "with_cap" {
             return emit_list_with_cap(buf, prog, e, c, escaping, regions, fn_body, dctx, "")
         }
-        return error { message = "codegen: this teko::list builtin not yet supported (only empty/push/with_cap — fixed+copy)" }
     }
     // teko::mem::free(x) — manual dealloc (the checker proved x is a mutable heap variable).
     if p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" && p.segments[p.segments.len - 1].name == "free" {
@@ -7218,60 +7217,122 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
 // optionals register the inner first so its typedef precedes the outer's reference. (C: the
 // cg_opt_set / cg_collect_* family.)
 // ---------------------------------------------------------------------------
-// The per-type generated typedefs collected in ONE walk: optional inners (tk_opt_<i>) AND slice
-// element types (tk_slice_<e>). Mirrors the C's `cg_opt_set` struct (two parallel lists threaded
-// by pointer); here it is a value threaded by return (the functional `.tks` idiom). One walk feeds
-// both — cg_collect_type_opts registers a slice's element in the same traversal as optionals.
-type CgTypeSet = struct { inners: []checker::Type; slices: []checker::Type; variants: []checker::Type }   // B-cg2 — inline tk_u_<keys>
+/**
+ * B-cg2 — the codegen registry of distinct anonymous types needing a typedef, each stored
+ * ALONGSIDE its already-computed mangled key so a dedup scan READS the key (O(1)) rather than
+ * recomputing it (the owner's "assign the converted value once, then only reference it"). The
+ * keys are collision-safe by construction: the SAME mangled string already used for dedup, so
+ * two types that mangle equal still collapse to one typedef (mangle-eq, not type-eq). Collected
+ * in ONE walk (cg_collect_type_opts registers a slice's element in the same traversal as
+ * optionals); threaded by return value (the functional `.tks` idiom), mirroring the C's
+ * `cg_opt_set`.
+ */
+type CgTypeSet = struct {
+    /** Optional inner types needing a `tk_opt_<key>` typedef, in registration order. */
+    inners: []checker::Type
+    /** The mangled dedup key of each `inners` entry, computed once at insertion. */
+    opt_keys: []str
+    /** Slice element types needing a `tk_slice_<key>` typedef, in registration order. */
+    slices: []checker::Type
+    /** The mangled dedup key of each `slices` entry, computed once at insertion. */
+    slice_keys: []str
+    /** Inline variant types needing a `tk_u_<keys>` typedef, in registration order. */
+    variants: []checker::Type
+    /** The mangled dedup key of each `variants` entry, computed once at insertion. */
+    variant_keys: []str
+}
 
-// the mangled-name key for a type (dedup key); "" for an unsupported type (skipped). Used for
-// both optional inners and slice elements (same mangle). (C: `cg_opt_mangle` render-to-scratch.)
+/**
+ * The mangled-name dedup key for a type; the empty string `""` for an unsupported type (skipped).
+ *
+ * Used for both optional inners and slice elements (same mangle). Renders `cg_opt_mangle` into a
+ * scratch buffer and materializes it once, so callers store the result rather than recompute it.
+ *
+ * @param t  the type to mangle
+ * @return   the mangled key, or `""` if `t` cannot be mangled
+ */
 fn cg_opt_key(t: checker::Type) -> str {
     match cg_opt_mangle(teko::list::empty(), t) { []byte as o => str(o); error => "" }
 }
-// register an optional inner (dedup by mangle). (C: `cg_opt_set_add`.)
+/**
+ * Register an optional inner in the codegen set, deduped by its mangled key.
+ *
+ * Computes the key ONCE and pushes it to the parallel `opt_keys` so later dedup scans READ the
+ * stored key instead of recomputing it. An unsupported inner (empty key) is skipped.
+ *
+ * @param set    the registry to extend
+ * @param inner  the optional's inner type to register
+ * @return       the set with `inner` appended, or unchanged if already present or unsupported
+ */
 fn cg_opt_set_add(set: CgTypeSet, inner: checker::Type) -> CgTypeSet {
     let key = cg_opt_key(inner)
     if key == "" { return set }
     mut i = 0
     loop {
-        if i >= set.inners.len { break }
-        if cg_opt_key(set.inners[i]) == key { return set }   // already present
+        if i >= set.opt_keys.len { break }
+        if set.opt_keys[i] == key { return set }
         i++
     }
-    CgTypeSet { inners = teko::list::push(set.inners, inner); slices = set.slices; variants = set.variants }
+    CgTypeSet { inners = teko::list::push(set.inners, inner); opt_keys = teko::list::push(set.opt_keys, key); slices = set.slices; slice_keys = set.slice_keys; variants = set.variants; variant_keys = set.variant_keys }
 }
-// register a slice element type (dedup by mangle), parallel to cg_opt_set_add. (C: `cg_slice_add`.)
+/**
+ * Register a slice element type in the codegen set, deduped by its mangled key.
+ *
+ * Parallel to `cg_opt_set_add`: computes the key ONCE, pushes it to `slice_keys`, and dedup
+ * scans read the stored key. An unsupported element (empty key) is skipped so `emit_type` errors
+ * honestly.
+ *
+ * @param set   the registry to extend
+ * @param elem  the slice's element type to register
+ * @return      the set with `elem` appended, or unchanged if already present or unsupported
+ */
 fn cg_slice_add(set: CgTypeSet, elem: checker::Type) -> CgTypeSet {
     let key = cg_opt_key(elem)
-    if key == "" { return set }   // unsupported element → skip (emit_type errors honestly)
+    if key == "" { return set }
     mut i = 0
     loop {
-        if i >= set.slices.len { break }
-        if cg_opt_key(set.slices[i]) == key { return set }   // already present
+        if i >= set.slice_keys.len { break }
+        if set.slice_keys[i] == key { return set }
         i++
     }
-    CgTypeSet { inners = set.inners; slices = teko::list::push(set.slices, elem); variants = set.variants }
+    CgTypeSet { inners = set.inners; opt_keys = set.opt_keys; slices = teko::list::push(set.slices, elem); slice_keys = teko::list::push(set.slice_keys, key); variants = set.variants; variant_keys = set.variant_keys }
 }
-// B-cg2 — the dedup key for an INLINE variant TYPE (its tk_u_<keys> name); "" for unsupported. (C: `cg_variant_typename` render-to-scratch.)
+/**
+ * B-cg2 — the dedup key for an INLINE variant type (its `tk_u_<keys>` name); `""` for unsupported.
+ *
+ * Renders `cg_variant_typename` into a scratch buffer and materializes it once. (C:
+ * `cg_variant_typename` render-to-scratch.)
+ *
+ * @param t  the type to key; only an inline `Variant` yields a non-empty key
+ * @return   the mangled variant name, or `""` if `t` is not a mangleable inline variant
+ */
 fn cg_variant_key(t: checker::Type) -> str {
     match t {
         checker::Variant as v => match cg_variant_typename(teko::list::empty(), v) { []byte as o => str(o); error => "" }
         _ => ""
     }
 }
-// B-cg2 — register an INLINE variant TYPE (dedup by its tk_u_<keys> name). A Named variant has
-// its own decl typedef and is NOT registered here. (C: `cg_variant_add`.)
+/**
+ * B-cg2 — register an INLINE variant type in the codegen set, deduped by its `tk_u_<keys>` name.
+ *
+ * A Named variant carries its own decl typedef and is NOT registered here. Computes the key ONCE,
+ * pushes it to `variant_keys`, and dedup scans read the stored key. An unsupported member (empty
+ * key) is skipped so `emit_type` errors honestly.
+ *
+ * @param set  the registry to extend
+ * @param t    the inline variant type to register
+ * @return     the set with `t` appended, or unchanged if already present or unsupported
+ */
 fn cg_variant_add(set: CgTypeSet, t: checker::Type) -> CgTypeSet {
     let key = cg_variant_key(t)
-    if key == "" { return set }   // unsupported member → skip (emit_type errors honestly)
+    if key == "" { return set }
     mut i = 0
     loop {
-        if i >= set.variants.len { break }
-        if cg_variant_key(set.variants[i]) == key { return set }   // already present
+        if i >= set.variant_keys.len { break }
+        if set.variant_keys[i] == key { return set }
         i++
     }
-    CgTypeSet { inners = set.inners; slices = set.slices; variants = teko::list::push(set.variants, t) }
+    CgTypeSet { inners = set.inners; opt_keys = set.opt_keys; slices = set.slices; slice_keys = set.slice_keys; variants = teko::list::push(set.variants, t); variant_keys = teko::list::push(set.variant_keys, key) }
 }
 // register every optional in a type AND every slice's element (nested inners/elements first, so
 // `T??` and `[][]T`/`[]T?` order right). (C: `cg_collect_type_opts`.)
@@ -7636,26 +7697,46 @@ fn cg_named_emitted(em: CgEmitted, name: str) -> bool {
     }
     false
 }
-// Has the optional whose inner mangles to `key` been emitted? (no matching node → no edge.)
+/**
+ * Report whether the optional whose inner mangles to `key` has already been emitted.
+ *
+ * An optional inner not present in the program's collected set carries no dependency edge, so it
+ * is treated as ready. The presence scan READS the stored `opt_keys` rather than recomputing each
+ * inner's mangle.
+ *
+ * @param em   the emitted-so-far record
+ * @param set  the collected type registry
+ * @param key  the mangled key of the optional inner in question
+ * @return     true if the inner is uncollected (no edge) or already emitted
+ */
 fn cg_opt_emitted_key(em: CgEmitted, set: CgTypeSet, key: str) -> bool {
-    // an optional inner not present in the program's collected set carries no edge → ready.
     mut i = 0
     mut present = false
     loop {
-        if i >= set.inners.len { break }
-        if cg_opt_key(set.inners[i]) == key { present = true; break }
+        if i >= set.opt_keys.len { break }
+        if set.opt_keys[i] == key { present = true; break }
         i++
     }
     if !present { return true }
     cg_str_in(em.opt_keys, key)
 }
-// Has the inline variant whose typename is `key` been emitted? (no matching node → no edge.)
+/**
+ * Report whether the inline variant whose typename is `key` has already been emitted.
+ *
+ * A variant not present in the collected set carries no dependency edge and is ready. The
+ * presence scan READS the stored `variant_keys` rather than recomputing each variant's mangle.
+ *
+ * @param em   the emitted-so-far record
+ * @param set  the collected type registry
+ * @param key  the `tk_u_<keys>` name of the variant in question
+ * @return     true if the variant is uncollected (no edge) or already emitted
+ */
 fn cg_uvar_emitted_key(em: CgEmitted, set: CgTypeSet, key: str) -> bool {
     mut i = 0
     mut present = false
     loop {
-        if i >= set.variants.len { break }
-        if cg_variant_key(set.variants[i]) == key { present = true; break }
+        if i >= set.variant_keys.len { break }
+        if set.variant_keys[i] == key { present = true; break }
         i++
     }
     if !present { return true }
@@ -7776,11 +7857,22 @@ fn cg_named_decls(prog: checker::TProgram) -> []parser::TypeDecl {
     named
 }
 
-// Replaces the old program-order body emission + cg_emit_optional_typedefs: emit slices first
-// (pointers), then the named/opt/inline-variant typedefs in by-value dependency order.
+/**
+ * Emit every generated typedef (slices, optionals, inline variants, named decls) in by-value
+ * dependency order, replacing the old program-order body emission + `cg_emit_optional_typedefs`.
+ *
+ * Slices lead (pointers), then a fixpoint emits the named/opt/inline-variant typedefs once each
+ * dependency is satisfied. The collected `CgTypeSet` carries each type's mangled key so the
+ * fixpoint READS the stored key instead of recomputing it per pass.
+ *
+ * @param buf   the output byte buffer to append to
+ * @param prog  the checked program whose types are emitted
+ * @return      the extended buffer
+ * @throws      when a recursive value type has no slice/boxed-reference break (cyclic dependency)
+ */
 fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error {
     // 1) collect every optional inner / slice element / inline variant used in the program.
-    mut set = CgTypeSet { inners = teko::list::empty(); slices = teko::list::empty(); variants = teko::list::empty() }
+    mut set = CgTypeSet { inners = teko::list::empty(); opt_keys = teko::list::empty(); slices = teko::list::empty(); slice_keys = teko::list::empty(); variants = teko::list::empty(); variant_keys = teko::list::empty() }
     mut i = 0
     loop {
         if i >= prog.items.len { break }
@@ -7922,7 +8014,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
         loop {
             if oi >= set.inners.len { break }
             let inner = set.inners[oi]
-            let okey = cg_opt_key(inner)
+            let okey = set.opt_keys[oi]
             if cg_str_in(em.opt_keys, okey) { oi++ } else {
                 if !cg_type_ready(prog, em, set, inner) { oi++ } else {
                     out = cb(out, "typedef struct ")   // named tag (matches the forward decl) so a pointer to it resolves
@@ -7944,7 +8036,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
         loop {
             if vi >= set.variants.len { break }
             let vt = set.variants[vi]
-            let vkey = cg_variant_key(vt)
+            let vkey = set.variant_keys[vi]
             if cg_str_in(em.uvar_keys, vkey) { vi++ } else {
                 // a tk_u_ embeds its members by value — all must be ready.
                 mut ready = true

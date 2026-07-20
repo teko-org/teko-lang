@@ -585,6 +585,71 @@ fn retype_literal_plain_leaf_unchanged_from_68() {
     teko::assert::is_true(prim_is(retyped.type, PrimKind::U8))
 }
 
+/**
+ * Reads whether a typed statement block's trailing expression leaf has primitive kind `k` — the
+ * probe shared by the `retype_literal` if/match recursion tests below.
+ *
+ * @param stmts  the branch/arm statement block
+ * @param k      the expected primitive kind of the trailing leaf
+ * @return       true iff the block's last statement is a trailing expression of prim `k`
+ */
+fn block_trailing_prim_is(stmts: []TStatement, k: PrimKind) -> bool {
+    if stmts.len == 0 { return false }
+    match stmts[stmts.len - 1] {
+        TExprStmt as es => prim_is(es.expr.type, k)
+        _ => false
+    }
+}
+
+/**
+ * (A) `retype_literal` over a checked `if` expression RECURSES into each branch's trailing value:
+ * the outer node AND both branch leaves are retyped to the destination prim — the correctness fix
+ * that borns an over-i64 `if`-arm at its true width (the §2.5 miscompile guard). Built directly on
+ * typed nodes, bypassing the parser (VM-safety, mirroring the array-element test above).
+ */
+#test
+fn retype_literal_recurses_into_if_arms() {
+    let cond = TExpr { kind = TBoolLit { value = true }; type = boolt(); line = 0; col = 0 }
+    let then_blk: []TStatement = teko::list::push(teko::list::empty(), texpr_stmt(tnum(7)))
+    let else_blk: []TStatement = teko::list::push(teko::list::empty(), texpr_stmt(tnum(9)))
+    let ife = TExpr { kind = TIfExpr { cond = cond; then_blk = then_blk; has_else = true; else_blk = else_blk }; type = i64t(); line = 0; col = 0 }
+    let retyped = retype_literal(ife, Prim { kind = PrimKind::U8 })
+    teko::assert::is_true(prim_is(retyped.type, PrimKind::U8))
+    match retyped.kind {
+        TIfExpr as f => {
+            teko::assert::is_true(block_trailing_prim_is(f.then_blk, PrimKind::U8))
+            teko::assert::is_true(block_trailing_prim_is(f.else_blk, PrimKind::U8))
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * (A) `retype_literal` over a checked `match` expression RECURSES into each arm's trailing value:
+ * the outer node AND every arm leaf are retyped to the destination prim (the if/match half of the
+ * §2.5 miscompile guard). Built directly on typed nodes.
+ */
+#test
+fn retype_literal_recurses_into_match_arms() {
+    let subject = tnum(1)
+    let arm0_body: []TStatement = teko::list::push(teko::list::empty(), texpr_stmt(tnum(7)))
+    let arm1_body: []TStatement = teko::list::push(teko::list::empty(), texpr_stmt(tnum(9)))
+    let arm0 = TArm { pattern = parser::LiteralPattern { value = e_num(1) }; has_when = false; guard = tnum(0); body = arm0_body }
+    let arm1 = TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = tnum(0); body = arm1_body }
+    let arms: []TArm = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let mx = TExpr { kind = TMatchExpr { subject = subject; arms = arms }; type = i64t(); line = 0; col = 0 }
+    let retyped = retype_literal(mx, Prim { kind = PrimKind::U8 })
+    teko::assert::is_true(prim_is(retyped.type, PrimKind::U8))
+    match retyped.kind {
+        TMatchExpr as m => {
+            teko::assert::is_true(m.arms.len == 2)
+            teko::assert::is_true(block_trailing_prim_is(m.arms[0].body, PrimKind::U8))
+            teko::assert::is_true(block_trailing_prim_is(m.arms[1].body, PrimKind::U8))
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
 #test
 fn return_type_checks() {
     let body1 = one_stmt(e_var("x"))
