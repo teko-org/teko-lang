@@ -258,7 +258,7 @@ fn subst_typeexpr(te: parser::TypeExpr, s: Subst) -> parser::TypeExpr {
                     }
                 }
             }
-            te
+            parser::NamedType { path = nt.path; args = subst_typeexpr_args(nt.args, s) }
         }
         parser::SliceType as st => parser::SliceType { element = subst_typeexpr(st.element, s) }
         parser::OptionalType as ot => parser::OptionalType { inner = subst_typeexpr(ot.inner, s) }
@@ -275,6 +275,28 @@ fn subst_typeexpr(te: parser::TypeExpr, s: Subst) -> parser::TypeExpr {
             parser::FunctionType { params = nps; ret = subst_typeexpr(fnt.ret, s) }
         }
     }
+}
+
+/**
+ * Substitute the type-params through a NamedType's generic argument list, so a stamped fn's
+ * `Ref<T>` / `Box<T>` / `List<T>` param annotation lowers its `T` to the concrete spelling
+ * (before this, `subst_typeexpr` rewrote only a BARE type-param, leaving a `Ref<T>` arg as the
+ * literal `T` — codegen then emitted the dangling `tk_t_T` / `tk_slice_T`). Empty for a plain
+ * name, so a non-generic NamedType round-trips unchanged (additive over the pre-borrow corpus).
+ *
+ * @param args  the NamedType's generic type-arguments, in declaration order
+ * @param s     the active `{type-param → concrete}` substitution
+ * @return      the arguments each recursively substituted through `s`
+ */
+fn subst_typeexpr_args(args: []parser::TypeExpr, s: Subst) -> []parser::TypeExpr {
+    mut out: []parser::TypeExpr = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        out = teko::list::push(out, subst_typeexpr(args[i], s))
+        i++
+    }
+    out
 }
 
 // find a type-param's bound concrete type in a Subst (the Subst's parallel names/types arrays).
