@@ -1128,7 +1128,7 @@ fn type_call(c0: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                 // contract element too (heterogeneous `[]Shape` args), like the binding-annotation path.
                 let is_arr = match dargs[ti].kind { parser::ArrayLit => true; _ => false }
                 let iface_arr_target = is_arr && is_iface_slice(f.params[ti], table)
-                let a = if (is_lam && pt_is_func) || iface_arr_target {
+                let a = if (is_lam && pt_is_func) || iface_arr_target || arg_wants_expected(dargs[ti], f.params[ti]) {
                     match type_value_expected(dargs[ti], f.params[ti], env, table) { TExpr as te => te; error as e => return e }
                 } else {
                     match type_expr(dargs[ti], env, table) { TExpr as te => te; error as e => return e }
@@ -3186,10 +3186,72 @@ fn type_value_expected(e: parser::Expr, expected: Type, env: Env, table: TypeTab
         parser::Lambda as lam => type_lambda(lam, expected, env, table)   // (W10) target type → un-annotated closure params infer (ruling 3)
         parser::ArrayLit as al => {
             if is_iface_slice(expected, table) { return type_array_lit_expected(al, expected, env, table) }   // (W10b.D3) []<interface> literal
-            type_expr(e, env, table)
+            adopt_value_to_expected(e, expected, env, table)
         }
-        _ => type_expr(e, env, table)
+        _ => adopt_value_to_expected(e, expected, env, table)
     }
+}
+
+/**
+ * Types a value against a known `expected` target and BORNS a fitting numeric literal (scalar,
+ * negative, or one reachable through an `if`/`match`/array composite) at that target — the single
+ * context-directed adoption path (M.5). A value already assignable to `expected` keeps its NATURAL
+ * type (a variant case stays its case type so codegen's `emit_as` wraps it); otherwise a fitting
+ * literal adopts `expected` via `literal_adopts` + `retype_literal` (the same pair `type_assign`
+ * uses), so the leaf is born at its narrow width. A non-fitting / non-literal value is returned
+ * unchanged for the caller to diagnose (M.1 fail-early messages preserved at the declaration site).
+ *
+ * @param e         the parsed value expression
+ * @param expected  the destination type the literal adopts
+ * @param env       the typing environment
+ * @param table     the program's type table
+ * @return          the typed value, its literal leaves born at `expected` when they fit, else the
+ *                  natural-typed value; propagates the first typing error
+ */
+fn adopt_value_to_expected(e: parser::Expr, expected: Type, env: Env, table: TypeTable) -> TExpr | error {
+    let t = match type_expr(e, env, table) { TExpr as te => te; error as err => return err }
+    if assignable_to(t.type, expected, table) { return t }
+    if literal_adopts(t, expected) { return retype_literal(t, expected) }
+    t
+}
+
+/**
+ * Does a parameter type accept a context-born literal — a numeric prim, `byte` (= u8), or a slice?
+ * Gates whether an `if`/`match`/array ARGUMENT is routed through `type_value_expected` so its
+ * literal leaves are born at the parameter's width (closing the args analogue of the assign-path
+ * miscompile: an over-`i64` `if`-arm arg must be born at the parameter type, not left `i64`).
+ *
+ * @param t  the parameter type
+ * @return   true iff `t` is a numeric prim, `byte`, or a slice
+ */
+fn param_takes_born_literal(t: Type) -> bool {
+    match t {
+        Byte => true
+        Prim as p => prim_is_int(p.kind) || prim_is_float(p.kind)
+        Slice => true
+        _ => false
+    }
+}
+
+/**
+ * Should this argument be typed against its parameter as an EXPECTED type? True for an `if`/`match`/
+ * array argument whose parameter accepts a born literal, so a fitting literal composite argument is
+ * born at the parameter's narrow width (rather than left `i64`/`f64` and merely outer-retyped). A
+ * non-composite or non-fitting argument is unaffected — the routed path is a no-op for it.
+ *
+ * @param arg    the parsed argument expression
+ * @param param  the parameter type it flows into
+ * @return       true iff the argument should route through `type_value_expected`
+ */
+fn arg_wants_expected(arg: parser::Expr, param: Type) -> bool {
+    let composite = match arg.kind {
+        parser::IfExpr => true
+        parser::MatchExpr => true
+        parser::ArrayLit => true
+        _ => false
+    }
+    if !composite { return false }
+    param_takes_born_literal(param)
 }
 
 /**
@@ -3735,7 +3797,54 @@ fn retype_literal(e: TExpr, to: Type) -> TExpr {
             }
             _ => TExpr { kind = e.kind; type = to; line = e.line; col = e.col }
         }
+        TIfExpr as f => {
+            let then_blk = retype_block_trailing(f.then_blk, to)
+            let else_blk = if f.has_else { retype_block_trailing(f.else_blk, to) } else { f.else_blk }
+            TExpr { kind = TIfExpr { cond = f.cond; then_blk = then_blk; has_else = f.has_else; else_blk = else_blk }; type = to; line = e.line; col = e.col }
+        }
+        TMatchExpr as m => {
+            mut arms: []TArm = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                let ar = m.arms[i]
+                arms = teko::list::push(arms, TArm { pattern = ar.pattern; has_when = ar.has_when; guard = ar.guard; body = retype_block_trailing(ar.body, to) })
+                i++
+            }
+            TExpr { kind = TMatchExpr { subject = m.subject; arms = arms }; type = to; line = e.line; col = e.col }
+        }
         _ => TExpr { kind = e.kind; type = to; line = e.line; col = e.col }
+    }
+}
+
+/**
+ * Rebuilds a typed statement block so its trailing value-expression is re-typed to `to`, mirroring
+ * `retype_literal`'s array-element recursion one level deeper into an `if`/`match` branch body. A
+ * diverging block (`return`/`break`/trailing panic) carries no value and is returned unchanged, as
+ * is a block whose last statement is not a trailing expression. Only reached for a branch whose
+ * trailing value already satisfied `literal_adopts(_, to)`, so retyping its leaf is sound.
+ *
+ * @param stmts  the branch/arm statement block
+ * @param to     the destination type each contributing branch leaf adopts
+ * @return       the block with its trailing expression re-typed to `to`, or the block unchanged
+ */
+fn retype_block_trailing(stmts: []TStatement, to: Type) -> []TStatement {
+    if stmts.len == 0 { return stmts }
+    if tblock_diverges(stmts) { return stmts }
+    match stmts[stmts.len - 1] {
+        TExprStmt as es => {
+            let last_index = stmts.len - 1
+            mut out: []TStatement = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= last_index { break }
+                out = teko::list::push(out, stmts[i])
+                i++
+            }
+            let last: TStatement = TExprStmt { expr = retype_literal(es.expr, to) }
+            teko::list::push(out, last)
+        }
+        _ => stmts
     }
 }
 
