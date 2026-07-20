@@ -16,6 +16,13 @@ fn u16t() -> Type { Prim { kind = PrimKind::U16 } }
 fn u64t() -> Type { Prim { kind = PrimKind::U64 } }
 
 /**
+ * u128t — the `u128` primitive type, for the comptime-fold unrepresentable-literal case.
+ *
+ * @return the `u128` primitive type
+ */
+fn u128t() -> Type { Prim { kind = PrimKind::U128 } }
+
+/**
  * cf_num — an integer number-literal typed expression of type `t` carrying value `value`.
  *
  * @param value  the integer value (i128 carrier, like the parser's Number)
@@ -296,4 +303,158 @@ fn fold_float_ops() {
 #test
 fn fold_rejects_nonscalar_form() {
     cf_is_error(te(TNullLit { }, i64t()))
+}
+
+/**
+ * cf_folds_to_num — assert `fold_expr` folds `e` to a `TNumber` literal whose carrier equals `want`.
+ *
+ * @param e     the const op-tree the driver must fold
+ * @param want  the expected reconstructed i128 carrier
+ */
+fn cf_folds_to_num(e: TExpr, want: i128) {
+    match fold_expr(e, empty_table(), empty_env()) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind {
+            TNumber as n => teko::assert::is_true(!n.is_float && n.value == want)
+            _ => teko::assert::is_true(false)
+        }
+    }
+}
+
+/**
+ * cf_fold_errors — assert `fold_expr` propagates a located error for the provably-const op-tree `e`
+ * (an overflow / ÷0 / out-of-range surfaced by the M.1 fold).
+ *
+ * @param e  the const op-tree whose fold must fail
+ */
+fn cf_fold_errors(e: TExpr) {
+    match fold_expr(e, empty_table(), empty_env()) {
+        error => teko::assert::is_true(true)
+        TExpr => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * cf_fold_kind_is — assert `fold_expr` succeeds and leaves `e`'s top-level kind a `TUnary` (proving
+ * the driver did NOT splice a literal — the unrepresentable/non-integer path leaves the op-tree).
+ *
+ * @param e  the op-tree the driver must leave as a `TUnary`
+ */
+fn cf_fold_stays_unary(e: TExpr) {
+    match fold_expr(e, empty_table(), empty_env()) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind { TUnary => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    }
+}
+
+/**
+ * fold_expr_folds_all_ones_u64 — the canonical mandate case: the driver folds `~(0 to u64)` to the
+ * u64 all-ones literal (its i128 carrier is the unsigned magnitude 2^64 - 1), so both engines load an
+ * immediate.
+ */
+#test
+fn fold_expr_folds_all_ones_u64() {
+    let e = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u64t()), u64t())
+    cf_folds_to_num(e, (~(0 to u64)) to i128)
+}
+
+/**
+ * fold_expr_folds_scalar_families — the driver folds an unsigned mask, a bitwise-and, a shift and a
+ * signed negation to their exact literal carriers (unsigned as the magnitude, signed as the signed
+ * integer).
+ */
+#test
+fn fold_expr_folds_scalar_families() {
+    cf_folds_to_num(cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u8t()), u8t()), 255 to i128)
+    cf_folds_to_num(cf_bin(lexer::TokenKind::Amp, cf_num(255 to i128, u8t()), cf_num(15 to i128, u8t()), u8t()), 15 to i128)
+    cf_folds_to_num(cf_bin(lexer::TokenKind::Shl, cf_num(1 to i128, u32t()), cf_num(8 to i128, u32t()), u32t()), 256 to i128)
+    cf_folds_to_num(cf_un(lexer::TokenKind::Minus, cf_cast(cf_num(1 to i128, i64t()), i8t()), i8t()), -1 to i128)
+}
+
+/**
+ * fold_expr_propagates_overflow — a provably-const overflow (`200 + 100` as u8) and a ÷0 (`5 / 0` as
+ * u8) surface through the driver as located compile errors, never a folded wrap.
+ */
+#test
+fn fold_expr_propagates_overflow() {
+    cf_fold_errors(cf_bin(lexer::TokenKind::Plus, cf_num(200 to i128, u8t()), cf_num(100 to i128, u8t()), u8t()))
+    cf_fold_errors(cf_bin(lexer::TokenKind::Slash, cf_num(5 to i128, u8t()), cf_num(0 to i128, u8t()), u8t()))
+}
+
+/**
+ * fold_expr_partial_tree — a partially-const tree folds only its const sub-tree: `x & ~(0 to u64)`
+ * keeps the runtime `x` on the left and splices the folded all-ones literal on the right.
+ */
+#test
+fn fold_expr_partial_tree() {
+    let x = te(TVar { name = "x"; is_func = false; func_ns = "teko::checker" }, u64t())
+    let mask = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u64t()), u64t())
+    let e = cf_bin(lexer::TokenKind::Amp, x, mask, u64t())
+    match fold_expr(e, empty_table(), empty_env()) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind {
+            TBinary as b => {
+                match b.left.kind { TVar => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+                match b.right.kind { TNumber as n => teko::assert::is_true(n.value == ((~(0 to u64)) to i128)); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+    }
+}
+
+/**
+ * fold_expr_leaves_unrepresentable_u128 — `~(0 to u128)` evaluates to an all-ones u128 that has no
+ * literal carrier (its magnitude exceeds i128-max), so the driver leaves the op-tree unfolded rather
+ * than emit a dishonest literal — behavior preserved.
+ */
+#test
+fn fold_expr_leaves_unrepresentable_u128() {
+    let e = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u128t()), u128t())
+    cf_fold_stays_unary(e)
+}
+
+/**
+ * fold_expr_leaves_float_optree — a float op-tree (`1.5 + 2.5`) is outside the CF2 integer subset, so
+ * the driver leaves it a runtime `TBinary` (only integer scalars fold in this crumb).
+ */
+#test
+fn fold_expr_leaves_float_optree() {
+    let e = cf_bin(lexer::TokenKind::Plus, cf_fnum(1.5), cf_fnum(2.5), f64t())
+    match fold_expr(e, empty_table(), empty_env()) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind { TBinary => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    }
+}
+
+/**
+ * inline_consts_folds_module_const_optree — the §8 fold-scalar case end to end: `const M: u64 = ~(0
+ * to u64)` used as `x & M` inlines M's op-tree at the use, and the composed CF2 fold collapses it to
+ * the all-ones literal — the returned `x & <literal>` carries a `TNumber`, not a `~` op-tree.
+ */
+#test
+fn inline_consts_folds_module_const_optree() {
+    let m_init = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u64t()), u64t())
+    let m = TConstDecl { name = "M"; namespace = "teko::checker"; ty = u64t(); init = m_init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
+    let x = te(TVar { name = "x"; is_func = false; func_ns = "teko::checker" }, u64t())
+    let mref = te(TVar { name = "M"; is_func = false; func_ns = "teko::checker" }, u64t())
+    let use_expr = cf_bin(lexer::TokenKind::Amp, x, mref, u64t())
+    mut body: []TStatement = teko::list::push(teko::list::empty(), c_ret(use_expr))
+    mut items: []TItem = teko::list::push(teko::list::empty(), m)
+    items = teko::list::push(items, c_fn("f", body))
+    match inline_consts(TProgram { items = items }) {
+        error => teko::assert::is_true(false)
+        TProgram as out => {
+            teko::assert::is_true(count_const_items(out) == 0)
+            match first_fn_return(out) {
+                TExpr as rv => match rv.kind {
+                    TBinary as b => match b.right.kind {
+                        TNumber as n => teko::assert::is_true(n.value == ((~(0 to u64)) to i128))
+                        _ => teko::assert::is_true(false)
+                    }
+                    _ => teko::assert::is_true(false)
+                }
+                null => teko::assert::is_true(false)
+            }
+        }
+    }
 }

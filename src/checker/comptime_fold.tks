@@ -1111,3 +1111,791 @@ fn float_div(x: f64, y: f64, e: TExpr) -> ConstValue | error {
     if y == 0.0 { return const_form_error("float division by zero in a constant (#comptime-fold)", e) }
     cv_float(teko::f64_bits(x / y), false)
 }
+
+/**
+ * cf_is_int_type — true iff `t` is an integer type the fold re-emits as a `TNumber` literal (a
+ * `Prim` integer i8..i128 / u8..u128, or `byte`). The evaluability predicate and `literal_of` both
+ * gate on this so the CF2 fold stays within the integer scalar subset (floats, chars, strings and
+ * aggregates are left unfolded for a later crumb).
+ *
+ * @param t  the type to classify
+ * @return   whether `t` is an integer/byte type
+ * @since #comptime-fold
+ */
+fn cf_is_int_type(t: Type) -> bool {
+    match int_info(t) {
+        IntInfo => true
+        error => false
+    }
+}
+
+/**
+ * cf_int_value — true iff `e` is a name-free, provably-const INTEGER op-tree the CF2 fold evaluates:
+ * an integer literal, a byte literal, a cast to an integer type, or `~`/`-`/`+ - * / % & | ^ << >>`
+ * over such operands. It is DELIBERATELY narrower than `is_const_expr` (the grammar oracle): it
+ * excludes enum-member paths (`TPathExpr`), aggregate literals, allowlisted calls and float forms —
+ * every shape `eval_const` does not yet reduce to a scalar integer — so a `true` guarantees
+ * `eval_const` either produces a `CVInt` or raises a genuine M.1 value error (overflow / ÷0 /
+ * out-of-range), never an unsupported-form error that would spuriously fail a valid program. Because
+ * no admitted shape resolves a name, `eval_const` never touches the environment (an empty `Env`
+ * suffices at the CF2 wiring site).
+ *
+ * @param e  the typed expression to classify
+ * @return   whether `e` is an integer op-tree the fold may evaluate
+ * @since #comptime-fold
+ */
+fn cf_int_value(e: TExpr) -> bool {
+    match e.kind {
+        TNumber as n => !n.is_float && cf_is_int_type(e.type)
+        TByteLit => true
+        TCast as c => cf_is_int_type(e.type) && cf_cast_operand_ok(c.expr)
+        TUnary as u => is_const_unary_op(u.op) && cf_int_value(u.operand)
+        TBinary as b => is_const_binary_op(b.op) && cf_int_value(b.left) && cf_int_value(b.right)
+        _ => false
+    }
+}
+
+/**
+ * cf_cast_operand_ok — true iff `e` is a legal operand of an integer-target cast the fold evaluates:
+ * an integer op-tree (`cf_int_value`) or a bare boolean literal (the sole `bool -> numeric` cast Teko
+ * admits, folded by `cast_to_int` to 1/0). A boolean is admitted ONLY here, never as a bare fold root
+ * or an arithmetic operand, so a fold never reaches `eval_const`'s unsupported `CVBool` arithmetic.
+ *
+ * @param e  the cast operand to classify
+ * @return   whether the operand is a foldable integer op-tree or a bare boolean literal
+ * @since #comptime-fold
+ */
+fn cf_cast_operand_ok(e: TExpr) -> bool {
+    match e.kind {
+        TBoolLit => true
+        _ => cf_int_value(e)
+    }
+}
+
+/**
+ * i128_max_as_u128 — the largest signed-i128 value (2^127 - 1) as a u128, the ceiling above which an
+ * unsigned comptime integer has NO `TNumber` literal form (the parser's `Number.value` carrier is an
+ * i128, and `value_fits` admits an unsigned literal only when it is non-negative — a u128 whose top
+ * bit is set cannot be spelled and is left unfolded).
+ *
+ * @return  2^127 - 1 as a u128
+ * @since #comptime-fold
+ */
+fn i128_max_as_u128() -> u128 { msb_value(128) - (1 to u128) }
+
+/**
+ * cv_int_to_i128 — reconstruct the i128 literal carrier a `CVInt` of width/signedness `info` re-emits
+ * as, in the SAME representation the parser/typer use (an unsigned value as its non-negative
+ * magnitude, a signed value as its signed integer), or null when the value has no literal form (a
+ * u128 whose magnitude exceeds i128-max — e.g. `~(0 to u128)`; such a value is left as its op-tree so
+ * behavior is preserved). Every returned carrier round-trips: fed back to the pipeline as a `TNumber`
+ * of the same type, it lowers to exactly the folded bits on both engines, because it is
+ * indistinguishable from a hand-written literal the existing lowering already emits correctly.
+ *
+ * @param bits  the value's two's-complement bits
+ * @param info  the value's width/signedness
+ * @return      the i128 literal carrier, or null when the value is unrepresentable as a literal
+ * @since #comptime-fold
+ */
+fn cv_int_to_i128(bits: u128, info: IntInfo) -> i128? {
+    let v = mask_to_width(bits, info.width)
+    if !info.is_signed {
+        if v > i128_max_as_u128() { return null }
+        return v to i128
+    }
+    if !bit_set(v, info.width - 1) { return v to i128 }
+    if is_min_bits(v, info) { return signed_min_i128(info.width) }
+    -(twos_neg(v, info.width) to i128)
+}
+
+/**
+ * literal_of — reconstruct a literal `TExpr` from a computed `ConstValue`, typed as `ty` and
+ * positioned at (`line`, `col`) — the inverse of `eval_const` used by the fold to splice a folded
+ * literal back into the typed AST. CF2 reconstructs the INTEGER case (a `CVInt` becomes a `TNumber`
+ * whose carrier is re-derived from the bits under `ty`); a value with no literal form (the u128
+ * top-bit case, `cv_int_to_i128 == null`) and every non-integer kind (folded only from a later crumb)
+ * return null, signalling the caller to leave the original op-tree unfolded (behavior preserved). The
+ * produced node is indistinguishable to lowering from a hand-written literal — zero runtime.
+ *
+ * @param v     the computed comptime value
+ * @param ty    the type the fold site resolved (the reconstructed literal's `.type`)
+ * @param line  the original expression's source line (diagnostics/position)
+ * @param col   the original expression's source column
+ * @return      a literal `TExpr` carrying `v` typed `ty`, or null when `v` has no literal form
+ * @since #comptime-fold
+ */
+fn literal_of(v: ConstValue, ty: Type, line: u32, col: u32) -> TExpr? {
+    match v.kind {
+        CVInt as ci => int_literal_of(ci, ty, line, col)
+        _ => null
+    }
+}
+
+/**
+ * int_literal_of — reconstruct a `TNumber` literal from an integer comptime value `ci`, typed `ty`
+ * and positioned at (`line`, `col`), or null when `ty` is not an integer or the value has no literal
+ * carrier (`cv_int_to_i128 == null`).
+ *
+ * @param ci    the integer comptime value
+ * @param ty    the reconstructed literal's type
+ * @param line  the original expression's source line
+ * @param col   the original expression's source column
+ * @return      the `TNumber` literal, or null when unrepresentable
+ * @since #comptime-fold
+ */
+fn int_literal_of(ci: CVInt, ty: Type, line: u32, col: u32) -> TExpr? {
+    match int_info(ty) {
+        error => null
+        IntInfo as info => match cv_int_to_i128(ci.bits, info) {
+            null => null
+            i128 as val => TExpr { kind = TNumber { is_float = false; value = val; fval = 0.0 }; type = ty; line = line; col = col }
+        }
+    }
+}
+
+/**
+ * fold_expr — the Layer-1a fold driver (CF2): rewrite `e` so every name-free, provably-const INTEGER
+ * op-tree becomes the literal it evaluates to (`literal_of(eval_const(e))`), and every other node is
+ * rebuilt around its folded children (a partially-const tree folds its const sub-trees). Composed
+ * AFTER `inline_rw_expr`'s reference substitution, so a module const's op-tree (e.g. `~(0 to u64)`,
+ * substituted at each use) collapses to its literal on BOTH engines — the VM loads an immediate
+ * instead of re-executing the op-tree. TOTAL over `TExprKind`. A provably-const overflow / ÷0 /
+ * out-of-range surfaces as a located compile error (M.1), propagated from `eval_const`.
+ *
+ * @param e      the typed expression to fold (post reference-substitution)
+ * @param table  the type table (forwarded to the evaluator; unused for the integer subset)
+ * @param env    the environment (unused for the name-free integer subset the fold admits)
+ * @return       the folded expression (a literal where provably const), or a located error
+ * @throws       a located error when a folded constant overflows / divides by zero / is out of range
+ * @since #comptime-fold
+ */
+pub fn fold_expr(e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    match e.kind {
+        TUnary => fold_op_node(e, table, env)
+        TBinary => fold_op_node(e, table, env)
+        TCast => fold_op_node(e, table, env)
+        _ => fold_children(e, table, env)
+    }
+}
+
+/**
+ * fold_op_node — fold a `~`/`-`/binary/cast node: when the whole subtree is a foldable integer
+ * op-tree (`cf_int_value`), evaluate it and splice the resulting literal; otherwise (or when the
+ * value has no literal form) rebuild the node around its folded children.
+ *
+ * @param e      the operator/cast expression to fold
+ * @param table  the type table (forwarded to the evaluator)
+ * @param env    the environment (forwarded to the evaluator)
+ * @return       the folded literal, or the node rebuilt around folded children, or a located error
+ * @since #comptime-fold
+ */
+fn fold_op_node(e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    if !cf_int_value(e) { return fold_children(e, table, env) }
+    match eval_const(e, table, env) {
+        error as x => return x
+        ConstValue as v => fold_splice(v, e, table, env)
+    }
+}
+
+/**
+ * fold_splice — splice a folded value `v` into the AST as a literal at `e`'s type/position, or (when
+ * `v` has no literal form) rebuild `e` around its folded children so foldable sub-trees still fold.
+ *
+ * @param v      the folded comptime value
+ * @param e      the original expression (its type/position for the reconstructed literal)
+ * @param table  the type table (forwarded to the child rebuild)
+ * @param env    the environment (forwarded to the child rebuild)
+ * @return       the reconstructed literal, or `e` rebuilt around folded children, or a located error
+ * @since #comptime-fold
+ */
+fn fold_splice(v: ConstValue, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    match literal_of(v, e.type, e.line, e.col) {
+        TExpr as lit => lit
+        null => fold_children(e, table, env)
+    }
+}
+
+/**
+ * fold_children — rebuild `e` around its folded children, recursing `fold_expr` into every
+ * sub-expression, block and format spec (the structural mirror of `inline_rw_expr`, but
+ * error-propagating so a folded overflow/÷0 surfaces). TOTAL over `TExprKind`; a leaf carries no
+ * foldable child and is returned unchanged.
+ *
+ * @param e      the typed expression to rebuild
+ * @param table  the type table (forwarded to each child fold)
+ * @param env    the environment (forwarded to each child fold)
+ * @return       `e` rebuilt with folded children, or a located error from a child fold
+ * @since #comptime-fold
+ */
+fn fold_children(e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    match e.kind {
+        TNumber => e
+        TStrLit => e
+        TByteLit => e
+        TCharLit => e
+        TBoolLit => e
+        TNullLit => e
+        TPathExpr => e
+        TVar => e
+        TBinary as b => fold_binary(b, e, table, env)
+        TUnary as u => fold_unary(u, e, table, env)
+        TCompare as c => fold_compare(c, e, table, env)
+        TCall as cl => fold_call(cl, e, table, env)
+        TIfExpr as f => fold_if(f, e, table, env)
+        TMatchExpr as m => fold_match(m, e, table, env)
+        TCast as c => fold_cast(c, e, table, env)
+        TFieldAccess as fa => fold_field(fa, e, table, env)
+        TSafeFieldAccess as sfa => fold_safe_field(sfa, e, table, env)
+        TCoalesce as co => fold_coalesce(co, e, table, env)
+        TStructInit as si => fold_struct(si, e, table, env)
+        TIndex as ix => fold_index(ix, e, table, env)
+        TInterp as in => fold_rw_interp(in, e, table, env)
+        TInExpr as n => fold_in(n, e, table, env)
+        TArrayLit as a => fold_array(a, e, table, env)
+        TLambda as lam => fold_lambda(lam, e, table, env)
+        TBorrow as b => fold_borrow(b, e, table, env)
+    }
+}
+
+/**
+ * fold_exprs — fold every expression in `xs` in order, propagating the first located error.
+ *
+ * @param xs     the typed expressions to fold
+ * @param table  the type table (forwarded to each fold)
+ * @param env    the environment (forwarded to each fold)
+ * @return       the folded expressions in order, or the first located error
+ * @since #comptime-fold
+ */
+fn fold_exprs(xs: []TExpr, table: TypeTable, env: Env) -> []TExpr | error {
+    mut out: []TExpr = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        let v = match fold_expr(xs[i], table, env) { error as x => return x; TExpr as f => f }
+        out = teko::list::push(out, v)
+        i++
+    }
+    out
+}
+
+/**
+ * fold_binary — rebuild a binary node around its folded operands (the non-evaluable path: at least
+ * one operand carries a runtime leaf, so the operator itself stays runtime).
+ *
+ * @param b      the typed binary expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each operand fold)
+ * @param env    the environment (forwarded to each operand fold)
+ * @return       the binary rebuilt with folded operands, or a located error
+ * @since #comptime-fold
+ */
+fn fold_binary(b: TBinary, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let l = match fold_expr(b.left, table, env) { error as x => return x; TExpr as v => v }
+    let r = match fold_expr(b.right, table, env) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TBinary { op = b.op; left = l; right = r }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_unary — rebuild a unary node around its folded operand (the non-evaluable path: the operand
+ * carries a runtime leaf).
+ *
+ * @param u      the typed unary expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to the operand fold)
+ * @param env    the environment (forwarded to the operand fold)
+ * @return       the unary rebuilt with a folded operand, or a located error
+ * @since #comptime-fold
+ */
+fn fold_unary(u: TUnary, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let o = match fold_expr(u.operand, table, env) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TUnary { op = u.op; operand = o }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_cast — rebuild a cast node around its folded operand (the non-evaluable / non-integer path).
+ *
+ * @param c      the typed cast expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to the operand fold)
+ * @param env    the environment (forwarded to the operand fold)
+ * @return       the cast rebuilt with a folded operand, or a located error
+ * @since #comptime-fold
+ */
+fn fold_cast(c: TCast, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let o = match fold_expr(c.expr, table, env) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TCast { expr = o }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_field — rebuild a field-access node around its folded receiver.
+ *
+ * @param fa     the typed field-access expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to the receiver fold)
+ * @param env    the environment (forwarded to the receiver fold)
+ * @return       the field access rebuilt with a folded receiver, or a located error
+ * @since #comptime-fold
+ */
+fn fold_field(fa: TFieldAccess, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let r = match fold_expr(fa.receiver, table, env) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TFieldAccess { receiver = r; field = fa.field }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_safe_field — rebuild an optional field-access node around its folded receiver.
+ *
+ * @param sfa    the typed optional field-access expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to the receiver fold)
+ * @param env    the environment (forwarded to the receiver fold)
+ * @return       the optional field access rebuilt with a folded receiver, or a located error
+ * @since #comptime-fold
+ */
+fn fold_safe_field(sfa: TSafeFieldAccess, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let r = match fold_expr(sfa.receiver, table, env) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TSafeFieldAccess { receiver = r; field = sfa.field }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_coalesce — rebuild a `??` coalesce node around its folded operands.
+ *
+ * @param co     the typed coalesce expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each operand fold)
+ * @param env    the environment (forwarded to each operand fold)
+ * @return       the coalesce rebuilt with folded operands, or a located error
+ * @since #comptime-fold
+ */
+fn fold_coalesce(co: TCoalesce, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let l = match fold_expr(co.left, table, env) { error as x => return x; TExpr as v => v }
+    let r = match fold_expr(co.right, table, env) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TCoalesce { left = l; right = r }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_index — rebuild an index node around its folded receiver and index.
+ *
+ * @param ix     the typed index expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each child fold)
+ * @param env    the environment (forwarded to each child fold)
+ * @return       the index rebuilt with folded children, or a located error
+ * @since #comptime-fold
+ */
+fn fold_index(ix: TIndex, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let r = match fold_expr(ix.receiver, table, env) { error as x => return x; TExpr as v => v }
+    let n = match fold_expr(ix.index, table, env) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TIndex { receiver = r; index = n }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_borrow — rebuild a `&x` borrow node around its folded operand.
+ *
+ * @param b      the typed borrow expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to the operand fold)
+ * @param env    the environment (forwarded to the operand fold)
+ * @return       the borrow rebuilt with a folded operand, or a located error
+ * @since #comptime-fold
+ */
+fn fold_borrow(b: TBorrow, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let o = match fold_expr(b.operand, table, env) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TBorrow { operand = o }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_call — rebuild a call node around its folded argument expressions (the callee path carries no
+ * foldable expression).
+ *
+ * @param cl     the typed call expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each argument fold)
+ * @param env    the environment (forwarded to each argument fold)
+ * @return       the call rebuilt with folded arguments, or a located error
+ * @since #comptime-fold
+ */
+fn fold_call(cl: TCall, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let args = match fold_exprs(cl.args, table, env) { error as x => return x; []TExpr as a => a }
+    TExpr { kind = TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_struct — rebuild a struct-init node around its folded field values.
+ *
+ * @param si     the typed struct-init expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each field fold)
+ * @param env    the environment (forwarded to each field fold)
+ * @return       the struct-init rebuilt with folded field values, or a located error
+ * @since #comptime-fold
+ */
+fn fold_struct(si: TStructInit, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let vals = match fold_exprs(si.field_vals, table, env) { error as x => return x; []TExpr as v => v }
+    TExpr { kind = TStructInit { field_names = si.field_names; field_vals = vals }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_in — rebuild an `in` membership node around its folded left-hand side and element list.
+ *
+ * @param n      the typed `in` expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each child fold)
+ * @param env    the environment (forwarded to each child fold)
+ * @return       the `in` expression rebuilt with folded children, or a located error
+ * @since #comptime-fold
+ */
+fn fold_in(n: TInExpr, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let lhs = match fold_expr(n.lhs, table, env) { error as x => return x; TExpr as v => v }
+    let elems = match fold_exprs(n.elems, table, env) { error as x => return x; []TExpr as v => v }
+    TExpr { kind = TInExpr { lhs = lhs; elems = elems }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_if — rebuild an `if` expression around its folded condition and folded branch blocks.
+ *
+ * @param f      the typed `if` expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each child fold)
+ * @param env    the environment (forwarded to each child fold)
+ * @return       the `if` expression rebuilt with folded children, or a located error
+ * @since #comptime-fold
+ */
+fn fold_if(f: TIfExpr, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let cond = match fold_expr(f.cond, table, env) { error as x => return x; TExpr as v => v }
+    let then_blk = match fold_block(f.then_blk, table, env) { error as x => return x; []TStatement as v => v }
+    let else_blk = match fold_block(f.else_blk, table, env) { error as x => return x; []TStatement as v => v }
+    TExpr { kind = TIfExpr { cond = cond; then_blk = then_blk; has_else = f.has_else; else_blk = else_blk }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_compare — rebuild a comparison chain around its folded first operand and every folded
+ * subsequent term.
+ *
+ * @param c      the typed comparison expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each operand fold)
+ * @param env    the environment (forwarded to each operand fold)
+ * @return       the comparison rebuilt with folded operands, or a located error
+ * @since #comptime-fold
+ */
+fn fold_compare(c: TCompare, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let first = match fold_expr(c.first, table, env) { error as x => return x; TExpr as v => v }
+    mut terms: []TCmpTerm = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= c.rest.len { break }
+        let operand = match fold_expr(c.rest[i].operand, table, env) { error as x => return x; TExpr as v => v }
+        terms = teko::list::push(terms, TCmpTerm { op = c.rest[i].op; operand = operand })
+        i++
+    }
+    TExpr { kind = TCompare { first = first; rest = terms }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_match — rebuild a match expression around its folded subject and every folded arm.
+ *
+ * @param m      the typed match expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each child fold)
+ * @param env    the environment (forwarded to each child fold)
+ * @return       the match rebuilt with folded children, or a located error
+ * @since #comptime-fold
+ */
+fn fold_match(m: TMatchExpr, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let subject = match fold_expr(m.subject, table, env) { error as x => return x; TExpr as v => v }
+    mut arms: []TArm = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.arms.len { break }
+        let arm = match fold_arm(m.arms[i], table, env) { error as x => return x; TArm as a => a }
+        arms = teko::list::push(arms, arm)
+        i++
+    }
+    TExpr { kind = TMatchExpr { subject = subject; arms = arms }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_arm — fold one match arm: its guard (when present) and its body block.
+ *
+ * @param arm    the typed match arm
+ * @param table  the type table (forwarded to the guard/body folds)
+ * @param env    the environment (forwarded to the guard/body folds)
+ * @return       the arm with a folded guard and body, or a located error
+ * @since #comptime-fold
+ */
+fn fold_arm(arm: TArm, table: TypeTable, env: Env) -> TArm | error {
+    let guard = if arm.has_when {
+        match fold_expr(arm.guard, table, env) { error as x => return x; TExpr as v => v }
+    } else { arm.guard }
+    let body = match fold_block(arm.body, table, env) { error as x => return x; []TStatement as v => v }
+    TArm { pattern = arm.pattern; has_when = arm.has_when; guard = guard; body = body }
+}
+
+/**
+ * fold_lambda — rebuild a closure literal around its folded body block (signature and captures carry
+ * no foldable expression).
+ *
+ * @param lam    the typed closure literal
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to the body fold)
+ * @param env    the environment (forwarded to the body fold)
+ * @return       the closure rebuilt with a folded body, or a located error
+ * @since #comptime-fold
+ */
+fn fold_lambda(lam: TLambda, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    let body = match fold_block(lam.body, table, env) { error as x => return x; []TStatement as v => v }
+    TExpr { kind = TLambda { params = lam.params; body = body; captures = lam.captures; ret = lam.ret; lift_id = lam.lift_id }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_rw_interp — rebuild an interpolation around its folded hole expressions and format specs. CF2
+ * folds each hole's op-tree (Layer 1a) but leaves the interpolation itself a runtime concat — the
+ * Layer-2 interp-to-`TStrLit` fold is a later crumb.
+ *
+ * @param in     the typed interpolation expression
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each hole/spec fold)
+ * @param env    the environment (forwarded to each hole/spec fold)
+ * @return       the interpolation rebuilt with folded holes and specs, or a located error
+ * @since #comptime-fold
+ */
+fn fold_rw_interp(in: TInterp, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    mut holes: []TExpr = teko::list::empty()
+    mut specs: []TFSpec = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= in.holes.len { break }
+        let hole = match fold_expr(in.holes[i], table, env) { error as x => return x; TExpr as v => v }
+        holes = teko::list::push(holes, hole)
+        if i < in.specs.len {
+            let sp = match fold_fspec(in.specs[i], table, env) { error as x => return x; TFSpec as s => s }
+            specs = teko::list::push(specs, sp)
+        }
+        i++
+    }
+    TExpr { kind = TInterp { pieces = in.pieces; holes = holes; specs = specs }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_fspec — fold a format spec: a dynamic (`:[…]`) spec's argument expressions are folded; a
+ * none/static spec carries no expression and is returned unchanged.
+ *
+ * @param sp     the format spec to fold
+ * @param table  the type table (forwarded to each argument fold)
+ * @param env    the environment (forwarded to each argument fold)
+ * @return       the spec with folded dynamic arguments, or a located error
+ * @since #comptime-fold
+ */
+fn fold_fspec(sp: TFSpec, table: TypeTable, env: Env) -> TFSpec | error {
+    match sp.kind {
+        TFSpecDynamic as fd => {
+            let args = match fold_exprs(fd.args, table, env) { error as x => return x; []TExpr as a => a }
+            TFSpec { kind = TFSpecDynamic { args = args } }
+        }
+        _ => sp
+    }
+}
+
+/**
+ * fold_array — rebuild an array/slice literal around its folded elements (a spread element's
+ * sub-slice expression included).
+ *
+ * @param a      the typed array literal
+ * @param e      the enclosing expression (its type/position)
+ * @param table  the type table (forwarded to each element fold)
+ * @param env    the environment (forwarded to each element fold)
+ * @return       the array literal rebuilt with folded elements, or a located error
+ * @since #comptime-fold
+ */
+fn fold_array(a: TArrayLit, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    mut elems: []TArrayElem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        let ex = match fold_expr(a.elements[i].expr, table, env) { error as x => return x; TExpr as v => v }
+        elems = teko::list::push(elems, TArrayElem { is_spread = a.elements[i].is_spread; expr = ex })
+        i++
+    }
+    TExpr { kind = TArrayLit { elements = elems }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_block — fold every statement in `stmts` in order, propagating the first located error.
+ *
+ * @param stmts  the typed statement block
+ * @param table  the type table (forwarded to each statement fold)
+ * @param env    the environment (forwarded to each statement fold)
+ * @return       the block with each statement folded, or the first located error
+ * @since #comptime-fold
+ */
+fn fold_block(stmts: []TStatement, table: TypeTable, env: Env) -> []TStatement | error {
+    mut out: []TStatement = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stmts.len { break }
+        let s = match fold_stmt(stmts[i], table, env) { error as x => return x; TStatement as v => v }
+        out = teko::list::push(out, s)
+        i++
+    }
+    out
+}
+
+/**
+ * fold_stmt — fold one typed statement, folding every expression and nested block it carries. TOTAL
+ * over `TStatement`; a value-less `break`/`continue` carries no foldable expression and is returned
+ * unchanged.
+ *
+ * @param st     the typed statement to fold
+ * @param table  the type table (forwarded to each child fold)
+ * @param env    the environment (forwarded to each child fold)
+ * @return       the statement with folded children, or a located error
+ * @since #comptime-fold
+ */
+fn fold_stmt(st: TStatement, table: TypeTable, env: Env) -> TStatement | error {
+    match st {
+        TBinding as b => {
+            let v = match fold_expr(b.value, table, env) { error as x => return x; TExpr as f => f }
+            TBinding { kind = b.kind; target = b.target; bound = b.bound; value = v }
+        }
+        TAssign as a => fold_assign(a, table, env)
+        TReturn as r => fold_return(r, st, table, env)
+        TLoopStmt as l => {
+            let init = match fold_block(l.init, table, env) { error as x => return x; []TStatement as v => v }
+            let body = match fold_block(l.body, table, env) { error as x => return x; []TStatement as v => v }
+            TLoopStmt { label = l.label; init = init; body = body }
+        }
+        TBreakStmt => st
+        TContinueStmt => st
+        TExprStmt as es => {
+            let v = match fold_expr(es.expr, table, env) { error as x => return x; TExpr as f => f }
+            TExprStmt { expr = v }
+        }
+        TDeferStmt as d => {
+            let body = match fold_block(d.body, table, env) { error as x => return x; []TStatement as v => v }
+            TDeferStmt { body = body }
+        }
+        TAdoptStmt as a => {
+            let body = match fold_block(a.body, table, env) { error as x => return x; []TStatement as v => v }
+            TAdoptStmt { name = a.name; body = body }
+        }
+    }
+}
+
+/**
+ * fold_return — fold a `return` statement's value (a value-less `return` is returned unchanged).
+ *
+ * @param r      the typed return statement
+ * @param st     the original statement (returned unchanged when value-less)
+ * @param table  the type table (forwarded to the value fold)
+ * @param env    the environment (forwarded to the value fold)
+ * @return       the return with a folded value, or a located error
+ * @since #comptime-fold
+ */
+fn fold_return(r: TReturn, st: TStatement, table: TypeTable, env: Env) -> TStatement | error {
+    if !r.has_value { return st }
+    let v = match fold_expr(r.value, table, env) { error as x => return x; TExpr as f => f }
+    TReturn { has_value = true; value = v }
+}
+
+/**
+ * fold_assign — fold an assignment's value and, for a field target, its typed LHS field-access
+ * expression (a simple/ref-deref target carries no foldable expression).
+ *
+ * @param a      the typed assignment
+ * @param table  the type table (forwarded to each child fold)
+ * @param env    the environment (forwarded to each child fold)
+ * @return       the assignment with folded children, or a located error
+ * @since #comptime-fold
+ */
+fn fold_assign(a: TAssign, table: TypeTable, env: Env) -> TStatement | error {
+    let value = match fold_expr(a.value, table, env) { error as x => return x; TExpr as f => f }
+    match a.kind {
+        parser::AssignKind::Field => {
+            let target = match fold_expr(a.target, table, env) { error as x => return x; TExpr as f => f }
+            TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = value; deref = a.deref; target = target }
+        }
+        _ => TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = value; deref = a.deref; target = a.target }
+    }
+}
+
+/**
+ * fold_empty_table — an empty type table for the CF2 fold: the name-free integer subset the fold
+ * admits never resolves a type through the table, so an empty one suffices at the wiring site.
+ *
+ * @return  an empty type table
+ * @since #comptime-fold
+ */
+fn fold_empty_table() -> TypeTable { teko::list::empty() }
+
+/**
+ * fold_program — fold every item of the substituted program: a function's body, a const declaration's
+ * initializer and a loose statement each have their op-trees folded; every other item passes through
+ * unchanged. Composed after `inline_consts`'s reference substitution as the second Layer-1a pass.
+ *
+ * @param prog  the reference-substituted typed program
+ * @return      the program with provably-const integer op-trees folded to literals, or a located
+ *              error (a folded constant overflow / ÷0 / out-of-range)
+ * @since #comptime-fold
+ */
+pub fn fold_program(prog: TProgram) -> TProgram | error {
+    let table = fold_empty_table()
+    let env = env_empty()
+    mut out: []TItem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        let it = match fold_item(prog.items[i], table, env) { error as x => return x; TItem as v => v }
+        out = teko::list::push(out, it)
+        i++
+    }
+    TProgram { items = out }
+}
+
+/**
+ * fold_item — fold one program item: a function's body, a const declaration's initializer or a loose
+ * statement; every other item (a type/use declaration) passes through unchanged.
+ *
+ * @param it     the program item to fold
+ * @param table  the type table (forwarded to the child fold)
+ * @param env    the environment (forwarded to the child fold)
+ * @return       the item with its op-trees folded, or a located error
+ * @since #comptime-fold
+ */
+fn fold_item(it: TItem, table: TypeTable, env: Env) -> TItem | error {
+    match it {
+        TFunction as f => fold_function(f, table, env)
+        TConstDecl as cd => fold_const_decl(cd, table, env)
+        TStatement as s => match fold_stmt(s, table, env) { error as x => return x; TStatement as v => v }
+        _ => it
+    }
+}
+
+/**
+ * fold_function — fold a top-level function's body; its signature, visibility and metadata are
+ * preserved.
+ *
+ * @param f      the typed function
+ * @param table  the type table (forwarded to the body fold)
+ * @param env    the environment (forwarded to the body fold)
+ * @return       the function with a folded body, or a located error
+ * @since #comptime-fold
+ */
+fn fold_function(f: TFunction, table: TypeTable, env: Env) -> TItem | error {
+    let body = match fold_block(f.body, table, env) { error as x => return x; []TStatement as v => v }
+    TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = f.return_type; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib }
+}
+
+/**
+ * fold_const_decl — fold a const declaration's initializer (the surviving exported scalar consts and
+ * every aggregate const collapse their op-trees to literals); the declaration's metadata is preserved.
+ *
+ * @param cd     the typed const declaration
+ * @param table  the type table (forwarded to the initializer fold)
+ * @param env    the environment (forwarded to the initializer fold)
+ * @return       the const declaration with a folded initializer, or a located error
+ * @since #comptime-fold
+ */
+fn fold_const_decl(cd: TConstDecl, table: TypeTable, env: Env) -> TItem | error {
+    let init = match fold_expr(cd.init, table, env) { error as x => return x; TExpr as v => v }
+    TConstDecl { name = cd.name; namespace = cd.namespace; ty = cd.ty; init = init; vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col }
+}

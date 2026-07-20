@@ -512,11 +512,17 @@ fn inline_place_item(out: []TItem, it: TItem, map: ScalarConstMap) -> []TItem {
  * program (they emit no code — no fn body, no arena, no global). An AGGREGATE const is NOT inlined
  * here — its TConstDecl passes through to lowering (crumb 6). Runs in the checker pipeline AFTER
  * `monomorphize` and BEFORE lowering, so lowering sees no scalar const reference and never reaches a
- * globals honest-stop for a scalar-only program.
+ * globals honest-stop for a scalar-only program. After substitution the pass composes the CF2 fold
+ * (`fold_program`, #comptime-fold): every name-free provably-const integer op-tree (a substituted
+ * module const's `~(0 to u64)`, or any inline literal op-tree) collapses to its literal, so BOTH
+ * engines load an immediate instead of re-executing the op-tree, and a provably-const
+ * overflow/÷0/out-of-range becomes a located compile error (M.1).
  *
  * @param prog  the fully typed, monomorphized program
- * @return      the program with scalar const references substituted and scalar const decls removed
+ * @return      the program with scalar const references substituted, scalar const decls removed and
+ *              provably-const integer op-trees folded to literals
  * @throws      a located error when the module-level consts form a reference cycle (`const_dep_order`)
+ *              or a folded constant overflows / divides by zero / is out of range (#comptime-fold)
  * @since #594
  */
 pub fn inline_consts(prog: TProgram) -> TProgram | error {
@@ -531,7 +537,7 @@ pub fn inline_consts(prog: TProgram) -> TProgram | error {
         out = inline_place_item(out, prog.items[i], smap)
         i++
     }
-    TProgram { items = out }
+    fold_program(TProgram { items = out })
 }
 
 /**

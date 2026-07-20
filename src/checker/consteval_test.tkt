@@ -443,19 +443,17 @@ fn first_fn_return(prog: TProgram) -> TExpr? {
 }
 
 /**
- * inline_left_number_is — assert the first function's returned expression is a binary whose LEFT
- * operand is the integer literal `want` (proving a scalar-const reference collapsed to its literal).
+ * inline_return_number_is — assert the first function's returned expression is the integer literal
+ * `want` (proving a scalar-const reference collapsed to its literal AND the comptime-fold pass then
+ * folded the const-known op-tree down to that single literal).
  *
  * @param prog  the inlined program
- * @param want  the expected left-operand literal value
+ * @param want  the expected folded literal value
  */
-fn inline_left_number_is(prog: TProgram, want: i128) {
+fn inline_return_number_is(prog: TProgram, want: i128) {
     match first_fn_return(prog) {
         TExpr as rv => match rv.kind {
-            TBinary as b => match b.left.kind {
-                TNumber as num => teko::assert::is_true(num.value == want)
-                _ => teko::assert::is_true(false)
-            }
+            TNumber as num => teko::assert::is_true(num.value == want)
             _ => teko::assert::is_true(false)
         }
         null => teko::assert::is_true(false)
@@ -464,7 +462,8 @@ fn inline_left_number_is(prog: TProgram, want: i128) {
 
 /**
  * inline_consts_substitutes_scalar_and_drops_decl — `const K: i64 = 41` used as `K + 1`: the inliner
- * substitutes `K` with the literal `41` and drops the scalar TConstDecl (no residual const item).
+ * substitutes `K` with the literal `41` and drops the scalar TConstDecl (no residual const item); the
+ * comptime-fold pass then collapses the const-known `41 + 1` to the literal `42`.
  */
 #test
 fn inline_consts_substitutes_scalar_and_drops_decl() {
@@ -477,7 +476,7 @@ fn inline_consts_substitutes_scalar_and_drops_decl() {
     match inline_consts(TProgram { items = items }) {
         TProgram as out => {
             teko::assert::is_true(count_const_items(out) == 0)
-            inline_left_number_is(out, 41)
+            inline_return_number_is(out, 42)
         }
         error => teko::assert::is_true(false)
     }
@@ -486,7 +485,7 @@ fn inline_consts_substitutes_scalar_and_drops_decl() {
 /**
  * inline_consts_collapses_nested_scalar_refs — `const B = A + 1; const A = 1` used as `return B`:
  * dependency-order inlining collapses `B` fully to `1 + 1` (no residual `TVar` for A or B), even
- * though B is declared before A.
+ * though B is declared before A; the comptime-fold pass then folds `1 + 1` to the literal `2`.
  */
 #test
 fn inline_consts_collapses_nested_scalar_refs() {
@@ -501,7 +500,7 @@ fn inline_consts_collapses_nested_scalar_refs() {
     match inline_consts(TProgram { items = items }) {
         TProgram as out => {
             teko::assert::is_true(count_const_items(out) == 0)
-            inline_left_number_is(out, 1)
+            inline_return_number_is(out, 2)
         }
         error => teko::assert::is_true(false)
     }
