@@ -285,6 +285,24 @@ fn fold_negate() {
 }
 
 /**
+ * fold_negative_min_literal — a leading `-` on an integer literal is a NEGATIVE LITERAL, not a
+ * negation of a positive one: the most-negative signed value of the `i8`/`i16`/`i32` families, whose
+ * positive magnitude `2^(w-1)` has NO signed form, folds to its exact two's-complement bits (`0x80…0`).
+ * The evaluator encodes the negated value against the whole type rather than range-checking the
+ * un-negatable positive operand in isolation (owner ruling 2026-07-20: the negative is a literal, not
+ * an operation — mirrors the type checker's negative-literal rule). Before the fix this raised a
+ * spurious "integer literal is out of range". `i64::MIN` (`-9223372036854775808`, whose bare `2^63`
+ * magnitude is not itself writable as a plain literal) is covered end-to-end by the
+ * `comptime_fold_format_oracle` regression, which folds it through the real parser.
+ */
+#test
+fn fold_negative_min_literal() {
+    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(128 to i128, i8t()), i8t()), 128 to u128)
+    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(32768 to i128, i16t()), i16t()), 32768 to u128)
+    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(2147483648 to i128, i32t()), i32t()), 2147483648 to u128)
+}
+
+/**
  * fold_float_ops — f64 literals and `+ - * /` fold through IEEE bits (byte-exact vs
  * `teko::f64_bits`), and a float divide by zero is a compile error.
  */
@@ -920,5 +938,302 @@ fn inline_consts_folds_module_const_optree() {
                 null => teko::assert::is_true(false)
             }
         }
+    }
+}
+
+/**
+ * cf_cvint — a `CVInt` comptime value carrying the two's-complement bits `bits` of type `ty`, for the
+ * CF5 `comptime_format` matrix.
+ *
+ * @param bits  the value's two's-complement bits
+ * @param ty    the value's declared integer type
+ * @return      the integer comptime value
+ */
+fn cf_cvint(bits: u128, ty: Type) -> ConstValue { ConstValue { kind = CVInt { bits = bits; ty = ty } } }
+
+/**
+ * cf_spec_static — a static (`:literal`) format spec carrying spec string `s`.
+ *
+ * @param s  the static spec string (e.g. `"X"`, `"d5"`)
+ * @return   the static format spec
+ */
+fn cf_spec_static(s: str) -> TFSpec { TFSpec { kind = TFSpecStatic { s = s } } }
+
+/**
+ * cf_spec_none — a no-format (`TFSpecNone`) spec, the natural-form render.
+ *
+ * @return  the none format spec
+ */
+fn cf_spec_none() -> TFSpec { TFSpec { kind = TFSpecNone { } } }
+
+/**
+ * cf_fmt_is — assert `comptime_format(v, sp, ty)` renders byte-for-byte to `want`.
+ *
+ * @param v     the const hole value
+ * @param sp    the format spec
+ * @param ty    the hole's resolved type
+ * @param want  the expected rendered string
+ */
+fn cf_fmt_is(v: ConstValue, sp: TFSpec, ty: Type, want: str) {
+    match comptime_format(v, sp, ty) {
+        error => teko::assert::is_true(false)
+        []byte as b => teko::assert::is_true(str_of_bytes(b) == want)
+    }
+}
+
+/**
+ * cf_fmt_declined — assert `comptime_format(v, sp, ty)` declines to fold (returns an error), so the
+ * caller leaves the hole runtime (a float / dynamic / unrecognized spec).
+ *
+ * @param v   the const hole value
+ * @param sp  the format spec
+ * @param ty  the hole's resolved type
+ */
+fn cf_fmt_declined(v: ConstValue, sp: TFSpec, ty: Type) {
+    match comptime_format(v, sp, ty) {
+        error => teko::assert::is_true(true)
+        []byte => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * fmt_hex_family — the `:x`/`:X` hex render mirrors `tk_fmt_x_lower`/`tk_fmt_x_upper`: no leading zeros,
+ * `"0"` for zero, and a negative signed value sign-extended to 64 bits (`-1 to i8 : X` → all-ones), the
+ * exact `(uint64_t)` cast the C backend emits.
+ */
+#test
+fn fmt_hex_family() {
+    cf_fmt_is(cf_cvint(255 to u128, u64t()), cf_spec_static("X"), u64t(), "FF")
+    cf_fmt_is(cf_cvint(255 to u128, u64t()), cf_spec_static("x"), u64t(), "ff")
+    cf_fmt_is(cf_cvint(0 to u128, u64t()), cf_spec_static("X"), u64t(), "0")
+    cf_fmt_is(cf_cvint(3735928559 to u128, u64t()), cf_spec_static("X"), u64t(), "DEADBEEF")
+    cf_fmt_is(cf_cvint(3735928559 to u128, u64t()), cf_spec_static("x"), u64t(), "deadbeef")
+    cf_fmt_is(cf_cvint((~(0 to u64)) to u128, u64t()), cf_spec_static("X"), u64t(), "FFFFFFFFFFFFFFFF")
+    cf_fmt_is(cf_cvint(255 to u128, i8t()), cf_spec_static("X"), i8t(), "FFFFFFFFFFFFFFFF")
+    cf_fmt_is(cf_cvint(4294967291 to u128, i32t()), cf_spec_static("X"), i32t(), "FFFFFFFFFFFFFFFB")
+}
+
+/**
+ * fmt_binary_family — the `:b` render mirrors `tk_fmt_b`: no leading zeros, `"0"` for zero.
+ */
+#test
+fn fmt_binary_family() {
+    cf_fmt_is(cf_cvint(255 to u128, u64t()), cf_spec_static("b"), u64t(), "11111111")
+    cf_fmt_is(cf_cvint(0 to u128, u64t()), cf_spec_static("b"), u64t(), "0")
+    cf_fmt_is(cf_cvint(5 to u128, u8t()), cf_spec_static("b"), u8t(), "101")
+}
+
+/**
+ * fmt_none_decimal — the natural (`TFSpecNone`) render mirrors `tk_u64_to_str` (unsigned) and
+ * `tk_i64_to_str` (signed, `'-'`-prefixed), including the u64/i64 edges.
+ */
+#test
+fn fmt_none_decimal() {
+    cf_fmt_is(cf_cvint(255 to u128, u64t()), cf_spec_none(), u64t(), "255")
+    cf_fmt_is(cf_cvint(0 to u128, u64t()), cf_spec_none(), u64t(), "0")
+    cf_fmt_is(cf_cvint((~(0 to u64)) to u128, u64t()), cf_spec_none(), u64t(), "18446744073709551615")
+    cf_fmt_is(cf_cvint((~(0 to u64)) to u128, i64t()), cf_spec_none(), i64t(), "-1")
+    cf_fmt_is(cf_cvint(255 to u128, i8t()), cf_spec_none(), i8t(), "-1")
+    cf_fmt_is(cf_cvint((1 to u128) << 63, i64t()), cf_spec_none(), i64t(), "-9223372036854775808")
+}
+
+/**
+ * fmt_d_width — the `:d` render mirrors `tk_fmt_d` (`%0*PRId64`): a default width of 1 (no padding), a
+ * wider field zero-padded AFTER the sign.
+ */
+#test
+fn fmt_d_width() {
+    cf_fmt_is(cf_cvint(42 to u128, i64t()), cf_spec_static("d"), i64t(), "42")
+    cf_fmt_is(cf_cvint(42 to u128, i64t()), cf_spec_static("d5"), i64t(), "00042")
+    cf_fmt_is(cf_cvint((~(0 to u64)) to u128, i64t()), cf_spec_static("d5"), i64t(), "-0001")
+    cf_fmt_is(cf_cvint((~(0 to u64)) to u128, i64t()), cf_spec_static("d"), i64t(), "-1")
+}
+
+/**
+ * fmt_n_thousands — the `:n` render mirrors `tk_fmt_n_i`: a `','` every three digits from the right, sign
+ * preserved.
+ */
+#test
+fn fmt_n_thousands() {
+    cf_fmt_is(cf_cvint(1000000 to u128, u64t()), cf_spec_static("n"), u64t(), "1,000,000")
+    cf_fmt_is(cf_cvint(255 to u128, u64t()), cf_spec_static("n"), u64t(), "255")
+    cf_fmt_is(cf_cvint(1234 to u128, i64t()), cf_spec_static("n"), i64t(), "1,234")
+    cf_fmt_is(cf_cvint((~(0 to u64)) to u128, i64t()), cf_spec_static("n"), i64t(), "-1")
+}
+
+/**
+ * fmt_none_bool_byte_bytes — the natural render of a bool (`"true"`/`"false"`), a byte (unsigned
+ * decimal) and a str/char value (its raw bytes passed through).
+ */
+#test
+fn fmt_none_bool_byte_bytes() {
+    cf_fmt_is(ConstValue { kind = CVBool { v = true } }, cf_spec_none(), boolt(), "true")
+    cf_fmt_is(ConstValue { kind = CVBool { v = false } }, cf_spec_none(), boolt(), "false")
+    cf_fmt_is(cf_cvint(200 to u128, bytet()), cf_spec_none(), bytet(), "200")
+    cf_fmt_is(ConstValue { kind = CVBytes { data = bytes_of_str("hi!") } }, cf_spec_none(), strt(), "hi!")
+    cf_fmt_is(ConstValue { kind = CVBytes { data = bytes_of_str("A") } }, cf_spec_none(), Char { }, "A")
+}
+
+/**
+ * fmt_declines_float_and_dynamic — the fold NEVER touches a float family (`:f`/`:e`/`:g`/`:p`, and a
+ * float hole with no spec) nor a dynamic spec — `comptime_format` returns an error so the caller leaves
+ * the hole runtime (M.3 honesty: no byte-divergent fold).
+ */
+#test
+fn fmt_declines_float_and_dynamic() {
+    cf_fmt_declined(cf_cvint(42 to u128, u64t()), cf_spec_static("f2"), u64t())
+    cf_fmt_declined(cf_cvint(42 to u128, u64t()), cf_spec_static("e"), u64t())
+    cf_fmt_declined(cf_cvint(42 to u128, u64t()), cf_spec_static("g"), u64t())
+    cf_fmt_declined(cf_cvint(42 to u128, u64t()), cf_spec_static("p"), u64t())
+    cf_fmt_declined(cf_cvint(42 to u128, u64t()), TFSpec { kind = TFSpecDynamic { args = teko::list::empty() } }, u64t())
+    cf_fmt_declined(ConstValue { kind = CVFloat { bits = teko::f64_bits(1.5); is_f32 = false } }, cf_spec_none(), f64t())
+}
+
+/**
+ * cf_interp_of — a typed interpolation `TExpr` of type `str` over one hole and its spec, with an empty
+ * leading and trailing piece (`$"{hole:spec}"`).
+ *
+ * @param hole  the hole expression
+ * @param sp    the hole's format spec
+ * @return      the typed interpolation expression
+ */
+fn cf_interp_of(hole: TExpr, sp: TFSpec) -> TExpr {
+    let pieces = teko::list::push(teko::list::push(teko::list::empty(), ""), "")
+    let holes = teko::list::push(teko::list::empty(), hole)
+    let specs = teko::list::push(teko::list::empty(), sp)
+    te(TInterp { pieces = pieces; holes = holes; specs = specs }, strt())
+}
+
+/**
+ * fold_interp_folds_hex — the canonical Layer-2 mandate: `$"{a:X}"` with `a == 0xFF` (a folded literal
+ * hole) collapses to the single `TStrLit "FF"` — no runtime `tk_str_concat`/`tk_fmt_x_upper`.
+ */
+#test
+fn fold_interp_folds_hex() {
+    let e = cf_interp_of(cf_num(255 to i128, u64t()), cf_spec_static("X"))
+    match e.kind {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+            error => teko::assert::is_true(false)
+            TExpr as f => match f.kind {
+                TStrLit as s => teko::assert::is_true(s.text == "FF")
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * fold_interp_multi_piece — a multi-piece interpolation with two const holes folds to one `TStrLit` that
+ * interleaves the literal pieces with each hole's render (`"v=" ++ "255" ++ " x=" ++ "FF"`).
+ */
+#test
+fn fold_interp_multi_piece() {
+    mut pieces: []str = teko::list::push(teko::list::empty(), "v=")
+    pieces = teko::list::push(pieces, " x=")
+    pieces = teko::list::push(pieces, "")
+    mut holes: []TExpr = teko::list::push(teko::list::empty(), cf_num(255 to i128, u64t()))
+    holes = teko::list::push(holes, cf_num(255 to i128, u64t()))
+    mut specs: []TFSpec = teko::list::push(teko::list::empty(), cf_spec_none())
+    specs = teko::list::push(specs, cf_spec_static("X"))
+    let e = te(TInterp { pieces = pieces; holes = holes; specs = specs }, strt())
+    match e.kind {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+            error => teko::assert::is_true(false)
+            TExpr as f => match f.kind {
+                TStrLit as s => teko::assert::is_true(s.text == "v=255 x=FF")
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * fold_interp_runtime_hole_stays — a RUNTIME hole (a bare `TVar`, standing in for a param/IO result)
+ * makes the whole interpolation stay its runtime concat shape (`TInterp` returned unchanged), preserving
+ * today's behavior (fixture E boundary).
+ */
+#test
+fn fold_interp_runtime_hole_stays() {
+    let hole = te(TVar { name = "x"; is_func = false; func_ns = "teko::checker" }, u64t())
+    let e = cf_interp_of(hole, cf_spec_static("X"))
+    match e.kind {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+            error => teko::assert::is_true(false)
+            TExpr as f => match f.kind {
+                TInterp => teko::assert::is_true(true)
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * fold_interp_float_hole_stays — a FLOAT hole (with a float spec) is never folded — the interpolation
+ * stays a runtime `TInterp` (the fold declines all float formatting, M.3 honesty).
+ */
+#test
+fn fold_interp_float_hole_stays() {
+    let e = cf_interp_of(cf_fnum(1.5), cf_spec_static("f2"))
+    match e.kind {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+            error => teko::assert::is_true(false)
+            TExpr as f => match f.kind {
+                TInterp => teko::assert::is_true(true)
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * comptime_format_declines_nominal_hole_type — a hole whose type is NOMINAL (a user type: a
+ * date/time, any `Named`) is OUTSIDE the fold whitelist (`Str`/`Char`/`Byte`/int/bool), so
+ * `comptime_format` returns a located error under the natural (`TFSpecNone`) render and `fold_interp`
+ * leaves the interpolation as a runtime format. Locks in the owner constraint (2026-07-20): comptime
+ * formatting of a date/time is NEVER attempted — date formatting stays at runtime, like float.
+ */
+#test
+fn comptime_format_declines_nominal_hole_type() {
+    match comptime_format(cf_cvint(0 to u128, i64t()), cf_spec_none(), Named { name = "DateTime" }) {
+        error => teko::assert::is_true(true)
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * comptime_format_declines_date_like_spec — a date/time format spec (lead char outside the integer
+ * fold whitelist `x`/`X`/`b`/`d`/`n`, e.g. a `yyyy`-style date pattern) is not recognized by the
+ * comptime formatter, so `comptime_format` errors and the interpolation stays runtime — a date FORMAT
+ * spec is never folded even on an integer-carried value (owner constraint 2026-07-20).
+ */
+#test
+fn comptime_format_declines_date_like_spec() {
+    match comptime_format(cf_cvint(0 to u128, i64t()), cf_spec_static("yyyy"), i64t()) {
+        error => teko::assert::is_true(true)
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * fold_interp_dynamic_spec_stays — a `TFSpecDynamic` spec (a runtime width/precision arg) makes the
+ * interpolation stay runtime, even when the hole itself is a const literal (fixture G boundary).
+ */
+#test
+fn fold_interp_dynamic_spec_stays() {
+    let dyn_spec = TFSpec { kind = TFSpecDynamic { args = teko::list::push(teko::list::empty(), cf_var("w", u64t())) } }
+    let e = cf_interp_of(cf_num(255 to i128, u64t()), dyn_spec)
+    match e.kind {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+            error => teko::assert::is_true(false)
+            TExpr as f => match f.kind {
+                TInterp => teko::assert::is_true(true)
+                _ => teko::assert::is_true(false)
+            }
+        }
+        _ => teko::assert::is_true(false)
     }
 }

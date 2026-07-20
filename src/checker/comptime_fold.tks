@@ -507,7 +507,29 @@ fn cast_max(dst: IntInfo) -> u128 {
  * @return       the folded value, or a located error
  * @since #comptime-fold
  */
+/**
+ * eval_unary_expr — evaluate a unary comptime expression. A leading `-` on an integer literal is a
+ * NEGATIVE LITERAL, not a negation OPERATION applied to a positive one: `-9223372036854775808` IS
+ * i64::MIN, whose positive magnitude `2^63` has no i64 form, so evaluating the operand in isolation
+ * would overflow even though the literal is in range. That form is encoded directly — the negated
+ * value `-N` range-checked against the whole expression's type via `encode_int_literal`'s negative
+ * path (the type checker's own negative-literal rule, `typer.tks`). Every other unary (`-2.5` over a
+ * float, `~x`, `-x` over a non-literal) takes the general evaluate-then-`apply_unary` path.
+ *
+ * @param u      the unary expression
+ * @param e      the enclosing expression (its type; positions any error)
+ * @param table  the type table (forwarded to the operand evaluator)
+ * @param env    the environment (module consts + provably-const locals)
+ * @return       the evaluated comptime value, or a located error
+ * @since #comptime-fold
+ */
 fn eval_unary_expr(u: TUnary, e: TExpr, table: TypeTable, env: Env) -> ConstValue | error {
+    if u.op == lexer::TokenKind::Minus {
+        match u.operand.kind {
+            TNumber as n => if !n.is_float { return eval_int_literal((0 to i128) - n.value, e.type, e) }
+            _ => { }
+        }
+    }
     match eval_const(u.operand, table, env) {
         error as x => return x
         ConstValue as v => apply_unary(u.op, v, e)
@@ -1648,15 +1670,18 @@ fn fold_lambda(lam: TLambda, e: TExpr, table: TypeTable, env: Env) -> TExpr | er
 }
 
 /**
- * fold_rw_interp — rebuild an interpolation around its folded hole expressions and format specs. CF2
- * folds each hole's op-tree (Layer 1a) but leaves the interpolation itself a runtime concat — the
- * Layer-2 interp-to-`TStrLit` fold is a later crumb.
+ * fold_rw_interp — fold an interpolation: first fold each hole's op-tree (Layer 1a) so a
+ * provably-const hole becomes its literal, then delegate the FINAL step to `fold_interp` (Layer 2),
+ * which collapses the whole interpolation to a single `TStrLit` when every hole is a const literal and
+ * every spec is `TFSpecNone`/`TFSpecStatic` of a foldable family — otherwise the interpolation is
+ * returned as its runtime concat shape (behavior preserved for any runtime hole or dynamic spec).
  *
  * @param in     the typed interpolation expression
  * @param e      the enclosing expression (its type/position)
- * @param table  the type table (forwarded to each hole/spec fold)
- * @param env    the environment (forwarded to each hole/spec fold)
- * @return       the interpolation rebuilt with folded holes and specs, or a located error
+ * @param table  the type table (forwarded to each hole/spec fold and to `fold_interp`)
+ * @param env    the environment (forwarded to each hole/spec fold and to `fold_interp`)
+ * @return       a folded `TStrLit` when fully const, else the interpolation rebuilt with folded holes
+ *               and specs, or a located error
  * @since #comptime-fold
  */
 fn fold_rw_interp(in: TInterp, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
@@ -1673,7 +1698,7 @@ fn fold_rw_interp(in: TInterp, e: TExpr, table: TypeTable, env: Env) -> TExpr | 
         }
         i++
     }
-    TExpr { kind = TInterp { pieces = in.pieces; holes = holes; specs = specs }; type = e.type; line = e.line; col = e.col }
+    fold_interp(TInterp { pieces = in.pieces; holes = holes; specs = specs }, e, table, env)
 }
 
 /**
@@ -2544,4 +2569,631 @@ pub fn propagate_locals(prog: TProgram) -> TProgram {
         i++
     }
     TProgram { items = out }
+}
+
+/**
+ * cf_single_byte — a one-element `[]byte` holding `b`, the base case the digit/character builders start
+ * from (the `"0"` of a zero-valued decimal/hex/binary render).
+ *
+ * @param b  the single byte
+ * @return   a `[]byte` of length one holding `b`
+ * @since #comptime-fold
+ */
+fn cf_single_byte(b: byte) -> []byte { teko::list::push(teko::list::empty(), b) }
+
+/**
+ * cf_append_bytes — the concatenation `a ++ b`, appending every byte of `b` onto `a` in order (the
+ * comptime formatter's piece/hole joiner and sign/pad prefixer).
+ *
+ * @param a  the prefix bytes
+ * @param b  the suffix bytes
+ * @return   the bytes of `a` followed by the bytes of `b`
+ * @since #comptime-fold
+ */
+fn cf_append_bytes(a: []byte, b: []byte) -> []byte {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * cf_reverse_bytes — the reverse of `a`, the last step of every digit builder (digits are produced
+ * least-significant first and emitted most-significant first).
+ *
+ * @param a  the bytes to reverse
+ * @return   the bytes of `a` in reverse order
+ * @since #comptime-fold
+ */
+fn cf_reverse_bytes(a: []byte) -> []byte {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = a.len
+    loop {
+        if i == (0 to u64) { break }
+        i--
+        out = teko::list::push(out, a[i])
+    }
+    out
+}
+
+/**
+ * cf_project_u64 — the low 64 bits of `bits` after the width/signedness `info` projection the C backend
+ * performs when it casts an interpolation hole to `uint64_t` (the argument every `tk_fmt_x_*`/`tk_fmt_b`
+ * / `tk_u64_to_str` receives). A signed value narrower than 64 bits is SIGN-EXTENDED to 64 (so `-1 to
+ * i8` renders as `FFFFFFFFFFFFFFFF` under `:X`, exactly as `(uint64_t)((int8_t)-1)` does); every other
+ * value is its low 64 bits (an unsigned value zero-extends, a 64-bit-or-wider value truncates — the
+ * SAME truncation `(uint64_t)` applies to an i128/u128 hole).
+ *
+ * @param bits  the value's two's-complement bits
+ * @param info  the value's width/signedness
+ * @return      the 64-bit pattern the runtime formatter receives, as a u128 in `[0, 2^64)`
+ * @since #comptime-fold
+ */
+fn cf_project_u64(bits: u128, info: IntInfo) -> u128 {
+    let masked = mask_to_width(bits, info.width)
+    if info.width >= 64 { return mask_to_width(masked, 64) }
+    if info.is_signed && bit_set(masked, info.width - 1) { return masked | (width_mask(64) ^ width_mask(info.width)) }
+    masked
+}
+
+/**
+ * cf_as_u64 — the 64-bit pattern a `CVInt` presents to the runtime formatters (the `(uint64_t)`/
+ * `(int64_t)` cast argument): its width/signedness drives `cf_project_u64`. A non-integer type never
+ * reaches here (the fold gates every static/numeric spec on an integer hole), so the error arm returns
+ * zero defensively and is unreachable.
+ *
+ * @param ci  the integer comptime value
+ * @return    the 64-bit pattern as a u128 in `[0, 2^64)`
+ * @since #comptime-fold
+ */
+fn cf_as_u64(ci: CVInt) -> u128 {
+    match int_info(ci.ty) {
+        error => 0 to u128
+        IntInfo as info => cf_project_u64(ci.bits, info)
+    }
+}
+
+/**
+ * cf_u64_decimal — the unsigned decimal render of `v` (a value in `[0, 2^64)`): the digits with no
+ * leading zeros, `"0"` for zero — byte-identical to `tk_u64_to_str`.
+ *
+ * @param v  the value to render (must be `< 2^64`)
+ * @return   the decimal digit bytes
+ * @since #comptime-fold
+ */
+fn cf_u64_decimal(v: u128) -> []byte {
+    if v == (0 to u128) { return cf_single_byte(48 to byte) }
+    mut rev: []byte = teko::list::empty()
+    mut x = v
+    loop {
+        if x == (0 to u128) { break }
+        let d = (x % (10 to u128)) to u64
+        rev = teko::list::push(rev, (48 + d) to byte)
+        x = x / (10 to u128)
+    }
+    cf_reverse_bytes(rev)
+}
+
+/**
+ * cf_i64_decimal — the signed decimal render of the 64-bit pattern `u` (interpreted as int64): a `'-'`
+ * prefix then the magnitude digits for a negative value, the plain digits otherwise — byte-identical to
+ * `tk_i64_to_str` (which forms the magnitude as `-(v + 1) + 1`, matched here by the two's-complement
+ * negation at width 64).
+ *
+ * @param u  the 64-bit pattern (a u128 in `[0, 2^64)`) interpreted as a signed int64
+ * @return   the signed decimal bytes
+ * @since #comptime-fold
+ */
+fn cf_i64_decimal(u: u128) -> []byte {
+    if bit_set(u, 63) { return cf_append_bytes(cf_single_byte(45 to byte), cf_u64_decimal(twos_neg(u, 64))) }
+    cf_u64_decimal(u)
+}
+
+/**
+ * cf_hex_digit — the ASCII byte of hex nibble `d` (`0`..`15`): a decimal digit for `0`..`9`, else an
+ * upper- or lower-case letter per `upper`.
+ *
+ * @param d      the nibble value (`0`..`15`)
+ * @param upper  true for `A`..`F`, false for `a`..`f`
+ * @return       the hex digit's ASCII byte
+ * @since #comptime-fold
+ */
+fn cf_hex_digit(d: u64, upper: bool) -> byte {
+    if d < (10 to u64) { return (48 + d) to byte }
+    if upper { return (65 + (d - (10 to u64))) to byte }
+    (97 + (d - (10 to u64))) to byte
+}
+
+/**
+ * cf_hex — the hex render of `v`: no leading zeros, `"0"` for zero, letters cased by `upper` —
+ * byte-identical to `tk_fmt_x_upper` (`%PRIX64`) / `tk_fmt_x_lower` (`%PRIx64`).
+ *
+ * @param v      the value to render (the projected 64-bit pattern)
+ * @param upper  true for upper-case hex (`:X`), false for lower-case (`:x`)
+ * @return       the hex digit bytes
+ * @since #comptime-fold
+ */
+fn cf_hex(v: u128, upper: bool) -> []byte {
+    if v == (0 to u128) { return cf_single_byte(48 to byte) }
+    mut rev: []byte = teko::list::empty()
+    mut x = v
+    loop {
+        if x == (0 to u128) { break }
+        let nib = (x & (15 to u128)) to u64
+        rev = teko::list::push(rev, cf_hex_digit(nib, upper))
+        x = x >> (4 to u32)
+    }
+    cf_reverse_bytes(rev)
+}
+
+/**
+ * cf_binary — the binary render of `v`: no leading zeros, `"0"` for zero — byte-identical to `tk_fmt_b`
+ * (which emits from the highest set bit down).
+ *
+ * @param v  the value to render (the projected 64-bit pattern)
+ * @return   the binary digit bytes
+ * @since #comptime-fold
+ */
+fn cf_binary(v: u128) -> []byte {
+    if v == (0 to u128) { return cf_single_byte(48 to byte) }
+    mut rev: []byte = teko::list::empty()
+    mut x = v
+    loop {
+        if x == (0 to u128) { break }
+        rev = teko::list::push(rev, (48 + ((x & (1 to u128)) to u64)) to byte)
+        x = x >> (1 to u32)
+    }
+    cf_reverse_bytes(rev)
+}
+
+/**
+ * cf_fmt_d — the `:d` render of the 64-bit pattern `u` (interpreted as int64) zero-padded to `width` —
+ * byte-identical to `tk_fmt_d` (`%0*PRId64`): a leading `'-'` for a negative value, then enough `'0'`
+ * fill to reach `width` (the field width COUNTS the sign), then the magnitude digits. A width no larger
+ * than the rendered body adds no padding.
+ *
+ * @param u      the 64-bit pattern (a u128 in `[0, 2^64)`) interpreted as a signed int64
+ * @param width  the minimum field width (the parsed spec digits, default 1)
+ * @return       the zero-padded signed decimal bytes
+ * @since #comptime-fold
+ */
+fn cf_fmt_d(u: u128, width: u64) -> []byte {
+    let neg = bit_set(u, 63)
+    let mag = if neg { twos_neg(u, 64) } else { u }
+    let digits = cf_u64_decimal(mag)
+    let sign_len = if neg { 1 to u64 } else { 0 to u64 }
+    let body = sign_len + digits.len
+    let pad = if width > body { width - body } else { 0 to u64 }
+    mut out: []byte = teko::list::empty()
+    if neg { out = teko::list::push(out, 45 to byte) }
+    mut i: u64 = 0
+    loop {
+        if i >= pad { break }
+        out = teko::list::push(out, 48 to byte)
+        i++
+    }
+    cf_append_bytes(out, digits)
+}
+
+/**
+ * cf_fmt_n — the `:n` render of the 64-bit pattern `u` (interpreted as int64): the signed decimal digits
+ * with a `','` thousands separator inserted every three digits from the right of the integer part —
+ * byte-identical to `tk_fmt_n_i`.
+ *
+ * @param u  the 64-bit pattern (a u128 in `[0, 2^64)`) interpreted as a signed int64
+ * @return   the comma-grouped signed decimal bytes
+ * @since #comptime-fold
+ */
+fn cf_fmt_n(u: u128) -> []byte {
+    let neg = bit_set(u, 63)
+    let mag = if neg { twos_neg(u, 64) } else { u }
+    let digits = cf_u64_decimal(mag)
+    let ndigits = digits.len
+    mut out: []byte = teko::list::empty()
+    if neg { out = teko::list::push(out, 45 to byte) }
+    mut k: u64 = 0
+    loop {
+        if k >= ndigits { break }
+        out = teko::list::push(out, digits[k])
+        let pos = ndigits - k - (1 to u64)
+        if pos > (0 to u64) && (pos % (3 to u64)) == (0 to u64) { out = teko::list::push(out, 44 to byte) }
+        k++
+    }
+    out
+}
+
+/**
+ * cf_spec_lead_low — the spec's leading format character, lowercased (an upper-case leading letter is
+ * folded to lower-case exactly as `emit_interp` does). An empty spec yields `'f'` (`102`), the same
+ * default `emit_interp` uses so an empty static spec routes to the float family (which the fold then
+ * declines).
+ *
+ * @param spec  the static format spec string
+ * @return      the normalized leading format character
+ * @since #comptime-fold
+ */
+fn cf_spec_lead_low(spec: str) -> byte {
+    let fc0 = if spec.len > (0 to u64) { spec[0] } else { 102 to byte }
+    if fc0 >= (65 to byte) && fc0 <= (90 to byte) { return (fc0 to u64 + 32) to byte }
+    fc0
+}
+
+/**
+ * cf_spec_width — the `:d` field width parsed from `spec`: the accumulated decimal digits anywhere after
+ * the leading character, or `1` when the spec carries no digits — mirroring `emit_interp`'s `prec`
+ * accumulation and its `'d'` default of `1`.
+ *
+ * @param spec  the static format spec string
+ * @return      the field width for `tk_fmt_d`
+ * @since #comptime-fold
+ */
+fn cf_spec_width(spec: str) -> u64 {
+    mut prec: u64 = 0
+    mut has: bool = false
+    mut si: u64 = 1
+    loop {
+        if si >= spec.len { break }
+        let ch = spec[si]
+        if ch >= (48 to byte) && ch <= (57 to byte) {
+            prec = prec * (10 to u64) + ((ch to u64) - (48 to u64))
+            has = true
+        }
+        si++
+    }
+    if !has { return 1 to u64 }
+    prec
+}
+
+/**
+ * cf_format_static_int — render integer value `ci` under the static spec `spec`, dispatching on its
+ * normalized leading character to the culture-invariant integer families the fold reproduces
+ * byte-for-byte: `x`/`X` hex, `b` binary, `d` zero-padded decimal, `n` comma-grouped decimal. Every
+ * other family (the float `f`/`e`/`g`/`p` and any unrecognized character) is an error the caller treats
+ * as "leave runtime" — the fold never emits bytes it cannot prove match `teko_rt.c`.
+ *
+ * @param ci    the integer comptime value
+ * @param spec  the static format spec string
+ * @return      the rendered bytes, or an error for a non-folded spec family
+ * @throws      an error when the spec's family is float or unrecognized (leave the hole runtime)
+ * @since #comptime-fold
+ */
+fn cf_format_static_int(ci: CVInt, spec: str) -> []byte | error {
+    let fc_low = cf_spec_lead_low(spec)
+    let u = cf_as_u64(ci)
+    if fc_low == (120 to byte) { return cf_hex(u, spec.len > (0 to u64) && spec[0] == (88 to byte)) }
+    if fc_low == (98 to byte) { return cf_binary(u) }
+    if fc_low == (100 to byte) { return cf_fmt_d(u, cf_spec_width(spec)) }
+    if fc_low == (110 to byte) { return cf_fmt_n(u) }
+    error { message = "comptime fold: this static format spec is not folded (#comptime-fold)" }
+}
+
+/**
+ * cf_format_static — render `v` under a static spec: only an integer value has a folded static family
+ * (hex/binary/decimal/thousands); a non-integer static hole (which cannot arise from a type-checked
+ * program) is an error the caller treats as "leave runtime".
+ *
+ * @param v     the hole's comptime value
+ * @param spec  the static format spec string
+ * @return      the rendered bytes, or an error to leave the hole runtime
+ * @since #comptime-fold
+ */
+fn cf_format_static(v: ConstValue, spec: str) -> []byte | error {
+    match v.kind {
+        CVInt as ci => cf_format_static_int(ci, spec)
+        _ => error { message = "comptime fold: a static format spec on a non-integer constant is not folded (#comptime-fold)" }
+    }
+}
+
+/**
+ * cf_bytes_value — the raw bytes of a folded string/char value, the natural (`TFSpecNone`) render of a
+ * `str`/`char` hole — the same bytes the runtime emits by passing the value straight through.
+ *
+ * @param v  the hole's comptime value
+ * @return   the raw bytes, or an error when the value is not a bytes value
+ * @since #comptime-fold
+ */
+fn cf_bytes_value(v: ConstValue) -> []byte | error {
+    match v.kind {
+        CVBytes as cb => cb.data
+        _ => error { message = "comptime fold: expected a string/char constant here (#comptime-fold)" }
+    }
+}
+
+/**
+ * cf_bool_value — the natural render of a folded boolean: `"true"` or `"false"`, byte-identical to the
+ * ternary `emit_interp` emits for a bool hole.
+ *
+ * @param v  the hole's comptime value
+ * @return   the boolean's text bytes, or an error when the value is not a boolean
+ * @since #comptime-fold
+ */
+fn cf_bool_value(v: ConstValue) -> []byte | error {
+    match v.kind {
+        CVBool as cb => if cb.v { bytes_of_str("true") } else { bytes_of_str("false") }
+        _ => error { message = "comptime fold: expected a boolean constant here (#comptime-fold)" }
+    }
+}
+
+/**
+ * cf_int_none_value — the natural (`TFSpecNone`) decimal render of an integer hole of prim kind `pk`: the
+ * signed decimal (`tk_i64_to_str`) for a signed integer, the unsigned decimal (`tk_u64_to_str`)
+ * otherwise.
+ *
+ * @param ci  the integer comptime value
+ * @param pk  the hole's prim kind (drives signed vs unsigned)
+ * @return    the decimal bytes
+ * @since #comptime-fold
+ */
+fn cf_int_none_value(ci: CVInt, pk: PrimKind) -> []byte {
+    if prim_is_signed(pk) { return cf_i64_decimal(cf_as_u64(ci)) }
+    cf_u64_decimal(cf_as_u64(ci))
+}
+
+/**
+ * cf_format_none_prim — the natural render of a `Prim` hole: `"true"`/`"false"` for a bool, the signed or
+ * unsigned decimal for an integer; a float (or any other prim) is an error the caller treats as "leave
+ * runtime" (the fold never touches float formatting).
+ *
+ * @param v  the hole's comptime value
+ * @param p  the hole's `Prim` type
+ * @return   the rendered bytes, or an error to leave the hole runtime
+ * @since #comptime-fold
+ */
+fn cf_format_none_prim(v: ConstValue, p: Prim) -> []byte | error {
+    if p.kind == PrimKind::Bool { return cf_bool_value(v) }
+    if prim_is_int(p.kind) {
+        match v.kind {
+            CVInt as ci => cf_int_none_value(ci, p.kind)
+            _ => error { message = "comptime fold: expected an integer constant here (#comptime-fold)" }
+        }
+    } else {
+        error { message = "comptime fold: this prim hole type is not folded (#comptime-fold)" }
+    }
+}
+
+/**
+ * cf_format_none — the natural render of a hole with no format spec, dispatching on its resolved type:
+ * `str`/`char` pass their bytes through, `byte` renders as unsigned decimal, a `Prim` routes to
+ * `cf_format_none_prim`; every other type (error message, aggregate, float) is an error the caller
+ * treats as "leave runtime".
+ *
+ * @param v        the hole's comptime value
+ * @param hole_ty  the hole's resolved type
+ * @return         the rendered bytes, or an error to leave the hole runtime
+ * @since #comptime-fold
+ */
+fn cf_format_none(v: ConstValue, hole_ty: Type) -> []byte | error {
+    match hole_ty {
+        Str => cf_bytes_value(v)
+        Char => cf_bytes_value(v)
+        Byte => match v.kind { CVInt as ci => cf_u64_decimal(cf_as_u64(ci)); _ => error { message = "comptime fold: expected a byte constant here (#comptime-fold)" } }
+        Prim as p => cf_format_none_prim(v, p)
+        _ => error { message = "comptime fold: this interpolation hole type is not folded (#comptime-fold)" }
+    }
+}
+
+/**
+ * comptime_format — the Layer-2 comptime formatter: render `v` under `sp` exactly as the runtime
+ * formatter in `teko_rt.c` would, producing the SAME bytes. Mirrors the spec-family dispatch of
+ * `codegen.tks:emit_interp` and `fmt_family_takes_prec`, but DELIBERATELY only for the culture-invariant
+ * integer/bool families the fold can prove byte-exact: `x`/`X` hex (`tk_fmt_x_lower/_upper`), `b` binary
+ * (`tk_fmt_b`), `d` zero-padded decimal (`tk_fmt_d`), `n` comma-grouped decimal (`tk_fmt_n_i`), and the
+ * `TFSpecNone` natural forms of int/uint (`tk_i64_to_str`/`tk_u64_to_str`), byte, bool and str/char. A
+ * FLOAT family (`f`/`e`/`g`/`p`, and `n` on a float), a `TFSpecDynamic` spec, and any unrecognized spec
+ * are NOT folded — an error is returned and the caller leaves the hole runtime, because a byte-divergent
+ * fold is worse than no fold (M.3 honesty). This function is the DUPLICATION risk (§10): its output MUST
+ * be byte-identical to `teko_rt.c` for every (value, spec) pair it folds, PINNED by the format-oracle
+ * differential fixture.
+ *
+ * @param v        the const hole value (from `eval_const`)
+ * @param sp       the hole's format spec (`TFSpecNone` or `TFSpecStatic`)
+ * @param hole_ty  the hole's resolved type (selects signed/unsigned/bool/str family)
+ * @return         the formatted bytes (byte-identical to the runtime), or an error for a spec the fold
+ *                 declines (the caller then leaves the hole runtime)
+ * @throws         an error for a float / dynamic / unrecognized spec, or a value/type kind mismatch
+ * @since #comptime-fold
+ */
+pub fn comptime_format(v: ConstValue, sp: TFSpec, hole_ty: Type) -> []byte | error {
+    match sp.kind {
+        TFSpecStatic as fs => cf_format_static(v, fs.s)
+        TFSpecDynamic => error { message = "comptime fold: a dynamic format spec is not folded (#comptime-fold)" }
+        _ => cf_format_none(v, hole_ty)
+    }
+}
+
+/**
+ * cf_is_const_literal — true iff `e` is a bare const literal a folded interpolation hole may render: an
+ * INTEGER number (a float literal is excluded — the fold never formats floats), a bool, a str, a char or
+ * a byte literal. After Layer-1, a provably-const hole IS such a literal; a runtime hole (a param, a
+ * call, an IO result) is not, so the interpolation stays runtime.
+ *
+ * @param e  the (already Layer-1 folded) hole expression
+ * @return   whether the hole is a bare const literal the fold can render
+ * @since #comptime-fold
+ */
+fn cf_is_const_literal(e: TExpr) -> bool {
+    match e.kind {
+        TNumber as n => !n.is_float
+        TBoolLit => true
+        TStrLit => true
+        TCharLit => true
+        TByteLit => true
+        _ => false
+    }
+}
+
+/**
+ * cf_none_spec_ok — true iff a hole of type `t` with NO format spec has a folded natural form:
+ * `str`/`char`/`byte`, a bool, or an integer prim. A float (or any other type) is left runtime.
+ *
+ * @param t  the hole's resolved type
+ * @return   whether the natural-form fold applies
+ * @since #comptime-fold
+ */
+fn cf_none_spec_ok(t: Type) -> bool {
+    match t {
+        Str => true
+        Char => true
+        Byte => true
+        Prim as p => p.kind == PrimKind::Bool || prim_is_int(p.kind)
+        _ => false
+    }
+}
+
+/**
+ * cf_static_spec_ok — true iff a hole of type `t` with static spec `spec` has a folded render: `t` must
+ * be an integer/byte type and the spec's leading family one of the culture-invariant integer families
+ * the fold reproduces (`x`/`X` hex, `b` binary, `d` decimal, `n` thousands). A float family and any
+ * unrecognized character are declined (left runtime).
+ *
+ * @param spec  the static format spec string
+ * @param t     the hole's resolved type
+ * @return      whether the static-spec fold applies
+ * @since #comptime-fold
+ */
+fn cf_static_spec_ok(spec: str, t: Type) -> bool {
+    if !cf_is_int_type(t) { return false }
+    if spec.len == (0 to u64) { return false }
+    let fc_low = cf_spec_lead_low(spec)
+    fc_low == (120 to byte) || fc_low == (98 to byte) || fc_low == (100 to byte) || fc_low == (110 to byte)
+}
+
+/**
+ * cf_hole_foldable — true iff hole `hole` under spec `sp` can be folded byte-exactly: the hole is a bare
+ * const literal AND the (spec, hole-type) pair names a folded family. A `TFSpecDynamic` spec is never
+ * folded (its arg selects the family at runtime).
+ *
+ * @param hole  the (already Layer-1 folded) hole expression
+ * @param sp    the hole's format spec
+ * @return      whether the hole is foldable to bytes
+ * @since #comptime-fold
+ */
+fn cf_hole_foldable(hole: TExpr, sp: TFSpec) -> bool {
+    if !cf_is_const_literal(hole) { return false }
+    match sp.kind {
+        TFSpecDynamic => false
+        TFSpecStatic as fs => cf_static_spec_ok(fs.s, hole.type)
+        _ => cf_none_spec_ok(hole.type)
+    }
+}
+
+/**
+ * cf_spec_at — the format spec for hole index `i`: `in.specs[i]` when present, else a `TFSpecNone` (an
+ * interpolation may carry fewer specs than holes for the trailing no-spec holes).
+ *
+ * @param in  the interpolation
+ * @param i   the hole index
+ * @return    the hole's format spec, or `TFSpecNone`
+ * @since #comptime-fold
+ */
+fn cf_spec_at(in: TInterp, i: u64) -> TFSpec {
+    if i < in.specs.len { return in.specs[i] }
+    TFSpec { kind = TFSpecNone { } }
+}
+
+/**
+ * cf_interp_foldable — true iff EVERY hole of `in` is foldable under its spec (`cf_hole_foldable`), the
+ * precondition for collapsing the whole interpolation to a single `TStrLit`. A single runtime hole or
+ * dynamic/float spec makes the whole interpolation stay its runtime concat shape.
+ *
+ * @param in  the interpolation (holes already Layer-1 folded)
+ * @return    whether the entire interpolation folds to a literal
+ * @since #comptime-fold
+ */
+fn cf_interp_foldable(in: TInterp) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= in.holes.len { break }
+        if !cf_hole_foldable(in.holes[i], cf_spec_at(in, i)) { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * cf_hole_bytes — evaluate hole `hole` to its comptime value and render it under `sp` via
+ * `comptime_format`. The caller has proven `cf_hole_foldable`, so both steps succeed for a well-typed
+ * program; an unexpected error propagates and makes the caller leave the interpolation runtime.
+ *
+ * @param hole   the (already Layer-1 folded) hole expression
+ * @param sp     the hole's format spec
+ * @param table  the type table (forwarded to `eval_const`)
+ * @param env    the environment (forwarded to `eval_const`)
+ * @return       the rendered bytes, or an error to leave the interpolation runtime
+ * @since #comptime-fold
+ */
+fn cf_hole_bytes(hole: TExpr, sp: TFSpec, table: TypeTable, env: Env) -> []byte | error {
+    match eval_const(hole, table, env) {
+        error as x => return x
+        ConstValue as v => comptime_format(v, sp, hole.type)
+    }
+}
+
+/**
+ * cf_interp_bytes — the byte-exact render of a fully-const interpolation: the literal pieces interleaved
+ * with each hole's `cf_hole_bytes` render (`pieces[0] ++ hole0 ++ pieces[1] ++ … ++ pieces[last]`,
+ * `pieces.len == holes.len + 1`). Any per-hole error propagates so the caller leaves the interpolation
+ * runtime.
+ *
+ * @param in     the fully-const interpolation
+ * @param table  the type table (forwarded to each hole render)
+ * @param env    the environment (forwarded to each hole render)
+ * @return       the concatenated bytes, or an error to leave the interpolation runtime
+ * @since #comptime-fold
+ */
+fn cf_interp_bytes(in: TInterp, table: TypeTable, env: Env) -> []byte | error {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= in.pieces.len { break }
+        out = cf_append_bytes(out, bytes_of_str(in.pieces[i]))
+        if i < in.holes.len {
+            let hb = match cf_hole_bytes(in.holes[i], cf_spec_at(in, i), table, env) { error as x => return x; []byte as b => b }
+            out = cf_append_bytes(out, hb)
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * cf_interp_expr — rewrap an interpolation as its runtime `TExpr` (the non-folded outcome), preserving
+ * the enclosing expression's type/position.
+ *
+ * @param in  the interpolation (holes already Layer-1 folded)
+ * @param e   the enclosing expression (its type/position)
+ * @return    the interpolation `TExpr` unchanged in shape
+ * @since #comptime-fold
+ */
+fn cf_interp_expr(in: TInterp, e: TExpr) -> TExpr {
+    TExpr { kind = TInterp { pieces = in.pieces; holes = in.holes; specs = in.specs }; type = e.type; line = e.line; col = e.col }
+}
+
+/**
+ * fold_interp — the Layer-2 interpolation fold: when EVERY hole of `in` is a const literal (post
+ * Layer-1) and EVERY spec is a folded `TFSpecNone`/`TFSpecStatic` family, format each hole via
+ * `comptime_format`, concatenate with the piece literals, and return a single `TStrLit` (interned to
+ * rodata by lowering, like any string literal) — zero runtime concat/format. If ANY hole is runtime, ANY
+ * spec is `TFSpecDynamic`, or any hole/spec is a family the fold declines (float in particular), `in` is
+ * returned UNCHANGED (still a runtime `tk_str_concat` shape), preserving today's behavior. A rendering
+ * that unexpectedly errors also leaves the interpolation runtime — the fold never emits bytes it cannot
+ * prove match `teko_rt.c`.
+ *
+ * @param in     the typed interpolation (holes already Layer-1 folded)
+ * @param e      the enclosing expression (its type/position for the produced `TStrLit`)
+ * @param table  the type table (forwarded to the per-hole evaluator)
+ * @param env    the environment (module consts + provably-const locals)
+ * @return       a single folded `TStrLit` when fully const, else `in` unchanged
+ * @since #comptime-fold
+ */
+pub fn fold_interp(in: TInterp, e: TExpr, table: TypeTable, env: Env) -> TExpr | error {
+    if !cf_interp_foldable(in) { return cf_interp_expr(in, e) }
+    match cf_interp_bytes(in, table, env) {
+        error => cf_interp_expr(in, e)
+        []byte as bs => TExpr { kind = TStrLit { text = str_of_bytes(bs) }; type = e.type; line = e.line; col = e.col }
+    }
 }
