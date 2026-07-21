@@ -70,7 +70,7 @@ fn lam_collect_stmt(s: parser::Statement, refs: Ref<[]str>, bound: Ref<[]str>) -
                 parser::DestructurePattern as dp => { mut j = 0; loop { if j >= dp.names.len { break }; bound.value = str_set_add(bound.value, dp.names[j]); j++ } }
             }
         }
-        parser::Assign as a => { lam_collect_expr(a.value, refs, bound); match a.kind { parser::AssignKind::Field => lam_collect_expr(a.target, refs, bound); _ => { } } }   // (#88) a closure writing `obj.f = …` captures the receiver's free vars
+        parser::Assign as a => { lam_collect_expr(a.value, refs, bound); if parser::assign_has_target(a.kind) { lam_collect_expr(a.target, refs, bound) } }
         parser::Return as r => if r.has_value { lam_collect_expr(r.value, refs, bound) } else { }
         parser::LoopStmt as l => { lam_collect_block(l.init, refs, bound); lam_collect_block(l.body, refs, bound) }
         parser::ExprStmt as es => lam_collect_expr(es.expr, refs, bound)
@@ -3485,11 +3485,46 @@ fn type_field_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt
     TypedStmt { node = TAssign { kind = parser::AssignKind::Field; name = ""; op = a.op; bound = field_t; value = v; deref = false; target = lhs }; env = env }
 }
 
+/**
+ * type_index_assign — type an INDEX-target assignment `ids[i] op= value` (`AssignKind::Index`). The
+ * receiver must be a mutable slice/array binding `[]T`, the index an integer, and the value assignable
+ * to the element type `T` (the same widen/adopt rule as a simple assign). Element write-back mutates
+ * the underlying buffer, so — exactly like a struct-field write — the receiver's ROOT variable must be
+ * a `mut` binding; a `let` / parameter slice is read-only and yields an honest diagnostic.
+ *
+ * @param a      the raw index assignment (`a.target` is the `Index{receiver,index}` LHS)
+ * @param env    the typing environment
+ * @param table  the folded type table
+ * @return       the typed `TAssign` (kind `Index`, `bound` = the element type), or a type error
+ * @throws       when the receiver is not a mutable slice, the index is non-integer, or the value does
+ *               not match the element type
+ */
+fn type_index_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt | error {
+    let ix = match a.target.kind { parser::Index as x => x; _ => return error { message = "assignment target is not an index access (internal: parser guarantees an index LHS)" } }
+    let recv = match type_expr(ix.receiver, env, table) { TExpr as te => te; error as e => return e }
+    let elem = match recv.type {
+        Slice as sl => match sl.element { Void => return error { message = "cannot assign into an untyped empty slice — its element type is unknown" }; _ => sl.element }
+        _ => return teko::error::err_typed(error { message = "index-assignment target is not a slice — only a slice `[]T` supports `ids[i] = v`" }, "[]T", type_render(recv.type))
+    }
+    let root = lvalue_root(ix.receiver)
+    if !root.reachable { return error { message = "cannot assign into an element of a temporary value — the receiver is not a mutable variable" } }
+    let rb = match lookup_binding(env, root.name) { ValBinding as vb => vb; error as e => return e }
+    if !rb.is_mut { return error { message = $"cannot assign into an element of immutable `{root.name}` — declare it `mut` (B.21)" } }
+    let lhs = match type_expr(a.target, env, table) { TExpr as te => te; error as e => return e }
+    mut v = match type_expr(a.value, env, table) { TExpr as te => te; error as e => return e }
+    if type_contains_ref(elem) || type_contains_ref(v.type) { return error { message = "a reference cannot be stored in a slice element (parameter-only in this version)" } }
+    if !assignable_to(v.type, elem, table) {
+        if !literal_adopts(v, elem) { return teko::error::err_typed(error { message = "assigned value does not match the slice element type" }, type_render(elem), type_render(v.type)) }
+        v = retype_literal(v, elem)
+    }
+    TypedStmt { node = TAssign { kind = parser::AssignKind::Index; name = ""; op = a.op; bound = elem; value = v; deref = false; target = lhs }; env = env }
+}
+
 fn type_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt | error {
-    // (#88) a FIELD target (`recv.field = …`) — Ref-deref vs struct/class field write, decided by the
-    // receiver TYPE (type_field_assign). The simple-name path below is unchanged.
     let is_field = match a.kind { parser::AssignKind::Field => true; _ => false }
     if is_field { return type_field_assign(a, env, table) }
+    let is_index = match a.kind { parser::AssignKind::Index => true; _ => false }
+    if is_index { return type_index_assign(a, env, table) }
     let tb = match lookup_binding(env, a.name) { ValBinding as vb => vb; error as e => return e }
     // (MEM-1b-ii) `r.value op= x` — write THROUGH a reference. The handle `r` need NOT be `mut`
     // (a `Ref<T>` is a const handle that grants WRITE to its mutable target — R2 mutable-target).
