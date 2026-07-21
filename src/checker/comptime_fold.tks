@@ -330,6 +330,7 @@ pub fn eval_const(e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -> Con
         TVar as v => eval_agg_ref(v, e, table, env, agg)
         TArrayLit as a => eval_array_agg(a, table, env, agg)
         TIndex as ix => eval_index_expr(ix, e, table, env, agg)
+        TFieldAccess as fa => eval_field_expr(fa, e, table, env, agg)
         _ => const_form_error("this expression is not a Tier-0..2 scalar constant the comptime fold evaluates yet (#comptime-fold)", e)
     }
 }
@@ -849,6 +850,83 @@ fn index_carrier(ci: CVInt) -> i128? {
         IntInfo as info => cv_int_to_i128(ci.bits, info)
     }
 }
+
+/**
+ * eval_field_expr — evaluate a `TFieldAccess` of a const receiver: `.len` of a const aggregate or
+ * const string yields its element/byte count (`eval_len_field`, CF4d). The `cf_can_fold_field` gate
+ * proves the receiver is const and the field foldable before the fold reaches here, so a non-foldable
+ * field is a soft located error (the fold then leaves the access runtime).
+ *
+ * @param fa     the typed field-access node
+ * @param e      the enclosing expression (its type is the field's type; positions any error)
+ * @param table  the type table (forwarded to the receiver eval)
+ * @param env    the environment (forwarded to the receiver eval)
+ * @param agg    the module-aggregate resolution table (resolves a module-const receiver)
+ * @return       the field's comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_field_expr(fa: TFieldAccess, e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -> ConstValue | error {
+    if is_len_field(fa) { return eval_len_field(fa, e, table, env, agg) }
+    const_form_error("comptime fold: this field access is not a foldable `.len` (#comptime-fold)", e)
+}
+
+/**
+ * is_len_field — is `fa` the built-in `.len` of a `str` or slice receiver (CF4d)? The typer resolves
+ * `.len` on a `str`/`[]T` to a `u64` BEFORE the struct-field path, so a `len` field of a user struct
+ * (its receiver a `Named` type) is NOT this case and stays the struct-field fold.
+ *
+ * @param fa  the typed field-access node
+ * @return    true iff `fa` is the length of a string/slice receiver
+ * @since #comptime-fold
+ */
+fn is_len_field(fa: TFieldAccess) -> bool {
+    if fa.field != "len" { return false }
+    match fa.receiver.type {
+        Str => true
+        Slice => true
+        _ => false
+    }
+}
+
+/**
+ * eval_len_field — evaluate `recv.len` of a const string/aggregate receiver (CF4d): fold the receiver
+ * to its `CVBytes` (a string's raw bytes) or `CVAgg` (an array's elements) and return the count as the
+ * field's `u64` type. A receiver that folds to neither is a soft located error (behavior preserved: the
+ * access stays runtime).
+ *
+ * @param fa     the typed field-access node (`fa.field == "len"`)
+ * @param e      the enclosing expression (its `u64` type is the count's type; positions any error)
+ * @param table  the type table (forwarded to the receiver eval)
+ * @param env    the environment (forwarded to the receiver eval)
+ * @param agg    the module-aggregate resolution table (resolves a module-const receiver)
+ * @return       the length as a `u64` comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_len_field(fa: TFieldAccess, e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -> ConstValue | error {
+    let recv = match eval_const(fa.receiver, table, env, agg) { error as x => return x; ConstValue as v => v }
+    match value_length(recv) {
+        null => const_form_error("comptime fold: `.len` receiver is not a const string or aggregate (#comptime-fold)", e)
+        u64 as n => cv_int(n to u128, e.type)
+    }
+}
+
+/**
+ * value_length — the element/byte count of a folded aggregate/string value, or null when the value is
+ * neither (a scalar has no `.len`). A `CVAgg`'s length is its element count; a `CVBytes`'s length is its
+ * byte count (the same count `.len` reads at runtime for a `str`/`[]byte`).
+ *
+ * @param v  the folded receiver value
+ * @return   the length, or null when `v` has no length
+ * @since #comptime-fold
+ */
+fn value_length(v: ConstValue) -> u64? {
+    match v.kind {
+        CVAgg as ag => ag.elems.len
+        CVBytes as cb => cb.data.len
+        _ => null
+    }
+}
+
 
 /**
  * apply_binary — apply a binary operator to two folded operands, dispatching on their
@@ -1387,6 +1465,24 @@ fn cf_agg_value(e: TExpr, agg: AggConstMap) -> bool {
 }
 
 /**
+ * cf_str_value — true iff `e` is a foldable const STRING the fold reduces to its bytes (CF4c/CF4d): an
+ * in-tree `TStrLit`, or a `TVar` naming a module const string recorded in `agg`. A local string binding
+ * (not propagated by `propagate_locals`), a runtime string, or a fn-value is not foldable.
+ *
+ * @param e    the receiver expression to classify
+ * @param agg  the module-aggregate resolution table
+ * @return     whether `e` is a foldable const string
+ * @since #comptime-fold
+ */
+fn cf_str_value(e: TExpr, agg: AggConstMap) -> bool {
+    match e.kind {
+        TStrLit => true
+        TVar as v => cf_var_is_agg_const(v, agg)
+        _ => false
+    }
+}
+
+/**
  * cf_var_is_agg_const — true iff `v` is a non-function reference naming a module aggregate const
  * recorded in `agg`. A fn-value (`is_func`) is never a const aggregate; a name absent from `agg` (a
  * local, a scalar const, a different-module name) is not foldable.
@@ -1474,6 +1570,41 @@ fn cf_fold_int(e: TExpr, agg: AggConstMap) -> bool {
         TUnary as u => is_const_unary_op(u.op) && cf_fold_int(u.operand, agg)
         TBinary as b => is_const_binary_op(b.op) && cf_fold_int(b.left, agg) && cf_fold_int(b.right, agg)
         TIndex as ix => cf_can_index(ix, agg)
+        TFieldAccess as fa => cf_can_fold_field(fa, agg)
+        _ => false
+    }
+}
+
+/**
+ * cf_can_fold_field — the fold's field-access gate (the field mirror of `cf_can_index`): true iff the
+ * whole `TFieldAccess` collapses to a literal — a foldable `.len` of a const string/aggregate (CF4d).
+ * When false the field access is rebuilt around its folded receiver (stays runtime), preserving today's
+ * behavior for a runtime receiver or a not-yet-foldable field.
+ *
+ * @param fa   the typed field-access node
+ * @param agg  the module-aggregate resolution table
+ * @return     whether the field access is fully const-foldable to a literal
+ * @since #comptime-fold
+ */
+fn cf_can_fold_field(fa: TFieldAccess, agg: AggConstMap) -> bool {
+    if is_len_field(fa) { return cf_len_receiver_const(fa, agg) }
+    false
+}
+
+/**
+ * cf_len_receiver_const — true iff the `.len` receiver `fa.receiver` is a foldable const the fold can
+ * take the length of (CF4d): a const aggregate for a slice receiver (`cf_agg_value`), or a const/literal
+ * string for a `str` receiver (`cf_str_value`).
+ *
+ * @param fa   the typed `.len` field-access node
+ * @param agg  the module-aggregate resolution table
+ * @return     whether the receiver's length is const-foldable
+ * @since #comptime-fold
+ */
+fn cf_len_receiver_const(fa: TFieldAccess, agg: AggConstMap) -> bool {
+    match fa.receiver.type {
+        Str => cf_str_value(fa.receiver, agg)
+        Slice => cf_agg_value(fa.receiver, agg)
         _ => false
     }
 }
@@ -1759,17 +1890,27 @@ fn fold_cast(c: TCast, e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -
 }
 
 /**
- * fold_field — rebuild a field-access node around its folded receiver.
+ * fold_field — fold a field access of a const receiver (CF4c/CF4d): when the whole access collapses to
+ * a literal (`cf_can_fold_field` — a `.len` of a const string/aggregate, or an integer field of a const
+ * struct), evaluate it and splice the literal (mirroring `fold_index`); otherwise rebuild the access
+ * around its folded receiver, so a runtime receiver or a not-yet-foldable field stays a runtime
+ * `TFieldAccess` (behavior identical to today).
  *
  * @param fa     the typed field-access expression
  * @param e      the enclosing expression (its type/position)
  * @param table  the type table (forwarded to the receiver fold)
  * @param env    the environment (forwarded to the receiver fold)
- * @param agg    the module-aggregate resolution table (forwarded through the fold spine to the index fold)
- * @return       the field access rebuilt with a folded receiver, or a located error
+ * @param agg    the module-aggregate resolution table (resolves a module-const receiver)
+ * @return       the folded literal, or the access rebuilt with a folded receiver, or a located error
  * @since #comptime-fold
  */
 fn fold_field(fa: TFieldAccess, e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -> TExpr | error {
+    if cf_can_fold_field(fa, agg) {
+        match eval_const(e, table, env, agg) {
+            error as x => return x
+            ConstValue as v => return fold_splice(v, e, table, env, agg)
+        }
+    }
     let r = match fold_expr(fa.receiver, table, env, agg) { error as x => return x; TExpr as v => v }
     TExpr { kind = TFieldAccess { receiver = r; field = fa.field }; type = e.type; line = e.line; col = e.col }
 }
