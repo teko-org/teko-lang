@@ -6032,7 +6032,118 @@ fn emit_assign_lvalue(buf: []byte, prog: checker::TProgram, a: checker::TAssign)
     }
 }
 
+/**
+ * emit_index_assign — a slice element store `ids[i] op= v` (`AssignKind::Index`). Captures the
+ * receiver slice and the index into single-eval temps, bounds-checks the index against `.len` (the
+ * SAME positioned `tk_panic_oob_at` as a read subscript), then writes the element in place through
+ * the shared `{ptr,len}` buffer. A shift-assign (`<<=`/`>>=`) routes through the width-masked
+ * `tk_shl_/tk_shr_` runtime helper — matching the bare `<<`/`>>` operator and the VM — instead of the
+ * UB-prone C compound shift; every other op emits the plain C compound store.
+ *
+ * @param buf       the output buffer
+ * @param prog      the typed program (type/name lowering)
+ * @param ret_type  the enclosing function's return type (threaded to `emit_as_r`)
+ * @param a         the typed index assignment (`a.target` is the typed `TIndex` LHS)
+ * @param indent    the current statement indent
+ * @param escaping  the frame's escaping-name set (threaded to child expr emission)
+ * @param regions   the active region frames
+ * @param fn_body   the enclosing function body (escape context)
+ * @param dctx      the defer context
+ * @return          the buffer with the element-store block appended, or a codegen error
+ * @throws          when the target is not a slice index, its element type is unsupported, or a child
+ *                  expression fails to emit
+ */
+fn emit_index_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let ix = match a.target.kind { checker::TIndex as ti => ti; _ => return error { message = "codegen: index-assign target is not a subscript (internal)" } }
+    let elem = match ix.receiver.type { checker::Slice as sl => sl.element; _ => return error { message = "codegen: index-assign receiver is not a slice (internal)" } }
+    let wstmp = $"_ws{buf.len}"
+    let witmp = $"_wi{buf.len + 1}"
+    mut out = cb(buf, indent)
+    out = cb(out, "{ ")
+    out = match emit_type(out, prog, ix.receiver.type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, wstmp)
+    out = cb(out, " = (")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, ix.receiver, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "); uint64_t ")
+    out = cb(out, witmp)
+    out = cb(out, " = (uint64_t)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, ix.index, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "); if (")
+    out = cb(out, witmp)
+    out = cb(out, " < ")
+    out = cb(out, wstmp)
+    out = cb(out, ".len) { ")
+    out = match emit_index_store_body(out, prog, ret_type, a, wstmp, witmp, elem, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, " } else { tk_panic_oob_at(")
+    out = cb(out, teko::u64_to_str(a.target.line to u64))
+    out = cb(out, ", ")
+    out = cb(out, teko::u64_to_str(a.target.col to u64))
+    cb(out, "); }\n }\n")
+}
+
+/**
+ * emit_index_store_body — the in-bounds element write of `emit_index_assign`: `<slot> op= <value>`,
+ * where `<slot>` is `<wstmp>.ptr[<witmp>]` (both already single-eval temps, so re-emitting the slot
+ * for a shift-assign is free) and `<value>` is wrapped into the element type via `emit_as_r`.
+ *
+ * @param buf       the output buffer
+ * @param prog      the typed program
+ * @param ret_type  the enclosing function's return type (threaded to `emit_as_r`)
+ * @param a         the typed index assignment (for its op + value)
+ * @param wstmp     the captured-slice temp name
+ * @param witmp     the captured-index temp name
+ * @param elem      the slice element type (the store's declared `bound`)
+ * @param escaping  the frame's escaping-name set
+ * @param regions   the active region frames
+ * @param fn_body   the enclosing function body
+ * @param dctx      the defer context
+ * @return          the buffer with the element store appended, or a codegen error
+ * @throws          when a shift-assign targets a non-integer element, or a child expression fails to emit
+ */
+fn emit_index_store_body(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, wstmp: str, witmp: str, elem: checker::Type, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    if a.op == lexer::TokenKind::ShlEq || a.op == lexer::TokenKind::ShrEq {
+        let prim = match elem { checker::Prim as p => p; _ => return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        if !cg_prim_is_int(prim.kind) { return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        let tag = match prim_int_tag(prim.kind) { str as t => t; error => return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        let fn_prefix = if a.op == lexer::TokenKind::ShlEq { "tk_shl_" } else { "tk_shr_" }
+        mut so = emit_index_slot(buf, wstmp, witmp)
+        so = cb(so, " = ")
+        so = cb(so, fn_prefix)
+        so = cb(so, tag)
+        so = cb(so, "(")
+        so = emit_index_slot(so, wstmp, witmp)
+        so = cb(so, ", ")
+        so = match emit_expr_ctx(so, prog, checker::Void { }, a.value, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        return cb(so, ");")
+    }
+    let op = match assignop_c(a.op) { str as s => s; error as err => return err }
+    mut out = emit_index_slot(buf, wstmp, witmp)
+    out = cb(out, " ")
+    out = cb(out, op)
+    out = cb(out, " ")
+    out = match emit_as_r(out, prog, ret_type, elem, a.value, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    cb(out, ";")
+}
+
+/**
+ * emit_index_slot — the C lvalue text `<wstmp>.ptr[<witmp>]` for a captured slice/index temp pair.
+ *
+ * @param buf    the output buffer
+ * @param wstmp  the captured-slice temp name
+ * @param witmp  the captured-index temp name
+ * @return       the buffer with the element lvalue appended
+ */
+fn emit_index_slot(buf: []byte, wstmp: str, witmp: str) -> []byte {
+    mut out = cb(buf, wstmp)
+    out = cb(out, ".ptr[")
+    out = cb(out, witmp)
+    cb(out, "]")
+}
+
 fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let is_index = match a.kind { parser::AssignKind::Index => true; _ => false }
+    if is_index { return emit_index_assign(buf, prog, ret_type, a, indent, escaping, regions, fn_body, dctx) }
     let op = match assignop_c(a.op) { str as s => s; error as err => return err }
     mut out = cb(buf, indent)
     // (S2 Level-1) SELF-APPEND to a non-escaping slice → route the grown buffer to the frame region
@@ -6395,7 +6506,7 @@ fn stmt_cov_lines(s: checker::TStatement) -> []u32 {
         checker::TBinding as b => cov_collect_expr(b.value, acc)
         checker::TAssign as a => {
             let av = cov_collect_expr(a.value, acc)
-            match a.kind { parser::AssignKind::Field => cov_collect_expr(a.target, av); _ => av }
+            if parser::assign_has_target(a.kind) { cov_collect_expr(a.target, av) } else { av }
         }
         checker::TReturn as r => if r.has_value { cov_collect_expr(r.value, acc) } else { acc }
         checker::TExprStmt as es => cov_collect_expr(es.expr, acc)
@@ -6629,7 +6740,7 @@ fn cg_block_calls_self(stmts: []checker::TStatement, ns: str, name: str) -> bool
         if i >= stmts.len { break }
         match stmts[i] {
             checker::TBinding as b => if cg_expr_calls_self(b.value, ns, name) { return true }
-            checker::TAssign as a => { if cg_expr_calls_self(a.value, ns, name) { return true }; match a.kind { parser::AssignKind::Field => if cg_expr_calls_self(a.target, ns, name) { return true }; _ => { } } }
+            checker::TAssign as a => { if cg_expr_calls_self(a.value, ns, name) { return true }; if parser::assign_has_target(a.kind) { if cg_expr_calls_self(a.target, ns, name) { return true } } }
             checker::TReturn as r => if r.has_value && cg_expr_calls_self(r.value, ns, name) { return true }
             checker::TLoopStmt as l => { if cg_block_calls_self(l.init, ns, name) { return true }; if cg_block_calls_self(l.body, ns, name) { return true } }
             checker::TExprStmt as es => if cg_expr_calls_self(es.expr, ns, name) { return true }
@@ -7443,7 +7554,7 @@ fn cg_collect_block_opts(set: CgTypeSet, stmts: []checker::TStatement) -> CgType
             // VM's coerce_to(a.bound)): a deref-assign `r.value = v` through a `Ref<T?>` has bound=`T?`,
             // and that optional's tk_opt_<T> typedef must be emitted even when the value's own type is a
             // bare `T` (widened) — mirrors the TBinding arm collecting b.bound.
-            checker::TAssign as a => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); match a.kind { parser::AssignKind::Field => s = cg_collect_expr_opts(s, a.target); _ => { } } }   // (#88) the FIELD LHS receiver may carry optional types too
+            checker::TAssign as a => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); if parser::assign_has_target(a.kind) { s = cg_collect_expr_opts(s, a.target) } }
             checker::TReturn as r => { if r.has_value { s = cg_collect_expr_opts(s, r.value) } }
             checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.init); s = cg_collect_block_opts(s, l.body) }
             checker::TExprStmt as es => { s = cg_collect_expr_opts(s, es.expr) }
@@ -8249,7 +8360,7 @@ fn cg_lift_block(stmts: []checker::TStatement, acc: Ref<StampAcc>) -> []checker:
 fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStatement {
     match s {
         checker::TBinding as b => checker::TBinding { kind = b.kind; target = b.target; bound = b.bound; value = cg_lift_expr(b.value, acc) }
-        checker::TAssign as a => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = match a.kind { parser::AssignKind::Field => cg_lift_expr(a.target, acc); _ => a.target } }   // (#88) lift lambdas in the FIELD LHS receiver too
+        checker::TAssign as a => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = if parser::assign_has_target(a.kind) { cg_lift_expr(a.target, acc) } else { a.target } }
         checker::TReturn as r => checker::TReturn { has_value = r.has_value; value = if r.has_value { cg_lift_expr(r.value, acc) } else { r.value } }
         checker::TLoopStmt as l => checker::TLoopStmt { label = l.label; init = cg_lift_block(l.init, acc); body = cg_lift_block(l.body, acc) }
         checker::TExprStmt as es => checker::TExprStmt { expr = cg_lift_expr(es.expr, acc) }
