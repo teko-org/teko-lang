@@ -559,3 +559,127 @@ fn pt_per_test_cov_report_str_shape() {
     teko::assert::str_contains(out, "per-test-cov a functions=10% lines=20% branches=30%\n")
     teko::assert::str_contains(out, "per-test-cov b functions=1% lines=2% branches=3%\n")
 }
+
+/**
+ * per_commit_base_of reads the value FOLLOWING `--per-commit-test` (the git base for the delta gate),
+ * is "" when the flag is absent, and is "" when the flag is the last token with no value after it.
+ */
+#test
+fn pt_per_commit_base_of_reads_the_value() {
+    teko::assert::is_true(per_commit_base_of(args_of("test", "--per-commit-test", "abc123")) == "abc123")
+    teko::assert::is_true(per_commit_base_of(args_of("--per-commit-test", "main", "test")) == "main")
+    teko::assert::is_true(per_commit_base_of(args_of("test", ".", "--coverage")) == "")
+    teko::assert::is_true(per_commit_base_of(args_of("test", ".", "--per-commit-test")) == "")
+}
+
+/**
+ * project_arg_of skips `--per-commit-test` AND its base value (a two-token value flag), so neither the
+ * flag nor the git ref that follows it is ever mistaken for the project positional.
+ */
+#test
+fn pt_project_arg_of_skips_the_per_commit_flag() {
+    teko::assert::is_true(project_arg_of(args_of("--per-commit-test", "main", "."), 0) == ".")
+    teko::assert::is_true(project_arg_of(args_of(".", "--per-commit-test", "main"), 0) == ".")
+}
+
+/**
+ * changed_line_set parses a unified diff into the added/replaced NEW-side line numbers per `.tks`
+ * file: a context line advances the new-side counter, a `+` line records the current number and
+ * advances, and the `@@` header (re)seeds it — so `changed_contains` answers membership tolerant of a
+ * repo-relative vs project-relative path (a `/`-boundary suffix match).
+ */
+#test
+fn pt_changed_line_set_parses_added_lines() {
+    let diff = "diff --git a/src/x.tks b/src/x.tks\n--- a/src/x.tks\n+++ b/src/x.tks\n@@ -1,3 +1,4 @@\n ctx\n+added2\n+added3\n ctx4\n"
+    let cls = changed_line_set(diff)
+    teko::assert::is_true(changed_contains(cls, "src/x.tks", 2))
+    teko::assert::is_true(changed_contains(cls, "src/x.tks", 3))
+    teko::assert::is_false(changed_contains(cls, "src/x.tks", 1))
+    teko::assert::is_false(changed_contains(cls, "src/x.tks", 4))
+    teko::assert::is_true(changed_contains(cls, "x.tks", 2))
+    teko::assert::is_false(changed_contains(cls, "other.tks", 2))
+}
+
+/**
+ * changed_line_set ignores a non-`.tks` file entirely (the delta gate measures Teko sources only) and
+ * a pure-deletion file (no `+` lines) contributes no changed unit.
+ */
+#test
+fn pt_changed_line_set_filters_non_tks_and_deletions() {
+    let diff = "+++ b/README.md\n@@ -1,1 +1,2 @@\n md\n+added\n+++ b/src/y.tks\n@@ -1,2 +1,1 @@\n keep\n-gone\n"
+    let cls = changed_line_set(diff)
+    teko::assert::is_false(changed_contains(cls, "README.md", 2))
+    teko::assert::is_false(changed_contains(cls, "src/y.tks", 1))
+    teko::assert::is_true(cls.files.len == 0)
+}
+
+/**
+ * cov_lines_from_cobertura reads one CovLine per BODY `<line>` element, taking the file from the
+ * enclosing `<class filename=…>` and hit from `hits > 0`, and SKIPS the per-method summary `<line>`
+ * (on the `<methods>` line) so a function's declaration line is not double-counted.
+ */
+#test
+fn pt_cov_lines_from_cobertura_reads_body_lines() {
+    let xml = "      <class name='ns::f' filename='src/x.tks' line-rate='0.5' branch-rate='1.0' complexity='0'>\n        <methods><method name='f' signature='()V' line-rate='0.5' branch-rate='1.0'><lines><line number='10' hits='1'/></lines></method></methods>\n        <lines>\n          <line number='11' hits='1'/>\n          <line number='12' hits='0'/>\n        </lines>\n      </class>\n"
+    let cov = cov_lines_from_cobertura(xml)
+    teko::assert::is_true(cov.len == 2)
+    teko::assert::is_true(cov[0].file == "src/x.tks")
+    teko::assert::is_true(cov[0].line == 11)
+    teko::assert::is_true(cov[0].hit)
+    teko::assert::is_true(cov[1].line == 12)
+    teko::assert::is_false(cov[1].hit)
+}
+
+/**
+ * A synthetic changed-line set + coverage map fully exercise delta_line_coverage: only lines that are
+ * BOTH executable and changed count toward the denominator, and only the covered ones toward the
+ * numerator (unchanged lines and other-file lines are excluded) — here 1 of 2 changed lines is hit.
+ */
+#test
+fn pt_delta_line_coverage_attributes_only_changed_lines() {
+    mut files: []ChangedFile = teko::list::empty()
+    files = teko::list::push(files, ChangedFile { path = "src/x.tks"; lines = teko::list::push(teko::list::push(teko::list::empty(), 2 to u32), 3 to u32) })
+    let cls = ChangedLines { files = files }
+    mut cov: []CovLine = teko::list::empty()
+    cov = teko::list::push(cov, CovLine { file = "src/x.tks"; line = 2 to u32; hit = true })
+    cov = teko::list::push(cov, CovLine { file = "src/x.tks"; line = 3 to u32; hit = false })
+    cov = teko::list::push(cov, CovLine { file = "src/x.tks"; line = 9 to u32; hit = true })
+    cov = teko::list::push(cov, CovLine { file = "other.tks"; line = 2 to u32; hit = true })
+    let d = delta_line_coverage(cov, cls)
+    teko::assert::is_true(d.cov == 1)
+    teko::assert::is_true(d.val == 2)
+    teko::assert::is_true(delta_pct(d) == 50)
+}
+
+/**
+ * delta_pct is vacuously 100% when nothing executable changed (an empty denominator) — a commit that
+ * touched no measurable code has nothing to prove, so the gate must never block it.
+ */
+#test
+fn pt_delta_pct_empty_is_vacuously_full() {
+    teko::assert::is_true(delta_pct(DeltaCoverage { cov = 0; val = 0 }) == 100)
+    teko::assert::is_true(delta_pct(DeltaCoverage { cov = 3; val = 4 }) == 75)
+}
+
+/**
+ * delta_floor_blocks encodes the whole per-commit warn-vs-fail policy: a below-floor delta is a
+ * non-blocking pass by default (validation off) and a hard failure only under `--cov-validation`; a
+ * delta at or above the floor never blocks regardless of the flag (owner ruling 0.3.0.29 / #19).
+ */
+#test
+fn pt_delta_floor_blocks_is_opt_in() {
+    teko::assert::is_false(delta_floor_blocks(50, 80, false))
+    teko::assert::is_true(delta_floor_blocks(50, 80, true))
+    teko::assert::is_false(delta_floor_blocks(80, 80, true))
+    teko::assert::is_false(delta_floor_blocks(100, 50, true))
+}
+
+/**
+ * per_commit_report_str renders the stable, greppable one-line delta report the CI log parses:
+ * the base ref, the delta percentage, and the covered/total changed-line counts.
+ */
+#test
+fn pt_per_commit_report_str_shape() {
+    let line = per_commit_report_str("origin/main", DeltaCoverage { cov = 3; val = 4 })
+    teko::assert::is_true(line == "teko: per-commit delta coverage (base origin/main): 75% (3/4) of changed executable lines covered")
+}
