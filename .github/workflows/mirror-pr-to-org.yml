@@ -1,30 +1,28 @@
 # .github/workflows/mirror-pr-to-org.yml
-# Auto-mirror a fork PR to the org (owner request). When a PR `alguma_branch -> seed` is OPENED,
-# REOPENED, UPDATED (a new commit — synchronize) or EDITED on the fork, this pushes `alguma_branch`
-# (same name) to the org and opens-or-updates an IDENTICAL PR there (`alguma_branch -> seed`, same
-# title + body), so the owner reviews/merges both sides and cuts the seed. synchronize is what keeps
-# the org head tracking every push to the fork PR — without it the org PR would freeze at the opening
-# commit. Head may be any branch EXCEPT the seed itself or main.
+# Auto-mirror a fork PR to the org (owner request). The fork PR is `branch -> seed/linux-x86_64`.
+# The mirror opens, on the org, a CROSS-FORK PR `fork:branch -> org:branch` — same branch name on
+# both sides. That org branch already exists on the org (here it is the umbrella
+# `remodel/emit-throughput`); the fork's copy carries the newer commits, and GitHub compares across
+# the fork network.
 #
-# REQUIRES a repo secret `ORG_PR_TOKEN` — a PAT (or GitHub App token) with `contents:write` +
-# `pull-requests:write` on `teko-org/teko-lang`. The fork's own github.token cannot write the org,
-# so WITHOUT the secret this fails loud (never silently no-ops, never fabricates a PR).
+# WHY cross-fork (no push, no alias): `schivei/teko-lang` is a fork of `teko-org/teko-lang`, so a PR
+# can be opened straight from the fork branch into the org's same-named branch — nothing is pushed to
+# the org. This is exactly what the org's ruleset wants (GH013: "changes must be made through a pull
+# request"): the PR IS the change. Earlier attempts pushed the branch to the org (rejected by the
+# ruleset) and invented `promote/*` aliases — all unnecessary. The org NEVER has `seed/*`; the org PR
+# base is the branch name itself (the org's umbrella), not the fork PR's seed base.
 #
-# Scope: fork repo only; base = seed/linux-x86_64; head ≠ seed/linux-x86_64 and head ≠ main.
+# REQUIRES a repo secret `ORG_PR_TOKEN` — a PAT (or GitHub App token) with `pull-requests:write` on
+# `teko-org/teko-lang` (contents write is NOT needed — nothing is pushed). Without it this fails loud.
 #
-# ORG RULESET (learned the hard way): teko-org protects remodel/** and the promote/** alias with
-# "changes must be made through a pull request" (GH013). That blocks UPDATES to an existing org
-# branch — even a fast-forward — so a stable alias can be created once but never advanced. The
-# umbrella head is therefore mirrored to a UNIQUE per-commit org branch (promote/<tail>--<sha7>):
-# every push is a fresh CREATE (allowed). The PR step closes the previous mirror PR so exactly one
-# current org PR remains. Feature-branch heads (not protected on the org) keep their own name.
+# Scope: fork repo only; fires on fork PRs whose base is seed/linux-x86_64; head ≠ seed and ≠ main.
 name: Mirror PR to org
 
 on:
   pull_request:
-    # opened/reopened create the org PR; synchronize re-pushes the head on every new commit
-    # so the org side tracks the fork PR (the "Open (or update)" step is idempotent — it
-    # force-pushes the branch and edits the existing org PR); edited keeps title/body in sync.
+    # opened/reopened create the org PR; synchronize/edited keep it in sync (the step is idempotent:
+    # it edits the existing org PR, and a cross-fork PR auto-tracks new commits on the fork branch —
+    # no push needed, so synchronize needs no branch update, just a title/body refresh).
     types: [opened, reopened, synchronize, edited]
     branches: [seed/linux-x86_64]   # only PRs whose BASE is the seed branch
 
@@ -37,9 +35,7 @@ concurrency:
 
 jobs:
   mirror:
-    # fork only; head is any branch EXCEPT the seed itself or main. The umbrella head
-    # (remodel/**) IS mirrored — it is pushed under a non-protected alias (see the resolve
-    # step) so the org's branch protection on remodel/** never rejects the push.
+    # fork only; head is any branch EXCEPT the seed itself or main
     if: >-
       github.repository == 'schivei/teko-lang' &&
       github.event.pull_request.head.ref != 'seed/linux-x86_64' &&
@@ -48,110 +44,43 @@ jobs:
     env:
       ORG: teko-org/teko-lang
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      BASE_REF: ${{ github.event.pull_request.base.ref }}
       TITLE: ${{ github.event.pull_request.title }}
       BODY: ${{ github.event.pull_request.body }}
       NUM: ${{ github.event.pull_request.number }}
-      ORG_TOKEN: ${{ secrets.ORG_PR_TOKEN }}
+      GH_TOKEN: ${{ secrets.ORG_PR_TOKEN }}
     steps:
       - name: Guard — secret present
         run: |
           set -eu
-          if [ -z "${ORG_TOKEN:-}" ]; then
-            echo "::error::ORG_PR_TOKEN secret is required (contents+pull-requests write on $ORG). No org PR created."
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::ORG_PR_TOKEN secret is required (pull-requests:write on $ORG). No org PR created."
             exit 1
           fi
 
-      - name: Checkout the PR head (full history)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          # Don't persist the github-actions[bot] credential in git config — its global
-          # http.https://github.com/.extraheader overrides the ORG_PR_TOKEN embedded in the org
-          # push URL below, so the push would resolve as github-actions[bot] and be denied 403.
-          persist-credentials: false
-
-      - name: Resolve the org head branch (unique per-commit for the protected umbrella head)
+      - name: Open (or update) the cross-fork org PR (fork:branch -> org:branch)
         run: |
           set -eu
-          # The org protects remodel/** AND the promote/** alias (ruleset: "changes must be made
-          # through a pull request" — GH013). That rule blocks UPDATES to an existing org branch —
-          # even a fast-forward — so a STABLE alias can be created ONCE but never advanced. To keep
-          # the org PR current, mint a UNIQUE per-commit branch (promote/<tail>--<sha7>): every push
-          # is a fresh CREATE (allowed), never a blocked update. The PR step closes the prior
-          # unique branch's PR so exactly one current org PR remains. Non-umbrella heads (feature
-          # branches, not protected on the org) keep their own name and are pushed in place.
-          case "$HEAD_REF" in
-            remodel/*)
-              TAIL="${HEAD_REF#remodel/}"
-              SHORT="$(printf '%s' "$HEAD_SHA" | cut -c1-7)"
-              echo "ORG_HEAD=promote/${TAIL}--${SHORT}" >> "$GITHUB_ENV"
-              echo "ORG_HEAD_PREFIX=promote/${TAIL}--" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "ORG_HEAD=${HEAD_REF}" >> "$GITHUB_ENV"
-              echo "ORG_HEAD_PREFIX=" >> "$GITHUB_ENV"
-              ;;
-          esac
-
-      - name: Push the head branch to the org (create under its org-head name)
-        run: |
-          set -eu
-          echo "org head branch = ${ORG_HEAD}  (fork head = ${HEAD_REF})"
-          # A unique per-commit umbrella branch is always a fresh create. A same-name feature head
-          # may already exist and be a fast-forward; keep the force-with-lease→plain fallback for it.
-          # Tolerate a rejected push ONLY when the branch already exists at this exact SHA (a
-          # re-delivered event): the PR step can still run against it. Any other failure is fatal.
-          if git push "https://x-access-token:${ORG_TOKEN}@github.com/${ORG}.git" \
-               "HEAD:refs/heads/${ORG_HEAD}" --force-with-lease 2>/tmp/pusherr || \
-             git push "https://x-access-token:${ORG_TOKEN}@github.com/${ORG}.git" \
-               "HEAD:refs/heads/${ORG_HEAD}" 2>>/tmp/pusherr; then
-            echo "pushed ${ORG_HEAD}"
-          else
-            cat /tmp/pusherr >&2
-            REMOTE_SHA="$(git ls-remote "https://x-access-token:${ORG_TOKEN}@github.com/${ORG}.git" "refs/heads/${ORG_HEAD}" | cut -f1)"
-            if [ "$REMOTE_SHA" = "$(git rev-parse HEAD)" ]; then
-              echo "branch ${ORG_HEAD} already at this SHA (re-delivery) — continuing"
-            else
-              echo "::error::push of ${ORG_HEAD} to $ORG failed and the branch is not already at this SHA."
-              exit 1
-            fi
-          fi
-
-      - name: Open the org PR (close any superseded mirror PR)
-        env:
-          GH_TOKEN: ${{ secrets.ORG_PR_TOKEN }}
-        run: |
-          set -eu
+          FORK_OWNER="${GITHUB_REPOSITORY%%/*}"   # e.g. schivei
           # Build the mirrored body in a FILE via printf %s — the fork PR body ($BODY) is arbitrary
-          # Markdown (backticks, quotes, $, newlines); interpolating it into an inline double-quoted
-          # assignment broke the shell parse ("unexpected EOF looking for matching quote"). printf %s
-          # takes each value as a literal argument, and --body-file avoids re-quoting entirely.
+          # Markdown (backticks, quotes, $, newlines); inlining it into a double-quoted assignment
+          # broke the shell parse. printf %s takes each value literally; --body-file avoids re-quoting.
           BODY_FILE="$RUNNER_TEMP/org-pr-body.md"
           {
             printf '%s\n\n---\n' "$BODY"
-            printf 'Mirrored from %s#%s (fork, head `%s` @ %s). One current org PR per umbrella push.\n' \
-              "$GITHUB_REPOSITORY" "$NUM" "$HEAD_REF" "$HEAD_SHA"
+            printf 'Mirrored from %s#%s (%s:%s -> %s). Titles/bodies kept in sync for the org-side merge.\n' \
+              "$GITHUB_REPOSITORY" "$NUM" "$FORK_OWNER" "$HEAD_REF" "$HEAD_REF"
           } > "$BODY_FILE"
-          # Close any older open mirror PR for this umbrella (unique-branch model → keep newest only),
-          # best-effort deleting its stale org branch. Skipped for same-name feature heads (no prefix).
-          if [ -n "${ORG_HEAD_PREFIX:-}" ]; then
-            OLD="$(gh pr list --repo "$ORG" --base "$BASE_REF" --state open --json number,headRefName \
-                     --jq ".[] | select(.headRefName|startswith(\"$ORG_HEAD_PREFIX\")) | select(.headRefName != \"$ORG_HEAD\") | .number" || true)"
-            for n in $OLD; do
-              gh pr close "$n" --repo "$ORG" --delete-branch \
-                --comment "Superseded by a newer mirror of the umbrella head (${ORG_HEAD})." || true
-              echo "closed superseded org PR #$n"
-            done
-          fi
-          EXIST="$(gh pr list --repo "$ORG" --head "$ORG_HEAD" --base "$BASE_REF" --state open --json number --jq '.[0].number' || true)"
-          if [ -n "${EXIST:-}" ]; then
+          # Find an already-open cross-fork PR (same fork head branch, same org base branch).
+          EXIST="$(gh pr list --repo "$ORG" --state open --base "$HEAD_REF" \
+                     --json number,headRefName,headRepositoryOwner \
+                     --jq "[.[] | select(.headRefName==\"$HEAD_REF\" and .headRepositoryOwner.login==\"$FORK_OWNER\")][0].number" \
+                     2>/dev/null || true)"
+          if [ -n "${EXIST:-}" ] && [ "$EXIST" != "null" ]; then
             gh pr edit "$EXIST" --repo "$ORG" --title "$TITLE" --body-file "$BODY_FILE"
-            echo "Updated org PR #$EXIST"
+            echo "Updated org PR #$EXIST ($FORK_OWNER:$HEAD_REF -> $HEAD_REF)"
           else
-            gh pr create --repo "$ORG" --head "$ORG_HEAD" --base "$BASE_REF" \
+            gh pr create --repo "$ORG" \
+              --head "${FORK_OWNER}:${HEAD_REF}" --base "$HEAD_REF" \
               --title "$TITLE" --body-file "$BODY_FILE" --draft
-            echo "Opened org draft PR ($ORG_HEAD -> $BASE_REF)"
+            echo "Opened org draft PR ($FORK_OWNER:$HEAD_REF -> $HEAD_REF)"
           fi
