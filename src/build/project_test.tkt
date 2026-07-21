@@ -464,3 +464,147 @@ fn pt_checked_program_of_reports_consteval_cycle_under_own_phase() {
         error => teko::assert::is_true(true)
     }
 }
+
+/** pt_push_u64le — append `v` as 8 little-endian bytes (the `.tkcov` wire form) to `b`. */
+fn pt_push_u64le(b: []byte, v: u64) -> []byte {
+    mut out = b
+    mut x = v
+    mut i: u64 = 0
+    loop {
+        if i >= 8 { break }
+        out = teko::list::push(out, (x & 255) to byte)
+        x = x >> 8
+        i++
+    }
+    out
+}
+
+/** pt_tkcov_section — append a `.tkcov` id section (u64 count then the ids) to `b`. */
+fn pt_tkcov_section(b: []byte, ids: []u64) -> []byte {
+    mut out = pt_push_u64le(b, ids.len)
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        out = pt_push_u64le(out, ids[i])
+        i++
+    }
+    out
+}
+
+/** pt_tkcov — a well-formed `.tkcov` byte buffer (as a `str`) with the given fn/branch/line sections. */
+fn pt_tkcov(fns: []u64, branches: []u64, lines: []u64) -> str {
+    mut b: []byte = teko::list::empty()
+    b = teko::list::push(b, b'T'); b = teko::list::push(b, b'K'); b = teko::list::push(b, b'C')
+    b = teko::list::push(b, b'O'); b = teko::list::push(b, b'V'); b = teko::list::push(b, b'1')
+    b = teko::list::push(b, 0 to byte); b = teko::list::push(b, 0 to byte)
+    b = pt_tkcov_section(b, fns)
+    b = pt_tkcov_section(b, branches)
+    b = pt_tkcov_section(b, lines)
+    str(b)
+}
+
+/** pt_ids — a `[]u64` from three ids (a small fixture helper). */
+fn pt_ids3(a: u64, b: u64, c: u64) -> []u64 {
+    teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), a), b), c)
+}
+
+/** pt_ids1 — a single-id `[]u64` fixture (the `u64` parameter forces the literal's width). */
+fn pt_ids1(a: u64) -> []u64 { teko::list::push(teko::list::empty(), a) }
+
+/** pt_ids2 — a two-id `[]u64` fixture. */
+fn pt_ids2(a: u64, b: u64) -> []u64 { teko::list::push(pt_ids1(a), b) }
+
+/** analyzer_of recognizes `--analyzer` and ignores its absence. */
+#test
+fn pt_analyzer_of_flag() {
+    let with = teko::list::push(teko::list::push(teko::list::empty(), "test"), "--analyzer")
+    teko::assert::is_true(analyzer_of(with))
+    let without = teko::list::push(teko::list::empty(), "test")
+    teko::assert::is_false(analyzer_of(without))
+}
+
+/** tkcov_magic_ok accepts the real magic and rejects a foreign/short header. */
+#test
+fn pt_tkcov_magic() {
+    teko::assert::is_true(tkcov_magic_ok(pt_tkcov(teko::list::empty(), teko::list::empty(), teko::list::empty())))
+    teko::assert::is_false(tkcov_magic_ok("nope"))
+    teko::assert::is_false(tkcov_magic_ok("TKCOV1XY"))
+}
+
+/** read_u64_le decodes a little-endian word and treats past-end bytes as zero. */
+#test
+fn pt_read_u64le() {
+    let bytes = pt_push_u64le(teko::list::empty(), 258)
+    teko::assert::is_true(read_u64_le(str(bytes), 0) == 258)
+    teko::assert::is_true(read_u64_le("", 0) == 0)
+}
+
+/** tkcov_ids merges the three sections and dedups shared ids; a bad magic yields no ids. */
+#test
+fn pt_tkcov_ids_merges_and_dedups() {
+    let fns = pt_ids2(1, 2)
+    let branches = pt_ids1(3)
+    let lines = pt_ids1(1)
+    let ids = tkcov_ids(pt_tkcov(fns, branches, lines))
+    teko::assert::is_true(ids.len == 3)
+    teko::assert::is_true(tkcov_ids("bad").len == 0)
+}
+
+/** dedup_ids keeps each id once in first-seen order; ids_contains backs it. */
+#test
+fn pt_dedup_ids() {
+    let dup = pt_ids3(7, 7, 9)
+    let uniq = dedup_ids(dup)
+    teko::assert::is_true(uniq.len == 2)
+    teko::assert::is_true(ids_contains(uniq, 9))
+    teko::assert::is_false(ids_contains(uniq, 4))
+}
+
+/** count_of tallies occurrences across the cross-test multiset; concat_ids/all_ids_of build it. */
+#test
+fn pt_count_and_all_ids() {
+    let a = pt_ids1(5)
+    let b = pt_ids1(5)
+    let joined = concat_ids(a, b)
+    teko::assert::is_true(count_of(joined, 5) == 2)
+    teko::assert::is_true(count_of(joined, 8) == 0)
+}
+
+/** classify_test: no ids ⇒ STALE, all shared ⇒ REDUNDANT, a unique id ⇒ LIVE. */
+#test
+fn pt_classify_test_axes() {
+    let unique = pt_ids1(1)
+    let shared_a = pt_ids1(2)
+    let shared_b = pt_ids1(2)
+    let all = concat_ids(concat_ids(unique, shared_a), shared_b)
+    teko::assert::is_true(verdict_text(classify_test(teko::list::empty(), all)) == "STALE")
+    teko::assert::is_true(verdict_text(classify_test(shared_a, all)) == "REDUNDANT")
+    teko::assert::is_true(verdict_text(classify_test(unique, all)) == "LIVE")
+}
+
+/** combined_status crosses the coverage axis with the assertion-fold axis, most-severe first. */
+#test
+fn pt_combined_status_precedence() {
+    teko::assert::is_true(status_text(combined_status(Verdict::Live, 2, 1)) == "MISLEADING")
+    teko::assert::is_true(status_text(combined_status(Verdict::Stale, 2, 2)) == "FOUNDATIONAL")
+    teko::assert::is_true(status_text(combined_status(Verdict::Stale, 1, 0)) == "DEAD")
+    teko::assert::is_true(status_text(combined_status(Verdict::Redundant, 1, 0)) == "REDUNDANT")
+    teko::assert::is_true(status_text(combined_status(Verdict::Live, 1, 0)) == "LIVE")
+}
+
+/** analyzer_report renders header, per-test lines with asserts=, and a per-status summary. */
+#test
+fn pt_analyzer_report_shape() {
+    let unique = pt_ids1(1)
+    let shared_a = pt_ids1(2)
+    let shared_b = pt_ids1(2)
+    mut recs: []TestRecord = teko::list::push(teko::list::empty(), TestRecord { label = "a::live"; ids = concat_ids(unique, shared_a); asserts_total = 1; asserts_folded = 0 })
+    recs = teko::list::push(recs, TestRecord { label = "a::red"; ids = shared_b; asserts_total = 1; asserts_folded = 0 })
+    recs = teko::list::push(recs, TestRecord { label = "a::found"; ids = teko::list::empty(); asserts_total = 1; asserts_folded = 1 })
+    let report = analyzer_report(recs)
+    teko::assert::is_true(teko::str::contains(report, "ADVISORY"))
+    teko::assert::is_true(teko::str::contains(report, "analyzer a::live ids=2 asserts=1/0 status=LIVE"))
+    teko::assert::is_true(teko::str::contains(report, "status=REDUNDANT"))
+    teko::assert::is_true(teko::str::contains(report, "status=FOUNDATIONAL"))
+    teko::assert::is_true(teko::str::contains(report, "1 FOUNDATIONAL"))
+}
