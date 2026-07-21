@@ -1998,7 +1998,8 @@ fn no_tty_of(args: []str) -> bool {
 /** project_arg_of — the FIRST non-flag positional (the project) from `start`, or "" if none (the
  *  caller reports). Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored),
  *  `--no-verify` (#249 lever A), `--cov-validation`/`--per-test-cov` (the 0.3.0.29 coverage knobs),
- *  `--native-gate` (#265, now an inert no-op), `--release`,
+ *  `--per-commit-test <base>` (the 0.3.0.29 delta-coverage gate — a value flag, so its base is skipped
+ *  too), `--native-gate` (#265, now an inert no-op), `--release`,
  *  `--opt=<n>` (the optimization axis), `--no-tty` (BUILD-OUTPUT OBSERVABILITY), and `--backend`
  *  (D1/#390: both the `--backend <value>` two-token form and the `--backend=<value>` single-token
  *  form) — every recognized build flag — so none of them is mistaken for the project. `--vm-gate`
@@ -2018,6 +2019,7 @@ fn project_arg_of(args: []str, start: u64) -> str {
         else if args[i] == "--no-verify" { i = i + 1 }
         else if args[i] == "--cov-validation" { i = i + 1 }
         else if args[i] == "--per-test-cov" { i = i + 1 }
+        else if args[i] == "--per-commit-test" { i = i + 2 }
         else if args[i] == "--native-gate" { i = i + 1 }
         else if args[i] == "--release" { i = i + 1 }
         else if args[i] == "--no-tty" { i = i + 1 }
@@ -2277,6 +2279,499 @@ fn run_per_test_cov(dir: str, fe: Frontend) -> i32 {
 }
 
 /**
+ * The changed lines of ONE source file since a git base — the file path (as git reports it,
+ * repo-relative) plus the new-side line numbers that the diff ADDED or replaced. The unit the
+ * per-commit delta gate attributes coverage to (owner ruling 0.3.0.29: "código vivo prova a si
+ * mesmo; congelado sai da conta" — only the lines a commit touched count toward its delta).
+ */
+type ChangedFile = struct {
+    /**
+     * The changed file's path exactly as `git diff` reports it (repo-relative, `b/`-prefix stripped).
+     */
+    path: str
+    /**
+     * The new-side (post-change) 1-based source line numbers this diff added or replaced, in order.
+     */
+    lines: []u32
+}
+
+/**
+ * The whole set of source lines changed since a git base — one `ChangedFile` per touched `.tks`
+ * file. Produced by `changed_line_set` from a `git diff <base>...HEAD` and consulted by
+ * `changed_contains` when attributing coverage to only the changed lines (the delta metric).
+ */
+type ChangedLines = struct {
+    /**
+     * The changed `.tks` files, each with its added/replaced new-side line numbers.
+     */
+    files: []ChangedFile
+}
+
+/**
+ * One executable production line as the coverage report saw it: its source file, its 1-based line
+ * number, and whether the run hit it. Parsed out of the Cobertura report (`cov_lines_from_cobertura`)
+ * so the delta attribution reuses the SAME executable-line surface and hit marks the coverage floors
+ * read — the delta is a projection of the aggregate coverage onto the changed lines.
+ */
+type CovLine = struct {
+    /**
+     * The source file the line belongs to (the Cobertura `<class filename=…>` of its function).
+     */
+    file: str
+    /**
+     * The 1-based source line number.
+     */
+    line: u32
+    /**
+     * Whether the aggregate run executed this line at least once (Cobertura `hits` &gt; 0).
+     */
+    hit: bool
+}
+
+/**
+ * A delta-coverage count — covered / total over the CHANGED executable lines only. `delta_pct`
+ * rounds down; an empty denominator (nothing executable changed) is vacuously 100% — a commit that
+ * touched no measurable code has nothing to prove, so the gate never blocks it.
+ */
+type DeltaCoverage = struct {
+    /**
+     * The number of changed executable lines the run covered (numerator).
+     */
+    cov: u64
+    /**
+     * The total number of changed executable lines (denominator).
+     */
+    val: u64
+}
+
+/**
+ * The value of the `--per-commit-test <base>` flag — the git ref/sha to diff against — or "" when
+ * the flag is absent (the no-op default: `teko test` behaves exactly as before, zero added cost).
+ * A DEV+CI knob (owner ruling 0.3.0.29 — the delta-coverage enforcer): with `--cov-validation` also
+ * present a below-floor delta FAILS the gate, otherwise it only warns (consistent with #19's
+ * default-non-blocking floor policy).
+ *
+ * @param args  the full CLI argument vector
+ * @return      the git base immediately following `--per-commit-test`, or "" when the flag is absent
+ */
+fn per_commit_base_of(args: []str) -> str {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--per-commit-test" {
+            if i + 1 < args.len { return args[i + 1] }
+            return ""
+        }
+        i = i + 1
+    }
+    ""
+}
+
+/**
+ * Does `s` begin with the byte sequence `p`? A local byte-level prefix test (there is no
+ * `teko::str::starts_with` builtin — only `ends_with`/`contains`), used throughout the unified-diff
+ * parser to classify each diff line by its leading marker.
+ *
+ * @param s  the string to test
+ * @param p  the required prefix
+ * @return   true iff `s` starts with `p`
+ */
+fn bp_prefix(s: str, p: str) -> bool {
+    if s.len < p.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= p.len { break }
+        if s[i] != p[i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+/**
+ * Split `text` into lines on the `\n` byte, dropping the terminators; a trailing non-newline segment
+ * is its own line and a trailing newline yields no empty final line. Kept local (rather than reaching
+ * for `teko::iter::split_lines`) so the diff/Cobertura parsers stay self-contained within the build
+ * namespace and directly unit-testable.
+ *
+ * @param text  the text to break into lines
+ * @return      the lines in order, without their line terminators
+ */
+fn bp_lines(text: str) -> []str {
+    mut out: []str = teko::list::empty()
+    mut start: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= text.len { break }
+        if text[i] == b'\n' {
+            out = teko::list::push(out, teko::str::slice(text, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < text.len { out = teko::list::push(out, teko::str::slice_from(text, start)) }
+    out
+}
+
+/**
+ * The first index of `needle` in `s`, or -1 when absent — a forward substring search (the only
+ * builtin, `last_index_of`, searches from the END). Backs the Cobertura attribute extractor.
+ *
+ * @param s       the haystack
+ * @param needle  the substring to locate (an empty needle matches at 0)
+ * @return        the 0-based index of the first occurrence, or -1 when `needle` does not occur
+ */
+fn bp_find(s: str, needle: str) -> i64 {
+    if needle.len == 0 { return 0 }
+    if s.len < needle.len { return -1 }
+    mut i: u64 = 0
+    let last = s.len - needle.len
+    loop {
+        if i > last { break }
+        if bp_prefix(teko::str::slice_from(s, i), needle) { return i to i64 }
+        i = i + 1
+    }
+    -1
+}
+
+/**
+ * The leading run of decimal digits of `s` as a u64 (0 when `s` does not start with a digit). Parses
+ * the small integers the diff hunk header and Cobertura attributes carry.
+ *
+ * @param s  the string whose leading digit run is read
+ * @return   the parsed non-negative integer, or 0 when there is no leading digit
+ */
+fn bp_parse_uint(s: str) -> u64 {
+    mut n: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        if c < b'0' || c > b'9' { break }
+        n = n * 10 + (c to u64) - (b'0' to u64)
+        i = i + 1
+    }
+    n
+}
+
+/**
+ * The new-side (post-change) start line of a unified-diff hunk header `@@ -a,b +c,d @@`: the integer
+ * immediately after the `+` (the `c`). 0 when the line carries no `+` group (never a valid header).
+ *
+ * @param line  the `@@ … @@` hunk header line
+ * @return      the new-side start line `c`, or 0 when the header is malformed
+ */
+fn bp_hunk_newstart(line: str) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= line.len { break }
+        if line[i] == b'+' { return bp_parse_uint(teko::str::slice_from(line, i + 1)) to u32 }
+        i = i + 1
+    }
+    0
+}
+
+/**
+ * The changed file's path from a unified-diff `+++ ` header line: the text after `+++ `, with a
+ * leading `b/` stripped. A `+++ /dev/null` (a pure deletion) yields "" so it registers no file.
+ *
+ * @param line  the `+++ …` header line
+ * @return      the repo-relative path, or "" for `/dev/null`
+ */
+fn bp_plusfile(line: str) -> str {
+    let rest = teko::str::slice_from(line, 4)
+    if rest == "/dev/null" { return "" }
+    if bp_prefix(rest, "b/") { return teko::str::slice_from(rest, 2) }
+    rest
+}
+
+/**
+ * Append a completed file's changed lines to the accumulator, but ONLY when it is a non-empty `.tks`
+ * file — a file with no added lines (pure deletion) or a non-Teko path contributes no delta unit, so
+ * it is dropped. Flushed by `changed_line_set` each time the diff advances to the next `+++` file.
+ *
+ * @param files  the changed-file accumulator so far
+ * @param path   the file just parsed (repo-relative)
+ * @param lines  its added/replaced new-side line numbers
+ * @return       `files` with the file appended when it is a non-empty `.tks`, else `files` unchanged
+ */
+fn cl_flush(files: []ChangedFile, path: str, lines: []u32) -> []ChangedFile {
+    if lines.len == 0 { return files }
+    if !teko::str::ends_with(path, ".tks") { return files }
+    teko::list::push(files, ChangedFile { path = path; lines = lines })
+}
+
+/**
+ * Parse a `git diff <base>...HEAD` unified diff into the set of new-side lines it changed per `.tks`
+ * file. Walks the diff line by line, tracking the current `+++` file and the running new-side line
+ * number seeded by each `@@` hunk header: an added line (`+`, not the `+++` header) records the
+ * current new-side number and advances it; a context line (leading space) advances it; a deletion
+ * (`-`, not the `---` header) and every header/metadata line leave it untouched. PURE — the git shell
+ * is elsewhere (`per_commit_diff_text`) so this is directly unit-testable on a synthetic diff.
+ *
+ * @param diff  the unified-diff text from `git diff <base>...HEAD`
+ * @return      the changed `.tks` files with their added/replaced new-side line numbers
+ */
+fn changed_line_set(diff: str) -> ChangedLines {
+    mut files: []ChangedFile = teko::list::empty()
+    mut cur_file: str = ""
+    mut cur_lines: []u32 = teko::list::empty()
+    mut newno: u32 = 0
+    let lines = bp_lines(diff)
+    mut i: u64 = 0
+    loop {
+        if i >= lines.len { break }
+        let ln = lines[i]
+        if bp_prefix(ln, "+++ ") {
+            files = cl_flush(files, cur_file, cur_lines)
+            cur_file = bp_plusfile(ln)
+            cur_lines = teko::list::empty()
+        } else if bp_prefix(ln, "@@ ") {
+            newno = bp_hunk_newstart(ln)
+        } else if bp_prefix(ln, "+") && !bp_prefix(ln, "+++") {
+            cur_lines = teko::list::push(cur_lines, newno)
+            newno = newno + 1
+        } else if bp_prefix(ln, " ") {
+            newno = newno + 1
+        }
+        i = i + 1
+    }
+    files = cl_flush(files, cur_file, cur_lines)
+    ChangedLines { files = files }
+}
+
+/**
+ * Do two source paths refer to the same file, tolerant of the repo-relative vs project-relative
+ * mismatch between what `git diff` reports (repo root) and what the checker records on a function
+ * (`f.file`, which may be project-relative)? True when they are equal or one is a path-suffix of the
+ * other (`.../src/x.tks` matches `x.tks` only across a `/` boundary, so `ax.tks` never matches `x.tks`).
+ *
+ * @param a  one path
+ * @param b  the other path
+ * @return   true iff `a` and `b` denote the same file up to a leading-directory prefix
+ */
+fn path_tail_match(a: str, b: str) -> bool {
+    if a == b { return true }
+    if teko::str::ends_with(a, teko::str::concat("/", b)) { return true }
+    if teko::str::ends_with(b, teko::str::concat("/", a)) { return true }
+    false
+}
+
+/**
+ * Was `(file, line)` changed since the base — i.e. is `line` in the changed-line set of a file that
+ * `path_tail_match`es `file`? The membership predicate the delta attribution consults per executable
+ * line. PURE and directly unit-testable against a synthetic `ChangedLines`.
+ *
+ * @param cls   the changed-line set from `changed_line_set`
+ * @param file  the executable line's source file
+ * @param line  the executable line's 1-based line number
+ * @return      true iff that file+line was added/replaced since the base
+ */
+fn changed_contains(cls: ChangedLines, file: str, line: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= cls.files.len { break }
+        if path_tail_match(cls.files[i].path, file) {
+            mut j: u64 = 0
+            loop {
+                if j >= cls.files[i].lines.len { break }
+                if cls.files[i].lines[j] == line { return true }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+/**
+ * The value of a single-quoted attribute `key` on a Cobertura element line — the text between `key`
+ * (e.g. `filename='`, `number='`, `hits='`) and the next single quote. "" when the key is absent.
+ *
+ * @param s    the element line
+ * @param key  the attribute prefix including the opening quote (e.g. `hits='`)
+ * @return     the attribute value, or "" when `key` does not occur
+ */
+fn xml_attr(s: str, key: str) -> str {
+    let at = bp_find(s, key)
+    if at < 0 { return "" }
+    let start = (at to u64) + key.len
+    mut j = start
+    loop {
+        if j >= s.len { break }
+        if s[j] == b'\'' { break }
+        j = j + 1
+    }
+    teko::str::slice(s, start, j)
+}
+
+/**
+ * Parse the executable production lines (file, line, hit) out of a Cobertura report — reusing the
+ * coverage subsystem's OWN exported renderer (`coverage::cov_cobertura`) as the source of truth for
+ * "which lines are executable and were they hit", so the delta metric can never diverge from the
+ * aggregate floors. Reads the `filename` off each `<class …>` and one `CovLine` off each body
+ * `<line number=… hits=…/>`; the per-method summary `<line>` (on the `<methods>` line) is skipped so
+ * a function's declaration line is not double-counted.
+ *
+ * @param xml  the Cobertura XML from `coverage::cov_cobertura`
+ * @return     one `CovLine` per executable production line, in report order
+ */
+fn cov_lines_from_cobertura(xml: str) -> []CovLine {
+    mut out: []CovLine = teko::list::empty()
+    mut cur_file: str = ""
+    let lines = bp_lines(xml)
+    mut i: u64 = 0
+    loop {
+        if i >= lines.len { break }
+        let ln = lines[i]
+        if teko::str::contains(ln, "<class ") {
+            cur_file = xml_attr(ln, "filename='")
+        } else if teko::str::contains(ln, "<line number='") && !teko::str::contains(ln, "<methods>") {
+            let num = bp_parse_uint(xml_attr(ln, "number='")) to u32
+            let hits = bp_parse_uint(xml_attr(ln, "hits='"))
+            out = teko::list::push(out, CovLine { file = cur_file; line = num; hit = hits > 0 })
+        }
+        i = i + 1
+    }
+    out
+}
+
+/**
+ * Attribute the aggregate line coverage to ONLY the changed lines — the delta metric. Of the
+ * executable production lines (`covlines`), count those that were changed since the base
+ * (`changed_contains`) as the denominator and the changed-AND-hit ones as the numerator. PURE: given
+ * a synthetic coverage map + changed-line set it computes the delta with no git and no sinks — the
+ * function the regression exercises.
+ *
+ * @param covlines  every executable production line with its hit flag (from `cov_lines_from_cobertura`)
+ * @param cls       the lines changed since the base (from `changed_line_set`)
+ * @return          the covered/total delta over the changed executable lines
+ */
+fn delta_line_coverage(covlines: []CovLine, cls: ChangedLines) -> DeltaCoverage {
+    mut cov: u64 = 0
+    mut val: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= covlines.len { break }
+        if changed_contains(cls, covlines[i].file, covlines[i].line) {
+            val = val + 1
+            if covlines[i].hit { cov = cov + 1 }
+        }
+        i = i + 1
+    }
+    DeltaCoverage { cov = cov; val = val }
+}
+
+/**
+ * The integer percentage of a delta count, rounded down. An empty denominator (no executable line
+ * changed) is vacuously 100% — a commit that touched no measurable code has nothing to prove.
+ *
+ * @param d  the delta count
+ * @return   the delta percentage in [0, 100]
+ */
+fn delta_pct(d: DeltaCoverage) -> u64 { if d.val == 0 { 100 } else { d.cov * 100 / d.val } }
+
+/**
+ * The per-commit delta-coverage policy as a pure predicate, mirroring `coverage_floor_blocks`: a
+ * below-floor delta BLOCKS the gate only when `--cov-validation` is opted in; otherwise it warns and
+ * the gate passes (owner ruling 0.3.0.29 / #19 default-non-blocking). A delta at or above the floor
+ * never blocks regardless of the flag.
+ *
+ * @param pct             the measured delta percentage
+ * @param floor           the [coverage] lines floor the delta must meet
+ * @param cov_validation  `--cov-validation` — enforcement opted in
+ * @return                true iff the gate must FAIL (validation on AND the delta is below the floor)
+ */
+fn delta_floor_blocks(pct: u64, floor: u64, cov_validation: bool) -> bool {
+    cov_validation && pct < floor
+}
+
+/**
+ * The one-line per-commit delta-coverage report the CI log greps: the base ref, the delta percentage,
+ * and the covered/total changed-line counts.
+ *
+ * @param base  the git base the delta was measured against
+ * @param d     the measured delta count
+ * @return      the formatted report line (no trailing newline)
+ */
+fn per_commit_report_str(base: str, d: DeltaCoverage) -> str {
+    $"teko: per-commit delta coverage (base {base}): {delta_pct(d)}% ({d.cov}/{d.val}) of changed executable lines covered"
+}
+
+/**
+ * Shell `git diff <base>...HEAD -- '*.tks'` to `out_path` (stderr silenced), returning git's exit
+ * status. Uses `sh -c` because `teko::process::run` has no redirection; the three-dot form diffs
+ * against the merge-base of `<base>` and `HEAD`, restricted to Teko sources. A non-zero status means
+ * git is unavailable or `<base>` is not a valid ref — the caller degrades gracefully.
+ *
+ * @param base      the git ref/sha to diff against
+ * @param out_path  the file to capture the diff into
+ * @return          git's exit status (0 on success)
+ */
+fn run_git_diff(base: str, out_path: str) -> i32 {
+    let cmd = teko::str::concat("git diff ", base, "...HEAD -- '*.tks' > ", out_path, " 2>/dev/null")
+    mut argv: []str = teko::list::push(teko::list::empty(), "sh")
+    argv = teko::list::push(argv, "-c")
+    argv = teko::list::push(argv, cmd)
+    teko::process::run(argv)
+}
+
+/**
+ * The captured `git diff <base>...HEAD` text, or an error when git is unavailable / `<base>` is not a
+ * valid ref (so the per-commit gate can degrade gracefully rather than crash — guardrail). Captures to
+ * a scratch file next to the project root, then slurps it.
+ *
+ * @param base  the git ref/sha to diff against
+ * @return      the unified-diff text, or an error describing the git failure
+ * @throws      when the `git diff` invocation fails or the scratch file cannot be read
+ */
+fn per_commit_diff_text(base: str) -> str | error {
+    let out_path = ".teko-per-commit.diff"
+    if run_git_diff(base, out_path) != 0 {
+        return error { message = teko::str::concat("git diff ", base, "...HEAD failed (git unavailable or invalid base)") }
+    }
+    teko::io::read_file(out_path)
+}
+
+/**
+ * The `teko test --per-commit-test <base>` body (owner ruling 0.3.0.29 — the delta-coverage CI
+ * enforcer). Diff `<base>...HEAD` for changed `.tks` lines (`changed_line_set`), project the just-run
+ * aggregate coverage onto those lines (`cov_lines_from_cobertura` over `coverage::cov_cobertura` +
+ * `delta_line_coverage`), report the delta, and apply the SAME warn-vs-fail policy as the floors: with
+ * `--cov-validation` a below-floor delta FAILS (exit 1); otherwise it only warns. When git is
+ * unavailable or `<base>` is invalid the gate degrades gracefully — an honest warning, exit 0, never a
+ * crash. Runs AFTER the aggregate floor policy, so the coverage sinks already hold the run's marks.
+ *
+ * @param dir             the project directory (for the diagnostic prefix)
+ * @param fe              the assembled front-end product (checked program + manifest floors)
+ * @param base            the git ref/sha to measure the delta against
+ * @param cov_validation  `--cov-validation` — enforce (fail) rather than warn on a below-floor delta
+ * @return                0 unless `cov_validation` is set AND the delta is below the [coverage] lines floor
+ * @throws                under `cov_validation`, when the delta is below the lines floor
+ */
+fn run_per_commit_test(dir: str, fe: Frontend, base: str, cov_validation: bool) -> i32 {
+    let diff = match per_commit_diff_text(base) {
+        str as s => s
+        error => {
+            teko::io::eprintln($"teko: warning: per-commit delta coverage skipped — `git diff {base}...HEAD` unavailable")
+            return 0
+        }
+    }
+    let cls = changed_line_set(diff)
+    let covlines = cov_lines_from_cobertura(coverage::cov_cobertura(fe.prog))
+    let d = delta_line_coverage(covlines, cls)
+    teko::io::println(per_commit_report_str(base, d))
+    let pct = delta_pct(d)
+    let floor = fe.manifest.cov_lines
+    if delta_floor_blocks(pct, floor, cov_validation) {
+        return fail(dir, $"per-commit delta coverage {pct}% is below the {floor}% floor ([coverage] lines) — the lines changed since {base} are undertested")
+    }
+    if pct < floor {
+        teko::io::eprintln($"teko: warning: per-commit delta coverage {pct}% is below the {floor}% floor ([coverage] lines) — the lines changed since {base} are undertested")
+    }
+    0
+}
+
+/**
  * The `teko test <dir>` entry (D2, post-VM): assemble WITH the `.tkt` tests, then run every
  * `#test` NATIVELY via the #265 native gate (emit a test-profile C TU, compile with `run_cc`,
  * run the child fail-fast — a failed assert panics with a non-zero exit, M.1), then apply the
@@ -2284,14 +2779,18 @@ fn run_per_test_cov(dir: str, fe: Frontend) -> i32 {
  * Unlike `teko build`, it emits NO release binary. `--coverage` writes a Cobertura report to
  * `<cwd>/cobertura.xml` (the project root — `teko test` has no `-o`). `--per-test-cov` additionally
  * emits the dev-time per-test attribution report (`run_per_test_cov`) AFTER the floor policy.
+ * `--per-commit-test <base>` runs the delta-coverage enforcer (`run_per_commit_test`) AFTER the floor
+ * policy — measuring coverage attributed to the lines changed since `<base>` and (under
+ * `--cov-validation`) failing when that delta is below floor; absent, it is a zero-cost no-op.
  *
- * @param dir             the project directory (already the cwd; the front-end chdir'd in)
- * @param gen_cov         `--coverage` — write the Cobertura report next to the project root
- * @param cov_validation  `--cov-validation` — enforce (fail) the coverage floors instead of warning
- * @param per_test_cov    `--per-test-cov` — also print the dev-time per-test attribution report
- * @return                0 when every test passes and the floor policy holds, else the failing status
+ * @param dir              the project directory (already the cwd; the front-end chdir'd in)
+ * @param gen_cov          `--coverage` — write the Cobertura report next to the project root
+ * @param cov_validation   `--cov-validation` — enforce (fail) the coverage floors instead of warning
+ * @param per_test_cov     `--per-test-cov` — also print the dev-time per-test attribution report
+ * @param per_commit_base  `--per-commit-test <base>` — the git base for the delta gate ("" = no-op)
+ * @return                 0 when every test passes and the floor + delta policies hold, else the failing status
  */
-fn test_project(dir: str, gen_cov: bool, cov_validation: bool, per_test_cov: bool) -> i32 {
+fn test_project(dir: str, gen_cov: bool, cov_validation: bool, per_test_cov: bool, per_commit_base: str) -> i32 {
     ensure_rt_dir_abs()
     let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
     let trc = run_native_gate(dir, "bin", fe.prog, fe.manifest, output_is_tty(false))
@@ -2303,6 +2802,10 @@ fn test_project(dir: str, gen_cov: bool, cov_validation: bool, per_test_cov: boo
     }
     let floor_rc = enforce_coverage_floors(dir, fe, cov_validation)
     if floor_rc != 0 { return floor_rc }
+    if per_commit_base.len > 0 {
+        let pc = run_per_commit_test(dir, fe, per_commit_base, cov_validation)
+        if pc != 0 { return pc }
+    }
     if per_test_cov { return run_per_test_cov(dir, fe) }
     0
 }
