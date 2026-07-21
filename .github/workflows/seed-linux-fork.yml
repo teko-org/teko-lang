@@ -39,10 +39,34 @@ jobs:
           S="$(sed -n 's/^suffix[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' teko.tkp | head -1)"
           echo "tag=v${V}${S:+-$S}" >> "$GITHUB_OUTPUT"
 
+      # IDEMPOTENT CUT: the `paths: ['teko.tkp']` trigger fires on ANY manifest edit, but a
+      # seed cut is only meaningful when the version FIELD advanced (a new tag). A manifest
+      # touch that leaves version/suffix unchanged (e.g. a comment or a non-version field)
+      # derives the SAME tag whose release already exists — rebuilding + re-uploading it is
+      # pure waste (and needlessly churns the asset agents fetch). So: if the release for the
+      # derived tag already exists, SKIP the whole cut. Mirrors tag-on-version-bump.yml's
+      # "tag already exists → skip" idempotency.
+      - name: Skip if this seed release already exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -eu
+          if gh release view "$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "SKIP: fork seed release '$V' already exists — version not bumped; nothing to cut."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "CUT: fork seed release '$V' is missing — building the seed."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Bootstrap seed (newest available release)
+        if: steps.exists.outputs.skip != 'true'
         run: ./scripts/ci_provision_teko.sh linux-x86_64-glibc
 
       - name: Build the seed — dry, no gate, no fixpoint
+        if: steps.exists.outputs.skip != 'true'
         run: |
           set -eu
           mkdir -p out
@@ -50,20 +74,18 @@ jobs:
           test -x out/teko
 
       - name: Package (binary at tarball root — fetch_teko.sh extracts to .teko/teko)
+        if: steps.exists.outputs.skip != 'true'
         run: tar -C out -czf teko-linux-x86_64-glibc.tar.gz teko
 
-      - name: Publish/refresh the fork release
+      - name: Publish the new fork seed release
+        if: steps.exists.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ steps.ver.outputs.tag }}
         run: |
           set -eu
           PRERELEASE=""; case "$V" in *-*) PRERELEASE="--prerelease" ;; esac
-          if gh release view "$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$V" teko-linux-x86_64-glibc.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            gh release create "$V" teko-linux-x86_64-glibc.tar.gz --repo "$GITHUB_REPOSITORY" \
-              --title "$V (fork seed — linux-x86_64-glibc)" \
-              --notes "Dry fork-scoped Linux x86-64 seed for agent/CI validation. Canonical multi-platform release lives on the org." \
-              $PRERELEASE
-          fi
+          gh release create "$V" teko-linux-x86_64-glibc.tar.gz --repo "$GITHUB_REPOSITORY" \
+            --title "$V (fork seed — linux-x86_64-glibc)" \
+            --notes "Dry fork-scoped Linux x86-64 seed for agent/CI validation. Canonical multi-platform release lives on the org." \
+            $PRERELEASE
