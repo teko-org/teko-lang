@@ -1,0 +1,550 @@
+/**
+ * TkrKind — the comparison policy a regressive's built artifact is checked under: `Exit` compares
+ * the exact exit code (the robust default oracle); `Print` compares exit AND stdout; `Trap` asserts
+ * a non-zero exit only (never byte-compares a trap against a platform's abort signal); `CompileFail`
+ * asserts the BUILD fails and its diagnostic contains the expected substring. Tier-A only — the
+ * compiler-as-regressive (`Compiler`) case is out of scope for 0.3.0.29.
+ *
+ * @since 0.3.0.29
+ */
+pub type TkrKind = enum { Exit; Print; Trap; CompileFail }
+
+/**
+ * TkrMatchMode — how one output stream is checked: `Ignore` (no expectation), `Literal` (exact
+ * bytes), or `Sha256` (a lowercase-hex sha256 of the bytes, for large/binary output). Modelled as a
+ * tag alongside `TkrMatch.text` because Teko enums carry no payload.
+ *
+ * @since 0.3.0.29
+ */
+pub type TkrMatchMode = enum { Ignore; Literal; Sha256 }
+
+/**
+ * TkrMatch — an expected output stream: the `mode` (Ignore/Literal/Sha256) plus `text` (the literal
+ * expected bytes for `Literal`, the lowercase-hex digest for `Sha256`, "" for `Ignore`).
+ *
+ * @since 0.3.0.29
+ */
+pub type TkrMatch = struct {
+    /** how the stream is checked. */
+    mode: TkrMatchMode
+    /** the literal expected bytes (Literal), the hex sha256 (Sha256), or "" (Ignore). */
+    text: str
+}
+
+/**
+ * TkrExpect — a per-os-arch expectation override declared by a `[expect.<os-arch>]` sub-table, for
+ * the legitimate divergences a target introduces (e.g. a wasm trap exit differing from a native
+ * abort). Each field overrides the top-level expectation ONLY for the named `osarch`; `has_exit`
+ * distinguishes "override the exit code" from "leave it inherited".
+ *
+ * @since 0.3.0.29
+ */
+pub type TkrExpect = struct {
+    /** the os-arch key this override applies to (e.g. "wasm", "x86_64-linux"). */
+    osarch: str
+    /** true when this override supplies an `exit` code (else the top-level exit is inherited). */
+    has_exit: bool
+    /** the overriding exit code (meaningful only when `has_exit`). */
+    exit: i32
+    /** the overriding stdout expectation (Ignore → inherit the top-level stdout). */
+    stdout: TkrMatch
+    /** the overriding stderr expectation (Ignore → inherit the top-level stderr). */
+    stderr: TkrMatch
+}
+
+/**
+ * TkrGolden — an opt-in strict per-os-arch byte golden: the lowercase-hex sha256 of the emitted
+ * artifact for the named `osarch`. A per-target fixpoint — fragile across toolchains, so it is
+ * additive to (never a replacement for) the portable output-based expectation.
+ *
+ * @since 0.3.0.29
+ */
+pub type TkrGolden = struct {
+    /** the os-arch the golden hash pins (e.g. "x86_64-linux"). */
+    osarch: str
+    /** the expected lowercase-hex sha256 of the emitted `.o`/binary for that os-arch. */
+    sha256: str
+}
+
+/**
+ * Tkr — one regressive's parsed `.tkr` spec: the opaque runtime inputs (`args`/`stdin`), the
+ * expected observable outputs (`exit`/`stdout`/`stderr`, literal or hashed), the variant set to run
+ * (`targets`), per-os-arch overrides (`expect`), the kind (exit/print/trap/compile_fail), the
+ * `compile_fail` diagnostic substring, and any opt-in per-os-arch byte golden (`golden`).
+ * Output-based expectations are the portable default; `golden` is strict opt-in.
+ *
+ * @since 0.3.0.29
+ */
+pub type Tkr = struct {
+    /** argv passed to the built binary — the fold-opaque runtime operands (the opacity law). */
+    args: []str
+    /** bytes fed to the process stdin; "" when none. */
+    stdin: str
+    /** the classification driving the comparison policy. */
+    kind: TkrKind
+    /** expected exit code (ignored for `Trap`, which asserts non-zero only). */
+    exit: i32
+    /** expected stdout (Ignore/Literal/Sha256). */
+    stdout: TkrMatch
+    /** expected stderr (Ignore/Literal/Sha256). */
+    stderr: TkrMatch
+    /** the variants to run: os-arch names, `["all"]`, or `[]` → inherit `[tests] targets`. */
+    targets: []str
+    /** per-os-arch expectation overrides ([expect.<os-arch>]); empty when uniform. */
+    expect: []TkrExpect
+    /** opt-in per-os-arch byte goldens ([golden.<os-arch>]); empty when output-based. */
+    golden: []TkrGolden
+    /** for `CompileFail`: the required diagnostic substring ("" → assert failure only). */
+    diagnostic: str
+}
+
+/**
+ * tkr_match_ignore — the empty `TkrMatch` (no expectation on a stream).
+ *
+ * @return an `Ignore`-mode match
+ * @since 0.3.0.29
+ */
+fn tkr_match_ignore() -> TkrMatch { TkrMatch { mode = TkrMatchMode::Ignore; text = "" } }
+
+/**
+ * tkr_kind_of — map a `kind = "…"` string to a `TkrKind`, or an honest error for an unknown kind
+ * (M.3 — no coercion to a default).
+ *
+ * @param s  the kind string ("exit" | "print" | "trap" | "compile_fail")
+ * @return   the parsed kind, or an `error` when `s` names no known kind
+ * @throws   when `s` is not one of the four known kinds
+ * @since 0.3.0.29
+ */
+fn tkr_kind_of(s: str) -> TkrKind | error {
+    if s == "exit" { return TkrKind::Exit }
+    if s == "print" { return TkrKind::Print }
+    if s == "trap" { return TkrKind::Trap }
+    if s == "compile_fail" { return TkrKind::CompileFail }
+    error { message = teko::str::concat("unknown .tkr kind: ", s) }
+}
+
+/**
+ * tkr_sub_osarch — extract the `<os-arch>` suffix of a `[expect.<os-arch>]` / `[golden.<os-arch>]`
+ * table header name (already stripped of the `expect.`/`golden.` prefix by the caller). A bare
+ * `[expect]`/`[golden]` with no suffix yields "".
+ *
+ * @param nm      the full table-header name (e.g. "expect.wasm")
+ * @param prefix  the recognised prefix including the dot ("expect." | "golden.")
+ * @return        the os-arch suffix, or "" when absent
+ * @since 0.3.0.29
+ */
+fn tkr_sub_osarch(nm: str, prefix: str) -> str {
+    if nm.len <= prefix.len { return "" }
+    teko::str::slice_from(nm, prefix.len)
+}
+
+/**
+ * TkrExpectAccum — the in-progress `[expect.<os-arch>]` block `parse_tkr` fills while reading the
+ * block's keys, flushed to the `Tkr.expect` list when the next table header (or end of file) is
+ * reached. Bundled so `parse_tkr`'s local prologue stays flat.
+ *
+ * @since 0.3.0.29
+ */
+type TkrExpectAccum = struct {
+    /** true while a `[expect.<os-arch>]` block is open (so it is flushed on the next header/EOF). */
+    active: bool
+    /** the current block's os-arch key. */
+    osarch: str
+    /** whether the current block declared an `exit` override. */
+    has_exit: bool
+    /** the current block's exit override. */
+    exit: i32
+    /** the current block's stdout override. */
+    stdout: TkrMatch
+    /** the current block's stderr override. */
+    stderr: TkrMatch
+}
+
+/**
+ * tkr_expect_reset — a fresh, inactive `[expect.<os-arch>]` accumulator for `osarch` (all overrides
+ * cleared to inherit). `active` is set true by the caller once a matching header opens the block.
+ *
+ * @param osarch  the os-arch key the new block targets
+ * @return        an inactive accumulator ready to collect the block's keys
+ * @since 0.3.0.29
+ */
+fn tkr_expect_reset(osarch: str) -> TkrExpectAccum {
+    TkrExpectAccum { active = false; osarch = osarch; has_exit = false; exit = 0; stdout = tkr_match_ignore(); stderr = tkr_match_ignore() }
+}
+
+/**
+ * tkr_flush_expect — append the accumulator's `[expect.<os-arch>]` override to `list` when the block
+ * is active, else return `list` unchanged. Called when a new table header opens or the file ends.
+ *
+ * @param list  the overrides accumulated so far
+ * @param acc   the block being closed
+ * @return      `list` with `acc`'s override appended when active
+ * @since 0.3.0.29
+ */
+fn tkr_flush_expect(list: []TkrExpect, acc: TkrExpectAccum) -> []TkrExpect {
+    if !acc.active { return list }
+    teko::list::push(list, TkrExpect { osarch = acc.osarch; has_exit = acc.has_exit; exit = acc.exit; stdout = acc.stdout; stderr = acc.stderr })
+}
+
+/**
+ * tkr_read_i32 — read an unquoted non-negative integer (an exit code) at `p` and narrow it to i32.
+ *
+ * @param s  the line being read
+ * @param p  the cursor at the value
+ * @return   the parsed value as i32
+ * @since 0.3.0.29
+ */
+fn tkr_read_i32(s: str, p: u64) -> i32 { mf_read_int(s, p) to i32 }
+
+/**
+ * TkrLine — one non-empty, non-comment `.tkr` key/value line resolved to its key text and the cursor
+ * at its value (past `=` and spaces). Returned by `tkr_split_kv` so the section handlers share one
+ * `key = value` decode.
+ *
+ * @since 0.3.0.29
+ */
+type TkrLine = struct {
+    /** the bare key text. */
+    key: str
+    /** the cursor at the value (past `=`). */
+    vpos: u64
+}
+
+/**
+ * tkr_split_kv — decode a `key = value` line into its key and value cursor, or an honest error when
+ * the key or the `=` is missing (M.3).
+ *
+ * @param line  the line to decode (already known non-blank, non-comment, non-header)
+ * @param i     the cursor at the first non-space byte
+ * @return      the key + value cursor, or an `error` on a malformed line
+ * @throws      when the line has no bare key or no `=`
+ * @since 0.3.0.29
+ */
+fn tkr_split_kv(line: str, i: u64) -> TkrLine | error {
+    let ke = mf_key_end(line, i)
+    if ke == i { return error { message = "malformed .tkr line (expected a key or '[table]')" } }
+    let key = teko::str::slice(line, i, ke)
+    let eq = mf_skip_spaces(line, ke)
+    if mf_at(line, eq) != b'=' { return error { message = "malformed .tkr key/value (expected '=')" } }
+    TkrLine { key = key; vpos = mf_skip_spaces(line, eq + 1) }
+}
+
+/**
+ * TkrBuild — the in-progress `Tkr` accumulator threaded through `parse_tkr`'s line loop: every
+ * top-level field, the current section tag (`sec`), and the open `[expect.<os-arch>]` block (`ex`).
+ * Bundled so each section's key handler is a small `TkrBuild -> TkrBuild | error` step rather than a
+ * mutation of a dozen locals — keeping `parse_tkr` flat.
+ *
+ * @since 0.3.0.29
+ */
+type TkrBuild = struct {
+    /** accumulated argv (fold-opaque operands). */
+    args: []str
+    /** accumulated stdin bytes. */
+    stdin: str
+    /** the parsed kind (defaults to Exit). */
+    kind: TkrKind
+    /** the parsed exit code (defaults to 0). */
+    exit: i32
+    /** the stdout expectation. */
+    stdout: TkrMatch
+    /** the stderr expectation. */
+    stderr: TkrMatch
+    /** the declared variant set. */
+    targets: []str
+    /** the compile_fail diagnostic substring. */
+    diagnostic: str
+    /** the flushed per-os-arch overrides. */
+    expect: []TkrExpect
+    /** the accumulated per-os-arch goldens. */
+    golden: []TkrGolden
+    /** the current section: "root" | "expect" | "golden" | "other". */
+    sec: str
+    /** the open `[expect.<os-arch>]` block (flushed to `expect` on the next header / EOF). */
+    ex: TkrExpectAccum
+}
+
+/**
+ * tkr_build_new — a fresh `TkrBuild` with every field at its documented default (kind Exit, exit 0,
+ * ignored streams, empty lists, section "root").
+ *
+ * @return the initial accumulator
+ * @since 0.3.0.29
+ */
+fn tkr_build_new() -> TkrBuild {
+    TkrBuild {
+        args = teko::list::empty(); stdin = ""; kind = TkrKind::Exit; exit = 0
+        stdout = tkr_match_ignore(); stderr = tkr_match_ignore(); targets = teko::list::empty()
+        diagnostic = ""; expect = teko::list::empty(); golden = teko::list::empty()
+        sec = "root"; ex = tkr_expect_reset("")
+    }
+}
+
+/**
+ * tkr_with_root_stream — a copy of `b` with its top-level `which` stream ("stdout"/"stderr") set to
+ * `m`. Isolates the two symmetric stream assignments from the key dispatch.
+ *
+ * @param b      the accumulator
+ * @param which  "stdout" or "stderr"
+ * @param m      the parsed match
+ * @return       `b` with the named stream replaced
+ * @since 0.3.0.29
+ */
+fn tkr_with_root_stream(b: TkrBuild, which: str, m: TkrMatch) -> TkrBuild {
+    let so = if which == "stdout" { m } else { b.stdout }
+    let se = if which == "stderr" { m } else { b.stderr }
+    TkrBuild { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = so; stderr = se; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden; sec = b.sec; ex = b.ex }
+}
+
+/**
+ * tkr_stream_match — build the `TkrMatch` for a `stdout`/`stderr` (Literal) or `*_sha256` (Sha256)
+ * key from the quoted value text.
+ *
+ * @param key   the key name (its `_sha256` suffix selects Sha256)
+ * @param text  the quoted value
+ * @return      the corresponding match
+ * @since 0.3.0.29
+ */
+fn tkr_stream_match(key: str, text: str) -> TkrMatch {
+    if teko::str::ends_with(key, "_sha256") { return TkrMatch { mode = TkrMatchMode::Sha256; text = text } }
+    TkrMatch { mode = TkrMatchMode::Literal; text = text }
+}
+
+/**
+ * tkr_apply_root_key — fold one root-section `key = value` line into `b` (M.3 honest errors on a
+ * malformed value or unknown kind). Unknown root keys are tolerated (forward-compatible).
+ *
+ * @param b     the accumulator
+ * @param key   the parsed key
+ * @param line  the source line
+ * @param v     the cursor at the value
+ * @return      the updated accumulator, or an `error` on a malformed value
+ * @throws      on a malformed list/string value or an unknown kind
+ * @since 0.3.0.29
+ */
+fn tkr_apply_root_key(b: TkrBuild, key: str, line: str, v: u64) -> TkrBuild | error {
+    if key == "args" {
+        let xs = match mf_read_str_list(line, v) { []str as x => x; error as e => return e }
+        return TkrBuild { args = xs; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden; sec = b.sec; ex = b.ex }
+    }
+    if key == "targets" {
+        let xs = match mf_read_str_list(line, v) { []str as x => x; error as e => return e }
+        return TkrBuild { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = xs; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden; sec = b.sec; ex = b.ex }
+    }
+    if key == "exit" {
+        return TkrBuild { args = b.args; stdin = b.stdin; kind = b.kind; exit = tkr_read_i32(line, v); stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden; sec = b.sec; ex = b.ex }
+    }
+    if key == "stdin" || key == "diagnostic" || key == "kind" || key == "stdout" || key == "stdout_sha256" || key == "stderr" || key == "stderr_sha256" {
+        let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
+        return tkr_apply_root_quoted(b, key, q.text)
+    }
+    b
+}
+
+/**
+ * tkr_apply_root_quoted — the quoted-value half of `tkr_apply_root_key` (stdin/diagnostic/kind and
+ * the two stream families), split out to keep each step short.
+ *
+ * @param b     the accumulator
+ * @param key   the parsed key
+ * @param text  the already-read quoted value
+ * @return      the updated accumulator, or an `error` on an unknown kind
+ * @throws      when `key == "kind"` names no known kind
+ * @since 0.3.0.29
+ */
+fn tkr_apply_root_quoted(b: TkrBuild, key: str, text: str) -> TkrBuild | error {
+    if key == "stdin" {
+        return TkrBuild { args = b.args; stdin = text; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden; sec = b.sec; ex = b.ex }
+    }
+    if key == "diagnostic" {
+        return TkrBuild { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = text; expect = b.expect; golden = b.golden; sec = b.sec; ex = b.ex }
+    }
+    if key == "kind" {
+        let k = match tkr_kind_of(text) { TkrKind as x => x; error as e => return e }
+        return TkrBuild { args = b.args; stdin = b.stdin; kind = k; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden; sec = b.sec; ex = b.ex }
+    }
+    let stream = if teko::str::ends_with(key, "stdout") || key == "stdout_sha256" { "stdout" } else { "stderr" }
+    tkr_with_root_stream(b, stream, tkr_stream_match(key, text))
+}
+
+/**
+ * tkr_apply_expect_key — fold one `[expect.<os-arch>]` key into the open block `b.ex` (exit override
+ * or a stream override). M.3 honest errors on a malformed stream value.
+ *
+ * @param b     the accumulator (its `ex` is the open block)
+ * @param key   the parsed key
+ * @param line  the source line
+ * @param v     the cursor at the value
+ * @return      the updated accumulator, or an `error` on a malformed value
+ * @throws      on a malformed stream value
+ * @since 0.3.0.29
+ */
+fn tkr_apply_expect_key(b: TkrBuild, key: str, line: str, v: u64) -> TkrBuild | error {
+    let e = b.ex
+    if key == "exit" {
+        let ne = TkrExpectAccum { active = e.active; osarch = e.osarch; has_exit = true; exit = tkr_read_i32(line, v); stdout = e.stdout; stderr = e.stderr }
+        return tkr_with_ex(b, ne)
+    }
+    if key == "stdout" || key == "stdout_sha256" {
+        let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e2 => return e2 }
+        let ne = TkrExpectAccum { active = e.active; osarch = e.osarch; has_exit = e.has_exit; exit = e.exit; stdout = tkr_stream_match(key, q.text); stderr = e.stderr }
+        return tkr_with_ex(b, ne)
+    }
+    if key == "stderr" || key == "stderr_sha256" {
+        let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e2 => return e2 }
+        let ne = TkrExpectAccum { active = e.active; osarch = e.osarch; has_exit = e.has_exit; exit = e.exit; stdout = e.stdout; stderr = tkr_stream_match(key, q.text) }
+        return tkr_with_ex(b, ne)
+    }
+    b
+}
+
+/**
+ * tkr_with_ex — a copy of `b` with its open `[expect.<os-arch>]` block replaced by `ne`.
+ *
+ * @param b   the accumulator
+ * @param ne  the new open block
+ * @return    `b` with `ex = ne`
+ * @since 0.3.0.29
+ */
+fn tkr_with_ex(b: TkrBuild, ne: TkrExpectAccum) -> TkrBuild {
+    TkrBuild { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden; sec = b.sec; ex = ne }
+}
+
+/**
+ * tkr_open_header — apply a `[table]` header to `b`: first flush any open `[expect]` block, then set
+ * the new section (opening a fresh `[expect.<os-arch>]` block or pushing a `[golden.<os-arch>]`
+ * placeholder). An unrecognised header selects section "other".
+ *
+ * @param b   the accumulator
+ * @param nm  the header name (already stripped of the surrounding brackets)
+ * @return    the updated accumulator
+ * @since 0.3.0.29
+ */
+fn tkr_open_header(b: TkrBuild, nm: str) -> TkrBuild {
+    let flushed = tkr_flush_expect(b.expect, b.ex)
+    let base = TkrBuild { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = flushed; golden = b.golden; sec = "other"; ex = tkr_expect_reset("") }
+    if mf_starts_with(nm, "expect.") {
+        let ne = TkrExpectAccum { active = true; osarch = tkr_sub_osarch(nm, "expect."); has_exit = false; exit = 0; stdout = tkr_match_ignore(); stderr = tkr_match_ignore() }
+        return TkrBuild { args = base.args; stdin = base.stdin; kind = base.kind; exit = base.exit; stdout = base.stdout; stderr = base.stderr; targets = base.targets; diagnostic = base.diagnostic; expect = base.expect; golden = base.golden; sec = "expect"; ex = ne }
+    }
+    if mf_starts_with(nm, "golden.") {
+        let ng = teko::list::push(base.golden, TkrGolden { osarch = tkr_sub_osarch(nm, "golden."); sha256 = "" })
+        return TkrBuild { args = base.args; stdin = base.stdin; kind = base.kind; exit = base.exit; stdout = base.stdout; stderr = base.stderr; targets = base.targets; diagnostic = base.diagnostic; expect = base.expect; golden = ng; sec = "golden"; ex = base.ex }
+    }
+    base
+}
+
+/**
+ * tkr_apply_key — dispatch one `key = value` line to the handler for the current section.
+ *
+ * @param b     the accumulator
+ * @param key   the parsed key
+ * @param line  the source line
+ * @param v     the cursor at the value
+ * @return      the updated accumulator, or an `error` on a malformed value
+ * @throws      on a malformed value in the active section
+ * @since 0.3.0.29
+ */
+fn tkr_apply_key(b: TkrBuild, key: str, line: str, v: u64) -> TkrBuild | error {
+    if b.sec == "root" { return tkr_apply_root_key(b, key, line, v) }
+    if b.sec == "expect" { return tkr_apply_expect_key(b, key, line, v) }
+    if b.sec == "golden" {
+        if key != "sha256" { return b }
+        let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
+        return TkrBuild { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = tkr_set_last_golden_sha(b.golden, q.text); sec = b.sec; ex = b.ex }
+    }
+    b
+}
+
+/**
+ * parse_tkr — read a `.tkr` source into a `Tkr`, or fail honestly (M.3 — no silent coercion). The
+ * recognised schema (all keys optional; sensible defaults when absent):
+ *   root:  args=[…] · stdin="…" · exit=N · stdout="…"|stdout_sha256="…" ·
+ *          stderr="…"|stderr_sha256="…" · kind="exit|print|trap|compile_fail" ·
+ *          targets=[…]|"all" · diagnostic="…"
+ *   [expect.<os-arch>]: exit=N · stdout/stdout_sha256 · stderr/stderr_sha256
+ *   [golden.<os-arch>]: sha256="…"
+ * Absent `kind` defaults to `Exit`; absent `exit` defaults to 0; absent streams are `Ignore`; an
+ * absent `targets` is an empty list (the runner inherits `[tests] targets`).
+ *
+ * @param src  the `.tkr` file contents
+ * @return     the parsed spec, or an `error` on any malformed line
+ * @throws     on a malformed line, an unknown `kind`, or a malformed value
+ * @since 0.3.0.29
+ */
+fn parse_tkr(src: str) -> Tkr | error {
+    mut b = tkr_build_new()
+    mut p: u64 = 0
+    loop {
+        if p >= src.len { break }
+        mut eol = p
+        loop {
+            if eol >= src.len { break }
+            if src[eol] == b'\n' { break }
+            eol = eol + 1
+        }
+        let line = teko::str::slice(src, p, eol)
+        if eol < src.len { p = eol + 1 } else { p = eol }
+
+        let i = mf_skip_spaces(line, 0)
+        let c = mf_at(line, i)
+        if c == 0 || c == b'#' { continue }
+        if c == b'[' {
+            let ke = mf_key_end(line, i + 1)
+            let nm = teko::str::slice(line, i + 1, ke)
+            let j = mf_skip_spaces(line, ke)
+            if mf_at(line, j) != b']' { return error { message = "malformed .tkr table header (expected ']')" } }
+            b = tkr_open_header(b, nm)
+            continue
+        }
+        let kv = match tkr_split_kv(line, i) { TkrLine as x => x; error as e => return e }
+        b = match tkr_apply_key(b, kv.key, line, kv.vpos) { TkrBuild as nb => nb; error as e => return e }
+    }
+    let expect = tkr_flush_expect(b.expect, b.ex)
+    Tkr { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; expect = expect; golden = b.golden; diagnostic = b.diagnostic }
+}
+
+/**
+ * tkr_set_last_golden_sha — set the `sha256` of the MOST RECENTLY opened `[golden.<os-arch>]` entry
+ * (the last element of `golden`), since a golden block's header is pushed first and its `sha256` key
+ * follows. Returns `golden` unchanged when it is empty (a stray `sha256` outside a block).
+ *
+ * @param golden  the goldens accumulated so far (last = the open block)
+ * @param sha     the hex digest read from the `sha256 = "…"` line
+ * @return        `golden` with the last entry's `sha256` set
+ * @since 0.3.0.29
+ */
+fn tkr_set_last_golden_sha(golden: []TkrGolden, sha: str) -> []TkrGolden {
+    if golden.len == 0 { return golden }
+    mut out: []TkrGolden = teko::list::empty()
+    mut k: u64 = 0
+    loop {
+        if k >= golden.len { break }
+        if k == golden.len - 1 {
+            out = teko::list::push(out, TkrGolden { osarch = golden[k].osarch; sha256 = sha })
+        } else {
+            out = teko::list::push(out, golden[k])
+        }
+        k = k + 1
+    }
+    out
+}
+
+/**
+ * tkr_expect_for — the `[expect.<os-arch>]` override matching `osarch`, or `null` when the `.tkr`
+ * declares none for it (the runner then uses the top-level expectation).
+ *
+ * @param t       the parsed spec
+ * @param osarch  the os-arch key to resolve
+ * @return        the matching override, or `null`
+ * @since 0.3.0.29
+ */
+fn tkr_expect_for(t: Tkr, osarch: str) -> TkrExpect? {
+    mut k: u64 = 0
+    loop {
+        if k >= t.expect.len { break }
+        if t.expect[k].osarch == osarch { return t.expect[k] }
+        k = k + 1
+    }
+    null
+}
