@@ -748,6 +748,7 @@ fn ptr_widens_to_opaque(from: Type, to: Type) -> bool {
 fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
     if type_eq(from, to) { return true }
     if depth <= 0 { return false }
+    if from_is_bare_null(from) && null_widens_into(to, table) { return true }
     // PRESENT-WRAP first (before variant decomposition): a whole `T` (even a named variant like
     // `TypeExpr`) wraps into `T?`. Checking this before the variant-from split keeps `TypeExpr →
     // TypeExpr?` a single present-wrap, not a member-by-member (which would wrongly fail).
@@ -812,6 +813,46 @@ fn widens_into_at(from: Type, to: Type, table: TypeTable, depth: i64) -> bool {
     }
 }
 fn widens_into(from: Type, to: Type, table: TypeTable) -> bool { widens_into_at(from, to, table, 16) }
+
+/**
+ * Is `from` a bare `null` value — either the concrete `Null` type (null-as-union), or the legacy
+ * `Optional{Void}` bare-null sentinel that a `null` literal still carries in an optional context?
+ * Both denote the value `null`, so both widen into a union listing `null`.
+ *
+ * @param from  the source value type
+ * @return      true iff `from` is a bare `null` in either representation
+ */
+fn from_is_bare_null(from: Type) -> bool {
+    match from {
+        Null => true
+        Optional as o => match o.inner { Void => true; _ => false }
+        _ => false
+    }
+}
+
+/**
+ * null_widens_into — a bare `null` (type `Null`) is assignable into a target that is `Null` itself
+ * or a union (inline or named) listing `null` among its members (set membership, order-independent).
+ *
+ * @param target  the resolved destination type
+ * @param table   the type table (to expand a named-variant target)
+ * @return        true iff a `Null` value is assignable into `target`
+ */
+fn null_widens_into(target: Type, table: TypeTable) -> bool {
+    match target { Null => return true; _ => { } }
+    match expand_variant(target, table) {
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                match v.members[i] { Null => return true; _ => { } }
+                i++
+            }
+            false
+        }
+        _ => false
+    }
+}
 
 // ── (W10b.D3) nominal contract conformance — the interface-value upcast / constraint gates ──────
 // These live HERE (not collect.tks) because widens_into needs them and resolve sits below collect
@@ -1349,6 +1390,48 @@ pub fn collect_sig_type_params(t: Type, table: TypeTable, acc: []str) -> []str {
     }
 }
 
+/**
+ * Is this named type-expr the `null` type-atom (null-as-union)? The parser carries a `null`
+ * in a type position as a single-segment, argument-free `NamedType` named "null" (`null` is a
+ * reserved keyword, so no user type ever bears that name).
+ *
+ * @param nt  the resolved-against named type-expr
+ * @return    true iff `nt` is exactly the `null` type-atom
+ */
+fn named_type_is_null(nt: parser::NamedType) -> bool {
+    if nt.args.len != 0 { return false }
+    if nt.path.segments.len != 1 { return false }
+    nt.path.segments[0].name == "null"
+}
+
+/**
+ * Canonicalize a union's member order so `null`, if present, is FIRST — leaving every other
+ * member in source order and collapsing any repeated `null` to a single leading one. Guarantees
+ * `null | error` and `error | null` share one resolved type (and one mangled typedef). A null-free
+ * member list is returned unchanged (behavior-preserving for the existing corpus).
+ *
+ * @param members  the resolved union members (source order)
+ * @return         the members with any `Null` moved to (a single) index 0
+ */
+fn union_normalize_null(members: []Type) -> []Type {
+    mut has_null = false
+    mut i = 0
+    loop {
+        if i >= members.len { break }
+        match members[i] { Null => has_null = true; _ => { } }
+        i++
+    }
+    if !has_null { return members }
+    mut out: []Type = teko::list::push(teko::list::empty(), Null { })
+    mut j = 0
+    loop {
+        if j >= members.len { break }
+        match members[j] { Null => { }; _ => out = teko::list::push(out, members[j]) }
+        j++
+    }
+    out
+}
+
 // resolve a syntactic TypeExpr to a pure semantic Type (recursive — B.8).
 // (#109 W1) `ref_ns` = the REFERENCING namespace (the namespace of the code that wrote `te`).
 // Threaded down every recursion (slice element / union members / fn-type params+ret / optional
@@ -1361,7 +1444,8 @@ pub fn resolve_type(te: parser::TypeExpr, table: TypeTable, ref_ns: str) -> Type
         // resolve to the nominal instance `Named{Box__g__i64}` — the concrete decl is stamped by the
         // instantiation pass / mono (blocker #1: reuse the Named case, no new Type variant).
         parser::NamedType as nt => {
-            if nt.args.len == 0 { resolve_named(nt.path, table, ref_ns) }
+            if named_type_is_null(nt) { Null { } }
+            else if nt.args.len == 0 { resolve_named(nt.path, table, ref_ns) }
             else { resolve_generic_inst(nt, table, ref_ns) }
         }
         parser::SliceType as st => {
@@ -1402,7 +1486,7 @@ pub fn resolve_type(te: parser::TypeExpr, table: TypeTable, ref_ns: str) -> Type
                 members = teko::list::push(members, m)
                 i++
             }
-            Variant { members = members }
+            Variant { members = union_normalize_null(members) }
         }
         // (W10a) FunctionType `(A, B) -> R` → Func { params; ret ; variadic = false }. The return MAY be `void`
         // (a function value can return nothing); params must be COMPLETE value types (void/ref
@@ -1495,6 +1579,7 @@ pub fn type_mangle(t: Type) -> str {
         Reference as r => teko::str::concat("ref_", type_mangle(r.inner))   // (MEM-1b)
         Variant => "variant"
         Func => "func"
+        Null => "null"
     }
 }
 
@@ -1648,6 +1733,7 @@ pub fn type_render(t: Type) -> str {
         Ptr as p => match p.inner { null => "ptr"; Type as t => $"ptr<{type_render(t)}>" }   // ptr<T> human render
         Uptr => "uptr"   // (C7.1a) opaque word-size unsigned
         Reference as r => $"Ref<{type_render(r.inner)}>"   // (MEM-1b) Ref<T> human render
+        Null => "null"
     }
 }
 

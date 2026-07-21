@@ -5155,3 +5155,60 @@ fn borrow_of_immutable_var_is_error() {
     let b = parser::Borrow { operand = e_var("x") }
     match type_expr(ek(b), env, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
 }
+
+/**
+ * A typed numeric-literal `TExpr` at the default `i64` leaf type, for the C2b union-adoption tests.
+ *
+ * @param v  the literal's integer value
+ * @return   a `TExpr` wrapping a `TNumber` leaf typed `i64`
+ */
+fn tnum_i64(v: i128) -> TExpr { TExpr { kind = TNumber { is_float = false; value = v; fval = 0.0 }; type = i64t(); line = 0; col = 0 } }
+
+/**
+ * A typed bare-`null` `TExpr` at the sentinel optional type, for the C2b union-adoption tests.
+ *
+ * @return  a `TExpr` wrapping a `TNullLit` leaf typed `void?`
+ */
+fn tnull_sentinel() -> TExpr { TExpr { kind = TNullLit { }; type = Optional { inner = Void { } }; line = 0; col = 0 } }
+
+/**
+ * The inline union `i32 | null` (null-first canonical order) — the unambiguous C2b adoption target
+ * with exactly one numeric member and the `null` member.
+ *
+ * @return  a `Variant` of `[null, i32]`
+ */
+fn union_i32_or_null() -> Type {
+    mut m: []Type = teko::list::push(teko::list::empty(), Null { })
+    m = teko::list::push(m, i32t())
+    Variant { members = m }
+}
+
+/**
+ * The ambiguous union `i8 | i32` — two numeric members a small literal fits, so C2b must NOT adopt
+ * a bare literal into it (explicit typing required).
+ *
+ * @return  a `Variant` of `[i8, i32]`
+ */
+fn union_i8_or_i32() -> Type {
+    mut m: []Type = teko::list::push(teko::list::empty(), i8t())
+    m = teko::list::push(m, i32t())
+    Variant { members = m }
+}
+
+/**
+ * C2b — a bare numeric literal adopts a union's SOLE fitting numeric member (`1` → `i32 | null`)
+ * and `retype_literal` borns it at that member; a bare `null` adopts the `null` member and is
+ * borned at `Null`; an ambiguous `i8 | i32` (two fitting numeric members) refuses a bare literal,
+ * and a union with no `null` member refuses a bare `null`.
+ */
+#test
+fn c2b_literal_adopts_union_member() {
+    teko::assert::is_true(literal_adopts(tnum_i64(1), union_i32_or_null()))
+    let rn = retype_literal(tnum_i64(1), union_i32_or_null())
+    teko::assert::is_true(prim_is(rn.type, PrimKind::I32))
+    teko::assert::is_true(literal_adopts(tnull_sentinel(), union_i32_or_null()))
+    let rnull = retype_literal(tnull_sentinel(), union_i32_or_null())
+    match rnull.type { Null => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    teko::assert::is_true(!literal_adopts(tnum_i64(1), union_i8_or_i32()))
+    teko::assert::is_true(!literal_adopts(tnull_sentinel(), union_i8_or_i32()))
+}

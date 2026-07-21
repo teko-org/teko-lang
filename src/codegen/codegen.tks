@@ -999,6 +999,7 @@ fn emit_type(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte |
         checker::Uptr => cb(buf, "uintptr_t")
         // (MEM-1b) Ref<T> → a bare `<T> *` today ("C pointer without `*`/`&`"; struct wrapper waits for W9+ metadata).
         checker::Reference as r => cb(match emit_type(buf, prog, r.inner) { []byte as o => o; error as e => return e }, " *")
+        checker::Null => cb(buf, "uint8_t")
     }
 }
 
@@ -1094,6 +1095,7 @@ fn cg_opt_mangle(buf: []byte, inner: checker::Type) -> []byte | error {
         checker::Char => cb(buf, "char")
         checker::Str => cb(buf, "str")
         checker::Error => cb(buf, "error")
+        checker::Null => cb(buf, "null")
         checker::Named as nm => cb_str(buf, checker::name_last_segment(nm.name))   // (#149) BARE key — the (#109 W3) canonical nm.name carries `::` (invalid C); mirror cg_opt_mangle_str and the C twin (tk_name_last_segment)
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
@@ -1131,6 +1133,7 @@ fn cg_opt_mangle_str(inner: checker::Type) -> str | error {
         checker::Char => "char"
         checker::Str => "str"
         checker::Error => "error"
+        checker::Null => "null"
         checker::Named as nm => checker::name_last_segment(nm.name)   // (#109 W3) BARE key — matches the syntactic cg_opt_mangle_texpr_str; keeps tk_u_/tk_slice_/tk_opt_ names valid C identifiers
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
@@ -4680,9 +4683,17 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
             out = cb_upper(out, ck)
             cb(out, ")")
         }
-        // A `null` pattern reaches here only over a NON-optional subject (the optional case is
-        // handled by cg_emit_pat_test's `.present` test) — the checker rejects that.
-        parser::NullPattern => error { message = "codegen: `null` pattern over a non-optional subject (internal)" }
+        parser::NullPattern => {
+            if cg_var_reaches(prog, variantT, "null", 16) {
+                mut out = cb(buf, "(")
+                out = cb(out, subj)
+                out = cb(out, ".tag == ")
+                out = match cg_emit_tag_prefix(out, variantT) { []byte as o => o; error as err => return err }
+                out = cb_upper(out, "null")
+                return cb(out, ")")
+            }
+            error { message = "codegen: `null` pattern over a non-optional subject (internal)" }
+        }
     }
 }
 
@@ -5440,7 +5451,10 @@ fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
         // null / ?. / ?? — the OPTIONAL value model (REBOOT_PLAN §202/§203; tk_opt_<inner>).
         // A bare `null` in raw expression position has the SENTINEL optional type: it cannot be
         // emitted alone — its concrete type comes from the destination slot via emit_as.
-        checker::TNullLit => error { message = "codegen: a bare `null` needs a known optional type from context (use it where a `T?` is expected)" }
+        checker::TNullLit => match e.type {
+            checker::Null => cb(buf, "0")
+            _ => error { message = "codegen: a bare `null` needs a known optional type from context (use it where a `T?` is expected)" }
+        }
         checker::TSafeFieldAccess as sfa => emit_safe_field_access(buf, prog, e, sfa, escaping, regions, fn_body, dctx)
         checker::TCoalesce as co => emit_coalesce(buf, prog, e, co, escaping, regions, fn_body, dctx)
         checker::TIndex as ix => emit_index(buf, prog, e, ix, escaping, regions, fn_body, dctx)   // W5-idx — subscript recv[index] (str + slice, bounds-checked)

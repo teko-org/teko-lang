@@ -3188,6 +3188,10 @@ fn type_value_expected(e: parser::Expr, expected: Type, env: Env, table: TypeTab
             if is_iface_slice(expected, table) { return type_array_lit_expected(al, expected, env, table) }   // (W10b.D3) []<interface> literal
             adopt_value_to_expected(e, expected, env, table)
         }
+        parser::NullLit => {
+            if null_widens_into(expected, table) { return TExpr { kind = TNullLit { }; type = Null { }; line = e.line; col = e.col } }
+            adopt_value_to_expected(e, expected, env, table)
+        }
         _ => adopt_value_to_expected(e, expected, env, table)
     }
 }
@@ -3700,19 +3704,84 @@ fn trailing_number(stmts: []TStatement) -> TExpr? {
     }
 }
 
-// C6 (extended) — a fitting numeric LITERAL adopts the destination type (return value / trailing
-// expr): int-literal → an int prim it fits OR `byte` (=u8, B.36); float-literal → a fitting float
-// prim. Reuses cast_kind (byte AS u8) + value_fits / float_fits — the same range rules as a binding.
-// RECURSES through a `match`/`if` whose every contributing arm trails an adopting literal (so
-// `match k { U8 => 8; … } : u32` adopts), mirroring tk_literal_adopts in expr.c.
+/**
+ * Does a numeric literal `n` fit the scalar destination `m` — an int/float prim it fits, or `byte`
+ * (= u8, B.36)? A bool or non-numeric `m` (`cast_kind` rejects it) never fits. The single-member
+ * fit test shared by the scalar and union arms of `literal_adopts`/`retype_literal`.
+ *
+ * @param n  the typed numeric-literal payload (its value/float flavor and magnitude)
+ * @param m  the candidate destination scalar type
+ * @return   true iff `n` is representable in `m` under the same range rules as a binding
+ */
+fn number_fits_member(n: TNumber, m: Type) -> bool {
+    match cast_kind(m) {
+        PrimKind as k => {
+            if n.is_float { prim_is_float(k) && float_fits(n.fval, k) }
+            else { prim_is_int(k) && value_fits(n.value, k) }
+        }
+        error => false
+    }
+}
+
+/**
+ * The lone union MEMBER a numeric literal unambiguously adopts (C2b). A literal distributes over a
+ * union only when EXACTLY ONE member is a numeric prim/byte it fits: zero fitting members means the
+ * union takes no bare literal, and two or more (e.g. an `i8 | i32` both admitting `1`) are ambiguous
+ * — both require an explicit type, so neither adopts. Returns that sole member, else `error`.
+ *
+ * @param n        the typed numeric-literal payload
+ * @param members  the union's member types
+ * @return         the single fitting numeric member, or `error` when zero or ≥2 fit
+ * @throws         when no member fits or more than one does (the ambiguous/absent cases)
+ */
+fn union_sole_numeric_member(n: TNumber, members: []Type) -> Type | error {
+    mut found: Type = Void { }
+    mut count = 0
+    mut i = 0
+    loop {
+        if i >= members.len { break }
+        if number_fits_member(n, members[i]) { found = members[i]; count = count + 1 }
+        i++
+    }
+    if count == 1 { found } else { error { message = "not exactly one numeric union member fits the literal" } }
+}
+
+/**
+ * Does a union list the `null` member — the destination a bare `null` literal adopts (C2b)? A set
+ * membership test over the union's members, order-independent (the null-first canonical order is
+ * incidental).
+ *
+ * @param members  the union's member types
+ * @return         true iff one member is the `Null` unit type
+ */
+fn union_lists_null(members: []Type) -> bool {
+    mut i = 0
+    loop {
+        if i >= members.len { break }
+        match members[i] { Null => return true; _ => { } }
+        i++
+    }
+    false
+}
+
+/**
+ * C6/C2b — does a fitting LITERAL adopt the destination `to` (a return value, trailing expr, binding,
+ * argument, or struct-field slot)? A numeric literal adopts an int/float prim it fits or `byte`
+ * (B.36); into a UNION it adopts the sole numeric member it fits (C2b — ambiguous ≥2 does not). A
+ * bare `null` adopts a union listing `null` (or `Null` itself). RECURSES through a `match`/`if` whose
+ * every contributing arm trails an adopting literal (so `match k { U8 => 8; … } : u32` adopts, and
+ * `if b { 1 } else { null } : i32 | null` distributes each leaf over the same union). An empty/all-
+ * fitting array literal adopts a `[]E` slot element-wise.
+ *
+ * @param e   the typed literal (or `if`/`match`/array composite whose leaves are literals)
+ * @param to  the destination type the literal is checked against
+ * @return    true iff every contributing literal leaf fits `to` (or its matching member)
+ */
 fn literal_adopts(e: TExpr, to: Type) -> bool {
     match e.kind {
-        TNumber as n => match cast_kind(to) {
-            PrimKind as k => {
-                if n.is_float { prim_is_float(k) && float_fits(n.fval, k) }
-                else { prim_is_int(k) && value_fits(n.value, k) }
-            }
-            error => false
+        TNumber as n => match to {
+            Variant as v => match union_sole_numeric_member(n, v.members) { Type => true; error => false }
+            _ => number_fits_member(n, to)
         }
         TMatchExpr as m => {
             mut any = false
@@ -3764,21 +3833,44 @@ fn literal_adopts(e: TExpr, to: Type) -> bool {
             }
             _ => false
         }
+        TNullLit => match to {
+            Variant as v => union_lists_null(v.members)
+            Null => true
+            _ => false
+        }
         _ => false
     }
 }
 
-// (#71) RETYPE a value that `literal_adopts(e, to)` already accepted — the retyping twin of the
-// range-check above. A plain leaf (number/match/if trailing) adopts by taking `to` wholesale (the
-// existing single-site behavior at every adoption call site: binding/assign/arg/struct-field). An
-// ARRAY LITERAL instead retypes ELEMENT-WISE: each non-spread element recurses into the slice's
-// element type (so a nested array-of-arrays retypes at every depth), and the array's own `.type`
-// becomes `to` — mirrors literal_adopts's recursion structure exactly, one level deeper (it
-// REBUILDS the already-typed tree — TExpr/TArrayLit/TArrayElem are value types — rather than just
-// reporting fit). A spread element is already a concrete `[]T` — left untouched (its own widen was
-// checked at array-literal typing time, same as the read side above).
+/**
+ * (#71/C2b) RETYPE a value that `literal_adopts(e, to)` already accepted — the retyping twin of the
+ * range-check above. A plain scalar leaf adopts by taking `to` wholesale (binding/assign/arg/struct-
+ * field). Into a UNION `to`, a numeric leaf instead takes its sole fitting MEMBER (so `1` becomes
+ * `i32`, assignable into `i32 | null`) and a `null` leaf becomes `Null` — the leaf is born at the
+ * narrow member while the surrounding `if`/`match` becomes the union. An ARRAY LITERAL retypes
+ * ELEMENT-WISE: each non-spread element recurses into the slice's element type (so a nested array-of-
+ * arrays retypes at every depth), and the array's own `.type` becomes `to`. Mirrors `literal_adopts`'s
+ * recursion exactly, one level deeper (it REBUILDS the already-typed tree — TExpr/TArrayLit/TArrayElem
+ * are value types — rather than just reporting fit). A spread element is already a concrete `[]T` —
+ * left untouched (its own widen was checked at array-literal typing time, same as the read side above).
+ *
+ * @param e   the typed value whose literal leaves adopt `to`
+ * @param to  the destination type each contributing leaf is born at (a union → its matching member)
+ * @return    the value rebuilt with its literal leaves re-typed
+ */
 fn retype_literal(e: TExpr, to: Type) -> TExpr {
     match e.kind {
+        TNumber as n => match to {
+            Variant as v => match union_sole_numeric_member(n, v.members) {
+                Type as mem => TExpr { kind = e.kind; type = mem; line = e.line; col = e.col }
+                error => TExpr { kind = e.kind; type = to; line = e.line; col = e.col }
+            }
+            _ => TExpr { kind = e.kind; type = to; line = e.line; col = e.col }
+        }
+        TNullLit => match to {
+            Variant => TExpr { kind = e.kind; type = Null { }; line = e.line; col = e.col }
+            _ => TExpr { kind = e.kind; type = to; line = e.line; col = e.col }
+        }
         TArrayLit as a => match to {
             Slice as s => {
                 mut elems: []TArrayElem = teko::list::empty()
@@ -3845,6 +3937,122 @@ fn retype_block_trailing(stmts: []TStatement, to: Type) -> []TStatement {
             teko::list::push(out, last)
         }
         _ => stmts
+    }
+}
+
+/**
+ * (C2b) BORN every literal return-position leaf of a function body at a UNION return type `ret`, so a
+ * numeric or `null` leaf that `literal_adopts(_, ret)` accepted is retyped to its member before
+ * codegen (which wraps the member into the union tag). The pass is GATED on `ret` being a `Variant`:
+ * a scalar/`byte`/optional return keeps its body byte-identical (codegen truncates/wraps a bare leaf
+ * at the boundary exactly as before), so the change is purely additive to the new union case.
+ *
+ * @param stmts  the typed function-body statements
+ * @param ret    the function's declared return type
+ * @param table  the program's type table (for the already-assignable probe)
+ * @return       the body with its adopting union return/trailing leaves born at their member, else
+ *               `stmts` unchanged
+ */
+fn retype_union_returns(stmts: []TStatement, ret: Type, table: TypeTable) -> []TStatement {
+    match ret {
+        Variant => retype_return_positions(stmts, ret, table, true)
+        _ => stmts
+    }
+}
+
+/**
+ * Rebuilds a statement block, re-typing each RETURN-position literal leaf to the union `ret` (C2b).
+ * `retype_trailing` distinguishes a value block (a function body — its final expr-statement is a
+ * return-position value) from a loop/adopt body (no trailing value; only explicit `return`s inside
+ * it are return positions). Recurses through nested loop/adopt bodies and through an `if`/`match`
+ * used as a statement so a `return` in any branch is reached.
+ *
+ * @param stmts            the statement block
+ * @param ret              the union return type each return-position leaf adopts
+ * @param table            the program's type table
+ * @param retype_trailing  true iff the block's final expr-statement is a return-position value
+ * @return                 the block with its return-position literal leaves born at their member
+ */
+fn retype_return_positions(stmts: []TStatement, ret: Type, table: TypeTable, retype_trailing: bool) -> []TStatement {
+    if stmts.len == 0 { return stmts }
+    let last = stmts.len - 1
+    mut out: []TStatement = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= stmts.len { break }
+        out = teko::list::push(out, retype_return_stmt(stmts[i], ret, table, retype_trailing && i == last))
+        i++
+    }
+    out
+}
+
+/**
+ * Re-types the return-position literal leaves of a single statement to the union `ret` (C2b). An
+ * explicit `return e` and (when `is_trailing`) a trailing expr-statement retype their value via
+ * `retype_literal` gated on `literal_adopts` — which fires ONLY on a bare literal leaf (a number,
+ * `null`, or an `if`/`match`/array composite of them), so a value already typed as the union or a
+ * member (a var/call/error — `literal_adopts` is false) is left untouched. The `null` case is why
+ * assignability is NOT a pre-filter: a bare-`null` sentinel widens into the union yet still must be
+ * born at `Null` for codegen. A loop/adopt body recurses (returns only); an `if`/`match` statement
+ * recurses into its branches.
+ *
+ * @param s            the statement to rebuild
+ * @param ret          the union return type each return-position leaf adopts
+ * @param table        the program's type table
+ * @param is_trailing  true iff `s` is a return-position trailing expr-statement
+ * @return             the statement with its return-position literal leaves born at their member
+ */
+fn retype_return_stmt(s: TStatement, ret: Type, table: TypeTable, is_trailing: bool) -> TStatement {
+    match s {
+        TReturn as r => {
+            if !r.has_value { return s }
+            if !literal_adopts(r.value, ret) { return s }
+            TReturn { has_value = true; value = retype_literal(r.value, ret) }
+        }
+        TLoopStmt as l => TLoopStmt { label = l.label; init = l.init; body = retype_return_positions(l.body, ret, table, false) }
+        TAdoptStmt as a => TAdoptStmt { name = a.name; body = retype_return_positions(a.body, ret, table, false) }
+        TExprStmt as es => {
+            let inner = retype_returns_in_expr(es.expr, ret, table)
+            if is_trailing && !texpr_diverges(inner) && literal_adopts(inner, ret) {
+                TExprStmt { expr = retype_literal(inner, ret) }
+            } else {
+                TExprStmt { expr = inner }
+            }
+        }
+        _ => s
+    }
+}
+
+/**
+ * Recurses into an `if`/`match` used as a STATEMENT, re-typing the return-position leaves inside its
+ * branches to the union `ret` (C2b) — the branch bodies are not trailing values (the composite is a
+ * statement), so only their explicit `return`s are return positions. Any other expression is
+ * returned unchanged.
+ *
+ * @param e      the statement-expression
+ * @param ret    the union return type each nested return leaf adopts
+ * @param table  the program's type table
+ * @return       the expression with its branch return leaves born at their member
+ */
+fn retype_returns_in_expr(e: TExpr, ret: Type, table: TypeTable) -> TExpr {
+    match e.kind {
+        TIfExpr as f => {
+            let then_blk = retype_return_positions(f.then_blk, ret, table, false)
+            let else_blk = if f.has_else { retype_return_positions(f.else_blk, ret, table, false) } else { f.else_blk }
+            TExpr { kind = TIfExpr { cond = f.cond; then_blk = then_blk; has_else = f.has_else; else_blk = else_blk }; type = e.type; line = e.line; col = e.col }
+        }
+        TMatchExpr as m => {
+            mut arms: []TArm = teko::list::empty()
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                let ar = m.arms[i]
+                arms = teko::list::push(arms, TArm { pattern = ar.pattern; has_when = ar.has_when; guard = ar.guard; body = retype_return_positions(ar.body, ret, table, false) })
+                i++
+            }
+            TExpr { kind = TMatchExpr { subject = m.subject; arms = arms }; type = e.type; line = e.line; col = e.col }
+        }
+        _ => e
     }
 }
 
@@ -4311,6 +4519,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     match check_trailing_value(tb.stmts, ret, table) { null => { }; error as e => return e }
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())
     if lc.failed { return error { message = lc.message } }
+    let ret_stmts = retype_union_returns(tb.stmts, ret, table)
     // (W10b.CLASS / #98 Option A) PREPEND the base-binding as the method body's FIRST statement: a
     // synthetic `let <binding>: <Base> = <self>` — self UPCAST to the base, NOT a reinterpret-cast.
     // Binding self (the concrete subclass) with the base-typed `bound` lets emit_as build the D3 fat
@@ -4328,10 +4537,10 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
         let bind_stmt = TBinding { kind = parser::BindKind::Let; target = parser::SimpleName { name = base_binding_name }; bound = Named { name = if name_qualifier(base_name) != "" { base_name } else { qualify(env.cur_ns, base_name) } }; value = cast_val }   // (#109 W3 / #152) canonical: base_name arrives PRE-QUALIFIED from canon_class_bases; a bare one qualifies by the class's own ns
         mut prefixed: []TStatement = teko::list::push(teko::list::empty(), bind_stmt)
         mut si = 0
-        loop { if si >= tb.stmts.len { break }; prefixed = teko::list::push(prefixed, tb.stmts[si]); si++ }
+        loop { if si >= ret_stmts.len { break }; prefixed = teko::list::push(prefixed, ret_stmts[si]); si++ }
         prefixed
     } else {
-        tb.stmts
+        ret_stmts
     }
     let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
     match check_ref_storability(tf) { null => { }; error as e => return e }
@@ -4687,7 +4896,8 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())   // W5-cf-2: loop labels resolve + are unique
     if lc.failed { return error { message = lc.message } }
     match check_must_free(f, tbl, env.cur_ns, tb.stmts, table) { null => { }; error as e => return e }
-    let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = tb.stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }   // (#49/E3) namespace/file/line stamped by type_item from the parsed item
+    let ret_stmts = retype_union_returns(tb.stmts, ret, table)
+    let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = ret_stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
     match check_ref_storability(tf) { null => { }; error as e => return e }
     tf
 }
