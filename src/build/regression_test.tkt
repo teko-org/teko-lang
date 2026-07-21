@@ -1,0 +1,134 @@
+/**
+ * regr_have_teko — is a built `bin/teko` present in the current project (the gen1 self-build CI
+ * always produces one before `teko test .`)? The end-to-end regression tests drive that binary to
+ * compile the fixture regressives; when it is absent (a bare `teko test .` with no prior build) they
+ * honest-skip rather than hard-fail.
+ *
+ * @return true when `bin/teko` exists
+ */
+fn regr_have_teko() -> bool {
+    match teko::fs::list_dir("bin") {
+        []str as e => {
+            mut k: u64 = 0
+            loop {
+                if k >= e.len { break }
+                if e[k] == "teko" { return true }
+                k = k + 1
+            }
+            false
+        }
+        error => false
+    }
+}
+
+/**
+ * regr_exe — the absolute path to this project's built `bin/teko`, used as the compiler that builds
+ * each fixture regressive during the end-to-end tests.
+ *
+ * @return the absolute `bin/teko` path
+ */
+fn regr_exe() -> str {
+    let cwd = match teko::env::cwd() { str as c => c; error => "" }
+    cwd ~ "/bin/teko"
+}
+
+/**
+ * regr_manifest_for — a synthetic `Manifest` whose `[tests] regression` names a single `source`, for
+ * driving `run_regression_sources` directly in a test.
+ *
+ * @param source  the regression source path
+ * @param gate    whether a failing regressive gates (`[tests] gate`)
+ * @return        the parsed manifest
+ */
+fn regr_manifest_for(source: str, gate: bool) -> Manifest {
+    let g = if gate { "true" } else { "false" }
+    let src = teko::str::concat("name = \"h\"\nsource = \"src\"\n[tests]\ngate = ", teko::str::concat(g, teko::str::concat("\nregression = [\"", teko::str::concat(source, "\"]\n"))))
+    match parse_manifest(src) { Manifest as m => m; error => parse_manifest_or_die() }
+}
+
+/**
+ * parse_manifest_or_die — the unreachable fallback for `regr_manifest_for` (the literal source it
+ * builds always parses); returns a trivially-valid manifest so the helper stays total.
+ *
+ * @return a minimal valid manifest
+ */
+fn parse_manifest_or_die() -> Manifest {
+    match parse_manifest("name = \"h\"\nsource = \"src\"\n") { Manifest as m => m; error => parse_manifest_or_die() }
+}
+
+#test
+/**
+ * regression_runs_and_passes_a_good_regressive — the end-to-end proof (passing case): the runner
+ * discovers, compiles, runs, and CHECKS the `exit_ok` fixture regressive, which prints "ok" and
+ * exits 3 (the `.tkr` checks both stdout and exit, and passes three argv operands through the
+ * runner's plumbing). Honest-skips when `bin/teko` is absent.
+ *
+ * @return void
+ */
+fn regression_runs_and_passes_a_good_regressive() {
+    if !regr_have_teko() { teko::assert::is_true(true); return }
+    let oc = run_one_regressive(regr_exe(), "examples/regression-fixture/regressions/exit_ok", "test.tkr", "bin/.regr-test/pass")
+    teko::assert::is_true(oc.ok)
+}
+
+#test
+/**
+ * regression_reports_a_bad_regressive_as_failure — the end-to-end proof (failing case): the
+ * `exit_bad` fixture exits 3 but its `.tkr` expects 99, so the runner must report a NON-skipped
+ * failure. Honest-skips when `bin/teko` is absent.
+ *
+ * @return void
+ */
+fn regression_reports_a_bad_regressive_as_failure() {
+    if !regr_have_teko() { teko::assert::is_true(true); return }
+    let oc = run_one_regressive(regr_exe(), "examples/regression-fixture/regressions-fail/exit_bad", "test.tkr", "bin/.regr-test/fail")
+    teko::assert::is_false(oc.ok)
+    teko::assert::is_false(oc.skipped)
+}
+
+#test
+/**
+ * regression_source_discovery_gates — driving `run_regression_sources` over the fixture: the passing
+ * `regressions/` source returns 0 (green), and the failing `regressions-fail/` source with gating on
+ * returns 1 (the failure gates the run). Honest-skips when `bin/teko` is absent.
+ *
+ * @return void
+ */
+fn regression_source_discovery_gates() {
+    if !regr_have_teko() { teko::assert::is_true(true); return }
+    let exe = regr_exe()
+    let good = regr_manifest_for("examples/regression-fixture/regressions", true)
+    teko::assert::is_true(run_regression_sources(exe, good) == 0)
+    let bad = regr_manifest_for("examples/regression-fixture/regressions-fail", true)
+    teko::assert::is_true(run_regression_sources(exe, bad) == 1)
+}
+
+#test
+/**
+ * regression_gate_false_is_advisory — with `[tests] gate = false` a failing regressive does NOT gate
+ * the run (returns 0), proving the advisory mode. Honest-skips when `bin/teko` is absent.
+ *
+ * @return void
+ */
+fn regression_gate_false_is_advisory() {
+    if !regr_have_teko() { teko::assert::is_true(true); return }
+    let advisory = regr_manifest_for("examples/regression-fixture/regressions-fail", false)
+    teko::assert::is_true(run_regression_sources(regr_exe(), advisory) == 0)
+}
+
+#test
+/**
+ * regression_phase_is_anti_recursive — with `TEKO_IN_REGRESSION` already set, `run_regression_phase`
+ * REFUSES to start a phase and returns 0 EVEN for a gating failing source (which would otherwise
+ * return 1) — the backstop against a regressive re-entering discovery. Honest-skips when `bin/teko`
+ * is absent. Defined last: it leaves the sentinel set for the rest of the process, which only
+ * affects `run_regression_phase` (the other tests call the sentinel-free core).
+ *
+ * @return void
+ */
+fn regression_phase_is_anti_recursive() {
+    if !regr_have_teko() { teko::assert::is_true(true); return }
+    match teko::env::set_var("TEKO_IN_REGRESSION", "1") { error => { }; null => { } }
+    let bad = regr_manifest_for("examples/regression-fixture/regressions-fail", true)
+    teko::assert::is_true(run_regression_phase(regr_exe(), bad) == 0)
+}

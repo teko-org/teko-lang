@@ -1,0 +1,183 @@
+/**
+ * tkr_parses — did the `.tkr` source parse successfully?
+ *
+ * @param src  the `.tkr` text
+ * @return     true when `parse_tkr` returns a `Tkr`
+ */
+fn tkr_parses(src: str) -> bool {
+    match parse_tkr(src) { Tkr => true; error => false }
+}
+
+#test
+/**
+ * tkr_exit_kind_full — the common `exit` regressive: fold-opaque `args`, an `exit` oracle, and a
+ * literal `stdout`. Absent `kind` defaults to `Exit`.
+ *
+ * @return void
+ */
+fn tkr_exit_kind_full() {
+    let src = "args = [\"7\", \"13\", \"5\"]\nexit = 42\nstdout = \"checksum=42\\n\"\n"
+    match parse_tkr(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.kind == TkrKind::Exit)
+            teko::assert::is_true(t.args.len == 3)
+            teko::assert::is_true(t.args[0] == "7")
+            teko::assert::is_true(t.args[2] == "5")
+            teko::assert::is_true(t.exit == 42)
+            teko::assert::is_true(t.stdout.mode == TkrMatchMode::Literal)
+            teko::assert::is_true(t.stdout.text == "checksum=42\\n")
+            teko::assert::is_true(t.stderr.mode == TkrMatchMode::Ignore)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_print_kind_sha256 — a `print` regressive whose stdout is checked by sha256 (large/binary
+ * output). `stdin` is fed as an opaque secondary channel.
+ *
+ * @return void
+ */
+fn tkr_print_kind_sha256() {
+    let src = "kind = \"print\"\nstdin = \"hello\"\nexit = 0\nstdout_sha256 = \"deadbeef\"\n"
+    match parse_tkr(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.kind == TkrKind::Print)
+            teko::assert::is_true(t.stdin == "hello")
+            teko::assert::is_true(t.stdout.mode == TkrMatchMode::Sha256)
+            teko::assert::is_true(t.stdout.text == "deadbeef")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_trap_kind — a `trap` regressive (non-zero-only comparison).
+ *
+ * @return void
+ */
+fn tkr_trap_kind() {
+    match parse_tkr("kind = \"trap\"\n") {
+        Tkr as t => teko::assert::is_true(t.kind == TkrKind::Trap)
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_compile_fail_diagnostic — a `compile_fail` regressive pins the required diagnostic substring
+ * (the strict upgrade over the legacy marker-only check).
+ *
+ * @return void
+ */
+fn tkr_compile_fail_diagnostic() {
+    let src = "kind = \"compile_fail\"\ndiagnostic = \"`_` is a write-only discard\"\n"
+    match parse_tkr(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.kind == TkrKind::CompileFail)
+            teko::assert::is_true(t.diagnostic == "`_` is a write-only discard")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_targets_forms — `targets` accepts the array form and a bare string (normalized to a 1-element
+ * list, including the `"all"` sentinel).
+ *
+ * @return void
+ */
+fn tkr_targets_forms() {
+    match parse_tkr("targets = [\"x86_64\", \"wasm\"]\n") {
+        Tkr as t => { teko::assert::is_true(t.targets.len == 2); teko::assert::is_true(t.targets[1] == "wasm") }
+        error => teko::assert::is_true(false)
+    }
+    match parse_tkr("targets = \"all\"\n") {
+        Tkr as t => { teko::assert::is_true(t.targets.len == 1); teko::assert::is_true(t.targets[0] == "all") }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_expect_override — a `[expect.<os-arch>]` sub-table overrides the exit/stdout for one os-arch;
+ * `tkr_expect_for` resolves it and returns `null` for an unlisted os-arch.
+ *
+ * @return void
+ */
+fn tkr_expect_override() {
+    let src = "exit = 42\n[expect.wasm]\nexit = 7\nstdout = \"w\"\n"
+    match parse_tkr(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.exit == 42)
+            teko::assert::is_true(t.expect.len == 1)
+            match tkr_expect_for(t, "wasm") {
+                TkrExpect as e => {
+                    teko::assert::is_true(e.has_exit)
+                    teko::assert::is_true(e.exit == 7)
+                    teko::assert::is_true(e.stdout.mode == TkrMatchMode::Literal)
+                    teko::assert::is_true(e.stdout.text == "w")
+                }
+                null => teko::assert::is_true(false)
+            }
+            match tkr_expect_for(t, "x86_64") { TkrExpect => teko::assert::is_true(false); null => teko::assert::is_true(true) }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_golden_table — a `[golden.<os-arch>]` sub-table pins the opt-in byte golden hash for one
+ * os-arch.
+ *
+ * @return void
+ */
+fn tkr_golden_table() {
+    let src = "exit = 0\n[golden.x86_64-linux]\nsha256 = \"abc123\"\n"
+    match parse_tkr(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.golden.len == 1)
+            teko::assert::is_true(t.golden[0].osarch == "x86_64-linux")
+            teko::assert::is_true(t.golden[0].sha256 == "abc123")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_defaults — an empty `.tkr` yields the safe defaults: `Exit` kind, exit 0, ignored streams,
+ * no args, no targets.
+ *
+ * @return void
+ */
+fn tkr_defaults() {
+    match parse_tkr("") {
+        Tkr as t => {
+            teko::assert::is_true(t.kind == TkrKind::Exit)
+            teko::assert::is_true(t.exit == 0)
+            teko::assert::is_true(t.args.len == 0)
+            teko::assert::is_true(t.targets.len == 0)
+            teko::assert::is_true(t.stdout.mode == TkrMatchMode::Ignore)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_rejects_malformed — a malformed line (missing `=`), an unknown `kind`, and a non-list `args`
+ * value are honest errors (M.3); a well-formed source still parses.
+ *
+ * @return void
+ */
+fn tkr_rejects_malformed() {
+    teko::assert::is_false(tkr_parses("exit 42\n"))
+    teko::assert::is_false(tkr_parses("kind = \"bogus\"\n"))
+    teko::assert::is_false(tkr_parses("args = 42\n"))
+    teko::assert::is_true(tkr_parses("exit = 1\n"))
+}
