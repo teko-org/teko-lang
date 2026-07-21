@@ -530,7 +530,30 @@ fn inline_place_item(out: []TItem, it: TItem, map: ScalarConstMap) -> []TItem {
  */
 pub fn inline_consts(prog: TProgram) -> TProgram | error {
     let substituted = match substitute_module_consts(prog) { error as e => return e; TProgram as sp => sp }
-    fold_program(propagate_locals(substituted))
+    let agg = match build_module_agg_map(substituted) { error as e => return e; ScalarConstMap as m => m }
+    fold_program(propagate_locals(substituted), agg)
+}
+
+/**
+ * build_module_agg_map — the module-aggregate resolution table the Layer-1c index fold reads (CF4),
+ * built ONCE from the substituted program: collect the module consts, order them by dependency, and
+ * collapse every AGGREGATE const's initializer (`build_aggregate_map`, the same table the C-backend
+ * aggregate inliner uses). A `TVar` receiver of a const `TIndex` resolves through this map, so `G[0]`
+ * folds to its element without inlining `G` (the shared-rodata model is preserved — only the specific
+ * `G[i]` sites fold; every other use of `G` stays a single interned `TVar`). A const-free program
+ * yields the empty map. Distinct from `inline_aggregate_consts`, which substitutes every aggregate
+ * reference and is C-backend-only.
+ *
+ * @param prog  the scalar-substituted typed program
+ * @return      the module-aggregate resolution table, or a located cycle error (`const_dep_order`)
+ * @throws      a located error when the module-level consts form a reference cycle
+ * @since #comptime-fold
+ */
+pub fn build_module_agg_map(prog: TProgram) -> AggConstMap | error {
+    let consts = collect_module_consts(prog.items)
+    if consts.len == 0 { return ScalarConstMap { names = teko::list::empty(); nss = teko::list::empty(); inits = teko::list::empty() } }
+    let ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
+    build_aggregate_map(ordered)
 }
 
 /**

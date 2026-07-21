@@ -330,7 +330,7 @@ fn fold_rejects_nonscalar_form() {
  * @param want  the expected reconstructed i128 carrier
  */
 fn cf_folds_to_num(e: TExpr, want: i128) {
-    match fold_expr(e, empty_table(), empty_env()) {
+    match fold_expr(e, empty_table(), empty_env(), empty_agg()) {
         error => teko::assert::is_true(false)
         TExpr as f => match f.kind {
             TNumber as n => teko::assert::is_true(!n.is_float && n.value == want)
@@ -346,7 +346,7 @@ fn cf_folds_to_num(e: TExpr, want: i128) {
  * @param e  the const op-tree whose fold must fail
  */
 fn cf_fold_errors(e: TExpr) {
-    match fold_expr(e, empty_table(), empty_env()) {
+    match fold_expr(e, empty_table(), empty_env(), empty_agg()) {
         error => teko::assert::is_true(true)
         TExpr => teko::assert::is_true(false)
     }
@@ -359,7 +359,7 @@ fn cf_fold_errors(e: TExpr) {
  * @param e  the op-tree the driver must leave as a `TUnary`
  */
 fn cf_fold_stays_unary(e: TExpr) {
-    match fold_expr(e, empty_table(), empty_env()) {
+    match fold_expr(e, empty_table(), empty_env(), empty_agg()) {
         error => teko::assert::is_true(false)
         TExpr as f => match f.kind { TUnary => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
     }
@@ -872,7 +872,7 @@ fn fold_expr_partial_tree() {
     let x = te(TVar { name = "x"; is_func = false; func_ns = "teko::checker" }, u64t())
     let mask = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u64t()), u64t())
     let e = cf_bin(lexer::TokenKind::Amp, x, mask, u64t())
-    match fold_expr(e, empty_table(), empty_env()) {
+    match fold_expr(e, empty_table(), empty_env(), empty_agg()) {
         error => teko::assert::is_true(false)
         TExpr as f => match f.kind {
             TBinary as b => {
@@ -902,7 +902,7 @@ fn fold_expr_leaves_unrepresentable_u128() {
 #test
 fn fold_expr_leaves_float_optree() {
     let e = cf_bin(lexer::TokenKind::Plus, cf_fnum(1.5), cf_fnum(2.5), f64t())
-    match fold_expr(e, empty_table(), empty_env()) {
+    match fold_expr(e, empty_table(), empty_env(), empty_agg()) {
         error => teko::assert::is_true(false)
         TExpr as f => match f.kind { TBinary => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
     }
@@ -1112,7 +1112,7 @@ fn cf_interp_of(hole: TExpr, sp: TFSpec) -> TExpr {
 fn fold_interp_folds_hex() {
     let e = cf_interp_of(cf_num(255 to i128, u64t()), cf_spec_static("X"))
     match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
             error => teko::assert::is_true(false)
             TExpr as f => match f.kind {
                 TStrLit as s => teko::assert::is_true(s.text == "FF")
@@ -1138,7 +1138,7 @@ fn fold_interp_multi_piece() {
     specs = teko::list::push(specs, cf_spec_static("X"))
     let e = te(TInterp { pieces = pieces; holes = holes; specs = specs }, strt())
     match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
             error => teko::assert::is_true(false)
             TExpr as f => match f.kind {
                 TStrLit as s => teko::assert::is_true(s.text == "v=255 x=FF")
@@ -1159,7 +1159,7 @@ fn fold_interp_runtime_hole_stays() {
     let hole = te(TVar { name = "x"; is_func = false; func_ns = "teko::checker" }, u64t())
     let e = cf_interp_of(hole, cf_spec_static("X"))
     match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
             error => teko::assert::is_true(false)
             TExpr as f => match f.kind {
                 TInterp => teko::assert::is_true(true)
@@ -1178,7 +1178,7 @@ fn fold_interp_runtime_hole_stays() {
 fn fold_interp_float_hole_stays() {
     let e = cf_interp_of(cf_fnum(1.5), cf_spec_static("f2"))
     match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
             error => teko::assert::is_true(false)
             TExpr as f => match f.kind {
                 TInterp => teko::assert::is_true(true)
@@ -1227,7 +1227,7 @@ fn fold_interp_dynamic_spec_stays() {
     let dyn_spec = TFSpec { kind = TFSpecDynamic { args = teko::list::push(teko::list::empty(), cf_var("w", u64t())) } }
     let e = cf_interp_of(cf_num(255 to i128, u64t()), dyn_spec)
     match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env()) {
+        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
             error => teko::assert::is_true(false)
             TExpr as f => match f.kind {
                 TInterp => teko::assert::is_true(true)
@@ -1385,4 +1385,61 @@ fn cf_can_index_rejects_runtime_index() {
 fn cf_can_index_rejects_runtime_receiver() {
     let ix = TIndex { receiver = cf_var("a", bytet()); index = cf_num(0 to i128, u64t()) }
     teko::assert::is_true(!cf_can_index(ix, empty_agg()))
+}
+
+/**
+ * cf_fold_stays_index — assert `fold_expr` over the map `agg` leaves `e`'s top-level kind a `TIndex`
+ * (the index stays runtime, not folded to a literal).
+ *
+ * @param e    the index expression to fold
+ * @param agg  the module-aggregate resolution table
+ */
+fn cf_fold_stays_index(e: TExpr, agg: AggConstMap) {
+    match fold_expr(e, empty_table(), empty_env(), agg) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind {
+            TIndex => teko::assert::is_true(true)
+            _ => teko::assert::is_true(false)
+        }
+    }
+}
+
+/**
+ * fold_leaves_runtime_index_runtime — the noflod-runtime-index negative: `G[i]` with a RUNTIME index
+ * `i` (a `TVar`, not a const integer) stays a runtime `TIndex` through the fold, even though `G` is a
+ * foldable module aggregate const — behavior identical to today.
+ */
+#test
+fn fold_leaves_runtime_index_runtime() {
+    let e = te(TIndex { receiver = cf_var("G", bytet()); index = cf_var("i", u64t()) }, bytet())
+    cf_fold_stays_index(e, cf_agg_g())
+}
+
+/**
+ * fold_leaves_runtime_receiver_runtime — the noflod-runtime-recv negative: `a[0]` on a RUNTIME
+ * receiver `a` (a param absent from the map) stays a runtime `TIndex` through the fold.
+ */
+#test
+fn fold_leaves_runtime_receiver_runtime() {
+    let e = te(TIndex { receiver = cf_var("a", bytet()); index = cf_num(0 to i128, u64t()) }, bytet())
+    cf_fold_stays_index(e, empty_agg())
+}
+
+/**
+ * fold_collapses_module_agg_index — the fixture-D fold: `(G[0] to u64) to i32` over the module-agg map
+ * collapses through `cf_fold_int`'s TIndex arm to the bare literal `31` (a `TNumber`), the enclosing
+ * casts folded away — the whole index+cast tree is a compile-time literal on both engines.
+ */
+#test
+fn fold_collapses_module_agg_index() {
+    let idx = te(TIndex { receiver = cf_var("G", bytet()); index = cf_num(0 to i128, u64t()) }, bytet())
+    let widened = cf_cast(idx, u64t())
+    let e = cf_cast(widened, i32t())
+    match fold_expr(e, empty_table(), empty_env(), cf_agg_g()) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind {
+            TNumber as n => teko::assert::is_true(n.value == (31 to i128))
+            _ => teko::assert::is_true(false)
+        }
+    }
 }
