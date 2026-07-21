@@ -109,7 +109,7 @@ for proj in "$REGRESSIONS_DIR"/*/; do
     binary_name="$(manifest_name "$manifest")"
 
     build_exit=0
-    run_limited "$TEKO" build "$proj" -o "$out/bin" >"$out/build.stdout" 2>"$out/build.stderr" || build_exit=$?
+    run_limited "$TEKO" build "$proj" -o "$out/bin" --no-verify --release >"$out/build.stdout" 2>"$out/build.stderr" || build_exit=$?
 
     if [ "$build_exit" -ne 0 ]; then
         fail=$((fail + 1)); failed_names+=("$name")

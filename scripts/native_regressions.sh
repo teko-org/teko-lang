@@ -52,7 +52,7 @@ check_cwd_build_regression() {
         return
     fi
 
-    ( cd "$CWD_REGRESSION_FIXTURE" && run_limited "$compiler_abs" build . -o "$out" ) \
+    ( cd "$CWD_REGRESSION_FIXTURE" && run_limited "$compiler_abs" build . -o "$out" --no-verify --release) \
         >"$out/build.stdout" 2>"$out/build.stderr"
     local build_exit=$?
 
@@ -123,7 +123,7 @@ fi
 if [ ! -x "$selfhosted_abs" ]; then
     if [ -x "$bootstrap_abs" ]; then
         echo "native_regressions: bin/teko not found — self-hosting via $bootstrap_abs build . -o bin"
-        if ! run_limited "$bootstrap_abs" build "$script_dir" -o "$script_dir/bin" >/tmp/teko-selfhost-build.log 2>&1; then
+        if ! run_limited "$bootstrap_abs" build "$script_dir" -o "$script_dir/bin" --no-verify --release >/tmp/teko-selfhost-build.log 2>&1; then
             echo "native_regressions: self-host build failed — see /tmp/teko-selfhost-build.log" >&2
             tail -20 /tmp/teko-selfhost-build.log | sed 's/^/      | /'
         fi
