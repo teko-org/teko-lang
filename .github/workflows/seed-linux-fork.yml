@@ -1,0 +1,68 @@
+# .github/workflows/seed-linux-fork.yml
+# Fork-scoped Linux x86-64 seed cut — LOCKED CI: push-only, this branch only, fork only.
+# A dry, single-artifact companion to the canonical multi-platform `release.yml` (org).
+# NO gen1/2/3 fixpoint, NO tests (those run where they belong — PR CI + the real seed cut).
+# Just: seed-bootstrap → `teko build . --no-verify --release` → tar the binary → publish on the fork.
+# Agents/CI then: `TEKO_REPO=<fork> sh scripts/fetch_teko.sh`.
+#
+# Cut a fork seed: merge the umbrella into `seed/linux-x86_64`, bump teko.tkp's build field, push.
+# The fork's Actions settings must ALLOW the push-trigger on this branch (the org push-CI
+# restriction does not cover it).
+name: Fork Seed (Linux x86-64)
+
+on:
+  push:
+    branches: [seed/linux-x86_64]
+
+permissions:
+  contents: write   # publish the fork release
+
+concurrency:
+  group: seed-linux-fork
+  cancel-in-progress: true
+
+jobs:
+  cut:
+    # fork only — never runs if this file ever lands on the org
+    if: github.repository == 'schivei/teko-lang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive tag from teko.tkp
+        id: ver
+        run: |
+          set -eu
+          V="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' teko.tkp | head -1)"
+          S="$(sed -n 's/^suffix[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' teko.tkp | head -1)"
+          echo "tag=v${V}${S:+-$S}" >> "$GITHUB_OUTPUT"
+
+      - name: Bootstrap seed (newest available release)
+        run: ./scripts/ci_provision_teko.sh linux-x86_64-glibc
+
+      - name: Build the seed — dry, no gate, no fixpoint
+        run: |
+          set -eu
+          mkdir -p out
+          teko build . --no-verify --release -o out
+          test -x out/teko
+
+      - name: Package (binary at tarball root — fetch_teko.sh extracts to .teko/teko)
+        run: tar -C out -czf teko-linux-x86_64-glibc.tar.gz teko
+
+      - name: Publish/refresh the fork release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -eu
+          PRERELEASE=""; case "$V" in *-*) PRERELEASE="--prerelease" ;; esac
+          if gh release view "$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$V" teko-linux-x86_64-glibc.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$V" teko-linux-x86_64-glibc.tar.gz --repo "$GITHUB_REPOSITORY" \
+              --title "$V (fork seed — linux-x86_64-glibc)" \
+              --notes "Dry fork-scoped Linux x86-64 seed for agent/CI validation. Canonical multi-platform release lives on the org." \
+              $PRERELEASE
+          fi
