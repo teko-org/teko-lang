@@ -445,7 +445,78 @@ fn eval_cast_expr(c: TCast, e: TExpr, table: TypeTable, env: Env, agg: AggConstM
 fn apply_cast(v: ConstValue, target: Type, e: TExpr) -> ConstValue | error {
     match int_info(target) {
         IntInfo as dst => cast_to_int(v, target, dst, e)
-        error => const_form_error("comptime fold: this cast target is not yet supported (#comptime-fold)", e)
+        error => cast_to_non_int(v, target, e)
+    }
+}
+
+/**
+ * cast_to_non_int — convert a folded value to a NON-integer cast target the comptime fold supports.
+ * The sole such target is `[]byte`: a folded `str`/`char` (`CVBytes`) coerced to `[]byte` (CF4c) folds
+ * to the byte-array const value (a `CVAgg` whose elements are the string's raw UTF-8 bytes, so an
+ * enclosing `.len`/index over the coercion also folds — the same rodata bytes the `str_to_bytes`
+ * lowering emits, materialized at the const level). Every other non-integer target is a located error
+ * until a later crumb folds it.
+ *
+ * @param v       the folded operand value
+ * @param target  the cast's target type
+ * @param e       the enclosing expression (positions any error)
+ * @return        the byte-array aggregate value, or a located error
+ * @since #comptime-fold
+ */
+fn cast_to_non_int(v: ConstValue, target: Type, e: TExpr) -> ConstValue | error {
+    if !is_byte_slice(target) { return const_form_error("comptime fold: this cast target is not yet supported (#comptime-fold)", e) }
+    match v.kind {
+        CVBytes as cb => cv_agg(bytes_to_cv_elems(cb.data))
+        _ => const_form_error("comptime fold: only a const string coerces to a byte-array const (#comptime-fold)", e)
+    }
+}
+
+/**
+ * bytes_to_cv_elems — the byte-array aggregate elements of a raw byte sequence: each byte as its own
+ * `byte`-typed `CVInt`, in order (the `str -> []byte` coercion's const value, CF4c). Index order is
+ * byte order, so an index/`.len` over the coercion reads exactly the rodata `str_to_bytes` emits.
+ *
+ * @param data  the raw bytes
+ * @return      one `byte` `CVInt` per byte, in order
+ * @since #comptime-fold
+ */
+fn bytes_to_cv_elems(data: []byte) -> []ConstValue {
+    mut out: []ConstValue = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= data.len { break }
+        out = teko::list::push(out, cv_int(data[i] to u128, Byte { }))
+        i++
+    }
+    out
+}
+
+/**
+ * is_byte_slice — is `t` the `[]byte` type (a `Slice` whose element is `byte`)? The one non-integer
+ * cast target the comptime fold coerces a const string into (CF4c).
+ *
+ * @param t  the type to classify
+ * @return   true iff `t` is `[]byte`
+ * @since #comptime-fold
+ */
+fn is_byte_slice(t: Type) -> bool {
+    match t {
+        Slice as sl => is_byte_type(sl.element)
+        _ => false
+    }
+}
+
+/**
+ * is_byte_type — is `t` the `byte` type? The element type a `[]byte` coercion target carries.
+ *
+ * @param t  the type to classify
+ * @return   true iff `t` is `byte`
+ * @since #comptime-fold
+ */
+fn is_byte_type(t: Type) -> bool {
+    match t {
+        Byte => true
+        _ => false
     }
 }
 
@@ -852,22 +923,23 @@ fn index_carrier(ci: CVInt) -> i128? {
 }
 
 /**
- * eval_field_expr — evaluate a `TFieldAccess` of a const receiver: `.len` of a const aggregate or
- * const string yields its element/byte count (`eval_len_field`, CF4d). The `cf_can_fold_field` gate
- * proves the receiver is const and the field foldable before the fold reaches here, so a non-foldable
- * field is a soft located error (the fold then leaves the access runtime).
+ * eval_field_expr — evaluate a `TFieldAccess` of a const receiver (CF4c/CF4d): `.len` of a const
+ * aggregate or const string yields its element/byte count (`eval_len_field`); a struct field of a const
+ * struct yields that field's const value (`eval_struct_field`). The `cf_can_fold_field` gate proves the
+ * receiver is const and the field foldable before the fold reaches here, so a non-foldable field is a
+ * soft located error (the fold then leaves the access runtime).
  *
  * @param fa     the typed field-access node
  * @param e      the enclosing expression (its type is the field's type; positions any error)
- * @param table  the type table (forwarded to the receiver eval)
- * @param env    the environment (forwarded to the receiver eval)
+ * @param table  the type table (forwarded to the receiver/field eval)
+ * @param env    the environment (forwarded to the receiver/field eval)
  * @param agg    the module-aggregate resolution table (resolves a module-const receiver)
  * @return       the field's comptime value, or a located error
  * @since #comptime-fold
  */
 fn eval_field_expr(fa: TFieldAccess, e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -> ConstValue | error {
     if is_len_field(fa) { return eval_len_field(fa, e, table, env, agg) }
-    const_form_error("comptime fold: this field access is not a foldable `.len` (#comptime-fold)", e)
+    eval_struct_field(fa, e, table, env, agg)
 }
 
 /**
@@ -927,6 +999,106 @@ fn value_length(v: ConstValue) -> u64? {
     }
 }
 
+/**
+ * eval_struct_field — evaluate `recv.field` of a const struct receiver (CF4c): resolve the receiver to
+ * its `TStructInit`, pick the initializer of the named field, and evaluate that. A receiver that is not
+ * a const struct, or a field the struct-init does not carry, is a soft located error (the fold then
+ * leaves the access runtime).
+ *
+ * @param fa     the typed field-access node
+ * @param e      the enclosing expression (its type is the field's type; positions any error)
+ * @param table  the type table (forwarded to the field-value eval)
+ * @param env    the environment (forwarded to the field-value eval)
+ * @param agg    the module-aggregate resolution table (resolves a module-const struct receiver)
+ * @return       the field's comptime value, or a located error
+ * @since #comptime-fold
+ */
+fn eval_struct_field(fa: TFieldAccess, e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -> ConstValue | error {
+    match struct_field_init(fa.receiver, fa.field, agg) {
+        null => const_form_error("comptime fold: field-access receiver is not a const struct (#comptime-fold)", e)
+        TExpr as fv => eval_const(fv, table, env, agg)
+    }
+}
+
+/**
+ * struct_field_init — the initializer expression of field `field` in the const struct `recv` names, or
+ * null when `recv` is not a resolvable const struct or carries no such field. Resolves an in-tree
+ * `TStructInit` receiver directly and a module-const-struct `TVar` receiver through the aggregate map
+ * (CF4c); a local struct binding — deliberately NOT propagated by `propagate_locals` — resolves to null
+ * and stays runtime.
+ *
+ * @param recv   the field-access receiver expression
+ * @param field  the accessed field's name
+ * @param agg    the module-aggregate resolution table
+ * @return       the field's initializer expression, or null
+ * @since #comptime-fold
+ */
+fn struct_field_init(recv: TExpr, field: str, agg: AggConstMap) -> TExpr? {
+    match resolve_struct_init(recv, agg) {
+        null => null
+        TStructInit as si => field_init_by_name(si, field)
+    }
+}
+
+/**
+ * resolve_struct_init — the `TStructInit` a const-struct receiver denotes: an in-tree struct literal
+ * directly, or a module-const-struct `TVar` resolved through the aggregate map (CF4c). Every other
+ * receiver (a local binding, a runtime leaf, a non-struct const) resolves to null, so the field access
+ * stays runtime.
+ *
+ * @param recv  the field-access receiver expression
+ * @param agg   the module-aggregate resolution table
+ * @return      the struct initializer, or null when the receiver is not a const struct
+ * @since #comptime-fold
+ */
+fn resolve_struct_init(recv: TExpr, agg: AggConstMap) -> TStructInit? {
+    match recv.kind {
+        TStructInit as si => si
+        TVar as v => resolve_struct_init_var(v, agg)
+        _ => null
+    }
+}
+
+/**
+ * resolve_struct_init_var — the `TStructInit` a `TVar` receiver names when it is a module const struct
+ * recorded in `agg`, or null otherwise (a fn-value, a local, a scalar/non-struct const, a
+ * different-module name). Mirrors `eval_agg_ref`'s resolution but keeps only the struct-init case.
+ *
+ * @param v    the reference node
+ * @param agg  the module-aggregate resolution table
+ * @return     the referenced struct initializer, or null
+ * @since #comptime-fold
+ */
+fn resolve_struct_init_var(v: TVar, agg: AggConstMap) -> TStructInit? {
+    if v.is_func { return null }
+    match agg_const_init(agg, v.name, v.func_ns) {
+        null => null
+        TExpr as init => match init.kind {
+            TStructInit as si => si
+            _ => null
+        }
+    }
+}
+
+/**
+ * field_init_by_name — the initializer of the field named `field` in the struct-init `si`, or null when
+ * `si` carries no such field. `si.field_names`/`si.field_vals` are PARALLEL and in the struct's declared
+ * order (the checker reorders), so a name lookup returns the matching value.
+ *
+ * @param si     the resolved struct initializer
+ * @param field  the accessed field's name
+ * @return       the field's initializer expression, or null
+ * @since #comptime-fold
+ */
+fn field_init_by_name(si: TStructInit, field: str) -> TExpr? {
+    mut i: u64 = 0
+    loop {
+        if i >= si.field_names.len { break }
+        if si.field_names[i] == field { return si.field_vals[i] }
+        i++
+    }
+    null
+}
 
 /**
  * apply_binary — apply a binary operator to two folded operands, dispatching on their
@@ -1460,8 +1632,24 @@ fn cf_agg_value(e: TExpr, agg: AggConstMap) -> bool {
     match e.kind {
         TArrayLit as a => cf_array_elems_const(a, agg)
         TVar as v => cf_var_is_agg_const(v, agg)
+        TCast as c => cf_str_to_bytes_cast(e, c, agg)
         _ => false
     }
+}
+
+/**
+ * cf_str_to_bytes_cast — true iff `e` is a `str -> []byte` coercion of a const string (CF4c): the cast's
+ * target is `[]byte` and its operand is a foldable const/literal string. Such a coercion folds to the
+ * byte-array const value (`cast_to_non_int`), so an enclosing `.len`/index over it also folds.
+ *
+ * @param e    the cast expression (its `.type` is the coercion target)
+ * @param c    the typed cast node
+ * @param agg  the module-aggregate resolution table
+ * @return     whether `e` is a foldable `str -> []byte` coercion
+ * @since #comptime-fold
+ */
+fn cf_str_to_bytes_cast(e: TExpr, c: TCast, agg: AggConstMap) -> bool {
+    is_byte_slice(e.type) && cf_str_value(c.expr, agg)
 }
 
 /**
@@ -1577,9 +1765,9 @@ fn cf_fold_int(e: TExpr, agg: AggConstMap) -> bool {
 
 /**
  * cf_can_fold_field — the fold's field-access gate (the field mirror of `cf_can_index`): true iff the
- * whole `TFieldAccess` collapses to a literal — a foldable `.len` of a const string/aggregate (CF4d).
- * When false the field access is rebuilt around its folded receiver (stays runtime), preserving today's
- * behavior for a runtime receiver or a not-yet-foldable field.
+ * whole `TFieldAccess` collapses to a literal — a foldable `.len` (CF4d) or an integer struct field of a
+ * const struct (CF4c). When false the field access is rebuilt around its folded receiver (stays
+ * runtime), preserving today's behavior for a runtime receiver or a not-yet-foldable field.
  *
  * @param fa   the typed field-access node
  * @param agg  the module-aggregate resolution table
@@ -1588,7 +1776,7 @@ fn cf_fold_int(e: TExpr, agg: AggConstMap) -> bool {
  */
 fn cf_can_fold_field(fa: TFieldAccess, agg: AggConstMap) -> bool {
     if is_len_field(fa) { return cf_len_receiver_const(fa, agg) }
-    false
+    cf_struct_int_field(fa, agg)
 }
 
 /**
@@ -1606,6 +1794,24 @@ fn cf_len_receiver_const(fa: TFieldAccess, agg: AggConstMap) -> bool {
         Str => cf_str_value(fa.receiver, agg)
         Slice => cf_agg_value(fa.receiver, agg)
         _ => false
+    }
+}
+
+/**
+ * cf_struct_int_field — true iff `fa` reads a field of a const struct whose value is a foldable integer
+ * op-tree (CF4c): the receiver resolves to a `TStructInit` (in-tree or a module const struct) that
+ * carries the named field, and that field's initializer is `cf_fold_int`. A non-struct receiver, an
+ * absent field, or a non-integer field value returns false (the access stays runtime).
+ *
+ * @param fa   the typed field-access node
+ * @param agg  the module-aggregate resolution table
+ * @return     whether `fa` reads a const struct's integer field
+ * @since #comptime-fold
+ */
+fn cf_struct_int_field(fa: TFieldAccess, agg: AggConstMap) -> bool {
+    match struct_field_init(fa.receiver, fa.field, agg) {
+        null => false
+        TExpr as fv => cf_fold_int(fv, agg)
     }
 }
 
