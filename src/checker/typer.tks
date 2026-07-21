@@ -922,6 +922,27 @@ fn type_method_call(mc: parser::MethodCall, env: Env, table: TypeTable) -> TExpr
 }
 
 /**
+ * struct_iface_named_stop — the located, named honest-stop for a STRUCT value used where an
+ * interface (or trait) VALUE is required. Returns the diagnostic error when `from` is a struct
+ * that nominally conforms to the contract `to` yet cannot up-cast into it (a struct has no stable
+ * address to back a fat pointer, resolve.tks:785); returns null otherwise, so a class `from` and a
+ * non-conforming `from` fall through to the caller's generic mismatch. The interface-value boxing
+ * of a struct is deferred to the safety spine (docs/design/interface-value-type.md §4) — this only
+ * NAMES the gap and points the user at the two surfaces that DO dispatch a struct's contract.
+ *
+ * @param from   the source (value) type at a widen/assign/arg site
+ * @param to     the destination (expected) contract type
+ * @param table  the program's type table (conformance + kind probes)
+ * @return       the located `err_typed` honest-stop, or null when the gap does not apply
+ * @see          struct_conforms_but_not_class — the predicate this diagnoses
+ * @since 0.3.0.29 interface-value keystone
+ */
+fn struct_iface_named_stop(from: Type, to: Type, table: TypeTable) -> error? {
+    if !struct_conforms_but_not_class(from, to, table) { return null }
+    teko::error::err_typed(error { message = "a `struct` value cannot be used as the interface `<Iface>` — a struct has no stable address to dispatch through. Make the implementer a `class` (`type T = class & <Iface>`), or take it by a generic contract-bound parameter (`fn f<T: <Iface>>(x: T)`), which dispatches statically. (interface-value boxing of a struct is deferred to the safety spine — docs/design/interface-value-type.md §4)" }, type_render(to), type_render(from))
+}
+
+/**
  * (W10b.D2/D3 / TR1) Type a dynamic contract-method dot-call `recv.method(args)` on an INTERFACE or
  * TRAIT receiver: resolve `method` to its dispatch contract + vtable slot, type the receiver + args
  * against the contract's effective signature (defaults live on the contract, DEFARGS rule E), and
@@ -960,6 +981,7 @@ fn type_contract_dispatch(ib: parser::InterfaceBody, struct_name: str, mc: parse
         if type_is_void(a.type) { return error { message = "a `void` expression cannot be passed as an argument (M.1)" } }
         let pt = f.params[ii]
         if !assignable_to(a.type, pt, table) {
+            match struct_iface_named_stop(a.type, pt, table) { error as se => return se; null => { } }
             if !literal_adopts(a, pt) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(pt), type_render(a.type)) }
             a = TExpr { kind = a.kind; type = pt; line = a.line; col = a.col }
         } else {
@@ -1193,6 +1215,7 @@ fn type_call(c0: parser::Call, env: Env, table: TypeTable) -> TExpr | error {
                 if !auto_reffed {
                     if !assignable_to(a.type, f.params[i], table) {
                         // (C1.8/E2) attach expected/actual — THE user's reported mismatch (mirrors expr.c).
+                        match struct_iface_named_stop(a.type, f.params[i], table) { error as se => return se; null => { } }
                         if !literal_adopts(a, f.params[i]) { return teko::error::err_typed(error { message = "argument type mismatch" }, type_render(f.params[i]), type_render(a.type)) }
                         a = TExpr { kind = a.kind; type = f.params[i]; line = a.line; col = a.col }   // C6 literal adopts the param type
                     } else {
@@ -3344,6 +3367,7 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
         if !assignable_to(v.type, at, table) {   // B.14 widening (case → variant) OR C6: a fitting literal adopts T (leaf stays i64)
             // (C1.8/E2) wrap with expected=type_render(at), actual=type_render(v.type) — mirrors
             // typer.c type_binding's tk_error_types wrap of annotated_literal_reason's message.
+            match struct_iface_named_stop(v.type, at, table) { error as se => return se; null => { } }
             match annotated_literal_ok(b.value, at) {
                 null => {
                     // a fitting bare-literal (plain-scalar) initializer ADOPTS the declared narrow

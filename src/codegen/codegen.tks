@@ -433,6 +433,27 @@ fn cg_canon_name(prog: checker::TProgram, name: str) -> str {
     match cg_find_decl(prog, name) { parser::TypeDecl as d => d.name; error => name }
 }
 
+/**
+ * cg_canon_name_ns — the CANONICAL decl name for a syntactic type PATH, resolved in the referencing
+ * namespace `ref_ns`. A bare `Reader` written in `teko::io` binds `teko::io::Reader`, NOT a
+ * same-last-segment cousin in another namespace (`teko::emit::Reader`, the #109 collision) — so an
+ * expected-slot type built for a call arg / struct field carries the RIGHT decl, and the
+ * class->interface upcast wrap (emit_as CONTRACT slot) fires against the real contract. Falls back
+ * to the ns-agnostic canonicaliser when no ns-precise decl matches (an imported type declared in
+ * another namespace), preserving the pre-existing no-collision behavior.
+ *
+ * @param prog    the typed program
+ * @param path    the syntactic type path (its last segment names the type)
+ * @param ref_ns  the namespace the path is written in (the callee fn's / struct decl's namespace)
+ * @return        the canonical decl name, or the ns-agnostic canonicalisation on no ns-precise hit
+ */
+fn cg_canon_name_ns(prog: checker::TProgram, path: parser::Path, ref_ns: str) -> str {
+    match cg_find_decl_ns(prog, path, ref_ns) {
+        parser::TypeDecl as d => d.name
+        error => cg_canon_name(prog, path.segments[path.segments.len - 1].name)
+    }
+}
+
 // cg_named_is_variant — is the NAMED type `name` a (declared) variant? (C: `cg_named_is_variant`.)
 fn cg_named_is_variant(prog: checker::TProgram, name: str) -> bool {
     match cg_find_variant_decl(prog, name) { parser::TypeDecl => true; error => false }
@@ -2571,7 +2592,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                                 if !arg_is_ref { out = cb(out, "&") }
                                 out = match emit_expr_ctx(out, prog, ret_type, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             } else {
-                                out = match emit_as_r(out, prog, ret_type, checker::Named { name = cg_canon_name(prog, pn) }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                out = match emit_as_r(out, prog, ret_type, checker::Named { name = cg_canon_name_ns(prog, nt.path, cf.namespace) }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             }
                             wrapped = true
                         }
@@ -2583,7 +2604,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                         // type, which mangles identically to the param's inner (exact-match widen).
                         parser::OptionalType as ot => {
                             let inner_t = match ot.inner {
-                                parser::NamedType as int_nt => checker::Named { name = cg_canon_name(prog, int_nt.path.segments[int_nt.path.segments.len - 1].name) }
+                                parser::NamedType as int_nt => checker::Named { name = cg_canon_name_ns(prog, int_nt.path, cf.namespace) }
                                 _ => c.args[j].type
                             }
                             out = match emit_as_r(out, prog, ret_type, checker::Optional { inner = inner_t }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -3382,11 +3403,11 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
             mut exp_t: checker::Type = checker::Void { }
             match fte_opt {
                 parser::TypeExpr as fte => match fte {
-                    parser::NamedType as nt => { exp_t = checker::Named { name = cg_canon_name(prog, nt.path.segments[nt.path.segments.len - 1].name) } }
+                    parser::NamedType as nt => { exp_t = checker::Named { name = cg_canon_name_ns(prog, nt.path, checker::name_qualifier(name)) } }
                     parser::SliceType as st => match st.element {
                         parser::NamedType as ent => {
                             let elem = ent.path.segments[ent.path.segments.len - 1].name
-                            if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name(prog, elem) } } }
+                            if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name_ns(prog, ent.path, checker::name_qualifier(name)) } } }
                         }
                         parser::OptionalType => { exp_t = cg_slice_param_type(prog, st, fv.type) }
                         _ => { }
@@ -3394,7 +3415,7 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
                     // a present value into a `T?` field (T named) → emit_as wraps T → T?
                     // ({ .present = true, .value = … }). (A bare `null` is the sentinel branch above.)
                     parser::OptionalType as ot => match ot.inner {
-                        parser::NamedType as inner_nt => { exp_t = checker::Optional { inner = checker::Named { name = cg_canon_name(prog, inner_nt.path.segments[inner_nt.path.segments.len - 1].name) } } }
+                        parser::NamedType as inner_nt => { exp_t = checker::Optional { inner = checker::Named { name = cg_canon_name_ns(prog, inner_nt.path, checker::name_qualifier(name)) } } }
                         _ => { }
                     }
                     _ => { }

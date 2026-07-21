@@ -876,6 +876,51 @@ pub fn is_class_name(name: str, table: TypeTable) -> bool {
 }
 
 /**
+ * is_struct_name — is `name` declared as a `struct` (a value type, no vtable)
+ * in the folded type table? The value-type twin of is_class_name/
+ * is_interface_name, used by the struct→interface honest-stop and by any
+ * value-vs-reference dispatch decision.
+ *
+ * @param name   a resolved (canonical or bare) type name
+ * @param table  the program's type table
+ * @return       true iff `name`'s TypeDecl body is a StructBody
+ * @see          is_class_name, is_interface_name
+ * @since 0.3.0.29 interface-value keystone
+ */
+pub fn is_struct_name(name: str, table: TypeTable) -> bool {
+    match type_table_find(table, name, "") {
+        parser::TypeDecl as td => match td.body { parser::StructBody => true; _ => false }
+        error => false
+    }
+}
+
+/**
+ * struct_conforms_but_not_class — does `from` name a STRUCT that nominally
+ * conforms to the interface/trait `to`, yet cannot up-cast to it as a value
+ * (a struct has no stable address to back a fat pointer, resolve.tks:785)? True
+ * only for the exact "struct implements contract, used as a contract VALUE" case
+ * — the one an honest-stop should name. A class `from` (which DOES widen) and a
+ * non-conforming `from` both answer false, so the caller's generic mismatch
+ * message stands for them.
+ *
+ * @param from   the source type at a widen/assign/arg site
+ * @param to     the destination (expected) type
+ * @param table  the program's type table (conformance + kind probes)
+ * @return       true iff `from` is a struct conforming to contract `to`
+ * @see          widens_into_at — the value-widen gate this diagnoses the gap of
+ * @since 0.3.0.29 interface-value keystone
+ */
+pub fn struct_conforms_but_not_class(from: Type, to: Type, table: TypeTable) -> bool {
+    match from {
+        Named as fn_ => match to {
+            Named as tn => is_struct_name(fn_.name, table) && (is_interface_name(tn.name, table) || is_trait_name(tn.name, table)) && type_conforms_to(fn_.name, tn.name, table)
+            _ => false
+        }
+        _ => false
+    }
+}
+
+/**
  * Is `name` a `#must_free` RELEVANT type (S2, the 0.1.0.0-beta memory+unsafe remodel #336) — a
  * type whose value must be consumed (freed or moved) on every non-diverging control-flow path?
  * Any TypeDecl kind may carry the flag (struct/class are the intended shape; the flag is purely
