@@ -1443,3 +1443,255 @@ fn fold_collapses_module_agg_index() {
         }
     }
 }
+
+/**
+ * cf_str — an in-tree `str`-literal typed expression carrying text `text`, the CF4d/CF4c const-string
+ * receiver (its `.type` is `str`, the shape the typer gives a string literal).
+ *
+ * @param text  the literal's text
+ * @return      the typed string-literal expression
+ */
+fn cf_str(text: str) -> TExpr { te(TStrLit { text = text }, strt()) }
+
+/**
+ * cf_field — a `recv.field` field-access typed expression of result type `t`, the CF4c/CF4d fold
+ * receiver shape (`.len` of a const string/aggregate, or a field of a const struct).
+ *
+ * @param recv   the receiver expression
+ * @param field  the accessed field's name
+ * @param t      the field access's resolved type
+ * @return       the typed field-access expression
+ */
+fn cf_field(recv: TExpr, field: str, t: Type) -> TExpr { te(TFieldAccess { receiver = recv; field = field }, t) }
+
+/**
+ * cf_slice_lit — an in-tree slice array-literal typed expression over `elems` with element type
+ * `elemty`, the CF4d `.len` receiver (its `.type` is `Slice`, so `is_len_field` admits the length fold).
+ *
+ * @param elems   the array's element expressions, in index order
+ * @param elemty  the slice's element type
+ * @return        the typed slice array-literal expression
+ */
+fn cf_slice_lit(elems: []TExpr, elemty: Type) -> TExpr {
+    mut es: []TArrayElem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= elems.len { break }
+        es = teko::list::push(es, TArrayElem { is_spread = false; expr = elems[i] })
+        i++
+    }
+    te(TArrayLit { elements = es }, Slice { element = elemty })
+}
+
+/**
+ * cf_point_init — an in-tree `Point { x = 30, y = 12 }` struct-init typed expression, the CF4c
+ * const-struct-field receiver (fields in declared order, `.type` the named struct type).
+ *
+ * @return  the typed struct-init expression
+ */
+fn cf_point_init() -> TExpr {
+    let names = teko::list::push(teko::list::push(teko::list::empty(), "x"), "y")
+    let vals = teko::list::push(teko::list::push(teko::list::empty(), cf_num(30 to i128, i64t())), cf_num(12 to i128, i64t()))
+    te(TStructInit { field_names = names; field_vals = vals }, Named { name = "Point" })
+}
+
+/**
+ * cf_agg_point — a hand-built `AggConstMap` recording `const POINT: Point = Point { x = 30, y = 12 }`
+ * in namespace `teko::checker`, the CF4c module-const-struct receiver `POINT.x` resolves against.
+ *
+ * @return  the module-aggregate resolution table holding `POINT`
+ */
+fn cf_agg_point() -> AggConstMap {
+    ScalarConstMap { names = teko::list::push(teko::list::empty(), "POINT"); nss = teko::list::push(teko::list::empty(), "teko::checker"); inits = teko::list::push(teko::list::empty(), cf_point_init()) }
+}
+
+/**
+ * cf_agg_str — a hand-built `AggConstMap` recording `const GREETING: str = "hello"` in namespace
+ * `teko::checker`, the CF4d module-const-string receiver `GREETING.len` resolves against.
+ *
+ * @return  the module-aggregate resolution table holding `GREETING`
+ */
+fn cf_agg_str() -> AggConstMap {
+    ScalarConstMap { names = teko::list::push(teko::list::empty(), "GREETING"); nss = teko::list::push(teko::list::empty(), "teko::checker"); inits = teko::list::push(teko::list::empty(), cf_str("hello")) }
+}
+
+/**
+ * cf_agg_first_is — assert `eval_const` over `agg` folds `e` to a `CVAgg` of exactly `want_len`
+ * elements whose first element is a `CVInt` with bits `first` (the CF4c `str -> []byte` const value).
+ *
+ * @param e         the const expression to fold
+ * @param agg       the module-aggregate resolution table
+ * @param want_len  the expected element count
+ * @param first     the expected first element's two's-complement bits
+ */
+fn cf_agg_first_is(e: TExpr, agg: AggConstMap, want_len: u64, first: u128) {
+    match eval_const(e, empty_table(), empty_env(), agg) {
+        error => teko::assert::is_true(false)
+        ConstValue as v => match v.kind {
+            CVAgg as ag => {
+                teko::assert::is_true(ag.elems.len == want_len)
+                match ag.elems[0].kind {
+                    CVInt as ci => teko::assert::is_true(ci.bits == first)
+                    _ => teko::assert::is_true(false)
+                }
+            }
+            _ => teko::assert::is_true(false)
+        }
+    }
+}
+
+/**
+ * cf_fold_stays_field — assert `fold_expr` over `agg` leaves `e`'s top-level kind a `TFieldAccess` (the
+ * field access stays runtime, not folded to a literal — the CF4c/CF4d runtime-receiver negative).
+ *
+ * @param e    the field-access expression to fold
+ * @param agg  the module-aggregate resolution table
+ */
+fn cf_fold_stays_field(e: TExpr, agg: AggConstMap) {
+    match fold_expr(e, empty_table(), empty_env(), agg) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind {
+            TFieldAccess => teko::assert::is_true(true)
+            _ => teko::assert::is_true(false)
+        }
+    }
+}
+
+/**
+ * eval_const_folds_inline_agg_len — the CF4d mandate case: `.len` of an in-tree `[]i64` array literal
+ * `[10, 20, 30]` folds to the element count `3` (with an EMPTY map — the receiver is in-tree).
+ */
+#test
+fn eval_const_folds_inline_agg_len() {
+    let elems = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), cf_num(10 to i128, i64t())), cf_num(20 to i128, i64t())), cf_num(30 to i128, i64t()))
+    cf_int_is(cf_field(cf_slice_lit(elems, i64t()), "len", u64t()), 3 to u128)
+}
+
+/**
+ * eval_const_folds_string_len — the CF4d string case: `.len` of an in-tree `str` literal `"hello"`
+ * folds to its byte count `5` (the byte length `.len` reads at runtime for a `str`).
+ */
+#test
+fn eval_const_folds_string_len() {
+    cf_int_is(cf_field(cf_str("hello"), "len", u64t()), 5 to u128)
+}
+
+/**
+ * eval_const_folds_module_agg_len — the CF4d module case: `G.len` over the hand-built `AggConstMap` for
+ * `const G: []byte = [0x1F, 0x8B]` folds to the element count `2` (the receiver resolved via the map).
+ */
+#test
+fn eval_const_folds_module_agg_len() {
+    cf_index_is(cf_field(cf_var("G", Slice { element = bytet() }), "len", u64t()), cf_agg_g(), 2 to u128)
+}
+
+/**
+ * eval_const_folds_module_string_len — the CF4d module-string case: `GREETING.len` over the hand-built
+ * map for `const GREETING: str = "hello"` folds to the byte count `5`.
+ */
+#test
+fn eval_const_folds_module_string_len() {
+    cf_index_is(cf_field(cf_var("GREETING", strt()), "len", u64t()), cf_agg_str(), 5 to u128)
+}
+
+/**
+ * eval_const_folds_inline_struct_field — the CF4c mandate case: `p.x`/`p.y` of an in-tree
+ * `Point { x = 30, y = 12 }` struct literal fold to the field values `30`/`12` (with an EMPTY map).
+ */
+#test
+fn eval_const_folds_inline_struct_field() {
+    cf_int_is(cf_field(cf_point_init(), "x", i64t()), 30 to u128)
+    cf_int_is(cf_field(cf_point_init(), "y", i64t()), 12 to u128)
+}
+
+/**
+ * eval_const_folds_module_struct_field — the CF4c module case: `POINT.x`/`POINT.y` over the hand-built
+ * map for `const POINT: Point = Point { x = 30, y = 12 }` fold to `30`/`12` (receiver via the map).
+ */
+#test
+fn eval_const_folds_module_struct_field() {
+    cf_index_is(cf_field(cf_var("POINT", Named { name = "Point" }), "x", i64t()), cf_agg_point(), 30 to u128)
+    cf_index_is(cf_field(cf_var("POINT", Named { name = "Point" }), "y", i64t()), cf_agg_point(), 12 to u128)
+}
+
+/**
+ * eval_const_folds_str_to_bytes — the CF4c coercion case: `"hi" to []byte` folds to the byte-array
+ * const value — a `CVAgg` of two `byte` elements whose first is `0x68` (`'h'`).
+ */
+#test
+fn eval_const_folds_str_to_bytes() {
+    cf_agg_first_is(cf_cast(cf_str("hi"), Slice { element = bytet() }), empty_agg(), 2 to u64, 0x68 to u128)
+}
+
+/**
+ * eval_const_folds_str_to_bytes_len — a `.len` over a `str -> []byte` coercion folds through the byte
+ * array const to the byte count `5` (`("hello" to []byte).len` -> `5`).
+ */
+#test
+fn eval_const_folds_str_to_bytes_len() {
+    let coerced = cf_cast(cf_str("hello"), Slice { element = bytet() })
+    cf_int_is(cf_field(coerced, "len", u64t()), 5 to u128)
+}
+
+/**
+ * fold_collapses_struct_field_arith — the CF4c fixture fold: `(POINT.x + POINT.y) to i32` over the
+ * module map collapses through `cf_fold_int`'s TFieldAccess arm to the bare literal `42` (a `TNumber`),
+ * every field read and the enclosing arithmetic/cast folded away.
+ */
+#test
+fn fold_collapses_struct_field_arith() {
+    let px = cf_field(cf_var("POINT", Named { name = "Point" }), "x", i64t())
+    let py = cf_field(cf_var("POINT", Named { name = "Point" }), "y", i64t())
+    let e = cf_cast(cf_bin(lexer::TokenKind::Plus, px, py, i64t()), i32t())
+    match fold_expr(e, empty_table(), empty_env(), cf_agg_point()) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind {
+            TNumber as n => teko::assert::is_true(n.value == (42 to i128))
+            _ => teko::assert::is_true(false)
+        }
+    }
+}
+
+/**
+ * fold_collapses_len — `G.len to i32` over the module map collapses through `cf_fold_int`'s
+ * TFieldAccess arm to the bare literal `2` (the length read and enclosing cast folded away).
+ */
+#test
+fn fold_collapses_len() {
+    let lf = cf_field(cf_var("G", Slice { element = bytet() }), "len", u64t())
+    match fold_expr(cf_cast(lf, i32t()), empty_table(), empty_env(), cf_agg_g()) {
+        error => teko::assert::is_true(false)
+        TExpr as f => match f.kind {
+            TNumber as n => teko::assert::is_true(n.value == (2 to i128))
+            _ => teko::assert::is_true(false)
+        }
+    }
+}
+
+/**
+ * fold_leaves_runtime_len_receiver_runtime — the CF4d negative: `a.len` with a RUNTIME receiver `a` (a
+ * param absent from the map) stays a runtime `TFieldAccess` through the fold, never a folded literal.
+ */
+#test
+fn fold_leaves_runtime_len_receiver_runtime() {
+    cf_fold_stays_field(cf_field(cf_var("a", Slice { element = bytet() }), "len", u64t()), empty_agg())
+}
+
+/**
+ * fold_leaves_runtime_struct_receiver_runtime — the CF4c negative: `p.x` with a RUNTIME receiver `p` (a
+ * param absent from the map) stays a runtime `TFieldAccess` through the fold.
+ */
+#test
+fn fold_leaves_runtime_struct_receiver_runtime() {
+    cf_fold_stays_field(cf_field(cf_var("p", Named { name = "Point" }), "x", i64t()), empty_agg())
+}
+
+/**
+ * cf_can_fold_field_rejects_runtime_receiver — a runtime receiver (a param `p`, absent from the map)
+ * makes `cf_can_fold_field` false, so `p.x` stays runtime (the gate's negative boundary).
+ */
+#test
+fn cf_can_fold_field_rejects_runtime_receiver() {
+    let fa = TFieldAccess { receiver = cf_var("p", Named { name = "Point" }); field = "x" }
+    teko::assert::is_true(!cf_can_fold_field(fa, empty_agg()))
+}
