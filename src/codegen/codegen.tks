@@ -46,8 +46,12 @@ use teko::parser
     historical emission, so the FIXPOINT `gen2.c == gen3.c` is untouched. `TestPlain` emits a
     test-gate main that calls each `#test` in `prog.items` order (native gate, no coverage).
     `TestCov` adds the `tk_cov_*` prologue/brackets (coverage sinks) — zero-cost when unused,
-    because those calls are simply absent from the emitted C under `Program`/`TestPlain`. */
-type CgMode = enum { Program; TestPlain; TestCov }
+    because those calls are simply absent from the emitted C under `Program`/`TestPlain`.
+    `TestAnalyze` (0.3.0.29) emits the SAME production-fn instrumentation as `TestCov`, but a
+    per-test ISOLATION harness: between every `#test` it resets all three sinks, runs the test,
+    and dumps THAT test's id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov` — one compile answers the
+    whole-suite stale/redundant question (`teko test . --analyzer`). */
+type CgMode = enum { Program; TestPlain; TestCov; TestAnalyze }
 
 /**
  * CovCtx — the coverage-instrumentation context threaded through TestCov body emission (#265).
@@ -8895,6 +8899,15 @@ pub fn tk_emit_c_test(prog0: checker::TProgram, cov: bool) -> str | error {
     tk_emit_c_mode(prog0, if cov { CgMode::TestCov } else { CgMode::TestPlain })
 }
 
+/** tk_emit_c_test_analyze — the ANALYZE-MODE test-gate emission entry (`teko test . --analyzer`,
+    0.3.0.29). Emits the same production-fn/line/branch instrumentation as `TestCov`, but a per-test
+    isolation harness (`emit_test_main_analyze`) that resets the sinks around each `#test` and dumps
+    that test's raw id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov`. One compile answers the whole-suite
+    stale/redundant question. Exposed so the build driver can request it across the namespace. */
+pub fn tk_emit_c_test_analyze(prog0: checker::TProgram) -> str | error {
+    tk_emit_c_mode(prog0, CgMode::TestAnalyze)
+}
+
 /** tk_emit_c_mode — emit the C translation unit under `mode` (#265, lever D of #249). Types,
     prototypes and function bodies are emitted IDENTICALLY across modes; only the trailing `main()`
     differs: Program = the virtual-main (loose statements), TestPlain/TestCov = the native test gate.
@@ -9107,6 +9120,7 @@ fn emit_program_main(buf: []byte, prog: checker::TProgram) -> []byte | error {
     calls and each test wrapped in `tk_cov_enter(idx)`/`tk_cov_leave`, then the sinks are dumped to a
     `.tkcov` for the parent to merge; under `TestPlain` NO `tk_cov_*` is emitted (zero-cost off). */
 fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte | error {
+    if mode == CgMode::TestAnalyze { return emit_test_main_analyze(buf, prog) }
     mut b = buf
     let cov = mode == CgMode::TestCov
     b = cb(b, "int main(int argc, char **argv) {\n")
@@ -9130,6 +9144,43 @@ fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte 
     if cov {
         b = cb(b, "    tk_cov_branches_on(false); tk_cov_lines_on(false);\n")
         b = cb(b, "    { const char *dp = getenv(\"TEKO_TKCOV\"); if (dp) tk_cov_dump(dp); }\n")
+    }
+    b = cb(b, "    return 0;\n")
+    b = cb(b, "}\n")
+    b
+}
+
+/**
+ * emit_test_main_analyze — the per-test ISOLATION harness main (`teko test . --analyzer`, 0.3.0.29).
+ *
+ * Turns line/branch sinks on once, then for EACH `#test` (via `emit_test_call_analyze`) resets all
+ * three sinks, runs exactly that one test under `tk_cov_enter(idx)`/`tk_cov_leave`, and dumps THAT
+ * test's raw id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov`. One compile + one run therefore yields N
+ * disjoint per-test id-sets, which the build driver reads back to classify STALE/REDUNDANT/LIVE —
+ * without the per-test recompile the aggregate `TestCov` sink forces on `--per-test-cov`. There is
+ * NO end-of-run aggregate dump: each test already flushed its own file.
+ *
+ * @param buf   the output byte buffer to append the emitted C to
+ * @param prog  the checked program whose `#test` items form the harness body
+ * @return      the buffer with the analyze-mode `main()` appended
+ * @since 0.3.0.29
+ */
+fn emit_test_main_analyze(buf: []byte, prog: checker::TProgram) -> []byte | error {
+    mut b = cb(buf, "extern int snprintf(char *, size_t, const char *, ...);\n")
+    b = cb(b, "int main(int argc, char **argv) {\n")
+    b = cb(b, "    tk_set_args(argc, argv);\n")
+    b = cb(b, "    tk_cov_branches_on(true);\n")
+    b = cb(b, "    tk_cov_lines_on(true);\n")
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.is_test { b = emit_test_call_analyze(b, f, i) }
+            }
+            _ => { }
+        }
+        i++
     }
     b = cb(b, "    return 0;\n")
     b = cb(b, "}\n")
@@ -9175,13 +9226,69 @@ fn emit_test_call(buf: []byte, f: checker::TFunction, idx: u64, cov: bool) -> []
     b
 }
 
+/**
+ * emit_test_call_analyze — one `#test` invocation under the analyze harness (0.3.0.29).
+ *
+ * Mirrors `emit_test_call`'s label prints and arena checkpoint, but ISOLATES this test's coverage:
+ * before the call it resets all three sinks so they hold ONLY this test's ids; after the call it
+ * dumps them to `$TEKO_ANALYZE_DIR/<idx>.tkcov` (the literal `idx` is baked in at emit time via the
+ * digit helper, so no runtime idx bookkeeping is needed). If `$TEKO_ANALYZE_DIR` is unset the dump
+ * is skipped (the binary still runs as a plain gate). The cov brackets nest strictly inside the
+ * arena checkpoint, exactly as `emit_test_call` and the VM runner order them.
+ *
+ * @param buf  the output byte buffer to append the emitted C to
+ * @param f    the `#test` function being invoked (its namespace + name form the label and symbol)
+ * @param idx  the `prog.items` coverage id — baked into the dump path AND passed to `tk_cov_enter`
+ * @return     the buffer with this test's isolated invocation appended
+ * @since 0.3.0.29
+ */
+fn emit_test_call_analyze(buf: []byte, f: checker::TFunction, idx: u64) -> []byte {
+    let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
+    let head = teko::str::concat("test ", label, " ... ")
+    mut b = cb(buf, "    tk_arena_push();\n")
+    b = cb(b, "    tk_print((tk_str){ (const tk_byte *)\"")
+    b = cb_cstr_escaped(b, head)
+    b = cb(b, "\", ")
+    b = cb_u128_digits(b, head.len to u128)
+    b = cb(b, " });\n")
+    b = cb(b, "    tk_cov_reset(); tk_cov_branch_reset(); tk_cov_line_reset();\n")
+    b = cb(cb_u128_digits(cb(b, "    tk_cov_enter("), idx to u128), ");\n")
+    b = cb_fn_name(cb(b, "    "), f.namespace, f.name)
+    b = cb(b, "();\n")
+    b = cb(b, "    tk_cov_leave();\n")
+    b = cb(b, "    { const char *d = getenv(\"TEKO_ANALYZE_DIR\"); if (d) { char p[1024]; snprintf(p, sizeof p, \"%s/")
+    b = cb_u128_digits(b, idx to u128)
+    b = cb(b, ".tkcov\", d); tk_cov_dump(p); } }\n")
+    b = cb(b, "    tk_println((tk_str){ (const tk_byte *)\"ok\", 2 });\n")
+    b = cb(b, "    tk_arena_pop();\n")
+    b
+}
+
+/**
+ * mode_instruments_cov — whether `mode` populates the `tk_cov_*` sinks (`TestCov` aggregates the
+ * whole run into one dump, `TestAnalyze` isolates each test into its own dump). Both emit the SAME
+ * production-fn/line/branch instrumentation; only the harness in `emit_test_main` differs. Program
+ * and TestPlain emit ZERO cov calls → byte-identical output → the gen2==gen3 fixpoint is intact.
+ *
+ * @param mode  the codegen mode being emitted
+ * @return      true for `TestCov`/`TestAnalyze`, false for `Program`/`TestPlain`
+ * @since 0.3.0.29
+ */
+fn mode_instruments_cov(mode: CgMode) -> bool {
+    match mode {
+        CgMode::TestCov => true
+        CgMode::TestAnalyze => true
+        _ => false
+    }
+}
+
 /** emit_function_mode — emit a function body, adding the `tk_cov_mark(idx)` entry prologue under
-    `TestCov` for each PRODUCTION (non-test, non-`teko::coverage`) function so function-level coverage
-    is populated natively — the mark the native gate records on entry. Under Program/TestPlain this is
-    exactly emit_function (no prologue → byte-identical). The coverage subsystem (`teko::coverage`) is
-    self-excluded so it never measures its own reporting code. (#265) */
+    `TestCov`/`TestAnalyze` for each PRODUCTION (non-test, non-`teko::coverage`) function so
+    function-level coverage is populated natively — the mark the native gate records on entry. Under
+    Program/TestPlain this is exactly emit_function (no prologue → byte-identical). The coverage
+    subsystem (`teko::coverage`) is self-excluded so it never measures its own reporting code. (#265) */
 fn emit_function_mode(buf: []byte, prog: checker::TProgram, f: checker::TFunction, mode: CgMode) -> []byte | error {
-    if mode != CgMode::TestCov { return emit_function(buf, prog, f) }
+    if !mode_instruments_cov(mode) { return emit_function(buf, prog, f) }
     if f.is_test || f.namespace == "teko::coverage" { return emit_function(buf, prog, f) }
     emit_function_cov(buf, prog, f, fn_items_index(prog, f) to i64)
 }
