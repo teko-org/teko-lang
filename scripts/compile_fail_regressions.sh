@@ -89,7 +89,7 @@ for proj in "$REGRESSIONS_DIR"/*/; do
     out="$(mktemp -d "${TMPDIR:-/tmp}/teko-compile-fail.XXXXXX")"
 
     build_exit=0
-    run_limited "$TEKO" build "$proj" -o "$out/bin" >"$out/stdout" 2>"$out/stderr" || build_exit=$?
+    run_limited "$TEKO" build "$proj" -o "$out/bin" --no-verify --release >"$out/stdout" 2>"$out/stderr" || build_exit=$?
 
     if [ "$build_exit" -eq 0 ]; then
         fail=$((fail + 1)); failed_names+=("$name")

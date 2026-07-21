@@ -226,7 +226,7 @@ selfhosted_abs="$script_dir/bin/teko"
 # CI always passes TEKO=./bin/teko already built, so this fallback is a no-op there).
 if [ ! -x "$selfhosted_abs" ] && [ -x "$bootstrap_abs" ]; then
     echo "crossmodule_regressions: bin/teko not found — self-hosting via $bootstrap_abs build . -o bin"
-    if ! run_limited "$bootstrap_abs" build "$script_dir" -o "$script_dir/bin" >/tmp/teko-crossmodule-selfhost.log 2>&1; then
+    if ! run_limited "$bootstrap_abs" build "$script_dir" -o "$script_dir/bin" --no-verify --release >/tmp/teko-crossmodule-selfhost.log 2>&1; then
         echo "crossmodule_regressions: self-host build failed — see /tmp/teko-crossmodule-selfhost.log" >&2
         tail -20 /tmp/teko-crossmodule-selfhost.log | sed 's/^/      | /'
     fi
