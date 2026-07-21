@@ -336,6 +336,96 @@ pub fn eval_const(e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -> Con
 }
 
 /**
+ * predicate_folds_const — does the boolean predicate `e` reduce to a COMPILE-TIME CONSTANT? (the
+ * test-analyzer's assertion discriminator, 0.3.0.29). An assertion whose predicate folds to a
+ * constant can NEVER discriminate at run time — `is_true` of a folded-`true` is a dead guard; a test
+ * whose predicates ALL fold tests the fold/foundation, not live production. This complements
+ * `eval_const`: `eval_const` reduces the SCALAR grammar (numbers/casts/arith), while a predicate is a
+ * BOOLEAN tree — so this also decides a `TCompare` (folds iff every operand folds), a logical `&&`/`||`
+ * (folds iff both sides fold), and a `!` (folds iff its operand folds). A leaf that is a runtime call
+ * or variable never folds, so the whole predicate is a real guard.
+ *
+ * @param e  the checked predicate expression (the single argument of `is_true`/`is_false`)
+ * @return   true iff `e` is comptime-decided (a dead guard), false iff it depends on a runtime value
+ * @since 0.3.0.29
+ */
+pub fn predicate_folds_const(e: TExpr) -> bool {
+    predicate_folds(e, fold_empty_table(), env_empty())
+}
+
+/**
+ * eval_folds — does `eval_const` reduce `e` to a `ConstValue` (versus erroring on a runtime form)?
+ * The scalar leg of `predicate_folds`.
+ *
+ * @param e      the expression to test
+ * @param table  the (empty) type table
+ * @param env    the (empty) environment
+ * @return       true iff `e` folds to a comptime `ConstValue`
+ * @since 0.3.0.29
+ */
+fn eval_folds(e: TExpr, table: TypeTable, env: Env) -> bool {
+    match eval_const(e, table, env, fold_empty_agg()) { ConstValue => true; error => false }
+}
+
+/**
+ * predicate_folds — the recursive boolean-predicate fold decision behind `predicate_folds_const`.
+ * A scalar/arith form defers to `eval_folds`; a comparison, a logical `&&`/`||`, and a `!` are decided
+ * structurally; every other form (a call, a variable) is a runtime value and does not fold.
+ *
+ * @param e      the predicate (sub)expression
+ * @param table  the (empty) type table forwarded to the scalar evaluator
+ * @param env    the (empty) environment forwarded to the scalar evaluator
+ * @return       true iff `e` is comptime-decided
+ * @since 0.3.0.29
+ */
+fn predicate_folds(e: TExpr, table: TypeTable, env: Env) -> bool {
+    if eval_folds(e, table, env) { return true }
+    match e.kind {
+        TCompare as c => compare_operands_fold(c, table, env)
+        TBinary as b => logical_binary_folds(b, table, env)
+        TUnary as u => predicate_folds(u.operand, table, env)
+        _ => false
+    }
+}
+
+/**
+ * compare_operands_fold — a `TCompare` is comptime-decided iff its first operand AND every subsequent
+ * operand each fold to a `ConstValue` (a comparison of constants has a fixed truth value).
+ *
+ * @param c      the typed comparison
+ * @param table  the (empty) type table
+ * @param env    the (empty) environment
+ * @return       true iff every operand folds
+ * @since 0.3.0.29
+ */
+fn compare_operands_fold(c: TCompare, table: TypeTable, env: Env) -> bool {
+    if !eval_folds(c.first, table, env) { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= c.rest.len { break }
+        if !eval_folds(c.rest[i].operand, table, env) { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * logical_binary_folds — a `TBinary` predicate is comptime-decided only for the boolean connectives
+ * `&&`/`||` and only when BOTH sides fold; any other binary that reached here failed `eval_folds`
+ * because an operand is a runtime value, so it does not fold.
+ *
+ * @param b      the typed binary node
+ * @param table  the (empty) type table
+ * @param env    the (empty) environment
+ * @return       true iff `b` is a `&&`/`||` whose both sides fold
+ * @since 0.3.0.29
+ */
+fn logical_binary_folds(b: TBinary, table: TypeTable, env: Env) -> bool {
+    if b.op != lexer::TokenKind::AndAnd && b.op != lexer::TokenKind::OrOr { return false }
+    predicate_folds(b.left, table, env) && predicate_folds(b.right, table, env)
+}
+
+/**
  * eval_number — evaluate a numeric literal (Tier 0): a float routes to the float-literal
  * encoder, an integer to the range-checked integer-literal encoder.
  *
@@ -2539,6 +2629,8 @@ fn fold_assign(a: TAssign, table: TypeTable, env: Env, agg: AggConstMap) -> TSta
  * @since #comptime-fold
  */
 fn fold_empty_table() -> TypeTable { teko::list::empty() }
+/** fold_empty_agg — the empty aggregate-const map for a predicate-fold context with no module aggregates (the analyzer's `eval_folds`). Mirrors fold_empty_table. */
+fn fold_empty_agg() -> AggConstMap { ScalarConstMap { names = teko::list::empty(); nss = teko::list::empty(); inits = teko::list::empty() } }
 
 /**
  * fold_program — fold every item of the substituted program: a function's body, a const declaration's

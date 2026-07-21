@@ -1922,6 +1922,19 @@ fn coverage_of(args: []str) -> bool {
     false
 }
 
+/** analyzer_of — does `--analyzer` appear in the args? (`teko test . --analyzer`, 0.3.0.29): after the
+    gate + coverage floors, run the dev-time whole-suite stale/redundant/misleading analyzer (ONE
+    compile, one run, per-test `.tkcov` dumps). Dev-time/advisory only — never wired into CI. */
+fn analyzer_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--analyzer" { return true }
+        i = i + 1
+    }
+    false
+}
+
 /** (Issue #249 lever A) does `--no-verify` appear in the args? A `build` normally ALWAYS runs the
  *  D4 `.tkt` gate first (unchanged default); this flag skips it entirely, emitting straight to
  *  codegen. Intended for a self-host release chain that has already proven the gate on an earlier
@@ -2025,6 +2038,7 @@ fn project_arg_of(args: []str, start: u64) -> str {
         else if args[i] == "--no-tty" { i = i + 1 }
         else if args[i] == "--backend" { i = i + 2 }
         else if args[i] == "--backend=native" || args[i] == "--backend=c" { i = i + 1 }
+        else if args[i] == "--analyzer" { i = i + 1 }
         else if opt_arg_has_prefix(args[i]) { i = i + 1 }
         else { return args[i] }
     }
@@ -2109,6 +2123,480 @@ fn run_project(dir: str, backend: Backend) -> i32 {
     let binp = teko::str::concat("target/debug/", stem)
     let argv = teko::list::push(teko::list::empty(), binp)
     teko::process::run(argv)
+}
+
+/** TKCOV_MAGIC_LEN — the fixed 8-byte magic header (`TKCOV1\0\0`) that opens every `.tkcov` dump,
+    and also the wire width of one `u64` id/count (both are 8). (0.3.0.29) */
+const TKCOV_MAGIC_LEN: u64 = 8
+
+/** TKCOV_SECTIONS — the three id sections a `.tkcov` file carries, in order: functions, branches,
+    lines (see `tk_cov_dump` in teko_rt.c). (0.3.0.29) */
+const TKCOV_SECTIONS: u64 = 3
+
+/** REDUNDANT_MIN — an id must be covered by at least this many DISTINCT tests for it to count as
+    "also covered elsewhere". A test is REDUNDANT when EVERY one of its ids reaches this floor (the
+    test itself contributes one, so 2 means at least one OTHER test covers the id too). (0.3.0.29) */
+const REDUNDANT_MIN: u64 = 2
+
+/** Verdict — the COVERAGE-SET axis of the analyzer (`teko test . --analyzer`, 0.3.0.29). `Stale`:
+    the test exercises NO production id (guards nothing — e.g. asserts only comptime-folded literals).
+    `Redundant`: every id it covers is ALSO covered by another test (removing it loses no coverage).
+    `Live`: it uniquely covers at least one id. This is crossed with the ASSERTION-FOLD axis to form
+    the combined `Status`. */
+type Verdict = enum { Stale; Redundant; Live }
+
+/** Status — the COMBINED per-test verdict (0.3.0.29 Crumb 4), crossing the coverage-set axis with the
+    assertion-fold axis, most-severe first. `Misleading`: an assertion folds to a constant AND the test
+    still covers production (looks LIVE, guards nothing — the star finding coverage counting cannot
+    see). `Foundational`: EVERY assertion folds to a constant (tests the fold/language foundation, e.g.
+    `1+1==2`). `Dead`: no production coverage and no live assertion. `Redundant`: real assertions +
+    covers production, but its coverage set ⊆ the union of the other tests. `Live`: real assertion(s)
+    plus at least one uniquely-covered production id. */
+type Status = enum { Misleading; Foundational; Dead; Redundant; Live }
+
+/** TestRecord — one `#test`'s analyzer input: its display label, the DEDUPED set of production ids
+    (functions ∪ branches ∪ lines) it covered (decoded from that test's isolated `.tkcov`), and its
+    assertion tally (from `checker::test_assert_stats`). (0.3.0.29) */
+type TestRecord = struct {
+    /** the `namespace::name` (or bare `name`) label, matching the native gate's `test <label>` line. */
+    label: str
+    /** the deduped production ids this test covered — empty ⇒ no coverage. */
+    ids: []u64
+    /** the number of bool assertions (`is_true`/`is_false`) the test makes. */
+    asserts_total: u64
+    /** how many of those assertions have a predicate that folds to a comptime constant (dead guards). */
+    asserts_folded: u64
+}
+
+/** verdict_text — the stable, greppable token for a coverage `Verdict` (`STALE`/`REDUNDANT`/`LIVE`).
+    Retained for the coverage-axis unit tests; the report prints the combined `Status`. (0.3.0.29) */
+fn verdict_text(v: Verdict) -> str {
+    match v {
+        Verdict::Stale => "STALE"
+        Verdict::Redundant => "REDUNDANT"
+        Verdict::Live => "LIVE"
+    }
+}
+
+/** status_text — the stable, greppable token for a combined `Status`
+    (`MISLEADING`/`FOUNDATIONAL`/`DEAD`/`REDUNDANT`/`LIVE`). (0.3.0.29) */
+fn status_text(s: Status) -> str {
+    match s {
+        Status::Misleading => "MISLEADING"
+        Status::Foundational => "FOUNDATIONAL"
+        Status::Dead => "DEAD"
+        Status::Redundant => "REDUNDANT"
+        Status::Live => "LIVE"
+    }
+}
+
+/**
+ * combined_status — cross the coverage-set axis (`cov`) with the assertion-fold axis (`total`/`folded`)
+ * into the single reported `Status`, most-severe first. A test "covers production" iff `cov` is not
+ * `Stale`. MISLEADING (a dead guard while covering production) outranks FOUNDATIONAL (all guards dead)
+ * outranks DEAD (no coverage, no live guard); the remaining production-covering tests with real guards
+ * are REDUNDANT or LIVE by their coverage set.
+ *
+ * @param cov     the coverage-set verdict for this test (`classify_test`)
+ * @param total   the number of bool assertions the test makes
+ * @param folded  how many of those assertions fold to a comptime constant
+ * @return        the combined `Status`
+ * @since 0.3.0.29
+ */
+fn combined_status(cov: Verdict, total: u64, folded: u64) -> Status {
+    let covers = cov != Verdict::Stale
+    let has_folded = folded >= 1
+    let all_folded = total >= 1 && folded == total
+    if has_folded && covers { return Status::Misleading }
+    if all_folded { return Status::Foundational }
+    if !covers { return Status::Dead }
+    match cov {
+        Verdict::Redundant => Status::Redundant
+        _ => Status::Live
+    }
+}
+
+/**
+ * test_label — the analyzer/gate display label for a `#test`: `namespace::name` when the function is
+ * namespaced, else the bare `name`. Matches the label the native test gate prints and the corpus
+ * report greps on.
+ *
+ * @param f  the `#test` function
+ * @return   `namespace::name`, or `name` when `f.namespace` is empty
+ * @since 0.3.0.29
+ */
+fn test_label(f: checker::TFunction) -> str {
+    if f.namespace.len != 0 { return teko::str::concat(f.namespace, "::", f.name) }
+    f.name
+}
+
+/**
+ * read_u64_le — decode the little-endian `u64` at byte offset `off` in the raw `.tkcov` bytes. Any
+ * byte that falls past the end of `data` reads as 0, so a truncated file decodes to a bounded value
+ * instead of panicking.
+ *
+ * @param data  the raw `.tkcov` file bytes (a `str` used as a byte buffer)
+ * @param off   the starting byte offset of the 8-byte little-endian word
+ * @return      the decoded unsigned 64-bit value
+ * @since 0.3.0.29
+ */
+fn read_u64_le(data: str, off: u64) -> u64 {
+    mut v: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= TKCOV_MAGIC_LEN { break }
+        let at = off + i
+        if at < data.len { v = v | ((data[at] to u64) << (i * TKCOV_MAGIC_LEN)) }
+        i++
+    }
+    v
+}
+
+/**
+ * tkcov_magic_ok — does `data` open with the 8-byte `TKCOV1\0\0` magic? A missing/short/foreign file
+ * fails, so `tkcov_ids` treats it as "no ids" (an absent per-test dump ⇒ STALE) rather than panicking.
+ *
+ * @param data  the raw `.tkcov` file bytes
+ * @return      true iff the first 8 bytes are exactly `T K C O V 1 \0 \0`
+ * @since 0.3.0.29
+ */
+fn tkcov_magic_ok(data: str) -> bool {
+    if data.len < TKCOV_MAGIC_LEN { return false }
+    let ascii = "TKCOV1"
+    mut i: u64 = 0
+    loop {
+        if i >= ascii.len { break }
+        if data[i] != ascii[i] { return false }
+        i++
+    }
+    if (data[6] to u64) != 0 { return false }
+    if (data[7] to u64) != 0 { return false }
+    true
+}
+
+/**
+ * ids_contains — is `id` already present in `ids`? (the linear membership test backing `dedup_ids`
+ * and `count_of` — the id sets are small per test).
+ *
+ * @param ids  the id list to search
+ * @param id   the id to look for
+ * @return     true iff `id` appears in `ids`
+ * @since 0.3.0.29
+ */
+fn ids_contains(ids: []u64, id: u64) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        if ids[i] == id { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * dedup_ids — the input id list with duplicates removed (first-seen order). One test may mark the
+ * same id many times (a hot branch/line); the classifier counts a test ONCE per id, so each test's
+ * set is deduped before it feeds the cross-test tally.
+ *
+ * @param ids  the raw id list (possibly with repeats)
+ * @return     a list holding each distinct id exactly once
+ * @since 0.3.0.29
+ */
+fn dedup_ids(ids: []u64) -> []u64 {
+    mut out: []u64 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        if !ids_contains(out, ids[i]) { out = teko::list::push(out, ids[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * tkcov_ids — decode one test's isolated `.tkcov` bytes into its DEDUPED production id set: validate
+ * the magic, then read the three sections (functions, branches, lines) — each a `u64` count followed
+ * by that many `u64` ids — and merge them into one deduped list (the three id-spaces are globally
+ * disjoint, so a single merged set is exact). A bad magic or a section whose count runs past the
+ * buffer yields whatever was decoded so far, never a panic.
+ *
+ * @param data  the raw `.tkcov` file bytes for one test
+ * @return      the deduped set of ids the test covered (empty when the file is absent/corrupt/empty)
+ * @since 0.3.0.29
+ */
+fn tkcov_ids(data: str) -> []u64 {
+    if !tkcov_magic_ok(data) { return teko::list::empty() }
+    mut acc: []u64 = teko::list::empty()
+    mut off: u64 = TKCOV_MAGIC_LEN
+    mut s: u64 = 0
+    loop {
+        if s >= TKCOV_SECTIONS { break }
+        if off + TKCOV_MAGIC_LEN > data.len { break }
+        let n = read_u64_le(data, off)
+        off = off + TKCOV_MAGIC_LEN
+        mut k: u64 = 0
+        loop {
+            if k >= n { break }
+            if off + TKCOV_MAGIC_LEN > data.len { break }
+            acc = teko::list::push(acc, read_u64_le(data, off))
+            off = off + TKCOV_MAGIC_LEN
+            k++
+        }
+        s++
+    }
+    dedup_ids(acc)
+}
+
+/**
+ * concat_ids — append every element of `b` onto `a` (list concat over `u64`). Used to fold every
+ * test's deduped ids into the one cross-test multiset `all_ids_of` builds.
+ *
+ * @param a  the accumulator list
+ * @param b  the list whose elements are appended
+ * @return   `a` followed by `b`
+ * @since 0.3.0.29
+ */
+fn concat_ids(a: []u64, b: []u64) -> []u64 {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * all_ids_of — the cross-test MULTISET: every record's deduped ids concatenated. Because each test's
+ * ids are already deduped, `count_of(all, id)` over this multiset equals the number of DISTINCT tests
+ * that cover `id` — exactly the signal the REDUNDANT test needs.
+ *
+ * @param recs  the per-test records
+ * @return      the concatenation of every record's ids
+ * @since 0.3.0.29
+ */
+fn all_ids_of(recs: []TestRecord) -> []u64 {
+    mut acc: []u64 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= recs.len { break }
+        acc = concat_ids(acc, recs[i].ids)
+        i++
+    }
+    acc
+}
+
+/**
+ * count_of — how many times `id` occurs in the cross-test multiset `all_ids` — i.e. how many distinct
+ * tests cover `id`.
+ *
+ * @param all_ids  the multiset from `all_ids_of`
+ * @param id       the production id to tally
+ * @return         the number of tests covering `id`
+ * @since 0.3.0.29
+ */
+fn count_of(all_ids: []u64, id: u64) -> u64 {
+    mut c: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= all_ids.len { break }
+        if all_ids[i] == id { c = c + 1 }
+        i++
+    }
+    c
+}
+
+/**
+ * classify_test — the analyzer verdict for one test given the cross-test multiset. STALE when it
+ * covers no id at all; LIVE when it uniquely covers at least one id (some id has fewer than
+ * `REDUNDANT_MIN` covering tests); REDUNDANT when every id it covers is also covered elsewhere.
+ *
+ * @param ids      this test's deduped id set
+ * @param all_ids  the cross-test multiset (`all_ids_of`)
+ * @return         `Verdict::Stale`, `Verdict::Live`, or `Verdict::Redundant`
+ * @since 0.3.0.29
+ */
+fn classify_test(ids: []u64, all_ids: []u64) -> Verdict {
+    if ids.len == 0 { return Verdict::Stale }
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        if count_of(all_ids, ids[i]) < REDUNDANT_MIN { return Verdict::Live }
+        i++
+    }
+    Verdict::Redundant
+}
+
+/** analyzer_header_line — the report's first line: the advisory banner. (0.3.0.29) */
+fn analyzer_header_line() -> str { "teko: test analyzer (dev-time; ADVISORY — removal is manual)" }
+
+/** analyzer_caveat_line — the report's second line: the REDUNDANT-but-still-a-localizer caveat. A
+    REDUNDANT backend golden-vector may still be the SOLE localizer of a specific bug; a human, not the
+    tool, decides whether to remove it. (0.3.0.29) */
+fn analyzer_caveat_line() -> str { "teko: caveat — a REDUNDANT test may still be a sole localizer (diagnostic value); a human decides" }
+
+/** analyzer_fold_line — the report's third line: the assertion-fold caveat. MISLEADING flags a test
+    whose assertion folded to a constant yet still covers production (a green test that guards nothing —
+    a class pure coverage counting cannot detect); FOUNDATIONAL flags a test whose assertions all fold
+    (it tests the language/fold foundation, e.g. `1+1==2`). (0.3.0.29) */
+fn analyzer_fold_line() -> str { "teko: note — MISLEADING = assertion folded-to-constant yet covers production (invisible to coverage); FOUNDATIONAL = tests the foundation (e.g. 1+1)" }
+
+/**
+ * analyzer_line — one per-test report line:
+ * `analyzer <label> ids=<n> asserts=<total>/<folded> status=<...>`.
+ *
+ * @param label   the test's `namespace::name` (or bare `name`) label
+ * @param n       the number of ids the test covered
+ * @param total   the number of bool assertions the test makes
+ * @param folded  how many of those assertions fold to a comptime constant
+ * @param s       the combined status
+ * @return        the formatted, greppable line
+ * @since 0.3.0.29
+ */
+fn analyzer_line(label: str, n: u64, total: u64, folded: u64, s: Status) -> str {
+    let st = status_text(s)
+    $"analyzer {label} ids={n} asserts={total}/{folded} status={st}"
+}
+
+/**
+ * StatusTally — the per-status counts accumulated across the report (0.3.0.29 Crumb 4), so the summary
+ * footer can be a single pure fold over the records.
+ */
+type StatusTally = struct {
+    /** count of MISLEADING tests. */
+    misleading: u64
+    /** count of FOUNDATIONAL tests. */
+    foundational: u64
+    /** count of DEAD tests. */
+    dead: u64
+    /** count of REDUNDANT tests. */
+    redundant: u64
+    /** count of LIVE tests. */
+    live: u64
+}
+
+/** tally_empty — the zero `StatusTally`. (0.3.0.29) */
+fn tally_empty() -> StatusTally { StatusTally { misleading = 0; foundational = 0; dead = 0; redundant = 0; live = 0 } }
+
+/**
+ * tally_add — increment the count for `s` in `t`.
+ *
+ * @param t  the running tally
+ * @param s  the status to increment
+ * @return   `t` with `s`'s count raised by one
+ * @since 0.3.0.29
+ */
+fn tally_add(t: StatusTally, s: Status) -> StatusTally {
+    match s {
+        Status::Misleading => StatusTally { misleading = t.misleading + 1; foundational = t.foundational; dead = t.dead; redundant = t.redundant; live = t.live }
+        Status::Foundational => StatusTally { misleading = t.misleading; foundational = t.foundational + 1; dead = t.dead; redundant = t.redundant; live = t.live }
+        Status::Dead => StatusTally { misleading = t.misleading; foundational = t.foundational; dead = t.dead + 1; redundant = t.redundant; live = t.live }
+        Status::Redundant => StatusTally { misleading = t.misleading; foundational = t.foundational; dead = t.dead; redundant = t.redundant + 1; live = t.live }
+        Status::Live => StatusTally { misleading = t.misleading; foundational = t.foundational; dead = t.dead; redundant = t.redundant; live = t.live + 1 }
+    }
+}
+
+/**
+ * analyzer_summary_line — the report footer: the per-status counts and their total.
+ *
+ * @param t  the accumulated status tally
+ * @return   the formatted summary line
+ * @since 0.3.0.29
+ */
+fn analyzer_summary_line(t: StatusTally) -> str {
+    let total = t.misleading + t.foundational + t.dead + t.redundant + t.live
+    $"analyzer: {t.misleading} MISLEADING, {t.foundational} FOUNDATIONAL, {t.dead} DEAD, {t.redundant} REDUNDANT, {t.live} LIVE (total {total})"
+}
+
+/**
+ * analyzer_report — the WHOLE analyzer report as one string: the three-line header, one
+ * `analyzer_line` per record (the coverage-set axis crossed with the assertion-fold axis into a
+ * combined `Status`), then the summary footer. Pure — the driver builds `recs` from the decoded
+ * `.tkcov` files plus `checker::test_assert_stats` and hands them here.
+ *
+ * @param recs  the per-test records (label + deduped ids + assertion tally)
+ * @return      the complete, newline-terminated report text
+ * @since 0.3.0.29
+ */
+fn analyzer_report(recs: []TestRecord) -> str {
+    let all = all_ids_of(recs)
+    mut out = teko::str::concat(analyzer_header_line(), "\n", analyzer_caveat_line(), "\n", analyzer_fold_line(), "\n")
+    mut tally = tally_empty()
+    mut i: u64 = 0
+    loop {
+        if i >= recs.len { break }
+        let r = recs[i]
+        let cov = classify_test(r.ids, all)
+        let s = combined_status(cov, r.asserts_total, r.asserts_folded)
+        out = teko::str::concat(out, analyzer_line(r.label, r.ids.len, r.asserts_total, r.asserts_folded, s), "\n")
+        tally = tally_add(tally, s)
+        i++
+    }
+    teko::str::concat(out, analyzer_summary_line(tally), "\n")
+}
+
+/**
+ * analyze_records_of — read every `#test`'s isolated `.tkcov` under `adir` and decode it into a
+ * `TestRecord`. The dump file is named by the test's `prog.items` index (the id the analyze harness
+ * baked into its path), so the order here matches the harness's run order. A missing/corrupt file
+ * decodes (via `tkcov_ids`) to an empty id set ⇒ STALE, so a test that never dumped is still reported.
+ *
+ * @param prog  the checked program whose `#test` items were run
+ * @param adir  the scratch directory the analyze binary wrote `<idx>.tkcov` files into
+ * @return      one `TestRecord` per `#test`, in `prog.items` order
+ * @since 0.3.0.29
+ */
+fn analyze_records_of(prog: checker::TProgram, adir: str) -> []TestRecord {
+    mut recs: []TestRecord = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.is_test {
+                    let path = $"{adir}/{i}.tkcov"
+                    let data = match teko::io::read_file(path) { str as s => s; error => "" }
+                    let stats = checker::test_assert_stats(f)
+                    recs = teko::list::push(recs, TestRecord { label = test_label(f); ids = tkcov_ids(data); asserts_total = stats.total; asserts_folded = stats.folded })
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    recs
+}
+
+/**
+ * run_analyzer — the `teko test . --analyzer` body (0.3.0.29): compile the ANALYZE-mode test gate
+ * ONCE, run it ONCE (each `#test` writes its own `<idx>.tkcov` under the scratch dir), then decode
+ * every per-test id set and print the stale/redundant/live report. One compile + one run answers the
+ * whole-suite question — no per-test recompile. Dev-time only, advisory: it prints and returns 0
+ * (a passing gate already ran first); it never fails the build on a verdict.
+ *
+ * @param dir  the project directory (diagnostics)
+ * @param fe   the already-assembled front-end product (checked program + manifest)
+ * @return     0 on success, else the failing status (emit/cc/run error)
+ * @since 0.3.0.29
+ */
+fn run_analyzer(dir: str, fe: Frontend) -> i32 {
+    let od = strip_trailing_slash("bin")
+    match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the analyzer output directory"); null => { } }
+    let stem = teko::str::concat(fe.manifest.name, "-tkanalyze")
+    let cfile = teko::str::concat(od, "/", stem, ".c")
+    let binp = teko::str::concat(od, "/", stem)
+    let emitted = match codegen::tk_emit_c_test_analyze(fe.prog) { str as s => s; error as e => return fail(dir, e.message) }
+    let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(fe.manifest.name, fe.manifest.version, fe.manifest.suffix, fe.manifest.description))
+    match teko::io::write_file(cfile, csrc) { error as e => return fail(dir, e.message); null => { } }
+    if run_cc(cfile, binp, fe.manifest, fe.prog, 0) != 0 { return fail(dir, "cc failed to build the analyzer test gate") }
+    let adir = teko::str::concat(od, "/analyze")
+    match teko::fs::mkdir(adir) { error => return fail(dir, "cannot create the analyzer scratch directory"); null => { } }
+    match teko::env::set_var("TEKO_ANALYZE_DIR", adir) { error => { }; null => { } }
+    let arc = teko::process::run(teko::list::push(teko::list::empty(), binp))
+    if arc != 0 { return arc }
+    teko::io::print(analyzer_report(analyze_records_of(fe.prog, adir)))
+    0
 }
 
 /**
@@ -2788,9 +3276,10 @@ fn run_per_commit_test(dir: str, fe: Frontend, base: str, cov_validation: bool) 
  * @param cov_validation   `--cov-validation` — enforce (fail) the coverage floors instead of warning
  * @param per_test_cov     `--per-test-cov` — also print the dev-time per-test attribution report
  * @param per_commit_base  `--per-commit-test <base>` — the git base for the delta gate ("" = no-op)
+ * @param analyzer         `--analyzer` — after the gate + floors, run the dev-time stale/redundant analyzer
  * @return                 0 when every test passes and the floor + delta policies hold, else the failing status
  */
-fn test_project(dir: str, gen_cov: bool, cov_validation: bool, per_test_cov: bool, per_commit_base: str) -> i32 {
+fn test_project(dir: str, gen_cov: bool, cov_validation: bool, per_test_cov: bool, per_commit_base: str, analyzer: bool) -> i32 {
     ensure_rt_dir_abs()
     let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
     let trc = run_native_gate(dir, "bin", fe.prog, fe.manifest, output_is_tty(false))
@@ -2807,5 +3296,6 @@ fn test_project(dir: str, gen_cov: bool, cov_validation: bool, per_test_cov: boo
         if pc != 0 { return pc }
     }
     if per_test_cov { return run_per_test_cov(dir, fe) }
+    if analyzer { return run_analyzer(dir, fe) }
     0
 }
