@@ -5212,3 +5212,70 @@ fn c2b_literal_adopts_union_member() {
     teko::assert::is_true(!literal_adopts(tnum_i64(1), union_i8_or_i32()))
     teko::assert::is_true(!literal_adopts(tnull_sentinel(), union_i8_or_i32()))
 }
+
+/**
+ * index_assign_requires_mut_container — `type_index_assign` accepts `a[i] = v` when the receiver is a
+ * `mut` slice binding, and REJECTS it when the receiver is immutable (a `let` or a parameter slice),
+ * yielding the "declare it `mut`" diagnostic. This immutable-container barrier is exactly what a slice
+ * for-each's element write-back inherits: `loop x in let_ids { x = 0 }` desugars to the index-store
+ * `let_ids[i] = x`, which this same check refuses — the source of the read-only for-each compile error.
+ */
+#test
+fn index_assign_requires_mut_container() {
+    let u64_slice: Type = Slice { element = Prim { kind = PrimKind::U64 } }
+    let lhs = ek(parser::Index { receiver = e_var("a"); index = e_num(1) })
+    let a = parser::Assign { kind = parser::AssignKind::Index; name = ""; op = lexer::TokenKind::Assign; value = e_num(9); deref = false; target = lhs }
+    let mut_env = define(empty_env(), "a", u64_slice, true)
+    match type_index_assign(a, mut_env, empty_table()) { TypedStmt => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let let_env = define(empty_env(), "a", u64_slice, false)
+    match type_index_assign(a, let_env, empty_table()) { TypedStmt => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * host_surface_resolves_env_io_fs_process — `host_surface_fn` resolves the C-native host-stdlib
+ * surface names (env / io / fs / process) to a `Func` type so a STANDALONE user program can bind them,
+ * and refuses any non-host name. Pins the arity and return shape of one representative per surface:
+ * `read_line` (io, 0 -> str), `args` (env, 0 -> []str), `read_file` (fs, 1 param) and `run`
+ * (process, 1 param -> i32).
+ */
+#test
+fn host_surface_resolves_env_io_fs_process() {
+    match host_surface_fn("read_line") {
+        Type as t => match t {
+            Func as f => {
+                teko::assert::is_true(f.params.len == 0)
+                match f.ret { Str => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match host_surface_fn("args") {
+        Type as t => match t {
+            Func as f => {
+                teko::assert::is_true(f.params.len == 0)
+                match f.ret { Slice as sl => match sl.element { Str => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match host_surface_fn("read_file") {
+        Type as t => match t { Func as f => teko::assert::is_true(f.params.len == 1); _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+    match host_surface_fn("run") {
+        Type as t => match t {
+            Func as f => {
+                teko::assert::is_true(f.params.len == 1)
+                match f.ret { Prim as p => teko::assert::is_true(p.kind == PrimKind::I32); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match host_surface_fn("definitely_not_a_host_fn") {
+        Type => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
+    }
+}
