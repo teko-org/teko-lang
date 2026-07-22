@@ -1006,7 +1006,10 @@ fn emit_type(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte |
         }
         // VARIANT (`A | B | …`) — the generated tk_u_<keys> tagged-union struct (B-cg2). Its
         // typedef is stamped in the prelude. A Named variant decl is reached via Named, not here.
-        checker::Variant as va => cg_variant_typename(buf, va)
+        checker::Variant as va => match cg_union_niche_member(prog, va) {
+            checker::Type as x => emit_type(buf, prog, x)
+            null => cg_variant_typename(buf, va)
+        }
         // (W10a) a function/closure VALUE type `(A, B) -> R` lowers to the uniform runtime
         // `tk_closure { void *fn; void *env; }` (teko_rt.h). The per-signature C type is only
         // needed at the CALL site (a cast on `.fn`), never as a storage type — so one struct
@@ -1280,6 +1283,220 @@ fn cg_variant_typename(buf: []byte, v: checker::Variant) -> []byte | error {
     out
 }
 
+/**
+ * cg_variant_has_null — does the resolved union carry a `null` member (an absence union)? Gates the
+ * C3 representation split: a null-bearing union takes the niche/`uint8`-tag rail; a null-FREE
+ * `A | B | C` keeps its legacy 4-byte enum tag (mangle byte-stability, base §6.3).
+ *
+ * @param v  the resolved union type
+ * @return   true iff a `Null` member is present
+ */
+fn cg_variant_has_null(v: checker::Variant) -> bool {
+    mut i = 0
+    loop {
+        if i >= v.members.len { break }
+        match v.members[i] { checker::Null => return true; _ => { } }
+        i++
+    }
+    false
+}
+
+/**
+ * cg_union_normalize_null — canonicalize a codegen-resolved union's member order so `null`, if
+ * present, is FIRST (mirroring the checker's `union_normalize_null`), collapsing any repeated `null`
+ * to a single leading one. A null-free member list is returned unchanged. Keeps a union resolved by
+ * the codegen-local `cg_te_to_type_ns` byte-identical to the checker-resolved one (same tk_u_ keys,
+ * same tag constants), so a signature/arg-position union agrees with its emitted typedef.
+ *
+ * @param members  the codegen-resolved union members (source order)
+ * @return         the members with any `Null` moved to (a single) index 0
+ */
+fn cg_union_normalize_null(members: []checker::Type) -> []checker::Type {
+    mut has_null = false
+    mut i = 0
+    loop {
+        if i >= members.len { break }
+        match members[i] { checker::Null => has_null = true; _ => { } }
+        i++
+    }
+    if !has_null { return members }
+    mut out: []checker::Type = teko::list::push(teko::list::empty(), checker::Null { })
+    mut j = 0
+    loop {
+        if j >= members.len { break }
+        match members[j] { checker::Null => { }; _ => out = teko::list::push(out, members[j]) }
+        j++
+    }
+    out
+}
+
+/**
+ * cg_type_is_niche_able — does a resolved type carry a spare NULL bit-pattern usable as the `null`
+ * niche of a two-member absence union? True for a class handle (a bare `tk_t_C *` pointer), `ptr<T>`,
+ * `Ref<T>`, and the fat `str`/`error` values (whose `.ptr` is never NULL for a live value); false for
+ * scalars, value structs, slices, closures, interfaces, and polymorphic bases (their fat vtable
+ * pointer is a separate, later concern).
+ *
+ * @param prog  the typed program (class resolution for a `Named` member)
+ * @param x     the candidate niche-carrying member type
+ * @return      true iff `x` may be emitted bare with `NULL` meaning `null`
+ */
+fn cg_type_is_niche_able(prog: checker::TProgram, x: checker::Type) -> bool {
+    match x {
+        checker::Ptr => true
+        checker::Reference => true
+        checker::Str => true
+        checker::Error => true
+        checker::Named as nm => cg_is_class_named(prog, nm.name) && !cg_is_polymorphic_base(prog, nm.name)
+        _ => false
+    }
+}
+
+/**
+ * cg_union_niche_member — for a two-member absence union `{ null, X }`, return `X` when it carries a
+ * spare NULL bit-pattern so codegen may emit `X` BARE with `NULL` (or a `{ptr=NULL}` fat value)
+ * meaning `null` and NO tag word; return `null` when the union must be tagged (a saturating payload,
+ * a value struct, or more than two members). The niche classes are: a `Named` class handle, `Ptr`,
+ * `Reference`, and `error`/`Str` (fat `{ptr,len}` whose `ptr` is never NULL for a live value).
+ *
+ * NOTE (divergence from the design signature, reported to the integrator): (1) the design writes
+ * `cg_union_niche_member(v)`; a `Named` niche must distinguish a CLASS handle (a pointer, niche-able)
+ * from a by-value struct (no NULL niche), which needs the program, so `prog` is threaded in. (2) the
+ * design return is `checker::Type | null | error`; the seed-sequencing law forbids a null-union
+ * VALUE in production `src/` before C5, so the seed-safe legacy `checker::Type?` (Optional) is used —
+ * `null` = tagged, a member = niche; there is no failing path, so the error arm is unnecessary.
+ *
+ * @param prog  the typed program (class/interface resolution for a `Named` member)
+ * @param v     the resolved union type (its members already null-first normalized)
+ * @return      the niche-carrying member `X`, or `null` if the union must be tagged
+ * @see         cg_union_tag_ctype (the inline `uint8`-tag path this gates)
+ * @since 0.3.0.30 (null-union C3)
+ */
+fn cg_union_niche_member(prog: checker::TProgram, v: checker::Variant) -> checker::Type? {
+    if v.members.len != 2 { return null }
+    mut null_count = 0
+    mut other: checker::Type? = null
+    mut i = 0
+    loop {
+        if i >= v.members.len { break }
+        match v.members[i] {
+            checker::Null => null_count = null_count + 1
+            _ => other = v.members[i]
+        }
+        i++
+    }
+    if null_count != 1 { return null }
+    let x = match other { checker::Type as t => t; null => return null }
+    if cg_type_is_niche_able(prog, x) { return x }
+    null
+}
+
+/**
+ * cg_niche_is_fat — is the niche member a fat value (`str`/`error`), whose null pattern zeroes an
+ * inner pointer field, versus a bare pointer handle whose null pattern is a zero word?
+ *
+ * @param x  the niche-carrying member type
+ * @return   true for `str`/`error`; false for a class/`ptr`/`Ref` pointer handle
+ */
+fn cg_niche_is_fat(x: checker::Type) -> bool {
+    match x { checker::Str => true; checker::Error => true; _ => false }
+}
+
+/**
+ * cg_niche_null_accessor — the C member-accessor chain whose zero encodes `null` for a niche member:
+ * `""` for a bare pointer handle (the word itself), `.ptr` for a `str` (its `{ptr,len}` head), and
+ * `.message.ptr` for an `error` (its leading `tk_str message`'s head). A live value never has this
+ * pointer NULL (base §6.2), so its zero is the reserved `null` bit-pattern.
+ *
+ * @param x  the niche-carrying member type
+ * @return   the accessor suffix to append to the subject before the `== 0` / `!= 0` test
+ */
+fn cg_niche_null_accessor(x: checker::Type) -> str {
+    match x {
+        checker::Str => ".ptr"
+        checker::Error => ".message.ptr"
+        _ => ""
+    }
+}
+
+/**
+ * cg_emit_niche_null — emit the C value that MEANS `null` for a niche member `x`: a bare `0` for a
+ * pointer handle (class/`ptr`/`Ref`), or a zero-filled compound literal `(<X>){0}` for a fat
+ * `str`/`error` value (its `.ptr` becomes NULL).
+ *
+ * @param buf   the emit buffer
+ * @param prog  the typed program (to spell the fat value's C type)
+ * @param x     the niche-carrying member type
+ * @return      `buf` with the null value appended, or an error
+ * @throws      error when the fat member's C type cannot be emitted
+ */
+fn cg_emit_niche_null(buf: []byte, prog: checker::TProgram, x: checker::Type) -> []byte | error {
+    if cg_niche_is_fat(x) {
+        mut o = cb(buf, "(")
+        o = match emit_type(o, prog, x) { []byte as r => r; error as e => return e }
+        return cb(o, "){0}")
+    }
+    cb(buf, "0")
+}
+
+/**
+ * cg_emit_niche_is_null — emit the boolean test that niche subject `subj` currently holds `null`:
+ * `(subj == 0)` for a pointer handle, `(subj.ptr == 0)` for a fat `str`/`error` value.
+ *
+ * @param buf   the emit buffer
+ * @param subj  the C subject expression (the bare niche value)
+ * @param x     the niche-carrying member type
+ * @return      `buf` with the boolean test appended
+ */
+fn cg_emit_niche_is_null(buf: []byte, subj: str, x: checker::Type) -> []byte {
+    mut o = cb(buf, "(")
+    o = cb(o, subj)
+    o = cb(o, cg_niche_null_accessor(x))
+    cb(o, " == 0)")
+}
+
+/**
+ * cg_emit_niche_not_null — emit the boolean test that niche subject `subj` currently holds the
+ * present member `x` (non-null): `(subj != 0)` for a pointer handle, `(subj.ptr != 0)` for a fat
+ * `str`/`error` value.
+ *
+ * @param buf   the emit buffer
+ * @param subj  the C subject expression (the bare niche value)
+ * @param x     the niche-carrying member type
+ * @return      `buf` with the boolean test appended
+ */
+fn cg_emit_niche_not_null(buf: []byte, subj: str, x: checker::Type) -> []byte {
+    mut o = cb(buf, "(")
+    o = cb(o, subj)
+    o = cb(o, cg_niche_null_accessor(x))
+    cb(o, " != 0)")
+}
+
+/**
+ * cg_union_tag_ctype — append the C type of a null-bearing tagged union's discriminant: a `uint8_t`
+ * (the owner's 1-byte `0b00000000`), REPLACING the legacy 4-byte `enum tk_tag_<keys>` for any union
+ * carrying a `null` member. A null-FREE `A | B | C` keeps its existing `tk_tag_<keys>` enum tag
+ * (mangle byte-stability, base §6.3).
+ *
+ * @param buf  the emit buffer
+ * @param v    the resolved null-bearing union
+ * @return     `buf` with `uint8_t` (null-bearing) or `tk_tag_<keys>` (null-free) appended, or an error
+ * @throws     error when a member key cannot be mangled
+ * @since 0.3.0.30 (null-union C3)
+ */
+fn cg_union_tag_ctype(buf: []byte, v: checker::Variant) -> []byte | error {
+    if cg_variant_has_null(v) { return cb(buf, "uint8_t") }
+    mut out = cb(buf, "tk_tag")
+    mut i = 0
+    loop {
+        if i >= v.members.len { break }
+        out = cb(out, "_")
+        out = match cg_member_key(out, v.members[i]) { []byte as o => o; error as e => return e }
+        i++
+    }
+    out
+}
+
 // cg_emit_variant_ctype — emit the C TYPE for any variant-shaped resolved type: a Named
 // variant decl → its mangled tk_t_<Name>; an inline `A | B | …` → its tk_u_<keys>. (C: `cg_emit_variant_ctype`.)
 fn cg_emit_variant_ctype(buf: []byte, v: checker::Type) -> []byte | error {
@@ -1306,6 +1523,29 @@ fn cg_opt_mangle_texpr_str(te: parser::TypeExpr) -> str | error {
 fn cg_member_key_texpr_str(m: parser::TypeExpr) -> str | error {
     let k = match cg_opt_mangle_texpr_str(m) { str as s => s; error as e => return e }
     if cg_is_c_keyword(k) { teko::str::concat(k, "_") } else { k }
+}
+
+/**
+ * cg_texpr_union_has_null — does a SYNTACTIC union type-expr carry a `null` member (the `null`
+ * type-atom, a single-segment argument-free `NamedType` named "null")? Gates whether the
+ * field/signature-position emitter routes through the C3 resolved representation.
+ *
+ * @param ut  the syntactic union type-expr
+ * @return    true iff one of its members is the `null` atom
+ */
+fn cg_texpr_union_has_null(ut: parser::UnionType) -> bool {
+    mut i = 0
+    loop {
+        if i >= ut.members.len { break }
+        match ut.members[i] {
+            parser::NamedType as nt => {
+                if nt.args.len == 0 && nt.path.segments.len == 1 && nt.path.segments[0].name == "null" { return true }
+            }
+            _ => { }
+        }
+        i++
+    }
+    false
 }
 
 // cg_variant_typename_texpr — the SYNTACTIC twin of cg_variant_typename — the inline-union
@@ -1416,7 +1656,16 @@ fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr, re
         parser::SliceType as st => cg_opt_mangle_texpr(cb(buf, "tk_slice_"), st.element)
         // INLINE union `A | B | …` in a signature/field position → the generated tk_u_<keys>
         // tagged-union struct (B-cg2); the typedef is stamped in the prelude. (C: emit_type_expr TEXPR_UNION arm.)
-        parser::UnionType as ut => cg_variant_typename_texpr(buf, ut)
+        parser::UnionType as ut => {
+            if !cg_texpr_union_has_null(ut) { return cg_variant_typename_texpr(buf, ut) }
+            match cg_te_to_type_ns(prog, ref_ns, te) {
+                checker::Variant as va => match cg_union_niche_member(prog, va) {
+                    checker::Type as x => emit_type(buf, prog, x)
+                    null => cg_variant_typename(buf, va)
+                }
+                _ => cg_variant_typename_texpr(buf, ut)
+            }
+        }
         // `T?` field/member position → the generated tk_opt_<innerMangle> struct (REBOOT §202).
         parser::OptionalType as ot => cg_opt_mangle_texpr(cb(buf, "tk_opt_"), ot.inner)
         // (W10a) a function-type field/param annotation → the uniform `tk_closure` (teko_rt.h).
@@ -2617,6 +2866,11 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                         parser::SliceType as slt => {
                             let exp_slice = cg_slice_param_type(prog, slt, c.args[j].type)
                             out = match emit_as_r(out, prog, ret_type, exp_slice, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                            wrapped = true
+                        }
+                        parser::UnionType => {
+                            let exp_union = cg_te_to_type_ns(prog, cf_ref_ns, cf.params[j].type_ann)
+                            out = match emit_as_r(out, prog, ret_type, exp_union, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             wrapped = true
                         }
                         _ => { }
@@ -4344,6 +4598,18 @@ fn cg_slice_param_type(prog: checker::TProgram, slt: parser::SliceType, arg_type
 }
 
 fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expected: checker::Type, value: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    match expected {
+        checker::Variant as nva => match cg_union_niche_member(prog, nva) {
+            checker::Type as nx => {
+                match value.kind {
+                    checker::TNullLit => return cg_emit_niche_null(buf, prog, nx)
+                    _ => return emit_expr_ctx(buf, prog, ret_type, value, escaping, regions, fn_body, dctx)
+                }
+            }
+            null => { }
+        }
+        _ => { }
+    }
     // OPTIONAL slot (REBOOT_PLAN §202): wrap the value into the slot's tk_opt_<inner> struct.
     //   * a bare `null`           → (tk_opt_<inner>){ .present = false }
     //   * an already-optional val → emitted plainly (it IS a tk_opt_<inner>)
@@ -4789,6 +5055,21 @@ fn cg_emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, 
         null => { }
     }
     match subjT {
+        checker::Variant as nva => match cg_union_niche_member(prog, nva) {
+            checker::Type as nx => {
+                match pat {
+                    parser::NullPattern => return cg_emit_niche_is_null(buf, subj, nx)
+                    parser::WildcardPattern => return cb(buf, "1")
+                    parser::BindPattern => return cg_emit_niche_not_null(buf, subj, nx)
+                    parser::FieldPattern => return cg_emit_niche_not_null(buf, subj, nx)
+                    _ => { }
+                }
+            }
+            null => { }
+        }
+        _ => { }
+    }
+    match subjT {
         checker::Optional as opt => {
             match opt.inner {
                 checker::Void => { }   // sentinel — never a real match subject; fall through
@@ -4884,6 +5165,28 @@ fn cg_emit_pat_binds(buf: []byte, prog: checker::TProgram, pat: parser::Pattern,
             return cg_emit_pat_binds(buf, prog, pat, ds, kd.var_type, indent)
         }
         null => { }
+    }
+    match subjT {
+        checker::Variant as nva => match cg_union_niche_member(prog, nva) {
+            checker::Type => {
+                match pat {
+                    parser::BindPattern as nbp => {
+                        if nbp.has_binding {
+                            mut o = cb(buf, indent)
+                            o = cb(o, "auto ")
+                            o = cb_str(o, nbp.binding)
+                            o = cb(o, " = ")
+                            o = cb(o, subj)
+                            return cb(o, ";\n")
+                        }
+                        return buf
+                    }
+                    _ => return buf
+                }
+            }
+            null => { }
+        }
+        _ => { }
     }
     match subjT {
         checker::Optional as opt => {
@@ -7674,6 +7977,10 @@ fn cg_te_to_type_ns(prog: checker::TProgram, ref_ns: str, te: parser::TypeExpr) 
             else if last == "str" { checker::Str { } }
             else if last == "error" { checker::Error { } }
             else if last == "void" { checker::Void { } }
+            else if last == "null" { checker::Null { } }
+            else if last == "uptr" { checker::Uptr { } }
+            else if last == "Ref" { if nt.args.len > 0 { checker::Reference { inner = cg_te_to_type_ns(prog, ref_ns, nt.args[0]) } } else { checker::Reference { inner = checker::Void { } } } }
+            else if last == "ptr" { if nt.args.len > 0 { checker::Ptr { inner = cg_te_to_type_ns(prog, ref_ns, nt.args[0]) } } else { checker::Ptr { inner = null } } }
             else { checker::Named { name = cg_te_canonical_name(prog, ref_ns, nt.path, last) } }
         }
         parser::SliceType as st => checker::Slice { element = cg_te_to_type_ns(prog, ref_ns, st.element) }
@@ -7686,7 +7993,7 @@ fn cg_te_to_type_ns(prog: checker::TProgram, ref_ns: str, te: parser::TypeExpr) 
                 mem = teko::list::push(mem, cg_te_to_type_ns(prog, ref_ns, ut.members[i]))
                 i++
             }
-            checker::Variant { members = mem }
+            checker::Variant { members = cg_union_normalize_null(mem) }
         }
         parser::FunctionType => checker::Func { params = teko::list::empty(); ret = checker::Void { }; variadic = false; param_names = []; n_required = 0; defaults = [] }
     }
@@ -7752,6 +8059,10 @@ fn cg_register_variant_body(set: CgTypeSet, prog: checker::TProgram, ref_ns: str
 // shape as a named variant decl, but keyed off the resolved member types). Members' typedefs
 // (slice/opt) precede it by registration order. (C: `cg_emit_inline_variant_typedef`.)
 fn cg_emit_inline_variant_typedef(buf: []byte, prog: checker::TProgram, v: checker::Variant) -> []byte | error {
+    match cg_union_niche_member(prog, v) {
+        checker::Type => return buf
+        null => { }
+    }
     // tag enum: typedef enum tk_tag_<keys> { TK_TAG_U_<UPPER keys…>_<UPPER key>, … } tk_tag_<keys>;
     mut out = cb(buf, "typedef enum tk_tag")
     mut a = 0
@@ -7790,17 +8101,10 @@ fn cg_emit_inline_variant_typedef(buf: []byte, prog: checker::TProgram, v: check
         b++
     }
     out = cb(out, ";\n")
-    // value struct: typedef struct tk_u_<keys> { tk_tag_<keys> tag; union { … } as; } tk_u_<keys>;
     out = cb(out, "typedef struct ")
     out = match cg_variant_typename(out, v) { []byte as o => o; error as err => return err }
-    out = cb(out, " {\n    tk_tag")
-    mut c = 0
-    loop {
-        if c >= v.members.len { break }
-        out = cb(out, "_")
-        out = match cg_member_key(out, v.members[c]) { []byte as o => o; error as err => return err }
-        c++
-    }
+    out = cb(out, " {\n    ")
+    out = match cg_union_tag_ctype(out, v) { []byte as o => o; error as err => return err }
     out = cb(out, " tag;\n    union {\n")
     mut m = 0
     loop {
