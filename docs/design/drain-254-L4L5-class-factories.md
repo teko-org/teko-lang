@@ -8,7 +8,7 @@ shipped through L3 (struct methods) and deferred at L4/L5 as a genuine design ga
 `Map::new()` / `Map<K,V>::new()`).
 **Rule:** every snippet is full-Javadoc, `.tks`-only. C twins FROZEN (only `teko_rt.{c,h}` maintained —
 none needed here). Ritual per crumb = full gate (gen1 native `#test` + `./bin/teko test .` VM +
-FIXPOINT gen2==gen3 byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit).
+FIXPOINT gen1==gen2 byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit).
 
 ---
 
@@ -327,7 +327,7 @@ Helpers to grep-or-add: `path_concat`, `single_seg_path`, `rewrite_segment_at` (
 ## 4. Ordered crumb sequence + regression fixtures
 
 Each crumb is independently gate-able; the guard everywhere is: **corpus carries zero generic
-self-constructs / generic static factories → every arm is a no-op → gen2==gen3 byte-identical.**
+self-constructs / generic static factories → every arm is a no-op → gen1==gen2 byte-identical.**
 
 **Crumb L4.1 — self-construct types to a phantom node (checker).**
 Add `is_self_generic_construct` + `phantom_self_inst_name` (typer/resolve); wire the self-construct
@@ -380,7 +380,7 @@ mono method path both engines). Gate: full VM gate.
 - **Fixpoint (the single most important guard):** the compiler's own source has ZERO generic
   self-constructs and ZERO generic static factories. Every new arm is gated on
   `template.type_params.len > 0` / `is_self_generic_construct` / non-empty `type_args`, all FALSE on
-  the corpus → the mono append and the typed program stay byte-identical → **gen2==gen3 byte-identical
+  the corpus → the mono append and the typed program stay byte-identical → **gen1==gen2 byte-identical
   MUST hold at each crumb.** Verify at every crumb, not only at the end (the L1–L3 lesson). The
   `any_generic` no-op guard (`monomorph.tks:739`) is unaffected.
 - **Laws:** all crumbs are `.tks`-only (Teko-only law); C twins FROZEN, none touched. Full-Javadoc on

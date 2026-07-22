@@ -9,7 +9,7 @@
 > ready for the implementer.
 >
 > This progression is BYTES-CHANGING. The load-bearing proof at every crumb is
-> the **self-host FIXPOINT** (`gen2 == gen3` byte-identical) plus the **size
+> the **self-host FIXPOINT** (`gen1==gen2` byte-identical) plus the **size
 > probe** (the emitted-C `sizeof`/heap assertion). These are NOT optional — a
 > crumb that changes representation and does not carry both rituals is incomplete.
 
@@ -82,7 +82,7 @@ the desugar bridge (C5) makes `T?` ≡ `T | null` before the corpus is rewritten
 ### 0.2 Ritual vocabulary (used per crumb below)
 
 - **[RITUAL: fixpoint]** — the self-host fixpoint: the seed builds `src/` → gen2
-  compiler; gen2 builds `src/` → gen3 compiler; **gen2 == gen3 byte-identical**.
+  compiler; gen2 builds `src/` → gen2 compiler; **gen1==gen2 byte-identical**.
   This is the load-bearing proof for every bytes-changing crumb.
 - **[RITUAL: size probe]** — a native throughput gate: an emitted-C fixture under
   `examples/regressions/` that `EXPECT_EXIT`s on `sizeof`/heap assertions matching
@@ -112,7 +112,7 @@ the pivot.
 zero-indirection classes, and admit `Ref<T> | null` at the resolve gate. No
 corpus value uses these shapes yet (C5 does), so the compiler's own emitted bytes
 are UNCHANGED — the crux fixpoint proof is that adding the machinery, dormant,
-leaves `gen2 == gen3`, and the size probe proves the new shapes hit target.
+leaves `gen1==gen2`, and the size probe proves the new shapes hit target.
 
 ### Representation decision (the rule, applied here)
 
@@ -223,7 +223,7 @@ fn cg_union_tag_ctype(buf: []byte, v: checker::Variant) -> []byte | error
 ### Ritual gate
 
 FIXPOINT is the crux: the machinery is dormant (no `src/` value uses it yet), so
-`gen2 == gen3` MUST hold byte-identically — proving C3 added the representation
+`gen1==gen2` MUST hold byte-identically — proving C3 added the representation
 without disturbing existing emission. Size probe proves the targets. Dual-engine
 proves oracle==native on the new shapes.
 
@@ -460,7 +460,7 @@ fn require_narrowed(use_site: checker::TExpr, val_type: checker::Type, narrowed:
 
 ### Ritual gate
 
-Fixpoint (the whole corpus now on the unified rail; `gen2 == gen3` proves the
+Fixpoint (the whole corpus now on the unified rail; `gen1==gen2` proves the
 pivot is behavior-preserving) + size probe (former `error?` = 16B) + dual-engine.
 
 ---
@@ -518,7 +518,7 @@ in `src/checker/*` (the `error?`-heavy fallible signatures) and the stdlib
   fn round-trips success (`null`) and failure (`error`) on BOTH engines,
   `EXPECT_EXIT` distinguishing the two paths.
 - The **byte-identical corpus rebuild** is itself the primary gate: gen2(C6) ==
-  gen2(C5) for the whole `src/`, plus `gen2 == gen3` fixpoint on the C6 tree.
+  gen2(C5) for the whole `src/`, plus `gen1==gen2` fixpoint on the C6 tree.
 
 ### Ritual gate
 
@@ -578,7 +578,7 @@ This is REMOVED code that OFFSETS the C1/C3 additions (base §7).
 
 ### Ritual gate
 
-Fixpoint (final ratified end-state; `gen2 == gen3`) + FULL GATE (whole `teko test .`
+Fixpoint (final ratified end-state; `gen1==gen2`) + FULL GATE (whole `teko test .`
 + every `scripts/*_regressions.sh` leg `completed + success`, VM-oracle + native).
 
 ---

@@ -24,7 +24,7 @@ evaluates the owner's own-backend+linker hypothesis per path.
 | **QW-1** | Native gate becomes the SOLE build-test gate (drop the duplicate VM step); VM gate → 1 periodic lane | CI-config | **~8-9m** (biggest) | LOW-MED | #265 line/branch cov (have fn cov) |
 | **QW-2** | riscv64-qemu → SMOKE (build + ~30-test arch subset, drop `--coverage`) | CI-config | ~7m off the riscv job | MED (owner ruling) | — |
 | **QW-3** | release-cross-smoke → x86_64-glibc only on PR; full 6-target on nightly/release | CI-config | ~3m | LOW | — |
-| **QW-4** | Fixpoint (gen2==gen3) is release-only, never on PR | CI-config | (already true) | — | — |
+| **QW-4** | Fixpoint (gen1==gen2) is release-only, never on PR | CI-config | (already true) | — | — |
 | **B (#265 full)** | Native gate with line+branch coverage → retire VM gate as default everywhere | compiler | folds QW-1's residual | MED | #265 cov instrumentation |
 | **C** | Coverage zero-cost when off (`tk_cov_*`/`tk_obs_enabled` out of the hot loop) | compiler | ~1-2s/gen | LOW | — |
 | **D** | VM Env O(n)→hash (dev-lane throughput) + already-fixed lexer | compiler | dev-only after B | LOW | — |
@@ -319,7 +319,7 @@ PR-time redundancy moves to nightly.
 
 ### QW-4 — Fixpoint is release-only (already the case; document + guard)
 
-The 3-gen fixpoint (gen2.c==gen3.c byte-identity) is NOT run on PR native.yml — PR CI builds
+The 2-gen fixpoint (gen1.c==gen2.c byte-identity) is NOT run on PR native.yml — PR CI builds
 gen1 once per platform and runs its gate. Good. Keep it that way; the fixpoint belongs to
 `release.yml` (and the #249 open question of whether gen-3 is even needed — a separate
 soundness proof). No PR change; this row exists to state the invariant so a future edit does
@@ -348,7 +348,7 @@ new critical path ≈ linux-x86_64 or windows-arm64 ~360s → ~6m
 ## 4. Compiler-speed architecture (28s/gen → ≤15s → lower)
 
 The self-build itself. Ordered levers; every determinism hazard flagged (the fixpoint
-gen2.c==gen3.c byte-identity must survive EVERY change).
+gen1.c==gen2.c byte-identity must survive EVERY change).
 
 ### Lever B — Native test-gate (the keystone; §2.1). 15.6s → sub-second AFTER #168 split.
 The compiler half of #265: emit per-line/per-branch `tk_cov_mark` in the test-profile codegen

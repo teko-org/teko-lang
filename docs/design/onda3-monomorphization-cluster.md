@@ -203,7 +203,7 @@ clean keying + mangle base; #294 is the ruled scope decision layered on the stam
 > All snippets are full-Javadoc, `.tks`-only. C twins are FROZEN — do NOT touch `.c/.h` except the
 > maintained runtime seam (`teko_rt.{c,h}`), which none of these need. Ritual = the full gate
 > (`teko-verify-both-with-test-gate`): gen1 `teko . -o bin` (native #test gate) + `./bin/teko test .`
-> (VM) + FIXPOINT `gen2==gen3` byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit.
+> (VM) + FIXPOINT `gen1==gen2` byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit.
 
 ### B/#296 — VM u128 non-trapping reinterpret (VM-only, ~1 crumb)
 
@@ -245,7 +245,7 @@ Then `vm.tks:1598` becomes `else { reinterpret_i128_to_u128(raw) }`.
   The .tkp mirrors the `iter_protocol` shape (`kind = "binary"`). This fixture PANICS on the VM today
   (proving the bug) and passes on both after the fix.
 - **Ritual point:** full gate. Extra vigilance on FIXPOINT (norm_int runs in the self-host's own literal
-  lowering — but the corpus carries no u128 high-bit literal, so gen2==gen3 must stay byte-identical;
+  lowering — but the corpus carries no u128 high-bit literal, so gen1==gen2 must stay byte-identical;
   the no-op-on-existing-corpus property is the guard).
 
 ### B/#299 — codegen cb_i128 negative literal (native-only, ~1 crumb)
@@ -389,7 +389,7 @@ proven for optionals/tags (`qualified_optional` fixture).
   that fixture's field-read workaround becomes obsolete (report it, do not silently rewrite unrelated
   fixtures; fold the flip into #290's PR since it IS the regression closure).
 - **Ritual points:** full gate. The self-host compiler is 100% free-function with same-bare classes only in
-  the `#109` type surface, so gen2==gen3 must stay byte-identical (the guard: the qualified-class predicate
+  the `#109` type surface, so gen1==gen2 must stay byte-identical (the guard: the qualified-class predicate
   is a no-op for every non-class-dispatch call). Verify the `di_same_name_cross_ns` flip in the same run.
 
 ### A/#254 — generic type methods (the big one; SEQUENCED after #290)
@@ -478,7 +478,7 @@ method set reuses the same class-lowering; no new codegen).
     key path) — proves the constraint gate + trait fold survive method stamping.
   - Plus corpus `#test`s in `generics_test.tkt` (run on the VM → cover the mono method path both engines).
 - **Ritual points:** full gate at EACH crumb (they are independently gate-able). The no-op-on-non-generic
-  guard (`monomorphize` `any_generic`, `:739`) MUST still hold → gen2==gen3 byte-identical (the compiler
+  guard (`monomorphize` `any_generic`, `:739`) MUST still hold → gen1==gen2 byte-identical (the compiler
   itself has zero generic methods). This is the single most important fixpoint guard in the cluster.
 
 ### A/#294 and A/#301 — see §4 (ruling) and §1 (root); crumbs below.
@@ -529,7 +529,7 @@ new rep.
 - **Highest risk: #254.** The mono pass runs on the self-host compiler itself. The compiler is 100%
   free-function with ZERO generic methods, so the `any_generic` no-op guard (`monomorph.tks:739`) MUST keep
   the non-generic corpus byte-identical. Every crumb of #254 must preserve "no generic method in the
-  program → output byte-identical". This is the non-negotiable fixpoint guard — verify gen2==gen3 at EACH
+  program → output byte-identical". This is the non-negotiable fixpoint guard — verify gen1==gen2 at EACH
   crumb, not just at the end.
 - **#290** touches `lookup_call`, which the compiler exercises on every call. The qualified-class predicate
   MUST be a no-op for every non-class-dispatch call (the guard: only fire when the second-to-last segment

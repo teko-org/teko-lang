@@ -49,7 +49,7 @@ AOT (own backend + the C backend) — and the VM==native differential is gone.
      a new `teko::coverage` namespace, retarget the self-exclusion guards, then delete all of
      `src/vm/` + the frozen C twins + the vestigial C-bootstrap. (re-baseline #3)
   5. **Cleanup + final fixpoint** — stale VM comments, DECISION_LOG, MASTER_PLAN marks, coverage-floor
-     re-check, final `gen2 == gen3` verify.
+     re-check, final `gen1==gen2` verify.
 - **Shared-code hazards found (2):** (a) the **coverage subsystem** (`cov_cobertura`, `cov_merge`,
   `functions_coverage`, `line_coverage`, `branch_coverage`, `*_coverage_pct`, and their
   `CovWalk`/`BranchSite`/`CovCount` helpers) lives in `vm.tks` but is consumed by the NATIVE gate —
@@ -291,7 +291,7 @@ Why acceptable (owner-accepted 2026-07-12; the honest scoreboard from the issue)
    - **adversarial review + the PoC round #523** — the human/structural net that caught #517 Finding 1
      in the first place (the *checker* was unsound; the fix is a checker fix, independent of which
      engine surfaced it).
-   - **self-host fixpoint** — `gen2 == gen3` byte-identity is itself a whole-compiler differential
+   - **self-host fixpoint** — `gen1==gen2` byte-identity is itself a whole-compiler differential
      (the compiler compiling the compiler) that no interpreter provides.
 5. **The regression bar is preserved by fixtures, not by the interpreter.** The `_ as x` class of bug is
    caught going forward by an *asserted* native fixture (see §7), not by an engine that happens to abort
@@ -440,15 +440,14 @@ self-host fixpoint re-baseline, sequenced strictly one-at-a-time (§6).
 - **Ritual leg:** full native gate + a `teko run` exec smoke + fixpoint. **Proves:** `teko test .` runs
   native and passes; `teko run <proj>` builds a debug binary and executes it, propagating the program's
   exit code (e.g. `teko::exit(5)` → 5); `--help` advertises `run` as a native debug-run and no longer
-  lists `--vm-gate`; `gen2 == gen3`.
+  lists `--vm-gate`; `gen1==gen2`.
 
 ### Crumb 3 — retire the REPL
 **Files:** delete `src/repl/repl.tks`, `src/repl/repl_test.tkt`; `main.tks`.
 - `main.tks`: remove the `if cmd == "repl"` arm + `teko::repl::run_cli` call, and the `teko repl …` help
   line.
 - **Ritual leg:** full native gate + fixpoint. **Proves:** `teko repl` is honestly rejected (exit 2);
-  no `teko::repl`/`teko::vm` import remains outside `src/vm/` + `project.tks`'s coverage calls; `gen2 ==
-  gen3`.
+  no `teko::repl`/`teko::vm` import remains outside `src/vm/` + `project.tks`'s coverage calls; `gen1==gen2`.
 
 ### Crumb 4 — move coverage out, delete `src/vm/`
 **Files:** create `src/coverage/coverage.tks`; edit `src/codegen/codegen.tks`, `src/build/project.tks`,
@@ -471,7 +470,7 @@ self-host fixpoint re-baseline, sequenced strictly one-at-a-time (§6).
 - **Ritual leg:** full native gate + own==C differential + fixpoint + coverage-floor re-check.
   **Proves:** `src/vm/` is gone; `teko . -o bin` self-build is green; the three coverage floors still
   pass (the move is self-excluded, §4.3); the `--coverage` Cobertura report is byte-identical to the
-  pre-move report on the same corpus; `gen2 == gen3`.
+  pre-move report on the same corpus; `gen1==gen2`.
 
 ### Crumb 5 — cleanup + final fixpoint + docs
 **Files:** `.github/workflows/sanitizers.yml`, `.github/workflows/native.yml`, `DECISION_LOG.md`,
@@ -481,7 +480,7 @@ self-host fixpoint re-baseline, sequenced strictly one-at-a-time (§6).
 - MASTER_PLAN: mark the VM interpreter + REPL rows retired; note `teko run`/`teko test` are now native
   (`teko run` = native debug build-and-exec); native is the sole engine.
 - **Ritual leg:** the FULL gate (this is the closing ritual point). **Proves:** the whole wave is green,
-  documentation matches reality, `gen2 == gen3` one final time.
+  documentation matches reality, `gen1==gen2` one final time.
 
 ---
 
@@ -489,7 +488,7 @@ self-host fixpoint re-baseline, sequenced strictly one-at-a-time (§6).
 
 Removing `vm.tks` (~1400 functions) + `repl.tks` + `driver.tks` shrinks the compiler source, so the
 emitted C for the whole compiler changes and the self-host fixpoint (memory
-`selfhost-byte-identity-broken`: normalized `gen1 == gen2`, byte-identical `gen2 == gen3`) re-baselines.
+`selfhost-byte-identity-broken`: normalized `gen1 == gen2`, byte-identical `gen1==gen2`) re-baselines.
 
 Per the re-baseline-ordering law, only ONE re-baseline may be in flight at a time and it must NOT overlap
 another issue's:
@@ -500,7 +499,7 @@ another issue's:
   verify completes before crumb N+1 begins). Crumbs 1 and 5 touch no `src/` code → no re-baseline.
 
 Determinism is preserved (the compiler is deterministic; removing modules only changes item indices /
-gensym counters uniformly), so each `gen2 == gen3` holds. The coverage move keeps the emitted C
+gensym counters uniformly), so each `gen1==gen2` holds. The coverage move keeps the emitted C
 byte-identical for surviving functions (§4.3), so the only source-driven diff is the *removal* of the VM
 functions — a clean shrink, not a churn.
 
@@ -530,7 +529,7 @@ with an asserted value (the corpus's standard exit(n) shape).
 
 - **After crumb 1** — CI green with the VM lanes removed and own==C + native gate intact (CI-only ritual;
   no fixpoint).
-- **After crumb 2** — full native gate + `teko run` rejection + fixpoint `gen2 == gen3`.
+- **After crumb 2** — full native gate + `teko run` rejection + fixpoint `gen1==gen2`.
 - **After crumb 3** — full native gate + `teko repl` rejection + fixpoint.
 - **After crumb 4** — full native gate + own==C differential + coverage-floor re-check +
   `--coverage` byte-identity + fixpoint. **This is the keystone ritual** (the VM is gone here).

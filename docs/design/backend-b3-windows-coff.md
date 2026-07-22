@@ -838,7 +838,7 @@ object format (COFF), so it hardens the shared pipeline against ABI/format coupl
   in CI at the ritual points. Local per-slice verification is PROPORTIONATE — the
   default-path-unchanged proof + the slice's own goldens/tests + (for the frame slice) B1's x86 frame
   goldens re-green byte-identical + (for the writer slice) the `emit_coff` goldens + a `lld-link`
-  consumability check. **NO local 3-gen-fixpoint or paranoid for the mechanical slices** — CI does it.
+  consumability check. **NO local 2-gen-fixpoint or paranoid for the mechanical slices** — CI does it.
 - **FIXPOINT is structural, not re-proven locally per slice.** B3 is purely ADDITIVE files + one
   guarded `AbiDescriptor` field (0 for every existing ABI) + one `NativeTarget` arm whose default
   (arm64) path is verbatim, so the default output is byte-unchanged by construction; CI's fixpoint leg

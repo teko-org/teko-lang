@@ -178,7 +178,7 @@ Ritual: fixpoint + probe: allocs de `cg_variant_typename_str` no dark-matter →
   novo. `*`/deref fica unsafe (não tocado). **Nenhuma nota de lei nova, nenhum HALT.**
 
 **Behavior:** TODOS os crumbs são ADITIVOS — nada no corpus USA `&x` ainda ⇒ o C emitido pro
-alvo é byte-idêntico e o fixpoint gen2==gen3 vale INALTERADO. O C do PRÓPRIO compilador só ganha
+alvo é byte-idêntico e o fixpoint gen1==gen2 vale INALTERADO. O C do PRÓPRIO compilador só ganha
 código morto (caminhos novos não exercitados pelo self-build) até AL3/AL6 migrarem sites.
 
 | # | Crumb | Tam | Ritual |
@@ -188,7 +188,7 @@ código morto (caminhos novos não exercitados pelo self-build) até AL3/AL6 mig
 | **F1.3** | Spine: autorizar borrow exclusivo (`is_unique_at`) + lifetime (`ref_target_outlives`); L2a `bf:=BfLocal`; relaxar escape-gate p/ o sink `mut y=&x` | M | spine_test.tkt + fixpoint verde |
 | **F1.4** | Codegen: lower `Borrow` → address-of `&` | S | codegen_test.tkt + diff VM==native |
 | **F1.5** | Ponte: `teko::list::grow(&x, v)` (coexistência, sem migrar sites) | S | list_test.tkt + fixpoint |
-| **F1.6** | Fixtures de regressão + fixpoint verde (prova de aditividade) | S | **RITUAL: fixpoint gen2==gen3 INALTERADO** |
+| **F1.6** | Fixtures de regressão + fixpoint verde (prova de aditividade) | S | **RITUAL: fixpoint gen1==gen2 INALTERADO** |
 
 **F1.1 — Parser.** Append um membro NOVO ao fim de `ExprKind` (append = tags estáveis, TKB
 byte-layout preservado; "código não mente" — um nó honesto, não `Unary{op=Amp}` sobrecarregado):
@@ -290,9 +290,9 @@ Teko com assert), MAIS 1–2 programas end-to-end rodados VM e native pra parida
 | borrow-alias-reject | `src/checker/spine_test.tkt` | dois borrows mut vivos de `x` | `is_unique_at`=false → erro exclusivo-XOR |
 | borrow-outlives | `src/checker/spine_test.tkt` | `mut y=&x` sink local | `ref_target_outlives`=true; escape-gate admite |
 | borrow-codegen | `src/codegen/codegen_test.tkt` | `grow(&x, v)` | emite `&x`; `<T> *`; diff VM==native byte-idêntico |
-| e2e-noop | programa end-to-end | corpus que NÃO usa `&x` | **fixpoint gen2==gen3 INALTERADO** |
+| e2e-noop | programa end-to-end | corpus que NÃO usa `&x` | **fixpoint gen1==gen2 INALTERADO** |
 
-**RITUAL de F1 (o que prova aditividade):** (1) fixpoint gen2==gen3 verde e INALTERADO — nada no
+**RITUAL de F1 (o que prova aditividade):** (1) fixpoint gen1==gen2 verde e INALTERADO — nada no
 corpus usa `&x`, então o C emitido pro alvo é byte-idêntico; (2) golden do corpus-alvo + diff
 VM==native; (3) suites `_test.tkt` novas verdes. NÃO deve haver mudança em bytes emitidos pro alvo
 (F1 é aditivo); qualquer diff no golden do alvo é REGRESSÃO, não esperado.

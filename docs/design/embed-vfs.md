@@ -445,7 +445,7 @@ and is inert; C1–C7 land when the owner unblocks.
 | **C1** | M | Parser: `EmbedDecl` node + `parse_embed`; wire into `parse_decl`/`parse_module`. | `parse_decl_test.tkt` parse goldens for both forms + each malformed tail |
 | **C2** | M | `resolve_embed_path`: exact-path, downward-only, escape rejection, conflict detection (pure fn — no I/O). | `embed_test.tkt`: escape/absolute/`..`/conflict → error; in-project → ok |
 | **C3** | M | Compile-time read seam `tk_rt_read_file_bytes` in **maintained** `teko_rt.{c,h}` + `io::read_file_bytes`; embed pass reads bytes; per-directive compress (call `deflate`/`gzip_compress`); level-range validation. | `io` seam test; embed pass unit: bytes read + round-trip through inflate |
-| **C4** | L | Const materialization: emit the four Tier-A consts into rodata via #594 Tier-A; build the `FileSystem` const over them. **Changes emitted bytes** (the binary now carries the VFS). | re-golden; **fixpoint gen2==gen3**; VM==native |
+| **C4** | L | Const materialization: emit the four Tier-A consts into rodata via #594 Tier-A; build the `FileSystem` const over them. **Changes emitted bytes** (the binary now carries the VFS). | re-golden; **fixpoint gen1==gen2**; VM==native |
 | **C5** | S/M | Accessor: `read`/`exists`/`list` (+ `read_str`) decode the packed table and inflate per `comp_tag`. | `embed_test.tkt`: embed→read round-trip for None/Deflate/Gzip |
 | **C6** | S | Mascot: `print_mascot` gated on `output_is_tty`; call at command entry. **The corpus now USES `#embed`** → requires C1–C5 in the released SEED first (see §5.1). | build/CLI test: TTY prints, `--no-tty`/non-TTY silent |
 | **C7** | M | (deferred extension) Glob matching (`*`, then `**`); zstd/lz4 variants. | glob match fixtures; new-codec round-trip |
@@ -461,7 +461,7 @@ the compiler's own corpus). Sequence: land C1–C5 → 🔑 SEED BUMP → then C
 
 - **Per crumb:** the crumb's own `.tkt` gate.
 - **RITUAL POINT — C4 (bytes change):** the binary first carries the rodata VFS. Full gate:
-  re-golden every backend/object goldens, **fixpoint gen2==gen3 byte-identical**, `diff_vm_native.sh`
+  re-golden every backend/object goldens, **fixpoint gen1==gen2 byte-identical**, `diff_vm_native.sh`
   (VM==native — same read/exit outcome), `TEKO_MEM_PARANOID=1`, Javadoc/`//`-audit. C0–C3 are
   byte-inert (no emitted-const change) and prove out on their unit gates + a green full gate.
 - **RITUAL POINT — after C5, before the C5→seed bump:** full gate again; the accessor is now

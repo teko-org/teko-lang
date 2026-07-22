@@ -1027,7 +1027,7 @@ HALTs.
   `match native_target()` and only for `TEKO_TARGET ∈ {wasm32-wasi, wasm64-wasi, wasm32-browser}`
   (`:865-872`). With NO env set (the compiler compiling itself, and every default user build),
   `native_backend_selected()` is `false`, `emit_native` is never entered, and not one byte of the C
-  codegen path changes — so **gen2 == gen3 holds by construction** (the fixpoint gate in
+  codegen path changes — so **gen1==gen2 holds by construction** (the fixpoint gate in
   `release.yml`/`sanitizers.yml` is untouched). This is the S-1 dividend: because the seam is the
   pre-existing `TEKO_BACKEND=native` + `TEKO_TARGET` and NOT a new env var, C1-8 adds **zero** new
   branches to the default path.
@@ -1167,7 +1167,7 @@ exit(s)
 - **C1-8d · fixpoint + full-gate keystone ritual + close #389 (reached-pending-close).** Confirm the whole ritual on the lane:
   the native test gate (#265, `run_gate_native`) green, `diff_c_own.sh` green (C-native == own-native,
   register targets), the new `validate_wasm_own` wasm leg green (own-wasm == C-native), and
-  **fixpoint gen2 == gen3 byte-identical** (Q4 — the wasm arm is unreachable on the default path, so
+  **fixpoint gen1==gen2 byte-identical** (Q4 — the wasm arm is unreachable on the default path, so
   this is preserved by construction; re-run the `release.yml`/`sanitizers.yml` fixpoint gate to prove
   it). Verify **100% coverage on C1-8's new code** — which is fixtures + CI YAML + this doc, carrying
   NO new Teko product lines, so the obligation is discharged by the already-covered `emit_native_wasm`/

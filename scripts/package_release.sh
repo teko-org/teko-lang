@@ -2,20 +2,20 @@
 # scripts/package_release.sh — assemble a Teko bootstrap RELEASE bundle for one platform.
 #
 # This is the packaging half of .github/workflows/release.yml. It runs AFTER the
-# workflow has already produced the self-host fixpoint (gen-1 -> gen-2 -> gen-3, with
-# gen-2 == gen-3 asserted byte-identical) and been handed the gen-3 outputs. It emits,
+# workflow has already produced the self-host fixpoint (gen-1 -> gen-2, with
+# gen-1 == gen-2 asserted byte-identical) and been handed the gen-2 outputs. It emits,
 # into $OUT_DIR:
 #
-#   1. teko-<LABEL>.tar.gz  (or .zip on Windows) — the per-platform gen-3 `teko` binary.
+#   1. teko-<LABEL>.tar.gz  (or .zip on Windows) — the per-platform gen-2 `teko` binary.
 #   2. teko-bootstrap-src.tar.gz — the PORTABLE, any-cc bootstrap snapshot: the generated
-#      gen-3 `teko.c` plus the EXACT minimal set of runtime/assert sources it links, in
+#      gen-2 `teko.c` plus the EXACT minimal set of runtime/assert sources it links, in
 #      the directory layout their #includes require. Same on every platform, so the
 #      workflow builds it ONCE (on the source-of-truth runner) and publishes it once.
 #   3. SHA256SUMS-<LABEL>.txt — checksums of every artifact this invocation produced.
 #
 # ── PROVEN minimal standalone-bootstrap file set ────────────────────────────────────
 # A from-scratch `cc teko.c ... -o teko` needs exactly (verified by building + running it):
-#   teko.c                 the gen-3 generated program (this is what gets published)
+#   teko.c                 the gen-2 generated program (this is what gets published)
 #   runtime/teko_rt.c      the execution runtime (tk_str, tk_print, tk_panic_*, arena, …)
 #   runtime/teko_rt.h      its header — teko.c does #include "teko_rt.h"
 #   assert/assert.c        the teko::assert seed (test assertions the corpus references)
@@ -28,9 +28,9 @@
 # Build line (POSIX):   cc -std=c23 -Iruntime -Iassert teko.c runtime/teko_rt.c assert/assert.c -lm -o teko
 #
 # Usage:
-#   package_release.sh <LABEL> <GEN3_DIR> <SRC_DIR> <OUT_DIR> [os]
+#   package_release.sh <LABEL> <GEN2_DIR> <SRC_DIR> <OUT_DIR> [os]
 #     LABEL     platform label, e.g. linux-x86_64 / macos-arm64 / windows-x86_64
-#     GEN3_DIR  directory holding the gen-3 outputs (teko binary + teko.c)
+#     GEN2_DIR  directory holding the gen-2 outputs (teko binary + teko.c)
 #     SRC_DIR   the repo's src/ directory (source of teko_rt.*, assert.*, win32_compat.h)
 #     OUT_DIR   where to write the archives + checksums
 #     os        optional: "windows" selects .zip + teko.exe; anything else = tar.gz + teko
@@ -54,15 +54,15 @@ fi
 BIN_PATH="$GEN3_DIR/$BIN_NAME"
 
 if [ ! -f "$BIN_PATH" ]; then
-    echo "package_release: gen-3 binary not found: $BIN_PATH" >&2
+    echo "package_release: gen-2 binary not found: $BIN_PATH" >&2
     exit 1
 fi
 if [ ! -f "$GEN3_DIR/teko.c" ]; then
-    echo "package_release: gen-3 teko.c not found: $GEN3_DIR/teko.c" >&2
+    echo "package_release: gen-2 teko.c not found: $GEN3_DIR/teko.c" >&2
     exit 1
 fi
 
-# ── 1. per-platform gen-3 binary archive ────────────────────────────────────────────
+# ── 1. per-platform gen-2 binary archive ────────────────────────────────────────────
 BIN_ARCHIVE="teko-${LABEL}"
 STAGE="$OUT_DIR/.stage-bin"
 rm -rf "$STAGE"
