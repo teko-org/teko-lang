@@ -6,6 +6,9 @@ use teko::lexer
 // bindings, assignment, loop/break/continue.
 fn parse_statement(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
     if !has_token(tokens, pos) { return err_at(tokens, pos, "expected a statement") }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Hash) {
+        return parse_inline_binding(tokens, pos)
+    }
     if is_kind_at(tokens, pos, lexer::TokenKind::Return) {
         // `return` with an optional value: bare `return` ends at a separator or `}`.
         let after = pos + 1
@@ -161,6 +164,34 @@ fn parse_annotation(tokens: []lexer::Token, pos: u64) -> Annotation | error {
     }
     let ty = match parse_type(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
     Annotation { has_type = true; type_ann = ty.node; next = ty.next }
+}
+
+/**
+ * parse_inline_binding — parse a local binding carrying the `#inline` layout attribute (C4's NEW
+ * binding parse site): `#inline let|mut|const TARGET [: T] = value`. The attribute forces a
+ * boxed-by-default union slot back to the in-frame inline-tag representation; it is recognized and
+ * consumed here, then the binding parses normally. Only a `let`/`mut`/`const` may follow `#inline` in
+ * statement position — any other statement after `#inline` is a precise placement error.
+ *
+ * NOTE (bounded C4 divergence, reported to the integrator): the parsed `#inline` flag is not yet
+ * persisted onto the binding AST nor honored by codegen — the end-to-end layout flip is a flagged
+ * remainder (see the C4 report). The parse site + `inline_attr_eligible` validator land in C4.
+ *
+ * @param tokens  the token stream
+ * @param pos     the index of the leading `#` token
+ * @return        the parsed binding statement (past the value), or a precise placement error
+ * @throws        when `#` is not `#inline`, or `#inline` is not followed by a binding keyword
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn parse_inline_binding(tokens: []lexer::Token, pos: u64) -> Parsed<Statement> | error {
+    if !is_kind_at(tokens, pos + 1, lexer::TokenKind::Ident) || tokens[pos + 1].text != "inline" {
+        return err_at(tokens, pos + 1, "expected `inline` after `#` — only `#inline` attaches to a local binding")
+    }
+    let after = skip_seps(tokens, pos + 2)
+    if !(is_kind_at(tokens, after, lexer::TokenKind::Let) || is_kind_at(tokens, after, lexer::TokenKind::Mut) || is_kind_at(tokens, after, lexer::TokenKind::Const)) {
+        return err_at(tokens, after, "`#inline` attaches only to a `let`/`mut`/`const` binding")
+    }
+    parse_binding(tokens, after)
 }
 
 // `let|mut|const TARGET [: T] = value` (B.13, B.21). TARGET is a name or a destructure

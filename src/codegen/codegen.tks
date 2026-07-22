@@ -1008,7 +1008,10 @@ fn emit_type(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte |
         // typedef is stamped in the prelude. A Named variant decl is reached via Named, not here.
         checker::Variant as va => match cg_union_niche_member(prog, va) {
             checker::Type as x => emit_type(buf, prog, x)
-            null => cg_variant_typename(buf, va)
+            null => match cg_union_box_member(prog, va) {
+                checker::Type as bx => cb(match emit_type(buf, prog, bx) { []byte as o => o; error as e => return e }, " *")
+                null => cg_variant_typename(buf, va)
+            }
         }
         // (W10a) a function/closure VALUE type `(A, B) -> R` lowers to the uniform runtime
         // `tk_closure { void *fn; void *env; }` (teko_rt.h). The per-signature C type is only
@@ -1497,6 +1500,247 @@ fn cg_union_tag_ctype(buf: []byte, v: checker::Variant) -> []byte | error {
     out
 }
 
+/**
+ * The physical storage class chosen for a resolved union type: `Niche` (bare value, `NULL` /
+ * `{ptr=NULL}` means `null`, no tag word — C3), `InlineTag` (`{ uint8_t tag; payload }`, in-frame,
+ * max-size, zero-indirection — a saturating payload < 16 bytes, or an `#inline`-forced slot), or
+ * `BoxInArena` (an 8-byte handle into the arena, `NULL` = `null` = zero heap, a bump-alloc cell on a
+ * non-null construct — a saturating payload ≥ 16 bytes, default). This is the LAYOUT dial only,
+ * orthogonal to the union's semantic category (base §6.4 Fact 4).
+ *
+ * @since 0.3.0.30 (null-union C4)
+ */
+type UnionRepr = enum { Niche; InlineTag; BoxInArena }
+
+/**
+ * cg_type_min_bytes — a conservative compile-time LOWER BOUND on the C storage size (in bytes) of a
+ * resolved value type, used only to classify a union member as saturating-large (≥ 16 bytes → box)
+ * versus small (< 16 → inline-tag). A `Prim` is its bit-width in bytes (`u128`/`i128` → 16); `byte`/
+ * `char` are one byte; the fat `str`/`error`/slice values are two words (16); a pointer/handle/closure
+ * is one word (8); a by-value struct is the sum of its field lower bounds (the walk stops at a class
+ * handle / slice / pointer, one word, so a recursive back-edge never diverges); an unknown shape
+ * defaults to one word. Over/under-approximation only shifts a borderline member between two valid
+ * representations — never miscompiles a value.
+ *
+ * @param prog  the typed program (struct-field resolution for a `Named` by-value aggregate)
+ * @param x     the resolved member type whose size lower bound is wanted
+ * @return      a lower bound, in bytes, on `x`'s C storage size
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn cg_type_min_bytes(prog: checker::TProgram, x: checker::Type) -> u64 {
+    cg_type_min_bytes_d(prog, x, 0)
+}
+
+/**
+ * cg_prim_min_bytes — the byte size of a scalar `Prim`: its bit width divided by 8, floored at one
+ * byte so a sub-byte `bool` still occupies a whole byte. `u128`/`i128` yield 16 (the box threshold).
+ *
+ * @param k  the primitive kind
+ * @return   the primitive's C storage size in bytes (≥ 1)
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn cg_prim_min_bytes(k: checker::PrimKind) -> u64 {
+    let bits = checker::prim_width(k) to u64
+    if bits < (8 to u64) { return 1 to u64 }
+    bits / (8 to u64)
+}
+
+/**
+ * cg_type_min_bytes_d — the depth-bounded worker behind `cg_type_min_bytes`. A `Named` by-value
+ * struct sums its field lower bounds; the `depth` cap (4) and the one-word treatment of every
+ * pointer/handle/slice keep the walk finite over a recursive value graph.
+ *
+ * @param prog   the typed program (struct-field resolution)
+ * @param x      the resolved type whose size lower bound is wanted
+ * @param depth  the current struct-nesting depth (a by-value struct beyond the cap counts as one word)
+ * @return       a lower bound, in bytes, on `x`'s C storage size
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn cg_type_min_bytes_d(prog: checker::TProgram, x: checker::Type, depth: u64) -> u64 {
+    match x {
+        checker::Prim as p => cg_prim_min_bytes(p.kind)
+        checker::Byte => 1 to u64
+        checker::Char => 4 to u64
+        checker::Str => 16 to u64
+        checker::Error => 16 to u64
+        checker::Slice => 16 to u64
+        checker::Ptr => 8 to u64
+        checker::Uptr => 8 to u64
+        checker::Reference => 8 to u64
+        checker::Func => 16 to u64
+        checker::Null => 1 to u64
+        checker::Named as nm => cg_named_min_bytes(prog, nm.name, depth)
+        _ => 8 to u64
+    }
+}
+
+/**
+ * cg_named_min_bytes — the size lower bound of a `Named` type: a CLASS/enum/interface/base is a
+ * one-word handle or small scalar; a by-value STRUCT is the sum of its resolved field lower bounds
+ * (below the depth cap), which is what makes a large aggregate cross the 16-byte box threshold.
+ *
+ * @param prog   the typed program (decl + field resolution)
+ * @param name   the canonical `Named` type name
+ * @param depth  the current struct-nesting depth
+ * @return       a lower bound, in bytes, on the named type's C storage size
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn cg_named_min_bytes(prog: checker::TProgram, name: str, depth: u64) -> u64 {
+    if cg_is_class_named(prog, name) { return 8 to u64 }
+    if cg_named_is_enum(prog, name) { return 4 to u64 }
+    if depth >= (4 to u64) { return 8 to u64 }
+    let d = match cg_find_decl(prog, name) { parser::TypeDecl as dd => dd; error => return 8 to u64 }
+    let sb = match d.body { parser::StructBody as s => s; _ => return 8 to u64 }
+    mut total = 0 to u64
+    mut i = 0
+    loop {
+        if i >= sb.fields.len { break }
+        let ft = cg_te_to_type_ns(prog, checker::name_qualifier(name), sb.fields[i].type_ann)
+        total = total + cg_type_min_bytes_d(prog, ft, depth + (1 to u64))
+        i++
+    }
+    total
+}
+
+/**
+ * cg_union_box_member — for a two-member absence union `{ null, X }`, return `X` when it is the
+ * BOX-IN-ARENA class: `X` carries NO spare NULL niche (so `cg_union_niche_member` declined it) AND
+ * its saturating payload is ≥ 16 bytes (`u128`/`i128`, a large by-value struct). Such an `X` is
+ * stored as an 8-byte handle into the arena (`NULL` = `null` = zero heap; a `tk_region_alloc` cell on
+ * a non-null construct); return `null` for any smaller/niche-able member (those stay niche or
+ * inline-tag). Mirrors `cg_union_niche_member`'s two-member/one-null shape gate.
+ *
+ * @param prog  the typed program (niche + size classification)
+ * @param v     the resolved union type (its members already null-first normalized)
+ * @return      the boxed member `X`, or `null` when the union is not a box-in-arena union
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn cg_union_box_member(prog: checker::TProgram, v: checker::Variant) -> checker::Type? {
+    if v.members.len != 2 { return null }
+    mut null_count = 0
+    mut other: checker::Type? = null
+    mut i = 0
+    loop {
+        if i >= v.members.len { break }
+        match v.members[i] {
+            checker::Null => null_count = null_count + 1
+            _ => other = v.members[i]
+        }
+        i++
+    }
+    if null_count != 1 { return null }
+    let x = match other { checker::Type as t => t; null => return null }
+    if cg_type_is_niche_able(prog, x) { return null }
+    if cg_type_min_bytes(prog, x) >= (16 to u64) { return x }
+    null
+}
+
+/**
+ * union_repr_class — classify how a resolved union is stored: `Niche` (bare, C3), `BoxInArena`
+ * (8-byte handle, saturating ≥ 16B default — C4), or `InlineTag` (`{uint8;payload}`, saturating < 16B
+ * or an `#inline`-forced slot). The single source of truth the union emitter consults so every emit
+ * site agrees on one physical shape per (type, forced-inline) pair.
+ *
+ * NOTE (divergence from the design signature, reported to the integrator): the design writes
+ * `union_repr_class(v, forced_inline, table)`; a `Named` member's niche/size classification needs the
+ * typed PROGRAM (class-vs-struct + field resolution), so `prog` is threaded in place of the checker
+ * `table`, exactly as `cg_union_niche_member` diverged in C3.
+ *
+ * @param prog            the typed program (member niche + size classification)
+ * @param v               the resolved union type
+ * @param forced_inline   true iff an `#inline` attribute rides the binding/field storing this union
+ * @return                the physical representation class
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn union_repr_class(prog: checker::TProgram, v: checker::Variant, forced_inline: bool) -> UnionRepr {
+    match cg_union_niche_member(prog, v) {
+        checker::Type => return UnionRepr::Niche
+        null => { }
+    }
+    if forced_inline { return UnionRepr::InlineTag }
+    match cg_union_box_member(prog, v) {
+        checker::Type => return UnionRepr::BoxInArena
+        null => { }
+    }
+    UnionRepr::InlineTag
+}
+
+/**
+ * cg_union_inline_recursive — would inline-forcing the union `union_t` be SELF-RECURSIVE (hence of no
+ * finite size)? True when the candidate payload `x` transitively EMBEDS `union_t` BY VALUE — through
+ * struct fields only; a slice/pointer/class handle is an indirection that finitizes the type and
+ * stops the walk. Depth-bounded so a genuinely finite value graph always terminates.
+ *
+ * @param prog     the typed program (struct-field resolution)
+ * @param union_t  the resolved union whose inline-forcing is being validated
+ * @param x        the resolved type currently being walked (initially the boxed payload member)
+ * @param depth    the current struct-nesting depth (bounded)
+ * @return         true iff `x` embeds `union_t` by value (inline-forcing would not terminate)
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn cg_union_inline_recursive(prog: checker::TProgram, union_t: checker::Type, x: checker::Type, depth: u64) -> bool {
+    if depth >= (8 to u64) { return false }
+    if cg_mangle_eq(union_t, x) { return true }
+    match x {
+        checker::Named as nm => {
+            if cg_is_class_named(prog, nm.name) { return false }
+            let d = match cg_find_decl(prog, nm.name) { parser::TypeDecl as dd => dd; error => return false }
+            let sb = match d.body { parser::StructBody as s => s; _ => return false }
+            mut i = 0
+            loop {
+                if i >= sb.fields.len { break }
+                let ft = cg_te_to_type_ns(prog, checker::name_qualifier(nm.name), sb.fields[i].type_ann)
+                if cg_union_inline_recursive(prog, union_t, ft, depth + (1 to u64)) { return true }
+                i++
+            }
+            false
+        }
+        _ => false
+    }
+}
+
+/**
+ * inline_attr_eligible — validate an `#inline` attribute applied to a binding or field of type `t`.
+ * Legal ONLY when `t` is a boxed-by-default sum: a `Variant` whose saturating max payload is ≥ 16
+ * bytes and carries no niche (the `BoxInArena` class), so `#inline` meaningfully flips it back to the
+ * in-frame inline-tag. Each ineligible class is rejected with a DISTINCT reason (never a silent
+ * no-op): a non-sum type; a niche-able sum (already one word); a self-recursive sum (MUST box — an
+ * inline self-recursive sum has no finite size); and a sum whose payload is already < 16 bytes
+ * (already inline). General scope, owner-ratified (D10).
+ *
+ * NOTE (divergence from the design signature, reported to the integrator): the design writes
+ * `inline_attr_eligible(t, table) -> null | error`; the niche/size/recursion classification reuses the
+ * codegen helpers that already take the typed PROGRAM (`cg_union_niche_member` / `cg_union_box_member`
+ * / `cg_union_inline_recursive`), so `prog` is threaded in place of the checker `table`, and the
+ * seed-safe legacy `error?` return is used (null = eligible, an error = the ineligible reason) — the
+ * same C3 divergence as `variant_member_admissible`.
+ *
+ * @param prog  the typed program (member niche + size + recursion resolution)
+ * @param t     the resolved type the `#inline` attribute is applied to
+ * @return      null when `#inline` is legal; an error naming the ineligible class
+ * @throws      error on any of the four ineligible classes (non-sum / niche-able / recursive / small)
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn inline_attr_eligible(prog: checker::TProgram, t: checker::Type) -> error? {
+    let v = match t {
+        checker::Variant as va => va
+        _ => return error { message = "`#inline` applies only to a boxed union (sum) type — this is not a sum" }
+    }
+    match cg_union_niche_member(prog, v) {
+        checker::Type => return error { message = "`#inline` is a no-op here: this union is already niche-optimal (one word, no tag)" }
+        null => { }
+    }
+    match cg_union_box_member(prog, v) {
+        checker::Type as bx => {
+            if cg_union_inline_recursive(prog, t, bx, 0 to u64) {
+                return error { message = "`#inline` cannot apply to a self-recursive union — it MUST box (an inline self-recursive sum has no finite size)" }
+            }
+            null
+        }
+        null => error { message = "`#inline` is a no-op here: this union's payload is already < 16 bytes (inline)" }
+    }
+}
+
 // cg_emit_variant_ctype — emit the C TYPE for any variant-shaped resolved type: a Named
 // variant decl → its mangled tk_t_<Name>; an inline `A | B | …` → its tk_u_<keys>. (C: `cg_emit_variant_ctype`.)
 fn cg_emit_variant_ctype(buf: []byte, v: checker::Type) -> []byte | error {
@@ -1661,7 +1905,10 @@ fn emit_type_expr(buf: []byte, prog: checker::TProgram, te: parser::TypeExpr, re
             match cg_te_to_type_ns(prog, ref_ns, te) {
                 checker::Variant as va => match cg_union_niche_member(prog, va) {
                     checker::Type as x => emit_type(buf, prog, x)
-                    null => cg_variant_typename(buf, va)
+                    null => match cg_union_box_member(prog, va) {
+                        checker::Type as bx => cb(match emit_type(buf, prog, bx) { []byte as o => o; error as e => return e }, " *")
+                        null => cg_variant_typename(buf, va)
+                    }
                 }
                 _ => cg_variant_typename_texpr(buf, ut)
             }
@@ -4032,6 +4279,21 @@ fn cg_wrap_open(buf: []byte, v: checker::Type, mkey: str) -> []byte | error {
 // is an illegal type here, so reachability is a separate predicate rather than a `null` result.
 // (C: `emit_variant_wrap`.)
 fn emit_variant_wrap(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expected: checker::Type, value: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    match expected {
+        checker::Variant as bva => match cg_union_box_member(prog, bva) {
+            checker::Type as bx => {
+                match value.kind {
+                    checker::TNullLit => return cb(buf, "0")
+                    _ => {
+                        if cg_mangle_eq(expected, value.type) { return emit_expr_ret(buf, prog, ret_type, value) }
+                        return cg_emit_box_construct(buf, prog, ret_type, bx, value, escaping, regions, fn_body, dctx)
+                    }
+                }
+            }
+            null => { }
+        }
+        _ => { }
+    }
     let vkey = match cg_member_key_str(value.type) { str as s => s; error => "" }
     let n = cg_var_nmem(prog, expected)
     // pass 1 — DIRECT: value's key matches a member of `expected`.
@@ -4597,6 +4859,43 @@ fn cg_slice_param_type(prog: checker::TProgram, slt: parser::SliceType, arg_type
     }
 }
 
+/**
+ * cg_emit_box_construct — emit the BOX-IN-ARENA construction of a non-null union payload: bump-alloc
+ * one arena cell for `inner`, copy the coerced value into it, and yield the cell handle, as a GNU
+ * statement-expression `({ <inner> *_ubxN = tk_region_alloc(tk_region_root(), sizeof(<inner>)); *_ubxN
+ * = (<value>); _ubxN; })`. The result is the 8-byte handle stored in a boxed `T | null` slot; the
+ * `null` case never calls this (it emits a bare `0`, zero heap). The cell rides the root region
+ * (leak-to-root, batch-safe — mem-model-empirical), matching the closure-env arena idiom.
+ *
+ * @param prog      the typed program
+ * @param ret_type  the enclosing return type (threaded for a diverging value-form inside `value`)
+ * @param inner     the resolved boxed payload type `X` of the `X | null` union
+ * @param value     the resolved payload expression being boxed
+ * @param escaping  the escaping-binding set (region model)
+ * @param regions   the active region frames
+ * @param fn_body   the enclosing function body (defer/region resolution)
+ * @param dctx      the defer context
+ * @return          `buf` with the box-construct statement-expression appended, or an error
+ * @throws          error when the inner type or the payload value cannot be emitted
+ * @since 0.3.0.30 (null-union C4)
+ */
+fn cg_emit_box_construct(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, inner: checker::Type, value: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let bxN = fresh_named("_ubx", buf.len to i64)
+    mut out = cb(buf, "({ ")
+    out = match emit_type(out, prog, inner) { []byte as o => o; error as e => return e }
+    out = cb(out, " *")
+    out = cb(out, bxN)
+    out = cb(out, " = tk_region_alloc(tk_region_root(), sizeof(")
+    out = match emit_type(out, prog, inner) { []byte as o => o; error as e => return e }
+    out = cb(out, ")); *")
+    out = cb(out, bxN)
+    out = cb(out, " = ")
+    out = match emit_as_r(out, prog, ret_type, inner, value, escaping, regions, fn_body, dctx) { []byte as o => o; error as e => return e }
+    out = cb(out, "; ")
+    out = cb(out, bxN)
+    cb(out, "; })")
+}
+
 fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expected: checker::Type, value: checker::TExpr, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
     match expected {
         checker::Variant as nva => match cg_union_niche_member(prog, nva) {
@@ -4604,6 +4903,21 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                 match value.kind {
                     checker::TNullLit => return cg_emit_niche_null(buf, prog, nx)
                     _ => return emit_expr_ctx(buf, prog, ret_type, value, escaping, regions, fn_body, dctx)
+                }
+            }
+            null => { }
+        }
+        _ => { }
+    }
+    match expected {
+        checker::Variant as bva => match cg_union_box_member(prog, bva) {
+            checker::Type as bx => {
+                match value.kind {
+                    checker::TNullLit => return cb(buf, "0")
+                    _ => {
+                        if cg_mangle_eq(expected, value.type) { return emit_expr_ctx(buf, prog, ret_type, value, escaping, regions, fn_body, dctx) }
+                        return cg_emit_box_construct(buf, prog, ret_type, bx, value, escaping, regions, fn_body, dctx)
+                    }
                 }
             }
             null => { }
@@ -5070,6 +5384,21 @@ fn cg_emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, 
         _ => { }
     }
     match subjT {
+        checker::Variant as bva => match cg_union_box_member(prog, bva) {
+            checker::Type => {
+                match pat {
+                    parser::NullPattern => { mut o = cb(buf, "("); o = cb(o, subj); return cb(o, " == 0)") }
+                    parser::WildcardPattern => return cb(buf, "1")
+                    parser::BindPattern => { mut o = cb(buf, "("); o = cb(o, subj); return cb(o, " != 0)") }
+                    parser::FieldPattern => { mut o = cb(buf, "("); o = cb(o, subj); return cb(o, " != 0)") }
+                    _ => { }
+                }
+            }
+            null => { }
+        }
+        _ => { }
+    }
+    match subjT {
         checker::Optional as opt => {
             match opt.inner {
                 checker::Void => { }   // sentinel — never a real match subject; fall through
@@ -5178,6 +5507,28 @@ fn cg_emit_pat_binds(buf: []byte, prog: checker::TProgram, pat: parser::Pattern,
                             o = cb(o, " = ")
                             o = cb(o, subj)
                             return cb(o, ";\n")
+                        }
+                        return buf
+                    }
+                    _ => return buf
+                }
+            }
+            null => { }
+        }
+        _ => { }
+    }
+    match subjT {
+        checker::Variant as bva => match cg_union_box_member(prog, bva) {
+            checker::Type => {
+                match pat {
+                    parser::BindPattern as nbp => {
+                        if nbp.has_binding {
+                            mut o = cb(buf, indent)
+                            o = cb(o, "auto ")
+                            o = cb_str(o, nbp.binding)
+                            o = cb(o, " = (*(")
+                            o = cb(o, subj)
+                            return cb(o, "));\n")
                         }
                         return buf
                     }
@@ -8060,6 +8411,10 @@ fn cg_register_variant_body(set: CgTypeSet, prog: checker::TProgram, ref_ns: str
 // (slice/opt) precede it by registration order. (C: `cg_emit_inline_variant_typedef`.)
 fn cg_emit_inline_variant_typedef(buf: []byte, prog: checker::TProgram, v: checker::Variant) -> []byte | error {
     match cg_union_niche_member(prog, v) {
+        checker::Type => return buf
+        null => { }
+    }
+    match cg_union_box_member(prog, v) {
         checker::Type => return buf
         null => { }
     }
