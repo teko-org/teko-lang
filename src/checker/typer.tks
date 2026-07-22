@@ -1498,6 +1498,27 @@ fn field_type(fields: []parser::Field, field: str, table: TypeTable, ref_ns: str
     error { message = $"no such field: {field}" }
 }
 
+/**
+ * require_narrowed — the null-union C5 deref fence (base §3d/§3f). Using a `T | null` (any
+ * null-bearing union) payload AS a bare member — a field read, or the `.value` deref of a
+ * `Ref<T> | null` — is REJECTED until the union has been narrowed to its bare member, the SAME
+ * narrowing invariant an unmatched `T | error` obeys. The two accepted narrowing scopes rebind the
+ * value to its bare member BEFORE this point (a `match` arm's pattern binding; the flow-narrowed
+ * branch of an equality guard), so reaching here with a still-`Variant` null-bearing type means the
+ * use is un-narrowed. Directs the author to the sanctioned narrowing forms.
+ *
+ * @param t  the receiver's resolved (still-union) type
+ * @return   the error demanding narrowing before the bare-member use
+ * @throws   error always (this is the reject path; the caller only calls it on a null-bearing union)
+ * @since 0.3.0.30 (null-union C5)
+ */
+fn require_narrowed(t: Type) -> error {
+    if is_ref_null_variant(t) {
+        return error { message = "cannot dereference a `Ref<T> | null` — narrow it to a bare `Ref<T>` first (`match r { null => …; Ref<T> as v => v.value }`), the deref fence keeping the never-null reference promise sound" }
+    }
+    error { message = "cannot use `.` on a `T | null` value before narrowing — narrow it first (`match x { null => …; T as v => v.… }`)" }
+}
+
 fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TExpr | error {
     let recv = match type_expr(fa.receiver, env, table) { TExpr as te => te; error as e => return e }
     // `.len` on a `str` or a slice (`[]T`) -> u64 (W5-idx). This precedes the struct-field
@@ -1534,6 +1555,7 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
     // and point at the sanctioned readers (`?.`/`??`) instead of the generic struct message.
     match recv.type {
         Optional => return error { message = "cannot use `.` on a nullable value (`T?`) — read it with `?.` or `??` (REBOOT_PLAN §203)" }
+        Variant => if variant_has_null_member(recv.type) { return require_narrowed(recv.type) }
         _ => { }
     }
     let name = match recv.type {
