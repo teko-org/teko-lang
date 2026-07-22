@@ -161,6 +161,7 @@ fn mono_type_mangle(t: Type) -> str {
         Reference as r => teko::str::concat("ref_", mono_type_mangle(r.inner))   // (MEM-1b)
         Variant => "variant"
         Func => "func"
+        Null => "null"
     }
 }
 
@@ -228,6 +229,7 @@ pub fn type_to_texpr(t: Type) -> parser::TypeExpr {   // (W10) pub: codegen synt
         }
         Uptr => mono_named_texpr("uptr")
         Reference as r => parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "Ref" }) }; args = teko::list::push(teko::list::empty(), type_to_texpr(r.inner)) }   // (MEM-1b)
+        Null => mono_named_texpr("null")
         Void => mono_named_texpr("void")
         Variant => mono_named_texpr("variant")
         Func as f => {   // (W10a) reconstruct a FunctionType `(A, B) -> R` (not a placeholder name)
@@ -770,10 +772,7 @@ fn mono_tstmt(st: TStatement, s: Subst, items: []TItem, table: TypeTable) -> WSt
         }
         TAssign as a => {
             let wv = match mono_texpr(a.value, s, items, table) { WExpr as w => w; error as er => return er }
-            // (#88) rewrite the FIELD target's LHS field-access (its receiver + resolved field type may
-            // reference a type-param); merge its insts. A non-FIELD target keeps the sentinel unchanged.
-            let is_field = match a.kind { parser::AssignKind::Field => true; _ => false }
-            if is_field {
+            if parser::assign_has_target(a.kind) {
                 let wt = match mono_texpr(a.target, s, items, table) { WExpr as w => w; error as er => return er }
                 return WStmt { stmt = TAssign { kind = a.kind; name = a.name; op = a.op; bound = subst_type(a.bound, s); value = wv.expr; deref = a.deref; target = wt.expr }; insts = mono_inst_concat(wv.insts, wt.insts) }
             }

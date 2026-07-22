@@ -698,4 +698,305 @@ LOCAL (the canonical `let a`)?**
 - **Owner decisions pending:** the three questions in §11 (Layer-3 scope, formatter
   A/B, dynamic-const-spec + confirm local-binding mandate). Layers 1–2 are ready to
   ratify and sequence as the mandate the moment those land.
+
+---
+
+## 13. CF4 implementation crumbs (0.3.0.29) — Layer 1c: `TIndex` of a const aggregate at a const index
+
+> Author: architect. Design-only; no product code written here. Grounds the CF4 crumb
+> line for seed **0.3.0.29** on branch `feat/0.3.0.29-cf4-index-fold`. Read against the
+> file:line ground truth of `src/checker/comptime_fold.tks` and `src/checker/consteval.tks`
+> as they stand on this branch.
+
+### 13.0 The load-bearing correction (read this first)
+
+§2/§4.3 and the CF4 task brief both assume that by the time the fold sees `G[0]`, the
+module const `G` has already been substituted to its `[..]` array-literal in place, so
+`eval_const` only has to evaluate a `TArrayLit` receiver. **That assumption is FALSE for
+the pipeline that feeds both engines.** Ground truth on this branch:
+
+- `inline_consts` (`consteval.tks:531`) = `fold_program(propagate_locals(substitute_module_consts(prog)))`.
+- `substitute_module_consts` inlines **scalar consts only** (`inline_place_item`,
+  `consteval.tks:502`, gates `is_scalar_const_type`; `is_scalar_const_type`
+  (`consteval.tks:14`) returns **false** for `Slice`/`Str`/`Named`/`Variant`). An
+  aggregate const's decl is **kept**; its references are **not** substituted. This is
+  asserted TODAY by `consteval_test.tkt:510` `inline_consts_keeps_aggregate_const`.
+- `inline_aggregate_consts` (`consteval.tks:640`) — the pass that DOES substitute
+  aggregate refs — is **C-BACKEND-ONLY**, called solely at `codegen.tks:8903`. The
+  LIR/native + VM path keeps `G` as a `TVar` resolving to ONE shared rodata entry
+  (`intern_aggregate_consts`, `lower_const.tks:690`), never inlines it.
+
+**Therefore, inside the fold, `G[0]`'s receiver is a `TVar G`, not a `TArrayLit`.** For
+fixture D to fold on **both** engines, `eval_const`'s `TIndex` arm must resolve the
+`TVar` receiver to the aggregate const's collapsed initializer through a threaded
+**module-aggregate map**. We must NOT reuse `inline_aggregate_consts` in the fold
+pipeline: inlining every aggregate ref would materialise per-use clones on the LIR/native
+path and defeat the shared-rodata model (an observable emit-byte regression on
+non-indexed uses of `G`). The env-based resolution folds ONLY the specific `G[i]` sites;
+every other use of `G` stays a `TVar` interned once, exactly as today.
+
+### 13.1 Scope of CF4 (ratified law-first; ratification flags called out)
+
+**IN scope (delivers fixture D + AL0's three targets):**
+
+- `eval_const` evaluates `TIndex{ receiver, index }` when `receiver` is a const aggregate
+  and `index` a const integer, to the element value.
+- A const-aggregate receiver is: (a) an in-tree `TArrayLit` of const elements; **or**
+  (b) a `TVar` naming a **module-level aggregate const** (resolved via the threaded map).
+- Out-of-range const index (`i >= len`, or a negative index) = **located compile error**
+  (M.1; §3.4), never silent.
+- `TIndex` with a **runtime** index OR a **runtime**/unresolved receiver stays runtime
+  (unfolded) — the negative boundary.
+
+**OUT of scope for CF4 (each flagged for owner ratification):**
+
+1. **Local aggregate binding indexing** (`let a = [1,2,3]; a[0]`, and the current
+   `gzip.tks:35` `let magic = GZIP_MAGIC; magic[0]`). Folding this requires recording a
+   **non-scalar** local binding in CF3's `LocalConstMap` and substituting it — which is
+   exactly the **regression trap** (§13.4). RECOMMENDATION: **defer**; AL0 const-ifies by
+   rewriting its own source to index the module const directly inside a const initializer
+   (`const GZIP_HEADER = [GZIP_MAGIC[0], GZIP_MAGIC[1], …]`, `al-wave-crumbs.md:96`),
+   which is the module-const-index case CF4 **does** fold. **Owner: ratify defer.**
+2. **`str → []byte` coercion in const position** (AL0's "str-in-const-position → CVBytes").
+   Not needed by fixture D (whose elements are `0x1F to byte`). RECOMMENDATION: **defer to
+   its own crumb** — it is a `CVBytes`/`literal_of` extension, orthogonal to indexing.
+   **Owner: ratify defer, or fold into CF4c if AL0 needs it same-seed.**
+3. **Struct-field / nested-aggregate indexing depth.** `eval_agg` over `TStructInit` and
+   nested `CVAgg` is cheap to include, but the only 0.3.0.29 driver (fixture D, AL0) is a
+   flat `[]byte`. RECOMMENDATION: **include arrays + one level of struct; leave the
+   `literal_of` of a nested `CVAgg`/`CVBytes` element returning `null` (→ unfolded, no
+   regression) until a concrete need.** Non-load-bearing; implementer's call.
+
+### 13.2 Functions to add / modify (full-Javadoc, copy verbatim), in dependency order
+
+**Threading decision.** `env: Env` (`scope.tks:55`) is a heavy checker struct and is
+**dead in the fold** (always `env_empty()`; the doc note at `comptime_fold.tks:1151`
+confirms "eval_const never touches the environment"). Do **not** overload it. Add a new
+**`AggConstMap`** carrier — reuse the existing parallel-array `ScalarConstMap` shape that
+`build_aggregate_map` (`consteval.tks:575`) already returns — and thread it through the
+fold spine alongside `(table, env)`. It is consulted in exactly two places
+(`eval_const`'s new `TVar`/`TIndex` resolution and the `fold_index` gate); every other
+`fold_*`/`eval_*` fn merely forwards it. The threading is mechanical (append one param).
+
+```teko
+/**
+ * AggConstMap — the module-level AGGREGATE-const resolution table the Layer-1c index
+ * fold reads: three PARALLEL lists (names / namespaces / collapsed initializers) over
+ * every module aggregate const, in dependency order, exactly as `build_aggregate_map`
+ * (`consteval.tks:575`) already produces. A `TVar` receiver of a const `TIndex` is
+ * resolved by a `(name, namespace)` lookup keyed on the reference's `func_ns` — the SAME
+ * key `inline_rw_var` uses — so the index fold and the type-checker never diverge. This
+ * table resolves ONLY module aggregate consts; a fn-value, a local binding, and a scalar
+ * const are never in it, so the CF3 fn-value/scalar invariants are untouched (§13.4).
+ *
+ * @since #comptime-fold
+ */
+pub type AggConstMap = ScalarConstMap
+
+/**
+ * cv_agg — wrap an ordered list of child comptime values into an aggregate ConstValue
+ * (the missing constructor for the already-declared `CVAgg`). The children are in
+ * declaration/index order, so `eval_index` reads `elems[i]` directly.
+ *
+ * @param elems  the child comptime values, in order
+ * @return       the aggregate ConstValue
+ * @since #comptime-fold
+ */
+fn cv_agg(elems: []ConstValue) -> ConstValue { ConstValue { kind = CVAgg { elems = elems } } }
+
+/**
+ * agg_const_init — resolve the collapsed initializer of the module aggregate const named
+ * `(name, ns)` in `agg`, or null when no such const is recorded (a fn-value, a local, a
+ * scalar const, or a different-module name never resolves — the fold then leaves the
+ * index runtime). A thin `(name, ns)`-keyed lookup over the parallel lists, mirroring
+ * `scalar_const_init` (`consteval.tks`).
+ *
+ * @param agg   the module-aggregate resolution table
+ * @param name  the reference's name
+ * @param ns    the reference's resolved namespace (`func_ns`)
+ * @return      the const's collapsed initializer, or null
+ * @since #comptime-fold
+ */
+fn agg_const_init(agg: AggConstMap, name: str, ns: str) -> TExpr?
+
+/**
+ * eval_array_agg — evaluate an array/slice literal's elements to a `CVAgg`, recursing
+ * `eval_const` into each element expression (a spread element is not const-foldable in
+ * CF4 and makes the aggregate non-const — its presence is rejected by `cf_agg_value`
+ * before this runs). Element order is index order.
+ *
+ * @param a      the typed array literal
+ * @param table  the type table (forwarded to each element eval)
+ * @param env    the environment (forwarded; unused by the const subset)
+ * @param agg    the module-aggregate resolution table (forwarded)
+ * @return       the aggregate comptime value, or the first located element error
+ * @since #comptime-fold
+ */
+fn eval_array_agg(a: TArrayLit, table: TypeTable, env: Env, agg: AggConstMap) -> ConstValue | error
+
+/**
+ * eval_index_expr — evaluate a `TIndex` of a const aggregate at a const index (Layer 1c):
+ * evaluate the receiver (which must yield a `CVAgg`) and the index (which must yield a
+ * `CVInt`), then read the element. A negative index or an index `>= elems.len` is a
+ * LOCATED COMPILE ERROR (M.1; LEGISLATION:148) — a hazard the compiler can already see.
+ * A non-aggregate receiver or non-integer index reaching here is an internal error (the
+ * `cf_agg_value`/`cf_int_value` gate proves the shape before `eval_const` is called).
+ *
+ * @param ix     the typed index expression
+ * @param e      the enclosing expression (positions any error)
+ * @param table  the type table (forwarded to the child evals)
+ * @param env    the environment (forwarded)
+ * @param agg    the module-aggregate resolution table (forwarded)
+ * @return       the element comptime value, or a located error (out-of-range / shape)
+ * @since #comptime-fold
+ */
+fn eval_index_expr(ix: TIndex, e: TExpr, table: TypeTable, env: Env, agg: AggConstMap) -> ConstValue | error
+
+/**
+ * cf_agg_value — true iff `e` is a const AGGREGATE the index fold may evaluate: an
+ * in-tree `TArrayLit` whose every element is a foldable const (`cf_int_value`, or a
+ * nested `cf_agg_value`), or a `TVar` (non-`is_func`) naming a module aggregate const in
+ * `agg`. A fn-value reference, a local binding, a spread element, or any runtime leaf
+ * returns false, so the index stays runtime. The gate that keeps `eval_const` from being
+ * called on a non-const shape (mirrors `cf_int_value`, `comptime_fold.tks:1158`).
+ *
+ * @param e    the receiver expression to classify
+ * @param agg  the module-aggregate resolution table
+ * @return     whether `e` is a foldable const aggregate
+ * @since #comptime-fold
+ */
+fn cf_agg_value(e: TExpr, agg: AggConstMap) -> bool
+
+/**
+ * cf_can_index — true iff the whole `TIndex` folds: a foldable const-aggregate receiver
+ * (`cf_agg_value`) AND a foldable const-integer index (`cf_int_value`). When false the
+ * index is rebuilt around its folded children (stays runtime), preserving today's
+ * behavior for a runtime index or receiver.
+ *
+ * @param ix   the typed index expression
+ * @param agg  the module-aggregate resolution table
+ * @return     whether the index expression is fully const-foldable
+ * @since #comptime-fold
+ */
+fn cf_can_index(ix: TIndex, agg: AggConstMap) -> bool
+```
+
+**Modifications to existing fns (extend, do not rewrite):**
+
+- `eval_const` (`comptime_fold.tks:295`) — add three arms to the outer `match`:
+  `TVar as v => eval_agg_ref(v, e, agg)` (resolve a module aggregate const ref → its
+  init → `eval_const`, guarding `v.is_func` → soft `const_form_error`; a lookup miss →
+  soft error so the caller's gate having passed on shape can still surface a genuine
+  out-of-range from `eval_index_expr`), `TArrayLit as a => eval_array_agg(a, …)`,
+  and `TIndex as ix => eval_index_expr(ix, e, …)`. (Struct: add `TStructInit` per §13.1(3).)
+- `cf_int_value` (`comptime_fold.tks:1158`) — gains a param `agg` and a
+  `TIndex as ix => cf_can_index(ix, agg)` arm, so an enclosing op-tree/cast over a folded
+  index also collapses (`G[0] to u64` → the literal `31`, not `(0x1F to byte) to u64`).
+  **Optional but recommended** for full zero-runtime; without it `G[0]` still folds to a
+  byte literal and a trivial widening cast (which LIR/C already folds) remains.
+- `fold_index` (`comptime_fold.tks:1496`) — the REBUILD-ONLY stub becomes: if
+  `cf_can_index(ix, agg)`, `eval_const(e, …)` then `fold_splice`; else the current
+  fold-children rebuild. Mirror of `fold_op_node` (`comptime_fold.tks:1303`).
+- `literal_of` (`comptime_fold.tks:1238`) — the folded ELEMENT is spliced through
+  `fold_splice`→`literal_of`. The `CVInt` arm already reconstructs a `TNumber`
+  (fixture D's byte element). `CVBytes`→`TStrLit` and `CVAgg`→`TArrayLit`/`TStructInit`
+  are §13.1(2)/(3) extensions; until added, a non-`CVInt` element returns `null` →
+  `fold_splice` falls back to child-rebuild (unfolded, no regression).
+- The fold spine — `fold_expr`, `fold_children`, and every `fold_*` container fn plus
+  `fold_op_node`/`fold_splice`/`fold_stmt`/`fold_block`/`fold_item`/`fold_program`, and
+  `eval_const`/`eval_*` — gain the `agg: AggConstMap` param (mechanical forward).
+- `fold_program` (`comptime_fold.tks:1854`) — accept the `agg` map (built by the caller)
+  instead of only `env_empty()`; forward it down.
+- `inline_consts` (`consteval.tks:531`) — build the map ONCE from the substituted
+  program and pass it in:
+  `let agg = build_module_agg_map(substituted); fold_program(propagate_locals(substituted), agg)`.
+  Add a small `pub fn build_module_agg_map(prog) -> AggConstMap | error` in `consteval.tks`
+  that reuses `collect_module_consts` + `const_dep_order` + `build_aggregate_map` (all
+  present; `build_aggregate_map` becomes `pub` or is wrapped). `propagate_locals` is
+  **NOT** given the map (see §13.4).
+
+### 13.3 Ordered, independently gate-able crumb sub-sequence
+
+| # | Crumb | Size | Ritual of proof |
+|---|---|---|---|
+| **CF4a** | `cv_agg` + `AggConstMap` alias + `eval_array_agg` + `eval_index_expr` + `eval_agg_ref` + the `eval_const` `TVar`/`TArrayLit`/`TIndex` arms + `cf_agg_value`/`cf_can_index`; thread `agg` through `eval_const`/`eval_*`. Pure evaluator, unit-testable via `eval_const` with a hand-built `AggConstMap`. **No fold wiring, no `inline_consts` change yet.** | **M** | `comptime_fold_test.tkt`: unit-assert `eval_const(G[0])` over a hand-built map → the element; out-of-range index → located error; negative index → error; runtime-index shape not admitted by `cf_can_index`. Build green. |
+| **CF4b** | Thread `agg` through the `fold_*` spine; `fold_index` gates on `cf_can_index` → eval + `fold_splice`; `fold_program` takes `agg`; `inline_consts` builds it via `build_module_agg_map`. Extend `cf_int_value` with the `TIndex` arm (full collapse of an enclosing cast). | **M** | **[RITUAL]** fixpoint gen2==gen3 byte-identical vs **new** golden (fold changes emit bytes — §9.1, only index-elimination); VM==native differential; fixture D + negatives green; 100% coverage of the CF4a/CF4b delta; `seed_from_dep_qualified_value_const_and_fn` still green (§13.4). |
+| **CF4c** | *(optional, ratification-gated — §13.1(2)/(3))* `CVBytes`/`CVAgg` `literal_of` + `str→[]byte` const coercion + `TStructInit` `eval_agg`. | **S** | fixtures for the struct-field / str-slice cases; same RITUAL if it lands same-seed. |
+
+### 13.4 How the sequence keeps `seed_from_dep_qualified_value_const_and_fn` green
+
+The prior CF4 attempt added an aggregate map **to `propagate_locals`** and broke
+`checker_const_test.tkt:283`. That test asserts, after `type_program_with_deps`: (i)
+`uses_qualified` body[0] `let tw = m1::twice` KEEPS `value` as a `TVar` with
+`is_func && func_ns == "m1"` (a fn-value binding must NOT be recorded/folded as a const
+local), and (ii) body[1] `m1::P` inlines to the number `5`.
+
+**This CF4 keeps it green by construction: it makes ZERO changes to the CF3 recording
+path.** `propagate_locals`, `lp_stmt`, `lp_binding`, `lp_record_binding`,
+`lp_record_simple`, and `lp_var` are **untouched**. The guarantees that already hold and
+that CF4 does not disturb:
+
+- **fn-value not recorded:** `lp_record_simple` (`comptime_fold.tks:2141`) records a
+  binding only when `lp_is_const_binding(kind) && cf_int_value(value)`. `cf_int_value` on
+  a `TVar` (the fn-value `m1::twice`) is **false** → the name is `lp_remove`d, never
+  bound. CF4 does NOT broaden this predicate for `propagate_locals` (it broadens
+  `cf_int_value` for the *fold* only, and only with a `TIndex` arm — a `TVar` is still
+  not `cf_int_value`).
+- **fn-value not substituted:** `lp_var` (`comptime_fold.tks:2158`) returns early on
+  `if v.is_func`. Untouched.
+- **`m1::P` still inlines to 5:** handled entirely by `substitute_module_consts`'s scalar
+  leg, which runs BEFORE `propagate_locals`/`fold_program`. CF4 touches neither.
+
+The CF4 aggregate map lives ONLY in the **fold** leg (`fold_program`/`eval_const`), is
+keyed to module **aggregate** consts (`build_aggregate_map` includes only
+`!is_scalar_const_type` decls), and cannot contain `twice` (a fn, not a const) or `P` (a
+scalar, already inlined and dropped). A fold-side `TVar` that is `is_func`, or that misses
+the aggregate map, resolves to a soft `const_form_error` and — because `cf_agg_value`/
+`cf_can_index` gate `eval_const` on shape first — is simply left runtime. No fn-value or
+scalar path is reachable from CF4's code. **Regression green by isolation, asserted at the
+CF4b RITUAL.**
+
+### 13.5 Regression fixtures + `.tkt` tests to add
+
+| Fixture | Where | Input | Expected (VM == native) |
+|---|---|---|---|
+| eval-index-unit | `src/checker/comptime_fold_test.tkt` | `eval_const` of `G[0]`, `G[1]` over a hand-built `AggConstMap` for `const G: []byte = [0x1F,0x8B]` | `eval_const` → `CVInt(0x1F)`, `CVInt(0x8B)` |
+| index-oob-error | `comptime_fold_test.tkt` | `eval_const` of `G[2]` (len 2) | **located compile error** (M.1); not a wrap, not a panic-shape |
+| index-neg-error | `comptime_fold_test.tkt` | `eval_const` of `G[-1 to i64]` | **located compile error** (M.1) |
+| index-arraylit-inline | `comptime_fold_test.tkt` | `fold_expr` of `[10 to byte, 20 to byte][1]` (in-tree `TArrayLit` receiver, empty map) | folds to `TNumber 20` (proves the no-map literal-receiver path) |
+| **fixture D (e2e)** | `examples/regressions/cf4_index_fold/` (`.tkp` + `src`) | `const G: []byte = [0x1F to byte, 0x8B to byte]` … `exit((G[0] to u64) to i32)` | exit **31** on `teko run` (VM) **and** the compiled binary (native); the emitted body carries the folded literal, no index op at the `G[0]` site |
+| index-in-const-init (e2e/tkt) | `comptime_fold_test.tkt` or the e2e dir | `const H: []byte = [G[0], G[1]]` (AL0's rewrite shape) | `H`'s init folds each `G[i]` to a byte literal; proves the module-const-index-inside-a-const-initializer path AL0 depends on |
+| **noflod-runtime-index (e2e/tkt)** | `comptime_fold_test.tkt` (negative) | `fn f(i: u64) -> byte { G[i] }` | `cf_can_index` false → `G[i]` stays a runtime `TIndex`; behavior identical to today; exit parity |
+| noflod-runtime-recv (negative) | `comptime_fold_test.tkt` | `fn f(a: []byte) -> byte { a[0] }` | runtime receiver → stays runtime |
+| regression-guard (existing) | `checker_const_test.tkt:283` | `seed_from_dep_qualified_value_const_and_fn` | UNCHANGED and green (§13.4) |
+
+The `.tkt` unit fixtures need a test helper `empty_agg()` (an `AggConstMap` with empty
+parallel lists) alongside the existing `empty_env()`/`empty_table()`; the fold-test call
+sites gain the `agg` argument (mechanical).
+
+### 13.6 Ritual points
+
+- **CF4a** — build-green + unit `.tkt` suite (pure evaluator; no emit change, no RITUAL).
+- **CF4b — [RITUAL]:** fixpoint gen2==gen3 byte-identical vs a **new** golden (§9.1: the
+  diff must be ONLY index-op elimination at const-index sites; review it); own==C
+  differential unchanged; VM==native on fixture D and the negatives; 100% coverage of the
+  CF4a+CF4b delta; the §13.4 regression asserted green.
+- **CF4c** (if it lands) — same RITUAL as CF4b.
+
+### 13.7 AL0 Tier-6 handshake outcome (§5 resolved for this seed)
+
+- **CF4 SUBSUMES AL0 Tier-6.** AL0 Tier-6 (`al-wave-crumbs.md:81,92–107`) is a *proposed*
+  const-eval extension (`TIndex` of a const aggregate) — it was **never implemented as
+  separate product code**, so there is **no stale AL0 code to remove**. Option (a) of §5
+  is taken: the general folder is the home; AL0 does **not** ship a parallel Tier-6.
+- **AL0 keeps its two Huffman generators** (`al-wave-crumbs.md:104`) unchanged. Its three
+  fold targets — `gzip_header` (`gzip.tks:33`), `wasm_preamble` (`objfile_wasm.tks:172`),
+  and `wasm_narrow_msg_bytes` — resolve once CF4b lands, **provided AL0 does its own
+  source rewrite** to index the module const directly inside a const initializer
+  (`const GZIP_HEADER: []byte = [GZIP_MAGIC[0], GZIP_MAGIC[1], …]`, the shape
+  `al-wave-crumbs.md:96` already prescribes). CF4 does **not** touch any AL file and does
+  **not** const-ify the current `let magic = GZIP_MAGIC; magic[0]` local-binding shape
+  (§13.1(1), deferred) — that is AL0's source-rewrite, not CF4's fold.
+- **No double-ship, no law tension.** Coordination only; reported up, not turned into a
+  new issue.
 ```

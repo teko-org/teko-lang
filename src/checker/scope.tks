@@ -347,10 +347,93 @@ fn buf_ptr_signature() -> Type {
 }
 
 /**
+ * Build a `str | error` result type (`tk_ffi_sres`-shaped), the union returned by the
+ * value-or-error host primitives `teko::env::var` / `teko::env::cwd` / `teko::io::read_file`.
+ *
+ * @return  a two-member `Variant { str, error }`
+ */
+fn host_str_or_error() -> Type {
+    mut m: []Type = teko::list::push(teko::list::empty(), Str { })
+    m = teko::list::push(m, Error { })
+    Variant { members = m }
+}
+
+/**
+ * Build the `[]str | error` result type (`tk_ffi_slres`-shaped) returned by `teko::fs::list_dir`.
+ *
+ * @return  a two-member `Variant { []str, error }`
+ */
+fn host_strslice_or_error() -> Type {
+    mut m: []Type = teko::list::push(teko::list::empty(), Slice { element = Str { } })
+    m = teko::list::push(m, Error { })
+    Variant { members = m }
+}
+
+/**
+ * Build the `error?` result type (`tk_ffi_ures`-shaped) returned by the effect-or-error host
+ * primitives `teko::env::set_var` / `teko::env::chdir` / `teko::io::write_file` /
+ * `teko::io::write_file_bytes` / `teko::fs::mkdir` / `teko::fs::remove_file`.
+ *
+ * @return  an `Optional { inner = error }`
+ */
+fn host_error_optional() -> Type {
+    Optional { inner = Error { } }
+}
+
+/**
+ * Build a fixed `Func` type from an explicit parameter list and return type — the shared
+ * constructor for every host-surface signature (all are non-generic, non-variadic, and require
+ * exactly their listed parameters).
+ *
+ * @param params  the ordered parameter types
+ * @param ret     the return type
+ * @return        the corresponding `Func`
+ */
+fn host_func(params: []Type, ret: Type) -> Type {
+    Func { params = params; ret = ret; variadic = false; param_names = []; n_required = params.len; defaults = [] }
+}
+
+/**
+ * Resolve a teko HOST-STDLIB surface name (`teko::env` / `teko::io` / `teko::fs` /
+ * `teko::process`) to its C-native `Func` type, mirroring the `extern fn` declarations in
+ * src/env/env.tks, src/io/io.tks, src/fs/fs.tks and src/process/process.tks EXACTLY so the call's
+ * checked type matches the fixed-ABI lift `emit_host_ffi` builds from it. This makes the host
+ * surface resolvable for ANY standalone user project. The compiler's own project keeps binding
+ * these through its discovered extern declarations (which win in `lookup_call` BEFORE this
+ * fallback fires), so the path is consulted only for a user program with no local declaration —
+ * additive, and byte-transparent for the compiler's own emission.
+ *
+ * @param name  the last path segment of the call (e.g. "args", "read_file", "list_dir", "run")
+ * @return      the host primitive's `Func` type, or `error` when `name` is no host surface
+ * @throws      "not a host surface function" when the name matches no host primitive
+ */
+fn host_surface_fn(name: str) -> Type | error {
+    let str_t = Str { }
+    let bytes_t = Slice { element = Byte { } }
+    let str_slice_t = Slice { element = Str { } }
+    if name == "args" { return host_func(teko::list::empty(), str_slice_t) }
+    if name == "read_line" || name == "read_stdin" { return host_func(teko::list::empty(), str_t) }
+    if name == "stdin_eof" { return host_func(teko::list::empty(), Prim { kind = PrimKind::Bool }) }
+    if name == "cwd" { return host_func(teko::list::empty(), host_str_or_error()) }
+    if name == "var" || name == "read_file" { return host_func(teko::list::push(teko::list::empty(), str_t), host_str_or_error()) }
+    if name == "chdir" || name == "mkdir" || name == "remove_file" { return host_func(teko::list::push(teko::list::empty(), str_t), host_error_optional()) }
+    if name == "set_var" || name == "write_file" { return host_func(teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t), host_error_optional()) }
+    if name == "write_file_bytes" {
+        mut p: []Type = teko::list::push(teko::list::empty(), str_t)
+        p = teko::list::push(p, bytes_t)
+        return host_func(p, host_error_optional())
+    }
+    if name == "list_dir" { return host_func(teko::list::push(teko::list::empty(), str_t), host_strslice_or_error()) }
+    if name == "run" || name == "run_quiet" { return host_func(teko::list::push(teko::list::empty(), str_slice_t), Prim { kind = PrimKind::I32 }) }
+    error { message = "not a host surface function" }
+}
+
+/**
  * Resolve an INJECTED built-in FUNCTION name to its `Func` type (mirrors `scope.c`'s
  * `tk_builtin_fn`): `print`/`println` + `teko::assert`, the self-host str/byte stdlib surface,
- * the D3 coverage sinks, the arena checkpoint/rewind/commit primitives, and the heap-backed
- * string interner. Resolved by LAST path segment only (like `builtin_type`) — every name here is
+ * the D3 coverage sinks, the arena checkpoint/rewind/commit primitives, the heap-backed
+ * string interner, and (via `host_surface_fn`) the C-native `teko::env`/`io`/`fs`/`process` host
+ * surface. Resolved by LAST path segment only (like `builtin_type`) — every name here is
  * assumed unique across the whole corpus, so a bare or `teko::`-rooted call resolves identically.
  * NON-generic, fixed signatures (M.5).
  *
@@ -562,5 +645,6 @@ fn builtin_fn(name: str) -> Type | error {
         p = teko::list::push(p, Str { })
         return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
     }
+    match host_surface_fn(name) { Type as t => return t; error => { } }
     error { message = "not a built-in function" }
 }

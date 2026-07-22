@@ -1,0 +1,172 @@
+// src/checker/test_assert.tks   (namespace 'teko::checker')
+//
+// Crumb 4 of the 0.3.0.29 test analyzer: the ASSERTION-FOLD signal. Coverage counting (the build
+// driver's TKCOV decode) says WHICH production a test touches, but is blind to whether the test's
+// ASSERTIONS actually discriminate. A `teko::assert::is_true(<expr that folds to a constant>)` can
+// never fail — a dead guard — even when the surrounding test DOES call production (the "misleading"
+// green test). This module walks a `#test` body, finds every `teko::assert::is_true`/`is_false` call,
+// and asks `predicate_folds_const` (comptime_fold.tks) whether the single predicate is comptime-decided.
+
+use teko::parser
+
+/**
+ * AssertStats — a `#test`'s assertion tally: how many bool assertions it makes, and how many of those
+ * have a predicate that folds to a compile-time constant (a dead guard). `folded == total` (with
+ * `total >= 1`) ⇒ FOUNDATIONAL; `folded >= 1` while the test covers production ⇒ MISLEADING.
+ */
+pub type AssertStats = struct {
+    /** the number of `teko::assert::is_true`/`is_false` calls found in the test body. */
+    total: u64
+    /** how many of those calls have a predicate that folds to a comptime constant (dead guards). */
+    folded: u64
+}
+
+/** assert_stats_empty — the zero tally (no assertions seen yet). (0.3.0.29) */
+fn assert_stats_empty() -> AssertStats { AssertStats { total = 0; folded = 0 } }
+
+/**
+ * assert_stats_add — the componentwise sum of two tallies (the fold over a statement block).
+ *
+ * @param a  the left tally
+ * @param b  the right tally
+ * @return   `{ total = a.total + b.total; folded = a.folded + b.folded }`
+ * @since 0.3.0.29
+ */
+fn assert_stats_add(a: AssertStats, b: AssertStats) -> AssertStats {
+    AssertStats { total = a.total + b.total; folded = a.folded + b.folded }
+}
+
+/**
+ * test_assert_stats — the assertion tally for one `#test`: walk its body (descending into loop/defer/
+ * adopt bodies and into `if`/`match` blocks used as statements) and count every bool assertion and
+ * how many fold to a constant.
+ *
+ * @param f  the `#test` function
+ * @return   the `{ total, folded }` assertion tally
+ * @since 0.3.0.29
+ */
+pub fn test_assert_stats(f: TFunction) -> AssertStats {
+    assert_stats_block(f.body)
+}
+
+/**
+ * assert_stats_block — the summed assertion tally over a statement block.
+ *
+ * @param stmts  the typed statement block
+ * @return       the tally accumulated over every statement
+ * @since 0.3.0.29
+ */
+fn assert_stats_block(stmts: []TStatement) -> AssertStats {
+    mut acc = assert_stats_empty()
+    mut i: u64 = 0
+    loop {
+        if i >= stmts.len { break }
+        acc = assert_stats_add(acc, assert_stats_stmt(stmts[i]))
+        i++
+    }
+    acc
+}
+
+/**
+ * assert_stats_stmt — the assertion tally contributed by one statement: an expression statement
+ * inspects its expression; a loop/defer/adopt descends into its block(s); every other statement form
+ * carries no assertion.
+ *
+ * @param s  the typed statement
+ * @return   the assertion tally for `s`
+ * @since 0.3.0.29
+ */
+fn assert_stats_stmt(s: TStatement) -> AssertStats {
+    match s {
+        TExprStmt as es => assert_stats_expr(es.expr)
+        TLoopStmt as l => assert_stats_add(assert_stats_block(l.init), assert_stats_block(l.body))
+        TDeferStmt as d => assert_stats_block(d.body)
+        TAdoptStmt as a => assert_stats_block(a.body)
+        _ => assert_stats_empty()
+    }
+}
+
+/**
+ * assert_stats_expr — the assertion tally for an expression in statement position: a direct call is
+ * tested for the assertion shape; an `if`/`match` descends into its blocks; every other expression
+ * carries no statement-level assertion (the corpus writes assertions as statements).
+ *
+ * @param e  the typed expression
+ * @return   the assertion tally for `e`
+ * @since 0.3.0.29
+ */
+fn assert_stats_expr(e: TExpr) -> AssertStats {
+    match e.kind {
+        TCall as c => assert_stats_call(c)
+        TIfExpr as f => assert_stats_if(f)
+        TMatchExpr as m => assert_stats_match(m)
+        _ => assert_stats_empty()
+    }
+}
+
+/**
+ * assert_stats_if — the assertion tally over an `if` expression's then/else blocks.
+ *
+ * @param f  the typed if expression
+ * @return   the tally over the then block plus the else block (when present)
+ * @since 0.3.0.29
+ */
+fn assert_stats_if(f: TIfExpr) -> AssertStats {
+    let then_stats = assert_stats_block(f.then_blk)
+    if !f.has_else { return then_stats }
+    assert_stats_add(then_stats, assert_stats_block(f.else_blk))
+}
+
+/**
+ * assert_stats_match — the assertion tally over every arm body of a `match` expression.
+ *
+ * @param m  the typed match expression
+ * @return   the summed tally over all arm bodies
+ * @since 0.3.0.29
+ */
+fn assert_stats_match(m: TMatchExpr) -> AssertStats {
+    mut acc = assert_stats_empty()
+    mut i: u64 = 0
+    loop {
+        if i >= m.arms.len { break }
+        acc = assert_stats_add(acc, assert_stats_block(m.arms[i].body))
+        i++
+    }
+    acc
+}
+
+/**
+ * assert_stats_call — the assertion tally for one call: 0 unless the callee is `teko::assert::is_true`
+ * or `teko::assert::is_false`, in which case it counts as one assertion, folded iff its single
+ * predicate argument is comptime-decided (`predicate_folds_const`).
+ *
+ * @param c  the typed call
+ * @return   `{ total = 1; folded = 0|1 }` for a bool assertion, else the zero tally
+ * @since 0.3.0.29
+ */
+fn assert_stats_call(c: TCall) -> AssertStats {
+    if !is_bool_assert_call(c) { return assert_stats_empty() }
+    mut folded: u64 = 0
+    if predicate_folds_const(c.args[0]) { folded = 1 }
+    AssertStats { total = 1; folded = folded }
+}
+
+/**
+ * is_bool_assert_call — is `c` a call to the single-predicate assertion `teko::assert::is_true` or
+ * `teko::assert::is_false`? Mirrors the codegen/VM recognition (`segments[0] == "teko"`,
+ * `segments[len-2] == "assert"`), and requires at least one argument (the predicate). `str_contains`
+ * is deliberately excluded — it takes two string arguments, not a bool predicate.
+ *
+ * @param c  the typed call
+ * @return   true iff `c` is a bool `teko::assert::is_true`/`is_false` call with a predicate argument
+ * @since 0.3.0.29
+ */
+fn is_bool_assert_call(c: TCall) -> bool {
+    if c.args.len == 0 { return false }
+    let segs = c.callee.segments
+    if segs.len < 2 { return false }
+    if segs[0].name != "teko" { return false }
+    if segs[segs.len - 2].name != "assert" { return false }
+    let last = segs[segs.len - 1].name
+    last == "is_true" || last == "is_false"
+}
