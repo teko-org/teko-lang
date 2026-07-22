@@ -1,236 +1,251 @@
-# The `ref` keyword + unsafe raw pointers + FFI — EXECUTABLE PLAN (0.3.0.30 build → 0.3.1 swap)
+# The `ref` keyword + a COMPLETE raw-pointer model + OWN-BACKEND-FIRST FFI — EXECUTABLE PLAN
 
 > **Status:** DESIGN-AHEAD, doc-only. **NOT implemented — the owner ratifies this plan before code.**
-> **The owner has DECIDED** (this is no longer an option comparison): the safe reference is the
-> **`ref` KEYWORD**; **`Ref<T>` becomes compiler-internal and invisible at the surface**; the raw
-> pointer sigils **`*` / `&` return to being EXCLUSIVE to `unsafe`** raw pointers. This document is the
-> **executable crumb sequence** that builds that decision under the same **accept(.30)→adopt(.31)**
-> discipline the null-union work uses: **0.3.0.30 BUILDS the whole new base (surface + backend),
-> seed-safe, coexisting with the old surface** (so it rides into the `0.3.0.30` seed); **0.3.1 SWAPS
-> the whole corpus** onto the new pattern using the `0.3.0.30` seed, then repurposes `&` and removes
-> the old forms.
+> **Owner-DECIDED:** the safe reference is the **`ref` KEYWORD**; **`Ref<T>` is compiler-internal and
+> INVISIBLE**; **`*` / `&` are `unsafe`-only raw-pointer operators.** Accept(.30)→adopt(.31) discipline
+> (like null-union): **.30 BUILDS the new base, seed-safe, coexisting**; **.31 SWAPS the corpus**, then
+> flips `&`, then removes the old forms.
 >
-> **The ratified semantic model is `docs/design/ref-transparent-model.md`** (tripartite law, R1–R11,
-> the A1–A6 spine, never-null, depth-cap-2, `Ref<T?>` transparency). This plan does NOT re-derive it —
-> it **executes** it. Companions read: `docs/design/marshall-spec.md` (the `ref`↔`ptr` boundary,
-> C0–C8), `docs/design/memory-unsafe-backend-remodel.md` (`unsafe`-by-type §2), `docs/design/
-> null-union-c3-c7-0.3.0.30.md` (the accept→adopt seed dance this mirrors), `docs/design/
-> wave-0.3.1-plan.md` (SW3/SW4/SW8 hooks). Verified against `src/` at authoring time.
+> **OWN-BACKEND-FIRST — the correction that governs Part B/C/D.** The C-transpile backend is being
+> **KILLED in .31–.32**; the **own linker lands .33–.34**. Therefore **relying on `cc` for FFI is a
+> trap** — anything that assumes a C preprocessor, a C compiler, or the `cc` link driver **regresses
+> the moment `cc` is gone.** So **ALL FFI (raw pointers, macros, varargs, callbacks, struct layout,
+> reverse-FFI, the `.h`) MUST have a REAL own-backend path — no honest-stop on the own backend, and
+> nothing that needs `cc` to exist** (not even "generate a wrapper the `cc` compiles" — there will be
+> no `cc`). The C macro problem is solved by a **teko-native macro resolver** (§4.2); varargs by a
+> **per-target own-backend ABI** (§4.3); C-library linking by the **own linker** (§4.5). The still-alive
+> C backend is a **transitional emitter to be deleted**, never a capability we bank on.
 >
-> **The build gate for every product-touching crumb (call it GATE-G):**
-> `teko build . --no-verify --release && ./bin/teko test .` **+ the self-host fixpoint**
-> (`gen1 == gen2 == gen3`) **+ `diff_vm_native`**. Doc/fixture-only crumbs skip the fixpoint.
+> **Semantic model = `docs/design/ref-transparent-model.md`** (executed here). Companions:
+> `docs/design/marshall-spec.md`, `docs/design/memory-unsafe-backend-remodel.md` (§4 the VM/backend
+> direction — own AOT backend + linker; C dies), `docs/design/own-backend-architecture.md`,
+> `docs/design/null-union-c3-c7-0.3.0.30.md` (the accept→adopt seed dance), `docs/design/
+> wave-0.3.1-plan.md`. Verified against `src/`.
+>
+> **GATE-G (every product crumb):** `teko build . --no-verify --release && ./bin/teko test .` +
+> self-host fixpoint (`gen1==gen2`, byte-identical — no gen3) + `diff_vm_native`. Design/fixture crumbs skip the fixpoint.
 
 ---
 
-## 0. The as-built state this plan is anchored on (verified in `src/`)
+## 0. As-built + the BACKEND TIMELINE that governs sequencing
 
 | fact | today | cite |
 |---|---|---|
-| **safe reference type** | `Ref<T>` (generic) → internal `Reference{inner}` | `resolve.tks` (`Ref<T>`→`Reference`) |
-| **reference deref** | `.value` (`AssignKind::RefDeref`) → C `(*p)` | `ast.tks:117`, `codegen.tks` |
-| **safe borrow / pass-by-ref** | **`&x` = a SAFE Borrow** (AL-wave-F1), used across the WHOLE corpus | `ast.tks:60`, `parse_expr.tks:471-477` |
-| **the `ref` keyword** | **does not exist** — no lexer token, `BindKind = enum{Let;Mut;Const}`, 0 binder uses | `ast.tks:101` |
-| **`*` as an operator** | **NOT an operator today — the glyph is FREE** (only multiply at the binary level) | `parse_expr.tks:517` |
-| **raw pointer internals** | `Ptr{inner:Type?}`, `Uptr{}`, `unsafe` modifier all EXIST internally | `type.tks:102`, `resolve.tks:1050` |
-| **surface `ptr<T>`/`uptr`** | **partial** — `ptr<T>` resolves; unsafe-gating is pointee-conditional; `uptr` not unsafe-carrying; no deref/arith operators | `resolve.tks:1057`, `:981` |
-| **runtime rep** | `Reference` AND `Ptr` both lower to bare `T*` — Marshall is ~free | `codegen.tks` |
+| safe reference | `Ref<T>`→`Reference{inner}`; deref `.value`→`(*p)` | `resolve.tks`, `ast.tks:117` |
+| safe borrow | **`&x` = SAFE Borrow** (AL-F1), corpus-wide | `ast.tks:60`, `parse_expr.tks:471` |
+| `ref` keyword | **does not exist** (`BindKind=enum{Let;Mut;Const}`) | `ast.tks:101` |
+| `*` operator | **NOT an operator — glyph FREE** | `parse_expr.tks:517` |
+| raw ptr internals | `Ptr{inner:Type?}`, `Uptr{}`, `unsafe`; `Ptr{inner=null}`≡opaque `ptr<void>` | `type.tks:102`, `resolve.tks:723` |
+| `ptr<T>`/`uptr` surface | **partial**; no deref/index/arrow/arith operators | `resolve.tks:1057` |
+| runtime rep | `Reference` and `Ptr` both → bare `T*` | `codegen.tks` |
 
-Two facts drive the whole sequencing:
+**The timeline (decisive):**
 
-1. **The reference already exists** (`Ref<T>` + `.value` + `&`/auto-ref) and self-hosts today. This
-   plan changes its **grafia** to the `ref` keyword and moves `Ref<T>` out of sight — a surface build
-   over a settled runtime (codegen `Reference → T*` is untouched).
-2. **`&` cannot mean two things at once.** Today `&x` is the SAFE borrow used everywhere in `src/`.
-   The decision makes `&` an **unsafe raw address-of**. Those are incompatible, so **the `&`
-   repurposing MUST wait until the corpus no longer uses `&x` as a borrow — i.e. .31**, after the
-   swap. This is the single load-bearing ordering constraint in the plan (§2, tension T1).
+```
+.30 (0.3.0.30)   C backend ALIVE   ── BUILD new surface + own-backend FFI codegen (seed-safe, coexist)
+.31 (0.3.1)      C backend DYING   ── SWAP corpus to `ref`, flip `&`; own-backend becomes primary
+.32              C backend DEAD    ── no cc, no C preprocessor, no cc link driver
+.33–.34          OWN LINKER        ── resolve C-lib symbols (.a/.o/.so) with no cc
+```
+
+**Consequence:** every FFI capability must be split into (a) an **own-backend codegen** part that is
+own-native and ships as early as the own backend can express it, and (b) — only where unavoidable — a
+**own-linker** part (resolving external C symbols) that couples with .33–.34. **No part may depend on
+`cc`.** The C-backend emitter for FFI is written ONLY as a throwaway bridge for .30/.31 differential
+testing and is deleted with kill-C.
 
 ---
 
-## 1. The ratified surface (what the corpus will read after .31)
+## 1. The ratified `ref` surface (post-.31 corpus)
 
-Executes `ref-transparent-model.md`; the owner's specific rules, verbatim:
+- **`Ref<T>` internal + invisible;** no `.value` at the surface.
+- **`ref` keyword, 4 positions:** `mut ref r: T` (**`let ref` illegal** — tripartite), `fn a(ref b: T)`,
+  `-> ref T`, **`a(ref x)`** (replaces `&x`).
+- **Transparent use** (type-directed auto-deref; `r = v` = R4 write-through).
+- **`*` / `&` = `unsafe`-only raw-pointer operators** (§2).
 
-- **`Ref<T>` is compiler-internal and INVISIBLE at the surface.** The surface never spells `Ref<T>` or
-  `.value` again; the checker still uses `Reference{T}` as the internal type.
-- **The `ref` keyword is the safe reference**, in four positions:
-  - variable binding — `mut ref r: T = …` (a mutable reference binding); **`let` cannot hold a
-    reference** — `let ref …` is illegal (tripartite law; a reference is inherently mutable).
-  - parameter — `fn a(ref b: T)` (by-reference param, R7 borrow-down).
-  - return — `fn a(...) -> ref T` (returns a reference, R6 materialize-in-caller-arena).
-  - call-site pass-by-reference — **`a(ref x)`**, which **REPLACES `&x`** for "pass this mutable
-    lvalue by reference."
-- **Use is transparent** — no `.value`; a `ref`-bound name auto-derefs (type-directed, ref-model §4);
-  `r = v` is R4 write-through.
-- **`*` and `&` are EXCLUSIVE to `unsafe` raw pointers**: `*p` = deref of a `ptr<T>`, `&x` = raw
-  address-of yielding `ptr<T>` — both legal only in `unsafe` context. Raw-pointer support (`ptr<T>`,
-  `uptr`, `*`-deref, `&`-address-of, arithmetic) must exist/complete.
+---
+
+## 2. The unified pointer model — COMPLETE raw pointer, zero tension (pure codegen → own-backend-native)
+
+Three disjoint worlds, one grafia each; **all pointer operators are machine instructions the own
+backend already emits (loads/stores/address arithmetic) — NONE need `cc`:**
+
+| world | grafia | internal | runtime | derefable? | sigils |
+|---|---|---|---|---|---|
+| SAFE reference | `ref T` (kw) | `Reference{T}` | `T*` | via auto-deref (safe) | none |
+| **REAL raw pointer** | **`ptr<T>`** (T concrete) | `Ptr{inner=T}` | `T*` | **yes — full set** | `*` `&` `->` `[]` `+` `-` |
+| OPAQUE handle | `ptr<void>` / `uptr` | `Ptr{inner=null}` / `Uptr` | `void*` / word | **no** (cast first) | none until cast |
+
+**The complete raw pointer is `ptr<T>` itself** (no separate `*T` type — dropped). Full `unsafe`-gated
+operator set, each a direct own-backend lowering:
+
+| op | meaning | own-backend lowering | phase |
+|---|---|---|---|
+| `*p` | deref (read/write) | load/store at `p` | **.30** (glyph free) |
+| `p[i]` | `*(p+i)` | `load [p + i*sizeof(T)]` | **.30** |
+| `p->f` / `(*p).f` | field via pointer | `load [p + offsetof(f)]` | **.30** |
+| `p + n` / `p - n` | element arithmetic | `p ± n*sizeof(T)` | **.30** |
+| `p - q` | pointer difference | `(p-q)/sizeof(T)` | **.30** |
+| address-of lvalue → `ptr<T>` | take address | `lea`/stack-slot address | **capability .30 (named `addr_of`); `&`-glyph .31** (T1) |
+| `null<T>()` / `is_null` | null ptr / test (union-nullable, not `?`) | `0` / `cmp` | **.30** |
+| `p to ptr<U>` / `to uptr` / `to ptr<T>` | reinterpret casts | no-op / mov | **.30** |
+
+`ptr<void>` deref is a **compile error** (no pointee) — cast to `ptr<T>` first, exactly as C requires
+off `void*`. `ptr<ptr<T>>` (`T**`) legal, uncapped. **Tension elimination:** `ref` (no sigils, safe) ≠
+`ptr<T>` (`*`/`&`, unsafe) ≠ `ptr<void>` (opaque, same family, `inner=null`); `*`/`&` never appear in
+safe code; Marshall (`wrap`/`unwrap`) is the sole crossing. **All of §2 is own-backend-native and
+ships in .30.**
+
+---
+
+## 3. Two-phase strategy + the T1 `&` nuance
+
+**.30 BUILD (seed-safe, coexist):** add `ref` (4 positions), the complete `ptr<T>` operators +
+`ptr<void>`/`uptr`, Marshall, and the FFI mechanisms of §4 — **all with a real own-backend codegen
+path** — while `Ref<T>`/`.value`/safe-`&x` keep working. `src/` adopts nothing new; seed `0.3.0.29`
+still builds gen1. **`&` frozen (safe borrow) in .30.**
+
+**.31 SWAP:** migrate `src/` (`Ref<T>`→`ref`, `.value`→transparent, `&x`→`a(ref x)`); hide `Ref<T>`;
+remove old acceptance; **last**, flip `&`→unsafe address-of.
+
+**T1:** `&` cannot be safe-borrow AND raw-address-of simultaneously; the corpus uses `&x` as a borrow,
+so the `&`-glyph flip is the **last .31 crumb**, after `&x`→`a(ref x)`. In .30 raw address-of is the
+named `marshall::addr_of(x)` / `unwrap(r)` — the raw pointer is COMPLETE without touching `&`.
+
+---
+
+## 4. OWN-BACKEND-FIRST FFI — the mechanisms (each with its real own-backend path)
+
+### 4.1 Raw pointers + Marshall — pure own-backend codegen
+
+§2's operators + `addr_of`/`wrap`/`unwrap`/`swap`/`null`/`is_null`/`to_uptr`/`from_uptr` are loads,
+stores, address arithmetic, and reinterprets — **the own backend emits them directly.** No `cc`, no
+linker dependency. Ships .30, own-native.
+
+### 4.2 C MACROS without a C preprocessor — the teko-native macro RESOLVER (the hard problem)
+
+`extern macro fn N(params) -> R = "MACRO" from header "h.h"` is resolved at build-time by a
+**teko-native resolver** the compiler owns — it reads the named header, finds the `#define`, and
+resolves it in **tiers**, never invoking `cc`:
 
 ```teko
 /**
- * Advances an array cursor by one and yields the current element, or `null` at the end.
- * `ref cur` is a by-reference parameter (internal `Reference{ArrayCursor}`); every use of
- * `cur` auto-derefs (no `.value`), and `cur = …` writes THROUGH the alias (R4). This is the
- * post-.31 spelling of the `over_array` idiom (was `cur: Ref<ArrayCursor>` + `.value`).
+ * Binds a C preprocessor macro as a typed function, resolved by teko's OWN macro resolver
+ * (no C preprocessor). The `from header "h.h"` names the header the resolver reads. The dev
+ * ASSERTS the signature; the resolver classifies the `#define` into one of four tiers (below)
+ * and lowers to own-backend IR — NEVER to a `cc` invocation.
  *
- * @param []i64 xs           the backing array (borrowed by value; not mutated)
- * @param ref ArrayCursor cur  the cursor, passed by reference (write-through advance)
- * @return i64 | null         the current element, or `null` when the cursor is exhausted
+ * @param u32 x  the argument
+ * @return u32   the asserted result
  * @since 0.3.1
  */
-fn over_array(xs: []i64, ref cur: ArrayCursor) -> i64 | null {
-    if cur.pos >= xs.len { return null }        // auto-deref — no `.value`
-    let v = xs[cur.pos]
-    cur = ArrayCursor { pos = cur.pos + 1 }      // write-through (R4)
-    v
-}
+extern macro fn htonl(x: u32) -> u32 = "htonl" from header "arpa/inet.h"
 ```
 
----
+- **Tier 0 — object-like / CONSTANT macro** (`O_RDONLY`, `INT_MAX`, `SOCK_STREAM`, flag bits — the
+  MOST COMMON case). The resolver reads the header, extracts `#define NAME <tokens>`, and **evaluates
+  the C constant-expression** with a **mini constant evaluator** (integer/char/hex literals, `<< >> | &
+  ^ ~ + - * / ( )`, and references to other object-like macros it recursively resolves). The value is
+  inlined as a typed Teko constant. **Fully own-native, zero runtime, ships in .30** (no IR needed —
+  just a value). This alone covers header CONSTANTS and FLAGS entirely.
+- **Tier 1 — symbol-alias macro** (`#define htonl(x) __bswap_32(x)` — the body is a single call to a
+  real linkable symbol, params forwarded). The resolver detects the wrapped symbol and **binds the
+  `extern macro fn` to that real symbol** — it becomes an ordinary `extern fn` call, resolved by the
+  own linker (§4.5). Own-native.
+- **Tier 2 — simple-body EXPANSION** (`#define htonl(x) ((((x)&0xff)<<24)|...)` — a pure
+  arithmetic/bitwise/shift/ternary expression over the parameters, the real low-level idiom). The
+  resolver parses the macro body as a **C expression** and **translates it to own-backend IR** (a
+  bounded C-expr→Teko-IR compiler: params, integer literals, Tier-0 constants, the arithmetic/
+  bitwise/shift/relational/ternary operators, casts to sized integer types). It is inlined at each
+  call and compiled by the own backend. **Own-native, no `cc`.** Covers htonl/htons/bit-twiddling.
+- **Tier 3 — arbitrary/complex C macro** (statements, side effects, token-paste `##`, stringize `#`,
+  calls into other complex macros, casts to C aggregate types). **HONEST ERROR — and ONLY here:**
+  *"this C macro is not mechanically resolvable; provide a Teko equivalent or bind a real linkable
+  symbol (`extern fn = \"sym\"`)."* This is the single honest-stop, reserved for genuinely arbitrary C
+  — NOT the common constant/flag/bit-twiddle cases.
 
-## 2. The two-phase strategy + the critical `&` sequencing nuance
+**Subsystem cost (real, bounded):** a minimal C header tokenizer + `#define` extractor, a C
+constant-evaluator (Tier 0), a symbol-detector (Tier 1), and a small C-expression→IR translator (Tier
+2). Sizeable but finite, and it makes `extern macro` REAL on the own backend for every case a
+low-level dev actually uses. **Sequencing:** Tier 0 ships in .30 (value inlining, no IR dependency);
+Tiers 1–2 land as own-backend IR expansion matures (couple with the own backend); Tier 3 is the
+always-present honest error.
 
-**Phase .30 (0.3.0.30) — BUILD, seed-safe, COEXIST.** Add every new surface (the `ref` keyword in all
-four positions, `*`-deref, complete `ptr<T>`/`uptr` unsafe support) and its backend, **while the old
-surface (`Ref<T>`, `.value`, safe-`&x`) keeps working unchanged.** `src/` does NOT adopt any new
-surface in .30, so **seed `0.3.0.29` still builds gen1** (the corpus is on the old spelling). The .30
-merge cuts the `0.3.0.30` seed, which now *understands* the new surface. **`&` is NOT touched in .30 —
-it stays the safe borrow.**
+### 4.3 VARARGS — a per-target own-backend ABI (not delegated to any C compiler)
 
-**Phase .31 (0.3.1) — SWAP the corpus, then repurpose `&`, then remove the old forms.** Using the
-`0.3.0.30` seed (which parses the new surface), migrate `src/`: `Ref<T>`→`ref`, `.value`→transparent,
-`&x`(borrow)→`ref x`. Only **after** the corpus no longer uses `&x` as a borrow: repurpose `&`→unsafe
-address-of, hide `Ref<T>` from the surface, and remove `.value`/old-`Ref<T>`/safe-`&x` acceptance.
+`extern fn printf(fmt: *byte, ...) -> i32 = "printf"` (`...` = C-ABI variadic tail, extern-only,
+trailing; default argument promotions `f32→f64`, sub-`int`→`int`). The **own backend implements the
+platform varargs calling convention itself**:
 
-**THE NUANCE (tension T1, load-bearing):** `&` is a safe borrow in the whole corpus today. If .30
-repurposed `&`→unsafe-address-of, the seed-build of the *current* corpus (which uses `&x` as a borrow)
-would break — the `0.3.0.29` seed and the .30 corpus both still mean "safe borrow." **Therefore `&`'s
-meaning is FROZEN through .30 and only flips in .31, AFTER the corpus swaps `&x`→`ref x`.** In .30 the
-unsafe address-of that raw-pointer support needs is provided by the **existing FFI primitives**
-(`teko::mem::as_ptr`/`buf_ptr`, `region_alloc` → `ptr<T>`) and Marshall `unwrap`, **NOT** by `&`. The
-`&`→pointer flip is the very last .31 crumb.
+- **SysV AMD64:** integer/pointer args in `RDI,RSI,RDX,RCX,R8,R9` then stack (right-to-left); floats in
+  `XMM0–7`; **`AL` = number of vector registers used** for the variadic call; overflow to the stack
+  with 16-byte alignment.
+- **AArch64 AAPCS64:** `x0–x7`/`v0–v7`, named args in registers, **variadic args passed on the stack**
+  (Apple's darwin variant differs — variadics always on stack); honor the platform variant.
+- **Windows x64:** `RCX,RDX,R8,R9` + 32-byte shadow space; **each vararg float is duplicated into the
+  matching GPR** (the Win64 vararg rule); overflow to stack.
 
-```
-timeline of the `&` glyph and the `Ref<T>`/`ref` grafia:
+This is a **real own-backend codegen crumb**, sequenced with the own backend's call lowering (it
+already lowers fixed-arg calls; varargs adds the promotion + AL/shadow/stack rules). **No `cc`
+delegation.** The transitional C-backend emits `printf(...)` verbatim ONLY for .30/.31 differential
+oracle; that emitter dies with C.
 
- seed 0.3.0.29 ──build──▶ .30 corpus (OLD surface) ──merge──▶ seed 0.3.0.30
-   &x = safe borrow          &x = safe borrow                    PARSES BOTH:
-   Ref<T>/.value             Ref<T>/.value  (unchanged)          ref-kw + *deref + ptr<T>
-   (no ref kw)               + ref-kw/​*deref/​ptr<T> ACCEPTED       ALSO ACCEPTED, unused in src/
-                                                                          │
- seed 0.3.0.30 ──build──▶ .31 corpus swap ─────────────────────────────┘
-   swap Ref<T>→ref, .value→transparent, &x→ref x   (still &=borrow until swap done)
-   THEN: & → unsafe address-of · hide Ref<T> · remove .value/old-Ref<T>/safe-&x
-```
+### 4.4 Struct layout, callbacks, calling conventions, errno — own-backend codegen
 
----
+- **`#repr("c")` + `extern union`** (G2): the own backend **lays out the aggregate per the target C
+  ABI** (field order preserved, natural alignment/padding, no Teko reordering) when `#repr("c")` is
+  present; a non-`#repr` aggregate crossing FFI is a compile error. Own-native layout algorithm — no
+  `cc`.
+- **`cabi` fn-pointer callbacks** (G3): only NON-capturing closures/top-level fns coerce (env-first ABI
+  dropped; capturing = reject); the own backend **emits a plain C-ABI function and takes its address**
+  — native. User-data is an explicit `ptr<T>`/`uptr` param.
+- **`#cconv("stdcall")`** (G4): the own backend emits the named calling convention (stdcall/… callee
+  cleanup, name decoration) itself; `teko::ffi::errno()` reads the thread-local `errno` via the
+  runtime (`teko_rt` TLS access) — native. Weak/versioning flagged follow-on.
 
-# PART A — the `ref` keyword (safe reference)
+### 4.5 Linking C libraries/objects — the OWN LINKER (.33–.34), surface early / link late
 
-## 3. Phase .30 — BUILD the `ref` surface + backend (seed-safe, coexisting)
+`extern from lib "L" from header "h.h" { … }` (G1, grouped extern-corpus block) and any `extern fn =
+"sym"` ultimately need the **external C symbol resolved against a `.a`/`.o`/`.so`**. The **own linker
+(.33–.34) does this — NOT `cc`:** it reads archive/object/shared formats (the backend already emits
+ELF/Mach-O/COFF objects — `objfile_*`), resolves undefined symbols against the named libs, and
+produces the final image. **Split:**
+- **.30 (surface + compiler-side reference):** parse the grouped block + `[extern.headers.<os>]` /
+  `[extern.libs.<os>]`; emit the undefined-symbol references + the relocation entries in the object.
+  This is own-native (object emission already exists).
+- **.33–.34 (resolution):** the own linker resolves those references against the C libs without `cc`.
+  In the .30–.32 interim the platform linker/`cc`-driver bridges the final link ONLY as throwaway
+  scaffolding — the DESIGN targets the own linker, and no capability assumes `cc` compiles anything.
 
-Every crumb below is **additive**: the parser/checker/codegen ACCEPT the new form; `src/` does not use
-it, so the `0.3.0.29` seed builds the .30 corpus unchanged. GATE-G at each product-touching crumb.
+This is the **one FFI capability genuinely coupled to the own-linker epic** (symbol *resolution*);
+everything else (codegen) is earlier and own-native.
 
-| crumb | size | touches (product?) | what to build | seed-safety |
-|---|---|---|---|---|
-| **A30.0** | L (design/verify) | no (design) | the §10.4-style auto-deref soundness pass on type-directed peeling + depth-cap-2 (ref-model open case #4/#5) — the verdict GATES A30.3 before it cements | doc-only |
-| **A30.1** | S | **yes** (lexer) | `ref` as a **contextual keyword** (like `from`/`params`/`unsafe`, via `is_name_at`) — so an identifier named `ref` still parses; only the binder/param/return/call positions trigger it | additive token; `src/` uses no `ref` keyword → seed-safe |
-| **A30.2** | M | **yes** (parser/AST) | `ref` in the 4 positions: binding `mut ref r: T`, param `fn a(ref b: T)`, return `-> ref T`, call-arg `a(ref x)`; `ref` grafia in type positions (fields/generic-args/slices/nesting); add `by_ref: bool` on `Param`/`Binding`/`FnDecl` + a `RefArg` expr node for `ref x` | additive productions; `src/` unaffected → seed-safe |
-| **A30.3** | M | **yes** (checker) | `ref`-binders resolve to internal `Reference{T}`; **`let ref` reject** (tripartite); transparent type-directed auto-deref (no `.value` needed on a `ref`-bound name); never-null; depth-cap-2 on resolved `Reference` depth; A4 definite-assignment on `ref` binders; `a(ref x)` = borrow-down (R7/A3, spine A2/A5). The A1–A6 spine is UNCHANGED (it already keys off `Reference`). | gated by A30.0; coexists with `Ref<T>`/`.value` acceptance → seed-safe |
-| **A30.4** | S | **yes** (codegen/lower) | `ref` bindings/params/returns lower to the EXISTING `Reference → T*` path; `a(ref x)` lowers to the EXISTING implicit auto-ref (`&x` at the C level) — **reuse, no new lowering** | reuse of built codegen → seed-safe |
-| **A30.5** | S | **yes** (coexistence) | keep `Ref<T>` + `.value` + safe-`&x` FULLY WORKING alongside `ref` (the accept-seed contract); a `ref`-bound name and a `Ref<T>`+`.value` value are two spellings of the same internal `Reference` | both surfaces accepted → the whole point of the .30 seed |
-| **A30.6** | S | no (fixtures) | the .30 accept-fixtures (§9) — new surface RUNs, old surface unchanged | doc/fixture-only |
+### 4.6 Reverse-FFI (`abi="c"`, `#[export]`) + the MANDATORY `.h` — own-native
 
-**A30 ritual:** A30.0 is a design gate (verdict before A30.3 cements the peel). A30.1–A30.5 each ride
-GATE-G. The .30 **seed cut** (merge) is a full gate + confirms BOTH spellings parse and `src/` still
-builds on the `0.3.0.29` seed (it must — `src/` is untouched).
-
-**Null reconciliation carried in A30.3 (the merged C5 `Ref<T> | null` work):** the surface
-`ref r: T | null` means **`Reference{ T | Null }`** (non-null spine, nullable pointee), never
-`Reference | Null`. The C5 pointer-is-null niche is **retargeted to the pointee** and the C5
-flow-narrow memo is **disabled across a reference boundary** (ref-model §4.2: another alias may null
-the slot; re-read via `?.`/`??`/`match`). It stays for genuinely-local non-ref `T | null`. This is a
-checker-side reclassification in `resolve.tks`/`typer.tks` + the null-union niche classifier — **no
-new rep path** (still a bare `T*` at a `T|Null` slot). Build it in .30 additively (it only fires for
-the new `ref` surface; the old `Ref<T>|null` niche keeps working until .31 removes the surface).
-
-## 4. Phase .31 — SWAP the corpus onto `ref`, then hide `Ref<T>` + remove old forms
-
-Uses the `0.3.0.30` seed (which parses `ref`). GATE-G at each product-touching crumb; the corpus swap
-is the load-bearing self-host proof.
-
-| crumb | size | touches | what to do | ordering |
-|---|---|---|---|---|
-| **A31.1** | L | **yes** (`src/**`) | migrate `Ref<T>`→`ref` (binding/type grafia) and `.value`→transparent across `src/` (the 114 `Ref<` sites + the Ref-subset of `.value`); fixpoint + `diff_vm_native` at EACH file; honest-stop (keep old form on a stubborn file) until green | first |
-| **A31.2** | M | **yes** (`src/**`) | swap every safe `&x` (borrow) → `ref x` at call sites (the AL-F1 sites); `&` STILL means borrow here — this is a pure spelling migration, not the repurposing | after A31.1 |
-| **A31.3** | S | **yes** (checker/codegen) | **hide `Ref<T>` from the surface** (reject `Ref<T>`/`.value` in user code — internal `Reference` only); remove the deprecated `.value`-on-`Reference` acceptance; remove the safe-`&x` **borrow** acceptance | **only after** A31.1+A31.2 green (corpus no longer uses any old form) |
-| **A31.4** | M | **yes** (parser/checker/codegen) | **REPURPOSE `&` → unsafe raw address-of** (`&x` yields `ptr<T>`, unsafe-only, marshall-spec §5.5) — now that A31.3 removed the safe-`&x` meaning and nothing in the corpus uses it as a borrow | **LAST** — the T1 flip |
-| **A31.5** | S | no (fixtures) | .31 swap-fixtures + the negative that `Ref<T>`/`.value`/safe-`&x` are now rejected | doc/fixture-only |
-
-**A31 ritual:** A31.1 is **self-host critical** (the corpus must build on `ref` with `.value` gone —
-the SW4 keystone). A31.3/A31.4 are full gates (they remove/repurpose shared surface). A31.4 is the
-single most delicate flip — its gate proves no residual `&x`-as-borrow survives.
-
----
-
-# PART B — unsafe raw pointers + FFI completeness
-
-`*` and `&` are the raw-pointer operators; `ptr<T>`/`uptr` are the raw types (all `unsafe`-only). The
-runtime rep is shared with `Reference` (`T*`), so Marshall is ~free (marshall-spec §3).
-
-## 5. Phase .30 — BUILD `*`-deref + complete `ptr<T>`/`uptr` (the glyph `*` is free today)
-
-`&`-address-of is **NOT** built here (T1 — `&` stays safe-borrow through .30); raw address-of in .30
-comes from the existing FFI primitives + Marshall `unwrap`. GATE-G at each product-touching crumb.
-
-| crumb | size | touches | what to build | seed-safety |
-|---|---|---|---|---|
-| **B30.1** | M | **yes** (parser/checker/codegen) | `*p` **prefix deref operator** on a `ptr<T>`, **unsafe-gated** (glyph free today, `parse_expr.tks:517`); parser adds `*` prefix; checker rejects in safe ctx; codegen `(*p)` | additive; `src/` uses no `*p` → seed-safe |
-| **B30.2** | M | **yes** (checker/codegen) | **complete `ptr<T>`/`uptr` unsafe** (marshall C0): `Ptr` unconditionally unsafe-carrying, `Uptr` unsafe-carrying; nullable-by-union `ptr<T> \| null` / `uptr \| null` (reject `ptr<T>?`); pointer arithmetic `p+n`/`p-n`/`p[i]`/`p->f` gated unsafe; migrate `teko::mem` FFI prims to `unsafe fn` | additive; only `rawbuf_*` (already unsafe) call them → seed-safe |
-| **B30.3** | M | **yes** (`src/marshall/*`) | the `teko::marshall` module: `null`/`is_null`/`to_uptr`/`from_uptr` (unsafe), `swap` (safe), and **`wrap`/`unwrap`** (`ref`↔`ptr<T>`) — buildable now because the internal `Reference` exists; the surface says `ref T`, not `Ref<T>` | new module, additive → seed-safe |
-| **B30.4** | S | no (fixtures) | the marshall/pointer accept-fixtures (§9) | doc/fixture-only |
-
-**Reconciliation flagged to the owner (marshall-spec §5.5):** raw-pointer operators bind to `ptr<T>`
-(as marshall-spec already has them); there is **no `*T` type** (an earlier draft floated one — it is
-dropped: `*` is an operator only, the raw type is `ptr<T>`). `ptr<T>` is the raw unsafe pointer,
-derefable via `*p` inside `unsafe`, nullable via union. This is consistent with the original
-marshall-spec (no re-point needed). **REPORTED** so the owner knows the `*T`-type idea is dropped.
-
-## 6. Phase .31 — repurpose `&` + FFI completeness (the security wave proper)
-
-The `&`→address-of flip is **A31.4** (Part A, last). The remaining FFI-completeness surfaces are
-additive and land after the corpus swap; each rides GATE-G. (Deep rationale/signatures for each were
-drafted in the prior FFI audit; here they are the executable .31 cluster.)
-
-| crumb | size | touches | what to build |
-|---|---|---|---|
-| **B31.0** | (=A31.4) | parser/checker/codegen | `&x` → unsafe raw address-of yielding `ptr<T>` (the T1 flip; sequenced in Part A) |
-| **B31.1** | M | parser/checker/codegen/manifest | **`extern macro fn … = "M" from header "h"`** — bind a C macro (no linker symbol); type-check the asserted signature; C-transpile expands textually; own-backend honest-stops OR generates a `cc`-compiled wrapper symbol; `[extern.headers.<os>]` manifest knob |
-| **B31.2** | M | parser/checker/codegen | **C-ABI variadics `...`** on `extern fn` (trailing, extern-only); default argument promotions; C-backend emits verbatim; own-backend varargs ABI is B31.7 |
-| **B31.3** | M | parser/manifest | **grouped `extern from lib "L" from header "h" { … }`** block — link a whole library/header set, not one symbol at a time; a `teko bindgen` tool is the flagged follow-on |
-| **B31.4** | M | parser/checker/codegen | **`#repr("c")`** struct layout + **`extern union`** — C layout compatibility for aggregates crossing by value (couples #502) or pointer; a non-`#repr` aggregate crossing FFI = compile error |
-| **B31.5** | M | parse_type/checker/codegen | **`cabi` fn-pointer** callbacks — only NON-capturing closures / top-level fns coerce (env-first ABI dropped); a capturing closure at the coercion site = compile error; user-data is an explicit `ptr<T>`/`uptr` param |
-| **B31.6** | S–M | parser/codegen/teko_rt | **`#cconv("stdcall")` + `teko::ffi::errno()`** (calling convention + thread-local errno read); weak/versioning flagged follow-on |
-| **B31.7** | L | backend | **own-backend variadic ABI** (SysV/AArch64/Windows) — the honest cost of toolchain independence; sequences with the SW13 backend debts; C-transpile gives B31.2 for free until then |
-| **B31.8** | M | manifest/checker/codegen | **reverse-FFI export:** `[artifact] abi = "c"` knob (on `static`/`shared`) + **`#[export("c_symbol")]`** (stable unmangled C symbol, C ABI, FFI-safe signature gate — no capturing closures, no bare `ref` crossing as-is; a `ref` is `unwrap`ped to `ptr<T>` at the boundary; aggregates need `#repr("c")`; no Teko `params []T` variadic export) |
-| **B31.9** | M | emit/header/teko_rt | reverse-FFI **C-header emitter** (`emit_c_header` — real `.h` with C prototypes + `#define`s for exported consts; closes the `extern type` header honest-stop `header.tks:91`) + the **`teko_rt_init`/`teko_rt_shutdown`** runtime-init contract (guarded auto-init fallback; arena stays process-root) + panic-must-not-unwind-into-C (an `#[export]` fn that can panic returns `… | error`) |
-
-**Reverse-FFI export marker (implementer copies verbatim):**
+- **`emit_c_header` — the `.h` (MANDATORY, .30):** generating the header is **pure text emission from
+  the checked program** — real C prototypes for every `#[export]` fn + **`#define`s for exported
+  `const`s** (this is "CREATING C macros callable from C") — **completely backend-independent, needs
+  no `cc` and no linker.** Ships in .30; also **closes the `extern type` header honest-stop**
+  (`header.tks:91`, **G5**).
+- **`[artifact] abi="c"` + `#[export("sym")]` (.30 codegen; artifact packaging couples own linker):**
+  the own backend **emits the exported symbol with the C ABI, unmangled** (FFI-safe signature gate: no
+  capturing closures; a `ref` is `unwrap`ped to `ptr<T>` at the boundary; aggregates need `#repr("c")`;
+  no Teko `params []T` variadic export). Packaging the `.a`/`.so`/`.dylib` uses the own
+  archiver/linker (.33–.34); the object + symbol emission is own-native and ships in .30.
+- **`teko_rt_init`/`teko_rt_shutdown`** (guarded auto-init; arena process-root) + **panic-must-not-
+  unwind-into-C** (a panicking `#[export]` fn returns `… | error`) — own-native runtime, .30.
 
 ```teko
 /**
- * Exported to C as the stable symbol `teko_add`. C ABI, no name mangling, no environment.
- * Only FFI-safe scalar / `ptr<T>` / `#repr("c")`-aggregate params and returns are permitted;
- * a bare `ref` is `unwrap`ped to `ptr<T>` at the boundary, a capturing closure is rejected,
- * and a `params []T` Teko variadic may not be exported (B31.8). The host calls `teko_rt_init`
- * once before any exported call (or relies on the guarded auto-init).
+ * Exported to C as the stable unmangled symbol `teko_add` (C ABI, no environment), emitted by
+ * the OWN backend. The generated `.h` (§4.6) carries `int64_t teko_add(int64_t, int64_t);`.
+ * Only FFI-safe scalar / `ptr<T>` / `#repr("c")`-aggregate params and returns are allowed.
  *
  * @param i64 a  first addend
  * @param i64 b  second addend
  * @return i64   the sum
- * @since 0.3.1
+ * @since 0.3.0.30
  */
 #[export("teko_add")]
 pub fn add(a: i64, b: i64) -> i64 { a + b }
@@ -238,128 +253,174 @@ pub fn add(a: i64, b: i64) -> i64 { a + b }
 
 ---
 
-## 7. Gate & fixpoint discipline (every product-touching crumb)
+## 5. Re-sequenced (own-backend-first): what ships when
 
-**GATE-G = `teko build . --no-verify --release && ./bin/teko test .` + fixpoint (`gen1==gen2==gen3`)
-+ `diff_vm_native`.** Notes:
+| capability | own-backend codegen | own-linker part | phase |
+|---|---|---|---|
+| `ref` keyword + transparent use | reuse `Reference→T*` | — | **.30 build / .31 adopt** |
+| complete `ptr<T>` ops (`*`,`[]`,`->`,`+`,`-`, `addr_of`, casts, null) | direct instructions | — | **.30** (own-native) |
+| Marshall (`wrap`/`unwrap`/`swap`/bridge) | reinterprets | — | **.30** |
+| `extern macro` Tier 0 (constants/flags) | value inline | — | **.30** (resolver, no cc) |
+| `extern macro` Tier 1–2 (symbol-alias / body-expand) | IR expansion | Tier 1 needs symbol link | **.31+ as IR matures** (Tier 1 link → .33–.34) |
+| `#repr("c")` / `extern union` layout | own layout algo | — | **.30** |
+| `cabi` callbacks | emit C-ABI fn + addr | — | **.30** |
+| `#cconv` / `errno` | own cconv emit / TLS | — | **.30** (common cases) |
+| C-ABI variadics `...` | **per-target vararg ABI** | — | **own-backend crumb** (with own-backend call lowering; .31±) |
+| `extern from lib` (grouped block, G1) | undef-symbol refs + relocs | **resolve vs `.a`/`.o`/`.so`** | surface **.30**; resolution **.33–.34** |
+| `abi="c"` + `#[export]` | emit unmangled C-ABI symbol | **package `.a`/`.so`** | codegen **.30**; packaging **.33–.34** |
+| `emit_c_header` `.h` (MANDATORY, G5) | pure text | — | **.30** (backend-independent) |
 
-- **.30 crumbs:** because `src/` does NOT adopt the new surface in .30, the `0.3.0.29` seed builds
-  gen1, gen1 builds gen2, gen2 builds gen3 — **fixpoint holds trivially** (the corpus is byte-identical
-  across the new-surface addition; it simply doesn't use it). A .30 crumb that perturbs `.tkb` output
-  for the *unchanged* corpus is a bug (the addition must be inert until adopted).
-- **.31 crumbs:** the seed is `0.3.0.30`. Each corpus-swap crumb must hold fixpoint on the NEW
-  spelling (`0.3.0.30` seed builds the swapped gen1; gen1 builds gen2; equal). `diff_vm_native` proves
-  the swap changed spelling, not behavior. A31.1 and A31.4 are the two crumbs where a break strands
-  the chain — migrate file-by-file with honest-stop.
-- **Design/fixture-only crumbs** (A30.0, A30.6, A31.5, B30.4) skip the fixpoint.
+**The only FFI parts coupled to the own linker (.33–.34)** are external-C-symbol *resolution* and lib
+*packaging*; **the only part coupled to own-backend call-lowering** is the vararg ABI; **everything
+else is own-native and ships .30.** The transitional C emitter (for differential testing) is deleted
+with kill-C — **no capability regresses when `cc` dies.**
 
-## 8. Seed-safety notes (everything in .30 must be buildable by seed `0.3.0.29`)
+---
 
-- **The binding rule:** `src/` must use NO new surface in .30. Every .30 crumb is a parser/checker/
-  codegen ADDITION that the compiler ACCEPTS but the compiler's own code does not WRITE. The corpus
-  stays on `Ref<T>`/`.value`/safe-`&x` through the entire .30 phase; adoption is 100% deferred to .31.
-- **`ref` is CONTEXTUAL** (A30.1) — a namespace segment / identifier named `ref` stays legal, and no
-  existing token is reserved away. Verify no `src/` identifier collision before merge (contextual
-  keyword, so even a collision is inert unless in a binder/param/return/call slot).
-- **`*`-deref (B30.1) uses a free glyph** — `*` is not a prefix operator today, so adding the prefix
-  deref cannot change the meaning of any existing `src/` expression (multiply stays at the binary
-  level). Seed-safe by construction.
-- **`&` is UNTOUCHED in .30** (T1) — its safe-borrow meaning is frozen so the `0.3.0.29` seed and the
-  .30 corpus agree. The flip is A31.4, after the corpus stops using `&x` as a borrow.
-- **`ptr<T>`/`uptr` completion (B30.2)** only tightens *unsafe-carrying* + adds operators used only in
-  `unsafe`; the FFI prims migrate to `unsafe fn` but their only callers (`rawbuf_*`) are already
-  unsafe — blast radius audited, seed-safe.
-- **The .30 merge cuts the `0.3.0.30` seed** carrying the full new surface; **.31 dogfoods it.** Never
-  remove an old form in .30 (that is a .31 crumb) — removing before the corpus swaps would strand the
-  seed chain (the null-union §0.1 seed-sequencing law, mirrored).
+## 6. Phase .30 crumbs (BUILD; additive; seed-safe; every FFI crumb has a real own-backend path)
 
-## 9. Regression fixtures (inputs → exit; VM & native)
+New `src/` modules are written in the OLD surface (seed `0.3.0.29` parses them); they swap in .31.
 
-**.30 accept-fixtures (both surfaces live):**
-- `ref_binding_ok` — `mut ref r: T = v; r = w` write-through → RUN, VM==native.
-- `ref_param_ok` — `fn f(ref b: T)` mutates caller's `mut` lvalue via `f(ref x)` → RUN, VM==native.
-- `ref_return_ok` — `fn g(...) -> ref T` (R6 caller-arena materialize) → RUN, VM==native.
-- `ref_use_transparent_ok` — a `ref`-bound name used with NO `.value` → RUN, VM==native.
-- `ref_optional_pointee_ok` — `mut ref r: T | null`; `?.`/`??`/`match` peel one level → RUN.
-- `old_surface_still_ok` — `Ref<T>` + `.value` + `&x` UNCHANGED (coexistence proof) → RUN, VM==native.
-- `let_ref_rejected` — `let ref r: T` → **EXPECT_COMPILE_FAIL** (tripartite).
-- `ref_uninit_rejected` — `mut ref r: T` no init → **EXPECT_COMPILE_FAIL** (A4).
-- `ref_depth_cap3_rejected` — consecutive-ref depth 3 → **EXPECT_COMPILE_FAIL**.
-- `ptr_deref_unsafe_ok` / `ptr_deref_in_safe_rejected` — `*p` in unsafe RUNs / in safe FAILS.
-- `ptr_optional_question_rejected` — `ptr<T>?` → **EXPECT_COMPILE_FAIL** (nullable is `ptr<T> | null`).
-- `marshall_swap_values` — SAFE `swap` → RUN, **VM==native**; `marshall_wrap_null_panics` — PANIC.
+**Part A — `ref` keyword:** A0 soundness gate (design) · A1 contextual `ref` lexer · A2 parser (4
+positions + type-grafia + `by_ref`/`RefArg`) · A3 checker (`ref`→`Reference`, `let ref` reject,
+auto-deref, never-null, depth-cap-2, A4, `a(ref x)` borrow-down, C5 niche→pointee) · A4 codegen (reuse
+`Reference→T*`) · A5 coexistence with `Ref<T>`/`.value`/`&x`.
 
-**.31 swap-fixtures (old forms now gone):**
-- `ref_selfhost_ok` — the `over_array`/iterator idiom compiles on `ref` → RUN (self-host proof).
-- `amp_is_unsafe_addressof_ok` — `&x` in `unsafe` yields `ptr<T>` → RUN (native); `amp_in_safe_rejected` — `&x` in safe → **EXPECT_COMPILE_FAIL** (the flip).
-- `refT_surface_rejected` — `Ref<T>` / `.value` in user code → **EXPECT_COMPILE_FAIL** (hidden).
-- FFI cluster: `extern_macro_htonl`, `variadic_printf`, `grouped_extern_block`, `repr_c_struct_byval`,
-  `cabi_callback_noncapturing` (+ `_capturing_rejected`), `ffi_errno_read`,
-  `revffi_export_add`, `revffi_c_header_emitted`, `revffi_rt_init_contract` — RUN;
-  `revffi_export_nonffisafe_rejected`, `revffi_export_teko_variadic_rejected` — COMPILE_FAIL.
+**Part B — complete `ptr<T>` (own-native codegen):** B1 `*p` deref · B2 `p[i]`/`p->f`/`(*p).f` · B3
+arith `p+n`/`p-n`/`p-q` · B4 `ptr<T>` typing (unconditional `Ptr`/`Uptr` unsafe-carrying; `ptr<void>`
+deref-reject; union-nullable; casts; migrate `teko::mem` prims to `unsafe fn`) · B5 `src/marshall/*`
+(`addr_of`/`wrap`/`unwrap`/`swap`/`null`/`is_null`/`to_uptr`/`from_uptr`).
 
-## 10. Law / Constitution tensions (called out; resolved law-first)
+**Part C — FFI mechanisms (own-native paths):** C1 **macro resolver Tier 0** (header read + constant
+evaluator; `[extern.headers.<os>]` knob) — REAL constants/flags, no cc · C2 grouped `extern from
+lib/header { … }` **surface + undef-symbol/reloc emission** (G1; resolution is §8) · C3 `#repr("c")` +
+`extern union` **own layout** (G2) · C4 `cabi` callbacks (G3) · C5 `#cconv` + `teko::ffi::errno()`
+(G4) · C6 variadic `...` **surface + checker promotions** (the own-backend vararg ABI lowering is §8).
 
-- **T1 [CRITICAL, ordering] — `&` cannot be safe-borrow AND unsafe-address-of at once.** The corpus
-  uses `&x` as a borrow everywhere. **Resolved:** freeze `&`'s meaning through .30; flip to
-  address-of only in **A31.4**, after A31.1/A31.2 swap `&x`→`ref x` and A31.3 removes the safe-`&x`
-  acceptance. Raw address-of in .30 uses the existing FFI prims / Marshall `unwrap`, not `&`. This is
-  the single non-negotiable ordering edge. Not a HALT.
-- **T2 [HIGH, stranding] — the corpus swap (A31.1) is self-host-critical.** If a `src/` pattern breaks
-  under the `ref` checker, no swapped gen1 builds. **Resolved:** file-by-file migration with GATE-G +
-  honest-stop (keep the old form on a stubborn file until resolved); remove old acceptance (A31.3)
-  only when 100% green. Mirrors null-union R2. Not a HALT.
-- **T3 [MEDIUM] — auto-deref soundness (depth-cap-2 peel) unverified.** **Resolved:** A30.0 runs the
-  §10.4-style soundness pass BEFORE A30.3 cements the peel; if it fails, narrow the nested-ref opening
-  (honest-stop) rather than cement an unsound peel. Not a HALT.
-- **T4 [MEDIUM] — the merged C5 `Ref<T> | null` niche re-interpretation.** **Resolved law-first**
-  (ref-model §4.2): the pointer-is-null niche retargets to the pointee and the flow-narrow memo is
-  disabled across ref boundaries; built additively in A30.3, old niche removed in A31.3. Review-heavy,
-  not a HALT.
-- **T5 [MEDIUM] — C-macro FFI vs toolchain-independence** (own-backend has no C preprocessor, B31.1).
-  **Resolved honest-stop:** `extern macro` works on the C-transpile backend + a generated
-  `cc`-compiled wrapper symbol; honest compile error on the *pure* own-backend. Not a HALT.
-- **T6 [MEDIUM] — C-ABI variadics on the own-backend** (B31.2/B31.7). **Resolved:** C-transpile ships
-  now; own-backend varargs ABI is a real backend crumb (B31.7, with SW13). Not a HALT.
-- **T7 [LOW] — reverse-FFI runtime init vs no-implicit-global** (B31.9). **Resolved:** explicit
-  `teko_rt_init/shutdown` + guarded auto-init; arena stays process-root (remodel §0). Not a HALT.
-- **T8 [LOW] — panics must not unwind into a C host** (B31.9). **Resolved:** the export boundary
-  catches Teko panics; a panicking `#[export]` fn returns `… | error`. Not a HALT.
+**Part D — reverse-FFI:** D1 `[artifact] abi="c"` + `#[export]` **own-backend C-ABI symbol emission** +
+FFI-safe gate · D2 **`emit_c_header` — the `.h`** (MANDATORY; prototypes + `#define` consts; close G5)
+· D3 `teko_rt_init`/`shutdown` + panic-not-into-C · D4 fixtures.
 
-**No genuine unresolved tension → NO HALT.** REPORTED for owner awareness: the `*T`-type idea is
-dropped (§B.5 — `*` is an operator, the raw type is `ptr<T>`); and the marshall-spec `swap`/`wrap`/
-`unwrap` signatures now spell `ref T` (not `Ref<T>`) at the surface — a companion-doc spelling edit.
+GATE-G on every product crumb. A0/D4 skip fixpoint. The .30 merge cuts the `0.3.0.30` seed.
+
+## 7. Phase .31 crumbs (SWAP)
+
+A31.1 corpus `Ref<T>`→`ref` + `.value`→transparent (114 sites; fixpoint+diff per file; self-host
+critical) · A31.2 `&x`→`a(ref x)` swap · A31.3 hide `Ref<T>` + remove `.value`/old-`Ref<T>`/safe-`&x`
+acceptance · A31.4 **FLIP `&`→unsafe raw address-of** (alias of `addr_of`; LAST, T1) · A31.5 fixtures.
+
+## 8. Own-backend / kill-C / own-linker coupled crumbs (real, no `cc`)
+
+- **KC1 — vararg ABI (own backend):** per-target SysV/AArch64/Win64 varargs lowering (§4.3) — with the
+  own-backend call-lowering completion (SW13-adjacent). Powers C6's `...` on the own backend.
+- **KC2 — macro resolver Tiers 1–2 (own backend IR):** symbol-alias binding + simple-body→IR expansion
+  (§4.2) — as the own-backend IR expansion path is ready. Tier 0 already shipped (.30).
+- **KC3 — own linker C-symbol resolution (.33–.34):** resolve `extern`/`extern from lib` undefined
+  symbols against `.a`/`.o`/`.so`; package `abi="c"` `.a`/`.so`/`.dylib` (§4.5). Replaces the `cc` link
+  bridge; the surface + object emission already shipped (.30).
+- **KC4 — delete the transitional C-FFI emitter** with kill-C: remove the throwaway C-backend FFI
+  emission once the own-backend paths (KC1–KC3) are green; confirm NO capability regresses (the
+  fixtures of §11 must pass on the own backend alone).
+
+Each KC crumb rides GATE-G; KC4 is the ritual proof that the own backend stands alone.
+
+## 9. GATE-G & fixpoint
+
+`teko build . --no-verify --release && ./bin/teko test .` + fixpoint + `diff_vm_native`. In .30 `src/`
+is unchanged, so fixpoint holds trivially (additions inert). In .31 each swap crumb holds fixpoint on
+the new spelling. **When the own-backend FFI paths land (KC), the differential migrates from
+VM/C-backend to own-vs-C-backend and then, at kill-C, to own-backend-only** (remodel §4). A0/D4/A31.5
+skip fixpoint.
+
+## 10. Seed-safety (.30 built by seed `0.3.0.29`)
+
+`src/` uses NO new surface in .30 (accept-only). `ref` contextual (no reserved token). `*`-deref uses
+a free glyph; `p[i]`/`p->f`/arith are new ops on `ptr` types unused by `src/`. `&` frozen (borrow).
+New modules (marshall, ffi, macro-resolver, c-header) written in OLD surface. FFI-prim `unsafe fn`
+migration only adds the modifier (seed parses it); callers `rawbuf_*` already unsafe. **The macro
+resolver + `.h` emitter are ordinary compiler code (no new surface) → seed-safe.** Never remove an old
+form in .30 (that is .31). The .30 merge cuts `0.3.0.30`; .31 dogfoods it.
+
+## 11. Fixtures (own-backend-validated, not cc-validated)
+
+Every FFI fixture must pass **on the own backend** (once its KC crumb lands) — a fixture that only
+passes via the C emitter is a regression trap. Native oracle = own backend.
+
+**.30 accept:** `ref_binding_ok`/`ref_param_ok`/`ref_return_ok`/`ref_use_transparent_ok`/
+`ref_optional_pointee_ok`; `old_surface_still_ok` (coexistence); `let_ref_rejected`/
+`ref_uninit_rejected`/`ref_depth_cap3_rejected` (COMPILE_FAIL). Pointers: `ptr_deref_ok`/
+`ptr_index_ok`/`ptr_arrow_ok`/`ptr_arith_ok`/`ptr_addr_of_ok`; `ptr_deref_in_safe_rejected`/
+`ptr_void_deref_rejected`/`ptr_optional_question_rejected`. `marshall_swap_values` (VM==native)/
+`marshall_wrap_null_panics`. FFI: `macro_const_flag_ok` (**Tier 0, own backend, no cc** — e.g.
+`O_RDONLY`), `macro_htonl_expand_ok` (**Tier 2, own backend**), `macro_complex_rejected` (Tier 3
+honest error); `repr_c_struct_byval` (own layout), `cabi_callback_noncapturing` (+ `_capturing_rejected`),
+`ffi_errno_read`. Reverse: `revffi_c_header_emitted` (the `.h` — pure text, no cc), `revffi_export_add`,
+`revffi_rt_init_contract`; `revffi_export_nonffisafe_rejected`.
+**Own-backend coupled:** `variadic_printf_ownbackend` (KC1, own-backend vararg ABI),
+`macro_symbol_alias_ok` (KC2 Tier 1), `extern_lib_link_ownlinker` (KC3, own linker resolves a C `.a`).
+**.31 swap:** `ref_selfhost_ok`; `amp_is_unsafe_addressof_ok`/`amp_in_safe_rejected`;
+`refT_surface_rejected`.
+
+## 12. Law / Constitution tensions (resolved law-first)
+
+- **T1 [CRITICAL, ordering] — `&` borrow vs raw address-of.** Freeze `&` in .30 (raw address-of ships
+  as named `addr_of`); flip the glyph LAST in .31 (A31.4). Not a HALT.
+- **T0 [CRITICAL, corrected] — FFI must be OWN-BACKEND-REAL, not cc-backed.** The prior draft leaned on
+  the C backend; **corrected:** every FFI capability has an own-backend path (macro resolver §4.2,
+  vararg ABI §4.3, own-linker resolution §4.5, own-native codegen for the rest); **no honest-stop on
+  the own backend and nothing that needs `cc` to exist** (the wrapper-symbol-compiled-by-`cc` idea is
+  DEAD). The C emitter is throwaway scaffolding deleted at kill-C (KC4). Not a HALT.
+- **T2 [HIGH] — corpus swap self-host-critical (A31.1).** File-by-file GATE-G + honest-stop. Not a HALT.
+- **T3 [MEDIUM] — auto-deref/depth-cap-2 soundness.** A0 gate before A3. Not a HALT.
+- **T4 [MEDIUM] — C5 `Ref<T>|null` niche re-interpretation.** Niche→pointee, flow-narrow disabled
+  across ref (ref-model §4.2); additive .30, old niche removed .31. Not a HALT.
+- **T5 [MEDIUM] — the C-macro resolver is a real subsystem, bounded.** Risk: Tier 2's C-expr→IR
+  translator scope-creeps. **Resolved:** hard-bound Tier 2 to arithmetic/bitwise/shift/relational/
+  ternary/cast-to-sized-int over params + literals + Tier-0 constants; anything past that is Tier 3
+  (honest error). The common low-level cases (constants, flags, byte-swaps) are covered; arbitrary C
+  is honestly refused. Not a HALT.
+- **T6 [MEDIUM] — vararg ABI is per-target, real work.** **Resolved:** KC1 implements SysV/AArch64/
+  Win64 with the own backend; sequenced with own-backend call lowering; the C emitter bridges only for
+  the .30/.31 differential and is deleted at kill-C. Not a HALT.
+- **T7 [MEDIUM] — external C-symbol resolution needs the own linker (.33–.34).** **Resolved:** split —
+  surface + undef-symbol/reloc emission in .30 (own-native), resolution in the own linker; the `cc`
+  link driver is a throwaway interim bridge, never a banked capability. This is the one genuine
+  coupling to the linker epic; flagged, not a HALT.
+- **T8 [LOW] — reverse-FFI init / panic-into-C.** Explicit `teko_rt_init/shutdown` + `… | error`. Not a HALT.
+
+**No unresolved tension → NO HALT.** REPORTED: the `*T`-type idea is dropped (raw pointer is `ptr<T>`);
+marshall signatures spell `ref T`; marshall gains `addr_of`; **the FFI plan is own-backend-first and
+carries no `cc` dependency** — the previously-floated "cc-compiles-a-wrapper" macro fallback is removed.
 
 ---
 
 ## Appendix — file/impact map (absolute paths)
 
-- **.30 build — Part A (`ref`):** `/home/user/teko-lang/src/lexer/lexer.tks` (contextual `ref`),
-  `/home/user/teko-lang/src/parser/ast.tks` (`by_ref` flag, `RefArg`),
-  `/home/user/teko-lang/src/parser/parse_decl.tks` (`ref` param/return),
-  `/home/user/teko-lang/src/parser/parse_stmt.tks` (`mut ref` binder),
-  `/home/user/teko-lang/src/parser/parse_type.tks` (`ref` grafia in type positions),
-  `/home/user/teko-lang/src/parser/parse_expr.tks` (`a(ref x)` call arg),
-  `/home/user/teko-lang/src/checker/resolve.tks` (`ref`→`Reference`, `let ref` reject, depth cap,
-  reject surface `Reference|Null`), `/home/user/teko-lang/src/checker/typer.tks` (auto-deref peel,
-  C5 flow-narrow restriction), `/home/user/teko-lang/src/codegen/codegen.tks` (reuse `Reference→T*`).
-- **.30 build — Part B (pointers):** `/home/user/teko-lang/src/parser/parse_expr.tks` (`*p` prefix
-  deref), `/home/user/teko-lang/src/checker/resolve.tks` (`unsafe_carrying_at` `Ptr`/`Uptr`; ptr
-  arith gates), `/home/user/teko-lang/src/codegen/codegen.tks` (`(*p)`, arith), new
-  `/home/user/teko-lang/src/marshall/marshall.tks` (wrap/unwrap/swap/bridge).
-- **.31 swap:** `/home/user/teko-lang/src/**` (114 `Ref<`, `.value` Ref-subset, `&x` borrow sites);
-  `/home/user/teko-lang/src/parser/parse_expr.tks` + `checker` + `codegen` for the `&`→address-of flip;
-  `resolve.tks` to hide `Ref<T>` from the surface.
-- **.31 FFI completeness:** `/home/user/teko-lang/src/parser/parse_decl.tks` (`extern macro`, `...`,
-  grouped `extern`), `/home/user/teko-lang/src/build/manifest.tks` (`[extern.headers]`, `abi="c"`),
-  `/home/user/teko-lang/src/emit/header.tks` (C-header emitter, close `header.tks:91`),
-  `/home/user/teko-lang/src/runtime/teko_rt.{c,h}` (maintained-C: errno read, `teko_rt_init/shutdown`),
-  `/home/user/teko-lang/src/backend/*` (own-backend varargs ABI).
-- **Companion designs:** `/home/user/teko-lang/docs/design/ref-transparent-model.md` (the ratified
-  semantic model — EXECUTED here), `/home/user/teko-lang/docs/design/marshall-spec.md` (C0–C8;
-  signatures now spell `ref T`), `/home/user/teko-lang/docs/design/memory-unsafe-backend-remodel.md`,
-  `/home/user/teko-lang/docs/design/null-union-c3-c7-0.3.0.30.md` (the accept→adopt seed dance),
-  `/home/user/teko-lang/docs/design/wave-0.3.1-plan.md` (SW3/SW4/SW8 hooks).
+- **.30 `ref`:** `/home/user/teko-lang/src/lexer/lexer.tks`, `.../parser/ast.tks`,
+  `.../parser/parse_{decl,stmt,type,expr}.tks`, `.../checker/{resolve,typer}.tks`,
+  `.../codegen/codegen.tks`.
+- **.30 complete `ptr<T>`:** `.../parser/parse_expr.tks` (`*p`/`p[i]`/`p->f`/`p+n`),
+  `.../checker/resolve.tks` (`Ptr`/`Uptr` unsafe; `ptr<void>` deref reject; casts),
+  `.../codegen/codegen.tks`, new `/home/user/teko-lang/src/marshall/marshall.tks`.
+- **.30 FFI mechanisms:** new `/home/user/teko-lang/src/ffi/macro_resolver.tks` (header tokenizer +
+  `#define` extractor + constant evaluator + C-expr→IR translator, Tiers 0–2), new
+  `/home/user/teko-lang/src/ffi/ffi.tks` (`errno`), `.../parser/parse_decl.tks` (`extern macro`, `...`,
+  grouped `extern`, `#repr`/`extern union`, `cabi`, `#cconv`), `.../build/manifest.tks`
+  (`[extern.headers]`), `.../codegen/codegen.tks` (own layout, cabi, cconv, vararg promotions),
+  `.../runtime/teko_rt.{c,h}` (maintained-C errno read).
+- **.30 reverse-FFI + `.h`:** `.../build/manifest.tks` (`abi="c"`), `.../checker/*` +
+  `.../codegen/codegen.tks` (`#[export]` unmangled C-ABI + FFI-safe gate),
+  `/home/user/teko-lang/src/emit/header.tks` (**`emit_c_header`**; close `header.tks:91`),
+  `.../runtime/teko_rt.{c,h}` (`teko_rt_init/shutdown`).
+- **.31 swap:** `/home/user/teko-lang/src/**`; `parse_expr.tks`+`checker`+`codegen` for `&`-flip;
+  `resolve.tks` to hide `Ref<T>`.
+- **Own-backend / kill-C / linker (KC):** `/home/user/teko-lang/src/backend/*` (per-target vararg ABI;
+  own layout; cconv), `/home/user/teko-lang/src/lir/lower.tks` (vararg lowering; macro-body IR),
+  `/home/user/teko-lang/src/backend/objfile_{elf,macho,coff}.tks` (undef symbols/relocs; the own linker
+  resolution + `abi="c"` packaging).
+- **Companions:** `/home/user/teko-lang/docs/design/ref-transparent-model.md`,
+  `.../marshall-spec.md` (`ref T` + `addr_of`), `.../memory-unsafe-backend-remodel.md` (§4 C dies),
+  `.../own-backend-architecture.md`, `.../null-union-c3-c7-0.3.0.30.md`, `.../wave-0.3.1-plan.md`.
 
-*This document is design-ahead and doc-only. No product code is changed. The owner ratifies this plan
-before implementation.*
+*Design-ahead, doc-only. No product code changed. Own-backend-first; no `cc` dependency. Owner
+ratifies before implementation.*

@@ -258,9 +258,8 @@ teko build . --no-verify --release      # 0.3.0.29 seed builds gen1 at -O2 into 
 ```
 ### [FIXPOINT] (append where PRODUCT code moves — C3, C4, C5, C6, C7)
 ```
-./bin/teko build . -o gen2 --no-verify --release
-./gen2/teko build . -o gen3 --no-verify --release
-cmp gen2/teko.c gen3/teko.c              # MUST be byte-identical (gen2 == gen3)
+./bin/teko build . -o gen2 --no-verify --release   # gen1 (./bin, seed-built) builds gen2
+cmp bin/teko.c gen2/teko.c               # MUST be byte-identical (gen1 == gen2 — no gen3)
 ```
 
 ---
@@ -419,7 +418,7 @@ tension (both reps are already law-blessed; the pivot only removes the legacy on
 
 **RISK-2 (tkb tag renumbering).** Deleting typeexpr tag 3 (Optional) and expr tags 14/15
 (SFA/Coalesce) changes the `.tkb` wire format. This is the compiler's own artifact format; the
-fixpoint (gen2==gen3) is the guard — any read/write asymmetry breaks byte-identity at C5/C6. Reserve
+fixpoint (gen1==gen2) is the guard — any read/write asymmetry breaks byte-identity at C5/C6. Reserve
 (don't reuse) the freed tags per the existing tkb version discipline, or bump the tkb format version
 if the header carries one. Report to the integrator; no user-facing compatibility law applies
 (bootstrap-internal format).
