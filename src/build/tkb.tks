@@ -1,0 +1,1125 @@
+/**
+ * TkbPhase — the Gherkin step PHASE: `Given` (opaque runtime inputs), `When` (the entry verb
+ * that classifies the kind), or `Then` (the expected observable output). `And`/`But` inherit
+ * the preceding step's phase and never appear as a distinct value here.
+ *
+ * @since 0.3.0.30
+ */
+pub type TkbPhase = enum { Given; When; Then }
+
+/**
+ * TkbStep — one lowered Gherkin step: the resolved `phase`, the `noun` phrase selecting a
+ * `Tkr` field (e.g. "args", "exit", "stdout sha256", "source"), the entry `verb` for a When,
+ * the `osarch` route from an `on "<os-arch>"` prefix, and the raw TOML `value` text (already
+ * placeholder-substituted, still in surface form so the reused `mf_read_*` lexers decode it).
+ *
+ * @since 0.3.0.30
+ */
+pub type TkbStep = struct {
+    /** the resolved phase (And/But inherit the previous step's). */
+    phase: TkbPhase
+    /** the noun-phrase selecting the target `Tkr` field ("" for an entry-verb When). */
+    noun: str
+    /** the entry verb ("built and run" | "compiled" | "compilation fails" | ""). */
+    verb: str
+    /** the os-arch route from an `on "<os-arch>"` prefix ("" = top-level expectation). */
+    osarch: str
+    /** the raw TOML value text right of `=` ("" for a valueless entry verb). */
+    value: str
+}
+
+/**
+ * TkbRow — one Examples data row: the ordered `cells` (column values). A wrapper struct rather
+ * than a bare `[]str` because a `[][]str` nested-slice STRUCT FIELD is not yet emittable by the
+ * backend (the optional/slice mangle twin's gap — reported up); `[]TkbRow` sidesteps it cleanly.
+ *
+ * @since 0.3.0.30
+ */
+pub type TkbRow = struct {
+    /** the row's column values (parallel to the Examples headers). */
+    cells: []str
+}
+
+/**
+ * TkbExamples — a Scenario Outline's parameter table: `headers` (placeholder names) and
+ * `rows` (one `TkbRow` of column values per case). Empty `headers` ⇒ a plain scenario (one
+ * implicit row).
+ *
+ * @since 0.3.0.30
+ */
+pub type TkbExamples = struct {
+    /** the placeholder column names from the header row. */
+    headers: []str
+    /** one row of column values per parametrised case. */
+    rows: []TkbRow
+}
+
+/**
+ * TkbScenario — one scenario: `name`, whether it is an `outline`, its ordered `steps`
+ * (Background Given steps prepended), and its `examples` table (empty for a plain scenario).
+ *
+ * @since 0.3.0.30
+ */
+pub type TkbScenario = struct {
+    /** the scenario's free-text label (report line). */
+    name: str
+    /** true for a `Scenario Outline` (expanded per Examples row). */
+    outline: bool
+    /** the ordered steps (Background Given steps prepended). */
+    steps: []TkbStep
+    /** the parameter table (empty headers ⇒ a single implicit row). */
+    examples: TkbExamples
+}
+
+/**
+ * TkbFeature — one parsed `.tkb` file: the `name` free text and the `scenarios` (Background
+ * already folded into each scenario's steps). One feature = one regressive project.
+ *
+ * @since 0.3.0.30
+ */
+pub type TkbFeature = struct {
+    /** the Feature free-text label. */
+    name: str
+    /** the scenarios, each carrying the Background Given steps. */
+    scenarios: []TkbScenario
+}
+
+/**
+ * tkb_is_ws — is `c` an ASCII whitespace byte (space, tab, CR, LF)? The trim/hex-scan predicate.
+ *
+ * @param c  the byte
+ * @return   true for space/tab/CR/LF
+ * @since 0.3.0.30
+ */
+fn tkb_is_ws(c: byte) -> bool { c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' }
+
+/**
+ * tkb_trim — `s` with leading and trailing ASCII whitespace removed.
+ *
+ * @param s  the text
+ * @return   the trimmed text
+ * @since 0.3.0.30
+ */
+fn tkb_trim(s: str) -> str {
+    mut a: u64 = 0
+    loop {
+        if a >= s.len { break }
+        if !tkb_is_ws(s[a]) { break }
+        a = a + 1
+    }
+    mut b = s.len
+    loop {
+        if b <= a { break }
+        if !tkb_is_ws(s[b - 1]) { break }
+        b = b - 1
+    }
+    teko::str::slice(s, a, b)
+}
+
+/**
+ * tkb_find_byte — the index of the first `c` in `s` at or after `from`, or `s.len` when absent.
+ *
+ * @param s     the text
+ * @param c     the byte to find
+ * @param from  the start cursor
+ * @return      the index of `c`, or `s.len`
+ * @since 0.3.0.30
+ */
+fn tkb_find_byte(s: str, c: byte, from: u64) -> u64 {
+    mut k = from
+    loop {
+        if k >= s.len { break }
+        if s[k] == c { return k }
+        k = k + 1
+    }
+    s.len
+}
+
+/**
+ * tkb_after — the remainder of `line` past `prefix` (already known to be a prefix of `line`),
+ * trimmed of surrounding whitespace. Used to read a keyword line's free text or a step body.
+ *
+ * @param line    the source line
+ * @param prefix  the matched keyword prefix
+ * @return        the trimmed remainder
+ * @since 0.3.0.30
+ */
+fn tkb_after(line: str, prefix: str) -> str { tkb_trim(teko::str::slice_from(line, prefix.len)) }
+
+/**
+ * tkb_table_cells — split a `| a | b | c |` table line into its trimmed cell values, dropping
+ * the empty spans before the first `|` and after the last. A line with no `|` yields [].
+ *
+ * @param line  the table line
+ * @return      the ordered cell values
+ * @since 0.3.0.30
+ */
+fn tkb_table_cells(line: str) -> []str {
+    let t = tkb_trim(line)
+    mut out: []str = teko::list::empty()
+    if t.len == 0 || t[0] != b'|' { return out }
+    mut k: u64 = 1
+    loop {
+        if k >= t.len { break }
+        let nb = tkb_find_byte(t, b'|', k)
+        if nb >= t.len { break }
+        out = teko::list::push(out, tkb_trim(teko::str::slice(t, k, nb)))
+        k = nb + 1
+    }
+    out
+}
+
+/**
+ * tkb_phase_of_keyword — the phase a leading step keyword selects: Given/When/Then map to their
+ * phase; `And`/`But` inherit `prev`. Returns `prev` for a non-keyword (never reached — the caller
+ * only calls this on a recognised keyword).
+ *
+ * @param kw    the keyword ("Given" | "When" | "Then" | "And" | "But")
+ * @param prev  the preceding step's phase (for And/But inheritance)
+ * @return      the resolved phase
+ * @since 0.3.0.30
+ */
+fn tkb_phase_of_keyword(kw: str, prev: TkbPhase) -> TkbPhase {
+    if kw == "Given" { return TkbPhase::Given }
+    if kw == "When" { return TkbPhase::When }
+    if kw == "Then" { return TkbPhase::Then }
+    prev
+}
+
+/**
+ * TkbStepKw — a step line resolved into its leading keyword and the trimmed body past it. The
+ * keyword is "" when the line opens with no recognised step keyword.
+ *
+ * @since 0.3.0.30
+ */
+type TkbStepKw = struct {
+    /** the recognised step keyword ("Given"/"When"/"Then"/"And"/"But"), or "". */
+    kw: str
+    /** the trimmed remainder of the line past the keyword. */
+    body: str
+}
+
+/**
+ * tkb_step_keyword — split a step line into its leading keyword + trimmed body, or a "" keyword
+ * when the line does not open with `Given`/`When`/`Then`/`And`/`But` followed by a space.
+ *
+ * @param line  the trimmed source line
+ * @return      the keyword + body split
+ * @since 0.3.0.30
+ */
+fn tkb_step_keyword(line: str) -> TkbStepKw {
+    if mf_starts_with(line, "Given ") { return TkbStepKw { kw = "Given"; body = tkb_after(line, "Given ") } }
+    if mf_starts_with(line, "When ") { return TkbStepKw { kw = "When"; body = tkb_after(line, "When ") } }
+    if mf_starts_with(line, "Then ") { return TkbStepKw { kw = "Then"; body = tkb_after(line, "Then ") } }
+    if mf_starts_with(line, "And ") { return TkbStepKw { kw = "And"; body = tkb_after(line, "And ") } }
+    if mf_starts_with(line, "But ") { return TkbStepKw { kw = "But"; body = tkb_after(line, "But ") } }
+    TkbStepKw { kw = ""; body = "" }
+}
+
+/**
+ * tkb_parse_step — lower one step body (past its keyword) into a `TkbStep`: an entry verb when it
+ * carries no `=`, else an `on "<os-arch>"`-routed `noun = value` pair. The value keeps its surface
+ * form (placeholders intact) so the reused `mf_read_*` lexers decode it after Outline substitution.
+ *
+ * @param phase  the step's resolved phase
+ * @param body   the trimmed step body (past the keyword)
+ * @return       the parsed step, or an `error` on a malformed `on "<os-arch>"` prefix
+ * @throws       when an `on` prefix is present but its os-arch is not a quoted string
+ * @since 0.3.0.30
+ */
+fn tkb_parse_step(phase: TkbPhase, body: str) -> TkbStep | error {
+    let eq = tkb_find_byte(body, b'=', 0)
+    if eq >= body.len {
+        return TkbStep { phase = phase; noun = ""; verb = body; osarch = ""; value = "" }
+    }
+    let value = tkb_trim(teko::str::slice_from(body, eq + 1))
+    mut lhs = tkb_trim(teko::str::slice_to(body, eq))
+    mut osarch = ""
+    if mf_starts_with(lhs, "on ") {
+        let rest = tkb_trim(teko::str::slice_from(lhs, 3))
+        let q = match mf_read_quoted(rest, 0) { MfQuoted as x => x; error as e => return e }
+        osarch = q.text
+        lhs = tkb_trim(teko::str::slice_from(rest, q.next))
+    }
+    TkbStep { phase = phase; noun = lhs; verb = ""; osarch = osarch; value = value }
+}
+
+/**
+ * TkbParse — the in-progress `.tkb` parse: the feature `name`, the completed `scenarios`, the
+ * shared Background Given `bg` steps, the OPEN scenario (`cur_*`), its `examples` accumulator, the
+ * `phase` inherited by an And/But, and the location flags (`in_bg`/`have_cur`/`in_examples`). Bundled
+ * so each line handler is one small `TkbParse -> TkbParse | error` step, keeping `parse_feature` flat.
+ *
+ * @since 0.3.0.30
+ */
+type TkbParse = struct {
+    /** the Feature free-text label. */
+    name: str
+    /** the scenarios closed so far. */
+    scenarios: []TkbScenario
+    /** the Background Given steps (prepended to every scenario on flush). */
+    bg: []TkbStep
+    /** true while a Background block is open (its Given steps append to `bg`). */
+    in_bg: bool
+    /** true while a Scenario/Scenario Outline is open (flushed on the next opener / EOF). */
+    have_cur: bool
+    /** the open scenario's label. */
+    cur_name: str
+    /** true when the open scenario is a `Scenario Outline`. */
+    cur_outline: bool
+    /** the open scenario's own steps (before Background prepend). */
+    cur_steps: []TkbStep
+    /** the open Examples header row (placeholder names); empty until read. */
+    ex_headers: []str
+    /** true once the Examples header row has been consumed. */
+    ex_have_headers: bool
+    /** the open Examples data rows. */
+    ex_rows: []TkbRow
+    /** true while an `Examples:` table is open (subsequent `|` lines are its rows). */
+    in_examples: bool
+    /** the phase an And/But inherits (the last Given/When/Then). */
+    phase: TkbPhase
+}
+
+/**
+ * tkb_parse_new — a fresh `TkbParse` before the first line (no feature name, nothing open).
+ *
+ * @return the initial parse state
+ * @since 0.3.0.30
+ */
+fn tkb_parse_new() -> TkbParse {
+    TkbParse {
+        name = ""; scenarios = teko::list::empty(); bg = teko::list::empty(); in_bg = false
+        have_cur = false; cur_name = ""; cur_outline = false; cur_steps = teko::list::empty()
+        ex_headers = teko::list::empty(); ex_have_headers = false; ex_rows = teko::list::empty()
+        in_examples = false; phase = TkbPhase::Given
+    }
+}
+
+/**
+ * tkb_prepend_bg — a step list with the Background Given steps prepended, in Background-then-own
+ * order (shared opaque inputs precede a scenario's own).
+ *
+ * @param bg     the Background Given steps
+ * @param steps  the scenario's own steps
+ * @return       the combined step list
+ * @since 0.3.0.30
+ */
+fn tkb_prepend_bg(bg: []TkbStep, steps: []TkbStep) -> []TkbStep {
+    mut out: []TkbStep = teko::list::empty()
+    mut k: u64 = 0
+    loop {
+        if k >= bg.len { break }
+        out = teko::list::push(out, bg[k])
+        k = k + 1
+    }
+    mut j: u64 = 0
+    loop {
+        if j >= steps.len { break }
+        out = teko::list::push(out, steps[j])
+        j = j + 1
+    }
+    out
+}
+
+/**
+ * tkb_flush_cur — close the open scenario (if any) into `p.scenarios`, folding the Background steps
+ * and the Examples table into it, then clear the open-scenario/examples state. A no-op when no
+ * scenario is open.
+ *
+ * @param p  the parse state
+ * @return   `p` with the open scenario appended and the per-scenario accumulators reset
+ * @since 0.3.0.30
+ */
+fn tkb_flush_cur(p: TkbParse) -> TkbParse {
+    if !p.have_cur { return p }
+    let sc = TkbScenario {
+        name = p.cur_name; outline = p.cur_outline
+        steps = tkb_prepend_bg(p.bg, p.cur_steps)
+        examples = TkbExamples { headers = p.ex_headers; rows = p.ex_rows }
+    }
+    TkbParse {
+        name = p.name; scenarios = teko::list::push(p.scenarios, sc); bg = p.bg; in_bg = false
+        have_cur = false; cur_name = ""; cur_outline = false; cur_steps = teko::list::empty()
+        ex_headers = teko::list::empty(); ex_have_headers = false; ex_rows = teko::list::empty()
+        in_examples = false; phase = p.phase
+    }
+}
+
+/**
+ * tkb_open_scenario — flush any open scenario and open a new one named `name`, `outline` selecting
+ * `Scenario Outline` vs `Scenario`. Leaves Background mode.
+ *
+ * @param p        the parse state
+ * @param name     the new scenario's label
+ * @param outline  true for a `Scenario Outline`
+ * @return         `p` with the new scenario open
+ * @since 0.3.0.30
+ */
+fn tkb_open_scenario(p: TkbParse, name: str, outline: bool) -> TkbParse {
+    let f = tkb_flush_cur(p)
+    TkbParse {
+        name = f.name; scenarios = f.scenarios; bg = f.bg; in_bg = false
+        have_cur = true; cur_name = name; cur_outline = outline; cur_steps = teko::list::empty()
+        ex_headers = teko::list::empty(); ex_have_headers = false; ex_rows = teko::list::empty()
+        in_examples = false; phase = TkbPhase::Given
+    }
+}
+
+/**
+ * tkb_add_step — append a parsed step to the open target: the Background list when in a Background
+ * block, else the open scenario's own steps. Updates the inherited phase. An entry verb / step
+ * outside any block is an honest error (M.3).
+ *
+ * @param p     the parse state
+ * @param step  the parsed step
+ * @return      `p` with the step recorded, or an `error` when no block is open
+ * @throws      when a step appears before any Background/Scenario opener
+ * @since 0.3.0.30
+ */
+fn tkb_add_step(p: TkbParse, step: TkbStep) -> TkbParse | error {
+    if p.in_bg {
+        return TkbParse {
+            name = p.name; scenarios = p.scenarios; bg = teko::list::push(p.bg, step); in_bg = true
+            have_cur = p.have_cur; cur_name = p.cur_name; cur_outline = p.cur_outline; cur_steps = p.cur_steps
+            ex_headers = p.ex_headers; ex_have_headers = p.ex_have_headers; ex_rows = p.ex_rows
+            in_examples = false; phase = step.phase
+        }
+    }
+    if !p.have_cur { return error { message = "tkb: a step appears before any Scenario/Background" } }
+    TkbParse {
+        name = p.name; scenarios = p.scenarios; bg = p.bg; in_bg = false
+        have_cur = true; cur_name = p.cur_name; cur_outline = p.cur_outline
+        cur_steps = teko::list::push(p.cur_steps, step)
+        ex_headers = p.ex_headers; ex_have_headers = p.ex_have_headers; ex_rows = p.ex_rows
+        in_examples = false; phase = step.phase
+    }
+}
+
+/**
+ * tkb_add_table_row — record a `| … |` line under the open Examples: the first row is the header
+ * (placeholder names), each subsequent row is a data row. An honest error when no Examples is open.
+ *
+ * @param p      the parse state
+ * @param cells  the parsed cell values
+ * @return       `p` with the header or a data row recorded, or an `error` outside an Examples block
+ * @throws       when a `|` line appears with no open `Examples:`
+ * @since 0.3.0.30
+ */
+fn tkb_add_table_row(p: TkbParse, cells: []str) -> TkbParse | error {
+    if !p.in_examples { return error { message = "tkb: a table row appears outside an Examples block" } }
+    if !p.ex_have_headers {
+        return TkbParse {
+            name = p.name; scenarios = p.scenarios; bg = p.bg; in_bg = false
+            have_cur = p.have_cur; cur_name = p.cur_name; cur_outline = p.cur_outline; cur_steps = p.cur_steps
+            ex_headers = cells; ex_have_headers = true; ex_rows = p.ex_rows; in_examples = true; phase = p.phase
+        }
+    }
+    TkbParse {
+        name = p.name; scenarios = p.scenarios; bg = p.bg; in_bg = false
+        have_cur = p.have_cur; cur_name = p.cur_name; cur_outline = p.cur_outline; cur_steps = p.cur_steps
+        ex_headers = p.ex_headers; ex_have_headers = true; ex_rows = teko::list::push(p.ex_rows, TkbRow { cells = cells })
+        in_examples = true; phase = p.phase
+    }
+}
+
+/**
+ * tkb_open_examples — mark the open scenario's `Examples:` table as active (its header/rows follow).
+ *
+ * @param p  the parse state
+ * @return   `p` with Examples reading enabled
+ * @since 0.3.0.30
+ */
+fn tkb_open_examples(p: TkbParse) -> TkbParse {
+    TkbParse {
+        name = p.name; scenarios = p.scenarios; bg = p.bg; in_bg = false
+        have_cur = p.have_cur; cur_name = p.cur_name; cur_outline = p.cur_outline; cur_steps = p.cur_steps
+        ex_headers = p.ex_headers; ex_have_headers = p.ex_have_headers; ex_rows = p.ex_rows
+        in_examples = true; phase = p.phase
+    }
+}
+
+/**
+ * tkb_apply_line — fold one already-trimmed `.tkb` line into the parse state: a Feature/Background/
+ * Scenario/Examples opener, a `|` table row, or a `Given`/`When`/`Then`/`And`/`But` step. A blank or
+ * `#`-comment line is skipped upstream; an unrecognised non-blank line is an honest error (M.3).
+ *
+ * @param p     the parse state
+ * @param line  the trimmed source line (non-blank, non-comment)
+ * @return      the updated parse state, or an `error` on a malformed step / stray table row
+ * @throws      on an unrecognised line, a malformed step value, or a table row outside Examples
+ * @since 0.3.0.30
+ */
+fn tkb_apply_line(p: TkbParse, line: str) -> TkbParse | error {
+    if mf_starts_with(line, "Feature:") {
+        let f = tkb_flush_cur(p)
+        return TkbParse {
+            name = tkb_after(line, "Feature:"); scenarios = f.scenarios; bg = f.bg; in_bg = false
+            have_cur = false; cur_name = ""; cur_outline = false; cur_steps = teko::list::empty()
+            ex_headers = teko::list::empty(); ex_have_headers = false; ex_rows = teko::list::empty()
+            in_examples = false; phase = TkbPhase::Given
+        }
+    }
+    if mf_starts_with(line, "Background:") {
+        let f = tkb_flush_cur(p)
+        return TkbParse {
+            name = f.name; scenarios = f.scenarios; bg = teko::list::empty(); in_bg = true
+            have_cur = false; cur_name = ""; cur_outline = false; cur_steps = teko::list::empty()
+            ex_headers = teko::list::empty(); ex_have_headers = false; ex_rows = teko::list::empty()
+            in_examples = false; phase = TkbPhase::Given
+        }
+    }
+    if mf_starts_with(line, "Scenario Outline:") { return tkb_open_scenario(p, tkb_after(line, "Scenario Outline:"), true) }
+    if mf_starts_with(line, "Scenario:") { return tkb_open_scenario(p, tkb_after(line, "Scenario:"), false) }
+    if mf_starts_with(line, "Examples:") { return tkb_open_examples(p) }
+    if line[0] == b'|' { return tkb_add_table_row(p, tkb_table_cells(line)) }
+    let kw = tkb_step_keyword(line)
+    if kw.kw.len == 0 { return error { message = teko::str::concat("tkb: unrecognised line: ", line) } }
+    let phase = tkb_phase_of_keyword(kw.kw, p.phase)
+    let step = match tkb_parse_step(phase, kw.body) { TkbStep as s => s; error as e => return e }
+    tkb_add_step(p, step)
+}
+
+/**
+ * parse_feature — read a `.tkb` source into a `TkbFeature`, or fail honestly (M.3). Reuses the
+ * manifest value lexers (`mf_read_quoted`/`mf_read_array`/`mf_read_int`) verbatim for every
+ * right-hand side; introduces only keyword-line + Examples-table parsing. Background Given steps are
+ * prepended to every scenario (at flush).
+ *
+ * @param src  the `.tkb` file contents
+ * @return     the parsed feature, or an `error` on any malformed line / unknown noun-phrase
+ * @throws     on a malformed keyword line, an unknown noun-phrase, or a malformed value
+ * @since 0.3.0.30
+ */
+fn parse_feature(src: str) -> TkbFeature | error {
+    mut p = tkb_parse_new()
+    mut cur: u64 = 0
+    loop {
+        if cur >= src.len { break }
+        mut eol = cur
+        loop {
+            if eol >= src.len { break }
+            if src[eol] == b'\n' { break }
+            eol = eol + 1
+        }
+        let raw = teko::str::slice(src, cur, eol)
+        if eol < src.len { cur = eol + 1 } else { cur = eol }
+        let line = tkb_trim(raw)
+        if line.len == 0 || line[0] == b'#' { continue }
+        p = match tkb_apply_line(p, line) { TkbParse as np => np; error as e => return e }
+    }
+    let done = tkb_flush_cur(p)
+    TkbFeature { name = done.name; scenarios = done.scenarios }
+}
+
+/**
+ * tkb_hex_nibble — the value 0–15 of a hex digit byte, or an error for a non-hex byte (M.3).
+ *
+ * @param c  the candidate hex digit
+ * @return   the nibble value, or an `error` when `c` is not `[0-9A-Fa-f]`
+ * @throws   on a non-hex byte
+ * @since 0.3.0.30
+ */
+fn tkb_hex_nibble(c: byte) -> u64 | error {
+    if c >= b'0' && c <= b'9' { return (c to u64) - (b'0' to u64) }
+    if c >= b'a' && c <= b'f' { return (c to u64) - (b'a' to u64) + 10 }
+    if c >= b'A' && c <= b'F' { return (c to u64) - (b'A' to u64) + 10 }
+    error { message = "tkb: non-hex byte in a HEX docstring" }
+}
+
+/**
+ * tkb_read_hex_docstring — decode a `"""<hex>"""` docstring to raw bytes, ignoring ALL ASCII
+ * whitespace between the fences. Carries CONTROL bytes (`\n`, `\0`, opcodes) LITERALLY into a
+ * `Literal` `TkrMatch`, closing the `.tkr` newline-in-quoted-literal gap. M.3 on bad hex.
+ *
+ * @param s  the source starting at (or before) the opening `"""`
+ * @param p  the cursor at the first `"`
+ * @return   the decoded bytes, or an `error` on malformed hex / an unterminated docstring
+ * @throws   on a non-hex nibble, an odd nibble count, or a missing closing `"""`
+ * @since 0.3.0.30
+ */
+fn tkb_read_hex_docstring(s: str, p: u64) -> str | error {
+    if !(mf_at(s, p) == b'"' && mf_at(s, p + 1) == b'"' && mf_at(s, p + 2) == b'"') {
+        return error { message = "tkb: expected a \"\"\" HEX docstring" }
+    }
+    mut k = p + 3
+    mut nibbles: []u64 = teko::list::empty()
+    mut closed = false
+    loop {
+        if k >= s.len { break }
+        if mf_at(s, k) == b'"' && mf_at(s, k + 1) == b'"' && mf_at(s, k + 2) == b'"' { closed = true; k = k + 3; break }
+        let c = s[k]
+        if tkb_is_ws(c) { k = k + 1; continue }
+        let n = match tkb_hex_nibble(c) { u64 as v => v; error as e => return e }
+        nibbles = teko::list::push(nibbles, n)
+        k = k + 1
+    }
+    if !closed { return error { message = "tkb: unterminated HEX docstring (missing closing \"\"\")" } }
+    if nibbles.len % 2 != 0 { return error { message = "tkb: odd hex-nibble count in a HEX docstring" } }
+    mut bytes: []byte = teko::list::empty()
+    mut j: u64 = 0
+    loop {
+        if j >= nibbles.len { break }
+        bytes = teko::list::push(bytes, (nibbles[j] * 16 + nibbles[j + 1]) to byte)
+        j = j + 2
+    }
+    match str_from_utf8(bytes) { str as out => out; error as e => e }
+}
+
+/**
+ * tkb_subst_row — textually substitute every `<header>` placeholder in `value` with the matching
+ * column value from `row`, BEFORE the reused `mf_read_*` lexers see it. Substitution is purely
+ * lexical, so a placeholder may sit anywhere inside a quoted string or an array element.
+ *
+ * @param value    the step value carrying `<name>` placeholders
+ * @param headers  the Examples header names
+ * @param row      the Examples row values (parallel to `headers`)
+ * @return         the substituted value
+ * @since 0.3.0.30
+ */
+fn tkb_subst_row(value: str, headers: []str, row: []str) -> str {
+    mut out = value
+    mut k: u64 = 0
+    loop {
+        if k >= headers.len { break }
+        let col = if k < row.len { row[k] } else { "" }
+        out = tkb_replace_all(out, teko::str::concat(teko::str::concat("<", headers[k]), ">"), col)
+        k = k + 1
+    }
+    out
+}
+
+/**
+ * tkb_replace_all — every non-overlapping occurrence of `needle` in `hay` replaced by `rep`
+ * (`needle` assumed non-empty — a placeholder token `<name>`).
+ *
+ * @param hay     the text
+ * @param needle  the token to replace (non-empty)
+ * @param rep     the replacement
+ * @return        `hay` with every `needle` replaced
+ * @since 0.3.0.30
+ */
+fn tkb_replace_all(hay: str, needle: str, rep: str) -> str {
+    if needle.len == 0 { return hay }
+    mut out = ""
+    mut k: u64 = 0
+    loop {
+        if k >= hay.len { break }
+        if k + needle.len <= hay.len && teko::str::slice(hay, k, k + needle.len) == needle {
+            out = out ~ rep
+            k = k + needle.len
+        } else {
+            out = out ~ teko::str::slice(hay, k, k + 1)
+            k = k + 1
+        }
+    }
+    out
+}
+
+/**
+ * tkb_step_subst — a copy of `step` with its `value` placeholder-substituted for `row`. A step
+ * with no placeholders (e.g. a Background step or an entry verb) is returned unchanged in effect.
+ *
+ * @param step     the step
+ * @param headers  the Examples header names
+ * @param row      the Examples row values
+ * @return         the substituted step
+ * @since 0.3.0.30
+ */
+fn tkb_step_subst(step: TkbStep, headers: []str, row: []str) -> TkbStep {
+    TkbStep {
+        phase = step.phase; noun = step.noun; verb = step.verb; osarch = step.osarch
+        value = tkb_subst_row(step.value, headers, row)
+    }
+}
+
+/**
+ * tkb_kind_for_verb — the `TkrKind` an entry verb / `it traps` selects: `compilation fails` ⇒
+ * CompileFail, `it traps` ⇒ Trap, `built and run`/`compiled` ⇒ Print (both run and check the
+ * declared streams; check_run treats Print and Exit alike bar the trap case). An unknown verb is
+ * an honest error (M.3).
+ *
+ * @param verb  the entry verb text
+ * @return      the selected kind, or an `error` for an unknown verb
+ * @throws      when `verb` names no known entry
+ * @since 0.3.0.30
+ */
+fn tkb_kind_for_verb(verb: str) -> TkrKind | error {
+    if verb == "compilation fails" { return TkrKind::CompileFail }
+    if verb == "it traps" { return TkrKind::Trap }
+    if verb == "built and run" || verb == "compiled" { return TkrKind::Print }
+    error { message = teko::str::concat("tkb: unknown When entry verb: ", verb) }
+}
+
+/**
+ * tkb_get_expect — the `[expect.<os-arch>]` accumulator in `list` for `osarch`, or a fresh
+ * inherit-everything override when absent. The caller mutates one field and puts it back.
+ *
+ * @param list    the overrides so far
+ * @param osarch  the os-arch key
+ * @return        the existing or a fresh override for `osarch`
+ * @since 0.3.0.30
+ */
+fn tkb_get_expect(list: []TkrExpect, osarch: str) -> TkrExpect {
+    mut k: u64 = 0
+    loop {
+        if k >= list.len { break }
+        if list[k].osarch == osarch { return list[k] }
+        k = k + 1
+    }
+    TkrExpect { osarch = osarch; has_exit = false; exit = 0; stdout = tkr_match_ignore(); stderr = tkr_match_ignore() }
+}
+
+/**
+ * tkb_put_expect — `list` with the override for `e.osarch` replaced by `e` (or `e` appended when
+ * absent), an upsert keyed by os-arch.
+ *
+ * @param list  the overrides so far
+ * @param e     the override to store
+ * @return      `list` with `e` upserted
+ * @since 0.3.0.30
+ */
+fn tkb_put_expect(list: []TkrExpect, e: TkrExpect) -> []TkrExpect {
+    mut out: []TkrExpect = teko::list::empty()
+    mut found = false
+    mut k: u64 = 0
+    loop {
+        if k >= list.len { break }
+        if list[k].osarch == e.osarch { out = teko::list::push(out, e); found = true } else { out = teko::list::push(out, list[k]) }
+        k = k + 1
+    }
+    if !found { out = teko::list::push(out, e) }
+    out
+}
+
+/**
+ * tkb_put_golden — `list` with the byte golden for `osarch` set to `sha` (upsert keyed by os-arch).
+ *
+ * @param list    the goldens so far
+ * @param osarch  the os-arch key
+ * @param sha     the expected artifact sha256
+ * @return        `list` with the golden upserted
+ * @since 0.3.0.30
+ */
+fn tkb_put_golden(list: []TkrGolden, osarch: str, sha: str) -> []TkrGolden {
+    mut out: []TkrGolden = teko::list::empty()
+    mut found = false
+    mut k: u64 = 0
+    loop {
+        if k >= list.len { break }
+        if list[k].osarch == osarch { out = teko::list::push(out, TkrGolden { osarch = osarch; sha256 = sha }); found = true } else { out = teko::list::push(out, list[k]) }
+        k = k + 1
+    }
+    if !found { out = teko::list::push(out, TkrGolden { osarch = osarch; sha256 = sha }) }
+    out
+}
+
+/**
+ * tkb_noun_stream_match — the `TkrMatch` for a stream noun-phrase value: `stdout`/`stderr` ⇒
+ * Literal bytes, `… sha256` ⇒ a Sha256 digest, `… bytes` ⇒ the HEX-docstring-decoded Literal bytes.
+ * M.3 on a malformed quoted / hex value.
+ *
+ * @param noun   the stream noun ("stdout" | "stdout sha256" | "stdout bytes" | stderr forms)
+ * @param value  the surface value (a quoted string or a `"""hex"""` docstring)
+ * @return       the parsed match, or an `error` on a malformed value
+ * @throws       on a malformed quoted string or HEX docstring
+ * @since 0.3.0.30
+ */
+fn tkb_noun_stream_match(noun: str, value: str) -> TkrMatch | error {
+    if teko::str::ends_with(noun, "bytes") {
+        let b = match tkb_read_hex_docstring(value, 0) { str as x => x; error as e => return e }
+        return TkrMatch { mode = TkrMatchMode::Literal; text = b }
+    }
+    let q = match mf_read_quoted(value, 0) { MfQuoted as x => x; error as e => return e }
+    if teko::str::ends_with(noun, "sha256") { return TkrMatch { mode = TkrMatchMode::Sha256; text = q.text } }
+    TkrMatch { mode = TkrMatchMode::Literal; text = q.text }
+}
+
+/**
+ * TkbLower — the in-progress lowering of a scenario to a `Tkr`: every top-level field plus the
+ * per-os-arch `expect`/`golden` upserts and the observed `has_run_verb`. Bundled so each step folds
+ * through one small `TkbLower -> TkbLower | error`.
+ *
+ * @since 0.3.0.30
+ */
+type TkbLower = struct {
+    /** accumulated fold-opaque argv operands. */
+    args: []str
+    /** accumulated stdin bytes. */
+    stdin: str
+    /** the classification (defaults to Exit until a When sets it). */
+    kind: TkrKind
+    /** the expected exit code. */
+    exit: i32
+    /** the top-level stdout expectation. */
+    stdout: TkrMatch
+    /** the top-level stderr expectation. */
+    stderr: TkrMatch
+    /** the declared variant set. */
+    targets: []str
+    /** the compile-fail diagnostic substring. */
+    diagnostic: str
+    /** the per-os-arch expectation overrides. */
+    expect: []TkrExpect
+    /** the per-os-arch byte goldens. */
+    golden: []TkrGolden
+}
+
+/**
+ * tkb_lower_new — a fresh `TkbLower` at the documented defaults (kind Exit, exit 0, ignored streams,
+ * empty lists).
+ *
+ * @return the initial lowering accumulator
+ * @since 0.3.0.30
+ */
+fn tkb_lower_new() -> TkbLower {
+    TkbLower {
+        args = teko::list::empty(); stdin = ""; kind = TkrKind::Exit; exit = 0
+        stdout = tkr_match_ignore(); stderr = tkr_match_ignore(); targets = teko::list::empty()
+        diagnostic = ""; expect = teko::list::empty(); golden = teko::list::empty()
+    }
+}
+
+/**
+ * tkb_apply_given — fold a `Given` noun (`args`/`stdin`/`stdin bytes`/`targets`; `source` is handled
+ * by the runner, not the `Tkr`) into `b`. M.3 on a malformed value or an unknown Given noun.
+ *
+ * @param b      the lowering accumulator
+ * @param noun   the Given noun-phrase
+ * @param value  the surface value
+ * @return       the updated accumulator, or an `error` on a bad value / unknown noun
+ * @throws       on a malformed value or an unknown Given noun-phrase
+ * @since 0.3.0.30
+ */
+fn tkb_apply_given(b: TkbLower, noun: str, value: str) -> TkbLower | error {
+    if noun == "source" { return b }
+    if noun == "args" {
+        let xs = match mf_read_str_list(value, 0) { []str as x => x; error as e => return e }
+        return TkbLower { args = xs; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    if noun == "targets" {
+        let xs = match mf_read_str_list(value, 0) { []str as x => x; error as e => return e }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = xs; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    if noun == "stdin" {
+        let q = match mf_read_quoted(value, 0) { MfQuoted as x => x; error as e => return e }
+        return TkbLower { args = b.args; stdin = q.text; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    if noun == "stdin bytes" {
+        let d = match tkb_read_hex_docstring(value, 0) { str as x => x; error as e => return e }
+        return TkbLower { args = b.args; stdin = d; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    error { message = teko::str::concat("tkb: unknown Given noun-phrase: ", noun) }
+}
+
+/**
+ * tkb_apply_then_top — fold a top-level (no `on`) `Then` noun (`exit`/the stdout+stderr families/
+ * `diagnostic`) into `b`. M.3 on a malformed value or an unknown Then noun.
+ *
+ * @param b      the lowering accumulator
+ * @param noun   the Then noun-phrase
+ * @param value  the surface value
+ * @return       the updated accumulator, or an `error` on a bad value / unknown noun
+ * @throws       on a malformed value or an unknown Then noun-phrase
+ * @since 0.3.0.30
+ */
+fn tkb_apply_then_top(b: TkbLower, noun: str, value: str) -> TkbLower | error {
+    if noun == "exit" {
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = tkr_read_i32(value, 0); stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    if noun == "diagnostic" {
+        let q = match mf_read_quoted(value, 0) { MfQuoted as x => x; error as e => return e }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = q.text; expect = b.expect; golden = b.golden }
+    }
+    if mf_starts_with(noun, "stdout") {
+        let m = match tkb_noun_stream_match(noun, value) { TkrMatch as x => x; error as e => return e }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = m; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    if mf_starts_with(noun, "stderr") {
+        let m = match tkb_noun_stream_match(noun, value) { TkrMatch as x => x; error as e => return e }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = m; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    error { message = teko::str::concat("tkb: unknown Then noun-phrase: ", noun) }
+}
+
+/**
+ * tkb_apply_then_osarch — fold an `on "<os-arch>"`-routed `Then` noun into a `[expect.<os-arch>]`
+ * override (`exit`/stdout/stderr) or a `[golden.<os-arch>]` (`artifact sha256`). M.3 on a bad value.
+ *
+ * @param b       the lowering accumulator
+ * @param osarch  the routed os-arch
+ * @param noun    the Then noun-phrase
+ * @param value   the surface value
+ * @return        the updated accumulator, or an `error` on a bad value / unknown noun
+ * @throws        on a malformed value or an unknown routed noun-phrase
+ * @since 0.3.0.30
+ */
+fn tkb_apply_then_osarch(b: TkbLower, osarch: str, noun: str, value: str) -> TkbLower | error {
+    if noun == "artifact sha256" {
+        let q = match mf_read_quoted(value, 0) { MfQuoted as x => x; error as e => return e }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = tkb_put_golden(b.golden, osarch, q.text) }
+    }
+    let e = tkb_get_expect(b.expect, osarch)
+    if noun == "exit" {
+        let ne = TkrExpect { osarch = osarch; has_exit = true; exit = tkr_read_i32(value, 0); stdout = e.stdout; stderr = e.stderr }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = tkb_put_expect(b.expect, ne); golden = b.golden }
+    }
+    if mf_starts_with(noun, "stdout") {
+        let m = match tkb_noun_stream_match(noun, value) { TkrMatch as x => x; error as er => return er }
+        let ne = TkrExpect { osarch = osarch; has_exit = e.has_exit; exit = e.exit; stdout = m; stderr = e.stderr }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = tkb_put_expect(b.expect, ne); golden = b.golden }
+    }
+    if mf_starts_with(noun, "stderr") {
+        let m = match tkb_noun_stream_match(noun, value) { TkrMatch as x => x; error as er => return er }
+        let ne = TkrExpect { osarch = osarch; has_exit = e.has_exit; exit = e.exit; stdout = e.stdout; stderr = m }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = tkb_put_expect(b.expect, ne); golden = b.golden }
+    }
+    error { message = teko::str::concat("tkb: unknown routed Then noun-phrase: ", noun) }
+}
+
+/**
+ * tkb_apply_step_lower — fold one step into the lowering: a When sets the kind, a Given sets an
+ * opaque input, a Then sets a top-level or `on`-routed expectation. M.3 on any malformed value.
+ *
+ * @param b     the lowering accumulator
+ * @param step  the (already placeholder-substituted) step
+ * @return      the updated accumulator, or an `error` on a bad value / unknown phrase
+ * @throws      on a malformed value, an unknown noun-phrase, or an unknown When verb
+ * @since 0.3.0.30
+ */
+fn tkb_apply_step_lower(b: TkbLower, step: TkbStep) -> TkbLower | error {
+    if step.phase == TkbPhase::When {
+        let k = match tkb_kind_for_verb(step.verb) { TkrKind as x => x; error as e => return e }
+        return TkbLower { args = b.args; stdin = b.stdin; kind = k; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    if step.phase == TkbPhase::Given { return tkb_apply_given(b, step.noun, step.value) }
+    if step.verb == "it traps" {
+        return TkbLower { args = b.args; stdin = b.stdin; kind = TkrKind::Trap; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; diagnostic = b.diagnostic; expect = b.expect; golden = b.golden }
+    }
+    if step.osarch.len > 0 { return tkb_apply_then_osarch(b, step.osarch, step.noun, step.value) }
+    tkb_apply_then_top(b, step.noun, step.value)
+}
+
+/**
+ * tkb_lower_to_tkr — fold a fully-substituted step list into a `Tkr` via the shared check-layer
+ * model (the lowering IR). Used by both the plain-scenario and per-Outline-row paths.
+ *
+ * @param steps  the scenario's steps (Background-prepended, placeholder-substituted)
+ * @return       the lowered spec, or an `error` on a malformed step value
+ * @throws       on a malformed value or an unknown noun-phrase
+ * @since 0.3.0.30
+ */
+fn tkb_lower_to_tkr(steps: []TkbStep) -> Tkr | error {
+    mut b = tkb_lower_new()
+    mut k: u64 = 0
+    loop {
+        if k >= steps.len { break }
+        b = match tkb_apply_step_lower(b, steps[k]) { TkbLower as nb => nb; error as e => return e }
+        k = k + 1
+    }
+    Tkr { args = b.args; stdin = b.stdin; kind = b.kind; exit = b.exit; stdout = b.stdout; stderr = b.stderr; targets = b.targets; expect = b.expect; golden = b.golden; diagnostic = b.diagnostic }
+}
+
+/**
+ * tkb_lower_scenario — lower one PLAIN scenario to a `Tkr`, folding Given/When/Then steps into the
+ * reused `Tkr` model (`Given`→opaque inputs, `When`→kind, `Then`→expectations, routing
+ * `on "<os-arch>"` into `TkrExpect`/`TkrGolden`). M.3 honest error on a bad value.
+ *
+ * @param sc  the scenario (steps already Background-prepended)
+ * @return    the lowered spec, or an `error` on a malformed step value / unknown phrase
+ * @throws    on a malformed value or an unknown noun-phrase
+ * @since 0.3.0.30
+ */
+fn tkb_lower_scenario(sc: TkbScenario) -> Tkr | error { tkb_lower_to_tkr(sc.steps) }
+
+/**
+ * tkb_expand_outline — expand a `Scenario Outline` into one `Tkr` per Examples row by textually
+ * substituting each `<name>` placeholder with the row's matching column value BEFORE the reused
+ * `mf_read_*` lexers see it, then lowering. A plain scenario yields a single-element list.
+ *
+ * @param sc  the (outline) scenario
+ * @return    one lowered spec per row, or an `error` on a width mismatch / bad value
+ * @throws    on a row width mismatch, an unknown placeholder, or a malformed value
+ * @since 0.3.0.30
+ */
+fn tkb_expand_outline(sc: TkbScenario) -> []Tkr | error {
+    if !sc.outline || sc.examples.headers.len == 0 {
+        let t = match tkb_lower_scenario(sc) { Tkr as x => x; error as e => return e }
+        return teko::list::push(teko::list::empty(), t)
+    }
+    mut out: []Tkr = teko::list::empty()
+    mut r: u64 = 0
+    loop {
+        if r >= sc.examples.rows.len { break }
+        let row = sc.examples.rows[r].cells
+        if row.len != sc.examples.headers.len { return error { message = "tkb: Examples row width does not match the header row" } }
+        mut subst: []TkbStep = teko::list::empty()
+        mut si: u64 = 0
+        loop {
+            if si >= sc.steps.len { break }
+            subst = teko::list::push(subst, tkb_step_subst(sc.steps[si], sc.examples.headers, row))
+            si = si + 1
+        }
+        let t = match tkb_lower_to_tkr(subst) { Tkr as x => x; error as e => return e }
+        out = teko::list::push(out, t)
+        r = r + 1
+    }
+    out
+}
+
+/**
+ * tkb_scenario_source — the `Given source "<file>"` path of a compile-fail scenario (the standalone
+ * source it compiles), or "" when the scenario declares none.
+ *
+ * @param sc  the scenario
+ * @return    the source file path (relative to the regressive dir), or ""
+ * @since 0.3.0.30
+ */
+fn tkb_scenario_source(sc: TkbScenario) -> str {
+    mut k: u64 = 0
+    loop {
+        if k >= sc.steps.len { break }
+        if sc.steps[k].phase == TkbPhase::Given && sc.steps[k].noun == "source" {
+            match mf_read_quoted(sc.steps[k].value, 0) { MfQuoted as q => return q.text; error => return "" }
+        }
+        k = k + 1
+    }
+    ""
+}
+
+/**
+ * SpecRef — a discovered spec file: its `name` (basename in the regressive dir) and `is_tkb`
+ * (true for a `.tkb`, false for a legacy `.tkr`). Lets `run_one_regressive` dispatch on format
+ * without re-scanning.
+ *
+ * @since 0.3.0.30
+ */
+type SpecRef = struct {
+    /** the spec file basename inside the regressive directory. */
+    name: str
+    /** true for a `.tkb` (canonical), false for a `.tkr` (legacy). */
+    is_tkb: bool
+}
+
+/**
+ * dir_first_spec — the first spec in `dir`, PREFERRING a `.tkb` over a `.tkr`, or `null` when `dir`
+ * is unreadable or holds no spec. Supersedes `dir_first_tkr` in discovery (`dir_first_tkr` retained
+ * for the legacy `.tkr`-only meta-tests).
+ *
+ * @param dir  the directory to inspect
+ * @return     the preferred spec ref, or `null`
+ * @since 0.3.0.30
+ */
+fn dir_first_spec(dir: str) -> SpecRef? {
+    let entries = match teko::fs::list_dir(dir) { []str as e => e; error => return null }
+    mut tkr = ""
+    mut k: u64 = 0
+    loop {
+        if k >= entries.len { break }
+        if teko::str::ends_with(entries[k], ".tkb") { return SpecRef { name = entries[k]; is_tkb = true } }
+        if tkr.len == 0 && teko::str::ends_with(entries[k], ".tkr") { tkr = entries[k] }
+        k = k + 1
+    }
+    if tkr.len > 0 { return SpecRef { name = tkr; is_tkb = false } }
+    null
+}
+
+/**
+ * tkb_run_scenarios — run every RUN scenario of a parsed feature against the already-built binary
+ * `binp`, checking each expanded `Tkr` via the unchanged `check_run`. The verdict is the FIRST
+ * failure, else pass. Compile-fail scenarios are handled separately by `run_one_tkb`.
+ *
+ * @param feat    the parsed feature
+ * @param binp    the built binary path
+ * @param prefix  the scratch-file prefix for the runs
+ * @return        the aggregate run verdict
+ * @since 0.3.0.30
+ */
+fn tkb_run_scenarios(feat: TkbFeature, binp: str, prefix: str) -> RegrOutcome {
+    mut si: u64 = 0
+    loop {
+        if si >= feat.scenarios.len { break }
+        let sc = feat.scenarios[si]
+        let specs = match tkb_expand_outline(sc) { []Tkr as xs => xs; error as e => return regr_fail(e.message) }
+        mut ri: u64 = 0
+        loop {
+            if ri >= specs.len { break }
+            let t = specs[ri]
+            let run = run_captured(argv_with_args(binp, t.args), t.stdin, $"{prefix}.{si}.{ri}.run")
+            let oc = check_run(t, HOST_TARGET, run)
+            if !oc.ok && !oc.skipped { return regr_fail($"{sc.name}[{ri}]: {oc.message}") }
+            ri = ri + 1
+        }
+        si = si + 1
+    }
+    regr_pass()
+}
+
+/**
+ * tkb_run_compile_fail — run the compile-fail scenarios of a parsed feature: compile each
+ * scenario's `Given source "<file>"` standalone (no shared artifact — the negative path compiles
+ * per scenario) and check via `check_compile_fail`. The verdict is the FIRST failure, else pass.
+ *
+ * @param exe       the absolute path to this compiler binary
+ * @param regr_dir  the regressive project directory
+ * @param feat      the parsed feature
+ * @param prefix    the scratch-file prefix for the compiles
+ * @return          the aggregate compile-fail verdict
+ * @since 0.3.0.30
+ */
+fn tkb_run_compile_fail(exe: str, regr_dir: str, feat: TkbFeature, prefix: str) -> RegrOutcome {
+    mut si: u64 = 0
+    loop {
+        if si >= feat.scenarios.len { break }
+        let sc = feat.scenarios[si]
+        let specs = match tkb_expand_outline(sc) { []Tkr as xs => xs; error as e => return regr_fail(e.message) }
+        let srcfile = tkb_scenario_source(sc)
+        if srcfile.len == 0 { return regr_fail($"{sc.name}: a compile-fail scenario needs a `Given source \"<file>\"`") }
+        let comp = compile_regressive_source(exe, regr_dir, srcfile, $"{prefix}.{si}.compile")
+        if specs.len > 0 {
+            let oc = check_compile_fail(specs[0], comp)
+            if !oc.ok { return regr_fail($"{sc.name}: {oc.message}") }
+        }
+        si = si + 1
+    }
+    regr_pass()
+}
+
+/**
+ * tkb_feature_is_compile_fail — does the feature's first scenario classify as `compilation fails`?
+ * A `.tkb` project is uniformly one kind (run-and-check OR compile-fail), so the first scenario's
+ * kind selects the runner path.
+ *
+ * @param feat  the parsed feature
+ * @return      true when the project is a compile-fail project
+ * @since 0.3.0.30
+ */
+fn tkb_feature_is_compile_fail(feat: TkbFeature) -> bool {
+    if feat.scenarios.len == 0 { return false }
+    match tkb_lower_scenario(feat.scenarios[0]) { Tkr as t => t.kind == TkrKind::CompileFail; error => false }
+}
+
+/**
+ * run_one_tkb — parse, then run a `.tkb` regressive. For RUN scenarios: compile the dir's `.tkp`
+ * ONCE, expand each scenario (outline ⇒ N `Tkr`s), and run the built binary per lowered `Tkr`
+ * through the UNCHANGED `check_run`. For COMPILE-FAIL scenarios: compile each scenario's
+ * `Given source "<file>"` standalone and check via `check_compile_fail` (no run, so no shared
+ * artifact — per-scenario compile is inherent to the negative path). The verdict is the FIRST
+ * failure, else pass.
+ *
+ * @param exe       the absolute path to this compiler binary
+ * @param regr_dir  the regressive project directory
+ * @param tkb_name  the `.tkb` basename inside `regr_dir`
+ * @param prefix    the scratch-file prefix for this regressive
+ * @return          the aggregate verdict
+ * @since 0.3.0.30
+ */
+fn run_one_tkb(exe: str, regr_dir: str, tkb_name: str, prefix: str) -> RegrOutcome {
+    let src = match teko::io::read_file(regr_dir ~ "/" ~ tkb_name) { str as s => s; error as e => return regr_fail(e.message) }
+    let feat = match parse_feature(src) { TkbFeature as x => x; error as e => return regr_fail(e.message) }
+    if tkb_feature_is_compile_fail(feat) { return tkb_run_compile_fail(exe, regr_dir, feat, prefix) }
+    let comp = compile_regressive(exe, regr_dir, prefix ~ ".compile")
+    if comp.exit != 0 { return regr_fail(teko::str::concat("compile failed: ", first_line(comp.stderr))) }
+    let name = match regressive_name(regr_dir) { str as s => s; error as e => return regr_fail(e.message) }
+    tkb_run_scenarios(feat, regr_dir ~ "/bin/" ~ name, prefix ~ ".run")
+}

@@ -1,0 +1,241 @@
+/**
+ * tkb_parses — did the `.tkb` source parse into a `TkbFeature`?
+ *
+ * @param src  the `.tkb` text
+ * @return     true when `parse_feature` succeeds
+ */
+fn tkb_parses(src: str) -> bool {
+    match parse_feature(src) { TkbFeature => true; error => false }
+}
+
+/**
+ * tkb_first_lowered — parse `src`, lower its first scenario to a `Tkr`, or fail the test on any
+ * error. A shared helper so each lowering test reads as one assertion block.
+ *
+ * @param src  the `.tkb` text (at least one scenario)
+ * @return     the first scenario's lowered spec
+ * @throws     when the source fails to parse / lower (the test asserts false first)
+ */
+fn tkb_first_lowered(src: str) -> Tkr | error {
+    let feat = match parse_feature(src) { TkbFeature as f => f; error as e => return e }
+    if feat.scenarios.len == 0 { return error { message = "no scenarios" } }
+    tkb_lower_scenario(feat.scenarios[0])
+}
+
+#test
+/**
+ * tkb_parse_plain_scenario — a Feature with one plain Scenario parses: the feature name and the
+ * scenario's step count (Given/When/Then) are captured, and the scenario is not an outline.
+ *
+ * @return void
+ */
+fn tkb_parse_plain_scenario() {
+    let src = "Feature: demo\n  Scenario: add\n    Given args = [\"add\", \"2\", \"3\"]\n    When built and run\n    Then exit = 5\n"
+    match parse_feature(src) {
+        TkbFeature as f => {
+            teko::assert::is_true(f.name == "demo")
+            teko::assert::is_true(f.scenarios.len == 1)
+            teko::assert::is_false(f.scenarios[0].outline)
+            teko::assert::is_true(f.scenarios[0].steps.len == 3)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkb_lower_scenario_fields — a plain scenario lowers to the expected `Tkr`: the fold-opaque args,
+ * the run kind, the exit oracle, and the literal stdout expectation.
+ *
+ * @return void
+ */
+fn tkb_lower_scenario_fields() {
+    let src = "Feature: f\n  Scenario: s\n    Given args = [\"add\", \"2\", \"3\"]\n    When built and run\n    Then exit = 5\n    And stdout = \"5\"\n"
+    match tkb_first_lowered(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.args.len == 3)
+            teko::assert::is_true(t.args[0] == "add")
+            teko::assert::is_true(t.args[2] == "3")
+            teko::assert::is_true(t.exit == 5)
+            teko::assert::is_true(t.kind == TkrKind::Print)
+            teko::assert::is_true(t.stdout.mode == TkrMatchMode::Literal)
+            teko::assert::is_true(t.stdout.text == "5")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkb_background_prepend — a Background Given step is prepended to every scenario's steps, ahead of
+ * the scenario's own steps.
+ *
+ * @return void
+ */
+fn tkb_background_prepend() {
+    let src = "Feature: f\n  Background:\n    Given targets = [\"host\"]\n  Scenario: s\n    Given args = [\"x\"]\n    When built and run\n    Then exit = 0\n"
+    match tkb_first_lowered(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.targets.len == 1)
+            teko::assert::is_true(t.targets[0] == "host")
+            teko::assert::is_true(t.args.len == 1)
+            teko::assert::is_true(t.args[0] == "x")
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkb_outline_expands — a `Scenario Outline` expands to one lowered `Tkr` per Examples row, each row
+ * textually substituting its `<name>` placeholders (here into the args and the exit oracle).
+ *
+ * @return void
+ */
+fn tkb_outline_expands() {
+    let src = "Feature: f\n  Scenario Outline: op\n    Given args = [\"<op>\", \"<a>\"]\n    When built and run\n    Then exit = <r>\n    Examples:\n      | op  | a  | r |\n      | inc | 4  | 5 |\n      | dec | 9  | 8 |\n"
+    match parse_feature(src) {
+        TkbFeature as f => {
+            teko::assert::is_true(f.scenarios[0].outline)
+            match tkb_expand_outline(f.scenarios[0]) {
+                []Tkr as xs => {
+                    teko::assert::is_true(xs.len == 2)
+                    teko::assert::is_true(xs[0].args[0] == "inc")
+                    teko::assert::is_true(xs[0].args[1] == "4")
+                    teko::assert::is_true(xs[0].exit == 5)
+                    teko::assert::is_true(xs[1].args[0] == "dec")
+                    teko::assert::is_true(xs[1].exit == 8)
+                }
+                error => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkb_hex_docstring_control_bytes — a `"""<hex>"""` docstring decodes to raw bytes, ignoring the
+ * whitespace between the nibble pairs and carrying control bytes (`\n`, `\0`) literally.
+ *
+ * @return void
+ */
+fn tkb_hex_docstring_control_bytes() {
+    match tkb_read_hex_docstring("\"\"\"0a 00 41\"\"\"", 0) {
+        str as b => {
+            teko::assert::is_true(b.len == 3)
+            teko::assert::is_true((b[0] to u64) == 10)
+            teko::assert::is_true((b[1] to u64) == 0)
+            teko::assert::is_true((b[2] to u64) == 65)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkb_hex_docstring_rejects_odd — an odd hex-nibble count and a non-hex byte are honest errors
+ * (M.3); a well-formed docstring still decodes.
+ *
+ * @return void
+ */
+fn tkb_hex_docstring_rejects_odd() {
+    match tkb_read_hex_docstring("\"\"\"0\"\"\"", 0) { str => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    match tkb_read_hex_docstring("\"\"\"zz\"\"\"", 0) { str => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    match tkb_read_hex_docstring("\"\"\"41\"\"\"", 0) { str as b => teko::assert::is_true(b == "A"); error => teko::assert::is_true(false) }
+}
+
+#test
+/**
+ * tkb_osarch_routing — a `Then on "<os-arch>"` step routes its exit/stdout into a `[expect.<os-arch>]`
+ * override (via the reused `tkr_expect_for`), leaving the top-level expectation intact.
+ *
+ * @return void
+ */
+fn tkb_osarch_routing() {
+    let src = "Feature: f\n  Scenario: s\n    When built and run\n    Then exit = 6\n    Then on \"wasm\" exit = 7\n"
+    match tkb_first_lowered(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.exit == 6)
+            match tkr_expect_for(t, "wasm") {
+                TkrExpect as e => { teko::assert::is_true(e.has_exit); teko::assert::is_true(e.exit == 7) }
+                null => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkb_compile_fail_lowers — a `compilation fails` scenario lowers to the CompileFail kind pinning the
+ * `diagnostic` substring, and `tkb_scenario_source` reports its `Given source "<file>"`.
+ *
+ * @return void
+ */
+fn tkb_compile_fail_lowers() {
+    let src = "Feature: f\n  Scenario: neg\n    Given source \"cases/x.tks\"\n    When compilation fails\n    Then diagnostic = \"out of range\"\n"
+    match parse_feature(src) {
+        TkbFeature as f => {
+            teko::assert::is_true(tkb_scenario_source(f.scenarios[0]) == "cases/x.tks")
+            match tkb_lower_scenario(f.scenarios[0]) {
+                Tkr as t => { teko::assert::is_true(t.kind == TkrKind::CompileFail); teko::assert::is_true(t.diagnostic == "out of range") }
+                error => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkb_tkr_parity — a `.tkb` scenario and the equivalent hand-written `.tkr` lower to the SAME `Tkr`
+ * (args/kind/exit/stdout), proving `.tkr` is the lowering IR of `.tkb`.
+ *
+ * @return void
+ */
+fn tkb_tkr_parity() {
+    let tkb_src = "Feature: f\n  Scenario: s\n    Given args = [\"7\", \"13\"]\n    When built and run\n    Then exit = 42\n    And stdout = \"ok\"\n"
+    let tkr_src = "args = [\"7\", \"13\"]\nkind = \"print\"\nexit = 42\nstdout = \"ok\"\n"
+    match tkb_first_lowered(tkb_src) {
+        Tkr as a => match parse_tkr(tkr_src) {
+            Tkr as b => {
+                teko::assert::is_true(a.args.len == b.args.len)
+                teko::assert::is_true(a.args[0] == b.args[0])
+                teko::assert::is_true(a.exit == b.exit)
+                teko::assert::is_true(a.stdout.mode == b.stdout.mode)
+                teko::assert::is_true(a.stdout.text == b.stdout.text)
+            }
+            error => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkb_rejects_malformed — an unknown noun-phrase, an unknown When verb, and a step before any
+ * Scenario are honest errors (M.3); a well-formed feature still parses.
+ *
+ * @return void
+ */
+fn tkb_rejects_malformed() {
+    teko::assert::is_false(tkb_parses("Feature: f\n  Given args = [\"x\"]\n"))
+    let bad_noun = "Feature: f\n  Scenario: s\n    When built and run\n    Then bogus = \"x\"\n"
+    match tkb_first_lowered(bad_noun) { Tkr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    let bad_verb = "Feature: f\n  Scenario: s\n    When teleported\n"
+    match tkb_first_lowered(bad_verb) { Tkr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    teko::assert::is_true(tkb_parses("Feature: f\n  Scenario: s\n    When built and run\n    Then exit = 0\n"))
+}
+
+#test
+/**
+ * tkb_discovery_prefers_tkb — `dir_first_spec` and the retained legacy `dir_first_tkr` both return
+ * the empty result for a non-existent directory (the discovery probe is a null on an unreadable dir).
+ *
+ * @return void
+ */
+fn tkb_discovery_prefers_tkb() {
+    match dir_first_spec("examples/regressions/__nope__") { SpecRef => teko::assert::is_true(false); null => teko::assert::is_true(true) }
+    match dir_first_tkr("examples/regressions/__nope__") { str => teko::assert::is_true(false); null => teko::assert::is_true(true) }
+}
