@@ -133,6 +133,28 @@ fn skip_level_error(arm_type: Type, subject: Type, table: TypeTable) -> error {
     error { message = $"'{arm_s}' is not a direct case of '{subj_s}' — match the outer case first ({hint_s} as v => match v {{ {arm_s} as x => … }})" }
 }
 
+/**
+ * Does `t` (an already one-level-expanded subject) carry a `null` member (null-as-union)? Used to
+ * admit a `null` match pattern over a `T | null` subject, mirroring the `variant`-member machinery.
+ *
+ * @param t  the subject's variant view (from `expand_variant`)
+ * @return   true iff `t` is a `Variant` one of whose members is `Null`
+ */
+fn variant_has_null_member(t: Type) -> bool {
+    match t {
+        Variant as v => {
+            mut i = 0
+            loop {
+                if i >= v.members.len { break }
+                match v.members[i] { Null => return true; _ => { } }
+                i++
+            }
+            false
+        }
+        _ => false
+    }
+}
+
 // validate a pattern against the subject; return the env extended with bindings.
 fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) -> Env | error {
     // OPTIONAL subject `T?` (REBOOT_PLAN §202): `null` matches the NONE case (binds nothing);
@@ -169,7 +191,10 @@ fn check_pattern(p: parser::Pattern, subject: Type, env: Env, table: TypeTable) 
     // members, never for a member's own inner cases.
     let subject_variant = expand_variant(subject, table)
     match p {
-        parser::NullPattern => return error { message = "`null` pattern requires an optional subject (`T?`) — REBOOT_PLAN §202" }
+        parser::NullPattern => {
+            if variant_has_null_member(subject_variant) { return env }
+            return error { message = "`null` pattern requires an optional subject (`T?`) or a union listing `null`" }
+        }
         parser::WildcardPattern => env
         parser::BindPattern as bp => {
             // `[]T as x` resolves the slice TYPE-expr; a path bind resolves the named/builtin case.
@@ -397,6 +422,7 @@ fn variant_covered(arms: []parser::Arm, members: []Type, table: TypeTable, ref_n
         if i >= members.len { break }
         match members[i] {
             Named as nm => { if !some_arm_names(arms, name_last_segment(nm.name), table, ref_ns) { return false } }   // (#109 W3) canonical member name → bare, to match the arms' bare case names
+            Null => { if !some_arm_is_null(arms) { return false } }
             _ => { if !some_arm_covers_type(arms, members[i], table, ref_ns) { return false } }
         }
         i++

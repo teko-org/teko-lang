@@ -110,16 +110,40 @@ pub type Binding = struct {   // let/mut/const TARGET [: T] = value
     type_ann: TypeExpr   // the parsed annotation (A.8)
     value: Expr
 }
-// (#88) an assignment TARGET is one of three shapes, tagged by `kind`:
-//   Simple   — `name op= value`; LHS is the bare binding `name` (deref=false, target = no_expr()).
-//   RefDeref — `name.value op= value`; write THROUGH a `Ref<T>` handle `name` (deref=true — the legacy
-//              MEM-1b-ii flag, preserved; target = no_expr()).
-//   Field    — `recv.field op= value`; write a struct/class field. `target` is the LHS field-access EXPR
-//              (a FieldAccess, receiver.field, arbitrarily nested); `name`/`deref` unused.
-// `deref` stays a plain bool == (kind==RefDeref) so every legacy reader / TKB byte layout is unchanged for the
-// two old shapes; a Field target is the ONLY new shape (kind=Field carries `target`, the general lvalue).
-pub type AssignKind = enum { Simple; RefDeref; Field }
+/**
+ * AssignKind — the target shape of an assignment (#88). One of four, tagged on `Assign`/`TAssign`:
+ *
+ * @field Simple    `name op= value` — the bare binding `name` (deref=false; target = no_expr()).
+ * @field RefDeref  `name.value op= value` — write THROUGH a `Ref<T>` handle `name` (deref=true, the
+ *                  legacy MEM-1b-ii flag; target = no_expr()).
+ * @field Field     `recv.field op= value` — a struct/class field write; `target` is the LHS field-access
+ *                  EXPR (a FieldAccess, arbitrarily nested); `name`/`deref` unused.
+ * @field Index     `ids[i] op= value` — a slice/array ELEMENT write; `target` is the LHS index EXPR (an
+ *                  `Index{receiver,index}`); `name`/`deref` unused. Appended LAST so the three legacy
+ *                  ordinals (and thus the TKB `assign_kind_byte` layout) are unchanged. `deref` stays a
+ *                  plain bool == (kind==RefDeref); Field/Index both carry the general lvalue in `target`
+ *                  (see `assign_has_target`).
+ */
+pub type AssignKind = enum { Simple; RefDeref; Field; Index }
 pub type Assign = struct { kind: AssignKind; name: str; op: lexer::TokenKind; value: Expr; deref: bool; target: Expr }   // x = / += / … (B.4); see AssignKind above
+
+/**
+ * assign_has_target — does an `AssignKind` carry a general lvalue EXPRESSION in `Assign.target` /
+ * `TAssign.target`? True for the two expr-target shapes — `Field` (`recv.field`) and `Index`
+ * (`ids[i]`) — and false for `Simple` / `RefDeref` (which write a bare `name`). Every AST/TAST walk
+ * that descends into a field assignment's `target` must descend an index assignment's `target` too
+ * (both hold sub-expressions naming free variables), so the two share this single predicate.
+ *
+ * @param kind  the assignment's target discriminant
+ * @return      true iff `target` holds a walkable lvalue expression (`Field` or `Index`)
+ */
+pub fn assign_has_target(kind: AssignKind) -> bool {
+    match kind {
+        AssignKind::Field => true
+        AssignKind::Index => true
+        _ => false
+    }
+}
 pub type Return = struct { has_value: bool; value: Expr }   // `return [expr]` — bare `return` (no value) has has_value=false, value a placeholder (B.20; P4a)
 /**
  * `[LABEL:] loop [<head>] { … }` (M.5, #517). The head is fully desugared by the parser: `init`

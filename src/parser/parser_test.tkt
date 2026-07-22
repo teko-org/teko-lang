@@ -978,29 +978,83 @@ fn rejects_loop_binding_no_separator() {
     teko::assert::is_true(stmt_errors("loop mut i 5 { }"))
 }
 
-/** parses_foreach_head — `loop mut x in it { s = s + x }` desugars to a 1-statement `init`
-    (`mut _it = it`) and a 1-statement body (the `match _it() { … }` pull) (#517 for-each). */
+/** rejects_mut_foreach_head — `loop mut x in it { … }` is REJECTED (0.3.0.29): a for-each element's
+    mutability is INHERITED from the container, so `mut` on the binding is a parse error directing the
+    user to drop it (`loop x in ids`). The `mut` non-range `in` no longer reaches the reserved `_it()`
+    path. */
 #test
-fn parses_foreach_head() {
-    match stmt_of("loop mut x in it { s = s + x }") {
-        LoopStmt as l => {
-            teko::assert::is_true(l.init.len == 1)
-            teko::assert::is_true(l.body.len == 1)
-            match l.body[0] { ExprStmt as es => match es.expr.kind { MatchExpr as me => teko::assert::is_true(me.arms.len == 2); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-        }
+fn rejects_mut_foreach_head() {
+    teko::assert::is_true(stmt_errors("loop mut x in it { s = s + x }"))
+}
+
+/** rejects_mut_foreach_destructure_head — the destructure spelling `loop mut { index; value } in it`
+    is likewise rejected under the inherited-mutability rule (0.3.0.29). */
+#test
+fn rejects_mut_foreach_destructure_head() {
+    teko::assert::is_true(stmt_errors("loop mut { index; value } in it { use_it() }"))
+}
+
+/**
+ * parses_slice_foreach_head — `loop x in ids { … }` over a bare-variable iterable is a slice for-each
+ * (0.3.0.29): it desugars to the proven range-counter form, so the resulting `LoopStmt` carries a
+ * NON-EMPTY `init` (the hidden counter/limit/first binds), unlike a plain `while`-condition head. The
+ * enumerate spelling `loop (x, i) in ids { … }` takes the same for-each path.
+ */
+#test
+fn parses_slice_foreach_head() {
+    match stmt_of("loop x in ids { s = s + x }") {
+        LoopStmt as l => teko::assert::is_true(l.init.len > 0)
+        _ => teko::assert::is_true(false)
+    }
+    match stmt_of("loop (x, i) in ids { s = s + x - i }") {
+        LoopStmt as l => teko::assert::is_true(l.init.len > 0)
         _ => teko::assert::is_true(false)
     }
 }
 
-/** parses_foreach_destructure_head — `loop mut { index; value } in it { }` expands the destructure
-    to per-field `mut` copies inside the pull arm; `init` is `mut _it = it` (#517, §5.5). */
+/**
+ * slice_foreach_distinct_from_membership_while — an iterable spelled as a `[ … ]` set is NOT a
+ * for-each: `loop x in [1, 2] { … }` is the `in` MEMBERSHIP operator of a `while`-condition head, so
+ * it desugars with an EMPTY `init` (the folded `if !(x in […]) { break }` lives in the body). This
+ * pins the bare-variable-vs-set split that `loop_head_is_foreach` decides.
+ */
 #test
-fn parses_foreach_destructure_head() {
-    match stmt_of("loop mut { index; value } in it { use_it() }") {
-        LoopStmt as l => {
-            teko::assert::is_true(l.init.len == 1)
-            teko::assert::is_true(l.body.len == 1)
-            match l.body[0] { ExprStmt as es => match es.expr.kind { MatchExpr as me => teko::assert::is_true(me.arms.len == 2); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+fn slice_foreach_distinct_from_membership_while() {
+    match stmt_of("loop x in [1, 2] { s = s + 1 }") {
+        LoopStmt as l => teko::assert::is_true(l.init.len == 0)
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * parses_index_assign — `ids[i] = v` parses as an `Assign` of kind `Index` whose `target` is the
+ * `Index` lvalue (0.3.0.29 element assignment). The compound (`+=`) and shift (`<<=`) spellings carry
+ * through the same path with their operator preserved.
+ */
+#test
+fn parses_index_assign() {
+    match stmt_of("ids[i] = 9") {
+        Assign as a => {
+            let is_index = match a.kind { AssignKind::Index => true; _ => false }
+            teko::assert::is_true(is_index)
+            teko::assert::is_true(a.op == lexer::TokenKind::Assign)
+            match a.target.kind { Index => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+        }
+        _ => teko::assert::is_true(false)
+    }
+    match stmt_of("ids[i] += 1") {
+        Assign as a => {
+            let is_index = match a.kind { AssignKind::Index => true; _ => false }
+            teko::assert::is_true(is_index)
+            teko::assert::is_true(a.op == lexer::TokenKind::PlusEq)
+        }
+        _ => teko::assert::is_true(false)
+    }
+    match stmt_of("ids[i] <<= 2") {
+        Assign as a => {
+            let is_index = match a.kind { AssignKind::Index => true; _ => false }
+            teko::assert::is_true(is_index)
+            teko::assert::is_true(a.op == lexer::TokenKind::ShlEq)
         }
         _ => teko::assert::is_true(false)
     }

@@ -1519,7 +1519,7 @@ fn ensure_rt_dir_abs() {
  *  @param out_dir  the build output directory (`-o`, default "bin")
  *  @return         0 on a fully gated, successfully built release, else the failing status
  *  @since #265 */
-fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false, 0, false, Backend::C) }
+fn compile_project(dir: str, out_dir: str) -> i32 { compile_project_g(dir, out_dir, false, false, 0, false, Backend::C, false) }
 
 // (#148) report_peak — the compiler prints its own memory cost at the end of a successful build
 // (peak RSS via teko::mem::peak_rss; 0 = unavailable on this host → print suppressed).
@@ -1588,23 +1588,111 @@ fn build_ungated(dir: str, out_dir: str, opt: i32, tty: bool, start: i128, backe
     codegen_and_report(dir, out_dir, fe.prog, with_backend(fe.manifest, backend), opt, tty, start)
 }
 
-/** Check the D4 coverage floors (from the `.tkp` [coverage] section; default 80/80/80) against
- *  `fe`'s recorded function/line/branch coverage. Returns 0 when every floor is met, else the
- *  first failing floor's `fail` status (BLOCKED — the build stops here). Extracted from run_gate
- *  so each floor check is one guard clause instead of three nested arms. */
+/**
+ * The human-readable messages for every D4 coverage floor a run fails to meet, in the fixed order
+ * functions → lines → branches. Empty (len 0) when every floor holds. The SINGLE source of the
+ * floor-comparison logic and its wording, shared by the strict enforcement path
+ * (`coverage_gate_result` fails on the first) and the non-blocking path (`warn_coverage_floors`
+ * prints them all) so both agree exactly on which floors are unmet. Takes the floors as explicit
+ * values (not a `Manifest`) so the comparison is a pure, directly-testable function.
+ *
+ * @param fcov     the measured function-coverage percentage
+ * @param lcov     the measured line-coverage percentage
+ * @param bcov     the measured branch-coverage percentage
+ * @param floor_f  the [coverage] functions floor percentage
+ * @param floor_l  the [coverage] lines floor percentage
+ * @param floor_b  the [coverage] branches floor percentage
+ * @return         one message per unmet floor (functions, then lines, then branches); empty when all hold
+ */
+fn unmet_coverage_floors(fcov: u64, lcov: u64, bcov: u64, floor_f: u64, floor_l: u64, floor_b: u64) -> []str {
+    mut msgs: []str = teko::list::empty()
+    if fcov < floor_f {
+        msgs = teko::list::push(msgs, $"function coverage {fcov}% is below the {floor_f}% floor ([coverage] functions) — add tests")
+    }
+    if lcov < floor_l {
+        msgs = teko::list::push(msgs, $"line coverage {lcov}% is below the {floor_l}% floor ([coverage] lines) — add tests")
+    }
+    if bcov < floor_b {
+        msgs = teko::list::push(msgs, $"branch coverage {bcov}% is below the {floor_b}% floor ([coverage] branches) — add tests")
+    }
+    msgs
+}
+
+/**
+ * The unmet-floor messages for `fe`'s recorded function/line/branch coverage against the `.tkp`
+ * [coverage] floors (default 50/50/49). Thin wrapper over `unmet_coverage_floors` that reads the
+ * three measured percentages off the coverage sinks and the three floors off the manifest.
+ *
+ * @param fe  the assembled front-end product (checked program + manifest with the floors)
+ * @return    one message per unmet floor; empty when every floor holds
+ */
+fn coverage_floor_misses(fe: Frontend) -> []str {
+    unmet_coverage_floors(coverage::coverage_pct(fe.prog), coverage::line_coverage_pct(fe.prog), coverage::branch_coverage_pct(fe.prog), fe.manifest.cov_functions, fe.manifest.cov_lines, fe.manifest.cov_branches)
+}
+
+/**
+ * The D4 coverage-floor POLICY as a pure predicate: does an unmet floor BLOCK the gate? Only when
+ * enforcement is opted into (`cov_validation`) AND at least one floor is unmet (owner ruling
+ * 0.3.0.29). The single source of the "warn vs fail" decision, exercised directly by the
+ * regression tests for both paths.
+ *
+ * @param misses          the unmet-floor messages (from `coverage_floor_misses`)
+ * @param cov_validation  `--cov-validation` — enforcement opted in
+ * @return                true iff the gate must FAIL (enforce on AND a floor unmet); false = warn/pass
+ */
+fn coverage_floor_blocks(misses: []str, cov_validation: bool) -> bool {
+    cov_validation && misses.len > 0
+}
+
+/**
+ * Check the D4 coverage floors STRICTLY (the `--cov-validation` path): 0 when every floor holds,
+ * else the FIRST unmet floor's `fail` status (BLOCKED — the build stops here). This is the historic
+ * enforcing behavior, now reached only under opt-in validation (owner ruling 0.3.0.29: floors are
+ * non-blocking by default — see `enforce_coverage_floors`).
+ *
+ * @param dir  the project directory (for the diagnostic prefix)
+ * @param fe   the assembled front-end product (checked program + manifest floors)
+ * @return     0 when every floor holds, else 1 with the first unmet floor reported to stderr
+ * @throws     the first unmet floor's message when any of functions/lines/branches is below its floor
+ */
 fn coverage_gate_result(dir: str, fe: Frontend) -> i32 {
-    let fcov = coverage::coverage_pct(fe.prog)
-    if fcov < fe.manifest.cov_functions {
-        return fail(dir, $"function coverage {fcov}% is below the {fe.manifest.cov_functions}% floor ([coverage] functions) — add tests")
+    let misses = coverage_floor_misses(fe)
+    if coverage_floor_blocks(misses, true) { return fail(dir, misses[0]) }
+    0
+}
+
+/**
+ * Print every unmet coverage floor as a NON-BLOCKING warning to stderr (the default path when
+ * `--cov-validation` is absent — owner ruling 0.3.0.29). Each message is prefixed `teko: warning:`
+ * and the build/gate proceeds regardless; only `--cov-validation` turns these into a failure.
+ *
+ * @param misses  the unmet-floor messages (from `coverage_floor_misses`); empty prints nothing
+ */
+fn warn_coverage_floors(misses: []str) {
+    mut i: u64 = 0
+    loop {
+        if i >= misses.len { break }
+        teko::io::eprintln(teko::str::concat("teko: warning: ", misses[i]))
+        i = i + 1
     }
-    let lcov = coverage::line_coverage_pct(fe.prog)
-    if lcov < fe.manifest.cov_lines {
-        return fail(dir, $"line coverage {lcov}% is below the {fe.manifest.cov_lines}% floor ([coverage] lines) — add tests")
-    }
-    let bcov = coverage::branch_coverage_pct(fe.prog)
-    if bcov < fe.manifest.cov_branches {
-        return fail(dir, $"branch coverage {bcov}% is below the {fe.manifest.cov_branches}% floor ([coverage] branches) — add tests")
-    }
+}
+
+/**
+ * Apply the D4 coverage-floor policy under the `--cov-validation` opt-in (owner ruling 0.3.0.29:
+ * the floors are a NON-BLOCKING warning by default; enforcement is opt-in). With `cov_validation`
+ * true an unmet floor FAILS the gate (`coverage_gate_result`, the historic behavior); with it false
+ * an unmet floor only WARNS (`warn_coverage_floors`) and the gate passes. The tests-pass gate itself
+ * is unaffected — only this coverage-FLOOR enforcement is made opt-in.
+ *
+ * @param dir             the project directory (for the diagnostic prefix)
+ * @param fe              the assembled front-end product (checked program + manifest floors)
+ * @param cov_validation  `--cov-validation` — enforce (fail) rather than warn on an unmet floor
+ * @return                0 unless `cov_validation` is set AND a floor is unmet, in which case 1
+ * @throws                under `cov_validation`, the first unmet floor's message
+ */
+fn enforce_coverage_floors(dir: str, fe: Frontend, cov_validation: bool) -> i32 {
+    if cov_validation { return coverage_gate_result(dir, fe) }
+    warn_coverage_floors(coverage_floor_misses(fe))
     0
 }
 
@@ -1707,13 +1795,14 @@ fn release_build_of(dir: str, out_dir: str, opt: i32, tty: bool, start: i128, ba
  *  @param tty      render the release rebuild's backend phases' in-place `\r` updates
  *  @param start    when the build began (the closing `built <path> <elapsed>` line's baseline)
  *  @param backend  the resolved code-generation backend (`--backend`, default `Backend::C`)
- *  @return         0 when every test passes, every floor is met, and the release build succeeds
+ *  @param cov_validation  `--cov-validation` — enforce (fail) the coverage floors instead of warning
+ *  @return         0 when every test passes, the floor policy is satisfied, and the release build succeeds
  *  @since #265 */
-fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, pf: ParsedFront, opt: i32, tty: bool, start: i128, backend: Backend) -> i32 {
+fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, pf: ParsedFront, opt: i32, tty: bool, start: i128, backend: Backend, cov_validation: bool) -> i32 {
     let trc = run_native_gate(dir, out_dir, fe.prog, fe.manifest, tty)
     if trc != 0 { return trc }
     report_native_coverage(fe.prog)
-    let gate_rc = coverage_gate_result(dir, fe)
+    let gate_rc = enforce_coverage_floors(dir, fe, cov_validation)
     if gate_rc != 0 { return gate_rc }
     if gen_cov {
         let xml = coverage::cov_cobertura(fe.prog)
@@ -1737,10 +1826,11 @@ fn run_gate_native(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, pf: Pars
  * @param tty      render the release rebuild's backend phases' in-place `\r` updates
  * @param start    when the build began (the closing `built <path> <elapsed>` line's baseline)
  * @param backend  the resolved code-generation backend (`--backend`, default `Backend::C`)
+ * @param cov_validation  `--cov-validation` — enforce (fail) the coverage floors instead of warning
  * @return         0 when the gate passes and the release build succeeds, else the failing status
  */
-fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, pf: ParsedFront, opt: i32, tty: bool, start: i128, backend: Backend) -> i32 {
-    run_gate_native(dir, out_dir, gen_cov, fe, pf, opt, tty, start, backend)
+fn run_gate(dir: str, out_dir: str, gen_cov: bool, fe: Frontend, pf: ParsedFront, opt: i32, tty: bool, start: i128, backend: Backend, cov_validation: bool) -> i32 {
+    run_gate_native(dir, out_dir, gen_cov, fe, pf, opt, tty, start, backend, cov_validation)
 }
 
 /** No `#test` functions at all: ignore the gate, build the production program straight from the
@@ -1767,9 +1857,10 @@ fn build_no_tests_present(dir: str, out_dir: str, fe: Frontend, opt: i32, tty: b
  *  @param opt          the cc optimization level (`--release`/`--opt=<n>`; 0 = dev/CI default, 2 = release seed)
  *  @param no_tty       `--no-tty` — force the plain, non-interactive observability output even on a terminal
  *  @param backend      the resolved code-generation backend (`--backend`, default `Backend::C`)
+ *  @param cov_validation  `--cov-validation` — enforce (fail) the coverage floors instead of warning (0.3.0.29)
  *  @return             0 on a fully gated, successfully built release, else the failing status
  *  @since #265 */
-fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, opt: i32, no_tty: bool, backend: Backend) -> i32 {
+fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, opt: i32, no_tty: bool, backend: Backend, cov_validation: bool) -> i32 {
     ensure_rt_dir_abs()
     match teko::env::chdir(dir) { error => return fail(dir, "cannot enter project directory"); null => { } }
     let tty = output_is_tty(no_tty)
@@ -1783,7 +1874,7 @@ fn compile_project_g(dir: str, out_dir: str, gen_cov: bool, no_verify: bool, opt
             if !has_tests(fe.prog) {
                 return build_no_tests_present(dir, out_dir, fe, opt, tty, start, backend)
             }
-            run_gate(dir, out_dir, gen_cov, fe, pf, opt, tty, start, backend)
+            run_gate(dir, out_dir, gen_cov, fe, pf, opt, tty, start, backend, cov_validation)
         }
         error as e => return fail(dir, e.message)
     }
@@ -1831,6 +1922,19 @@ fn coverage_of(args: []str) -> bool {
     false
 }
 
+/** analyzer_of — does `--analyzer` appear in the args? (`teko test . --analyzer`, 0.3.0.29): after the
+    gate + coverage floors, run the dev-time whole-suite stale/redundant/misleading analyzer (ONE
+    compile, one run, per-test `.tkcov` dumps). Dev-time/advisory only — never wired into CI. */
+fn analyzer_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--analyzer" { return true }
+        i = i + 1
+    }
+    false
+}
+
 /** (Issue #249 lever A) does `--no-verify` appear in the args? A `build` normally ALWAYS runs the
  *  D4 `.tkt` gate first (unchanged default); this flag skips it entirely, emitting straight to
  *  codegen. Intended for a self-host release chain that has already proven the gate on an earlier
@@ -1841,6 +1945,44 @@ fn no_verify_of(args: []str) -> bool {
     loop {
         if i >= args.len { break }
         if args[i] == "--no-verify" { return true }
+        i = i + 1
+    }
+    false
+}
+
+/**
+ * Does `--cov-validation` appear in the args? (Owner ruling 0.3.0.29.) The D4 coverage floors are a
+ * NON-BLOCKING warning by default; this flag opts INTO strict enforcement — an unmet floor then FAILS
+ * the build/test gate (`enforce_coverage_floors`), the historic behavior. The tests-pass gate is
+ * always mandatory and unaffected; only the coverage-FLOOR enforcement is gated behind this flag.
+ *
+ * @param args  the full CLI argument vector
+ * @return      true iff `--cov-validation` appears anywhere in `args`
+ */
+fn cov_validation_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--cov-validation" { return true }
+        i = i + 1
+    }
+    false
+}
+
+/**
+ * Does `--per-test-cov` appear in the args? (Owner ruling 0.3.0.29 — the T2 lever.) A DEV-TIME
+ * `teko test` flag that attributes coverage to EACH `#test` individually (`run_per_test_cov`),
+ * printing a per-test functions/lines/branches report used to prove which tests are redundant or
+ * subsumed. Off by default and zero-cost when absent; NOT a CI gate.
+ *
+ * @param args  the full CLI argument vector
+ * @return      true iff `--per-test-cov` appears anywhere in `args`
+ */
+fn per_test_cov_of(args: []str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--per-test-cov" { return true }
         i = i + 1
     }
     false
@@ -1868,7 +2010,9 @@ fn no_tty_of(args: []str) -> bool {
 
 /** project_arg_of — the FIRST non-flag positional (the project) from `start`, or "" if none (the
  *  caller reports). Skips `-o <dir>` (and its value), `--no-test` (D4; currently ignored),
- *  `--no-verify` (#249 lever A), `--native-gate` (#265, now an inert no-op), `--release`,
+ *  `--no-verify` (#249 lever A), `--cov-validation`/`--per-test-cov` (the 0.3.0.29 coverage knobs),
+ *  `--per-commit-test <base>` (the 0.3.0.29 delta-coverage gate — a value flag, so its base is skipped
+ *  too), `--native-gate` (#265, now an inert no-op), `--release`,
  *  `--opt=<n>` (the optimization axis), `--no-tty` (BUILD-OUTPUT OBSERVABILITY), and `--backend`
  *  (D1/#390: both the `--backend <value>` two-token form and the `--backend=<value>` single-token
  *  form) — every recognized build flag — so none of them is mistaken for the project. `--vm-gate`
@@ -1886,11 +2030,15 @@ fn project_arg_of(args: []str, start: u64) -> str {
         if args[i] == "-o" { i = i + 2 }
         else if args[i] == "--no-test" { i = i + 1 }
         else if args[i] == "--no-verify" { i = i + 1 }
+        else if args[i] == "--cov-validation" { i = i + 1 }
+        else if args[i] == "--per-test-cov" { i = i + 1 }
+        else if args[i] == "--per-commit-test" { i = i + 2 }
         else if args[i] == "--native-gate" { i = i + 1 }
         else if args[i] == "--release" { i = i + 1 }
         else if args[i] == "--no-tty" { i = i + 1 }
         else if args[i] == "--backend" { i = i + 2 }
         else if args[i] == "--backend=native" || args[i] == "--backend=c" { i = i + 1 }
+        else if args[i] == "--analyzer" { i = i + 1 }
         else if opt_arg_has_prefix(args[i]) { i = i + 1 }
         else { return args[i] }
     }
@@ -1977,19 +2125,1152 @@ fn run_project(dir: str, backend: Backend) -> i32 {
     teko::process::run(argv)
 }
 
+/** TKCOV_MAGIC_LEN — the fixed 8-byte magic header (`TKCOV1\0\0`) that opens every `.tkcov` dump,
+    and also the wire width of one `u64` id/count (both are 8). (0.3.0.29) */
+const TKCOV_MAGIC_LEN: u64 = 8
+
+/** TKCOV_SECTIONS — the three id sections a `.tkcov` file carries, in order: functions, branches,
+    lines (see `tk_cov_dump` in teko_rt.c). (0.3.0.29) */
+const TKCOV_SECTIONS: u64 = 3
+
+/** REDUNDANT_MIN — an id must be covered by at least this many DISTINCT tests for it to count as
+    "also covered elsewhere". A test is REDUNDANT when EVERY one of its ids reaches this floor (the
+    test itself contributes one, so 2 means at least one OTHER test covers the id too). (0.3.0.29) */
+const REDUNDANT_MIN: u64 = 2
+
+/** Verdict — the COVERAGE-SET axis of the analyzer (`teko test . --analyzer`, 0.3.0.29). `Stale`:
+    the test exercises NO production id (guards nothing — e.g. asserts only comptime-folded literals).
+    `Redundant`: every id it covers is ALSO covered by another test (removing it loses no coverage).
+    `Live`: it uniquely covers at least one id. This is crossed with the ASSERTION-FOLD axis to form
+    the combined `Status`. */
+type Verdict = enum { Stale; Redundant; Live }
+
+/** Status — the COMBINED per-test verdict (0.3.0.29 Crumb 4), crossing the coverage-set axis with the
+    assertion-fold axis, most-severe first. `Misleading`: an assertion folds to a constant AND the test
+    still covers production (looks LIVE, guards nothing — the star finding coverage counting cannot
+    see). `Foundational`: EVERY assertion folds to a constant (tests the fold/language foundation, e.g.
+    `1+1==2`). `Dead`: no production coverage and no live assertion. `Redundant`: real assertions +
+    covers production, but its coverage set ⊆ the union of the other tests. `Live`: real assertion(s)
+    plus at least one uniquely-covered production id. */
+type Status = enum { Misleading; Foundational; Dead; Redundant; Live }
+
+/** TestRecord — one `#test`'s analyzer input: its display label, the DEDUPED set of production ids
+    (functions ∪ branches ∪ lines) it covered (decoded from that test's isolated `.tkcov`), and its
+    assertion tally (from `checker::test_assert_stats`). (0.3.0.29) */
+type TestRecord = struct {
+    /** the `namespace::name` (or bare `name`) label, matching the native gate's `test <label>` line. */
+    label: str
+    /** the deduped production ids this test covered — empty ⇒ no coverage. */
+    ids: []u64
+    /** the number of bool assertions (`is_true`/`is_false`) the test makes. */
+    asserts_total: u64
+    /** how many of those assertions have a predicate that folds to a comptime constant (dead guards). */
+    asserts_folded: u64
+}
+
+/** verdict_text — the stable, greppable token for a coverage `Verdict` (`STALE`/`REDUNDANT`/`LIVE`).
+    Retained for the coverage-axis unit tests; the report prints the combined `Status`. (0.3.0.29) */
+fn verdict_text(v: Verdict) -> str {
+    match v {
+        Verdict::Stale => "STALE"
+        Verdict::Redundant => "REDUNDANT"
+        Verdict::Live => "LIVE"
+    }
+}
+
+/** status_text — the stable, greppable token for a combined `Status`
+    (`MISLEADING`/`FOUNDATIONAL`/`DEAD`/`REDUNDANT`/`LIVE`). (0.3.0.29) */
+fn status_text(s: Status) -> str {
+    match s {
+        Status::Misleading => "MISLEADING"
+        Status::Foundational => "FOUNDATIONAL"
+        Status::Dead => "DEAD"
+        Status::Redundant => "REDUNDANT"
+        Status::Live => "LIVE"
+    }
+}
+
+/**
+ * combined_status — cross the coverage-set axis (`cov`) with the assertion-fold axis (`total`/`folded`)
+ * into the single reported `Status`, most-severe first. A test "covers production" iff `cov` is not
+ * `Stale`. MISLEADING (a dead guard while covering production) outranks FOUNDATIONAL (all guards dead)
+ * outranks DEAD (no coverage, no live guard); the remaining production-covering tests with real guards
+ * are REDUNDANT or LIVE by their coverage set.
+ *
+ * @param cov     the coverage-set verdict for this test (`classify_test`)
+ * @param total   the number of bool assertions the test makes
+ * @param folded  how many of those assertions fold to a comptime constant
+ * @return        the combined `Status`
+ * @since 0.3.0.29
+ */
+fn combined_status(cov: Verdict, total: u64, folded: u64) -> Status {
+    let covers = cov != Verdict::Stale
+    let has_folded = folded >= 1
+    let all_folded = total >= 1 && folded == total
+    if has_folded && covers { return Status::Misleading }
+    if all_folded { return Status::Foundational }
+    if !covers { return Status::Dead }
+    match cov {
+        Verdict::Redundant => Status::Redundant
+        _ => Status::Live
+    }
+}
+
+/**
+ * read_u64_le — decode the little-endian `u64` at byte offset `off` in the raw `.tkcov` bytes. Any
+ * byte that falls past the end of `data` reads as 0, so a truncated file decodes to a bounded value
+ * instead of panicking.
+ *
+ * @param data  the raw `.tkcov` file bytes (a `str` used as a byte buffer)
+ * @param off   the starting byte offset of the 8-byte little-endian word
+ * @return      the decoded unsigned 64-bit value
+ * @since 0.3.0.29
+ */
+fn read_u64_le(data: str, off: u64) -> u64 {
+    mut v: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= TKCOV_MAGIC_LEN { break }
+        let at = off + i
+        if at < data.len { v = v | ((data[at] to u64) << (i * TKCOV_MAGIC_LEN)) }
+        i++
+    }
+    v
+}
+
+/**
+ * tkcov_magic_ok — does `data` open with the 8-byte `TKCOV1\0\0` magic? A missing/short/foreign file
+ * fails, so `tkcov_ids` treats it as "no ids" (an absent per-test dump ⇒ STALE) rather than panicking.
+ *
+ * @param data  the raw `.tkcov` file bytes
+ * @return      true iff the first 8 bytes are exactly `T K C O V 1 \0 \0`
+ * @since 0.3.0.29
+ */
+fn tkcov_magic_ok(data: str) -> bool {
+    if data.len < TKCOV_MAGIC_LEN { return false }
+    let ascii = "TKCOV1"
+    mut i: u64 = 0
+    loop {
+        if i >= ascii.len { break }
+        if data[i] != ascii[i] { return false }
+        i++
+    }
+    if (data[6] to u64) != 0 { return false }
+    if (data[7] to u64) != 0 { return false }
+    true
+}
+
+/**
+ * ids_contains — is `id` already present in `ids`? (the linear membership test backing `dedup_ids`
+ * and `count_of` — the id sets are small per test).
+ *
+ * @param ids  the id list to search
+ * @param id   the id to look for
+ * @return     true iff `id` appears in `ids`
+ * @since 0.3.0.29
+ */
+fn ids_contains(ids: []u64, id: u64) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        if ids[i] == id { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * dedup_ids — the input id list with duplicates removed (first-seen order). One test may mark the
+ * same id many times (a hot branch/line); the classifier counts a test ONCE per id, so each test's
+ * set is deduped before it feeds the cross-test tally.
+ *
+ * @param ids  the raw id list (possibly with repeats)
+ * @return     a list holding each distinct id exactly once
+ * @since 0.3.0.29
+ */
+fn dedup_ids(ids: []u64) -> []u64 {
+    mut out: []u64 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        if !ids_contains(out, ids[i]) { out = teko::list::push(out, ids[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * tkcov_ids — decode one test's isolated `.tkcov` bytes into its DEDUPED production id set: validate
+ * the magic, then read the three sections (functions, branches, lines) — each a `u64` count followed
+ * by that many `u64` ids — and merge them into one deduped list (the three id-spaces are globally
+ * disjoint, so a single merged set is exact). A bad magic or a section whose count runs past the
+ * buffer yields whatever was decoded so far, never a panic.
+ *
+ * @param data  the raw `.tkcov` file bytes for one test
+ * @return      the deduped set of ids the test covered (empty when the file is absent/corrupt/empty)
+ * @since 0.3.0.29
+ */
+fn tkcov_ids(data: str) -> []u64 {
+    if !tkcov_magic_ok(data) { return teko::list::empty() }
+    mut acc: []u64 = teko::list::empty()
+    mut off: u64 = TKCOV_MAGIC_LEN
+    mut s: u64 = 0
+    loop {
+        if s >= TKCOV_SECTIONS { break }
+        if off + TKCOV_MAGIC_LEN > data.len { break }
+        let n = read_u64_le(data, off)
+        off = off + TKCOV_MAGIC_LEN
+        mut k: u64 = 0
+        loop {
+            if k >= n { break }
+            if off + TKCOV_MAGIC_LEN > data.len { break }
+            acc = teko::list::push(acc, read_u64_le(data, off))
+            off = off + TKCOV_MAGIC_LEN
+            k++
+        }
+        s++
+    }
+    dedup_ids(acc)
+}
+
+/**
+ * concat_ids — append every element of `b` onto `a` (list concat over `u64`). Used to fold every
+ * test's deduped ids into the one cross-test multiset `all_ids_of` builds.
+ *
+ * @param a  the accumulator list
+ * @param b  the list whose elements are appended
+ * @return   `a` followed by `b`
+ * @since 0.3.0.29
+ */
+fn concat_ids(a: []u64, b: []u64) -> []u64 {
+    mut out = a
+    mut i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = teko::list::push(out, b[i])
+        i++
+    }
+    out
+}
+
+/**
+ * all_ids_of — the cross-test MULTISET: every record's deduped ids concatenated. Because each test's
+ * ids are already deduped, `count_of(all, id)` over this multiset equals the number of DISTINCT tests
+ * that cover `id` — exactly the signal the REDUNDANT test needs.
+ *
+ * @param recs  the per-test records
+ * @return      the concatenation of every record's ids
+ * @since 0.3.0.29
+ */
+fn all_ids_of(recs: []TestRecord) -> []u64 {
+    mut acc: []u64 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= recs.len { break }
+        acc = concat_ids(acc, recs[i].ids)
+        i++
+    }
+    acc
+}
+
+/**
+ * count_of — how many times `id` occurs in the cross-test multiset `all_ids` — i.e. how many distinct
+ * tests cover `id`.
+ *
+ * @param all_ids  the multiset from `all_ids_of`
+ * @param id       the production id to tally
+ * @return         the number of tests covering `id`
+ * @since 0.3.0.29
+ */
+fn count_of(all_ids: []u64, id: u64) -> u64 {
+    mut c: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= all_ids.len { break }
+        if all_ids[i] == id { c = c + 1 }
+        i++
+    }
+    c
+}
+
+/**
+ * classify_test — the analyzer verdict for one test given the cross-test multiset. STALE when it
+ * covers no id at all; LIVE when it uniquely covers at least one id (some id has fewer than
+ * `REDUNDANT_MIN` covering tests); REDUNDANT when every id it covers is also covered elsewhere.
+ *
+ * @param ids      this test's deduped id set
+ * @param all_ids  the cross-test multiset (`all_ids_of`)
+ * @return         `Verdict::Stale`, `Verdict::Live`, or `Verdict::Redundant`
+ * @since 0.3.0.29
+ */
+fn classify_test(ids: []u64, all_ids: []u64) -> Verdict {
+    if ids.len == 0 { return Verdict::Stale }
+    mut i: u64 = 0
+    loop {
+        if i >= ids.len { break }
+        if count_of(all_ids, ids[i]) < REDUNDANT_MIN { return Verdict::Live }
+        i++
+    }
+    Verdict::Redundant
+}
+
+/** analyzer_header_line — the report's first line: the advisory banner. (0.3.0.29) */
+fn analyzer_header_line() -> str { "teko: test analyzer (dev-time; ADVISORY — removal is manual)" }
+
+/** analyzer_caveat_line — the report's second line: the REDUNDANT-but-still-a-localizer caveat. A
+    REDUNDANT backend golden-vector may still be the SOLE localizer of a specific bug; a human, not the
+    tool, decides whether to remove it. (0.3.0.29) */
+fn analyzer_caveat_line() -> str { "teko: caveat — a REDUNDANT test may still be a sole localizer (diagnostic value); a human decides" }
+
+/** analyzer_fold_line — the report's third line: the assertion-fold caveat. MISLEADING flags a test
+    whose assertion folded to a constant yet still covers production (a green test that guards nothing —
+    a class pure coverage counting cannot detect); FOUNDATIONAL flags a test whose assertions all fold
+    (it tests the language/fold foundation, e.g. `1+1==2`). (0.3.0.29) */
+fn analyzer_fold_line() -> str { "teko: note — MISLEADING = assertion folded-to-constant yet covers production (invisible to coverage); FOUNDATIONAL = tests the foundation (e.g. 1+1)" }
+
+/**
+ * analyzer_line — one per-test report line:
+ * `analyzer <label> ids=<n> asserts=<total>/<folded> status=<...>`.
+ *
+ * @param label   the test's `namespace::name` (or bare `name`) label
+ * @param n       the number of ids the test covered
+ * @param total   the number of bool assertions the test makes
+ * @param folded  how many of those assertions fold to a comptime constant
+ * @param s       the combined status
+ * @return        the formatted, greppable line
+ * @since 0.3.0.29
+ */
+fn analyzer_line(label: str, n: u64, total: u64, folded: u64, s: Status) -> str {
+    let st = status_text(s)
+    $"analyzer {label} ids={n} asserts={total}/{folded} status={st}"
+}
+
+/**
+ * StatusTally — the per-status counts accumulated across the report (0.3.0.29 Crumb 4), so the summary
+ * footer can be a single pure fold over the records.
+ */
+type StatusTally = struct {
+    /** count of MISLEADING tests. */
+    misleading: u64
+    /** count of FOUNDATIONAL tests. */
+    foundational: u64
+    /** count of DEAD tests. */
+    dead: u64
+    /** count of REDUNDANT tests. */
+    redundant: u64
+    /** count of LIVE tests. */
+    live: u64
+}
+
+/** tally_empty — the zero `StatusTally`. (0.3.0.29) */
+fn tally_empty() -> StatusTally { StatusTally { misleading = 0; foundational = 0; dead = 0; redundant = 0; live = 0 } }
+
+/**
+ * tally_add — increment the count for `s` in `t`.
+ *
+ * @param t  the running tally
+ * @param s  the status to increment
+ * @return   `t` with `s`'s count raised by one
+ * @since 0.3.0.29
+ */
+fn tally_add(t: StatusTally, s: Status) -> StatusTally {
+    match s {
+        Status::Misleading => StatusTally { misleading = t.misleading + 1; foundational = t.foundational; dead = t.dead; redundant = t.redundant; live = t.live }
+        Status::Foundational => StatusTally { misleading = t.misleading; foundational = t.foundational + 1; dead = t.dead; redundant = t.redundant; live = t.live }
+        Status::Dead => StatusTally { misleading = t.misleading; foundational = t.foundational; dead = t.dead + 1; redundant = t.redundant; live = t.live }
+        Status::Redundant => StatusTally { misleading = t.misleading; foundational = t.foundational; dead = t.dead; redundant = t.redundant + 1; live = t.live }
+        Status::Live => StatusTally { misleading = t.misleading; foundational = t.foundational; dead = t.dead; redundant = t.redundant; live = t.live + 1 }
+    }
+}
+
+/**
+ * analyzer_summary_line — the report footer: the per-status counts and their total.
+ *
+ * @param t  the accumulated status tally
+ * @return   the formatted summary line
+ * @since 0.3.0.29
+ */
+fn analyzer_summary_line(t: StatusTally) -> str {
+    let total = t.misleading + t.foundational + t.dead + t.redundant + t.live
+    $"analyzer: {t.misleading} MISLEADING, {t.foundational} FOUNDATIONAL, {t.dead} DEAD, {t.redundant} REDUNDANT, {t.live} LIVE (total {total})"
+}
+
+/**
+ * analyzer_report — the WHOLE analyzer report as one string: the three-line header, one
+ * `analyzer_line` per record (the coverage-set axis crossed with the assertion-fold axis into a
+ * combined `Status`), then the summary footer. Pure — the driver builds `recs` from the decoded
+ * `.tkcov` files plus `checker::test_assert_stats` and hands them here.
+ *
+ * @param recs  the per-test records (label + deduped ids + assertion tally)
+ * @return      the complete, newline-terminated report text
+ * @since 0.3.0.29
+ */
+fn analyzer_report(recs: []TestRecord) -> str {
+    let all = all_ids_of(recs)
+    mut out = teko::str::concat(analyzer_header_line(), "\n", analyzer_caveat_line(), "\n", analyzer_fold_line(), "\n")
+    mut tally = tally_empty()
+    mut i: u64 = 0
+    loop {
+        if i >= recs.len { break }
+        let r = recs[i]
+        let cov = classify_test(r.ids, all)
+        let s = combined_status(cov, r.asserts_total, r.asserts_folded)
+        out = teko::str::concat(out, analyzer_line(r.label, r.ids.len, r.asserts_total, r.asserts_folded, s), "\n")
+        tally = tally_add(tally, s)
+        i++
+    }
+    teko::str::concat(out, analyzer_summary_line(tally), "\n")
+}
+
+/**
+ * analyze_records_of — read every `#test`'s isolated `.tkcov` under `adir` and decode it into a
+ * `TestRecord`. The dump file is named by the test's `prog.items` index (the id the analyze harness
+ * baked into its path), so the order here matches the harness's run order. A missing/corrupt file
+ * decodes (via `tkcov_ids`) to an empty id set ⇒ STALE, so a test that never dumped is still reported.
+ *
+ * @param prog  the checked program whose `#test` items were run
+ * @param adir  the scratch directory the analyze binary wrote `<idx>.tkcov` files into
+ * @return      one `TestRecord` per `#test`, in `prog.items` order
+ * @since 0.3.0.29
+ */
+fn analyze_records_of(prog: checker::TProgram, adir: str) -> []TestRecord {
+    mut recs: []TestRecord = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.is_test {
+                    let path = $"{adir}/{i}.tkcov"
+                    let data = match teko::io::read_file(path) { str as s => s; error => "" }
+                    let stats = checker::test_assert_stats(f)
+                    recs = teko::list::push(recs, TestRecord { label = test_label(f); ids = tkcov_ids(data); asserts_total = stats.total; asserts_folded = stats.folded })
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    recs
+}
+
+/**
+ * run_analyzer — the `teko test . --analyzer` body (0.3.0.29): compile the ANALYZE-mode test gate
+ * ONCE, run it ONCE (each `#test` writes its own `<idx>.tkcov` under the scratch dir), then decode
+ * every per-test id set and print the stale/redundant/live report. One compile + one run answers the
+ * whole-suite question — no per-test recompile. Dev-time only, advisory: it prints and returns 0
+ * (a passing gate already ran first); it never fails the build on a verdict.
+ *
+ * @param dir  the project directory (diagnostics)
+ * @param fe   the already-assembled front-end product (checked program + manifest)
+ * @return     0 on success, else the failing status (emit/cc/run error)
+ * @since 0.3.0.29
+ */
+fn run_analyzer(dir: str, fe: Frontend) -> i32 {
+    let od = strip_trailing_slash("bin")
+    match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the analyzer output directory"); null => { } }
+    let stem = teko::str::concat(fe.manifest.name, "-tkanalyze")
+    let cfile = teko::str::concat(od, "/", stem, ".c")
+    let binp = teko::str::concat(od, "/", stem)
+    let emitted = match codegen::tk_emit_c_test_analyze(fe.prog) { str as s => s; error as e => return fail(dir, e.message) }
+    let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(fe.manifest.name, fe.manifest.version, fe.manifest.suffix, fe.manifest.description))
+    match teko::io::write_file(cfile, csrc) { error as e => return fail(dir, e.message); null => { } }
+    if run_cc(cfile, binp, fe.manifest, fe.prog, 0) != 0 { return fail(dir, "cc failed to build the analyzer test gate") }
+    let adir = teko::str::concat(od, "/analyze")
+    match teko::fs::mkdir(adir) { error => return fail(dir, "cannot create the analyzer scratch directory"); null => { } }
+    match teko::env::set_var("TEKO_ANALYZE_DIR", adir) { error => { }; null => { } }
+    let arc = teko::process::run(teko::list::push(teko::list::empty(), binp))
+    if arc != 0 { return arc }
+    teko::io::print(analyzer_report(analyze_records_of(fe.prog, adir)))
+    0
+}
+
+/**
+ * One test's coverage attribution: the label of the `#test` and the percentage of the WHOLE
+ * production surface (functions / lines / branches) that this single test exercised on its own.
+ * Emitted one row per test by `--per-test-cov` (owner ruling 0.3.0.29 — the T2 lever): a dev-time
+ * tool to prove which tests are redundant or subsumed by another.
+ */
+type PerTestCoverage = struct {
+    /**
+     * The test's label — `namespace::name`, or the bare `name` when the test has no namespace.
+     */
+    label: str
+    /**
+     * The percentage of production functions this test alone executed (against the whole surface).
+     */
+    functions: u64
+    /**
+     * The percentage of production executable lines this test alone hit (against the whole surface).
+     */
+    lines: u64
+    /**
+     * The percentage of production branch outcomes this test alone took (against the whole surface).
+     */
+    branches: u64
+}
+
+/**
+ * The label of a `#test` function — `namespace::name`, or the bare `name` when it has no namespace.
+ * Matches the label the native gate prints for the test (`emit_test_call`), so a per-test row is
+ * traceable to its `test <label> ... ok` line.
+ *
+ * @param f  the `#test` function
+ * @return   the human label used in the per-test report
+ */
+fn test_label(f: checker::TFunction) -> str {
+    if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
+}
+
+/**
+ * Format ONE per-test attribution row as a single stable, machine-parseable line (no trailing
+ * newline). The shape is `per-test-cov <label> functions=<f>% lines=<l>% branches=<b>%` — the
+ * fields the T2 investigation greps to rank tests by marginal coverage.
+ *
+ * @param r  the per-test coverage row
+ * @return   the formatted line (no trailing newline)
+ */
+fn per_test_cov_row_str(r: PerTestCoverage) -> str {
+    $"per-test-cov {r.label} functions={r.functions}% lines={r.lines}% branches={r.branches}%"
+}
+
+/**
+ * Format the full per-test attribution report: a fixed header line followed by one
+ * `per_test_cov_row_str` line per test, each newline-terminated. The header is
+ * `teko: per-test coverage attribution`; an empty `rows` yields the header alone.
+ *
+ * @param rows  the per-test coverage rows, in test order
+ * @return      the complete report text (header + one line per row), newline-terminated throughout
+ */
+fn per_test_cov_report_str(rows: []PerTestCoverage) -> str {
+    mut out = teko::str::concat("teko: per-test coverage attribution", "\n")
+    mut i: u64 = 0
+    loop {
+        if i >= rows.len { break }
+        out = teko::str::concat(out, per_test_cov_row_str(rows[i]), "\n")
+        i = i + 1
+    }
+    out
+}
+
+/**
+ * The program reduced to its production items plus EXACTLY ONE `#test` (the one at `keep_idx`): every
+ * non-test item is kept in order, every OTHER `#test` is dropped. Emitting + measuring this program
+ * attributes the run's coverage to that single test. The kept test's own body is excluded from the
+ * production coverage surface exactly as `line_coverage`/`branch_coverage` already exclude `#test`
+ * functions, so the reported percentages measure only PRODUCTION code the test reached.
+ *
+ * @param prog      the full checked program (production items + every `#test`)
+ * @param keep_idx  the `prog.items` index of the single `#test` to retain
+ * @return          the program with only production items and the one kept test
+ */
+fn keep_single_test(prog: checker::TProgram, keep_idx: u64) -> checker::TProgram {
+    mut kept: []checker::TItem = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        mut drop = false
+        match prog.items[i] {
+            checker::TFunction as f => { if f.is_test && i != keep_idx { drop = true } }
+            _ => { }
+        }
+        if !drop { kept = teko::list::push(kept, prog.items[i]) }
+        i = i + 1
+    }
+    checker::TProgram { items = kept }
+}
+
+/**
+ * Emit, compile and RUN the coverage-instrumented test binary for `filtered` (a single-test program
+ * from `keep_single_test`), then attribute its coverage to THIS process's sinks: reset the three
+ * sinks, then merge the child's dumped `.tkcov`. On return the in-process coverage sinks hold ONLY
+ * this test's marks, so `coverage::*_pct(filtered)` reads its per-test attribution. Reuses the same
+ * native-gate machinery (`codegen::tk_emit_c_test` + `run_cc` + `teko::process::run` + `cov_merge`)
+ * as the aggregate gate; the only difference is the single-test program and the pre-merge reset.
+ *
+ * @param dir       the project directory (for diagnostics)
+ * @param out_dir   the scratch output directory (the per-test TU + binary + `.tkcov` land here)
+ * @param filtered  the single-test program to instrument (production items + one `#test`)
+ * @param m         the resolved manifest (name/version drive the emitted metadata)
+ * @param stem      the output artifact stem (shared across tests — each run overwrites the scratch)
+ * @return          0 on success (sinks now hold this test's coverage), else the failing status
+ * @throws          when the scratch dir/emit/cc fails, or the child test process exits non-zero
+ */
+fn run_one_test_cov(dir: str, out_dir: str, filtered: checker::TProgram, m: Manifest, stem: str) -> i32 {
+    let od = strip_trailing_slash(out_dir)
+    match teko::fs::mkdir(od) { error => return fail(dir, "cannot create the output directory"); null => { } }
+    let cfile = teko::str::concat(od, "/", stem, ".c")
+    let binp = teko::str::concat(od, "/", stem)
+    let covfile = teko::str::concat(od, "/", stem, ".tkcov")
+    let emitted = match codegen::tk_emit_c_test(filtered, true) { str as s => s; error as e => return fail(dir, e.message) }
+    let csrc = teko::str::concat(emitted, codegen::tk_emit_meta(m.name, m.version, m.suffix, m.description))
+    match teko::io::write_file(cfile, csrc) { error as e => return fail(dir, e.message); null => { } }
+    if run_cc(cfile, binp, m, filtered, 0) != 0 { return fail(dir, "cc failed to build the per-test coverage gate") }
+    match teko::env::set_var("TEKO_TKCOV", covfile) { error => { }; null => { } }
+    let argv = teko::list::push(teko::list::empty(), binp)
+    let trc = teko::process::run(argv)
+    if trc != 0 { return trc }
+    teko::cov_reset()
+    teko::cov_branch_reset()
+    teko::cov_line_reset()
+    coverage::cov_merge(covfile)
+    0
+}
+
+/**
+ * run_per_test_cov — the `teko test --per-test-cov` body (owner ruling 0.3.0.29 — the T2 lever). For
+ * EACH `#test` in `fe.prog`, build the single-test program (`keep_single_test`), run it under coverage
+ * in isolation (`run_one_test_cov` — reset sinks then merge only that test), read the three attributed
+ * percentages off the now-isolated sinks, and collect a `PerTestCoverage` row. Finally print the full
+ * report (`per_test_cov_report_str`). DEV-TIME only: it recompiles one test binary per test, so it is
+ * deliberately opt-in and never runs in the default gate. It also leaves the in-process sinks holding
+ * the LAST test's marks (harmless — it runs after the aggregate floor policy, at the end of the run).
+ *
+ * @param dir  the project directory (for diagnostics)
+ * @param fe   the assembled front-end product (checked program WITH the `.tkt` tests + manifest)
+ * @return     0 when every per-test run succeeds and the report prints, else the failing status
+ */
+fn run_per_test_cov(dir: str, fe: Frontend) -> i32 {
+    mut rows: []PerTestCoverage = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= fe.prog.items.len { break }
+        match fe.prog.items[i] {
+            checker::TFunction as f => {
+                if f.is_test {
+                    let filtered = keep_single_test(fe.prog, i)
+                    let rc = run_one_test_cov(dir, "bin", filtered, fe.manifest, teko::str::concat(fe.manifest.name, "-pertest"))
+                    if rc != 0 { return rc }
+                    rows = teko::list::push(rows, PerTestCoverage { label = test_label(f); functions = coverage::coverage_pct(filtered); lines = coverage::line_coverage_pct(filtered); branches = coverage::branch_coverage_pct(filtered) })
+                }
+            }
+            _ => { }
+        }
+        i = i + 1
+    }
+    teko::io::print(per_test_cov_report_str(rows))
+    0
+}
+
+/**
+ * The changed lines of ONE source file since a git base — the file path (as git reports it,
+ * repo-relative) plus the new-side line numbers that the diff ADDED or replaced. The unit the
+ * per-commit delta gate attributes coverage to (owner ruling 0.3.0.29: "código vivo prova a si
+ * mesmo; congelado sai da conta" — only the lines a commit touched count toward its delta).
+ */
+type ChangedFile = struct {
+    /**
+     * The changed file's path exactly as `git diff` reports it (repo-relative, `b/`-prefix stripped).
+     */
+    path: str
+    /**
+     * The new-side (post-change) 1-based source line numbers this diff added or replaced, in order.
+     */
+    lines: []u32
+}
+
+/**
+ * The whole set of source lines changed since a git base — one `ChangedFile` per touched `.tks`
+ * file. Produced by `changed_line_set` from a `git diff <base>...HEAD` and consulted by
+ * `changed_contains` when attributing coverage to only the changed lines (the delta metric).
+ */
+type ChangedLines = struct {
+    /**
+     * The changed `.tks` files, each with its added/replaced new-side line numbers.
+     */
+    files: []ChangedFile
+}
+
+/**
+ * One executable production line as the coverage report saw it: its source file, its 1-based line
+ * number, and whether the run hit it. Parsed out of the Cobertura report (`cov_lines_from_cobertura`)
+ * so the delta attribution reuses the SAME executable-line surface and hit marks the coverage floors
+ * read — the delta is a projection of the aggregate coverage onto the changed lines.
+ */
+type CovLine = struct {
+    /**
+     * The source file the line belongs to (the Cobertura `<class filename=…>` of its function).
+     */
+    file: str
+    /**
+     * The 1-based source line number.
+     */
+    line: u32
+    /**
+     * Whether the aggregate run executed this line at least once (Cobertura `hits` &gt; 0).
+     */
+    hit: bool
+}
+
+/**
+ * A delta-coverage count — covered / total over the CHANGED executable lines only. `delta_pct`
+ * rounds down; an empty denominator (nothing executable changed) is vacuously 100% — a commit that
+ * touched no measurable code has nothing to prove, so the gate never blocks it.
+ */
+type DeltaCoverage = struct {
+    /**
+     * The number of changed executable lines the run covered (numerator).
+     */
+    cov: u64
+    /**
+     * The total number of changed executable lines (denominator).
+     */
+    val: u64
+}
+
+/**
+ * The value of the `--per-commit-test <base>` flag — the git ref/sha to diff against — or "" when
+ * the flag is absent (the no-op default: `teko test` behaves exactly as before, zero added cost).
+ * A DEV+CI knob (owner ruling 0.3.0.29 — the delta-coverage enforcer): with `--cov-validation` also
+ * present a below-floor delta FAILS the gate, otherwise it only warns (consistent with #19's
+ * default-non-blocking floor policy).
+ *
+ * @param args  the full CLI argument vector
+ * @return      the git base immediately following `--per-commit-test`, or "" when the flag is absent
+ */
+fn per_commit_base_of(args: []str) -> str {
+    mut i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if args[i] == "--per-commit-test" {
+            if i + 1 < args.len { return args[i + 1] }
+            return ""
+        }
+        i = i + 1
+    }
+    ""
+}
+
+/**
+ * Does `s` begin with the byte sequence `p`? A local byte-level prefix test (there is no
+ * `teko::str::starts_with` builtin — only `ends_with`/`contains`), used throughout the unified-diff
+ * parser to classify each diff line by its leading marker.
+ *
+ * @param s  the string to test
+ * @param p  the required prefix
+ * @return   true iff `s` starts with `p`
+ */
+fn bp_prefix(s: str, p: str) -> bool {
+    if s.len < p.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i >= p.len { break }
+        if s[i] != p[i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+/**
+ * Split `text` into lines on the `\n` byte, dropping the terminators; a trailing non-newline segment
+ * is its own line and a trailing newline yields no empty final line. Kept local (rather than reaching
+ * for `teko::iter::split_lines`) so the diff/Cobertura parsers stay self-contained within the build
+ * namespace and directly unit-testable.
+ *
+ * @param text  the text to break into lines
+ * @return      the lines in order, without their line terminators
+ */
+fn bp_lines(text: str) -> []str {
+    mut out: []str = teko::list::empty()
+    mut start: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= text.len { break }
+        if text[i] == b'\n' {
+            out = teko::list::push(out, teko::str::slice(text, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < text.len { out = teko::list::push(out, teko::str::slice_from(text, start)) }
+    out
+}
+
+/**
+ * The first index of `needle` in `s`, or -1 when absent — a forward substring search (the only
+ * builtin, `last_index_of`, searches from the END). Backs the Cobertura attribute extractor.
+ *
+ * @param s       the haystack
+ * @param needle  the substring to locate (an empty needle matches at 0)
+ * @return        the 0-based index of the first occurrence, or -1 when `needle` does not occur
+ */
+fn bp_find(s: str, needle: str) -> i64 {
+    if needle.len == 0 { return 0 }
+    if s.len < needle.len { return -1 }
+    mut i: u64 = 0
+    let last = s.len - needle.len
+    loop {
+        if i > last { break }
+        if bp_prefix(teko::str::slice_from(s, i), needle) { return i to i64 }
+        i = i + 1
+    }
+    -1
+}
+
+/**
+ * The leading run of decimal digits of `s` as a u64 (0 when `s` does not start with a digit). Parses
+ * the small integers the diff hunk header and Cobertura attributes carry.
+ *
+ * @param s  the string whose leading digit run is read
+ * @return   the parsed non-negative integer, or 0 when there is no leading digit
+ */
+fn bp_parse_uint(s: str) -> u64 {
+    mut n: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        if c < b'0' || c > b'9' { break }
+        n = n * 10 + (c to u64) - (b'0' to u64)
+        i = i + 1
+    }
+    n
+}
+
+/**
+ * The new-side (post-change) start line of a unified-diff hunk header `@@ -a,b +c,d @@`: the integer
+ * immediately after the `+` (the `c`). 0 when the line carries no `+` group (never a valid header).
+ *
+ * @param line  the `@@ … @@` hunk header line
+ * @return      the new-side start line `c`, or 0 when the header is malformed
+ */
+fn bp_hunk_newstart(line: str) -> u32 {
+    mut i: u64 = 0
+    loop {
+        if i >= line.len { break }
+        if line[i] == b'+' { return bp_parse_uint(teko::str::slice_from(line, i + 1)) to u32 }
+        i = i + 1
+    }
+    0
+}
+
+/**
+ * The changed file's path from a unified-diff `+++ ` header line: the text after `+++ `, with a
+ * leading `b/` stripped. A `+++ /dev/null` (a pure deletion) yields "" so it registers no file.
+ *
+ * @param line  the `+++ …` header line
+ * @return      the repo-relative path, or "" for `/dev/null`
+ */
+fn bp_plusfile(line: str) -> str {
+    let rest = teko::str::slice_from(line, 4)
+    if rest == "/dev/null" { return "" }
+    if bp_prefix(rest, "b/") { return teko::str::slice_from(rest, 2) }
+    rest
+}
+
+/**
+ * Append a completed file's changed lines to the accumulator, but ONLY when it is a non-empty `.tks`
+ * file — a file with no added lines (pure deletion) or a non-Teko path contributes no delta unit, so
+ * it is dropped. Flushed by `changed_line_set` each time the diff advances to the next `+++` file.
+ *
+ * @param files  the changed-file accumulator so far
+ * @param path   the file just parsed (repo-relative)
+ * @param lines  its added/replaced new-side line numbers
+ * @return       `files` with the file appended when it is a non-empty `.tks`, else `files` unchanged
+ */
+fn cl_flush(files: []ChangedFile, path: str, lines: []u32) -> []ChangedFile {
+    if lines.len == 0 { return files }
+    if !teko::str::ends_with(path, ".tks") { return files }
+    teko::list::push(files, ChangedFile { path = path; lines = lines })
+}
+
+/**
+ * Parse a `git diff <base>...HEAD` unified diff into the set of new-side lines it changed per `.tks`
+ * file. Walks the diff line by line, tracking the current `+++` file and the running new-side line
+ * number seeded by each `@@` hunk header: an added line (`+`, not the `+++` header) records the
+ * current new-side number and advances it; a context line (leading space) advances it; a deletion
+ * (`-`, not the `---` header) and every header/metadata line leave it untouched. PURE — the git shell
+ * is elsewhere (`per_commit_diff_text`) so this is directly unit-testable on a synthetic diff.
+ *
+ * @param diff  the unified-diff text from `git diff <base>...HEAD`
+ * @return      the changed `.tks` files with their added/replaced new-side line numbers
+ */
+fn changed_line_set(diff: str) -> ChangedLines {
+    mut files: []ChangedFile = teko::list::empty()
+    mut cur_file: str = ""
+    mut cur_lines: []u32 = teko::list::empty()
+    mut newno: u32 = 0
+    let lines = bp_lines(diff)
+    mut i: u64 = 0
+    loop {
+        if i >= lines.len { break }
+        let ln = lines[i]
+        if bp_prefix(ln, "+++ ") {
+            files = cl_flush(files, cur_file, cur_lines)
+            cur_file = bp_plusfile(ln)
+            cur_lines = teko::list::empty()
+        } else if bp_prefix(ln, "@@ ") {
+            newno = bp_hunk_newstart(ln)
+        } else if bp_prefix(ln, "+") && !bp_prefix(ln, "+++") {
+            cur_lines = teko::list::push(cur_lines, newno)
+            newno = newno + 1
+        } else if bp_prefix(ln, " ") {
+            newno = newno + 1
+        }
+        i = i + 1
+    }
+    files = cl_flush(files, cur_file, cur_lines)
+    ChangedLines { files = files }
+}
+
+/**
+ * Do two source paths refer to the same file, tolerant of the repo-relative vs project-relative
+ * mismatch between what `git diff` reports (repo root) and what the checker records on a function
+ * (`f.file`, which may be project-relative)? True when they are equal or one is a path-suffix of the
+ * other (`.../src/x.tks` matches `x.tks` only across a `/` boundary, so `ax.tks` never matches `x.tks`).
+ *
+ * @param a  one path
+ * @param b  the other path
+ * @return   true iff `a` and `b` denote the same file up to a leading-directory prefix
+ */
+fn path_tail_match(a: str, b: str) -> bool {
+    if a == b { return true }
+    if teko::str::ends_with(a, teko::str::concat("/", b)) { return true }
+    if teko::str::ends_with(b, teko::str::concat("/", a)) { return true }
+    false
+}
+
+/**
+ * Was `(file, line)` changed since the base — i.e. is `line` in the changed-line set of a file that
+ * `path_tail_match`es `file`? The membership predicate the delta attribution consults per executable
+ * line. PURE and directly unit-testable against a synthetic `ChangedLines`.
+ *
+ * @param cls   the changed-line set from `changed_line_set`
+ * @param file  the executable line's source file
+ * @param line  the executable line's 1-based line number
+ * @return      true iff that file+line was added/replaced since the base
+ */
+fn changed_contains(cls: ChangedLines, file: str, line: u32) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= cls.files.len { break }
+        if path_tail_match(cls.files[i].path, file) {
+            mut j: u64 = 0
+            loop {
+                if j >= cls.files[i].lines.len { break }
+                if cls.files[i].lines[j] == line { return true }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    false
+}
+
+/**
+ * The value of a single-quoted attribute `key` on a Cobertura element line — the text between `key`
+ * (e.g. `filename='`, `number='`, `hits='`) and the next single quote. "" when the key is absent.
+ *
+ * @param s    the element line
+ * @param key  the attribute prefix including the opening quote (e.g. `hits='`)
+ * @return     the attribute value, or "" when `key` does not occur
+ */
+fn xml_attr(s: str, key: str) -> str {
+    let at = bp_find(s, key)
+    if at < 0 { return "" }
+    let start = (at to u64) + key.len
+    mut j = start
+    loop {
+        if j >= s.len { break }
+        if s[j] == b'\'' { break }
+        j = j + 1
+    }
+    teko::str::slice(s, start, j)
+}
+
+/**
+ * Parse the executable production lines (file, line, hit) out of a Cobertura report — reusing the
+ * coverage subsystem's OWN exported renderer (`coverage::cov_cobertura`) as the source of truth for
+ * "which lines are executable and were they hit", so the delta metric can never diverge from the
+ * aggregate floors. Reads the `filename` off each `<class …>` and one `CovLine` off each body
+ * `<line number=… hits=…/>`; the per-method summary `<line>` (on the `<methods>` line) is skipped so
+ * a function's declaration line is not double-counted.
+ *
+ * @param xml  the Cobertura XML from `coverage::cov_cobertura`
+ * @return     one `CovLine` per executable production line, in report order
+ */
+fn cov_lines_from_cobertura(xml: str) -> []CovLine {
+    mut out: []CovLine = teko::list::empty()
+    mut cur_file: str = ""
+    let lines = bp_lines(xml)
+    mut i: u64 = 0
+    loop {
+        if i >= lines.len { break }
+        let ln = lines[i]
+        if teko::str::contains(ln, "<class ") {
+            cur_file = xml_attr(ln, "filename='")
+        } else if teko::str::contains(ln, "<line number='") && !teko::str::contains(ln, "<methods>") {
+            let num = bp_parse_uint(xml_attr(ln, "number='")) to u32
+            let hits = bp_parse_uint(xml_attr(ln, "hits='"))
+            out = teko::list::push(out, CovLine { file = cur_file; line = num; hit = hits > 0 })
+        }
+        i = i + 1
+    }
+    out
+}
+
+/**
+ * Attribute the aggregate line coverage to ONLY the changed lines — the delta metric. Of the
+ * executable production lines (`covlines`), count those that were changed since the base
+ * (`changed_contains`) as the denominator and the changed-AND-hit ones as the numerator. PURE: given
+ * a synthetic coverage map + changed-line set it computes the delta with no git and no sinks — the
+ * function the regression exercises.
+ *
+ * @param covlines  every executable production line with its hit flag (from `cov_lines_from_cobertura`)
+ * @param cls       the lines changed since the base (from `changed_line_set`)
+ * @return          the covered/total delta over the changed executable lines
+ */
+fn delta_line_coverage(covlines: []CovLine, cls: ChangedLines) -> DeltaCoverage {
+    mut cov: u64 = 0
+    mut val: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= covlines.len { break }
+        if changed_contains(cls, covlines[i].file, covlines[i].line) {
+            val = val + 1
+            if covlines[i].hit { cov = cov + 1 }
+        }
+        i = i + 1
+    }
+    DeltaCoverage { cov = cov; val = val }
+}
+
+/**
+ * The integer percentage of a delta count, rounded down. An empty denominator (no executable line
+ * changed) is vacuously 100% — a commit that touched no measurable code has nothing to prove.
+ *
+ * @param d  the delta count
+ * @return   the delta percentage in [0, 100]
+ */
+fn delta_pct(d: DeltaCoverage) -> u64 { if d.val == 0 { 100 } else { d.cov * 100 / d.val } }
+
+/**
+ * The per-commit delta-coverage policy as a pure predicate, mirroring `coverage_floor_blocks`: a
+ * below-floor delta BLOCKS the gate only when `--cov-validation` is opted in; otherwise it warns and
+ * the gate passes (owner ruling 0.3.0.29 / #19 default-non-blocking). A delta at or above the floor
+ * never blocks regardless of the flag.
+ *
+ * @param pct             the measured delta percentage
+ * @param floor           the [coverage] lines floor the delta must meet
+ * @param cov_validation  `--cov-validation` — enforcement opted in
+ * @return                true iff the gate must FAIL (validation on AND the delta is below the floor)
+ */
+fn delta_floor_blocks(pct: u64, floor: u64, cov_validation: bool) -> bool {
+    cov_validation && pct < floor
+}
+
+/**
+ * The one-line per-commit delta-coverage report the CI log greps: the base ref, the delta percentage,
+ * and the covered/total changed-line counts.
+ *
+ * @param base  the git base the delta was measured against
+ * @param d     the measured delta count
+ * @return      the formatted report line (no trailing newline)
+ */
+fn per_commit_report_str(base: str, d: DeltaCoverage) -> str {
+    $"teko: per-commit delta coverage (base {base}): {delta_pct(d)}% ({d.cov}/{d.val}) of changed executable lines covered"
+}
+
+/**
+ * Shell `git diff <base>...HEAD -- '*.tks'` to `out_path` (stderr silenced), returning git's exit
+ * status. Uses `sh -c` because `teko::process::run` has no redirection; the three-dot form diffs
+ * against the merge-base of `<base>` and `HEAD`, restricted to Teko sources. A non-zero status means
+ * git is unavailable or `<base>` is not a valid ref — the caller degrades gracefully.
+ *
+ * @param base      the git ref/sha to diff against
+ * @param out_path  the file to capture the diff into
+ * @return          git's exit status (0 on success)
+ */
+fn run_git_diff(base: str, out_path: str) -> i32 {
+    let cmd = teko::str::concat("git diff ", base, "...HEAD -- '*.tks' > ", out_path, " 2>/dev/null")
+    mut argv: []str = teko::list::push(teko::list::empty(), "sh")
+    argv = teko::list::push(argv, "-c")
+    argv = teko::list::push(argv, cmd)
+    teko::process::run(argv)
+}
+
+/**
+ * The captured `git diff <base>...HEAD` text, or an error when git is unavailable / `<base>` is not a
+ * valid ref (so the per-commit gate can degrade gracefully rather than crash — guardrail). Captures to
+ * a scratch file next to the project root, then slurps it.
+ *
+ * @param base  the git ref/sha to diff against
+ * @return      the unified-diff text, or an error describing the git failure
+ * @throws      when the `git diff` invocation fails or the scratch file cannot be read
+ */
+fn per_commit_diff_text(base: str) -> str | error {
+    let out_path = ".teko-per-commit.diff"
+    if run_git_diff(base, out_path) != 0 {
+        return error { message = teko::str::concat("git diff ", base, "...HEAD failed (git unavailable or invalid base)") }
+    }
+    teko::io::read_file(out_path)
+}
+
+/**
+ * The `teko test --per-commit-test <base>` body (owner ruling 0.3.0.29 — the delta-coverage CI
+ * enforcer). Diff `<base>...HEAD` for changed `.tks` lines (`changed_line_set`), project the just-run
+ * aggregate coverage onto those lines (`cov_lines_from_cobertura` over `coverage::cov_cobertura` +
+ * `delta_line_coverage`), report the delta, and apply the SAME warn-vs-fail policy as the floors: with
+ * `--cov-validation` a below-floor delta FAILS (exit 1); otherwise it only warns. When git is
+ * unavailable or `<base>` is invalid the gate degrades gracefully — an honest warning, exit 0, never a
+ * crash. Runs AFTER the aggregate floor policy, so the coverage sinks already hold the run's marks.
+ *
+ * @param dir             the project directory (for the diagnostic prefix)
+ * @param fe              the assembled front-end product (checked program + manifest floors)
+ * @param base            the git ref/sha to measure the delta against
+ * @param cov_validation  `--cov-validation` — enforce (fail) rather than warn on a below-floor delta
+ * @return                0 unless `cov_validation` is set AND the delta is below the [coverage] lines floor
+ * @throws                under `cov_validation`, when the delta is below the lines floor
+ */
+fn run_per_commit_test(dir: str, fe: Frontend, base: str, cov_validation: bool) -> i32 {
+    let diff = match per_commit_diff_text(base) {
+        str as s => s
+        error => {
+            teko::io::eprintln($"teko: warning: per-commit delta coverage skipped — `git diff {base}...HEAD` unavailable")
+            return 0
+        }
+    }
+    let cls = changed_line_set(diff)
+    let covlines = cov_lines_from_cobertura(coverage::cov_cobertura(fe.prog))
+    let d = delta_line_coverage(covlines, cls)
+    teko::io::println(per_commit_report_str(base, d))
+    let pct = delta_pct(d)
+    let floor = fe.manifest.cov_lines
+    if delta_floor_blocks(pct, floor, cov_validation) {
+        return fail(dir, $"per-commit delta coverage {pct}% is below the {floor}% floor ([coverage] lines) — the lines changed since {base} are undertested")
+    }
+    if pct < floor {
+        teko::io::eprintln($"teko: warning: per-commit delta coverage {pct}% is below the {floor}% floor ([coverage] lines) — the lines changed since {base} are undertested")
+    }
+    0
+}
+
 /**
  * The `teko test <dir>` entry (D2, post-VM): assemble WITH the `.tkt` tests, then run every
  * `#test` NATIVELY via the #265 native gate (emit a test-profile C TU, compile with `run_cc`,
- * run the child fail-fast — a failed assert panics with a non-zero exit, M.1), and enforce the
- * D4 coverage floors. Unlike `teko build`, it emits NO release binary. `--coverage` writes a
- * Cobertura report to `<cwd>/cobertura.xml` (the project root — `teko test` has no `-o`).
+ * run the child fail-fast — a failed assert panics with a non-zero exit, M.1), then apply the
+ * D4 coverage-floor policy (`--cov-validation` enforces; otherwise warns — owner ruling 0.3.0.29).
+ * Unlike `teko build`, it emits NO release binary. `--coverage` writes a Cobertura report to
+ * `<cwd>/cobertura.xml` (the project root — `teko test` has no `-o`). `--per-test-cov` additionally
+ * emits the dev-time per-test attribution report (`run_per_test_cov`) AFTER the floor policy.
+ * `--per-commit-test <base>` runs the delta-coverage enforcer (`run_per_commit_test`) AFTER the floor
+ * policy — measuring coverage attributed to the lines changed since `<base>` and (under
+ * `--cov-validation`) failing when that delta is below floor; absent, it is a zero-cost no-op.
+ * When the manifest declares `[tests] regression` directories (`test_regression_dirs`), the
+ * regression phase (`run_regression_phase`) runs after the floor + delta policies and before any
+ * dev-time report; with no regression directories it is a zero-cost no-op (the 0.3.0.29 inert base).
  *
- * @param dir      the project directory (already the cwd; the front-end chdir'd in)
- * @param gen_cov  `--coverage` — write the Cobertura report next to the project root
- * @return         0 when every test passes and the floors hold, else the failing status
+ * @param dir              the project directory (already the cwd; the front-end chdir'd in)
+ * @param gen_cov          `--coverage` — write the Cobertura report next to the project root
+ * @param cov_validation   `--cov-validation` — enforce (fail) the coverage floors instead of warning
+ * @param per_test_cov     `--per-test-cov` — also print the dev-time per-test attribution report
+ * @param per_commit_base  `--per-commit-test <base>` — the git base for the delta gate ("" = no-op)
+ * @param analyzer         `--analyzer` — after the gate + floors, run the dev-time stale/redundant analyzer
+ * @return                 0 when every test passes and the floor + delta policies hold, else the failing status
  */
-fn test_project(dir: str, gen_cov: bool) -> i32 {
+fn test_project(dir: str, gen_cov: bool, cov_validation: bool, per_test_cov: bool, per_commit_base: str, analyzer: bool) -> i32 {
     ensure_rt_dir_abs()
+    let exe = self_exe_path()
     let fe = match project_frontend_sel(dir, true) { Frontend as x => x; error as e => return fail(dir, e.message) }
     let trc = run_native_gate(dir, "bin", fe.prog, fe.manifest, output_is_tty(false))
     if trc != 0 { return trc }
@@ -1998,5 +3279,17 @@ fn test_project(dir: str, gen_cov: bool) -> i32 {
         match teko::io::write_file("cobertura.xml", xml) { error as e => return fail(dir, e.message); null => { } }
         teko::io::println("teko: wrote coverage report cobertura.xml")
     }
-    coverage_gate_result(dir, fe)
+    let floor_rc = enforce_coverage_floors(dir, fe, cov_validation)
+    if floor_rc != 0 { return floor_rc }
+    if per_commit_base.len > 0 {
+        let pc = run_per_commit_test(dir, fe, per_commit_base, cov_validation)
+        if pc != 0 { return pc }
+    }
+    if fe.manifest.test_regression_dirs.len > 0 {
+        let rrc = run_regression_phase(exe, fe.manifest)
+        if rrc != 0 { return rrc }
+    }
+    if per_test_cov { return run_per_test_cov(dir, fe) }
+    if analyzer { return run_analyzer(dir, fe) }
+    0
 }

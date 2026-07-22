@@ -46,8 +46,12 @@ use teko::parser
     historical emission, so the FIXPOINT `gen2.c == gen3.c` is untouched. `TestPlain` emits a
     test-gate main that calls each `#test` in `prog.items` order (native gate, no coverage).
     `TestCov` adds the `tk_cov_*` prologue/brackets (coverage sinks) — zero-cost when unused,
-    because those calls are simply absent from the emitted C under `Program`/`TestPlain`. */
-type CgMode = enum { Program; TestPlain; TestCov }
+    because those calls are simply absent from the emitted C under `Program`/`TestPlain`.
+    `TestAnalyze` (0.3.0.29) emits the SAME production-fn instrumentation as `TestCov`, but a
+    per-test ISOLATION harness: between every `#test` it resets all three sinks, runs the test,
+    and dumps THAT test's id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov` — one compile answers the
+    whole-suite stale/redundant question (`teko test . --analyzer`). */
+type CgMode = enum { Program; TestPlain; TestCov; TestAnalyze }
 
 /**
  * CovCtx — the coverage-instrumentation context threaded through TestCov body emission (#265).
@@ -427,6 +431,27 @@ fn cg_find_variant_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl 
 // truth every codegen predicate agrees on for bare→decl resolution.
 fn cg_canon_name(prog: checker::TProgram, name: str) -> str {
     match cg_find_decl(prog, name) { parser::TypeDecl as d => d.name; error => name }
+}
+
+/**
+ * cg_canon_name_ns — the CANONICAL decl name for a syntactic type PATH, resolved in the referencing
+ * namespace `ref_ns`. A bare `Reader` written in `teko::io` binds `teko::io::Reader`, NOT a
+ * same-last-segment cousin in another namespace (`teko::emit::Reader`, the #109 collision) — so an
+ * expected-slot type built for a call arg / struct field carries the RIGHT decl, and the
+ * class->interface upcast wrap (emit_as CONTRACT slot) fires against the real contract. Falls back
+ * to the ns-agnostic canonicaliser when no ns-precise decl matches (an imported type declared in
+ * another namespace), preserving the pre-existing no-collision behavior.
+ *
+ * @param prog    the typed program
+ * @param path    the syntactic type path (its last segment names the type)
+ * @param ref_ns  the namespace the path is written in (the callee fn's / struct decl's namespace)
+ * @return        the canonical decl name, or the ns-agnostic canonicalisation on no ns-precise hit
+ */
+fn cg_canon_name_ns(prog: checker::TProgram, path: parser::Path, ref_ns: str) -> str {
+    match cg_find_decl_ns(prog, path, ref_ns) {
+        parser::TypeDecl as d => d.name
+        error => cg_canon_name(prog, path.segments[path.segments.len - 1].name)
+    }
 }
 
 // cg_named_is_variant — is the NAMED type `name` a (declared) variant? (C: `cg_named_is_variant`.)
@@ -999,6 +1024,7 @@ fn emit_type(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte |
         checker::Uptr => cb(buf, "uintptr_t")
         // (MEM-1b) Ref<T> → a bare `<T> *` today ("C pointer without `*`/`&`"; struct wrapper waits for W9+ metadata).
         checker::Reference as r => cb(match emit_type(buf, prog, r.inner) { []byte as o => o; error as e => return e }, " *")
+        checker::Null => cb(buf, "uint8_t")
     }
 }
 
@@ -1094,6 +1120,7 @@ fn cg_opt_mangle(buf: []byte, inner: checker::Type) -> []byte | error {
         checker::Char => cb(buf, "char")
         checker::Str => cb(buf, "str")
         checker::Error => cb(buf, "error")
+        checker::Null => cb(buf, "null")
         checker::Named as nm => cb_str(buf, checker::name_last_segment(nm.name))   // (#149) BARE key — the (#109 W3) canonical nm.name carries `::` (invalid C); mirror cg_opt_mangle_str and the C twin (tk_name_last_segment)
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
@@ -1131,6 +1158,7 @@ fn cg_opt_mangle_str(inner: checker::Type) -> str | error {
         checker::Char => "char"
         checker::Str => "str"
         checker::Error => "error"
+        checker::Null => "null"
         checker::Named as nm => checker::name_last_segment(nm.name)   // (#109 W3) BARE key — matches the syntactic cg_opt_mangle_texpr_str; keeps tk_u_/tk_slice_/tk_opt_ names valid C identifiers
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
@@ -2412,6 +2440,9 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             else if last == "ewrite" { builtin = "tk_ewrite"; has_builtin = true }   // (str) -> void (stderr)
             else if last == "eprint" { builtin = "tk_eprint"; has_builtin = true }   // (str) -> void (stderr)
             else if last == "eprintln" { builtin = "tk_eprintln"; has_builtin = true }   // (str) -> void (stderr + '\n')
+            else if last == "read_line" { builtin = "tk_rt_read_line"; has_builtin = true }
+            else if last == "stdin_eof" { builtin = "tk_rt_stdin_eof"; has_builtin = true }
+            else if last == "read_stdin" { builtin = "tk_rt_read_stdin"; has_builtin = true }
             else if last == "parse" { builtin = "tk_float_parse"; has_builtin = true }   // teko::float::parse(str) -> f64
             // arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns. (`div`/`rem`
             // mangle to tk_* so they never clash with libc's div/rem.)
@@ -2552,6 +2583,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
         match cf_res {
             checker::TFunction as cf => {
                 if j < cf.params.len {
+                    let cf_ref_ns = cg_fn_ref_ns(prog, cf.namespace)
                     match cf.params[j].type_ann {
                         parser::NamedType as nt => {
                             let pn = nt.path.segments[nt.path.segments.len - 1].name
@@ -2564,7 +2596,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                                 if !arg_is_ref { out = cb(out, "&") }
                                 out = match emit_expr_ctx(out, prog, ret_type, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             } else {
-                                out = match emit_as_r(out, prog, ret_type, checker::Named { name = cg_canon_name(prog, pn) }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                out = match emit_as_r(out, prog, ret_type, checker::Named { name = cg_canon_name_ns(prog, nt.path, cf_ref_ns) }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             }
                             wrapped = true
                         }
@@ -2576,7 +2608,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                         // type, which mangles identically to the param's inner (exact-match widen).
                         parser::OptionalType as ot => {
                             let inner_t = match ot.inner {
-                                parser::NamedType as int_nt => checker::Named { name = cg_canon_name(prog, int_nt.path.segments[int_nt.path.segments.len - 1].name) }
+                                parser::NamedType as int_nt => checker::Named { name = cg_canon_name_ns(prog, int_nt.path, cf_ref_ns) }
                                 _ => c.args[j].type
                             }
                             out = match emit_as_r(out, prog, ret_type, checker::Optional { inner = inner_t }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -3375,11 +3407,11 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
             mut exp_t: checker::Type = checker::Void { }
             match fte_opt {
                 parser::TypeExpr as fte => match fte {
-                    parser::NamedType as nt => { exp_t = checker::Named { name = cg_canon_name(prog, nt.path.segments[nt.path.segments.len - 1].name) } }
+                    parser::NamedType as nt => { exp_t = checker::Named { name = cg_canon_name_ns(prog, nt.path, checker::name_qualifier(name)) } }
                     parser::SliceType as st => match st.element {
                         parser::NamedType as ent => {
                             let elem = ent.path.segments[ent.path.segments.len - 1].name
-                            if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name(prog, elem) } } }
+                            if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name_ns(prog, ent.path, checker::name_qualifier(name)) } } }
                         }
                         parser::OptionalType => { exp_t = cg_slice_param_type(prog, st, fv.type) }
                         _ => { }
@@ -3387,7 +3419,7 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
                     // a present value into a `T?` field (T named) → emit_as wraps T → T?
                     // ({ .present = true, .value = … }). (A bare `null` is the sentinel branch above.)
                     parser::OptionalType as ot => match ot.inner {
-                        parser::NamedType as inner_nt => { exp_t = checker::Optional { inner = checker::Named { name = cg_canon_name(prog, inner_nt.path.segments[inner_nt.path.segments.len - 1].name) } } }
+                        parser::NamedType as inner_nt => { exp_t = checker::Optional { inner = checker::Named { name = cg_canon_name_ns(prog, inner_nt.path, checker::name_qualifier(name)) } } }
                         _ => { }
                     }
                     _ => { }
@@ -4680,9 +4712,17 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
             out = cb_upper(out, ck)
             cb(out, ")")
         }
-        // A `null` pattern reaches here only over a NON-optional subject (the optional case is
-        // handled by cg_emit_pat_test's `.present` test) — the checker rejects that.
-        parser::NullPattern => error { message = "codegen: `null` pattern over a non-optional subject (internal)" }
+        parser::NullPattern => {
+            if cg_var_reaches(prog, variantT, "null", 16) {
+                mut out = cb(buf, "(")
+                out = cb(out, subj)
+                out = cb(out, ".tag == ")
+                out = match cg_emit_tag_prefix(out, variantT) { []byte as o => o; error as err => return err }
+                out = cb_upper(out, "null")
+                return cb(out, ")")
+            }
+            error { message = "codegen: `null` pattern over a non-optional subject (internal)" }
+        }
     }
 }
 
@@ -5440,7 +5480,10 @@ fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
         // null / ?. / ?? — the OPTIONAL value model (REBOOT_PLAN §202/§203; tk_opt_<inner>).
         // A bare `null` in raw expression position has the SENTINEL optional type: it cannot be
         // emitted alone — its concrete type comes from the destination slot via emit_as.
-        checker::TNullLit => error { message = "codegen: a bare `null` needs a known optional type from context (use it where a `T?` is expected)" }
+        checker::TNullLit => match e.type {
+            checker::Null => cb(buf, "0")
+            _ => error { message = "codegen: a bare `null` needs a known optional type from context (use it where a `T?` is expected)" }
+        }
         checker::TSafeFieldAccess as sfa => emit_safe_field_access(buf, prog, e, sfa, escaping, regions, fn_body, dctx)
         checker::TCoalesce as co => emit_coalesce(buf, prog, e, co, escaping, regions, fn_body, dctx)
         checker::TIndex as ix => emit_index(buf, prog, e, ix, escaping, regions, fn_body, dctx)   // W5-idx — subscript recv[index] (str + slice, bounds-checked)
@@ -6032,7 +6075,118 @@ fn emit_assign_lvalue(buf: []byte, prog: checker::TProgram, a: checker::TAssign)
     }
 }
 
+/**
+ * emit_index_assign — a slice element store `ids[i] op= v` (`AssignKind::Index`). Captures the
+ * receiver slice and the index into single-eval temps, bounds-checks the index against `.len` (the
+ * SAME positioned `tk_panic_oob_at` as a read subscript), then writes the element in place through
+ * the shared `{ptr,len}` buffer. A shift-assign (`<<=`/`>>=`) routes through the width-masked
+ * `tk_shl_/tk_shr_` runtime helper — matching the bare `<<`/`>>` operator and the VM — instead of the
+ * UB-prone C compound shift; every other op emits the plain C compound store.
+ *
+ * @param buf       the output buffer
+ * @param prog      the typed program (type/name lowering)
+ * @param ret_type  the enclosing function's return type (threaded to `emit_as_r`)
+ * @param a         the typed index assignment (`a.target` is the typed `TIndex` LHS)
+ * @param indent    the current statement indent
+ * @param escaping  the frame's escaping-name set (threaded to child expr emission)
+ * @param regions   the active region frames
+ * @param fn_body   the enclosing function body (escape context)
+ * @param dctx      the defer context
+ * @return          the buffer with the element-store block appended, or a codegen error
+ * @throws          when the target is not a slice index, its element type is unsupported, or a child
+ *                  expression fails to emit
+ */
+fn emit_index_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let ix = match a.target.kind { checker::TIndex as ti => ti; _ => return error { message = "codegen: index-assign target is not a subscript (internal)" } }
+    let elem = match ix.receiver.type { checker::Slice as sl => sl.element; _ => return error { message = "codegen: index-assign receiver is not a slice (internal)" } }
+    let wstmp = $"_ws{buf.len}"
+    let witmp = $"_wi{buf.len + 1}"
+    mut out = cb(buf, indent)
+    out = cb(out, "{ ")
+    out = match emit_type(out, prog, ix.receiver.type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, wstmp)
+    out = cb(out, " = (")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, ix.receiver, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "); uint64_t ")
+    out = cb(out, witmp)
+    out = cb(out, " = (uint64_t)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, ix.index, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "); if (")
+    out = cb(out, witmp)
+    out = cb(out, " < ")
+    out = cb(out, wstmp)
+    out = cb(out, ".len) { ")
+    out = match emit_index_store_body(out, prog, ret_type, a, wstmp, witmp, elem, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, " } else { tk_panic_oob_at(")
+    out = cb(out, teko::u64_to_str(a.target.line to u64))
+    out = cb(out, ", ")
+    out = cb(out, teko::u64_to_str(a.target.col to u64))
+    cb(out, "); }\n }\n")
+}
+
+/**
+ * emit_index_store_body — the in-bounds element write of `emit_index_assign`: `<slot> op= <value>`,
+ * where `<slot>` is `<wstmp>.ptr[<witmp>]` (both already single-eval temps, so re-emitting the slot
+ * for a shift-assign is free) and `<value>` is wrapped into the element type via `emit_as_r`.
+ *
+ * @param buf       the output buffer
+ * @param prog      the typed program
+ * @param ret_type  the enclosing function's return type (threaded to `emit_as_r`)
+ * @param a         the typed index assignment (for its op + value)
+ * @param wstmp     the captured-slice temp name
+ * @param witmp     the captured-index temp name
+ * @param elem      the slice element type (the store's declared `bound`)
+ * @param escaping  the frame's escaping-name set
+ * @param regions   the active region frames
+ * @param fn_body   the enclosing function body
+ * @param dctx      the defer context
+ * @return          the buffer with the element store appended, or a codegen error
+ * @throws          when a shift-assign targets a non-integer element, or a child expression fails to emit
+ */
+fn emit_index_store_body(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, wstmp: str, witmp: str, elem: checker::Type, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    if a.op == lexer::TokenKind::ShlEq || a.op == lexer::TokenKind::ShrEq {
+        let prim = match elem { checker::Prim as p => p; _ => return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        if !cg_prim_is_int(prim.kind) { return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        let tag = match prim_int_tag(prim.kind) { str as t => t; error => return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        let fn_prefix = if a.op == lexer::TokenKind::ShlEq { "tk_shl_" } else { "tk_shr_" }
+        mut so = emit_index_slot(buf, wstmp, witmp)
+        so = cb(so, " = ")
+        so = cb(so, fn_prefix)
+        so = cb(so, tag)
+        so = cb(so, "(")
+        so = emit_index_slot(so, wstmp, witmp)
+        so = cb(so, ", ")
+        so = match emit_expr_ctx(so, prog, checker::Void { }, a.value, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        return cb(so, ");")
+    }
+    let op = match assignop_c(a.op) { str as s => s; error as err => return err }
+    mut out = emit_index_slot(buf, wstmp, witmp)
+    out = cb(out, " ")
+    out = cb(out, op)
+    out = cb(out, " ")
+    out = match emit_as_r(out, prog, ret_type, elem, a.value, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    cb(out, ";")
+}
+
+/**
+ * emit_index_slot — the C lvalue text `<wstmp>.ptr[<witmp>]` for a captured slice/index temp pair.
+ *
+ * @param buf    the output buffer
+ * @param wstmp  the captured-slice temp name
+ * @param witmp  the captured-index temp name
+ * @return       the buffer with the element lvalue appended
+ */
+fn emit_index_slot(buf: []byte, wstmp: str, witmp: str) -> []byte {
+    mut out = cb(buf, wstmp)
+    out = cb(out, ".ptr[")
+    out = cb(out, witmp)
+    cb(out, "]")
+}
+
 fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let is_index = match a.kind { parser::AssignKind::Index => true; _ => false }
+    if is_index { return emit_index_assign(buf, prog, ret_type, a, indent, escaping, regions, fn_body, dctx) }
     let op = match assignop_c(a.op) { str as s => s; error as err => return err }
     mut out = cb(buf, indent)
     // (S2 Level-1) SELF-APPEND to a non-escaping slice → route the grown buffer to the frame region
@@ -6395,7 +6549,7 @@ fn stmt_cov_lines(s: checker::TStatement) -> []u32 {
         checker::TBinding as b => cov_collect_expr(b.value, acc)
         checker::TAssign as a => {
             let av = cov_collect_expr(a.value, acc)
-            match a.kind { parser::AssignKind::Field => cov_collect_expr(a.target, av); _ => av }
+            if parser::assign_has_target(a.kind) { cov_collect_expr(a.target, av) } else { av }
         }
         checker::TReturn as r => if r.has_value { cov_collect_expr(r.value, acc) } else { acc }
         checker::TExprStmt as es => cov_collect_expr(es.expr, acc)
@@ -6629,7 +6783,7 @@ fn cg_block_calls_self(stmts: []checker::TStatement, ns: str, name: str) -> bool
         if i >= stmts.len { break }
         match stmts[i] {
             checker::TBinding as b => if cg_expr_calls_self(b.value, ns, name) { return true }
-            checker::TAssign as a => { if cg_expr_calls_self(a.value, ns, name) { return true }; match a.kind { parser::AssignKind::Field => if cg_expr_calls_self(a.target, ns, name) { return true }; _ => { } } }
+            checker::TAssign as a => { if cg_expr_calls_self(a.value, ns, name) { return true }; if parser::assign_has_target(a.kind) { if cg_expr_calls_self(a.target, ns, name) { return true } } }
             checker::TReturn as r => if r.has_value && cg_expr_calls_self(r.value, ns, name) { return true }
             checker::TLoopStmt as l => { if cg_block_calls_self(l.init, ns, name) { return true }; if cg_block_calls_self(l.body, ns, name) { return true } }
             checker::TExprStmt as es => if cg_expr_calls_self(es.expr, ns, name) { return true }
@@ -6661,6 +6815,37 @@ fn cg_fn_is_self_recursive(f: checker::TFunction) -> bool {
     cg_block_calls_self(f.body, f.namespace, f.name)
 }
 
+/**
+ * cg_fn_ref_ns — the namespace a function's param type annotations were WRITTEN in, so a bare
+ * contract name in a method's param type resolves the way the checker resolved it. A METHOD's
+ * `TFunction` namespace is exactly its owner type's canonical name (`module::Owner`), but its param
+ * types were resolved by the checker in the OWNER's enclosing MODULE namespace (collect.tks
+ * `method_func_type` takes `items[i].namespace`) — so a bare `Reader` on a `class & Reader` factory
+ * must bind the sibling module decl (`teko::io::Reader`) past a same-last-segment cousin
+ * (`teko::emit::Reader`, the #109 collision), NOT be resolved against the over-qualified
+ * `teko::io::Owner`. Used at BOTH the param-signature emitter (emit_function_sig) AND the caller's
+ * arg-slot upcast canonicalisation (emit_call), so the factory's declared param type and the
+ * class->interface box built for its argument agree on the real contract. A FREE function's
+ * namespace already IS its module namespace, so it is returned unchanged. Detection is EXACT: only
+ * when `ns` names an existing type decl is it a method's owner-qualified namespace.
+ *
+ * @param prog  the typed program (scanned for a type decl whose canonical name equals `ns`)
+ * @param ns    the function's declared namespace (`TFunction.namespace`)
+ * @return      the enclosing MODULE namespace for a method's owner-named ns, else `ns` unchanged
+ */
+fn cg_fn_ref_ns(prog: checker::TProgram, ns: str) -> str {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => { if d.name == ns { return checker::name_qualifier(ns) } }
+            _ => { }
+        }
+        i++
+    }
+    ns
+}
+
 // emit_function — a TFunction -> a C function definition.
 // (C: `emit_function`.)
 // emit_function_sig — the return type + name + params up to the `)` (no body). Shared by the
@@ -6682,11 +6867,12 @@ fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction
     if f.params.len == 0 {
         out = cb(out, "void")
     } else {
+        let ref_ns = cg_fn_ref_ns(prog, f.namespace)
         mut i: u64 = 0
         loop {
             if i >= f.params.len { break }
             if i > 0 { out = cb(out, ", ") }
-            out = match emit_type_expr(out, prog, f.params[i].type_ann, f.namespace) { []byte as o => o; error as err => return err }   // (#109 W3) ref_ns = the fn's declaring ns
+            out = match emit_type_expr(out, prog, f.params[i].type_ann, ref_ns) { []byte as o => o; error as err => return err }
             out = cb(out, " ")
             out = cb_ident(out, f.params[i].name)
             i++
@@ -7443,7 +7629,7 @@ fn cg_collect_block_opts(set: CgTypeSet, stmts: []checker::TStatement) -> CgType
             // VM's coerce_to(a.bound)): a deref-assign `r.value = v` through a `Ref<T?>` has bound=`T?`,
             // and that optional's tk_opt_<T> typedef must be emitted even when the value's own type is a
             // bare `T` (widened) — mirrors the TBinding arm collecting b.bound.
-            checker::TAssign as a => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); match a.kind { parser::AssignKind::Field => s = cg_collect_expr_opts(s, a.target); _ => { } } }   // (#88) the FIELD LHS receiver may carry optional types too
+            checker::TAssign as a => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); if parser::assign_has_target(a.kind) { s = cg_collect_expr_opts(s, a.target) } }
             checker::TReturn as r => { if r.has_value { s = cg_collect_expr_opts(s, r.value) } }
             checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.init); s = cg_collect_block_opts(s, l.body) }
             checker::TExprStmt as es => { s = cg_collect_expr_opts(s, es.expr) }
@@ -8249,7 +8435,7 @@ fn cg_lift_block(stmts: []checker::TStatement, acc: Ref<StampAcc>) -> []checker:
 fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStatement {
     match s {
         checker::TBinding as b => checker::TBinding { kind = b.kind; target = b.target; bound = b.bound; value = cg_lift_expr(b.value, acc) }
-        checker::TAssign as a => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = match a.kind { parser::AssignKind::Field => cg_lift_expr(a.target, acc); _ => a.target } }   // (#88) lift lambdas in the FIELD LHS receiver too
+        checker::TAssign as a => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = if parser::assign_has_target(a.kind) { cg_lift_expr(a.target, acc) } else { a.target } }
         checker::TReturn as r => checker::TReturn { has_value = r.has_value; value = if r.has_value { cg_lift_expr(r.value, acc) } else { r.value } }
         checker::TLoopStmt as l => checker::TLoopStmt { label = l.label; init = cg_lift_block(l.init, acc); body = cg_lift_block(l.body, acc) }
         checker::TExprStmt as es => checker::TExprStmt { expr = cg_lift_expr(es.expr, acc) }
@@ -8895,6 +9081,15 @@ pub fn tk_emit_c_test(prog0: checker::TProgram, cov: bool) -> str | error {
     tk_emit_c_mode(prog0, if cov { CgMode::TestCov } else { CgMode::TestPlain })
 }
 
+/** tk_emit_c_test_analyze — the ANALYZE-MODE test-gate emission entry (`teko test . --analyzer`,
+    0.3.0.29). Emits the same production-fn/line/branch instrumentation as `TestCov`, but a per-test
+    isolation harness (`emit_test_main_analyze`) that resets the sinks around each `#test` and dumps
+    that test's raw id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov`. One compile answers the whole-suite
+    stale/redundant question. Exposed so the build driver can request it across the namespace. */
+pub fn tk_emit_c_test_analyze(prog0: checker::TProgram) -> str | error {
+    tk_emit_c_mode(prog0, CgMode::TestAnalyze)
+}
+
 /** tk_emit_c_mode — emit the C translation unit under `mode` (#265, lever D of #249). Types,
     prototypes and function bodies are emitted IDENTICALLY across modes; only the trailing `main()`
     differs: Program = the virtual-main (loose statements), TestPlain/TestCov = the native test gate.
@@ -9107,6 +9302,7 @@ fn emit_program_main(buf: []byte, prog: checker::TProgram) -> []byte | error {
     calls and each test wrapped in `tk_cov_enter(idx)`/`tk_cov_leave`, then the sinks are dumped to a
     `.tkcov` for the parent to merge; under `TestPlain` NO `tk_cov_*` is emitted (zero-cost off). */
 fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte | error {
+    if mode == CgMode::TestAnalyze { return emit_test_main_analyze(buf, prog) }
     mut b = buf
     let cov = mode == CgMode::TestCov
     b = cb(b, "int main(int argc, char **argv) {\n")
@@ -9130,6 +9326,43 @@ fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte 
     if cov {
         b = cb(b, "    tk_cov_branches_on(false); tk_cov_lines_on(false);\n")
         b = cb(b, "    { const char *dp = getenv(\"TEKO_TKCOV\"); if (dp) tk_cov_dump(dp); }\n")
+    }
+    b = cb(b, "    return 0;\n")
+    b = cb(b, "}\n")
+    b
+}
+
+/**
+ * emit_test_main_analyze — the per-test ISOLATION harness main (`teko test . --analyzer`, 0.3.0.29).
+ *
+ * Turns line/branch sinks on once, then for EACH `#test` (via `emit_test_call_analyze`) resets all
+ * three sinks, runs exactly that one test under `tk_cov_enter(idx)`/`tk_cov_leave`, and dumps THAT
+ * test's raw id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov`. One compile + one run therefore yields N
+ * disjoint per-test id-sets, which the build driver reads back to classify STALE/REDUNDANT/LIVE —
+ * without the per-test recompile the aggregate `TestCov` sink forces on `--per-test-cov`. There is
+ * NO end-of-run aggregate dump: each test already flushed its own file.
+ *
+ * @param buf   the output byte buffer to append the emitted C to
+ * @param prog  the checked program whose `#test` items form the harness body
+ * @return      the buffer with the analyze-mode `main()` appended
+ * @since 0.3.0.29
+ */
+fn emit_test_main_analyze(buf: []byte, prog: checker::TProgram) -> []byte | error {
+    mut b = cb(buf, "extern int snprintf(char *, size_t, const char *, ...);\n")
+    b = cb(b, "int main(int argc, char **argv) {\n")
+    b = cb(b, "    tk_set_args(argc, argv);\n")
+    b = cb(b, "    tk_cov_branches_on(true);\n")
+    b = cb(b, "    tk_cov_lines_on(true);\n")
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.is_test { b = emit_test_call_analyze(b, f, i) }
+            }
+            _ => { }
+        }
+        i++
     }
     b = cb(b, "    return 0;\n")
     b = cb(b, "}\n")
@@ -9175,13 +9408,69 @@ fn emit_test_call(buf: []byte, f: checker::TFunction, idx: u64, cov: bool) -> []
     b
 }
 
+/**
+ * emit_test_call_analyze — one `#test` invocation under the analyze harness (0.3.0.29).
+ *
+ * Mirrors `emit_test_call`'s label prints and arena checkpoint, but ISOLATES this test's coverage:
+ * before the call it resets all three sinks so they hold ONLY this test's ids; after the call it
+ * dumps them to `$TEKO_ANALYZE_DIR/<idx>.tkcov` (the literal `idx` is baked in at emit time via the
+ * digit helper, so no runtime idx bookkeeping is needed). If `$TEKO_ANALYZE_DIR` is unset the dump
+ * is skipped (the binary still runs as a plain gate). The cov brackets nest strictly inside the
+ * arena checkpoint, exactly as `emit_test_call` and the VM runner order them.
+ *
+ * @param buf  the output byte buffer to append the emitted C to
+ * @param f    the `#test` function being invoked (its namespace + name form the label and symbol)
+ * @param idx  the `prog.items` coverage id — baked into the dump path AND passed to `tk_cov_enter`
+ * @return     the buffer with this test's isolated invocation appended
+ * @since 0.3.0.29
+ */
+fn emit_test_call_analyze(buf: []byte, f: checker::TFunction, idx: u64) -> []byte {
+    let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
+    let head = teko::str::concat("test ", label, " ... ")
+    mut b = cb(buf, "    tk_arena_push();\n")
+    b = cb(b, "    tk_print((tk_str){ (const tk_byte *)\"")
+    b = cb_cstr_escaped(b, head)
+    b = cb(b, "\", ")
+    b = cb_u128_digits(b, head.len to u128)
+    b = cb(b, " });\n")
+    b = cb(b, "    tk_cov_reset(); tk_cov_branch_reset(); tk_cov_line_reset();\n")
+    b = cb(cb_u128_digits(cb(b, "    tk_cov_enter("), idx to u128), ");\n")
+    b = cb_fn_name(cb(b, "    "), f.namespace, f.name)
+    b = cb(b, "();\n")
+    b = cb(b, "    tk_cov_leave();\n")
+    b = cb(b, "    { const char *d = getenv(\"TEKO_ANALYZE_DIR\"); if (d) { char p[1024]; snprintf(p, sizeof p, \"%s/")
+    b = cb_u128_digits(b, idx to u128)
+    b = cb(b, ".tkcov\", d); tk_cov_dump(p); } }\n")
+    b = cb(b, "    tk_println((tk_str){ (const tk_byte *)\"ok\", 2 });\n")
+    b = cb(b, "    tk_arena_pop();\n")
+    b
+}
+
+/**
+ * mode_instruments_cov — whether `mode` populates the `tk_cov_*` sinks (`TestCov` aggregates the
+ * whole run into one dump, `TestAnalyze` isolates each test into its own dump). Both emit the SAME
+ * production-fn/line/branch instrumentation; only the harness in `emit_test_main` differs. Program
+ * and TestPlain emit ZERO cov calls → byte-identical output → the gen2==gen3 fixpoint is intact.
+ *
+ * @param mode  the codegen mode being emitted
+ * @return      true for `TestCov`/`TestAnalyze`, false for `Program`/`TestPlain`
+ * @since 0.3.0.29
+ */
+fn mode_instruments_cov(mode: CgMode) -> bool {
+    match mode {
+        CgMode::TestCov => true
+        CgMode::TestAnalyze => true
+        _ => false
+    }
+}
+
 /** emit_function_mode — emit a function body, adding the `tk_cov_mark(idx)` entry prologue under
-    `TestCov` for each PRODUCTION (non-test, non-`teko::coverage`) function so function-level coverage
-    is populated natively — the mark the native gate records on entry. Under Program/TestPlain this is
-    exactly emit_function (no prologue → byte-identical). The coverage subsystem (`teko::coverage`) is
-    self-excluded so it never measures its own reporting code. (#265) */
+    `TestCov`/`TestAnalyze` for each PRODUCTION (non-test, non-`teko::coverage`) function so
+    function-level coverage is populated natively — the mark the native gate records on entry. Under
+    Program/TestPlain this is exactly emit_function (no prologue → byte-identical). The coverage
+    subsystem (`teko::coverage`) is self-excluded so it never measures its own reporting code. (#265) */
 fn emit_function_mode(buf: []byte, prog: checker::TProgram, f: checker::TFunction, mode: CgMode) -> []byte | error {
-    if mode != CgMode::TestCov { return emit_function(buf, prog, f) }
+    if !mode_instruments_cov(mode) { return emit_function(buf, prog, f) }
     if f.is_test || f.namespace == "teko::coverage" { return emit_function(buf, prog, f) }
     emit_function_cov(buf, prog, f, fn_items_index(prog, f) to i64)
 }

@@ -1,0 +1,83 @@
+/**
+ * Reader — a one-method contract used as a dynamic-dispatch VALUE type. Its last segment collides
+ * with the private `codec::Reader` struct (the #109 hazard); a `class & Reader` factory below takes
+ * this contract by its BARE name, so the emitter must bind it in the OWNER MODULE namespace.
+ */
+type Reader = interface {
+    /**
+     * read — yield the reader's value offset by `n`.
+     *
+     * @param n  the caller's per-read offset
+     * @return   the reader's stored value plus `n`
+     */
+    fn read(self, n: i64) -> i64
+}
+
+/**
+ * Fixed — a class conforming to `Reader`, holding a constant base value. Up-casts into the `Reader`
+ * interface value at a call boundary and dispatches through its vtable.
+ */
+type Fixed = class & Reader {
+    /** the reader's stored base value. */
+    pub v: i64
+
+    /**
+     * make — build a `Fixed` over the base value `x`.
+     *
+     * @param x  the stored base value
+     * @return   the constructed reader
+     */
+    pub fn make(x: i64) -> Fixed { Fixed { v = x } }
+
+    /**
+     * read — the `Reader` contract: base value plus the caller's offset.
+     *
+     * @param n  the caller's per-read offset
+     * @return   `self.v + n`
+     */
+    pub fn read(self, n: i64) -> i64 { self.v + n }
+}
+
+/**
+ * Cap — a wrapping class conforming to `Reader`. Its STATIC FACTORY `of` takes the wrapped stream by
+ * the BARE contract name `Reader` — the exact shape the method-param signature emitter must resolve
+ * in this module's namespace (`Cap`'s owner module) so it binds `stream::Reader`, not the sibling
+ * `codec::Reader` struct. Storing the bare-typed param into the interface-typed `inner` field would
+ * fail to compile were the param mis-bound to the struct.
+ */
+type Cap = class & Reader {
+    /** the wrapped source stream, held as a dynamic interface value. */
+    pub inner: Reader
+    /** the fixed amount added on top of every wrapped read. */
+    pub extra: i64
+
+    /**
+     * of — wrap `inner`, adding `extra` to every read it serves.
+     *
+     * @param inner  the source stream to wrap, taken by the bare contract name
+     * @param extra  the amount added to each wrapped read
+     * @return       the wrapping reader
+     */
+    pub fn of(inner: Reader, extra: i64) -> Cap { Cap { inner = inner; extra = extra } }
+
+    /**
+     * read — dispatch to the wrapped stream, then add this cap's fixed `extra`.
+     *
+     * @param n  the caller's per-read offset
+     * @return   the wrapped read plus `extra`
+     */
+    pub fn read(self, n: i64) -> i64 { self.inner.read(n) + self.extra }
+}
+
+/**
+ * scenario — wrap a `Fixed` in a `Cap` through the bare-`Reader` factory, drive one dynamic read,
+ * and touch the colliding `codec::Reader` so its decl stays live. `Cap::of(Fixed::make(2), 5)` then
+ * `.read(3)` yields `(2 + 3) + 5 = 10`.
+ *
+ * @return  the wrapped read result (10)
+ */
+pub fn scenario() -> i64 {
+    let capped = Cap::of(Fixed::make(2), 5)
+    let _live = codec::spread(4, 5)
+    capped.read(3)
+}

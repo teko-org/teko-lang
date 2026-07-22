@@ -34,3 +34,177 @@ fn assert_i64_slice_eq(got: []i64, want: []i64) {
     teko::assert::is_true(xs[0] == "a")
     teko::assert::is_true(xs[1] == "b")
 }
+
+/**
+ * Sum a parameter `[]u64` with the slice for-each read form `loop x in ids` — proving `x` binds the
+ * ELEMENT (a value copy) of a by-value parameter slice, not the index. Used by the read-form test to
+ * exercise the parameter (read-only) path distinct from a local container.
+ *
+ * @param ids  the parameter slice whose elements are summed
+ * @return     the sum of every element (0 for an empty slice)
+ */
+fn sum_u64(ids: []u64) -> u64 {
+    mut s: u64 = 0
+    loop x in ids { s = s + x }
+    s
+}
+
+/**
+ * Accumulate `element - index` over a parameter `[]u64` with the enumerate for-each `loop (x, i) in
+ * ids` — pinning the owner-ratified binding ORDER (element FIRST, index SECOND, index typed `u64`).
+ * Chosen data keeps every `x - i` non-negative; a swapped order (index into `x`, element into `i`)
+ * would compute `0 - first_element`, underflowing `u64` to a huge value — so a correct total is a
+ * guard against a reversed binding.
+ *
+ * @param ids  the parameter slice enumerated as `(element, index)`
+ * @return     the sum of `element - index` across the slice
+ */
+fn weighted_u64(ids: []u64) -> u64 {
+    mut a: u64 = 0
+    loop (x, i) in ids { a = a + x - i }
+    a
+}
+
+/**
+ * A local mutable `[]u64` element assignment `a[i] = v` writes the addressed slot in place, leaving
+ * the other elements untouched (the ratified element-assignment primitive over a `mut` container).
+ */
+#test
+fn element_assign_updates_slot() {
+    mut a: []u64 = [1, 2, 3]
+    a[1] = 9
+    teko::assert::is_true(a[0] + a[1] + a[2] == 13)
+    teko::assert::is_true(a[0] == 1)
+    teko::assert::is_true(a[2] == 3)
+}
+
+/**
+ * The index of an element assignment may be any computed integer expression, not just a literal —
+ * `a[i] = v` evaluates `i` to select the slot.
+ */
+#test
+fn element_assign_computed_index() {
+    mut a: []u64 = [1, 2, 3]
+    mut i: u64 = 1
+    a[i + 1] = 10
+    teko::assert::is_true(a[2] == 10)
+    teko::assert::is_true(a[0] + a[1] + a[2] == 13)
+}
+
+/**
+ * Compound element assignment `a[i] op= v` reads the current slot, applies the arithmetic op, and
+ * stores back in place — `+=` and `-=` over a mutable `[]u64`.
+ */
+#test
+fn element_compound_assign() {
+    mut a: []u64 = [10, 20, 30]
+    a[0] += 5
+    a[1] -= 5
+    teko::assert::is_true(a[0] == 15)
+    teko::assert::is_true(a[1] == 15)
+    teko::assert::is_true(a[2] == 30)
+}
+
+/**
+ * Shift-assign element forms `a[i] <<= n` / `a[i] >>= n` route through the width-masked shift and
+ * store back in place — matching the bare `<<` / `>>` operators over a mutable `[]u64`.
+ */
+#test
+fn element_shift_assign() {
+    mut a: []u64 = [1, 2, 4]
+    a[0] <<= 3
+    a[2] >>= 1
+    teko::assert::is_true(a[0] == 8)
+    teko::assert::is_true(a[2] == 2)
+    teko::assert::is_true(a[1] == 2)
+}
+
+/**
+ * The slice for-each read form `loop x in ids` over a by-value parameter slice binds each ELEMENT in
+ * turn (a value copy), so the accumulator sees the element values.
+ */
+#test
+fn foreach_reads_param_slice() {
+    let xs: []u64 = [3, 4, 5]
+    teko::assert::is_true(sum_u64(xs) == 12)
+}
+
+/**
+ * The enumerate for-each `loop (x, i) in ids` binds the element FIRST and the index SECOND (a `u64`).
+ * The chosen data makes a reversed binding underflow `u64`, so the exact total pins the order.
+ */
+#test
+fn foreach_enumerate_element_first_index_u64() {
+    let xs: []u64 = [10, 20, 30]
+    teko::assert::is_true(weighted_u64(xs) == 57)
+}
+
+/**
+ * A body write to the for-each element over a MUTABLE local container writes back through the shared
+ * buffer — `loop x in m { x = x * 2 }` doubles every element of `m` in place.
+ */
+#test
+fn foreach_writeback_mutates_container() {
+    mut m: []u64 = [1, 2, 3]
+    loop x in m { x = x * 2 }
+    teko::assert::is_true(m[0] == 2)
+    teko::assert::is_true(m[1] == 4)
+    teko::assert::is_true(m[2] == 6)
+}
+
+/**
+ * A for-each over an immutable `let` container that never writes the element is a read-only iteration
+ * — the elements are summed without any write-back.
+ */
+#test
+fn foreach_readonly_let_slice_reads() {
+    let r: []u64 = [5, 6, 7]
+    mut s: u64 = 0
+    loop x in r { s = s + x }
+    teko::assert::is_true(s == 18)
+}
+
+/**
+ * `break` inside a slice for-each leaves the loop immediately, so elements after the break point are
+ * never accumulated.
+ */
+#test
+fn foreach_break_stops_iteration() {
+    let xs: []u64 = [1, 2, 3, 4]
+    mut s: u64 = 0
+    loop x in xs {
+        if x == 3 { break }
+        s = s + x
+    }
+    teko::assert::is_true(s == 3)
+}
+
+/**
+ * `continue` inside a slice for-each skips the rest of the current iteration and advances to the next
+ * element.
+ */
+#test
+fn foreach_continue_skips_element() {
+    let xs: []u64 = [1, 2, 3, 4]
+    mut s: u64 = 0
+    loop x in xs {
+        if x == 2 { continue }
+        s = s + x
+    }
+    teko::assert::is_true(s == 8)
+}
+
+/**
+ * Nested slice for-each loops compose — the inner loop runs fully for every outer element, so the
+ * accumulator sums the full product matrix.
+ */
+#test
+fn foreach_nested_loops_multiply() {
+    let xs: []u64 = [1, 2, 3]
+    let ys: []u64 = [1, 2]
+    mut s: u64 = 0
+    loop x in xs {
+        loop y in ys { s = s + x * y }
+    }
+    teko::assert::is_true(s == 18)
+}
