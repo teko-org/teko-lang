@@ -3,10 +3,11 @@
 > **Status:** DESIGN-AHEAD, doc-only. **NOT implemented — the owner reviews before any code.**
 > Wave: **0.3.1 "Security/FFI"** (this is the security/FFI wave, NOT `0.3.0.30`). This document
 > **SUPERSEDES THE SPELLING** (not the safety model) of `docs/design/ref-transparent-model.md`: the
-> owner has ratified the direction — **remove the surface `ref` keyword, make `Ref<T>` a
-> compiler-internal type, and replace it with a `*`-before-the-identifier sugar.** The entire
-> soundness apparatus (the tripartite law, R1–R11, the A1–A6 spine, arena/R11 lifetimes, never-null,
-> `Ref<T?>` transparency) is **carried over unchanged** — only the surface grafia changes.
+> owner has ratified the direction — **remove the (planned) surface `ref` keyword, make `Ref<T>` a
+> compiler-internal type, and replace the reference's grafia with a `*`-before-the-identifier sugar.**
+> The entire soundness apparatus (the tripartite law, R1–R11, the A1–A6 spine, arena/R11 lifetimes,
+> never-null, `Ref<T?>` transparency) is **carried over unchanged** — only the surface grafia of the
+> already-existing reference changes.
 >
 > **Read for this design (all read at authoring time):** `docs/design/ref-transparent-model.md`
 > (the ratified model + tripartite law + A1–A6 + §4.2 null-transparency), `docs/design/marshall-spec.md`
@@ -35,18 +36,28 @@ Two facts govern the whole design; both were verified in `src/`.
    **So this whole change is surface-only.** No runtime, ABI, or codegen-representation change is
    implied by Part A — the spine, escape gates, and `Reference → T*` lowering are untouched.
 
-2. **The `ref` binding modifier from `ref-transparent-model.md` was never built.** `BindKind` in
-   `ast.tks` is `enum { Let; Mut; Const }` — there is **no `Ref` bind kind**, and `ref x:` appears
-   **0 times** in `src/`. Today the surface is the **generic `Ref<T>` type + `.value` deref**
-   (`resolve.tks` maps `Ref<T>` → `Reference{inner}`; `.value` is `AssignKind::RefDeref`). This means
-   **there is nothing to un-build**: this design specifies the ONE surface that ships (the `*`-sugar),
-   so the `ref`-keyword hop of `wave-0.3.1-plan.md` SW3/SW4 is *re-spelled*, not migrated twice.
+2. **The reference EXISTS today — as `Ref<T>` — and has for ~10 versions; only its GRAFIA is open.**
+   Be precise about what is and is not built, because it decides the fallback framing (A.9):
+   - **There is no `ref` KEYWORD, and there never was.** The lexer has no `ref` token; `BindKind` in
+     `ast.tks` is `enum { Let; Mut; Const }` (no `Ref` arm); `ref x:` / `ref t` as a binder or param
+     appears **0 times** in `src/`. The transparent `ref`-keyword surface of
+     `ref-transparent-model.md` is **designed but UNBUILT** — it would be **new construction**.
+   - **But the REFERENCE itself is fully built and in daily use** — it is the generic type **`Ref<T>`**
+     (**114 uses in `src/`**, owner-verified) + **`.value`** (the deref) + **`&`/auto-ref** (the
+     borrow). This is the reference the compiler self-hosts on today.
+   The consequence that governs A.9: **the only existing reference artifact is `Ref<T>` + `.value` +
+   `&`.** BOTH candidate surfaces — (A) the `*name` sugar of this doc, and (B) the transparent
+   `ref`-keyword of ref-transparent-model — are **equivalent-cost NEW CONSTRUCTION of a fresh grafia
+   over that already-existing `Ref<T>`.** Neither "keeps an existing keyword" (there is none) and
+   neither invents the reference (it already exists). **The real decision is purely the GRAFIA of the
+   reference we already have** — `Ref<T>`/`.value` → `*name` (A) vs `Ref<T>`/`.value` → `ref`-keyword
+   (B). Everything below Part A is grafia + lowering of that one settled semantic object.
 
 The current pointer/unsafe surfaces (all confirmed present):
 
 | surface | internal | notes |
 |---|---|---|
-| `Ref<T>` (generic type) + `.value` | `Reference{inner}` | never-null (R2); `Ref<T> \| null` niche merged (`resolve.tks:1503`) |
+| `Ref<T>` (generic type) + `.value` | `Reference{inner}` | the reference IN USE today (114 sites); never-null (R2); `Ref<T> \| null` niche merged (`resolve.tks:1503`) |
 | `&x` (prefix) | `Borrow` → `Reference{T}` | AL-wave-F1 SAFE mutable borrow; lowers to C `&x` |
 | `ptr<T>` / `ptr<void>` | `Ptr{inner:Type?}` | raw address; `unsafe`-carrying only when pointee unsafe (today) |
 | `uptr` | `Uptr{}` | opaque word (carries `Arena.region`, D35) |
@@ -280,28 +291,43 @@ this model:
   **only in `unsafe` context**, exactly as `marshall-spec.md` §5.5 already wants (`&x` = raw
   `ptr<T>`/`*T` of an lvalue; banned in safe code). This *removes* the AL-wave-F1 safe borrow (its
   job is now done by auto-borrow) and frees `&` to mean the one thing every C/Zig programmer expects.
-- **Consequence for `src/`:** the ~38 `&`-prefix sites in the corpus (mostly already implicit via
+- **Consequence for `src/`:** the `&`-prefix sites in the corpus (mostly already implicit via
   auto-ref) must be audited during adoption (A.10): a safe `&x` becomes a bare `x` passed to a
   `*param`; any genuine raw address-of moves inside an `unsafe fn`. Because most `&` are already
   implicit at call sites, the blast radius is small (analysis §2.1).
 
-## A.9 The fallback evaluation — `*name`-sugar vs `ref`-keyword-with-hidden-`Ref<T>` (owner asked; recommend one)
+## A.9 The fallback evaluation — `*name`-sugar vs a NEW transparent `ref`-keyword (owner asked; recommend one)
 
-The owner's stated fallback: **keep the `ref` KEYWORD but hide the `Ref<T>` TYPE from the surface;
-if hidden, mut-by-reference `&x` becomes `ref x`.** Comparison, law-first:
+**Framing first (the fact that decides this): both options are NEW CONSTRUCTION of equivalent cost
+over the SAME already-existing reference.** The reference is built and in daily use as `Ref<T>` +
+`.value` + `&` (114 `Ref<` sites, §0 fact 2). There is **no `ref` keyword to "keep"** — it never
+existed. So the choice is NOT "keep vs replace"; it is **which fresh grafia to build over the
+existing `Ref<T>`:**
 
-| criterion (law) | (A) `*name`-sugar (this doc) | (B) `ref`-keyword, hidden `Ref<T>` |
+- **(A) `*name`-sugar** (this doc) — build the `*`-before-the-identifier grafia; `Ref<T>` becomes
+  compiler-internal.
+- **(B) a transparent `ref`-KEYWORD, built from scratch** (per `ref-transparent-model.md`) — build a
+  new contextual `ref` keyword + `ref` type-grafia, hiding `Ref<T>` as compiler-internal. The owner's
+  stated fallback ("keep the `ref` keyword but hide the `Ref<T>` type; then `&x` becomes `ref x`")
+  is, factually, **this construction** — there is no keyword to keep, so B is "CONSTRUIR a `ref`
+  keyword," and in B the mut-by-reference `&x` is spelled `ref x`.
+
+Both keep `Ref<T>` + `.value`-lowering + the spine unchanged; both delete surface `.value`; both are
+the same-sized parser+checker build. The only existing artifact to keep-or-swap is the `Ref<T>` +
+`.value` + `&` grafia. Comparison, law-first:
+
+| criterion (law) | (A) `*name`-sugar (build) | (B) new transparent `ref`-keyword (build) |
 |---|---|---|
 | **verbosity / ergonomics** (owner's goal) | **best** — one glyph, no keyword, no `.value`; `*t`, `mut *t`, `fn *f` | good — `ref t`, `ref x`, but a word per binder is 2–3 chars more |
 | **teachability** (M.3 honest) | **mixed** — `*name` (safe ref) vs `*Type` (raw ptr) is a *subtle* same-glyph/different-position rule a newcomer can misread as "everything with `*` is a pointer" | **best** — `ref` reads as "reference"; `*T` is unambiguously "raw pointer"; two distinct words, zero overload |
 | **grammar ambiguity** (M.4) | resolved by strict position (A.1), but `*` is heavily overloaded (multiply, deref, raw-ptr, ref-binder) — the *parser* is clean, the *reader* carries the load | **best** — `ref` is a fresh contextual keyword; `*` means only "raw pointer / deref"; no reader overload |
 | **`*T`-vs-`ptr<T>` collision** (§5 of the analysis) | **resolved by construction** — `*name` (binder, safe) can never occupy a type slot, so it never collides with `*T`/`ptr<T>` | resolved differently — `ref` (safe) and `ptr`/`*T` (unsafe) are distinct words; also clean |
 | **keyword sparsity** (M.0) | **best** — zero new keyword | costs one contextual keyword (`ref`) — cheap (Teko already does contextual kw) |
-| **migration cost** | new parser *positions* (fn-name `*`, param-name `*`, binder `*`) + type-position `*T` | new contextual keyword + `ref` type-grafia; larger checker surface but already spec'd in ref-model |
-| **owner status** | the ratified DIRECTION | the documented fallback |
+| **build cost** | new parser *positions* (fn-name `*`, param-name `*`, binder `*`) + type-position `*T` | new contextual keyword + `ref` type-grafia; comparable checker surface, spec'd in ref-model |
+| **owner status** | the ratified DIRECTION | the documented fallback (build-from-scratch) |
 
-**RECOMMENDATION: proceed with (A) `*name`-sugar — but gate the surface behind a teachability +
-soundness review (an §10.4-style pass) before it cements.** (A) is ergonomically strongest and, more
+**RECOMMENDATION: build (A) `*name`-sugar — but gate the surface behind a teachability + soundness
+review (an §10.4-style pass) before it cements.** (A) is ergonomically strongest and, more
 importantly, it *dissolves* the load-bearing `*T`-vs-`ptr<T>` collision **by construction** (a safe
 binder and a raw type can never occupy the same slot), which is the single sharpest design constraint
 the analysis identified. Its one real cost is **teachability of the overloaded `*`** (M.3): a reader
@@ -312,13 +338,15 @@ mitigable:
 1. **Diagnostics carry the rule.** Any `*` misuse (`let *x`, `**x`, `*T` in safe context) emits the
    positional explanation, so the compiler *teaches* the rule at the point of confusion.
 2. **The review gate.** Run a short teachability/soundness pass (mirroring ref-model §10.4 auto-deref)
-   BEFORE cementing the parser positions; if the overload proves too costly, **fall back to (B)** —
-   the fallback is fully law-passing and already designed in ref-model, so the escape hatch is cheap.
+   BEFORE cementing the parser positions; if the overload proves too costly, **build (B) instead** —
+   the fallback is fully law-passing and already designed in ref-model, so the escape hatch is cheap
+   (and, because both are fresh construction over the same `Ref<T>`, switching before build starts
+   costs nothing already sunk).
 
 If the owner weights teachability over ergonomics, **(B) is the honest second choice** and loses on
 nothing but verbosity. Both pass all Laws; (A) wins on ergonomics + collision-dissolution, (B) wins
-on teachability. **The owner ratifies.** (No HALT — both options are law-passing; this is a
-preference call the owner owns.)
+on teachability. **The owner ratifies.** (No HALT — both options are law-passing new-construction over
+the existing reference; this is a preference call the owner owns.)
 
 ## A.10 Part-A crumb sequence (re-spells wave-0.3.1-plan SW3/SW4; seed-sequenced)
 
@@ -329,7 +357,7 @@ single highest stranding risk; never remove the old acceptance in the same sub-w
 
 | crumb | size | touches | notes |
 |---|---|---|---|
-| **A0** teachability/soundness review of the `*` overload (gates A2) | L (design) | design + a parser/checker unit harness | the §10.4-style gate; verdict = proceed-with-(A) **or** fall back to (B) (A.9) |
+| **A0** teachability/soundness review of the `*` overload (gates A2) | L (design) | design + a parser/checker unit harness | the §10.4-style gate; verdict = build-(A) **or** build-(B) instead (A.9) |
 | **A1** lexer/AST: `PtrType{pointee}` type node + `by_ref` flag on `Param`/`Binding`/`FnDecl` | S | `ast.tks` | additive; no new token |
 | **A2** parser: accept leading `*` at fn-name / param-name / `mut`-binder slots, and `*` at type-primary start | M | `parse_decl.tks`, `parse_stmt.tks`, `parse_type.tks` | gated by A0; `let *`/`const *`/`**name` = parse error |
 | **A3** checker: `*name` binders resolve to `Reference{..}` (`by_ref`); `*T` resolves to `Ptr{inner}` + unsafe-gate; tripartite `let *` reject; A4 definite-assignment on `*`-binders | M | `checker/resolve.tks`, `checker/typer.tks` | the spine/escape gates are UNCHANGED (they read `Reference`) |
@@ -337,7 +365,7 @@ single highest stranding risk; never remove the old acceptance in the same sub-w
 | **A5** never-null re-point: reject surface `Reference \| Null`; retarget the C5 niche + restrict the flow-narrow memo (A.7) | M | `resolve.tks`, `typer.tks`, null-union niche classifier | **the C5 reconciliation** — review-heavy |
 | **A6** auto-deref + bare use sites (type-directed peel; `.value` deprecated-but-accepted) | L | `checker/typer.tks`, `codegen.tks` | carries ref-model §4; `.value` alias kept for the seed dance |
 | **A7** `&x` → unsafe-only raw address-of (retire the AL-wave-F1 safe borrow; auto-borrow replaces it) | S | `parse_expr.tks` (Borrow), `checker`, `codegen` | `&x` now yields `*T`, unsafe-gated (marshall-spec §5.5) |
-| **A8** ADOPT in `src/`: migrate `Ref<T>`/`.value`/safe-`&x` → `*name`/bare-use; remove the `.value` + old-`Ref<T>` acceptance | L | `src/**` (96 `Ref<`, the Ref-subset of `.value`, ~38 `&`) | fixpoint + `diff_vm_native` at each file; honest-stop (keep old form on a stubborn file) until green, THEN remove the alias |
+| **A8** ADOPT in `src/`: migrate `Ref<T>`/`.value`/safe-`&x` → `*name`/bare-use; remove the `.value` + old-`Ref<T>` acceptance | L | `src/**` (114 `Ref<`, the Ref-subset of `.value`, the `&` sites) | fixpoint + `diff_vm_native` at each file; honest-stop (keep old form on a stubborn file) until green, THEN remove the alias |
 
 **Seed-sequencing:** A1–A7 land in one seed with BOTH spellings accepted (`0.3.1.N-beta`); A8 dogfoods
 that seed and only then drops the alias (`0.3.1.(N+1)-beta`). The corpus must never use `*name` before
@@ -428,8 +456,8 @@ Surface — an additive macro form of `extern`:
  * EXPANDS the macro textually (C-transpile backend) rather than emitting a symbol call. The
  * header that defines the macro must be named so it is in scope at expansion.
  *
- * @param i32 x  the value passed to the macro
- * @return i32   the asserted result type
+ * @param u32 x  the value passed to the macro
+ * @return u32   the asserted result type
  * @since 0.3.1
  */
 extern macro fn htonl(x: u32) -> u32 = "htonl" from header "arpa/inet.h"
@@ -696,8 +724,9 @@ what crosses the boundary / what the artifact exposes). B10 is a full gate + the
 
 1. **`*` overload teachability (M.3) — Part A.** The same glyph is multiply / deref / raw-pointer /
    ref-binder, disambiguated by position. **Resolved:** strict positional grammar (A.1) + teaching
-   diagnostics + the A0 review gate; fall back to the `ref`-keyword (A.9-B) if the review finds the
-   overload too costly. *Preference call — owner ratifies A vs B; not a HALT (both pass all Laws).*
+   diagnostics + the A0 review gate; build the new `ref`-keyword instead (A.9-B) if the review finds
+   the overload too costly. *Preference call — owner ratifies A vs B; not a HALT (both are law-passing
+   new construction over the same existing `Ref<T>`).*
 2. **C-macro FFI vs toolchain-independence (Teko-only / own-backend has no C preprocessor) — B2.**
    **Resolved honest-stop:** `extern macro` works on the C-transpile backend and via a generated
    `cc`-compiled wrapper symbol (so it degrades to an ordinary `extern fn` at link); it is an honest
@@ -749,5 +778,7 @@ resolution.
   `/home/user/teko-lang/docs/design/memory-unsafe-backend-remodel.md` (`unsafe`-by-type),
   `/home/user/teko-lang/docs/design/wave-0.3.1-plan.md` (SW3/SW4 re-spelled, SW8 extended).
 
-*This document is design-ahead and doc-only. No product code is changed. The owner reviews and
-ratifies (A vs B spelling; the marshall-spec §5.5 re-point) before implementation.*
+*This document is design-ahead and doc-only. No product code is changed. The reference already exists
+as `Ref<T>`; both surface options (A `*name`, B a new transparent `ref` keyword) are equal-cost fresh
+grafia over it. The owner reviews and ratifies (A vs B spelling; the marshall-spec §5.5 re-point)
+before implementation.*
