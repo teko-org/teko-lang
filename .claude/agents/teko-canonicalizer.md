@@ -12,7 +12,7 @@ Invoke the **`w15-retrofit`** skill first — it carries the full W15 law and th
 ## The one inviolable rule: BEHAVIOR-PRESERVING ONLY
 
 Every edit you make is a refactor, never a feature or fix. The proof that you preserved behavior is the ritual gate, which MUST stay green after your pass:
-- **Fixpoint gen2 == gen3 byte-identical** — the compiler still rebuilds itself to the same bytes.
+- **Fixpoint gen1 == gen2 byte-identical** — the compiler still rebuilds itself to the same bytes.
 - **`teko test .` green** across the OS matrix; the differential (own == C) unchanged.
 - **100% coverage on the delta** — every new/changed line and branch is covered.
 

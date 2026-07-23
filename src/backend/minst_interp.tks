@@ -8,13 +8,13 @@
  * C-vs-own byte differential subsumes it.
  *
  * Scope (A2-2): the straight-line integer subset the core selector covers
- * (`MAlu`'s arithmetic lane, `MMSub`, `MNeg`, `MCmp`/`MCmpImm`/`MCSet`,
- * `MMovZ`/`MMovK`/`MMovN`, `MMov`, `MRet`). Every other `MInst` case is a
- * NAMED honest-stop — EXACTLY mirroring `lir_interp`'s own gaps (bitwise/
- * shift ops, `INot`/`FNeg`/float ops/conversions) or naming the later A2
- * sub-sub-PR that selects it (memory: A2-4; control flow: A2-3; calls:
- * A2-5) — so a fixture that reaches one honest-stops IDENTICALLY on both
- * sides of the equivalence check, per the plan's closing note.
+ * (`MAlu`'s arithmetic, bitwise, and shift lanes, `MMSub`, `MNeg`, `MMvn`,
+ * `MCmp`/`MCmpImm`/`MCSet`, `MMovZ`/`MMovK`/`MMovN`, `MMov`, `MRet`). Every
+ * other `MInst` case is a NAMED honest-stop — EXACTLY mirroring `lir_interp`'s
+ * own gaps (`FNeg`/float ops/conversions) or naming the later A2 sub-sub-PR
+ * that selects it (memory: A2-4; control flow: A2-3; calls: A2-5) — so a
+ * fixture that reaches one honest-stops IDENTICALLY on both sides of the
+ * equivalence check, per the plan's closing note.
  *
  * @since #383 A2-2
  */
@@ -572,11 +572,13 @@ fn alu_div(a: i128, b: i128) -> AluEval {
 }
 
 /**
- * eval_alu — the arithmetic of an `MAluOp`: `Add`/`Sub`/`Mul`/`Sdiv`/`Udiv`
- * evaluate over the unmasked i128 carrier (matching `lir_interp`'s own
- * unmasked model, so the equivalence check holds for any in-range value);
- * the bitwise/shift lane (`And`/`Orr`/`Eor`/`Lsl`/`Asr`/`Lsr`) honest-stops,
- * mirroring `lir_interp`'s OWN gap for those `LBinOp` cases today.
+ * eval_alu — the arithmetic of an `MAluOp` over the unmasked i128 carrier
+ * (matching `lir_interp`'s own unmasked model, so the equivalence check holds
+ * for any in-range value): `Add`/`Sub`/`Mul`/`Sdiv`/`Udiv` arithmetic, the
+ * bitwise lane (`And`/`Orr`/`Eor`, pure two's-complement bit ops), and the
+ * shift lane (`Lsl`/`Asr`/`Lsr`) — `Asr`/`Lsr` both shift on the signed carrier,
+ * agreeing for the non-negative in-range fixtures exactly as `Sdiv`/`Udiv` do,
+ * and mirroring `lir_interp`'s own `eval_bin` shift arms.
  *
  * @param MAluOp op  the operation to evaluate
  * @param i128 a  the first operand
@@ -590,12 +592,12 @@ fn eval_alu(op: MAluOp, a: i128, b: i128) -> AluEval {
         MAluOp::Mul => alu_ok(a * b)
         MAluOp::Sdiv => alu_div(a, b)
         MAluOp::Udiv => alu_div(a, b)
-        MAluOp::And => alu_err("minst interp: bitwise ops are out of the A2-2 run subset (matches lir interp's own gap)")
-        MAluOp::Orr => alu_err("minst interp: bitwise ops are out of the A2-2 run subset (matches lir interp's own gap)")
-        MAluOp::Eor => alu_err("minst interp: bitwise ops are out of the A2-2 run subset (matches lir interp's own gap)")
-        MAluOp::Lsl => alu_err("minst interp: shift ops are out of the A2-2 run subset (matches lir interp's own gap)")
-        MAluOp::Asr => alu_err("minst interp: shift ops are out of the A2-2 run subset (matches lir interp's own gap)")
-        MAluOp::Lsr => alu_err("minst interp: shift ops are out of the A2-2 run subset (matches lir interp's own gap)")
+        MAluOp::And => alu_ok(a & b)
+        MAluOp::Orr => alu_ok(a | b)
+        MAluOp::Eor => alu_ok(a ^ b)
+        MAluOp::Lsl => alu_ok(a << b)
+        MAluOp::Asr => alu_ok(a >> b)
+        MAluOp::Lsr => alu_ok(a >> b)
     }
 }
 
@@ -686,6 +688,22 @@ fn interp_neg(mrf: MRegFile, x: MNeg) -> MIStep {
     let a = mrf_get(mrf, x.a)
     if !a.ok { return mistep_stop(mires_error("minst interp: neg operand register is undefined"), mrf) }
     mistep_cont(mrf_set(mrf, x.dst, -a.value))
+}
+
+/**
+ * interp_mvn — an `MMvn` step: `dst = ~a`, the bitwise one's-complement over the unmasked
+ * i128 carrier (matching `lir_interp`'s own `eval_un` INot arm, so the equivalence check
+ * holds for any in-range value; narrow-width masking is deferred exactly as `interp_neg`
+ * defers it).
+ *
+ * @param MRegFile mrf  the register file to read/update
+ * @param MMvn x  the instruction to execute
+ * @return MIStep  the instruction's effect
+ */
+fn interp_mvn(mrf: MRegFile, x: MMvn) -> MIStep {
+    let a = mrf_get(mrf, x.a)
+    if !a.ok { return mistep_stop(mires_error("minst interp: mvn operand register is undefined"), mrf) }
+    mistep_cont(mrf_set(mrf, x.dst, ~a.value))
 }
 
 /**
@@ -909,13 +927,13 @@ fn interp_call(mrf: MRegFile, x: MCall) -> MIStep {
 
 /**
  * interp_one — execute one `MInst`, dispatching by case (§4 of the isel
- * plan). A2-2's own selections (`MAlu`/`MAluImm`/`MMSub`/`MNeg`/`MCmp`/
- * `MCmpImm`/`MCSet`/`MMovZ`/`MMovK`/`MMovN`/`MMov`/`MRet`) plus A2-3 control
- * flow (`MBranch`/`MBranchCond`/`MCbz`) plus A2-4 memory (`MFrameAddr`/
- * `MLoad`/`MStore`) execute for real; every other case honest-stops, naming
- * either `lir_interp`'s own matching gap (float/bitwise/shift/`INot`/
- * conversions), the symbol relocations `MAdrp`/`MAddLo` (no run-time address
- * without a linker — golden-dump only), or the later A2 sub-sub-PR that
+ * plan). A2-2's own selections (`MAlu` — arithmetic, bitwise, and shift —
+ * `MAluImm`/`MMSub`/`MNeg`/`MMvn`/`MCmp`/`MCmpImm`/`MCSet`/`MMovZ`/`MMovK`/
+ * `MMovN`/`MMov`/`MRet`) plus A2-3 control flow (`MBranch`/`MBranchCond`/
+ * `MCbz`) plus A2-4 memory (`MFrameAddr`/`MLoad`/`MStore`) execute for real;
+ * every other case honest-stops, naming either `lir_interp`'s own matching gap
+ * (float/conversions), the symbol relocations `MAdrp`/`MAddLo` (no run-time
+ * address without a linker — golden-dump only), or the later A2 sub-sub-PR that
  * selects it (calls: A2-5).
  *
  * @param MRegFile mrf  the register file to read/update
@@ -928,7 +946,7 @@ fn interp_one(mrf: MRegFile, inst: MInst) -> MIStep {
         MAluImm as x => interp_alu_imm(mrf, x)
         MMSub as x => interp_msub(mrf, x)
         MNeg as x => interp_neg(mrf, x)
-        MMvn => out_of_scope("minst interp: bitwise not is out of the A2-2 run subset (matches lir interp's own INot gap)", mrf)
+        MMvn as x => interp_mvn(mrf, x)
         MFAlu => out_of_scope("minst interp: float ops are out of the A2-2 run subset (matches lir interp's own float gap)", mrf)
         MFNeg => out_of_scope("minst interp: float ops are out of the A2-2 run subset (matches lir interp's own float gap)", mrf)
         MCmp as x => interp_cmp(mrf, x)

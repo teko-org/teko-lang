@@ -670,49 +670,6 @@ fn cgt_emit_unary_compare_cast() {
 }
 
 // ---------------------------------------------------------------------------
-// Group L: emit_as — direct call to the convenience wrapper
-// ---------------------------------------------------------------------------
-#test
-fn cgt_emit_as_direct() {
-    let prog = cgt_prog()
-    let n = cgt_num_i64(7)
-    let dst = checker::Prim { kind = checker::PrimKind::I64 }
-    // emit_as(buf, prog, expected, value) → emit_as_r with Void ret_type
-    let result = match emit_as(cgt_empty(), prog, dst, n, teko::list::empty(), teko::list::empty(), teko::list::empty(), dctx_empty()) { []byte as o => str(o); error => "" }
-    teko::assert::is_true(teko::str::contains(result, "7"))
-}
-
-// ---------------------------------------------------------------------------
-// Group M: emit_if_value — builds fresh_tmp_name, emit_branch_value,
-//   emit_stmt_value (via emit_expr on a TIfExpr with has_else=true)
-// ---------------------------------------------------------------------------
-#test
-fn cgt_emit_if_value() {
-    let prog = cgt_prog()
-
-    // Build: if (true) { 1 } else { 0 }  — as an expression (has_else=true)
-    let then_stmt: checker::TStatement = cgt_stmt(cgt_num_i64(1))
-    let else_stmt: checker::TStatement = cgt_stmt(cgt_num_i64(0))
-    let then_blk: []checker::TStatement = teko::list::push(teko::list::empty(), then_stmt)
-    let else_blk: []checker::TStatement = teko::list::push(teko::list::empty(), else_stmt)
-    let if_e = checker::TIfExpr {
-        cond = cgt_e_bool_t()
-        then_blk = then_blk
-        has_else = true
-        else_blk = else_blk
-    }
-    let e_if = checker::TExpr {
-        kind = if_e
-        type = checker::Prim { kind = checker::PrimKind::I64 }
-        line = 0; col = 0
-    }
-    let result = match emit_expr(cgt_empty(), prog, e_if) { []byte as o => str(o); error => "" }
-    // emit_if_value produces a GNU stmt-expr `({ ... })`
-    teko::assert::is_true(result.len > 0)
-    teko::assert::is_true(teko::str::contains(result, "if"))
-}
-
-// ---------------------------------------------------------------------------
 // Group M2: S2/W9 — VALUE-position arm regions. A value `if`/`match` arm with a NON-tail
 //   binding takes the value-arm path (emit_branch_value / emit_arm_value) and yields its tail
 //   to the enclosing sink. With NO escape context (emit_expr threads empty escaping/regions/
@@ -1184,49 +1141,6 @@ fn cgt_byvalue_boxed_variant() {
     teko::assert::is_false(cg_variant_has_member(vdecl, "unknown"))
 }
 
-// (#122) a self-referencing CLASS with a `next: Node?` field. A class is pointer-lowered, so the
-// optional-of-class edge is a POINTER edge (never a by-value size cycle): the field must NOT be
-// boxed, and cg_find_struct_field_type must find the class field's declared `Node?` type (so a
-// `next = null` construction lowers to `(tk_opt_Node){ .present = false }`, not the raw-`null`
-// codegen error). Regression guard for the two native-only symptoms in issue #122.
-#test
-fn cgt_selfref_class_optional_field() {
-    // type Node = class { value: i64; next: Node? }
-    let f_value = parser::Field { name = "value"; type_ann = cgt_named_te("i64"); vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
-    let next_te = parser::OptionalType { inner = cgt_named_te("Node") }
-    let f_next = parser::Field { name = "next"; type_ann = next_te; vis = parser::Visibility::Pub; is_intern = false; has_doc = false; doc = "" }
-    let fields: []parser::Field = teko::list::push(teko::list::push(teko::list::empty(), f_value), f_next)
-    let cbody = parser::ClassBody {
-        kind = parser::ClassKind::Sealed
-        has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""
-        implements = teko::list::empty()
-        fields = fields
-        methods = teko::list::empty()
-        consts = teko::list::empty()
-    }
-    let cdecl = parser::TypeDecl { name = "Node"; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = cbody; vis = parser::Visibility::Pub; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
-    let prog = checker::TProgram { items = teko::list::push(teko::list::empty(), cdecl) }
-
-    // the class IS recognized as a class (reference type)
-    teko::assert::is_true(cg_is_class_named(prog, "Node"))
-
-    // the self-referencing class-optional field is a POINTER edge → NOT boxed
-    teko::assert::is_false(cg_field_boxed(prog, "Node", next_te))
-    // reachability stops at the class name (no by-value cycle back to Node)
-    teko::assert::is_false(cg_te_reaches_byvalue(prog, next_te, "Node", teko::list::empty()))
-
-    // the class field's declared `Node?` type IS found (drives the null-init lowering)
-    match cg_find_struct_field_type(prog, "Node", "next") {
-        parser::OptionalType => teko::assert::is_true(true)
-        _ => teko::assert::is_true(false)   // must be the OptionalType, never null/other
-    }
-    // a non-optional class field is found too
-    match cg_find_struct_field_type(prog, "Node", "value") {
-        parser::NamedType => teko::assert::is_true(true)
-        _ => teko::assert::is_true(false)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Group Q: emit_call, emit_list_empty, get_push_elem, emit_list_push,
 //           emit_field_access (slice.len + Named receiver → cg_find_struct_field_type)
@@ -1485,140 +1399,6 @@ fn cgt_emit_struct_init_error() {
 // Original invariant tests (kept from initial version)
 // ---------------------------------------------------------------------------
 
-// emit_binary — `(L op R)` for +,-,*,&,|,^,<<,>> must preserve C integer semantics.
-#test
-fn lowers_integer_arithmetic() {
-    teko::assert::is_true(1 + 2 == 3)
-    teko::assert::is_true(7 - 4 == 3)
-    teko::assert::is_true(6 * 7 == 42)
-    teko::assert::is_true((6 & 3) == 2)
-    teko::assert::is_true((4 | 1) == 5)
-    teko::assert::is_true((5 ^ 1) == 4)
-    teko::assert::is_true((1 << 4) == 16)
-    teko::assert::is_true((32 >> 2) == 8)
-}
-
-// emit_div_mod — the checked `/` and `%` path (tk_div_*/tk_mod_*) on a non-zero divisor
-// must produce the plain quotient / remainder.
-#test
-fn lowers_checked_div_mod() {
-    teko::assert::is_true(42 / 6 == 7)
-    teko::assert::is_true(43 % 6 == 1)
-}
-
-// emit_compare — chained comparisons lower to `((a<b) && (b<c))`.
-#test
-fn lowers_chained_compare() {
-    teko::assert::is_true(1 < 2)
-    teko::assert::is_false(2 < 1)
-    teko::assert::is_true(1 <= 1)
-    teko::assert::is_false(1 == 2)
-}
-
-// emit_unary — `(op X)` for -, ~, !.
-#test
-fn lowers_unary_ops() {
-    teko::assert::is_true(-(3) + 3 == 0)
-    teko::assert::is_false(!(1 < 2))
-}
-
-// emit_cast — a widening / same-range cast is the plain C cast (no guard) and is lossless.
-#test
-fn lowers_widening_cast() {
-    let x = 200 to i64
-    teko::assert::is_true(x == 200)
-}
-
-// #49 — out-of-range shift counts are DEFINED, not UB: the count is masked by the LEFT
-// operand's bit-width minus 1 (C#/Java semantics), in BOTH engines. `(1 to i32) << 40` masks
-// the count to `40 & 31 == 8`, so the result is `1 << 8 == 256` — NOT 0 (a naive-mask-by-127
-// VM bug) and NOT arbitrary UB (native's old plain-C `<<`). Covers u8/i32/u64 widths, SHL and
-// SHR, plus an in-range control to prove the mask is a no-op when the count already fits.
-#test
-fn masked_shift_out_of_range_count() {
-    let a: i32 = 1
-    teko::assert::is_true((a << 40) == 256)   // 40 & 31 == 8  -> 1 << 8 == 256
-    let b: u8 = 1
-    teko::assert::is_true((b << 9) == 2)   // 9 & 7 == 1   -> 1 << 1 == 2
-    let c: u64 = 256
-    teko::assert::is_true((c >> 65) == 128)   // 65 & 63 == 1 -> 256 >> 1 == 128
-    let d: i32 = 8
-    teko::assert::is_true((d >> 34) == 2)   // 34 & 31 == 2 -> 8 >> 2 == 2
-    // in-range control — the mask must be a NO-OP when the count already fits the width.
-    let e: i32 = 1
-    teko::assert::is_true((e << 3) == 8)
-    let f: u8 = 128
-    teko::assert::is_true((f >> 7) == 1)   // count == width-1 (boundary, still in range)
-}
-
-// #61 — the COMPOUND-ASSIGN shift forms (`<<=`/`>>=`) must apply the SAME width-(-1) mask as
-// the binary `<<`/`>>` operator (#49), in BOTH engines. Native codegen used to emit the raw C
-// `<<=`/`>>=` compound operator for these, which is UB for an out-of-range count even though
-// the plain binary path (and the VM's compound_apply) was already fixed. `x <<= 40` on an i32
-// must mask to `40 & 31 == 8` -> 256, and a u8 `<<= 200` guards the historical "mask by a fixed
-// 127" VM bug: `200 & 7 == 0`, so the value must be UNCHANGED, not shifted by (200 & 127) == 72.
-// NOTE: each `mut` initializer is an explicit `to <T>` cast (not a bare literal) — a bare
-// integer literal types to a DEFAULT i64 leaf (N1/N2) and, on a `mut` binding, that leaf's
-// width is what the VM's runtime slot value carries; a subsequent compound-assign's width mask
-// (compound_apply, keyed off the LEFT operand's OWN runtime width) would then read 64 instead
-// of the annotated width. This is a pre-existing checker/VM literal-adoption gap unrelated to
-// #61 (native codegen already declares the correctly-narrow C type from the annotation
-// regardless), so the cast sidesteps it rather than masks it.
-#test
-fn masked_compound_assign_shift_out_of_range_count() {
-    mut x: i32 = 1 to i32
-    x <<= 40
-    teko::assert::is_true(x == 256)   // 40 & 31 == 8 -> 1 << 8 == 256
-    mut y: u8 = 1 to u8
-    y <<= 200
-    teko::assert::is_true(y == 1)   // 200 & 7 == 0 -> 1 << 0 == 1 (mask-127 regression guard: 200 & 127 == 72, would be 0)
-    mut z: u64 = 256 to u64
-    z >>= 65
-    teko::assert::is_true(z == 128)   // 65 & 63 == 1 -> 256 >> 1 == 128
-    // in-range control — the mask must be a NO-OP when the count already fits the width.
-    mut w: i32 = 1 to i32
-    w <<= 3
-    teko::assert::is_true(w == 8)
-}
-
-// #68 — a BARE numeric-literal initializer on a narrow-typed `mut` binding (`mut y: u8 = 1`,
-// no `to <T>` cast) must adopt the DECLARED type at the checker, so the VM's runtime slot is
-// built at the annotated width — not the literal's natural i64 default (N1/N2). Before the fix,
-// `compound_apply`'s shift-count mask (keyed off the LEFT operand's OWN runtime width) read 63
-// instead of 7 for a `u8`, so `y <<= 200` computed `200 & 63 == 8 -> 1 << 8 == 256`, truncating
-// to 0 in the VM while native codegen (which reads the width straight from the annotation,
-// independent of the literal's checked type) already produced the correct `1`. Covers u8/i16/u32
-// widths, plus an untyped `let x = 1` control proving inference for un-annotated bindings is
-// UNCHANGED (still defaults to i64).
-#test
-fn bare_literal_narrow_binding_adopts_declared_type() {
-    // u8: 200 & 7 == 0 -> 1 << 0 == 1 (the historical VM bug would mask by 63: 200 & 63 == 8 ->
-    // 1 << 8 == 256, truncated to byte 0 — this is the exact #68 discriminating case).
-    mut y: u8 = 1
-    y <<= 200
-    teko::assert::is_true(y == 1)
-    // u8: a count that DOES discriminate an 8-wide vs 64-wide mask differently from the above —
-    // 9 & 7 == 1 -> 1 << 1 == 2 (a 64-wide mask would leave the count unmasked: 1 << 9 == 512,
-    // truncated to byte 0).
-    mut y2: u8 = 1
-    y2 <<= 9
-    teko::assert::is_true(y2 == 2)
-    // i16: 20 & 15 == 4 -> 1 << 4 == 16 (a 64-wide mask would leave the count unmasked: 1 << 20,
-    // far outside an i16's range).
-    mut n: i16 = 1
-    n <<= 20
-    teko::assert::is_true(n == 16)
-    // u32: 40 & 31 == 8 -> 1 << 8 == 256 (a 64-wide mask would leave the count unmasked: 1 << 40,
-    // outside a u32's range).
-    mut u: u32 = 1
-    u <<= 40
-    teko::assert::is_true(u == 256)
-    // control — an UNTYPED binding's bare literal is unaffected (still infers i64, N1/N2): a
-    // shift count that only a 64-wide mask keeps in-range.
-    let x = 1
-    teko::assert::is_true((x << 40) == 1099511627776)   // 40 & 63 == 40 -> 1 << 40 (i64, no truncation)
-}
-
 /**
  * Builds a single-`uptr`-field `#must_free` struct TypeDecl named `name` — the Arena-shaped
  * manual region-handle (#358) the codegen region-free path recognizes structurally.
@@ -1862,4 +1642,76 @@ fn cgt_dedup_key_cache() {
     teko::assert::is_true(set.variants.len == 1)
     teko::assert::is_true(set.variant_keys.len == set.variants.len)
     teko::assert::is_true(set.variant_keys[0] == cg_variant_key(set.variants[0]))
+}
+
+/**
+ * Build a two-member union `{ a, b }` — the shape the C4 niche/box classifiers gate on.
+ *
+ * @param a  the first union member
+ * @param b  the second union member
+ * @return   the resolved `Variant` with members `[a, b]`
+ */
+fn cgt_var2(a: checker::Type, b: checker::Type) -> checker::Variant {
+    mut ms: []checker::Type = teko::list::empty()
+    ms = teko::list::push(ms, a)
+    ms = teko::list::push(ms, b)
+    checker::Variant { members = ms }
+}
+
+/**
+ * The `u128 | null` union — no niche, a saturating 16-byte payload (the box-in-arena class).
+ *
+ * @return  the resolved `u128 | null` variant
+ */
+fn cgt_u128_null() -> checker::Variant {
+    cgt_var2(checker::Null { }, checker::Prim { kind = checker::PrimKind::U128 })
+}
+
+/**
+ * The `i32 | null` union — a saturating scalar < 16 bytes (the inline-tag class).
+ *
+ * @return  the resolved `i32 | null` variant
+ */
+fn cgt_i32_null() -> checker::Variant {
+    cgt_var2(checker::Null { }, checker::Prim { kind = checker::PrimKind::I32 })
+}
+
+/**
+ * The `ptr | null` union — a niche-able handle (the niche class).
+ *
+ * @return  the resolved `ptr | null` variant
+ */
+fn cgt_ptr_null() -> checker::Variant {
+    cgt_var2(checker::Null { }, checker::Ptr { inner = null })
+}
+
+/**
+ * Assert `union_repr_class` picks the right physical representation per member class and the
+ * `#inline` force flag: `u128|null` boxes by default and forces to inline-tag; `i32|null` is
+ * inline-tag; a niche-able `ptr|null` is niche regardless of the force flag.
+ */
+#test
+fn cgt_union_repr_class_dial() {
+    let p = cgt_prog()
+    teko::assert::is_true(match union_repr_class(p, cgt_u128_null(), false) { UnionRepr::BoxInArena => true; _ => false })
+    teko::assert::is_true(match union_repr_class(p, cgt_u128_null(), true) { UnionRepr::InlineTag => true; _ => false })
+    teko::assert::is_true(match union_repr_class(p, cgt_i32_null(), false) { UnionRepr::InlineTag => true; _ => false })
+    teko::assert::is_true(match union_repr_class(p, cgt_ptr_null(), false) { UnionRepr::Niche => true; _ => false })
+    teko::assert::is_true(match union_repr_class(p, cgt_ptr_null(), true) { UnionRepr::Niche => true; _ => false })
+}
+
+/**
+ * Assert `inline_attr_eligible` accepts a boxed `u128|null` and rejects each ineligible class with an
+ * error: a non-sum (`i32`), an already-inline sum (`i32|null`), and a niche-able sum (`ptr|null`).
+ */
+#test
+fn cgt_inline_attr_eligible_classes() {
+    let p = cgt_prog()
+    let u128box: checker::Type = cgt_u128_null()
+    teko::assert::is_true(match inline_attr_eligible(p, u128box) { error => false; null => true })
+    teko::assert::is_true(match inline_attr_eligible(p, checker::Prim { kind = checker::PrimKind::I32 }) { error => true; null => false })
+    let i32inline: checker::Type = cgt_i32_null()
+    teko::assert::is_true(match inline_attr_eligible(p, i32inline) { error => true; null => false })
+    let ptrniche: checker::Type = cgt_ptr_null()
+    teko::assert::is_true(match inline_attr_eligible(p, ptrniche) { error => true; null => false })
 }

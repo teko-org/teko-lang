@@ -1,0 +1,88 @@
+/**
+ * src/numeric/surface_test.tkt (namespace 'teko::numeric') — LIVE end-to-end #test coverage for the
+ * `bigint`/`dec` SURFACE: the `bi`/`d` literals (with the `0b` binary-literal guard), the operator
+ * sugar (`+ - * / %` and comparisons lowering to the single runtime implementation), and literal
+ * adoption. Proves the whole lex → parse → check → codegen path end to end under the native gate.
+ */
+
+/**
+ * assert_eq_str — assert two strings are byte-equal.
+ *
+ * @param got   the produced string
+ * @param want  the expected string
+ */
+fn assert_eq_str(got: str, want: str) {
+    teko::assert::is_true(got == want)
+}
+
+/**
+ * bigint_literal_lexes_and_renders — a `bi` literal lexes past `i128` and renders back, and the `0b`
+ * guard keeps binary/hex literals intact while `0bi` becomes bigint zero.
+ */
+#test
+fn bigint_literal_lexes_and_renders() {
+    let big: bigint = 123456789012345678901234567890bi
+    assert_eq_str(teko::numeric::bigint::to_str(big), "123456789012345678901234567890")
+    assert_eq_str(teko::numeric::bigint::to_str(0bi), "0")
+    let bin = 0b101
+    teko::assert::is_true(bin == 5)
+    let hex = 0xff
+    teko::assert::is_true(hex == 255)
+}
+
+/**
+ * bigint_operators_compute_factorial_25 — multiplication sugar (`*`) computes 25! exactly and the
+ * string matches; addition/subtraction sugar and literal adoption (`+ 1`) also lower correctly.
+ */
+#test
+fn bigint_operators_compute_factorial_25() {
+    mut acc: bigint = 1bi
+    mut i: i64 = 1
+    loop {
+        if i > 25 { break }
+        acc = acc * teko::numeric::bigint::of(i)
+        i = i + 1
+    }
+    assert_eq_str(teko::numeric::bigint::to_str(acc), "15511210043330985984000000")
+
+    let x: bigint = 100bi
+    let y = x + 1
+    let z = y - 1bi
+    assert_eq_str(teko::numeric::bigint::to_str(y), "101")
+    assert_eq_str(teko::numeric::bigint::to_str(z), "100")
+    assert_eq_str(teko::numeric::bigint::to_str(-5bi), "-5")
+}
+
+/**
+ * bigint_comparisons_and_div_mod — the comparison sugar orders bigints, and `/`/`%` lower to
+ * truncating division and remainder.
+ */
+#test
+fn bigint_comparisons_and_div_mod() {
+    let a: bigint = 500bi
+    let b: bigint = 1000bi
+    teko::assert::is_true(a < b)
+    teko::assert::is_true(b > a)
+    teko::assert::is_true(a <= 500bi)
+    teko::assert::is_true(a == 500bi)
+    teko::assert::is_true(a != b)
+    assert_eq_str(teko::numeric::bigint::to_str(7bi / 3bi), "2")
+    assert_eq_str(teko::numeric::bigint::to_str(-7bi % 3bi), "-1")
+}
+
+/**
+ * dec_sum_distinct_scales — the `d` literal and `+` sugar add decimals with DIFFERENT fractional
+ * scales exactly (`0.1 + 0.2 == 0.3`, `1.5 + 2.25 == 3.75`), and `*`/`/` lower too.
+ */
+#test
+fn dec_sum_distinct_scales() {
+    let sum = 0.1d + 0.2d
+    assert_eq_str(teko::numeric::dec::to_str(sum), "0.3")
+    teko::assert::is_true(sum == 0.3d)
+    assert_eq_str(teko::numeric::dec::to_str(1.5d + 2.25d), "3.75")
+    assert_eq_str(teko::numeric::dec::to_str(10d + 0.001d), "10.001")
+    assert_eq_str(teko::numeric::dec::to_str(1.5d * 1.5d), "2.25")
+    assert_eq_str(teko::numeric::dec::to_str(1d / 4d), "0.25")
+    teko::assert::is_true(0.1d < 0.2d)
+    teko::assert::is_true(0.30d == 0.3d)
+}

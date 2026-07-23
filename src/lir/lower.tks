@@ -258,10 +258,18 @@ fn prim_is_float_kind(k: checker::PrimKind) -> bool {
     k == checker::PrimKind::F16 || k == checker::PrimKind::F32 || k == checker::PrimKind::F64
 }
 
-/** lbinop_of — the LBinOp for an arithmetic operator token given the RESULT's PrimKind.
-    Float kinds pick the F-family; integers pick S/U by signedness. N1 emits only the
-    arithmetic subset; a non-arithmetic operator honest-stops (comparisons/bitwise/shifts
-    are declared in the enum for N2 but not lowered yet). */
+/**
+ * lbinop_of — the LBinOp for a binary operator token given the RESULT's PrimKind. Float
+ * kinds pick the F-family (arithmetic only); integers pick the signed/unsigned opcode
+ * variant by signedness across the arithmetic, bitwise, and shift operators. A token with
+ * no LBinOp in the lowered subset (a non-arithmetic float operator) honest-stops.
+ *
+ * @param op  the binary operator token
+ * @param k   the PrimKind of the operation's result — selects the float/int family and,
+ *            for integers, the signed/unsigned opcode variant
+ * @return    the LBinOp the operator lowers to
+ * @throws    when the operator is out of the lowered subset (a float non-arithmetic op)
+ */
 pub fn lbinop_of(op: lexer::TokenKind, k: checker::PrimKind) -> LBinOp | error {
     if prim_is_float_kind(k) { return lbinop_float(op) }
     lbinop_int(op, prim_is_signed_int(k))
@@ -278,8 +286,20 @@ fn lbinop_float(op: lexer::TokenKind) -> LBinOp | error {
     }
 }
 
-/** lbinop_int — the integer LBinOp for an arithmetic operator token, S/U chosen by
-    `signed`. */
+/**
+ * lbinop_int — the integer LBinOp for an operator token, the signed/unsigned variant chosen
+ * by `signed`. Covers the arithmetic subset (`+ - * / %`), the bitwise operators (`& | ^`),
+ * and the shifts: `<<` is signedness-agnostic (IShl), while `>>` picks the arithmetic
+ * (IShrS) or logical (IShrU) right shift by `signed` — the shift's result carries the LEFT
+ * operand's type, so `signed` there is the shifted value's signedness, exactly as the
+ * checker types it.
+ *
+ * @param op      the binary operator token
+ * @param signed  true when the result's integer type is signed (selects IDivS/IRemS/IShrS
+ *                over the IDivU/IRemU/IShrU variants)
+ * @return        the integer LBinOp the operator lowers to
+ * @throws        when the token is not an integer arithmetic/bitwise/shift operator
+ */
 fn lbinop_int(op: lexer::TokenKind, signed: bool) -> LBinOp | error {
     match op {
         lexer::TokenKind::Plus => LBinOp::IAdd
@@ -287,25 +307,31 @@ fn lbinop_int(op: lexer::TokenKind, signed: bool) -> LBinOp | error {
         lexer::TokenKind::Star => LBinOp::IMul
         lexer::TokenKind::Slash => if signed { LBinOp::IDivS } else { LBinOp::IDivU }
         lexer::TokenKind::Percent => if signed { LBinOp::IRemS } else { LBinOp::IRemU }
+        lexer::TokenKind::Amp => LBinOp::IAnd
+        lexer::TokenKind::Pipe => LBinOp::IOr
+        lexer::TokenKind::Caret => LBinOp::IXor
+        lexer::TokenKind::Shl => LBinOp::IShl
+        lexer::TokenKind::Shr => if signed { LBinOp::IShrS } else { LBinOp::IShrU }
         _ => error { message = "native backend N1: integer operator not yet lowered (N2)" }
     }
 }
 
 /**
- * lunop_of — the LUnOp for an ARITHMETIC prefix operator token given the operand's
- * PrimKind. `-` picks FNeg/INeg by kind. `!` (logical-not) is NOT handled here — it is
- * intercepted in lower_unary and lowered to a logical `operand == 0` (see
- * lower_logical_not), so mapping `!` to the bitwise LUnOp::INot (the F1c miscompile) is
- * gone. N1 does not lower `~`.
+ * lunop_of — the LUnOp for a prefix operator token given the operand's PrimKind. `-` picks
+ * FNeg/INeg by family; `~` (bitwise one's-complement, integer-only per the checker) picks
+ * INot. `!` (logical-not) is NOT handled here — it is intercepted in lower_unary and lowered
+ * to a logical `operand == 0` (see lower_logical_not), so `!` never reaches the bitwise
+ * LUnOp::INot (the F1c miscompile is gone); `~`, a genuine one's-complement, DOES.
  *
- * @param lexer::TokenKind op  the prefix operator token
- * @param checker::PrimKind k  the operand's PrimKind (selects the float/int family for `-`)
- * @return LUnOp  the negation LUnOp for `-`
- * @throws  for any operator other than `-` (`!` is handled by lower_unary; `~` is N2)
+ * @param op  the prefix operator token
+ * @param k   the operand's PrimKind (selects the float/int family for `-`)
+ * @return    the negation LUnOp for `-` (INeg/FNeg), or INot for `~`
+ * @throws    for any operator other than `-`/`~` (`!` is handled by lower_unary)
  */
 pub fn lunop_of(op: lexer::TokenKind, k: checker::PrimKind) -> LUnOp | error {
     match op {
         lexer::TokenKind::Minus => if prim_is_float_kind(k) { LUnOp::FNeg } else { LUnOp::INeg }
+        lexer::TokenKind::Tilde => LUnOp::INot
         _ => error { message = "native backend N1: unary operator not yet lowered (N2)" }
     }
 }

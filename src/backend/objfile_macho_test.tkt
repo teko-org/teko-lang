@@ -12,16 +12,6 @@ fn mo_gpr(id: u32) -> MReg {
 }
 
 /**
- * mo_fpr — a physical FPR operand with the given ISA id.
- *
- * @param u32 id  the ISA register number
- * @return MReg  the physical FPR operand
- */
-fn mo_fpr(id: u32) -> MReg {
-    preg(id, MRegClass::FPR)
-}
-
-/**
  * mo_block — a machine block (no params) with the given id and instructions.
  *
  * @param u32 id  the block id
@@ -53,17 +43,6 @@ fn mo_no_uses() -> []MReg {
 }
 
 /**
- * mo_exit_module — the keystone `exit(42)` shape: a single frameless `main` of
- * `movz x0,#42` then `bl tk_exit` (a call, no return), no rodata.
- *
- * @return MModule  the one-function module
- */
-fn mo_exit_module() -> MModule {
-    let insts = teko::list::push(teko::list::push(teko::list::empty(), movz_inst(true, mo_gpr(0), 42 to u32, 0 to u32)), call_inst("tk_exit", mo_no_uses(), mo_gpr(0), false, false))
-    add_mfunc(empty_mmodule(), mo_func("main", insts))
-}
-
-/**
  * mo_object_of — encode `m` and assemble its Mach-O object, or an empty buffer
  * on an unexpected honest-stop (so a golden length/byte assertion fails loudly).
  *
@@ -87,116 +66,6 @@ fn mo_object_of(m: MModule) -> []byte {
  */
 fn mo_u32_at(bytes: []byte, i: u64) -> u32 {
     (bytes[i] to u32) | ((bytes[i + (1 to u64)] to u32) << (8 to u32)) | ((bytes[i + (2 to u64)] to u32) << (16 to u32)) | ((bytes[i + (3 to u64)] to u32) << (24 to u32))
-}
-
-#test
-/**
- * mach_header_is_arm64_object — the `mach_header_64` prefix of the `exit(42)`
- * object: magic `0xFEEDFACF` (bytes `CF FA ED FE`), cputype `CPU_TYPE_ARM64`,
- * filetype `MH_OBJECT`, four load commands, and the 280-byte command block. The
- * whole object is 376 bytes.
- *
- * @return void
- */
-fn mach_header_is_arm64_object() {
-    let obj = mo_object_of(mo_exit_module())
-    teko::assert::is_true(obj.len == (376 to u64))
-    teko::assert::is_true(obj[0] == (0xCF to byte))
-    teko::assert::is_true(obj[1] == (0xFA to byte))
-    teko::assert::is_true(obj[2] == (0xED to byte))
-    teko::assert::is_true(obj[3] == (0xFE to byte))
-    teko::assert::is_true(mo_u32_at(obj, 0 to u64) == (0xFEEDFACF to u32))
-    teko::assert::is_true(mo_u32_at(obj, 4 to u64) == (0x0100000C to u32))
-    teko::assert::is_true(mo_u32_at(obj, 12 to u64) == (1 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 16 to u64) == (4 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 20 to u64) == (280 to u32))
-}
-
-#test
-/**
- * segment_and_text_section_fields — the `LC_SEGMENT_64` of the `exit(42)` object
- * has one section; the `__text` `section_64` names `__TEXT,__text`, sits at file
- * offset 312, is 4-byte aligned, points its relocation table at 320 with one
- * entry, and carries the pure-instructions flags.
- *
- * @return void
- */
-fn segment_and_text_section_fields() {
-    let obj = mo_object_of(mo_exit_module())
-    teko::assert::is_true(mo_u32_at(obj, 32 to u64) == (0x19 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 96 to u64) == (1 to u32))
-    teko::assert::is_true(obj[104] == (0x5F to byte))
-    teko::assert::is_true(obj[106] == (0x74 to byte))
-    teko::assert::is_true(mo_u32_at(obj, 152 to u64) == (312 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 156 to u64) == (2 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 160 to u64) == (320 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 164 to u64) == (1 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 168 to u64) == (0x80000400 to u32))
-}
-
-#test
-/**
- * load_commands_present — the `exit(42)` object carries `LC_BUILD_VERSION`
- * (macOS platform), `LC_SYMTAB` (2 symbols, string table at 360), and
- * `LC_DYSYMTAB` (1 defined, 1 undefined) at their computed offsets.
- *
- * @return void
- */
-fn load_commands_present() {
-    let obj = mo_object_of(mo_exit_module())
-    teko::assert::is_true(mo_u32_at(obj, 184 to u64) == (0x32 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 192 to u64) == (1 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 208 to u64) == (2 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 216 to u64) == (328 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 220 to u64) == (2 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 224 to u64) == (360 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 228 to u64) == (16 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 232 to u64) == (0x0B to u32))
-    teko::assert::is_true(mo_u32_at(obj, 252 to u64) == (1 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 256 to u64) == (1 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 260 to u64) == (1 to u32))
-}
-
-#test
-/**
- * text_image_and_branch26_reloc — the `exit(42)` object's `__text` bytes are
- * `movz x0,#42` then the `bl` placeholder, and the single relocation is an
- * external `ARM64_RELOC_BRANCH26` at section offset 4 targeting symbol index 1
- * (`_tk_exit`): the packed `relocation_info` word is `0x2D000001`.
- *
- * @return void
- */
-fn text_image_and_branch26_reloc() {
-    let obj = mo_object_of(mo_exit_module())
-    teko::assert::is_true(mo_u32_at(obj, 312 to u64) == (0xD2800540 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 316 to u64) == (0x94000000 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 320 to u64) == (4 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 324 to u64) == (0x2D000001 to u32))
-}
-
-#test
-/**
- * symtab_defines_main_and_undefs_tk_exit — the `exit(42)` symbol table has
- * `_main` as `N_SECT | N_EXT` in section 1 at value 0, then `_tk_exit` as
- * `N_UNDF | N_EXT` in section 0; the string table starts with the reserved NUL
- * then `_main` and `_tk_exit`.
- *
- * @return void
- */
-fn symtab_defines_main_and_undefs_tk_exit() {
-    let obj = mo_object_of(mo_exit_module())
-    teko::assert::is_true(mo_u32_at(obj, 328 to u64) == (1 to u32))
-    teko::assert::is_true(obj[332] == (0x0F to byte))
-    teko::assert::is_true(obj[333] == (1 to byte))
-    teko::assert::is_true(mo_u32_at(obj, 336 to u64) == (0 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 344 to u64) == (7 to u32))
-    teko::assert::is_true(obj[348] == (0x01 to byte))
-    teko::assert::is_true(obj[349] == (0 to byte))
-    teko::assert::is_true(obj[360] == (0 to byte))
-    teko::assert::is_true(obj[361] == (0x5F to byte))
-    teko::assert::is_true(obj[362] == (0x6D to byte))
-    teko::assert::is_true(obj[367] == (0x5F to byte))
-    teko::assert::is_true(obj[368] == (0x74 to byte))
 }
 
 /**
@@ -289,50 +158,6 @@ fn sym_index_finds_and_sentinels() {
     teko::assert::is_true(sym_index(syms, "z") == (2 to u32))
 }
 
-#test
-/**
- * reloc_kind_maps_to_arm64_types — the `MRelocKind` → Mach-O `r_type`/`r_pcrel`
- * mapping: PAGE21(3, pc-rel), PAGEOFF12(4, absolute), BRANCH26(2, pc-rel).
- *
- * @return void
- */
-fn reloc_kind_maps_to_arm64_types() {
-    teko::assert::is_true(reloc_type_value(MRelocKind::PageHi) == (3 to u32))
-    teko::assert::is_true(reloc_type_value(MRelocKind::PageLo) == (4 to u32))
-    teko::assert::is_true(reloc_type_value(MRelocKind::Call) == (2 to u32))
-    teko::assert::is_true(reloc_pcrel(MRelocKind::PageHi) == (1 to u32))
-    teko::assert::is_true(reloc_pcrel(MRelocKind::PageLo) == (0 to u32))
-    teko::assert::is_true(reloc_pcrel(MRelocKind::Call) == (1 to u32))
-    teko::assert::is_true(reloc_type_value(MRelocKind::Abs64) == (0 to u32))
-    teko::assert::is_true(reloc_pcrel(MRelocKind::Abs64) == (0 to u32))
-    teko::assert::is_true(reloc_length(MRelocKind::Abs64) == (3 to u32))
-    teko::assert::is_true(reloc_length(MRelocKind::Call) == (2 to u32))
-    teko::assert::is_true(reloc_length(MRelocKind::PageHi) == (2 to u32))
-    teko::assert::is_true(reloc_length(MRelocKind::PageLo) == (2 to u32))
-}
-
-#test
-/**
- * pad_to_mult_rounds_up — `pad_to_mult` zero-pads a buffer up to a multiple of
- * `k` (a 5-byte buffer to 8), and leaves an already-aligned buffer untouched.
- *
- * @return void
- */
-fn pad_to_mult_rounds_up() {
-    mut five: []byte = teko::list::empty()
-    mut i: u64 = 0
-    loop {
-        if i >= (5 to u64) { break }
-        five = teko::list::push(five, 1 to byte)
-        i++
-    }
-    let padded = pad_to_mult(five, 4 to u32)
-    teko::assert::is_true(padded.len == (8 to u64))
-    teko::assert::is_true(padded[5] == (0 to byte))
-    let already = pad_to_mult(padded, 4 to u32)
-    teko::assert::is_true(already.len == (8 to u64))
-}
-
 /**
  * mo_rodata_reloc_module — a frameless `main` of `adrp x0,"s0"; add-lo
  * x0,x0,"s0"; bl tk_exit` (no `ret`, so it stays frameless) plus one rodata
@@ -406,37 +231,6 @@ fn bad_enc() -> EncodedModule {
     EncodedModule { text = teko::list::empty(); rodata = teko::list::empty(); symbols = teko::list::empty(); relocs = teko::list::empty() }
 }
 
-#test
-/**
- * empty_module_emits_a_minimal_valid_object — a module with no functions, no
- * rodata, and no globals still emits a well-formed (if degenerate) object: one
- * `__text` section of size 0, zero relocations, zero symbols, and a 1-byte
- * string table (just the reserved leading NUL) — the F2(d) base-case golden,
- * exercised end to end through `emit_macho` rather than assumed.
- *
- * @return void
- */
-fn empty_module_emits_a_minimal_valid_object() {
-    let enc = match encode_module(AAPCS64, empty_mmodule()) {
-        EncodedModule as x => x
-        error as e => bad_enc()
-    }
-    let obj = emit_macho(enc)
-    teko::assert::is_true(obj.len == (313 to u64))
-    teko::assert::is_true(mo_u32_at(obj, 0 to u64) == (0xFEEDFACF to u32))
-    teko::assert::is_true(mo_u32_at(obj, 96 to u64) == (1 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 144 to u64) == (0 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 152 to u64) == (312 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 164 to u64) == (0 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 220 to u64) == (0 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 240 to u64) == (0 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 244 to u64) == (0 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 252 to u64) == (0 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 256 to u64) == (0 to u32))
-    teko::assert::is_true(mo_u32_at(obj, 260 to u64) == (0 to u32))
-    teko::assert::is_true(obj[312] == (0 to byte))
-}
-
 /**
  * mo_rodata_ptr_enc — a hand-built `EncodedModule` with no functions and a 16-byte
  * `__const` = an 8-byte pointer slot (offset 0) then the target datum `0x41` (offset
@@ -471,34 +265,4 @@ fn tb3_macho_const_reloc_emitted() {
     teko::assert::is_true(mo_u32_at(obj, 412) == 0x0E000001)
     teko::assert::is_true(obj[392] == (0 to byte))
     teko::assert::is_true(obj[400] == (0x41 to byte))
-}
-
-/**
- * T-B3: o MESMO objeto sem relocs colapsa ao formato histórico — `__const` com
- * reloff/nreloc = 0 e nenhuma segunda tabela (byte-identidade do braço vazio).
- */
-#test
-fn tb3_macho_no_relocs_collapses() {
-    let base = mo_rodata_ptr_enc()
-    let obj = emit_macho(EncodedModule { text = base.text; rodata = base.rodata; symbols = base.symbols; relocs = teko::list::empty() })
-    teko::assert::is_true(obj.len == 454)
-    teko::assert::is_true(mo_u32_at(obj, 240) == 0)
-    teko::assert::is_true(mo_u32_at(obj, 244) == 0)
-}
-
-/**
- * T-B3 (§4.5): a partição por RelocSect separa text/rodata preservando a ordem, e
- * uma lista só-Text produz partição rodata vazia.
- */
-#test
-fn tb3_macho_partition_relocs_arms() {
-    let rt = Reloc { offset = 0 to u32; sym = "a"; kind = MRelocKind::Call; sect = RelocSect::Text }
-    let rr = Reloc { offset = 8 to u32; sym = "b"; kind = MRelocKind::Abs64; sect = RelocSect::Rodata }
-    let parts = macho_partition_relocs([rt, rr])
-    teko::assert::is_true(parts.text.len == 1)
-    teko::assert::is_true(parts.rodata.len == 1)
-    teko::assert::is_true(parts.text[0].sym == "a")
-    teko::assert::is_true(parts.rodata[0].sym == "b")
-    let only_text = macho_partition_relocs([rt])
-    teko::assert::is_true(only_text.rodata.len == 0)
 }

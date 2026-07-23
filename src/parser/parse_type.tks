@@ -44,7 +44,42 @@ fn parse_null_type(pos: u64) -> ParsedType {
     ParsedType { node = NamedType { path = Path { segments = segs }; args = teko::list::empty() }; next = pos + 1; pending_gt = 0 }
 }
 
+/**
+ * is_ref_grafia_at — is the token at `pos` the contextual `ref` keyword used as the SAFE-reference
+ * type grafia (0.3.0.30 Part A)? `ref` is NOT a reserved token (the lexer emits a plain `Ident`);
+ * it becomes the reference grafia only in a type position, when the `ref` identifier is immediately
+ * followed by another token that can begin a type (a name, `[`, `(`, or `ref` again for nesting).
+ * A bare identifier literally named `ref` at the end of a type (none exist in the corpus) stays an
+ * ordinary named type.
+ *
+ * @param tokens  the token stream
+ * @param pos     the candidate `ref` position
+ * @return        true iff `pos` opens a `ref`-grafia reference type
+ */
+fn is_ref_grafia_at(tokens: []lexer::Token, pos: u64) -> bool {
+    if !(is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "ref") { return false }
+    is_name_at(tokens, pos + 1) || is_kind_at(tokens, pos + 1, lexer::TokenKind::LBracket) || is_kind_at(tokens, pos + 1, lexer::TokenKind::LParen)
+}
+
+/**
+ * wrap_ref_type — build the compiler-internal reference type `Ref<inner>` (checker `Reference{inner}`)
+ * that the surface `ref`-grafia desugars to. `Ref` is the compiler-internal name of the safe reference
+ * (invisible on the surface, per the ratified 0.3.1 model); the `ref` keyword is its only user grafia.
+ *
+ * @param inner  the referenced (pointee) type
+ * @return       a `NamedType` `Ref<inner>` resolving to `checker::Reference{inner}`
+ */
+fn wrap_ref_type(inner: TypeExpr) -> TypeExpr {
+    let segs = teko::list::push(teko::list::empty(), Segment { name = "Ref" })
+    let args = teko::list::push(teko::list::empty(), inner)
+    NamedType { path = Path { segments = segs }; args = args }
+}
+
 fn parse_type_primary(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+    if is_ref_grafia_at(tokens, pos) {
+        let inner = match parse_type_primary(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
+        return ParsedType { node = wrap_ref_type(inner.node); next = inner.next; pending_gt = inner.pending_gt }
+    }
     let base = if is_kind_at(tokens, pos, lexer::TokenKind::LBracket) {
         match parse_slice(tokens, pos) { ParsedType as x => x; error as e => return e }
     } else if is_kind_at(tokens, pos, lexer::TokenKind::LParen) {

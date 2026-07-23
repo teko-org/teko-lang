@@ -1,0 +1,388 @@
+use teko::numeric::bigint
+
+/**
+ * src/numeric/dec/dec.tks (namespace 'teko::numeric::dec') — the arbitrary-precision base-10
+ * fixed/decimal engine that backs the compiler-known `dec` surface type and its operator sugar.
+ *
+ * The `dec` surface (`1.5d` literals, `+ - * /` and comparisons) lowers to the functions in THIS
+ * module — one runtime implementation, no doubling. A `Decimal` is an exact rational whose
+ * denominator is a power of ten: two `BigInt`s, `num` and `den = 10^k`. Exact base-10 arithmetic
+ * (money, no binary-float rounding). Reuses the pure-Teko `teko::numeric::bigint` engine, so `dec`
+ * needs no C either and survives kill-c (numeric-completeness design §4).
+ *
+ * DIVISION is exact-or-panic: `a / b` panics unless the reduced result terminates in base 10 (its
+ * denominator's only prime factors are 2 and 5). Modulo (`%`) is NOT defined on `dec` (the checker
+ * rejects it).
+ */
+
+/**
+ * The base-10 radix used to normalize the power-of-ten denominator and to scale between decimals.
+ */
+const RADIX: u64 = 10
+
+/**
+ * The low prime factor of the decimal radix (`10 = 2 * 5`). A reduced fraction terminates in base 10
+ * exactly when its denominator's only prime factors are `RADIX_PRIME_LO` and `RADIX_PRIME_HI`, so
+ * `div` extracts these to test exactness and to rebuild the power-of-ten denominator.
+ */
+const RADIX_PRIME_LO: u64 = 2
+
+/**
+ * The high prime factor of the decimal radix (`10 = 2 * 5`); see `RADIX_PRIME_LO`.
+ */
+const RADIX_PRIME_HI: u64 = 5
+
+/**
+ * Arbitrary-precision base-10 decimal: the exact value `num / den`, where `den` is a non-negative
+ * power of ten (`10^k`). Value-semantic and immutable — every operation returns a fresh, normalized
+ * value. The compiler-known `dec` surface name resolves to this struct.
+ */
+pub type Decimal = struct {
+    /** The signed numerator (a `BigInt`); carries the value's sign. */
+    num: bigint::BigInt
+    /** The denominator, always a positive `BigInt` power of ten (`10^k`, `k >= 0`). */
+    den: bigint::BigInt
+}
+
+/**
+ * A factor-extraction result: how many times a small prime divided a value, and the reduced value
+ * after removing them.
+ */
+type FactorOut = struct {
+    /** The number of times the factor divided the input. */
+    count: u64
+    /** The input with all copies of the factor removed. */
+    reduced: bigint::BigInt
+}
+
+/**
+ * `base ** e` as a `BigInt` (repeated multiplication; `e` small).
+ *
+ * @param base  the base value
+ * @param e     the exponent
+ * @return      `base` raised to `e`
+ */
+fn pow_small(base: u64, e: u64) -> bigint::BigInt {
+    let b = bigint::of(base to i64)
+    mut r = bigint::one()
+    mut i: u64 = 0
+    loop {
+        if i >= e { break }
+        r = bigint::mul(r, b)
+        i = i + 1
+    }
+    r
+}
+
+/**
+ * `10^k` as a `BigInt` (a canonical power-of-ten denominator).
+ *
+ * @param k  the exponent
+ * @return   `10^k`
+ */
+fn pow10(k: u64) -> bigint::BigInt {
+    pow_small(RADIX, k)
+}
+
+/**
+ * The greatest common divisor of two `BigInt`s (Euclid over their magnitudes).
+ *
+ * @param a  the first value
+ * @param b  the second value
+ * @return   `gcd(|a|, |b|)`, non-negative
+ */
+fn big_gcd(a: bigint::BigInt, b: bigint::BigInt) -> bigint::BigInt {
+    mut x = bigint::abs(a)
+    mut y = bigint::abs(b)
+    loop {
+        if bigint::is_zero(y) { break }
+        let r = bigint::rem(x, y)
+        x = y
+        y = r
+    }
+    x
+}
+
+/**
+ * Remove every factor `f` from a non-negative `BigInt`, counting how many were removed.
+ *
+ * @param x  the value to reduce
+ * @param f  the small prime factor to extract
+ * @return   the removal count and the reduced value
+ */
+fn extract_factor(x: bigint::BigInt, f: u64) -> FactorOut {
+    let fb = bigint::of(f to i64)
+    mut cur = x
+    mut cnt: u64 = 0
+    loop {
+        if bigint::is_zero(cur) { break }
+        if !bigint::is_zero(bigint::rem(cur, fb)) { break }
+        cur = bigint::div(cur, fb)
+        cnt = cnt + 1
+    }
+    FactorOut { count = cnt; reduced = cur }
+}
+
+/**
+ * The larger of two `u64`s.
+ *
+ * @param a  the first value
+ * @param b  the second value
+ * @return   `max(a, b)`
+ */
+fn max_u64(a: u64, b: u64) -> u64 {
+    if a > b { return a }
+    b
+}
+
+/**
+ * Normalize a decimal: trim shared factors of ten from `num`/`den` so the scale is minimal, and
+ * canonicalize zero to `0 / 1`. The denominator stays a power of ten.
+ *
+ * @param d  the (possibly denormalized) decimal
+ * @return   the normalized decimal
+ */
+pub fn normalize(d: Decimal) -> Decimal {
+    if bigint::is_zero(d.num) { return Decimal { num = bigint::zero(); den = bigint::one() } }
+    let ten = bigint::of(RADIX to i64)
+    mut num = d.num
+    mut den = d.den
+    loop {
+        if bigint::eq(den, bigint::one()) { break }
+        if !bigint::is_zero(bigint::rem(num, ten)) { break }
+        num = bigint::div(num, ten)
+        den = bigint::div(den, ten)
+    }
+    Decimal { num = num; den = den }
+}
+
+/**
+ * The whole `Decimal` for a machine `i64` (denominator `1`).
+ *
+ * @param n  the machine integer
+ * @return   `n` as a `Decimal`
+ */
+pub fn of(n: i64) -> Decimal {
+    Decimal { num = bigint::of(n); den = bigint::one() }
+}
+
+/**
+ * Parse a decimal string into a `Decimal`. Accepts `[-]int[.frac][e[+-]exp]` with `_` group
+ * separators. Returns an error for malformed input.
+ *
+ * @param s  the decimal text
+ * @return   the parsed value, or an error describing the malformed input
+ * @throws   when `s` is empty, has no digit, or contains an invalid character
+ */
+pub fn from_str(s: str) -> Decimal | error {
+    if s.len == 0 { return error { message = "dec::from_str: empty string" } }
+    mut i: u64 = 0
+    mut neg = false
+    if s[0] == b'-' { neg = true; i = 1 } else { if s[0] == b'+' { i = 1 } }
+    mut digits: []byte = teko::list::empty()
+    mut scale: u64 = 0
+    mut seen_dot = false
+    mut saw_digit = false
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        if c == b'_' { i = i + 1; continue }
+        if c == b'e' || c == b'E' { break }
+        if c == b'.' {
+            if seen_dot { return error { message = "dec::from_str: multiple decimal points" } }
+            seen_dot = true
+            i = i + 1
+            continue
+        }
+        if c < b'0' || c > b'9' { return error { message = "dec::from_str: invalid character" } }
+        digits = teko::list::push(digits, c)
+        if seen_dot { scale = scale + 1 }
+        saw_digit = true
+        i = i + 1
+    }
+    if !saw_digit { return error { message = "dec::from_str: no digits" } }
+    let expv = match parse_exponent(s, i) { i64 as e => e; error as er => return er }
+    let digstr = match teko::str::str_from_utf8(digits) { str as ss => ss; error => return error { message = "dec::from_str: internal digit encoding" } }
+    mut num = match bigint::from_str(digstr) { bigint::BigInt as bb => bb; error as e => return e }
+    if neg { num = bigint::neg(num) }
+    let fscale: i64 = (scale to i64) - expv
+    if fscale >= 0 { return normalize(Decimal { num = num; den = pow10(fscale to u64) }) }
+    let scaled = bigint::mul(num, pow10((0 - fscale) to u64))
+    normalize(Decimal { num = scaled; den = bigint::one() })
+}
+
+/**
+ * Parse an optional `[eE][+-]?digits` exponent starting at `i`. When no exponent is present the
+ * exponent is `0`.
+ *
+ * @param s  the full source text
+ * @param i  the index at (or past) the mantissa
+ * @return   the exponent value, or an error for a malformed exponent
+ * @throws   when an `e`/`E` is not followed by at least one digit or carries an invalid character
+ */
+fn parse_exponent(s: str, i: u64) -> i64 | error {
+    if i >= s.len { return 0 }
+    if s[i] != b'e' && s[i] != b'E' { return 0 }
+    mut j = i + 1
+    mut eneg = false
+    if j < s.len && s[j] == b'-' { eneg = true; j = j + 1 } else { if j < s.len && s[j] == b'+' { j = j + 1 } }
+    mut eval: i64 = 0
+    mut esaw = false
+    loop {
+        if j >= s.len { break }
+        let c = s[j]
+        if c == b'_' { j = j + 1; continue }
+        if c < b'0' || c > b'9' { return error { message = "dec::from_str: invalid exponent" } }
+        eval = eval * (RADIX to i64) + ((c to i64) - (b'0' to i64))
+        esaw = true
+        j = j + 1
+    }
+    if !esaw { return error { message = "dec::from_str: empty exponent" } }
+    if eneg { return 0 - eval }
+    eval
+}
+
+/**
+ * Parse a literal decimal string (the numeric text a `d` literal desugars to) into a `Decimal`. The
+ * lexer guarantees the text is a valid decimal literal, so this never fails in practice; a malformed
+ * input panics rather than returning an error.
+ *
+ * @param s  the literal decimal text (no suffix)
+ * @return   the parsed value
+ */
+pub fn of_lit(s: str) -> Decimal {
+    match from_str(s) {
+        Decimal as d => d
+        error as e => panic(e.message)
+    }
+}
+
+/**
+ * The power-of-ten exponent `k` of a canonical denominator `10^k` (its number of trailing zeros).
+ *
+ * @param den  a `BigInt` equal to `10^k`
+ * @return     the exponent `k`
+ */
+fn den_scale(den: bigint::BigInt) -> u64 {
+    let s = bigint::to_str(den)
+    s.len - 1
+}
+
+/**
+ * Render a `Decimal` to its canonical decimal string (a leading `-` for a negative value, a `.` when
+ * the scale is nonzero, no trailing zeros beyond the minimal scale).
+ *
+ * @param x  the value
+ * @return   the decimal text
+ */
+pub fn to_str(x: Decimal) -> str {
+    let nx = normalize(x)
+    let k = den_scale(nx.den)
+    let numabs = bigint::to_str(bigint::abs(nx.num))
+    let sign = if bigint::is_neg(nx.num) { "-" } else { "" }
+    if k == 0 { return teko::str::concat(sign, numabs) }
+    mut digits = numabs
+    loop {
+        if digits.len >= k + 1 { break }
+        digits = teko::str::concat("0", digits)
+    }
+    let intpart = teko::str::slice_to(digits, digits.len - k)
+    let fracpart = teko::str::slice_from(digits, digits.len - k)
+    teko::str::concat(sign, intpart, ".", fracpart)
+}
+
+/**
+ * Negate a `Decimal`.
+ *
+ * @param x  the value
+ * @return   `-x`
+ */
+pub fn neg(x: Decimal) -> Decimal {
+    Decimal { num = bigint::neg(x.num); den = x.den }
+}
+
+/**
+ * Add two decimals exactly (common denominator via cross-multiplication, then normalize).
+ *
+ * @param a  the left addend
+ * @param b  the right addend
+ * @return   `a + b`
+ */
+pub fn add(a: Decimal, b: Decimal) -> Decimal {
+    let num = bigint::add(bigint::mul(a.num, b.den), bigint::mul(b.num, a.den))
+    let den = bigint::mul(a.den, b.den)
+    normalize(Decimal { num = num; den = den })
+}
+
+/**
+ * Subtract `b` from `a` exactly.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return   `a - b`
+ */
+pub fn sub(a: Decimal, b: Decimal) -> Decimal {
+    let num = bigint::sub(bigint::mul(a.num, b.den), bigint::mul(b.num, a.den))
+    let den = bigint::mul(a.den, b.den)
+    normalize(Decimal { num = num; den = den })
+}
+
+/**
+ * Multiply two decimals exactly.
+ *
+ * @param a  the left factor
+ * @param b  the right factor
+ * @return   `a * b`
+ */
+pub fn mul(a: Decimal, b: Decimal) -> Decimal {
+    let num = bigint::mul(a.num, b.num)
+    let den = bigint::mul(a.den, b.den)
+    normalize(Decimal { num = num; den = den })
+}
+
+/**
+ * Divide `a` by `b`, EXACT-OR-PANIC: the result must terminate in base 10 (its reduced denominator's
+ * only prime factors are 2 and 5). A non-terminating quotient (e.g. `1 / 3`) panics rather than
+ * silently rounding; a zero divisor panics.
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return   the exact quotient
+ */
+pub fn div(a: Decimal, b: Decimal) -> Decimal {
+    mut p = bigint::mul(a.num, b.den)
+    mut q = bigint::mul(a.den, b.num)
+    if bigint::is_zero(q) { panic("dec::div: division by zero") }
+    if bigint::is_neg(q) { p = bigint::neg(p); q = bigint::neg(q) }
+    let g = big_gcd(p, q)
+    p = bigint::div(p, g)
+    q = bigint::div(q, g)
+    let f2 = extract_factor(q, RADIX_PRIME_LO)
+    let f5 = extract_factor(f2.reduced, RADIX_PRIME_HI)
+    if !bigint::eq(f5.reduced, bigint::one()) { panic("dec::div: non-terminating quotient (not exact)") }
+    let k = max_u64(f2.count, f5.count)
+    let num = bigint::mul(p, bigint::mul(pow_small(RADIX_PRIME_LO, k - f2.count), pow_small(RADIX_PRIME_HI, k - f5.count)))
+    normalize(Decimal { num = num; den = pow10(k) })
+}
+
+/**
+ * Three-way compare of two decimals (cross-multiplication; both denominators are positive).
+ *
+ * @param a  the left value
+ * @param b  the right value
+ * @return   `1` if `a > b`, `-1` if `a < b`, `0` if equal
+ */
+pub fn cmp(a: Decimal, b: Decimal) -> i64 {
+    bigint::cmp(bigint::mul(a.num, b.den), bigint::mul(b.num, a.den))
+}
+
+/**
+ * Value equality of two decimals.
+ *
+ * @param a  the left value
+ * @param b  the right value
+ * @return   `true` iff `a == b`
+ */
+pub fn eq(a: Decimal, b: Decimal) -> bool {
+    cmp(a, b) == 0
+}

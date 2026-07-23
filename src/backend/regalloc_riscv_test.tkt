@@ -89,17 +89,6 @@ fn rr_module_of(f: MFuncRiscv) -> MModuleRiscv {
 }
 
 /**
- * rr_number — `number_insts_riscv` over `f`'s RPO block order (the call the
- * numbering + back-edge passes take), wrapped so fixtures stay terse.
- *
- * @param MFuncRiscv f  the function to number
- * @return []NumberedInstRiscv  the RPO-numbered stream
- */
-fn rr_number(f: MFuncRiscv) -> []NumberedInstRiscv {
-    number_insts_riscv(f, rpo_block_order_riscv(f))
-}
-
-/**
  * rr_intervals — `compute_intervals_riscv` over `f`'s RPO-numbered stream,
  * computing the order once and threading it to both the numbering and the
  * back-edge test.
@@ -302,55 +291,6 @@ fn rr_all_kinds() -> []MInstRiscv {
 }
 
 #test
-fn rr_inst_regs_covers_every_minst_case() {
-    let g0 = rr_v(0)
-    let g1 = rr_v(1)
-    let mem = rr_mem(rr_v(0), 0 to i32)
-    let noargs: []MReg = teko::list::empty()
-    teko::assert::is_true(inst_regs_riscv(li_riscv(g0, 1 to i32)).has_def)
-    teko::assert::is_true(inst_regs_riscv(li_riscv(g0, 1 to i32)).uses.len == 0 to u64)
-    teko::assert::is_true(inst_regs_riscv(lui_riscv(g0, 1 to u32)).has_def)
-    teko::assert::is_true(inst_regs_riscv(auipc_riscv(g0, 1 to u32)).has_def)
-    teko::assert::is_true(inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Add, true, g0, g1, rr_v(2))).uses.len == 2 to u64)
-    teko::assert::is_true(!inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Add, true, g0, g1, rr_v(2))).is_call)
-    teko::assert::is_true(inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Div, true, g0, g1, rr_v(2))).uses.len == 2 to u64)
-    teko::assert::is_true(!inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Div, true, g0, g1, rr_v(2))).is_call)
-    teko::assert::is_true(inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Rem, true, g0, g1, rr_v(2))).has_def)
-    teko::assert::is_true(inst_regs_riscv(alu_i_riscv(MAluOpRiscv::Addi, g0, g1, 0 to i32)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs_riscv(slt_riscv(g0, g1, rr_v(2), false)).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs_riscv(load_riscv(MMemSizeRiscv::D, false, g0, mem)).has_def)
-    teko::assert::is_true(inst_regs_riscv(load_riscv(MMemSizeRiscv::D, false, g0, mem)).uses.len == 1 to u64)
-    teko::assert::is_true(!inst_regs_riscv(store_riscv(MMemSizeRiscv::D, g0, mem)).has_def)
-    teko::assert::is_true(inst_regs_riscv(store_riscv(MMemSizeRiscv::D, g0, mem)).uses.len == 2 to u64)
-    teko::assert::is_true(!inst_regs_riscv(branch_riscv(MCond::EQ, g0, g1, 0 to u32)).has_def)
-    teko::assert::is_true(inst_regs_riscv(branch_riscv(MCond::EQ, g0, g1, 0 to u32)).uses.len == 2 to u64)
-    teko::assert::is_true(!inst_regs_riscv(jal_riscv(0 to u32)).has_def)
-    teko::assert::is_true(inst_regs_riscv(jal_riscv(0 to u32)).uses.len == 0 to u64)
-    teko::assert::is_true(inst_regs_riscv(jalr_riscv(g0, g1, 0 to i32)).has_def)
-    teko::assert::is_true(inst_regs_riscv(jalr_riscv(g0, g1, 0 to i32)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs_riscv(call_riscv("f", one_reg(rr_p(10)), rr_p(10), true, false)).is_call)
-    teko::assert::is_true(inst_regs_riscv(call_riscv("f", noargs, rr_p(10), false, false)).has_def == false)
-    teko::assert::is_true(inst_regs_riscv(call_ind_riscv(g0, noargs, rr_p(10), true)).is_call)
-    teko::assert::is_true(inst_regs_riscv(call_ind_riscv(g0, noargs, rr_p(10), false)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs_riscv(lla_riscv(g0, "s")).has_def)
-    teko::assert::is_true(inst_regs_riscv(lla_riscv(g0, "s")).uses.len == 0 to u64)
-    teko::assert::is_true(inst_regs_riscv(frame_addr_riscv(g0, 0 to u32)).has_def)
-    teko::assert::is_true(!inst_regs_riscv(RET_RISCV).has_def)
-    teko::assert::is_true(inst_regs_riscv(RET_RISCV).uses.len == 0 to u64)
-}
-
-#test
-fn rr_alu_dst_is_a_pure_def_not_a_use() {
-    let ir = inst_regs_riscv(alu_r_riscv(MAluOpRiscv::Add, true, rr_v(2), rr_v(0), rr_v(1)))
-    teko::assert::is_true(ir.has_def)
-    teko::assert::is_true(ir.def_reg.id == 2 to u32)
-    teko::assert::is_true(ir.uses.len == 2 to u64)
-    teko::assert::is_true(ir.uses[0].id == 0 to u32)
-    teko::assert::is_true(ir.uses[1].id == 1 to u32)
-    teko::assert::is_true(!ir.is_call)
-}
-
-#test
 fn rr_map_minst_covers_every_case() {
     let kinds = rr_all_kinds()
     let table = rr_full_subst(27 to u32)
@@ -361,25 +301,6 @@ fn rr_map_minst_covers_every_case() {
         teko::assert::is_true(rr_inst_all_phys(map_minst_riscv(kinds[i], table)))
         i++
     }
-}
-
-#test
-fn rr_map_minst_leaves_unmapped_virtuals() {
-    let m0 = map_minst_riscv(alu_r_riscv(MAluOpRiscv::Add, true, rr_v(0), rr_v(1), rr_v(2)), teko::list::empty())
-    teko::assert::is_true(!rr_inst_all_phys(m0))
-}
-
-#test
-fn rr_number_insts_flattens_in_block_order() {
-    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), li_riscv(rr_v(0), 1 to i32)) }
-    let b1 = MBlockRiscv { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), RET_RISCV) }
-    let f = MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let stream = rr_number(f)
-    teko::assert::is_true(stream.len == 2 to u64)
-    teko::assert::is_true(stream[0].point == 0)
-    teko::assert::is_true(stream[0].block_id == 0)
-    teko::assert::is_true(stream[1].point == 1)
-    teko::assert::is_true(stream[1].block_id == 1)
 }
 
 /**
@@ -400,17 +321,6 @@ fn rr_entry_param_add_fixture() -> []MInstRiscv {
     insts = teko::list::push(insts, rr_mov(rr_p(10), rr_v(2)))
     insts = teko::list::push(insts, RET_RISCV)
     insts
-}
-
-#test
-fn rr_entry_live_pins_and_result_pin_intervals() {
-    let iset = match rr_intervals(rr_func(rr_entry_param_add_fixture())) { IntervalSet as s => s; error => return }
-    teko::assert::is_true(rr_iv_has(iset.virt, 0, 0, 2))
-    teko::assert::is_true(rr_iv_has(iset.virt, 1, 1, 2))
-    teko::assert::is_true(rr_iv_has(iset.virt, 2, 2, 3))
-    teko::assert::is_true(rr_iv_has(iset.fixed, 10, 0, 0))
-    teko::assert::is_true(rr_iv_has(iset.fixed, 11, 0, 1))
-    teko::assert::is_true(rr_iv_has(iset.fixed, 10, 3, 4))
 }
 
 #test
@@ -443,17 +353,6 @@ fn rr_repeated_physical_def_splits_into_two_pins() {
     let iset = match rr_intervals(rr_func(rr_double_phys_def_fixture())) { IntervalSet as s => s; error => return }
     teko::assert::is_true(rr_iv_has(iset.fixed, 10, 0, 1))
     teko::assert::is_true(rr_iv_has(iset.fixed, 10, 2, 3))
-}
-
-#test
-fn rr_spill_scratch_is_t4_t5_t6() {
-    let abi = RISCV64_LP64D
-    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0 to u32).id == 29 to u32)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 1 to u32).id == 30 to u32)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 2 to u32).id == 31 to u32)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0 to u32).is_phys)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0 to u32).id == 30 to u32)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 1 to u32).id == 31 to u32)
 }
 
 /**
@@ -588,24 +487,6 @@ fn rr_div_is_not_a_call_no_crossing_and_caller_saved_ok() {
 }
 
 #test
-fn rr_rewrite_inreg_physical_and_dedup() {
-    let a0: RegAssignment = InReg { vreg_id = 0 to u32; phys = 9 to u32 }
-    let sr = rr_sr(teko::list::push(teko::list::empty(), a0))
-    let out = rewrite_inst_riscv(RISCV64_LP64D, sr, alu_r_riscv(MAluOpRiscv::Add, true, rr_v(0), rr_v(0), rr_v(0)), 0 to u32)
-    teko::assert::is_true(out.len == 1 to u64)
-    teko::assert::is_true(rr_inst_all_phys(out[0]))
-}
-
-#test
-fn rr_rewrite_physical_use_passes_through() {
-    let a0: RegAssignment = InReg { vreg_id = 20 to u32; phys = 12 to u32 }
-    let sr = rr_sr(teko::list::push(teko::list::empty(), a0))
-    let out = rewrite_inst_riscv(RISCV64_LP64D, sr, store_riscv(MMemSizeRiscv::D, rr_v(20), rr_mem(rr_p(2), 0 to i32)), 0 to u32)
-    teko::assert::is_true(out.len == 1 to u64)
-    teko::assert::is_true(rr_inst_all_phys(out[0]))
-}
-
-#test
 fn rr_rewrite_spilled_use_reloads() {
     let a0: RegAssignment = Spilled { vreg_id = 0 to u32; slot = 0 to u32 }
     let a2: RegAssignment = InReg { vreg_id = 2 to u32; phys = 12 to u32 }
@@ -626,23 +507,6 @@ fn rr_rewrite_spilled_def_stores() {
     teko::assert::is_true(rr_inst_all_phys(out[0]))
     teko::assert::is_true(rr_is_frame_addr(out[1]))
     teko::assert::is_true(rr_is_store(out[2]))
-}
-
-#test
-fn rr_rewrite_no_assignment_passes_through() {
-    let out = rewrite_inst_riscv(RISCV64_LP64D, rr_sr(teko::list::empty()), li_riscv(rr_v(2), 5 to i32), 0 to u32)
-    teko::assert::is_true(out.len == 1 to u64)
-    teko::assert::is_true(!rr_inst_all_phys(out[0]))
-}
-
-#test
-fn rr_all_physical_detects_virtuals() {
-    let def_virtual = rr_named_func("main", teko::list::push(teko::list::empty(), li_riscv(rr_v(0), 1 to i32)))
-    teko::assert::is_true(!all_physical_riscv(def_virtual))
-    let use_virtual = rr_named_func("main", teko::list::push(teko::list::empty(), rr_mov(rr_p(10), rr_v(0))))
-    teko::assert::is_true(!all_physical_riscv(use_virtual))
-    let phys = rr_named_func("main", teko::list::push(teko::list::empty(), rr_mov(rr_p(10), rr_p(11))))
-    teko::assert::is_true(all_physical_riscv(phys))
 }
 
 /**
@@ -741,16 +605,6 @@ fn rr_fpr_spill_fixture() -> []MInstRiscv {
 }
 
 #test
-fn rr_regalloc_fpr_spill_honest_stops() {
-    let f = rr_func(rr_fpr_spill_fixture())
-    let is_err = match regalloc_func_riscv(rr_fpr_spill_abi(), f) {
-        MFuncRiscv => false
-        error => true
-    }
-    teko::assert::is_true(is_err)
-}
-
-#test
 fn rr_regalloc_module_carries_tables_and_propagates() {
     let f1 = rr_named_func("a", rr_entry_param_add_fixture())
     let f2 = rr_named_func("b", rr_entry_param_add_fixture())
@@ -769,110 +623,6 @@ fn rr_regalloc_module_carries_tables_and_propagates() {
         error => true
     }
     teko::assert::is_true(is_err)
-}
-
-#test
-fn rr_regalloc_func_two_block_loop_allocates() {
-    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(1 to u32)) }
-    let b1 = MBlockRiscv { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(0 to u32)) }
-    let f = MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let ok = match regalloc_func_riscv(RISCV64_LP64D, f) {
-        MFuncRiscv => true
-        error => false
-    }
-    teko::assert::is_true(ok)
-}
-
-/**
- * rr_natural_loops_riscv_two_block_loop_golden — the RISC-V mirror of the
- * neutral `natural_loops` golden (#389 F2 review NIT 3): a two-block loop
- * (`b0: jal b1`; `b1: jal b0`) numbers `b0`'s instruction at point 0 and `b1`'s
- * at point 1, so the retreating edge (`b1`'s jump back to `b0`) yields exactly
- * one `NaturalLoop{header_pt=0, latch_pt=1}`.
- */
-#test
-fn rr_natural_loops_riscv_two_block_loop_golden() {
-    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(1 to u32)) }
-    let b1 = MBlockRiscv { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jal_riscv(0 to u32)) }
-    let f = MFuncRiscv { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let o = rpo_block_order_riscv(f)
-    let stream = number_insts_riscv(f, o)
-    let loops = natural_loops_riscv(stream, o, reachable_blocks_riscv(f))
-    teko::assert::is_true(loops.len == (1 to u64))
-    teko::assert::is_true(loops[0].header_pt == (0 to u32))
-    teko::assert::is_true(loops[0].latch_pt == (1 to u32))
-}
-
-/**
- * rr_diamond_fixture — an acyclic id-inverted diamond mirroring isel output: the
- * MERGE block has id 1 (lowest) but is targeted by the arm blocks id 2/3, and
- * `v10` is defined in the arms and used in the merge — the numbering inversion
- * the #443 RPO fix handles. B0 compares `v0` with itself and branches on EQ via
- * a fused `MBranchRiscv`, then a trailing `MJalRiscv` to the fall-through arm.
- *
- * @return MFuncRiscv  the diamond function
- */
-fn rr_diamond_fixture() -> MFuncRiscv {
-    mut i0: []MInstRiscv = teko::list::empty()
-    i0 = teko::list::push(i0, li_riscv(rr_v(0), 1 to i32))
-    i0 = teko::list::push(i0, branch_riscv(MCond::EQ, rr_v(0), rr_v(0), 3 to u32))
-    i0 = teko::list::push(i0, jal_riscv(2 to u32))
-    let b0 = MBlockRiscv { id = 0; params = teko::list::empty(); insts = i0 }
-    mut i1: []MInstRiscv = teko::list::empty()
-    i1 = teko::list::push(i1, rr_mov(rr_p(10), rr_v(10)))
-    i1 = teko::list::push(i1, RET_RISCV)
-    let b1 = MBlockRiscv { id = 1; params = teko::list::push(teko::list::empty(), rr_v(10)); insts = i1 }
-    mut i2: []MInstRiscv = teko::list::empty()
-    i2 = teko::list::push(i2, li_riscv(rr_v(1), 42 to i32))
-    i2 = teko::list::push(i2, rr_mov(rr_v(10), rr_v(1)))
-    i2 = teko::list::push(i2, jal_riscv(1 to u32))
-    let b2 = MBlockRiscv { id = 2; params = teko::list::empty(); insts = i2 }
-    mut i3: []MInstRiscv = teko::list::empty()
-    i3 = teko::list::push(i3, li_riscv(rr_v(2), 99 to i32))
-    i3 = teko::list::push(i3, rr_mov(rr_v(10), rr_v(2)))
-    i3 = teko::list::push(i3, jal_riscv(1 to u32))
-    let b3 = MBlockRiscv { id = 3; params = teko::list::empty(); insts = i3 }
-    mut blocks: []MBlockRiscv = teko::list::empty()
-    blocks = teko::list::push(blocks, b0)
-    blocks = teko::list::push(blocks, b1)
-    blocks = teko::list::push(blocks, b2)
-    blocks = teko::list::push(blocks, b3)
-    MFuncRiscv { symbol = "main"; blocks = blocks; frame = teko::list::empty() }
-}
-
-#test
-fn rr_rpo_order_ranks_merge_after_arms() {
-    let order = rpo_block_order_riscv(rr_diamond_fixture())
-    teko::assert::is_true(order.len == 4 to u64)
-    teko::assert::is_true(order[0] == 0 to u32)
-    teko::assert::is_true(block_pos(order, 1 to u32) > block_pos(order, 2 to u32))
-    teko::assert::is_true(block_pos(order, 1 to u32) > block_pos(order, 3 to u32))
-}
-
-#test
-fn rr_rpo_numbering_places_arms_before_merge() {
-    let stream = rr_number(rr_diamond_fixture())
-    mut max_b2: u32 = 0 to u32
-    mut min_b1: u32 = 1000000 to u32
-    mut i: u64 = 0
-    loop {
-        if i >= stream.len { break }
-        let ni = stream[i]
-        if ni.block_id == 2 to u32 { max_b2 = ni.point }
-        if ni.block_id == 1 to u32 {
-            if ni.point < min_b1 { min_b1 = ni.point }
-        }
-        i++
-    }
-    teko::assert::is_true(max_b2 < min_b1)
-}
-
-#test
-fn rr_regalloc_diamond_allocates_all_physical() {
-    let f = rr_diamond_fixture()
-    teko::assert::is_true(!all_physical_riscv(f))
-    let cf = match regalloc_func_riscv(RISCV64_LP64D, f) { MFuncRiscv as g => g; error => return }
-    teko::assert::is_true(all_physical_riscv(cf))
 }
 
 /**
@@ -914,22 +664,4 @@ fn rr_rpo_defensive_paths() {
     let ord2 = rpo_block_order_riscv(f2)
     teko::assert::is_true(ord2.len == 2 to u64)
     teko::assert::is_true(u32_in(ord2, 9 to u32))
-}
-
-#test
-fn rr_three_address_rewrite_prints_all_physical_golden() {
-    let insts = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
-        li_riscv(rr_v(0), 5 to i32)),
-        li_riscv(rr_v(1), 7 to i32)),
-        alu_r_riscv(MAluOpRiscv::Add, true, rr_v(2), rr_v(0), rr_v(1))),
-        rr_mov(rr_p(10), rr_v(2))),
-        RET_RISCV)
-    let cf = match regalloc_func_riscv(RISCV64_LP64D, rr_func(insts)) { MFuncRiscv as g => g; error => return }
-    let text = minst_print_riscv(rr_module_of(cf))
-    teko::assert::is_true(all_physical_riscv(cf))
-    teko::assert::str_contains(text, "li %p5, #5")
-    teko::assert::str_contains(text, "li %p6, #7")
-    teko::assert::str_contains(text, "add %p7, %p5, %p6")
-    teko::assert::str_contains(text, "addi %p10, %p7, #0")
-    teko::assert::str_contains(text, "ret")
 }

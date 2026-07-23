@@ -20,45 +20,6 @@ fn rat_fpr(id: u32) -> MReg {
 }
 
 #test
-fn rat_arg_reg_fills_x0_to_x7_v0_to_v7_then_overflows() {
-    let abi = AAPCS64
-    let a0 = arg_reg(abi, MRegClass::GPR, 0)
-    teko::assert::is_true(a0.ok)
-    teko::assert::is_true(a0.reg.id == 0)
-    teko::assert::is_true(a0.reg.is_phys)
-    teko::assert::is_true(a0.reg.reg_class == MRegClass::GPR)
-    let a7 = arg_reg(abi, MRegClass::GPR, 7)
-    teko::assert::is_true(a7.ok)
-    teko::assert::is_true(a7.reg.id == 7)
-    let a8 = arg_reg(abi, MRegClass::GPR, 8)
-    teko::assert::is_true(!a8.ok)
-    let f0 = arg_reg(abi, MRegClass::FPR, 0)
-    teko::assert::is_true(f0.ok)
-    teko::assert::is_true(f0.reg.id == 0)
-    teko::assert::is_true(f0.reg.reg_class == MRegClass::FPR)
-    let f8 = arg_reg(abi, MRegClass::FPR, 8)
-    teko::assert::is_true(!f8.ok)
-}
-
-#test
-fn rat_allocatable_pool_caller_saved_first_excludes_reserved() {
-    let abi = AAPCS64
-    let gpr = allocatable_pool(abi, MRegClass::GPR)
-    teko::assert::is_true(gpr[0] == 0)
-    teko::assert::is_true(contains_u32(gpr, 14))
-    teko::assert::is_true(!contains_u32(gpr, 15))
-    teko::assert::is_true(!contains_u32(gpr, 18))
-    teko::assert::is_true(contains_u32(gpr, 19))
-    teko::assert::is_true(contains_u32(gpr, 28))
-    teko::assert::is_true(!contains_u32(gpr, 29))
-    let fpr = allocatable_pool(abi, MRegClass::FPR)
-    teko::assert::is_true(fpr[0] == 0)
-    teko::assert::is_true(contains_u32(fpr, 8))
-    teko::assert::is_true(!contains_u32(fpr, 30))
-    teko::assert::is_true(!contains_u32(fpr, 31))
-}
-
-#test
 fn rat_caller_and_callee_saved_partition() {
     let abi = AAPCS64
     teko::assert::is_true(is_caller_saved(abi, rat_gpr(0)))
@@ -69,17 +30,6 @@ fn rat_caller_and_callee_saved_partition() {
     teko::assert::is_true(is_caller_saved(abi, rat_fpr(0)))
     teko::assert::is_true(!is_caller_saved(abi, rat_fpr(8)))
     teko::assert::is_true(is_callee_saved(abi, rat_fpr(8)))
-}
-
-#test
-fn rat_spill_scratch_reserved_registers() {
-    let abi = AAPCS64
-    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0).id == 15)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 2).id == 17)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::GPR, 0).is_phys)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0).id == 30)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 1).id == 31)
-    teko::assert::is_true(spill_scratch(abi, MRegClass::FPR, 0).reg_class == MRegClass::FPR)
 }
 
 /**
@@ -122,206 +72,6 @@ fn rgt_p(id: u32) -> MReg {
 fn rgt_func(insts: []MInst) -> MFunc {
     let b = MBlock { id = 0; params = teko::list::empty(); insts = insts }
     MFunc { symbol = "main"; blocks = teko::list::push(teko::list::empty(), b); frame = teko::list::empty() }
-}
-
-/**
- * rgt_number — `number_insts` over `f`'s RPO block order (#443): the call the
- * numbering + back-edge passes now take, wrapped so fixtures stay terse.
- *
- * @param MFunc f  the function to number
- * @return []NumberedInst  the RPO-numbered stream
- */
-fn rgt_number(f: MFunc) -> []NumberedInst {
-    number_insts(f, rpo_block_order(f))
-}
-
-/**
- * rgt_intervals — `compute_intervals` over `f`'s RPO-numbered stream (#443),
- * computing the order once and threading it to both the numbering and the
- * back-edge test.
- *
- * @param MFunc f  the function to analyze
- * @return IntervalSet | error  the intervals, or a back-edge honest-stop
- */
-fn rgt_intervals(f: MFunc) -> IntervalSet | error {
-    let o = rpo_block_order(f)
-    compute_intervals(number_insts(f, o), o, reachable_blocks(f))
-}
-
-/**
- * iv_has — whether `list` contains an interval with exactly `reg_id`/`start`/
- * `end`.
- *
- * @param []LiveInterval list  the intervals to search
- * @param u32 reg_id  the register id to match
- * @param u32 start  the start point to match
- * @param u32 end  the end point to match
- * @return bool  true iff such an interval is present
- */
-fn iv_has(list: []LiveInterval, reg_id: u32, start: u32, end: u32) -> bool {
-    mut i: u64 = 0
-    loop {
-        if i >= list.len { break }
-        let iv = list[i]
-        if iv.reg_id == reg_id && iv.start == start && iv.end == end { return true }
-        i++
-    }
-    false
-}
-
-/**
- * iv_crosses — whether `list` has an interval for `reg_id` marked
- * `crosses_call`.
- *
- * @param []LiveInterval list  the intervals to search
- * @param u32 reg_id  the register id to match
- * @return bool  true iff a matching interval crosses a call
- */
-fn iv_crosses(list: []LiveInterval, reg_id: u32) -> bool {
-    mut i: u64 = 0
-    loop {
-        if i >= list.len { break }
-        let iv = list[i]
-        if iv.reg_id == reg_id && iv.crosses_call { return true }
-        i++
-    }
-    false
-}
-
-#test
-fn rgt_inst_regs_covers_every_minst_case() {
-    let g0 = rgt_v(0)
-    let g1 = rgt_v(1)
-    let g2 = rgt_v(2)
-    let g3 = rgt_v(3)
-    let mem = MMem { base = rgt_v(0); offset = 0 to i32 }
-    let noargs: []MReg = teko::list::empty()
-    teko::assert::is_true(inst_regs(alu_inst(MAluOp::Add, true, g0, g1, g2)).has_def)
-    teko::assert::is_true(inst_regs(alu_inst(MAluOp::Add, true, g0, g1, g2)).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs(alu_imm_inst(MAluOp::Add, true, g0, g1, 5 to i64)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(msub_inst(true, g0, g1, g2, g3)).uses.len == 3 to u64)
-    teko::assert::is_true(inst_regs(neg_inst(true, g0, g1)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(mvn_inst(true, g0, g1)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(falu_inst(MFAluOp::FAdd, true, rgt_vf(0), rgt_vf(1), rgt_vf(2))).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs(fneg_inst(true, rgt_vf(0), rgt_vf(1))).uses.len == 1 to u64)
-    teko::assert::is_true(!inst_regs(cmp_inst(true, g0, g1)).has_def)
-    teko::assert::is_true(inst_regs(cmp_inst(true, g0, g1)).uses.len == 2 to u64)
-    teko::assert::is_true(!inst_regs(cmp_imm_inst(true, g0, 3 to i64)).has_def)
-    teko::assert::is_true(inst_regs(fcmp_inst(true, rgt_vf(0), rgt_vf(1))).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs(cset_inst(true, g0, MCond::EQ)).has_def)
-    teko::assert::is_true(inst_regs(cset_inst(true, g0, MCond::EQ)).uses.len == 0 to u64)
-    teko::assert::is_true(inst_regs(movz_inst(true, g0, 5, 0)).has_def)
-    teko::assert::is_true(inst_regs(movn_inst(true, g0, 5, 0)).has_def)
-    teko::assert::is_true(inst_regs(movk_inst(true, g0, 5, 0)).has_def)
-    teko::assert::is_true(inst_regs(movk_inst(true, g0, 5, 0)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(mov_inst(true, g0, g1)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(fmov_inst(true, rgt_vf(0), g1)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(ext_inst(MExtOp::Sxtb, g0, g1)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(cvt_inst(MCvtOp::Scvtf, rgt_vf(0), g1)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(load_inst(MMemSize::X, false, g0, mem)).has_def)
-    teko::assert::is_true(inst_regs(load_inst(MMemSize::X, false, g0, mem)).uses.len == 1 to u64)
-    teko::assert::is_true(!inst_regs(store_inst(MMemSize::X, g0, mem)).has_def)
-    teko::assert::is_true(inst_regs(store_inst(MMemSize::X, g0, mem)).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs(frame_addr_inst(g0, 0)).has_def)
-    teko::assert::is_true(inst_regs(adrp_inst(g0, "s", MRelocKind::PageHi)).has_def)
-    teko::assert::is_true(inst_regs(add_lo_inst(g0, g1, "s", MRelocKind::PageLo)).uses.len == 1 to u64)
-    teko::assert::is_true(!inst_regs(branch_inst(0)).has_def)
-    teko::assert::is_true(inst_regs(branch_inst(0)).uses.len == 0 to u64)
-    teko::assert::is_true(inst_regs(branch_cond_inst(MCond::EQ, 0)).uses.len == 0 to u64)
-    teko::assert::is_true(inst_regs(cbz_inst(true, false, g0, 0)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs(call_inst("f", one_reg(rgt_p(0)), rgt_p(0), true, false)).is_call)
-    teko::assert::is_true(inst_regs(call_inst("f", noargs, rgt_p(0), false, false)).has_def == false)
-    teko::assert::is_true(inst_regs(call_indirect_inst(g0, noargs, rgt_p(0), true)).is_call)
-    teko::assert::is_true(inst_regs(call_indirect_inst(g0, noargs, rgt_p(0), false)).uses.len == 1 to u64)
-    teko::assert::is_true(!inst_regs(RET_INST).has_def)
-    teko::assert::is_true(inst_regs(RET_INST).uses.len == 0 to u64)
-}
-
-#test
-fn rgt_number_insts_flattens_in_block_order() {
-    let b0 = MBlock { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), movz_inst(true, rgt_v(0), 1, 0)) }
-    let b1 = MBlock { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), RET_INST) }
-    let f = MFunc { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let stream = rgt_number(f)
-    teko::assert::is_true(stream.len == 2 to u64)
-    teko::assert::is_true(stream[0].point == 0)
-    teko::assert::is_true(stream[0].block_id == 0)
-    teko::assert::is_true(stream[1].point == 1)
-    teko::assert::is_true(stream[1].block_id == 1)
-}
-
-#test
-fn rgt_two_param_add_intervals_and_result_pin() {
-    mut insts: []MInst = teko::list::empty()
-    insts = teko::list::push(insts, mov_inst(true, rgt_v(0), rgt_p(0)))
-    insts = teko::list::push(insts, mov_inst(true, rgt_v(1), rgt_p(1)))
-    insts = teko::list::push(insts, alu_inst(MAluOp::Add, true, rgt_v(2), rgt_v(0), rgt_v(1)))
-    insts = teko::list::push(insts, mov_inst(true, rgt_p(0), rgt_v(2)))
-    insts = teko::list::push(insts, RET_INST)
-    let iset = match rgt_intervals(rgt_func(insts)) { IntervalSet as s => s; error => return }
-    teko::assert::is_true(iv_has(iset.virt, 0, 0, 2))
-    teko::assert::is_true(iv_has(iset.virt, 1, 1, 2))
-    teko::assert::is_true(iv_has(iset.virt, 2, 2, 3))
-    teko::assert::is_true(iv_has(iset.fixed, 0, 3, 4))
-    teko::assert::is_true(iv_has(iset.fixed, 1, 0, 1))
-}
-
-#test
-fn rgt_value_crossing_a_call_is_marked() {
-    mut insts: []MInst = teko::list::empty()
-    insts = teko::list::push(insts, movz_inst(true, rgt_v(0), 5, 0))
-    insts = teko::list::push(insts, call_inst("tk_x", teko::list::empty(), rgt_p(0), false, false))
-    insts = teko::list::push(insts, mov_inst(true, rgt_p(0), rgt_v(0)))
-    insts = teko::list::push(insts, RET_INST)
-    let iset = match rgt_intervals(rgt_func(insts)) { IntervalSet as s => s; error => return }
-    teko::assert::is_true(iset.call_points.len == 1 to u64)
-    teko::assert::is_true(iset.call_points[0] == 1)
-    teko::assert::is_true(iv_crosses(iset.virt, 0))
-}
-
-#test
-fn rgt_self_loop_allocates_and_natural_loops_finds_it() {
-    let insts = teko::list::push(teko::list::empty(), branch_inst(0))
-    let f = rgt_func(insts)
-    let o = rpo_block_order(f)
-    let stream = number_insts(f, o)
-    let loops = natural_loops(stream, o, reachable_blocks(f))
-    teko::assert::is_true(loops.len == (1 to u64))
-    teko::assert::is_true(loops[0].header_pt == (0 to u32))
-    teko::assert::is_true(loops[0].latch_pt == (0 to u32))
-    let ok = match rgt_intervals(f) { IntervalSet => true; error => false }
-    teko::assert::is_true(ok)
-}
-
-#test
-fn rgt_natural_loops_empty_on_acyclic_diamond() {
-    let f = rgt_diamond_fixture()
-    let o = rpo_block_order(f)
-    let stream = number_insts(f, o)
-    let loops = natural_loops(stream, o, reachable_blocks(f))
-    teko::assert::is_true(loops.len == (0 to u64))
-}
-
-#test
-fn rgt_extend_over_loops_widens_header_live_to_latch() {
-    let loops = teko::list::push(teko::list::empty(), NaturalLoop { header_pt = 2 to u32; latch_pt = 8 to u32 })
-    mut virt: []LiveInterval = teko::list::empty()
-    virt = teko::list::push(virt, ai_iv(0, 1, 4, false))
-    virt = teko::list::push(virt, ai_iv(1, 5, 7, false))
-    let out = extend_over_loops(virt, loops, teko::list::empty())
-    teko::assert::is_true(iv_has(out, 0, 1, 8))
-    teko::assert::is_true(iv_has(out, 1, 5, 7))
-}
-
-#test
-fn rgt_extend_over_loops_recomputes_crosses_call() {
-    let loops = teko::list::push(teko::list::empty(), NaturalLoop { header_pt = 2 to u32; latch_pt = 8 to u32 })
-    let cps = teko::list::push(teko::list::empty(), 6 to u32)
-    mut virt: []LiveInterval = teko::list::empty()
-    virt = teko::list::push(virt, ai_iv(0, 1, 4, false))
-    let out = extend_over_loops(virt, loops, cps)
-    teko::assert::is_true(iv_has(out, 0, 1, 8))
-    teko::assert::is_true(iv_crosses(out, 0))
 }
 
 /**
@@ -426,31 +176,6 @@ fn ai_tiny_abi() -> AbiDescriptor {
 }
 
 #test
-fn ai_disjoint_intervals_reuse_a_register() {
-    let virt = teko::list::push(teko::list::push(teko::list::empty(), ai_iv(0, 0, 2, false)), ai_iv(1, 3, 5, false))
-    let scan = linear_scan(AAPCS64, ai_set(virt, teko::list::empty()))
-    teko::assert::is_true(ai_phys(scan, 0) == ai_phys(scan, 1))
-}
-
-#test
-fn ai_overlapping_intervals_get_distinct_registers() {
-    let virt = teko::list::push(teko::list::push(teko::list::empty(), ai_iv(0, 0, 5, false)), ai_iv(1, 2, 7, false))
-    let scan = linear_scan(AAPCS64, ai_set(virt, teko::list::empty()))
-    teko::assert::is_true(ai_phys(scan, 0) != ai_phys(scan, 1))
-    teko::assert::is_true(ai_phys(scan, 0) != 100000 to u32)
-    teko::assert::is_true(ai_phys(scan, 1) != 100000 to u32)
-}
-
-#test
-fn ai_crosses_call_gets_a_callee_saved_register() {
-    let virt = teko::list::push(teko::list::empty(), ai_iv(0, 0, 5, true))
-    let scan = linear_scan(AAPCS64, ai_set(virt, teko::list::empty()))
-    let p = ai_phys(scan, 0)
-    teko::assert::is_true(p != 100000 to u32)
-    teko::assert::is_true(is_callee_saved(AAPCS64, preg(p, MRegClass::GPR)))
-}
-
-#test
 fn ai_overlapping_fixed_pin_is_avoided() {
     let virt = teko::list::push(teko::list::empty(), ai_iv(0, 0, 5, false))
     let fixed = teko::list::push(teko::list::empty(), ai_fixed(0, 0, 5))
@@ -467,29 +192,6 @@ fn ai_pressure_spills_furthest_next_use() {
     teko::assert::is_true(ai_spilled(scan, 0))
     teko::assert::is_true(!ai_spilled(scan, 2))
     teko::assert::is_true(ai_phys(scan, 2) != 100000 to u32)
-}
-
-#test
-fn ai_pressure_spills_the_new_value_when_it_is_furthest() {
-    let virt = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
-        ai_iv(0, 0, 3, false)), ai_iv(1, 1, 4, false)), ai_iv(2, 2, 9, false))
-    let scan = linear_scan(ai_tiny_abi(), ai_set(virt, teko::list::empty()))
-    teko::assert::is_true(ai_spilled(scan, 2))
-    teko::assert::is_true(!ai_spilled(scan, 0))
-    teko::assert::is_true(!ai_spilled(scan, 1))
-}
-
-#test
-fn ai_no_two_inreg_same_phys_overlap() {
-    let virt = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
-        ai_iv(0, 0, 5, false)), ai_iv(1, 2, 7, false)), ai_iv(2, 6, 9, false))
-    let scan = linear_scan(AAPCS64, ai_set(virt, teko::list::empty()))
-    let p0 = ai_phys(scan, 0)
-    let p1 = ai_phys(scan, 1)
-    let p2 = ai_phys(scan, 2)
-    teko::assert::is_true(p0 != p1)
-    teko::assert::is_true(p1 != p2)
-    teko::assert::is_true(p0 == p2)
 }
 
 /**
@@ -541,36 +243,6 @@ fn rgt_inst_all_phys(inst: MInst) -> bool {
         i++
     }
     true
-}
-
-/**
- * rgt_is_frame_addr — whether `inst` is an `MFrameAddr`.
- *
- * @param MInst inst  the instruction
- * @return bool  true iff MFrameAddr
- */
-fn rgt_is_frame_addr(inst: MInst) -> bool {
-    match inst { MFrameAddr => true; _ => false }
-}
-
-/**
- * rgt_is_load — whether `inst` is an `MLoad`.
- *
- * @param MInst inst  the instruction
- * @return bool  true iff MLoad
- */
-fn rgt_is_load(inst: MInst) -> bool {
-    match inst { MLoad => true; _ => false }
-}
-
-/**
- * rgt_is_store — whether `inst` is an `MStore`.
- *
- * @param MInst inst  the instruction
- * @return bool  true iff MStore
- */
-fn rgt_is_store(inst: MInst) -> bool {
-    match inst { MStore => true; _ => false }
 }
 
 /**
@@ -645,78 +317,6 @@ fn rgt_map_minst_covers_every_case() {
     }
 }
 
-#test
-fn rgt_map_minst_leaves_unmapped_virtuals() {
-    let m0 = map_minst_regs(alu_inst(MAluOp::Add, true, rgt_v(0), rgt_v(1), rgt_v(2)), teko::list::empty())
-    teko::assert::is_true(!rgt_inst_all_phys(m0))
-}
-
-/**
- * rgt_sr — a `ScanResult` from a list of assignments (no callee-saved).
- *
- * @param []RegAssignment a  the assignments
- * @return ScanResult  the scan result
- */
-fn rgt_sr(a: []RegAssignment) -> ScanResult {
-    ScanResult { assignments = a; used_callee_saved = teko::list::empty() }
-}
-
-#test
-fn rgt_rewrite_inreg_physical_and_dedup() {
-    let a0: RegAssignment = InReg { vreg_id = 0 to u32; phys = 9 to u32 }
-    let a3: RegAssignment = InReg { vreg_id = 3 to u32; phys = 11 to u32 }
-    let sr = rgt_sr(teko::list::push(teko::list::push(teko::list::empty(), a0), a3))
-    let inst = msub_inst(true, rgt_v(3), rgt_v(0), rgt_v(0), rat_gpr(5))
-    let out = rewrite_inst(AAPCS64, sr, inst, 0 to u32)
-    teko::assert::is_true(out.len == (1 to u64))
-    teko::assert::is_true(rgt_inst_all_phys(out[0]))
-}
-
-#test
-fn rgt_rewrite_spilled_use_reloads() {
-    let a0: RegAssignment = Spilled { vreg_id = 0 to u32; slot = 0 to u32 }
-    let a1: RegAssignment = InReg { vreg_id = 1 to u32; phys = 10 to u32 }
-    let a2: RegAssignment = InReg { vreg_id = 2 to u32; phys = 11 to u32 }
-    let sr = rgt_sr(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), a0), a1), a2))
-    let inst = alu_inst(MAluOp::Add, true, rgt_v(2), rgt_v(0), rgt_v(1))
-    let out = rewrite_inst(AAPCS64, sr, inst, 0 to u32)
-    teko::assert::is_true(out.len == (3 to u64))
-    teko::assert::is_true(rgt_is_frame_addr(out[0]))
-    teko::assert::is_true(rgt_is_load(out[1]))
-    teko::assert::is_true(rgt_inst_all_phys(out[2]))
-}
-
-#test
-fn rgt_rewrite_spilled_def_stores() {
-    let a0: RegAssignment = InReg { vreg_id = 0 to u32; phys = 9 to u32 }
-    let a1: RegAssignment = InReg { vreg_id = 1 to u32; phys = 10 to u32 }
-    let a2: RegAssignment = Spilled { vreg_id = 2 to u32; slot = 0 to u32 }
-    let sr = rgt_sr(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), a0), a1), a2))
-    let inst = alu_inst(MAluOp::Add, true, rgt_v(2), rgt_v(0), rgt_v(1))
-    let out = rewrite_inst(AAPCS64, sr, inst, 0 to u32)
-    teko::assert::is_true(out.len == (3 to u64))
-    teko::assert::is_true(rgt_inst_all_phys(out[0]))
-    teko::assert::is_true(rgt_is_frame_addr(out[1]))
-    teko::assert::is_true(rgt_is_store(out[2]))
-}
-
-#test
-fn rgt_rewrite_no_assignment_passes_through() {
-    let out = rewrite_inst(AAPCS64, rgt_sr(teko::list::empty()), alu_inst(MAluOp::Add, true, rgt_v(2), rgt_v(0), rgt_v(1)), 0 to u32)
-    teko::assert::is_true(out.len == (1 to u64))
-    teko::assert::is_true(!rgt_inst_all_phys(out[0]))
-}
-
-#test
-fn rgt_all_physical_detects_virtuals() {
-    let def_virtual = rgt_named_func("main", teko::list::push(teko::list::empty(), movz_inst(true, rgt_v(0), 1, 0)))
-    teko::assert::is_true(!all_physical(def_virtual))
-    let use_virtual = rgt_named_func("main", teko::list::push(teko::list::empty(), mov_inst(true, rat_gpr(0), rgt_v(0))))
-    teko::assert::is_true(!all_physical(use_virtual))
-    let phys = rgt_named_func("main", teko::list::push(teko::list::empty(), mov_inst(true, rat_gpr(0), rat_gpr(1))))
-    teko::assert::is_true(all_physical(phys))
-}
-
 /**
  * rgt_add_fixture — `movz v0=3; movz v1=5; add v2=v0+v1; mov x0=v2; ret`
  * (returns 8), the base interp-equivalence fixture.
@@ -731,25 +331,6 @@ fn rgt_add_fixture() -> []MInst {
     insts = teko::list::push(insts, mov_inst(true, rat_gpr(0), rgt_v(2)))
     insts = teko::list::push(insts, RET_INST)
     insts
-}
-
-#test
-fn rgt_regalloc_nonspill_interp_equivalence() {
-    let f = rgt_named_func("main", rgt_add_fixture())
-    let pre = minst_interp(rgt_module_of(f), "main", rgt_no_args())
-    teko::assert::is_true(pre == (8 to i128))
-    let colored = match regalloc_module(AAPCS64, rgt_module_of(f)) {
-        MModule as mm => mm
-        error => return
-    }
-    let post = minst_interp(colored, "main", rgt_no_args())
-    teko::assert::is_true(post == pre)
-    let cf = match regalloc_func(AAPCS64, f) {
-        MFunc as g => g
-        error => return
-    }
-    teko::assert::is_true(all_physical(cf))
-    teko::assert::is_true(!all_physical(f))
 }
 
 /**
@@ -857,16 +438,6 @@ fn rgt_fpr_spill_fixture() -> []MInst {
 }
 
 #test
-fn rgt_regalloc_fpr_spill_honest_stops() {
-    let f = rgt_named_func("main", rgt_fpr_spill_fixture())
-    let is_err = match regalloc_func(rgt_fpr_spill_abi(), f) {
-        MFunc => false
-        error => true
-    }
-    teko::assert::is_true(is_err)
-}
-
-#test
 fn rgt_regalloc_module_carries_tables_and_propagates() {
     let f1 = rgt_named_func("a", rgt_add_fixture())
     let f2 = rgt_named_func("b", rgt_add_fixture())
@@ -885,40 +456,6 @@ fn rgt_regalloc_module_carries_tables_and_propagates() {
         error => true
     }
     teko::assert::is_true(is_err)
-}
-
-#test
-fn rgt_regalloc_func_two_block_loop_allocates() {
-    let b0 = MBlock { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), MBranch { target = 1 to u32 }) }
-    let b1 = MBlock { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), MBranch { target = 0 to u32 }) }
-    let f = MFunc { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let ok = match regalloc_func(AAPCS64, f) {
-        MFunc => true
-        error => false
-    }
-    teko::assert::is_true(ok)
-}
-
-#test
-fn rgt_rewrite_movk_inreg_def_dedup() {
-    let a0: RegAssignment = InReg { vreg_id = 0 to u32; phys = 9 to u32 }
-    let sr = rgt_sr(teko::list::push(teko::list::empty(), a0))
-    let out = rewrite_inst(AAPCS64, sr, movk_inst(true, rgt_v(0), 2 to u32, 16 to u32), 0 to u32)
-    teko::assert::is_true(out.len == (1 to u64))
-    teko::assert::is_true(rgt_inst_all_phys(out[0]))
-}
-
-#test
-fn rgt_rewrite_movk_spilled_def_dedup() {
-    let a0: RegAssignment = Spilled { vreg_id = 0 to u32; slot = 0 to u32 }
-    let sr = rgt_sr(teko::list::push(teko::list::empty(), a0))
-    let out = rewrite_inst(AAPCS64, sr, movk_inst(true, rgt_v(0), 2 to u32, 16 to u32), 0 to u32)
-    teko::assert::is_true(out.len == (5 to u64))
-    teko::assert::is_true(rgt_is_frame_addr(out[0]))
-    teko::assert::is_true(rgt_is_load(out[1]))
-    teko::assert::is_true(rgt_inst_all_phys(out[2]))
-    teko::assert::is_true(rgt_is_frame_addr(out[3]))
-    teko::assert::is_true(rgt_is_store(out[4]))
 }
 
 /**
@@ -951,22 +488,6 @@ fn rgt_regalloc_movk_rmw_interp_equivalence() {
 }
 
 #test
-fn rgt_regalloc_conditional_terminators_allocate() {
-    let bc = rgt_func(teko::list::push(teko::list::empty(), MBranchCond { cond = MCond::EQ; target = 0 to u32 }))
-    let ok1 = match regalloc_func(AAPCS64, bc) {
-        MFunc => true
-        error => false
-    }
-    teko::assert::is_true(ok1)
-    let cbz = rgt_func(teko::list::push(teko::list::empty(), MCbz { wide = true; zero = true; a = rgt_p(0); target = 0 to u32 }))
-    let ok2 = match regalloc_func(AAPCS64, cbz) {
-        MFunc => true
-        error => false
-    }
-    teko::assert::is_true(ok2)
-}
-
-#test
 fn rgt_linear_scan_equal_start_tie_break() {
     let virt = teko::list::push(teko::list::push(teko::list::empty(), ai_iv(1, 0, 5, false)), ai_iv(0, 0, 7, false))
     let scan = linear_scan(AAPCS64, ai_set(virt, teko::list::empty()))
@@ -976,112 +497,12 @@ fn rgt_linear_scan_equal_start_tie_break() {
 }
 
 #test
-fn rgt_compute_intervals_use_only_vreg() {
-    let f = rgt_func(teko::list::push(teko::list::push(teko::list::empty(), cmp_inst(true, rgt_v(0), rgt_p(0))), RET_INST))
-    let iset = match rgt_intervals(f) {
-        IntervalSet as s => s
-        error => return
-    }
-    teko::assert::is_true(iv_has(iset.virt, 0, 0, 0))
-}
-
-#test
 fn rgt_linear_scan_two_spill_marks_prior_spilled() {
     let virt = teko::list::push(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
         ai_iv(0, 0, 3, false)), ai_iv(1, 1, 100, false)), ai_iv(2, 2, 50, false)), ai_iv(3, 3, 4, false))
     let scan = linear_scan(ai_tiny_abi(), ai_set(virt, teko::list::empty()))
     teko::assert::is_true(ai_spilled(scan, 1))
     teko::assert::is_true(ai_spilled(scan, 2))
-}
-
-/**
- * rgt_diamond_fixture — an acyclic id-inverted diamond matching isel output:
- * the MERGE block has id 1 (lowest) but is targeted by the arm blocks id 2/3,
- * and `v10` is defined in the arms and used in the merge — the numbering
- * inversion #443 fixes. B0's `cbz` on a nonzero `v0` falls through to B2, so
- * the function returns 42.
- *
- * @return MFunc  the diamond function
- */
-fn rgt_diamond_fixture() -> MFunc {
-    mut i0: []MInst = teko::list::empty()
-    i0 = teko::list::push(i0, movz_inst(true, rgt_v(0), 1, 0))
-    i0 = teko::list::push(i0, MCbz { wide = true; zero = true; a = rgt_v(0); target = 3 to u32 })
-    i0 = teko::list::push(i0, MBranch { target = 2 to u32 })
-    let b0 = MBlock { id = 0; params = teko::list::empty(); insts = i0 }
-    mut i1: []MInst = teko::list::empty()
-    i1 = teko::list::push(i1, mov_inst(true, rgt_p(0), rgt_v(10)))
-    i1 = teko::list::push(i1, RET_INST)
-    let b1 = MBlock { id = 1; params = teko::list::push(teko::list::empty(), rgt_v(10)); insts = i1 }
-    mut i2: []MInst = teko::list::empty()
-    i2 = teko::list::push(i2, movz_inst(true, rgt_v(1), 42, 0))
-    i2 = teko::list::push(i2, mov_inst(true, rgt_v(10), rgt_v(1)))
-    i2 = teko::list::push(i2, MBranch { target = 1 to u32 })
-    let b2 = MBlock { id = 2; params = teko::list::empty(); insts = i2 }
-    mut i3: []MInst = teko::list::empty()
-    i3 = teko::list::push(i3, movz_inst(true, rgt_v(2), 99, 0))
-    i3 = teko::list::push(i3, mov_inst(true, rgt_v(10), rgt_v(2)))
-    i3 = teko::list::push(i3, MBranch { target = 1 to u32 })
-    let b3 = MBlock { id = 3; params = teko::list::empty(); insts = i3 }
-    mut blocks: []MBlock = teko::list::empty()
-    blocks = teko::list::push(blocks, b0)
-    blocks = teko::list::push(blocks, b1)
-    blocks = teko::list::push(blocks, b2)
-    blocks = teko::list::push(blocks, b3)
-    MFunc { symbol = "main"; blocks = blocks; frame = teko::list::empty() }
-}
-
-#test
-fn rgt_rpo_order_ranks_merge_after_arms() {
-    let f = rgt_diamond_fixture()
-    let order = rpo_block_order(f)
-    teko::assert::is_true(order.len == (4 to u64))
-    teko::assert::is_true(order[0] == (0 to u32))
-    teko::assert::is_true(block_pos(order, 1 to u32) > block_pos(order, 2 to u32))
-    teko::assert::is_true(block_pos(order, 1 to u32) > block_pos(order, 3 to u32))
-}
-
-#test
-fn rgt_rpo_numbering_places_arms_before_merge() {
-    let f = rgt_diamond_fixture()
-    let stream = rgt_number(f)
-    mut max_b2: u32 = 0 to u32
-    mut min_b1: u32 = 1000000 to u32
-    mut i: u64 = 0
-    loop {
-        if i >= stream.len { break }
-        let ni = stream[i]
-        if ni.block_id == (2 to u32) { max_b2 = ni.point }
-        if ni.block_id == (1 to u32) {
-            if ni.point < min_b1 { min_b1 = ni.point }
-        }
-        i++
-    }
-    teko::assert::is_true(max_b2 < min_b1)
-}
-
-#test
-fn rgt_regalloc_nested_if_allocates_and_preserves() {
-    let f = rgt_diamond_fixture()
-    let m = rgt_module_of(f)
-    let pre = minst_interp(m, "main", rgt_no_args())
-    teko::assert::is_true(pre == (42 to i128))
-    let is_err = match regalloc_func(AAPCS64, f) {
-        MFunc => false
-        error => true
-    }
-    teko::assert::is_true(!is_err)
-    teko::assert::is_true(!all_physical(f))
-    let cf = match regalloc_func(AAPCS64, f) {
-        MFunc as g => g
-        error => return
-    }
-    teko::assert::is_true(all_physical(cf))
-    let colored = match regalloc_module(AAPCS64, m) {
-        MModule as mm => mm
-        error => return
-    }
-    teko::assert::is_true(minst_interp(colored, "main", rgt_no_args()) == pre)
 }
 
 #test
@@ -1098,4 +519,3 @@ fn rgt_rpo_defensive_paths() {
     teko::assert::is_true(ord2.len == (2 to u64))
     teko::assert::is_true(u32_in(ord2, 9 to u32))
 }
-

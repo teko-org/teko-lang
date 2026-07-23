@@ -636,7 +636,7 @@ sobre `parts.text` == sobre `enc.relocs` de hoje; `coff_apply_data_reloc_addends
 `objfile_coff_test.tkt` (ex.: `exit` 120 bytes, `rodata` 198 bytes, `longname` 131
 bytes) intactos.
 
-O **fixpoint gen2==gen3** + ambas as engines são a prova viva final. **QED.**
+O **fixpoint gen1==gen2** + ambas as engines são a prova viva final. **QED.**
 
 ---
 
@@ -823,7 +823,7 @@ o arquivo compila a cada passo.
   byte-idênticos (`objfile_macho_test.tkt`, `objfile_coff_test.tkt`,
   `objfile_elf_test.tkt`, `objfile_elf_riscv_test.tkt`, `encode_*_test.tkt`,
   `minst_test.tkt`, `lower_test.tkt`, `lir_interp_test.tkt`, `tkb_test.tkt`) +
-  **fixpoint gen2==gen3** + ambas as engines (VM + nativo) + 100% de cobertura do
+  **fixpoint gen1==gen2** + ambas as engines (VM + nativo) + 100% de cobertura do
   delta (as fixtures §4.1/§4.3 cobrem o braço rodata-reloc; §4.2/§4.4 o colapso; §4.5
   os helpers/arms novos; os goldens existentes o braço `parts.rodata` vazia). **Sem
   seed bump** — T-B3 não adiciona capacidade que o corpus use (o 🔑 SEED BUMP #3 é

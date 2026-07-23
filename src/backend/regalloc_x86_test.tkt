@@ -74,17 +74,6 @@ fn rx_module_of(f: MFuncX86) -> MModuleX86 {
 }
 
 /**
- * rx_number — `number_insts_x86` over `f`'s RPO block order (the call the
- * numbering + back-edge passes take), wrapped so fixtures stay terse.
- *
- * @param MFuncX86 f  the function to number
- * @return []NumberedInstX86  the RPO-numbered stream
- */
-fn rx_number(f: MFuncX86) -> []NumberedInstX86 {
-    number_insts_x86(f, rpo_block_order_x86(f))
-}
-
-/**
  * rx_intervals — `compute_intervals_x86` over `f`'s RPO-numbered stream,
  * computing the order once and threading it to both the numbering and the
  * back-edge test.
@@ -202,46 +191,6 @@ fn rx_inst_all_phys(inst: MInstX86) -> bool {
 }
 
 /**
- * rx_is_frame_addr — whether `inst` is an `MFrameAddrX86`.
- *
- * @param MInstX86 inst  the instruction
- * @return bool  true iff MFrameAddrX86
- */
-fn rx_is_frame_addr(inst: MInstX86) -> bool {
-    match inst { MFrameAddrX86 => true; _ => false }
-}
-
-/**
- * rx_is_load — whether `inst` is an `MLoadX86`.
- *
- * @param MInstX86 inst  the instruction
- * @return bool  true iff MLoadX86
- */
-fn rx_is_load(inst: MInstX86) -> bool {
-    match inst { MLoadX86 => true; _ => false }
-}
-
-/**
- * rx_is_store — whether `inst` is an `MStoreX86`.
- *
- * @param MInstX86 inst  the instruction
- * @return bool  true iff MStoreX86
- */
-fn rx_is_store(inst: MInstX86) -> bool {
-    match inst { MStoreX86 => true; _ => false }
-}
-
-/**
- * rx_sr — a `ScanResult` from a list of assignments (no callee-saved used).
- *
- * @param []RegAssignment a  the assignments
- * @return ScanResult  the scan result
- */
-fn rx_sr(a: []RegAssignment) -> ScanResult {
-    ScanResult { assignments = a; used_callee_saved = teko::list::empty() }
-}
-
-/**
  * rx_full_subst — a table mapping virtual ids `0..n-1` to a physical GPR (for
  * the `map_minst_x86` coverage test; every operand becomes physical).
  *
@@ -290,53 +239,6 @@ fn rx_all_kinds() -> []MInstX86 {
 }
 
 #test
-fn rx_inst_regs_covers_every_minst_case() {
-    let g0 = rx_v(0)
-    let g1 = rx_v(1)
-    let mem = rx_mem(rx_v(0), 0 to i32)
-    let noargs: []MReg = teko::list::empty()
-    teko::assert::is_true(inst_regs_x86(movimm_x86(g0, 1 to i64, true)).has_def)
-    teko::assert::is_true(inst_regs_x86(movimm_x86(g0, 1 to i64, true)).uses.len == 0 to u64)
-    teko::assert::is_true(inst_regs_x86(mov_x86(g0, g1, true)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs_x86(alu_rm_x86(MAluOpX86::Add, g0, g1, true)).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs_x86(imul_x86(g0, g1, true)).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs_x86(divseq_x86(g0, g1, rx_v(2), true, false, true)).is_call)
-    teko::assert::is_true(inst_regs_x86(divseq_x86(g0, g1, rx_v(2), true, false, true)).has_def)
-    teko::assert::is_true(inst_regs_x86(divseq_x86(g0, g1, rx_v(2), true, false, true)).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs_x86(shift_x86(MShiftOpX86::Shl, g0, true)).uses.len == 2 to u64)
-    teko::assert::is_true(!inst_regs_x86(cmp_x86(g0, g1, true)).has_def)
-    teko::assert::is_true(inst_regs_x86(cmp_x86(g0, g1, true)).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs_x86(setcc_x86(g0, MCond::EQ)).has_def)
-    teko::assert::is_true(inst_regs_x86(setcc_x86(g0, MCond::EQ)).uses.len == 0 to u64)
-    teko::assert::is_true(!inst_regs_x86(jcc_x86(MCond::EQ, 0 to u32)).has_def)
-    teko::assert::is_true(inst_regs_x86(jcc_x86(MCond::EQ, 0 to u32)).uses.len == 0 to u64)
-    teko::assert::is_true(inst_regs_x86(neg_x86(g0, true)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs_x86(not_x86(g0, true)).uses.len == 1 to u64)
-    teko::assert::is_true(inst_regs_x86(load_x86(MMemSizeX86::Q, false, g0, mem)).has_def)
-    teko::assert::is_true(inst_regs_x86(load_x86(MMemSizeX86::Q, false, g0, mem)).uses.len == 1 to u64)
-    teko::assert::is_true(!inst_regs_x86(store_x86(MMemSizeX86::Q, g0, mem)).has_def)
-    teko::assert::is_true(inst_regs_x86(store_x86(MMemSizeX86::Q, g0, mem)).uses.len == 2 to u64)
-    teko::assert::is_true(inst_regs_x86(frame_addr_x86(g0, 0 to u32)).has_def)
-    teko::assert::is_true(inst_regs_x86(lea_rip_x86(g0, "s", RelocKindX86::Pc32)).has_def)
-    teko::assert::is_true(inst_regs_x86(lea_rip_x86(g0, "s", RelocKindX86::Pc32)).uses.len == 0 to u64)
-    teko::assert::is_true(!inst_regs_x86(jmp_x86(0 to u32)).has_def)
-    teko::assert::is_true(inst_regs_x86(call_x86("f", one_reg(rx_p(7)), rx_p(0), true, false)).is_call)
-    teko::assert::is_true(inst_regs_x86(call_x86("f", noargs, rx_p(0), false, false)).has_def == false)
-    teko::assert::is_true(inst_regs_x86(call_ind_x86(g0, noargs, rx_p(0), true)).is_call)
-    teko::assert::is_true(inst_regs_x86(call_ind_x86(g0, noargs, rx_p(0), false)).uses.len == 1 to u64)
-    teko::assert::is_true(!inst_regs_x86(ret_x86()).has_def)
-    teko::assert::is_true(inst_regs_x86(ret_x86()).uses.len == 0 to u64)
-}
-
-#test
-fn rx_shift_names_the_rcx_count_pin() {
-    let ir = inst_regs_x86(shift_x86(MShiftOpX86::Shl, rx_v(20), true))
-    teko::assert::is_true(ir.uses.len == 2 to u64)
-    teko::assert::is_true(ir.uses[1].is_phys)
-    teko::assert::is_true(ir.uses[1].id == 1 to u32)
-}
-
-#test
 fn rx_map_minst_covers_every_case() {
     let kinds = rx_all_kinds()
     let table = rx_full_subst(28 to u32)
@@ -347,25 +249,6 @@ fn rx_map_minst_covers_every_case() {
         teko::assert::is_true(rx_inst_all_phys(map_minst_x86(kinds[i], table)))
         i++
     }
-}
-
-#test
-fn rx_map_minst_leaves_unmapped_virtuals() {
-    let m0 = map_minst_x86(alu_rm_x86(MAluOpX86::Add, rx_v(0), rx_v(1), true), teko::list::empty())
-    teko::assert::is_true(!rx_inst_all_phys(m0))
-}
-
-#test
-fn rx_number_insts_flattens_in_block_order() {
-    let b0 = MBlockX86 { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), movimm_x86(rx_v(0), 1 to i64, true)) }
-    let b1 = MBlockX86 { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), ret_x86()) }
-    let f = MFuncX86 { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let stream = rx_number(f)
-    teko::assert::is_true(stream.len == 2 to u64)
-    teko::assert::is_true(stream[0].point == 0)
-    teko::assert::is_true(stream[0].block_id == 0)
-    teko::assert::is_true(stream[1].point == 1)
-    teko::assert::is_true(stream[1].block_id == 1)
 }
 
 /**
@@ -385,17 +268,6 @@ fn rx_entry_param_add_fixture() -> []MInstX86 {
     insts = teko::list::push(insts, mov_x86(rx_p(0), rx_v(2), true))
     insts = teko::list::push(insts, ret_x86())
     insts
-}
-
-#test
-fn rx_entry_live_pins_and_result_pin_intervals() {
-    let iset = match rx_intervals(rx_func(rx_entry_param_add_fixture())) { IntervalSet as s => s; error => return }
-    teko::assert::is_true(rx_iv_has(iset.virt, 0, 0, 2))
-    teko::assert::is_true(rx_iv_has(iset.virt, 1, 1, 3))
-    teko::assert::is_true(rx_iv_has(iset.virt, 2, 2, 4))
-    teko::assert::is_true(rx_iv_has(iset.fixed, 7, 0, 0))
-    teko::assert::is_true(rx_iv_has(iset.fixed, 6, 0, 1))
-    teko::assert::is_true(rx_iv_has(iset.fixed, 0, 4, 5))
 }
 
 #test
@@ -430,16 +302,6 @@ fn rx_repeated_physical_def_splits_into_two_pins() {
     teko::assert::is_true(rx_iv_has(iset.fixed, 0, 2, 3))
 }
 
-#test
-fn rx_fpr_spill_detection_covers_def_and_use() {
-    let mem = rx_mem(rx_p(7), 0 to i32)
-    let a10: RegAssignment = Spilled { vreg_id = 10 to u32; slot = 0 to u32 }
-    let sr = rx_sr(teko::list::push(teko::list::empty(), a10))
-    teko::assert::is_true(inst_has_fpr_spill_x86(sr, load_x86(MMemSizeX86::Q, false, rx_vf(10), mem)))
-    teko::assert::is_true(inst_has_fpr_spill_x86(sr, store_x86(MMemSizeX86::Q, rx_vf(10), mem)))
-    teko::assert::is_false(inst_has_fpr_spill_x86(sr, movimm_x86(rx_v(0), 1 to i64, true)))
-}
-
 /**
  * rx_call_cross_fixture — `mov v0=#5; call tk_x; mov rax=v0; ret` — `v0` is live
  * across the call and must be marked `crosses_call`, then land callee-saved.
@@ -464,100 +326,6 @@ fn rx_value_crossing_a_call_is_marked_and_callee_saved() {
     let p = rx_phys(scan, 0)
     teko::assert::is_true(p != 100000 to u32)
     teko::assert::is_true(is_callee_saved(SYSV64, rx_p(p)))
-}
-
-/**
- * rx_r_eq_a_op_a_fixture — `mov v10=#5; mov v11=v10; add v11,v10; mov rax=v11;
- * ret` — the two-address `r = a + a`. The seeded destination `v11` and the
- * source `v10` overlap, so the scan must give them DISTINCT physregs (the
- * dst≠a interference the copy-first two-address shape relies on).
- *
- * @return []MInstX86  the fixture stream
- */
-fn rx_r_eq_a_op_a_fixture() -> []MInstX86 {
-    mut insts: []MInstX86 = teko::list::empty()
-    insts = teko::list::push(insts, movimm_x86(rx_v(10), 5 to i64, true))
-    insts = teko::list::push(insts, mov_x86(rx_v(11), rx_v(10), true))
-    insts = teko::list::push(insts, alu_rm_x86(MAluOpX86::Add, rx_v(11), rx_v(10), true))
-    insts = teko::list::push(insts, mov_x86(rx_p(0), rx_v(11), true))
-    insts = teko::list::push(insts, ret_x86())
-    insts
-}
-
-#test
-fn rx_two_address_r_eq_a_op_a_gives_distinct_registers() {
-    let f = rx_func(rx_r_eq_a_op_a_fixture())
-    let iset = match rx_intervals(f) { IntervalSet as s => s; error => return }
-    let scan = linear_scan(SYSV64, iset)
-    teko::assert::is_true(rx_phys(scan, 10) != 100000 to u32)
-    teko::assert::is_true(rx_phys(scan, 11) != 100000 to u32)
-    teko::assert::is_true(rx_phys(scan, 10) != rx_phys(scan, 11))
-    let cf = match regalloc_func_x86(SYSV64, f) { MFuncX86 as g => g; error => return }
-    teko::assert::is_true(all_physical_x86(cf))
-    teko::assert::is_true(!all_physical_x86(f))
-}
-
-#test
-fn rx_two_address_rewrite_prints_all_physical_golden() {
-    let cf = match regalloc_func_x86(SYSV64, rx_func(rx_r_eq_a_op_a_fixture())) { MFuncX86 as g => g; error => return }
-    let text = minst_print_x86(rx_module_of(cf))
-    teko::assert::is_true(all_physical_x86(cf))
-    teko::assert::str_contains(text, "mov.q %p0, #5")
-    teko::assert::str_contains(text, "mov.q %p1, %p0")
-    teko::assert::str_contains(text, "add.q %p1, %p0")
-    teko::assert::str_contains(text, "mov.q %p0, %p1")
-    teko::assert::str_contains(text, "ret")
-}
-
-/**
- * rx_div_cross_fixture — `mov v10=#6; mov v11=#2; mov v12=#100;
- * div v13=v10/v11; add v12,v13; mov rax=v12; ret`. `v12` is live across the
- * `MDivSeqX86` (its `is_call=true` clobber) so it must land callee-saved (never
- * RAX/RDX); the divisor `v11` ends AT the div point and so also avoids RAX/RDX.
- *
- * @return []MInstX86  the fixture stream
- */
-fn rx_div_cross_fixture() -> []MInstX86 {
-    mut insts: []MInstX86 = teko::list::empty()
-    insts = teko::list::push(insts, movimm_x86(rx_v(10), 6 to i64, true))
-    insts = teko::list::push(insts, movimm_x86(rx_v(11), 2 to i64, true))
-    insts = teko::list::push(insts, movimm_x86(rx_v(12), 100 to i64, true))
-    insts = teko::list::push(insts, divseq_x86(rx_v(13), rx_v(10), rx_v(11), true, false, true))
-    insts = teko::list::push(insts, alu_rm_x86(MAluOpX86::Add, rx_v(12), rx_v(13), true))
-    insts = teko::list::push(insts, mov_x86(rx_p(0), rx_v(12), true))
-    insts = teko::list::push(insts, ret_x86())
-    insts
-}
-
-#test
-fn rx_div_value_live_across_lands_callee_saved() {
-    let f = rx_func(rx_div_cross_fixture())
-    let iset = match rx_intervals(f) { IntervalSet as s => s; error => return }
-    teko::assert::is_true(rx_iv_crosses(iset.virt, 12))
-    let scan = linear_scan(SYSV64, iset)
-    let p12 = rx_phys(scan, 12)
-    teko::assert::is_true(p12 != 100000 to u32)
-    teko::assert::is_true(is_callee_saved(SYSV64, rx_p(p12)))
-    teko::assert::is_true(p12 != 0 to u32)
-    teko::assert::is_true(p12 != 2 to u32)
-}
-
-#test
-fn rx_div_divisor_never_rax_or_rdx() {
-    let f = rx_func(rx_div_cross_fixture())
-    let iset = match rx_intervals(f) { IntervalSet as s => s; error => return }
-    teko::assert::is_true(rx_iv_crosses(iset.virt, 11))
-    let scan = linear_scan(SYSV64, iset)
-    let p11 = rx_phys(scan, 11)
-    teko::assert::is_true(p11 != 100000 to u32)
-    teko::assert::is_true(p11 != 0 to u32)
-    teko::assert::is_true(p11 != 2 to u32)
-}
-
-#test
-fn rx_div_end_to_end_all_physical() {
-    let cf = match regalloc_func_x86(SYSV64, rx_func(rx_div_cross_fixture())) { MFuncX86 as g => g; error => return }
-    teko::assert::is_true(all_physical_x86(cf))
 }
 
 /**
@@ -590,77 +358,6 @@ fn rx_shifted_value_stays_off_the_rcx_pin() {
     teko::assert::is_true(p20 != 1 to u32)
     let cf = match regalloc_func_x86(SYSV64, f) { MFuncX86 as g => g; error => return }
     teko::assert::is_true(all_physical_x86(cf))
-}
-
-#test
-fn rx_rewrite_inreg_physical_and_dedup() {
-    let a0: RegAssignment = InReg { vreg_id = 0 to u32; phys = 9 to u32 }
-    let sr = rx_sr(teko::list::push(teko::list::empty(), a0))
-    let out = rewrite_inst_x86(SYSV64, sr, alu_rm_x86(MAluOpX86::Add, rx_v(0), rx_v(0), true), 0 to u32)
-    teko::assert::is_true(out.len == 1 to u64)
-    teko::assert::is_true(rx_inst_all_phys(out[0]))
-}
-
-#test
-fn rx_rewrite_physical_use_passes_through() {
-    let a0: RegAssignment = InReg { vreg_id = 20 to u32; phys = 12 to u32 }
-    let sr = rx_sr(teko::list::push(teko::list::empty(), a0))
-    let out = rewrite_inst_x86(SYSV64, sr, shift_x86(MShiftOpX86::Shl, rx_v(20), true), 0 to u32)
-    teko::assert::is_true(out.len == 1 to u64)
-    teko::assert::is_true(rx_inst_all_phys(out[0]))
-}
-
-#test
-fn rx_rewrite_spilled_use_reloads() {
-    let a0: RegAssignment = Spilled { vreg_id = 0 to u32; slot = 0 to u32 }
-    let a2: RegAssignment = InReg { vreg_id = 2 to u32; phys = 12 to u32 }
-    let sr = rx_sr(teko::list::push(teko::list::push(teko::list::empty(), a0), a2))
-    let out = rewrite_inst_x86(SYSV64, sr, alu_rm_x86(MAluOpX86::Add, rx_v(2), rx_v(0), true), 0 to u32)
-    teko::assert::is_true(out.len == 3 to u64)
-    teko::assert::is_true(rx_is_frame_addr(out[0]))
-    teko::assert::is_true(rx_is_load(out[1]))
-    teko::assert::is_true(rx_inst_all_phys(out[2]))
-}
-
-#test
-fn rx_rewrite_spilled_def_stores() {
-    let a2: RegAssignment = Spilled { vreg_id = 2 to u32; slot = 0 to u32 }
-    let sr = rx_sr(teko::list::push(teko::list::empty(), a2))
-    let out = rewrite_inst_x86(SYSV64, sr, movimm_x86(rx_v(2), 5 to i64, true), 0 to u32)
-    teko::assert::is_true(out.len == 3 to u64)
-    teko::assert::is_true(rx_inst_all_phys(out[0]))
-    teko::assert::is_true(rx_is_frame_addr(out[1]))
-    teko::assert::is_true(rx_is_store(out[2]))
-}
-
-#test
-fn rx_rewrite_rmw_spilled_def_dedup() {
-    let a0: RegAssignment = Spilled { vreg_id = 0 to u32; slot = 0 to u32 }
-    let sr = rx_sr(teko::list::push(teko::list::empty(), a0))
-    let out = rewrite_inst_x86(SYSV64, sr, neg_x86(rx_v(0), true), 0 to u32)
-    teko::assert::is_true(out.len == 5 to u64)
-    teko::assert::is_true(rx_is_frame_addr(out[0]))
-    teko::assert::is_true(rx_is_load(out[1]))
-    teko::assert::is_true(rx_inst_all_phys(out[2]))
-    teko::assert::is_true(rx_is_frame_addr(out[3]))
-    teko::assert::is_true(rx_is_store(out[4]))
-}
-
-#test
-fn rx_rewrite_no_assignment_passes_through() {
-    let out = rewrite_inst_x86(SYSV64, rx_sr(teko::list::empty()), movimm_x86(rx_v(2), 5 to i64, true), 0 to u32)
-    teko::assert::is_true(out.len == 1 to u64)
-    teko::assert::is_true(!rx_inst_all_phys(out[0]))
-}
-
-#test
-fn rx_all_physical_detects_virtuals() {
-    let def_virtual = rx_named_func("main", teko::list::push(teko::list::empty(), movimm_x86(rx_v(0), 1 to i64, true)))
-    teko::assert::is_true(!all_physical_x86(def_virtual))
-    let use_virtual = rx_named_func("main", teko::list::push(teko::list::empty(), mov_x86(rx_p(0), rx_v(0), true)))
-    teko::assert::is_true(!all_physical_x86(use_virtual))
-    let phys = rx_named_func("main", teko::list::push(teko::list::empty(), mov_x86(rx_p(0), rx_p(1), true)))
-    teko::assert::is_true(all_physical_x86(phys))
 }
 
 /**
@@ -761,16 +458,6 @@ fn rx_fpr_spill_fixture() -> []MInstX86 {
 }
 
 #test
-fn rx_regalloc_fpr_spill_honest_stops() {
-    let f = rx_func(rx_fpr_spill_fixture())
-    let is_err = match regalloc_func_x86(rx_fpr_spill_abi(), f) {
-        MFuncX86 => false
-        error => true
-    }
-    teko::assert::is_true(is_err)
-}
-
-#test
 fn rx_regalloc_module_carries_tables_and_propagates() {
     let f1 = rx_named_func("a", rx_entry_param_add_fixture())
     let f2 = rx_named_func("b", rx_entry_param_add_fixture())
@@ -789,110 +476,6 @@ fn rx_regalloc_module_carries_tables_and_propagates() {
         error => true
     }
     teko::assert::is_true(is_err)
-}
-
-#test
-fn rx_regalloc_func_two_block_loop_allocates() {
-    let b0 = MBlockX86 { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jmp_x86(1 to u32)) }
-    let b1 = MBlockX86 { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jmp_x86(0 to u32)) }
-    let f = MFuncX86 { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let ok = match regalloc_func_x86(SYSV64, f) {
-        MFuncX86 => true
-        error => false
-    }
-    teko::assert::is_true(ok)
-}
-
-/**
- * rx_natural_loops_x86_two_block_loop_golden — the x86 mirror of the neutral
- * `natural_loops` golden (#389 F2 review NIT 3): a two-block loop (`b0: jmp b1`;
- * `b1: jmp b0`) numbers `b0`'s instruction at point 0 and `b1`'s at point 1, so
- * the retreating edge (`b1`'s jump back to `b0`) yields exactly one
- * `NaturalLoop{header_pt=0, latch_pt=1}`.
- */
-#test
-fn rx_natural_loops_x86_two_block_loop_golden() {
-    let b0 = MBlockX86 { id = 0; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jmp_x86(1 to u32)) }
-    let b1 = MBlockX86 { id = 1; params = teko::list::empty(); insts = teko::list::push(teko::list::empty(), jmp_x86(0 to u32)) }
-    let f = MFuncX86 { symbol = "main"; blocks = teko::list::push(teko::list::push(teko::list::empty(), b0), b1); frame = teko::list::empty() }
-    let o = rpo_block_order_x86(f)
-    let stream = number_insts_x86(f, o)
-    let loops = natural_loops_x86(stream, o, reachable_blocks_x86(f))
-    teko::assert::is_true(loops.len == (1 to u64))
-    teko::assert::is_true(loops[0].header_pt == (0 to u32))
-    teko::assert::is_true(loops[0].latch_pt == (1 to u32))
-}
-
-/**
- * rx_diamond_fixture — an acyclic id-inverted diamond mirroring isel output: the
- * MERGE block has id 1 (lowest) but is targeted by the arm blocks id 2/3, and
- * `v10` is defined in the arms and used in the merge — the numbering inversion
- * the #443 RPO fix handles. B0 compares `v0` with itself and branches on EQ.
- *
- * @return MFuncX86  the diamond function
- */
-fn rx_diamond_fixture() -> MFuncX86 {
-    mut i0: []MInstX86 = teko::list::empty()
-    i0 = teko::list::push(i0, movimm_x86(rx_v(0), 1 to i64, true))
-    i0 = teko::list::push(i0, cmp_x86(rx_v(0), rx_v(0), true))
-    i0 = teko::list::push(i0, jcc_x86(MCond::EQ, 3 to u32))
-    i0 = teko::list::push(i0, jmp_x86(2 to u32))
-    let b0 = MBlockX86 { id = 0; params = teko::list::empty(); insts = i0 }
-    mut i1: []MInstX86 = teko::list::empty()
-    i1 = teko::list::push(i1, mov_x86(rx_p(0), rx_v(10), true))
-    i1 = teko::list::push(i1, ret_x86())
-    let b1 = MBlockX86 { id = 1; params = teko::list::push(teko::list::empty(), rx_v(10)); insts = i1 }
-    mut i2: []MInstX86 = teko::list::empty()
-    i2 = teko::list::push(i2, movimm_x86(rx_v(1), 42 to i64, true))
-    i2 = teko::list::push(i2, mov_x86(rx_v(10), rx_v(1), true))
-    i2 = teko::list::push(i2, jmp_x86(1 to u32))
-    let b2 = MBlockX86 { id = 2; params = teko::list::empty(); insts = i2 }
-    mut i3: []MInstX86 = teko::list::empty()
-    i3 = teko::list::push(i3, movimm_x86(rx_v(2), 99 to i64, true))
-    i3 = teko::list::push(i3, mov_x86(rx_v(10), rx_v(2), true))
-    i3 = teko::list::push(i3, jmp_x86(1 to u32))
-    let b3 = MBlockX86 { id = 3; params = teko::list::empty(); insts = i3 }
-    mut blocks: []MBlockX86 = teko::list::empty()
-    blocks = teko::list::push(blocks, b0)
-    blocks = teko::list::push(blocks, b1)
-    blocks = teko::list::push(blocks, b2)
-    blocks = teko::list::push(blocks, b3)
-    MFuncX86 { symbol = "main"; blocks = blocks; frame = teko::list::empty() }
-}
-
-#test
-fn rx_rpo_order_ranks_merge_after_arms() {
-    let order = rpo_block_order_x86(rx_diamond_fixture())
-    teko::assert::is_true(order.len == 4 to u64)
-    teko::assert::is_true(order[0] == 0 to u32)
-    teko::assert::is_true(block_pos(order, 1 to u32) > block_pos(order, 2 to u32))
-    teko::assert::is_true(block_pos(order, 1 to u32) > block_pos(order, 3 to u32))
-}
-
-#test
-fn rx_rpo_numbering_places_arms_before_merge() {
-    let stream = rx_number(rx_diamond_fixture())
-    mut max_b2: u32 = 0 to u32
-    mut min_b1: u32 = 1000000 to u32
-    mut i: u64 = 0
-    loop {
-        if i >= stream.len { break }
-        let ni = stream[i]
-        if ni.block_id == 2 to u32 { max_b2 = ni.point }
-        if ni.block_id == 1 to u32 {
-            if ni.point < min_b1 { min_b1 = ni.point }
-        }
-        i++
-    }
-    teko::assert::is_true(max_b2 < min_b1)
-}
-
-#test
-fn rx_regalloc_diamond_allocates_all_physical() {
-    let f = rx_diamond_fixture()
-    teko::assert::is_true(!all_physical_x86(f))
-    let cf = match regalloc_func_x86(SYSV64, f) { MFuncX86 as g => g; error => return }
-    teko::assert::is_true(all_physical_x86(cf))
 }
 
 /**

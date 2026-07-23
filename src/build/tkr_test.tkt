@@ -1,52 +1,87 @@
 /**
- * tkr_parses — did the `.tkr` source parse successfully?
+ * tkr_parses — did the `.tkr` (Gherkin) source parse into a `[]TkrFeature`?
  *
  * @param src  the `.tkr` text
- * @return     true when `parse_tkr` returns a `Tkr`
+ * @return     true when `parse_tkr` succeeds
  */
 fn tkr_parses(src: str) -> bool {
-    match parse_tkr(src) { Tkr => true; error => false }
+    match parse_tkr(src) { []TkrFeature => true; error => false }
+}
+
+/**
+ * tkr_first_lowered — parse `src`, lower the FIRST feature's first scenario to a `Tkr`, or fail the
+ * test on any error. A shared helper so each lowering test reads as one assertion block.
+ *
+ * @param src  the `.tkr` text (at least one feature with a scenario)
+ * @return     the first scenario's lowered spec
+ * @throws     when the source fails to parse / lower (the test asserts false first)
+ */
+fn tkr_first_lowered(src: str) -> Tkr | error {
+    let feats = match parse_tkr(src) { []TkrFeature as f => f; error as e => return e }
+    if feats.len == 0 { return error { message = "no features" } }
+    if feats[0].scenarios.len == 0 { return error { message = "no scenarios" } }
+    tkr_lower_scenario(feats[0].scenarios[0])
 }
 
 #test
 /**
- * tkr_exit_kind_full — the common `exit` regressive: fold-opaque `args`, an `exit` oracle, and a
- * literal `stdout`. Absent `kind` defaults to `Exit`.
+ * tkr_parse_multi_feature — a file with MULTIPLE `Feature:` blocks yields a `[]TkrFeature` of the
+ * right length, each carrying its own scenarios (the free file-granularity, companion §1.1).
  *
  * @return void
  */
-fn tkr_exit_kind_full() {
-    let src = "args = [\"7\", \"13\", \"5\"]\nexit = 42\nstdout = \"checksum=42\\n\"\n"
+fn tkr_parse_multi_feature() {
+    let src = "Feature: a\n  Scenario: s1\n    When built and run\n    Then exit = 0\nFeature: b\n  Scenario: s2\n    When built and run\n    Then exit = 1\n  Scenario: s3\n    When built and run\n    Then exit = 2\n"
     match parse_tkr(src) {
+        []TkrFeature as fs => {
+            teko::assert::is_true(fs.len == 2)
+            teko::assert::is_true(fs[0].name == "a")
+            teko::assert::is_true(fs[0].scenarios.len == 1)
+            teko::assert::is_true(fs[1].name == "b")
+            teko::assert::is_true(fs[1].scenarios.len == 2)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_implicit_feature — a file with no explicit `Feature:` is one implicit feature carrying its
+ * scenarios (companion §1.1); an empty file yields the empty list.
+ *
+ * @return void
+ */
+fn tkr_implicit_feature() {
+    let src = "Scenario: s\n  When built and run\n  Then exit = 0\n"
+    match parse_tkr(src) {
+        []TkrFeature as fs => {
+            teko::assert::is_true(fs.len == 1)
+            teko::assert::is_true(fs[0].name == "")
+            teko::assert::is_true(fs[0].scenarios.len == 1)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match parse_tkr("# just a comment\n") { []TkrFeature as fs => teko::assert::is_true(fs.len == 0); error => teko::assert::is_true(false) }
+}
+
+#test
+/**
+ * tkr_lower_scenario_fields — a plain scenario lowers to the expected `Tkr`: the fold-opaque args,
+ * the run kind, the exit oracle, and the literal stdout expectation.
+ *
+ * @return void
+ */
+fn tkr_lower_scenario_fields() {
+    let src = "Feature: f\n  Scenario: s\n    Given args = [\"add\", \"2\", \"3\"]\n    When built and run\n    Then exit = 5\n    And stdout = \"5\"\n"
+    match tkr_first_lowered(src) {
         Tkr as t => {
-            teko::assert::is_true(t.kind == TkrKind::Exit)
             teko::assert::is_true(t.args.len == 3)
-            teko::assert::is_true(t.args[0] == "7")
-            teko::assert::is_true(t.args[2] == "5")
-            teko::assert::is_true(t.exit == 42)
-            teko::assert::is_true(t.stdout.mode == TkrMatchMode::Literal)
-            teko::assert::is_true(t.stdout.text == "checksum=42\\n")
-            teko::assert::is_true(t.stderr.mode == TkrMatchMode::Ignore)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-/**
- * tkr_print_kind_sha256 — a `print` regressive whose stdout is checked by sha256 (large/binary
- * output). `stdin` is fed as an opaque secondary channel.
- *
- * @return void
- */
-fn tkr_print_kind_sha256() {
-    let src = "kind = \"print\"\nstdin = \"hello\"\nexit = 0\nstdout_sha256 = \"deadbeef\"\n"
-    match parse_tkr(src) {
-        Tkr as t => {
+            teko::assert::is_true(t.args[0] == "add")
+            teko::assert::is_true(t.args[2] == "3")
+            teko::assert::is_true(t.exit == 5)
             teko::assert::is_true(t.kind == TkrKind::Print)
-            teko::assert::is_true(t.stdin == "hello")
-            teko::assert::is_true(t.stdout.mode == TkrMatchMode::Sha256)
-            teko::assert::is_true(t.stdout.text == "deadbeef")
+            teko::assert::is_true(t.stdout.mode == TkrMatchMode::Literal)
+            teko::assert::is_true(t.stdout.text == "5")
         }
         error => teko::assert::is_true(false)
     }
@@ -54,30 +89,19 @@ fn tkr_print_kind_sha256() {
 
 #test
 /**
- * tkr_trap_kind — a `trap` regressive (non-zero-only comparison).
+ * tkr_background_prepend — a Background Given step is prepended to every scenario's steps, ahead of
+ * the scenario's own steps.
  *
  * @return void
  */
-fn tkr_trap_kind() {
-    match parse_tkr("kind = \"trap\"\n") {
-        Tkr as t => teko::assert::is_true(t.kind == TkrKind::Trap)
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-/**
- * tkr_compile_fail_diagnostic — a `compile_fail` regressive pins the required diagnostic substring
- * (the strict upgrade over the legacy marker-only check).
- *
- * @return void
- */
-fn tkr_compile_fail_diagnostic() {
-    let src = "kind = \"compile_fail\"\ndiagnostic = \"`_` is a write-only discard\"\n"
-    match parse_tkr(src) {
+fn tkr_background_prepend() {
+    let src = "Feature: f\n  Background:\n    Given targets = [\"host\"]\n  Scenario: s\n    Given args = [\"x\"]\n    When built and run\n    Then exit = 0\n"
+    match tkr_first_lowered(src) {
         Tkr as t => {
-            teko::assert::is_true(t.kind == TkrKind::CompileFail)
-            teko::assert::is_true(t.diagnostic == "`_` is a write-only discard")
+            teko::assert::is_true(t.targets.len == 1)
+            teko::assert::is_true(t.targets[0] == "host")
+            teko::assert::is_true(t.args.len == 1)
+            teko::assert::is_true(t.args[0] == "x")
         }
         error => teko::assert::is_true(false)
     }
@@ -85,45 +109,80 @@ fn tkr_compile_fail_diagnostic() {
 
 #test
 /**
- * tkr_targets_forms — `targets` accepts the array form and a bare string (normalized to a 1-element
- * list, including the `"all"` sentinel).
+ * tkr_outline_expands — a `Scenario Outline` expands to one lowered `Tkr` per Examples row, each row
+ * textually substituting its `<name>` placeholders (here into the args and the exit oracle).
  *
  * @return void
  */
-fn tkr_targets_forms() {
-    match parse_tkr("targets = [\"x86_64\", \"wasm\"]\n") {
-        Tkr as t => { teko::assert::is_true(t.targets.len == 2); teko::assert::is_true(t.targets[1] == "wasm") }
-        error => teko::assert::is_true(false)
-    }
-    match parse_tkr("targets = \"all\"\n") {
-        Tkr as t => { teko::assert::is_true(t.targets.len == 1); teko::assert::is_true(t.targets[0] == "all") }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-/**
- * tkr_expect_override — a `[expect.<os-arch>]` sub-table overrides the exit/stdout for one os-arch;
- * `tkr_expect_for` resolves it and returns `null` for an unlisted os-arch.
- *
- * @return void
- */
-fn tkr_expect_override() {
-    let src = "exit = 42\n[expect.wasm]\nexit = 7\nstdout = \"w\"\n"
+fn tkr_outline_expands() {
+    let src = "Feature: f\n  Scenario Outline: op\n    Given args = [\"<op>\", \"<a>\"]\n    When built and run\n    Then exit = <r>\n    Examples:\n      | op  | a  | r |\n      | inc | 4  | 5 |\n      | dec | 9  | 8 |\n"
     match parse_tkr(src) {
-        Tkr as t => {
-            teko::assert::is_true(t.exit == 42)
-            teko::assert::is_true(t.expect.len == 1)
-            match tkr_expect_for(t, "wasm") {
-                TkrExpect as e => {
-                    teko::assert::is_true(e.has_exit)
-                    teko::assert::is_true(e.exit == 7)
-                    teko::assert::is_true(e.stdout.mode == TkrMatchMode::Literal)
-                    teko::assert::is_true(e.stdout.text == "w")
+        []TkrFeature as fs => {
+            teko::assert::is_true(fs[0].scenarios[0].outline)
+            match tkr_expand_outline(fs[0].scenarios[0]) {
+                []Tkr as xs => {
+                    teko::assert::is_true(xs.len == 2)
+                    teko::assert::is_true(xs[0].args[0] == "inc")
+                    teko::assert::is_true(xs[0].args[1] == "4")
+                    teko::assert::is_true(xs[0].exit == 5)
+                    teko::assert::is_true(xs[1].args[0] == "dec")
+                    teko::assert::is_true(xs[1].exit == 8)
                 }
+                error => teko::assert::is_true(false)
+            }
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_hex_docstring_control_bytes — a `"""<hex>"""` docstring decodes to raw bytes, ignoring the
+ * whitespace between the nibble pairs and carrying control bytes (`\n`, `\0`) literally.
+ *
+ * @return void
+ */
+fn tkr_hex_docstring_control_bytes() {
+    match tkr_read_hex_docstring("\"\"\"0a 00 41\"\"\"", 0) {
+        str as b => {
+            teko::assert::is_true(b.len == 3)
+            teko::assert::is_true((b[0] to u64) == 10)
+            teko::assert::is_true((b[1] to u64) == 0)
+            teko::assert::is_true((b[2] to u64) == 65)
+        }
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * tkr_hex_docstring_rejects_odd — an odd hex-nibble count and a non-hex byte are honest errors
+ * (M.3); a well-formed docstring still decodes.
+ *
+ * @return void
+ */
+fn tkr_hex_docstring_rejects_odd() {
+    match tkr_read_hex_docstring("\"\"\"0\"\"\"", 0) { str => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    match tkr_read_hex_docstring("\"\"\"zz\"\"\"", 0) { str => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    match tkr_read_hex_docstring("\"\"\"41\"\"\"", 0) { str as b => teko::assert::is_true(b == "A"); error => teko::assert::is_true(false) }
+}
+
+#test
+/**
+ * tkr_osarch_routing — a `Then on "<os-arch>"` step routes its exit into a per-os-arch override (via
+ * the reused `tkr_expect_for`), leaving the top-level expectation intact.
+ *
+ * @return void
+ */
+fn tkr_osarch_routing() {
+    let src = "Feature: f\n  Scenario: s\n    When built and run\n    Then exit = 6\n    Then on \"wasm\" exit = 7\n"
+    match tkr_first_lowered(src) {
+        Tkr as t => {
+            teko::assert::is_true(t.exit == 6)
+            match tkr_expect_for(t, "wasm") {
+                TkrExpect as e => { teko::assert::is_true(e.has_exit); teko::assert::is_true(e.exit == 7) }
                 null => teko::assert::is_true(false)
             }
-            match tkr_expect_for(t, "x86_64") { TkrExpect => teko::assert::is_true(false); null => teko::assert::is_true(true) }
         }
         error => teko::assert::is_true(false)
     }
@@ -131,18 +190,20 @@ fn tkr_expect_override() {
 
 #test
 /**
- * tkr_golden_table — a `[golden.<os-arch>]` sub-table pins the opt-in byte golden hash for one
- * os-arch.
+ * tkr_compile_fail_lowers — a `compilation fails` scenario lowers to the CompileFail kind pinning the
+ * `diagnostic` substring, and `tkr_scenario_source` reports its `Given source = "<file>"`.
  *
  * @return void
  */
-fn tkr_golden_table() {
-    let src = "exit = 0\n[golden.x86_64-linux]\nsha256 = \"abc123\"\n"
+fn tkr_compile_fail_lowers() {
+    let src = "Feature: f\n  Scenario: neg\n    Given source = \"cases/x.tks\"\n    When compilation fails\n    Then diagnostic = \"out of range\"\n"
     match parse_tkr(src) {
-        Tkr as t => {
-            teko::assert::is_true(t.golden.len == 1)
-            teko::assert::is_true(t.golden[0].osarch == "x86_64-linux")
-            teko::assert::is_true(t.golden[0].sha256 == "abc123")
+        []TkrFeature as fs => {
+            teko::assert::is_true(tkr_scenario_source(fs[0].scenarios[0]) == "cases/x.tks")
+            match tkr_lower_scenario(fs[0].scenarios[0]) {
+                Tkr as t => { teko::assert::is_true(t.kind == TkrKind::CompileFail); teko::assert::is_true(t.diagnostic == "out of range") }
+                error => teko::assert::is_true(false)
+            }
         }
         error => teko::assert::is_true(false)
     }
@@ -150,19 +211,28 @@ fn tkr_golden_table() {
 
 #test
 /**
- * tkr_defaults — an empty `.tkr` yields the safe defaults: `Exit` kind, exit 0, ignored streams,
- * no args, no targets.
+ * tkr_verdict_parity — a lowered scenario and the equivalent hand-built `Tkr` yield the SAME
+ * `check_run` verdict on both a matching and a mismatching `CapResult` (identical `RegrOutcome.ok`),
+ * proving the lowering IR is faithful AND that the runner REPORTS a failure on a mismatch (the
+ * failure-reporting self-test the deleted `regression-fixture/` demo used to carry, companion §7).
  *
  * @return void
  */
-fn tkr_defaults() {
-    match parse_tkr("") {
-        Tkr as t => {
-            teko::assert::is_true(t.kind == TkrKind::Exit)
-            teko::assert::is_true(t.exit == 0)
-            teko::assert::is_true(t.args.len == 0)
-            teko::assert::is_true(t.targets.len == 0)
-            teko::assert::is_true(t.stdout.mode == TkrMatchMode::Ignore)
+fn tkr_verdict_parity() {
+    let src = "Feature: f\n  Scenario: s\n    Given args = [\"7\"]\n    When built and run\n    Then exit = 42\n    And stdout = \"ok\"\n"
+    match tkr_first_lowered(src) {
+        Tkr as lowered => {
+            let hand = Tkr {
+                args = teko::list::push(teko::list::empty(), "7"); stdin = ""; kind = TkrKind::Print; exit = 42
+                stdout = TkrMatch { mode = TkrMatchMode::Literal; text = "ok" }; stderr = tkr_match_ignore()
+                targets = teko::list::empty(); expect = teko::list::empty(); golden = teko::list::empty(); diagnostic = ""
+            }
+            let good = CapResult { exit = 42; stdout = "ok"; stderr = "" }
+            let bad = CapResult { exit = 1; stdout = "no"; stderr = "" }
+            teko::assert::is_true(check_run(lowered, HOST_TARGET, good).ok)
+            teko::assert::is_true(check_run(hand, HOST_TARGET, good).ok)
+            teko::assert::is_false(check_run(lowered, HOST_TARGET, bad).ok)
+            teko::assert::is_false(check_run(hand, HOST_TARGET, bad).ok)
         }
         error => teko::assert::is_true(false)
     }
@@ -170,14 +240,53 @@ fn tkr_defaults() {
 
 #test
 /**
- * tkr_rejects_malformed — a malformed line (missing `=`), an unknown `kind`, and a non-list `args`
- * value are honest errors (M.3); a well-formed source still parses.
+ * tkr_discovery_lists_tkr — `dir_tkr_files` returns the empty list for an unreadable directory and
+ * the renamed `rt_behavior.tkr` for its regressor dir; that dir is NOT the self-project (no
+ * `regressor.tkr`), so the runner executes it.
+ *
+ * @return void
+ */
+fn tkr_discovery_lists_tkr() {
+    teko::assert::is_true(dir_tkr_files("examples/regressions/__nope__").len == 0)
+    let files = dir_tkr_files("examples/regressions/rt_behavior")
+    teko::assert::is_true(files.len == 1)
+    teko::assert::is_true(files[0] == "rt_behavior.tkr")
+    teko::assert::is_false(dir_is_self_project("examples/regressions/rt_behavior"))
+}
+
+#test
+/**
+ * tkr_files_sort_deterministically — `dir_tkr_files`'s insertion sort orders basenames byte-wise, so
+ * a project holding multiple `.tkr` files runs them in a stable order regardless of `list_dir`'s
+ * order (companion §10).
+ *
+ * @return void
+ */
+fn tkr_files_sort_deterministically() {
+    let a = tkr_insert_sorted(teko::list::empty(), "io.tkr")
+    let b = tkr_insert_sorted(a, "arith.tkr")
+    let c = tkr_insert_sorted(b, "bitwise.tkr")
+    teko::assert::is_true(c.len == 3)
+    teko::assert::is_true(c[0] == "arith.tkr")
+    teko::assert::is_true(c[1] == "bitwise.tkr")
+    teko::assert::is_true(c[2] == "io.tkr")
+    teko::assert::is_true(tkr_basename_lt("a.tkr", "b.tkr"))
+    teko::assert::is_false(tkr_basename_lt("b.tkr", "a.tkr"))
+    teko::assert::is_false(tkr_basename_lt("a.tkr", "a.tkr"))
+}
+
+#test
+/**
+ * tkr_rejects_malformed — an unknown noun-phrase, an unknown When verb, and a step before any
+ * Scenario are honest errors (M.3); a well-formed feature still parses.
  *
  * @return void
  */
 fn tkr_rejects_malformed() {
-    teko::assert::is_false(tkr_parses("exit 42\n"))
-    teko::assert::is_false(tkr_parses("kind = \"bogus\"\n"))
-    teko::assert::is_false(tkr_parses("args = 42\n"))
-    teko::assert::is_true(tkr_parses("exit = 1\n"))
+    teko::assert::is_false(tkr_parses("Feature: f\n  Given args = [\"x\"]\n"))
+    let bad_noun = "Feature: f\n  Scenario: s\n    When built and run\n    Then bogus = \"x\"\n"
+    match tkr_first_lowered(bad_noun) { Tkr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    let bad_verb = "Feature: f\n  Scenario: s\n    When teleported\n"
+    match tkr_first_lowered(bad_verb) { Tkr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+    teko::assert::is_true(tkr_parses("Feature: f\n  Scenario: s\n    When built and run\n    Then exit = 0\n"))
 }

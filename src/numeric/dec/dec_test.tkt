@@ -1,0 +1,92 @@
+/**
+ * src/numeric/dec/dec_test.tkt (namespace 'teko::numeric::dec') — LIVE #test coverage for the exact
+ * base-10 decimal engine. Exercises parse/render normalization, exact addition of operands with
+ * DISTINCT scales (the binary-float trap `0.1 + 0.2 == 0.3`), multiplication scale, exact-or-panic
+ * division, and comparison.
+ */
+
+/**
+ * assert_eq_str — assert two strings are byte-equal.
+ *
+ * @param got   the produced string
+ * @param want  the expected string
+ */
+fn assert_eq_str(got: str, want: str) {
+    teko::assert::is_true(got == want)
+}
+
+/**
+ * parse_render_normalizes — `of_lit` then `to_str` renders the canonical decimal, trimming trailing
+ * zeros beyond the minimal scale and dropping a whole value's point.
+ */
+#test
+fn parse_render_normalizes() {
+    assert_eq_str(to_str(of(0)), "0")
+    assert_eq_str(to_str(of(-3)), "-3")
+    assert_eq_str(to_str(of_lit("1.5")), "1.5")
+    assert_eq_str(to_str(of_lit("0.1")), "0.1")
+    assert_eq_str(to_str(of_lit("0.001")), "0.001")
+    assert_eq_str(to_str(of_lit("123")), "123")
+    assert_eq_str(to_str(of_lit("1.00")), "1")
+    assert_eq_str(to_str(of_lit("1.50")), "1.5")
+    assert_eq_str(to_str(of_lit("-2.500")), "-2.5")
+}
+
+/**
+ * add_distinct_scales_is_exact — adding decimals with DIFFERENT numbers of fractional digits is
+ * exact, including the classic `0.1 + 0.2 == 0.3` that binary floats get wrong.
+ */
+#test
+fn add_distinct_scales_is_exact() {
+    assert_eq_str(to_str(add(of_lit("0.1"), of_lit("0.2"))), "0.3")
+    teko::assert::is_true(eq(add(of_lit("0.1"), of_lit("0.2")), of_lit("0.3")))
+    assert_eq_str(to_str(add(of_lit("1.5"), of_lit("2.25"))), "3.75")
+    assert_eq_str(to_str(add(of_lit("10"), of_lit("0.001"))), "10.001")
+    assert_eq_str(to_str(add(of_lit("0.75"), of_lit("0.25"))), "1")
+}
+
+/**
+ * sub_and_neg — subtraction and negation are exact and normalized.
+ */
+#test
+fn sub_and_neg() {
+    assert_eq_str(to_str(sub(of_lit("0.3"), of_lit("0.1"))), "0.2")
+    assert_eq_str(to_str(sub(of_lit("1"), of_lit("0.001"))), "0.999")
+    assert_eq_str(to_str(neg(of_lit("2.5"))), "-2.5")
+    assert_eq_str(to_str(sub(of_lit("2.5"), of_lit("2.5"))), "0")
+}
+
+/**
+ * mul_scales — multiplication adds scales and normalizes the product.
+ */
+#test
+fn mul_scales() {
+    assert_eq_str(to_str(mul(of_lit("1.5"), of_lit("1.5"))), "2.25")
+    assert_eq_str(to_str(mul(of_lit("0.1"), of_lit("0.1"))), "0.01")
+    assert_eq_str(to_str(mul(of_lit("1.00"), of_lit("1.0"))), "1")
+    assert_eq_str(to_str(mul(of_lit("-1.25"), of_lit("4"))), "-5")
+}
+
+/**
+ * div_is_exact_or_none — division yields the exact terminating quotient (denominators of 2s and 5s).
+ */
+#test
+fn div_is_exact_or_none() {
+    assert_eq_str(to_str(div(of_lit("1"), of_lit("4"))), "0.25")
+    assert_eq_str(to_str(div(of_lit("1"), of_lit("8"))), "0.125")
+    assert_eq_str(to_str(div(of_lit("6"), of_lit("3"))), "2")
+    assert_eq_str(to_str(div(of_lit("10"), of_lit("4"))), "2.5")
+    assert_eq_str(to_str(div(of_lit("0.3"), of_lit("0.1"))), "3")
+    assert_eq_str(to_str(div(of_lit("2.5"), of_lit("1"))), "2.5")
+}
+
+/**
+ * cmp_ignores_representation — comparison orders decimals by value regardless of stored scale.
+ */
+#test
+fn cmp_ignores_representation() {
+    teko::assert::is_true(cmp(of_lit("0.1"), of_lit("0.2")) == -1)
+    teko::assert::is_true(cmp(of_lit("0.2"), of_lit("0.1")) == 1)
+    teko::assert::is_true(cmp(of_lit("0.30"), of_lit("0.3")) == 0)
+    teko::assert::is_true(eq(of_lit("1.500"), of_lit("1.5")))
+}

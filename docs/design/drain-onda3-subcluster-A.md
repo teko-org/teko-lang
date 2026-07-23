@@ -4,7 +4,7 @@
 **Parent design:** `docs/design/onda3-monomorphization-cluster.md`.
 **Order (A):** `#290` → `#301` → `#254` → `#294`. **Seed:** `teko.tkp` current (`.37-alpha`).
 **Rule:** every snippet is full-Javadoc, `.tks`-only. C twins FROZEN (only `teko_rt.{c,h}` is maintained — none needed here).
-**Ritual (all):** full gate — gen1 `teko . -o bin` (native #test) + `./bin/teko test .` (VM) + FIXPOINT gen2==gen3 byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit.
+**Ritual (all):** full gate — gen1 `teko . -o bin` (native #test) + `./bin/teko test .` (VM) + FIXPOINT gen1==gen2 byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit.
 
 ## RE-VERIFICATION HEADLINE (the #296 lesson: count sites, do not trust "1 crumb")
 
@@ -83,7 +83,7 @@ fn ns_matches_qualified_class(b_ns: str, callee: parser::Path) -> bool {
 Apply at ALL **4** compare sites (`scope.tks:143` + `:156` in `lookup_call`, `:179` + `:192` in `call_ns`). Guard: only substitute the predicate when `callee.segments.len >= 3 && second_to_last names a class`; else keep `ns_last_seg(b.ns) == qual`. Helpers `join_ns`/`path_prefix_segments`/`ends_with_ns` — grep first; `ends_with_ns` likely already exists (`find_class_method` at `vm.tks:2998` uses an `ends_with(tf.namespace, "::" ~ class_name)` idiom — reuse that exact tail-compare).
 
 **Fixtures:** `examples/regressions/same_bare_method_dispatch/` (VM==native), modeled on `di_same_name_cross_ns`. Two ns `left`/`right`, each `type Svc = class { pub tag: i64; pub fn make(x: i64) -> Svc; pub fn tag_of(self) -> i64 { self.tag } }`; `left::Svc::make(3).tag_of() == 3`, `right::Svc::make(7).tag_of() == 7`; `exit(l + r)` = **exit 10**. Fails to type-check today, passes both after. **Fold in:** flip `di_same_name_cross_ns` to CALL the method (its field-read is the #290 workaround) IN THIS PR — it IS the regression closure (report the flip in the PR body; do not silently rewrite).
-**Ritual:** full gate; the compiler's own #109 type surface has same-bare classes, so gen2==gen3 is a loud guard. The qualified-class predicate MUST be a no-op for every non-class-dispatch call.
+**Ritual:** full gate; the compiler's own #109 type surface has same-bare classes, so gen1==gen2 is a loud guard. The qualified-class predicate MUST be a no-op for every non-class-dispatch call.
 
 ---
 
@@ -124,7 +124,7 @@ Verified VM facts: `eval_lambda_call` (`vm.tks:2962`) DOES merge callee cells ba
 - `examples/regressions/closure_in_ref_roundtrip/` (VM==native) — the `reseat` repro; exit-code protocol.
 - `examples/regressions/closure_optional_field/` (native — `tk_opt_func` must cc-compile): a struct with a `Fn?` field and a `[]Fn` field, constructed + read.
 - `flat_map`-shaped `iter_test.tkt` once round-trip holds (unparks ITER0 #184).
-**Ritual:** ship BOTH engines in ONE PR (mangle=native, cell=VM) so `diff_vm_native.sh` never sees a half-fixed state. Corpus carries no `Fn?`/`[]Fn` today → gen2==gen3 trivially preserved (guard: the new arms are a no-op unless a Func inner appears).
+**Ritual:** ship BOTH engines in ONE PR (mangle=native, cell=VM) so `diff_vm_native.sh` never sees a half-fixed state. Corpus carries no `Fn?`/`[]Fn` today → gen1==gen2 trivially preserved (guard: the new arms are a no-op unless a Func inner appears).
 
 ---
 
@@ -192,7 +192,7 @@ Method walk per method: `subst_texpr_names` each `params[i].type_ann` + `return_
  * instance name, its body rewritten through the instance's Subst — mirroring the free-fn stamp
  * (monomorphize PHASE-2, monomorph.tks:795) but the callable's owner is the stamped type, so
  * `list.push(x)` on a `List<i64>` dispatches to `List__g__i64::push`. Reuses mono_block/subst_type
- * unchanged. A NO-OP when the instance carries no methods (the existing corpus) → gen2==gen3 preserved.
+ * unchanged. A NO-OP when the instance carries no methods (the existing corpus) → gen1==gen2 preserved.
  * @param inst   the type instance (mangled name + Subst)
  * @param gtd    the generic type-decl template (carrying methods after layer 2)
  * @param items  the program items (transitive generic-call discovery)
@@ -228,7 +228,7 @@ With L1-L4, a generic class's static factory (body constructs `Self<T>{…}`, re
 - `examples/regressions/generic_method_self_construct/` — `fn dup(self) -> Box<T> { Box { value = self.value } }` (proves the L4 return-type thread).
 - `examples/regressions/generic_method_trait_fold/` — a `<K: Hashable & Eq>` chain method (the #163 Map-key path — proves the constraint gate + trait fold survive stamping).
 - Corpus `#test`s in `generics_test.tkt` (VM → cover the mono method path both engines).
-**Ritual:** full gate at EACH layer (independently gate-able). The `any_generic` no-op guard (`monomorph.tks:739`) MUST hold — the compiler has ZERO generic methods → gen2==gen3 byte-identical is the single most important fixpoint guard in the cluster. Verify at each layer, not only at the end.
+**Ritual:** full gate at EACH layer (independently gate-able). The `any_generic` no-op guard (`monomorph.tks:739`) MUST hold — the compiler has ZERO generic methods → gen1==gen2 byte-identical is the single most important fixpoint guard in the cluster. Verify at each layer, not only at the end.
 **Sequencing vs #162 (S6):** memory `teko-generic-methods-gap` sequences #254 AFTER #162 to avoid conflict in monomorph/typer/resolve/collect. Confirm #162's merge state; layers 1-2 (collect/resolve) are the conflict-prone ones — coordinate or rebase.
 
 ---
@@ -273,7 +273,7 @@ Call it at the head of `rekey_iface_dispatch` (return early on a struct rewrite)
 **Fixtures (VM==native):**
 - `examples/regressions/struct_through_constraint/` — `type P = struct { pub w: i64; pub fn measure(self) -> i64 { self.w } }` + `fn total<T: Measurable>(x: T) -> i64 { x.measure() }`; `total(P{w=5})` → **exit 5**. Panics on VM / cc-rejects natively today; both pass after.
 - `examples/regressions/struct_vs_class_constraint/` — same constraint satisfied by a STRUCT and by a CLASS in the same program; the struct dispatches direct, the class through the vtable — both correct (proves the no-op-for-class guard).
-**Ritual:** full gate; gated on #254 green (the stamped concrete method is the direct target). gen2==gen3: the compiler uses no constraint-bound struct dispatch → the new arm is a no-op there.
+**Ritual:** full gate; gated on #254 green (the stamped concrete method is the direct target). gen1==gen2: the compiler uses no constraint-bound struct dispatch → the new arm is a no-op there.
 
 ---
 

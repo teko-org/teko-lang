@@ -1,0 +1,83 @@
+# .github/workflows/seed-linux-fork.yml
+# Fork-scoped Linux x86-64 seed cut — MANUAL (workflow_dispatch), fork-only, main-only.
+# The seed/* BRANCH model is retired (owner 2026-07-23): this file now lives on the
+# umbrella/main and the cut is dispatched by the OWNER from the Actions screen. It still
+# publishes the same dry single-artifact fork RELEASE (tag derived from teko.tkp) that
+# agents/CI fetch via `TEKO_REPO=<fork> sh scripts/fetch_teko.sh`.
+# LOCKS: never runs on the org (repository guard) and only executes on main (ref guard) —
+# the file may EXIST on the org's main after equalization, but must never run there.
+name: Fork Seed (Linux x86-64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # publish the fork release
+
+concurrency:
+  group: seed-linux-fork
+  cancel-in-progress: true
+
+jobs:
+  cut:
+    # fork only + main only — the file may exist on the org / other branches, but the cut
+    # is dispatched exclusively on schivei/teko-lang@main.
+    if: github.repository == 'schivei/teko-lang' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive tag from teko.tkp
+        id: ver
+        run: |
+          set -eu
+          V="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' teko.tkp | head -1)"
+          S="$(sed -n 's/^suffix[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' teko.tkp | head -1)"
+          echo "tag=v${V}${S:+-$S}" >> "$GITHUB_OUTPUT"
+
+      # IDEMPOTENT CUT: if the release for the derived tag already exists, skip the whole
+      # cut — re-dispatching without a version bump must be a no-op, never asset churn.
+      - name: Skip if this seed release already exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -eu
+          if gh release view "$V" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "SKIP: fork seed release '$V' already exists — version not bumped; nothing to cut."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "CUT: fork seed release '$V' is missing — building the seed."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bootstrap seed (newest available release)
+        if: steps.exists.outputs.skip != 'true'
+        run: ./scripts/ci_provision_teko.sh linux-x86_64-glibc
+
+      - name: Build the seed — dry, no gate, no fixpoint
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -eu
+          mkdir -p out
+          teko build . --no-verify --release -o out
+          test -x out/teko
+
+      - name: Package (binary at tarball root — fetch_teko.sh extracts to .teko/teko)
+        if: steps.exists.outputs.skip != 'true'
+        run: tar -C out -czf teko-linux-x86_64-glibc.tar.gz teko
+
+      - name: Publish the new fork seed release
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -eu
+          PRERELEASE=""; case "$V" in *-*) PRERELEASE="--prerelease" ;; esac
+          gh release create "$V" teko-linux-x86_64-glibc.tar.gz --repo "$GITHUB_REPOSITORY" \
+            --title "$V (fork seed — linux-x86_64-glibc)" \
+            --notes "Dry fork-scoped Linux x86-64 seed for agent/CI validation. Canonical multi-platform release lives on the org." \
+            $PRERELEASE

@@ -154,7 +154,7 @@ The three "don't-recompile-from-source" optimizations — incremental, link-only
 generic-from-`.tkb` — MUST all produce byte-identical output to a from-source build (M.2). Same
 dragon, three doors; this is a law from the design of the package manager, not a surprise at the
 first failing fixpoint. The regression bar is the existing one: temp-normalized gen1↔gen2 diff = 0
-and gen2 == gen3 byte-identical (FIXPOINT).
+and gen1==gen2 byte-identical (FIXPOINT).
 
 ### 2.7 `ref` = the package boundary (safe Teko↔Teko FFI)
 
@@ -755,7 +755,7 @@ Parse `[tools]` into a parallel `tool_specs: []DepSpec`.
   - `D4` `[tools]` entry parses into `tool_specs`, distinct from `dep_specs`; exit 0.
   - `D5` malformed inline table (`{ path = }`) → honest error; exit non-zero.
 - **Ritual:** FULL GATE — `manifest.tks` is production code the compiler reads; both engines +
-  byte-identity + fixpoint gen2==gen3 (the compiler self-builds through the manifest parser).
+  byte-identity + fixpoint gen1==gen2 (the compiler self-builds through the manifest parser).
 
 ### Crumb C4 — `.tkh` manifest block (PK-codec)
 
@@ -826,7 +826,7 @@ not yet merged it is design-ahead against #180's declared seam.
     idempotent re-run exits 0 (F7).
   - `C7d` the read-only store is not mutated during a build (F9); exit 0.
 - **Ritual:** FULL GATE (the whole native build path) — both engines + byte-identity + **fixpoint
-  gen2==gen3** is the wall for the "don't-recompile-from-source" invariant (§2.6). Register that
+  gen1==gen2** is the wall for the "don't-recompile-from-source" invariant (§2.6). Register that
   the self-host does NOT exercise cross-package generics (the compiler is single-package) — the
   resolver/lockfile fixtures are the only coverage there; the ritual proves no regression but does
   not prove multi-package generics.
@@ -848,7 +848,7 @@ build to a native exe now.
 
 ### Ritual summary
 
-The **full gate** (both engines · paranoid · diff_vm_native · parity · fixpoint gen2==gen3) is
+The **full gate** (both engines · paranoid · diff_vm_native · parity · fixpoint gen1==gen2) is
 mandatory at crumbs **C3, C4, C5, C6, C7, C8** — every crumb that touches production compiler code
 or the serializer. C1/C2 are pure additive logic (VM+native build must pass; no fixpoint
 dependency). The serializer crumb (C4) and the cache-wire crumb (C7) are the two where

@@ -268,46 +268,352 @@ fn type_tilde_chain(b: parser::Binary, env: Env, table: TypeTable) -> TExpr | er
     (opaque OR interface-mirroring), so every arm below already falls through to its own clear error
     for a `T` operand — NO new logic is needed, and none is added here (avoids gold-plating a
     pre-alpha surface). Real operators on T arrive with an operator-trait constraint (#176+). */
+/**
+ * deref_ref_value — the transparent auto-deref of the `ref` keyword surface (0.3.0.30 Part A). Peels
+ * ONE surface `ref`/`Reference{T}` layer off a typed expression used in a VALUE context, so the
+ * developer reads a `ref`-bound name bare (no `.value`) exactly as its referenced value. The peel
+ * lowers to the same `.value` read (`TFieldAccess` field `value` → codegen `(*p)`) the surface no
+ * longer spells. On any non-reference expression it is an identity no-op, so it fires ONLY on the new
+ * `ref` surface (the current corpus never produces a bare `Reference` in a value position). References
+ * are internally depth-1, so a single peel reaches the value.
+ *
+ * @param te  the typed operand
+ * @return    `te` with its outermost `Reference` peeled to the referenced value, else `te` unchanged
+ */
+fn deref_ref_value(te: TExpr) -> TExpr {
+    match te.type {
+        Reference as rf => TExpr { kind = TFieldAccess { receiver = te; field = "value" }; type = rf.inner; line = te.line; col = te.col }
+        _ => te
+    }
+}
+
+/**
+ * bignum_kind — classify a type as one of the compiler-known arbitrary-precision surfaces. Returns
+ * `"bigint"` for `teko::numeric::bigint::BigInt`, `"dec"` for `teko::numeric::dec::Decimal`, or the
+ * empty string for anything else. The single discriminator behind the operator/comparison sugar.
+ *
+ * @param t  the resolved type
+ * @return   `"bigint"`, `"dec"`, or `""`
+ */
+fn bignum_kind(t: Type) -> str {
+    match t {
+        Named as n => {
+            if n.name == "teko::numeric::bigint::BigInt" { return "bigint" }
+            if n.name == "teko::numeric::dec::Decimal" { return "dec" }
+            ""
+        }
+        _ => ""
+    }
+}
+
+/**
+ * bignum_named — the `Named` type of a bignum kind (`"bigint"` → the `BigInt` struct, otherwise the
+ * `Decimal` struct).
+ *
+ * @param kind  `"bigint"` or `"dec"`
+ * @return      the corresponding `Named` type
+ */
+fn bignum_named(kind: str) -> Type {
+    if kind == "bigint" { return Named { name = "teko::numeric::bigint::BigInt" } }
+    Named { name = "teko::numeric::dec::Decimal" }
+}
+
+/**
+ * bignum_ns — the runtime module namespace backing a bignum kind (drives the mangled C symbol of the
+ * lowered call).
+ *
+ * @param kind  `"bigint"` or `"dec"`
+ * @return      `"teko::numeric::bigint"` or `"teko::numeric::dec"`
+ */
+fn bignum_ns(kind: str) -> str {
+    if kind == "bigint" { return "teko::numeric::bigint" }
+    "teko::numeric::dec"
+}
+
+/**
+ * bignum_call — build a typed call `teko::numeric::<kind>::<fn_name>(args)` — the ONE runtime
+ * implementation both the library and the operator sugar target (no doubling). A namespaced,
+ * non-closure `TCall` codegen resolves to the mangled library symbol under both backends.
+ *
+ * @param kind     `"bigint"` or `"dec"`
+ * @param fn_name  the library function's bare name (`add`/`sub`/`mul`/`div`/`rem`/`cmp`/`neg`/`of`)
+ * @param args     the typed argument expressions
+ * @param ret      the call's result type
+ * @return         the typed call expression
+ */
+fn bignum_call(kind: str, fn_name: str, args: []TExpr, ret: Type) -> TExpr {
+    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" })
+    segs = teko::list::push(segs, parser::Segment { name = "numeric" })
+    segs = teko::list::push(segs, parser::Segment { name = kind })
+    segs = teko::list::push(segs, parser::Segment { name = fn_name })
+    let callee = parser::Path { segments = segs }
+    TExpr { kind = TCall { callee = callee; args = args; call_ns = bignum_ns(kind); is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = ret; line = 0; col = 0 }
+}
+
+/**
+ * bignum_adopt_operand — coerce one operand of a bignum operation to the target kind. A value already
+ * of that kind passes through; a fitting non-negative integer LITERAL adopts it via the library's
+ * `of` constructor (literal-adopt: `big + 1` works). Every other operand — a value of the OTHER
+ * bignum kind, a machine-typed variable, or a float literal — is rejected with a diagnostic that
+ * names the explicit conversion (no implicit promotion, B.22).
+ *
+ * @param e     the typed operand
+ * @param kind  the target bignum kind (`"bigint"` or `"dec"`)
+ * @return      the operand as a value of `kind`, or an error explaining the required explicit step
+ * @throws      when the operand mixes bignum kinds, is a non-literal of a different type, is a float
+ *              literal, or is an integer literal too large to adopt without a suffix
+ */
+fn bignum_adopt_operand(e: TExpr, kind: str) -> TExpr | error {
+    if bignum_kind(e.type) == kind { return e }
+    if bignum_kind(e.type) != "" { return error { message = "cannot mix `bigint` and `dec` in one operation — convert explicitly" } }
+    match e.kind {
+        TNumber as n => {
+            if n.is_float { return error { message = $"a floating-point literal cannot adopt `{kind}` — write it with a `bi`/`d` suffix or convert explicitly with `{kind}::of(...)`" } }
+            if !value_fits(n.value, PrimKind::I64) { return error { message = $"integer literal is too large to adopt into `{kind}` — write it with a `bi`/`d` suffix" } }
+            let lit = TExpr { kind = e.kind; type = Prim { kind = PrimKind::I64 }; line = e.line; col = e.col }
+            bignum_call(kind, "of", teko::list::push(teko::list::empty(), lit), bignum_named(kind))
+        }
+        _ => error { message = $"no implicit conversion to `{kind}` — wrap the operand with `{kind}::of(x)` (no implicit promotion — B.22)" }
+    }
+}
+
+/**
+ * bignum_op_fn — map a binary operator token to the bignum library function it lowers to. Rejects
+ * `%` on `dec` (decimals define no remainder) and any non-arithmetic operator on either kind.
+ *
+ * @param op    the operator token
+ * @param kind  the bignum kind (`"bigint"` or `"dec"`)
+ * @return      the library function name, or an error for an unsupported operator
+ * @throws      when the operator is `%` on `dec`, or is not one of `+ - * /` (`%` on `bigint`)
+ */
+fn bignum_op_fn(op: lexer::TokenKind, kind: str) -> str | error {
+    if op == lexer::TokenKind::Plus { return "add" }
+    if op == lexer::TokenKind::Minus { return "sub" }
+    if op == lexer::TokenKind::Star { return "mul" }
+    if op == lexer::TokenKind::Slash { return "div" }
+    if op == lexer::TokenKind::Percent {
+        if kind == "dec" { return error { message = "`%` (modulo) is not defined on `dec` — a decimal has no remainder operator" } }
+        return "rem"
+    }
+    error { message = $"this operator is not defined on `{kind}` — `bigint` supports `+ - * / %`, `dec` supports `+ - * /`, and comparisons (`< > <= >= == !=`)" }
+}
+
+/**
+ * type_bignum_binop — lower a binary operator over a bignum operand to its library call (operator
+ * sugar). Determines the target kind (rejecting a `bigint`/`dec` mix), maps the operator to its
+ * function, adopts each operand, and returns the typed call.
+ *
+ * @param op     the operator token
+ * @param l      the typed left operand
+ * @param r      the typed right operand
+ * @param lk     the left operand's bignum kind (`""` if not a bignum)
+ * @param rk     the right operand's bignum kind (`""` if not a bignum)
+ * @return       the typed library call implementing the operator, or a type error
+ * @throws       when the operands mix kinds, an operator is unsupported, or an operand cannot adopt
+ */
+fn type_bignum_binop(op: lexer::TokenKind, l: TExpr, r: TExpr, lk: str, rk: str) -> TExpr | error {
+    if lk != "" && rk != "" && lk != rk { return error { message = "cannot mix `bigint` and `dec` in one operation — convert explicitly" } }
+    let kind = if lk != "" { lk } else { rk }
+    let fn_name = match bignum_op_fn(op, kind) { str as s => s; error as e => return e }
+    let la = match bignum_adopt_operand(l, kind) { TExpr as te => te; error as e => return e }
+    let ra = match bignum_adopt_operand(r, kind) { TExpr as te => te; error as e => return e }
+    mut cargs: []TExpr = teko::list::push(teko::list::empty(), la)
+    cargs = teko::list::push(cargs, ra)
+    bignum_call(kind, fn_name, cargs, bignum_named(kind))
+}
+
+/**
+ * combine_and — fold two bool `TExpr`s into a short-circuiting `&&`, or seed the fold with the first
+ * term. Used to chain a bignum comparison (`a < b < c` → `cmp(a,b)<0 && cmp(b,c)<0`).
+ *
+ * @param acc   the accumulated bool expression, or `null` for the first term
+ * @param next  the next bool comparison term
+ * @return      `acc && next`, or `next` when `acc` is `null`
+ */
+fn combine_and(acc: TExpr?, next: TExpr) -> TExpr {
+    match acc {
+        TExpr as a => TExpr { kind = TBinary { op = lexer::TokenKind::AndAnd; left = a; right = next }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+        null => next
+    }
+}
+
+/**
+ * type_bignum_compare — lower a comparison whose first operand is a bignum to a chain of `cmp(...)
+ * <op> 0` terms (comparison sugar). Each adjacent pair becomes a `cmp` call compared to zero; a
+ * chained comparison folds the terms with `&&`. Operands adopt the first operand's kind.
+ *
+ * @param first  the typed (bignum) first operand
+ * @param rest   the raw comparison terms (operator + untyped operand)
+ * @param env    the typing environment
+ * @param table  the folded type table
+ * @param kind   the bignum kind of the comparison
+ * @return       the typed bool expression, or a type error
+ * @throws       when an operand cannot adopt the kind or the chain is empty
+ */
+fn type_bignum_compare(first: TExpr, rest: []parser::CmpTerm, env: Env, table: TypeTable, kind: str) -> TExpr | error {
+    mut prev = match bignum_adopt_operand(first, kind) { TExpr as te => te; error as e => return e }
+    mut acc: TExpr? = null
+    mut i = 0
+    loop {
+        if i >= rest.len { break }
+        let cur_raw = deref_ref_value(match type_expr(rest[i].operand, env, table) { TExpr as te => te; error as e => return e })
+        let cur = match bignum_adopt_operand(cur_raw, kind) { TExpr as te => te; error as e => return e }
+        mut cmp_args: []TExpr = teko::list::push(teko::list::empty(), prev)
+        cmp_args = teko::list::push(cmp_args, cur)
+        let cmp_call = bignum_call(kind, "cmp", cmp_args, Prim { kind = PrimKind::I64 })
+        let zero = TExpr { kind = TNumber { is_float = false; value = 0; fval = 0.0 }; type = Prim { kind = PrimKind::I64 }; line = 0; col = 0 }
+        let term = TCmpTerm { op = rest[i].op; operand = zero }
+        let one_cmp = TExpr { kind = TCompare { first = cmp_call; rest = teko::list::push(teko::list::empty(), term) }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+        acc = combine_and(acc, one_cmp)
+        prev = cur
+        i = i + 1
+    }
+    match acc { TExpr as te => te; null => error { message = "a comparison needs at least one operator" } }
+}
+
+/**
+ * A pair of typed binary operands after literal-adoption normalization.
+ */
+type BinOperands = struct {
+    /** The left operand. */
+    l: TExpr
+    /** The right operand. */
+    r: TExpr
+}
+
+/**
+ * adopt_binop_operands — when a binary's operands differ only because one is an untyped numeric
+ * LITERAL, retype that literal to the other (non-literal) operand's type so `line + 1` / `n % 10`
+ * type-check (C6): the non-literal operand's type wins, and the literal node is rebuilt with it. The
+ * left operand takes priority when both would adopt. Already-equal or non-adoptable operands pass
+ * through unchanged.
+ *
+ * @param l  the typed left operand
+ * @param r  the typed right operand
+ * @return   the operands with a fitting literal retyped to its partner's type
+ */
+fn adopt_binop_operands(l: TExpr, r: TExpr) -> BinOperands {
+    if type_eq(l.type, r.type) { return BinOperands { l = l; r = r } }
+    if literal_adopts(l, r.type) { return BinOperands { l = TExpr { kind = l.kind; type = r.type; line = l.line; col = l.col }; r = r } }
+    if literal_adopts(r, l.type) { return BinOperands { l = l; r = TExpr { kind = r.kind; type = l.type; line = r.line; col = r.col } } }
+    BinOperands { l = l; r = r }
+}
+
+/**
+ * err_binop_type_mismatch — wrap a binary-operand type-mismatch with rendered expected/actual types
+ * so the driver prints "expected X, found Y" (mirrors expr.c type_binary's tk_error_types wrap;
+ * C1.8/E2).
+ *
+ * @param msg  the diagnostic message
+ * @param l    the left operand (renders as "expected")
+ * @param r    the right operand (renders as "actual")
+ * @return     the type-annotated error
+ */
+fn err_binop_type_mismatch(msg: str, l: TExpr, r: TExpr) -> error {
+    teko::error::err_typed(error { message = msg }, type_render(l.type), type_render(r.type))
+}
+
+/**
+ * type_shift_binop — type a shift (`<< >>`): integer operands only (no float bit-shifts — B.38); the
+ * result takes the left operand's type.
+ *
+ * @param op  the shift operator token
+ * @param l   the typed left operand
+ * @param r   the typed right operand
+ * @return    the typed shift expression, or a type error
+ * @throws    when either operand is not an integer
+ */
+fn type_shift_binop(op: lexer::TokenKind, l: TExpr, r: TExpr) -> TExpr | error {
+    if !is_integer(l.type) || !is_integer(r.type) { return error { message = "shift needs integer operands (no float bit-shifts — B.38)" } }
+    TExpr { kind = TBinary { op = op; left = l; right = r }; type = l.type; line = 0; col = 0 }
+}
+
+/**
+ * type_arith_binop — type an arithmetic operator (`+ - * /`) over the native numeric set (ints AND
+ * floats). Same-type only (no promotion, no mixed int/float — B.22; a cross-family operand needs an
+ * explicit `to`).
+ *
+ * @param op  the arithmetic operator token
+ * @param l   the typed left operand
+ * @param r   the typed right operand
+ * @return    the typed arithmetic expression, or a type error
+ * @throws    when the left operand is not numeric, or the operands differ in type
+ */
+fn type_arith_binop(op: lexer::TokenKind, l: TExpr, r: TExpr) -> TExpr | error {
+    if !is_numeric(l.type) { return error { message = "arithmetic needs a numeric operand (int or float)" } }
+    if !type_eq(l.type, r.type) { return err_binop_type_mismatch("operands must be the same type (no promotion, no mixed int/float — B.22; use `to`)", l, r) }
+    TExpr { kind = TBinary { op = op; left = l; right = r }; type = l.type; line = 0; col = 0 }
+}
+
+/**
+ * type_bitwise_binop — type a bitwise/remainder operator (`% & | ^`): integer operands only (not a
+ * float — B.38), same-type (no promotion — B.22).
+ *
+ * @param op  the bitwise/remainder operator token
+ * @param l   the typed left operand
+ * @param r   the typed right operand
+ * @return    the typed expression, or a type error
+ * @throws    when the left operand is not an integer, or the operands differ in type
+ */
+fn type_bitwise_binop(op: lexer::TokenKind, l: TExpr, r: TExpr) -> TExpr | error {
+    if !is_integer(l.type) { return error { message = "bitwise/remainder needs an integer (not a float — B.38)" } }
+    if !type_eq(l.type, r.type) { return err_binop_type_mismatch("operands must be the same type (no promotion — B.22)", l, r) }
+    TExpr { kind = TBinary { op = op; left = l; right = r }; type = l.type; line = 0; col = 0 }
+}
+
+/**
+ * type_logical_binop — type a logical operator (`&& ||`): bool operands, bool result, short-circuit
+ * (matches C + the VM).
+ *
+ * @param op  the logical operator token
+ * @param l   the typed left operand
+ * @param r   the typed right operand
+ * @return    the typed bool expression, or a type error
+ * @throws    when either operand is not a bool
+ */
+fn type_logical_binop(op: lexer::TokenKind, l: TExpr, r: TExpr) -> TExpr | error {
+    if !is_bool(l.type) || !is_bool(r.type) { return error { message = "logical `&&`/`||` need bool operands" } }
+    TExpr { kind = TBinary { op = op; left = l; right = r }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+}
+
+/**
+ * type_binary — type a binary expression. Dispatches, in order: the `~` concat chain; the `bigint`/
+ * `dec` operator sugar (lowered to library calls); then the native operator classes — shift, arith
+ * (`+ - * /`), bitwise/remainder (`% & | ^`), and logical (`&& ||`). Operands are normalized so a
+ * fitting untyped numeric literal adopts its partner's type first (C6).
+ *
+ * @param b      the binary expression node
+ * @param env    the typing environment
+ * @param table  the folded type table
+ * @return       the typed binary (or lowered bignum call) expression, or a type error
+ * @throws       on a void operand, an incompatible operand type, or a non-binary operator
+ */
 fn type_binary(b: parser::Binary, env: Env, table: TypeTable) -> TExpr | error {
     if b.op == lexer::TokenKind::Tilde { return type_tilde_chain(b, env, table) }
-    mut l = match type_expr(b.left, env, table) { TExpr as te => te; error as e => return e }
-    mut r = match type_expr(b.right, env, table) { TExpr as te => te; error as e => return e }
-    if type_is_void(l.type) || type_is_void(r.type) { return error { message = "a `void` expression cannot be an operand (M.1)" } }
-    // C6 — a fitting numeric LITERAL operand adopts the OTHER operand's type (e.g. `line + 1`,
-    // `n % 10`): the non-literal operand's type wins; rebuild the literal node with that type.
-    if !type_eq(l.type, r.type) {
-        if literal_adopts(l, r.type) { l = TExpr { kind = l.kind; type = r.type; line = l.line; col = l.col } }
-        else { if literal_adopts(r, l.type) { r = TExpr { kind = r.kind; type = l.type; line = r.line; col = r.col } } }
-    }
-    if op_is_shift(b.op) {
-        if !is_integer(l.type) || !is_integer(r.type) { return error { message = "shift needs integer operands (no float bit-shifts — B.38)" } }
-        return TExpr { kind = TBinary { op = b.op; left = l; right = r }; type = l.type; line = 0; col = 0 }
-    }
-    if op_is_arith(b.op) {
-        // + - * / over the native numeric set (B.38): ints AND floats. Same-type only
-        // (B.22 — no promotion, no mixed int/float; cross-family needs an explicit `to`).
-        if !is_numeric(l.type) { return error { message = "arithmetic needs a numeric operand (int or float)" } }
-        // (C1.8/E2) attach expected=type_render(l.type), actual=type_render(r.type) so the driver
-        // prints "expected X, found Y" — mirrors expr.c type_binary's tk_error_types wrap.
-        if !type_eq(l.type, r.type) { return teko::error::err_typed(error { message = "operands must be the same type (no promotion, no mixed int/float — B.22; use `to`)" }, type_render(l.type), type_render(r.type)) }
-        return TExpr { kind = TBinary { op = b.op; left = l; right = r }; type = l.type; line = 0; col = 0 }
-    }
-    if op_is_arith_bitwise(b.op) {   // %, & | ^ — integer-only
-        if !is_integer(l.type) { return error { message = "bitwise/remainder needs an integer (not a float — B.38)" } }
-        // (C1.8/E2) attach expected/actual (type_render of l/r) — mirrors expr.c type_binary.
-        if !type_eq(l.type, r.type) { return teko::error::err_typed(error { message = "operands must be the same type (no promotion — B.22)" }, type_render(l.type), type_render(r.type)) }
-        return TExpr { kind = TBinary { op = b.op; left = l; right = r }; type = l.type; line = 0; col = 0 }
-    }
-    if b.op == lexer::TokenKind::AndAnd || b.op == lexer::TokenKind::OrOr {   // logical && / || — bool operands, bool result, short-circuit (matches C + the VM)
-        if !is_bool(l.type) || !is_bool(r.type) { return error { message = "logical `&&`/`||` need bool operands" } }
-        return TExpr { kind = TBinary { op = b.op; left = l; right = r }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
-    }
+    let l0 = deref_ref_value(match type_expr(b.left, env, table) { TExpr as te => te; error as e => return e })
+    let r0 = deref_ref_value(match type_expr(b.right, env, table) { TExpr as te => te; error as e => return e })
+    if type_is_void(l0.type) || type_is_void(r0.type) { return error { message = "a `void` expression cannot be an operand (M.1)" } }
+    let lk = bignum_kind(l0.type)
+    let rk = bignum_kind(r0.type)
+    if lk != "" || rk != "" { return type_bignum_binop(b.op, l0, r0, lk, rk) }
+    let ops = adopt_binop_operands(l0, r0)
+    let l = ops.l
+    let r = ops.r
+    if op_is_shift(b.op) { return type_shift_binop(b.op, l, r) }
+    if op_is_arith(b.op) { return type_arith_binop(b.op, l, r) }
+    if op_is_arith_bitwise(b.op) { return type_bitwise_binop(b.op, l, r) }
+    if b.op == lexer::TokenKind::AndAnd || b.op == lexer::TokenKind::OrOr { return type_logical_binop(b.op, l, r) }
     error { message = "not a binary operator" }
 }
 
 fn type_unary(u: parser::Unary, env: Env, table: TypeTable) -> TExpr | error {
-    let o = match type_expr(u.operand, env, table) { TExpr as te => te; error as e => return e }
+    let o = deref_ref_value(match type_expr(u.operand, env, table) { TExpr as te => te; error as e => return e })
     if type_is_void(o.type) { return error { message = "a `void` expression cannot be an operand (M.1)" } }
+    let uk = bignum_kind(o.type)
+    if uk != "" {
+        if u.op == lexer::TokenKind::Minus { return bignum_call(uk, "neg", teko::list::push(teko::list::empty(), o), bignum_named(uk)) }
+        return error { message = $"unary `!`/`~` is not defined on `{uk}`" }
+    }
     if u.op == lexer::TokenKind::Minus {   // negation: any numeric (int or float — B.38)
         if !is_numeric(o.type) { return error { message = "unary `-` needs a numeric operand (int or float)" } }
         return TExpr { kind = TUnary { op = u.op; operand = o }; type = o.type; line = 0; col = 0 }
@@ -324,14 +630,16 @@ fn type_unary(u: parser::Unary, env: Env, table: TypeTable) -> TExpr | error {
 }
 
 fn type_compare(c: parser::Compare, env: Env, table: TypeTable) -> TExpr | error {
-    mut first = match type_expr(c.first, env, table) { TExpr as te => te; error as e => return e }
+    mut first = deref_ref_value(match type_expr(c.first, env, table) { TExpr as te => te; error as e => return e })
     mut prev = first.type
     if type_is_void(prev) { return error { message = "a `void` expression cannot be an operand (M.1)" } }
+    let fk = bignum_kind(first.type)
+    if fk != "" { return type_bignum_compare(first, c.rest, env, table, fk) }
     mut terms: []TCmpTerm = teko::list::empty()
     mut i = 0
     loop {
         if i >= c.rest.len { break }
-        mut cur = match type_expr(c.rest[i].operand, env, table) { TExpr as te => te; error as e => return e }
+        mut cur = deref_ref_value(match type_expr(c.rest[i].operand, env, table) { TExpr as te => te; error as e => return e })
         if type_is_void(cur.type) { return error { message = "a `void` expression cannot be an operand (M.1)" } }
         // numeric-literal adoption (parity with binary ops): a literal operand adopts the OTHER's
         // numeric type so `c < 0x20` (byte vs int-literal) and `0x20 < c` compare (byte = u8).
@@ -1498,8 +1806,29 @@ fn field_type(fields: []parser::Field, field: str, table: TypeTable, ref_ns: str
     error { message = $"no such field: {field}" }
 }
 
+/**
+ * require_narrowed — the null-union C5 deref fence (base §3d/§3f). Using a `T | null` (any
+ * null-bearing union) payload AS a bare member — a field read, or the `.value` deref of a
+ * `Ref<T> | null` — is REJECTED until the union has been narrowed to its bare member, the SAME
+ * narrowing invariant an unmatched `T | error` obeys. The two accepted narrowing scopes rebind the
+ * value to its bare member BEFORE this point (a `match` arm's pattern binding; the flow-narrowed
+ * branch of an equality guard), so reaching here with a still-`Variant` null-bearing type means the
+ * use is un-narrowed. Directs the author to the sanctioned narrowing forms.
+ *
+ * @param t  the receiver's resolved (still-union) type
+ * @return   the error demanding narrowing before the bare-member use
+ * @throws   error always (this is the reject path; the caller only calls it on a null-bearing union)
+ * @since 0.3.0.30 (null-union C5)
+ */
+fn require_narrowed(t: Type) -> error {
+    if is_ref_null_variant(t) {
+        return error { message = "cannot dereference a `Ref<T> | null` — narrow it to a bare `Ref<T>` first (`match r { null => …; Ref<T> as v => v.value }`), the deref fence keeping the never-null reference promise sound" }
+    }
+    error { message = "cannot use `.` on a `T | null` value before narrowing — narrow it first (`match x { null => …; T as v => v.… }`)" }
+}
+
 fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TExpr | error {
-    let recv = match type_expr(fa.receiver, env, table) { TExpr as te => te; error as e => return e }
+    mut recv = match type_expr(fa.receiver, env, table) { TExpr as te => te; error as e => return e }
     // `.len` on a `str` or a slice (`[]T`) -> u64 (W5-idx). This precedes the struct-field
     // path: a str/slice has no struct body, so `len` is a built-in length, not a field.
     let is_str_or_slice = match recv.type { Str => true; Slice => true; _ => false }
@@ -1526,7 +1855,7 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
             if fa.field == "value" {
                 return TExpr { kind = TFieldAccess { receiver = recv; field = fa.field }; type = rf.inner; line = 0; col = 0 }
             }
-            return error { message = "a reference (`Ref<T>`) exposes only `.value` (the referenced value)" }
+            recv = deref_ref_value(recv)
         }
         _ => { }
     }
@@ -1534,6 +1863,7 @@ fn type_field_access(fa: parser::FieldAccess, env: Env, table: TypeTable) -> TEx
     // and point at the sanctioned readers (`?.`/`??`) instead of the generic struct message.
     match recv.type {
         Optional => return error { message = "cannot use `.` on a nullable value (`T?`) — read it with `?.` or `??` (REBOOT_PLAN §203)" }
+        Variant => if variant_has_null_member(recv.type) { return require_narrowed(recv.type) }
         _ => { }
     }
     let name = match recv.type {
@@ -3404,7 +3734,7 @@ fn type_binding(b: parser::Binding, env: Env, table: TypeTable) -> TypedStmt | e
     }
     match bound {
         Reference => { }
-        _ => if type_contains_ref(bound) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
+        _ => if type_contains_ref(bound) && !is_ref_null_variant(bound) { return error { message = "a reference cannot be bound to a local (parameter-only in this version)" } }
     }
     if !env.fn_unsafe && unsafe_carrying(bound, table) {
         return error { message = "safe fn binds a local of unsafe type — mark the enclosing fn `unsafe fn` or bind only safe types (§2: unsafe data cannot be held by a safe local)" }
@@ -3526,6 +3856,22 @@ fn type_assign(a: parser::Assign, env: Env, table: TypeTable) -> TypedStmt | err
     let is_index = match a.kind { parser::AssignKind::Index => true; _ => false }
     if is_index { return type_index_assign(a, env, table) }
     let tb = match lookup_binding(env, a.name) { ValBinding as vb => vb; error as e => return e }
+    if !a.deref {
+        match tb.type {
+            Reference as rf => {
+                mut wv = match type_expr(a.value, env, table) { TExpr as te => te; error as e => return e }
+                let rhs_is_ref = match wv.type { Reference => true; _ => false }
+                if !rhs_is_ref {
+                    if !assignable_to(wv.type, rf.inner, table) {
+                        if !literal_adopts(wv, rf.inner) { return teko::error::err_typed(error { message = "assigned value does not match the referenced type" }, type_render(rf.inner), type_render(wv.type)) }
+                        wv = retype_literal(wv, rf.inner)
+                    }
+                    return TypedStmt { node = TAssign { kind = parser::AssignKind::RefDeref; name = a.name; op = a.op; bound = rf.inner; value = wv; deref = true; target = no_texpr() }; env = env }
+                }
+            }
+            _ => { }
+        }
+    }
     // (MEM-1b-ii) `r.value op= x` — write THROUGH a reference. The handle `r` need NOT be `mut`
     // (a `Ref<T>` is a const handle that grants WRITE to its mutable target — R2 mutable-target).
     // The assigned-to type is the ref's inner T; the value must widen/adopt into T.
@@ -4156,6 +4502,189 @@ fn check_returns_inexpr(e: TExpr, ret: Type, table: TypeTable) -> error? {
     }
 }
 
+/**
+ * name_in_set — is `name` one of `set` (a small ordered string set)? The membership test the `ref`
+ * return pass-down gate uses over the function's reference-parameter names.
+ *
+ * @param set   the candidate names
+ * @param name  the name to find
+ * @return      true iff `name` occurs in `set`
+ */
+fn name_in_set(set: []str, name: str) -> bool {
+    mut i = 0
+    loop {
+        if i >= set.len { break }
+        if set[i] == name { return true }
+        i++
+    }
+    false
+}
+
+/**
+ * ref_value_is_passdown — is the returned reference expression `e` a sound R6/R7 pass-down: a BARE
+ * read of one of the function's own `ref`/`Reference` parameters (whose target is the caller's,
+ * outliving the call), or an if/match whose every branch trailing value is itself a pass-down? Any
+ * other reference source (an `&x` borrow of a local, a ref local, a field/element) is NOT a pass-down.
+ *
+ * @param e           the returned typed expression (already known to be `Reference`-typed)
+ * @param ref_params  the names of the function's reference parameters
+ * @return            true iff `e` is a sound reference pass-down
+ */
+fn ref_value_is_passdown(e: TExpr, ref_params: []str) -> bool {
+    match e.kind {
+        TVar as v => name_in_set(ref_params, v.name)
+        TIfExpr as f => ref_trailing_is_passdown(f.then_blk, ref_params) && ref_trailing_is_passdown(f.else_blk, ref_params)
+        TMatchExpr as m => ref_arms_are_passdown(m.arms, ref_params)
+        _ => false
+    }
+}
+
+/**
+ * ref_arms_are_passdown — do ALL match arms' trailing values qualify as reference pass-downs?
+ *
+ * @param arms        the typed match arms
+ * @param ref_params  the function's reference-parameter names
+ * @return            true iff every arm's trailing value is a pass-down
+ */
+fn ref_arms_are_passdown(arms: []TArm, ref_params: []str) -> bool {
+    mut i = 0
+    loop {
+        if i >= arms.len { break }
+        if !ref_trailing_is_passdown(arms[i].body, ref_params) { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * ref_trailing_is_passdown — does a block's trailing value qualify as a reference pass-down (a bare
+ * ref-parameter read, transitively through nested if/match)? A block with no expression trailing
+ * value cannot yield the reference and is treated as non-pass-down (conservative reject).
+ *
+ * @param stmts       the block's typed statements
+ * @param ref_params  the function's reference-parameter names
+ * @return            true iff the block's trailing value is a pass-down
+ */
+fn ref_trailing_is_passdown(stmts: []TStatement, ref_params: []str) -> bool {
+    match tblock_trailing(stmts) {
+        TExpr as t => ref_value_is_passdown(t, ref_params)
+        null => false
+    }
+}
+
+/**
+ * check_ref_return_passdown — the soundness gate for a `-> ref T` function (0.3.0.30 Part A). A
+ * function that returns a reference may return ONLY a bare read of one of its own `ref` PARAMETERS
+ * (the identity pass-down, R6/R7 — the aliased storage belongs to the caller and outlives the call).
+ * Every explicit `return`, and the body's trailing value, is checked; a reference sourced any other
+ * way (a local `&x` borrow, a ref local, a struct field) is conservatively REJECTED pending the
+ * transitive-escape spine (ref-transparent-model §9 honest-stop). Non-reference returns are ignored.
+ *
+ * @param stmts       the function body's typed statements
+ * @param ref_params  the function's reference-parameter names
+ * @return            null when every returned reference is a sound pass-down, else the reject error
+ * @throws            when a returned reference is not an own-`ref`-parameter pass-down
+ */
+fn check_ref_return_passdown(stmts: []TStatement, ref_params: []str) -> error? {
+    mut i = 0
+    loop {
+        if i >= stmts.len { break }
+        match check_ref_return_passdown_stmt(stmts[i], ref_params) { null => { }; error as e => return e }
+        i++
+    }
+    match tblock_trailing(stmts) {
+        TExpr as t => match t.type {
+            Reference => if !ref_value_is_passdown(t, ref_params) { return ref_passdown_error() }
+            _ => { }
+        }
+        null => { }
+    }
+    null
+}
+
+/**
+ * ref_passdown_error — the shared diagnostic for a `-> ref T` return that is not a sound pass-down.
+ *
+ * @return the reject error naming the pass-down-only rule and the spine dependency
+ */
+fn ref_passdown_error() -> error {
+    error { message = "a `-> ref T` function may return only one of its own `ref` parameters (identity pass-down) — a reference to a local, a `ref` local, or a stored field cannot escape until the transitive-escape spine lands (reference-model §9 conservative honest-stop)" }
+}
+
+/**
+ * collect_ref_param_names — the names of a function's parameters whose resolved type is a
+ * `Reference` (a `ref`/`Ref<T>` parameter). Drives the `-> ref T` return pass-down gate.
+ *
+ * @param params  the function's syntactic parameters
+ * @param tbl     the type-parameter table in scope
+ * @param ns      the function's enclosing namespace (the type-resolution referencing ns)
+ * @return        the reference parameters' names, in declaration order
+ */
+fn collect_ref_param_names(params: []parser::Param, tbl: TypeTable, ns: str) -> []str {
+    mut out: []str = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= params.len { break }
+        if params[i].has_type {
+            let rt = match resolve_type(params[i].type_ann, tbl, ns) { Type as t => t; error => Void { } }
+            match rt { Reference => out = teko::list::push(out, params[i].name); _ => { } }
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * check_ref_return_passdown_stmt — walk one typed statement for reference `return`s, descending into
+ * loop/adopt bodies and if/match blocks, gating every reference-typed `return` value.
+ *
+ * @param s           the typed statement
+ * @param ref_params  the function's reference-parameter names
+ * @return            null when sound, else the reject error
+ * @throws            when a reference `return` is not a pass-down
+ */
+fn check_ref_return_passdown_stmt(s: TStatement, ref_params: []str) -> error? {
+    match s {
+        TReturn as r => {
+            if !r.has_value { return null }
+            match r.value.type { Reference => if !ref_value_is_passdown(r.value, ref_params) { return ref_passdown_error() }; _ => { } }
+            null
+        }
+        TLoopStmt as l => check_ref_return_passdown(l.body, ref_params)
+        TAdoptStmt as a => check_ref_return_passdown(a.body, ref_params)
+        TExprStmt as es => check_ref_return_passdown_inexpr(es.expr, ref_params)
+        _ => null
+    }
+}
+
+/**
+ * check_ref_return_passdown_inexpr — descend into an if/match expression-statement's blocks, gating
+ * every reference-typed `return` nested inside a branch.
+ *
+ * @param e           the typed expression
+ * @param ref_params  the function's reference-parameter names
+ * @return            null when sound, else the reject error
+ * @throws            when a nested reference `return` is not a pass-down
+ */
+fn check_ref_return_passdown_inexpr(e: TExpr, ref_params: []str) -> error? {
+    match e.kind {
+        TIfExpr as f => {
+            match check_ref_return_passdown(f.then_blk, ref_params) { null => { }; error as e => return e }
+            check_ref_return_passdown(f.else_blk, ref_params)
+        }
+        TMatchExpr as m => {
+            mut i = 0
+            loop {
+                if i >= m.arms.len { break }
+                match check_ref_return_passdown(m.arms[i].body, ref_params) { null => { }; error as e => return e }
+                i++
+            }
+            null
+        }
+        _ => null
+    }
+}
+
 // the trailing-value check — ONLY when the last statement is an expression (else: NO claim, the
 // guard against false-rejecting a body that ends in a diverging loop/if/match — the every-path item).
 fn check_trailing_value(stmts: []TStatement, ret: Type, table: TypeTable) -> error? {
@@ -4560,7 +5089,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     }
     if inject_base_binding { local = define(local, base_binding_name, Named { name = if name_qualifier(base_name) != "" { base_name } else { qualify(env.cur_ns, base_name) } }, false) }   // (#109 W3 / #152) canonical: base_name arrives PRE-QUALIFIED from canon_class_bases (cross-ns exact); a bare (unresolvable/root) one qualifies by the class's own ns
     let ret = match function_return(f, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
-    match ret { Reference => return error { message = "a function cannot return a reference (pass-down only)" }; _ => { } }
+    if is_ref_null_variant(ret) { return error { message = "a function cannot return an optional reference (`Ref<T> | null`) — references are pass-down only (R3)" } }
     if f.is_extern {
         let ret_ok = if is_teko_rt {
             teko_rt_type_ok(ret)
@@ -4576,6 +5105,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     let tb = match type_block(f.body, local, tbl) { TypedBlock as bk => bk; error as e => return e }
     match check_returns(tb.stmts, ret, table) { null => { }; error as e => return e }
     match check_trailing_value(tb.stmts, ret, table) { null => { }; error as e => return e }
+    match ret { Reference => match check_ref_return_passdown(tb.stmts, collect_ref_param_names(f.params, tbl, env.cur_ns)) { null => { }; error as e => return e }; _ => { } }
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())
     if lc.failed { return error { message = lc.message } }
     let ret_stmts = retype_union_returns(tb.stmts, ret, table)
@@ -4601,7 +5131,7 @@ fn type_method(f: parser::Function, struct_name: str, env: Env, table: TypeTable
     } else {
         ret_stmts
     }
-    let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
+    let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = fixed_params; return_type = ret; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = f.c_symbol; from_lib = "" }
     match check_ref_storability(tf) { null => { }; error as e => return e }
     tf
 }
@@ -4816,20 +5346,27 @@ fn check_ref_storability_match(m: TMatchExpr, spine: Spine) -> error? {
 }
 
 /**
- * Gate a `TBinding`: only a bare-`Reference`-bound `SimpleName` is a ref-to-local (nested-ref bounds
- * were rejected inline); check the spine. A destructure names no single ref cell.
+ * Gate a `TBinding`: a bare-`Reference`-bound `SimpleName`, OR a `Ref<T> | null`-bound `SimpleName`
+ * whose initializer is itself a live reference (a `&x` borrow or a ref-param alias — null-union C5
+ * lifting the "references are parameter-only" restriction for the two-member ref-null shape), is a
+ * ref-to-local; the spine must prove the borrow's referent outlives it. A `Ref<T> | null` local
+ * initialized to `null` borrows nothing and cannot dangle, so it is admitted without an outlives
+ * proof. A destructure names no single ref cell.
  *
- * @param TBinding b  the typed binding
- * @param Spine spine  the function's spine fact
- * @return error?  null when sound, else the reject error
+ * @param b      the typed binding
+ * @param spine  the function's spine fact
+ * @return       null when sound, else the R5 reject error
+ * @throws       error when the ref-to-local's referent does not provably outlive the borrow
  */
 fn check_ref_bind_storable(b: TBinding, spine: Spine) -> error? {
-    match b.bound {
-        Reference => match b.target {
-            parser::SimpleName as sn => ref_borrow_or_error(spine, sn.name, b.value)
-            parser::DestructurePattern => null
-        }
-        _ => null
+    let is_ref_bind = match b.bound {
+        Reference => true
+        _ => is_ref_null_variant(b.bound) && type_contains_ref(b.value.type)
+    }
+    if !is_ref_bind { return null }
+    match b.target {
+        parser::SimpleName as sn => ref_borrow_or_error(spine, sn.name, b.value)
+        parser::DestructurePattern => null
     }
 }
 
@@ -4932,9 +5469,7 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
         local = match seed_di_injects(f, local, tbl) { Env as e => e; error as e => return e }
     }
     let ret = match function_return(f, tbl, env.cur_ns) { Type as t => t; error as e => return e }   // (#109 W1) ref_ns = the fn's enclosing namespace
-    // (MEM Step 0, R3) ESCAPE GATE — a function cannot RETURN a reference (pass-down only): a
-    // returned ref would outlive its caller-stack target. References flow only DOWN as params.
-    match ret { Reference => return error { message = "a function cannot return a reference (pass-down only)" }; _ => { } }
+    if is_ref_null_variant(ret) { return error { message = "a function cannot return an optional reference (`Ref<T> | null`) — references are pass-down only (R3)" } }
     if f.is_extern {
         // an extern is a bodyless foreign declaration (no body to check / return-analyze).
         // Validate the return marshals (void = no value is fine; else prim/byte only for now).
@@ -4952,11 +5487,12 @@ fn type_function(f: parser::Function, env: Env, table: TypeTable) -> TFunction |
     let tb = match type_block(f.body, local, tbl) { TypedBlock as bk => bk; error as e => return e }
     match check_returns(tb.stmts, ret, table) { null => { }; error as e => return e }   // C5: each `return e` matches `ret`
     match check_trailing_value(tb.stmts, ret, table) { null => { }; error as e => return e }   // C5: trailing value (when present) matches
+    match ret { Reference => match check_ref_return_passdown(tb.stmts, collect_ref_param_names(f.params, tbl, env.cur_ns)) { null => { }; error as e => return e }; _ => { } }
     let lc = check_labels(tb.stmts, teko::list::empty(), false, teko::list::empty())   // W5-cf-2: loop labels resolve + are unique
     if lc.failed { return error { message = lc.message } }
     match check_must_free(f, tbl, env.cur_ns, tb.stmts, table) { null => { }; error as e => return e }
     let ret_stmts = retype_union_returns(tb.stmts, ret, table)
-    let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = ret_stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = ""; from_lib = "" }
+    let tf = TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = ret; body = ret_stmts; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = ""; file = ""; line = 0; col = 0; is_test = f.is_test; is_extern = false; c_symbol = f.c_symbol; from_lib = "" }
     match check_ref_storability(tf) { null => { }; error as e => return e }
     tf
 }

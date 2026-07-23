@@ -398,7 +398,7 @@ TODA compilação real `LRodata.relocs` é vazio ⇒ `encode_rodata` produz `rel
 `append_relocs(mt.relocs, [])` = `mt.relocs` (idêntico) ⇒ a partição ELF/Mach-O/COFF põe
 tudo em `text`/`relocs` e a partição rodata vazia ⇒ `.rela.rodata`/`__const`/`.rdata`
 relocs vazios ⇒ cada objeto byte-idêntico. Os goldens `encode_*_test.tkt`,
-`objfile_{elf,elf_riscv,macho,coff}_test.tkt` + **fixpoint gen2==gen3** são a prova. As
+`objfile_{elf,elf_riscv,macho,coff}_test.tkt` + **fixpoint gen1==gen2** são a prova. As
 únicas fixtures que MUDAM de expectativa são as três de T-B1 (§5, "o gate dispara") que
 assertavam o honest-stop `encode_module*` — agora invertem para "produz a `Rodata`
 reloc" (§5.7 abaixo).
@@ -541,7 +541,7 @@ arquivo compila a cada passo.
 - **Por-edit:** o `.tkt` do arquivo (tabela) — cada edit é gate-able só.
 - **RITUAL POINT — fim de T-B5:** gate COMPLETO — todos os goldens de VM
   (`lir_interp_test.tkt`) e de backend (`encode_*_test.tkt`, `objfile_*_test.tkt`,
-  `lower_test.tkt`, `tkb_test.tkt`) byte-idênticos + **fixpoint gen2==gen3** + ambas as
+  `lower_test.tkt`, `tkb_test.tkt`) byte-idênticos + **fixpoint gen1==gen2** + ambas as
   engines (VM + nativo) + 100% de cobertura do delta (§5). Zero bytes mudam (produtor
   ainda fechado), então um gate verde É a prova de compatibilidade.
 - **🔑 SEED BUMP #3 (0.3.0.25) — DEPOIS do gate de T-B5.** A capability data→data está

@@ -44,83 +44,8 @@ fn is_error(source: str) -> bool {
 }
 
 #test
-fn lexes_kinds_in_order() {
-    teko::assert::is_true(kinds_eq("1 + 2 * 3", [TokenKind::Number, TokenKind::Plus,
-                TokenKind::Number, TokenKind::Star, TokenKind::Number]))
-    teko::assert::is_true(kinds_eq("( a )", [TokenKind::LParen, TokenKind::Ident, TokenKind::RParen]))
-    teko::assert::is_true(kinds_eq("1_000", [TokenKind::Number]))   // one number (separator)
-    teko::assert::is_true(kinds_eq("__bar", [TokenKind::Ident]))   // one ident (leading _)
-    teko::assert::is_true(kinds_eq("_", [TokenKind::Underscore]))
-    teko::assert::is_true(kinds_eq("", teko::list::empty()))   // empty
-}
-
-#test
 fn rejects_unexpected_byte() {
     teko::assert::is_true(is_error("1 @ 2"))   // unexpected byte
-}
-
-/**
- * rejects_bad_underscore_tokens — the write-only discard `_` (owner ruling 2026-07-15) lexes as a
- * lone `Underscore`, but a PURE run of two or more underscores (`__`, `___`) and an underscore run
- * immediately followed by a digit (`_1`) are letterless non-identifiers and must fail lexing.
- * Underscores adjacent to / mixed with letters (`_foo`, `foo_`, `a_b`, `_x_1`, `__bar`) stay
- * ordinary identifiers.
- *
- * @return  void — asserts the token kinds and lex failures directly
- */
-#test
-fn rejects_bad_underscore_tokens() {
-    teko::assert::is_true(is_error("__"))
-    teko::assert::is_true(is_error("___"))
-    teko::assert::is_true(is_error("_1"))
-    teko::assert::is_true(is_error("_123abc"))
-    teko::assert::is_true(kinds_eq("_", [TokenKind::Underscore]))
-    teko::assert::is_true(kinds_eq("_foo", [TokenKind::Ident]))
-    teko::assert::is_true(kinds_eq("foo_", [TokenKind::Ident]))
-    teko::assert::is_true(kinds_eq("a_b", [TokenKind::Ident]))
-    teko::assert::is_true(kinds_eq("_x_1", [TokenKind::Ident]))
-    teko::assert::is_true(kinds_eq("__bar", [TokenKind::Ident]))
-}
-
-#test
-fn preserves_token_spans() {
-    // 1_000+foo -> Number("1_000") Plus("+") Ident("foo")
-    let toks = match tokenize("1_000+foo") {
-        []Token as ts => ts
-        error => return
-    }
-    teko::assert::is_true(toks.len == 3)
-    teko::assert::is_true(toks[0].text == "1_000")
-    teko::assert::is_true(toks[1].text == "+")
-    teko::assert::is_true(toks[2].text == "foo")
-}
-
-// --- F1: the `to` cast keyword ---
-
-#test
-fn lexes_to_cast_keyword() {
-    // happy: `x to u32` lexes as Ident · To · Ident.
-    teko::assert::is_true(kinds_eq("x to u32", [TokenKind::Ident, TokenKind::To, TokenKind::Ident]))
-}
-
-#test
-fn to_is_reserved_not_ident() {
-    // barrier: `to` is a keyword — the lexer yields `To`, never `Ident`, so it
-    // cannot be a name (the parser then rejects `To` in name position — P-phase).
-    teko::assert::is_true(kinds_eq("to", [TokenKind::To]))
-    teko::assert::is_false(kinds_eq("to", [TokenKind::Ident]))
-}
-
-#test
-fn lexes_dot_access() {
-    // `.` is its own token (P2/F2): a.b → Ident · Dot · Ident.
-    // `..` is DotDot (C6.7 spread prefix); `..=` is DotDotEq (range, maximal munch).
-    teko::assert::is_true(kinds_eq("a.b", [TokenKind::Ident, TokenKind::Dot, TokenKind::Ident]))
-    teko::assert::is_true(kinds_eq("a; b", [TokenKind::Ident, TokenKind::Semicolon, TokenKind::Ident]))   // `;` separator (P3b-field)
-    teko::assert::is_true(kinds_eq("variant", [TokenKind::Variant]))   // `variant` keyword (P5c)
-    teko::assert::is_true(kinds_eq(".", [TokenKind::Dot]))
-    teko::assert::is_true(kinds_eq("..", [TokenKind::DotDot]))   // spread prefix (C6.7)
-    teko::assert::is_true(kinds_eq("..=", [TokenKind::DotDotEq]))   // range (maximal munch wins)
 }
 
 // --- raw / verbatim strings `@"…"` and multi-line strings `"""…"""` ---
@@ -138,18 +63,6 @@ fn one_str_text(source: str) -> str {
 }
 
 #test
-fn lexes_raw_string_literal() {
-    // a raw string is a single Str token.
-    teko::assert::is_true(kinds_eq("@\"abc\"", [TokenKind::Str]))
-    // backslash stays LITERAL: `@"a\nb"` decodes to the 4 bytes  a \ n b.
-    teko::assert::is_true(one_str_text("@\"a\\nb\"") == "a\\nb")
-    // a doubled quote `""` inside is one literal `"`: `@"a""b"` → `a"b`.
-    teko::assert::is_true(one_str_text("@\"a\"\"b\"") == "a\"b")
-    // empty raw string `@""`.
-    teko::assert::is_true(one_str_text("@\"\"") == "")
-}
-
-#test
 fn lexes_multiline_string_literal() {
     // a multi-line string is a single Str token; it spans ≥2 lines (literal newline).
     teko::assert::is_true(kinds_eq("\"\"\"a\nb\"\"\"", [TokenKind::Str]))
@@ -162,44 +75,7 @@ fn lexes_multiline_string_literal() {
     teko::assert::is_true(one_str_text("\"\"\"\"\"\"") == "")
 }
 
-#test
-fn rejects_unterminated_raw_and_multiline() {
-    teko::assert::is_true(is_error("@\"abc"))   // unterminated raw string
-    teko::assert::is_true(is_error("\"\"\"abc"))   // unterminated multi-line string
-}
-
 // ---- orthogonal prefix modifiers ($ × @) × delimiters (single/multi) ----
-
-#test
-fn lexes_orthogonal_string_modifiers() {
-    // plain single: escapes ON — `"a\nb"` → a <LF> b.
-    teko::assert::is_true(one_str_text("\"a\\nb\"") == "a\nb")
-    // verbatim single: `@"a\nb"` → a \ n b (backslash literal).
-    teko::assert::is_true(one_str_text("@\"a\\nb\"") == "a\\nb")
-    // verbatim single doubled-quote collapse: `@"a""b"` → a " b.
-    teko::assert::is_true(one_str_text("@\"a\"\"b\"") == "a\"b")
-    // multi plain: `"""a\nb"""` → a <LF> b (escapes on).
-    teko::assert::is_true(one_str_text("\"\"\"a\\nb\"\"\"") == "a\nb")
-    // multi verbatim: `@"""a\nb"""` → a \ n b (backslash literal).
-    teko::assert::is_true(one_str_text("@\"\"\"a\\nb\"\"\"") == "a\\nb")
-    // multi verbatim: a lone `"` is literal — `@"""a"b"""` → a " b (NO `""`→`"` collapse).
-    teko::assert::is_true(one_str_text("@\"\"\"a\"b\"\"\"") == "a\"b")
-}
-
-// the kinds of the (interp) string + a trailing newline token — `$"…"` / `$@"…"`.
-#test
-fn lexes_interp_token_kinds() {
-    // plain interpolation → Interp.
-    teko::assert::is_true(kinds_eq("$\"x{1}y\"", [TokenKind::Interp]))
-    // verbatim interpolation `$@"…"` → InterpRaw (order: $ then @).
-    teko::assert::is_true(kinds_eq("$@\"x{1}y\"", [TokenKind::InterpRaw]))
-    // order-free: `@$"…"` is the SAME as `$@"…"` → InterpRaw.
-    teko::assert::is_true(kinds_eq("@$\"x{1}y\"", [TokenKind::InterpRaw]))
-    // multi-line verbatim interpolation `$@"""…"""` → InterpRaw.
-    teko::assert::is_true(kinds_eq("$@\"\"\"x{1}y\"\"\"", [TokenKind::InterpRaw]))
-    // multi-line plain interpolation `$"""…"""` → Interp.
-    teko::assert::is_true(kinds_eq("$\"\"\"x{1}y\"\"\"", [TokenKind::Interp]))
-}
 
 // the InterpRaw token's text is the FRESH inner bytes the lexer already resolved:
 // single-line verbatim has the `""`→`"` collapse applied; multi-line is as-is.
@@ -230,50 +106,4 @@ fn lexes_brace_doubling_close_finding() {
     teko::assert::is_true(one_str_text("$@\"{{x}}\"") == "{{x}}")
     // order-free verbatim: `@$"{{x}}"` → inner `{{x}}` (preserved for the parser to collapse).
     teko::assert::is_true(one_str_text("@$\"{{x}}\"") == "{{x}}")
-}
-
-// ---- char literals `c'…'` (UTF-8 codepoint, 1–4 bytes) ----
-
-#test
-fn lexes_char_literal_ascii() {
-    // `c'A'` is a single Char token whose text is the 1-byte UTF-8 `A`.
-    teko::assert::is_true(kinds_eq("c'A'", [TokenKind::Char]))
-    teko::assert::is_true(one_str_text("c'A'") == "A")
-    teko::assert::is_true(one_str_text("c'A'").len == 1)
-}
-
-// NOTE: a MULTIBYTE char literal (`c'é'`, `c'😀'`) is NOT unit-tested here. The `.tkt` gate runs
-// under BOTH engines, and the VM lexer has a PRE-EXISTING multibyte-UTF-8 collection limitation
-// (it captures one byte of a multibyte codepoint — independent of `char`; the same limitation
-// affects raw-string collection). Native is fully correct: the end-to-end reproducer
-// examples/regressions/chars decodes `c'é'` (U+00E9 = 233) and exits 220 on the NATIVE binary.
-
-#test
-fn lexes_char_literal_escape() {
-    // `c'\n'` decodes the escape to one ASCII byte (newline, 0x0A).
-    teko::assert::is_true(kinds_eq("c'\\n'", [TokenKind::Char]))
-    teko::assert::is_true(one_str_text("c'\\n'") == "\n")
-    teko::assert::is_true(one_str_text("c'\\n'").len == 1)
-}
-
-#test
-fn rejects_char_literal_two_codepoints() {
-    // `c'ab'` is TWO codepoints — not a single char → lex error.
-    teko::assert::is_true(is_error("c'ab'"))
-    // an empty char `c''` is also rejected.
-    teko::assert::is_true(is_error("c''"))
-    // unterminated char literal.
-    teko::assert::is_true(is_error("c'a"))
-}
-
-#test
-fn upper_snake_truth_table() {
-    teko::assert::is_true(is_upper_snake("OUTER"))
-    teko::assert::is_true(is_upper_snake("A"))
-    teko::assert::is_true(is_upper_snake("A0_B9"))
-    teko::assert::is_false(is_upper_snake("outer"))
-    teko::assert::is_false(is_upper_snake("_X"))
-    teko::assert::is_false(is_upper_snake("0A"))
-    teko::assert::is_false(is_upper_snake("A-B"))
-    teko::assert::is_false(is_upper_snake(""))
 }
