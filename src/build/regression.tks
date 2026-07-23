@@ -136,22 +136,23 @@ fn dir_first_tkr(dir: str) -> str? {
 
 /**
  * discover_source — resolve one `[tests] regression` source into the list of regressive directories
- * it names: if the source path itself holds a `.tkr` it IS a single regressive; otherwise every
- * immediate subdirectory that holds a `.tkr` is one. A non-directory / empty source yields [].
+ * it names: if the source path itself holds a spec (`.tkb` or legacy `.tkr`) it IS a single
+ * regressive; otherwise every immediate subdirectory that holds a spec is one. A non-directory /
+ * empty source yields [].
  *
  * @param source  the regression source path (relative to the project root)
  * @return         the regressive directories under `source`
  * @since 0.3.0.29
  */
 fn discover_source(source: str) -> []str {
-    match dir_first_tkr(source) { str => return teko::list::push(teko::list::empty(), source); null => { } }
+    match dir_first_spec(source) { SpecRef => return teko::list::push(teko::list::empty(), source); null => { } }
     let entries = match teko::fs::list_dir(source) { []str as e => e; error => return teko::list::empty() }
     mut out: []str = teko::list::empty()
     mut k: u64 = 0
     loop {
         if k >= entries.len { break }
         let sub = source ~ "/" ~ entries[k]
-        match dir_first_tkr(sub) { str => out = teko::list::push(out, sub); null => { } }
+        match dir_first_spec(sub) { SpecRef => out = teko::list::push(out, sub); null => { } }
         k = k + 1
     }
     out
@@ -215,6 +216,28 @@ fn argv_with_args(binp: str, args: []str) -> []str {
 fn compile_regressive(exe: str, regr_dir: str, prefix: str) -> CapResult {
     mut argv: []str = teko::list::push(teko::list::empty(), exe)
     argv = teko::list::push(argv, regr_dir)
+    argv = teko::list::push(argv, "-o")
+    argv = teko::list::push(argv, "bin")
+    argv = teko::list::push(argv, "--no-verify")
+    run_captured(argv, "", prefix)
+}
+
+/**
+ * compile_regressive_source — build a SINGLE standalone source `srcfile` (relative to `regr_dir`)
+ * with the current compiler `exe` (`teko <regr_dir>/<srcfile> -o bin --no-verify`), capturing the
+ * build's exit/stderr. The negative path (a `.tkb` `compilation fails` scenario) compiles a distinct
+ * failing source per scenario, so there is no shared built artifact — each row targets its own file.
+ *
+ * @param exe       the absolute path to this compiler binary
+ * @param regr_dir  the regressive project directory
+ * @param srcfile   the source file (relative to `regr_dir`) to compile standalone
+ * @param prefix    the scratch-file prefix for this compile
+ * @return          the captured build outcome
+ * @since 0.3.0.30
+ */
+fn compile_regressive_source(exe: str, regr_dir: str, srcfile: str, prefix: str) -> CapResult {
+    mut argv: []str = teko::list::push(teko::list::empty(), exe)
+    argv = teko::list::push(argv, regr_dir ~ "/" ~ srcfile)
     argv = teko::list::push(argv, "-o")
     argv = teko::list::push(argv, "bin")
     argv = teko::list::push(argv, "--no-verify")
@@ -336,6 +359,23 @@ fn run_one_regressive(exe: str, regr_dir: str, tkr_name: str, prefix: str) -> Re
 }
 
 /**
+ * run_one_spec — dispatch a discovered spec to its format runner: a `.tkb` (canonical) through
+ * `run_one_tkb`, a legacy `.tkr` through `run_one_regressive`. The verdict layer is shared, so both
+ * paths yield the same `RegrOutcome`.
+ *
+ * @param exe       the absolute path to this compiler binary
+ * @param regr_dir  the regressive project directory
+ * @param spec      the discovered spec (basename + format)
+ * @param prefix    the scratch-file prefix for this regressive
+ * @return          the verdict
+ * @since 0.3.0.30
+ */
+fn run_one_spec(exe: str, regr_dir: str, spec: SpecRef, prefix: str) -> RegrOutcome {
+    if spec.is_tkb { return run_one_tkb(exe, regr_dir, spec.name, prefix) }
+    run_one_regressive(exe, regr_dir, spec.name, prefix)
+}
+
+/**
  * report_regressive — print one report line for a regressive's verdict (ok / FAIL / skip).
  *
  * @param rd  the regressive directory (the report label)
@@ -393,9 +433,9 @@ fn run_regression_sources(exe: str, m: Manifest) -> i32 {
         loop {
             if di >= dirs.len { break }
             let rd = dirs[di]
-            match dir_first_tkr(rd) {
-                str as tkr => {
-                    let oc = run_one_regressive(exe, rd, tkr, work ~ "/" ~ regr_sanitize(rd))
+            match dir_first_spec(rd) {
+                SpecRef as spec => {
+                    let oc = run_one_spec(exe, rd, spec, work ~ "/" ~ regr_sanitize(rd))
                     total = total + 1
                     report_regressive(rd, oc)
                     if !oc.ok && !oc.skipped { fails = fails + 1 }
