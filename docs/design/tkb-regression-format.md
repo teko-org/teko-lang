@@ -128,7 +128,7 @@ line, so a placeholder may sit anywhere inside a quoted string or an array eleme
 ### 5.1 Compile-fail Outlines (the negative path — compile-per-scenario)
 
 A `compilation fails` scenario has NO run phase and NO shared built artifact, so the
-compile-once rule does NOT apply to it: each scenario compiles its own `Given source
+compile-once rule does NOT apply to it: each scenario compiles its own `Given source =
 "cases/<f>.tks"` standalone and asserts the build fails (+ the `Then diagnostic` substring).
 A `compile_fail` project is therefore a single project directory whose `.tkb` Outline names a
 distinct failing source per row — ONE spec, N failing compiles, no run:
@@ -136,7 +136,7 @@ distinct failing source per row — ONE spec, N failing compiles, no run:
 ```
   Feature: compile_fail_diag — the rejected-construct diagnostics
     Scenario Outline: <name> is rejected with its pinned message
-      Given source "<file>"
+      Given source = "<file>"
       When compilation fails
       Then diagnostic = "<msg>"
       Examples:
