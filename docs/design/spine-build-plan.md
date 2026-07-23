@@ -444,7 +444,7 @@ verdict: `fn_escaping_vars` stays byte-identical). A non-scalar bare local joins
 `xs = push(xs, item); free(xs)` passing (`mem_free` fixture); (b) `is_mem_free_call` skips a
 `teko::mem::free` call so the consume never marks its own target shared (else every `free` would
 reject itself); (c) the scalar-field discriminator keeps `.len`-before-`free` unique. Validated: the
-gen-2 self-build accepts the whole compiler corpus (no over-reject), gen2==gen3 byte-identical
+gen-2 self-build accepts the whole compiler corpus (no over-reject), gen1==gen2 byte-identical
 (fixpoint held), and the two new negative fixtures (`free_captured_by_container_rejected`,
 `free_field_extract_rejected`) reject with the aliased-free diagnostic.
 
@@ -476,7 +476,7 @@ so the implementer does not hunt for a channel AST that isn't there.
 
 ## 5. Sequencing — the sub-PR order into #329
 
-Each sub-PR is independently gate-able (full gate + FIXPOINT gen1==gen2==gen3 + `diff_vm_native` +
+Each sub-PR is independently gate-able (full gate + FIXPOINT gen1==gen2 + `diff_vm_native` +
 independent review — the recon's `ADDITIVE-BUT-GATE-TOUCHING` classification):
 
 1. **PR-1 — L1 `spine.tks` (the fact, PURE).** Adds `src/checker/spine.tks` with `Cell`/`PointsTo`/
@@ -578,7 +578,7 @@ one-function budget.
 ## Verification (doc-only)
 
 This change is a single `.md` file. `git diff --stat origin/remodel/memory-unsafe-backend -- '*.tks'
-'*.tkt'` MUST be EMPTY. Doc-only ⇒ fixpoint (gen1==gen2==gen3) preserved by construction, no `.tks`
+'*.tkt'` MUST be EMPTY. Doc-only ⇒ fixpoint (gen1==gen2) preserved by construction, no `.tks`
 delta; `diff_vm_native` unaffected. No full build gate is required for this plan.
 
 ## No unresolved HALT

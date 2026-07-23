@@ -1863,3 +1863,89 @@ fn cgt_dedup_key_cache() {
     teko::assert::is_true(set.variant_keys.len == set.variants.len)
     teko::assert::is_true(set.variant_keys[0] == cg_variant_key(set.variants[0]))
 }
+
+/**
+ * Build a two-member union `{ a, b }` — the shape the C4 niche/box classifiers gate on.
+ *
+ * @param a  the first union member
+ * @param b  the second union member
+ * @return   the resolved `Variant` with members `[a, b]`
+ */
+fn cgt_var2(a: checker::Type, b: checker::Type) -> checker::Variant {
+    mut ms: []checker::Type = teko::list::empty()
+    ms = teko::list::push(ms, a)
+    ms = teko::list::push(ms, b)
+    checker::Variant { members = ms }
+}
+
+/**
+ * The `u128 | null` union — no niche, a saturating 16-byte payload (the box-in-arena class).
+ *
+ * @return  the resolved `u128 | null` variant
+ */
+fn cgt_u128_null() -> checker::Variant {
+    cgt_var2(checker::Null { }, checker::Prim { kind = checker::PrimKind::U128 })
+}
+
+/**
+ * The `i32 | null` union — a saturating scalar < 16 bytes (the inline-tag class).
+ *
+ * @return  the resolved `i32 | null` variant
+ */
+fn cgt_i32_null() -> checker::Variant {
+    cgt_var2(checker::Null { }, checker::Prim { kind = checker::PrimKind::I32 })
+}
+
+/**
+ * The `ptr | null` union — a niche-able handle (the niche class).
+ *
+ * @return  the resolved `ptr | null` variant
+ */
+fn cgt_ptr_null() -> checker::Variant {
+    cgt_var2(checker::Null { }, checker::Ptr { inner = null })
+}
+
+/**
+ * Assert `union_repr_class` picks the right physical representation per member class and the
+ * `#inline` force flag: `u128|null` boxes by default and forces to inline-tag; `i32|null` is
+ * inline-tag; a niche-able `ptr|null` is niche regardless of the force flag.
+ */
+#test
+fn cgt_union_repr_class_dial() {
+    let p = cgt_prog()
+    teko::assert::is_true(match union_repr_class(p, cgt_u128_null(), false) { UnionRepr::BoxInArena => true; _ => false })
+    teko::assert::is_true(match union_repr_class(p, cgt_u128_null(), true) { UnionRepr::InlineTag => true; _ => false })
+    teko::assert::is_true(match union_repr_class(p, cgt_i32_null(), false) { UnionRepr::InlineTag => true; _ => false })
+    teko::assert::is_true(match union_repr_class(p, cgt_ptr_null(), false) { UnionRepr::Niche => true; _ => false })
+    teko::assert::is_true(match union_repr_class(p, cgt_ptr_null(), true) { UnionRepr::Niche => true; _ => false })
+}
+
+/**
+ * Assert the box classifier's size gate: `u128|null` (16B) boxes, `i32|null` (4B) does not, a
+ * niche-able `ptr|null` does not; and `cg_type_min_bytes` reports 16 for `u128` and 4 for `i32`.
+ */
+#test
+fn cgt_box_member_size_gate() {
+    let p = cgt_prog()
+    teko::assert::is_true(match cg_union_box_member(p, cgt_u128_null()) { checker::Type => true; null => false })
+    teko::assert::is_true(match cg_union_box_member(p, cgt_i32_null()) { checker::Type => false; null => true })
+    teko::assert::is_true(match cg_union_box_member(p, cgt_ptr_null()) { checker::Type => false; null => true })
+    teko::assert::is_true(cg_type_min_bytes(p, checker::Prim { kind = checker::PrimKind::U128 }) == (16 to u64))
+    teko::assert::is_true(cg_type_min_bytes(p, checker::Prim { kind = checker::PrimKind::I32 }) == (4 to u64))
+}
+
+/**
+ * Assert `inline_attr_eligible` accepts a boxed `u128|null` and rejects each ineligible class with an
+ * error: a non-sum (`i32`), an already-inline sum (`i32|null`), and a niche-able sum (`ptr|null`).
+ */
+#test
+fn cgt_inline_attr_eligible_classes() {
+    let p = cgt_prog()
+    let u128box: checker::Type = cgt_u128_null()
+    teko::assert::is_true(match inline_attr_eligible(p, u128box) { error => false; null => true })
+    teko::assert::is_true(match inline_attr_eligible(p, checker::Prim { kind = checker::PrimKind::I32 }) { error => true; null => false })
+    let i32inline: checker::Type = cgt_i32_null()
+    teko::assert::is_true(match inline_attr_eligible(p, i32inline) { error => true; null => false })
+    let ptrniche: checker::Type = cgt_ptr_null()
+    teko::assert::is_true(match inline_attr_eligible(p, ptrniche) { error => true; null => false })
+}

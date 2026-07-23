@@ -95,7 +95,7 @@ all targets. The LIR-dump (`src/lir/lir_print.tks`, deterministic, floats as exa
 
 `tk_emit_c` retires only when **all** hold (decision collected at N8, #225): (1) own-native
 passes the full 3-way gate on every target for K consecutive green releases; (2) the own backend
-self-hosts (gen1==gen2==gen3 byte-identical through the own path, the fixpoint bar); (3) the
+self-hosts (gen1==gen2 byte-identical through the own path, the fixpoint bar); (3) the
 M-linker (#226) removes the last external-linker dependency, so no target silently falls back to
 `cc`. Until then C-native stays the trusted side of the differential. **Do not retire the VM
 differential before C-vs-own is in place** (`memory-unsafe-backend-remodel.md:187-189`).

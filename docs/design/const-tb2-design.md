@@ -406,7 +406,7 @@ TODA compilação real `has_rr = false`, e:
 
 ⇒ Cada byte idêntico ao pré-T-B2. Os goldens de `objfile_elf_test.tkt` /
 `objfile_elf_riscv_test.tkt` (ex.: `exit`-object = 688 bytes, `shoff=240`, `e_shnum=7`,
-`e_shstrndx=5`) e o **fixpoint gen2==gen3** são a prova viva. **QED.**
+`e_shstrndx=5`) e o **fixpoint gen1==gen2** são a prova viva. **QED.**
 
 ---
 
@@ -524,7 +524,7 @@ o arquivo compila a cada passo.
 - **RITUAL POINT — fim de T-B2:** gate COMPLETO — todos os goldens de backend
   byte-idênticos (`objfile_elf_test.tkt`, `objfile_elf_riscv_test.tkt`,
   `objfile_coff_test.tkt`, `objfile_macho_test.tkt`, `encode_*_test.tkt`,
-  `lower_test.tkt`, `lir_interp_test.tkt`, `tkb_test.tkt`) + **fixpoint gen2==gen3** +
+  `lower_test.tkt`, `lir_interp_test.tkt`, `tkb_test.tkt`) + **fixpoint gen1==gen2** +
   ambas as engines (VM + nativo) + 100% de cobertura do delta (as fixtures §4 cobrem o
   braço `has_rr=true`; os goldens cobrem `has_rr=false`; §4.4 cobre os dois braços de
   `elf_resolve_rela`). **Sem seed bump** — T-B2 não adiciona capacidade que o corpus

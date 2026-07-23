@@ -59,7 +59,7 @@ Two consequences drive the whole layout:
    the wave — see §5 (Critical path) and §7 (Risks).
 
 Ritual vocabulary used below:
-- **Full gate** = C-gate + self-host + native + **fixpoint gen1==gen2==gen3** + `diff_vm_native` +
+- **Full gate** = C-gate + self-host + native + **fixpoint gen1==gen2** + `diff_vm_native` +
   100%-new-code coverage + independent review. **Every sub-wave merge is a full gate** (it cuts a
   seed — a bad seed strands the chain).
 - **Fast-path** = a low-exposure sub-PR *inside* a sub-wave whose fixpoint holds trivially (pure
@@ -135,7 +135,7 @@ sub-waves (SW3–SW7). This is why concurrency infra precedes the spine.
 
 **Parallelizes:** 2.2 ⟂ 2.3 once 2.1 lands (both depend on G8). 2.1 is the gate.
 **Ritual:** full gate at merge; **extra**: run the fixpoint gate under the parallel front-end (2.3) to
-prove determinism (gen1==gen2==gen3 must hold with threads on).
+prove determinism (gen1==gen2 must hold with threads on).
 **Fixtures owed:**
 - `threading_spawn_join` — spawn N workers summing a shared-via-`sync` counter → RUN, deterministic exit, **VM==native** (VM may serialize; result identical).
 - `sync_mutex_once` — `once` runs body exactly once under contention → RUN.
@@ -304,7 +304,7 @@ fn a1_escape_ok(place: AccessPath, roots: BorrowRoots) -> Ok | error
 - `ref_in_returned_slice_rejected` — `[]ref T` whose elements root at a local → **EXPECT_COMPILE_FAIL**.
 - `closure_captures_escaping_local_ref_rejected` — closure capturing a local `ref` that escapes → **EXPECT_COMPILE_FAIL** (with the A1-interproc diagnostic).
 - `iter_closure_param_root_ok` — the `over_array` param-rooted capture → RUN, VM==native (proves the corpus idiom survives).
-- (gate) **corpus self-hosts**; fixpoint gen1==gen2==gen3.
+- (gate) **corpus self-hosts**; fixpoint gen1==gen2.
 
 **Seed-cut moment:** `0.3.1.6-beta` — the transitive gate is live; the safety thesis is proven on the
 corpus.
@@ -580,7 +580,7 @@ the A6 fixtures as load-bearing (independent review of each), and prefer `#wire`
 so A6-DI is subsumed by A1 (less bespoke code, more shared coverage).
 
 ### R5 — [MEDIUM] Parallel front-end must not perturb the fixpoint (SW2). If #449 changes `.tkb`
-byte-output or breaks gen1==gen2==gen3, the seed chain stalls. **Resolution:** keep #449 behind an
+byte-output or breaks gen1==gen2, the seed chain stalls. **Resolution:** keep #449 behind an
 env flag defaulted OFF; the SEED builds serially; land `parallel_frontend_determinism` green on all
 platforms before flipping the default. Determinism is a Law (differential equivalence) — reject any
 scheduling that observably reorders output.

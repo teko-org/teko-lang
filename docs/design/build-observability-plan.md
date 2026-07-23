@@ -382,7 +382,7 @@ backend pela ausência de output. Nenhuma dessas fases altera os bytes do `.o`/b
 
 ### Fatos do código que governam a prova
 
-1. **O FIXPOINT só restringe o programa de RELEASE.** `gen2.c==gen3.c` compara o C do
+1. **O FIXPOINT só restringe o programa de RELEASE.** `gen1.c==gen2.c` compara o C do
    BINÁRIO de release (`mono(sem_testes)` → `tk_emit_c` → o `teko`). O programa do GATE
    (`<name>-tktest.c`, `run_native_gate`, `project.tks:1524-1543`) é DESCARTÁVEL: compila,
    roda, some. **Os bytes do gate NÃO entram no fixpoint.** Isto abre espaço: o gate pode
@@ -483,7 +483,7 @@ extras no ambiente. Riscos residuais NÃO elimináveis estaticamente por mim:
 
 Ambos são "quase certamente seguros" mas não os PROVO no papel. **Como a validação é só no CI
 (seed local não builda), o gate de fixpoint É o validador exato:** se
-`gen2.c==gen3.c` E `gen2.c` continua idêntico ao `gen2.c` pré-mudança, a invariância vale.
+`gen1.c==gen2.c` E `gen2.c` continua idêntico ao `gen2.c` pré-mudança, a invariância vale.
 Recomendação: implementar (c-final) como crumb SEPARADO, gated no fixpoint — se regredir o
 golden do `gen2.c` no CI, reverter para (a).
 
@@ -690,7 +690,7 @@ e uma chamada por fragmento sem probe. **Mesmos bytes emitidos** (a ordem/conte�
   grandes, OU capacidade carregada de forma robusta, de modo que `tk_append_bytes_fo`/
   `tk_slice_push` NUNCA degradem para copy-grow total repetido do buffer grande.
   `src/runtime/teko_rt.c` é o **seed C MANTIDO** (edição permitida pela lei). Bytes de saída
-  INALTERADOS → **fixpoint preservado (gen2.c==gen3.c + `cmp` local)**. Se a tempestade for
+  INALTERADOS → **fixpoint preservado (gen1.c==gen2.c + `cmp` local)**. Se a tempestade for
   confirmada (AL1), esta é a alavanca de ORDEM DE GRANDEZA (ver ganho abaixo). Guarda: gate de
   659 testes + TEKO_MEM_PARANOID + fixpoint.
 
@@ -733,7 +733,7 @@ e uma chamada por fragmento sem probe. **Mesmos bytes emitidos** (a ordem/conte�
 ### Riscos
 
 - **E2** edita `teko_rt.c` (seed mantido): PERIGO = mudar bytes de saída. Mitiga: o append é
-  byte-idêntico (só a bookkeeping de capacidade muda); ritual = fixpoint `gen2.c==gen3.c` +
+  byte-idêntico (só a bookkeeping de capacidade muda); ritual = fixpoint `gen1.c==gen2.c` +
   `cmp` local + gate 659 + `TEKO_MEM_PARANOID` (a rede do #148).
 - **E3** (`[]byte`→`Builder`): churn de assinaturas + risco de um alias romper o decreto de
   cadeia LINEAR (o mesmo invariante que `append_fo`/`push_fo` já exigem). Evitar contágio unsafe
@@ -783,7 +783,7 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
     terminando em `.tkt`; procedência exata, `ast.tks:411`).
 - **Prova de fixpoint** (§"Gap 2", (a)): `filter_tkt(parse(with tests))` ≡ `parse(without
   tests)` (Fatos 3/4) → release byte-idêntico. Ponto ritual: **gate de fixpoint do CI**
-  (`gen2.c==gen3.c` e golden do `gen2.c` inalterado).
+  (`gen1.c==gen2.c` e golden do `gen2.c` inalterado).
 - Observabilidade: o `frontend_check` de release passa a REPORTAR `checker`/`monomorph` de
   verdade (não mais quiet), suprimindo só o banner duplicado. Regressão `.tkt` + build gated
   com `CI=1` → stderr mostra a fase `checker` da produção entre os testes e o backend.
@@ -813,7 +813,7 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
 - Arquivos: `src/codegen/codegen.tks` (`tk_emit_c_report` + `on_item` no loop de corpos de
   `tk_emit_c_mode`; `tk_emit_c` vira wrapper no-op), `src/build/project.tks` (`backend` passa
   o hook).
-- **PROVA de byte-identidade obrigatória**: o `on_item` não toca `b`; golden `gen2.c==gen3.c`
+- **PROVA de byte-identidade obrigatória**: o `on_item` não toca `b`; golden `gen1.c==gen2.c`
   intacto. Regressão: além do `.tkt`, o gate de FIXPOINT do CI é o ponto ritual.
 - Risco: estrutural (codegen). Independe do const wave.
 
@@ -866,7 +866,7 @@ fim do crumb 8 (provar que default não emite `.tkc`).
    monomorfização/procedência). Evitar: NÃO fiar no `release_build_of`; `.tkc` fica OFF-by-
    default (crumb 8). Este é o trade-off ruim que o owner pediu para eu sinalizar.
 2. **Heartbeat do codegen tocando bytes** (crumb 5). Evitar: `on_item` só stderr, nunca
-   toca `b: []byte`; ponto ritual = gate de fixpoint `gen2.c==gen3.c`.
+   toca `b: []byte`; ponto ritual = gate de fixpoint `gen1.c==gen2.c`.
 3. **START-lines em Plain mudando goldens de output de TESTE** — se algum golden do CI
    compara stderr do build literalmente, as novas linhas quebram. Evitar: auditar
    `scripts/*_test.sh` que capturam ERR (ex.: `cli_flags_test.sh` compara stderr do help,

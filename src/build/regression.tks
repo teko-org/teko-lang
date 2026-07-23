@@ -69,6 +69,67 @@ fn sh_squote(arg: str) -> str {
 }
 
 /**
+ * windows_path_to_sh — rewrite every backslash in a Windows-style path to a forward slash — the FIRST
+ * of the two rewrites `to_sh_path` applies on a Windows host (`windows_drive_to_mount` is the
+ * second). Extracted so the conversion itself (not just the OS gate) is unit-testable on every CI
+ * host, independent of `teko::os()`.
+ *
+ * @param path  a Windows-style filesystem path (drive-letter + backslash separators)
+ * @return      `path` with every `\` rewritten to `/`
+ * @since 0.3.0.30
+ */
+fn windows_path_to_sh(path: str) -> str {
+    mut out = ""
+    mut k: u64 = 0
+    loop {
+        if k >= path.len { break }
+        if path[k] == b'\\' { out = out ~ "/" } else { out = out ~ teko::str::slice(path, k, k + 1) }
+        k = k + 1
+    }
+    out
+}
+
+/**
+ * windows_drive_to_mount — rewrite a forward-slashed, drive-letter-prefixed path (`D:/a/b`) to its
+ * git-bash/MSYS POSIX MOUNT form (`/d/a/b`) — the canonical, unambiguous form `cygpath -u` produces
+ * and the one every MSYS tool's own PATH/HOME already uses natively. A bare `D:/...` string, while
+ * often accepted for opening a FILE, is not guaranteed to resolve the same way when a shell decides
+ * HOW TO LAUNCH a command (its "is this a path?" check looks for a leading `/`); the mount form
+ * removes that ambiguity entirely. The drive letter is lowercased (matching `cygpath -u` — MSYS's
+ * fixed mount table is keyed on the lowercase letter). `path` unchanged when it carries no
+ * `<letter>:` prefix (already POSIX, or not a path at all).
+ *
+ * @param path  a forward-slashed path, possibly `<letter>:`-prefixed
+ * @return      the MSYS mount-style POSIX form, or `path` unchanged when it carries no drive letter
+ * @since 0.3.0.30
+ */
+fn windows_drive_to_mount(path: str) -> str {
+    if path.len < 2 || !is_ascii_alpha(path[0]) || path[1] != b':' { return path }
+    let d = path[0]
+    let lower_idx = if d >= b'A' && d <= b'Z' { (d to u64) - (b'A' to u64) } else { (d to u64) - (b'a' to u64) }
+    let drive = teko::str::slice("abcdefghijklmnopqrstuvwxyz", lower_idx, lower_idx + 1)
+    "/" ~ drive ~ teko::str::slice(path, 2, path.len)
+}
+
+/**
+ * to_sh_path — normalize a FILESYSTEM PATH for the `/bin/sh -c` this runner spawns children through:
+ * on a Windows host that `sh` is git-bash/MSYS, whose child-launch path resolution wants a POSIX
+ * mount-style absolute path (`/d/a/.../teko.exe`), not the native backslash form (`D:\a\...\teko.exe`,
+ * the shape a Windows CI runner hands the compiler as `argv[0]`/CWD-joined paths) — unconverted, the
+ * spawned command reads as "command not found" instead of the compiler. `windows_path_to_sh` handles
+ * the backslash-to-slash rewrite, then `windows_drive_to_mount` folds the drive letter into the mount
+ * form. A no-op on every other host, where a path never carries a `\` or a drive letter to begin with.
+ *
+ * @param path  a filesystem path as this host's `teko::env`/argv APIs return it
+ * @return      the git-bash mount-style form of `path` on a Windows host, else `path` unchanged
+ * @since 0.3.0.30
+ */
+fn to_sh_path(path: str) -> str {
+    if teko::os() != "windows" { return path }
+    windows_drive_to_mount(windows_path_to_sh(path))
+}
+
+/**
  * sh_join — join an argv into a single space-separated, individually single-quoted `sh -c` command
  * fragment.
  *
@@ -91,7 +152,11 @@ fn sh_join(argv: []str) -> str {
 /**
  * run_captured — run `argv` with `stdin_data` on its stdin, capturing exit/stdout/stderr via a
  * `/bin/sh -c` redirection to scratch files under `prefix` (`.in`/`.out`/`.err`). The scratch
- * directory is created if missing. On a read failure the captured stream is "".
+ * directory is created if missing. On a read failure the captured stream is "". The native
+ * `mkdir_p`/`write_file`/`read_file` calls use `prefix`'s host-native form (backslash on Windows is
+ * fine there); only the redirection tokens embedded in the `sh -c` command line go through
+ * `to_sh_path` (`argv` itself is the caller's job — see `compile_regressive`/`argv_with_args`, which
+ * convert the PATH entries they build before handing the argv here).
  *
  * @param argv        the command to run (argv[0] is the executable)
  * @param stdin_data  bytes to feed the child's stdin
@@ -105,7 +170,7 @@ fn run_captured(argv: []str, stdin_data: str, prefix: str) -> CapResult {
     let so = prefix ~ ".out"
     let se = prefix ~ ".err"
     match teko::io::write_file(si, stdin_data) { error => { }; null => { } }
-    let cmd = sh_join(argv) ~ " < " ~ sh_squote(si) ~ " > " ~ sh_squote(so) ~ " 2> " ~ sh_squote(se)
+    let cmd = sh_join(argv) ~ " < " ~ sh_squote(to_sh_path(si)) ~ " > " ~ sh_squote(to_sh_path(so)) ~ " 2> " ~ sh_squote(to_sh_path(se))
     mut shv: []str = teko::list::push(teko::list::empty(), "sh")
     shv = teko::list::push(shv, "-c")
     shv = teko::list::push(shv, cmd)
@@ -136,22 +201,23 @@ fn dir_first_tkr(dir: str) -> str? {
 
 /**
  * discover_source — resolve one `[tests] regression` source into the list of regressive directories
- * it names: if the source path itself holds a `.tkr` it IS a single regressive; otherwise every
- * immediate subdirectory that holds a `.tkr` is one. A non-directory / empty source yields [].
+ * it names: if the source path itself holds a spec (`.tkb` or legacy `.tkr`) it IS a single
+ * regressive; otherwise every immediate subdirectory that holds a spec is one. A non-directory /
+ * empty source yields [].
  *
  * @param source  the regression source path (relative to the project root)
  * @return         the regressive directories under `source`
  * @since 0.3.0.29
  */
 fn discover_source(source: str) -> []str {
-    match dir_first_tkr(source) { str => return teko::list::push(teko::list::empty(), source); null => { } }
+    match dir_first_spec(source) { SpecRef => return teko::list::push(teko::list::empty(), source); null => { } }
     let entries = match teko::fs::list_dir(source) { []str as e => e; error => return teko::list::empty() }
     mut out: []str = teko::list::empty()
     mut k: u64 = 0
     loop {
         if k >= entries.len { break }
         let sub = source ~ "/" ~ entries[k]
-        match dir_first_tkr(sub) { str => out = teko::list::push(out, sub); null => { } }
+        match dir_first_spec(sub) { SpecRef => out = teko::list::push(out, sub); null => { } }
         k = k + 1
     }
     out
@@ -182,8 +248,9 @@ fn regressive_name(regr_dir: str) -> str | error {
 }
 
 /**
- * argv_with_args — build the run argv: the binary path followed by the `.tkr` `args` (the fold-opaque
- * runtime operands).
+ * argv_with_args — build the run argv: the binary path (`to_sh_path`-normalized, so the `sh -c` that
+ * `run_captured` spawns can exec it on Windows) followed by the `.tkr` `args` UNCHANGED (the
+ * fold-opaque runtime operands — never path-normalized, since they are not necessarily paths).
  *
  * @param binp  the built binary path
  * @param args  the argv operands from the `.tkr`
@@ -191,7 +258,7 @@ fn regressive_name(regr_dir: str) -> str | error {
  * @since 0.3.0.29
  */
 fn argv_with_args(binp: str, args: []str) -> []str {
-    mut out: []str = teko::list::push(teko::list::empty(), binp)
+    mut out: []str = teko::list::push(teko::list::empty(), to_sh_path(binp))
     mut k: u64 = 0
     loop {
         if k >= args.len { break }
@@ -204,7 +271,9 @@ fn argv_with_args(binp: str, args: []str) -> []str {
 /**
  * compile_regressive — build the regressive project at `regr_dir` with the current compiler `exe`
  * (`teko <regr_dir> -o bin --no-verify`), capturing the build's exit/stderr (the stderr carries the
- * diagnostic a `compile_fail` regressive pins). The binary lands at `<regr_dir>/bin/<name>`.
+ * diagnostic a `compile_fail` regressive pins). The binary lands at `<regr_dir>/bin/<name>`. Both
+ * `exe` and `regr_dir` are `to_sh_path`-normalized before they enter the argv, so the `sh -c` this
+ * spawns through can exec them on Windows.
  *
  * @param exe       the absolute path to this compiler binary
  * @param regr_dir  the regressive project directory
@@ -213,8 +282,32 @@ fn argv_with_args(binp: str, args: []str) -> []str {
  * @since 0.3.0.29
  */
 fn compile_regressive(exe: str, regr_dir: str, prefix: str) -> CapResult {
-    mut argv: []str = teko::list::push(teko::list::empty(), exe)
-    argv = teko::list::push(argv, regr_dir)
+    mut argv: []str = teko::list::push(teko::list::empty(), to_sh_path(exe))
+    argv = teko::list::push(argv, to_sh_path(regr_dir))
+    argv = teko::list::push(argv, "-o")
+    argv = teko::list::push(argv, "bin")
+    argv = teko::list::push(argv, "--no-verify")
+    run_captured(argv, "", prefix)
+}
+
+/**
+ * compile_regressive_source — build a SINGLE standalone source `srcfile` (relative to `regr_dir`)
+ * with the current compiler `exe` (`teko <regr_dir>/<srcfile> -o bin --no-verify`), capturing the
+ * build's exit/stderr. The negative path (a `.tkb` `compilation fails` scenario) compiles a distinct
+ * failing source per scenario, so there is no shared built artifact — each row targets its own file.
+ * Both `exe` and the joined source path are `to_sh_path`-normalized before they enter the argv, so
+ * the `sh -c` this spawns through can exec them on Windows.
+ *
+ * @param exe       the absolute path to this compiler binary
+ * @param regr_dir  the regressive project directory
+ * @param srcfile   the source file (relative to `regr_dir`) to compile standalone
+ * @param prefix    the scratch-file prefix for this compile
+ * @return          the captured build outcome
+ * @since 0.3.0.30
+ */
+fn compile_regressive_source(exe: str, regr_dir: str, srcfile: str, prefix: str) -> CapResult {
+    mut argv: []str = teko::list::push(teko::list::empty(), to_sh_path(exe))
+    argv = teko::list::push(argv, to_sh_path(regr_dir ~ "/" ~ srcfile))
     argv = teko::list::push(argv, "-o")
     argv = teko::list::push(argv, "bin")
     argv = teko::list::push(argv, "--no-verify")
@@ -336,6 +429,23 @@ fn run_one_regressive(exe: str, regr_dir: str, tkr_name: str, prefix: str) -> Re
 }
 
 /**
+ * run_one_spec — dispatch a discovered spec to its format runner: a `.tkb` (canonical) through
+ * `run_one_tkb`, a legacy `.tkr` through `run_one_regressive`. The verdict layer is shared, so both
+ * paths yield the same `RegrOutcome`.
+ *
+ * @param exe       the absolute path to this compiler binary
+ * @param regr_dir  the regressive project directory
+ * @param spec      the discovered spec (basename + format)
+ * @param prefix    the scratch-file prefix for this regressive
+ * @return          the verdict
+ * @since 0.3.0.30
+ */
+fn run_one_spec(exe: str, regr_dir: str, spec: SpecRef, prefix: str) -> RegrOutcome {
+    if spec.is_tkb { return run_one_tkb(exe, regr_dir, spec.name, prefix) }
+    run_one_regressive(exe, regr_dir, spec.name, prefix)
+}
+
+/**
  * report_regressive — print one report line for a regressive's verdict (ok / FAIL / skip).
  *
  * @param rd  the regressive directory (the report label)
@@ -393,9 +503,9 @@ fn run_regression_sources(exe: str, m: Manifest) -> i32 {
         loop {
             if di >= dirs.len { break }
             let rd = dirs[di]
-            match dir_first_tkr(rd) {
-                str as tkr => {
-                    let oc = run_one_regressive(exe, rd, tkr, work ~ "/" ~ regr_sanitize(rd))
+            match dir_first_spec(rd) {
+                SpecRef as spec => {
+                    let oc = run_one_spec(exe, rd, spec, work ~ "/" ~ regr_sanitize(rd))
                     total = total + 1
                     report_regressive(rd, oc)
                     if !oc.ok && !oc.skipped { fails = fails + 1 }

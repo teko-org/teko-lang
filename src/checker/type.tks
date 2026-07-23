@@ -44,7 +44,7 @@ fn prim_is_signed(k: PrimKind) -> bool {
 }
 
 // bit width of a prim: ints 8/16/32/64/128, floats 16/32/64, bool 1.
-fn prim_width(k: PrimKind) -> u32 {
+pub fn prim_width(k: PrimKind) -> u32 {
     match k {
         U8 => 8; U16 => 16; U32 => 32; U64 => 64; U128 => 128
         I8 => 8; I16 => 16; I32 => 32; I64 => 64; I128 => 128
@@ -195,4 +195,36 @@ fn types_contain_ref(xs: []Type) -> bool {
         i++
     }
     false
+}
+
+/**
+ * is_ref_null_variant — is `t` the two-member absence union `Ref<T> | null` (exactly one `Null`
+ * member and one `Reference` member, in either source order)? This is the SOLE ref-bearing shape the
+ * null-union C3 resolve gate admits (owner D3), and the ONE shape whose LOCAL binding null-union C5
+ * lifts out of the "references are parameter-only" restriction: the borrow-spine still proves the
+ * handle does not outlive its referent, and the universal narrowing invariant fences the deref (a
+ * `Ref<T> | null` cannot be dereferenced until narrowed to a bare `Ref<T>`), so the bare-reference R2
+ * promise stays sound. Any other ref-carrying type (a bare `Reference`, a slice/optional/struct that
+ * reaches a `Reference`, a `> 2`-member union) is NOT this shape and stays rejected.
+ *
+ * @param t  the resolved type to classify
+ * @return   true iff `t` is a `Variant` whose members are exactly `{ null, Reference }`
+ * @since 0.3.0.30 (null-union C5)
+ */
+fn is_ref_null_variant(t: Type) -> bool {
+    let ms = match t { Variant as v => v.members; _ => return false }
+    if ms.len != 2 { return false }
+    mut has_null = false
+    mut has_ref = false
+    mut i = 0
+    loop {
+        if i >= ms.len { break }
+        match ms[i] {
+            Null => has_null = true
+            Reference => has_ref = true
+            _ => return false
+        }
+        i++
+    }
+    has_null && has_ref
 }

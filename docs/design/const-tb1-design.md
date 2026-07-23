@@ -323,7 +323,7 @@ could add a `Rodata` one):
    `objfile_elf_test.tkt`, `objfile_elf_riscv_test.tkt`, `objfile_macho_test.tkt`,
    `objfile_coff_test.tkt` (object-file goldens), `lower_test.tkt`,
    `lir_interp_test.tkt`, `tkb_test.tkt` — must ALL stay byte-for-byte green, and
-   **fixpoint gen2==gen3** is the final proof that the self-hosting compiler emits
+   **fixpoint gen1==gen2** is the final proof that the self-hosting compiler emits
    identical bytes.
 
 ---
@@ -377,7 +377,7 @@ is the byte-identity guard.
 
 - **Per-edit:** the file's own `.tkt` gate (table §4) — each edit is gate-able alone.
 - **RITUAL POINT — end of T-B1:** the FULL gate (every backend golden byte-identical
-  + `lower`/`lir_interp`/`tkb` suites + **fixpoint gen2==gen3** + both engines). Zero
+  + `lower`/`lir_interp`/`tkb` suites + **fixpoint gen1==gen2** + both engines). Zero
   bytes changed, so a green full gate IS the compatibility proof. **No seed bump** —
   T-B1 adds no capability the corpus uses (the 🔑 SEED BUMP #3 is after T-B5, §8).
 

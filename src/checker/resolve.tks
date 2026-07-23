@@ -1477,6 +1477,66 @@ fn union_normalize_null(members: []Type) -> []Type {
     out
 }
 
+/**
+ * Collect every member of `xs` except the one at index `skip` — the SIBLING set a variant
+ * member is validated against (`variant_member_admissible` needs the other members to decide the
+ * shape-aware R2 relaxation for a `Reference`). Preserves source order of the retained members.
+ *
+ * @param xs    the full resolved member list
+ * @param skip  the index whose member is being validated (excluded from the result)
+ * @return      the members of `xs` other than `xs[skip]`, in source order
+ */
+fn variant_siblings(xs: []Type, skip: i64) -> []Type {
+    mut out: []Type = teko::list::empty()
+    mut i = 0
+    loop {
+        if i >= xs.len { break }
+        if (i to i64) != skip { out = teko::list::push(out, xs[i]) }
+        i++
+    }
+    out
+}
+
+/**
+ * Decide whether a resolved `member` may stand in a union alongside `siblings` (the C3 replacement
+ * for the flat variant-member gate). `void` and a nullable `T?` are never members. A `Reference` is
+ * admitted ONLY as the never-null handle of a two-member `Ref<T> | null` union (R2 relaxed, owner
+ * D3) — exactly one sibling, itself a `Null`; every other stored `Reference` stays rejected (R4). An
+ * interface `Named` remains an honest stop (the #28 S4 carve-out — interface-in-union rebases on top
+ * of null-union and relaxes this arm itself). `Null` and ordinary value members are admissible.
+ *
+ * NOTE (divergence from the design signature, reported to the integrator): the design return is
+ * `null | error`; the seed-sequencing law forbids a null-union VALUE in production `src/` before C5,
+ * so the seed-safe legacy `error?` (Optional) is used — `null` = admissible, an `error` = rejected.
+ * The caller match (`{ error as e => …; null => … }`) is byte-identical between the two spellings.
+ *
+ * @param member    the resolved candidate member type
+ * @param siblings  the other resolved members already collected for this union
+ * @param table     the type table (interface-name resolution)
+ * @return          null when `member` is admissible; an error naming why not
+ * @throws          error when `member` is `void`, a nullable, an out-of-shape `Reference`, or an interface
+ * @since 0.3.0.30 (null-union C3)
+ */
+fn variant_member_admissible(member: Type, siblings: []Type, table: TypeTable) -> error? {
+    match member {
+        Void => return error { message = "a variant member may not be `void`" }
+        Optional => return error { message = "a variant member may not be nullable (`T?`) — use `T | …` and mark the whole type `?`" }
+        Reference => {
+            if siblings.len == 1 {
+                match siblings[0] { Null => return null; _ => { } }
+            }
+            return error { message = "a reference cannot be stored in a struct/variant/collection" }
+        }
+        Named as nm => {
+            if is_interface_name(nm.name, table) {
+                return error { message = "an interface cannot be a variant member yet — bind the interface value on its own (no `I | error` unions)" }
+            }
+            null
+        }
+        _ => null
+    }
+}
+
 // resolve a syntactic TypeExpr to a pure semantic Type (recursive — B.8).
 // (#109 W1) `ref_ns` = the REFERENCING namespace (the namespace of the code that wrote `te`).
 // Threaded down every recursion (slice element / union members / fn-type params+ret / optional
@@ -1511,25 +1571,17 @@ pub fn resolve_type(te: parser::TypeExpr, table: TypeTable, ref_ns: str) -> Type
                     Type as t => t
                     error as e => return e
                 }
-                // M.1/rules 2 & 3: a variant member must be a COMPLETE type — never
-                // `void` (not a value) and never nullable (`T?` — disjoint domain).
-                match m {
-                    Void => return error { message = "a variant member may not be `void`" }
-                    Optional => return error { message = "a variant member may not be nullable (`T?`) — use `T | …` and mark the whole type `?`" }
-                    Reference => return error { message = "a reference cannot be stored in a struct/variant/collection" }   // (MEM Step 0, R4)
-                    // (W10b.D3) an interface (contract) variant member is an honest stop: the VM's
-                    // untagged values discriminate a match arm by the CONCRETE class name, so a
-                    // `Shape | error` subject would silently diverge between the engines (native
-                    // has a tag, the VM does not). Plain interface-typed values work — bind first.
-                    Named as nm => {
-                        if is_interface_name(nm.name, table) {
-                            return error { message = "an interface cannot be a variant member yet — bind the interface value on its own (no `I | error` unions)" }
-                        }
-                    }
-                    _ => { }
-                }
                 members = teko::list::push(members, m)
                 i++
+            }
+            mut j = 0
+            loop {
+                if j >= members.len { break }
+                match variant_member_admissible(members[j], variant_siblings(members, j to i64), table) {
+                    error as e => return e
+                    null => { }
+                }
+                j++
             }
             Variant { members = union_normalize_null(members) }
         }

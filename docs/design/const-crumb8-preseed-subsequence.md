@@ -35,7 +35,7 @@ re-derived heuristic. This single mechanism resolves BOTH findings:
 
 **Fixpoint safety:** in the single-project self-build every const's `func_ns` equals
 its own map namespace, so `(name, ns)` is an exact self-match and the substitution is
-unchanged → gen2==gen3 preserved. The keying only ever *disambiguates* a real
+unchanged → gen1==gen2 preserved. The keying only ever *disambiguates* a real
 cross-module duplicate, which cannot arise in a single project.
 
 ---
@@ -115,7 +115,7 @@ fn inline_rw_var(v: TVar, e: TExpr, map: ScalarConstMap) -> TExpr
   fixture is the end-to-end proof of this same shadowing.
 
 ### Gate
-Full ritual on the c8b sub-PR: both engines + `.tkt` + **fixpoint gen2==gen3** + 100%
+Full ritual on the c8b sub-PR: both engines + `.tkt` + **fixpoint gen1==gen2** + 100%
 delta coverage on the touched `inline_rw_*` arms + native `EXPECT_COMPILE_FAIL` leg
 (green once c8e lands; if c8e not yet merged, run the new unit test + the existing
 positive const fixtures).

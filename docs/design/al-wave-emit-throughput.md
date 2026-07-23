@@ -362,7 +362,7 @@ migra um módulo de value-thread → ref-push, roda o gate, segue. **Nenhum cuto
 **FIXPOINT preservado**: a migração muda a espinha de alocação INTERNA e a grafia da fonte do
 compilador, **NÃO os bytes emitidos do programa-alvo** (o compilador compila o corpus de
 teste identicamente antes e depois). Marcação por crumb:
-- **Preserva-alvo, muda-C-do-compilador** (gen2==gen3 entre si; C emitido para o corpus-alvo
+- **Preserva-alvo, muda-C-do-compilador** (gen1==gen2 entre si; C emitido para o corpus-alvo
   byte-idêntico): F1, F3, AL3, AL6 (níveis push/`[N]T`). Prova: golden do corpus-alvo + diff
   VM==native + fixpoint.
 - **Preserva tudo**: AL1, AL4a (string idêntica, só cacheia), F2 (≤7 sites), AL4b, AL5.
@@ -466,7 +466,7 @@ baseline de AL1 como régua.
   sub-lote. Nunca cutover duro.
 - **Fixpoint / byte-identidade.** F1/F3/AL3/AL6 mudam o C do compilador mas preservam o C
   emitido para o corpus-alvo. Resolução: golden do alvo + diff VM==native + fixpoint
-  gen2==gen3; marcação por crumb em §6.
+  gen1==gen2; marcação por crumb em §6.
 - **`let`-profundo pode quebrar código que muta conteúdo de `let`.** Blast: 7 index-writes
   (§7). Resolução: migrar os ≤7 a `mut`, depois apertar; baixo risco.
 - **Sink-to-value (mudança de regra).** Não-quebra provado em §4.1: a preservação de alias só

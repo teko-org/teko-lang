@@ -275,7 +275,7 @@ Precisely:
 - The spine query itself (`fn_spine`, `ref_target_outlives`) is **ADDITIVE** — a new function beside the
   untouched `fn_escaping_vars`. It changes **no** existing `mark_*` code and **no** codegen routing site
   (`codegen.tks:5555,5564,5623,6072,6075,6277` all keep reading the unchanged name set). By that part
-  alone, fixpoint (gen1==gen2==gen3) is preserved: adding a *new* pure query does not change generated C.
+  alone, fixpoint (gen1==gen2) is preserved: adding a *new* pure query does not change generated C.
 - **HOWEVER**, the BUILD *also* relaxes three type gates (`typer.tks:2450,2512`; guarded `resolve`/`typer`
   sites) so that programs previously **rejected** now **compile**. That changes the accepted language and
   therefore the emitted output for newly-accepted programs. Those relaxations are read by the checker and
@@ -283,7 +283,7 @@ Precisely:
   codegen branch.
 
 **Therefore the BUILD (#331) requires the FULL shared-checker discipline:** full gate (C + self-host +
-native) + FIXPOINT (gen1==gen2==gen3 byte-identical) + `diff_vm_native` (`scripts/diff_vm_native.sh`,
+native) + FIXPOINT (gen1==gen2 byte-identical) + `diff_vm_native` (`scripts/diff_vm_native.sh`,
 VM==native on every regression) + **independent review**. The build is **NOT** trivially additive —
 the query is additive, but the gate relaxations it enables are shared-checker-touching. This recon
 records that requirement so #331 inherits it (issue #330 §5 "the downstream build is NOT additive").
@@ -334,7 +334,7 @@ diagnostic"); fixture 2 is a **run** fixture (VM exit == native exit == sentinel
 ## Verification (doc-only)
 
 This change is a single `.md` file. `git diff --stat origin/remodel/memory-unsafe-backend -- '*.tks' '*.tkt'`
-is EMPTY (confirmed). Doc-only ⇒ fixpoint (gen1==gen2==gen3) preserved by construction, no `.tks` delta;
+is EMPTY (confirmed). Doc-only ⇒ fixpoint (gen1==gen2) preserved by construction, no `.tks` delta;
 `diff_vm_native` unaffected. No full build gate is required for this recon.
 
 ---

@@ -289,7 +289,7 @@ implementer makes — NOT this doc); S4 drafts piece-2 coordination. Piece 1
 explicitly deferred (§1, §4.4).
 
 **RITUAL types:** *full-gate* = the complete `teko test .` + positive/native
-regression lane + fixpoint (gen2 == gen3); *fixture-gate* = the new regression's
+regression lane + fixpoint (gen1==gen2); *fixture-gate* = the new regression's
 own C-native exit assertion.
 
 ### Crumb S1 — named honest-stop for struct→interface. **S. Message-only, behavior-preserving. RITUAL: full-gate.**

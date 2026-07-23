@@ -1003,7 +1003,7 @@ trailing-value framed `main` rides the same `MRetRiscv`+prologue path the frame 
 - **CI is the gate.** The FULL gate (both engines + FIXPOINT + paranoid + the qemu differential) runs
   in CI at the ritual points. Local per-slice verification is PROPORTIONATE — the default-path-unchanged
   proof + the slice's own goldens/tests + (for the writer-reuse slice) B1's ELF goldens re-green
-  byte-identical. **NO local 3-gen-fixpoint or paranoid for the mechanical slices** — CI does it.
+  byte-identical. **NO local 2-gen-fixpoint or paranoid for the mechanical slices** — CI does it.
 - **FIXPOINT is structural, not re-proven locally per slice.** B2 is purely ADDITIVE files + one
   `NativeTarget` arm whose default (arm64) path is verbatim, so the default output is byte-unchanged by
   construction; CI's fixpoint leg confirms it once.

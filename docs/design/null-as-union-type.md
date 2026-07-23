@@ -714,7 +714,7 @@ mechanical and fixture-guarded (§8 Crumb 6), so it is churn, not risk.
 ## 8. Crumb plan — FINAL, RATIFIED SEQUENCE (8 gate-able crumbs)
 
 Each crumb is independently gate-able. RITUAL types: **fixpoint** = self-host
-gen2 == gen3; **size probe** = the native throughput gate (a `sizeof`/heap probe
+gen1==gen2; **size probe** = the native throughput gate (a `sizeof`/heap probe
 in emitted C asserting the §6.2/§6.5 targets — required at every crumb that
 changes representation). The order guarantees **no intermediate build regresses
 layout or breaks the fixpoint**: the representation (C3/C4) lands BEFORE any corpus
@@ -739,7 +739,7 @@ pub type Null = struct { }
 ```
 
 Fixture: `t/null_type_inert.tks` — a file that never mentions `null` compiles
-byte-identically to pre-crumb (gen2 == gen3).
+byte-identically to pre-crumb (gen1==gen2).
 
 **Crumb 2 — union accepts a `null` member + null-first canonical order. S.
 BEHAVIOR-PRESERVING.** In resolve variant-member validation (`resolve.tks:1387`)

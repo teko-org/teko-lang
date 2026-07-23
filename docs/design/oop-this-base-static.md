@@ -227,13 +227,13 @@ No genuine Law tension. The only open fork is process (migration shape), not law
 ## 5. Ordered crumb plan (for a teko-implementer)
 
 Each crumb is independently gate-able (`./build/teko . -o bin` + `.tkt` gate, then
-`./bin/teko . -o gen2`, then temp-normalized diff + gen2==gen3).
+`./bin/teko . -o gen2`, then temp-normalized diff + gen1==gen2).
 
 **C1 — lexer + AST fields (no behavior).**
 - `token.tks`: add `Static` member (Javadoc). `lexer.tks:270`: `if text == "static" { return TokenKind::Static }`.
 - `ast.tks`: add `is_static: bool` to `Function` (Javadoc it). Default `false` at every existing
   `Function{…}` construction site (grep `Function {` — mostly `synth.tks`, `collect.tks`,
-  parser). Fixpoint: pure field addition, codegen ignores it → gen2==gen3 holds.
+  parser). Fixpoint: pure field addition, codegen ignores it → gen1==gen2 holds.
 - Ritual: full gate. Regression: `parser_test.tkt` — `static fn` parses, `is_static==true`.
 
 **C2 — parser: `static` + synthetic `this` receiver + `base` binding rename.**
@@ -263,8 +263,8 @@ Each crumb is independently gate-able (`./build/teko . -o bin` + `.tkt` gate, th
   - `class Base(binding) {` → `class Base {`, rename in-body `binding.` → `base.`.
 - `synth.tks` is CODE that emits methods — update it to emit `name="this"` + `is_static` directly
   (its synthesized `self` sites at `:199,314,365,418,475`).
-- Because codegen output is unchanged, the rewrite MUST keep gen2==gen3 byte-identical. Validate
-  after: temp-normalized diff=0 + gen2==gen3 (memory `selfhost-byte-identity-broken`).
+- Because codegen output is unchanged, the rewrite MUST keep gen1==gen2 byte-identical. Validate
+  after: temp-normalized diff=0 + gen1==gen2 (memory `selfhost-byte-identity-broken`).
 - Ritual: full gate + **explicit fixpoint check** (the load-bearing gate for this issue).
 
 **C5 — remove dual-syntax (only if §6 = transition).**
@@ -288,7 +288,7 @@ Each crumb is independently gate-able (`./build/teko . -o bin` + `.tkt` gate, th
 
 ### Ritual points (full gate MUST pass)
 - End of C1, C2, C3, C4 (and C5 if used). C4's ritual additionally REQUIRES the byte-identity
-  fixpoint (gen2==gen3, temp-normalized diff=0) — this is where a codegen regression would surface.
+  fixpoint (gen1==gen2, temp-normalized diff=0) — this is where a codegen regression would surface.
 
 ### Size estimate — **L** (front-end-only, tiny production corpus).
 Not XL: production `src/` has 0 classes / 4 interfaces / 0 traits, and codegen/VM are untouched. The
