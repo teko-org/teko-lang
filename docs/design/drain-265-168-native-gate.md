@@ -102,7 +102,7 @@ so the thread is one value, not a bool viral through 30 signatures:
  * prog.items index (so interior line/branch marks key on the same `fn` the static floor walk
  * queries — `line_coverage`/`branch_coverage` in vm.tks use `i to u64`). `on == false` is the
  * default for every non-TestCov path → NO `tk_cov_*` emitted → byte-identical output → the
- * gen2==gen3 fixpoint is untouched.
+ * gen1==gen2 fixpoint is untouched.
  *
  * @see emit_function_cov  the entry that constructs a live CovCtx (cov_idx >= 0)
  * @see line_coverage  the static walk whose `fn` index this MUST match
@@ -359,7 +359,7 @@ authority per the VM=dev/native=production ruling.
 - **Before C1** (CI flip): fixture 8 (A-parity) GREEN across the 79 fixtures — the mandatory
   precondition to demote the VM lane (main-integrity: never drop a floor that catches a regression).
 
-**Fixpoint (gen2.c == gen3.c byte-identity) survival — the non-negotiable invariant.** The fixpoint
+**Fixpoint (gen1.c==gen2.c byte-identity) survival — the non-negotiable invariant.** The fixpoint
 compares the `Program`-mode emission (the release TU). ALL #265 instrumentation is gated on
 `CgMode::TestCov` / `CovCtx.on` — the `Program` path constructs `cov_off()` everywhere, so it emits
 ZERO `tk_cov_*` bytes → the release `teko.c` is byte-for-byte unchanged → **the fixpoint is

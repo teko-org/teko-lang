@@ -394,7 +394,7 @@ monomorph 766, codegen 7628, tkb_read 522, + the test ctors above.
   `tk_lbl_OUTER_break`): re-baseline any codegen/emit assertion referencing
   `tk_lbl_outer_*`.
 - **The self-host fixpoint re-baselines** because the compiler SOURCE grows (new
-  parser/checker/desugar code) — gen2 == gen3 must re-establish at every crumb
+  parser/checker/desugar code) — gen1==gen2 must re-establish at every crumb
   (determinism, always required). Note: the compiler `src/` uses **no** labeled
   or head-form loops, so none of the compiler's own generated C changes from the
   feature itself; the fixpoint moves only because new source is added.
@@ -481,7 +481,7 @@ field. Verify class-element field-write reaches the shared object; struct-elemen
 field-write does not.
 
 **Crumb 9 — final fixpoint re-baseline + coverage sweep.**
-Re-establish gen2 == gen3, confirm 100% coverage on all new/changed code
+Re-establish gen1==gen2, confirm 100% coverage on all new/changed code
 (justify any unreachable arm in the PR), full ritual gate. **Ritual point.**
 
 Ritual points (where the FULL gate + fixpoint must pass): crumbs 2, 3, 4, 6, 9

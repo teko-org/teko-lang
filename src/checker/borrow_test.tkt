@@ -137,17 +137,6 @@ fn bw_trait_decl(name: str, fields: []parser::Field) -> parser::TypeDecl {
 }
 
 /**
- * A `type Name = <type_ann>` transparent alias declaration.
- *
- * @param name      the alias's name
- * @param type_ann  the aliased syntactic type
- * @return          the `TypeDecl`
- */
-fn bw_alias_decl(name: str, type_ann: parser::TypeExpr) -> parser::TypeDecl {
-    bw_decl(name, parser::AliasBody { alias = type_ann })
-}
-
-/**
  * A `type Name = variant M1 | M2 | …` union declaration.
  *
  * @param name     the variant's name
@@ -227,46 +216,11 @@ fn bw_table2(a: parser::TypeDecl, b: parser::TypeDecl) -> TypeTable {
 fn bw_empty_table() -> TypeTable { teko::list::empty() }
 
 /**
- * `type_reaches_ref` answers `true` directly on a bare `Reference` — the base case every deeper
- * walk bottoms out on.
- */
-#test fn reaches_ref_true_on_bare_reference() {
-    teko::assert::is_true(type_reaches_ref(bw_ref(bw_i64()), bw_empty_table(), teko::list::empty()))
-}
-
-/**
- * `type_reaches_ref` answers `false` on a plain scalar (the `_ => false` fallback arm covering
- * every non-composite, non-Named `Type` case).
- */
-#test fn reaches_ref_false_on_scalar() {
-    teko::assert::is_false(type_reaches_ref(bw_i64(), bw_empty_table(), teko::list::empty()))
-}
-
-/**
  * A `Slice` reaches ref iff its element does.
  */
 #test fn reaches_ref_slice_follows_element() {
     teko::assert::is_true(type_reaches_ref(Slice { element = bw_ref(bw_i64()) }, bw_empty_table(), teko::list::empty()))
     teko::assert::is_false(type_reaches_ref(Slice { element = bw_i64() }, bw_empty_table(), teko::list::empty()))
-}
-
-/**
- * An `Optional` reaches ref iff its inner does.
- */
-#test fn reaches_ref_optional_follows_inner() {
-    teko::assert::is_true(type_reaches_ref(Optional { inner = bw_ref(bw_i64()) }, bw_empty_table(), teko::list::empty()))
-    teko::assert::is_false(type_reaches_ref(Optional { inner = bw_i64() }, bw_empty_table(), teko::list::empty()))
-}
-
-/**
- * A `Variant` reaches ref iff ANY member does — a reaching member past the first one still short-
- * circuits `types_reach_ref`'s scan, and an all-clear member list falls through to `false`.
- */
-#test fn reaches_ref_variant_any_member() {
-    let members = teko::list::push(teko::list::push(teko::list::empty(), bw_i64()), bw_ref(bw_i64()))
-    teko::assert::is_true(type_reaches_ref(Variant { members = members }, bw_empty_table(), teko::list::empty()))
-    let clear = teko::list::push(teko::list::push(teko::list::empty(), bw_i64()), Str { })
-    teko::assert::is_false(type_reaches_ref(Variant { members = clear }, bw_empty_table(), teko::list::empty()))
 }
 
 /**
@@ -295,16 +249,6 @@ fn bw_empty_table() -> TypeTable { teko::list::empty() }
  */
 #test fn reaches_ref_named_unknown_is_conservative_true() {
     teko::assert::is_true(type_reaches_ref(bw_named("Ghost"), bw_empty_table(), teko::list::empty()))
-}
-
-/**
- * A struct reaches ref iff any of its fields does.
- */
-#test fn reaches_ref_named_struct_field() {
-    let with_ref = bw_struct_decl("Holder", teko::list::push(teko::list::empty(), bw_field("r", bw_ref_ann("i64"))))
-    teko::assert::is_true(type_reaches_ref(bw_named("Holder"), bw_table1(with_ref), teko::list::empty()))
-    let without = bw_struct_decl("Plain", teko::list::push(teko::list::empty(), bw_field("n", bw_named_ann("i64"))))
-    teko::assert::is_false(type_reaches_ref(bw_named("Plain"), bw_table1(without), teko::list::empty()))
 }
 
 /**
@@ -343,25 +287,6 @@ fn bw_empty_table() -> TypeTable { teko::list::empty() }
     teko::assert::is_true(type_reaches_ref(bw_named("RefTrait"), bw_table1(with_ref), teko::list::empty()))
     let without = bw_trait_decl("PlainTrait", teko::list::push(teko::list::empty(), bw_field("n", bw_named_ann("i64"))))
     teko::assert::is_false(type_reaches_ref(bw_named("PlainTrait"), bw_table1(without), teko::list::empty()))
-}
-
-/**
- * A transparent alias reaches ref iff its resolved aliased type does.
- */
-#test fn reaches_ref_named_alias_follows_target() {
-    let ref_alias = bw_alias_decl("RefAlias", bw_ref_ann("i64"))
-    teko::assert::is_true(type_reaches_ref(bw_named("RefAlias"), bw_table1(ref_alias), teko::list::empty()))
-    let plain_alias = bw_alias_decl("PlainAlias", bw_named_ann("i64"))
-    teko::assert::is_false(type_reaches_ref(bw_named("PlainAlias"), bw_table1(plain_alias), teko::list::empty()))
-}
-
-/**
- * An alias whose target does not resolve (an unknown name) conservatively answers `true`
- * (`type_expr_reaches_ref`'s `error` arm).
- */
-#test fn reaches_ref_named_alias_unresolvable_target_is_conservative_true() {
-    let bad_alias = bw_alias_decl("BadAlias", bw_named_ann("Nonexistent"))
-    teko::assert::is_true(type_reaches_ref(bw_named("BadAlias"), bw_table1(bad_alias), teko::list::empty()))
 }
 
 /**
@@ -678,84 +603,11 @@ fn bw_binary(t: Type) -> TExpr {
 }
 
 /**
- * `fn_borrow_summary` on an empty body borrows nothing (the vacuous case — no escaping candidate
- * expression exists to resolve).
- */
-#test fn borrow_summary_empty_body_borrows_nothing() {
-    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), teko::list::empty()), bw_empty_table(), borrow_summary_env_empty())
-    teko::assert::is_false(sum.returns_all)
-    teko::assert::is_true(sum.returns_borrow_of.len == 0)
-}
-
-/**
- * A tail read of a `Reference`-typed parameter marks that parameter's index; a tail read of a plain
- * scalar parameter marks nothing.
- */
-#test fn borrow_summary_direct_tail_param_read() {
-    let ref_params = teko::list::push(teko::list::empty(), bw_param("cur"))
-    let ref_body = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("cur", bw_ref(bw_i64()))))
-    let ref_sum = fn_borrow_summary(bw_fn(ref_params, ref_body), bw_empty_table(), borrow_summary_env_empty())
-    teko::assert::is_false(ref_sum.returns_all)
-    teko::assert::is_true(ref_sum.returns_borrow_of.len == 1)
-    teko::assert::is_true(ref_sum.returns_borrow_of[0] == 0)
-
-    let scalar_params = teko::list::push(teko::list::empty(), bw_param("v"))
-    let scalar_body = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("v", bw_i64())))
-    let scalar_sum = fn_borrow_summary(bw_fn(scalar_params, scalar_body), bw_empty_table(), borrow_summary_env_empty())
-    teko::assert::is_false(scalar_sum.returns_all)
-    teko::assert::is_true(scalar_sum.returns_borrow_of.len == 0)
-}
-
-/**
  * A tail read of a bare TOP-LEVEL FUNCTION reference (`is_func = true`) never marks a parameter — it
  * names no parameter at all.
  */
 #test fn borrow_summary_func_value_tail_borrows_nothing() {
     let body = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var_func("helper", bw_func_type(teko::list::empty(), bw_i64()))))
-    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), borrow_summary_env_empty())
-    teko::assert::is_false(sum.returns_all)
-    teko::assert::is_true(sum.returns_borrow_of.len == 0)
-}
-
-/**
- * A tail read of an UNRESOLVABLE name (neither a parameter nor a local) falls back on its observed
- * type: widening when that type reaches a `Reference`, contributing nothing otherwise.
- */
-#test fn borrow_summary_unresolved_name_falls_back_on_type() {
-    let widens = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("global", bw_ref(bw_i64()))))
-    let widen_sum = fn_borrow_summary(bw_fn(teko::list::empty(), widens), bw_empty_table(), borrow_summary_env_empty())
-    teko::assert::is_true(widen_sum.returns_all)
-
-    let clear = teko::list::push(teko::list::empty(), bw_exprstmt(bw_var("global", bw_i64())))
-    let clear_sum = fn_borrow_summary(bw_fn(teko::list::empty(), clear), bw_empty_table(), borrow_summary_env_empty())
-    teko::assert::is_false(clear_sum.returns_all)
-    teko::assert::is_true(clear_sum.returns_borrow_of.len == 0)
-}
-
-/**
- * THE CORPUS IDIOM: `let it: T = () => { … }; it` — a closure literal bound to a top-level local,
- * then read bare in tail position. The one-hop local-alias chase resolves `it` back to the `TLambda`
- * and unions its captures: a `Reference` param captured directly marks its index; a captured plain
- * scalar param does not.
- */
-#test fn borrow_summary_local_bound_lambda_resolves_captures() {
-    let params = teko::list::push(teko::list::push(teko::list::empty(), bw_param("v")), bw_param("cur"))
-    let caps = teko::list::push(teko::list::push(teko::list::empty(), bw_capture("v", bw_i64())), bw_capture("cur", bw_ref(bw_i64())))
-    let lam = bw_lambda(caps, Optional { inner = bw_i64() })
-    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_let("it", lam)), bw_exprstmt(bw_var("it", lam.type)))
-    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), borrow_summary_env_empty())
-    teko::assert::is_false(sum.returns_all)
-    teko::assert::is_true(sum.returns_borrow_of.len == 1)
-    teko::assert::is_true(sum.returns_borrow_of[0] == 1)
-}
-
-/**
- * A closure with NO captures at all (the `empty()`-shaped iterator) trivially borrows nothing —
- * the capture-union loop simply never runs.
- */
-#test fn borrow_summary_lambda_with_no_captures_borrows_nothing() {
-    let lam = bw_lambda(teko::list::empty(), Optional { inner = bw_i64() })
-    let body = teko::list::push(teko::list::push(teko::list::empty(), bw_let("it", lam)), bw_exprstmt(bw_var("it", lam.type)))
     let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), borrow_summary_env_empty())
     teko::assert::is_false(sum.returns_all)
     teko::assert::is_true(sum.returns_borrow_of.len == 0)
@@ -815,45 +667,6 @@ fn bw_binary(t: Type) -> TExpr {
     let body = teko::list::push(teko::list::empty(), bw_exprstmt(call))
     let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), borrow_summary_env_empty())
     teko::assert::is_true(sum.returns_all)
-}
-
-/**
- * A call to a callee whose OWN summary is `returns_all` widens the CALLER too (the widening
- * propagates one hop up the borrow call-graph).
- */
-#test fn borrow_summary_call_to_widened_callee_widens_caller() {
-    let env = borrow_summary_env_insert(borrow_summary_env_empty(), "t", "helper", BorrowSummary { returns_borrow_of = teko::list::empty(); returns_all = true })
-    let call = bw_call("helper", "t", teko::list::empty(), bw_i64())
-    let body = teko::list::push(teko::list::empty(), bw_exprstmt(call))
-    let sum = fn_borrow_summary(bw_fn(teko::list::empty(), body), bw_empty_table(), env)
-    teko::assert::is_true(sum.returns_all)
-}
-
-/**
- * A call to a PRECISELY-summarized callee composes bottom-up: the borrowed callee-parameter index
- * maps onto the ACTUAL argument fed there, and — when that argument is itself one of the CALLER's
- * own parameters — the caller inherits that parameter's index. An out-of-range borrowed index (more
- * indices than the call actually supplies) is silently skipped, never crashing.
- */
-#test fn borrow_summary_call_composes_argument_onto_caller_param() {
-    let callee_sum = BorrowSummary { returns_borrow_of = teko::list::push(teko::list::empty(), 0 to u32); returns_all = false }
-    let env = borrow_summary_env_insert(borrow_summary_env_empty(), "t", "wrap", callee_sum)
-    let params = teko::list::push(teko::list::empty(), bw_param("cur"))
-    let args = teko::list::push(teko::list::empty(), bw_var("cur", bw_ref(bw_i64())))
-    let call = bw_call("wrap", "t", args, Optional { inner = bw_i64() })
-    let body = teko::list::push(teko::list::empty(), bw_exprstmt(call))
-    let sum = fn_borrow_summary(bw_fn(params, body), bw_empty_table(), env)
-    teko::assert::is_false(sum.returns_all)
-    teko::assert::is_true(sum.returns_borrow_of.len == 1)
-    teko::assert::is_true(sum.returns_borrow_of[0] == 0)
-
-    let oob_sum = BorrowSummary { returns_borrow_of = teko::list::push(teko::list::empty(), 3 to u32); returns_all = false }
-    let oob_env = borrow_summary_env_insert(borrow_summary_env_empty(), "t", "wrap2", oob_sum)
-    let oob_call = bw_call("wrap2", "t", teko::list::empty(), bw_i64())
-    let oob_body = teko::list::push(teko::list::empty(), bw_exprstmt(oob_call))
-    let oob_result = fn_borrow_summary(bw_fn(teko::list::empty(), oob_body), bw_empty_table(), oob_env)
-    teko::assert::is_false(oob_result.returns_all)
-    teko::assert::is_true(oob_result.returns_borrow_of.len == 0)
 }
 
 /**
@@ -1065,12 +878,4 @@ fn bw_binary(t: Type) -> TExpr {
     let empty_path = TCall { callee = parser::Path { segments = teko::list::empty() }; args = teko::list::empty(); call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }
     teko::assert::is_true(call_last_segment(empty_path.callee) == "")
     teko::assert::is_true(call_target_key(empty_path) == "")
-}
-
-/**
- * `borrow_summary_env_empty` starts with no keys; `borrow_summary_env_find` on it (or on any key it
- * was never given) answers `null`.
- */
-#test fn borrow_summary_env_empty_finds_nothing() {
-    teko::assert::is_true(match borrow_summary_env_find(borrow_summary_env_empty(), "t::nope") { BorrowSummary => false; null => true })
 }

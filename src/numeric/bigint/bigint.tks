@@ -1,0 +1,656 @@
+/**
+ * src/numeric/bigint/bigint.tks (namespace 'teko::numeric::bigint') — the arbitrary-precision
+ * signed-integer engine that backs the compiler-known `bigint` surface type and its operator sugar.
+ *
+ * The `bigint` surface (`123bi` literals, `+ - * / %` and comparisons) lowers to the functions in
+ * THIS module — one runtime implementation, no doubling (the operator `+` and the library both call
+ * `add`). The engine is PURE TEKO over a `[]u64` limb vector, so it compiles under both backends and
+ * survives kill-c with zero porting (numeric-completeness design §4.4).
+ *
+ * REPRESENTATION. A `BigInt` is sign-magnitude: `neg` is the sign, `limbs` the little-endian
+ * magnitude. Each limb holds a base-2^32 "digit" (a value in `[0, 2^32)`) stored in a `u64`. The
+ * base is 2^32 — NOT 2^64 — so that a limb product `(2^32-1)^2` plus two limb-sized carries still
+ * fits a `u64` with no overflow, keeping every inner loop overflow-free regardless of the build's
+ * overflow policy. The magnitude is always normalized (no trailing zero limbs); zero is the empty
+ * limb vector with `neg = false`, so a value's sign and magnitude are canonical.
+ */
+
+/**
+ * The number of value bits per limb (the base-2^32 "digit" width). A limb stores a value in
+ * `[0, 2^32)`; two limb products plus carries stay within a `u64`, so limb arithmetic never overflows.
+ */
+const LIMB_BITS: u64 = 32
+
+/**
+ * The limb base, `2^32`. A normalized limb is strictly less than this value.
+ */
+const LIMB_BASE: u64 = 4294967296
+
+/**
+ * The limb mask, `2^32 - 1`. Bitwise-anding a `u64` with this yields its low 32 bits (one limb).
+ */
+const LIMB_MASK: u64 = 4294967295
+
+/**
+ * The decimal radix, used by `parse`/`to_str` for base-10 conversion.
+ */
+const DEC_RADIX: u64 = 10
+
+/**
+ * Arbitrary-precision signed integer. Sign-magnitude, little-endian base-2^32 limbs, value-semantic
+ * and immutable (every operation returns a fresh value). NOT a machine scalar — the compiler-known
+ * `bigint` surface name resolves to this struct.
+ */
+pub type BigInt = struct {
+    /** The sign — `true` for a strictly negative value; always `false` for zero. */
+    neg: bool
+    /** The magnitude as little-endian base-2^32 limbs, normalized (no trailing zero limbs); the empty vector is zero. */
+    limbs: []u64
+}
+
+/**
+ * A magnitude quotient/remainder pair, the result of general (bit-by-bit) long division.
+ */
+type MagDivMod = struct {
+    /** The quotient magnitude. */
+    q: []u64
+    /** The remainder magnitude. */
+    r: []u64
+}
+
+/**
+ * A magnitude quotient plus a small (single-limb) remainder, the result of dividing by a divisor
+ * that fits one limb (used by `to_str` for base-10 extraction).
+ */
+type SmallDivMod = struct {
+    /** The quotient magnitude. */
+    q: []u64
+    /** The remainder, a value in `[0, divisor)`. */
+    r: u64
+}
+
+/**
+ * A fresh `[]u64` of length `n` with every limb zero. The buffer is newly allocated (never aliased),
+ * so the caller may index-assign into it safely.
+ *
+ * @param n  the number of zero limbs
+ * @return   a length-`n` zero-filled limb vector
+ */
+fn zeros(n: u64) -> []u64 {
+    mut out: []u64 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = teko::list::push(out, 0)
+        i = i + 1
+    }
+    out
+}
+
+/**
+ * A single power-of-two bit mask `1 << pos` as a `u64` (a typed `1` so the shift result is `u64`,
+ * not the default `i64`).
+ *
+ * @param pos  the bit position, in `[0, 64)`
+ * @return     `1 << pos` as a `u64`
+ */
+fn bit_mask(pos: u64) -> u64 {
+    let one: u64 = 1
+    one << pos
+}
+
+/**
+ * Strip trailing (high) zero limbs so the magnitude is canonical. Returns the input unchanged when it
+ * already has no trailing zeros; otherwise a fresh trimmed copy.
+ *
+ * @param limbs  a (possibly denormalized) magnitude
+ * @return       the same magnitude with trailing zero limbs removed
+ */
+fn mag_norm(limbs: []u64) -> []u64 {
+    mut n = limbs.len
+    loop {
+        if n == 0 { break }
+        if limbs[n - 1] != 0 { break }
+        n = n - 1
+    }
+    if n == limbs.len { return limbs }
+    mut out: []u64 = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = teko::list::push(out, limbs[i])
+        i = i + 1
+    }
+    out
+}
+
+/**
+ * Is this normalized magnitude zero (the empty limb vector)?
+ *
+ * @param a  a normalized magnitude
+ * @return   `true` iff every limb is zero
+ */
+fn mag_is_zero(a: []u64) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != 0 { return false }
+        i = i + 1
+    }
+    true
+}
+
+/**
+ * Compare two normalized magnitudes.
+ *
+ * @param a  the left magnitude (normalized)
+ * @param b  the right magnitude (normalized)
+ * @return   `1` if `a > b`, `-1` if `a < b`, `0` if equal
+ */
+fn mag_cmp(a: []u64, b: []u64) -> i64 {
+    if a.len != b.len {
+        if a.len > b.len { return 1 }
+        return -1
+    }
+    mut i = a.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        if a[i] != b[i] {
+            if a[i] > b[i] { return 1 }
+            return -1
+        }
+    }
+    0
+}
+
+/**
+ * Add two magnitudes (base-2^32 schoolbook addition with carry).
+ *
+ * @param a  the left magnitude
+ * @param b  the right magnitude
+ * @return   the normalized sum magnitude
+ */
+fn mag_add(a: []u64, b: []u64) -> []u64 {
+    let n = if a.len > b.len { a.len } else { b.len }
+    mut out: []u64 = teko::list::empty()
+    mut carry: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= n { break }
+        mut s = carry
+        if i < a.len { s = s + a[i] }
+        if i < b.len { s = s + b[i] }
+        out = teko::list::push(out, s & LIMB_MASK)
+        carry = s >> LIMB_BITS
+        i = i + 1
+    }
+    if carry != 0 { out = teko::list::push(out, carry) }
+    mag_norm(out)
+}
+
+/**
+ * Subtract magnitude `b` from magnitude `a`, requiring `a >= b` (base-2^32 schoolbook subtraction
+ * with borrow). Callers guarantee the ordering.
+ *
+ * @param a  the minuend magnitude (must be >= `b`)
+ * @param b  the subtrahend magnitude
+ * @return   the normalized difference magnitude
+ */
+fn mag_sub(a: []u64, b: []u64) -> []u64 {
+    mut out: []u64 = teko::list::empty()
+    mut borrow: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        let ai = a[i]
+        mut sub = borrow
+        if i < b.len { sub = sub + b[i] }
+        if ai >= sub {
+            out = teko::list::push(out, ai - sub)
+            borrow = 0
+        } else {
+            out = teko::list::push(out, ai + LIMB_BASE - sub)
+            borrow = 1
+        }
+        i = i + 1
+    }
+    mag_norm(out)
+}
+
+/**
+ * Multiply two magnitudes (base-2^32 schoolbook multiplication). The accumulator is a fresh
+ * zero-filled buffer of size `len(a)+len(b)`; every limb stays below 2^32 (carries are propagated
+ * immediately), so the `u64` accumulator never overflows.
+ *
+ * @param a  the left magnitude
+ * @param b  the right magnitude
+ * @return   the normalized product magnitude
+ */
+fn mag_mul(a: []u64, b: []u64) -> []u64 {
+    if a.len == 0 { return teko::list::empty() }
+    if b.len == 0 { return teko::list::empty() }
+    mut r = zeros(a.len + b.len)
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        mut carry: u64 = 0
+        mut j: u64 = 0
+        loop {
+            if j >= b.len { break }
+            let cur = r[i + j] + a[i] * b[j] + carry
+            r[i + j] = cur & LIMB_MASK
+            carry = cur >> LIMB_BITS
+            j = j + 1
+        }
+        mut k = i + b.len
+        loop {
+            if carry == 0 { break }
+            let cur2 = r[k] + carry
+            r[k] = cur2 & LIMB_MASK
+            carry = cur2 >> LIMB_BITS
+            k = k + 1
+        }
+        i = i + 1
+    }
+    mag_norm(r)
+}
+
+/**
+ * The bit length of a normalized magnitude — the position of its highest set bit plus one, or 0 for
+ * zero.
+ *
+ * @param a  a magnitude
+ * @return   the number of significant bits
+ */
+fn mag_bitlen(a: []u64) -> u64 {
+    let n = mag_norm(a)
+    if n.len == 0 { return 0 }
+    let hi = n[n.len - 1]
+    mut bits: u64 = 0
+    mut v = hi
+    loop {
+        if v == 0 { break }
+        bits = bits + 1
+        v = v >> 1
+    }
+    (n.len - 1) * LIMB_BITS + bits
+}
+
+/**
+ * Read bit `i` of a magnitude (bit 0 is the least significant).
+ *
+ * @param a  the magnitude
+ * @param i  the bit index
+ * @return   the bit value, `0` or `1`
+ */
+fn mag_bit(a: []u64, i: u64) -> u64 {
+    let limb = i / LIMB_BITS
+    let pos = i % LIMB_BITS
+    if limb >= a.len { return 0 }
+    (a[limb] >> pos) & 1
+}
+
+/**
+ * Shift a magnitude left by one bit (multiply by two).
+ *
+ * @param a  the magnitude
+ * @return   the normalized doubled magnitude
+ */
+fn mag_shl1(a: []u64) -> []u64 {
+    mut out: []u64 = teko::list::empty()
+    mut carry: u64 = 0
+    mut i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        let v = ((a[i] << 1) & LIMB_MASK) | carry
+        out = teko::list::push(out, v)
+        carry = (a[i] >> (LIMB_BITS - 1)) & 1
+        i = i + 1
+    }
+    if carry != 0 { out = teko::list::push(out, carry) }
+    mag_norm(out)
+}
+
+/**
+ * Set bit `i` of a magnitude, growing it if needed. Builds a fresh buffer (never mutates the input),
+ * so no caller's magnitude is aliased.
+ *
+ * @param a  the magnitude
+ * @param i  the bit index to set
+ * @return   a fresh magnitude equal to `a` with bit `i` set
+ */
+fn mag_setbit(a: []u64, i: u64) -> []u64 {
+    let limb = i / LIMB_BITS
+    let pos = i % LIMB_BITS
+    let need = limb + 1
+    let n = if a.len > need { a.len } else { need }
+    mut out = zeros(n)
+    mut j: u64 = 0
+    loop {
+        if j >= a.len { break }
+        out[j] = a[j]
+        j = j + 1
+    }
+    out[limb] = out[limb] | bit_mask(pos)
+    mag_norm(out)
+}
+
+/**
+ * Divide a magnitude by a single-limb divisor (`d < 2^32`), returning the quotient magnitude and the
+ * remainder. Used by `to_str` for base-10 digit extraction.
+ *
+ * @param a  the dividend magnitude
+ * @param d  the divisor, a value in `(0, 2^32)`
+ * @return   the quotient magnitude and the remainder in `[0, d)`
+ */
+fn mag_divmod_small(a: []u64, d: u64) -> SmallDivMod {
+    mut q = zeros(a.len)
+    mut r: u64 = 0
+    mut i = a.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        let cur = (r << LIMB_BITS) | a[i]
+        q[i] = cur / d
+        r = cur % d
+    }
+    SmallDivMod { q = mag_norm(q); r = r }
+}
+
+/**
+ * Divide magnitude `a` by nonzero magnitude `b` (bit-by-bit long division). The caller guarantees
+ * `b` is nonzero.
+ *
+ * @param a  the dividend magnitude
+ * @param b  the divisor magnitude (nonzero)
+ * @return   the quotient and remainder magnitudes
+ */
+fn mag_divmod(a: []u64, b: []u64) -> MagDivMod {
+    let n = mag_bitlen(a)
+    mut q: []u64 = teko::list::empty()
+    mut r: []u64 = teko::list::empty()
+    mut i = n
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        r = mag_shl1(r)
+        if mag_bit(a, i) == 1 { r = mag_setbit(r, 0) }
+        if mag_cmp(r, b) >= 0 {
+            r = mag_sub(r, b)
+            q = mag_setbit(q, i)
+        }
+    }
+    MagDivMod { q = mag_norm(q); r = mag_norm(r) }
+}
+
+/**
+ * Build a magnitude holding a single `u64` value (split across at most two base-2^32 limbs).
+ *
+ * @param v  the value
+ * @return   the normalized magnitude of `v`
+ */
+fn one_limb(v: u64) -> []u64 {
+    if v == 0 { return teko::list::empty() }
+    let lo = v & LIMB_MASK
+    let hi = v >> LIMB_BITS
+    mut out = teko::list::push(teko::list::empty(), lo)
+    if hi != 0 { out = teko::list::push(out, hi) }
+    out
+}
+
+/**
+ * Construct a normalized `BigInt` from a sign and a magnitude. The magnitude is normalized and, when
+ * it is zero, the sign is forced to `false` so zero has one canonical form.
+ *
+ * @param neg    the desired sign
+ * @param limbs  the magnitude (need not be pre-normalized)
+ * @return       the canonical `BigInt`
+ */
+fn mk(neg: bool, limbs: []u64) -> BigInt {
+    let n = mag_norm(limbs)
+    if n.len == 0 { return BigInt { neg = false; limbs = n } }
+    BigInt { neg = neg; limbs = n }
+}
+
+/**
+ * The zero `BigInt`.
+ *
+ * @return  `0`
+ */
+pub fn zero() -> BigInt {
+    BigInt { neg = false; limbs = teko::list::empty() }
+}
+
+/**
+ * The unit `BigInt`.
+ *
+ * @return  `1`
+ */
+pub fn one() -> BigInt {
+    mk(false, one_limb(1))
+}
+
+/**
+ * Is this value zero?
+ *
+ * @param x  the value
+ * @return   `true` iff `x == 0`
+ */
+pub fn is_zero(x: BigInt) -> bool {
+    mag_is_zero(x.limbs)
+}
+
+/**
+ * Convert a machine `i64` to a `BigInt`. Handles `i64::MIN` (whose magnitude has no `i64`
+ * counterpart) by taking the magnitude in `i128`.
+ *
+ * @param n  the machine integer
+ * @return   `n` as a `BigInt`
+ */
+pub fn of(n: i64) -> BigInt {
+    if n == 0 { return zero() }
+    let neg = n < 0
+    let mag128: i128 = if neg { 0 - (n to i128) } else { n to i128 }
+    mk(neg, one_limb(mag128 to u64))
+}
+
+/**
+ * Parse a decimal string into a `BigInt`. Accepts an optional leading `+`/`-`, decimal digits, and
+ * `_` group separators. Returns an error for an empty string or an invalid character.
+ *
+ * @param s  the decimal text
+ * @return   the parsed value, or an error describing the malformed input
+ * @throws   when `s` is empty, carries no digit, or contains a non-decimal character
+ */
+pub fn from_str(s: str) -> BigInt | error {
+    if s.len == 0 { return error { message = "bigint::parse: empty string" } }
+    mut i: u64 = 0
+    mut neg = false
+    if s[0] == b'-' { neg = true; i = 1 } else { if s[0] == b'+' { i = 1 } }
+    let ten = one_limb(DEC_RADIX)
+    mut mag: []u64 = teko::list::empty()
+    mut saw_digit = false
+    loop {
+        if i >= s.len { break }
+        let c = s[i]
+        if c == b'_' { i = i + 1; continue }
+        if c < b'0' || c > b'9' { return error { message = "bigint::parse: invalid decimal digit" } }
+        let d = (c to u64) - (b'0' to u64)
+        mag = mag_add(mag_mul(mag, ten), one_limb(d))
+        saw_digit = true
+        i = i + 1
+    }
+    if !saw_digit { return error { message = "bigint::parse: no digits" } }
+    mk(neg, mag)
+}
+
+/**
+ * Parse a literal digit string (the numeric text a `bi` literal desugars to) into a `BigInt`. The
+ * lexer guarantees the text is a valid decimal literal, so this never fails in practice; a malformed
+ * input panics rather than returning an error (the surface never produces one).
+ *
+ * @param s  the literal decimal text (no suffix)
+ * @return   the parsed value
+ */
+pub fn of_lit(s: str) -> BigInt {
+    match from_str(s) {
+        BigInt as b => b
+        error as e => panic(e.message)
+    }
+}
+
+/**
+ * Render a `BigInt` to its canonical decimal string (a leading `-` for a negative value, no leading
+ * zeros, `"0"` for zero).
+ *
+ * @param x  the value
+ * @return   the decimal text
+ */
+pub fn to_str(x: BigInt) -> str {
+    if is_zero(x) { return "0" }
+    mut digs: []byte = teko::list::empty()
+    mut m = x.limbs
+    loop {
+        if mag_is_zero(m) { break }
+        let dm = mag_divmod_small(m, DEC_RADIX)
+        digs = teko::list::push(digs, ((b'0' to u64) + dm.r) to byte)
+        m = dm.q
+    }
+    mut out: []byte = teko::list::empty()
+    if x.neg { out = teko::list::push(out, b'-') }
+    mut i = digs.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        out = teko::list::push(out, digs[i])
+    }
+    match teko::str::str_from_utf8(out) {
+        str as s => s
+        error => ""
+    }
+}
+
+/**
+ * Negate a `BigInt` (zero is unchanged).
+ *
+ * @param x  the value
+ * @return   `-x`
+ */
+pub fn neg(x: BigInt) -> BigInt {
+    if is_zero(x) { return zero() }
+    mk(!x.neg, x.limbs)
+}
+
+/**
+ * The magnitude (absolute value) of a `BigInt`.
+ *
+ * @param x  the value
+ * @return   `|x|`
+ */
+pub fn abs(x: BigInt) -> BigInt {
+    mk(false, x.limbs)
+}
+
+/**
+ * Add two `BigInt`s. Same signs add magnitudes; opposite signs subtract the smaller magnitude from
+ * the larger and take the larger's sign.
+ *
+ * @param a  the left addend
+ * @param b  the right addend
+ * @return   `a + b`
+ */
+pub fn add(a: BigInt, b: BigInt) -> BigInt {
+    if a.neg == b.neg { return mk(a.neg, mag_add(a.limbs, b.limbs)) }
+    let c = mag_cmp(a.limbs, b.limbs)
+    if c == 0 { return zero() }
+    if c > 0 { return mk(a.neg, mag_sub(a.limbs, b.limbs)) }
+    mk(b.neg, mag_sub(b.limbs, a.limbs))
+}
+
+/**
+ * Subtract `b` from `a`.
+ *
+ * @param a  the minuend
+ * @param b  the subtrahend
+ * @return   `a - b`
+ */
+pub fn sub(a: BigInt, b: BigInt) -> BigInt {
+    add(a, neg(b))
+}
+
+/**
+ * Multiply two `BigInt`s. The sign is the XOR of the operand signs; a zero product is canonical zero.
+ *
+ * @param a  the left factor
+ * @param b  the right factor
+ * @return   `a * b`
+ */
+pub fn mul(a: BigInt, b: BigInt) -> BigInt {
+    mk(a.neg != b.neg, mag_mul(a.limbs, b.limbs))
+}
+
+/**
+ * Truncating integer division `a / b` (quotient rounded toward zero). Panics on a zero divisor.
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return   the truncated quotient
+ */
+pub fn div(a: BigInt, b: BigInt) -> BigInt {
+    if is_zero(b) { panic("bigint::div: division by zero") }
+    let dm = mag_divmod(a.limbs, b.limbs)
+    mk(a.neg != b.neg, dm.q)
+}
+
+/**
+ * Remainder `a % b` with the sign of the dividend (truncated-division convention, matching the
+ * machine-int `%`). Panics on a zero divisor.
+ *
+ * @param a  the dividend
+ * @param b  the divisor
+ * @return   the remainder, with the sign of `a`
+ */
+pub fn rem(a: BigInt, b: BigInt) -> BigInt {
+    if is_zero(b) { panic("bigint::rem: division by zero") }
+    let dm = mag_divmod(a.limbs, b.limbs)
+    mk(a.neg, dm.r)
+}
+
+/**
+ * Three-way compare of two `BigInt`s.
+ *
+ * @param a  the left value
+ * @param b  the right value
+ * @return   `1` if `a > b`, `-1` if `a < b`, `0` if equal
+ */
+pub fn cmp(a: BigInt, b: BigInt) -> i64 {
+    if a.neg != b.neg {
+        if a.neg { return -1 }
+        return 1
+    }
+    let mc = mag_cmp(a.limbs, b.limbs)
+    if a.neg { return 0 - mc }
+    mc
+}
+
+/**
+ * Value equality of two `BigInt`s.
+ *
+ * @param a  the left value
+ * @param b  the right value
+ * @return   `true` iff `a == b`
+ */
+pub fn eq(a: BigInt, b: BigInt) -> bool {
+    cmp(a, b) == 0
+}
+
+/**
+ * Is this value strictly negative? (Zero is never negative — it is canonicalized to a clear sign.)
+ *
+ * @param x  the value
+ * @return   `true` iff `x < 0`
+ */
+pub fn is_neg(x: BigInt) -> bool {
+    x.neg
+}

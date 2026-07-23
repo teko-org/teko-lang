@@ -1,0 +1,63 @@
+/**
+ * Narrow a `Ref<i32> | null` local to its bare `Ref<i32>` member and read the referent, or a
+ * distinct sentinel on the `null` arm. The deref happens ONLY inside the narrowed `match` arm — the
+ * C5 fence rejects `r.value` on the un-narrowed union.
+ *
+ * @param r  the optional-reference local to discriminate
+ * @param absent_sentinel  the value contributed when `r` is `null`
+ * @return   the referent when present, else `absent_sentinel`
+ */
+fn narrowed_read(r: Ref<i32> | null, absent_sentinel: i32) -> i32 {
+    mut out: i32 = 0
+    match r {
+        null => out = absent_sentinel
+        Ref<i32> as rr => out = rr.value
+    }
+    out
+}
+
+/**
+ * Bind a PRESENT `Ref<i32> | null` LOCAL from a borrow (`&x`) and read it narrowed — the C5
+ * local-binding relaxation under test (a `Ref<T> | null` local was rejected in C3).
+ *
+ * @return  the referent value 7
+ */
+pub fn probe_present_local() -> i32 {
+    mut x: i32 = 7
+    let r: Ref<i32> | null = &x
+    narrowed_read(r, 100)
+}
+
+/**
+ * Bind an ABSENT `Ref<i32> | null` LOCAL (`null` borrows nothing, admitted without an outlives
+ * proof) and read the sentinel arm.
+ *
+ * @return  the absent sentinel 5
+ */
+pub fn probe_absent_local() -> i32 {
+    let r: Ref<i32> | null = null
+    narrowed_read(r, 5)
+}
+
+/**
+ * Round-trip a present ref local through a second referent (`&y`, y=13) to exercise the borrow-spine
+ * outlives proof on a distinct cell.
+ *
+ * @return  the referent value 13
+ */
+pub fn probe_present_helper() -> i32 {
+    mut y: i32 = 13
+    let r: Ref<i32> | null = &y
+    narrowed_read(r, 200)
+}
+
+/**
+ * Round-trip a second absent ref local, contributing a distinct sentinel so a miscompiled arm shifts
+ * the exit code.
+ *
+ * @return  the absent sentinel 9
+ */
+pub fn probe_absent_helper() -> i32 {
+    let r: Ref<i32> | null = null
+    narrowed_read(r, 9)
+}

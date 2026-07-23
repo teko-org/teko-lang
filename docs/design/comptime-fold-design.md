@@ -516,7 +516,7 @@ independently gate-able; ritual points (full gate) marked **[RITUAL]**.
 | # | Crumb | Size | Ritual of proof |
 |---|---|---|---|
 | **CF1** | `comptime_fold.tks` skeleton: `ConstValue` domain + `eval_const` for Tier 0–2 scalars (literals, cast, unary `~`/`-`, binary `+ - * / % & | ^ << >>`) with overflow/÷0/out-of-range → located compile error. Pure; no wiring yet. | **M** | `comptime_fold_test.tkt`: unit-assert `eval_const` on a value matrix (each int family min/max/wrap-edge, ÷0, out-of-range cast → error). Build green. |
-| **CF2** | `literal_of` + `fold_expr` (Tier 0–5 driver) wired into `inline_consts` AFTER reference-substitution. Module consts now fold their op-trees to literals. | **S/M** | **[RITUAL]** fixpoint gen2==gen3 GREEN vs **new** golden (fold changes emitted bytes — §9); VM==native differential on a folding corpus; 100% coverage of the CF1/CF2 delta. |
+| **CF2** | `literal_of` + `fold_expr` (Tier 0–5 driver) wired into `inline_consts` AFTER reference-substitution. Module consts now fold their op-trees to literals. | **S/M** | **[RITUAL]** fixpoint gen1==gen2 GREEN vs **new** golden (fold changes emitted bytes — §9); VM==native differential on a folding corpus; 100% coverage of the CF1/CF2 delta. |
 | **CF3** | Layer 1b: per-fn pre-pass seeding provably-const LOCAL `let`/`const` bindings into the fold env; guard skips any runtime-valued binding (DECISION_LOG:391). | **M** | **[RITUAL]** fixpoint GREEN vs new golden; fixtures E/F (runtime binding NOT folded) exit-code identical VM+native; boundary coverage. |
 | **CF4** | Layer 1c: `eval_const` handles `TIndex` of const aggregate + const index (+ str→[]byte coercion). **Coordinate with AL0 Tier-6 — do not double-ship (§5).** | **S** | fixture D folds; `TIndex` with runtime index/receiver stays runtime; VM==native. |
 | **CF5** | Layer 2: `comptime_format` (mirror `teko_rt.c`) + `fold_interp`; `inline_rw_interp` delegates its final step. + the **format-oracle** differential fixture. | **M** | **[RITUAL]** fixpoint GREEN vs new golden; **format-oracle exhaustive fixture** (§8) byte-identical; VM==native on `$"{a:X}"`-class programs; coverage. |
@@ -575,7 +575,7 @@ against the wrong baseline.
 1. **Re-golden**: capture the folded output as the new golden; review the diff is
    *only* runtime-op-elimination (concat/format/op-tree → literal), never an observable
    change.
-2. **Fixpoint gen2==gen3 GREEN against the new golden**: the compiler, compiled by
+2. **Fixpoint gen1==gen2 GREEN against the new golden**: the compiler, compiled by
    itself, still reaches a fixed point — self-stability preserved *with* the fold on.
 3. **VM==native differential**: the folded program's observable output (exit code +
    printed bytes) is identical on both engines, and identical to the unfolded twin.
@@ -920,7 +920,7 @@ fn cf_can_index(ix: TIndex, agg: AggConstMap) -> bool
 | # | Crumb | Size | Ritual of proof |
 |---|---|---|---|
 | **CF4a** | `cv_agg` + `AggConstMap` alias + `eval_array_agg` + `eval_index_expr` + `eval_agg_ref` + the `eval_const` `TVar`/`TArrayLit`/`TIndex` arms + `cf_agg_value`/`cf_can_index`; thread `agg` through `eval_const`/`eval_*`. Pure evaluator, unit-testable via `eval_const` with a hand-built `AggConstMap`. **No fold wiring, no `inline_consts` change yet.** | **M** | `comptime_fold_test.tkt`: unit-assert `eval_const(G[0])` over a hand-built map → the element; out-of-range index → located error; negative index → error; runtime-index shape not admitted by `cf_can_index`. Build green. |
-| **CF4b** | Thread `agg` through the `fold_*` spine; `fold_index` gates on `cf_can_index` → eval + `fold_splice`; `fold_program` takes `agg`; `inline_consts` builds it via `build_module_agg_map`. Extend `cf_int_value` with the `TIndex` arm (full collapse of an enclosing cast). | **M** | **[RITUAL]** fixpoint gen2==gen3 byte-identical vs **new** golden (fold changes emit bytes — §9.1, only index-elimination); VM==native differential; fixture D + negatives green; 100% coverage of the CF4a/CF4b delta; `seed_from_dep_qualified_value_const_and_fn` still green (§13.4). |
+| **CF4b** | Thread `agg` through the `fold_*` spine; `fold_index` gates on `cf_can_index` → eval + `fold_splice`; `fold_program` takes `agg`; `inline_consts` builds it via `build_module_agg_map`. Extend `cf_int_value` with the `TIndex` arm (full collapse of an enclosing cast). | **M** | **[RITUAL]** fixpoint gen1==gen2 byte-identical vs **new** golden (fold changes emit bytes — §9.1, only index-elimination); VM==native differential; fixture D + negatives green; 100% coverage of the CF4a/CF4b delta; `seed_from_dep_qualified_value_const_and_fn` still green (§13.4). |
 | **CF4c** | *(optional, ratification-gated — §13.1(2)/(3))* `CVBytes`/`CVAgg` `literal_of` + `str→[]byte` const coercion + `TStructInit` `eval_agg`. | **S** | fixtures for the struct-field / str-slice cases; same RITUAL if it lands same-seed. |
 
 ### 13.4 How the sequence keeps `seed_from_dep_qualified_value_const_and_fn` green
@@ -977,7 +977,7 @@ sites gain the `agg` argument (mechanical).
 ### 13.6 Ritual points
 
 - **CF4a** — build-green + unit `.tkt` suite (pure evaluator; no emit change, no RITUAL).
-- **CF4b — [RITUAL]:** fixpoint gen2==gen3 byte-identical vs a **new** golden (§9.1: the
+- **CF4b — [RITUAL]:** fixpoint gen1==gen2 byte-identical vs a **new** golden (§9.1: the
   diff must be ONLY index-op elimination at const-index sites; review it); own==C
   differential unchanged; VM==native on fixture D and the negatives; 100% coverage of the
   CF4a+CF4b delta; the §13.4 regression asserted green.

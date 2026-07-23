@@ -1,0 +1,139 @@
+/**
+ * src/numeric/bigint/bigint_test.tkt (namespace 'teko::numeric::bigint') — LIVE #test coverage for
+ * the arbitrary-precision integer engine. Every path (carry/borrow across limbs, schoolbook multiply,
+ * bit-by-bit divide/mod with the truncated-division sign convention, and decimal parse/render
+ * round-trips) is exercised directly against the module's public functions.
+ */
+
+/**
+ * assert_eq_str — assert two strings are byte-equal, the workhorse of the render/round-trip checks.
+ *
+ * @param got   the produced string
+ * @param want  the expected string
+ */
+fn assert_eq_str(got: str, want: str) {
+    teko::assert::is_true(got == want)
+}
+
+/**
+ * of_and_to_str_round_trip — `of(i64)` then `to_str` renders the canonical decimal, including zero
+ * and negatives.
+ */
+#test
+fn of_and_to_str_round_trip() {
+    assert_eq_str(to_str(of(0)), "0")
+    assert_eq_str(to_str(of(1)), "1")
+    assert_eq_str(to_str(of(12345)), "12345")
+    assert_eq_str(to_str(of(-99)), "-99")
+    assert_eq_str(to_str(of(9223372036854775807)), "9223372036854775807")
+    assert_eq_str(to_str(of(-9223372036854775807 - 1)), "-9223372036854775808")
+}
+
+/**
+ * from_str_round_trips_beyond_i128 — `from_str` parses values far past a machine word and `to_str`
+ * renders them back exactly (multi-limb magnitudes).
+ */
+#test
+fn from_str_round_trips_beyond_i128() {
+    assert_eq_str(to_str(of_lit("18446744073709551616")), "18446744073709551616")
+    assert_eq_str(to_str(of_lit("340282366920938463463374607431768211456")), "340282366920938463463374607431768211456")
+    assert_eq_str(to_str(of_lit("-100000000000000000000000000000000")), "-100000000000000000000000000000000")
+    assert_eq_str(to_str(of_lit("1_000_000")), "1000000")
+    assert_eq_str(to_str(of_lit("007")), "7")
+}
+
+/**
+ * add_carries_across_limbs — addition propagates carries across the 2^32 limb boundary.
+ */
+#test
+fn add_carries_across_limbs() {
+    assert_eq_str(to_str(add(of_lit("4294967295"), of_lit("1"))), "4294967296")
+    assert_eq_str(to_str(add(of_lit("18446744073709551615"), of_lit("1"))), "18446744073709551616")
+    assert_eq_str(to_str(add(of_lit("99999999999999999999"), of_lit("1"))), "100000000000000000000")
+}
+
+/**
+ * sub_borrows_across_limbs — subtraction propagates borrows across the limb boundary and yields
+ * signed results.
+ */
+#test
+fn sub_borrows_across_limbs() {
+    assert_eq_str(to_str(sub(of_lit("4294967296"), of_lit("1"))), "4294967295")
+    assert_eq_str(to_str(sub(of_lit("10000000000000000000"), of_lit("1"))), "9999999999999999999")
+    assert_eq_str(to_str(sub(of(3), of(10))), "-7")
+    assert_eq_str(to_str(sub(of(10), of(10))), "0")
+}
+
+/**
+ * mul_matches_factorial_25 — repeated multiplication computes 25! exactly (a value far beyond
+ * i128), rendered as its known decimal string.
+ */
+#test
+fn mul_matches_factorial_25() {
+    mut acc = one()
+    mut i: i64 = 1
+    loop {
+        if i > 25 { break }
+        acc = mul(acc, of(i))
+        i = i + 1
+    }
+    assert_eq_str(to_str(acc), "15511210043330985984000000")
+}
+
+/**
+ * div_and_rem_truncate_toward_zero — division truncates toward zero and the remainder takes the
+ * dividend's sign (the `tk_rem` convention).
+ */
+#test
+fn div_and_rem_truncate_toward_zero() {
+    assert_eq_str(to_str(div(of(7), of(3))), "2")
+    assert_eq_str(to_str(rem(of(7), of(3))), "1")
+    assert_eq_str(to_str(div(of(-7), of(3))), "-2")
+    assert_eq_str(to_str(rem(of(-7), of(3))), "-1")
+    assert_eq_str(to_str(div(of(7), of(-3))), "-2")
+    assert_eq_str(to_str(rem(of(7), of(-3))), "1")
+    assert_eq_str(to_str(rem(of(-7), of(-3))), "-1")
+}
+
+/**
+ * div_mod_large — quotient/remainder hold across a multi-limb dividend divided by a small divisor
+ * (`q*b + r == a`, `0 <= r < b`).
+ */
+#test
+fn div_mod_large() {
+    let a = of_lit("123456789012345678901234567890")
+    let b = of(1000000)
+    let q = div(a, b)
+    let r = rem(a, b)
+    assert_eq_str(to_str(q), "123456789012345678901234")
+    assert_eq_str(to_str(r), "567890")
+    assert_eq_str(to_str(add(mul(q, b), r)), "123456789012345678901234567890")
+}
+
+/**
+ * cmp_orders_signed_values — three-way compare orders across signs and magnitudes.
+ */
+#test
+fn cmp_orders_signed_values() {
+    teko::assert::is_true(cmp(of(-5), of(3)) == -1)
+    teko::assert::is_true(cmp(of(3), of(-5)) == 1)
+    teko::assert::is_true(cmp(of(7), of(7)) == 0)
+    teko::assert::is_true(cmp(of_lit("100000000000000000000"), of_lit("99999999999999999999")) == 1)
+    teko::assert::is_true(eq(of_lit("42"), of(42)))
+}
+
+/**
+ * sum_1_to_10000_no_gc — a region-scoped accumulation loop (no-GC stress) sums 1..10000 as `bigint`
+ * and lands on the closed-form `n(n+1)/2 = 50005000`.
+ */
+#test
+fn sum_1_to_10000_no_gc() {
+    mut acc = zero()
+    mut i: i64 = 1
+    loop {
+        if i > 10000 { break }
+        acc = add(acc, of(i))
+        i = i + 1
+    }
+    assert_eq_str(to_str(acc), "50005000")
+}

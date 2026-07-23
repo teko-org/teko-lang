@@ -643,12 +643,15 @@ fn interp_bin(rf: RegFile, inst: LInst, b: LBin, mem: MemStore) -> IStep {
 }
 
 /** eval_bin — the arithmetic of an integer LBinOp over the i128 carrier. Signed and
-    unsigned divide/remainder/comparison all use the carrier's plain (signed) i128
+    unsigned divide/remainder/comparison/shift all use the carrier's plain (signed) i128
     operators — the N1/A1-1 fixtures are non-negative, so signed and unsigned agree, exactly
-    like eval_div/eval_rem's existing reasoning; a zero divisor honest-stops. Float
-    comparisons are declared (so the match documents every LBinOp) but honest-stop: the
-    interp carries no float VALUE yet (LConstFloat itself errors — see interp_inst). Bitwise/
-    shift ops remain out of the run subset (N2). */
+    like eval_div/eval_rem's existing reasoning; a zero divisor honest-stops. The bitwise ops
+    (IAnd/IOr/IXor) are pure two's-complement bit operations, exact on the carrier for any
+    in-range operand; the shifts (IShl/IShrS/IShrU) shift on the carrier — width masking of a
+    narrow-type result is deferred to the phase that runs narrow types (mirroring eval_un's
+    ZExt/SExt/Trunc identity). Float comparisons are declared (so the match documents every
+    LBinOp) but honest-stop: the interp carries no float VALUE yet (LConstFloat itself errors
+    — see interp_inst). */
 fn eval_bin(op: LBinOp, a: i128, b: i128) -> EvalOut {
     match op {
         IAdd => eval_ok(a + b)
@@ -658,6 +661,12 @@ fn eval_bin(op: LBinOp, a: i128, b: i128) -> EvalOut {
         IDivU => eval_div(a, b)
         IRemS => eval_rem(a, b)
         IRemU => eval_rem(a, b)
+        IAnd => eval_ok(a & b)
+        IOr => eval_ok(a | b)
+        IXor => eval_ok(a ^ b)
+        IShl => eval_ok(a << b)
+        IShrS => eval_ok(a >> b)
+        IShrU => eval_ok(a >> b)
         ICmpEq => eval_ok(bool_to_i128(a == b))
         ICmpNe => eval_ok(bool_to_i128(a != b))
         ICmpLtS => eval_ok(bool_to_i128(a < b))
@@ -708,12 +717,15 @@ fn interp_un(rf: RegFile, inst: LInst, u: LUn, mem: MemStore) -> IStep {
     istep_cont(rf_set(rf, inst.result, r.value), mem)
 }
 
-/** eval_un — the arithmetic of an integer LUnOp: INeg negates; ZExt/SExt/Trunc are the
-    identity over the carrier (the fixtures' casts stay within i128); a float unary honest-
-    stops. */
+/** eval_un — the arithmetic of an integer LUnOp: INeg negates; INot is the bitwise
+    one's-complement (`~a`) over the carrier — exact for a signed operand and any non-negative
+    in-range value, with narrow-unsigned width masking deferred exactly as the cast identities
+    below defer it; ZExt/SExt/Trunc are the identity over the carrier (the fixtures' casts stay
+    within i128); a float unary honest-stops. */
 fn eval_un(op: LUnOp, a: i128) -> EvalOut {
     match op {
         INeg => eval_ok(-a)
+        INot => eval_ok(~a)
         ZExt => eval_ok(a)
         SExt => eval_ok(a)
         Trunc => eval_ok(a)

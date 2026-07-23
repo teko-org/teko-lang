@@ -4,7 +4,7 @@
 **Parents:** `docs/design/onda3-monomorphization-cluster.md`, `docs/design/drain-onda3-subcluster-A.md` (K-A: #290→#301→#254→#294, all landed). This is the K-A follow-on cluster — the same mono-pass + codegen machinery, one layer deeper.
 **Trigger:** #163 (collections) shipped `List<T>` + a `str`-keyed `Map<V>` (PR #321) by WORKING AROUND these gaps (each documented verbatim in `src/collections/{list,map,collections}.tks`). The generic stack under-delivers the collections ruling (`Map<K: Hashable & Eq, V>`, `teko::env = Map<str, str?>` generically, nested generics) until these land.
 **Seed:** `teko.tkp` current. **Rule:** every snippet is full-Javadoc, `.tks`-only. C twins FROZEN (only `teko_rt.{c,h}` maintained — none needed here). **Size:** **L** — a multi-PR round, the twin of onda-3 sub-cluster A.
-**Ritual (every crumb):** full gate — gen1 `teko . -o bin` (native `#test`) + `./bin/teko test .` (VM) + FIXPOINT gen2==gen3 byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit. **The `any_generic` no-op guard (`monomorph.tks` PHASE-1/PHASE-2 gate) MUST hold — the compiler corpus has ZERO generic instances, so gen2==gen3 stays byte-identical; verify at EACH crumb, not only at the end.**
+**Ritual (every crumb):** full gate — gen1 `teko . -o bin` (native `#test`) + `./bin/teko test .` (VM) + FIXPOINT gen1==gen2 byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit. **The `any_generic` no-op guard (`monomorph.tks` PHASE-1/PHASE-2 gate) MUST hold — the compiler corpus has ZERO generic instances, so gen1==gen2 stays byte-identical; verify at EACH crumb, not only at the end.**
 
 ---
 
@@ -99,7 +99,7 @@ Wire in BOTH TCall result arms of `mono_texpr` (`monomorph.tks:568` and `:571`):
 - `examples/regressions/generic_sibling_method/` — `type Ctr<T> = class { intern n: i64; pub fn make() -> Ctr<T> { Ctr { n = 0 } }; pub fn count(self) -> i64 { self.n }; pub fn twice(self) -> i64 { self.count() + self.count() } }`; `Ctr<i64>::make().twice()` → **exit 0** (or seed `n=3` via a setter for exit 6). Fails to LINK natively today (VM passes), passes both after.
 - Fold-in note (report in PR body, do NOT silently rewrite): after #3, flip `src/collections/{list,collections}.tks`'s `arr_replace_at`/`arr_drop_at`/`arr_drop_last` from free functions back to private instance methods IF it keeps the corpus building — that IS the #163-workaround closure. Deferred to the #163-follow-up PR that adopts these fixes; keep the free-fn form until the fix is green (do not gate #3 on the collections rewrite).
 
-**Ritual:** full gate. `mono_rekey_call_ns` is a no-op for every `call_ns` the Subst does not remap (every existing call) → gen2==gen3 byte-identical.
+**Ritual:** full gate. `mono_rekey_call_ns` is a no-op for every `call_ns` the Subst does not remap (every existing call) → gen1==gen2 byte-identical.
 
 ---
 
@@ -217,7 +217,7 @@ Call it in `rekey_iface_dispatch` alongside `rekey_struct_constraint_dispatch`. 
 - `examples/regressions/type_param_hash_struct/` — a struct `Point` deriving `Hashable & Eq`, `fn h<K: Hashable>(k: K) -> u64 { k.hash() }`, `h(Point{x=1;y=2})` (proves crumb 1.4 deriver path).
 - Fold-in note (report in PR body): after #1, `teko::env` (`src/env/`) can adopt `Map<str, str?>` generically ([[teko-env-as-map]] unblocked) — DO NOT rewrite env in this PR; report the unblock.
 
-**Ritual:** full gate at EACH crumb (1.1→1.4 independently gate-able). The structural-trait interface registration is inert unless a constraint names one → gen2==gen3 byte-identical (the compiler corpus has structural DERIVERS from #177 but no structural-CONSTRAINED type params). Verify the no-op at 1.2 specifically (the widest table change).
+**Ritual:** full gate at EACH crumb (1.1→1.4 independently gate-able). The structural-trait interface registration is inert unless a constraint names one → gen1==gen2 byte-identical (the compiler corpus has structural DERIVERS from #177 but no structural-CONSTRAINED type params). Verify the no-op at 1.2 specifically (the widest table change).
 
 ---
 
@@ -246,7 +246,7 @@ if nt.args.len > 0 {
 **Fixtures (VM==native):**
 - `examples/regressions/generic_class_param/` — `type Bag<T> = class { intern xs: []T; pub fn make() -> Bag<T> { Bag { xs = teko::list::empty() } }; pub fn add(self, x: T) { self.xs = teko::list::push(self.xs, x) } }` + a FREE fn `fn size(b: Bag<i64>) -> u64 { b.xs.len }`; `let g = Bag<i64>::make(); g.add(5); size(g)` → **exit 1**. cc-rejects today (ptr/value mismatch), passes both after. Include a generic STRUCT param variant to prove structs stay by-value (no regression).
 
-**Ritual:** full gate. The compiler corpus has NO generic-instance params → the new class-pointer arm is a no-op there; gen2==gen3 byte-identical.
+**Ritual:** full gate. The compiler corpus has NO generic-instance params → the new class-pointer arm is a no-op there; gen1==gen2 byte-identical.
 
 ---
 
@@ -287,7 +287,7 @@ fn retarget_generic_static_callee(c: parser::Call, table: TypeTable, ref_ns: str
 **Fixtures (VM==native):**
 - `examples/regressions/cross_ns_generic_factory/` — namespace `coll` declares `type Stack<T> = class { … pub fn make() -> Stack<T> { … } }`; a DIFFERENT namespace calls `coll::Stack<i64>::make()` → **exit 0** (or push/len for a nonzero). Fails resolution today, passes both after.
 
-**Ritual:** full gate. Corpus factories are single-ns today → the qualified form is byte-identical for a bare-base call (the `len < 2` / qualifier-equals-ref_ns paths). gen2==gen3 preserved.
+**Ritual:** full gate. Corpus factories are single-ns today → the qualified form is byte-identical for a bare-base call (the `len < 2` / qualifier-equals-ref_ns paths). gen1==gen2 preserved.
 
 ---
 
@@ -323,7 +323,7 @@ fn nested_phantom_inst_name(nested_base: str, owner_tparams: []str) -> str { /* 
 - `examples/regressions/nested_generic_construct/` — `type Cell<T> = class { intern v: T; pub fn make(x: T) -> Cell<T> { Cell { v = x } }; pub fn read(self) -> T { self.v } }` + `type Holder<T> = class { intern c: Cell<T>; pub fn make(x: T) -> Holder<T> { Holder { c = Cell<T>::make(x) } }; pub fn get(self) -> T { self.c.read() } }`; `Holder<i64>::make(9).get()` → **exit 9**. "not visible bare" today, passes both after.
 - Fold-in note (report in PR body): after #2, `Map<V>` MAY adopt a `[]Entry<V>` single-array store (map.tks's parallel-array workaround comment is the witness) — DO NOT rewrite Map here; report the unblock. Parallel arrays remain a valid representation, so this is a nicety, not required.
 
-**Ritual:** full gate. Corpus has no nested generic constructs → the nested-phantom path is a no-op; gen2==gen3 byte-identical. This is the WIDEST edit (checker resolve + mono subst + discovery) — gate it LAST and independently.
+**Ritual:** full gate. Corpus has no nested generic constructs → the nested-phantom path is a no-op; gen1==gen2 byte-identical. This is the WIDEST edit (checker resolve + mono subst + discovery) — gate it LAST and independently.
 
 ---
 
@@ -332,7 +332,7 @@ fn nested_phantom_inst_name(nested_base: str, owner_tparams: []str) -> str { /* 
 - **D22 (constraint = monomorphization gate, NOT dynamic vtable) — the load-bearing law for #1.** The structural-trait synthetic interface (crumb 1.2, option A) must NEVER lower to a runtime `tk_vt_<K>_<Trait>` for a struct/primitive `K`; crumb 1.4 rewrites every `k.hash()`/`k.eq()` on a concrete-bound `K` to a DIRECT builtin/stamped-method call at mono. This is the SAME ruling D22 ratified for #294 structs, extended from user contracts to compiler-known structural traits — **no new owner HALT** (logged for LTS review as an extension of D22). Dynamic vtable dispatch stays class-only, unchanged.
 - **No-GC / native-authoritative (`teko-no-gc-vm-role`):** every fix is a compile-time stamp/re-key/emit change; no runtime metadata, no allocation-model change. Native is authoritative on divergence; every fixture is VM==native.
 - **OOP hard-cut interaction (D27-owner, RATIFIED 2026-07-06):** the `this`/`base`/`static` hard-cut is a PURE FRONT-END RENAME (receiver = `params[0]` positional; codegen/VM read positionally, never by name) → codegen/VM byte-identical → **orthogonal to and fixpoint-safe against every fix here** (#254/#294 needed zero change; so do these). BUT the hard-cut's mechanical codemod WILL rewrite generic-class method bodies (rename `self`→`this`). **Sequencing:** these five fixes are SEMANTIC (dispatch/emit/resolve); the hard-cut is SYNTACTIC (rename). Land the flagship chain (#3→#1) and #4/#5 on the OLD syntax (as #163 did), then let the hard-cut codemod rewrite the corpus atomically (D27-owner's plan). If the hard-cut lands FIRST, these snippets' `self` receivers become `this` — a trivial rename in the fixtures, no logic change. **No law tension.** Recommend: hard-cut BEFORE #2 (the widest, latest), so #2's new fixtures are written in the new syntax once.
-- **Risk — the structural-trait table registration (crumb 1.2) is the widest table change.** Mitigation: the five synthetic decls are INERT unless a constraint names one; the `any_generic` guard + gen2==gen3 is the loud tripwire (the compiler corpus derives structural traits from #177 but never CONSTRAINS a type param on one). Verify the no-op at crumb 1.2 in isolation before 1.3/1.4.
+- **Risk — the structural-trait table registration (crumb 1.2) is the widest table change.** Mitigation: the five synthetic decls are INERT unless a constraint names one; the `any_generic` guard + gen1==gen2 is the loud tripwire (the compiler corpus derives structural traits from #177 but never CONSTRAINS a type param on one). Verify the no-op at crumb 1.2 in isolation before 1.3/1.4.
 - **Risk — `#254 L4 Env.expected_ret` churn** (DECISION_LOG.md:245, "alta rotatividade") is ADJACENT: #2's return-position nested construct may lean on the same expected-type thread. If L4's `Env` field is still open, #2's checker crumb must set `env.expected_ret` for the nested construct's return-typed field — sequence #2 AFTER L4 is confirmed stable. Reported, not turned into a new issue.
 - **Risk — the #296 lesson (count sites, do not trust "1 crumb").** Verified counts are in the root-cause table; every fix here is 1–4 sites, re-verified at file:line. The one to eyeball hardest is #1 crumb 1.2 (three interface-plumbing sites collapse to ZERO new arms under option A — confirm `is_interface_name`/`iface_methods_by_name`/`resolve_iface_dispatch` all light up for the registered synthetic decls).
 

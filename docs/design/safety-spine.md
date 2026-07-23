@@ -219,7 +219,7 @@ fires on the dogfood corpus (verify this in slice 1b; see §C1 risk R2).
 
 ## B2.2 The crumb sequence — cheap → expensive
 
-Each slice is independently gate-able (full gate + FIXPOINT gen1==gen2==gen3 + `diff_vm_native` +
+Each slice is independently gate-able (full gate + FIXPOINT gen1==gen2 + `diff_vm_native` +
 independent review — the #330 `ADDITIVE-BUT-GATE-TOUCHING` discipline, because each RELAXES or TIGHTENS
 the accepted language). Ordered so the seed never uses a feature it cannot yet parse (all of A1–A6 are
 checker-only; no new surface except Block 1's `ref`, so the stable-seed constraint binds only Block 1).
@@ -511,7 +511,7 @@ Ref-in-field escape) — prefer that (less new code). **Dogfooding exposure:** Z
 | SP-5 | A5 | composite path all-mut + R10 | full + fixpoint + diff |
 | SP-6 | A6 | free-ownership + DI-monotonic | full + fixpoint + diff |
 
-**RITUAL POINTS (the full gate MUST pass — C-gate + self-host + native + FIXPOINT gen1==gen2==gen3 +
+**RITUAL POINTS (the full gate MUST pass — C-gate + self-host + native + FIXPOINT gen1==gen2 +
 `diff_vm_native` + 100%-new-code coverage + independent review):**
 - **SP-0** (surface change touches the parser + checker — shared).
 - **SP-3** (the transitive gate — this is where self-host either survives or reveals the iterator

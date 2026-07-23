@@ -36,7 +36,7 @@ Author: architect. Implementer executes the crumb sequence in order.
    middle of code* (conditions, indices, offsets, masks, sizes, file magic, section
    flags) must also become named `const` / `enum` / `flags`.
 4. Some families become `enum` or `flags`, not scalar `const`.
-5. Behavior-preserving, proven by **fixpoint gen2==gen3** + both-engine (VM +
+5. Behavior-preserving, proven by **fixpoint gen1==gen2** + both-engine (VM +
    native) tests + 100% coverage of the delta.
 6. **Three placements** (owner clarification 2026-07-15, from the issue body): `const`
    is placement-polymorphic — LOCAL, MODULE, and TYPE-MEMBER. See §0.1.
@@ -811,7 +811,7 @@ of the ISA encoders** `encode_x86_64.tks` (90 hits), `encode_arm64.tks` (66),
 recurring opcode / mask / field constant into `const`/`enum`/`flags` per the W15
 rule. The sweep is sequenced AFTER the feature reaches the bootstrap seed (crumbs
 1–7) so the encoders may spell `const`/`enum`/`flags`, and each file is its own
-crumb with **frozen-byte golden + fixpoint gen2==gen3 as the per-file acceptance
+crumb with **frozen-byte golden + fixpoint gen1==gen2 as the per-file acceptance
 bar** — the emitted machine bytes must not change by a single byte.
 
 Exempted even under RULING 2: a genuinely one-off opcode byte that appears exactly
@@ -841,7 +841,7 @@ decides. The `*_empty()` factories are never touched (they are not constants).
 ## 8. Ordered crumb sequence (each: step · shapes · fixtures · ritual)
 
 Each crumb is independently gate-able. The **ritual point** is where the FULL gate
-(both engines + `.tkt` + fixpoint gen2==gen3 + 100% delta coverage) must pass.
+(both engines + `.tkt` + fixpoint gen1==gen2 + 100% delta coverage) must pass.
 Bootstrap-seed rule: `const` must be usable by the corpus only *after* it lands in
 the seed — so the FEATURE crumbs (1–8) land and become part of the released seed
 BEFORE the MIGRATION crumbs (9+) and the RULING-2 encoder sweep (S*) may use
@@ -980,7 +980,7 @@ bumps are the mechanism for making each increment available to the corpus.
   minst, register consts).
 - **Fixtures:** existing per-module tests keep their exit codes; a golden asserts the
   migrated value equals the old fn's value (both engines).
-- **Ritual:** full gate per file batch (fixpoint gen2==gen3 is the real proof). Each
+- **Ritual:** full gate per file batch (fixpoint gen1==gen2 is the real proof). Each
   merge tags a `-beta` (rolling BUMP #2).
 
 ### Crumb 10 — migrate enum families (6.2)
@@ -999,7 +999,7 @@ bumps are the mechanism for making each increment available to the corpus.
 
 ### Crumbs S1–S6 — RULING-2 ISA-encoder + writer magic-value sweep (file-by-file)
 Sequenced AFTER crumb 8 (feature in seed). Each file is one crumb; the acceptance
-bar is **frozen machine/object bytes + fixpoint gen2==gen3** — not one emitted byte
+bar is **frozen machine/object bytes + fixpoint gen1==gen2** — not one emitted byte
 may change. Recurring opcode/mask/field literals → `const`/`enum`/`flags` per W15.
 - **S1** `src/backend/stackify.tks` (109 hits): wasm opcode `enum`, LEB masks →
   `const`, value-type already via `WasmVType` (crumb 10).
@@ -1045,7 +1045,7 @@ relocation absent today (§5.1), then migrates the ABI descriptors.
 ## 9. Risks + law tensions (with resolution)
 
 1. **Fixpoint risk on wire-byte migrations (enum/flags).** A discriminant or OR
-   spelling that changes an emitted byte breaks gen2==gen3 and object goldens.
+   spelling that changes an emitted byte breaks gen1==gen2 and object goldens.
    *Resolution:* route every serialized tag through a single `match`-driven `_wire`
    helper; assert byte-identity against the pre-migration goldens BEFORE changing
    logic. Never let the enum's *internal* discriminant leak to the wire.

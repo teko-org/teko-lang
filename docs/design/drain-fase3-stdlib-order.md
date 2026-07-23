@@ -356,7 +356,7 @@ its "Crumb-plan de architect entra como comentário aqui"). Summary of the 5-cru
    `StructBody` (currently `methods = empty()`); ADD a `ClassBody` arm. Gate: full ritual.
 3. **`monomorph.tks`** — new pass: per-instantiation re-type/rewrite method bodies
    (recursive, incl. self-construction `Box<T>{...}`); emit method-sets per instance in
-   BOTH codegen and VM. Gate: full ritual + fixpoint (gen2==gen3) — this is the highest-risk
+   BOTH codegen and VM. Gate: full ritual + fixpoint (gen1==gen2) — this is the highest-risk
    crumb (touches codegen AND vm).
 4. **typer return-type-as-expected** — thread declared return type as expected-context so
    `fn box_make<T>(v: T) -> Box<T> { Box { value = v } }` infers. Gate: full ritual.

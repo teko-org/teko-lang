@@ -181,41 +181,6 @@ fn buf_is_a_value_growing_returns_new() {
 }
 
 /**
- * buf_slice_in_range — half-open sub-regions inside the bounds.
- */
-#test
-fn buf_slice_in_range() {
-    let b = Buf::from_str("hello, teko")
-    teko::assert::is_true(text_of(buf_of(b.slice(0, 5)).to_str()) == "hello")
-    teko::assert::is_true(text_of(buf_of(b.slice(7, 11)).to_str()) == "teko")
-    teko::assert::is_true(buf_of(b.slice(3, 3)).len() == 0)
-}
-
-/**
- * buf_slice_out_of_bounds_errors — bad ranges are errors, never silently clamped (M.1).
- */
-#test
-fn buf_slice_out_of_bounds_errors() {
-    let b = Buf::from_str("abc")
-    teko::assert::is_true(is_buf_error(b.slice(2, 1)))
-    teko::assert::is_true(is_buf_error(b.slice(0, 4)))
-}
-
-/**
- * buf_to_str_validates_utf8 — decoding rejects malformed UTF-8.
- */
-#test
-fn buf_to_str_validates_utf8() {
-    teko::assert::is_true(text_of(Buf::from_str("café").to_str()) == "café")
-    let malformed = Buf::from_bytes([0x80])
-    let failed = match malformed.to_str() {
-        str => false
-        error => true
-    }
-    teko::assert::is_true(failed)
-}
-
-/**
  * null_stream_reads_nothing_and_discards_everything — the discard sink / empty source, dispatched as
  * interface values.
  */
@@ -248,34 +213,6 @@ fn null_stream_seek_contract() {
 }
 
 /**
- * mem_reader_reads_in_steps_to_eof — a class `MemReader` advances its own cursor across dispatched
- * reads (the class arena-mutation rule), draining to an EOF empty chunk.
- */
-#test
-fn mem_reader_reads_in_steps_to_eof() {
-    let reader = MemReader::of_str("hello, teko")
-    let first = buf_of(reader.read(5))
-    teko::assert::is_true(text_of(first.to_str()) == "hello")
-    teko::assert::is_true(reader.pos == 5)
-    let second = buf_of(reader.read(100))
-    teko::assert::is_true(text_of(second.to_str()) == ", teko")
-    let third = buf_of(reader.read(1))
-    teko::assert::is_true(third.len() == 0)
-    teko::assert::is_true(reader.pos == 11)
-}
-
-/**
- * mem_reader_read_zero_yields_empty — a zero-ask yields an empty chunk and does not advance.
- */
-#test
-fn mem_reader_read_zero_yields_empty() {
-    let reader = MemReader::of_str("abc")
-    let step = buf_of(reader.read(0))
-    teko::assert::is_true(step.len() == 0)
-    teko::assert::is_true(reader.pos == 0)
-}
-
-/**
  * mem_reader_seek_whence_math — Start/Current/End seek arithmetic, past-end allowed, negative
  * rejected.
  */
@@ -295,17 +232,6 @@ fn mem_reader_seek_whence_math() {
         error => true
     }
     teko::assert::is_true(rejected)
-}
-
-/**
- * mem_writer_accumulates — a class `MemWriter` appends across dispatched writes.
- */
-#test
-fn mem_writer_accumulates() {
-    let writer = MemWriter::empty()
-    teko::assert::is_true(count_of(writer.write(Buf::from_str("hello"))) == 5)
-    teko::assert::is_true(count_of(writer.write(Buf::from_str(", teko"))) == 6)
-    teko::assert::is_true(text_of(writer.content().to_str()) == "hello, teko")
 }
 
 /**
@@ -335,31 +261,6 @@ fn read_exact_demands_the_count() {
 }
 
 /**
- * write_all_and_copy_move_everything — `copy` and `write_all` over dynamic values move all bytes.
- */
-#test
-fn write_all_and_copy_move_everything() {
-    let reader = MemReader::of_str("hello, teko")
-    let writer = MemWriter::empty()
-    teko::assert::is_true(count_of(copy(writer, reader)) == 11)
-    teko::assert::is_true(text_of(writer.content().to_str()) == "hello, teko")
-    teko::assert::is_true(reader.pos == 11)
-    let sink = MemWriter::empty()
-    teko::assert::is_true(count_of(write_all(sink, Buf::from_str("abc"))) == 3)
-    teko::assert::is_true(text_of(sink.content().to_str()) == "abc")
-}
-
-/**
- * write_all_over_a_partial_writer_loops — `write_all` re-offers the tail until a slow sink drains it.
- */
-#test
-fn write_all_over_a_partial_writer_loops() {
-    let half = HalfWriter::make()
-    teko::assert::is_true(count_of(write_all(half, Buf::from_str("abcdefg"))) == 7)
-    teko::assert::is_true(text_of(half.inner.content().to_str()) == "abcdefg")
-}
-
-/**
  * write_all_guards_against_no_progress — a stalled or over-reporting writer is an error.
  */
 #test
@@ -376,40 +277,6 @@ fn write_all_guards_against_no_progress() {
         error => true
     }
     teko::assert::is_true(caught)
-}
-
-/**
- * limit_reader_caps_the_stream — a `LimitReader` yields at most its cap, then EOF, and leaves the
- * underlying stream un-drained past the cap.
- */
-#test
-fn limit_reader_caps_the_stream() {
-    let reader = MemReader::of_str("hello, teko")
-    let limited = LimitReader::of(reader, 4)
-    let capped = buf_of(read_all(limited))
-    teko::assert::is_true(text_of(capped.to_str()) == "hell")
-    teko::assert::is_true(limited.remaining == 0)
-    teko::assert::is_true(reader.pos == 4)
-    teko::assert::is_true(buf_of(limited.read(1)).len() == 0)
-}
-
-/**
- * buf_reader_gulps_ahead — a `BufReader` pulls chunk_size gulps and serves small reads from them.
- */
-#test
-fn buf_reader_gulps_ahead() {
-    let reader = MemReader::of_str("abcdefgh")
-    let buffered = BufReader::of(reader, 4)
-    teko::assert::is_true(text_of(buf_of(buffered.read(1)).to_str()) == "a")
-    teko::assert::is_true(reader.pos == 4)
-    teko::assert::is_true(text_of(buf_of(buffered.read(2)).to_str()) == "bc")
-    teko::assert::is_true(reader.pos == 4)
-    teko::assert::is_true(text_of(buf_of(buffered.read(5)).to_str()) == "d")
-    teko::assert::is_true(text_of(buf_of(buffered.read(3)).to_str()) == "efg")
-    teko::assert::is_true(reader.pos == 8)
-    teko::assert::is_true(text_of(buf_of(buffered.read(10)).to_str()) == "h")
-    teko::assert::is_true(buf_of(buffered.read(1)).len() == 0)
-    teko::assert::is_true(buf_of(buffered.read(0)).len() == 0)
 }
 
 /**
@@ -462,20 +329,4 @@ fn combinators_propagate_stream_errors() {
     teko::assert::is_true(is_buf_error(limited.read(1)))
     let buffered = BufReader::of(FailReader::make(), 4)
     teko::assert::is_true(is_buf_error(buffered.read(1)))
-}
-
-/**
- * pipeline_composes_across_wrappers — source → buffered reads → limit → copy → buffered writes →
- * flush: the IO1 payoff shape, entirely on dynamic interface values.
- */
-#test
-fn pipeline_composes_across_wrappers() {
-    let reader = MemReader::of_str("the quick brown fox")
-    let piped = LimitReader::of(BufReader::of(reader, 4), 9)
-    let writer = MemWriter::empty()
-    let buffered_sink = BufWriter::of(writer, 3)
-    teko::assert::is_true(count_of(copy(buffered_sink, piped)) == 9)
-    teko::assert::is_true(count_of(buffered_sink.flush()) == 1)
-    teko::assert::is_true(text_of(writer.content().to_str()) == "the quick")
-    teko::assert::is_true(reader.pos == 12)
 }

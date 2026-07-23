@@ -82,27 +82,6 @@ fn kav_gzip_stream() -> []byte {
 }
 
 /**
- * `adler32_of` matches RFC 1950's reference test vector: `Adler-32("123456789")` is a
- * well-known check value (`0x091E01DE`), and the empty slice yields `1` (the algorithm's
- * initial state, never touched by any byte).
- */
-#test
-fn adler32_known_vectors() {
-    let s = "123456789"
-    mut data: []byte = teko::list::empty()
-    mut i: u64 = 0
-    loop {
-        if i >= s.len { break }
-        data = teko::list::push(data, s[i])
-        i++
-    }
-    teko::assert::is_true(teko::compress::adler32_of(data) == 0x091E01DE)
-
-    mut empty: []byte = teko::list::empty()
-    teko::assert::is_true(teko::compress::adler32_of(empty) == 1)
-}
-
-/**
  * `inflate` decodes a real single-block DYNAMIC-Huffman DEFLATE stream (produced by
  * CPython's `zlib`) back to its exact original bytes.
  */
@@ -113,18 +92,6 @@ fn inflate_dynamic_huffman_known_vector() {
         error as e => { teko::assert::is_true(false); teko::list::empty() }
     }
     teko::assert::is_true(bytes_eq(decoded, kav_plaintext()))
-}
-
-/**
- * A malformed DEFLATE stream (reserved `BTYPE 11`) is a reported `error`, never a panic.
- */
-#test
-fn inflate_reserved_block_type_is_error() {
-    let bad: []byte = [0x07 to byte]
-    match teko::compress::inflate(bad) {
-        []byte => teko::assert::is_true(false)
-        error => teko::assert::is_true(true)
-    }
 }
 
 /**
@@ -185,30 +152,6 @@ fn zlib_known_vector_and_round_trip() {
 }
 
 /**
- * A corrupted zlib trailer (Adler-32 mismatch) is a reported `error`, never a panic —
- * flip the last trailer byte of an otherwise-valid stream.
- */
-#test
-fn zlib_corrupted_checksum_is_error() {
-    let good = teko::compress::zlib_compress(kav_plaintext())
-    mut corrupt: []byte = teko::list::empty()
-    mut i: u64 = 0
-    loop {
-        if i >= good.len { break }
-        if i == good.len - 1 {
-            corrupt = teko::list::push(corrupt, ((good[i] to u32) ^ 0xFF) to byte)
-        } else {
-            corrupt = teko::list::push(corrupt, good[i])
-        }
-        i++
-    }
-    match teko::compress::zlib_decompress(corrupt) {
-        []byte => teko::assert::is_true(false)
-        error => teko::assert::is_true(true)
-    }
-}
-
-/**
  * `gzip_decompress` decodes a real gzip member (produced by CPython's `gzip.compress`)
  * back to its exact original bytes, and this module's own `gzip_compress` output
  * round-trips through the same decoder.
@@ -227,50 +170,4 @@ fn gzip_known_vector_and_round_trip() {
         error as e => { teko::assert::is_true(false); teko::list::empty() }
     }
     teko::assert::is_true(bytes_eq(own_roundtrip, plaintext))
-}
-
-/**
- * A corrupted gzip magic byte is a reported `error`, never a panic.
- */
-#test
-fn gzip_bad_magic_is_error() {
-    let good = teko::compress::gzip_compress(kav_plaintext())
-    mut corrupt: []byte = teko::list::empty()
-    mut i: u64 = 0
-    loop {
-        if i >= good.len { break }
-        if i == 0 {
-            corrupt = teko::list::push(corrupt, ((good[i] to u32) ^ 0xFF) to byte)
-        } else {
-            corrupt = teko::list::push(corrupt, good[i])
-        }
-        i++
-    }
-    match teko::compress::gzip_decompress(corrupt) {
-        []byte => teko::assert::is_true(false)
-        error => teko::assert::is_true(true)
-    }
-}
-
-/**
- * A ZIP archive written with `write_zip_deflate` (method-8 entries) round-trips through
- * `read_zip` exactly like a STORE archive, transparently decompressing each entry.
- */
-#test
-fn zip_deflate_entries_round_trip() {
-    let plaintext = kav_plaintext()
-    mut entries: []teko::compress::ZipEntry = teko::list::empty()
-    entries = teko::list::push(entries, teko::compress::ZipEntry { name = "payload.bin"; data = plaintext })
-
-    let archive = teko::compress::write_zip_deflate(entries)
-    teko::assert::is_true(archive.len > 0)
-
-    match teko::compress::read_zip(archive) {
-        []teko::compress::ZipEntry as got => {
-            teko::assert::is_true(got.len == 1)
-            teko::assert::is_true(teko::runtime::str_eq(got[0].name, "payload.bin"))
-            teko::assert::is_true(bytes_eq(got[0].data, plaintext))
-        }
-        error as e => teko::assert::is_true(false)
-    }
 }

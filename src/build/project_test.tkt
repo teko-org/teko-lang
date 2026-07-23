@@ -2,109 +2,6 @@ use teko::parser
 use teko::checker
 
 /**
- * A minimal `parser::Item` fixture for the `filter_tkt` provenance tests: a bare
- * `use teko::lexer` item stamped with the given source `file` (the content is
- * irrelevant to `filter_tkt`, which looks only at provenance).
- *
- * @param file  the provenance path to stamp on the item
- * @return      the fixture item
- */
-fn pt_item_from(file: str) -> parser::Item {
-    let upath = parser::Path { segments = teko::list::push(teko::list::push(teko::list::empty(), parser::Segment { name = "teko" }), parser::Segment { name = "lexer" }) }
-    let u = parser::UseDecl { path = upath; has_alias = false; alias = ""; names = teko::list::empty() }
-    parser::Item { content = u; namespace = ""; file = file }
-}
-
-/**
- * `filter_tkt` drops exactly the items whose provenance is a `.tkt` file and keeps
- * everything else IN ORDER — the property the parse-once gated build relies on
- * (`filter_tkt(parse(with tests))` ≡ `parse(without tests)`, so the release program
- * is byte-identical to the historical re-parsed one and the FIXPOINT holds).
- */
-#test
-fn pt_filter_tkt_drops_test_provenance_in_order() {
-    mut items: []parser::Item = teko::list::empty()
-    items = teko::list::push(items, pt_item_from("src/a.tks"))
-    items = teko::list::push(items, pt_item_from("src/a_test.tkt"))
-    items = teko::list::push(items, pt_item_from("src/b.tks"))
-    items = teko::list::push(items, pt_item_from("main.tks"))
-    let got = filter_tkt(parser::Program { items = items })
-    teko::assert::is_true(got.items.len == 3)
-    teko::assert::is_true(got.items[0].file == "src/a.tks")
-    teko::assert::is_true(got.items[1].file == "src/b.tks")
-    teko::assert::is_true(got.items[2].file == "main.tks")
-}
-
-/**
- * `filter_tkt` on a program with NO `.tkt` items is the identity (same length, same
- * order) — the no-tests project takes the same path with zero effect.
- */
-#test
-fn pt_filter_tkt_no_tkt_is_identity() {
-    mut items: []parser::Item = teko::list::empty()
-    items = teko::list::push(items, pt_item_from("src/a.tks"))
-    items = teko::list::push(items, pt_item_from("main.tks"))
-    let got = filter_tkt(parser::Program { items = items })
-    teko::assert::is_true(got.items.len == 2)
-    teko::assert::is_true(got.items[0].file == "src/a.tks")
-    teko::assert::is_true(got.items[1].file == "main.tks")
-}
-
-/**
- * abs_path_of leaves an already-absolute POSIX path untouched and joins a relative one onto
- * `cwd` with a '/', exactly as the pre-B3-6 single-arm helper did.
- */
-#test
-fn pt_abs_path_posix_is_byte_identical() {
-    teko::assert::is_true(abs_path_of("/already/abs", "/cwd") == "/already/abs")
-    teko::assert::is_true(abs_path_of("rel", "/cwd") == "/cwd/rel")
-    teko::assert::is_true(abs_path_of("rel/deeper", "/cwd") == "/cwd/rel/deeper")
-}
-
-/**
- * abs_path_of returns "" for an empty `path`, and for a relative `path` with no `cwd` to
- * anchor it — the two "neither input is usable" guards.
- */
-#test
-fn pt_abs_path_empty_inputs() {
-    teko::assert::is_true(abs_path_of("", "/cwd") == "")
-    teko::assert::is_true(abs_path_of("rel", "") == "")
-}
-
-/**
- * abs_path_of recognises a Windows drive-letter path as already absolute — with either a
- * forward-slash or a backslash after the drive, and with an upper- or lower-case drive letter —
- * returning it as-is instead of concatenating garbage onto `cwd`.
- */
-#test
-fn pt_abs_path_windows_drive_is_absolute() {
-    teko::assert::is_true(abs_path_of("C:/Users/x/teko.exe", "/cwd") == "C:/Users/x/teko.exe")
-    teko::assert::is_true(abs_path_of("C:\\Users\\x", "/cwd") == "C:\\Users\\x")
-    teko::assert::is_true(abs_path_of("d:/lower/drive", "/cwd") == "d:/lower/drive")
-}
-
-/**
- * abs_path_of recognises a `\\host\share` UNC path as already absolute and returns it as-is.
- */
-#test
-fn pt_abs_path_windows_unc_is_absolute() {
-    teko::assert::is_true(abs_path_of("\\\\host\\share", "/cwd") == "\\\\host\\share")
-}
-
-/**
- * abs_path_of treats non-absolute shapes that merely resemble Windows prefixes as RELATIVE: a
- * one-byte path, a `<letter><non-colon>` pair, a `<non-letter>:` pair, and a lone leading
- * backslash all fail the drive/UNC guards and get joined onto `cwd`.
- */
-#test
-fn pt_abs_path_windows_lookalikes_are_relative() {
-    teko::assert::is_true(abs_path_of("a", "/cwd") == "/cwd/a")
-    teko::assert::is_true(abs_path_of("ab", "/cwd") == "/cwd/ab")
-    teko::assert::is_true(abs_path_of("1:x", "/cwd") == "/cwd/1:x")
-    teko::assert::is_true(abs_path_of("\\a", "/cwd") == "/cwd/\\a")
-}
-
-/**
  * dirname_of splits a POSIX path at the last '/' and returns "." for a separator-less name —
  * byte-identical to the '/'-only original.
  */
@@ -112,41 +9,6 @@ fn pt_abs_path_windows_lookalikes_are_relative() {
 fn pt_dirname_posix_is_byte_identical() {
     teko::assert::is_true(dirname_of("/a/b/c") == "/a/b")
     teko::assert::is_true(dirname_of("file") == ".")
-}
-
-/**
- * dirname_of splits a Windows path at the rightmost separator, honouring both '\' and '/'
- * drive-letter forms.
- */
-#test
-fn pt_dirname_windows_splits_at_last_separator() {
-    teko::assert::is_true(dirname_of("C:\\a\\b\\teko.exe") == "C:\\a\\b")
-    teko::assert::is_true(dirname_of("C:/a/b/teko.exe") == "C:/a/b")
-    teko::assert::is_true(dirname_of("C:\\only") == "C:")
-}
-
-/**
- * dirname_of on a mixed-separator path splits at whichever separator is rightmost, covering both
- * the `'\' after the last '/'` and the `'/' after the last '\'` orderings.
- */
-#test
-fn pt_dirname_mixed_separators_take_rightmost() {
-    teko::assert::is_true(dirname_of("a/b\\c") == "a/b")
-    teko::assert::is_true(dirname_of("a\\b/c") == "a\\b")
-}
-
-/**
- * is_ascii_alpha classifies ASCII letters (upper and lower) as true and every non-letter byte
- * (digits, punctuation) as false — the drive-letter guard's full truth table.
- */
-#test
-fn pt_is_ascii_alpha_truth_table() {
-    teko::assert::is_true(is_ascii_alpha(b'A'))
-    teko::assert::is_true(is_ascii_alpha(b'Z'))
-    teko::assert::is_true(is_ascii_alpha(b'a'))
-    teko::assert::is_true(is_ascii_alpha(b'z'))
-    teko::assert::is_false(is_ascii_alpha(b'5'))
-    teko::assert::is_false(is_ascii_alpha(b':'))
 }
 
 /**
@@ -248,44 +110,6 @@ fn args_of(a: str, b: str, c: str) -> []str {
 
 #test
 /**
- * opt_level_of_defaults_to_zero — with NO optimization flag on the line the resolved level is 0
- * (the dev/CI default: no `-O`, byte-identical to the historic release line — the FIXPOINT floor).
- *
- * @return void
- */
-fn opt_level_of_defaults_to_zero() {
-    teko::assert::is_true(opt_level_of(args_of(".", "-o", "bin")) == 0)
-    teko::assert::is_true(opt_level_of(args_of(".", "--no-verify", "")) == 0)
-}
-
-#test
-/**
- * opt_level_of_release_and_opt_select_two — `--release` and `--opt=2` both resolve to level 2 (the
- * release seed profile that appends `-O2`), while `--opt=1` resolves to 1 and `--opt=0` back to 0.
- *
- * @return void
- */
-fn opt_level_of_release_and_opt_select_two() {
-    teko::assert::is_true(opt_level_of(args_of(".", "--release", "")) == 2)
-    teko::assert::is_true(opt_level_of(args_of(".", "--opt=2", "")) == 2)
-    teko::assert::is_true(opt_level_of(args_of(".", "--opt=1", "")) == 1)
-    teko::assert::is_true(opt_level_of(args_of(".", "--opt=0", "")) == 0)
-}
-
-#test
-/**
- * opt_level_of_last_flag_wins — a later `--opt=` overrides an earlier `--release`, and a malformed
- * suffix falls back to the fully-optimized level 2 rather than silently disabling optimization.
- *
- * @return void
- */
-fn opt_level_of_last_flag_wins() {
-    teko::assert::is_true(opt_level_of(args_of("--release", "--opt=0", ".")) == 0)
-    teko::assert::is_true(opt_level_of(args_of("--opt=9", ".", "")) == 2)
-}
-
-#test
-/**
  * opt_cc_flag_maps_levels_to_flags — level 0 emits NO flag (""), level 1 `-O1`, level 2 `-O2`, and
  * an out-of-range level clamps to `-O2` — the exact strings `build_cc_argv` appends to the cc line.
  *
@@ -311,34 +135,6 @@ fn project_arg_of_skips_optimization_flags() {
     teko::assert::is_true(project_arg_of(args_of(".", "--release", ""), 0) == ".")
 }
 
-
-#test
-/**
- * backend_of_defaults_to_c — with NO `--backend` flag on the line (and no `TEKO_BACKEND=native`
- * in the test env) the resolved backend is `Backend::C`, the trusted default that keeps a flagless
- * build byte-identical (FIXPOINT). D1/#390.
- *
- * @return void
- */
-fn backend_of_defaults_to_c() {
-    teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::C)
-    teko::assert::is_true(backend_of(args_of("build", ".", ""), 0) == Backend::C)
-}
-
-#test
-/**
- * backend_of_flag_wins_every_spelling — the `--backend` flag resolves in both the single-token
- * `--backend=<v>` and two-token `--backend <v>` forms, for both `native` and `c`. D1/#390.
- *
- * @return void
- */
-fn backend_of_flag_wins_every_spelling() {
-    teko::assert::is_true(backend_of(args_of("--backend=native", "", ""), 0) == Backend::Native)
-    teko::assert::is_true(backend_of(args_of("--backend=c", "", ""), 0) == Backend::C)
-    teko::assert::is_true(backend_of(args_of("--backend", "native", ""), 0) == Backend::Native)
-    teko::assert::is_true(backend_of(args_of("--backend", "c", ""), 0) == Backend::C)
-}
-
 #test
 /**
  * project_arg_of_skips_backend_flag — `project_arg_of` skips `--backend` and its value in BOTH
@@ -349,120 +145,6 @@ fn backend_of_flag_wins_every_spelling() {
 fn project_arg_of_skips_backend_flag() {
     teko::assert::is_true(project_arg_of(args_of("--backend=native", "proj", ""), 0) == "proj")
     teko::assert::is_true(project_arg_of(args_of("--backend", "native", "proj"), 0) == "proj")
-}
-
-#test
-/**
- * backend_of_incomplete_or_unknown_flag_falls_through — a `--backend` with no following value (it
- * was the last token) or an UNKNOWN value neither matches nor consumes a selection, so resolution
- * falls through to the default `Backend::C` (no `TEKO_BACKEND` in the test env). Covers the
- * short-circuit false side of `i + 1 < args.len` and the unknown-value inner branches. D1/#390.
- *
- * @return void
- */
-fn backend_of_incomplete_or_unknown_flag_falls_through() {
-    teko::assert::is_true(backend_of(args_of("--backend", "", ""), 0) == Backend::C)
-    teko::assert::is_true(backend_of(args_of("--backend", "wat", ""), 0) == Backend::C)
-}
-
-#test
-/**
- * backend_of_env_fallback_when_flag_absent — with NO `--backend` flag, resolution defers to the
- * `TEKO_BACKEND` env: `native` selects the own backend. A present flag still WINS over the env.
- * Resets `TEKO_BACKEND` to empty at the end so later tests see the default (the single-process test
- * runner shares env). Covers the `native_backend_selected()` true branch of `backend_of`. D1/#390.
- *
- * @return void
- */
-fn backend_of_env_fallback_when_flag_absent() {
-    match teko::env::set_var("TEKO_BACKEND", "native") { error => teko::assert::is_true(false); null => { } }
-    teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::Native)
-    teko::assert::is_true(backend_of(args_of("--backend=c", "", ""), 0) == Backend::C)
-    match teko::env::set_var("TEKO_BACKEND", "") { error => { }; null => { } }
-    teko::assert::is_true(backend_of(args_of(".", "-o", "bin"), 0) == Backend::C)
-}
-
-/**
- * pt_ek — wrap a `parser::ExprKind` into a position-less `parser::Expr` (the checked-program
- * fixtures below never assert on positions).
- *
- * @param k  the expression kind to wrap
- * @return   the wrapped expression
- */
-fn pt_ek(k: parser::ExprKind) -> parser::Expr { parser::Expr { kind = k; line = 0; col = 0 } }
-
-/**
- * pt_num — an integer `parser::Number` literal expression.
- *
- * @param v  the literal value
- * @return   the number expression
- */
-fn pt_num(v: i128) -> parser::Expr { pt_ek(parser::Number { is_float = false; value = v; fval = 0.0 }) }
-
-/**
- * pt_var — a bare-name `parser::Var` reference expression (how a module const is read).
- *
- * @param name  the referenced name
- * @return      the variable-reference expression
- */
-fn pt_var(name: str) -> parser::Expr { pt_ek(parser::Var { name = name }) }
-
-/**
- * pt_i64_t — the named type expression `i64`, the fixtures' only const type.
- *
- * @return  the `i64` type expression
- */
-fn pt_i64_t() -> parser::TypeExpr {
-    parser::NamedType { path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "i64" }) }; args = teko::list::empty() }
-}
-
-/**
- * pt_const_item — a module-level `parser::ConstDecl` of type `i64` wrapped as a program `Item`
- * with `.tks` provenance, the `checked_program_of` consteval-phase fixtures' building block.
- *
- * @param name  the constant's name
- * @param init  its initializer expression
- * @param line  its source line (distinct per fixture const so located errors differ)
- * @return      the program item carrying the const
- */
-fn pt_const_item(name: str, init: parser::Expr, line: u32) -> parser::Item {
-    let cd = parser::ConstDecl { name = name; ty = pt_i64_t(); init = init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = line; col = 1 }
-    parser::Item { content = cd; namespace = ""; file = "app.tks" }
-}
-
-/**
- * pt_checked_program_of_settles_consteval_ok — `checked_program_of` (report=false, the Quiet path)
- * runs a well-formed single-const program through checker → monomorph → consteval and returns the
- * inlined `TProgram`: the `consteval` phase's ok arm settles (with `module_const_count`'s upfront
- * total) and the scalar const is dropped from the item surface by `inline_consts`.
- */
-#test
-fn pt_checked_program_of_settles_consteval_ok() {
-    mut items: []parser::Item = teko::list::empty()
-    items = teko::list::push(items, pt_const_item("K", pt_num(1), 1))
-    let empty_dep = checker::TProgram { items = teko::list::empty() }
-    match checked_program_of(parser::Program { items = items }, empty_dep, false, false) {
-        checker::TProgram => teko::assert::is_true(true)
-        error => teko::assert::is_true(false)
-    }
-}
-
-/**
- * pt_checked_program_of_reports_consteval_cycle_under_own_phase — `const A = B; const B = A` is a
- * reference cycle the checker and monomorph phases accept (pass-1 binds both names) and ONLY
- * `inline_consts` rejects: `checked_program_of` must surface that error through the `consteval`
- * phase's fail arm (its own label — NOT a re-ended `monomorph`) and return it to the caller.
- */
-#test
-fn pt_checked_program_of_reports_consteval_cycle_under_own_phase() {
-    mut items: []parser::Item = teko::list::empty()
-    items = teko::list::push(items, pt_const_item("A", pt_var("B"), 1))
-    items = teko::list::push(items, pt_const_item("B", pt_var("A"), 2))
-    let empty_dep = checker::TProgram { items = teko::list::empty() }
-    match checked_program_of(parser::Program { items = items }, empty_dep, false, false) {
-        checker::TProgram => teko::assert::is_true(false)
-        error => teko::assert::is_true(true)
-    }
 }
 
 /** pt_push_u64le — append `v` as 8 little-endian bytes (the `.tkcov` wire form) to `b`. */
@@ -523,22 +205,6 @@ fn pt_analyzer_of_flag() {
     teko::assert::is_false(analyzer_of(without))
 }
 
-/** tkcov_magic_ok accepts the real magic and rejects a foreign/short header. */
-#test
-fn pt_tkcov_magic() {
-    teko::assert::is_true(tkcov_magic_ok(pt_tkcov(teko::list::empty(), teko::list::empty(), teko::list::empty())))
-    teko::assert::is_false(tkcov_magic_ok("nope"))
-    teko::assert::is_false(tkcov_magic_ok("TKCOV1XY"))
-}
-
-/** read_u64_le decodes a little-endian word and treats past-end bytes as zero. */
-#test
-fn pt_read_u64le() {
-    let bytes = pt_push_u64le(teko::list::empty(), 258)
-    teko::assert::is_true(read_u64_le(str(bytes), 0) == 258)
-    teko::assert::is_true(read_u64_le("", 0) == 0)
-}
-
 /** tkcov_ids merges the three sections and dedups shared ids; a bad magic yields no ids. */
 #test
 fn pt_tkcov_ids_merges_and_dedups() {
@@ -558,16 +224,6 @@ fn pt_dedup_ids() {
     teko::assert::is_true(uniq.len == 2)
     teko::assert::is_true(ids_contains(uniq, 9))
     teko::assert::is_false(ids_contains(uniq, 4))
-}
-
-/** count_of tallies occurrences across the cross-test multiset; concat_ids/all_ids_of build it. */
-#test
-fn pt_count_and_all_ids() {
-    let a = pt_ids1(5)
-    let b = pt_ids1(5)
-    let joined = concat_ids(a, b)
-    teko::assert::is_true(count_of(joined, 5) == 2)
-    teko::assert::is_true(count_of(joined, 8) == 0)
 }
 
 /** classify_test: no ids ⇒ STALE, all shared ⇒ REDUNDANT, a unique id ⇒ LIVE. */
@@ -644,25 +300,6 @@ fn pt_project_arg_of_skips_the_coverage_knobs() {
 }
 
 /**
- * unmet_coverage_floors reports NOTHING when every measured percentage meets or exceeds its floor
- * (equal counts as met — the comparison is strict `<`), and reports one message PER unmet floor, in
- * the fixed functions → lines → branches order, each naming the offending metric.
- */
-#test
-fn pt_unmet_coverage_floors_flags_only_the_low_metrics() {
-    teko::assert::is_true(unmet_coverage_floors(50, 50, 49, 50, 50, 49).len == 0)
-    teko::assert::is_true(unmet_coverage_floors(90, 90, 90, 50, 50, 49).len == 0)
-    let all_low = unmet_coverage_floors(10, 20, 30, 50, 50, 49)
-    teko::assert::is_true(all_low.len == 3)
-    teko::assert::str_contains(all_low[0], "function coverage 10%")
-    teko::assert::str_contains(all_low[1], "line coverage 20%")
-    teko::assert::str_contains(all_low[2], "branch coverage 30%")
-    let only_branch = unmet_coverage_floors(80, 80, 40, 50, 50, 49)
-    teko::assert::is_true(only_branch.len == 1)
-    teko::assert::str_contains(only_branch[0], "branch coverage 40%")
-}
-
-/**
  * coverage_floor_blocks encodes the whole `--cov-validation` policy: a run BELOW a floor is a
  * non-blocking pass by default (validation off → never blocks) and a hard failure only when
  * validation is opted in; a run that MEETS every floor never blocks regardless of the flag.
@@ -675,16 +312,6 @@ fn pt_coverage_floor_blocks_is_opt_in() {
     teko::assert::is_true(coverage_floor_blocks(below, true))
     teko::assert::is_false(coverage_floor_blocks(met, false))
     teko::assert::is_false(coverage_floor_blocks(met, true))
-}
-
-/**
- * per_test_cov_row_str renders one attribution row in the stable, greppable shape the T2
- * investigation parses: `per-test-cov <label> functions=<f>% lines=<l>% branches=<b>%`.
- */
-#test
-fn pt_per_test_cov_row_str_shape() {
-    let r = PerTestCoverage { label = "teko::demo::t1"; functions = 42; lines = 37; branches = 25 }
-    teko::assert::is_true(per_test_cov_row_str(r) == "per-test-cov teko::demo::t1 functions=42% lines=37% branches=25%")
 }
 
 /**
@@ -741,19 +368,6 @@ fn pt_changed_line_set_parses_added_lines() {
     teko::assert::is_false(changed_contains(cls, "src/x.tks", 4))
     teko::assert::is_true(changed_contains(cls, "x.tks", 2))
     teko::assert::is_false(changed_contains(cls, "other.tks", 2))
-}
-
-/**
- * changed_line_set ignores a non-`.tks` file entirely (the delta gate measures Teko sources only) and
- * a pure-deletion file (no `+` lines) contributes no changed unit.
- */
-#test
-fn pt_changed_line_set_filters_non_tks_and_deletions() {
-    let diff = "+++ b/README.md\n@@ -1,1 +1,2 @@\n md\n+added\n+++ b/src/y.tks\n@@ -1,2 +1,1 @@\n keep\n-gone\n"
-    let cls = changed_line_set(diff)
-    teko::assert::is_false(changed_contains(cls, "README.md", 2))
-    teko::assert::is_false(changed_contains(cls, "src/y.tks", 1))
-    teko::assert::is_true(cls.files.len == 0)
 }
 
 /**

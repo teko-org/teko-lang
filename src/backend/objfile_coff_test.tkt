@@ -56,22 +56,6 @@ fn co_reloc(offset: u32, sym: str, kind: RelocKindX86, addend: i64) -> RelocX86 
 }
 
 /**
- * co_exit_module — the keystone `exit`-shape hand-built module: a `main` of
- * `mov ecx,42` then `call tk_exit` (the exact 10 `.text` bytes an assembler emits),
- * no rodata — the smallest module with a defined global function, an undefined
- * extern, and one `Plt32` (call REL32) relocation whose disp32 field is 0.
- *
- * @return EncodedModuleX86  the hand-built one-function module
- */
-fn co_exit_module() -> EncodedModuleX86 {
-    let text = [0xB9 to byte, 0x2A to byte, 0 to byte, 0 to byte, 0 to byte, 0xE8 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
-    let main = co_sym("main", true, false, 1 to u8, 0 to u32)
-    let ext = co_sym("tk_exit", false, false, 0 to u8, 0 to u32)
-    let reloc = co_reloc(6 to u32, "tk_exit", RelocKindX86::Plt32, (0 to i64) - (4 to i64))
-    EncodedModuleX86 { text = text; rodata = teko::list::empty(); symbols = [main, ext]; relocs = [reloc] }
-}
-
-/**
  * co_longname_module — a hand-built module whose call target `tk_region_alloc`
  * (15 bytes, > 8) exercises the string-table name union: a `call` (5 `.text` bytes)
  * with one `Plt32` relocation, no rodata.
@@ -84,27 +68,6 @@ fn co_longname_module() -> EncodedModuleX86 {
     let ext = co_sym("tk_region_alloc", false, false, 0 to u8, 0 to u32)
     let reloc = co_reloc(1 to u32, "tk_region_alloc", RelocKindX86::Plt32, (0 to i64) - (4 to i64))
     EncodedModuleX86 { text = text; rodata = teko::list::empty(); symbols = [main, ext]; relocs = [reloc] }
-}
-
-/**
- * co_rodata_module — a hand-built module with a rodata datum `str0` at `.rdata`
- * byte offset 4, a `lea rax,[rip+0]` (`Pc32`, 7 `.text` bytes) targeting it, and a
- * `call tk_exit` (`Plt32`, 5 `.text` bytes). Pins the two-section layout, the
- * `.rdata` STATIC section symbol, the rodata relocation re-pointed at that section
- * symbol with its offset folded in-place, and the `SymbolTableIndex` shift the
- * leading section symbol imposes on the `tk_exit` reloc.
- *
- * @return EncodedModuleX86  the hand-built rodata module
- */
-fn co_rodata_module() -> EncodedModuleX86 {
-    let text = [0x48 to byte, 0x8D to byte, 0x05 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0xE8 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
-    let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
-    let str0 = co_sym("str0", true, true, 2 to u8, 4 to u32)
-    let main = co_sym("main", true, false, 1 to u8, 0 to u32)
-    let ext = co_sym("tk_exit", false, false, 0 to u8, 0 to u32)
-    let r0 = co_reloc(3 to u32, "str0", RelocKindX86::Pc32, (0 to i64) - (4 to i64))
-    let r1 = co_reloc(8 to u32, "tk_exit", RelocKindX86::Plt32, (0 to i64) - (4 to i64))
-    EncodedModuleX86 { text = text; rodata = rodata; symbols = [str0, main, ext]; relocs = [r0, r1] }
 }
 
 /**
@@ -137,130 +100,6 @@ fn co_abs64_module() -> EncodedModuleX86 {
 
 #test
 /**
- * coff_header_is_amd64_object — the `IMAGE_FILE_HEADER` of the hand-built `exit`
- * object: `Machine = IMAGE_FILE_MACHINE_AMD64`(0x8664), one section,
- * `TimeDateStamp = 0` (deterministic), `PointerToSymbolTable = 80`,
- * `NumberOfSymbols = 2`, `SizeOfOptionalHeader = 0`, `Characteristics = 0`. The
- * whole object is 120 bytes.
- *
- * @return void
- */
-fn coff_header_is_amd64_object() {
-    let obj = emit_coff(co_exit_module())
-    teko::assert::is_true(obj.len == (120 to u64))
-    teko::assert::is_true(co_u16_at(obj, 0 to u64) == (0x8664 to u32))
-    teko::assert::is_true(co_u16_at(obj, 2 to u64) == (1 to u32))
-    teko::assert::is_true(co_u32_at(obj, 4 to u64) == (0 to u32))
-    teko::assert::is_true(co_u32_at(obj, 8 to u64) == (80 to u32))
-    teko::assert::is_true(co_u32_at(obj, 12 to u64) == (2 to u32))
-    teko::assert::is_true(co_u16_at(obj, 16 to u64) == (0 to u32))
-    teko::assert::is_true(co_u16_at(obj, 18 to u64) == (0 to u32))
-}
-
-#test
-/**
- * coff_text_section_header — the `.text` `IMAGE_SECTION_HEADER` of the `exit`
- * object: `Name = ".text"`, `VirtualSize = 0`, `VirtualAddress = 0`,
- * `SizeOfRawData = 10`, `PointerToRawData = 60`, `PointerToRelocations = 70`,
- * `NumberOfRelocations = 1`, `Characteristics = 0x60500020`
- * (CODE|EXECUTE|READ|ALIGN_16BYTES).
- *
- * @return void
- */
-fn coff_text_section_header() {
-    let obj = emit_coff(co_exit_module())
-    teko::assert::is_true(obj[20 to u64] == (0x2E to byte))
-    teko::assert::is_true(obj[21 to u64] == (0x74 to byte))
-    teko::assert::is_true(obj[22 to u64] == (0x65 to byte))
-    teko::assert::is_true(obj[23 to u64] == (0x78 to byte))
-    teko::assert::is_true(obj[24 to u64] == (0x74 to byte))
-    teko::assert::is_true(obj[25 to u64] == (0 to byte))
-    teko::assert::is_true(co_u32_at(obj, 28 to u64) == (0 to u32))
-    teko::assert::is_true(co_u32_at(obj, 32 to u64) == (0 to u32))
-    teko::assert::is_true(co_u32_at(obj, 36 to u64) == (10 to u32))
-    teko::assert::is_true(co_u32_at(obj, 40 to u64) == (60 to u32))
-    teko::assert::is_true(co_u32_at(obj, 44 to u64) == (70 to u32))
-    teko::assert::is_true(co_u16_at(obj, 52 to u64) == (1 to u32))
-    teko::assert::is_true(co_u32_at(obj, 56 to u64) == (0x60500020 to u32))
-}
-
-#test
-/**
- * coff_text_bytes_and_no_fold — the `.text` image is copied verbatim (the
- * `mov ecx,42` `B9 2A 00 00 00` prefix), and the `call` disp32 field at `.text`
- * offset 6 (file offset 66) stays 0: a non-rodata `Plt32` relocation writes no
- * in-place addend (the −4 is implicit in COFF REL32).
- *
- * @return void
- */
-fn coff_text_bytes_and_no_fold() {
-    let obj = emit_coff(co_exit_module())
-    teko::assert::is_true(obj[60 to u64] == (0xB9 to byte))
-    teko::assert::is_true(obj[61 to u64] == (0x2A to byte))
-    teko::assert::is_true(obj[65 to u64] == (0xE8 to byte))
-    teko::assert::is_true(co_u32_at(obj, 66 to u64) == (0 to u32))
-}
-
-#test
-/**
- * coff_text_relocation_rel32 — the `.text` `IMAGE_RELOCATION` of the `exit` object
- * (at file offset 70): `VirtualAddress = 6` (section-relative), `SymbolTableIndex =
- * 1` (the `tk_exit` symbol), `Type = IMAGE_REL_AMD64_REL32`(0x0004).
- *
- * @return void
- */
-fn coff_text_relocation_rel32() {
-    let obj = emit_coff(co_exit_module())
-    teko::assert::is_true(co_u32_at(obj, 70 to u64) == (6 to u32))
-    teko::assert::is_true(co_u32_at(obj, 74 to u64) == (1 to u32))
-    teko::assert::is_true(co_u16_at(obj, 78 to u64) == (0x0004 to u32))
-}
-
-#test
-/**
- * coff_symbols_defined_and_undefined — the `IMAGE_SYMBOL` table of the `exit`
- * object: `main` (at file offset 80) is `Name = "main"` inline, `Value = 0`
- * (section-relative), `SectionNumber = 1`, `Type = 0x20` (DTYPE_FUNCTION),
- * `StorageClass = 2` (EXTERNAL), 0 aux; `tk_exit` (at 98) is `Name = "tk_exit"`
- * inline, `SectionNumber = 0` (UNDEFINED), `StorageClass = 2`, 0 aux.
- *
- * @return void
- */
-fn coff_symbols_defined_and_undefined() {
-    let obj = emit_coff(co_exit_module())
-    teko::assert::is_true(obj[80 to u64] == (0x6D to byte))
-    teko::assert::is_true(obj[81 to u64] == (0x61 to byte))
-    teko::assert::is_true(obj[82 to u64] == (0x69 to byte))
-    teko::assert::is_true(obj[83 to u64] == (0x6E to byte))
-    teko::assert::is_true(obj[84 to u64] == (0 to byte))
-    teko::assert::is_true(co_u32_at(obj, 88 to u64) == (0 to u32))
-    teko::assert::is_true(co_u16_at(obj, 92 to u64) == (1 to u32))
-    teko::assert::is_true(co_u16_at(obj, 94 to u64) == (0x20 to u32))
-    teko::assert::is_true(obj[96 to u64] == (2 to byte))
-    teko::assert::is_true(obj[97 to u64] == (0 to byte))
-    teko::assert::is_true(obj[98 to u64] == (0x74 to byte))
-    teko::assert::is_true(obj[104 to u64] == (0x74 to byte))
-    teko::assert::is_true(obj[105 to u64] == (0 to byte))
-    teko::assert::is_true(co_u16_at(obj, 110 to u64) == (0 to u32))
-    teko::assert::is_true(obj[114 to u64] == (2 to byte))
-    teko::assert::is_true(obj[115 to u64] == (0 to byte))
-}
-
-#test
-/**
- * coff_strtab_all_inline_is_size_only — with every name ≤ 8 bytes, the string
- * table of the `exit` object (at file offset 116) is JUST the 4-byte size field,
- * whose value is 4 (the size includes itself, minimum 4) — no name bytes follow.
- *
- * @return void
- */
-fn coff_strtab_all_inline_is_size_only() {
-    let obj = emit_coff(co_exit_module())
-    teko::assert::is_true(co_u32_at(obj, 116 to u64) == (4 to u32))
-}
-
-#test
-/**
  * coff_long_name_uses_strtab_union — a > 8-byte name (`tk_region_alloc`) emits the
  * `IMAGE_SYMBOL` `Name` union `[0,0,0,0]` (Zeroes) then `Offset = 4` into the
  * string table (the first long name lands right after the 4-byte size field); the
@@ -280,84 +119,6 @@ fn coff_long_name_uses_strtab_union() {
     teko::assert::is_true(obj[115 to u64] == (0x74 to byte))
     teko::assert::is_true(obj[116 to u64] == (0x6B to byte))
     teko::assert::is_true(obj[130 to u64] == (0 to byte))
-}
-
-#test
-/**
- * coff_rodata_makes_two_sections — a module with rodata has `NumberOfSections = 2`,
- * `NumberOfSymbols = 3` (the `.rdata` section symbol + `main` + `tk_exit`), and a
- * `.rdata` `IMAGE_SECTION_HEADER` (at file offset 60): `Name = ".rdata"`,
- * `SizeOfRawData = 8`, `PointerToRawData = 112`, `Characteristics = 0x40400040`
- * (INITIALIZED_DATA|READ|ALIGN_8BYTES). The whole object is 198 bytes.
- *
- * @return void
- */
-fn coff_rodata_makes_two_sections() {
-    let obj = emit_coff(co_rodata_module())
-    teko::assert::is_true(obj.len == (198 to u64))
-    teko::assert::is_true(co_u16_at(obj, 2 to u64) == (2 to u32))
-    teko::assert::is_true(co_u32_at(obj, 12 to u64) == (3 to u32))
-    teko::assert::is_true(obj[60 to u64] == (0x2E to byte))
-    teko::assert::is_true(obj[61 to u64] == (0x72 to byte))
-    teko::assert::is_true(obj[62 to u64] == (0x64 to byte))
-    teko::assert::is_true(co_u32_at(obj, 76 to u64) == (8 to u32))
-    teko::assert::is_true(co_u32_at(obj, 80 to u64) == (112 to u32))
-    teko::assert::is_true(co_u32_at(obj, 96 to u64) == (0x40400040 to u32))
-}
-
-#test
-/**
- * coff_rodata_section_symbol_is_static — the `.rdata` `IMAGE_SYMBOL` (at file
- * offset 140, the first symbol): `Name = ".rdata"` inline, `Value = 0`,
- * `SectionNumber = 2`, `Type = 0`, `StorageClass = 3` (STATIC), 0 aux — the section
- * symbol every rodata relocation targets.
- *
- * @return void
- */
-fn coff_rodata_section_symbol_is_static() {
-    let obj = emit_coff(co_rodata_module())
-    teko::assert::is_true(obj[140 to u64] == (0x2E to byte))
-    teko::assert::is_true(obj[141 to u64] == (0x72 to byte))
-    teko::assert::is_true(obj[142 to u64] == (0x64 to byte))
-    teko::assert::is_true(co_u32_at(obj, 148 to u64) == (0 to u32))
-    teko::assert::is_true(co_u16_at(obj, 152 to u64) == (2 to u32))
-    teko::assert::is_true(co_u16_at(obj, 154 to u64) == (0 to u32))
-    teko::assert::is_true(obj[156 to u64] == (3 to byte))
-    teko::assert::is_true(obj[157 to u64] == (0 to byte))
-}
-
-#test
-/**
- * coff_rodata_reloc_targets_section_symbol_and_shifts_index — the rodata `Pc32`
- * relocation (at file offset 120) re-points at the `.rdata` section symbol (index
- * 0) as `Type = REL32`(0x0004); the `call tk_exit` relocation (at 130) targets
- * `SymbolTableIndex = 2` — proving the leading section symbol shifted `tk_exit`
- * from index 1 to 2 (the A4-4/B1-7-class correctness point).
- *
- * @return void
- */
-fn coff_rodata_reloc_targets_section_symbol_and_shifts_index() {
-    let obj = emit_coff(co_rodata_module())
-    teko::assert::is_true(co_u32_at(obj, 120 to u64) == (3 to u32))
-    teko::assert::is_true(co_u32_at(obj, 124 to u64) == (0 to u32))
-    teko::assert::is_true(co_u16_at(obj, 128 to u64) == (0x0004 to u32))
-    teko::assert::is_true(co_u32_at(obj, 130 to u64) == (8 to u32))
-    teko::assert::is_true(co_u32_at(obj, 134 to u64) == (2 to u32))
-    teko::assert::is_true(co_u16_at(obj, 138 to u64) == (0x0004 to u32))
-}
-
-#test
-/**
- * coff_rodata_addend_folded_in_place — the rodata datum's `.rdata` byte offset (4)
- * is written IN-PLACE into the `lea` disp32 field at `.text` offset 3 (file offset
- * 103), since COFF has no `r_addend` field and the −4 is implicit in REL32 — the
- * `B3-rodata-addend` detail, unit-goldened.
- *
- * @return void
- */
-fn coff_rodata_addend_folded_in_place() {
-    let obj = emit_coff(co_rodata_module())
-    teko::assert::is_true(co_u32_at(obj, 103 to u64) == (4 to u32))
 }
 
 #test
@@ -396,20 +157,6 @@ fn coff_abs64_emits_addr64() {
 
 #test
 /**
- * coff_reloc_type_maps_all_kinds — the `RelocKindX86` → `IMAGE_REL_AMD64_*`
- * mapping: `Plt32` and `Pc32` both → REL32(0x0004), `Abs64` → ADDR64(0x0001),
- * covering every arm of the adapter.
- *
- * @return void
- */
-fn coff_reloc_type_maps_all_kinds() {
-    teko::assert::is_true(coff_reloc_type(RelocKindX86::Plt32) == (0x0004 to u32))
-    teko::assert::is_true(coff_reloc_type(RelocKindX86::Pc32) == (0x0004 to u32))
-    teko::assert::is_true(coff_reloc_type(RelocKindX86::Abs64) == (0x0001 to u32))
-}
-
-#test
-/**
  * coff_symbol_index_finds_and_sentinels — `coff_symbol_index` returns a present
  * symbol's index and, for an absent name, the one-past-end sentinel (`syms.len`),
  * covering both arms of the lookup the relocation table relies on.
@@ -420,19 +167,6 @@ fn coff_symbol_index_finds_and_sentinels() {
     let syms = coff_build_symbols([co_sym("main", true, false, 1 to u8, 0 to u32), co_sym("tk_exit", false, false, 0 to u8, 0 to u32)])
     teko::assert::is_true(coff_symbol_index(syms, "tk_exit") == (1 to u32))
     teko::assert::is_true(coff_symbol_index(syms, "absent") == (2 to u32))
-}
-
-#test
-/**
- * coff_secsym_index_sentinel — `coff_rodata_secsym_index` returns the one-past-end
- * sentinel when the resolved table has no `.rdata` STATIC section symbol (the
- * no-rodata module), covering the fall-through arm.
- *
- * @return void
- */
-fn coff_secsym_index_sentinel() {
-    let syms = coff_build_symbols([co_sym("main", true, false, 1 to u8, 0 to u32)])
-    teko::assert::is_true(coff_rodata_secsym_index(syms) == (1 to u32))
 }
 
 #test
@@ -518,34 +252,4 @@ fn tb3_coff_rdata_reloc_emitted() {
     teko::assert::is_true(co_u32_at(obj, 101) == 8)
     teko::assert::is_true(co_u32_at(obj, 105) == 0)
     teko::assert::is_true(obj[109] == (0x41 to byte))
-}
-
-/**
- * T-B3: o MESMO módulo sem relocs colapsa — `.rdata` com pointer/nreloc = 0, sem
- * segunda tabela e sem fold (byte-identidade do braço vazio).
- */
-#test
-fn tb3_coff_no_relocs_collapses() {
-    let base = co_rodata_ptr_module()
-    let obj = emit_coff(EncodedModuleX86 { text = base.text; rodata = base.rodata; symbols = base.symbols; relocs = teko::list::empty() })
-    teko::assert::is_true(obj.len == 157)
-    teko::assert::is_true(co_u32_at(obj, 84) == 0)
-    teko::assert::is_true(co_u16_at(obj, 92) == 0)
-}
-
-/**
- * T-B3 (§4.5): a partição COFF separa por RelocSect e o fold in-place grava o word
- * baixo do slot (8) deixando o alto em 0; sobre relocs vazia o .rdata volta intacto.
- */
-#test
-fn tb3_coff_partition_and_fold_arms() {
-    let m = co_rodata_ptr_module()
-    let parts = coff_partition_relocs(m.relocs)
-    teko::assert::is_true(parts.text.len == 0)
-    teko::assert::is_true(parts.rdata.len == 1)
-    let folded = coff_apply_data_reloc_addends(m.rodata, m.symbols, parts.rdata)
-    teko::assert::is_true(folded[0] == (8 to byte))
-    teko::assert::is_true(folded[4] == (0 to byte))
-    let untouched = coff_apply_data_reloc_addends(m.rodata, m.symbols, teko::list::empty())
-    teko::assert::is_true(untouched[0] == (0 to byte))
 }

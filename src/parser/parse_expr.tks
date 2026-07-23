@@ -2,6 +2,37 @@
 
 use teko::lexer
 
+/**
+ * parse_num_suffix_lit — desugar a `bi`/`d` arbitrary-precision Number token into a call to the
+ * numeric library's `of_lit` constructor (`123bi` → `teko::numeric::bigint::of_lit("123")`, `1.5d`
+ * → `teko::numeric::dec::of_lit("1.5")`). This keeps arbitrary-precision literals out of the
+ * fixed-width `Number` node — no new AST/typed-AST node is needed; the checker and both backends see
+ * an ordinary Call. A `bi` literal must be a whole number (no `.`/exponent).
+ *
+ * @param tokens  the token stream
+ * @param pos     the Number token's index
+ * @param txt     the Number token text (carrying the `bi`/`d` suffix)
+ * @return        the parsed `of_lit` call expression, or an error for a fractional `bi` literal
+ * @throws        when a `bi` literal carries a fraction or exponent (bigint is a whole number)
+ */
+fn parse_num_suffix_lit(tokens: []lexer::Token, pos: u64, txt: str) -> Parsed<Expr> | error {
+    let is_big = lit_is_bigint(txt)
+    let numeric = if is_big { lit_strip_suffix(txt, 2) } else { lit_strip_suffix(txt, 1) }
+    if is_big && lit_is_float(numeric) {
+        return err_at(tokens, pos, "a `bi` bigint literal must be a whole number (no fraction or exponent)")
+    }
+    let module = if is_big { "bigint" } else { "dec" }
+    mut segs: []Segment = teko::list::push(teko::list::empty(), Segment { name = "teko" })
+    segs = teko::list::push(segs, Segment { name = "numeric" })
+    segs = teko::list::push(segs, Segment { name = module })
+    segs = teko::list::push(segs, Segment { name = "of_lit" })
+    let arg = Expr { kind = StrLit { text = numeric }; line = tokens[pos].line; col = tokens[pos].col }
+    let args = teko::list::push(teko::list::empty(), arg)
+    let arg_names = teko::list::push(teko::list::empty(), "")
+    let call = Call { callee = Path { segments = segs }; args = args; arg_names = arg_names; type_args = teko::list::empty() }
+    Parsed<Expr> { node = Expr { kind = call; line = tokens[pos].line; col = tokens[pos].col }; next = pos + 1 }
+}
+
 // `( e, e, … )` — `pos` is at `(`. Empty `()` allowed; comma-separated; no trailing
 // comma (strict — M.2). Returns the args and the position after `)`. Used by Call (here)
 // and by MethodCall (P2b). Args parse with struct literals ALLOWED (W4a): a comma/paren
@@ -303,6 +334,9 @@ fn parse_atom(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed<Ex
     }
     if k == lexer::TokenKind::Number {
         let txt = tokens[pos].text
+        if lit_is_bigint(txt) || lit_is_dec(txt) {
+            return parse_num_suffix_lit(tokens, pos, txt)
+        }
         // a FLOAT token carries fval (via lit_float); an INT token carries value (via lit_int) — mirror parse_expr.c.
         let num = if lit_is_float(txt) { Number { is_float = true; value = 0; fval = lit_float(txt) } }
         else { Number { is_float = false; value = lit_int(txt); fval = 0.0 } }
@@ -473,6 +507,10 @@ fn parse_postfix(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed
 // bitwise-and, consumed at the binary level — so a leading `&` here is unambiguous. Below `to`.
 fn parse_unary(tokens: []lexer::Token, pos: u64, allow_struct: bool) -> Parsed<Expr> | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::Amp) {
+        let operand = match parse_unary(tokens, pos + 1, allow_struct) { Parsed<Expr> as x => x; error as e => return e }
+        return Parsed<Expr> { node = Expr { kind = Borrow { operand = operand.node }; line = tokens[pos].line; col = tokens[pos].col }; next = operand.next }
+    }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "ref" && is_name_at(tokens, pos + 1) {
         let operand = match parse_unary(tokens, pos + 1, allow_struct) { Parsed<Expr> as x => x; error as e => return e }
         return Parsed<Expr> { node = Expr { kind = Borrow { operand = operand.node }; line = tokens[pos].line; col = tokens[pos].col }; next = operand.next }
     }

@@ -1,0 +1,65 @@
+/**
+ * A — a payload-bearing case of `Op`, carrying an `i64` in `x`.
+ *
+ * @field x  the case payload
+ */
+type A = struct {
+    /** the case payload. */
+    x: i64
+}
+
+/**
+ * B — the other case of `Op`, carrying an `i64` in `y`.
+ *
+ * @field y  the case payload
+ */
+type B = struct {
+    /** the case payload. */
+    y: i64
+}
+
+/**
+ * Op — a two-case inline-tag variant; the payload of the mutated `Op | null` field.
+ */
+type Op = variant A | B
+
+/**
+ * Box — a one-field struct whose `f: Op | null` field is mutated in place through the write-back
+ * cycle (value → null → value), re-matched at each stage.
+ *
+ * @field f  the mutated `Op | null` field
+ */
+type Box = struct {
+    /** the mutated `Op | null` field. */
+    f: Op | null
+}
+
+/**
+ * cycle — exercise the FULL mutation cycle of a null-union field. Start with a present `A`, match it
+ * (accumulate its payload), write `null` back and re-match (the `null` arm), write a `B` back and
+ * re-match (the `B` arm), accumulating a distinct amount at each stage so the exit code witnesses
+ * every write:
+ *   A { x = 30 } -> +30 ; b.f = null -> +2 ; b.f = B { y = 10 } -> +10  ==>  42
+ *
+ * @return the staged accumulator (42)
+ * @since 0.3.0.30
+ */
+pub fn cycle() -> i64 {
+    mut b: Box = Box { f = A { x = 30 } }
+    mut acc = 0
+    match b.f {
+        Op as v => match v { A as a => acc = acc + a.x; B as bb => acc = acc + bb.y }
+        null => acc = acc + 1000
+    }
+    b.f = null
+    match b.f {
+        Op as v => acc = acc + 5000
+        null => acc = acc + 2
+    }
+    b.f = B { y = 10 }
+    match b.f {
+        Op as v => match v { A as a => acc = acc + 7000; B as bb => acc = acc + bb.y }
+        null => acc = acc + 9000
+    }
+    return acc
+}

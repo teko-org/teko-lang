@@ -1,0 +1,80 @@
+/**
+ * Big — the LARGE case of `Op`: three `i64` fields (24 bytes), which pushes `Op | null` past the
+ * 16-byte threshold onto the box-in-arena representation rail.
+ *
+ * @field a  the first payload word
+ * @field b  the second payload word
+ * @field c  the third payload word
+ */
+type Big = struct {
+    /** the first payload word. */
+    a: i64
+    /** the second payload word. */
+    b: i64
+    /** the third payload word. */
+    c: i64
+}
+
+/**
+ * Small — the small case of `Op`, a single `i64`, so the variant genuinely has two cases of unequal
+ * size (the saturating max — `Big` — decides the ≥ 16-byte boxing).
+ *
+ * @field s  the sole payload word
+ */
+type Small = struct {
+    /** the sole payload word. */
+    s: i64
+}
+
+/**
+ * Op — a two-case variant whose saturating payload (`Big`, 24 bytes) is ≥ 16 bytes, so `Op | null`
+ * boxes into an arena handle.
+ */
+type Op = variant Big | Small
+
+/**
+ * Holder — the struct under test: its `f` field is the box-in-arena union `Op | null`, stored as an
+ * 8-byte handle, alongside a neighbouring scalar.
+ *
+ * @field f      the boxed `Op | null` field (an arena handle, or the NULL handle)
+ * @field label  a neighbouring scalar added into the result
+ */
+type Holder = struct {
+    /** the boxed `Op | null` field (an arena handle, or the NULL handle). */
+    f: Op | null
+    /** a neighbouring scalar added into the result. */
+    label: i64
+}
+
+/**
+ * make_big — a `Holder` whose boxed field holds a `Big` case derived from `v` (`{ v, v+1, v+2 }`),
+ * boxed into the arena by the struct literal.
+ *
+ * @param v  the seed for the three `Big` words
+ * @return   a `Holder` with `f = Big { a = v; b = v + 1; c = v + 2 }` and `label = 1`
+ * @since 0.3.0.30
+ */
+pub fn make_big(v: i64) -> Holder { return Holder { f = Big { a = v; b = v + 1; c = v + 2 }; label = 1 } }
+
+/**
+ * make_null — a `Holder` whose boxed field holds `null` (the NULL arena handle).
+ *
+ * @return a `Holder` with `f = null` and `label = 8`
+ * @since 0.3.0.30
+ */
+pub fn make_null() -> Holder { return Holder { f = null; label = 8 } }
+
+/**
+ * read — dereference the boxed field and match it: a `Big` case sums its three words plus `label`, a
+ * `Small` case yields its word, and `null` yields `label` alone.
+ *
+ * @param h  the holder read through
+ * @return   the boxed case's contribution plus/at `label`
+ * @since 0.3.0.30
+ */
+pub fn read(h: Holder) -> i64 {
+    match h.f {
+        Op as v => match v { Big as bg => return bg.a + bg.b + bg.c + h.label; Small as sm => return sm.s }
+        null => return h.label
+    }
+}

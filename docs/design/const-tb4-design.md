@@ -303,7 +303,7 @@ T-B1..T-B4), então **nenhuma `LRodata` carrega `relocs` não-vazio**. Portanto:
 `narrow_msg_data_segment_matches_the_traced_golden` (`:490`), os testes de módulo
 `assemble_program_*` (`stackify_test.tkt`, ex. `:2847`/`:2886` que fixam
 `m.data[i].offset == wasm_rodata_base()`), e `wasm_layout_rodata_*`
-(`:2170`/`:2188`/`:2204`) — todos permanecem verbatim. **fixpoint gen2==gen3** + ambas
+(`:2170`/`:2188`/`:2204`) — todos permanecem verbatim. **fixpoint gen1==gen2** + ambas
 as engines é a prova final. **QED.**
 
 ---
@@ -481,7 +481,7 @@ Cada edit é gate-able isoladamente; rodar o `.tkt` listado após cada um.
 - **Por-edit:** o `.tkt` do arquivo (tabela) — cada edit é gate-able só.
 - **RITUAL POINT — fim de T-B4:** gate COMPLETO — todos os goldens wasm byte-idênticos
   (`stackify_test.tkt`, `objfile_wasm_test.tkt`) + os demais goldens de backend
-  (encoders/writers/`lower`/`lir_interp`/`tkb`) intactos + **fixpoint gen2==gen3** +
+  (encoders/writers/`lower`/`lir_interp`/`tkb`) intactos + **fixpoint gen1==gen2** +
   ambas as engines (VM + nativo) + 100% de cobertura do delta (§5). **Sem seed bump** —
   T-B4 não adiciona capacidade que o corpus use (o 🔑 SEED BUMP #3 é depois de T-B5,
   plano §8).

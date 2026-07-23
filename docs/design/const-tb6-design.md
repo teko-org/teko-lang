@@ -52,7 +52,7 @@ rodata): `lower.tks:5137 serialize_const`.
    `AAPCS64 == aapcs64()` campo-a-campo ANTES de remover as fns.
 5. **Goldens/fixpoint (ponto 4):** regalloc goldens byte-idênticos (valores iguais); os
    object goldens re-baseiam UMA vez SE o compilador for nativo-compilado (o `.rela.rodata`
-   dos descritores passa a existir), intactos se C-compilado; **fixpoint gen2==gen3** é a
+   dos descritores passa a existir), intactos se C-compilado; **fixpoint gen1==gen2** é a
    barra final.
 6. **O perigo nº1 é o determinismo dos símbolos de rodata** — resolvido por símbolos
    função-pura de (const, campo) + ordem de intern determinística (leaves em ordem de campo,
@@ -577,12 +577,12 @@ caminhos), aparecem entradas rodata reais + relocs data→data:
 - **O binário do compilador em si:** muda (a fonte migrou: inline de struct-literal em vez de
   fn-call no C backend; ou rodata no nativo). Isso é esperado e NÃO é uma regressão.
 
-### 6.3 O papel do fixpoint gen2==gen3
+### 6.3 O papel do fixpoint gen1==gen2
 
-`fixpoint` compila o compilador com ele mesmo duas vezes e exige gen2==gen3. É a prova de que
+`fixpoint` compila o compilador com ele mesmo duas vezes e exige gen1==gen2. É a prova de que
 a migração é AUTO-CONSISTENTE: qualquer não-determinismo nos símbolos de leaf, na ordem de
-intern, ou nos offsets re-baseados quebraria gen2==gen3 imediatamente. Como os símbolos são
-função-pura de (const, campo) e a ordem de intern é determinística (§3.3/§3.4), gen2==gen3
+intern, ou nos offsets re-baseados quebraria gen1==gen2 imediatamente. Como os símbolos são
+função-pura de (const, campo) e a ordem de intern é determinística (§3.3/§3.4), gen1==gen2
 segura. **O fixpoint é o guarda central do perigo nº1.** No CI: o gate T-B6 exige o fixpoint
 verde além dos goldens.
 
@@ -652,7 +652,7 @@ golden de equivalência §6.1 temporário).
 - **Escada de gates:** `T25 × branch gated`:
   1. gen1 = seed T25 compila o working tree T-B6 (C backend) → OK.
   2. gen2 = gen1 compila o working tree → OK.
-  3. gen3 = gen2 compila o working tree → **assert gen2 == gen3** (fixpoint).
+  3. gen2 = gen1 compila o working tree → **assert gen1==gen2** (fixpoint).
   4. `.tkt` de cada arquivo editado (por-edit, tabela §9) + o gate COMPLETO no ritual.
 - **Ambas as engines:** as fixtures §7.3/§7.5 rodam VM + nativo pelo harness `.tkt` — a prova
   dual-engine ao nível SOURCE que faltava até o BUMP #3.
@@ -681,7 +681,7 @@ sem E4; ainda assim sequencia-se E4 antes p/ que as fixtures dual-engine E7 tenh
 - **RITUAL POINT — fim de T-B6:** gate COMPLETO — todos os goldens VM (`lir_interp_test.tkt`)
   + backend (`encode_*_test.tkt`, `objfile_*_test.tkt`, `lower_test.tkt`, `tkb_test.tkt`) +
   **regalloc goldens BYTE-IDÊNTICOS** (`regalloc_*_test.tkt`, `abi_*_test.tkt`) +
-  **fixpoint gen2==gen3** + ambas as engines (VM + nativo) nas fixtures dual-engine + 100% de
+  **fixpoint gen1==gen2** + ambas as engines (VM + nativo) nas fixtures dual-engine + 100% de
   cobertura do delta (§7). Object goldens re-baseados UMA vez (se aplicável) e congelados.
 - **Fecho do Tier-B / do #594 pointer-bearing:** T-B6 é o FINALE — a partir daqui `serialize_
   const` não tem mais gate produtor fechado para slice/`str`; a cadeia data→data está viva
@@ -693,7 +693,7 @@ sem E4; ainda assim sequencia-se E4 antes p/ que as fixtures dual-engine E7 tenh
 
 1. **Determinismo dos símbolos de rodata (o perigo nº1 pro fixpoint).** Um símbolo de leaf
    derivado de um contador de intern global mudaria quando outro const fosse adicionado →
-   quebra gen2==gen3. *Resolução:* `const_leaf_symbol` é FUNÇÃO PURA de (nome-do-const,
+   quebra gen1==gen2. *Resolução:* `const_leaf_symbol` é FUNÇÃO PURA de (nome-do-const,
    nome-do-campo) (§3.3); a ordem de intern é a ordem de campo declarada (§3.4). O fixpoint
    (§6.3) é o guarda. Nenhum contador global toca os símbolos de leaf.
 

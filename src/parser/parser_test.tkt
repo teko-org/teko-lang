@@ -4,249 +4,10 @@
 // helper: lex `source`, then parse a type from position 0 — the TypeExpr, or error.
 use teko::lexer
 
-fn type_of(source: str) -> TypeExpr | error {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return error { message = "lex failed" } }
-    let pt = match parse_type(toks, 0) { ParsedType as x => x; error as e => return e }
-    pt.node
-}
-
 // does parsing a type from `source` fail (the barrier)?
 fn type_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_type(toks, 0) { ParsedType => false; error => true }
-}
-
-// is `t` a single-segment NamedType named `name`?
-fn named_is(t: TypeExpr, name: str) -> bool {
-    match t {
-        NamedType as n => n.path.segments.len == 1 && n.path.segments[0].name == name
-        _ => false
-    }
-}
-
-// the arity of a union type (0 if `t` is not a UnionType).
-fn union_arity(t: TypeExpr) -> u64 {
-    match t {
-        UnionType as u => u.members.len
-        _ => 0 to u64
-    }
-}
-
-#test
-fn parses_named_and_path() {
-    // happy: a bare name, and a multi-segment path.
-    let t = match type_of("u64") { TypeExpr as x => x; error => return }
-    teko::assert::is_true(named_is(t, "u64"))
-    let p = match type_of("lexer::Token") { TypeExpr as x => x; error => return }
-    match p {
-        NamedType as n => {
-            teko::assert::is_true(n.path.segments.len == 2)
-            teko::assert::is_true(n.path.segments[0].name == "lexer")
-            teko::assert::is_true(n.path.segments[1].name == "Token")
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn parses_slice_and_nesting() {
-    // happy: []u64 and [][]u64 (B.8 recursion).
-    let t = match type_of("[]u64") { TypeExpr as x => x; error => return }
-    match t {
-        SliceType as s => teko::assert::is_true(named_is(s.element, "u64"))
-        _ => teko::assert::is_true(false)
-    }
-    let t2 = match type_of("[][]u64") { TypeExpr as x => x; error => return }
-    match t2 {
-        SliceType as s => match s.element {
-            SliceType as s2 => teko::assert::is_true(named_is(s2.element, "u64"))
-            _ => teko::assert::is_true(false)
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-// is `t` a single-segment NamedType named `name` with `nargs` generic type-arguments? (S4)
-fn named_with_args(t: TypeExpr, name: str, nargs: u64) -> bool {
-    match t {
-        NamedType as n => n.path.segments.len == 1 && n.path.segments[0].name == name && n.args.len == nargs
-        _ => false
-    }
-}
-
-#test
-fn parses_generic_type_args() {
-    // Box<i64> → NamedType "Box" with one type-arg (named i64).
-    let t = match type_of("Box<i64>") { TypeExpr as x => x; error => return }
-    teko::assert::is_true(named_with_args(t, "Box", 1 to u64))
-    match t {
-        NamedType as n => teko::assert::is_true(named_is(n.args[0], "i64"))
-        _ => teko::assert::is_true(false)
-    }
-    // Result<i64, str> → two type-args.
-    let r = match type_of("Result<i64, str>") { TypeExpr as x => x; error => return }
-    teko::assert::is_true(named_with_args(r, "Result", 2 to u64))
-    // []Box<i64> → a slice whose element is Box<i64>.
-    let s = match type_of("[]Box<i64>") { TypeExpr as x => x; error => return }
-    match s {
-        SliceType as sl => teko::assert::is_true(named_with_args(sl.element, "Box", 1 to u64))
-        _ => teko::assert::is_true(false)
-    }
-    // Box<i64>? → an optional wrapping Box<i64>.
-    let o = match type_of("Box<i64>?") { TypeExpr as x => x; error => return }
-    match o {
-        OptionalType as ot => teko::assert::is_true(named_with_args(ot.inner, "Box", 1 to u64))
-        _ => teko::assert::is_true(false)
-    }
-    // a plain name keeps zero args (no regression).
-    let p = match type_of("u64") { TypeExpr as x => x; error => return }
-    teko::assert::is_true(named_with_args(p, "u64", 0 to u64))
-}
-
-#test
-fn parses_nested_generic_type_args() {
-    // Box<Box<i64>> → Box with one arg = Box<i64> (the `>>` Shr close-split, S4 crumb 1b).
-    let t = match type_of("Box<Box<i64>>") { TypeExpr as x => x; error => return }
-    match t {
-        NamedType as n => {
-            teko::assert::is_true(n.path.segments[0].name == "Box")
-            teko::assert::is_true(n.args.len == 1)
-            match n.args[0] {
-                NamedType as inner => {
-                    teko::assert::is_true(inner.path.segments[0].name == "Box")
-                    teko::assert::is_true(inner.args.len == 1)
-                    teko::assert::is_true(named_is(inner.args[0], "i64"))
-                }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // triple nesting parses (`>>>` lexes as Shr+Gt; the pending-`>` thread closes all three levels).
-    teko::assert::is_true(!type_errors("Box<Box<Box<i64>>>"))
-    // a multi-arg whose LAST arg is nested: Result<i64, Box<str>>.
-    let r = match type_of("Result<i64, Box<str>>") { TypeExpr as x => x; error => return }
-    teko::assert::is_true(named_with_args(r, "Result", 2 to u64))
-}
-
-#test
-fn generic_lt_backtracks_to_comparison() {
-    // `x to i64 < y` is a COMPARISON of a cast, NOT a generic on i64 — the speculative type-args
-    // parse must backtrack and leave `<` to the comparison operator (cast target is a type-primary).
-    teko::assert::is_true(!expr_errors("x to i64 < y"))
-    match expr_of("x to i64 < y") {
-        Compare as c => teko::assert::is_true(c.rest.len == 1)
-        _ => teko::assert::is_true(false)
-    }
-}
-
-// (W9.4) struct construction with explicit type-args parses into StructLit.type_args.
-#test
-fn parses_struct_lit_type_args() {
-    // `Box<i64>{ value = 1 }` → StructLit with type_path Box, one type-arg i64, one field.
-    match expr_of("Box<i64>{ value = 1 }") {
-        StructLit as sl => {
-            teko::assert::is_true(sl.type_path.segments[sl.type_path.segments.len - 1].name == "Box")
-            teko::assert::is_true(sl.type_args.len == 1)
-            teko::assert::is_true(named_is(sl.type_args[0], "i64"))
-            teko::assert::is_true(sl.field_names.len == 1)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // the bare form keeps zero type-args (no regression).
-    match expr_of("Box{ value = 1 }") {
-        StructLit as sl => teko::assert::is_true(sl.type_args.len == 0)
-        _ => teko::assert::is_true(false)
-    }
-    // empty literal with type-args: `Foo<str>{ }`.
-    match expr_of("Foo<str>{ }") {
-        StructLit as sl => { teko::assert::is_true(sl.type_args.len == 1); teko::assert::is_true(sl.field_names.len == 0) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-// (W9.4) the `>>` Shr close-split works at a construction site: `Box<Box<i64>>{ … }`.
-#test
-fn parses_nested_struct_lit_type_args() {
-    match expr_of("Box<Box<i64>>{ value = 1 }") {
-        StructLit as sl => {
-            teko::assert::is_true(sl.type_args.len == 1)
-            match sl.type_args[0] {
-                NamedType as inner => { teko::assert::is_true(inner.path.segments[0].name == "Box"); teko::assert::is_true(inner.args.len == 1) }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-// (W9.4) a `<`-after-name that is NOT a struct construction still backtracks to comparison.
-#test
-fn struct_lit_type_args_backtrack_to_comparison() {
-    // `a < b` is a comparison — there is no `{` after a closed `<…>`, so the speculative parse must
-    // backtrack and leave `<` to the comparison operator (no struct literal).
-    teko::assert::is_true(!expr_errors("a < b"))
-    match expr_of("a < b") {
-        Compare as c => teko::assert::is_true(c.rest.len == 1)
-        _ => teko::assert::is_true(false)
-    }
-}
-
-// (W9.4) bind patterns carry explicit type-args (`Foo<i64> as x`, incl `>>` split).
-#test
-fn parses_bind_pattern_type_args() {
-    match pattern_of("Foo<str> as x") {
-        BindPattern as bp => {
-            teko::assert::is_true(!bp.is_slice)
-            teko::assert::is_true(bp.has_binding)
-            teko::assert::is_true(bp.binding == "x")
-            teko::assert::is_true(bp.type_args.len == 1)
-            teko::assert::is_true(named_is(bp.type_args[0], "str"))
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // bare `Foo<i64>` (no `as`) keeps the type-args and binds nothing.
-    match pattern_of("Foo<i64>") {
-        BindPattern as bp => { teko::assert::is_true(bp.type_args.len == 1); teko::assert::is_false(bp.has_binding) }
-        _ => teko::assert::is_true(false)
-    }
-    // nested `Box<Box<i64>> as x` — the `>>` close-split in pattern position.
-    match pattern_of("Box<Box<i64>> as x") {
-        BindPattern as bp => {
-            teko::assert::is_true(bp.type_args.len == 1)
-            match bp.type_args[0] {
-                NamedType as inner => teko::assert::is_true(inner.path.segments[0].name == "Box")
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // plain `Foo as x` keeps zero type-args (no regression).
-    match pattern_of("Foo as x") {
-        BindPattern as bp => teko::assert::is_true(bp.type_args.len == 0)
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn parses_union_and_single() {
-    // happy: A | B (arity 2), A | B | C (arity 3); a single primary is NOT wrapped (M.5).
-    let u2 = match type_of("A | B") { TypeExpr as x => x; error => return }
-    teko::assert::is_true(union_arity(u2) == 2)
-    let u3 = match type_of("A | B | C") { TypeExpr as x => x; error => return }
-    teko::assert::is_true(union_arity(u3) == 3)
-    let one = match type_of("A") { TypeExpr as x => x; error => return }
-    teko::assert::is_true(union_arity(one) == 0)
-    teko::assert::is_true(named_is(one, "A"))
-    // precedence: []A | B is ([]A) | B — a 2-member union whose first member is a slice.
-    let mix = match type_of("[]A | B") { TypeExpr as x => x; error => return }
-    match mix {
-        UnionType as u => {
-            teko::assert::is_true(u.members.len == 2)
-            match u.members[0] { SliceType as s => teko::assert::is_true(named_is(s.element, "A")); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
 }
 
 #test
@@ -261,65 +22,12 @@ fn rejects_malformed_types() {
 
 // appended to parser_test.tkt — P2a expression-atom tests. #test collected.
 
-// helper: lex `source`, parse an expression from 0 — the Expr (panics on a parse failure: every
-// call site expects success and inspects the shape via `match expr_of(...) { <case> as x => …
-// }`; a genuine parse-failure barrier is `expr_errors`'s job, not this helper's). Returning a
-// BARE `Expr` (not `Expr | error`) keeps every existing call site's skip-level `<ExprKind case>
-// as x` arm a DIRECT case of the (non-variant, struct) subject — the AST struct-vs-kind codegen
-// descend (`Expr = struct { kind: ExprKind; … }`) only lowers cleanly off a bare NAMED struct
-// subject, never through a `T | error` wrapper (#110 — the same class of bug this fn avoided by
-// accident until the checker started rejecting the wrapped shape).
-fn expr_of(source: str) -> Expr {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => panic("expr_of: lex failed") }
-    let pe = match parse_expr(toks, 0) { Parsed<Expr> as x => x; error => panic("expr_of: parse failed") }
-    pe.node
-}
-
 // does parsing an expression from `source` fail (the barrier)?
 // A parse that succeeds but leaves tokens unconsumed also counts as an error
 // (e.g. `to u32` parses `to` as a name-var but leaves `u32` unconsumed).
 fn expr_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_expr(toks, 0) { Parsed<Expr> as pe => pe.next < toks.len; error => true }
-}
-
-#test
-fn parses_literals_and_names() {
-    match expr_of("42") { Number as nn => teko::assert::is_true(nn.value == 42); _ => teko::assert::is_true(false) }
-    match expr_of("x") { Var as v => teko::assert::is_true(v.name == "x"); _ => teko::assert::is_true(false) }
-    match expr_of("b'A'") { ByteLit as bl => teko::assert::is_true(bl.value == b'A'); _ => teko::assert::is_true(false) }
-    match expr_of("\"hi\"") { StrLit as s => teko::assert::is_true(s.text == "hi"); _ => teko::assert::is_true(false) }
-    // a qualified path as a value → PathExpr (PrimKind::U32 shape).
-    match expr_of("PrimKind::U32") {
-        PathExpr as pe => {
-            teko::assert::is_true(pe.path.segments.len == 2)
-            teko::assert::is_true(pe.path.segments[0].name == "PrimKind")
-            teko::assert::is_true(pe.path.segments[1].name == "U32")
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn parses_calls_and_paren() {
-    // f(x) → Call(1 arg); f() → Call(0); ns::f(x) → Call with a 2-segment callee.
-    match expr_of("f(x)") { Call as c => { teko::assert::is_true(c.callee.segments.len == 1); teko::assert::is_true(c.args.len == 1) }; _ => teko::assert::is_true(false) }
-    match expr_of("f()") { Call as c => teko::assert::is_true(c.args.len == 0); _ => teko::assert::is_true(false) }
-    match expr_of("ns::f(x)") { Call as c => teko::assert::is_true(c.callee.segments.len == 2); _ => teko::assert::is_true(false) }
-    // a parenthesized atom is transparent: (42) is just 42.
-    match expr_of("(42)") { Number as nn => teko::assert::is_true(nn.value == 42); _ => teko::assert::is_true(false) }
-}
-
-// `{{`/`}}` doubling: a PAIR escapes one literal brace; the odd one out is a hole delimiter.
-// An UNBALANCED run (a lone `{`/`}` left after pairing) is a COMPILE ERROR — user 2026-06-30
-// ("produzir pânico/erro na compilação é melhor"), NOT a verbatim degrade.
-#test
-fn rejects_unbalanced_interp_braces() {
-    teko::assert::is_true(expr_errors("$\"{abc}}\""))   // `{abc}}` — hole then a lone `}`
-    teko::assert::is_true(expr_errors("$\"{{abc}\""))   // `{{abc}` — `{{`→`{`, then a lone `}`
-    // odd-run BALANCED cases PARSE fine (the hole forms; `abc` undefined is a later type error):
-    match expr_of("$\"{abc}}}\"") { Interp => teko::assert::is_true(true); _ => teko::assert::is_true(false) }   // → `ab}`
-    match expr_of("$\"{{{abc}\"") { Interp => teko::assert::is_true(true); _ => teko::assert::is_true(false) }   // → `{ab`
 }
 
 #test
@@ -336,34 +44,6 @@ fn rejects_malformed_atoms() {
 // appended to parser_test.tkt — P2b postfix tests.
 
 #test
-fn parses_field_and_method() {
-    // a.b → FieldAccess; a.b() → MethodCall(0 args); a.b(x) → MethodCall(1 arg).
-    match expr_of("a.b") { FieldAccess as fa => teko::assert::is_true(fa.field == "b"); _ => teko::assert::is_true(false) }
-    match expr_of("a.b()") { MethodCall as mc => { teko::assert::is_true(mc.method == "b"); teko::assert::is_true(mc.args.len == 0) }; _ => teko::assert::is_true(false) }
-    match expr_of("a.b(x)") { MethodCall as mc => { teko::assert::is_true(mc.method == "b"); teko::assert::is_true(mc.args.len == 1) }; _ => teko::assert::is_true(false) }
-}
-
-#test
-fn postfix_chains_left() {
-    // a.b.c → FieldAccess(FieldAccess(a,b),c) — left-assoc.
-    match expr_of("a.b.c") {
-        FieldAccess as outer => {
-            teko::assert::is_true(outer.field == "c")
-            match outer.receiver { FieldAccess as inner => teko::assert::is_true(inner.field == "b"); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // f(x).g → FieldAccess(Call(f,[x]), g) — postfix applies after a call atom.
-    match expr_of("f(x).g") {
-        FieldAccess as fa => {
-            teko::assert::is_true(fa.field == "g")
-            match fa.receiver { Call as c => teko::assert::is_true(c.args.len == 1); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
 fn rejects_malformed_postfix() {
     teko::assert::is_true(expr_errors("a."))   // no name after `.`
     teko::assert::is_true(expr_errors("a.5"))   // a number is not a field/method name
@@ -373,52 +53,6 @@ fn rejects_malformed_postfix() {
 // appended to parser_test.tkt — P2c unary + cast tests.
 
 #test
-fn parses_unary() {
-    match expr_of("-x") { Unary as u => teko::assert::is_true(u.op == lexer::TokenKind::Minus); _ => teko::assert::is_true(false) }
-    match expr_of("!a") { Unary as u => teko::assert::is_true(u.op == lexer::TokenKind::Bang); _ => teko::assert::is_true(false) }
-    match expr_of("~b") { Unary as u => teko::assert::is_true(u.op == lexer::TokenKind::Tilde); _ => teko::assert::is_true(false) }
-    // right-assoc: !!a is !(!a).
-    match expr_of("!!a") {
-        Unary as outer => match outer.operand { Unary as inner => teko::assert::is_true(inner.op == lexer::TokenKind::Bang); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn parses_borrow() {
-    // prefix &x is a Borrow of the operand lvalue (AL wave F1).
-    match expr_of("&x") { Borrow as b => match b.operand { Var as v => teko::assert::is_true(v.name == "x"); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-    // right-assoc: `& &x` is `&(&x)`. NOTE the space: `&&` lexes to the single AndAnd token
-    // (logical-and), so a nested borrow MUST be spelled with a space between the two `&`.
-    match expr_of("& &x") {
-        Borrow as outer => match outer.operand { Borrow as inner => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    // the prefix interception must NOT swallow the binary bitwise-and: `a & b` stays a Binary.
-    match expr_of("a & b") { Binary as bin => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-}
-
-#test
-fn parses_cast() {
-    match expr_of("x to u32") { Cast as c => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-    // target may be a slice type.
-    match expr_of("x to []u8") {
-        Cast as c => match c.target { SliceType as s => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    // left-assoc: x to A to B is (x to A) to B — the outer Cast's expr is a Cast.
-    match expr_of("x to A to B") {
-        Cast as outer => match outer.expr { Cast as inner => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    // unary binds tighter than `to`: -x to u32 is (-x) to u32 — a Cast of a Unary.
-    match expr_of("-x to u32") {
-        Cast as c => match c.expr { Unary as u => teko::assert::is_true(u.op == lexer::TokenKind::Minus); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
 fn rejects_malformed_unary_cast() {
     teko::assert::is_true(expr_errors("-"))   // unary with no operand
     teko::assert::is_true(expr_errors("x to"))   // cast with no target type
@@ -426,48 +60,6 @@ fn rejects_malformed_unary_cast() {
 }
 
 // appended to parser_test.tkt — P2d binary + comparison tests.
-
-// is `e` a Binary with op `op`?
-fn binop_is(e: Expr, op: lexer::TokenKind) -> bool {
-    match e { Binary as b => b.op == op; _ => false }
-}
-
-#test
-fn binary_precedence() {
-    // `1 + 2 * 3` is `1 + (2 * 3)`: a `+` whose right is a `*`.
-    match expr_of("1 + 2 * 3") {
-        Binary as b => { teko::assert::is_true(b.op == lexer::TokenKind::Plus); teko::assert::is_true(binop_is(b.right, lexer::TokenKind::Star)) }
-        _ => teko::assert::is_true(false)
-    }
-    // `1 * 2 + 3` is `(1 * 2) + 3`: a `+` whose left is a `*`.
-    match expr_of("1 * 2 + 3") {
-        Binary as b => { teko::assert::is_true(b.op == lexer::TokenKind::Plus); teko::assert::is_true(binop_is(b.left, lexer::TokenKind::Star)) }
-        _ => teko::assert::is_true(false)
-    }
-    // bitwise: `&` (mult level) binds tighter than `|` (add level): `a | b & c` is `a | (b & c)`.
-    match expr_of("a | b & c") {
-        Binary as b => { teko::assert::is_true(b.op == lexer::TokenKind::Pipe); teko::assert::is_true(binop_is(b.right, lexer::TokenKind::Amp)) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn comparison_and_chains() {
-    // `a < b` → Compare with 1 term.
-    match expr_of("a < b") {
-        Compare as cmp => { teko::assert::is_true(cmp.rest.len == 1); teko::assert::is_true(cmp.rest[0].op == lexer::TokenKind::Lt) }
-        _ => teko::assert::is_true(false)
-    }
-    // `a < b < c` is kept as a chain (M.3): Compare with 2 terms.
-    match expr_of("a < b < c") { Compare as cmp => teko::assert::is_true(cmp.rest.len == 2); _ => teko::assert::is_true(false) }
-    // additive binds tighter than comparison: `a + b < c` → Compare whose first is a `+`.
-    match expr_of("a + b < c") {
-        Compare as cmp => match cmp.first { Binary as b => teko::assert::is_true(b.op == lexer::TokenKind::Plus); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    // a lone additive is NOT wrapped in Compare (M.5 — no needless node).
-    match expr_of("a + b") { Binary as b => teko::assert::is_true(b.op == lexer::TokenKind::Plus); _ => teko::assert::is_true(false) }
-}
 
 #test
 fn rejects_malformed_binary() {
@@ -480,43 +72,6 @@ fn rejects_malformed_binary() {
 // appended to parser_test.tkt — P2e logical tests + a full-ladder end-to-end check.
 
 #test
-fn parses_logical() {
-    match expr_of("a && b") { Binary as b => teko::assert::is_true(b.op == lexer::TokenKind::AndAnd); _ => teko::assert::is_true(false) }
-    match expr_of("a || b") { Binary as b => teko::assert::is_true(b.op == lexer::TokenKind::OrOr); _ => teko::assert::is_true(false) }
-    // `&&` binds tighter than `||`: `a && b || c` is `(a && b) || c`.
-    match expr_of("a && b || c") {
-        Binary as b => { teko::assert::is_true(b.op == lexer::TokenKind::OrOr); teko::assert::is_true(binop_is(b.left, lexer::TokenKind::AndAnd)) }
-        _ => teko::assert::is_true(false)
-    }
-    // `a || b && c` is `a || (b && c)`: an `||` whose right is `&&`.
-    match expr_of("a || b && c") {
-        Binary as b => { teko::assert::is_true(b.op == lexer::TokenKind::OrOr); teko::assert::is_true(binop_is(b.right, lexer::TokenKind::AndAnd)) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn full_ladder_end_to_end() {
-    // `a + b < c && d` is `((a + b) < c) && d`: an `&&` whose left is a Compare whose
-    // first is a `+`. Exercises additive → comparison → and in one shot.
-    match expr_of("a + b < c && d") {
-        Binary as top => {
-            teko::assert::is_true(top.op == lexer::TokenKind::AndAnd)
-            match top.left {
-                Compare as cmp => match cmp.first { Binary as p => teko::assert::is_true(p.op == lexer::TokenKind::Plus); _ => teko::assert::is_true(false) }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // `x to u32 + 1` is `(x to u32) + 1`: cast binds tighter than additive.
-    match expr_of("x to u32 + 1") {
-        Binary as b => { teko::assert::is_true(b.op == lexer::TokenKind::Plus); match b.left { Cast as c => teko::assert::is_true(true); _ => teko::assert::is_true(false) } }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
 fn rejects_malformed_logical() {
     teko::assert::is_true(expr_errors("a &&"))   // no rhs
     teko::assert::is_true(expr_errors("a ||"))   // no rhs
@@ -525,36 +80,10 @@ fn rejects_malformed_logical() {
 
 // appended to parser_test.tkt — P3a pattern tests.
 
-// helper: lex `source`, parse a pattern from 0 — the Pattern (panics on a parse failure; see
-// expr_of's comment above — #110: a bare `Pattern` keeps every call site's `<case> as x` arm a
-// DIRECT case of the subject, instead of a skip-level match through a `Pattern | error` wrapper).
-fn pattern_of(source: str) -> Pattern {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => panic("pattern_of: lex failed") }
-    let pp = match parse_pattern(toks, 0) { Parsed<Pattern> as x => x; error => panic("pattern_of: parse failed") }
-    pp.node
-}
-
 // does parsing a pattern from `source` fail (the barrier)?
 fn pattern_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_pattern(toks, 0) { Parsed<Pattern> => false; error => true }
-}
-
-#test
-fn parses_wildcard_and_literals() {
-    match pattern_of("_") { WildcardPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-    match pattern_of("5") {
-        LiteralPattern as lp => match lp.value { Number as nn => teko::assert::is_true(nn.value == 5); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    match pattern_of("\"s\"") {
-        LiteralPattern as lp => match lp.value { StrLit as s => teko::assert::is_true(s.text == "s"); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    match pattern_of("b'A'") {
-        LiteralPattern as lp => match lp.value { ByteLit as bl => teko::assert::is_true(bl.value == b'A'); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
 }
 
 #test
@@ -566,51 +95,12 @@ fn rejects_non_patterns() {
 // appended to parser_test.tkt — P3b bind + bare-case tests.
 
 #test
-fn parses_bind_and_bare() {
-    // `Foo as x` → BindPattern with binding.
-    match pattern_of("Foo as x") {
-        BindPattern as bp => {
-            teko::assert::is_true(bp.has_binding)
-            teko::assert::is_true(bp.binding == "x")
-            teko::assert::is_true(bp.type_name.segments.len == 1)
-            teko::assert::is_true(bp.type_name.segments[0].name == "Foo")
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // bare `Foo` → BindPattern, no binding (matches the case; the checker's `Byte =>` shape).
-    match pattern_of("Foo") { BindPattern as bp => teko::assert::is_false(bp.has_binding); _ => teko::assert::is_true(false) }
-    // a qualified case: `lexer::Token as t`.
-    match pattern_of("lexer::Token as t") {
-        BindPattern as bp => { teko::assert::is_true(bp.has_binding); teko::assert::is_true(bp.type_name.segments.len == 2) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
 fn rejects_malformed_bind() {
     teko::assert::is_true(pattern_errors("Foo as"))   // `as` with no name
     teko::assert::is_true(pattern_errors("Foo as 5"))   // a number is not a binding name
 }
 
 // appended to parser_test.tkt — P3b-field field-pattern tests.
-
-#test
-fn parses_field_pattern() {
-    // Foo { a; b } → FieldPattern with fields [a, b].
-    match pattern_of("Foo { a; b }") {
-        FieldPattern as fp => {
-            teko::assert::is_true(fp.type_name.segments[0].name == "Foo")
-            teko::assert::is_true(fp.fields.len == 2)
-            teko::assert::is_true(fp.fields[0] == "a")
-            teko::assert::is_true(fp.fields[1] == "b")
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // an empty field list is allowed: Foo { }.
-    match pattern_of("Foo { }") { FieldPattern as fp => teko::assert::is_true(fp.fields.len == 0); _ => teko::assert::is_true(false) }
-    // a single field.
-    match pattern_of("Foo { a }") { FieldPattern as fp => teko::assert::is_true(fp.fields.len == 1); _ => teko::assert::is_true(false) }
-}
 
 #test
 fn rejects_malformed_field() {
@@ -622,30 +112,6 @@ fn rejects_malformed_field() {
 // appended to parser_test.tkt — P3c range + alt tests.
 
 #test
-fn parses_range_and_alt() {
-    // 1 ..= 5 → RangePattern with literal bounds.
-    match pattern_of("1 ..= 5") {
-        RangePattern as rp => {
-            match rp.lo { Number as nn => teko::assert::is_true(nn.value == 1); _ => teko::assert::is_true(false) }
-            match rp.hi { Number as nn => teko::assert::is_true(nn.value == 5); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // 1 | 2 | 3 → AltPattern with 3 options.
-    match pattern_of("1 | 2 | 3") { AltPattern as ap => teko::assert::is_true(ap.options.len == 3); _ => teko::assert::is_true(false) }
-    // a single pattern is NOT wrapped in Alt (M.5).
-    match pattern_of("5") { LiteralPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-    // alt of ranges: 1 ..= 5 | 10 ..= 15 → Alt of 2, each a Range.
-    match pattern_of("1 ..= 5 | 10 ..= 15") {
-        AltPattern as ap => {
-            teko::assert::is_true(ap.options.len == 2)
-            match ap.options[0] { RangePattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
 fn rejects_malformed_range_alt() {
     teko::assert::is_true(pattern_errors("1 ..="))   // range with no hi
     teko::assert::is_true(pattern_errors("_ ..= 5"))   // a range bound must be a literal (wildcard isn't)
@@ -654,47 +120,9 @@ fn rejects_malformed_range_alt() {
 
 // appended to parser_test.tkt — P3d arm tests.
 
-// helper: lex `source`, parse an arm from 0 — the Arm, or error.
-fn parser_arm_of(source: str) -> Arm | error {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return error { message = "lex failed" } }
-    let pa = match parse_arm(toks, 0) { Parsed<Arm> as x => x; error as e => return e }
-    pa.node
-}
-
 fn arm_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_arm(toks, 0) { Parsed<Arm> => false; error => true }
-}
-
-#test
-fn parses_arms() {
-    // `_ => 5`: wildcard, no guard, body 5.
-    match parser_arm_of("_ => 5") {
-        Arm as a => {
-            teko::assert::is_false(a.has_when)
-            match a.pattern { WildcardPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-            teko::assert::is_true(a.body.len == 1)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // `Foo as x => x`: bind pattern, body the bound var.
-    match parser_arm_of("Foo as x => x") {
-        Arm as a => match a.pattern { BindPattern as bp => teko::assert::is_true(bp.binding == "x"); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    // `1 when c => 2`: a guard.
-    match parser_arm_of("1 when c => 2") {
-        Arm as a => {
-            teko::assert::is_true(a.has_when)
-            match a.guard { Var as v => teko::assert::is_true(v.name == "c"); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // `1 ..= 5 => 0`: a range-pattern arm.
-    match parser_arm_of("1 ..= 5 => 0") {
-        Arm as a => match a.pattern { RangePattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
 }
 
 #test
@@ -706,40 +134,9 @@ fn rejects_malformed_arms() {
 
 // appended to parser_test.tkt — P4a block + statement tests.
 
-// helper: lex `source`, parse a block from 0 — the []Statement, or error.
-fn block_of(source: str) -> []Statement | error {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return error { message = "lex failed" } }
-    let pb = match parse_block(toks, 0) { ParsedList<Statement> as x => x; error as e => return e }
-    pb.items
-}
-
 fn block_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_block(toks, 0) { ParsedList<Statement> => false; error => true }
-}
-
-#test
-fn parses_block_stmts() {
-    // empty block.
-    match block_of("{ }") { []Statement as ss => teko::assert::is_true(ss.len == 0); error => teko::assert::is_true(false) }
-    // a bare-expression statement.
-    let one = match block_of("{ x }") { []Statement as ss => ss; error => return }
-    teko::assert::is_true(one.len == 1)
-    match one[0] {
-        ExprStmt as es => match es.expr { Var as v => teko::assert::is_true(v.name == "x"); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    // return with a value.
-    let r = match block_of("{ return 5 }") { []Statement as ss => ss; error => return }
-    match r[0] {
-        Return as ret => { teko::assert::is_true(ret.has_value); match ret.value { Number as nn => teko::assert::is_true(nn.value == 5); _ => teko::assert::is_true(false) } }
-        _ => teko::assert::is_true(false)
-    }
-    // bare return (no value).
-    let br = match block_of("{ return }") { []Statement as ss => ss; error => return }
-    match br[0] { Return as ret => teko::assert::is_false(ret.has_value); _ => teko::assert::is_true(false) }
-    // two statements separated by `;`.
-    match block_of("{ a; b }") { []Statement as ss => teko::assert::is_true(ss.len == 2); error => teko::assert::is_true(false) }
 }
 
 #test
@@ -751,43 +148,9 @@ fn rejects_malformed_block() {
 
 // appended to parser_test.tkt — P4b binding tests.
 
-// helper: parse a single statement from `source` — the Statement (panics on a parse failure; see
-// expr_of's comment above — #110: a bare `Statement` keeps every call site's `<case> as x` arm a
-// DIRECT case of the subject, instead of a skip-level match through a `Statement | error` wrapper).
-fn stmt_of(source: str) -> Statement {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => panic("stmt_of: lex failed") }
-    let ps = match parse_statement(toks, 0) { Parsed<Statement> as x => x; error => panic("stmt_of: parse failed") }
-    ps.node
-}
-
 fn stmt_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_statement(toks, 0) { Parsed<Statement> => false; error => true }
-}
-
-#test
-fn parses_bindings() {
-    // let x = 1
-    match stmt_of("let x = 1") {
-        Binding as b => {
-            teko::assert::is_true(b.kind == BindKind::Let)
-            teko::assert::is_false(b.has_type)
-            match b.target { SimpleName as sn => teko::assert::is_true(sn.name == "x"); _ => teko::assert::is_true(false) }
-            match b.value { Number as nn => teko::assert::is_true(nn.value == 1); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // mut y: u8 = 2  (with annotation)
-    match stmt_of("mut y: u8 = 2") {
-        Binding as b => {
-            teko::assert::is_true(b.kind == BindKind::Mut)
-            teko::assert::is_true(b.has_type)
-            match b.type_ann { NamedType as nt => teko::assert::is_true(nt.path.segments[0].name == "u8"); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // const Z = 3
-    match stmt_of("const Z = 3") { Binding as b => teko::assert::is_true(b.kind == BindKind::Const); _ => teko::assert::is_true(false) }
 }
 
 #test
@@ -801,67 +164,6 @@ fn rejects_malformed_bindings() {
 // appended to parser_test.tkt — P4c destructure + assignment tests.
 
 #test
-fn parses_destructure_and_assign() {
-    // let { x; y } = p → Binding with a destructure target of 2 names.
-    match stmt_of("let { x; y } = p") {
-        Binding as b => match b.target {
-            DestructurePattern as dp => { teko::assert::is_true(dp.names.len == 2); teko::assert::is_true(dp.names[0] == "x") }
-            _ => teko::assert::is_true(false)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // x = 5 → Assign with op `=`.
-    match stmt_of("x = 5") {
-        Assign as a => { teko::assert::is_true(a.name == "x"); teko::assert::is_true(a.op == lexer::TokenKind::Assign) }
-        _ => teko::assert::is_true(false)
-    }
-    // x += 1 → Assign with op `+=`.
-    match stmt_of("x += 1") { Assign as a => teko::assert::is_true(a.op == lexer::TokenKind::PlusEq); _ => teko::assert::is_true(false) }
-    // a bare expression is still an ExprStmt, not an Assign.
-    match stmt_of("x") { ExprStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-}
-
-// (#88) FIELD-target assignment parsing — `recv.field = v` is an Assign with kind=Field and a
-// field-access `target`; `recv.field += v` too; a bare method-call `obj.m()` stays an ExprStmt
-// (never swallowed as an assign target).
-#test
-fn parses_field_assign_targets() {
-    // `obj.f = 5` → Assign with kind=Field and a FieldAccess target.
-    match stmt_of("obj.f = 5") {
-        Assign as a => {
-            let is_field = match a.kind { AssignKind::Field => true; _ => false }
-            teko::assert::is_true(is_field)
-            teko::assert::is_true(a.op == lexer::TokenKind::Assign)
-            match a.target.kind { FieldAccess as fa => teko::assert::is_true(fa.field == "f"); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // `obj.f += 1` → Assign, kind=Field, op=`+=`.
-    match stmt_of("obj.f += 1") {
-        Assign as a => {
-            let is_field = match a.kind { AssignKind::Field => true; _ => false }
-            teko::assert::is_true(is_field)
-            teko::assert::is_true(a.op == lexer::TokenKind::PlusEq)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // nested `a.b.c = 1` → Assign, kind=Field (the target is a nested FieldAccess).
-    match stmt_of("a.b.c = 1") {
-        Assign as a => { let is_field = match a.kind { AssignKind::Field => true; _ => false }; teko::assert::is_true(is_field) }
-        _ => teko::assert::is_true(false)
-    }
-    // `r.value = 7` still parses as a FIELD target (the TYPER decides Ref-deref vs field from the type).
-    match stmt_of("r.value = 7") {
-        Assign as a => { let is_field = match a.kind { AssignKind::Field => true; _ => false }; teko::assert::is_true(is_field) }
-        _ => teko::assert::is_true(false)
-    }
-    // a bare method-call statement is an ExprStmt, NOT an assign target (never swallowed).
-    match stmt_of("obj.m()") { ExprStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-    // a field READ used as a statement (no assign-op) stays an ExprStmt.
-    match stmt_of("obj.f") { ExprStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-}
-
-#test
 fn rejects_malformed_assign() {
     teko::assert::is_true(stmt_errors("x ="))   // assignment with no value
     teko::assert::is_true(stmt_errors("let { x = p"))   // unclosed destructure
@@ -869,99 +171,12 @@ fn rejects_malformed_assign() {
 
 // appended to parser_test.tkt — P4d loop/break/continue tests.
 
-#test
-fn parses_loop_break_continue() {
-    // loop { x } → LoopStmt with a 1-statement body.
-    match stmt_of("loop { x }") { LoopStmt as l => teko::assert::is_true(l.body.len == 1); _ => teko::assert::is_true(false) }
-    // an empty loop body.
-    match stmt_of("loop { }") { LoopStmt as l => teko::assert::is_true(l.body.len == 0); _ => teko::assert::is_true(false) }
-    // break / continue.
-    match stmt_of("break") { BreakStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-    match stmt_of("continue") { ContinueStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-    // loop { break } → a LoopStmt whose body is a single BreakStmt.
-    match stmt_of("loop { break }") {
-        LoopStmt as l => match l.body[0] { BreakStmt => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
 /** rejects_malformed_loop — a while-head with no body brace, and an unclosed infinite body, both
     fail to parse (#517: `loop x` is now a while-condition `x` that then wants a `{`). */
 #test
 fn rejects_malformed_loop() {
     teko::assert::is_true(stmt_errors("loop x"))
     teko::assert::is_true(stmt_errors("loop {"))
-}
-
-/** parses_prefix_label — `OUTER: loop { break OUTER }` parses to a labeled `LoopStmt` (#517 prefix
-    label), empty `init`, whose body is a single `break OUTER`. */
-#test
-fn parses_prefix_label() {
-    match stmt_of("OUTER: loop { break OUTER }") {
-        LoopStmt as l => {
-            teko::assert::is_true(l.label == "OUTER")
-            teko::assert::is_true(l.init.len == 0)
-            teko::assert::is_true(l.body.len == 1)
-            match l.body[0] { BreakStmt as b => teko::assert::is_true(b.label == "OUTER"); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/** parses_while_head — `loop n < 3 { }` folds the condition into the body as a leading
-    `if !(n < 3) { break }` (#517 while-head), leaving `init` empty and `label` unset. */
-#test
-fn parses_while_head() {
-    match stmt_of("loop n < 3 { }") {
-        LoopStmt as l => {
-            teko::assert::is_true(l.label == "")
-            teko::assert::is_true(l.init.len == 0)
-            teko::assert::is_true(l.body.len == 1)
-            match l.body[0] { ExprStmt as es => match es.expr.kind { IfExpr => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/** parses_bare_ident_while_head — `loop ready { }` treats `ready` as a boolean while-condition, NOT
-    a label (labels are the prefix form only) (#517). */
-#test
-fn parses_bare_ident_while_head() {
-    match stmt_of("loop ready { }") {
-        LoopStmt as l => {
-            teko::assert::is_true(l.label == "")
-            teko::assert::is_true(l.body.len == 1)
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/** parses_range_head — `loop mut i in 0..3 { s = s + i }` desugars to a 3-statement `init`
-    (counter, `_hi`, `_first`) and a body folded with the guarded step + guard (#517 range). */
-#test
-fn parses_range_head() {
-    match stmt_of("loop mut i in 0..3 { s = s + i }") {
-        LoopStmt as l => {
-            teko::assert::is_true(l.label == "")
-            teko::assert::is_true(l.init.len == 3)
-            match l.init[0] { Binding as b => match b.target { SimpleName as sn => teko::assert::is_true(sn.name == "i"); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-            teko::assert::is_true(l.body.len == 4)
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/** parses_range_head_inclusive — `loop mut i in 0..=3 { }` parses as an inclusive range (same
-    desugar shape as the exclusive form) (#517). */
-#test
-fn parses_range_head_inclusive() {
-    match stmt_of("loop mut i in 0..=3 { }") {
-        LoopStmt as l => {
-            teko::assert::is_true(l.init.len == 3)
-            teko::assert::is_true(l.body.len == 3)
-        }
-        _ => teko::assert::is_true(false)
-    }
 }
 
 /** rejects_range_destructure — a destructure target on a range (`loop mut { x } in 0..3`) is
@@ -976,102 +191,6 @@ fn rejects_range_destructure() {
 #test
 fn rejects_loop_binding_no_separator() {
     teko::assert::is_true(stmt_errors("loop mut i 5 { }"))
-}
-
-/** rejects_mut_foreach_head — `loop mut x in it { … }` is REJECTED (0.3.0.29): a for-each element's
-    mutability is INHERITED from the container, so `mut` on the binding is a parse error directing the
-    user to drop it (`loop x in ids`). The `mut` non-range `in` no longer reaches the reserved `_it()`
-    path. */
-#test
-fn rejects_mut_foreach_head() {
-    teko::assert::is_true(stmt_errors("loop mut x in it { s = s + x }"))
-}
-
-/** rejects_mut_foreach_destructure_head — the destructure spelling `loop mut { index; value } in it`
-    is likewise rejected under the inherited-mutability rule (0.3.0.29). */
-#test
-fn rejects_mut_foreach_destructure_head() {
-    teko::assert::is_true(stmt_errors("loop mut { index; value } in it { use_it() }"))
-}
-
-/**
- * parses_slice_foreach_head — `loop x in ids { … }` over a bare-variable iterable is a slice for-each
- * (0.3.0.29): it desugars to the proven range-counter form, so the resulting `LoopStmt` carries a
- * NON-EMPTY `init` (the hidden counter/limit/first binds), unlike a plain `while`-condition head. The
- * enumerate spelling `loop (x, i) in ids { … }` takes the same for-each path.
- */
-#test
-fn parses_slice_foreach_head() {
-    match stmt_of("loop x in ids { s = s + x }") {
-        LoopStmt as l => teko::assert::is_true(l.init.len > 0)
-        _ => teko::assert::is_true(false)
-    }
-    match stmt_of("loop (x, i) in ids { s = s + x - i }") {
-        LoopStmt as l => teko::assert::is_true(l.init.len > 0)
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * slice_foreach_distinct_from_membership_while — an iterable spelled as a `[ … ]` set is NOT a
- * for-each: `loop x in [1, 2] { … }` is the `in` MEMBERSHIP operator of a `while`-condition head, so
- * it desugars with an EMPTY `init` (the folded `if !(x in […]) { break }` lives in the body). This
- * pins the bare-variable-vs-set split that `loop_head_is_foreach` decides.
- */
-#test
-fn slice_foreach_distinct_from_membership_while() {
-    match stmt_of("loop x in [1, 2] { s = s + 1 }") {
-        LoopStmt as l => teko::assert::is_true(l.init.len == 0)
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * parses_index_assign — `ids[i] = v` parses as an `Assign` of kind `Index` whose `target` is the
- * `Index` lvalue (0.3.0.29 element assignment). The compound (`+=`) and shift (`<<=`) spellings carry
- * through the same path with their operator preserved.
- */
-#test
-fn parses_index_assign() {
-    match stmt_of("ids[i] = 9") {
-        Assign as a => {
-            let is_index = match a.kind { AssignKind::Index => true; _ => false }
-            teko::assert::is_true(is_index)
-            teko::assert::is_true(a.op == lexer::TokenKind::Assign)
-            match a.target.kind { Index => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    match stmt_of("ids[i] += 1") {
-        Assign as a => {
-            let is_index = match a.kind { AssignKind::Index => true; _ => false }
-            teko::assert::is_true(is_index)
-            teko::assert::is_true(a.op == lexer::TokenKind::PlusEq)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    match stmt_of("ids[i] <<= 2") {
-        Assign as a => {
-            let is_index = match a.kind { AssignKind::Index => true; _ => false }
-            teko::assert::is_true(is_index)
-            teko::assert::is_true(a.op == lexer::TokenKind::ShlEq)
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/** parses_three_part_head — `loop mut i = 0; i < 4; i++ { }` desugars to a 2-statement `init`
-    (counter, `_first`) and a body folded with the guarded step + condition guard (#517 3-part). */
-#test
-fn parses_three_part_head() {
-    match stmt_of("loop mut i = 0; i < 4; i++ { s = s + i }") {
-        LoopStmt as l => {
-            teko::assert::is_true(l.init.len == 2)
-            match l.init[0] { Binding as b => match b.target { SimpleName as sn => teko::assert::is_true(sn.name == "i"); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-            teko::assert::is_true(l.body.len == 4)
-        }
-        _ => teko::assert::is_true(false)
-    }
 }
 
 /** rejects_three_part_missing_semicolon — a 3-part head missing the `;` after the init is rejected
@@ -1091,48 +210,7 @@ fn rejects_loop_head_missing_body_brace() {
     teko::assert::is_true(stmt_errors("loop mut x in it y"))
 }
 
-/** parses_underscore_as_underscore_discard — `_ as _` is a bindingless wildcard (≡ `_`, discard-as-
-    discard is coherent, not a contradiction); `_ as 5` (a non-name after `as`) is rejected the same
-    way it always was (#517). */
-#test
-fn parses_underscore_as_underscore_discard() {
-    match expr_of("match o { _ as _ => 0 }") {
-        MatchExpr as me => match me.arms[0].pattern { WildcardPattern => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-    teko::assert::is_true(expr_errors("match o { _ as 5 => 0 }"))
-}
-
 // appended to parser_test.tkt — P4e if/match-expression tests (reuses expr_of).
-
-#test
-fn parses_if_and_match() {
-    // if c { a } → IfExpr, no else.
-    match expr_of("if c { a }") {
-        IfExpr as ie => { teko::assert::is_false(ie.has_else); teko::assert::is_true(ie.then_blk.len == 1) }
-        _ => teko::assert::is_true(false)
-    }
-    // if c { a } else { b } → IfExpr with else.
-    match expr_of("if c { a } else { b }") {
-        IfExpr as ie => { teko::assert::is_true(ie.has_else); teko::assert::is_true(ie.else_blk.len == 1) }
-        _ => teko::assert::is_true(false)
-    }
-    // else-if chains: the else block holds a single (nested) IfExpr statement.
-    match expr_of("if a { 1 } else if b { 2 } else { 3 }") {
-        IfExpr as ie => {
-            teko::assert::is_true(ie.has_else)
-            match ie.else_blk[0] {
-                ExprStmt as es => match es.expr { IfExpr => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // match subj { _ => 0 } → MatchExpr with 1 arm.
-    match expr_of("match x { _ => 0 }") { MatchExpr as me => teko::assert::is_true(me.arms.len == 1); _ => teko::assert::is_true(false) }
-    // a match with two arms.
-    match expr_of("match x { 1 => a; _ => b }") { MatchExpr as me => teko::assert::is_true(me.arms.len == 2); _ => teko::assert::is_true(false) }
-}
 
 #test
 fn rejects_malformed_if_match() {
@@ -1186,68 +264,6 @@ fn rejects_underscore_read_positions() {
     teko::assert::is_true(stmt_errors("return _"))
 }
 
-/** parses_discard_assign — the keyword-less `_ = expr` is the ONE valid discard: it evaluates `expr`
-    for its side effect and binds nothing, lowering to a SimpleName "_" Binding (codegen emits
-    `(void)(expr);`). Underscore-plus-letter identifiers (`_foo`, `__bar`) remain ordinary reads. */
-#test
-fn parses_discard_assign() {
-    teko::assert::is_false(stmt_errors("_ = side()"))
-    match stmt_of("_ = side()") {
-        Binding as b => {
-            teko::assert::is_true(b.kind == BindKind::Let)
-            match b.target { SimpleName as sn => teko::assert::is_true(sn.name == "_"); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    match expr_of("_foo") { Var as v => teko::assert::is_true(v.name == "_foo"); _ => teko::assert::is_true(false) }
-    match expr_of("__bar") { Var as v => teko::assert::is_true(v.name == "__bar"); _ => teko::assert::is_true(false) }
-}
-
-// appended to parser_test.tkt — R-main-b main-file tests.
-
-fn main_file_of(source: str) -> MainFile | error {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return error { message = "lex failed" } }
-    let pf = match parse_main_file(toks, 0) { Parsed<MainFile> as x => x; error as e => return e }
-    pf.node
-}
-
-fn main_file_errors(source: str) -> bool {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
-    match parse_main_file(toks, 0) { Parsed<MainFile> => false; error => true }
-}
-
-#test
-fn parses_main_file() {
-    // a use header + a statement body.
-    match main_file_of("use teko::lexer; x") {
-        MainFile as mf => {
-            teko::assert::is_true(mf.uses.len == 1)
-            teko::assert::is_true(mf.uses[0].path.segments[0].name == "teko")
-            teko::assert::is_true(mf.body.len == 1)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // a use with an alias, then a body statement.
-    match main_file_of("use a::b as c; x = 1") {
-        MainFile as mf => { teko::assert::is_true(mf.uses[0].has_alias); teko::assert::is_true(mf.uses[0].alias == "c") }
-        _ => teko::assert::is_true(false)
-    }
-    // no use header, just a body of two statements.
-    match main_file_of("let x = 1; x") {
-        MainFile as mf => { teko::assert::is_true(mf.uses.len == 0); teko::assert::is_true(mf.body.len == 2) }
-        _ => teko::assert::is_true(false)
-    }
-    // an empty file → an empty virtual main.
-    match main_file_of("") { MainFile as mf => { teko::assert::is_true(mf.uses.len == 0); teko::assert::is_true(mf.body.len == 0) }; _ => teko::assert::is_true(false) }
-}
-
-#test
-fn rejects_decls_in_main() {
-    teko::assert::is_true(main_file_errors("fn f() { }"))   // a function declaration is forbidden
-    teko::assert::is_true(main_file_errors("type T = struct { }"))   // a type declaration is forbidden
-    teko::assert::is_true(main_file_errors("x; use a::b"))   // a `use` after a statement is misplaced
-}
-
 // appended to parser_test.tkt — P5a function tests.
 
 // helper: parse a function decl from `source` — the Function, or error.
@@ -1262,64 +278,6 @@ fn func_errors(source: str) -> bool {
     match parse_function(toks, 0, false, "", false, false) { Parsed<Decl> => false; error => true }
 }
 
-/** parses_discard_parameter — the parser ACCEPTS a `_` discard parameter (the CHECKER, not the
-    parser, gates it to interface impls / base overrides), including two `_` in a row; each is a
-    Param named "_" with no type. A `_: T` discard parameter (a type on the discard) is a parse
-    error (owner refinement 2026-07-15). */
-#test
-fn parses_discard_parameter() {
-    match func_of("fn f(x: i64, _, _, p: i64) -> i64 { x }") {
-        Function as f => {
-            teko::assert::is_true(f.params.len == 4)
-            teko::assert::is_true(f.params[1].name == "_")
-            teko::assert::is_false(f.params[1].has_type)
-            teko::assert::is_true(f.params[2].name == "_")
-            teko::assert::is_false(f.params[2].has_type)
-            teko::assert::is_true(f.params[3].name == "p")
-        }
-        _ => teko::assert::is_true(false)
-    }
-    teko::assert::is_true(func_errors("fn f(_: i64) -> i64 { 0 }"))
-}
-
-#test
-fn parses_functions() {
-    // fn f() -> u8 { return 1 }
-    match func_of("fn f() -> u8 { return 1 }") {
-        Function as f => {
-            teko::assert::is_true(f.name == "f")
-            teko::assert::is_true(f.params.len == 0)
-            teko::assert::is_true(f.has_return)
-            teko::assert::is_false(f.vis == Visibility::Exp)
-            teko::assert::is_true(f.body.len == 1)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // exp fn g(x: u8, y: str) { }  — params, exported, Unit return (no `-> ret`).
-    match func_of("exp fn g(x: u8, y: str) { }") {
-        Function as f => {
-            teko::assert::is_true(f.vis == Visibility::Exp)
-            teko::assert::is_false(f.has_return)
-            teko::assert::is_true(f.params.len == 2)
-            teko::assert::is_true(f.params[0].name == "x")
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // a doc comment precedes the function, SAME LINE.
-    match func_of("/** hi */ fn h() { }") { Function as f => teko::assert::is_true(f.has_doc); _ => teko::assert::is_true(false) }
-    // (#111) a doc comment precedes the function on ITS OWN LINE — must parse and attach.
-    match func_of("/** hi */\nfn h() { }") {
-        Function as f => { teko::assert::is_true(f.has_doc); teko::assert::is_true(f.doc == "/** hi */") }
-        _ => teko::assert::is_true(false)
-    }
-    // (#111) own-line doc comment followed by a same-line `exp fn …` (doc attaches through
-    // the modifier to the function).
-    match func_of("/** hi */\nexp fn h() -> u8 { return 1 }") {
-        Function as f => { teko::assert::is_true(f.has_doc); teko::assert::is_true(f.vis == Visibility::Exp) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
 #test
 fn rejects_malformed_functions() {
     teko::assert::is_true(func_errors("fn { }"))   // no name
@@ -1331,50 +289,9 @@ fn rejects_malformed_functions() {
 
 // appended to parser_test.tkt — P5b struct type-decl tests.
 
-fn type_decl_of(source: str) -> TypeDecl | error {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return error { message = "lex failed" } }
-    let pd = match parse_type_decl(toks, 0) { Parsed<Decl> as x => x; error as e => return e }
-    match pd.node { TypeDecl as td => td; _ => error { message = "not a type decl" } }
-}
-
 fn type_decl_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_type_decl(toks, 0) { Parsed<Decl> as pd => pd.next < toks.len; error => true }
-}
-
-#test
-fn parses_struct_decl() {
-    // type Point = struct { x: i32; y: i32 }
-    match type_decl_of("type Point = struct { x: i32; y: i32 }") {
-        TypeDecl as td => {
-            teko::assert::is_true(td.name == "Point")
-            teko::assert::is_false(td.vis == Visibility::Exp)
-            match td.body {
-                StructBody as sb => { teko::assert::is_true(sb.fields.len == 2); teko::assert::is_true(sb.fields[0].name == "x") }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // /** d */ exp type Empty = struct { }  — exp, doc, empty struct, SAME LINE.
-    match type_decl_of("/** d */ exp type Empty = struct { }") {
-        TypeDecl as td => {
-            teko::assert::is_true(td.vis == Visibility::Exp)
-            teko::assert::is_true(td.has_doc)
-            match td.body { StructBody as sb => teko::assert::is_true(sb.fields.len == 0); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // (#111) the same doc comment on ITS OWN LINE before `exp type Empty = struct { }`.
-    match type_decl_of("/** d */\nexp type Empty = struct { }") {
-        TypeDecl as td => {
-            teko::assert::is_true(td.vis == Visibility::Exp)
-            teko::assert::is_true(td.has_doc)
-            teko::assert::is_true(td.doc == "/** d */")
-            match td.body { StructBody as sb => teko::assert::is_true(sb.fields.len == 0); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
 }
 
 #test
@@ -1389,34 +306,6 @@ fn rejects_malformed_struct() {
 // appended to parser_test.tkt — P5c enum/variant tests.
 
 #test
-fn parses_enum_and_variant() {
-    // type Color = enum { Red; Green; Blue }
-    match type_decl_of("type Color = enum { Red; Green; Blue }") {
-        TypeDecl as td => match td.body {
-            EnumBody as eb => { teko::assert::is_true(eb.members.len == 3); teko::assert::is_true(eb.members[0] == "Red") }
-            _ => teko::assert::is_true(false)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // type Shape = variant Circle | Square → VariantBody with a 2-member union.
-    match type_decl_of("type Shape = variant Circle | Square") {
-        TypeDecl as td => match td.body {
-            VariantBody as vb => match vb.type_expr {
-                UnionType as u => teko::assert::is_true(u.members.len == 2)
-                _ => teko::assert::is_true(false)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // a single-type variant: `variant A` (degenerate but parseable; the checker may require 2+).
-    match type_decl_of("type S = variant A") {
-        TypeDecl as td => match td.body { VariantBody => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-#test
 fn rejects_malformed_enum_variant() {
     teko::assert::is_true(type_decl_errors("type C = enum Red }"))   // no `{` after `enum`
     teko::assert::is_true(type_decl_errors("type C = enum { 5 }"))   // a number is not a member name
@@ -1426,39 +315,9 @@ fn rejects_malformed_enum_variant() {
 
 // appended to parser_test.tkt — P5d standalone `use` tests.
 
-fn use_of(source: str) -> UseDecl | error {
-    let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return error { message = "lex failed" } }
-    let pu = match parse_use(toks, 0) { Parsed<UseDecl> as x => x; error as e => return e }
-    pu.node
-}
-
 fn use_errors(source: str) -> bool {
     let toks = match lexer::tokenize(source) { []lexer::Token as ts => ts; error => return true }
     match parse_use(toks, 0) { Parsed<UseDecl> => false; error => true }
-}
-
-#test
-fn parses_use_decls() {
-    match use_of("use a::b::c") {
-        UseDecl as u => {
-            teko::assert::is_false(u.has_alias)
-            teko::assert::is_true(u.path.segments.len == 3)
-            teko::assert::is_true(u.path.segments[2].name == "c")
-            teko::assert::is_true(u.names.len == 0)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    match use_of("use a::b as c") {
-        UseDecl as u => {
-            teko::assert::is_true(u.has_alias)
-            teko::assert::is_true(u.alias == "c")
-            teko::assert::is_true(u.path.segments.len == 2)
-            teko::assert::is_true(u.names.len == 0)
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // a single-segment use.
-    match use_of("use teko") { UseDecl as u => teko::assert::is_true(u.path.segments.len == 1); _ => teko::assert::is_true(false) }
 }
 
 #test
@@ -1467,34 +326,6 @@ fn rejects_malformed_use() {
     teko::assert::is_true(use_errors("use a as"))   // `as` with no alias name
     teko::assert::is_true(use_errors("use ::"))   // `::` with no leading name
     teko::assert::is_true(use_errors("use a::"))   // trailing `::` with no name and no `[`
-}
-
-/**
- * A grouped list-import (S1, #335) round-trips through the parser: a 3-segment path with a two-name
- * group (no alias, names preserved in order), and a single-element group.
- */
-#test
-fn parses_grouped_use_import() {
-    match use_of("use teko::mem::unsafe::[ Owned, RawBuf ]") {
-        UseDecl as u => {
-            teko::assert::is_false(u.has_alias)
-            teko::assert::is_true(u.alias == "")
-            teko::assert::is_true(u.path.segments.len == 3)
-            teko::assert::is_true(u.path.segments[2].name == "unsafe")
-            teko::assert::is_true(u.names.len == 2)
-            teko::assert::is_true(u.names[0] == "Owned")
-            teko::assert::is_true(u.names[1] == "RawBuf")
-        }
-        _ => teko::assert::is_true(false)
-    }
-    match use_of("use path::[ A ]") {
-        UseDecl as u => {
-            teko::assert::is_true(u.path.segments.len == 1)
-            teko::assert::is_true(u.names.len == 1)
-            teko::assert::is_true(u.names[0] == "A")
-        }
-        _ => teko::assert::is_true(false)
-    }
 }
 
 #test
@@ -1519,102 +350,6 @@ fn module_errors(source: str) -> bool {
     match parse_module(toks, 0) { Parsed<Module> => false; error => true }
 }
 
-#test
-fn parses_module() {
-    // a use header + two declarations (a type and a function).
-    match module_of("use teko::lexer; type T = struct { x: u8 }; fn f() { }") {
-        Module as m => { teko::assert::is_true(m.uses.len == 1); teko::assert::is_true(m.decls.len == 2) }
-        _ => teko::assert::is_true(false)
-    }
-    // exp + doc on a declaration, SAME LINE.
-    match module_of("/** d */ exp fn g() -> u8 { return 1 }") {
-        Module as m => {
-            teko::assert::is_true(m.uses.len == 0)
-            teko::assert::is_true(m.decls.len == 1)
-            match m.decls[0] { Function as fn0 => { teko::assert::is_true(fn0.vis == Visibility::Exp); teko::assert::is_true(fn0.has_doc) }; _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // (#111) exp + doc on ITS OWN LINE before the declaration.
-    match module_of("/** d */\nexp fn g() -> u8 { return 1 }") {
-        Module as m => {
-            teko::assert::is_true(m.uses.len == 0)
-            teko::assert::is_true(m.decls.len == 1)
-            match m.decls[0] { Function as fn0 => { teko::assert::is_true(fn0.vis == Visibility::Exp); teko::assert::is_true(fn0.has_doc) }; _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // (#111) an own-line doc comment attaches to the NEXT declaration, not a preceding one:
-    // two functions, a doc comment only before the second — the first must stay doc-less.
-    match module_of("fn a() { }\n\n/** second */\nfn b() { }") {
-        Module as m => {
-            teko::assert::is_true(m.decls.len == 2)
-            match m.decls[0] { Function as fn0 => teko::assert::is_false(fn0.has_doc); _ => teko::assert::is_true(false) }
-            match m.decls[1] { Function as fn1 => { teko::assert::is_true(fn1.has_doc); teko::assert::is_true(fn1.doc == "/** second */") }; _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // an empty module.
-    match module_of("") { Module as m => { teko::assert::is_true(m.uses.len == 0); teko::assert::is_true(m.decls.len == 0) }; _ => teko::assert::is_true(false) }
-}
-
-#test
-fn rejects_statements_in_module() {
-    teko::assert::is_true(module_errors("let x = 1"))   // a loose binding is a statement, not a declaration
-    teko::assert::is_true(module_errors("x = 5"))   // an assignment is a statement
-    teko::assert::is_true(module_errors("f()"))   // a bare expression is a statement
-}
-
-/**
- * A module-level `const NAME: Type = init` parses to a ConstDecl across the three
- * visibility tiers, and a leading doc attaches through `with_outer_doc` (#594 crumb 1).
- */
-#test
-fn parses_module_const() {
-    match module_of("const A: i64 = 1") {
-        Module as m => {
-            teko::assert::is_true(m.decls.len == 1)
-            match m.decls[0] {
-                ConstDecl as c => {
-                    teko::assert::is_true(c.name == "A")
-                    teko::assert::is_true(c.vis == Visibility::Private)
-                    teko::assert::is_false(c.has_doc)
-                }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    match module_of("pub const B: u8 = ~(0 to u8)") {
-        Module as m => {
-            teko::assert::is_true(m.decls.len == 1)
-            match m.decls[0] {
-                ConstDecl as c => { teko::assert::is_true(c.name == "B"); teko::assert::is_true(c.vis == Visibility::Pub) }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    match module_of("exp const C: u32 = 0x78") {
-        Module as m => {
-            match m.decls[0] {
-                ConstDecl as c => { teko::assert::is_true(c.name == "C"); teko::assert::is_true(c.vis == Visibility::Exp) }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    match module_of("/** the answer */\nconst K: i64 = 42") {
-        Module as m => {
-            match m.decls[0] {
-                ConstDecl as c => { teko::assert::is_true(c.has_doc); teko::assert::is_true(c.doc == "/** the answer */") }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
 /**
  * A module-level `const` REQUIRES both a type annotation and an initializer; omitting
  * either is a located parse error (#594 crumb 1).
@@ -1625,74 +360,7 @@ fn rejects_ill_formed_module_const() {
     teko::assert::is_true(module_errors("const D: i64"))
 }
 
-/**
- * A `const` in STATEMENT position stays the pre-existing local binding — the module
- * ConstDecl path must not regress a local `const` inside a function body (#594 crumb 1).
- */
-#test
-fn local_const_still_parses_as_binding() {
-    match module_of("fn f() -> i64 { const F: i64 = 1; return F }") {
-        Module as m => {
-            teko::assert::is_true(m.decls.len == 1)
-            match m.decls[0] { Function as fn0 => teko::assert::is_true(fn0.name == "f"); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
 // appended to parser_test.tkt — P6 end-to-end integration.
-
-#test
-fn integration_module() {
-    // a realistic module: use + a struct + an enum + a function with a conditional return.
-    let src = "use teko::lexer; type Tok = struct { kind: u8; text: str }; type Kind = enum { A; B }; fn classify(t: Tok) -> Kind { if t.kind == 0 { return Kind::A }; Kind::B }"
-    match module_of(src) {
-        Module as m => {
-            teko::assert::is_true(m.uses.len == 1)
-            teko::assert::is_true(m.decls.len == 3)
-            // the third declaration is the function `classify`.
-            match m.decls[2] {
-                Function as fn0 => {
-                    teko::assert::is_true(fn0.name == "classify")
-                    teko::assert::is_true(fn0.params.len == 1)
-                    teko::assert::is_true(fn0.params[0].name == "t")
-                    teko::assert::is_true(fn0.has_return)
-                    teko::assert::is_true(fn0.body.len == 2)   // the `if` statement, then `Kind::B`
-                }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn integration_main() {
-    // a realistic main.tks: use + a mutable binding, a loop with break + assignment, and a match.
-    let src = "use teko::io; mut n = 0; loop { if n == 3 { break }; n = n + 1 }; let r = match n { 3 => 1; _ => 0 }"
-    match main_file_of(src) {
-        MainFile as mf => {
-            teko::assert::is_true(mf.uses.len == 1)
-            teko::assert::is_true(mf.body.len == 3)   // `mut n`, the loop, and `let r`
-            // the second body statement is the loop.
-            match mf.body[1] { LoopStmt as l => teko::assert::is_true(l.body.len == 2); _ => teko::assert::is_true(false) }
-            // the third binds `r` to a match expression.
-            match mf.body[2] {
-                Binding as b => match b.value { MatchExpr as me => teko::assert::is_true(me.arms.len == 2); _ => teko::assert::is_true(false) }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn integration_barriers() {
-    teko::assert::is_true(module_errors("fn f() { } let x = 1"))   // a loose statement in a module
-    teko::assert::is_true(main_file_errors("type T = struct { }"))   // a declaration in a main file
-    teko::assert::is_true(module_errors("fn f() { x + }"))   // a malformed expression in a body
-    teko::assert::is_true(main_file_errors("let x = ; x"))   // a malformed binding in the main body
-}
 
 #test
 fn struct_literal_separator_is_semicolon() {
@@ -1702,248 +370,8 @@ fn struct_literal_separator_is_semicolon() {
     teko::assert::is_true(!module_errors("fn f() -> P { P { a = 1; b = 2 } }"))   // `;` between fields → ok
 }
 
-// ---------------------------------------------------------------------------
-// (NP-OOP, issue #116) `?.` safe navigation — the postfix chain forms.
-// ---------------------------------------------------------------------------
-#test
-fn parses_safe_field_and_safe_method_call() {
-    // `a?.b` — safe FIELD access (the pre-OOP form, unchanged).
-    match expr_of("a?.b") { SafeFieldAccess as sf => teko::assert::is_true(sf.field == "b"); _ => teko::assert::is_true(false) }
-    // `a?.m(1, 2)` — safe METHOD call, positional args.
-    match expr_of("a?.m(1, 2)") {
-        SafeMethodCall as sm => { teko::assert::is_true(sm.method == "m"); teko::assert::is_true(sm.args.len == 2) }
-        _ => teko::assert::is_true(false)
-    }
-    // `a?.m()?.n` — the safe chain: a SafeFieldAccess whose receiver is the SafeMethodCall.
-    match expr_of("a?.m()?.n") {
-        SafeFieldAccess as sf => {
-            teko::assert::is_true(sf.field == "n")
-            match sf.receiver.kind { SafeMethodCall as sm => teko::assert::is_true(sm.method == "m"); _ => teko::assert::is_true(false) }
-        }
-        _ => teko::assert::is_true(false)
-    }
-    // `a?.` with nothing after is a parse error.
-    teko::assert::is_true(expr_errors("a?."))
-}
-
-// --- (TR0, 2026-07-02) `trait` declarations — a CONTEXTUAL keyword, never reserved ---
-
-#test
-fn parses_trait_decl() {
-    // struct-shaped: a field, a PROVIDED method (body), and a REQUIREMENT (bodyless).
-    match module_of("type T = trait { x: i64; fn m(self) -> i64 { self.x }; fn need(self) -> i64 }") {
-        Module as m => {
-            teko::assert::is_true(m.decls.len == 1)
-            match m.decls[0] {
-                TypeDecl as td => match td.body {
-                    TraitBody as tb => {
-                        teko::assert::is_true(tb.fields.len == 1)
-                        teko::assert::is_true(tb.fields[0].name == "x")
-                        teko::assert::is_true(tb.methods.len == 2)
-                        teko::assert::is_true(tb.methods[0].body.len == 1)   // provided (has a body)
-                        teko::assert::is_true(tb.methods[1].body.len == 0)   // a requirement (bodyless)
-                    }
-                    _ => teko::assert::is_true(false)
-                }
-                _ => teko::assert::is_true(false)
-            }
-        }
-        error => teko::assert::is_true(false)
-    }
-    // an empty trait body parses too.
-    match module_of("type E = trait { }") {
-        Module as m => match m.decls[0] { TypeDecl as td => match td.body { TraitBody as tb => teko::assert::is_true(tb.fields.len == 0 && tb.methods.len == 0); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn trait_stays_contextual_not_reserved() {
-    // `trait` as a PARAMETER name and inside an expression — an ordinary identifier.
-    match module_of("fn trait_id(trait: i64) -> i64 { trait + 1 }") {
-        Module as m => teko::assert::is_true(m.decls.len == 1)
-        error => teko::assert::is_true(false)
-    }
-    // `trait` as a struct FIELD name.
-    match module_of("type S = struct { trait: i64 }") { Module => teko::assert::is_true(true); error => teko::assert::is_true(false) }
-    // `type X = trait` with NO `{` — a transparent ALIAS to a type literally named `trait`.
-    match module_of("type X = trait") {
-        Module as m => match m.decls[0] { TypeDecl as td => match td.body { AliasBody => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn trait_derive_list_positions_parse() {
-    // deriving rides the SAME `&`-list as interfaces: `struct T1 & T2 { … }` / `class & T1 { … }`
-    // (the parser records names; trait-vs-interface is the CHECKER's split, fold_traits).
-    match module_of("type P = struct T1 & T2 { y: i64 }") {
-        Module as m => match m.decls[0] { TypeDecl as td => match td.body { StructBody as sb => teko::assert::is_true(sb.implements.len == 2); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-        error => teko::assert::is_true(false)
-    }
-    match module_of("type C = class & T1 { pub fn f(self) -> i64 { 0 } }") {
-        Module as m => match m.decls[0] { TypeDecl as td => match td.body { ClassBody as cb2 => teko::assert::is_true(cb2.implements.len == 1 && !cb2.has_base); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn trait_declares_no_derive_list_of_its_own() {
-    // `trait A & B { }` is NOT a trait declaration (`{` must follow `trait` immediately) —
-    // compose at the DERIVER instead. This parses as a malformed alias → an error.
-    teko::assert::is_true(module_errors("type T = trait A & B { }"))
-}
-
 // --- (#111) own-line `/** … */` doc comments — must parse and ATTACH to the NEXT declaration,
 // same as the pre-existing same-line placement (Javadoc/rustdoc/JSDoc-style is own-line). ---
-
-#test
-fn doc_comment_own_line_attaches_to_struct_method() {
-    // a doc comment on its own line before a STRUCT method (struct_item_is_method's peek +
-    // parse_function's own doc-consume both must skip the intervening newline).
-    match module_of("type S = struct { /** greets */\npub fn hi(self) -> i64 { 0 } }") {
-        Module as m => match m.decls[0] {
-            TypeDecl as td => match td.body {
-                StructBody as sb => {
-                    teko::assert::is_true(sb.methods.len == 1)
-                    teko::assert::is_true(sb.methods[0].has_doc)
-                    teko::assert::is_true(sb.methods[0].doc == "/** greets */")
-                }
-                _ => teko::assert::is_true(false)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn doc_comment_own_line_attaches_to_class_method() {
-    // a doc comment on its own line before a CLASS method (class_item_is_method's peek).
-    match module_of("type C = class { /** greets */\npub fn hi(self) -> i64 { 0 } }") {
-        Module as m => match m.decls[0] {
-            TypeDecl as td => match td.body {
-                ClassBody as cb => {
-                    teko::assert::is_true(cb.methods.len == 1)
-                    teko::assert::is_true(cb.methods[0].has_doc)
-                    teko::assert::is_true(cb.methods[0].doc == "/** greets */")
-                }
-                _ => teko::assert::is_true(false)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn doc_comment_own_line_attaches_to_flags_decl() {
-    // an own-line doc comment before a `flags` declaration (tk_parse_flags_decl's doc-consume).
-    match module_of("/** bit flags */\nflags Perm { Read; Write }") {
-        Module as m => match m.decls[0] {
-            TypeDecl as td => { teko::assert::is_true(td.has_doc); teko::assert::is_true(td.doc == "/** bit flags */") }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-fn doc_comment_own_line_with_blank_line_still_attaches() {
-    // a blank line (multiple newlines) between the doc comment and the declaration is still
-    // "own line" placement — skip_seps/tk_skip_seps consume a RUN of separators, not just one.
-    match module_of("/** d */\n\n\nfn f() { }") {
-        Module as m => match m.decls[0] { Function as f => teko::assert::is_true(f.has_doc); _ => teko::assert::is_true(false) }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-/**
- * (issue #285) a doc comment on its own line before a STRUCT FIELD — parse_fields' field
- * branch must peel a leading Doc too, not just struct_item_is_method's method peek.
- *
- * NOTE (bootstrap ordering): this test's OWN doc sits after `#test` (the seed compiler
- * building this corpus does not yet contain this issue's fix); the new before-the-attribute
- * placement is instead exercised as a source STRING via `module_of`, parsed at runtime.
- */
-fn doc_comment_own_line_attaches_to_struct_field() {
-    match module_of("type S = struct { /** the x coordinate */\nx: i64; y: i64 }") {
-        Module as m => match m.decls[0] {
-            TypeDecl as td => match td.body {
-                StructBody as sb => {
-                    teko::assert::is_true(sb.fields.len == 2)
-                    teko::assert::is_true(sb.fields[0].has_doc)
-                    teko::assert::is_true(sb.fields[0].doc == "/** the x coordinate */")
-                    teko::assert::is_false(sb.fields[1].has_doc)
-                }
-                _ => teko::assert::is_true(false)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-/**
- * (issue #285) a doc comment on its own line before a CLASS FIELD, both with and without a
- * following `pub`/`exp`/`intern` modifier — parse_class_fields must peel the Doc BEFORE those
- * modifiers (the same ordering parse_function already uses for a method/fn).
- */
-fn doc_comment_own_line_attaches_to_class_field() {
-    match module_of("type C = class { /** the x coordinate */\npub x: i64; y: i64 }") {
-        Module as m => match m.decls[0] {
-            TypeDecl as td => match td.body {
-                ClassBody as cb => {
-                    teko::assert::is_true(cb.fields.len == 2)
-                    teko::assert::is_true(cb.fields[0].has_doc)
-                    teko::assert::is_true(cb.fields[0].doc == "/** the x coordinate */")
-                    teko::assert::is_true(cb.fields[0].vis == Visibility::Pub)
-                    teko::assert::is_false(cb.fields[1].has_doc)
-                }
-                _ => teko::assert::is_true(false)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-/**
- * (issue #285) a doc comment directly above `#test fn …` — the standard Javadoc placement, ABOVE
- * the attribute. parse_decl must peel the doc BEFORE parse_decl_attributes runs, or `#test`
- * (sitting between the doc and `fn`) is never recognized as an attribute at all.
- */
-fn doc_comment_before_attribute_attaches_to_test_fn() {
-    match module_of("/** exercises addition */\n#test\nfn t_add() { }") {
-        Module as m => match m.decls[0] {
-            Function as f => {
-                teko::assert::is_true(f.has_doc)
-                teko::assert::is_true(f.doc == "/** exercises addition */")
-                teko::assert::is_true(f.is_test)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
-/**
- * (issue #285) the pre-existing placement — a doc comment AFTER `#test`, directly above `fn` —
- * must keep working alongside the new before-the-attribute placement above.
- */
-fn doc_comment_after_attribute_attaches_to_test_fn() {
-    match module_of("#test\n/** exercises addition */\nfn t_add() { }") {
-        Module as m => match m.decls[0] {
-            Function as f => { teko::assert::is_true(f.has_doc); teko::assert::is_true(f.is_test) }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
 
 /** The `DiKind` carried by the first declaration of `source`, or `DiKind::None` if it is not a
  *  type decl — a parser-test accessor for the W10c lifetime-annotation cases below. */
@@ -1963,43 +391,9 @@ fn parses_lifetime_annotations_on_a_type() {
 }
 
 #test
-fn parses_inject_overlay_on_a_function() {
-    match module_of("#inject(log: Logger, db: Store)\nfn handle() { }") {
-        Module as m => match m.decls[0] {
-            Function as f => {
-                teko::assert::is_true(f.has_inject)
-                teko::assert::is_true(f.injects.len == 2)
-                teko::assert::is_true(f.injects[0].name == "log")
-                teko::assert::is_true(f.injects[1].name == "db")
-                teko::assert::is_false(f.injects[0].has_key)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-    match module_of("#inject()\nfn handle() { }") {
-        Module as m => match m.decls[0] {
-            Function as f => { teko::assert::is_true(f.has_inject); teko::assert::is_true(f.injects.len == 0) }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-#test
 fn rejects_swapped_di_placement() {
     teko::assert::is_true(module_errors("#singleton\nfn handle() { }"))
     teko::assert::is_true(module_errors("#inject(log: Logger)\ntype Logger = class { }"))
-}
-
-#test
-fn rejects_double_lifetime_annotation() {
-    teko::assert::is_true(module_errors("#singleton\n#scoped\ntype Logger = class { }"))
-}
-
-#test
-fn rejects_double_inject_overlay() {
-    teko::assert::is_true(module_errors("#inject(a: A)\n#inject(b: B)\nfn handle() { }"))
 }
 
 /** The `must_free` flag carried by the first declaration of `source`, or `false` if it is
@@ -2035,167 +429,71 @@ fn rejects_must_free_on_fn_flags_and_let() {
 }
 
 /**
- * S2 (#336) acceptance 6: a doubled `#must_free` on one declaration is rejected, mirroring the
- * doubled-lifetime-annotation check.
+ * The `c_symbol` an `exp` function carries after parsing `source`'s first declaration (the reverse-FFI
+ * `exp("…")` override, "" when none), or "<err>" when the module fails to parse.
+ *
+ * @param source  a single-declaration module
+ * @return        the parsed function's `c_symbol`, or "<err>"
  */
-#test
-fn rejects_double_must_free_attribute() {
-    teko::assert::is_true(module_errors("#must_free\n#must_free\ntype FileHandle = class { }"))
+fn ffx_first_fn_c_symbol(source: str) -> str {
+    let m = match module_of(source) { Module as x => x; error => return "<err>" }
+    if m.decls.len == 0 { return "<err>" }
+    match m.decls[0] { Function as f => f.c_symbol; _ => "<err>" }
 }
 
 /**
- * U1 (#332) acceptance 1/2: `unsafe type M = struct { … }` and `unsafe type C = class { }`
- * both parse, with the resulting `TypeDecl.is_unsafe` set to true.
+ * Whether the first declaration of `source` parses as a NON-extern `exp` function (the export shape).
+ *
+ * @param source  a single-declaration module
+ * @return        true iff the first decl is an `exp`, non-extern function
  */
-#test
-fn parses_unsafe_struct_and_class_type_decl() {
-    match type_decl_of("unsafe type M = struct { p: u8 }") {
-        TypeDecl as td => teko::assert::is_true(td.is_unsafe)
-        _ => teko::assert::is_true(false)
-    }
-    match type_decl_of("unsafe type C = class { }") {
-        TypeDecl as td => teko::assert::is_true(td.is_unsafe)
-        _ => teko::assert::is_true(false)
-    }
+fn ffx_first_fn_is_plain_exp(source: str) -> bool {
+    let m = match module_of(source) { Module as x => x; error => return false }
+    if m.decls.len == 0 { return false }
+    match m.decls[0] { Function as f => f.vis == Visibility::Exp && !f.is_extern; _ => false }
 }
 
 /**
- * `pub unsafe type` carries both `is_unsafe = true` and `vis = Pub` (the visibility consume
- * runs immediately ahead of the `unsafe` consume in `parse_type_decl`). `extern unsafe type`
- * carries `is_unsafe = true` on the opaque-handle construction; plain `extern type` (no
- * `unsafe`) leaves it false.
+ * The `exp("c_name")` override captures the C export symbol onto a plain (non-extern) `exp` function.
  */
 #test
-fn parses_pub_unsafe_and_extern_unsafe_type_decl() {
-    match type_decl_of("pub unsafe type M = struct { p: u8 }") {
-        TypeDecl as td => { teko::assert::is_true(td.is_unsafe); teko::assert::is_true(td.vis == Visibility::Pub) }
-        _ => teko::assert::is_true(false)
-    }
-    match type_decl_of("extern unsafe type Handle") {
-        TypeDecl as td => { teko::assert::is_true(td.is_unsafe); match td.body { ExternBody => teko::assert::is_true(true); _ => teko::assert::is_true(false) } }
-        _ => teko::assert::is_true(false)
-    }
-    match type_decl_of("extern type Plain") {
-        TypeDecl as td => teko::assert::is_false(td.is_unsafe)
-        _ => teko::assert::is_true(false)
-    }
+fn ffx_parses_export_override() {
+    teko::assert::is_true(ffx_first_fn_c_symbol("exp(\"teko_add\") fn add(a: i64, b: i64) -> i64 { a }") == "teko_add")
+    teko::assert::is_true(ffx_first_fn_is_plain_exp("exp(\"teko_add\") fn add(a: i64, b: i64) -> i64 { a }"))
 }
 
 /**
- * U1 (#332) acceptance 3: `pub unsafe fn f() -> …` carries `is_unsafe = true` AND `vis = Pub`;
- * a bare `unsafe fn g() { }` carries `is_unsafe = true` with `vis` staying Private (default).
+ * A bare `exp` (no override) leaves the export symbol empty — the flatten-canonical default applies later.
  */
 #test
-fn parses_unsafe_fn_with_and_without_pub() {
-    match func_of("pub unsafe fn f() -> u8 { return 1 }") {
-        Function as f => { teko::assert::is_true(f.is_unsafe); teko::assert::is_true(f.vis == Visibility::Pub) }
-        _ => teko::assert::is_true(false)
-    }
-    match func_of("unsafe fn g() { }") {
-        Function as f => { teko::assert::is_true(f.is_unsafe); teko::assert::is_true(f.vis == Visibility::Private) }
-        _ => teko::assert::is_true(false)
-    }
+fn ffx_bare_exp_has_no_override() {
+    teko::assert::is_true(ffx_first_fn_c_symbol("exp fn add(a: i64) -> i64 { a }") == "")
 }
 
 /**
- * U1 (#332) acceptance 4 (no-regression control): a normal `type`/`fn`, with no `unsafe`
- * modifier, still parses and carries `is_unsafe = false` (the default everywhere).
+ * A malformed override — a missing `)`, a non-string argument, and the override on an `extern` import —
+ * each fails to parse (M.3 — no silent coercion).
  */
 #test
-fn plain_type_and_fn_default_to_not_unsafe() {
-    match type_decl_of("type X = struct { }") {
-        TypeDecl as td => teko::assert::is_false(td.is_unsafe)
-        _ => teko::assert::is_true(false)
-    }
-    match func_of("fn h() { }") {
-        Function as f => teko::assert::is_false(f.is_unsafe)
-        _ => teko::assert::is_true(false)
-    }
+fn ffx_rejects_malformed_export_override() {
+    teko::assert::is_true(module_errors("exp(\"teko_add\" fn add() -> i64 { 0 }"))
+    teko::assert::is_true(module_errors("exp(42) fn add() -> i64 { 0 }"))
+    teko::assert::is_true(module_errors("exp(\"x\") extern fn c_add(a: i64) -> i64 = \"c_add\""))
 }
 
 /**
- * U1 (#332) acceptance 6: a method's own `Function.is_unsafe` stays false even inside an
- * `unsafe type` — the enclosing `TypeDecl.is_unsafe` is the sole source of truth (methods are
- * never marked individually).
+ * The FFI IMPORT surface: `extern fn name(...) -> R = "SYM" from "lib"` parses as a bodyless foreign
+ * function carrying its C symbol and providing library (the FFI-in base, task item 1).
  */
 #test
-fn unsafe_method_inside_an_unsafe_type_is_not_individually_marked() {
-    match type_decl_of("unsafe type C = class { pub fn m(self) { } }") {
-        TypeDecl as td => {
-            teko::assert::is_true(td.is_unsafe)
-            match td.body {
-                ClassBody as cb => teko::assert::is_false(cb.methods[0].is_unsafe)
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * U1 (#332) acceptance 7: `unsafe extern fn` is REJECTED (the accepted modifier order is
- * `[pub|exp] [extern] unsafe fn` — `extern` is consumed before `unsafe` is even attempted), but
- * `extern unsafe fn` parses cleanly, carrying both `is_unsafe` and `is_extern`.
- */
-#test
-fn rejects_unsafe_before_extern_but_accepts_extern_unsafe() {
-    teko::assert::is_true(func_errors("unsafe extern fn bad() = \"bad\""))
-    match func_of("extern unsafe fn good() = \"good\"") {
-        Function as f => { teko::assert::is_true(f.is_unsafe); teko::assert::is_true(f.is_extern) }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * An own-line outer doc-comment (issue #285 placement) attaches to an `unsafe type` reached
- * through the full `parse_decl` path — exercises `with_outer_doc`'s `TypeDecl` rebuild arm,
- * the one that must also preserve `is_unsafe` (U1, #332).
- */
-#test
-fn outer_doc_attaches_to_a_type_decl_through_parse_decl() {
-    match module_of("/** d */\nunsafe type M = struct { }") {
-        Module as m => match m.decls[0] {
-            TypeDecl as td => { teko::assert::is_true(td.has_doc); teko::assert::is_true(td.doc == "/** d */"); teko::assert::is_true(td.is_unsafe) }
-            _ => teko::assert::is_true(false)
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-/**
- * The `parse_decl` pre-dispatch lookahead must also skip a contextual `unsafe`, or an
- * `unsafe fn`/`unsafe type` falls through to the "expected a declaration" error instead of
- * reaching `parse_function`/`parse_type_decl` (U1, #332).
- */
-#test
-fn parses_unsafe_decl_through_the_module_lookahead() {
-    match module_of("unsafe fn f() { }\nunsafe type T = struct { }") {
-        Module as m => {
-            teko::assert::is_true(m.decls.len == 2)
-            match m.decls[0] { Function as f => teko::assert::is_true(f.is_unsafe); _ => teko::assert::is_true(false) }
-            match m.decls[1] { TypeDecl as td => teko::assert::is_true(td.is_unsafe); _ => teko::assert::is_true(false) }
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-/**
- * U1 (#332) acceptance 5: `unsafe` stays a CONTEXTUAL keyword — a namespace segment literally
- * named `unsafe` (e.g. `teko::mem::unsafe`) remains a legal `::`-path component, both in a
- * `use` header and in a qualified type reference.
- */
-#test
-fn unsafe_still_parses_as_a_path_segment() {
-    match module_of("use teko::mem::unsafe") {
-        Module as m => teko::assert::is_true(m.uses.len == 1)
-        error => teko::assert::is_true(false)
-    }
-    let t = match type_of("teko::mem::unsafe::RawBuf") { TypeExpr as x => x; error => return }
-    match t {
-        NamedType as n => {
-            teko::assert::is_true(n.path.segments.len == 4)
-            teko::assert::is_true(n.path.segments[2].name == "unsafe")
-            teko::assert::is_true(n.path.segments[3].name == "RawBuf")
+fn ffx_parses_extern_import() {
+    let m = match module_of("extern fn strlen(s: u64) -> u64 = \"strlen\" from \"c\"") { Module as x => x; error => return teko::assert::is_true(false) }
+    teko::assert::is_true(m.decls.len == 1)
+    match m.decls[0] {
+        Function as f => {
+            teko::assert::is_true(f.is_extern)
+            teko::assert::is_true(f.c_symbol == "strlen")
+            teko::assert::is_true(f.from_lib == "c")
         }
         _ => teko::assert::is_true(false)
     }

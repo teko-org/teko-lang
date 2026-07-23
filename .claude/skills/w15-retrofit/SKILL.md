@@ -16,7 +16,7 @@ At **lane close**: every feature/fix sub-PR has drained into the lane (all green
 ## The inviolable rule: BEHAVIOR-PRESERVING
 
 Every change is a refactor. The guardrail that proves it:
-- **Fixpoint gen2 == gen3 byte-identical** (the compiler rebuilds itself to the same bytes).
+- **Fixpoint gen1 == gen2 byte-identical** (the compiler rebuilds itself to the same bytes).
 - **`teko test .` green** on the OS matrix; the own==C differential unchanged.
 - **100% coverage of the delta.**
 

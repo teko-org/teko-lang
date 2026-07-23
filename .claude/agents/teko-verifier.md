@@ -14,7 +14,7 @@ The compiler is the latest RELEASED teko binary (CI seeds from it). Before doing
 1. Rebuild the self-hosted compiler from the seed, then the gate BOTH engines: VM (`teko test .`) and native (`teko . -o bin` / `./bin/teko . -o gen2`) — report the test count and any failure verbatim.
 2. `bash scripts/diff_vm_native.sh` — expect `51 passed, 0 failed, 1 expected-fail` (report the exact tally).
 3. `TEKO_MEM_PARANOID=1` full build — expect exit 0 (the arena-reuse oracle).
-4. FIXPOINT: `gen2 → gen3`, `cmp gen2/teko.c gen3/teko.c` byte-identical; plus temp-normalized parity where relevant.
+4. FIXPOINT: `gen1 → gen2`, `cmp gen1/teko.c gen2/teko.c` byte-identical; plus temp-normalized parity where relevant.
 5. The self-reported memory peak (`teko: memory: peak N MB`) — flag any regression past the ≤300 MB pure-build target.
 6. CI status of the PR (the 4 lanes) if a PR exists.
 

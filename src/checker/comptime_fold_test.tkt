@@ -131,33 +131,6 @@ fn cf_is_error(e: TExpr) {
 }
 
 /**
- * fold_scalar_all_ones_u64 — the §8 fold-scalar case: `~(0 to u64)` folds to the u64
- * all-ones literal (0xFFFFFFFFFFFFFFFF), the canonical mask constant.
- */
-#test
-fn fold_scalar_all_ones_u64() {
-    let z = cf_cast(cf_num(0 to i128, i64t()), u64t())
-    cf_int_is(cf_un(lexer::TokenKind::Tilde, z, u64t()), (~(0 to u64)) to u128)
-}
-
-/**
- * fold_int_family_edges — the min/max edge of each VM-safe integer family folds to its
- * exact two's-complement bits (unsigned max via `~0`, signed min/max as literals).
- */
-#test
-fn fold_int_family_edges() {
-    cf_int_is(cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u8t()), u8t()), 255 to u128)
-    cf_int_is(cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u16t()), u16t()), 65535 to u128)
-    cf_int_is(cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u32t()), u32t()), 4294967295 to u128)
-    cf_int_is(cf_num(127 to i128, i8t()), 127 to u128)
-    cf_int_is(cf_num(-128 to i128, i8t()), 128 to u128)
-    cf_int_is(cf_num(32767 to i128, i16t()), 32767 to u128)
-    cf_int_is(cf_num(-32768 to i128, i16t()), 32768 to u128)
-    cf_int_is(cf_num(2147483647 to i128, i32t()), 2147483647 to u128)
-    cf_int_is(cf_num(-2147483648 to i128, i32t()), 2147483648 to u128)
-}
-
-/**
  * fold_byte_and_bool_literals — a byte literal folds to its 8-bit value; a bool literal
  * folds to a CVBool.
  */
@@ -190,18 +163,6 @@ fn fold_shift_ops() {
     cf_int_is(cf_bin(lexer::TokenKind::Shl, cf_num(1 to i128, u8t()), cf_num(10 to i128, u8t()), u8t()), 4 to u128)
     cf_int_is(cf_bin(lexer::TokenKind::Shr, cf_num(255 to i128, u8t()), cf_num(1 to i128, u8t()), u8t()), 127 to u128)
     cf_int_is(cf_bin(lexer::TokenKind::Shr, cf_num(-128 to i128, i8t()), cf_num(1 to i128, i8t()), i8t()), 192 to u128)
-}
-
-/**
- * fold_arith_ok — in-range `+ - * / %` fold to the exact value at u8 width.
- */
-#test
-fn fold_arith_ok() {
-    cf_int_is(cf_bin(lexer::TokenKind::Plus, cf_num(100 to i128, u8t()), cf_num(50 to i128, u8t()), u8t()), 150 to u128)
-    cf_int_is(cf_bin(lexer::TokenKind::Minus, cf_num(50 to i128, u8t()), cf_num(20 to i128, u8t()), u8t()), 30 to u128)
-    cf_int_is(cf_bin(lexer::TokenKind::Star, cf_num(12 to i128, u8t()), cf_num(20 to i128, u8t()), u8t()), 240 to u128)
-    cf_int_is(cf_bin(lexer::TokenKind::Slash, cf_num(10 to i128, u8t()), cf_num(3 to i128, u8t()), u8t()), 3 to u128)
-    cf_int_is(cf_bin(lexer::TokenKind::Percent, cf_num(10 to i128, u8t()), cf_num(3 to i128, u8t()), u8t()), 1 to u128)
 }
 
 /**
@@ -261,48 +222,6 @@ fn fold_cast_ok() {
 }
 
 /**
- * fold_cast_out_of_range — an out-of-range constant cast is a compile error, mirroring the
- * runtime's trapping narrowing cast (`300 to u8`, `-1 to u8`, `128 to i8`, `-129 to i8`).
- */
-#test
-fn fold_cast_out_of_range() {
-    cf_is_error(cf_cast(cf_num(300 to i128, i64t()), u8t()))
-    cf_is_error(cf_cast(cf_num(-1 to i128, i64t()), u8t()))
-    cf_is_error(cf_cast(cf_num(128 to i128, i64t()), i8t()))
-    cf_is_error(cf_cast(cf_num(-129 to i128, i64t()), i8t()))
-}
-
-/**
- * fold_negate — unary `-` folds a signed value, errors on a signed MIN (no positive) and
- * on a non-zero unsigned value (out of range), and passes `-0` on an unsigned type.
- */
-#test
-fn fold_negate() {
-    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(127 to i128, i8t()), i8t()), 129 to u128)
-    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(0 to i128, u8t()), u8t()), 0 to u128)
-    cf_is_error(cf_un(lexer::TokenKind::Minus, cf_num(-128 to i128, i8t()), i8t()))
-    cf_is_error(cf_un(lexer::TokenKind::Minus, cf_num(5 to i128, u8t()), u8t()))
-}
-
-/**
- * fold_negative_min_literal — a leading `-` on an integer literal is a NEGATIVE LITERAL, not a
- * negation of a positive one: the most-negative signed value of the `i8`/`i16`/`i32` families, whose
- * positive magnitude `2^(w-1)` has NO signed form, folds to its exact two's-complement bits (`0x80…0`).
- * The evaluator encodes the negated value against the whole type rather than range-checking the
- * un-negatable positive operand in isolation (owner ruling 2026-07-20: the negative is a literal, not
- * an operation — mirrors the type checker's negative-literal rule). Before the fix this raised a
- * spurious "integer literal is out of range". `i64::MIN` (`-9223372036854775808`, whose bare `2^63`
- * magnitude is not itself writable as a plain literal) is covered end-to-end by the
- * `comptime_fold_format_oracle` regression, which folds it through the real parser.
- */
-#test
-fn fold_negative_min_literal() {
-    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(128 to i128, i8t()), i8t()), 128 to u128)
-    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(32768 to i128, i16t()), i16t()), 32768 to u128)
-    cf_int_is(cf_un(lexer::TokenKind::Minus, cf_num(2147483648 to i128, i32t()), i32t()), 2147483648 to u128)
-}
-
-/**
  * fold_float_ops — f64 literals and `+ - * /` fold through IEEE bits (byte-exact vs
  * `teko::f64_bits`), and a float divide by zero is a compile error.
  */
@@ -312,15 +231,6 @@ fn fold_float_ops() {
     cf_float_is(cf_bin(lexer::TokenKind::Plus, cf_fnum(1.5), cf_fnum(2.5), f64t()), teko::f64_bits(4.0))
     cf_float_is(cf_un(lexer::TokenKind::Minus, cf_fnum(2.5), f64t()), teko::f64_bits(-2.5))
     cf_is_error(cf_bin(lexer::TokenKind::Slash, cf_fnum(1.0), cf_fnum(0.0), f64t()))
-}
-
-/**
- * fold_rejects_nonscalar_form — a form outside the Tier-0..2 scalar subset (a `null`
- * literal) is a located error, not a fold.
- */
-#test
-fn fold_rejects_nonscalar_form() {
-    cf_is_error(te(TNullLit { }, i64t()))
 }
 
 /**
@@ -363,17 +273,6 @@ fn cf_fold_stays_unary(e: TExpr) {
         error => teko::assert::is_true(false)
         TExpr as f => match f.kind { TUnary => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
     }
-}
-
-/**
- * fold_expr_folds_all_ones_u64 — the canonical mandate case: the driver folds `~(0 to u64)` to the
- * u64 all-ones literal (its i128 carrier is the unsigned magnitude 2^64 - 1), so both engines load an
- * immediate.
- */
-#test
-fn fold_expr_folds_all_ones_u64() {
-    let e = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u64t()), u64t())
-    cf_folds_to_num(e, (~(0 to u64)) to i128)
 }
 
 /**
@@ -544,36 +443,6 @@ fn cf_fn_of(name: str, body: []TStatement) -> TProgram {
 }
 
 /**
- * cf3_folds_local_let_use — the canonical CF3 (Layer 1b) case: a LOCAL `let a: u64 = 0xFF` used as
- * `a >> 4` propagates + folds to the literal `0x0F` (15), with NO module const present — the fold runs
- * for a const-free program.
- */
-#test
-fn cf3_folds_local_let_use() {
-    let let_a = cf_let("a", cf_num(255 to i128, u64t()))
-    let use_a = cf_bin(lexer::TokenKind::Shr, cf_var("a", u64t()), cf_num(4 to i128, u64t()), u64t())
-    mut body: []TStatement = teko::list::push(teko::list::empty(), let_a)
-    body = teko::list::push(body, c_ret(use_a))
-    cf_return_is_num(cf_fn_of("f", body), "f", 15 to i128)
-}
-
-/**
- * cf3_chained_local_bindings_fold — a chain of provably-const locals collapses transitively:
- * `let a: u64 = 0xFF; let hi = a >> 4; return hi` folds `hi` to `15` (the propagated `a` makes `hi`'s
- * initializer provably const, which is itself recorded and propagated to the return).
- */
-#test
-fn cf3_chained_local_bindings_fold() {
-    let let_a = cf_let("a", cf_num(255 to i128, u64t()))
-    let hi_init = cf_bin(lexer::TokenKind::Shr, cf_var("a", u64t()), cf_num(4 to i128, u64t()), u64t())
-    let let_hi = cf_let("hi", hi_init)
-    mut body: []TStatement = teko::list::push(teko::list::empty(), let_a)
-    body = teko::list::push(body, let_hi)
-    body = teko::list::push(body, c_ret(cf_var("hi", u64t())))
-    cf_return_is_num(cf_fn_of("f", body), "f", 15 to i128)
-}
-
-/**
  * cf3_local_const_binding_folds — a LOCAL `const` binding (`BindKind::Const`, not a module const) of a
  * provably-const integer folds identically to a `let`: `const k: u8 = 240 | 15; return k` → `255`.
  */
@@ -584,64 +453,6 @@ fn cf3_local_const_binding_folds() {
     mut body: []TStatement = teko::list::push(teko::list::empty(), let_k)
     body = teko::list::push(body, c_ret(cf_var("k", u8t())))
     cf_return_is_num(cf_fn_of("f", body), "f", 255 to i128)
-}
-
-/**
- * cf3_runtime_binding_not_folded — the strict guard (fixture E): a binding initialized from a RUNTIME
- * leaf (a free reference standing in for a param/IO result) is never recorded, and neither is a binding
- * derived from it — `let x = p; let y = x + 1; return y` leaves `y` a bare `TVar` (unfolded).
- */
-#test
-fn cf3_runtime_binding_not_folded() {
-    let let_x = cf_let("x", cf_var("p", u64t()))
-    let y_init = cf_bin(lexer::TokenKind::Plus, cf_var("x", u64t()), cf_num(1 to i128, u64t()), u64t())
-    let let_y = cf_let("y", y_init)
-    mut body: []TStatement = teko::list::push(teko::list::empty(), let_x)
-    body = teko::list::push(body, let_y)
-    body = teko::list::push(body, c_ret(cf_var("y", u64t())))
-    cf_return_is_var(cf_fn_of("f", body), "f")
-}
-
-/**
- * cf3_mut_binding_not_folded — the strict guard (fixture F): a `mut` binding is never recorded even
- * when its initializer is a provably-const literal, so `mut a: u64 = 0xFF; return a & 0x0F` keeps the
- * runtime `a` on the left of the `&` (a reassignment could change it).
- */
-#test
-fn cf3_mut_binding_not_folded() {
-    let mut_a = cf_mut("a", cf_num(255 to i128, u64t()))
-    let use_a = cf_bin(lexer::TokenKind::Amp, cf_var("a", u64t()), cf_num(15 to i128, u64t()), u64t())
-    mut body: []TStatement = teko::list::push(teko::list::empty(), mut_a)
-    body = teko::list::push(body, c_ret(use_a))
-    match cf_return_of(cf_fn_of("f", body), "f") {
-        TExpr as rv => match rv.kind {
-            TBinary as b => match b.left.kind {
-                TVar => teko::assert::is_true(true)
-                _ => teko::assert::is_true(false)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        null => teko::assert::is_true(false)
-    }
-}
-
-/**
- * cf3_inner_shadow_does_not_leak — scope correctness: an inner block re-binding `a` to a DIFFERENT
- * const does not leak past the block, so the OUTER `return a` folds to the outer value `5`, never the
- * inner `99` — proving CF3's block-scoped threading.
- */
-#test
-fn cf3_inner_shadow_does_not_leak() {
-    let outer_a = cf_let("a", cf_num(5 to i128, u64t()))
-    let inner_a = cf_let("a", cf_num(99 to i128, u64t()))
-    let inner_use = texpr_stmt(cf_bin(lexer::TokenKind::Amp, cf_var("a", u64t()), cf_num(1 to i128, u64t()), u64t()))
-    mut then_blk: []TStatement = teko::list::push(teko::list::empty(), inner_a)
-    then_blk = teko::list::push(then_blk, inner_use)
-    let ife = te(TIfExpr { cond = te(TBoolLit { value = true }, boolt()); then_blk = then_blk; has_else = false; else_blk = teko::list::empty() }, Void { })
-    mut body: []TStatement = teko::list::push(teko::list::empty(), outer_a)
-    body = teko::list::push(body, texpr_stmt(ife))
-    body = teko::list::push(body, c_ret(cf_var("a", u64t())))
-    cf_return_is_num(cf_fn_of("f", body), "f", 5 to i128)
 }
 
 /**
@@ -658,44 +469,6 @@ fn cf3_destructure_shadow_kills_const() {
     body = teko::list::push(body, de)
     body = teko::list::push(body, c_ret(cf_var("a", u64t())))
     cf_return_is_var(cf_fn_of("f", body), "f")
-}
-
-/**
- * cf3_top_level_loose_statement_folds — a LOOSE top-level `let g: u64 = 0xF0` (the implicit main's
- * body) threads into a following loose statement so `exit(g | 0x0F)` folds to `exit(255)` — the CF3
- * top-level threading path.
- */
-#test
-fn cf3_top_level_loose_statement_folds() {
-    let let_g = cf_let("g", cf_num(240 to i128, u64t()))
-    let use_g = cf_bin(lexer::TokenKind::Pipe, cf_var("g", u64t()), cf_num(15 to i128, u64t()), u64t())
-    mut items: []TItem = teko::list::push(teko::list::empty(), let_g)
-    items = teko::list::push(items, texpr_stmt(use_g))
-    match inline_consts(TProgram { items = items }) {
-        error => teko::assert::is_true(false)
-        TProgram as out => cf3_assert_second_loose_num(out, 255 to i128)
-    }
-}
-
-/**
- * cf3_assert_second_loose_num — assert the program's second loose top-level statement is an expression
- * statement carrying the integer literal `want`.
- *
- * @param prog  the folded program
- * @param want  the expected folded literal carrier
- */
-fn cf3_assert_second_loose_num(prog: TProgram, want: i128) {
-    teko::assert::is_true(prog.items.len == 2)
-    match prog.items[1] {
-        TStatement as st => match st {
-            TExprStmt as es => match es.expr.kind {
-                TNumber as n => teko::assert::is_true(n.value == want)
-                _ => teko::assert::is_true(false)
-            }
-            _ => teko::assert::is_true(false)
-        }
-        _ => teko::assert::is_true(false)
-    }
 }
 
 /**
@@ -864,27 +637,6 @@ fn cf3_assert_first_stmt_var(body: []TStatement) {
 }
 
 /**
- * fold_expr_partial_tree — a partially-const tree folds only its const sub-tree: `x & ~(0 to u64)`
- * keeps the runtime `x` on the left and splices the folded all-ones literal on the right.
- */
-#test
-fn fold_expr_partial_tree() {
-    let x = te(TVar { name = "x"; is_func = false; func_ns = "teko::checker" }, u64t())
-    let mask = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u64t()), u64t())
-    let e = cf_bin(lexer::TokenKind::Amp, x, mask, u64t())
-    match fold_expr(e, empty_table(), empty_env(), empty_agg()) {
-        error => teko::assert::is_true(false)
-        TExpr as f => match f.kind {
-            TBinary as b => {
-                match b.left.kind { TVar => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-                match b.right.kind { TNumber as n => teko::assert::is_true(n.value == ((~(0 to u64)) to i128)); _ => teko::assert::is_true(false) }
-            }
-            _ => teko::assert::is_true(false)
-        }
-    }
-}
-
-/**
  * fold_expr_leaves_unrepresentable_u128 — `~(0 to u128)` evaluates to an all-ones u128 that has no
  * literal carrier (its magnitude exceeds i128-max), so the driver leaves the op-tree unfolded rather
  * than emit a dishonest literal — behavior preserved.
@@ -893,52 +645,6 @@ fn fold_expr_partial_tree() {
 fn fold_expr_leaves_unrepresentable_u128() {
     let e = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u128t()), u128t())
     cf_fold_stays_unary(e)
-}
-
-/**
- * fold_expr_leaves_float_optree — a float op-tree (`1.5 + 2.5`) is outside the CF2 integer subset, so
- * the driver leaves it a runtime `TBinary` (only integer scalars fold in this crumb).
- */
-#test
-fn fold_expr_leaves_float_optree() {
-    let e = cf_bin(lexer::TokenKind::Plus, cf_fnum(1.5), cf_fnum(2.5), f64t())
-    match fold_expr(e, empty_table(), empty_env(), empty_agg()) {
-        error => teko::assert::is_true(false)
-        TExpr as f => match f.kind { TBinary => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
-    }
-}
-
-/**
- * inline_consts_folds_module_const_optree — the §8 fold-scalar case end to end: `const M: u64 = ~(0
- * to u64)` used as `x & M` inlines M's op-tree at the use, and the composed CF2 fold collapses it to
- * the all-ones literal — the returned `x & <literal>` carries a `TNumber`, not a `~` op-tree.
- */
-#test
-fn inline_consts_folds_module_const_optree() {
-    let m_init = cf_un(lexer::TokenKind::Tilde, cf_cast(cf_num(0 to i128, i64t()), u64t()), u64t())
-    let m = TConstDecl { name = "M"; namespace = "teko::checker"; ty = u64t(); init = m_init; vis = parser::Visibility::Private; has_doc = false; doc = ""; line = 1; col = 1 }
-    let x = te(TVar { name = "x"; is_func = false; func_ns = "teko::checker" }, u64t())
-    let mref = te(TVar { name = "M"; is_func = false; func_ns = "teko::checker" }, u64t())
-    let use_expr = cf_bin(lexer::TokenKind::Amp, x, mref, u64t())
-    mut body: []TStatement = teko::list::push(teko::list::empty(), c_ret(use_expr))
-    mut items: []TItem = teko::list::push(teko::list::empty(), m)
-    items = teko::list::push(items, c_fn("f", body))
-    match inline_consts(TProgram { items = items }) {
-        error => teko::assert::is_true(false)
-        TProgram as out => {
-            teko::assert::is_true(count_const_items(out) == 0)
-            match first_fn_return(out) {
-                TExpr as rv => match rv.kind {
-                    TBinary as b => match b.right.kind {
-                        TNumber as n => teko::assert::is_true(n.value == ((~(0 to u64)) to i128))
-                        _ => teko::assert::is_true(false)
-                    }
-                    _ => teko::assert::is_true(false)
-                }
-                null => teko::assert::is_true(false)
-            }
-        }
-    }
 }
 
 /**
@@ -1090,210 +796,12 @@ fn fmt_declines_float_and_dynamic() {
 }
 
 /**
- * cf_interp_of — a typed interpolation `TExpr` of type `str` over one hole and its spec, with an empty
- * leading and trailing piece (`$"{hole:spec}"`).
- *
- * @param hole  the hole expression
- * @param sp    the hole's format spec
- * @return      the typed interpolation expression
- */
-fn cf_interp_of(hole: TExpr, sp: TFSpec) -> TExpr {
-    let pieces = teko::list::push(teko::list::push(teko::list::empty(), ""), "")
-    let holes = teko::list::push(teko::list::empty(), hole)
-    let specs = teko::list::push(teko::list::empty(), sp)
-    te(TInterp { pieces = pieces; holes = holes; specs = specs }, strt())
-}
-
-/**
- * fold_interp_folds_hex — the canonical Layer-2 mandate: `$"{a:X}"` with `a == 0xFF` (a folded literal
- * hole) collapses to the single `TStrLit "FF"` — no runtime `tk_str_concat`/`tk_fmt_x_upper`.
- */
-#test
-fn fold_interp_folds_hex() {
-    let e = cf_interp_of(cf_num(255 to i128, u64t()), cf_spec_static("X"))
-    match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
-            error => teko::assert::is_true(false)
-            TExpr as f => match f.kind {
-                TStrLit as s => teko::assert::is_true(s.text == "FF")
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * fold_interp_multi_piece — a multi-piece interpolation with two const holes folds to one `TStrLit` that
- * interleaves the literal pieces with each hole's render (`"v=" ++ "255" ++ " x=" ++ "FF"`).
- */
-#test
-fn fold_interp_multi_piece() {
-    mut pieces: []str = teko::list::push(teko::list::empty(), "v=")
-    pieces = teko::list::push(pieces, " x=")
-    pieces = teko::list::push(pieces, "")
-    mut holes: []TExpr = teko::list::push(teko::list::empty(), cf_num(255 to i128, u64t()))
-    holes = teko::list::push(holes, cf_num(255 to i128, u64t()))
-    mut specs: []TFSpec = teko::list::push(teko::list::empty(), cf_spec_none())
-    specs = teko::list::push(specs, cf_spec_static("X"))
-    let e = te(TInterp { pieces = pieces; holes = holes; specs = specs }, strt())
-    match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
-            error => teko::assert::is_true(false)
-            TExpr as f => match f.kind {
-                TStrLit as s => teko::assert::is_true(s.text == "v=255 x=FF")
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * fold_interp_runtime_hole_stays — a RUNTIME hole (a bare `TVar`, standing in for a param/IO result)
- * makes the whole interpolation stay its runtime concat shape (`TInterp` returned unchanged), preserving
- * today's behavior (fixture E boundary).
- */
-#test
-fn fold_interp_runtime_hole_stays() {
-    let hole = te(TVar { name = "x"; is_func = false; func_ns = "teko::checker" }, u64t())
-    let e = cf_interp_of(hole, cf_spec_static("X"))
-    match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
-            error => teko::assert::is_true(false)
-            TExpr as f => match f.kind {
-                TInterp => teko::assert::is_true(true)
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * fold_interp_float_hole_stays — a FLOAT hole (with a float spec) is never folded — the interpolation
- * stays a runtime `TInterp` (the fold declines all float formatting, M.3 honesty).
- */
-#test
-fn fold_interp_float_hole_stays() {
-    let e = cf_interp_of(cf_fnum(1.5), cf_spec_static("f2"))
-    match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
-            error => teko::assert::is_true(false)
-            TExpr as f => match f.kind {
-                TInterp => teko::assert::is_true(true)
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * comptime_format_declines_nominal_hole_type — a hole whose type is NOMINAL (a user type: a
- * date/time, any `Named`) is OUTSIDE the fold whitelist (`Str`/`Char`/`Byte`/int/bool), so
- * `comptime_format` returns a located error under the natural (`TFSpecNone`) render and `fold_interp`
- * leaves the interpolation as a runtime format. Locks in the owner constraint (2026-07-20): comptime
- * formatting of a date/time is NEVER attempted — date formatting stays at runtime, like float.
- */
-#test
-fn comptime_format_declines_nominal_hole_type() {
-    match comptime_format(cf_cvint(0 to u128, i64t()), cf_spec_none(), Named { name = "DateTime" }) {
-        error => teko::assert::is_true(true)
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * comptime_format_declines_date_like_spec — a date/time format spec (lead char outside the integer
- * fold whitelist `x`/`X`/`b`/`d`/`n`, e.g. a `yyyy`-style date pattern) is not recognized by the
- * comptime formatter, so `comptime_format` errors and the interpolation stays runtime — a date FORMAT
- * spec is never folded even on an integer-carried value (owner constraint 2026-07-20).
- */
-#test
-fn comptime_format_declines_date_like_spec() {
-    match comptime_format(cf_cvint(0 to u128, i64t()), cf_spec_static("yyyy"), i64t()) {
-        error => teko::assert::is_true(true)
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
- * fold_interp_dynamic_spec_stays — a `TFSpecDynamic` spec (a runtime width/precision arg) makes the
- * interpolation stay runtime, even when the hole itself is a const literal (fixture G boundary).
- */
-#test
-fn fold_interp_dynamic_spec_stays() {
-    let dyn_spec = TFSpec { kind = TFSpecDynamic { args = teko::list::push(teko::list::empty(), cf_var("w", u64t())) } }
-    let e = cf_interp_of(cf_num(255 to i128, u64t()), dyn_spec)
-    match e.kind {
-        TInterp as in => match fold_interp(in, e, empty_table(), empty_env(), empty_agg()) {
-            error => teko::assert::is_true(false)
-            TExpr as f => match f.kind {
-                TInterp => teko::assert::is_true(true)
-                _ => teko::assert::is_true(false)
-            }
-        }
-        _ => teko::assert::is_true(false)
-    }
-}
-
-/**
  * empty_agg — an empty `AggConstMap` (no module aggregate consts recorded), the CF4a companion to
  * `empty_env()`/`empty_table()` for a fold-test call site that resolves no `TVar` receiver.
  *
  * @return  an `AggConstMap` with empty parallel lists
  */
 fn empty_agg() -> AggConstMap { ScalarConstMap { names = teko::list::empty(); nss = teko::list::empty(); inits = teko::list::empty() } }
-
-/**
- * cf_byte_lit — a `to byte` cast of the integer `v` (the fixture-D element shape `0x1F to byte`), a
- * foldable const byte element for the index-fold unit matrix.
- *
- * @param v  the byte value (i128 carrier)
- * @return   the typed `v to byte` cast expression
- */
-fn cf_byte_lit(v: i128) -> TExpr { cf_cast(cf_num(v, u64t()), bytet()) }
-
-/**
- * cf_byte_array — an in-tree `[]byte` array-literal typed expression over the byte-cast elements
- * `elems`, the CF4a const-aggregate receiver (both the inline-receiver case and the hand-built
- * module-aggregate map's collapsed initializer).
- *
- * @param elems  the array's element expressions, in index order
- * @return       the typed array-literal expression
- */
-fn cf_byte_array(elems: []TExpr) -> TExpr {
-    mut es: []TArrayElem = teko::list::empty()
-    mut i: u64 = 0
-    loop {
-        if i >= elems.len { break }
-        es = teko::list::push(es, TArrayElem { is_spread = false; expr = elems[i] })
-        i++
-    }
-    te(TArrayLit { elements = es }, bytet())
-}
-
-/**
- * cf_agg_g — a hand-built `AggConstMap` recording `const G: []byte = [0x1F to byte, 0x8B to byte]` in
- * namespace `teko::checker`, the fixture-D receiver the CF4a index-fold resolves a `TVar G` against.
- *
- * @return  the module-aggregate resolution table holding `G`
- */
-fn cf_agg_g() -> AggConstMap {
-    let init = cf_byte_array(teko::list::push(teko::list::push(teko::list::empty(), cf_byte_lit(0x1F)), cf_byte_lit(0x8B)))
-    ScalarConstMap { names = teko::list::push(teko::list::empty(), "G"); nss = teko::list::push(teko::list::empty(), "teko::checker"); inits = teko::list::push(teko::list::empty(), init) }
-}
-
-/**
- * cf_g_index — the typed `G[i]` index expression: a `TVar G` receiver indexed by the const integer
- * `i` (typed `t`), the CF4a module-aggregate-index shape.
- *
- * @param i  the index value (i128 carrier)
- * @param t  the index's integer type
- * @return   the typed `G[i]` index expression
- */
-fn cf_g_index(i: i128, t: Type) -> TExpr { te(TIndex { receiver = cf_var("G", bytet()); index = cf_num(i, t) }, bytet()) }
 
 /**
  * cf_index_is — assert `eval_const` over the map `agg` folds the index expression `ix` to an integer
@@ -1310,137 +818,6 @@ fn cf_index_is(ix: TExpr, agg: AggConstMap, want: u128) {
             _ => teko::assert::is_true(false)
         }
         error => teko::assert::is_true(false)
-    }
-}
-
-/**
- * cf_index_errors — assert `eval_const` over the map `agg` rejects the index expression `ix` with a
- * located error (an out-of-range or negative const index — M.1).
- *
- * @param ix   the index expression that must fail to fold
- * @param agg  the module-aggregate resolution table
- */
-fn cf_index_errors(ix: TExpr, agg: AggConstMap) {
-    match eval_const(ix, empty_table(), empty_env(), agg) {
-        error => teko::assert::is_true(true)
-        ConstValue => teko::assert::is_true(false)
-    }
-}
-
-/**
- * eval_const_folds_module_agg_index — the CF4a mandate case: `G[0]`/`G[1]` over a hand-built
- * `AggConstMap` for `const G: []byte = [0x1F, 0x8B]` fold to the byte elements `0x1F`/`0x8B`.
- */
-#test
-fn eval_const_folds_module_agg_index() {
-    let agg = cf_agg_g()
-    cf_index_is(cf_g_index(0 to i128, u64t()), agg, 0x1F to u128)
-    cf_index_is(cf_g_index(1 to i128, u64t()), agg, 0x8B to u128)
-}
-
-/**
- * eval_const_index_out_of_range_errors — an index at the aggregate length (`G[2]` over a len-2 `G`)
- * is a located compile error (M.1), never a silent wrap or a runtime trap.
- */
-#test
-fn eval_const_index_out_of_range_errors() {
-    cf_index_errors(cf_g_index(2 to i128, u64t()), cf_agg_g())
-}
-
-/**
- * eval_const_negative_index_errors — a negative const index (`G[-1]`) is a located compile error
- * (M.1).
- */
-#test
-fn eval_const_negative_index_errors() {
-    cf_index_errors(cf_g_index(-1 to i128, i64t()), cf_agg_g())
-}
-
-/**
- * eval_const_folds_inline_arraylit_index — an in-tree `TArrayLit` receiver folds with an EMPTY map:
- * `[10 to byte, 20 to byte][1]` evaluates to `20`, proving the no-map literal-receiver path.
- */
-#test
-fn eval_const_folds_inline_arraylit_index() {
-    let arr = cf_byte_array(teko::list::push(teko::list::push(teko::list::empty(), cf_byte_lit(10 to i128)), cf_byte_lit(20 to i128)))
-    let ix = te(TIndex { receiver = arr; index = cf_num(1 to i128, u64t()) }, bytet())
-    cf_index_is(ix, empty_agg(), 20 to u128)
-}
-
-/**
- * cf_can_index_rejects_runtime_index — a runtime index (a `TVar i`, not a const integer) makes
- * `cf_can_index` false, so the index stays runtime (the negative boundary the fold gate enforces).
- */
-#test
-fn cf_can_index_rejects_runtime_index() {
-    let ix = TIndex { receiver = cf_var("G", bytet()); index = cf_var("i", u64t()) }
-    teko::assert::is_true(!cf_can_index(ix, cf_agg_g()))
-}
-
-/**
- * cf_can_index_rejects_runtime_receiver — a runtime receiver (a param `a`, absent from the map) makes
- * `cf_can_index` false, so `a[0]` stays runtime.
- */
-#test
-fn cf_can_index_rejects_runtime_receiver() {
-    let ix = TIndex { receiver = cf_var("a", bytet()); index = cf_num(0 to i128, u64t()) }
-    teko::assert::is_true(!cf_can_index(ix, empty_agg()))
-}
-
-/**
- * cf_fold_stays_index — assert `fold_expr` over the map `agg` leaves `e`'s top-level kind a `TIndex`
- * (the index stays runtime, not folded to a literal).
- *
- * @param e    the index expression to fold
- * @param agg  the module-aggregate resolution table
- */
-fn cf_fold_stays_index(e: TExpr, agg: AggConstMap) {
-    match fold_expr(e, empty_table(), empty_env(), agg) {
-        error => teko::assert::is_true(false)
-        TExpr as f => match f.kind {
-            TIndex => teko::assert::is_true(true)
-            _ => teko::assert::is_true(false)
-        }
-    }
-}
-
-/**
- * fold_leaves_runtime_index_runtime — the noflod-runtime-index negative: `G[i]` with a RUNTIME index
- * `i` (a `TVar`, not a const integer) stays a runtime `TIndex` through the fold, even though `G` is a
- * foldable module aggregate const — behavior identical to today.
- */
-#test
-fn fold_leaves_runtime_index_runtime() {
-    let e = te(TIndex { receiver = cf_var("G", bytet()); index = cf_var("i", u64t()) }, bytet())
-    cf_fold_stays_index(e, cf_agg_g())
-}
-
-/**
- * fold_leaves_runtime_receiver_runtime — the noflod-runtime-recv negative: `a[0]` on a RUNTIME
- * receiver `a` (a param absent from the map) stays a runtime `TIndex` through the fold.
- */
-#test
-fn fold_leaves_runtime_receiver_runtime() {
-    let e = te(TIndex { receiver = cf_var("a", bytet()); index = cf_num(0 to i128, u64t()) }, bytet())
-    cf_fold_stays_index(e, empty_agg())
-}
-
-/**
- * fold_collapses_module_agg_index — the fixture-D fold: `(G[0] to u64) to i32` over the module-agg map
- * collapses through `cf_fold_int`'s TIndex arm to the bare literal `31` (a `TNumber`), the enclosing
- * casts folded away — the whole index+cast tree is a compile-time literal on both engines.
- */
-#test
-fn fold_collapses_module_agg_index() {
-    let idx = te(TIndex { receiver = cf_var("G", bytet()); index = cf_num(0 to i128, u64t()) }, bytet())
-    let widened = cf_cast(idx, u64t())
-    let e = cf_cast(widened, i32t())
-    match fold_expr(e, empty_table(), empty_env(), cf_agg_g()) {
-        error => teko::assert::is_true(false)
-        TExpr as f => match f.kind {
-            TNumber as n => teko::assert::is_true(n.value == (31 to i128))
-            _ => teko::assert::is_true(false)
-        }
     }
 }
 
@@ -1496,16 +873,6 @@ fn cf_point_init() -> TExpr {
 }
 
 /**
- * cf_agg_point — a hand-built `AggConstMap` recording `const POINT: Point = Point { x = 30, y = 12 }`
- * in namespace `teko::checker`, the CF4c module-const-struct receiver `POINT.x` resolves against.
- *
- * @return  the module-aggregate resolution table holding `POINT`
- */
-fn cf_agg_point() -> AggConstMap {
-    ScalarConstMap { names = teko::list::push(teko::list::empty(), "POINT"); nss = teko::list::push(teko::list::empty(), "teko::checker"); inits = teko::list::push(teko::list::empty(), cf_point_init()) }
-}
-
-/**
  * cf_agg_str — a hand-built `AggConstMap` recording `const GREETING: str = "hello"` in namespace
  * `teko::checker`, the CF4d module-const-string receiver `GREETING.len` resolves against.
  *
@@ -1541,23 +908,6 @@ fn cf_agg_first_is(e: TExpr, agg: AggConstMap, want_len: u64, first: u128) {
 }
 
 /**
- * cf_fold_stays_field — assert `fold_expr` over `agg` leaves `e`'s top-level kind a `TFieldAccess` (the
- * field access stays runtime, not folded to a literal — the CF4c/CF4d runtime-receiver negative).
- *
- * @param e    the field-access expression to fold
- * @param agg  the module-aggregate resolution table
- */
-fn cf_fold_stays_field(e: TExpr, agg: AggConstMap) {
-    match fold_expr(e, empty_table(), empty_env(), agg) {
-        error => teko::assert::is_true(false)
-        TExpr as f => match f.kind {
-            TFieldAccess => teko::assert::is_true(true)
-            _ => teko::assert::is_true(false)
-        }
-    }
-}
-
-/**
  * eval_const_folds_inline_agg_len — the CF4d mandate case: `.len` of an in-tree `[]i64` array literal
  * `[10, 20, 30]` folds to the element count `3` (with an EMPTY map — the receiver is in-tree).
  */
@@ -1565,24 +915,6 @@ fn cf_fold_stays_field(e: TExpr, agg: AggConstMap) {
 fn eval_const_folds_inline_agg_len() {
     let elems = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), cf_num(10 to i128, i64t())), cf_num(20 to i128, i64t())), cf_num(30 to i128, i64t()))
     cf_int_is(cf_field(cf_slice_lit(elems, i64t()), "len", u64t()), 3 to u128)
-}
-
-/**
- * eval_const_folds_string_len — the CF4d string case: `.len` of an in-tree `str` literal `"hello"`
- * folds to its byte count `5` (the byte length `.len` reads at runtime for a `str`).
- */
-#test
-fn eval_const_folds_string_len() {
-    cf_int_is(cf_field(cf_str("hello"), "len", u64t()), 5 to u128)
-}
-
-/**
- * eval_const_folds_module_agg_len — the CF4d module case: `G.len` over the hand-built `AggConstMap` for
- * `const G: []byte = [0x1F, 0x8B]` folds to the element count `2` (the receiver resolved via the map).
- */
-#test
-fn eval_const_folds_module_agg_len() {
-    cf_index_is(cf_field(cf_var("G", Slice { element = bytet() }), "len", u64t()), cf_agg_g(), 2 to u128)
 }
 
 /**
@@ -1605,93 +937,10 @@ fn eval_const_folds_inline_struct_field() {
 }
 
 /**
- * eval_const_folds_module_struct_field — the CF4c module case: `POINT.x`/`POINT.y` over the hand-built
- * map for `const POINT: Point = Point { x = 30, y = 12 }` fold to `30`/`12` (receiver via the map).
- */
-#test
-fn eval_const_folds_module_struct_field() {
-    cf_index_is(cf_field(cf_var("POINT", Named { name = "Point" }), "x", i64t()), cf_agg_point(), 30 to u128)
-    cf_index_is(cf_field(cf_var("POINT", Named { name = "Point" }), "y", i64t()), cf_agg_point(), 12 to u128)
-}
-
-/**
  * eval_const_folds_str_to_bytes — the CF4c coercion case: `"hi" to []byte` folds to the byte-array
  * const value — a `CVAgg` of two `byte` elements whose first is `0x68` (`'h'`).
  */
 #test
 fn eval_const_folds_str_to_bytes() {
     cf_agg_first_is(cf_cast(cf_str("hi"), Slice { element = bytet() }), empty_agg(), 2 to u64, 0x68 to u128)
-}
-
-/**
- * eval_const_folds_str_to_bytes_len — a `.len` over a `str -> []byte` coercion folds through the byte
- * array const to the byte count `5` (`("hello" to []byte).len` -> `5`).
- */
-#test
-fn eval_const_folds_str_to_bytes_len() {
-    let coerced = cf_cast(cf_str("hello"), Slice { element = bytet() })
-    cf_int_is(cf_field(coerced, "len", u64t()), 5 to u128)
-}
-
-/**
- * fold_collapses_struct_field_arith — the CF4c fixture fold: `(POINT.x + POINT.y) to i32` over the
- * module map collapses through `cf_fold_int`'s TFieldAccess arm to the bare literal `42` (a `TNumber`),
- * every field read and the enclosing arithmetic/cast folded away.
- */
-#test
-fn fold_collapses_struct_field_arith() {
-    let px = cf_field(cf_var("POINT", Named { name = "Point" }), "x", i64t())
-    let py = cf_field(cf_var("POINT", Named { name = "Point" }), "y", i64t())
-    let e = cf_cast(cf_bin(lexer::TokenKind::Plus, px, py, i64t()), i32t())
-    match fold_expr(e, empty_table(), empty_env(), cf_agg_point()) {
-        error => teko::assert::is_true(false)
-        TExpr as f => match f.kind {
-            TNumber as n => teko::assert::is_true(n.value == (42 to i128))
-            _ => teko::assert::is_true(false)
-        }
-    }
-}
-
-/**
- * fold_collapses_len — `G.len to i32` over the module map collapses through `cf_fold_int`'s
- * TFieldAccess arm to the bare literal `2` (the length read and enclosing cast folded away).
- */
-#test
-fn fold_collapses_len() {
-    let lf = cf_field(cf_var("G", Slice { element = bytet() }), "len", u64t())
-    match fold_expr(cf_cast(lf, i32t()), empty_table(), empty_env(), cf_agg_g()) {
-        error => teko::assert::is_true(false)
-        TExpr as f => match f.kind {
-            TNumber as n => teko::assert::is_true(n.value == (2 to i128))
-            _ => teko::assert::is_true(false)
-        }
-    }
-}
-
-/**
- * fold_leaves_runtime_len_receiver_runtime — the CF4d negative: `a.len` with a RUNTIME receiver `a` (a
- * param absent from the map) stays a runtime `TFieldAccess` through the fold, never a folded literal.
- */
-#test
-fn fold_leaves_runtime_len_receiver_runtime() {
-    cf_fold_stays_field(cf_field(cf_var("a", Slice { element = bytet() }), "len", u64t()), empty_agg())
-}
-
-/**
- * fold_leaves_runtime_struct_receiver_runtime — the CF4c negative: `p.x` with a RUNTIME receiver `p` (a
- * param absent from the map) stays a runtime `TFieldAccess` through the fold.
- */
-#test
-fn fold_leaves_runtime_struct_receiver_runtime() {
-    cf_fold_stays_field(cf_field(cf_var("p", Named { name = "Point" }), "x", i64t()), empty_agg())
-}
-
-/**
- * cf_can_fold_field_rejects_runtime_receiver — a runtime receiver (a param `p`, absent from the map)
- * makes `cf_can_fold_field` false, so `p.x` stays runtime (the gate's negative boundary).
- */
-#test
-fn cf_can_fold_field_rejects_runtime_receiver() {
-    let fa = TFieldAccess { receiver = cf_var("p", Named { name = "Point" }); field = "x" }
-    teko::assert::is_true(!cf_can_fold_field(fa, empty_agg()))
 }

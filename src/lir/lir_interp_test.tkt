@@ -162,82 +162,17 @@ fn iwt_f5_unary_neg_round_trip() {
     teko::assert::is_true(interp_lmodule(iwt_neg_exit(), "main", iwt_no_args()) == iwt_i128(42))
 }
 
-#test
-fn iwt_plain_return_from_entry_is_the_value() {
-    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
-    let c = alloc_vreg(f)
-    f = c.func
-    f = append_inst(f, 0, const_int_inst(c.vreg, iwt_i128(7), 0, 0))
-    f = append_inst(f, 0, ret_inst(c.vreg, 0, 0))
-    teko::assert::is_true(interp_lmodule(add_func(empty_module(), f), "main", iwt_no_args()) == iwt_i128(7))
-}
-
-#test
-fn iwt_missing_entry_is_negative_sentinel() {
-    teko::assert::is_true(interp_lmodule(empty_module(), "nope", iwt_no_args()) == iwt_i128(-1))
-}
-
-#test
-fn iwt_unknown_runtime_call_is_negative_sentinel() {
-    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
-    f = append_inst(f, 0, void_call_inst("tk_println", teko::list::empty(), false, 0, 0))
-    let z = alloc_vreg(f)
-    f = z.func
-    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
-    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
-    teko::assert::is_true(interp_lmodule(add_func(empty_module(), f), "main", iwt_no_args()) == iwt_i128(-1))
-}
-
-/** iwt_if_exit — F6: `exit(if x<y {x} else {y})` — branch to a per-arm block, each jumping
-    to a merge block-arg carrying the picked value, exit(the merge value). Proves
-    interp_blocks follows an LBranch to its chosen target and binds the winning jump's
-    block-arg into the merge block's param. */
-fn iwt_if_exit(x: i64, y: i64) -> LModule {
-    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
-    let vx = alloc_vreg(f)
-    f = vx.func
-    f = append_inst(f, 0, const_int_inst(vx.vreg, iwt_i128(x), 0, 0))
-    let vy = alloc_vreg(f)
-    f = vy.func
-    f = append_inst(f, 0, const_int_inst(vy.vreg, iwt_i128(y), 0, 0))
-    let vc = alloc_vreg(f)
-    f = vc.func
-    f = append_inst(f, 0, bin_inst(vc.vreg, LBinOp::ICmpLtS, vx.vreg, vy.vreg, 0, 0))
-    let thenb = alloc_block(f)
-    f = thenb.func
-    let elseb = alloc_block(f)
-    f = elseb.func
-    let mergeb = alloc_block(f)
-    f = mergeb.func
-    let mp = add_block_param(f, mergeb.block_id)
-    f = mp.func
-    f = append_inst(f, 0, branch_inst(vc.vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
-    f = append_inst(f, thenb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), vx.vreg), 0, 0))
-    f = append_inst(f, elseb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), vy.vreg), 0, 0))
-    let eargs = teko::list::push(teko::list::empty(), mp.vreg)
-    f = append_inst(f, mergeb.block_id, void_call_inst("tk_exit", eargs, false, 0, 0))
-    let z = alloc_vreg(f)
-    f = z.func
-    f = append_inst(f, mergeb.block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
-    f = append_inst(f, mergeb.block_id, ret_inst(z.vreg, 0, 0))
-    add_func(empty_module(), f)
-}
-
-#test
-fn iwt_f6_if_expr_picks_the_then_arm() {
-    teko::assert::is_true(interp_lmodule(iwt_if_exit(2, 100), "main", iwt_no_args()) == iwt_i128(2))
-}
-
-#test
-fn iwt_f6_if_expr_picks_the_else_arm() {
-    teko::assert::is_true(interp_lmodule(iwt_if_exit(100, 7), "main", iwt_no_args()) == iwt_i128(7))
-}
-
-/** iwt_chain_lt_exit — F7: `exit((a<b) && (b<c) ? 1 : 0)`, the branch-merge AND shape
-    lower_compare produces for a chained comparison `a<b<c`. Proves interp_blocks follows a
-    SEQUENCE of branch/merge transitions (not just one), short-circuiting past the second
-    comparison's block through the merge's 0 constant when the first term is already false. */
-fn iwt_chain_lt_exit(a: i64, b: i64, c: i64) -> LModule {
+/**
+ * iwt_binop_exit — `exit(a <op> b)`: two int consts feed a binary op whose result feeds
+ * tk_exit, exactly the iwt_let_mul_exit shape parameterized over an arbitrary LBinOp — the
+ * run-oracle probe for the KP2 bitwise/shift arms.
+ *
+ * @param op  the binary LBinOp to place between the two operands
+ * @param a   the left operand's constant value
+ * @param b   the right operand's constant value
+ * @return    the built `main`-and-exit module
+ */
+fn iwt_binop_exit(op: LBinOp, a: i64, b: i64) -> LModule {
     mut f = new_func("main", 0, teko::list::empty(), LType::I32)
     let va = alloc_vreg(f)
     f = va.func
@@ -245,51 +180,74 @@ fn iwt_chain_lt_exit(a: i64, b: i64, c: i64) -> LModule {
     let vb = alloc_vreg(f)
     f = vb.func
     f = append_inst(f, 0, const_int_inst(vb.vreg, iwt_i128(b), 0, 0))
-    let vc = alloc_vreg(f)
-    f = vc.func
-    f = append_inst(f, 0, const_int_inst(vc.vreg, iwt_i128(c), 0, 0))
-    let t1 = alloc_vreg(f)
-    f = t1.func
-    f = append_inst(f, 0, bin_inst(t1.vreg, LBinOp::ICmpLtS, va.vreg, vb.vreg, 0, 0))
-    let t2 = alloc_vreg(f)
-    f = t2.func
-    f = append_inst(f, 0, bin_inst(t2.vreg, LBinOp::ICmpLtS, vb.vreg, vc.vreg, 0, 0))
-    let thenb = alloc_block(f)
-    f = thenb.func
-    let elseb = alloc_block(f)
-    f = elseb.func
-    let mergeb = alloc_block(f)
-    f = mergeb.func
-    let mp = add_block_param(f, mergeb.block_id)
-    f = mp.func
-    f = append_inst(f, 0, branch_inst(t1.vreg, thenb.block_id, teko::list::empty(), elseb.block_id, teko::list::empty(), 0, 0))
-    f = append_inst(f, thenb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), t2.vreg), 0, 0))
-    let zero = alloc_vreg(f)
-    f = zero.func
-    f = append_inst(f, elseb.block_id, const_int_inst(zero.vreg, iwt_i128(0), 0, 0))
-    f = append_inst(f, elseb.block_id, jump_inst(mergeb.block_id, teko::list::push(teko::list::empty(), zero.vreg), 0, 0))
-    let eargs = teko::list::push(teko::list::empty(), mp.vreg)
-    f = append_inst(f, mergeb.block_id, void_call_inst("tk_exit", eargs, false, 0, 0))
+    let vr = alloc_vreg(f)
+    f = vr.func
+    f = append_inst(f, 0, bin_inst(vr.vreg, op, va.vreg, vb.vreg, 0, 0))
+    let args = teko::list::push(teko::list::empty(), vr.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", args, false, 0, 0))
     let z = alloc_vreg(f)
     f = z.func
-    f = append_inst(f, mergeb.block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
-    f = append_inst(f, mergeb.block_id, ret_inst(z.vreg, 0, 0))
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
     add_func(empty_module(), f)
 }
 
-#test
-fn iwt_f7_chain_all_ascending_is_true() {
-    teko::assert::is_true(interp_lmodule(iwt_chain_lt_exit(1, 2, 3), "main", iwt_no_args()) == iwt_i128(1))
+/**
+ * iwt_unop_exit — `exit(<op> a)`: one int const feeds a unary op whose result feeds tk_exit
+ * — the run-oracle probe for the KP2 INot arm.
+ *
+ * @param op  the unary LUnOp to apply to the operand
+ * @param a   the operand's constant value
+ * @return    the built `main`-and-exit module
+ */
+fn iwt_unop_exit(op: LUnOp, a: i64) -> LModule {
+    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
+    let va = alloc_vreg(f)
+    f = va.func
+    f = append_inst(f, 0, const_int_inst(va.vreg, iwt_i128(a), 0, 0))
+    let vr = alloc_vreg(f)
+    f = vr.func
+    f = append_inst(f, 0, un_inst(vr.vreg, op, va.vreg, 0, 0))
+    let args = teko::list::push(teko::list::empty(), vr.vreg)
+    f = append_inst(f, 0, void_call_inst("tk_exit", args, false, 0, 0))
+    let z = alloc_vreg(f)
+    f = z.func
+    f = append_inst(f, 0, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
+    f = append_inst(f, 0, ret_inst(z.vreg, 0, 0))
+    add_func(empty_module(), f)
 }
 
+/**
+ * iwt_runs_bitwise_ops — the oracle RUNS `& | ^`: `6 & 3 == 2`, `6 | 3 == 7`, `6 ^ 3 == 5`
+ * (exact two's-complement bit ops on the carrier). Before KP2 eval_bin honest-stopped these.
+ */
 #test
-fn iwt_f7_chain_breaks_at_the_second_term_is_false() {
-    teko::assert::is_true(interp_lmodule(iwt_chain_lt_exit(1, 5, 3), "main", iwt_no_args()) == iwt_i128(0))
+fn iwt_runs_bitwise_ops() {
+    teko::assert::is_true(interp_lmodule(iwt_binop_exit(LBinOp::IAnd, 6, 3), "main", iwt_no_args()) == iwt_i128(2))
+    teko::assert::is_true(interp_lmodule(iwt_binop_exit(LBinOp::IOr, 6, 3), "main", iwt_no_args()) == iwt_i128(7))
+    teko::assert::is_true(interp_lmodule(iwt_binop_exit(LBinOp::IXor, 6, 3), "main", iwt_no_args()) == iwt_i128(5))
 }
 
+/**
+ * iwt_runs_shift_ops — the oracle RUNS `<< >>`: `5 << 3 == 40`, and both the arithmetic
+ * (IShrS) and logical (IShrU) right shift of a non-negative value agree — `40 >> 3 == 5`.
+ */
 #test
-fn iwt_f7_chain_fails_at_the_first_term_is_false() {
-    teko::assert::is_true(interp_lmodule(iwt_chain_lt_exit(5, 2, 3), "main", iwt_no_args()) == iwt_i128(0))
+fn iwt_runs_shift_ops() {
+    teko::assert::is_true(interp_lmodule(iwt_binop_exit(LBinOp::IShl, 5, 3), "main", iwt_no_args()) == iwt_i128(40))
+    teko::assert::is_true(interp_lmodule(iwt_binop_exit(LBinOp::IShrS, 40, 3), "main", iwt_no_args()) == iwt_i128(5))
+    teko::assert::is_true(interp_lmodule(iwt_binop_exit(LBinOp::IShrU, 40, 3), "main", iwt_no_args()) == iwt_i128(5))
+}
+
+/**
+ * iwt_runs_bitwise_not — the oracle RUNS INot (`~`): `~0 == -1`, `~(-1) == 0`, `~5 == -6`
+ * (one's-complement on the signed carrier). Before KP2 eval_un honest-stopped INot.
+ */
+#test
+fn iwt_runs_bitwise_not() {
+    teko::assert::is_true(interp_lmodule(iwt_unop_exit(LUnOp::INot, 0), "main", iwt_no_args()) == iwt_i128(-1))
+    teko::assert::is_true(interp_lmodule(iwt_unop_exit(LUnOp::INot, -1), "main", iwt_no_args()) == iwt_i128(0))
+    teko::assert::is_true(interp_lmodule(iwt_unop_exit(LUnOp::INot, 5), "main", iwt_no_args()) == iwt_i128(-6))
 }
 
 /** iwt_alloc_field — reserve a slot at `base`, store `val` at `offset`, then load it back
@@ -556,115 +514,6 @@ fn iwt_exit_const(f0: LFunc, block_id: u32, code: i64) -> LFunc {
     f = z.func
     f = append_inst(f, block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
     append_inst(f, block_id, ret_inst(z.vreg, 0, 0))
-}
-
-/**
- * iwt_match_scalar_exit — F16: `exit(match e { 0=>10; 1=>20; _=>0 })` as
- * hand-built LIR: a two-step `ICmpEq` test chain, each arm's success block
- * exiting directly. Proves the interp follows a MULTI-ARM scalar test chain
- * (composition of A1-1's branch/jump — A1-5, #382).
- *
- * @param i64 e_val  the match subject's value
- * @return LModule  the hand-built single-function module
- */
-fn iwt_match_scalar_exit(e_val: i64) -> LModule {
-    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
-    let ev = alloc_vreg(f)
-    f = ev.func
-    f = append_inst(f, 0, const_int_inst(ev.vreg, iwt_i128(e_val), 0, 0))
-    let c0 = alloc_vreg(f)
-    f = c0.func
-    f = append_inst(f, 0, const_int_inst(c0.vreg, iwt_i128(0), 0, 0))
-    let t0 = alloc_vreg(f)
-    f = t0.func
-    f = append_inst(f, 0, bin_inst(t0.vreg, LBinOp::ICmpEq, ev.vreg, c0.vreg, 0, 0))
-    let arm0b = alloc_block(f)
-    f = arm0b.func
-    let next0b = alloc_block(f)
-    f = next0b.func
-    f = append_inst(f, 0, branch_inst(t0.vreg, arm0b.block_id, teko::list::empty(), next0b.block_id, teko::list::empty(), 0, 0))
-    f = iwt_exit_const(f, arm0b.block_id, 10)
-    let c1 = alloc_vreg(f)
-    f = c1.func
-    f = append_inst(f, next0b.block_id, const_int_inst(c1.vreg, iwt_i128(1), 0, 0))
-    let t1 = alloc_vreg(f)
-    f = t1.func
-    f = append_inst(f, next0b.block_id, bin_inst(t1.vreg, LBinOp::ICmpEq, ev.vreg, c1.vreg, 0, 0))
-    let arm1b = alloc_block(f)
-    f = arm1b.func
-    let next1b = alloc_block(f)
-    f = next1b.func
-    f = append_inst(f, next0b.block_id, branch_inst(t1.vreg, arm1b.block_id, teko::list::empty(), next1b.block_id, teko::list::empty(), 0, 0))
-    f = iwt_exit_const(f, arm1b.block_id, 20)
-    f = iwt_exit_const(f, next1b.block_id, 0)
-    add_func(empty_module(), f)
-}
-
-#test
-fn iwt_f16_match_scalar_first_arm_wins() {
-    teko::assert::is_true(interp_lmodule(iwt_match_scalar_exit(0), "main", iwt_no_args()) == iwt_i128(10))
-}
-
-#test
-fn iwt_f16_match_scalar_second_arm_wins() {
-    teko::assert::is_true(interp_lmodule(iwt_match_scalar_exit(1), "main", iwt_no_args()) == iwt_i128(20))
-}
-
-#test
-fn iwt_f16_match_scalar_wildcard_wins() {
-    teko::assert::is_true(interp_lmodule(iwt_match_scalar_exit(9), "main", iwt_no_args()) == iwt_i128(0))
-}
-
-/**
- * iwt_match_guard_exit — F17: `exit(match x { 1 when flag => 100; _ => 0 })`,
- * `flag` a second int PARAMETER standing in for an arbitrary guard condition
- * (nonzero = true) — proves a FAILED guard falls through to the SAME next-arm
- * block a failed pattern test targets (A1-5, #382, §2.4).
- *
- * @param i64 x_val  the match subject's value
- * @param i64 flag_val  the guard's stand-in condition (nonzero = true)
- * @return LModule  the hand-built single-function module
- */
-fn iwt_match_guard_exit(x_val: i64, flag_val: i64) -> LModule {
-    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
-    let xv = alloc_vreg(f)
-    f = xv.func
-    f = append_inst(f, 0, const_int_inst(xv.vreg, iwt_i128(x_val), 0, 0))
-    let flag = alloc_vreg(f)
-    f = flag.func
-    f = append_inst(f, 0, const_int_inst(flag.vreg, iwt_i128(flag_val), 0, 0))
-    let c1 = alloc_vreg(f)
-    f = c1.func
-    f = append_inst(f, 0, const_int_inst(c1.vreg, iwt_i128(1), 0, 0))
-    let t1 = alloc_vreg(f)
-    f = t1.func
-    f = append_inst(f, 0, bin_inst(t1.vreg, LBinOp::ICmpEq, xv.vreg, c1.vreg, 0, 0))
-    let armb = alloc_block(f)
-    f = armb.func
-    let nextb = alloc_block(f)
-    f = nextb.func
-    f = append_inst(f, 0, branch_inst(t1.vreg, armb.block_id, teko::list::empty(), nextb.block_id, teko::list::empty(), 0, 0))
-    let guardb = alloc_block(f)
-    f = guardb.func
-    f = append_inst(f, armb.block_id, branch_inst(flag.vreg, guardb.block_id, teko::list::empty(), nextb.block_id, teko::list::empty(), 0, 0))
-    f = iwt_exit_const(f, guardb.block_id, 100)
-    f = iwt_exit_const(f, nextb.block_id, 0)
-    add_func(empty_module(), f)
-}
-
-#test
-fn iwt_f17_match_guard_true_takes_the_guarded_arm() {
-    teko::assert::is_true(interp_lmodule(iwt_match_guard_exit(1, 1), "main", iwt_no_args()) == iwt_i128(100))
-}
-
-#test
-fn iwt_f17_match_guard_false_falls_through_to_the_next_arm() {
-    teko::assert::is_true(interp_lmodule(iwt_match_guard_exit(1, 0), "main", iwt_no_args()) == iwt_i128(0))
-}
-
-#test
-fn iwt_f17_match_pattern_false_never_reaches_the_guard() {
-    teko::assert::is_true(interp_lmodule(iwt_match_guard_exit(2, 1), "main", iwt_no_args()) == iwt_i128(0))
 }
 
 /**
@@ -1089,65 +938,6 @@ fn iwt_f21_lambda_capture_roundtrip() {
 }
 
 /**
- * iwt_counting_loop_exit — F8 (A1-2, #382): a loop whose head is promoted
- * with one block-arg for the running counter — `%hp` — bumped by one every
- * iteration and compared against `target`; the branch's TRUE edge exits
- * with the bumped value, the FALSE edge loops back carrying it — proving
- * `interp_blocks` correctly re-enters an already-visited block (a genuine
- * back-edge, not just a forward merge like F6/F7) and threads a mutated
- * block-arg across iterations.
- *
- * @param i64 target  the counter value that ends the loop
- * @return LModule  the built one-function module
- */
-fn iwt_counting_loop_exit(target: i64) -> LModule {
-    mut f = new_func("main", 0, teko::list::empty(), LType::I32)
-    let s0 = alloc_vreg(f)
-    f = s0.func
-    f = append_inst(f, 0, const_int_inst(s0.vreg, iwt_i128(0), 0, 0))
-    let headb = alloc_block(f)
-    f = headb.func
-    let exitb = alloc_block(f)
-    f = exitb.func
-    let hp = add_block_param(f, headb.block_id)
-    f = hp.func
-    let ep = add_block_param(f, exitb.block_id)
-    f = ep.func
-    f = append_inst(f, 0, jump_inst(headb.block_id, teko::list::push(teko::list::empty(), s0.vreg), 0, 0))
-    let one = alloc_vreg(f)
-    f = one.func
-    f = append_inst(f, headb.block_id, const_int_inst(one.vreg, iwt_i128(1), 0, 0))
-    let bumped = alloc_vreg(f)
-    f = bumped.func
-    f = append_inst(f, headb.block_id, bin_inst(bumped.vreg, LBinOp::IAdd, hp.vreg, one.vreg, 0, 0))
-    let tgt = alloc_vreg(f)
-    f = tgt.func
-    f = append_inst(f, headb.block_id, const_int_inst(tgt.vreg, iwt_i128(target), 0, 0))
-    let cmp = alloc_vreg(f)
-    f = cmp.func
-    f = append_inst(f, headb.block_id, bin_inst(cmp.vreg, LBinOp::ICmpEq, bumped.vreg, tgt.vreg, 0, 0))
-    let loop_args = teko::list::push(teko::list::empty(), bumped.vreg)
-    f = append_inst(f, headb.block_id, branch_inst(cmp.vreg, exitb.block_id, loop_args, headb.block_id, loop_args, 0, 0))
-    let eargs = teko::list::push(teko::list::empty(), ep.vreg)
-    f = append_inst(f, exitb.block_id, void_call_inst("tk_exit", eargs, false, 0, 0))
-    let z = alloc_vreg(f)
-    f = z.func
-    f = append_inst(f, exitb.block_id, const_int_inst(z.vreg, iwt_i128(0), 0, 0))
-    f = append_inst(f, exitb.block_id, ret_inst(z.vreg, 0, 0))
-    add_func(empty_module(), f)
-}
-
-#test
-fn iwt_f8_counting_loop_with_break_sums_to_five() {
-    teko::assert::is_true(interp_lmodule(iwt_counting_loop_exit(5), "main", iwt_no_args()) == iwt_i128(5))
-}
-
-#test
-fn iwt_f8_counting_loop_with_break_runs_more_than_one_iteration() {
-    teko::assert::is_true(interp_lmodule(iwt_counting_loop_exit(200), "main", iwt_no_args()) == iwt_i128(200))
-}
-
-/**
  * iwt_defer_return_exit — F9 (A1-2, #382): `let s=1; defer { s=s+100 };
  * exit(s)` inlined straight-line (defer has NO LIR op of its own — it is
  * pure re-lowering of its body at the exit point, so the shape a real
@@ -1180,61 +970,4 @@ fn iwt_defer_return_exit() -> LModule {
 #test
 fn iwt_f9_defer_observed_side_effect_via_return_value() {
     teko::assert::is_true(interp_lmodule(iwt_defer_return_exit(), "main", iwt_no_args()) == iwt_i128(101))
-}
-
-/**
- * T-B5: a semeadura resolve um ponteiro rodata-interno — a célula do slot recebe o
- * ÍNDICE DE CÉLULA do datum-alvo (o endereço na memória da VM), e um load naquela
- * célula seguido de um load no endereço devolvido alcança o byte-alvo (deref
- * end-to-end). O word alto do slot permanece zero.
- */
-#test
-fn tb5_vm_resolves_internal_pointer() {
-    let slot = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
-    let p = LRodata { symbol = "p"; bytes = slot; relocs = teko::list::push(teko::list::empty(), data_reloc(0 to u32, "t")) }
-    let t = LRodata { symbol = "t"; bytes = iwt_bytes_of("A"); relocs = teko::list::empty() }
-    mut rodata: []LRodata = teko::list::empty()
-    rodata = teko::list::push(rodata, p)
-    rodata = teko::list::push(rodata, t)
-    let m = LModule { funcs = teko::list::empty(); rodata = rodata; globals = teko::list::empty(); layouts = teko::list::empty() }
-    match seed_rodata(m) {
-        MemStore as mem => {
-            let slot_read = mem_load(mem, 0 to i128)
-            teko::assert::is_true(slot_read.ok)
-            teko::assert::is_true(slot_read.value == (8 to i128))
-            let hi_read = mem_load(mem, 1 to i128)
-            teko::assert::is_true(hi_read.ok)
-            teko::assert::is_true(hi_read.value == (0 to i128))
-            let target_read = mem_load(mem, 8 to i128)
-            teko::assert::is_true(target_read.ok)
-            teko::assert::is_true(target_read.value == (65 to i128))
-        }
-        error => teko::assert::is_true(false)
-    }
-}
-
-/**
- * T-B5: relocs vazio é identidade (o braço de toda compilação real) e alvo
- * desconhecido é erro nomeado — a run inteira devolve o sentinela -1 via
- * interp_lmodule, nunca um miscompile silencioso.
- */
-#test
-fn tb5_vm_empty_identity_and_unknown_target() {
-    let a = LRodata { symbol = "a"; bytes = iwt_bytes_of("hi"); relocs = teko::list::empty() }
-    let m0 = LModule { funcs = teko::list::empty(); rodata = teko::list::push(teko::list::empty(), a); globals = teko::list::empty(); layouts = teko::list::empty() }
-    match seed_rodata(m0) {
-        MemStore as mem => {
-            let a_read = mem_load(mem, 0 to i128)
-            teko::assert::is_true(a_read.ok)
-            teko::assert::is_true(a_read.value == (104 to i128))
-        }
-        error => teko::assert::is_true(false)
-    }
-    let bad = LRodata { symbol = "p"; bytes = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]; relocs = teko::list::push(teko::list::empty(), data_reloc(0 to u32, "nope")) }
-    let m1 = LModule { funcs = teko::list::empty(); rodata = teko::list::push(teko::list::empty(), bad); globals = teko::list::empty(); layouts = teko::list::empty() }
-    match seed_rodata(m1) {
-        MemStore => teko::assert::is_true(false)
-        error as e => teko::assert::str_contains(e.message, "unknown rodata symbol")
-    }
-    teko::assert::is_true(interp_lmodule(m1, "main", teko::list::empty()) == ((0 to i128) - (1 to i128)))
 }

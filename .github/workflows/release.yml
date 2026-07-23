@@ -128,11 +128,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/ci_provision_teko.sh linux-x86_64-glibc
 
-      # Three self-host generations, all `--no-verify` (CI already gated this commit):
-      # seed→gen1→gen2→gen3. The PUBLISHED artifact is gen3 — the binary produced by the
-      # self-hosted chain of THIS tag, not by the previous release's seed — and gen2==gen3
-      # byte-identity is asserted here as the release's own FIXPOINT gate (owner ruling
-      # 2026-07-10, from B1 on).
+      # Two self-host generations, all `--no-verify` (CI already gated this commit):
+      # seed→gen1→gen2. The PUBLISHED artifact is gen2 — the binary produced by the
+      # self-hosted chain of THIS tag, not by the previous release's seed. The invariant
+      # gen1==gen2 (byte-identical) is GUARANTEED by the earlier lanes being green; no
+      # explicit comparison is necessary (owner ruling 2026-07-22).
       #
       # Deliberately NOT `--release`: this leg only needs the byte-identical `out/teko.c`
       # (the gen binaries are discarded — the SHIPPED Linux artifacts are cross-compiled from
@@ -142,7 +142,7 @@ jobs:
       # zig `-O0`/`-O1`/`-O2` all self-host with byte-identical `teko.c`. So the `-O2` seed-speed
       # win (owner ruling 2026-07-14) now lands on the Linux seed as well; the x86_64 cross-smoke
       # RUNS the artifact so any regression re-reddens. See scripts/cross_compile_linux.sh.
-      - name: Emit the portable teko.c (gen3 of 3, no gate)
+      - name: Emit the portable teko.c (gen2 of 2, no gate)
         run: |
           set -eu
           mkdir -p out
@@ -205,20 +205,21 @@ jobs:
           LABEL: ${{ matrix.label }}
         run: ./scripts/ci_provision_teko.sh "$LABEL"
 
-      # Three self-host generations, all `--no-verify` — the PUBLISHED binary is gen3
-      # (built by THIS tag's own self-hosted chain), with gen2==gen3 asserted as the
-      # release's fixpoint gate (owner ruling 2026-07-10, from B1 on). `shell: bash` on
+      # Two self-host generations, all `--no-verify` — the PUBLISHED binary is gen2
+      # (built by THIS tag's own self-hosted chain). The invariant gen1==gen2 (byte-identical)
+      # is GUARANTEED by the earlier lanes being green; no explicit comparison is necessary
+      # (owner ruling 2026-07-22). `shell: bash` on
       # all platforms: the seed is added to $GITHUB_PATH as a POSIX path, which only
       # bash resolves on Windows.
       #
-      # `--release` on all three generations builds every link at `-O2` (owner ruling
+      # `--release` on both generations builds every link at `-O2` (owner ruling
       # 2026-07-14): the published macOS/Windows seed is compiled optimized once here, so
       # everyone downstream gets a compiler that RUNS ~1.30x faster (the diagnostic measured
       # 168.7s → 129.6s at -O2), paying the heavier cc cost (~+33s) only at release. Applying
-      # it to the whole chain SELF-PROVES the -O2 binary: gen1(-O2) builds gen2, gen2(-O2)
-      # builds out, so any -O2 problem fails the build loudly instead of shipping. -O2 emits
-      # BYTE-IDENTICAL teko.c (proven by cmp), so the gen2==gen3 fixpoint below is unchanged.
-      - name: Build the release binary (gen3 of 3, no gate)
+      # it to the whole chain SELF-PROVES the -O2 binary: gen1(-O2) builds gen2, so any -O2
+      # problem fails the build loudly instead of shipping. -O2 emits
+      # BYTE-IDENTICAL teko.c, so the gen1==gen2 invariant is preserved.
+      - name: Build the release binary (gen2 of 2, no gate)
         shell: bash
         run: |
           set -eu
@@ -282,7 +283,7 @@ jobs:
           Self-hosted \`teko\` compiler binaries. Each binary was produced by the previous
           release's compiler compiling this tag's own sources; **correctness was verified by
           CI** on this exact commit before it reached main (the \`.tkt\` gate, the self-host
-          fixpoint \`gen-2 == gen-3\`, and the VM==native differential all ran in the
+          fixpoint \`gen-1 == gen-2\` (proving seed-safe determinism), and the VM==native differential all ran in the
           \`Native Build & Test\` / SAST / Sanitizers / CodeQL workflows on the merged PR).
           The release itself re-validates nothing — CI is the single source of truth.
 

@@ -1,0 +1,336 @@
+use teko::checker
+use teko::parser
+
+/**
+ * A single-segment path.
+ *
+ * @param s  the segment name
+ * @return   a `Path` with one segment
+ */
+fn ffx_path1(s: str) -> parser::Path {
+    parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = s }) }
+}
+
+/**
+ * A bare named type annotation (`NamedType` with no generic args).
+ *
+ * @param s  the type's surface name
+ * @return   the `TypeExpr`
+ */
+fn ffx_named_te(s: str) -> parser::TypeExpr {
+    parser::NamedType { path = ffx_path1(s); args = teko::list::empty() }
+}
+
+/**
+ * A throwaway zero-literal expression (a default-slot filler for a non-defaulted parameter).
+ *
+ * @return  a positioned `Expr`
+ */
+fn ffx_no_expr() -> parser::Expr {
+    parser::Expr { kind = parser::Number { is_float = false; value = 0 to i128; fval = 0.0 }; line = 0; col = 0 }
+}
+
+/**
+ * A fixed (non-variadic, non-defaulted) parameter of the named type.
+ *
+ * @param name    the parameter name
+ * @param tyname  the surface type name
+ * @return        the `Param`
+ */
+fn ffx_param(name: str, tyname: str) -> parser::Param {
+    parser::Param { name = name; has_type = true; type_ann = ffx_named_te(tyname); is_params = false; has_default = false; default_expr = ffx_no_expr() }
+}
+
+/**
+ * A C#-style `params` variadic parameter (used only to drive the export-variadic rejection).
+ *
+ * @param name    the parameter name
+ * @param tyname  the surface element type name
+ * @return        the variadic `Param`
+ */
+fn ffx_param_variadic(name: str, tyname: str) -> parser::Param {
+    parser::Param { name = name; has_type = true; type_ann = ffx_named_te(tyname); is_params = true; has_default = false; default_expr = ffx_no_expr() }
+}
+
+/**
+ * A checked function with the given export shape.
+ *
+ * @param name     the function name
+ * @param ns       the declaring namespace
+ * @param ret      the resolved return type
+ * @param params   the parameter list
+ * @param vis      the visibility
+ * @param csym     the `exp("…")` override symbol ("" = flatten-canonical default)
+ * @param tparams  the generic type-parameter names (empty for a monomorphic function)
+ * @return         the `TFunction`
+ */
+fn ffx_tf(name: str, ns: str, ret: checker::Type, params: []parser::Param, vis: parser::Visibility, csym: str, tparams: []str) -> checker::TFunction {
+    checker::TFunction {
+        name = name
+        type_params = tparams
+        type_constraints = teko::list::empty()
+        params = params
+        return_type = ret
+        body = teko::list::empty()
+        vis = vis
+        has_doc = false
+        doc = ""
+        namespace = ns
+        file = ""
+        line = 0; col = 0
+        is_test = false
+        is_extern = false
+        c_symbol = csym
+        from_lib = ""
+    }
+}
+
+/**
+ * A one-item program.
+ *
+ * @param it  the sole item
+ * @return    the `TProgram`
+ */
+fn ffx_prog1(it: checker::TItem) -> checker::TProgram {
+    checker::TProgram { items = teko::list::push(teko::list::empty(), it) }
+}
+
+/**
+ * A two-item program.
+ *
+ * @param a  the first item
+ * @param b  the second item
+ * @return   the `TProgram`
+ */
+fn ffx_prog2(a: checker::TItem, b: checker::TItem) -> checker::TProgram {
+    checker::TProgram { items = teko::list::push(teko::list::push(teko::list::empty(), a), b) }
+}
+
+/**
+ * A resolved `i64` type.
+ *
+ * @return  the `i64` `Prim` type
+ */
+fn ffx_i64() -> checker::Type { checker::Prim { kind = checker::PrimKind::I64 } }
+
+/**
+ * A minimal `TypeDecl` carrying the given body and visibility.
+ *
+ * @param name  the type name
+ * @param vis   the visibility
+ * @param body  the type body
+ * @return      the `TypeDecl`
+ */
+fn ffx_decl(name: str, vis: parser::Visibility, body: parser::TypeBody) -> parser::TypeDecl {
+    parser::TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = body; vis = vis; has_doc = false; doc = ""; line = 0; col = 0; di_kind = parser::DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }
+}
+
+/**
+ * An `exp` class declaration (used to drive the class-export rejection).
+ *
+ * @param name  the class name
+ * @return      the `TypeDecl`
+ */
+fn ffx_class_decl(name: str) -> parser::TypeDecl {
+    ffx_decl(name, parser::Visibility::Exp, parser::ClassBody { kind = parser::ClassKind::Sealed; has_base = false; base_name = ""; has_base_binding = false; base_binding_name = ""; implements = teko::list::empty(); fields = teko::list::empty(); methods = teko::list::empty(); consts = teko::list::empty() })
+}
+
+/**
+ * An `exp` interface declaration (used to drive the interface-export rejection).
+ *
+ * @param name  the interface name
+ * @return      the `TypeDecl`
+ */
+fn ffx_iface_decl(name: str) -> parser::TypeDecl {
+    ffx_decl(name, parser::Visibility::Exp, parser::InterfaceBody { extends = teko::list::empty(); methods = teko::list::empty() })
+}
+
+/**
+ * A scalar `add(a: i64, b: i64) -> i64` export in namespace `demo`.
+ *
+ * @param csym  the `exp("…")` override ("" = flatten-canonical default)
+ * @return      the `TFunction`
+ */
+fn ffx_add_fn(csym: str) -> checker::TFunction {
+    let ps = teko::list::push(teko::list::push(teko::list::empty(), ffx_param("a", "i64")), ffx_param("b", "i64"))
+    ffx_tf("add", "demo", ffx_i64(), ps, parser::Visibility::Exp, csym, teko::list::empty())
+}
+
+/**
+ * Whether `hay` contains `needle` as a substring (assertion helper).
+ *
+ * @param hay     the text searched
+ * @param needle  the substring sought
+ * @return        true iff `needle` occurs in `hay`
+ */
+fn ffx_contains(hay: str, needle: str) -> bool {
+    if needle.len == 0 { return true }
+    if needle.len > hay.len { return false }
+    mut i: u64 = 0
+    loop {
+        if i + needle.len > hay.len { break }
+        mut j: u64 = 0
+        mut ok = true
+        loop {
+            if j >= needle.len { break }
+            if hay[i + j] != needle[j] { ok = false; break }
+            j++
+        }
+        if ok { return true }
+        i++
+    }
+    false
+}
+
+#test
+/**
+ * flatten_canonical joins the namespace and name with single underscores, collapsing `::` and
+ * auto-prefixing the (project-root) namespace.
+ */
+fn ffx_flatten_canonical_shapes() {
+    teko::assert::is_true(flatten_canonical("demo", "add") == "demo_add")
+    teko::assert::is_true(flatten_canonical("demo::math", "add") == "demo_math_add")
+    teko::assert::is_true(flatten_canonical("", "add") == "add")
+}
+
+#test
+/**
+ * cg_c_export_symbol takes the `exp("…")` override verbatim when present, else the flatten default.
+ */
+fn ffx_export_symbol_default_and_override() {
+    teko::assert::is_true(cg_c_export_symbol(ffx_add_fn("")) == "demo_add")
+    teko::assert::is_true(cg_c_export_symbol(ffx_add_fn("teko_add")) == "teko_add")
+}
+
+#test
+/**
+ * emit_c_header renders a real C prototype for a scalar export, under the default flattened symbol.
+ */
+fn ffx_header_scalar_prototype() {
+    let h = match emit_c_header(ffx_prog1(ffx_add_fn(""))) { str as s => s; error => "" }
+    teko::assert::is_true(ffx_contains(h, "int64_t demo_add(int64_t a, int64_t b);"))
+    teko::assert::is_true(ffx_contains(h, "#include <stdint.h>"))
+}
+
+#test
+/**
+ * emit_c_header honors the `exp("…")` override in the prototype symbol.
+ */
+fn ffx_header_override_symbol() {
+    let h = match emit_c_header(ffx_prog1(ffx_add_fn("teko_add"))) { str as s => s; error => "" }
+    teko::assert::is_true(ffx_contains(h, "int64_t teko_add(int64_t a, int64_t b);"))
+}
+
+#test
+/**
+ * A zero-parameter `void` export renders `void <sym>(void);`.
+ */
+fn ffx_header_void_noparams() {
+    let f = ffx_tf("ping", "demo", checker::Void { }, teko::list::empty(), parser::Visibility::Exp, "", teko::list::empty())
+    let h = match emit_c_header(ffx_prog1(f)) { str as s => s; error => "" }
+    teko::assert::is_true(ffx_contains(h, "void demo_ping(void);"))
+}
+
+#test
+/**
+ * The export wrappers forward the C symbol to the internal `__`-mangled Teko symbol.
+ */
+fn ffx_wrappers_forward_to_internal() {
+    let w = match cg_c_export_wrappers_text(ffx_prog1(ffx_add_fn(""))) { str as s => s; error => "" }
+    teko::assert::is_true(ffx_contains(w, "int64_t demo_add(int64_t a, int64_t b) { return demo__add(a, b); }"))
+}
+
+#test
+/**
+ * The gate PASSES a well-formed scalar export.
+ */
+fn ffx_gate_ok_scalar() {
+    match check_ffi_export(ffx_prog1(ffx_add_fn(""))) {
+        null => teko::assert::is_true(true)
+        error => teko::assert::is_true(false)
+    }
+}
+
+#test
+/**
+ * The gate REJECTS an exported class categorically.
+ */
+fn ffx_gate_class_rejected() {
+    match check_ffi_export(ffx_prog1(ffx_class_decl("Widget"))) {
+        null => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(ffx_contains(e.message, "cannot export class `Widget`"))
+    }
+}
+
+#test
+/**
+ * The gate REJECTS an exported interface categorically.
+ */
+fn ffx_gate_interface_rejected() {
+    match check_ffi_export(ffx_prog1(ffx_iface_decl("Drawable"))) {
+        null => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(ffx_contains(e.message, "cannot export interface `Drawable`"))
+    }
+}
+
+#test
+/**
+ * The gate REJECTS a non-FFI-safe parameter type (`str`).
+ */
+fn ffx_gate_nonffisafe_param_rejected() {
+    let ps = teko::list::push(teko::list::empty(), ffx_param("s", "str"))
+    let f = ffx_tf("greet", "demo", ffx_i64(), ps, parser::Visibility::Exp, "", teko::list::empty())
+    match check_ffi_export(ffx_prog1(f)) {
+        null => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(ffx_contains(e.message, "parameter `s`"))
+    }
+}
+
+#test
+/**
+ * The gate REJECTS a Teko `params` variadic export.
+ */
+fn ffx_gate_variadic_rejected() {
+    let ps = teko::list::push(teko::list::empty(), ffx_param_variadic("xs", "i64"))
+    let f = ffx_tf("sum", "demo", ffx_i64(), ps, parser::Visibility::Exp, "", teko::list::empty())
+    match check_ffi_export(ffx_prog1(f)) {
+        null => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(ffx_contains(e.message, "`params` variadic"))
+    }
+}
+
+#test
+/**
+ * The gate REJECTS a generic export (only monomorphic instances have a C signature).
+ */
+fn ffx_gate_generic_rejected() {
+    let tps = teko::list::push(teko::list::empty(), "T")
+    let f = ffx_tf("id", "demo", ffx_i64(), teko::list::empty(), parser::Visibility::Exp, "", tps)
+    match check_ffi_export(ffx_prog1(f)) {
+        null => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(ffx_contains(e.message, "generic function `id`"))
+    }
+}
+
+#test
+/**
+ * The gate REJECTS two exports colliding on one C symbol.
+ */
+fn ffx_gate_collision_rejected() {
+    let a = ffx_tf("add", "demo", ffx_i64(), teko::list::empty(), parser::Visibility::Exp, "teko_x", teko::list::empty())
+    let b = ffx_tf("sub", "demo", ffx_i64(), teko::list::empty(), parser::Visibility::Exp, "teko_x", teko::list::empty())
+    match check_ffi_export(ffx_prog2(a, b)) {
+        null => teko::assert::is_true(false)
+        error as e => teko::assert::is_true(ffx_contains(e.message, "collision"))
+    }
+}
+
+#test
+/**
+ * A PRIVATE function is invisible to the C header (only `exp` crosses the boundary).
+ */
+fn ffx_private_fn_absent_from_header() {
+    let f = ffx_tf("secret", "demo", ffx_i64(), teko::list::empty(), parser::Visibility::Private, "", teko::list::empty())
+    let h = match emit_c_header(ffx_prog1(f)) { str as s => s; error => "" }
+    teko::assert::is_true(!ffx_contains(h, "demo_secret"))
+}
