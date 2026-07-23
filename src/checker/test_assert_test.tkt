@@ -1,0 +1,239 @@
+// src/checker/test_assert_test.tkt   (namespace 'teko::checker')
+//
+// Unit tests for the 0.3.0.29 assertion-fold analyzer signal: `predicate_folds_const` (comptime_fold)
+// and `test_assert_stats` (test_assert). Fixtures build the typed AST directly — no parse/check needed.
+
+use teko::lexer
+use teko::parser
+
+/** taf_num — a typed i64 number-literal expression fixture. */
+fn taf_num(v: i128) -> TExpr {
+    TExpr { kind = TNumber { is_float = false; value = v; fval = 0.0 }; type = Prim { kind = PrimKind::I64 }; line = 0; col = 0 }
+}
+
+/** taf_bool — a typed bool-literal expression fixture. */
+fn taf_bool(b: bool) -> TExpr {
+    TExpr { kind = TBoolLit { value = b }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+}
+
+/** taf_var — a typed variable-reference expression fixture (a runtime leaf). */
+fn taf_var(n: str) -> TExpr {
+    TExpr { kind = TVar { name = n; is_func = false; func_ns = "" }; type = Prim { kind = PrimKind::I64 }; line = 0; col = 0 }
+}
+
+/** taf_cmp — a typed `a <op> b` comparison expression fixture. */
+fn taf_cmp(a: TExpr, op: lexer::TokenKind, b: TExpr) -> TExpr {
+    let term = TCmpTerm { op = op; operand = b }
+    TExpr { kind = TCompare { first = a; rest = teko::list::push(teko::list::empty(), term) }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+}
+
+/** taf_bin — a typed `a <op> b` binary expression fixture. */
+fn taf_bin(a: TExpr, op: lexer::TokenKind, b: TExpr) -> TExpr {
+    TExpr { kind = TBinary { op = op; left = a; right = b }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+}
+
+/** taf_not — a typed `!operand` unary expression fixture. */
+fn taf_not(operand: TExpr) -> TExpr {
+    TExpr { kind = TUnary { op = lexer::TokenKind::Bang; operand = operand }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+}
+
+/** taf_path — a `teko::assert::<name>` callee path fixture. */
+fn taf_path(name: str) -> parser::Path {
+    mut segs: []parser::Segment = teko::list::push(teko::list::empty(), parser::Segment { name = "teko" })
+    segs = teko::list::push(segs, parser::Segment { name = "assert" })
+    segs = teko::list::push(segs, parser::Segment { name = name })
+    parser::Path { segments = segs }
+}
+
+/** taf_call — a typed call expression fixture to `path` with `args`. */
+fn taf_call(path: parser::Path, args: []TExpr) -> TExpr {
+    TExpr { kind = TCall { callee = path; args = args; call_ns = ""; is_closure_call = false; callee_type = Void { }; is_iface_dispatch = false; iface_slot = 0 }; type = Prim { kind = PrimKind::Bool }; line = 0; col = 0 }
+}
+
+/** taf_assert — a typed `teko::assert::<name>(pred)` call-expression fixture. */
+fn taf_assert(name: str, pred: TExpr) -> TExpr {
+    taf_call(taf_path(name), teko::list::push(teko::list::empty(), pred))
+}
+
+/** taf_expr_stmt — wrap an expression as an expression statement. */
+fn taf_expr_stmt(e: TExpr) -> TStatement { TExprStmt { expr = e } }
+
+/** taf_fn — a `#test` TFunction fixture with the given body. */
+fn taf_fn(body: []TStatement) -> TFunction {
+    TFunction {
+        name = "t"; type_params = teko::list::empty(); type_constraints = teko::list::empty()
+        params = teko::list::empty(); return_type = Void { }; body = body
+        vis = parser::Visibility::Private; has_doc = false; doc = ""; namespace = "probe"
+        file = ""; line = 0; col = 0; is_test = true; is_extern = false; c_symbol = ""; from_lib = ""
+    }
+}
+
+/**
+ * A comparison of two constant literals folds — `1 == 2` is comptime-decided (a dead guard predicate),
+ * so `predicate_folds_const` is true.
+ */
+#test
+fn taf_const_compare_folds() {
+    let pred = taf_cmp(taf_num(1), lexer::TokenKind::EqEq, taf_num(2))
+    teko::assert::is_true(predicate_folds_const(pred))
+}
+
+/** A bare bool literal folds. */
+#test
+fn taf_bool_literal_folds() {
+    teko::assert::is_true(predicate_folds_const(taf_bool(true)))
+}
+
+/** A comparison whose FIRST operand is a runtime variable does NOT fold. */
+#test
+fn taf_runtime_first_does_not_fold() {
+    let pred = taf_cmp(taf_var("x"), lexer::TokenKind::EqEq, taf_num(2))
+    teko::assert::is_false(predicate_folds_const(pred))
+}
+
+/** A comparison whose LATER operand is a runtime variable does NOT fold. */
+#test
+fn taf_runtime_operand_does_not_fold() {
+    let pred = taf_cmp(taf_num(1), lexer::TokenKind::EqEq, taf_var("x"))
+    teko::assert::is_false(predicate_folds_const(pred))
+}
+
+/** A `&&` of two constant predicates folds (the logical-connective leg). */
+#test
+fn taf_logical_and_of_constants_folds() {
+    let pred = taf_bin(taf_bool(true), lexer::TokenKind::AndAnd, taf_bool(false))
+    teko::assert::is_true(predicate_folds_const(pred))
+}
+
+/** A `&&` with a runtime side does NOT fold. */
+#test
+fn taf_logical_and_with_runtime_does_not_fold() {
+    let pred = taf_bin(taf_bool(true), lexer::TokenKind::AndAnd, taf_var("x"))
+    teko::assert::is_false(predicate_folds_const(pred))
+}
+
+/** A non-logical binary with a runtime operand does NOT fold (the `logical_binary_folds` false leg). */
+#test
+fn taf_nonlogical_binary_runtime_does_not_fold() {
+    let pred = taf_bin(taf_var("x"), lexer::TokenKind::Plus, taf_num(1))
+    teko::assert::is_false(predicate_folds_const(pred))
+}
+
+/** A `!` of a constant comparison folds (the unary leg). */
+#test
+fn taf_not_of_constant_folds() {
+    let pred = taf_not(taf_cmp(taf_num(1), lexer::TokenKind::EqEq, taf_num(1)))
+    teko::assert::is_true(predicate_folds_const(pred))
+}
+
+/** A runtime call predicate does NOT fold (the catch-all `_ => false` leg). */
+#test
+fn taf_runtime_call_does_not_fold() {
+    let pred = taf_call(taf_path("helper"), teko::list::empty())
+    teko::assert::is_false(predicate_folds_const(pred))
+}
+
+/**
+ * test_assert_stats over a body of two assertions — one folded (`1 == 2`), one runtime (`is_true(x)`)
+ * — counts total 2 and folded 1.
+ */
+#test
+fn taf_stats_counts_folded_and_real() {
+    mut body: []TStatement = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_true", taf_cmp(taf_num(1), lexer::TokenKind::EqEq, taf_num(2)))))
+    body = teko::list::push(body, taf_expr_stmt(taf_assert("is_true", taf_var("x"))))
+    let stats = test_assert_stats(taf_fn(body))
+    teko::assert::is_true(stats.total == 2)
+    teko::assert::is_true(stats.folded == 1)
+}
+
+/** An `is_false` assertion is counted, and a folded predicate under it is a dead guard. */
+#test
+fn taf_stats_counts_is_false() {
+    let body = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_false", taf_bool(false))))
+    let stats = test_assert_stats(taf_fn(body))
+    teko::assert::is_true(stats.total == 1)
+    teko::assert::is_true(stats.folded == 1)
+}
+
+/** A non-assert call statement contributes nothing to the tally. */
+#test
+fn taf_stats_ignores_non_assert_call() {
+    let body = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_call(taf_path("str_contains"), teko::list::push(teko::list::empty(), taf_bool(true)))))
+    let stats = test_assert_stats(taf_fn(body))
+    teko::assert::is_true(stats.total == 0)
+}
+
+/** Assertions nested inside a loop body are found (the loop-descent leg). */
+#test
+fn taf_stats_descends_into_loop() {
+    let inner = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_true", taf_bool(true))))
+    let loop_stmt: TStatement = TLoopStmt { label = ""; init = teko::list::empty(); body = inner }
+    let stats = test_assert_stats(taf_fn(teko::list::push(teko::list::empty(), loop_stmt)))
+    teko::assert::is_true(stats.total == 1)
+    teko::assert::is_true(stats.folded == 1)
+}
+
+/** Assertions in both branches of an `if` used as a statement are found (the if-descent leg). */
+#test
+fn taf_stats_descends_into_if() {
+    let then_blk = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_true", taf_bool(true))))
+    let else_blk = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_true", taf_var("x"))))
+    let if_expr = TExpr { kind = TIfExpr { cond = taf_var("c"); then_blk = then_blk; has_else = true; else_blk = else_blk }; type = Void { }; line = 0; col = 0 }
+    let stats = test_assert_stats(taf_fn(teko::list::push(teko::list::empty(), taf_expr_stmt(if_expr))))
+    teko::assert::is_true(stats.total == 2)
+    teko::assert::is_true(stats.folded == 1)
+}
+
+/** An `if` with no else descends into the then block only (the `!has_else` leg). */
+#test
+fn taf_stats_if_without_else() {
+    let then_blk = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_true", taf_bool(true))))
+    let if_expr = TExpr { kind = TIfExpr { cond = taf_var("c"); then_blk = then_blk; has_else = false; else_blk = teko::list::empty() }; type = Void { }; line = 0; col = 0 }
+    let stats = test_assert_stats(taf_fn(teko::list::push(teko::list::empty(), taf_expr_stmt(if_expr))))
+    teko::assert::is_true(stats.total == 1)
+}
+
+/** Assertions inside a `match` arm body are found (the match-descent leg). */
+#test
+fn taf_stats_descends_into_match() {
+    let arm_body = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_true", taf_bool(true))))
+    let arm = TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = taf_var("g"); body = arm_body }
+    let match_expr = TExpr { kind = TMatchExpr { subject = taf_var("s"); arms = teko::list::push(teko::list::empty(), arm) }; type = Void { }; line = 0; col = 0 }
+    let stats = test_assert_stats(taf_fn(teko::list::push(teko::list::empty(), taf_expr_stmt(match_expr))))
+    teko::assert::is_true(stats.total == 1)
+}
+
+/** A non-expression statement (a bare `return`) contributes nothing (the `_ => empty` leg). */
+#test
+fn taf_stats_ignores_return_statement() {
+    let body = teko::list::push(teko::list::empty(), TReturn { has_value = false; value = taf_num(0) })
+    let stats = test_assert_stats(taf_fn(body))
+    teko::assert::is_true(stats.total == 0)
+}
+
+/** A call whose path is too short to be an assert is ignored (the `segs.len < 2` guard). */
+#test
+fn taf_stats_ignores_short_path_call() {
+    let path = parser::Path { segments = teko::list::push(teko::list::empty(), parser::Segment { name = "foo" }) }
+    let body = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_call(path, teko::list::push(teko::list::empty(), taf_bool(true)))))
+    let stats = test_assert_stats(taf_fn(body))
+    teko::assert::is_true(stats.total == 0)
+}
+
+/** A defer body's assertions are found (the defer-descent leg). */
+#test
+fn taf_stats_descends_into_defer() {
+    let inner = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_true", taf_bool(true))))
+    let body = teko::list::push(teko::list::empty(), TDeferStmt { body = inner })
+    let stats = test_assert_stats(taf_fn(body))
+    teko::assert::is_true(stats.total == 1)
+}
+
+/** An adopt body's assertions are found (the adopt-descent leg). */
+#test
+fn taf_stats_descends_into_adopt() {
+    let inner = teko::list::push(teko::list::empty(), taf_expr_stmt(taf_assert("is_true", taf_bool(true))))
+    let body = teko::list::push(teko::list::empty(), TAdoptStmt { name = ""; body = inner })
+    let stats = test_assert_stats(taf_fn(body))
+    teko::assert::is_true(stats.total == 1)
+}

@@ -1465,6 +1465,73 @@ fn sp_tcall_segs(names: []str, ns: str) -> TCall {
     teko::assert::is_true(is_mem_free_call(sp_tcall_segs(teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "teko"), "mem"), "free"), "teko::mem")))
 }
 
+/**
+ * A `&referent` explicit safe-borrow expression (`TBorrow`) over a bare non-scalar local, typed
+ * `Reference<str>` — the F1.3 stored-ref-bind RHS shape (`mut y = &x`).
+ *
+ * @param str referent  the borrowed local's name
+ * @return TExpr  a `TBorrow` typed expression
+ */
+fn sp_borrow(referent: str) -> TExpr {
+    TExpr { kind = TBorrow { operand = sp_nonscalar_var(referent) }; type = Reference { inner = sp_nonscalar() }; line = 0; col = 0 }
+}
+
+/**
+ * Is a borrowed-from value `BfLocal`?
+ *
+ * @param BorrowedFrom b  the borrowed-from value
+ * @return bool { match b { BfLocal => true; _ => false } }  true iff `BfLocal`
+ */
+fn sp_bf_is_local(b: BorrowedFrom) -> bool { match b { BfLocal => true; _ => false } }
+
+/**
+ * (F1.3) A local ref-bind `mut y = &x` SEEDS `bf[y] := BfLocal(x)` at the single syntactic borrow
+ * site, so `ref_target_outlives(y, x)` ADMITS — the borrowed local `x` (a `PtFrame` allocation) is
+ * not adopter-confined, so the stored borrow provably does not dangle. This is the escape-gate
+ * relaxation's spine proof (`ref_borrow_or_error` consumes it to admit the ref-to-local bind).
+ */
+#test fn spine_borrow_bind_seeds_bflocal_and_ref_target_outlives() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("x", sp_field("obj", "data", sp_nonscalar()))),
+        sp_let("y", sp_borrow("x")))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    let xi = cell_of(s, "x")
+    let yi = cell_of(s, "y")
+    teko::assert::is_true(xi >= 0)
+    teko::assert::is_true(yi >= 0)
+    teko::assert::is_true(sp_bf_is_local(s.bf[yi to u32]))
+    teko::assert::is_true(ref_target_outlives(s, yi to u32, xi to u32))
+}
+
+/**
+ * (F1.3) Two LIVE mutable borrows of the same local `x` (`mut y = &x; mut z = &x`) ALIAS `x` — each
+ * stored borrow marks its referent shared — so `is_unique_at(x)` is FALSE, the exclusive-XOR fact a
+ * later exclusive-mut borrow site consumes to reject "cannot borrow `x` mutably — it is already
+ * aliased here".
+ */
+#test fn spine_two_live_borrows_of_x_mark_it_shared_is_unique_false() {
+    let body = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(),
+                sp_let("x", sp_field("obj", "data", sp_nonscalar()))),
+            sp_let("y", sp_borrow("x"))),
+        sp_let("z", sp_borrow("x")))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    teko::assert::is_false(is_unique_at(s, cell_of(s, "x") to u32))
+}
+
+/**
+ * (F1.3) `ref_borrow_or_error` ADMITS a stored local ref-bind `mut y = &x` whose borrow provably
+ * outlives its referent: `ref_bind_referent_name` reads the `&x` operand `x` (a `PtFrame`-allocated
+ * local, not adopter-confined), so the storability gate returns null — no R5 reject. This is the
+ * typer-side consumer of the F1.3 spine facts, the end-to-end admission of the `mut y = &x` sink.
+ */
+#test fn ref_borrow_or_error_admits_outliving_local_borrow() {
+    let body = teko::list::push(teko::list::push(teko::list::empty(),
+            sp_let("x", sp_field("obj", "data", sp_nonscalar()))),
+        sp_let("y", sp_borrow("x")))
+    let s = fn_spine(sp_fn(teko::list::empty(), body))
+    match ref_borrow_or_error(s, "y", sp_borrow("x")) { null => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+}
+
 /** A fresh capturing call `push(xs)` — its non-scalar bare-local arg `xs` is a capture operand. */
 fn sp_cap() -> TExpr { sp_nonfree_call(teko::list::push(teko::list::empty(), sp_nonscalar_var("xs"))) }
 

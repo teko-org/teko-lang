@@ -585,6 +585,71 @@ fn retype_literal_plain_leaf_unchanged_from_68() {
     teko::assert::is_true(prim_is(retyped.type, PrimKind::U8))
 }
 
+/**
+ * Reads whether a typed statement block's trailing expression leaf has primitive kind `k` — the
+ * probe shared by the `retype_literal` if/match recursion tests below.
+ *
+ * @param stmts  the branch/arm statement block
+ * @param k      the expected primitive kind of the trailing leaf
+ * @return       true iff the block's last statement is a trailing expression of prim `k`
+ */
+fn block_trailing_prim_is(stmts: []TStatement, k: PrimKind) -> bool {
+    if stmts.len == 0 { return false }
+    match stmts[stmts.len - 1] {
+        TExprStmt as es => prim_is(es.expr.type, k)
+        _ => false
+    }
+}
+
+/**
+ * (A) `retype_literal` over a checked `if` expression RECURSES into each branch's trailing value:
+ * the outer node AND both branch leaves are retyped to the destination prim — the correctness fix
+ * that borns an over-i64 `if`-arm at its true width (the §2.5 miscompile guard). Built directly on
+ * typed nodes, bypassing the parser (VM-safety, mirroring the array-element test above).
+ */
+#test
+fn retype_literal_recurses_into_if_arms() {
+    let cond = TExpr { kind = TBoolLit { value = true }; type = boolt(); line = 0; col = 0 }
+    let then_blk: []TStatement = teko::list::push(teko::list::empty(), texpr_stmt(tnum(7)))
+    let else_blk: []TStatement = teko::list::push(teko::list::empty(), texpr_stmt(tnum(9)))
+    let ife = TExpr { kind = TIfExpr { cond = cond; then_blk = then_blk; has_else = true; else_blk = else_blk }; type = i64t(); line = 0; col = 0 }
+    let retyped = retype_literal(ife, Prim { kind = PrimKind::U8 })
+    teko::assert::is_true(prim_is(retyped.type, PrimKind::U8))
+    match retyped.kind {
+        TIfExpr as f => {
+            teko::assert::is_true(block_trailing_prim_is(f.then_blk, PrimKind::U8))
+            teko::assert::is_true(block_trailing_prim_is(f.else_blk, PrimKind::U8))
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
+/**
+ * (A) `retype_literal` over a checked `match` expression RECURSES into each arm's trailing value:
+ * the outer node AND every arm leaf are retyped to the destination prim (the if/match half of the
+ * §2.5 miscompile guard). Built directly on typed nodes.
+ */
+#test
+fn retype_literal_recurses_into_match_arms() {
+    let subject = tnum(1)
+    let arm0_body: []TStatement = teko::list::push(teko::list::empty(), texpr_stmt(tnum(7)))
+    let arm1_body: []TStatement = teko::list::push(teko::list::empty(), texpr_stmt(tnum(9)))
+    let arm0 = TArm { pattern = parser::LiteralPattern { value = e_num(1) }; has_when = false; guard = tnum(0); body = arm0_body }
+    let arm1 = TArm { pattern = parser::WildcardPattern { }; has_when = false; guard = tnum(0); body = arm1_body }
+    let arms: []TArm = teko::list::push(teko::list::push(teko::list::empty(), arm0), arm1)
+    let mx = TExpr { kind = TMatchExpr { subject = subject; arms = arms }; type = i64t(); line = 0; col = 0 }
+    let retyped = retype_literal(mx, Prim { kind = PrimKind::U8 })
+    teko::assert::is_true(prim_is(retyped.type, PrimKind::U8))
+    match retyped.kind {
+        TMatchExpr as m => {
+            teko::assert::is_true(m.arms.len == 2)
+            teko::assert::is_true(block_trailing_prim_is(m.arms[0].body, PrimKind::U8))
+            teko::assert::is_true(block_trailing_prim_is(m.arms[1].body, PrimKind::U8))
+        }
+        _ => teko::assert::is_true(false)
+    }
+}
+
 #test
 fn return_type_checks() {
     let body1 = one_stmt(e_var("x"))
@@ -5064,5 +5129,153 @@ fn mem_free_accepts_region_handle() {
     match type_call(call, env, region_handle_table()) {
         TExpr as te => match te.type { Void => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
         error => teko::assert::is_true(false)
+    }
+}
+
+/** borrow_of_mut_var_types_to_reference — `&x` types to `Reference { inner = <operand type> }`
+    when `x` is a `mut` local (AL wave F1.2). */
+#test
+fn borrow_of_mut_var_types_to_reference() {
+    let env = define(empty_env(), "x", u32t(), true)
+    let b = parser::Borrow { operand = e_var("x") }
+    let te = match type_expr(ek(b), env, empty_table()) { TExpr as e => e; error => { teko::assert::is_true(false); return } }
+    match te.type {
+        Reference as r => teko::assert::is_true(prim_is(r.inner, PrimKind::U32))
+        _ => teko::assert::is_true(false)
+    }
+    match te.kind { TBorrow as tb => teko::assert::is_true(prim_is(tb.operand.type, PrimKind::U32)); _ => teko::assert::is_true(false) }
+}
+
+/** borrow_of_immutable_var_is_error — `&x` over an IMMUTABLE binding is rejected: a reference
+    would have no way to mutate its pointee (AL wave F1.2; F2's `&(let)` rejection is enforced
+    right here, at the borrow site). */
+#test
+fn borrow_of_immutable_var_is_error() {
+    let env = define(empty_env(), "x", u32t(), false)
+    let b = parser::Borrow { operand = e_var("x") }
+    match type_expr(ek(b), env, empty_table()) { TExpr => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * A typed numeric-literal `TExpr` at the default `i64` leaf type, for the C2b union-adoption tests.
+ *
+ * @param v  the literal's integer value
+ * @return   a `TExpr` wrapping a `TNumber` leaf typed `i64`
+ */
+fn tnum_i64(v: i128) -> TExpr { TExpr { kind = TNumber { is_float = false; value = v; fval = 0.0 }; type = i64t(); line = 0; col = 0 } }
+
+/**
+ * A typed bare-`null` `TExpr` at the sentinel optional type, for the C2b union-adoption tests.
+ *
+ * @return  a `TExpr` wrapping a `TNullLit` leaf typed `void?`
+ */
+fn tnull_sentinel() -> TExpr { TExpr { kind = TNullLit { }; type = Optional { inner = Void { } }; line = 0; col = 0 } }
+
+/**
+ * The inline union `i32 | null` (null-first canonical order) — the unambiguous C2b adoption target
+ * with exactly one numeric member and the `null` member.
+ *
+ * @return  a `Variant` of `[null, i32]`
+ */
+fn union_i32_or_null() -> Type {
+    mut m: []Type = teko::list::push(teko::list::empty(), Null { })
+    m = teko::list::push(m, i32t())
+    Variant { members = m }
+}
+
+/**
+ * The ambiguous union `i8 | i32` — two numeric members a small literal fits, so C2b must NOT adopt
+ * a bare literal into it (explicit typing required).
+ *
+ * @return  a `Variant` of `[i8, i32]`
+ */
+fn union_i8_or_i32() -> Type {
+    mut m: []Type = teko::list::push(teko::list::empty(), i8t())
+    m = teko::list::push(m, i32t())
+    Variant { members = m }
+}
+
+/**
+ * C2b — a bare numeric literal adopts a union's SOLE fitting numeric member (`1` → `i32 | null`)
+ * and `retype_literal` borns it at that member; a bare `null` adopts the `null` member and is
+ * borned at `Null`; an ambiguous `i8 | i32` (two fitting numeric members) refuses a bare literal,
+ * and a union with no `null` member refuses a bare `null`.
+ */
+#test
+fn c2b_literal_adopts_union_member() {
+    teko::assert::is_true(literal_adopts(tnum_i64(1), union_i32_or_null()))
+    let rn = retype_literal(tnum_i64(1), union_i32_or_null())
+    teko::assert::is_true(prim_is(rn.type, PrimKind::I32))
+    teko::assert::is_true(literal_adopts(tnull_sentinel(), union_i32_or_null()))
+    let rnull = retype_literal(tnull_sentinel(), union_i32_or_null())
+    match rnull.type { Null => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+    teko::assert::is_true(!literal_adopts(tnum_i64(1), union_i8_or_i32()))
+    teko::assert::is_true(!literal_adopts(tnull_sentinel(), union_i8_or_i32()))
+}
+
+/**
+ * index_assign_requires_mut_container — `type_index_assign` accepts `a[i] = v` when the receiver is a
+ * `mut` slice binding, and REJECTS it when the receiver is immutable (a `let` or a parameter slice),
+ * yielding the "declare it `mut`" diagnostic. This immutable-container barrier is exactly what a slice
+ * for-each's element write-back inherits: `loop x in let_ids { x = 0 }` desugars to the index-store
+ * `let_ids[i] = x`, which this same check refuses — the source of the read-only for-each compile error.
+ */
+#test
+fn index_assign_requires_mut_container() {
+    let u64_slice: Type = Slice { element = Prim { kind = PrimKind::U64 } }
+    let lhs = ek(parser::Index { receiver = e_var("a"); index = e_num(1) })
+    let a = parser::Assign { kind = parser::AssignKind::Index; name = ""; op = lexer::TokenKind::Assign; value = e_num(9); deref = false; target = lhs }
+    let mut_env = define(empty_env(), "a", u64_slice, true)
+    match type_index_assign(a, mut_env, empty_table()) { TypedStmt => teko::assert::is_true(true); error => teko::assert::is_true(false) }
+    let let_env = define(empty_env(), "a", u64_slice, false)
+    match type_index_assign(a, let_env, empty_table()) { TypedStmt => teko::assert::is_true(false); error => teko::assert::is_true(true) }
+}
+
+/**
+ * host_surface_resolves_env_io_fs_process — `host_surface_fn` resolves the C-native host-stdlib
+ * surface names (env / io / fs / process) to a `Func` type so a STANDALONE user program can bind them,
+ * and refuses any non-host name. Pins the arity and return shape of one representative per surface:
+ * `read_line` (io, 0 -> str), `args` (env, 0 -> []str), `read_file` (fs, 1 param) and `run`
+ * (process, 1 param -> i32).
+ */
+#test
+fn host_surface_resolves_env_io_fs_process() {
+    match host_surface_fn("read_line") {
+        Type as t => match t {
+            Func as f => {
+                teko::assert::is_true(f.params.len == 0)
+                match f.ret { Str => teko::assert::is_true(true); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match host_surface_fn("args") {
+        Type as t => match t {
+            Func as f => {
+                teko::assert::is_true(f.params.len == 0)
+                match f.ret { Slice as sl => match sl.element { Str => teko::assert::is_true(true); _ => teko::assert::is_true(false) }; _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match host_surface_fn("read_file") {
+        Type as t => match t { Func as f => teko::assert::is_true(f.params.len == 1); _ => teko::assert::is_true(false) }
+        error => teko::assert::is_true(false)
+    }
+    match host_surface_fn("run") {
+        Type as t => match t {
+            Func as f => {
+                teko::assert::is_true(f.params.len == 1)
+                match f.ret { Prim as p => teko::assert::is_true(p.kind == PrimKind::I32); _ => teko::assert::is_true(false) }
+            }
+            _ => teko::assert::is_true(false)
+        }
+        error => teko::assert::is_true(false)
+    }
+    match host_surface_fn("definitely_not_a_host_fn") {
+        Type => teko::assert::is_true(false)
+        error => teko::assert::is_true(true)
     }
 }

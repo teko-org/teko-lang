@@ -255,6 +255,8 @@ fn mark_expr(e: TExpr, escaping: bool, acc: Ref<[]str>) -> void {
                 i++
             }
         }
+
+        TBorrow as b => mark_expr(b.operand, escaping, acc)
     }
 }
 
@@ -298,7 +300,7 @@ fn mark_stmt(s: TStatement, tail: bool, acc: Ref<[]str>) -> void {
                 mark_expr(self_append_item(a), true, acc)
             } else {
                 mark_expr(a.value, true, acc)
-                match a.kind { parser::AssignKind::Field => mark_expr(a.target, true, acc); _ => { } }
+                if parser::assign_has_target(a.kind) { mark_expr(a.target, true, acc) }
             }
         }
         // a return value escapes the frame entirely.
@@ -527,7 +529,7 @@ fn chain_stats_stmt(s: TStatement, name: str) -> ChainStats {
         }
         TAssign as a => {
             mut st = chain_stats_expr(a.value, name)
-            match a.kind { parser::AssignKind::Field => st = cs_add(st, chain_stats_expr(a.target, name)); _ => { } }
+            if parser::assign_has_target(a.kind) { st = cs_add(st, chain_stats_expr(a.target, name)) }
             if a.name == name {
                 if assign_is_self_append(a) { st = cs_add(st, ChainStats { births_empty = 0; births_other = 0; other_writes = 0; self_appends = 1 }) }
                 else { st = cs_add(st, ChainStats { births_empty = 0; births_other = 0; other_writes = 1; self_appends = 0 }) }
@@ -724,6 +726,7 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
             loop { if i >= lam.captures.len { break }; if lam.captures[i].name == name { return 1 }; i++ }
             0
         }
+        TBorrow as b => count_reads_expr(b.operand, name)
     }
 }
 
@@ -731,7 +734,7 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
 fn count_reads_stmt(s: TStatement, name: str) -> i64 {
     match s {
         TBinding as b => count_reads_expr(b.value, name)
-        TAssign as a => count_reads_expr(a.value, name) + match a.kind { parser::AssignKind::Field => count_reads_expr(a.target, name); _ => 0 }   // (#88) the FIELD receiver reads `name` too
+        TAssign as a => count_reads_expr(a.value, name) + (if parser::assign_has_target(a.kind) { count_reads_expr(a.target, name) } else { 0 })
         TReturn as r => if r.has_value { count_reads_expr(r.value, name) } else { 0 }
         TExprStmt as es => count_reads_expr(es.expr, name)
         TLoopStmt as l => count_reads_block(l.init, name) + count_reads_block(l.body, name)

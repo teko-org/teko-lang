@@ -46,8 +46,12 @@ use teko::parser
     historical emission, so the FIXPOINT `gen2.c == gen3.c` is untouched. `TestPlain` emits a
     test-gate main that calls each `#test` in `prog.items` order (native gate, no coverage).
     `TestCov` adds the `tk_cov_*` prologue/brackets (coverage sinks) — zero-cost when unused,
-    because those calls are simply absent from the emitted C under `Program`/`TestPlain`. */
-type CgMode = enum { Program; TestPlain; TestCov }
+    because those calls are simply absent from the emitted C under `Program`/`TestPlain`.
+    `TestAnalyze` (0.3.0.29) emits the SAME production-fn instrumentation as `TestCov`, but a
+    per-test ISOLATION harness: between every `#test` it resets all three sinks, runs the test,
+    and dumps THAT test's id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov` — one compile answers the
+    whole-suite stale/redundant question (`teko test . --analyzer`). */
+type CgMode = enum { Program; TestPlain; TestCov; TestAnalyze }
 
 /**
  * CovCtx — the coverage-instrumentation context threaded through TestCov body emission (#265).
@@ -427,6 +431,27 @@ fn cg_find_variant_decl(prog: checker::TProgram, name: str) -> parser::TypeDecl 
 // truth every codegen predicate agrees on for bare→decl resolution.
 fn cg_canon_name(prog: checker::TProgram, name: str) -> str {
     match cg_find_decl(prog, name) { parser::TypeDecl as d => d.name; error => name }
+}
+
+/**
+ * cg_canon_name_ns — the CANONICAL decl name for a syntactic type PATH, resolved in the referencing
+ * namespace `ref_ns`. A bare `Reader` written in `teko::io` binds `teko::io::Reader`, NOT a
+ * same-last-segment cousin in another namespace (`teko::emit::Reader`, the #109 collision) — so an
+ * expected-slot type built for a call arg / struct field carries the RIGHT decl, and the
+ * class->interface upcast wrap (emit_as CONTRACT slot) fires against the real contract. Falls back
+ * to the ns-agnostic canonicaliser when no ns-precise decl matches (an imported type declared in
+ * another namespace), preserving the pre-existing no-collision behavior.
+ *
+ * @param prog    the typed program
+ * @param path    the syntactic type path (its last segment names the type)
+ * @param ref_ns  the namespace the path is written in (the callee fn's / struct decl's namespace)
+ * @return        the canonical decl name, or the ns-agnostic canonicalisation on no ns-precise hit
+ */
+fn cg_canon_name_ns(prog: checker::TProgram, path: parser::Path, ref_ns: str) -> str {
+    match cg_find_decl_ns(prog, path, ref_ns) {
+        parser::TypeDecl as d => d.name
+        error => cg_canon_name(prog, path.segments[path.segments.len - 1].name)
+    }
 }
 
 // cg_named_is_variant — is the NAMED type `name` a (declared) variant? (C: `cg_named_is_variant`.)
@@ -999,6 +1024,7 @@ fn emit_type(buf: []byte, prog: checker::TProgram, t: checker::Type) -> []byte |
         checker::Uptr => cb(buf, "uintptr_t")
         // (MEM-1b) Ref<T> → a bare `<T> *` today ("C pointer without `*`/`&`"; struct wrapper waits for W9+ metadata).
         checker::Reference as r => cb(match emit_type(buf, prog, r.inner) { []byte as o => o; error as e => return e }, " *")
+        checker::Null => cb(buf, "uint8_t")
     }
 }
 
@@ -1094,6 +1120,7 @@ fn cg_opt_mangle(buf: []byte, inner: checker::Type) -> []byte | error {
         checker::Char => cb(buf, "char")
         checker::Str => cb(buf, "str")
         checker::Error => cb(buf, "error")
+        checker::Null => cb(buf, "null")
         checker::Named as nm => cb_str(buf, checker::name_last_segment(nm.name))   // (#149) BARE key — the (#109 W3) canonical nm.name carries `::` (invalid C); mirror cg_opt_mangle_str and the C twin (tk_name_last_segment)
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
@@ -1131,6 +1158,7 @@ fn cg_opt_mangle_str(inner: checker::Type) -> str | error {
         checker::Char => "char"
         checker::Str => "str"
         checker::Error => "error"
+        checker::Null => "null"
         checker::Named as nm => checker::name_last_segment(nm.name)   // (#109 W3) BARE key — matches the syntactic cg_opt_mangle_texpr_str; keeps tk_u_/tk_slice_/tk_opt_ names valid C identifiers
         checker::Optional as o => match o.inner {
             checker::Void => error { message = "codegen: nested bare-null optional (internal)" }
@@ -1187,28 +1215,69 @@ fn cg_member_key_str(m: checker::Type) -> str | error {
     if cg_is_c_keyword(k) { teko::str::concat(k, "_") } else { k }
 }
 
-// cg_member_key — append a resolved member's key to a buffer. (C: `cg_member_key`.)
-fn cg_member_key(buf: []byte, m: checker::Type) -> []byte | error {
-    cb(buf, match cg_member_key_str(m) { str as s => s; error as e => return e })
+/**
+ * Report whether a resolved variant member's mangled KEY collides with a C keyword — the
+ * allocation-free predicate that drives the trailing-`_` escape in the buffer-emitting
+ * `cg_member_key`. Only a bare leaf key can be a keyword: a composite member (`Optional`,
+ * `Slice`) always carries an `opt_`/`slice_` prefix, so it never collides; a `Prim` yields a
+ * keyword only for `Bool` (`bool`), a `Char` yields `char`, and a `Named` is tested against its
+ * last path segment. Mirrors `cg_is_c_keyword(cg_member_key_str(m))` byte-for-byte without
+ * building the key string.
+ *
+ * @param m  the resolved member type whose emitted key is examined
+ * @return   true when the key equals a C keyword and thus needs a trailing `_`
+ */
+fn cg_member_key_is_c_keyword(m: checker::Type) -> bool {
+    match m {
+        checker::Prim as p => match p.kind {
+            checker::PrimKind::Bool => true
+            _ => false
+        }
+        checker::Char => true
+        checker::Named as nm => cg_is_c_keyword(checker::name_last_segment(nm.name))
+        _ => false
+    }
 }
 
-// cg_variant_typename_str — the deterministic C type NAME of an INLINE variant `A | B | …`:
-// `tk_u_` then each member's key joined by `_`, in SOURCE ORDER. (C: `cg_variant_typename`.)
-fn cg_variant_typename_str(v: checker::Variant) -> str | error {
-    mut name = "tk_u"
+/**
+ * Append a resolved variant member's C-identifier-safe KEY directly to `buf`, with ZERO
+ * throwaway `str` (AL4a-1): the key text is written straight into the byte buffer via
+ * `cg_opt_mangle` (which already handles the `slice_<elem>` member shape), then a trailing `_`
+ * is appended when the key collides with a C keyword so the union field, the `.as.<key>`
+ * construction, and the destructure all agree. Byte-identical to the retired build-then-append
+ * path (`cb(buf, cg_member_key_str(m))`).
+ *
+ * @param buf  the C-symbol byte buffer to append to
+ * @param m    the resolved member type whose key is emitted
+ * @return     the extended buffer
+ * @throws     when the member is an untyped empty slice/optional with no known element type
+ */
+fn cg_member_key(buf: []byte, m: checker::Type) -> []byte | error {
+    let out = match cg_opt_mangle(buf, m) { []byte as o => o; error as e => return e }
+    if cg_member_key_is_c_keyword(m) { cb(out, "_") } else { out }
+}
+
+/**
+ * Append the deterministic C type NAME of an INLINE variant `A | B | …` directly to `buf`, with
+ * ZERO throwaway `str` (AL4a-1): emit `tk_u`, then for each member in SOURCE ORDER emit `_`
+ * followed by that member's key straight into the buffer. Byte-identical to the retired
+ * build-then-append path that composed the whole name with `teko::str::concat`.
+ *
+ * @param buf  the C-symbol byte buffer to append to
+ * @param v    the inline variant whose `tk_u_<keys>` name is emitted
+ * @return     the extended buffer
+ * @throws     when a member's key cannot be mangled (untyped empty slice/optional element)
+ */
+fn cg_variant_typename(buf: []byte, v: checker::Variant) -> []byte | error {
+    mut out = cb(buf, "tk_u")
     mut i = 0
     loop {
         if i >= v.members.len { break }
-        let k = match cg_member_key_str(v.members[i]) { str as s => s; error as e => return e }
-        name = teko::str::concat(name, "_", k)
+        out = cb(out, "_")
+        out = match cg_member_key(out, v.members[i]) { []byte as o => o; error as e => return e }
         i++
     }
-    name
-}
-
-// cg_variant_typename — append the inline-variant tk_u_<keys> name to a buffer. (C: `cg_variant_typename`.)
-fn cg_variant_typename(buf: []byte, v: checker::Variant) -> []byte | error {
-    cb(buf, match cg_variant_typename_str(v) { str as s => s; error as e => return e })
+    out
 }
 
 // cg_emit_variant_ctype — emit the C TYPE for any variant-shaped resolved type: a Named
@@ -2233,7 +2302,6 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
         if llast == "with_cap" {
             return emit_list_with_cap(buf, prog, e, c, escaping, regions, fn_body, dctx, "")
         }
-        return error { message = "codegen: this teko::list builtin not yet supported (only empty/push/with_cap — fixed+copy)" }
     }
     // teko::mem::free(x) — manual dealloc (the checker proved x is a mutable heap variable).
     if p.segments.len >= 2 && p.segments[p.segments.len - 2].name == "mem" && p.segments[p.segments.len - 1].name == "free" {
@@ -2372,6 +2440,9 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
             else if last == "ewrite" { builtin = "tk_ewrite"; has_builtin = true }   // (str) -> void (stderr)
             else if last == "eprint" { builtin = "tk_eprint"; has_builtin = true }   // (str) -> void (stderr)
             else if last == "eprintln" { builtin = "tk_eprintln"; has_builtin = true }   // (str) -> void (stderr + '\n')
+            else if last == "read_line" { builtin = "tk_rt_read_line"; has_builtin = true }
+            else if last == "stdin_eof" { builtin = "tk_rt_stdin_eof"; has_builtin = true }
+            else if last == "read_stdin" { builtin = "tk_rt_read_stdin"; has_builtin = true }
             else if last == "parse" { builtin = "tk_float_parse"; has_builtin = true }   // teko::float::parse(str) -> f64
             // arithmetic FFI over the i128 carrier (sign-aware) + float bit-patterns. (`div`/`rem`
             // mangle to tk_* so they never clash with libc's div/rem.)
@@ -2512,6 +2583,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
         match cf_res {
             checker::TFunction as cf => {
                 if j < cf.params.len {
+                    let cf_ref_ns = cg_fn_ref_ns(prog, cf.namespace)
                     match cf.params[j].type_ann {
                         parser::NamedType as nt => {
                             let pn = nt.path.segments[nt.path.segments.len - 1].name
@@ -2524,7 +2596,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                                 if !arg_is_ref { out = cb(out, "&") }
                                 out = match emit_expr_ctx(out, prog, ret_type, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             } else {
-                                out = match emit_as_r(out, prog, ret_type, checker::Named { name = cg_canon_name(prog, pn) }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+                                out = match emit_as_r(out, prog, ret_type, checker::Named { name = cg_canon_name_ns(prog, nt.path, cf_ref_ns) }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
                             }
                             wrapped = true
                         }
@@ -2536,7 +2608,7 @@ fn emit_call(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, e: c
                         // type, which mangles identically to the param's inner (exact-match widen).
                         parser::OptionalType as ot => {
                             let inner_t = match ot.inner {
-                                parser::NamedType as int_nt => checker::Named { name = cg_canon_name(prog, int_nt.path.segments[int_nt.path.segments.len - 1].name) }
+                                parser::NamedType as int_nt => checker::Named { name = cg_canon_name_ns(prog, int_nt.path, cf_ref_ns) }
                                 _ => c.args[j].type
                             }
                             out = match emit_as_r(out, prog, ret_type, checker::Optional { inner = inner_t }, c.args[j], escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
@@ -3335,11 +3407,11 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
             mut exp_t: checker::Type = checker::Void { }
             match fte_opt {
                 parser::TypeExpr as fte => match fte {
-                    parser::NamedType as nt => { exp_t = checker::Named { name = cg_canon_name(prog, nt.path.segments[nt.path.segments.len - 1].name) } }
+                    parser::NamedType as nt => { exp_t = checker::Named { name = cg_canon_name_ns(prog, nt.path, checker::name_qualifier(name)) } }
                     parser::SliceType as st => match st.element {
                         parser::NamedType as ent => {
                             let elem = ent.path.segments[ent.path.segments.len - 1].name
-                            if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name(prog, elem) } } }
+                            if !cg_is_prim_name(elem) { exp_t = checker::Slice { element = checker::Named { name = cg_canon_name_ns(prog, ent.path, checker::name_qualifier(name)) } } }
                         }
                         parser::OptionalType => { exp_t = cg_slice_param_type(prog, st, fv.type) }
                         _ => { }
@@ -3347,7 +3419,7 @@ fn emit_struct_init_literal(buf: []byte, prog: checker::TProgram, e: checker::TE
                     // a present value into a `T?` field (T named) → emit_as wraps T → T?
                     // ({ .present = true, .value = … }). (A bare `null` is the sentinel branch above.)
                     parser::OptionalType as ot => match ot.inner {
-                        parser::NamedType as inner_nt => { exp_t = checker::Optional { inner = checker::Named { name = cg_canon_name(prog, inner_nt.path.segments[inner_nt.path.segments.len - 1].name) } } }
+                        parser::NamedType as inner_nt => { exp_t = checker::Optional { inner = checker::Named { name = cg_canon_name_ns(prog, inner_nt.path, checker::name_qualifier(name)) } } }
                         _ => { }
                     }
                     _ => { }
@@ -4024,11 +4096,215 @@ fn emit_host_ffi(buf: []byte, prog: checker::TProgram, e: checker::TExpr, c: che
     return cb(o, "; })")
 }
 
-// cg_type_mangle_eq — do two resolved types mangle to the SAME generated C type name (→ same
-// C struct/typedef)? Renders both via the optional-mangle to scratch strings and compares.
-// (C: `cg_type_mangle_eq`.)
-fn cg_type_mangle_eq(a: checker::Type, c: checker::Type) -> bool {
-    cg_opt_key(a) == cg_opt_key(c)
+/**
+ * Report whether two resolved types produce the SAME generated C type name — the byte-free twin
+ * of the retired `cg_type_mangle_eq`, which built two throwaway mangle strings only to compare
+ * them (AL4a-2, following the `qualify_eq` precedent). It decides `mangle(a) == mangle(b)`
+ * byte-for-byte WITHOUT allocating, mirroring `cg_opt_mangle`/`cg_opt_key` exactly: a type whose
+ * mangle would error (an inline `Variant`, a `Void`-inner optional/slice, an unsupported shape)
+ * has the empty key `""`, so two such types compare equal and an erroring type never equals a
+ * well-formed one. This is MANGLE-equality, NOT `type_eq`: two DISTINCT types can share a C name
+ * (the #109 bare-last-segment case — `teko::io::Reader` and `teko::emit::Reader` both mangle to
+ * `Reader`), and this predicate returns true for them exactly as the string compare did.
+ *
+ * @param a  the first resolved type
+ * @param b  the second resolved type
+ * @return   true iff the two types mangle to the identical C type name
+ */
+fn cg_mangle_eq(a: checker::Type, b: checker::Type) -> bool {
+    let ea = cg_mangle_errors(a)
+    let eb = cg_mangle_errors(b)
+    if ea || eb { return ea && eb }
+    cg_mangle_bytes_eq(a, b)
+}
+
+/**
+ * Report whether a type's mangle would ERROR (making its `cg_opt_key` the empty string `""`),
+ * mirroring the error arms of `cg_opt_mangle` precisely: an inline `Variant` and any unsupported
+ * shape error, and an `Optional`/`Slice` errors when its inner/element is the `Void` sentinel or
+ * itself errors. Every leaf (`Prim`, `Byte`, `Char`, `Str`, `Error`, `Named`) mangles cleanly.
+ *
+ * @param t  the resolved type
+ * @return   true iff `cg_opt_mangle` would return an error for `t`
+ */
+fn cg_mangle_errors(t: checker::Type) -> bool {
+    match t {
+        checker::Prim => false
+        checker::Byte => false
+        checker::Char => false
+        checker::Str => false
+        checker::Error => false
+        checker::Named => false
+        checker::Optional as o => match o.inner {
+            checker::Void => true
+            _ => cg_mangle_errors(o.inner)
+        }
+        checker::Slice as sl => match sl.element {
+            checker::Void => true
+            _ => cg_mangle_errors(sl.element)
+        }
+        _ => true
+    }
+}
+
+/**
+ * Compare the mangles of two types already known to mangle cleanly, byte-for-byte and without
+ * allocating. `Optional` prepends `opt_`, `Slice` prepends `slice_`, and each recurses; a `Named`
+ * mangles to its bare last path segment; every other leaf mangles to a fixed literal. Because a
+ * `Named`'s arbitrary segment text can coincide with a composite's rendered form (`Named "opt_str"`
+ * and `str?` both yield `opt_str`), any comparison that touches a `Named` is routed through
+ * `cg_mangle_type_matches_name`, which folds the other side's WHOLE mangle against the segment
+ * bytes — giving true byte-identity with the old string compare, not a mere constructor match.
+ *
+ * @param a  the first resolved type (mangles cleanly)
+ * @param b  the second resolved type (mangles cleanly)
+ * @return   true iff `mangle(a)` equals `mangle(b)` byte-for-byte
+ */
+fn cg_mangle_bytes_eq(a: checker::Type, b: checker::Type) -> bool {
+    match a {
+        checker::Named as na => cg_mangle_type_matches_name(b, na.name)
+        checker::Optional as oa => match b {
+            checker::Named as nb => cg_mangle_type_matches_name(a, nb.name)
+            checker::Optional as ob => cg_mangle_bytes_eq(oa.inner, ob.inner)
+            _ => false
+        }
+        checker::Slice as sa => match b {
+            checker::Named as nb => cg_mangle_type_matches_name(a, nb.name)
+            checker::Slice as sb => cg_mangle_bytes_eq(sa.element, sb.element)
+            _ => false
+        }
+        _ => match b {
+            checker::Named as nb => cg_mangle_type_matches_name(a, nb.name)
+            checker::Optional => false
+            checker::Slice => false
+            _ => cg_leaf_literal_eq(a, b)
+        }
+    }
+}
+
+/**
+ * Compare two FIXED leaf types (`Prim`, `Byte`, `Char`, `Str`, `Error`) by their mangle literal.
+ * These literals are compile-time constants (no allocation) and never error, so the `str`
+ * comparison is a pure byte compare of two literals.
+ *
+ * @param a  the first fixed-leaf type
+ * @param b  the second fixed-leaf type
+ * @return   true iff both mangle to the same fixed literal
+ */
+fn cg_leaf_literal_eq(a: checker::Type, b: checker::Type) -> bool {
+    match cg_opt_mangle_str(a) {
+        str as sa => match cg_opt_mangle_str(b) { str as sb => sa == sb; error => false }
+        error => false
+    }
+}
+
+/**
+ * Report whether a cleanly-mangling type's full mangle equals the bare last segment of `name`,
+ * byte-for-byte and allocation-free. Walks `t` while advancing a cursor over `name`'s last
+ * `::`-segment: a match holds exactly when the walk consumes the segment to its end and no further.
+ *
+ * @param t     the resolved type whose mangle is folded against the segment
+ * @param name  the (possibly canonical) name whose bare last segment is the target text
+ * @return      true iff `mangle(t)` equals `name`'s last segment byte-for-byte
+ */
+fn cg_mangle_type_matches_name(t: checker::Type, name: str) -> bool {
+    let start = cg_name_last_segment_offset(name)
+    let end = cg_mangle_consume(t, name, start)
+    end >= 0 && (end to u64) == name.len
+}
+
+/**
+ * Advance an allocation-free cursor over `name` by matching the mangle of `t` against the bytes at
+ * `off`, returning the new offset or `-1` on any mismatch/overrun. `Optional` consumes `opt_` then
+ * recurses on its inner; `Slice` consumes `slice_` then recurses on its element; a `Named` matches
+ * its own bare last segment; every fixed leaf matches its literal. Mirrors the exact byte sequence
+ * `cg_opt_mangle` would emit.
+ *
+ * @param t     the cleanly-mangling type to consume
+ * @param name  the byte source the cursor walks
+ * @param off   the current cursor offset into `name`
+ * @return      the offset just past `mangle(t)`, or `-1` on mismatch
+ */
+fn cg_mangle_consume(t: checker::Type, name: str, off: u64) -> i64 {
+    match t {
+        checker::Optional as o => {
+            let o2 = cg_match_literal(name, off, "opt_")
+            if o2 < 0 { -1 } else { cg_mangle_consume(o.inner, name, o2 to u64) }
+        }
+        checker::Slice as sl => {
+            let o2 = cg_match_literal(name, off, "slice_")
+            if o2 < 0 { -1 } else { cg_mangle_consume(sl.element, name, o2 to u64) }
+        }
+        checker::Named as nm => cg_match_segment(name, off, nm.name)
+        _ => match cg_opt_mangle_str(t) {
+            str as lit => cg_match_literal(name, off, lit)
+            error => -1
+        }
+    }
+}
+
+/**
+ * Match the literal `lit` against `name` starting at `off`, returning `off + lit.len` on an exact
+ * byte match or `-1` on mismatch/overrun. Allocation-free.
+ *
+ * @param name  the byte source
+ * @param off   the cursor offset to match at
+ * @param lit   the literal expected at `off`
+ * @return      the offset just past `lit`, or `-1` if it does not match there
+ */
+fn cg_match_literal(name: str, off: u64, lit: str) -> i64 {
+    if off + lit.len > name.len { return -1 }
+    mut i: u64 = 0
+    loop {
+        if i >= lit.len { break }
+        if name[off + i] != lit[i] { return -1 }
+        i++
+    }
+    (off + lit.len) to i64
+}
+
+/**
+ * Match the bare last segment of `other` against `name` starting at `off`, returning the offset
+ * just past it on an exact byte match or `-1` otherwise. The `Named`-leaf twin of
+ * `cg_match_literal`: it compares the segment in place (from `other`'s last-segment offset)
+ * without materializing it.
+ *
+ * @param name   the byte source the cursor walks
+ * @param off    the cursor offset to match at
+ * @param other  the name whose bare last segment is the expected text
+ * @return       the offset just past the segment, or `-1` if it does not match there
+ */
+fn cg_match_segment(name: str, off: u64, other: str) -> i64 {
+    let s = cg_name_last_segment_offset(other)
+    let seglen = other.len - s
+    if off + seglen > name.len { return -1 }
+    mut i: u64 = 0
+    loop {
+        if i >= seglen { break }
+        if name[off + i] != other[s + i] { return -1 }
+        i++
+    }
+    (off + seglen) to i64
+}
+
+/**
+ * The byte offset at which `name`'s bare last `::`-segment begins — `0` for a bare name,
+ * `<last "::"> + 2` for a canonical `ns::Name`. The allocation-free offset form of
+ * `checker::name_last_segment` (which copies the segment out); mirrors its `::`-scan exactly so
+ * the two agree byte-for-byte.
+ *
+ * @param name  the (possibly canonical) name to scan
+ * @return      the offset where the bare last segment starts
+ */
+fn cg_name_last_segment_offset(name: str) -> u64 {
+    mut last_sep: i64 = -1
+    mut i: u64 = 0
+    loop {
+        if i + 1 >= name.len { break }
+        if name[i] == b':' && name[i + 1] == b':' { last_sep = i to i64 }
+        i++
+    }
+    if last_sep < 0 { 0 } else { (last_sep to u64) + 2 }
 }
 
 // emit_as — emit `value` into a slot whose EXPECTED type is `expected`. When `expected` is
@@ -4123,7 +4399,7 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
                     let concrete_diff = match value.type {
                         checker::Slice as svt => match svt.element {
                             checker::Void => false   // sentinel handled above
-                            _ => !cg_type_mangle_eq(sexp.element, svt.element)
+                            _ => !cg_mangle_eq(sexp.element, svt.element)
                         }
                         _ => false
                     }
@@ -4242,7 +4518,7 @@ fn emit_as_r(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, expe
     // AND each arm's trailing value wraps into it (case → wider variant, via emit_stmt_value/
     // emit_arm_value → emit_as_r). Guarded on EVERY narrow member reaching `expected` (a true widen).
     let vt_is_variant = match value.type { checker::Variant => true; checker::Named as vn => cg_named_is_variant(prog, vn.name); _ => false }
-    if vt_is_variant && !cg_type_mangle_eq(value.type, expected) && cg_narrow_variant_widens_into(prog, value.type, expected) {
+    if vt_is_variant && !cg_mangle_eq(value.type, expected) && cg_narrow_variant_widens_into(prog, value.type, expected) {
         let widened = checker::TExpr { kind = value.kind; type = expected; line = value.line; col = value.col }
         match value.kind {
             checker::TIfExpr as f => return emit_if_value(buf, prog, ret_type, widened, f, escaping, regions, fn_body, dctx)
@@ -4436,9 +4712,17 @@ fn emit_pat_test(buf: []byte, prog: checker::TProgram, pat: parser::Pattern, sub
             out = cb_upper(out, ck)
             cb(out, ")")
         }
-        // A `null` pattern reaches here only over a NON-optional subject (the optional case is
-        // handled by cg_emit_pat_test's `.present` test) — the checker rejects that.
-        parser::NullPattern => error { message = "codegen: `null` pattern over a non-optional subject (internal)" }
+        parser::NullPattern => {
+            if cg_var_reaches(prog, variantT, "null", 16) {
+                mut out = cb(buf, "(")
+                out = cb(out, subj)
+                out = cb(out, ".tag == ")
+                out = match cg_emit_tag_prefix(out, variantT) { []byte as o => o; error as err => return err }
+                out = cb_upper(out, "null")
+                return cb(out, ")")
+            }
+            error { message = "codegen: `null` pattern over a non-optional subject (internal)" }
+        }
     }
 }
 
@@ -5196,7 +5480,10 @@ fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
         // null / ?. / ?? — the OPTIONAL value model (REBOOT_PLAN §202/§203; tk_opt_<inner>).
         // A bare `null` in raw expression position has the SENTINEL optional type: it cannot be
         // emitted alone — its concrete type comes from the destination slot via emit_as.
-        checker::TNullLit => error { message = "codegen: a bare `null` needs a known optional type from context (use it where a `T?` is expected)" }
+        checker::TNullLit => match e.type {
+            checker::Null => cb(buf, "0")
+            _ => error { message = "codegen: a bare `null` needs a known optional type from context (use it where a `T?` is expected)" }
+        }
         checker::TSafeFieldAccess as sfa => emit_safe_field_access(buf, prog, e, sfa, escaping, regions, fn_body, dctx)
         checker::TCoalesce as co => emit_coalesce(buf, prog, e, co, escaping, regions, fn_body, dctx)
         checker::TIndex as ix => emit_index(buf, prog, e, ix, escaping, regions, fn_body, dctx)   // W5-idx — subscript recv[index] (str + slice, bounds-checked)
@@ -5223,7 +5510,33 @@ fn emit_expr_ctx(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, 
         // env = NULL and the lifted fn is `R(params)` (W10a-compatible call cast). A CAPTURING lambda
         // allocates its env struct and uses the env-first ABI (handled below).
         checker::TLambda as lam => emit_lambda(buf, prog, e, lam, escaping, regions, fn_body, dctx)
+        checker::TBorrow as b => emit_borrow(buf, prog, ret_type, b, escaping, regions, fn_body, dctx)
     }
+}
+
+/**
+ * Lower a safe borrow `&x` (`TBorrow`, AL wave F1.4) to its C address-of form: emit `&` then the
+ * operand expression. This is byte-identical to the auto-ref `&` the call path already emits for a
+ * `Ref<T>` parameter (see `emit_call`) — a borrow just makes that address-of explicit as a
+ * first-class expression. The `Reference` type already lowers to `<T> *`, so a ref-bind local
+ * `mut y = &x` is a pointer initialized with `&x`, and any `y.value` read / write-through lowers
+ * through the existing RefDeref path. Zero new representation.
+ *
+ * @param buf      the code buffer being appended to
+ * @param prog     the typed program (namespaces + resolved function table)
+ * @param ret_type the enclosing function's return type, threaded to the operand emitter
+ * @param b        the typed borrow node (`&operand`)
+ * @param escaping the names escaping the current scope (region threading)
+ * @param regions  the live region frames
+ * @param fn_body  the enclosing function body statements
+ * @param dctx     the defer context
+ * @return         the buffer with `&<operand>` appended
+ * @throws         error propagated from emitting the borrow's operand expression
+ * @since 0.x (#AL/F1.4)
+ */
+fn emit_borrow(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, b: checker::TBorrow, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let out = cb(buf, "&")
+    emit_expr_ctx(out, prog, ret_type, b.operand, escaping, regions, fn_body, dctx)
 }
 
 // (W10) the lifted C function name for a lambda with the given stamp id: `__tkclo_<id>`.
@@ -5762,7 +6075,118 @@ fn emit_assign_lvalue(buf: []byte, prog: checker::TProgram, a: checker::TAssign)
     }
 }
 
+/**
+ * emit_index_assign — a slice element store `ids[i] op= v` (`AssignKind::Index`). Captures the
+ * receiver slice and the index into single-eval temps, bounds-checks the index against `.len` (the
+ * SAME positioned `tk_panic_oob_at` as a read subscript), then writes the element in place through
+ * the shared `{ptr,len}` buffer. A shift-assign (`<<=`/`>>=`) routes through the width-masked
+ * `tk_shl_/tk_shr_` runtime helper — matching the bare `<<`/`>>` operator and the VM — instead of the
+ * UB-prone C compound shift; every other op emits the plain C compound store.
+ *
+ * @param buf       the output buffer
+ * @param prog      the typed program (type/name lowering)
+ * @param ret_type  the enclosing function's return type (threaded to `emit_as_r`)
+ * @param a         the typed index assignment (`a.target` is the typed `TIndex` LHS)
+ * @param indent    the current statement indent
+ * @param escaping  the frame's escaping-name set (threaded to child expr emission)
+ * @param regions   the active region frames
+ * @param fn_body   the enclosing function body (escape context)
+ * @param dctx      the defer context
+ * @return          the buffer with the element-store block appended, or a codegen error
+ * @throws          when the target is not a slice index, its element type is unsupported, or a child
+ *                  expression fails to emit
+ */
+fn emit_index_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let ix = match a.target.kind { checker::TIndex as ti => ti; _ => return error { message = "codegen: index-assign target is not a subscript (internal)" } }
+    let elem = match ix.receiver.type { checker::Slice as sl => sl.element; _ => return error { message = "codegen: index-assign receiver is not a slice (internal)" } }
+    let wstmp = $"_ws{buf.len}"
+    let witmp = $"_wi{buf.len + 1}"
+    mut out = cb(buf, indent)
+    out = cb(out, "{ ")
+    out = match emit_type(out, prog, ix.receiver.type) { []byte as o => o; error as err => return err }
+    out = cb(out, " ")
+    out = cb(out, wstmp)
+    out = cb(out, " = (")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, ix.receiver, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "); uint64_t ")
+    out = cb(out, witmp)
+    out = cb(out, " = (uint64_t)(")
+    out = match emit_expr_ctx(out, prog, checker::Void { }, ix.index, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, "); if (")
+    out = cb(out, witmp)
+    out = cb(out, " < ")
+    out = cb(out, wstmp)
+    out = cb(out, ".len) { ")
+    out = match emit_index_store_body(out, prog, ret_type, a, wstmp, witmp, elem, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    out = cb(out, " } else { tk_panic_oob_at(")
+    out = cb(out, teko::u64_to_str(a.target.line to u64))
+    out = cb(out, ", ")
+    out = cb(out, teko::u64_to_str(a.target.col to u64))
+    cb(out, "); }\n }\n")
+}
+
+/**
+ * emit_index_store_body — the in-bounds element write of `emit_index_assign`: `<slot> op= <value>`,
+ * where `<slot>` is `<wstmp>.ptr[<witmp>]` (both already single-eval temps, so re-emitting the slot
+ * for a shift-assign is free) and `<value>` is wrapped into the element type via `emit_as_r`.
+ *
+ * @param buf       the output buffer
+ * @param prog      the typed program
+ * @param ret_type  the enclosing function's return type (threaded to `emit_as_r`)
+ * @param a         the typed index assignment (for its op + value)
+ * @param wstmp     the captured-slice temp name
+ * @param witmp     the captured-index temp name
+ * @param elem      the slice element type (the store's declared `bound`)
+ * @param escaping  the frame's escaping-name set
+ * @param regions   the active region frames
+ * @param fn_body   the enclosing function body
+ * @param dctx      the defer context
+ * @return          the buffer with the element store appended, or a codegen error
+ * @throws          when a shift-assign targets a non-integer element, or a child expression fails to emit
+ */
+fn emit_index_store_body(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, wstmp: str, witmp: str, elem: checker::Type, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    if a.op == lexer::TokenKind::ShlEq || a.op == lexer::TokenKind::ShrEq {
+        let prim = match elem { checker::Prim as p => p; _ => return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        if !cg_prim_is_int(prim.kind) { return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        let tag = match prim_int_tag(prim.kind) { str as t => t; error => return error { message = "codegen: shift-assign on a non-integer slice element not supported" } }
+        let fn_prefix = if a.op == lexer::TokenKind::ShlEq { "tk_shl_" } else { "tk_shr_" }
+        mut so = emit_index_slot(buf, wstmp, witmp)
+        so = cb(so, " = ")
+        so = cb(so, fn_prefix)
+        so = cb(so, tag)
+        so = cb(so, "(")
+        so = emit_index_slot(so, wstmp, witmp)
+        so = cb(so, ", ")
+        so = match emit_expr_ctx(so, prog, checker::Void { }, a.value, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+        return cb(so, ");")
+    }
+    let op = match assignop_c(a.op) { str as s => s; error as err => return err }
+    mut out = emit_index_slot(buf, wstmp, witmp)
+    out = cb(out, " ")
+    out = cb(out, op)
+    out = cb(out, " ")
+    out = match emit_as_r(out, prog, ret_type, elem, a.value, escaping, regions, fn_body, dctx) { []byte as o => o; error as err => return err }
+    cb(out, ";")
+}
+
+/**
+ * emit_index_slot — the C lvalue text `<wstmp>.ptr[<witmp>]` for a captured slice/index temp pair.
+ *
+ * @param buf    the output buffer
+ * @param wstmp  the captured-slice temp name
+ * @param witmp  the captured-index temp name
+ * @return       the buffer with the element lvalue appended
+ */
+fn emit_index_slot(buf: []byte, wstmp: str, witmp: str) -> []byte {
+    mut out = cb(buf, wstmp)
+    out = cb(out, ".ptr[")
+    out = cb(out, witmp)
+    cb(out, "]")
+}
+
 fn emit_assign(buf: []byte, prog: checker::TProgram, ret_type: checker::Type, a: checker::TAssign, indent: str, frame: str, escaping: []str, regions: []RegionFrame, fn_body: []checker::TStatement, dctx: DeferCtx) -> []byte | error {
+    let is_index = match a.kind { parser::AssignKind::Index => true; _ => false }
+    if is_index { return emit_index_assign(buf, prog, ret_type, a, indent, escaping, regions, fn_body, dctx) }
     let op = match assignop_c(a.op) { str as s => s; error as err => return err }
     mut out = cb(buf, indent)
     // (S2 Level-1) SELF-APPEND to a non-escaping slice → route the grown buffer to the frame region
@@ -6125,7 +6549,7 @@ fn stmt_cov_lines(s: checker::TStatement) -> []u32 {
         checker::TBinding as b => cov_collect_expr(b.value, acc)
         checker::TAssign as a => {
             let av = cov_collect_expr(a.value, acc)
-            match a.kind { parser::AssignKind::Field => cov_collect_expr(a.target, av); _ => av }
+            if parser::assign_has_target(a.kind) { cov_collect_expr(a.target, av) } else { av }
         }
         checker::TReturn as r => if r.has_value { cov_collect_expr(r.value, acc) } else { acc }
         checker::TExprStmt as es => cov_collect_expr(es.expr, acc)
@@ -6359,7 +6783,7 @@ fn cg_block_calls_self(stmts: []checker::TStatement, ns: str, name: str) -> bool
         if i >= stmts.len { break }
         match stmts[i] {
             checker::TBinding as b => if cg_expr_calls_self(b.value, ns, name) { return true }
-            checker::TAssign as a => { if cg_expr_calls_self(a.value, ns, name) { return true }; match a.kind { parser::AssignKind::Field => if cg_expr_calls_self(a.target, ns, name) { return true }; _ => { } } }
+            checker::TAssign as a => { if cg_expr_calls_self(a.value, ns, name) { return true }; if parser::assign_has_target(a.kind) { if cg_expr_calls_self(a.target, ns, name) { return true } } }
             checker::TReturn as r => if r.has_value && cg_expr_calls_self(r.value, ns, name) { return true }
             checker::TLoopStmt as l => { if cg_block_calls_self(l.init, ns, name) { return true }; if cg_block_calls_self(l.body, ns, name) { return true } }
             checker::TExprStmt as es => if cg_expr_calls_self(es.expr, ns, name) { return true }
@@ -6391,6 +6815,37 @@ fn cg_fn_is_self_recursive(f: checker::TFunction) -> bool {
     cg_block_calls_self(f.body, f.namespace, f.name)
 }
 
+/**
+ * cg_fn_ref_ns — the namespace a function's param type annotations were WRITTEN in, so a bare
+ * contract name in a method's param type resolves the way the checker resolved it. A METHOD's
+ * `TFunction` namespace is exactly its owner type's canonical name (`module::Owner`), but its param
+ * types were resolved by the checker in the OWNER's enclosing MODULE namespace (collect.tks
+ * `method_func_type` takes `items[i].namespace`) — so a bare `Reader` on a `class & Reader` factory
+ * must bind the sibling module decl (`teko::io::Reader`) past a same-last-segment cousin
+ * (`teko::emit::Reader`, the #109 collision), NOT be resolved against the over-qualified
+ * `teko::io::Owner`. Used at BOTH the param-signature emitter (emit_function_sig) AND the caller's
+ * arg-slot upcast canonicalisation (emit_call), so the factory's declared param type and the
+ * class->interface box built for its argument agree on the real contract. A FREE function's
+ * namespace already IS its module namespace, so it is returned unchanged. Detection is EXACT: only
+ * when `ns` names an existing type decl is it a method's owner-qualified namespace.
+ *
+ * @param prog  the typed program (scanned for a type decl whose canonical name equals `ns`)
+ * @param ns    the function's declared namespace (`TFunction.namespace`)
+ * @return      the enclosing MODULE namespace for a method's owner-named ns, else `ns` unchanged
+ */
+fn cg_fn_ref_ns(prog: checker::TProgram, ns: str) -> str {
+    mut i = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            parser::TypeDecl as d => { if d.name == ns { return checker::name_qualifier(ns) } }
+            _ => { }
+        }
+        i++
+    }
+    ns
+}
+
 // emit_function — a TFunction -> a C function definition.
 // (C: `emit_function`.)
 // emit_function_sig — the return type + name + params up to the `)` (no body). Shared by the
@@ -6412,11 +6867,12 @@ fn emit_function_sig(buf: []byte, prog: checker::TProgram, f: checker::TFunction
     if f.params.len == 0 {
         out = cb(out, "void")
     } else {
+        let ref_ns = cg_fn_ref_ns(prog, f.namespace)
         mut i: u64 = 0
         loop {
             if i >= f.params.len { break }
             if i > 0 { out = cb(out, ", ") }
-            out = match emit_type_expr(out, prog, f.params[i].type_ann, f.namespace) { []byte as o => o; error as err => return err }   // (#109 W3) ref_ns = the fn's declaring ns
+            out = match emit_type_expr(out, prog, f.params[i].type_ann, ref_ns) { []byte as o => o; error as err => return err }
             out = cb(out, " ")
             out = cb_ident(out, f.params[i].name)
             i++
@@ -6947,60 +7403,122 @@ fn emit_type_decl(buf: []byte, prog: checker::TProgram, d: parser::TypeDecl) -> 
 // optionals register the inner first so its typedef precedes the outer's reference. (C: the
 // cg_opt_set / cg_collect_* family.)
 // ---------------------------------------------------------------------------
-// The per-type generated typedefs collected in ONE walk: optional inners (tk_opt_<i>) AND slice
-// element types (tk_slice_<e>). Mirrors the C's `cg_opt_set` struct (two parallel lists threaded
-// by pointer); here it is a value threaded by return (the functional `.tks` idiom). One walk feeds
-// both — cg_collect_type_opts registers a slice's element in the same traversal as optionals.
-type CgTypeSet = struct { inners: []checker::Type; slices: []checker::Type; variants: []checker::Type }   // B-cg2 — inline tk_u_<keys>
+/**
+ * B-cg2 — the codegen registry of distinct anonymous types needing a typedef, each stored
+ * ALONGSIDE its already-computed mangled key so a dedup scan READS the key (O(1)) rather than
+ * recomputing it (the owner's "assign the converted value once, then only reference it"). The
+ * keys are collision-safe by construction: the SAME mangled string already used for dedup, so
+ * two types that mangle equal still collapse to one typedef (mangle-eq, not type-eq). Collected
+ * in ONE walk (cg_collect_type_opts registers a slice's element in the same traversal as
+ * optionals); threaded by return value (the functional `.tks` idiom), mirroring the C's
+ * `cg_opt_set`.
+ */
+type CgTypeSet = struct {
+    /** Optional inner types needing a `tk_opt_<key>` typedef, in registration order. */
+    inners: []checker::Type
+    /** The mangled dedup key of each `inners` entry, computed once at insertion. */
+    opt_keys: []str
+    /** Slice element types needing a `tk_slice_<key>` typedef, in registration order. */
+    slices: []checker::Type
+    /** The mangled dedup key of each `slices` entry, computed once at insertion. */
+    slice_keys: []str
+    /** Inline variant types needing a `tk_u_<keys>` typedef, in registration order. */
+    variants: []checker::Type
+    /** The mangled dedup key of each `variants` entry, computed once at insertion. */
+    variant_keys: []str
+}
 
-// the mangled-name key for a type (dedup key); "" for an unsupported type (skipped). Used for
-// both optional inners and slice elements (same mangle). (C: `cg_opt_mangle` render-to-scratch.)
+/**
+ * The mangled-name dedup key for a type; the empty string `""` for an unsupported type (skipped).
+ *
+ * Used for both optional inners and slice elements (same mangle). Renders `cg_opt_mangle` into a
+ * scratch buffer and materializes it once, so callers store the result rather than recompute it.
+ *
+ * @param t  the type to mangle
+ * @return   the mangled key, or `""` if `t` cannot be mangled
+ */
 fn cg_opt_key(t: checker::Type) -> str {
     match cg_opt_mangle(teko::list::empty(), t) { []byte as o => str(o); error => "" }
 }
-// register an optional inner (dedup by mangle). (C: `cg_opt_set_add`.)
+/**
+ * Register an optional inner in the codegen set, deduped by its mangled key.
+ *
+ * Computes the key ONCE and pushes it to the parallel `opt_keys` so later dedup scans READ the
+ * stored key instead of recomputing it. An unsupported inner (empty key) is skipped.
+ *
+ * @param set    the registry to extend
+ * @param inner  the optional's inner type to register
+ * @return       the set with `inner` appended, or unchanged if already present or unsupported
+ */
 fn cg_opt_set_add(set: CgTypeSet, inner: checker::Type) -> CgTypeSet {
     let key = cg_opt_key(inner)
     if key == "" { return set }
     mut i = 0
     loop {
-        if i >= set.inners.len { break }
-        if cg_opt_key(set.inners[i]) == key { return set }   // already present
+        if i >= set.opt_keys.len { break }
+        if set.opt_keys[i] == key { return set }
         i++
     }
-    CgTypeSet { inners = teko::list::push(set.inners, inner); slices = set.slices; variants = set.variants }
+    CgTypeSet { inners = teko::list::push(set.inners, inner); opt_keys = teko::list::push(set.opt_keys, key); slices = set.slices; slice_keys = set.slice_keys; variants = set.variants; variant_keys = set.variant_keys }
 }
-// register a slice element type (dedup by mangle), parallel to cg_opt_set_add. (C: `cg_slice_add`.)
+/**
+ * Register a slice element type in the codegen set, deduped by its mangled key.
+ *
+ * Parallel to `cg_opt_set_add`: computes the key ONCE, pushes it to `slice_keys`, and dedup
+ * scans read the stored key. An unsupported element (empty key) is skipped so `emit_type` errors
+ * honestly.
+ *
+ * @param set   the registry to extend
+ * @param elem  the slice's element type to register
+ * @return      the set with `elem` appended, or unchanged if already present or unsupported
+ */
 fn cg_slice_add(set: CgTypeSet, elem: checker::Type) -> CgTypeSet {
     let key = cg_opt_key(elem)
-    if key == "" { return set }   // unsupported element → skip (emit_type errors honestly)
+    if key == "" { return set }
     mut i = 0
     loop {
-        if i >= set.slices.len { break }
-        if cg_opt_key(set.slices[i]) == key { return set }   // already present
+        if i >= set.slice_keys.len { break }
+        if set.slice_keys[i] == key { return set }
         i++
     }
-    CgTypeSet { inners = set.inners; slices = teko::list::push(set.slices, elem); variants = set.variants }
+    CgTypeSet { inners = set.inners; opt_keys = set.opt_keys; slices = teko::list::push(set.slices, elem); slice_keys = teko::list::push(set.slice_keys, key); variants = set.variants; variant_keys = set.variant_keys }
 }
-// B-cg2 — the dedup key for an INLINE variant TYPE (its tk_u_<keys> name); "" for unsupported. (C: `cg_variant_typename` render-to-scratch.)
+/**
+ * B-cg2 — the dedup key for an INLINE variant type (its `tk_u_<keys>` name); `""` for unsupported.
+ *
+ * Renders `cg_variant_typename` into a scratch buffer and materializes it once. (C:
+ * `cg_variant_typename` render-to-scratch.)
+ *
+ * @param t  the type to key; only an inline `Variant` yields a non-empty key
+ * @return   the mangled variant name, or `""` if `t` is not a mangleable inline variant
+ */
 fn cg_variant_key(t: checker::Type) -> str {
     match t {
         checker::Variant as v => match cg_variant_typename(teko::list::empty(), v) { []byte as o => str(o); error => "" }
         _ => ""
     }
 }
-// B-cg2 — register an INLINE variant TYPE (dedup by its tk_u_<keys> name). A Named variant has
-// its own decl typedef and is NOT registered here. (C: `cg_variant_add`.)
+/**
+ * B-cg2 — register an INLINE variant type in the codegen set, deduped by its `tk_u_<keys>` name.
+ *
+ * A Named variant carries its own decl typedef and is NOT registered here. Computes the key ONCE,
+ * pushes it to `variant_keys`, and dedup scans read the stored key. An unsupported member (empty
+ * key) is skipped so `emit_type` errors honestly.
+ *
+ * @param set  the registry to extend
+ * @param t    the inline variant type to register
+ * @return     the set with `t` appended, or unchanged if already present or unsupported
+ */
 fn cg_variant_add(set: CgTypeSet, t: checker::Type) -> CgTypeSet {
     let key = cg_variant_key(t)
-    if key == "" { return set }   // unsupported member → skip (emit_type errors honestly)
+    if key == "" { return set }
     mut i = 0
     loop {
-        if i >= set.variants.len { break }
-        if cg_variant_key(set.variants[i]) == key { return set }   // already present
+        if i >= set.variant_keys.len { break }
+        if set.variant_keys[i] == key { return set }
         i++
     }
-    CgTypeSet { inners = set.inners; slices = set.slices; variants = teko::list::push(set.variants, t) }
+    CgTypeSet { inners = set.inners; opt_keys = set.opt_keys; slices = set.slices; slice_keys = set.slice_keys; variants = teko::list::push(set.variants, t); variant_keys = teko::list::push(set.variant_keys, key) }
 }
 // register every optional in a type AND every slice's element (nested inners/elements first, so
 // `T??` and `[][]T`/`[]T?` order right). (C: `cg_collect_type_opts`.)
@@ -7111,7 +7629,7 @@ fn cg_collect_block_opts(set: CgTypeSet, stmts: []checker::TStatement) -> CgType
             // VM's coerce_to(a.bound)): a deref-assign `r.value = v` through a `Ref<T?>` has bound=`T?`,
             // and that optional's tk_opt_<T> typedef must be emitted even when the value's own type is a
             // bare `T` (widened) — mirrors the TBinding arm collecting b.bound.
-            checker::TAssign as a => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); match a.kind { parser::AssignKind::Field => s = cg_collect_expr_opts(s, a.target); _ => { } } }   // (#88) the FIELD LHS receiver may carry optional types too
+            checker::TAssign as a => { s = cg_collect_type_opts(s, a.bound); s = cg_collect_expr_opts(s, a.value); if parser::assign_has_target(a.kind) { s = cg_collect_expr_opts(s, a.target) } }
             checker::TReturn as r => { if r.has_value { s = cg_collect_expr_opts(s, r.value) } }
             checker::TLoopStmt as l => { s = cg_collect_block_opts(s, l.init); s = cg_collect_block_opts(s, l.body) }
             checker::TExprStmt as es => { s = cg_collect_expr_opts(s, es.expr) }
@@ -7365,26 +7883,46 @@ fn cg_named_emitted(em: CgEmitted, name: str) -> bool {
     }
     false
 }
-// Has the optional whose inner mangles to `key` been emitted? (no matching node → no edge.)
+/**
+ * Report whether the optional whose inner mangles to `key` has already been emitted.
+ *
+ * An optional inner not present in the program's collected set carries no dependency edge, so it
+ * is treated as ready. The presence scan READS the stored `opt_keys` rather than recomputing each
+ * inner's mangle.
+ *
+ * @param em   the emitted-so-far record
+ * @param set  the collected type registry
+ * @param key  the mangled key of the optional inner in question
+ * @return     true if the inner is uncollected (no edge) or already emitted
+ */
 fn cg_opt_emitted_key(em: CgEmitted, set: CgTypeSet, key: str) -> bool {
-    // an optional inner not present in the program's collected set carries no edge → ready.
     mut i = 0
     mut present = false
     loop {
-        if i >= set.inners.len { break }
-        if cg_opt_key(set.inners[i]) == key { present = true; break }
+        if i >= set.opt_keys.len { break }
+        if set.opt_keys[i] == key { present = true; break }
         i++
     }
     if !present { return true }
     cg_str_in(em.opt_keys, key)
 }
-// Has the inline variant whose typename is `key` been emitted? (no matching node → no edge.)
+/**
+ * Report whether the inline variant whose typename is `key` has already been emitted.
+ *
+ * A variant not present in the collected set carries no dependency edge and is ready. The
+ * presence scan READS the stored `variant_keys` rather than recomputing each variant's mangle.
+ *
+ * @param em   the emitted-so-far record
+ * @param set  the collected type registry
+ * @param key  the `tk_u_<keys>` name of the variant in question
+ * @return     true if the variant is uncollected (no edge) or already emitted
+ */
 fn cg_uvar_emitted_key(em: CgEmitted, set: CgTypeSet, key: str) -> bool {
     mut i = 0
     mut present = false
     loop {
-        if i >= set.variants.len { break }
-        if cg_variant_key(set.variants[i]) == key { present = true; break }
+        if i >= set.variant_keys.len { break }
+        if set.variant_keys[i] == key { present = true; break }
         i++
     }
     if !present { return true }
@@ -7505,11 +8043,22 @@ fn cg_named_decls(prog: checker::TProgram) -> []parser::TypeDecl {
     named
 }
 
-// Replaces the old program-order body emission + cg_emit_optional_typedefs: emit slices first
-// (pointers), then the named/opt/inline-variant typedefs in by-value dependency order.
+/**
+ * Emit every generated typedef (slices, optionals, inline variants, named decls) in by-value
+ * dependency order, replacing the old program-order body emission + `cg_emit_optional_typedefs`.
+ *
+ * Slices lead (pointers), then a fixpoint emits the named/opt/inline-variant typedefs once each
+ * dependency is satisfied. The collected `CgTypeSet` carries each type's mangled key so the
+ * fixpoint READS the stored key instead of recomputing it per pass.
+ *
+ * @param buf   the output byte buffer to append to
+ * @param prog  the checked program whose types are emitted
+ * @return      the extended buffer
+ * @throws      when a recursive value type has no slice/boxed-reference break (cyclic dependency)
+ */
 fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error {
     // 1) collect every optional inner / slice element / inline variant used in the program.
-    mut set = CgTypeSet { inners = teko::list::empty(); slices = teko::list::empty(); variants = teko::list::empty() }
+    mut set = CgTypeSet { inners = teko::list::empty(); opt_keys = teko::list::empty(); slices = teko::list::empty(); slice_keys = teko::list::empty(); variants = teko::list::empty(); variant_keys = teko::list::empty() }
     mut i = 0
     loop {
         if i >= prog.items.len { break }
@@ -7651,7 +8200,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
         loop {
             if oi >= set.inners.len { break }
             let inner = set.inners[oi]
-            let okey = cg_opt_key(inner)
+            let okey = set.opt_keys[oi]
             if cg_str_in(em.opt_keys, okey) { oi++ } else {
                 if !cg_type_ready(prog, em, set, inner) { oi++ } else {
                     out = cb(out, "typedef struct ")   // named tag (matches the forward decl) so a pointer to it resolves
@@ -7673,7 +8222,7 @@ fn cg_emit_types_ordered(buf: []byte, prog: checker::TProgram) -> []byte | error
         loop {
             if vi >= set.variants.len { break }
             let vt = set.variants[vi]
-            let vkey = cg_variant_key(vt)
+            let vkey = set.variant_keys[vi]
             if cg_str_in(em.uvar_keys, vkey) { vi++ } else {
                 // a tk_u_ embeds its members by value — all must be ready.
                 mut ready = true
@@ -7886,7 +8435,7 @@ fn cg_lift_block(stmts: []checker::TStatement, acc: Ref<StampAcc>) -> []checker:
 fn cg_lift_stmt(s: checker::TStatement, acc: Ref<StampAcc>) -> checker::TStatement {
     match s {
         checker::TBinding as b => checker::TBinding { kind = b.kind; target = b.target; bound = b.bound; value = cg_lift_expr(b.value, acc) }
-        checker::TAssign as a => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = match a.kind { parser::AssignKind::Field => cg_lift_expr(a.target, acc); _ => a.target } }   // (#88) lift lambdas in the FIELD LHS receiver too
+        checker::TAssign as a => checker::TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = cg_lift_expr(a.value, acc); deref = a.deref; target = if parser::assign_has_target(a.kind) { cg_lift_expr(a.target, acc) } else { a.target } }
         checker::TReturn as r => checker::TReturn { has_value = r.has_value; value = if r.has_value { cg_lift_expr(r.value, acc) } else { r.value } }
         checker::TLoopStmt as l => checker::TLoopStmt { label = l.label; init = cg_lift_block(l.init, acc); body = cg_lift_block(l.body, acc) }
         checker::TExprStmt as es => checker::TExprStmt { expr = cg_lift_expr(es.expr, acc) }
@@ -8532,6 +9081,15 @@ pub fn tk_emit_c_test(prog0: checker::TProgram, cov: bool) -> str | error {
     tk_emit_c_mode(prog0, if cov { CgMode::TestCov } else { CgMode::TestPlain })
 }
 
+/** tk_emit_c_test_analyze — the ANALYZE-MODE test-gate emission entry (`teko test . --analyzer`,
+    0.3.0.29). Emits the same production-fn/line/branch instrumentation as `TestCov`, but a per-test
+    isolation harness (`emit_test_main_analyze`) that resets the sinks around each `#test` and dumps
+    that test's raw id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov`. One compile answers the whole-suite
+    stale/redundant question. Exposed so the build driver can request it across the namespace. */
+pub fn tk_emit_c_test_analyze(prog0: checker::TProgram) -> str | error {
+    tk_emit_c_mode(prog0, CgMode::TestAnalyze)
+}
+
 /** tk_emit_c_mode — emit the C translation unit under `mode` (#265, lever D of #249). Types,
     prototypes and function bodies are emitted IDENTICALLY across modes; only the trailing `main()`
     differs: Program = the virtual-main (loose statements), TestPlain/TestCov = the native test gate.
@@ -8744,6 +9302,7 @@ fn emit_program_main(buf: []byte, prog: checker::TProgram) -> []byte | error {
     calls and each test wrapped in `tk_cov_enter(idx)`/`tk_cov_leave`, then the sinks are dumped to a
     `.tkcov` for the parent to merge; under `TestPlain` NO `tk_cov_*` is emitted (zero-cost off). */
 fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte | error {
+    if mode == CgMode::TestAnalyze { return emit_test_main_analyze(buf, prog) }
     mut b = buf
     let cov = mode == CgMode::TestCov
     b = cb(b, "int main(int argc, char **argv) {\n")
@@ -8767,6 +9326,43 @@ fn emit_test_main(buf: []byte, prog: checker::TProgram, mode: CgMode) -> []byte 
     if cov {
         b = cb(b, "    tk_cov_branches_on(false); tk_cov_lines_on(false);\n")
         b = cb(b, "    { const char *dp = getenv(\"TEKO_TKCOV\"); if (dp) tk_cov_dump(dp); }\n")
+    }
+    b = cb(b, "    return 0;\n")
+    b = cb(b, "}\n")
+    b
+}
+
+/**
+ * emit_test_main_analyze — the per-test ISOLATION harness main (`teko test . --analyzer`, 0.3.0.29).
+ *
+ * Turns line/branch sinks on once, then for EACH `#test` (via `emit_test_call_analyze`) resets all
+ * three sinks, runs exactly that one test under `tk_cov_enter(idx)`/`tk_cov_leave`, and dumps THAT
+ * test's raw id-set to `$TEKO_ANALYZE_DIR/<idx>.tkcov`. One compile + one run therefore yields N
+ * disjoint per-test id-sets, which the build driver reads back to classify STALE/REDUNDANT/LIVE —
+ * without the per-test recompile the aggregate `TestCov` sink forces on `--per-test-cov`. There is
+ * NO end-of-run aggregate dump: each test already flushed its own file.
+ *
+ * @param buf   the output byte buffer to append the emitted C to
+ * @param prog  the checked program whose `#test` items form the harness body
+ * @return      the buffer with the analyze-mode `main()` appended
+ * @since 0.3.0.29
+ */
+fn emit_test_main_analyze(buf: []byte, prog: checker::TProgram) -> []byte | error {
+    mut b = cb(buf, "extern int snprintf(char *, size_t, const char *, ...);\n")
+    b = cb(b, "int main(int argc, char **argv) {\n")
+    b = cb(b, "    tk_set_args(argc, argv);\n")
+    b = cb(b, "    tk_cov_branches_on(true);\n")
+    b = cb(b, "    tk_cov_lines_on(true);\n")
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.is_test { b = emit_test_call_analyze(b, f, i) }
+            }
+            _ => { }
+        }
+        i++
     }
     b = cb(b, "    return 0;\n")
     b = cb(b, "}\n")
@@ -8812,13 +9408,69 @@ fn emit_test_call(buf: []byte, f: checker::TFunction, idx: u64, cov: bool) -> []
     b
 }
 
+/**
+ * emit_test_call_analyze — one `#test` invocation under the analyze harness (0.3.0.29).
+ *
+ * Mirrors `emit_test_call`'s label prints and arena checkpoint, but ISOLATES this test's coverage:
+ * before the call it resets all three sinks so they hold ONLY this test's ids; after the call it
+ * dumps them to `$TEKO_ANALYZE_DIR/<idx>.tkcov` (the literal `idx` is baked in at emit time via the
+ * digit helper, so no runtime idx bookkeeping is needed). If `$TEKO_ANALYZE_DIR` is unset the dump
+ * is skipped (the binary still runs as a plain gate). The cov brackets nest strictly inside the
+ * arena checkpoint, exactly as `emit_test_call` and the VM runner order them.
+ *
+ * @param buf  the output byte buffer to append the emitted C to
+ * @param f    the `#test` function being invoked (its namespace + name form the label and symbol)
+ * @param idx  the `prog.items` coverage id — baked into the dump path AND passed to `tk_cov_enter`
+ * @return     the buffer with this test's isolated invocation appended
+ * @since 0.3.0.29
+ */
+fn emit_test_call_analyze(buf: []byte, f: checker::TFunction, idx: u64) -> []byte {
+    let label = if f.namespace.len != 0 { teko::str::concat(f.namespace, "::", f.name) } else { f.name }
+    let head = teko::str::concat("test ", label, " ... ")
+    mut b = cb(buf, "    tk_arena_push();\n")
+    b = cb(b, "    tk_print((tk_str){ (const tk_byte *)\"")
+    b = cb_cstr_escaped(b, head)
+    b = cb(b, "\", ")
+    b = cb_u128_digits(b, head.len to u128)
+    b = cb(b, " });\n")
+    b = cb(b, "    tk_cov_reset(); tk_cov_branch_reset(); tk_cov_line_reset();\n")
+    b = cb(cb_u128_digits(cb(b, "    tk_cov_enter("), idx to u128), ");\n")
+    b = cb_fn_name(cb(b, "    "), f.namespace, f.name)
+    b = cb(b, "();\n")
+    b = cb(b, "    tk_cov_leave();\n")
+    b = cb(b, "    { const char *d = getenv(\"TEKO_ANALYZE_DIR\"); if (d) { char p[1024]; snprintf(p, sizeof p, \"%s/")
+    b = cb_u128_digits(b, idx to u128)
+    b = cb(b, ".tkcov\", d); tk_cov_dump(p); } }\n")
+    b = cb(b, "    tk_println((tk_str){ (const tk_byte *)\"ok\", 2 });\n")
+    b = cb(b, "    tk_arena_pop();\n")
+    b
+}
+
+/**
+ * mode_instruments_cov — whether `mode` populates the `tk_cov_*` sinks (`TestCov` aggregates the
+ * whole run into one dump, `TestAnalyze` isolates each test into its own dump). Both emit the SAME
+ * production-fn/line/branch instrumentation; only the harness in `emit_test_main` differs. Program
+ * and TestPlain emit ZERO cov calls → byte-identical output → the gen2==gen3 fixpoint is intact.
+ *
+ * @param mode  the codegen mode being emitted
+ * @return      true for `TestCov`/`TestAnalyze`, false for `Program`/`TestPlain`
+ * @since 0.3.0.29
+ */
+fn mode_instruments_cov(mode: CgMode) -> bool {
+    match mode {
+        CgMode::TestCov => true
+        CgMode::TestAnalyze => true
+        _ => false
+    }
+}
+
 /** emit_function_mode — emit a function body, adding the `tk_cov_mark(idx)` entry prologue under
-    `TestCov` for each PRODUCTION (non-test, non-`teko::coverage`) function so function-level coverage
-    is populated natively — the mark the native gate records on entry. Under Program/TestPlain this is
-    exactly emit_function (no prologue → byte-identical). The coverage subsystem (`teko::coverage`) is
-    self-excluded so it never measures its own reporting code. (#265) */
+    `TestCov`/`TestAnalyze` for each PRODUCTION (non-test, non-`teko::coverage`) function so
+    function-level coverage is populated natively — the mark the native gate records on entry. Under
+    Program/TestPlain this is exactly emit_function (no prologue → byte-identical). The coverage
+    subsystem (`teko::coverage`) is self-excluded so it never measures its own reporting code. (#265) */
 fn emit_function_mode(buf: []byte, prog: checker::TProgram, f: checker::TFunction, mode: CgMode) -> []byte | error {
-    if mode != CgMode::TestCov { return emit_function(buf, prog, f) }
+    if !mode_instruments_cov(mode) { return emit_function(buf, prog, f) }
     if f.is_test || f.namespace == "teko::coverage" { return emit_function(buf, prog, f) }
     emit_function_cov(buf, prog, f, fn_items_index(prog, f) to i64)
 }

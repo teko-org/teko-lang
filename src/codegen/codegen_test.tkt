@@ -411,11 +411,10 @@ fn cgt_opt_mangle_and_keys() {
     let mk1 = match cg_member_key(cgt_empty(), checker::Str { }) { []byte as o => str(o); error => "" }
     teko::assert::is_true(mk1 == "str")
 
-    // cg_variant_typename_str — `tk_u_<key1>_<key2>` for an inline variant
     let vm1: []checker::Type = teko::list::push(teko::list::empty(), checker::Prim { kind = checker::PrimKind::I64 })
     let vm2: []checker::Type = teko::list::push(vm1, checker::Str { })
     let va = checker::Variant { members = vm2 }
-    let vn = match cg_variant_typename_str(va) { str as s => s; error => "" }
+    let vn = match cg_variant_typename(cgt_empty(), va) { []byte as o => str(o); error => "" }
     teko::assert::is_true(vn == "tk_u_i64_str")
 
     // cg_variant_typename — buffer variant
@@ -537,6 +536,33 @@ fn cgt_emit_expr_variants() {
     let ssl = match emit_expr(cgt_empty(), prog, esl) { []byte as o => str(o); error => "" }
     teko::assert::is_true(teko::str::contains(ssl, "hello"))
     teko::assert::is_true(teko::str::contains(ssl, "5"))
+}
+
+/**
+ * F1.4 (AL wave) — `emit_borrow`: a safe borrow `&x` (`TBorrow`) lowers to the C address-of form
+ * `&<operand>`, byte-identical to the auto-ref `&` the call path already emits. Here the operand is
+ * a bare `TVar x`, so the emitted text is exactly `&x`; a keyword-named target keeps its escaped
+ * identifier (`&return_`), proving the operand flows through the normal expression dispatch.
+ */
+#test
+fn cgt_emit_borrow() {
+    let prog = cgt_prog()
+
+    let borrow_x = checker::TExpr {
+        kind = checker::TBorrow { operand = cgt_e_var("x") }
+        type = checker::Reference { inner = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let sx = match emit_expr(cgt_empty(), prog, borrow_x) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(sx == "&x")
+
+    let borrow_kw = checker::TExpr {
+        kind = checker::TBorrow { operand = cgt_e_var("return") }
+        type = checker::Reference { inner = checker::Prim { kind = checker::PrimKind::I64 } }
+        line = 0; col = 0
+    }
+    let skw = match emit_expr(cgt_empty(), prog, borrow_kw) { []byte as o => str(o); error => "" }
+    teko::assert::is_true(skw == "&return_")
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +810,7 @@ fn cgt_loop_init_walkers() {
     let body: []checker::TStatement = teko::list::push(cgt_empty_stmts(), checker::TBreakStmt { label = "" })
     let loop_s: checker::TStatement = checker::TLoopStmt { label = ""; init = init; body = body }
     let stmts: []checker::TStatement = teko::list::push(cgt_empty_stmts(), loop_s)
-    let set0 = CgTypeSet { inners = teko::list::empty(); slices = teko::list::empty(); variants = teko::list::empty() }
+    let set0 = CgTypeSet { inners = teko::list::empty(); opt_keys = teko::list::empty(); slices = teko::list::empty(); slice_keys = teko::list::empty(); variants = teko::list::empty(); variant_keys = teko::list::empty() }
     let collected = cg_collect_block_opts(set0, stmts)
     teko::assert::is_true(collected.inners.len == 0)
     mut acc = StampAcc { next = 0; fns = teko::list::empty(); lams = teko::list::empty() }
@@ -1733,4 +1759,107 @@ fn cgt_vtable_pair_gate_excludes_abstract_self() {
     teko::assert::is_true(!cg_pair_is_base_vtable(prog, base, base))
     teko::assert::is_true(cg_pair_is_base_vtable(prog, sub, base))
     teko::assert::is_true(cg_pair_is_base_vtable(prog, vbase, vbase))
+}
+
+/**
+ * cgt_mangle_eq — the byte-free `cg_mangle_eq` (AL4a-2) decides identical-C-name exactly as the
+ * retired string compare `cg_opt_key(a) == cg_opt_key(b)` did. Every case double-checks the
+ * expected boolean AND that `cg_mangle_eq` agrees with that string oracle, proving the refactor
+ * is behavior-preserving. Covers: same-shape equal/unequal; two DISTINCT `Named` that mangle
+ * EQUAL because they share a bare last segment (#109 `teko::io::Reader` vs `teko::emit::Reader`);
+ * a `Named` whose text coincides with a composite's rendered form (`Named "opt_str"` vs `str?`,
+ * both mangle to `opt_str`) — distinct types, equal mangle; a fixed leaf vs a same-text `Named`
+ * (`str` vs `Named "str"`); erroring types (inline `Variant`, both map to the empty key `""`);
+ * and distinct types that mangle DIFFERENTLY.
+ */
+#test
+fn cgt_mangle_eq() {
+    let i32t: checker::Type = checker::Prim { kind = checker::PrimKind::I32 }
+    let u8t: checker::Type = checker::Prim { kind = checker::PrimKind::U8 }
+    let strt: checker::Type = checker::Str { }
+    let named_str: checker::Type = checker::Named { name = "str" }
+    let reader_io: checker::Type = checker::Named { name = "teko::io::Reader" }
+    let reader_emit: checker::Type = checker::Named { name = "teko::emit::Reader" }
+    let writer: checker::Type = checker::Named { name = "teko::io::Writer" }
+    let opt_str: checker::Type = checker::Optional { inner = strt }
+    let opt_str2: checker::Type = checker::Optional { inner = checker::Str { } }
+    let slice_str: checker::Type = checker::Slice { element = strt }
+    let named_opt_str: checker::Type = checker::Named { name = "opt_str" }
+    let slice_reader_a: checker::Type = checker::Slice { element = reader_io }
+    let slice_reader_b: checker::Type = checker::Slice { element = reader_emit }
+    let opt_i64: checker::Type = checker::Optional { inner = checker::Prim { kind = checker::PrimKind::I64 } }
+    mut va_members: []checker::Type = teko::list::empty()
+    va_members = teko::list::push(va_members, i32t)
+    va_members = teko::list::push(va_members, u8t)
+    let variant_a: checker::Type = checker::Variant { members = va_members }
+    mut vb_members: []checker::Type = teko::list::empty()
+    vb_members = teko::list::push(vb_members, strt)
+    vb_members = teko::list::push(vb_members, i32t)
+    let variant_b: checker::Type = checker::Variant { members = vb_members }
+
+    teko::assert::is_true(cg_mangle_eq(i32t, i32t))
+    teko::assert::is_false(cg_mangle_eq(i32t, u8t))
+    teko::assert::is_true(cg_mangle_eq(reader_io, reader_emit))
+    teko::assert::is_false(cg_mangle_eq(reader_io, writer))
+    teko::assert::is_true(cg_mangle_eq(opt_str, opt_str2))
+    teko::assert::is_false(cg_mangle_eq(opt_str, slice_str))
+    teko::assert::is_true(cg_mangle_eq(named_opt_str, opt_str))
+    teko::assert::is_true(cg_mangle_eq(strt, named_str))
+    teko::assert::is_true(cg_mangle_eq(slice_reader_a, slice_reader_b))
+    teko::assert::is_false(cg_mangle_eq(opt_str, opt_i64))
+    teko::assert::is_true(cg_mangle_eq(variant_a, variant_b))
+    teko::assert::is_false(cg_mangle_eq(variant_a, i32t))
+
+    teko::assert::is_true(cg_opt_key(i32t) == cg_opt_key(i32t))
+    teko::assert::is_false(cg_opt_key(i32t) == cg_opt_key(u8t))
+    teko::assert::is_true(cg_opt_key(reader_io) == cg_opt_key(reader_emit))
+    teko::assert::is_false(cg_opt_key(reader_io) == cg_opt_key(writer))
+    teko::assert::is_true(cg_opt_key(opt_str) == cg_opt_key(opt_str2))
+    teko::assert::is_false(cg_opt_key(opt_str) == cg_opt_key(slice_str))
+    teko::assert::is_true(cg_opt_key(named_opt_str) == cg_opt_key(opt_str))
+    teko::assert::is_true(cg_opt_key(strt) == cg_opt_key(named_str))
+    teko::assert::is_true(cg_opt_key(slice_reader_a) == cg_opt_key(slice_reader_b))
+    teko::assert::is_false(cg_opt_key(opt_str) == cg_opt_key(opt_i64))
+    teko::assert::is_true(cg_opt_key(variant_a) == cg_opt_key(variant_b))
+    teko::assert::is_false(cg_opt_key(variant_a) == cg_opt_key(i32t))
+}
+
+/**
+ * cgt_dedup_key_cache — AL4a-3: `CgTypeSet` stores each registered type's mangled key at insertion
+ * so dedup scans READ the cached key instead of recomputing it. Proves the cache is faithful and
+ * the dedup relation is unchanged: (1) each parallel `*_keys` array stays exactly as long as its
+ * type array; (2) every cached key byte-equals the freshly recomputed key (`cg_opt_key` /
+ * `cg_variant_key`) — the identical string the scans compared before; (3) a mangle-equal duplicate
+ * still collapses (no growth) while a distinct type appends one entry alongside its key.
+ */
+#test
+fn cgt_dedup_key_cache() {
+    let strt: checker::Type = checker::Str { }
+    let i64t: checker::Type = checker::Prim { kind = checker::PrimKind::I64 }
+    let named_str: checker::Type = checker::Named { name = "str" }
+    mut set = CgTypeSet { inners = teko::list::empty(); opt_keys = teko::list::empty(); slices = teko::list::empty(); slice_keys = teko::list::empty(); variants = teko::list::empty(); variant_keys = teko::list::empty() }
+
+    set = cg_opt_set_add(set, strt)
+    set = cg_opt_set_add(set, i64t)
+    set = cg_opt_set_add(set, named_str)
+    teko::assert::is_true(set.inners.len == 2)
+    teko::assert::is_true(set.opt_keys.len == set.inners.len)
+    teko::assert::is_true(set.opt_keys[0] == cg_opt_key(set.inners[0]))
+    teko::assert::is_true(set.opt_keys[1] == cg_opt_key(set.inners[1]))
+
+    set = cg_slice_add(set, strt)
+    set = cg_slice_add(set, strt)
+    teko::assert::is_true(set.slices.len == 1)
+    teko::assert::is_true(set.slice_keys.len == set.slices.len)
+    teko::assert::is_true(set.slice_keys[0] == cg_opt_key(set.slices[0]))
+
+    mut va_members: []checker::Type = teko::list::empty()
+    va_members = teko::list::push(va_members, i64t)
+    va_members = teko::list::push(va_members, strt)
+    let variant_a: checker::Type = checker::Variant { members = va_members }
+    set = cg_variant_add(set, variant_a)
+    set = cg_variant_add(set, variant_a)
+    teko::assert::is_true(set.variants.len == 1)
+    teko::assert::is_true(set.variant_keys.len == set.variants.len)
+    teko::assert::is_true(set.variant_keys[0] == cg_variant_key(set.variants[0]))
 }

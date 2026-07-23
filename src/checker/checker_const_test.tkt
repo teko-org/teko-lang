@@ -89,12 +89,12 @@ fn collects_const_forward_ref_resolves_in_pass1() {
  * const's name in pass-1 before any initializer is typed, so a const whose initializer FORWARD-
  * references a const declared LATER in the file resolves, and the dependency-ordered inliner
  * substitutes it. `const B: i64 = A + 1` sits ABOVE `const A: i64 = 1`; `uses_b` reads `B`. The
- * scalar inliner SUBSTITUTES (it does not arithmetic-fold), so `A` collapses into `B`'s initializer
- * (`1 + 1`) and `B` collapses into `uses_b`'s body — the read becomes the binary `1 + 1` (#594 crumb
- * 2). The with-deps companion of `collects_const_forward_ref_resolves_in_pass1` (which only exercised
- * `type_program`/`collect_funcs`); the dep program is EMPTY — the single-project path every
- * `teko build` takes. A pass-1 that failed to bind `A` before typing `B`'s initializer would surface
- * "undefined name: A" here instead of a `TProgram`.
+ * scalar inliner substitutes `A` into `B`'s initializer (`1 + 1`) and `B` into `uses_b`'s body, and
+ * the comptime-fold pass (CF) then collapses the const-known op-tree `1 + 1` to the literal `2` — the
+ * read becomes `TNumber{2}` (#594 crumb 2 + comptime-fold). The with-deps companion of
+ * `collects_const_forward_ref_resolves_in_pass1` (which only exercised `type_program`/`collect_funcs`);
+ * the dep program is EMPTY — the single-project path every `teko build` takes. A pass-1 that failed to
+ * bind `A` before typing `B`'s initializer would surface "undefined name: A" here instead of a `TProgram`.
  */
 #test
 fn type_program_with_deps_resolves_const_forward_ref() {
@@ -109,10 +109,7 @@ fn type_program_with_deps_resolves_const_forward_ref() {
     let empty_dep = TProgram { items = teko::list::empty() }
     match type_program_with_deps(parser::Program { items = items }, empty_dep) {
         TProgram as tp => match first_stmt_expr_of(tp, "uses_b") {
-            TBinary as bin => {
-                match bin.left.kind { TNumber as l => teko::assert::is_true(l.value == 1); _ => teko::assert::is_true(false) }
-                match bin.right.kind { TNumber as r => teko::assert::is_true(r.value == 1); _ => teko::assert::is_true(false) }
-            }
+            TNumber as n => teko::assert::is_true(n.value == 2)
             _ => teko::assert::is_true(false)
         }
         error => teko::assert::is_true(false)

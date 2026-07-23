@@ -175,7 +175,7 @@ if [[ ! -x "$teko_abs" ]]; then
     fi
     if [[ -x "$builder_abs" ]]; then
         echo "diff_c_own: $TEKO not found — self-hosting via $builder_abs build $script_dir -o bin"
-        if ! "$builder_abs" build "$script_dir" -o "$script_dir/bin" --no-verify >/tmp/teko-diffcown-selfhost.log 2>&1; then
+        if ! "$builder_abs" build "$script_dir" -o "$script_dir/bin" --no-verify --release >/tmp/teko-diffcown-selfhost.log 2>&1; then
             echo "diff_c_own: self-host build failed — see /tmp/teko-diffcown-selfhost.log" >&2
             tail -20 /tmp/teko-diffcown-selfhost.log | sed 's/^/      | /'
             exit 2
@@ -219,32 +219,18 @@ CORPUS=(
 #   the irrefutable-`_` dead fallback block (unreachable source counted as a retreat);
 #   `has_back_edge` is now reachability-aware, `match` allocates and runs (own == C == 42).
 #
-# own_print_exit — the ORIGINAL stop (`teko::io::println` mangled to the wrong external
-#   symbol, a linker-surfaced undefined-`println` failure) is CLOSED (#389 C1-6):
-#   `call_symbol` (`src/lir/lower.tks`) now maps the io group (`print`/`println`/
-#   `eprint`/`eprintln`/`write`/`ewrite`) to their `tk_*` runtime twins, mirroring
-#   codegen.tks's own bare-name builtin dispatch (`codegen.tks:2289-2297`), and lowers
-#   their lone `str` argument through its (ptr, len) FAT pair (`lower_fat_expr`) so the
-#   two-eightbyte `tk_str`-by-value AAPCS64/SysV ABI is reproduced exactly (a lone
-#   struct-by-value argument decomposes to two consecutive registers — no isel/regalloc
-#   change needed). This fixture's OWN message is a STRING INTERPOLATION
-#   (`$"answer={6*7}!"`), and `lower_fat_expr`'s CLOSED fat-pointer-producer set does
-#   NOT (yet) include a call result — `tk_str_concat`/`tk_i64_to_str`'s OWN return-value
-#   ABI (a `tk_str` returned in two registers, X0:X1/RAX:RDX) is a SEPARATE, wider,
-#   PRE-EXISTING gap (A1-4, #382 — `lower_interp`'s own doc: "closes the LOWERING
-#   honest-stop only") that `lower_fat_expr` already names explicitly ("a call result …
-#   honest-stops … a later phase, N2") — REPORTED up, not this crumb's scope (fixing it
-#   needs a wider LCall multi-register-return threading, well beyond a builtin-dispatch
-#   fix). So the fixture NOW compiler-honest-stops one step later, with a DIFFERENT,
-#   NAMED signature: `lower_fat_expr`'s own "fat-pointer receiver `string interpolation`
-#   not yet lowered (N2)" — a COMPILER diagnostic, not a linker failure. The
-#   KNOWN_STOP_ERR substring below matches THIS new signature.
+# own_print_exit — PROMOTED to the compared corpus (#comptime-fold CF5): its OWN message was a
+#   STRING INTERPOLATION `$"answer={6*7}!"`, whose call-result fat-pointer receiver
+#   (`tk_str_concat`'s two-register `tk_str` return — the wider N2 gap `lower_fat_expr` honest-stops
+#   on) the own backend could not yet lower. CF5 folds the provably-const interpolation to the plain
+#   string literal `"answer=42!"` at comptime, so NO call-result receiver remains: the own backend
+#   lowers it through the already-closed lone-`str` (ptr, len) fat-pair path (#389 C1-6) and own == C
+#   == 42. The stop is closed BY CONSTRUCTION (the folding removes the un-lowerable form), so the
+#   fixture joins the compared exit(n) corpus and the KNOWN_STOP list is now empty.
 #
 declare -a KNOWN_STOP=(
-    own_print_exit
 )
 declare -a KNOWN_STOP_ERR=(
-    "fat-pointer receiver"
 )
 
 known_stop_index_of() {
@@ -293,7 +279,7 @@ for proj in "${fixtures[@]}"; do
     cout="$work/$name-c"
     oout="$work/$name-own"
 
-    ( unset TEKO_BACKEND; env $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$cout" --no-verify ) >"$work/$name.cbuild" 2>&1
+    ( unset TEKO_BACKEND; env $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$cout" --no-verify --release ) >"$work/$name.cbuild" 2>&1
     if [[ $? -ne 0 ]]; then
         fail=$((fail + 1)); failed_names+=("$name")
         printf 'FAIL  %-16s C-native build failed\n' "$name"
@@ -303,7 +289,7 @@ for proj in "${fixtures[@]}"; do
     $RUN_WRAP "$cout/$name" >"$work/$name.cout" 2>&1
     c_exit=$?
 
-    env TEKO_BACKEND=native $OWN_TARGET_ENV $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$oout" --no-verify >"$work/$name.obuild" 2>&1
+    env TEKO_BACKEND=native $OWN_TARGET_ENV $TEKO_CC_ENV "$teko_abs" build "$proj" -o "$oout" --no-verify --release >"$work/$name.obuild" 2>&1
     own_build_rc=$?
 
     if known_stop_index_of "$name" >/dev/null; then

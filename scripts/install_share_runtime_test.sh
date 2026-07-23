@@ -52,7 +52,7 @@ trap cleanup EXIT INT TERM
 GEN_DIR="$WORK/gen"
 mkdir -p "$GEN_DIR"
 cp "$TEKO_BINARY" "$GEN_DIR/teko"
-( cd "$REPO_ROOT" && "$TEKO_BINARY" . -o "$GEN_DIR/emit" >/dev/null 2>&1 ) || true
+( cd "$REPO_ROOT" && "$TEKO_BINARY" . -o "$GEN_DIR/emit" --no-verify --release >/dev/null 2>&1 ) || true
 [ -f "$GEN_DIR/emit/teko.c" ] && cp "$GEN_DIR/emit/teko.c" "$GEN_DIR/teko.c"
 [ -f "$GEN_DIR/teko.c" ] || fail "could not obtain a gen teko.c to package (unexpected build failure)"
 
@@ -123,7 +123,7 @@ cp -R "$FIXTURE_SRC" "$FIXTURE"
 rm -rf "${FIXTURE:?}/out" "${FIXTURE:?}/bin"
 
 BUILD_LOG="$WORK/build.log"
-if ! ( cd "$FIXTURE" && env -i HOME="$FAKE_HOME" PATH="/usr/bin:/bin" "$INSTALLED_BIN" . -o out >"$BUILD_LOG" 2>&1 ); then
+if ! ( cd "$FIXTURE" && env -i HOME="$FAKE_HOME" PATH="/usr/bin:/bin" "$INSTALLED_BIN" . -o out --no-verify --release >"$BUILD_LOG" 2>&1 ); then
     cat "$BUILD_LOG" >&2
     fail "the installed binary could not build a project outside a checkout (issue #157 regressed)"
 fi

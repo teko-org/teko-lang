@@ -29,6 +29,7 @@ fn write_type(buf: []byte, t: StrTable, ty: checker::Type) -> []byte {
         checker::Uptr => write_u8(buf, 11)   // (C7.1a) tag 11 = uptr
         checker::Reference as r => write_type(write_u8(buf, 13), t, r.inner)   // (MEM-1b) tag 13 = Ref<T>
         checker::Char => write_u8(buf, 14)   // (UTF-8 increment 1) tag 14 = char — APPENDED (no reorder)
+        checker::Null => write_u8(buf, 15)
     }
 }
 
@@ -205,6 +206,7 @@ fn write_texpr(buf: []byte, t: StrTable, te: checker::TExpr) -> []byte {
         checker::TLambda as lam => write_u64(write_u8(b, 22), lam.lift_id)
         // (UTF-8 increment 1) CharLit: tag 23 + the codepoint's UTF-8 bytes (interned u32).
         checker::TCharLit as ch => write_u32(write_u8(b, 23), st_find(t, ch.bytes))
+        checker::TBorrow as bw => write_texpr(write_u8(b, 25), t, bw.operand)
     }
 }
 
@@ -257,7 +259,7 @@ fn write_tstatement(buf: []byte, t: StrTable, s: checker::TStatement) -> []byte 
             b = write_type(b, t, a.bound)
             b = write_texpr(b, t, a.value)
             b = write_u8(b, (if a.deref { 1 } else { 0 }) to byte)   // (MEM-1b-ii) deref ⇒ `name.value op= …`
-            match a.kind { parser::AssignKind::Field => write_texpr(b, t, a.target); _ => b }   // (#88) the FIELD LHS field-access
+            if parser::assign_has_target(a.kind) { write_texpr(b, t, a.target) } else { b }
         }
         // TReturn (2): has_value (u8) + value (TExpr).
         checker::TReturn as r => write_texpr(write_u8(write_u8(buf, 2), (if r.has_value { 1 } else { 0 }) to byte), t, r.value)

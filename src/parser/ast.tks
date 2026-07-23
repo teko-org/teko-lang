@@ -48,6 +48,16 @@ pub type Coalesce = struct { left: Expr; right: Expr }   // x ?? y — Elvis / n
 pub type MethodCall = struct { receiver: Expr; method: str; args: []Expr }   // recv.method(a, …) — B.29 instance call via `.`; method *checking* is deferred (M.4)
 pub type SafeMethodCall = struct { receiver: Expr; method: str; args: []Expr }   // recv?.method(a, …) — null-propagating method call (NP-OOP, issue #116)
 pub type Cast = struct { expr: Expr; target: TypeExpr }   // x to T — explicit conversion; preserves→ok / loses→compile-error (E7; M.0+M.1)
+/**
+ * Borrow — the prefix `&x` safe mutable-borrow expression (AL wave F1). Takes a live
+ * borrow of the operand lvalue, surfacing the auto-ref that is implicit in argument
+ * position today as an explicit operator. Types to `Reference<T>`; mutability is inferred
+ * from the operand's binding + the consuming position (bare `&x`, no `&mut`). A borrow of
+ * an immutable (`let`) binding in mutable position is a checker error (auto-enforces F2).
+ * `&` is the SAFE `ref` surface here — NOT the unsafe raw-pointer sigil (that stays unsafe;
+ * `*`/deref untouched, prospecção §12).
+ */
+pub type Borrow = struct { operand: Expr }   // &x — safe mutable borrow (AL wave F1)
 pub type PathExpr = struct { path: Path }   // a qualified path as a VALUE — Enum::Member (e.g. PrimKind::U32), module statics (P2; the F2/Part-1 AST had only single-name Var)
 pub type StructLit = struct { type_path: Path; type_args: []TypeExpr; field_names: []str; field_vals: []Expr }   // Name { field = value, … } — a struct VALUE constructor (W4a); (W9.4) type_args = explicit `Foo<i64>{ … }` generic args (empty for bare `Foo { … }`); parallel slices (.len replaces nfields)
 pub type Index = struct { receiver: Expr; index: Expr }   // recv[index] — str→byte, []T→T (W5-idx)
@@ -84,7 +94,7 @@ pub type Lambda = struct { params: []LambdaParam; body: []Statement }
 // `TExpr` (tast.tks) and the C `tk_expr` (ast.h), so EVERY expression node carries its 1-based
 // source position. The parser stamps line/col from the node's first token; the checker copies
 // it onto the typed node and onto type-errors, so a message points at the failing expression.
-pub type ExprKind = variant Number | Var | Call | IfExpr | MatchExpr | StrLit | ByteLit | CharLit | BoolLit | NullLit | Binary | Unary | Compare | FieldAccess | SafeFieldAccess | Coalesce | MethodCall | SafeMethodCall | Cast | PathExpr | StructLit | Index | Interp | InExpr | ArrayLit | Lambda
+pub type ExprKind = variant Number | Var | Call | IfExpr | MatchExpr | StrLit | ByteLit | CharLit | BoolLit | NullLit | Binary | Unary | Compare | FieldAccess | SafeFieldAccess | Coalesce | MethodCall | SafeMethodCall | Cast | PathExpr | StructLit | Index | Interp | InExpr | ArrayLit | Lambda | Borrow
 pub type Expr = struct { kind: ExprKind; line: u32; col: u32 }
 
 // --- statements ---
@@ -100,16 +110,40 @@ pub type Binding = struct {   // let/mut/const TARGET [: T] = value
     type_ann: TypeExpr   // the parsed annotation (A.8)
     value: Expr
 }
-// (#88) an assignment TARGET is one of three shapes, tagged by `kind`:
-//   Simple   — `name op= value`; LHS is the bare binding `name` (deref=false, target = no_expr()).
-//   RefDeref — `name.value op= value`; write THROUGH a `Ref<T>` handle `name` (deref=true — the legacy
-//              MEM-1b-ii flag, preserved; target = no_expr()).
-//   Field    — `recv.field op= value`; write a struct/class field. `target` is the LHS field-access EXPR
-//              (a FieldAccess, receiver.field, arbitrarily nested); `name`/`deref` unused.
-// `deref` stays a plain bool == (kind==RefDeref) so every legacy reader / TKB byte layout is unchanged for the
-// two old shapes; a Field target is the ONLY new shape (kind=Field carries `target`, the general lvalue).
-pub type AssignKind = enum { Simple; RefDeref; Field }
+/**
+ * AssignKind — the target shape of an assignment (#88). One of four, tagged on `Assign`/`TAssign`:
+ *
+ * @field Simple    `name op= value` — the bare binding `name` (deref=false; target = no_expr()).
+ * @field RefDeref  `name.value op= value` — write THROUGH a `Ref<T>` handle `name` (deref=true, the
+ *                  legacy MEM-1b-ii flag; target = no_expr()).
+ * @field Field     `recv.field op= value` — a struct/class field write; `target` is the LHS field-access
+ *                  EXPR (a FieldAccess, arbitrarily nested); `name`/`deref` unused.
+ * @field Index     `ids[i] op= value` — a slice/array ELEMENT write; `target` is the LHS index EXPR (an
+ *                  `Index{receiver,index}`); `name`/`deref` unused. Appended LAST so the three legacy
+ *                  ordinals (and thus the TKB `assign_kind_byte` layout) are unchanged. `deref` stays a
+ *                  plain bool == (kind==RefDeref); Field/Index both carry the general lvalue in `target`
+ *                  (see `assign_has_target`).
+ */
+pub type AssignKind = enum { Simple; RefDeref; Field; Index }
 pub type Assign = struct { kind: AssignKind; name: str; op: lexer::TokenKind; value: Expr; deref: bool; target: Expr }   // x = / += / … (B.4); see AssignKind above
+
+/**
+ * assign_has_target — does an `AssignKind` carry a general lvalue EXPRESSION in `Assign.target` /
+ * `TAssign.target`? True for the two expr-target shapes — `Field` (`recv.field`) and `Index`
+ * (`ids[i]`) — and false for `Simple` / `RefDeref` (which write a bare `name`). Every AST/TAST walk
+ * that descends into a field assignment's `target` must descend an index assignment's `target` too
+ * (both hold sub-expressions naming free variables), so the two share this single predicate.
+ *
+ * @param kind  the assignment's target discriminant
+ * @return      true iff `target` holds a walkable lvalue expression (`Field` or `Index`)
+ */
+pub fn assign_has_target(kind: AssignKind) -> bool {
+    match kind {
+        AssignKind::Field => true
+        AssignKind::Index => true
+        _ => false
+    }
+}
 pub type Return = struct { has_value: bool; value: Expr }   // `return [expr]` — bare `return` (no value) has has_value=false, value a placeholder (B.20; P4a)
 /**
  * `[LABEL:] loop [<head>] { … }` (M.5, #517). The head is fully desugared by the parser: `init`
