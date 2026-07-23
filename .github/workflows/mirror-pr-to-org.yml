@@ -1,0 +1,86 @@
+# .github/workflows/mirror-pr-to-org.yml
+# MANUAL org-PR creator (workflow_dispatch): the OWNER dispatches it with the UMBRELLA
+# branch name + title + body, and it opens (or updates) the cross-fork PR on the org —
+# `schivei:<branch> -> teko-org:<branch>`. This replaces the old event-driven PR mirror:
+# with the seed/* branch model retired (owner 2026-07-23) there is no promotion-PR event
+# to piggyback on, and event triggers proved unreliable for this flow (pull_request needs
+# a merge ref; pull_request_target registers from the default branch).
+# LOCKS: never runs on the org (repository guard) and only executes on main (ref guard) —
+# after equalization the file EXISTS on org main, but must never run there.
+# REQUIRES the repo secret `ORG_PR_TOKEN` (pull-requests:write on teko-org/teko-lang).
+name: Mirror PR to org
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Nome da branch umbrella (existe no fork E na org; vira head e base do PR cross-fork)"
+        required: true
+        type: string
+      title:
+        description: "Título do PR na org"
+        required: true
+        type: string
+      body:
+        description: "Descritivo (markdown) do PR na org"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-org-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'schivei/teko-lang' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      ORG: teko-org/teko-lang
+      BR: ${{ inputs.branch }}
+      TITLE: ${{ inputs.title }}
+      BODY: ${{ inputs.body }}
+    steps:
+      - name: Guard — org secret present
+        env:
+          ORG_TOKEN: ${{ secrets.ORG_PR_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${ORG_TOKEN:-}" ]; then
+            echo "::error::ORG_PR_TOKEN secret is required (pull-requests:write on $ORG)."
+            exit 1
+          fi
+          case "$BR" in
+            main|seed/*) echo "::error::branch '$BR' is not mirrorable (main/seed são excluídas)."; exit 1 ;;
+          esac
+
+      - name: Open (or update) the cross-fork org PR (fork:branch -> org:branch)
+        env:
+          GH_TOKEN: ${{ secrets.ORG_PR_TOKEN }}
+        run: |
+          set -eu
+          FORK_OWNER="${GITHUB_REPOSITORY%%/*}"
+          # Title/body through FILES (never inline shell) — arbitrary Markdown is not shell-safe.
+          BODY_FILE="$RUNNER_TEMP/org-pr-body.md"
+          {
+            printf '%s' "$BODY"
+            printf '\n\n---\n'
+            printf 'Opened via manual dispatch from %s (%s:%s -> %s).\n' \
+              "$GITHUB_REPOSITORY" "$FORK_OWNER" "$BR" "$BR"
+          } > "$BODY_FILE"
+          EXIST="$(gh pr list --repo "$ORG" --state open --base "$BR" \
+                     --json number,headRefName,headRepositoryOwner \
+                     --jq "[.[] | select(.headRefName==\"$BR\" and .headRepositoryOwner.login==\"$FORK_OWNER\")][0].number" \
+                     2>/dev/null || true)"
+          if [ -n "${EXIST:-}" ] && [ "$EXIST" != "null" ]; then
+            gh pr edit "$EXIST" --repo "$ORG" --title "$TITLE" --body-file "$BODY_FILE"
+            echo "Updated org PR #$EXIST ($FORK_OWNER:$BR -> $BR)"
+          else
+            gh pr create --repo "$ORG" \
+              --head "${FORK_OWNER}:${BR}" --base "$BR" \
+              --title "$TITLE" --body-file "$BODY_FILE" --draft
+            echo "Opened org draft PR ($FORK_OWNER:$BR -> $BR)"
+          fi
