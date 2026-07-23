@@ -947,8 +947,11 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
         return emit_native(dir, stem, out_dir, prog, m)
     }
     let mode = report_mode(false, tty)
+    if m.abi == "c" {
+        match codegen::check_ffi_export(prog) { null => { }; error as e => return fail(dir, e.message) }
+    }
     let codegen_phase = phase_begin("codegen", count_unit_text(0, prog.items.len, "items"), mode)
-    let emitted = match codegen::tk_emit_c(prog) {
+    let emitted = match ffi_emit_c(prog, m.abi) {
         str as s => s
         error as e => {
             phase_end_fail(codegen_phase, count_unit_text(0, prog.items.len, "items"), e.message)
@@ -968,6 +971,9 @@ fn backend(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manife
         null => { }   // error? — null = success
     }
     phase_end_ok(emit_phase, teko::str::concat(cfile, teko::str::concat(" ", size_text(csrc.len))))
+    if m.abi == "c" {
+        match ffi_write_c_header(od, stem, prog) { null => { }; error as e => return fail(dir, e.message) }
+    }
     let cc_phase = phase_begin("cc", binp, mode)
     if run_cc(cfile, binp, m, prog, opt) != 0 {
         phase_end_fail(cc_phase, binp, "cc failed to build the generated C")
@@ -1561,6 +1567,40 @@ fn strip_tests(prog: checker::TProgram) -> checker::TProgram {
  */
 fn report_build_done(binp: str, start: i128) {
     teko::io::eprintln(teko::str::concat("built ", binp, teko::str::concat("   ", teko::str::concat(elapsed_str(start), "s"))))
+}
+
+/**
+ * Emit the C translation unit, selecting the reverse-FFI export emitter (`tk_emit_c_export`, which appends
+ * the C-ABI export wrappers) when the artifact's ABI is `"c"`, else the ordinary emitter (FFI-D).
+ *
+ * @param prog  the checked program
+ * @param abi   the artifact ABI (`"c"` = reverse-FFI export, else the native Teko ABI)
+ * @return      the emitted C source text
+ * @throws      when codegen fails
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn ffi_emit_c(prog: checker::TProgram, abi: str) -> str | error {
+    if abi == "c" { return codegen::tk_emit_c_export(prog) }
+    codegen::tk_emit_c(prog)
+}
+
+/**
+ * Write the MANDATORY reverse-FFI C header (`<stem>.h`) beside the artifact for an `abi="c"` build — pure
+ * text (real C prototypes for every `exp` function), needing no C preprocessor and no cc (FFI-D, KP11).
+ *
+ * @param od    the output directory (trailing slash stripped)
+ * @param stem  the artifact stem (the header is `<stem>.h`)
+ * @param prog  the checked program
+ * @return      null on success
+ * @throws      when the header cannot be generated or written
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn ffi_write_c_header(od: str, stem: str, prog: checker::TProgram) -> error? {
+    let hsrc = match codegen::emit_c_header(prog) { str as s => s; error as e => return e }
+    let hpath = teko::str::concat(od, "/", teko::str::concat(stem, ".h"))
+    match teko::io::write_file(hpath, hsrc) { error as e => return e; null => { } }
+    teko::io::println(teko::str::concat("teko: wrote reverse-FFI header ", hpath))
+    null
 }
 
 /** Hand `prog` to the backend at optimization level `opt` and, on success, report the closing

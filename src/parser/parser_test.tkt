@@ -427,3 +427,74 @@ fn rejects_must_free_on_fn_flags_and_let() {
     teko::assert::is_true(module_errors("#must_free\nflags F { A; B }"))
     teko::assert::is_true(module_errors("#must_free\nlet x = 1"))
 }
+
+/**
+ * The `c_symbol` an `exp` function carries after parsing `source`'s first declaration (the reverse-FFI
+ * `exp("…")` override, "" when none), or "<err>" when the module fails to parse.
+ *
+ * @param source  a single-declaration module
+ * @return        the parsed function's `c_symbol`, or "<err>"
+ */
+fn ffx_first_fn_c_symbol(source: str) -> str {
+    let m = match module_of(source) { Module as x => x; error => return "<err>" }
+    if m.decls.len == 0 { return "<err>" }
+    match m.decls[0] { Function as f => f.c_symbol; _ => "<err>" }
+}
+
+/**
+ * Whether the first declaration of `source` parses as a NON-extern `exp` function (the export shape).
+ *
+ * @param source  a single-declaration module
+ * @return        true iff the first decl is an `exp`, non-extern function
+ */
+fn ffx_first_fn_is_plain_exp(source: str) -> bool {
+    let m = match module_of(source) { Module as x => x; error => return false }
+    if m.decls.len == 0 { return false }
+    match m.decls[0] { Function as f => f.vis == Visibility::Exp && !f.is_extern; _ => false }
+}
+
+/**
+ * The `exp("c_name")` override captures the C export symbol onto a plain (non-extern) `exp` function.
+ */
+#test
+fn ffx_parses_export_override() {
+    teko::assert::is_true(ffx_first_fn_c_symbol("exp(\"teko_add\") fn add(a: i64, b: i64) -> i64 { a }") == "teko_add")
+    teko::assert::is_true(ffx_first_fn_is_plain_exp("exp(\"teko_add\") fn add(a: i64, b: i64) -> i64 { a }"))
+}
+
+/**
+ * A bare `exp` (no override) leaves the export symbol empty — the flatten-canonical default applies later.
+ */
+#test
+fn ffx_bare_exp_has_no_override() {
+    teko::assert::is_true(ffx_first_fn_c_symbol("exp fn add(a: i64) -> i64 { a }") == "")
+}
+
+/**
+ * A malformed override — a missing `)`, a non-string argument, and the override on an `extern` import —
+ * each fails to parse (M.3 — no silent coercion).
+ */
+#test
+fn ffx_rejects_malformed_export_override() {
+    teko::assert::is_true(module_errors("exp(\"teko_add\" fn add() -> i64 { 0 }"))
+    teko::assert::is_true(module_errors("exp(42) fn add() -> i64 { 0 }"))
+    teko::assert::is_true(module_errors("exp(\"x\") extern fn c_add(a: i64) -> i64 = \"c_add\""))
+}
+
+/**
+ * The FFI IMPORT surface: `extern fn name(...) -> R = "SYM" from "lib"` parses as a bodyless foreign
+ * function carrying its C symbol and providing library (the FFI-in base, task item 1).
+ */
+#test
+fn ffx_parses_extern_import() {
+    let m = match module_of("extern fn strlen(s: u64) -> u64 = \"strlen\" from \"c\"") { Module as x => x; error => return teko::assert::is_true(false) }
+    teko::assert::is_true(m.decls.len == 1)
+    match m.decls[0] {
+        Function as f => {
+            teko::assert::is_true(f.is_extern)
+            teko::assert::is_true(f.c_symbol == "strlen")
+            teko::assert::is_true(f.from_lib == "c")
+        }
+        _ => teko::assert::is_true(false)
+    }
+}

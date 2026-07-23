@@ -226,6 +226,52 @@ fn consume_unsafe_modifier(tokens: []lexer::Token, pos: u64) -> Parsed<bool> {
 // `allow_bodyless` (W10b.IF) — true ONLY for an INTERFACE method: a pure signature `fn sig(self) -> T`
 // with NO body (the interface is a contract). Mirrors the `abstract fn` bodyless path; every other
 // caller passes false.
+/**
+ * Consume the OPTIONAL `("c_name")` reverse-FFI symbol override that may follow an `exp` visibility
+ * marker on a function (FFI-D, reverse-FFI export). The override names the exact C symbol the `exp`
+ * function is emitted under in an `abi="c"` artifact, mirroring the `= "SYM"` an `extern` import uses;
+ * absent, the codegen flattens the canonical name (`ns::fn` → `ns_fn`) instead. A `(` that opens the
+ * override MUST wrap a single quoted string and close with `)`.
+ *
+ * @param tokens  the full token stream
+ * @param pos     the index immediately past the consumed `exp` keyword
+ * @return        the override symbol (empty string when no `(` follows) and the index past it
+ * @throws        when a `(` opens but is not a single quoted string closed by `)`
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn parse_export_override(tokens: []lexer::Token, pos: u64) -> Parsed<str> | error {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::LParen) { return Parsed<str> { node = ""; next = pos } }
+    mut p = pos + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Str) {
+        return err_at(tokens, p, "expected a quoted C symbol inside `exp(\"…\")`")
+    }
+    let sym = tokens[p].text
+    p = p + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
+        return err_at(tokens, p, "expected `)` to close the `exp(\"…\")` export-symbol override")
+    }
+    Parsed<str> { node = sym; next = p + 1 }
+}
+
+/**
+ * Advance the `parse_decl` keyword-search cursor past an OPTIONAL `("c_name")` reverse-FFI export
+ * override that may follow an `exp` marker, so the following `fn`/`type`/`flags`/`const` search lands on
+ * the real keyword (FFI-D). This is a lightweight peek only — `parse_function` re-parses (and validates)
+ * the override from the declaration's true start.
+ *
+ * @param tokens  the full token stream
+ * @param pos     the index immediately past the consumed `exp` keyword
+ * @return        the index past a `("STR")` override group, or `pos` unchanged when none follows
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn skip_export_override_peek(tokens: []lexer::Token, pos: u64) -> u64 {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::LParen) { return pos }
+    mut k = pos + 1
+    if is_kind_at(tokens, k, lexer::TokenKind::Str) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::RParen) { k = k + 1 }
+    k
+}
+
 fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str, allow_receiver: bool, allow_bodyless: bool) -> Parsed<Decl> | error {
     mut p = pos
     mut has_doc = false
@@ -239,12 +285,16 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
         p = skip_seps(tokens, p + 1)
     }
     mut vis = Visibility::Private   // default: own-namespace only
+    mut export_c_symbol = ""
     if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
         vis = Visibility::Pub
         p = p + 1
     } else if is_kind_at(tokens, p, lexer::TokenKind::Exp) {
         vis = Visibility::Exp
         p = p + 1
+        let ov = match parse_export_override(tokens, p) { Parsed<str> as x => x; error as e => return e }
+        export_c_symbol = ov.node
+        p = ov.next
     }
     // (W10b.CLASS, 2026-07-01) `intern` widens reach to "also visible to inheritors" — combines
     // WITH the vis above, not a 4th tier; meaningful only inside a class body, but parsed
@@ -298,6 +348,7 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
     }
     if is_extern {
         if is_test { return err_at(tokens, p, "`#test` may not precede `extern`") }
+        if export_c_symbol != "" { return err_at(tokens, p, "an `extern` (imported) function may not carry an `exp(\"…\")` export override") }
         if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
             return err_at(tokens, p, "expected `= \"symbol\"` to bind the C symbol of an `extern` function")
         }
@@ -325,13 +376,13 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
     // enforced by the checker, not the parser). A bare `;`/newline/`}` follows instead of `{`.
     if (is_abstract || allow_bodyless) && !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         let no_body: []Statement = teko::list::empty()
-        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe }; next = p }
+        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = export_c_symbol; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe }; next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' for the function body")
     }
     let blk = match parse_block(tokens, p) { ParsedList<Statement> as x => x; error as e => return e }
-    Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe }; next = blk.next }
+    Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = export_c_symbol; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe }; next = blk.next }
 }
 
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
@@ -1115,7 +1166,7 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         k = k + 1
     } else if is_kind_at(tokens, k, lexer::TokenKind::Exp) {
         vis = Visibility::Exp
-        k = k + 1
+        k = skip_export_override_peek(tokens, k + 1)
     }
     mut saw_extern = false
     if is_kind_at(tokens, k, lexer::TokenKind::Extern) {

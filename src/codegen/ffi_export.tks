@@ -1,0 +1,405 @@
+/**
+ * src/codegen/ffi_export.tks (namespace 'teko::codegen') — the reverse-FFI (Teko -> C) EXPORT surface
+ * for an `[artifact] abi = "c"` project (FFI-D, own-native). Three concerns, all backend-independent and
+ * pure over the CHECKED program:
+ *   * NAMING     — the C symbol an `exp` function is emitted under: the `exp("c_name")` override, or the
+ *                  flattened canonical (`ns::fn` -> `ns_fn`, project-root-prefixed by construction).
+ *   * THE GATE   — `check_ffi_export`: reject a non-FFI-safe `exp` signature and a class/interface export
+ *                  categorically, and reject two exports colliding on one C symbol.
+ *   * THE HEADER — `emit_c_header`: the pure-text `.h` (real C prototypes) a C consumer includes.
+ * The C-ABI wrapper EMISSION (`cg_c_export_wrappers_text`) reuses `cg_c_export_symbol` + the FFI C-type
+ * mappers here so the prototype and the emitted object symbol always agree.
+ */
+
+/**
+ * Flatten a canonical Teko name (`namespace` + `name`) to a single C identifier for the reverse-FFI
+ * boundary: every `::` collapses to a single `_`, and the namespace joins the name with one `_`. Because
+ * the canonical root IS the project name (`teko.tkp` `name`; the source root is invisible), the flattened
+ * form auto-prefixes every export with the project name — `demo::math` + `add` -> `demo_math_add`,
+ * `demo` + `add` -> `demo_add` — the libc-collision resistance a hand-written C library gets manually.
+ *
+ * @param namespace  the declaring namespace ("" for a truly root-less symbol -> the bare name)
+ * @param name       the symbol's bare name
+ * @return           the flattened, single-underscore C identifier
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+pub fn flatten_canonical(namespace: str, name: str) -> str {
+    if namespace.len == 0 { return name }
+    teko::str::concat(ffi_flatten_seps(namespace), "_", name)
+}
+
+/**
+ * Collapse each `::` in a canonical namespace to a single `_` (the C-facing flatten; distinct from the
+ * internal `__` mangle `cb_fn_name` uses). `demo::math` -> `demo_math`.
+ *
+ * @param s  the canonical namespace
+ * @return   the same text with every `::` rewritten to one `_`
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn ffi_flatten_seps(s: str) -> str {
+    mut out: []byte = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        if i + 1 < s.len && s[i] == b':' && s[i + 1] == b':' {
+            out = teko::list::push(out, b'_')
+            i = i + 2
+        } else {
+            out = teko::list::push(out, s[i])
+            i++
+        }
+    }
+    str(out)
+}
+
+/**
+ * The C symbol an `exp` function is emitted under in an `abi="c"` artifact: the `exp("c_name")` override
+ * verbatim when present (carried on `c_symbol`, mirroring how `extern` carries its import symbol), else the
+ * flattened canonical default.
+ *
+ * @param f  the checked function
+ * @return   the C-facing export symbol
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+pub fn cg_c_export_symbol(f: checker::TFunction) -> str {
+    if f.c_symbol != "" { return f.c_symbol }
+    flatten_canonical(f.namespace, f.name)
+}
+
+/**
+ * Map a resolved return `Type` to its FFI-safe C spelling, or fail when the type cannot cross the C ABI.
+ * The base-slice FFI-safe set is the fixed-width scalars (`iN`/`uN` for N in 8..64, `f32`/`f64`, `bool`,
+ * `byte`) plus the return-only `void`. Everything else — `str`, a slice, an aggregate, a closure, `T?`,
+ * `T | error`, `u128`/`i128`, `f16`, AND `ptr<T>` (whose stable C spelling couples the raw-pointer export
+ * crumb — honest-stop) — is rejected here.
+ *
+ * @param t  the resolved return type
+ * @return   the C type text (e.g. `int64_t`, `void`)
+ * @throws   when `t` is not FFI-safe for export
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn ffi_ctype_of_type(t: checker::Type) -> str | error {
+    match t {
+        checker::Void => "void"
+        checker::Prim as p => ffi_c_scalar(ffi_prim_name(p.kind))
+        checker::Byte => "uint8_t"
+        _ => error { message = "return type is not FFI-safe for export (only fixed-width scalars and `void` cross the C ABI in the base slice; `ptr<T>`/aggregate export is a later crumb)" }
+    }
+}
+
+/**
+ * Map a parsed parameter `TypeExpr` to its FFI-safe C spelling, or fail. Parameters carry their surface
+ * annotation (not a resolved `Type`), so the mapper matches the written type: a `NamedType` naming a
+ * fixed-width scalar. A slice / union / optional / function type — and `ptr<T>` (honest-stop, per the
+ * return mapper) — is rejected.
+ *
+ * @param te  the parsed parameter type annotation
+ * @return    the C type text
+ * @throws    when `te` is not an FFI-safe parameter type for export
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn ffi_ctype_of_typeexpr(te: parser::TypeExpr) -> str | error {
+    match te {
+        parser::NamedType as nt => ffi_c_scalar(cg_path_last(nt.path))
+        _ => error { message = "parameter type is not FFI-safe for export (only fixed-width scalars cross the C ABI in the base slice)" }
+    }
+}
+
+/**
+ * The surface name of a scalar `PrimKind`, as written in Teko source (`i64`, `u8`, `f64`, `bool`, …). The
+ * bridge between the resolved `Prim` return type and the shared, surface-keyed `ffi_c_scalar` mapper.
+ *
+ * @param k  the primitive kind
+ * @return   the Teko surface spelling
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn ffi_prim_name(k: checker::PrimKind) -> str {
+    match k {
+        U8 => "u8"; U16 => "u16"; U32 => "u32"; U64 => "u64"; U128 => "u128"
+        I8 => "i8"; I16 => "i16"; I32 => "i32"; I64 => "i64"; I128 => "i128"
+        F16 => "f16"; F32 => "f32"; F64 => "f64"
+        Bool => "bool"
+    }
+}
+
+/**
+ * Map an FFI-safe scalar's surface name to its stable C type, or fail. The 128-bit ints and `f16` are
+ * rejected — they have no portable, standard C type (`__int128`/`_Float16` are non-standard extensions).
+ *
+ * @param nm  the scalar's surface name
+ * @return    the stable C type (e.g. `int32_t`, `double`, `_Bool` via `bool`)
+ * @throws    when `nm` is not an FFI-safe scalar
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn ffi_c_scalar(nm: str) -> str | error {
+    if nm == "i8" { return "int8_t" }
+    if nm == "i16" { return "int16_t" }
+    if nm == "i32" { return "int32_t" }
+    if nm == "i64" { return "int64_t" }
+    if nm == "u8" { return "uint8_t" }
+    if nm == "u16" { return "uint16_t" }
+    if nm == "u32" { return "uint32_t" }
+    if nm == "u64" { return "uint64_t" }
+    if nm == "byte" { return "uint8_t" }
+    if nm == "f32" { return "float" }
+    if nm == "f64" { return "double" }
+    if nm == "bool" { return "bool" }
+    error { message = teko::str::concat("type `", nm, "` is not an FFI-safe scalar (i8..i64/u8..u64/byte/f32/f64/bool)") }
+}
+
+/**
+ * The reverse-FFI EXPORT GATE for an `abi="c"` artifact (FFI-D). Enforced categorically, before codegen:
+ *   * an `exp` class or interface is a COMPILE ERROR — a Teko class/interface has no stable C ABI, so it
+ *     may not cross the boundary in this slice (no shelved fallback; the owner's rejection ruling).
+ *   * an `exp` function must be FFI-safe: every parameter and the return type map to a C type, no Teko
+ *     `params []T` variadic parameter, and no unresolved generic parameter (only monomorphic export).
+ *   * two exports resolving to the SAME C symbol are a COMPILE ERROR, naming both.
+ * Non-`exp` declarations are ignored — they are internal to the artifact and never reach C.
+ *
+ * @param prog  the checked program of the `abi="c"` artifact
+ * @return      null on success
+ * @throws      on an exported class/interface, a non-FFI-safe `exp` signature, or a C-symbol collision
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+pub fn check_ffi_export(prog: checker::TProgram) -> error? {
+    mut seen_syms: []str = teko::list::empty()
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.vis == parser::Visibility::Exp {
+                    match check_ffi_export_fn(f) { null => { }; error as e => return e }
+                    let sym = cg_c_export_symbol(f)
+                    if ffi_str_in(seen_syms, sym) {
+                        return error { message = teko::str::concat("reverse-FFI export collision: two exported functions resolve to the C symbol `", sym, "` — give one an explicit `exp(\"other_name\")`") }
+                    }
+                    seen_syms = teko::list::push(seen_syms, sym)
+                }
+            }
+            parser::TypeDecl as d => {
+                match check_ffi_export_type(d) { null => { }; error as e => return e }
+            }
+            _ => { }
+        }
+        i++
+    }
+    null
+}
+
+/**
+ * Reject an exported class or interface declaration (FFI-D categorical rule). A class/interface carries a
+ * Teko vtable/reference-object layout with no stable C ABI; exporting it is a compile error rather than a
+ * silently-degraded handle. Every other `exp` type kind passes this check (they are not emitted by this
+ * slice's header, but they are not rejected here either — only class/interface are categorical errors).
+ *
+ * @param d  the type declaration
+ * @return   null when `d` is not an exported class/interface
+ * @throws   when `d` is an `exp` class or interface
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn check_ffi_export_type(d: parser::TypeDecl) -> error? {
+    if d.vis != parser::Visibility::Exp { return null }
+    match d.body {
+        parser::ClassBody => error { message = teko::str::concat("cannot export class `", d.name, "` across the C ABI (`abi=\"c\"`): a Teko class has no stable C layout — expose a `#repr(\"c\")` struct + free functions instead") }
+        parser::InterfaceBody => error { message = teko::str::concat("cannot export interface `", d.name, "` across the C ABI (`abi=\"c\"`): a Teko interface vtable has no stable C layout — expose free functions instead") }
+        _ => null
+    }
+}
+
+/**
+ * Validate one exported function's signature for the C boundary: a resolved-return + surface-parameter
+ * FFI-safety check, plus a reject on a Teko `params []T` variadic and on an unresolved generic.
+ *
+ * @param f  the exported function
+ * @return   null when every part of the signature is FFI-safe
+ * @throws   naming the function and the offending part when it is not
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn check_ffi_export_fn(f: checker::TFunction) -> error? {
+    if f.type_params.len != 0 {
+        return error { message = teko::str::concat("cannot export generic function `", f.name, "` across the C ABI: only a monomorphic instance has a C signature") }
+    }
+    match ffi_ctype_of_type(f.return_type) {
+        str => { }
+        error as e => return error { message = teko::str::concat("exported function `", f.name, "`: ", e.message) }
+    }
+    mut i: u64 = 0
+    loop {
+        if i >= f.params.len { break }
+        let p = f.params[i]
+        if p.is_params {
+            return error { message = teko::str::concat("cannot export function `", f.name, "` with a Teko `params` variadic across the C ABI — declare a fixed C signature instead") }
+        }
+        match ffi_ctype_of_typeexpr(p.type_ann) {
+            str => { }
+            error as e => return error { message = teko::str::concat("exported function `", f.name, "`, parameter `", p.name, "`: ", e.message) }
+        }
+        i++
+    }
+    null
+}
+
+/**
+ * The C header (`.h`) for an `abi="c"` artifact (FFI-D, KP11): PURE TEXT — a real C prototype per exported
+ * function, needing no C preprocessor beyond the `<stdint.h>`/`<stdbool.h>` fixed-width typedefs. A C
+ * consumer `#include`s it and calls the exported symbols. The gate (`check_ffi_export`) must pass first, so
+ * every signature here is FFI-safe by construction. Const `#define`s and aggregate typedefs are a later
+ * crumb (honest-stop): this slice's header is functions-only.
+ *
+ * @param prog  the checked program of the `abi="c"` artifact
+ * @return      the header source text
+ * @throws      when an exported signature is not FFI-safe (should not occur after the gate)
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+pub fn emit_c_header(prog: checker::TProgram) -> str | error {
+    mut b: []byte = teko::list::empty()
+    b = cb(b, "/* generated by teko — reverse-FFI C header (abi=\"c\"); do not edit */\n")
+    b = cb(b, "#ifndef TEKO_EXPORT_H\n")
+    b = cb(b, "#define TEKO_EXPORT_H\n")
+    b = cb(b, "#include <stdint.h>\n")
+    b = cb(b, "#include <stdbool.h>\n\n")
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.vis == parser::Visibility::Exp {
+                    b = match emit_c_header_proto(b, f) { []byte as o => o; error as e => return e }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    b = cb(b, "\n#endif\n")
+    str(b)
+}
+
+/**
+ * Append one exported function's C prototype (`<ret> <sym>(<params>);`) to the header buffer.
+ *
+ * @param buf  the header buffer
+ * @param f    the exported function
+ * @return     the buffer with the prototype appended
+ * @throws     when a part of the signature is not FFI-safe
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn emit_c_header_proto(buf: []byte, f: checker::TFunction) -> []byte | error {
+    mut out = buf
+    let ret = match ffi_ctype_of_type(f.return_type) { str as s => s; error as e => return e }
+    out = cb(out, ret)
+    out = cb(out, " ")
+    out = cb(out, cg_c_export_symbol(f))
+    out = cb(out, "(")
+    out = match emit_c_header_params(out, f) { []byte as o => o; error as e => return e }
+    cb(out, ");\n")
+}
+
+/**
+ * Append an exported function's parameter list (C types + names), or `void` for a zero-parameter function.
+ *
+ * @param buf  the header buffer
+ * @param f    the exported function
+ * @return     the buffer with the parameter list appended
+ * @throws     when a parameter type is not FFI-safe
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn emit_c_header_params(buf: []byte, f: checker::TFunction) -> []byte | error {
+    mut out = buf
+    if f.params.len == 0 { return cb(out, "void") }
+    mut i: u64 = 0
+    loop {
+        if i >= f.params.len { break }
+        if i > 0 { out = cb(out, ", ") }
+        let ct = match ffi_ctype_of_typeexpr(f.params[i].type_ann) { str as s => s; error as e => return e }
+        out = cb(out, ct)
+        out = cb(out, " ")
+        out = cb_ident(out, f.params[i].name)
+        i++
+    }
+    out
+}
+
+/**
+ * The C-ABI export WRAPPER definitions (FFI-D, .30 codegen — the transitional C emitter). For each `exp`
+ * function, a plain C-ABI function under its export symbol that forwards to the internal `__`-mangled Teko
+ * symbol: `int64_t demo_add(int64_t a, int64_t b) { return demo__add(a, b); }`. The wrapper decouples the
+ * C-facing (single-underscore / `exp("…")`) name from the internal mangle, so internal Teko callers are
+ * untouched. Base-slice signatures are scalar/`void` only, so the FFI C types equal the internal scalar C
+ * types and no casts are needed. Appended after the main translation unit (every internal symbol is already
+ * prototyped). Own-backend object-symbol emission + `.a`/`.so` packaging is the honest-stop (own linker,
+ * KC3); this text is the C-backend transitional path the design keeps for .30/.31.
+ *
+ * @param prog  the checked program of the `abi="c"` artifact
+ * @return      the wrapper C source text ("" when the artifact exports nothing)
+ * @throws      when an exported signature is not FFI-safe (should not occur after the gate)
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+pub fn cg_c_export_wrappers_text(prog: checker::TProgram) -> str | error {
+    mut b: []byte = teko::list::empty()
+    b = cb(b, "\n/* reverse-FFI C-ABI export wrappers (abi=\"c\") */\n")
+    mut i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            checker::TFunction as f => {
+                if f.vis == parser::Visibility::Exp && !f.is_extern {
+                    b = match cg_c_export_wrapper_one(b, f) { []byte as o => o; error as e => return e }
+                }
+            }
+            _ => { }
+        }
+        i++
+    }
+    str(b)
+}
+
+/**
+ * Emit one export wrapper definition (`<ret> <sym>(<params>) { [return] <internal>(<args>); }`).
+ *
+ * @param buf  the wrapper buffer
+ * @param f    the exported function
+ * @return     the buffer with the wrapper appended
+ * @throws     when a part of the signature is not FFI-safe
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn cg_c_export_wrapper_one(buf: []byte, f: checker::TFunction) -> []byte | error {
+    mut out = buf
+    let ret = match ffi_ctype_of_type(f.return_type) { str as s => s; error as e => return e }
+    out = cb(out, ret)
+    out = cb(out, " ")
+    out = cb(out, cg_c_export_symbol(f))
+    out = cb(out, "(")
+    out = match emit_c_header_params(out, f) { []byte as o => o; error as e => return e }
+    out = cb(out, ") { ")
+    if ret != "void" { out = cb(out, "return ") }
+    out = cb_fn_name(out, f.namespace, f.name)
+    out = cb(out, "(")
+    mut i: u64 = 0
+    loop {
+        if i >= f.params.len { break }
+        if i > 0 { out = cb(out, ", ") }
+        out = cb_ident(out, f.params[i].name)
+        i++
+    }
+    cb(out, "); }\n")
+}
+
+/**
+ * Whether `needle` is already present in `xs` (the export-collision membership test).
+ *
+ * @param xs      the accumulated C symbols
+ * @param needle  the candidate C symbol
+ * @return        true iff `needle` equals some element of `xs`
+ * @since 0.3.0.30 (FFI base — reverse-FFI export)
+ */
+fn ffi_str_in(xs: []str, needle: str) -> bool {
+    mut i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == needle { return true }
+        i++
+    }
+    false
+}
