@@ -1,19 +1,19 @@
 // core_teko.mc -- the taught compiler's own main(), naming the parts of
 // D64.1 (docs/design/plano-ngen-entrega4.md §64) instead of the whole
 // `<mc/core>` bundle: `<mc/core_min>` comes from `[compiler].core` in
-// `mc.toml` (this file assumes it is already included), and this file adds
+// `teko.toml` (this file assumes it is already included), and this file adds
 // the four parts teko actually uses --
 //
 //   <mc/core_machines>  arm64 and x86-64, both machines every CI leg needs
 //   <mc/core_writers>   macho/backend_exe, backend_elf/backend_elf_exe,
 //                       backend_coff -- every writer a leg links with
 //   <mc/core_build>     `mc build --entry-only`, what the CI (and this
-//                       file's own `mc.toml`) compiles each fixture with
+//                       project's own `teko.toml`) compiles each fixture with
 //   <mc/core_bundle>    `#include <name>`, which `lib/rt.tk` needs for
 //                       `<sys>`
 //
 // `<mc/core_pkg>` and `<mc/core_sandbox>` are left out on purpose: nothing
-// under `ngen/` calls `mc pkg`, `mc update` or `mc sandbox`, and no fixture
+// in this repository calls `mc pkg`, `mc update` or `mc sandbox`, and no fixture
 // exercises them either. `main()` below is `src/main.mc`'s own list with
 // those two omitted and `mc_pkg_init()`/`mc_sandbox_init()` gone with them.
 //

@@ -80,8 +80,9 @@ Efeitos: split + rebase mudam os bytes de `mc.toml` → nova tree hash (sem cons
 publicação); o `awk` que remove `[linker]` passa a derivar de `teko.toml` e o config do CI deixa de
 carregar `[package]` inútil; `release.yml` segue lendo `check`/`lib` de `mc.toml` (só some o prefixo).
 
-**Pergunta ao mc (fork g4):** com a raiz = lib `teko`, o tool `tekoc` precisa de segundo manifesto —
-o registro aceita dois subpaths do mesmo repo (raiz e `tool/`) ou o tool vai para outro repo?
+**Nomes ratificados (dono, 2026-09-06):** a raiz é a **lib `teko`**; o compilador ensinado será a
+ferramenta **`tekoc`**, com manifesto próprio num **subpath** deste repositório — em crumb próprio,
+depois. O passo 4 **não** cria esse manifesto; só registra o rumo.
 
 ## 4. Ordem (branch única, um commit por passo, CI verde a cada passo)
 
@@ -100,7 +101,19 @@ o registro aceita dois subpaths do mesmo repo (raiz e `tool/`) ou o tool vai par
    (prova de que o `mv` não move byte de `[package].files`) e `6e6bb5df…` com os quatro
    comentários do `mc.toml` que diziam `ngen` corrigidos.
 4. **Split do manifesto** (`mc.toml` = `[package]`; `teko.toml` = build; CI deriva de `teko.toml`) —
-   gate: 5 pernas + `bootstrap.sh` + pré-voo do `check` no `release.yml`.
+   gate: 5 pernas + `bootstrap.sh` + pré-voo do `check` no `release.yml`. **✔ FEITO**
+   (`ngen/rebase-4-split`): `mc.toml` ficou com `[package]` + cabeçalho curto, **sem `[project]` e
+   sem `module =`** (chave que o mc ignora, D230); `teko.toml` novo carrega
+   `[project]/[target]/[compiler]/[linker]/[limits]/[include]` idênticos aos de antes — o
+   `[include]` é chave de BUILD, e o pacote continua fechado sobre `files` porque nenhum
+   `#include` da árvore depende dele. `mc build .` recusa com `missing key: project.entry`, como
+   no mc. Derivam do `teko.toml`: `ngen.yml` (o `awk` do `[linker]` + os `sed` de `[target]`),
+   `scripts/bootstrap.sh` (inclusive o guard de raiz e o `--linker-toml`), `scripts/measure.sh` e
+   as receitas do `README.md`/`HANDOFF.md` §4; o `release.yml` segue lendo `check`/`lib` do
+   `mc.toml`. Como o hash de `files` mudaria de qualquer forma, entraram junto os **30 comentários
+   de 19 ficheiros de código** que ainda diziam `ngen/…` (só texto: o `--dump-ast` das 45 fixtures
+   é byte-idêntico ao da base `ff4303f0`). `mc pkg hash .` =
+   `8dd22e12f2ebc451817e6dcca7613c98e6bc4d3a028c84641a6033fe9586b3b6`.
 5. **Docs**: `README.md` raiz (do `ngen/README.md`), `HANDOFF.md` na raiz, `CLAUDE.md` novo,
    `CONTRIBUTING.md`; nota de rebase nos `docs/design/*` (sem reescrever histórico).
 
