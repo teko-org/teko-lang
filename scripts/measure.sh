@@ -6,10 +6,10 @@
 # from (D64.1) can quote a real number instead of a guess.
 #
 # BINARY is the compiler `mc build` produced (`[compiler].out`, e.g.
-# `ngen/build/teko`); CONFIG is the `mc.toml`-shaped file `mc build`/
-# `mc limits` read (host-derived, per HANDOFF.md §4 -- never `ngen/mc.toml`
+# `build/teko`); CONFIG is the `mc.toml`-shaped file `mc build`/
+# `mc limits` read (host-derived, per HANDOFF.md §4 -- never `mc.toml`
 # itself, which targets the CI's linux/x86_64 leg); DIR is the project
-# directory `mc limits` reads, default `ngen`.
+# directory `mc limits` reads, default `.` (the repository root).
 #
 # Sections come from `mc --dump-syms` on the GENERATED glue source
 # (`BINARY.mc`, `#include <mc/host>` + the parts + the modules) -- the same
@@ -23,7 +23,7 @@
 
 binary="$1"
 config="$2"
-dir="${3:-ngen}"
+dir="${3:-.}"
 
 if [ -z "$binary" ] || [ -z "$config" ]; then
     echo "usage: measure.sh BINARY CONFIG [DIR]" >&2

@@ -1,10 +1,10 @@
 name: ngen (mc) CI
 
-# Builds and tests `ngen/` -- the teko-over-mc port (docs/design/port-teko-mc.md,
-# DECISION_LOG.md D211/D212/D213) -- with the mc toolchain (github.com/minicompiler/mc)
-# PINNED to `ngen/MC_VERSION` (ngen/HANDOFF.md §3.2). `src/` is frozen (D211/D212):
-# the escada gen0->gen3 this repository's other workflows run is irrelevant to
-# `ngen/` and is deliberately NOT run here.
+# Builds and tests the repository ROOT -- the teko-over-mc port that used to
+# live in `ngen/` (docs/design/port-teko-mc.md, DECISION_LOG.md D211/D212/D213)
+# -- with the mc toolchain (github.com/minicompiler/mc) PINNED to `MC_VERSION`
+# (HANDOFF.md §3.2). The old compiler's tree and the escada gen0->gen3 that went
+# with it are gone (docs/design/plano-rebase-raiz.md), so nothing else is run here.
 #
 # FIVE NATIVE LEGS (dono 2026-09-04): linux/x86_64, linux/aarch64, macos/aarch64,
 # windows/x86_64 and windows/aarch64. Each one runs on a runner of its own
@@ -19,7 +19,7 @@ name: ngen (mc) CI
 # (`mc build ngen && run`) and fails if any leg failed.
 #
 # The SIXTH job is `fixpoint` (S4.3, S4.3b): the self-hosting ladder teko0 ->
-# teko1 -> teko2 -> teko3 over `ngen/mc_teko.tk`, on the SAME FIVE PAIRS. It
+# teko1 -> teko2 -> teko3 over `mc_teko.tk`, on the SAME FIVE PAIRS. It
 # proves a different thing from the legs -- that the compiler reproduces itself,
 # not that a fixture exits 42 -- and it is deliberately NOT wired into the
 # aggregator: `mc build ngen && run` is the name the ruleset requires and its
@@ -88,7 +88,7 @@ jobs:
           # called (`arm64`). They differ, so both are written out.
           #
           # `config` is what the leg appends to the generated `mc.toml`: the
-          # linker (and, on Windows, the sysroot) that `ngen/mc.toml`'s own
+          # linker (and, on Windows, the sysroot) that `mc.toml`'s own
           # `[linker]` is replaced with. macOS appends NOTHING -- with no
           # `[linker]` the built-in `macho-exe` backend writes and signs the
           # executable itself (docs/guide/50-cross-compile.md), which is the
@@ -187,7 +187,7 @@ jobs:
           persist-credentials: false
 
       # `.github/actions/setup-mc` resolves the mc release PINNED by
-      # `ngen/MC_VERSION`, downloads the asset for this pair, verifies the
+      # `MC_VERSION`, downloads the asset for this pair, verifies the
       # `.sha256` and asserts `mc --host`; it exports `MC` for the steps below.
       # The fixpoint job uses the very same action, so the two never test
       # different compilers.
@@ -213,7 +213,7 @@ jobs:
           arch: ${{ matrix.arch }}
           mc: ${{ steps.mc.outputs.mc }}
 
-      # `ngen/mc.toml` is the single source of truth and is never edited: the
+      # `mc.toml` is the single source of truth and is never edited: the
       # leg config is DERIVED from it, so `[project]`, `[compiler]`, `[include]`
       # and `[limits]` can never drift between the five legs. Only the machine
       # and the way it links change -- `[target] os`/`arch`, the `.exe` suffix
@@ -224,51 +224,51 @@ jobs:
           MC_VERSION: ${{ steps.mc.outputs.version }}
         run: |
           set -eu
-          printf '%s' "$MC_TARGET_TAIL" >ngen/mc.target-tail
+          printf '%s' "$MC_TARGET_TAIL" >mc.target-tail
           # `[target].libc` changed meaning in the post-M42 patch (mc >= 0.12.1):
           # a soname ("libc.so.6") became a family ("gnu"|"musl"), and the old
-          # spelling is refused. `ngen/MC_VERSION` can move across that line,
+          # spelling is refused. `MC_VERSION` can move across that line,
           # so this still picks the spelling by the resolved version.
           if [ -n "$MC_LIBC_FAMILY" ]; then
             if [ "$(printf '%s\n%s\n' 0.12.1 "$MC_VERSION" | sort -V | head -n1)" = "0.12.1" ]; then
-              printf 'libc   = "%s"\n' "$MC_LIBC_FAMILY" >>ngen/mc.target-tail
+              printf 'libc   = "%s"\n' "$MC_LIBC_FAMILY" >>mc.target-tail
             else
-              case "$MC_LIBC_FAMILY" in gnu) printf 'libc   = "libc.so.6"\n' >>ngen/mc.target-tail ;; musl) printf 'libc   = "libc.so"\n' >>ngen/mc.target-tail ;; esac
+              case "$MC_LIBC_FAMILY" in gnu) printf 'libc   = "libc.so.6"\n' >>mc.target-tail ;; musl) printf 'libc   = "libc.so"\n' >>mc.target-tail ;; esac
             fi
           fi
-          awk '/^\[/ { skip = ($0 == "[linker]") } !skip' ngen/mc.toml \
+          awk '/^\[/ { skip = ($0 == "[linker]") } !skip' mc.toml \
             | sed -e "s#^os   = .*#os   = \"$MC_OS\"#" \
                   -e "s#^arch = .*#arch = \"$MC_ARCH\"#" \
                   -e "s#^out   = .*#out   = \"build/teko-hello$EXE\"#" \
-            | sed -e "/^arch = /r ngen/mc.target-tail" \
-            >ngen/mc.ci.toml
-          rm -f ngen/mc.target-tail
-          printf '\n%s\n' "$MC_CONFIG_TAIL" >>ngen/mc.ci.toml
-          cat ngen/mc.ci.toml
+            | sed -e "/^arch = /r mc.target-tail" \
+            >mc.ci.toml
+          rm -f mc.target-tail
+          printf '\n%s\n' "$MC_CONFIG_TAIL" >>mc.ci.toml
+          cat mc.ci.toml
 
-      - name: mc build ngen
+      - name: mc build .
         run: |
           set -eu
-          "$MC" build ngen --config ngen/mc.ci.toml
+          "$MC" build . --config mc.ci.toml
 
       - name: run tests/hello.tk, expect exit 42
         run: |
           set +e
-          "ngen/build/teko-hello$EXE"
+          "build/teko-hello$EXE"
           rc=$?
           set -e
           if [ "$rc" -ne 42 ]; then
-            echo "::error::ngen/build/teko-hello$EXE exited $rc, expected 42" >&2
+            echo "::error::build/teko-hello$EXE exited $rc, expected 42" >&2
             exit 1
           fi
-          echo "ngen/build/teko-hello$EXE exited 42, as expected"
+          echo "build/teko-hello$EXE exited 42, as expected"
 
       - name: run the primitives, types and surface fixtures
         # `mc --exe` always emits a Mach-O (`minicompiler/mc` src/main.mc:227
         # hardcodes `bname = "macho-exe"`, ignoring host and [target]), so
         # compiling a fixture with `teko --exe` produced an unrunnable
         # binary off macOS (ENOEXEC, exit 126). The only path that honours
-        # `[target]` and `[linker]` is the one `mc build ngen` itself used for
+        # `[target]` and `[linker]` is the one `mc build .` itself used for
         # tests/hello.tk (docs/build.md `mc build DIR --config FILE`): a
         # `[project]` naming the fixture. Each fixture gets its own config,
         # generated here from the LEG config by swapping only
@@ -287,7 +287,7 @@ jobs:
         run: |
           set +e -u
           status=0
-          for src in ngen/tests/primitives_*.tk ngen/tests/types_*.tk ngen/tests/surface_*.tk; do
+          for src in tests/primitives_*.tk tests/types_*.tk tests/surface_*.tk; do
             name=$(basename "$src" .tk)
             want=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
             if [ -z "$want" ]; then
@@ -295,18 +295,18 @@ jobs:
               status=1
               continue
             fi
-            cfg="ngen/mc.$name.toml"
+            cfg="mc.$name.toml"
             sed -e "s#^entry = .*#entry = \"tests/$name.tk\"#" \
                 -e "s#^out   = .*#out   = \"build/$name$EXE\"#" \
-                ngen/mc.ci.toml >"$cfg"
-            if ! "ngen/build/teko$EXE" build ngen --config "$cfg" --entry-only; then
+                mc.ci.toml >"$cfg"
+            if ! "build/teko$EXE" build . --config "$cfg" --entry-only; then
               echo "::error::$src failed to compile" >&2
               status=1
               rm -f "$cfg"
               continue
             fi
             rm -f "$cfg"
-            "ngen/build/$name$EXE"
+            "build/$name$EXE"
             rc=$?
             if [ "$rc" -ne "$want" ]; then
               echo "::error::$src exited $rc, expected $want" >&2
@@ -339,9 +339,9 @@ jobs:
           if-no-files-found: error
 
   # The SIXTH job (docs/design/plano-ngen-entrega4.md §64(f) S4.3, §73): the
-  # self-hosting ladder, not the fixture suite. `ngen/scripts/bootstrap.sh` runs
-  # teko0 (`mc build ngen --compiler-only`, the stock mc) -> teko1 -> teko2 ->
-  # teko3, each one compiling `ngen/mc_teko.tk` with the compiler the previous
+  # self-hosting ladder, not the fixture suite. `scripts/bootstrap.sh` runs
+  # teko0 (`mc build . --compiler-only`, the stock mc) -> teko1 -> teko2 ->
+  # teko3, each one compiling `mc_teko.tk` with the compiler the previous
   # stage produced, and checks the three criteria of the plan's §64(f): `cmp` of
   # the OBJECTS teko2.o/teko3.o, an empty diff between the two `--dump-asm`
   # dumps, and teko1 compiling and running all 45 fixtures.
@@ -354,7 +354,7 @@ jobs:
   # linker is what makes `mc` write `<out>.o` and hand it over -- without one
   # the built-in executable backend writes the binary and no object at all, and
   # there is nothing to `cmp`. On linux and macOS that linker is
-  # `ngen/mc.toml`'s own `cc`, kept as it is. On Windows there is no `cc` and no
+  # `mc.toml`'s own `cc`, kept as it is. On Windows there is no `cc` and no
   # C runtime, so the matrix carries the leg's `lld-link` line and the script
   # takes it through `--linker-toml`, which replaces the `[linker]` block of the
   # derived config; the three files it links against come from the same
@@ -391,7 +391,7 @@ jobs:
             exe: ''
             linker: ''
           # `linker` is what `--linker-toml` feeds the script INSTEAD of
-          # `ngen/mc.toml`'s `[linker] cc`: on Windows `cc` is not a linker, and
+          # `mc.toml`'s `[linker] cc`: on Windows `cc` is not a linker, and
           # the ladder still needs one, because a linker is what makes `mc`
           # leave `<out>.o` on disk for the `cmp`. It is the same line the
           # native leg carries, against the same sysroot.
@@ -453,7 +453,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # The same action the Windows leg uses: `winstart.obj`, `mcrt.obj` and
-      # `kernel32.lib` under `ngen/build/sysroot/windows-<arch>`, which is what
+      # `kernel32.lib` under `build/sysroot/windows-<arch>`, which is what
       # the `[sysroot] path` of the matrix's `linker` block resolves to, plus
       # LLVM on `$PATH` and a `TMPDIR` the native `mc` can open.
       - name: build the Windows sysroot
@@ -480,17 +480,17 @@ jobs:
       # Times per stage, sizes of every object and binary, and the three
       # criteria are all printed by the script itself. `--linker-toml` is passed
       # only where the matrix carries a linker block -- everywhere else
-      # `ngen/mc.toml`'s own `[linker] cc` is what the derived configs keep.
+      # `mc.toml`'s own `[linker] cc` is what the derived configs keep.
       - name: teko0 -> teko1 -> teko2 -> teko3
         run: |
           set -eu
           if [ -n "$MC_LINKER" ]; then
-            printf '%s\n' "$MC_LINKER" >ngen/mc.linker.toml
-            cat ngen/mc.linker.toml
-            sh ngen/scripts/bootstrap.sh --os "${{ matrix.os }}" --arch "${{ matrix.arch }}" \
-              --linker-toml ngen/mc.linker.toml
+            printf '%s\n' "$MC_LINKER" >mc.linker.toml
+            cat mc.linker.toml
+            sh scripts/bootstrap.sh --os "${{ matrix.os }}" --arch "${{ matrix.arch }}" \
+              --linker-toml mc.linker.toml
           else
-            sh ngen/scripts/bootstrap.sh --os "${{ matrix.os }}" --arch "${{ matrix.arch }}"
+            sh scripts/bootstrap.sh --os "${{ matrix.os }}" --arch "${{ matrix.arch }}"
           fi
 
       # Reported, NOT gated: the `cmp` above already proves the fixed point
@@ -513,13 +513,13 @@ jobs:
               shasum -a 256 "$1" | cut -d' ' -f1
             fi
           }
-          mkdir -p ngen/build
+          mkdir -p build
           {
             printf '### fixpoint (%s/%s), mc %s\n\n' \
               "${{ matrix.os }}" "${{ matrix.arch }}" "${{ steps.mc.outputs.version }}"
             printf '| object | bytes | sha256 |\n|---|---:|---|\n'
             for o in "teko$EXE" "teko1$EXE.o" "teko2$EXE.o" "teko3$EXE.o"; do
-              f="ngen/build/$o"
+              f="build/$o"
               if [ -f "$f" ]; then
                 printf '| `%s` | %s | `%s` |\n' "$o" "$(wc -c <"$f" | tr -d ' ')" "$(sha256 "$f")"
               else
@@ -527,21 +527,21 @@ jobs:
               fi
             done
             printf '\nThe sha256 is reported, not gated.\n'
-          } >ngen/build/provenance.md
-          cat ngen/build/provenance.md >>"$GITHUB_STEP_SUMMARY"
-          cat ngen/build/provenance.md
+          } >build/provenance.md
+          cat build/provenance.md >>"$GITHUB_STEP_SUMMARY"
+          cat build/provenance.md
 
       - name: upload the fixpoint provenance
         if: inputs.package
         uses: actions/upload-artifact@v6
         with:
           name: provenance-${{ matrix.os }}-${{ matrix.arch }}
-          path: ngen/build/provenance.md
+          path: build/provenance.md
           if-no-files-found: error
 
       # higiene 4 item B: `teko1.o` was once seen differing between two runs of
       # the ladder on one machine, and it has not reproduced (44 runs, plano
-      # §74(c)). `teko0` (`ngen/build/teko`, the binary the stock mc writes) is
+      # §74(c)). `teko0` (`build/teko`, the binary the stock mc writes) is
       # in the table above for that reason -- an identical teko0 with a
       # different teko1.o is the compiler's own nondeterminism, a different one
       # is a different input. When stage 1 and stage 2 disagree, the readable
@@ -552,15 +552,15 @@ jobs:
         id: dumps
         run: |
           set -eu
-          o1="ngen/build/teko1$EXE.o"
-          o2="ngen/build/teko2$EXE.o"
+          o1="build/teko1$EXE.o"
+          o2="build/teko2$EXE.o"
           if [ ! -f "$o1" ] || [ ! -f "$o2" ]; then exit 0; fi
           if cmp -s "$o1" "$o2"; then exit 0; fi
-          mkdir -p ngen/build/dumps
-          "ngen/build/teko$EXE"  --dump-asm ngen/mc_teko.tk >ngen/build/dumps/teko0-asm.txt 2>&1 || true
-          "ngen/build/teko1$EXE" --dump-asm ngen/mc_teko.tk >ngen/build/dumps/teko1-asm.txt 2>&1 || true
-          diff ngen/build/dumps/teko0-asm.txt ngen/build/dumps/teko1-asm.txt \
-            >ngen/build/dumps/diff.txt 2>&1 || true
+          mkdir -p build/dumps
+          "build/teko$EXE"  --dump-asm mc_teko.tk >build/dumps/teko0-asm.txt 2>&1 || true
+          "build/teko1$EXE" --dump-asm mc_teko.tk >build/dumps/teko1-asm.txt 2>&1 || true
+          diff build/dumps/teko0-asm.txt build/dumps/teko1-asm.txt \
+            >build/dumps/diff.txt 2>&1 || true
           echo "archive=yes" >>"$GITHUB_OUTPUT"
 
       - name: upload the dumps
@@ -568,12 +568,18 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: fixpoint-dumps-${{ matrix.os }}-${{ matrix.arch }}
-          path: ngen/build/dumps
+          path: build/dumps
           retention-days: 14
 
   # The required check on `main` -- the name the ruleset asks for, kept while
   # the work moved into a five-way matrix. `needs.leg.result` is the matrix's
   # aggregate: `success` only when every leg succeeded.
+  #
+  # THE NAME STAYS LITERAL. The directory it names is gone -- the port is the
+  # repository root now and the legs run `mc build .` -- but a required check is
+  # matched by NAME: renaming this job makes `main`'s ruleset wait forever for a
+  # check nobody reports. Renaming it is a step of its own, taken together with
+  # the ruleset (docs/design/plano-rebase-raiz.md §5 R2).
   gate:
     name: mc build ngen && run
     needs: leg

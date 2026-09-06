@@ -3,8 +3,8 @@
 # fixpoint"): the fixed point of the SELF-HOSTED teko, in the protocol of the
 # `mc` repository's own `scripts/bootstrap.sh`.
 #
-#   teko0 = mc build ngen --config <cfg> --compiler-only     (the stock mc)
-#   teko1 = teko0 build ngen --config <cfg1> --entry-only     over mc_teko.tk
+#   teko0 = mc build . --config <cfg> --compiler-only     (the stock mc)
+#   teko1 = teko0 build . --config <cfg1> --entry-only     over mc_teko.tk
 #   teko2 = teko1 ...                                         over mc_teko.tk
 #   teko3 = teko2 ...                                         over mc_teko.tk
 #   cmp build/teko2.o build/teko3.o          <- the criterion, on the OBJECTS
@@ -23,37 +23,37 @@
 # with an absolute one the module treats every file as "outside the project"
 # and the `internal` check goes blind, D224):
 #
-#   sh ngen/scripts/bootstrap.sh                 # host from `mc --host`
-#   sh ngen/scripts/bootstrap.sh --os linux --arch x86_64
-#   sh ngen/scripts/bootstrap.sh --os windows --arch x86_64 \
-#       --linker-toml ngen/mc.linker.toml
+#   sh scripts/bootstrap.sh                 # host from `mc --host`
+#   sh scripts/bootstrap.sh --os linux --arch x86_64
+#   sh scripts/bootstrap.sh --os windows --arch x86_64 \
+#       --linker-toml mc.linker.toml
 #
 # `--os`/`--arch` name the pair OUT LOUD and are checked against `mc --host`:
 # the ladder RUNS every stage it builds, so a target that is not this machine is
 # refused rather than cross-built into something nothing can execute.
 #
-# `--linker-toml FILE` REPLACES `ngen/mc.toml`'s own `[linker]` with the blocks
+# `--linker-toml FILE` REPLACES `mc.toml`'s own `[linker]` with the blocks
 # in FILE -- `[sysroot]` and `[linker]` as the CI's Windows leg writes them.
 # Windows has no direct-executable backend and no C runtime, so `cc` is not a
 # linker there: the link is `lld-link` against a sysroot of three files
 # (`.github/actions/windows-sysroot`). Everywhere else the option is not passed
-# and `ngen/mc.toml`'s `[linker] cc` stands.
+# and `mc.toml`'s `[linker] cc` stands.
 #
 # `mc` has to already be on PATH -- this script never downloads one. The `mc`
 # the CI puts on PATH before this script runs is the version PINNED by
-# `ngen/MC_VERSION` (`cat ngen/MC_VERSION`, read by `.github/actions/setup-mc`;
-# `ngen/HANDOFF.md` §3.2/§4), so a local run against a different `mc` is
+# `MC_VERSION` (`cat MC_VERSION`, read by `.github/actions/setup-mc`;
+# `HANDOFF.md` §3.2/§4), so a local run against a different `mc` is
 # comparing against a different fixed point than CI's.
 #
-# Needs mc >= 0.15.10 (`ngen/MC_VERSION`): before it, `source_claim` hid the
+# Needs mc >= 0.15.10 (`MC_VERSION`): before it, `source_claim` hid the
 # prelude's `while`/`for` from the core sources once the dialect taught the same
 # lexeme (plano §70(f)); 0.15.10's TE_RULE fixed it and the ladder closes.
 #
-# The derived configs are written next to `ngen/mc.toml` (an entry path is
+# The derived configs are written next to `mc.toml` (an entry path is
 # resolved against the CONFIG's own directory, so a config in a scratch
-# directory cannot find `mc_teko.tk`) and removed on exit; `ngen/mc.toml`
+# directory cannot find `mc_teko.tk`) and removed on exit; `mc.toml`
 # itself is never touched. They always carry a `[linker]` block on purpose --
-# `ngen/mc.toml`'s own, or the one `--linker-toml` names: with a linker `mc`
+# `mc.toml`'s own, or the one `--linker-toml` names: with a linker `mc`
 # writes `<out>.o` and hands it over, which is what leaves the object on disk
 # for the `cmp`, and without one the built-in executable backend writes the
 # binary and no object at all.
@@ -82,16 +82,16 @@ if [ -n "$linker" ] && [ ! -f "$linker" ]; then
     exit 1
 fi
 
-if [ ! -f ngen/mc.toml ]; then
-    echo "FAIL: run from the repository root (ngen/mc.toml not found)" >&2
+if [ ! -f mc.toml ]; then
+    echo "FAIL: run from the repository root (mc.toml not found)" >&2
     exit 1
 fi
-if [ ! -f ngen/mc_teko.tk ]; then
-    echo "FAIL: ngen/mc_teko.tk not found" >&2
+if [ ! -f mc_teko.tk ]; then
+    echo "FAIL: mc_teko.tk not found" >&2
     exit 1
 fi
 if ! command -v mc >/dev/null 2>&1; then
-    echo "FAIL: no 'mc' on PATH (ngen/HANDOFF.md §4 installs it from the release)" >&2
+    echo "FAIL: no 'mc' on PATH (HANDOFF.md §4 installs it from the release)" >&2
     exit 1
 fi
 
@@ -120,16 +120,16 @@ fi
 exe=""
 if [ "$os" = "windows" ]; then exe=".exe"; fi
 
-teko0="ngen/build/teko$exe"
-teko1="ngen/build/teko1$exe"
-teko2="ngen/build/teko2$exe"
-teko3="ngen/build/teko3$exe"
+teko0="build/teko$exe"
+teko1="build/teko1$exe"
+teko2="build/teko2$exe"
+teko3="build/teko3$exe"
 
-cfg0="ngen/mc.boot0.toml"
-cfg1="ngen/mc.boot1.toml"
-cfg2="ngen/mc.boot2.toml"
-cfg3="ngen/mc.boot3.toml"
-cfgf="ngen/mc.bootfix.toml"
+cfg0="mc.boot0.toml"
+cfg1="mc.boot1.toml"
+cfg2="mc.boot2.toml"
+cfg3="mc.boot3.toml"
+cfgf="mc.bootfix.toml"
 asm2="${TMPDIR:-/tmp}/teko2.$$.asm"
 asm3="${TMPDIR:-/tmp}/teko3.$$.asm"
 out="${TMPDIR:-/tmp}/bootstrap.$$.out"
@@ -142,7 +142,7 @@ trap 'rm -f "$cfg0" "$cfg1" "$cfg2" "$cfg3" "$cfgf" "$asm2" "$asm3" "$out" "$err
 # the ladder's own: the taught compiler is written by the HOST's executable
 # backend (mc docs/build.md § [compiler]), whose ELF writer defaults the program
 # interpreter and the libc soname to musl -- so on a glibc machine stage 1 gets
-# `ngen/build/teko: not found` at exit 127, the loader's way of saying the
+# `build/teko: not found` at exit 127, the loader's way of saying the
 # interpreter named in the binary does not exist. The ladder RUNS every stage it
 # builds, so the loader THIS machine actually has is the oracle: named when it is
 # there, and on a musl machine nothing is appended and the musl defaults stand.
@@ -163,17 +163,17 @@ write_target_tail() {
     echo "-- glibc machine: [target] interp $loader, libc gnu --"
 }
 
-# `ngen/mc.toml` minus the `[linker]` block when one is being substituted; the
+# `mc.toml` minus the `[linker]` block when one is being substituted; the
 # whole file otherwise. Same `awk` the CI's leg config uses.
 base_config() {
     if [ -z "$linker" ]; then
-        cat ngen/mc.toml
+        cat mc.toml
         return 0
     fi
-    awk '/^\[/ { skip = ($0 == "[linker]") } !skip' ngen/mc.toml
+    awk '/^\[/ { skip = ($0 == "[linker]") } !skip' mc.toml
 }
 
-# derive CONFIG ENTRY OUT -- ngen/mc.toml with the host's own target and one
+# derive CONFIG ENTRY OUT -- mc.toml with the host's own target and one
 # stage's entry/output, the same `sed` shape HANDOFF.md §4 uses for a fixture
 derive() {
     base_config \
@@ -241,36 +241,36 @@ step() {
 }
 
 echo "=== S4.2 -- fixed point of the self-hosted teko: teko0 -> teko1 -> teko2 -> teko3 ==="
-echo "-- target $os/$arch, entry ngen/mc_teko.tk --"
+echo "-- target $os/$arch, entry mc_teko.tk --"
 write_target_tail
 
 t_total0=$(now)
 
-echo "-- stage 0: mc build ngen --compiler-only -> $teko0 --"
+echo "-- stage 0: mc build . --compiler-only -> $teko0 --"
 derive "$cfg0" "tests/hello.tk" "build/teko-hello$exe"
-step "mc builds teko0" mc build ngen --config "$cfg0" --compiler-only
+step "mc builds teko0" mc build . --config "$cfg0" --compiler-only
 echo "  size $teko0: $(size_of "$teko0") bytes"
 
 echo "-- stage 1: teko0 mc_teko.tk -> $teko1 --"
 derive "$cfg1" "mc_teko.tk" "build/teko1$exe"
-step "teko0 compiles mc_teko.tk" "$teko0" build ngen --config "$cfg1" --entry-only
+step "teko0 compiles mc_teko.tk" "$teko0" build . --config "$cfg1" --entry-only
 echo "  size $teko1.o: $(size_of "$teko1.o") bytes"
 echo "  size $teko1:   $(size_of "$teko1") bytes"
 
 echo "-- stage 2: teko1 mc_teko.tk -> $teko2 --"
 derive "$cfg2" "mc_teko.tk" "build/teko2$exe"
-step "teko1 compiles mc_teko.tk" "$teko1" build ngen --config "$cfg2" --entry-only
+step "teko1 compiles mc_teko.tk" "$teko1" build . --config "$cfg2" --entry-only
 echo "  size $teko2.o: $(size_of "$teko2.o") bytes"
 
 echo "-- stage 3: teko2 mc_teko.tk -> $teko3 --"
 derive "$cfg3" "mc_teko.tk" "build/teko3$exe"
-step "teko2 compiles mc_teko.tk" "$teko2" build ngen --config "$cfg3" --entry-only
+step "teko2 compiles mc_teko.tk" "$teko2" build . --config "$cfg3" --entry-only
 echo "  size $teko3.o: $(size_of "$teko3.o") bytes"
 
 echo "-- criterion 1: cmp $teko2.o $teko3.o --"
 if ! cmp "$teko2.o" "$teko3.o"; then
     echo "FAIL: teko2.o != teko3.o -- no fixed point" >&2
-    echo "diagnosis: diff <($teko2 --dump-asm ngen/mc_teko.tk) <($teko3 --dump-asm ngen/mc_teko.tk)" >&2
+    echo "diagnosis: diff <($teko2 --dump-asm mc_teko.tk) <($teko3 --dump-asm mc_teko.tk)" >&2
     exit 1
 fi
 echo "  ok: teko2.o == teko3.o"
@@ -281,7 +281,7 @@ echo "  ok: teko2.o == teko3.o"
 # what makes the NEXT one attributable without rerunning anything: teko0 is the
 # only stage the stock `mc` writes, so an identical teko0 with a different
 # teko1.o is a compiler nondeterminism, a different teko0 is a different input
-# (mc version, tree, or a stale ngen/build), and teko1.o == teko2.o says the
+# (mc version, tree, or a stale build), and teko1.o == teko2.o says the
 # ladder was already at the fixed point on its first turn.
 echo "-- provenance (reported, not gated) --"
 echo "  mc:       $(mc --version 2>&1 | head -1)"
@@ -296,8 +296,8 @@ else
 fi
 
 echo "-- criterion 2: --dump-asm of teko2 vs teko3 --"
-"$teko2" --dump-asm ngen/mc_teko.tk > "$asm2" 2>&1
-"$teko3" --dump-asm ngen/mc_teko.tk > "$asm3" 2>&1
+"$teko2" --dump-asm mc_teko.tk > "$asm2" 2>&1
+"$teko3" --dump-asm mc_teko.tk > "$asm3" 2>&1
 if ! diff "$asm2" "$asm3" > "$out"; then
     echo "FAIL: the two dumps differ" >&2
     head -40 "$out" >&2
@@ -308,12 +308,12 @@ echo "  ok: $(wc -l < "$asm2" | tr -d ' ') lines, diff empty"
 echo "-- criterion 3: teko1 compiles the fixtures --"
 pass=0
 fail=0
-for src in ngen/tests/*.tk; do
+for src in tests/*.tk; do
     n=$(basename "$src" .tk)
     want=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
     derive "$cfgf" "tests/$n.tk" "build/$n$exe"
-    if "$teko1" build ngen --config "$cfgf" --entry-only >"$out" 2>"$err"; then
-        "ngen/build/$n$exe"
+    if "$teko1" build . --config "$cfgf" --entry-only >"$out" 2>"$err"; then
+        "build/$n$exe"
         got=$?
     else
         got="build-fail"
