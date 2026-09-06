@@ -61,12 +61,12 @@ build paths share, so it is where the version constant lives.
   and pass it when compiling `teko_rt.c`. This is generic: a user building their project gets
   THEIR manifest's version; teko building itself gets `0.0.1.0-bootstrap`. Single source of
   truth = the project's own `.tkp`. No runtime file read.
-- **`src/env/env.tks`**: declare `pub extern fn version() -> str = "tk_rt_version" from "teko_rt"`
+- **`src/env/env.tks`**: declare `pub extern fn version(): str = "tk_rt_version" from "teko_rt"`
   so `main.tks` can call `teko::env::version()`; it lowers to the raw `tk_rt_version()` C call.
 - **`src/codegen/codegen.{c,tks}`**: add `version -> tk_rt_version` to the plain builtin map
   (mirrors the `os -> tk_rt_os` precedent, line ~2056), so the call lowers to `tk_rt_version()`
   in the generated main, regardless of extern-resolution order.
-- **`src/checker/scope.{c,tks}`**: add a `version` builtin_fn `() -> str` (mirrors `os`), so
+- **`src/checker/scope.{c,tks}`**: add a `version` builtin_fn `(): str` (mirrors `os`), so
   the call typechecks even via the builtin fallback path.
 
 `main.c` calls `tk_rt_version()` directly (already includes `driver.h`; add the teko_rt.h

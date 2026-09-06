@@ -346,7 +346,7 @@ former constructions that STAY until Phase B/C7; C4 only rewrites `T?` in ANNOTA
   `checker_test.tkt` (sfa/co 1019-1024, TCoalesce 1784, sfa+co 1936-1937, np_smc/sfa/co 3314-3434),
   `comptime_fold_test.tkt` (coalesce_use/safe_use 717-725), `spine_test.tkt` (1553-1554),
   `lower_test.tkt` (lwt_coalesce* / lwt_safe_field_access 1737-1795), `tkb_test.tkt` (TCoalesce 134-137),
-  `lir_interp_test.tkt` (iwt_coalesce_exit 494), `codegen_test.tkt` (TSafeFieldAccess/TCoalesce 1419-1451).
+  `lir_oracle_test.tkt` (iwt_coalesce_exit 494), `codegen_test.tkt` (TSafeFieldAccess/TCoalesce 1419-1451).
 
 **C6 — delete `T?` TYPE sugar.** [RITUAL] + [FIXPOINT].
 - Lexer: remove `TokenKind::Question` (`src/lexer/token.tks` 102) and its map entry
@@ -387,13 +387,12 @@ Now that no `OptionalType`/`TSafeFieldAccess`/`TCoalesce` produce it, `Optional`
 
 ---
 
-## 4. REGRESSION FIXTURES to add (inputs → expected exit, VM + native)
+## 4. REGRESSION FIXTURES to add (inputs → expected exit, native)
 
 Behavior-preservation (Phase A) is guarded by the SEVEN rewritten fixtures keeping their existing
 `EXPECT_EXIT` unchanged (np_oop, optionals, safe_field_access_class, lambda_opt_typedef,
 selfref_class_optional, native_gate_coercions, wasm_panic_hook). No new positive fixture is needed for
-the rewrite itself — the unchanged exit codes across the rewrite ARE the assertion, run in both the
-VM/self-test lane and the native `./bin/teko test .` lane.
+the rewrite itself — the unchanged exit codes across the rewrite ARE the assertion, run natively via `./bin/teko test .`.
 
 Add, after Phase B, to lock in ERADICATION — negative/expect-fail cases (each a minimal `.tkb`
 project whose BUILD must fail). Placement: the main gate's `[tests] regression = ["examples/regressions"]`
@@ -405,10 +404,10 @@ report that gap up to the integrator rather than inventing a lane. Each fixture:
 
 | new fixture | source (one-liner) | expected | asserts |
 |---|---|---|---|
-| `sugar_qmark_type_rejected`   | `fn f() -> i64? { 1 }`                | compile FAILS (lex error on `?`) | `T?` eradicated (C6) |
+| `sugar_qmark_type_rejected`   | `fn f(): i64? { 1 }`                | compile FAILS (lex error on `?`) | `T?` eradicated (C6) |
 | `sugar_qmark_field_rejected`  | `let y = x?.n`                        | compile FAILS (lex/parse on `?`) | `?.` eradicated (C5) |
 | `sugar_coalesce_rejected`     | `let y = a ?? 0`                      | compile FAILS (lex/parse on `?`) | `??` eradicated (C5) |
-| `sugar_slice_opt_rejected`    | `fn f(xs: []i64?) -> i64 { 0 }`      | compile FAILS               | element `?` eradicated (C6) |
+| `sugar_slice_opt_rejected`    | `fn f(xs: []i64?): i64 { 0 }`      | compile FAILS               | element `?` eradicated (C6) |
 
 Each carries an `EXPECT_EXIT` (non-zero compile failure) and, where the fail-lane supports it, an
 expected-message substring (`unexpected` / the lexer's stray-`?` message). These run under the same

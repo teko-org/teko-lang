@@ -64,7 +64,7 @@ Every claim below was read from the tree at authoring time.
   bytes** on the LP64 targets. This asymmetry (optional's 1-byte `bool` vs
   variant's 4-byte `enum`) is the crux of the representation analysis (§6).
 - **`null` literal lowering (LIR).** `lower.tks:4310-4314` `lower_null_lit`:
-  `null -> const_int 0` (a zero word). The VM/LIR path carries `null` as a zero
+  `null -> const_int 0` (a zero word). The LIR lowering carries `null` as a zero
   slot; the native C backend carries an optional as the `tk_opt` struct. There is
   **no** pointer niche-optimization in the C backend today (see §6).
 - **`error?` is the pervasive Result idiom.** 77 declarations in `src/` return
@@ -148,7 +148,7 @@ whole value. That is the single factual correction; everything else survives.
 ```
 mut valor: i32 | null = null        // Null widens into i32 | null
 let x: i32 | null | null = null     // idempotent — dedup to i32 | null
-fn find(k: str) -> Node | null      // absence as an ordinary member
+fn find(k: str): Node | null      // absence as an ordinary member
 let r: str | null | error = fetch() // triple union, no special-casing
 ```
 
@@ -575,7 +575,7 @@ Partly, and the residual gap must be reported plainly:
 
 The reason is fundamental: a statically-compiled native frame reserves the space
 a binding might need over its lifetime. The mental model where "null costs 1
-byte" holds LITERALLY in the VM (uniform boxed word slots — `lower.tks:4310`
+byte" held in the LIR design (uniform boxed word slots — `lower.tks:4310`
 already carries `null` as a zero word), and holds in the HEAP dimension natively
 (box-in-arena: null allocates nothing). It cannot hold for a native inline slot
 without dynamic stack resizing. **Recommendation to the owner: adopt "pay for the
@@ -695,7 +695,7 @@ net addition, `−` = net deletion, `±` = both (offsetting).
 | Checker | `checker/borrow.tks`,`spine.tks`,`revalidate.tks`,`check_modules.tks` | DELETE Optional arms; they fold into existing Variant arms | ± M (total) |
 | LIR | `lir/lower.tks` | ADD `null` lit → `Null` value; DELETE `lower_coalesce`/`lower_safe_field_access`/`lower_safe_method_call` | ± M |
 | Codegen | `codegen/codegen.tks` | ADD `tk_null`, uint8 tag + niche-filling + box-in-arena (≥16B) + `#inline` attr; DELETE the `tk_opt_*` former paths (folded into the unified `Variant`) | ± **L** |
-| Backends | native LIR isel / VM value model | `Null` value (1-byte / zero slot); niche-aware loads; box-in-arena + `#inline` | + M |
+| Backends | native LIR isel value model | `Null` value (1-byte / zero slot); niche-aware loads; box-in-arena + `#inline` | + M |
 | Stdlib + corpus | 77 `-> error?` + all `T?`/`?.`/`??`/`?.m()` | REQUIRED mechanical rewrite → `null \| error` / `T \| null` + `match`/`if` (THE biggest churn) | + **L** |
 | Tests | `tests/`, corpus fixtures | new regression fixtures (§8); delete operator fixtures | + M |
 
@@ -725,7 +725,7 @@ function shapes are contracts the implementer copies verbatim (full Javadoc).
 **Crumb 1 — add the `Null` type case (inert). S. RITUAL: fixpoint.
 BEHAVIOR-PRESERVING (no bytes change).** Add the case to `Type` (`type.tks:93`)
 plus an arm in every exhaustive `match` over `checker::Type` (type_eq /
-subst_type / type_mangle / codegen / VM / backends). Nothing produces `Null` yet.
+subst_type / type_mangle / codegen / backends). Nothing produces `Null` yet.
 
 ```
 /**
@@ -759,7 +759,7 @@ resolve to one type + one mangle (§3c). Nothing produces such a union yet.
  * @param members the deduped union members (source order)
  * @return the members with any `Null` moved to index 0
  */
-fn union_normalize_null(members: []checker::Type) -> []checker::Type
+fn union_normalize_null(members: []checker::Type): []checker::Type
 ```
 
 Fixture: `t/union_null_member.tks` — `let x: i32 | null = 0` / `= null` both
@@ -786,7 +786,7 @@ use). RITUAL: size probe + fixpoint.** Emit `tk_null` (1-byte). Teach the unifie
  * @return the niche-carrying member, or `null` if the union must be tagged
  * @throws error on an internally malformed member type
  */
-fn cg_union_niche_member(v: checker::Variant) -> checker::Type | null | error
+fn cg_union_niche_member(v: checker::Variant): checker::Type | null | error
 ```
 
 Size probe `t/repr_niche.tks`: `ClassRef|null`==8, `Ref<T>|null`==8, `ptr<T>|null`
@@ -812,7 +812,7 @@ that binding/field's codegen from box to inline-tag.
  * @param table the type table (recursion + size resolution)
  * @return null when `#inline` is legal; an error naming the ineligible class
  */
-fn inline_attr_eligible(t: checker::Type, table: TypeTable) -> error?
+fn inline_attr_eligible(t: checker::Type, table: TypeTable): error?
 ```
 
 Size probe `t/repr_box.tks`: `u128|null` slot ==8 (boxed) with zero heap for the
@@ -841,7 +841,7 @@ source and unchanged behavior.
  * @param table  the type table (to expand a named-variant target)
  * @return true iff a `Null` value is assignable into `target`
  */
-fn null_widens_into(target: checker::Type, table: TypeTable) -> bool
+fn null_widens_into(target: checker::Type, table: TypeTable): bool
 
 /**
  * narrow_on_eq_guard — the one genuinely new checker piece (§3f): if `cond` is
@@ -852,7 +852,7 @@ fn null_widens_into(target: checker::Type, table: TypeTable) -> bool
  * @param env  the current flow type-environment
  * @return the (then-env, else-env) overrides, or the unchanged env
  */
-fn narrow_on_eq_guard(cond: checker::TExpr, env: FlowEnv) -> BranchEnvs
+fn narrow_on_eq_guard(cond: checker::TExpr, env: FlowEnv): BranchEnvs
 ```
 
 Fixtures: `t/null_narrow_match.tks` + `t/null_narrow_ifguard.tks` (bare payload
@@ -868,7 +868,7 @@ so the rewrite changes source spelling only, not emitted bytes). RITUAL: fixpoin
 `match`/`if x != null`. After this crumb no source uses the legacy forms.
 
 Fixture: `t/error_union_migration.tks` — a representative `null | error` fn
-round-trips success (`null`) and failure (`error`) on both engines; and the whole
+round-trips success (`null`) and failure (`error`) natively; and the whole
 corpus rebuild is byte-identical to its C5 output.
 
 **Crumb 7 — DELETE the dead surface + the `Optional` former. M (net deletion).
@@ -888,7 +888,7 @@ RITUAL: full gate + fixpoint (final ratified end-state).** Confirm the
 `Optional{Void}` narrowing/inference sentinel is fully gone (its arms left with
 the case in C7) and that the SEPARATE empty-collection `Slice{Void}` sentinel is
 UNTOUCHED (`t/empty_slice_sentinel.tks` still infers). Full-Javadoc audit of every
-declaration touched across C1-C7 (W15 law). Whole-suite gate, VM + native.
+declaration touched across C1-C7 (W15 law). Whole-suite gate, native.
 
 ---
 
@@ -910,7 +910,7 @@ form physics allows (8-byte handle, zero heap when null). The two factual
 corrections the owner must accept: (1) §6.1 — `i32 | null` is `discriminant +
 i32`, not one byte; and (2) §6.6 — a mutable `u128 | null` inline slot can be
 8 bytes (boxed) or 32 (inline) but never 1 byte, because a native frame reserves
-lifetime-max space; "1 byte when null" holds literally only in the VM and, in
+lifetime-max space; "1 byte when null" held in the LIR design as a zero word, and, in
 spirit, as "zero heap when null" natively. R2 is now RELAXED (owner): bare
 `Ref<T>` stays never-null, `Ref<T> | null` is the explicit nullable form, and the
 mandatory NARROWING INVARIANT (§3d) keeps the bare-ref promise sound. The sentinel

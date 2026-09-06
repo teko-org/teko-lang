@@ -1,64 +1,34 @@
 use teko::lexer
 
-/**
- * Does the token at `pos` start a top-level declaration (`fn` or `type`)? Shared with
- * `parse_module` (R-main-c).
- *
- * @param []lexer::Token tokens  the token stream
- * @param u64 pos  the index to test
- * @return bool  true iff a `fn`/`type`/`extern` keyword starts there
- */
-fn is_decl_start(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_decl_start(tokens: []lexer::Token, pos: u64): bool {
     is_kind_at(tokens, pos, lexer::TokenKind::Fn) || is_kind_at(tokens, pos, lexer::TokenKind::Type) || is_kind_at(tokens, pos, lexer::TokenKind::Extern)
 }
 
-/**
- * The owning namespace's path for a `use`, stopping BEFORE a trailing grouped-import
- * `::[` (S1, the 0.1.0.0-beta remodel §3.1) rather than erroring on it like the shared
- * `parse_path` does. Mirrors `parse_path`'s segment loop exactly, except the loop breaks
- * (instead of demanding a name) when `::` is immediately followed by `[` — leaving the
- * cursor at that `::` so the caller can recognize the grouped form.
- *
- * @param []lexer::Token tokens  the token stream
- * @param u64 pos  the index of the path's first segment (an `Ident`)
- * @return Parsed<Path> | error  the parsed path plus the resume index (at the trailing `::[`, or past the
- *               last plain segment), or a parse error if no leading name is present
- */
-fn parse_use_path(tokens: []lexer::Token, pos: u64) -> Parsed<Path> | error {
+fn parse_use_path(tokens: []lexer::Token, pos: u64): Parsed<Path> | error {
     if !is_name_at(tokens, pos) { return err_at(tokens, pos, "expected a name") }
-    mut segs: []Segment = teko::list::empty()
-    segs = teko::list::push(segs, Segment { name = tokens[pos].text })
-    mut p = pos + 1
+    var segs: []Segment = []
+    segs = [..segs, Segment { name = tokens[pos].text }]
+    var p = pos + 1
     loop {
         if !is_kind_at(tokens, p, lexer::TokenKind::ColonColon) { break }
         if is_kind_at(tokens, p + 1, lexer::TokenKind::LBracket) { break }
         if !is_kind_at(tokens, p + 1, lexer::TokenKind::Ident) {
             return err_at(tokens, p + 1, "expected a name after '::'")
         }
-        segs = teko::list::push(segs, Segment { name = tokens[p + 1].text })
+        segs = [..segs, Segment { name = tokens[p + 1].text }]
         p = p + 2
     }
     Parsed<Path> { node = Path { segments = segs }; next = p }
 }
 
-/**
- * A grouped import's name list `[ A, B, … ]` (S1, the 0.1.0.0-beta remodel §3.1) — one or
- * more `Ident`s separated by `,`, terminated by `]`. Rejects an empty list, a missing
- * comma between names, and a trailing comma before `]`.
- *
- * @param []lexer::Token tokens  the token stream
- * @param u64 pos  the index of the first name (just past the opening `[`)
- * @return ParsedList<str> | error  the collected names in order plus the resume index (past the closing `]`),
- *               or a parse error for any malformed list
- */
-fn parse_use_name_list(tokens: []lexer::Token, pos: u64) -> ParsedList<str> | error {
+fn parse_use_name_list(tokens: []lexer::Token, pos: u64): ParsedList<str> | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::Ident) {
         return err_at(tokens, pos, "expected a name in a grouped `use` import")
     }
-    mut names: []str = teko::list::empty()
-    mut p = pos
+    var names: []str = []
+    var p = pos
     loop {
-        names = teko::list::push(names, tokens[p].text)
+        names = [..names, tokens[p].text]
         p = p + 1
         if is_kind_at(tokens, p, lexer::TokenKind::RBracket) { break }
         if !is_kind_at(tokens, p, lexer::TokenKind::Comma) {
@@ -72,27 +42,18 @@ fn parse_use_name_list(tokens: []lexer::Token, pos: u64) -> ParsedList<str> | er
     ParsedList<str> { items = names; next = p + 1 }
 }
 
-/**
- * A `use` declaration in any of its three forms: bare `use a::b::c`, aliased
- * `use a::b::c as alias`, or grouped `use a::b::[ X, Y ]` (S1, the 0.1.0.0-beta remodel
- * §3.1 — no alias on the grouped form). `pos` is at the `use` keyword.
- *
- * @param []lexer::Token tokens  the token stream
- * @param u64 pos  the index of the `use` keyword
- * @return Parsed<UseDecl> | error  the parsed `UseDecl` plus the resume index, or a parse error
- */
-fn parse_use(tokens: []lexer::Token, pos: u64) -> Parsed<UseDecl> | error {
-    let pp = match parse_use_path(tokens, pos + 1) { Parsed<Path> as x => x; error as e => return e }
+fn parse_use(tokens: []lexer::Token, pos: u64): Parsed<UseDecl> | error {
+    var pp = match parse_use_path(tokens, pos + 1) { Parsed<Path> as x => x; error as e => return e }
     if is_kind_at(tokens, pp.next, lexer::TokenKind::ColonColon) && is_kind_at(tokens, pp.next + 1, lexer::TokenKind::LBracket) {
-        let nl = match parse_use_name_list(tokens, pp.next + 2) { ParsedList<str> as x => x; error as e => return e }
+        var nl = match parse_use_name_list(tokens, pp.next + 2) { ParsedList<str> as x => x; error as e => return e }
         if is_kind_at(tokens, nl.next, lexer::TokenKind::As) {
             return err_at(tokens, nl.next, "a grouped `use` import takes no alias")
         }
         return Parsed<UseDecl> { node = UseDecl { path = pp.node; has_alias = false; alias = ""; names = nl.items }; next = nl.next }
     }
-    mut has_alias = false
-    mut alias = ""
-    mut p = pp.next
+    var has_alias = false
+    var alias = ""
+    var p = pp.next
     if is_kind_at(tokens, p, lexer::TokenKind::As) {
         if !is_kind_at(tokens, p + 1, lexer::TokenKind::Ident) {
             return err_at(tokens, p + 1, "expected a name after `as` in a `use`")
@@ -101,61 +62,64 @@ fn parse_use(tokens: []lexer::Token, pos: u64) -> Parsed<UseDecl> | error {
         alias = tokens[p + 1].text
         p = p + 2
     }
-    Parsed<UseDecl> { node = UseDecl { path = pp.node; has_alias = has_alias; alias = alias; names = teko::list::empty() }; next = p }
+    Parsed<UseDecl> { node = UseDecl { path = pp.node; has_alias = has_alias; alias = alias; names = [] }; next = p }
 }
 
-/**
- * The `use` header at the top of a file: zero or more `use` decls, separator-terminated.
- * Shared by `parse_main_file` and `parse_module`.
- *
- * @param []lexer::Token tokens  the token stream
- * @param u64 pos  the index to start scanning from (before the first `use`, or the header's
- *               own start)
- * @return ParsedList<UseDecl> | error  the parsed `use` decls plus the resume index where the body/decls begin, or
- *               a parse error
- */
-fn parse_use_header(tokens: []lexer::Token, pos: u64) -> ParsedList<UseDecl> | error {
-    mut p = skip_seps(tokens, pos)
-    mut uses: []UseDecl = teko::list::empty()
+fn parse_use_header(tokens: []lexer::Token, pos: u64): ParsedList<UseDecl> | error {
+    var p = skip_trivia(tokens, pos)
+    var uses: []UseDecl = []
     loop {
         if !is_kind_at(tokens, p, lexer::TokenKind::Use) { break }
-        let u = match parse_use(tokens, p) { Parsed<UseDecl> as x => x; error as e => return e }
-        uses = teko::list::push(uses, u.node)
+        var u = match parse_use(tokens, p) { Parsed<UseDecl> as x => x; error as e => return e }
+        uses = [..uses, u.node]
         p = u.next
         if !has_token(tokens, p) { break }
         if !is_sep(tokens, p) {
             return err_at(tokens, p, "expected ';' or a newline after a `use`")
         }
-        p = skip_seps(tokens, p)
+        p = skip_trivia(tokens, p)
     }
     ParsedList<UseDecl> { items = uses; next = p }
 }
 
+pub fn parse_main_file(tokens: []lexer::Token, pos: u64): Parsed<MainFile> | error {
+    var hdr = match parse_use_header(tokens, pos) { ParsedList<UseDecl> as x => x; error as e => return e }
+    var body = match fill_main_body(tokens, skip_trivia(tokens, hdr.next), 0) { ParsedList<@Statement()> as x => x; error as e => return e }
+    Parsed<MainFile> { node = MainFile { uses = hdr.items; body = body.items }; next = body.next }
+}
+
 /**
- * A `main.tks` file: the `use` header, then the VIRTUAL MAIN's body (statements). Rejects
- * any type/function declaration.
+ * Parse the remaining top-level statements of a virtual main, allocating the
+ * exact-sized array at end-of-input and writing each statement into its slot as
+ * the recursion unwinds — one parse pass, no per-iteration spread reallocation.
  *
- * @param []lexer::Token tokens  the token stream
- * @param u64 pos  the file start (0)
- * @return Parsed<MainFile> | error  the parsed `MainFile` plus the resume index, or a parse error
+ * @param tokens  the token stream being parsed
+ * @param p       index of the next statement, or of end-of-input
+ * @param filled  count of statements already parsed by outer frames
+ * @return        the exact-sized statement array and the index past the body
+ * @throws        when main.tks declares a type/function, or a statement is not
+ *                followed by ';' or a newline
  */
-pub fn parse_main_file(tokens: []lexer::Token, pos: u64) -> Parsed<MainFile> | error {
-    let hdr = match parse_use_header(tokens, pos) { ParsedList<UseDecl> as x => x; error as e => return e }
-    mut p = skip_seps(tokens, hdr.next)
-    mut body: []Statement = teko::list::empty()
-    loop {
-        if !has_token(tokens, p) { break }
-        if is_decl_start(tokens, p) {
-            return err_at(tokens, p, "main.tks is a virtual main: it may not declare types or functions (only `use` + statements)")
-        }
-        let s = match parse_statement(tokens, p) { Parsed<Statement> as x => x; error as e => return e }
-        body = teko::list::push(body, s.node)
-        p = s.next
-        if !has_token(tokens, p) { break }
-        if !is_sep(tokens, p) {
-            return err_at(tokens, p, "expected ';' or a newline after a statement")
-        }
-        p = skip_seps(tokens, p)
+fn fill_main_body(tokens: []lexer::Token, p: u64, filled: u64): ParsedList<@Statement()> | error {
+    if !has_token(tokens, p) {
+        var empty: [filled]@Statement() = []
+        return ParsedList<@Statement()> { items = empty; next = p }
     }
-    Parsed<MainFile> { node = MainFile { uses = hdr.items; body = body }; next = p }
+    if is_decl_start(tokens, p) {
+        return err_at(tokens, p, "main.tks is a virtual main: it may not declare types or functions (only `use` + statements)")
+    }
+    var s = match parse_statement(tokens, p) { Parsed<@Statement()> as x => x; error as e => return e }
+    var q = s.next
+    if !has_token(tokens, q) {
+        var last: [filled + 1]@Statement() = []
+        last[filled] = s.node
+        return ParsedList<@Statement()> { items = last; next = q }
+    }
+    if !is_sep(tokens, q) {
+        return err_at(tokens, q, "expected ';' or a newline after a statement")
+    }
+    var rest = match fill_main_body(tokens, skip_trivia(tokens, q), filled + 1) { ParsedList<@Statement()> as x => x; error as e => return e }
+    var items = rest.items
+    items[filled] = s.node
+    ParsedList<@Statement()> { items = items; next = rest.next }
 }

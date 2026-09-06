@@ -8,15 +8,15 @@ source: docs/design/ref-transparent-model.md, docs/design/marshall-spec.md, DECI
 
 **Tripartite + class exception:** values (structs, primitives, inline variants) are cheap-to-copy; references (classes, slices, optionals) are capability-passing. Classes are reference types. Plain refs `T` carry referent into scope; optionals `T?` sink to value (? → unwrap → T).
 
-**Mandatory ref modifier everywhere:** functions receiving class args use `ref` (receiver implicit; params explicit at call); same for stored borrows in structs (ref fields = borrowed pointers). `Ref<T>` internal (no user surface); capability-import model for Wasm.
+**Mandatory ref modifier everywhere:** functions receiving class args use `ref` (receiver implicit; params explicit at call); same for stored borrows in structs (ref fields = borrowed pointers). `Ref<T>` internal (no user surface); capability-import model at the module boundary.
 
-**Ref grafia:** everywhere in surface (param + field decls); `Ref<>` in internal C (VM/codegen); cap-2 safety invariant (two owning refs max per heap allocation; spine infers, checker validates); unbounded unsafe (explicit `unsafe` type modifier breaks the cap).
+**Ref grafia:** everywhere in surface (param + field decls); `Ref<>` in internal C (ROTA C / native codegen); cap-2 safety invariant (two owning refs max per heap allocation; spine infers, checker validates); unbounded unsafe (explicit `unsafe` type modifier breaks the cap).
 
 **Never-null refs:** `T` is guaranteed non-null (NULL ≠ absent); `T?` is the absence vessel. Bare `?` is narrowing (T → T?); methods return T or T? explicitly.
 
 **No narrowing through refs:** a ref to T? does not "become" T (no view-type). Stored borrow of optional field is rejected unless field + scope have matching lifetime (spine bounds).
 
-**Sigils unsafe-only:** `&`, `*` as untyped pointers only in `unsafe` code; safe code uses typed `T`, `ref T`, `T?`, `ptr<T>` (the last two explicit at unsafe boundary).
+**Sigils unsafe-only:** `&`, `*` as untyped pointers only in `unsafe` code; safe code uses typed `T`, `ref T`, `T?`, `ptr<T>` (the last two explicit at unsafe boundary). **RULING (owner 2026-07-29, literal):** "esquece &T, já expurgamos sigilos, somente utilizaveis como ponteiros crus sob unsafe" — the `&T` read-borrow (NOEMA model from `docs/design/memory-model-surface-comparison.html`) was evaluated during the multi-model design study and is now PERMANENTLY CLOSED. No type sigil returns to Teko. Safe borrowing uses the keyword `ref` (user surface); `Reference` / `Ref<T>` is the internal checker representation. Unsafe pointer access via `ptr<T>` in `unsafe` blocks. The comparison document records NOEMA as an alternative explored; Teko chose the 2×2 matrix (no immutable borrow).
 
 **No safe immutable borrow:** safe borrows are mutable (receiver/parameter); immutable requires `unsafe const ref` or value-copy. Immutability is not a safety property; it's an annotation (future).
 

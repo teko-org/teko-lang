@@ -1,66 +1,68 @@
-// src/io/io.tks   (namespace 'teko::io')
-//
-// teko::io — the host I/O surface: file read/write and console output primitives.
-// These are EXTERN declarations backed by the teko_rt C runtime (teko_rt.c / teko_rt.h).
-// The checker's builtin_fn (scope.c / scope.tks) resolves these by last-segment name;
-// this file is the canonical Teko materialization of those host-FFI entries (C7.3 — SUPREME RULE).
-//
-// Return types:
-//   str | error  → tk_ffi_sres  (ok + value + err)
-//   error?       → tk_ffi_ures  (ok + err; null = success)
-//   void         → bare C call
-//
-// The `from "teko_rt"` clause is informational — the library is always linked via the
-// root teko.tkp [extern.libs] entries; `from` does NOT drive the link step today (C7.1).
+/** teko::io::read_file — read `path` as UTF-8 text (TOTAL form, over read_stream).
+ * @return the file contents, or an error on failure. */
+exp fn read_file(path: str): str | error {
+    match read_stream(path) {
+        []byte as b => str_of_bytes(b)
+        error as e => e
+    }
+}
 
-// teko::io::read_file(path) — slurp the whole file as UTF-8 bytes (owned copy).
-// Returns the file contents as a str, or an error on failure (missing file, permissions, …).
-pub extern fn read_file(path: str) -> str | error = "tk_rt_read_file" from "teko_rt"
+/** teko::io::read_line — read one line from stdin (newline stripped); "" at EOF (check
+ * stdin_eof() to distinguish from a genuine blank line). */
+exp fn read_line(): str { teko::runtime::read_line() }
 
-/** (DT3) teko::io::read_line() — read one line from stdin (the trailing newline stripped).
-    Returns the line's text, or "" when stdin has no more input — check stdin_eof() right
-    after to tell that apart from a genuine blank line (a plain `str` return, not `str |
-    error`: a brand-new host primitive with an `error`-shaped surface needs the codegen
-    host-FFI lifter to already know its name, which the RELEASED bootstrap seed's frozen
-    codegen.c cannot learn post-release — see teko_rt.h's own note). */
-pub extern fn read_line() -> str = "tk_rt_read_line" from "teko_rt"
+/** teko::io::stdin_eof — whether the last read_line() call hit end of input. */
+exp fn stdin_eof(): bool { teko::runtime::stdin_eof() }
 
-/** (DT3) teko::io::stdin_eof() — did the LAST read_line() call hit real EOF (stdin fully
-    exhausted, no more input at all)? Read this after an empty read_line() result. */
-pub extern fn stdin_eof() -> bool = "tk_rt_stdin_eof" from "teko_rt"
+/** teko::io::read_stdin — read all of stdin until EOF. */
+exp fn read_stdin(): str { teko::runtime::read_stdin() }
 
-/** (#229) teko::io::read_stdin() — slurp all of stdin until EOF (owned copy), for `teko fmt -`.
-    A bare str (no error union, unlike read_file): a `str | error` extern needs a NEW per-name
-    codegen lift (emit_host_ffi) that the CURRENTLY RELEASED seed's compiler cannot lower yet
-    (the seed is one release behind the PR that adds it), so this — like read_line()/version()
-    — has no recoverable-error channel; a genuine read failure panics. */
-pub extern fn read_stdin() -> str = "tk_rt_read_stdin" from "teko_rt"
+/** teko::io::write_file — (over)write `path` with `content` (TOTAL form, over write_stream).
+ * @return null on success, or the failure. */
+exp fn write_file(path: str, content: str): error | null {
+    write_stream(path, content.bytes())
+}
 
-// teko::io::write_file(path, content) — (over)write the file at `path` with `content`.
-// Returns error? (null = success, non-null = error with message).
-pub extern fn write_file(path: str, content: str) -> error | null = "tk_rt_write_file" from "teko_rt"
+/** teko::io::append_file — append `content` to the file at `path`, creating it when absent
+ * (TOTAL form, over append_stream).
+ * @return null on success, or the failure. */
+exp fn append_file(path: str, content: str): error | null {
+    append_stream(path, content.bytes())
+}
 
-// teko::io::write_file_bytes(path, data) — write raw bytes to a file (C7.12: .tkl output).
-// Accepts a []byte slice, so binary data (e.g. ZIP archives) is written without UTF-8 reinterpretation.
-// Returns error? (null = success, non-null = error with message).
-pub extern fn write_file_bytes(path: str, data: []byte) -> error | null = "tk_rt_write_file_bytes" from "teko_rt"
+/** teko::io::write_file_bytes — write raw bytes to `path` (TOTAL form, over write_stream). */
+exp fn write_file_bytes(path: str, data: []byte): error | null {
+    write_stream(path, data)
+}
 
-// teko::io::write(s) — write exactly s.len bytes to stdout; no newline, no NUL.
-// (The host output FFI bottom; the runtime's print/println lower to this.)
-pub extern fn write(s: str) -> void = "tk_write" from "teko_rt"
+/** teko::io::read_file_bytes — read `path` as raw bytes (TOTAL form, over read_stream); the binary-asset
+ * companion of read_file that returns bytes rather than decoding UTF-8.
+ * @return the file bytes, or an error on failure. */
+exp fn read_file_bytes(path: str): []byte | error {
+    read_stream(path)
+}
 
-// teko::io::ewrite(s) — write exactly s.len bytes to stderr; no newline, no NUL.
-// (The host error-output FFI bottom; eprint/eprintln/panic lower to this.)
-pub extern fn ewrite(s: str) -> void = "tk_ewrite" from "teko_rt"
+/** teko::io::write — write `s` to stdout verbatim (no newline), captured into the running test's
+ * channel when one is open. */
+exp fn write(s: str) { teko::runtime::write(s) }
 
-// teko::io::print(s) — alias for write(s); conventional console print to stdout.
-pub extern fn print(s: str) -> void = "tk_print" from "teko_rt"
+/** teko::io::ewrite — write `s` to stderr verbatim (no newline), captured into the running test's
+ * channel when one is open. */
+exp fn ewrite(s: str) { teko::runtime::ewrite(s) }
 
-// teko::io::println(s) — write s to stdout followed by a single newline (0x0A).
-pub extern fn println(s: str) -> void = "tk_println" from "teko_rt"
+/** teko::io::print — write `s` to stdout, captured into the running test's channel when one is open. */
+exp fn print(s: str) { teko::runtime::print(s) }
 
-// teko::io::eprint(s) — write s to stderr; no newline.
-pub extern fn eprint(s: str) -> void = "tk_eprint" from "teko_rt"
+/** teko::io::println — write `s` to stdout followed by a newline, captured into the running test's
+ * channel when one is open. */
+exp fn println(s: str) { teko::runtime::println(s) }
 
-// teko::io::eprintln(s) — write s to stderr followed by a single newline (0x0A).
-pub extern fn eprintln(s: str) -> void = "tk_eprintln" from "teko_rt"
+/** teko::io::eprint — write `s` to stderr, captured into the running test's channel when one is open. */
+exp fn eprint(s: str) { teko::runtime::eprint(s) }
+
+/** teko::io::eprintln — write `s` to stderr followed by a newline, captured into the running test's
+ * channel when one is open. */
+exp fn eprintln(s: str) { teko::runtime::eprintln(s) }
+
+/** teko::io::flush — flush buffered stdout to the OS. */
+exp fn flush() { teko::runtime::flush() }

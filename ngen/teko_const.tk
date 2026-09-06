@@ -1,0 +1,184 @@
+// teko_const.tk -- `const` as sugar over the mc core's own `#define` (D218,
+// entrega 5: "the mc uses #define; build const as sugar"), spelled three ways:
+//
+//   const i64 N = 10;                 top level, program-wide, or, inside
+//                                      `namespace geo { }`, `geo__N`
+//   public const i64 MAX = 4;         a class/struct member, no slot at all --
+//                                      `Nome__MAX`, reached as `Nome.MAX` or
+//                                      bare from inside the type
+//   ... a function body ...           not taught (teko_stmt.tk's own
+//                                      `tk_stop_const`): `#define` is a single
+//                                      program-wide table, with no notion of a
+//                                      local's own scope
+//
+// `def_add` folds the declared expression ONCE, exactly where `#define` itself
+// would, and the CORE's own `parse_primary` already substitutes a bare
+// occurrence of the EXACT name it was given -- which is everything a plain,
+// unnamespaced, top-level `const` needs; nothing here duplicates that (a
+// `syntax()` handler producing zero declarations, the same shape mc's own
+// `enum` demo module gives its `#define`s, `mc docs/reference/hooks.md` §
+// `syntax()`). What the core's substitution cannot reach -- a QUALIFIED
+// reference (`geo.N`, `Nome.MAX`), a BARE one inside the namespace/type that
+// owns it, and a generic's own `const N: i64` bound, which reads a raw token
+// rather than an expression -- is what the two tables below answer, each
+// holding the SAME folded `i64` `def_add` already has, so a lookup never
+// re-parses or re-folds anything; it only rebuilds the `N_INT` node
+// `parse_primary` would have built, at the position that needs it.
+//
+// The declared TYPE (`i64`, `bool`, ...) is read and required to be a scalar
+// core/alias word (`p_type()` never matches a class/struct/interface/trait,
+// which are registered as plain words rather than `type_alias`, teko_ns.tk's
+// own header) but is otherwise DOCUMENTAL: the core's `#define` has no type of
+// its own -- every reference becomes `TY_I64`, `parse_primary`'s own choice --
+// so there is nothing to check the declared type against.
+
+uptr tk_ns_qualified_name(uptr nome);
+
+void tk_check_member(i64 owner, i64 vis, uptr m, i64 line, uptr fl);
+
+i64 tk_method_named_find(i64 ci, uptr name);
+
+// ---- top-level consts, program-wide (bare, or "__"-qualified by namespace) ----
+
+#define TK_MAXGCONST 128
+
+uptr gc_name[TK_MAXGCONST];           // the #define's own full ("__"-joined) name
+i64  gc_val[TK_MAXGCONST];
+i64  tk_ngconst = 0;
+
+uptr gc_name_at(i64 i) { return ld64(gc_name + i * 8); }
+i64  gc_val_at(i64 i)  { return ld64(gc_val + i * 8); }
+
+void set_gc_name_at(i64 i, uptr v) { st64(gc_name + i * 8, v); }
+void set_gc_val_at(i64 i, i64 v)   { st64(gc_val + i * 8, v); }
+
+// the index of the top-level const named `full` (its own "__"-joined name), or -1
+i64 tk_gconst_find(uptr full) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_ngconst) break;
+        if (str_eq(gc_name_at(i), full)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+void tk_gconst_add(uptr full, i64 val) {
+    if (tk_ngconst == TK_MAXGCONST) err_at(tk_file, tk_line, "teko: too many top-level consts");
+    set_gc_name_at(tk_ngconst, full);
+    set_gc_val_at(tk_ngconst, val);
+    tk_ngconst = tk_ngconst + 1;
+}
+
+// the `N_INT` a reference to top-level const `gi` becomes -- the very node
+// `parse_primary` builds for a `#define` it recognises by its own bare name
+i64 tk_gconst_node(i64 gi, i64 line, uptr fl) {
+    i64 n = node_new(N_INT, line, fl);
+    set_nd_val(n, gc_val_at(gi));
+    set_nd_type(n, TY_I64);
+    return n;
+}
+
+// `const i64 N = 10;` at the top level: outside a namespace the name IS the
+// `#define`'s own name, so the core's `parse_primary` already answers every
+// bare use from here on and this handler produces no declaration at all --
+// `top_add(0)` is the same no-op `import`/`using`/`enum` already rely on
+// (mc `src/parse.mc`'s own `parse_top`/namespace-block loop). Inside a
+// namespace the name is qualified ahead of the `#define` (`geo__N`), which is
+// what lets `tk_ns_qualified_call` (`geo.N`) and `tk_ns_rewrite_ident` (a bare
+// `N` reached from inside `geo`, or through a `using`) find it again.
+void tk_const_top() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    p_next();                                     // the `const` word
+    i64 ty = p_type();
+    uptr name = p_ident();
+    p_expect(K_ASSIGN, "expected = after const");
+    i64 e = fold(parse_expr(0));
+    if (nd_kind(e) != N_INT) err_at(fl, line, "teko: const requires a constant expression");
+    p_expect(K_SEMI, "expected ; after const");
+    uptr full = tk_ns_qualified_name(name);
+    def_add(full, nd_val(e), line, fl);
+    tk_gconst_add(full, nd_val(e));
+}
+
+// ---- member consts: `public const i64 MAX = 4;`, `Nome__MAX`, no slot ----
+
+#define TK_MAXMCONST 128
+
+i64  mc_cls[TK_MAXMCONST];            // the class/struct that declares it
+uptr mc_name[TK_MAXMCONST];           // the member's own short name
+uptr mc_sym[TK_MAXMCONST];            // the #define's own symbol, "Tipo__Nome"
+i64  mc_val[TK_MAXMCONST];
+i64  mc_vis[TK_MAXMCONST];
+i64  tk_nmconst = 0;
+
+i64  mc_cls_at(i64 i)  { return ld64(mc_cls + i * 8); }
+uptr mc_name_at(i64 i) { return ld64(mc_name + i * 8); }
+uptr mc_sym_at(i64 i)  { return ld64(mc_sym + i * 8); }
+i64  mc_val_at(i64 i)  { return ld64(mc_val + i * 8); }
+i64  mc_vis_at(i64 i)  { return ld64(mc_vis + i * 8); }
+
+void set_mc_cls_at(i64 i, i64 v)  { st64(mc_cls + i * 8, v); }
+void set_mc_name_at(i64 i, uptr v) { st64(mc_name + i * 8, v); }
+void set_mc_sym_at(i64 i, uptr v)  { st64(mc_sym + i * 8, v); }
+void set_mc_val_at(i64 i, i64 v)  { st64(mc_val + i * 8, v); }
+void set_mc_vis_at(i64 i, i64 v)  { st64(mc_vis + i * 8, v); }
+
+// index into the const table of `name` declared by `ci` or by one of its
+// bases -- inherited exactly like a field, `tk_field_find`'s own shape
+i64 tk_mconst_find(i64 ci, uptr name) {
+    loop {
+        if (ci < 0) break;
+        i64 i = 0;
+        loop {
+            if (i >= tk_nmconst) break;
+            if (mc_cls_at(i) == ci && str_eq(mc_name_at(i), name)) return i;
+            i = i + 1;
+        }
+        ci = sr_base_at(ci);
+    }
+    return 0 - 1;
+}
+
+void tk_mconst_add(i64 ci, uptr name, uptr sym, i64 val, i64 vis) {
+    if (tk_nmconst == TK_MAXMCONST) err_at(tk_file, tk_line, "teko: too many consts");
+    set_mc_cls_at(tk_nmconst, ci);
+    set_mc_name_at(tk_nmconst, name);
+    set_mc_sym_at(tk_nmconst, sym);
+    set_mc_val_at(tk_nmconst, val);
+    set_mc_vis_at(tk_nmconst, vis);
+    tk_nmconst = tk_nmconst + 1;
+}
+
+// `Nome.MAX` and a bare `MAX` reached from inside the type alike: the same
+// visibility gate a field or method passes, then the `N_INT` a `#define`
+// would have folded to.
+i64 tk_mconst_use(i64 mi, i64 line, uptr fl) {
+    tk_check_member(mc_cls_at(mi), mc_vis_at(mi), mc_name_at(mi), line, fl);
+    i64 n = node_new(N_INT, line, fl);
+    set_nd_val(n, mc_val_at(mi));
+    set_nd_type(n, TY_I64);
+    return n;
+}
+
+// `public const i64 MAX = 4;` -- the modifiers (visibility, `const` itself)
+// are already read by `teko_class.tk`'s `tk_member_mods`; this reads the
+// type, the name, the value and registers both the real `#define` and the
+// row a static/bare access finds again. `static const` is refused before
+// this is ever reached (C#'s own rule: `const` already is one).
+i64 tk_member_const(i64 ci, i64 off, i64 vis, i64 ti) {
+    if (ti >= 0) err_at(tk_file, tk_line, "teko: a trait brings no const; only a class or struct declares one");
+    i64 ty = p_type();
+    uptr m = p_ident();
+    p_expect(K_ASSIGN, "expected = after const");
+    i64 e = fold(parse_expr(0));
+    if (nd_kind(e) != N_INT) err_at(tk_file, tk_line, "teko: const requires a constant expression");
+    p_expect(K_SEMI, "expected ; after const");
+    if (tk_mconst_find(ci, m) >= 0 || tk_field_find(ci, m) >= 0 || tk_method_named_find(ci, m) >= 0)
+        err_at2(tk_file, tk_line, "teko: a const and a member cannot share a name", m);
+    uptr sym = tk_join3(sr_name_at(ci), "__", m);
+    def_add(sym, nd_val(e), tk_line, tk_file);
+    tk_mconst_add(ci, m, sym, nd_val(e), vis);
+    return off;
+}

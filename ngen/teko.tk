@@ -1,0 +1,516 @@
+// teko.tk -- teko taught to `mc` from outside `src/`, in `ngen/` (not
+// `mc/examples/`, per the dono's 2026-09-04 ruling): entrega 2 teaches the
+// primitives on top of entrega 1's vertical slice. Not compiled as a
+// program: `mc build` links this INSIDE a compiler (`#include <mc/core>`
+// plus this file, docs/build.md § [compiler]) that then compiles a `.tk`
+// source.
+//
+// D213 (dono 2026-09-04): reuse the mc core's own syntax; teach only the
+// DELTA. `examples/lang` does not reimplement expressions/statements/types
+// either -- it adds classes/generics/interfaces on top of the base. So the
+// core's own spelling (`i64 name(params) { ... return e; }`, `if (c) {}`,
+// the whole Pratt grammar) IS the teko-over-mc spelling here; nothing in
+// this file re-teaches it.
+//
+// What entrega 1 added:
+//   bool                                                    type_alias  (M12)
+//   class interface namespace import using type              syntax      (M12, honest-stop)
+//   var const match when                                     syntax_stmt (M12, honest-stop)
+//   new                                                       syntax_expr (M21, honest-stop)
+//
+// What entrega 2 (this one) adds -- docs/design/port-teko-mc.md §3, all
+// `type_alias`/library wiring, no new syntax:
+//   char isize usize byte ptr str                            type_alias  (M12)
+//   f32 f64 (+ ldf64/ldf32/stf64/stf32/sqrt_f64/fabs/fmin/fmax) <float> (M24)
+//
+// What entrega 3 (tipos, D214) adds, one construct per commit -- `struct` (no
+// vtable, fields from offset 0), `class` (vtable at word 0, base-first fields,
+// `virtual`/`override`) and `interface` (no object at all: a table, and itab
+// dispatch through the class's vtable):
+//   struct Name { type field; ... }                          syntax      (M12)
+//   class Name [: Base][, Iface...] { fields, methods }      syntax      (M12)
+//   interface Name { T method(...); ... }                    syntax      (M12)
+//   trait Name { fields, methods }  +  use A, B;             syntax      (M12)
+//   new Name                                                  syntax_expr (M21)
+//   p.field, p.field = e, p.method(...)                       syntax_infix (M21)
+//   the N_VAR of a local of struct/class/interface type       on_stmt     (M21.5)
+//   { ... } -- every block, so the locals table has a scope   syntax_stmt (M21.5)
+//
+// What entrega 4's C8 adds -- generics with constants, by record and replay
+// (teko_generic.tk), which is what makes a bound a compile-time constant:
+//   class/struct Name<T, const N: i64> { ... }                p_skip_balanced
+//   Name<Circle, 4> x = new Name<Circle, 4>;                  p_push_source + p_subst_*
+//   T items[N]  /  x.items[i]                                 an inline array field
+//
+// and C7c makes `params` one of them -- a declaration generic in its COUNT,
+// instantiated per call site so the bound is a constant there too:
+//   i64 total(params xs) { ... xs_len ... xs[i] ... }          teko_params.tk
+//   total(1, 2)  ->  total__2(<two words>)                     one body per count
+// What entrega 5's C5b adds -- operator overloading as C# writes it, a STATIC
+// member naming both operands and resolved over both of them (teko_ops.tk):
+//   public static Vec operator+(Vec a, Vec b)                  a contextual word
+//   public static Vec operator+(i64 k, Vec v)                  the reversed form
+//   public static Vec operator-(Vec a)                         the unary form
+//   public static i64 operator==  /  operator!=                declared in pairs
+//   a + b  /  (a + b) == c  /  2 + v  /  -a                    pass() over
+//                                                              N_BINARY, N_UNARY
+// What entrega 4's C6 adds -- a default parameter value in a free
+// (top-level) function, unblocked by mc 0.10.3's `syntax_param`
+// (teko_default.tk):
+//   i64 add(i64 a, i64 b = 10) { return a + b; }              syntax_param
+//   add(1)                                                     pass() ->
+//                                                              add(1, 10)
+//   add(1) against an overload of `add` that needs no default  teko_over.tk's
+//                                                              own fourth round
+//
+// What entrega 5's member crumb adds (D220, teko_access.tk) -- C#'s modifiers,
+// with C#'s defaults (a type is `internal`, a member is `private`):
+//   public/internal before class/struct/interface/trait        syntax      (M12)
+//   public/private/protected/static on a member                read by tk_member
+//   Name.field, Name.field = e, Name.m(...)                    syntax_expr (M21)
+//   the statement either of those two opens                    syntax_stmt (M21.5)
+//
+// What entrega 5's property crumb adds (D223, teko_prop.tk) -- C#'s properties
+// and the interface C# 8 and C# 11 grew, both read by the machinery above:
+//   T Name { get; set; }  /  { get => e; set => s; }  /  { get { } }
+//   `value` inside a `set`, visibility per accessor, virtual/override/static
+//   p.Name, p.Name = e, Name (inside the type), Type.Name for a static one
+//   interface: T Name { get; set; }, a method WITH a body, `static abstract`
+//
+// What entrega 5's `abstract` crumb adds (D224) -- C#'s own abstract class:
+//   abstract class Shape { public abstract i64 area(); }      syntax (M12)
+//   an abstract member is a vtable slot with nothing in it, which the first
+//   concrete class of the chain has to fill with an `override`; `new Shape` is
+//   refused, and the class emits no vtable and no constructor at all
+//   partial class Shape { ... }   the same class, declared in more than one
+//   partial class Shape { ... }   place; a part after the first adds members to
+//                                 the row the first one opened, and the type
+//                                 closes at its first use or at the end of the
+//                                 unit -- a part written after that is refused
+//
+// What entrega 5's reclaim crumb adds (D218) -- the arena gives memory back, and
+// C#'s two members that say when:
+//   the object grows a reference count (word 1) and the vtable a release (word 0)
+//   public Name(params) { } / : base(args)                    a constructor
+//   ~Name() { }                                               a destructor
+//   new Name(args)                                            picks by signature
+//   the reference counting itself, injected over every body   pass (teko_rc.tk)
+//
+// What entrega 5's `while`/`do`/`for` crumb adds (D218/D221/D226,
+// teko_loop.tk) -- C#'s three loops, lowered at parse time to the core's own
+// `loop`/`if`/`break N` (kept, D221):
+//   while (c) stmt                                              syntax_stmt
+//   do stmt while (c);                                          syntax_stmt
+//   for (init; cond; step) stmt                                 syntax_stmt
+//   x++;  x--;  x += e;  x -= e;   (also a `for` loop's step)   word_add +
+//                                                               a pushed #rule
+//
+// What entrega 5's M45 crumb adds -- the unary `+` (teko_ops.tk's own
+// `tk_unary_plus`, the mc 0.13.0 release the `syntax_expr`/`parse_expr`
+// route came from) and the two boolean literals (teko_type.tk):
+//   +v  (a type declares `operator+(T a)`)                     syntax_expr,
+//   +i  (over a core type: the identity, `+i == i`)             pass()
+//   true  false                                                 syntax_expr
+//
+// What entrega 5's N1 crumb adds -- `namespace`/`using` and qualified type
+// names (teko_ns.tk; a free function inside a namespace stays plain, N2's):
+//   namespace A.B { class Circle { ... } }                      syntax
+//   namespace A.B;                          (file-scoped, C# 10)  syntax
+//   using geo;                                                  syntax
+//   Circle c = new Circle();  (the short name, inside or with a `using`)
+//   geo.Circle c = new geo.Circle();  geo.Circle.made           the segment
+//
+// What entrega 5's N2 crumb adds -- a free function declared inside a
+// namespace, mangled the same way a type already is (teko_ns.tk's own
+// `tk_ns_pass`):
+//   namespace geo { i64 area(i64 r) { ... } }                    geo__area
+//   geo.area(x)                              (qualified)         syntax_expr/
+//                                                                 syntax_stmt
+//   area(x)     (bare, from inside geo or through a `using geo;`) pass()
+//
+// What entrega 5's N3 crumb adds -- `import`, sugar over the core's own
+// `lex_include` plus an implicit `using` (teko_ns.tk's own `tk_import`):
+//   import parts.geo;             (once-only, "parts/geo.tk")      syntax
+//   Circle c = new Circle();  parts.geo.twice(x)  &twice           the
+//                              bare/qualified forms `using` already gives
+//
+// What entrega 5's `const` crumb adds -- a folded constant, sugar over the
+// core's own `#define` (D218, teko_const.tk):
+//   const i64 N = 10;                  top level, or `geo__N` in a namespace  syntax
+//   N  /  geo.N  (qualified)  /  N  (bare, from inside geo or a `using`)
+//   var x[N];                          array size: the core's own `#define` folding
+//   Box<Circle, N>                     a generic's own `const` bound (teko_generic.tk)
+//   public const i64 MAX = 4;          a class/struct member, no slot
+//   Nome.MAX  /  MAX (bare, inside)    the same two forms a static member takes
+//
+// What entrega 5's ternary crumb adds -- C#'s `c ? a : b`, associative to the
+// right, hoisted at a pass() to the `if`/local the core already lowers to
+// (D228, teko_ternary.tk):
+//   c ? a : b                          an initializer, a return, an argument   syntax_infix
+//   c1 ? a : c2 ? b : d                 right-associative, lazy either way
+//   while (c ? 1 : 0) { ... }           the hoist lands inside the loop's own body
+//
+// What entrega 5's `switch` crumb adds -- both of C#'s own spellings
+// (D222/D228, teko_switch.tk): the statement rebaixed at parse time to a
+// one-lap `loop`/`if` chain (teko_loop.tk's own shape), and the expression as
+// sugar over the ternary's own placeholder chain (D228, no machinery of its
+// own):
+//   switch (x) { case 1: ... break; case 2: case 3: ... break; default: ... }  syntax_stmt
+//   case N when cond:                   a guarded label; `default` moves last
+//   break; / break N;                    the switch counts as ONE loop level
+//   x switch { 1 => a, 2 or 3 => b, _ when c => d, _ => e }                    syntax_infix
+//
+// What entrega 5's K1 crumb adds -- a NAMED delegate (C#/D221 §41, not a
+// generic `Func<>`/`Action<>`), a typed pointer to a function, and `null`
+// (teko_deleg.tk):
+//   public delegate i64 Op(i64 a, i64 b);   the signature, at top level or in
+//                                            a namespace
+//   Op f = add;   Op g = new Op(add);       contextual and explicit wraps of a
+//                                            plain function, a thunk generated
+//                                            per (delegate, function) pair
+//   f(3, 4)                                 a typed `callp` through the
+//                                            object's own code pointer, a
+//                                            pass() over every N_CALL and
+//                                            teko_expr.tk's own field access
+//   Op f = null;   f == null                the null reference, an `N_INT` 0
+//
+// What §58's DI1/DI2 crumbs add (D229) -- a class names its own lifetime in
+// the list after `:`, `inject` resolves a service with no dependency of its
+// own at comptime (no runtime container), and constructor injection over the
+// dependency graph it names (teko_di.tk):
+//   class Clock : IClock, IServiceSingleton { ... }   a NAME, not a base
+//   IClock a = inject IClock;   Clock b = inject Clock;   both the same
+//                                                          instance
+//   class Repo : IServiceTransient {
+//       public Repo(IClock c) { ... }                     INJECTED BY
+//                                                          CONSTRUCTOR
+//   }
+//
+// What §58's DI3 crumb adds -- `scope { ... }`, and the Scoped/Transient
+// lifetimes a Singleton's own root does not distinguish (teko_di.tk):
+//   scope {                                               a lexical scope
+//       IAudit a = inject IAudit;                         one instance per
+//       IAudit b = inject IAudit;                          `scope { }`, freed
+//   }                                                       at its own `}`
+//   Repo r = inject Repo;                                 a Transient: fresh
+//                                                          every injection
+//
+// Everything else in docs/design/port-teko-mc.md §3 (generics, error-union,
+// the rest of DI, concurrency, the rest of the stdlib) is a later entrega and
+// is not stubbed here: it does not yet have a reserved word to stop on, so it
+// simply is not part of the language this compiler accepts.
+//
+// What §64's S2 crumb adds -- `teko` as its own driver, not a dialect of `mc`
+// dressed up with modules (D64.3/D64.4/D64.5, core_teko.mc's own main()):
+//   teko build [DIR] [--config FILE] ...   tk_build below, delegating to the
+//                                          core's own drv_build once the
+//                                          config is resolved
+//   DIR/teko.toml                          the dev-facing config `teko build`
+//                                          prefers; DIR/mc.toml (the core's
+//                                          own default) when it is absent or
+//                                          `--config` already names one
+//   teko limits [DIR|FILE.tk]              tk_limits below, the core's own
+//                                          drv_limits with a `.tk` single
+//                                          file also recognized (the core's
+//                                          own check only knows `.mc`); a
+//                                          DIR still defaults to DIR/mc.toml,
+//                                          the file that taught this
+//                                          compiler in the first place
+
+#include "teko_type.tk"
+#include "teko_prefix.tk"
+#include "teko_float.tk"
+#include "teko_struct.tk"
+#include "teko_array.tk"
+#include "teko_const.tk"
+#include "teko_ns.tk"
+#include "teko_fwd.tk"
+#include "teko_ref.tk"
+#include "teko_iface.tk"
+#include "teko_trait.tk"
+#include "teko_generic.tk"
+#include "teko_class.tk"
+#include "teko_di.tk"
+#include "teko_prop.tk"
+#include "teko_this.tk"
+#include "teko_access.tk"
+#include "teko_typeof.tk"
+#include "teko_deleg.tk"
+#include "teko_heaparr.tk"
+#include "teko_ternary.tk"
+#include "teko_stmt.tk"
+#include "teko_expr.tk"
+#include "teko_params.tk"
+#include "teko_default.tk"
+#include "teko_over.tk"
+#include "teko_ops.tk"
+#include "teko_rc.tk"
+#include "teko_loop.tk"
+#include "teko_switch.tk"
+
+// tk_build(argc, argv) -- `teko build`'s own handler, registered by
+// core_teko.mc's main() (D64.3). D64.4: it resolves the config `drv_build`
+// (src/driver.mc) is about to read, then delegates to it -- the driver
+// itself is not reimplemented, only the file it reads is chosen first.
+//
+// The scan below answers exactly two questions drv_build will re-derive on
+// its own in full (this is not a second parse of every flag, only of the two
+// that decide the config file): was `--config` already given, and what is
+// DIR (defaulting to "." the same way drv_run does)? `--sysroot-dir`/
+// `--libs-dir` are skipped over because each takes the next token, which
+// must not be mistaken for DIR.
+//
+// D64.5: with no `--config`, `DIR/teko.toml` -- the dev-facing config, same
+// schema as `mc.toml` minus `[compiler]` -- wins when it exists; `mc.toml`
+// (drv_build's own default, `ngen/mc.toml`'s enduring role: what taught this
+// very compiler) applies otherwise, unchanged, via the untouched call below.
+i64 tk_build(i64 argc, uptr argv) {
+    uptr dir = 0;
+    i64 has_cfg = 0;
+    i64 i = 2;                                 // argv[1] is "build"
+    loop {
+        if (i >= argc) break;
+        uptr a = ld64(argv + i * 8);
+        if (str_eq(a, "--config"))           { has_cfg = 1; i = i + 1; }
+        else if (str_eq(a, "--sysroot-dir")) i = i + 1;
+        else if (str_eq(a, "--libs-dir"))    i = i + 1;
+        else if (ld8(a) != '-' && dir == 0)  dir = a;
+        i = i + 1;
+    }
+    if (dir == 0) dir = ".";
+    if (!has_cfg) {
+        uptr tcfg = path_norm(tm_cat(dir, "/teko.toml"));
+        if (path_exists(tcfg)) {
+            uptr av = xalloc((argc + 2) * 8);
+            i64 k = 0;
+            loop {
+                if (k >= argc) break;
+                st64(av + k * 8, ld64(argv + k * 8));
+                k = k + 1;
+            }
+            st64(av + argc * 8, "--config");
+            st64(av + (argc + 1) * 8, tcfg);
+            return drv_build(argc + 2, av);
+        }
+    }
+    return drv_build(argc, argv);
+}
+
+// tk_limits(argc, argv) -- `teko limits`'s own handler. `drv_limits`
+// (src/driver.mc) tells a single source file from a project directory with
+// `drv_is_source`, which asks for a `.mc` suffix -- the one thing that does
+// not carry over unchanged from `mc limits`, since a teko source is `.tk`.
+// The scan below finds the same two things `drv_limits` would (the path and
+// whether `--config` was given) only to decide which case this is; a `.tk`
+// path takes the exact three calls `drv_limits` makes for a `.mc` one
+// (`lim_compile_file`/`lim_report`/`lim_exit_code`, all public in
+// src/limits.mc), and everything else -- a directory, a `.mc` file, no
+// argument at all, an unknown flag -- is left to `drv_limits` unchanged.
+i64 tk_is_source(uptr p) {
+    i64 n = cstrlen(p);
+    if (n < 3) return 0;
+    return ld8(p + n - 3) == '.' && ld8(p + n - 2) == 't' && ld8(p + n - 1) == 'k';
+}
+
+i64 tk_limits(i64 argc, uptr argv) {
+    uptr path = 0;
+    i64 i = 2;                                 // argv[1] is "limits"
+    loop {
+        if (i >= argc) break;
+        uptr a = ld64(argv + i * 8);
+        if (str_eq(a, "--config")) i = i + 1;
+        else if (ld8(a) != '-' && path == 0) path = a;
+        i = i + 1;
+    }
+    if (path != 0 && tk_is_source(path)) {
+        set_drv_lim_mode(1);
+        lim_compile_file(path);
+        lim_report(path);
+        return lim_exit_code();
+    }
+    return drv_limits(argc, argv);
+}
+
+// teko_init() -- what entrega 4's S3 crumb (D64.7) exports instead of
+// `user_init` (docs/reference/packages.md §3: "a package never defines
+// `user_init`; it exports `<name>_init()` and the project's own module
+// calls it"). Every registration this compiler needs is still here,
+// unchanged; only the name changed, so `ngen/user.mc` -- the PROJECT's
+// own file, not the package's -- can call it from its own `user_init()`.
+void teko_init() {
+    // `tk_access_init` first: it reads `cfg_file`/`lex_file()` and touches
+    // nothing the lexer is reading FROM (no push, no cursor move), so it is
+    // safe ahead of the forward scan below and gives it a working
+    // `tk_origin_of_file` for a trait's own placeholder (§50 O1).
+    tk_access_init();
+
+    // §55 (mc 0.15.3's `on_source`): registers the forward-scan callback.
+    // Order against `tk_loop_init`'s own prelude push no longer matters --
+    // the callback runs once per source the lexer announces, filtered by
+    // name, not by when it happens to register (teko_fwd.tk's own header).
+    tk_fwd_init();
+
+    tk_types_init();
+    tk_float_init();
+    tk_loop_init();
+    tk_ns_init();
+    tk_ref_init();
+    tk_ha_init();
+
+    syntax("public",    &tk_public);
+    syntax("internal",  &tk_internal);
+    syntax("abstract",  &tk_abstract);
+    syntax("partial",   &tk_partial);
+    syntax("class",     &tk_class);
+    syntax("interface", &tk_interface);
+    syntax("trait",     &tk_trait);
+    syntax("type",      &tk_stop_type);
+    syntax("namespace", &tk_namespace);
+    syntax("import",    &tk_import);
+    syntax("using",     &tk_using);
+    syntax("const",     &tk_const_top);
+    syntax("delegate",  &tk_delegate);
+
+    syntax_stmt("{",     &tk_block);
+    syntax_stmt("var",   &tk_stop_var);
+    syntax_stmt("const", &tk_stop_const);
+    syntax_stmt("match", &tk_stop_match);
+    syntax_stmt("when",  &tk_stop_when);
+    syntax_stmt("while",  &tk_while);
+    syntax_stmt("do",     &tk_do);
+    syntax_stmt("for",    &tk_for);
+    syntax_stmt("foreach", &tk_foreach);
+    syntax_stmt("switch", &tk_switch_stmt);
+    syntax_stmt("scope",  &tk_scope_stmt);
+
+    syntax("struct", &tk_struct);
+
+    syntax_expr("new", &tk_new);
+    syntax_expr("inject", &tk_inject);
+    syntax_expr("this", &tk_this);
+    syntax_expr("+", &tk_unary_plus);
+    syntax_expr("true", &tk_true);
+    syntax_expr("false", &tk_false);
+    syntax_expr("null", &tk_null);
+    syntax_expr("ref", &tk_ref_arg);
+    syntax_expr("out", &tk_out_arg);
+    syntax_infix(".", 12, &tk_dot);
+    syntax_infix("[", 12, &tk_bracket);
+    syntax_infix("?", TK_TERN_PREC, &tk_tern_infix);
+    syntax_infix("switch", TK_TERN_PREC, &tk_switch_infix);
+
+    on_stmt(&tk_on_stmt);
+    on_stmt(&tk_arr_on_stmt);
+    on_stmt(&tk_ref_on_stmt);
+    on_stmt(&tk_lam_taint_stmt);
+
+    // C6: a default parameter value in a free function's own list. The only
+    // `syntax_param` registration in this compiler, so registration order
+    // among handlers does not come up -- see teko_default.tk's own header.
+    syntax_param(&tk_default_param);
+
+    // FIRST among the passes, and a later one must not slip in front: the
+    // `params` pass INSTANTIATES `i64 total(params xs)` once per argument count
+    // -- `total(a, b, c)` becomes `total__3(ptr)`, with the count a constant
+    // inside the body -- and the declaration that was generic leaves the unit.
+    // Whatever comes next -- the overload mangling of C4 above all -- then sees
+    // ordinary functions with ordinary parameters, and never has to know what a
+    // `params` list is. Running after it would mean mangling a declaration the
+    // `params` pass is about to take away.
+    // AHEAD of every other pass: a partial class no use closed is closed here,
+    // and what that emits -- a constructor, a vtable initializer -- is an
+    // ordinary declaration the passes below have to see like any other.
+    pass(&tk_partial_pass);
+
+    // entrega 5, crumb N2: every namespaced free function/prototype is
+    // mangled and every bare call inside a namespace resolved before ANY
+    // pass that censuses by name -- `params`, the oracle, overload
+    // mangling and defaults all have to see the FINAL symbol.
+    pass(&tk_ns_pass);
+
+    // §50 O1: every forward-scanned name the unit is now fully parsed with
+    // has either been adopted by its real declaration or never used at all;
+    // this is the backstop for a scan false positive (teko_fwd.tk's own
+    // header, decision 14) -- placed right after `tk_ns_pass`, before any
+    // pass below censuses by name.
+    pass(&tk_fwd_pass);
+
+    // §58 DI1: every service in the unit is registered by now (`tk_conf_apply`
+    // runs at parse time, and `tk_partial_pass` above has already closed every
+    // class), so every `inject` -- wherever the source wrote it relative to the
+    // service it names -- resolves here, before any pass below censuses the
+    // tree by name (teko_di.tk's own header).
+    pass(&tk_di_pass);
+
+    // ahead of tk_params_pass: a global array's own leftover N_INDEX has to
+    // be gone before that walk runs, unconditionally, over every N_INDEX in
+    // the unit the moment a `params` list exists anywhere in it
+    // (teko_array.tk's own header).
+    pass(&tk_array_pass);
+
+    pass(&tk_params_pass);
+    pass(&tk_typeof_pass);
+
+    // K2 (D221 §41): BEHIND the oracle (a parameter's own type is already the
+    // pointee, so nothing here needs it to have run) and AHEAD of every pass
+    // below, so a `ref`/`out` parameter reads and writes as `ldW(x)`/`stW(x,
+    // e)` before delegate/ternary/ops/overload/rc ever see the body
+    // (teko_ref.tk's own header spells the exception `tk_rc_assign` keeps).
+    pass(&tk_ref_pass);
+
+    // K1 (D221 §41): BEHIND the oracle, whose scope walk (`tk_ty_pass_walk`)
+    // this pass reuses to tell a delegate-typed local/parameter from any
+    // other name -- and AHEAD of every pass below, so `f(3, 4)` is already
+    // the typed `callp` teko_deleg.tk built by the time ternary/ops/over/rc
+    // see the tree (teko_deleg.tk's own header).
+    pass(&tk_deleg_pass);
+
+    // entrega 5, ternary crumb (D228): BEHIND the oracle, because `tk_ty_of`
+    // -- what this pass leans on to type an arm -- only answers a `.` on a
+    // receiver the parser could not type once teko_typeof.tk's own pass has
+    // rewritten the deferred placeholder into the load/call it stands for;
+    // ahead of every pass below, so none of them has to know a ternary was
+    // ever written (teko_ternary.tk's own header spells the whole ordering
+    // out, arm by arm).
+    pass(&tk_ternary_pass);
+
+    // entrega 5, switch crumb's own bug fix: the level a bare `continue`
+    // bumped past a switch's own loop can only be checked once every
+    // `N_LOOP` -- a bare `loop { }` included -- is in the tree, which parse
+    // time never has (teko_switch.tk's own header explains the mc core gap).
+    // AHEAD of `tk_rc_pass`: that pass relocates a `break`/`continue` it
+    // wraps in a release block to a FRESH node index (`teko_rc.tk`'s own
+    // `tk_rc_jump`), so this has to run before it does, while the node index
+    // this pass looks up is still the one it was recorded under.
+    pass(&tk_switch_guard_pass);
+
+    // BEHIND the oracle, because it asks the oracle what the two operands of a
+    // `+` are, and AHEAD of the overload mangling, because the call it puts in
+    // the tree already names the method's own symbol -- the one teko_class.tk
+    // gave the declaration -- and has nothing left for a mangling pass to pick.
+    pass(&tk_ops_pass);
+
+    // C6's own default-fill, for a name declared exactly once: no type to
+    // compare, so it needs neither the oracle above nor the overload mangling
+    // below, and it must run BEFORE that mangling -- a name declared MORE
+    // than once is left untouched here on purpose (teko_default.tk's own
+    // header explains why) and is what the fourth round tk_over_pass adds
+    // just below resolves instead, defaults included.
+    pass(&tk_default_pass);
+
+    // BEHIND both of the above: the overload mangling reads ordinary
+    // parameter lists (a `params` list is gone by now, replaced by its
+    // instances, whose `__k` suffix is a number and cannot collide with the
+    // type-named suffix an overload takes) and ordinary calls (the oracle's
+    // pass has already rebuilt every deferred `.`), and it renames
+    // declarations, which is the one rewrite the two before it would not
+    // survive.
+    pass(&tk_over_pass);
+
+    // LAST of all. Ownership is a question about a value's static TYPE: the
+    // oracle has to have rewritten every deferred `.` first, the operators have
+    // to have become the calls they are, and the overloads have to carry their
+    // own symbols -- two `pick`s spelled the same are two declarations of one
+    // name until the mangling, and only one of them may answer with an object.
+    pass(&tk_rc_pass);
+}

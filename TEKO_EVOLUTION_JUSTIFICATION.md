@@ -9,7 +9,7 @@
 > **Method / honesty note (M.3).** Every count below was measured against the live tree on branch
 > the reboot line (now `main`). Where a number is a *projection* (e.g. a compile-time speedup) it is labelled
 > **[projected]** and the model is shown. The corpus measured: **49 `.tks` source units**, **40 `.c`
-> compilation units**, **49 `.h`**, **14 `.tkt` tests** — **63 VM-run units (`.tks`+`.tkt`)**, **138
+> compilation units**, **49 `.h`**, **14 `.tkt` tests** — **63 legacy engine-run units (`.tks`+`.tkt`)**, **138
 > `.c`/`.h`/`.tks` source files**, across **11 subsystems** under `src/`. Source LOC: **`.tks` ≈ 9,312**,
 > **`.c` ≈ 8,698**, **`.h` ≈ 1,947**.
 
@@ -22,9 +22,9 @@
 | `.tks` source units | 49 | `src/**/*.tks` |
 | `.c` compilation units | 40 | `src/**/*.c` |
 | `.h` headers | 49 | `src/**/*.h` |
-| `.tkt` VM tests | 14 | `src/**/*.tkt` |
-| VM-run units (`.tks`+`.tkt`) | 63 | the "≈64 corpus files" |
-| subsystems | 11 | `src/{lexer,parser,checker,codegen,vm,emit,text,build,runtime,assert,…}` |
+| `.tkt` legacy engine tests | 14 | `src/**/*.tkt` |
+| legacy engine-run units (`.tks`+`.tkt`) | 63 | the "≈64 corpus files" |
+| subsystems | 11 | `src/{lexer,parser,checker,codegen,legacy engine,emit,text,build,runtime,assert,…}` |
 | `teko::list::push` calls (`.tks`) | **120** | `grep list::push` |
 | `teko::list::empty` calls (`.tks`) | **103** | `grep list::empty` |
 | total `teko::list::*` calls (`.tks`) | **212** | combined |
@@ -53,7 +53,7 @@ These are the load-bearing denominators. "Improvement" below is always stated *r
 
 - **Self-host unblock — the headline.** **212** `teko::list` calls + **98** `[]T as x` patterns + **307**
   `.len` + **305** index reads are spread across **27 of 49** source units (55%). The front-end **cannot
-  self-compile** until the collection read-side + COPY-append are lowered through codegen/VM. Per
+  self-compile** until the collection read-side + COPY-append are lowered through codegen/legacy engine. Per
   `TEKO_CORRECTION_PLAN` (§15, gap #14), the *current* self-host wall is literally
   `parse_expr.tks:115` — a `[]lexer::Token as ts` slice pattern. So collections is the gate on **~55% of
   the corpus** and on self-host itself; nothing else on this list unblocks anything until it lands.
@@ -225,7 +225,7 @@ recommendation that still leaves async on the table for the legislator's call.
 ### 5b. routines (coroutines / green threads / goroutine-style)
 
 - **Numbers.** M:N green threads give cheap spawn (thousands of tasks, ~KB stacks) vs. 1:1 OS threads
-  (~MB stack, syscall to clone). For the compiler's actual parallel unit — **49 `.tks` / 63 VM-run
+  (~MB stack, syscall to clone). For the compiler's actual parallel unit — **49 `.tks` / 63 legacy engine-run
   units** — you need *tens*, not thousands, of tasks, so the M:N spawn-cost advantage is **near-zero in
   this workload**. The structured-scope ergonomics (a `scope{}` that joins all children) are the real win
   and survive into the chosen model.
@@ -242,7 +242,7 @@ recommendation that still leaves async on the table for the legislator's call.
 ### 5d. parallelism (true multi-core — where the biggest NUMBER lives)
 
 - **The compile-time speedup [projected].** The checker/lowering passes over the **49 `.tks` source
-  units** (or 63 VM-run units) are *embarrassingly parallel per file* up to the cross-file resolve. Model:
+  units** (or 63 legacy engine-run units) are *embarrassingly parallel per file* up to the cross-file resolve. Model:
   let *S* = serial fraction (cross-module resolve, link), *P* = parallelizable fraction (lex+parse+check
   per file). Amdahl on *N* cores gives speedup `1 / (S + P/N)`.
   - If per-file work is **P = 0.8** (lex/parse/check dominate; resolve+emit serial):
@@ -287,7 +287,7 @@ ROI = (improvement magnitude) ÷ (implementation cost) , adjusted by dependency 
 | Rank | Feature | Improvement magnitude | Impl. cost | Dependencies | ROI verdict |
 |---|---|---|---|---|---|
 | **1** | **`tk_alloc()` seam** (sub-step of Arenas) | Turns a future 68-site swap into a 1-site swap | **~0 (mechanical, now)** | none | **Highest** — do it immediately, zero risk |
-| **2** | **Collections (copy-append + read-side)** | Unblocks self-host of **~55% of corpus**; 212 calls / 98 patterns / 307 `.len` lowered; frozen forward-compatible surface | Medium-High (codegen/VM slice subsystem) | self-host backend only | **Top** — gates everything; mandatory |
+| **2** | **Collections (copy-append + read-side)** | Unblocks self-host of **~55% of corpus**; 212 calls / 98 patterns / 307 `.len` lowered; frozen forward-compatible surface | Medium-High (codegen/legacy engine slice subsystem) | self-host backend only | **Top** — gates everything; mandatory |
 | **3** | **Arenas + escape check** | Erases the **152-site** manual-lifetime surface + the real use-after-realloc class; deterministic free | Medium (bump allocator + 1 depth check) | seam | **High** — the keystone; everything safe reuses it |
 | **4** | **Generics (mono)** | ~30+ hand-specializations → ~3 definitions; 16 `TK_LIST` → 1; no boxing | Medium (mono pass) | self-host (M.4 data); parallel with arenas | **High** — big dedup, independent mechanism |
 | **5** | **ref / ref mut** | 123 `tk_type` copies → O(1); null-deref class excluded; **0 new analysis** | Low-Medium (rides the escape check) | arenas (S2) | **High per unit cost** — cheap, big safety |
@@ -298,7 +298,7 @@ ROI = (improvement magnitude) ÷ (implementation cost) , adjusted by dependency 
 ## What to build first for the biggest quality/number win
 
 **Introduce the `tk_alloc()` allocation seam now (zero cost, turns a 68-site future swap into one site),
-then drive the collections read-side + COPY-append through codegen/VM to finish self-host.** Collections is
+then drive the collections read-side + COPY-append through codegen/legacy engine to finish self-host.** Collections is
 the only feature that is simultaneously (a) the gate on **~55% of the corpus** and on self-host itself —
 the current wall is a real slice pattern at `parse_expr.tks:115` — and (b) shippable with a **frozen,
 forward-compatible surface**, so all **212 list calls / 98 patterns / 307 `.len` / 305 indexes** written

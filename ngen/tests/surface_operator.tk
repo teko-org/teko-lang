@@ -1,0 +1,190 @@
+// surface_operator.tk -- operator overloading as C# writes it (D218, crumb C5b).
+// An operator is a `public static` member that NAMES BOTH OPERANDS: there is no
+// receiver in it, no `this`, and no vtable slot, so which declaration a site
+// lands on is decided by the static types of the two operands and by nothing
+// else. `operator` is CONTEXTUAL inside the body of a type, like `virtual` and
+// `override`, so nothing outside a type body loses the word.
+//
+// Both operands being parameters is what makes the reversed form -- `i64` on
+// the left, `Vec` on the right -- an ordinary declaration rather than a special
+// case, and a unary operator one that names a single operand. The candidates of
+// a site are the operators declared by the type of EITHER side, so `2 + v`
+// reaches a declaration whose first parameter is not a Vec at all.
+//
+// A comparison is declared in PAIRS, as C# requires: `operator==` without an
+// `operator!=` beside it is refused where it was written.
+//
+// The route is a pass over N_BINARY and N_UNARY, not `syntax_infix`: at parse
+// time the type of an operand that is a parameter is not known yet, and the
+// pass is also where an address this project itself builds (`ld64(p + OFF)`) is
+// told apart from an operand.
+//
+// The chain is what the pass has to get right twice: `(a + b) == c` resolves
+// the `+` first and asks the `==` about the RETURN type of `operator+`, not
+// about the type of `a`.
+//
+// And the core keeps its own arithmetic: the `i64` sum and the `u8` comparison
+// below are the same nodes they were before this construct existed.
+//
+// `.`/`[` bind tighter than `- ! ~` (teko_prefix.tk): `!b[1]`, `-a.x` and
+// `~g[2]` are the bracket/member resolved first and the unary wrapped around
+// that, not the reverse -- the core's own prefix table reads `- ! ~` before
+// `syntax_expr` is ever consulted, so `tk_dot`/`tk_bracket` sink through the
+// chain themselves.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+class Vec {
+    public i64 x;
+    public i64 y;
+
+    public static Vec operator+(Vec a, Vec b) {
+        Vec r = new Vec;
+        r.x = a.x + b.x;
+        r.y = a.y + b.y;
+        return r;
+    }
+
+    public static Vec operator+(i64 k, Vec v) {
+        Vec r = new Vec;
+        r.x = k + v.x;
+        r.y = k + v.y;
+        return r;
+    }
+
+    public static Vec operator-(Vec a) {
+        Vec r = new Vec;
+        r.x = 0 - a.x;
+        r.y = 0 - a.y;
+        return r;
+    }
+
+    public static Vec operator+(Vec a) {
+        return a;
+    }
+
+    public static i64 operator==(Vec a, Vec b) {
+        if (a.x != b.x) return 0;
+        if (a.y != b.y) return 0;
+        return 1;
+    }
+
+    public static i64 operator!=(Vec a, Vec b) {
+        return !(a == b);
+    }
+}
+
+// three levels deep: GrandBase and MidA both declare `operator+(<own type>,
+// i64)`, Kid declares neither. `kid + 2` reaches both through the BASE round
+// (Kid is a GrandBase two hops up and a MidA one hop up), and the one closer
+// to Kid -- MidA's -- wins, the way C#'s own tie-break picks the most derived
+// parameter rather than refusing the site as ambiguous.
+class GrandBase {
+    public i64 n;
+
+    public static i64 operator+(GrandBase g, i64 k) {
+        return (g.n + k) * 100;
+    }
+}
+
+class MidA : GrandBase {
+    public static i64 operator+(MidA m, i64 k) {
+        return m.n + k;
+    }
+}
+
+class Kid : MidA {
+    public i64 tag;
+}
+
+class Flag {
+    public bool on;
+
+    public bool flag() {
+        return on;
+    }
+}
+
+// both operands are PARAMETERS: nothing types them while the body is parsed,
+// and the oracle answers from the pass, where the whole unit exists
+Vec combine(Vec a, Vec b) {
+    return a + b;
+}
+
+i64 main() {
+    Vec a = new Vec;
+    a.x = 10;
+    a.y = 4;
+
+    Vec b = new Vec;
+    b.x = 20;
+    b.y = 8;
+
+    Vec c = new Vec;
+    c.x = 30;
+    c.y = 12;
+
+    if (((a + b) == c) != 1) return 1;           // the chain: `+` resolved first
+    if (((a + b) != c) != 0) return 2;           // ...and the pair answers too
+    if ((combine(a, b) == c) != 1) return 3;     // the operator over parameters
+
+    Vec d = -a;                                  // the unary form
+    if (d.x != 0 - 10) return 4;
+    if (d.y != 0 - 4) return 5;
+
+    Vec e = 2 + a;                               // reversed: `i64` on the left
+    if (e.x != 12) return 6;
+    if (e.y != 6) return 7;
+
+    i64 n = 20 + 22;                             // the core's own sum
+    if (n != 42) return 8;
+
+    u8 p = 7;
+    u8 q = 7;
+    if ((p == q) != 1) return 9;                 // the core's own comparison
+
+    Kid kid = new Kid;
+    kid.n = 5;
+    kid.tag = 1;
+    if ((kid + 2) != 7) return 10;               // MidA's, not GrandBase's
+
+    Vec f = +a;                                  // the unary `+`, M45's own site
+    if (f.x != a.x) return 11;
+    if (f.y != a.y) return 12;
+
+    i64 i = 5;
+    if (+i != i) return 13;                      // `+` over a core type: the identity
+
+    i64 barr[2];
+    barr[0] = 1;
+    barr[1] = 0;
+    if (!barr[1] != 1) return 14;                 // !b[1]: the bracket binds first
+
+    i64 iarr[2];
+    iarr[0] = 6;
+    iarr[1] = 9;
+    if (-iarr[0] != -6) return 15;                // -a[0]
+
+    Flag flg = new Flag;
+    flg.on = false;
+    if (!flg.on != 1) return 16;                  // !f.on: a field
+
+    Vec pv = new Vec;
+    pv.x = 9;
+    pv.y = 0;
+    if (-pv.x != -9) return 17;                   // -p.x: a field, over the core's own i64
+
+    i64 garr[3];
+    garr[2] = 5;
+    if (~garr[2] != -6) return 18;                // ~g[2]
+
+    flg.on = true;
+    if (!flg.flag() != 0) return 19;              // !c.flag(): a method
+
+    if (-(-iarr[1]) != 9) return 20;              // -(-a[1])
+
+    Vec s = a + b;
+    return s.x + s.y;
+}

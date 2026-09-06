@@ -1,0 +1,542 @@
+use teko::parser
+
+type CxBinds = struct { names: []str; vals: []TExpr }
+
+type CxCtx = struct { table: TypeTable; binds: CxBinds; depth: u32 }
+
+fn cx_empty_binds(): CxBinds { CxBinds { names = []; vals = [] } }
+
+fn cx_max_depth(): u32 { 64 }
+
+fn cx_binds_lookup(binds: CxBinds, name: str): TExpr | null {
+    var i: u64 = 0
+    loop {
+        if i >= binds.names.len { break }
+        if binds.names[i] == name { return binds.vals[i] }
+        i++
+    }
+    null
+}
+
+pub fn expand_comptime(prog: TProgram, table: TypeTable): TProgram | error {
+    if table.comptimes.len == 0 { return prog }
+    var ctx = CxCtx { table = table; binds = cx_empty_binds(); depth = 0 to u32 }
+    var out: [prog.items.len]@TItem() = []
+    var i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        var it = match cx_item(prog.items[i], ctx) { error as x => return x; (@TItem()) as v => v }
+        out[i] = it
+        i++
+    }
+    TProgram { items = out }
+}
+
+fn cx_item(it: @TItem(), ctx: CxCtx): @TItem() | error {
+    match it {
+        TFunction as f => cx_function(f, ctx)
+        TConstDecl as cd => cx_const_decl(cd, ctx)
+        (@TStatement()) as s => match cx_stmt(s, ctx) { error as x => return x; (@TStatement()) as v => v }
+        _ => it
+    }
+}
+
+fn cx_function(f: TFunction, ctx: CxCtx): @TItem() | error {
+    var body = match cx_block(f.body, ctx) { error as x => return x; []@TStatement() as v => v }
+    TFunction { overload_suffix = f.overload_suffix; name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = f.return_type; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; ret_extra = f.ret_extra; guard = f.guard }
+}
+
+fn cx_const_decl(cd: TConstDecl, ctx: CxCtx): @TItem() | error {
+    var init = match cx_expr(cd.init, ctx) { error as x => return x; TExpr as v => v }
+    TConstDecl { name = cd.name; namespace = cd.namespace; ty = cd.ty; init = init; vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col; guard = cd.guard }
+}
+
+fn cx_block(stmts: []@TStatement(), ctx: CxCtx): []@TStatement() | error {
+    var out: [stmts.len]@TStatement() = []
+    var i: u64 = 0
+    loop {
+        if i >= stmts.len { break }
+        var s = match cx_stmt(stmts[i], ctx) { error as x => return x; (@TStatement()) as v => v }
+        out[i] = s
+        i++
+    }
+    out
+}
+
+fn cx_stmt(st: @TStatement(), ctx: CxCtx): @TStatement() | error {
+    match st {
+        TBinding as b => {
+            var v = match cx_expr(b.value, ctx) { error as x => return x; TExpr as f => f }
+            TBinding { kind = b.kind; target = b.target; bound = b.bound; value = v }
+        }
+        TAssign as a => cx_assign(a, ctx)
+        TReturn as r => cx_return(r, st, ctx)
+        TLoopStmt as l => {
+            var init = match cx_block(l.init, ctx) { error as x => return x; []@TStatement() as v => v }
+            var body = match cx_block(l.body, ctx) { error as x => return x; []@TStatement() as v => v }
+            TLoopStmt { label = l.label; init = init; body = body }
+        }
+        TBreakStmt => st
+        TContinueStmt => st
+        TExprStmt as es => {
+            var v = match cx_expr(es.expr, ctx) { error as x => return x; TExpr as f => f }
+            TExprStmt { expr = v }
+        }
+        TDeferStmt as d => {
+            var body = match cx_block(d.body, ctx) { error as x => return x; []@TStatement() as v => v }
+            TDeferStmt { body = body }
+        }
+        TAdoptStmt as a => {
+            var body = match cx_block(a.body, ctx) { error as x => return x; []@TStatement() as v => v }
+            TAdoptStmt { name = a.name; body = body }
+        }
+        TBlockStmt as b => {
+            var body = match cx_block(b.body, ctx) { error as x => return x; []@TStatement() as v => v }
+            TBlockStmt { body = body }
+        }
+        TSpawn as sp => {
+            var v = match cx_expr(sp.call, ctx) { error as x => return x; TExpr as f => f }
+            TSpawn { call = v; id = sp.id }
+        }
+    }
+}
+
+fn cx_return(r: TReturn, st: @TStatement(), ctx: CxCtx): @TStatement() | error {
+    if !r.has_value { return st }
+    var v = match cx_expr(r.value, ctx) { error as x => return x; TExpr as f => f }
+    TReturn { has_value = true; value = v; values = [] }
+}
+
+fn cx_assign(a: TAssign, ctx: CxCtx): @TStatement() | error {
+    var value = match cx_expr(a.value, ctx) { error as x => return x; TExpr as f => f }
+    if parser::assign_has_target(a.kind) {
+        var target = match cx_expr(a.target, ctx) { error as x => return x; TExpr as f => f }
+        return TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = value; deref = a.deref; target = target }
+    }
+    TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = value; deref = a.deref; target = a.target }
+}
+
+fn cx_expr(e: TExpr, ctx: CxCtx): TExpr | error {
+    match e.kind {
+        TVar as v => match cx_binds_lookup(ctx.binds, v.name) {
+            TExpr as lit => return lit
+            null => { }
+        }
+        _ => { }
+    }
+    var rebuilt = match cx_children(e, ctx) { error as x => return x; TExpr as v => v }
+    match rebuilt.kind {
+        TCall as c => cx_maybe_comptime(c, rebuilt, ctx)
+        _ => rebuilt
+    }
+}
+
+fn cx_exprs(es: []TExpr, ctx: CxCtx): []TExpr | error {
+    var out: [es.len]TExpr = []
+    var i: u64 = 0
+    loop {
+        if i >= es.len { break }
+        var x = match cx_expr(es[i], ctx) { error as e2 => return e2; TExpr as v => v }
+        out[i] = x
+        i++
+    }
+    out
+}
+
+fn cx_children(e: TExpr, ctx: CxCtx): TExpr | error {
+    match e.kind {
+        TNumber => e
+        TStrLit => e
+        TByteStrLit => e
+        TByteLit => e
+        TCharLit => e
+        TBoolLit => e
+        TNullLit => e
+        TPathExpr => e
+        TVar => e
+        TBinary as b => cx_binary(b, e, ctx)
+        TUnary as u => cx_unary(u, e, ctx)
+        TCompare as c => cx_compare(c, e, ctx)
+        TCall as cl => cx_call(cl, e, ctx)
+        TIfExpr as f => cx_if(f, e, ctx)
+        TMatchExpr as m => cx_match(m, e, ctx)
+        TCast as c => cx_cast(c, e, ctx)
+        TFieldAccess as fa => cx_field(fa, e, ctx)
+        TStructInit as si => cx_struct(si, e, ctx)
+        TIndex as ix => cx_index(ix, e, ctx)
+        TInterp as in => cx_interp(in, e, ctx)
+        TInExpr as n => cx_in(n, e, ctx)
+        TArrayLit as a => cx_array(a, e, ctx)
+        TSliceOfLen as s => cx_slice_of_len(s, e, ctx)
+        TZeroOf => e
+        TLambda as lam => cx_lambda(lam, e, ctx)
+        TBorrow as b => cx_borrow(b, e, ctx)
+        TBlockExpr as b => cx_block_expr(b, e, ctx)
+    }
+}
+
+fn cx_binary(b: TBinary, e: TExpr, ctx: CxCtx): TExpr | error {
+    var l = match cx_expr(b.left, ctx) { error as x => return x; TExpr as v => v }
+    var r = match cx_expr(b.right, ctx) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TBinary { op = b.op; left = l; right = r }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_unary(u: TUnary, e: TExpr, ctx: CxCtx): TExpr | error {
+    var o = match cx_expr(u.operand, ctx) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TUnary { op = u.op; operand = o }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_cast(c: TCast, e: TExpr, ctx: CxCtx): TExpr | error {
+    var o = match cx_expr(c.expr, ctx) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TCast { expr = o }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_field(fa: TFieldAccess, e: TExpr, ctx: CxCtx): TExpr | error {
+    var r = match cx_expr(fa.receiver, ctx) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TFieldAccess { receiver = r; field = fa.field }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_index(ix: TIndex, e: TExpr, ctx: CxCtx): TExpr | error {
+    var r = match cx_expr(ix.receiver, ctx) { error as x => return x; TExpr as v => v }
+    var n = match cx_expr(ix.index, ctx) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TIndex { receiver = r; index = n }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_borrow(b: TBorrow, e: TExpr, ctx: CxCtx): TExpr | error {
+    var o = match cx_expr(b.operand, ctx) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TBorrow { operand = o }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_call(cl: TCall, e: TExpr, ctx: CxCtx): TExpr | error {
+    var args = match cx_exprs(cl.args, ctx) { error as x => return x; []TExpr as a => a }
+    TExpr { kind = TCall { overload_suffix = cl.overload_suffix; callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot; type_args = cl.type_args; ret_extra = cl.ret_extra }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_struct(si: TStructInit, e: TExpr, ctx: CxCtx): TExpr | error {
+    var vals = match cx_exprs(si.field_vals, ctx) { error as x => return x; []TExpr as v => v }
+    TExpr { kind = TStructInit { field_names = si.field_names; field_vals = vals }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_in(n: TInExpr, e: TExpr, ctx: CxCtx): TExpr | error {
+    var lhs = match cx_expr(n.lhs, ctx) { error as x => return x; TExpr as v => v }
+    var elems = match cx_exprs(n.elems, ctx) { error as x => return x; []TExpr as v => v }
+    TExpr { kind = TInExpr { lhs = lhs; elems = elems }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_if(f: TIfExpr, e: TExpr, ctx: CxCtx): TExpr | error {
+    var cond = match cx_expr(f.cond, ctx) { error as x => return x; TExpr as v => v }
+    var then_blk = match cx_block(f.then_blk, ctx) { error as x => return x; []@TStatement() as v => v }
+    var else_blk = match cx_block(f.else_blk, ctx) { error as x => return x; []@TStatement() as v => v }
+    TExpr { kind = TIfExpr { cond = cond; then_blk = then_blk; has_else = f.has_else; else_blk = else_blk }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_compare(c: TCompare, e: TExpr, ctx: CxCtx): TExpr | error {
+    var first = match cx_expr(c.first, ctx) { error as x => return x; TExpr as v => v }
+    var terms: [c.rest.len]TCmpTerm = []
+    var i: u64 = 0
+    loop {
+        if i >= c.rest.len { break }
+        var operand = match cx_expr(c.rest[i].operand, ctx) { error as x => return x; TExpr as v => v }
+        terms[i] = TCmpTerm { op = c.rest[i].op; operand = operand }
+        i++
+    }
+    TExpr { kind = TCompare { first = first; rest = terms }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_match(m: TMatchExpr, e: TExpr, ctx: CxCtx): TExpr | error {
+    var subject = match cx_expr(m.subject, ctx) { error as x => return x; TExpr as v => v }
+    var arms: [m.arms.len]TArm = []
+    var i: u64 = 0
+    loop {
+        if i >= m.arms.len { break }
+        var arm = match cx_arm(m.arms[i], ctx) { error as x => return x; TArm as a => a }
+        arms[i] = arm
+        i++
+    }
+    TExpr { kind = TMatchExpr { subject = subject; arms = arms }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_arm(arm: TArm, ctx: CxCtx): TArm | error {
+    var guard = if arm.has_when {
+        match cx_expr(arm.guard, ctx) { error as x => return x; TExpr as v => v }
+    } else { arm.guard }
+    var body = match cx_block(arm.body, ctx) { error as x => return x; []@TStatement() as v => v }
+    TArm { pattern = arm.pattern; has_when = arm.has_when; guard = guard; body = body }
+}
+
+fn cx_lambda(lam: TLambda, e: TExpr, ctx: CxCtx): TExpr | error {
+    var body = match cx_block(lam.body, ctx) { error as x => return x; []@TStatement() as v => v }
+    TExpr { kind = TLambda { params = lam.params; body = body; captures = lam.captures; ret = lam.ret; lift_id = lam.lift_id }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_block_expr(blk: TBlockExpr, e: TExpr, ctx: CxCtx): TExpr | error {
+    var body = match cx_block(blk.body, ctx) { error as x => return x; []@TStatement() as v => v }
+    TExpr { kind = TBlockExpr { body = body }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_interp(in: TInterp, e: TExpr, ctx: CxCtx): TExpr | error {
+    var holes: [in.holes.len]TExpr = []
+    var specs: []TFSpec = []
+    var i: u64 = 0
+    loop {
+        if i >= in.holes.len { break }
+        var hole = match cx_expr(in.holes[i], ctx) { error as x => return x; TExpr as v => v }
+        holes[i] = hole
+        if i < in.specs.len {
+            var sp = match cx_fspec(in.specs[i], ctx) { error as x => return x; TFSpec as s => s }
+            specs = [..specs, sp]
+        }
+        i++
+    }
+    TExpr { kind = TInterp { pieces = in.pieces; holes = holes; specs = specs }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_fspec(sp: TFSpec, ctx: CxCtx): TFSpec | error {
+    match sp.kind {
+        TFSpecDynamic as fd => {
+            var args = match cx_exprs(fd.args, ctx) { error as x => return x; []TExpr as a => a }
+            TFSpec { kind = TFSpecDynamic { args = args } }
+        }
+        _ => sp
+    }
+}
+
+fn cx_slice_of_len(s: TSliceOfLen, e: TExpr, ctx: CxCtx): TExpr | error {
+    var sz = match cx_expr(s.size, ctx) { error as x => return x; TExpr as v => v }
+    TExpr { kind = TSliceOfLen { size = sz; element = s.element }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_array(a: TArrayLit, e: TExpr, ctx: CxCtx): TExpr | error {
+    var elems: [a.elements.len]TArrayElem = []
+    var i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        var ex = match cx_expr(a.elements[i].expr, ctx) { error as x => return x; TExpr as v => v }
+        elems[i] = TArrayElem { is_spread = a.elements[i].is_spread; expr = ex }
+        i++
+    }
+    TExpr { kind = TArrayLit { elements = elems }; type = e.type; line = e.line; col = e.col }
+}
+
+fn cx_maybe_comptime(c: TCall, e: TExpr, ctx: CxCtx): TExpr | error {
+    if c.call_ns != comptime_call_ns() { return e }
+    var name = cx_call_name(c)
+    match tt_find_comptime(ctx.table, name) {
+        null => error { message = $"internal: comptime call `@{name}` resolved to no `comptime` declaration at expansion" }
+        ComptimeReg as reg => cx_eval_comptime(c, reg.decl, reg.namespace, e, ctx)
+    }
+}
+
+fn cx_call_name(c: TCall): str {
+    if c.callee.segments.len == 0 { return "" }
+    c.callee.segments[c.callee.segments.len - 1].name
+}
+
+fn cx_eval_comptime(c: TCall, cd: parser::ComptimeDecl, ns: str, e: TExpr, ctx: CxCtx): TExpr | error {
+    if ctx.depth >= cx_max_depth() { return error { message = $"comptime call `@{cd.name}` nests deeper than {cx_max_depth() to u64} frames — a recursive comptime cannot be folded" } }
+    if cd.type_params.len != c.type_args.len { return error { message = $"comptime `@{cd.name}` expects {cd.type_params.len} type argument(s), got {c.type_args.len}" } }
+    if c.args.len != cd.params.len { return error { message = $"comptime `@{cd.name}` expects {cd.params.len} argument(s), got {c.args.len}" } }
+    var tb = CxTypeBinds { names = cd.type_params; types = c.type_args }
+    var rc = CxRefl { tb = tb; table = ctx.table; fields_elem = cx_slice_elem_name(cd.ret) }
+    var binds = match cx_bind_args(cd, c, ctx) { error as x => return x; CxBinds as b => b }
+    var bodyval0 = match cx_body_value(cd) { null => return error { message = $"comptime `@{cd.name}`'s body is not a single value expression — a statement-body comptime is not yet foldable" }; parser::Expr as bv => bv }
+    var bodyval = match cx_reflect_expr(bodyval0, rc) { error as x => return x; parser::Expr as bv => bv }
+    var env = match cx_param_env(cd, ns, ctx) { error as x => return x; Env as v => v }
+    var typed = match type_expr(bodyval, env, ctx.table) { error as x => return x; TExpr as v => v }
+    var frame = CxCtx { table = ctx.table; binds = binds; depth = ctx.depth + (1 to u32) }
+    var substituted = match cx_expr(typed, frame) { error as x => return x; TExpr as v => v }
+    var value = match eval_const(substituted, ctx.table, env_empty(), cx_expand_agg()) { error as x => return x; ConstValue as v => v }
+    match comptime_literal_of(value, e.type, ctx.table, e.line, e.col) {
+        TExpr as lit => lit
+        null => error { message = $"comptime `@{cd.name}`'s result has no literal form for its declared return type" }
+    }
+}
+
+type CxTypeBinds = struct { names: []str; types: []@Type() }
+
+type CxRefl = struct { tb: CxTypeBinds; table: TypeTable; fields_elem: str }
+
+fn cx_type_bind(tb: CxTypeBinds, name: str): @Type() | null {
+    var i: u64 = 0
+    loop {
+        if i >= tb.names.len { break }
+        if tb.names[i] == name { return tb.types[i] }
+        i++
+    }
+    null
+}
+
+fn cx_reflect_expr(e: parser::Expr, rc: CxRefl): parser::Expr | error {
+    match e.kind {
+        parser::FieldAccess as fa => cx_reflect_field(fa, e, rc)
+        parser::Binary as b => {
+            var l = match cx_reflect_expr(b.left, rc) { error as x => return x; parser::Expr as v => v }
+            var r = match cx_reflect_expr(b.right, rc) { error as x => return x; parser::Expr as v => v }
+            parser::Expr { kind = parser::Binary { op = b.op; left = l; right = r }; line = e.line; col = e.col }
+        }
+        parser::Unary as u => {
+            var o = match cx_reflect_expr(u.operand, rc) { error as x => return x; parser::Expr as v => v }
+            parser::Expr { kind = parser::Unary { op = u.op; operand = o }; line = e.line; col = e.col }
+        }
+        parser::Cast as c => {
+            var o = match cx_reflect_expr(c.expr, rc) { error as x => return x; parser::Expr as v => v }
+            parser::Expr { kind = parser::Cast { expr = o; target = c.target }; line = e.line; col = e.col }
+        }
+        parser::Index as ix => {
+            var recv = match cx_reflect_expr(ix.receiver, rc) { error as x => return x; parser::Expr as v => v }
+            var idx = match cx_reflect_expr(ix.index, rc) { error as x => return x; parser::Expr as v => v }
+            parser::Expr { kind = parser::Index { receiver = recv; index = idx }; line = e.line; col = e.col }
+        }
+        parser::Call as cl => {
+            var args = match cx_reflect_args(cl.args, rc) { error as x => return x; []parser::Expr as v => v }
+            parser::Expr { kind = parser::Call { callee = cl.callee; args = args; arg_names = cl.arg_names; owner_type_args = cl.owner_type_args; callee_type_args = cl.callee_type_args }; line = e.line; col = e.col }
+        }
+        _ => e
+    }
+}
+
+fn cx_reflect_args(args: []parser::Expr, rc: CxRefl): []parser::Expr | error {
+    var out: [args.len]parser::Expr = []
+    var i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        var a = match cx_reflect_expr(args[i], rc) { error as x => return x; parser::Expr as v => v }
+        out[i] = a
+        i++
+    }
+    out
+}
+
+fn cx_reflect_field(fa: parser::FieldAccess, e: parser::Expr, rc: CxRefl): parser::Expr | error {
+    var recv_name = match fa.receiver.kind { parser::Var as v => v.name; _ => "" }
+    if recv_name != "" {
+        match cx_type_bind(rc.tb, recv_name) {
+            (@Type()) as t => return cx_reflect_of(t, fa.field, e, recv_name, rc)
+            null => { }
+        }
+    }
+    var r = match cx_reflect_expr(fa.receiver, rc) { error as x => return x; parser::Expr as v => v }
+    parser::Expr { kind = parser::FieldAccess { receiver = r; field = fa.field }; line = e.line; col = e.col }
+}
+
+fn cx_reflect_of(t: @Type(), field: str, e: parser::Expr, tname: str, rc: CxRefl): parser::Expr | error {
+    if field == "name" { return parser::Expr { kind = parser::StrLit { text = type_render(t) }; line = e.line; col = e.col } }
+    if field == "fields" { return cx_reflect_fields(t, e, tname, rc) }
+    if field == "size" {
+        match cx_type_size(t) {
+            u32 as sz => return parser::Expr { kind = parser::Number { is_float = false; value = parser::numint_of_u64(sz to u64); fval = 0.0 }; line = e.line; col = e.col }
+            null => return error { message = $"comptime `{tname}.size` is not foldable for `{type_render(t)}` — an aggregate's slot size needs layout, not yet reachable at comptime" }
+        }
+    }
+    error { message = $"comptime type reflection has only `.size`, `.name` and `.fields` — `{tname}.{field}` is not a reflection field" }
+}
+
+fn cx_reflect_fields(t: @Type(), e: parser::Expr, tname: str, rc: CxRefl): parser::Expr | error {
+    if rc.fields_elem == "" { return error { message = $"comptime `{tname}.fields` requires the comptime to return a `[]Struct` descriptor slice" } }
+    var type_name = match t { Named as n => n.name; _ => return error { message = $"comptime `{tname}.fields` needs a field-shaped type — `{type_render(t)}` has no fields" } }
+    var fvs = match deriver_field_view(type_name, rc.table) { []FieldView as v => v; error as x => return x }
+    var elems: [fvs.len]parser::ArrayElem = []
+    var i: u64 = 0
+    loop {
+        if i >= fvs.len { break }
+        elems[i] = parser::ArrayElem { is_spread = false; expr = cx_field_descriptor(fvs[i], rc.fields_elem, e) }
+        i++
+    }
+    parser::Expr { kind = parser::ArrayLit { elements = elems }; line = e.line; col = e.col }
+}
+
+fn cx_field_descriptor(fv: FieldView, elem: str, e: parser::Expr): parser::Expr {
+    var names = ["name", "is_nullable"]
+    var name_lit = parser::Expr { kind = parser::StrLit { text = fv.name }; line = e.line; col = e.col }
+    var null_lit = parser::Expr { kind = parser::BoolLit { value = variant_has_null_member(fv.type) }; line = e.line; col = e.col }
+    var vals = [name_lit, null_lit]
+    parser::Expr { kind = parser::StructLit { type_path = cx_path1(elem); type_args = []; field_names = names; field_vals = vals }; line = e.line; col = e.col }
+}
+
+fn cx_path1(name: str): parser::Path {
+    parser::Path { segments = [parser::Segment { name = name }] }
+}
+
+fn cx_slice_elem_name(te: @TypeExpr()): str {
+    match te {
+        parser::SliceType as sl => match sl.element {
+            parser::NamedType as nm => if nm.path.segments.len > 0 { nm.path.segments[nm.path.segments.len - 1].name } else { "" }
+            _ => ""
+        }
+        _ => ""
+    }
+}
+
+fn cx_type_size(t: @Type()): u32 | null {
+    match t {
+        Prim as p => cx_prim_size(p.kind)
+        Byte => 1 to u32
+        Ptr => 8 to u32
+        Uptr => 8 to u32
+        Reference => 8 to u32
+        _ => null
+    }
+}
+
+fn cx_prim_size(k: PrimKind): u32 {
+    match k {
+        U8 => 1 to u32
+        I8 => 1 to u32
+        Bool => 1 to u32
+        U16 => 2 to u32
+        I16 => 2 to u32
+        U32 => 4 to u32
+        I32 => 4 to u32
+        F32 => 4 to u32
+        U64 => 8 to u32
+        I64 => 8 to u32
+        F64 => 8 to u32
+        Isize => 8 to u32
+        Usize => 8 to u32
+    }
+}
+
+fn cx_expand_agg(): AggConstMap { ScalarConstMap { names = []; nss = []; inits = [] } }
+
+fn cx_bind_args(cd: parser::ComptimeDecl, c: TCall, ctx: CxCtx): CxBinds | error {
+    var names: [cd.params.len]str = []
+    var vals: [cd.params.len]TExpr = []
+    var i: u64 = 0
+    loop {
+        if i >= cd.params.len { break }
+        var cv = match eval_const(c.args[i], ctx.table, env_empty(), cx_expand_agg()) {
+            ConstValue as v => v
+            error => return error { message = $"comptime `@{cd.name}`'s argument `{cd.params[i].name}` must be a compile-time constant" }
+        }
+        var pty = match resolve_type(cd.params[i].type_ann, ctx.table, "") { (@Type()) as t => t; error as x => return x }
+        var lit = match comptime_literal_of(cv, pty, ctx.table, c.args[i].line, c.args[i].col) {
+            TExpr as l => l
+            null => return error { message = $"comptime `@{cd.name}`'s argument `{cd.params[i].name}` has no literal form for its parameter type" }
+        }
+        names[i] = cd.params[i].name
+        vals[i] = lit
+        i++
+    }
+    CxBinds { names = names; vals = vals }
+}
+
+fn cx_param_env(cd: parser::ComptimeDecl, ns: str, ctx: CxCtx): Env | error {
+    var env = with_ns(env_empty(), ns)
+    var i: u64 = 0
+    loop {
+        if i >= cd.params.len { break }
+        var pty = match resolve_type(cd.params[i].type_ann, ctx.table, ns) { (@Type()) as t => t; error as x => return x }
+        env = define(env, cd.params[i].name, pty, false)
+        i++
+    }
+    env
+}
+
+fn cx_body_value(cd: parser::ComptimeDecl): parser::Expr | null {
+    if cd.body.len != 1 { return null }
+    match cd.body[0] {
+        parser::Return as r => if r.has_value { r.value } else { null }
+        parser::ExprStmt as es => es.expr
+        _ => null
+    }
+}

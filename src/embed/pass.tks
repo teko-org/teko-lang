@@ -1,0 +1,413 @@
+use teko::parser
+
+/**
+ * dirname_of — the directory portion of a path (everything before the last `/`); the empty string when
+ * the path has no separator.
+ *
+ * @param path  the file path
+ * @return      the directory portion, or "" for a bare file name
+ */
+fn dirname_of(path: str): str {
+    var last: u64 = 0
+    var found = false
+    var i: u64 = 0
+    loop {
+        if i >= path.len { break }
+        if path[i] == b'/' { last = i; found = true }
+        i = i + 1
+    }
+    if !found { return "" }
+    path.slice(0, last)
+}
+
+/**
+ * strip_root_prefix — `path` made relative to `root`: drop a leading `root` (and the `/` after it) when
+ * present, else return `path` unchanged (paths in this compiler are already root-relative).
+ *
+ * @param root  the project root prefix
+ * @param path  the path to relativize
+ * @return      the root-relative path
+ */
+fn strip_root_prefix(root: str, path: str): str {
+    if root.len == 0 { return path }
+    if path.len < root.len { return path }
+    var i: u64 = 0
+    loop {
+        if i >= root.len { break }
+        if path[i] != root[i] { return path }
+        i = i + 1
+    }
+    if path.len == root.len { return "" }
+    if path[root.len] != b'/' { return path }
+    path.slice_from(root.len + 1)
+}
+
+/**
+ * is_drive_absolute — whether `pattern` begins with a Windows drive-absolute prefix (`X:\` or `X:/`),
+ * which is not a valid `#embed` anchor.
+ *
+ * @param pattern  the `#embed` pattern
+ * @return         true when the pattern is drive-absolute
+ */
+fn is_drive_absolute(pattern: str): bool {
+    if pattern.len < 3 { return false }
+    var c = pattern[0]
+    var is_alpha = (c >= b'A' && c <= b'Z') || (c >= b'a' && c <= b'z')
+    if !is_alpha { return false }
+    if pattern[1] != b':' { return false }
+    pattern[2] == b'/' || pattern[2] == b'\\'
+}
+
+/**
+ * normalize_rel — collapse the `.`, `..`, and empty segments of a root-relative path. A `..` that would
+ * rise above the root is an escape error.
+ *
+ * @param joined  the anchor-joined root-relative path
+ * @return        the normalized root-relative path, or an escape error
+ * @throws        when a `..` segment rises above the project root
+ */
+fn normalize_rel(joined: str): str | error {
+    var n = joined.len
+    var seg_start: [n + 1]u64 = []
+    var seg_len: [n + 1]u64 = []
+    var depth: u64 = 0
+    var i: u64 = 0
+    loop {
+        loop { if i >= n { break }; if joined[i] != b'/' { break }; i = i + 1 }
+        if i >= n { break }
+        var start = i
+        loop { if i >= n { break }; if joined[i] == b'/' { break }; i = i + 1 }
+        var len = i - start
+        if len == 1 && joined[start] == b'.' { continue }
+        if len == 2 && joined[start] == b'.' && joined[start + 1] == b'.' {
+            if depth == 0 { return error { message = "escape" } }
+            depth = depth - 1
+            continue
+        }
+        seg_start[depth] = start
+        seg_len[depth] = len
+        depth = depth + 1
+    }
+    var total: u64 = 0
+    var k: u64 = 0
+    loop {
+        if k >= depth { break }
+        if k > 0 { total = total + 1 }
+        total = total + seg_len[k]
+        k = k + 1
+    }
+    var out: [total]byte = []
+    var oi: u64 = 0
+    k = 0
+    loop {
+        if k >= depth { break }
+        if k > 0 { out[oi] = b'/'; oi = oi + 1 }
+        var j: u64 = 0
+        loop {
+            if j >= seg_len[k] { break }
+            out[oi] = joined[seg_start[k] + j]
+            oi = oi + 1
+            j = j + 1
+        }
+        k = k + 1
+    }
+    str_of_bytes(out)
+}
+
+/**
+ * resolve_embed_path — resolve an `#embed` pattern to its normalized VFS key. A bare pattern anchors at
+ * the directive's source-file directory (file-relative); a leading `/` anchors at the project root. The
+ * result is normalized relative to `root` and prefixed `<proj>::/`. Rejects, by construction, any path
+ * escaping `root` via `..` and any Windows drive-absolute prefix.
+ *
+ * @param root     the project root (the dir holding the .tkp)
+ * @param proj     the project name (the compiler-injected `<project-name>::` asset namespace)
+ * @param src_dir  the directory of the .tks carrying the directive (bare-pattern anchor)
+ * @param pattern  the `#embed` pattern verbatim
+ * @return         the normalized `<proj>::/rel` key, or a located escape error
+ * @throws         on a `..` escape past root, or a drive-absolute pattern
+ */
+pub fn embed_rel_path(root: str, src_dir: str, pattern: str): str | error {
+    if is_drive_absolute(pattern) {
+        return error { message = teko::str::concat("#embed path must not be drive-absolute: \"", pattern, "\"") }
+    }
+    var joined = ""
+    if pattern.len > 0 && pattern[0] == b'/' {
+        joined = pattern.slice_from(1)
+    } else {
+        var anchor = strip_root_prefix(root, src_dir)
+        joined = if anchor.len == 0 { pattern } else { teko::str::concat(anchor, "/", pattern) }
+    }
+    match normalize_rel(joined) {
+        str as r => r
+        error => error { message = teko::str::concat("#embed path escapes the project root: \"", pattern, "\"") }
+    }
+}
+
+pub fn resolve_embed_path(root: str, proj: str, src_dir: str, pattern: str): str | error {
+    var rel = match embed_rel_path(root, src_dir, pattern) { str as r => r; error as e => return e }
+    teko::str::concat(proj, "::/", rel)
+}
+
+/**
+ * EmbedEntry — one resolved embedded file: its normalized VFS key, the raw (possibly compressed) content
+ * bytes, the original uncompressed length, and the codec tag.
+ *
+ * @since 0.3.1
+ */
+pub type EmbedEntry = struct {
+    /** The normalized `<proj>::/rel` key. */
+    key: str
+    /** The raw content bytes as stored (compressed when `comp != None`). */
+    blob: []byte
+    /** The original uncompressed byte length. */
+    orig_len: u64
+    /** The codec the content was compressed with. */
+    comp: EmbedCompress
+}
+
+/**
+ * EmbedResult — the outcome of the embed pass: the ordered resolved entries and any collected
+ * compile-time diagnostics (one per rejected directive).
+ *
+ * @since 0.3.1
+ */
+pub type EmbedResult = struct {
+    /** The resolved entries in directive/emit order. */
+    entries: []EmbedEntry
+    /** The collected located diagnostics; a non-empty list fails the build. */
+    diags: []str
+}
+
+/**
+ * codec_name — the display name of a codec for a diagnostic.
+ *
+ * @param comp  the codec
+ * @return      the human name
+ */
+fn codec_name(comp: EmbedCompress): str {
+    match comp {
+        EmbedCompress::None => "None"
+        EmbedCompress::Deflate => "Deflate"
+        EmbedCompress::Gzip => "Gzip"
+    }
+}
+
+/**
+ * level_in_range — whether `level` is within the codec's declared range (Deflate/Gzip 0..9; None ignores
+ * the level).
+ *
+ * @param comp   the codec
+ * @param level  the requested compression level
+ * @return       true when the level is acceptable
+ */
+fn level_in_range(comp: EmbedCompress, level: i64): bool {
+    match comp {
+        EmbedCompress::None => true
+        EmbedCompress::Deflate => level >= 0 && level <= 9
+        EmbedCompress::Gzip => level >= 0 && level <= 9
+    }
+}
+
+/**
+ * compress_bytes — apply the directive's codec to `bytes` at build time; None stores verbatim.
+ *
+ * @param comp   the codec
+ * @param bytes  the raw file bytes
+ * @return       the stored (possibly compressed) bytes
+ */
+fn compress_bytes(comp: EmbedCompress, bytes: []byte): []byte {
+    match comp {
+        EmbedCompress::None => bytes
+        EmbedCompress::Deflate => teko::compress::deflate(bytes)
+        EmbedCompress::Gzip => teko::compress::gzip_compress(bytes)
+    }
+}
+
+/**
+ * located_diag — a compiler-style `file:line:col: message` diagnostic for a directive.
+ *
+ * @param ed   the directive
+ * @param msg  the cause
+ * @return     the located diagnostic string
+ */
+fn located_diag(ed: parser::EmbedDecl, msg: str): str {
+    teko::str::concat(ed.src_path, ":", teko::u64_to_str(ed.line to u64), ":", teko::u64_to_str(ed.col to u64), ": ", msg)
+}
+
+/**
+ * key_already_seen — whether `key` is among the first `count` accumulated keys (conflict detection).
+ *
+ * @param keys   the accumulated key buffer
+ * @param count  the number of live keys
+ * @param key    the candidate key
+ * @return       true when a duplicate exists
+ */
+fn key_already_seen(keys: []str, count: u64, key: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= count { break }
+        if keys[i] == key { return true }
+        i = i + 1
+    }
+    false
+}
+
+/**
+ * run_embed_pass — resolve, validate, read, and compress every `#embed` directive at compile time,
+ * collecting one located diagnostic per rejected directive. Path escapes, drive-absolute prefixes,
+ * out-of-range levels, missing files, and duplicate keys are all reported; the surviving directives
+ * become ordered entries feeding the Tier-A const materialization.
+ *
+ * @param embeds  every parsed `#embed` directive across the program
+ * @param proj    the project name (asset namespace)
+ * @param root    the project root prefix
+ * @return        the resolved entries and any collected diagnostics
+ */
+pub fn run_embed_pass(embeds: []parser::EmbedDecl, proj: str, root: str): EmbedResult {
+    var n = embeds.len
+    var entries: [n]EmbedEntry = []
+    var keys: [n]str = []
+    var diags: [n]str = []
+    var ecount: u64 = 0
+    var dcount: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        var ed = embeds[i]
+        var src_dir = dirname_of(ed.src_path)
+        var key = ""
+        var ok = true
+        match resolve_embed_path(root, proj, src_dir, ed.pattern) {
+            str as k => key = k
+            error as e => { diags[dcount] = located_diag(ed, e.message); dcount = dcount + 1; ok = false }
+        }
+        if ok && !level_in_range(ed.comp, ed.level) {
+            diags[dcount] = located_diag(ed, teko::str::concat("#embed compression level ", teko::str::i64_to_str(ed.level), " out of range for ", codec_name(ed.comp), " (0..9)"))
+            dcount = dcount + 1
+            ok = false
+        }
+        if ok && key_already_seen(keys, ecount, key) {
+            diags[dcount] = located_diag(ed, teko::str::concat("#embed path conflict: \"", key, "\" embedded by two directives"))
+            dcount = dcount + 1
+            ok = false
+        }
+        if ok {
+            var rel = key.slice_from(proj.len + 3)
+            match teko::io::read_file_bytes(rel) {
+                []byte as bytes => {
+                    keys[ecount] = key
+                    entries[ecount] = EmbedEntry { key = key; blob = compress_bytes(ed.comp, bytes); orig_len = bytes.len; comp = ed.comp }
+                    ecount = ecount + 1
+                }
+                error => {
+                    diags[dcount] = located_diag(ed, teko::str::concat("#embed: no such file in the project: \"", ed.pattern, "\""))
+                    dcount = dcount + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    EmbedResult { entries = teko::collections::arr_slice(entries, 0, ecount); diags = teko::collections::arr_slice(diags, 0, dcount) }
+}
+
+/**
+ * EMBED_RECORD_BYTES — the fixed width of one packed table record: six little-endian u64 fields
+ * (name_off, name_len, blob_off, blob_len, orig_len, comp_tag).
+ */
+pub const EMBED_RECORD_BYTES: u64 = 48
+
+/**
+ * comp_tag_of — the numeric codec tag stored in the table (0=None, 1=Deflate, 2=Gzip).
+ *
+ * @param comp  the codec
+ * @return      the tag byte value
+ */
+fn comp_tag_of(comp: EmbedCompress): u64 {
+    match comp {
+        EmbedCompress::None => 0
+        EmbedCompress::Deflate => 1
+        EmbedCompress::Gzip => 2
+    }
+}
+
+/**
+ * put_u64_le — write `v` as eight little-endian bytes into `out` starting at `at`.
+ *
+ * @param out  the destination buffer
+ * @param at   the start offset
+ * @param v    the value
+ * @return     the offset past the written eight bytes
+ */
+fn put_u64_le(ref out: []byte, at: u64, v: u64): u64 {
+    var j: u64 = 0
+    loop {
+        if j >= 8 { break }
+        out[at + j] = ((v >> (j * 8)) & 0xFF) to byte
+        j = j + 1
+    }
+    at + 8
+}
+
+/**
+ * EmbedHeaps — the four Tier-A heaps materialized from the resolved entries: the concatenated key heap,
+ * the concatenated content heap, the packed record table, and the entry count.
+ *
+ * @since 0.3.1
+ */
+pub type EmbedHeaps = struct {
+    /** The concatenated UTF-8 key heap. */
+    names: []byte
+    /** The concatenated (possibly compressed) content heap. */
+    blobs: []byte
+    /** The packed fixed-width record table. */
+    table: []byte
+    /** The entry count. */
+    count: u64
+}
+
+/**
+ * serialize_embed_heaps — flatten the resolved entries into the four Tier-A heaps (names, blobs, packed
+ * table, count) ready for rodata const materialization.
+ *
+ * @param result  the resolved embed entries
+ * @return        the four flattened heaps
+ */
+pub fn serialize_embed_heaps(result: EmbedResult): EmbedHeaps {
+    var n = result.entries.len
+    var names_len: u64 = 0
+    var blobs_len: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        names_len = names_len + result.entries[i].key.len
+        blobs_len = blobs_len + result.entries[i].blob.len
+        i = i + 1
+    }
+    var names: [names_len]byte = []
+    var blobs: [blobs_len]byte = []
+    var table: [n * EMBED_RECORD_BYTES]byte = []
+    var noff: u64 = 0
+    var boff: u64 = 0
+    var toff: u64 = 0
+    i = 0
+    loop {
+        if i >= n { break }
+        var ent = result.entries[i]
+        var kb = ent.key.bytes()
+        var name_off = noff
+        var j: u64 = 0
+        loop { if j >= kb.len { break }; names[noff] = kb[j]; noff = noff + 1; j = j + 1 }
+        var blob_off = boff
+        var b: u64 = 0
+        loop { if b >= ent.blob.len { break }; blobs[boff] = ent.blob[b]; boff = boff + 1; b = b + 1 }
+        toff = put_u64_le(table, toff, name_off)
+        toff = put_u64_le(table, toff, kb.len)
+        toff = put_u64_le(table, toff, blob_off)
+        toff = put_u64_le(table, toff, ent.blob.len)
+        toff = put_u64_le(table, toff, ent.orig_len)
+        toff = put_u64_le(table, toff, comp_tag_of(ent.comp))
+        i = i + 1
+    }
+    EmbedHeaps { names = names; blobs = blobs; table = table; count = n }
+}

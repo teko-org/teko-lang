@@ -1,0 +1,813 @@
+fn xml_namespace_uri(): str {
+    "http://www.w3.org/XML/1998/namespace"
+}
+
+fn xmlns_namespace_uri(): str {
+    "http://www.w3.org/2000/xmlns/"
+}
+
+/**
+ * The kind discriminant of an `XmlNode`: which of the five well-formed node shapes it is.
+ * `Element` is `<name attrs>children</name>` (or the empty `<name attrs/>`); `Text` is
+ * character data between markup with entities already decoded; `Comment` is `<!-- ... -->`;
+ * `CData` is a `<![CDATA[ ... ]]>` section whose contents are taken verbatim; and
+ * `ProcessingInstruction` is `<?target data?>`.
+ */
+exp type NodeKind = enum {
+    Element; Text; Comment; CData; ProcessingInstruction
+}
+
+/**
+ * One attribute of an element, with its qualified name split into prefix + local part and
+ * its namespace URI resolved from the in-scope declarations.
+ */
+exp type XmlAttr = struct {
+    /**
+     * The attribute's qualified name exactly as written (e.g. `id`, `xml:lang`, `xmlns:x`).
+     */
+    name: str
+    /**
+     * The namespace prefix (the part before `:`), or `""` when the name is unprefixed. For a
+     * namespace declaration the prefix is literally `xmlns` (with `local` the declared prefix).
+     */
+    prefix: str
+    /**
+     * The local part (the part after `:`, or the whole name when unprefixed).
+     */
+    local: str
+    /**
+     * The resolved namespace URI. `""` for an unprefixed attribute (an unprefixed attribute is
+     * NOT in the default namespace, per XML Namespaces §6.2); the reserved `xmlns` URI for a
+     * namespace declaration; otherwise the URI bound to `prefix`.
+     */
+    namespace_uri: str
+    /**
+     * The attribute value with entity and character references decoded.
+     */
+    value: str
+}
+
+/**
+ * A node in the parsed XML tree. A single tagged struct spanning all five `NodeKind`s: `kind`
+ * selects which fields are meaningful.
+ */
+exp type XmlNode = struct {
+    /**
+     * Which node shape this is; selects which of the fields below carry meaning.
+     */
+    kind: NodeKind
+    /**
+     * The element's qualified name (`Element`) or the processing instruction's target
+     * (`ProcessingInstruction`); `""` for text, comment, and CDATA nodes.
+     */
+    name: str
+    /**
+     * The element's namespace prefix, or `""`. Meaningful only for `Element`.
+     */
+    prefix: str
+    /**
+     * The element's local name (name after the prefix). Meaningful only for `Element`.
+     */
+    local: str
+    /**
+     * The element's resolved namespace URI, or `""` when it is in no namespace. Meaningful
+     * only for `Element`.
+     */
+    namespace_uri: str
+    /**
+     * The character payload: decoded text (`Text`), comment body (`Comment`), verbatim CDATA
+     * contents (`CData`), or the instruction data after the target (`ProcessingInstruction`).
+     * `""` for `Element`.
+     */
+    text: str
+    /**
+     * The element's attributes in document order. Empty for non-element nodes.
+     */
+    attributes: []XmlAttr
+    /**
+     * The element's child nodes in document order. Empty for non-element nodes.
+     */
+    children: []XmlNode
+}
+
+/**
+ * Builds a text node carrying the given decoded character data.
+ */
+exp fn text_node(value: str): XmlNode {
+    XmlNode { kind = NodeKind::Text; name = ""; prefix = ""; local = ""; namespace_uri = ""; text = value; attributes = []; children = [] }
+}
+
+/**
+ * Builds a comment node.
+ */
+exp fn comment_node(body: str): XmlNode {
+    XmlNode { kind = NodeKind::Comment; name = ""; prefix = ""; local = ""; namespace_uri = ""; text = body; attributes = []; children = [] }
+}
+
+/**
+ * Builds a CDATA-section node.
+ */
+exp fn cdata_node(contents: str): XmlNode {
+    XmlNode { kind = NodeKind::CData; name = ""; prefix = ""; local = ""; namespace_uri = ""; text = contents; attributes = []; children = [] }
+}
+
+/**
+ * Builds a processing-instruction node.
+ */
+exp fn pi_node(target: str, data: str): XmlNode {
+    XmlNode { kind = NodeKind::ProcessingInstruction; name = target; prefix = ""; local = ""; namespace_uri = ""; text = data; attributes = []; children = [] }
+}
+
+/**
+ * Reports whether a node is an element.
+ */
+exp fn is_element(node: XmlNode): bool {
+    node.kind == NodeKind::Element
+}
+
+/**
+ * Reports whether a node is character-data text.
+ */
+exp fn is_text(node: XmlNode): bool {
+    node.kind == NodeKind::Text
+}
+
+fn str_eq(a: str, b: str): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+fn is_xml_ws(b: byte): bool {
+    b == b' ' || b == b'\t' || b == b'\r' || b == b'\n'
+}
+
+fn is_name_start(b: byte): bool {
+    (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') || b == b'_' || b == b':' || b >= 0x80 to byte
+}
+
+fn is_name_char(b: byte): bool {
+    is_name_start(b) || (b >= b'0' && b <= b'9') || b == b'-' || b == b'.'
+}
+
+fn is_digit_byte(b: byte): bool {
+    b >= b'0' && b <= b'9'
+}
+
+fn hex_digit_value(b: byte): i64 {
+    if b >= b'0' && b <= b'9' { return (b to i64) - (b'0' to i64) }
+    if b >= b'a' && b <= b'f' { return (b to i64) - (b'a' to i64) + 10 }
+    if b >= b'A' && b <= b'F' { return (b to i64) - (b'A' to i64) + 10 }
+    -1
+}
+
+fn codepoint_to_str(cp: i64): str {
+    if cp <= 0x7F {
+        one_byte(cp to byte)
+    } else if cp <= 0x7FF {
+        var b0 = (0xC0 | (cp >> 6)) to byte
+        var b1 = (0x80 | (cp & 0x3F)) to byte
+        one_byte(b0) ~ one_byte(b1)
+    } else if cp <= 0xFFFF {
+        var b0 = (0xE0 | (cp >> 12)) to byte
+        var b1 = (0x80 | ((cp >> 6) & 0x3F)) to byte
+        var b2 = (0x80 | (cp & 0x3F)) to byte
+        one_byte(b0) ~ one_byte(b1) ~ one_byte(b2)
+    } else {
+        var b0 = (0xF0 | (cp >> 18)) to byte
+        var b1 = (0x80 | ((cp >> 12) & 0x3F)) to byte
+        var b2 = (0x80 | ((cp >> 6) & 0x3F)) to byte
+        var b3 = (0x80 | (cp & 0x3F)) to byte
+        one_byte(b0) ~ one_byte(b1) ~ one_byte(b2) ~ one_byte(b3)
+    }
+}
+
+pub type QName = struct {
+    prefix: str
+    local: str
+}
+
+fn split_qname(name: str): QName {
+    var i: u64 = 0
+    loop {
+        if i >= name.len { break }
+        if name[i] == b':' {
+            return QName { prefix = slice_str(name, 0, i); local = slice_str(name, i + 1, name.len) }
+        }
+        i++
+    }
+    QName { prefix = ""; local = name }
+}
+
+fn slice_str(s: str, from: u64, to: u64): str {
+    var out: str = ""
+    var i = from
+    loop {
+        if i >= to { break }
+        out = out ~ one_byte(s[i])
+        i++
+    }
+    out
+}
+
+pub type NsScope = struct {
+    prefixes: []str
+    uris: []str
+}
+
+fn root_scope(): NsScope {
+    var prefixes: []str = []
+    var uris: []str = []
+    prefixes = [..prefixes, "xml"]
+    uris = [..uris, xml_namespace_uri()]
+    NsScope { prefixes = prefixes; uris = uris }
+}
+
+fn scope_extend(scope: NsScope, prefix: str, uri: str): NsScope {
+    NsScope { prefixes = [..scope.prefixes, prefix]; uris = [..scope.uris, uri] }
+}
+
+fn scope_lookup(scope: NsScope, prefix: str): str {
+    var i = scope.prefixes.len
+    loop {
+        if i == 0 { break }
+        i--
+        if str_eq(scope.prefixes[i], prefix) { return scope.uris[i] }
+    }
+    ""
+}
+
+pub type XmlCursor = struct {
+    pos: u64
+    node: XmlNode
+}
+
+pub type NameScan = struct {
+    pos: u64
+    text: str
+}
+
+pub type TextScan = struct {
+    pos: u64
+    text: str
+}
+
+fn skip_ws(p: []byte, pos: u64): u64 {
+    var at = pos
+    loop {
+        if at >= p.len || !is_xml_ws(p[at]) { break }
+        at++
+    }
+    at
+}
+
+fn matches_at(p: []byte, pos: u64, token: str): bool {
+    if pos + token.len > p.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= token.len { break }
+        if p[pos + i] != token[i] { return false }
+        i++
+    }
+    true
+}
+
+fn index_of(p: []byte, pos: u64, token: str): u64 {
+    var at = pos
+    loop {
+        if at + token.len > p.len { break }
+        if matches_at(p, at, token) { return at }
+        at++
+    }
+    p.len
+}
+
+fn scan_name(p: []byte, pos: u64): NameScan | error {
+    if pos >= p.len || !is_name_start(p[pos]) {
+        return error { message = concat("xml: expected a name at offset ", i64_to_str(pos to i64)) }
+    }
+    var at = pos
+    loop {
+        if at >= p.len || !is_name_char(p[at]) { break }
+        at++
+    }
+    NameScan { pos = at; text = slice_str_bytes(p, pos, at) }
+}
+
+fn slice_str_bytes(p: []byte, from: u64, to: u64): str {
+    var out: str = ""
+    var i = from
+    loop {
+        if i >= to { break }
+        out = out ~ one_byte(p[i])
+        i++
+    }
+    out
+}
+
+fn decode_reference(p: []byte, pos: u64): TextScan | error {
+    var semi = index_of(p, pos, ";")
+    if semi >= p.len {
+        return error { message = concat("xml: unterminated entity reference at offset ", i64_to_str(pos to i64)) }
+    }
+    if p[pos + 1] == b'#' {
+        return decode_char_reference(p, pos, semi)
+    }
+    var name = slice_str_bytes(p, pos + 1, semi)
+    if str_eq(name, "lt") { return TextScan { pos = semi + 1; text = "<" } }
+    if str_eq(name, "gt") { return TextScan { pos = semi + 1; text = ">" } }
+    if str_eq(name, "amp") { return TextScan { pos = semi + 1; text = "&" } }
+    if str_eq(name, "quot") { return TextScan { pos = semi + 1; text = "\"" } }
+    if str_eq(name, "apos") { return TextScan { pos = semi + 1; text = "'" } }
+    error { message = concat("xml: unknown entity reference &", concat(name, ";")) }
+}
+
+fn decode_char_reference(p: []byte, pos: u64, semi: u64): TextScan | error {
+    var hex = p[pos + 2] == b'x' || p[pos + 2] == b'X'
+    var digits_start = if hex { pos + 3 } else { pos + 2 }
+    if digits_start >= semi {
+        return error { message = concat("xml: empty numeric character reference at offset ", i64_to_str(pos to i64)) }
+    }
+    var value: i64 = 0
+    var i = digits_start
+    loop {
+        if i >= semi { break }
+        var d = if hex { hex_digit_value(p[i]) } else { digit_or_neg(p[i]) }
+        if d < 0 {
+            return error { message = concat("xml: invalid digit in numeric character reference at offset ", i64_to_str(i to i64)) }
+        }
+        value = (value * (if hex { 16 } else { 10 })) + d
+        if value > 0x10FFFF {
+            return error { message = "xml: numeric character reference out of Unicode range" }
+        }
+        i++
+    }
+    TextScan { pos = semi + 1; text = codepoint_to_str(value) }
+}
+
+fn digit_or_neg(b: byte): i64 {
+    if is_digit_byte(b) { return (b to i64) - (b'0' to i64) }
+    -1
+}
+
+fn scan_char_data(p: []byte, pos: u64): TextScan | error {
+    var out: str = ""
+    var at = pos
+    loop {
+        if at >= p.len {
+            return error { message = "xml: unexpected end of input inside element content" }
+        }
+        var b = p[at]
+        if b == b'<' { return TextScan { pos = at; text = out } }
+        if b == b'&' {
+            var r = match decode_reference(p, at) { TextScan as s => s; error as e => return e }
+            out = out ~ r.text
+            at = r.pos
+            continue
+        }
+        out = out ~ one_byte(b)
+        at++
+    }
+    error { message = "xml: unreachable" }
+}
+
+fn scan_attr_value(p: []byte, pos: u64, quote: byte): TextScan | error {
+    var out: str = ""
+    var at = pos
+    loop {
+        if at >= p.len {
+            return error { message = "xml: unterminated attribute value" }
+        }
+        var b = p[at]
+        if b == quote { return TextScan { pos = at + 1; text = out } }
+        if b == b'<' {
+            return error { message = concat("xml: raw '<' in attribute value at offset ", i64_to_str(at to i64)) }
+        }
+        if b == b'&' {
+            var r = match decode_reference(p, at) { TextScan as s => s; error as e => return e }
+            out = out ~ r.text
+            at = r.pos
+            continue
+        }
+        out = out ~ one_byte(b)
+        at++
+    }
+    error { message = "xml: unreachable" }
+}
+
+pub type TagHead = struct {
+    pos: u64
+    attrs: []XmlAttr
+    self_closing: bool
+}
+
+fn parse_attributes(p: []byte, pos: u64): TagHead | error {
+    var attrs: []XmlAttr = []
+    var at = pos
+    loop {
+        at = skip_ws(p, at)
+        if at >= p.len {
+            return error { message = "xml: unterminated start tag" }
+        }
+        if p[at] == b'>' { return TagHead { pos = at + 1; attrs = attrs; self_closing = false } }
+        if p[at] == b'/' {
+            if at + 1 >= p.len || p[at + 1] != b'>' {
+                return error { message = concat("xml: expected '/>' at offset ", i64_to_str(at to i64)) }
+            }
+            return TagHead { pos = at + 2; attrs = attrs; self_closing = true }
+        }
+        var attr = match parse_one_attribute(p, at) { AttrScan as a => a; error as e => return e }
+        if attribute_name_taken(attrs, attr.attr.name) {
+            return error { message = concat("xml: duplicate attribute ", attr.attr.name) }
+        }
+        attrs = [..attrs, attr.attr]
+        at = attr.pos
+    }
+    error { message = "xml: unreachable" }
+}
+
+fn attribute_name_taken(attrs: []XmlAttr, name: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= attrs.len { break }
+        if str_eq(attrs[i].name, name) { return true }
+        i++
+    }
+    false
+}
+
+pub type AttrScan = struct {
+    pos: u64
+    attr: XmlAttr
+}
+
+fn parse_one_attribute(p: []byte, pos: u64): AttrScan | error {
+    var name = match scan_name(p, pos) { NameScan as n => n; error as e => return e }
+    var at = skip_ws(p, name.pos)
+    if at >= p.len || p[at] != b'=' {
+        return error { message = concat("xml: expected '=' after attribute ", name.text) }
+    }
+    at = skip_ws(p, at + 1)
+    if at >= p.len || (p[at] != b'"' && p[at] != b'\'') {
+        return error { message = concat("xml: attribute value must be quoted for ", name.text) }
+    }
+    var value = match scan_attr_value(p, at + 1, p[at]) { TextScan as v => v; error as e => return e }
+    var qn = split_qname(name.text)
+    var attr = XmlAttr { name = name.text; prefix = qn.prefix; local = qn.local; namespace_uri = ""; value = value.text }
+    AttrScan { pos = value.pos; attr = attr }
+}
+
+fn scope_with_declarations(scope: NsScope, attrs: []XmlAttr): NsScope {
+    var result = scope
+    var i: u64 = 0
+    loop {
+        if i >= attrs.len { break }
+        var a = attrs[i]
+        if str_eq(a.name, "xmlns") {
+            result = scope_extend(result, "", a.value)
+        } else if str_eq(a.prefix, "xmlns") {
+            result = scope_extend(result, a.local, a.value)
+        }
+        i++
+    }
+    result
+}
+
+fn resolve_attribute_namespaces(scope: NsScope, attrs: []XmlAttr): []XmlAttr | error {
+    var out: []XmlAttr = []
+    var i: u64 = 0
+    loop {
+        if i >= attrs.len { break }
+        var a = attrs[i]
+        var uri = match resolve_one_attribute_uri(scope, a) { str as u => u; error as e => return e }
+        out = [..out, XmlAttr { name = a.name; prefix = a.prefix; local = a.local; namespace_uri = uri; value = a.value }]
+        i++
+    }
+    out
+}
+
+fn resolve_one_attribute_uri(scope: NsScope, a: XmlAttr): str | error {
+    if str_eq(a.name, "xmlns") || str_eq(a.prefix, "xmlns") { return xmlns_namespace_uri() }
+    if a.prefix.len == 0 { return "" }
+    var uri = scope_lookup(scope, a.prefix)
+    if uri.len == 0 {
+        return error { message = concat("xml: unbound namespace prefix in attribute ", a.name) }
+    }
+    uri
+}
+
+fn parse_element(p: []byte, pos: u64, scope: NsScope): XmlCursor | error {
+    var name = match scan_name(p, pos + 1) { NameScan as n => n; error as e => return e }
+    var head = match parse_attributes(p, name.pos) { TagHead as h => h; error as e => return e }
+    var child_scope = scope_with_declarations(scope, head.attrs)
+    var attrs = match resolve_attribute_namespaces(child_scope, head.attrs) { []XmlAttr as r => r; error as e => return e }
+    var qn = split_qname(name.text)
+    var element_uri = match resolve_element_uri(child_scope, qn) { str as u => u; error as e => return e }
+    var node = XmlNode { kind = NodeKind::Element; name = name.text; prefix = qn.prefix; local = qn.local; namespace_uri = element_uri; text = ""; attributes = attrs; children = [] }
+    if head.self_closing {
+        return XmlCursor { pos = head.pos; node = node }
+    }
+    parse_element_content(p, head.pos, child_scope, node, name.text)
+}
+
+fn resolve_element_uri(scope: NsScope, qn: QName): str | error {
+    if qn.prefix.len == 0 { return scope_lookup(scope, "") }
+    var uri = scope_lookup(scope, qn.prefix)
+    if uri.len == 0 {
+        return error { message = concat("xml: unbound namespace prefix ", qn.prefix) }
+    }
+    uri
+}
+
+fn parse_element_content(p: []byte, pos: u64, scope: NsScope, open_node: XmlNode, open_name: str): XmlCursor | error {
+    var children: []XmlNode = []
+    var at = pos
+    loop {
+        if at >= p.len {
+            return error { message = concat("xml: unclosed element <", concat(open_name, ">")) }
+        }
+        if p[at] != b'<' {
+            var text = match scan_char_data(p, at) { TextScan as t => t; error as e => return e }
+            children = [..children, text_node(text.text)]
+            at = text.pos
+            continue
+        }
+        if matches_at(p, at, "</") {
+            return finish_element(p, at, open_node, open_name, children)
+        }
+        var child = match parse_markup(p, at, scope) { XmlCursor as c => c; error as e => return e }
+        children = [..children, child.node]
+        at = child.pos
+    }
+    error { message = "xml: unreachable" }
+}
+
+fn finish_element(p: []byte, pos: u64, open_node: XmlNode, open_name: str, children: []XmlNode): XmlCursor | error {
+    var name = match scan_name(p, pos + 2) { NameScan as n => n; error as e => return e }
+    if !str_eq(name.text, open_name) {
+        return error { message = concat("xml: end tag </", concat(name.text, concat("> does not match <", concat(open_name, ">")))) }
+    }
+    var at = skip_ws(p, name.pos)
+    if at >= p.len || p[at] != b'>' {
+        return error { message = concat("xml: malformed end tag for ", open_name) }
+    }
+    var complete = XmlNode { kind = NodeKind::Element; name = open_node.name; prefix = open_node.prefix; local = open_node.local; namespace_uri = open_node.namespace_uri; text = ""; attributes = open_node.attributes; children = children }
+    XmlCursor { pos = at + 1; node = complete }
+}
+
+fn parse_markup(p: []byte, pos: u64, scope: NsScope): XmlCursor | error {
+    if matches_at(p, pos, "<!--") { return parse_comment(p, pos) }
+    if matches_at(p, pos, "<![CDATA[") { return parse_cdata(p, pos) }
+    if matches_at(p, pos, "<?") { return parse_pi(p, pos) }
+    if matches_at(p, pos, "<!") {
+        return error { message = concat("xml: unexpected declaration in element content at offset ", i64_to_str(pos to i64)) }
+    }
+    parse_element(p, pos, scope)
+}
+
+fn parse_comment(p: []byte, pos: u64): XmlCursor | error {
+    var start = pos + 4
+    var end = index_of(p, start, "-->")
+    if end >= p.len {
+        return error { message = "xml: unterminated comment" }
+    }
+    XmlCursor { pos = end + 3; node = comment_node(slice_str_bytes(p, start, end)) }
+}
+
+fn parse_cdata(p: []byte, pos: u64): XmlCursor | error {
+    var start = pos + 9
+    var end = index_of(p, start, "]]>")
+    if end >= p.len {
+        return error { message = "xml: unterminated CDATA section" }
+    }
+    XmlCursor { pos = end + 3; node = cdata_node(slice_str_bytes(p, start, end)) }
+}
+
+fn parse_pi(p: []byte, pos: u64): XmlCursor | error {
+    var target = match scan_name(p, pos + 2) { NameScan as n => n; error as e => return e }
+    var end = index_of(p, target.pos, "?>")
+    if end >= p.len {
+        return error { message = "xml: unterminated processing instruction" }
+    }
+    var data = slice_str_bytes(p, skip_ws(p, target.pos), end)
+    XmlCursor { pos = end + 2; node = pi_node(target.text, data) }
+}
+
+fn skip_prolog(p: []byte, pos: u64): u64 | error {
+    var at = skip_ws(p, pos)
+    loop {
+        if at >= p.len { break }
+        if matches_at(p, at, "<!--") {
+            var end = index_of(p, at + 4, "-->")
+            if end >= p.len { return error { message = "xml: unterminated comment in prolog" } }
+            at = skip_ws(p, end + 3)
+            continue
+        }
+        if matches_at(p, at, "<!DOCTYPE") {
+            at = match skip_doctype(p, at) { u64 as n => n; error as e => return e }
+            at = skip_ws(p, at)
+            continue
+        }
+        if matches_at(p, at, "<?") {
+            var end = index_of(p, at + 2, "?>")
+            if end >= p.len { return error { message = "xml: unterminated processing instruction in prolog" } }
+            at = skip_ws(p, end + 2)
+            continue
+        }
+        break
+    }
+    at
+}
+
+fn skip_doctype(p: []byte, pos: u64): u64 | error {
+    var at = pos + 9
+    loop {
+        if at >= p.len { return error { message = "xml: unterminated DOCTYPE" } }
+        if p[at] == b'[' {
+            var close = index_of(p, at, "]")
+            if close >= p.len { return error { message = "xml: unterminated DOCTYPE internal subset" } }
+            at = close + 1
+            continue
+        }
+        if p[at] == b'>' { return at + 1 }
+        at++
+    }
+    error { message = "xml: unreachable" }
+}
+
+fn skip_trailing(p: []byte, pos: u64): u64 {
+    var at = skip_ws(p, pos)
+    loop {
+        if at >= p.len { break }
+        if matches_at(p, at, "<!--") {
+            var end = index_of(p, at + 4, "-->")
+            if end >= p.len { break }
+            at = skip_ws(p, end + 3)
+            continue
+        }
+        if matches_at(p, at, "<?") {
+            var end = index_of(p, at + 2, "?>")
+            if end >= p.len { break }
+            at = skip_ws(p, end + 2)
+            continue
+        }
+        break
+    }
+    at
+}
+
+/**
+ * Parses a complete, well-formed XML 1.0 document and returns its root element node. The
+ * prolog (declaration, comments, PIs, DOCTYPE) is skipped; exactly one root element must be
+ * present, and only whitespace / comments / PIs may follow it.
+ */
+exp fn parse(text: str): XmlNode | error {
+    var p = text.bytes()
+    var start = match skip_prolog(p, 0) { u64 as n => n; error as e => return e }
+    if start >= p.len || p[start] != b'<' {
+        return error { message = "xml: document has no root element" }
+    }
+    if matches_at(p, start, "</") || matches_at(p, start, "<!") || matches_at(p, start, "<?") {
+        return error { message = "xml: expected a root element" }
+    }
+    var root = match parse_element(p, start, root_scope()) { XmlCursor as c => c; error as e => return e }
+    var after = skip_trailing(p, root.pos)
+    if after != p.len {
+        return error { message = concat("xml: unexpected content after root element at offset ", i64_to_str(after to i64)) }
+    }
+    root.node
+}
+
+fn escape_text(s: str): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        var b = s[i]
+        if b == b'&' { out = out ~ "&amp;" } else if b == b'<' { out = out ~ "&lt;" } else if b == b'>' { out = out ~ "&gt;" } else { out = out ~ one_byte(b) }
+        i++
+    }
+    out
+}
+
+fn escape_attr(s: str): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        var b = s[i]
+        if b == b'&' { out = out ~ "&amp;" } else if b == b'<' { out = out ~ "&lt;" } else if b == b'"' { out = out ~ "&quot;" } else { out = out ~ one_byte(b) }
+        i++
+    }
+    out
+}
+
+/**
+ * Serializes an `XmlNode` tree back into XML 1.0 text with correct text and attribute
+ * escaping. Total: a well-formed node always has a valid rendering (M.3). An element with no
+ * children is written in the empty-element form `<name .../>`.
+ */
+exp fn serialize(node: XmlNode): str {
+    match node.kind {
+        NodeKind::Element => serialize_element(node)
+        NodeKind::Text => escape_text(node.text)
+        NodeKind::Comment => concat("<!--", concat(node.text, "-->"))
+        NodeKind::CData => concat("<![CDATA[", concat(node.text, "]]>"))
+        NodeKind::ProcessingInstruction => serialize_pi(node)
+    }
+}
+
+fn serialize_element(node: XmlNode): str {
+    var out = concat("<", concat(node.name, serialize_attributes(node.attributes)))
+    if node.children.len == 0 {
+        return out ~ "/>"
+    }
+    out = out ~ ">"
+    var i: u64 = 0
+    loop {
+        if i >= node.children.len { break }
+        out = out ~ serialize(node.children[i])
+        i++
+    }
+    out ~ concat("</", concat(node.name, ">"))
+}
+
+fn serialize_attributes(attrs: []XmlAttr): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= attrs.len { break }
+        out = out ~ concat(" ", concat(attrs[i].name, concat("=\"", concat(escape_attr(attrs[i].value), "\""))))
+        i++
+    }
+    out
+}
+
+fn serialize_pi(node: XmlNode): str {
+    if node.text.len == 0 {
+        return concat("<?", concat(node.name, "?>"))
+    }
+    concat("<?", concat(node.name, concat(" ", concat(node.text, "?>"))))
+}
+
+/**
+ * Returns the value of an element's attribute by qualified name, or `null` when absent.
+ */
+exp fn get_attribute(node: XmlNode, name: str): str | null {
+    var i: u64 = 0
+    loop {
+        if i >= node.attributes.len { break }
+        if str_eq(node.attributes[i].name, name) { return node.attributes[i].value }
+        i++
+    }
+    null
+}
+
+/**
+ * Returns an element's child nodes that are themselves elements (skipping text, comments,
+ * CDATA, and PIs), in document order.
+ */
+exp fn element_children(node: XmlNode): []XmlNode {
+    var out: []XmlNode = []
+    var i: u64 = 0
+    loop {
+        if i >= node.children.len { break }
+        if node.children[i].kind == NodeKind::Element { out = [..out, node.children[i]] }
+        i++
+    }
+    out
+}
+
+/**
+ * Returns the first child element with the given qualified name, or `null` when none exists.
+ */
+exp fn first_child(node: XmlNode, name: str): XmlNode | null {
+    var i: u64 = 0
+    loop {
+        if i >= node.children.len { break }
+        if node.children[i].kind == NodeKind::Element && str_eq(node.children[i].name, name) { return node.children[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * Concatenates the decoded character data of an element's direct text and CDATA children
+ * (not descendants), the common "the text of this element" accessor.
+ */
+exp fn text_content(node: XmlNode): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= node.children.len { break }
+        var c = node.children[i]
+        if c.kind == NodeKind::Text || c.kind == NodeKind::CData { out = out ~ c.text }
+        i++
+    }
+    out
+}

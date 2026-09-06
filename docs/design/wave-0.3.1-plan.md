@@ -11,7 +11,7 @@
 > modifier, `ref` grafia in every type position with `Ref<>` compiler-internal + depth cap 2,
 > never-null refs, `Ref<T?>` transparency + no-narrowing, cases A–F); `docs/design/marshall-spec.md`
 > (operand law, wrapper law, arrays §5.7, crumbs C0–C8); `docs/design/safety-spine.md` (PR #507,
-> SP-0..SP-6); `docs/design/vm-retirement.md` (context); `DECISION_LOG.md` **D36** (seed chain),
+> SP-0..SP-6); the native-only consolidation decision (context); `DECISION_LOG.md` **D36** (seed chain),
 > **D33** (metaprogramming post-1.0).
 >
 > **This plan writes NO product code and does NOT touch `teko.tkp`.** It is the sequencing contract;
@@ -110,8 +110,8 @@ vocabulary once avoids re-plumbing it later.
 
 **Parallelizes:** 1.1 ⟂ 1.2 (manifest vs attribute — disjoint files). 1.3 after both.
 **Ritual:** full gate at merge (seed cut).
-**Fixtures owed** (input → exit, VM & native):
-- `arena_size_directive_ok` — a fn with `#arena_size(4096)` allocating < N → RUN, exit = f(payload), **VM==native**.
+**Fixtures owed** (input → exit, native):
+- `arena_size_directive_ok` — a fn with `#arena_size(4096)` allocating < N → RUN, exit = f(payload), **consistent**.
 - `resources_manifest_parsed` — `.tkp` with `[resources] max_memory=50 max_cpu=25` builds + a probe prints the resolved effective bytes → RUN.
 - `resources_percent_out_of_range` — `max_cpu=250` → **EXPECT_COMPILE_FAIL** (u8 %, 0–100).
 - `arena_size_on_unsafe_rejected` — `#arena_size` on an `unsafe`-only path → **EXPECT_COMPILE_FAIL** (directive is non-unsafe by ruling).
@@ -137,7 +137,7 @@ sub-waves (SW3–SW7). This is why concurrency infra precedes the spine.
 **Ritual:** full gate at merge; **extra**: run the fixpoint gate under the parallel front-end (2.3) to
 prove determinism (gen1==gen2 must hold with threads on).
 **Fixtures owed:**
-- `threading_spawn_join` — spawn N workers summing a shared-via-`sync` counter → RUN, deterministic exit, **VM==native** (VM may serialize; result identical).
+- `threading_spawn_join` — spawn N workers summing a shared-via-`sync` counter → RUN, deterministic exit, **consistent**.
 - `sync_mutex_once` — `once` runs body exactly once under contention → RUN.
 - `threading_affinity_error` — request an invalid core → returns `error`, handled → RUN (no panic).
 - `parallel_frontend_determinism` — build the corpus with `TEKO_FRONTEND_THREADS>1` → identical `.tkb` bytes to the serial build (fixpoint).
@@ -166,7 +166,7 @@ soundness workflow runs FIRST — before the checker cements the peeling rule** 
 | 3.2 transparent type-directed auto-deref (§4) + `ref` grafia in EVERY type position (fields, generic args, slices, returns, nesting) + `Ref<>` becomes compiler-internal name for `Reference{T}` | L | `checker/resolve.tks`, `checker/expr.tks`, `typer` | gated by 3.0; peel EXACTLY the layers the use-site type demands |
 | 3.3 depth cap 2 (consecutive `ref` levels; containers reset the chain; safe-world only) + never-null (`Ref<…>?` is a compile error everywhere; `Ref<T?>` transparency, no flow-narrowing through `ref`) | M | `checker/resolve.tks` (relax the old `Ref<Ref<T>>` reject to KEEP-only-value-model cases; add cap + null rules) | ref-model §3/§4.2 |
 | 3.4 `.value`-on-`Reference` kept as **deprecated-but-accepted** alias (parses old + new) | S | `checker`, `codegen` | the stable-seed dance step 1 — DO NOT remove yet |
-| 3.5 fixtures | S | regressions | negatives compile-time; positives VM==native |
+| 3.5 fixtures | S | regressions | negatives compile-time; positives consistent |
 
 **Parallelizes:** 3.1 ⟂ (3.3 null/cap rules can be drafted in parallel) but 3.2 depends on 3.0's
 verdict and 3.1. 3.4 last.
@@ -189,16 +189,16 @@ builds gen1).
  * @see docs/design/ref-transparent-model.md §4, §4.2 (null transparency), §3 (depth cap 2)
  * @since 0.3.1.3-beta
  */
-fn autoderef_to(expr: Expr, expected: Type) -> Expr | error
+fn autoderef_to(expr: Expr, expected: Type): Expr | error
 ```
 
 **Fixtures owed:**
-- `ref_grafia_field_ok` — `struct H { r: ref int }` used transparently → RUN, VM==native.
+- `ref_grafia_field_ok` — `struct H { r: ref int }` used transparently → RUN, consistent.
 - `ref_depth_cap2_ok` — `ref x: ref T` (depth 2) → RUN; `ref_depth_cap3_rejected` — `ref x: ref ref T` → **EXPECT_COMPILE_FAIL** ("exceeds cap").
-- `ref_optional_transparency_ok` — `ref x: T? = null`; `?.`/`??`/`match` peel one level → RUN, VM==native.
+- `ref_optional_transparency_ok` — `ref x: T? = null`; `?.`/`??`/`match` peel one level → RUN, consistent.
 - `ref_of_optional_ref_rejected` — `Ref<T>?` in any position → **EXPECT_COMPILE_FAIL** ("uma referência sempre existe...").
 - `ref_value_deprecated_alias_ok` — `.value` on a `Reference` still parses (deprecation, not removal) → RUN.
-- `autoderef_free_generic_no_peel` — `f<U>(x)` with `x: Ref<Ref<T>>` passes the whole ref → RUN, VM==native.
+- `autoderef_free_generic_no_peel` — `f<U>(x)` with `x: Ref<Ref<T>>` passes the whole ref → RUN, consistent.
 
 **Seed-cut moment:** merge → `0.3.1.3-beta` — the new spelling is now parseable by the seed. **This is
 the seed SW4 dogfoods.**
@@ -216,16 +216,16 @@ the wave (see §7).
 | 4.1 migrate `src/` `.value`-on-`Ref` → transparent; `Ref<T>` binding → `ref` modifier where it is a borrow-down (the 28 `src/iter`+`src/io` closures + ~10 pipeline accumulators) | L | `src/iter/*`, `src/io/*`, checker helpers | fixpoint + `diff_vm_native` at EACH file; if a file's pattern breaks, keep `.value` for that file (honest-stop) and resolve before removing the alias |
 | 4.2 adopt `ref` grafia in type positions across `src/` (fields, returns, slices) where already a reference | M | `src/**` | mechanical; guided by 3.2 |
 | 4.3 remove deprecated `.value`-on-`Reference` acceptance (stable-seed dance step 3) | S | `checker`, `codegen` | ONLY after 4.1/4.2 green |
-| 4.4 **#497** drop `-> void` (57 sites; internal `Void` type stays; `fn` w/o `-> T` returns nothing) | M | parser, checker, codegen, VM, `src/**` (57), `.tkt` (2) | independent-of-spine, mechanical; safe (the seed already parses fn-without-return) |
+| 4.4 **#497** drop `-> void` (57 sites; internal `Void` type stays; `fn` w/o `-> T` returns nothing) | M | parser, checker, codegen, `src/**` (57), `.tkt` (2) | independent-of-spine, mechanical; safe (the seed already parses fn-without-return) |
 | 4.5 fixtures | S | regressions | |
 
 **Parallelizes:** 4.4 (#497) ⟂ 4.1/4.2 (disjoint). 4.3 strictly after 4.1+4.2.
 **Ritual:** **full gate** — self-host is the critical proof; the corpus must build clean on `ref`
 spelling with the `.value` path removed.
 **Fixtures owed:**
-- `void_return_removed_ok` — `fn f() { ... }` (no `-> void`) → RUN, VM==native.
+- `void_return_removed_ok` — `fn f() { ... }` (no `-> void`) → RUN, consistent.
 - `iter_closure_ref_selfhost` — the `over_array`/`range` idiom compiles under the new spelling → RUN.
-- (regression) existing `optionals` (exit 6) + `match_pattern_bindings` (exit 5) unchanged, VM==native.
+- (regression) existing `optionals` (exit 6) + `match_pattern_bindings` (exit 5) unchanged, consistent.
 
 **Seed-cut moment:** merge → `0.3.1.4-beta` — compiler self-hosts on the transparent model; `.value`
 gone.
@@ -251,8 +251,8 @@ risk (safety-spine C-recommendation).
 facts yet).
 **Fixtures owed:**
 - `ref_uninit_rejected` — `ref x: T` with no initializer → **EXPECT_COMPILE_FAIL** (A4).
-- `ref_param_rvalue_copies` — passing a temporary to a `ref` param mutates a callee-local copy → RUN, VM==native.
-- `ref_param_lvalue_aliases` — passing a live `mut` lvalue write-through mutates the caller → RUN, VM==native.
+- `ref_param_rvalue_copies` — passing a temporary to a `ref` param mutates a callee-local copy → RUN, consistent.
+- `ref_param_lvalue_aliases` — passing a live `mut` lvalue write-through mutates the caller → RUN, consistent.
 
 **Seed-cut moment:** `0.3.1.5-beta` — facts present, guards active; the accepted language narrows only
 on uninit-Ref + rvalue/lvalue.
@@ -296,14 +296,14 @@ refinement), NOT a blanket reject.
  * @see docs/design/ref-transparent-model.md §8 A1, §7 (the single root hole)
  * @since 0.3.1.6-beta
  */
-fn a1_escape_ok(place: AccessPath, roots: BorrowRoots) -> Ok | error
+fn a1_escape_ok(place: AccessPath, roots: BorrowRoots): Ok | error
 ```
 
 **Fixtures owed (the soundness proof set):**
 - `ref_in_struct_escape_rejected` — `struct Holder { r: ref int }` returned with a local-rooted ref → **EXPECT_COMPILE_FAIL** (the §7 UAF).
 - `ref_in_returned_slice_rejected` — `[]ref T` whose elements root at a local → **EXPECT_COMPILE_FAIL**.
 - `closure_captures_escaping_local_ref_rejected` — closure capturing a local `ref` that escapes → **EXPECT_COMPILE_FAIL** (with the A1-interproc diagnostic).
-- `iter_closure_param_root_ok` — the `over_array` param-rooted capture → RUN, VM==native (proves the corpus idiom survives).
+- `iter_closure_param_root_ok` — the `over_array` param-rooted capture → RUN, consistent (proves the corpus idiom survives).
 - (gate) **corpus self-hosts**; fixpoint gen1==gen2.
 
 **Seed-cut moment:** `0.3.1.6-beta` — the transitive gate is live; the safety thesis is proven on the
@@ -361,7 +361,7 @@ model; no double migration. Signatures/bodies: `docs/design/marshall-spec.md`.
 `marshall_ptr_field_in_safe_struct_rejected`, `marshall_uptr_in_safe_rejected`,
 `marshall_ptr_optional_rejected` (all COMPILE_FAIL) · `marshall_uptr_roundtrip` (RUN) ·
 `marshall_ptr_arith_index` (RUN, native) / `marshall_ptr_arith_in_safe_rejected` (COMPILE_FAIL) ·
-`marshall_swap_values` (RUN, **VM+native**) / `marshall_swap_on_let_rejected` /
+`marshall_swap_values` (RUN, **native**) / `marshall_swap_on_let_rejected` /
 `marshall_swap_on_mut_value_rejected` (COMPILE_FAIL) · `marshall_wrap_unwrap_roundtrip`,
 `marshall_wrap_null_panics`, `marshall_wrap_type_mismatch_rejected`, `marshall_unwrap_in_safe_rejected` ·
 `marshall_ffi_cstr_roundtrip`, buffer-fill · `marshall_slice_wrap` (native-only).
@@ -388,9 +388,9 @@ parallelizable sub-wave.
 | 9.8 | S–M | **#283** | |
 
 **Parallelizes:** all eight are independent bug-fixes → fan out; only #503 has a soft edge to SW8.
-**Ritual:** full gate at merge; each fix ships its own before/after regression (VM==native).
+**Ritual:** full gate at merge; each fix ships its own before/after regression (consistent).
 **Fixtures owed:** one differential regression per item (input that reproduces → expected exit /
-COMPILE_FAIL, VM==native), e.g. `int_over_i64max_unsigned_cast`, `extern_struct_byval`,
+COMPILE_FAIL, consistent), e.g. `int_over_i64max_unsigned_cast`, `extern_struct_byval`,
 `ptr_void_param_valid_c`, plus one named fixture per #519/#412/#495/#301/#283 mirroring its report.
 **Seed-cut moment:** `0.3.1.9-beta`.
 
@@ -414,10 +414,10 @@ one seed at merge. Sequence-sensitive only in that each new grammar must be addi
 
 **Parallelizes:** mostly independent; 10.4 (#517) after 10.2 (#526 for-each). 10.6 (#477) is pure
 desugar (S).
-**Ritual:** full gate; each new surface ships a differential fixture (VM==native) + a negative.
+**Ritual:** full gate; each new surface ships a differential fixture (consistent) + a negative.
 **Fixtures owed:** `postfix_bang_diverging_qq` (RUN + a COMPILE_FAIL for misuse) · `foreach_backend_ok`
 (RUN, native) · `discard_underscore_only` (`_` read → COMPILE_FAIL) · `ref_foreach_ok` (RUN,
-VM==native) · `flags_bitwise_masked_not` (RUN) · `grouped_attrs_desugar` (RUN, equals stacked form) ·
+consistent) · `flags_bitwise_masked_not` (RUN) · `grouped_attrs_desugar` (RUN, equals stacked form) ·
 `static_slice_rodata` (RUN, native).
 **Seed-cut moment:** `0.3.1.10-beta`.
 
@@ -431,12 +431,12 @@ threading) for parallelism and process surface.
 | Crumb | Size | Item | Notes |
 |-------|------|------|-------|
 | 11.1 | M | **#473** `teko::process` expanded — `run_captured`/`spawn`/`wait`/`run_pool` | the subprocess substrate the others share; anticipates 0.4 process surface |
-| 11.2 | M | **#442** glob selector / single test or test-scope selector (VM+native gate) | on 11.1 |
+| 11.2 | M | **#442** glob selector / single test or test-scope selector (native gate) | on 11.1 |
 | 11.3 | S | **#471** `#test_panic("msg")` + `#test_exit(N)` — assert divergence without interrupting the run | on 11.1 |
 | 11.4 | M | **#472** parallel tests by default (per-process) + `#serial_group("name")` | on 11.1 + SW2 threading |
 
 **Parallelizes:** 11.2 ⟂ 11.3 ⟂ 11.4 once 11.1 lands.
-**Ritual:** full gate; the runner change itself must keep the existing gate green (VM==native across
+**Ritual:** full gate; the runner change itself must keep the existing gate green (consistent across
 the whole suite under the new parallel runner).
 **Fixtures owed:** `process_run_captured` (RUN, captures stdout+exit) · `test_selector_glob` (selects a
 subset, both engines) · `test_panic_asserted` / `test_exit_asserted` (a diverging test PASSES) ·
@@ -482,7 +482,7 @@ incoherent suggesting a directive that does not exist. Flagged UP for the owner'
 **Parallelizes:** 13.1 ⟂ 13.2 ⟂ 13.3 (distinct backend passes).
 **Ritual:** full gate + the final wave W15 sweep + doc-sync pre-launch (header ruling: each wave gets
 its own W15 sweep before launch).
-**Fixtures owed:** `i128_regpair_arith` (RUN, native, VM==native) · `fpr_spill_pressure` (many live
+**Fixtures owed:** `i128_regpair_arith` (RUN, native, consistent) · `fpr_spill_pressure` (many live
 floats → correct spill, RUN native) · `loop_back_edge_native` (an extensible `loop` recovery case,
 RUN native).
 **Seed-cut moment:** `0.3.1.13-beta` → promote to **`0.3.1.0` release**; #395 → closed.
@@ -531,8 +531,7 @@ its impact-ordering is a preference, not a hard chain.
 
 All of the following need NO blocked API and can be authored/prebuilt against DECLARED shapes today:
 
-- **Fixtures — ALL of them.** Every fixture named above (inputs + expected exit/COMPILE_FAIL, VM &
-  native) can be written now; they compile-fail or run against the honest-stop until the feature lands.
+- **Fixtures — ALL of them.** Every fixture named above (inputs + expected exit/COMPILE_FAIL, native) can be written now; they compile-fail or run against the honest-stop until the feature lands.
 - **The §10.4 auto-deref soundness workflow (SW3 crumb 3.0)** — a paper/adversarial pass; run it NOW
   so SW3 opens with a ratified peeling verdict (it GATES the surface, so front-loading removes the
   SW3 critical-path risk).
@@ -619,5 +618,5 @@ awareness; the plan is executable as written.
 
 *Companion designs: `docs/design/ref-transparent-model.md` (the model + A1–A6 + §10.4 open case),
 `docs/design/marshall-spec.md` (C0–C8), `docs/design/safety-spine.md` (SP-0..SP-6 + thesis risks),
-`docs/design/vm-retirement.md` (context). Governing: `DECISION_LOG.md` D36 (seed chain), D33
+the native-only consolidation decision (context). Governing: `DECISION_LOG.md` D36 (seed chain), D33
 (metaprogramming post-1.0). Wave epic: #395 (stays OPEN until SW13 = 100%).*

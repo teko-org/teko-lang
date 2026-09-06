@@ -1,0 +1,155 @@
+use teko::encoding::json
+
+fn read_stdin_n(n: u64): []byte { teko::runtime::read_stdin_n(n) }
+
+pub type RpcMessage = struct {
+        body: @JsonValue()
+}
+
+const CRLF: str = "\r\n"
+
+pub fn encode_frame(body: @JsonValue()): str {
+    var payload = json::encode(body)
+    teko::str::concat("Content-Length: ", teko::u64_to_str(payload.len), CRLF, CRLF, payload)
+}
+
+pub fn write_message(body: @JsonValue()) {
+    teko::io::write(encode_frame(body))
+}
+
+pub fn log(msg: str) {
+    teko::io::eprintln(teko::str::concat("teko-lsp: ", msg))
+}
+
+fn ascii_lower(b: byte): byte {
+    if b >= b'A' && b <= b'Z' { return ((b to i64) + 32) to byte }
+    b
+}
+
+fn header_is_content_length(line: str): bool {
+    var name = "content-length"
+    if line.len < name.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= name.len { break }
+        if ascii_lower(line[i]) != name[i] { return false }
+        i = i + 1
+    }
+    line[name.len] == b':'
+}
+
+fn parse_header_value_u64(line: str): u64 | null {
+    var i: u64 = 0
+    loop {
+        if i >= line.len { return null }
+        if line[i] == b':' { i = i + 1; break }
+        i = i + 1
+    }
+    loop {
+        if i >= line.len || line[i] != b' ' { break }
+        i = i + 1
+    }
+    if i >= line.len || line[i] < b'0' || line[i] > b'9' { return null }
+    var n: u64 = 0
+    loop {
+        if i >= line.len || line[i] < b'0' || line[i] > b'9' { break }
+        n = n * 10 + ((line[i] to u64) - (b'0' to u64))
+        i = i + 1
+    }
+    n
+}
+
+fn body_to_message(body_bytes: []byte): RpcMessage | error {
+    var text = match teko::text::str_from_utf8(body_bytes) {
+        str as s => s
+        error as e => return error { message = teko::str::concat("malformed frame: body is not UTF-8: ", e.message) }
+    }
+    var value = match json::decode(text) {
+        (@JsonValue()) as v => v
+        error as e => return error { message = teko::str::concat("malformed frame: body is not JSON: ", e.message) }
+    }
+    RpcMessage { body = value }
+}
+
+pub fn read_message(): RpcMessage | error {
+    var have_len = false
+    var content_length: u64 = 0
+    var saw_header = false
+    loop {
+        var line = teko::io::read_line()
+        if line.len == 0 {
+            if !saw_header && teko::io::stdin_eof() { return error { message = "eof" } }
+            break
+        }
+        saw_header = true
+        if header_is_content_length(line) {
+            match parse_header_value_u64(line) {
+                u64 as n => { content_length = n; have_len = true }
+                null => { return error { message = "malformed frame: unparseable Content-Length" } }
+            }
+        }
+    }
+    if !have_len { return error { message = "malformed frame: missing Content-Length" } }
+    var body_bytes = read_stdin_n(content_length)
+    if body_bytes.len < content_length { return error { message = "malformed frame: truncated body" } }
+    body_to_message(body_bytes)
+}
+
+fn find_crlf_crlf(bytes: []byte): u64 | null {
+    if bytes.len < 4 { return null }
+    var i: u64 = 0
+    loop {
+        if i + 4 > bytes.len { return null }
+        if bytes[i] == b'\r' && bytes[i + 1] == b'\n' && bytes[i + 2] == b'\r' && bytes[i + 3] == b'\n' { return i }
+        i = i + 1
+    }
+    null
+}
+
+fn slice_bytes(bytes: []byte, from: u64, to: u64): []byte {
+    var out: []byte = []
+    var i = from
+    loop {
+        if i >= to || i >= bytes.len { break }
+        out = [..out, bytes[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn content_length_of_header_bytes(header: []byte): u64 | null {
+    var text = match teko::text::str_from_utf8(header) { str as s => s; error => return null }
+    var start: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= text.len {
+            var last = text.slice(start, text.len)
+            if header_is_content_length(last) { return parse_header_value_u64(last) }
+            break
+        }
+        if text[i] == b'\r' && i + 1 < text.len && text[i + 1] == b'\n' {
+            var line = text.slice(start, i)
+            if header_is_content_length(line) { return parse_header_value_u64(line) }
+            i = i + 2
+            start = i
+            continue
+        }
+        i = i + 1
+    }
+    null
+}
+
+pub fn decode_frame_bytes(bytes: []byte): RpcMessage | error {
+    var sep = match find_crlf_crlf(bytes) {
+        u64 as s => s
+        null => return error { message = "malformed frame: no header/body separator" }
+    }
+    var header = slice_bytes(bytes, 0, sep)
+    var content_length = match content_length_of_header_bytes(header) {
+        u64 as n => n
+        null => return error { message = "malformed frame: missing Content-Length" }
+    }
+    var body_start = sep + 4
+    if body_start + content_length > bytes.len { return error { message = "malformed frame: truncated body" } }
+    body_to_message(slice_bytes(bytes, body_start, body_start + content_length))
+}

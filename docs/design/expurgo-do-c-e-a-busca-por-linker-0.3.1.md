@@ -59,11 +59,6 @@ como literal de string que vira símbolo externo, exatamente estes:
 **apenas dentro de doc-comments** que descrevem o que o emissor de C fazia — nenhum deles é
 emitido como referência. A superfície viva é de **onze** símbolos.
 
-O alvo wasm não precisa de nenhum deles: `backend/stackify.tks:5059-5065` SINTETIZA
-`tk_print`/`tk_write`/`tk_println`/`tk_eprint`/`tk_ewrite`/`tk_eprintln`/`tk_panic_str` como
-funções do próprio módulo e mapeia `tk_exit` direto para o import WASI `proc_exit`
-(`stackify.tks:4624`). O expurgo do runtime C não toca o caminho wasm.
-
 Os outros 145 símbolos de `teko_rt.c` existem para o `teko.c` gerado — morrem com o emissor.
 
 ---
@@ -84,7 +79,7 @@ Essa condição **acabou de ser satisfeita**. O commit `afdb1fd8` (já no vagão
 - `collect_undefined_x86` já derivava `GLOBAL|NOTYPE / SHN_UNDEF` de qualquer alvo de relocation
   não definido, e `objfile_elf.tks` já emitia `R_X86_64_PLT32`. **Só o NOME estava errado.**
 
-A prova do commit: `pub extern fn c_getpid() -> i32 = "getpid"` passou de
+A prova do commit: `pub extern fn c_getpid(): i32 = "getpid"` passou de
 `ld: undefined reference to 'externprobe__p__c_getpid'` para `nm -u → U getpid`, binário roda.
 
 **Consequência:** `teko_rt.tks` pode declarar `extern fn write(fd, buf, n)`, `extern fn _exit(c)`,
@@ -368,7 +363,7 @@ fonte que o seed .30 compila já não pode saber emitir C — o gen1 nasce, por 
 
 | chamada | linha | o que é |
 |---|---|---|
-| `codegen::tk_emit_tsym` | 1366 | o mapa `.tsym` — **consumido pelo caminho NATIVO** (`project.tks:2019` e `:2295` escrevem `<bin>.tsym` depois de `finish_native_object`/`emit_native_wasm`), é o que resolve o stack trace E4 |
+| `codegen::tk_emit_tsym` | 1366 | o mapa `.tsym` — **consumido pelo caminho NATIVO** (escreve `<bin>.tsym` depois de `finish_native_object`), é o que resolve o stack trace E4 |
 | `codegen::check_ffi_export` | 1392 | uma REGRA DE CHECKER sobre `exp`/`abi="c"`, não um emissor |
 | `codegen::emit_c_header` | 2528 | morre com `ffi_export.tks` |
 | `codegen::tk_emit_c_test` | 2707 | o harness de teste — **pré-requisito da carga irmã** |

@@ -1,0 +1,53 @@
+use teko::crypto
+use teko::encoding::cbor
+
+fn cose_mac0_structure_bytes(protected_bytes: []byte, external_aad: []byte, payload: []byte): []byte {
+    var arr = cose_four(cbor::cbor_text("MAC0"), cbor::cbor_bytes(protected_bytes), cbor::cbor_bytes(external_aad), cbor::cbor_bytes(payload))
+    cbor::encode_canonical(cbor::cbor_array(arr))
+}
+
+/**
+ * Computes an `HMAC 256/256` `COSE_Mac0` document over `payload` and returns its encoded,
+ * tag-17 form (RFC 9052 §6.2): builds the protected header (`alg` fixed to `Hmac256`) and
+ * unprotected header (`kid` when non-empty), computes the `MAC_structure`, HMAC-SHA-256s it
+ * under `secret`, and canonical-CBOR-encodes `[protected, unprotected, payload, tag]` under
+ * tag 17. HMAC never fails, so this is total (no `CryptoError` case).
+ */
+exp fn cose_mac0_create(secret: []byte, kid: []byte, external_aad: []byte, payload: []byte): []byte {
+    var protected_bytes = cose_protected_header_bytes(CoseAlg::Hmac256)
+    var unprotected = cose_unprotected_header(kid)
+    var mac_input = cose_mac0_structure_bytes(protected_bytes, external_aad, payload)
+    var tag = crypto::hmac_sha256_of(secret, mac_input)
+    var arr = cose_four(cbor::cbor_bytes(protected_bytes), unprotected, cbor::cbor_bytes(payload), cbor::cbor_bytes(tag))
+    cbor::encode_canonical(cbor::cbor_tag(17, cbor::cbor_array(arr)))
+}
+
+/**
+ * Verifies an encoded `COSE_Mac0` document (tag 17, or a bare untagged array) and returns the
+ * payload on success: extracts the four fields, requires the protected header's `alg` to be
+ * `Hmac256`, recomputes the `MAC_structure` from the EXACT protected/payload bytes on the wire,
+ * and checks the tag against a fresh HMAC-SHA-256 under `secret` with `teko::crypto::ct_eq`.
+ */
+exp fn cose_mac0_verify(secret: []byte, external_aad: []byte, cose_bytes: []byte): []byte | crypto::CryptoError {
+    var four = match cose_decode_four_tuple(17, cose_bytes) {
+        CoseFourTuple as t => t
+        crypto::CryptoError as e => return e
+    }
+    var protected_map = match cose_decode_protected_map(four.protected) {
+        cbor::CborValue as m => m
+        crypto::CryptoError as e => return e
+    }
+    var alg = match cose_header_alg(protected_map) {
+        CoseAlg as a => a
+        crypto::CryptoError as e => return e
+    }
+    if alg != CoseAlg::Hmac256 {
+        return crypto::crypto_error("cose_mac0_verify: protected header 'alg' is not HMAC 256/256")
+    }
+    var mac_input = cose_mac0_structure_bytes(four.protected, external_aad, four.payload)
+    var expected = crypto::hmac_sha256_of(secret, mac_input)
+    if !crypto::ct_eq(expected, four.trailer) {
+        return crypto::crypto_error("cose_mac0_verify: MAC tag verification failed")
+    }
+    four.payload
+}

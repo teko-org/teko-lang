@@ -1,0 +1,135 @@
+name: build the Windows sysroot
+description: >
+  Everything a Windows link needs that is not the program. Windows has no
+  direct-executable backend and no C runtime, so every `mc` link there is
+  `lld-link` against three files -- `winstart.obj`, `mcrt.obj` and
+  `kernel32.lib` -- and none of them is downloaded: the two objects are the
+  system layer and the entry point, compiled out of the bundle inside `mc`
+  itself, and the import library is generated from a list of names
+  (`minicompiler/mc` scripts/sysroot-windows.sh). Both Windows jobs of
+  `ngen.yml` -- the native leg and the fixpoint ladder -- need the same three
+  files, so they are assembled HERE, once.
+
+  The action also puts LLVM's `lld-link` and `llvm-dlltool` on `$PATH` in
+  WINDOWS form, because `mc` spawns the linker through CreateProcessA, and
+  points `TMPDIR` at the runner's own temp, because the native `mc` cannot open
+  the `/tmp/...` paths `mktemp -d` hands out (`minicompiler/mc`
+  docs/guide/95-windows-host.md).
+
+inputs:
+  arch:
+    description: 'what `mc --host` calls the machine: x86_64 | aarch64 (never arm64)'
+    required: true
+  mc:
+    description: 'the mc binary that compiles the two objects, as `.github/actions/setup-mc` outputs it'
+    required: true
+  dir:
+    description: >
+      where the sysroot is written, relative to the repository root. Empty (the
+      default) is `ngen/build/sysroot/windows-<arch>`, which is what the
+      `[sysroot] path = "build/sysroot/windows-<arch>"` of a config living in
+      `ngen/` resolves to.
+    required: false
+    default: ''
+  llvm-version:
+    description: 'LLVM release to download when the image carries no lld-link'
+    required: false
+    default: '20.1.8'
+
+outputs:
+  dir:
+    description: 'the sysroot directory, relative to the repository root'
+    value: ${{ steps.sysroot.outputs.dir }}
+
+runs:
+  using: composite
+  steps:
+    # `lld-link` links and `llvm-dlltool` writes the import library; both ship
+    # with LLVM, which both Windows images already carry. The download is the
+    # branch that must never be reached silently -- a Windows binary is executed
+    # after this, so it fails loudly instead of skipping.
+    - name: obtain the LLVM tools
+      shell: bash
+      env:
+        MC_ARCH: ${{ inputs.arch }}
+        LLVM_VERSION: ${{ inputs.llvm-version }}
+      run: |
+        set -eu
+        have() { [ -x "$1/lld-link.exe" ] && [ -x "$1/llvm-dlltool.exe" ]; }
+        bin=""
+        for cand in "/c/Program Files/LLVM/bin" "$PWD/.llvm/bin"; do
+          if have "$cand"; then bin="$cand"; break; fi
+        done
+        if [ -z "$bin" ]; then
+          echo "LLVM not on this image -- downloading $LLVM_VERSION"
+          case "$MC_ARCH" in
+            aarch64) tarball="clang+llvm-$LLVM_VERSION-aarch64-pc-windows-msvc.tar.xz"
+                     installer="LLVM-$LLVM_VERSION-woa64.exe" ;;
+            *)       tarball="clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz"
+                     installer="LLVM-$LLVM_VERSION-win64.exe" ;;
+          esac
+          base="https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION"
+          mkdir -p .llvm
+          if curl -fSL -o "$RUNNER_TEMP/llvm.tar.xz" "$base/$tarball"; then
+            tar -xf "$RUNNER_TEMP/llvm.tar.xz" -C .llvm --strip-components=1
+          else
+            curl -fSL -o "$RUNNER_TEMP/llvm.exe" "$base/$installer"
+            7z x -o.llvm "$RUNNER_TEMP/llvm.exe" >/dev/null
+          fi
+          bin="$PWD/.llvm/bin"
+        fi
+        if ! have "$bin"; then
+          echo "::error::lld-link and llvm-dlltool are not both in $bin" >&2
+          exit 1
+        fi
+        cygpath -w "$bin" >>"$GITHUB_PATH"
+        echo "TMPDIR=$(cygpath -m "$RUNNER_TEMP")" >>"$GITHUB_ENV"
+        # `llvm-dlltool` has no --version and answers its usage with a
+        # non-zero exit, so the existence check above is its whole probe.
+        "$bin/lld-link.exe" --version
+        echo "llvm-dlltool: $bin/llvm-dlltool.exe"
+
+    # The list of kernel32 entry points is the one the two layers declare; it is
+    # `minicompiler/mc` scripts/sysroot-windows.sh's, verbatim.
+    - name: compile winstart.obj, mcrt.obj and kernel32.lib
+      id: sysroot
+      shell: bash
+      env:
+        MC: ${{ inputs.mc }}
+        MC_ARCH: ${{ inputs.arch }}
+        MC_SYSROOT: ${{ inputs.dir }}
+      run: |
+        set -eu
+        case "$MC_ARCH" in
+          aarch64) backend="coff-obj-arm64";  machine="arm64" ;;
+          *)       backend="coff-obj-x86_64"; machine="i386:x86-64" ;;
+        esac
+        dir="$MC_SYSROOT"
+        if [ -z "$dir" ]; then dir="ngen/build/sysroot/windows-$MC_ARCH"; fi
+        mkdir -p "$dir"
+        printf '#include <sys_windows_start>\n' >"$dir/winstart.mc"
+        printf '#include <sys_windows_host>\n'  >"$dir/mcrt.mc"
+        "$MC" --backend="$backend" "$dir/winstart.mc" -o "$dir/winstart.obj"
+        "$MC" --backend="$backend" "$dir/mcrt.mc"     -o "$dir/mcrt.obj"
+        cat >"$dir/kernel32.def" <<'DEF'
+        LIBRARY kernel32.dll
+        EXPORTS
+        CloseHandle
+        CreateDirectoryA
+        CreateFileA
+        CreateProcessA
+        DeleteFileA
+        ExitProcess
+        GetCommandLineA
+        GetEnvironmentVariableA
+        GetExitCodeProcess
+        GetLastError
+        GetStdHandle
+        ReadFile
+        VirtualAlloc
+        WaitForSingleObject
+        WriteFile
+        DEF
+        llvm-dlltool -m "$machine" -d "$dir/kernel32.def" -D kernel32.dll -l "$dir/kernel32.lib"
+        ls -l "$dir"
+        echo "dir=$dir" >>"$GITHUB_OUTPUT"

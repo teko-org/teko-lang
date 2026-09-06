@@ -1,0 +1,230 @@
+// surface_di.tk -- §58 DI1/DI2/DI4 (D229): a class names a service lifetime
+// in its own `:` list, and `inject` resolves it at comptime, no runtime
+// container. DI2 grows this into a THREE-LEVEL chain resolved by
+// CONSTRUCTOR: Svc(IRepo, IClock) <- Repo(IDb) <- Db, with Db's own
+// constructor filling a DEFAULT nobody passes, and a call through the
+// INTERFACE (`r.load()`) proving the itab still dispatches to a singleton
+// this graph built.
+//
+// Clock names IServiceSingleton -- a marker, never a base or an interface --
+// and answers to TWO keys: the interface it implements, and its own concrete
+// name. Both injections below land on the SAME object: `tick()` keeps
+// counting across the two, and `rt_live()` never rises past the one instance
+// the program ever allocates -- the singleton is a root, never released.
+//
+// DI4 grows this with: `namespace app { ... }` + `using app;`, injected both
+// qualified (`app.ICache`) and bare; a key that is an interface's own BASE
+// (`ICache : IBase`, `Cache` implements only `ICache`); a Singleton that
+// receives a Scoped (`Board`, `GaugeX`, `GaugeY` each pull in a `Meter`) --
+// ONE Meter shared by Board's own two dependents, and a DIFFERENT Meter per
+// singleton; and a class derived from a service that is not itself one
+// (`ClockView : Clock`, built with a plain `new`).
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+interface IClock {
+    i64 tick();
+}
+
+interface IDb {
+    i64 query();
+}
+
+interface IRepo {
+    i64 load();
+}
+
+class Clock : IClock, IServiceSingleton {
+    i64 n;
+
+    public i64 tick() {
+        n = n + 1;
+        return n;
+    }
+}
+
+class Db : IDb, IServiceSingleton {
+    i64 n;
+
+    public Db(i64 seed = 5) {
+        n = seed;
+    }
+
+    public i64 query() {
+        n = n + 1;
+        return n;
+    }
+}
+
+class Repo : IRepo, IServiceSingleton {
+    IDb db;
+
+    public Repo(IDb db) {
+        this.db = db;
+    }
+
+    public i64 load() {
+        return this.db.query();
+    }
+}
+
+class Svc : IServiceSingleton {
+    IRepo repo;
+    IClock clock;
+
+    public Svc(IRepo repo, IClock clock) {
+        this.repo = repo;
+        this.clock = clock;
+    }
+
+    public i64 run() {
+        return this.repo.load() + this.clock.tick();
+    }
+}
+
+// a class derived from a service that is NOT itself a service (§58 (f) DI4):
+// the marker never inherits, so `ClockView` answers to no DI key at all and
+// is built with a plain `new`, its own object with its own state.
+class ClockView : Clock {
+}
+
+namespace app {
+    interface IBase {
+        i64 tag();
+    }
+
+    interface ICache : IBase {
+        i64 hit();
+    }
+
+    class Cache : ICache, IServiceSingleton {
+        i64 n;
+
+        public i64 hit() {
+            n = n + 1;
+            return n;
+        }
+
+        public i64 tag() {
+            return 9;
+        }
+    }
+}
+
+using app;
+
+class Meter : IServiceScoped {
+    i64 n;
+
+    public i64 tick() {
+        n = n + 1;
+        return n;
+    }
+}
+
+class WrapA : IServiceTransient {
+    Meter m;
+
+    public WrapA(Meter m) {
+        this.m = m;
+    }
+
+    public i64 read() {
+        return this.m.tick();
+    }
+}
+
+class WrapB : IServiceTransient {
+    Meter m;
+
+    public WrapB(Meter m) {
+        this.m = m;
+    }
+
+    public i64 read() {
+        return this.m.tick();
+    }
+}
+
+// a Singleton with TWO dependents of its own that both need the SAME Scoped
+// (D229, teko != C#): `WrapA` and `WrapB` each pull in a `Meter`, and both
+// land on the ONE Meter Board's own private scope built.
+class Board : IServiceSingleton {
+    WrapA a;
+    WrapB b;
+
+    public Board(WrapA a, WrapB b) {
+        this.a = a;
+        this.b = b;
+    }
+
+    public i64 total() {
+        return this.a.read() + this.b.read();
+    }
+}
+
+// two DIFFERENT singletons pulling in the SAME Scoped class: each gets its
+// OWN instance (decision 11), never Board's and never each other's.
+class GaugeX : IServiceSingleton {
+    Meter m;
+
+    public GaugeX(Meter m) {
+        this.m = m;
+    }
+
+    public i64 read() {
+        return this.m.tick();
+    }
+}
+
+class GaugeY : IServiceSingleton {
+    Meter m;
+
+    public GaugeY(Meter m) {
+        this.m = m;
+    }
+
+    public i64 read() {
+        return this.m.tick();
+    }
+}
+
+i64 main() {
+    IClock a = inject IClock;
+    Clock b = inject Clock;
+    if (a.tick() != 1) return 1;
+    if (b.tick() != 2) return 2;
+    if (rt_live() != 1) return 3;
+    IRepo r = inject IRepo;               // through the interface: proves the itab
+    if (r.load() != 6) return 4;          // Db's own default (5), then one query()
+    Svc s = inject Svc;                   // built by CONSTRUCTOR: IRepo and IClock
+    if (s.run() != 10) return 5;          // the SAME Repo and Clock singletons
+    if (rt_live() != 4) return 6;         // Clock, Db, Repo, Svc -- never more
+
+    app.ICache viaFull = inject app.ICache;
+    if (viaFull.hit() != 1) return 7;
+    ICache viaShort = inject ICache;           // bare, via `using app;`
+    if (viaShort.hit() != 2) return 8;
+    IBase viaBase = inject IBase;              // the interface-BASE key (ICache : IBase)
+    if (viaBase.tag() != 9) return 9;
+    if (viaFull.hit() != 3) return 10;         // still the SAME Cache singleton
+    if (rt_live() != 5) return 11;             // + Cache
+
+    Board brd = inject Board;
+    if (brd.total() != 3) return 12;           // WrapA.tick=1, WrapB.tick=2 -- ONE Meter
+    if (rt_live() != 9) return 13;             // + Meter, WrapA, WrapB, Board
+
+    GaugeX gx = inject GaugeX;
+    GaugeY gy = inject GaugeY;
+    if (gx.read() != 1) return 14;             // its OWN Meter, restarts at 1
+    if (gy.read() != 1) return 15;             // a DIFFERENT Meter, also restarts at 1
+    if (rt_live() != 13) return 16;            // + Meter(gx), GaugeX, Meter(gy), GaugeY
+
+    ClockView cv = new ClockView();
+    if (cv.tick() != 1) return 17;             // an ordinary object, its OWN state
+    if (rt_live() != 14) return 18;            // + ClockView -- never wired into DI
+
+    return 42;
+}

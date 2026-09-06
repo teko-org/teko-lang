@@ -1,0 +1,175 @@
+// surface_array_heap.tk -- `T[]` of heap (K3, D221 §41): a run-time-sized
+// array, `new T[n]`, `xs[i]`/`xs[i] = e` and its compound forms,
+// `xs.Length`, and the reference count every element of a COUNTED type
+// earns -- an object with the SAME shape a delegate's is (teko_heaparr.tk).
+//
+// What each helper proves, in order:
+//
+//   1. `basiccheck` -- a run-time `n` (`new i64[n]`), `xs[i]`/`xs[i] = e`,
+//      the compound forms `+=`/`-=`/`++`, `.Length` as the bound of a
+//      `while` AND of a `for` loop.
+//   2. `widthcheck` -- `u8` and `i32` elements: width and sign, the same
+//      `tk_arr_load`/`tk_arr_store` a local fixed array already reuses.
+//   3. `paramcheck` -- `T[]` as a parameter of a free function AND of a
+//      method, and as a class FIELD (`this.items`), read through both.
+//   4. `circlecheck` -- `Circle[]`: overwriting a slot releases the OLD
+//      element, and releasing the array releases every element still in
+//      it -- `rt_live()` proves the floor both times.
+//   5. `delegatecheck` -- `Op[]`: an array of delegate values, called
+//      through the index (`ops[i](args)`), a bare function name coerced
+//      into the slot the same way a delegate LOCAL already is.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 basiccheck() {
+    i64 n = 5;
+    i64[] xs = new i64[n];
+    i64 i = 0;
+    while (i < xs.Length) {
+        xs[i] = i;
+        i = i + 1;
+    }
+    i64 sum = 0;
+    for (i64 j = 0; j < xs.Length; j++) {
+        sum = sum + xs[j];
+    }
+    if (sum != 10) return 1;                      // 0+1+2+3+4
+    xs[0] += 100;
+    xs[1] -= 1;
+    xs[2]++;
+    if (xs[0] != 100) return 2;
+    if (xs[1] != 0) return 3;
+    if (xs[2] != 3) return 4;
+    return 0;
+}
+
+i64 widthcheck() {
+    u8[] bs = new u8[2];
+    bs[0] = 250;
+    bs[1] = 10;
+    if (bs[0] + bs[1] != 260) return 1;
+    i32[] ws = new i32[1];
+    ws[0] = 0 - 7;
+    if (ws[0] >= 0) return 2;
+    if (ws[0] != 0 - 7) return 3;
+    return 0;
+}
+
+class Box {
+    i64[] items;
+
+    public Box(i64 n) { this.items = new i64[n]; }
+
+    public void fill(i64[] src) {
+        i64 i = 0;
+        while (i < src.Length) {
+            this.items[i] = src[i];
+            i = i + 1;
+        }
+    }
+
+    public i64 total() {
+        i64 s = 0;
+        i64 i = 0;
+        while (i < this.items.Length) {
+            s = s + this.items[i];
+            i = i + 1;
+        }
+        return s;
+    }
+}
+
+i64 sumOf(i64[] xs) {
+    i64 s = 0;
+    i64 i = 0;
+    while (i < xs.Length) {
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+i64 paramcheck() {
+    i64[] src = new i64[3];
+    src[0] = 1;
+    src[1] = 2;
+    src[2] = 3;
+    if (sumOf(src) != 6) return 1;
+    Box b = new Box(3);
+    b.fill(src);
+    if (b.total() != 6) return 2;
+    return 0;
+}
+
+i64 circle_dtors = 0;
+
+class Circle {
+    i64 r;
+
+    public Circle(i64 r) { this.r = r; }
+    public i64 area() { return r * r; }
+    ~Circle() { circle_dtors = circle_dtors + 1; }
+}
+
+i64 sumAreas(Circle[] cs) {
+    i64 total = 0;
+    i64 i = 0;
+    while (i < cs.Length) {
+        total = total + cs[i].area();
+        i = i + 1;
+    }
+    return total;
+}
+
+i64 circlecheck() {
+    i64 floor = rt_live();
+    Circle[] cs = new Circle[3];
+    cs[0] = new Circle(1);
+    cs[1] = new Circle(2);
+    cs[2] = new Circle(3);
+    if (rt_live() != floor + 4) return 1;         // the array object + the 3 circles
+    if (sumAreas(cs) != 14) return 2;
+    cs[0] = new Circle(10);                       // replaces: the old Circle(1) is released
+    if (circle_dtors != 1) return 3;
+    if (cs[0].area() != 100) return 4;
+    cs = null;                                    // releases the array AND its 3 live circles
+    if (circle_dtors != 4) return 5;
+    if (rt_live() != floor) return 6;
+    return 0;
+}
+
+public delegate i64 Op(i64 a, i64 b);
+
+i64 add(i64 a, i64 b) { return a + b; }
+i64 mul(i64 a, i64 b) { return a * b; }
+
+i64 delegatecheck() {
+    Op[] ops = new Op[2];
+    ops[0] = add;
+    ops[1] = mul;
+    i64 r = ops[0](3, 4) + ops[1](3, 4);
+    if (r != 19) return 1;                        // 7 + 12
+    return 0;
+}
+
+i64 main() {
+    i64 bad = basiccheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = widthcheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = paramcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = circlecheck();
+    if (bad != 0) return 60 + bad;
+    if (rt_live() != 0) return 69;
+
+    bad = delegatecheck();
+    if (bad != 0) return 70 + bad;
+
+    return 42;
+}

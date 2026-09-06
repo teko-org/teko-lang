@@ -103,16 +103,19 @@ real, e cada editor consome uma **saída gerada**, nunca uma cópia digitada à 
 
 ---
 
-## Eixo C — Intellisense (`teko lsp`, Language Server Protocol) — DIFERIDO
+## Eixo C — Intellisense (`teko lsp`, Language Server Protocol) — SERVIDOR FEITO, CLIENTES DIFERIDO
 
 > **RATIFICADO (2026-07-01).** O LSP **não** é um binário/processo `tooling/teko-lsp/` externo escrito
 > num degrau intermediário (C) e migrado depois — vai direto para dentro do **próprio compilador**, como
 > um **subcomando** `teko lsp` (ao lado de `build`/`run`/`test` em `main.c`/`main.tks`), escrito
 > **nativamente em Teko**. Isso resolve as duas questões que este documento deixava "abertas": a
-> linguagem de implementação (Teko, não C) e binário-separado-vs-subcomando (subcomando). **Implementação
-> DIFERIDA até o compilador atingir uma versão estabilizada** — recomendo como marco o fechamento de
-> **★ THE VALIDATION GATE** do `TEKO_MASTER_PLAN.md` (self-host nativo fechando, hoje 🔶 Fase 6); o marco
-> exato de "estabilizada" é do legislador, não deste documento.
+> linguagem de implementação (Teko, não C) e binário-separado-vs-subcomando (subcomando).
+>
+> **ATUALIZADO (2026-08-03):** o **servidor `teko lsp`** (C1–C6) está **FEITO** e testado (ruling do
+> dono, `docs/memory/lsp-cliente-e-tooling-diferido-0.3.1.md`); crumbs 0/A–G/D completos, confirmado
+> por compilação real (checker 9651/9651). O que **DIFERIDO** é o lado cliente/editor (VS Code, Vim,
+> Emacs) — TypeScript/glue de editor, exigem agente não-Teko — e cores ricas (Crumb H), semantic tokens
+> (Crumb I), smoke test fim-a-fim (§9.2 do design).
 
 **Cânone:** o intellisense **reaproveita** o front-end real de Teko (`teko::lexer`/`teko::parser`/
 `teko::checker`), nunca reimplementa análise léxica/semântica em paralelo — o mesmo princípio DRY/SUPREME
@@ -122,13 +125,13 @@ obrigatório enquanto o C for a base de bootstrap (como todo o resto do compilad
 
 | # | Entrega | Estado |
 |---|---|---|
-| C1 | **Esqueleto `teko lsp`** — novo subcomando (`src/lsp/lsp.{tks,c,h}` + `lsp_test.tkt`), processo stdio, handshake LSP (`initialize`/`initialized`/`shutdown`/`exit`), reaproveita `teko::lexer`/`teko::parser`/`teko::checker` (não duplica). | **diferido** — aguarda versão estabilizada do compilador |
-| C2 | **Diagnostics** — reanálise por arquivo ao editar/salvar (debounce), publica `textDocument/publishDiagnostics` a partir dos `tk_error` do checker — mesmo `arquivo:linha:coluna` que a CLI já emite (ver Eixo E do ROADMAP_INDEPENDENCE para a doutrina de posição). Erro de parse → diagnóstico honesto, nunca trava o editor. | **diferido** (dep C1) |
-| C3 | **Hover** — tipo inferido da expressão sob o cursor, lido direto da árvore tipada (`tast`) já produzida pelo checker. | **diferido** (dep C1) |
-| C4 | **Completion** — símbolos em escopo (vars/fns), membros de `struct`/`interface`, namespaces alcançáveis via `use`, e keywords da linguagem. | **diferido** (dep C1) |
-| C5 | **Go-to-definition / find-references** — usa a mesma tabela de símbolos/escopo do checker (`resolve.tks`/`scope.tks`), não uma reconstrução própria. | **diferido** (dep C1) |
-| C6 | **Document symbols / outline** — lista de `fn`/`struct`/`variant`/`interface` de um arquivo. | **diferido** (dep C1) |
-| C7 | *(avançado, opcional)* **Semantic tokens** — realce preciso baseado no checker (distingue tipo vs valor vs namespace), superior ao regex do Eixo B quando o cliente suporta. | **diferido** (dep C1–C6) |
+| C1 | **Esqueleto `teko lsp`** — novo subcomando (`src/lsp/lsp.{tks,c,h}` + `lsp_test.tkt`), processo stdio, handshake LSP (`initialize`/`initialized`/`shutdown`/`exit`), reaproveita `teko::lexer`/`teko::parser`/`teko::checker` (não duplica). | **✓ FEITO** (2026-08-03; crumbs 0/A–G/D, confirmado por compilação real — `docs/memory/lsp-cliente-e-tooling-diferido-0.3.1.md`) |
+| C2 | **Diagnostics** — reanálise por arquivo ao editar/salvar (debounce), publica `textDocument/publishDiagnostics` a partir dos `tk_error` do checker — mesmo `arquivo:linha:coluna` que a CLI já emite (ver Eixo E do ROADMAP_INDEPENDENCE para a doutrina de posição). Erro de parse → diagnóstico honesto, nunca trava o editor. | **✓ FEITO** (parte de C1; diagnósticos ao vivo implementados) |
+| C3 | **Hover** — tipo inferido da expressão sob o cursor, lido direto da árvore tipada (`tast`) já produzida pelo checker. | **✓ FEITO** (parte de C1) |
+| C4 | **Completion** — símbolos em escopo (vars/fns), membros de `struct`/`interface`, namespaces alcançáveis via `use`, e keywords da linguagem. | **✓ FEITO** (parte de C1) |
+| C5 | **Go-to-definition / find-references** — usa a mesma tabela de símbolos/escopo do checker (`resolve.tks`/`scope.tks`), não uma reconstrução própria. | **✓ FEITO** (parte de C1) |
+| C6 | **Document symbols / outline** — lista de `fn`/`struct`/`variant`/`interface` de um arquivo. | **✓ FEITO** (parte de C1; índice de símbolos + overrides implementados) |
+| C7 | *(avançado, opcional)* **Semantic tokens** — realce preciso baseado no checker (distingue tipo vs valor vs namespace), superior ao regex do Eixo B quando o cliente suporta. | **⏸ DIFERIDO** (fase 2 do design; não bloqueia v1; `initialize_result` ainda não anuncia `semanticTokensProvider`) |
 
 > **Nano fica de fora do Eixo C por design, não por atraso** — não tem API de plugin/processo externo
 > para falar LSP. Recebe só o Eixo B (cores) e a documentação do Eixo D5 (fluxo manual de build).
@@ -214,10 +217,10 @@ tooling/
 ## Caminho crítico
 
 **A (fonte única)** → **B (cores, 4 editores em paralelo)** → **E (empacotamento das partes de cor/build)**.
-**C (LSP) está fora deste caminho** — diferido até a versão estabilizada do compilador; quando destravar,
-segue **C → D1/D3-client/D4-client → E** (clients LSP). Duas exceções já entregáveis hoje, sem esperar
-nada: **D2** (VS Code tasks + problemMatcher) e as partes `:make`/`compile` de **D3/D4** — a CLI já existe
-e já emite `arquivo:linha:coluna`.
+**C1–C6 (servidor LSP) está FEITO** (2026-08-03); o caminho dos clientes segue **D1/D3-client/D4-client → E**
+(clients LSP, diferido — exigem agente TS). **C7 (semantic tokens)** é fase 2 do design, não bloqueia v1.
+Três entregáveis hoje, sem esperar nada: **D2** (VS Code tasks + problemMatcher) e as partes `:make`/
+`compile` de **D3/D4** — a CLI já existe e já emite `arquivo:linha:coluna`; **D5** (doc Nano).
 
 ---
 
@@ -255,7 +258,7 @@ e já emite `arquivo:linha:coluna`.
 ---
 
 ## Estado
-- **✓ Feitos:** nenhum — documento novo, define o roadmap.
+- **✓ Feitos:** **Eixo C — C1–C6** (servidor `teko lsp` completo, crumbs 0/A–G/D testados, 2026-08-03).
 - **▶ Prontos agora (sem dependência):** **A1** (extrator de spec) · **D2** (tasks/problemMatcher VS Code — a CLI já existe e já emite `arquivo:linha:coluna`) · as partes `:make`/`compile` de **D3/D4** · **D5** (doc Nano).
-- **⏸ Bloqueado (não pegar ainda):** todo o **Eixo C** (C1–C7) e os clients LSP de **D1/D3/D4** — diferidos até a versão estabilizada do compilador (marco em aberto, ver Decisões).
+- **⏸ Diferido (o que falta):** **C7** (semantic tokens — fase 2) · **D1/D3-client/D4-client** (clientes de editor — TypeScript/glue, exigem agente não-Teko) · **Crumb H** (cores TextMate ricas — bloqueado por harness de verificação de gramática) · **Crumb I** (semantic tokens da gramática) · **smoke test end-to-end** (§9.2 do design).
 - **Em seguida:** A1 → {A2, A3, A4, A5} → {B1, B2, B3, B4} → Eixo E; independentemente, D2 e as partes `:make`/`compile` de D3/D4 podem sair já. C1 só abre quando o marco de estabilização for declarado.

@@ -1,0 +1,578 @@
+/**
+ * The kind discriminant of a `BsonValue`: which BSON element type it holds. Each maps to a BSON
+ * type byte.
+ */
+exp type BsonKind = enum {
+    Double; String; Document; Array; Binary; ObjectId; Bool; DateTime; Null; Int32; Int64; Timestamp; Decimal128; MinKey; MaxKey
+}
+
+/**
+ * One BSON element value as a tagged struct spanning every `BsonKind`: `kind` selects which
+ * fields below carry meaning.
+ */
+exp type BsonValue = struct {
+    /**
+     * Which BSON element type this is; selects which of the fields below are meaningful.
+     */
+    kind: BsonKind
+    /**
+     * The floating-point value for `Double`. Zero otherwise.
+     */
+    real: f64
+    /**
+     * The string content for `String`. Empty otherwise.
+     */
+    text: str
+    /**
+     * The boolean value for `Bool`. `false` otherwise.
+     */
+    flag: bool
+    /**
+     * The signed integer for `Int32` and `Int64`, and the millisecond instant for `DateTime`.
+     * Zero otherwise.
+     */
+    int_val: i64
+    /**
+     * The unsigned value for `Timestamp` (the combined 64-bit BSON timestamp). Zero otherwise.
+     */
+    uint_val: u64
+    /**
+     * The payload bytes for `Binary`, the 12 bytes for `ObjectId`, and the 16 bytes for
+     * `Decimal128`. Empty otherwise.
+     */
+    bytes: []byte
+    /**
+     * The binary subtype for `Binary` (e.g. `0x00` generic, `0x04` UUID). Zero otherwise.
+     */
+    subtype: byte
+    /**
+     * The field names of a `Document`, parallel to `vals`. Empty for an `Array` (its names are the
+     * synthesised decimal indices) and for scalars.
+     */
+    keys: []str
+    /**
+     * The field values of a `Document` and the elements of an `Array`. Empty for scalars.
+     */
+    vals: []BsonValue
+}
+
+type BsonRead = struct {
+    value: BsonValue
+    pos: u64
+}
+
+type DocRead = struct {
+    keys: []str
+    vals: []BsonValue
+    pos: u64
+}
+
+type NameRead = struct {
+    name: str
+    pos: u64
+}
+
+fn no_bytes(): []byte {
+    []
+}
+
+fn no_keys(): []str {
+    []
+}
+
+fn no_vals(): []BsonValue {
+    []
+}
+
+fn mk_value(kind: BsonKind, real: f64, text: str, flag: bool, int_val: i64, uint_val: u64, bytes: []byte, subtype: byte, keys: []str, vals: []BsonValue): BsonValue {
+    BsonValue { kind = kind; real = real; text = text; flag = flag; int_val = int_val; uint_val = uint_val; bytes = bytes; subtype = subtype; keys = keys; vals = vals }
+}
+
+/**
+ * Wraps a double as a `0x01` element value.
+ */
+exp fn bson_double(x: f64): BsonValue {
+    mk_value(BsonKind::Double, x, "", false, 0, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * Wraps a UTF-8 string as a `0x02` element value.
+ */
+exp fn bson_string(s: str): BsonValue {
+    mk_value(BsonKind::String, 0.0, s, false, 0, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * Wraps parallel field-name / value slices as an embedded document (`0x03`, also the `0x04` array
+ * body form). `keys[i]` names `vals[i]`; the two slices must have the same length.
+ */
+exp fn bson_document(keys: []str, vals: []BsonValue): BsonValue {
+    mk_value(BsonKind::Document, 0.0, "", false, 0, 0, no_bytes(), 0 to byte, keys, vals)
+}
+
+/**
+ * Wraps a sequence of elements as a `0x04` array value; the integer field names are synthesised on
+ * encode.
+ */
+exp fn bson_array(vals: []BsonValue): BsonValue {
+    mk_value(BsonKind::Array, 0.0, "", false, 0, 0, no_bytes(), 0 to byte, no_keys(), vals)
+}
+
+/**
+ * Wraps payload bytes and a subtype as a `0x05` binary value.
+ */
+exp fn bson_binary(subtype: byte, data: []byte): BsonValue {
+    mk_value(BsonKind::Binary, 0.0, "", false, 0, 0, data, subtype, no_keys(), no_vals())
+}
+
+/**
+ * Wraps 12 bytes as a `0x07` ObjectId value. Encoding rejects a slice that is not exactly 12
+ * bytes.
+ */
+exp fn bson_objectid(id: []byte): BsonValue {
+    mk_value(BsonKind::ObjectId, 0.0, "", false, 0, 0, id, 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * Wraps a boolean as a `0x08` element value.
+ */
+exp fn bson_bool(b: bool): BsonValue {
+    mk_value(BsonKind::Bool, 0.0, "", b, 0, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * Wraps a millisecond instant as a `0x09` UTC datetime value.
+ */
+exp fn bson_datetime(ms: i64): BsonValue {
+    mk_value(BsonKind::DateTime, 0.0, "", false, ms, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * The `0x0A` null element value.
+ */
+exp fn bson_null(): BsonValue {
+    mk_value(BsonKind::Null, 0.0, "", false, 0, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * Wraps a 32-bit integer as a `0x10` element value; the low 32 bits are encoded.
+ */
+exp fn bson_int32(v: i64): BsonValue {
+    mk_value(BsonKind::Int32, 0.0, "", false, v, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * Wraps a 64-bit integer as a `0x12` element value.
+ */
+exp fn bson_int64(v: i64): BsonValue {
+    mk_value(BsonKind::Int64, 0.0, "", false, v, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * Wraps a 64-bit BSON timestamp as a `0x11` element value.
+ */
+exp fn bson_timestamp(t: u64): BsonValue {
+    mk_value(BsonKind::Timestamp, 0.0, "", false, 0, t, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/** Wraps 16 bytes as a `0x13` Decimal128 value (carried verbatim). Encoding rejects a slice that is not exactly 16 bytes. */
+exp fn bson_decimal128(raw: []byte): BsonValue {
+    mk_value(BsonKind::Decimal128, 0.0, "", false, 0, 0, raw, 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * The `0xFF` min-key element value (sorts before every other BSON value).
+ */
+exp fn bson_min_key(): BsonValue {
+    mk_value(BsonKind::MinKey, 0.0, "", false, 0, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+/**
+ * The `0x7F` max-key element value (sorts after every other BSON value).
+ */
+exp fn bson_max_key(): BsonValue {
+    mk_value(BsonKind::MaxKey, 0.0, "", false, 0, 0, no_bytes(), 0 to byte, no_keys(), no_vals())
+}
+
+fn append_all(out: []byte, more: []byte): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= more.len { break }
+        acc = [..acc, more[i]]
+        i++
+    }
+    acc
+}
+
+fn append_le(out: []byte, v: u64, count: u64): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= count { break }
+        acc = [..acc, ((v >> (i * 8)) & 0xFF) to byte]
+        i++
+    }
+    acc
+}
+
+fn append_le_i64(out: []byte, v: i64, count: u64): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= count { break }
+        acc = [..acc, ((v >> (i * 8)) & 0xFF) to byte]
+        i++
+    }
+    acc
+}
+
+fn encode_cstring(name: str): []byte | error {
+    var raw = name.bytes()
+    var i: u64 = 0
+    loop {
+        if i >= raw.len { break }
+        if raw[i] == 0x00 { return error { message = "bson: field name contains an interior NUL" } }
+        i++
+    }
+    [..raw, 0x00 to byte]
+}
+
+fn encode_string_value(s: str): []byte {
+    var raw = s.bytes()
+    var out = append_le(no_bytes(), (raw.len + 1) to u64, 4)
+    append_all(out, [..raw, 0x00 to byte])
+}
+
+fn encode_value(v: BsonValue): []byte | error {
+    match v.kind {
+        BsonKind::Double => append_le(no_bytes(), f64_bits(v.real), 8)
+        BsonKind::String => encode_string_value(v.text)
+        BsonKind::Document => encode_document(v)
+        BsonKind::Array => encode_array_value(v.vals)
+        BsonKind::Binary => encode_binary_value(v)
+        BsonKind::ObjectId => encode_fixed(v.bytes, 12, "ObjectId")
+        BsonKind::Bool => [..no_bytes(), (if v.flag { 0x01 } else { 0x00 }) to byte]
+        BsonKind::DateTime => append_le_i64(no_bytes(), v.int_val, 8)
+        BsonKind::Null => no_bytes()
+        BsonKind::Int32 => append_le_i64(no_bytes(), v.int_val, 4)
+        BsonKind::Int64 => append_le_i64(no_bytes(), v.int_val, 8)
+        BsonKind::Timestamp => append_le(no_bytes(), v.uint_val, 8)
+        BsonKind::Decimal128 => encode_fixed(v.bytes, 16, "Decimal128")
+        BsonKind::MinKey => no_bytes()
+        BsonKind::MaxKey => no_bytes()
+    }
+}
+
+fn encode_fixed(data: []byte, want: u64, what: str): []byte | error {
+    if data.len != want { return error { message = concat("bson: ", what, " must be ", i64_to_str(want to i64), " bytes") } }
+    data
+}
+
+fn encode_binary_value(v: BsonValue): []byte {
+    var out = append_le(no_bytes(), v.bytes.len, 4)
+    out = [..out, v.subtype]
+    append_all(out, v.bytes)
+}
+
+fn encode_array_value(vals: []BsonValue): []byte | error {
+    var keys: []str = no_keys()
+    var i: u64 = 0
+    loop {
+        if i >= vals.len { break }
+        keys = [..keys, u64_to_str(i)]
+        i++
+    }
+    encode_document(bson_document(keys, vals))
+}
+
+fn encode_elements(keys: []str, vals: []BsonValue): []byte | error {
+    var out: []byte = no_bytes()
+    var i: u64 = 0
+    loop {
+        if i >= keys.len { break }
+        out = [..out, type_byte(vals[i].kind)]
+        var name = match encode_cstring(keys[i]) { []byte as b => b; error as e => return e }
+        out = append_all(out, name)
+        var body = match encode_value(vals[i]) { []byte as b => b; error as e => return e }
+        out = append_all(out, body)
+        i++
+    }
+    out
+}
+
+fn type_byte(kind: BsonKind): byte {
+    match kind {
+        BsonKind::Double => 0x01 to byte
+        BsonKind::String => 0x02 to byte
+        BsonKind::Document => 0x03 to byte
+        BsonKind::Array => 0x04 to byte
+        BsonKind::Binary => 0x05 to byte
+        BsonKind::ObjectId => 0x07 to byte
+        BsonKind::Bool => 0x08 to byte
+        BsonKind::DateTime => 0x09 to byte
+        BsonKind::Null => 0x0A to byte
+        BsonKind::Int32 => 0x10 to byte
+        BsonKind::Timestamp => 0x11 to byte
+        BsonKind::Int64 => 0x12 to byte
+        BsonKind::Decimal128 => 0x13 to byte
+        BsonKind::MinKey => 0xFF to byte
+        BsonKind::MaxKey => 0x7F to byte
+    }
+}
+
+fn encode_document(doc: BsonValue): []byte | error {
+    if doc.kind != BsonKind::Document && doc.kind != BsonKind::Array {
+        return error { message = "bson: top-level value must be a document" }
+    }
+    var body = match encode_elements(doc.keys, doc.vals) { []byte as b => b; error as e => return e }
+    var total = 4 + body.len + 1
+    var out = append_le(no_bytes(), total, 4)
+    out = append_all(out, body)
+    [..out, 0x00 to byte]
+}
+
+/**
+ * Encodes a complete BSON document to a fresh byte slice. The top-level value must be a
+ * `Document`.
+ */
+exp fn encode(doc: BsonValue): []byte | error {
+    if doc.kind != BsonKind::Document { return error { message = "bson: top-level value must be a document" } }
+    encode_document(doc)
+}
+
+fn read_error(what: str, pos: u64): error {
+    error { message = concat("bson: ", what, " at offset ", i64_to_str(pos to i64)) }
+}
+
+fn read_le_u(p: []byte, pos: u64, count: u64): u64 {
+    var v: u64 = 0
+    var i = count
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        v = (v << 8) | (p[pos + i] to u64)
+    }
+    v
+}
+
+fn read_le_i32(p: []byte, pos: u64): i64 {
+    var u = read_le_u(p, pos, 4)
+    if u >= 0x80000000 { return (u to i64) - 4294967296 }
+    u to i64
+}
+
+fn read_le_i64(p: []byte, pos: u64): i64 {
+    var low = read_le_u(p, pos, 4) to i64
+    var high = read_le_i32(p, pos + 4)
+    high * 4294967296 + low
+}
+
+fn read_cstring(p: []byte, pos: u64): NameRead | error {
+    var out: []byte = no_bytes()
+    var at = pos
+    loop {
+        if at >= p.len { return read_error("unterminated field name", pos) }
+        if p[at] == 0x00 { return NameRead { name = str_of_bytes(out); pos = at + 1 } }
+        out = [..out, p[at]]
+        at++
+    }
+}
+
+fn take_bytes(p: []byte, pos: u64, n: u64): []byte | error {
+    if pos + n > p.len { return read_error("truncated value", pos) }
+    var out: []byte = no_bytes()
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = [..out, p[pos + i]]
+        i++
+    }
+    out
+}
+
+fn decode_string(p: []byte, pos: u64): BsonRead | error {
+    if pos + 4 > p.len { return read_error("truncated string length", pos) }
+    var len = read_le_u(p, pos, 4)
+    if len == 0 { return read_error("string length must include the terminator", pos) }
+    var body = match take_bytes(p, pos + 4, len - 1) { []byte as b => b; error as e => return e }
+    if pos + 4 + len > p.len { return read_error("truncated string", pos) }
+    BsonRead { value = bson_string(str_of_bytes(body)); pos = pos + 4 + len }
+}
+
+fn decode_binary(p: []byte, pos: u64): BsonRead | error {
+    if pos + 5 > p.len { return read_error("truncated binary header", pos) }
+    var len = read_le_u(p, pos, 4)
+    var sub = p[pos + 4]
+    var payload = match take_bytes(p, pos + 5, len) { []byte as b => b; error as e => return e }
+    BsonRead { value = bson_binary(sub, payload); pos = pos + 5 + len }
+}
+
+fn decode_value(p: []byte, t: byte, pos: u64): BsonRead | error {
+    if t == 0x01 to byte { return decode_double(p, pos) }
+    if t == 0x02 to byte { return decode_string(p, pos) }
+    if t == 0x03 to byte { return decode_embedded(p, pos) }
+    if t == 0x04 to byte { return decode_array(p, pos) }
+    if t == 0x05 to byte { return decode_binary(p, pos) }
+    if t == 0x07 to byte { return decode_fixed(p, pos, 12, false) }
+    if t == 0x08 to byte { return decode_bool(p, pos) }
+    if t == 0x09 to byte { return decode_datetime(p, pos) }
+    if t == 0x0A to byte { return BsonRead { value = bson_null(); pos = pos } }
+    if t == 0x10 to byte { return decode_int32(p, pos) }
+    if t == 0x11 to byte { return decode_timestamp(p, pos) }
+    if t == 0x12 to byte { return decode_int64(p, pos) }
+    if t == 0x13 to byte { return decode_fixed(p, pos, 16, true) }
+    if t == 0xFF to byte { return BsonRead { value = bson_min_key(); pos = pos } }
+    if t == 0x7F to byte { return BsonRead { value = bson_max_key(); pos = pos } }
+    read_error(concat("unsupported element type 0x", hex_byte(t)), pos)
+}
+
+fn hex_byte(b: byte): str {
+    concat(hex_digit((b to u64) >> 4), hex_digit((b to u64) & 0xF))
+}
+
+fn hex_digit(n: u64): str {
+    if n < 10 { return one_byte((0x30 + n) to byte) }
+    one_byte((0x61 + (n - 10)) to byte)
+}
+
+fn decode_double(p: []byte, pos: u64): BsonRead | error {
+    if pos + 8 > p.len { return read_error("truncated double", pos) }
+    BsonRead { value = bson_double(f64_from_bits(read_le_u(p, pos, 8))); pos = pos + 8 }
+}
+
+fn decode_bool(p: []byte, pos: u64): BsonRead | error {
+    if pos + 1 > p.len { return read_error("truncated boolean", pos) }
+    BsonRead { value = bson_bool(p[pos] != 0x00); pos = pos + 1 }
+}
+
+fn decode_datetime(p: []byte, pos: u64): BsonRead | error {
+    if pos + 8 > p.len { return read_error("truncated datetime", pos) }
+    BsonRead { value = bson_datetime(read_le_i64(p, pos)); pos = pos + 8 }
+}
+
+fn decode_int32(p: []byte, pos: u64): BsonRead | error {
+    if pos + 4 > p.len { return read_error("truncated int32", pos) }
+    BsonRead { value = bson_int32(read_le_i32(p, pos)); pos = pos + 4 }
+}
+
+fn decode_int64(p: []byte, pos: u64): BsonRead | error {
+    if pos + 8 > p.len { return read_error("truncated int64", pos) }
+    BsonRead { value = bson_int64(read_le_i64(p, pos)); pos = pos + 8 }
+}
+
+fn decode_timestamp(p: []byte, pos: u64): BsonRead | error {
+    if pos + 8 > p.len { return read_error("truncated timestamp", pos) }
+    BsonRead { value = bson_timestamp(read_le_u(p, pos, 8)); pos = pos + 8 }
+}
+
+fn decode_fixed(p: []byte, pos: u64, n: u64, is_decimal: bool): BsonRead | error {
+    var raw = match take_bytes(p, pos, n) { []byte as b => b; error as e => return e }
+    if is_decimal { return BsonRead { value = bson_decimal128(raw); pos = pos + n } }
+    BsonRead { value = bson_objectid(raw); pos = pos + n }
+}
+
+fn decode_embedded(p: []byte, pos: u64): BsonRead | error {
+    var doc = match decode_doc_at(p, pos) { DocRead as d => d; error as e => return e }
+    BsonRead { value = bson_document(doc.keys, doc.vals); pos = doc.pos }
+}
+
+fn decode_array(p: []byte, pos: u64): BsonRead | error {
+    var doc = match decode_doc_at(p, pos) { DocRead as d => d; error as e => return e }
+    BsonRead { value = bson_array(doc.vals); pos = doc.pos }
+}
+
+fn decode_doc_at(p: []byte, pos: u64): DocRead | error {
+    if pos + 4 > p.len { return read_error("truncated document length", pos) }
+    var declared = read_le_u(p, pos, 4)
+    if declared < 5 { return read_error("document length too small", pos) }
+    if pos + declared > p.len { return read_error("document length exceeds input", pos) }
+    var keys: []str = no_keys()
+    var vals: []BsonValue = no_vals()
+    var at = pos + 4
+    loop {
+        if at >= p.len { return read_error("unterminated document", pos) }
+        if p[at] == 0x00 {
+            if at + 1 != pos + declared { return read_error("document length disagrees with terminator", pos) }
+            return DocRead { keys = keys; vals = vals; pos = at + 1 }
+        }
+        var t = p[at]
+        var name = match read_cstring(p, at + 1) { NameRead as n => n; error as e => return e }
+        var val = match decode_value(p, t, name.pos) { BsonRead as r => r; error as e => return e }
+        keys = [..keys, name.name]
+        vals = [..vals, val.value]
+        at = val.pos
+    }
+}
+
+/**
+ * Decodes a complete BSON document: a single top-level document with any trailing bytes reported as
+ * a checked error.
+ */
+exp fn decode(p: []byte): BsonValue | error {
+    var doc = match decode_doc_at(p, 0) { DocRead as d => d; error as e => return e }
+    if doc.pos != p.len { return read_error("trailing bytes after document", doc.pos) }
+    bson_document(doc.keys, doc.vals)
+}
+
+fn bytes_equal(a: []byte, b: []byte): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+fn str_equal(a: str, b: str): bool {
+    bytes_equal(a.bytes(), b.bytes())
+}
+
+/**
+ * Structurally compares two `BsonValue` trees for equality, recursing through documents (in field
+ * order) and arrays. Doubles compare by `f64` bit pattern (the round-trip identity relation).
+ */
+exp fn bson_equal(a: BsonValue, b: BsonValue): bool {
+    if a.kind != b.kind { return false }
+    match a.kind {
+        BsonKind::Double => f64_bits(a.real) == f64_bits(b.real)
+        BsonKind::String => str_equal(a.text, b.text)
+        BsonKind::Bool => a.flag == b.flag
+        BsonKind::DateTime => a.int_val == b.int_val
+        BsonKind::Int32 => a.int_val == b.int_val
+        BsonKind::Int64 => a.int_val == b.int_val
+        BsonKind::Timestamp => a.uint_val == b.uint_val
+        BsonKind::Null => true
+        BsonKind::MinKey => true
+        BsonKind::MaxKey => true
+        BsonKind::ObjectId => bytes_equal(a.bytes, b.bytes)
+        BsonKind::Decimal128 => bytes_equal(a.bytes, b.bytes)
+        BsonKind::Binary => a.subtype == b.subtype && bytes_equal(a.bytes, b.bytes)
+        BsonKind::Array => vals_equal(a.vals, b.vals)
+        BsonKind::Document => keys_equal(a.keys, b.keys) && vals_equal(a.vals, b.vals)
+    }
+}
+
+fn keys_equal(a: []str, b: []str): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if !str_equal(a[i], b[i]) { return false }
+        i++
+    }
+    true
+}
+
+fn vals_equal(a: []BsonValue, b: []BsonValue): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if !bson_equal(a[i], b[i]) { return false }
+        i++
+    }
+    true
+}

@@ -1,0 +1,761 @@
+const NF_SIG17: u64 = 17
+
+const NF_LIMB: u64 = 4294967296
+
+const NF_LIMB_MASK: u64 = 4294967295
+
+type NfRatio = struct {
+    r: []u32
+    s: []u32
+}
+
+type NfScaled = struct {
+    r: []u32
+    s: []u32
+    e10: i64
+}
+
+type NfDig = struct {
+    d: []u32
+    e10: i64
+    carried: bool
+}
+
+type NfParts = struct {
+    kind: i32
+    neg: bool
+    m: u64
+    e: i64
+}
+
+fn nf_norm(a: []u32): []u32 {
+    var n = a.len
+    loop {
+        if n == 0 { break }
+        if a[n - 1] != 0 { break }
+        n = n - 1
+    }
+    var out: [n]u32 = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = a[i]
+        i = i + 1
+    }
+    out
+}
+
+fn nf_u64(v: u64): []u32 {
+    var out: [2]u32 = []
+    out[0] = (v & NF_LIMB_MASK) to u32
+    out[1] = (v >> 32) to u32
+    nf_norm(out)
+}
+
+fn nf_cmp(a: []u32, b: []u32): i64 {
+    if a.len != b.len {
+        if a.len < b.len { return -1 }
+        return 1
+    }
+    var i = a.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        if a[i] != b[i] {
+            if a[i] < b[i] { return -1 }
+            return 1
+        }
+    }
+    0
+}
+
+fn nf_sub(a: []u32, b: []u32): []u32 {
+    var out: [a.len]u32 = []
+    var borrow: i64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        var bi: i64 = if i < b.len { b[i] to i64 } else { 0 }
+        var d: i64 = (a[i] to i64) - bi - borrow
+        if d < 0 {
+            d = d + (NF_LIMB to i64)
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        out[i] = d to u32
+        i = i + 1
+    }
+    nf_norm(out)
+}
+
+fn nf_mul_u32(a: []u32, m: u64): []u32 {
+    if a.len == 0 { return a }
+    var out: [a.len + 1]u32 = []
+    var carry: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        var t = (a[i] to u64) * m + carry
+        out[i] = (t & NF_LIMB_MASK) to u32
+        carry = t >> 32
+        i = i + 1
+    }
+    out[a.len] = carry to u32
+    nf_norm(out)
+}
+
+fn nf_shl(a: []u32, bits: u64): []u32 {
+    if a.len == 0 { return a }
+    var limb = bits / 32
+    var bit = bits % 32
+    var out: [a.len + limb + 1]u32 = []
+    var carry: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        var v = ((a[i] to u64) << bit) | carry
+        out[i + limb] = (v & NF_LIMB_MASK) to u32
+        carry = v >> 32
+        i = i + 1
+    }
+    out[a.len + limb] = carry to u32
+    nf_norm(out)
+}
+
+fn nf_mul_pow10(a: []u32, k: u64): []u32 {
+    var out = a
+    var i: u64 = 0
+    loop {
+        if i >= k { break }
+        out = nf_mul_u32(out, 10)
+        i = i + 1
+    }
+    out
+}
+
+fn nf_parts(x: f64): NfParts {
+    var bits = teko::f64_bits(x)
+    var neg = (bits >> 63) != 0
+    var exp_field = (bits >> 52) & 2047
+    var frac = bits & 4503599627370495
+    if exp_field == 2047 {
+        if frac != 0 { return NfParts { kind = 2; neg = neg; m = 0; e = 0 } }
+        return NfParts { kind = 3; neg = neg; m = 0; e = 0 }
+    }
+    if exp_field == 0 && frac == 0 {
+        return NfParts { kind = 1; neg = neg; m = 0; e = 0 }
+    }
+    if exp_field == 0 {
+        return NfParts { kind = 0; neg = neg; m = frac; e = (0 - 1074) to i64 }
+    }
+    NfParts { kind = 0; neg = neg; m = frac | 4503599627370496; e = (exp_field to i64) - 1075 }
+}
+
+fn nf_raw_ratio(m: u64, e: i64): NfRatio {
+    if e >= 0 {
+        return NfRatio { r = nf_shl(nf_u64(m), e to u64); s = nf_u64(1) }
+    }
+    NfRatio { r = nf_u64(m); s = nf_shl(nf_u64(1), (0 - e) to u64) }
+}
+
+fn nf_normalize(rat: NfRatio): NfScaled {
+    var r = rat.r
+    var s = rat.s
+    var e10: i64 = 0
+    loop {
+        if nf_cmp(r, s) >= 0 { break }
+        r = nf_mul_u32(r, 10)
+        e10 = e10 - 1
+    }
+    loop {
+        var s10 = nf_mul_u32(s, 10)
+        if nf_cmp(r, s10) < 0 { break }
+        s = s10
+        e10 = e10 + 1
+    }
+    NfScaled { r = r; s = s; e10 = e10 }
+}
+
+fn nf_round_up(r: []u32, s: []u32, last: u32): bool {
+    var c = nf_cmp(nf_mul_u32(r, 2), s)
+    if c > 0 { return true }
+    if c < 0 { return false }
+    (last % 2) == 1
+}
+
+fn nf_gen(sc: NfScaled, ndig: u64): NfDig {
+    var r = sc.r
+    var s = sc.s
+    var out: [ndig]u32 = []
+    var i: u64 = 0
+    loop {
+        if i >= ndig { break }
+        var dd: u32 = 0
+        loop {
+            if nf_cmp(r, s) < 0 { break }
+            r = nf_sub(r, s)
+            dd = dd + 1
+        }
+        out[i] = dd
+        if i != ndig - 1 { r = nf_mul_u32(r, 10) }
+        i = i + 1
+    }
+    var e10 = sc.e10
+    var carried = false
+    if nf_round_up(r, s, out[ndig - 1]) {
+        var k: i64 = (ndig - 1) to i64
+        var done = false
+        loop {
+            if k < 0 { break }
+            var ki = k to u64
+            out[ki] = out[ki] + 1
+            if out[ki] < 10 { done = true; break }
+            out[ki] = 0
+            k = k - 1
+        }
+        if !done {
+            out[0] = 1
+            e10 = e10 + 1
+            carried = true
+        }
+    }
+    NfDig { d = out; e10 = e10; carried = carried }
+}
+
+fn nf_dchar(d: u32): byte {
+    ((48 to u32) + d) to byte
+}
+
+fn nf_zeros(n: u64): []byte {
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = b'0'
+        i = i + 1
+    }
+    out
+}
+
+fn nf_to_str(b: []byte): str {
+    match teko::text::str_from_utf8(b) {
+        str as s => s
+        error => ""
+    }
+}
+
+fn nf_sig_bytes(d: []u32, nsig: u64): []byte {
+    var out: [nsig]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= nsig { break }
+        out[i] = nf_dchar(d[i])
+        i = i + 1
+    }
+    out
+}
+
+fn nf_strip(d: []u32, ndig: u64): u64 {
+    var k = ndig - 1
+    loop {
+        if k == 0 { break }
+        if d[k] != 0 { break }
+        k = k - 1
+    }
+    k + 1
+}
+
+fn nf_exp_field(e10: i64): []byte {
+    var neg = e10 < 0
+    var mag = if neg { (0 - e10) to u64 } else { e10 to u64 }
+    [..[b'e', if neg { b'-' } else { b'+' }], ..nf_min2(mag)]
+}
+
+fn nf_min2(v: u64): []byte {
+    var w = nf_decimal_width(v)
+    var out: [w]byte = []
+    var rem = v
+    var i = w
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        out[i] = nf_dchar((rem % 10) to u32)
+        rem = rem / 10
+    }
+    out
+}
+
+fn nf_decimal_width(v: u64): u64 {
+    var n: u64 = 1
+    var t = v
+    loop {
+        if t < 10 { break }
+        t = t / 10
+        n = n + 1
+    }
+    if n < 2 { 2 } else { n }
+}
+
+fn nf_slice(src: []byte, from: u64, upto: u64): []byte {
+    var out: [upto - from]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= upto - from { break }
+        out[i] = src[from + i]
+        i = i + 1
+    }
+    out
+}
+
+fn nf_sci(sig: []byte, e10: i64): []byte {
+    var expb = nf_exp_field(e10)
+    if sig.len == 1 { return [..sig, ..expb] }
+    [..nf_slice(sig, 0, 1), ..[b'.'], ..nf_slice(sig, 1, sig.len), ..expb]
+}
+
+fn nf_fixed(sig: []byte, e10: i64): []byte {
+    if e10 < 0 {
+        return [..[b'0', b'.'], ..nf_zeros(((0 - e10) - 1) to u64), ..sig]
+    }
+    var intlen = (e10 + 1) to u64
+    if sig.len <= intlen {
+        return [..sig, ..nf_zeros(intlen - sig.len)]
+    }
+    [..nf_slice(sig, 0, intlen), ..[b'.'], ..nf_slice(sig, intlen, sig.len)]
+}
+
+fn nf_render_g(neg: bool, dig: NfDig, p: u64): str {
+    var nsig = nf_strip(dig.d, p)
+    var sig = nf_sig_bytes(dig.d, nsig)
+    var body = if dig.e10 < (0 - 4) || dig.e10 >= (p to i64) { nf_sci(sig, dig.e10) } else { nf_fixed(sig, dig.e10) }
+    if neg { return nf_to_str([..[b'-'], ..body]) }
+    nf_to_str(body)
+}
+
+fn nf_render_e(neg: bool, dig: NfDig, prec: u64): str {
+    var head = nf_slice(nf_sig_bytes(dig.d, prec + 1), 0, 1)
+    var body = if prec == 0 { [..head, ..nf_exp_field(dig.e10)] } else { [..head, ..[b'.'], ..nf_slice(nf_sig_bytes(dig.d, prec + 1), 1, prec + 1), ..nf_exp_field(dig.e10)] }
+    if neg { return nf_to_str([..[b'-'], ..body]) }
+    nf_to_str(body)
+}
+
+fn nf_render_f_body(dig: NfDig, prec: u64): []byte {
+    if dig.carried {
+        if dig.e10 >= 0 {
+            var intp = [..[b'1'], ..nf_zeros(dig.e10 to u64)]
+            if prec == 0 { return intp }
+            return [..intp, ..[b'.'], ..nf_zeros(prec)]
+        }
+        return [..[b'0', b'.'], ..nf_zeros(((0 - dig.e10) - 1) to u64), ..[b'1'], ..nf_zeros((prec to i64 + dig.e10) to u64)]
+    }
+    var ndig = dig.e10 + 1 + (prec to i64)
+    var sig = nf_sig_bytes(dig.d, ndig to u64)
+    if dig.e10 < 0 {
+        if prec == 0 { return [b'0'] }
+        return [..[b'0', b'.'], ..nf_zeros(((0 - dig.e10) - 1) to u64), ..sig]
+    }
+    var intlen = (dig.e10 + 1) to u64
+    if prec == 0 { return nf_slice(sig, 0, intlen) }
+    [..nf_slice(sig, 0, intlen), ..[b'.'], ..nf_slice(sig, intlen, ndig to u64)]
+}
+
+fn nf_fixed_str(neg: bool, m: u64, e: i64, prec: u64): str {
+    var sc = nf_normalize(nf_raw_ratio(m, e))
+    var ndig = sc.e10 + 1 + (prec to i64)
+    var body = if ndig < 1 { nf_small_fixed(m, e, prec) } else { nf_render_f_body(nf_gen(sc, ndig to u64), prec) }
+    if neg { return nf_to_str([..[b'-'], ..body]) }
+    nf_to_str(body)
+}
+
+fn nf_small_fixed(m: u64, e: i64, prec: u64): []byte {
+    var rat = nf_raw_ratio(m, e)
+    var scaled = nf_mul_u32(nf_mul_pow10(rat.r, prec), 2)
+    if nf_cmp(scaled, rat.s) > 0 {
+        if prec == 0 { return [b'1'] }
+        return [..[b'0', b'.'], ..nf_zeros(prec - 1), ..[b'1']]
+    }
+    if prec == 0 { return [b'0'] }
+    [..[b'0', b'.'], ..nf_zeros(prec)]
+}
+
+fn nf_zero_fixed(neg: bool, prec: u64): str {
+    var body = if prec == 0 { [b'0'] } else { [..[b'0', b'.'], ..nf_zeros(prec)] }
+    if neg { return nf_to_str([..[b'-'], ..body]) }
+    nf_to_str(body)
+}
+
+fn nf_nonfinite(p: NfParts): str {
+    if p.kind == 2 { return "nan" }
+    if p.neg { return "-inf" }
+    "inf"
+}
+
+/**
+ * Render `x` as `%.17g`: a 17-significant-digit decimal that round-trips exactly
+ * (`teko::float::parse(f64_g17(x)) == x` for every finite `x`).
+ *
+ * @param x  the value to render
+ * @return   the decimal text; `nan`, `inf`/`-inf` and `0`/`-0` for non-finite and zero
+ */
+exp fn f64_g17(x: f64): str {
+    var p = nf_parts(x)
+    if p.kind >= 2 { return nf_nonfinite(p) }
+    if p.kind == 1 { return if p.neg { "-0" } else { "0" } }
+    nf_render_g(p.neg, nf_gen(nf_normalize(nf_raw_ratio(p.m, p.e)), NF_SIG17), NF_SIG17)
+}
+
+/**
+ * Render `x` as `%.17g` (exact binary64 round-trip); the alias the codegen uses for float
+ * literals and `$"{x}"` interpolation.
+ *
+ * @param x  the value to render
+ * @return   the decimal text
+ */
+exp fn ftoa(x: f64): str {
+    f64_g17(x)
+}
+
+/**
+ * Render `x` fixed-point with exactly `prec` fractional digits (`%.*f`, round-half-even).
+ *
+ * @param x     the value
+ * @param prec  the fractional-digit count
+ * @return      the fixed-point text
+ */
+exp fn fmt_f(x: f64, prec: i64): str {
+    var p = nf_parts(x)
+    if p.kind >= 2 { return nf_nonfinite(p) }
+    var pr = if prec < 0 { 0 to u64 } else { prec to u64 }
+    if p.kind == 1 { return nf_zero_fixed(p.neg, pr) }
+    nf_fixed_str(p.neg, p.m, p.e, pr)
+}
+
+/**
+ * Render `x` in scientific notation with `prec` fractional mantissa digits (`%.*e`).
+ *
+ * @param x     the value
+ * @param prec  the fractional-mantissa-digit count
+ * @return      the scientific text
+ */
+exp fn fmt_e(x: f64, prec: i64): str {
+    var p = nf_parts(x)
+    if p.kind >= 2 { return nf_nonfinite(p) }
+    var pr = if prec < 0 { 0 to u64 } else { prec to u64 }
+    if p.kind == 1 {
+        if pr == 0 { return if p.neg { "-0e+00" } else { "0e+00" } }
+        return nf_to_str([..if p.neg { [b'-', b'0', b'.'] } else { [b'0', b'.'] }, ..nf_zeros(pr), ..[b'e', b'+', b'0', b'0']])
+    }
+    nf_render_e(p.neg, nf_gen(nf_normalize(nf_raw_ratio(p.m, p.e)), pr + 1), pr)
+}
+
+/**
+ * Render `x` in the shorter of fixed/scientific with `prec` significant digits (`%.*g`).
+ *
+ * @param x     the value
+ * @param prec  the significant-digit count (0 is treated as 1)
+ * @return      the general-format text
+ */
+exp fn fmt_g(x: f64, prec: i64): str {
+    var p = nf_parts(x)
+    if p.kind >= 2 { return nf_nonfinite(p) }
+    if p.kind == 1 { return if p.neg { "-0" } else { "0" } }
+    var pr = if prec <= 0 { 1 to u64 } else { prec to u64 }
+    nf_render_g(p.neg, nf_gen(nf_normalize(nf_raw_ratio(p.m, p.e)), pr), pr)
+}
+
+/**
+ * Render `x` fixed-point with `prec` fractional digits and thousands separators.
+ *
+ * @param x     the value
+ * @param prec  the fractional-digit count
+ * @return      the grouped fixed-point text
+ */
+exp fn fmt_n_f(x: f64, prec: i64): str {
+    nf_group_str(fmt_f(x, prec))
+}
+
+/**
+ * Render `x * 100` fixed-point with `prec` fractional digits, followed by `%`.
+ *
+ * @param x     the ratio to render as a percentage
+ * @param prec  the fractional-digit count
+ * @return      the percentage text
+ */
+exp fn fmt_p(x: f64, prec: i64): str {
+    nf_to_str([..nf_bytes_of(fmt_f(x * 100.0, prec)), ..[b'%']])
+}
+
+/**
+ * Render `x` as decimal, zero-padded on the left to `width` (the sign counts toward `width`).
+ *
+ * @param x      the value
+ * @param width  the minimum field width
+ * @return       the zero-padded decimal text
+ */
+exp fn fmt_d(x: i64, width: i64): str {
+    var neg = x < 0
+    var mag = nf_abs_u64(x)
+    var digs = nf_dec_digits(mag)
+    var signlen: i64 = if neg { 1 } else { 0 }
+    var pad = width - signlen - (digs.len to i64)
+    var padn = if pad < 0 { 0 to u64 } else { pad to u64 }
+    if neg { return nf_to_str([..[b'-'], ..nf_zeros(padn), ..digs]) }
+    nf_to_str([..nf_zeros(padn), ..digs])
+}
+
+/**
+ * Render `x` as upper-case hexadecimal, no `0x` prefix, no padding.
+ *
+ * @param x  the value
+ * @return   the hex text
+ */
+exp fn fmt_x_upper(x: u64): str {
+    nf_to_str(nf_radix_digits(x, 16, true))
+}
+
+/**
+ * Render `x` as lower-case hexadecimal, no `0x` prefix, no padding.
+ *
+ * @param x  the value
+ * @return   the hex text
+ */
+exp fn fmt_x_lower(x: u64): str {
+    nf_to_str(nf_radix_digits(x, 16, false))
+}
+
+/**
+ * Render `x` as binary, no `0b` prefix, no padding.
+ *
+ * @param x  the value
+ * @return   the binary text
+ */
+exp fn fmt_b(x: u64): str {
+    nf_to_str(nf_radix_digits(x, 2, false))
+}
+
+/**
+ * Render `x` as decimal with a comma every three digits.
+ *
+ * @param x  the value
+ * @return   the grouped decimal text
+ */
+exp fn fmt_n_i(x: i64): str {
+    var neg = x < 0
+    var grouped = nf_group(nf_dec_digits(nf_abs_u64(x)))
+    if neg { return nf_to_str([..[b'-'], ..grouped]) }
+    nf_to_str(grouped)
+}
+
+/**
+ * Format `x` by the leading byte of `spec` (`f`/`e`/`g`/`n`/`p`, case-insensitive); an
+ * empty/unknown spec falls back to `%.17g`.
+ *
+ * @param x     the value
+ * @param spec  the format spec
+ * @return      the formatted text
+ */
+exp fn fmt_dyn_f64(x: f64, spec: str): str {
+    if spec.len == 0 { return ftoa(x) }
+    var prec = nf_parse_prec(spec, 6)
+    var fc = nf_lead_lower(spec)
+    if fc == b'f' { return fmt_f(x, prec) }
+    if fc == b'e' { return fmt_e(x, prec) }
+    if fc == b'g' { return fmt_g(x, prec) }
+    if fc == b'n' { return fmt_n_f(x, prec) }
+    if fc == b'p' { return fmt_p(x, prec) }
+    ftoa(x)
+}
+
+/**
+ * Format signed `x` by the leading byte of `spec` (`d`/`x`/`X`/`b`/`n`); an empty/unknown spec
+ * falls back to decimal.
+ *
+ * @param x     the value
+ * @param spec  the format spec
+ * @return      the formatted text
+ */
+exp fn fmt_dyn_i64(x: i64, spec: str): str {
+    if spec.len == 0 { return fmt_d(x, 1) }
+    var prec = nf_parse_prec(spec, 0)
+    var fc = nf_lead_lower(spec)
+    if fc == b'd' { return fmt_d(x, if prec > 0 { prec } else { 1 }) }
+    if fc == b'x' {
+        if spec[0] == b'X' { return fmt_x_upper(x to u64) }
+        return fmt_x_lower(x to u64)
+    }
+    if fc == b'b' { return fmt_b(x to u64) }
+    if fc == b'n' { return fmt_n_i(x) }
+    fmt_d(x, 1)
+}
+
+/**
+ * Format unsigned `x` by the leading byte of `spec` (`d`/`x`/`X`/`b`/`n`); an empty/unknown spec
+ * falls back to decimal.
+ *
+ * @param x     the value
+ * @param spec  the format spec
+ * @return      the formatted text
+ */
+exp fn fmt_dyn_u64(x: u64, spec: str): str {
+    if spec.len == 0 { return nf_to_str(nf_dec_digits(x)) }
+    var prec = nf_parse_prec(spec, 0)
+    var fc = nf_lead_lower(spec)
+    if fc == b'd' { return fmt_d(x to i64, if prec > 0 { prec } else { 1 }) }
+    if fc == b'x' {
+        if spec[0] == b'X' { return fmt_x_upper(x) }
+        return fmt_x_lower(x)
+    }
+    if fc == b'b' { return fmt_b(x) }
+    if fc == b'n' { return fmt_n_i(x to i64) }
+    nf_to_str(nf_dec_digits(x))
+}
+
+fn nf_abs_u64(x: i64): u64 {
+    if x >= 0 { return x to u64 }
+    ((0 - (x + 1)) to u64) + 1
+}
+
+fn nf_dec_digits(v: u64): []byte {
+    nf_radix_digits(v, 10, false)
+}
+
+fn nf_radix_digits(x: u64, radix: u64, upper: bool): []byte {
+    if x == 0 { return [b'0'] }
+    var w = nf_radix_width(x, radix)
+    var out: [w]byte = []
+    var n = x
+    var i = w
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        out[i] = nf_radix_char((n % radix) to u32, upper)
+        n = n / radix
+    }
+    out
+}
+
+fn nf_radix_width(x: u64, radix: u64): u64 {
+    var n: u64 = 0
+    var t = x
+    loop {
+        if t == 0 { break }
+        t = t / radix
+        n = n + 1
+    }
+    n
+}
+
+fn nf_radix_char(d: u32, upper: bool): byte {
+    if d < (10 to u32) { return ((48 to u32) + d) to byte }
+    var off = d - (10 to u32)
+    if upper { return ((65 to u32) + off) to byte }
+    ((97 to u32) + off) to byte
+}
+
+fn nf_group(digs: []byte): []byte {
+    var n = digs.len
+    var ncommas = if n == 0 { 0 to u64 } else { (n - 1) / 3 }
+    var out: [n + ncommas]byte = []
+    var o: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        if i > 0 && (n - i) % 3 == 0 {
+            out[o] = b','
+            o = o + 1
+        }
+        out[o] = digs[i]
+        o = o + 1
+        i = i + 1
+    }
+    out
+}
+
+fn nf_group_str(body: str): str {
+    var b = nf_bytes_of(body)
+    var dot = b.len
+    var k: u64 = 0
+    loop {
+        if k >= b.len { break }
+        if b[k] == b'.' { dot = k; break }
+        k = k + 1
+    }
+    var start: u64 = if b.len > 0 && b[0] == b'-' { 1 } else { 0 }
+    var intpart = nf_group(nf_slice(b, start, dot))
+    var rest = nf_slice(b, dot, b.len)
+    if start == 1 { return nf_to_str([..[b'-'], ..intpart, ..rest]) }
+    nf_to_str([..intpart, ..rest])
+}
+
+fn nf_bytes_of(s: str): []byte {
+    var out: [s.len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        out[i] = s[i]
+        i = i + 1
+    }
+    out
+}
+
+fn nf_lead_lower(spec: str): byte {
+    if spec.len == 0 { return 0 to byte }
+    ((spec[0] to u64) | 32) to byte
+}
+
+fn nf_parse_prec(spec: str, def: i64): i64 {
+    var i: u64 = 0
+    loop {
+        if i >= spec.len { break }
+        if spec[i] >= b'0' && spec[i] <= b'9' { break }
+        i = i + 1
+    }
+    if i >= spec.len { return def }
+    var p: i64 = 0
+    loop {
+        if i >= spec.len { break }
+        if spec[i] < b'0' || spec[i] > b'9' { break }
+        if p < 10000 { p = p * 10 + ((spec[i] to i64) - 48) }
+        if p > 10000 { p = 10000 }
+        i = i + 1
+    }
+    p
+}
+
+fn nf_len_out(s: str, out_len: u64): i64 {
+    teko::mem::store_u64(out_len, s.len)
+    teko::sys::ptr_word(s.as_ptr())
+}
+
+fn nf_spec_of(sptr: u64, slen: u64): str {
+    str(teko::mem::bytes_from_ptr(teko::sys::word_ptr(sptr to i64), slen))
+}
+
+fn ftoa_len(x: f64, out_len: u64): i64 { nf_len_out(ftoa(x), out_len) }
+
+fn fmt_f_len(x: f64, prec: i64, out_len: u64): i64 { nf_len_out(fmt_f(x, prec), out_len) }
+
+fn fmt_e_len(x: f64, prec: i64, out_len: u64): i64 { nf_len_out(fmt_e(x, prec), out_len) }
+
+fn fmt_g_len(x: f64, prec: i64, out_len: u64): i64 { nf_len_out(fmt_g(x, prec), out_len) }
+
+fn fmt_p_len(x: f64, prec: i64, out_len: u64): i64 { nf_len_out(fmt_p(x, prec), out_len) }
+
+fn fmt_n_f_len(x: f64, prec: i64, out_len: u64): i64 { nf_len_out(fmt_n_f(x, prec), out_len) }
+
+fn fmt_d_len(x: i64, width: i64, out_len: u64): i64 { nf_len_out(fmt_d(x, width), out_len) }
+
+fn fmt_x_upper_len(x: u64, out_len: u64): i64 { nf_len_out(fmt_x_upper(x), out_len) }
+
+fn fmt_x_lower_len(x: u64, out_len: u64): i64 { nf_len_out(fmt_x_lower(x), out_len) }
+
+fn fmt_b_len(x: u64, out_len: u64): i64 { nf_len_out(fmt_b(x), out_len) }
+
+fn fmt_n_i_len(x: i64, out_len: u64): i64 { nf_len_out(fmt_n_i(x), out_len) }
+
+fn fmt_dyn_f64_len(x: f64, sptr: u64, slen: u64, out_len: u64): i64 { nf_len_out(fmt_dyn_f64(x, nf_spec_of(sptr, slen)), out_len) }
+
+fn fmt_dyn_i64_len(x: i64, sptr: u64, slen: u64, out_len: u64): i64 { nf_len_out(fmt_dyn_i64(x, nf_spec_of(sptr, slen)), out_len) }
+
+fn fmt_dyn_u64_len(x: u64, sptr: u64, slen: u64, out_len: u64): i64 { nf_len_out(fmt_dyn_u64(x, nf_spec_of(sptr, slen)), out_len) }

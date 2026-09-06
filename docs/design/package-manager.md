@@ -39,7 +39,7 @@ decisions.
 
 The **only** item the owner left open is *server/registry: later vs parallel-now* — and the
 owner's direction for THIS work is explicit: **"servidor depois, primeiro versão + definições"**
-→ the registry server, the site `teko-lang.cloud`, and the wasm playground (#509) are §7
+→ the registry server and the site `teko-lang.cloud` are §7
 (deferred). Everything else above is settled and this doc merely consolidates it.
 
 ---
@@ -240,7 +240,7 @@ pub type VersionReq = struct { bounds: []VersionBound }
  * @return the parsed Version, or an error when `s` is malformed (non-numeric field, empty)
  * @since 0.3.x
  */
-pub fn parse_version(s: str) -> Version | error
+pub fn parse_version(s: str): Version | error
 
 /**
  * Total order over versions: field-by-field (major, minor, patch, build), then a final release
@@ -251,7 +251,7 @@ pub fn parse_version(s: str) -> Version | error
  * @return -1 when a < b, 0 when equal, 1 when a > b
  * @since 0.3.x
  */
-pub fn compare_versions(a: Version, b: Version) -> i64
+pub fn compare_versions(a: Version, b: Version): i64
 
 /**
  * Parse a requirement string, desugaring `^`/`~` and splitting a space-separated range into
@@ -261,7 +261,7 @@ pub fn compare_versions(a: Version, b: Version) -> i64
  * @return the VersionReq, or an error when a comparator or version is malformed
  * @since 0.3.x
  */
-pub fn parse_version_req(s: str) -> VersionReq | error
+pub fn parse_version_req(s: str): VersionReq | error
 
 /**
  * Does a version satisfy EVERY bound of a requirement?
@@ -271,7 +271,7 @@ pub fn parse_version_req(s: str) -> VersionReq | error
  * @return true iff `v` satisfies all bounds of `req`
  * @since 0.3.x
  */
-pub fn version_satisfies(v: Version, req: VersionReq) -> bool
+pub fn version_satisfies(v: Version, req: VersionReq): bool
 ```
 
 ### 3.2 Dependency declarations (PK0): the `[dependencies]` grammar
@@ -379,7 +379,7 @@ pub type Resolution = struct {
  * @return the package's manifest block (name, version, declared deps)
  * @since 0.3.x
  */
-pub fn header_manifest(h: Header) -> PkgManifest
+pub fn header_manifest(h: Header): PkgManifest
 
 /**
  * Resolve the whole dependency graph FLAT and single-aligned.
@@ -395,7 +395,7 @@ pub fn header_manifest(h: Header) -> PkgManifest
  * @return the flat single-aligned Resolution, or a build error (conflict, cycle, or missing package)
  * @since 0.3.x
  */
-pub fn resolve_deps(root: Manifest, store: PackageStore) -> Resolution | error
+pub fn resolve_deps(root: Manifest, store: PackageStore): Resolution | error
 
 /**
  * The alignment check for ONE package name: find the single version satisfying ALL requirements
@@ -408,7 +408,7 @@ pub fn resolve_deps(root: Manifest, store: PackageStore) -> Resolution | error
  *         unsatisfiable requirements
  * @since 0.3.x
  */
-pub fn align_versions(name: str, reqs: []VersionReq, available: []Version) -> Version | error
+pub fn align_versions(name: str, reqs: []VersionReq, available: []Version): Version | error
 ```
 
 **Algorithm (deterministic, M.2):**
@@ -469,7 +469,7 @@ pub type Lockfile = struct { entries: []LockEntry }
  * @return the `teko.lock` file contents
  * @since 0.3.x
  */
-pub fn write_lockfile(res: Resolution) -> str
+pub fn write_lockfile(res: Resolution): str
 
 /**
  * Parse `teko.lock` text back into a Lockfile.
@@ -478,7 +478,7 @@ pub fn write_lockfile(res: Resolution) -> str
  * @return the parsed Lockfile, or an error on a malformed entry
  * @since 0.3.x
  */
-pub fn parse_lockfile(src: str) -> Lockfile | error
+pub fn parse_lockfile(src: str): Lockfile | error
 
 /**
  * Does a fresh Resolution still match the pinned Lockfile (same names, versions, integrity)?
@@ -489,7 +489,7 @@ pub fn parse_lockfile(src: str) -> Lockfile | error
  * @return true iff every resolved dep matches its pinned entry exactly
  * @since 0.3.x
  */
-pub fn lockfile_matches(lock: Lockfile, res: Resolution) -> bool
+pub fn lockfile_matches(lock: Lockfile, res: Resolution): bool
 ```
 
 ### 3.5 Cache + monomorphization-by-use (PK5 — wires into the ratified #180 build)
@@ -602,8 +602,8 @@ building your own source — works now.
   The registry (deferred, §7) needs anti-squat policy + publisher identity verification. Recorded
   as a registry-layer requirement, not a compiler one.
 - **Runtime capability / sandbox.** v1 = full-trust-once-installed (like Cargo/npm). FUTURE =
-  capability-based execution / an opt-in **WASI-sandbox** for running tools in isolation (chroot to
-  project, client-open / server-opt-in). Connects to wasm backend targets (N6a WASI / N6b browser).
+  capability-based execution / an opt-in **sandbox** for running tools in isolation (chroot to
+  project, client-open / server-opt-in).
   Recorded as a future direction, out of PK0–PK3 scope.
 
 ---
@@ -702,7 +702,7 @@ honest-stop); `path=`/`git=` tools are full-trust.
 #### 5.3.3 Security note (restated)
 
 A `tool` runs arbitrary code when executed → authenticity is NOT deferred for tools (§4.3). The
-future WASI-sandbox option (§4.3) is the isolation path for running an untrusted tool. This is the
+future sandbox option (§4.3) is the isolation path for running an untrusted tool. This is the
 ONE seam where the "integrity-now, authenticity-later" default is overridden.
 
 ---
@@ -710,9 +710,9 @@ ONE seam where the "integrity-now, authenticity-later" default is overridden.
 ## 6. The PK0–PK3 crumb sequence (the executable plan)
 
 Each crumb is the smallest independently gate-able step, with its key signatures (above, §3), its
-regression fixtures (inputs → exit code, VM and native), and its ritual point. Fixtures for pure
-logic run on the VM as `.tkt`; end-to-end build fixtures run NATIVE (per the native-test-gate
-ruling — `#test` is compiled native, never VM). New modules land as compilable skeletons with
+regression fixtures (inputs → exit code, rota C e backend nativo), and its ritual point. Fixtures for pure
+logic are `.tkt` tests; end-to-end build fixtures run native (per the native-test-gate
+ruling — `#test` is compiled native). New modules land as compilable skeletons with
 full doc-comments + honest-stops so the plan advances even before every dep closes (design-ahead).
 
 ### Crumb C1 — `version.tks`: the version model (PK1-a)
@@ -720,13 +720,13 @@ full doc-comments + honest-stops so the plan advances even before every dep clos
 New module `src/build/version.tks` (namespace `teko::build`): `Version`, `CmpOp`,
 `parse_version`, `compare_versions`. Pure functions, no compiler wiring yet.
 
-- **Fixtures (VM `.tkt`):**
+- **Fixtures (test (`.tkt`)):**
   - `V1a` `parse_version("1.2.3")` → `{1,2,3,0,""}`; `parse_version("0.2.0.2-beta")` →
     `{0,2,0,2,"beta"}`; exit 0.
   - `V1b` `parse_version("1.x")` / `""` → error path taken; exit 0 (the test asserts the error).
   - `V1c` `compare_versions(1.2.3, 1.2.4)` = -1; `compare_versions(1.0.0, 1.0.0-beta)` = 1
     (final > prerelease); `compare_versions(0.2.0.1, 0.2.0.2)` = -1 (build field); exit 0.
-- **Ritual:** none required (pure additive logic, no compiler behavior change); a VM + native
+- **Ritual:** none required (pure additive logic, no compiler behavior change); a rota C e backend nativo
   build of the new module must pass. Fixpoint is neutral (compiler does not yet use it).
 
 ### Crumb C2 — `version.tks`: requirements (PK1-b)
@@ -734,13 +734,13 @@ New module `src/build/version.tks` (namespace `teko::build`): `Version`, `CmpOp`
 Add `VersionBound`, `VersionReq`, `parse_version_req` (with `^`/`~` desugar + ranges),
 `version_satisfies` to `version.tks`.
 
-- **Fixtures (VM `.tkt`):**
+- **Fixtures (test (`.tkt`)):**
   - `V2a` `version_satisfies(1.5.0, ">=1.2 <2.0")` = true; `version_satisfies(2.0.0, ">=1.2 <2.0")`
     = false; exit 0.
   - `V2b` `^1.2.3` accepts 1.9.0, rejects 2.0.0; `^0.2.3` accepts 0.2.9, rejects 0.3.0; exit 0.
   - `V2c` `~1.2.3` accepts 1.2.9, rejects 1.3.0; `=1.2.3` accepts only 1.2.3; exit 0.
   - `V2d` `parse_version_req(">= bad")` → error; exit 0 (asserts error).
-- **Ritual:** none required (pure). VM + native build passes.
+- **Ritual:** none required (pure). rota C e backend nativo build passes.
 
 ### Crumb C3 — `manifest.tks`: `[dependencies]` with sources + constraints (PK0)
 
@@ -748,13 +748,13 @@ Extend `manifest.tks`: `RegistrySource`/`PathSource`/`GitSource`/`DepSource`/`De
 `mf_read_inline_table` helper; `Manifest.dep_specs: []DepSpec` (keep `deps: []str` derived).
 Parse `[tools]` into a parallel `tool_specs: []DepSpec`.
 
-- **Fixtures (VM `.tkt` for parse + native for round-trip through the driver):**
+- **Fixtures (test (`.tkt`) for parse + native for round-trip through the driver):**
   - `D1` `[dependencies]` with `"@acme/json" = ">=1.2 <2.0"` → `DepSpec` registry, 2 bounds; exit 0.
   - `D2` `bar = { path = "../bar" }` → `PathSource`; exit 0.
   - `D3` `baz = { git = "https://…", tag = "v1.0" }` → `GitSource{git_ref="v1.0"}`; exit 0.
   - `D4` `[tools]` entry parses into `tool_specs`, distinct from `dep_specs`; exit 0.
   - `D5` malformed inline table (`{ path = }`) → honest error; exit non-zero.
-- **Ritual:** FULL GATE — `manifest.tks` is production code the compiler reads; both engines +
+- **Ritual:** FULL GATE — `manifest.tks` is production code the compiler reads; rota C e backend nativo +
   byte-identity + fixpoint gen1==gen2 (the compiler self-builds through the manifest parser).
 
 ### Crumb C4 — `.tkh` manifest block (PK-codec)
@@ -764,15 +764,15 @@ read / collect it; bump the `.tkh` format version to 2 (the reader accepts 2); `
 accessor. This is the codec change that lets the resolver read dep edges from the `.tkh`.
 
 - **Fixtures:**
-  - `H1` (VM `.tkt`) round-trip: build a `Header` with a manifest block (name/version/2 deps) →
+  - `H1` (test (`.tkt`)) round-trip: build a `Header` with a manifest block (name/version/2 deps) →
     `emit_tkh` → `read_tkh` → identical; exit 0.
-  - `H2` (VM `.tkt`) byte-fidelity: emit → load → re-emit BYTE-IDENTICAL (the C7.16 acceptance
+  - `H2` (test (`.tkt`)) byte-fidelity: emit → load → re-emit BYTE-IDENTICAL (the C7.16 acceptance
     bar, now including the manifest block); exit 0.
   - `H3` (native) an emitted package's `.tkh` (version 2) is read back by the resolver's
     `header_manifest` and yields the declared deps; exit 0.
   - `H4` a version-1 `.tkh` (no manifest block) → honest "unsupported/legacy .tkh" OR forward-read
     with an empty manifest (decide at implementation; the honest-stop is acceptable); exit as designed.
-- **Ritual:** FULL GATE — touches the serializer; both engines + byte-identity + **fixpoint**
+- **Ritual:** FULL GATE — touches the serializer; rota C e backend nativo + byte-identity + **fixpoint**
   (the codec is exactly where byte-identity regressions hide).
 
 ### Crumb C5 — the flat single-aligned resolver (PK2)
@@ -782,17 +782,17 @@ New module `src/build/resolve_deps.tks` (namespace `teko::build`): `ResolvedDep`
 fetch is PK4/deferred), `resolve_deps`, `align_versions`. Design-ahead: the `PackageStore` is a
 declared interface fed by an in-memory fixture today and by the real store when PK4 closes.
 
-- **Fixtures (VM `.tkt` over synthetic in-memory headers + store):**
+- **Fixtures (test (`.tkt`) over synthetic in-memory headers + store):**
   - `R1` diamond A→C(`>=1.0`), B→C(`>=1.1`); store C = {1.0, 1.1, 1.2} → aligns C to **1.2** (highest
     satisfying both), ONE `ResolvedDep` for C (no duplication); exit 0.
   - `R2` conflict A→C(`<1.5`), B→C(`>=1.5`) → BUILD ERROR naming both imposers; exit non-zero.
   - `R3` cycle A→B→A → honest build error (no hang); exit non-zero.
   - `R4` `order` is leaves-first (Kahn): for A→B→C, `order` = [C, B, A]; exit 0.
-  - `R5` single-aligned canonicity: two deps both requiring `Foo<i64>` from C resolve to the SAME
+  - `R5` single-aligned canonicity: two deps requiring `Foo<i64>` from C resolve to the SAME
     C instance → one canonical stamped type (ties to #180 F1/F5 byte-identity); exit 0.
 - **Ritual:** FULL GATE after the resolver is wired into the build (compiler behavior change);
-  both engines + byte-identity + fixpoint. (The resolver logic alone, tested over in-memory
-  stores, gates VM+native without the fixpoint dependency until it is wired.)
+  rota C e backend nativo + byte-identity + fixpoint. (The resolver logic alone, tested over in-memory
+  stores, gates rota C e backend nativo without the fixpoint dependency until it is wired.)
 
 ### Crumb C6 — `teko.lock` (PK3)
 
@@ -803,13 +803,13 @@ sha256_of; already exists in `src/crypto/hash.tks` #194-204). FNV is used ONLY f
 (non-security). Layer-1 integrity gates on sha256 being wired.
 
 - **Fixtures:**
-  - `L1` (VM `.tkt`) resolve → `write_lockfile` → `parse_lockfile` → `lockfile_matches` = true
+  - `L1` (test (`.tkt`)) resolve → `write_lockfile` → `parse_lockfile` → `lockfile_matches` = true
     (round-trip, deterministic name-sorted output); exit 0.
   - `L2` (native) a lock pins version+hash; a store `.tkl` whose hash differs from the pin →
     integrity error (tamper detected); exit non-zero.
   - `L3` (native) lockfile present + matches → build re-uses pinned versions, output byte-identical
     to the no-lock build (reproducibility); exit 0.
-- **Ritual:** FULL GATE (production build path); both engines + byte-identity + fixpoint.
+- **Ritual:** FULL GATE (production build path); rota C e backend nativo + byte-identity + fixpoint.
 
 ### Crumb C7 — wire resolution into the build cache + CLI (PK5, into #180)
 
@@ -825,7 +825,7 @@ not yet merged it is design-ahead against #180's declared seam.
   - `C7c` `teko clean` → `<target>/.teko-cache/` removed; `<stem>` + `<stem>.c` + the store remain;
     idempotent re-run exits 0 (F7).
   - `C7d` the read-only store is not mutated during a build (F9); exit 0.
-- **Ritual:** FULL GATE (the whole native build path) — both engines + byte-identity + **fixpoint
+- **Ritual:** FULL GATE (the whole native build path) — rota C e backend nativo + byte-identity + **fixpoint
   gen1==gen2** is the wall for the "don't-recompile-from-source" invariant (§2.6). Register that
   the self-host does NOT exercise cross-package generics (the compiler is single-package) — the
   resolver/lockfile fixtures are the only coverage there; the ritual proves no regression but does
@@ -844,13 +844,13 @@ build to a native exe now.
   - `T3` (native) a `path=` tool builds to a native exe; exit 0.
   - `T4` (native) a REMOTE-registry `[tools]` entry → honest-stop "requires signature verification
     (PK7)"; exit non-zero.
-- **Ritual:** FULL GATE (production build dispatch touched); both engines + byte-identity + fixpoint.
+- **Ritual:** FULL GATE (production build dispatch touched); rota C e backend nativo + byte-identity + fixpoint.
 
 ### Ritual summary
 
-The **full gate** (both engines · paranoid · diff_vm_native · parity · fixpoint gen1==gen2) is
+The **full gate** (rota C e backend nativo · paranoid · diff_vm_native · parity · fixpoint gen1==gen2) is
 mandatory at crumbs **C3, C4, C5, C6, C7, C8** — every crumb that touches production compiler code
-or the serializer. C1/C2 are pure additive logic (VM+native build must pass; no fixpoint
+or the serializer. C1/C2 are pure additive logic (rota C e backend nativo build must pass; no fixpoint
 dependency). The serializer crumb (C4) and the cache-wire crumb (C7) are the two where
 byte-identity regressions are most likely — treat their fixpoint as the primary bar.
 
@@ -876,7 +876,7 @@ later without redesign.
 - **Registry server + site `teko-lang.cloud` + package server.** The owner's direction: server
   LATER; first the version + the definitions (this doc). The VPS (`root@187.77.42.87`,
   runner `vps-x64`, dokploy) is the eventual home.
-- **Wasm playground (#509).** Rides the wasm backend targets (N6a WASI / N6b browser); out of the
+- **Playground (#509).** Needs a target the browser can run, which this project does not emit; out of the
   package-manager scope now.
 - **Bindgen (#506).** The multi-language FFI binding generator (`--emit-bindings`) and the `.tks`
   link-only consumption path are a SIBLING track (pós-LTS for the non-`.tks` targets); the `.tkh`

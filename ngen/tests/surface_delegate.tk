@@ -1,0 +1,232 @@
+// surface_delegate.tk -- a NAMED delegate (K1, D221 §41): a typed pointer to
+// a function, over `callp`, plus `null`.
+//
+// What each helper proves, in order:
+//
+//   1. `dcheck` -- `Op f = add;` (contextual) and `Op g = new Op(mul);`
+//      (explicit) both wrap a plain function in a thunk generated once per
+//      (delegate, function) pair; `f(3, 4)` rebaixes to a typed `callp`;
+//      `Op` as a PARAMETER (`apply`) and as a RETURN (`choose`), and the
+//      free-function overload `apply(Op)` vs `apply(i64)`;
+//   2. `fcheck` -- a class field of delegate type, called where it is read
+//      (`h.cb(2, 3)`), and released along with the object that holds it;
+//   3. `ncheck` -- `null`, an `N_INT` 0, guarded by an `if`;
+//   4. `geo.use_gop()` -- the same declaration, INSIDE a namespace.
+//   5. `rcheck` -- a delegate whose RETURN is a counted class (`Make`):
+//      `Cell c = f(7);` takes the reference `f(7)` already owns with no
+//      extra increment; `c = null;` then runs the destructor -- the bug K1b
+//      fixed, an increment `rt_own` never sheds because the reclaim looked
+//      up the count under the ORPHANED node the delegate rewrite built
+//      rather than the one it copied into (teko_deleg.tk's `tk_deleg_call`).
+//      Also covers a reassignment (`c = f(8)`, the prior reference released),
+//      `return f(x)` from a function declared to answer `Cell`, `f(x)` as an
+//      argument (parked and swept with the statement), and a delegate whose
+//      own return is ANOTHER delegate (`Chooser`, itself counted).
+//   6. `fdcheck` -- a delegate whose RETURN is a float (V1): the indirect call
+//      carries the cast that declares its return type to the core, so
+//      `1.0 + d(2.0)` is 5.0 and not the 3.0 the untyped `callp` left in the
+//      register; the same by `new Scale(dbl)`, from a class field, and in
+//      `f32`, where the value travels in the single-precision half.
+//
+// `rt_live()` is back to its floor after every helper returns: the reclaim
+// (teko_rc.tk) already scopes a delegate value exactly as it scopes a class
+// reference, teko_struct.tk's `tk_is_counted` the only line that changed.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+delegate i64 Op(i64 a, i64 b);
+
+i64 add(i64 a, i64 b) {
+    return a + b;
+}
+
+i64 mul(i64 a, i64 b) {
+    return a * b;
+}
+
+i64 apply(Op f) {
+    return f(3, 4);
+}
+
+i64 apply(i64 k) {
+    return k;
+}
+
+Op choose(i64 which, Op a, Op b) {
+    if (which != 0) return a;
+    return b;
+}
+
+class H {
+    public Op cb;
+}
+
+delegate f64 Scale(f64 x);
+delegate f32 Scale32(f32 x);
+
+f64 dbl(f64 x) {
+    return x * 2.0;
+}
+
+f32 half32(f32 x) {
+    return x * 0.5f;
+}
+
+class FH {
+    public Scale cb;
+}
+
+i64 dcheck() {
+    Op f = add;
+    if (f(3, 4) != 7) return 1;
+
+    Op g = new Op(mul);
+    if (g(3, 4) != 12) return 2;
+
+    if (apply(f) != 7) return 3;                  // apply__Op
+    if (apply(9) != 9) return 4;                  // apply__i64
+
+    Op picked = choose(1, f, g);
+    if (picked(3, 4) != 7) return 5;
+    picked = choose(0, f, g);
+    if (picked(3, 4) != 12) return 6;
+
+    return 0;
+}
+
+i64 fcheck() {
+    H h = new H;
+    Op cb = add;
+    h.cb = cb;
+    if (h.cb(2, 3) != 5) return 1;
+    return 0;
+}
+
+i64 ncheck() {
+    Op maybe = null;
+    if (maybe == null) return 0;
+    return 1;
+}
+
+i64 fdcheck() {
+    Scale d = dbl;
+    if (d(2.0) != 4.0) return 1;
+    if (1.0 + d(2.0) != 5.0) return 2;            // the nested form, at a moved depth
+    if (1.0 + (2.0 + (4.0 + d(8.0))) != 23.0) return 3;
+
+    Scale g = new Scale(dbl);
+    if (1.0 + g(3.0) != 7.0) return 4;
+
+    FH h = new FH;
+    h.cb = d;
+    if (1.0 + h.cb(2.0) != 5.0) return 5;         // the same call from a class FIELD
+
+    Scale32 s = half32;
+    if (1.0f + s(3.0f) != 2.5f) return 6;
+
+    return 0;
+}
+
+namespace geo {
+    delegate i64 GOp(i64 a, i64 b);
+
+    i64 gadd(i64 a, i64 b) {
+        return a + b;
+    }
+
+    i64 use_gop() {
+        GOp f = gadd;
+        return f(10, 20);
+    }
+}
+
+i64 cell_dtors = 0;
+
+class Cell {
+    public i64 v;
+
+    public Cell(i64 x) {
+        v = x;
+    }
+
+    ~Cell() {
+        cell_dtors = cell_dtors + 1;
+    }
+}
+
+delegate Cell Make(i64 x);
+delegate Make Chooser(i64 which);
+
+Cell mkcell(i64 x) {
+    return new Cell(x);
+}
+
+Cell mkcell2(i64 x) {
+    return new Cell(x + 100);
+}
+
+Make choose_make(i64 which) {
+    if (which != 0) return new Make(mkcell2);
+    return new Make(mkcell);
+}
+
+Cell via_return(Make f, i64 x) {
+    return f(x);
+}
+
+i64 via_arg(Cell c) {
+    return c.v;
+}
+
+i64 rcheck() {
+    Make f = mkcell;
+    Cell c = f(7);
+    if (c.v != 7) return 1;
+    c = null;
+    if (cell_dtors != 1) return 2;                // the reference `f(7)` owned, freed once
+
+    c = f(8);                                     // reassignment: no prior slot to release
+    if (c.v != 8) return 3;
+
+    Cell r = via_return(f, 9);                     // `return f(x);` from a Cell-returning fn
+    if (r.v != 9) return 4;
+
+    if (via_arg(f(10)) != 10) return 5;            // `f(x)` as an argument, parked and swept
+
+    Chooser pick = choose_make;
+    Make picked = pick(1);                         // a delegate returning ANOTHER delegate
+    Cell got = picked(5);
+    if (got.v != 105) return 6;
+
+    return 0;
+}
+
+i64 main() {
+    i64 bad = dcheck();
+    if (bad != 0) return 10 + bad;
+    if (rt_live() != 0) return 20;
+
+    bad = fcheck();
+    if (bad != 0) return 30 + bad;
+    if (rt_live() != 0) return 40;
+
+    bad = ncheck();
+    if (bad != 0) return 50 + bad;
+    if (rt_live() != 0) return 60;
+
+    bad = fdcheck();
+    if (bad != 0) return 120 + bad;
+    if (rt_live() != 0) return 130;
+
+    if (geo.use_gop() != 30) return 70;
+    if (rt_live() != 0) return 80;
+
+    bad = rcheck();
+    if (bad != 0) return 90 + bad;
+    if (rt_live() != 0) return 100;
+    if (cell_dtors != 5) return 110 + cell_dtors;
+
+    return 42;
+}

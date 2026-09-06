@@ -45,11 +45,11 @@ e o vagão 15 é a mais nova que emite.
 
 ## A cadeia, e onde ela termina
 
-    hoje        bootstrap/teko.c (15) -> cc -> binario do 15 (tem backend C)
+    hoje        bootstrap/teko.c (15): cc -> binario do 15 (tem backend C)
                   -> constroi o vagao 20 EM UMA GERACAO, e emite o teko.c(20)
 
     quando o N2 fechar
-                bootstrap/teko.c (20) -> cc -> binario do 20 (so backend nativo)
+                bootstrap/teko.c (20): cc -> binario do 20 (so backend nativo)
                   -> constroi o vagao 20 NATIVAMENTE, sem emitir nada
 
 O critério de parada do dono — *"até termos um teko.c que não gera outro teko.c"* — e o fecho do

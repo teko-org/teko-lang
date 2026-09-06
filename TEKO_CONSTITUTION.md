@@ -234,8 +234,8 @@ to be audited. A **closed system, without gaps.**
   OS**. It does **not** mean *bare-metal* (no OS, device drivers, bare hardware).
   Bare-metal is the **aspiration** — the north star — not the shippable reality, because
   rewriting every access/security/driver layer takes *years*. Teko names this honestly
-  in **three materialization stages** (build-order, M.4): **(1) `.tkb`** — IL/bytecode,
-  *interpreted*, the first materialization and the bootstrap stepping-stone (the least
+  in **three materialization stages** (build-order, M.4): **(1) `.tkb`** — the serialized IL
+  form, the first materialization and the bootstrap stepping-stone (the least
   "metal," the simplest to reach); **(2) AOT-native on a host OS** — the **LTS**, where
   the metal *ethos* is fully realized (native code, no GC, no hidden runtime; IO via
   host syscalls) — **this is what ships**; **(3) bare-metal** — the aspiration (native,

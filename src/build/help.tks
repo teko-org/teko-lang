@@ -1,36 +1,10 @@
-/**
- * src/build/help.tks (namespace 'teko::build')
- *
- * The `--help`/`-h` CLI surface — a sibling of project.tks's other CLI-flag helpers
- * (out_dir_of, project_arg_of, coverage_of, no_verify_of), split into its own file
- * because main.tks is the virtual-main (no `fn`/`type` declarations) and needs a
- * module home for its help logic. `teko --help` prints the GENERAL usage banner;
- * `teko <command> --help` prints that command's own usage — the owner's 2026-07-14
- * ruling that `--help` always answers the most specific command it was given for.
- */
 
-/**
- * is_known_command — is `cmd` one of the CLI subcommands that owns its own help text
- * (`build`/`run`/`test`/`fmt`/`init`)? Used by `help_cmd_of` to decide whether
- * `args[1]` names a command-specific help page or falls back to the general banner.
- *
- * @param cmd  a candidate first positional argument
- * @return     true iff `cmd` is a recognized subcommand
- */
-fn is_known_command(cmd: str) -> bool {
-    cmd == "build" || cmd == "run" || cmd == "test" || cmd == "fmt" || cmd == "init"
+fn is_known_command(cmd: str): bool {
+    cmd == "build" || cmd == "run" || cmd == "test" || cmd == "fmt" || cmd == "init" || cmd == "lsp"
 }
 
-/**
- * wants_help — does ANY argument in `args` request help (`--help` or `-h`), at any
- * position? `main.tks` checks this BEFORE the "no args" guard and BEFORE command
- * dispatch, so `--help` wins no matter where it appears on the line.
- *
- * @param args  the full CLI argument vector (args[0] is the program name)
- * @return      true iff `--help` or `-h` appears anywhere in `args`
- */
-fn wants_help(args: []str) -> bool {
-    mut i: u64 = 0
+fn wants_help(args: []str): bool {
+    var i: u64 = 0
     loop {
         if i >= args.len { break }
         if args[i] == "--help" || args[i] == "-h" { return true }
@@ -39,34 +13,21 @@ fn wants_help(args: []str) -> bool {
     false
 }
 
-/**
- * help_cmd_of — which command's help page `args` asks for: `args[1]` when it names a
- * known subcommand (`build`/`run`/`test`/`fmt`), else "" for the general banner. `teko
- * --help` yields "" (`"--help"` is not a known command); `teko build --help` yields
- * "build" regardless of where `--help` sits on the line.
- *
- * @param args  the full CLI argument vector (args[0] is the program name)
- * @return      the command name whose help to print, or "" for the general banner
- */
-fn help_cmd_of(args: []str) -> str {
+fn help_cmd_of(args: []str): str {
     if args.len < 2 { return "" }
-    let cmd = args[1]
+    var cmd = args[1]
     if is_known_command(cmd) { return cmd }
     ""
 }
 
-/**
- * print_help_general — the GENERAL usage banner (unchanged from the pre-existing
- * `--help` text in main.tks): the version line, every subcommand's one-line summary,
- * and the build/bare flags. Printed to stderr; the caller exits 0.
- */
 fn print_help_general() {
     teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
     teko::io::eprintln("usage: teko build <projdir>   build the project to a native binary")
     teko::io::eprintln("       teko run   <projdir>   build (debug) and run the project's native binary")
     teko::io::eprintln("       teko test  <projdir>   run the project's tests")
-    teko::io::eprintln("       teko fmt   [--check] <path>...   format .tks/.tkt sources (self-hosted binary only)")
+    teko::io::eprintln("       teko fmt   --check | --apply <path>...   format .tks/.tkt sources (self-hosted binary only)")
     teko::io::eprintln("       teko init  [dir]        scaffold a new project (interactive; writes teko.tkp + a stub)")
+    teko::io::eprintln("       teko lsp                run the language server (JSON-RPC over stdio; for editor integration)")
     teko::io::eprintln("       teko <projdir>         (bare) ≡ build")
     teko::io::eprintln("       teko --version | -v    print the version and exit")
     teko::io::eprintln("       teko --help | -h       print this help and exit")
@@ -76,18 +37,15 @@ fn print_help_general() {
     teko::io::eprintln("       --no-verify            skip the .tkt test gate (build ONLY; unverified binary — CI/self-host use)")
     teko::io::eprintln("       --cov-validation       enforce the [coverage] floors (default: an unmet floor only warns)")
     teko::io::eprintln("       --release              build the binary optimized (cc -O2; slower to produce, faster to run)")
+    teko::io::eprintln("       --debug=lines          emit debug info: breakpoint by .tks line, step, and backtrace in")
+    teko::io::eprintln("                              tdb, gdb, lldb and VSCode. Does NOT include variables")
+    teko::io::eprintln("       --debug=none           no debug information (the default, including under --release)")
     teko::io::eprintln("       --opt=<0|1|2>          set the cc optimization level (default 0; no -O — fast to produce)")
     teko::io::eprintln("       --no-tty               force plain, non-interactive build output (no \\r in-place updates)")
     teko::io::eprintln("       --allow-undef          link blind over a shared lib absent here (resolved at load on the target)")
     teko::io::eprintln("teko compiles projects, not files: pass a project directory or .tkp")
 }
 
-/**
- * print_help_build — the `teko build` usage page: what it does and its own flags
- * (`-o`, `--coverage`, `--no-verify`, `--cov-validation`, `--release`, `--opt=<0|1|2>`, `--no-tty`,
- * `--allow-undef`).
- * Printed to stderr; the caller exits 0.
- */
 fn print_help_build() {
     teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
     teko::io::eprintln("usage: teko build <projdir>   build the project to a native binary")
@@ -97,16 +55,14 @@ fn print_help_build() {
     teko::io::eprintln("       --no-verify            skip the .tkt test gate (build ONLY; unverified binary — CI/self-host use)")
     teko::io::eprintln("       --cov-validation       enforce the [coverage] floors (default: an unmet floor only warns)")
     teko::io::eprintln("       --release              build the binary optimized (cc -O2; slower to produce, faster to run)")
+    teko::io::eprintln("       --debug=lines          emit debug info: breakpoint by .tks line, step, and backtrace in")
+    teko::io::eprintln("                              tdb, gdb, lldb and VSCode. Does NOT include variables")
+    teko::io::eprintln("       --debug=none           no debug information (the default, including under --release)")
     teko::io::eprintln("       --opt=<0|1|2>          set the cc optimization level (default 0; no -O — fast to produce)")
     teko::io::eprintln("       --no-tty               force plain, non-interactive build output (no \\r in-place updates)")
     teko::io::eprintln("       --allow-undef          link blind over a shared lib absent here (resolved at load on the target)")
 }
 
-/**
- * print_help_run — the `teko run` usage page: build (debug profile) and execute the
- * project's native binary, plus the `-o` output-directory flag it shares with
- * `build`. Printed to stderr; the caller exits 0.
- */
 fn print_help_run() {
     teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
     teko::io::eprintln("usage: teko run <projdir>   build (debug) and run the project's native binary")
@@ -114,10 +70,6 @@ fn print_help_run() {
     teko::io::eprintln("       -o <dir>               output directory (default: bin)")
 }
 
-/**
- * print_help_test — the `teko test` usage page: run the project's tests, plus the
- * `--coverage`, `--cov-validation`, and `--per-test-cov` flags. Printed to stderr; the caller exits 0.
- */
 fn print_help_test() {
     teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
     teko::io::eprintln("usage: teko test <projdir>   run the project's tests")
@@ -128,22 +80,26 @@ fn print_help_test() {
     teko::io::eprintln("       --per-test-cov         print per-test coverage attribution (dev-time; recompiles one binary per test)")
 }
 
-/**
- * print_help_fmt — the `teko fmt` usage page: the canonical formatter over one or
- * more source paths, plus its `--check` flag. Printed to stderr; the caller exits 0.
- */
 fn print_help_fmt() {
     teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
-    teko::io::eprintln("usage: teko fmt [--check] <path>...   format .tks/.tkt sources (self-hosted binary only)")
+    teko::io::eprintln("usage: teko fmt --check <path>...   report .tks/.tkt sources that are not formatted")
+    teko::io::eprintln("       teko fmt --apply <path>...   format them, rewriting each file in place")
+    teko::io::eprintln("       teko fmt -                   format stdin to stdout, touching no file")
     teko::io::eprintln("flags:")
-    teko::io::eprintln("       --check                report unformatted files without rewriting them")
+    teko::io::eprintln("       --check                report unformatted files without rewriting them (exit 1 if any)")
+    teko::io::eprintln("       --apply                rewrite every unformatted file in place")
+    teko::io::eprintln("(a path is a .tks/.tkt file or a directory walked recursively; self-hosted binary only)")
 }
 
-/**
- * print_help_init — the `teko init` usage page: scaffold a new project at an
- * optional target directory (default: the current directory). Printed to stderr;
- * the caller exits 0.
- */
+fn print_help_lsp() {
+    teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
+    teko::io::eprintln("usage: teko lsp   run the language server (JSON-RPC 2.0 over stdio)")
+    teko::io::eprintln("meant to be launched by an editor's language-client, not typed directly")
+    teko::io::eprintln("speaks: initialize, shutdown, exit, textDocument/didOpen|didChange|didClose,")
+    teko::io::eprintln("        textDocument/formatting, textDocument/hover, textDocument/definition,")
+    teko::io::eprintln("        textDocument/completion")
+}
+
 fn print_help_init() {
     teko::io::eprintln(teko::str::concat("teko ", teko::env::version()))
     teko::io::eprintln("usage: teko init [dir]   scaffold a new project (default dir: the current directory)")
@@ -151,19 +107,12 @@ fn print_help_init() {
     teko::io::eprintln("(an empty answer or EOF uses the shown default); refuses to overwrite an existing teko.tkp")
 }
 
-/**
- * print_help — print the help page for `cmd`: the GENERAL banner for "" (the
- * pre-existing `teko --help` text, unchanged), else the command-specific page for
- * "build"/"run"/"test"/"fmt"/"init". Every page is printed to stderr, version line
- * first; the caller (`main.tks`) exits 0 afterward.
- *
- * @param cmd  "" for the general banner, else a known subcommand name
- */
 fn print_help(cmd: str) {
     if cmd == "build" { print_help_build(); return }
     if cmd == "run" { print_help_run(); return }
     if cmd == "test" { print_help_test(); return }
     if cmd == "fmt" { print_help_fmt(); return }
     if cmd == "init" { print_help_init(); return }
+    if cmd == "lsp" { print_help_lsp(); return }
     print_help_general()
 }

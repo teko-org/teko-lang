@@ -3,7 +3,7 @@
 Design doc for issue **#517** (in-wave, 0.3). Recovers a frontend design that
 failed to land: labels shipped in the **suffix** position (`loop NAME {}`),
 which foreclosed the condition/range head. This doc settles the load-bearing
-decision, the parser algorithm, the AST/checker/VM/codegen/LIR work, the
+decision, the parser algorithm, the AST/checker/codegen/LIR work, the
 migration, and the ordered crumb sequence.
 
 Ground truth this doc was written against (read before implementing):
@@ -13,10 +13,9 @@ Ground truth this doc was written against (read before implementing):
 - `src/checker/typer.tks:3035-3038` (`type_loop`), `:3365+` (`check_labels`).
 - `src/lir/lower.tks:1707-1866` — `lower_loop`, `lower_break`, `lower_continue`, `LoopTargets`, `close_loop_body` (the #382 SSA/block-arg loop mechanism).
 - `src/codegen/codegen.tks:5808-5856` (`emit_loop`), `:6046-6068` (break/continue emit).
-- `src/vm/vm.tks:3469-3488` (loop/break/continue exec), `:300-308` (defers), `:3500-3508` (`exec_adopt` — the base/pop scope pattern reused for `init`).
 - `src/parser/parse_expr.tks:393-397` — `parse_expr_no_struct` (the if/match scrutinee form; **reused** for the while-head so a trailing `{` opens the body, not a struct literal).
 - `src/parser/parse_pattern.tks:7-75` — pattern grammar (`_` = `WildcardPattern`, no `as`; `Foo as x`/`i64 as v` needs a **type name**).
-- `src/iter/int_iter.tks`, `src/iter/int_terminals.tks` — ITER0: an iterator is a **closure `() -> T?`** (`null` = exhausted); consumers match `i64 as v`/`null`.
+- `src/iter/int_iter.tks`, `src/iter/int_terminals.tks` — ITER0: an iterator is a **closure `(): T?`** (`null` = exhausted); consumers match `i64 as v`/`null`.
 
 ---
 
@@ -41,9 +40,8 @@ Two ways to make it correct:
 
 - **(a) step-field lowering** — thread `step` onto `LoopStmt`; make
   `lower_continue`, `close_loop_body`, and codegen route `continue`/fall-through
-  through a step block. This edits the **delicate #382 loop mechanism** in THREE
-  backends (VM `run_loop`, LIR `LoopTargets`/`lower_continue`, codegen
-  continue-emission).
+  through a step block. This edits the **delicate #382 loop mechanism** in both
+  backends (LIR `LoopTargets`/`lower_continue`, codegen continue-emission).
 - **(b) parser-desugar with a first-iteration guard (CHOSEN)** — fold the step
   to the **TOP** of the body behind a `_first` guard, so the existing
   continue-to-top routing runs the step for free:
@@ -65,7 +63,6 @@ For the **for-each** heads there is no `_first` at all: the "step" is the
 |---|---|---|
 | LIR `lower.tks` loop mechanism (`LoopTargets`, `lower_continue`, `close_loop_body`) | **changed** (step block, continue routing) | **unchanged** — `lower_loop` only lowers `init` before the existing loop |
 | C codegen loop mechanism (`emit_loop` continue/while) | **changed** (cont-label at step, bare `continue`→goto) | **unchanged** — `emit_loop` only wraps a non-empty `init` in a `{ }` scope |
-| VM `run_loop` | **changed** (step on continue+fall-through) | **unchanged** — `exec` only runs `init` once in a base/pop scope |
 
 Only the **new** behavior "run `init` once, loop-scoped, before iterating" is
 added, and it lives entirely OUTSIDE the loop mechanism. This is the strongly
@@ -85,7 +82,7 @@ range/3-part (none for while/for-each). Acceptable; the loop-perf lever is #449.
    expands (in the parser) to per-field `mut a = _elem.a; mut b = _elem.b`,
    reusing fully-supported field-access + simple bindings. This **sidesteps the
    incomplete B.13 general-destructure-binding path** (which today no-ops in the
-   typer, `typer.tks:2903`, and **panics in the VM**, `vm.tks:3392`). See §5.5
+   typer, `typer.tks:2903`, and **would panic at runtime** (see §5.5
    and the adjacent-findings note.
 
 ---
@@ -177,8 +174,7 @@ completes).
  *
  * @field label the UPPER_SNAKE prefix label, or "" when unlabeled
  * @field init  the loop-scoped preamble, run once before the first iteration; it
- *              does NOT leak past the loop (checker scope / VM base-pop / codegen
- *              brace)
+ *              does NOT leak past the loop (checker scope / codegen brace / native backend)
  * @field body  the iteration body (folded head + user statements)
  * @since M.5 (#517 recovers the head; init added by #517)
  */
@@ -192,7 +188,7 @@ pub type TLoopStmt = struct { label: str; init: []TStatement; body: []TStatement
 
 Widening the struct forces `init = teko::list::empty()` at every constructor and
 `init` recursion at every walker (§7, crumb 2). The loop MECHANISM readers
-(`emit_loop`, `lower_loop`, VM loop arm) additionally learn to run `init`.
+(`emit_loop`, `lower_loop`) additionally learn to run `init`.
 
 ---
 
@@ -206,7 +202,7 @@ already folded them), so most checker work comes for free:
   condition. (Diagnostic wording is if-flavored; the loop-specific message is a
   micro-decision, §8.)
 - **iterator/closure wiring** — free: `_it()` is an ordinary call; the checker's
-  call typing requires `_it : () -> T?` and yields `T?` for the `match`. A raw
+  call typing requires `_it : (): T?` and yields `T?` for the `match`. A raw
   collection fails here (not callable) — the deferred case.
 - **element type inference** — free: `mut x = _v` (simple) / `mut a = _elem.a`
   (destructure) infer from the subject's non-null / field type. No `: T` needed.
@@ -226,7 +222,7 @@ already folded them), so most checker work comes for free:
    * @param table the type table
    * @return the typed loop statement paired with the UNCHANGED outer env, or a type error
    */
-  fn type_loop(l: parser::LoopStmt, env: Env, table: TypeTable) -> TypedStmt | error {
+  fn type_loop(l: parser::LoopStmt, env: Env, table: TypeTable): TypedStmt | error {
       let ib = match type_block(l.init, env, table) { TypedBlock as bk => bk; error as e => return e }
       let bb = match type_block(l.body, ib.env, table) { TypedBlock as bk => bk; error as e => return e }
       TypedStmt { node = TLoopStmt { label = l.label; init = ib.stmts; body = bb.stmts }; env = env }
@@ -249,7 +245,7 @@ already folded them), so most checker work comes for free:
    * @param label the loop's declared label ("" = unlabeled, always ok)
    * @return true when the label is empty or a valid UPPER_SNAKE identifier
    */
-  fn label_format_ok(label: str) -> bool { label.len == 0 || lexer::is_upper_snake(label) }
+  fn label_format_ok(label: str): bool { label.len == 0 || lexer::is_upper_snake(label) }
   ```
 
 ---
@@ -307,7 +303,7 @@ body = [
 `<step>` is any statement (`i++`, `i += 2`, `p = p.next`, …). `<cond>` is
 re-evaluated each iteration (C-`for`), unlike the range bound (captured once).
 
-### 5.4 for-each closure-iterator — `loop mut x in <it>` (`<it> : () -> T?`)
+### 5.4 for-each closure-iterator — `loop mut x in <it>` (`<it> : (): T?`)
 
 Requires the **new `_ as x` wildcard-binding pattern** (§5.4.1). `mut` = a local
 **COPY** (owner 2026-07-12) — NO write-back logic; class elements share their
@@ -340,8 +336,6 @@ already-matched `null` stripped. On `match opt { null => …; _ as x => … }` w
 - **checker** match-arm typing: a wildcard-bind arm binds `x` to `subject-minus-
   matched-cases` (after a `null` arm on `T?` that is `T`; on a plain `T` it is
   `T`).
-- **VM** match exec: bind `x` to the value (optional payload if non-null) — reuse
-  the existing `T as x` payload extraction, minus the tag check.
 - **codegen** + **tkb codec**: extract the payload with the checker-annotated
   type; serialize the empty-type-name bind.
 
@@ -377,7 +371,6 @@ allowed and harmless.
 | `examples/regressions/adopt_break_unknown_label/src/lib.tks` | `loop outer {` → `OUTER: loop {`; `break outer` → `break OUTER`; `break nosuchlabel` → `break NOSUCHLABEL` (still unknown → still compile-fails, now via the enclosing-check not the format-check) |
 | `src/emit/tkb_test.tkt:240-260` | label string `"outer"` → `"OUTER"` (×3 sites); add `init = teko::list::empty()` to the `TLoopStmt {…}` at :247 |
 | `src/lir/lower_test.tkt:95-96, 1362-1372` | `lwt_loop` ctor gains `init = teko::list::empty()`; labels `"outer"` → `"OUTER"` |
-| `src/vm/vm_test.tkt` | any `TLoopStmt {…}` ctor gains `init = teko::list::empty()`; labels → UPPER_SNAKE (audit; the listed defer-loop fixtures build unlabeled loops) |
 | `src/checker/{checker,spine}_test.tkt`, `src/codegen/codegen_test.tkt` | every `TLoopStmt {…}` / `LoopStmt {…}` ctor gains `init = teko::list::empty()` |
 | `src/parser/parser_test.tkt:862-877, 1289` | update loop error tests (`loop x` now = while-head with no `{` → new message); add head-form + prefix-label acceptance/rejection cases |
 
@@ -420,7 +413,7 @@ proving fixture. New/changed code owes **100% coverage** (measured natively,
 `teko . -o bin --coverage`).
 
 **Crumb 1 — lexer: `is_upper_snake`.**
-Add `pub fn is_upper_snake(text: str) -> bool` (`[A-Z][A-Z0-9_]*`; empty → false).
+Add `pub fn is_upper_snake(text: str): bool` (`[A-Z][A-Z0-9_]*`; empty → false).
 Ritual: unit (`lexer_test`). Fixture: truth table — `OUTER`✓, `A`✓, `A0_B9`✓,
 `outer`✗, `_X`✗, `0A`✗, `A-B`✗, ``✗.
 
@@ -429,7 +422,7 @@ Add `init: []Statement` / `[]TStatement` to `LoopStmt`/`TLoopStmt`; set
 `init = teko::list::empty()` at ALL ctors (typer, monomorph, codegen-lift,
 tkb_read, every test ctor); tkb frame/write/read carry `init`; every walker
 recurses `l.init` (escape ×3, initanalysis ×2, spine ×5, monomorph, reachability,
-codegen collect/lift). VM/codegen/LIR loop readers IGNORE the (always-empty)
+codegen collect/lift). Codegen and LIR loop readers IGNORE the (always-empty)
 `init` here → **byte-identical**. Ritual: FULL gate + self-host fixpoint +
 byte-identity of existing loops. Fixture: `tkb` roundtrip asserts `init` survives
 (empty); the whole existing suite is the regression. **Ritual point.**
@@ -440,41 +433,40 @@ Parser: recognize `Ident : loop`; dispatch `{`→infinite, else→while-fold
 in a later step`. Remove suffix-label parsing. Checker: `check_labels` enforces
 UPPER_SNAKE. **Migration** (§6.1): rename all label fixtures; migrate the adopt
 example; update `parser_test`. Ritual: FULL gate + fixpoint re-baseline (goto
-labels). Fixtures (VM + native): `OUTER: loop { break OUTER }` runs; `loop i < n {}`
+labels). Fixtures (rota C e backend nativo): `OUTER: loop { break OUTER }` runs; `loop i < n {}`
 counts to exit code n; `loop ready {}` treats `ready` as bool; **compile-fail**:
 `outer: loop {}` (lowercase label), adopt example on `NOSUCHLABEL`. **Ritual point.**
 
 **Crumb 4 — range (`loop mut i in a..b` / `a..=b`) — brings `init` online.**
 Parser: loop-head binding + `in` + range; desugar §5.2. First non-empty `init`:
-add VM run-init (base/pop, modeled on `exec_adopt`), codegen `{ }` wrapper for
-non-empty `init`, LIR `lower_loop` lowering `init` before the loop. Ritual: FULL
-gate. Fixtures (VM + native, exit codes): `loop mut i in 0..3 { s += i }` → 3;
+codegen `{ }` wrapper for non-empty `init`, LIR `lower_loop` lowering `init` before the loop. Ritual: FULL
+gate. Fixtures (rota C e backend nativo, exit codes): `loop mut i in 0..3 { s += i }` → 3;
 `0..=3` → 6; a `continue`-skips-evens loop proves `continue` runs the step;
 **compile-fail**: reading `i` after the loop (non-leak); endpoint captured once
 (mutating `n` in the body does not extend the range). **Ritual point.**
 
 **Crumb 5 — 3-part (`loop mut i = a; cond; step {}`).**
 Parser: binding + `;` cond `;` step; desugar §5.3. Reuses crumb-4 machinery.
-Ritual: FULL gate. Fixtures (VM + native): `loop mut i = 0; i < 4; i++ { s += i }`
+Ritual: FULL gate. Fixtures (rota C e backend nativo): `loop mut i = 0; i < 4; i++ { s += i }`
 → 6; a `continue` loop proves the step still runs; **compile-fail**: non-bool
 cond, reading `i` after the loop.
 
 **Crumb 6 — `_ as x` wildcard-binding pattern.**
-Parser (`_ as name`), checker (subject-minus-null bind), VM (bind payload),
-codegen (payload extract), tkb codec. Ritual: FULL gate. Fixture (VM + native):
+Parser (`_ as name`), checker (subject-minus-null bind),
+codegen (payload extract), tkb codec. Ritual: FULL gate. Fixture (rota C e backend nativo):
 `match some_opt { null => 0; _ as x => x }` binds the payload; `match plainval {
 _ as x => x }` binds the whole value. **Ritual point.**
 
 **Crumb 7 — for-each closure-iterator (simple `mut x`).**
 Parser: non-range `in` → closure desugar §5.4. Ritual: FULL gate. Fixtures
-(VM + native): `loop mut x in range(rc) { s += x }` over `0..3` → 3;
+(rota C e backend nativo): `loop mut x in range(rc) { s += x }` over `0..3` → 3;
 `continue` re-advances; a raw-collection iterable is a clean **type error** at
 `_it()` (deferred case). Confirm the `mut` copy has no write-back (rebinding `x`
 does not change the source).
 
 **Crumb 8 — for-each destructure (`mut { a; b }`).**
 Parser: destructure target → per-field `mut` bindings §5.5. Ritual: FULL gate.
-Fixtures (VM + native): `loop mut { index; value } in enumerate(range(rc)) { … }`
+Fixtures (rota C e backend nativo): `loop mut { index; value } in enumerate(range(rc)) { … }`
 binds both fields with inferred types; **compile-fail**: destructuring an unknown
 field. Verify class-element field-write reaches the shared object; struct-element
 field-write does not.
@@ -509,7 +501,7 @@ desugars proven by their fixtures).
    loop-conditions for a loop-specific message as a polish follow-on.
 7. **Raw-collection for-each diagnostic** — currently "not callable" at `_it()`.
    **Default: accept**; a targeted "raw collections are not yet iterable — pass a
-   closure iterator `() -> T?`" message is a polish follow-on.
+   closure iterator `(): T?`" message is a polish follow-on.
 8. **UPPER_SNAKE enforcement site** — **Default: checker `check_labels`** (single
    source of truth) with the lexer predicate; a parser-side early diagnostic is
    the alternative (better position, but splits label rules).
@@ -531,8 +523,7 @@ desugars proven by their fixtures).
 
 - **B.13 general destructure-binding is incomplete.** Standalone
   `mut { x; y } = <expr>` no-ops in the typer (`typer.tks:2903` returns env
-  unchanged — names never bound) and **PANICS in the VM** (`vm.tks:3392`
-  "destructuring binding not yet supported"); codegen yields an empty name
+  unchanged — names never bound) and **would panic at runtime**; codegen yields an empty name
   (`codegen.tks:773`). #517's for-each destructure routes AROUND this via
   per-field field-access expansion (§5.5), so #517 does not depend on it.
   Completing B.13 as a first-class binding (nested patterns, variant destructure,

@@ -1,0 +1,179 @@
+name: package the taught teko compiler
+description: >
+  Turn the `ngen/build/teko` a leg has just built AND PROVEN into the two files
+  a GitHub Release carries for that pair -- `teko-<version>-<target>.tar.gz` and
+  its `.sha256` -- in exactly the shape `minicompiler/mc` ships its own
+  (scripts/release-assets.sh there): one directory inside the archive, the
+  binary named what the target expects, and reproducible bytes.
+
+  The action packages, it never builds. The binary handed to it is the one the
+  fixtures have just run against, so what a release publishes is what the gate
+  proved -- not a sibling built again at tag time.
+
+inputs:
+  version:
+    description: 'the release version, without its leading `v` (`0.3.1`)'
+    required: true
+  target:
+    description: 'the pair as a release asset spells it (`linux-x86_64`, `macos-arm64`)'
+    required: true
+  binary:
+    description: 'the compiler to package, relative to the repository root'
+    required: false
+    default: ''
+  exe:
+    description: 'suffix an executable carries on this operating system (`.exe` on Windows)'
+    required: false
+    default: ''
+  outdir:
+    description: 'where the tarball and its checksum are written'
+    required: false
+    default: dist
+
+outputs:
+  tarball:
+    description: 'the packaged archive, as a path relative to the repository root'
+    value: ${{ steps.pack.outputs.tarball }}
+  sha256:
+    description: 'the archive checksum, as 64 hex characters'
+    value: ${{ steps.pack.outputs.sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - name: package
+      id: pack
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        TARGET: ${{ inputs.target }}
+        BINARY: ${{ inputs.binary }}
+        EXE: ${{ inputs.exe }}
+        OUTDIR: ${{ inputs.outdir }}
+      run: |
+        set -eu
+        version="${VERSION#v}"
+        if [ -z "$version" ]; then
+          echo "::error::no version was given -- an asset cannot be named" >&2
+          exit 1
+        fi
+        binary="${BINARY:-ngen/build/teko$EXE}"
+        if [ ! -f "$binary" ]; then
+          echo "::error::$binary was not produced -- there is nothing to package" >&2
+          exit 1
+        fi
+
+        name="teko-$version-$TARGET"
+        stage="$OUTDIR/.stage/$name"
+        rm -rf "$OUTDIR/.stage"
+        mkdir -p "$stage/lib"
+
+        # The name inside the archive is the name the program has to have on the
+        # target: a file that is not called *.exe cannot be launched on Windows.
+        binname="teko"
+        case "$TARGET" in windows-*) binname="teko.exe" ;; esac
+        cp "$binary" "$stage/$binname"
+        chmod 755 "$stage/$binname"
+
+        # A teko PROGRAM includes the runtime by path (`#include "../lib/rt.tk"` --
+        # every fixture under ngen/tests does), so the archive that carries the
+        # compiler carries the runtime that compiler expects to find.
+        cp ngen/lib/rt.tk "$stage/lib/rt.tk"
+        if [ -f ngen/README.md ]; then cp ngen/README.md "$stage/README.md"; fi
+        if [ -f LICENSE ]; then cp LICENSE "$stage/LICENSE"; fi
+
+        # Generated, never dated: a date would make two builds of one tag differ.
+        {
+          echo "teko $version -- $TARGET"
+          echo
+          echo "The teko compiler, taught to mc (github.com/minicompiler/mc) by the"
+          echo "modules of the 'teko' package. One file matters: the compiler itself."
+          echo
+          echo "Install"
+          echo "-------"
+          case "$TARGET" in
+            windows-*) printf '%s\n' '  copy teko.exe C:\tools\teko.exe        # or anywhere on your PATH' ;;
+            *)         echo "  install -m 755 teko /usr/local/bin/teko   # or anywhere on your PATH" ;;
+          esac
+          echo
+          case "$TARGET" in
+          macos-*)
+            echo "macOS quarantine"
+            echo "----------------"
+            echo "A downloaded binary carries com.apple.quarantine and Gatekeeper refuses"
+            echo "to run it. Clear the flag once:"
+            echo
+            echo "  xattr -d com.apple.quarantine teko"
+            echo
+            ;;
+          windows-*)
+            echo "Windows"
+            echo "-------"
+            echo "There is no direct-executable backend on Windows: a program is an"
+            echo "object plus a linker, so mc.toml needs a [linker] naming lld-link and"
+            echo "a [sysroot] holding winstart.obj, mcrt.obj and kernel32.lib."
+            echo
+            ;;
+          esac
+          echo "Verify the download"
+          echo "-------------------"
+          echo "  shasum -a 256 -c $name.tar.gz.sha256     # macOS"
+          echo "  sha256sum -c $name.tar.gz.sha256         # Linux"
+          echo
+          echo "Use it"
+          echo "------"
+          echo "  teko build DIR --config DIR/mc.toml        # a project, from its mc.toml"
+          echo "  teko build DIR --config FILE --entry-only  # reuse the taught compiler"
+          echo "  teko --host                                # what this binary is"
+          echo
+          echo "lib/rt.tk is the runtime a teko program includes:"
+          echo
+          printf '%s\n' '  #include "lib/rt.tk"'
+          echo
+          echo "Documentation: ngen/README.md and docs/design/port-teko-mc.md in the"
+          echo "repository this was built from."
+        } > "$stage/INSTALL.txt"
+
+        # Two runs from one tree must produce the same bytes: a fixed mtime on
+        # every staged file (what makes bsdtar, which has no --mtime, reproducible),
+        # an explicit sorted member list instead of a directory walk, `ustar` so GNU
+        # tar and bsdtar agree byte for byte, and `gzip -n` so the header carries
+        # neither a name nor a timestamp.
+        TZ=UTC find "$OUTDIR/.stage" -exec touch -t 197001010000 {} +
+        members=$(cd "$OUTDIR/.stage" && find "$name" -type f | LC_ALL=C sort)
+
+        gnu=0
+        tarbin=tar
+        if command -v gtar >/dev/null 2>&1; then
+          tarbin=gtar; gnu=1
+        elif tar --version 2>/dev/null | head -1 | grep -q GNU; then
+          gnu=1
+        fi
+
+        # shellcheck disable=SC2086  # $members is the member list, deliberately split
+        pack() {
+          if [ "$gnu" = 1 ]; then
+            $tarbin --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+                    --format=ustar -cf - $members
+          else
+            tar --uid 0 --gid 0 --uname '' --gname '' --numeric-owner \
+                --format ustar -cf - $members
+          fi
+        }
+
+        tarball="$OUTDIR/$name.tar.gz"
+        rm -f "$tarball" "$tarball.sha256"
+        (cd "$OUTDIR/.stage" && pack) | gzip -n -9 > "$tarball"
+        rm -rf "$OUTDIR/.stage"
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          (cd "$OUTDIR" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+        else
+          (cd "$OUTDIR" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+        fi
+        sum=$(cut -d' ' -f1 <"$tarball.sha256")
+
+        ls -l "$tarball" "$tarball.sha256"
+        cat "$tarball.sha256"
+        echo "tarball=$tarball" >>"$GITHUB_OUTPUT"
+        echo "sha256=$sum"      >>"$GITHUB_OUTPUT"

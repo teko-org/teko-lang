@@ -1,0 +1,443 @@
+// teko_prop.tk -- properties, spelled as C# spells them (D223, dono
+// 2026-09-04): a member that reads like a field at every use site and is a pair
+// of methods everywhere else.
+//
+//   class Square {                     i64 square_get_Side(uptr this)
+//       public i64 Side { get; set; }  void square_set_Side(uptr this, i64 value)
+//                                      #define SQUARE_SIDE__BACKING 8
+//       public i64 Area {
+//           get => Side * Side;        i64 square_get_Area(uptr this)
+//       }
+//   }
+//
+//   p.Side = 3;                        square_set_Side(p, 3)
+//   p.Side                             square_get_Side(p)
+//   Side          (inside the type)    the same two, with `this` as the receiver
+//
+// The accessors are ordinary rows of teko_class.tk's method table, which is
+// what buys the rest with no machinery of its own: a vtable slot PER ACCESSOR
+// (so `virtual`/`override` on the `get` leaves the inherited `set` alone),
+// `static`, the overload symbols, visibility per accessor (`{ get; private
+// set; }`), and the conformance check an interface property is answered by.
+//
+// An AUTO-property -- an accessor written `;` and nothing else -- gets a
+// backing field of its own, `private`, named after the property; the two
+// accessors are then the load and the store of that field. Either both
+// accessors are auto or neither is, as in C#.
+//
+// An ABSTRACT property writes its accessors the same way and gets NO backing
+// field: each accessor is a vtable slot with nothing in it, which the first
+// concrete class down the chain answers with an `override` of its own.
+//
+// `value` is the `set`'s parameter and nothing more: an ordinary name, so a
+// local called `value` shadows it exactly as C# says it does, and the word stays
+// the program's everywhere else. `get` and `set` are read INSIDE the property's
+// braces only -- neither is reserved, so `T get()` remains an ordinary method
+// (surface_generics.tk declares one).
+//
+// An interface declares the same shape with the bodies left out (teko_iface.tk):
+// its accessors are signatures, and the class that conforms answers them with
+// the two methods its own property produced.
+
+#define TK_MAXPROP 64                 // properties, summed across all types
+
+uptr pr_name[TK_MAXPROP];
+i64  pr_cls[TK_MAXPROP];              // the type that declares it
+i64  pr_ty[TK_MAXPROP];
+i64  pr_trait[TK_MAXPROP];            // the trait it was copied from, or -1
+i64  tk_nprop = 0;
+
+// the property being read, saved and restored around the body: instantiating a
+// generic re-parses a whole class inside an accessor's own expression
+i64 pp_get = 0;                       // it declares a `get`
+i64 pp_set = 0;                       // ...and a `set`
+i64 pp_auto = 0 - 1;                  // 1 auto-implemented, 0 with bodies, -1 nothing said
+i64 pp_backing = 0 - 1;               // the field an auto-property loads and stores
+
+// ---- table accessors (no raw ld64/st64 outside this section) ----
+uptr pr_name_at(i64 i)  { return ld64(pr_name + i * 8); }
+i64  pr_cls_at(i64 i)   { return ld64(pr_cls + i * 8); }
+i64  pr_ty_at(i64 i)    { return ld64(pr_ty + i * 8); }
+i64  pr_trait_at(i64 i) { return ld64(pr_trait + i * 8); }
+
+void set_pr_name_at(i64 i, uptr v)  { st64(pr_name + i * 8, v); }
+void set_pr_cls_at(i64 i, i64 v)    { st64(pr_cls + i * 8, v); }
+void set_pr_ty_at(i64 i, i64 v)     { st64(pr_ty + i * 8, v); }
+void set_pr_trait_at(i64 i, i64 v)  { st64(pr_trait + i * 8, v); }
+
+// ---- the names the source never writes ----
+// C#'s own spelling of the two methods a property is, so a type that declares
+// both a property `X` and a method `get_X` collides exactly where C# collides
+uptr tk_get_name(uptr m) { return tk_join("get_", m); }
+uptr tk_set_name(uptr m) { return tk_join("set_", m); }
+
+// the one name C# gives the value handed to a `set`
+uptr tk_value_name() { return "value"; }
+
+// the field an auto-property lives in: a member of the object like any other,
+// so a second field spelled this way is a duplicate rather than a surprise
+uptr tk_backing_name(uptr m) { return tk_join(m, "__backing"); }
+
+// ---- lookups, linear and in declaration order ----
+i64 tk_prop_own(i64 ci, uptr m) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprop) break;
+        if (pr_cls_at(i) == ci) {
+            if (str_eq(pr_name_at(i), m)) return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// the property `m` of `ci` or of one of its bases, or -1
+i64 tk_prop_find(i64 ci, uptr m) {
+    loop {
+        if (ci < 0) break;
+        i64 pi = tk_prop_own(ci, m);
+        if (pi >= 0) return pi;
+        ci = sr_base_at(ci);
+    }
+    return 0 - 1;
+}
+
+// 1 when `m` is a property somewhere in the interface CLOSURE of `si` -- its
+// own, or one it reaches only by extending another interface -- and `pdecl`
+// then holds the interface that actually DECLARES it (mirrors
+// `tk_ifmeth_find_deep`, teko_iface.tk): a receiver typed `I2` (`interface
+// I2 : I1`) reaches an `I1` property without redeclaring it, and dispatch
+// has to go through `I1`'s own itab entry, the same way a method already
+// does since §50 I1. `tk_prop_find`'s own `sr_base_at` walk answers a
+// CLASS's property; an interface never sets that field, so this is a
+// separate function rather than one more branch in it.
+i64 tk_ifprop_find_deep(i64 si, uptr m, uptr pdecl) {
+    if (tk_prop_own(si, m) >= 0) {
+        st64(pdecl, si);
+        return 1;
+    }
+    i64 n = tk_iface_nbase(si);
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        if (tk_ifprop_find_deep(tk_iface_base_at(si, i), m, pdecl)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// the property called `m` when the receiver's type is not known statically,
+// under the rule tk_field_by_name uses: -1 nobody declares it, -2 more than one
+// type does and only the receiver's type could decide
+i64 tk_prop_by_name(uptr m) {
+    i64 found = 0 - 1;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nprop) break;
+        if (str_eq(pr_name_at(i), m)) {
+            if (found >= 0) return 0 - 2;
+            found = i;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+void tk_prop_add(i64 ci, uptr m, i64 ty, i64 ti) {
+    if (tk_nprop == TK_MAXPROP) err_at(tk_file, tk_line, "teko: too many properties");
+    set_pr_name_at(tk_nprop, m);
+    set_pr_cls_at(tk_nprop, ci);
+    set_pr_ty_at(tk_nprop, ty);
+    set_pr_trait_at(tk_nprop, ti);
+    tk_nprop = tk_nprop + 1;
+}
+
+// ---- the declaration ----
+// the parameter list of one accessor: the receiver an instance property takes,
+// and the `value` a `set` is handed -- an ordinary parameter, which is what
+// makes a local of that name shadow it and the pass resolve it for free
+i64 tk_prop_params(i64 fty, i64 wantset, i64 stat) {
+    i64 head = 0;
+    if (!stat) head = param_new(TY_UPTR, tk_this_name());
+    if (wantset) head = list_append(head, param_new(fty, tk_value_name()));
+    return head;
+}
+
+// the modifier one accessor may carry, which may only NARROW the property's own
+// (`public i64 X { get; private set; }`)
+i64 tk_accessor_vis(i64 vis) {
+    i64 v = 0 - 1;
+    loop {
+        i64 w = 0 - 1;
+        if (tk_word("public"))         w = TK_VPUBLIC;
+        else if (tk_word("private"))   w = TK_VPRIVATE;
+        else if (tk_word("protected")) w = TK_VPROTECTED;
+        if (w < 0) break;
+        if (v >= 0) err_at(p_file(), p_line(), "teko: the accessor already has a visibility");
+        v = w;
+        p_next();
+    }
+    if (v < 0) return vis;
+    if (v > vis) err_at(p_file(), p_line(), "teko: an accessor is not more visible than its property");
+    return v;
+}
+
+// `get` or `set`, read as the contextual words they are: 1 for a `set`, 0 for a
+// `get`, and a name that is neither says so where it stands
+i64 tk_accessor_word(uptr m) {
+    if (tk_kw("get")) {
+        if (pp_get) err_at2(p_file(), p_line(), "teko: the property already declares `get`", m);
+        pp_get = 1;
+        p_next();
+        return 0;
+    }
+    if (tk_kw("set")) {
+        if (pp_set) err_at2(p_file(), p_line(), "teko: the property already declares `set`", m);
+        pp_set = 1;
+        p_next();
+        return 1;
+    }
+    err_at2(p_file(), p_line(), "teko: a property declares `get`, `set` or both", m);
+    return 0;
+}
+
+// a property is auto-implemented in BOTH of its accessors or in neither
+void tk_prop_form(i64 want_auto) {
+    if (pp_auto < 0) {
+        pp_auto = want_auto;
+        return;
+    }
+    if (pp_auto == want_auto) return;
+    err_at(p_file(), p_line(), "teko: an auto-property has no accessor with a body");
+}
+
+// the backing field of an auto-property: `private`, of the property's own type,
+// and part of the object exactly as a written-out field is -- or a global of its
+// own when the property is static
+i64 tk_prop_backing(i64 ci, uptr name, uptr m, i64 fty, i64 off, i64 stat) {
+    uptr bn = tk_backing_name(m);
+    if (stat) {
+        tk_static_field(ci, name, bn, fty, 0, TK_VPRIVATE);
+        pp_backing = tk_field_find(ci, bn);
+        return off;
+    }
+    off = tk_field_place(ci, name, bn, fty, 0, off, TK_VPRIVATE);
+    pp_backing = tk_field_find(ci, bn);
+    return off;
+}
+
+// where the backing field lives, as an address a load or a store takes
+i64 tk_prop_addr(i64 fi) {
+    if (fd_sym_at(fi)) return tk_id(fd_sym_at(fi));
+    return tk_bin(K_ADD, tk_this_recv(), tk_int(fd_off_at(fi)));
+}
+
+// the body an auto-property's accessor gets: the load of the backing field, or
+// the store of `value` into it
+void tk_prop_auto_body(uptr fn, i64 rty, i64 prs, i64 fty, i64 wantset) {
+    i64 addr = tk_prop_addr(pp_backing);
+    i64 body = tk_ret(tk_call(tk_ldn(fty), addr));
+    if (wantset) body = tk_stmt(tk_os_mark(tk_call2(tk_stn(fty), addr, tk_id(tk_value_name())), fty));
+    top_add(tk_func(rty, fn, prs, tk_blk(body)));
+}
+
+// `=> expression;` for a `get` and `=> statement;` for a `set`, read with the
+// receiver in scope exactly as a block body is read (teko_class.tk's
+// tk_member_body). The `set` form is a STATEMENT because `side = value` is one:
+// `=` is not in the core's infix table, deliberately (teko_expr.tk).
+void tk_prop_arrow_body(i64 ci, i64 rty, uptr fn, i64 prs, i64 stat, i64 wantset) {
+    i64 mark = tk_nlocal;
+    if (!stat) tk_local_add(tk_this_name(), ci);
+    i64 keepstat = 0;
+    i64 keep = tk_this_enter_body(ci, stat, &keepstat);
+    i64 line = p_line();
+    uptr fl = p_file();
+    i64 body = 0;
+    if (wantset) {
+        body = parse_stmt();
+    } else {
+        i64 e = parse_expr(0);
+        p_expect(K_SEMI, "expected ; after the accessor expression");
+        tk_line = line;
+        tk_file = fl;
+        body = tk_ret(e);
+    }
+    tk_this_leave_body(keep, keepstat);
+    tk_nlocal = mark;
+    tk_line = line;
+    tk_file = fl;
+    i64 f = tk_func(rty, fn, prs, tk_blk(body));
+    set_nd_line(f, line);
+    set_nd_file(f, fl);
+    top_add(f);
+}
+
+// the tokens of an accessor the class's own member wins over: the copy is not
+// parsed at all, so nothing it names is resolved against the wrong type
+void tk_prop_skip_accessor() {
+    if (p_accept(K_SEMI)) return;
+    if (p_id() == K_LBRACE) {
+        tk_skip_body();
+        return;
+    }
+    p_expect(K_ARROW, "expected => in the accessor");
+    loop {
+        if (p_accept(K_SEMI)) break;
+        if (p_id() == T_EOF) err_at(tk_file, tk_line, "teko: unterminated accessor");
+        p_next();
+    }
+}
+
+// the three shapes one accessor's body takes
+i64 tk_prop_body(i64 ci, uptr name, uptr m, i64 fty, i64 off, uptr fn, i64 rty, i64 prs, i64 stat, i64 wantset) {
+    if (p_accept(K_SEMI)) {
+        tk_prop_form(1);
+        if (pp_backing < 0) off = tk_prop_backing(ci, name, m, fty, off, stat);
+        tk_prop_auto_body(fn, rty, prs, fty, wantset);
+        return off;
+    }
+    tk_prop_form(0);
+    if (p_id() == K_LBRACE) {
+        tk_member_body(ci, rty, fn, prs, stat);
+        return off;
+    }
+    if (!p_accept(K_ARROW)) err_at2(p_file(), p_line(), "teko: an accessor is `;`, `=> ...;` or a block", m);
+    tk_prop_arrow_body(ci, rty, fn, prs, stat, wantset);
+    return off;
+}
+
+// one accessor, declared as the method it is: the same gate, the same symbol
+// rule and the same vtable slot a written-out method of that signature gets
+i64 tk_prop_accessor(i64 ci, uptr name, uptr m, i64 fty, i64 off, i64 ti, i64 vis, i64 stat, i64 kind) {
+    i64 avis = tk_accessor_vis(vis);
+    i64 wantset = tk_accessor_word(m);
+    uptr acc = tk_get_name(m);
+    if (wantset) acc = tk_set_name(m);
+    i64 prs = tk_prop_params(fty, wantset, stat);
+    uptr sig = tk_sig_of(prs, !stat);
+    i64 kind2 = tk_member_gate(ci, acc, sig, ti, kind);
+    if (kind2 < 0) {
+        tk_prop_skip_accessor();
+        return off;
+    }
+    uptr fn = tk_method_symbol(ci, name, acc, sig);
+    i64 rty = fty;
+    if (wantset) rty = TY_VOID;
+    i64 mi = tk_method_add(acc, ci, sig, fn, wantset, wantset, tk_ndflt, rty,
+                           tk_slot_take(ci, kind2, acc, sig, fn));
+    set_mt_vis_at(mi, avis);
+    set_mt_static_at(mi, stat);
+    set_mt_prop_at(mi, 1);
+    if (kind2 == 3) {
+        set_mt_abst_at(mi, 1);
+        tk_abstract_end(m);                      // `get;` and no backing field at all
+        return off;
+    }
+    return tk_prop_body(ci, name, m, fty, off, fn, rty, prs, stat, wantset);
+}
+
+// a property the class declares itself, or one copied from a trait that the
+// class does not declare -- the whole member is skipped in the other case, so
+// the copy's backing field is not laid out beside the one that won
+i64 tk_prop_read(i64 ci, uptr name, uptr m, i64 fty, i64 off, i64 ti, i64 vis, i64 stat, i64 kind) {
+    i64 own = tk_prop_own(ci, m);
+    if (own >= 0) {
+        if (ti < 0) err_at2(tk_file, tk_line, "teko: duplicate property", m);
+        if (pr_trait_at(own) >= 0) err_at2(tk_file, tk_line, "teko: two traits bring the same property", m);
+        i64 n = 0;
+        p_skip_balanced(K_LBRACE, K_RBRACE, &n);
+        p_accept(K_SEMI);
+        return off;
+    }
+    p_expect(K_LBRACE, "expected { in the property body");
+    loop {
+        if (p_id() == K_RBRACE) break;
+        if (p_id() == T_EOF) err_at2(tk_file, tk_line, "teko: unterminated property", m);
+        off = tk_prop_accessor(ci, name, m, fty, off, ti, vis, stat, kind);
+    }
+    p_next();                                    // }
+    p_accept(K_SEMI);                            // a C programmer's trailing ;
+    if (!pp_get && !pp_set) err_at2(tk_file, tk_line, "teko: a property declares `get`, `set` or both", m);
+    tk_prop_add(ci, m, fty, ti);
+    return off;
+}
+
+// `T Name { ... }` as a member of a class, a struct or a trait, with the
+// modifiers and the type already read (teko_class.tk's tk_member)
+i64 tk_prop_member(i64 ci, uptr name, uptr m, i64 fty, i64 off, i64 ti, i64 vis, i64 stat, i64 kind) {
+    if (fty == TY_VOID) err_at2(tk_file, tk_line, "teko: property of type void", m);
+    if (tk_field_find(ci, m) >= 0)
+        err_at2(tk_file, tk_line, "teko: a property and a field cannot share a name", m);
+    i64 k0 = pp_get;
+    i64 k1 = pp_set;
+    i64 k2 = pp_auto;
+    i64 k3 = pp_backing;
+    pp_get = 0;
+    pp_set = 0;
+    pp_auto = 0 - 1;
+    pp_backing = 0 - 1;
+    off = tk_prop_read(ci, name, m, fty, off, ti, vis, stat, kind);
+    pp_get = k0;
+    pp_set = k1;
+    pp_auto = k2;
+    pp_backing = k3;
+    return off;
+}
+
+// ---- reaching one, wherever the site is ----
+// the accessor a use site resolves to, picked the way a method call picks --
+// level by level up the chain, so an `override` that redeclares only the `get`
+// still inherits the `set` it did not mention
+i64 tk_prop_pick(i64 si, uptr m, i64 wantset) {
+    if (wantset) return tk_method_pick(si, tk_set_name(m), 1);
+    return tk_method_pick(si, tk_get_name(m), 0);
+}
+
+// ...and the same question with every refusal answered: the accessor the
+// property does not declare, and the two gates a member passes
+i64 tk_prop_accessor_of(i64 si, uptr m, i64 wantset, i64 line, uptr fl) {
+    i64 mi = tk_prop_pick(si, m, wantset);
+    if (mi < 0) {
+        if (wantset) err_at2(fl, line, "teko: the property has no `set`", m);
+        err_at2(fl, line, "teko: the property has no `get`", m);
+    }
+    tk_check_member(mt_cls_at(mi), mt_vis_at(mi), m, line, fl);
+    return mi;
+}
+
+// `p.X` / `p.X = e` on a receiver whose type is known. `=` is read here for the
+// same reason tk_field_use reads it: it is not in the core's infix table, so
+// the Pratt loop has already stopped.
+i64 tk_prop_use(i64 left, i64 si, uptr m, i64 line, uptr fl) {
+    if (p_id() == K_LPAR) err_at2(fl, line, "teko: the member is a property; it is not called", m);
+    if (p_accept(K_ASSIGN)) {
+        i64 v = parse_expr(0);
+        i64 ms = tk_prop_accessor_of(si, m, 1, line, fl);
+        if (mt_static_at(ms)) tk_reject_static_member(si, m, line, fl);
+        return tk_emit_call(left, ms, v, 1, line, fl);
+    }
+    i64 mg = tk_prop_accessor_of(si, m, 0, line, fl);
+    if (mt_static_at(mg)) tk_reject_static_member(si, m, line, fl);
+    return tk_emit_call(left, mg, 0, 0, line, fl);
+}
+
+// `Name.X` / `Name.X = e` -- a static property answers to its type and to
+// nothing else, so the call carries no receiver at all (teko_access.tk)
+i64 tk_prop_static_use(i64 si, uptr m, i64 line, uptr fl) {
+    i64 wantset = 0;
+    i64 v = 0;
+    if (p_accept(K_ASSIGN)) {
+        wantset = 1;
+        v = parse_expr(0);
+    }
+    i64 mi = tk_prop_accessor_of(si, m, wantset, line, fl);
+    if (!mt_static_at(mi))
+        err_at(fl, line, tk_join3("teko: ", tk_join3(sr_name_at(si), ".", m),
+                                  " is an instance member; reach it through an object"));
+    tk_line = line;
+    tk_file = fl;
+    i64 r = tk_call(mt_fn_at(mi), v);
+    i64 rs = tk_struct_by_ty(mt_ret_at(mi));
+    if (rs >= 0) tk_xt_add(r, rs, 0);
+    return r;
+}

@@ -1,56 +1,523 @@
-/**
- * FileReader — expose a file's whole contents as a one-shot `Reader` VALUE: the first `read` slurps
- * `path` and yields the entire file as one Buf (or the read error), and every later `read` yields
- * EOF (an empty Buf). A CLASS, so the "already delivered" flag advances across dispatched reads (the
- * class arena-mutation rule); it up-casts into `Reader` and drives any combinator (`copy`, `read_all`).
- *
- * True streaming `read` needs the arena-backed mutable Buf half (the N-KEYSTONE, documented in
- * `stream.tks`); until then a file stream is the whole buffer lifted into the contract. `read` calls
- * the `read_file` extern, so it runs NATIVE-only (the VM refuses foreign calls by design, C7.1a).
- */
-pub type FileReader = class & Reader {
-    /** The path read on the first pull. */
-    pub path: str
-    /** Whether the file's contents have already been handed out. */
-    pub delivered: bool
+/** CHUNK — the streaming chunk ceiling: 1024 bytes, a small reusable buffer with no growing
+ * accumulator. Every stream read/write moves at most this many bytes per OS call. */
+exp const CHUNK: u64 = 1024
 
-    /**
-     * of — a file reader over `path`, positioned before its (single) whole-buffer read.
-     *
-     * @param path  the file to read on the first pull
-     * @return      the constructed reader
-     */
-    pub fn of(path: str) -> FileReader { FileReader { path = path; delivered = false } }
+/** Stream — a byte sink: buffered write, flush and close. */
+exp type Stream = abstract class {
+    /** write — append `s` to the stream, buffering internally. */
+    pub abstract fn write(s: str)
 
-    /**
-     * read — on the first call, slurp the whole file (the read error rides the `Buf | error`
-     * channel); on every later call, yield EOF.
-     *
-     * @param max  the requested chunk size (ignored — the whole file is one chunk)
-     * @return     the file bytes on the first call, then the empty chunk, or the read error
-     * @throws     the `read_file` error on a genuine read failure
-     */
-    pub fn read(self, max: u64) -> Buf | error {
-        if self.delivered { return Buf::empty() }
-        self.delivered = true
-        match read_file(self.path) {
-            str as s => Buf::from_str(s)
-            error as e => e
+    /** flush — drain any bytes still held in the internal buffer to the underlying resource. */
+    pub abstract fn flush()
+
+    /** close — flush and release the stream's resource. */
+    pub abstract fn close()
+}
+
+/** FileStream — an open OS file handle: a POSIX fd (Linux/macOS) or a Windows HANDLE carried as a
+ * word, with a reusable ≤1024-byte write buffer. The dev drives open/close and the read primitives
+ * directly; `write`/`flush`/`close` buffer and drain through the stream itself. */
+exp type FileStream = class Stream {
+    /** The POSIX fd or the Windows HANDLE, carried as a word. */
+    pub handle: i64
+    /** The reusable write buffer, flushed once full. */
+    sbuf: []byte
+    /** The bytes currently held in `sbuf`, not yet flushed. */
+    sfill: u64
+    /** The cumulative bytes handed to `write` (flushed or still pending). */
+    pub written: u64
+    /** The next fresh-name ordinal for the C function currently being emitted by the codegen
+     * writer; unused by callers outside the codegen writer. */
+    pub next_gensym: u64
+    /** The in-memory backing slice for a read-only rodata cursor; empty for an fd/HANDLE stream. */
+    pub mem: []byte
+    /** The read cursor into `mem` (memory-backed) — advanced by `stream_read`. */
+    pub rpos: u64
+
+    /** open — open `path` for writing, truncating (creating when absent) — the write-stream
+     * constructor for callers that want the buffered `Stream` interface.
+     * @return the open stream, or an error when the file cannot be opened. */
+    pub static fn open(path: str): FileStream | error { open_write(path) }
+
+    /** of_handle — a fresh stream wrapping the already-open handle `h`, with an empty write
+     * buffer — the constructor `open_read`/`open_write`/`open_append` build on. */
+    pub static fn of_handle(h: i64): FileStream {
+        var sb: [CHUNK]byte = []
+        FileStream { handle = h; sbuf = sb; sfill = 0; written = 0; next_gensym = 0; mem = []; rpos = 0 }
+    }
+
+    /** of_slice — a read-only, memory-backed FileStream over the byte slice `data` (e.g. a slice into
+     * embedded rodata). No OS handle is opened; `stream_read` pulls from `data` and advances an
+     * internal cursor. The write path is unused on such a stream.
+     * @param data  the backing bytes (borrowed; a rodata slice is zero-copy)
+     * @return a fresh read-only stream positioned at 0. */
+    pub static fn of_slice(data: []byte): FileStream {
+        FileStream { handle = -1; sbuf = []; sfill = 0; written = 0; next_gensym = 0; mem = data; rpos = 0 }
+    }
+
+    /** read_mem — copy up to `want` bytes from the memory backing into `into` (via its base pointer),
+     * advancing the read cursor; 0 at end of the backing slice.
+     * @param into  the reusable destination buffer, written in place through its base pointer
+     * @param want  the capped byte count to move
+     * @return the bytes copied (0 at the end of the backing). */
+    pub fn read_mem(into: []byte, want: u64): u64 {
+        var left = self.mem.len - self.rpos
+        if left == 0 { return 0 to u64 }
+        var take = if want < left { want } else { left }
+        var dst = buf_base(into, 0) to u64
+        var j: u64 = 0
+        loop { if j >= take { break }; teko::mem::store_u8(dst + j, self.mem[self.rpos + j] to u64); j = j + 1 }
+        self.rpos = self.rpos + take
+        take
+    }
+
+    /** write — buffer `s`, flushing to the file whenever the buffer fills. */
+    pub override fn write(s: str) {
+        self.write_bytes(s.bytes())
+    }
+
+    /** write_bytes — buffer `data`, flushing to the file whenever the buffer fills. */
+    pub fn write_bytes(data: []byte) {
+        var n = data.len
+        var i: u64 = 0
+        loop {
+            if i >= n { break }
+            if self.sfill >= self.sbuf.len { self.flush() }
+            var room = self.sbuf.len - self.sfill
+            var take = n - i
+            if room < take { take = room }
+            var j: u64 = 0
+            loop {
+                if j >= take { break }
+                self.sbuf[self.sfill + j] = data[i + j]
+                j = j + 1
+            }
+            self.sfill = self.sfill + take
+            self.written = self.written + take
+            i = i + take
         }
+    }
+
+    /** write_byte — buffer a single byte, flushing to the file first when the buffer is full. */
+    pub fn write_byte(x: byte) {
+        if self.sfill >= self.sbuf.len { self.flush() }
+        self.sbuf[self.sfill] = x
+        self.sfill = self.sfill + 1
+        self.written = self.written + 1
+    }
+
+    /** flush — drain the pending buffer to the file. */
+    pub override fn flush() {
+        if self.sfill == 0 { return }
+        match stream_write_prefix(self, self.sbuf, self.sfill) { u64 => { }; error => { } }
+        self.sfill = 0
+    }
+
+    /** close — flush the pending buffer, then release the OS handle. */
+    pub override fn close() {
+        self.flush()
+        match stream_close(self) { error => { }; null => { } }
+    }
+
+    /** gensym — the next fresh-name ordinal for the C function currently being emitted, advancing
+     * the counter. Reset at the start of each emitted C function via `reset_gensym`. */
+    pub fn gensym(): u64 {
+        var n = self.next_gensym
+        self.next_gensym = self.next_gensym + 1
+        n
+    }
+
+    /** reset_gensym — restart the fresh-name counter at the top of a newly emitted C function. */
+    pub fn reset_gensym() {
+        self.next_gensym = 0
     }
 }
 
+const WIN_CP_UTF8: u32 = 65001
+
+const WIN_GENERIC_READ: u32 = 0x80000000
+
+const WIN_GENERIC_WRITE: u32 = 0x40000000
+
+const WIN_FILE_SHARE_READ: u32 = 0x00000001
+
+const WIN_CREATE_ALWAYS: u32 = 2
+
+const WIN_OPEN_EXISTING: u32 = 3
+
+const WIN_OPEN_ALWAYS: u32 = 4
+
+const WIN_FILE_ATTR_NORMAL: u32 = 0x80
+
+const WIN_INVALID_HANDLE: i64 = -1
+
+/** cstr_addr — the address of a NUL-terminated C copy of `path`.
+ * @param path  the text to materialize
+ * @return the word address of the C string */
+fn cstr_addr(path: str): i64 {
+    teko::sys::ptr_word(teko::mem::as_cstr(path))
+}
+
+#os("linux")
+fn os_open(path: str, oflags: i64, mode: i64): i64 {
+    teko::sys::syscall4(teko::sys::SYS_OPENAT, teko::sys::AT_FDCWD, cstr_addr(path), oflags, mode)
+}
+
+#os("linux")
+fn os_read(fd: i64, addr: i64, count: i64): i64 {
+    teko::sys::syscall3(teko::sys::SYS_READ, fd, addr, count)
+}
+
+#os("linux")
+fn os_write(fd: i64, addr: i64, count: i64): i64 {
+    teko::sys::syscall3(teko::sys::SYS_WRITE, fd, addr, count)
+}
+
+#os("linux")
+fn os_lseek(fd: i64, off: i64, whence: i64): i64 {
+    teko::sys::syscall3(teko::sys::SYS_LSEEK, fd, off, whence)
+}
+
+#os("linux")
+fn os_close(fd: i64): i64 {
+    teko::sys::syscall1(teko::sys::SYS_CLOSE, fd)
+}
+
+#os("macos")
+fn os_open(path: str, oflags: i64, mode: i64): i64 {
+    teko::sys::abi::os_open_raw(cstr_addr(path) to u64, oflags to i32, mode to i32) to i64
+}
+
+#os("macos")
+fn os_read(fd: i64, addr: i64, count: i64): i64 {
+    teko::sys::abi::os_read_raw(fd to i32, addr to u64, count to u64)
+}
+
+#os("macos")
+fn os_write(fd: i64, addr: i64, count: i64): i64 {
+    teko::sys::abi::os_write_raw(fd to i32, addr to u64, count to u64)
+}
+
+#os("macos")
+fn os_lseek(fd: i64, off: i64, whence: i64): i64 {
+    teko::sys::abi::os_lseek_raw(fd to i32, off, whence to i32)
+}
+
+#os("macos")
+fn os_close(fd: i64): i64 {
+    teko::sys::abi::os_close_raw(fd to i32) to i64
+}
+
+#os("windows")
+fn win_wide_path(path: str): i64 {
+    var addr = cstr_addr(path)
+    var wbuf = teko::sys::ptr_word(teko::mem::buf_ptr((path.len + 1) * 2))
+    _ = teko::sys::abi::MultiByteToWideChar(WIN_CP_UTF8, 0, addr to u64, -1 to i32, wbuf to u64, (path.len + 1) to i32)
+    wbuf
+}
+
+#os("windows")
+fn win_open(path: str, access: u32, disp: u32): i64 {
+    var h = teko::sys::abi::CreateFileW(win_wide_path(path) to u64, access, WIN_FILE_SHARE_READ, 0, disp, WIN_FILE_ATTR_NORMAL, 0)
+    h to i64
+}
+
+#os("windows")
+fn os_read(fd: i64, addr: i64, count: i64): i64 {
+    var got = teko::sys::ptr_word(teko::mem::buf_ptr(8)) to u64
+    teko::mem::store_u64(got, 0 to u64)
+    if teko::sys::abi::ReadFile(fd to u64, addr to u64, count to u32, got, 0) == 0 { return -1 }
+    teko::mem::load_u64(got) to i64
+}
+
+#os("windows")
+fn os_write(fd: i64, addr: i64, count: i64): i64 {
+    var put = teko::sys::ptr_word(teko::mem::buf_ptr(8)) to u64
+    teko::mem::store_u64(put, 0 to u64)
+    if teko::sys::abi::WriteFile(fd to u64, addr to u64, count to u32, put, 0) == 0 { return -1 }
+    teko::mem::load_u64(put) to i64
+}
+
+#os("windows")
+fn os_lseek(fd: i64, off: i64, whence: i64): i64 {
+    var newp = teko::mem::buf_ptr(8)
+    if teko::sys::abi::SetFilePointerEx(fd to u64, off, teko::sys::ptr_word(newp) to u64, whence to u32) == 0 { return -1 }
+    teko::mem::load_u64(teko::sys::ptr_word(newp) to u64) to i64
+}
+
+#os("windows")
+fn os_close(fd: i64): i64 {
+    if teko::sys::abi::CloseHandle(fd to u64) == 0 { return -1 }
+    0
+}
+
+/** is_os_error — whether a raw OS result marks failure: any negative POSIX/Windows return.
+ * @param r  the raw result of an os_* wrapper
+ * @return true when the call failed */
+fn is_os_error(r: i64): bool {
+    r < 0
+}
+
+/** buf_base — the word address of element `i` of `xs`, without materializing the slice.
+ * @param xs  the byte buffer
+ * @param i   the element index
+ * @return the address of `xs[i]` */
+fn buf_base(xs: []byte, i: u64): i64 {
+    teko::sys::ptr_word(teko::mem::byte_ptr(xs, i))
+}
+
+/** open_read — open `path` read-only, cursor at the start.
+ * @param path  the file to read
+ * @return the open stream, or an error when the file cannot be opened */
+exp fn open_read(path: str): FileStream | error {
+    var h = os_open_read(path)
+    if is_os_error(h) { return error { message = $"teko::io::open_read: cannot open {path}" } }
+    FileStream::of_handle(h)
+}
+
+#os("linux")
+fn os_open_read(path: str): i64 {
+    os_open(path, teko::sys::O_RDONLY, 0)
+}
+
+#os("macos")
+fn os_open_read(path: str): i64 {
+    os_open(path, teko::sys::O_RDONLY, 0)
+}
+
+#os("windows")
+fn os_open_read(path: str): i64 {
+    var h = win_open(path, WIN_GENERIC_READ, WIN_OPEN_EXISTING)
+    if h == WIN_INVALID_HANDLE { return -1 }
+    h
+}
+
+/** open_write — open `path` for writing, truncating (creating when absent), cursor at the start.
+ * @param path  the file to (re)write
+ * @return the open stream, or an error when the file cannot be opened */
+exp fn open_write(path: str): FileStream | error {
+    var h = os_open_write(path)
+    if is_os_error(h) { return error { message = $"teko::io::open_write: cannot open {path}" } }
+    FileStream::of_handle(h)
+}
+
+#os("linux")
+fn os_open_write(path: str): i64 {
+    os_open(path, teko::sys::O_WRONLY | teko::sys::O_CREAT | teko::sys::O_TRUNC, teko::sys::OPEN_MODE_644)
+}
+
+#os("macos")
+fn os_open_write(path: str): i64 {
+    teko::sys::abi::os_creat_raw(cstr_addr(path) to u64, teko::sys::OPEN_MODE_644 to i32) to i64
+}
+
+#os("windows")
+fn os_open_write(path: str): i64 {
+    var h = win_open(path, WIN_GENERIC_WRITE, WIN_CREATE_ALWAYS)
+    if h == WIN_INVALID_HANDLE { return -1 }
+    h
+}
+
+/** open_append — open `path` append-only (creating when absent): every write lands at the end of
+ * the file. `stream_seek` on such a stream repositions only the read cursor; the OS forces writes
+ * to the end.
+ * @param path  the file to append to
+ * @return the open stream, or an error when the file cannot be opened */
+exp fn open_append(path: str): FileStream | error {
+    var h = os_open_append(path)
+    if is_os_error(h) { return error { message = $"teko::io::open_append: cannot open {path}" } }
+    FileStream::of_handle(h)
+}
+
+#os("linux")
+fn os_open_append(path: str): i64 {
+    os_open(path, teko::sys::O_WRONLY | teko::sys::O_CREAT | teko::sys::O_APPEND, teko::sys::OPEN_MODE_644)
+}
+
+#os("macos")
+fn os_open_append(path: str): i64 {
+    var h = os_open(path, teko::sys::O_WRONLY | teko::sys::O_APPEND, 0)
+    if !is_os_error(h) { return h }
+    var c = teko::sys::abi::os_creat_raw(cstr_addr(path) to u64, teko::sys::OPEN_MODE_644 to i32) to i64
+    if is_os_error(c) { return -1 }
+    _ = os_close(c)
+    os_open(path, teko::sys::O_WRONLY | teko::sys::O_APPEND, 0)
+}
+
+#os("windows")
+fn os_open_append(path: str): i64 {
+    var h = win_open(path, WIN_GENERIC_WRITE, WIN_OPEN_ALWAYS)
+    if h == WIN_INVALID_HANDLE { return -1 }
+    _ = os_lseek(h, 0, teko::sys::SEEK_END)
+    h
+}
+
+/** stream_read — read up to `min(into.len, CHUNK)` bytes from the stream into `into`, advancing
+ * the OS cursor; returns the count read (0 at end-of-file). The caller consumes `into[0..count]`,
+ * so a final partial chunk never carries padding zeros.
+ * @param s     the stream to read
+ * @param into  the reusable destination buffer, written in place
+ * @return the bytes read (0 at EOF), or a read error */
+exp fn stream_read(s: FileStream, into: []byte): u64 | error {
+    var want = into.len
+    if want > CHUNK { want = CHUNK }
+    if want == 0 { return 0 to u64 }
+    if s.handle < 0 { return s.read_mem(into, want) }
+    var n = os_read(s.handle, buf_base(into, 0), want to i64)
+    if is_os_error(n) { return error { message = "teko::io::stream_read: read failed" } }
+    n to u64
+}
+
+/** teko::io::of_slice — a read-only, memory-backed FileStream over `data` (e.g. an embedded rodata
+ * slice). `stream_read` pulls chunks from `data` without touching the OS.
+ * @param data  the backing bytes (borrowed; a rodata slice is zero-copy)
+ * @return a fresh read-only stream positioned at 0. */
+exp fn of_slice(data: []byte): FileStream {
+    FileStream::of_slice(data)
+}
+
 /**
- * file_flush — commit a `MemWriter`'s accumulated bytes to `path` via the `write_file_bytes` extern
- * (NATIVE-only). A `MemWriter` IS a `Writer`, so any combinator (`copy`, `write_all`) can drive it;
- * this seals the result to disk.
+ * stream_bytes — the whole in-memory backing slice of a memory-backed stream (e.g. one built by
+ * `of_slice` over an embedded rodata blob). Returns the zero-copy backing view without advancing the
+ * read cursor; empty for an fd/HANDLE stream that has no memory backing.
  *
- * @param path  the destination path
- * @param sink  the accumulator whose bytes are written out
- * @return      null on success, or the write error
- * @throws      the `write_file_bytes` error when the path could not be written
- * @since IO1
+ * @param s  the stream whose backing bytes are wanted
+ * @return   the backing byte slice (empty for a handle-backed stream)
  */
-pub fn file_flush(path: str, sink: MemWriter) -> error | null {
-    write_file_bytes(path, sink.content().bytes())
+exp fn stream_bytes(s: FileStream): []byte {
+    s.mem
+}
+
+/** stream_write — write all of `data` to the stream, slicing internally into chunks of at most
+ * CHUNK bytes and writing each in order. Nothing accumulates; the base pointer of `data` is used
+ * directly (no payload copy).
+ * @param s     the stream to write
+ * @param data  the bytes to write, in the order built
+ * @return the total bytes written, or a write error */
+exp fn stream_write(s: FileStream, data: []byte): u64 | error {
+    var off: u64 = 0
+    loop {
+        if off >= data.len { break }
+        var take = data.len - off
+        if take > CHUNK { take = CHUNK }
+        var n = os_write(s.handle, buf_base(data, off), take to i64)
+        if is_os_error(n) { return error { message = "teko::io::stream_write: write failed" } }
+        if n == 0 { return error { message = "teko::io::stream_write: no progress" } }
+        off = off + (n to u64)
+    }
+    off
+}
+
+/** stream_write_prefix — write the first `n` bytes of `data` (the caller's fixed pending buffer,
+ * only partly filled), slicing into CHUNK writes. Zero-copy: the base pointer of `data` is used
+ * directly, so a reusable buffer never allocates on flush.
+ * @param s     the stream to write
+ * @param data  the buffer whose leading `n` bytes are written
+ * @param n     the count of leading bytes to write (must be `<= data.len`)
+ * @return the total bytes written, or a write error */
+exp fn stream_write_prefix(s: FileStream, data: []byte, n: u64): u64 | error {
+    var off: u64 = 0
+    loop {
+        if off >= n { break }
+        var take = n - off
+        if take > CHUNK { take = CHUNK }
+        var w = os_write(s.handle, buf_base(data, off), take to i64)
+        if is_os_error(w) { return error { message = "teko::io::stream_write_prefix: write failed" } }
+        if w == 0 { return error { message = "teko::io::stream_write_prefix: no progress" } }
+        off = off + (w to u64)
+    }
+    off
+}
+
+/** whence_code — the OS seek origin code for a `Whence`.
+ * @param whence  the seek origin
+ * @return the SEEK_SET/CUR/END code */
+fn whence_code(whence: Whence): i64 {
+    match whence {
+        Whence::Start => teko::sys::SEEK_SET
+        Whence::Current => teko::sys::SEEK_CUR
+        Whence::End => teko::sys::SEEK_END
+    }
+}
+
+/** stream_seek — reposition the read cursor: `off` relative to Start / Current / End. On an
+ * append-only stream the OS still forces writes to the end; only the read position moves.
+ * @param s       the stream to reposition
+ * @param off     the offset (may be negative with Current / End)
+ * @param whence  the origin of the offset
+ * @return the new absolute position, or an error on a negative target */
+exp fn stream_seek(s: FileStream, off: i64, whence: Whence): u64 | error {
+    var pos = os_lseek(s.handle, off, whence_code(whence))
+    if is_os_error(pos) { return error { message = "teko::io::stream_seek: negative or failed seek" } }
+    pos to u64
+}
+
+/** stream_size — the total byte length of the stream's file, by seeking to the end and back.
+ * @param s  the stream to measure
+ * @return the total in bytes, or a seek error */
+exp fn stream_size(s: FileStream): u64 | error {
+    var here = os_lseek(s.handle, 0, teko::sys::SEEK_CUR)
+    if is_os_error(here) { return error { message = "teko::io::stream_size: seek failed" } }
+    var total = os_lseek(s.handle, 0, teko::sys::SEEK_END)
+    if is_os_error(total) { return error { message = "teko::io::stream_size: seek failed" } }
+    _ = os_lseek(s.handle, here, teko::sys::SEEK_SET)
+    total to u64
+}
+
+/** stream_close — close the handle and release the OS resource.
+ * @param s  the stream to close
+ * @return null on success, or the close error */
+exp fn stream_close(s: FileStream): error | null {
+    if is_os_error(os_close(s.handle)) { return error { message = "teko::io::stream_close: close failed" } }
+    null
+}
+
+/** write_stream — the recommended write path: open `path` truncating, write `data` chunked, and
+ * close (even on error).
+ * @param path  the destination file
+ * @param data  the bytes to write
+ * @return null on success, or the first error */
+exp fn write_stream(path: str, data: []byte): error | null {
+    var s = match open_write(path) { FileStream as fs => fs; error as e => return e }
+    var w = stream_write(s, data)
+    _ = stream_close(s)
+    match w { u64 => null; error as e => e }
+}
+
+/** append_stream — like write_stream, but appends to the end of `path` (creating when absent).
+ * @param path  the destination file
+ * @param data  the bytes to append
+ * @return null on success, or the first error */
+exp fn append_stream(path: str, data: []byte): error | null {
+    var s = match open_append(path) { FileStream as fs => fs; error as e => return e }
+    var w = stream_write(s, data)
+    _ = stream_close(s)
+    match w { u64 => null; error as e => e }
+}
+
+/** read_stream — the read-only read path: measure `path`, allocate one exact-sized buffer, drain
+ * it in CHUNK steps, and close (even on error). Materializes (the caller needs the whole text) but
+ * with exact sizing and no growth.
+ * @param path  the file to read
+ * @return the file bytes, or the first error */
+exp fn read_stream(path: str): []byte | error {
+    var s = match open_read(path) { FileStream as fs => fs; error as e => return e }
+    var total = match stream_size(s) { u64 as t => t; error as e => { _ = stream_close(s); return e } }
+    var scratch: []byte = teko::mem::bytes_from_ptr(teko::mem::buf_ptr(CHUNK), CHUNK)
+    var out: [total]byte = []
+    var got: u64 = 0
+    loop {
+        if got >= total { break }
+        var n = match stream_read(s, scratch) { u64 as c => c; error as e => { _ = stream_close(s); return e } }
+        if n == 0 { break }
+        var j: u64 = 0
+        loop {
+            if j >= n { break }
+            out[got + j] = scratch[j]
+            j = j + 1
+        }
+        got = got + n
+    }
+    _ = stream_close(s)
+    out
 }

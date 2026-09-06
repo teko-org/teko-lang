@@ -1,162 +1,49 @@
-// src/build/manifest.tks   (namespace 'teko::build')
-//
-// The `.tkp` manifest reader — the FIRST step of project-based compilation: the
-// manifest is read BEFORE any Teko is parsed (LEGISLATION: "standalone simple
-// parser"). TOML because it is explicit and *typed* (no coercion lies — M.3),
-// commentable (M.2), and minimal (M.5). This parses a MINIMAL TOML SUBSET — enough
-// for `.tkp`, not full TOML.
+use teko::encoding::toml
 
-/**
- * The code-generation backend a build lowers through. `C` emits C and links it with the
- * host `cc` (the trusted default, byte-identical across generations — FIXPOINT-preserving);
- * `Native` opts into Teko's own AOT backend + M-linker (`lir::lower` → isel → regalloc →
- * encode → objfile → link). Selected by the `TEKO_BACKEND=native` environment variable — the
- * earlier `--backend={c,native}` CLI flag was REMOVED as unused surface (owner ruling
- * 2026-07-24; D1/#390, own-backend-architecture §3.7 supersede this transitional env seam with
- * the real manifest surface). The default is `C`, so an env-free build stays on the trusted path.
- */
+
 type Backend = enum { C; Native }
 
-/**
- * The parsed manifest. `artifact` reuses the enum from tkp_rule.tks (same namespace, bare
- * reference). deps/aliases are simple string lists in the seed (M.5 — richer dependency
- * records are evolution).
- *
- * link_lib_name and os_lib_name (C7.20) are PARALLEL to link_flags and os_lib_os/os_lib_flag
- * respectively: each holds the originating `[extern.libs]`/`[extern.libs.<key>]` KEY for its
- * same-indexed resolved flag (one key can fan out to several flags, e.g. a `-framework Name`
- * pair — every one of those flags carries that same key). That key is the same name an
- * `extern fn … from "<key>"` binds to, so a reachability pass can filter a whole key's flags
- * together by whether any of its externs is actually called.
- *
- * A `[extern.libs.<key>]` SECTION key is either a bare OS (`linux` — any arch of that OS,
- * LEGISLATION:426) or a full os-arch name (`x86_64-linux` — that target only, the ratified §4.2
- * arch-key fill of teko-target-crosslink-0.3.1.md); both land in os_lib_os and are told apart at
- * link time by `os_lib_key_matches`. link_mode/os_lib_mode carry the declared `static:`/`shared:`
- * linkage so the R4 and R5 rules can be applied per entry (§4.3/§5).
- */
 pub type Manifest = struct {
-    name: str   // canonical root
-    artifact: Artifact   // Executable | Library  (from tkp_rule.tks)
-    /**
-     * `[artifact] abi = "c"` — the reverse-FFI (Teko→C) application binary interface; "" = the native
-     * Teko ABI (default). "c" arms the `exp`-function C-ABI export + `.h` generation (FFI-D).
-     */
+    name: str
+    artifact: Artifact
     abi: str
-    source: str   // the invisible source root
-    deps: []str   // [dependencies] keys
-    aliases: []str   // [aliases] keys
-    version: str   // `version = "x.y.z.b"` (info; empty if unset)
-    suffix: str   // `suffix = "bootstrap"` (pre-release stage; empty if unset)
-    description: str   // `description = "…"` — embedded in the binary's metadata (C7.1k; empty if unset)
-    platforms: []str   // [platforms] targets — OSes this project targets (CI matrix; informational for a single build)
-    cov_functions: u64   // [coverage] functions — the D4 FUNCTION-coverage floor % (default 80)
-    cov_lines: u64   // [coverage] lines     — the D4 LINE-coverage floor %     (default 80)
-    cov_branches: u64   // [coverage] branches  — the D4 BRANCH-coverage floor %   (default 80)
-    /**
-     * The GLOBAL `[extern.libs]` section's resolved cc link flags (C7.1e), in declaration order:
-     * `-l<name>` for a bare name, the path itself for a direct file, a `-flag` element verbatim.
-     * These link on EVERY target.
-     */
+    source: str
+    deps: []str
+    aliases: []str
+    version: str
+    suffix: str
+    description: str
+    platforms: []str
+    cov_functions: u64
+    cov_lines: u64
+    cov_branches: u64
     link_flags: []str
-    /**
-     * The originating `[extern.libs]` KEY of each same-indexed `link_flags` entry (C7.20) — the
-     * same name an `extern fn … from "<key>"` binds to, so extern-reachability can filter a whole
-     * key's flags together even when one key fanned out to several.
-     */
     link_lib_name: []str
-    /**
-     * The declared LINKAGE MODE of each global `[extern.libs]` flag — `"static"`, `"shared"`, or
-     * `""` when the element states none. PARALLEL to `link_flags`/`link_lib_name`. Recorded (no
-     * longer stripped) because the R4 static-locality rule and the R5 shared fail-or-`--allow-undef`
-     * rule are DIFFERENT rules, and only the mode tells them apart
-     * (teko-target-crosslink-0.3.1.md §4.3).
-     *
-     * @since 0.3.1
-     */
     link_mode: []str
-    /**
-     * The SECTION KEY each deferred `[extern.libs.<key>]` flag belongs to: either a bare OS
-     * (`"linux"` — any arch of that OS, LEGISLATION:426) or a full os-arch name
-     * (`"x86_64-linux"` — that target only, the §4.2 arch-key fill). Selected at LINK time by
-     * `os_lib_key_matches`, so parsing stays host-independent.
-     */
     os_lib_os: []str
-    /**
-     * The resolved cc link flag of each deferred entry, PARALLEL to `os_lib_os` — same vocabulary
-     * as `link_flags`, appended to the link line only when its section key matches the build's
-     * target.
-     */
     os_lib_flag: []str
-    /**
-     * The originating `[extern.libs.<key>]` KEY of each same-indexed `os_lib_flag` entry (C7.20),
-     * the per-section sibling of `link_lib_name`.
-     */
     os_lib_name: []str
-    /**
-     * The declared LINKAGE MODE of each deferred `[extern.libs.<os>]`/`[extern.libs.<os-arch>]`
-     * flag — `"static"`, `"shared"`, or `""`. PARALLEL to `os_lib_os`/`os_lib_flag`/`os_lib_name`,
-     * the per-section sibling of `link_mode`.
-     *
-     * @since 0.3.1
-     */
     os_lib_mode: []str
-    cc: str   // [extern] cc — the C driver to invoke ("" = the default `cc`) (C7.1f)
-    target: str   // [extern] target — a cross target triple for `-target` ("" = host)
-    sysroot: str   // [extern] sysroot — `--sysroot` for cross builds ("" = none)
-    freestanding: bool   // [extern] freestanding — drop the implicit libc (`-nostdlib`); default false
-    /**
-     * test_regression_files — `[tests] regression` — the EXPLICIT, ORDERED list of `.tkr`
-     * regressor FILE paths (relative to the project root) the `teko test` lane runs, in list
-     * order. There is NO directory discovery and NO glob: each entry names ONE `.tkr` file.
-     * `[]` when the `[tests]` section (or the key) is absent → the regression tier is OFF. A
-     * listed path that does not resolve to a readable file is a MANIFEST ERROR (M.3), never a
-     * silent skip.
-     *
-     * @since 0.3.1
-     */
+    cc: str
+    target: str
+    sysroot: str
+    freestanding: bool
     test_regression_files: []str
-    /**
-     * `[tests] gate` — true (the default): a failing regressive FAILS `teko test`; false: the
-     * regressive result is advisory. Absent → true. @since 0.3.0.29
-     */
     test_gate: bool
-    /**
-     * `[tests] targets` — the default variant set a `.tkr` inherits when it declares no `targets`.
-     * Absent → `["host"]` (the build host's native target). @since 0.3.0.29
-     */
     test_default_targets: []str
-    /**
-     * The resolved code-generation backend (`C` default, `Native` for the own AOT path).
-     * NOT a `.tkp` key: it is stamped from the `TEKO_BACKEND` env (the sole selection seam —
-     * the earlier `--backend` CLI flag was removed, owner ruling 2026-07-24) by `backend_of` +
-     * `with_backend` after the front-end parses the manifest (D1/#390).
-     */
     backend: Backend
 }
 
-// parse_manifest — read a `.tkp` source into a Manifest, or fail honestly (M.3 — no
-// silent coercion). The recognized TOML subset:
-//   * top-level  `key = "value"`     → name / source (strings)
-//   * table head `[table]`           → [artifact] / [dependencies] / [aliases]
-//   * `[artifact] kind = "binary"|"static"|"shared"|"package"` → Artifact (default Binary)
-//   * keys under [dependencies]      → deps
-//   * keys under [aliases]           → aliases
-//   * arrays     `key = ["a", "b"]`  → recognized (a value form)
-// Missing required fields (name, source) or malformed lines → error.
-// --- line/byte cursor helpers (zero-copy views into the source bytes) --------
 
-// the byte at p, or 0 past the end (a safe peek, like the lexer's `at`).
-fn mf_at(s: str, p: u64) -> byte {
+fn mf_at(s: str, p: u64): byte {
     if p >= s.len { return 0 }
     s[p]
 }
 
-fn mf_is_space(c: byte) -> bool { c == b' ' || c == b'\t' || c == b'\r' }
+fn mf_is_space(c: byte): bool { c == b' ' || c == b'\t' || c == b'\r' }
 
-// advance past spaces/tabs/CR (NOT newlines — a line is the unit of work).
-fn mf_skip_spaces(s: str, p: u64) -> u64 {
-    mut q = p
+fn mf_skip_spaces(s: str, p: u64): u64 {
+    var q = p
     loop {
         if q >= s.len { break }
         if !mf_is_space(s[q]) { break }
@@ -165,15 +52,13 @@ fn mf_skip_spaces(s: str, p: u64) -> u64 {
     q
 }
 
-// a key byte: letters, digits, `_`, `-`, `.` (TOML bare-key set + `.` for dotted deps).
-fn mf_is_key_byte(c: byte) -> bool {
+fn mf_is_key_byte(c: byte): bool {
     (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') ||
     c == b'_' || c == b'-' || c == b'.'
 }
 
-// the position just past the bare key at p (== p if none).
-fn mf_key_end(s: str, p: u64) -> u64 {
-    mut q = p
+fn mf_key_end(s: str, p: u64): u64 {
+    var q = p
     loop {
         if q >= s.len { break }
         if !mf_is_key_byte(s[q]) { break }
@@ -182,29 +67,26 @@ fn mf_key_end(s: str, p: u64) -> u64 {
     q
 }
 
-// a `"…"` quoted scalar: the bytes between the quotes (escapes NOT interpreted — M.5)
-// plus the position just past the closing quote.
 type MfQuoted = struct { text: str; next: u64 }
-fn mf_read_quoted(s: str, p: u64) -> MfQuoted | error {
+fn mf_read_quoted(s: str, p: u64): MfQuoted | error {
     if mf_at(s, p) != b'"' { return error { message = "expected a quoted string value" } }
-    let start = p + 1
-    mut q = start
+    var start = p + 1
+    var q = start
     loop {
         if q >= s.len { break }
         if s[q] == b'"' { break }
         q = q + 1
     }
     if q >= s.len { return error { message = "unterminated string value" } }
-    MfQuoted { text = teko::str::slice(s, start, q); next = q + 1 }
+    MfQuoted { text = s.slice(start, q); next = q + 1 }
 }
 
-// an UNQUOTED non-negative integer value (TOML `key = 80`): the digit run at p (0 if none).
-fn mf_read_int(s: str, p: u64) -> u64 {
-    mut q = p
-    mut n: u64 = 0
+fn mf_read_int(s: str, p: u64): u64 {
+    var q = p
+    var n: u64 = 0
     loop {
         if q >= s.len { break }
-        let c = s[q]
+        var c = s[q]
         if c < b'0' || c > b'9' { break }
         n = n * 10 + (c to u64) - (b'0' to u64)
         q = q + 1
@@ -212,176 +94,83 @@ fn mf_read_int(s: str, p: u64) -> u64 {
     n
 }
 
-// a `["a", "b"]` array of quoted strings (C7.1e): the elements + the pos past the closing `]`.
-// An empty `[]` yields an empty list. Elements are quoted scalars separated by commas.
 type MfArray = struct { items: []str; next: u64 }
-fn mf_read_array(s: str, p: u64) -> MfArray | error {
+fn mf_read_array(s: str, p: u64): MfArray | error {
     if mf_at(s, p) != b'[' { return error { message = "expected '[' for an array value" } }
-    mut q = mf_skip_spaces(s, p + 1)
-    mut items: []str = teko::list::empty()
-    if mf_at(s, q) == b']' { return MfArray { items = items; next = q + 1 } }   // empty []
+    var q = mf_skip_spaces(s, p + 1)
+    var items: []str = []
+    if mf_at(s, q) == b']' { return MfArray { items = items; next = q + 1 } }
     loop {
-        let elem = match mf_read_quoted(s, q) { MfQuoted as x => x; error as e => return e }
-        items = teko::list::push(items, elem.text)
+        var elem = match mf_read_quoted(s, q) { MfQuoted as x => x; error as e => return e }
+        items = [..items, elem.text]
         q = mf_skip_spaces(s, elem.next)
-        let c = mf_at(s, q)
+        var c = mf_at(s, q)
         if c == b']' { return MfArray { items = items; next = q + 1 } }
         if c != b',' { return error { message = "expected ',' or ']' in an array value" } }
         q = mf_skip_spaces(s, q + 1)
     }
-    error { message = "unterminated array value" }   // unreachable (the loop returns on ']' / errors)
+    error { message = "unterminated array value" }
 }
 
-// strip a leading `lib` from a library name for the `-l` flag (`libc` -> `c`; `z` stays `z`). (C7.1e)
-fn mf_strip_lib(name: str) -> str {
-    if name.len > 3 && name[0] == b'l' && name[1] == b'i' && name[2] == b'b' { teko::str::slice_from(name, 3) } else { name }
+fn mf_strip_lib(name: str): str {
+    if name.len > 3 && name[0] == b'l' && name[1] == b'i' && name[2] == b'b' { name.slice_from(3) } else { name }
 }
 
-fn mf_starts_with(s: str, p: str) -> bool {
+fn mf_starts_with(s: str, p: str): bool {
     if s.len < p.len { return false }
-    teko::str::slice_to(s, p.len) == p
+    s.slice_to(p.len) == p
 }
 
-// does `s` name a direct library FILE (a path or a known extension), vs a `-l` lib name?
-fn mf_has_path(s: str) -> bool {
-    if teko::str::contains(s, "/") { return true }
-    teko::str::ends_with(s, ".a") || teko::str::ends_with(s, ".so") || teko::str::ends_with(s, ".dylib") ||
-    teko::str::ends_with(s, ".dll") || teko::str::ends_with(s, ".o") || teko::str::ends_with(s, ".lib")
+fn mf_has_path(s: str): bool {
+    if s.contains("/") { return true }
+    s.ends_with(".a") || s.ends_with(".so") || s.ends_with(".dylib") ||
+    s.ends_with(".dll") || s.ends_with(".o") || s.ends_with(".lib")
 }
 
-/**
- * LINK_MODE_STATIC — the `os_lib_mode`/`link_mode` token for a FORCED-STATIC element
- * (`static:<name>`, or a `.a`/`.lib`/`.o` direct file whose extension decides it —
- * LEGISLATION:423). Named once so the parser, the R4 validator and their tests cannot drift.
- *
- * @since 0.3.1
- */
 const LINK_MODE_STATIC: str = "static"
 
-/**
- * LINK_MODE_SHARED — the `os_lib_mode`/`link_mode` token for a FORCED-DYNAMIC element
- * (`shared:<name>`, or a `.so`/`.dylib`/`.dll` direct file). The R5 fail-or-`--allow-undef` rule
- * keys on exactly this token.
- *
- * @since 0.3.1
- */
 const LINK_MODE_SHARED: str = "shared"
 
-/**
- * MODE_PREFIX_LEN — the byte length of both `static:` and `shared:`, the two mode prefixes
- * `mf_extern_spec` strips (they are deliberately the same width — D39: one constant, one strip).
- *
- * @since 0.3.1
- */
 const MODE_PREFIX_LEN: u64 = 7
 
-/**
- * ExternLibSpec — one resolved `[extern.libs…]` array element: the cc link flag it contributes and
- * the LINKAGE MODE it declared. The mode used to be stripped and thrown away; it is now carried so
- * the R4 static-locality rule (a cross static lib must be a local file) and the R5 shared rule (a
- * missing shared lib fails unless `--allow-undef`) can be told apart at all
- * (teko-target-crosslink-0.3.1.md §4.3/§5).
- *
- * @since 0.3.1
- */
 type ExternLibSpec = struct {
-    /** the cc link flag this element resolves to (`-l<name>`, a direct file path, or a verbatim `-flag`). */
     flag: str
-    /** the declared linkage mode: `LINK_MODE_STATIC`, `LINK_MODE_SHARED`, or `""` when unstated. */
     mode: str
 }
 
-/**
- * mf_mode_from_ext — the linkage mode a DIRECT FILE's extension decides, per LEGISLATION:423 ("a
- * path … → linked as a direct file (the extension decides static vs shared)"): `.a`/`.lib`/`.o` →
- * static, `.so`/`.dylib`/`.dll` → shared, anything else → `""` (unstated). Consulted only when the
- * element carried no explicit `static:`/`shared:` prefix, which always wins.
- *
- * @param s  the path form of the element (mode prefix already stripped)
- * @return   `LINK_MODE_STATIC`, `LINK_MODE_SHARED`, or `""` when the extension decides neither
- * @since 0.3.1
- */
-fn mf_mode_from_ext(s: str) -> str {
-    if teko::str::ends_with(s, ".a") || teko::str::ends_with(s, ".lib") || teko::str::ends_with(s, ".o") { return LINK_MODE_STATIC }
-    if teko::str::ends_with(s, ".so") || teko::str::ends_with(s, ".dylib") || teko::str::ends_with(s, ".dll") { return LINK_MODE_SHARED }
+fn mf_mode_from_ext(s: str): str {
+    if s.ends_with(".a") || s.ends_with(".lib") || s.ends_with(".o") { return LINK_MODE_STATIC }
+    if s.ends_with(".so") || s.ends_with(".dylib") || s.ends_with(".dll") { return LINK_MODE_SHARED }
     ""
 }
 
-/**
- * mf_extern_spec — resolve ONE `[extern.libs]` array element (or, for an empty array, the lib key
- * itself) to its cc link flag PLUS its declared linkage mode (C7.1e + the §4.3 mode column):
- * a `-flag` element passes through verbatim with no mode (the M.5 escape); otherwise an explicit
- * `static:`/`shared:` prefix is stripped and REMEMBERED, and what remains is either a direct file
- * (a `/` or a known library extension — linked verbatim, the extension supplying the mode when the
- * prefix did not) or a bare name (`-l<name>`, a leading `lib` stripped). Stripping the prefix
- * BEFORE the path test is what makes the ratified `static:vendor/x86_64-linux/libfoo.a` spelling
- * (§4.2) resolve to the file `vendor/x86_64-linux/libfoo.a` instead of leaking the literal
- * `static:` prefix onto the link line.
- *
- * @param s  the raw array element (or the lib key, for an empty array)
- * @return   the resolved flag + declared mode
- * @since 0.3.1
- */
-fn mf_extern_spec(s: str) -> ExternLibSpec {
+fn mf_extern_spec(s: str): ExternLibSpec {
     if s.len > 0 && s[0] == b'-' { return ExternLibSpec { flag = s; mode = "" } }
-    mut mode = ""
-    mut rest = s
-    if mf_starts_with(rest, "static:") { mode = LINK_MODE_STATIC; rest = teko::str::slice_from(rest, MODE_PREFIX_LEN) }
-    else if mf_starts_with(rest, "shared:") { mode = LINK_MODE_SHARED; rest = teko::str::slice_from(rest, MODE_PREFIX_LEN) }
+    var mode = ""
+    var rest = s
+    if mf_starts_with(rest, "static:") { mode = LINK_MODE_STATIC; rest = rest.slice_from(MODE_PREFIX_LEN) }
+    else if mf_starts_with(rest, "shared:") { mode = LINK_MODE_SHARED; rest = rest.slice_from(MODE_PREFIX_LEN) }
     if mf_has_path(rest) {
-        let by_ext = if mode.len > 0 { mode } else { mf_mode_from_ext(rest) }
+        var by_ext = if mode.len > 0 { mode } else { mf_mode_from_ext(rest) }
         return ExternLibSpec { flag = rest; mode = by_ext }
     }
     ExternLibSpec { flag = teko::str::concat("-l", mf_strip_lib(rest)); mode = mode }
 }
 
-/**
- * (C7.20 + the §4.3 mode column) The parallel accumulators `parse_manifest` grows while it reads
- * `[extern.libs]` / `[extern.libs.<key>]` lines: `link_flags`/`link_lib_name`/`link_mode` for the
- * global section, `os_lib_os`/`os_lib_flag`/`os_lib_name`/`os_lib_mode` for a deferred per-section
- * one. Bundled into one struct so `parse_extern_libs_entry` can take and return them as a single
- * value.
- */
 type ExternLibsAccum = struct {
-    /** the global `[extern.libs]` flags so far. */
     link_flags: []str
-    /** the originating key of each global flag, parallel to `link_flags`. */
     link_lib_name: []str
-    /** the declared linkage mode of each global flag, parallel to `link_flags` (0.3.1). */
     link_mode: []str
-    /** the section key (bare OS or os-arch) of each deferred flag. */
     os_lib_os: []str
-    /** the deferred flags so far, parallel to `os_lib_os`. */
     os_lib_flag: []str
-    /** the originating key of each deferred flag, parallel to `os_lib_os`. */
     os_lib_name: []str
-    /** the declared linkage mode of each deferred flag, parallel to `os_lib_os` (0.3.1). */
     os_lib_mode: []str
 }
 
-/**
- * parse_extern_libs_entry — fold one `[extern.libs]`/`[extern.libs.<key>]` `key = [ <spec…> ]`
- * line into `accum`. An empty array resolves the KEY itself to one flag (`-l<key>`); a
- * non-empty array resolves every element via `mf_extern_spec` (bare → `-l`, path/`*.a` → file,
- * `-flag` → verbatim), each carrying its declared linkage mode. Every resolved flag is pushed
- * alongside `key` (C7.20 — the same name an `extern fn … from "<key>"` binds to, so a later
- * reachability pass can filter a whole key's flags together even when one key fanned out to
- * several, e.g. a `-framework Name` pair). A global `[extern.libs]` entry (`is_os = false`) links
- * on every target; a `[extern.libs.<key>]` entry is DEFERRED with its section key and selected at
- * link time by `os_lib_key_matches` (C7.1f + the §4.2 os-arch fill) — so parsing stays
- * host-independent.
- *
- * @param accum  the accumulators so far
- * @param key    the manifest key being folded (the `from "<key>"` handle)
- * @param elems  the declared array elements ([] → the key resolves itself)
- * @param is_os  true for a `[extern.libs.<key>]` section (deferred), false for the global one
- * @param os     the section key of a deferred entry (a bare OS or a full os-arch name)
- * @return       the updated accumulators
- */
-fn parse_extern_libs_entry(accum: ExternLibsAccum, key: str, elems: []str, is_os: bool, os: str) -> ExternLibsAccum {
+fn parse_extern_libs_entry(accum: ExternLibsAccum, key: str, elems: []str, is_os: bool, os: str): ExternLibsAccum {
     if elems.len == 0 { return push_extern_lib_spec(accum, key, mf_extern_spec(key), is_os, os) }
-    mut acc = accum
-    mut ai = 0
+    var acc = accum
+    var ai = 0
     loop {
         if ai >= elems.len { break }
         acc = push_extern_lib_spec(acc, key, mf_extern_spec(elems[ai]), is_os, os)
@@ -390,236 +179,218 @@ fn parse_extern_libs_entry(accum: ExternLibsAccum, key: str, elems: []str, is_os
     acc
 }
 
-/**
- * push_extern_lib_spec — append one resolved spec (flag + mode, with its originating key) to
- * `accum`, routing to the global columns or the deferred per-section ones per `is_os`.
- *
- * @param accum  the accumulators so far
- * @param key    the originating manifest key
- * @param spec   the resolved flag + declared linkage mode
- * @param is_os  true to route into the deferred per-section columns
- * @param os     the section key of a deferred entry (ignored when `is_os` is false)
- * @return       the updated accumulators
- */
-fn push_extern_lib_spec(accum: ExternLibsAccum, key: str, spec: ExternLibSpec, is_os: bool, os: str) -> ExternLibsAccum {
+fn push_extern_lib_spec(accum: ExternLibsAccum, key: str, spec: ExternLibSpec, is_os: bool, os: str): ExternLibsAccum {
     if is_os {
         return ExternLibsAccum {
             link_flags = accum.link_flags; link_lib_name = accum.link_lib_name; link_mode = accum.link_mode
-            os_lib_os = teko::list::push(accum.os_lib_os, os)
-            os_lib_flag = teko::list::push(accum.os_lib_flag, spec.flag)
-            os_lib_name = teko::list::push(accum.os_lib_name, key)
-            os_lib_mode = teko::list::push(accum.os_lib_mode, spec.mode)
+            os_lib_os = [..accum.os_lib_os, os]
+            os_lib_flag = [..accum.os_lib_flag, spec.flag]
+            os_lib_name = [..accum.os_lib_name, key]
+            os_lib_mode = [..accum.os_lib_mode, spec.mode]
         }
     }
     ExternLibsAccum {
-        link_flags = teko::list::push(accum.link_flags, spec.flag)
-        link_lib_name = teko::list::push(accum.link_lib_name, key)
-        link_mode = teko::list::push(accum.link_mode, spec.mode)
+        link_flags = [..accum.link_flags, spec.flag]
+        link_lib_name = [..accum.link_lib_name, key]
+        link_mode = [..accum.link_mode, spec.mode]
         os_lib_os = accum.os_lib_os; os_lib_flag = accum.os_lib_flag; os_lib_name = accum.os_lib_name
         os_lib_mode = accum.os_lib_mode
     }
 }
 
-/**
- * HOST_TARGET — the os-arch name of the build host's native lane: the sole variant `teko test`
- * executes in 0.3.0.29, the default a `.tkr` inherits when it declares no `targets`, and the key the
- * regression runner resolves `[expect.<os-arch>]` overrides against. Named once so the manifest
- * default and the runner's execution lane cannot drift apart.
- */
 const HOST_TARGET: str = "host"
 
-/**
- * mf_read_str_list — read a `[tests]`-style list value that accepts BOTH the array form
- * `["a", "b"]` AND a bare quoted string `"a"` (normalized to a 1-element list), for the ergonomic
- * `regression = "dir"` ≡ `regression = ["dir"]` shorthand. Any other value form is an honest
- * error (M.3 — no coercion).
- *
- * @param s  the manifest line being parsed
- * @param p  the cursor at the value (past `=` and leading spaces)
- * @return   the parsed element list, or an `error` on a malformed value
- * @since 0.3.0.29
- */
-fn mf_read_str_list(s: str, p: u64) -> []str | error {
-    let c = mf_at(s, p)
+fn mf_read_str_list(s: str, p: u64): []str | error {
+    var c = mf_at(s, p)
     if c == b'[' {
-        let arr = match mf_read_array(s, p) { MfArray as a => a; error as e => return e }
+        var arr = match mf_read_array(s, p) { MfArray as a => a; error as e => return e }
         return arr.items
     }
     if c == b'"' {
-        let q = match mf_read_quoted(s, p) { MfQuoted as x => x; error as e => return e }
-        return teko::list::push(teko::list::empty(), q.text)
+        var q = match mf_read_quoted(s, p) { MfQuoted as x => x; error as e => return e }
+        return [q.text]
     }
     error { message = "expected a quoted string or an array value" }
 }
 
-/**
- * .tks mirror of manifest.c::tk_parse_manifest — the minimal TOML subset, one line at a
- * time; every malformed line is an honest error (M.3 — no coercion). `section` is tracked
- * as a tag string ("root"/"artifact"/"deps"/"aliases"/"coverage"/"tests"/"other").
- */
-fn parse_manifest(src: str) -> Manifest | error {
-    mut name = ""
-    mut source = ""
-    mut artifact = Artifact::Binary   // default (executable) until `[artifact] kind = "…"`
-    mut abi = ""
-    mut deps: []str = teko::list::empty()
-    mut aliases: []str = teko::list::empty()
-    mut version = ""
-    mut suffix = ""
-    mut description = ""   // `description = "…"` — embedded in the binary metadata (C7.1k)
-    mut platforms: []str = teko::list::empty()   // [platforms] targets — the OSes this project targets
-    mut cov_functions: u64 = 80   // D4 floors — default 80 when [coverage] / its keys are absent
-    mut cov_lines: u64 = 80
-    mut cov_branches: u64 = 80
-    mut link_flags: []str = teko::list::empty()   // [extern.libs] resolved cc link flags (C7.1e)
-    mut link_lib_name: []str = teko::list::empty()
-    mut link_mode: []str = teko::list::empty()
-    mut os_lib_os: []str = teko::list::empty()   // [extern.libs.<os>] — deferred per-OS flags, keyed by OS (C7.1f)
-    mut os_lib_flag: []str = teko::list::empty()   // [extern.libs.<os>] — the resolved flag (parallel to os_lib_os)
-    mut os_lib_name: []str = teko::list::empty()
-    mut os_lib_mode: []str = teko::list::empty()
-    mut cc = ""   // [extern] scalars (C7.1f) — cross/driver knobs
-    mut target = ""
-    mut sysroot = ""
-    mut freestanding = false
-    mut test_regression_files: []str = teko::list::empty()
-    mut test_gate = true
-    mut test_default_targets: []str = teko::list::push(teko::list::empty(), HOST_TARGET)
-    mut sec_os = ""   // the OS of the current `[extern.libs.<os>]` section
-    mut have_name = false
-    mut have_source = false
-    mut sec = "root"
+const ARTIFACT_KIND_BINARY: str = "binary"
 
-    mut p: u64 = 0
+const ARTIFACT_KIND_STATIC: str = "static"
+
+const ARTIFACT_KIND_SHARED: str = "shared"
+
+const ARTIFACT_KIND_PACKAGE: str = "package"
+
+const ARTIFACT_KIND_TOOL: str = "tool"
+
+type ArtifactKind = struct {
+    spelling: str
+    artifact: Artifact
+}
+
+fn artifact_kind_table(): []ArtifactKind {
+    [
+        ArtifactKind { spelling = ARTIFACT_KIND_BINARY; artifact = Artifact::Binary },
+        ArtifactKind { spelling = ARTIFACT_KIND_STATIC; artifact = Artifact::Static },
+        ArtifactKind { spelling = ARTIFACT_KIND_SHARED; artifact = Artifact::Shared },
+        ArtifactKind { spelling = ARTIFACT_KIND_PACKAGE; artifact = Artifact::Package },
+        ArtifactKind { spelling = ARTIFACT_KIND_TOOL; artifact = Artifact::Tool }
+    ]
+}
+
+fn artifact_kinds_listed(): str {
+    var rows = artifact_kind_table()
+    var out = ""
+    var i: u64 = 0
     loop {
-        if p >= src.len { break }
-        // slice the current line [p, eol); leave p past the newline for the next turn.
-        mut eol = p
-        loop {
-            if eol >= src.len { break }
-            if src[eol] == b'\n' { break }
-            eol = eol + 1
-        }
-        let line = teko::str::slice(src, p, eol)
-        if eol < src.len { p = eol + 1 } else { p = eol }
-
-        let i = mf_skip_spaces(line, 0)
-        let c = mf_at(line, i)
-
-        if c == 0 || c == b'#' {
-            // blank or comment line — skip
-        } else if c == b'[' {
-            // a table header `[name]`
-            let ke = mf_key_end(line, i + 1)
-            let nm = teko::str::slice(line, i + 1, ke)
-            let j = mf_skip_spaces(line, ke)
-            if mf_at(line, j) != b']' { return error { message = "malformed table header (expected ']')" } }
-            if nm == "artifact" { sec = "artifact" }
-            else if nm == "dependencies" { sec = "deps" }
-            else if nm == "aliases" { sec = "aliases" }
-            else if nm == "platforms" { sec = "platforms" }   // C7.1k: OSes this project targets (CI matrix)
-            else if nm == "coverage" { sec = "coverage" }
-            else if nm == "tests" { sec = "tests" }
-            else if nm == "extern.libs" { sec = "extern.libs" }   // C7.1e: libraries to link (all OSes)
-            else if mf_starts_with(nm, "extern.libs.") { sec = "extern.libs.os"; sec_os = teko::str::slice_from(nm, 12) }   // C7.1f: per-OS libs
-            else if nm == "extern" { sec = "extern" }   // C7.1f: cc/target/sysroot/freestanding scalars
-            else { sec = "other" }   // [extern.search] / unknown — deferred
-        } else {
-            // a `key = value` pair
-            let ke = mf_key_end(line, i)
-            if ke == i { return error { message = "malformed line (expected a key or '[table]')" } }
-            let key = teko::str::slice(line, i, ke)
-            let eq = mf_skip_spaces(line, ke)
-            if mf_at(line, eq) != b'=' { return error { message = "malformed key/value (expected '=')" } }
-            let v = mf_skip_spaces(line, eq + 1)
-
-            if sec == "root" {
-                // name / source / version / suffix are top-level quoted strings.
-                let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
-                if key == "name" { name = q.text; have_name = true }
-                else if key == "source" { source = q.text; have_source = true }
-                else if key == "version" { version = q.text }
-                else if key == "suffix" { suffix = q.text }
-                else if key == "description" { description = q.text }
-                // unknown top-level keys are ignored (forward-compatible — M.5).
-            } else if sec == "coverage" {
-                // [coverage] functions / lines / branches — UNQUOTED integer floors (default 80 each).
-                if key == "functions" { cov_functions = mf_read_int(line, v) }
-                else if key == "lines" { cov_lines = mf_read_int(line, v) }
-                else if key == "branches" { cov_branches = mf_read_int(line, v) }
-            } else if sec == "tests" {
-                if key == "regression" {
-                    test_regression_files = match mf_read_str_list(line, v) { []str as xs => xs; error as e => return e }
-                } else if key == "targets" {
-                    test_default_targets = match mf_read_str_list(line, v) { []str as xs => xs; error as e => return e }
-                } else if key == "gate" {
-                    test_gate = mf_at(line, v) == b't'
-                }
-            } else if sec == "artifact" {
-                // `kind = "binary" | "static" | "shared" | "package"` (C7.1m); unknown → Binary.
-                if key == "kind" {
-                    let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
-                    if q.text == "static" { artifact = Artifact::Static }
-                    else if q.text == "shared" { artifact = Artifact::Shared }
-                    else if q.text == "package" { artifact = Artifact::Package }
-                    else { artifact = Artifact::Binary }
-                }
-                if key == "abi" {
-                    let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
-                    if q.text == "c" { abi = "c" } else { abi = "" }
-                }
-            } else if sec == "deps" {
-                deps = teko::list::push(deps, key)
-            } else if sec == "aliases" {
-                aliases = teko::list::push(aliases, key)
-            } else if sec == "platforms" {
-                // [platforms] targets = ["macos", "linux", "windows"] — the OSes the project's CI builds.
-                if key == "targets" {
-                    let arr = match mf_read_array(line, v) { MfArray as a => a; error as e => return e }
-                    platforms = arr.items
-                }
-            } else if sec == "extern" {
-                // [extern] scalars (C7.1f): cc/target/sysroot are quoted strings; freestanding is a bool.
-                if key == "cc" || key == "target" || key == "sysroot" {
-                    let q = match mf_read_quoted(line, v) { MfQuoted as x => x; error as e => return e }
-                    if key == "cc" { cc = q.text } else if key == "target" { target = q.text } else { sysroot = q.text }
-                } else if key == "freestanding" {
-                    freestanding = mf_at(line, v) == b't'   // `true` → true, anything else → false
-                }
-                // `prefer` and other [extern] keys are ignored for now (static/shared mode deferred).
-            } else if sec == "extern.libs" || sec == "extern.libs.os" {
-                let arr = match mf_read_array(line, v) { MfArray as a => a; error as e => return e }
-                let accum = ExternLibsAccum { link_flags = link_flags; link_lib_name = link_lib_name; link_mode = link_mode; os_lib_os = os_lib_os; os_lib_flag = os_lib_flag; os_lib_name = os_lib_name; os_lib_mode = os_lib_mode }
-                let updated = parse_extern_libs_entry(accum, key, arr.items, sec == "extern.libs.os", sec_os)
-                link_flags = updated.link_flags
-                link_lib_name = updated.link_lib_name
-                link_mode = updated.link_mode
-                os_lib_os = updated.os_lib_os
-                os_lib_flag = updated.os_lib_flag
-                os_lib_name = updated.os_lib_name
-                os_lib_mode = updated.os_lib_mode
-            }
-            // "other" → keys ignored (M.5)
-        }
+        if i >= rows.len { break }
+        if i > 0 { out = out ~ ", " }
+        out = out ~ rows[i].spelling
+        i = i + 1
     }
+    out
+}
 
+fn artifact_from_kind(spelling: str): Artifact | error {
+    var rows = artifact_kind_table()
+    var i: u64 = 0
+    loop {
+        if i >= rows.len { break }
+        if rows[i].spelling == spelling { return rows[i].artifact }
+        i = i + 1
+    }
+    error { message = "unknown [artifact] kind \"" ~ spelling ~ "\" — accepted kinds: " ~ artifact_kinds_listed() }
+}
+
+fn mf2_str(t: toml::TomlValue, key: str, default: str): str {
+    match toml::toml_get(t, key) {
+        toml::TomlValue as v => if v.kind == toml::TomlKind::String { v.text } else { default }
+        null => default
+    }
+}
+
+fn mf2_bool(t: toml::TomlValue, key: str, default: bool): bool {
+    match toml::toml_get(t, key) {
+        toml::TomlValue as v => if v.kind == toml::TomlKind::Boolean { v.bool_val } else { default }
+        null => default
+    }
+}
+
+fn mf2_u64(t: toml::TomlValue, key: str, default: u64): u64 {
+    match toml::toml_get(t, key) {
+        toml::TomlValue as v => if v.kind == toml::TomlKind::Integer && v.int_val >= 0 { v.int_val to u64 } else { default }
+        null => default
+    }
+}
+
+fn mf2_table(t: toml::TomlValue, key: str): toml::TomlValue {
+    match toml::toml_get(t, key) {
+        toml::TomlValue as v => if v.kind == toml::TomlKind::Table { v } else { toml::toml_table_empty() }
+        null => toml::toml_table_empty()
+    }
+}
+
+fn mf2_value_to_str_list(v: toml::TomlValue): []str {
+    if v.kind == toml::TomlKind::String { return [v.text] }
+    if v.kind != toml::TomlKind::Array { return [] }
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= v.items.len { break }
+        if v.items[i].kind == toml::TomlKind::String { out = [..out, v.items[i].text] }
+        i++
+    }
+    out
+}
+
+fn mf2_str_list(t: toml::TomlValue, key: str): []str {
+    match toml::toml_get(t, key) {
+        toml::TomlValue as v => mf2_value_to_str_list(v)
+        null => []
+    }
+}
+
+fn mf2_fold_libs_table(accum: ExternLibsAccum, libs: toml::TomlValue, is_os: bool, os: str): ExternLibsAccum {
+    var acc = accum
+    var i: u64 = 0
+    loop {
+        if i >= libs.keys.len { break }
+        var key = libs.keys[i]
+        var val = libs.vals[i]
+        if val.kind == toml::TomlKind::Array {
+            acc = parse_extern_libs_entry(acc, key, mf2_value_to_str_list(val), is_os, os)
+        } else if val.kind == toml::TomlKind::Table {
+            acc = mf2_fold_libs_table(acc, val, true, key)
+        }
+        i++
+    }
+    acc
+}
+
+fn parse_manifest(src: str): Manifest | error {
+    var root = match toml::parse_toml(src) { toml::TomlValue as t => t; error as e => return e }
+
+    var name = ""
+    var have_name = false
+    match toml::toml_get(root, "name") {
+        toml::TomlValue as v => { have_name = true; if v.kind == toml::TomlKind::String { name = v.text } }
+        null => { }
+    }
+    var source = ""
+    var have_source = false
+    match toml::toml_get(root, "source") {
+        toml::TomlValue as v => { have_source = true; if v.kind == toml::TomlKind::String { source = v.text } }
+        null => { }
+    }
     if !have_name { return error { message = "manifest missing required field 'name'" } }
     if !have_source { return error { message = "manifest missing required field 'source'" } }
 
-    Manifest { name = name; artifact = artifact; abi = abi; source = source; deps = deps; aliases = aliases; version = version; suffix = suffix; description = description; platforms = platforms; cov_functions = cov_functions; cov_lines = cov_lines; cov_branches = cov_branches; link_flags = link_flags; link_lib_name = link_lib_name; link_mode = link_mode; os_lib_os = os_lib_os; os_lib_flag = os_lib_flag; os_lib_name = os_lib_name; os_lib_mode = os_lib_mode; cc = cc; target = target; sysroot = sysroot; freestanding = freestanding; test_regression_files = test_regression_files; test_gate = test_gate; test_default_targets = test_default_targets; backend = Backend::C }
+    var version = mf2_str(root, "version", "")
+    var suffix = mf2_str(root, "suffix", "")
+    var description = mf2_str(root, "description", "")
+
+    var artifact_table = mf2_table(root, "artifact")
+    var artifact = Artifact::Binary
+    match toml::toml_get(artifact_table, "kind") {
+        toml::TomlValue as v => {
+            var spelling = if v.kind == toml::TomlKind::String { v.text } else { "" }
+            artifact = match artifact_from_kind(spelling) { Artifact as a => a; error as e => return e }
+        }
+        null => { }
+    }
+    var abi_raw = mf2_str(artifact_table, "abi", "")
+    var abi = if abi_raw == "c" { "c" } else { "" }
+
+    var deps = mf2_table(root, "dependencies").keys
+    var aliases = mf2_table(root, "aliases").keys
+    var platforms = mf2_str_list(mf2_table(root, "platforms"), "targets")
+
+    var coverage_table = mf2_table(root, "coverage")
+    var cov_functions = mf2_u64(coverage_table, "functions", 80)
+    var cov_lines = mf2_u64(coverage_table, "lines", 80)
+    var cov_branches = mf2_u64(coverage_table, "branches", 80)
+
+    var tests_table = mf2_table(root, "tests")
+    var test_regression_files = mf2_str_list(tests_table, "regression")
+    var test_gate = mf2_bool(tests_table, "gate", true)
+    var test_default_targets = match toml::toml_get(tests_table, "targets") {
+        toml::TomlValue as v => mf2_value_to_str_list(v)
+        null => [HOST_TARGET]
+    }
+
+    var extern_table = mf2_table(root, "extern")
+    var cc = mf2_str(extern_table, "cc", "")
+    var target = mf2_str(extern_table, "target", "")
+    var sysroot = mf2_str(extern_table, "sysroot", "")
+    var freestanding = mf2_bool(extern_table, "freestanding", false)
+
+    var libs_table = mf2_table(extern_table, "libs")
+    var empty_accum = ExternLibsAccum { link_flags = []; link_lib_name = []; link_mode = []; os_lib_os = []; os_lib_flag = []; os_lib_name = []; os_lib_mode = [] }
+    var libs_accum = mf2_fold_libs_table(empty_accum, libs_table, false, "")
+
+    Manifest { name = name; artifact = artifact; abi = abi; source = source; deps = deps; aliases = aliases; version = version; suffix = suffix; description = description; platforms = platforms; cov_functions = cov_functions; cov_lines = cov_lines; cov_branches = cov_branches; link_flags = libs_accum.link_flags; link_lib_name = libs_accum.link_lib_name; link_mode = libs_accum.link_mode; os_lib_os = libs_accum.os_lib_os; os_lib_flag = libs_accum.os_lib_flag; os_lib_name = libs_accum.os_lib_name; os_lib_mode = libs_accum.os_lib_mode; cc = cc; target = target; sysroot = sysroot; freestanding = freestanding; test_regression_files = test_regression_files; test_gate = test_gate; test_default_targets = test_default_targets; backend = Backend::C }
 }
 
-/**
- * with_backend — a copy of `m` with its code-generation `backend` set to `b`, every other
- * field carried through unchanged. The `TEKO_BACKEND` resolver (`backend_of`, project.tks)
- * stamps the resolved selection onto the front-end's manifest with this before the artifact
- * dispatch reads `m.backend`; `parse_manifest` itself never sets a non-default backend, so the
- * manifest reader stays a pure `.tkp` → `Manifest` function (D1/#390).
- *
- * @param m  the manifest to copy
- * @param b  the resolved backend selection to stamp on the copy
- * @return   a new `Manifest` identical to `m` except for `backend = b`
- */
-fn with_backend(m: Manifest, b: Backend) -> Manifest {
+fn with_backend(m: Manifest, b: Backend): Manifest {
     Manifest { name = m.name; artifact = m.artifact; abi = m.abi; source = m.source; deps = m.deps; aliases = m.aliases; version = m.version; suffix = m.suffix; description = m.description; platforms = m.platforms; cov_functions = m.cov_functions; cov_lines = m.cov_lines; cov_branches = m.cov_branches; link_flags = m.link_flags; link_lib_name = m.link_lib_name; link_mode = m.link_mode; os_lib_os = m.os_lib_os; os_lib_flag = m.os_lib_flag; os_lib_name = m.os_lib_name; os_lib_mode = m.os_lib_mode; cc = m.cc; target = m.target; sysroot = m.sysroot; freestanding = m.freestanding; test_regression_files = m.test_regression_files; test_gate = m.test_gate; test_default_targets = m.test_default_targets; backend = b }
 }

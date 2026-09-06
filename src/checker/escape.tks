@@ -1,47 +1,9 @@
-// src/checker/escape.tks   (namespace 'teko::checker')
-//
-// THE ESCAPE CHECK (MEM Step 1 — the memory-model keystone). A conservative, ONE-DEPTH,
-// SECURITY-FIRST analysis over the typed AST: for one function it computes the set of LOCAL
-// variable names that ESCAPE the frame. The codegen reads this to decide whether a heap
-// allocation a function makes may be placed in a per-FUNCTION frame region (bulk-freed at
-// every exit edge) or must outlive the frame (allocated in root → leaked, which is SAFE).
-//
-// SOUNDNESS IS THE ABSOLUTE RULE (M.1/M.5): never classify an escaping allocation as
-// frame-local. When the analysis cannot PROVE an allocation is frame-local it is treated as
-// ESCAPING (a leak is safe; a use-after-free is a vulnerability). The analysis is therefore
-// intentionally INCOMPLETE — it frees only a provable subset.
-//
-// THE MODEL (no points-to graph — DEFERRED to a later, finer step):
-//   * A variable ESCAPES if any read of it (a `TVar`) appears in an ESCAPING position.
-//   * Escaping positions are: a `return` value; a TAIL expr-statement (an IMPLICIT RETURN — the
-//     trailing value of a function body or of an if/match branch whose value is returned, which
-//     codegen drop-then-returns: emit_block_tail/emit_exprstmt_tail); a call argument; a
-//     struct-init field value; an array / interpolation / `in` element; an assignment RHS; a
-//     binding RHS. (A call may retain its argument; a returned/stored value outlives the frame.)
-//     ALL of these propagate the escaping context DOWN into their sub-expressions.
-//   * The ONE refinement that lets a provable frame-local subset exist: reading a SCALAR field of
-//     a BARE LOCAL (`x.f` where `x` is a `TVar` AND `x.f`'s resolved type is `Prim`/`byte`/`bool`)
-//     yields a COPY of a STACK MEMBER — the struct local sits on the C stack and its scalar fields
-//     are stack members (boxed recursive back-edge fields are NEVER scalar), so the read embeds NO
-//     heap pointer and survives the frame-region drop. So `x` does NOT escape through that read.
-//     Any OTHER receiver — a nested field access (`a.b.y`: `.y` is scalar but `a.b` is a boxed heap
-//     hop), an index (`a[i]`: the element lives behind the slice's heap `.ptr`), a call result, a
-//     cast, … — conservatively inherits the OUTER (possibly escaping) context, because evaluating
-//     it dereferences an interior pointer (an auto-boxed back-edge / a heap-backed slice). The drop
-//     happens BEFORE the tail value is evaluated, so EVERY sub-read of the tail value runs post-drop
-//     — anything that derefs a frame-allocable cell must propagate escaping (UAF). When unsure,
-//     propagate escaping (a leak is SAFE; a use-after-free is a vulnerability).
-//
-// A `let`/`mut x = StructInit{…}` binding is FRAME-LOCAL iff `x` is NOT in the escaping set:
-// the struct value — and every heap cell auto-boxed inside it — dies with the frame, so the
-// allocation may go in the frame region. This is the only allocation the codegen frame-routes.
 
 use teko::parser
 use teko::lexer
 
-// str_set_has — membership in a name set (linear; sets are tiny — a function's locals).
-fn str_set_has(set: []str, name: str) -> bool {
-    mut i = 0
+fn str_set_has(set: []str, name: str): bool {
+    var i = 0
     loop {
         if i >= set.len { break }
         if set[i] == name { return true }
@@ -50,16 +12,12 @@ fn str_set_has(set: []str, name: str) -> bool {
     false
 }
 
-// str_set_add — add `name` if absent (kept deduped so codegen sees a stable set).
-fn str_set_add(set: []str, name: str) -> []str {
+fn str_set_add(set: []str, name: str): []str {
     if str_set_has(set, name) { return set }
-    teko::list::push(set, name)
+    [..set, name]
 }
 
-// type_is_scalar — a Prim / byte / bool. Reading a field of this type yields a pure value
-// COPY that carries NO interior heap pointer, so the receiver does not escape through it.
-// (str is a VIEW {ptr,len} that may alias — deliberately NOT scalar here, stays conservative.)
-fn type_is_scalar(t: Type) -> bool {
+fn type_is_scalar(t: @Type()): bool {
     match t {
         Prim => true
         Byte => true
@@ -67,61 +25,31 @@ fn type_is_scalar(t: Type) -> bool {
     }
 }
 
-// expr_is_bare_var — is `e` a DIRECT variable read (a `TVar`), with NO field-access / index /
-// call / cast / etc. wrapping it? The scalar-read non-escaping refinement is sound ONLY for a
-// scalar field of a BARE local: such a field is a STACK member of the struct value (boxed /
-// recursive back-edge fields are NEVER scalar), so it survives the frame-region drop and may be
-// read post-drop. For ANY non-bare receiver (a nested `a.b`, an index `a[i]`, a call result, …)
-// the receiver lives in the SAME (escaping) context — reading a scalar OFF it still derefs an
-// interior heap hop (e.g. `a.b.y`: `.y` is scalar but `a.b` is a boxed heap pointer into the
-// frame), so the refinement must NOT clear escaping there (MEM Step 1 UAF fix #2 — security).
-fn expr_is_bare_var(e: TExpr) -> bool {
+fn expr_is_bare_var(e: TExpr): bool {
     match e.kind {
         TVar => true
         _ => false
     }
 }
 
-/**
- * Walks `e`, adding every variable read in an ESCAPING position to `acc` IN PLACE — write-through
- * (0.3.1 adoption; the pre-adoption spelling threaded a `Ref<[]str>` cell), so the grown set is
- * visible to every caller through the one shared reference — no thread-and-return. `escaping` is
- * the context: true means a read here lets the variable outlive the frame. The `ref` param is
- * FORWARDED straight through to every recursive call (it is already a reference, no re-borrow).
- * The `str_set_add` call reads `acc.value` explicitly — passing a `ref`-bound argument bare where a
- * plain-value parameter is expected is not yet auto-deref'd by the checker's call-argument typing
- * (only operator/field-access/assignment contexts are); the explicit read stays legal (`.value` is
- * not hidden, only the `Ref<T>` type name is) and keeps this generation seed-buildable.
- *
- * @param e         the expression to walk
- * @param escaping  true when a read here outlives the enclosing frame
- * @param acc       the escaping-name accumulator (by-reference, write-through, grown in place)
- */
-fn mark_expr(e: TExpr, escaping: bool, ref acc: []str) -> void {
+fn mark_expr(e: TExpr, escaping: bool, ref acc: []str) {
     match e.kind {
-        // a bare variable read: it escapes only if read in an escaping context.
         TVar as v => if escaping { acc = str_set_add(acc.value, v.name) } else { }
 
-        // leaves with no variable reads.
         TNumber => { }
         TStrLit => { }
+        TByteStrLit => { }
         TByteLit => { }
         TCharLit => { }
         TBoolLit => { }
         TNullLit => { }
         TPathExpr => { }
 
-        // operators: operands inherit the OUTER context (a returned `a + b` returns both).
         TBinary as b => { mark_expr(b.left, escaping, acc); mark_expr(b.right, escaping, acc) }
         TUnary as u => mark_expr(u.operand, escaping, acc)
         TCompare as c => {
-            // a comparison RESULT is a bool (a pure copy), but the operands are EVALUATED in the
-            // outer context: when this comparison is the tail value (escaping=true) the operands
-            // run AFTER the frame-region drop, so a `a.b`-style operand dereferences a frame cell
-            // post-drop → propagate `escaping` (UAF audit). The bare-TVar scalar refinement still
-            // applies one level down (e.g. `a.val < b.val` keeps `a`/`b` frame-local).
             mark_expr(c.first, escaping, acc)
-            mut i = 0
+            var i = 0
             loop {
                 if i >= c.rest.len { break }
                 mark_expr(c.rest[i].operand, escaping, acc)
@@ -129,9 +57,8 @@ fn mark_expr(e: TExpr, escaping: bool, ref acc: []str) -> void {
             }
         }
 
-        // a call: every argument may be RETAINED by the callee → escaping (one-depth, conservative).
         TCall as call => {
-            mut i = 0
+            var i = 0
             loop {
                 if i >= call.args.len { break }
                 mark_expr(call.args[i], true, acc)
@@ -139,24 +66,14 @@ fn mark_expr(e: TExpr, escaping: bool, ref acc: []str) -> void {
             }
         }
 
-        // control-flow expressions: the branch bodies are statement blocks whose TAIL value inherits
-        // the outer context — when this if/match is itself in an escaping position (escaping=true,
-        // e.g. it is the function-body tail value that codegen drop-then-returns) each branch's
-        // trailing value IS returned and therefore escaping (MEM Step 1 UAF fix #1). The COND/GUARD
-        // is a bool test, but when the if/match is a SUB-expression of a tail value it is EVALUATED
-        // post-drop too (the whole tail value is emitted after the region drop), so a `a.b`-style
-        // cond would deref a frame cell → propagate `escaping` (UAF audit; safe over-marking).
         TIfExpr as f => {
             mark_expr(f.cond, escaping, acc)
             mark_block(f.then_blk, escaping, acc)
             if f.has_else { mark_block(f.else_blk, escaping, acc) }
         }
         TMatchExpr as m => {
-            // the subject is read to discriminate (and, for `as x` binds, may alias the bound
-            // sub-value) — inherit the outer context so a returned arm that surfaces the subject
-            // keeps it escaping. The guard is likewise post-drop in a tail position → escaping.
             mark_expr(m.subject, escaping, acc)
-            mut i = 0
+            var i = 0
             loop {
                 if i >= m.arms.len { break }
                 if m.arms[i].has_when { mark_expr(m.arms[i].guard, escaping, acc) }
@@ -165,43 +82,21 @@ fn mark_expr(e: TExpr, escaping: bool, ref acc: []str) -> void {
             }
         }
 
-        // a cast yields a fresh scalar/value — but the operand may itself be a var; inherit context.
         TCast as ct => mark_expr(ct.expr, escaping, acc)
 
-        // FIELD READ — the soundness-critical refinement. The scalar-read non-escaping refinement
-        // is SOUND ONLY for a scalar field of a BARE local (`x.f` where `x` is a TVar): that field
-        // is a STACK member of the struct value (recursive/boxed fields are never scalar), so it
-        // survives the frame-region drop. For ANY non-bare receiver (`a.b.y`, `a[i].y`, a call
-        // result, …) the receiver is in the SAME (escaping) context — reading a scalar OFF it still
-        // derefs an interior heap hop (`a.b` is a boxed frame pointer) → propagate escaping (UAF
-        // fix #2). Otherwise (non-scalar result, or non-bare receiver) inherit the outer context.
         TFieldAccess as fa => {
-            let refine = type_is_scalar(e.type) && expr_is_bare_var(fa.receiver)
-            let recv_ctx = if refine { false } else { escaping }
+            var refine = type_is_scalar(e.type) && expr_is_bare_var(fa.receiver)
+            var recv_ctx = if refine { false } else { escaping }
             mark_expr(fa.receiver, recv_ctx, acc)
         }
-        TSafeFieldAccess as sfa => {
-            let refine = type_is_scalar(e.type) && expr_is_bare_var(sfa.receiver)
-            let recv_ctx = if refine { false } else { escaping }
-            mark_expr(sfa.receiver, recv_ctx, acc)
-        }
-        TCoalesce as co => { mark_expr(co.left, escaping, acc); mark_expr(co.right, escaping, acc) }
 
-        // INDEX READ (`a[i]`) — a slice/array is ALWAYS heap-backed, so an index read DEREFERENCES a
-        // heap pointer. There is NO bare-local stack-member analogue (the elements live behind the
-        // slice's `.ptr`), so in an escaping context the receiver is ESCAPING — no scalar refinement
-        // for an index (UAF fix #2). The index sub-expression is also EVALUATED in the outer context
-        // (post-drop when escaping=true), so a `a.b`-style index dereferences a frame cell → it too
-        // propagates `escaping`; the bare-TVar scalar refinement still keeps `a[x.i]` ⇒ `x` local.
         TIndex as ix => {
             mark_expr(ix.receiver, escaping, acc)
             mark_expr(ix.index, escaping, acc)
         }
 
-        // aggregate constructors: every component is STORED into a value that takes the outer
-        // context (a returned struct/array carries its components out of the frame).
         TStructInit as si => {
-            mut i = 0
+            var i = 0
             loop {
                 if i >= si.field_vals.len { break }
                 mark_expr(si.field_vals[i], escaping, acc)
@@ -209,27 +104,24 @@ fn mark_expr(e: TExpr, escaping: bool, ref acc: []str) -> void {
             }
         }
         TArrayLit as al => {
-            mut i = 0
+            var i = 0
             loop {
                 if i >= al.elements.len { break }
                 mark_expr(al.elements[i].expr, escaping, acc)
                 i++
             }
         }
+        TSliceOfLen as s => mark_expr(s.size, escaping, acc)
+        TZeroOf => { }
         TInterp as ip => {
-            // an interpolation BUILDS a fresh str; its holes are rendered (copied) into it and never
-            // alias the result. But the holes are EVALUATED in the outer context: when the interp is
-            // the tail value (escaping=true) they render AFTER the frame-region drop, so a `a.b`-style
-            // hole dereferences a frame cell post-drop → propagate `escaping` (UAF audit). The
-            // bare-TVar scalar refinement still keeps `"{x.val}"` frame-local one level down.
-            mut i = 0
+            var i = 0
             loop {
                 if i >= ip.holes.len { break }
                 mark_expr(ip.holes[i], escaping, acc)
                 if i < ip.specs.len {
                     match ip.specs[i].kind {
                         TFSpecDynamic as fd => {
-                            mut k = 0
+                            var k = 0
                             loop { if k >= fd.args.len { break }; mark_expr(fd.args[k], escaping, acc); k++ }
                         }
                         _ => { }
@@ -239,25 +131,16 @@ fn mark_expr(e: TExpr, escaping: bool, ref acc: []str) -> void {
             }
         }
         TInExpr as ine => {
-            // `x in [ … ]` yields a bool, but lhs/elems are EVALUATED (and compared) in the outer
-            // context: when the `in` is the tail value (escaping=true) they run AFTER the frame-region
-            // drop, so a `a.b`-style operand dereferences a frame cell post-drop → propagate
-            // `escaping` (UAF audit). The bare-TVar scalar refinement still applies one level down.
             mark_expr(ine.lhs, escaping, acc)
-            mut i = 0
+            var i = 0
             loop {
                 if i >= ine.elems.len { break }
                 mark_expr(ine.elems[i], escaping, acc)
                 i++
             }
         }
-        // (W10) a closure literal: its CAPTURES are vars of THIS function read into the closure's env.
-        // When the closure value escapes (escaping context), its captures escape with it — mark them so
-        // they allocate in the enclosing/root region (sound over-approximation; a by-copy capture is a
-        // snapshot, but over-marking only routes more to root, never a UAF). The body belongs to the
-        // LIFTED function, so it is NOT walked here.
         TLambda as lam => {
-            mut i = 0
+            var i = 0
             loop {
                 if i >= lam.captures.len { break }
                 if escaping { acc = str_set_add(acc.value, lam.captures[i].name) }
@@ -266,121 +149,120 @@ fn mark_expr(e: TExpr, escaping: bool, ref acc: []str) -> void {
         }
 
         TBorrow as b => mark_expr(b.operand, escaping, acc)
+        TBlockExpr as b => mark_block(b.body, escaping, acc)
     }
 }
 
-/**
- * Walks a statement block, threading the escaping-var accumulator. `tail` is TRUE when this
- * block's TRAILING value is RETURNED (the function/branch tail) — codegen drops the frame region
- * BEFORE that value and `return`s it (`emit_block_tail`/`emit_exprstmt_tail`), so the last
- * statement, when it is a value-bearing expr-statement, must be analysed in an ESCAPING context
- * (MEM Step 1 UAF fix). All NON-last statements are interior (`tail = false`). A `tail = false`
- * block (a loop/defer body, or a discarded if/match branch) discards its trailing value.
- *
- * @param body  the statement block to walk
- * @param tail  true iff the block's trailing value is returned
- * @param acc   the escaping-name accumulator (by-reference, write-through, grown in place)
- */
-fn mark_block(body: []TStatement, tail: bool, ref acc: []str) -> void {
-    mut i = 0
+fn mark_class_holder_escape(elem: TExpr, ref acc: []str) {
+    mark_expr(elem, true, acc)
+}
+
+fn mark_block(body: []@TStatement(), tail: bool, ref acc: []str) {
+    var i = 0
     loop {
         if i >= body.len { break }
-        let is_last = i + 1 == body.len
+        var is_last = i + 1 == body.len
         mark_stmt(body[i], tail && is_last, acc)
         i++
     }
 }
 
-/**
- * Walks one statement, establishing the escaping context per position. `tail` is TRUE only for
- * the block's LAST statement when that block's trailing value is returned: an expr-statement
- * there is an IMPLICIT RETURN (B.20/W5a) whose value codegen produces AFTER dropping the frame
- * region, so it must be ESCAPING (not discarded).
- *
- * @param s     the statement to walk
- * @param tail  true iff `s` is the block's last statement and its trailing value is returned
- * @param acc   the escaping-name accumulator (by-reference, write-through, grown in place)
- */
-fn mark_stmt(s: TStatement, tail: bool, ref acc: []str) -> void {
+fn mark_stmt(s: @TStatement(), tail: bool, ref acc: []str) {
     match s {
-        // a binding RHS escapes (the value lives on through the bound name; conservatively the
-        // name may itself later escape — we do not run a second fixpoint pass).
         TBinding as b => mark_expr(b.value, true, acc)
-        // an assignment RHS escapes (it may be written into an outer/captured location). (#88) a FIELD
-        // write stores into an object that OUTLIVES the frame (a class is cell-backed; a struct field
-        // write escapes through its `mut` root), so the receiver's reads are escaping too.
         TAssign as a => {
-            // (S2 Level-1) SELF-APPEND carve-out: `xs = teko::list::push(xs, item)` grows xs in place —
-            // the base read of xs is CONSUMED by the write-back (the old buffer is copied into the grown
-            // one and replaced), so it does NOT escape through this statement. Mark ONLY the appended
-            // item (still conservatively escaping); leaving the base UNmarked lets a non-escaping
-            // accumulator be proven frame-local (single-pass, no fixpoint — item stays over-marked, which
-            // is always safe). Any OTHER read of xs (return/arg/alias/index) still marks it escaping via
-            // its own position, so a truly-escaping accumulator is never frame-routed.
             if assign_is_self_append(a) {
-                mark_expr(self_append_item(a), true, acc)
+                mark_self_append_items(a, acc)
             } else {
                 mark_expr(a.value, true, acc)
                 if parser::assign_has_target(a.kind) { mark_expr(a.target, true, acc) }
             }
         }
-        // a return value escapes the frame entirely.
         TReturn as r => if r.has_value { mark_expr(r.value, true, acc) } else { }
-        // an expression-statement: DISCARDED (value unused → NON-escaping) UNLESS it is in TAIL
-        // position, where it is an implicit RETURN whose value escapes the frame (codegen
-        // drop-then-returns it). Nested calls/returns inside still escape via their own positions.
         TExprStmt as es => mark_expr(es.expr, tail, acc)
-        // a loop body's trailing expr is NOT a return (a loop exits via break) → NON-tail.
         TLoopStmt as l => { mark_block(l.init, false, acc); mark_block(l.body, false, acc) }
         TBreakStmt => { }
         TContinueStmt => { }
-        // a defer body's trailing expr is run for effect, NOT a return → NON-tail.
         TDeferStmt as d => mark_block(d.body, false, acc)
         TAdoptStmt as a => mark_block(a.body, false, acc)
+        TBlockStmt as b => mark_block(b.body, false, acc)
+        TSpawn as sp => mark_expr(sp.call, false, acc)
     }
 }
 
-// fn_escaping_vars — the per-function escape set: every local that outlives the frame. PUBLIC:
-// the codegen (both engines) and the checker test read it. A function's PARAMETERS are immutable
-// inputs (B.21) and never frame-allocated here, so they need no entry. The body is analysed in
-// TAIL position: its trailing value-bearing expr-statement is an IMPLICIT RETURN (escaping).
-pub fn fn_escaping_vars(f: TFunction) -> []str {
-    mut acc: []str = teko::list::empty()
+pub fn fn_escaping_vars(f: TFunction): []str {
+    var acc: []str = []
     mark_block(f.body, true, acc)
     acc
 }
 
-// binding_is_frame_local — does this binding's value allocate into the frame region? True iff
-// it is a `let`/`mut` to a SIMPLE name that is NOT in the escaping set AND whose value is a
-// struct-init (the only codegen allocation site that can be frame-routed — the auto-boxed
-// recursive back-edge). A `const`, a destructure, a discard (`_`), an escaping name, or any
-// non-struct-init value is NOT frame-local (→ allocates in root, the safe default). PUBLIC.
-pub fn binding_is_frame_local(escaping: []str, b: TBinding) -> bool {
-    let name = match b.target {
+pub fn fn_frees_old_vars(f: TFunction): []str {
+    var acc: []str = []
+    collect_frees_old_names(f.body, f.body, acc)
+    acc
+}
+
+fn collect_frees_old_names(fn_body: []@TStatement(), body: []@TStatement(), ref acc: []str) {
+    var i = 0
+    loop {
+        if i >= body.len { break }
+        collect_frees_old_stmt(fn_body, body[i], acc)
+        i++
+    }
+}
+
+fn collect_frees_old_stmt(fn_body: []@TStatement(), s: @TStatement(), ref acc: []str) {
+    match s {
+        TAssign as a => {
+            if (assign_is_self_append(a) || assign_is_self_concat(a)) && !str_set_has(acc.value, a.name) && assign_frees_old(fn_body, a) {
+                acc = str_set_add(acc.value, a.name)
+            }
+        }
+        TExprStmt as es => collect_frees_old_expr(fn_body, es.expr, acc)
+        TLoopStmt as l => { collect_frees_old_names(fn_body, l.init, acc); collect_frees_old_names(fn_body, l.body, acc) }
+        TDeferStmt as d => collect_frees_old_names(fn_body, d.body, acc)
+        TAdoptStmt as a => collect_frees_old_names(fn_body, a.body, acc)
+        TBlockStmt as b => collect_frees_old_names(fn_body, b.body, acc)
+        TBinding => { }
+        TReturn => { }
+        TBreakStmt => { }
+        TContinueStmt => { }
+        TSpawn as sp => collect_frees_old_expr(fn_body, sp.call, acc)
+    }
+}
+
+fn collect_frees_old_expr(fn_body: []@TStatement(), e: TExpr, ref acc: []str) {
+    match e.kind {
+        TIfExpr as f => {
+            collect_frees_old_names(fn_body, f.then_blk, acc)
+            if f.has_else { collect_frees_old_names(fn_body, f.else_blk, acc) }
+        }
+        TMatchExpr as m => {
+            var i = 0
+            loop { if i >= m.arms.len { break }; collect_frees_old_names(fn_body, m.arms[i].body, acc); i++ }
+        }
+        _ => { }
+    }
+}
+
+pub fn binding_is_frame_local(escaping: []str, b: TBinding): bool {
+    var name = match b.target {
         parser::SimpleName as sn => sn.name
         parser::DestructurePattern => return false
     }
     if name == "_" { return false }
     if b.kind == parser::BindKind::Const { return false }
     if str_set_has(escaping, name) { return false }
-    match b.value.kind {
-        TStructInit => true
-        _ => false
-    }
+    true
 }
 
-// (S2 Level-1) tcall_is_list_push — is this call `…::list::push(base, item)`, the one true grow
-// intrinsic? Matched by the path tail (`list`, `push`) so any spelling of the namespace works.
-fn tcall_is_list_push(c: TCall) -> bool {
-    let segs = c.callee.segments
+fn tcall_is_list_push(c: TCall): bool {
+    var segs = c.callee.segments
     if segs.len < 2 { return false }
     segs[segs.len - 1].name == "push" && segs[segs.len - 2].name == "list"
 }
 
-// (S2 Level-1) assign_is_self_append — is `a` exactly `xs = teko::list::push(xs, item)` (a plain
-// SIMPLE name write whose RHS grows the SAME name)? Only this shape earns the base-read carve-out;
-// a field/deref write, a different target, or any other RHS keeps the conservative escaping mark.
-fn assign_is_self_append(a: TAssign) -> bool {
+pub fn assign_is_self_append(a: TAssign): bool {
     match a.kind { parser::AssignKind::Simple => { }; _ => return false }
     match a.value.kind {
         TCall as c => {
@@ -391,27 +273,68 @@ fn assign_is_self_append(a: TAssign) -> bool {
                 _ => false
             }
         }
+        TArrayLit as al => {
+            if al.elements.len < 1 { return false }
+            if !al.elements[0].is_spread { return false }
+            match al.elements[0].expr.kind {
+                TVar as v => v.name == a.name
+                _ => false
+            }
+        }
         _ => false
     }
 }
 
-// (S2 Level-1) self_append_item — the APPENDED element (arg1) of a self-append. Precondition:
-// assign_is_self_append(a) held; the fallback (whole RHS) is never reached on that path.
-fn self_append_item(a: TAssign) -> TExpr {
-    match a.value.kind {
-        TCall as c => c.args[1]
-        _ => a.value
+fn tcall_is_str_concat_callee(c: TCall): bool {
+    var segs = c.callee.segments
+    if segs.len == 0 { return false }
+    var last = segs[segs.len - 1].name
+    if last != "concat" && last != "str_concat" { return false }
+    if segs.len == 1 { return true }
+    segs[0].name == "teko"
+}
+
+fn concat_first_arg_is_var(c: TCall, name: str): bool {
+    if c.args.len < 1 { return false }
+    match c.args[0].kind {
+        TVar as v => v.name == name
+        TArrayLit as al => {
+            if al.elements.len < 1 { return false }
+            if al.elements[0].is_spread { return false }
+            match al.elements[0].expr.kind {
+                TVar as v => v.name == name
+                _ => false
+            }
+        }
+        _ => false
     }
 }
 
-// (S2 Level-1) assign_routes_to_frame — THE routing predicate: should this assignment's grown slice
-// buffer be allocated in the function frame region (freed when the frame drops)? True iff it is a
-// self-append `xs = push(xs, …)` whose target xs is a NON-escaping slice, so its whole buffer history
-// dies with the frame. The codegen and the escape carve-out (mark_stmt) SHARE this exact shape — they
-// must never disagree: a routed push whose base the carve-out did NOT exempt could leave xs escaping
-// (leak, safe) but a base the carve-out exempted that codegen does NOT route just stays on root (also
-// safe). Coupling them here keeps both correct by construction. PUBLIC (codegen reads it).
-pub fn assign_routes_to_frame(escaping: []str, a: TAssign) -> bool {
+pub fn assign_is_self_concat(a: TAssign): bool {
+    match a.kind { parser::AssignKind::Simple => { }; _ => return false }
+    if !is_str_type(a.bound) { return false }
+    match a.value.kind {
+        TCall as c => tcall_is_str_concat_callee(c) && concat_first_arg_is_var(c, a.name)
+        _ => false
+    }
+}
+
+fn mark_self_append_items(a: TAssign, ref acc: []str) {
+    match a.value.kind {
+        TCall as c => if c.args.len == 2 { mark_class_holder_escape(c.args[1], acc) } else { }
+        TArrayLit as al => {
+            var i: u64 = 1
+            loop {
+                if i >= al.elements.len { break }
+                mark_class_holder_escape(al.elements[i].expr, acc)
+                i++
+            }
+        }
+        _ => { }
+    }
+}
+
+pub fn assign_routes_to_frame(escaping: []str, a: TAssign): bool {
     if !assign_is_self_append(a) { return false }
     if str_set_has(escaping, a.name) { return false }
     match a.bound {
@@ -420,51 +343,43 @@ pub fn assign_routes_to_frame(escaping: []str, a: TAssign) -> bool {
     }
 }
 
-// ── (#148 S2 Level-2) LINEAR-CHAIN proof — free-old-on-grow. ─────────────────────────────
-// The C twin's lists realloc (freeing the old buffer per grow); the generated code RETAINS every
-// dead doubling in the arena — the measured gen-1-vs-gen-0 memory gap. For a PROVABLY LINEAR
-// accumulator chain, each copy-grow may park the OLD buffer on the runtime free-list for reuse
-// (realloc parity). THE PROOF (v1, conservative — any doubt routes to root, a safe leak):
-//   1. the name is BORN EXACTLY ONCE in the fn, from `…::list::empty()` (no shared buffer at birth,
-//      no shadowing to conflate the counts below);
-//   2. EVERY write to the name is a self-append `xs = push(xs, …)` (no rebinding to an alias);
-//   3. the READ EQUATION: every read of the name is a self-append base — EXCEPT reads in the fn's
-//      FINAL statement (nothing pushes after it, so capturing the final buffer there is safe).
-//      total_reads(body) - reads(final stmt) == n_self_appends  ⇒  no mid-chain capture exists,
-//      so no alias can observe a parked (freed) intermediate buffer.
-
-// per-name WRITE statistics across a whole fn body (reads are counted by count_reads_*).
 type ChainStats = struct { births_empty: i64; births_other: i64; other_writes: i64; self_appends: i64 }
 
-fn cs_zero() -> ChainStats { ChainStats { births_empty = 0; births_other = 0; other_writes = 0; self_appends = 0 } }
-fn cs_add(a: ChainStats, b: ChainStats) -> ChainStats {
+fn cs_zero(): ChainStats { ChainStats { births_empty = 0; births_other = 0; other_writes = 0; self_appends = 0 } }
+fn cs_add(a: ChainStats, b: ChainStats): ChainStats {
     ChainStats { births_empty = a.births_empty + b.births_empty; births_other = a.births_other + b.births_other; other_writes = a.other_writes + b.other_writes; self_appends = a.self_appends + b.self_appends }
 }
 
-// is this binding's value exactly `…::list::empty()` (the fresh-buffer birth)?
-fn binding_value_is_list_empty(b: TBinding) -> bool {
+fn binding_value_is_list_empty(b: TBinding): bool {
     match b.value.kind {
         TCall as c => {
-            let segs = c.callee.segments
+            var segs = c.callee.segments
             if segs.len < 2 { return false }
             segs[segs.len - 1].name == "empty" && segs[segs.len - 2].name == "list"
         }
+        TArrayLit as al => al.elements.len == 0
         _ => false
     }
 }
 
-// walk an expr for STATEMENT BLOCKS embedded in if/match arms (bindings/assigns live there too).
-fn chain_stats_expr(e: TExpr, name: str) -> ChainStats {
+fn binding_value_is_empty_str(b: TBinding): bool {
+    match b.value.kind {
+        TStrLit as s => s.text.len == 0
+        _ => false
+    }
+}
+
+fn chain_stats_expr(e: TExpr, name: str): ChainStats {
     match e.kind {
         TIfExpr as f => {
-            mut s = chain_stats_expr(f.cond, name)
+            var s = chain_stats_expr(f.cond, name)
             s = cs_add(s, chain_stats_block(f.then_blk, name))
             if f.has_else { s = cs_add(s, chain_stats_block(f.else_blk, name)) }
             s
         }
         TMatchExpr as m => {
-            mut s = chain_stats_expr(m.subject, name)
-            mut i = 0
+            var s = chain_stats_expr(m.subject, name)
+            var i = 0
             loop {
                 if i >= m.arms.len { break }
                 if m.arms[i].has_when { s = cs_add(s, chain_stats_expr(m.arms[i].guard, name)) }
@@ -476,44 +391,42 @@ fn chain_stats_expr(e: TExpr, name: str) -> ChainStats {
         TBinary as b => cs_add(chain_stats_expr(b.left, name), chain_stats_expr(b.right, name))
         TUnary as u => chain_stats_expr(u.operand, name)
         TCompare as c => {
-            mut s = chain_stats_expr(c.first, name)
-            mut i = 0
+            var s = chain_stats_expr(c.first, name)
+            var i = 0
             loop { if i >= c.rest.len { break }; s = cs_add(s, chain_stats_expr(c.rest[i].operand, name)); i++ }
             s
         }
         TCall as call => {
-            mut s = cs_zero()
-            mut i = 0
+            var s = cs_zero()
+            var i = 0
             loop { if i >= call.args.len { break }; s = cs_add(s, chain_stats_expr(call.args[i], name)); i++ }
             s
         }
         TCast as ct => chain_stats_expr(ct.expr, name)
         TFieldAccess as fa => chain_stats_expr(fa.receiver, name)
-        TSafeFieldAccess as sfa => chain_stats_expr(sfa.receiver, name)
-        TCoalesce as co => cs_add(chain_stats_expr(co.left, name), chain_stats_expr(co.right, name))
         TIndex as ix => cs_add(chain_stats_expr(ix.receiver, name), chain_stats_expr(ix.index, name))
         TStructInit as si => {
-            mut s = cs_zero()
-            mut i = 0
+            var s = cs_zero()
+            var i = 0
             loop { if i >= si.field_vals.len { break }; s = cs_add(s, chain_stats_expr(si.field_vals[i], name)); i++ }
             s
         }
         TArrayLit as al => {
-            mut s = cs_zero()
-            mut i = 0
+            var s = cs_zero()
+            var i = 0
             loop { if i >= al.elements.len { break }; s = cs_add(s, chain_stats_expr(al.elements[i].expr, name)); i++ }
             s
         }
         TInterp as ip => {
-            mut s = cs_zero()
-            mut i = 0
+            var s = cs_zero()
+            var i = 0
             loop {
                 if i >= ip.holes.len { break }
                 s = cs_add(s, chain_stats_expr(ip.holes[i], name))
                 if i < ip.specs.len {
                     match ip.specs[i].kind {
                         TFSpecDynamic as fd => {
-                            mut k = 0
+                            var k = 0
                             loop { if k >= fd.args.len { break }; s = cs_add(s, chain_stats_expr(fd.args[k], name)); k++ }
                         }
                         _ => { }
@@ -524,23 +437,24 @@ fn chain_stats_expr(e: TExpr, name: str) -> ChainStats {
             s
         }
         TInExpr as ine => {
-            mut s = chain_stats_expr(ine.lhs, name)
-            mut i = 0
+            var s = chain_stats_expr(ine.lhs, name)
+            var i = 0
             loop { if i >= ine.elems.len { break }; s = cs_add(s, chain_stats_expr(ine.elems[i], name)); i++ }
             s
         }
-        _ => cs_zero()   // leaves + TLambda (its body is a LIFTED fn — not this frame's chain)
+        TBlockExpr as b => chain_stats_block(b.body, name)
+        _ => cs_zero()
     }
 }
 
-fn chain_stats_stmt(s: TStatement, name: str) -> ChainStats {
+fn chain_stats_stmt(s: @TStatement(), name: str): ChainStats {
     match s {
         TBinding as b => {
-            mut st = chain_stats_expr(b.value, name)
+            var st = chain_stats_expr(b.value, name)
             match b.target {
                 parser::SimpleName as sn => {
                     if sn.name == name {
-                        if binding_value_is_list_empty(b) { st = cs_add(st, ChainStats { births_empty = 1; births_other = 0; other_writes = 0; self_appends = 0 }) }
+                        if binding_value_is_list_empty(b) || binding_value_is_empty_str(b) { st = cs_add(st, ChainStats { births_empty = 1; births_other = 0; other_writes = 0; self_appends = 0 }) }
                         else { st = cs_add(st, ChainStats { births_empty = 0; births_other = 1; other_writes = 0; self_appends = 0 }) }
                     }
                 }
@@ -549,10 +463,10 @@ fn chain_stats_stmt(s: TStatement, name: str) -> ChainStats {
             st
         }
         TAssign as a => {
-            mut st = chain_stats_expr(a.value, name)
+            var st = chain_stats_expr(a.value, name)
             if parser::assign_has_target(a.kind) { st = cs_add(st, chain_stats_expr(a.target, name)) }
             if a.name == name {
-                if assign_is_self_append(a) { st = cs_add(st, ChainStats { births_empty = 0; births_other = 0; other_writes = 0; self_appends = 1 }) }
+                if assign_is_self_append(a) || assign_is_self_concat(a) { st = cs_add(st, ChainStats { births_empty = 0; births_other = 0; other_writes = 0; self_appends = 1 }) }
                 else { st = cs_add(st, ChainStats { births_empty = 0; births_other = 0; other_writes = 1; self_appends = 0 }) }
             }
             st
@@ -564,84 +478,94 @@ fn chain_stats_stmt(s: TStatement, name: str) -> ChainStats {
         TContinueStmt => cs_zero()
         TDeferStmt as d => chain_stats_block(d.body, name)
         TAdoptStmt as a => chain_stats_block(a.body, name)
+        TBlockStmt as b => chain_stats_block(b.body, name)
+        TSpawn as sp => chain_stats_expr(sp.call, name)
     }
 }
 
-fn chain_stats_block(body: []TStatement, name: str) -> ChainStats {
-    mut s = cs_zero()
-    mut i: u64 = 0
+fn chain_stats_block(body: []@TStatement(), name: str): ChainStats {
+    var s = cs_zero()
+    var i: u64 = 0
     loop { if i >= body.len { break }; s = cs_add(s, chain_stats_stmt(body[i], name)); i++ }
     s
 }
 
-// assign_frees_old — may THIS self-append's copy-grow PARK the old buffer for reuse? True iff the
-// whole-fn linear-chain proof above holds for the assigned name. PUBLIC (codegen reads it).
-pub fn assign_frees_old(fn_body: []TStatement, a: TAssign) -> bool {
-    if !assign_is_self_append(a) { return false }
-    let st = chain_stats_block(fn_body, a.name)
-    if st.births_empty != 1 { return false }   // born exactly once, from empty()
-    if st.births_other != 0 { return false }   // no shadow / no aliasing rebirth
-    if st.other_writes != 0 { return false }   // writes are self-append only
-    let total = count_reads_block(fn_body, a.name)
+fn name_escapes_body(fn_body: []@TStatement(), name: str): bool {
+    var esc: []str = []
+    mark_block(fn_body, true, esc)
+    str_set_has(esc, name)
+}
+
+pub fn assign_frees_old(fn_body: []@TStatement(), a: TAssign): bool {
+    if !assign_is_self_append(a) && !assign_is_self_concat(a) { return false }
+    if name_escapes_body(fn_body, a.name) { return false }
+    var st = chain_stats_block(fn_body, a.name)
+    if st.births_empty != 1 { return false }
+    if st.births_other != 0 { return false }
+    if st.other_writes != 0 { return false }
+    var total = count_reads_block(fn_body, a.name)
     if fn_body.len == 0 { return false }
-    let last_reads = count_reads_stmt(fn_body[fn_body.len - 1], a.name)
-    let last_st = chain_stats_stmt(fn_body[fn_body.len - 1], a.name)
+    var last_reads = count_reads_stmt(fn_body[fn_body.len - 1], a.name)
+    var last_st = chain_stats_stmt(fn_body[fn_body.len - 1], a.name)
     if last_st.self_appends > 0 {
-        // the FINAL statement itself pushes (a tail loop/match building the chain): a capture inside
-        // it could precede a later push ON THE SAME PATH — unprovable syntactically. Allow only when
-        // its reads are EXACTLY its own self-append bases (no capture there at all).
         if last_reads != last_st.self_appends { return false }
         return total == st.self_appends
     }
-    total - last_reads == st.self_appends   // every non-final read is a self-append base
+    total - last_reads == st.self_appends
 }
 
-// binding_is_frame_local_slice — (S2 Level-1) a SLICE binding whose buffer never leaves the frame:
-// a `let`/`mut` SIMPLE name, NOT const, NOT in the escaping set, whose bound type is a slice. Unlike
-// the struct-init predicate the value need not be an allocation site — a slice accumulator is BUILT
-// by later `xs = push(xs, …)` self-appends (each routed to the frame region); this predicate marks
-// that the frame is NEEDED and the name is a non-escaping slice. PUBLIC (the codegen reads it).
-pub fn binding_is_frame_local_slice(escaping: []str, b: TBinding) -> bool {
-    let name = match b.target {
+fn named_type_is_slice_backed(n: Named, table: TypeTable, visited: []str): bool {
+    if str_set_has(visited, n.name) { return false }
+    match type_table_find(table, n.name, "") {
+        parser::TypeDecl as td => type_decl_is_slice_backed(td, table, str_set_add(visited, n.name))
+        error => false
+    }
+}
+
+fn type_decl_is_slice_backed(td: parser::TypeDecl, table: TypeTable, visited: []str): bool {
+    match td.body {
+        parser::NewtypeBody as nb => type_expr_is_slice_backed(nb.backing, table, visited, type_ns_of(table, td.name))
+        parser::AliasBody as ab => type_expr_is_slice_backed(ab.alias, table, visited, type_ns_of(table, td.name))
+        _ => false
+    }
+}
+
+fn type_expr_is_slice_backed(te: @TypeExpr(), table: TypeTable, visited: []str, owner_ns: str): bool {
+    match resolve_type(te, table, owner_ns) {
+        (@Type()) as t => bound_type_is_slice_backed(t, table, visited)
+        error => false
+    }
+}
+
+fn bound_type_is_slice_backed(t: @Type(), table: TypeTable, visited: []str): bool {
+    match t {
+        Slice => true
+        Named as n => named_type_is_slice_backed(n, table, visited)
+        _ => false
+    }
+}
+
+pub fn type_is_slice_backed(t: @Type(), table: TypeTable): bool {
+    bound_type_is_slice_backed(t, table, [])
+}
+
+pub fn binding_is_frame_local_slice(escaping: []str, table: TypeTable, b: TBinding): bool {
+    var name = match b.target {
         parser::SimpleName as sn => sn.name
         parser::DestructurePattern => return false
     }
     if name == "_" { return false }
     if b.kind == parser::BindKind::Const { return false }
     if str_set_has(escaping, name) { return false }
-    match b.bound {
-        Slice => true
-        _ => false
-    }
+    type_is_slice_backed(b.bound, table)
 }
 
-// ── S2 — PER-BLOCK escape (block-local freeing). ──────────────────────────────
-// W8 frees only a per-FUNCTION subset; S2 lets a scope-introducing BLOCK (a loop body, an
-// if-then/else block, a match arm) free its OWN provably-block-local allocations at the block's
-// every exit edge. The SAFETY INVARIANT is identical and absolute: when in ANY doubt route the
-// binding to the ENCLOSING region (behave as W8 — a leak is safe, a use-after-free is NEVER).
-//
-// THE BLOCK-ESCAPE CONDITION (security-first, conservative): a binding `x` declared directly in
-// block B may be freed at B's exit ONLY IF every textual READ of `x` in the whole function is a
-// read in a NON-TAIL position strictly inside B. We prove this by counting reads:
-//   total reads of `x` in the function body == non-tail reads of `x` inside B.
-// Any read OUTSIDE B, or a read in B's TAIL value (an arm/if value used outside B — the UAF trap),
-// makes the counts differ ⇒ x is treated as block-ESCAPING ⇒ routed to the enclosing region. This
-// single condition subsumes all four prompt rules: (2) function-escape (those reads sit in escaping
-// positions OUTSIDE B too — actually they may be inside B, but binding_is_frame_local already gates
-// (1)+(2)); (3) arm/if tail-value escape (the tail read is excluded from the inside count); (4)
-// `outerVar = x` (the read sits in an assignment whose statement is inside B but the WRITE escapes —
-// to stay sound we also treat a read flowing into ANY assignment RHS as escaping by NOT excluding
-// assignment statements from the "tail/escaping" reads). Shadowed/same-named siblings just lose the
-// optimization (counts differ) — never unsafe.
-
-// count_reads_expr — total count of bare-variable reads of `name` anywhere in `e` (every position;
-// no escaping refinement — a read is a read for reachability purposes).
-fn count_reads_expr(e: TExpr, name: str) -> i64 {
+fn count_reads_expr(e: TExpr, name: str): i64 {
     match e.kind {
         TVar as v => if v.name == name { 1 } else { 0 }
         TNumber => 0
         TStrLit => 0
+        TByteStrLit => 0
         TByteLit => 0
         TCharLit => 0
         TBoolLit => 0
@@ -650,8 +574,8 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
         TBinary as b => count_reads_expr(b.left, name) + count_reads_expr(b.right, name)
         TUnary as u => count_reads_expr(u.operand, name)
         TCompare as c => {
-            mut n = count_reads_expr(c.first, name)
-            mut i = 0
+            var n = count_reads_expr(c.first, name)
+            var i = 0
             loop {
                 if i >= c.rest.len { break }
                 n = n + count_reads_expr(c.rest[i].operand, name)
@@ -660,8 +584,8 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
             n
         }
         TCall as call => {
-            mut n: i64 = 0
-            mut i = 0
+            var n: i64 = 0
+            var i = 0
             loop {
                 if i >= call.args.len { break }
                 n = n + count_reads_expr(call.args[i], name)
@@ -670,14 +594,14 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
             n
         }
         TIfExpr as f => {
-            mut n = count_reads_expr(f.cond, name)
+            var n = count_reads_expr(f.cond, name)
             n = n + count_reads_block(f.then_blk, name)
             if f.has_else { n = n + count_reads_block(f.else_blk, name) }
             n
         }
         TMatchExpr as m => {
-            mut n = count_reads_expr(m.subject, name)
-            mut i = 0
+            var n = count_reads_expr(m.subject, name)
+            var i = 0
             loop {
                 if i >= m.arms.len { break }
                 if m.arms[i].has_when { n = n + count_reads_expr(m.arms[i].guard, name) }
@@ -688,12 +612,10 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
         }
         TCast as ct => count_reads_expr(ct.expr, name)
         TFieldAccess as fa => count_reads_expr(fa.receiver, name)
-        TSafeFieldAccess as sfa => count_reads_expr(sfa.receiver, name)
-        TCoalesce as co => count_reads_expr(co.left, name) + count_reads_expr(co.right, name)
         TIndex as ix => count_reads_expr(ix.receiver, name) + count_reads_expr(ix.index, name)
         TStructInit as si => {
-            mut n: i64 = 0
-            mut i = 0
+            var n: i64 = 0
+            var i = 0
             loop {
                 if i >= si.field_vals.len { break }
                 n = n + count_reads_expr(si.field_vals[i], name)
@@ -702,8 +624,8 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
             n
         }
         TArrayLit as al => {
-            mut n: i64 = 0
-            mut i = 0
+            var n: i64 = 0
+            var i = 0
             loop {
                 if i >= al.elements.len { break }
                 n = n + count_reads_expr(al.elements[i].expr, name)
@@ -711,16 +633,18 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
             }
             n
         }
+        TSliceOfLen as s => count_reads_expr(s.size, name)
+        TZeroOf => 0
         TInterp as ip => {
-            mut n: i64 = 0
-            mut i = 0
+            var n: i64 = 0
+            var i = 0
             loop {
                 if i >= ip.holes.len { break }
                 n = n + count_reads_expr(ip.holes[i], name)
                 if i < ip.specs.len {
                     match ip.specs[i].kind {
                         TFSpecDynamic as fd => {
-                            mut k = 0
+                            var k = 0
                             loop { if k >= fd.args.len { break }; n = n + count_reads_expr(fd.args[k], name); k++ }
                         }
                         _ => { }
@@ -731,8 +655,8 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
             n
         }
         TInExpr as ine => {
-            mut n = count_reads_expr(ine.lhs, name)
-            mut i = 0
+            var n = count_reads_expr(ine.lhs, name)
+            var i = 0
             loop {
                 if i >= ine.elems.len { break }
                 n = n + count_reads_expr(ine.elems[i], name)
@@ -740,19 +664,17 @@ fn count_reads_expr(e: TExpr, name: str) -> i64 {
             }
             n
         }
-        // (W10) a closure literal reads `name` ONCE if it captures it (the snapshot/alias at creation);
-        // the body's reads belong to the lifted function, not this one.
         TLambda as lam => {
-            mut i = 0
+            var i = 0
             loop { if i >= lam.captures.len { break }; if lam.captures[i].name == name { return 1 }; i++ }
             0
         }
         TBorrow as b => count_reads_expr(b.operand, name)
+        TBlockExpr as b => count_reads_block(b.body, name)
     }
 }
 
-// count_reads_stmt — total reads of `name` in one statement (all sub-positions).
-fn count_reads_stmt(s: TStatement, name: str) -> i64 {
+fn count_reads_stmt(s: @TStatement(), name: str): i64 {
     match s {
         TBinding as b => count_reads_expr(b.value, name)
         TAssign as a => count_reads_expr(a.value, name) + (if parser::assign_has_target(a.kind) { count_reads_expr(a.target, name) } else { 0 })
@@ -763,13 +685,14 @@ fn count_reads_stmt(s: TStatement, name: str) -> i64 {
         TContinueStmt => 0
         TDeferStmt as d => count_reads_block(d.body, name)
         TAdoptStmt as a => count_reads_block(a.body, name)
+        TBlockStmt as b => count_reads_block(b.body, name)
+        TSpawn as sp => count_reads_expr(sp.call, name)
     }
 }
 
-// count_reads_block — total reads of `name` across every statement of a block.
-fn count_reads_block(body: []TStatement, name: str) -> i64 {
-    mut n: i64 = 0
-    mut i = 0
+fn count_reads_block(body: []@TStatement(), name: str): i64 {
+    var n: i64 = 0
+    var i = 0
     loop {
         if i >= body.len { break }
         n = n + count_reads_stmt(body[i], name)
@@ -778,22 +701,17 @@ fn count_reads_block(body: []TStatement, name: str) -> i64 {
     n
 }
 
-// count_block_local_reads — reads of `name` strictly inside block B that are SAFE to free past:
-// every read EXCEPT (a) the block's TAIL value when B yields a value (an arm/if value used outside
-// B), and (b) any read that is the RHS of an ASSIGN statement (could write to an enclosing var).
-// A binding's own initializer never reads its own name, so the binding statement contributes 0.
-fn count_block_local_reads(body: []TStatement, name: str, is_value: bool) -> i64 {
-    mut n: i64 = 0
-    mut i = 0
+fn count_block_local_reads(body: []@TStatement(), name: str, is_value: bool): i64 {
+    var n: i64 = 0
+    var i = 0
     loop {
         if i >= body.len { break }
-        let is_last = i + 1 == body.len
+        var is_last = i + 1 == body.len
         match body[i] {
-            // an assignment RHS may flow into an ENCLOSING-scope variable → treat as escaping
-            // (do NOT count as a safe inside read), so `outerVar = x` blocks block-local freeing.
-            TAssign => { }
+            TAssign as a => {
+                if a.name == name && (assign_is_self_append(a) || assign_is_self_concat(a)) { n = n + count_reads_expr(a.value, name) }
+            }
             TExprStmt as es => {
-                // the block's TAIL expr-statement is the block VALUE when B yields one → escaping.
                 if is_value && is_last { } else { n = n + count_reads_expr(es.expr, name) }
             }
             _ => { n = n + count_reads_stmt(body[i], name) }
@@ -803,19 +721,13 @@ fn count_block_local_reads(body: []TStatement, name: str, is_value: bool) -> i64
     n
 }
 
-// binding_is_block_local — may binding `b` (declared at the TOP LEVEL of block B, whose enclosing
-// function body is `fn_body`, and which yields a value iff `is_value`) be freed at B's exit edges?
-// True iff binding_is_frame_local holds (struct-init, simple non-escaping name) AND every textual
-// read of the name in the WHOLE function is a SAFE non-tail/non-assign read strictly inside B.
-// CONSERVATIVE: any read outside B, in B's tail value, or as an assignment RHS ⇒ false ⇒ route to
-// the enclosing region (the W8/leak-safe default). PUBLIC — both codegen engines read it.
-pub fn binding_is_block_local(escaping: []str, fn_body: []TStatement, block_body: []TStatement, is_value: bool, b: TBinding) -> bool {
+pub fn binding_is_block_local(escaping: []str, fn_body: []@TStatement(), block_body: []@TStatement(), is_value: bool, b: TBinding): bool {
     if !binding_is_frame_local(escaping, b) { return false }
-    let name = match b.target {
+    var name = match b.target {
         parser::SimpleName as sn => sn.name
         parser::DestructurePattern => return false
     }
-    let total = count_reads_block(fn_body, name)
-    let inside = count_block_local_reads(block_body, name, is_value)
+    var total = count_reads_block(fn_body, name)
+    var inside = count_block_local_reads(block_body, name, is_value)
     total == inside
 }

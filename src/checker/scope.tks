@@ -1,731 +1,612 @@
-// src/checker/scope.tks  (namespace 'teko::checker')
 
 use teko::parser
 
-/**
- * ValBinding — one value binding in the checker environment: a name, its resolved type, whether it
- * is a `mut` local, its declaring namespace (top-level fns/consts only), and whether it names a
- * module-level `const`. The namespace drives namespace-aware CALL resolution (#41); `is_const`
- * distinguishes a `const` reference from an ordinary value so a forward reference resolves in pass-1
- * and the crumb-5 inliner can find it (#594).
- *
- * @param name      the bound identifier
- * @param type      the binding's resolved value type
- * @param is_mut    true ONLY for a `mut` local; let/const/params/match-bindings are false (B.21)
- * @param ns        the declaring namespace of a top-level fn/const; "" for locals/params (#41)
- * @param is_const  true iff this names a module-level `const` (#594 crumb 2)
- * @param vis       the declaring visibility of a top-level `const` — gates a namespace-qualified
- *                  value reference `ns::NAME` across namespaces (`Pub` for locals/params/fns, which
- *                  this arm never visibility-gates) (#594 crumb 8c, issue #613)
- */
-type ValBinding = struct {
+pub type ValBinding = struct {
     name: str
-    type: Type
+    type: @Type()
     is_mut: bool
     ns: str
     is_const: bool
     vis: parser::Visibility
+    is_global: bool
 }
 
-// the environment: a FLAT list of bindings PLUS the namespace currently being type-checked, so an
-// UNQUALIFIED call resolves to a same-namespace function rather than a global bare-name collision
-// (#41). Later bindings shadow earlier (lexical); block scoping is implicit. (Mirror of C tk_env.)
-// `owner_type` (W10b.CLASS) — the DECLARING class of the method body CURRENTLY being typed ("" —
-// not inside any class method, e.g. a free function or top-level statement). Set ONLY by
-// type_method, to the class that ORIGINALLY WROTE this body (own method: itself; inherited,
-// not-overridden method: the ancestor that declared it) — NEVER the class it's being re-typed
-// FOR, which may differ (increment 2's per-owning-class re-stamping). Drives `intern`/private
-// member-access enforcement (a field/method is reachable only from its declaring class's own
-// code, or — if `is_intern` — from a subclass's own code too).
-// (#148) TWO-SEGMENT env: `base` holds the SEALED collected globals (every top-level fn/method
-// signature — hundreds of KB), `bindings` the per-scope locals. The checker extends one collected
-// env NON-LINEARLY (every function/arm forks from the same base), and a single flat list made each
-// fork COPY the whole global segment on its first define (measured 1.3 GB / 4.5k copies of ~287 KB
-// on a self-build). Sealing the globals once (seal(), called by the typer between collect and the
-// typing loop) makes a fork copy only its OWN locals — a few dozen entries. Lookups scan bindings
-// innermost-first, THEN base innermost-first (locals shadow globals; global order preserved).
-/** (U2, the 0.1.0.0-beta memory+unsafe remodel #333) `fn_unsafe` — is the fn body CURRENTLY
- *  being typed effectively `unsafe` (its own `is_unsafe`, OR the enclosing type's for a
- *  method — the same `method_is_effective_unsafe` OR-rule `collect.tks::method_func_type`
- *  applies)? Set ONCE by `type_function` (and the method-body typer) before typing the
- *  body, so the local-binding containment gate (`type_binding`) can read it without any
- *  extra parameter threaded through every statement/expression typer — same shape as
- *  `owner_type`. `false` for every non-`unsafe` fn (the overwhelming default), so a
- *  corpus with zero `unsafe` types types byte-identically. */
-/** `file` — the source file of the item CURRENTLY being typed, set once per item by
- *  `type_item` (`with_file`), exactly like `cur_ns`/`owner_type`/`fn_unsafe` above and for
- *  the same reason: a per-item fact the deep expression typers need without threading a
- *  parameter through every one of them.
- *
- *  WHO NEEDS IT AND WHY IT DID NOT EXIST BEFORE: only a WARNING does. An ERROR is returned
- *  upward and `surface_at` stamps the file on it at item level, where the file is already in
- *  hand — so for the checker's entire error surface this field would be dead weight. A
- *  warning has no return path: `warn_redundant_cast` (D1) prints at the moment of detection
- *  and must name the file ITSELF or emit a bare `451:23:` that cannot distinguish
- *  `typer.tks` from `encode_x86_64.tks`. Any future checker warning inherits the same need.
- *
- *  `""` when unset (the unit tests' `env_empty`), which renders as a position with no file —
- *  degraded but never wrong. */
-pub type Env = struct { base: []ValBinding; bindings: []ValBinding; cur_ns: str; owner_type: str; di: DiRegistry; injects: []DiInjectBind; fn_unsafe: bool; file: str }
-
-// an empty env (no bindings, no current namespace, not inside any class method).
-pub fn env_empty() -> Env { Env { base = teko::list::empty(); bindings = teko::list::empty(); cur_ns = ""; owner_type = ""; di = di_registry_empty(); injects = teko::list::empty(); fn_unsafe = false; file = "" } }
-
-/** (W10c/MEM-3) set the program DI registry once — the typer seeds it onto the base env after the
- *  DI pass so `type_function` can resolve each `#inject` binding to its provider. */
-pub fn with_di(env: Env, di: DiRegistry) -> Env {
-    Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; di = di; injects = env.injects; fn_unsafe = env.fn_unsafe; file = env.file }
+pub fn fn_binding(name: str, t: @Type(), ns: str, is_global: bool): ValBinding {
+    ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = false; vis = parser::Visibility::Pub; is_global = is_global }
 }
 
-/** (W10c/MEM-3) set the DI-injected locals in scope for the fn body about to be typed. */
-pub fn with_injects(env: Env, injects: []DiInjectBind) -> Env {
-    Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = injects; fn_unsafe = env.fn_unsafe; file = env.file }
+pub fn const_binding(name: str, t: @Type(), ns: str, vis: parser::Visibility, is_global: bool): ValBinding {
+    ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = true; vis = vis; is_global = is_global }
 }
 
-/**
- * (U2) set whether the fn body about to be typed is effectively `unsafe` — read by the
- * local-binding containment gate in `type_binding`.
- *
- * @param Env env  the environment about to type a fn body
- * @param bool fn_unsafe  is the fn (own flag OR, for a method, its enclosing type's) unsafe?
- * @return Env  `env` with `fn_unsafe` set
- */
-pub fn with_fn_unsafe(env: Env, fn_unsafe: bool) -> Env {
-    Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = fn_unsafe; file = env.file }
+pub fn env_with_bindings(env: Env, bindings: []ValBinding): Env {
+    Env { base_slots = env.base_slots; bindings = bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; file = env.file; base_index = env.base_index; ret_expected = env.ret_expected; explicit = env.explicit }
 }
 
-/** (W10c/MEM-3) the DI-injected binding named `name` in scope, or an error if none — the signal a
- *  `type_var` uses to decide whether to lower the read into a materializer call. */
-pub fn lookup_inject(env: Env, name: str) -> DiInjectBind | error {
-    mut i = env.injects.len
+pub type Env = struct { base_slots: []ValBinding; bindings: []ValBinding; cur_ns: str; owner_type: str; file: str; base_index: NameIndex; ret_expected: @Type(); explicit: bool }
+
+pub fn env_empty(): Env { Env { base_slots = []; bindings = []; cur_ns = ""; owner_type = ""; file = ""; base_index = nidx_empty(); ret_expected = Void { }; explicit = false } }
+
+pub fn with_explicit(env: Env, on: bool): Env { Env { base_slots = env.base_slots; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; file = env.file; base_index = env.base_index; ret_expected = env.ret_expected; explicit = on } }
+
+pub fn seal(env: Env): Env {
+    var b = [..env.base_slots, ..env.bindings];
+    Env { base_slots = b; bindings = []; cur_ns = env.cur_ns; owner_type = env.owner_type; file = env.file; base_index = nidx_build(nidx_names_of(b)); ret_expected = env.ret_expected; explicit = env.explicit }
+}
+
+pub fn with_ns(env: Env, ns: str): Env { Env { base_slots = env.base_slots; bindings = env.bindings; cur_ns = ns; owner_type = env.owner_type; file = env.file; base_index = env.base_index; ret_expected = env.ret_expected; explicit = env.explicit } }
+
+pub fn with_file(env: Env, file: str): Env { Env { base_slots = env.base_slots; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; file = file; base_index = env.base_index; ret_expected = env.ret_expected; explicit = env.explicit } }
+
+pub fn with_owner(env: Env, owner: str): Env { Env { base_slots = env.base_slots; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = owner; file = env.file; base_index = env.base_index; ret_expected = env.ret_expected; explicit = env.explicit } }
+
+pub fn with_ret_expected(env: Env, t: @Type()): Env { Env { base_slots = env.base_slots; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; file = env.file; base_index = env.base_index; ret_expected = t; explicit = env.explicit } }
+
+fn binding_is_writable(t: @Type(), is_mut: bool): bool {
+    if is_mut { return true }
+    match t { Reference => true; _ => false }
+}
+
+pub fn define(env: Env, name: str, t: @Type(), is_mut: bool): Env {
+    Env { base_slots = env.base_slots; bindings = [..env.bindings, ValBinding { name = name; type = t; is_mut = binding_is_writable(t, is_mut); ns = ""; is_const = false; vis = parser::Visibility::Pub; is_global = false }]; cur_ns = env.cur_ns; owner_type = env.owner_type; file = env.file; base_index = env.base_index; ret_expected = env.ret_expected; explicit = env.explicit }
+}
+
+pub fn define_fn(env: Env, name: str, t: @Type(), ns: str, is_global: bool): Env {
+    Env { base_slots = env.base_slots; bindings = [..env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = false; vis = parser::Visibility::Pub; is_global = is_global }]; cur_ns = env.cur_ns; owner_type = env.owner_type; file = env.file; base_index = env.base_index; ret_expected = env.ret_expected; explicit = env.explicit }
+}
+
+pub fn define_const(env: Env, name: str, t: @Type(), ns: str, vis: parser::Visibility, is_global: bool): Env {
+    Env { base_slots = env.base_slots; bindings = [..env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = true; vis = vis; is_global = is_global }]; cur_ns = env.cur_ns; owner_type = env.owner_type; file = env.file; base_index = env.base_index; ret_expected = env.ret_expected; explicit = env.explicit }
+}
+
+fn bind_is_mut(k: parser::BindKind): bool { k == parser::BindKind::Var }
+
+fn nidx_names_of(b: []ValBinding): []str {
+    var names: [b.len]str = []
+    var i: u64 = 0
     loop {
-        if i == 0 { break }
-        i = i - 1
-        if env.injects[i].name == name { return env.injects[i] }
+        if i >= b.len { break }
+        names[i] = b[i].name
+        i++
     }
-    error { message = $"no injected binding named {name}" }
+    names
 }
 
-// (#148) seal — move the accumulated bindings into the immutable `base` segment. Called ONCE per
-// collected env, at the collect→type boundary; later defines land in the fresh `bindings`.
-pub fn seal(env: Env) -> Env {
-    mut b = env.base
-    mut i: u64 = 0
-    loop { if i >= env.bindings.len { break }; b = teko::list::push(b, env.bindings[i]); i++ }
-    Env { base = b; bindings = teko::list::empty(); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe; file = env.file }
-}
-
-// (#41) set the namespace currently being type-checked — the typed pass sets it per item.
-pub fn with_ns(env: Env, ns: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe; file = env.file } }
-
-/**
- * with_file — set the source file of the item about to be typed. The twin of `with_ns`, set
- * from the same place (`type_item`) off the same `parser::Item`, and read only by the checker's
- * WARNING surface, which has no return path to be positioned on (see the `file` field's own
- * note).
- *
- * @param env   the environment to derive from
- * @param file  the item's source file path as the parser recorded it
- * @return      `env` with `file` set
- * @since       0.3.1
- */
-pub fn with_file(env: Env, file: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe; file = file } }
-
-// (W10b.CLASS) set the DECLARING class of the method body about to be typed ("" clears it —
-// used when entering a free function).
-pub fn with_owner(env: Env, owner: str) -> Env { Env { base = env.base; bindings = env.bindings; cur_ns = env.cur_ns; owner_type = owner; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe; file = env.file } }
-
-// define a LOCAL name (append). `is_mut`: a `mut` binding passes true; everything else false (B.21).
-// Locals carry no namespace ("").
-pub fn define(env: Env, name: str, t: Type, is_mut: bool) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = is_mut; ns = ""; is_const = false; vis = parser::Visibility::Pub }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe; file = env.file }
-}
-
-// (#41) define a TOP-LEVEL FUNCTION binding carrying its declaring namespace.
-pub fn define_fn(env: Env, name: str, t: Type, ns: str) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = false; vis = parser::Visibility::Pub }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe; file = env.file }
-}
-
-/**
- * define_const — bind a module-level `const` name to its resolved type in the pass-1 environment so
- * a forward reference (another const, or a fn body naming a const declared later in the file)
- * resolves before pass-2 types the initializer (#594 crumb 2). Reuses the value-binding path with
- * `is_const = true`, carrying the const's declaring namespace, mirroring `define_fn`.
- *
- * @param env   the pass-1 environment being accumulated
- * @param name  the constant's identifier
- * @param t     the constant's resolved value type
- * @param ns    the namespace the const is declared in
- * @param vis   the const's declaring visibility — gates a cross-namespace `ns::NAME` reference to a
- *              `private` const (#594 crumb 8c, issue #613)
- * @return      `env` extended with the const binding
- * @since #594
- */
-pub fn define_const(env: Env, name: str, t: Type, ns: str, vis: parser::Visibility) -> Env {
-    Env { base = env.base; bindings = teko::list::push(env.bindings, ValBinding { name = name; type = t; is_mut = false; ns = ns; is_const = true; vis = vis }); cur_ns = env.cur_ns; owner_type = env.owner_type; di = env.di; injects = env.injects; fn_unsafe = env.fn_unsafe; file = env.file }
-}
-
-// a binding is mutable iff declared `mut` (Let and Const are immutable — B.21).
-fn bind_is_mut(k: parser::BindKind) -> bool { k == parser::BindKind::Mut }
-
-// the WHOLE binding (type + mutability), innermost first — for the `mut` write-guard (B.21).
-fn lookup_binding(env: Env, name: str) -> ValBinding | error {
-    mut i = env.bindings.len
+fn lookup_binding(env: Env, name: str): ValBinding | error {
+    var i = env.bindings.len
     loop {
         if i == 0 { break }
         i = i - 1
         if env.bindings[i].name == name { return env.bindings[i] }
     }
-    mut j = env.base.len   // (#148) then the sealed globals (locals shadow)
+    var h = teko::runtime::str_hash(name)
+    var best: i64 = -1
+    var k = nidx_lower_bound(env.base_index, h)
     loop {
-        if j == 0 { break }
-        j = j - 1
-        if env.base[j].name == name { return env.base[j] }
+        if k >= env.base_index.slots.len { break }
+        if env.base_index.slots[k].hash != h { break }
+        var p = env.base_index.slots[k].pos
+        if env.base_slots[p].name == name && (p to i64) > best { best = p to i64 }
+        k++
     }
+    if best >= 0 { return env.base_slots[best to u64] }
     error { message = $"undefined name: {name}" }
 }
 
-/**
- * lookup_value_in_ns — the value binding named `name` whose declaring namespace satisfies the
- * qualifier `ns`, or an error when none exists. Unlike `lookup_binding` (name-only, tail-first), this
- * filters by BOTH the name AND the namespace — the resolver for a namespace-qualified value spelling
- * `ns::name` (#594 crumb 8c, issue #613). The namespace test is `qualifier_selects_ns` (the SAME
- * ends-with rule `lookup_call` applies to a qualified callee), so the SHORT written qualifier `m1`
- * matches a binding declared in the project-rooted namespace `proj::m1`. The MATCHED binding's FULL
- * namespace (`b.ns`) is what the caller stamps onto `TVar.func_ns` — never the short qualifier — so
- * the c8b `(name, namespace)`-keyed scalar inliner (which keys on the const's OWN full namespace)
- * substitutes a qualified const identically to a bare one. Scans the mutable bindings innermost-first,
- * then the sealed globals (a dep's exported const/fn is a global).
- *
- * @param env   the type-checking environment
- * @param name  the value's bare name (the path's last segment)
- * @param ns    the written qualifier namespace (the path minus its last segment)
- * @return      the matching binding, or an "unknown value: ns::name" error
- * @since #594
- */
-fn lookup_value_in_ns(env: Env, name: str, ns: str) -> ValBinding | error {
-    mut i = env.bindings.len
+fn lookup_value_in_ns(env: Env, name: str, ns: str): ValBinding | error {
+    var i = env.bindings.len
     loop {
         if i == 0 { break }
         i = i - 1
         if env.bindings[i].name == name && qualifier_selects_ns(env.bindings[i].ns, ns) { return env.bindings[i] }
     }
-    mut j = env.base.len
+    var j = env.base_slots.len
     loop {
         if j == 0 { break }
         j = j - 1
-        if env.base[j].name == name && qualifier_selects_ns(env.base[j].ns, ns) { return env.base[j] }
+        if env.base_slots[j].name == name && qualifier_selects_ns(env.base_slots[j].ns, ns) { return env.base_slots[j] }
     }
     error { message = $"unknown value: {ns}::{name}" }
 }
 
-// the type of a name — the common case; a thin wrapper so existing callers are unchanged.
-fn lookup(env: Env, name: str) -> Type | error {
+fn lookup(env: Env, name: str): @Type() | error {
     match lookup_binding(env, name) { ValBinding as b => b.type; error as e => e }
 }
 
-// (#41) the LAST `::`-segment of a namespace ("teko::lexer" -> "lexer").
-fn ns_last_seg(ns: str) -> str {
-    mut cut: u64 = 0
-    mut i: u64 = 0
+fn ns_last_seg(ns: str): str {
+    var cut: u64 = 0
+    var i: u64 = 0
     loop {
         if i + 1 >= ns.len { break }
         if ns[i] == b':' && ns[i + 1] == b':' { cut = i + 2 }
         i++
     }
-    slice(ns, cut, ns.len)
+    ns.slice(cut, ns.len)
 }
 
-/**
- * Does the binding namespace `b_ns` satisfy the QUALIFIER of a qualified call callee? The qualifier
- * is every segment of `callee` before the last (the called name), joined with `::`. A binding
- * matches when its namespace equals that FULL qualifier, or ends with `::<qualifier>` — the same
- * R0-R5 rule `qualifier_selects_ns` already applies to type references. Keying off the FULL
- * qualifier (not merely its last segment) disambiguates two same-bare classes across namespaces:
- * a class method's ns is `owner::…::Class` (collect's `method_ns` convention), and the method
- * dispatch callee carries `[..owner.., Class, method]` (#290, #109-family). A plain `ns::fn` call
- * is unaffected — its qualifier is the target namespace, matched exactly as before.
- *
- * @param b_ns    the candidate binding's declaring namespace (never empty at the call site)
- * @param callee  the qualified call callee (`callee.segments.len > 1`)
- * @return        true iff `b_ns` equals or ends-with the callee's full `::`-joined qualifier
- * @since onda-3 (#290)
- */
-fn ns_matches_call_qualifier(b_ns: str, callee: parser::Path) -> bool {
+fn ns_matches_call_qualifier(b_ns: str, callee: parser::Path): bool {
     qualifier_selects_ns(b_ns, path_qualifier(callee, callee.segments.len - 1))
 }
 
-/**
- * Does binding `b` resolve the call `callee` in env `env`? An UNQUALIFIED callee (`ns`-less) binds a
- * LOCAL (ns empty) or a function in the CURRENT namespace; a QUALIFIED callee binds a function whose
- * namespace satisfies the callee's full qualifier (`ns_matches_call_qualifier`). Shared by
- * `lookup_call` and `call_ns` so both scans apply one identical rule.
- *
- * @param b         a candidate value binding (already known to share the callee's last-segment name)
- * @param callee    the call callee path
- * @param cur_ns    the calling namespace (for the unqualified same-namespace case)
- * @param qualified whether the callee carries a qualifier (`callee.segments.len > 1`)
- * @return          true iff `b` is the call's resolved target under the namespace rules
- * @since onda-3 (#290)
- */
-fn call_binding_matches(b: ValBinding, callee: parser::Path, cur_ns: str, qualified: bool) -> bool {
-    if !qualified { return b.ns.len == 0 || b.ns == cur_ns }
+fn call_is_teko_shorthand(callee: parser::Path): bool {
+    callee.segments.len == 2 && callee.segments[0].name == "teko"
+}
+
+fn ns_is_teko_surface(ns: str): bool {
+    ns.len >= 6 && ns.slice(0, 6) == "teko::"
+}
+
+fn call_binding_matches(b: ValBinding, callee: parser::Path, cur_ns: str, qualified: bool): bool {
+    if !qualified { return b.ns.len == 0 || b.ns == cur_ns || b.is_global }
+    if call_is_teko_shorthand(callee) && b.is_global && ns_is_teko_surface(b.ns) { return true }
     b.ns.len != 0 && ns_matches_call_qualifier(b.ns, callee)
 }
 
-/**
- * (#41) NAMESPACE-AWARE call resolution (mirror of C `tk_env_lookup_call`): the type of the function
- * or value the callee names. An UNQUALIFIED `name` binds a LOCAL (empty ns) or a function in the
- * CURRENT namespace; a QUALIFIED `q::…::name` binds a function whose namespace satisfies the callee's
- * full qualifier (`call_binding_matches`). Scans innermost bindings first (locals shadow), then the
- * sealed globals under the same rule.
- *
- * @param env     the typing environment (local bindings + sealed globals + current namespace)
- * @param callee  the call callee path
- * @return        the resolved target's type
- * @throws        when no binding resolves the callee (`undefined name`)
- */
-fn lookup_call(env: Env, callee: parser::Path) -> Type | error {
-    let name = callee.segments[callee.segments.len - 1].name
-    let qualified = callee.segments.len > 1
-    mut i = env.bindings.len
+fn call_base_pos(env: Env, callee: parser::Path, name: str, qualified: bool): i64 {
+    var h = teko::runtime::str_hash(name)
+    var best: i64 = -1
+    var k = nidx_lower_bound(env.base_index, h)
+    loop {
+        if k >= env.base_index.slots.len { break }
+        if env.base_index.slots[k].hash != h { break }
+        var p = env.base_index.slots[k].pos
+        var b = env.base_slots[p]
+        if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) && (p to i64) > best { best = p to i64 }
+        k++
+    }
+    best
+}
+
+fn lookup_call(env: Env, callee: parser::Path): @Type() | error {
+    var name = callee.segments[callee.segments.len - 1].name
+    var qualified = callee.segments.len > 1
+    var i = env.bindings.len
     loop {
         if i == 0 { break }
         i = i - 1
-        let b = env.bindings[i]
+        var b = env.bindings[i]
         if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { return b.type }
     }
-    mut j = env.base.len
-    loop {
-        if j == 0 { break }
-        j = j - 1
-        let b = env.base[j]
-        if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { return b.type }
-    }
+    var p = call_base_pos(env, callee, name, qualified)
+    if p >= 0 { return env.base_slots[p to u64].type }
     error { message = $"undefined name: {name}" }
 }
 
-/**
- * (#49) the resolved target's declaring NAMESPACE for a call — the same scan as `lookup_call` but
- * returning the winning binding's namespace. Codegen mangles a user call by this namespace; an empty
- * string means a LOCAL (empty ns), an unresolved callee, or a builtin (use the call-map / bare name).
- *
- * @param env     the typing environment
- * @param callee  the call callee path
- * @return        the resolved target's namespace, or "" for a local/builtin/unresolved callee
- */
-fn call_ns(env: Env, callee: parser::Path) -> str {
-    let name = callee.segments[callee.segments.len - 1].name
-    let qualified = callee.segments.len > 1
-    mut i = env.bindings.len
+fn call_ns(env: Env, callee: parser::Path): str {
+    var name = callee.segments[callee.segments.len - 1].name
+    var qualified = callee.segments.len > 1
+    var i = env.bindings.len
     loop {
         if i == 0 { break }
         i = i - 1
-        let b = env.bindings[i]
+        var b = env.bindings[i]
         if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { return b.ns }
     }
-    mut j = env.base.len
-    loop {
-        if j == 0 { break }
-        j = j - 1
-        let b = env.base[j]
-        if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { return b.ns }
-    }
+    var p = call_base_pos(env, callee, name, qualified)
+    if p >= 0 { return env.base_slots[p to u64].ns }
     ""
 }
 
-/**
- * NotBuiltinType — the marker `builtin_type` returns for a name that is simply not a built-in: a
- * STRUCTURED "keep looking" answer, distinct from the `error` arm, which is reserved for a name
- * that IS reserved and rejected (the removed `i128`/`u128`/`f16`).
- *
- * It replaces a sentinel `error { message = "not a built-in type" }` whose only reader compared the
- * MESSAGE TEXT, from another file (`resolve.resolve_named`). Message equality as identity breaks
- * the moment anyone rewords a diagnostic — a refactor that is supposed to be safe — and the failure
- * is silent: the resolver would start propagating "not a built-in type" as a user-facing error
- * instead of falling through to the user-type rules.
- */
+fn binding_is_func(b: ValBinding): bool {
+    match b.type { Func => true; _ => false }
+}
+
+pub fn lookup_call_candidates(env: Env, callee: parser::Path): []ValBinding {
+    var name = callee.segments[callee.segments.len - 1].name
+    var qualified = callee.segments.len > 1
+    var out: []ValBinding = []
+    var h = teko::runtime::str_hash(name)
+    var k = nidx_lower_bound(env.base_index, h)
+    loop {
+        if k >= env.base_index.slots.len { break }
+        if env.base_index.slots[k].hash != h { break }
+        var p = env.base_index.slots[k].pos
+        var b = env.base_slots[p]
+        if b.name == name && call_binding_matches(b, callee, env.cur_ns, qualified) { out = [..out, b] }
+        k++
+    }
+    var i: u64 = 0
+    loop {
+        if i >= env.bindings.len { break }
+        var lb = env.bindings[i]
+        if lb.name == name && call_binding_matches(lb, callee, env.cur_ns, qualified) { out = [..out, lb] }
+        i++
+    }
+    out
+}
+
+pub fn call_has_global_overload(env: Env, callee: parser::Path): bool {
+    var cands = lookup_call_candidates(env, callee)
+    if cands.len < 2 { return false }
+    var i: u64 = 0
+    loop {
+        if i >= cands.len { break }
+        if cands[i].is_global { return true }
+        i++
+    }
+    false
+}
+
+pub fn overload_func_bindings(env: Env, ns: str, name: str): []ValBinding {
+    var h = teko::runtime::str_hash(name)
+    var out: []ValBinding = []
+    var k = nidx_lower_bound(env.base_index, h)
+    loop {
+        if k >= env.base_index.slots.len { break }
+        if env.base_index.slots[k].hash != h { break }
+        var p = env.base_index.slots[k].pos
+        var b = env.base_slots[p]
+        if b.name == name && b.ns == ns && !b.is_const && binding_is_func(b) { out = [..out, b] }
+        k++
+    }
+    out
+}
+
+pub fn env_is_overloaded(env: Env, ns: str, name: str): bool {
+    overload_func_bindings(env, ns, name).len >= 2
+}
+
 type NotBuiltinType = struct { }
 
-/**
- * builtin_type — resolve an INJECTED built-in type name to its `Type` (B.19). User types
- * (struct/enum/variant) resolve against the collected registry (Etapa 3), not here.
- *
- * `i128`/`u128`/`f16` are explicit HONEST-STOP arms (drop-128, 2026-07-24): the language's widest
- * integer is 64-bit and its floats are f32/f64, so these three names never resolve to a `Prim` —
- * they name the removed 128-bit family / half-precision float and point the caller at the
- * surviving escape hatch (`teko::numeric::bigint::BigInt` / `Decimal` / `f32`) instead of being
- * reported as merely unknown.
- *
- * @param name  the surface type name to resolve
- * @return      the resolved `Type`, or `NotBuiltinType` when the name is not a built-in at all
- * @throws      when `name` is `i128`/`u128`/`f16` — removed, and rejected by NAME so the message
- *              can point at the replacement
- */
-fn builtin_type(name: str) -> Type | NotBuiltinType | error {
+fn builtin_type(name: str): @Type() | NotBuiltinType | error {
     if name == "u8" { return Prim { kind = PrimKind::U8 } }
     if name == "u16" { return Prim { kind = PrimKind::U16 } }
     if name == "u32" { return Prim { kind = PrimKind::U32 } }
     if name == "u64" { return Prim { kind = PrimKind::U64 } }
-    if name == "u128" { return error { message = "type 'u128' was removed (0.3.1): the language's widest integer is 64-bit (i64/u64). For larger integers use teko::numeric::bigint::BigInt (write '123bi') or Decimal." } }
     if name == "i8" { return Prim { kind = PrimKind::I8 } }
     if name == "i16" { return Prim { kind = PrimKind::I16 } }
     if name == "i32" { return Prim { kind = PrimKind::I32 } }
     if name == "i64" { return Prim { kind = PrimKind::I64 } }
-    if name == "i128" { return error { message = "type 'i128' was removed (0.3.1): the language's widest integer is 64-bit (i64/u64). For larger integers use teko::numeric::bigint::BigInt (write '123bi') or Decimal." } }
-    if name == "f16" { return error { message = "type 'f16' was removed (0.3.1): the language's floats are f32/f64. Use f32." } }
-    if name == "f32" { return Prim { kind = PrimKind::F32 } }   // native floats (B.38)
-    if name == "f64" { return Prim { kind = PrimKind::F64 } }   // native floats (B.38)
+    if name == "f32" { return Prim { kind = PrimKind::F32 } }
+    if name == "f64" { return Prim { kind = PrimKind::F64 } }
     if name == "bool" { return Prim { kind = PrimKind::Bool } }
+    if name == "isize" { return Prim { kind = PrimKind::Isize } }
+    if name == "usize" { return Prim { kind = PrimKind::Usize } }
     if name == "byte" { return Byte { } }
-    if name == "char" { return Char { } }   // a UTF-8 codepoint (1–4 bytes) — distinct from byte / []byte
-    if name == "str" { return Str { } }
+    if name == "char" { return Char { } }
+    if name == "str" { return Named { name = "teko::base::str" } }
     if name == "bigint" { return Named { name = "teko::numeric::bigint::BigInt" } }
     if name == "dec" { return Named { name = "teko::numeric::dec::Decimal" } }
     if name == "error" { return Error { } }
-    if name == "void" { return Void { } }   // (C7.2) explicit void return annotation in extern fn declarations
-    if name == "ptr" { return Ptr { inner = null } }   // (C7.1a) opaque FFI pointer (transport-only)
-    if name == "uptr" { return Uptr { } }   // (C7.1a) opaque word-size unsigned (transport-only)
+    if name == "()" { return Void { } }
+    if name == "ptr" { return Ptr { inner = null } }
+    if name == "uptr" { return Uptr { } }
     NotBuiltinType { }
 }
 
-/**
- * C7.19 (#169 D0) — the ratified `Buf` transport's signature: `buf_ptr(len: u64) -> ptr<byte>`.
- * Bump-allocates `len` bytes from the currently open arena region (S1) and hands back the raw
- * address; a raw `extern` (libc/OS) writes through that pointer, and Teko re-reads the written
- * bytes by length via `bytes_from_ptr`. The region stays opaque to Teko until that read-back, so
- * no index-assignment is ever needed — the `[]byte`-param sugar is a future, separate addition.
- */
-fn buf_ptr_signature() -> Type {
-    let len_param: []Type = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })
-    Func { params = len_param; ret = Ptr { inner = Byte { } }; variadic = false; param_names = []; n_required = len_param.len; defaults = [] }
+fn tempty(): []@Type() { [] }
+
+fn buf_ptr_signature(): @Type() {
+    var len_param: []@Type() = [..tempty(), Prim { kind = PrimKind::U64 }]
+    Func { params = len_param; ret = Ptr { inner = null }; variadic = false; param_names = []; n_required = len_param.len; defaults = []; ret_extra = [] }
 }
 
-/**
- * Build a `str | error` result type (`tk_ffi_sres`-shaped), the union returned by the
- * value-or-error host primitives `teko::env::var` / `teko::env::cwd` / `teko::io::read_file`.
- *
- * @return  a two-member `Variant { str, error }`
- */
-fn host_str_or_error() -> Type {
-    mut m: []Type = teko::list::push(teko::list::empty(), Str { })
-    m = teko::list::push(m, Error { })
+fn byte_ptr_signature(): @Type() {
+    var bp: []@Type() = [..tempty(), Slice { element = Byte { } }, Prim { kind = PrimKind::U64 }]
+    Func { params = bp; ret = Ptr { inner = null }; variadic = false; param_names = []; n_required = bp.len; defaults = []; ret_extra = [] }
+}
+
+fn as_cstr_signature(str_t: @Type()): @Type() {
+    var p: []@Type() = [..tempty(), str_t]
+    Func { params = p; ret = Ptr { inner = null }; variadic = false; param_names = []; n_required = p.len; defaults = []; ret_extra = [] }
+}
+
+fn str_from_c_signature(str_t: @Type()): @Type() {
+    var sfc: []@Type() = [..tempty(), Ptr { inner = null }, Prim { kind = PrimKind::U64 }]
+    Func { params = sfc; ret = str_t; variadic = false; param_names = []; n_required = sfc.len; defaults = []; ret_extra = [] }
+}
+
+fn region_buf_signature(str_t: @Type()): @Type() {
+    var rb: []@Type() = [..tempty(), Uptr { }, Prim { kind = PrimKind::U64 }, str_t]
+    Func { params = rb; ret = Ptr { inner = null }; variadic = false; param_names = []; n_required = rb.len; defaults = []; ret_extra = [] }
+}
+
+fn capture_panic_signature(): @Type() {
+    var body_t: @Type() = Func { params = []; ret = Null { }; variadic = false; param_names = []; n_required = 0; defaults = []; ret_extra = [] }
+    var params: []@Type() = [..tempty(), body_t]
+    var members: []@Type() = [..tempty(), Named { name = "teko::base::str" }, Null { }]
+    Func { params = params; ret = Variant { members = members }; variadic = false; param_names = []; n_required = params.len; defaults = []; ret_extra = [] }
+}
+
+fn capture_longjmp_signature(): @Type() {
+    var params: []@Type() = [..tempty(), Prim { kind = PrimKind::U64 }]
+    Func { params = params; ret = Void { }; variadic = false; param_names = []; n_required = params.len; defaults = []; ret_extra = [] }
+}
+
+fn load_u64_signature(): @Type() {
+    var addr_param: []@Type() = [..tempty(), Prim { kind = PrimKind::U64 }]
+    Func { params = addr_param; ret = Prim { kind = PrimKind::U64 }; variadic = false; param_names = []; n_required = addr_param.len; defaults = []; ret_extra = [] }
+}
+
+fn store_u64_signature(): @Type() {
+    var params: []@Type() = [..tempty(), Prim { kind = PrimKind::U64 }, Prim { kind = PrimKind::U64 }]
+    Func { params = params; ret = Void { }; variadic = false; param_names = []; n_required = params.len; defaults = []; ret_extra = [] }
+}
+
+fn host_str_or_error(): @Type() {
+    var m: []@Type() = [..tempty(), Named { name = "teko::base::str" }, Error { }]
     Variant { members = m }
 }
 
-/**
- * Build the `[]str | error` result type (`tk_ffi_slres`-shaped) returned by `teko::fs::list_dir`.
- *
- * @return  a two-member `Variant { []str, error }`
- */
-fn host_strslice_or_error() -> Type {
-    mut m: []Type = teko::list::push(teko::list::empty(), Slice { element = Str { } })
-    m = teko::list::push(m, Error { })
+fn host_strslice_or_error(): @Type() {
+    var m: []@Type() = [..tempty(), Slice { element = Named { name = "teko::base::str" } }, Error { }]
     Variant { members = m }
 }
 
-/**
- * Build the `error?` result type (`tk_ffi_ures`-shaped) returned by the effect-or-error host
- * primitives `teko::env::set_var` / `teko::env::chdir` / `teko::io::write_file` /
- * `teko::io::write_file_bytes` / `teko::fs::mkdir` / `teko::fs::remove_file`.
- *
- * @return  an `Optional { inner = error }`
- */
-fn host_error_optional() -> Type {
-    Optional { inner = Error { } }
+fn host_error_optional(): @Type() {
+    var m: []@Type() = [..tempty(), Null { }, Error { }]
+    Variant { members = m }
 }
 
-/**
- * Build a fixed `Func` type from an explicit parameter list and return type — the shared
- * constructor for every host-surface signature (all are non-generic, non-variadic, and require
- * exactly their listed parameters).
- *
- * @param params  the ordered parameter types
- * @param ret     the return type
- * @return        the corresponding `Func`
- */
-fn host_func(params: []Type, ret: Type) -> Type {
-    Func { params = params; ret = ret; variadic = false; param_names = []; n_required = params.len; defaults = [] }
+fn host_func(params: []@Type(), ret: @Type()): @Type() {
+    Func { params = params; ret = ret; variadic = false; param_names = []; n_required = params.len; defaults = []; ret_extra = [] }
 }
 
-/**
- * Resolve a teko HOST-STDLIB surface name (`teko::env` / `teko::io` / `teko::fs` /
- * `teko::process`) to its C-native `Func` type, mirroring the `extern fn` declarations in
- * src/env/env.tks, src/io/io.tks, src/fs/fs.tks and src/process/process.tks EXACTLY so the call's
- * checked type matches the fixed-ABI lift `emit_host_ffi` builds from it. This makes the host
- * surface resolvable for ANY standalone user project. The compiler's own project keeps binding
- * these through its discovered extern declarations (which win in `lookup_call` BEFORE this
- * fallback fires), so the path is consulted only for a user program with no local declaration —
- * additive, and byte-transparent for the compiler's own emission.
- *
- * @param name  the last path segment of the call (e.g. "args", "read_file", "list_dir", "run")
- * @return      the host primitive's `Func` type, or `error` when `name` is no host surface
- * @throws      "not a host surface function" when the name matches no host primitive
- */
-fn host_surface_fn(name: str) -> Type | error {
-    let str_t = Str { }
-    let bytes_t = Slice { element = Byte { } }
-    let str_slice_t = Slice { element = Str { } }
-    if name == "args" { return host_func(teko::list::empty(), str_slice_t) }
-    if name == "read_line" || name == "read_stdin" { return host_func(teko::list::empty(), str_t) }
-    if name == "stdin_eof" { return host_func(teko::list::empty(), Prim { kind = PrimKind::Bool }) }
-    if name == "cwd" { return host_func(teko::list::empty(), host_str_or_error()) }
-    if name == "var" || name == "read_file" { return host_func(teko::list::push(teko::list::empty(), str_t), host_str_or_error()) }
-    if name == "chdir" || name == "mkdir" || name == "remove_file" { return host_func(teko::list::push(teko::list::empty(), str_t), host_error_optional()) }
-    if name == "set_var" || name == "write_file" { return host_func(teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t), host_error_optional()) }
+fn host_surface_fn(name: str): @Type() | error {
+    var str_t: @Type() = Named { name = "teko::base::str" }
+    var bytes_t = Slice { element = Byte { } }
+    var str_slice_t = Slice { element = Named { name = "teko::base::str" } }
+    if name == "args" { return host_func([], str_slice_t) }
+    if name == "read_line" || name == "read_stdin" { return host_func([], str_t) }
+    if name == "stdin_eof" { return host_func([], Prim { kind = PrimKind::Bool }) }
+    if name == "cwd" { return host_func([], host_str_or_error()) }
+    if name == "var" || name == "read_file" { return host_func([..tempty(), str_t], host_str_or_error()) }
+    if name == "chdir" || name == "mkdir" || name == "remove_file" { return host_func([..tempty(), str_t], host_error_optional()) }
+    if name == "set_var" || name == "write_file" { return host_func([..tempty(), str_t, str_t], host_error_optional()) }
     if name == "write_file_bytes" {
-        mut p: []Type = teko::list::push(teko::list::empty(), str_t)
-        p = teko::list::push(p, bytes_t)
+        var p: []@Type() = [..tempty(), str_t, bytes_t]
         return host_func(p, host_error_optional())
     }
-    if name == "list_dir" { return host_func(teko::list::push(teko::list::empty(), str_t), host_strslice_or_error()) }
-    if name == "run" || name == "run_quiet" { return host_func(teko::list::push(teko::list::empty(), str_slice_t), Prim { kind = PrimKind::I32 }) }
+    if name == "list_dir" { return host_func([..tempty(), str_t], host_strslice_or_error()) }
+    if name == "run" || name == "run_quiet" { return host_func([..tempty(), str_slice_t], Prim { kind = PrimKind::I32 }) }
     error { message = "not a host surface function" }
 }
 
-/**
- * Resolve an INJECTED built-in FUNCTION name to its `Func` type (mirrors `scope.c`'s
- * `tk_builtin_fn`): `print`/`println` + `teko::assert`, the self-host str/byte stdlib surface,
- * the D3 coverage sinks, the arena checkpoint/rewind/commit primitives, the heap-backed
- * string interner, and (via `host_surface_fn`) the C-native `teko::env`/`io`/`fs`/`process` host
- * surface. Resolved by LAST path segment only (like `builtin_type`) — every name here is
- * assumed unique across the whole corpus, so a bare or `teko::`-rooted call resolves identically.
- * NON-generic, fixed signatures (M.5). The `div`/`rem`/`int_to_float` reserved arithmetic
- * builtins over the wide i128 carrier (the retired VM's own `/`/`%` lowering, `teko_rt.c`:
- * `tk_div`/`tk_rem`/`tk_int_to_float`) are REMOVED (drop-128, 2026-07-24): native codegen never
- * routed through them (it uses the per-width `tk_div_<tag>`/`tk_mod_<tag>` helpers via
- * `prim_div_tag`), and no corpus call site was bare and unqualified, so they were dead weight
- * once i128 left the type system.
- *
- * @param name  the last path segment of the call being resolved
- * @return      the built-in's `Func` type, or `error` if `name` names no built-in (the caller
- *              reports "unknown function")
- */
-fn builtin_fn(name: str) -> Type | error {
-    let str_t = Str { }
-    let void_t = Void { }
-    let bytes_t = Slice { element = Byte { } }
-    if name == "os" { return Func { params = teko::list::empty(); ret = str_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }   // teko::os() -> str ("macos"/"linux"/"windows") — C7.1f
-    if name == "arch" { return Func { params = teko::list::empty(); ret = str_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "version" { return Func { params = teko::list::empty(); ret = str_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }   // teko::env::version() -> str — CLI --version
-    if name == "peak_rss" { return Func { params = teko::list::empty(); ret = Prim { kind = PrimKind::U64 }; variadic = false; param_names = []; n_required = 0; defaults = [] } }   // (#148) teko::mem::peak_rss() -> u64 — the process peak RSS in bytes (0 = unavailable)
-    if name == "append_fo" {   // (#148 R2) teko::mem::append_fo([]byte, str) -> []byte — bulk append, free-old BY DECREE (linear builder chains only)
-        mut afp: []Type = teko::list::push(teko::list::empty(), bytes_t)
-        afp = teko::list::push(afp, str_t)
-        return Func { params = afp; ret = bytes_t; variadic = false; param_names = []; n_required = afp.len; defaults = [] }
+fn assert_void_sig(params: []@Type()): @Type() {
+    Func { params = params; ret = Void { }; variadic = false; param_names = []; n_required = params.len; defaults = []; ret_extra = [] }
+}
+
+fn assert_one_sig(t: @Type()): @Type() {
+    var p: []@Type() = [..tempty(), t]
+    assert_void_sig(p)
+}
+
+fn assert_pair_sig(t: @Type()): @Type() {
+    var p: []@Type() = [..tempty(), t, t]
+    assert_void_sig(p)
+}
+
+fn assert_named_flag_sig(): @Type() {
+    var p: []@Type() = [..tempty(), Named { name = "teko::base::str" }, Prim { kind = PrimKind::Bool }]
+    assert_void_sig(p)
+}
+
+fn assert_builtin_fn(name: str): @Type() | null {
+    var str_t: @Type() = Named { name = "teko::base::str" }
+    var bool_t = Prim { kind = PrimKind::Bool }
+    if name == "is_true" || name == "is_false" { return assert_one_sig(bool_t) }
+    if name == "scenario_begin" { return assert_one_sig(str_t) }
+    if name == "scenario_ok" { return assert_void_sig([]) }
+    if name == "eq_i64" || name == "ne_i64" || name == "lt_i64" || name == "le_i64" || name == "gt_i64" || name == "ge_i64" {
+        return assert_pair_sig(Prim { kind = PrimKind::I64 })
     }
-    if name == "abort" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }   // teko::abort — host abort FFI bottom (() -> void)
-    if name == "print" || name == "println" || name == "write" || name == "ewrite" || name == "eprint" || name == "eprintln" {
-        let iop = teko::list::push(teko::list::empty(), str_t)
-        return Func { params = iop; ret = void_t; variadic = false; param_names = []; n_required = iop.len; defaults = [] }
+    if name == "eq_u64" || name == "len_eq" { return assert_pair_sig(Prim { kind = PrimKind::U64 }) }
+    if name == "eq_f64" {
+        var f64_t = Prim { kind = PrimKind::F64 }
+        var fp: []@Type() = [..tempty(), f64_t, f64_t, f64_t]
+        return assert_void_sig(fp)
     }
-    // D3 — test-coverage sink (host side-channel): cov_reset()/cov_mark(u64) -> void ; cov_distinct() -> u64.
-    if name == "cov_reset" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "cov_mark" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }); ret = void_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })).len; defaults = [] } }
-    if name == "cov_distinct" { return Func { params = teko::list::empty(); ret = Prim { kind = PrimKind::U64 }; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "cov_is_marked" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }); ret = Prim { kind = PrimKind::Bool }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })).len; defaults = [] } }
-    // D3-branch — branch-coverage sink: branches_on(bool)/branch_reset()/enter(u64)/leave()/branch(u32,u32,u64) -> void ; branch_hit(u64,u32,u32,u64) -> bool.
-    if name == "cov_branches_on" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::Bool }); ret = void_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::Bool })).len; defaults = [] } }
-    if name == "cov_branch_reset" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "cov_enter" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }); ret = void_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })).len; defaults = [] } }
-    if name == "cov_leave" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    // (#109 test-gate memory) arena_push()/arena_pop() -> void — checkpoint/rewind the root region's
-    // bump position around each #test (bounds the self-host test gate's memory). Host side-channel.
-    if name == "arena_push" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "arena_pop" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "arena_commit" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "intern_get" {
-        let igp: []Type = teko::list::push(teko::list::empty(), str_t)
-        return Func { params = igp; ret = str_t; variadic = false; param_names = []; n_required = igp.len; defaults = [] }
+    if name == "eq_str" || name == "ne_str" || name == "str_contains" || name == "str_absent" || name == "str_starts_with" || name == "str_ends_with" {
+        return assert_pair_sig(str_t)
     }
-    if name == "intern_put" {
-        mut ipp: []Type = teko::list::push(teko::list::empty(), str_t)
-        ipp = teko::list::push(ipp, str_t)
-        return Func { params = ipp; ret = str_t; variadic = false; param_names = []; n_required = ipp.len; defaults = [] }
+    if name == "bytes_eq" { return assert_pair_sig(Slice { element = Byte { } }) }
+    if name == "is_present" || name == "is_absent" || name == "is_ok" || name == "is_error" { return assert_named_flag_sig() }
+    null
+}
+
+pub fn assert_builtin_name(last: str): bool {
+    match assert_builtin_fn(last) { (@Type()) as _gt4 => true; null => false }
+}
+
+fn type_is_fat_by_value(t: @Type()): bool {
+    if is_str_type(t) { return true }
+    match t {
+        Slice => true
+        _ => false
     }
-    if name == "intern_reset" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "cov_branch" {
-        mut bp: []Type = teko::list::push(teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U32 }), Prim { kind = PrimKind::U32 })
-        bp = teko::list::push(bp, Prim { kind = PrimKind::U64 })
-        return Func { params = bp; ret = void_t; variadic = false; param_names = []; n_required = (bp).len; defaults = [] }
+}
+
+fn count_leading_fat_params(f: Func): u64 {
+    var n: u64 = 0
+    loop {
+        if n >= f.params.len { break }
+        if !type_is_fat_by_value(f.params[n]) { break }
+        n++
     }
-    if name == "cov_branch_hit" {
-        mut hp: []Type = teko::list::push(teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }), Prim { kind = PrimKind::U32 })
-        hp = teko::list::push(teko::list::push(hp, Prim { kind = PrimKind::U32 }), Prim { kind = PrimKind::U64 })
-        return Func { params = hp; ret = Prim { kind = PrimKind::Bool }; variadic = false; param_names = []; n_required = (hp).len; defaults = [] }
+    n
+}
+
+pub fn assert_fat_arg_arity(last: str): u64 {
+    var none: u64 = 0 to u64
+    var t = match assert_builtin_fn(last) { (@Type()) as x => x; null => return none }
+    match t { Func as f => count_leading_fat_params(f); _ => none }
+}
+
+fn syscallN_signature(arity: u64): @Type() {
+    var i64_t: @Type() = Prim { kind = PrimKind::I64 }
+    var nparams = arity + (1 to u64)
+    var ps: [nparams]@Type() = []
+    var i: u64 = 0 to u64
+    loop {
+        if i >= nparams { break }
+        ps[i] = i64_t
+        i = i + (1 to u64)
     }
-    // D3-line — line-coverage sink: lines_on(bool)/line_reset()/line(u32) -> void ; line_hit(u64,u32) -> bool.
-    if name == "cov_lines_on" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::Bool }); ret = void_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::Bool })).len; defaults = [] } }
-    if name == "cov_line_reset" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "cov_line" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U32 }); ret = void_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U32 })).len; defaults = [] } }
-    if name == "cov_line_hit" {
-        mut lp: []Type = teko::list::push(teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }), Prim { kind = PrimKind::U32 })
-        return Func { params = lp; ret = Prim { kind = PrimKind::Bool }; variadic = false; param_names = []; n_required = (lp).len; defaults = [] }
+    Func { params = ps; ret = i64_t; variadic = false; param_names = []; n_required = ps.len; defaults = []; ret_extra = [] }
+}
+
+fn thread_clone_signature(): @Type() {
+    var i64_t: @Type() = Prim { kind = PrimKind::I64 }
+    var ps: []@Type() = [..tempty(), i64_t, i64_t, i64_t, i64_t, i64_t]
+    Func { params = ps; ret = i64_t; variadic = false; param_names = []; n_required = ps.len; defaults = []; ret_extra = [] }
+}
+
+fn atomic_rmw_signature(nargs: u64): @Type() {
+    var i64_t: @Type() = Prim { kind = PrimKind::I64 }
+    var ps: [nargs]@Type() = []
+    var i: u64 = 0 to u64
+    loop {
+        if i >= nargs { break }
+        ps[i] = i64_t
+        i = i + (1 to u64)
     }
-    if name == "fdiv" { return Func { params = teko::list::push(teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 }), Prim { kind = PrimKind::F64 }); ret = Prim { kind = PrimKind::F64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 }), Prim { kind = PrimKind::F64 })).len; defaults = [] } }
-    if name == "panic_div0" || name == "panic_oob" || name == "panic_cast" || name == "panic_overflow" { return Func { params = teko::list::empty(); ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = [] } }
-    if name == "floor" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 }); ret = Prim { kind = PrimKind::F64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 })).len; defaults = [] } }
-    if name == "f64_from_bits" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }); ret = Prim { kind = PrimKind::F64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })).len; defaults = [] } }
-    if name == "f64_bits" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 }); ret = Prim { kind = PrimKind::U64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 })).len; defaults = [] } }
-    if name == "is_true" || name == "is_false" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::Bool }); ret = void_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::Bool })).len; defaults = [] } }
-    if name == "str_contains" { return Func { params = teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t); ret = void_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t)).len; defaults = [] } }
-    if name == "slice" {
-        mut p: []Type = teko::list::push(teko::list::empty(), str_t)   // []Type: a heterogeneous param list (str, u64, u64)
-        p = teko::list::push(p, Prim { kind = PrimKind::U64 })
-        p = teko::list::push(p, Prim { kind = PrimKind::U64 })
-        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+    Func { params = ps; ret = i64_t; variadic = false; param_names = []; n_required = ps.len; defaults = []; ret_extra = [] }
+}
+
+fn weak_get_signature(): @Type() {
+    var t_param: @Type() = Named { name = "T" }
+    var p: []@Type() = [..tempty(), Ptr { inner = null }]
+    var m: []@Type() = [..tempty(), t_param, Null { }]
+    Func { params = p; ret = Variant { members = m }; variadic = false; param_names = []; n_required = p.len; defaults = []; ret_extra = [] }
+}
+
+fn deep_copy_signature(): @Type() {
+    var t_param: @Type() = Named { name = "T" }
+    var p: []@Type() = [..tempty(), t_param]
+    var m: []@Type() = [..tempty(), t_param, Error { }]
+    Func { params = p; ret = Variant { members = m }; variadic = false; param_names = []; n_required = p.len; defaults = []; ret_extra = [] }
+}
+
+fn builtin_fn(name: str): @Type() | error {
+    var str_t: @Type() = Named { name = "teko::base::str" }
+    var void_t = Void { }
+    var bytes_t = Slice { element = Byte { } }
+    if name == "version" { return Func { params = []; ret = str_t; variadic = false; param_names = []; n_required = 0; defaults = []; ret_extra = [] } }
+    if name == "peak_rss" { return Func { params = []; ret = Prim { kind = PrimKind::U64 }; variadic = false; param_names = []; n_required = 0; defaults = []; ret_extra = [] } }
+    if name == "append_fo" {
+        var afp: []@Type() = [..tempty(), bytes_t, str_t]
+        return Func { params = afp; ret = bytes_t; variadic = false; param_names = []; n_required = afp.len; defaults = []; ret_extra = [] }
     }
-    if name == "str" || name == "str_of_bytes" { return Func { params = teko::list::push(teko::list::empty(), bytes_t); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), bytes_t)).len; defaults = [] } }
-    if name == "one_byte" { return Func { params = teko::list::push(teko::list::empty(), Byte { }); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Byte { })).len; defaults = [] } }
-    if name == "str_concat" { return Func { params = teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t)).len; defaults = [] } }   // internal 2-arg primitive, unchanged
-    if name == "str_hash" { return Func { params = teko::list::push(teko::list::empty(), str_t); ret = Prim { kind = PrimKind::U64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), str_t)).len; defaults = [] } }
-    if name == "str_compare" { return Func { params = teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t); ret = Prim { kind = PrimKind::I64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t)).len; defaults = [] } }
-    // "str_concat3" REMOVED (2026-07-01) — superseded by the variadic "concat" below.
-    if name == "i64_to_str" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::I64 }); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::I64 })).len; defaults = [] } }
-    if name == "u64_to_str" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })).len; defaults = [] } }
-    if name == "ftoa" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 }); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 })).len; defaults = [] } }
-    if name == "f64_g17" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 }); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 })).len; defaults = [] } }   // host float renderer FFI bottom
-    // teko::float::parse(str) -> f64 — no namespace file exists for teko::float; keep as seed.
-    if name == "parse" { return Func { params = teko::list::push(teko::list::empty(), str_t); ret = Prim { kind = PrimKind::F64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), str_t)).len; defaults = [] } }
-    // NOTE: teko::io::*, teko::env::*, teko::fs::*, teko::process::* seeds have been REMOVED (C7.3).
-    // Those host surfaces are declared in src/io/io.tks, src/env/env.tks, src/fs/fs.tks,
-    // src/process/process.tks and are collected into the checker env via the normal discover/collect
-    // pass. The env lookup at type_call (typer.tks line 208) finds them BEFORE this fallback fires.
-    // teko::str::* — the self-host string stdlib the corpus calls namespaced (resolved by last
-    // segment, like the underscored twins; the C runtime twins are tk_str_concat/slice/…).
-    // "concat"/"concat3" are matched by BARE last-segment name (see lookup_call/call_ns above,
-    // and this fn's callers), so ANY namespace prefix ending in these names resolves identically
-    // — this is what makes `teko::string::concat(a, b)` (the LEGISLATED public API per
-    // TEKO_LEGISLATION.md's "`+` never concatenates" rule: string building is `string::concat` /
-    // interpolation `$"..."`, never `+`) and `teko::str::concat(a, b)` (the spelling the corpus
-    // already uses pervasively) two names for the same builtin dispatch. No separate
-    // registration is needed for the `string::` spelling — this comment documents the mechanism
-    // so the legislated name is discoverable here, not just inferable.
-    // "concat" (== the LEGISLATED string::concat) is the ONE public variadic form (2026-07-01,
-    // `concat3` removed): `concat(params pieces: []str) -> str` — ONE param, itself a []str, and
-    // `variadic = true` so the checker's params call-site desugar (typer.tks/expr.c) packs N
-    // trailing str args into a []str automatically, or passes an existing []str straight through.
-    if name == "concat" { return Func { params = teko::list::push(teko::list::empty(), Slice { element = str_t }); ret = str_t; variadic = true; param_names = []; n_required = (teko::list::push(teko::list::empty(), Slice { element = str_t })).len; defaults = [] } }
-    if name == "slice_to" || name == "slice_from" {
-        mut p: []Type = teko::list::push(teko::list::empty(), str_t)   // []Type: (str, u64)
-        p = teko::list::push(p, Prim { kind = PrimKind::U64 })
-        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+    if name == "abort" { return Func { params = []; ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = []; ret_extra = [] } }
+    if name == "arena_push" { return Func { params = []; ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = []; ret_extra = [] } }
+    if name == "arena_pop" { return Func { params = []; ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = []; ret_extra = [] } }
+    if name == "arena_commit" { return Func { params = []; ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = []; ret_extra = [] } }
+    if name == "task_reset" { return Func { params = []; ret = void_t; variadic = false; param_names = []; n_required = 0; defaults = []; ret_extra = [] } }
+    if name == "fdiv" { return Func { params = [..tempty(), Prim { kind = PrimKind::F64 }, Prim { kind = PrimKind::F64 }]; ret = Prim { kind = PrimKind::F64 }; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::F64 }, Prim { kind = PrimKind::F64 }]).len; defaults = []; ret_extra = [] } }
+    if name == "floor" { return Func { params = [..tempty(), Prim { kind = PrimKind::F64 }]; ret = Prim { kind = PrimKind::F64 }; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::F64 }]).len; defaults = []; ret_extra = [] } }
+    if name == "f64_from_bits" { return Func { params = [..tempty(), Prim { kind = PrimKind::U64 }]; ret = Prim { kind = PrimKind::F64 }; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::U64 }]).len; defaults = []; ret_extra = [] } }
+    if name == "f64_bits" { return Func { params = [..tempty(), Prim { kind = PrimKind::F64 }]; ret = Prim { kind = PrimKind::U64 }; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::F64 }]).len; defaults = []; ret_extra = [] } }
+    if name == "syscall0" { return syscallN_signature(0 to u64) }
+    if name == "syscall1" { return syscallN_signature(1 to u64) }
+    if name == "syscall2" { return syscallN_signature(2 to u64) }
+    if name == "syscall3" { return syscallN_signature(3 to u64) }
+    if name == "syscall4" { return syscallN_signature(4 to u64) }
+    if name == "syscall5" { return syscallN_signature(5 to u64) }
+    if name == "syscall6" { return syscallN_signature(6 to u64) }
+    if name == "thread_clone" { return thread_clone_signature() }
+    if name == "atomic_cas_u32" { return atomic_rmw_signature(3 to u64) }
+    if name == "atomic_xchg_u32" { return atomic_rmw_signature(2 to u64) }
+    if name == "atomic_add_u32" { return atomic_rmw_signature(2 to u64) }
+    if name == "atomic_load_u32" { return atomic_rmw_signature(1 to u64) }
+    if name == "ptr_word" {
+        var pwp: []@Type() = [..tempty(), Ptr { inner = null }]
+        return Func { params = pwp; ret = Prim { kind = PrimKind::I64 }; variadic = false; param_names = []; n_required = pwp.len; defaults = []; ret_extra = [] }
     }
-    if name == "len" { return Func { params = teko::list::push(teko::list::empty(), str_t); ret = Prim { kind = PrimKind::U64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), str_t)).len; defaults = [] } }
-    if name == "bytes_of_str" { return Func { params = teko::list::push(teko::list::empty(), str_t); ret = bytes_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), str_t)).len; defaults = [] } }   // bytes_of_str(str) -> []byte
-    if name == "str_from_utf8" {   // str_from_utf8([]byte) -> str | error (ROUND 0 / B.36)
-        mut m: []Type = teko::list::push(teko::list::empty(), str_t)
-        m = teko::list::push(m, Error { })
-        return Func { params = teko::list::push(teko::list::empty(), bytes_t); ret = Variant { members = m }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), bytes_t)).len; defaults = [] }
+    if name == "word_ptr" {
+        var wpp: []@Type() = [..tempty(), Prim { kind = PrimKind::I64 }]
+        return Func { params = wpp; ret = Ptr { inner = null }; variadic = false; param_names = []; n_required = wpp.len; defaults = []; ret_extra = [] }
     }
-    if name == "chars" { return Func { params = teko::list::push(teko::list::empty(), str_t); ret = Slice { element = Char { } }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), str_t)).len; defaults = [] } }   // str::chars(str) -> []char
-    if name == "len_chars" { return Func { params = teko::list::push(teko::list::empty(), str_t); ret = Prim { kind = PrimKind::I64 }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), str_t)).len; defaults = [] } }   // str::len_chars(str) -> i64
-    // --- ROUND 0: UTF-8 codepoint operations ---
-    if name == "char_at" {   // char_at(str, i64) -> char
-        mut p: []Type = teko::list::push(teko::list::empty(), str_t)
-        p = teko::list::push(p, Prim { kind = PrimKind::I64 })
-        return Func { params = p; ret = Char { }; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+    if name == "retain" || name == "release" {
+        var rrp: []@Type() = [..tempty(), Ptr { inner = null }]
+        return Func { params = rrp; ret = void_t; variadic = false; param_names = []; n_required = rrp.len; defaults = []; ret_extra = [] }
     }
-    if name == "str_slice_chars" {   // str_slice_chars(str, i64, i64) -> str
-        mut p: []Type = teko::list::push(teko::list::empty(), str_t)
-        p = teko::list::push(p, Prim { kind = PrimKind::I64 })
-        p = teko::list::push(p, Prim { kind = PrimKind::I64 })
-        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+    if name == "weak_get" { return weak_get_signature() }
+    if name == "deep_copy" { return deep_copy_signature() }
+    match assert_builtin_fn(name) { (@Type()) as at => return at; null => { } }
+    if name == "slice_view" {
+        var t_param: @Type() = Named { name = "T" }
+        var p: []@Type() = [..tempty(), t_param, Prim { kind = PrimKind::U64 }, Prim { kind = PrimKind::U64 }]
+        return Func { params = p; ret = t_param; variadic = false; param_names = []; n_required = (p).len; defaults = []; ret_extra = [] }
     }
-    if name == "is_alpha" { return Func { params = teko::list::push(teko::list::empty(), Char { }); ret = Prim { kind = PrimKind::Bool }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Char { })).len; defaults = [] } }   // is_alpha(char) -> bool
-    if name == "is_digit" { return Func { params = teko::list::push(teko::list::empty(), Char { }); ret = Prim { kind = PrimKind::Bool }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Char { })).len; defaults = [] } }   // is_digit(char) -> bool
-    if name == "is_space" { return Func { params = teko::list::push(teko::list::empty(), Char { }); ret = Prim { kind = PrimKind::Bool }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Char { })).len; defaults = [] } }   // is_space(char) -> bool
-    if name == "to_lower" { return Func { params = teko::list::push(teko::list::empty(), Char { }); ret = Char { }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Char { })).len; defaults = [] } }   // to_lower(char) -> char
-    if name == "to_upper" { return Func { params = teko::list::push(teko::list::empty(), Char { }); ret = Char { }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Char { })).len; defaults = [] } }   // to_upper(char) -> char
-    if name == "ends_with" { return Func { params = teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t); ret = Prim { kind = PrimKind::Bool }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t)).len; defaults = [] } }
-    if name == "contains" { return Func { params = teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t); ret = Prim { kind = PrimKind::Bool }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t)).len; defaults = [] } }
+    if name == "str" || name == "str_of_bytes" { return Func { params = [..tempty(), bytes_t]; ret = str_t; variadic = false; param_names = []; n_required = ([..tempty(), bytes_t]).len; defaults = []; ret_extra = [] } }
+    if name == "one_byte" { return Func { params = [..tempty(), Byte { }]; ret = str_t; variadic = false; param_names = []; n_required = ([..tempty(), Byte { }]).len; defaults = []; ret_extra = [] } }
+    if name == "str_concat" { return Func { params = [..tempty(), str_t, str_t]; ret = str_t; variadic = false; param_names = []; n_required = ([..tempty(), str_t, str_t]).len; defaults = []; ret_extra = [] } }
+    if name == "i64_to_str" { return Func { params = [..tempty(), Prim { kind = PrimKind::I64 }]; ret = str_t; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::I64 }]).len; defaults = []; ret_extra = [] } }
+    if name == "u64_to_str" { return Func { params = [..tempty(), Prim { kind = PrimKind::U64 }]; ret = str_t; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::U64 }]).len; defaults = []; ret_extra = [] } }
+    if name == "ftoa" { return Func { params = [..tempty(), Prim { kind = PrimKind::F64 }]; ret = str_t; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::F64 }]).len; defaults = []; ret_extra = [] } }
+    if name == "parse" { return Func { params = [..tempty(), str_t]; ret = Prim { kind = PrimKind::F64 }; variadic = false; param_names = []; n_required = ([..tempty(), str_t]).len; defaults = []; ret_extra = [] } }
+    if name == "concat" { return Func { params = [..tempty(), Slice { element = str_t }]; ret = str_t; variadic = true; param_names = []; n_required = ([..tempty(), Slice { element = str_t }]).len; defaults = []; ret_extra = [] } }
+    if name == "str_from_utf8" {
+        var m: []@Type() = [..tempty(), str_t, Error { }]
+        return Func { params = [..tempty(), bytes_t]; ret = Variant { members = m }; variadic = false; param_names = []; n_required = ([..tempty(), bytes_t]).len; defaults = []; ret_extra = [] }
+    }
     if name == "last_index_of" {
-        mut m: []Type = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })   // []Type: (u64 | error)
-        m = teko::list::push(m, Error { })
-        let u64_or_err = Variant { members = m }
-        return Func { params = teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t); ret = u64_or_err; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::push(teko::list::empty(), str_t), str_t)).len; defaults = [] }
+        var m: []@Type() = [..tempty(), Prim { kind = PrimKind::U64 }, Error { }]
+        var u64_or_err = Variant { members = m }
+        return Func { params = [..tempty(), str_t, str_t]; ret = u64_or_err; variadic = false; param_names = []; n_required = ([..tempty(), str_t, str_t]).len; defaults = []; ret_extra = [] }
     }
-    // error diagnostic adornment builtins (E2): err_loc(error,u32,u32)->error ; err_typed(error,str,str)->error.
     if name == "err_loc" {
-        mut p: []Type = teko::list::push(teko::list::empty(), Error { })   // []Type: (error, u32, u32)
-        p = teko::list::push(p, Prim { kind = PrimKind::U32 })
-        p = teko::list::push(p, Prim { kind = PrimKind::U32 })
-        return Func { params = p; ret = Error { }; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+        var p: []@Type() = [..tempty(), Error { }, Prim { kind = PrimKind::U32 }, Prim { kind = PrimKind::U32 }]
+        return Func { params = p; ret = Error { }; variadic = false; param_names = []; n_required = (p).len; defaults = []; ret_extra = [] }
     }
     if name == "err_typed" {
-        mut p: []Type = teko::list::push(teko::list::empty(), Error { })   // []Type: (error, str, str)
-        p = teko::list::push(p, str_t)
-        p = teko::list::push(p, str_t)
-        return Func { params = p; ret = Error { }; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+        var p: []@Type() = [..tempty(), Error { }, str_t, str_t]
+        return Func { params = p; ret = Error { }; variadic = false; param_names = []; n_required = (p).len; defaults = []; ret_extra = [] }
     }
-    // (C7.1a) marshalling primitives — teko::mem: move aggregates across the FFI boundary.
-    // `as_ptr` is the raw byte pointer of a `str` (borrows; pairs with `.len`; NOT NUL-terminated).
-    if name == "as_ptr" { return Func { params = teko::list::push(teko::list::empty(), str_t); ret = Ptr { inner = null }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), str_t)).len; defaults = [] } }
-    // `as_cstr(str) -> ptr<byte>` — a fresh NUL-terminated copy of `str`'s bytes, bump-allocated
-    // into the ENCLOSING region (c-types-and-marshalling-0.3.1.md §7.3/§9.5, crumb C3+C7): the
-    // result is a TYPED byte pointer, never the opaque `ptr` (a `void *` reading/writing octets is
-    // `ptr<byte>` by the design's own §5.3 rule), and its storage is bulk-freed with the enclosing
-    // region rather than leaked on the process heap.
-    if name == "as_cstr" { return Func { params = teko::list::push(teko::list::empty(), str_t); ret = Ptr { inner = Byte { } }; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), str_t)).len; defaults = [] } }
-    // `str_from_c(p: ptr<byte>, max: u64) -> str` — the BOUNDED inbound C-string scan
-    // (c-types-and-marshalling-0.3.1.md §6, crumb C2), replacing the unbounded `str_from_cstr`
-    // (`strlen` on a foreign pointer). TOTAL: `p` null or `max == 0` yield the empty `str`; a NUL at
-    // octet `i < max` yields the first `i` octets; no NUL in `[0, max)` yields exactly `max` octets
-    // (truncation, not a panic — a fixed-width unterminated C field is a legitimate input).
-    if name == "str_from_c" {
-        mut sfc: []Type = teko::list::push(teko::list::empty(), Ptr { inner = Byte { } })
-        sfc = teko::list::push(sfc, Prim { kind = PrimKind::U64 })
-        return Func { params = sfc; ret = str_t; variadic = false; param_names = []; n_required = sfc.len; defaults = [] }
-    }
-    // `bytes_from_ptr(ptr, u64) -> []byte` — copy `n` octets from a foreign pointer back.
+    if name == "as_cstr" { return as_cstr_signature(str_t) }
+    if name == "str_from_c" { return str_from_c_signature(str_t) }
     if name == "bytes_from_ptr" {
-        mut bp: []Type = teko::list::push(teko::list::empty(), Ptr { inner = null })
-        bp = teko::list::push(bp, Prim { kind = PrimKind::U64 })
-        return Func { params = bp; ret = bytes_t; variadic = false; param_names = []; n_required = (bp).len; defaults = [] }
+        var bp: []@Type() = [..tempty(), Ptr { inner = null }, Prim { kind = PrimKind::U64 }]
+        return Func { params = bp; ret = bytes_t; variadic = false; param_names = []; n_required = (bp).len; defaults = []; ret_extra = [] }
     }
+    if name == "capture_panic" { return capture_panic_signature() }
+    if name == "capture_longjmp" { return capture_longjmp_signature() }
+    if name == "load_u64" { return load_u64_signature() }
+    if name == "store_u64" { return store_u64_signature() }
+    if name == "load_u8" { return load_u64_signature() }
+    if name == "store_u8" { return store_u64_signature() }
     if name == "buf_ptr" { return buf_ptr_signature() }
-    // `region_buf(region: uptr, len: u64, init: str) -> ptr<byte>` — the NAMED-region twin of
-    // `buf_ptr` (c-types-and-marshalling-0.3.1.md §7.3, crumb C5): bump-allocates `len` contiguous
-    // octets INTO the caller-chosen region, copies at most `len` octets of `init` into the front of
-    // that buffer, and writes a NUL terminator at the first octet `init` did not fill (or at the
-    // final octet, when `init` fills the whole span) — the tier-2 allocation `c_string_in_arena`
-    // needs and `buf_ptr`'s enclosing-region form cannot provide (a NAMED region, not the lexical one).
-    if name == "region_buf" {
-        mut rb: []Type = teko::list::push(teko::list::empty(), Uptr { })
-        rb = teko::list::push(rb, Prim { kind = PrimKind::U64 })
-        rb = teko::list::push(rb, str_t)
-        return Func { params = rb; ret = Ptr { inner = Byte { } }; variadic = false; param_names = []; n_required = rb.len; defaults = [] }
-    }
-    // ROUND 0 format helpers — VM-intercepted (try_builtin_call) + native (tk_fmt_*).
+    if name == "byte_ptr" { return byte_ptr_signature() }
+    if name == "region_buf" { return region_buf_signature(str_t) }
     if name == "fmt_f" || name == "fmt_e" || name == "fmt_g" || name == "fmt_n_f" || name == "fmt_p" {
-        mut p: []Type = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 })
-        p = teko::list::push(p, Prim { kind = PrimKind::I64 })
-        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+        var p: []@Type() = [..tempty(), Prim { kind = PrimKind::F64 }, Prim { kind = PrimKind::I64 }]
+        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = []; ret_extra = [] }
     }
     if name == "fmt_d" {
-        mut p: []Type = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::I64 })
-        p = teko::list::push(p, Prim { kind = PrimKind::I64 })
-        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+        var p: []@Type() = [..tempty(), Prim { kind = PrimKind::I64 }, Prim { kind = PrimKind::I64 }]
+        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = []; ret_extra = [] }
     }
     if name == "fmt_x_upper" || name == "fmt_x_lower" || name == "fmt_b" {
-        return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 }); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })).len; defaults = [] }
+        return Func { params = [..tempty(), Prim { kind = PrimKind::U64 }]; ret = str_t; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::U64 }]).len; defaults = []; ret_extra = [] }
     }
-    if name == "fmt_n_i" { return Func { params = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::I64 }); ret = str_t; variadic = false; param_names = []; n_required = (teko::list::push(teko::list::empty(), Prim { kind = PrimKind::I64 })).len; defaults = [] } }
+    if name == "fmt_n_i" { return Func { params = [..tempty(), Prim { kind = PrimKind::I64 }]; ret = str_t; variadic = false; param_names = []; n_required = ([..tempty(), Prim { kind = PrimKind::I64 }]).len; defaults = []; ret_extra = [] } }
     if name == "fmt_dyn_f64" {
-        mut p: []Type = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::F64 })
-        p = teko::list::push(p, Str { })
-        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+        var p: []@Type() = [..tempty(), Prim { kind = PrimKind::F64 }, Named { name = "teko::base::str" }]
+        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = []; ret_extra = [] }
     }
     if name == "fmt_dyn_i64" {
-        mut p: []Type = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::I64 })
-        p = teko::list::push(p, Str { })
-        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+        var p: []@Type() = [..tempty(), Prim { kind = PrimKind::I64 }, Named { name = "teko::base::str" }]
+        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = []; ret_extra = [] }
     }
     if name == "fmt_dyn_u64" {
-        mut p: []Type = teko::list::push(teko::list::empty(), Prim { kind = PrimKind::U64 })
-        p = teko::list::push(p, Str { })
-        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = [] }
+        var p: []@Type() = [..tempty(), Prim { kind = PrimKind::U64 }, Named { name = "teko::base::str" }]
+        return Func { params = p; ret = str_t; variadic = false; param_names = []; n_required = (p).len; defaults = []; ret_extra = [] }
     }
-    match host_surface_fn(name) { Type as t => return t; error => { } }
+    match host_surface_fn(name) { (@Type()) as t => return t; error => { } }
     error { message = "not a built-in function" }
+}
+
+/**
+ * is_runtime_alloc_builtin — true for the region-allocating runtime builtins whose bare-name calls the
+ * codegen used to name-detect and hand-emit. Re-resolving these to `teko::runtime` lets the generic
+ * call path emit the symbol and thread the implicit region argument automatically.
+ *
+ * @param name  the bare builtin name
+ * @return      true iff `name` is a `teko::runtime` string/number-formatting allocator
+ */
+fn is_runtime_alloc_builtin(name: str): bool {
+    if name == "one_byte" || name == "str_concat" || name == "i64_to_str" || name == "u64_to_str" || name == "ftoa" { return true }
+    if name == "fmt_f" || name == "fmt_e" || name == "fmt_g" || name == "fmt_n_f" || name == "fmt_p" { return true }
+    if name == "fmt_d" || name == "fmt_x_upper" || name == "fmt_x_lower" || name == "fmt_b" || name == "fmt_n_i" { return true }
+    name == "fmt_dyn_f64" || name == "fmt_dyn_i64" || name == "fmt_dyn_u64"
 }

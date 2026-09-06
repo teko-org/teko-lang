@@ -1,0 +1,138 @@
+use teko::crypto
+use teko::encoding::cbor
+use teko::numeric::bigint
+
+fn cose_sig1_structure_bytes(protected_bytes: []byte, external_aad: []byte, payload: []byte): []byte {
+    var arr = cose_four(cbor::cbor_text("Signature1"), cbor::cbor_bytes(protected_bytes), cbor::cbor_bytes(external_aad), cbor::cbor_bytes(payload))
+    cbor::encode_canonical(cbor::cbor_array(arr))
+}
+
+fn cose_sign1_es256_raw(scalar: bigint::BigInt, message: []byte): crypto::P256Signature | crypto::CryptoError {
+    var attempt: u64 = 0
+    loop {
+        if attempt >= 16 {
+            return crypto::crypto_error("cose_sign1: ES256 signing failed to derive a valid ECDSA nonce")
+        }
+        var k = bigint::from_bytes_be(crypto::secure_bytes(32))
+        match crypto::ecdsa_p256_sign(scalar, crypto::EcHashAlg::Sha256, message, k) {
+            crypto::P256Signature as sig => return sig
+            crypto::CryptoError => attempt = attempt + 1
+        }
+    }
+    crypto::crypto_error("cose_sign1: ES256 signing unreachable")
+}
+
+fn cose_sign1_es256_to_bytes(sig: crypto::P256Signature): []byte | crypto::CryptoError {
+    var r_bytes = match bigint::to_bytes_be_padded(sig.r, 32) {
+        []byte as b => b
+        error => return crypto::crypto_error("cose_sign1: ES256 signature 'r' does not fit 32 bytes")
+    }
+    var s_bytes = match bigint::to_bytes_be_padded(sig.s, 32) {
+        []byte as b => b
+        error => return crypto::crypto_error("cose_sign1: ES256 signature 's' does not fit 32 bytes")
+    }
+    cose_bytes_concat(r_bytes, s_bytes)
+}
+
+fn cose_sign1_sign_es256(key: CoseSigningKey, message: []byte): []byte | crypto::CryptoError {
+    if key.kind != CoseSigningKeyKind::EcdsaPrivate {
+        return crypto::crypto_error("cose_sign1: ES256 signing requires an EC P-256 private key")
+    }
+    var sig = match cose_sign1_es256_raw(key.ec_scalar, message) {
+        crypto::P256Signature as s => s
+        crypto::CryptoError as e => return e
+    }
+    cose_sign1_es256_to_bytes(sig)
+}
+
+fn cose_sign1_sign_eddsa(key: CoseSigningKey, message: []byte): []byte | crypto::CryptoError {
+    if key.kind != CoseSigningKeyKind::Ed25519Private {
+        return crypto::crypto_error("cose_sign1: EdDSA signing requires an Ed25519 private key")
+    }
+    crypto::ed25519_sign(key.ed_secret, message)
+}
+
+fn cose_sign1_sign_rs256(key: CoseSigningKey, message: []byte): []byte | crypto::CryptoError {
+    if key.kind != CoseSigningKeyKind::RsaPrivate {
+        return crypto::crypto_error("cose_sign1: RS256 signing requires an RSA private key")
+    }
+    crypto::rsa_sign_pkcs1v15(key.rsa_key, crypto::RsaHashAlg::Sha256, message)
+}
+
+fn cose_sign1_sign_ps256(key: CoseSigningKey, message: []byte): []byte | crypto::CryptoError {
+    if key.kind != CoseSigningKeyKind::RsaPrivate {
+        return crypto::crypto_error("cose_sign1: PS256 signing requires an RSA private key")
+    }
+    crypto::rsa_sign_pss(key.rsa_key, crypto::RsaHashAlg::Sha256, message, crypto::secure_bytes(32))
+}
+
+fn cose_sign1_dispatch_sign(alg: CoseAlg, key: CoseSigningKey, sig_input: []byte): []byte | crypto::CryptoError {
+    match alg {
+        ES256 => cose_sign1_sign_es256(key, sig_input)
+        EdDSA => cose_sign1_sign_eddsa(key, sig_input)
+        RS256 => cose_sign1_sign_rs256(key, sig_input)
+        PS256 => cose_sign1_sign_ps256(key, sig_input)
+        Hmac256 => crypto::crypto_error("cose_sign1: HMAC is not a Sign1 algorithm; use cose_mac0_create")
+    }
+}
+
+fn cose_sign1_verify_es256(key: CoseVerificationKey, sig_input: []byte, sig: []byte): bool {
+    if key.kind != CoseVerificationKeyKind::EcdsaPublic || sig.len != 64 { return false }
+    var r = bigint::from_bytes_be(cose_bytes_slice(sig, 0, 32))
+    var s = bigint::from_bytes_be(cose_bytes_slice(sig, 32, 64))
+    crypto::ecdsa_p256_verify(key.ec_point, crypto::EcHashAlg::Sha256, sig_input, r, s)
+}
+
+fn cose_sign1_dispatch_verify(alg: CoseAlg, key: CoseVerificationKey, sig_input: []byte, sig: []byte): bool {
+    match alg {
+        ES256 => cose_sign1_verify_es256(key, sig_input, sig)
+        EdDSA => key.kind == CoseVerificationKeyKind::Ed25519Public && crypto::ed25519_verify(key.ed_public, sig_input, sig)
+        RS256 => key.kind == CoseVerificationKeyKind::RsaPublic && crypto::rsa_verify_pkcs1v15(key.rsa_key, crypto::RsaHashAlg::Sha256, sig_input, sig)
+        PS256 => key.kind == CoseVerificationKeyKind::RsaPublic && crypto::rsa_verify_pss(key.rsa_key, crypto::RsaHashAlg::Sha256, sig_input, sig)
+        Hmac256 => false
+    }
+}
+
+/**
+ * Signs `payload` under `alg`/`key` and returns the encoded, tag-18 `COSE_Sign1` document
+ * (RFC 9052 §4.2): builds the protected header (`alg` only) and unprotected header (`kid` when
+ * non-empty), computes the `Sig_structure` over the EXACT protected header bytes, signs it, and
+ * canonical-CBOR-encodes `[protected, unprotected, payload, signature]` under tag 18.
+ */
+exp fn cose_sign1_sign(alg: CoseAlg, key: CoseSigningKey, kid: []byte, external_aad: []byte, payload: []byte): []byte | crypto::CryptoError {
+    var protected_bytes = cose_protected_header_bytes(alg)
+    var unprotected = cose_unprotected_header(kid)
+    var sig_input = cose_sig1_structure_bytes(protected_bytes, external_aad, payload)
+    var sig = match cose_sign1_dispatch_sign(alg, key, sig_input) {
+        []byte as s => s
+        crypto::CryptoError as e => return e
+    }
+    var arr = cose_four(cbor::cbor_bytes(protected_bytes), unprotected, cbor::cbor_bytes(payload), cbor::cbor_bytes(sig))
+    cbor::encode_canonical(cbor::cbor_tag(18, cbor::cbor_array(arr)))
+}
+
+/**
+ * Verifies an encoded `COSE_Sign1` document (tag 18, or a bare untagged array) and returns the
+ * payload on success: extracts the four fields, reads `alg` off the protected header, recomputes
+ * the `Sig_structure` from the EXACT protected/payload bytes on the wire, and checks the
+ * signature under `key`.
+ */
+exp fn cose_sign1_verify(key: CoseVerificationKey, external_aad: []byte, cose_bytes: []byte): []byte | crypto::CryptoError {
+    var four = match cose_decode_four_tuple(18, cose_bytes) {
+        CoseFourTuple as t => t
+        crypto::CryptoError as e => return e
+    }
+    var protected_map = match cose_decode_protected_map(four.protected) {
+        cbor::CborValue as m => m
+        crypto::CryptoError as e => return e
+    }
+    var alg = match cose_header_alg(protected_map) {
+        CoseAlg as a => a
+        crypto::CryptoError as e => return e
+    }
+    var sig_input = cose_sig1_structure_bytes(four.protected, external_aad, four.payload)
+    if !cose_sign1_dispatch_verify(alg, key, sig_input, four.trailer) {
+        return crypto::crypto_error("cose_sign1_verify: signature verification failed")
+    }
+    four.payload
+}

@@ -1,3 +1,5 @@
+> **[HISTÓRICO]** — documenta o crumb T-B1 da onda const (Tier-B), já executado. Não descreve o estado atual do projeto.
+
 # T-B1 — widen the reloc model for data→data relocations (#594 Tier-B)
 
 Status: READY-TO-IMPLEMENT (architect, 2026-07-18). Track: Tier-B pointer-bearing
@@ -11,7 +13,7 @@ consumer-side honest-stop scaffold that never fires today.
 > `encode_x86_64.tks:1310`); the LIR carries a data-section relocation entry for a
 > rodata-internal pointer field." T-B1 delivers the TYPES + the plumbing seam;
 > emission is T-B2 (ELF `.rela.rodata`), T-B3 (Mach-O/COFF rodata relocs), T-B4
-> (wasm intra-data offsets), T-B5 (VM). No producer emits a Tier-B const yet
+> (wasm intra-data offsets), T-B5 (motor legado). No producer emits a Tier-B const yet
 > (`serialize_const` still honest-stops pointer-bearing aggregates — T-B6 flips it).
 
 ---
@@ -84,7 +86,7 @@ relocation, `.text`-section-relative (module-rebased)" (`encode_x86_64.tks:1921`
    Mach-O local rodata reloc / wasm intra-data offset) — T-B2/T-B3/T-B4.
 
 T-B1 delivers #1, #2, and the #3 seam (as a honest-stop). #4/#5 are the later
-writer/VM crumbs.
+writer/motor legado crumbs.
 
 ### 1.5 Codec audit (risk #5, answered)
 
@@ -179,7 +181,7 @@ pub type LDataReloc = struct { offset: u32; target: str }
  * @return        the data-relocation entry
  * @since #594 T-B1
  */
-pub fn data_reloc(offset: u32, target: str) -> LDataReloc {
+pub fn data_reloc(offset: u32, target: str): LDataReloc {
     LDataReloc { offset = offset; target = target }
 }
 ```
@@ -192,7 +194,7 @@ flat-bytes behavior):
     string literal's UTF-8, an interpolation piece, or a Tier-A aggregate const's
     serialized image), and its internal pointer relocations (#594 T-B1 — EMPTY for
     every entry the compiler produces today; a Tier-B aggregate const populates it
-    from T-B6, and T-B2..T-B5 teach the writers/VM to emit/resolve them). Referenced
+    from T-B6, and T-B2..T-B5 teach the writers/motor legado to emit/resolve them). Referenced
     by `LGlobalAddr` (A1-4, #382). */
 pub type LRodata = struct { symbol: str; bytes: []byte; relocs: []LDataReloc }
 ```
@@ -200,7 +202,7 @@ pub type LRodata = struct { symbol: str; bytes: []byte; relocs: []LDataReloc }
 `LRodata` literal edits (add `relocs = teko::list::empty()`):
 
 - `lower.tks:3888` (`intern_rodata`), `lower.tks:5162` (`intern_aggregate_const_decl`).
-- test helpers: `lir_interp_test.tkt:432`, any `lower_test.tkt` / `stackify_test.tkt`
+- test helpers: `lir_oracle_test.tkt:432`, any `lower_test.tkt` / `stackify_test.tkt`
   `LRodata { … }` builder (the compiler enumerates them).
 
 > `serialize_const` (`lower.tks:5137`) and its Tier-B honest-stop (`:5142`) are
@@ -212,7 +214,7 @@ pub type LRodata = struct { symbol: str; bytes: []byte; relocs: []LDataReloc }
 ### 2.4 `encode_rodata` — the consumer seam (honest-stop, all three encoders)
 
 `encode_rodata` gains a scan of each entry's `relocs`; if any is non-empty it
-honest-stops (a rodata-internal pointer needs the T-B2..T-B5 writer/VM path). Its
+honest-stops (a rodata-internal pointer needs the T-B2..T-B5 writer/motor legado path). Its
 return type becomes `ModuleRodata | error` (arm64 `encode_arm64.tks:2638`) and the
 `encode_module*` callers (`encode_x86_64.tks:2425`,
 `encode_arm64.tks:2735`, um backend encoder) match the new arm. Because every
@@ -223,7 +225,7 @@ byte-identical.
 /**
  * honest_data_reloc — the named honest-stop for a rodata-INTERNAL pointer relocation
  * (#594 T-B1): a Tier-B aggregate const whose rodata image contains a pointer needs a
- * data→data relocation the object writers/VM cannot emit until T-B2..T-B5 (§5.1). No
+ * data→data relocation the object writers/motor legado cannot emit until T-B2..T-B5 (§5.1). No
  * const produces one yet (`serialize_const` honest-stops pointer-bearing aggregates
  * upstream), so this never fires in T-B1 — it is the placed seam T-B2 replaces with
  * real `.rela.rodata` emission.
@@ -231,7 +233,7 @@ byte-identical.
  * @return  the located Tier-B honest-stop error
  * @since #594 T-B1
  */
-fn honest_data_reloc() -> error {
+fn honest_data_reloc(): error {
     error { message = "rodata-internal pointer relocation: emission lands in T-B2..T-B5 (#594 T-B)" }
 }
 
@@ -244,7 +246,7 @@ fn honest_data_reloc() -> error {
  * @return        true iff some entry has an `LDataReloc`
  * @since #594 T-B1
  */
-fn rodata_has_internal_relocs(rodata: []lir::LRodata) -> bool {
+fn rodata_has_internal_relocs(rodata: []lir::LRodata): bool {
     mut i: u64 = 0
     loop {
         if i >= rodata.len { break }
@@ -264,7 +266,7 @@ fn rodata_has_internal_relocs(rodata: []lir::LRodata) -> bool {
 and its signature/callsite:
 
 ```teko
-fn encode_rodata(rodata: []lir::LRodata) -> ModuleRodata | error
+fn encode_rodata(rodata: []lir::LRodata): ModuleRodata | error
 ```
 
 ```teko
@@ -317,7 +319,7 @@ could add a `Rodata` one):
    `encode_arm64_test.tkt`, um backend encoder (instruction/module goldens),
    `objfile_elf_test.tkt`, um backend ELF writer, `objfile_macho_test.tkt`,
    `objfile_coff_test.tkt` (object-file goldens), `lower_test.tkt`,
-   `lir_interp_test.tkt`, `tkb_test.tkt` — must ALL stay byte-for-byte green, and
+   `lir_oracle_test.tkt`, `tkb_test.tkt` — must ALL stay byte-for-byte green, and
    **fixpoint gen1==gen2** is the final proof that the self-hosting compiler emits
    identical bytes.
 
@@ -329,23 +331,23 @@ Each edit is independently gate-able; run the listed `.tkt` after each.
 
 | # | File | Edit | Regression gate (`.tkt`) |
 |---|---|---|---|
-| E1 | `src/lir/lir.tks` | `LDataReloc` type + `data_reloc` helper (§2.3); widen `LRodata` with `relocs` | `lower_test.tkt`, `lir_interp_test.tkt` compile + pass; `tkb_test.tkt` (proves codec still round-trips TProgram, unaffected) |
-| E2 | `src/lir/lower.tks` | add `relocs = teko::list::empty()` to `LRodata` literals `:3888`, `:5162`; leave `serialize_const:5142` honest-stop unchanged | `lower_test.tkt` (esp. the aggregate-const rodata test near `:877`), `lir_interp_test.tkt` |
+| E1 | `src/lir/lir.tks` | `LDataReloc` type + `data_reloc` helper (§2.3); widen `LRodata` with `relocs` | `lower_test.tkt`, `lir_oracle_test.tkt` compile + pass; `tkb_test.tkt` (proves codec still round-trips TProgram, unaffected) |
+| E2 | `src/lir/lower.tks` | add `relocs = teko::list::empty()` to `LRodata` literals `:3888`, `:5162`; leave `serialize_const:5142` honest-stop unchanged | `lower_test.tkt` (esp. the aggregate-const rodata test near `:877`), `lir_oracle_test.tkt` |
 | E3 | `src/backend/minst.tks` | `RelocSect` enum (§2.1) | `minst_test.tkt` compiles |
 | E4 | `src/backend/encode_x86_64.tks` | `sect` on `RelocX86` (`:1844`); `sect = RelocSect::Text` at `:2131`; `sect = r.sect` at `:2327`; `encode_rodata` guard + `\| error` + callsite `:2425` | `encode_x86_64_test.tkt`, `objfile_elf_test.tkt`, `objfile_coff_test.tkt` (all goldens byte-identical) |
 | E5 | `src/backend/encode_arm64.tks` | `sect` on `Reloc` (`:2066`); `sect = RelocSect::Text` at `:2340`; `sect = r.sect` at `:2504`; `encode_rodata` guard + `\| error` + callsite `:2735` | `encode_arm64_test.tkt`, `objfile_macho_test.tkt` |
 | E6 | `` | `sect` on um tipo de reloc (`:1798`); `sect = RelocSect::Text` at `:2199`; `sect = r.sect` at `:2322`; `encode_rodata` guard + `\| error` + callsite `:2491` | um backend encoder, um backend ELF writer |
-| E7 | test helpers (`lir_interp_test.tkt:432`, `lower_test.tkt`, `stackify_test.tkt`, `objfile_coff_test.tkt:117` `co_noreloc_module` if it builds `RelocX86`/`LRodata`) | add the new default fields to test-side literals | the touched `.tkt` themselves |
+| E7 | test helpers (`lir_oracle_test.tkt:432`, `lower_test.tkt`, `stackify_test.tkt`, `objfile_coff_test.tkt:117` `co_noreloc_module` if it builds `RelocX86`/`LRodata`) | add the new default fields to test-side literals | the touched `.tkt` themselves |
 
 > The writers (`objfile_elf.tks`, um backend ELF writer, `objfile_macho.tks`,
 > `objfile_coff.tks`) are **NOT edited in T-B1** (§2.5 decision). They are T-B2/T-B3.
 
 ---
 
-## 5. Regression fixtures to ADD (inputs → expected, VM and native)
+## 5. Regression fixtures to ADD (inputs → expected, motor legado and native)
 
 All three are unit `.tkt` tests calling the backend directly, so they run identically
-under the VM and the native harness (same `error`/exit outcome).
+under the motor legado and the native harness (same `error`/exit outcome).
 
 1. **The gate fires (new behavior):** hand-build an `LModule` with one `LRodata {
    symbol = "k"; bytes = <8 zero bytes>; relocs = [data_reloc(0, "other")] }` and call
@@ -372,7 +374,7 @@ is the byte-identity guard.
 
 - **Per-edit:** the file's own `.tkt` gate (table §4) — each edit is gate-able alone.
 - **RITUAL POINT — end of T-B1:** the FULL gate (every backend golden byte-identical
-  + `lower`/`lir_interp`/`tkb` suites + **fixpoint gen1==gen2** + both engines). Zero
+  + `lower`/`lir_oracle`/`tkb` suites + **fixpoint gen1==gen2** + both engines). Zero
   bytes changed, so a green full gate IS the compatibility proof. **No seed bump** —
   T-B1 adds no capability the corpus uses (the 🔑 SEED BUMP #3 is after T-B5, §8).
 

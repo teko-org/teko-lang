@@ -95,9 +95,6 @@ Veredito por alvo:
   índice const-expr**; (ii) trocar `gzip_cm_deflate()` por um `const GZIP_CM_DEFLATE: byte = 8
   to byte` (ele já é `{ 8 to byte }`). Então `const GZIP_HEADER: []byte = [GZIP_MAGIC[0],
   GZIP_MAGIC[1], GZIP_CM_DEFLATE, 0 to byte, …]`.
-- **`wasm_preamble` (objfile_wasm.tks:172) → PRECISA ESTENDER const-eval** (mesmo Tier-6
-  `TIndex`-de-const para `WASM_MAGIC[0..3]`; `WASM_VERSION_1` já é Tier-3 OK).
-- **`wasm_narrow_msg_bytes` (stackify.tks:4503) → PRECISA ESTENDER const-eval** (str→[]byte em
   posição const) OU manter gerador. Um byte-array literal perde a string legível; a extensão
   limpa é permitir `const MSG: []byte = "…"` (coerção str→bytes const).
 
@@ -164,8 +161,8 @@ Ritual: fixpoint + probe: allocs de `cg_variant_typename_str` no dark-matter →
   (`src/parser/optokens.tks:25`, `parse_multiplicative` `src/parser/parse_expr.tks:511`); o unário é
   só `- ~ !` (`optokens.tks:9-13`). Um `&` em posição de PREFIXO é inambíguo (binário só ocorre
   após operando esquerdo). `*`/deref NÃO muda em F1 (prospecção, §12 do doc-mãe).
-- Spine (#331): queries PURAS já existem — `is_unique_at(s, binding) -> bool`
-  (`src/checker/spine.tks:1484`), `ref_target_outlives(s, borrow, referent) -> bool` (`:1438`),
+- Spine (#331): queries PURAS já existem — `is_unique_at(s, binding): bool`
+  (`src/checker/spine.tks:1484`), `ref_target_outlives(s, borrow, referent): bool` (`:1438`),
   `BorrowedFrom = BfNone|BfParam|BfLocal|BfTop` (`:146`). A relaxação **L2a** (`bf := BfLocal` no
   ÚNICO sítio sintático de borrow de um ref-bind local) está descrita `:21-23,:139-143,:1268,:1352`
   — é EXATAMENTE a máquina do `mut y = &x`. F1 é o CONSUMO (PR-2/PR-3), não a query.
@@ -186,7 +183,7 @@ código morto (caminhos novos não exercitados pelo self-build) até AL3/AL6 mig
 | **F1.1** | Parser: prefixo `&x` como expr de borrow → AST | S | build verde + parser_test.tkt |
 | **F1.2** | Checker: tipar `&x` → `Reference<T>` (mut/shared inferido); rejeitar `&(let)` mutável | M | checker_test.tkt + fixpoint |
 | **F1.3** | Spine: autorizar borrow exclusivo (`is_unique_at`) + lifetime (`ref_target_outlives`); L2a `bf:=BfLocal`; relaxar escape-gate p/ o sink `mut y=&x` | M | spine_test.tkt + fixpoint verde |
-| **F1.4** | Codegen: lower `Borrow` → address-of `&` | S | codegen_test.tkt + diff VM==native |
+| **F1.4** | Codegen: lower `Borrow` → address-of `&` | S | codegen_test.tkt + native validation |
 | **F1.5** | Ponte: `teko::list::grow(&x, v)` (coexistência, sem migrar sites) | S | list_test.tkt + fixpoint |
 | **F1.6** | Fixtures de regressão + fixpoint verde (prova de aditividade) | S | **RITUAL: fixpoint gen1==gen2 INALTERADO** |
 
@@ -235,7 +232,7 @@ ESTE primeiro. O sink local `mut y = &x` fica gated por F1.3.
  * @throws      error when the operand is not a `mut` lvalue in a mutable position, or not an lvalue
  * @since 0.x (#AL/F1.2)
  */
-fn type_borrow_expr(b: parser::Borrow, env: Env, mut_pos: bool) -> TExpr | error
+fn type_borrow_expr(b: parser::Borrow, env: Env, mut_pos: bool): TExpr | error
 ```
 
 **F1.3 — Spine.** No sítio de borrow (o nó `Borrow` OU o ref-bind local `mut y = &x`), CONSUMIR as
@@ -265,7 +262,7 @@ semântica de valor (o `cap`-no-objeto vem em F3/AL3; aqui a ponte só troca a a
 /**
  * Grow `x` by appending `v`, mutating `x` IN-PLACE through the exclusive mutable borrow `&x` (F1
  * bridge). This is the coexistence signature for the ref-push migration (AL3): it lives ALONGSIDE
- * the untouched value-thread `push(xs, v) -> []T` so no unmigrated site changes. F1's body writes
+ * the untouched value-thread `push(xs, v): []T` so no unmigrated site changes. F1's body writes
  * through the reference (`x.value = push(x.value, v)`) — behavior-identical to the value form; the
  * cap-in-object win that removes the global tk_push_cache lands with F3+AL3, not here. Migration is
  * gradual, fixpoint-green per sub-lote (§6); a final rename to `push` is optional once all sites move.
@@ -276,25 +273,24 @@ semântica de valor (o `cap`-no-objeto vem em F3/AL3; aqui a ponte só troca a a
  * @throws   panic if cap overflows u64 (M.1 fail-loud) — reached only once F3's cap-doubling lands
  * @since 0.x (#AL/F1.5 bridge; in-place cap = AL3)
  */
-pub fn grow[T](x: &[]T, v: T) -> void
+pub fn grow[T](x: &[]T, v: T)
 ```
 
 **F1.6 — Fixtures + ritual.** `.tkt` colocados (o padrão do repo: `src/<mod>/<mod>_test.tkt`, testes
-Teko com assert), MAIS 1–2 programas end-to-end rodados VM e native pra paridade de exit code:
+Teko com assert), MAIS 1–2 programas end-to-end rodados natively pra validação de exit code:
 
-| Fixture | Onde | Entrada | Esperado (VM==native) |
+| Fixture | Onde | Entrada | Esperado (native) |
 |---|---|---|---|
 | borrow-parse | `src/parser/parser_test.tkt` | `&x` prefixo → `Borrow{Var}`; `a & b` → `Binary` | AST correta; exit 0 |
 | borrow-mut-ok | `src/checker/checker_test.tkt` | `mut x=…; grow(&x, v)` | tipa `Reference`; exit 0 |
 | borrow-let-reject | `src/checker/checker_test.tkt` | `let x=…; grow(&x, v)` | erro "immutable"; exit ≠0 (gate rejeita) |
 | borrow-alias-reject | `src/checker/spine_test.tkt` | dois borrows mut vivos de `x` | `is_unique_at`=false → erro exclusivo-XOR |
 | borrow-outlives | `src/checker/spine_test.tkt` | `mut y=&x` sink local | `ref_target_outlives`=true; escape-gate admite |
-| borrow-codegen | `src/codegen/codegen_test.tkt` | `grow(&x, v)` | emite `&x`; `<T> *`; diff VM==native byte-idêntico |
+| borrow-codegen | `src/codegen/codegen_test.tkt` | `grow(&x, v)` | emite `&x`; `<T> *`; native validation byte-idêntico |
 | e2e-noop | programa end-to-end | corpus que NÃO usa `&x` | **fixpoint gen1==gen2 INALTERADO** |
 
 **RITUAL de F1 (o que prova aditividade):** (1) fixpoint gen1==gen2 verde e INALTERADO — nada no
-corpus usa `&x`, então o C emitido pro alvo é byte-idêntico; (2) golden do corpus-alvo + diff
-VM==native; (3) suites `_test.tkt` novas verdes. NÃO deve haver mudança em bytes emitidos pro alvo
+corpus usa `&x`, então o C emitido pro alvo é byte-idêntico; (2) golden do corpus-alvo + native validation; (3) suites `_test.tkt` novas verdes. NÃO deve haver mudança em bytes emitidos pro alvo
 (F1 é aditivo); qualquer diff no golden do alvo é REGRESSÃO, não esperado.
 
 **Risco/tensão:** nenhuma tensão de lei (carve-out `ref` já legislado; `*` não tocado). Risco único

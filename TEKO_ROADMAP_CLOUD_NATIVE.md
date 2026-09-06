@@ -69,7 +69,7 @@ assert clean drain + exit code.
 **▪ CN6 — `teko::resilience`.** **Deps:** `teko::time`, closures (W10 ✅). **Files:**
 `src/resilience/*.tks`. **Retry** with backoff (exponential + jitter) + max attempts, **circuit breaker**
 (closed/open/half-open), **timeout** wrapper, **bulkhead**/semaphore-limit. All as higher-order functions
-over a fallible closure `() -> T | error`. **Verify:** `.tkt` — deterministic backoff schedule, breaker
+over a fallible closure `(): T | error`. **Verify:** `.tkt` — deterministic backoff schedule, breaker
 state transitions (fixed clock injected).
 
 ### Scheduling / background work

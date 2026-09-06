@@ -240,7 +240,7 @@ instruction-encoding order B1 fixed (`RAX=0,RCX=1,RDX=2,RBX=3,RSP=4,RBP=5,RSI=6,
  *
  * @return AbiDescriptor  the Win64 register file
  */
-pub fn win64() -> AbiDescriptor {
+pub fn win64(): AbiDescriptor {
     AbiDescriptor {
         gpr_arg = win64_gpr_arg_seq()
         fpr_arg = push_range(teko::list::empty(), 0, 3)
@@ -330,7 +330,7 @@ The frame is the ONLY part of `encode_x86_64.tks` B3 touches, and only its side-
  * @param MFuncX86 f  the fully-physical function
  * @return bool  true iff the function issues at least one call
  */
-fn func_makes_call_x86(f: MFuncX86) -> bool { … }
+fn func_makes_call_x86(f: MFuncX86): bool { … }
 ```
 
 ### 4.2 `compute_frame_layout_x86` — the shadow-space reservation (the one guarded change)
@@ -486,7 +486,7 @@ type CoffStrtab = struct {
  * @param []Symbol symbols  the symbol table, in emission order
  * @return CoffStrtab  the string-table bytes + per-symbol inline/offset resolution
  */
-fn build_coff_strtab(symbols: []Symbol) -> CoffStrtab { … }
+fn build_coff_strtab(symbols: []Symbol): CoffStrtab { … }
 ```
 
 ### 5.3 The symbol table — local(static)-then-external, aux-free MVP
@@ -534,7 +534,7 @@ numerically (the ONLY COFF knowledge the writer injects), exactly as the ELF ada
  * @param RelocKindX86 kind  the relocation kind the encoder tagged
  * @return u32  the `IMAGE_RELOCATION` `Type` field value
  */
-fn coff_reloc_type(kind: RelocKindX86) -> u32 {
+fn coff_reloc_type(kind: RelocKindX86): u32 {
     match kind {
         Plt32 => 0x0004 to u32
         Pc32  => 0x0004 to u32
@@ -572,7 +572,7 @@ fn coff_reloc_type(kind: RelocKindX86) -> u32 {
  * @param EncodedModuleX86 enc  the section images + symbols + relocations
  * @return []byte  the PE/COFF object file bytes
  */
-pub fn emit_coff(enc: EncodedModuleX86) -> []byte { … }
+pub fn emit_coff(enc: EncodedModuleX86): []byte { … }
 ```
 
 Baked A4-4/B1-7-class findings (as COFF requirements):
@@ -623,7 +623,7 @@ Baked A4-4/B1-7-class findings (as COFF requirements):
  * @param m     the resolved manifest (link knobs)
  * @return      0 on a successful build+link, else the failing status
  */
-fn emit_native_win(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest) -> i32 {
+fn emit_native_win(dir: str, od: str, stem: str, lmod: teko::lir::LModule, prog: checker::TProgram, m: Manifest): i32 {
     let sel = match teko::backend::select_module_x86(lmod) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
     let col = match teko::backend::regalloc_module_x86(teko::backend::win64(), sel) { teko::backend::MModuleX86 as x => x; error as e => return fail(dir, e.message) }
     let enc = match teko::backend::encode_module_x86(teko::backend::win64(), col) { teko::backend::EncodedModuleX86 as x => x; error as e => return fail(dir, e.message) }
@@ -683,12 +683,12 @@ placement, and the FIRST executing own==C differential that runs the artifact NA
 | `.obj` well-formedness (`llvm-readobj --sections/--symbols/--relocations` / `llvm-objdump` / `lld-link`) | ✓ | ✓ (llvm tools cross-format) |
 | **executing `C-native == own-native` differential** | ✓ (runs the PE natively) | honest-skip (cannot run PE) |
 
-### 6.3 The interp oracle — NO parallel `minst_x86_interp` (inherited from B1's R-2)
+### 6.3 The oracle — NO parallel `minst_x86_oracle` (inherited from B1's R-2)
 
 B3 adds no instruction semantics (it reuses `MInstX86` whole), so the oracle question is B1's exactly:
-the target-independent LIR interp + the assembler-cross-checked goldens + the EXECUTING Windows
-differential (a runner that runs the artifact natively) cover the oracle role. No parallel interp is
-built (inherited `B1-interp`, REPORTED not blocking).
+the target-independent LIR oracle + the assembler-cross-checked goldens + the EXECUTING Windows
+differential (a runner that runs the artifact natively) cover the oracle role. No parallel oracle is
+built (inherited `B1-oracle`, REPORTED not blocking).
 
 ---
 
@@ -763,7 +763,7 @@ the COFF `.o` via host `clang -target x86_64-windows` (which drives `lld-link`) 
   `Symbol` stay single-sourced. A future extraction — a neutral "object skeleton" describing
   sections/symbols/relocs that each format renders — is the same DRY-sweep candidate B1's R-1 / B2's
   R-1 raise. REPORTED for the integrator to sequence (a 0.3.1 DRY-sweep companion), not a B3 blocker.
-- **R-2 · No parallel `minst_x86_interp`.** §6.3 — inherited from B1's R-2; the LIR interp + goldens +
+- **R-2 · No parallel `minst_x86_oracle`.** §6.3 — inherited from B1's R-2; the LIR oracle + goldens +
   the executing Windows differential cover the oracle role. REPORTED.
 - **R-3 · `own_print_exit` (LIR builtin-call surface).** The KNOWN-STOP (`diff_c_own.sh:190`, `println`
   vs `tk_println`) is a shared LIR-lowering gap — it KNOWN-STOPs identically on the Windows lane (the
@@ -828,7 +828,7 @@ object format (COFF), so it hardens the shared pipeline against ABI/format coupl
 
 ### 9.3 Ritual posture — RIGHT-SIZED (dono ruling 2026-07-10; CI is the gate)
 
-- **CI is the gate.** The FULL gate (both engines + FIXPOINT + paranoid + the Windows differential) runs
+- **CI is the gate.** The FULL gate (native validation + FIXPOINT + paranoid + the Windows differential) runs
   in CI at the ritual points. Local per-slice verification is PROPORTIONATE — the
   default-path-unchanged proof + the slice's own goldens/tests + (for the frame slice) B1's x86 frame
   goldens re-green byte-identical + (for the writer slice) the `emit_coff` goldens + a `lld-link`
@@ -840,7 +840,7 @@ object format (COFF), so it hardens the shared pipeline against ABI/format coupl
 - **100% coverage on new code (definition-of-done).** The COFF writer is branchy (per-section,
   inline-vs-strtab name, per-reloc-kind, static-vs-external symbol) — cover every branch + every
   honest-stop arm via goldens; a genuinely unreachable arm is justified in the PR.
-- **VM-gotcha watch** (dense byte-work, the A4/B1/B2 list carries over): (a) build the COFF records in
+- **byte-work gotcha watch** (dense byte-work, the A4/B1/B2 list carries over): (a) build the COFF records in
   `u32`/`u64`, narrow to `byte` only at the last LE-emit step; (b) the 18-byte `IMAGE_SYMBOL` is
   UNALIGNED — do not `pad_to_mult` the symbol table (COFF packs it); (c) no `x = match {…return}` —
   use `let x = match {…}` then act; (d) a NEGATIVE `to u32`/`to u8` **panics** — the strtab 4-byte size
@@ -861,7 +861,7 @@ object format (COFF), so it hardens the shared pipeline against ABI/format coupl
 - After **B3-3** (COFF writer): full CI gate + the `emit_coff` header/section/symtab/reloc goldens
   green + `llvm-readobj --sections/--symbols/--relocations` / `lld-link` consumability on the emitted object (any host,
   machine-free).
-- The **KEYSTONE full CI ritual at B3-4**: the whole gate — both engines + fixpoint + the **windows-x86_64
+- The **KEYSTONE full CI ritual at B3-4**: the whole gate — native validation (C-native + own-x86_64) + fixpoint + the **windows-x86_64
   C-vs-own leg green** (executing the PE NATIVELY on the runner) + the macOS byte-test lane green.
 
 ---

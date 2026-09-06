@@ -17,7 +17,7 @@
 > C backend is a **transitional emitter to be deleted**, never a capability we bank on.
 >
 > **Semantic model = `docs/design/ref-transparent-model.md`** (executed here). Companions:
-> `docs/design/marshall-spec.md`, `docs/design/memory-unsafe-backend-remodel.md` (§4 the VM/backend
+> `docs/design/marshall-spec.md`, `docs/design/memory-unsafe-backend-remodel.md` (§4 backend
 > direction — own AOT backend + linker; C dies), `docs/design/own-backend-architecture.md`,
 > `docs/design/null-union-c3-c7-0.3.0.30.md` (the accept→adopt seed dance), `docs/design/
 > wave-0.3.1-plan.md`. Verified against `src/`.
@@ -47,6 +47,15 @@
 .32              C backend DEAD    ── no cc, no C preprocessor, no cc link driver
 .33–.34          OWN LINKER        ── resolve C-lib symbols (.a/.o/.so) with no cc
 ```
+
+> **⚠ SUPERSEDED (2026-07-28, ruling "Plano de Sequenciamento por Plataforma"):** the timeline above
+> reflects the design-ahead sketch. The **actual backend retirement is per-platform** — the C backend is
+> **ALIVE until 0.3.1.4 inclusive** (per the sequenced roadmap at
+> `docs/memory/0.3.1-plano-sequenciado-por-plataforma.md` § Discrepância encontrada), then each platform
+> that has migrated to native discontinues it, others migrate or pause. This correction does not alter
+> the FFI design (all capabilities remain own-backend-first); it updates the **nominal version** where
+> the C emitter is **decommissioned globally**. Reference: `0.3.1-plano-sequenciado-por-plataforma.md`
+> for platform-specific migration.
 
 **Consequence:** every FFI capability must be split into (a) an **own-backend codegen** part that is
 own-native and ships as early as the own backend can express it, and (b) — only where unavoidable — a
@@ -137,7 +146,7 @@ linker dependency. Ships .30, own-native.
 
 ### 4.2 C MACROS without a C preprocessor — the teko-native macro RESOLVER (the hard problem)
 
-`extern macro fn N(params) -> R = "MACRO" from header "h.h"` is resolved at build-time by a
+`extern macro fn N(params): R = "MACRO" from header "h.h"` is resolved at build-time by a
 **teko-native resolver** the compiler owns — it reads the named header, finds the `#define`, and
 resolves it in **tiers**, never invoking `cc`:
 
@@ -152,7 +161,7 @@ resolves it in **tiers**, never invoking `cc`:
  * @return u32   the asserted result
  * @since 0.3.1
  */
-extern macro fn htonl(x: u32) -> u32 = "htonl" from header "arpa/inet.h"
+extern macro fn htonl(x: u32): u32 = "htonl" from header "arpa/inet.h"
 ```
 
 - **Tier 0 — object-like / CONSTANT macro** (`O_RDONLY`, `INT_MAX`, `SOCK_STREAM`, flag bits — the
@@ -186,7 +195,7 @@ always-present honest error.
 
 ### 4.3 VARARGS — a per-target own-backend ABI (not delegated to any C compiler)
 
-`extern fn printf(fmt: *byte, ...) -> i32 = "printf"` (`...` = C-ABI variadic tail, extern-only,
+`extern fn printf(fmt: *byte, ...): i32 = "printf"` (`...` = C-ABI variadic tail, extern-only,
 trailing; default argument promotions `f32→f64`, sub-`int`→`int`). The **own backend implements the
 platform varargs calling convention itself**:
 
@@ -260,7 +269,7 @@ everything else (codegen) is earlier and own-native.
  * @since 0.3.0.30
  */
 #[export("teko_add")]
-pub fn add(a: i64, b: i64) -> i64 { a + b }
+pub fn add(a: i64, b: i64): i64 { a + b }
 ```
 
 ---
@@ -341,7 +350,7 @@ Each KC crumb rides GATE-G; KC4 is the ritual proof that the own backend stands 
 `teko build . --no-verify --release && ./bin/teko test .` + fixpoint + `diff_vm_native`. In .30 `src/`
 is unchanged, so fixpoint holds trivially (additions inert). In .31 each swap crumb holds fixpoint on
 the new spelling. **When the own-backend FFI paths land (KC), the differential migrates from
-VM/C-backend to own-vs-C-backend and then, at kill-C, to own-backend-only** (remodel §4). A0/D4/A31.5
+C-backend to own-vs-C-backend and then, at kill-C, to own-backend-only** (remodel §4). A0/D4/A31.5
 skip fixpoint.
 
 ## 10. Seed-safety (.30 built by seed `0.3.0.29`)
@@ -362,7 +371,7 @@ passes via the C emitter is a regression trap. Native oracle = own backend.
 `ref_optional_pointee_ok`; `old_surface_still_ok` (coexistence); `let_ref_rejected`/
 `ref_uninit_rejected`/`ref_depth_cap3_rejected` (COMPILE_FAIL). Pointers: `ptr_deref_ok`/
 `ptr_index_ok`/`ptr_arrow_ok`/`ptr_arith_ok`/`ptr_addr_of_ok`; `ptr_deref_in_safe_rejected`/
-`ptr_void_deref_rejected`/`ptr_optional_question_rejected`. `marshall_swap_values` (VM==native)/
+`ptr_void_deref_rejected`/`ptr_optional_question_rejected`. `marshall_swap_values` /
 `marshall_wrap_null_panics`. FFI: `macro_const_flag_ok` (**Tier 0, own backend, no cc** — e.g.
 `O_RDONLY`), `macro_htonl_expand_ok` (**Tier 2, own backend**), `macro_complex_rejected` (Tier 3
 honest error); `repr_c_struct_byval` (own layout), `cabi_callback_noncapturing` (+ `_capturing_rejected`),

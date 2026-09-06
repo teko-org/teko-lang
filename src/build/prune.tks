@@ -1,0 +1,68 @@
+use teko::parser
+
+pub type CcEnv = struct {
+    os: str
+    arch: str
+    build_flags: []str
+}
+
+fn str_list_contains(xs: []str, needle: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == needle { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn pred_axis_eq(e: parser::PEq, env: CcEnv): bool {
+    if e.axis == "os" { return env.os == e.value }
+    if e.axis == "arch" { return env.arch == e.value }
+    false
+}
+
+pub fn eval_pred(p: parser::Pred, env: CcEnv): bool {
+    match p.kind {
+        parser::PTrue => true
+        parser::PEq as e => pred_axis_eq(e, env)
+        parser::PFlag as f => str_list_contains(env.build_flags, f.name)
+        parser::PNot as n => !eval_pred(n.inner, env)
+        parser::PAnd as a => eval_pred(a.left, env) && eval_pred(a.right, env)
+        parser::POr as o => eval_pred(o.left, env) || eval_pred(o.right, env)
+    }
+}
+
+pub type PruneMode = struct {
+    keep_target_arms: bool
+}
+
+fn cc_eval_at(p: parser::Pred, env: CcEnv, os: str, arch: str): bool {
+    eval_pred(p, CcEnv { os = os; arch = arch; build_flags = env.build_flags })
+}
+
+fn cc_target_survives(p: parser::Pred, env: CcEnv): bool {
+    if cc_eval_at(p, env, "linux", "x86_64") { return true }
+    if cc_eval_at(p, env, "linux", "arm64") { return true }
+    if cc_eval_at(p, env, "macos", "arm64") { return true }
+    if cc_eval_at(p, env, "windows", "x86_64") { return true }
+    false
+}
+
+fn cc_keep_item(it: parser::Item, env: CcEnv, mode: PruneMode): bool {
+    if !mode.keep_target_arms { return eval_pred(it.guard, env) }
+    cc_target_survives(it.guard, env)
+}
+
+pub fn prune_cc(program: parser::Program, env: CcEnv, mode: PruneMode): parser::Program {
+    var kept: [program.items.len]parser::Item = []
+    var count: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= program.items.len { break }
+        var it = program.items[i]
+        if cc_keep_item(it, env, mode) { kept[count] = it; count = count + 1 }
+        i = i + 1
+    }
+    parser::Program { items = teko::collections::arr_slice(kept, 0, count) }
+}

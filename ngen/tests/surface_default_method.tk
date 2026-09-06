@@ -1,0 +1,81 @@
+// surface_default_method.tk -- a default argument on a method (entrega 4, crumb
+// C1): `i64 area(i64 k = 2)`, in a class, in a struct, in a trait and as an
+// interface signature. The default belongs to the DECLARATION the call site
+// resolves against, and the call site fills it in -- so a `virtual`/`override`
+// pair keeps ONE vtable slot: `b.area()` on a name declared `Base` takes Base's
+// own default and still runs Derived's override, while `d.area()` on the
+// derived name takes Derived's.
+//
+// An unqualified call fills the default too: `area()` inside `scaled` is
+// `this.area()`, and it takes the default of the declaration it lands on.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+interface Scaled {
+    i64 scaled(i64 k = 3);
+}
+
+trait Doubling {
+    public i64 twice(i64 k = 2) {
+        return n * k;
+    }
+}
+
+struct Box {
+    public i64 w;
+
+    public i64 grow(i64 k = 4) {
+        return w + k;
+    }
+}
+
+class Base : Scaled {
+    public i64 n;
+
+    use Doubling;
+
+    public virtual i64 area(i64 k = 2) {
+        return n * k;
+    }
+
+    public i64 scaled(i64 k) {
+        return area() * k;
+    }
+}
+
+class Derived : Base {
+    public override i64 area(i64 k = 5) {
+        return n * k * 10;
+    }
+}
+
+i64 main() {
+    Box x = new Box;
+    x.w = 8;
+    if (x.grow() != 12) return 1;                // a method on a struct, direct call
+    if (x.grow(1) != 9) return 2;
+
+    Base b = new Base;
+    b.n = 3;
+    if (b.area() != 6) return 3;                 // the virtual's own default
+    if (b.area(4) != 12) return 4;
+    if (b.twice() != 6) return 5;                // the trait's method, copied in
+    if (b.twice(3) != 9) return 6;
+
+    Derived d = new Derived;
+    d.n = 1;
+    if (d.area() != 50) return 7;                // the override's own default
+    if (d.area(2) != 20) return 8;
+
+    Base r = d;
+    if (r.area() != 20) return 9;                // Base's default, Derived's slot
+    if (r.area(1) != 10) return 10;
+
+    Scaled s = b;
+    if (s.scaled() != 18) return 11;             // the interface's default, through the itab
+    if (s.scaled(1) != 6) return 12;
+
+    return b.area() + d.area(2) + x.grow() + 4;  // 6 + 20 + 12 + 4
+}

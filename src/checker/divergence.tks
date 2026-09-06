@@ -1,0 +1,329 @@
+
+use teko::parser
+
+type DivTable = struct {
+    mask: u64
+    hashes: []u64
+    ns: []str
+    names: []str
+    slots: []u64
+    diverges: []u64
+}
+
+pub type DivergeSet = struct {
+    mask: u64
+    hashes: []u64
+    ns: []str
+    names: []str
+    present: []u64
+}
+
+fn pair_hash(ns: str, name: str): u64 {
+    var a = teko::runtime::str_hash(ns)
+    var b = teko::runtime::str_hash(name)
+    (a ^ (b << 13)) ^ (b >> 7)
+}
+
+fn div_tab_cap(entries: u64): u64 {
+    var want = (entries + 1) * 2
+    var cap: u64 = 16
+    loop {
+        if cap >= want { break }
+        cap = cap * 2
+    }
+    cap
+}
+
+fn count_tfunctions(items: []@TItem()): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        match items[i] {
+            TFunction => n = n + 1
+            _ => { }
+        }
+        i = i + 1
+    }
+    n
+}
+
+fn call_last_name(c: TCall): str {
+    if c.callee.segments.len == 0 { return "" }
+    c.callee.segments[c.callee.segments.len - 1].name
+}
+
+fn call_is_indirect(c: TCall): bool {
+    c.is_closure_call || c.is_iface_dispatch
+}
+
+fn table_group_diverges(t: DivTable, ns: str, name: str): bool {
+    if t.slots.len == 0 { return false }
+    var h = pair_hash(ns, name)
+    var at = h & t.mask
+    loop {
+        if t.slots[at] == 0 { return false }
+        if t.hashes[at] == h && t.ns[at] == ns && t.names[at] == name {
+            return t.diverges[t.slots[at] - 1] == 1
+        }
+        at = (at + 1) & t.mask
+    }
+    false
+}
+
+fn call_triggers(t: DivTable, c: TCall): bool {
+    if tcall_is_diverging_builtin(c) { return true }
+    if call_is_indirect(c) { return true }
+    if c.call_ns.len == 0 { return false }
+    var last = call_last_name(c)
+    if last.len == 0 { return false }
+    table_group_diverges(t, c.call_ns, last)
+}
+
+fn args_reach(t: DivTable, args: []TExpr): bool {
+    var i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if expr_reaches(t, args[i]) { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn expr_reaches(t: DivTable, e: TExpr): bool {
+    match e.kind {
+        TCall as c => {
+            if call_triggers(t, c) { return true }
+            args_reach(t, c.args)
+        }
+        TBinary as b => expr_reaches(t, b.left) || expr_reaches(t, b.right)
+        TUnary as u => expr_reaches(t, u.operand)
+        TCompare as cm => {
+            if expr_reaches(t, cm.first) { return true }
+            var i: u64 = 0
+            loop {
+                if i >= cm.rest.len { break }
+                if expr_reaches(t, cm.rest[i].operand) { return true }
+                i = i + 1
+            }
+            false
+        }
+        TIfExpr as f => {
+            if expr_reaches(t, f.cond) { return true }
+            if block_reaches(t, f.then_blk) { return true }
+            f.has_else && block_reaches(t, f.else_blk)
+        }
+        TMatchExpr as m => {
+            if expr_reaches(t, m.subject) { return true }
+            var i: u64 = 0
+            loop {
+                if i >= m.arms.len { break }
+                if m.arms[i].has_when && expr_reaches(t, m.arms[i].guard) { return true }
+                if block_reaches(t, m.arms[i].body) { return true }
+                i = i + 1
+            }
+            false
+        }
+        TCast as ct => expr_reaches(t, ct.expr)
+        TFieldAccess as fa => expr_reaches(t, fa.receiver)
+        TIndex as ix => expr_reaches(t, ix.receiver) || expr_reaches(t, ix.index)
+        TStructInit as si => args_reach(t, si.field_vals)
+        TArrayLit as al => {
+            var i: u64 = 0
+            loop {
+                if i >= al.elements.len { break }
+                if expr_reaches(t, al.elements[i].expr) { return true }
+                i = i + 1
+            }
+            false
+        }
+        TSliceOfLen as s => expr_reaches(t, s.size)
+        TInterp as ip => {
+            var i: u64 = 0
+            loop {
+                if i >= ip.holes.len { break }
+                if expr_reaches(t, ip.holes[i]) { return true }
+                if i < ip.specs.len {
+                    match ip.specs[i].kind {
+                        TFSpecDynamic as fd => if args_reach(t, fd.args) { return true }
+                        _ => { }
+                    }
+                }
+                i = i + 1
+            }
+            false
+        }
+        TInExpr as ine => {
+            if expr_reaches(t, ine.lhs) { return true }
+            args_reach(t, ine.elems)
+        }
+        TBorrow as b => expr_reaches(t, b.operand)
+        TBlockExpr as b => block_reaches(t, b.body)
+        _ => false
+    }
+}
+
+fn stmt_reaches(t: DivTable, s: @TStatement()): bool {
+    match s {
+        TBinding as b => expr_reaches(t, b.value)
+        TAssign as a => expr_reaches(t, a.value) || (parser::assign_has_target(a.kind) && expr_reaches(t, a.target))
+        TReturn as r => r.has_value && expr_reaches(t, r.value)
+        TExprStmt as es => expr_reaches(t, es.expr)
+        TLoopStmt as l => block_reaches(t, l.init) || block_reaches(t, l.body)
+        TDeferStmt as d => block_reaches(t, d.body)
+        TAdoptStmt as a => block_reaches(t, a.body)
+        TBlockStmt as b => block_reaches(t, b.body)
+        TSpawn as sp => match sp.call.kind {
+            TCall as c => args_reach(t, c.args)
+            _ => expr_reaches(t, sp.call)
+        }
+        TBreakStmt => false
+        TContinueStmt => false
+    }
+}
+
+fn block_reaches(t: DivTable, body: []@TStatement()): bool {
+    var i: u64 = 0
+    loop {
+        if i >= body.len { break }
+        if stmt_reaches(t, body[i]) { return true }
+        i = i + 1
+    }
+    false
+}
+
+pub fn divergence_analysis(prog: TProgram): DivergeSet {
+    var fcount = count_tfunctions(prog.items)
+    var cap = div_tab_cap(fcount)
+    var mask = cap - 1
+    var ghashes: [cap]u64 = []
+    var gns: [cap]str = []
+    var gnames: [cap]str = []
+    var gslots: [cap]u64 = []
+    var group_ns: [fcount]str = []
+    var group_name: [fcount]str = []
+    var diverges: [fcount]u64 = []
+    var fn_gid: [fcount]u64 = []
+    var ngroups: u64 = 0
+    var kf: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TFunction as f => {
+                var h = pair_hash(f.namespace, f.name)
+                var at = h & mask
+                loop {
+                    if gslots[at] == 0 {
+                        gslots[at] = ngroups + 1
+                        ghashes[at] = h
+                        gns[at] = f.namespace
+                        gnames[at] = f.name
+                        group_ns[ngroups] = f.namespace
+                        group_name[ngroups] = f.name
+                        fn_gid[kf] = ngroups
+                        ngroups = ngroups + 1
+                        break
+                    }
+                    if ghashes[at] == h && gns[at] == f.namespace && gnames[at] == f.name {
+                        fn_gid[kf] = gslots[at] - 1
+                        break
+                    }
+                    at = (at + 1) & mask
+                }
+                kf = kf + 1
+            }
+            _ => { }
+        }
+        i = i + 1
+    }
+    loop {
+        var t = DivTable { mask = mask; hashes = ghashes; ns = gns; names = gnames; slots = gslots; diverges = diverges }
+        var changed = false
+        var kf2: u64 = 0
+        var j: u64 = 0
+        loop {
+            if j >= prog.items.len { break }
+            match prog.items[j] {
+                TFunction as f => {
+                    var gid = fn_gid[kf2]
+                    kf2 = kf2 + 1
+                    if diverges[gid] == 0 && block_reaches(t, f.body) {
+                        diverges[gid] = 1
+                        changed = true
+                    }
+                }
+                _ => { }
+            }
+            j = j + 1
+        }
+        if !changed { break }
+    }
+    build_diverge_set(group_ns, group_name, diverges, ngroups)
+}
+
+fn count_true(diverges: []u64, ngroups: u64): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= ngroups { break }
+        if diverges[i] == 1 { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+fn build_diverge_set(group_ns: []str, group_name: []str, diverges: []u64, ngroups: u64): DivergeSet {
+    var ndiv = count_true(diverges, ngroups)
+    var cap = div_tab_cap(ndiv)
+    var mask = cap - 1
+    var hashes: [cap]u64 = []
+    var ns: [cap]str = []
+    var names: [cap]str = []
+    var present: [cap]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= ngroups { break }
+        if diverges[i] == 1 {
+            var h = pair_hash(group_ns[i], group_name[i])
+            var at = h & mask
+            loop {
+                if present[at] == 0 {
+                    present[at] = 1
+                    hashes[at] = h
+                    ns[at] = group_ns[i]
+                    names[at] = group_name[i]
+                    break
+                }
+                at = (at + 1) & mask
+            }
+        }
+        i = i + 1
+    }
+    DivergeSet { mask = mask; hashes = hashes; ns = ns; names = names; present = present }
+}
+
+pub fn div_group_diverges(s: DivergeSet, ns: str, name: str): bool {
+    if s.present.len == 0 { return false }
+    var h = pair_hash(ns, name)
+    var at = h & s.mask
+    loop {
+        if s.present[at] == 0 { return false }
+        if s.hashes[at] == h && s.ns[at] == ns && s.names[at] == name { return true }
+        at = (at + 1) & s.mask
+    }
+    false
+}
+
+pub fn div_call_diverges(s: DivergeSet, c: TCall): bool {
+    if tcall_is_diverging_builtin(c) { return true }
+    if call_is_indirect(c) { return true }
+    if c.call_ns.len == 0 { return false }
+    var last = call_last_name(c)
+    if last.len == 0 { return false }
+    div_group_diverges(s, c.call_ns, last)
+}
+
+pub fn div_fn_diverges(s: DivergeSet, f: TFunction): bool {
+    div_group_diverges(s, f.namespace, f.name)
+}

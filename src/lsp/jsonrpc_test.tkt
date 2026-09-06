@@ -1,0 +1,41 @@
+use teko::encoding::json
+
+fn body_field_str(m: RpcMessage, key: str): str {
+    match m.body {
+        json::JsonObject as o => match json::object_get(o, key) {
+            (@JsonValue()) as v => match v { json::JsonString as s => s.value; _ => "" }
+            null => ""
+        }
+        _ => ""
+    }
+}
+
+#test
+fn encode_frame_prepends_content_length() {
+    var body = match json::decode("{\"m\":\"x\"}") { (@JsonValue()) as v => v; error => json::JsonNull { } }
+    teko::assert::eq_str(encode_frame(body), "Content-Length: 9\r\n\r\n{\"m\":\"x\"}")
+}
+
+#test
+fn decode_frame_round_trips() {
+    var frame = "Content-Length: 30\r\n\r\n{\"method\":\"initialize\",\"id\":1}"
+    var msg = match decode_frame_bytes(frame.bytes()) { RpcMessage as m => m; error as e => { teko::assert::eq_str(e.message, "no error expected"); return } }
+    teko::assert::eq_str(body_field_str(msg, "method"), "initialize")
+}
+
+#test
+fn decode_frame_rejects_truncated_body() {
+    var frame = "Content-Length: 50\r\n\r\n{\"method\":\"x\"}"
+    match decode_frame_bytes(frame.bytes()) {
+        RpcMessage => teko::assert::eq_str("accepted a truncated frame", "should have been rejected")
+        error as e => teko::assert::eq_str(e.message, "malformed frame: truncated body")
+    }
+}
+
+#test
+fn decode_frame_rejects_missing_separator() {
+    match decode_frame_bytes("Content-Length: 2\r\n{}".bytes()) {
+        RpcMessage => teko::assert::eq_str("accepted a frame with no separator", "should have been rejected")
+        error as e => teko::assert::eq_str(e.message, "malformed frame: no header/body separator")
+    }
+}

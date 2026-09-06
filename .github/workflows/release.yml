@@ -1,346 +1,344 @@
-name: Bootstrap Release
+name: Release
 
-# ══════════════════════════════════════════════════════════════════════════════════════════════
-# THE RELEASE COMPILES NOTHING. IT PROMOTES.
+# ==============================================================================
+# THE RELEASE PROMOTES. IT DOES NOT REBUILD.
 #
-# ── WHY (owner ruling 2026-07-26) ─────────────────────────────────────────────────────────────
-# "release muda para pegar os artefatos e republicar com tag correta e os nomes corretos dos
-# arquivos, só, nada mais. Ele tem que saber encontrar o último build e torná-lo um entregável,
-# além de remover o build por não ser mais necessário (virou versão oficial)." And the argument,
-# which is the part worth keeping: "se o binário gerado na primeira etapa, que passou todos os
-# gates é válido, release só precisa promover, não tem que recompilar e 'jogar fora' algo provado."
+# `src/` is frozen (D211/D212) and the deliverable of this repository is the
+# taught teko compiler that lives in `ngen/`. Cutting a version is therefore:
 #
-# THE POINT IS NOT RUNNER MINUTES. IT IS THAT RECOMPILING PUBLISHES BYTES NO GATE EVER SAW.
-# The workflow this replaces seeded a compiler, emitted the tag's teko.c and built every artifact
-# from scratch at tag time. Those artifacts were SIBLINGS of the ones CI validated — same source,
-# different build, zero gates. Every release published so far carries that defect. Promotion
-# closes it by construction: the artifact that passed the gates IS the deliverable.
+#   1. run the ngen gate over the TAG -- the five native legs (each one runs
+#      every fixture on its own os AND arch) and the fixpoint ladder;
+#   2. package, INSIDE each leg, the `ngen/build/teko` those fixtures have just
+#      run against;
+#   3. attach the ten files to the tag's GitHub Release, with notes that name
+#      the mc version and carry the fixpoint's own hashes;
+#   4. announce the release to the mc package registry -- when the owner has
+#      registered the package and turned the switch on.
 #
-# ── AND IT IS WHERE THE LAST CROSS-COMPILER DIED ──────────────────────────────────────────────
-# The deleted build body cross-compiled the Linux artifacts through
-# scripts/cross_compile_linux.sh. Owner, same day: "O zig deve morrer agora, imediatamente, sem
-# espera, assim que entregar a carga, já deve estar morto." Both that script and this workflow's
-# build body are gone. The Linux artifacts are produced by the target's OWN native toolchain in
-# the PR lane (scripts/native_linux_asset.sh) and are simply carried here.
+# Step 2 is what makes step 3 honest, and it is why there is no separate
+# `assets` job: a job that compiled the compiler again would publish bytes NO
+# GATE EVER SAW. (This repository's previous release workflow was rewritten for
+# exactly that reason, in its own words: "se o binário gerado na primeira etapa,
+# que passou todos os gates é válido, release só precisa promover".) The gate is
+# `ngen.yml` itself, called with `workflow_call`, so the release cannot drift
+# from the CI: there is one matrix, one `setup-mc`, one packaging action.
 #
-# ══════════════════════════════════════════════════════════════════════════════════════════════
-# WHERE THE BYTES COME FROM: `.github/workflows/nightly.yml`.
+# HOW TO CUT A VERSION
 #
-# It runs on every push to `main`, executes the SAME producers pr.yml's `artifact` root runs (the
-# shared scripts/produce_assets.sh over the shared scripts/ci_producer_matrix.sh leg table), and
-# publishes a PRERELEASE holding the seven assets plus the portable bootstrap snapshot.
+#   git tag -a v0.3.1 -m "teko 0.3.1" && git push origin v0.3.1
 #
-# THE TAG IS AN EXACT NAME, NEVER A SEARCH:
+# or, for a tag that already exists:
 #
-#     v<A.B.C.D>-nightly_<sha8>
+#   gh workflow run release.yml --ref v0.3.1
 #
-# derived by scripts/nightly_tag.sh — the SAME script the publisher calls to mint it and this
-# workflow calls to find it. That sharing is not tidiness: the failure mode of two hand-copied
-# derivations is not a warning and not a red lane, it is this workflow reporting "no nightly to
-# promote" and stopping, discovered only when a release is being cut. One character of drift costs
-# a release.
+# (or the Actions tab -> Release -> Run workflow, choosing the `v0.3.1` tag as
+# the branch/tag to run on). Both roads end in the same four jobs; the ref the
+# run is dispatched ON is the version, and there is no VERSION file and no
+# `version` input to trust.
 #
-# <A.B.C.D> is teko.tkp's version — its 4th field IS the build number, which is exactly what the
-# ruling asks the `*` to become. <sha8> is the first 8 hex of the commit the artifacts were built
-# from, i.e. the commit this tag points at.
-#
-# WHAT MAKES THE DELETE AT THE END SAFE (and it is checked, not assumed — see step 4): because the
-# name is a function of (build number, commit), two nightlies can only coexist if they came from
-# DIFFERENT commits, and then they have different names. The one deleted is by construction the
-# one that was just downloaded — the delete step reuses the very output the download used, and
-# re-verifies the tag resolves to THIS commit before removing anything.
-#
-# NOTE ON THE workflow_dispatch VERSION OVERRIDE: it changes the tag this workflow PUBLISHES, not
-# the nightly it looks for. The nightly was named from teko.tkp at build time, so the lookup stays
-# keyed on the manifest — which is correct, and is why the override cannot make the build
-# unfindable.
-# ══════════════════════════════════════════════════════════════════════════════════════════════
+# A version carrying a `-` suffix (`0.3.1-rc1`, `0.0.0-test`) is published as a
+# PRE-RELEASE: it never becomes "latest" and `mc pkg add` never chooses it
+# without being named explicitly (mc docs/guide/27-publishing.md § 4).
+# ==============================================================================
+
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: >-
-          Release version / tag. LEAVE EMPTY to use the teko.tkp-derived tag
-          (the manifest is the source of truth). Provide a value ONLY to override
-          for a one-off.
-        required: false
-        default: ""
-      dry_run:
-        description: >-
-          Resolve and stage the promotion — download the nightly's assets, give them their
-          official names and re-checksum them — but do NOT publish and do NOT delete the nightly.
-        required: false
-        default: "false"
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
+  workflow_dispatch:
 
-# Publishing a Release, and deleting the promoted nightly, both need contents: write.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  promote:
-    # NEVER on a fork (owner ruling 2026-07-18): a fork has no nightly and no business publishing
-    # a canonical release, even if a tag lands there or someone hits workflow_dispatch on it.
-    if: github.repository == 'teko-org/teko-lang'
-    name: promote the gated build to a release
+  # One place decides what is being released, so the three jobs below cannot
+  # disagree about it. The only source of truth is this run's OWN ref: GitHub
+  # has already resolved and would check it out before any job here starts, so
+  # `github.ref_type == 'tag'` is proof enough that the tag exists -- there is
+  # no separate input to distrust and nothing left for a `gh api` round trip
+  # to confirm.
+  version:
+    name: What is being released
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.derive.outputs.tag }}
+      version: ${{ steps.derive.outputs.version }}
+      prerelease: ${{ steps.derive.outputs.prerelease }}
+    steps:
+      - name: derive the tag and the version
+        id: derive
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ "$REF_TYPE" != tag ]; then
+            echo "::error::this run is on $REF_TYPE '$REF_NAME', not a tag -- push a v* tag or dispatch with --ref vX.Y.Z" >&2
+            exit 1
+          fi
+          tag="$REF_NAME"
+          case "$tag" in
+            v*) : ;;
+            *) echo "::error::'$tag' is not a release tag (it must start with 'v')" >&2; exit 1 ;;
+          esac
+          version="${tag#v}"
+          # X.Y.Z, optionally followed by a pre-release suffix
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$version' is not a X.Y.Z version" >&2
+            exit 1
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          echo "tag=$tag"               >>"$GITHUB_OUTPUT"
+          echo "version=$version"       >>"$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >>"$GITHUB_OUTPUT"
+          echo "releasing $tag as teko $version (prerelease: $prerelease)"
+
+  # The gate IS the CI workflow, called over the tag. Five legs plus the two
+  # fixpoint runners, exactly what a pull request gets -- and, with
+  # `package: true`, each leg also packages the binary it has just proven and
+  # each fixpoint runner archives its provenance table.
+  gate:
+    name: ngen gate
+    needs: version
+    uses: ./.github/workflows/ngen.yml
+    with:
+      package: true
+      version: ${{ needs.version.outputs.version }}
+
+  release:
+    name: Publish the release
+    needs: [version, gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: check out the tag
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ needs.version.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      # The manifest is the SOURCE OF TRUTH for the version. A pushed tag that disagrees with it
-      # is refused rather than published: the tag is a claim about the manifest, and a claim that
-      # does not match its subject is a mislabelled release.
-      - name: Resolve the version
-        id: version
+      # Ten files: a `.tar.gz` and a `.sha256` for each of the five legs.
+      - name: collect the packaged assets
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: collect the fixpoint provenance
+        uses: actions/download-artifact@v7
+        with:
+          pattern: provenance-*
+          path: provenance
+
+      - name: every asset a leg owes must be here
         env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-          EVENT_NAME: ${{ github.event_name }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -eu
-          DERIVED="$(sh scripts/derive_version.sh)"
-          echo "teko.tkp-derived tag = $DERIVED"
-          if [ "$EVENT_NAME" = "push" ]; then
-            V="${GITHUB_REF#refs/tags/}"
-            if [ "$V" != "$DERIVED" ]; then
-              echo "::error::Pushed tag '$V' does not match the teko.tkp-derived tag '$DERIVED'." >&2
-              echo "The manifest (teko.tkp) is the source of truth — bump its 'version'/'suffix'" >&2
-              echo "so the derived tag becomes '$V', or push the tag the manifest sanctions." >&2
-              exit 1
-            fi
-            echo "Pushed tag '$V' matches the manifest-derived tag — OK."
-          elif [ -n "$INPUT_VERSION" ]; then
-            V="$INPUT_VERSION"
-            echo "Using workflow_dispatch override version = $V (manifest-derived was $DERIVED)"
-          else
-            V="$DERIVED"
-            echo "workflow_dispatch input empty — using manifest-derived version = $V"
-          fi
-          # The NUMBER: no leading v, no prerelease suffix. This is what a nightly tag is keyed
-          # on, because a nightly is cut from a COMMIT, not from a suffix decision made later.
-          NUM="${V#v}"; NUM="${NUM%%-*}"
-          echo "version=$V"  >> "$GITHUB_OUTPUT"
-          echo "number=$NUM" >> "$GITHUB_OUTPUT"
-          echo "Release version = $V (number $NUM)"
+          missing=0
+          for target in linux-x86_64 linux-arm64 macos-arm64 windows-x86_64 windows-arm64; do
+            for f in "dist/teko-$VERSION-$target.tar.gz" "dist/teko-$VERSION-$target.tar.gz.sha256"; do
+              if [ ! -s "$f" ]; then
+                echo "::error::$f is missing" >&2
+                missing=1
+              fi
+            done
+          done
+          [ "$missing" -eq 0 ]
+          ls -l dist
 
-      # ── 1. FIND THE BUILD ────────────────────────────────────────────────────────────────────
-      # ONE exact tag name, computed by the SAME script nightly.yml used to mint it. No "newest
-      # prerelease", no date sort, no pattern match, and deliberately NO second accepted spelling:
-      # every additional form a lookup accepts is another way for the wrong build to be promoted —
-      # and then deleted.
-      - name: Resolve the nightly to promote
-        id: nightly
+      # The notes say what a downloader needs and what an auditor asks for: the
+      # toolchain that built it, the checksum of every file, and the ladder's own
+      # numbers. The mc version is read out of the provenance table rather than
+      # passed around, so the note and the measurement have one source.
+      - name: compose the release notes
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG" || true
+          annotation=$(git tag -l --format='%(contents)' "$TAG")
+          mcver=$(sed -n 's/.*, mc \([0-9][0-9.]*\).*/\1/p' provenance/*/provenance.md | head -1)
+          {
+            if [ -n "$annotation" ]; then
+              printf '%s\n' "$annotation"
+            else
+              echo "teko $VERSION -- the teko compiler, taught to mc."
+            fi
+            echo
+            echo "Built and proven by the \`ngen\` gate over this tag: five native legs"
+            echo "(linux/x86_64, linux/aarch64, macos/aarch64, windows/x86_64,"
+            echo "windows/aarch64), each one running every fixture on its own operating"
+            echo "system AND architecture, plus the self-hosting fixpoint ladder"
+            echo "(teko0 -> teko1 -> teko2 -> teko3) on linux/x86_64 and macos/aarch64."
+            echo "The binaries attached here are the ones those fixtures ran against."
+            echo
+            echo "## Toolchain"
+            echo
+            if [ -n "$mcver" ]; then
+              echo "Built with **mc $mcver** (<https://github.com/minicompiler/mc>)."
+            else
+              echo "Built with the latest release of mc (<https://github.com/minicompiler/mc>)."
+            fi
+            echo
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "# macOS (arm64)"
+            echo "tar xzf teko-$VERSION-macos-arm64.tar.gz"
+            echo "xattr -d com.apple.quarantine teko-$VERSION-macos-arm64/teko"
+            echo "install -m 755 teko-$VERSION-macos-arm64/teko /usr/local/bin/teko"
+            echo
+            echo "# Linux (x86_64 or arm64)"
+            echo "tar xzf teko-$VERSION-linux-x86_64.tar.gz"
+            echo "install -m 755 teko-$VERSION-linux-x86_64/teko /usr/local/bin/teko"
+            echo
+            echo "# Windows (x86_64 or arm64)"
+            echo "tar xzf teko-$VERSION-windows-x86_64.tar.gz"
+            printf '%s\n' "copy teko-$VERSION-windows-x86_64\\teko.exe C:\\tools\\teko.exe"
+            echo '```'
+            echo
+            echo "## Checksums"
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+            echo
+            echo "## Fixpoint"
+            echo
+            for f in provenance/*/provenance.md; do
+              [ -f "$f" ] && cat "$f"
+              echo
+            done
+          } >"$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      # Create, or update in place: a rerun of this job after a red
+      # `publish-to-registry` must not be blocked by the release it already made.
+      - name: create or update the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
         run: |
           set -eu
-          NIGHTLY="$(sh scripts/nightly_tag.sh "$GITHUB_SHA")"
-          echo "this tag points at commit $GITHUB_SHA"
-          echo "looking for the nightly release '$NIGHTLY'"
-          if ! gh release view "$NIGHTLY" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::No nightly build exists to promote." >&2
-            echo "Looked for the EXACT tag '$NIGHTLY' (scripts/nightly_tag.sh)." >&2
-            echo "" >&2
-            echo "This workflow builds nothing (owner ruling 2026-07-26): the artifact that passed" >&2
-            echo "the gates IS the deliverable, and recompiling here would publish bytes no gate" >&2
-            echo "ever saw. It promotes what .github/workflows/nightly.yml published for THIS" >&2
-            echo "commit. If that name does not exist, either the nightly for this commit never" >&2
-            echo "ran or it failed — check that workflow's run on $GITHUB_SHA. Reviving a build" >&2
-            echo "here is not the fix." >&2
-            echo "" >&2
-            echo "Releases currently visible:" >&2
-            gh release list --repo "$GITHUB_REPOSITORY" --limit 30 >&2 || true
+          pre=""
+          [ "$PRERELEASE" = "true" ] && pre="--prerelease"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already has a release -- updating it"
+            gh release upload "$TAG" dist/teko-*.tar.gz dist/teko-*.tar.gz.sha256 --clobber
+            # shellcheck disable=SC2086
+            gh release edit "$TAG" --title "teko $VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md" $pre
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --title "teko $VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md" --verify-tag $pre \
+              dist/teko-*.tar.gz dist/teko-*.tar.gz.sha256
+          fi
+          gh release view "$TAG" --json tagName,isPrerelease,assets \
+            --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[].name]}'
+
+  # The registry side (mc docs/guide/27-publishing.md). Two halves:
+  #
+  #   * a PRE-FLIGHT that always runs -- `mc pkg hash` of the tagged tree and a
+  #     compile of every `[package].check` unit with the STOCK mc, which is what
+  #     the registry's own validator does inside its sandbox (§ 5). Finding out
+  #     here that a check unit does not build is worth the two minutes; finding
+  #     out from a `failed` job report is not;
+  #   * the ANNOUNCEMENT, gated by the repository variable
+  #     TEKO_REGISTRY_PUBLISH. The package has to be registered once, by a
+  #     person, at https://minicompiler.dev/me (§ 3); until the owner has done
+  #     that the registry answers `404 not registered` and a job that ran
+  #     anyway would be red on every release, hiding a real failure. Without the
+  #     variable this job prints the plan and exits 0 -- it is never a lie about
+  #     having published.
+  #
+  # `mc pkg check` is NOT what runs here: it takes an INDEX file of a registry
+  # (`mc pkg check INDEX.toml`), which is the registry's own CI gate over a row
+  # that already exists, not a directory validator.
+  publish-to-registry:
+    name: Publish to the mc registry
+    needs: [version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: check out the tag
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ needs.version.outputs.tag }}
+          persist-credentials: false
+
+      - name: set up the mc toolchain
+        id: mc
+        uses: ./.github/actions/setup-mc
+        with:
+          os: linux
+          arch: x86_64
+          asset: x86_64
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: the tree hash a consumer will lock
+        run: |
+          set -eu
+          echo "mc pkg hash ngen = $("$MC" pkg hash ngen)"
+
+      # Each entry of `[package].check` is one translation unit, compiled ON ITS
+      # OWN by a stock mc on linux/x86_64, with no network and no teko module
+      # loaded (docs/reference/packages.md § 3). With no `check` key the unit is
+      # `lib`, so that is the fallback here too.
+      - name: compile every [package].check unit with the stock mc
+        run: |
+          set -eu
+          units=$(sed -n 's/^check *= *\[\(.*\)\].*/\1/p' ngen/mc.toml | tr -d '" ' | tr ',' ' ')
+          if [ -z "$units" ]; then
+            units=$(sed -n 's/^lib *= *"\(.*\)".*/\1/p' ngen/mc.toml)
+          fi
+          if [ -z "$units" ]; then
+            echo "::error::ngen/mc.toml names neither [package].check nor [package].lib" >&2
             exit 1
           fi
-          echo "tag=$NIGHTLY" >> "$GITHUB_OUTPUT"
-          echo "promoting nightly '$NIGHTLY'"
-
-      # ── 2. GIVE THE ASSETS THEIR OFFICIAL NAMES ──────────────────────────────────────────────
-      # The official names are what scripts/package_release.sh already emits — `teko-<label>.tar.gz`
-      # / `.zip`, `teko-bootstrap-src.tar.gz`. A nightly that stamped `-nightly` (with or without
-      # the sha8) into its FILE names is normalised here; one that did not is untouched. The
-      # checksum manifest is REGENERATED rather than carried, so SHA256SUMS.txt always describes
-      # the bytes and the names actually published.
-      - name: Download the nightly's assets and give them their official names
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NIGHTLY: ${{ steps.nightly.outputs.tag }}
-        run: |
-          set -eu
-          rm -rf release; mkdir -p release
-          gh release download "$NIGHTLY" --repo "$GITHUB_REPOSITORY" --dir release --pattern '*'
-          echo "=== as downloaded ==="
-          ls -la release/
-
-          rm -f release/SHA256SUMS.txt
-          for f in release/*; do
-            b="$(basename "$f")"
-            n="$(printf '%s' "$b" | sed -E 's/-nightly(_[0-9a-f]{8})?//')"
-            if [ "$b" != "$n" ]; then
-              mv "$f" "release/$n"
-              echo "renamed $b -> $n"
-            fi
+          mc="$PWD/$MC"
+          for unit in $units; do
+            echo "--- $unit"
+            (cd ngen && "$mc" "$unit" -o "$RUNNER_TEMP/check.o")
+            echo "    ok: $unit compiles on its own"
           done
 
-          ( cd release && sha256sum ./* > sums.tmp && sed 's|\./||' sums.tmp > SHA256SUMS.txt && rm -f sums.tmp )
-          echo "=== official names ==="
-          ls -la release/
-          echo "=== SHA256SUMS.txt ==="
-          cat release/SHA256SUMS.txt
+      - name: announce the release to the registry
+        if: vars.TEKO_REGISTRY_PUBLISH == '1'
+        uses: minicompiler/register-action@v1
+        with:
+          tag: ${{ needs.version.outputs.tag }}
 
-          # A promotion that carried no binary is a promotion of nothing. Refuse, rather than
-          # publish an empty release that looks like a successful one.
-          if ! ls release/teko-*.tar.gz release/teko-*.zip >/dev/null 2>&1; then
-            echo "::error::the nightly '$NIGHTLY' carried no teko-*.tar.gz / teko-*.zip asset" >&2
-            exit 1
-          fi
-
-      - name: Write release notes
+      - name: what would have been announced
+        if: vars.TEKO_REGISTRY_PUBLISH != '1'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          V: ${{ steps.version.outputs.version }}
-          NIGHTLY: ${{ steps.nightly.outputs.tag }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -eu
-          cat > release/NOTES.md <<EOF
-          # Teko $V
-
-          Self-hosted \`teko\` compiler binaries. **These are the exact artifacts CI validated** —
-          promoted from the gated build \`$NIGHTLY\`, byte for byte. The release compiles nothing:
-          re-building at tag time would publish a sibling of the tested binary that no gate ever
-          saw.
-
-          Every Linux artifact is built with the TARGET's own native toolchain — glibc against a
-          glibc-2.28 sysroot for wide compatibility, musl fully static. No cross-compiler is
-          involved.
-
-          ## Artifacts
-          Linux ships **glibc** (dynamic; needs glibc >= 2.28) and **musl** (fully static; runs
-          anywhere) for **x86_64** and **arm64**:
-          - \`teko-linux-{x86_64,arm64}-glibc.tar.gz\`
-          - \`teko-linux-{x86_64,arm64}-musl.tar.gz\`
-          - \`teko-macos-arm64.tar.gz\`, \`teko-windows-x86_64.zip\`
-          - \`teko-bootstrap-src.tar.gz\` — the portable, **any-cc** bootstrap snapshot: the
-            generated \`teko.c\` plus the exact minimal runtime it links.
-          - \`SHA256SUMS.txt\` — checksums of every artifact, regenerated over the promoted bytes.
-
-          ## Building from the portable \`teko.c\` snapshot
-          Unpack \`teko-bootstrap-src.tar.gz\` and build with any C23 compiler:
-
-          \`\`\`sh
-          tar xzf teko-bootstrap-src.tar.gz
-          cd teko-bootstrap-src
-          cc -std=c23 -Iruntime -Iassert \\
-             teko.c runtime/teko_rt.c assert/assert.c \\
-             -lm -o teko          # or run ./build.sh
-          \`\`\`
-
-          MSVC is not supported — the runtime uses \`__int128\` and other GCC/Clang extensions.
-          EOF
-          echo "wrote release/NOTES.md"
-
-          # Append GitHub's auto-generated changelog against the CORRECT predecessor. GitHub's
-          # /releases API is NOT version-ordered, so its auto-picked "previous tag" is wrong.
-          # Compute the predecessor by VERSION — the highest published version-tag below this one
-          # — and pass it to generate-notes. Nightly tags are excluded: they are transitory and
-          # are never a predecessor.
-          PRED="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
-            --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^v?[0-9]+([.][0-9]+){3}"))' \
-            | grep -v -- '-nightly' \
-            | grep -vxF "$V" \
-            | awk '{ o=$0; v=$0; sub(/^v/,"",v); print v"\t"o }' | sort -V | tail -n1 | cut -f2)"
-          if [ -n "$PRED" ]; then
-            echo "changelog predecessor (by version) = $PRED"
-            BODY="$(gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
-              -f tag_name="$V" -f previous_tag_name="$PRED" --jq '.body' 2>/dev/null || true)"
-            if [ -n "$BODY" ]; then
-              { printf '\n\n## Changes since %s\n\n' "$PRED"; printf '%s\n' "$BODY"; } >> release/NOTES.md
-              echo "appended changelog vs $PRED"
-            else
-              echo "generate-notes returned empty — keeping static notes only"
-            fi
-          else
-            echo "no predecessor version-tag found — first release, no changelog"
-          fi
-
-      # ── 3. REPUBLISH UNDER THE VERSION TAG ───────────────────────────────────────────────────
-      - name: Create the GitHub Release
-        if: github.event.inputs.dry_run != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          V: ${{ steps.version.outputs.version }}
-        run: |
-          set -eu
-          # Idempotent: replace assets if the release already exists, else create it.
-          if gh release view "$V" >/dev/null 2>&1; then
-            echo "Release $V exists — uploading assets (clobber)."
-            gh release upload "$V" release/teko-*.tar.gz release/teko-*.zip release/SHA256SUMS.txt --clobber
-            gh release edit "$V" --notes-file release/NOTES.md
-          else
-            echo "Creating release $V."
-            ASSETS=""
-            for f in release/teko-*.tar.gz release/teko-*.zip release/SHA256SUMS.txt; do
-              [ -e "$f" ] && ASSETS="$ASSETS $f"
-            done
-            PRERELEASE=""
-            case "$V" in *-*) PRERELEASE="--prerelease" ;; esac
-            # shellcheck disable=SC2086
-            gh release create "$V" \
-              --title "Teko $V" \
-              --notes-file release/NOTES.md \
-              $PRERELEASE \
-              $ASSETS
-          fi
-
-      # ── 4. DELETE THE PROMOTED BUILD ─────────────────────────────────────────────────────────
-      # "além de remover o build por não ser mais necessário (virou versão oficial)". The nightly
-      # was transitory by construction; once its bytes carry a version tag, leaving it behind
-      # would offer two names for one artifact and make "which one is the release" a question.
-      # The tag goes with it: a dangling `-nightly` tag keeps the release list noisy and would let
-      # a later promotion resolve a build whose assets are gone.
-      #
-      # ORDER MATTERS: this runs AFTER the publish step, so a failed publish leaves the nightly
-      # intact and the promotion re-runnable.
-      - name: Delete the promoted nightly build
-        if: github.event.inputs.dry_run != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NIGHTLY: ${{ steps.nightly.outputs.tag }}
-        run: |
-          set -eu
-          # THE WRONG-NIGHTLY GUARD. `$NIGHTLY` is the very output the download step used, so the
-          # thing deleted is the thing promoted by construction. Two belts on top of that, because
-          # this is the one irreversible step in the workflow:
-          #   1. RE-DERIVE the name and refuse if it moved. A tag name is a function of (build
-          #      number, commit); if re-deriving it now yields something else, the manifest changed
-          #      under the run and nothing should be deleted.
-          #   2. ASSERT THE TAG POINTS AT THIS COMMIT. Two nightlies can only coexist if they came
-          #      from different commits — and then they have different names — but a name is only
-          #      trustworthy if the tag behind it really resolves where it claims. Checked against
-          #      the git ref, not against the release's targetCommitish (which is a branch name for
-          #      a release created from a branch and would prove nothing).
-          EXPECT="$(sh scripts/nightly_tag.sh "$GITHUB_SHA")"
-          if [ "$EXPECT" != "$NIGHTLY" ]; then
-            echo "::error::the nightly name moved during this run ('$NIGHTLY' -> '$EXPECT')." >&2
-            echo "Refusing to delete anything: the assets were promoted from '$NIGHTLY'." >&2
-            exit 1
-          fi
-          TAGSHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${NIGHTLY}" --jq '.object.sha' 2>/dev/null || true)"
-          if [ -n "$TAGSHA" ] && [ "$TAGSHA" != "$GITHUB_SHA" ]; then
-            echo "::error::tag '$NIGHTLY' resolves to $TAGSHA, not to this release's commit $GITHUB_SHA." >&2
-            echo "Refusing to delete a build that is not the one just promoted." >&2
-            exit 1
-          fi
-          echo "deleting the promoted transitional build '$NIGHTLY' (release + tag) at $GITHUB_SHA"
-          gh release delete "$NIGHTLY" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
-
-      - name: Dry run — nothing was published, nothing was deleted
-        if: github.event.inputs.dry_run == 'true'
-        run: |
-          echo "dry_run=true: the promotion was resolved and staged, and stopped before publishing."
-          ls -la release/
+          echo "TEKO_REGISTRY_PUBLISH is not \"1\": nothing was announced, and that is not a failure."
+          echo
+          echo "With the variable set, this job runs minicompiler/register-action@v1 with"
+          echo "tag=$TAG. The action POSTs https://minicompiler.dev/poll with"
+          echo "git_url=https://github.com/$GITHUB_REPOSITORY, waits for the validator's job,"
+          echo "prints its report and asserts that https://pkg.minicompiler.dev/index/teko.toml"
+          echo "carries version = \"${TAG#v}\"."
+          echo
+          echo "Before that can work, once and by a person (guide 27 § 3):"
+          echo "  1. log in at https://minicompiler.dev/login and accept the documents;"
+          echo "  2. POST /repos on /me with git_url = https://github.com/$GITHUB_REPOSITORY;"
+          echo "  3. set the repository variable TEKO_REGISTRY_PUBLISH to 1."

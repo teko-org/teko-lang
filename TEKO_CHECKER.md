@@ -90,7 +90,7 @@ type Slice    = struct { element: Type }       // []T — recursive (B.8)
 type Optional = struct { inner: Type }         // T? — built-in nullable former (like Slice)
 type Named    = struct { name: str }           // a user type, equal by NAME (nominal)
 type Variant  = struct { members: []Type }     // A | B | … (two or more); members are COMPLETE types
-type Func     = struct { params: []Type; ret: Type }   // (params) -> ret  (ret may be void)
+type Func     = struct { params: []Type; ret: Type }   // (params): ret  (ret may be void)
 type Byte     = struct { }                     // the octet type
 type Str      = struct { }                     // validated UTF-8
 type Error    = struct { }                     // the native `error` (lowercase; supersedes `Error`)
@@ -100,7 +100,7 @@ type Void     = struct { }                     // return-only marker; legal ONLY
 type Type = Prim | Byte | Str | Slice | Optional | Named | Variant | Func | Error | Void
 
 // nominal type equality (B.13): structural over the shape, but Named is by name.
-fn type_eq(a: Type, b: Type) -> bool {
+fn type_eq(a: Type, b: Type): bool {
     match a {
         Prim as pa    => match b { Prim as pb    => pa.kind == pb.kind;             _ => false }
         Byte          => match b { Byte          => true;                           _ => false }
@@ -119,7 +119,7 @@ fn type_eq(a: Type, b: Type) -> bool {
 }
 
 // element-wise equality of two type lists (same length, each equal in order).
-fn types_eq(xs: []Type, ys: []Type) -> bool {
+fn types_eq(xs: []Type, ys: []Type): bool {
     if xs.len != ys.len { return false }
     mut i = 0
     loop {
@@ -254,15 +254,15 @@ type Env = []ValBinding
 // define a name (append); returns the extended env (ref-less consume-return). `is_mut`
 // comes from the call site: a `mut` binding passes true; EVERYTHING else (let, const,
 // params, match-bindings, function signatures) passes false (B.21).
-fn define(env: Env, name: str, t: Type, is_mut: bool) -> Env {
+fn define(env: Env, name: str, t: Type, is_mut: bool): Env {
     teko::list::push(env, ValBinding { name = name; type = t; is_mut = is_mut })
 }
 
 // a binding is mutable iff declared `mut` (Let and Const are immutable — B.21).
-fn bind_is_mut(k: BindKind) -> bool { k == BindKind::Mut }
+fn bind_is_mut(k: BindKind): bool { k == BindKind::Mut }
 
 // the WHOLE binding (type + mutability), innermost first — for the `mut` write-guard (B.21).
-fn lookup_binding(env: Env, name: str) -> ValBinding | error {
+fn lookup_binding(env: Env, name: str): ValBinding | error {
     mut i = env.len
     loop {
         if i == 0 { break }
@@ -273,13 +273,13 @@ fn lookup_binding(env: Env, name: str) -> ValBinding | error {
 }
 
 // the type of a name — the common case; a thin wrapper so existing callers are unchanged.
-fn lookup(env: Env, name: str) -> Type | error {
+fn lookup(env: Env, name: str): Type | error {
     match lookup_binding(env, name) { ValBinding as b => b.type; error as e => e }
 }
 
 // resolve an INJECTED built-in type name to its Type (B.19). User types
 // (struct/enum/variant) resolve against the collected registry (Etapa 3).
-fn builtin_type(name: str) -> Type | error {
+fn builtin_type(name: str): Type | error {
     if name == "u8"   { return Prim { kind = PrimKind::U8 } }
     if name == "u16"  { return Prim { kind = PrimKind::U16 } }
     if name == "u32"  { return Prim { kind = PrimKind::U32 } }
@@ -403,7 +403,7 @@ type TypeReg   = struct { name: str; decl: TypeDecl }   // TypeDecl from the par
 type TypeTable = []TypeReg
 
 // find a user type by name; error if not registered.
-fn type_table_find(table: TypeTable, name: str) -> TypeDecl | error {
+fn type_table_find(table: TypeTable, name: str): TypeDecl | error {
     mut i = 0
     loop {
         if i >= table.len { break }
@@ -414,7 +414,7 @@ fn type_table_find(table: TypeTable, name: str) -> TypeDecl | error {
 }
 
 // resolve a NAMED type (a path) to a semantic Type: built-in or user type.
-fn resolve_named(path: Path, table: TypeTable) -> Type | error {
+fn resolve_named(path: Path, table: TypeTable): Type | error {
     let name = path.segments[path.segments.len - 1].name   // seed: last segment
     match builtin_type(name) {                  // u8…u64, byte, str, error, …
         Type as t => return t
@@ -428,7 +428,7 @@ fn resolve_named(path: Path, table: TypeTable) -> Type | error {
 }
 
 // resolve a syntactic TypeExpr to a pure semantic Type (recursive — B.8).
-fn resolve_type(te: TypeExpr, table: TypeTable) -> Type | error {
+fn resolve_type(te: TypeExpr, table: TypeTable): Type | error {
     match te {
         NamedType as nt => resolve_named(nt.path, table)
         SliceType as st => {
@@ -465,7 +465,7 @@ fn resolve_type(te: TypeExpr, table: TypeTable) -> Type | error {
 type Collected = struct { types: TypeTable; env: Env }
 
 // gather ALL user type declarations first (so a forward reference resolves).
-fn collect_types(items: []Item) -> TypeTable {
+fn collect_types(items: []Item): TypeTable {
     mut table = teko::list::empty()
     mut i = 0
     loop {
@@ -480,7 +480,7 @@ fn collect_types(items: []Item) -> TypeTable {
 }
 
 // a function's signature as a FuncType (resolve its param + return types).
-fn func_type(f: Function, table: TypeTable) -> Type | error {
+fn func_type(f: Function, table: TypeTable): Type | error {
     mut params = teko::list::empty()
     mut i = 0
     loop {
@@ -500,7 +500,7 @@ fn func_type(f: Function, table: TypeTable) -> Type | error {
 }
 
 // register every top-level function's signature (now that all type names exist).
-fn collect_funcs(items: []Item, table: TypeTable) -> Env | error {
+fn collect_funcs(items: []Item, table: TypeTable): Env | error {
     mut env = teko::list::empty()
     mut i = 0
     loop {
@@ -521,7 +521,7 @@ fn collect_funcs(items: []Item, table: TypeTable) -> Env | error {
 }
 
 // pass 1: types first, then function signatures — the top-level environment.
-fn collect(program: Program) -> Collected | error {
+fn collect(program: Program): Collected | error {
     let table = collect_types(program.items)
     let env = match collect_funcs(program.items, table) {
         Env as e     => e
@@ -700,23 +700,23 @@ base compartilhada consumida pela camada **typed** (`type_binary`/`type_unary`/
 // src/checker/expr.tks  (namespace 'teko::checker')
 
 // --- type predicates ---
-fn is_bool(t: Type) -> bool {
+fn is_bool(t: Type): bool {
     match t { Prim as p => p.kind == PrimKind::Bool; _ => false }
 }
-fn is_integer(t: Type) -> bool {
+fn is_integer(t: Type): bool {
     match t { Prim as p => p.kind != PrimKind::Bool; _ => false }   // every Prim but Bool
 }
 // sign-check (B.22): two numerics compare regardless of sign/width; else same type.
-fn is_comparable(a: Type, b: Type) -> bool {
+fn is_comparable(a: Type, b: Type): bool {
     if is_integer(a) && is_integer(b) { return true }
     type_eq(a, b)
 }
 
 // --- binary-op regimes (on the op token) ---
-fn op_is_shift(op: lexer::TokenKind) -> bool {
+fn op_is_shift(op: lexer::TokenKind): bool {
     op == lexer::TokenKind::Shl || op == lexer::TokenKind::Shr
 }
-fn op_is_arith_bitwise(op: lexer::TokenKind) -> bool {
+fn op_is_arith_bitwise(op: lexer::TokenKind): bool {
     op == lexer::TokenKind::Plus  || op == lexer::TokenKind::Minus ||
     op == lexer::TokenKind::Star  || op == lexer::TokenKind::Slash ||
     op == lexer::TokenKind::Percent ||
@@ -748,7 +748,7 @@ não-`static`).
 // src/checker/match.tks  (namespace 'teko::checker')
 
 // validate a pattern against the subject; return the env extended with bindings.
-fn check_pattern(p: Pattern, subject: Type, env: Env, table: TypeTable) -> Env | error {
+fn check_pattern(p: Pattern, subject: Type, env: Env, table: TypeTable): Env | error {
     match p {
         WildcardPattern   => env
         BindPattern as bp => {
@@ -817,7 +817,7 @@ fn check_pattern(p: Pattern, subject: Type, env: Env, table: TypeTable) -> Env |
 // --- exhaustiveness (B.15) ---
 
 // an UNGUARDED `_` covers everything; a guarded `_ when g` does NOT (B.15 — `when` excluded).
-fn has_wildcard(arms: []Arm) -> bool {
+fn has_wildcard(arms: []Arm): bool {
     mut i = 0
     loop {
         if i >= arms.len { break }
@@ -830,7 +830,7 @@ fn has_wildcard(arms: []Arm) -> bool {
 }
 
 // the case-name(s) a variant pattern selects: a single Bind/Field, or EACH bare option of an Alt.
-fn arm_case_names(p: Pattern) -> []str {
+fn arm_case_names(p: Pattern): []str {
     match p {
         BindPattern as bp  => teko::list::push(teko::list::empty(), bp.type_name.segments[bp.type_name.segments.len - 1].name)
         FieldPattern as fp => teko::list::push(teko::list::empty(), fp.type_name.segments[fp.type_name.segments.len - 1].name)
@@ -853,7 +853,7 @@ fn arm_case_names(p: Pattern) -> []str {
 }
 
 // is `name` covered by some UNGUARDED arm (directly via Bind/Field, or via an Alt option)?
-fn some_arm_names(arms: []Arm, name: str) -> bool {
+fn some_arm_names(arms: []Arm, name: str): bool {
     mut i = 0
     loop {
         if i >= arms.len { break }
@@ -872,7 +872,7 @@ fn some_arm_names(arms: []Arm, name: str) -> bool {
 }
 
 // every member of the variant must be named by some unguarded arm.
-fn variant_covered(arms: []Arm, members: []Type) -> bool {
+fn variant_covered(arms: []Arm, members: []Type): bool {
     mut i = 0
     loop {
         if i >= members.len { break }
@@ -886,7 +886,7 @@ fn variant_covered(arms: []Arm, members: []Type) -> bool {
 }
 
 // a `_` covers all; otherwise a Variant subject must have every case named.
-fn exhaustive(arms: []Arm, subject: Type) -> bool {
+fn exhaustive(arms: []Arm, subject: Type): bool {
     if has_wildcard(arms) { return true }
     match subject {
         Variant as v => variant_covered(arms, v.members)
@@ -1141,22 +1141,22 @@ type TypedBlock = struct { stmts: []TStatement; env: Env }   // a typed block + 
 // not duplication (M.5). C1: every node, statement and item re-derived.
 
 // ---- leaves ----
-fn type_number(n: Number) -> TExpr {
+fn type_number(n: Number): TExpr {
     TExpr { kind = TNumber { value = n.value }; type = Prim { kind = PrimKind::I64 } }   // [literal typing in annotated context: C6]
 }
-fn type_strlit(s: StrLit) -> TExpr {
+fn type_strlit(s: StrLit): TExpr {
     TExpr { kind = TStrLit { text = s.text }; type = Str { } }
 }
-fn type_bytelit(b: ByteLit) -> TExpr {
+fn type_bytelit(b: ByteLit): TExpr {
     TExpr { kind = TByteLit { value = b.value }; type = Byte { } }
 }
-fn type_var(v: Var, env: Env) -> TExpr | error {
+fn type_var(v: Var, env: Env): TExpr | error {
     let t = match lookup(env, v.name) { Type as ty => ty; error as e => return e }
     TExpr { kind = TVar { name = v.name }; type = t }
 }
 
 // ---- operators (the SAME B.22 regimes as check_binary/check_unary/check_compare) ----
-fn type_binary(b: Binary, env: Env, table: TypeTable) -> TExpr | error {
+fn type_binary(b: Binary, env: Env, table: TypeTable): TExpr | error {
     let l = match type_expr(b.left, env, table)  { TExpr as te => te; error as e => return e }
     let r = match type_expr(b.right, env, table) { TExpr as te => te; error as e => return e }
     if op_is_shift(b.op) {
@@ -1171,7 +1171,7 @@ fn type_binary(b: Binary, env: Env, table: TypeTable) -> TExpr | error {
     error { message = "not a binary operator" }
 }
 
-fn type_unary(u: Unary, env: Env, table: TypeTable) -> TExpr | error {
+fn type_unary(u: Unary, env: Env, table: TypeTable): TExpr | error {
     let o = match type_expr(u.operand, env, table) { TExpr as te => te; error as e => return e }
     if u.op == lexer::TokenKind::Minus || u.op == lexer::TokenKind::Tilde {
         if !is_integer(o.type) { return error { message = "unary -/~ needs an integer" } }
@@ -1184,7 +1184,7 @@ fn type_unary(u: Unary, env: Env, table: TypeTable) -> TExpr | error {
     error { message = "not a unary operator" }
 }
 
-fn type_compare(c: Compare, env: Env, table: TypeTable) -> TExpr | error {
+fn type_compare(c: Compare, env: Env, table: TypeTable): TExpr | error {
     let first = match type_expr(c.first, env, table) { TExpr as te => te; error as e => return e }
     mut prev = first.type
     mut terms = teko::list::empty()
@@ -1200,7 +1200,7 @@ fn type_compare(c: Compare, env: Env, table: TypeTable) -> TExpr | error {
     TExpr { kind = TCompare { first = first; rest = terms }; type = Prim { kind = PrimKind::Bool } }
 }
 
-fn type_call(c: Call, env: Env, table: TypeTable) -> TExpr | error {
+fn type_call(c: Call, env: Env, table: TypeTable): TExpr | error {
     let name = c.callee.segments[c.callee.segments.len - 1].name
     let ft = match lookup(env, name) { Type as t => t; error as e => return e }
     match ft {
@@ -1234,7 +1234,7 @@ fn type_call(c: Call, env: Env, table: TypeTable) -> TExpr | error {
 // Redefinitions Index; the prior rule over-applied M.1, forbidding what a guard makes non-silent.)*
 
 // does a constant i64 value fit the target primitive's range? (shared with C6 — literal range.)
-fn value_fits(v: i64, k: PrimKind) -> bool {
+fn value_fits(v: i64, k: PrimKind): bool {
     if k == PrimKind::U8  { return v >= 0 && v <= 255 }
     if k == PrimKind::U16 { return v >= 0 && v <= 65535 }
     if k == PrimKind::U32 { return v >= 0 && v <= 4294967295 }
@@ -1253,7 +1253,7 @@ fn value_fits(v: i64, k: PrimKind) -> bool {
 // byte casts AS u8 (B.36 "byte = u8 newtype"): byte's values ARE u8 values, so the effective
 // PrimKind for range/cast rules is U8. Bool and non-numeric types have no cast kind (rejected).
 // One source of truth (M.5) for cast_check + const_range_check.
-fn cast_kind(t: Type) -> PrimKind | error {
+fn cast_kind(t: Type): PrimKind | error {
     match t {
         Prim as p => {
             if p.kind == PrimKind::Bool { error { message = "bool casts are not defined in the seed" } }
@@ -1267,7 +1267,7 @@ fn cast_kind(t: Type) -> PrimKind | error {
 // is `from -> to` a DEFINED conversion? Any integer/byte ↔ integer/byte is (the loss is
 // runtime/codegen's — B; byte casts AS u8 — B.36). Only Bool and non-numeric ends are rejected.
 // Reused by the counter-validation (E6-2) — ONE source of truth (M.5).
-fn cast_check(from: Type, to: Type) -> error? {                  // fallible-no-value: null = ok, error = failure
+fn cast_check(from: Type, to: Type): error? {                  // fallible-no-value: null = ok, error = failure
     if type_eq(from, to) { return null }                         // same type — a no-op
     let _ = match cast_kind(from) { PrimKind as k => k; error as e => return e }
     let _ = match cast_kind(to)   { PrimKind as k => k; error as e => return e }
@@ -1276,7 +1276,7 @@ fn cast_check(from: Type, to: Type) -> error? {                  // fallible-no-
 
 // a CONSTANT literal already out of the target's range is a compile error (M.1 — fail early);
 // non-constant operands are guarded at runtime by codegen. Direct literals only (comptime folding deferred).
-fn const_range_check(e: Expr, target: Type) -> error? {          // fallible-no-value: null = ok, error = failure
+fn const_range_check(e: Expr, target: Type): error? {          // fallible-no-value: null = ok, error = failure
     match e {
         Number as n => match cast_kind(target) {                 // byte target → U8 range (0..255)
             PrimKind as k => {
@@ -1296,7 +1296,7 @@ fn const_range_check(e: Expr, target: Type) -> error? {          // fallible-no-
 // NOTE: the counter-validation does NOT yet re-prove the binding-level fit — a forged typed tree
 // `bound=u8, value=300` would currently pass revalidate. That re-proof lands with `validate_statement`
 // (deferred; named gap — §VI). The front-line type check above already rejects such source.
-fn annotated_literal_ok(value: Expr, ann: Type) -> error? {      // fallible-no-value: null = ok, error = failure
+fn annotated_literal_ok(value: Expr, ann: Type): error? {      // fallible-no-value: null = ok, error = failure
     match value {
         Number as n => match ann {
             Prim as p => {
@@ -1312,7 +1312,7 @@ fn annotated_literal_ok(value: Expr, ann: Type) -> error? {      // fallible-no-
 // `x to T` — type the inner, resolve the target, demand the conversion is DEFINED, then reject a
 // CONSTANT literal already out of range (fail early — M.1). The runtime fit-check for non-constant
 // operands is codegen's (debug-panic / release-defined) — deferred (M.4).
-fn type_cast(c: Cast, env: Env, table: TypeTable) -> TExpr | error {
+fn type_cast(c: Cast, env: Env, table: TypeTable): TExpr | error {
     let inner = match type_expr(c.expr, env, table) { TExpr as te => te; error as e => return e }
     let target = match resolve_type(c.target, table) { Type as t => t; error as e => return e }
     match cast_check(inner.type, target) { null => {}; error as e => return e }
@@ -1325,7 +1325,7 @@ fn type_cast(c: Cast, env: Env, table: TypeTable) -> TExpr | error {
 // `Named` type to its `TypeDecl` body and read the field's declared type. Receiver must be a struct.
 
 // find a field by name in a struct body and resolve its annotation (M.3 — exact).
-fn field_type(sb: StructBody, field: str, table: TypeTable) -> Type | error {
+fn field_type(sb: StructBody, field: str, table: TypeTable): Type | error {
     mut i = 0
     loop {
         if i >= sb.fields.len { break }
@@ -1335,7 +1335,7 @@ fn field_type(sb: StructBody, field: str, table: TypeTable) -> Type | error {
     error { message = $"no such field: {field}" }
 }
 
-fn type_field_access(fa: FieldAccess, env: Env, table: TypeTable) -> TExpr | error {
+fn type_field_access(fa: FieldAccess, env: Env, table: TypeTable): TExpr | error {
     let recv = match type_expr(fa.receiver, env, table) { TExpr as te => te; error as e => return e }
     let name = match recv.type {
         Named as n => n.name
@@ -1353,7 +1353,7 @@ fn type_field_access(fa: FieldAccess, env: Env, table: TypeTable) -> TExpr | err
 }
 
 // ---- the expression dispatch (the evolved check_expr) ----
-fn type_expr(e: Expr, env: Env, table: TypeTable) -> TExpr | error {
+fn type_expr(e: Expr, env: Env, table: TypeTable): TExpr | error {
     match e {
         Number as n    => type_number(n)
         StrLit as s    => type_strlit(s)
@@ -1373,7 +1373,7 @@ fn type_expr(e: Expr, env: Env, table: TypeTable) -> TExpr | error {
 }
 
 // ---- the value-type a TYPED block yields: the last stmt's, if an ExprStmt; else void (no value) ----
-fn tblock_type(stmts: []TStatement) -> Type {
+fn tblock_type(stmts: []TStatement): Type {
     if stmts.len == 0 { return Void { } }
     match stmts[stmts.len - 1] {
         TExprStmt as es => es.expr.type
@@ -1382,7 +1382,7 @@ fn tblock_type(stmts: []TStatement) -> Type {
 }
 
 // ---- a typed block: thread the env, collect the typed statements ----
-fn type_block(stmts: []Statement, env: Env, table: TypeTable) -> TypedBlock | error {
+fn type_block(stmts: []Statement, env: Env, table: TypeTable): TypedBlock | error {
     mut cur = env
     mut out = teko::list::empty()
     mut i = 0
@@ -1397,7 +1397,7 @@ fn type_block(stmts: []Statement, env: Env, table: TypeTable) -> TypedBlock | er
 }
 
 // ---- if as a VALUE (B.20): cond bool; `else` required; both branches one type ----
-fn type_if(f: IfExpr, env: Env, table: TypeTable) -> TExpr | error {
+fn type_if(f: IfExpr, env: Env, table: TypeTable): TExpr | error {
     let c = match type_expr(f.cond, env, table) { TExpr as te => te; error as e => return e }
     if !is_bool(c.type) { return error { message = "an `if` condition must be a bool" } }
     if !f.has_else { return error { message = "an `if` used as a value needs an `else`" } }
@@ -1410,7 +1410,7 @@ fn type_if(f: IfExpr, env: Env, table: TypeTable) -> TExpr | error {
 }
 
 // ---- if as a STATEMENT: cond bool; branches validated; no `else`; value discarded → void ----
-fn type_if_stmt(f: IfExpr, env: Env, table: TypeTable) -> TExpr | error {
+fn type_if_stmt(f: IfExpr, env: Env, table: TypeTable): TExpr | error {
     let c = match type_expr(f.cond, env, table) { TExpr as te => te; error as e => return e }
     if !is_bool(c.type) { return error { message = "an `if` condition must be a bool" } }
     let tb = match type_block(f.then_blk, env, table) { TypedBlock as bk => bk; error as e => return e }
@@ -1422,7 +1422,7 @@ fn type_if_stmt(f: IfExpr, env: Env, table: TypeTable) -> TExpr | error {
 }
 
 // ---- one typed arm: pattern extends env; `when` guard bool; body typed in that env ----
-fn type_arm(a: Arm, subject: Type, env: Env, table: TypeTable) -> TArm | error {
+fn type_arm(a: Arm, subject: Type, env: Env, table: TypeTable): TArm | error {
     let e2 = match check_pattern(a.pattern, subject, env, table) { Env as e => e; error as err => return err }
     let body = match type_expr(a.body, e2, table) { TExpr as te => te; error as err => return err }
     mut guard = body                                  // gated by has_when (placeholder reuses body — never read)
@@ -1435,7 +1435,7 @@ fn type_arm(a: Arm, subject: Type, env: Env, table: TypeTable) -> TArm | error {
 }
 
 // ---- match as a VALUE: all arm bodies the SAME type → the match's type; EXHAUSTIVE (B.15) ----
-fn type_match(m: MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
+fn type_match(m: MatchExpr, env: Env, table: TypeTable): TExpr | error {
     let s = match type_expr(m.subject, env, table) { TExpr as te => te; error as e => return e }
     if m.arms.len == 0 { return error { message = "a `match` needs at least one arm" } }
     let a0 = match type_arm(m.arms[0], s.type, env, table) { TArm as a => a; error as e => return e }
@@ -1455,7 +1455,7 @@ fn type_match(m: MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
 }
 
 // ---- match as a STATEMENT: validate the arms; exhaustiveness forced; value discarded → void ----
-fn type_match_stmt(m: MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
+fn type_match_stmt(m: MatchExpr, env: Env, table: TypeTable): TExpr | error {
     let s = match type_expr(m.subject, env, table) { TExpr as te => te; error as e => return e }
     mut arms = teko::list::empty()
     mut i = 0
@@ -1471,7 +1471,7 @@ fn type_match_stmt(m: MatchExpr, env: Env, table: TypeTable) -> TExpr | error {
 
 // ---- statements (the evolved check_* — produce the typed node + advance the env) ----
 
-fn type_binding(b: Binding, env: Env, table: TypeTable) -> TypedStmt | error {
+fn type_binding(b: Binding, env: Env, table: TypeTable): TypedStmt | error {
     let v = match type_expr(b.value, env, table) { TExpr as te => te; error as e => return e }
     mut bound = v.type
     if b.has_type {
@@ -1488,7 +1488,7 @@ fn type_binding(b: Binding, env: Env, table: TypeTable) -> TypedStmt | error {
     }
 }
 
-fn type_assign(a: Assign, env: Env, table: TypeTable) -> TypedStmt | error {
+fn type_assign(a: Assign, env: Env, table: TypeTable): TypedStmt | error {
     let tb = match lookup_binding(env, a.name) { ValBinding as vb => vb; error as e => return e }
     if !tb.is_mut { return error { message = $"cannot assign to immutable `{a.name}` — declare it `mut` (B.21)" } }
     let v = match type_expr(a.value, env, table) { TExpr as te => te; error as e => return e }
@@ -1496,17 +1496,17 @@ fn type_assign(a: Assign, env: Env, table: TypeTable) -> TypedStmt | error {
     TypedStmt { node = TAssign { name = a.name; op = a.op; value = v }; env = env }   // mut rule enforced (B.21)
 }
 
-fn type_return(r: Return, env: Env, table: TypeTable) -> TypedStmt | error {
+fn type_return(r: Return, env: Env, table: TypeTable): TypedStmt | error {
     let v = match type_expr(r.value, env, table) { TExpr as te => te; error as e => return e }
     TypedStmt { node = TReturn { has_value = r.has_value; value = v }; env = env }    // value gated by has_value (B.20); the return-type match is enforced by type_function's check_returns (C5)
 }
 
-fn type_loop(l: LoopStmt, env: Env, table: TypeTable) -> TypedStmt | error {
+fn type_loop(l: LoopStmt, env: Env, table: TypeTable): TypedStmt | error {
     let tb = match type_block(l.body, env, table) { TypedBlock as bk => bk; error as e => return e }
     TypedStmt { node = TLoopStmt { body = tb.stmts }; env = env }     // body bindings stay block-local
 }
 
-fn type_exprstmt(es: ExprStmt, env: Env, table: TypeTable) -> TypedStmt | error {
+fn type_exprstmt(es: ExprStmt, env: Env, table: TypeTable): TypedStmt | error {
     // a TOP-LEVEL if/match is a STATEMENT — its value is discarded, so no `else` is required.
     match es.expr {
         IfExpr as f    => {
@@ -1524,7 +1524,7 @@ fn type_exprstmt(es: ExprStmt, env: Env, table: TypeTable) -> TypedStmt | error 
     }
 }
 
-fn type_statement(s: Statement, env: Env, table: TypeTable) -> TypedStmt | error {
+fn type_statement(s: Statement, env: Env, table: TypeTable): TypedStmt | error {
     match s {
         Binding as b   => type_binding(b, env, table)
         Assign as a    => type_assign(a, env, table)
@@ -1539,7 +1539,7 @@ fn type_statement(s: Statement, env: Env, table: TypeTable) -> TypedStmt | error
 // ---- items + program (the evolved check_function/check_item/check_program — E5c) ----
 
 // the resolved return type: the annotation if present, else void (the `-> void` marker — no value).
-fn function_return(f: Function, table: TypeTable) -> Type | error {
+fn function_return(f: Function, table: TypeTable): Type | error {
     if !f.has_return { return Void { } }
     resolve_type(f.return_type, table)
 }
@@ -1555,7 +1555,7 @@ fn function_return(f: Function, table: TypeTable) -> Type | error {
 // dual-walked — see the check_*/type_* duplication note in "Próximas etapas".)
 
 // is a value of type `from` admissible where `to` is expected? (B.14 — variant member inclusion.)
-fn assignable_to(from: Type, to: Type) -> bool {
+fn assignable_to(from: Type, to: Type): bool {
     if type_eq(from, to) { return true }
     match to {
         Variant as v => {
@@ -1573,7 +1573,7 @@ fn assignable_to(from: Type, to: Type) -> bool {
 
 // check every `return` reachable as a statement (descend into loop bodies and `if`-blocks;
 // match-arm returns await the divergence item — arm bodies are expressions, not statements).
-fn check_returns(stmts: []TStatement, ret: Type) -> error? {     // fallible-no-value: null = ok, error = failure
+fn check_returns(stmts: []TStatement, ret: Type): error? {     // fallible-no-value: null = ok, error = failure
     mut i = 0
     loop {
         if i >= stmts.len { break }
@@ -1583,7 +1583,7 @@ fn check_returns(stmts: []TStatement, ret: Type) -> error? {     // fallible-no-
     null
 }
 
-fn check_return_stmt(s: TStatement, ret: Type) -> error? {       // fallible-no-value: null = ok, error = failure
+fn check_return_stmt(s: TStatement, ret: Type): error? {       // fallible-no-value: null = ok, error = failure
     match s {
         TReturn as r => {
             if r.has_value {
@@ -1601,7 +1601,7 @@ fn check_return_stmt(s: TStatement, ret: Type) -> error? {       // fallible-no-
 }
 
 // returns can also live inside a top-level `if`'s blocks (`if c { return e }`).
-fn check_returns_inexpr(e: TExpr, ret: Type) -> error? {         // fallible-no-value: null = ok, error = failure
+fn check_returns_inexpr(e: TExpr, ret: Type): error? {         // fallible-no-value: null = ok, error = failure
     match e.kind {
         TIfExpr as f => {
             match check_returns(f.then_blk, ret) { null => {}; error as e => return e }
@@ -1613,7 +1613,7 @@ fn check_returns_inexpr(e: TExpr, ret: Type) -> error? {         // fallible-no-
 
 // the trailing-value check — ONLY when the last statement is an expression (else: NO claim, the
 // guard against false-rejecting a body that ends in a diverging loop/if/match — the every-path item).
-fn check_trailing_value(stmts: []TStatement, ret: Type) -> error? {   // fallible-no-value: null = ok, error = failure
+fn check_trailing_value(stmts: []TStatement, ret: Type): error? {   // fallible-no-value: null = ok, error = failure
     if stmts.len == 0 { return null }
     match stmts[stmts.len - 1] {
         TExprStmt as es => {
@@ -1624,7 +1624,7 @@ fn check_trailing_value(stmts: []TStatement, ret: Type) -> error? {   // fallibl
     }
 }
 
-fn type_function(f: Function, env: Env, table: TypeTable) -> TFunction | error {
+fn type_function(f: Function, env: Env, table: TypeTable): TFunction | error {
     mut local = env
     mut i = 0
     loop {
@@ -1640,7 +1640,7 @@ fn type_function(f: Function, env: Env, table: TypeTable) -> TFunction | error {
     TFunction { name = f.name; params = f.params; return_type = ret; body = tb.stmts; is_exp = f.is_exp }
 }
 
-fn type_item(item: Item, env: Env, table: TypeTable) -> TItem | error {
+fn type_item(item: Item, env: Env, table: TypeTable): TItem | error {
     match item {
         Function as f  => {
             let tf = match type_function(f, env, table) { TFunction as x => x; error as e => return e }
@@ -1656,7 +1656,7 @@ fn type_item(item: Item, env: Env, table: TypeTable) -> TItem | error {
 }
 
 // THE TYPED ENTRY POINT: pass 1 (collect top-level names) + pass 2 (type each item).
-fn type_program(program: Program) -> TProgram | error {
+fn type_program(program: Program): TProgram | error {
     let c = match collect(program) { Collected as col => col; error as e => return e }
     mut items = teko::list::empty()
     mut i = 0
@@ -2182,7 +2182,7 @@ tk_typed_stmt_result tk_type_statement(tk_statement s, tk_env env, tk_type_table
 static tk_type function_return(tk_function f, tk_type_table table) {
     if (!f.has_return) return void_t();    // returns no value → the `-> void` marker
     tk_type_result r = tk_resolve_type(f.return_type, table);
-    return r.ok ? r.as.value : void_t();   // collect validated signatures; a bad annotation surfaces there
+    return r.ok ? r.as.value _t();   // collect validated signatures; a bad annotation surfaces there
 }
 
 // ---- C5: return / final-expr vs the declared return type (see the Teko twin; NULL = ok) ----
@@ -2285,14 +2285,14 @@ tk_tprogram_result tk_type_program(tk_program program) {
 // type_* must produce a fully typed node (happy) or refuse an ill-typed one (barrier).
 
 // --- small Type/AST constructors (keep the tests legible — M.2) ---
-fn u32t()  -> Type { Prim { kind = PrimKind::U32 } }
-fn u8t()   -> Type { Prim { kind = PrimKind::U8 } }
-fn i64t()  -> Type { Prim { kind = PrimKind::I64 } }
-fn boolt() -> Type { Prim { kind = PrimKind::Bool } }
-fn empty_env()   -> Env       { teko::list::empty() }
-fn empty_table() -> TypeTable { teko::list::empty() }
-fn path1(name: str) -> Path { Path { segments = teko::list::push(teko::list::empty(), Segment { name = name }) } }
-fn prim_is(t: Type, k: PrimKind) -> bool { match t { Prim as p => p.kind == k; _ => false } }
+fn u32t(): Type { Prim { kind = PrimKind::U32 } }
+fn u8t(): Type { Prim { kind = PrimKind::U8 } }
+fn i64t(): Type { Prim { kind = PrimKind::I64 } }
+fn boolt(): Type { Prim { kind = PrimKind::Bool } }
+fn empty_env(): Env       { teko::list::empty() }
+fn empty_table(): TypeTable { teko::list::empty() }
+fn path1(name: str): Path { Path { segments = teko::list::push(teko::list::empty(), Segment { name = name }) } }
+fn prim_is(t: Type, k: PrimKind): bool { match t { Prim as p => p.kind == k; _ => false } }
 
 #test
 fn types_leaves() {
@@ -2431,16 +2431,16 @@ fn rejects_ill_typed() {
 }
 
 // --- C2 cast helpers ---
-fn i8t()  -> Type { Prim { kind = PrimKind::I8 } }
-fn i16t() -> Type { Prim { kind = PrimKind::I16 } }
-fn i32t() -> Type { Prim { kind = PrimKind::I32 } }
-fn strt() -> Type { Str { } }
+fn i8t(): Type { Prim { kind = PrimKind::I8 } }
+fn i16t(): Type { Prim { kind = PrimKind::I16 } }
+fn i32t(): Type { Prim { kind = PrimKind::I32 } }
+fn strt(): Type { Str { } }
 // a `varname to target_name` cast over the parser AST.
-fn cast_of(varname: str, target_name: str) -> Cast {
+fn cast_of(varname: str, target_name: str): Cast {
     Cast { expr = Var { name = varname }; target = NamedType { path = path1(target_name) } }
 }
 // `varname: src` cast to `target_name` — true iff it types to the primitive `want`.
-fn cast_types_to(varname: str, src: Type, target_name: str, want: PrimKind) -> bool {
+fn cast_types_to(varname: str, src: Type, target_name: str, want: PrimKind): bool {
     let env = define(empty_env(), varname, src, false)
     match type_cast(cast_of(varname, target_name), env, empty_table()) {
         TExpr as te => prim_is(te.type, want)
@@ -2448,7 +2448,7 @@ fn cast_types_to(varname: str, src: Type, target_name: str, want: PrimKind) -> b
     }
 }
 // does the cast fail to type (the barrier)?
-fn cast_errors(varname: str, src: Type, target_name: str) -> bool {
+fn cast_errors(varname: str, src: Type, target_name: str): bool {
     let env = define(empty_env(), varname, src, false)
     match type_cast(cast_of(varname, target_name), env, empty_table()) {
         TExpr => false
@@ -2456,12 +2456,12 @@ fn cast_errors(varname: str, src: Type, target_name: str) -> bool {
     }
 }
 // a CONSTANT literal `v to target_name` — true iff it types to `want`.
-fn cast_const_types_to(v: i64, target_name: str, want: PrimKind) -> bool {
+fn cast_const_types_to(v: i64, target_name: str, want: PrimKind): bool {
     let c = Cast { expr = Number { value = v }; target = NamedType { path = path1(target_name) } }
     match type_cast(c, empty_env(), empty_table()) { TExpr as te => prim_is(te.type, want); error => false }
 }
 // does a CONSTANT cast fail (out of range — the fail-early barrier)?
-fn cast_const_errors(v: i64, target_name: str) -> bool {
+fn cast_const_errors(v: i64, target_name: str): bool {
     let c = Cast { expr = Number { value = v }; target = NamedType { path = path1(target_name) } }
     match type_cast(c, empty_env(), empty_table()) { TExpr => false; error => true }
 }
@@ -2505,9 +2505,9 @@ fn revalidate_rederives_casts() {
 }
 
 // --- byte↔int cast helpers (byte casts AS u8 — B.36) ---
-fn bytet() -> Type { Byte { } }
+fn bytet(): Type { Byte { } }
 // byte is the cast TARGET: the result type is Byte{} (not a Prim), so assert via type_eq.
-fn cast_types_to_byte(varname: str, src: Type) -> bool {
+fn cast_types_to_byte(varname: str, src: Type): bool {
     let env = define(empty_env(), varname, src, false)
     match type_cast(cast_of(varname, "byte"), env, empty_table()) {
         TExpr as te => type_eq(te.type, Byte { })
@@ -2515,7 +2515,7 @@ fn cast_types_to_byte(varname: str, src: Type) -> bool {
     }
 }
 // a CONSTANT `v to byte` — true iff it types (result is Byte{}).
-fn cast_const_types_to_byte(v: i64) -> bool {
+fn cast_const_types_to_byte(v: i64): bool {
     let c = Cast { expr = Number { value = v }; target = NamedType { path = path1("byte") } }
     match type_cast(c, empty_env(), empty_table()) { TExpr as te => type_eq(te.type, Byte { }); error => false }
 }
@@ -2556,13 +2556,13 @@ fn revalidate_rederives_byte_casts() {
 
 // --- C3 field-access helpers (reuse path1/empty_env/define/prim_is from above) ---
 // a TypeTable with one struct `Foo { token: u8 }`.
-fn foo_table() -> TypeTable {
+fn foo_table(): TypeTable {
     let fld = Field { name = "token"; type_ann = NamedType { path = path1("u8") } }
     let fields = teko::list::push(teko::list::empty(), fld)
     let td = TypeDecl { name = "Foo"; body = StructBody { fields = fields }; is_exp = false; has_doc = false; doc = "" }
     teko::list::push(teko::list::empty(), TypeReg { name = "Foo"; decl = td })
 }
-fn foo_env() -> Env { define(empty_env(), "s", Named { name = "Foo" }, false) }   // s : Foo
+fn foo_env(): Env { define(empty_env(), "s", Named { name = "Foo" }, false) }   // s : Foo
 
 #test
 fn field_read_types_to_field_type() {
@@ -2636,8 +2636,8 @@ fn annotated_literal() {
     match type_binding(b3, env, empty_table()) { TypedStmt => assert false; error => assert true }
 }
 
-// build `fn f(x: u32) -> <ret> { body }` for the C5 return-checking tests.
-fn fn_x_u32(ret: TypeExpr, body: []Statement) -> Function {
+// build `fn f(x: u32): <ret> { body }` for the C5 return-checking tests.
+fn fn_x_u32(ret: TypeExpr, body: []Statement): Function {
     let p = Param { name = "x"; type_ann = NamedType { path = path1("u32") } }
     let params = teko::list::push(teko::list::empty(), p)
     Function { name = "f"; params = params; has_return = true; return_type = ret; body = body; is_exp = false; has_doc = false; doc = "" }
@@ -2676,7 +2676,7 @@ fn return_type_mismatch_errors() {
 
 // --- C7: pattern checking (Field/Range/Alt) + exhaustiveness helpers ---
 // a variant Color = RED | GREEN | BLUE.
-fn color_subject() -> Type {
+fn color_subject(): Type {
     mut members: []Type = teko::list::empty()
     members = teko::list::push(members, Named { name = "RED" })
     members = teko::list::push(members, Named { name = "GREEN" })
@@ -2684,7 +2684,7 @@ fn color_subject() -> Type {
     Variant { members = members }
 }
 // register RED/GREEN/BLUE as (bodyless) user types so `resolve_named` finds them.
-fn color_table() -> TypeTable {
+fn color_table(): TypeTable {
     mut t: TypeTable = teko::list::empty()
     mut i = 0
     let names = teko::list::push(teko::list::push(teko::list::push(teko::list::empty(), "RED"), "GREEN"), "BLUE")
@@ -2697,10 +2697,10 @@ fn color_table() -> TypeTable {
     t
 }
 // a bare (non-binding) case pattern `CASE`.
-fn case_pat(name: str) -> Pattern { BindPattern { type_name = path1(name); has_binding = false; binding = "" } }
+fn case_pat(name: str): Pattern { BindPattern { type_name = path1(name); has_binding = false; binding = "" } }
 // an unguarded / guarded arm with the given pattern.
-fn arm_of(p: Pattern) -> Arm { Arm { pattern = p; has_when = false; guard = Number { value = 0 }; body = Number { value = 0 } } }
-fn guarded_arm_of(p: Pattern) -> Arm { Arm { pattern = p; has_when = true; guard = Number { value = 1 }; body = Number { value = 0 } } }
+fn arm_of(p: Pattern): Arm { Arm { pattern = p; has_when = false; guard = Number { value = 0 }; body = Number { value = 0 } } }
+fn guarded_arm_of(p: Pattern): Arm { Arm { pattern = p; has_when = true; guard = Number { value = 1 }; body = Number { value = 0 } } }
 
 #test
 fn field_pattern_binds_fields() {
@@ -2812,17 +2812,17 @@ presente + os filhos são válidos).
 ```teko
 // src/checker/revalidate.tks  (namespace 'teko::checker')
 
-fn is_bool(t: Type) -> bool    { match t { Prim as p => p.kind == PrimKind::Bool; _ => false } }
-fn is_integer(t: Type) -> bool { match t { Prim as p => p.kind != PrimKind::Bool; _ => false } }
+fn is_bool(t: Type): bool    { match t { Prim as p => p.kind == PrimKind::Bool; _ => false } }
+fn is_integer(t: Type): bool { match t { Prim as p => p.kind != PrimKind::Bool; _ => false } }
 
 // the stored type must equal the type derived independently here.
-fn check_node_type(stored: Type, expected: Type) -> error? {     // fallible-no-value: null = ok, error = failure
+fn check_node_type(stored: Type, expected: Type): error? {     // fallible-no-value: null = ok, error = failure
     if type_eq(stored, expected) { return null }
     error { message = "corrupt typed tree: a node's type does not match its derivation" }
 }
 
 // re-derive a binary's result type from its operands (B.22), independently.
-fn rederive_binary(lt: Type, rt: Type, op: lexer::TokenKind) -> Type | error {
+fn rederive_binary(lt: Type, rt: Type, op: lexer::TokenKind): Type | error {
     if op_is_shift(op) {
         if !is_integer(lt) || !is_integer(rt) { return error { message = "corrupt: shift operands not integer" } }
         return lt
@@ -2835,7 +2835,7 @@ fn rederive_binary(lt: Type, rt: Type, op: lexer::TokenKind) -> Type | error {
     error { message = "corrupt: unknown binary operator" }
 }
 
-fn validate_each(xs: []TExpr) -> error? {                        // fallible-no-value: null = ok, error = failure
+fn validate_each(xs: []TExpr): error? {                        // fallible-no-value: null = ok, error = failure
     mut i = 0
     loop {
         if i >= xs.len { break }
@@ -2847,7 +2847,7 @@ fn validate_each(xs: []TExpr) -> error? {                        // fallible-no-
 
 // COUNTER-VALIDATE a typed expression: re-derive its type and confirm it matches
 // the stored one (operators/literals), or check it structurally (env-dependent).
-fn validate_texpr(te: TExpr) -> error? {                         // fallible-no-value: null = ok, error = failure
+fn validate_texpr(te: TExpr): error? {                         // fallible-no-value: null = ok, error = failure
     match te.kind {
         TNumber  => check_node_type(te.type, Prim { kind = PrimKind::I64 })
         TStrLit  => check_node_type(te.type, Str { })
@@ -3037,11 +3037,11 @@ não a compilação.) Strings são **deduplicadas** numa tabela e referenciadas 
 // src/emit/tkb_buf.tks  (namespace 'teko::emit')
 
 // extract the low 8 bits as a byte.
-fn lo8(x: u32) -> byte { (x & 0xFF) to byte }
+fn lo8(x: u32): byte { (x & 0xFF) to byte }
 
-fn write_u8(buf: []byte, x: byte) -> []byte { teko::list::push(buf, x) }
+fn write_u8(buf: []byte, x: byte): []byte { teko::list::push(buf, x) }
 
-fn write_u32(buf: []byte, x: u32) -> []byte {
+fn write_u32(buf: []byte, x: u32): []byte {
     mut b = buf
     b = teko::list::push(b, lo8(x))
     b = teko::list::push(b, lo8(x >> 8))
@@ -3051,7 +3051,7 @@ fn write_u32(buf: []byte, x: u32) -> []byte {
 }
 
 // an i64 as 8 LE bytes. codec i64s are non-negative (TNumber magnitudes), so the value conversion is exact.
-fn write_i64(buf: []byte, x: i64) -> []byte {
+fn write_i64(buf: []byte, x: i64): []byte {
     mut b = buf
     mut bits = x to u64                // codec i64s are non-negative (TNumber magnitudes), so the value conversion is exact
     mut k = 0
@@ -3065,7 +3065,7 @@ fn write_i64(buf: []byte, x: i64) -> []byte {
 }
 
 // a length-prefixed byte run (used by the string table).
-fn write_bytes(buf: []byte, s: str) -> []byte {
+fn write_bytes(buf: []byte, s: str): []byte {
     mut b = write_u32(buf, s.len to u32)
     mut i = 0
     loop {
@@ -3081,9 +3081,9 @@ fn write_bytes(buf: []byte, s: str) -> []byte {
 type StrTable = struct { strings: []str }
 type Interned = struct { table: StrTable; index: u32 }
 
-fn st_empty() -> StrTable { StrTable { strings = teko::list::empty() } }
+fn st_empty(): StrTable { StrTable { strings = teko::list::empty() } }
 
-fn st_find(t: StrTable, s: str) -> u32 {
+fn st_find(t: StrTable, s: str): u32 {
     mut i = 0
     loop {
         if i >= t.strings.len { break }
@@ -3094,7 +3094,7 @@ fn st_find(t: StrTable, s: str) -> u32 {
 }
 
 // intern s → its index, adding it if new (dedup = exact round-trip + compact).
-fn st_intern(t: StrTable, s: str) -> Interned {
+fn st_intern(t: StrTable, s: str): Interned {
     let found = st_find(t, s)
     if found != 0xFFFFFFFF { return Interned { table = t; index = found } }
     let idx = t.strings.len to u32
@@ -3102,7 +3102,7 @@ fn st_intern(t: StrTable, s: str) -> Interned {
 }
 
 // serialize the whole string table into the buffer (count, then each string).
-fn write_strtable(buf: []byte, t: StrTable) -> []byte {
+fn write_strtable(buf: []byte, t: StrTable): []byte {
     mut b = write_u32(buf, t.strings.len to u32)
     mut i = 0
     loop {
@@ -3115,7 +3115,7 @@ fn write_strtable(buf: []byte, t: StrTable) -> []byte {
 
 // --- FNV-1a (alteration detection; keyed signing is evolution) ---
 
-fn fnv1a(data: []byte) -> u64 {
+fn fnv1a(data: []byte): u64 {
     mut h = 0xCBF29CE484222325         // offset basis
     mut i = 0
     loop {
@@ -3234,7 +3234,7 @@ depois o tag/payload — e os **doc-comments não entram** (o `.tkb` é o objeto
 // src/emit/tkb_write.tks  (namespace 'teko::emit')
 
 // a Type → tag byte + payload. (prim_byte/kind_byte = the enum's ordinal — E7.)
-fn write_type(buf: []byte, t: StrTable, ty: Type) -> []byte {
+fn write_type(buf: []byte, t: StrTable, ty: Type): []byte {
     match ty {
         Prim as p    => write_u8(write_u8(buf, 0), prim_byte(p.kind))
         Byte         => write_u8(buf, 1)
@@ -3249,7 +3249,7 @@ fn write_type(buf: []byte, t: StrTable, ty: Type) -> []byte {
     }
 }
 
-fn write_types(buf: []byte, t: StrTable, xs: []Type) -> []byte {
+fn write_types(buf: []byte, t: StrTable, xs: []Type): []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -3261,7 +3261,7 @@ fn write_types(buf: []byte, t: StrTable, xs: []Type) -> []byte {
 }
 
 // a path (callee) → count + each segment's name index.
-fn write_path(buf: []byte, t: StrTable, p: Path) -> []byte {
+fn write_path(buf: []byte, t: StrTable, p: Path): []byte {
     mut b = write_u32(buf, p.segments.len to u32)
     mut i = 0
     loop {
@@ -3273,7 +3273,7 @@ fn write_path(buf: []byte, t: StrTable, p: Path) -> []byte {
 }
 
 // a list of typed expressions (call args) → count + each.
-fn write_texprs(buf: []byte, t: StrTable, xs: []TExpr) -> []byte {
+fn write_texprs(buf: []byte, t: StrTable, xs: []TExpr): []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -3285,7 +3285,7 @@ fn write_texprs(buf: []byte, t: StrTable, xs: []TExpr) -> []byte {
 }
 
 // the comparison terms → count + each (op byte + operand).
-fn write_terms(buf: []byte, t: StrTable, ts: []TCmpTerm) -> []byte {
+fn write_terms(buf: []byte, t: StrTable, ts: []TCmpTerm): []byte {
     mut b = write_u32(buf, ts.len to u32)
     mut i = 0
     loop {
@@ -3297,7 +3297,7 @@ fn write_terms(buf: []byte, t: StrTable, ts: []TCmpTerm) -> []byte {
 }
 
 // a TExpr → its type, then a tag + payload (children recursive).
-fn write_texpr(buf: []byte, t: StrTable, te: TExpr) -> []byte {
+fn write_texpr(buf: []byte, t: StrTable, te: TExpr): []byte {
     let b = write_type(buf, t, te.type)        // every node carries its type
     match te.kind {
         TNumber as n   => write_i64(write_u8(b, 0), n.value)
@@ -3427,7 +3427,7 @@ strings por índice) → calcula o **hash** (FNV-1a do corpo) → emite **header
 ```teko
 // src/emit/tkb_frame.tks  (namespace 'teko::emit')
 
-fn write_u64(buf: []byte, x: u64) -> []byte {
+fn write_u64(buf: []byte, x: u64): []byte {
     mut b = buf
     mut v = x
     mut k = 0
@@ -3440,7 +3440,7 @@ fn write_u64(buf: []byte, x: u64) -> []byte {
     b
 }
 
-fn append_bytes(dst: []byte, src: []byte) -> []byte {
+fn append_bytes(dst: []byte, src: []byte): []byte {
     mut b = dst
     mut i = 0
     loop {
@@ -3453,7 +3453,7 @@ fn append_bytes(dst: []byte, src: []byte) -> []byte {
 
 // --- collect every string into the table (pre-pass; mirrors the write helpers) ---
 
-fn collect_type_list(t: StrTable, xs: []Type) -> StrTable {
+fn collect_type_list(t: StrTable, xs: []Type): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -3464,7 +3464,7 @@ fn collect_type_list(t: StrTable, xs: []Type) -> StrTable {
     tab
 }
 
-fn collect_type_strings(t: StrTable, ty: Type) -> StrTable {
+fn collect_type_strings(t: StrTable, ty: Type): StrTable {
     match ty {
         Named as n   => st_intern(t, n.name).table
         Slice as s   => collect_type_strings(t, s.element)
@@ -3474,7 +3474,7 @@ fn collect_type_strings(t: StrTable, ty: Type) -> StrTable {
     }
 }
 
-fn collect_path(t: StrTable, p: Path) -> StrTable {
+fn collect_path(t: StrTable, p: Path): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -3485,7 +3485,7 @@ fn collect_path(t: StrTable, p: Path) -> StrTable {
     tab
 }
 
-fn collect_texprs(t: StrTable, xs: []TExpr) -> StrTable {
+fn collect_texprs(t: StrTable, xs: []TExpr): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -3496,7 +3496,7 @@ fn collect_texprs(t: StrTable, xs: []TExpr) -> StrTable {
     tab
 }
 
-fn collect_terms(t: StrTable, ts: []TCmpTerm) -> StrTable {
+fn collect_terms(t: StrTable, ts: []TCmpTerm): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -3507,7 +3507,7 @@ fn collect_terms(t: StrTable, ts: []TCmpTerm) -> StrTable {
     tab
 }
 
-fn collect_strings(t: StrTable, te: TExpr) -> StrTable {
+fn collect_strings(t: StrTable, te: TExpr): StrTable {
     let t1 = collect_type_strings(t, te.type)        // the node's type may name things
     match te.kind {
         TVar as v     => st_intern(t1, v.name).table
@@ -3524,7 +3524,7 @@ fn collect_strings(t: StrTable, te: TExpr) -> StrTable {
 
 // --- the frame: header (magic + version + hash) + the body ---
 
-fn serialize(te: TExpr) -> []byte {
+fn serialize(te: TExpr): []byte {
     let table = collect_strings(st_empty(), te)
     let body = write_texpr(write_strtable(teko::list::empty(), table), table, te)
     let h = fnv1a(body)
@@ -3642,12 +3642,12 @@ type RType   = struct { r: Reader; value: Type }
 type RTypes  = struct { r: Reader; value: []Type }
 type RTable  = struct { r: Reader; value: []str }
 
-fn read_u8(r: Reader) -> RByte | error {
+fn read_u8(r: Reader): RByte | error {
     if r.pos >= r.data.len { return error { message = "truncated .tkb" } }
     RByte { r = Reader { data = r.data; pos = r.pos + 1 }; value = r.data[r.pos] }
 }
 
-fn read_u32(r: Reader) -> RU32 | error {
+fn read_u32(r: Reader): RU32 | error {
     let a = match read_u8(r)   { RByte as x => x; error as e => return e }
     let b = match read_u8(a.r) { RByte as x => x; error as e => return e }
     let c = match read_u8(b.r) { RByte as x => x; error as e => return e }
@@ -3655,21 +3655,21 @@ fn read_u32(r: Reader) -> RU32 | error {
     RU32 { r = d.r; value = (a.value to u32) | ((b.value to u32) << 8) | ((c.value to u32) << 16) | ((d.value to u32) << 24) }
 }
 
-fn read_u64(r: Reader) -> RU64 | error {
+fn read_u64(r: Reader): RU64 | error {
     let lo = match read_u32(r)    { RU32 as x => x; error as e => return e }
     let hi = match read_u32(lo.r) { RU32 as x => x; error as e => return e }
     RU64 { r = hi.r; value = (lo.value to u64) | ((hi.value to u64) << 32) }
 }
 
 // a string reference = a u32 index into the (already-read) table.
-fn read_str(r: Reader, table: []str) -> RStr | error {
+fn read_str(r: Reader, table: []str): RStr | error {
     let idx = match read_u32(r) { RU32 as x => x; error as e => return e }
     if (idx.value to u64) >= table.len { return error { message = "bad string index in .tkb" } }
     RStr { r = idx.r; value = table[idx.value] }
 }
 
 // the string table: count, then each (len + bytes).
-fn read_strtable(r: Reader) -> RTable | error {
+fn read_strtable(r: Reader): RTable | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut table = teko::list::empty()
@@ -3695,7 +3695,7 @@ fn read_strtable(r: Reader) -> RTable | error {
 }
 
 // inverse of prim_byte (PrimKind ↔ byte).
-fn prim_of(b: byte) -> PrimKind {
+fn prim_of(b: byte): PrimKind {
     if b == 0 { return PrimKind::U8 }
     if b == 1 { return PrimKind::U16 }
     if b == 2 { return PrimKind::U32 }
@@ -3707,7 +3707,7 @@ fn prim_of(b: byte) -> PrimKind {
     PrimKind::Bool
 }
 
-fn read_types(r: Reader, table: []str) -> RTypes | error {
+fn read_types(r: Reader, table: []str): RTypes | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs = teko::list::empty()
@@ -3723,7 +3723,7 @@ fn read_types(r: Reader, table: []str) -> RTypes | error {
 }
 
 // inverse of write_type — tags 0=Prim 1=Byte 2=Str 3=error 4=void 5=Slice 6=Named 7=Variant 8=Func 9=Optional.
-fn read_type(r: Reader, table: []str) -> RType | error {
+fn read_type(r: Reader, table: []str): RType | error {
     let tag = match read_u8(r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
         let k = match read_u8(tag.r) { RByte as x => x; error as e => return e }
@@ -3864,15 +3864,15 @@ type RTExprs = struct { r: Reader; value: []TExpr }
 type RTerms  = struct { r: Reader; value: []TCmpTerm }
 type RPath   = struct { r: Reader; value: Path }
 
-fn read_i64(r: Reader) -> RI64 | error {
+fn read_i64(r: Reader): RI64 | error {
     let u = match read_u64(r) { RU64 as x => x; error as e => return e }
     RI64 { r = u.r; value = u.value to i64 }               // codec i64s are non-negative (TNumber magnitudes), so the value conversion is exact
 }
 
 // inverse of kind_byte (operator TokenKind ↔ byte). The byte→enum ordinal is E7's cast.
-fn kind_of(b: byte) -> lexer::TokenKind { /* E7: the byte → operator-TokenKind */ }
+fn kind_of(b: byte): lexer::TokenKind { /* E7: the byte → operator-TokenKind */ }
 
-fn read_path(r: Reader, table: []str) -> RPath | error {
+fn read_path(r: Reader, table: []str): RPath | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut segs = teko::list::empty()
@@ -3887,7 +3887,7 @@ fn read_path(r: Reader, table: []str) -> RPath | error {
     RPath { r = rr; value = Path { segments = segs } }
 }
 
-fn read_texprs(r: Reader, table: []str) -> RTExprs | error {
+fn read_texprs(r: Reader, table: []str): RTExprs | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs = teko::list::empty()
@@ -3902,7 +3902,7 @@ fn read_texprs(r: Reader, table: []str) -> RTExprs | error {
     RTExprs { r = rr; value = xs }
 }
 
-fn read_terms(r: Reader, table: []str) -> RTerms | error {
+fn read_terms(r: Reader, table: []str): RTerms | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut ts = teko::list::empty()
@@ -3919,7 +3919,7 @@ fn read_terms(r: Reader, table: []str) -> RTerms | error {
 }
 
 // inverse of write_texpr: the type FIRST, then tag (0..7), then the payload.
-fn read_texpr(r: Reader, table: []str) -> RTExpr | error {
+fn read_texpr(r: Reader, table: []str): RTExpr | error {
     let ty = match read_type(r, table) { RType as x => x; error as e => return e }
     let tag = match read_u8(ty.r) { RByte as x => x; error as e => return e }
     if tag.value == 0 {
@@ -3974,7 +3974,7 @@ fn read_texpr(r: Reader, table: []str) -> RTExpr | error {
 }
 
 // THE ENTRY: verify the header + hash, then read the table and the typed tree.
-fn deserialize(data: []byte) -> TExpr | error {
+fn deserialize(data: []byte): TExpr | error {
     let r0 = Reader { data = data; pos = 0 }
     let m0 = match read_u8(r0)   { RByte as x => x; error as e => return e }
     let m1 = match read_u8(m0.r) { RByte as x => x; error as e => return e }
@@ -4073,8 +4073,8 @@ seguem reservadas até existir um serializador de statement.)
 ```teko
 // src/emit/tkb_test.tkt — tests for the .tkb codec (S1a/S1b). NO main: PUBLIC #test
 
-fn u8ty()  -> Type { Prim { kind = PrimKind::U8 } }
-fn i64ty() -> Type { Prim { kind = PrimKind::I64 } }
+fn u8ty(): Type { Prim { kind = PrimKind::U8 } }
+fn i64ty(): Type { Prim { kind = PrimKind::I64 } }
 
 #test
 fn tkb_roundtrip_cast() {
@@ -4223,16 +4223,16 @@ type Header = struct { types: []TyExport; fns: []FnSig }
 // --- the writers (reuse write_type / write_types; strings by u32 index) -----------
 
 // a doc: a presence byte, then (iff present) its string index.
-fn write_doc(buf: []byte, t: StrTable, has_doc: bool, doc: str) -> []byte {
+fn write_doc(buf: []byte, t: StrTable, has_doc: bool, doc: str): []byte {
     if !has_doc { return write_u8(buf, 0) }
     write_u32(write_u8(buf, 1), st_find(t, doc))
 }
 
-fn write_sigparam(buf: []byte, t: StrTable, p: SigParam) -> []byte {
+fn write_sigparam(buf: []byte, t: StrTable, p: SigParam): []byte {
     write_type(write_u32(buf, st_find(t, p.name)), t, p.type)
 }
 
-fn write_sigparams(buf: []byte, t: StrTable, xs: []SigParam) -> []byte {
+fn write_sigparams(buf: []byte, t: StrTable, xs: []SigParam): []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -4243,14 +4243,14 @@ fn write_sigparams(buf: []byte, t: StrTable, xs: []SigParam) -> []byte {
     b
 }
 
-fn write_fnsig(buf: []byte, t: StrTable, f: FnSig) -> []byte {
+fn write_fnsig(buf: []byte, t: StrTable, f: FnSig): []byte {
     mut b = write_u32(buf, st_find(t, f.name))
     b = write_sigparams(b, t, f.params)
     b = write_type(b, t, f.ret)
     write_doc(b, t, f.has_doc, f.doc)
 }
 
-fn write_fnsigs(buf: []byte, t: StrTable, xs: []FnSig) -> []byte {
+fn write_fnsigs(buf: []byte, t: StrTable, xs: []FnSig): []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -4261,11 +4261,11 @@ fn write_fnsigs(buf: []byte, t: StrTable, xs: []FnSig) -> []byte {
     b
 }
 
-fn write_sigfield(buf: []byte, t: StrTable, f: SigField) -> []byte {
+fn write_sigfield(buf: []byte, t: StrTable, f: SigField): []byte {
     write_type(write_u32(buf, st_find(t, f.name)), t, f.type)
 }
 
-fn write_sigfields(buf: []byte, t: StrTable, xs: []SigField) -> []byte {
+fn write_sigfields(buf: []byte, t: StrTable, xs: []SigField): []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -4277,7 +4277,7 @@ fn write_sigfields(buf: []byte, t: StrTable, xs: []SigField) -> []byte {
 }
 
 // a list of member NAMES (enum) → count + each name index.
-fn write_members(buf: []byte, t: StrTable, xs: []str) -> []byte {
+fn write_members(buf: []byte, t: StrTable, xs: []str): []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -4289,7 +4289,7 @@ fn write_members(buf: []byte, t: StrTable, xs: []str) -> []byte {
 }
 
 // the TyShape ordinal byte — explicit (no enum→int cast needed). Struct=0 Enum=1 Variant=2.
-fn shape_byte(s: TyShape) -> byte {
+fn shape_byte(s: TyShape): byte {
     if s == TyShape::Struct { return 0 }
     if s == TyShape::Enum   { return 1 }
     2
@@ -4297,7 +4297,7 @@ fn shape_byte(s: TyShape) -> byte {
 
 // uniform: all three lists are written; `shape` selects the meaningful one, the others
 // come out empty (count 0). Sequential, branch-free both ways (M.1 / M.5).
-fn write_tyexport(buf: []byte, t: StrTable, e: TyExport) -> []byte {
+fn write_tyexport(buf: []byte, t: StrTable, e: TyExport): []byte {
     mut b = write_u32(buf, st_find(t, e.name))
     b = write_u8(b, shape_byte(e.shape))
     b = write_sigfields(b, t, e.fields)
@@ -4306,7 +4306,7 @@ fn write_tyexport(buf: []byte, t: StrTable, e: TyExport) -> []byte {
     write_doc(b, t, e.has_doc, e.doc)
 }
 
-fn write_tyexports(buf: []byte, t: StrTable, xs: []TyExport) -> []byte {
+fn write_tyexports(buf: []byte, t: StrTable, xs: []TyExport): []byte {
     mut b = write_u32(buf, xs.len to u32)
     mut i = 0
     loop {
@@ -4317,22 +4317,22 @@ fn write_tyexports(buf: []byte, t: StrTable, xs: []TyExport) -> []byte {
     b
 }
 
-fn write_header(buf: []byte, t: StrTable, h: Header) -> []byte {
+fn write_header(buf: []byte, t: StrTable, h: Header): []byte {
     write_fnsigs(write_tyexports(buf, t, h.types), t, h.fns)
 }
 
 // --- collect every string (pre-pass; mirrors the writers; reuse collect_type_*) ----
 
-fn collect_doc(t: StrTable, has_doc: bool, doc: str) -> StrTable {
+fn collect_doc(t: StrTable, has_doc: bool, doc: str): StrTable {
     if !has_doc { return t }
     st_intern(t, doc).table
 }
 
-fn collect_sigparam(t: StrTable, p: SigParam) -> StrTable {
+fn collect_sigparam(t: StrTable, p: SigParam): StrTable {
     collect_type_strings(st_intern(t, p.name).table, p.type)
 }
 
-fn collect_sigparams(t: StrTable, xs: []SigParam) -> StrTable {
+fn collect_sigparams(t: StrTable, xs: []SigParam): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -4343,14 +4343,14 @@ fn collect_sigparams(t: StrTable, xs: []SigParam) -> StrTable {
     tab
 }
 
-fn collect_fnsig(t: StrTable, f: FnSig) -> StrTable {
+fn collect_fnsig(t: StrTable, f: FnSig): StrTable {
     let t1 = st_intern(t, f.name).table
     let t2 = collect_sigparams(t1, f.params)
     let t3 = collect_type_strings(t2, f.ret)
     collect_doc(t3, f.has_doc, f.doc)
 }
 
-fn collect_fnsigs(t: StrTable, xs: []FnSig) -> StrTable {
+fn collect_fnsigs(t: StrTable, xs: []FnSig): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -4361,11 +4361,11 @@ fn collect_fnsigs(t: StrTable, xs: []FnSig) -> StrTable {
     tab
 }
 
-fn collect_sigfield(t: StrTable, f: SigField) -> StrTable {
+fn collect_sigfield(t: StrTable, f: SigField): StrTable {
     collect_type_strings(st_intern(t, f.name).table, f.type)
 }
 
-fn collect_sigfields(t: StrTable, xs: []SigField) -> StrTable {
+fn collect_sigfields(t: StrTable, xs: []SigField): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -4376,7 +4376,7 @@ fn collect_sigfields(t: StrTable, xs: []SigField) -> StrTable {
     tab
 }
 
-fn collect_members(t: StrTable, xs: []str) -> StrTable {
+fn collect_members(t: StrTable, xs: []str): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -4387,7 +4387,7 @@ fn collect_members(t: StrTable, xs: []str) -> StrTable {
     tab
 }
 
-fn collect_tyexport(t: StrTable, e: TyExport) -> StrTable {
+fn collect_tyexport(t: StrTable, e: TyExport): StrTable {
     let t1 = st_intern(t, e.name).table
     let t2 = collect_sigfields(t1, e.fields)
     let t3 = collect_members(t2, e.members)
@@ -4395,7 +4395,7 @@ fn collect_tyexport(t: StrTable, e: TyExport) -> StrTable {
     collect_doc(t4, e.has_doc, e.doc)
 }
 
-fn collect_tyexports(t: StrTable, xs: []TyExport) -> StrTable {
+fn collect_tyexports(t: StrTable, xs: []TyExport): StrTable {
     mut tab = t
     mut i = 0
     loop {
@@ -4406,13 +4406,13 @@ fn collect_tyexports(t: StrTable, xs: []TyExport) -> StrTable {
     tab
 }
 
-fn collect_header(t: StrTable, h: Header) -> StrTable {
+fn collect_header(t: StrTable, h: Header): StrTable {
     collect_fnsigs(collect_tyexports(t, h.types), h.fns)
 }
 
 // --- the frame: collect → table → body → FNV-1a → header ("TKH\0" + ver + hash) ----
 
-fn emit_tkh(h: Header) -> []byte {
+fn emit_tkh(h: Header): []byte {
     let table = collect_header(st_empty(), h)
     let body = write_header(write_strtable(teko::list::empty(), table), table, h)
     let hash = fnv1a(body)
@@ -4440,20 +4440,20 @@ type RTyExport   = struct { r: Reader; value: TyExport }
 type RTyExports  = struct { r: Reader; value: []TyExport }
 type RHeader     = struct { r: Reader; value: Header }
 
-fn read_doc(r: Reader, table: []str) -> RDoc | error {
+fn read_doc(r: Reader, table: []str): RDoc | error {
     let p = match read_u8(r) { RByte as x => x; error as e => return e }
     if p.value == 0 { return RDoc { r = p.r; has_doc = false; doc = "" } }
     let d = match read_str(p.r, table) { RStr as x => x; error as e => return e }
     RDoc { r = d.r; has_doc = true; doc = d.value }
 }
 
-fn read_sigparam(r: Reader, table: []str) -> RSigParam | error {
+fn read_sigparam(r: Reader, table: []str): RSigParam | error {
     let nm = match read_str(r, table)     { RStr as x => x; error as e => return e }
     let ty = match read_type(nm.r, table) { RType as x => x; error as e => return e }
     RSigParam { r = ty.r; value = SigParam { name = nm.value; type = ty.value } }
 }
 
-fn read_sigparams(r: Reader, table: []str) -> RSigParams | error {
+fn read_sigparams(r: Reader, table: []str): RSigParams | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs = teko::list::empty()
@@ -4468,7 +4468,7 @@ fn read_sigparams(r: Reader, table: []str) -> RSigParams | error {
     RSigParams { r = rr; value = xs }
 }
 
-fn read_fnsig(r: Reader, table: []str) -> RFnSig | error {
+fn read_fnsig(r: Reader, table: []str): RFnSig | error {
     let nm = match read_str(r, table)          { RStr as x => x; error as e => return e }
     let ps = match read_sigparams(nm.r, table) { RSigParams as x => x; error as e => return e }
     let rt = match read_type(ps.r, table)      { RType as x => x; error as e => return e }
@@ -4479,7 +4479,7 @@ fn read_fnsig(r: Reader, table: []str) -> RFnSig | error {
     } }
 }
 
-fn read_fnsigs(r: Reader, table: []str) -> RFnSigs | error {
+fn read_fnsigs(r: Reader, table: []str): RFnSigs | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs = teko::list::empty()
@@ -4494,13 +4494,13 @@ fn read_fnsigs(r: Reader, table: []str) -> RFnSigs | error {
     RFnSigs { r = rr; value = xs }
 }
 
-fn read_sigfield(r: Reader, table: []str) -> RSigField | error {
+fn read_sigfield(r: Reader, table: []str): RSigField | error {
     let nm = match read_str(r, table)     { RStr as x => x; error as e => return e }
     let ty = match read_type(nm.r, table) { RType as x => x; error as e => return e }
     RSigField { r = ty.r; value = SigField { name = nm.value; type = ty.value } }
 }
 
-fn read_sigfields(r: Reader, table: []str) -> RSigFields | error {
+fn read_sigfields(r: Reader, table: []str): RSigFields | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs = teko::list::empty()
@@ -4515,7 +4515,7 @@ fn read_sigfields(r: Reader, table: []str) -> RSigFields | error {
     RSigFields { r = rr; value = xs }
 }
 
-fn read_members(r: Reader, table: []str) -> RMembers | error {
+fn read_members(r: Reader, table: []str): RMembers | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs = teko::list::empty()
@@ -4531,13 +4531,13 @@ fn read_members(r: Reader, table: []str) -> RMembers | error {
 }
 
 // inverse of shape_byte (byte → TyShape).
-fn shape_of(b: byte) -> TyShape {
+fn shape_of(b: byte): TyShape {
     if b == 0 { return TyShape::Struct }
     if b == 1 { return TyShape::Enum }
     TyShape::Variant
 }
 
-fn read_tyexport(r: Reader, table: []str) -> RTyExport | error {
+fn read_tyexport(r: Reader, table: []str): RTyExport | error {
     let nm = match read_str(r, table)          { RStr as x => x; error as e => return e }
     let sh = match read_u8(nm.r)               { RByte as x => x; error as e => return e }
     let fs = match read_sigfields(sh.r, table) { RSigFields as x => x; error as e => return e }
@@ -4551,7 +4551,7 @@ fn read_tyexport(r: Reader, table: []str) -> RTyExport | error {
     } }
 }
 
-fn read_tyexports(r: Reader, table: []str) -> RTyExports | error {
+fn read_tyexports(r: Reader, table: []str): RTyExports | error {
     let n = match read_u32(r) { RU32 as x => x; error as e => return e }
     mut rr = n.r
     mut xs = teko::list::empty()
@@ -4566,14 +4566,14 @@ fn read_tyexports(r: Reader, table: []str) -> RTyExports | error {
     RTyExports { r = rr; value = xs }
 }
 
-fn read_header(r: Reader, table: []str) -> RHeader | error {
+fn read_header(r: Reader, table: []str): RHeader | error {
     let ts = match read_tyexports(r, table) { RTyExports as x => x; error as e => return e }
     let fs = match read_fnsigs(ts.r, table) { RFnSigs as x => x; error as e => return e }
     RHeader { r = fs.r; value = Header { types = ts.value; fns = fs.value } }
 }
 
 // THE ENTRY: verify magic "TKH\0" + version, recompute the FNV-1a, then read.
-fn read_tkh(data: []byte) -> Header | error {
+fn read_tkh(data: []byte): Header | error {
     let r0 = Reader { data = data; pos = 0 }
     let m0 = match read_u8(r0)   { RByte as x => x; error as e => return e }
     let m1 = match read_u8(m0.r) { RByte as x => x; error as e => return e }

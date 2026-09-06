@@ -1,3 +1,5 @@
+> **[HISTÓRICO]** — documenta o crumb T-B4 da onda const (Tier-B), já executado. Não descreve o estado atual do projeto.
+
 # T-B4 — wasm resolve ponteiros rodata-INTERNOS em emit-time (sem relocation) (#594 Tier-B)
 
 Status: READY-TO-IMPLEMENT (architect, 2026-07-18). Track: Tier-B pointer-bearing
@@ -17,7 +19,7 @@ relocs). Predecessores: `docs/design/const-tb{1,2,3}-design.md`.
 > `EncodedModule`. **Nenhum produtor a exercita ainda** (o `serialize_const` produtor
 > honest-stopa qualquer agregado pointer-bearing até T-B6), então toda `LRodata` chega
 > com `relocs` vazio, o módulo é **byte-idêntico** e todos os goldens/fixpoint ficam
-> intactos. **encode_*/ELF/Mach-O/COFF/VM intocados; sem seed bump** (o 🔑 SEED BUMP #3
+> intactos. **encode_*/ELF/Mach-O/COFF/motor legado intocados; sem seed bump** (o 🔑 SEED BUMP #3
 > é depois de T-B5, plano §8).
 
 > **Correção de referência de linha.** O plano §8 aponta `objfile_wasm.tks:640`, mas a
@@ -161,7 +163,7 @@ já o chama unqualified em `:487`/`:530`, provando o acesso cross-file same-name
  * @param str target  o símbolo da entrada referenciada
  * @return u32 | error  o endereço absoluto do alvo, ou um erro nomeado
  */
-fn wasm_data_addr_of(symbols: []str, offsets: []u32, target: str) -> u32 | error {
+fn wasm_data_addr_of(symbols: []str, offsets: []u32, target: str): u32 | error {
     mut i: u64 = 0
     loop {
         if i >= symbols.len { break }
@@ -195,7 +197,7 @@ fn wasm_data_addr_of(symbols: []str, offsets: []u32, target: str) -> u32 | error
  * @return WasmRodataLayout | error  o layout com os slots de ponteiro escritos, ou o
  *                                   erro nomeado de alvo desconhecido propagado
  */
-pub fn wasm_relocate_rodata(layout: WasmRodataLayout, rodata: []lir::LRodata) -> WasmRodataLayout | error {
+pub fn wasm_relocate_rodata(layout: WasmRodataLayout, rodata: []lir::LRodata): WasmRodataLayout | error {
     let base = layout.segment.offset
     mut buf = layout.segment.bytes
     mut i: u64 = 0
@@ -253,7 +255,7 @@ seu próprio gate OU da resolução real.
 **Decisão (law-first): IMPLEMENTAR A RESOLUÇÃO REAL, sem gate wasm.** Justificativa:
 
 1. **A resolução é BARATA e testável à mão.** Ao contrário dos encoders nativos — que
-   precisam de um registro de relocation que os writers/VM não consumiam até
+   precisam de um registro de relocation que os writers/motor legado não consumiam até
    T-B2..T-B5 — o wasm precisa de ZERO relocation: o endereço-alvo é uma constante i32
    conhecida na emissão (`offsets[alvo]`), escrita com um `write_u32_le_at` já
    existente. São ~25 linhas (dois fns), e cada braço é fixável por `WasmRodataLayout`
@@ -261,7 +263,7 @@ seu próprio gate OU da resolução real.
    resolution". A Lei "issues são 100%" + "smallest safe step" favorece entregar o
    end-state real quando ele é barato e completo, em vez de um gate que só adia.
 2. **O caminho wasm é self-contained e fica COMPLETO com T-B4.** wasm não depende de
-   linker, writer nativo, nem VM. Implementar a resolução real fecha o wasm32
+   linker, writer nativo, nem motor legado. Implementar a resolução real fecha o wasm32
    inteiramente — sem gate, porque não há nada incompleto a proteger no wasm32.
 3. **Nenhum vazamento prematuro de capacidade.** O produtor (`serialize_const`,
    `lower.tks`) continua honest-stopando agregados pointer-bearing até T-B6, então
@@ -325,7 +327,7 @@ construindo `WasmRodataLayout`/`LModule` à mão — o precedente de
  * @param []lir::LDataReloc relocs  as relocations internas
  * @return lir::LRodata  a entrada
  */
-fn srt_rodata_rel(symbol: str, bytes: []byte, relocs: []lir::LDataReloc) -> lir::LRodata {
+fn srt_rodata_rel(symbol: str, bytes: []byte, relocs: []lir::LDataReloc): lir::LRodata {
     lir::LRodata { symbol = symbol; bytes = bytes; relocs = relocs }
 }
 ```
@@ -414,7 +416,7 @@ fn wasm_data_addr_of_resolves_and_errors() {
 Um `LModule` cujo rodata carrega uma reloc interna → `wasm_assemble_program(lmod,
 false)` → o `WasmModule.data`'s segment contém o endereço absoluto
 `wasm_rodata_base() + offset_do_alvo` nos 4 bytes baixos do slot. Prova que a costura
-§2.4 encadeia. Roda idêntico na VM e no harness nativo (é um `.tkt` de backend).
+§2.4 encadeia. Roda idêntico no motor legado e no harness nativo (é um `.tkt` de backend).
 
 ```teko
 #test
@@ -472,7 +474,7 @@ Cada edit é gate-able isoladamente; rodar o `.tkt` listado após cada um.
 | E3 | `src/backend/stackify_test.tkt` | helper `srt_rodata_rel` + fixtures §5.1–§5.7 | os próprios testes novos (verde) |
 
 > `objfile_wasm.tks` **NÃO é tocado** (§correção de linha) — o segment já chega
-> patcheado. Nenhum encoder nativo, writer ELF/Mach-O/COFF, ou VM é tocado (esses são
+> patcheado. Nenhum encoder nativo, writer ELF/Mach-O/COFF, ou motor legado é tocado (esses são
 > T-B1/T-B2/T-B3/T-B5). O honest-stop `encode_rodata` de T-B1 **permanece** intocado
 > (protege os caminhos NATIVOS; o wasm nunca passou por ele).
 
@@ -481,8 +483,8 @@ Cada edit é gate-able isoladamente; rodar o `.tkt` listado após cada um.
 - **Por-edit:** o `.tkt` do arquivo (tabela) — cada edit é gate-able só.
 - **RITUAL POINT — fim de T-B4:** gate COMPLETO — todos os goldens wasm byte-idênticos
   (`stackify_test.tkt`, `objfile_wasm_test.tkt`) + os demais goldens de backend
-  (encoders/writers/`lower`/`lir_interp`/`tkb`) intactos + **fixpoint gen1==gen2** +
-  ambas as engines (VM + nativo) + 100% de cobertura do delta (§5). **Sem seed bump** —
+  (encoders/writers/`lower`/`lir_oracle`/`tkb`) intactos + **fixpoint gen1==gen2** +
+  ambas as engines (motor legado + nativo) + 100% de cobertura do delta (§5). **Sem seed bump** —
   T-B4 não adiciona capacidade que o corpus use (o 🔑 SEED BUMP #3 é depois de T-B5,
   plano §8).
 
@@ -539,7 +541,7 @@ gates a montante (não faz parte de T-B4, mas nomeado):
   crumb produtor (T-B6, atrás do 🔑 SEED BUMP #3 pós-T-B5). Só então
   `wasm_relocate_rodata` recebe `relocs` não-vazio em compilação real. Até lá, o caminho
   é exercitado só pelas fixtures §5.
-- **T-B5 (VM):** resolver o ponteiro rodata-interno no `LGlobalAddr`/load tipado do
-  interpretador (`lir_interp.tks:527`) — completa a cadeia junto com os writers.
+- **T-B5 (motor legado):** resolver o ponteiro rodata-interno no `LGlobalAddr`/load tipado do
+  motor legado (`lir_oracle.tks:527`) — completa a cadeia junto com os writers.
 - **wasm64/i64:** o write de 8 bytes, quando o `wasm_scope_stop_wasm64`-com-rodata for
   levantado (§7.5). Nada disso bloqueia T-B4 — o wasm32 está pronto.

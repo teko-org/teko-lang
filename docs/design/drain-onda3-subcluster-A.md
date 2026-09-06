@@ -1,10 +1,12 @@
+> **[HISTÓRICO]** — documenta a re-verificação de crumbs de implementação da Onda-3, já completada. Não descreve o estado atual do projeto.
+
 # Drain — Onda-3 sub-cluster A (re-verified implementation crumbs)
 
 **Status:** DESIGN-AHEAD (architect). No product code changed. Re-verified at file:line against the current tree.
 **Parent design:** `docs/design/onda3-monomorphization-cluster.md`.
 **Order (A):** `#290` → `#301` → `#254` → `#294`. **Seed:** `teko.tkp` current (`.37-alpha`).
 **Rule:** every snippet is full-Javadoc, `.tks`-only. C twins FROZEN (only `teko_rt.{c,h}` is maintained — none needed here).
-**Ritual (all):** full gate — gen1 `teko . -o bin` (native #test) + `./bin/teko test .` (VM) + FIXPOINT gen1==gen2 byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit.
+**Ritual (all):** full gate — gen1 `teko . -o bin` (native #test) + `./bin/teko test .` (the legacy engine) + FIXPOINT gen1==gen2 byte-identical + `diff_c_own.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit.
 
 ## RE-VERIFICATION HEADLINE (the #296 lesson: count sites, do not trust "1 crumb")
 
@@ -13,7 +15,7 @@ The original cluster doc under-described three of the four roots. Verified count
 | Issue | doc estimate | **verified** | added sites the doc missed |
 |-------|-------------|--------------|-----------------------------|
 | #290 | 2 crumbs (typer desugar + scope predicate) | **verified 3 sites** | sibling desugar at `typer.tks:774-778` (base-vtable path) uses CANONICAL `struct_name` directly — MUST stay canonical or it regresses into the same bug from the other side |
-| #301 | 3 mangle arms | **verified 5 native sites + 1 VM probe** | `cg_member_key_str:1039` + `cg_variant_typename_str:1057` auto-cover the `ReadFn\|error` variant-member case (delegation) — but the present-wrap at `cg_wrap_elem_str:3459` and the typedef-body emitter at `codegen.tks:6894` are the load-bearing downstream consumers to eyeball; `cg_type_ready` already Func-ready |
+| #301 | 3 mangle arms | **verified 5 native sites + 1 legacy engine probe** | `cg_member_key_str:1039` + `cg_variant_typename_str:1057` auto-cover the `ReadFn\|error` variant-member case (delegation) — but the present-wrap at `cg_wrap_elem_str:3459` and the typedef-body emitter at `codegen.tks:6894` are the load-bearing downstream consumers to eyeball; `cg_type_ready` already Func-ready |
 | #254 | "4 collect + 2 typer" call-sites (layer 1) | **verified 2 fn-body edits, layer 2 has 3 sites not 2, layer 4 needs env-plumbing** | layer-2 `ClassBody` is NOT dropped (it survives UN-substituted via the `_` arm) — a *different* bug than StructBody's drop; `collect_body_insts:1424` has no method-body walk (transitive insts from method bodies never discovered); layer-4 `type_return` has NO return-type in scope → needs an `env` field, not a one-liner |
 | #294 | 1 post-ruling crumb | **verified 2 sites** | `rekey_iface_dispatch:404` early-returns `cl` unchanged when the receiver conforms (line 410) — a STRUCT receiver keeps `is_iface_dispatch=true` and hits the class-only vtable at `codegen.tks:1881→emit_iface_call`; the fix must REWRITE to a direct call, and `emit_iface_call` must never see a struct receiver |
 
@@ -42,7 +44,7 @@ Change `typer.tks:786`: build the callee from the canonical qualifier's segments
  * @return             the `[..ns.., Class, method]` callee path (all leading qualifier segments + Class + method)
  * @since onda-3 (#290)
  */
-fn method_dispatch_callee(struct_name: str, method: str) -> parser::Path {
+fn method_dispatch_callee(struct_name: str, method: str): parser::Path {
     mut segs: []parser::Segment = teko::list::empty()
     let qual = name_qualifier(struct_name)
     if qual.len > 0 {
@@ -75,19 +77,19 @@ When the callee path has ≥3 segments AND the second-to-last names a class in t
  * @return        true iff `b_ns` == or ends-with the callee's `<owner-segments>::<Class>` tail
  * @since onda-3 (#290)
  */
-fn ns_matches_qualified_class(b_ns: str, callee: parser::Path) -> bool {
+fn ns_matches_qualified_class(b_ns: str, callee: parser::Path): bool {
     let want = join_ns(path_prefix_segments(callee))
     b_ns == want || ends_with_ns(b_ns, want)
 }
 ```
-Apply at ALL **4** compare sites (`scope.tks:143` + `:156` in `lookup_call`, `:179` + `:192` in `call_ns`). Guard: only substitute the predicate when `callee.segments.len >= 3 && second_to_last names a class`; else keep `ns_last_seg(b.ns) == qual`. Helpers `join_ns`/`path_prefix_segments`/`ends_with_ns` — grep first; `ends_with_ns` likely already exists (`find_class_method` at `vm.tks:2998` uses an `ends_with(tf.namespace, "::" ~ class_name)` idiom — reuse that exact tail-compare).
+Apply at ALL **4** compare sites (`scope.tks:143` + `:156` in `lookup_call`, `:179` + `:192` in `call_ns`). Guard: only substitute the predicate when `callee.segments.len >= 3 && second_to_last names a class`; else keep `ns_last_seg(b.ns) == qual`. Helpers `join_ns`/`path_prefix_segments`/`ends_with_ns` — grep first; `ends_with_ns` likely already exists (`find_class_method` at `the legacy engine` uses an `ends_with(tf.namespace, "::" ~ class_name)` idiom — reuse that exact tail-compare).
 
-**Fixtures:** `examples/regressions/same_bare_method_dispatch/` (VM==native), modeled on `di_same_name_cross_ns`. Two ns `left`/`right`, each `type Svc = class { pub tag: i64; pub fn make(x: i64) -> Svc; pub fn tag_of(self) -> i64 { self.tag } }`; `left::Svc::make(3).tag_of() == 3`, `right::Svc::make(7).tag_of() == 7`; `exit(l + r)` = **exit 10**. Fails to type-check today, passes both after. **Fold in:** flip `di_same_name_cross_ns` to CALL the method (its field-read is the #290 workaround) IN THIS PR — it IS the regression closure (report the flip in the PR body; do not silently rewrite).
+**Fixtures:** `examples/regressions/same_bare_method_dispatch/` (legacy engine==native), modeled on `di_same_name_cross_ns`. Two ns `left`/`right`, each `type Svc = class { pub tag: i64; pub fn make(x: i64): Svc; pub fn tag_of(self): i64 { self.tag } }`; `left::Svc::make(3).tag_of() == 3`, `right::Svc::make(7).tag_of() == 7`; `exit(l + r)` = **exit 10**. Fails to type-check today, passes both after. **Fold in:** flip `di_same_name_cross_ns` to CALL the method (its field-read is the #290 workaround) IN THIS PR — it IS the regression closure (report the flip in the PR body; do not silently rewrite).
 **Ritual:** full gate; the compiler's own #109 type surface has same-bare classes, so gen1==gen2 is a loud guard. The qualified-class predicate MUST be a no-op for every non-class-dispatch call.
 
 ---
 
-## A/#301 — closure-in-Ref/optional round-trip — **verified 5 native sites + 1 VM probe**
+## A/#301 — closure-in-Ref/optional round-trip — **verified 5 native sites + 1 legacy engine probe**
 
 **Native roots (confirmed):** the mangle family drops `checker::Func`. The three PRIMARY arms:
 - `cg_opt_mangle` (`codegen.tks:942`) — `_` fallthrough at `:969` = "optional/slice inner type not yet supported".
@@ -113,18 +115,18 @@ parser::FunctionType => "func"
 ```
 The fragment `"func"` MATCHES `cg_texpr_mangle`'s existing `parser::FunctionType => "func"` (`codegen.tks:1134`) — one canonical spelling. No new typedef code needed (the collection/emit paths above light up automatically).
 
-**Crumb 2 (VM) — the ref-cell closure round-trip — PROBE-GATED (design complete, one line probe-pinned).**
-Verified VM facts: `eval_lambda_call` (`vm.tks:2962`) DOES merge callee cells back (`with_cells(caller, fe.env.cells)`, `:2981`); the deref-read `cell_get` (`vm.tks:1236`) and cells-merge for a user fn (`:3267`) are `Value`-generic, so a `FuncVal` threads through structurally. Two verified suspects:
-1. **snapshot capture** — `fv.cap_vals` bound by value at `eval_lambda_call:2977` (from the `TLambda` snapshot at `vm.tks:2170-2182`): a closure that must observe a cell WRITE made after its capture needs to capture the CELL INDEX (a `RefVal`), not the value. This is already the sound pattern (#300's `make_counter` proof).
-2. **`coerce_to` on a Func return** — `vm.tks:3270` runs `coerce_to(rv, f.return_type)` on the returned value; if `f.return_type` is a `Ref<Fn>`/`Fn?` the coerce may not carry a FuncVal through unchanged. **Verify `coerce_to` has a Func/Ref-of-Func passthrough.**
+**Crumb 2 (the legacy engine) — the ref-cell closure round-trip — PROBE-GATED (design complete, one line probe-pinned).**
+Verified legacy engine facts: `eval_lambda_call` (`the legacy engine`) DOES merge callee cells back (`with_cells(caller, fe.env.cells)`, `:2981`); the deref-read `cell_get` (`the legacy engine`) and cells-merge for a user fn (`:3267`) are `Value`-generic, so a `FuncVal` threads through structurally. Two verified suspects:
+1. **snapshot capture** — `fv.cap_vals` bound by value at `eval_lambda_call:2977` (from the `TLambda` snapshot at `the legacy engine`): a closure that must observe a cell WRITE made after its capture needs to capture the CELL INDEX (a `RefVal`), not the value. This is already the sound pattern (#300's `make_counter` proof).
+2. **`coerce_to` on a Func return** — `the legacy engine` runs `coerce_to(rv, f.return_type)` on the returned value; if `f.return_type` is a `Ref<Fn>`/`Fn?` the coerce may not carry a FuncVal through unchanged. **Verify `coerce_to` has a Func/Ref-of-Func passthrough.**
 
 **Implementer probe FIRST:** run the `reseat(cell: Ref<IntFn>, n)` repro under `TEKO_TRACE`; confirm whether the drop is (1) the snapshot, (2) `coerce_to`, or (3) the merge. Land whichever the probe proves. **The native crumb 1 is the load-bearing half** and unblocks the `ReadFn | error` union-arm case regardless.
 
 **Fixtures:**
-- `examples/regressions/closure_in_ref_roundtrip/` (VM==native) — the `reseat` repro; exit-code protocol.
+- `examples/regressions/closure_in_ref_roundtrip/` (legacy engine==native) — the `reseat` repro; exit-code protocol.
 - `examples/regressions/closure_optional_field/` (native — `tk_opt_func` must cc-compile): a struct with a `Fn?` field and a `[]Fn` field, constructed + read.
 - `flat_map`-shaped `iter_test.tkt` once round-trip holds (unparks ITER0 #184).
-**Ritual:** ship BOTH engines in ONE PR (mangle=native, cell=VM) so `diff_vm_native.sh` never sees a half-fixed state. Corpus carries no `Fn?`/`[]Fn` today → gen1==gen2 trivially preserved (guard: the new arms are a no-op unless a Func inner appears).
+**Ritual:** ship BOTH engines in ONE PR (mangle=native, cell=legacy engine) so `diff_c_own.sh` never sees a half-fixed state. Corpus carries no `Fn?`/`[]Fn` today → gen1==gen2 trivially preserved (guard: the new arms are a no-op unless a Func inner appears).
 
 ---
 
@@ -152,7 +154,7 @@ Free-fn sites `func_type` (`collect.tks:27`) and `type_function` (`typer.tks:302
  * @return            a type-param table over `owner_tps ++ mtps` / `owner_tcs ++ mtcs`
  * @since onda-3 (#254)
  */
-fn method_type_param_table(owner_name: str, mtps: []str, mtcs: []parser::ConstraintExpr, table: TypeTable) -> TypeTable {
+fn method_type_param_table(owner_name: str, mtps: []str, mtcs: []parser::ConstraintExpr, table: TypeTable): TypeTable {
     match type_table_find(table, owner_name, "") {
         parser::TypeDecl as td => type_param_table(concat_tps(td.type_params, mtps), concat_tcs(td.type_constraints, mtcs), "", table)
         error => type_param_table(mtps, mtcs, "", table)
@@ -209,7 +211,7 @@ Method walk per method: `subst_texpr_names` each `params[i].type_ann` + `return_
 
 ```teko
 // type_return (typer.tks:2482) — thread the enclosing return type as the struct-init expected context:
-fn type_return(r: parser::Return, env: Env, table: TypeTable) -> TypedStmt | error {
+fn type_return(r: parser::Return, env: Env, table: TypeTable): TypedStmt | error {
     if !r.has_value {
         return TypedStmt { node = TReturn { has_value = false; value = void_texpr() }; env = env }
     }
@@ -222,12 +224,12 @@ fn type_return(r: parser::Return, env: Env, table: TypeTable) -> TypedStmt | err
 ### Layer 5 — generic class static factory.
 With L1-L4, a generic class's static factory (body constructs `Self<T>{…}`, return type is the generic instance) type-checks and stamps. The ClassBody method carrier (L2/L3) covers it. Verify arena-per-object ref semantics survive stamping (the stamped method set reuses the same class-lowering; no new codegen).
 
-**Fixtures (VM==native unless noted):**
-- `examples/regressions/generic_struct_method/` — `type Box<T> = struct { value: T; pub fn get(self) -> T { self.value } }`; `Box<i64>{value=42}.get()` → **exit 42**; a second `Box<u8>` inst proves per-instance stamping.
-- `examples/regressions/generic_class_factory/` — `type Cell<T> = class { pub v: T; pub fn make(x: T) -> Cell<T> { Cell { v = x } }; pub fn read(self) -> T { self.v } }`; `Cell<i64>::make(7).read()` → exit 7 (proves L5 + L4).
-- `examples/regressions/generic_method_self_construct/` — `fn dup(self) -> Box<T> { Box { value = self.value } }` (proves the L4 return-type thread).
+**Fixtures (legacy engine==native unless noted):**
+- `examples/regressions/generic_struct_method/` — `type Box<T> = struct { value: T; pub fn get(self): T { self.value } }`; `Box<i64>{value=42}.get()` → **exit 42**; a second `Box<u8>` inst proves per-instance stamping.
+- `examples/regressions/generic_class_factory/` — `type Cell<T> = class { pub v: T; pub fn make(x: T): Cell<T> { Cell { v = x } }; pub fn read(self): T { self.v } }`; `Cell<i64>::make(7).read()` → exit 7 (proves L5 + L4).
+- `examples/regressions/generic_method_self_construct/` — `fn dup(self): Box<T> { Box { value = self.value } }` (proves the L4 return-type thread).
 - `examples/regressions/generic_method_trait_fold/` — a `<K: Hashable & Eq>` chain method (the #163 Map-key path — proves the constraint gate + trait fold survive stamping).
-- Corpus `#test`s in `generics_test.tkt` (VM → cover the mono method path both engines).
+- Corpus `#test`s in `generics_test.tkt` (legacy engine → cover the mono method path both engines).
 **Ritual:** full gate at EACH layer (independently gate-able). The `any_generic` no-op guard (`monomorph.tks:739`) MUST hold — the compiler has ZERO generic methods → gen1==gen2 byte-identical is the single most important fixpoint guard in the cluster. Verify at each layer, not only at the end.
 **Sequencing vs #162 (S6):** memory `teko-generic-methods-gap` sequences #254 AFTER #162 to avoid conflict in monomorph/typer/resolve/collect. Confirm #162's merge state; layers 1-2 (collect/resolve) are the conflict-prone ones — coordinate or rebase.
 
@@ -237,7 +239,7 @@ With L1-L4, a generic class's static factory (body constructs `Self<T>{…}`, re
 
 **Roots (confirmed):**
 - `rekey_iface_dispatch` (`monomorph.tks:404`) — when the receiver conforms (`type_conforms_to`, `:410`) it returns `cl` UNCHANGED, keeping `is_iface_dispatch=true`. `type_conforms_to` accepts structs AND classes nominally, so a constraint-bound STRUCT reaches here with `is_iface_dispatch=true`.
-- `[+SITE MISSED]` codegen: `emit_call` routes `c.is_iface_dispatch` → `emit_iface_call` (`codegen.tks:1881`), which emits the class-only fat-pointer upcast + `tk_vt_<T>_<iface>` (every `tk_vt_`/`cg_is_class_named` site: `codegen.tks:441,3488,3863,3888`). A struct has no `{data,vtable}` rep → cc-reject / miscompile natively; VM has no vtable value to name-dispatch through → panic. So there are TWO sites: the rekey (checker) AND the emit (codegen) — the fix must ensure a struct receiver NEVER reaches `emit_iface_call`.
+- `[+SITE MISSED]` codegen: `emit_call` routes `c.is_iface_dispatch` → `emit_iface_call` (`codegen.tks:1881`), which emits the class-only fat-pointer upcast + `tk_vt_<T>_<iface>` (every `tk_vt_`/`cg_is_class_named` site: `codegen.tks:441,3488,3863,3888`). A struct has no `{data,vtable}` rep → cc-reject / miscompile natively; legacy engine has no vtable value to name-dispatch through → panic. So there are TWO sites: the rekey (checker) AND the emit (codegen) — the fix must ensure a struct receiver NEVER reaches `emit_iface_call`.
 
 **RULING (a) — applied, law-first (M.1/M.3, matches `teko-oop-w10b-design`): a constraint is a monomorphization GATE, not a dynamic-dispatch promotion.** A `<T: Contract>` body with `T` bound to a concrete struct is fully known at instantiation → lower `x.measure()` to a DIRECT call to the stamped `Struct::measure` (produced by #254), never an upcast. No value-vtable, no new rep. Dynamic dispatch (fat pointer) stays class-only. **No owner HALT.** Logged for LTS v1.0.0.0 review.
 *Residual flag (informational, do NOT expand):* a future "struct value stored behind a `Contract`-typed slot" (heterogeneous struct-as-contract collection) is NOT provided by (a) — that needs boxing/(b), a NEW capability out of #294's scope. Report, do not turn into an issue.
@@ -259,7 +261,7 @@ In `rekey_iface_dispatch` (`monomorph.tks:404`), BEFORE the `type_conforms_to` e
  * @return      a DIRECT TCall keyed on the stamped struct method when the receiver is a struct; else `cl`
  * @since onda-3 (#294)
  */
-fn rekey_struct_constraint_dispatch(cl: TCall, args: []TExpr, table: TypeTable) -> TCall {
+fn rekey_struct_constraint_dispatch(cl: TCall, args: []TExpr, table: TypeTable): TCall {
     if !cl.is_iface_dispatch || args.len == 0 { return cl }
     let recv = match args[0].type { Named as n => n.name; _ => return cl }
     if !is_struct_named(table, recv) { return cl }   // class/interface → leave for the vtable path
@@ -268,17 +270,17 @@ fn rekey_struct_constraint_dispatch(cl: TCall, args: []TExpr, table: TypeTable) 
     TCall { callee = direct; args = cl.args; call_ns = recv; is_closure_call = false; callee_type = cl.callee_type; is_iface_dispatch = false; iface_slot = 0 }
 }
 ```
-Call it at the head of `rekey_iface_dispatch` (return early on a struct rewrite) so `emit_iface_call` never receives a struct. Provide `is_struct_named(table, name)` (a struct-decl-body probe; the checker twin of `cg_is_class_named`). The VM side needs no new dispatch — a direct call resolves through `find_function_ns` like any stamped method.
+Call it at the head of `rekey_iface_dispatch` (return early on a struct rewrite) so `emit_iface_call` never receives a struct. Provide `is_struct_named(table, name)` (a struct-decl-body probe; the checker twin of `cg_is_class_named`). The legacy engine side needs no new dispatch — a direct call resolves through `find_function_ns` like any stamped method.
 
-**Fixtures (VM==native):**
-- `examples/regressions/struct_through_constraint/` — `type P = struct { pub w: i64; pub fn measure(self) -> i64 { self.w } }` + `fn total<T: Measurable>(x: T) -> i64 { x.measure() }`; `total(P{w=5})` → **exit 5**. Panics on VM / cc-rejects natively today; both pass after.
+**Fixtures (legacy engine==native):**
+- `examples/regressions/struct_through_constraint/` — `type P = struct { pub w: i64; pub fn measure(self): i64 { self.w } }` + `fn total<T: Measurable>(x: T): i64 { x.measure() }`; `total(P{w=5})` → **exit 5**. Panics on legacy engine / cc-rejects natively today; both pass after.
 - `examples/regressions/struct_vs_class_constraint/` — same constraint satisfied by a STRUCT and by a CLASS in the same program; the struct dispatches direct, the class through the vtable — both correct (proves the no-op-for-class guard).
 **Ritual:** full gate; gated on #254 green (the stamped concrete method is the direct target). gen1==gen2: the compiler uses no constraint-bound struct dispatch → the new arm is a no-op there.
 
 ---
 
 ## What remains BLOCKED (design-ahead honesty)
-- **#301 VM crumb 2** — probe-gated: `TEKO_TRACE` the `reseat` repro to pin snapshot (`vm.tks:2977`) vs `coerce_to` (`vm.tks:3270`) vs merge. Design complete (capture-the-cell-index). Native crumb 1 (mangle) is fully specified and unblocks the `ReadFn | error` union-arm case immediately.
+- **#301 legacy engine crumb 2** — probe-gated: `TEKO_TRACE` the `reseat` repro to pin snapshot (`the legacy engine`) vs `coerce_to` (`the legacy engine`) vs merge. Design complete (capture-the-cell-index). Native crumb 1 (mangle) is fully specified and unblocks the `ReadFn | error` union-arm case immediately.
 - **#294** — gated on #254's method stamping (the direct target). Ruling (a) applied, law-clean; the crumb is a small dispatch-rewrite once #254 lands.
 - **#254 layer 4** — the `Env` field addition is wide; confirm `type_expr_expected`/`type_value_expected`'s exact entry name before editing (both exist, name-verify).
 - Everything else (#290, #301 native, #254 layers 1-3/5) is fully specified against the current tree and can start once #300 is merged and #290→#254 ordering is honored.

@@ -1,0 +1,267 @@
+use teko::crypto
+use teko::encoding::base64
+use teko::encoding::json
+use teko::numeric::bigint
+
+/**
+ * An imported `"oct"` JWK: the raw HMAC secret (`k`, RFC 7518 §6.4.1). The same value serves both
+ * signing and verification — HMAC is symmetric.
+ */
+exp type JwkOct = struct {
+    /** the raw shared secret */
+    secret: []byte
+}
+
+/**
+ * An imported `"RSA"` JWK's public component (`n`, `e`, RFC 7518 §6.3.1) — usable for `RS*`/`PS*`
+ * verification.
+ */
+exp type JwkRsaPublic = struct {
+    /** the RSA public key */
+    key: crypto::RsaPublicKey
+}
+
+/**
+ * An imported `"RSA"` JWK's private component (`n`, `e`, `d`, RFC 7518 §6.3.2) — usable for
+ * `RS*`/`PS*` signing.
+ */
+exp type JwkRsaPrivate = struct {
+    /** the RSA private key */
+    key: crypto::RsaPrivateKey
+}
+
+/**
+ * An imported `"EC"` JWK's public component (`crv:"P-256"`, `x`, `y`, RFC 7518 §6.2.1) — usable
+ * for `ES256` verification.
+ */
+exp type JwkEcPublic = struct {
+    /** the P-256 public point `Q` */
+    point: crypto::P256Point
+}
+
+/**
+ * An imported `"EC"` JWK's private component (`crv:"P-256"`, `x`, `y`, `d`, RFC 7518 §6.2.2) —
+ * usable for `ES256` signing. The public point is carried alongside the scalar for the caller's
+ * convenience (it is already present in the JWK).
+ */
+exp type JwkEcPrivate = struct {
+    /** the private scalar `d` */
+    scalar: bigint::BigInt
+    /** the matching public point `Q = d*G` */
+    point: crypto::P256Point
+}
+
+/**
+ * An imported `"OKP"` JWK's public component (`crv:"Ed25519"`, `x`, RFC 8037 §2) — usable for
+ * `EdDSA` verification.
+ */
+exp type JwkOkpPublic = struct {
+    /** the 32-byte Ed25519 public key */
+    public_key: []byte
+}
+
+/**
+ * An imported `"OKP"` JWK's private component (`crv:"Ed25519"`, `x`, `d`, RFC 8037 §2) — usable
+ * for `EdDSA` signing.
+ */
+exp type JwkOkpPrivate = struct {
+    /** the 32-byte Ed25519 secret key seed */
+    secret_key: []byte
+}
+
+macro JoseKey() { lowering { JwkOct | JwkRsaPublic | JwkRsaPrivate | JwkEcPublic | JwkEcPrivate | JwkOkpPublic | JwkOkpPrivate } }
+
+fn jwk_parse_object(jwk_json: str): json::JsonObject | crypto::CryptoError {
+    var v = match json::decode(jwk_json) {
+        (@JsonValue()) as x => x
+        error => return crypto::crypto_error("jwk: invalid JSON")
+    }
+    match v {
+        json::JsonObject as o => o
+        _ => crypto::crypto_error("jwk: JWK must be a JSON object")
+    }
+}
+
+fn jwk_field_str(obj: json::JsonObject, field: str): str | null {
+    match json::object_get(obj, field) {
+        (@JsonValue()) as v => match v {
+            json::JsonString as s => s.value
+            _ => null
+        }
+        null => null
+    }
+}
+
+fn jwk_required_str(obj: json::JsonObject, field: str): str | crypto::CryptoError {
+    match jwk_field_str(obj, field) {
+        str as s => s
+        null => crypto::crypto_error(concat("jwk: missing or non-string field '", field, "'"))
+    }
+}
+
+fn jwk_required_bytes(obj: json::JsonObject, field: str): []byte | crypto::CryptoError {
+    var text = match jwk_required_str(obj, field) {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    match base64::decode_url_safe_no_pad(text) {
+        []byte as b => b
+        error => crypto::crypto_error(concat("jwk: invalid base64url in field '", field, "'"))
+    }
+}
+
+fn jwk_parse_oct(obj: json::JsonObject): @JoseKey() | crypto::CryptoError {
+    var secret = match jwk_required_bytes(obj, "k") {
+        []byte as b => b
+        crypto::CryptoError as e => return e
+    }
+    JwkOct { secret = secret }
+}
+
+fn jwk_parse_rsa_public(obj: json::JsonObject): @JoseKey() | crypto::CryptoError {
+    var n = match jwk_required_bytes(obj, "n") {
+        []byte as b => b
+        crypto::CryptoError as e => return e
+    }
+    var e = match jwk_required_bytes(obj, "e") {
+        []byte as b => b
+        crypto::CryptoError as e2 => return e2
+    }
+    JwkRsaPublic { key = crypto::rsa_public_key_from_bytes_be(n, e) }
+}
+
+fn jwk_parse_rsa_private(obj: json::JsonObject): @JoseKey() | crypto::CryptoError {
+    var n = match jwk_required_bytes(obj, "n") {
+        []byte as b => b
+        crypto::CryptoError as e => return e
+    }
+    var e = match jwk_required_bytes(obj, "e") {
+        []byte as b => b
+        crypto::CryptoError as e2 => return e2
+    }
+    var d = match jwk_required_bytes(obj, "d") {
+        []byte as b => b
+        crypto::CryptoError as e3 => return e3
+    }
+    JwkRsaPrivate { key = crypto::rsa_private_key_from_bytes_be(n, d, e) }
+}
+
+fn jwk_ec_p256_point(obj: json::JsonObject): crypto::P256Point | crypto::CryptoError {
+    var crv = match jwk_required_str(obj, "crv") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    if crv != "P-256" {
+        return crypto::crypto_error(concat("jwk: unsupported EC curve '", crv, "' (only P-256 is implemented; P-384/P-521 for ES384/ES512 are gated)"))
+    }
+    var x_bytes = match jwk_required_bytes(obj, "x") {
+        []byte as b => b
+        crypto::CryptoError as e2 => return e2
+    }
+    var y_bytes = match jwk_required_bytes(obj, "y") {
+        []byte as b => b
+        crypto::CryptoError as e3 => return e3
+    }
+    var point = crypto::P256Point { infinity = false; x = bigint::from_bytes_be(x_bytes); y = bigint::from_bytes_be(y_bytes) }
+    if !crypto::ec_p256_is_on_curve(point) {
+        return crypto::crypto_error("jwk: EC point does not satisfy the P-256 curve equation")
+    }
+    point
+}
+
+fn jwk_parse_ec_public(obj: json::JsonObject): @JoseKey() | crypto::CryptoError {
+    var point = match jwk_ec_p256_point(obj) {
+        crypto::P256Point as p => p
+        crypto::CryptoError as e => return e
+    }
+    JwkEcPublic { point = point }
+}
+
+fn jwk_parse_ec_private(obj: json::JsonObject): @JoseKey() | crypto::CryptoError {
+    var point = match jwk_ec_p256_point(obj) {
+        crypto::P256Point as p => p
+        crypto::CryptoError as e => return e
+    }
+    var d_bytes = match jwk_required_bytes(obj, "d") {
+        []byte as b => b
+        crypto::CryptoError as e2 => return e2
+    }
+    JwkEcPrivate { scalar = bigint::from_bytes_be(d_bytes); point = point }
+}
+
+fn jwk_parse_okp_public(obj: json::JsonObject): @JoseKey() | crypto::CryptoError {
+    var crv = match jwk_required_str(obj, "crv") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    if crv != "Ed25519" {
+        return crypto::crypto_error(concat("jwk: unsupported OKP curve '", crv, "' (only Ed25519 is implemented)"))
+    }
+    var pk = match jwk_required_bytes(obj, "x") {
+        []byte as b => b
+        crypto::CryptoError as e2 => return e2
+    }
+    if pk.len != 32 {
+        return crypto::crypto_error("jwk: Ed25519 public key must be exactly 32 bytes")
+    }
+    JwkOkpPublic { public_key = pk }
+}
+
+fn jwk_parse_okp_private(obj: json::JsonObject): @JoseKey() | crypto::CryptoError {
+    var crv = match jwk_required_str(obj, "crv") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    if crv != "Ed25519" {
+        return crypto::crypto_error(concat("jwk: unsupported OKP curve '", crv, "' (only Ed25519 is implemented)"))
+    }
+    var sk = match jwk_required_bytes(obj, "d") {
+        []byte as b => b
+        crypto::CryptoError as e2 => return e2
+    }
+    if sk.len != 32 {
+        return crypto::crypto_error("jwk: Ed25519 secret key seed must be exactly 32 bytes")
+    }
+    JwkOkpPrivate { secret_key = sk }
+}
+
+/**
+ * Imports a JWK for VERIFICATION: the public-facing key material regardless of whether the JWK
+ * also carries a private component (a private JWK's public members remain valid for
+ * verification).
+ */
+exp fn jwk_to_verify_key(jwk_json: str): @JoseKey() | crypto::CryptoError {
+    var obj = match jwk_parse_object(jwk_json) {
+        json::JsonObject as o => o
+        crypto::CryptoError as e => return e
+    }
+    var kty = match jwk_required_str(obj, "kty") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    if kty == "oct" { return jwk_parse_oct(obj) }
+    if kty == "RSA" { return jwk_parse_rsa_public(obj) }
+    if kty == "EC" { return jwk_parse_ec_public(obj) }
+    if kty == "OKP" { return jwk_parse_okp_public(obj) }
+    crypto::crypto_error(concat("jwk: unsupported kty '", kty, "'"))
+}
+
+/**
+ * Imports a JWK for SIGNING: the private key material, failing closed when the required private
+ * component (`k` for `"oct"`, `d` otherwise) is absent.
+ */
+exp fn jwk_to_sign_key(jwk_json: str): @JoseKey() | crypto::CryptoError {
+    var obj = match jwk_parse_object(jwk_json) {
+        json::JsonObject as o => o
+        crypto::CryptoError as e => return e
+    }
+    var kty = match jwk_required_str(obj, "kty") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    if kty == "oct" { return jwk_parse_oct(obj) }
+    if kty == "RSA" { return jwk_parse_rsa_private(obj) }
+    if kty == "EC" { return jwk_parse_ec_private(obj) }
+    if kty == "OKP" { return jwk_parse_okp_private(obj) }
+    crypto::crypto_error(concat("jwk: unsupported kty '", kty, "'"))
+}

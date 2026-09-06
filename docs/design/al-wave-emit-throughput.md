@@ -166,7 +166,7 @@ type PhaseSample = struct { name: str; elapsed_ns: u64; out_bytes: u64 }
  * @return              a razão; 0.0 quando output_bytes == 0 (guard)
  * @since 0.x (#AL1)
  */
-pub fn copy_amplification(grow_bytes: u64, output_bytes: u64) -> f64
+pub fn copy_amplification(grow_bytes: u64, output_bytes: u64): f64
 ```
 
 ---
@@ -222,7 +222,7 @@ sites (esperado ~0 no padrão mutável).
  * @throws   pânico se cap estourar u64 (M.1 fail-loud)
  * @since 0.x (#AL3/F1)
  */
-pub fn push[T](x: &[]T, v: T) -> void
+pub fn push[T](x: &[]T, v: T)
 ```
 
 Ritual: fixpoint verde (o C do compilador muda, mas o C emitido para o CORPUS-ALVO não). Blast:
@@ -284,7 +284,7 @@ a recomputação). Ritual: fixpoint + probe: allocs de `cg_variant_typename_str`
  * @return      o nome manglado interned (computado 1×, servido N×)
  * @since 0.x (#AL4a)
  */
-pub fn variant_typename_interned(cache: &ManglingIntern, t: Type) -> str
+pub fn variant_typename_interned(cache: &ManglingIntern, t: Type): str
 ```
 
 ---
@@ -330,7 +330,7 @@ bom — **não mexer**. Ritual: probe dark-matter str MB ↓ + pico RSS ↓.
  * @return  void, ou error num write curto/falho (M.1)
  * @since 0.x (#AL4b)
  */
-pub fn ew_write(w: &EmitWriter, s: str) -> void | error
+pub fn ew_write(w: &EmitWriter, s: str) | error
 ```
 
 ### 5.3 AL5 — region-per-phase (M/L) — ELEVADO pela prova
@@ -339,14 +339,14 @@ pub fn ew_write(w: &EmitWriter, s: str) -> void | error
 fase recebe uma `tk_region` própria, dropada em um passo no fim — remove a acumulação root
 process-lifetime. Primitivas já existem (`teko_rt.h:148-152`; reclaim observável
 `teko_rt.c:1078-1086`). Dona da região onde `[N]T` soft aloca (F3). Ritual: probe
-reclaim-ratio ↑ (de 0%), RSS ↓, zero regressão (diff VM==native + fixpoint).
+reclaim-ratio ↑ (de 0%), RSS ↓, zero regressão (native validation + fixpoint).
 
 ---
 
 ## 6. PONTE DE COEXISTÊNCIA — o que torna o blast radius gerenciável
 
 **Viável: SIM.** As duas assinaturas coexistem durante a migração:
-- `teko::list::push(xs: []T, v: T) -> []T` — value-thread, ATUAL, intocada (byte-idêntica).
+- `teko::list::push(xs: []T, v: T): []T` — value-thread, ATUAL, intocada (byte-idêntica).
 - ref-push, NOVA (F1/AL3) — a forma borrow.
 
 Ponte por **nome novo durante a migração** (`push_into`/`grow` para a forma borrow),
@@ -362,8 +362,7 @@ migra um módulo de value-thread → ref-push, roda o gate, segue. **Nenhum cuto
 compilador, **NÃO os bytes emitidos do programa-alvo** (o compilador compila o corpus de
 teste identicamente antes e depois). Marcação por crumb:
 - **Preserva-alvo, muda-C-do-compilador** (gen1==gen2 entre si; C emitido para o corpus-alvo
-  byte-idêntico): F1, F3, AL3, AL6 (níveis push/`[N]T`). Prova: golden do corpus-alvo + diff
-  VM==native + fixpoint.
+  byte-idêntico): F1, F3, AL3, AL6 (níveis push/`[N]T`). Prova: golden do corpus-alvo + native validation + fixpoint.
 - **Preserva tudo**: AL1, AL4a (string idêntica, só cacheia), F2 (≤7 sites), AL4b, AL5.
 - **Muda-bytes-com-justificativa**: **AL0** const-ificação (runtime→rodata, 5 sites — por
   honestidade/W15, não perf).
@@ -464,7 +463,7 @@ baseline de AL1 como régua.
 - **Blast radius (§7).** ~1383 push-sites. Resolução: PONTE (§6) → gradual, fixpoint por
   sub-lote. Nunca cutover duro.
 - **Fixpoint / byte-identidade.** F1/F3/AL3/AL6 mudam o C do compilador mas preservam o C
-  emitido para o corpus-alvo. Resolução: golden do alvo + diff VM==native + fixpoint
+  emitido para o corpus-alvo. Resolução: golden do alvo + native validation + fixpoint
   gen1==gen2; marcação por crumb em §6.
 - **`let`-profundo pode quebrar código que muta conteúdo de `let`.** Blast: 7 index-writes
   (§7). Resolução: migrar os ≤7 a `mut`, depois apertar; baixo risco.

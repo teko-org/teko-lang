@@ -1,34 +1,289 @@
-// src/fs/fs.tks  (namespace teko::fs)
-//
-// teko::fs — filesystem namespace: directory listing, creation, and file removal.
-// These are extern fn declarations binding the C runtime symbols in teko_rt.{c,h}.
-// The implementations live in src/runtime/teko_rt.c; this file is the canonical
-// Teko-surface declaration (SUPREME RULE: no .c/.h without a .tks twin).
-//
-// Return types:
-//   []str | error  — tk_ffi_slres  (ok / ptr+len / err)
-//   error?         — tk_ffi_ures   (ok / err)
-//
-// The codegen dispatches these by last-segment name via emit_host_ffi (codegen.c /
-// codegen.tks): list_dir     -> CG_FFI_SLRES / "tk_rt_list_dir";
-//                mkdir       -> CG_FFI_URES  / "tk_rt_mkdir";
-//                remove_file -> CG_FFI_URES  / "tk_rt_remove_file".
-// The checker resolves them via tk_builtin_fn / builtin_fn (scope.c / scope.tks).
+/** FileInfo — the essentials of a path for planning reads without overrun: the exact byte size and
+ * whether it is a directory. */
+exp type FileInfo = struct {
+    /** The total file size in bytes (0 for a directory). */
+    size: u64
+    /** True when the path is a directory. */
+    is_dir: bool
+}
 
-// list_dir — return all entries of the directory at path (excluding "." and ".."),
-// or an error when the directory cannot be opened.
-// C symbol: tk_ffi_slres tk_rt_list_dir(tk_str path)  [teko_rt.c:451]
-pub extern fn list_dir(path: str) -> []str | error = "tk_rt_list_dir" from "teko_rt"
+/** teko::fs::list_dir — the entries of the directory at `path` (excluding "." and ".."), sorted
+ * byte-lexicographically for a reproducible walk. */
+exp fn list_dir(path: str): []str | error {
+    os_list_dir(path)
+}
 
-// mkdir — create a directory at path with mode 0755; succeeds when it already exists
-// (idempotent — safe to call for build output directories that persist between runs).
-// Returns nothing on success, or an error on failure.
-// C symbol: tk_ffi_ures tk_rt_mkdir(tk_str path)  [teko_rt.c:428]
-pub extern fn mkdir(path: str) -> error | null = "tk_rt_mkdir" from "teko_rt"
+/** teko::fs::mkdir — create a directory at `path` with mode 0755; succeeds when it already
+ * exists. */
+exp fn mkdir(path: str): error | null {
+    os_mkdir(path)
+}
 
-// remove_file — delete the file at path (libc remove); succeeds when the file is already
-// absent (idempotent — mirrors mkdir's already-exists-is-success contract: "ensure the
-// file does not exist"). Returns nothing on success, or an error on failure.
-// (issue #79) First use: cleaning the cc-family probe file in the build backend.
-// C symbol: tk_ffi_ures tk_rt_remove_file(tk_str path)
-pub extern fn remove_file(path: str) -> error | null = "tk_rt_remove_file" from "teko_rt"
+/** teko::fs::remove_file — delete the file at `path`; succeeds when it is already absent. */
+exp fn remove_file(path: str): error | null {
+    os_remove_file(path)
+}
+
+/** teko::fs::file_size — the exact byte length of `path`, for sizing a reader. */
+exp fn file_size(path: str): u64 | error {
+    var s = match teko::io::open_read(path) { teko::io::FileStream as fs => fs; error as e => return e }
+    var total = teko::io::stream_size(s)
+    _ = teko::io::stream_close(s)
+    total
+}
+
+/** teko::fs::stat — the info of `path` without opening a data stream. */
+exp fn stat(path: str): FileInfo | error {
+    if path_is_dir(path) { return FileInfo { size = 0; is_dir = true } }
+    var sz = match file_size(path) { u64 as n => n; error as e => return e }
+    FileInfo { size = sz; is_dir = false }
+}
+
+fn path_is_dir(path: str): bool {
+    os_is_dir(path)
+}
+
+fn cstr_addr(path: str): i64 {
+    teko::sys::ptr_word(teko::mem::as_cstr(path))
+}
+
+fn load_u16(addr: i64): u64 {
+    teko::mem::load_u8(addr to u64) | (teko::mem::load_u8((addr + 1) to u64) << 8)
+}
+
+fn cstr_len(addr: i64): u64 {
+    var n: u64 = 0
+    loop {
+        if teko::mem::load_u8((addr + (n to i64)) to u64) == 0 { break }
+        n = n + 1
+    }
+    n
+}
+
+fn name_at(addr: i64): str {
+    teko::mem::str_from_c(teko::sys::word_ptr(addr), cstr_len(addr))
+}
+
+fn is_dot_name(addr: i64): bool {
+    var c0 = teko::mem::load_u8(addr to u64)
+    if c0 != 46 { return false }
+    var c1 = teko::mem::load_u8((addr + 1) to u64)
+    if c1 == 0 { return true }
+    if c1 != 46 { return false }
+    teko::mem::load_u8((addr + 2) to u64) == 0
+}
+
+fn name_less(a: str, b: str): bool {
+    var n = if a.len < b.len { a.len } else { b.len }
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        if a[i] != b[i] { return (a[i] to u64) < (b[i] to u64) }
+        i = i + 1
+    }
+    a.len < b.len
+}
+
+fn sorted_names(xs: []str): []str {
+    var n = xs.len
+    var out: [n]str = []
+    var c: u64 = 0
+    loop {
+        if c >= n { break }
+        out[c] = xs[c]
+        c = c + 1
+    }
+    var i: u64 = 1
+    loop {
+        if i >= n { break }
+        var key = out[i]
+        var j = i
+        loop {
+            if j == 0 { break }
+            if !name_less(key, out[j - 1]) { break }
+            out[j] = out[j - 1]
+            j = j - 1
+        }
+        out[j] = key
+        i = i + 1
+    }
+    out
+}
+
+#os("linux")
+fn os_open_dir(path: str): i64 {
+    teko::sys::syscall4(teko::sys::SYS_OPENAT, teko::sys::AT_FDCWD, cstr_addr(path), teko::sys::O_RDONLY | teko::sys::O_DIRECTORY, 0)
+}
+
+#os("linux")
+fn getdents_scan(fd: i64, out: ref []str, counting: bool): u64 {
+    var buf = teko::sys::ptr_word(teko::mem::buf_ptr(8192))
+    var k: u64 = 0
+    loop {
+        var nread = teko::sys::syscall3(teko::sys::SYS_GETDENTS64, fd, buf, 8192)
+        if nread <= 0 { break }
+        var pos: i64 = 0
+        loop {
+            if pos >= nread { break }
+            var rec = buf + pos
+            var reclen = (teko::mem::load_u64((rec + 16) to u64) & 0xFFFF) to i64
+            if reclen <= 0 { break }
+            var name_addr = rec + 19
+            if !is_dot_name(name_addr) {
+                if !counting { out[k] = name_at(name_addr) }
+                k = k + 1
+            }
+            pos = pos + reclen
+        }
+    }
+    k
+}
+
+#os("linux")
+fn os_list_dir(path: str): []str | error {
+    var fd = os_open_dir(path)
+    if fd < 0 { return error { message = teko::str::concat("teko::fs::list_dir: cannot open directory ", path) } }
+    var empty: []str = []
+    var n = getdents_scan(fd, empty, true)
+    _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, fd)
+    var fd2 = os_open_dir(path)
+    if fd2 < 0 { return error { message = teko::str::concat("teko::fs::list_dir: cannot open directory ", path) } }
+    var out: [n]str = []
+    _ = getdents_scan(fd2, out, false)
+    _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, fd2)
+    sorted_names(out)
+}
+
+#os("linux")
+fn os_mkdir(path: str): error | null {
+    var r = teko::sys::syscall3(teko::sys::SYS_MKDIRAT, teko::sys::AT_FDCWD, cstr_addr(path), teko::sys::OPEN_MODE_755)
+    if r == 0 || r == -17 { return null }
+    error { message = teko::str::concat("teko::fs::mkdir: cannot create directory ", path) }
+}
+
+#os("linux")
+fn os_remove_file(path: str): error | null {
+    var r = teko::sys::syscall3(teko::sys::SYS_UNLINKAT, teko::sys::AT_FDCWD, cstr_addr(path), 0)
+    if r == 0 || r == -2 { return null }
+    error { message = teko::str::concat("teko::fs::remove_file: cannot remove file ", path) }
+}
+
+#os("linux")
+fn os_is_dir(path: str): bool {
+    var buf = teko::sys::ptr_word(teko::mem::buf_ptr(256))
+    var r = teko::sys::syscall5(teko::sys::SYS_STATX, teko::sys::AT_FDCWD, cstr_addr(path), 0, teko::sys::STATX_BASIC_STATS, buf)
+    if r < 0 { return false }
+    (load_u16(buf + 28) & teko::sys::S_IFMT) == teko::sys::S_IFDIR
+}
+
+#os("macos")
+fn readdir_scan(dir: u64, out: ref []str, counting: bool): u64 {
+    var k: u64 = 0
+    loop {
+        var ent = teko::sys::abi::os_readdir_raw(dir)
+        if ent == 0 { break }
+        var name_addr = (ent to i64) + 21
+        if !is_dot_name(name_addr) {
+            if !counting { out[k] = name_at(name_addr) }
+            k = k + 1
+        }
+    }
+    k
+}
+
+#os("macos")
+fn os_list_dir(path: str): []str | error {
+    var d1 = teko::sys::abi::os_opendir_raw(cstr_addr(path) to u64)
+    if d1 == 0 { return error { message = teko::str::concat("teko::fs::list_dir: cannot open directory ", path) } }
+    var empty: []str = []
+    var n = readdir_scan(d1, empty, true)
+    _ = teko::sys::abi::os_closedir_raw(d1)
+    var d2 = teko::sys::abi::os_opendir_raw(cstr_addr(path) to u64)
+    if d2 == 0 { return error { message = teko::str::concat("teko::fs::list_dir: cannot open directory ", path) } }
+    var out: [n]str = []
+    _ = readdir_scan(d2, out, false)
+    _ = teko::sys::abi::os_closedir_raw(d2)
+    sorted_names(out)
+}
+
+#os("macos")
+fn os_mkdir(path: str): error | null {
+    var r = teko::sys::abi::os_mkdir_raw(cstr_addr(path) to u64, 0x1ED to u32)
+    if r == 0 { return null }
+    if os_is_dir(path) { return null }
+    error { message = teko::str::concat("teko::fs::mkdir: cannot create directory ", path) }
+}
+
+#os("macos")
+fn os_remove_file(path: str): error | null {
+    var r = teko::sys::abi::os_unlink_raw(cstr_addr(path) to u64)
+    if r == 0 { return null }
+    error { message = teko::str::concat("teko::fs::remove_file: cannot remove file ", path) }
+}
+
+#os("macos")
+fn os_is_dir(path: str): bool {
+    var buf = teko::sys::ptr_word(teko::mem::buf_ptr(256))
+    var r = teko::sys::abi::os_stat_raw(cstr_addr(path) to u64, buf to u64)
+    if r != 0 { return false }
+    (load_u16(buf + 4) & teko::sys::S_IFMT) == teko::sys::S_IFDIR
+}
+
+#os("windows")
+fn win_find_pattern(path: str): i64 {
+    cstr_addr(teko::str::concat(path, "\\*"))
+}
+
+#os("windows")
+fn win_scan(h: u64, data: i64, out: ref []str, counting: bool): u64 {
+    var k: u64 = 0
+    var more = true
+    loop {
+        if !more { break }
+        var name_addr = data + 44
+        if !is_dot_name(name_addr) {
+            if !counting { out[k] = name_at(name_addr) }
+            k = k + 1
+        }
+        if teko::sys::abi::FindNextFileA(h, data to u64) == 0 { more = false }
+    }
+    k
+}
+
+#os("windows")
+fn os_list_dir(path: str): []str | error {
+    var data = teko::sys::ptr_word(teko::mem::buf_ptr(512))
+    var h1 = teko::sys::abi::FindFirstFileA(win_find_pattern(path) to u64, data to u64)
+    if h1 == 0xFFFFFFFFFFFFFFFF { return error { message = teko::str::concat("teko::fs::list_dir: cannot open directory ", path) } }
+    var empty: []str = []
+    var n = win_scan(h1, data, empty, true)
+    _ = teko::sys::abi::FindClose(h1)
+    var data2 = teko::sys::ptr_word(teko::mem::buf_ptr(512))
+    var h2 = teko::sys::abi::FindFirstFileA(win_find_pattern(path) to u64, data2 to u64)
+    if h2 == 0xFFFFFFFFFFFFFFFF { return error { message = teko::str::concat("teko::fs::list_dir: cannot open directory ", path) } }
+    var out: [n]str = []
+    _ = win_scan(h2, data2, out, false)
+    _ = teko::sys::abi::FindClose(h2)
+    sorted_names(out)
+}
+
+#os("windows")
+fn os_mkdir(path: str): error | null {
+    if teko::sys::abi::CreateDirectoryA(cstr_addr(path) to u64, 0) != 0 { return null }
+    if os_is_dir(path) { return null }
+    error { message = teko::str::concat("teko::fs::mkdir: cannot create directory ", path) }
+}
+
+#os("windows")
+fn os_remove_file(path: str): error | null {
+    if teko::sys::abi::DeleteFileA(cstr_addr(path) to u64) != 0 { return null }
+    if teko::sys::abi::GetFileAttributesA(cstr_addr(path) to u64) == 0xFFFFFFFF { return null }
+    error { message = teko::str::concat("teko::fs::remove_file: cannot remove file ", path) }
+}
+
+#os("windows")
+fn os_is_dir(path: str): bool {
+    var attr = teko::sys::abi::GetFileAttributesA(cstr_addr(path) to u64)
+    if attr == 0xFFFFFFFF { return false }
+    ((attr to u64) & 0x10) != 0
+}

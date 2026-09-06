@@ -1,0 +1,344 @@
+/**
+ * One `key = value` (or `key : value`) pair, already trimmed and (optionally) unquoted.
+ */
+exp type IniEntry = struct {
+    /**
+     * The entry's key, exact source case, trimmed.
+     */
+    key: str
+    /**
+     * The entry's value, trimmed, with a full `"..."` span's outer quotes stripped.
+     */
+    value: str
+}
+
+/**
+ * One `[name]` section: its name plus its entries, in source order. The document's leading
+ * "global" section (keys appearing before any `[header]`) has `name == ""`.
+ */
+exp type IniSection = struct {
+    /**
+     * The section's name, trimmed (`""` for the global/default section).
+     */
+    name: str
+    /**
+     * The section's entries, in source order.
+     */
+    entries: []IniEntry
+}
+
+/**
+ * A complete INI document: its sections, in source order.
+ */
+exp type IniDocument = struct {
+    /**
+     * The document's sections, in source order.
+     */
+    sections: []IniSection
+}
+
+/**
+ * A fresh, empty INI document — the starting point for building one programmatically (grow it
+ * with `ini_set`), and what `parse_ini` starts folding lines into.
+ */
+exp fn ini_empty(): IniDocument {
+    IniDocument { sections = [] }
+}
+
+fn find_section_index(doc: IniDocument, name: str): i64 {
+    var i: u64 = 0
+    loop {
+        if i >= doc.sections.len { break }
+        if doc.sections[i].name == name { return i to i64 }
+        i++
+    }
+    -1
+}
+
+fn find_entry_index(section: IniSection, key: str): i64 {
+    var i: u64 = 0
+    loop {
+        if i >= section.entries.len { break }
+        if section.entries[i].key == key { return i to i64 }
+        i++
+    }
+    -1
+}
+
+fn ensure_section(doc: IniDocument, name: str): IniDocument {
+    if find_section_index(doc, name) >= 0 { return doc }
+    var section = IniSection { name = name; entries = [] }
+    IniDocument { sections = [..doc.sections, section] }
+}
+
+fn set_entry(section: IniSection, key: str, value: str): IniSection {
+    var idx = find_entry_index(section, key)
+    if idx < 0 {
+        return IniSection { name = section.name; entries = [..section.entries, IniEntry { key = key; value = value }] }
+    }
+    var entries: [section.entries.len]IniEntry = []
+    var i: u64 = 0
+    loop {
+        if i >= section.entries.len { break }
+        if (i to i64) == idx { entries[i] = IniEntry { key = key; value = value } } else { entries[i] = section.entries[i] }
+        i++
+    }
+    IniSection { name = section.name; entries = entries }
+}
+
+/**
+ * Returns `doc` with `section`'s `key` set to `value` (creating the section first when absent —
+ * the ONLY way to grow an `IniDocument`, no index-assignment, per house style).
+ */
+exp fn ini_set(doc: IniDocument, section: str, key: str, value: str): IniDocument {
+    var with_section = ensure_section(doc, section)
+    var idx = find_section_index(with_section, section)
+    var sections: [with_section.sections.len]IniSection = []
+    var i: u64 = 0
+    loop {
+        if i >= with_section.sections.len { break }
+        if (i to i64) == idx { sections[i] = set_entry(with_section.sections[i], key, value) } else { sections[i] = with_section.sections[i] }
+        i++
+    }
+    IniDocument { sections = sections }
+}
+
+/**
+ * Looks up section `name` in `doc`.
+ */
+exp fn ini_get_section(doc: IniDocument, name: str): IniSection | null {
+    var idx = find_section_index(doc, name)
+    if idx < 0 { return null }
+    doc.sections[idx to u64]
+}
+
+/**
+ * Looks up `section`'s `key`.
+ */
+exp fn ini_get(doc: IniDocument, section: str, key: str): str | null {
+    var s = match ini_get_section(doc, section) { IniSection as sec => sec; null => return null }
+    var idx = find_entry_index(s, key)
+    if idx < 0 { return null }
+    s.entries[idx to u64].value
+}
+
+fn ini_error(what: str, pos: u64): error {
+    error { message = concat("ini: ", what, " at offset ", i64_to_str(pos to i64)) }
+}
+
+fn is_ini_ws(b: byte): bool {
+    b == b' ' || b == b'\t' || b == b'\r'
+}
+
+fn skip_ws(input: []byte, pos: u64): u64 {
+    var at = pos
+    loop {
+        if at < input.len && (input[at] == b' ' || input[at] == b'\t') { at = at + 1; continue }
+        break
+    }
+    at
+}
+
+fn skip_to_eol(input: []byte, pos: u64): u64 {
+    var at = pos
+    loop {
+        if at >= input.len || input[at] == b'\n' { break }
+        at = at + 1
+    }
+    at
+}
+
+fn consume_newline(input: []byte, pos: u64): u64 {
+    if input[pos] == b'\r' && pos + 1 < input.len && input[pos + 1] == b'\n' { return pos + 2 }
+    pos + 1
+}
+
+fn skip_blank_lines(input: []byte, pos: u64): u64 {
+    var at = pos
+    loop {
+        var p = skip_ws(input, at)
+        if p >= input.len { return p }
+        if input[p] == b'\n' || input[p] == b'\r' { at = consume_newline(input, p); continue }
+        if input[p] == b';' || input[p] == b'#' { at = skip_to_eol(input, p); continue }
+        return p
+    }
+    at
+}
+
+fn bytes_range_str(input: []byte, from: u64, to: u64): str {
+    str(teko::collections::arr_slice(input, from, to))
+}
+
+fn trim_str(s: str): str {
+    var b = s.bytes()
+    var start: u64 = 0
+    loop {
+        if start < b.len && is_ini_ws(b[start]) { start = start + 1; continue }
+        break
+    }
+    var end = b.len
+    loop {
+        if end > start && is_ini_ws(b[end - 1]) { end = end - 1; continue }
+        break
+    }
+    s.slice(start, end)
+}
+
+fn strip_optional_quotes(v: str): str {
+    var b = v.bytes()
+    if b.len >= 2 && b[0] == b'"' && b[b.len - 1] == b'"' { return v.slice(1, b.len - 1) }
+    v
+}
+
+type SectionNameStep = struct {
+    key: str
+    next: u64
+}
+
+type IniLineStep = struct {
+    key: str
+    value: str
+    next: u64
+}
+
+fn parse_section_header(input: []byte, pos: u64): SectionNameStep | error {
+    var at = pos + 1
+    var start = at
+    loop {
+        if at >= input.len || input[at] == b'\n' || input[at] == b'\r' { return ini_error("unterminated section header", pos) }
+        if input[at] == b']' { break }
+        at = at + 1
+    }
+    var name = trim_str(bytes_range_str(input, start, at))
+    var after_bracket = at + 1
+    var line_tail = skip_ws(input, after_bracket)
+    if line_tail < input.len && (input[line_tail] == b';' || input[line_tail] == b'#') { line_tail = skip_to_eol(input, line_tail) }
+    var after = if line_tail < input.len && (input[line_tail] == b'\n' || input[line_tail] == b'\r') { consume_newline(input, line_tail) } else { line_tail }
+    SectionNameStep { key = name; next = after }
+}
+
+fn parse_ini_line(input: []byte, pos: u64): IniLineStep | error {
+    var at = pos
+    var sep_pos = pos
+    var found_sep = false
+    loop {
+        if at >= input.len || input[at] == b'\n' || input[at] == b'\r' { break }
+        if !found_sep && (input[at] == b'=' || input[at] == b':') {
+            found_sep = true
+            sep_pos = at
+        }
+        at = at + 1
+    }
+    if !found_sep { return ini_error("missing '=' or ':' separator", pos) }
+    var key = trim_str(bytes_range_str(input, pos, sep_pos))
+    if key.len == 0 { return ini_error("empty key", pos) }
+    var value = strip_optional_quotes(trim_str(bytes_range_str(input, sep_pos + 1, at)))
+    var after = if at < input.len { consume_newline(input, at) } else { at }
+    IniLineStep { key = key; value = value; next = after }
+}
+
+/**
+ * Parses a complete INI document.
+ */
+exp fn parse_ini(text: str): IniDocument | error {
+    var input = text.bytes()
+    var doc = ini_empty()
+    var current = ""
+    var have_current = false
+    var pos = skip_blank_lines(input, 0)
+    loop {
+        if pos >= input.len { break }
+        if input[pos] == b'[' {
+            var h = match parse_section_header(input, pos) { SectionNameStep as s => s; error as e => return e }
+            current = h.key
+            have_current = true
+            doc = ensure_section(doc, current)
+            pos = skip_blank_lines(input, h.next)
+            continue
+        }
+        var kv = match parse_ini_line(input, pos) { IniLineStep as s => s; error as e => return e }
+        var target = if have_current { current } else { "" }
+        doc = ini_set(doc, target, kv.key, kv.value)
+        pos = skip_blank_lines(input, kv.next)
+    }
+    doc
+}
+
+fn section_to_bytes(section: IniSection): []byte {
+    var header: []byte = []
+    if section.name.len > 0 {
+        header = [b'[', ..section.name.bytes(), b']', b'\n']
+    }
+    var parts: [section.entries.len][]byte = []
+    var total = header.len
+    var i: u64 = 0
+    loop {
+        if i >= section.entries.len { break }
+        var eb: []byte = [
+            ..section.entries[i].key.bytes(),
+            .." = ".bytes(),
+            ..section.entries[i].value.bytes(),
+            b'\n',
+        ]
+        parts[i] = eb
+        total = total + eb.len
+        i++
+    }
+    var out: [total]byte = []
+    var pos: u64 = 0
+    var h: u64 = 0
+    loop {
+        if h >= header.len { break }
+        out[pos] = header[h]
+        pos++
+        h++
+    }
+    i = 0
+    loop {
+        if i >= section.entries.len { break }
+        var eb = parts[i]
+        var j: u64 = 0
+        loop {
+            if j >= eb.len { break }
+            out[pos] = eb[j]
+            pos++
+            j++
+        }
+        i++
+    }
+    out
+}
+
+/**
+ * Renders `doc` as INI text: each section's `[name]` header (the global `""` section renders with
+ * no header line) followed by its `key = value` lines, in source order. Total (M.3): any
+ * `IniDocument` has a valid INI rendering.
+ */
+exp fn write_ini(doc: IniDocument): str {
+    var parts: [doc.sections.len][]byte = []
+    var total: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= doc.sections.len { break }
+        var sb = section_to_bytes(doc.sections[i])
+        parts[i] = sb
+        total = total + sb.len
+        i++
+    }
+    var out: [total]byte = []
+    var pos: u64 = 0
+    i = 0
+    loop {
+        if i >= doc.sections.len { break }
+        var sb = parts[i]
+        var j: u64 = 0
+        loop {
+            if j >= sb.len { break }
+            out[pos] = sb[j]
+            pos++
+            j++
+        }
+        i++
+    }
+    str(out)
+}

@@ -1,0 +1,76 @@
+fn opaque_zero(): u64 {
+    var n: u64 = 1
+    n = n - 1
+    n
+}
+
+fn shift(b: byte, off: u64): byte {
+    ((b to u64) + off) to byte
+}
+
+fn single_byte_weight(off: u64): i64 {
+    var s = teko::one_byte(shift(b'A', off))
+    if s.len != 1 { return 0 }
+    if s[0] != b'A' { return 0 }
+    3
+}
+
+fn escape_accum_weight(off: u64): i64 {
+    var out = ""
+    out = out ~ teko::one_byte(shift(b'"', off))
+    out = out ~ teko::one_byte(shift(b'\\', off))
+    out = out ~ teko::one_byte(shift(0x0C to byte, off))
+    if out.len != 3 { return 0 }
+    if out[0] != b'"' { return 0 }
+    if out[1] != b'\\' { return 0 }
+    if out[2] != (0x0C to byte) { return 0 }
+    12
+}
+
+fn utf8_pair_weight(off: u64): i64 {
+    var two = teko::one_byte(shift(0xC3 to byte, off)) ~ teko::one_byte(shift(0xA9 to byte, off))
+    if two.len != 2 { return 0 }
+    if two[0] != (0xC3 to byte) { return 0 }
+    if two[1] != (0xA9 to byte) { return 0 }
+    16
+}
+
+fn from_slice_weight(off: u64): i64 {
+    var src: [2]byte = []
+    src[0] = shift(b'n', off)
+    src[1] = shift(b'l', off)
+    var out = ""
+    var i: u64 = 0
+    loop {
+        if i >= src.len { break }
+        out = out ~ teko::one_byte(src[i])
+        i++
+    }
+    if out.len != 2 { return 0 }
+    if out[0] != b'n' { return 0 }
+    if out[1] != b'l' { return 0 }
+    32
+}
+
+fn two_live_weight(off: u64): i64 {
+    var a = teko::one_byte(shift(b'a', off))
+    var b = teko::one_byte(shift(b'z', off))
+    if a[0] != b'a' { return 0 }
+    if b[0] != b'z' { return 0 }
+    if a.len != 1 { return 0 }
+    if b.len != 1 { return 0 }
+    64
+}
+
+fn nul_byte_weight(off: u64): i64 {
+    var s = teko::one_byte(shift(0 to byte, off))
+    if s.len != 1 { return 0 }
+    if s[0] != (0 to byte) { return 0 }
+    128
+}
+
+/** Soma de seis pesos disjuntos (3, 12, 16, 32, 64, 128); 255 sse `one_byte` acerta as seis formas. */
+exp fn score(): i64 {
+    var off = opaque_zero()
+    single_byte_weight(off) + escape_accum_weight(off) + utf8_pair_weight(off) + from_slice_weight(off) + two_live_weight(off) + nul_byte_weight(off)
+}

@@ -40,9 +40,15 @@ echo "build_gen1_from_c: CC=$CC CFLAGS_EXTRA='${CFLAGS_EXTRA:-}'"
 "$CC" --version 2>/dev/null | head -n1 || true
 
 # shellcheck disable=SC2086  # CFLAGS_EXTRA is a flag LIST and must word-split.
-"$CC" -std=c2x -w -g ${CFLAGS_EXTRA:-} \
+# -pthread: teko_rt.c's tk_thread_spawn (§10 C0a) calls pthread_create/detach/join on
+# non-Windows (guarded by `#ifndef _WIN32`; Windows uses CreateThread, no flag). Kept out of the
+# Windows lane, which links its own thread API. Retired when teko_rt.c goes to FFI (§16).
+GEN1_PTHREAD="-pthread"
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*|Windows_NT) GEN1_PTHREAD="" ;; esac
+# shellcheck disable=SC2086  # GEN1_PTHREAD/CFLAGS_EXTRA are flag LISTs and must word-split.
+"$CC" -std=c2x -w -g $GEN1_PTHREAD ${CFLAGS_EXTRA:-} \
     -I"$SRC/runtime" -I"$SRC/assert" \
-    "$TEKO_C" "$SRC/runtime/teko_rt.c" "$SRC/assert/assert.c" -lm \
+    "$TEKO_C" "$SRC/runtime/teko_rt.c" "$SRC/assert/assert.c" \
     -o "$OUT/teko"
 
 [ -x "$OUT/teko" ] || { echo "build_gen1_from_c: the link reported success but $OUT/teko is not executable" >&2; exit 1; }

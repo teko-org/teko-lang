@@ -1,0 +1,173 @@
+use teko::parser
+
+fn unused_fn_warning(f: TFunction): str {
+    diag_at(f.file, f.line, f.col, $"warning: unused private function `{f.name}`")
+}
+
+pub fn collect_unused_fn_warnings(prog: TProgram): []str {
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TFunction as f => {
+                if f.vis == parser::Visibility::Private && f.name != "main" && !f.is_test {
+                    if !used_in_program(prog, f.name) { out = [..out, unused_fn_warning(f)] }
+                }
+            }
+            _ => { }
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn innermost_cast_type(e: TExpr): @Type() {
+    match e.kind {
+        TCast as tc => match tc.expr.kind { TCast => innermost_cast_type(tc.expr); _ => e.type }
+        _ => e.type
+    }
+}
+
+fn redundant_cast_warning(file: str, line: u32, col: u32, ty: @Type()): str {
+    diag_at(file, line, col, $"warning: redundant cast: this `to {type_render(ty)}` is a provable no-op (cast-width-hygiene-0.3.1.md D1) — delete it")
+}
+
+fn note_class1_cast(file: str, e: TExpr, out: []str): []str {
+    match e.kind {
+        TCast as tc => if type_eq(tc.expr.type, e.type) { [..out, redundant_cast_warning(file, e.line, e.col, e.type)] } else { out }
+        _ => out
+    }
+}
+
+fn note_class3_binary(file: str, b: TBinary, out: []str): []str {
+    if !op_is_arith(b.op) && !op_is_arith_bitwise(b.op) { return out }
+    match redundant_widen_cast_of(b.left, b.right) {
+        TExpr as bad => [..out, redundant_cast_warning(file, bad.line, bad.col, innermost_cast_type(bad))]
+        null => out
+    }
+}
+
+fn note_class3_compare(file: str, c: TCompare, out: []str): []str {
+    var acc = out
+    var prev = c.first
+    var i: u64 = 0
+    loop {
+        if i >= c.rest.len { break }
+        var cur = c.rest[i].operand
+        acc = match redundant_widen_cast_of(prev, cur) {
+            TExpr as bad => [..acc, redundant_cast_warning(file, bad.line, bad.col, innermost_cast_type(bad))]
+            null => acc
+        }
+        prev = cur
+        i = i + 1
+    }
+    acc
+}
+
+fn note_redundant_casts_expr(file: str, e: TExpr, out: []str): []str {
+    var acc = note_class1_cast(file, e, out)
+    match e.kind {
+        TBinary as b => {
+            acc = note_class3_binary(file, b, acc)
+            acc = note_redundant_casts_expr(file, b.left, acc)
+            acc = note_redundant_casts_expr(file, b.right, acc)
+        }
+        TUnary as u => acc = note_redundant_casts_expr(file, u.operand, acc)
+        TCompare as cm => {
+            acc = note_class3_compare(file, cm, acc)
+            acc = note_redundant_casts_expr(file, cm.first, acc)
+            var i: u64 = 0
+            loop { if i >= cm.rest.len { break }; acc = note_redundant_casts_expr(file, cm.rest[i].operand, acc); i = i + 1 }
+        }
+        TCall as c => { var i: u64 = 0; loop { if i >= c.args.len { break }; acc = note_redundant_casts_expr(file, c.args[i], acc); i = i + 1 } }
+        TCast as ct => acc = note_redundant_casts_expr(file, ct.expr, acc)
+        TIfExpr as f => {
+            acc = note_redundant_casts_expr(file, f.cond, acc)
+            acc = note_redundant_casts_block(file, f.then_blk, acc)
+            if f.has_else { acc = note_redundant_casts_block(file, f.else_blk, acc) }
+        }
+        TMatchExpr as m => {
+            acc = note_redundant_casts_expr(file, m.subject, acc)
+            var i: u64 = 0
+            loop {
+                if i >= m.arms.len { break }
+                if m.arms[i].has_when { acc = note_redundant_casts_expr(file, m.arms[i].guard, acc) }
+                acc = note_redundant_casts_block(file, m.arms[i].body, acc)
+                i = i + 1
+            }
+        }
+        TFieldAccess as fa => acc = note_redundant_casts_expr(file, fa.receiver, acc)
+        TIndex as ix => { acc = note_redundant_casts_expr(file, ix.receiver, acc); acc = note_redundant_casts_expr(file, ix.index, acc) }
+        TStructInit as si => { var i: u64 = 0; loop { if i >= si.field_vals.len { break }; acc = note_redundant_casts_expr(file, si.field_vals[i], acc); i = i + 1 } }
+        TInterp as ip => {
+            var i: u64 = 0
+            loop {
+                if i >= ip.holes.len { break }
+                acc = note_redundant_casts_expr(file, ip.holes[i], acc)
+                if i < ip.specs.len {
+                    match ip.specs[i].kind {
+                        TFSpecDynamic as fd => { var k: u64 = 0; loop { if k >= fd.args.len { break }; acc = note_redundant_casts_expr(file, fd.args[k], acc); k = k + 1 } }
+                        _ => { }
+                    }
+                }
+                i = i + 1
+            }
+        }
+        TInExpr as ie => {
+            acc = note_redundant_casts_expr(file, ie.lhs, acc)
+            var i: u64 = 0
+            loop { if i >= ie.elems.len { break }; acc = note_redundant_casts_expr(file, ie.elems[i], acc); i = i + 1 }
+        }
+        TArrayLit as al => { var i: u64 = 0; loop { if i >= al.elements.len { break }; acc = note_redundant_casts_expr(file, al.elements[i].expr, acc); i = i + 1 } }
+        TBorrow as bo => acc = note_redundant_casts_expr(file, bo.operand, acc)
+        TLambda as lam => acc = note_redundant_casts_block(file, lam.body, acc)
+        TBlockExpr as b => acc = note_redundant_casts_block(file, b.body, acc)
+        _ => { }
+    }
+    acc
+}
+
+fn note_redundant_casts_block(file: str, stmts: []@TStatement(), out: []str): []str {
+    var acc = out
+    var i: u64 = 0
+    loop { if i >= stmts.len { break }; acc = note_redundant_casts_stmt(file, stmts[i], acc); i = i + 1 }
+    acc
+}
+
+fn note_redundant_casts_stmt(file: str, s: @TStatement(), out: []str): []str {
+    match s {
+        TBinding as b => note_redundant_casts_expr(file, b.value, out)
+        TAssign as a => {
+            var acc1 = note_redundant_casts_expr(file, a.value, out)
+            if parser::assign_has_target(a.kind) { note_redundant_casts_expr(file, a.target, acc1) } else { acc1 }
+        }
+        TReturn as r => if r.has_value { note_redundant_casts_expr(file, r.value, out) } else { out }
+        TLoopStmt as l => note_redundant_casts_block(file, l.body, note_redundant_casts_block(file, l.init, out))
+        TExprStmt as x => note_redundant_casts_expr(file, x.expr, out)
+        TDeferStmt as d => note_redundant_casts_block(file, d.body, out)
+        TAdoptStmt as ad => note_redundant_casts_block(file, ad.body, out)
+        TBlockStmt as b => note_redundant_casts_block(file, b.body, out)
+        _ => out
+    }
+}
+
+pub fn collect_redundant_cast_warnings(prog: TProgram): []str {
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i] {
+            TFunction as f => out = note_redundant_casts_block(f.file, f.body, out)
+            TConstDecl as cd => out = note_redundant_casts_expr("", cd.init, out)
+            (@TStatement()) as s => out = note_redundant_casts_stmt("", s, out)
+            _ => { }
+        }
+        i = i + 1
+    }
+    out
+}
+
+pub fn collect_warnings(prog: TProgram): []str {
+    concat_diags(collect_unused_fn_warnings(prog), collect_redundant_cast_warnings(prog))
+}

@@ -15,12 +15,22 @@
 #      `needs:`. A job outside every `needs:` runs, can fail, and blocks nothing.
 #   2. NO PHANTOMS — no aggregator `needs:` a job the workflow does not define. (GitHub rejects
 #      this at parse time, but catching it here names the aggregator instead of the file.)
-#   3. ROOTED — every aggregator `needs:` the ARTIFACT ROOT. This is the owner's ruling of
-#      2026-07-26 ("todas as lanes de pull_request precisam depender dessa lane de artefatos")
-#      made structural: an aggregator that does not transitively stand on the root can report
-#      success while the root that every lane consumes was never green. It is also what stops an
-#      aggregator from being vacuous in LIGHT mode — the root runs in both tiers, so every gate
-#      always has at least one job it is genuinely asserting.
+#   3. ANCHORED (was ROOTED, redefined 2026-07-29) — every aggregator `needs:` AT LEAST ONE of the
+#      BOTH-TIER ANCHOR jobs. Before this wagon there was one `artifact` job (a matrix over every
+#      producer leg) that every aggregator needed, so "rooted" meant "needs that one name". Owner
+#      correction, 2026-07-29: a matrix's aggregate `result` is `success` only when EVERY leg
+#      succeeds, so `needs: artifact` could never tell "the leg I wanted failed" apart from "some
+#      OTHER leg failed" — one red leg silently skipped every consumer of five green ones. The fix
+#      was to remove the matrix: each producer leg is now its OWN job (`artifact-<label>`), and
+#      each consumer needs only the leg(s) IT actually consumes, so a red leg blocks only its own
+#      chain. With the shared job gone, "the root" is no longer one name — it is the SET of
+#      producer legs that run on BOTH tiers (today: `artifact-linux-x86_64-glibc`,
+#      `artifact-windows-x86_64`), and the property this assertion still protects is the one
+#      ROOTED protected: an aggregator whose own legs are ALL full-tier-only would report SUCCESS
+#      on the light tier having asserted nothing, unless it also directly needs one of these two.
+#      "Needs the artifact root" became "needs at least one anchor" — ANY, not ALL, because no
+#      single aggregator needs every producer leg any more (only test-suite-gate happens to need
+#      all six, and that is a fact about what it aggregates, not a rule this check enforces).
 #   4. NAMES — every required-check name exists VERBATIM. They are the only required checks on
 #      `main`, and `main` has no bypass: a name that stops reporting does not go red, it goes
 #      PENDING FOREVER and jams the drain. A typo in a `name:` is therefore a merge-blocking
@@ -29,13 +39,15 @@
 # FAIL-CLOSED BY CONSTRUCTION: if the job-key extraction ever broke it would not find the
 # aggregators either, and assertion 0 stops the run rather than passing an empty comparison.
 #
-# Usage:  ci_gate_coverage.sh <workflow.yml> <root-job> <gate-job>…
+# Usage:  ci_gate_coverage.sh <workflow.yml> "<anchor-job>…" <gate-job>…
+#   <anchor-job>…  ONE argument: the both-tier anchor job names, space-separated (quote it as a
+#                  single shell word). An aggregator's `needs:` must contain AT LEAST ONE of them.
 #
 # POSIX sh + awk only — no PyYAML, which is not guaranteed on every runner image.
 set -eu
 
-WF="${1:?usage: ci_gate_coverage.sh <workflow.yml> <root-job> <gate-job>...}"
-ROOT="${2:?missing root-job}"
+WF="${1:?usage: ci_gate_coverage.sh <workflow.yml> \"<anchor-job>...\" <gate-job>...}"
+ANCHORS="${2:?missing anchor-job(s)}"
 shift 2
 GATES="$*"
 [ -n "$GATES" ] || { echo "ci_gate_coverage: no gate jobs named" >&2; exit 1; }
@@ -106,10 +118,12 @@ for g in $GATES; do
         FAILED=1
     fi
 done
-if ! grep -qx "$ROOT" "$TMP/jobs"; then
-    echo "ERROR: the artifact root '$ROOT' is not a job in $WF." >&2
-    FAILED=1
-fi
+for a in $ANCHORS; do
+    if ! grep -qx "$a" "$TMP/jobs"; then
+        echo "ERROR: the anchor job '$a' is not a job in $WF." >&2
+        FAILED=1
+    fi
+done
 [ "$FAILED" = "0" ] || { echo "ci_gate_coverage FAILED (extraction)"; exit 1; }
 
 # ── per-gate needs ────────────────────────────────────────────────────────────────────────────
@@ -130,12 +144,17 @@ for g in $GATES; do
         }
     done < "$TMP/needs.$g"
 
-    # 3. ROOTED
-    if ! grep -qx "$ROOT" "$TMP/needs.$g"; then
-        echo "ERROR: $g does not need the artifact root '$ROOT'." >&2
-        echo "  Every aggregator must stand on the root: it is the lane every other lane consumes," >&2
-        echo "  and it is the one job that runs in BOTH tiers — without it an aggregator whose own" >&2
-        echo "  legs are all full-only reports SUCCESS in light mode having asserted nothing." >&2
+    # 3. ANCHORED — needs AT LEAST ONE anchor, not necessarily all of them (see the header: no
+    # single aggregator needs every producer leg any more, only test-suite-gate happens to).
+    anchored=0
+    for a in $ANCHORS; do
+        grep -qx "$a" "$TMP/needs.$g" && anchored=1
+    done
+    if [ "$anchored" != "1" ]; then
+        echo "ERROR: $g needs none of the anchor jobs ($ANCHORS)." >&2
+        echo "  Every aggregator must stand on at least one BOTH-TIER producer leg — without one," >&2
+        echo "  an aggregator whose own legs are all full-only reports SUCCESS in light mode having" >&2
+        echo "  asserted nothing." >&2
         FAILED=1
     fi
 done
@@ -169,4 +188,4 @@ if [ "$FAILED" = "1" ]; then
     echo "ci_gate_coverage FAILED."
     exit 1
 fi
-echo "ci_gate_coverage OK — every job is covered, every aggregator is rooted at '$ROOT', every required name present."
+echo "ci_gate_coverage OK — every job is covered, every aggregator is anchored on one of '$ANCHORS', every required name present."

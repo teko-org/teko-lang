@@ -1,24 +1,33 @@
 name: CodeQL
 
-# CI runs on PULL REQUESTS ONLY (cost: a green PR already proved main; the post-merge push
-# would just re-run it). Branch protection gates merges on these checks; the release trusts
-# main and does not re-validate. chore/reboot stays listed for PRs into it (#54).
-# NOTE: dropping push means the default-branch security dashboard no longer refreshes per
-# merge — add a `schedule:` trigger here if periodic default-branch scanning is wanted.
+# Runs on PULL REQUESTS only: a green PR already proved the head, and the
+# post-merge push would just re-run it.
+#
+# WHAT IS LEFT TO SCAN. `src/` is frozen (D211/D212) and the work lives in
+# `ngen/`, which is `.tk` and `.mc` -- languages CodeQL has no analyzer for. The
+# `c-cpp` leg that used to compile `src/runtime/teko_rt.c` and
+# `src/assert/assert.c` scanned exactly that frozen tree, so it was re-proving
+# bytes nobody may change; it is gone with the rest of the old compiler's CI.
+# What remains is `actions`, and it is not decoration: this repository's CI is
+# now four workflows and two composite actions that download a toolchain, run a
+# `gh release create` with `contents: write`, and interpolate branch names --
+# the class of thing the `actions` analyzer exists for.
+#
+# NOTE on the `paths:` filter: a GitHub required check that stops REPORTING goes
+# pending forever, not red. Should the `code_scanning` ruleset rule ever be
+# switched on for `main`, this filter has to go -- a docs-only pull request
+# would otherwise sit blocked "waiting for CodeQL". Today the `main` ruleset
+# requires only `mc build ngen && run` (ngen/HANDOFF.md §3.4).
 on:
   pull_request:
-    branches: ['**']   # '**' cruza '/' — casa base com barra (remodel/...); '*' simples nao
-    paths: ['**.tkp', '**.tks', '**.tkt', '**.tkr', '**.sh', '**.c', '**.h', '.github/workflows/*.yml']
+    branches: ['**']   # '**' cruza '/' — casa base com barra; '*' simples nao
+    paths: ['ngen/**', '.github/**']
 
 # Restrict default token scope for all jobs in this workflow.
 permissions:
   contents: read
 
 jobs:
-  # CodeQL is NOT path-gated. It feeds the `code_scanning` ruleset rule, which requires
-  # a completed analysis for the PR head — gating it (skipping on docs/config-only PRs)
-  # leaves the PR BLOCKED "waiting for CodeQL". So CodeQL runs on every PR; the expensive
-  # multi-platform build/test lanes (native/sanitizers/sast) stay path-gated instead.
   analyze:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
@@ -33,37 +42,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - language: c-cpp
-            build-mode: manual
           - language: actions
             build-mode: none
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install clang (c-cpp only)
-        if: matrix.language == 'c-cpp'
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y clang
+        uses: actions/checkout@v5
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-
-      # Teko-only: the compiler is the released binary and its C twins are FROZEN. CodeQL
-      # scans the LIVE maintained C — the runtime seam + assert seed linked into every
-      # generated program. A minimal cc (no cmake / compiler C build) is what it traces.
-      - name: Build (c-cpp — live runtime only)
-        if: matrix.language == 'c-cpp'
-        run: |
-          # One -c per file: clang rejects -o with multiple -c inputs, and CodeQL must
-          # trace a SUCCESSFUL compile to extract source (else "configuration error").
-          clang -c -std=c23 -Isrc/runtime -Isrc/assert src/runtime/teko_rt.c -o teko_rt.o
-          clang -c -std=c23 -Isrc/runtime -Isrc/assert src/assert/assert.c   -o assert.o
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4

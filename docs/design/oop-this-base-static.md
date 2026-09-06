@@ -4,7 +4,7 @@ Architect design (2026-07-06). Owner-requested (2026-07-06) on developer feedbac
 current method syntax (loose untyped first-arg receiver + `class Base(binding)`) is hard to read.
 
 **Verdict up front:** this is a **front-end-only rename** that lowers to the EXACT SAME
-TAST/codegen/VM the current model already produces. The single design fork needing the owner's
+TAST/codegen the current model produces. The single design fork needing the owner's
 ruling is **hard-cut vs dual-syntax transition** (see §6, HALT). Everything else resolves law-first.
 
 ---
@@ -28,11 +28,10 @@ ruling is **hard-cut vs dual-syntax transition** (see §6, HALT). Everything els
   `args[0]` with an EMPTY arg-name (`src/checker/typer.tks:812-819`, `cnames` pushes `""`). So the
   "receiver is never named at the call site" rule (memory `teko-default-args-named-call`) is
   structural, independent of what we call the receiver inside the body.
-- **Codegen/VM never match the receiver by name.** Codegen emits `params[0]` positionally through
+- **Codegen never matches the receiver by name.** Codegen emits `params[0]` positionally through
   `cb_ident` (`src/codegen/codegen.tks:5950`), rewriting the placeholder `type_ann` to
-  `Named{struct_name}` in the typer (`typer.tks:3057-3075`) BEFORE codegen sees it. The VM binds
-  `params[0]` positionally (`src/vm/vm.tks:1229+`). **The receiver's spelling is invisible to both
-  back-ends** → renaming it is guaranteed fixpoint-neutral.
+  `Named{struct_name}` in the typer (`typer.tks:3057-3075`) BEFORE codegen sees it.
+  **The receiver's spelling is invisible to the backend** → renaming it is guaranteed fixpoint-neutral.
 - **Lexer:** `this` / `base` / `static` / `self` are NOT keywords today
   (`src/lexer/lexer.tks:266-274`; the file explicitly notes `self`/`base` are deliberately plain
   identifiers). `class`/`abstract`/`virtual`/`override`/`intern`/`interface` ARE keywords.
@@ -56,10 +55,10 @@ CURRENT:
 ```
 type Animal = virtual class {
     name: str
-    pub fn greet(self) -> str { self.name }
+    pub fn greet(self): str { self.name }
 }
 type Dog = class Animal(parent) {
-    pub override fn greet(self) -> str { parent.greet() ~ "!" }
+    pub override fn greet(self): str { parent.greet() ~ "!" }
 }
 ```
 
@@ -67,10 +66,10 @@ PROPOSED:
 ```
 type Animal = virtual class {
     name: str
-    pub fn greet() -> str { this.name }
+    pub fn greet(): str { this.name }
 }
 type Dog = class Animal {
-    pub override fn greet() -> str { base.greet() ~ "!" }
+    pub override fn greet(): str { base.greet() ~ "!" }
 }
 ```
 
@@ -83,8 +82,8 @@ CURRENT (static = a TYPED or zero first param; `make` below is static because it
 ```
 type Point = class {
     x: i64; y: i64
-    pub fn make(x: i64, y: i64) -> Point { Point { x = x; y = y } }   // static (no untyped 1st param)
-    pub fn dist(self) -> i64 { self.x + self.y }                       // instance (untyped `self`)
+    pub fn make(x: i64, y: i64): Point { Point { x = x; y = y } }   // static (no untyped 1st param)
+    pub fn dist(self): i64 { self.x + self.y }                       // instance (untyped `self`)
 }
 ```
 
@@ -92,15 +91,15 @@ PROPOSED (static = the `static` keyword; instance = its absence):
 ```
 type Point = class {
     x: i64; y: i64
-    pub static fn make(x: i64, y: i64) -> Point { Point { x = x; y = y } }
-    pub fn dist() -> i64 { this.x + this.y }
+    pub static fn make(x: i64, y: i64): Point { Point { x = x; y = y } }
+    pub fn dist(): i64 { this.x + this.y }
 }
 ```
 
 ### Interface signature
 
-CURRENT: `pub type Reader = interface { fn read(self, into: Buf) -> u64 | error }`
-PROPOSED: `pub type Reader = interface { fn read(into: Buf) -> u64 | error }`
+CURRENT: `pub type Reader = interface { fn read(self, into: Buf): u64 | error }`
+PROPOSED: `pub type Reader = interface { fn read(into: Buf): u64 | error }`
 
 An interface method is instance-by-default (a contract on `this`); a static signature would be
 `static fn …` (interfaces do not carry statics today — remains rejected, unchanged).
@@ -170,12 +169,7 @@ An interface method is instance-by-default (a contract on `this`); a static sign
   a C++ back-end and costs nothing (it only changes the emitted param name, uniformly at def+use via
   `cb_ident`, so still fixpoint-neutral).
 
-### 2.5 VM — `src/vm/vm.tks`
-- **Zero change.** The VM binds `params[0]` positionally and the base binding is a normal
-  `let` statement in the TAST it interprets. `vm.tks:2842` even documents the base-binding cast as a
-  same-storage upcast — untouched.
-
-**Net:** parser + lexer + a handful of checker diagnostics change. **Codegen and VM produce the
+**Net:** parser + lexer + a handful of checker diagnostics change. **Codegen produces the
 same bytes.** This is the property that lets the fixpoint survive a corpus-wide rewrite.
 
 ---
@@ -207,7 +201,7 @@ are untouched.
   `this`/`base` are Ref-BY-LOWERING (the same pointer-passing the current receiver uses —
   `teko-oop-w10b-design` "no `Ref<T>` receiver"). They introduce **no `ref` keyword and no `Ref<T>`
   in a receiver position** — fully consistent. Receiver-by-Ref via `this` is exactly the settled
-  no-GC / arena / regions memory model (`teko-no-gc-vm-role`): `this` is an arena-backed
+  no-GC / arena / regions memory model: `this` is an arena-backed
   pointer-lowered receiver, not a new reference type.
 - **Closures capturing `this`** (`teko-closures-design`): a lambda inside a method already captures
   the local `self`; renaming it `this` changes nothing (capture is by the local's name, resolved in
@@ -271,27 +265,27 @@ Each crumb is independently gate-able (`./build/teko . -o bin` + `.tkt` gate, th
 - Delete the old loose-receiver + `(binding)` parse paths and the structural static fallback.
 - Ritual: full gate + fixpoint.
 
-### Regression fixtures (inputs → expected, VM and native identical)
+### Regression fixtures (inputs → expected, rota C e backend nativo identical)
 - `parser_test.tkt`:
-  - `type C = class { pub fn f() -> i64 { 0 } }` → parses; `methods[0].params[0].name=="this"`,
+  - `type C = class { pub fn f(): i64 { 0 } }` → parses; `methods[0].params[0].name=="this"`,
     `has_type==false`, `is_static==false`.
-  - `type C = class { pub static fn make() -> C { … } }` → `is_static==true`, 0 params.
-  - `type D = class B { override fn g() -> i64 { base.h() } }` → `has_base`, base local == `base`.
+  - `type C = class { pub static fn make(): C { … } }` → `is_static==true`, 0 params.
+  - `type D = class B { override fn g(): i64 { base.h() } }` → `has_base`, base local == `base`.
   - `static fn topLevel() {}` at module scope → **error** (statics are type-members only).
   - `type C = class { fn f(this: i64) {} }` → **error** (`this` reserved in a method).
 - `checker_test.tkt`:
   - instance method body uses `this.field` → type-checks; a sealed class + `base` → error.
-  - interface `type R = interface { fn read(into: Buf) -> u64 | error }` conformance still holds.
+  - interface `type R = interface { fn read(into: Buf): u64 | error }` conformance still holds.
   - a static factory called `C::make()` and an instance `x.f()` both resolve (parity unchanged).
 - `vm_test.tkt` + `codegen_test.tkt`: port the existing VmCounter/VmShape/VmDogD3 fixtures to the
-  new syntax; assert IDENTICAL exit codes/outputs VM and native (the whole point: behavior frozen).
+  new syntax; assert IDENTICAL exit codes/outputs on rota C e backend nativo (the whole point: behavior frozen).
 
 ### Ritual points (full gate MUST pass)
 - End of C1, C2, C3, C4 (and C5 if used). C4's ritual additionally REQUIRES the byte-identity
   fixpoint (gen1==gen2, temp-normalized diff=0) — this is where a codegen regression would surface.
 
 ### Size estimate — **L** (front-end-only, tiny production corpus).
-Not XL: production `src/` has 0 classes / 4 interfaces / 0 traits, and codegen/VM are untouched. The
+Not XL: production `src/` has 0 classes / 4 interfaces / 0 traits, and codegen is untouched. The
 weight is (a) the mechanical `.tkt` rewrite (~89 receiver sites, concentrated in 5 test files +
 `synth.tks`), and (b) getting the fixpoint green after a corpus-wide rename. The parser/checker
 delta is small and additive.
@@ -300,7 +294,7 @@ delta is small and additive.
 
 ## 6. HALT — one owner decision (migration shape)
 
-The design is settled; the codegen/VM are provably untouched. The ONE fork that is process-policy,
+The design is settled; the codegen is provably untouched. The ONE fork that is process-policy,
 not law, and that changes the PR shape and the risk profile, is:
 
 **FORK: hard-cut vs dual-syntax transition.**

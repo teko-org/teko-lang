@@ -1,0 +1,177 @@
+// order_types.tk -- free order of declaration for a type name (§50 O1/O2,
+// docs/design/plano-ngen-entrega4.md): every construct below is used BEFORE
+// it is declared, resolving through the forward scan (teko_fwd.tk) instead
+// of the "declared above" limit the handoff's C6 debt named.
+//
+// O1 (identity-only sites): `Holder` uses `Circle`, a class inside
+// `namespace Geo`, by its short name (through `using Geo;`, itself written
+// before the namespace even exists in the file) as a field, a method
+// parameter and a method return type. `ShapeUser` does the same for `Shape`,
+// a PLAIN (non-namespaced) class. `BoxUser` holds a LOCAL of a type declared
+// further down (`Box`, a class). `TraitUser` writes `use T;` above `trait T`.
+//
+// O2 (sites that need the CORPO, deferred to a pass): `box_value` calls a
+// method on a PARAMETER of type `Box`, declared further down still. `main`
+// constructs `new Box(41)` -- a constructor WITH an argument -- before
+// `class Box` is read, reads a `static` field and a `const` through
+// `Box.made`/`Box.STEP`, and calls a method on the result. `OpAddUser`
+// coerces a bare function name (`op_add`) into a local of delegate type `Op`,
+// declared below it. `qual_check` constructs `new Geo.Item()` -- a type
+// reached through a QUALIFIED, dotted name -- before `namespace Geo` (and
+// the `Item` class inside it) are read; `Geo` itself is only ever opened for
+// real later in this same file, which is the point being proven.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+using Geo;
+
+class Holder {
+    public Circle mine;
+
+    public Circle same(Circle c) {
+        return c;
+    }
+}
+
+class ShapeUser {
+    public Shape s;
+
+    public Shape pick(Shape a, Shape b) {
+        return a;
+    }
+}
+
+class BoxUser {
+    public i64 check() {
+        Box b = null;
+        if (b == null) return 1;
+        return 0;
+    }
+}
+
+class OpUser {
+    public i64 check() {
+        Op f = null;
+        if (f == null) return 1;
+        return 0;
+    }
+}
+
+class OpAddUser {
+    public i64 check() {
+        Op f = op_add;
+        return f(3, 4);
+    }
+}
+
+class TraitUser {
+    use T;
+}
+
+i64 box_value(Box b) {
+    return b.get();
+}
+
+i64 qual_check() {
+    Geo.Item gi = new Geo.Item();
+    gi.tag = 11;
+    return gi.tag;
+}
+
+i64 op_add(i64 a, i64 b) {
+    return a + b;
+}
+
+// the O2 constructs together, in their own scope: `rt_live()` proves the
+// floor before and after -- `b`/`oau` are the only two counted locals still
+// alive right before this returns, `qual_check`'s own `Geo.Item` already
+// released when it returned its `tag`.
+i64 o2_checks() {
+    i64 floor = rt_live();
+    Box b = new Box(41);
+    b.bump();
+    if (box_value(b) != 42) return 6;
+    if (Box.STEP != 1) return 7;
+    if (b.get() + Box.made != 43) return 8;
+
+    OpAddUser oau = new OpAddUser();
+    if (oau.check() != 7) return 9;
+
+    if (qual_check() != 11) return 10;
+    if (rt_live() != floor + 2) return 11;
+    return 0;
+}
+
+namespace Geo {
+    class Circle {
+        public i64 r;
+    }
+
+    class Item {
+        public i64 tag;
+    }
+}
+
+class Shape {
+    public i64 sides;
+}
+
+class Box {
+    public i64 v;
+    public static i64 made;
+    public const i64 STEP = 1;
+
+    public Box(i64 x) {
+        v = x;
+        made = made + 1;
+    }
+
+    public i64 bump() {
+        v = v + STEP;
+        return v;
+    }
+
+    public i64 get() {
+        return v;
+    }
+}
+
+delegate i64 Op(i64 a, i64 b);
+
+trait T {
+    public i64 tval() {
+        return 9;
+    }
+}
+
+i64 main() {
+    Holder h = new Holder();
+    Geo.Circle gc = new Geo.Circle();
+    gc.r = 7;
+    h.mine = gc;
+    if (h.same(gc).r != 7) return 1;
+
+    ShapeUser su = new ShapeUser();
+    Shape sh1 = new Shape();
+    sh1.sides = 3;
+    Shape sh2 = new Shape();
+    sh2.sides = 4;
+    su.s = sh1;
+    if (su.pick(sh1, sh2).sides != 3) return 2;
+
+    BoxUser bu = new BoxUser();
+    if (bu.check() != 1) return 3;
+
+    OpUser ou = new OpUser();
+    if (ou.check() != 1) return 4;
+
+    TraitUser tu = new TraitUser();
+    if (tu.tval() != 9) return 5;
+
+    i64 bad = o2_checks();
+    if (bad != 0) return bad;
+
+    return 42;
+}

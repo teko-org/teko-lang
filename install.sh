@@ -316,6 +316,12 @@ install_share_runtime() {
     cp -R "$bundle_dir/runtime" "$share_dir/runtime" || { log "warning: cannot write $share_dir/runtime"; return 1; }
     cp -R "$bundle_dir/assert" "$share_dir/assert" || { log "warning: cannot write $share_dir/assert"; return 1; }
     cp "$bundle_dir/win32_compat.h" "$share_dir/win32_compat.h" || { log "warning: cannot write $share_dir/win32_compat.h"; return 1; }
+    # §16 crumb I0: the runtime-prelude injection SOURCE (teko::sys sits in a sibling sys/ dir,
+    # teko::runtime's arena.tks rides inside runtime/ above). Present only in bundles from a
+    # release whose compiler injects; tolerated absent for an older bundle.
+    if [ -d "$bundle_dir/sys" ]; then
+        cp -R "$bundle_dir/sys" "$share_dir/sys" || { log "warning: cannot write $share_dir/sys"; return 1; }
+    fi
     log "installed native-build runtime to $share_dir"
     return 0
 }

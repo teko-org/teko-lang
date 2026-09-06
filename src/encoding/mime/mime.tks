@@ -1,0 +1,394 @@
+/**
+ * Delegates to `teko::encoding::url::parse_form` — parses an `application/x-www-form-urlencoded`
+ * body (or a URL query string, `?`-prefix already stripped) into its decoded `key=value` fields.
+ */
+exp fn parse_form_urlencoded(body: str): []teko::encoding::url::FormField | error {
+    teko::encoding::url::parse_form(body)
+}
+
+/**
+ * Delegates to `teko::encoding::url::encode_form` — renders decoded fields back into one
+ * `application/x-www-form-urlencoded` body string.
+ */
+exp fn encode_form_urlencoded(fields: []teko::encoding::url::FormField): str {
+    teko::encoding::url::encode_form(fields)
+}
+
+/**
+ * A fixed, deterministic `multipart/form-data` boundary string — a convenience default for
+ * tests and low-stakes uses. It carries no unpredictability guarantee: a caller whose part
+ * payloads might contain this exact literal, or who needs collision-resistance against
+ * untrusted input, must supply its own.
+ */
+exp fn default_boundary(): str {
+    "----TekoFormBoundary7c2f9ab4d1"
+}
+
+/**
+ * One decoded `multipart/form-data` part: the `Content-Disposition: form-data` field name, an
+ * optional filename (a file-upload part), an optional declared content type, and the part's raw
+ * byte payload.
+ */
+exp type MultipartPart = struct {
+    /**
+     * The `Content-Disposition: form-data; name="..."` field name.
+     */
+    name: str
+    /**
+     * The `; filename="..."` parameter, or `""` when the part has none (a plain form field
+     * rather than a file upload).
+     */
+    filename: str
+    /**
+     * The part's `Content-Type:` header value, or `""` when the part declares none.
+     */
+    content_type: str
+    /**
+     * The part's raw payload bytes (the region between the header block's blank line and the
+     * next boundary delimiter).
+     */
+    data: []byte
+}
+
+fn append_bytes(out: []byte, extra: []byte): []byte {
+    var o = out
+    var i: u64 = 0
+    loop {
+        if i >= extra.len { break }
+        o = [..o, extra[i]]
+        i++
+    }
+    o
+}
+
+fn append_str(out: []byte, text: str): []byte {
+    append_bytes(out, text.bytes())
+}
+
+fn append_crlf(out: []byte): []byte {
+    var o = [..out, b'\r']
+    [..o, b'\n']
+}
+
+fn append_quoted(out: []byte, text: str): []byte {
+    var input = text.bytes()
+    var o = [..out, b'"']
+    var i: u64 = 0
+    loop {
+        if i >= input.len { break }
+        var b = input[i]
+        if b == b'"' || b == b'\\' { o = [..o, b'\\'] }
+        o = [..o, b]
+        i++
+    }
+    [..o, b'"']
+}
+
+fn append_part_headers(out: []byte, part: MultipartPart): []byte {
+    var o = append_str(out, "Content-Disposition: form-data; name=")
+    o = append_quoted(o, part.name)
+    if part.filename.len > 0 {
+        o = append_str(o, "; filename=")
+        o = append_quoted(o, part.filename)
+    }
+    o = append_crlf(o)
+    if part.content_type.len > 0 {
+        o = append_str(o, concat("Content-Type: ", part.content_type))
+        o = append_crlf(o)
+    }
+    o
+}
+
+fn append_part(out: []byte, part: MultipartPart, boundary: str): []byte {
+    var o = append_str(out, concat("--", boundary))
+    o = append_crlf(o)
+    o = append_part_headers(o, part)
+    o = append_crlf(o)
+    o = append_bytes(o, part.data)
+    append_crlf(o)
+}
+
+fn append_final_boundary(out: []byte, boundary: str): []byte {
+    var o = append_str(out, concat("--", boundary, "--"))
+    append_crlf(o)
+}
+
+/**
+ * Renders `parts` as one `multipart/form-data` body under `boundary`: each part as a
+ * `--boundary`-delimited section, followed by the final `--boundary--` delimiter. Total: always
+ * succeeds for any `parts`/`boundary` (a boundary that collides with content inside `parts` is a
+ * caller responsibility).
+ */
+exp fn build_multipart(parts: []MultipartPart, boundary: str): []byte {
+    var out: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= parts.len { break }
+        out = append_part(out, parts[i], boundary)
+        i++
+    }
+    append_final_boundary(out, boundary)
+}
+
+fn bytes_slice(data: []byte, from: u64, to: u64): []byte {
+    var out: []byte = []
+    var i = from
+    loop {
+        if i >= to { break }
+        out = [..out, data[i]]
+        i++
+    }
+    out
+}
+
+fn bytes_match_at(haystack: []byte, needle: []byte, pos: u64): bool {
+    if pos + needle.len > haystack.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= needle.len { break }
+        if haystack[pos + i] != needle[i] { return false }
+        i++
+    }
+    true
+}
+
+fn bytes_index_of(haystack: []byte, needle: []byte, from: u64): u64 | null {
+    var pos = from
+    loop {
+        if pos + needle.len > haystack.len { break }
+        if bytes_match_at(haystack, needle, pos) { return pos }
+        pos++
+    }
+    null
+}
+
+fn ascii_lower(b: byte): byte {
+    if b >= b'A' && b <= b'Z' {
+        return ((b to u32) + ((b'a' to u32) - (b'A' to u32))) to byte
+    }
+    b
+}
+
+fn bytes_ieq_at(haystack: []byte, needle: []byte, pos: u64): bool {
+    if pos + needle.len > haystack.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= needle.len { break }
+        if ascii_lower(haystack[pos + i]) != ascii_lower(needle[i]) { return false }
+        i++
+    }
+    true
+}
+
+fn trim_leading_spaces(data: []byte): []byte {
+    var i: u64 = 0
+    loop {
+        if i >= data.len { break }
+        if data[i] != b' ' { break }
+        i++
+    }
+    bytes_slice(data, i, data.len)
+}
+
+fn unescape_quoted(raw: []byte): str | error {
+    var out: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= raw.len { break }
+        var b = raw[i]
+        if b == b'\\' {
+            if i + 1 >= raw.len { return error { message = "mime: dangling escape in quoted parameter value" } }
+            out = [..out, raw[i + 1]]
+            i = i + 2
+            continue
+        }
+        out = [..out, b]
+        i++
+    }
+    str_from_utf8(out)
+}
+
+fn find_unescaped_quote(line: []byte, from: u64): u64 | error {
+    var i = from
+    loop {
+        if i >= line.len { return error { message = "mime: unterminated quoted parameter value" } }
+        if line[i] == b'\\' { i = i + 2; continue }
+        if line[i] == b'"' { return i }
+        i++
+    }
+    error { message = "mime: unreachable" }
+}
+
+type ParamLookup = struct {
+    found: bool
+    value: str
+}
+
+fn find_param_value(line: []byte, param: str): ParamLookup | error {
+    var marker = concat(param, "=\"").bytes()
+    var pos = match bytes_index_of(line, marker, 0) {
+        u64 as p => p
+        null => return ParamLookup { found = false; value = "" }
+    }
+    var content_start = pos + marker.len
+    var end = match find_unescaped_quote(line, content_start) { u64 as p => p; error as e => return e }
+    var text = match unescape_quoted(bytes_slice(line, content_start, end)) { str as s => s; error as e => return e }
+    ParamLookup { found = true; value = text }
+}
+
+type HeaderInfo = struct {
+    name: str
+    filename: str
+    content_type: str
+    has_name: bool
+}
+
+fn apply_content_disposition(info: HeaderInfo, line: []byte): HeaderInfo | error {
+    var name_lookup = match find_param_value(line, "name") { ParamLookup as p => p; error as e => return e }
+    if !name_lookup.found {
+        return error { message = "mime: Content-Disposition header missing name parameter" }
+    }
+    var filename_lookup = match find_param_value(line, "filename") { ParamLookup as p => p; error as e => return e }
+    var filename = ""
+    if filename_lookup.found { filename = filename_lookup.value }
+    HeaderInfo { name = name_lookup.value; filename = filename; content_type = info.content_type; has_name = true }
+}
+
+fn apply_content_type(info: HeaderInfo, line: []byte, prefix_len: u64): HeaderInfo | error {
+    var value = trim_leading_spaces(bytes_slice(line, prefix_len, line.len))
+    var text = match str_from_utf8(value) { str as s => s; error as e => return e }
+    HeaderInfo { name = info.name; filename = info.filename; content_type = text; has_name = info.has_name }
+}
+
+fn apply_header_line(info: HeaderInfo, line: []byte): HeaderInfo | error {
+    var disposition_prefix = "content-disposition:".bytes()
+    if bytes_ieq_at(line, disposition_prefix, 0) {
+        return apply_content_disposition(info, line)
+    }
+    var type_prefix = "content-type:".bytes()
+    if bytes_ieq_at(line, type_prefix, 0) {
+        return apply_content_type(info, line, type_prefix.len)
+    }
+    info
+}
+
+fn parse_headers(headers: []byte): HeaderInfo | error {
+    var info = HeaderInfo { name = ""; filename = ""; content_type = ""; has_name = false }
+    if headers.len == 0 { return info }
+    var crlf = "\r\n".bytes()
+    var start: u64 = 0
+    loop {
+        var line_end = match bytes_index_of(headers, crlf, start) { u64 as p => p; null => headers.len }
+        var line = bytes_slice(headers, start, line_end)
+        info = match apply_header_line(info, line) { HeaderInfo as h => h; error as e => return e }
+        if line_end >= headers.len { break }
+        start = line_end + 2
+    }
+    info
+}
+
+type PartSlice = struct {
+    headers: []byte
+    content: []byte
+}
+
+fn split_headers_and_body(body: []byte, start: u64, end: u64): PartSlice | error {
+    var region = bytes_slice(body, start, end)
+    var separator = "\r\n\r\n".bytes()
+    var blank = match bytes_index_of(region, separator, 0) {
+        u64 as p => p
+        null => return error { message = "mime: multipart part missing header/body blank-line separator" }
+    }
+    PartSlice { headers = bytes_slice(region, 0, blank); content = bytes_slice(region, blank + 4, region.len) }
+}
+
+fn parse_one_part(body: []byte, start: u64, end: u64): MultipartPart | error {
+    var slices = match split_headers_and_body(body, start, end) { PartSlice as s => s; error as e => return e }
+    var info = match parse_headers(slices.headers) { HeaderInfo as h => h; error as e => return e }
+    if !info.has_name {
+        return error { message = "mime: multipart part missing Content-Disposition name" }
+    }
+    MultipartPart { name = info.name; filename = info.filename; content_type = info.content_type; data = slices.content }
+}
+
+fn is_final_boundary(body: []byte, pos: u64): bool {
+    bytes_match_at(body, "--".bytes(), pos)
+}
+
+fn skip_boundary_crlf(body: []byte, pos: u64): u64 | error {
+    if bytes_match_at(body, "\r\n".bytes(), pos) { return pos + 2 }
+    error { message = "mime: malformed multipart boundary delimiter line" }
+}
+
+fn trim_trailing_crlf(body: []byte, end: u64): u64 {
+    if end >= 2 && body[end - 2] == b'\r' && body[end - 1] == b'\n' { return end - 2 }
+    end
+}
+
+/**
+ * Parses a `multipart/form-data` body under `boundary` (typically extracted from the enclosing
+ * request/response's `Content-Type` header via `extract_boundary`) into its parts, in source
+ * order. Malformed input — a missing boundary, a truncated part, a header block with no name, or
+ * a dangling quoted-value escape — is a checked `error`, never a panic (M.1 fail-loud).
+ */
+exp fn parse_multipart(body: []byte, boundary: str): []MultipartPart | error {
+    var delim = concat("--", boundary).bytes()
+    var cursor = match bytes_index_of(body, delim, 0) {
+        u64 as p => p
+        null => return error { message = "mime: multipart boundary not found in body" }
+    }
+    var parts: []MultipartPart = []
+    loop {
+        var after_delim = cursor + delim.len
+        if is_final_boundary(body, after_delim) { break }
+        var headers_start = match skip_boundary_crlf(body, after_delim) { u64 as p => p; error as e => return e }
+        var next = match bytes_index_of(body, delim, headers_start) {
+            u64 as p => p
+            null => return error { message = "mime: unterminated multipart body (missing final boundary)" }
+        }
+        var content_end = trim_trailing_crlf(body, next)
+        var part = match parse_one_part(body, headers_start, content_end) { MultipartPart as p => p; error as e => return e }
+        parts = [..parts, part]
+        cursor = next
+    }
+    parts
+}
+
+fn find_token_end(input: []byte, from: u64): u64 {
+    var i = from
+    loop {
+        if i >= input.len { break }
+        if input[i] == b';' || input[i] == b' ' { break }
+        i++
+    }
+    i
+}
+
+fn extract_unquoted_boundary(input: []byte, start: u64): str | error {
+    var end = find_token_end(input, start)
+    str_from_utf8(bytes_slice(input, start, end))
+}
+
+fn extract_quoted_boundary(input: []byte, start: u64): str | error {
+    var end = match find_unescaped_quote(input, start + 1) { u64 as p => p; error as e => return e }
+    unescape_quoted(bytes_slice(input, start + 1, end))
+}
+
+/**
+ * Extracts the `boundary` parameter from a `multipart/form-data; boundary=...` `Content-Type`
+ * header value, accepting both the quoted (`boundary="..."`) and unquoted (`boundary=...`)
+ * forms RFC 2046 §5.1 allows.
+ */
+exp fn extract_boundary(content_type: str): str | error {
+    var input = content_type.bytes()
+    var marker = "boundary=".bytes()
+    var pos = match bytes_index_of(input, marker, 0) {
+        u64 as p => p
+        null => return error { message = "mime: Content-Type has no boundary parameter" }
+    }
+    var start = pos + marker.len
+    if start < input.len && input[start] == b'"' {
+        return extract_quoted_boundary(input, start)
+    }
+    extract_unquoted_boundary(input, start)
+}

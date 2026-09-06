@@ -1,11 +1,13 @@
 # #443 — RPO block numbering for the A3 register allocator (crumb plan)
 
+> **[NOTA]** — este documento descreve oráculos diferenciais ativos durante o bring-up do backend nativo. Ambos os oráculos foram desde então **retirados** (#524 e seguintes); o restante deste documento é registro histórico do método usado, não descreve o estado atual do projeto.
+
 **Status:** DESIGN (doc-only). Sub-PR of the 0.3 own-AOT-backend wave (umbrella
 `remodel/backend-build`). Issue **#443**. Fix branch `fix/issue-443-rpo-numbering`, base the
 backend wave umbrella. **0.3.1 backend-completion — must land EARLY, before A4**, because it
 unblocks multi-block `if`/`match` register allocation. Grounded in the merged A3 code
 (`src/backend/regalloc.tks`, PR #398), the A1 LIR lowering (`src/lir/lower.tks`, `lir.tks`), the
-A2 isel (`src/backend/isel_arm64.tks`), and the machine-IR interp (`src/backend/minst_interp.tks`).
+A2 isel (`src/backend/isel_arm64.tks`), and the machine-IR oracle (`src/backend/minst_oracle.tks`).
 Supersedes the KNOWN OVER-APPROXIMATION warning in `docs/design/backend-a3-regalloc.md` §6.2.
 
 > This is a PLAN. It does not write product code. It specifies the crumb sequence, the exact
@@ -112,7 +114,7 @@ irreducible-CFG feature knows to revisit it.
 
 | Candidate site | Verdict | Reason |
 |---|---|---|
-| **Pre-pass in `regalloc_func` (`regalloc.tks`)** | **CHOSEN** | Localizes the fix to the consumer. No id change, no block-list mutation, no isel/lower/interp perturbation. Smallest blast radius; ripple contained to `regalloc.tks` + `regalloc_test.tkt` (verified: those three fns have no other src callers). |
+| **Pre-pass in `regalloc_func` (`regalloc.tks`)** | **CHOSEN** | Localizes the fix to the consumer. No id change, no block-list mutation, no isel/lower/oracle perturbation. Smallest blast radius; ripple contained to `regalloc.tks` + `regalloc_test.tkt` (verified: those three fns have no other src callers). |
 | Fix block emission order in isel `select_all_blocks` | Rejected | isel emits in LIR order and appends edge blocks as discovered; reordering mid-selection is complex and perturbs A2 golden dumps for zero allocator benefit. |
 | Make `alloc_block`/`lower_if_value` allocate ids topologically | Rejected | Deep A1 change: every LIR/golden dump shifts, wide blast radius across the whole backend, for a problem the allocator can solve locally. |
 | `number_insts` computes RPO internally (only) | Rejected as *sole* change | `has_back_edge` **also** needs positions; computing RPO in two places duplicates the DFS. Thread one shared `order`. |
@@ -121,20 +123,20 @@ irreducible-CFG feature knows to revisit it.
 
 ## 4. The subtle invariant — targets are IDS; we renumber, we do not reorder
 
-`MBranch`/`MBranchCond`/`MCbz` `.target` fields hold **block IDS** (`minst.tks`), and the interp
-follows the CFG **by id** (`find_mblock(f, cur)`, `minst_interp.tks:1093`, seeded from
+`MBranch`/`MBranchCond`/`MCbz` `.target` fields hold **block IDS** (`minst.tks`), and the oracle
+follows the CFG **by id** (`find_mblock(f, cur)`, `minst_oracle.tks:1093`, seeded from
 `f.blocks[0].id`, `:1122`). Because the RPO pass:
 
 - **does not change any `MBlock.id`**, every branch `.target` stays valid untouched;
 - **does not reorder `MFunc.blocks`**, `rewrite_func` (`regalloc.tks:1576`) rebuilds blocks in the
   same list order with the same ids — output structure is identical to today except for register
-  substitution, so **golden dumps and the interp are provably unaffected**;
+  substitution, so **golden dumps and the oracle are provably unaffected**;
 - uses RPO **only** to assign program *points* for liveness and to compute *positions* for the
   back-edge test.
 
-**Interp-correctness argument:** the interp is order-independent (id-driven) with the single
+**Oracle-correctness argument:** the oracle is order-independent (id-driven) with the single
 constraint `entry = f.blocks[0]`. The pass touches neither ids nor `blocks[0]`, so
-`minst_interp(regalloc(sel)) == minst_interp(sel)` continues to hold by construction. (Should a
+`minst_oracle(regalloc(sel)) == minst_oracle(sel)` continues to hold by construction. (Should a
 future variant choose to *physically* reorder into RPO for A4 code layout — a legitimate future
 optimization — the **only** invariant to preserve is entry-at-index-0, which RPO guarantees since
 RPO always starts at the entry. That variant is out of scope for #443.)
@@ -157,7 +159,7 @@ W15 law; no inline `//`. The repo convention folds the error case into `@return 
  * @param u32 x  the value to find
  * @return bool  true iff `x` is present
  */
-fn u32_in(list: []u32, x: u32) -> bool {
+fn u32_in(list: []u32, x: u32): bool {
     mut i: u64 = 0
     loop {
         if i >= list.len { break }
@@ -173,7 +175,7 @@ fn u32_in(list: []u32, x: u32) -> bool {
  * @param []u32 list  the list to reverse
  * @return []u32  the reversed list
  */
-fn reverse_u32(list: []u32) -> []u32 {
+fn reverse_u32(list: []u32): []u32 {
     mut out: []u32 = teko::list::empty()
     mut i: u64 = list.len
     loop {
@@ -193,7 +195,7 @@ fn reverse_u32(list: []u32) -> []u32 {
  * @param u32 id  the block id
  * @return []MInst  the block's instructions, or empty
  */
-fn block_insts_of(f: MFunc, id: u32) -> []MInst {
+fn block_insts_of(f: MFunc, id: u32): []MInst {
     mut i: u64 = 0
     loop {
         if i >= f.blocks.len { break }
@@ -213,7 +215,7 @@ fn block_insts_of(f: MFunc, id: u32) -> []MInst {
  * @param u32 id  the block whose successors to enumerate
  * @return []u32  the distinct successor block ids, in terminator order
  */
-fn block_successors(f: MFunc, id: u32) -> []u32 {
+fn block_successors(f: MFunc, id: u32): []u32 {
     let insts = block_insts_of(f, id)
     mut out: []u32 = teko::list::empty()
     mut i: u64 = 0
@@ -254,7 +256,7 @@ type RpoState = struct {
  * @param RpoState st  the visited set + post-order so far
  * @return RpoState  the updated visited set + post-order
  */
-fn rpo_visit(f: MFunc, id: u32, st: RpoState) -> RpoState {
+fn rpo_visit(f: MFunc, id: u32, st: RpoState): RpoState {
     if u32_in(st.visited, id) { return st }
     let succs = block_successors(f, id)
     mut cur = RpoState { visited = teko::list::push(st.visited, id); post = st.post }
@@ -277,7 +279,7 @@ fn rpo_visit(f: MFunc, id: u32, st: RpoState) -> RpoState {
  * @param []u32 order  the reachable-block order so far
  * @return []u32  the order extended with any unreachable block ids
  */
-fn append_unvisited(f: MFunc, order: []u32) -> []u32 {
+fn append_unvisited(f: MFunc, order: []u32): []u32 {
     mut out = order
     mut i: u64 = 0
     loop {
@@ -300,7 +302,7 @@ fn append_unvisited(f: MFunc, order: []u32) -> []u32 {
  * @param MFunc f  the selected function
  * @return []u32  the RPO block-id order (entry first)
  */
-fn rpo_block_order(f: MFunc) -> []u32 {
+fn rpo_block_order(f: MFunc): []u32 {
     if f.blocks.len == 0 { return teko::list::empty() }
     let entry = f.blocks[0].id
     let st = rpo_visit(f, entry, RpoState { visited = teko::list::empty(); post = teko::list::empty() })
@@ -316,7 +318,7 @@ fn rpo_block_order(f: MFunc) -> []u32 {
  * @param u32 id  the block id to rank
  * @return u32  the 0-based RPO position, or `order.len`
  */
-fn block_pos(order: []u32, id: u32) -> u32 {
+fn block_pos(order: []u32, id: u32): u32 {
     mut i: u64 = 0
     loop {
         if i >= order.len { break }
@@ -342,7 +344,7 @@ fn block_pos(order: []u32, id: u32) -> u32 {
  * @param []u32 order  the RPO block-id order (from `rpo_block_order`)
  * @return []NumberedInst  the flattened, RPO-numbered stream
  */
-fn number_insts(f: MFunc, order: []u32) -> []NumberedInst {
+fn number_insts(f: MFunc, order: []u32): []NumberedInst {
     mut out: []NumberedInst = teko::list::empty()
     mut p: u32 = 0
     mut bi: u64 = 0
@@ -378,7 +380,7 @@ fn number_insts(f: MFunc, order: []u32) -> []NumberedInst {
  * @param []u32 order  the RPO block-id order
  * @return bool  true iff a retreating (back-)edge is present
  */
-fn has_back_edge(stream: []NumberedInst, order: []u32) -> bool {
+fn has_back_edge(stream: []NumberedInst, order: []u32): bool {
     mut i: u64 = 0
     loop {
         if i >= stream.len { break }
@@ -406,7 +408,7 @@ fn has_back_edge(stream: []NumberedInst, order: []u32) -> bool {
  * @param []u32 order  the RPO block-id order (for the back-edge test)
  * @return IntervalSet | error  the computed intervals, or the back-edge stop
  */
-fn compute_intervals(stream: []NumberedInst, order: []u32) -> IntervalSet | error {
+fn compute_intervals(stream: []NumberedInst, order: []u32): IntervalSet | error {
     if has_back_edge(stream, order) {
         return error { message = "regalloc: a loop back-edge needs live-range holes over the strict linear numbering — deferred to the A3-loop follow-up (§6.2)" }
     }
@@ -428,7 +430,7 @@ fn compute_intervals(stream: []NumberedInst, order: []u32) -> IntervalSet | erro
  * @param MFunc f  the selected function (virtual MRegs + ABI pins)
  * @return MFunc | error  the fully-colored function, or a named honest-stop
  */
-pub fn regalloc_func(abi: AbiDescriptor, f: MFunc) -> MFunc | error {
+pub fn regalloc_func(abi: AbiDescriptor, f: MFunc): MFunc | error {
     let order = rpo_block_order(f)
     let numbered = number_insts(f, order)
     let ivals = match compute_intervals(numbered, order) {
@@ -453,8 +455,7 @@ legitimate (a `.tkt` sees its module's internals).
 
 ## 6. The crumb sequence (ordered, each independently gate-able)
 
-Every crumb owes the full ritual — the **both-engine gate** (native `teko . -o bin` AND VM
-`teko test .`) · paranoid · fixpoint — and **100% coverage on its new code**. No machine bytes.
+Every crumb owes the full ritual — the **native gate** (native `teko . -o bin`) · paranoid · fixpoint — and **100% coverage on its new code**. No machine bytes.
 
 **CRITICAL SEQUENCING LAW (do not violate):** the numbering fix (Crumb 2) MUST land **before or
 with** the back-edge relaxation (Crumb 3). Relaxing `has_back_edge` first — while numbering is
@@ -481,7 +482,7 @@ over-stops (never miscompiles). Never the reverse.
 - **Update** the 5 existing `number_insts(...)` call sites in `regalloc_test.tkt`
   (lines 221, 237, 252, 261, 918). For the single-block fixtures RPO order == `[0]` == id order, so
   **expected values are unchanged** — only the call adds `rpo_block_order(f)`. Recommended helper to
-  cut churn: `fn rgt_number(f: MFunc) -> []NumberedInst { number_insts(f, rpo_block_order(f)) }`.
+  cut churn: `fn rgt_number(f: MFunc): []NumberedInst { number_insts(f, rpo_block_order(f)) }`.
 - **New white-box test** (the inverted-liveness case, at the numbering layer): build the diamond
   fixture where a vreg is **defined in a high-id arm block and used in the low-id merge block**
   (§10.3); assert its def-point < its use-point in `number_insts(f, rpo_block_order(f))` (monotonic
@@ -495,10 +496,10 @@ over-stops (never miscompiles). Never the reverse.
   `order` to `compute_intervals` (§5.5). Now a nested `if`/`match` **allocates**; a real `loop`
   **still honest-stops**.
 - **Update** the 4 existing `compute_intervals(...)` call sites in `regalloc_test.tkt`
-  (lines 237, 252, 261, 918) to thread `order` (helper: `fn rgt_intervals(f: MFunc) ->
+  (lines 237, 252, 261, 918) to thread `order` (helper: `fn rgt_intervals(f: MFunc):
   IntervalSet | error { let o = rpo_block_order(f); compute_intervals(number_insts(f, o), o) }`).
   Single-block expected values unchanged.
-- **New fixtures** (§10): the nested-`if` interp-equivalence + allocate-success (§10.1); the loop
+- **New fixtures** (§10): the nested-`if` oracle-equivalence + allocate-success (§10.1); the loop
   still-honest-stops guard (§10.2, the existing `rgt_regalloc_func_back_edge_honest_stops` at
   `regalloc_test.tkt:827` is a genuine B0↔B1 loop and MUST stay green — extend or keep it).
 - **Doc-sync:** update `docs/design/backend-a3-regalloc.md` §6.2 — replace the "KNOWN
@@ -535,11 +536,11 @@ All five are **single-block** fixtures (`rgt_func` builds one block id 0), so RP
 
 ## 8. Regression fixtures (built to match isel's actual output)
 
-Model the harness on the existing interp-equivalence tests (`regalloc_test.tkt:675-692`) and the
-existing back-edge test (`:827-837`). `minst_interp` follows the CFG by id from `blocks[0]`, so a
+Model the harness on the existing oracle-equivalence tests (`regalloc_test.tkt:675-692`) and the
+existing back-edge test (`:827-837`). `minst_oracle` follows the CFG by id from `blocks[0]`, so a
 hand-built `MFunc` with an id-inverted merge exercises exactly the isel shape.
 
-### 8.1 Nested-`if` interp-equivalence + allocate-success (the primary #443 regression)
+### 8.1 Nested-`if` oracle-equivalence + allocate-success (the primary #443 regression)
 Build an **acyclic** `MFunc` whose block-list/id order is NOT topological — a merge block with a
 **lower id than the arm-tail blocks that jump to it**, and a **vreg defined in an arm and used in
 the merge** (so it also exercises the inversion). Concretely (ids in parens):
@@ -552,11 +553,11 @@ the merge** (so it also exercises the inversion). Concretely (ids in parens):
 
 `v10` is **defined in B2/B3 (ids 2/3) and used in B1 (id 1)** — the id-inversion. Block list in id
 order `[B0,B1,B2,B3]`. Assert:
-1. `minst_interp(module, "main") == 42` (pre) — the interp already runs this (id-driven).
+1. `minst_oracle(module, "main") == 42` (pre) — the oracle already runs this (id-driven).
 2. `regalloc_func(aapcs64(), f)` returns **`MFunc` (NOT error)** — this is the sharp guard: it
    **fails before the fix** (`has_back_edge` false-positives on B2→B1 / B3→B1), **passes after**.
 3. `all_physical(colored) == true` and `all_physical(f) == false`.
-4. `minst_interp(regalloc_module(...), "main") == 42` (post == pre) — semantics preserved.
+4. `minst_oracle(regalloc_module(...), "main") == 42` (post == pre) — semantics preserved.
 
 > Do NOT wrap the `regalloc_func` result in the `error => return` early-out the other harnesses use
 > — that would silently pass before the fix. Assert `is_err == false` explicitly.
@@ -566,7 +567,7 @@ Add a second value that stays live **across** the arms into the merge, so a mis-
 would color it identically to `v10` and corrupt the result: e.g. B0 also `movz v20=7`, and B1
 computes `add v11 = v10 + v20; mov x0 = v11` → expected 49. Under inverted numbering `v10`'s range
 collapses and the scan can alias it with `v20` → wrong sum; under RPO both are live → 49. The
-interp-equivalence (post == 49) is the black-box catch.
+oracle-equivalence (post == 49) is the black-box catch.
 
 ### 8.3 The loop still honest-stops (the deferral guard — already present)
 `regalloc_test.tkt:827 rgt_regalloc_func_back_edge_honest_stops` builds B0→B1→B0 (a genuine
@@ -583,16 +584,15 @@ proof that RPO fixed the numbering even independently of the back-edge test.
 
 ## 9. Ritual points
 
-- **Both-engine gate at every crumb:** native `teko . -o bin` **and** VM `teko test .`. The
-  diff-VM==native lane runs the VM; the recursion in `rpo_visit` and the `mut cur = RpoState{…}` /
-  `cur = rpo_visit(…)` reassignment must run on both.
-- **VM gotcha watch:**
-  - No `x = match { … return }` reassignment (VM can't do control flow inside a match used as an
+- **Native gate at every crumb:** native `teko . -o bin`. The recursion in `rpo_visit` and the `mut cur = RpoState{…}` /
+  `cur = rpo_visit(…)` reassignment must run correctly.
+- **Code pattern watch:**
+  - No `x = match { … return }` reassignment (control flow restrictions in certain contexts), so
     assignment RHS) — none is introduced; `regalloc_func` keeps the existing `let … = match { …
     error as e => return e }` **binding** shape (`regalloc.tks:1634`, the pattern isel documents at
     `isel_arm64.tks:1831-1835`).
   - Literal u32 anchoring: keep the `to u32` casts on literals (`i to u32`, `order.len to u32`) as
-    the surrounding code does; a bare integer literal can mis-infer width in the VM.
+    the surrounding code does; a bare integer literal can mis-infer width.
   - `mut i: u64 = list.len` then `i = i - 1` in `reverse_u32` guards the `i == 0` break BEFORE
     decrement (no u64 underflow).
 - **100% coverage on new code** (`teko . -o bin --coverage`, native path, never `test --coverage`):
@@ -614,7 +614,7 @@ proof that RPO fixed the numbering even independently of the back-edge test.
 | **`number_insts`/`compute_intervals` signature change breaks existing tests.** | Ripple is fully mapped (§7); all five sites are single-block, expected values unchanged, mechanical edit + optional helper. |
 | **Recursion depth in `rpo_visit`.** | Bounded by CFG nesting depth (structured control flow, shallow). Functional threading, one entry per block (`visited` guard). If ever a concern, an explicit-stack iterative post-order is a drop-in later; not needed now (M.1, simplest correct first). |
 | **Unreachable blocks left un-numbered.** | `append_unvisited` makes the order total (every block numbered), so no vreg is dropped. |
-| **Physically reordering `MFunc.blocks` (the tempting A4-layout variant).** | Out of scope for #443. We renumber, not reorder (§4) — smallest blast radius, interp/golden dumps untouched. If A4 wants RPO code layout, that is a separate, later change whose only invariant is entry-at-index-0 (RPO already guarantees). |
+| **Physically reordering `MFunc.blocks` (the tempting A4-layout variant).** | Out of scope for #443. We renumber, not reorder (§4) — smallest blast radius, oracle/golden dumps untouched. If A4 wants RPO code layout, that is a separate, later change whose only invariant is entry-at-index-0 (RPO already guarantees). |
 
 **No genuine unresolved tension → no HALT.** Every decision is resolved law-first with the RPO
 pass; the deferrals (A3-loop for real loops, A3-splitting, A4-frame) are unchanged. The one thing

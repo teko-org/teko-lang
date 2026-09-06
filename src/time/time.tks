@@ -1,376 +1,229 @@
-/**
- * src/time/time.tks   (namespace `teko::time`)
- *
- * DATE/TIME — the drop-128 A6 redesign (owner-ratified type table, 2026-07-24). Five value
- * types, EVERY carrier field <= 64 bits (no `i128`/`u128` anywhere in this module):
- *
- *   `date`      — `i32` days since 1970-01-01 (Gregorian proleptic), +-5.88M years.
- *   `time`      — `u64` ns since midnight, domain `0..86_399_999_999_999` (23:59:59.999999999).
- *   `span`      — `i64` ns signed duration/delta, +-292 years; also the monotonic-clock reading.
- *   `datetime`  — `{days: i32; ticks: u64}`, a civil date+time-of-day with NO timezone.
- *   `dto`       — a `datetime` plus a fixed `offset_minutes: i16`. A geographic zone id
- *                 (tzdata-backed) is Tier 2, deferred to .32+ — `dto` carries only the fixed
- *                 numeric offset, never a zone name.
- *
- * `timestamp` (i64 UNIX seconds) is a REPRESENTATION, not a carrier type — see
- * `timestamp_from_datetime`/`timestamp_to_datetime` below. Its domain (+-292 BILLION years)
- * vastly exceeds `datetime`'s (+-5.88M years, bounded by `date`'s `i32`), so
- * `timestamp_to_datetime` HONESTLY PANICS (via the `to i32` cast) on a timestamp whose day
- * count does not fit `date` — never a silent wrap.
- *
- * EXTERN-STRUCT CALLING CONVENTION (read before adding a new extern here). An `extern fn`'s
- * struct param/return is declared, in the generated C, using `teko_rt.h`'s OWN typedef — never
- * the mangled typedef codegen generates for the SAME-shaped Teko type. The two are
- * layout-identical but NOMINALLY DISTINCT C types, so a value fresh off an extern call can
- * NEVER be stored in a `let`/field or passed to a non-extern fn (a C COMPILE ERROR, not a
- * runtime bug — verified empirically against this compiler). So every host-dependent clock read
- * below is a PRIVATE extern returning a bare SCALAR (`wall_days`/`wall_ns_of_day`/
- * `wall_offset_minutes`/`monotonic_ns`), never a carrier struct; the PUBLIC `*_now`/`*_today`
- * constructors are ordinary (non-extern) Teko functions that compose the scalar into the
- * carrier struct entirely on the Teko side — fully storable/composable from that point on, and
- * VM-runnable except for the four private scalar reads themselves (still native-only, same as
- * the ROUND 0 design). Every other operation (accessors, arithmetic, `timestamp` conversions) is
- * pure Teko end-to-end, so both engines produce byte-identical results wherever they run at all.
- */
-
 /** A calendar date: `i32` days since 1970-01-01 (Gregorian proleptic). No time-of-day, no zone. */
-pub type date = struct {
-    /** the number of days since 1970-01-01 (may be negative for a pre-epoch date) */
+exp type date = struct {
+    /** days since 1970-01-01 (may be negative for a pre-epoch date) */
     days: i32
 }
 
 /** A time-of-day: `u64` nanoseconds since midnight. Domain `0..86_399_999_999_999`. */
-pub type time = struct {
-    /** the number of nanoseconds since 00:00:00.000000000 (< 86_400_000_000_000) */
+exp type time = struct {
+    /** nanoseconds since 00:00:00.000000000 (< 86_400_000_000_000) */
     ticks: u64
 }
 
 /** A signed duration/delta: `i64` nanoseconds, +-292 years. Also a monotonic-clock reading. */
-pub type span = struct {
+exp type span = struct {
     /** the signed nanosecond count (negative = a duration into the past) */
     ticks: i64
 }
 
-/** A civil date+time-of-day with NO timezone: a `date` and a `time` flattened into one value. */
-pub type datetime = struct {
-    /** the date component — days since 1970-01-01 (see `date.days`) */
+/** A civil date+time-of-day with no timezone: a `date` and a `time` flattened into one value. */
+exp type datetime = struct {
+    /** the date component — days since 1970-01-01 */
     days: i32
-    /** the time-of-day component — ns since midnight (see `time.ticks`) */
+    /** the time-of-day component — ns since midnight */
     ticks: u64
 }
 
-/**
- * A `datetime` with a FIXED UTC offset. A geographic zone id (tzdata-backed) is Tier 2
- * (deferred to .32+); this carries only the numeric offset, never a zone name.
- */
-pub type dto = struct {
-    /** the date component — days since 1970-01-01 (see `date.days`) */
+/** A `datetime` with a fixed UTC offset (no geographic zone id). */
+exp type dto = struct {
+    /** the date component — days since 1970-01-01 */
     days: i32
-    /** the time-of-day component — ns since midnight (see `time.ticks`) */
+    /** the time-of-day component — ns since midnight */
     ticks: u64
     /** the fixed UTC offset, in minutes (positive = east of UTC) */
     offset_minutes: i16
 }
 
-/** How many nanoseconds make up one full day — the `time`/`datetime` ticks-field modulus. */
 const NS_PER_DAY: i64 = 86400000000000
 
-/**
- * SPAN_MAX — the largest `span`, i.e. `i64::MAX` nanoseconds (~292 years). The ceiling every
- * arithmetic guard in this module checks against BEFORE computing, so no operation here can reach
- * a signed overflow.
- */
 const SPAN_MAX: i64 = 9223372036854775807
 
-/**
- * SPAN_MIN — the most negative `span` (`-2^63` ns), spelled as a subtraction because `2^63` has no
- * `i64` literal form.
- */
-const SPAN_MIN: i64 = -9223372036854775807 - 1
+const SPAN_MIN: i64 = -9223372036854775808
 
-/**
- * SPAN_MAX_WHOLE_DAYS — the largest whole-day count whose nanosecond value, PLUS a full day of
- * sub-day remainder, still fits a `span`.
- *
- * PROOF: `106_750 * 86_400_000_000_000 = 9_223_200_000_000_000_000`, which is
- * `172_036_854_775_807` below `i64::MAX` — more than one whole day of nanoseconds
- * (`86_400_000_000_000`) of headroom. So for any `|days| <= SPAN_MAX_WHOLE_DAYS` and any
- * `|remainder| < NS_PER_DAY`, `days * NS_PER_DAY + remainder` is exactly representable, in both
- * signs (`i64::MIN` is one further from zero than `i64::MAX`, so the negative side has strictly
- * more room). One more day (`106_751`) would overflow: `106_751 * NS_PER_DAY` exceeds `i64::MAX`.
- * This is `datetime_diff`'s exact domain — ~292 years, the `span` domain the module header states.
- */
 const SPAN_MAX_WHOLE_DAYS: i64 = 106750
 
-/**
- * DATE_DAYS_MAX — the largest `date.days`, i.e. `i32::MAX` (~5.88M years past the epoch). Every
- * `date` arithmetic guard checks against it before narrowing back to the `i32` carrier.
- */
 const DATE_DAYS_MAX: i64 = 2147483647
 
-/**
- * DATE_DAYS_MIN — the most negative `date.days`, i.e. `i32::MIN`.
- */
 const DATE_DAYS_MIN: i64 = -2147483648
 
-/**
- * Days since 1970-01-01, UTC, from the host wall clock. NATIVE-ONLY (the VM rejects every
- * `extern fn`); a bare scalar so a caller can compose it into a `date` without tripping the
- * extern-struct calling convention documented in the module doc.
- *
- * @return the current UTC day count
- */
-extern fn wall_days() -> i32 = "tk_rt_wall_days" from "teko_rt"
+#os("linux")
+fn clock_read_ns(clockid: i64): i64 {
+    var ts = teko::sys::ptr_word(teko::mem::buf_ptr(16))
+    _ = teko::sys::syscall2(teko::sys::SYS_CLOCK_GETTIME, clockid, ts)
+    (teko::mem::load_u64(ts to u64) to i64) * 1000000000 + (teko::mem::load_u64((ts + 8) to u64) to i64)
+}
 
-/**
- * Nanoseconds since midnight, UTC, from the host wall clock. NATIVE-ONLY; see `wall_days`.
- *
- * @return the current UTC ns-of-day, always `< 86_400_000_000_000`
- */
-extern fn wall_ns_of_day() -> u64 = "tk_rt_wall_ns_of_day" from "teko_rt"
+#os("linux")
+fn wall_now_ns(): i64 {
+    clock_read_ns(teko::sys::CLOCK_REALTIME to i64)
+}
 
-/**
- * The host's local UTC offset, in minutes (positive = east of UTC). NATIVE-ONLY; see `wall_days`.
- *
- * @return the current local UTC offset, in minutes
- */
-extern fn wall_offset_minutes() -> i16 = "tk_rt_wall_offset_minutes" from "teko_rt"
+#os("linux")
+fn mono_now_ns(): i64 {
+    clock_read_ns(teko::sys::CLOCK_MONOTONIC to i64)
+}
 
-/**
- * Nanoseconds from an UNSPECIFIED monotonic origin (never compare across process runs; never
- * subtract against a wall-clock reading). NATIVE-ONLY; see `wall_days`.
- *
- * @return the current monotonic-clock ns reading
- */
-extern fn monotonic_ns() -> i64 = "tk_rt_monotonic_ns" from "teko_rt"
+#os("macos")
+fn clock_read_ns(clockid: i32): i64 {
+    var ts = teko::sys::ptr_word(teko::mem::buf_ptr(16))
+    _ = teko::sys::abi::os_clock_gettime(clockid, ts to u64)
+    (teko::mem::load_u64(ts to u64) to i64) * 1000000000 + (teko::mem::load_u64((ts + 8) to u64) to i64)
+}
 
-/**
- * Construct a `date` from an explicit days-since-epoch value — the deterministic alternative to
- * `date_today()` (tests should prefer this).
- *
- * @param days  days since 1970-01-01 (may be negative)
- * @return      the `date` for `days`
- */
-pub fn date_from_days(days: i32) -> date {
+#os("macos")
+fn wall_now_ns(): i64 {
+    clock_read_ns(teko::sys::CLOCK_REALTIME)
+}
+
+#os("macos")
+fn mono_now_ns(): i64 {
+    clock_read_ns(teko::sys::CLOCK_MONOTONIC)
+}
+
+#os("windows")
+fn wall_now_ns(): i64 {
+    var ft = teko::sys::ptr_word(teko::mem::buf_ptr(8))
+    teko::sys::abi::GetSystemTimePreciseAsFileTime(ft to u64)
+    var ticks = teko::mem::load_u64(ft to u64) to i64
+    (ticks - 116444736000000000) * 100
+}
+
+#os("windows")
+fn mono_now_ns(): i64 {
+    var f = teko::sys::ptr_word(teko::mem::buf_ptr(8))
+    var c = teko::sys::ptr_word(teko::mem::buf_ptr(8))
+    _ = teko::sys::abi::QueryPerformanceFrequency(f to u64)
+    _ = teko::sys::abi::QueryPerformanceCounter(c to u64)
+    var freq = teko::mem::load_u64(f to u64) to i64
+    var cnt = teko::mem::load_u64(c to u64) to i64
+    if freq == 0 { return 0 }
+    (cnt / freq) * 1000000000 + ((cnt % freq) * 1000000000) / freq
+}
+
+extern fn wall_offset_minutes(): i16 = "tk_rt_wall_offset_minutes" from "teko_rt"
+
+fn wall_days(): i32 {
+    var secs = wall_now_ns() / 1000000000
+    if secs >= 0 { return (secs / 86400) to i32 }
+    ((secs - 86399) / 86400) to i32
+}
+
+fn wall_ns_of_day(): u64 {
+    var ns = wall_now_ns()
+    var day_ns: i64 = 86400 * 1000000000
+    var rem = ns % day_ns
+    if rem < 0 { rem = rem + day_ns }
+    rem to u64
+}
+
+/** teko::time::monotonic_ns — a monotonic-clock reading in nanoseconds; meaningful only against
+ * another reading from the same process run. */
+exp fn monotonic_ns(): i64 {
+    mono_now_ns()
+}
+
+/** teko::time::date_from_days — a `date` from an explicit days-since-epoch value. */
+exp fn date_from_days(days: i32): date {
     date { days = days }
 }
 
-/**
- * Construct a `time` from an explicit ns-since-midnight value, validating its domain.
- *
- * @param ns  nanoseconds since midnight; must be `< 86_400_000_000_000` (< 24h)
- * @return    the `time` for `ns`
- * @throws    panics when `ns` names a moment at or past the next midnight
- */
-pub fn time_from_ns(ns: u64) -> time {
+/** teko::time::time_from_ns — a `time` from an explicit ns-since-midnight value.
+ * @throws panics when `ns` is at or past the next midnight (>= 86_400_000_000_000). */
+exp fn time_from_ns(ns: u64): time {
     if ns >= 86400000000000 { panic("teko::time: time-of-day ns out of range (must be < 86_400_000_000_000, i.e. < 24h)") }
     time { ticks = ns }
 }
 
-/**
- * Construct a `span` from an explicit signed nanosecond count. Every `i64` is a valid `span` —
- * the carrier IS the domain, no validation needed.
- *
- * @param ns  the signed nanosecond duration
- * @return    the `span` for `ns`
- */
-pub fn span_from_ns(ns: i64) -> span {
+/** teko::time::span_from_ns — a `span` from an explicit signed nanosecond count. */
+exp fn span_from_ns(ns: i64): span {
     span { ticks = ns }
 }
 
-/**
- * Combine a `date` and a `time` into a `datetime` (civil, no timezone).
- *
- * @param d  the date component
- * @param t  the time-of-day component
- * @return   the combined `datetime`
- */
-pub fn datetime_of(d: date, t: time) -> datetime {
+/** teko::time::datetime_of — combine a `date` and a `time` into a `datetime`. */
+exp fn datetime_of(d: date, t: time): datetime {
     datetime { days = d.days; ticks = t.ticks }
 }
 
-/**
- * Attach a fixed UTC offset to a `datetime`, producing a `dto`.
- *
- * @param dt               the civil datetime
- * @param offset_minutes   the fixed UTC offset, in minutes (positive = east of UTC)
- * @return                 the combined `dto`
- */
-pub fn dto_of(dt: datetime, offset_minutes: i16) -> dto {
+/** teko::time::dto_of — attach a fixed UTC offset to a `datetime`, producing a `dto`. */
+exp fn dto_of(dt: datetime, offset_minutes: i16): dto {
     dto { days = dt.days; ticks = dt.ticks; offset_minutes = offset_minutes }
 }
 
-/**
- * Today's date (UTC, host wall clock). NATIVE-ONLY (see the module doc); use `date_from_days`
- * in tests for deterministic results.
- *
- * @return today's `date`, UTC
- */
-pub fn date_today() -> date {
+/** teko::time::date_today — today's date (UTC, host wall clock). */
+exp fn date_today(): date {
     date_from_days(wall_days())
 }
 
-/**
- * The current time-of-day (UTC, host wall clock). NATIVE-ONLY; see `date_today`.
- *
- * @return the current UTC `time`
- */
-pub fn time_now_utc() -> time {
+/** teko::time::time_now_utc — the current time-of-day (UTC, host wall clock). */
+exp fn time_now_utc(): time {
     time_from_ns(wall_ns_of_day())
 }
 
-/**
- * The current UTC `datetime` (host wall clock). NATIVE-ONLY; see `date_today`.
- *
- * Reads `date_today()` and `time_now_utc()` independently (two separate host clock reads, like
- * the ROUND 0 design before it) — a moment-of-execution skew across a midnight boundary is
- * possible but immaterial for this library's use (build-progress reporting, log timestamps).
- *
- * @return the current UTC `datetime`
- */
-pub fn datetime_now() -> datetime {
+/** teko::time::datetime_now — the current UTC `datetime` (host wall clock). */
+exp fn datetime_now(): datetime {
     datetime_of(date_today(), time_now_utc())
 }
 
-/**
- * The current local `dto` (host wall clock + host local UTC offset). NATIVE-ONLY; see
- * `date_today`.
- *
- * @return the current local `dto`
- */
-pub fn dto_local_now() -> dto {
+/** teko::time::dto_local_now — the current local `dto` (host wall clock + local UTC offset). */
+exp fn dto_local_now(): dto {
     dto_of(datetime_now(), wall_offset_minutes())
 }
 
-/**
- * A fresh monotonic-clock reading, as a `span`. NATIVE-ONLY; see `date_today`. Meaningful only
- * as the operand of `span_sub` against ANOTHER `span_monotonic_now()` reading from the SAME
- * process run (an elapsed-time measurement) — never compare its raw value across runs or
- * against a wall-clock `span`.
- *
- * @return an opaque monotonic instant, as a `span`
- */
-pub fn span_monotonic_now() -> span {
+/** teko::time::span_monotonic_now — a fresh monotonic-clock reading, as a `span`. Meaningful
+ * only against another reading from the SAME process run. */
+exp fn span_monotonic_now(): span {
     span_from_ns(monotonic_ns())
 }
 
-/**
- * Floor division (rounds towards -infinity, unlike Teko's native truncating `/`) — the shared
- * normalization primitive `datetime_add`/`timestamp_to_datetime` use to keep a ticks-of-day
- * value inside `[0, modulus)` even when the dividend is negative.
- *
- * @param a  the dividend
- * @param b  the positive divisor
- * @return   `a` divided by `b`, rounded towards -infinity
- */
-fn floor_div(a: i64, b: i64) -> i64 {
-    let q = a / b
-    let r = a % b
+fn floor_div(a: i64, b: i64): i64 {
+    var q = a / b
+    var r = a % b
     if r != 0 && (r < 0) != (b < 0) { q - 1 } else { q }
 }
 
-/**
- * date_days_checked — narrow a day count computed in `i64` back onto the `date` carrier, refusing
- * a value outside `i32`. Every `date`-producing operation funnels through here, so the carrier is
- * never reached by a wrapped or truncated value: the domain is checked BEFORE the narrowing, and
- * the message names the barrier (M.3) instead of leaving a `to i32` cast panic to speak for it.
- *
- * @param days  the day count to place on the carrier
- * @return      `days` as the `i32` the `date` carrier holds
- * @throws      panics when `days` is outside `[i32::MIN, i32::MAX]`, i.e. past `date`'s ratified
- *              +-5.88M-year domain
- */
-fn date_days_checked(days: i64) -> i32 {
+fn date_days_checked(days: i64): i32 {
     if days > DATE_DAYS_MAX || days < DATE_DAYS_MIN {
         panic("teko::time: date out of range (a `date` holds +-5.88M years, the i32 day carrier)")
     }
     days to i32
 }
 
-/**
- * `dt` advanced by `sp` (may be negative — a `datetime` moved backward). Normalizes the
- * resulting ticks-of-day back into `[0, 86_400_000_000_000)`, carrying the overflow/underflow
- * into the date component.
- *
- * PROOF THAT THE INTERNAL ARITHMETIC CANNOT OVERFLOW, given the guard below: `dt.ticks` is a
- * ticks-of-day, so `0 <= dt.ticks < NS_PER_DAY` and `(dt.ticks to i64)` is non-negative. The sum
- * `(dt.ticks to i64) + sp.ticks` can therefore only overflow ABOVE (adding a non-negative to any
- * `i64` never underflows), which the guard rejects; `floor_div` and the `day_delta * NS_PER_DAY`
- * that follows stay inside the sum's own magnitude. The final day count is computed in `i64` and
- * narrowed through `date_days_checked`.
- *
- * @param dt  the starting datetime
- * @param sp  the signed nanosecond offset to apply
- * @return    `dt` shifted by `sp`
- * @throws    panics when `sp` would carry the ns sum past `i64`, or when the resulting date leaves
- *            `date`'s `i32` domain
- */
-pub fn datetime_add(dt: datetime, sp: span) -> datetime {
+/** teko::time::datetime_add — `dt` advanced by `sp` (may be negative), normalizing the
+ * ticks-of-day back into `[0, 24h)` and carrying the remainder into the date component.
+ * @throws panics when `sp` overflows the ns sum, or the resulting date leaves `date`'s domain. */
+exp fn datetime_add(dt: datetime, sp: span): datetime {
     if sp.ticks > SPAN_MAX - (dt.ticks to i64) {
         panic("teko::time: datetime_add overflows the ns span domain (+-292 years)")
     }
-    let combined = (dt.ticks to i64) + sp.ticks
-    let day_delta = floor_div(combined, NS_PER_DAY)
-    let new_ticks = combined - day_delta * NS_PER_DAY
+    var combined = (dt.ticks to i64) + sp.ticks
+    var day_delta = floor_div(combined, NS_PER_DAY)
+    var new_ticks = combined - day_delta * NS_PER_DAY
     datetime { days = date_days_checked(dt.days + day_delta); ticks = new_ticks to u64 }
 }
 
-/**
- * `dt` moved back by `sp` — `datetime_add(dt, -sp)`.
- *
- * @param dt  the starting datetime
- * @param sp  the signed nanosecond offset to subtract
- * @return    `dt` shifted by `-sp`
- * @throws    panics when `sp` is `i64::MIN` (its negation is not a `span`), or from
- *            `datetime_add` on the shifted value
- */
-pub fn datetime_sub(dt: datetime, sp: span) -> datetime {
+/** teko::time::datetime_sub — `dt` moved back by `sp` (`datetime_add(dt, -sp)`).
+ * @throws panics when `sp` is `i64::MIN`, or from `datetime_add` on the shifted value. */
+exp fn datetime_sub(dt: datetime, sp: span): datetime {
     if sp.ticks == SPAN_MIN {
         panic("teko::time: datetime_sub cannot negate the most negative span (i64::MIN)")
     }
     datetime_add(dt, span { ticks = 0 - sp.ticks })
 }
 
-/**
- * The signed duration `a - b`, as a `span`. Computes the day delta in `i64` first (the `i32`
- * carriers are widened BEFORE subtracting, so two dates at opposite ends of `date`'s +-5.88M-year
- * domain do not wrap the subtraction itself), checks it against `span`'s own, much narrower domain,
- * and only then scales to nanoseconds.
- *
- * PROOF: with `|day_diff| <= SPAN_MAX_WHOLE_DAYS` (see that constant's own proof) the product
- * `day_diff * NS_PER_DAY` leaves more than one full day of nanoseconds of headroom, and
- * `|tick_diff| < NS_PER_DAY` because both operands are ticks-of-day — so the final sum is exactly
- * representable. `date`'s domain is +-5.88M years and `span`'s is +-292 years by owner-ratified
- * design, so a difference this rejects is a genuine domain mismatch, not a bug.
- *
- * @param a  the later (minuend) datetime
- * @param b  the earlier (subtrahend) datetime
- * @return   `a - b`, as a `span`
- * @throws   panics when the true difference exceeds `span`'s +-292-year domain
- */
-pub fn datetime_diff(a: datetime, b: datetime) -> span {
-    let day_diff = (a.days to i64) - (b.days to i64)
+/** teko::time::datetime_diff — the signed duration `a - b`, as a `span`.
+ * @throws panics when the true difference exceeds `span`'s +-292-year domain. */
+exp fn datetime_diff(a: datetime, b: datetime): span {
+    var day_diff = (a.days to i64) - (b.days to i64)
     if day_diff > SPAN_MAX_WHOLE_DAYS || day_diff < 0 - SPAN_MAX_WHOLE_DAYS {
         panic("teko::time: datetime_diff exceeds the span domain (+-292 years)")
     }
-    let tick_diff = (a.ticks to i64) - (b.ticks to i64)
+    var tick_diff = (a.ticks to i64) - (b.ticks to i64)
     span { ticks = day_diff * NS_PER_DAY + tick_diff }
 }
 
-/**
- * The sum of two `span`s.
- *
- * PROOF THAT THE GUARD IS EXACT AND CANNOT ITSELF OVERFLOW: for `b >= 0` the sum exceeds `i64` iff
- * `a > SPAN_MAX - b`, and `SPAN_MAX - b` is in range because `b >= 0`; for `b < 0` the sum
- * underflows iff `a < SPAN_MIN - b`, and `SPAN_MIN - b` is in range because `-b > 0`. Both
- * subtractions are therefore representable, and no other pair can leave the domain.
- *
- * @param a  the first span
- * @param b  the second span
- * @return   `a + b`
- * @throws   panics when the sum leaves the `i64` nanosecond domain
- */
-pub fn span_add(a: span, b: span) -> span {
+/** teko::time::span_add — the sum of two `span`s.
+ * @throws panics when the sum leaves the `i64` nanosecond domain. */
+exp fn span_add(a: span, b: span): span {
     if b.ticks >= 0 && a.ticks > SPAN_MAX - b.ticks {
         panic("teko::time: span_add overflows the ns span domain (+-292 years)")
     }
@@ -380,20 +233,9 @@ pub fn span_add(a: span, b: span) -> span {
     span { ticks = a.ticks + b.ticks }
 }
 
-/**
- * The difference of two `span`s (`a - b`).
- *
- * PROOF THAT THE GUARD IS EXACT AND CANNOT ITSELF OVERFLOW: for `b <= 0` the difference exceeds
- * `i64` iff `a > SPAN_MAX + b`, and `SPAN_MAX + b` is in range because `b <= 0`; for `b > 0` it
- * underflows iff `a < SPAN_MIN + b`, and `SPAN_MIN + b` is in range because `b > 0`. Written as
- * additions precisely so the guard never has to negate `b` (`i64::MIN` has no negation).
- *
- * @param a  the minuend span
- * @param b  the subtrahend span
- * @return   `a - b`
- * @throws   panics when the difference leaves the `i64` nanosecond domain
- */
-pub fn span_sub(a: span, b: span) -> span {
+/** teko::time::span_sub — the difference of two `span`s (`a - b`).
+ * @throws panics when the difference leaves the `i64` nanosecond domain. */
+exp fn span_sub(a: span, b: span): span {
     if b.ticks <= 0 && a.ticks > SPAN_MAX + b.ticks {
         panic("teko::time: span_sub overflows the ns span domain (+-292 years)")
     }
@@ -403,124 +245,57 @@ pub fn span_sub(a: span, b: span) -> span {
     span { ticks = a.ticks - b.ticks }
 }
 
-/**
- * `d` shifted by a signed day count (may be negative). The shift is computed in `i64` and narrowed
- * through `date_days_checked`, so a shift past the carrier is refused instead of wrapping.
- *
- * @param d     the starting date
- * @param days  the signed day offset to apply
- * @return      `d` shifted by `days`
- * @throws      panics when the shifted date leaves `date`'s `i32` domain
- */
-pub fn date_add_days(d: date, days: i32) -> date {
+/** teko::time::date_add_days — `d` shifted by a signed day count (may be negative).
+ * @throws panics when the shifted date leaves `date`'s `i32` domain. */
+exp fn date_add_days(d: date, days: i32): date {
     date { days = date_days_checked((d.days to i64) + (days to i64)) }
 }
 
-/**
- * The signed day difference `a - b`. Both carriers are widened to `i64` BEFORE subtracting (two
- * dates at opposite ends of the `i32` domain differ by more than `i32` can hold), and the result is
- * narrowed back through `date_days_checked`.
- *
- * @param a  the later (minuend) date
- * @param b  the earlier (subtrahend) date
- * @return   `a - b`, in days
- * @throws   panics when the difference does not fit `i32`
- */
-pub fn date_diff_days(a: date, b: date) -> i32 {
+/** teko::time::date_diff_days — the signed day difference `a - b`.
+ * @throws panics when the difference does not fit `i32`. */
+exp fn date_diff_days(a: date, b: date): i32 {
     date_days_checked((a.days to i64) - (b.days to i64))
 }
 
-/**
- * `dt` as a UNIX timestamp (whole seconds since 1970-01-01T00:00:00Z). LOSSY: any sub-second
- * remainder in `dt.ticks` is truncated (floored towards -infinity is not needed here — `dt`'s
- * ns-of-day is always non-negative, so plain truncating division is exact-or-floor already).
- * Never panics — `timestamp`'s `i64`-second domain (+-292 BILLION years) is vastly wider than
- * `datetime`'s (+-5.88M years, `date`'s own `i32` bound).
- *
- * @param dt  the civil datetime to convert
- * @return    the UNIX timestamp, in whole seconds
- */
-pub fn timestamp_from_datetime(dt: datetime) -> i64 {
+/** teko::time::timestamp_from_datetime — `dt` as a UNIX timestamp (whole seconds since
+ * 1970-01-01T00:00:00Z); lossy — any sub-second remainder is truncated. */
+exp fn timestamp_from_datetime(dt: datetime): i64 {
     (dt.days to i64) * 86400 + ((dt.ticks / 1000000000) to i64)
 }
 
-/**
- * A UNIX timestamp (whole seconds since 1970-01-01T00:00:00Z) as a civil `datetime`.
- *
- * @param ts  the UNIX timestamp, in whole seconds (may be negative, pre-1970)
- * @return    the civil `datetime` for `ts`
- * @throws    panics when `ts` names a day count outside `date`'s `i32` domain (+-5.88M years) —
- *            `timestamp`'s own domain is far wider (+-292 BILLION years), so this is a genuine,
- *            expected domain mismatch (owner-ratified table), not a bug
- */
-pub fn timestamp_to_datetime(ts: i64) -> datetime {
-    let days = floor_div(ts, 86400)
-    let secs_of_day = ts - days * 86400
+/** teko::time::timestamp_to_datetime — a UNIX timestamp as a civil `datetime`.
+ * @throws panics when `ts` names a day count outside `date`'s `i32` domain. */
+exp fn timestamp_to_datetime(ts: i64): datetime {
+    var days = floor_div(ts, 86400)
+    var secs_of_day = ts - days * 86400
     datetime { days = days to i32; ticks = (secs_of_day to u64) * 1000000000 }
 }
 
-/**
- * A Gregorian calendar date broken into its year, month, and day-of-month components.
- *
- * `$"{d:yyyy-MM-dd}"` and `date_to_string`/`time_to_string` compute their fields in pure Teko
- * (via `civil_from_days`), so both engines (VM and native) produce byte-identical output.
- */
 pub type CivilDate = struct {
-    /** the Gregorian year (e.g. 1970 for epoch day 0; may be negative for far-past dates) */
     year: i64
-    /** the month, 1 through 12 */
     month: i64
-    /** the day of the month, 1 through 31 */
     day: i64
 }
 
-/**
- * Convert a days-since-epoch count (`date.days`) into its Gregorian year/month/day.
- *
- * Uses the Richards (2013) Julian-Day-Number algorithm, identical to teko_rt.c's
- * `tk_jdn_to_ymd` (mirrored by design, not shared — see teko_rt.h), so it handles negative day
- * counts (pre-1970 dates) the same way.
- *
- * @param days  the number of days since 1970-01-01 (may be negative)
- * @return      the year, month (1..12), and day-of-month (1..31) for `days`
- */
-pub fn civil_from_days(days: i64) -> CivilDate {
-    let jdn = days + 2440588
-    let f = jdn + 1401 + (((4 * jdn + 274277) / 146097) * 3 / 4) - 38
-    let e = 4 * f + 3
-    let g = (e % 1461) / 4
-    let h = 5 * g + 2
-    let day = (h % 153) / 5 + 1
-    let month = (h / 153 + 2) % 12 + 1
-    let year = e / 1461 - 4716 + (14 - month) / 12
+pub fn civil_from_days(days: i64): CivilDate {
+    var jdn = days + 2440588
+    var f = jdn + 1401 + (((4 * jdn + 274277) / 146097) * 3 / 4) - 38
+    var e = 4 * f + 3
+    var g = (e % 1461) / 4
+    var h = 5 * g + 2
+    var day = (h % 153) / 5 + 1
+    var month = (h / 153 + 2) % 12 + 1
+    var year = e / 1461 - 4716 + (14 - month) / 12
     CivilDate { year = year; month = month; day = day }
 }
 
-/**
- * Render `v` in decimal, left-padded with leading zeros to at least `width` DIGITS. A negative `v`
- * keeps its `-` in front of the padded digits (`pad_zeros(-221, 4)` is `"-0221"`, the ISO-8601
- * extended spelling of a pre-year-1 year), so the sign is never counted as a digit nor buried
- * inside the zeros.
- *
- * @param v      the value to render (any sign — `civ.year` is documented negative-capable)
- * @param width  the minimum digit width, excluding any sign
- * @return       `v` in decimal, zero-padded on the left to `width` digits
- */
-fn pad_zeros(v: i64, width: i64) -> str {
+fn pad_zeros(v: i64, width: i64): str {
     if v < 0 { return teko::str::concat("-", pad_zeros_magnitude(magnitude_of(v), width)) }
     pad_zeros_magnitude(v to u64, width)
 }
 
-/**
- * Render an unsigned magnitude in decimal, left-padded with leading zeros to at least `width`
- * digits — the sign-free core `pad_zeros` wraps.
- *
- * @param mag    the magnitude to render
- * @param width  the minimum digit width
- * @return       `mag` in decimal, zero-padded on the left to `width` digits
- */
-fn pad_zeros_magnitude(mag: u64, width: i64) -> str {
-    mut s = digits_of_magnitude(mag)
+fn pad_zeros_magnitude(mag: u64, width: i64): str {
+    var s = digits_of_magnitude(mag)
     loop {
         if s.len to i64 >= width { break }
         s = teko::str::concat("0", s)
@@ -528,107 +303,59 @@ fn pad_zeros_magnitude(mag: u64, width: i64) -> str {
     s
 }
 
-/**
- * Render an integer as its plain decimal text, sign included.
- *
- * The pre-0.3.1 form took an `i64`, documented "non-negative", and computed each digit as
- * `(48 + n % 10) to byte`. Teko's `%` truncates towards zero, so for a NEGATIVE `n` the remainder
- * is negative and the digit byte came out BELOW `'0'` — the year -221 rendered as `"/."`-style
- * garbage. `CivilDate.year` is documented negative-capable and `civil_from_days` genuinely produces
- * it for any pre-0001-01-01 date, so that path was reachable from the public API
- * (`date_to_string`). Splitting the sign off and rendering the MAGNITUDE makes the function total.
- *
- * @param v  the value to render (any sign)
- * @return   the decimal text of `v` ("0" for zero, `-` prefixed when negative)
- */
-fn digits_of(v: i64) -> str {
+fn digits_of(v: i64): str {
     if v < 0 { return teko::str::concat("-", digits_of_magnitude(magnitude_of(v))) }
     digits_of_magnitude(v to u64)
 }
 
-/**
- * magnitude_of — the absolute value of `v` as a `u64`.
- *
- * PROOF THAT IT IS EXACT AT `i64::MIN`: negating `v` directly would overflow there (`2^63` is not
- * an `i64`), so the negation is done on `v + 1` — which lies in `[i64::MIN + 1, 0]`, making
- * `0 - (v + 1)` land in `[0, i64::MAX]`, both in range — and the missing unit is added back in the
- * `u64` domain, where `i64::MAX + 1` is representable.
- *
- * @param v  the (possibly negative) value whose magnitude is wanted
- * @return   `|v|`, exactly, for every `i64`
- */
-fn magnitude_of(v: i64) -> u64 {
+fn magnitude_of(v: i64): u64 {
     if v >= 0 { return v to u64 }
     ((0 - (v + 1)) to u64) + 1
 }
 
-/**
- * Render an unsigned magnitude as its plain decimal text — the sign-free core `digits_of` wraps.
- *
- * @param mag  the magnitude to render
- * @return     the decimal digits of `mag` ("0" for zero)
- */
-fn digits_of_magnitude(mag: u64) -> str {
+fn digits_of_magnitude(mag: u64): str {
     if mag == 0 { return "0" }
-    mut digits: []byte = teko::list::empty()
-    mut n = mag
+    var digits: []byte = []
+    var n = mag
     loop {
         if n == 0 { break }
-        digits = teko::list::push(digits, (48 + (n % 10)) to byte)
+        digits = [..digits, (48 + (n % 10)) to byte]
         n = n / 10
     }
-    mut xs: []byte = teko::list::empty()
-    mut k = digits.len
-    loop { if k == 0 { break }; k = k - 1; xs = teko::list::push(xs, digits[k]) }
+    var xs: []byte = []
+    var k = digits.len
+    loop { if k == 0 { break }; k = k - 1; xs = [..xs, digits[k]] }
     str(xs)
 }
 
-/**
- * The number of leading bytes at `pattern[i]` that equal `pattern[i]` (a run of one token byte).
- *
- * Calendar patterns use repeated letters to select a width (`yyyy` vs `yy`, `MM` vs `M`); this
- * counts the run so the caller can dispatch on its length.
- *
- * @param pattern  the format pattern
- * @param i        the run's start index
- * @return         the count of consecutive bytes equal to `pattern[i]`, starting at `i`
- */
-fn run_length(pattern: str, i: u64) -> u64 {
-    let c = pattern[i]
-    mut j = i
+fn run_length(pattern: str, i: u64): u64 {
+    var c = pattern[i]
+    var j = i
     loop { if j >= pattern.len { break }; if pattern[j] != c { break }; j++ }
     j - i
 }
 
-/**
- * Format a `date` value against a calendar pattern (`$"{d:yyyy-MM-dd}"` / `to_string`).
- *
- * Recognized tokens: `yyyy` (4-digit year), `yy` (2-digit year), `MM`/`M` (month), `dd`/`d`
- * (day). Any other byte — separators like `-`, `/`, `.`, spaces — passes through literally.
- *
- * @param d        the date to format
- * @param pattern  the calendar pattern
- * @return         `d` rendered per `pattern`
- */
-pub fn date_to_string(d: date, pattern: str) -> str {
-    let civ = civil_from_days(d.days to i64)
-    mut out = ""
-    mut i = 0 to u64
+/** teko::time::date_to_string — format `d` against a calendar pattern (`yyyy`/`yy`, `MM`/`M`,
+ * `dd`/`d`; any other byte passes through literally). */
+exp fn date_to_string(d: date, pattern: str): str {
+    var civ = civil_from_days(d.days to i64)
+    var out = ""
+    var i = 0 to u64
     loop {
         if i >= pattern.len { break }
-        let c = pattern[i]
+        var c = pattern[i]
         if c == b'y' {
-            let n = run_length(pattern, i)
+            var n = run_length(pattern, i)
             if n >= 4 { out = teko::str::concat(out, pad_zeros(civ.year, 4)) }
             else { out = teko::str::concat(out, pad_zeros(civ.year % 100, 2)) }
             i = i + n
         } else if c == b'M' {
-            let n = run_length(pattern, i)
+            var n = run_length(pattern, i)
             if n >= 2 { out = teko::str::concat(out, pad_zeros(civ.month, 2)) }
             else { out = teko::str::concat(out, digits_of(civ.month)) }
             i = i + n
         } else if c == b'd' {
-            let n = run_length(pattern, i)
+            var n = run_length(pattern, i)
             if n >= 2 { out = teko::str::concat(out, pad_zeros(civ.day, 2)) }
             else { out = teko::str::concat(out, digits_of(civ.day)) }
             i = i + n
@@ -640,38 +367,30 @@ pub fn date_to_string(d: date, pattern: str) -> str {
     out
 }
 
-/**
- * Format a `time` value against a clock pattern (`$"{t:HH:mm:ss}"` / `to_string`).
- *
- * Recognized tokens: `HH`/`H` (hour 0..23), `mm`/`m` (minute), `ss`/`s` (second). Any other byte
- * passes through literally.
- *
- * @param t        the time-of-day to format
- * @param pattern  the clock pattern
- * @return         `t` rendered per `pattern`
- */
-pub fn time_to_string(t: time, pattern: str) -> str {
-    let secs = (t.ticks / 1000000000) to i64
-    let hour = secs / 3600
-    let minute = (secs % 3600) / 60
-    let second = secs % 60
-    mut out = ""
-    mut i = 0 to u64
+/** teko::time::time_to_string — format `t` against a clock pattern (`HH`/`H`, `mm`/`m`, `ss`/`s`;
+ * any other byte passes through literally). */
+exp fn time_to_string(t: time, pattern: str): str {
+    var secs = (t.ticks / 1000000000) to i64
+    var hour = secs / 3600
+    var minute = (secs % 3600) / 60
+    var second = secs % 60
+    var out = ""
+    var i = 0 to u64
     loop {
         if i >= pattern.len { break }
-        let c = pattern[i]
+        var c = pattern[i]
         if c == b'H' {
-            let n = run_length(pattern, i)
+            var n = run_length(pattern, i)
             if n >= 2 { out = teko::str::concat(out, pad_zeros(hour, 2)) }
             else { out = teko::str::concat(out, digits_of(hour)) }
             i = i + n
         } else if c == b'm' {
-            let n = run_length(pattern, i)
+            var n = run_length(pattern, i)
             if n >= 2 { out = teko::str::concat(out, pad_zeros(minute, 2)) }
             else { out = teko::str::concat(out, digits_of(minute)) }
             i = i + n
         } else if c == b's' {
-            let n = run_length(pattern, i)
+            var n = run_length(pattern, i)
             if n >= 2 { out = teko::str::concat(out, pad_zeros(second, 2)) }
             else { out = teko::str::concat(out, digits_of(second)) }
             i = i + n

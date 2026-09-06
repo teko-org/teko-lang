@@ -1,0 +1,102 @@
+// surface_overload_method.tk -- method overloading (entrega 4, crumb C2): one
+// name, several signatures, in a struct, in a class and in an interface. The
+// FIRST method of a name keeps the plain `owner_name` symbol and every overload
+// after it carries its parameter types, so a program that never overloads emits
+// what it always emitted.
+//
+// `virtual i64 area()` and `virtual i64 area(i64 k)` are two SLOTS, not one:
+// the table is keyed by (name, signature), so Square's two `override`s each land
+// on the base slot of their own signature -- `r.area()` and `r.area(2)` on a
+// name declared `Shape` both run Square's.
+//
+// `pick` is declared twice at the same arity and never called: two signatures
+// that differ only in parameter types are two declarations with two symbols,
+// and a CALL to them is refused (the argument types are what would tell them
+// apart, and no module can ask the core for those mid-body).
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+interface Sizer {
+    i64 size();
+    i64 size(i64 k);
+}
+
+struct Box {
+    public i64 w;
+
+    public i64 grow() {
+        return w + 1;
+    }
+
+    public i64 grow(i64 k) {
+        return w + k;
+    }
+}
+
+class Shape : Sizer {
+    public i64 side;
+
+    public virtual i64 area() {
+        return side;
+    }
+
+    public virtual i64 area(i64 k) {
+        return side * k;
+    }
+
+    public i64 size() {
+        return side;
+    }
+
+    public i64 size(i64 k) {
+        return side + k;
+    }
+
+    i64 pick(i64 a) {
+        return a;
+    }
+
+    i64 pick(uptr a) {
+        return 0;
+    }
+}
+
+class Square : Shape {
+    public override i64 area() {
+        return side * side;
+    }
+
+    public override i64 area(i64 k) {
+        return side * side * k;
+    }
+}
+
+i64 main() {
+    Box x = new Box;
+    x.w = 5;
+    if (x.grow() != 6) return 1;                 // a struct's two `grow`s
+    if (x.grow(3) != 8) return 2;
+
+    Shape p = new Shape;
+    p.side = 3;
+    if (p.area() != 3) return 3;                 // slot 0
+    if (p.area(2) != 6) return 4;                // slot 1
+
+    Square q = new Square;
+    q.side = 4;
+    if (q.area() != 16) return 5;
+    if (q.area(2) != 32) return 6;
+
+    Shape r = new Square;
+    r.side = 4;
+    if (r.area() != 16) return 7;                // the override of slot 0
+    if (r.area(2) != 32) return 8;               // ...and of slot 1, through the base
+
+    Sizer s = p;
+    if (s.size() != 3) return 9;                 // an overloaded interface method
+    if (s.size(4) != 7) return 10;
+
+    return q.area() + p.area(2) + x.grow(3) + 12;   // 16 + 6 + 8 + 12
+}

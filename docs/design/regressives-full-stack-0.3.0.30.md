@@ -225,7 +225,7 @@ Renames (Gherkin `Tkb*`/`tkb_*` → `Tkr*`/`tkr_*`, avoiding collision with the 
 `parse_feature`→`parse_tkr` (REPLACES the deleted TOML `parse_tkr`); `run_one_tkb`→`run_one_tkr`;
 every `tkb_*` helper → `tkr_*`. Discovery collapses to `.tkr`-only (drop the dual-format
 `SpecRef.is_tkb`) AND scans ALL `.tkr` in a dir, not the first (owner 2026-07-23, #40 — free
-file granularity; companion §10): `dir_first_tkr` → `dir_tkr_files(dir) -> []str`, and
+file granularity; companion §10): `dir_first_tkr` → `dir_tkr_files(dir): []str`, and
 `parse_tkr` returns a `[]TkrFeature` (a file may hold multiple `Feature:` blocks).
 
 Signature shapes (full Javadoc; bodies migrate from the current `tkb.tks`):
@@ -267,7 +267,7 @@ pub type TkrFeature = struct {
  * @throws     on a malformed keyword line, an unknown noun-phrase, or a malformed value
  * @since 0.3.0.30
  */
-fn parse_tkr(src: str) -> []TkrFeature | error { /* migrate the tkb.tks body; loop features */ }
+fn parse_tkr(src: str): []TkrFeature | error { /* migrate the tkb.tks body; loop features */ }
 
 /**
  * dir_tkr_files — the basenames of ALL `*.tkr` files in `dir` (sorted for a stable report),
@@ -279,7 +279,7 @@ fn parse_tkr(src: str) -> []TkrFeature | error { /* migrate the tkb.tks body; lo
  * @return     every `.tkr` basename in `dir` (sorted), or an empty list
  * @since 0.3.0.30
  */
-fn dir_tkr_files(dir: str) -> []str { /* list_dir, filter .tkr, sort */ }
+fn dir_tkr_files(dir: str): []str { /* list_dir, filter .tkr, sort */ }
 
 /**
  * run_one_regressor — exercise a regressor DIRECTORY: for EVERY `.tkr` in `dir_tkr_files(dir)`,
@@ -297,7 +297,7 @@ fn dir_tkr_files(dir: str) -> []str { /* list_dir, filter .tkr, sort */ }
  * @return          the aggregate verdict over every `.tkr` in the directory
  * @since 0.3.0.30
  */
-fn run_one_regressor(exe: str, regr_dir: str, prefix: str) -> RegrOutcome { /* iterate + fold */ }
+fn run_one_regressor(exe: str, regr_dir: str, prefix: str): RegrOutcome { /* iterate + fold */ }
 ```
 
 Root self-project guard in `run_regression_sources`: a discovered dir resolving to the repo root

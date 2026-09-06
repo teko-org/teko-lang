@@ -1,42 +1,7 @@
-// main.tks — the EXECUTABLE entry point of the `teko` project (root of the canonical
-// `teko::` namespace). This is the Teko ORIGINAL of the project-root main.c.
-//
-// WHY A PAIR. The project is written in pairs: a C/H SEED (compiled by the host cc) +
-// the canonical .tks. The seed `teko` exists to compile the .tks sources — this file
-// included — and so reproduce the compiler in Teko (SELF-HOSTING, the bootstrap's whole
-// point). main.tks and main.c must therefore stay SEMANTICALLY EQUIVALENT.
-//
-// MONOLITH, PROJECTS ONLY (REBOOT_PLAN §2.6). Teko compiles PROJECTS (`.tkp`), never an
-// isolated `.tks` file — a lone file is not a compilation unit. The CLI is project-only:
-//   teko build <projdir>   front-end → native codegen (a binary)
-//   teko run   <projdir>   front-end → VM (debug profile)
-//   teko test  <projdir>   honest stub (the test runner is crumb D2, not yet built)
-//   teko fmt   <path>...   canonical formatter (DT0 — self-hosted binary only)
-//   teko repl              an interactive session over the VM (DT3 — self-hosted binary only)
-//   teko <projdir>         ≡ build
-// A bare file / `.tks` argument is rejected honestly.
-//
-// SHAPE (§2.20 — entry point). A LINEAR virtual main: top-level statements + local
-// var/const only (no fn/type declarations — those live in modules). Output contract:
-// natural end → exit 0; `teko::exit(n)` → exit n; panic → stderr + exit ≠0. NO value
-// return. Argv via `teko::env::args()` (args[0] is the program, args[1] the subcommand
-// or project). `teko::` is injected and reserved, referenced by absolute path — no `use`.
-//
-// MIRRORS main.c: subcommand dispatch (build/run/test) over a project dir, with bare
-// arg ≡ build and a file/`.tks` arg rejected; exit with the driver's status. main.c also
-// installs a fatal-signal handler that prints a C STACK TRACE on a crash (SIGSEGV/BUS/ILL/FPE
-// — M.1, "be honest about WHERE"); that is a DEFERRED host edge (signal/backtrace are not Teko-
-// expressible yet — like teko::env/exit), so it has no .tks form here.
-//
-// NOT YET SEED-COMPILABLE (honest — M.3). The driver surfaces (`teko::build`,
-// `teko::run`, the original of driver.c's tk_compile_project / tk_run_project) and the
-// `teko::env`/`teko::exit` surfaces exist today only as C seed, not as materialized .tks
-// pairs; per the roadmap, self-hosting is deferred past the first binary. This file is
-// the canonical SOURCE that materialization will target.
-
-let args = teko::env::args()
+var build_clock = teko::build::build_clock_start()
+var args = teko::env::args()
 if args.len >= 2 {
-    let a1 = args[1]
+    var a1 = args[1]
     if a1 == "--version" || a1 == "-v" {
         teko::io::println(teko::str::concat("teko ", teko::env::version()))
         teko::exit(0)
@@ -52,14 +17,14 @@ if args.len < 2 {
     teko::exit(2)
 }
 
-let cmd = args[1]
+var cmd = args[1]
 
-// `fmt` — DT0 (TEKO_ROADMAP_DEVTOOLS): the canonical formatter, a native subcommand
-// implemented pure-Teko in src/fmt/fmt.tks (the teko::regex precedent — corpus source,
-// no C twin). MIRRORS main.c's `fmt` arm: the C seed recognizes the subcommand too, but
-// stops honestly (M.3) — it exists to bootstrap, not to format.
 if cmd == "fmt" {
     teko::exit(teko::fmt::run_cli(args))
+}
+
+if cmd == "lsp" {
+    teko::exit(teko::lsp::run_lsp())
 }
 
 if cmd == "init" {
@@ -71,46 +36,71 @@ if cmd == "build" || cmd == "run" || cmd == "test" {
         teko::io::eprintln("teko: --backend was removed; select the backend with the TEKO_BACKEND environment variable instead (e.g. TEKO_BACKEND=native)")
         teko::exit(2)
     }
-    // the project + optional `-o <dir>` (default "bin") — scanned from arg index 2.
-    let out_dir = teko::build::out_dir_of(args, 2)
-    mut arg = teko::build::project_arg_of(args, 2)
-    if teko::strings::ends_with(arg, ".tks") {
+    if teko::build::has_bare_g_flag(args, 2) {
+        teko::io::eprintln(teko::build::bare_g_rejected_message())
+        teko::exit(2)
+    }
+    var out_dir = teko::build::out_dir_of(args, 2)
+    var arg = teko::build::project_arg_of(args, 2)
+    if arg.ends_with(".tks") {
         teko::io::eprintln("teko: teko compiles projects: pass a project directory or .tkp (a lone .tks is not a unit)")
         teko::exit(2)
     }
     if arg == "" {
         arg = "."
     }
-    let dir = teko::build::project_dir_of(arg)
-    let cov = teko::build::coverage_of(args)   // `--coverage` → write <out>/cobertura.xml (test: project root)
-    let cov_val = teko::build::cov_validation_of(args)
-    let bk = teko::build::backend_of()
+    var dir = teko::build::project_dir_of(arg)
+    var cov = teko::build::coverage_of(args)
+    var cov_val = teko::build::cov_validation_of(args)
+    var bk = teko::build::backend_of()
     if cmd == "build" {
-        let no_verify = teko::build::no_verify_of(args)
-        let opt = teko::build::opt_level_of(args)
-        let no_tty = teko::build::no_tty_of(args)
-        teko::exit(teko::build::compile_project_g(dir, out_dir, cov, no_verify, opt, no_tty, bk, cov_val))
+        var no_verify = teko::build::no_verify_of(args)
+        var opt = teko::build::opt_level_of(args)
+        var no_tty = teko::build::no_tty_of(args)
+        match teko::build::debug_info_of(args) {
+            teko::build::DebugInfo as debug => {
+                var code = teko::build::compile_project_g(dir, out_dir, cov, no_verify, opt, no_tty, bk, cov_val, debug, teko::build::explicit_of(args))
+                teko::build::build_clock_report(build_clock)
+                teko::exit(code)
+            }
+            error as e => {
+                teko::io::eprintln(e.message)
+                teko::exit(2)
+            }
+        }
     }
     if cmd == "run" {
         teko::exit(teko::build::run_project(dir, bk))
     }
-    // test — D2: assemble with the `.tkt` tests, run every `#test` on the VM (fail-fast).
     teko::exit(teko::build::test_project(dir, cov, cov_val, teko::build::per_test_cov_of(args), teko::build::per_commit_base_of(args), teko::build::analyzer_of(args), teko::build::arith_cast_gate_of(args)))
 }
 
-// bare argument: a project ≡ build (also honors `-o <dir>`); a file/`.tks` is rejected.
 if teko::build::has_backend_flag(args, 1) {
     teko::io::eprintln("teko: --backend was removed; select the backend with the TEKO_BACKEND environment variable instead (e.g. TEKO_BACKEND=native)")
     teko::exit(2)
 }
-if teko::strings::ends_with(cmd, ".tks") {
+if teko::build::has_bare_g_flag(args, 1) {
+    teko::io::eprintln(teko::build::bare_g_rejected_message())
+    teko::exit(2)
+}
+if cmd.ends_with(".tks") {
     teko::io::eprintln("teko: teko compiles projects: pass a project directory or .tkp (a lone .tks is not a unit)")
     teko::exit(2)
 }
-let bare_out = teko::build::out_dir_of(args, 1)
-let bare_proj = teko::build::project_arg_of(args, 1)
+var bare_out = teko::build::out_dir_of(args, 1)
+var bare_proj = teko::build::project_arg_of(args, 1)
 if bare_proj == "" {
     teko::io::eprintln("teko compiles projects: pass a project directory or .tkp")
     teko::exit(2)
 }
-teko::exit(teko::build::compile_project_g(teko::build::project_dir_of(bare_proj), bare_out, teko::build::coverage_of(args), teko::build::no_verify_of(args), teko::build::opt_level_of(args), teko::build::no_tty_of(args), teko::build::backend_of(), teko::build::cov_validation_of(args)))
+match teko::build::debug_info_of(args) {
+    teko::build::DebugInfo as bare_debug => {
+        var bare_code = teko::build::compile_project_g(teko::build::project_dir_of(bare_proj), bare_out, teko::build::coverage_of(args), teko::build::no_verify_of(args), teko::build::opt_level_of(args), teko::build::no_tty_of(args), teko::build::backend_of(), teko::build::cov_validation_of(args), bare_debug, teko::build::explicit_of(args))
+        teko::build::build_clock_report(build_clock)
+        teko::exit(bare_code)
+    }
+    error as e => {
+        teko::io::eprintln(e.message)
+        teko::exit(2)
+    }
+}

@@ -1,0 +1,355 @@
+// surface_lambda.tk -- lambda, local named function, `use (a, &b)` (K4, D221
+// §41): the explicit form `new Op((T a, T b) => body)`, over the same
+// object K1's plain-function wrap already builds. K4b adds a delegate
+// captured BY VALUE (item 11) and the contextual/short grafias (items 12/13).
+// K4c adds a clean `f` unrelated to `byref_check`'s own (item 14) and a
+// ternary of two function names coerced into a delegate (item 15).
+//
+// What each helper proves, in order:
+//
+//   1. `nocap_check` -- a lambda with no capture at all.
+//   2. `byval_check` -- `use (k)` freezes a COPY at construction: mutating
+//      the declarer's `k` afterward does not change what the closure reads.
+//   3. `byref_check` -- `use (&acc)` derefs the declarer's OWN slot, and a
+//      second call sees what the first one left there.
+//   4. `two_lambdas_check` -- two closures of the SAME delegate type, each
+//      with its own capture, do not step on one another.
+//   5. `local_named_check` -- `Op twice = new Op(...)`, D221 decision 22's
+//      own reading of a "local named function".
+//   6. `method_check` -- a lambda stored in a field and called through
+//      `this.cb(x)`, one passed as a METHOD argument (explicit AND
+//      contextual grafia) and called there.
+//   7. `counted_check` -- `use (b)` of a class reference: the closure holds
+//      its own count, `rt_live()` stays at 1 after the declarer's own `b`
+//      is dropped, and drops to 0 only once the closure itself is released.
+//   8. `geo.use_lambda()` -- the same machinery inside a `namespace`.
+//   9. `block_check` -- a lambda with a BLOCK body, `=> { ...; return e; }`.
+//  10. `free_arg_check` -- `new Op(...)` as the argument of a FREE function.
+//  11. `deleg_byval_check` -- a delegate itself captured BY VALUE (K4b).
+//  12. `contextual_check` -- `Op f = (i64 x) use (k) => x * k;`, no `new`.
+//  13. `short_check` -- `Op g = x => x + 1;`, the single-parameter grafia.
+//  14. `clean_f_returns_check` -- a CLEAN `f`, in a function of its own,
+//      returned as-is: `byref_check`'s own `f` captures by reference and
+//      must not taint this one just because the two share a name (K4c).
+//  15. `ternary_check` -- `flag ? add1 : double_it` coerced into `Op`, both
+//      as a `return` and as a plain initializer (K4c).
+//  16. `global_const_free_check` -- a lambda with NO `use (...)` at all reads
+//      a global (live, not frozen), reads a `const`, calls a free function
+//      and WRITES the global back, all visible to the caller afterward
+//      (D226 compat crumb item 3).
+//  17. `nested_check` (higiene 2, item 6) -- a lambda literal built INSIDE
+//      another one's own body, `use (k)` at BOTH levels: the shared capture
+//      table used to reset to 0 at either end of the INNER lambda's own
+//      `tk_lambda_finish`, wiping out the OUTER's still-in-progress capture
+//      of the same name (`k`) and refusing it as "not captured" once the
+//      outer's own body walk ran.
+//  18. `manycap_check` (higiene 3, item B) -- FIFTEEN captures in one
+//      `use (...)`, fourteen by value and one by reference. The allocator
+//      used to take one PARAMETER per capture, so anything past twelve died
+//      on the mc ABI's own `at most 12 parameters`; it now takes the object
+//      and the captures are written at the creation site.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+delegate i64 Op(i64 a);
+
+i64 apply(Op f, i64 x) {
+    return f(x);
+}
+
+i64 add1(i64 x) {
+    return x + 1;
+}
+
+i64 double_it(i64 x) {
+    return x * 2;
+}
+
+class Holder {
+    public Op cb;
+
+    public i64 run(i64 x) {
+        return this.cb(x);
+    }
+
+    public i64 relay(Op f, i64 x) {
+        return f(x);
+    }
+}
+
+i64 boxes_released = 0;
+
+class Box {
+    public i64 v;
+
+    public Box(i64 x) {
+        v = x;
+    }
+
+    ~Box() {
+        boxes_released = boxes_released + 1;
+    }
+}
+
+delegate i64 BoxOp();
+
+i64 glob_counter = 0;
+
+const i64 STEP = 5;
+
+i64 bump_free(i64 x) {
+    return x + 1;
+}
+
+namespace geo {
+    i64 use_lambda() {
+        i64 k = 3;
+        Op f = new Op((i64 x) use (k) => x * k);
+        return f(5);
+    }
+}
+
+i64 nocap_check() {
+    Op f = new Op((i64 x) => x * 2);
+    if (f(21) != 42) return 1;
+    return 0;
+}
+
+i64 byval_check() {
+    i64 k = 3;
+    Op f = new Op((i64 x) use (k) => x * k);
+    k = 999;
+    if (f(5) != 15) return 1;
+    return 0;
+}
+
+i64 byref_check() {
+    i64 acc = 0;
+    Op f = new Op((i64 x) use (&acc) => { acc = acc + x; return acc; });
+    if (f(3) != 3) return 1;
+    if (f(4) != 7) return 2;
+    if (acc != 7) return 3;
+    return 0;
+}
+
+i64 two_lambdas_check() {
+    i64 k1 = 2;
+    i64 k2 = 10;
+    Op f1 = new Op((i64 x) use (k1) => x * k1);
+    Op f2 = new Op((i64 x) use (k2) => x * k2);
+    if (f1(5) != 10) return 1;
+    if (f2(5) != 50) return 2;
+    return 0;
+}
+
+i64 local_named_check() {
+    Op twice = new Op((i64 x) => x * 2);
+    if (twice(21) != 42) return 1;
+    return 0;
+}
+
+i64 method_check() {
+    Holder h = new Holder;
+    h.cb = new Op((i64 x) => x + 1);
+    if (h.run(41) != 42) return 1;
+    if (h.relay(new Op((i64 x) => x - 1), 43) != 42) return 2;
+    if (h.relay((i64 x) => x - 1, 43) != 42) return 3;         // contextual, no `new` (K4b)
+    return 0;
+}
+
+i64 counted_check() {
+    Box b = new Box(9);
+    BoxOp f = new BoxOp(() use (b) => b.v);
+    if (f() != 9) return 1;
+    b = null;
+    if (rt_live() != 2) return 2;                  // the closure keeps the Box alive
+    f = null;
+    if (boxes_released != 1) return 3;
+    if (rt_live() != 0) return 4;
+    return 0;
+}
+
+i64 block_check() {
+    Op f = new Op((i64 x) => { i64 y = x * 2; return y + 1; });
+    if (f(10) != 21) return 1;
+    return 0;
+}
+
+i64 free_arg_check() {
+    if (apply(new Op((i64 x) => x - 1), 43) != 42) return 1;
+    return 0;
+}
+
+i64 deleg_byval_check() {
+    Op inner = new Op((i64 x) => x + 1);
+    Op f = new Op((i64 x) use (inner) => inner(x) * 2);
+    if (f(4) != 10) return 1;
+    return 0;
+}
+
+i64 contextual_check() {
+    i64 k = 3;
+    Op f = (i64 x) use (k) => x * k;
+    if (f(5) != 15) return 1;
+    return 0;
+}
+
+i64 short_check() {
+    Op g = x => x + 1;
+    if (g(41) != 42) return 1;
+    return 0;
+}
+
+Op clean_f_returns() {
+    Op f = new Op((i64 x) => x * 2);
+    return f;
+}
+
+i64 clean_f_returns_check() {
+    Op g = clean_f_returns();
+    if (g(21) != 42) return 1;
+    return 0;
+}
+
+Op ternary_pick(i64 flag) {
+    return flag != 0 ? add1 : double_it;
+}
+
+i64 ternary_check() {
+    Op p = ternary_pick(1);
+    if (p(21) != 22) return 1;
+    Op q = ternary_pick(0);
+    if (q(21) != 42) return 2;
+    i64 flag = 1;
+    Op g = flag != 0 ? add1 : double_it;
+    if (g(21) != 22) return 3;
+    flag = 0;
+    Op h = flag != 0 ? add1 : double_it;
+    if (h(21) != 42) return 4;
+    return 0;
+}
+
+i64 global_const_free_check() {
+    glob_counter = 10;
+    Op f = new Op((i64 x) => bump_free(x) + STEP + glob_counter);
+    if (f(0) != 16) return 1;                      // bump_free(0)=1, STEP=5, glob_counter=10
+    glob_counter = 20;
+    if (f(0) != 26) return 2;                      // reads the LIVE global, not a frozen copy
+    Op inc = new Op((i64 x) => { glob_counter = glob_counter + x; return glob_counter; });
+    if (inc(5) != 25) return 3;                    // writes the global from inside the lambda
+    if (glob_counter != 25) return 4;               // ...and the write reaches the real global
+    return 0;
+}
+
+i64 nested_check() {
+    i64 k = 10;
+    Op outer = new Op((i64 x) use (k) => {
+        Op inner = new Op((i64 y) use (k) => y + k);
+        return inner(x) + k;
+    });
+    if (outer(1) != 21) return 1;                   // inner(1)=1+10=11, +k=10 -> 21
+    return 0;
+}
+
+i64 manycap_check() {
+    i64 acc = 0;
+    i64 c1 = 1;
+    i64 c2 = 2;
+    i64 c3 = 3;
+    i64 c4 = 4;
+    i64 c5 = 5;
+    i64 c6 = 6;
+    i64 c7 = 7;
+    i64 c8 = 8;
+    i64 c9 = 9;
+    i64 c10 = 10;
+    i64 c11 = 11;
+    i64 c12 = 12;
+    i64 c13 = 13;
+    i64 c14 = 14;
+    Op f = new Op((i64 x) use (&acc, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14) => {
+        acc = acc + x + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 + c10 + c11 + c12 + c13 + c14;
+        return acc;
+    });
+    if (f(5) != 110) return 1;                     // c1..c14 sum to 105
+    if (f(1) != 216) return 2;                     // the by-reference capture kept the first sum
+    if (acc != 216) return 3;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = nocap_check();
+    if (bad != 0) return 10 + bad;
+    if (rt_live() != 0) return 20;
+
+    bad = byval_check();
+    if (bad != 0) return 30 + bad;
+    if (rt_live() != 0) return 40;
+
+    bad = byref_check();
+    if (bad != 0) return 50 + bad;
+    if (rt_live() != 0) return 60;
+
+    bad = two_lambdas_check();
+    if (bad != 0) return 70 + bad;
+    if (rt_live() != 0) return 80;
+
+    bad = local_named_check();
+    if (bad != 0) return 90 + bad;
+    if (rt_live() != 0) return 100;
+
+    bad = method_check();
+    if (bad != 0) return 110 + bad;
+    if (rt_live() != 0) return 120;
+
+    bad = counted_check();
+    if (bad != 0) return 130 + bad;
+    if (rt_live() != 0) return 140;
+
+    if (geo.use_lambda() != 15) return 150;
+    if (rt_live() != 0) return 160;
+
+    bad = block_check();
+    if (bad != 0) return 170 + bad;
+    if (rt_live() != 0) return 180;
+
+    bad = free_arg_check();
+    if (bad != 0) return 190 + bad;
+    if (rt_live() != 0) return 200;
+
+    bad = deleg_byval_check();
+    if (bad != 0) return 210 + bad;
+    if (rt_live() != 0) return 220;
+
+    bad = contextual_check();
+    if (bad != 0) return 230 + bad;
+    if (rt_live() != 0) return 240;
+
+    bad = short_check();
+    if (bad != 0) return 250 + bad;
+    if (rt_live() != 0) return 260;
+
+    bad = clean_f_returns_check();
+    if (bad != 0) return 270 + bad;
+    if (rt_live() != 0) return 280;
+
+    bad = ternary_check();
+    if (bad != 0) return 290 + bad;
+    if (rt_live() != 0) return 300;
+
+    bad = global_const_free_check();
+    if (bad != 0) return 310 + bad;
+    if (rt_live() != 0) return 320;
+
+    bad = nested_check();
+    if (bad != 0) return 330 + bad;
+    if (rt_live() != 0) return 340;
+
+    bad = manycap_check();
+    if (bad != 0) return 350 + bad;
+    if (rt_live() != 0) return 360;
+
+    return 42;
+}

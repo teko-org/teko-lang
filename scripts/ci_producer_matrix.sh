@@ -56,6 +56,73 @@
 #   seed      the released asset label whose binary RUNS on this runner — NOT always what the leg
 #             produces, so it is a field rather than a derivation the caller can get wrong
 #   produces  the CONTRACT: the asset labels this leg must mint
+#   fixpoint_backend
+#             the backend gen2 and gen3 are built with in `scripts/fixpoint_gate.sh` — `native`
+#             or `c`. THE PLATFORM-SEQUENCING LEVER, and it lives here because the leg table is
+#             where a platform's stage is declared. See the block below.
+#
+# ── THE LEVER: WHICH LEGS GENERATE NATIVE (owner ruling 2026-07-28) ───────────────────────────
+# Owner, 2026-07-28: *"Só tem uma falha, gen2 e gen3 estão emitindo C e não deveriam, reabilite o
+# check de emissão (somente nas pernas Linux), verá que não passará nada."*
+#
+# REFINADO pelo dono em 2026-07-29: *"pode pegar uma perna musl do x86 e uma glibc do arm64 e
+# colocar em c, assim tem duas pernas para cada lado em libc diferentes"*. Passam a ser DUAS as
+# pernas nativas, não quatro, escolhidas para que cada backend cubra os dois arcos E as duas libc:
+#
+#   | perna                | backend  |
+#   |----------------------|----------|
+#   | linux-x86_64-glibc   | native   |
+#   | linux-arm64-musl     | native   |
+#   | linux-x86_64-musl    | c        |
+#   | linux-arm64-glibc    | c        |
+#
+# A régua continua a medir (x86 + arm, glibc + musl) e ganham-se duas pernas verdes que provam o
+# resto do oleoduto — produção de asset, testes, determinismo — que o vermelho total escondia.
+# macOS e Windows carregam `"c"`, porque o plano sequenciado por plataforma
+# (docs/memory/0.3.1-plano-sequenciado-por-plataforma.md) os migra em 0.3.1.1–0.3.1.4 e retira a
+# rota C depois disso.
+#
+# THE RED IS THE PRODUCT, NOT AN ACCIDENT. The native backend does not build the compiler yet —
+# `docs/memory/0.3.1.0-linux-native-first-stop.md` names the stop it reaches today, by address —
+# so the TWO native Linux legs are EXPECTED to fail, and that failure is the honest measurement of
+# how far the native self-build gets. Reduzir de quatro para duas NÃO abranda a régua: as duas que
+# ficam cobrem os dois arcos e as duas libc, logo qualquer divergência entre arco ou entre libc
+# continua a aparecer. The owner asked for it in as many words: *"verá que não passará
+# nada."* It is not to be softened with `continue-on-error`, a narrowed criterion, or files
+# excluded from the emission check; the address it reports IS the deliverable.
+#
+# ── A ESCADA DE VALIDAÇÃO DA ALAVANCA (ruling do dono, 2026-07-29) ────────────────────────────
+# O 2×2 de hoje é o PRIMEIRO de quatro estados, não o estado final. Literal do dono:
+#
+#   *"Assim, quando ambas as 4 pernas percorrerem verdes todo o caminho, inverte o fixpoint, para
+#   garantir, e depois as 4 em c e por último as 4 em native (que fecha o arco e estabiliza tudo)."*
+#
+#   | # | estado                                   | o que prova                                    |
+#   |---|------------------------------------------|------------------------------------------------|
+#   | 1 | 2 native + 2 c (HOJE)                    | a régua mede, e o oleoduto a jusante volta a correr |
+#   | 2 | INVERTER o par                           | o self-host nativo não é específico das pernas escolhidas |
+#   | 3 | as 4 em `c`                              | a rota C não regrediu em lado nenhum com o trabalho nativo |
+#   | 4 | as 4 em `native`                         | fecha o arco e estabiliza                      |
+#
+# O estado 1 avança para o 2 **só quando as quatro pernas percorrerem verdes TODO o caminho** — o
+# que hoje não acontece, porque as duas nativas param no degrau da vez
+# (`docs/memory/0.3.1.0-linux-native-first-stop.md` nomeia-o por endereço).
+#
+# O estado 2 é o passo que a intuição saltaria, e é o que apanha o erro mais caro: se o self-host
+# nativo funcionasse por acidente de arco ou de libc, o 2×2 de hoje NÃO o revelaria — só inverter
+# revela. Não o saltes para chegar mais depressa ao 4.
+#
+# A inversão do estado 2 é: `linux-x86_64-musl` e `linux-arm64-glibc` passam a `"native"`;
+# `linux-x86_64-glibc` e `linux-arm64-musl` passam a `"c"`.
+#
+# TO TURN IT BACK: set the leg's `fixpoint_backend` to `"c"`. Nothing else moves — the emission
+# check is DERIVED from this field inside `fixpoint_gate.sh` (a native generation that emits C is
+# a defect on any leg), so one word per leg is the whole switch, in both directions.
+#
+# WHY A FIELD AND NOT AN `if:` ON THE STEP: `endsWith(matrix.producer, '-musl')`-style predicates
+# already exist in pr.yml for the toolchain install, and every one of them is a place a seventh leg
+# gets forgotten. This table is consumed by pr.yml AND nightly.yml from ONE definition; a stage
+# declared as a field cannot be set for a leg in one workflow and missed in the other.
 #
 # LEG ORDER IS SLOWEST-FIRST. GitHub starts matrix legs in declaration order, so the slowest
 # producer must not queue behind cheap ones — and with one leg per label that ordering matters
@@ -69,16 +136,16 @@ set -eu
 MODE="${1:?usage: ci_producer_matrix.sh <light|full>}"
 
 # The arm64 legs lead: their runner pool is the scarcer one, so they must not queue behind x86_64.
-A_AG='{"producer":"linux-arm64-glibc","os":"ubuntu-24.04-arm","timeout":90,"kind":"linux","seed":"linux-arm64-glibc","produces":"linux-arm64-glibc"}'
-A_AM='{"producer":"linux-arm64-musl","os":"ubuntu-24.04-arm","timeout":90,"kind":"linux","seed":"linux-arm64-glibc","produces":"linux-arm64-musl"}'
-A_XM='{"producer":"linux-x86_64-musl","os":"ubuntu-latest","timeout":90,"kind":"linux","seed":"linux-x86_64-glibc","produces":"linux-x86_64-musl"}'
-A_WX='{"producer":"windows-x86_64","os":"windows-latest","timeout":90,"kind":"native","seed":"windows-x86_64","produces":"windows-x86_64"}'
-A_MAC='{"producer":"macos-arm64","os":"macos-latest","timeout":60,"kind":"native","seed":"macos-arm64","produces":"macos-arm64"}'
+A_AG='{"producer":"linux-arm64-glibc","os":"ubuntu-24.04-arm","timeout":90,"kind":"linux","seed":"linux-arm64-glibc","produces":"linux-arm64-glibc","fixpoint_backend":"c"}'
+A_AM='{"producer":"linux-arm64-musl","os":"ubuntu-24.04-arm","timeout":90,"kind":"linux","seed":"linux-arm64-glibc","produces":"linux-arm64-musl","fixpoint_backend":"native"}'
+A_XM='{"producer":"linux-x86_64-musl","os":"ubuntu-latest","timeout":90,"kind":"linux","seed":"linux-x86_64-glibc","produces":"linux-x86_64-musl","fixpoint_backend":"c"}'
+A_WX='{"producer":"windows-x86_64","os":"windows-latest","timeout":90,"kind":"native","seed":"windows-x86_64","produces":"windows-x86_64","fixpoint_backend":"native"}'
+A_MAC='{"producer":"macos-arm64","os":"macos-latest","timeout":60,"kind":"native","seed":"macos-arm64","produces":"macos-arm64","fixpoint_backend":"native"}'
 
 # linux-x86_64-glibc is declared in both tiers and is the ONLY Linux leg on light: it is the asset
-# every fixed-name consumer downloads (the wasm regressor, mem-paranoid), so a light run without
+# every fixed-name consumer downloads (the fail-closed regressor, mem-paranoid), so a light run without
 # it would leave those lanes with nothing to fetch.
-A_XG='{"producer":"linux-x86_64-glibc","os":"ubuntu-latest","timeout":90,"kind":"linux","seed":"linux-x86_64-glibc","produces":"linux-x86_64-glibc"}'
+A_XG='{"producer":"linux-x86_64-glibc","os":"ubuntu-latest","timeout":90,"kind":"linux","seed":"linux-x86_64-glibc","produces":"linux-x86_64-glibc","fixpoint_backend":"native"}'
 
 case "$MODE" in
     full)

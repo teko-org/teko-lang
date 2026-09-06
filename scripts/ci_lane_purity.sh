@@ -1,6 +1,5 @@
 #!/usr/bin/env sh
-# scripts/ci_lane_purity.sh — prove that the artifact lane is the ONLY lane that builds, and that
-# zig is dead.
+# scripts/ci_lane_purity.sh — prove that only the producer legs build, and that zig is dead.
 #
 # ── WHY THIS IS A GATE STEP AND NOT A ONE-OFF AUDIT ───────────────────────────────────────────
 # The owner's ruling of 2026-07-26 — "todas as lanes de pull_request precisam depender dessa lane
@@ -11,10 +10,19 @@
 # a check: any job that reaches for the seed, the ladder or a cross toolchain fails the gate that
 # runs it.
 #
+# THE ALLOWED SET IS NOW SIX JOBS, NOT ONE (2026-07-29). There used to be a single `artifact` job
+# — a matrix over every producer leg — so "only the root builds" meant "only that one job name may
+# call these scripts". Owner correction, 2026-07-29: the matrix was removed (see pr.yml's header)
+# so that a red leg stops only its own chain instead of hiding behind a shared aggregate result.
+# Each producer leg is now its own job, `artifact-<label>`, and ALL SIX of them legitimately call
+# these scripts — so the allowed set passed to this script is the six job names, space-separated
+# in one shell word. `check_token`'s membership test already worked on a SET (`case " $allowed "
+# in *" $job "*`) before this wagon; only the caller's single name became six.
+#
 # ── WHAT IS FORBIDDEN, AND WHERE ──────────────────────────────────────────────────────────────
-#   produce_assets             the SHARED PRODUCTION PATH   — artifact root only
-#   build_with_seed_fallback   the LADDER                   — artifact root only
-#   ci_provision_teko          the SEED                     — artifact root only (+ exceptions)
+#   produce_assets             the SHARED PRODUCTION PATH   — a producer leg only
+#   build_with_seed_fallback   the LADDER                   — a producer leg only
+#   ci_provision_teko          the SEED                     — a producer leg only (+ exceptions)
 #   cross_compile_linux        the deleted cross script     — nowhere
 #   zig                        the deleted toolchain        — nowhere, in ANY workflow or script
 #
@@ -22,7 +30,7 @@
 # extracted into scripts/produce_assets.sh so that pr.yml and nightly.yml could share one
 # production path, the older two tokens stopped appearing in pr.yml at all — and a check that only
 # looked for them would have started passing for the wrong reason. Guarding the new name keeps the
-# law exactly as strong as it was: whatever the root does to build, no other lane may do.
+# law exactly as strong as it was: whatever a producer leg does to build, no other lane may do.
 #
 # The zig sweep is deliberately wider than this workflow: the owner's order was "O zig deve morrer
 # agora, imediatamente, sem espera, assim que entregar a carga, já deve estar morto", so the check
@@ -31,7 +39,7 @@
 #
 # ── COMMENTS ARE STRIPPED, AND THAT IS LOAD-BEARING ───────────────────────────────────────────
 # Every one of these tokens must remain WRITEABLE in prose — the files explain at length why zig
-# died and why only the root may seed, and a check that forbade the words would forbid the
+# died and why only a producer leg may seed, and a check that forbade the words would forbid the
 # explanation. So full-line comments (`#` as the first non-blank character) are removed before
 # scanning. The consequence, stated so nobody trips on it: a forbidden token in a TRAILING comment
 # on a line of code is NOT stripped and will fail the check. Put the explanation on its own line.
@@ -41,13 +49,15 @@
 # reviewable, single-line admission — the opposite of a silent carve-out in the checker. An
 # UNDECLARED violation fails; a declared one is printed on every run so it cannot be forgotten.
 #
-# Usage:  ci_lane_purity.sh <workflow.yml> <root-job> [exceptions-file] [scan-dir…]
+# Usage:  ci_lane_purity.sh <workflow.yml> "<allowed-job>…" [exceptions-file] [scan-dir…]
+#   <allowed-job>…  ONE argument: the job names allowed to build, space-separated (quote it as a
+#                   single shell word) — the six `artifact-<label>` jobs today.
 #
 # POSIX sh + awk only.
 set -eu
 
-WF="${1:?usage: ci_lane_purity.sh <workflow.yml> <root-job> [exceptions] [scan-dir...]}"
-ROOT="${2:?missing root-job}"
+WF="${1:?usage: ci_lane_purity.sh <workflow.yml> \"<allowed-job>...\" [exceptions] [scan-dir...]}"
+ROOT="${2:?missing allowed-job(s)}"
 EXC="${3:-.github/ci-lane-exceptions.txt}"
 # `shift 3` on a 2-argument call is an ERROR IN A SPECIAL BUILTIN, which POSIX says terminates a
 # non-interactive shell — `|| true` does not save it (measured: exit 2, no output). Guard on `$#`
@@ -95,13 +105,13 @@ check_token() {
     printf '%s\n' "$hits" | while IFS="$(printf '\t')" read -r job line text; do
         [ -n "$job" ] || continue
         case " $allowed " in
-            *" $job "*) echo "  ok   $job:$line uses '$tok' (the root may)"; continue ;;
+            *" $job "*) echo "  ok   $job:$line uses '$tok' (an allowed producer leg)"; continue ;;
         esac
         if grep -qx "$job $tok" "$TMP/exc"; then
             echo "  DECL $job:$line uses '$tok' — declared exception in $EXC"
             continue
         fi
-        echo "ERROR: $WF job '$job' line $line reaches for '$tok' outside the artifact root:" >&2
+        echo "ERROR: $WF job '$job' line $line reaches for '$tok' outside the producer legs:" >&2
         printf '       %s\n' "$text" >&2
         echo "VIOLATION" >> "$TMP/violations"
     done
@@ -148,4 +158,4 @@ if [ "$FAILED" = "1" ]; then
     echo "ci_lane_purity FAILED."
     exit 1
 fi
-echo "ci_lane_purity OK — only '$ROOT' seeds and builds; zig is gone."
+echo "ci_lane_purity OK — only the producer legs ($ROOT) seed and build; zig is gone."

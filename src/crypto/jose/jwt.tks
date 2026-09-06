@@ -1,0 +1,76 @@
+use teko::crypto
+use teko::encoding::json
+
+/**
+ * Signs `claims_json` under `alg`/`key` as a JWT: a JWS whose protected header adds
+ * `"typ":"JWT"` (RFC 7519 §5.1) and whose payload is `claims_json`'s raw UTF-8 bytes.
+ */
+exp fn jwt_sign(alg: JwsAlg, key: @JoseKey(), claims_json: str): str | crypto::CryptoError {
+    var keys: []str = ["typ"]
+    var values: []@JsonValue() = [json::JsonString { value = "JWT" }]
+    jws_sign(alg, key, json::JsonObject { keys = keys; values = values }, claims_json.bytes())
+}
+
+/**
+ * Verifies a JWT and returns its claims as JSON text: delegates entirely to `jws_verify` (the
+ * `"typ"` header is not itself re-checked — RFC 7519 §5.1 marks it as merely RECOMMENDED, and
+ * every failure mode `jws_verify` already reports as a `CryptoError` covers the security-relevant
+ * checks).
+ */
+exp fn jwt_verify(key: @JoseKey(), token: str): str | crypto::CryptoError {
+    var payload = match jws_verify(key, token) {
+        []byte as b => b
+        crypto::CryptoError as e => return e
+    }
+    match str_from_utf8(payload) {
+        str as s => s
+        error => crypto::crypto_error("jwt: claims payload is not valid UTF-8")
+    }
+}
+
+fn jwt_parse_claims(claims_json: str): json::JsonObject | crypto::CryptoError {
+    var v = match json::decode(claims_json) {
+        (@JsonValue()) as x => x
+        error => return crypto::crypto_error("jwt: claims is not valid JSON")
+    }
+    match v {
+        json::JsonObject as o => o
+        _ => crypto::crypto_error("jwt: claims is not a JSON object")
+    }
+}
+
+/**
+ * The string value of claim `name` (e.g. `"sub"`, `"iss"`) in `claims_json`.
+ */
+exp fn jwt_claim_str(claims_json: str, name: str): str | crypto::CryptoError {
+    var obj = match jwt_parse_claims(claims_json) {
+        json::JsonObject as o => o
+        crypto::CryptoError as e => return e
+    }
+    match json::object_get(obj, name) {
+        (@JsonValue()) as v => match v {
+            json::JsonString as s => s.value
+            _ => crypto::crypto_error(concat("jwt: claim '", name, "' is not a string"))
+        }
+        null => crypto::crypto_error(concat("jwt: missing claim '", name, "'"))
+    }
+}
+
+/**
+ * The numeric value of claim `name` (e.g. `"exp"`, `"iat"`, both RFC 7519 `NumericDate` — seconds
+ * since the Unix epoch, RFC 7519 §2) in `claims_json`. This unit never reads the current time
+ * itself; a caller validating `exp`/`nbf` compares this value against a time it supplies.
+ */
+exp fn jwt_claim_number(claims_json: str, name: str): f64 | crypto::CryptoError {
+    var obj = match jwt_parse_claims(claims_json) {
+        json::JsonObject as o => o
+        crypto::CryptoError as e => return e
+    }
+    match json::object_get(obj, name) {
+        (@JsonValue()) as v => match v {
+            json::JsonNumber as n => n.value
+            _ => crypto::crypto_error(concat("jwt: claim '", name, "' is not a number"))
+        }
+        null => crypto::crypto_error(concat("jwt: missing claim '", name, "'"))
+    }
+}

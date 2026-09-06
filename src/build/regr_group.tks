@@ -1,230 +1,55 @@
-/**
- * src/build/regr_group.tks   (namespace `teko::build`)
- *
- * GROUPED REGRESSION BUILDS — one build per PROJECT-and-configuration, not one per scenario (owner
- * ruling 2026-07-25): *"Pq um build por cenário se todos os cenários em um tkr (ou mais) estão
- * dentro de um único projeto (tkp)? … poderia executar estes builds ANTES de qualquer teste começar
- * … cada regressão deve pertencer a um único tkp, mas um tkp pode ter vários tkr. Logo, se tenho 10
- * tkr em um único tkp, somente um build é necessário."*
- *
- * WHAT THE RULING COSTS TO HONOUR. A `Given source inline` scenario is not a file in a project — it
- * is a program the runner SYNTHESIZES a scratch project around (`compile_snippet_text`). Two hundred
- * of those synthesized projects are two hundred front-end start-ups and two hundred `cc` runs for
- * programs whose largest is nine lines: on the .31 corpus that is 70% of the whole regression
- * phase's wall time. Folding them into ONE project is therefore the ruling's whole point, and the
- * fold has exactly three obligations, none of them negotiable:
- *
- *   1. every scenario still COMPILES for real, RUNS for real, and has its exit/stdout/stderr checked
- *      for real — the fold may not weaken a single assertion;
- *   2. two snippets that declare the same bare `Point` may not collide — each snippet gets its OWN
- *      NAMESPACE (`src/m<k>/body.tks` → `<project>::m<k>`, the directory-is-namespace rule of
- *      `discover`), which is the language's own answer to that collision (`di_same_name_cross_ns`
- *      proves it end-to-end for classes, interfaces and DI providers alike);
- *   3. a scenario whose BUILD CONFIGURATION differs (`Given target`, `Given env`)
- *      may not share a build with one that does not — the group key IS the child env plus the
- *      target, so a differing configuration is a different group by construction.
- *
- * WHAT IS DELIBERATELY NOT GROUPED, and why (each is measured, not assumed — see the report in the
- * lane's own notes):
- *
- *   - a `compilation fails` scenario. Its build MUST fail; a group containing it could never build,
- *     so it keeps one build each. This is inevitable, not a gap.
- *   - a `Then object well-formed` / `Then module valid` scenario. The leaf tool inspects the emitted
- *     `<binary>.o` / `.wasm` — in a group that artifact is the WHOLE group's, so the check would no
- *     longer be about the scenario that declared it. Grouping it would silently change what is
- *     checked, which is worse than the build it saves.
- *   - a scenario the host cannot build at all (`target_toolchain_skip_reason`) — it is honest-skipped
- *     BEFORE any build, so it has no build to save.
- *   - a project-based (`.tkp`-on-disk) scenario — those already share one build per `.tkr` file
- *     (`RegrBuilt`), which is what the ruling asks for, already true since 0.3.0.30.
- *   - a snippet whose top-level statements contain a `return` (`snippet_stmts_have_return`) — in the
- *     virtual main a top-level `return e` sets the EXIT CODE, and inside the `entry()` function the
- *     fold moves those statements into it would return a value from a `void` function. One scenario
- *     of the .31 corpus.
- *   - a scenario built by the OWN (native) backend, UNLESS its group is SOLO — that backend cannot
- *     lower a dispatcher, so it may share a build only with rows carrying the byte-identical
- *     source, which is emitted verbatim with no dispatcher at all (`regr_group_solo`,
- *     `regr_group_lone_source`).
- *
- * WHY A CONFIGURATION CAN STILL NEED SEVERAL BUILDS (`regr_group_for_row`). Namespaces answer the
- * bare-name collision for everything the language resolves canonically — the `di_same_name_cross_ns`
- * regressor proves it for classes, interfaces, methods and DI providers alike. They do NOT answer it
- * everywhere, and folding the .31 corpus found three passes where they do not, each REPRODUCED down
- * to a two-module project:
- *
- *   - the STRUCTURAL-TRAIT SYNTHESIZER (`src/checker/synth.tks`) resolves a derived type's field
- *     types by BARE name. `type Inner = struct Eq & Ord & …` folded beside an unrelated `type Inner
- *     = struct { f: Op | null }` from another namespace makes the `Eq` synthesis walk the WRONG
- *     `Inner` and stop with "structural trait `Eq` cannot derive over field `f`";
- *   - a top-level `const` resolves by bare name: `const B: byte = 5` folded beside `const B: i64 =
- *     A + 1` makes `B to i64` read as a no-op and earns the cast-hygiene D1 rejection;
- *   - a top-level `fn` PASSED AS A VALUE resolves by bare name: `fold(…, add)` folded beside three
- *     other members' `add` picks one of theirs and fails on the argument type.
- *
- * All three are the defect class issues #284/#290 fixed for DI, still open elsewhere — COMPILER bugs,
- * reported up, not worked around in the compiler from here. What this module does instead is refuse
- * to CREATE the collision: a configuration's rows are packed into as many groups as it takes for no
- * two members of one group to declare the same bare TOP-LEVEL name. The packing is greedy and
- * first-fit, and on the .31 corpus it turns one 203-row configuration into eleven builds instead of
- * 203 — while making the fold immune to any other bare-name-keyed pass, not just these three.
- *
- * THE FALLBACK IS THE SAFETY PROOF. A grouped build is a pure OPTIMISATION: when it succeeds, its
- * members run from the group binary; when it FAILS for any reason at all, every member silently
- * reverts to its own scratch-project build (`tkr_ensure_artifact`, the pre-grouping path) and the
- * gate is byte-for-byte what it was before. That is what makes the tail classification below safe to
- * be a heuristic: BOTH ways of getting it wrong are compile errors, never wrong answers, and a
- * compile error costs only the speed-up.
- */
 
-/**
- * REGR_GROUP_PROJECT_NAME — the canonical root name every generated group project is stamped with.
- * Fixed rather than derived, so the built binary's path (`<dir>/bin/<name>`) is known to the runner
- * without re-parsing the synthesized `.tkp` — the same reason `SNIPPET_PROJECT_NAME` is fixed.
- */
 const REGR_GROUP_PROJECT_NAME: str = "regrgroup"
 
-/**
- * REGR_GROUP_ENTRY_VAR — the environment-variable key the group binary reads to learn WHICH member
- * scenario to run. An environment variable and NOT an argv slot: a scenario's `Given args` are its
- * own fold-opaque operands, and shifting them by one to make room for a selector would change what
- * every `args`-reading fixture observes.
- */
 const REGR_GROUP_ENTRY_VAR: str = "TEKO_REGR_ENTRY"
 
-/**
- * REGR_GROUP_UNKNOWN_ENTRY_EXIT — the exit status the group binary's dispatcher takes when the
- * selector names no member. It cannot happen in a correct run (the runner sets the selector from the
- * very plan that generated the dispatcher), so its whole job is to be LOUD if it ever does: the row
- * fails with this code against whatever it expected, and the dispatcher names the missing entry on
- * stderr. Silence here would let a mis-mapped scenario report the previous member's result.
- */
 const REGR_GROUP_UNKNOWN_ENTRY_EXIT: i32 = 97
 
-/**
- * REGR_GROUP_MIN_MEMBERS — how many rows a group must hold before it is worth generating. A group of
- * ONE is the per-scenario build it replaces, plus a generated project and a dispatcher: strictly
- * more machinery for exactly the same build count. Below this bound the rows stay on the ordinary
- * per-scenario path.
- */
 const REGR_GROUP_MIN_MEMBERS: u64 = 2
 
-/**
- * REGR_GROUP_KEY_SEP — the separator joining a group key's parts (the target and each env token).
- * A newline, because an env token is `K=V` and a target is an os-arch name — neither may contain
- * one, so no two distinct configurations can ever collide into one key.
- */
 const REGR_GROUP_KEY_SEP: str = "\n"
 
-/**
- * RegrGroupSpec — the BUILD CONFIGURATION shared by every member of one group: the per-scenario
- * child env (`Given env`/`Given target` already lowered to `K=V` tokens) and the
- * declared target. Two rows may share a build exactly when both match.
- */
 pub type RegrGroupSpec = struct {
-    /** the child env every member of this group compiles under (`K=V` tokens). */
     env: []str
-    /** the declared os-arch target ("" / `HOST_TARGET` → the build host's own). */
     target: str
 }
 
-/**
- * RegrGroupMember — the binding of ONE scenario row to its slot inside a grouped build: the row's
- * scratch-prefix `key` (the runner computes the identical string for the same row when it runs it —
- * see `regr_group_slot`), the `group` it belongs to, the `module` namespace its snippet was written
- * into, and the snippet `source` itself.
- */
 pub type RegrGroupMember = struct {
-    /** the row's scratch-file prefix — its identity, shared by the plan pass and the run pass. */
     key: str
-    /** the index of the group this row belongs to (into `RegrGroupPlan.specs`). */
     group: u64
-    /** the namespace segment this row's snippet was written into (`m<k>`). */
     module: str
-    /**
-     * the snippet source this row CONTRIBUTES to its group — or "" when an earlier member of the
-     * same group already contributed the byte-identical source and this row simply reuses its
-     * module. The reuse is what keeps a `Scenario Outline` whose placeholders appear only in
-     * `args`/`Then` (its fifteen rows share one program) from claiming fifteen modules and
-     * colliding with itself fifteen ways.
-     */
     source: str
 }
 
-/**
- * RegrGroupPlan — the whole plan: one entry per GROUP (a build configuration plus a name-collision-
- * free set of members, so one configuration may appear in several entries), and every row assigned
- * to one of them.
- */
 pub type RegrGroupPlan = struct {
-    /** each group's build configuration, in first-appearance order (a configuration may repeat). */
     specs: []RegrGroupSpec
-    /** every groupable row, in walk order. */
     members: []RegrGroupMember
 }
 
-/**
- * RegrGroupBuild — the outcome of building ONE group: whether it built (`ok`), the artifact its
- * members run, and what the build cost. A group that did NOT build is not an error — its members
- * fall back to their own per-scenario builds — so `ok = false` carries no verdict, only a lost
- * speed-up.
- */
 pub type RegrGroupBuild = struct {
-    /** true when the group project compiled and its members may run from `binp`. */
     ok: bool
-    /** the built artifact every member runs (target-resolved — a wasm group yields the module). */
     binp: str
-    /** how many rows this group covers (the report's "scenarios" column). */
     members: u64
-    /** the build's own three-phase measurement (one build, whatever it cost). */
     times: PhaseTimes
 }
 
-/**
- * RegrGroups — the resolved grouping the runner consults per row: the member bindings and the
- * per-group build outcomes, together. Empty (`members = []`) when nothing was grouped, in which case
- * every lookup misses and the runner behaves exactly as it did before grouping existed.
- */
 pub type RegrGroups = struct {
-    /** every groupable row's binding. */
     members: []RegrGroupMember
-    /** the per-group build outcomes, indexed by `RegrGroupMember.group`. */
     builds: []RegrGroupBuild
 }
 
-/**
- * RegrGroupSlot — what a row needs to run from a grouped build instead of building its own: the
- * artifact, and the selector naming its own entry inside it.
- */
 pub type RegrGroupSlot = struct {
-    /** the group artifact this row runs. */
     binp: str
-    /** the value of `REGR_GROUP_ENTRY_VAR` that selects this row's snippet. */
     module: str
 }
 
-/**
- * regr_groups_empty — the grouping that groups nothing. The identity the runner uses when planning
- * found no eligible row, so the "is this row grouped?" question has exactly one answer path.
- *
- * @return an empty grouping (every lookup misses)
- */
-pub fn regr_groups_empty() -> RegrGroups {
-    RegrGroups { members = teko::list::empty(); builds = teko::list::empty() }
+pub fn regr_groups_empty(): RegrGroups {
+    RegrGroups { members = []; builds = [] }
 }
 
-/**
- * regr_group_key — the key two rows must share to share one build: the declared target followed by
- * every child-env token, joined by `REGR_GROUP_KEY_SEP`. Keying on the WHOLE env (rather than on the
- * `TEKO_BACKEND`/`TEKO_TARGET` tokens the runner happens to know about) is the conservative choice
- * and the honest one: an arbitrary `Given env` token may or may not reach the compiler, and a key
- * that guessed wrong would silently share a build between two differently-configured scenarios.
- *
- * @param t  the lowered row
- * @return   the row's build-configuration key
- */
-fn regr_group_key(t: Tkr) -> str {
-    mut key = t.target
-    mut i: u64 = 0
+fn regr_group_key(t: Tkr): str {
+    var key = t.target
+    var i: u64 = 0
     loop {
         if i >= t.env.len { break }
         key = key ~ REGR_GROUP_KEY_SEP ~ t.env[i]
@@ -233,59 +58,24 @@ fn regr_group_key(t: Tkr) -> str {
     key
 }
 
-/**
- * snippet_tail_is_value — does a snippet's LAST top-level statement supply the program's EXIT CODE?
- *
- * The virtual-main rule (#423/#382, `lower_main_tail_stmt`) is that the last loose top-level
- * statement, when it is a NON-VOID expression, IS the exit code — so `total()` at the end of a
- * snippet means "exit with what `total()` returned", while `exit(0)` or `if bad() != 0 { exit(1) }`
- * are void statements that fall through to exit 0. A grouped snippet's statements move into a
- * function body, where that rule does not apply, so the value tail must be made explicit
- * (`exit(<tail>)`) and the void tail must be left alone.
- *
- * This is a SYNTACTIC classification, and it is allowed to be one because both ways of being wrong
- * are COMPILE ERRORS, never wrong answers: a value tail left bare in a `void` function is rejected
- * ("the function's final expression does not match its declared return type"), and a void tail
- * wrapped in `exit(…)` is rejected for passing `void` to it. Either rejection fails the GROUP build,
- * which drops every member back to its own per-scenario build — the pre-grouping behaviour, green
- * and merely slower.
- *
- * @param tail  the snippet's last top-level statement chunk
- * @return      true when the chunk is an expression whose value is the exit code
- */
-fn snippet_tail_is_value(tail: str) -> bool {
-    let t = tkr_trim(tail)
+fn snippet_tail_is_value(tail: str): bool {
+    var t = tkr_trim(tail)
     if t.len == 0 { return false }
     if mf_starts_with(t, "exit(") || mf_starts_with(t, "panic(") { return false }
-    if mf_starts_with(t, "let ") || mf_starts_with(t, "mut ") { return false }
     if mf_starts_with(t, "if ") || mf_starts_with(t, "match ") { return false }
     if mf_starts_with(t, "loop") || mf_starts_with(t, "for ") || mf_starts_with(t, "while ") { return false }
     if mf_starts_with(t, "defer") || mf_starts_with(t, "adopt") || mf_starts_with(t, "#") { return false }
     !snippet_tail_is_assignment(t)
 }
 
-/**
- * snippet_tail_is_assignment — is `t` an ASSIGNMENT statement (`x = e`, `p.f = e`, `xs[i] = e`, or a
- * compound `+=`-family form)? An assignment is void, so it must not be wrapped in `exit(…)` — and it
- * is the one void shape that opens with an ordinary expression instead of a keyword, so
- * `snippet_tail_is_value`'s keyword tests cannot see it.
- *
- * Detects the FIRST line's first `=` at bracket depth 0 that is not part of a comparison (`==`,
- * `!=`, `<=`, `>=`) nor of a match arrow (`=>`), skipping string/char literals. Depth 0 is what
- * makes `exit(x = 1)`-shaped false positives impossible and what keeps a keyword-argument-looking
- * `f(a = 1)` (were the language to grow one) out of the answer.
- *
- * @param t  the trimmed tail chunk
- * @return   true when the chunk's first line is an assignment
- */
-fn snippet_tail_is_assignment(t: str) -> bool {
-    mut depth: i64 = 0
-    mut open = false
-    mut quote: byte = b'"'
-    mut k: u64 = 0
+fn snippet_tail_is_assignment(t: str): bool {
+    var depth: i64 = 0
+    var open = false
+    var quote: byte = b'"'
+    var k: u64 = 0
     loop {
         if k >= t.len { break }
-        let c = t[k]
+        var c = t[k]
         if c == b'\n' { break }
         if open {
             if c == b'\\' { k = k + 2; continue }
@@ -297,10 +87,10 @@ fn snippet_tail_is_assignment(t: str) -> bool {
         if c == b'(' || c == b'[' || c == b'{' { depth = depth + 1; k = k + 1; continue }
         if c == b')' || c == b']' || c == b'}' { depth = depth - 1; k = k + 1; continue }
         if c == b'=' && depth == 0 {
-            let prev = if k > 0 { t[k - 1] } else { b' ' }
-            let next = if k + 1 < t.len { t[k + 1] } else { b' ' }
-            let is_cmp = prev == b'=' || prev == b'!' || prev == b'<' || prev == b'>' || next == b'='
-            let is_arrow = next == b'>'
+            var prev = if k > 0 { t[k - 1] } else { b' ' }
+            var next = if k + 1 < t.len { t[k + 1] } else { b' ' }
+            var is_cmp = prev == b'=' || prev == b'!' || prev == b'<' || prev == b'>' || next == b'='
+            var is_arrow = next == b'>'
             if !is_cmp && !is_arrow { return true }
         }
         k = k + 1
@@ -308,28 +98,13 @@ fn snippet_tail_is_assignment(t: str) -> bool {
     false
 }
 
-/**
- * snippet_stmts_have_return — does the snippet's STATEMENT half contain a `return` keyword anywhere?
- * Such a snippet is refused by the fold: in the virtual main a top-level `return e` SETS THE EXIT
- * CODE, while inside the `void entry()` the fold moves those statements into, the very same `return
- * e` returns a value from a void function and is rejected. Rewriting it would mean deciding, per
- * `return`, whether it exits the program or a nested lambda — a judgement this module has no way to
- * make from source text, and one build is not worth guessing at.
- *
- * The scan is a WORD scan outside string/char literals, so `"return"` inside a literal never counts.
- * A `return` inside a COMMENT does count — that only ever costs the snippet its fold, never a wrong
- * answer, and the cheap conservative reading is the right trade here.
- *
- * @param stmts  the snippet's statement half (`SnippetSplit.stmts`)
- * @return       true when a `return` keyword appears in it
- */
-fn snippet_stmts_have_return(stmts: str) -> bool {
-    mut open = false
-    mut quote: byte = b'"'
-    mut k: u64 = 0
+fn snippet_stmts_have_return(stmts: str): bool {
+    var open = false
+    var quote: byte = b'"'
+    var k: u64 = 0
     loop {
         if k >= stmts.len { break }
-        let c = stmts[k]
+        var c = stmts[k]
         if open {
             if c == b'\\' { k = k + 2; continue }
             if c == quote { open = false }
@@ -343,45 +118,21 @@ fn snippet_stmts_have_return(stmts: str) -> bool {
     false
 }
 
-/**
- * snippet_word_at — does `word` occur in `s` at `at` as a WHOLE identifier — neither preceded nor
- * followed by an identifier byte? The keyword test behind `snippet_stmts_have_return`, so
- * `returned_value` is not mistaken for a `return`.
- *
- * @param s     the text
- * @param at    the candidate start offset
- * @param word  the keyword to match
- * @return      true when `word` sits at `at` on identifier boundaries
- */
-fn snippet_word_at(s: str, at: u64, word: str) -> bool {
+fn snippet_word_at(s: str, at: u64, word: str): bool {
     if at + word.len > s.len { return false }
-    if teko::str::slice(s, at, at + word.len) != word { return false }
+    if s.slice(at, at + word.len) != word { return false }
     if at > 0 && snippet_is_ident_byte(s[at - 1]) { return false }
-    let after = at + word.len
+    var after = at + word.len
     if after < s.len && snippet_is_ident_byte(s[after]) { return false }
     true
 }
 
-/**
- * snippet_is_ident_byte — is `c` a byte an identifier may contain (letter, digit, `_`)? The
- * word-boundary predicate.
- *
- * @param c  the byte
- * @return   true for a letter, a digit or `_`
- */
-fn snippet_is_ident_byte(c: byte) -> bool {
+fn snippet_is_ident_byte(c: byte): bool {
     is_ascii_alpha(c) || (c >= b'0' && c <= b'9') || c == b'_'
 }
 
-/**
- * regr_env_has — does `env` carry the exact `K=V` token `tok`?
- *
- * @param env  the row's child env
- * @param tok  the token to look for
- * @return     true when present
- */
-fn regr_env_has(env: []str, tok: str) -> bool {
-    mut i: u64 = 0
+fn regr_env_has(env: []str, tok: str): bool {
+    var i: u64 = 0
     loop {
         if i >= env.len { break }
         if env[i] == tok { return true }
@@ -390,68 +141,24 @@ fn regr_env_has(env: []str, tok: str) -> bool {
     false
 }
 
-/**
- * regr_group_module_text — the generated module file for ONE member snippet: its top-level
- * DECLARATIONS verbatim, then its top-level STATEMENTS wrapped in `pub fn entry()`.
- *
- * Declarations and statements land in the SAME file (and therefore the same namespace), which is
- * strictly better than the ungrouped shape's `main.tks` + `src/regr_decls.tks` split — a snippet's
- * statements go on seeing its own declarations unqualified, while another member's same-named
- * declaration is a different namespace entirely.
- *
- * @param src_text  the member's inline snippet source
- * @return          the module file's whole text
- */
-fn regr_group_module_text(src_text: str) -> str {
-    let split = split_snippet_decls_and_stmts(src_text)
-    let head = teko::str::slice(split.stmts, 0, split.stmts.len - split.tail.len)
-    let tail = tkr_trim(split.tail)
-    let body = if snippet_tail_is_value(tail) { head ~ "exit(" ~ tail ~ ")\n" } else { head ~ tail ~ "\n" }
+fn regr_group_module_text(src_text: str): str {
+    var split = split_snippet_decls_and_stmts(src_text)
+    var head = split.stmts.slice(0, split.stmts.len - split.tail.len)
+    var tail = tkr_trim(split.tail)
+    var body = if snippet_tail_is_value(tail) { head ~ "exit(" ~ tail ~ ")\n" } else { head ~ tail ~ "\n" }
     split.decls ~ "\n/** The scenario body this group member runs. */\npub fn entry() {\n" ~ body ~ "}\n"
 }
 
-/**
- * regr_group_manifest_text — the generated `.tkp` of a group project: a `binary` artifact named
- * `REGR_GROUP_PROJECT_NAME` rooted at `src`, so every `src/m<k>/` directory becomes its own
- * namespace (`discover`'s directory rule) and the generated `main.tks` at the project root stays the
- * virtual-main entry.
- *
- * @return the `.tkp` text
- */
-fn regr_group_manifest_text() -> str {
+fn regr_group_manifest_text(): str {
     "name = \"" ~ REGR_GROUP_PROJECT_NAME ~ "\"\nsource = \"src\"\n\n[artifact]\nkind = \"binary\"\n"
 }
 
-/**
- * regr_group_dispatch_line — the generated `main.tks` line that routes the selector to ONE member's
- * `entry()`. `hit` is set BEFORE the call so an entry that DIVERGES (`exit(…)`, the common case)
- * and one that FALLS THROUGH are handled by the same line.
- *
- * @param module  the member's namespace segment
- * @return        the dispatcher line
- */
-fn regr_group_dispatch_line(module: str) -> str {
+fn regr_group_dispatch_line(module: str): str {
     $"if regr_entry == \"{module}\" {{ regr_hit = true; {module}::entry() }}\n"
 }
 
-/**
- * regr_group_main_text — the generated `main.tks` of a group project: read the selector, run the
- * member it names, and end.
- *
- * The two exits are the whole contract. Falling off the end of the selected `entry()` is a snippet
- * whose own virtual main fell through, which exits 0 — so the dispatcher's last statement is
- * `exit(0)`. A selector naming NO member cannot happen (the runner sets it from this very plan) and
- * therefore must be loud if it ever does: it names the missing entry on stderr and takes
- * `REGR_GROUP_UNKNOWN_ENTRY_EXIT`, which the row then reports as an exit mismatch.
- *
- * The dispatcher deliberately contains no unreachable statement: from the compiler's view every
- * `entry()` may return, so the trailing `exit(0)` is a reachable end, not dead code.
- *
- * @param dispatch  the concatenated per-member dispatcher lines
- * @return          the `main.tks` text
- */
-fn regr_group_main_text(dispatch: str) -> str {
-    mut out = $"let regr_entry = match teko::env::var(\"{REGR_GROUP_ENTRY_VAR}\") {{ str as v => v; error => \"\" }}\n"
+fn regr_group_main_text(dispatch: str): str {
+    var out = $"let regr_entry = match teko::env::var(\"{REGR_GROUP_ENTRY_VAR}\") {{ str as v => v; error => \"\" }}\n"
     out = out ~ "mut regr_hit = false\n"
     out = out ~ dispatch
     out = out ~ "if !regr_hit {\n"
@@ -462,145 +169,81 @@ fn regr_group_main_text(dispatch: str) -> str {
     out
 }
 
-/**
- * regr_row_source — the SNIPPET TEXT a row contributes to a group, whichever way the row spells it:
- * the `Given source inline` body, or the contents of the `Given source = "<file>"` file resolved
- * against `regr_dir`. "" when the row carries neither (a project-based row) or when the named file
- * cannot be read.
- *
- * A file-based row folds exactly like an inline one, and it HAS to: since the owner banned inline
- * code in a `.tkr` ("está proibido inline code em tkr"), a `.tkr` can only name its snippet as a
- * file — so a fold that only understood `source_inline` would have quietly charged one build per
- * scenario for the whole corpus, which is the cost the fold exists to remove. Measured on the .31
- * corpus at the moment the ban landed: the F5 backend-differential rows alone went from 2 grouped
- * builds to 30 individual ones until this function existed.
- *
- * An unreadable file is NOT an error here: the ordinary run reports a missing `Given source` as the
- * manifest error it is, and planning must never be the thing that reports it (the same rule
- * `regr_plan_file` follows for an unparseable `.tkr`).
- *
- * @param regr_dir  the directory the row's `.tkr` lives in (a `Given source` is relative to it)
- * @param t         the lowered row
- * @return          the snippet text, or "" when the row has none
- */
-fn regr_row_source(regr_dir: str, t: Tkr) -> str {
+fn regr_row_source(regr_dir: str, t: Tkr): str {
     if t.source_inline.len > 0 { return t.source_inline }
     if t.source_file.len == 0 { return "" }
     match teko::io::read_file(regr_dir ~ "/" ~ t.source_file) { str as s => s; error => "" }
 }
 
-/**
- * regr_row_groupable — may this row share a build with the other rows of its configuration? Every
- * exclusion is stated (and argued) in this file's header; the order here is cheapest-test-first.
- *
- * @param regr_dir  the directory the row's `.tkr` lives in (to resolve a `Given source` file)
- * @param t         the lowered row
- * @return          true when the row may be folded into a group
- */
-fn regr_row_groupable(regr_dir: str, t: Tkr) -> bool {
+fn regr_row_groupable(regr_dir: str, t: Tkr): bool {
     if t.kind == TkrKind::CompileFail { return false }
     if t.dep_dir.len > 0 || t.in_place { return false }
-    if t.check_wellformed || t.check_module_valid { return false }
+    if t.check_wellformed { return false }
     if target_toolchain_skip_reason(t.target).len > 0 { return false }
-    let src = regr_row_source(regr_dir, t)
+    var src = regr_row_source(regr_dir, t)
     if src.len == 0 { return false }
     !snippet_stmts_have_return(split_snippet_decls_and_stmts(src).stmts)
 }
 
-/**
- * snippet_head_ident_after — the identifier that follows `kw` at the head of `head` (a chunk's text
- * with its leading modifier tokens already stripped), or "" when `head` does not open with `kw`.
- * The name-claim reader: `type Point = struct …` yields `Point`.
- *
- * @param head  the declaration head, past any `pub`/`exp`/`unsafe`/`extern` modifier
- * @param kw    the declaration keyword to match, trailing space included (e.g. `"type "`)
- * @return      the declared name, or "" when `head` does not start with `kw`
- */
-fn snippet_head_ident_after(head: str, kw: str) -> str {
+fn snippet_head_ident_after(head: str, kw: str): str {
     if !mf_starts_with(head, kw) { return "" }
-    mut k = kw.len
+    var k = kw.len
     loop {
         if k >= head.len { break }
         if head[k] != b' ' && head[k] != b'\t' { break }
         k = k + 1
     }
-    mut e = k
+    var e = k
     loop {
         if e >= head.len { break }
         if !snippet_is_ident_byte(head[e]) { break }
         e = e + 1
     }
-    teko::str::slice(head, k, e)
+    head.slice(k, e)
 }
 
-/**
- * snippet_line_declared_name — the bare name `line` declares at TOP LEVEL (`type`/`class`/
- * `interface`/`flags`/`const`/`fn`, after any modifier tokens), or "" when it declares none.
- *
- * All six kinds share ONE claim namespace: a `type Foo` and a `fn Foo` in two different members
- * would be claimed against each other, which over-claims by a group at worst and never lets a real
- * collision through. Under-claiming is the expensive mistake here, not over-claiming.
- *
- * @param line  a top-level declaration line of a snippet's declaration half
- * @return      the declared bare name, or ""
- */
-fn snippet_line_declared_name(line: str) -> str {
-    let t = tkr_trim(line)
-    let head = teko::str::slice(t, snippet_chunk_head_keyword_start(t), t.len)
-    let as_type = snippet_head_ident_after(head, "type ")
+fn snippet_line_declared_name(line: str): str {
+    var t = tkr_trim(line)
+    var head = t.slice(snippet_chunk_head_keyword_start(t), t.len)
+    var as_type = snippet_head_ident_after(head, "type ")
     if as_type.len > 0 { return as_type }
-    let as_class = snippet_head_ident_after(head, "class ")
+    var as_class = snippet_head_ident_after(head, "class ")
     if as_class.len > 0 { return as_class }
-    let as_iface = snippet_head_ident_after(head, "interface ")
+    var as_iface = snippet_head_ident_after(head, "interface ")
     if as_iface.len > 0 { return as_iface }
-    let as_flags = snippet_head_ident_after(head, "flags ")
+    var as_flags = snippet_head_ident_after(head, "flags ")
     if as_flags.len > 0 { return as_flags }
-    let as_const = snippet_head_ident_after(head, "const ")
+    var as_const = snippet_head_ident_after(head, "const ")
     if as_const.len > 0 { return as_const }
     snippet_head_ident_after(head, "fn ")
 }
 
-/**
- * snippet_declared_names — every bare name a snippet's declaration half introduces AT TOP LEVEL.
- * The claim set a group member holds, so no other member of the same group may declare any of them.
- *
- * TOP LEVEL is the whole point of the brace-depth walk here, and it is not a nicety: a class's own
- * METHODS are addressed through their type (`Dog::make`), so forty-seven members each declaring a
- * `pub fn make()` inside their own class collide with nothing — claiming those would have forced
- * forty-seven groups for no reason at all. Only a declaration that begins a chunk at depth 0 is
- * claimed; the walk mirrors `split_snippet_decls_and_stmts` (the same literal-and-comment-aware
- * `snippet_brace_delta`, the same doc-comment skip, the same "an attribute line accumulates onto
- * the declaration it decorates" rule).
- *
- * @param decls  the snippet's declaration half (`SnippetSplit.decls`)
- * @return       the declared bare names, in source order (duplicates harmless)
- */
-fn snippet_declared_names(decls: str) -> []str {
-    mut out: []str = teko::list::empty()
-    mut depth: i64 = 0
-    mut in_chunk = false
-    mut in_str = false
-    mut in_comment = false
-    mut cur: u64 = 0
+fn snippet_declared_names(decls: str): []str {
+    var out: []str = []
+    var depth: i64 = 0
+    var in_chunk = false
+    var in_str = false
+    var in_comment = false
+    var cur: u64 = 0
     loop {
         if cur >= decls.len { break }
-        mut eol = cur
+        var eol = cur
         loop {
             if eol >= decls.len { break }
             if decls[eol] == b'\n' { break }
             eol = eol + 1
         }
-        let line = teko::str::slice(decls, cur, eol)
-        let next = if eol < decls.len { eol + 1 } else { eol }
-        let trimmed = tkr_trim(line)
+        var line = decls.slice(cur, eol)
+        var next = if eol < decls.len { eol + 1 } else { eol }
+        var trimmed = tkr_trim(line)
         if !in_chunk && trimmed.len == 0 { cur = next; continue }
         if !in_chunk && mf_starts_with(trimmed, "/**") { cur = snippet_skip_doc_comment(decls, cur); continue }
         if !in_chunk && !mf_starts_with(trimmed, "#") {
-            let name = snippet_line_declared_name(trimmed)
-            if name.len > 0 { out = teko::list::push(out, name) }
+            var name = snippet_line_declared_name(trimmed)
+            if name.len > 0 { out = [..out, name] }
             in_chunk = true
         }
-        let scan = snippet_brace_delta(line, in_str, in_comment)
+        var scan = snippet_brace_delta(line, in_str, in_comment)
         depth = depth + scan.delta
         in_str = scan.in_str
         in_comment = scan.in_comment
@@ -610,34 +253,18 @@ fn snippet_declared_names(decls: str) -> []str {
     out
 }
 
-/**
- * RegrNameClaim — one bare TOP-LEVEL name a group already holds. The packing constraint made explicit:
- * a flat claim list (rather than a per-group name slice) because a slice-of-slices is not an
- * emittable struct field, and a linear scan over a few hundred claims costs nothing next to a build.
- */
 type RegrNameClaim = struct {
-    /** the group holding the claim. */
     group: u64
-    /** the bare top-level name it holds. */
     name: str
 }
 
-/**
- * regr_claims_conflict — would adding a member declaring `names` to group `g` create a bare-name
- * collision with what `g` already holds?
- *
- * @param claims  every claim made so far
- * @param g       the candidate group
- * @param names   the member's declared bare top-level names
- * @return        true when the group already holds one of them
- */
-fn regr_claims_conflict(claims: []RegrNameClaim, g: u64, names: []str) -> bool {
-    mut i: u64 = 0
+fn regr_claims_conflict(claims: []RegrNameClaim, g: u64, names: []str): bool {
+    var i: u64 = 0
     loop {
         if i >= claims.len { break }
-        let c = claims[i]
+        var c = claims[i]
         if c.group == g {
-            mut j: u64 = 0
+            var j: u64 = 0
             loop {
                 if j >= names.len { break }
                 if names[j] == c.name { return true }
@@ -649,92 +276,34 @@ fn regr_claims_conflict(claims: []RegrNameClaim, g: u64, names: []str) -> bool {
     false
 }
 
-/**
- * regr_claims_add — `claims` with every name in `names` claimed for group `g`.
- *
- * @param claims  the claims so far
- * @param g       the group taking the names
- * @param names   the names to claim
- * @return        the extended claim list
- */
-fn regr_claims_add(claims: []RegrNameClaim, g: u64, names: []str) -> []RegrNameClaim {
-    mut out = claims
-    mut i: u64 = 0
+fn regr_claims_add(claims: []RegrNameClaim, g: u64, names: []str): []RegrNameClaim {
+    var out = claims
+    var i: u64 = 0
     loop {
         if i >= names.len { break }
-        out = teko::list::push(out, RegrNameClaim { group = g; name = names[i] })
+        out = [..out, RegrNameClaim { group = g; name = names[i] }]
         i = i + 1
     }
     out
 }
 
-/**
- * RegrPlanAcc — the plan under construction: the group keys seen so far (parallel to `specs` — and
- * NOT distinct, since one configuration may need several groups), the configurations they stand for,
- * the bare-name claims each group holds, the member bindings, and the running module counter. One
- * struct so the per-file/per-feature/per-row walk threads a single value instead of five.
- */
 type RegrPlanAcc = struct {
-    /** each group's configuration key (repeats when a configuration needed several groups). */
     keys: []str
-    /** the configuration behind each group (parallel to `keys`). */
     specs: []RegrGroupSpec
-    /** the bare top-level names each group holds. */
     claims: []RegrNameClaim
-    /** every groupable row's binding, in walk order. */
     members: []RegrGroupMember
-    /** how many members have been assigned a module name (the `m<k>` counter). */
     next_module: u64
 }
 
-/**
- * regr_plan_empty — the empty plan accumulator.
- *
- * @return an accumulator with no groups, no members and a zeroed module counter
- */
-fn regr_plan_empty() -> RegrPlanAcc {
-    RegrPlanAcc { keys = teko::list::empty(); specs = teko::list::empty(); claims = teko::list::empty(); members = teko::list::empty(); next_module = 0 }
+fn regr_plan_empty(): RegrPlanAcc {
+    RegrPlanAcc { keys = []; specs = []; claims = []; members = []; next_module = 0 }
 }
 
-/**
- * regr_group_for_row — the FIRST group that both matches the row's build configuration and can take
- * its declared top-level names without a bare-name collision, or `acc.keys.len` when a new group is
- * needed. First-fit rather than best-fit: the corpus's collisions cluster on a handful of names
- * (`Point`, `Dog`, `Animal`, …), so first-fit already packs the bulk into one group, and a smarter
- * packing would trade a real complexity cost for at most a build or two.
- *
- * @param acc    the accumulator
- * @param gkey   the row's build-configuration key
- * @param names  the row's declared bare top-level names
- * @return       the group to place the row in, or `acc.keys.len` for a fresh one
- */
-/**
- * regr_group_solo — must a group hold members of ONE source only? ALWAYS, now.
- *
- * The rule used to key on the `TEKO_BACKEND=native` child-env token, because only the rows that
- * OPTED IN to the own backend could not carry a dispatcher. The `TEKO_BACKEND` selector was
- * EXCISED (owner ruling 2026-07-26 — the own backend is the only emission route), so every row
- * builds native and the exemption has no rows left to exempt.
- *
- * A multi-member group needs a DISPATCHER, and a dispatcher needs to read a selector and compare
- * it — which the own backend still cannot lower: `teko::env::var` returns `str | error` and a
- * `match` over it stops with "fat-pointer receiver `match-expression` not yet lowered (N2)", and
- * runtime string interpolation stops the same way. Until THAT honest-stop falls, a dispatcher
- * cannot be built at all, so grouping by shared source is the only shape available.
- *
- * WHAT THIS COSTS, said out loud: grouping was what took the corpus from 126 builds to 44. Solo
- * groups give that back. The way to earn it again is to close the named stop above, not to relax
- * this rule — a relaxed rule would emit a dispatcher the backend refuses, and the corpus would go
- * red at build time instead of honestly slow.
- *
- * @param gkey  the group's configuration key (unused — the answer no longer depends on it)
- * @return      true, always
- */
-fn regr_group_solo(gkey: str) -> bool { true }
+fn regr_group_solo(gkey: str): bool { true }
 
-fn regr_group_for_row(acc: RegrPlanAcc, gkey: str, names: []str) -> u64 {
+fn regr_group_for_row(acc: RegrPlanAcc, gkey: str, names: []str): u64 {
     if regr_group_solo(gkey) { return acc.keys.len }
-    mut g: u64 = 0
+    var g: u64 = 0
     loop {
         if g >= acc.keys.len { break }
         if acc.keys[g] == gkey && !regr_claims_conflict(acc.claims, g, names) { return g }
@@ -743,105 +312,59 @@ fn regr_group_for_row(acc: RegrPlanAcc, gkey: str, names: []str) -> u64 {
     acc.keys.len
 }
 
-/**
- * regr_plan_add_row — fold ONE groupable row into the accumulator: place it in the first group that
- * matches its configuration and can hold its top-level names (opening a new one when none can), claim
- * those names for that group, and give the row a fresh module name.
- *
- * @param acc  the accumulator
- * @param t    the lowered row
- * @param key  the row's scratch-file prefix (its identity across the plan and run passes)
- * @param src  the row's resolved snippet text (`regr_row_source` — inline body or named file)
- * @return     the accumulator with the row bound
- */
-fn regr_plan_add_row(acc: RegrPlanAcc, t: Tkr, key: str, src: str) -> RegrPlanAcc {
-    let gkey = regr_group_key(t)
+fn regr_plan_add_row(acc: RegrPlanAcc, t: Tkr, key: str, src: str): RegrPlanAcc {
+    var gkey = regr_group_key(t)
     match regr_plan_twin_of(acc, gkey, src) {
         RegrGroupMember as twin => return regr_plan_reuse(acc, twin, key)
         null => { }
     }
-    let names = snippet_declared_names(split_snippet_decls_and_stmts(src).decls)
-    let idx = regr_group_for_row(acc, gkey, names)
-    let fresh = idx == acc.keys.len
-    let keys = if fresh { teko::list::push(acc.keys, gkey) } else { acc.keys }
-    let specs = if fresh { teko::list::push(acc.specs, RegrGroupSpec { env = t.env; target = t.target }) } else { acc.specs }
-    let member = RegrGroupMember { key = key; group = idx; module = $"m{acc.next_module}"; source = src }
+    var names = snippet_declared_names(split_snippet_decls_and_stmts(src).decls)
+    var idx = regr_group_for_row(acc, gkey, names)
+    var fresh = idx == acc.keys.len
+    var keys = if fresh { [..acc.keys, gkey] } else { acc.keys }
+    var specs = if fresh { [..acc.specs, RegrGroupSpec { env = t.env; target = t.target }] } else { acc.specs }
+    var member = RegrGroupMember { key = key; group = idx; module = $"m{acc.next_module}"; source = src }
     RegrPlanAcc {
         keys = keys; specs = specs
         claims = regr_claims_add(acc.claims, idx, names)
-        members = teko::list::push(acc.members, member)
+        members = [..acc.members, member]
         next_module = acc.next_module + 1
     }
 }
 
-/**
- * regr_plan_twin_of — an already-bound member of a group with configuration `gkey` whose snippet
- * source is byte-identical to `source`, or `null` when there is none. Two rows with the same source
- * under the same configuration are the same PROGRAM — they differ only in `args`/`stdin` and in what
- * they expect of it — so they share one module instead of colliding with each other over every name
- * that program declares.
- *
- * @param acc     the accumulator
- * @param gkey    the row's build-configuration key
- * @param source  the row's inline snippet source
- * @return        the member whose module this row can reuse, or null
- */
-fn regr_plan_twin_of(acc: RegrPlanAcc, gkey: str, source: str) -> RegrGroupMember | null {
-    mut i: u64 = 0
+fn regr_plan_twin_of(acc: RegrPlanAcc, gkey: str, source: str): RegrGroupMember | null {
+    var i: u64 = 0
     loop {
         if i >= acc.members.len { break }
-        let mb = acc.members[i]
+        var mb = acc.members[i]
         if mb.source == source && acc.keys[mb.group] == gkey { return mb }
         i = i + 1
     }
     null
 }
 
-/**
- * regr_plan_reuse — bind a row to the module an identical earlier member already contributed. The
- * new member carries NO source, so the group project is written once and the dispatcher gains no
- * duplicate line, while the row still resolves to the right entry at run time.
- *
- * @param acc   the accumulator
- * @param twin  the member whose group and module are reused
- * @param key   the row's scratch-file prefix
- * @return      the accumulator with the row bound to the twin's module
- */
-fn regr_plan_reuse(acc: RegrPlanAcc, twin: RegrGroupMember, key: str) -> RegrPlanAcc {
-    let member = RegrGroupMember { key = key; group = twin.group; module = twin.module; source = "" }
+fn regr_plan_reuse(acc: RegrPlanAcc, twin: RegrGroupMember, key: str): RegrPlanAcc {
+    var member = RegrGroupMember { key = key; group = twin.group; module = twin.module; source = "" }
     RegrPlanAcc {
         keys = acc.keys; specs = acc.specs; claims = acc.claims
-        members = teko::list::push(acc.members, member)
+        members = [..acc.members, member]
         next_module = acc.next_module
     }
 }
 
-/**
- * regr_plan_feature — fold every groupable row of ONE feature into the accumulator, walking exactly
- * as the runner does so the row prefixes (`<feature prefix>.<scenario>.<row>`) it records are the
- * same strings the runner later looks up. A COMPILE-FAIL feature is skipped whole, matching
- * `run_one_feature`'s own dispatch: every row of such a feature goes down the compile-fail path,
- * where a successful build would be a failure.
- *
- * @param regr_dir  the directory the `.tkr` lives in (to resolve a `Given source` file)
- * @param feat    the parsed feature
- * @param prefix  the feature's scratch-file prefix
- * @param acc     the accumulator
- * @return        the accumulator with the feature's groupable rows bound
- */
-fn regr_plan_feature(regr_dir: str, feat: TkrFeature, prefix: str, acc: RegrPlanAcc) -> RegrPlanAcc {
+fn regr_plan_feature(regr_dir: str, feat: TkrFeature, prefix: str, acc: RegrPlanAcc): RegrPlanAcc {
     if tkr_feature_is_compile_fail(feat) { return acc }
-    mut cur = acc
-    mut si: u64 = 0
+    var cur = acc
+    var si: u64 = 0
     loop {
         if si >= feat.scenarios.len { break }
-        let sc = feat.scenarios[si]
+        var sc = feat.scenarios[si]
         if tkb_scenario_is_declarative(sc) { si = si + 1; continue }
-        let specs = match tkr_expand_outline(sc) { []Tkr as xs => xs; error => return cur }
-        mut ri: u64 = 0
+        var specs = match tkr_expand_outline(sc) { []Tkr as xs => xs; error => return cur }
+        var ri: u64 = 0
         loop {
             if ri >= specs.len { break }
-            let t = specs[ri]
+            var t = specs[ri]
             if regr_row_groupable(regr_dir, t) {
                 cur = regr_plan_add_row(cur, t, $"{prefix}.{si}.{ri}", regr_row_source(regr_dir, t))
             }
@@ -852,21 +375,11 @@ fn regr_plan_feature(regr_dir: str, feat: TkrFeature, prefix: str, acc: RegrPlan
     cur
 }
 
-/**
- * regr_plan_file — fold every groupable row of ONE listed `.tkr` file into the accumulator. An
- * unreadable or unparseable file contributes nothing: the ORDINARY run reports that as the manifest
- * error it is (`run_regression_sources`), and planning must never be the thing that reports it.
- *
- * @param path    the listed `.tkr` path
- * @param prefix  the file's scratch-file prefix
- * @param acc     the accumulator
- * @return        the accumulator with the file's groupable rows bound
- */
-fn regr_plan_file(path: str, prefix: str, acc: RegrPlanAcc) -> RegrPlanAcc {
-    let src = match teko::io::read_file(path) { str as s => s; error => return acc }
-    let feats = match parse_tkr(src) { []TkrFeature as xs => xs; error => return acc }
-    mut cur = acc
-    mut fi: u64 = 0
+fn regr_plan_file(path: str, prefix: str, acc: RegrPlanAcc): RegrPlanAcc {
+    var src = match teko::io::read_file(path) { str as s => s; error => return acc }
+    var feats = match parse_tkr(src) { []TkrFeature as xs => xs; error => return acc }
+    var cur = acc
+    var fi: u64 = 0
     loop {
         if fi >= feats.len { break }
         cur = regr_plan_feature(dirname_of(path), feats[fi], $"{prefix}.f{fi}", cur)
@@ -875,16 +388,9 @@ fn regr_plan_file(path: str, prefix: str, acc: RegrPlanAcc) -> RegrPlanAcc {
     cur
 }
 
-/**
- * regr_group_member_count — how many members the plan assigned to group `g`.
- *
- * @param members  every member binding
- * @param g        the group index
- * @return         that group's member count
- */
-fn regr_group_member_count(members: []RegrGroupMember, g: u64) -> u64 {
-    mut n: u64 = 0
-    mut i: u64 = 0
+fn regr_group_member_count(members: []RegrGroupMember, g: u64): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= members.len { break }
         if members[i].group == g { n = n + 1 }
@@ -893,61 +399,25 @@ fn regr_group_member_count(members: []RegrGroupMember, g: u64) -> u64 {
     n
 }
 
-/**
- * regr_plan_groups — the whole plan for a run: walk every listed `.tkr` file in manifest order and
- * bind every groupable row to its configuration's group. The prefixes recorded here are built from
- * the same `<work>/<sanitized path>` stem the run pass uses, which is what lets a row be recognised
- * later without a second identity scheme.
- *
- * @param m     the resolved manifest (its `test_regression_files` is the walk)
- * @param work  the regression scratch work tree
- * @return      the plan (its `members` empty when nothing is groupable)
- */
-pub fn regr_plan_groups(m: Manifest, work: str) -> RegrGroupPlan {
-    mut acc = regr_plan_empty()
-    mut si: u64 = 0
+pub fn regr_plan_groups(m: Manifest, work: str): RegrGroupPlan {
+    var acc = regr_plan_empty()
+    var si: u64 = 0
     loop {
         if si >= m.test_regression_files.len { break }
-        let path = m.test_regression_files[si]
+        var path = m.test_regression_files[si]
         acc = regr_plan_file(path, work ~ "/" ~ regr_sanitize(path), acc)
         si = si + 1
     }
     RegrGroupPlan { specs = acc.specs; members = acc.members }
 }
 
-/**
- * regr_group_write_project — materialize group `g`'s project on disk: the synthesized `.tkp`, one
- * `src/<module>/body.tks` per CONTRIBUTING member, and the generated `main.tks` dispatcher. A member
- * that reuses an identical earlier member's module carries no source (`RegrGroupMember.source`) and
- * so writes nothing and adds no second dispatcher line. The tree is wiped first, so no module of a
- * previous run sharing this directory can survive into this one (the same hermeticity
- * `compile_snippet_text` gives a scratch snippet project).
- *
- * @param members  every member binding (only those of group `g` are written)
- * @param g        the group index
- * @param dir      the group project directory
- */
-/**
- * regr_group_lone_source — the single source of group `g` when EVERY member of it contributes that
- * same one (so exactly one member carries a non-empty `source`), else `null`.
- *
- * A group in that shape needs no dispatcher and no `src/m<k>/` module: it IS one program, and it is
- * written exactly as `compile_snippet_text` writes a one-off snippet — declarations to
- * `src/regr_decls.tks`, statements to `main.tks`, or the text verbatim when it declares nothing.
- * That is what lets rows the OWN backend must build share one build, since a dispatcher is the one
- * thing that backend cannot lower.
- *
- * @param members  every member binding (only those of group `g` are read)
- * @param g        the group index
- * @return         the group's single source, or `null` when it has several
- */
-fn regr_group_lone_source(members: []RegrGroupMember, g: u64) -> str | null {
-    mut found = ""
-    mut n: u64 = 0
-    mut i: u64 = 0
+fn regr_group_lone_source(members: []RegrGroupMember, g: u64): str | null {
+    var found = ""
+    var n: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= members.len { break }
-        let mb = members[i]
+        var mb = members[i]
         if mb.group == g && mb.source.len > 0 {
             found = mb.source
             n = n + 1
@@ -959,12 +429,12 @@ fn regr_group_lone_source(members: []RegrGroupMember, g: u64) -> str | null {
 }
 
 fn regr_group_write_project(members: []RegrGroupMember, g: u64, dir: str) {
-    match sh_rm_rf(dir) { error => { }; null => { } }
+    match rm_rf(dir) { error => { }; null => { } }
     match mkdir_p(teko::str::concat(dir, "/src/")) { error => { }; null => { } }
     match teko::io::write_file(dir ~ "/teko.tkp", regr_group_manifest_text()) { error => { }; null => { } }
     match regr_group_lone_source(members, g) {
         str as only => {
-            let split = split_snippet_decls_and_stmts(only)
+            var split = split_snippet_decls_and_stmts(only)
             if split.decls.len > 0 {
                 match teko::io::write_file(dir ~ "/src/regr_decls.tks", split.decls) { error => { }; null => { } }
                 match teko::io::write_file(dir ~ "/main.tks", split.stmts) { error => { }; null => { } }
@@ -975,11 +445,11 @@ fn regr_group_write_project(members: []RegrGroupMember, g: u64, dir: str) {
         }
         null => { }
     }
-    mut dispatch = ""
-    mut i: u64 = 0
+    var dispatch = ""
+    var i: u64 = 0
     loop {
         if i >= members.len { break }
-        let mb = members[i]
+        var mb = members[i]
         if mb.group == g && mb.source.len > 0 {
             match mkdir_p(teko::str::concat(dir, "/src/", mb.module, "/")) { error => { }; null => { } }
             match teko::io::write_file(dir ~ "/src/" ~ mb.module ~ "/body.tks", regr_group_module_text(mb.source)) { error => { }; null => { } }
@@ -990,75 +460,28 @@ fn regr_group_write_project(members: []RegrGroupMember, g: u64, dir: str) {
     match teko::io::write_file(dir ~ "/main.tks", regr_group_main_text(dispatch)) { error => { }; null => { } }
 }
 
-/**
- * regr_group_skipped — the `RegrGroupBuild` of a group that was NOT built (too few members, or its
- * build failed). Its members fall back to their own per-scenario builds, so it costs nothing and
- * claims nothing.
- *
- * @param members  how many rows the group would have covered
- * @param times    what the attempt cost (zero when nothing was attempted)
- * @return         an un-built group outcome
- */
-fn regr_group_skipped(members: u64, times: PhaseTimes) -> RegrGroupBuild {
+fn regr_group_skipped(members: u64, times: PhaseTimes): RegrGroupBuild {
     RegrGroupBuild { ok = false; binp = ""; members = members; times = times }
 }
 
-/** regr_group_dir — where group `g` generates and builds. One directory per group, and that
-    one-to-one is what makes the builds safe to run at the same time. */
-fn regr_group_dir(work: str, g: u64) -> str { $"{work}/.group{g}" }
+fn regr_group_dir(work: str, g: u64): str { $"{work}/.group{g}" }
 
-/**
- * regr_group_generate — write group `g`'s project to its OWN directory and return what generating it
- * cost. Isolation lives here and nowhere else: `.group0`, `.group1`, … never share a path, which is
- * precisely what licenses their builds to run at the same time.
- *
- * @param plan  the whole plan (its members select this group's)
- * @param g     the group index
- * @param work  the regression scratch work tree
- * @return      the nanoseconds spent generating
- */
-fn regr_group_generate(plan: RegrGroupPlan, g: u64, work: str) -> i64 {
-    let t_start = regr_now_ns()
+fn regr_group_generate(plan: RegrGroupPlan, g: u64, work: str): i64 {
+    var t_start = regr_now_ns()
     regr_group_write_project(plan.members, g, regr_group_dir(work, g))
     regr_now_ns() - t_start
 }
 
-/**
- * regr_group_buildable — is group `g` worth generating at all? A group below
- * `REGR_GROUP_MIN_MEMBERS` is not: its rows are cheaper on the ordinary per-scenario path.
- *
- * @param plan  the whole plan
- * @param g     the group index
- * @return      true when this group earns a build
- */
-fn regr_group_buildable(plan: RegrGroupPlan, g: u64) -> bool {
+fn regr_group_buildable(plan: RegrGroupPlan, g: u64): bool {
     regr_group_member_count(plan.members, g) >= REGR_GROUP_MIN_MEMBERS
 }
 
-/**
- * regr_group_verdict — fold ONE group's captured build into its `RegrGroupBuild`, reporting the
- * outcome on stdout BEFORE any scenario runs (the ruling's *"executar estes builds ANTES de qualquer
- * teste começar, mostrando a saída deles no início"*).
- *
- * A group whose build FAILED reports the compiler's own diagnostic tail and is marked un-built: its
- * members then take the ordinary per-scenario path, so the failure costs speed and never
- * correctness. And because every group in the batch is folded — not just up to the first failure —
- * one broken group no longer hides the verdict of the ones beside it.
- *
- * @param plan    the whole plan
- * @param g       the group index
- * @param work    the regression scratch work tree
- * @param n       how many groups there are (the report's `g/n`)
- * @param comp    this group's captured build
- * @param gen_ns  what generating its project cost
- * @return        the group's build outcome
- */
-fn regr_group_verdict(plan: RegrGroupPlan, g: u64, work: str, n: u64, comp: CapResult, gen_ns: i64) -> RegrGroupBuild {
-    let count = regr_group_member_count(plan.members, g)
-    let spec = plan.specs[g]
-    let capped = cap_with_extra_harness(comp, gen_ns)
-    let times = PhaseTimes { harness_ns = capped.harness_ns; compile_ns = capped.child_ns; run_ns = 0; builds = 1 }
-    let cfg = regr_group_config_text(spec)
+fn regr_group_verdict(plan: RegrGroupPlan, g: u64, work: str, n: u64, comp: CapResult, gen_ns: i64): RegrGroupBuild {
+    var count = regr_group_member_count(plan.members, g)
+    var spec = plan.specs[g]
+    var capped = cap_with_extra_harness(comp, gen_ns)
+    var times = PhaseTimes { harness_ns = capped.harness_ns; compile_ns = capped.child_ns; run_ns = 0; builds = 1 }
+    var cfg = regr_group_config_text(spec)
     if capped.exit != 0 {
         teko::io::println($"teko: regression group {g + 1}/{n} FAILED to build ({count} scenario(s), {cfg}) — each falls back to its own build")
         teko::io::println(compile_failure_message(capped))
@@ -1068,17 +491,10 @@ fn regr_group_verdict(plan: RegrGroupPlan, g: u64, work: str, n: u64, comp: CapR
     RegrGroupBuild { ok = true; binp = artifact_path_for_target($"{regr_group_dir(work, g)}/bin/{REGR_GROUP_PROJECT_NAME}", spec.target); members = count; times = times }
 }
 
-/**
- * regr_group_config_text — a group's configuration rendered for its report line: the target it
- * builds for and the env tokens it builds under. What a reader needs to tell two groups apart.
- *
- * @param spec  the group's configuration
- * @return      the rendered configuration
- */
-fn regr_group_config_text(spec: RegrGroupSpec) -> str {
-    let target = if spec.target.len == 0 { HOST_TARGET } else { spec.target }
-    mut env = ""
-    mut i: u64 = 0
+fn regr_group_config_text(spec: RegrGroupSpec): str {
+    var target = if spec.target.len == 0 { HOST_TARGET } else { spec.target }
+    var env = ""
+    var i: u64 = 0
     loop {
         if i >= spec.env.len { break }
         if env.len > 0 { env = env ~ " " }
@@ -1089,108 +505,58 @@ fn regr_group_config_text(spec: RegrGroupSpec) -> str {
     $"target {target}, env {env}"
 }
 
-/**
- * regr_build_groups — build every planned group, in plan order, printing each outcome as it lands.
- * Runs BEFORE the first scenario, so the log opens with what the run is about to cost and with any
- * build failure already named.
- *
- * @param exe   the absolute path to this compiler binary
- * @param plan  the plan
- * @param work  the regression scratch work tree
- * @return      the grouping the runner consults per row
- */
-pub fn regr_build_groups(exe: str, plan: RegrGroupPlan, work: str) -> RegrGroups {
+pub fn regr_build_groups(exe: str, plan: RegrGroupPlan, work: str): RegrGroups {
     if plan.members.len == 0 { return regr_groups_empty() }
-    let prep = regr_groups_prepare(exe, plan, work)
-    let caps = run_captured_batch(prep.cmds, prep.prefixes)
+    var prep = regr_groups_prepare(exe, plan, work)
+    var caps = run_pool(prep.specs, regr_jobs())
     RegrGroups { members = plan.members; builds = regr_groups_fold(plan, work, prep, caps) }
 }
 
-/**
- * RegrBatchPrep — everything `regr_build_groups` must know AFTER generating the projects and BEFORE
- * launching them: the command per buildable group, where its capture files land, and what generating
- * each one cost. `gen_ns` is indexed by GROUP, `cmds`/`prefixes` by position in the batch — the two
- * are not the same list, because a group below the member floor is generated by nobody and appears
- * in neither.
- */
 type RegrBatchPrep = struct {
-    /** the redirected build command of each buildable group, in group order. */
-    cmds: []str
-    /** each command's scratch prefix, parallel to `cmds`. */
+    specs: []ProcSpec
     prefixes: []str
-    /** what generating each GROUP's project cost, indexed by group (0 for one never generated). */
     gen_ns: []i64
 }
 
-/**
- * regr_groups_prepare — generate every buildable group's project and collect the command that builds
- * it, WITHOUT building anything yet.
- *
- * The separation is the design. Generation writes to disk and must finish before any build reads
- * from disk; building is what benefits from running many at once. Doing them in one pass would
- * serialize the second on the first.
- *
- * @param exe   the absolute path to this compiler binary
- * @param plan  the whole plan
- * @param work  the regression scratch work tree
- * @return      the batch's commands, prefixes and per-group generation cost
- */
-fn regr_groups_prepare(exe: str, plan: RegrGroupPlan, work: str) -> RegrBatchPrep {
-    mut cmds: []str = teko::list::empty()
-    mut prefixes: []str = teko::list::empty()
-    mut gen_ns: []i64 = teko::list::empty()
-    mut g: u64 = 0
+fn regr_groups_prepare(exe: str, plan: RegrGroupPlan, work: str): RegrBatchPrep {
+    var specs: []ProcSpec = []
+    var prefixes: []str = []
+    var gen_ns: []i64 = []
+    var g: u64 = 0
     loop {
         if g >= plan.specs.len { break }
-        if !regr_group_buildable(plan, g) { gen_ns = teko::list::push(gen_ns, 0); g = g + 1; continue }
-        gen_ns = teko::list::push(gen_ns, regr_group_generate(plan, g, work))
-        let dir = regr_group_dir(work, g)
-        let prefix = dir ~ ".compile"
-        prefixes = teko::list::push(prefixes, prefix)
-        cmds = teko::list::push(cmds, compile_regressive_cmd(exe, dir, with_regr_cov_env(plan.specs[g].env, prefix), prefix))
+        if !regr_group_buildable(plan, g) { gen_ns = [..gen_ns, 0]; g = g + 1; continue }
+        gen_ns = [..gen_ns, regr_group_generate(plan, g, work)]
+        var dir = regr_group_dir(work, g)
+        var prefix = dir ~ ".compile"
+        prefixes = [..prefixes, prefix]
+        specs = [..specs, compile_regressive_spec(exe, dir, with_regr_cov_env(plan.specs[g].env, prefix), prefix)]
         g = g + 1
     }
-    RegrBatchPrep { cmds = cmds; prefixes = prefixes; gen_ns = gen_ns }
+    RegrBatchPrep { specs = specs; prefixes = prefixes; gen_ns = gen_ns }
 }
 
-/**
- * regr_groups_fold — turn the batch's captures back into one `RegrGroupBuild` per group, in group
- * order, re-inserting the un-generated groups the batch never carried.
- *
- * @param plan  the whole plan
- * @param work  the regression scratch work tree
- * @param prep  what `regr_groups_prepare` produced
- * @param caps  the batch's captures, parallel to `prep.cmds`
- * @return      one build outcome per group
- */
-fn regr_groups_fold(plan: RegrGroupPlan, work: str, prep: RegrBatchPrep, caps: []CapResult) -> []RegrGroupBuild {
-    mut builds: []RegrGroupBuild = teko::list::empty()
-    mut g: u64 = 0
-    mut at: u64 = 0
+fn regr_groups_fold(plan: RegrGroupPlan, work: str, prep: RegrBatchPrep, caps: []CapResult): []RegrGroupBuild {
+    var builds: []RegrGroupBuild = []
+    var g: u64 = 0
+    var at: u64 = 0
     loop {
         if g >= plan.specs.len { break }
         if !regr_group_buildable(plan, g) {
-            builds = teko::list::push(builds, regr_group_skipped(regr_group_member_count(plan.members, g), phase_zero()))
+            builds = [..builds, regr_group_skipped(regr_group_member_count(plan.members, g), phase_zero())]
             g = g + 1
             continue
         }
-        builds = teko::list::push(builds, regr_group_verdict(plan, g, work, plan.specs.len, caps[at], prep.gen_ns[g]))
+        builds = [..builds, regr_group_verdict(plan, g, work, plan.specs.len, caps[at], prep.gen_ns[g])]
         at = at + 1
         g = g + 1
     }
     builds
 }
 
-/**
- * regr_groups_total — the summed cost of every grouped build, folded into the run's phase total so
- * the summary line still accounts for every build the run paid for.
- *
- * @param gs  the grouping
- * @return    the summed measurement of the group builds
- */
-pub fn regr_groups_total(gs: RegrGroups) -> PhaseTimes {
-    mut acc = phase_zero()
-    mut i: u64 = 0
+pub fn regr_groups_total(gs: RegrGroups): PhaseTimes {
+    var acc = phase_zero()
+    var i: u64 = 0
     loop {
         if i >= gs.builds.len { break }
         acc = phase_add(acc, gs.builds[i].times)
@@ -1199,22 +565,13 @@ pub fn regr_groups_total(gs: RegrGroups) -> PhaseTimes {
     acc
 }
 
-/**
- * regr_group_slot — the grouped artifact and selector for the row whose scratch prefix is `key`, or
- * `null` when the row was not grouped (or its group did not build). The `null` answer is the whole
- * fallback: the caller then resolves the row's artifact exactly as it did before grouping existed.
- *
- * @param gs   the grouping
- * @param key  the row's scratch-file prefix
- * @return     the row's slot, or null when it has none
- */
-pub fn regr_group_slot(gs: RegrGroups, key: str) -> RegrGroupSlot | null {
-    mut i: u64 = 0
+pub fn regr_group_slot(gs: RegrGroups, key: str): RegrGroupSlot | null {
+    var i: u64 = 0
     loop {
         if i >= gs.members.len { break }
-        let mb = gs.members[i]
+        var mb = gs.members[i]
         if mb.key == key {
-            let b = gs.builds[mb.group]
+            var b = gs.builds[mb.group]
             if !b.ok { return null }
             return RegrGroupSlot { binp = b.binp; module = mb.module }
         }
@@ -1223,22 +580,13 @@ pub fn regr_group_slot(gs: RegrGroups, key: str) -> RegrGroupSlot | null {
     null
 }
 
-/**
- * regr_with_entry_env — `t` with the group selector (`REGR_GROUP_ENTRY_VAR=<module>`) appended to
- * its child env, so the group binary runs THIS row's snippet. Appended to the row's OWN env rather
- * than replacing it: a `Given env` token still has to reach the child.
- *
- * @param t       the lowered row
- * @param module  the row's module namespace inside its group
- * @return        `t` with the selector token in its env
- */
-pub fn regr_with_entry_env(t: Tkr, module: str) -> Tkr {
+pub fn regr_with_entry_env(t: Tkr, module: str): Tkr {
     Tkr {
         args = t.args; stdin = t.stdin; kind = t.kind; exit = t.exit; stdout = t.stdout; stderr = t.stderr
         targets = t.targets; expect = t.expect; golden = t.golden; diagnostic = t.diagnostic
         source_inline = t.source_inline; source_file = t.source_file
-        env = teko::list::push(t.env, $"{REGR_GROUP_ENTRY_VAR}={module}")
+        env = [..t.env, $"{REGR_GROUP_ENTRY_VAR}={module}"]
         target = t.target; in_place = t.in_place; dep_dir = t.dep_dir
-        check_wellformed = t.check_wellformed; check_module_valid = t.check_module_valid
+        check_wellformed = t.check_wellformed
     }
 }

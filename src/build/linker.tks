@@ -1,73 +1,27 @@
-/**
- * LinkArch — the machine a link step must produce code for. (`src/build/linker.tks`, namespace
- * `teko::build`.)
- *
- * The compiler stopped asking "which C compiler?" and started asking "which LINKER, and is it
- * native to the target?" (owner ruling 2026-07-26: "não é .c que importa, importa o linker …
- * ajustes nas lanes e no compilador para procurar pelo linker e não pelo compilador C").
- * A linker that EXISTS but targets the wrong machine is worse than no linker at all: it produces
- * a wrong artifact and nobody notices — which is exactly what happened when a PE built for one
- * machine was published under a label promising another, by a toolchain resolved from the PATH
- * instead of chosen.
- */
 type LinkArch = enum { X8664; Arm64 }
 
-/**
- * LinkFormat — the object/executable container the link step must emit.
- *
- * The format is independent of the machine (arm64 exists in both Mach-O and PE), so the probe
- * carries both and asserts both: a linker native to the machine but foreign to the format is
- * still the wrong tool.
- */
 type LinkFormat = enum { Elf; Macho; Pe }
 
-/**
- * MINGW_TOKEN — the substring that identifies a MinGW toolchain in a command token or path.
- *
- * MinGW is FORBIDDEN on every Windows host, not merely deprioritised (owner ruling 2026-07-26:
- * "E sobre mingw, proibido, tem que usar o linker nativo e não emulado"). The measured defect that
- * earned the ban: a runner published a PE whose PROVENANCE read
- * `toolchain_cc=cc.exe (x86_64-posix-seh-rev2, Built by MinGW-Builds project) 14.2.0` while the
- * host reported a different machine — an EMULATED toolchain minting a binary for the machine it
- * emulated, under the label of the machine it ran on, with nothing asserting the difference.
- */
 const MINGW_TOKEN: str = "mingw"
 
-/**
- * linker_is_mingw — is `cmd` a MinGW linker, by command token or by the path it was found at?
- *
- * Matches the canonical cross prefix (`x86_64-w64-mingw32-ld`) and any MSYS2/MinGW-Builds install
- * path (`/mingw64/bin/ld`, `C:/msys64/mingw64/bin/ld.exe`). The check is on the WHOLE spelling,
- * lowercased by the caller's table, because both the prefix form and the path form are how MinGW
- * actually reaches a PATH in practice.
- *
- * @param cmd  the linker command token or absolute path under consideration
- * @return     true iff `cmd` names a MinGW toolchain
- */
-fn linker_is_mingw(cmd: str) -> bool {
-    teko::str::contains(cmd, MINGW_TOKEN)
+fn linker_is_mingw(cmd: str): bool {
+    cmd.contains(MINGW_TOKEN)
 }
 
-/**
- * arch_name — the human spelling of a `LinkArch`, for diagnostics.
- *
- * @param a  the machine
- * @return   "x86_64" or "arm64"
- */
-fn arch_name(a: LinkArch) -> str {
+const MINGW_TRIPLE_ABI_TOKEN: str = "windows-gnu"
+
+fn triple_is_mingw(triple: str): bool {
+    triple.contains(MINGW_TOKEN) || triple.contains(MINGW_TRIPLE_ABI_TOKEN)
+}
+
+fn arch_name(a: LinkArch): str {
     match a {
         LinkArch::X8664 => "x86_64"
         LinkArch::Arm64 => "arm64"
     }
 }
 
-/**
- * format_name — the human spelling of a `LinkFormat`, for diagnostics.
- *
- * @param f  the container format
- * @return   "ELF", "Mach-O" or "PE"
- */
-fn format_name(f: LinkFormat) -> str {
+fn format_name(f: LinkFormat): str {
     match f {
         LinkFormat::Elf => "ELF"
         LinkFormat::Macho => "Mach-O"
@@ -75,20 +29,7 @@ fn format_name(f: LinkFormat) -> str {
     }
 }
 
-/**
- * gnu_emulation_for — the GNU-ld `-m` emulation name that pins (`arch`, `fmt`).
- *
- * This is the whole architecture assertion, and it needs no output capture: `ld -m <emulation>
- * --version` exits 0 when the linker supports the emulation and non-zero ("unrecognised emulation
- * mode") when it does not. Same exit-code-only shape the old `cc_family_is_clang` flag-acceptance
- * probe used, applied to the question that actually matters — not "which vendor?" but "does this
- * linker target the machine I asked for?".
- *
- * @param arch  the machine the link must target
- * @param fmt   the container format the link must emit
- * @return      the `-m` emulation name, or "" for a pair GNU ld has no emulation for
- */
-fn gnu_emulation_for(arch: LinkArch, fmt: LinkFormat) -> str {
+fn gnu_emulation_for(arch: LinkArch, fmt: LinkFormat): str {
     match fmt {
         LinkFormat::Elf => match arch {
             LinkArch::X8664 => "elf_x86_64"
@@ -102,200 +43,83 @@ fn gnu_emulation_for(arch: LinkArch, fmt: LinkFormat) -> str {
     }
 }
 
-/**
- * linker_candidates — the linkers this build is ALLOWED to consider for (`arch`, `fmt`), in
- * preference order.
- *
- * The list is EXPLICIT and short by design. `resolve_cc` used to return the bare token `"cc"` on
- * every host and let the PATH decide what that meant; that is how an emulated x86_64 MinGW became
- * the toolchain of an ARM64 runner without anyone choosing it. A candidate that is not in this
- * table is not reachable, however prominent it is on the PATH.
- *
- * MinGW appears in NO arm: it is forbidden outright, and `linker_is_mingw` rejects it by name even
- * when it answers to one of these spellings on the PATH.
- *
- * @param arch  the machine the link must target
- * @param fmt   the container format the link must emit
- * @return      the candidate linker commands, most preferred first
- */
-fn linker_candidates(arch: LinkArch, fmt: LinkFormat) -> []str {
-    mut out: []str = teko::list::empty()
+fn linker_candidates(arch: LinkArch, fmt: LinkFormat): []str {
     match fmt {
         LinkFormat::Macho => {
-            out = teko::list::push(out, "ld")
-            out = teko::list::push(out, "ld64.lld")
-            return out
+            ["ld", "ld64.lld"]
         }
         LinkFormat::Pe => {
-            out = teko::list::push(out, "lld-link")
-            out = teko::list::push(out, "link")
-            return out
+            ["lld-link"]
         }
         LinkFormat::Elf => {
-            out = teko::list::push(out, "ld.lld")
-            out = teko::list::push(out, "ld")
-            out = teko::list::push(out, "ld.gold")
-            return out
+            ["ld.lld", "ld", "ld.gold"]
         }
     }
 }
 
-/**
- * no_linker_error — the M.3 refusal issued when no candidate is native to the requested target.
- *
- * It names all three things a reader needs and a silent default hides: the target that was WANTED,
- * the candidates that were TRIED, and the rule that made the answer "none". Never a fallback to
- * whatever the PATH holds — that fallback is the defect, not the recovery.
- *
- * @param arch  the machine the link had to target
- * @param fmt   the container format the link had to emit
- * @return      the named error
- */
-fn no_linker_error(arch: LinkArch, fmt: LinkFormat) -> error {
-    error { message = teko::str::concat(
-        "no linker on this host targets ", arch_name(arch), "/", format_name(fmt),
-        ". Tried: ", join_candidates(linker_candidates(arch, fmt)),
-        ". A linker is NOT resolved from the PATH by default (that is how an emulated x86_64 MinGW",
-        " once became the toolchain of an ARM64 runner); install a linker native to the target",
-        " or name one explicitly.") }
+fn no_linker_error(arch: LinkArch, fmt: LinkFormat): error {
+    error { message = $"no linker on this host targets {arch_name(arch)}/{format_name(fmt)}. Tried: {join_candidates(linker_candidates(arch, fmt))}. A linker is NOT resolved from the PATH by default; install a linker native to the target or name one explicitly." }
 }
 
-/**
- * mingw_rejected_error — the M.3 refusal issued when a candidate resolves to a MinGW toolchain.
- *
- * The rejection TEACHES, deliberately. A silent skip would leave someone free to put MinGW back on
- * the PATH in six months and reintroduce the emulated-x86_64-published-as-ARM64 defect, because
- * nothing in the log would say why it had been removed.
- *
- * @param cmd   the command token or path that resolved to MinGW
- * @param arch  the machine the link had to target
- * @return      the named error
- */
-fn mingw_rejected_error(cmd: str, arch: LinkArch) -> error {
-    error { message = teko::str::concat(
-        "refusing the MinGW linker '", cmd, "' for a ", arch_name(arch), " target.",
-        " MinGW is forbidden on every Windows host (owner ruling 2026-07-26): a published",
-        " asset was once minted by an EMULATED MinGW whose machine was not the host's, and",
-        " nobody noticed, because the toolchain was resolved from the PATH instead of chosen.",
-        " Use a linker native to the target (lld-link ships with LLVM).") }
+const MINGW_BAN_REASON: str = "MinGW is forbidden (proibido) on every Windows host: the linker must be native to the target, not an EMULATED one resolved from the PATH."
+
+fn mingw_rejected_error(cmd: str, arch: LinkArch): error {
+    error { message = $"refusing the MinGW linker '{cmd}' for a {arch_name(arch)} target. {MINGW_BAN_REASON} Use a linker native to the target (lld-link ships with LLVM)." }
 }
 
-/**
- * join_candidates — the candidate list as one comma-separated string, for a diagnostic.
- *
- * @param cands  the candidate linker commands
- * @return       "a, b, c", or "(none)" for an empty list
- */
-fn join_candidates(cands: []str) -> str {
+fn join_candidates(cands: []str): str {
     if cands.len == 0 { return "(none)" }
-    mut out = cands[0]
-    mut i: u64 = 1
+    var out = cands[0]
+    var i: u64 = 1
     loop {
         if i >= cands.len { break }
-        out = teko::str::concat(out, ", ", cands[i])
+        out = $"{out}, {cands[i]}"
         i = i + 1
     }
     out
 }
 
-/**
- * linker_targets_arch — does `cmd` actually target (`arch`, `fmt`)?
- *
- * The assertion the ruling demands: finding a linker is not enough, it has to MIRAR o alvo pedido.
- * For a GNU-ld-compatible candidate the question is answered by exit code alone — `-m <emulation>
- * --version` fails on an unsupported emulation — so no output capture is needed, and none exists
- * (`teko::process` exposes `run`/`run_quiet`, both returning only a status).
- *
- * A pair with no GNU emulation name (every Mach-O pair, and the PE linkers, which take
- * `/machine:` rather than `-m`) cannot be probed this way; those return false here and are
- * asserted by their own arm in `resolve_linker`.
- *
- * WHAT THE PROBE MEANS PER VENDOR, measured on linux-x86_64/binutils-2.42 + LLVM lld:
- * `ld -m elf_x86_64 --version` exits 0 and `ld -m aarch64linux --version` exits 1, so for GNU ld
- * this is a genuine DISCRIMINATOR — a host-only BFD ld cannot claim a foreign machine. `ld.lld`
- * exits 0 for both, and that answer is honest rather than permissive: lld carries every target by
- * construction, so it really can emit aarch64 ELF from an x86_64 host. That is CROSS, which is
- * legitimate; what the ruling forbids is an EMULATED toolchain — one whose machine is not the
- * host's — and emulation is caught by `linker_is_mingw` plus the architecture assertion on the
- * PUBLISHED artifact (scripts/produce_assets.sh), not by this probe.
- *
- * @param cmd   the candidate linker command
- * @param arch  the machine the link must target
- * @param fmt   the container format the link must emit
- * @return      true iff the candidate ran and accepted the target's emulation
- */
-fn linker_targets_arch(cmd: str, arch: LinkArch, fmt: LinkFormat) -> bool {
-    let emu = gnu_emulation_for(arch, fmt)
+fn linker_targets_arch(cmd: str, arch: LinkArch, fmt: LinkFormat): bool {
+    var emu = gnu_emulation_for(arch, fmt)
     if emu.len == 0 { return false }
-    mut argv: []str = teko::list::empty()
-    argv = teko::list::push(argv, cmd)
-    argv = teko::list::push(argv, "-m")
-    argv = teko::list::push(argv, emu)
-    argv = teko::list::push(argv, "--version")
+    var argv: []str = [
+        cmd, "-m", emu, "--version"
+    ]
     teko::process::run_quiet(argv) == 0
 }
 
-/**
- * pe_linker_targets_arch — does the PE candidate `cmd` target `arch`?
- *
- * `lld-link` and MSVC `link` take `/machine:<ARCH>` instead of GNU's `-m <emulation>`, and both
- * exit non-zero on a machine they cannot emit. `/?` makes the probe a help request rather than a
- * link attempt, so nothing is written and no input is needed.
- *
- * A machine this build has no PE target for spells to "" and is REFUSED here rather than probed:
- * a machine name the probe cannot assert must never reach a linker, because a candidate that
- * happens to exit 0 would then stand in for an assertion that was never made.
- *
- * @param cmd   the candidate PE linker command
- * @param arch  the machine the link must target
- * @return      true iff the candidate ran and accepted the machine
- */
-fn pe_linker_targets_arch(cmd: str, arch: LinkArch) -> bool {
-    let machine = match arch {
+fn pe_linker_targets_arch(cmd: str, arch: LinkArch): bool {
+    var machine = match arch {
         LinkArch::X8664 => "/machine:X64"
         LinkArch::Arm64 => ""
     }
     if machine.len == 0 { return false }
-    mut argv: []str = teko::list::empty()
-    argv = teko::list::push(argv, cmd)
-    argv = teko::list::push(argv, machine)
-    argv = teko::list::push(argv, "/?")
+    var argv: []str = [
+        cmd, machine, "/?"
+    ]
     teko::process::run_quiet(argv) == 0
 }
 
-/**
- * candidate_targets — the format-aware architecture assertion for one candidate.
- *
- * @param cmd   the candidate linker command
- * @param arch  the machine the link must target
- * @param fmt   the container format the link must emit
- * @return      true iff the candidate is native to the requested target
- */
-fn candidate_targets(cmd: str, arch: LinkArch, fmt: LinkFormat) -> bool {
+fn macho_linker_targets_arch(cmd: str, arch: LinkArch): bool {
+    var argv: []str = [
+        cmd, "-arch", arch_name(arch), "-v"
+    ]
+    teko::process::run_quiet(argv) == 0
+}
+
+fn candidate_targets(cmd: str, arch: LinkArch, fmt: LinkFormat): bool {
     if fmt == LinkFormat::Pe { return pe_linker_targets_arch(cmd, arch) }
+    if fmt == LinkFormat::Macho { return macho_linker_targets_arch(cmd, arch) }
     linker_targets_arch(cmd, arch, fmt)
 }
 
-/**
- * resolve_linker — the linker for (`arch`, `fmt`), or a named refusal.
- *
- * Walks `linker_candidates` in order and returns the FIRST candidate that both survives the MinGW
- * ban and passes the architecture assertion. There is no last-resort arm: a host with no native
- * linker gets `no_linker_error`, never a silent `"cc"`.
- *
- * @param arch  the machine the link must target
- * @param fmt   the container format the link must emit
- * @return      the linker command to invoke
- * @throws      `mingw_rejected_error` when the only viable candidate is MinGW, else
- *              `no_linker_error` when no candidate targets the requested machine
- */
-fn resolve_linker(arch: LinkArch, fmt: LinkFormat) -> str | error {
-    let cands = linker_candidates(arch, fmt)
-    mut saw_mingw = ""
-    mut i: u64 = 0
+fn resolve_linker(arch: LinkArch, fmt: LinkFormat): str | error {
+    var cands = linker_candidates(arch, fmt)
+    var saw_mingw = ""
+    var i: u64 = 0
     loop {
         if i >= cands.len { break }
-        let cmd = cands[i]
+        var cmd = cands[i]
         if linker_is_mingw(cmd) {
             saw_mingw = cmd
         } else if candidate_targets(cmd, arch, fmt) {

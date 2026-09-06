@@ -1,0 +1,281 @@
+// teko_heaparr.tk -- K3 (D221/§41): `T[]` of heap, C#'s array type -- an
+// object with the SAME shape a delegate's is (vtable, count, then its own
+// data), one row of teko_struct.tk's type table per distinct ELEMENT type,
+// made lazily the first time it is spelled or allocated:
+//
+//   i64[] xs = new i64[n];
+//   xs[i]  xs[i] = e  xs[i] += k  xs.Length
+//   Circle[] cs = new Circle[n];   // an element release runs per slot
+//
+// TYPE POSITION. `T[]` is the sibling `syntax_type(&tk_ha_type)` gives
+// `syntax_param` (mc 0.14.2, the §41(e) request this port made): consulted
+// right after the core -- or `tk_gen_ty`'s own fallback to `p_type()`, or
+// this module's own two edits to `tk_default_param`/`tk_ref_param` -- reads a
+// type word and advances past it, at every position a type may be written in
+// (`p_type()`, a local, a global, a cast, an `extern`, a parameter of a free
+// function or of a member). `tk_ha_row` (teko_struct.tk, the row identity
+// `tk_is_counted` already shares) is memoized per element, so `i64[]` spelled
+// twice is one row; `T[][]` is refused where the SECOND `[]` is read, because
+// nothing here lowers a nested one.
+//
+// LAYOUT (the object `new T[n]` allocates):
+//
+//   +0  vtable pointer   ->  {+0 &tkarr_release_T, +8 0}   (TK_HAVTSIZE, the
+//                                                            same 2-word shape
+//                                                            a delegate's own
+//                                                            vtable carries)
+//   +8  reference count
+//   +16 length (the `n` `new` was given)
+//   +24 elements, width = type_width(T)
+//
+// so `rc_dec` (ngen/lib/rt.tk) frees an array it knows nothing about exactly
+// as it frees a class: through word 0 of the vtable. The array object is
+// COUNTED regardless of what T is (`tk_is_counted`, teko_struct.tk); an
+// ELEMENT is released too, but ONLY when T itself is counted
+// (`tkarr_release_T` skips the per-slot pass otherwise) -- `rt_release_array`
+// (already in lib/rt.tk, today serving an inline array FIELD) is reused
+// as-is.
+//
+// INDEXING AND `Length`. `xs[i]` is a run-time-checked address, `tk_arr_at`
+// (lib/rt.tk, new): `0 <= i < xs.Length` or `panic`; `Length` itself is
+// read-only, `ld64(xs + 16)`. Both resolve AT PARSE TIME, in `tk_bracket`
+// (teko_params.tk) and `tk_dot` (teko_expr.tk)'s own `tk_member_of`, the same
+// early branch the array-FIELD and local-fixed-array cases already are --
+// for a receiver the parser already types (a local, teko_struct.tk's own
+// `on_stmt`; a field, teko_expr.tk's `tk_field_use`; a call's own return)
+// AND for a PARAMETER of `T[]` type, which the core never reports mid-body
+// any more than a struct/class one is, but whose OWN type this module
+// already knows: `teko_struct.tk`'s `tk_hp_*` table records it the instant
+// `teko_default.tk`/`teko_class.tk` read the parameter, before the body
+// that indexes it is even parsed -- no oracle, no placeholder, no deferred
+// pass, the same reason `ref`/`out`'s own pointee (K2) needs none once the
+// parameter itself is in hand.
+//
+// `panic` (K1, D221 §41 decision 18) is the guard `tk_arr_at` calls on an
+// out-of-range index -- the same `rt_panic`, `exit(70)`, every other guard in
+// this port uses.
+
+#define TK_HAOBJSIZE 24                // vtable + count + length, before elements
+#define TK_HAVTSIZE  16                // release + an unused itab word (delegate's own shape)
+
+i64  ha_gen[TK_MAXSTRUCT];             // 1 once a row's vtable/release/alloc are top_add-ed
+i64  ha_gen_at(i64 i)        { return ld64(ha_gen + i * 8); }
+void set_ha_gen_at(i64 i, i64 v) { st64(ha_gen + i * 8, v); }
+
+// teko_expr.tk is included after this file: `xs[i](args)`, an array whose
+// ELEMENT is a delegate (`Op[]`), reads the argument list the same way a
+// delegate FIELD's own call does (`tk_field_deleg_call`).
+i64 tk_args(uptr pn);
+
+uptr tk_ha_relname(i64 ety)   { return tk_join("tkarr_release_", type_name(ety)); }
+uptr tk_ha_vtname(i64 ety)    { return tk_join("tkarr_vt_", type_name(ety)); }
+uptr tk_ha_allocname(i64 ety) { return tk_join("tkarr_new_", type_name(ety)); }
+
+// `ld64(t + 16)`, freshly built every time: a node lives in only one sibling
+// list, so a caller that needs it twice (the release fn's own size, and,
+// when T is counted, the element count it passes to `rt_release_array` too)
+// builds it twice rather than clone it.
+i64 tk_ha_len(uptr t) { return tk_call("ld64", tk_bin(K_ADD, tk_id(t), tk_int(16))); }
+
+// `void tkarr_release_T(uptr p) { [rt_release_array(p+24, len);] rt_free(p, 24+len*W); }`
+// -- the per-slot pass runs only when an ELEMENT is itself counted; the array
+// object is freed regardless of T.
+i64 tk_ha_release_fn(i64 ety, uptr relname) {
+    uptr t = "p";
+    i64 size = tk_bin(K_ADD, tk_int(TK_HAOBJSIZE), tk_bin(K_MUL, tk_ha_len(t), tk_int(type_width(ety))));
+    i64 st = 0;
+    if (tk_is_counted(ety)) {
+        i64 base = tk_bin(K_ADD, tk_id(t), tk_int(TK_HAOBJSIZE));
+        st = tk_stmt(tk_call2("rt_release_array", base, tk_ha_len(t)));
+    }
+    st = list_append(st, tk_stmt(tk_call2("rt_free", tk_id(t), size)));
+    return tk_func(TY_VOID, relname, param_new(TY_UPTR, t), tk_blk(st));
+}
+
+// `T[] tkarr_new_T(i64 n) { if (n<0) panic; uptr p=rt_alloc(24+n*W); vtable/
+// count/length installed; return p; }` -- the vtable is filled on every
+// call, idempotently, the same shape a delegate's own allocator fills.
+i64 tk_ha_alloc_fn(i64 si, i64 ety, uptr allocname, uptr vtname, uptr relname) {
+    i64 w = type_width(ety);
+    i64 guard = tk_if(tk_bin(K_LT, tk_id("n"), tk_int(0)),
+                      tk_stmt(tk_call("panic", tk_str("a negative array length"))));
+    i64 size = tk_bin(K_ADD, tk_int(TK_HAOBJSIZE), tk_bin(K_MUL, tk_id("n"), tk_int(w)));
+    i64 st = list_append(guard, tk_var(TY_UPTR, "p", tk_call("rt_alloc", size)));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_id(vtname), tk_addr(relname))));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_id("p"), tk_id(vtname))));
+    i64 cnt = tk_bin(K_ADD, tk_id("p"), tk_int(8));
+    st = list_append(st, tk_stmt(tk_call2("st64", cnt, tk_int(1))));
+    i64 lenslot = tk_bin(K_ADD, tk_id("p"), tk_int(16));
+    st = list_append(st, tk_stmt(tk_call2("st64", lenslot, tk_id("n"))));
+    i64 r = tk_id("p");
+    tk_xt_add(r, si, 0);                          // already owned: the count above, not rt_own
+    st = list_append(st, tk_ret(r));
+    return tk_func(sr_ty_at(si), allocname, param_new(TY_I64, "n"), tk_blk(st));
+}
+
+// generates the three top-level declarations a row needs, once, the first
+// time the row is actually ALLOCATED (`new T[n]`) -- not the first time it is
+// merely SPELLED, which may happen mid a parameter list still being read
+// (`top_add` resets `p_decl_name()`, which would corrupt the very
+// declaration `syntax_param` is inside if this ran there).
+void tk_ha_ensure_gen(i64 si) {
+    if (ha_gen_at(si)) return;
+    set_ha_gen_at(si, 1);
+    i64 ety = ha_ety_at(si);
+    uptr relname = tk_ha_relname(ety);
+    uptr vtname = tk_ha_vtname(ety);
+    top_add(tk_glb(TY_U8, vtname, TK_HAVTSIZE));
+    top_add(tk_ha_release_fn(ety, relname));
+    top_add(tk_ha_alloc_fn(si, ety, tk_ha_allocname(ety), vtname, relname));
+}
+
+// `tk_arr_at(base, idx, width)` -- the run-time-checked address (lib/rt.tk's
+// new `tk_arr_at`), shared by every load/store/compound below.
+i64 tk_ha_addr(i64 base, i64 idx, i64 ety) {
+    return tk_call("tk_arr_at", list_append(list_append(base, idx), tk_int(type_width(ety))));
+}
+
+// the borrowed load: `tk_arr_load` (teko_array.tk) already sign-extends a
+// narrow signed element, and a counted one is tagged pure (re-reading the
+// slot is free) exactly as the struct-field precedent tags its own.
+i64 tk_ha_load(i64 base, i64 ety, i64 idx) {
+    i64 r = tk_arr_load(ety, tk_ha_addr(base, idx, ety));
+    i64 es = tk_struct_by_ty(ety);
+    if (es >= 0) tk_xt_add(r, es, 1);
+    return r;
+}
+
+// the store: the SAME `stW(addr, v)` call teko_struct.tk's own array-field
+// store builds, marked for teko_rc.tk's own pass to pick between `rt_store`/
+// `rt_store_own` when the element is counted -- zero new machinery there.
+i64 tk_ha_store(i64 base, i64 ety, i64 idx, i64 v) {
+    tk_check_field_store(ety, v, tk_line, tk_file);
+    return tk_os_mark(tk_call2(tk_stn(ety), tk_ha_addr(base, idx, ety), v), ety);
+}
+
+// `xs[i] OP= e` / `xs[i]++` / `xs[i]--`: the address is built twice (once to
+// read, once to write), the same trade `tk_arr_compound`'s own header
+// accepts for a local fixed array -- no fixture indexes with a call.
+i64 tk_ha_compound(i64 base, i64 ety, i64 idx, i64 op, i64 v) {
+    i64 idx2 = tk_clone(idx);
+    i64 base2 = tk_clone(base);
+    i64 cur = tk_ha_load(base, ety, idx);
+    return tk_ha_store(base2, ety, idx2, tk_bin(op, cur, v));
+}
+
+// `xs[i](args)` -- an array whose ELEMENT is a delegate (`Op[]`): the same
+// call `teko_expr.tk`'s own `tk_field_deleg_call` builds for a delegate
+// FIELD, over the array's own guarded address instead of a field's fixed
+// offset.
+i64 tk_ha_deleg_call(i64 addr, i64 ety, i64 di, i64 line, uptr fl) {
+    i64 obj = tk_call(tk_ldn(ety), addr);
+    i64 na = 0;
+    i64 args = tk_args(&na);
+    i64 r = tk_deleg_build(di, obj, args, na, line, fl);
+    i64 ret = dg_ret_at(di);
+    tk_xt_put(r, tk_struct_by_ty(ret), ret, 0);
+    return r;
+}
+
+// `xs[i]`, `xs[i] = e`, `xs[i] += e` / `-=` / `++` / `--`: `left` already
+// types as a `T[]` row -- a local, a field, or a call's own return -- so the
+// element type and the guarded address are known here, at parse time, the
+// same early branch the array-FIELD and local-fixed-array cases already are
+// (teko_params.tk's own `tk_bracket`).
+i64 tk_ha_index(i64 left, i64 si) {
+    i64 ety = ha_ety_at(si);
+    i64 line = p_line();
+    uptr fl = p_file();
+    i64 idx = parse_expr(0);
+    p_expect(K_RBRACK, "expected ] after the index");
+    tk_line = line;
+    tk_file = fl;
+    if (tk_bracket_no_write && tk_arr_write_follows())
+        err_at(fl, line, "teko: the left side of = is not a place");
+    if (p_accept(K_ASSIGN)) {
+        i64 v = parse_expr(0);
+        tk_line = line;
+        tk_file = fl;
+        i64 dsi = tk_deleg_row(ety);               // `ops[i] = add;`: the same coercion a
+        if (dsi >= 0) {                                        // delegate LOCAL/field takes (K1)
+            if (tk_lam_escapes(v))                              // D221/§41 K4b
+                err_at(fl, line, "teko: a lambda that captures by reference cannot leave its scope");
+            v = tk_deleg_coerce(dsi, v, line, fl);
+        }
+        return tk_ha_store(left, ety, idx, v);
+    }
+    if (p_id() == tk_pluseq_tok || p_id() == tk_minuseq_tok) {
+        i64 op = K_ADD;
+        if (p_id() == tk_minuseq_tok) op = K_SUB;
+        p_next();
+        i64 e = parse_expr(0);
+        tk_line = line;
+        tk_file = fl;
+        return tk_ha_compound(left, ety, idx, op, e);
+    }
+    if (p_id() == tk_incr_tok || p_id() == tk_decr_tok) {
+        i64 op = K_ADD;
+        if (p_id() == tk_decr_tok) op = K_SUB;
+        p_next();
+        tk_line = line;
+        tk_file = fl;
+        return tk_ha_compound(left, ety, idx, op, tk_int(1));
+    }
+    i64 di = tk_deleg_row(ety);
+    if (di >= 0 && p_id() == K_LPAR) return tk_ha_deleg_call(tk_ha_addr(left, idx, ety), ety, di, line, fl);
+    return tk_ha_load(left, ety, idx);
+}
+
+// `xs.Length` -- the one member a `T[]` answers, checked here because
+// `tk_member_of` already knows `left` types as a KARRAY row.
+i64 tk_ha_member_of(i64 left, i64 si, uptr m, i64 line, uptr fl) {
+    if (!str_eq(m, "Length")) err_at2(fl, line, "teko: an array has no member", m);
+    if (p_id() == K_ASSIGN) err_at2(fl, line, "teko: is read-only", m);
+    tk_line = line;
+    tk_file = fl;
+    return tk_call("ld64", tk_bin(K_ADD, left, tk_int(16)));
+}
+
+// `new T[n]` -- the type word `T` was already read (`type_of_token`, before
+// `tk_new` consumed it) and the `[` is what tells this apart from `new
+// Op(fn)`/`new Point`/`new Box<...>`. `ety` can never itself be a `T[]` row
+// here: its own reserved word (`i64[]`) is a lexeme the lexer cannot form, so
+// no source text can name it as the word right after `new` -- `T[][]` is
+// refused where it is actually written, the type position (`tk_ha_type`).
+i64 tk_new_array(i64 ety, i64 line, uptr fl) {
+    if (ety == TY_VOID) err_at(fl, line, "teko: an array of type void");
+    p_next();                                     // the '['
+    if (p_id() == K_RBRACK) err_at(fl, line, "teko: `new T[]` needs a length; write `new T[n]`");
+    i64 n = parse_expr(0);
+    p_expect(K_RBRACK, "expected ] after the array length");
+    tk_line = line;
+    tk_file = fl;
+    i64 ty = tk_ha_row(ety);
+    i64 si = tk_struct_by_ty(ty);
+    tk_ha_ensure_gen(si);
+    i64 call = tk_call(tk_ha_allocname(ety), n);
+    tk_xt_add(call, si, 0);
+    return call;
+}
+
+// `syntax_type`: consulted right after the core has read a type word and
+// advanced past it, at every position that reads one -- a suffix this
+// module owns, `[]`, answers with `tk_ha_row`'s own memoized id; anything
+// else stands. `take_type` (mc's own) dispatches this ONCE per type
+// position, so a SECOND `[]` right after the first (`T[][]`) is not another
+// call here -- it is refused right where it stands, with a message of this
+// module's own, rather than left for the core to stumble into later.
+i64 tk_ha_type(i64 ty) {
+    if (ty == TY_VOID) return 0;
+    if (p_id() != K_LBRACK) return 0;
+    p_next();
+    p_expect(K_RBRACK, "expected ] after the element type");
+    i64 line = p_line();
+    uptr fl = p_file();
+    if (p_id() == K_LBRACK) err_at(fl, line, "teko: an array of arrays is not taught yet");
+    return tk_ha_row(ty);
+}
+
+void tk_ha_init() {
+    syntax_type(&tk_ha_type);
+}

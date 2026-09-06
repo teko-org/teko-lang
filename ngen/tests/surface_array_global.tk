@@ -1,0 +1,116 @@
+// surface_array_global.tk -- a global `T[]` of heap (G1, §50): `i64[] g;`
+// with no bracket count of its own, `g = new i64[n];` at some later
+// statement, `g[i]`/`g[i] = e`/`+=`/`++`, `g.Length` as the bound of a
+// `while` AND of a `for`, `u8`/`i32` global elements proving width and sign,
+// `Circle[] cs` global -- a ROOT, never released, so `rt_live()` never
+// returns to the floor once it grows -- and a `T[]` global declared inside a
+// `namespace`.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64[] g;
+
+i64 fill_and_sum(i64 n) {
+    g = new i64[n];
+    i64 i = 0;
+    while (i < g.Length) {
+        g[i] = i;
+        i = i + 1;
+    }
+    i64 sum = 0;
+    for (i64 j = 0; j < g.Length; j++) {
+        sum = sum + g[j];
+    }
+    return sum;
+}
+
+i64 compoundcheck() {
+    g[0] += 100;
+    g[1] -= 1;
+    g[2]++;
+    if (g[0] != 100) return 1;
+    if (g[1] != 0) return 2;
+    if (g[2] != 3) return 3;
+    return 0;
+}
+
+u8[] bs;
+i32[] ws;
+
+i64 widthcheck() {
+    bs = new u8[2];
+    bs[0] = 250;
+    bs[1] = 10;
+    if (bs[0] + bs[1] != 260) return 1;
+    ws = new i32[1];
+    ws[0] = 0 - 7;
+    if (ws[0] >= 0) return 2;
+    if (ws[0] != 0 - 7) return 3;
+    return 0;
+}
+
+class Circle {
+    i64 r;
+
+    public Circle(i64 r) { this.r = r; }
+    public i64 area() { return r * r; }
+}
+
+Circle[] cs;
+
+i64 sumAreas() {
+    i64 total = 0;
+    i64 i = 0;
+    while (i < cs.Length) {
+        total = total + cs[i].area();
+        i = i + 1;
+    }
+    return total;
+}
+
+i64 circlecheck() {
+    cs = new Circle[3];
+    cs[0] = new Circle(1);
+    cs[1] = new Circle(2);
+    cs[2] = new Circle(3);
+    return sumAreas();
+}
+
+namespace geo {
+    i64[] pts;
+
+    i64 sum_pts(i64 n) {
+        pts = new i64[n];
+        i64 i = 0;
+        while (i < pts.Length) {
+            pts[i] = i * 2;
+            i = i + 1;
+        }
+        i64 s = 0;
+        for (i64 j = 0; j < pts.Length; j++) {
+            s = s + pts[j];
+        }
+        return s;
+    }
+}
+
+i64 main() {
+    i64 sum = fill_and_sum(5);
+    if (sum != 10) return 1;                      // 0+1+2+3+4
+
+    i64 bad = compoundcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = widthcheck();
+    if (bad != 0) return 20 + bad;
+
+    i64 floor = rt_live();                        // g/bs/ws are roots too, allocated already
+    if (circlecheck() != 14) return 32;
+    if (rt_live() != floor + 4) return 33;        // the array object + the 3 circles: a ROOT,
+                                                   // never released -- the floor is gone for good
+    if (geo.sum_pts(4) != 12) return 40;          // 0+2+4+6
+
+    return 42;
+}

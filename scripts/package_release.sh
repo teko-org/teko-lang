@@ -23,9 +23,13 @@
 #   win32_compat.h         POSIX->Win32 shims; #ifdef _WIN32 no-op on POSIX, but
 #                          runtime/teko_rt.c does #include "../win32_compat.h" so it must
 #                          be present at the bundle root for a Windows `cc` to find it.
+#   runtime/arena.tks      §16 crumb I0: the Teko-over-mmap arena SOURCE the installed compiler
+#                          injects into every user program (not needed to build teko.c itself).
+#   sys/sys.tks            §16 crumb I0: the const-only teko::sys ABI values the injected arena
+#                          references; sibling of runtime/ (rt_dir()'s <parent>/sys shape).
 # assert/assert.h does #include "../runtime/teko_rt.h", so runtime/ and assert/ MUST be
 # siblings and win32_compat.h MUST sit at the bundle root (teko_rt.c reaches it via ../).
-# Build line (POSIX):   cc -std=c23 -Iruntime -Iassert teko.c runtime/teko_rt.c assert/assert.c -lm -o teko
+# Build line (POSIX):   cc -std=c23 -Iruntime -Iassert teko.c runtime/teko_rt.c assert/assert.c -o teko
 #
 # Usage:
 #   package_release.sh <LABEL> <GEN2_DIR> <SRC_DIR> <OUT_DIR> [os]
@@ -96,7 +100,7 @@ if [ "${EMIT_SRC_BUNDLE:-0}" = "1" ]; then
     SRC_BUNDLE="teko-bootstrap-src"
     SSTAGE="$OUT_DIR/.stage-src/$SRC_BUNDLE"
     rm -rf "$OUT_DIR/.stage-src"
-    mkdir -p "$SSTAGE/runtime" "$SSTAGE/assert"
+    mkdir -p "$SSTAGE/runtime" "$SSTAGE/assert" "$SSTAGE/sys"
 
     cp "$GEN3_DIR/teko.c"            "$SSTAGE/teko.c"
     cp "$SRC_DIR/runtime/teko_rt.c" "$SSTAGE/runtime/teko_rt.c"
@@ -105,18 +109,35 @@ if [ "${EMIT_SRC_BUNDLE:-0}" = "1" ]; then
     cp "$SRC_DIR/assert/assert.h"   "$SSTAGE/assert/assert.h"
     cp "$SRC_DIR/win32_compat.h"    "$SSTAGE/win32_compat.h"
 
+    # §16 runtime-prelude injection (crumb I0): the compiler injects these Teko runtime SOURCES
+    # into every ordinary program so the Teko-over-mmap arena is compiled INTO its own teko.c
+    # (rt_inject_namespaces / inject_runtime_prelude, src/build/project.tks). They ride beside the
+    # C runtime probe dir: arena.tks (namespace teko::runtime) in runtime/, sys.tks (teko::sys) in
+    # a sibling sys/. An install without them makes `teko build` of a user program fail to inject.
+    cp "$SRC_DIR/runtime/arena.tks" "$SSTAGE/runtime/arena.tks"
+    cp "$SRC_DIR/runtime/sync.tks"  "$SSTAGE/runtime/sync.tks"
+    cp "$SRC_DIR/runtime/thread.tks" "$SSTAGE/runtime/thread.tks"
+    cp "$SRC_DIR/sys/sys.tks"       "$SSTAGE/sys/sys.tks"
+
     # A ready-to-run build script inside the bundle (POSIX + a Windows note).
     cat > "$SSTAGE/build.sh" <<'EOF'
 #!/usr/bin/env sh
 # Build the Teko bootstrap compiler from this portable snapshot with any C23 cc.
 # POSIX:   ./build.sh            (uses $CC or cc)
 # Windows: clang -std=c23 -Iruntime -Iassert teko.c runtime/teko_rt.c assert/assert.c -o teko.exe
-#          (MSVC is NOT supported — the runtime needs __int128 / GCC-Clang extensions.)
+#          (MSVC's own cl.exe is NOT supported — the runtime and the emitted C need GCC/Clang
+#          extensions: _Float16, __builtin_*_overflow, statement expressions. clang targeting the
+#          MSVC ABI IS supported; the 128-bit types that once forced libgcc are gone.)
 set -eu
 CC="${CC:-cc}"
-"$CC" -std=c23 -w -Iruntime -Iassert \
+# -pthread: teko_rt.c's tk_thread_spawn (§10 C0a) needs pthread on non-Windows (Windows uses
+# CreateThread). Kept off the Windows lane. Retired when teko_rt.c goes to FFI (§16).
+REL_PTHREAD="-pthread"
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*|Windows_NT) REL_PTHREAD="" ;; esac
+# shellcheck disable=SC2086  # REL_PTHREAD is a flag and must word-split.
+"$CC" -std=c23 -w $REL_PTHREAD -Iruntime -Iassert \
     teko.c runtime/teko_rt.c assert/assert.c \
-    -lm -o teko
+    -o teko
 echo "built ./teko"
 EOF
     chmod +x "$SSTAGE/build.sh"

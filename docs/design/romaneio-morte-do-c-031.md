@@ -77,7 +77,7 @@ se resolve deletando alguma coisa.
 |---|---:|
 | `src/codegen/codegen.tks` — o emissor de C | **10.727** |
 | `src/lir/**` — lowering para LIR | 8.474 |
-| `src/backend/**` — isel, regalloc, stackify, objfile | 33.464 |
+| `src/backend/**` — isel, regalloc, objfile | 33.464 |
 
 O caminho nativo já é **quatro vezes** o emissor de C. O C não é a implementação principal com um
 experimento nativo ao lado; é o contrário, há muito tempo. As 10.727 linhas do emissor são a maior
@@ -183,7 +183,7 @@ pagando por isso com trabalho de lowering (o N2) que nada tem a ver com o proble
 mais o preço do alvo de 10 builds.
 
 **A medição que confirma o ruling** (`regressor.tkr` pós-excisão, 344 linhas, Features R0/F2/F5/F7/F9):
-avulsos (`x86_64-windows`, `x86_64-linux`, `wasm32-wasi`). **Todo o resto varia só em fonte e exit
+avulsos (`x86_64-windows`, `x86_64-linux`). **Todo o resto varia só em fonte e exit
 esperado**, isto é: não precisa de build próprio para nada.
 
 **A convergência que fecha o argumento.** Oito dos nove diretórios de `examples/regressions/` são
@@ -200,7 +200,7 @@ Desenho decorrente, despachado em `cargo/20-regressor-canais`:
 | diagnostics | todos os compile-fail, **um** build que falha | 1 |
 | cross-ns | os 8 de composição, juntos e por isso mais densos | 1 |
 | `cwd_build` | semântica de cwd própria | 1 |
-| avulsos | `wasm32-wasi`, `x86_64-windows` | 2 |
+| avulsos | `x86_64-windows` | 1 |
 
 **A lição de método, que vale além deste caso:** quando um mecanismo de otimização quebra porque
 seu eixo morreu, a pergunta certa não é *"como restauro o mecanismo?"* — é *"o mecanismo ainda tem

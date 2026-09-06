@@ -1,0 +1,254 @@
+
+use teko::parser
+
+pub const TK_REGION_STACK_CAP: u64 = 64
+
+pub const ARENA_DEPTH_DEFAULT: u64 = 1
+
+pub type Scope = struct { }
+
+pub type Frame = struct { }
+
+pub type Caller = struct { }
+
+pub type Root = struct { }
+
+pub type Unresolved = struct { }
+
+macro ResidenceTier() { lowering { Scope | Frame | Caller | Root | Unresolved } }
+
+pub type BindingResidence = struct {
+    name: str
+    tier: @ResidenceTier()
+}
+
+pub type ReturnResidence = struct {
+    is_move: bool
+    tier: @ResidenceTier()
+}
+
+pub type ResidencePlan = struct {
+    bindings: []BindingResidence
+    returns: []ReturnResidence
+}
+
+pub fn residence_tier(is_singleton: bool, pt: @PointsTo(), escapes_frame: bool, is_block_local: bool): @ResidenceTier() {
+    if is_singleton { return Root { } }
+    match pt {
+        PtRoot => return Root { }
+        PtParam => return Caller { }
+        PtTop => return Unresolved { }
+        PtFrame => { }
+        PtAdopter => { }
+    }
+    if escapes_frame { return Caller { } }
+    if is_block_local { return Scope { } }
+    Frame { }
+}
+
+pub fn residence_plan(f: TFunction, table: TypeTable): ResidencePlan {
+    var sp = fn_spine(f)
+    var escaping = fn_escaping_vars(f)
+    var bindings = plan_block_bindings(f.body, f.body, false, sp, escaping, table)
+    var returns = plan_block_returns(f.body, sp)
+    ResidencePlan { bindings = bindings; returns = returns }
+}
+
+/**
+ * binding_is_service_singleton — true when binding `b`'s declared type is a `service singleton`, the
+ * declarative root residence: such a binding must reside in `Root`, not the enclosing scope/frame. Reuses
+ * the landed `is_service_name`/`service_lifetime_of`, the same trail the service ctor routing already
+ * uses. A `service scoped`/`transient` binding is not root — it takes the ordinary scope/frame residence.
+ *
+ * @param b      the typed binding
+ * @param table  the checker type table (to resolve the type name to its service lifetime)
+ * @return       true iff `b`'s type is a `service singleton`
+ * @since 0.3.1
+ */
+fn binding_is_service_singleton(b: TBinding, table: TypeTable): bool {
+    match b.bound {
+        Named as nm => {
+            if !is_service_name(nm.name, table) { return false }
+            match service_lifetime_of(nm.name, table) {
+                parser::ServiceLifetime as lt => lifetime_eq(lt, parser::ServiceLifetime::Singleton)
+                null => false
+            }
+        }
+        _ => false
+    }
+}
+
+fn binding_name(b: TBinding): str {
+    match b.target {
+        parser::SimpleName as sn => sn.name
+        parser::DestructurePattern => ""
+    }
+}
+
+fn residence_name_in_set(set: []str, name: str): bool {
+    var i = 0
+    loop {
+        if i >= set.len { break }
+        if set[i] == name { return true }
+        i++
+    }
+    false
+}
+
+fn binding_points_to(sp: Spine, name: str): @PointsTo() {
+    if name == "" { return PtTop { } }
+    var idx = cell_of(sp, name)
+    if idx < 0 { return PtFrame { } }
+    sp.pt[idx to u32]
+}
+
+fn plan_binding(b: TBinding, fn_body: []@TStatement(), block_body: []@TStatement(), is_value: bool, sp: Spine, escaping: []str, table: TypeTable): BindingResidence {
+    var name = binding_name(b)
+    var is_singleton = binding_is_service_singleton(b, table)
+    var pt = binding_points_to(sp, name)
+    var escapes = residence_name_in_set(escaping, name)
+    var blk_local = binding_is_block_local(escaping, fn_body, block_body, is_value, b)
+    BindingResidence { name = name; tier = residence_tier(is_singleton, pt, escapes, blk_local) }
+}
+
+fn append_residences(acc: []BindingResidence, more: []BindingResidence): []BindingResidence {
+    var a = acc
+    var i = 0
+    loop {
+        if i >= more.len { break }
+        a = [..a, more[i]]
+        i++
+    }
+    a
+}
+
+fn plan_block_bindings(block: []@TStatement(), fn_body: []@TStatement(), is_value: bool, sp: Spine, escaping: []str, table: TypeTable): []BindingResidence {
+    var acc: []BindingResidence = []
+    var i = 0
+    loop {
+        if i >= block.len { break }
+        acc = plan_stmt_bindings(block[i], fn_body, block, is_value, sp, escaping, acc, table)
+        i++
+    }
+    acc
+}
+
+fn plan_stmt_bindings(s: @TStatement(), fn_body: []@TStatement(), block: []@TStatement(), is_value: bool, sp: Spine, escaping: []str, acc: []BindingResidence, table: TypeTable): []BindingResidence {
+    match s {
+        TBinding as b => [..acc, plan_binding(b, fn_body, block, is_value, sp, escaping, table)]
+        TLoopStmt as l => {
+            var with_init = append_residences(acc, plan_block_bindings(l.init, fn_body, false, sp, escaping, table))
+            append_residences(with_init, plan_block_bindings(l.body, fn_body, false, sp, escaping, table))
+        }
+        TDeferStmt as d => append_residences(acc, plan_block_bindings(d.body, fn_body, false, sp, escaping, table))
+        TAdoptStmt as a => append_residences(acc, plan_block_bindings(a.body, fn_body, false, sp, escaping, table))
+        TBlockStmt as b => append_residences(acc, plan_block_bindings(b.body, fn_body, false, sp, escaping, table))
+        _ => acc
+    }
+}
+
+fn return_points_to(e: TExpr, sp: Spine): @PointsTo() {
+    match e.kind {
+        TVar as v => binding_points_to(sp, v.name)
+        _ => PtFrame { }
+    }
+}
+
+fn plan_return(r: TReturn, sp: Spine): ReturnResidence {
+    if !r.has_value { return ReturnResidence { is_move = false; tier = Frame { } } }
+    match return_points_to(r.value, sp) {
+        PtParam => ReturnResidence { is_move = false; tier = Caller { } }
+        PtRoot => ReturnResidence { is_move = false; tier = Root { } }
+        PtTop => ReturnResidence { is_move = true; tier = Unresolved { } }
+        PtFrame => ReturnResidence { is_move = true; tier = Caller { } }
+        PtAdopter => ReturnResidence { is_move = true; tier = Caller { } }
+    }
+}
+
+fn append_returns(acc: []ReturnResidence, more: []ReturnResidence): []ReturnResidence {
+    var a = acc
+    var i = 0
+    loop {
+        if i >= more.len { break }
+        a = [..a, more[i]]
+        i++
+    }
+    a
+}
+
+fn plan_block_returns(block: []@TStatement(), sp: Spine): []ReturnResidence {
+    var acc: []ReturnResidence = []
+    var i = 0
+    loop {
+        if i >= block.len { break }
+        acc = plan_stmt_returns(block[i], sp, acc)
+        i++
+    }
+    acc
+}
+
+fn plan_stmt_returns(s: @TStatement(), sp: Spine, acc: []ReturnResidence): []ReturnResidence {
+    match s {
+        TReturn as r => [..acc, plan_return(r, sp)]
+        TLoopStmt as l => {
+            var with_init = append_returns(acc, plan_block_returns(l.init, sp))
+            append_returns(with_init, plan_block_returns(l.body, sp))
+        }
+        TDeferStmt as d => append_returns(acc, plan_block_returns(d.body, sp))
+        TAdoptStmt as a => append_returns(acc, plan_block_returns(a.body, sp))
+        TBlockStmt as b => append_returns(acc, plan_block_returns(b.body, sp))
+        _ => acc
+    }
+}
+
+fn slot_bytes(t: @Type()): usize {
+    match t {
+        Prim as p => (prim_width(p.kind, host_target()) / 8) to usize
+        Byte => 1
+        _ => 8
+    }
+}
+
+pub fn scope_slot_count(body: []@TStatement()): usize {
+    var total: usize = 0
+    var i = 0
+    loop {
+        if i >= body.len { break }
+        total = total + stmt_slot_count(body[i])
+        i++
+    }
+    total
+}
+
+fn stmt_slot_count(s: @TStatement()): usize {
+    match s {
+        TBinding => 1
+        TLoopStmt as l => scope_slot_count(l.init) + scope_slot_count(l.body)
+        TDeferStmt as d => scope_slot_count(d.body)
+        TAdoptStmt as a => scope_slot_count(a.body)
+        TBlockStmt as b => scope_slot_count(b.body)
+        _ => 0
+    }
+}
+
+pub fn region_slots(body: []@TStatement()): usize {
+    var total: usize = 0
+    var i = 0
+    loop {
+        if i >= body.len { break }
+        total = total + stmt_slot_bytes(body[i])
+        i++
+    }
+    total
+}
+
+fn stmt_slot_bytes(s: @TStatement()): usize {
+    match s {
+        TBinding as b => slot_bytes(b.bound)
+        TLoopStmt as l => region_slots(l.init) + region_slots(l.body)
+        TDeferStmt as d => region_slots(d.body)
+        TAdoptStmt as a => region_slots(a.body)
+        TBlockStmt as b => region_slots(b.body)
+        _ => 0
+    }
+}

@@ -1,0 +1,136 @@
+// surface_di_scope.tk -- §58 DI3/DI4 (D229): `scope { }` opens a LEXICAL
+// scope, and inside it a Scoped service is one instance per scope, a
+// Transient one per injection, its own Scoped dependency resolved against
+// the SAME scope that asked for it.
+//
+// What each block of `main` proves, in order:
+//
+//   1. two injections of the same Scoped inside ONE `scope { }` answer with
+//      the SAME instance, and it dies at that `}`;
+//   2. two `scope { }` in a row build TWO different instances, the first
+//      one gone before the second opens;
+//   3. a Transient built inside a scope is fresh every injection, and its
+//      own Scoped dependency is the scope's ONE shared instance;
+//   4. a `scope { }` nested inside another builds its OWN instance, freed at
+//      its own `}`, and the outer one is untouched by it;
+//   5. a `return` from inside a `scope { }` still releases what it opened;
+//   6. DI4: a namespaced Scoped, injected both qualified and bare (via
+//      `using`), is the SAME scope local either way.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 dtors = 0;
+
+interface IAudit { i64 hit(); }
+
+class Audit : IAudit, IServiceScoped {
+    i64 n;
+
+    public i64 hit() { n = n + 1; return n; }
+
+    ~Audit() { dtors = dtors + 1; }
+}
+
+class Job : IServiceTransient {
+    IAudit a;
+
+    public Job(IAudit a) { this.a = a; }
+
+    public i64 use() { return this.a.hit(); }
+}
+
+namespace mon {
+    interface IProbe {
+        i64 read();
+    }
+
+    class Probe : IProbe, IServiceScoped {
+        i64 n;
+
+        public i64 read() {
+            n = n + 1;
+            return n;
+        }
+    }
+}
+
+using mon;
+
+// a `return` from inside a `scope { }`: the block never reaches its own `}`,
+// so whatever it opened has to be released on the way out instead
+i64 early_return() {
+    scope {
+        IAudit e = inject IAudit;
+        if (e.hit() == 1) return 99;
+    }
+    return 0;
+}
+
+i64 main() {
+    scope {
+        IAudit a1 = inject IAudit;
+        IAudit a2 = inject IAudit;
+        if (a1.hit() != 1) return 1;
+        if (a2.hit() != 2) return 2;               // the SAME instance
+        if (rt_live() != 1) return 3;
+    }
+    if (rt_live() != 0) return 4;
+    if (dtors != 1) return 5;
+
+    dtors = 0;
+    scope {
+        IAudit b1 = inject IAudit;
+        if (b1.hit() != 1) return 6;
+    }
+    scope {
+        IAudit b2 = inject IAudit;
+        if (b2.hit() != 1) return 7;               // a fresh instance, restarts at 1
+    }
+    if (rt_live() != 0) return 8;
+    if (dtors != 2) return 9;
+
+    dtors = 0;
+    scope {
+        Job j1 = inject Job;
+        Job j2 = inject Job;
+        if (j1.use() != 1) return 10;
+        if (j2.use() != 2) return 11;              // the scope's ONE Audit, shared
+        if (rt_live() != 3) return 12;             // the Audit, and both Jobs
+    }
+    if (rt_live() != 0) return 13;
+    if (dtors != 1) return 14;                     // one Audit, freed once both Jobs let go
+
+    dtors = 0;
+    scope {
+        IAudit outer = inject IAudit;
+        if (outer.hit() != 1) return 15;
+        scope {
+            IAudit inner = inject IAudit;
+            if (inner.hit() != 1) return 16;       // its own instance, restarts at 1
+            if (rt_live() != 2) return 17;
+        }
+        if (rt_live() != 1) return 18;
+        if (dtors != 1) return 19;                 // the inner Audit, and only it
+        if (outer.hit() != 2) return 20;           // untouched by the inner scope
+    }
+    if (rt_live() != 0) return 21;
+    if (dtors != 2) return 22;
+
+    dtors = 0;
+    if (early_return() != 99) return 23;
+    if (rt_live() != 0) return 24;
+    if (dtors != 1) return 25;
+
+    scope {
+        mon.IProbe p1 = inject mon.IProbe;
+        IProbe p2 = inject IProbe;                 // bare, via `using mon;` -- the SAME scope local
+        if (p1.read() != 1) return 26;
+        if (p2.read() != 2) return 27;
+        if (rt_live() != 1) return 28;
+    }
+    if (rt_live() != 0) return 29;
+
+    return 42;
+}

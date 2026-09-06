@@ -1,110 +1,70 @@
-// src/parser/parse_decl.tks   (namespace 'teko::parser')
 
 use teko::lexer
 
-/**
- * parse_discard_param — parse a `_` DISCARD parameter (owner refinement 2026-07-15): a parameter
- * that occupies the ABI slot but binds no name and allocates nothing. It carries NO type annotation
- * (`_`, never `_: T`) — its type is resolved BY POSITION from the interface/base signature the
- * function implements or overrides; the CHECKER both fills that type and enforces that a discard
- * parameter appears only in an implementing/overriding signature. Repetition (`x, _, _, p`) is
- * allowed: each `_` is a separate comma-separated token. Emitted as a Param named "_" — a name the
- * lexer can never produce for a real identifier, so the checker recognizes it unambiguously.
- *
- * @param tokens   the token stream
- * @param pos      the index of the `_` (Underscore) token
- * @param params   the parameters accumulated so far
- * @return         `params` with the discard Param appended, and the index just past the `_`
- * @throws         when a type annotation follows the `_` (`_: T` is invalid for a discard param)
- */
-fn parse_discard_param(tokens: []lexer::Token, pos: u64, params: []Param) -> ParsedList<Param> | error {
+fn parse_discard_param(tokens: []lexer::Token, pos: u64, params: []Param): ParsedList<Param> | error {
     if is_kind_at(tokens, pos + 1, lexer::TokenKind::Colon) {
         return err_at(tokens, pos + 1, "a `_` discard parameter takes no type annotation — its type is fixed by position from the interface/base signature being implemented or overridden")
     }
-    let out = teko::list::push(params, Param { name = "_"; has_type = false; type_ann = no_type(); is_params = false; has_default = false; default_expr = no_expr() })
+    var out = [..params, Param { name = "_"; has_type = false; type_ann = no_type(); is_params = false; has_default = false; default_expr = no_expr() }]
     ParsedList<Param> { items = out; next = pos + 1 }
 }
 
-// `( name: T, name: T, … )` — comma-separated params; empty `()` allowed; params are
-// immutable (B.21). `pos` is at `(`. `allow_untyped_first` (OOP A1, 2026-07-01) — true ONLY
-// for a struct method's param list: the 1st param may be a bare name with NO `: type` (the
-// unified-method-model RECEIVER, name free, type injected by the checker as the enclosing
-// struct); every other caller (a top-level/extern `fn`) passes false, where every param stays
-// mandatorily typed exactly as before (no behavior change for the non-method corpus).
-fn parse_params(tokens: []lexer::Token, pos: u64, allow_untyped_first: bool) -> ParsedList<Param> | error {
-    mut p = pos + 1   // consume `(`
-    mut params: []Param = teko::list::empty()
-    mut seen_default = false   // DEFARGS (2026-07-01) — TRAILING-ONLY: once true, every later param must also default
-    mut first = true
+fn parse_params(tokens: []lexer::Token, pos: u64): ParsedList<Param> | error {
+    var p = pos + 1
+    var params: []Param = []
+    var seen_default = false
     if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
         return ParsedList<Param> { items = params; next = p + 1 }
     }
     loop {
         if is_kind_at(tokens, p, lexer::TokenKind::Underscore) {
-            let dp = match parse_discard_param(tokens, p, params) { ParsedList<Param> as x => x; error as e => return e }
+            var dp = match parse_discard_param(tokens, p, params) { ParsedList<Param> as x => x; error as e => return e }
             params = dp.items
-            first = false
             p = dp.next
             if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
             p = p + 1
             continue
         }
-        // `params` — a CONTEXTUAL variadic-parameter modifier (2026-07-01), like `from` in the
-        // `extern` position: NOT a reserved word (295+ existing uses as a plain identifier/field
-        // name across the corpus), so it only triggers when `params` is immediately followed by
-        // ANOTHER name + `:` — i.e. `params pieces: []T`. A parameter *literally named* `params`
-        // (`params: []T`, colon right after) is unaffected — ordinary parsing. Trailing-only:
-        // rejected below if another param follows. Type must be a slice `[]T` (checked once parsed).
-        let has_params_kw = is_kind_at(tokens, p, lexer::TokenKind::Ident) && tokens[p].text == "params" &&
+        var has_params_kw = is_kind_at(tokens, p, lexer::TokenKind::Ident) && tokens[p].text == "params" &&
         is_name_at(tokens, p + 1) && is_kind_at(tokens, p + 2, lexer::TokenKind::Colon)
         if has_params_kw { p = p + 1 }
-        let has_ref_kw = is_kind_at(tokens, p, lexer::TokenKind::Ident) && tokens[p].text == "ref" &&
+        var has_ref_kw = is_kind_at(tokens, p, lexer::TokenKind::Ident) && tokens[p].text == "ref" &&
         is_name_at(tokens, p + 1) && is_kind_at(tokens, p + 2, lexer::TokenKind::Colon)
         if has_ref_kw { p = p + 1 }
+        if is_kind_at(tokens, p, lexer::TokenKind::SelfKw) {
+            return err_at(tokens, p, "`self` is the synthetic receiver; it cannot name a parameter")
+        }
         if !is_name_at(tokens, p) {
             return err_at(tokens, p, "expected a parameter name")
         }
-        let name = tokens[p].text
-        // (OOP A1) the RECEIVER: only the very first param, only when the caller allows it, only
-        // when NOT immediately followed by `:` (a typed 1st param means the method is STATIC).
-        let is_receiver = first && allow_untyped_first && !has_params_kw && !has_ref_kw && !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon)
-        first = false
-        if is_receiver {
-            params = teko::list::push(params, Param { name = name; has_type = false; type_ann = no_type(); is_params = false; has_default = false; default_expr = no_expr() })
-            p = p + 1
-        } else {
-            if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
-                return err_at(tokens, p + 1, "expected ':' after a parameter name")
-            }
-            let ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
-            if has_params_kw {
-                match ty.node { SliceType => { }; _ => return err_at(tokens, p + 2, "'params' parameter must have a slice type ([]T)") }
-            }
-            let param_ty = if has_ref_kw { wrap_ref_type(ty.node) } else { ty.node }
-            // DEFARGS (2026-07-01) — `= <expr>` right after the type: a default value, evaluated at
-            // the call site when the argument is omitted. TRAILING-ONLY (rule A): once ANY param
-            // defaults, every param after it must ALSO default — `=` uses Assign, consistent with
-            // struct-init `{f=v}` (not `:`, which is a type annotation).
-            mut ppos = ty.next
-            mut has_default = false
-            mut default_expr = no_expr()
-            if is_kind_at(tokens, ppos, lexer::TokenKind::Assign) {
-                let dv = match parse_expr(tokens, ppos + 1) { Parsed<Expr> as x => x; error as e => return e }
-                has_default = true
-                default_expr = dv.node
-                ppos = dv.next
-            } else if seen_default {
-                return err_at(tokens, ppos, "a default-valued parameter must be followed only by other defaulted parameters (defaults are trailing-only)")
-            }
-            if has_default { seen_default = true }
-            params = teko::list::push(params, Param { name = name; has_type = true; type_ann = param_ty; is_params = has_params_kw; has_default = has_default; default_expr = default_expr })
-            p = ppos
+        var name = tokens[p].text
+        if !is_kind_at(tokens, p + 1, lexer::TokenKind::Colon) {
+            return err_at(tokens, p + 1, "expected ':' after a parameter name")
         }
+        var ty = match parse_type(tokens, p + 2) { ParsedType as x => x; error as e => return e }
+        if has_params_kw {
+            match ty.node { SliceType => { }; _ => return err_at(tokens, p + 2, "'params' parameter must have a slice type ([]T)") }
+        }
+        var param_ty = if has_ref_kw { wrap_ref_type(ty.node) } else { ty.node }
+        var ppos = ty.next
+        var has_default = false
+        var default_expr = no_expr()
+        if is_kind_at(tokens, ppos, lexer::TokenKind::Assign) {
+            var dv = match parse_expr(tokens, ppos + 1) { Parsed<Expr> as x => x; error as e => return e }
+            has_default = true
+            default_expr = dv.node
+            ppos = dv.next
+        } else if seen_default && !has_params_kw {
+            return err_at(tokens, ppos, "a default-valued parameter must be followed only by other defaulted parameters (defaults are trailing-only)")
+        }
+        if has_default { seen_default = true }
+        params = [..params, Param { name = name; has_type = true; type_ann = param_ty; is_params = has_params_kw; has_default = has_default; default_expr = default_expr }]
+        p = ppos
         if has_params_kw && is_kind_at(tokens, p, lexer::TokenKind::Comma) {
             return err_at(tokens, p, "'params' must be the last parameter")
         }
         if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
-        p = p + 1   // consume `,`
+        p = p + 1
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
         return err_at(tokens, p, "expected ')' to close the parameter list")
@@ -112,77 +72,95 @@ fn parse_params(tokens: []lexer::Token, pos: u64, allow_untyped_first: bool) -> 
     ParsedList<Param> { items = params; next = p + 1 }
 }
 
-// (W11/S6, 2026-07-01) `<T: A & B | C>` — a constraint ATOM: a bare nominal name (a
-// variant/struct the type-param must nominally belong to). Never `?`/null/void (a
-// constraint targets a concrete nominal type, matching the `<T?>` ban below).
-fn parse_constraint_atom(tokens: []lexer::Token, pos: u64) -> Parsed<ConstraintExpr> | error {
-    if !is_kind_at(tokens, pos, lexer::TokenKind::Ident) {
-        return err_at(tokens, pos, "expected a constraint name (a nominal variant/struct) in a type-parameter constraint")
-    }
-    let name = tokens[pos].text
-    mut p = pos + 1
-    if is_kind_at(tokens, p, lexer::TokenKind::Question) {
-        return err_at(tokens, p, "a nullability `?` is not allowed on a constraint atom — a constraint targets a concrete nominal type")
-    }
-    Parsed<ConstraintExpr> { node = ConstraintAtom { name = name }; next = p }
+fn is_service_lifetime_at(tokens: []lexer::Token, pos: u64): bool {
+    if !is_name_at(tokens, pos) { return false }
+    var w = tokens[pos].text
+    w == "singleton" || w == "scoped" || w == "transient"
 }
-// `&`-term: one or more atoms joined by `&` (AND), left-associative.
-fn parse_constraint_and(tokens: []lexer::Token, pos: u64) -> Parsed<ConstraintExpr> | error {
-    mut left = match parse_constraint_atom(tokens, pos) { Parsed<ConstraintExpr> as x => x; error as e => return e }
+fn is_bare_constraint_name_at(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Ident) &&
+    !is_kind_at(tokens, pos + 1, lexer::TokenKind::Lt) &&
+    !is_kind_at(tokens, pos + 1, lexer::TokenKind::ColonColon)
+}
+fn can_start_constraint_type_at(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Ident) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::LBracket) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::LParen)
+}
+fn parse_constraint_atom(tokens: []lexer::Token, pos: u64): ParsedConstraintTerm | error {
+    if is_kind_at(tokens, pos, lexer::TokenKind::Class) {
+        return ParsedConstraintTerm { node = ConstraintForm { form = "class"; has_lifetime = false; lifetime = ServiceLifetime::Singleton }; next = pos + 1; pending_gt = 0 }
+    }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Struct) {
+        return ParsedConstraintTerm { node = ConstraintForm { form = "struct"; has_lifetime = false; lifetime = ServiceLifetime::Singleton }; next = pos + 1; pending_gt = 0 }
+    }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Service) {
+        if is_service_lifetime_at(tokens, pos + 1) {
+            var lt = match parse_service_lifetime(tokens, pos + 1) { Parsed<ServiceLifetime> as x => x; error as e => return e }
+            return ParsedConstraintTerm { node = ConstraintForm { form = "service"; has_lifetime = true; lifetime = lt.node }; next = lt.next; pending_gt = 0 }
+        }
+        return ParsedConstraintTerm { node = ConstraintForm { form = "service"; has_lifetime = false; lifetime = ServiceLifetime::Singleton }; next = pos + 1; pending_gt = 0 }
+    }
+    if is_bare_constraint_name_at(tokens, pos) {
+        var name = tokens[pos].text
+        if name == "notnull" { return ParsedConstraintTerm { node = ConstraintNotNull { }; next = pos + 1; pending_gt = 0 } }
+        return ParsedConstraintTerm { node = ConstraintAtom { name = name }; next = pos + 1; pending_gt = 0 }
+    }
+    if !can_start_constraint_type_at(tokens, pos) {
+        return err_at(tokens, pos, "expected a constraint term (a form word, a service lifetime, an interface/type/slice/`error`, a disjunction, or `notnull`) in a type-parameter constraint")
+    }
+    var t = match parse_type_primary(tokens, pos) { ParsedType as x => x; error as e => return e }
+    ParsedConstraintTerm { node = ConstraintType { ty = t.node }; next = t.next; pending_gt = t.pending_gt }
+}
+fn is_notnull_constraint(c: @ConstraintExpr()): bool {
+    match c { parser::ConstraintNotNull => true; _ => false }
+}
+fn parse_constraint_and(tokens: []lexer::Token, pos: u64): ParsedConstraintTerm | error {
+    var left = match parse_constraint_atom(tokens, pos) { ParsedConstraintTerm as x => x; error as e => return e }
     loop {
+        if left.pending_gt > 0 { break }
         if !is_kind_at(tokens, left.next, lexer::TokenKind::Amp) { break }
-        let right = match parse_constraint_atom(tokens, left.next + 1) { Parsed<ConstraintExpr> as x => x; error as e => return e }
-        left = Parsed<ConstraintExpr> { node = ConstraintAnd { left = left.node; right = right.node }; next = right.next }
+        var right = match parse_constraint_atom(tokens, left.next + 1) { ParsedConstraintTerm as x => x; error as e => return e }
+        left = ParsedConstraintTerm { node = ConstraintAnd { left = left.node; right = right.node }; next = right.next; pending_gt = right.pending_gt }
     }
     left
 }
-// `|`-chain over `&`-terms (so `&` binds tighter than `|`: `C1 & C2 | C3` = `(C1 & C2) | C3`),
-// left-associative. This is a DEDICATED grammar (2 precedence levels, boolean semantics),
-// distinct from parse_type's `|` (a type UNION) — reusing that grammar would conflate two
-// different meanings of the same token under different AST targets.
-fn parse_constraint_expr(tokens: []lexer::Token, pos: u64) -> Parsed<ConstraintExpr> | error {
-    mut left = match parse_constraint_and(tokens, pos) { Parsed<ConstraintExpr> as x => x; error as e => return e }
+fn parse_constraint_expr(tokens: []lexer::Token, pos: u64): ParsedConstraintTerm | error {
+    var left = match parse_constraint_and(tokens, pos) { ParsedConstraintTerm as x => x; error as e => return e }
     loop {
+        if left.pending_gt > 0 { break }
         if !is_kind_at(tokens, left.next, lexer::TokenKind::Pipe) { break }
-        let right = match parse_constraint_and(tokens, left.next + 1) { Parsed<ConstraintExpr> as x => x; error as e => return e }
-        left = Parsed<ConstraintExpr> { node = ConstraintOr { left = left.node; right = right.node }; next = right.next }
+        if is_notnull_constraint(left.node) { return err_at(tokens, pos, "`notnull` may not be a `|` alternative — it is a non-null modifier, use it with `&` (e.g. `class & notnull`) (§9.2b)") }
+        var right = match parse_constraint_and(tokens, left.next + 1) { ParsedConstraintTerm as x => x; error as e => return e }
+        if is_notnull_constraint(right.node) { return err_at(tokens, left.next + 1, "`notnull` may not be a `|` alternative — it is a non-null modifier, use it with `&` (e.g. `class & notnull`) (§9.2b)") }
+        left = ParsedConstraintTerm { node = ConstraintOr { left = left.node; right = right.node }; next = right.next; pending_gt = right.pending_gt }
     }
     left
 }
 
-// `[doc] [pub|exp] fn name(params) -> ret { body }` (B.21, B.29). Doc + visibility optional
-// and precede `fn`; `-> ret` optional (absent = Unit). `pos` is at the doc, `pub`/`exp`, or `fn`.
-// (S4) An OPTIONAL generic type-parameter list `<T, U, …>` after a fn/type NAME. `pos` is at the
-// token AFTER the name. No `<` → empty list, pos unchanged. The decl-site `<` is UNAMBIGUOUS: the
-// `fn`/`type` keyword already committed the parse to a decl, so it is never a comparison. A decl
-// list never nests, so it closes with a single `>` (no `>>` split — that is parse_type_args' job).
-// (W11/S6) each name may carry an OPTIONAL `: ConstraintExpr` — names/constraints stay PARALLEL
-// (NoConstraint{} filling an unconstrained slot), so every downstream reader indexes both by i.
-fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedTypeParams | error {
+fn parse_type_params(tokens: []lexer::Token, pos: u64): ParsedTypeParams | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::Lt) {
-        return ParsedTypeParams { names = teko::list::empty(); constraints = teko::list::empty(); next = pos }
+        return ParsedTypeParams { names = []; constraints = []; next = pos }
     }
-    mut p = pos + 1
-    mut names: []str = teko::list::empty()
-    mut constraints: []ConstraintExpr = teko::list::empty()
+    var p = pos + 1
+    var names: []str = []
+    var constraints: []@ConstraintExpr() = []
     loop {
         if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
             return err_at(tokens, p, "expected a type-parameter name in '<…>'")
         }
-        names = teko::list::push(names, tokens[p].text)
+        names = [..names, tokens[p].text]
         p = p + 1
-        // Nullability `?` is NEVER allowed on a type-PARAMETER declaration (legislation 2026-06-28):
-        // `?` marks a USE of a type (`a: T?`, `-> T?`), never the param decl `<T?>` (nor a constraint).
-        if is_kind_at(tokens, p, lexer::TokenKind::Question) {
-            return err_at(tokens, p, "a nullability `?` is not allowed on a type parameter — use `T?` only in a parameter or return type")
-        }
+        var closed_by_pending = false
         if is_kind_at(tokens, p, lexer::TokenKind::Colon) {
-            let c = match parse_constraint_expr(tokens, p + 1) { Parsed<ConstraintExpr> as x => x; error as e => return e }
-            constraints = teko::list::push(constraints, c.node)
+            var c = match parse_constraint_expr(tokens, p + 1) { ParsedConstraintTerm as x => x; error as e => return e }
+            constraints = [..constraints, c.node]
             p = c.next
+            closed_by_pending = c.pending_gt > 0
         } else {
-            constraints = teko::list::push(constraints, NoConstraint { })
+            constraints = [..constraints, NoConstraint { }]
         }
+        if closed_by_pending { break }
         if is_kind_at(tokens, p, lexer::TokenKind::Comma) { p = p + 1 }
         else if is_kind_at(tokens, p, lexer::TokenKind::Gt) { p = p + 1; break }
         else { return err_at(tokens, p, "expected ',' or '>' in a type-parameter list") }
@@ -190,67 +168,39 @@ fn parse_type_params(tokens: []lexer::Token, pos: u64) -> ParsedTypeParams | err
     ParsedTypeParams { names = names; constraints = constraints; next = p }
 }
 
-/**
- * Does token `pos` start a contextual `unsafe` declaration modifier?
- *
- * `unsafe` (U1, 0.1.0.0-beta memory+unsafe remodel §3) is deliberately CONTEXTUAL — a plain
- * `Ident` whose text is `"unsafe"` — not a reserved keyword, so a namespace segment literally
- * named `unsafe` (e.g. `teko::mem::unsafe`) stays a legal `::`-path component.
- *
- * @param []lexer::Token tokens  the full token stream
- * @param u64 pos  the position to test
- * @return bool  true iff `tokens[pos]` is the contextual `unsafe` modifier
- */
-fn is_unsafe_modifier_at(tokens: []lexer::Token, pos: u64) -> bool {
-    is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "unsafe"
-}
-
-/**
- * Consume an optional contextual `unsafe` modifier at `pos` — the declaration-level risk marker
- * on `type`/`fn` (U1, 0.1.0.0-beta memory+unsafe remodel §2/§3). Placed AFTER `extern` in both
- * `parse_function` and `parse_type_decl`'s modifier chain, so `pub unsafe fn`/bare `unsafe fn`
- * parse, and so does `extern unsafe fn`/`pub extern unsafe fn` — `extern` is consumed FIRST and
- * this call comes second, so it simply sees the modifier in its expected slot. The token order
- * `unsafe extern fn` is what fails (`unsafe` gets consumed here, `extern` is then found where
- * `fn` was required) — that is a WORD-ORDER rule, not a claim that an extern cannot be unsafe;
- * `docs/design/c-types-and-marshalling-0.3.1.md` §4 measured `pub extern unsafe fn … = "sym"`
- * parsing, checking, and threading `is_unsafe` through to the `Function` node end to end.
- *
- * @param []lexer::Token tokens  the full token stream
- * @param u64 pos  the position to consume from (immediately after the `extern` consume)
- * @return Parsed<bool>  whether `unsafe` was present (`node`), and the position just past it (`next`,
- *               unchanged if absent)
- */
-fn consume_unsafe_modifier(tokens: []lexer::Token, pos: u64) -> Parsed<bool> {
-    if !is_unsafe_modifier_at(tokens, pos) { return Parsed<bool> { node = false; next = pos } }
+fn consume_static_modifier(tokens: []lexer::Token, pos: u64): Parsed<bool> {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Static) { return Parsed<bool> { node = false; next = pos } }
     Parsed<bool> { node = true; next = pos + 1 }
 }
 
-// `allow_receiver` (OOP A1, 2026-07-01) — true ONLY when called for a struct-body method: lets
-// the 1st param be a bare untyped name (the receiver). A top-level `fn` always passes false.
-// `allow_bodyless` (W10b.IF) — true ONLY for an INTERFACE method: a pure signature `fn sig(self) -> T`
-// with NO body (the interface is a contract). Mirrors the `abstract fn` bodyless path; every other
-// caller passes false.
-/**
- * Consume the OPTIONAL `("c_name")` reverse-FFI symbol override that may follow an `exp` visibility
- * marker on a function (FFI-D, reverse-FFI export). The override names the exact C symbol the `exp`
- * function is emitted under in an `abi="c"` artifact, mirroring the `= "SYM"` an `extern` import uses;
- * absent, the codegen flattens the canonical name (`ns::fn` → `ns_fn`) instead. A `(` that opens the
- * override MUST wrap a single quoted string and close with `)`.
- *
- * @param tokens  the full token stream
- * @param pos     the index immediately past the consumed `exp` keyword
- * @return        the override symbol (empty string when no `(` follows) and the index past it
- * @throws        when a `(` opens but is not a single quoted string closed by `)`
- * @since 0.3.0.30 (FFI base — reverse-FFI export)
- */
-fn parse_export_override(tokens: []lexer::Token, pos: u64) -> Parsed<str> | error {
+fn consume_global_modifier(tokens: []lexer::Token, pos: u64): Parsed<bool> {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Global) { return Parsed<bool> { node = false; next = pos } }
+    Parsed<bool> { node = true; next = pos + 1 }
+}
+
+fn is_variable_binding_head(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "var"
+}
+
+fn inject_synthetic_receiver(params: []Param): []Param {
+    var out: []Param = []
+    out = [..out, Param { name = "self"; has_type = false; type_ann = no_type(); is_params = false; has_default = false; default_expr = no_expr() }]
+    var i = 0 to u64
+    loop {
+        if i >= params.len { break }
+        out = [..out, params[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn parse_export_override(tokens: []lexer::Token, pos: u64): Parsed<str> | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::LParen) { return Parsed<str> { node = ""; next = pos } }
-    mut p = pos + 1
+    var p = pos + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::Str) {
         return err_at(tokens, p, "expected a quoted C symbol inside `exp(\"…\")`")
     }
-    let sym = tokens[p].text
+    var sym = tokens[p].text
     p = p + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
         return err_at(tokens, p, "expected `)` to close the `exp(\"…\")` export-symbol override")
@@ -258,92 +208,83 @@ fn parse_export_override(tokens: []lexer::Token, pos: u64) -> Parsed<str> | erro
     Parsed<str> { node = sym; next = p + 1 }
 }
 
-/**
- * Advance the `parse_decl` keyword-search cursor past an OPTIONAL `("c_name")` reverse-FFI export
- * override that may follow an `exp` marker, so the following `fn`/`type`/`flags`/`const` search lands on
- * the real keyword (FFI-D). This is a lightweight peek only — `parse_function` re-parses (and validates)
- * the override from the declaration's true start.
- *
- * @param tokens  the full token stream
- * @param pos     the index immediately past the consumed `exp` keyword
- * @return        the index past a `("STR")` override group, or `pos` unchanged when none follows
- * @since 0.3.0.30 (FFI base — reverse-FFI export)
- */
-fn skip_export_override_peek(tokens: []lexer::Token, pos: u64) -> u64 {
+fn skip_export_override_peek(tokens: []lexer::Token, pos: u64): u64 {
     if !is_kind_at(tokens, pos, lexer::TokenKind::LParen) { return pos }
-    mut k = pos + 1
+    var k = pos + 1
     if is_kind_at(tokens, k, lexer::TokenKind::Str) { k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::RParen) { k = k + 1 }
     k
 }
 
-/**
- * Parse a `fn` declaration's signature + body, from an optional leading doc-comment through the
- * closing `}` (or the bodyless/`extern` forms). Shared by the top-level `fn` position (real
- * `is_test`/`os_guard`/`has_arena_size`/`arena_size` attributes threaded in from
- * `parse_decl_attributes`) and every struct/class METHOD call site (`allow_receiver = true`,
- * always `is_test = false`, `os_guard = ""`, `has_arena_size = false`, `arena_size = 0` — methods
- * do not go through the attribute collector in this crumb).
- *
- * @param tokens          the full token stream
- * @param pos             the index of the leading doc-comment/modifier/`fn` keyword
- * @param is_test         a `#test` attribute precedes it? (top-level only)
- * @param os_guard        a `#os("…")` conditional-compile guard ("" = all OSes; top-level only)
- * @param allow_receiver  true for a struct/class method (an untyped 1st param names the receiver)
- * @param allow_bodyless  true where a signature-only `fn` (no `{ … }`) is legal (interface method)
- * @param has_arena_size  a `#arena_size(N)` directive precedes it? (#453, top-level only)
- * @param arena_size      the directive's byte count (valid iff `has_arena_size`)
- * @return                the parsed `Function` declaration + the resume index
- * @throws                a malformed signature/body, or `#arena_size`/`#test` before `extern`
- */
-fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str, allow_receiver: bool, allow_bodyless: bool, has_arena_size: bool, arena_size: u64) -> Parsed<Decl> | error {
-    mut p = pos
-    mut has_doc = false
-    mut doc = ""
-    // (#111) an own-line doc comment attaches to the NEXT declaration: skip the significant
-    // newline(s) between the `/** … */` and the modifiers/keyword that follow it. Same-line
-    // placement (no newline in between) is unaffected — skip_seps is a no-op there.
-    if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
-        has_doc = true
-        doc = tokens[p].text
+fn is_return_type_intro_at(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Colon)
+}
+
+fn parse_multi_return_types(tokens: []lexer::Token, pos: u64): ParsedList<@TypeExpr()> | error {
+    var p = skip_seps(tokens, pos + 1)
+    if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
+        return err_at(tokens, p, "a multiple-return signature `( A, B )` needs at least two types")
+    }
+    var types: []@TypeExpr() = []
+    loop {
+        var t = match parse_type(tokens, p) { ParsedType as x => x; error as e => return e }
+        types = [..types, t.node]
+        p = skip_seps(tokens, t.next)
+        if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
         p = skip_seps(tokens, p + 1)
     }
-    mut vis = Visibility::Private   // default: own-namespace only
-    mut export_c_symbol = ""
+    if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
+        return err_at(tokens, p, "expected ')' to close a multiple-return signature")
+    }
+    if types.len < 2 {
+        return err_at(tokens, pos, "a multiple-return signature `( A, B )` needs at least two types — for a single return type write `A`, not `( A )`")
+    }
+    ParsedList<@TypeExpr()> { items = types; next = p + 1 }
+}
+
+fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str, is_type_method: bool, allow_bodyless: bool): Parsed<@Decl()> | error {
+    var p = pos
+    var has_doc = false
+    var doc = docspan_none()
+    if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
+        has_doc = true
+        doc = docspan_of(tokens[p].file, tokens[p].byte_off, tokens[p].text.len)
+        p = skip_seps(tokens, p + 1)
+    }
+    var vis = Visibility::Private
+    var export_c_symbol = ""
     if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
         vis = Visibility::Pub
         p = p + 1
     } else if is_kind_at(tokens, p, lexer::TokenKind::Exp) {
         vis = Visibility::Exp
         p = p + 1
-        let ov = match parse_export_override(tokens, p) { Parsed<str> as x => x; error as e => return e }
+        var ov = match parse_export_override(tokens, p) { Parsed<str> as x => x; error as e => return e }
         export_c_symbol = ov.node
         p = ov.next
     }
-    // (W10b.CLASS, 2026-07-01) `intern` widens reach to "also visible to inheritors" — combines
-    // WITH the vis above, not a 4th tier; meaningful only inside a class body, but parsed
-    // universally (harmless elsewhere, matching how `pub`/`exp` parse even where meaningless).
-    mut is_intern = false
+    var global_mod = consume_global_modifier(tokens, p)
+    var is_global = global_mod.node
+    p = global_mod.next
+    var is_intern = false
     if is_kind_at(tokens, p, lexer::TokenKind::Intern) {
         is_intern = true
         p = p + 1
     }
-    // Method modifiers — meaningful only inside a class body (inheritance, W10b.CLASS increment
-    // 2+); parsed universally here so a top-level `fn` grammar never needs to special-case them.
-    mut is_abstract = false
-    mut is_virtual = false
-    mut is_override = false
+    var is_abstract = false
+    var is_virtual = false
+    var is_override = false
     if is_kind_at(tokens, p, lexer::TokenKind::Abstract) { is_abstract = true; p = p + 1 }
     else if is_kind_at(tokens, p, lexer::TokenKind::Virtual) { is_virtual = true; p = p + 1 }
     else if is_kind_at(tokens, p, lexer::TokenKind::Override) { is_override = true; p = p + 1 }
-    mut is_extern = false   // C7.1a: `extern fn …` (foreign, no body)
+    var static_mod = consume_static_modifier(tokens, p)
+    var is_static = static_mod.node
+    p = static_mod.next
+    var is_extern = false
     if is_kind_at(tokens, p, lexer::TokenKind::Extern) {
         is_extern = true
         p = p + 1
     }
-    let unsafe_mod = consume_unsafe_modifier(tokens, p)
-    let is_unsafe = unsafe_mod.node
-    p = unsafe_mod.next
     if !is_kind_at(tokens, p, lexer::TokenKind::Fn) {
         return err_at(tokens, p, "expected `fn`")
     }
@@ -351,28 +292,40 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
     if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
         return err_at(tokens, p, "expected a function name")
     }
-    let name = tokens[p].text
-    let name_line: u32 = tokens[p].line
-    let name_col: u32 = tokens[p].col   // W-loc-2: the fn's source position
+    var name = tokens[p].text
+    var name_line: u32 = tokens[p].line
+    var name_col: u32 = tokens[p].col
     p = p + 1
-    let tps = match parse_type_params(tokens, p) { ParsedTypeParams as x => x; error as e => return e }   // (S4/W11) `<T, U: A & B, …>`
+    var tps = match parse_type_params(tokens, p) { ParsedTypeParams as x => x; error as e => return e }
     p = tps.next
     if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
         return err_at(tokens, p, "expected '(' for the parameter list")
     }
-    let params = match parse_params(tokens, p, allow_receiver) { ParsedList<Param> as x => x; error as e => return e }
+    var params = match parse_params(tokens, p) { ParsedList<Param> as x => x; error as e => return e }
     p = params.next
-    mut has_return = false
-    mut return_type = no_type()
-    if is_kind_at(tokens, p, lexer::TokenKind::Arrow) {
-        let ret = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
-        has_return = true
-        return_type = ret.node
-        p = ret.next
+    if is_type_method && !is_static {
+        params = ParsedList<Param> { items = inject_synthetic_receiver(params.items); next = params.next }
+    }
+    var has_return = false
+    var return_type = no_type()
+    var ret_types: []@TypeExpr() = []
+    if is_return_type_intro_at(tokens, p) {
+        if is_kind_at(tokens, p + 1, lexer::TokenKind::LParen) {
+            var mr = match parse_multi_return_types(tokens, p + 1) { ParsedList<@TypeExpr()> as x => x; error as e => return e }
+            ret_types = mr.items
+            has_return = true
+            return_type = ret_types[0]
+            p = mr.next
+        } else {
+            var ret = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
+            has_return = true
+            return_type = ret.node
+            p = ret.next
+        }
     }
     if is_extern {
+        if ret_types.len > 0 { return err_at(tokens, p, "an `extern` function may not declare a multiple-return `( A, B )` signature") }
         if is_test { return err_at(tokens, p, "`#test` may not precede `extern`") }
-        if has_arena_size { return err_at(tokens, p, "`#arena_size(…)` may not precede `extern` (there is no Teko body to size)") }
         if export_c_symbol != "" { return err_at(tokens, p, "an `extern` (imported) function may not carry an `exp(\"…\")` export override") }
         if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
             return err_at(tokens, p, "expected `= \"symbol\"` to bind the C symbol of an `extern` function")
@@ -381,11 +334,9 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
         if !is_kind_at(tokens, p, lexer::TokenKind::Str) {
             return err_at(tokens, p, "expected a quoted C symbol after `=` in an `extern` function")
         }
-        let c_symbol = tokens[p].text
+        var c_symbol = tokens[p].text
         p = p + 1
-        mut from_lib = ""   // "" = implicit libc (C7.1a, macOS)
-        // `from` is CONTEXTUAL (not a reserved word — the corpus uses it as an identifier), so
-        // match it as a plain Ident in the extern position.
+        var from_lib = ""
         if is_kind_at(tokens, p, lexer::TokenKind::Ident) && tokens[p].text == "from" {
             p = p + 1
             if !is_kind_at(tokens, p, lexer::TokenKind::Str) {
@@ -394,55 +345,239 @@ fn parse_function(tokens: []lexer::Token, pos: u64, is_test: bool, os_guard: str
             from_lib = tokens[p].text
             p = p + 1
         }
-        let no_body: []Statement = teko::list::empty()
-        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = true; c_symbol = c_symbol; from_lib = from_lib; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe; has_arena_size = false; arena_size = 0 to u64 }; next = p }
+        var no_body: []@Statement() = []
+        return Parsed<@Decl()> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = true; c_symbol = c_symbol; from_lib = from_lib; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; is_static = is_static; is_getter = false; is_setter = false; accessor_prop = ""; ret_types = []; is_operator = false; is_global = is_global }; next = p }
     }
-    // (W10b.CLASS increment 2) `abstract fn …` — a SIGNATURE ONLY, no body (abstract classes only;
-    // enforced by the checker, not the parser). A bare `;`/newline/`}` follows instead of `{`.
     if (is_abstract || allow_bodyless) && !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
-        if has_arena_size { return err_at(tokens, p, "`#arena_size(…)` may not precede an `abstract fn` (there is no Teko body to size)") }
-        let no_body: []Statement = teko::list::empty()
-        return Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = export_c_symbol; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe; has_arena_size = false; arena_size = 0 to u64 }; next = p }
+        if ret_types.len > 0 { return err_at(tokens, p, "a bodyless (`abstract`/interface) function may not declare a multiple-return `( A, B )` signature yet") }
+        var no_body: []@Statement() = []
+        return Parsed<@Decl()> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = no_body; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = export_c_symbol; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; is_static = is_static; is_getter = false; is_setter = false; accessor_prop = ""; ret_types = []; is_operator = false; is_global = is_global }; next = p }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' for the function body")
     }
-    let blk = match parse_block(tokens, p) { ParsedList<Statement> as x => x; error as e => return e }
-    Parsed<Decl> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = export_c_symbol; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; has_inject = false; injects = teko::list::empty(); is_unsafe = is_unsafe; has_arena_size = has_arena_size; arena_size = arena_size }; next = blk.next }
+    var blk = match parse_block(tokens, p) { ParsedList<@Statement()> as x => x; error as e => return e }
+    Parsed<@Decl()> { node = Function { name = name; type_params = tps.names; type_constraints = tps.constraints; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = is_test; is_extern = false; c_symbol = export_c_symbol; from_lib = ""; os_guard = os_guard; is_intern = is_intern; is_abstract = is_abstract; is_virtual = is_virtual; is_override = is_override; is_static = is_static; is_getter = false; is_setter = false; accessor_prop = ""; ret_types = ret_types; is_operator = false; is_global = is_global }; next = blk.next }
 }
 
-// `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
-// trailing separator allowed. `pos` is at `{`. (Inside `{}` → `;`/newline, B.17.)
-// (OOP A1, 2026-07-01) A struct body's items are INTERLEAVED fields and methods (unified
-// method model): `type S = struct { s: str; fn a(self) -> str { self.s } ; fn b() -> void {} }`.
-// An item starting with `fn` (optionally preceded by a doc comment / `pub`/`exp`) is a METHOD,
-// parsed via `parse_function` with `allow_receiver = true`; anything else is a plain field
-// (`name: type`), exactly as before. Struct members (fields + methods) stay ALL PUBLIC per
-// W10b.0.A — a method's `pub`/`exp` marker is accepted (parses) but carries no extra reach
-// beyond the struct's own visibility (the checker does not special-case it further here).
-fn struct_item_is_method(tokens: []lexer::Token, pos: u64) -> bool {
-    mut k = pos
-    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }   // (#111) own-line doc
+fn accessor_kind_at(tokens: []lexer::Token, pos: u64): u64 {
+    var k = pos
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) { k = k + 1 }
     else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
-    is_kind_at(tokens, k, lexer::TokenKind::Fn)
+    if is_kind_at(tokens, k, lexer::TokenKind::Intern) { k = k + 1 }
+    if !is_kind_at(tokens, k, lexer::TokenKind::Ident) { return 0 to u64 }
+    var word = tokens[k].text
+    if word != "get" && word != "set" { return 0 to u64 }
+    if !is_name_at(tokens, k + 1) { return 0 to u64 }
+    if !is_kind_at(tokens, k + 2, lexer::TokenKind::LParen) { return 0 to u64 }
+    if word == "get" { return 1 to u64 }
+    2 to u64
 }
-/**
- * skip_field_inline_attr — consume an optional leading `#inline` layout attribute at a struct/class
- * FIELD position (C4's NEW field parse site), returning the index of the field name that follows. A
- * `#` that does not name `inline` is a precise error — `#inline` is the only field attribute.
- *
- * NOTE (bounded C4 divergence, reported to the integrator): the parsed `#inline` flag is not yet
- * persisted onto the `Field` AST nor honored by codegen — the end-to-end layout flip is a flagged
- * remainder (see the C4 report). The parse site + `inline_attr_eligible` validator land in C4.
- *
- * @param tokens  the token stream
- * @param pos     the index at the (possible) leading `#`
- * @return        the index past a consumed `#inline` (or `pos` unchanged when absent), or an error
- * @throws        when a `#` at `pos` is not `#inline`
- * @since 0.3.0.30 (null-union C4)
- */
-fn skip_field_inline_attr(tokens: []lexer::Token, pos: u64) -> u64 | error {
+
+fn parse_accessor(tokens: []lexer::Token, pos: u64, allow_bodyless: bool): Parsed<@Decl()> | error {
+    var p = pos
+    var has_doc = false
+    var doc = docspan_none()
+    if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
+        has_doc = true
+        doc = docspan_of(tokens[p].file, tokens[p].byte_off, tokens[p].text.len)
+        p = skip_seps(tokens, p + 1)
+    }
+    var vis = Visibility::Private
+    if is_kind_at(tokens, p, lexer::TokenKind::Pub) { vis = Visibility::Pub; p = p + 1 }
+    else if is_kind_at(tokens, p, lexer::TokenKind::Exp) { vis = Visibility::Exp; p = p + 1 }
+    var is_intern = false
+    if is_kind_at(tokens, p, lexer::TokenKind::Intern) { is_intern = true; p = p + 1 }
+    if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
+        return err_at(tokens, p, "expected `get` or `set` to open a property accessor")
+    }
+    var word = tokens[p].text
+    var is_getter = word == "get"
+    var is_setter = word == "set"
+    if !is_getter && !is_setter {
+        return err_at(tokens, p, "expected `get` or `set` to open a property accessor")
+    }
+    p = p + 1
+    if !is_name_at(tokens, p) {
+        return err_at(tokens, p, "expected a property name after `get`/`set`")
+    }
+    var prop = tokens[p].text
+    var name_line: u32 = tokens[p].line
+    var name_col: u32 = tokens[p].col
+    p = p + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
+        return err_at(tokens, p, "expected '(' for the accessor parameter list")
+    }
+    var params = match parse_params(tokens, p) { ParsedList<Param> as x => x; error as e => return e }
+    p = params.next
+    if is_getter && params.items.len != 0 {
+        return err_at(tokens, p, "a getter takes no parameters — write `get " ~ prop ~ "(): T`")
+    }
+    if is_setter && params.items.len != 1 {
+        return err_at(tokens, p, "a setter takes exactly one value parameter — write `set " ~ prop ~ "(value: T)`")
+    }
+    if is_setter && !params.items[0].has_type {
+        return err_at(tokens, p, "a setter's value parameter must declare a type — write `set " ~ prop ~ "(value: T)`")
+    }
+    var injected = inject_synthetic_receiver(params.items)
+    var has_return = false
+    var return_type = no_type()
+    if is_return_type_intro_at(tokens, p) {
+        var ret = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
+        has_return = true
+        return_type = ret.node
+        p = ret.next
+    }
+    if is_getter && !has_return {
+        return err_at(tokens, p, "a getter must declare a return type — write `get " ~ prop ~ "(): T`")
+    }
+    if is_setter && has_return {
+        return err_at(tokens, p, "a setter returns nothing — drop the `: T` after `set " ~ prop ~ "(value: T)`")
+    }
+    var sym = (if is_getter { "__get_" } else { "__set_" }) ~ prop
+    var body: []@Statement() = []
+    if allow_bodyless && !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+        return Parsed<@Decl()> { node = accessor_function(sym, injected, has_return, return_type, body, vis, has_doc, doc, name_line, name_col, is_intern, is_getter, is_setter, prop); next = p }
+    }
+    if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+        return err_at(tokens, p, "expected '{' for the accessor body")
+    }
+    var blk = match parse_block(tokens, p) { ParsedList<@Statement()> as x => x; error as e => return e }
+    Parsed<@Decl()> { node = accessor_function(sym, injected, has_return, return_type, blk.items, vis, has_doc, doc, name_line, name_col, is_intern, is_getter, is_setter, prop); next = blk.next }
+}
+
+fn accessor_function(sym: str, params: []Param, has_return: bool, return_type: @TypeExpr(), body: []@Statement(), vis: Visibility, has_doc: bool, doc: DocSpan, line: u32, col: u32, is_intern: bool, is_getter: bool, is_setter: bool, prop: str): Function {
+    Function {
+        name = sym; type_params = []; type_constraints = []
+        params = params; has_return = has_return; return_type = return_type; body = body
+        vis = vis; has_doc = has_doc; doc = doc; line = line; col = col
+        is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""
+        is_intern = is_intern; is_abstract = false; is_virtual = false; is_override = false; is_static = false
+        is_getter = is_getter; is_setter = is_setter; accessor_prop = prop; ret_types = []
+        is_operator = false
+   ; is_global = false }
+}
+
+fn parse_member_fn_or_accessor(tokens: []lexer::Token, pos: u64, allow_bodyless: bool): Parsed<@Decl()> | error {
+    if accessor_kind_at(tokens, pos) != 0 to u64 {
+        return parse_accessor(tokens, pos, allow_bodyless)
+    }
+    parse_function(tokens, pos, false, "", true, allow_bodyless)
+}
+
+fn value_member_prefix_end(tokens: []lexer::Token, pos: u64): u64 {
+    var k = pos
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
+    if is_kind_at(tokens, k, lexer::TokenKind::Pub) { k = k + 1 }
+    else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Intern) { k = k + 1 }
+    k
+}
+
+fn value_member_is_operator(tokens: []lexer::Token, pos: u64): bool {
+    var k = value_member_prefix_end(tokens, pos)
+    if !is_kind_at(tokens, k, lexer::TokenKind::Ident) { return false }
+    if tokens[k].text != "operator" { return false }
+    is_kind_at(tokens, k + 1, lexer::TokenKind::Ident)
+}
+
+fn parse_operator_member(tokens: []lexer::Token, pos: u64, allow_bodyless: bool): Parsed<Function> | error {
+    var p = pos
+    var has_doc = false
+    var doc = docspan_none()
+    if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
+        has_doc = true
+        doc = docspan_of(tokens[p].file, tokens[p].byte_off, tokens[p].text.len)
+        p = skip_seps(tokens, p + 1)
+    }
+    p = p + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
+        return err_at(tokens, p, "expected a dunder operator name (`__add`, `__eq`, `__index`, …) after `operator`")
+    }
+    var name = tokens[p].text
+    var name_line: u32 = tokens[p].line
+    var name_col: u32 = tokens[p].col
+    p = p + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
+        return err_at(tokens, p, "expected '(' for the operator's operand list")
+    }
+    var params = match parse_params(tokens, p) { ParsedList<Param> as x => x; error as e => return e }
+    p = params.next
+    var has_return = false
+    var return_type = no_type()
+    if is_return_type_intro_at(tokens, p) {
+        var ret = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
+        has_return = true
+        return_type = ret.node
+        p = ret.next
+    }
+    if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+        if allow_bodyless {
+            return Parsed<Function> { node = Function { name = name; type_params = []; type_constraints = []; params = params.items; has_return = has_return; return_type = return_type; body = []; vis = Visibility::Pub; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; is_static = true; is_getter = false; is_setter = false; accessor_prop = ""; ret_types = []; is_operator = true; is_global = false }; next = p }
+        }
+        return err_at(tokens, p, "expected '{' for the operator body")
+    }
+    var blk = match parse_block(tokens, p) { ParsedList<@Statement()> as x => x; error as e => return e }
+    Parsed<Function> { node = Function { name = name; type_params = []; type_constraints = []; params = params.items; has_return = has_return; return_type = return_type; body = blk.items; vis = Visibility::Pub; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_test = false; is_extern = false; c_symbol = ""; from_lib = ""; os_guard = ""; is_intern = false; is_abstract = false; is_virtual = false; is_override = false; is_static = true; is_getter = false; is_setter = false; accessor_prop = ""; ret_types = []; is_operator = true; is_global = false }; next = blk.next }
+}
+
+fn parse_value_type_members(tokens: []lexer::Token, pos: u64): ParsedStructBody | error {
+    var p = skip_seps(tokens, pos + 1)
+    var methods: []Function = []
+    var consts: []ConstDecl = []
+    if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
+        return ParsedStructBody { fields = []; methods = methods; consts = consts; next = p + 1 }
+    }
+    loop {
+        if value_member_is_operator(tokens, p) {
+            var op = match parse_operator_member(tokens, p, false) { Parsed<Function> as x => x; error as e => return e }
+            methods = [..methods, op.node]
+            p = op.next
+        } else {
+            var fdoc = peel_leading_doc(tokens, p)
+            var mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            if mcs.handled {
+                consts = mcs.consts
+                p = mcs.next
+            } else {
+                var k = value_member_prefix_end(tokens, p)
+                if is_kind_at(tokens, k, lexer::TokenKind::Static) {
+                    return err_at(tokens, k, "a value-type body may not declare a `static` method — write a separate free function instead")
+                }
+                if is_name_at(tokens, k) && is_kind_at(tokens, k + 1, lexer::TokenKind::Colon) {
+                    return err_at(tokens, k, "a value-type body may not declare fields")
+                }
+                if !is_kind_at(tokens, k, lexer::TokenKind::Fn) {
+                    return err_at(tokens, k, "a value-type body may contain only readonly methods (`fn …`), `operator …`, and `const` declarations")
+                }
+                var m = match parse_function(tokens, p, false, "", true, false) { Parsed<@Decl()> as x => x; error as e => return e }
+                var mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a value-type method must parse to a Function") }
+                methods = [..methods, mf]
+                p = m.next
+            }
+        }
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
+        if !is_sep(tokens, p) {
+            return err_at(tokens, p, "expected ';', a newline, or '}' after a value-type member")
+        }
+        p = skip_seps(tokens, p)
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
+    }
+    ParsedStructBody { fields = []; methods = methods; consts = consts; next = p + 1 }
+}
+
+fn struct_item_is_method(tokens: []lexer::Token, pos: u64): bool {
+    var k = pos
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
+    if is_kind_at(tokens, k, lexer::TokenKind::Pub) { k = k + 1 }
+    else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Global) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Static) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Fn) { return true }
+    accessor_kind_at(tokens, pos) != 0 to u64
+}
+fn skip_field_inline_attr(tokens: []lexer::Token, pos: u64): u64 | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::Hash) { return pos }
     if !is_kind_at(tokens, pos + 1, lexer::TokenKind::Ident) || tokens[pos + 1].text != "inline" {
         return err_at(tokens, pos + 1, "the only field attribute is `#inline`")
@@ -450,37 +585,50 @@ fn skip_field_inline_attr(tokens: []lexer::Token, pos: u64) -> u64 | error {
     skip_seps(tokens, pos + 2)
 }
 
-fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
-    mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
-    mut fields: []Field = teko::list::empty()
-    mut methods: []Function = teko::list::empty()
-    mut consts: []ConstDecl = teko::list::empty()
+fn parse_readonly_marker(tokens: []lexer::Token, pos: u64): ReadonlyMarker {
+    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "readonly" {
+        return ReadonlyMarker { present = true; next = pos + 1 }
+    }
+    ReadonlyMarker { present = false; next = pos }
+}
+
+fn parse_fields(tokens: []lexer::Token, pos: u64): ParsedStructBody | error {
+    var p = skip_seps(tokens, pos + 1)
+    var fields: []Field = []
+    var methods: []Function = []
+    var consts: []ConstDecl = []
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
         return ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
     }
     loop {
-        if struct_item_is_method(tokens, p) {
-            let m = match parse_function(tokens, p, false, "", true, false, false, 0 to u64) { Parsed<Decl> as x => x; error as e => return e }
-            let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a struct method must parse to a Function") }
-            methods = teko::list::push(methods, mf)
+        if value_member_is_operator(tokens, p) {
+            var op = match parse_operator_member(tokens, p, false) { Parsed<Function> as x => x; error as e => return e }
+            methods = [..methods, op.node]
+            p = op.next
+        } else if struct_item_is_method(tokens, p) {
+            var m = match parse_member_fn_or_accessor(tokens, p, false) { Parsed<@Decl()> as x => x; error as e => return e }
+            var mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a struct method must parse to a Function") }
+            methods = [..methods, mf]
             p = m.next
         } else {
-            let fdoc = peel_leading_doc(tokens, p)
-            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            var fdoc = peel_leading_doc(tokens, p)
+            var mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
             if mcs.handled {
                 consts = mcs.consts
                 p = mcs.next
             } else {
-                let fstart = match skip_field_inline_attr(tokens, fdoc.next) { u64 as x => x; error as e => return e }
+                var iattr = match skip_field_inline_attr(tokens, fdoc.next) { u64 as x => x; error as e => return e }
+                var ro = parse_readonly_marker(tokens, iattr)
+                var fstart = ro.next
                 if !is_name_at(tokens, fstart) {
                     return err_at(tokens, fstart, "expected a field name, a method (`fn …`), or a `const` member")
                 }
-                let name = tokens[fstart].text
+                var name = tokens[fstart].text
                 if !is_kind_at(tokens, fstart + 1, lexer::TokenKind::Colon) {
                     return err_at(tokens, fstart + 1, "expected ':' after a field name")
                 }
-                let ty = match parse_type(tokens, fstart + 2) { ParsedType as x => x; error as e => return e }
-                fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc })
+                var ty = match parse_type(tokens, fstart + 2) { ParsedType as x => x; error as e => return e }
+                fields = [..fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc; is_readonly = ro.present }]
                 p = ty.next
             }
         }
@@ -489,65 +637,66 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
             return err_at(tokens, p, "expected ';', a newline, or '}' after a struct member")
         }
         p = skip_seps(tokens, p)
-        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
     }
     ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
 }
 
-// (W10b.CLASS) is the member at `pos` a method (`fn …`, past any doc/vis/intern/dispatch
-// modifiers) or a field? Mirrors `struct_item_is_method`'s lookahead, plus the class-only
-// `intern`/`abstract`/`virtual`/`override` modifiers `parse_function` itself now consumes.
-fn class_item_is_method(tokens: []lexer::Token, pos: u64) -> bool {
-    mut k = pos
-    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }   // (#111) own-line doc
+fn class_item_is_method(tokens: []lexer::Token, pos: u64): bool {
+    var k = pos
+    if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) { k = k + 1 }
     else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Global) { k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::Intern) { k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::Abstract) { k = k + 1 }
     else if is_kind_at(tokens, k, lexer::TokenKind::Virtual) { k = k + 1 }
     else if is_kind_at(tokens, k, lexer::TokenKind::Override) { k = k + 1 }
-    is_kind_at(tokens, k, lexer::TokenKind::Fn)
+    if is_kind_at(tokens, k, lexer::TokenKind::Static) { k = k + 1 }
+    if is_kind_at(tokens, k, lexer::TokenKind::Fn) { return true }
+    accessor_kind_at(tokens, pos) != 0 to u64
 }
 
-// `{ [pub|exp]? [intern]? name: T; … }` interleaved with methods (`parse_function`,
-// `allow_receiver = true`) — a class body's member list. Unlike a struct, a bare field
-// defaults to Visibility::Private (encapsulation is the class default; `pub`/`intern` widen).
-fn parse_class_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
-    mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
-    mut fields: []Field = teko::list::empty()
-    mut methods: []Function = teko::list::empty()
-    mut consts: []ConstDecl = teko::list::empty()
+fn parse_class_fields(tokens: []lexer::Token, pos: u64): ParsedStructBody | error {
+    var p = skip_seps(tokens, pos + 1)
+    var fields: []Field = []
+    var methods: []Function = []
+    var consts: []ConstDecl = []
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
         return ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
     }
     loop {
-        if class_item_is_method(tokens, p) {
-            let m = match parse_function(tokens, p, false, "", true, false, false, 0 to u64) { Parsed<Decl> as x => x; error as e => return e }
-            let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a class method must parse to a Function") }
-            methods = teko::list::push(methods, mf)
+        if value_member_is_operator(tokens, p) {
+            var op = match parse_operator_member(tokens, p, false) { Parsed<Function> as x => x; error as e => return e }
+            methods = [..methods, op.node]
+            p = op.next
+        } else if class_item_is_method(tokens, p) {
+            var m = match parse_member_fn_or_accessor(tokens, p, false) { Parsed<@Decl()> as x => x; error as e => return e }
+            var mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a class method must parse to a Function") }
+            methods = [..methods, mf]
             p = m.next
         } else {
-            let fdoc = peel_leading_doc(tokens, p)
-            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            var fdoc = peel_leading_doc(tokens, p)
+            var mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
             if mcs.handled {
                 consts = mcs.consts
                 p = mcs.next
             } else {
-                mut fp = match skip_field_inline_attr(tokens, fdoc.next) { u64 as x => x; error as e => return e }
-                mut fvis = Visibility::Private
+                var fp = match skip_field_inline_attr(tokens, fdoc.next) { u64 as x => x; error as e => return e }
+                var fvis = Visibility::Private
                 if is_kind_at(tokens, fp, lexer::TokenKind::Pub) { fvis = Visibility::Pub; fp = fp + 1 }
                 else if is_kind_at(tokens, fp, lexer::TokenKind::Exp) { fvis = Visibility::Exp; fp = fp + 1 }
-                mut fintern = false
+                var fintern = false
                 if is_kind_at(tokens, fp, lexer::TokenKind::Intern) { fintern = true; fp = fp + 1 }
                 if !is_name_at(tokens, fp) {
                     return err_at(tokens, fp, "expected a field name, a method (`fn …`), or a `const` member")
                 }
-                let name = tokens[fp].text
+                var name = tokens[fp].text
                 if !is_kind_at(tokens, fp + 1, lexer::TokenKind::Colon) {
                     return err_at(tokens, fp + 1, "expected ':' after a field name")
                 }
-                let ty = match parse_type(tokens, fp + 2) { ParsedType as x => x; error as e => return e }
-                fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = fvis; is_intern = fintern; has_doc = fdoc.has_doc; doc = fdoc.doc })
+                var ty = match parse_type(tokens, fp + 2) { ParsedType as x => x; error as e => return e }
+                fields = [..fields, Field { name = name; type_ann = ty.node; vis = fvis; is_intern = fintern; has_doc = fdoc.has_doc; doc = fdoc.doc; is_readonly = false }]
                 p = ty.next
             }
         }
@@ -556,132 +705,180 @@ fn parse_class_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
             return err_at(tokens, p, "expected ';', a newline, or '}' after a class member")
         }
         p = skip_seps(tokens, p)
-        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
     }
     ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
 }
 
-// `[abstract|virtual] class [Base[(binding)]] [& I1 & I2 …] { members }`. `pos` is at
-// `abstract`/`virtual`/`class` (the caller has already dispatched on one of these).
-// SEALED (no modifier) is Teko's default class kind (final + instantiable) — see ClassKind's doc.
-fn parse_class_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error {
-    mut p = pos
-    mut kind = ClassKind::Sealed
+fn parse_class_body(tokens: []lexer::Token, pos: u64): Parsed<@TypeBody()> | error {
+    var p = pos
+    var kind = ClassKind::Sealed
     if is_kind_at(tokens, p, lexer::TokenKind::Abstract) { kind = ClassKind::Abstract; p = p + 1 }
     else if is_kind_at(tokens, p, lexer::TokenKind::Virtual) { kind = ClassKind::Virtual; p = p + 1 }
+    if is_kind_at(tokens, p, lexer::TokenKind::Service) {
+        return err_at(tokens, p, "a service is always sealed; write 'type N = service <lifetime> { … }' (no 'virtual'/'abstract')")
+    }
     if !is_kind_at(tokens, p, lexer::TokenKind::Class) {
         return err_at(tokens, p, "expected `class`")
     }
     p = p + 1
-    mut has_base = false
-    mut base_name = ""
-    mut has_base_binding = false
-    mut base_binding_name = ""
+    var has_base = false
+    var base_name = ""
+    var has_base_binding = false
+    var base_binding_name = ""
     if is_name_at(tokens, p) {
         has_base = true
         base_name = tokens[p].text
         p = p + 1
         if is_kind_at(tokens, p, lexer::TokenKind::LParen) {
-            if !is_name_at(tokens, p + 1) {
-                return err_at(tokens, p + 1, "expected a base-binding name after '('")
-            }
-            has_base_binding = true
-            base_binding_name = tokens[p + 1].text
-            if !is_kind_at(tokens, p + 2, lexer::TokenKind::RParen) {
-                return err_at(tokens, p + 2, "expected ')' after the base-binding name")
-            }
-            p = p + 3
+            return err_at(tokens, p, "super is accessed via `base`, not a named binding — write `class Base { … }`, not `class Base(name)`")
         }
     }
-    mut implements: []str = teko::list::empty()
+    var implements: []str = []
     loop {
         if !is_kind_at(tokens, p, lexer::TokenKind::Amp) { break }
         if !is_name_at(tokens, p + 1) {
             return err_at(tokens, p + 1, "expected an interface name after '&'")
         }
-        implements = teko::list::push(implements, tokens[p + 1].text)
+        implements = [..implements, tokens[p + 1].text]
         p = p + 2
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' for the class body")
     }
-    let fs = match parse_class_fields(tokens, p) { ParsedStructBody as x => x; error as e => return e }
-    Parsed<TypeBody> { node = ClassBody {
+    var fs = match parse_class_fields(tokens, p) { ParsedStructBody as x => x; error as e => return e }
+    Parsed<@TypeBody()> { node = ClassBody {
             kind = kind; has_base = has_base; base_name = base_name
             has_base_binding = has_base_binding; base_binding_name = base_binding_name
             implements = implements; fields = fs.fields; methods = fs.methods; consts = fs.consts
+            is_service = false; service_lifetime = ServiceLifetime::Singleton
         }; next = fs.next }
 }
 
-// (W10b.IF) parse a `Name [& Name …]` list where the FIRST name has NO leading `&` (interface
-// extends / struct implements — a flat list of interface names). Returns the names + the resume pos.
-fn parse_amp_name_list(tokens: []lexer::Token, pos: u64) -> ParsedList<str> | error {
-    mut p = pos
-    mut names: []str = teko::list::empty()
+fn parse_service_lifetime(tokens: []lexer::Token, pos: u64): Parsed<ServiceLifetime> | error {
+    if is_name_at(tokens, pos) && tokens[pos].text == "singleton" {
+        return Parsed<ServiceLifetime> { node = ServiceLifetime::Singleton; next = pos + 1 }
+    }
+    if is_name_at(tokens, pos) && tokens[pos].text == "scoped" {
+        return Parsed<ServiceLifetime> { node = ServiceLifetime::Scoped; next = pos + 1 }
+    }
+    if is_name_at(tokens, pos) && tokens[pos].text == "transient" {
+        return Parsed<ServiceLifetime> { node = ServiceLifetime::Transient; next = pos + 1 }
+    }
+    err_at(tokens, pos, "expected a service lifetime `singleton`/`scoped`/`transient` after `service`")
+}
+
+fn parse_service_body(tokens: []lexer::Token, pos: u64): Parsed<@TypeBody()> | error {
+    var lt = match parse_service_lifetime(tokens, pos + 1) { Parsed<ServiceLifetime> as x => x; error as e => return e }
+    var p = lt.next
+    var implements: []str = []
+    loop {
+        if !is_kind_at(tokens, p, lexer::TokenKind::Amp) { break }
+        if !is_name_at(tokens, p + 1) {
+            return err_at(tokens, p + 1, "expected an interface name after '&'")
+        }
+        implements = [..implements, tokens[p + 1].text]
+        p = p + 2
+    }
+    if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+        return err_at(tokens, p, "expected '{' for the service body")
+    }
+    var fs = match parse_class_fields(tokens, p) { ParsedStructBody as x => x; error as e => return e }
+    Parsed<@TypeBody()> { node = ClassBody {
+            kind = ClassKind::Sealed; has_base = false; base_name = ""
+            has_base_binding = false; base_binding_name = ""
+            implements = implements; fields = fs.fields; methods = fs.methods; consts = fs.consts
+            is_service = true; service_lifetime = lt.node
+        }; next = fs.next }
+}
+
+fn parse_amp_name_list(tokens: []lexer::Token, pos: u64): ParsedList<str> | error {
+    var p = pos
+    var names: []str = []
     if is_name_at(tokens, p) {
-        names = teko::list::push(names, tokens[p].text)
+        names = [..names, tokens[p].text]
         p = p + 1
         loop {
             if !is_kind_at(tokens, p, lexer::TokenKind::Amp) { break }
             if !is_name_at(tokens, p + 1) { return err_at(tokens, p + 1, "expected an interface name after '&'") }
-            names = teko::list::push(names, tokens[p + 1].text)
+            names = [..names, tokens[p + 1].text]
             p = p + 2
         }
     }
     ParsedList<str> { items = names; next = p }
 }
 
-// (W10b.IF) `interface [I1 & I2 …] { fn sig(self) -> T; … }`. `pos` is at `interface`. The `I1 & I2`
-// extends list (multiple inheritance) sits between `interface` and `{`; each member is a BODYLESS
-// method signature (parse_function allow_receiver=true, allow_bodyless=true) — no fields, no bodies.
-fn parse_interface_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error {
-    let ext = match parse_amp_name_list(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
-    mut p = ext.next
+fn parse_interface_body(tokens: []lexer::Token, pos: u64): Parsed<@TypeBody()> | error {
+    var ext_start = pos + 1
+    if is_kind_at(tokens, ext_start, lexer::TokenKind::Amp) { ext_start = ext_start + 1 }
+    var ext = match parse_amp_name_list(tokens, ext_start) { ParsedList<str> as x => x; error as e => return e }
+    var p = ext.next
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' for the interface body")
     }
     p = skip_seps(tokens, p + 1)
-    mut methods: []Function = teko::list::empty()
+    var methods: []Function = []
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
-        return Parsed<TypeBody> { node = InterfaceBody { extends = ext.items; methods = methods }; next = p + 1 }
+        return Parsed<@TypeBody()> { node = InterfaceBody { extends = ext.items; methods = methods }; next = p + 1 }
     }
     loop {
-        let idoc = peel_leading_doc(tokens, p)
-        let imc = peek_member_const(tokens, idoc.next)
-        if imc.is_const || imc.bad_override { return reject_const_member(tokens, imc.kw_pos) }
-        let m = match parse_function(tokens, p, false, "", true, true, false, 0 to u64) { Parsed<Decl> as x => x; error as e => return e }
-        let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "an interface member must be a method signature (`fn …`)") }
-        methods = teko::list::push(methods, mf)
-        p = m.next
+        if value_member_is_operator(tokens, p) {
+            var op = match parse_operator_member(tokens, p, true) { Parsed<Function> as x => x; error as e => return e }
+            methods = [..methods, op.node]
+            p = op.next
+        } else {
+            var idoc = peel_leading_doc(tokens, p)
+            var imc = peek_member_const(tokens, idoc.next)
+            if imc.is_const || imc.bad_override { return reject_const_member(tokens, imc.kw_pos) }
+            var m = match parse_member_fn_or_accessor(tokens, p, true) { Parsed<@Decl()> as x => x; error as e => return e }
+            var mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "an interface member must be a method signature (`fn …`)") }
+            methods = [..methods, mf]
+            p = m.next
+        }
         if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
         if !is_sep(tokens, p) { return err_at(tokens, p, "expected ';', a newline, or '}' after an interface method") }
         p = skip_seps(tokens, p)
-        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
     }
-    Parsed<TypeBody> { node = InterfaceBody { extends = ext.items; methods = methods }; next = p + 1 }
+    Parsed<@TypeBody()> { node = InterfaceBody { extends = ext.items; methods = methods }; next = p + 1 }
 }
 
-// (TR0) `trait { <fields>; <methods, with or without bodies> }`. `pos` is at the `{` (the caller
-// consumed the contextual `trait`). The body is STRUCT-SHAPED: interleaved `name: T` fields and
-// `fn` methods; unlike a struct's, a method here MAY be bodyless (a requirement the deriver must
-// satisfy — parse_function allow_bodyless=true, the interface-member path). Mirrors parse_fields.
-fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | error {
-    mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
-    mut fields: []Field = teko::list::empty()
-    mut methods: []Function = teko::list::empty()
-    mut consts: []ConstDecl = teko::list::empty()
+fn parse_trait_composition(tokens: []lexer::Token, pos: u64): ParsedList<str> | error {
+    var p = pos
+    var names: []str = []
+    loop {
+        if !is_kind_at(tokens, p, lexer::TokenKind::Amp) { break }
+        if !is_name_at(tokens, p + 1) { return err_at(tokens, p + 1, "expected a trait or interface name after '&'") }
+        names = [..names, tokens[p + 1].text]
+        p = p + 2
+    }
+    ParsedList<str> { items = names; next = p }
+}
+
+fn parse_trait_members(tokens: []lexer::Token, pos: u64): ParsedStructBody | error {
+    var p = skip_seps(tokens, pos + 1)
+    var fields: []Field = []
+    var methods: []Function = []
+    var consts: []ConstDecl = []
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
         return ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
     }
     loop {
-        if struct_item_is_method(tokens, p) {
-            let m = match parse_function(tokens, p, false, "", true, true, false, 0 to u64) { Parsed<Decl> as x => x; error as e => return e }
-            let mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a trait method must parse to a Function") }
-            methods = teko::list::push(methods, mf)
+        if value_member_is_operator(tokens, p) {
+            var op = match parse_operator_member(tokens, p, false) { Parsed<Function> as x => x; error as e => return e }
+            methods = [..methods, op.node]
+            p = op.next
+        } else if struct_item_is_method(tokens, p) {
+            var m = match parse_member_fn_or_accessor(tokens, p, true) { Parsed<@Decl()> as x => x; error as e => return e }
+            var mf = match m.node { Function as f => f; _ => return err_at(tokens, p, "internal: a trait method must parse to a Function") }
+            if mf.body.len == 0 {
+                return err_at(tokens, p, "a trait method must have a body — a bodyless member belongs on an interface")
+            }
+            methods = [..methods, mf]
             p = m.next
         } else {
-            let fdoc = peel_leading_doc(tokens, p)
-            let mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
+            var fdoc = peel_leading_doc(tokens, p)
+            var mcs = match try_parse_member_const(tokens, fdoc.next, fdoc.has_doc, fdoc.doc, consts) { MemberConstStep as x => x; error as e => return e }
             if mcs.handled {
                 consts = mcs.consts
                 p = mcs.next
@@ -689,12 +886,12 @@ fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
                 if !is_name_at(tokens, fdoc.next) {
                     return err_at(tokens, fdoc.next, "expected a field name, a method (`fn …`), or a `const` member in the trait body")
                 }
-                let name = tokens[fdoc.next].text
+                var name = tokens[fdoc.next].text
                 if !is_kind_at(tokens, fdoc.next + 1, lexer::TokenKind::Colon) {
                     return err_at(tokens, fdoc.next + 1, "expected ':' after a field name")
                 }
-                let ty = match parse_type(tokens, fdoc.next + 2) { ParsedType as x => x; error as e => return e }
-                fields = teko::list::push(fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc })
+                var ty = match parse_type(tokens, fdoc.next + 2) { ParsedType as x => x; error as e => return e }
+                fields = [..fields, Field { name = name; type_ann = ty.node; vis = Visibility::Pub; is_intern = false; has_doc = fdoc.has_doc; doc = fdoc.doc; is_readonly = false }]
                 p = ty.next
             }
         }
@@ -703,79 +900,114 @@ fn parse_trait_fields(tokens: []lexer::Token, pos: u64) -> ParsedStructBody | er
             return err_at(tokens, p, "expected ';', a newline, or '}' after a trait member")
         }
         p = skip_seps(tokens, p)
-        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }   // trailing separator
+        if is_kind_at(tokens, p, lexer::TokenKind::RBrace) { break }
     }
     ParsedStructBody { fields = fields; methods = methods; consts = consts; next = p + 1 }
 }
 
-// the body of a type declaration. `struct [I & …] { fields }`, `interface [I & …] { sigs }`,
-// `trait { … }`, `enum { … }`, `variant A | B`, `[abstract|virtual] class …`, or ELSE a
-// TRANSPARENT alias `= <type-expr>` (self-host parity). `pos` is at the body's first token.
-fn parse_type_body(tokens: []lexer::Token, pos: u64) -> Parsed<TypeBody> | error {
+fn freeze_all_fields(fields: []Field): []Field {
+    var out: []Field = []
+    var i = 0 to u64
+    loop {
+        if i >= fields.len { break }
+        var f = fields[i]
+        out = [..out, Field { name = f.name; type_ann = f.type_ann; vis = f.vis; is_intern = f.is_intern; has_doc = f.has_doc; doc = f.doc; is_readonly = true }]
+        i++
+    }
+    out
+}
+
+fn is_readonly_struct_head(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "readonly" && is_kind_at(tokens, pos + 1, lexer::TokenKind::Struct)
+}
+
+fn parse_struct_body(tokens: []lexer::Token, pos: u64, is_readonly: bool): Parsed<@TypeBody()> | error {
+    var impls = match parse_amp_name_list(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
+    if !is_kind_at(tokens, impls.next, lexer::TokenKind::LBrace) {
+        return err_at(tokens, impls.next, "expected '{' after `struct` (or its interface list)")
+    }
+    var fs = match parse_fields(tokens, impls.next) { ParsedStructBody as x => x; error as e => return e }
+    var flds = fs.fields
+    if is_readonly { flds = freeze_all_fields(fs.fields) }
+    Parsed<@TypeBody()> { node = StructBody { fields = flds; methods = fs.methods; implements = impls.items; consts = fs.consts; is_readonly = is_readonly }; next = fs.next }
+}
+
+fn is_trait_decl_head(tokens: []lexer::Token, pos: u64): bool {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Ident) { return false }
+    if tokens[pos].text != "trait" { return false }
+    is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) || is_kind_at(tokens, pos + 1, lexer::TokenKind::Amp)
+}
+
+fn parse_type_body(tokens: []lexer::Token, pos: u64): Parsed<@TypeBody()> | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::Class) || is_kind_at(tokens, pos, lexer::TokenKind::Abstract) || is_kind_at(tokens, pos, lexer::TokenKind::Virtual) {
         return parse_class_body(tokens, pos)
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Interface) {
         return parse_interface_body(tokens, pos)
     }
-    // (TR0) `trait` is CONTEXTUAL, like `from`/`params` — NOT a reserved word (an identifier named
-    // `trait` stays an ordinary Ident everywhere else). It only means "trait declaration" when the
-    // body position holds Ident("trait") IMMEDIATELY followed by `{` — a transparent alias to a
-    // type named `trait` (`type X = trait`) has no `{` and still parses as an alias below. A trait
-    // declares NO derive-list of its own (no `trait A & B { }` — compose at the deriver instead).
-    if is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "trait" && is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
-        let fs = match parse_trait_fields(tokens, pos + 1) { ParsedStructBody as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = TraitBody { fields = fs.fields; methods = fs.methods; consts = fs.consts }; next = fs.next }
+    if is_kind_at(tokens, pos, lexer::TokenKind::Service) {
+        return parse_service_body(tokens, pos)
+    }
+    if is_trait_decl_head(tokens, pos) {
+        var impls = match parse_trait_composition(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
+        if !is_kind_at(tokens, impls.next, lexer::TokenKind::LBrace) {
+            return err_at(tokens, impls.next, "expected '{' after `trait` (or its `& …` composition list)")
+        }
+        var fs = match parse_trait_members(tokens, impls.next) { ParsedStructBody as x => x; error as e => return e }
+        return Parsed<@TypeBody()> { node = TraitBody { fields = fs.fields; methods = fs.methods; consts = fs.consts; implements = impls.items }; next = fs.next }
+    }
+    if is_readonly_struct_head(tokens, pos) {
+        return parse_struct_body(tokens, pos + 1, true)
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Struct) {
-        // (W10b.IF) optional implements list `struct I1 & I2 { … }` between `struct` and `{`.
-        let impls = match parse_amp_name_list(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
-        if !is_kind_at(tokens, impls.next, lexer::TokenKind::LBrace) {
-            return err_at(tokens, impls.next, "expected '{' after `struct` (or its interface list)")
-        }
-        let fs = match parse_fields(tokens, impls.next) { ParsedStructBody as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = StructBody { fields = fs.fields; methods = fs.methods; implements = impls.items; consts = fs.consts }; next = fs.next }
+        return parse_struct_body(tokens, pos, false)
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Enum) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
             return err_at(tokens, pos + 1, "expected '{' after `enum`")
         }
         match reject_const_body_member(tokens, pos + 1) { error as e => return e; null => { } }
-        let ms = match parse_field_names(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = EnumBody { members = ms.items }; next = ms.next }
+        var ms = match parse_field_names(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
+        if is_kind_at(tokens, ms.next, lexer::TokenKind::LBrace) {
+            var mb = match parse_value_type_members(tokens, ms.next) { ParsedStructBody as x => x; error as e => return e }
+            return Parsed<@TypeBody()> { node = EnumBody { members = ms.items; methods = mb.methods; consts = mb.consts }; next = mb.next }
+        }
+        return Parsed<@TypeBody()> { node = EnumBody { members = ms.items; methods = []; consts = [] }; next = ms.next }
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Flags) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
             return err_at(tokens, pos + 1, "expected '{' after `flags`")
         }
         match reject_const_body_member(tokens, pos + 1) { error as e => return e; null => { } }
-        let ms = match parse_field_names(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = FlagsBody { members = ms.items; values = teko::list::empty() }; next = ms.next }
+        var ms = match parse_field_names(tokens, pos + 1) { ParsedList<str> as x => x; error as e => return e }
+        if is_kind_at(tokens, ms.next, lexer::TokenKind::LBrace) {
+            var mb = match parse_value_type_members(tokens, ms.next) { ParsedStructBody as x => x; error as e => return e }
+            return Parsed<@TypeBody()> { node = FlagsBody { members = ms.items; values = []; methods = mb.methods; consts = mb.consts }; next = mb.next }
+        }
+        return Parsed<@TypeBody()> { node = FlagsBody { members = ms.items; values = []; methods = []; consts = [] }; next = ms.next }
     }
     if is_kind_at(tokens, pos, lexer::TokenKind::Variant) {
-        let ty = match parse_type(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
-        return Parsed<TypeBody> { node = VariantBody { type_expr = ty.node }; next = ty.next }
+        var ty = match parse_type(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
+        return Parsed<@TypeBody()> { node = VariantBody { type_expr = ty.node }; next = ty.next }
     }
-    // ELSE: `type Name = <type-expr>` — a TRANSPARENT alias (slice `[]T`, a named type, a
-    // union `A | B`, an optional `T?`, …). Parse a full type-expression (self-host parity).
-    let al = match parse_type(tokens, pos) { ParsedType as x => x; error as e => return e }
-    Parsed<TypeBody> { node = AliasBody { alias = al.node }; next = al.next }
+    var al = match parse_type(tokens, pos) { ParsedType as x => x; error as e => return e }
+    if is_kind_at(tokens, al.next, lexer::TokenKind::LBrace) {
+        var mb = match parse_value_type_members(tokens, al.next) { ParsedStructBody as x => x; error as e => return e }
+        return Parsed<@TypeBody()> { node = NewtypeBody { backing = al.node; methods = mb.methods; consts = mb.consts }; next = mb.next }
+    }
+    Parsed<@TypeBody()> { node = AliasBody { alias = al.node }; next = al.next }
 }
 
-// `[doc] [pub|exp] flags Name { Member; Member; … }` (C8.2).
-// A standalone bitflag-enum declaration: `flags` keyword + name + member-name list.
-// Power-of-2 values are auto-assigned by the checker (C8.3); no `=` and no manual values here.
-fn parse_flags_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
-    mut p = pos
-    mut has_doc = false
-    mut doc = ""
-    // (#111) an own-line doc comment attaches to the NEXT declaration; see parse_function.
+fn parse_flags_decl(tokens: []lexer::Token, pos: u64): Parsed<@Decl()> | error {
+    var p = pos
+    var has_doc = false
+    var doc = docspan_none()
     if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
         has_doc = true
-        doc = tokens[p].text
+        doc = docspan_of(tokens[p].file, tokens[p].byte_off, tokens[p].text.len)
         p = skip_seps(tokens, p + 1)
     }
-    mut vis = Visibility::Private
+    var vis = Visibility::Private
     if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
         vis = Visibility::Pub
         p = p + 1
@@ -783,6 +1015,9 @@ fn parse_flags_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         vis = Visibility::Exp
         p = p + 1
     }
+    var global_mod = consume_global_modifier(tokens, p)
+    var is_global = global_mod.node
+    p = global_mod.next
     if !is_kind_at(tokens, p, lexer::TokenKind::Flags) {
         return err_at(tokens, p, "expected `flags`")
     }
@@ -790,30 +1025,65 @@ fn parse_flags_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
         return err_at(tokens, p, "expected a type name after `flags`")
     }
-    let name = tokens[p].text
-    let name_line: u32 = tokens[p].line
-    let name_col: u32 = tokens[p].col
+    var name = tokens[p].text
+    var name_line: u32 = tokens[p].line
+    var name_col: u32 = tokens[p].col
     p = p + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
         return err_at(tokens, p, "expected '{' after the flags type name")
     }
-    let ms = match parse_field_names(tokens, p) { ParsedList<str> as x => x; error as e => return e }
-    Parsed<Decl> { node = TypeDecl { name = name; type_params = teko::list::empty(); type_constraints = teko::list::empty(); body = FlagsBody { members = ms.items; values = teko::list::empty() }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = false; must_free = false }; next = ms.next }
+    var ms = match parse_field_names(tokens, p) { ParsedList<str> as x => x; error as e => return e }
+    var methods: []Function = []
+    var consts: []ConstDecl = []
+    var body_next = ms.next
+    if is_kind_at(tokens, ms.next, lexer::TokenKind::LBrace) {
+        var mb = match parse_value_type_members(tokens, ms.next) { ParsedStructBody as x => x; error as e => return e }
+        methods = mb.methods
+        consts = mb.consts
+        body_next = mb.next
+    }
+    Parsed<@Decl()> { node = TypeDecl { name = name; type_params = []; type_constraints = []; body = FlagsBody { members = ms.items; values = []; methods = methods; consts = consts }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_global = is_global }; next = body_next }
 }
 
-// `[doc] [pub|exp] type Name = <body>` (B.13, nominal). Doc + visibility precede `type`.
-// `pos` is at the doc, `pub`/`exp`, or `type`.
-fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
-    mut p = pos
-    mut has_doc = false
-    mut doc = ""
-    // (#111) an own-line doc comment attaches to the NEXT declaration; see parse_function.
+fn parse_extern_type_body(tokens: []lexer::Token, pos: u64): Parsed<@TypeBody()> | error {
+    var p = pos
+    if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
+        return Parsed<@TypeBody()> { node = ExternBody { }; next = p }
+    }
+    p = p + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Struct) {
+        return err_at(tokens, p, "an `extern type` is either opaque (`extern type Name`) or a C-ABI struct (`extern type Name = struct { … }`)")
+    }
+    if !is_kind_at(tokens, p + 1, lexer::TokenKind::LBrace) {
+        return err_at(tokens, p + 1, "expected '{' after `struct` in an `extern type`")
+    }
+    var fs = match parse_fields(tokens, p + 1) { ParsedStructBody as x => x; error as e => return e }
+    if fs.methods.len > 0 || fs.consts.len > 0 {
+        return err_at(tokens, p, "an extern struct declares only fields (no methods, consts, or interfaces)")
+    }
+    var q = fs.next
+    var c_tag = ""
+    if is_kind_at(tokens, q, lexer::TokenKind::Ident) && tokens[q].text == "from" {
+        q = q + 1
+        if !is_kind_at(tokens, q, lexer::TokenKind::Str) {
+            return err_at(tokens, q, "expected a quoted C struct tag after `from`")
+        }
+        c_tag = tokens[q].text
+        q = q + 1
+    }
+    Parsed<@TypeBody()> { node = ExternStructBody { fields = fs.fields; c_tag = c_tag }; next = q }
+}
+
+fn parse_type_decl(tokens: []lexer::Token, pos: u64): Parsed<@Decl()> | error {
+    var p = pos
+    var has_doc = false
+    var doc = docspan_none()
     if is_kind_at(tokens, p, lexer::TokenKind::Doc) {
         has_doc = true
-        doc = tokens[p].text
+        doc = docspan_of(tokens[p].file, tokens[p].byte_off, tokens[p].text.len)
         p = skip_seps(tokens, p + 1)
     }
-    mut vis = Visibility::Private   // default: own-namespace only
+    var vis = Visibility::Private
     if is_kind_at(tokens, p, lexer::TokenKind::Pub) {
         vis = Visibility::Pub
         p = p + 1
@@ -821,14 +1091,14 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         vis = Visibility::Exp
         p = p + 1
     }
-    mut is_extern = false   // C7.1a: `extern type Name` (opaque foreign handle)
+    var global_mod = consume_global_modifier(tokens, p)
+    var is_global = global_mod.node
+    p = global_mod.next
+    var is_extern = false
     if is_kind_at(tokens, p, lexer::TokenKind::Extern) {
         is_extern = true
         p = p + 1
     }
-    let unsafe_mod = consume_unsafe_modifier(tokens, p)
-    let is_unsafe = unsafe_mod.node
-    p = unsafe_mod.next
     if !is_kind_at(tokens, p, lexer::TokenKind::Type) {
         return err_at(tokens, p, "expected `type`")
     }
@@ -836,260 +1106,207 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
         return err_at(tokens, p, "expected a type name")
     }
-    let name = tokens[p].text
+    var name = tokens[p].text
     if is_reserved_type_name(name) {
         return err_at(tokens, p, "`Ref` is a reserved type name — it is the compiler-internal safe reference the `ref` keyword desugars to, so no user type may take it (write `ref T` in a type position, `ref x: T` to bind)")
     }
-    let name_line: u32 = tokens[p].line
-    let name_col: u32 = tokens[p].col   // W-loc-2: the type's source position
+    var name_line: u32 = tokens[p].line
+    var name_col: u32 = tokens[p].col
     p = p + 1
-    let tps = match parse_type_params(tokens, p) { ParsedTypeParams as x => x; error as e => return e }   // (S4/W11) `type Box<T: A & B> = …`
+    var tps = match parse_type_params(tokens, p) { ParsedTypeParams as x => x; error as e => return e }
     p = tps.next
     if is_extern {
-        // `extern type Name` — an OPAQUE foreign handle: no `= <body>`, lowers to `void *`.
-        return Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = ExternBody { }; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = is_unsafe; must_free = false }; next = p }
+        var eb = match parse_extern_type_body(tokens, p) { Parsed<@TypeBody()> as x => x; error as e => return e }
+        return Parsed<@Decl()> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = eb.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_global = is_global }; next = eb.next }
     }
     if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
         return err_at(tokens, p, "expected '=' in a type declaration")
     }
-    let body = match parse_type_body(tokens, p + 1) { Parsed<TypeBody> as x => x; error as e => return e }
-    Parsed<Decl> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = body.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; di_kind = DiKind::None; has_di_key = false; di_key = ""; is_unsafe = is_unsafe; must_free = false }; next = body.next }
+    var body = match parse_type_body(tokens, p + 1) { Parsed<@TypeBody()> as x => x; error as e => return e }
+    Parsed<@Decl()> { node = TypeDecl { name = name; type_params = tps.names; type_constraints = tps.constraints; body = body.node; vis = vis; has_doc = has_doc; doc = doc; line = name_line; col = name_col; is_global = is_global }; next = body.next }
 }
 
-// `parse_module` returns Parsed<Module> (an instance of the result.tks generic).
 
-/** Collect the leading `#…` attributes before a declaration keyword (each on its own line or
- *  inline): `#test` (D2), `#os("…")` (C7.1f), the three DI lifetimes `#singleton`/`#scoped`/
- *  `#transient` (W10c, precede a `type`), the `#inject(…)` overlay (W10c, precedes a `fn`),
- *  `#arena_size(N)` (#453, the 0.3.1 SW1 resource/arena foundation — precedes a `fn`), and
- *  `#must_free` (S2, the 0.1.0.0-beta memory+unsafe remodel #336 — precedes a `type`). A second
- *  lifetime annotation, a doubled `#must_free`, or a doubled `#arena_size(…)`, on one declaration
- *  is an honest error. `next` resumes at the doc/visibility/keyword that follows the block;
- *  placement (fn-vs-type) is enforced by the caller so the message names the actual keyword. */
-fn parse_decl_attributes(tokens: []lexer::Token, pos: u64) -> ParsedAttributes | error {
-    mut start = pos
-    mut is_test = false
-    mut os_guard = ""
-    mut di_kind = DiKind::None
-    mut has_key = false
-    mut key = ""
-    mut has_inject = false
-    mut injects: []InjectBinding = teko::list::empty()
-    mut must_free = false
-    mut has_arena_size = false
-    mut arena_size: u64 = 0 to u64
+fn parse_decl_attributes(tokens: []lexer::Token, pos: u64): ParsedAttributes | error {
+    var start = pos
+    var is_test = false
+    var os_guard = ""
+    var guard = pred_true()
     loop {
         if !is_kind_at(tokens, start, lexer::TokenKind::Hash) { break }
         if !is_kind_at(tokens, start + 1, lexer::TokenKind::Ident) {
             return err_at(tokens, start + 1, "expected an attribute name after `#`")
         }
-        let attr = tokens[start + 1].text
+        var attr = tokens[start + 1].text
         if attr == "test" {
             is_test = true
             start = skip_seps(tokens, start + 2)
         } else if attr == "os" {
             if !is_kind_at(tokens, start + 2, lexer::TokenKind::LParen) { return err_at(tokens, start + 2, "expected '(' after `#os`") }
             if !is_kind_at(tokens, start + 3, lexer::TokenKind::Str) { return err_at(tokens, start + 3, "expected a quoted OS name in `#os(\"…\")`") }
+            match cc_axis_value_diag("os", tokens[start + 3].text, tokens[start + 3].line, tokens[start + 3].col) { error as e => return e; null => { } }
             os_guard = tokens[start + 3].text
             if !is_kind_at(tokens, start + 4, lexer::TokenKind::RParen) { return err_at(tokens, start + 4, "expected ')' to close `#os(…)`") }
+            guard = attr_guard_and(guard, pred_os(tokens[start + 3].text))
             start = skip_seps(tokens, start + 5)
-        } else if attr == "inject" {
-            if has_inject { return err_at(tokens, start + 1, "a function may carry only one `#inject(…)` overlay") }
-            let ov = match parse_inject_overlay(tokens, start) { ParsedList<InjectBinding> as x => x; error as e => return e }
-            has_inject = true
-            injects = ov.items
-            start = skip_seps(tokens, ov.next)
-        } else if attr == "arena_size" {
-            if has_arena_size { return err_at(tokens, start + 1, "a function may carry only one `#arena_size(…)` directive") }
-            let parsed = match parse_arena_size_arg(tokens, start) { ParsedU64 as x => x; error as e => return e }
-            has_arena_size = true
-            arena_size = parsed.value
-            start = skip_seps(tokens, parsed.next)
-        } else if attr == "singleton" || attr == "scoped" || attr == "transient" {
-            if di_kind != DiKind::None { return err_at(tokens, start + 1, "a type may carry only one lifetime annotation (`#singleton`/`#scoped`/`#transient`)") }
-            di_kind = lifetime_kind_of(attr)
-            start = skip_seps(tokens, start + 2)
-        } else if attr == "must_free" {
-            if must_free { return err_at(tokens, start + 1, "a type may carry only one `#must_free` attribute") }
-            must_free = true
-            start = skip_seps(tokens, start + 2)
+        } else if attr == "arch" {
+            if !is_kind_at(tokens, start + 2, lexer::TokenKind::LParen) { return err_at(tokens, start + 2, "expected '(' after `#arch`") }
+            if !is_kind_at(tokens, start + 3, lexer::TokenKind::Str) { return err_at(tokens, start + 3, "expected a quoted arch name in `#arch(\"…\")`") }
+            match cc_axis_value_diag("arch", tokens[start + 3].text, tokens[start + 3].line, tokens[start + 3].col) { error as e => return e; null => { } }
+            if !is_kind_at(tokens, start + 4, lexer::TokenKind::RParen) { return err_at(tokens, start + 4, "expected ')' to close `#arch(…)`") }
+            guard = attr_guard_and(guard, pred_arch(tokens[start + 3].text))
+            start = skip_seps(tokens, start + 5)
         } else if attr == "inline" {
-            return err_at(tokens, start + 1, "`#inline` attaches to a local binding (`#inline let …`) or a struct field (`#inline name: T`), not a declaration")
+            return err_at(tokens, start + 1, "`#inline` attaches to a local binding (`#inline var …`) or a struct field (`#inline name: T`), not a declaration")
         } else {
-            return err_at(tokens, start + 1, "unknown attribute (only `#test`, `#os(\"…\")`, `#inject(…)`, `#arena_size(N)`, the lifetimes `#singleton`/`#scoped`/`#transient`, `#must_free`, and the binding/field `#inline` are recognized)")
+            return err_at(tokens, start + 1, "unknown attribute (only `#test`, `#os(\"…\")`, `#arch(\"…\")`, and the binding/field `#inline` are recognized)")
         }
     }
-    ParsedAttributes { is_test = is_test; os_guard = os_guard; di_kind = di_kind; has_key = has_key; key = key; has_inject = has_inject; injects = injects; must_free = must_free; has_arena_size = has_arena_size; arena_size = arena_size; next = start }
+    ParsedAttributes { is_test = is_test; os_guard = os_guard; guard = guard; next = start }
 }
 
-/** A parsed `u64` literal + the resume index (the `#arena_size(N)` argument's own tiny result
- *  shape — not worth a whole named type in `result.tks` for one call site). */
-type ParsedU64 = struct { value: u64; next: u64 }
-
-/** Parse the `(N)` byte-count argument of `#arena_size(N)`. `pos` is at the `#`. `N` must be a
- *  bare positive integer literal (no suffix, no expression) — a compile-time constant the
- *  developer writes; the compiler never computes or infers it (owner ruling 2026-07-13). */
-fn parse_arena_size_arg(tokens: []lexer::Token, pos: u64) -> ParsedU64 | error {
-    if !is_kind_at(tokens, pos + 2, lexer::TokenKind::LParen) { return err_at(tokens, pos + 2, "expected '(' after `#arena_size`") }
-    if !is_kind_at(tokens, pos + 3, lexer::TokenKind::Number) { return err_at(tokens, pos + 3, "expected a positive integer byte count in `#arena_size(N)`") }
-    let lit = tokens[pos + 3].text
-    let n = match lit_int(lit) { NumInt as v => v; error as e => return err_at(tokens, pos + 3, e.message) }
-    if n.neg || n.mag == (0 to u64) { return err_at(tokens, pos + 3, "`#arena_size(N)` requires a positive byte count") }
-    if !is_kind_at(tokens, pos + 4, lexer::TokenKind::RParen) { return err_at(tokens, pos + 4, "expected ')' to close `#arena_size(…)`") }
-    ParsedU64 { value = n.mag; next = pos + 5 }
+fn attr_guard_and(acc: Pred, add: Pred): Pred {
+    match acc.kind {
+        PTrue => add
+        _ => pred_and(acc, add)
+    }
 }
 
-/** Map a lifetime attribute name to its `DiKind` (the caller has verified it is one of the three). */
-fn lifetime_kind_of(attr: str) -> DiKind {
-    if attr == "singleton" { return DiKind::Singleton }
-    if attr == "scoped" { return DiKind::Scoped }
-    DiKind::Transient
-}
-
-/** Parse the `#inject( name: Type, … )` overlay into its bindings. `pos` is at the `#`. The list
- *  is comma-separated, may be empty, and each binding is `name: Type` (keys `@Key` are #173 — the
- *  bare `@` is not a lexable token in core, so a keyed binding never reaches here). */
-fn parse_inject_overlay(tokens: []lexer::Token, pos: u64) -> ParsedList<InjectBinding> | error {
-    if !is_kind_at(tokens, pos + 2, lexer::TokenKind::LParen) {
-        return err_at(tokens, pos + 2, "expected '(' after `#inject`")
-    }
-    mut p = pos + 3
-    mut bindings: []InjectBinding = teko::list::empty()
-    if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
-        return ParsedList<InjectBinding> { items = bindings; next = p + 1 }
-    }
-    loop {
-        let b = match parse_inject_binding(tokens, p) { Parsed<InjectBinding> as x => x; error as e => return e }
-        bindings = teko::list::push(bindings, b.node)
-        p = b.next
-        if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
-        p = p + 1
-    }
-    if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
-        return err_at(tokens, p, "expected ',' or ')' in an `#inject(…)` overlay")
-    }
-    ParsedList<InjectBinding> { items = bindings; next = p + 1 }
-}
-
-/** Parse one `name: Type` binding inside an `#inject(…)` overlay. `pos` is at the binding name. */
-fn parse_inject_binding(tokens: []lexer::Token, pos: u64) -> Parsed<InjectBinding> | error {
-    if !is_name_at(tokens, pos) {
-        return err_at(tokens, pos, "expected an injected dependency name")
-    }
-    let name = tokens[pos].text
-    let bline: u32 = tokens[pos].line
-    let bcol: u32 = tokens[pos].col
-    if !is_kind_at(tokens, pos + 1, lexer::TokenKind::Colon) {
-        return err_at(tokens, pos + 1, "expected ':' after an injected dependency name")
-    }
-    let ty = match parse_type(tokens, pos + 2) { ParsedType as x => x; error as e => return e }
-    Parsed<InjectBinding> { node = InjectBinding { name = name; type_ann = ty.node; has_key = false; key = ""; line = bline; col = bcol }; next = ty.next }
-}
-
-/**
- * Peel an OPTIONAL leading doc-comment off `pos`, before any `#…` attribute is parsed
- * (issue #285 — the standard Javadoc placement precedes `#test`/`#os`/`#inject`/the DI
- * lifetimes, not just the `pub`/`exp`/keyword `parse_function`/`parse_type_decl` already handle).
- *
- * @param tokens  the full token stream
- * @param pos     the position to peek at (a Doc token, or the first attribute/keyword)
- * @return        the peeled doc (absent when `pos` is not a Doc token) + the resume position
- */
-fn peel_leading_doc(tokens: []lexer::Token, pos: u64) -> ParsedLeadingDoc {
+fn peel_leading_doc(tokens: []lexer::Token, pos: u64): ParsedLeadingDoc {
     if !is_kind_at(tokens, pos, lexer::TokenKind::Doc) {
-        return ParsedLeadingDoc { has_doc = false; doc = ""; next = pos }
+        return ParsedLeadingDoc { has_doc = false; doc = docspan_none(); next = pos }
     }
-    ParsedLeadingDoc { has_doc = true; doc = tokens[pos].text; next = skip_seps(tokens, pos + 1) }
+    ParsedLeadingDoc { has_doc = true; doc = docspan_of(tokens[pos].file, tokens[pos].byte_off, tokens[pos].text.len); next = skip_seps(tokens, pos + 1) }
 }
 
-/**
- * Rebuild a parsed Decl with an OUTER doc-comment attached (issue #285) — used only when
- * `parse_decl` itself peeled a doc that preceded the `#…` attributes, so the inner
- * `parse_function`/`parse_type_decl`/`parse_flags_decl` never saw it and left `has_doc=false`.
- * A no-op (the node is returned unchanged) when `has_doc` is false or the node is neither.
- *
- * @param node     the freshly parsed declaration
- * @param has_doc  true iff an outer doc-comment was peeled by `parse_decl`
- * @param doc      the outer doc-comment's text (valid iff has_doc)
- * @return         `node`, with `has_doc`/`doc` overridden to the outer doc when present
- */
-fn with_outer_doc(node: Decl, has_doc: bool, doc: str) -> Decl {
+fn with_outer_doc(node: @Decl(), has_doc: bool, doc: DocSpan): @Decl() {
     if !has_doc { return node }
     match node {
-        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = true; doc = doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = f.has_inject; injects = f.injects; is_unsafe = f.is_unsafe; has_arena_size = f.has_arena_size; arena_size = f.arena_size }
-        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; di_kind = td.di_kind; has_di_key = td.has_di_key; di_key = td.di_key; is_unsafe = td.is_unsafe; must_free = td.must_free }
-        ConstDecl as cd => ConstDecl { name = cd.name; ty = cd.ty; init = cd.init; vis = cd.vis; has_doc = true; doc = doc; line = cd.line; col = cd.col }
+        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = true; doc = doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; is_static = f.is_static; is_getter = f.is_getter; is_setter = f.is_setter; accessor_prop = f.accessor_prop; ret_types = f.ret_types; is_operator = f.is_operator; is_global = f.is_global }
+        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = true; doc = doc; line = td.line; col = td.col; is_global = td.is_global }
+        ConstDecl as cd => ConstDecl { name = cd.name; ty = cd.ty; init = cd.init; vis = cd.vis; has_doc = true; doc = doc; line = cd.line; col = cd.col; is_global = cd.is_global }
         _ => node
     }
 }
 
-/**
- * parse_const_decl — parse a module-level `const NAME: Type = <const-expr>` (#594),
- * reached from `parse_decl` after the optional doc/`pub`/`exp` peel. The type
- * annotation is MANDATORY at module scope (unlike a local `const`, whose type may
- * infer): a public constant's type is part of its contract. The initializer is
- * parsed as a full expression here and validated as a const-expr later, in the
- * checker (`is_const_expr`), so parse errors stay syntactic.
- *
- * @param tokens  the full token stream
- * @param start   the index of the `const` keyword
- * @param vis     the visibility peeled by `parse_decl`
- * @return        the parsed ConstDecl and the index just past its initializer
- * @throws        a located error on a missing name, a missing `: Type`, a missing
- *                `=`, or an ill-formed initializer expression
- * @since #594
- */
-fn parse_const_decl(tokens: []lexer::Token, start: u64, vis: Visibility) -> Parsed<Decl> | error {
-    let kw_line: u32 = tokens[start].line
-    let kw_col: u32 = tokens[start].col
-    mut p = start + 1
+fn parse_macro_params(tokens: []lexer::Token, pos: u64): ParsedList<Param> | error {
+    var p = pos + 1
+    var params: []Param = []
+    if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
+        return ParsedList<Param> { items = params; next = p + 1 }
+    }
+    loop {
+        var is_pack = is_kind_at(tokens, p, lexer::TokenKind::Ident) && tokens[p].text == "params" && is_name_at(tokens, p + 1)
+        if is_pack { p = p + 1 }
+        if !is_name_at(tokens, p) {
+            return err_at(tokens, p, "expected a macro parameter name")
+        }
+        var name = tokens[p].text
+        p = p + 1
+        var has_type = false
+        var type_ann = no_type()
+        if is_kind_at(tokens, p, lexer::TokenKind::Colon) {
+            var pt = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
+            has_type = true
+            type_ann = pt.node
+            p = pt.next
+        }
+        var has_default = false
+        var default_expr = no_expr()
+        if is_kind_at(tokens, p, lexer::TokenKind::Assign) {
+            var de = match parse_expr(tokens, p + 1) { Parsed<Expr> as x => x; error as e => return e }
+            has_default = true
+            default_expr = de.node
+            p = de.next
+        }
+        params = [..params, Param { name = name; has_type = has_type; type_ann = type_ann; is_params = is_pack; has_default = has_default; default_expr = default_expr }]
+        if is_pack && is_kind_at(tokens, p, lexer::TokenKind::Comma) {
+            return err_at(tokens, p, "a `params` pack must be the last macro parameter")
+        }
+        if !is_kind_at(tokens, p, lexer::TokenKind::Comma) { break }
+        p = p + 1
+    }
+    if !is_kind_at(tokens, p, lexer::TokenKind::RParen) {
+        return err_at(tokens, p, "expected ')' to close the macro parameter list")
+    }
+    ParsedList<Param> { items = params; next = p + 1 }
+}
+
+fn parse_macro_decl(tokens: []lexer::Token, pos: u64, vis: Visibility): Parsed<@Decl()> | error {
+    var p = pos + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
+        return err_at(tokens, p, "expected a macro name after `macro`")
+    }
+    var name = tokens[p].text
+    p = p + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
+        return err_at(tokens, p, "expected '(' for the macro's parameter list")
+    }
+    var params = match parse_macro_params(tokens, p) { ParsedList<Param> as x => x; error as e => return e }
+    p = params.next
+    if is_return_type_intro_at(tokens, p) {
+        return err_at(tokens, p, "a `macro` has no return type — use `comptime` for a value")
+    }
+    if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+        return err_at(tokens, p, "expected '{' for the macro body")
+    }
+    var blk = match parse_block(tokens, p) { ParsedList<@Statement()> as x => x; error as e => return e }
+    Parsed<@Decl()> { node = MacroDecl { name = name; params = params.items; body = blk.items; vis = vis }; next = blk.next }
+}
+
+fn parse_comptime_decl(tokens: []lexer::Token, pos: u64, vis: Visibility, is_global: bool): Parsed<@Decl()> | error {
+    var p = pos + 1
+    if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
+        return err_at(tokens, p, "expected a comptime name after `comptime`")
+    }
+    var name = tokens[p].text
+    p = p + 1
+    var tps = match parse_type_params(tokens, p) { ParsedTypeParams as x => x; error as e => return e }
+    p = tps.next
+    if !is_kind_at(tokens, p, lexer::TokenKind::LParen) {
+        return err_at(tokens, p, "expected '(' for the comptime's parameter list")
+    }
+    var params = match parse_params(tokens, p) { ParsedList<Param> as x => x; error as e => return e }
+    p = params.next
+    if !is_return_type_intro_at(tokens, p) {
+        return err_at(tokens, p, "a `comptime` must declare a return type")
+    }
+    var ret = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
+    p = ret.next
+    if !is_kind_at(tokens, p, lexer::TokenKind::LBrace) {
+        return err_at(tokens, p, "expected '{' for the comptime body")
+    }
+    var blk = match parse_block(tokens, p) { ParsedList<@Statement()> as x => x; error as e => return e }
+    Parsed<@Decl()> { node = ComptimeDecl { name = name; type_params = tps.names; params = params.items; ret = ret.node; body = blk.items; vis = vis; is_global = is_global }; next = blk.next }
+}
+
+fn parse_const_decl(tokens: []lexer::Token, start: u64, vis: Visibility, is_global: bool): Parsed<@Decl()> | error {
+    var kw_line: u32 = tokens[start].line
+    var kw_col: u32 = tokens[start].col
+    var p = start + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::Ident) {
         return err_at(tokens, p, "expected a constant name after `const`")
     }
-    let name = tokens[p].text
+    var name = tokens[p].text
     p = p + 1
     if !is_kind_at(tokens, p, lexer::TokenKind::Colon) {
         return err_at(tokens, p, "expected ':' and a type — a module-level `const` must declare its type")
     }
-    let ty = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
+    var ty = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
     p = ty.next
     if !is_kind_at(tokens, p, lexer::TokenKind::Assign) {
         return err_at(tokens, p, "expected `=` and an initializer for a `const`")
     }
-    let init = match parse_expr(tokens, p + 1) { Parsed<Expr> as x => x; error as e => return e }
-    let cd = ConstDecl { name = name; ty = ty.node; init = init.node; vis = vis; has_doc = false; doc = ""; line = kw_line; col = kw_col }
-    Parsed<Decl> { node = cd; next = init.next }
+    var init = match parse_expr(tokens, p + 1) { Parsed<Expr> as x => x; error as e => return e }
+    var cd = ConstDecl { name = name; ty = ty.node; init = init.node; vis = vis; has_doc = false; doc = docspan_none(); line = kw_line; col = kw_col; is_global = is_global }
+    Parsed<@Decl()> { node = cd; next = init.next }
 }
 
-/**
- * MemberConstPeek — the non-destructive lookahead a type-body member loop runs to decide whether the
- * next member (after its leading doc was peeled) is a static `const` member (#594 crumb 7). It peels
- * an OPTIONAL `pub`/`exp` visibility and reports the `const` keyword's position, so the caller can
- * either delegate to `parse_type_member_const` or fall back to field/method parsing UNCHANGED (the
- * peek never advances the caller's cursor). `bad_override` flags a `[pub|exp] override const …`, a
- * parse error the caller surfaces (`override` is method-only).
- *
- * @param is_const     the next member is a `const` (delegate to `parse_type_member_const`)
- * @param vis          the visibility peeled ahead of the `const` (Private when none)
- * @param kw_pos       the index of the `const` keyword (or the `override` keyword when bad_override)
- * @param bad_override an `override` illegally precedes the `const`
- */
 type MemberConstPeek = struct { is_const: bool; vis: Visibility; kw_pos: u64; bad_override: bool }
 
-/**
- * peek_member_const — decide, without moving the caller's cursor, whether the member at `pos` (past
- * its already-peeled leading doc) is a static `const` member (#594 crumb 7). Peels an optional
- * `pub`/`exp`, then classifies the following token: an `override const` is `bad_override`, a plain
- * `const` is a member const, anything else is a field/method the caller parses as before.
- *
- * @param tokens  the token stream
- * @param pos     the member's first token (after the leading doc was peeled)
- * @return        the classification (is_const / bad_override / the peeled visibility + keyword index)
- * @since #594
- */
-fn peek_member_const(tokens: []lexer::Token, pos: u64) -> MemberConstPeek {
-    mut k = pos
-    mut vis = Visibility::Private
+fn peek_member_const(tokens: []lexer::Token, pos: u64): MemberConstPeek {
+    var k = pos
+    var vis = Visibility::Private
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) { vis = Visibility::Pub; k = k + 1 }
     else if is_kind_at(tokens, k, lexer::TokenKind::Exp) { vis = Visibility::Exp; k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::Override) && is_kind_at(tokens, k + 1, lexer::TokenKind::Const) {
@@ -1101,121 +1318,93 @@ fn peek_member_const(tokens: []lexer::Token, pos: u64) -> MemberConstPeek {
     MemberConstPeek { is_const = false; vis = vis; kw_pos = k; bad_override = false }
 }
 
-/**
- * MemberConstStep — the outcome of one `try_parse_member_const` attempt inside a struct/class/trait
- * member loop (#594 crumb 7). When `handled`, the member was a `const`: `consts` is the caller's
- * list with the parsed ConstDecl pushed and `next` is the index past its initializer. When not
- * handled, `consts` is returned UNCHANGED and `next` echoes the position the caller passed in, so
- * the field/method fallback resumes exactly where the peek looked.
- *
- * @param handled the member was a `const` and was consumed
- * @param consts  the caller's consts list (with the new ConstDecl pushed iff handled)
- * @param next    the index past the const's initializer (or the caller's position iff not handled)
- */
 type MemberConstStep = struct { handled: bool; consts: []ConstDecl; next: u64 }
 
-/**
- * try_parse_member_const — the shared member-const step every struct/class/trait member loop runs
- * (#594 crumb 7): peek via `peek_member_const`, surface the method-only-`override` error, and, when
- * the member IS a `const`, delegate to `parse_type_member_const` and push the result onto the
- * caller's consts list. A non-const member leaves the cursor and the list untouched, so the caller
- * falls back to its own field parsing unchanged.
- *
- * @param tokens   the token stream
- * @param pos      the member's first token (after the leading doc was peeled)
- * @param has_doc  whether a leading doc-comment preceded the member
- * @param doc      the leading doc-comment's text (valid iff has_doc)
- * @param consts   the member loop's consts list so far
- * @return         the step outcome (handled flag, updated consts, cursor to resume at)
- * @throws         a located error on `override const` or a malformed member const
- * @since #594
- */
-fn try_parse_member_const(tokens: []lexer::Token, pos: u64, has_doc: bool, doc: str, consts: []ConstDecl) -> MemberConstStep | error {
-    let mc = peek_member_const(tokens, pos)
+fn try_parse_member_const(tokens: []lexer::Token, pos: u64, has_doc: bool, doc: DocSpan, consts: []ConstDecl): MemberConstStep | error {
+    var mc = peek_member_const(tokens, pos)
     if mc.bad_override { return err_at(tokens, mc.kw_pos, "a `const` member may not carry `override` — `override` is method-only") }
     if mc.is_const {
-        let cd = match parse_type_member_const(tokens, mc.kw_pos, mc.vis, has_doc, doc) { Parsed<ConstDecl> as x => x; error as e => return e }
-        return MemberConstStep { handled = true; consts = teko::list::push(consts, cd.node); next = cd.next }
+        var cd = match parse_type_member_const(tokens, mc.kw_pos, mc.vis, has_doc, doc) { Parsed<ConstDecl> as x => x; error as e => return e }
+        return MemberConstStep { handled = true; consts = [..consts, cd.node]; next = cd.next }
     }
     MemberConstStep { handled = false; consts = consts; next = pos }
 }
 
-/**
- * reject_const_member — the located error a body that carries no `consts` list (interface / enum /
- * flags) raises when a `const` member appears in it (#594 crumb 7). A member const is static
- * type-level state, which only a struct, class, or trait body owns.
- *
- * @param tokens  the token stream
- * @param pos     the offending `const` keyword's index
- * @return        the located parse error
- * @since #594
- */
-fn reject_const_member(tokens: []lexer::Token, pos: u64) -> error {
+fn reject_const_member(tokens: []lexer::Token, pos: u64): error {
     err_at(tokens, pos, "a `const` member is only allowed in a struct, class, or trait body")
 }
 
-/**
- * reject_const_body_member — guard the name-only `enum`/`flags` member list (`parse_field_names`)
- * against a `const` member (#594 crumb 7): those bodies carry no `consts` list, so a `const` at the
- * first member position is the same located error the interface path raises. `brace_pos` is at the
- * body's opening `{`.
- *
- * @param tokens     the token stream
- * @param brace_pos  the index of the body's opening `{`
- * @return           the located error when a `const` opens the member list, else null
- * @since #594
- */
-fn reject_const_body_member(tokens: []lexer::Token, brace_pos: u64) -> error | null {
-    let fp = skip_seps(tokens, brace_pos + 1)
+fn reject_const_body_member(tokens: []lexer::Token, brace_pos: u64): error | null {
+    var fp = skip_seps(tokens, brace_pos + 1)
     if is_kind_at(tokens, fp, lexer::TokenKind::Const) { return reject_const_member(tokens, fp) }
     null
 }
 
-/**
- * parse_type_member_const — parse a `[pub|exp] const NAME: Type = <const-expr>` member inside a
- * struct/class/trait body (#594 crumb 7), DELEGATING the `const …` grammar to `parse_const_decl` so
- * the type-member and module placements never diverge. The leading doc (peeled by the member loop) is
- * threaded onto the returned ConstDecl; the visibility was peeled by `peek_member_const`. A member
- * const is static/type-level — it takes no layout slot and is resolved by `TypeName::NAME`.
- *
- * @param tokens   the token stream
- * @param pos      the index of the `const` keyword (after the peeled doc/visibility)
- * @param vis      the visibility peeled by the member loop
- * @param has_doc  whether a leading doc-comment preceded the member
- * @param doc      the leading doc-comment's text (valid iff has_doc)
- * @return         the parsed member ConstDecl and the index past its initializer
- * @throws         a located error on a missing name / `: Type` / `=` / bad initializer
- * @since #594
- */
-fn parse_type_member_const(tokens: []lexer::Token, pos: u64, vis: Visibility, has_doc: bool, doc: str) -> Parsed<ConstDecl> | error {
-    let d = match parse_const_decl(tokens, pos, vis) { Parsed<Decl> as x => x; error as e => return e }
-    let base = match d.node { ConstDecl as c => c; _ => return err_at(tokens, pos, "internal: a member const must parse to a ConstDecl") }
-    let cd = ConstDecl { name = base.name; ty = base.ty; init = base.init; vis = base.vis; has_doc = has_doc; doc = doc; line = base.line; col = base.col }
+fn parse_type_member_const(tokens: []lexer::Token, pos: u64, vis: Visibility, has_doc: bool, doc: DocSpan): Parsed<ConstDecl> | error {
+    var d = match parse_const_decl(tokens, pos, vis, false) { Parsed<@Decl()> as x => x; error as e => return e }
+    var parsed_const = match d.node { ConstDecl as c => c; _ => return err_at(tokens, pos, "internal: a member const must parse to a ConstDecl") }
+    var cd = ConstDecl { name = parsed_const.name; ty = parsed_const.ty; init = parsed_const.init; vis = parsed_const.vis; has_doc = has_doc; doc = doc; line = parsed_const.line; col = parsed_const.col; is_global = parsed_const.is_global }
     Parsed<ConstDecl> { node = cd; next = d.next }
 }
 
+fn embed_compression_atom(name: str): teko::embed::EmbedCompress | error {
+    if name == "None" { return teko::embed::EmbedCompress::None }
+    if name == "Deflate" { return teko::embed::EmbedCompress::Deflate }
+    if name == "Gzip" { return teko::embed::EmbedCompress::Gzip }
+    error { message = "#embed compression type must be one of None, Deflate, Gzip" }
+}
+
 /**
- * Parse one top-level declaration at `pos` — `[doc] [#attrs] [doc] [pub|exp] fn|type|flags …`.
+ * parse_embed — parse a top-level `#embed(...)` at `pos` (the `#`), mirroring the `#os("…")` payload
+ * shape. Accepts form A `("pattern")` and form B `("pattern", TYPE, LEVEL)` (TYPE a bare None/Deflate/
+ * Gzip atom, LEVEL an Int). Purely syntactic — path/range validity are resolve-time concerns. Stamps the
+ * containing source-file path for later file-relative anchoring.
  *
- * The Javadoc MAY precede the `#…` attributes (issue #285, the standard placement — a doc
- * describes the whole declaration, above every modifier) OR follow them (the pre-existing
- * placement `parse_function`/`parse_type_decl`/`parse_flags_decl` already parse themselves);
- * both are accepted, but only one may be present (a doc in both slots is not a Teko idiom and
- * the second is treated as part of the keyword search, erroring normally if it doesn't fit).
- *
- * @param tokens  the full token stream
- * @param pos     the position of the first token of the declaration (a Doc, `#`, `pub`/`exp`,
- *                `extern`, or `fn`/`type`/`flags`)
- * @return        the parsed declaration and the position just past it
- * @throws        a plain `error` when `pos` is not the start of a valid declaration
+ * @param tokens  the token stream
+ * @param pos     the index of the `#` beginning the directive
+ * @return        the parsed EmbedDecl and the index past the closing `)`
+ * @throws        a located error on a missing `(`, a non-string pattern, a malformed `, TYPE, LEVEL`
+ *                tail, or an unknown compression type
+ * @since 0.3.1
  */
-fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
-    let outer_doc = peel_leading_doc(tokens, pos)
-    let attrs = match parse_decl_attributes(tokens, outer_doc.next) { ParsedAttributes as x => x; error as e => return e }
-    let start = attrs.next
-    mut k = start
+fn parse_embed(tokens: []lexer::Token, pos: u64): Parsed<@Decl()> | error {
+    var line = tokens[pos].line
+    var col = tokens[pos].col
+    var src_path = tokens[pos].file
+    if !is_kind_at(tokens, pos + 2, lexer::TokenKind::LParen) { return err_at(tokens, pos + 2, "expected '(' after `#embed`") }
+    if !is_kind_at(tokens, pos + 3, lexer::TokenKind::Str) { return err_at(tokens, pos + 3, "expected a quoted pattern in `#embed(\"…\")`") }
+    var pattern = tokens[pos + 3].text
+    if is_kind_at(tokens, pos + 4, lexer::TokenKind::RParen) {
+        var node = EmbedDecl { pattern = pattern; has_compression = false; comp = teko::embed::EmbedCompress::None; level = 0; src_path = src_path; line = line; col = col }
+        return Parsed<@Decl()> { node = node; next = pos + 5 }
+    }
+    if !is_kind_at(tokens, pos + 4, lexer::TokenKind::Comma) { return err_at(tokens, pos + 4, "expected ',' or ')' after the `#embed` pattern") }
+    if !is_name_at(tokens, pos + 5) { return err_at(tokens, pos + 5, "expected a compression type (None, Deflate, Gzip) after the `#embed` pattern") }
+    var comp = match embed_compression_atom(tokens[pos + 5].text) { teko::embed::EmbedCompress as c => c; error as e => return err_at(tokens, pos + 5, e.message) }
+    if !is_kind_at(tokens, pos + 6, lexer::TokenKind::Comma) { return err_at(tokens, pos + 6, "expected ',' then a compression level in `#embed(\"…\", TYPE, LEVEL)`") }
+    if !is_kind_at(tokens, pos + 7, lexer::TokenKind::Number) { return err_at(tokens, pos + 7, "expected an integer compression level in `#embed(\"…\", TYPE, LEVEL)`") }
+    var lv = match lit_int(tokens[pos + 7].text) { NumInt as v => v; error as e => return err_at(tokens, pos + 7, e.message) }
+    if lv.neg { return err_at(tokens, pos + 7, "the `#embed` compression level must not be negative") }
+    if !is_kind_at(tokens, pos + 8, lexer::TokenKind::RParen) { return err_at(tokens, pos + 8, "expected ')' to close `#embed(…)`") }
+    var noded = EmbedDecl { pattern = pattern; has_compression = true; comp = comp; level = numint_to_i64(lv); src_path = src_path; line = line; col = col }
+    Parsed<@Decl()> { node = noded; next = pos + 9 }
+}
+
+fn is_embed_directive_at(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Hash) && is_kind_at(tokens, pos + 1, lexer::TokenKind::Ident) && tokens[pos + 1].text == "embed"
+}
+
+fn parse_decl(tokens: []lexer::Token, pos: u64): ParsedDecl | error {
+    if is_embed_directive_at(tokens, pos) {
+        var ed = match parse_embed(tokens, pos) { Parsed<@Decl()> as x => x; error as e => return e }
+        return ParsedDecl { node = ed.node; guard = pred_true(); next = ed.next }
+    }
+    var outer_doc = peel_leading_doc(tokens, pos)
+    var attrs = match parse_decl_attributes(tokens, outer_doc.next) { ParsedAttributes as x => x; error as e => return e }
+    var start = attrs.next
+    var k = start
     if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = skip_seps(tokens, k + 1) }
-    mut vis = Visibility::Private
+    var vis = Visibility::Private
     if is_kind_at(tokens, k, lexer::TokenKind::Pub) {
         vis = Visibility::Pub
         k = k + 1
@@ -1223,31 +1412,45 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
         vis = Visibility::Exp
         k = skip_export_override_peek(tokens, k + 1)
     }
-    mut saw_extern = false
+    var global_peek = consume_global_modifier(tokens, k)
+    var is_global = global_peek.node
+    k = global_peek.next
+    if is_global && is_variable_binding_head(tokens, k) {
+        return err_at(tokens, k, "`global` is not allowed on a variable — only on a namespace-level fn, type, or const")
+    }
+    var saw_extern = false
     if is_kind_at(tokens, k, lexer::TokenKind::Extern) {
         saw_extern = true
         k = k + 1
     }
-    if is_unsafe_modifier_at(tokens, k) { k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::Fn) {
-        let d = match parse_fn_decl_with_attrs(tokens, start, attrs) { Parsed<Decl> as x => x; error as e => return e }
-        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
+        var d = match parse_fn_decl_with_attrs(tokens, start, attrs) { Parsed<@Decl()> as x => x; error as e => return e }
+        return ParsedDecl { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); guard = attrs.guard; next = d.next }
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Type) {
-        let d = match parse_type_decl_with_attrs(tokens, start, k, attrs) { Parsed<Decl> as x => x; error as e => return e }
-        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
+        var d = match parse_type_decl_with_attrs(tokens, start, k, attrs) { Parsed<@Decl()> as x => x; error as e => return e }
+        return ParsedDecl { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); guard = attrs.guard; next = d.next }
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Flags) {
-        let d = match parse_flags_decl_with_attrs(tokens, start, k, attrs) { Parsed<Decl> as x => x; error as e => return e }
-        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
+        var d = match parse_flags_decl_with_attrs(tokens, start, k, attrs) { Parsed<@Decl()> as x => x; error as e => return e }
+        return ParsedDecl { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); guard = attrs.guard; next = d.next }
     }
     if is_kind_at(tokens, k, lexer::TokenKind::Const) {
         if saw_extern { return err_at(tokens, k, "expected `fn` or `type` after `extern`") }
         match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => { } }
-        if attrs.di_kind != DiKind::None { return err_at(tokens, k, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may not precede a `const`") }
-        if attrs.must_free { return err_at(tokens, k, "`#must_free` may not precede a `const`") }
-        let d = match parse_const_decl(tokens, k, vis) { Parsed<Decl> as x => x; error as e => return e }
-        return Parsed<Decl> { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); next = d.next }
+        var d = match parse_const_decl(tokens, k, vis, is_global) { Parsed<@Decl()> as x => x; error as e => return e }
+        return ParsedDecl { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); guard = attrs.guard; next = d.next }
+    }
+    if is_kind_at(tokens, k, lexer::TokenKind::Macro) {
+        if saw_extern { return err_at(tokens, k, "there is no `extern macro` — a macro is native-only") }
+        if is_global { return err_at(tokens, k, "`global` is not allowed on a macro — only on a fn, type, const, or comptime") }
+        var d = match parse_macro_decl(tokens, k, vis) { Parsed<@Decl()> as x => x; error as e => return e }
+        return ParsedDecl { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); guard = attrs.guard; next = d.next }
+    }
+    if is_kind_at(tokens, k, lexer::TokenKind::Comptime) {
+        if saw_extern { return err_at(tokens, k, "there is no `extern comptime` — a comptime is native-only") }
+        var d = match parse_comptime_decl(tokens, k, vis, is_global) { Parsed<@Decl()> as x => x; error as e => return e }
+        return ParsedDecl { node = with_outer_doc(d.node, outer_doc.has_doc, outer_doc.doc); guard = attrs.guard; next = d.next }
     }
     if saw_extern {
         return err_at(tokens, k, "expected `fn` or `type` after `extern`")
@@ -1255,79 +1458,165 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> Parsed<Decl> | error {
     err_at(tokens, k, "expected a declaration (`fn`/`type`/`flags`, optionally `pub`/`exp`/doc); loose statements belong in main.tks")
 }
 
-/** Parse a `fn` declaration reached through `parse_decl`, applying the collected attributes:
- *  a `#singleton`/`#scoped`/`#transient` lifetime may not precede a function, `#must_free` may
- *  only precede a `type` (S2 #336), and the `#inject` overlay and `#arena_size(N)` (#453) are
- *  threaded into the parsed Function (has_inject/injects, has_arena_size/arena_size). */
-fn parse_fn_decl_with_attrs(tokens: []lexer::Token, start: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
-    if attrs.di_kind != DiKind::None { return err_at(tokens, start, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may only precede a `type`, not a function") }
-    if attrs.must_free { return err_at(tokens, start, "`#must_free` may only precede a `type`") }
-    let d = match parse_function(tokens, start, attrs.is_test, attrs.os_guard, false, false, attrs.has_arena_size, attrs.arena_size) { Parsed<Decl> as x => x; error as e => return e }
-    Parsed<Decl> { node = with_fn_inject(d.node, attrs.has_inject, attrs.injects); next = d.next }
+fn parse_fn_decl_with_attrs(tokens: []lexer::Token, start: u64, attrs: ParsedAttributes): Parsed<@Decl()> | error {
+    parse_function(tokens, start, attrs.is_test, attrs.os_guard, false, false)
 }
 
-/** Parse a `type` declaration reached through `parse_decl`, applying the collected attributes:
- *  `#test`/`#os`/`#inject` may not precede a type, and a lifetime annotation + `#must_free` (S2
- *  #336) are threaded into the parsed TypeDecl (di_kind/has_di_key/di_key/must_free). */
-fn parse_type_decl_with_attrs(tokens: []lexer::Token, start: u64, k: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
+fn parse_type_decl_with_attrs(tokens: []lexer::Token, start: u64, k: u64, attrs: ParsedAttributes): Parsed<@Decl()> | error {
     match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => { } }
-    let d = match parse_type_decl(tokens, start) { Parsed<Decl> as x => x; error as e => return e }
-    Parsed<Decl> { node = with_type_di(d.node, attrs.di_kind, attrs.has_key, attrs.key, attrs.must_free); next = d.next }
+    parse_type_decl(tokens, start)
 }
 
-/** Parse a `flags` declaration reached through `parse_decl`. Flags carry no DI (they are values,
- *  not injectable objects); a lifetime annotation or `#must_free` on one is a plain type-vs-fn
- *  placement error (flags are values, not a freeable heap handle). */
-fn parse_flags_decl_with_attrs(tokens: []lexer::Token, start: u64, k: u64, attrs: ParsedAttributes) -> Parsed<Decl> | error {
+fn parse_flags_decl_with_attrs(tokens: []lexer::Token, start: u64, k: u64, attrs: ParsedAttributes): Parsed<@Decl()> | error {
     match reject_fn_only_attrs_on_type(tokens, k, attrs) { error as e => return e; null => { } }
-    if attrs.di_kind != DiKind::None { return err_at(tokens, k, "a lifetime annotation (`#singleton`/`#scoped`/`#transient`) may not precede a `flags` type") }
-    if attrs.must_free { return err_at(tokens, k, "`#must_free` may not precede a `flags` type") }
     parse_flags_decl(tokens, start)
 }
 
-/** The function-only attributes (`#test`, `#os`, `#inject`, `#arena_size`) are all rejected
- *  before a `type`. */
-fn reject_fn_only_attrs_on_type(tokens: []lexer::Token, k: u64, attrs: ParsedAttributes) -> error | null {
+fn reject_fn_only_attrs_on_type(tokens: []lexer::Token, k: u64, attrs: ParsedAttributes): error | null {
     if attrs.is_test { return err_at(tokens, k, "`#test` may only precede a function") }
-    if attrs.os_guard != "" { return err_at(tokens, k, "`#os(\"…\")` may only precede a function") }
-    if attrs.has_inject { return err_at(tokens, k, "an `#inject(…)` overlay may only precede a function, not a `type`") }
-    if attrs.has_arena_size { return err_at(tokens, k, "`#arena_size(…)` may only precede a function, not a `type`") }
     null
 }
 
-/** Rebuild a parsed Function with its `#inject` overlay attached (all other fields preserved). */
-fn with_fn_inject(node: Decl, has_inject: bool, injects: []InjectBinding) -> Decl {
-    match node {
-        Function as f => Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; has_inject = has_inject; injects = injects; is_unsafe = f.is_unsafe; has_arena_size = f.has_arena_size; arena_size = f.arena_size }
-        _ => node
-    }
+
+fn is_decl_head_token(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Hash) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Pub) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Exp) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Global) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Extern) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Fn) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Type) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Flags) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Const) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Macro) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Comptime)
 }
 
-/** Rebuild a parsed TypeDecl with its DI lifetime annotation and `#must_free` marker (S2 #336)
- *  attached (all other fields preserved). */
-fn with_type_di(node: Decl, di_kind: DiKind, has_key: bool, key: str, must_free: bool) -> Decl {
-    match node {
-        TypeDecl as td => TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = td.body; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; di_kind = di_kind; has_di_key = has_key; di_key = key; is_unsafe = td.is_unsafe; must_free = must_free }
-        _ => node
+fn doc_classifies(tokens: []lexer::Token, docpos: u64): bool {
+    if !is_kind_at(tokens, docpos, lexer::TokenKind::Doc) { return false }
+    var p = docpos + 1
+    if is_kind_at(tokens, p, lexer::TokenKind::Semicolon) { return false }
+    if is_kind_at(tokens, p, lexer::TokenKind::Newline) {
+        p = p + 1
+        if is_sep(tokens, p) { return false }
     }
+    is_decl_head_token(tokens, p)
 }
 
-// a module file: the `use` header, then a loop of declarations. Rejects loose statements.
-// `pos` is 0 (file start).
-pub fn parse_module(tokens: []lexer::Token, pos: u64) -> Parsed<Module> | error {
-    let hdr = match parse_use_header(tokens, pos) { ParsedList<UseDecl> as x => x; error as e => return e }
-    mut p = skip_seps(tokens, hdr.next)
-    mut decls: []Decl = teko::list::empty()
+fn skip_trivia(tokens: []lexer::Token, pos: u64): u64 {
+    var p = pos
+    loop {
+        if is_sep(tokens, p) { p = p + 1; continue }
+        if is_kind_at(tokens, p, lexer::TokenKind::Doc) && !doc_classifies(tokens, p) { p = p + 1; continue }
+        break
+    }
+    p
+}
+
+fn is_cc_region_marker_at(tokens: []lexer::Token, pos: u64): bool {
+    is_cc_if_start(tokens, pos) ||
+    is_cc_marker(tokens, pos, "elseif") ||
+    is_cc_marker(tokens, pos, "endif") ||
+    is_cc_else(tokens, pos)
+}
+
+fn is_core_decl_keyword_at(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Fn) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Type) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Flags) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Const) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Macro) ||
+    is_kind_at(tokens, pos, lexer::TokenKind::Comptime) ||
+    is_embed_directive_at(tokens, pos)
+}
+
+fn count_module_decls(tokens: []lexer::Token, start: u64): u64 {
+    var p = start
+    var depth: u64 = 0
+    var pending = true
+    var count: u64 = 0
     loop {
         if !has_token(tokens, p) { break }
-        let d = match parse_decl(tokens, p) { Parsed<Decl> as x => x; error as e => return e }
-        decls = teko::list::push(decls, d.node)
+        var k = tokens[p].kind
+        if k == lexer::TokenKind::LParen || k == lexer::TokenKind::LBrace || k == lexer::TokenKind::LBracket {
+            depth = depth + 1
+            p = p + 1
+            continue
+        }
+        if k == lexer::TokenKind::RParen || k == lexer::TokenKind::RBrace || k == lexer::TokenKind::RBracket {
+            if depth > 0 { depth = depth - 1 }
+            p = p + 1
+            continue
+        }
+        if depth != 0 { p = p + 1; continue }
+        if k == lexer::TokenKind::Semicolon || k == lexer::TokenKind::Newline {
+            pending = true
+            p = p + 1
+            continue
+        }
+        if k == lexer::TokenKind::Hash && is_cc_region_marker_at(tokens, p) {
+            pending = true
+            p = p + 1
+            continue
+        }
+        if pending && is_core_decl_keyword_at(tokens, p) {
+            count = count + 1
+            pending = false
+        }
+        p = p + 1
+    }
+    count
+}
+
+pub fn parse_module(tokens: []lexer::Token, pos: u64): Parsed<Module> | error {
+    var hdr = match parse_use_header(tokens, pos) { ParsedList<UseDecl> as x => x; error as e => return e }
+    var p = skip_trivia(tokens, hdr.next)
+    var ndecls = count_module_decls(tokens, p)
+    var decls: [ndecls]@Decl() = []
+    var decl_guards: [ndecls]Pred = []
+    var count: u64 = 0
+    loop {
+        if !has_token(tokens, p) { break }
+        if is_cc_if_start(tokens, p) {
+            var region = match parse_cc_region(tokens, p, pred_true()) { ParsedRegion as x => x; error as e => return e }
+            var r: u64 = 0
+            loop {
+                if r >= region.decls.len { break }
+                decls[count] = region.decls[r]
+                decl_guards[count] = region.guards[r]
+                count++
+                r++
+            }
+            p = region.next
+            if !has_token(tokens, p) { break }
+            if !is_sep(tokens, p) {
+                return err_at(tokens, p, "expected ';' or a newline after a `#endif`")
+            }
+            p = skip_trivia(tokens, p)
+            continue
+        }
+        var d = match parse_decl(tokens, p) { ParsedDecl as x => x; error as e => return e }
+        decls[count] = d.node
+        decl_guards[count] = d.guard
+        count++
         p = d.next
         if !has_token(tokens, p) { break }
         if !is_sep(tokens, p) {
             return err_at(tokens, p, "expected ';' or a newline after a declaration")
         }
-        p = skip_seps(tokens, p)
+        p = skip_trivia(tokens, p)
     }
-    Parsed<Module> { node = Module { uses = hdr.items; decls = decls }; next = p }
+    if count == ndecls {
+        return Parsed<Module> { node = Module { uses = hdr.items; decls = decls; decl_guards = decl_guards }; next = p }
+    }
+    var out_decls: [count]@Decl() = []
+    var out_guards: [count]Pred = []
+    var t: u64 = 0
+    loop {
+        if t >= count { break }
+        out_decls[t] = decls[t]
+        out_guards[t] = decl_guards[t]
+        t++
+    }
+    Parsed<Module> { node = Module { uses = hdr.items; decls = out_decls; decl_guards = out_guards }; next = p }
 }

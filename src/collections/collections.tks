@@ -1,70 +1,163 @@
-/**
- * teko::collections — the growable, heap-of-arena collection classes (issue #163, the flagship
- * payoff of the #254 generic-class keystone). This root unit holds the pure array combinators the
- * `List<T>` and `Map<V>` classes both fold over: Teko arrays are FIXED-SIZE value snapshots
- * (`teko::list::push` copy-appends, returning a NEW array), so every "in-place" mutation a growable
- * collection performs is a self-field REASSIGNMENT to a freshly built array. These free generic
- * helpers centralise the two rebuild shapes (replace-at, drop-at) that field reassignment needs,
- * monomorphized per element type at each instantiation.
- *
- * WHY free functions and not private instance methods: on the freshly landed generic-class stack a
- * generic instance method that calls a SIBLING generic instance method on `self` type-checks and
- * runs on the VM, but the native mono/codegen pass never emits the stamped sibling (`List__…`),
- * so the C fails to link (`use of undeclared identifier`). Routing shared logic through a free
- * generic function — which the mono pass DOES stamp per instantiation — keeps both engines in lock
- * step. Reported to the integrator as a generic-stack follow-up (#163 report).
- */
+/** The fixed leaf capacity of a `Chunked<T>` chain; the tail grows by one chunk of this size (never geometric). */
+exp const CHUNK: u64 = 256
 
-/**
- * Return a copy of `xs` with the element at index `at` replaced by `v` — the value-functional
- * shape a growable collection uses to overwrite one slot (Teko has no array index-assignment). An
- * `at` outside `[0, xs.len)` yields an unchanged copy, so the caller guards the bound before the
- * write it intends to be observable.
- *
- * @param xs  the source array
- * @param at  the index to overwrite
- * @param v   the replacement element
- * @return    a fresh array equal to `xs` except at `at`, which holds `v`
- */
-pub fn arr_replace_at<T>(xs: []T, at: u64, v: T) -> []T {
-    mut out: []T = teko::list::empty()
-    mut i: u64 = 0
+/** Copy of `xs` with the element at `at` replaced by `v`; out-of-range `at` yields an unchanged copy. */
+exp fn arr_replace_at<T>(xs: []T, at: u64, v: T): []T {
+    var out: [xs.len]T = []
+    var i: u64 = 0
     loop {
         if i >= xs.len { break }
-        if i == at { out = teko::list::push(out, v) } else { out = teko::list::push(out, xs[i]) }
+        if i == at { out[i] = v } else { out[i] = xs[i] }
         i++
     }
     out
 }
 
-/**
- * Return a copy of `xs` with the element at index `at` removed (the following elements shift down
- * by one), the value-functional shape `Map::remove` and `List::remove_at` use. An `at` at or beyond
- * `xs.len` yields an unchanged copy.
- *
- * @param xs  the source array
- * @param at  the index to drop
- * @return    a fresh array equal to `xs` with the `at`-th element removed
- */
-pub fn arr_drop_at<T>(xs: []T, at: u64) -> []T {
-    mut out: []T = teko::list::empty()
-    mut i: u64 = 0
+/** Copy of a `[]u64` array with the element at `at` removed; out-of-range `at` yields an unchanged copy. */
+exp fn arr_drop_u64_at(xs: []u64, at: u64): []u64 {
+    var out: [xs.len]u64 = []
+    var count: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= xs.len { break }
-        if i != at { out = teko::list::push(out, xs[i]) }
+        if i != at {
+            out[count] = xs[i]
+            count++
+        }
         i++
     }
-    out
+    arr_slice(out, 0, count)
 }
 
-/**
- * Return a copy of `xs` with its last element removed — the backing shape of `List::pop`. An empty
- * `xs` yields an empty copy (the caller decides whether an empty pop is an error).
- *
- * @param xs  the source array
- * @return    a fresh array equal to `xs` without its final element
- */
-pub fn arr_drop_last<T>(xs: []T) -> []T {
-    if xs.len == 0 { return teko::list::empty() }
+/** Copy of `xs` with the element at `at` removed; out-of-range `at` yields an unchanged copy. */
+exp fn arr_drop_at<T>(xs: []T, at: u64): []T {
+    var out: [xs.len]T = []
+    var count: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i != at {
+            out[count] = xs[i]
+            count++
+        }
+        i++
+    }
+    arr_slice(out, 0, count)
+}
+
+/** Copy of `xs` with its last element removed; an empty `xs` yields an empty copy. */
+exp fn arr_drop_last<T>(xs: []T): []T {
+    if xs.len == 0 { return [] }
     arr_drop_at(xs, xs.len - 1)
+}
+
+/** Copy of `xs` with `v` inserted before index `at` (clamped to `xs.len` for an append). */
+exp fn arr_insert_at<T>(xs: []T, at: u64, v: T): []T {
+    var out: [xs.len + 1]T = []
+    var count: u64 = 0
+    var inserted = false
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i == at {
+            out[count] = v
+            count++
+            inserted = true
+        }
+        out[count] = xs[i]
+        count++
+        i++
+    }
+    if !inserted {
+        out[count] = v
+        count++
+    }
+    arr_slice(out, 0, count)
+}
+
+/** Copy of `xs` with the elements at `i` and `j` exchanged; out-of-range indices yield an unchanged copy. */
+exp fn arr_swap<T>(xs: []T, i: u64, j: u64): []T {
+    if i >= xs.len || j >= xs.len { return arr_slice(xs, 0, xs.len) }
+    var swapped_i = arr_replace_at(xs, i, xs[j])
+    arr_replace_at(swapped_i, j, xs[i])
+}
+
+/** Copy of `xs` in reverse order. */
+exp fn arr_reverse<T>(xs: []T): []T {
+    var out: [xs.len]T = []
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out[i] = xs[xs.len - 1 - i]
+        i++
+    }
+    out
+}
+
+/** Copy of the half-open range `[from, min(to, xs.len))` of `xs`. */
+exp fn arr_slice<T>(xs: []T, from: u64, to: u64): []T {
+    var hi = to
+    if hi > xs.len { hi = xs.len }
+    var n = if hi > from { hi - from } else { 0 }
+    var out: [n]T = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = xs[from + i]
+        i++
+    }
+    out
+}
+
+pub fn sorted_insert<T: IOrd>(ref items: []T, x: T): bool {
+    var arr = items.value
+    var lo: u64 = 0
+    var hi: u64 = arr.len
+    loop {
+        if lo >= hi { break }
+        var mid = lo + (hi - lo) / 2
+        if arr[mid] < x { lo = mid + 1 } else { hi = mid }
+    }
+    if lo < arr.len && !(x < arr[lo]) && !(arr[lo] < x) { return false }
+    items.value = arr_insert_at(arr, lo, x)
+    true
+}
+
+pub fn heap_sift_up<T: IOrd>(heap: []T): []T {
+    var h = heap
+    if h.len == 0 { return h }
+    var i = h.len - 1
+    loop {
+        if i == 0 { break }
+        var parent = (i - 1) / 2
+        if !(h[i] < h[parent]) { break }
+        h = arr_swap(h, i, parent)
+        i = parent
+    }
+    h
+}
+
+pub fn heap_pop_min<T: IOrd>(ref heap: []T): T {
+    var h = heap.value
+    var top = h[0]
+    var last = h[h.len - 1]
+    h = arr_drop_last(h)
+    if h.len == 0 {
+        heap.value = h
+        return top
+    }
+    h = arr_replace_at(h, 0, last)
+    var i: u64 = 0
+    loop {
+        var l = i * 2 + 1
+        var r = i * 2 + 2
+        var smallest = i
+        if l < h.len && h[l] < h[smallest] { smallest = l }
+        if r < h.len && h[r] < h[smallest] { smallest = r }
+        if smallest == i { break }
+        h = arr_swap(h, i, smallest)
+        i = smallest
+    }
+    heap.value = h
+    top
 }

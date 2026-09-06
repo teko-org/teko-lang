@@ -1,0 +1,28 @@
+fn cstr(s: str): i64 {
+    teko::sys::ptr_word(teko::mem::as_cstr(s))
+}
+
+/** fx::run — write "teko-openat" to /tmp via SYS_openat+SYS_write, reopen read-only, read it back
+ * with SYS_read, and compare the bytes; 0 when they match. */
+pub fn run(): i64 {
+    var path = cstr("/tmp/tk_fx_openat")
+    var fd = teko::sys::syscall4(teko::sys::SYS_OPENAT, teko::sys::AT_FDCWD, path, teko::sys::O_WRONLY | teko::sys::O_CREAT | teko::sys::O_TRUNC, teko::sys::OPEN_MODE_644)
+    if fd < 0 { return 10 }
+    var msg = "teko-openat"
+    var w = teko::sys::syscall3(teko::sys::SYS_WRITE, fd, cstr(msg), 11)
+    _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, fd)
+    if w != 11 { return 11 }
+    var fd2 = teko::sys::syscall4(teko::sys::SYS_OPENAT, teko::sys::AT_FDCWD, path, teko::sys::O_RDONLY, 0)
+    if fd2 < 0 { return 12 }
+    var bw = teko::sys::ptr_word(teko::mem::buf_ptr(32))
+    var r = teko::sys::syscall3(teko::sys::SYS_READ, fd2, bw, 32)
+    _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, fd2)
+    if r != 11 { return 13 }
+    var i: u64 = 0
+    loop {
+        if i >= 11 { break }
+        if teko::mem::load_u8((bw + (i to i64)) to u64) != (msg[i] to u64) { return 20 }
+        i = i + 1
+    }
+    0
+}

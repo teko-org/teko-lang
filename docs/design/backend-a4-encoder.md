@@ -1,11 +1,13 @@
 # A4 / N2d — arm64 encoder + Mach-O object + link via system `ld` (crumb plan)
 
+> **[NOTA]** — este documento descreve oráculos diferenciais ativos durante o bring-up do backend nativo. Ambos os oráculos foram desde então **retirados** (#524 e seguintes); o restante deste documento é registro histórico do método usado, não descreve o estado atual do projeto.
+
 **Status:** DESIGN (doc-only). Sub-PR of the 0.3 own-AOT-backend wave. Issue **#385**. Branch
 `fix/issue-385-encoder` (the A4 mini-umbrella; base = the umbrella carrying A1+A2+A3+#443). Base for
 the design: `docs/design/own-backend-architecture.md` §3.5 (object emission) + §5 (D-2 runtime link,
 D-5 system-linker sequencing), `docs/design/backend-a3-regalloc.md` §3.5/§6.1 (the frame deferral A4
 owns), grounded in the merged code (`src/backend/minst.tks`, `regalloc.tks`, `abi_aapcs64.tks`,
-`minst_interp.tks`, `src/lir/lir.tks`, `src/build/project.tks`).
+`minst_oracle.tks`, `src/lir/lir.tks`, `src/build/project.tks`).
 
 > This is a PLAN. It designs **the KEYSTONE**: the first point where the own backend produces a REAL
 > native executable to diff against the C backend — "the birth of the C-vs-own differential". A4
@@ -33,13 +35,13 @@ owns), grounded in the merged code (`src/backend/minst.tks`, `regalloc.tks`, `ab
   arm64 is fixed-width, so no relaxation/iteration), plus a `[]Reloc` for symbol references
   (`MRelocKind` maps 1:1 to the three ARM64 external reloc types). Module assembly flattens the words
   to `[]byte` little-endian (`(w & 0xFF) to byte` idiom) and rebases per-function reloc offsets.
-- **Frame:** a pure `compute_frame_layout(abi, f) -> FrameLayout` side-table (frame size, the
+- **Frame:** a pure `compute_frame_layout(abi, f): FrameLayout` side-table (frame size, the
   callee-saved save list **re-derived by scanning the physical `MFunc`** — `MFunc` does not carry
   `used_callee_saved`, §3.1 — and a `slot → SP-offset` map). The encoder consumes it to prepend the
   prologue and to expand `MFrameAddr → ADD dst, sp, #off` and `MRet → epilogue + ret`, **without
-  mutating the block stream** — so the A3 interp oracle stays valid on the pre-encode `MFunc`.
+  mutating the block stream** — so the A3 oracle stays valid on the pre-encode `MFunc`.
 - **Differential:** a new `scripts/diff_c_own.sh` leg over an **`exit(n)`-terminated** integer/control
-  corpus: `C-native exit == own-native exit (== interp)`. Gated on **macOS-arm64** (needs the host
+  corpus: `C-native exit == own-native exit (== oracle)`. Gated on **macOS-arm64** (needs the host
   Mach-O `ld`); honest-skip elsewhere with a named reason.
 - **No genuine HALT.** Two decisions are resolved law-first and recorded (§7): re-derive the
   callee-saved set (M.1) and use a temporary `TEKO_BACKEND=native` env seam (M.4, D1 supersedes). One
@@ -67,8 +69,8 @@ owns), grounded in the merged code (`src/backend/minst.tks`, `regalloc.tks`, `ab
 
 The entry function is the synthesized virtual-`main`: `new_func("main", 0, [], I32)`
 (`lower.tks:4054`) — symbol `main`, nullary, returns i32. On Mach-O it becomes the defined symbol
-`_main`, exactly the entry the C crt0 calls. The interp oracle runs it as `minst_interp(m, "main",
-args)` (`minst_interp.tks:1117`); only `tk_exit` executes (exit code read from x0, `interp_call`
+`_main`, exactly the entry the C crt0 calls. The oracle runs it as `minst_oracle(m, "main",
+args)` (`minst_oracle.tks:1117`); only `tk_exit` executes (exit code read from x0, `oracle_call`
 `:901`), every other call is golden-dump-only.
 
 **The three tables ride through unchanged** into the object: `MModule.rodata` (`[]LRodata` — interned
@@ -98,14 +100,14 @@ verbatim. Instruction words are `u32`; the object's `__text` is their little-end
  * emit_u32_le — append `w` to `buf` as four little-endian bytes (the arm64
  * instruction-word / Mach-O little-endian-field emit primitive), the shared
  * `[]byte` idiom (`src/compress/compress.tks:117`). All bit-slicing stays in
- * u32 arithmetic; only the final `& 0xFF` narrows to `byte` (the VM byte-width
- * anchoring gotcha — never widen a `byte` mid-expression).
+ * u32 arithmetic; only the final `& 0xFF` narrows to `byte` (byte-width constraint:
+ * never widen a `byte` mid-expression).
  *
  * @param []byte buf  the buffer to extend
  * @param u32 w  the 32-bit word to append
  * @return []byte  `buf` followed by w's four little-endian bytes
  */
-pub fn emit_u32_le(buf: []byte, w: u32) -> []byte {
+pub fn emit_u32_le(buf: []byte, w: u32): []byte {
     mut b = teko::list::push(buf, (w & 0xFF) to byte)
     b = teko::list::push(b, ((w >> 8) & 0xFF) to byte)
     b = teko::list::push(b, ((w >> 16) & 0xFF) to byte)
@@ -252,7 +254,7 @@ pub type Symbol = struct {
  * @param MReg r  a physical register (is_phys must hold; A4 runs post-regalloc)
  * @return u32  its 5-bit ISA field value
  */
-fn enc_reg(r: MReg) -> u32 { r.id }
+fn enc_reg(r: MReg): u32 { r.id }
 
 /**
  * sf_bit — the size flag for a `wide` operand: 1 (the 64-bit X form) shifted to
@@ -261,7 +263,7 @@ fn enc_reg(r: MReg) -> u32 { r.id }
  * @param bool wide  true for the 64-bit form
  * @return u32  `1 << 31` when wide, else 0
  */
-fn sf_bit(wide: bool) -> u32 { if wide { 0x80000000 } else { 0 } }
+fn sf_bit(wide: bool): u32 { if wide { 0x80000000 } else { 0 } }
 ```
 
 The i64 immediate on `MAluImm`/`MCmpImm` is masked to the 12-bit unsigned field; a **negative** imm
@@ -376,7 +378,7 @@ pub type EncWord = struct {
  * @param MInst inst  the instruction to encode (all operands physical)
  * @return EncWord | error  the encoding, or a named honest-stop
  */
-fn encode_inst_word(layout: FrameLayout, inst: MInst) -> EncWord | error { … }
+fn encode_inst_word(layout: FrameLayout, inst: MInst): EncWord | error { … }
 
 /**
  * encode_func — lower one fully-colored `MFunc` to an `EncodedFunc`: compute
@@ -390,7 +392,7 @@ fn encode_inst_word(layout: FrameLayout, inst: MInst) -> EncWord | error { … }
  * @param MFunc f  the fully-physical function
  * @return EncodedFunc | error  the encoded function, or a named honest-stop
  */
-pub fn encode_func(abi: AbiDescriptor, f: MFunc) -> EncodedFunc | error { … }
+pub fn encode_func(abi: AbiDescriptor, f: MFunc): EncodedFunc | error { … }
 
 /**
  * encode_module — encode every `MFunc` of `m`, concatenate their `__text`
@@ -404,7 +406,7 @@ pub fn encode_func(abi: AbiDescriptor, f: MFunc) -> EncodedFunc | error { … }
  * @param MModule m  the fully-colored module
  * @return EncodedModule | error  the section images + symbols + relocs
  */
-pub fn encode_module(abi: AbiDescriptor, m: MModule) -> EncodedModule | error { … }
+pub fn encode_module(abi: AbiDescriptor, m: MModule): EncodedModule | error { … }
 ```
 
 ---
@@ -413,9 +415,9 @@ pub fn encode_module(abi: AbiDescriptor, m: MModule) -> EncodedModule | error { 
 
 A3 finalized the *slot table* (`MFunc.frame`) and recorded nothing else; the prologue/epilogue and the
 `MFrameAddr` SP/FP-offset resolution are A4's (`backend-a3-regalloc.md` §6.1, §3.5). A4 does them as a
-**pure side-table** the encoder consumes — the block stream is NOT rewritten, so the A3 interp oracle
-still runs the pre-encode `MFunc` unchanged (the interp models slots directly via `frame_slot_addr`,
-`minst_interp.tks:843`, and has no SP — mutating `MFrameAddr` into SP arithmetic would break it).
+**pure side-table** the encoder consumes — the block stream is NOT rewritten, so the A3 oracle
+still runs the pre-encode `MFunc` unchanged (the oracle models slots directly via `frame_slot_addr`,
+`minst_oracle.tks:843`, and has no SP — mutating `MFrameAddr` into SP arithmetic would break it).
 
 ### 3.1 The callee-saved save-set is RE-DERIVED (not carried)
 
@@ -436,7 +438,7 @@ that could desync, and keeps A3's output type frozen (§7, D-A).
  * byte size, the ordered callee-saved registers to save/restore (re-derived by
  * scanning, §3.1), and the SP-relative byte offset of EVERY frame slot. Purely
  * a side-table the encoder reads; the block stream is never rewritten (so the
- * A3 interp oracle stays valid).
+ * A3 oracle stays valid).
  *
  * @since #385 A4-2
  */
@@ -482,7 +484,7 @@ pub type FrameLayout = struct {
  * @param MFunc f  the fully-physical function
  * @return FrameLayout  the resolved frame
  */
-pub fn compute_frame_layout(abi: AbiDescriptor, f: MFunc) -> FrameLayout { … }
+pub fn compute_frame_layout(abi: AbiDescriptor, f: MFunc): FrameLayout { … }
 
 /**
  * slot_offset — the SP-relative byte offset of frame slot `slot` under
@@ -493,7 +495,7 @@ pub fn compute_frame_layout(abi: AbiDescriptor, f: MFunc) -> FrameLayout { … }
  * @param u32 slot  the frame-slot index
  * @return u32  the SP-relative byte offset
  */
-pub fn slot_offset(layout: FrameLayout, slot: u32) -> u32 { … }
+pub fn slot_offset(layout: FrameLayout, slot: u32): u32 { … }
 ```
 
 **Frame decision.** A function is FRAMELESS (`size=0`, no prologue/epilogue) iff it has no frame
@@ -584,7 +586,7 @@ A minimal `MH_OBJECT` (relocatable) Mach-O for arm64, enough for `ld`/`cc` to li
  * @param EncodedModule enc  the section images + symbols + relocations
  * @return []byte  the Mach-O object file bytes
  */
-pub fn emit_macho(enc: EncodedModule) -> []byte { … }
+pub fn emit_macho(enc: EncodedModule): []byte { … }
 ```
 
 Testability: golden byte assertions on the fixed header prefix (magic/cputype/filetype) and a tiny
@@ -617,7 +619,7 @@ cross-checks the bytes; the encoder slices (A4-1..A4-3) need no tool at all.
  * @param m the resolved manifest
  * @return the process exit status (0 on success)
  */
-fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest): i32 {
     let lmod = match lir::lower_program(prog) { lir::LModule as x => x; error as e => return fail(dir, e.message) }
     let sel  = match isel::select_module(lmod) { minst::MModule as x => x; error as e => return fail(dir, e.message) }
     let col  = match regalloc::regalloc_module(abi::aapcs64(), sel) { minst::MModule as x => x; error as e => return fail(dir, e.message) }
@@ -630,7 +632,7 @@ fn emit_native(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Ma
 ### 5.2 The link step (reuse `run_cc`'s machinery)
 
 `run_cc` (`project.tks:397`) already assembles the exact link line A4 needs — it just passes a `.c`
-where A4 passes a `.o`. Extract a `link_object(objfile, binary, m, prog) -> i32` that reuses `run_cc`'s
+where A4 passes a `.o`. Extract a `link_object(objfile, binary, m, prog): i32` that reuses `run_cc`'s
 compiler resolution, the `teko_rt.c` + `assert.c` sources, `-lm`, the reachable `[extern.libs]` flags,
 and the `__info_plist` `-Wl,-sectcreate` (so `__info_plist` parity is preserved for free in the
 `cc`-linker era, `own-backend-architecture.md` §2.1). The only change is `cfile → objfile`; `cc` links
@@ -640,13 +642,13 @@ the keystone corpus does not read argv; see §6 `A4-args`.)
 
 ### 5.3 The differential gate
 
-A new leg — `scripts/diff_c_own.sh` (or an own arm inside `diff_vm_native.sh`) — over an
-**`exit(n)`-terminated** integer/control corpus (the subset the interp already runs, §1). Per fixture:
+A new leg — `scripts/diff_c_own.sh` (or an own arm inside `diff_c_own.sh`) — over an
+**`exit(n)`-terminated** integer/control corpus (the subset the oracle already runs, §1). Per fixture:
 
 1. **C-native** (trusted): `teko <fixture> -o <cbin>` (default path) → run → capture exit + stdout.
 2. **own-native**: `TEKO_BACKEND=native teko <fixture> -o <ownbin>` → run → capture exit + stdout.
-3. **assert** `C-native == own-native` on exit code AND stdout; optionally a third `== interp` leg via
-   a tiny `minst_interp`/`interp_lmodule` harness for a pre-machine cross-check.
+3. **assert** `C-native == own-native` on exit code AND stdout; optionally a third `== oracle` leg via
+   a tiny `minst_oracle`/`oracle_lmodule` harness for a pre-machine cross-check.
 
 **Gated on macOS-arm64** (the highest-RAM lane, the native-test-gate ruling; needs the host Mach-O
 `ld`); on any other host the leg **honest-skips** with a named reason (`"A4 own-backend differential
@@ -724,7 +726,7 @@ of line 8449:
   `emit_block_tail` → `emit_exprstmt_tail`, whose `in_main` branch emits `return (int)(<tail value>);`
   (`codegen.tks:5499-5502`). The `return 0;` at line 8449 is a FALL-THROUGH DEFAULT — dead code when a
   value-carrying tail already returned. So the C backend returns the trailing expression's value as the
-  exit code (verified empirically: `6 * 7` → C-native exit 42, VM exit 42).
+  exit code (verified empirically: `6 * 7` → C-native exit 42).
 - **LIR own backend.** `#423` (commit `87f81b6`, "virtual-main trailing exit") touched ONLY the LIR side
   (`lower.tks`/`lir.tks`) — it made `close_virtual_main` MIRROR `lower_fn_body`'s #421 trailing-expression
   auto-return, bringing LIR INTO PARITY with the already-existing C behavior. The C backend was not
@@ -733,7 +735,7 @@ of line 8449:
 **Resolution (law-consistent, no deferral).** The ratified semantic (#421/#423) is: a trailing loose
 expression IS the process exit code. Both backends implement it; they are ALIGNED. The differential
 corpus is scoped to `exit(n)`-terminated fixtures not to sidestep a divergence (there is none) but
-because that is (a) exactly the subset the LIR interp oracle validates and (b) the own-backend's
+because that is (a) exactly the subset the LIR oracle validates and (b) the own-backend's
 frameless-`main` first light (`bl _tk_exit`, no `MRet`). This exit(n)-corpus convention is codified in
 `scripts/diff_c_own.sh`'s header.
 
@@ -769,30 +771,30 @@ framed-`main` fixture once A3-loop or an equivalent unblocks one), not a new des
 
 ### 9.2 End-to-end differential fixtures (`examples/regressions/`, driven by `diff_c_own.sh`)
 
-| fixture | program (shape) | expected exit | VM | C-native | own-native |
-|---|---|---|---|---|---|
-| `own_exit_zero` | `exit(0)` | 0 | ✓ (existing) | ✓ (existing) | **new** |
-| `own_exit_code` | `exit(42)` | 42 | ✓ | ✓ | **new** |
-| `own_arith_exit` | `exit(6 * 7)` | 42 | ✓ | ✓ | **new** |
-| `own_sub_exit` | `exit(100 - 58)` | 42 | ✓ | ✓ | **new** |
-| `own_if_exit` | `if 5 > 3 { exit(1) } else { exit(2) }` | 1 | ✓ | ✓ | **new** |
-| `own_match_exit` | `match k { 0 => exit(7); _ => exit(9) }` | (per k) | ✓ | ✓ | **new** |
+| fixture | program (shape) | expected exit | C-native | own-native |
+|---|---|---|---|---|
+| `own_exit_zero` | `exit(0)` | 0 | ✓ (existing) | **new** |
+| `own_exit_code` | `exit(42)` | 42 | ✓ | **new** |
+| `own_arith_exit` | `exit(6 * 7)` | 42 | ✓ | **new** |
+| `own_sub_exit` | `exit(100 - 58)` | 42 | ✓ | **new** |
+| `own_if_exit` | `if 5 > 3 { exit(1) } else { exit(2) }` | 1 | ✓ | **new** |
+| `own_match_exit` | `match k { 0 => exit(7); _ => exit(9) }` | (per k) | ✓ | **new** |
 
 All exit-code (no stdout) at first; a `print`-then-`exit` fixture is added once `MCall` to the string
-runtime is exercised (rides the same BL/reloc path). The VM + C-native legs are already covered by
-`diff_vm_native.sh`; A4-5 adds the own-native leg and asserts `own == C (== interp)`.
+runtime is exercised (rides the same BL/reloc path). The C-native leg is already covered by
+`diff_c_own.sh`; A4-5 adds the own-native leg and asserts `own == C`.
 
 ### 9.3 Ritual + coverage posture
 
-- **Every A4-N** owes the full ritual: **both-engine gate** (native `teko . -o bin` AND `teko test .`
-  VM), **paranoid**, **fixpoint**, and **100% coverage on its new code** (definition-of-done). The
+- **Every A4-N** owes the full ritual: **native gate** (native `teko . -o bin` via the backend),
+  **paranoid**, **fixpoint**, and **100% coverage on its new code** (definition-of-done). The
   encoder is highly branchy (per-`MInst`, per-width, per-cond) — cover every encoded case + every
   honest-stop arm via golden tests; a genuinely unreachable arm is justified in the PR.
-- **VM-gotcha watch** (the encoder is dense byte-work): (a) build buffers via `teko::list::push(buf,
-  (w & 0xFF) to byte)` — never widen a `byte` mid-expression (byte-width anchoring); (b) do all
-  bit-slicing in `u32`/`u64`, narrow to `byte` only at the last step; (c) no `x = match {…return}` —
-  use `let x = match {…}` then act (the isel/regalloc VM gotcha); (d) `u32` shifts for imm26/imm19
-  displacement math (watch sign masking on negative displacements).
+- **Encoder gotchas** (dense byte-work): (a) build buffers via `teko::list::push(buf, (w & 0xFF) to byte)` —
+  never widen a `byte` mid-expression (byte-width constraint); (b) do all bit-slicing in `u32`/`u64`,
+  narrow to `byte` only at the last step; (c) no inline match returns — use `let x = match {…}` then act
+  (avoids isel/regalloc issues); (d) `u32` shifts for imm26/imm19 displacement math (watch sign masking on
+  negative displacements).
 - **Fixpoint is trivially preserved** through A4-1..A4-4 (new files, no reachable call from the default
   path) and through A4-5 (the native path is behind the `TEKO_BACKEND=native` seam; default stays C).
 
@@ -829,7 +831,7 @@ A3 (done) + #443 (done) ─▶ A4-1 ─▶ A4-2 ─▶ A4-3 ─▶ A4-4 ─▶ A
   stop. **Proven by:** header/symtab/reloc golden bytes + `otool`/`nm` well-formedness on macOS-arm64.
 - **A4-5 · link + differential (KEYSTONE)** — `emit_native` in `src/build/project.tks`, `link_object`
   (extracted from `run_cc`), the `TEKO_BACKEND=native` seam, `scripts/diff_c_own.sh`, the §9.2
-  fixtures; the `A4-args` stop. **Proven by:** `own-native == C-native (== interp)` exit codes over the
+  fixtures; the `A4-args` stop. **Proven by:** `own-native == C-native (== oracle)` exit codes over the
   corpus on macOS-arm64 (honest-skip elsewhere). **#385 CLOSES.**
 
 **Files:** new `src/backend/encode_arm64.tks`, `src/backend/objfile_macho.tks`,

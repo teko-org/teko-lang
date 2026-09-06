@@ -1,0 +1,444 @@
+const COVS_FN_IDS: u64 = 0
+
+const COVS_FN_N: u64 = 8
+
+const COVS_FN_CAP: u64 = 16
+
+const COVS_BR_IDS: u64 = 24
+
+const COVS_BR_N: u64 = 32
+
+const COVS_BR_CAP: u64 = 40
+
+const COVS_BR_ON: u64 = 48
+
+const COVS_STK_IDS: u64 = 56
+
+const COVS_STK_SP: u64 = 64
+
+const COVS_STK_CAP: u64 = 72
+
+const COVS_LN_IDS: u64 = 80
+
+const COVS_LN_N: u64 = 88
+
+const COVS_LN_CAP: u64 = 96
+
+const COVS_LN_ON: u64 = 104
+
+const COVS_LN_USED: u64 = 112
+
+const COVS_BYTES: u64 = 120
+
+const COV_FN_CAP: u64 = 524288
+
+const COV_BR_CAP: u64 = 1048576
+
+const COV_STK_CAP: u64 = 65536
+
+const COV_LN_CAP: u64 = 2097152
+
+const COV_LN_MAXN: u64 = 1048576
+
+const COV_HASH_MULT: u64 = 1099511628211
+
+const COV_BRANCH_BASE: u64 = 18014398509481984
+
+const COV_HEADER_BYTES: u64 = 32
+
+fn cov_state(): u64 {
+    var s = cov_state_slot()
+    if s != 0 { return s }
+    var blk = teko::sys::ptr_word(region_alloc(region_root(), COVS_BYTES)) to u64
+    _ = rt_memset(blk, 0, COVS_BYTES)
+    set_cov_state_slot(blk)
+    blk
+}
+
+fn covs_get(field: u64): u64 {
+    teko::mem::load_u64(cov_state() + field)
+}
+
+fn covs_set(field: u64, value: u64) {
+    teko::mem::store_u64(cov_state() + field, value)
+}
+
+fn cov_alloc_words(n: u64): u64 {
+    var addr = teko::sys::ptr_word(region_alloc(region_root(), n * 8)) to u64
+    _ = rt_memset(addr, 0, n * 8)
+    addr
+}
+
+fn cov_flag(on: bool): u64 {
+    if on { 1 } else { 0 }
+}
+
+fn cov_ensure_fn() {
+    if covs_get(COVS_FN_CAP) != 0 { return }
+    covs_set(COVS_FN_IDS, cov_alloc_words(COV_FN_CAP))
+    covs_set(COVS_FN_CAP, COV_FN_CAP)
+}
+
+/** teko::runtime::cov_reset — forget the function-coverage marks (buffer kept). */
+exp global fn cov_reset() {
+    covs_set(COVS_FN_N, 0)
+}
+
+/** teko::runtime::cov_mark — record function `id` as executed (deduped). */
+exp global fn cov_mark(id: u64) {
+    cov_ensure_fn()
+    var ids = covs_get(COVS_FN_IDS)
+    var n = covs_get(COVS_FN_N)
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        if teko::mem::load_u64(ids + i * 8) == id { return }
+        i++
+    }
+    if n >= covs_get(COVS_FN_CAP) { panic("cov: function sink overflow") }
+    teko::mem::store_u64(ids + n * 8, id)
+    covs_set(COVS_FN_N, n + 1)
+}
+
+/** teko::runtime::cov_distinct — how many distinct functions were marked. */
+exp global fn cov_distinct(): u64 {
+    covs_get(COVS_FN_N)
+}
+
+/** teko::runtime::cov_is_marked — whether function `id` was marked. */
+exp global fn cov_is_marked(id: u64): bool {
+    var ids = covs_get(COVS_FN_IDS)
+    var n = covs_get(COVS_FN_N)
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        if teko::mem::load_u64(ids + i * 8) == id { return true }
+        i++
+    }
+    false
+}
+
+fn cov_branch_id(fn_idx: u64, line: u32, col: u32, outcome: u64): u64 {
+    COV_BRANCH_BASE + (fn_idx << 38) + ((line to u64) << 14) + (((col to u64) & 255) << 6) + (outcome & 63)
+}
+
+fn cov_ensure_br() {
+    if covs_get(COVS_BR_CAP) != 0 { return }
+    covs_set(COVS_BR_IDS, cov_alloc_words(COV_BR_CAP))
+    covs_set(COVS_BR_CAP, COV_BR_CAP)
+}
+
+fn cov_branch_add(id: u64) {
+    cov_ensure_br()
+    var ids = covs_get(COVS_BR_IDS)
+    var n = covs_get(COVS_BR_N)
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        if teko::mem::load_u64(ids + i * 8) == id { return }
+        i++
+    }
+    if n >= covs_get(COVS_BR_CAP) { panic("cov: branch sink overflow") }
+    teko::mem::store_u64(ids + n * 8, id)
+    covs_set(COVS_BR_N, n + 1)
+}
+
+fn cov_ensure_stk() {
+    if covs_get(COVS_STK_CAP) != 0 { return }
+    covs_set(COVS_STK_IDS, cov_alloc_words(COV_STK_CAP))
+    covs_set(COVS_STK_CAP, COV_STK_CAP)
+}
+
+fn cov_cur_fn(): u64 {
+    var sp = covs_get(COVS_STK_SP)
+    if sp == 0 { return 0 }
+    teko::mem::load_u64(covs_get(COVS_STK_IDS) + (sp - 1) * 8)
+}
+
+/** teko::runtime::cov_branches_on — enable/disable branch recording. */
+exp global fn cov_branches_on(on: bool) {
+    covs_set(COVS_BR_ON, cov_flag(on))
+}
+
+/** teko::runtime::cov_branch_reset — clear branch marks and the fn-attribution stack. */
+exp global fn cov_branch_reset() {
+    covs_set(COVS_BR_N, 0)
+    covs_set(COVS_STK_SP, 0)
+}
+
+/** teko::runtime::cov_enter — push `fn_idx` onto the branch fn-attribution stack. */
+exp global fn cov_enter(fn_idx: u64) {
+    if covs_get(COVS_BR_ON) == 0 { return }
+    cov_ensure_stk()
+    var sp = covs_get(COVS_STK_SP)
+    if sp >= covs_get(COVS_STK_CAP) { panic("cov: fn stack overflow") }
+    teko::mem::store_u64(covs_get(COVS_STK_IDS) + sp * 8, fn_idx)
+    covs_set(COVS_STK_SP, sp + 1)
+}
+
+/** teko::runtime::cov_leave — pop the branch fn-attribution stack. */
+exp global fn cov_leave() {
+    if covs_get(COVS_BR_ON) == 0 { return }
+    var sp = covs_get(COVS_STK_SP)
+    if sp > 0 { covs_set(COVS_STK_SP, sp - 1) }
+}
+
+/** teko::runtime::cov_branch — mark a taken branch outcome in the current stack fn. */
+exp global fn cov_branch(line: u32, col: u32, outcome: u64) {
+    if covs_get(COVS_BR_ON) == 0 { return }
+    cov_branch_add(cov_branch_id(cov_cur_fn(), line, col, outcome))
+}
+
+/** teko::runtime::cov_branch_at — mark a taken branch outcome for the explicit `fn_idx`. */
+exp global fn cov_branch_at(fn_idx: u64, line: u32, col: u32, outcome: u64) {
+    if covs_get(COVS_BR_ON) == 0 { return }
+    cov_branch_add(cov_branch_id(fn_idx, line, col, outcome))
+}
+
+/** teko::runtime::cov_branch_hit — whether the branch (fn,line,col,outcome) was taken. */
+exp global fn cov_branch_hit(fn_idx: u64, line: u32, col: u32, outcome: u64): bool {
+    var id = cov_branch_id(fn_idx, line, col, outcome)
+    var ids = covs_get(COVS_BR_IDS)
+    var n = covs_get(COVS_BR_N)
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        if teko::mem::load_u64(ids + i * 8) == id { return true }
+        i++
+    }
+    false
+}
+
+fn cov_line_id(fn_idx: u64, line: u32): u64 {
+    ((fn_idx << 24) | (line to u64)) + 1
+}
+
+fn cov_ensure_ln() {
+    if covs_get(COVS_LN_CAP) != 0 { return }
+    covs_set(COVS_LN_IDS, cov_alloc_words(COV_LN_CAP))
+    covs_set(COVS_LN_USED, cov_alloc_words(COV_LN_MAXN))
+    covs_set(COVS_LN_CAP, COV_LN_CAP)
+}
+
+fn cov_line_insert(id: u64) {
+    if id == 0 { return }
+    cov_ensure_ln()
+    var cap = covs_get(COVS_LN_CAP)
+    var n = covs_get(COVS_LN_N)
+    if n >= COV_LN_MAXN { panic("cov: line hash full") }
+    var ids = covs_get(COVS_LN_IDS)
+    var h = (id * COV_HASH_MULT) & (cap - 1)
+    loop {
+        var cur = teko::mem::load_u64(ids + h * 8)
+        if cur == 0 { break }
+        if cur == id { return }
+        h = (h + 1) & (cap - 1)
+    }
+    teko::mem::store_u64(ids + h * 8, id)
+    teko::mem::store_u64(covs_get(COVS_LN_USED) + n * 8, h)
+    covs_set(COVS_LN_N, n + 1)
+}
+
+/** teko::runtime::cov_lines_on — enable/disable line recording. */
+exp global fn cov_lines_on(on: bool) {
+    covs_set(COVS_LN_ON, cov_flag(on))
+}
+
+/** teko::runtime::cov_line_reset — clear the line marks (only the used slots are zeroed). */
+exp global fn cov_line_reset() {
+    var n = covs_get(COVS_LN_N)
+    if n == 0 { return }
+    var ids = covs_get(COVS_LN_IDS)
+    var used = covs_get(COVS_LN_USED)
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        teko::mem::store_u64(ids + teko::mem::load_u64(used + i * 8) * 8, 0)
+        i++
+    }
+    covs_set(COVS_LN_N, 0)
+}
+
+/** teko::runtime::cov_line — mark `line` executed in the current stack fn. */
+exp global fn cov_line(line: u32) {
+    if covs_get(COVS_LN_ON) == 0 || line == 0 { return }
+    cov_line_insert(cov_line_id(cov_cur_fn(), line))
+}
+
+/** teko::runtime::cov_line_at — mark `line` executed for the explicit `fn_idx`. */
+exp global fn cov_line_at(fn_idx: u64, line: u32) {
+    if covs_get(COVS_LN_ON) == 0 || line == 0 { return }
+    cov_line_insert(cov_line_id(fn_idx, line))
+}
+
+/** teko::runtime::cov_line_hit — whether (fn,line) was marked executed. */
+exp global fn cov_line_hit(fn_idx: u64, line: u32): bool {
+    var cap = covs_get(COVS_LN_CAP)
+    if cap == 0 { return false }
+    var id = cov_line_id(fn_idx, line)
+    var ids = covs_get(COVS_LN_IDS)
+    var h = (id * COV_HASH_MULT) & (cap - 1)
+    loop {
+        var cur = teko::mem::load_u64(ids + h * 8)
+        if cur == 0 { return false }
+        if cur == id { return true }
+        h = (h + 1) & (cap - 1)
+    }
+    false
+}
+
+/** teko::runtime::cov_begin — start a fresh coverage run: reset all three sinks and enable recording. */
+exp global fn cov_begin() {
+    cov_reset()
+    cov_branch_reset()
+    cov_branches_on(true)
+    cov_line_reset()
+    cov_lines_on(true)
+}
+
+/** teko::runtime::cov_stop — stop branch and line recording. */
+exp global fn cov_stop() {
+    cov_branches_on(false)
+    cov_lines_on(false)
+}
+
+/** teko::runtime::cov_reset_all — clear all three sinks without changing the on/off flags. */
+exp global fn cov_reset_all() {
+    cov_reset()
+    cov_branch_reset()
+    cov_line_reset()
+}
+
+fn cov_put_u64(buf: ref []byte, k: u64, v: u64) {
+    var i: u64 = 0
+    loop {
+        if i >= 8 { break }
+        buf[k + i] = ((v >> (i * 8)) & 255) to byte
+        i++
+    }
+}
+
+fn cov_get_u64(buf: []byte, k: u64): u64 {
+    var v: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= 8 { break }
+        v = v | ((buf[k + i] to u64) << (i * 8))
+        i++
+    }
+    v
+}
+
+fn cov_dump_size(fn_n: u64, br_n: u64, ln_n: u64): u64 {
+    COV_HEADER_BYTES + (fn_n + br_n + ln_n) * 8
+}
+
+fn cov_write_magic(buf: ref []byte) {
+    buf[0] = b'T'
+    buf[1] = b'K'
+    buf[2] = b'C'
+    buf[3] = b'O'
+    buf[4] = b'V'
+    buf[5] = b'1'
+    buf[6] = 0 to byte
+    buf[7] = 0 to byte
+}
+
+fn cov_write_words(buf: ref []byte, at: u64, src_base: u64, n: u64): u64 {
+    cov_put_u64(buf, at, n)
+    var k = at + 8
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        cov_put_u64(buf, k, teko::mem::load_u64(src_base + i * 8))
+        k = k + 8
+        i++
+    }
+    k
+}
+
+/** teko::runtime::cov_dump — write the three coverage sinks to `path` as a `.tkcov` file. */
+exp global fn cov_dump(path: str) {
+    var fn_n = covs_get(COVS_FN_N)
+    var br_n = covs_get(COVS_BR_N)
+    var ln_n = covs_get(COVS_LN_N)
+    var total = cov_dump_size(fn_n, br_n, ln_n)
+    var buf: [total]byte = []
+    cov_write_magic(buf)
+    var k = cov_write_words(buf, 8, covs_get(COVS_FN_IDS), fn_n)
+    k = cov_write_words(buf, k, covs_get(COVS_BR_IDS), br_n)
+    cov_put_u64(buf, k, ln_n)
+    k = k + 8
+    var used = covs_get(COVS_LN_USED)
+    var ids = covs_get(COVS_LN_IDS)
+    var i: u64 = 0
+    loop {
+        if i >= ln_n { break }
+        cov_put_u64(buf, k, teko::mem::load_u64(ids + teko::mem::load_u64(used + i * 8) * 8))
+        k = k + 8
+        i++
+    }
+    _ = teko::io::write_stream(path, buf)
+}
+
+/** teko::runtime::cov_dump_env — dump to the file named by `TEKO_TKCOV` (no-op when unset). */
+exp global fn cov_dump_env() {
+    match teko::env::var("TEKO_TKCOV") {
+        str as p => cov_dump(p)
+        error => { }
+    }
+}
+
+/** teko::runtime::cov_dump_analyze — dump to `$TEKO_ANALYZE_DIR/<idx>.tkcov` (no-op when unset). */
+exp global fn cov_dump_analyze(idx: u64) {
+    match teko::env::var("TEKO_ANALYZE_DIR") {
+        str as d => cov_dump(teko::str::concat(d, "/", teko::str::concat(u64_to_str(idx), ".tkcov")))
+        error => { }
+    }
+}
+
+fn cov_magic_ok(buf: []byte): bool {
+    if buf.len < 8 { return false }
+    buf[0] == b'T' && buf[1] == b'K' && buf[2] == b'C' && buf[3] == b'O' && buf[4] == b'V' && buf[5] == b'1'
+}
+
+/** teko::runtime::cov_merge — union a `.tkcov` file into this process's sinks; false when unreadable. */
+exp global fn cov_merge(path: str): bool {
+    var buf = match teko::io::read_stream(path) { []byte as b => b; error => return false }
+    if !cov_magic_ok(buf) { return false }
+    var k: u64 = 8
+    if k + 8 > buf.len { return false }
+    var fn_n = cov_get_u64(buf, k)
+    k = k + 8
+    var i: u64 = 0
+    loop {
+        if i >= fn_n { break }
+        if k + 8 > buf.len { return false }
+        cov_mark(cov_get_u64(buf, k))
+        k = k + 8
+        i++
+    }
+    if k + 8 > buf.len { return false }
+    var br_n = cov_get_u64(buf, k)
+    k = k + 8
+    i = 0
+    loop {
+        if i >= br_n { break }
+        if k + 8 > buf.len { return false }
+        cov_branch_add(cov_get_u64(buf, k))
+        k = k + 8
+        i++
+    }
+    if k + 8 > buf.len { return false }
+    var ln_n = cov_get_u64(buf, k)
+    k = k + 8
+    i = 0
+    loop {
+        if i >= ln_n { break }
+        if k + 8 > buf.len { return false }
+        cov_line_insert(cov_get_u64(buf, k))
+        k = k + 8
+        i++
+    }
+    true
+}

@@ -65,7 +65,7 @@ lock de dependências. **Nada decidido — só nomeado.**
 
 **Cânone + legislação do usuário:** `.tkt` = testes **junto** ao `.tks`, mesma namespace (enxergam o
 privado), marcados por `#test`, compilados no perfil de teste *(REBOOT_PLAN §2 rev.8, l.129–131;
-LEGISLATION §186–187)*. Perfis: **debug=VM**, **release=nativo**, **CI roda release** como portão de
+LEGISLATION §186–187)*. Perfis: **debug=motor legado**, **release=nativo**, **CI roda release** como portão de
 qualidade *(REBOOT_PLAN §2.21, l.964–977)*. "P22 Testing + coverage" está listado como **PULL EARLY**
 *(REBOOT_PLAN l.1140)* — mas **não há doutrina de cobertura ainda**.
 
@@ -77,23 +77,23 @@ qualidade *(REBOOT_PLAN §2.21, l.964–977)*. "P22 Testing + coverage" está li
 3. Testes rodam **isolados** (`teko test`). Para produzir **release**, **havendo `.tkt`**, eles **devem
    ser executados** e a Teko impõe um threshold de cobertura (default 80%, configurável, piso 10%).
 4. **Testes NÃO são artefatos (legislador).** Um `.tkt` é lexado/parseado/checado como o resto, mas é
-   **executado durante o build, no VM/interpretador, sobre a árvore tipada — ANTES de qualquer emissão
+   **executado durante o build, no motor legado, sobre a árvore tipada — ANTES de qualquer emissão
    (`.tkb`/`.tkh`) ou codegen nativo** — e depois descartado. **Tests nunca viram `.tkb` nem binário**
    (consistente com "`.tkt` ignorado no release"). Ordem: read→lex→parse→check →
-   **[se há `.tkt`: VM roda os testes + mede cobertura → portão]** → emit/codegen. O portão **precede** a
-   emissão. → **É por isso que o VM (Eixo D) entra agora**: ele é o motor de execução dos perfis
+   **[se há `.tkt`: motor legado roda os testes + mede cobertura → portão]** → emit/codegen. O portão **precede** a
+   emissão. → **É por isso que o motor legado (Eixo D) entra agora**: ele é o motor de execução dos perfis
    **test/debug** (Stage-1 — CONSTITUTION §237–245). O runner/cobertura/portão (B3–B5) são realizados
-   **sobre o VM** (ver Eixo D: D2/D3/D4).
+   **sobre o motor legado** (ver Eixo D: D2/D3/D4).
 
 | # | Entrega | Lei | Estado |
 |---|---|---|---|
 | B1 | **Namespace `teko::assert`** — `is_true(bool)`, `is_false(bool)`, `str_contains(hay,needle)` injetados; falha → `teko::panic`. (`equals`/`not_equals`/`is_error`/`is_ok` precisam de genéricos/tipos-resultado — deferidos.) | M.1/M.3 | **✓ feito** |
 | B2 | **Migrar os `.tkt`** do `assert` solto → `teko::assert::*`. | M.3 | **✓ feito** (646 asserts em 8 `.tkt`; só `assert_test.tkt` resta) |
-| B3 | **Coletor + runner `#test`** → realizado como **D2** (roda no VM, não em nativo). `teko test`. | M.1 | → Eixo D |
-| B4 | **Cobertura por LINHA** → realizado como **D3** (o VM conta linhas executadas; `.tkt` fora do denominador). | M.3 | → Eixo D |
+| B3 | **Coletor + runner `#test`** → realizado como **D2** (roda no motor legado, não em nativo). `teko test`. | M.1 | → Eixo D |
+| B4 | **Cobertura por LINHA** → realizado como **D3** (o motor legado conta linhas executadas; `.tkt` fora do denominador). | M.3 | → Eixo D |
 | B5 | **Portão pré-emissão** → realizado como **D4** (threshold configurável, piso 10%, default 80%; release executa obrigatório, debug/test permite `--no-test`; gate **antes** de emit/codegen). | M.1 | → Eixo D |
 
-> **Resultado do Eixo B + D:** `teko test` roda a suíte no **VM** (cobertura por linha medida); `teko build
+> **Resultado do Eixo B + D:** `teko test` roda a suíte no **motor legado** (cobertura por linha medida); `teko build
 > --release` é barrado, **antes de emitir/codegen**, por testes verdes + cobertura ≥ threshold; debug/test
 > permite `--no-test`. `teko::assert` é a superfície canônica; `assert`-solto saiu dos `.tkt`.
 
@@ -107,7 +107,7 @@ plataforma — o "fundo OS/FFI" sobre o qual **IO, arena, rede, tempo, threads**
 tipada**, NÃO FFI; **FFI é só para código estrangeiro** na fronteira insegura *(LEGISLATION §215–226)*.
 `ptr`/`uptr` são **opacos, só-transporte** *(LEGISLATION §235–240)*. A semente **inclui FFI/syscall** (ler
 fonte, escrever saída, `exit`) *(REBOOT_PLAN l.1104–1105)*; a **forma do `extern`** é decisão aberta
-*(l.1186–1187)*. Três estágios: **`.tkb` VM → AOT-nativo (LTS, é o que ships) → bare-metal**
+*(l.1186–1187)*. Três estágios: **`.tkb` motor legado → AOT-nativo (LTS, é o que ships) → bare-metal**
 *(CONSTITUTION §237–245)*; backend **próprio, sem LLVM** *(REBOOT_PLAN l.974–976)*; **bootstrap em 4
 pontos** *(REBOOT_PLAN l.1075–1094)*.
 
@@ -119,35 +119,35 @@ pontos** *(REBOOT_PLAN l.1075–1094)*.
 | C5 | **Capabilities / sandboxing / auditoria de superfície** (`exp`/`extern`/syscall). | M.1 | **evolução** |
 
 ### Backlog nomeado (já levantado, alimenta a independência)
-genéricos + constraints · ponteiros de função / `use`-capture / `inject` (DI) · métodos/OOP (override pós-genéricos) · `flags` · pacotes/pré-linker (A6) · concorrência (`ref`+escape) · crypto/TLS (libs finas sobre FFI, **sem** TLS/HTTP nativo). *(Citações: REBOOT_PLAN §3–7, l.1104–1170; TEKO_HISTORY backlog.)* *(O "modo VM" saiu do backlog — promovido ao Eixo D, pois os testes exigem o VM agora.)*
+genéricos + constraints · ponteiros de função / `use`-capture / `inject` (DI) · métodos/OOP (override pós-genéricos) · `flags` · pacotes/pré-linker (A6) · concorrência (`ref`+escape) · crypto/TLS (libs finas sobre FFI, **sem** TLS/HTTP nativo). *(Citações: REBOOT_PLAN §3–7, l.1104–1170; TEKO_HISTORY backlog.)* *(O "modo motor legado" saiu do backlog — promovido ao Eixo D, pois os testes exigem o motor legado agora.)*
 
 ---
 
-## Eixo D — VM / interpretador (perfil test/debug)
+## Eixo D — motor legado (perfil test/debug)
 
-**Por que agora:** os testes (Eixo B) **executam no VM sobre a árvore tipada, antes de emit/codegen**, e são
-descartados (não viram `.tkb`/binário). O VM é o motor do **sub-perfil de teste** — o **Stage-1** da doutrina
-*(CONSTITUTION §237–245: `.tkb`/IL interpretado, o degrau de bootstrap)*.
+**Por que agora:** os testes (Eixo B) **executam no motor legado sobre a árvore tipada, antes de emit/codegen**, e são
+descartados (não viram `.tkb`/binário). O motor legado é o motor do **sub-perfil de teste** — o **Stage-1** da doutrina
+*(CONSTITUTION §237–245: `.tkb`/IL executado, o degrau de bootstrap)*.
 
-> **Sub-perfil de teste (legislador):** é uma **fase de VM comum a todos os perfis**, não exclusiva de
-> debug/test. **release TAMBÉM roda os testes** — executa o sub-perfil de teste **na VM** (o portão) e só
-> **então** segue o pipeline para o codegen nativo. Resumo: **debug** = roda no VM (+ sub-perfil de teste);
-> **test** (`teko test`) = só o sub-perfil de teste, isolado; **release** = **sub-perfil de teste na VM →
+> **Sub-perfil de teste (legislador):** é uma **fase de motor legado comum a todos os perfis**, não exclusiva de
+> debug/test. **release TAMBÉM roda os testes** — executa o sub-perfil de teste **no motor legado** (o portão) e só
+> **então** segue o pipeline para o codegen nativo. Resumo: **debug** = roda no motor legado (+ sub-perfil de teste);
+> **test** (`teko test`) = só o sub-perfil de teste, isolado; **release** = **sub-perfil de teste no motor legado →
 > portão → codegen nativo**. `--no-test` pula a fase em debug/test, **nunca em release** (havendo `.tkt`).
 
-O VM interpreta a **árvore tipada (`tast`)** diretamente — para testes NÃO há passo de serialização `.tkb`
-(o `.tkb` é só para pacotes/deps, A6). O mesmo VM é o motor que o release usa para o portão antes de emitir.
+O motor legado executa a **árvore tipada (`tast`)** diretamente — para testes NÃO há passo de serialização `.tkb`
+(o `.tkb` é só para pacotes/deps, A6). O mesmo motor legado é o motor que o release usa para o portão antes de emitir.
 
 | # | Entrega | Lei | Estado |
 |---|---|---|---|
-| D1 | **Interpretador da árvore tipada** — avalia `TExpr`/`TStatement`/`TFunction` sobre um modelo de valor (int/bool/`str`/`list`), incluindo os builtins injetados (`print`/`println`/`teko::assert::*`) e os pânicos (÷0/cast/OOB → `teko::panic`). NÃO serializa `.tkb`. | M.0 | **novo** — *pronto (consome `tast`, que existe)* |
-| D2 | **Runner sobre o VM** (≙ B3) — coleta `#test`, executa cada uma no VM **junto do código da sua namespace** (multi-arquivo via A3), reporta nome/contagem/pass-fail, **exit ≠0** em falha. `teko test`. | M.1 | dep: D1, A3 |
-| D3 | **Cobertura no VM** (≙ B4) — o VM conta **linhas** executadas durante os `#test`; % sobre o código de produção (`.tkt` fora do denominador). | M.3 | dep: D2 |
-| D4 | **Portão pré-emissão** (≙ B5) — o driver roda o gate-VM (testes + cobertura) **ANTES** de emit/codegen; release barra em falha/cobertura<threshold (configurável, piso 10%, default 80%); debug/test permite `--no-test`. | M.1 | dep: D3, A1 (threshold no `.tkp`) |
+| D1 | **Motor legado da árvore tipada** — avalia `TExpr`/`TStatement`/`TFunction` sobre um modelo de valor (int/bool/`str`/`list`), incluindo os builtins injetados (`print`/`println`/`teko::assert::*`) e os pânicos (÷0/cast/OOB → `teko::panic`). NÃO serializa `.tkb`. | M.0 | **novo** — *pronto (consome `tast`, que existe)* |
+| D2 | **Runner sobre o motor legado** (≙ B3) — coleta `#test`, executa cada uma no motor legado **junto do código da sua namespace** (multi-arquivo via A3), reporta nome/contagem/pass-fail, **exit ≠0** em falha. `teko test`. | M.1 | dep: D1, A3 |
+| D3 | **Cobertura no motor legado** (≙ B4) — o motor legado conta **linhas** executadas durante os `#test`; % sobre o código de produção (`.tkt` fora do denominador). | M.3 | dep: D2 |
+| D4 | **Portão pré-emissão** (≙ B5) — o driver roda o portão do motor legado (testes + cobertura) **ANTES** de emit/codegen; release barra em falha/cobertura<threshold (configurável, piso 10%, default 80%); debug/test permite `--no-test`. | M.1 | dep: D3, A1 (threshold no `.tkp`) |
 
-> **Resultado do Eixo D:** o VM existe como motor test/debug; `teko test` roda a suíte interpretada; o
-> portão de release passa pelo VM antes de emitir qualquer artefato. O mesmo VM é o degrau para o
-> dev-loop interpretado (Stage-1) e para a futura validação diferencial do self-hosting (C4).
+> **Resultado do Eixo D:** o motor legado existe como motor test/debug; `teko test` roda a suíte executada; o
+> portão de release passa pelo motor legado antes de emitir qualquer artefato. O mesmo motor legado é o degrau para o
+> dev-loop executado (Stage-1) e para a futura validação diferencial do self-hosting (C4).
 
 ---
 
@@ -162,9 +162,9 @@ symbols) *(REBOOT_PLAN l.113–114; §"sem stack trace salvo via `.tsym`")*. Hoj
 | # | Entrega | Lei | Estado |
 |---|---|---|---|
 | E1 | **Posição na pipeline** — fiar `{ file, line, col }` do lexer → tokens → parser → AST → `tast` (cada nó sabe sua origem). | M.3 | **novo** |
-| E2 | **`teko::Error` + pânicos com file:line** — `tk_error`/`Error` ganham `file`+`line`; pânicos (÷0/cast/OOB/assert) imprimem `arquivo:linha` (no VM e no nativo). | M.1/M.3 | **novo** (dep E1) |
+| E2 | **`teko::Error` + pânicos com file:line** — `tk_error`/`Error` ganham `file`+`line`; pânicos (÷0/cast/OOB/assert) imprimem `arquivo:linha` (no motor legado e no nativo). | M.1/M.3 | **novo** (dep E1) |
 | E3 | **Emissão `.tsym`** — um arquivo de símbolos (mapa símbolo↔file:line, frames) emitido junto do artefato, para debugger e stack-trace de release. | M.4 | **novo** (dep E1) |
-| E4 | **Stack-trace** — frames de chamada carregam origem; pânico imprime a pilha (VM direto; nativo via `.tsym`). | M.1 | **novo** (dep E2, E3) |
+| E4 | **Stack-trace** — frames de chamada carregam origem; pânico imprime a pilha (motor legado direto; nativo via `.tsym`). | M.1 | **novo** (dep E2, E3) |
 
 > **Resultado do Eixo E:** erros e pânicos apontam `arquivo:linha`; um `.tsym` acompanha o build para
 > debugger e stack-trace. Base para o tooling de evolução (language server, depurador).
@@ -180,9 +180,9 @@ symbols) *(REBOOT_PLAN l.113–114; §"sem stack trace salvo via `.tsym`")*. Hoj
 - **[A5b mirror dos mains]** `main.tks` e `main.c` **desalinharam** — re-espelhar: ambos exprimem a entrada
   **projeto-só** + subcomandos (`build`/`run`/`test`), semanticamente equivalentes (§2.20).
 - **[B1! aderência do `teko::assert`]** `src/assert/` precisa do **par co-localizado** `assert.{tks,c,h}`
-  (hoje só `assert.tks`; a impl C está em `teko_rt.c`/`vm.c`/`scope.c`). Mover a realização C dos
-  `teko::assert::*` para `src/assert/assert.{c,h}` (a casa da namespace; como os testes rodam no **VM**, é o
-  VM/assert que a consome) — fechar a brecha de par.
+  (hoje só `assert.tks`; a impl C está em `teko_rt.c`/no twin C do motor legado/`scope.c`). Mover a realização C dos
+  `teko::assert::*` para `src/assert/assert.{c,h}` (a casa da namespace; como os testes rodam no **motor legado**, é o
+  motor legado/assert que a consome) — fechar a brecha de par.
 
 ---
 
@@ -236,17 +236,17 @@ que por sua vez destrava `driver.tks`/`main.tks` (self-hosting). F3-pânicos (BI
 ### Eixo B — testes/cobertura
 - **[B1] ✓ `teko::assert`** — par: `src/assert/assert.tks` + injeção (`scope`) + `runtime/teko_rt`. Feito: `is_true`/`is_false`/`str_contains` (resto deferido — genéricos).
 - **[B2] ✓ Migrar os `.tkt`** — feito: 646 asserts em 8 `.tkt` → `teko::assert::*` (só `assert_test.tkt` resta, fecha com D2).
-- **B3/B4/B5 → realizados no Eixo D** (runner/cobertura/portão rodam **no VM**, não em nativo). Ver D2/D3/D4.
+- **B3/B4/B5 → realizados no Eixo D** (runner/cobertura/portão rodam **no motor legado**, não em nativo). Ver D2/D3/D4.
 
-### Eixo D — VM / interpretador (test/debug)
-- **[D1] Interpretador da árvore tipada** — deps: — · M.0 · par: `src/vm/vm.{tks,c,h}` + `vm_test.tkt`
-  > Avalia `TExpr`/`TStatement`/`TFunction` sobre um modelo de valor (int/bool/`str`/`list`), incluindo os builtins injetados (`print`/`println`/`teko::assert::*`) e os pânicos (÷0/cast → `teko::panic`). **NÃO** serializa `.tkb`. **Aceite:** interpreta `return 6*7`→42, `print("x")`, `teko::assert::is_true(true/false)` (passa/paniqueia), sem tocar codegen.
-- **[D2] Runner `#test` no VM** (≙ B3) — deps: D1, A3 · M.1 · par: `src/build/testrun.{tks,c,h}` + `driver` (`teko test`)
-  > Coleta `#test`, interpreta cada uma no VM **junto do código da namespace** (multi-arquivo via A3), reporta, exit≠0 em falha. **Aceite:** `teko test` roda a suíte do repo no VM; falha injetada → exit≠0 + relatório. (Fecha o `assert_test.tkt`.)
-- **[D3] Cobertura por linha no VM** (≙ B4) — deps: D2 · M.3 · par: `src/build/coverage.{tks,c,h}` (contadores no VM)
-  > O VM conta linhas executadas; % sobre produção (`.tkt` fora do denominador). **Aceite:** relatório determinístico para o repo.
+### Eixo D — motor legado (test/debug)
+- **[D1] Motor legado da árvore tipada** — deps: — · M.0 · par: twins C/Teko do motor legado (+ testes correspondentes)
+  > Avalia `TExpr`/`TStatement`/`TFunction` sobre um modelo de valor (int/bool/`str`/`list`), incluindo os builtins injetados (`print`/`println`/`teko::assert::*`) e os pânicos (÷0/cast → `teko::panic`). **NÃO** serializa `.tkb`. **Aceite:** executa `return 6*7`→42, `print("x")`, `teko::assert::is_true(true/false)` (passa/paniqueia), sem tocar codegen.
+- **[D2] Runner `#test` no motor legado** (≙ B3) — deps: D1, A3 · M.1 · par: `src/build/testrun.{tks,c,h}` + `driver` (`teko test`)
+  > Coleta `#test`, executa cada uma no motor legado **junto do código da namespace** (multi-arquivo via A3), reporta, exit≠0 em falha. **Aceite:** `teko test` roda a suíte do repo no motor legado; falha injetada → exit≠0 + relatório. (Fecha o `assert_test.tkt`.)
+- **[D3] Cobertura por linha no motor legado** (≙ B4) — deps: D2 · M.3 · par: `src/build/coverage.{tks,c,h}` (contadores no motor legado)
+  > O motor legado conta linhas executadas; % sobre produção (`.tkt` fora do denominador). **Aceite:** relatório determinístico para o repo.
 - **[D4] Portão pré-emissão** (≙ B5) — deps: D3, A1 (threshold), A5 (driver) · M.1 · par: `driver` (`build --release`/`--no-test`)
-  > Gate-VM (testes + cobertura) **antes** de emit/codegen; release barra em falha/cobertura<threshold; debug/test permite `--no-test`. **Aceite:** abaixo do threshold ou teste vermelho → release barrado antes de emitir; `--no-test` recusado em release.
+  > portão do motor legado (testes + cobertura) **antes** de emit/codegen; release barra em falha/cobertura<threshold; debug/test permite `--no-test`. **Aceite:** abaixo do threshold ou teste vermelho → release barrado antes de emitir; `--no-test` recusado em release.
 
 ### Eixo C — independência/FFI
 - **[C1.0] LEGISLAR `extern`/FFI** — deps: — · M.0/M.1 · par: `TEKO_LEGISLATION.md`
@@ -258,12 +258,11 @@ que por sua vez destrava `driver.tks`/`main.tks` (self-hosting). F3-pânicos (BI
 - **[C2c] `teko::fs` (dir-list)** — deps: C1.1 · M.4 · par: `src/fs/fs.{tks,c,h}` + test → `list_dir` (par Teko de A2).
 - **[C2d] `teko::process` (exec)** — deps: C1.1 · M.4 · par: `src/process/process.{tks,c,h}` + test → invocar `cc`.
   > **Aceite (cada C2x):** roda sobre FFI; `.tkt` cobre feliz + erro.
-- **[C3] Backend nativo próprio** — deps: C1.1 · M.0 · **agendado** · par: `src/codegen/native/*` (lir/isel/regalloc/enc/obj + `stackify_wasm`/`obj_wasm` + `native_emit`, `src/runtime` inalterado como link target)
-  > Emite direto ao metal (+ Wasm), aposenta o `cc` (eventualmente). Plano completo (matriz de alvos, arquitetura de
-  > camadas, milestones N1–N8, linker próprio L1–L4 diferido, Wasm via `wasm-ld`) em `TEKO_ROADMAP_NATIVE_BACKEND.md`.
-  > **Aceite (M1):** os 6 alvos de CI (`.github/workflows/native.yml`) + Wasm/WASI + Wasm/Browser (2 jobs novos)
-  > rodam a suite via objeto nativo, todos os motores concordando (VM==native-C==native-obj, ambos Wasm inclusos;
-  > testes de `fs`/`process` no Browser verificam o honest-stop, não rodam de fato).
+- **[C3] Backend nativo próprio** — deps: C1.1 · M.0 · **agendado** · par: `src/codegen/native/*` (lir/isel/regalloc/enc/obj + `native_emit`, `src/runtime` inalterado como link target)
+  > Emite direto ao metal, aposenta o `cc` (eventualmente). Plano completo (matriz de alvos, arquitetura de
+  > camadas, milestones N1–N8, linker próprio L1–L4 diferido) em `TEKO_ROADMAP_NATIVE_BACKEND.md`.
+  > **Aceite (M1):** os alvos nativos de CI (`.github/workflows/native.yml`)
+  > rodam a suite via objeto nativo, todos os motores concordando (native-C==native-obj).
 - **[C4] Self-hosting** — deps: A5, B5, C2*, M1, M2 · M.4 · **diferido**
   > Ciclo 4 pontos (semente-C → Teko ger.1 → ger.2==ger.3 + corretude diferencial); aposenta C. **Aceite (futuro):** ger.2==ger.3 bit-a-bit.
 - **[C5] Capabilities/sandboxing** — deps: C1.1 · M.1 · **evolução** — auditoria de superfície `exp`/`extern`/syscall.
@@ -277,9 +276,9 @@ que por sua vez destrava `driver.tks`/`main.tks` (self-hosting). F3-pânicos (BI
 - **[F3-pânicos] ✓** — `codegen_c.c` + `runtime/teko_rt`: guards ÷0 + conversão impossível. Feito (overflow deferido → build profiles).
 
 ### Estado
-- **✓ Feitos:** A1, A2, A3, B1, B2, M1, F3-pânicos, D1 (+ integração VM: `teko run`).
-- **▶ Prontos agora (deps satisfeitas):** **D2** (runner `#test` no VM — destrava D3/D4, torna os 646 asserts executáveis) · **A4** (regra do main pelo artefato) · **A5!**+**A5b** (projeto-só + mirror dos mains — correções) · **B1!** (aderência do `teko::assert`) · **E1** (posição na pipeline) · **C1.0** (legislar `extern` — você).
-- **Em seguida:** A4 → A5! → A5b (Eixo A/entrada); D2 → D3 → D4 (testes no VM); E1 → E2 → {E3,E4} (símbolos/diagnósticos); C1.0 → C1.1 → C2* (FFI/host).
+- **✓ Feitos:** A1, A2, A3, B1, B2, M1, F3-pânicos, D1 (+ integração motor legado: `teko run`).
+- **▶ Prontos agora (deps satisfeitas):** **D2** (runner `#test` no motor legado — destrava D3/D4, torna os 646 asserts executáveis) · **A4** (regra do main pelo artefato) · **A5!**+**A5b** (projeto-só + mirror dos mains — correções) · **B1!** (aderência do `teko::assert`) · **E1** (posição na pipeline) · **C1.0** (legislar `extern` — você).
+- **Em seguida:** A4 → A5! → A5b (Eixo A/entrada); D2 → D3 → D4 (testes no motor legado); E1 → E2 → {E3,E4} (símbolos/diagnósticos); C1.0 → C1.1 → C2* (FFI/host).
 - **Correções a fechar (legislador):** A5! (remover single-file), A5b (mirror mains), B1! (par `assert.{c,h}`).
 
 ---
@@ -287,7 +286,7 @@ que por sua vez destrava `driver.tks`/`main.tks` (self-hosting). F3-pânicos (BI
 ## Referência cruzada (2026-07-04)
 
 A maioria dos Eixos deste roadmap foi entregue e promovida para `TEKO_MASTER_PLAN.md`:
-- **Eixos A–D (projeto, testes, independência, VM)** → **Phase 7** (host independence) ✅
+- **Eixos A–D (projeto, testes, independência, motor legado)** → **Phase 7** (host independence) ✅
 - **Eixo E (símbolos/diagnósticos)** → **Phase 1** (diagnostics) ✅
 - **Eixo C (FFI)** → **Phase 7** (extern/FFI) ✅
 

@@ -1,0 +1,413 @@
+use teko::numeric::bigint
+
+/**
+ * An RSA public key: the modulus `n` and the public exponent `e` (RFC 8017 §3.1), both raw
+ * `BigInt` components — no ASN.1 wrapping.
+ */
+exp type RsaPublicKey = struct {
+    /** the RSA modulus, `n = p * q` */
+    n: bigint::BigInt
+    /** the public exponent */
+    e: bigint::BigInt
+}
+
+/**
+ * An RSA private key in the plain (non-CRT) form: the modulus `n`, the private exponent `d`, and
+ * the public exponent `e` (RFC 8017 §3.2, the "first representation"). `e` is carried alongside
+ * `d`/`n` purely for the caller's convenience (e.g. deriving the matching `RsaPublicKey`); the
+ * signing primitive itself only reads `n` and `d`.
+ */
+exp type RsaPrivateKey = struct {
+    /** the RSA modulus, `n = p * q` */
+    n: bigint::BigInt
+    /** the private exponent */
+    d: bigint::BigInt
+    /** the public exponent (carried for convenience; unused by `mod_pow`-based signing) */
+    e: bigint::BigInt
+}
+
+/**
+ * The hash algorithm selecting both a digest primitive and its EMSA-PKCS1-v1_5 `DigestInfo`
+ * prefix / EMSA-PSS parameters. Limited to the three SHA-2 members PKCS#1 v2.2 lists for RSA
+ * signatures at production strength; SHA-1/MD5 are legacy-broken and deliberately excluded here
+ * even though `teko::crypto::hash` still ships them for other interop.
+ */
+exp type RsaHashAlg = enum { Sha256; Sha384; Sha512 }
+
+fn rsa_hash(alg: RsaHashAlg, data: []byte): []byte {
+    match alg {
+        Sha256 => sha256_of(data)
+        Sha384 => sha384_of(data)
+        Sha512 => sha512_of(data)
+    }
+}
+
+fn rsa_hash_len(alg: RsaHashAlg): u64 {
+    match alg {
+        Sha256 => 32
+        Sha384 => 48
+        Sha512 => 64
+    }
+}
+
+const DIGEST_INFO_SHA256: []byte = [
+    0x30 to byte, 0x31 to byte, 0x30 to byte, 0x0d to byte, 0x06 to byte, 0x09 to byte,
+    0x60 to byte, 0x86 to byte, 0x48 to byte, 0x01 to byte, 0x65 to byte, 0x03 to byte,
+    0x04 to byte, 0x02 to byte, 0x01 to byte, 0x05 to byte, 0x00 to byte, 0x04 to byte,
+    0x20 to byte
+]
+
+const DIGEST_INFO_SHA384: []byte = [
+    0x30 to byte, 0x41 to byte, 0x30 to byte, 0x0d to byte, 0x06 to byte, 0x09 to byte,
+    0x60 to byte, 0x86 to byte, 0x48 to byte, 0x01 to byte, 0x65 to byte, 0x03 to byte,
+    0x04 to byte, 0x02 to byte, 0x02 to byte, 0x05 to byte, 0x00 to byte, 0x04 to byte,
+    0x30 to byte
+]
+
+const DIGEST_INFO_SHA512: []byte = [
+    0x30 to byte, 0x51 to byte, 0x30 to byte, 0x0d to byte, 0x06 to byte, 0x09 to byte,
+    0x60 to byte, 0x86 to byte, 0x48 to byte, 0x01 to byte, 0x65 to byte, 0x03 to byte,
+    0x04 to byte, 0x02 to byte, 0x03 to byte, 0x05 to byte, 0x00 to byte, 0x04 to byte,
+    0x40 to byte
+]
+
+fn rsa_digest_info_prefix(alg: RsaHashAlg): []byte {
+    match alg {
+        Sha256 => DIGEST_INFO_SHA256
+        Sha384 => DIGEST_INFO_SHA384
+        Sha512 => DIGEST_INFO_SHA512
+    }
+}
+
+fn rsa_bytes_concat(a: []byte, b: []byte): []byte {
+    [..a, ..b]
+}
+
+fn rsa_bytes_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+/**
+ * Build an `RsaPublicKey` from its raw big-endian byte components (`OS2IP` on each).
+ */
+exp fn rsa_public_key_from_bytes_be(n: []byte, e: []byte): RsaPublicKey {
+    RsaPublicKey { n = bigint::from_bytes_be(n); e = bigint::from_bytes_be(e) }
+}
+
+/**
+ * Build an `RsaPrivateKey` (plain, non-CRT) from its raw big-endian byte components.
+ */
+exp fn rsa_private_key_from_bytes_be(n: []byte, d: []byte, e: []byte): RsaPrivateKey {
+    RsaPrivateKey { n = bigint::from_bytes_be(n); d = bigint::from_bytes_be(d); e = bigint::from_bytes_be(e) }
+}
+
+/**
+ * Build an `RsaPublicKey` from hexadecimal component text (see `bigint::from_hex` for the
+ * accepted syntax: optional `0x` prefix, either digit case, `_` separators).
+ */
+exp fn rsa_public_key_from_hex(n_hex: str, e_hex: str): RsaPublicKey | CryptoError {
+    var n = match bigint::from_hex(n_hex) {
+        bigint::BigInt as b => b
+        error => return crypto_error("rsa_public_key_from_hex: invalid modulus hex")
+    }
+    var e = match bigint::from_hex(e_hex) {
+        bigint::BigInt as b => b
+        error => return crypto_error("rsa_public_key_from_hex: invalid exponent hex")
+    }
+    RsaPublicKey { n = n; e = e }
+}
+
+/**
+ * Build an `RsaPrivateKey` (plain, non-CRT) from hexadecimal component text.
+ */
+exp fn rsa_private_key_from_hex(n_hex: str, d_hex: str, e_hex: str): RsaPrivateKey | CryptoError {
+    var n = match bigint::from_hex(n_hex) {
+        bigint::BigInt as b => b
+        error => return crypto_error("rsa_private_key_from_hex: invalid modulus hex")
+    }
+    var d = match bigint::from_hex(d_hex) {
+        bigint::BigInt as b => b
+        error => return crypto_error("rsa_private_key_from_hex: invalid private exponent hex")
+    }
+    var e = match bigint::from_hex(e_hex) {
+        bigint::BigInt as b => b
+        error => return crypto_error("rsa_private_key_from_hex: invalid public exponent hex")
+    }
+    RsaPrivateKey { n = n; d = d; e = e }
+}
+
+fn rsa_modulus_len_bytes(n: bigint::BigInt): u64 {
+    (bigint::bit_length(n) + 7) / 8
+}
+
+fn rsa_sp1(priv: RsaPrivateKey, m: bigint::BigInt): bigint::BigInt | CryptoError {
+    match bigint::mod_pow(m, priv.d, priv.n) {
+        bigint::BigInt as s => s
+        error => crypto_error("rsa_sp1: mod_pow failed")
+    }
+}
+
+fn rsa_vp1(pubkey: RsaPublicKey, s: bigint::BigInt): bigint::BigInt | CryptoError {
+    if bigint::is_neg(s) || bigint::cmp(s, pubkey.n) >= 0 {
+        return crypto_error("rsa_vp1: signature representative out of range")
+    }
+    match bigint::mod_pow(s, pubkey.e, pubkey.n) {
+        bigint::BigInt as m => m
+        error => crypto_error("rsa_vp1: mod_pow failed")
+    }
+}
+
+fn rsa_emsa_pkcs1_v15_encode(alg: RsaHashAlg, message: []byte, em_len: u64): []byte | CryptoError {
+    var t = rsa_bytes_concat(rsa_digest_info_prefix(alg), rsa_hash(alg, message))
+    if em_len < t.len + 11 {
+        return crypto_error("rsa_emsa_pkcs1_v15_encode: intended encoded message length too short")
+    }
+    var ps_len = em_len - t.len - 3
+    var ps: [ps_len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= ps_len { break }
+        ps[i] = 0xFF to byte
+        i++
+    }
+    [0x00 to byte, 0x01 to byte, ..ps, 0x00 to byte, ..t]
+}
+
+/**
+ * RSASSA-PKCS1-v1_5 sign (RFC 8017 §8.2.1): EMSA-PKCS1-v1_5-encode the message to the modulus
+ * width, convert to an integer (`OS2IP`), apply RSASP1, and convert the result back to a
+ * `k`-byte signature (`I2OSP`). Deterministic — the same key/hash/message always produces the
+ * same signature, matching every PKCS#1 v1.5 reference implementation byte-for-byte.
+ */
+exp fn rsa_sign_pkcs1v15(priv: RsaPrivateKey, hash_alg: RsaHashAlg, message: []byte): []byte | CryptoError {
+    var k = rsa_modulus_len_bytes(priv.n)
+    var em = match rsa_emsa_pkcs1_v15_encode(hash_alg, message, k) {
+        []byte as b => b
+        CryptoError as err => return err
+    }
+    var s = match rsa_sp1(priv, bigint::from_bytes_be(em)) {
+        bigint::BigInt as b => b
+        CryptoError as err => return err
+    }
+    match bigint::to_bytes_be_padded(s, k) {
+        []byte as b => b
+        error => crypto_error("rsa_sign_pkcs1v15: signature encoding failed")
+    }
+}
+
+/**
+ * RSASSA-PKCS1-v1_5 verify (RFC 8017 §8.2.2): reject a wrong-length signature, apply RSAVP1,
+ * re-encode the message the same way `rsa_sign_pkcs1v15` did, and compare the two encodings with
+ * `ct_eq`. Never panics — every malformed input (wrong length, out-of-range representative, a
+ * too-small modulus) simply yields `false`.
+ */
+exp fn rsa_verify_pkcs1v15(pubkey: RsaPublicKey, hash_alg: RsaHashAlg, message: []byte, sig: []byte): bool {
+    var k = rsa_modulus_len_bytes(pubkey.n)
+    if sig.len != k {
+        return false
+    }
+    var m = match rsa_vp1(pubkey, bigint::from_bytes_be(sig)) {
+        bigint::BigInt as b => b
+        CryptoError => return false
+    }
+    var em_actual = match bigint::to_bytes_be_padded(m, k) {
+        []byte as b => b
+        error => return false
+    }
+    var em_expected = match rsa_emsa_pkcs1_v15_encode(hash_alg, message, k) {
+        []byte as b => b
+        CryptoError => return false
+    }
+    ct_eq(em_actual, em_expected)
+}
+
+fn rsa_i2osp_counter(counter: u64): []byte {
+    [
+        ((counter >> 24) & 0xFF) to byte,
+        ((counter >> 16) & 0xFF) to byte,
+        ((counter >> 8) & 0xFF) to byte,
+        (counter & 0xFF) to byte,
+    ]
+}
+
+fn rsa_mgf1(alg: RsaHashAlg, seed: []byte, mask_len: u64): []byte {
+    var h_len = rsa_hash_len(alg)
+    var n_blocks = (mask_len + h_len - 1) / h_len
+    var out: [n_blocks * h_len]byte = []
+    var pos: u64 = 0
+    var counter: u64 = 0
+    loop {
+        if counter >= n_blocks { break }
+        var block = rsa_hash(alg, [..seed, ..rsa_i2osp_counter(counter)])
+        var j: u64 = 0
+        loop {
+            if j >= block.len { break }
+            out[pos] = block[j]
+            pos++
+            j++
+        }
+        counter++
+    }
+    rsa_bytes_slice(out, 0, mask_len)
+}
+
+fn rsa_pss_zero8(): []byte {
+    var out: [8]byte = []
+    out
+}
+
+fn rsa_pss_xor(a: []byte, b: []byte): []byte {
+    var out: [a.len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        out[i] = ((a[i] to u32) ^ (b[i] to u32)) to byte
+        i++
+    }
+    out
+}
+
+fn rsa_pss_keep_mask(n_bits: u32): u32 {
+    (0xFF to u32) >> n_bits
+}
+
+fn rsa_pss_clear_top_bits(buf: []byte, n_bits: u32): []byte {
+    if n_bits == 0 || buf.len == 0 {
+        return buf
+    }
+    var out: [buf.len]byte = []
+    out[0] = ((buf[0] to u32) & rsa_pss_keep_mask(n_bits)) to byte
+    var i: u64 = 1
+    loop {
+        if i >= buf.len { break }
+        out[i] = buf[i]
+        i++
+    }
+    out
+}
+
+fn rsa_pss_top_bits_clear(buf: []byte, n_bits: u32): bool {
+    if n_bits == 0 || buf.len == 0 {
+        return true
+    }
+    var clear_mask = (0xFF to u32) ^ rsa_pss_keep_mask(n_bits)
+    ((buf[0] to u32) & clear_mask) == 0
+}
+
+fn rsa_pss_extract_salt(db: []byte): []byte | CryptoError {
+    var i: u64 = 0
+    loop {
+        if i >= db.len {
+            return crypto_error("rsa_pss_extract_salt: no 0x01 separator found")
+        }
+        if db[i] != 0x00 to byte {
+            break
+        }
+        i++
+    }
+    if db[i] != 0x01 to byte {
+        return crypto_error("rsa_pss_extract_salt: malformed 0x01 separator")
+    }
+    rsa_bytes_slice(db, i + 1, db.len)
+}
+
+fn rsa_emsa_pss_encode(alg: RsaHashAlg, message: []byte, salt: []byte, em_bits: u64): []byte | CryptoError {
+    var h_len = rsa_hash_len(alg)
+    var em_len = (em_bits + 7) / 8
+    if em_len < h_len + salt.len + 2 {
+        return crypto_error("rsa_emsa_pss_encode: modulus too small for digest and salt")
+    }
+    var m_prime = rsa_bytes_concat(rsa_bytes_concat(rsa_pss_zero8(), rsa_hash(alg, message)), salt)
+    var h = rsa_hash(alg, m_prime)
+    var ps_len = em_len - salt.len - h_len - 2
+    var ps: [ps_len]byte = []
+    var db: []byte = [..ps, 0x01 to byte, ..salt]
+    var masked_db = rsa_pss_xor(db, rsa_mgf1(alg, h, em_len - h_len - 1))
+    var clear_bits = (8 * em_len - em_bits) to u32
+    var em = rsa_bytes_concat(rsa_pss_clear_top_bits(masked_db, clear_bits), h)
+    [..em, 0xbc to byte]
+}
+
+fn rsa_emsa_pss_verify(alg: RsaHashAlg, message: []byte, em: []byte, em_bits: u64): bool {
+    var h_len = rsa_hash_len(alg)
+    var em_len = em.len
+    if em_len < h_len + 2 {
+        return false
+    }
+    if em[em_len - 1] != 0xbc to byte {
+        return false
+    }
+    var db_len = em_len - h_len - 1
+    var masked_db = rsa_bytes_slice(em, 0, db_len)
+    var h = rsa_bytes_slice(em, db_len, db_len + h_len)
+    var clear_bits = (8 * em_len - em_bits) to u32
+    if !rsa_pss_top_bits_clear(masked_db, clear_bits) {
+        return false
+    }
+    var db = rsa_pss_clear_top_bits(rsa_pss_xor(masked_db, rsa_mgf1(alg, h, db_len)), clear_bits)
+    var salt = match rsa_pss_extract_salt(db) {
+        []byte as s => s
+        CryptoError => return false
+    }
+    var m_prime = rsa_bytes_concat(rsa_bytes_concat(rsa_pss_zero8(), rsa_hash(alg, message)), salt)
+    ct_eq(rsa_hash(alg, m_prime), h)
+}
+
+/**
+ * RSASSA-PSS sign (RFC 8017 §8.1.1) with a CALLER-SUPPLIED salt: EMSA-PSS-encode the message
+ * (see `rsa_emsa_pss_encode` for why the salt is a parameter, not randomly drawn), convert to an
+ * integer, apply RSASP1, and convert back to a `k`-byte signature.
+ */
+exp fn rsa_sign_pss(priv: RsaPrivateKey, hash_alg: RsaHashAlg, message: []byte, salt: []byte): []byte | CryptoError {
+    var mod_bits = bigint::bit_length(priv.n)
+    if mod_bits == 0 {
+        return crypto_error("rsa_sign_pss: modulus must be positive")
+    }
+    var em_bits = mod_bits - 1
+    var em = match rsa_emsa_pss_encode(hash_alg, message, salt, em_bits) {
+        []byte as b => b
+        CryptoError as err => return err
+    }
+    var s = match rsa_sp1(priv, bigint::from_bytes_be(em)) {
+        bigint::BigInt as b => b
+        CryptoError as err => return err
+    }
+    match bigint::to_bytes_be_padded(s, rsa_modulus_len_bytes(priv.n)) {
+        []byte as b => b
+        error => crypto_error("rsa_sign_pss: signature encoding failed")
+    }
+}
+
+/**
+ * RSASSA-PSS verify (RFC 8017 §8.1.2): reject a wrong-length signature, apply RSAVP1, and check
+ * the recovered integer's EMSA-PSS encoding against `message` (the salt length is recovered
+ * from the padding, never a parameter here). Never panics.
+ */
+exp fn rsa_verify_pss(pubkey: RsaPublicKey, hash_alg: RsaHashAlg, message: []byte, sig: []byte): bool {
+    var k = rsa_modulus_len_bytes(pubkey.n)
+    if sig.len != k {
+        return false
+    }
+    var mod_bits = bigint::bit_length(pubkey.n)
+    if mod_bits == 0 {
+        return false
+    }
+    var em_bits = mod_bits - 1
+    var m = match rsa_vp1(pubkey, bigint::from_bytes_be(sig)) {
+        bigint::BigInt as b => b
+        CryptoError => return false
+    }
+    var em = match bigint::to_bytes_be_padded(m, (em_bits + 7) / 8) {
+        []byte as b => b
+        error => return false
+    }
+    rsa_emsa_pss_verify(hash_alg, message, em, em_bits)
+}

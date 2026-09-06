@@ -1,0 +1,259 @@
+fn aead_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+fn aead_append(dst: []byte, src: []byte): []byte {
+    [..dst, ..src]
+}
+
+fn aead_zero16(): []byte {
+    var out: [16]byte = []
+    out
+}
+
+fn aead_pad16(buf: []byte): []byte {
+    var n = buf.len
+    loop {
+        if n % 16 == 0 { break }
+        n++
+    }
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= buf.len { break }
+        out[i] = buf[i]
+        i++
+    }
+    out
+}
+
+fn aead_xor_n(a: []byte, b: []byte, n: u64): []byte {
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = ((a[i] to u32) ^ (b[i] to u32)) to byte
+        i++
+    }
+    out
+}
+
+fn aead_be_bytes(x: u64, n: u64): []byte {
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = ((x >> ((n - 1 - i) * 8)) & 0xFF) to byte
+        i++
+    }
+    out
+}
+
+fn aead_le64_bytes(x: u64): []byte {
+    var out: [8]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 8 { break }
+        out[i] = ((x >> (i * 8)) & 0xFF) to byte
+        i++
+    }
+    out
+}
+
+fn gcm_j0(nonce: []byte): []byte {
+    var out: [nonce.len + 4]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= nonce.len { break }
+        out[i] = nonce[i]
+        i++
+    }
+    out[nonce.len + 3] = 1 to byte
+    out
+}
+
+fn gcm_inc32(block: []byte): []byte {
+    var c = ((block[12] to u32) << 24) | ((block[13] to u32) << 16) | ((block[14] to u32) << 8) | (block[15] to u32)
+    c = teko::math::wrapping_add_u32(c, 1)
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 12 { break }
+        out[i] = block[i]
+        i++
+    }
+    out[12] = ((c >> 24) & 0xFF) to byte
+    out[13] = ((c >> 16) & 0xFF) to byte
+    out[14] = ((c >> 8) & 0xFF) to byte
+    out[15] = (c & 0xFF) to byte
+    out
+}
+
+fn gcm_ghash_input(aad: []byte, ct: []byte): []byte {
+    var out = aead_pad16(aead_slice(aad, 0, aad.len))
+    out = aead_pad16(aead_append(out, ct))
+    [..out, ..aead_be_bytes(aad.len * 8, 8), ..aead_be_bytes(ct.len * 8, 8)]
+}
+
+fn gcm_tag(ks: AesKey, nonce: []byte, aad: []byte, ct: []byte): []byte | CryptoError {
+    var h = aes_encrypt_block_ks(ks, aead_zero16())
+    var s = match ghash(h, gcm_ghash_input(aad, ct)) { []byte as x => x; CryptoError as e => return e }
+    aead_xor_n(s, aes_encrypt_block_ks(ks, gcm_j0(nonce)), 16)
+}
+
+/**
+ * AES-GCM authenticated encryption (NIST SP 800-38D) with a 96-bit nonce — the enterprise-norm
+ * AEAD (AES-256-GCM when the key is 32 bytes; AES-128/192-GCM follow the key size). Encrypts
+ * `plaintext` under GCTR and appends the 16-byte authentication tag over `aad ‖ ciphertext`.
+ */
+exp fn aes_gcm_seal(key: []byte, nonce: []byte, aad: []byte, plaintext: []byte): []byte | CryptoError {
+    if nonce.len != 12 { return crypto_error("aes_gcm: nonce must be exactly 12 bytes (96-bit)") }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var ct = match aes_ctr(key, gcm_inc32(gcm_j0(nonce)), plaintext) { []byte as c => c; CryptoError as e => return e }
+    var tag = match gcm_tag(ks, nonce, aad, ct) { []byte as t => t; CryptoError as e => return e }
+    aead_append(ct, tag)
+}
+
+/**
+ * AES-GCM authenticated decryption (NIST SP 800-38D): splits `ct_tag` into ciphertext and the
+ * trailing 16-byte tag, recomputes the tag over `aad ‖ ciphertext`, and — only if the recomputed
+ * tag matches the received tag in constant time — returns the GCTR-decrypted plaintext. A tag
+ * mismatch yields a `CryptoError` and no plaintext (M.1: authentication failure never leaks the
+ * decryption).
+ */
+exp fn aes_gcm_open(key: []byte, nonce: []byte, aad: []byte, ct_tag: []byte): []byte | CryptoError {
+    if nonce.len != 12 { return crypto_error("aes_gcm: nonce must be exactly 12 bytes (96-bit)") }
+    if ct_tag.len < 16 { return crypto_error("aes_gcm: input shorter than the 16-byte tag") }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var ct = aead_slice(ct_tag, 0, ct_tag.len - 16)
+    var recv = aead_slice(ct_tag, ct_tag.len - 16, ct_tag.len)
+    var tag = match gcm_tag(ks, nonce, aad, ct) { []byte as t => t; CryptoError as e => return e }
+    if !ct_eq(tag, recv) { return crypto_error("aes_gcm: authentication failed") }
+    aes_ctr(key, gcm_inc32(gcm_j0(nonce)), ct)
+}
+
+fn chacha_poly_key(key: []byte, nonce: []byte): []byte | CryptoError {
+    var block0 = match chacha20(key, nonce, 0 to u32, aead_append(aead_zero16(), aead_zero16())) { []byte as b => b; CryptoError as e => return e }
+    aead_slice(block0, 0, 32)
+}
+
+fn chacha_mac_input(aad: []byte, ct: []byte): []byte {
+    var out = aead_pad16(aead_slice(aad, 0, aad.len))
+    out = aead_pad16(aead_append(out, ct))
+    [..out, ..aead_le64_bytes(aad.len), ..aead_le64_bytes(ct.len)]
+}
+
+/**
+ * ChaCha20-Poly1305 authenticated encryption (RFC 8439 §2.8): encrypts `plaintext` with ChaCha20
+ * (message counter 1) and appends the 16-byte Poly1305 tag over the padded `aad ‖ ciphertext ‖
+ * length block`, keyed by the block-0 one-time key.
+ */
+exp fn chacha20_poly1305_seal(key: []byte, nonce: []byte, aad: []byte, plaintext: []byte): []byte | CryptoError {
+    var otk = match chacha_poly_key(key, nonce) { []byte as k => k; CryptoError as e => return e }
+    var ct = match chacha20(key, nonce, 1 to u32, plaintext) { []byte as c => c; CryptoError as e => return e }
+    var tag = match poly1305(otk, chacha_mac_input(aad, ct)) { []byte as t => t; CryptoError as e => return e }
+    aead_append(ct, tag)
+}
+
+/**
+ * ChaCha20-Poly1305 authenticated decryption (RFC 8439 §2.8): splits `ct_tag` into ciphertext and
+ * the trailing 16-byte tag, recomputes the Poly1305 tag over the padded `aad ‖ ciphertext ‖ length
+ * block`, and — only if it matches the received tag in constant time — returns the ChaCha20-
+ * decrypted plaintext. A tag mismatch yields a `CryptoError` and no plaintext.
+ */
+exp fn chacha20_poly1305_open(key: []byte, nonce: []byte, aad: []byte, ct_tag: []byte): []byte | CryptoError {
+    if ct_tag.len < 16 { return crypto_error("chacha20_poly1305: input shorter than the 16-byte tag") }
+    var otk = match chacha_poly_key(key, nonce) { []byte as k => k; CryptoError as e => return e }
+    var ct = aead_slice(ct_tag, 0, ct_tag.len - 16)
+    var recv = aead_slice(ct_tag, ct_tag.len - 16, ct_tag.len)
+    var tag = match poly1305(otk, chacha_mac_input(aad, ct)) { []byte as t => t; CryptoError as e => return e }
+    if !ct_eq(tag, recv) { return crypto_error("chacha20_poly1305: authentication failed") }
+    chacha20(key, nonce, 1 to u32, ct)
+}
+
+fn ccm_params(nonce: []byte, tag_len: u64): u64 | CryptoError {
+    if nonce.len < 7 || nonce.len > 13 { return crypto_error("aes_ccm: nonce must be 7..13 bytes") }
+    if tag_len < 4 || tag_len > 16 || tag_len % 2 != 0 { return crypto_error("aes_ccm: tag length must be one of 4,6,8,10,12,14,16") }
+    15 - nonce.len
+}
+
+fn ccm_b0(nonce: []byte, q: u64, aad_len: u64, pt_len: u64, tag_len: u64): []byte {
+    var adata = if aad_len > 0 { 1 to u64 } else { 0 to u64 }
+    var flag_byte = 64 * adata + 8 * ((tag_len - 2) / 2) + (q - 1)
+    [(flag_byte & 0xFF) to byte, ..nonce, ..aead_be_bytes(pt_len, q)]
+}
+
+fn ccm_format_aad(aad: []byte): []byte {
+    if aad.len == 0 { return [] }
+    var prefix: []byte = []
+    if aad.len < 65280 {
+        prefix = aead_be_bytes(aad.len, 2)
+    } else if aad.len < 4294967296 {
+        prefix = [0xff to byte, 0xfe to byte, ..aead_be_bytes(aad.len, 4)]
+    } else {
+        prefix = [0xff to byte, 0xff to byte, ..aead_be_bytes(aad.len, 8)]
+    }
+    aead_pad16([..prefix, ..aad])
+}
+
+fn ccm_mac_input(nonce: []byte, q: u64, aad: []byte, pt: []byte, tag_len: u64): []byte {
+    var out = ccm_b0(nonce, q, aad.len, pt.len, tag_len)
+    out = aead_append(out, ccm_format_aad(aad))
+    aead_pad16(aead_append(out, pt))
+}
+
+fn ccm_cbc_mac(ks: AesKey, blocks: []byte): []byte {
+    var y = aead_zero16()
+    var off: u64 = 0
+    loop {
+        if off >= blocks.len { break }
+        y = aes_encrypt_block_ks(ks, aead_xor_n(y, aead_slice(blocks, off, off + 16), 16))
+        off = off + 16
+    }
+    y
+}
+
+fn ccm_ctr_block(nonce: []byte, q: u64, i: u64): []byte {
+    [((q - 1) & 0xFF) to byte, ..nonce, ..aead_be_bytes(i, q)]
+}
+
+/**
+ * AES-CCM authenticated encryption (NIST SP 800-38C): CBC-MACs the formatted `B0 ‖ AAD ‖
+ * plaintext` for the tag `T`, CTR-encrypts the plaintext from counter block `A1`, masks the tag
+ * with `E_K(A0)`, and returns `ciphertext ‖ MSB_tag_len(T ⊕ E_K(A0))`.
+ */
+exp fn aes_ccm_seal(key: []byte, nonce: []byte, aad: []byte, plaintext: []byte, tag_len: u64): []byte | CryptoError {
+    var q = match ccm_params(nonce, tag_len) { u64 as v => v; CryptoError as e => return e }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var y = ccm_cbc_mac(ks, ccm_mac_input(nonce, q, aad, plaintext, tag_len))
+    var ct = match aes_ctr(key, ccm_ctr_block(nonce, q, 1), plaintext) { []byte as c => c; CryptoError as e => return e }
+    var s0 = aes_encrypt_block_ks(ks, ccm_ctr_block(nonce, q, 0))
+    aead_append(ct, aead_xor_n(y, s0, tag_len))
+}
+
+/**
+ * AES-CCM authenticated decryption (NIST SP 800-38C): splits `ct_tag` into ciphertext and the
+ * trailing `tag_len`-byte tag, CTR-decrypts the ciphertext from counter block `A1`, recomputes the
+ * CBC-MAC tag over the recovered plaintext, and — only if the masked tag matches the received tag
+ * in constant time — returns the plaintext. A tag mismatch yields a `CryptoError` and no plaintext.
+ */
+exp fn aes_ccm_open(key: []byte, nonce: []byte, aad: []byte, ct_tag: []byte, tag_len: u64): []byte | CryptoError {
+    var q = match ccm_params(nonce, tag_len) { u64 as v => v; CryptoError as e => return e }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    if ct_tag.len < tag_len { return crypto_error("aes_ccm: input shorter than the tag") }
+    var ct = aead_slice(ct_tag, 0, ct_tag.len - tag_len)
+    var recv = aead_slice(ct_tag, ct_tag.len - tag_len, ct_tag.len)
+    var pt = match aes_ctr(key, ccm_ctr_block(nonce, q, 1), ct) { []byte as p => p; CryptoError as e => return e }
+    var y = ccm_cbc_mac(ks, ccm_mac_input(nonce, q, aad, pt, tag_len))
+    var s0 = aes_encrypt_block_ks(ks, ccm_ctr_block(nonce, q, 0))
+    if !ct_eq(aead_xor_n(y, s0, tag_len), recv) { return crypto_error("aes_ccm: authentication failed") }
+    pt
+}

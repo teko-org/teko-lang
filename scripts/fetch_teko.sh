@@ -50,15 +50,79 @@ if [ "$o" = linux ]; then
   LABEL="${o}-${a}-${libc}"
 fi
 
-# Newest release BY VERSION — the /releases API is not version-ordered, so `[0]` can be
-# a stale tag (0.0.1.9 ahead of 0.0.1.17). Filter to MAJOR.MINOR.PATCH.BUILD + `sort -V`.
-TAG="$(gh api "repos/${REPO}/releases" --paginate \
-  --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^v?[0-9]+([.][0-9]+){3}"))' \
-  | awk '{ orig=$0; ver=$0; sub(/^v/,"",ver); print ver"\t"orig }' | sort -V | tail -n1 | cut -f2)"
-if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-  echo "fetch_teko: no published release found for $REPO" >&2
+BIN_PROBE="teko"
+[ "$o" = windows ] && BIN_PROBE="teko.exe"
+
+# SEM `gh`, HÁ UM SEGUNDO CAMINHO — e ele existe porque a sua ausência já custou meia hora a
+# cada um de dois agentes, no mesmo dia, sem nenhum dos dois conseguir NOMEAR a parede.
+#
+# O que se passava (medido 2026-07-30): esta caixa não tem `gh` autenticado. O guião morria aqui,
+# o chamador caía para a semente em cache — que estava uma versão atrasada, `0.3.0.30-beta` — e
+# essa semente NÃO constrói a árvore de hoje: pára em `src/build/project.tks:2076: unknown
+# function: arch`, porque `teko::arch()` só passou a builtin reconhecido pela semente DEPOIS do
+# 0.3.0.30. O `build_with_seed_fallback.sh` esgotava então `MAX_PROBES=64` a procurar um degrau
+# construível que não existia. Nada disto dizia "não tens compilador"; dizia coisas sobre `arch`.
+#
+# A cache partilhada é o remédio: quem TEM como buscar a semente (o integrador, pelo MCP do
+# GitHub, ou qualquer humano com `gh`) deposita-a uma vez em `$TEKO_SEED_CACHE`, e todos os
+# worktrees a encontram sem rede e sem credencial.
+SEED_CACHE="${TEKO_SEED_CACHE:-$HOME/.teko-seed}"
+
+# COMO SE DETECTA, e a primeira versão desta detecção estava errada — fica registado porque o
+# erro é instrutivo. Eu escrevi `command -v gh || ! gh auth status` e ele NÃO disparou: nesta
+# caixa o `gh` existe e o `gh auth status` sai 0. O que falha é o ACESSO AO REPOSITÓRIO, com um
+# 403 que chega como corpo JSON no sítio onde se esperava uma etiqueta. Verifiquei um PROXY da
+# condição em vez da condição — a mesma patologia que a barra do tronco recusa.
+#
+# A detecção certa é TENTAR A CHAMADA e validar a FORMA do que volta: uma etiqueta de versão
+# casa `^v?N.N.N.N`. Um objecto de erro, uma string vazia, um `null` — nada disso casa, e todos
+# caem no mesmo ramo, sem eu ter de enumerar os modos de falha do `gh`.
+probe_tag() {
+  gh api "repos/${REPO}/releases" --paginate \
+    --jq 'map(select(.draft | not) | .tag_name)[] | select(test("^v?[0-9]+([.][0-9]+){3}"))' 2>/dev/null \
+    | awk '{ orig=$0; ver=$0; sub(/^v/,"",ver); print ver"\t"orig }' | sort -V | tail -n1 | cut -f2
+}
+TAG=""
+command -v gh >/dev/null 2>&1 && TAG="$(probe_tag)"
+case "$TAG" in
+  v[0-9]*.[0-9]*.[0-9]*.[0-9]*|[0-9]*.[0-9]*.[0-9]*.[0-9]*) ;;
+  *) TAG="" ;;
+esac
+
+if [ -z "$TAG" ]; then
+  if [ -x "${SEED_CACHE}/${BIN_PROBE}" ]; then
+    echo "fetch_teko: o \`gh\` não devolveu etiqueta — a usar a cache partilhada ${SEED_CACHE}"
+    mkdir -p "$DEST"
+    cp "${SEED_CACHE}/${BIN_PROBE}" "${DEST}/${BIN_PROBE}"
+    chmod +x "${DEST}/${BIN_PROBE}"
+    [ -f "${SEED_CACHE}/.version" ] && cp "${SEED_CACHE}/.version" "${DEST}/.version"
+    "${DEST}/${BIN_PROBE}" --version || true
+    exit 0
+  fi
+  # FALHA ALTO E NOMEIA O QUE FALTA. O contrário — devolver silêncio e deixar o chamador cair
+  # numa semente velha — é o erro escondido que esta secção existe para matar.
+  cat >&2 <<EOF
+fetch_teko: FATAL — o \`gh\` não devolveu nenhuma etiqueta de versão para ${REPO} (sem
+  binário, sem autenticação, ou sem acesso ao repositório) E não há cache partilhada em
+  ${SEED_CACHE}
+
+NÃO caias para uma semente antiga: uma semente uma versão atrás não constrói esta árvore, e
+falha a dizer coisas sobre \`arch\` em vez de dizer que está velha.
+
+Como encher a cache (quem tem o MCP do GitHub — o integrador):
+  1. mcp__github__actions_list  method=list_workflow_run_artifacts  resource_id=<run-id>
+     → escolhe \`teko-assets-<label>\` de uma perna \`artifact\` VERDE
+  2. mcp__github__actions_get   method=download_workflow_run_artifact  resource_id=<artifact-id>
+  3. curl o URL, unzip, e instala o binário em ${SEED_CACHE}/${BIN_PROBE}
+
+Ou, com \`gh\` autenticado, corre este guião normalmente.
+EOF
   exit 1
 fi
+
+# A etiqueta mais recente POR VERSÃO já foi obtida e validada acima por `probe_tag` — a API
+# /releases não vem ordenada por versão (0.0.1.9 podia aparecer à frente de 0.0.1.17), daí o
+# filtro a MAJOR.MINOR.PATCH.BUILD e o `sort -V`. Chegar aqui significa que `$TAG` casa a forma.
 
 BIN="teko"
 [ "$o" = windows ] && BIN="teko.exe"

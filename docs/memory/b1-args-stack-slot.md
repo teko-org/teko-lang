@@ -51,6 +51,10 @@ instruction selector to emit that call.
 `.github/workflows/pr.yml`'s Windows self-test step holds a KNOWN-STOP envelope (owner ruling
 2026-07-28: *"Ok KNOWN-STOP para os testes de WINDOWS"*). It lives in the LANE and not in
 `own_native.tkr` because that fixture passes on every System V leg — a fixture cannot hold two
-truths, but a lane can hold the one true of its own ABI. The envelope demands the suite fail, that
-the failure name `B1-args`, that exactly one regression row failed, and that no unit test did. When
+truths, but a lane can hold the one true of its own ABI. The verdict is delegated to
+`scripts/known_stop_gate.sh`, which demands the suite fail, that the failure name the EXACT pinned
+diagnostic ("an integer call argument past the ABI's argument-register window needs the stack-arg
+slot") — not merely the shared `B1-args` family name, which `select_param_x86`'s parameter stop and
+`pin_args_x86`'s variadic-call stop also carry (`scripts/known_stop_gate_test.sh` proves the
+distinction by inversion) — that exactly one regression row failed, and that no unit test did. When
 this fix lands, that first condition goes red and the envelope comes out.

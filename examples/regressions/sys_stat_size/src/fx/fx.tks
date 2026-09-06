@@ -1,0 +1,44 @@
+fn cstr(s: str): i64 {
+    teko::sys::ptr_word(teko::mem::as_cstr(s))
+}
+
+fn zero_statx(): teko::sys::Statx {
+    teko::sys::Statx {
+        stx_mask = 0; stx_blksize = 0; stx_attributes = 0; stx_nlink = 0; stx_uid = 0
+        stx_gid = 0; stx_mode = 0; stx_spare0 = 0; stx_ino = 0; stx_size = 0
+        stx_blocks = 0; stx_attributes_mask = 0; stx_pad0 = 0; stx_pad1 = 0; stx_pad2 = 0
+        stx_pad3 = 0; stx_pad4 = 0; stx_pad5 = 0; stx_pad6 = 0; stx_pad7 = 0
+        stx_pad8 = 0; stx_pad9 = 0; stx_pad10 = 0; stx_pad11 = 0; stx_pad12 = 0
+        stx_pad13 = 0; stx_pad14 = 0; stx_pad15 = 0; stx_pad16 = 0; stx_pad17 = 0
+        stx_pad18 = 0; stx_pad19 = 0; stx_pad20 = 0; stx_pad21 = 0; stx_pad22 = 0
+        stx_pad23 = 0; stx_pad24 = 0; stx_pad25 = 0
+    }
+}
+
+fn write_42(path: str): bool {
+    var fd = teko::sys::syscall4(teko::sys::SYS_OPENAT, teko::sys::AT_FDCWD, cstr(path), teko::sys::O_WRONLY | teko::sys::O_CREAT | teko::sys::O_TRUNC, teko::sys::OPEN_MODE_644)
+    if fd < 0 { return false }
+    var payload = teko::sys::ptr_word(teko::mem::buf_ptr(42))
+    var i: u64 = 0
+    loop {
+        if i >= 42 { break }
+        teko::mem::store_u8((payload + (i to i64)) to u64, 88)
+        i = i + 1
+    }
+    var w = teko::sys::syscall3(teko::sys::SYS_WRITE, fd, payload, 42)
+    _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, fd)
+    w == 42
+}
+
+/** fx::run — write a 42-byte file, SYS_statx it into a teko::sys::Statx (per-#os extern struct whose
+ * declared field offsets are pinned here by reading stx_size through field access), return 0 when
+ * stx_size == 42. */
+pub fn run(): i64 {
+    var path = "/tmp/tk_fx_statx"
+    if !write_42(path) { return 10 }
+    var sx = zero_statx()
+    var r = teko::sys::syscall5(teko::sys::SYS_STATX, teko::sys::AT_FDCWD, cstr(path), 0, teko::sys::STATX_BASIC_STATS, teko::sys::ref_word(sx))
+    if r < 0 { return 11 }
+    if sx.stx_size != 42 { return 20 }
+    0
+}

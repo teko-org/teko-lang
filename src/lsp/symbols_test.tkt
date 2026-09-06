@@ -1,0 +1,122 @@
+use teko::parser
+
+const SYM_SRC: str = "/**\n * Doubles a number.\n */\npub fn double(x: i64): i64 { return x * 2 }\n\n/**\n * A point in 2D space.\n */\npub type Point = struct { x: i64; y: i64; fn len(): i64 { return self.x } }\n\n/**\n * The circle constant, approximated.\n */\npub const PI: f64 = 3.14\n"
+
+fn sym_path(): str {
+    var p = teko::test::scoped("lsp-sym-fixture.tks")
+    match teko::io::write_file(p, SYM_SRC) { error => { }; null => { } }
+    p
+}
+
+fn sym_program(): parser::Program {
+    match document_program(sym_path(), SYM_SRC) {
+        parser::Program as p => p
+        error => parser::Program { items = [] }
+    }
+}
+
+fn find_symbol(syms: []Symbol, name: str): Symbol | null {
+    var i: u64 = 0
+    loop {
+        if i >= syms.len { break }
+        if syms[i].name == name { return syms[i] }
+        i = i + 1
+    }
+    null
+}
+
+#test
+fn build_symbol_index_indexes_a_documented_function() {
+    var syms = build_symbol_index(sym_program())
+    var s = match find_symbol(syms, "double") {
+        Symbol as s => s
+        null => { teko::assert::is_true(false); return }
+    }
+    teko::assert::is_true(s.kind == SymKind::Function)
+    teko::assert::str_contains(s.doc, "Doubles a number")
+    teko::assert::eq_str(s.signature, "fn double(x: i64): i64")
+}
+
+#test
+fn build_symbol_index_indexes_a_documented_type() {
+    var syms = build_symbol_index(sym_program())
+    var s = match find_symbol(syms, "Point") {
+        Symbol as s => s
+        null => { teko::assert::is_true(false); return }
+    }
+    teko::assert::is_true(s.kind == SymKind::Type)
+    teko::assert::str_contains(s.doc, "A point in 2D space")
+    teko::assert::eq_str(s.signature, "type Point")
+}
+
+#test
+fn build_symbol_index_indexes_struct_fields() {
+    var syms = build_symbol_index(sym_program())
+    var x = match find_symbol(syms, "x") { Symbol as s => s; null => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(x.kind == SymKind::Field)
+    teko::assert::eq_str(x.signature, "x: i64")
+    var y = match find_symbol(syms, "y") { Symbol as s => s; null => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(y.kind == SymKind::Field)
+    teko::assert::eq_str(y.signature, "y: i64")
+}
+
+#test
+fn build_symbol_index_indexes_a_struct_method() {
+    var syms = build_symbol_index(sym_program())
+    var m = match find_symbol(syms, "len") { Symbol as s => s; null => { teko::assert::is_true(false); return } }
+    teko::assert::is_true(m.kind == SymKind::Method)
+    teko::assert::eq_str(m.signature, "fn len(self): i64")
+}
+
+#test
+fn build_symbol_index_indexes_a_documented_const() {
+    var syms = build_symbol_index(sym_program())
+    var s = match find_symbol(syms, "PI") {
+        Symbol as s => s
+        null => { teko::assert::is_true(false); return }
+    }
+    teko::assert::is_true(s.kind == SymKind::Const)
+    teko::assert::str_contains(s.doc, "circle constant")
+    teko::assert::eq_str(s.signature, "const PI: f64")
+}
+
+#test
+fn build_symbol_index_finds_exactly_the_expected_symbols() {
+    var syms = build_symbol_index(sym_program())
+    teko::assert::eq_u64(syms.len, 6)
+}
+
+#test
+fn word_at_position_finds_the_identifier_under_the_cursor() {
+    var word = match word_at_position(SYM_SRC, 3, 9) {
+        str as w => w
+        null => { teko::assert::is_true(false); return }
+    }
+    teko::assert::eq_str(word, "double")
+}
+
+#test
+fn word_at_position_outside_any_token_is_null() {
+    match word_at_position(SYM_SRC, 100, 0) {
+        str as w => teko::assert::eq_str(w, "<expected null>")
+        null => { }
+    }
+}
+
+#test
+fn resolve_symbol_at_finds_the_function_symbol_under_the_cursor() {
+    var sym = match resolve_symbol_at(sym_path(), SYM_SRC, 3, 9) {
+        Symbol as s => s
+        null => { teko::assert::is_true(false); return }
+    }
+    teko::assert::eq_str(sym.name, "double")
+    teko::assert::is_true(sym.kind == SymKind::Function)
+}
+
+#test
+fn resolve_symbol_at_on_a_keyword_is_null() {
+    match resolve_symbol_at(sym_path(), SYM_SRC, 3, 0) {
+        Symbol as s => teko::assert::eq_str(s.name, "<expected null>")
+        null => { }
+    }
+}

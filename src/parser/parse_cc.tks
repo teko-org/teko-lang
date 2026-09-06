@@ -1,0 +1,248 @@
+use teko::lexer
+
+type ParsedRegion = struct { decls: []@Decl(); guards: []Pred; next: u64 }
+
+fn is_cc_if_start(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Hash) && is_kind_at(tokens, pos + 1, lexer::TokenKind::If)
+}
+
+fn is_cc_marker(tokens: []lexer::Token, pos: u64, name: str): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Hash) && is_kind_at(tokens, pos + 1, lexer::TokenKind::Ident) && tokens[pos + 1].text == name
+}
+
+fn is_cc_else(tokens: []lexer::Token, pos: u64): bool {
+    is_kind_at(tokens, pos, lexer::TokenKind::Hash) && is_kind_at(tokens, pos + 1, lexer::TokenKind::Else)
+}
+
+fn parse_cc_paren_pred(tokens: []lexer::Token, pos: u64): Parsed<Pred> | error {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::LParen) { return err_at(tokens, pos, "expected '(' to open the `#if`/`#elseif` predicate") }
+    var inner = match parse_pred(tokens, pos + 1) { Parsed<Pred> as x => x; error as e => return e }
+    if !is_kind_at(tokens, inner.next, lexer::TokenKind::RParen) { return err_at(tokens, inner.next, "expected ')' to close the `#if`/`#elseif` predicate") }
+    Parsed<Pred> { node = inner.node; next = inner.next + 1 }
+}
+
+fn parse_pred(tokens: []lexer::Token, pos: u64): Parsed<Pred> | error {
+    parse_pred_or(tokens, pos)
+}
+
+fn parse_pred_or(tokens: []lexer::Token, pos: u64): Parsed<Pred> | error {
+    var left = match parse_pred_and(tokens, pos) { Parsed<Pred> as x => x; error as e => return e }
+    var acc = left.node
+    var p = left.next
+    loop {
+        if !is_kind_at(tokens, p, lexer::TokenKind::OrOr) { break }
+        var right = match parse_pred_and(tokens, p + 1) { Parsed<Pred> as x => x; error as e => return e }
+        acc = pred_or(acc, right.node)
+        p = right.next
+    }
+    Parsed<Pred> { node = acc; next = p }
+}
+
+fn parse_pred_and(tokens: []lexer::Token, pos: u64): Parsed<Pred> | error {
+    var left = match parse_pred_unary(tokens, pos) { Parsed<Pred> as x => x; error as e => return e }
+    var acc = left.node
+    var p = left.next
+    loop {
+        if !is_kind_at(tokens, p, lexer::TokenKind::AndAnd) { break }
+        var right = match parse_pred_unary(tokens, p + 1) { Parsed<Pred> as x => x; error as e => return e }
+        acc = pred_and(acc, right.node)
+        p = right.next
+    }
+    Parsed<Pred> { node = acc; next = p }
+}
+
+fn parse_pred_unary(tokens: []lexer::Token, pos: u64): Parsed<Pred> | error {
+    if is_kind_at(tokens, pos, lexer::TokenKind::Bang) {
+        var operand = match parse_pred_unary(tokens, pos + 1) { Parsed<Pred> as x => x; error as e => return e }
+        return Parsed<Pred> { node = pred_not(operand.node); next = operand.next }
+    }
+    parse_pred_primary(tokens, pos)
+}
+
+fn parse_pred_primary(tokens: []lexer::Token, pos: u64): Parsed<Pred> | error {
+    if is_kind_at(tokens, pos, lexer::TokenKind::LParen) {
+        var inner = match parse_pred(tokens, pos + 1) { Parsed<Pred> as x => x; error as e => return e }
+        if !is_kind_at(tokens, inner.next, lexer::TokenKind::RParen) { return err_at(tokens, inner.next, "expected ')' to close a grouped predicate") }
+        return Parsed<Pred> { node = inner.node; next = inner.next + 1 }
+    }
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Ident) {
+        return err_at(tokens, pos, "expected a predicate: `os`/`arch == \"…\"`, a build flag, `(`, or `!`")
+    }
+    var name = tokens[pos].text
+    if (name == "os" || name == "arch") && is_kind_at(tokens, pos + 1, lexer::TokenKind::EqEq) {
+        return parse_pred_axis_eq(tokens, pos, name)
+    }
+    Parsed<Pred> { node = Pred { kind = PFlag { name = name } }; next = pos + 1 }
+}
+
+fn parse_pred_axis_eq(tokens: []lexer::Token, pos: u64, axis: str): Parsed<Pred> | error {
+    if !is_kind_at(tokens, pos + 2, lexer::TokenKind::Str) {
+        return err_at(tokens, pos + 2, "expected a quoted value after `==` in a `#if` axis comparison")
+    }
+    match cc_axis_value_diag(axis, tokens[pos + 2].text, tokens[pos + 2].line, tokens[pos + 2].col) { error as e => return e; null => { } }
+    Parsed<Pred> { node = Pred { kind = PEq { axis = axis; value = tokens[pos + 2].text } }; next = pos + 3 }
+}
+
+fn cc_axis_canon_values(axis: str): []str {
+    if axis == "os" { return ["linux", "macos", "windows"] }
+    if axis == "arch" { return ["x86_64", "arm64"] }
+    []
+}
+
+fn cc_str_list_has(xs: []str, needle: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == needle { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn cc_axis_alias_hint(axis: str, value: str): str {
+    if axis == "arch" {
+        if value == "aarch64" { return "arm64" }
+        if value == "amd64" || value == "x64" || value == "x86-64" { return "x86_64" }
+    }
+    if axis == "os" {
+        if value == "darwin" || value == "apple" || value == "osx" || value == "macosx" { return "macos" }
+        if value == "win" || value == "win32" || value == "win64" || value == "mingw" || value == "w64" { return "windows" }
+    }
+    ""
+}
+
+fn cc_min3(a: u64, b: u64, c: u64): u64 {
+    var m = if a < b { a } else { b }
+    if c < m { c } else { m }
+}
+
+fn cc_edit_distance(a: str, b: str): u64 {
+    var m = a.len
+    var n = b.len
+    var prev: []u64 = []
+    var j: u64 = 0
+    loop {
+        if j > n { break }
+        prev = [..prev, j]
+        j = j + 1
+    }
+    var i: u64 = 1
+    loop {
+        if i > m { break }
+        var curr: []u64 = [i]
+        var k: u64 = 1
+        loop {
+            if k > n { break }
+            var cost = if a[i - 1] == b[k - 1] { 0 to u64 } else { 1 to u64 }
+            curr = [..curr, cc_min3(prev[k] + 1, curr[k - 1] + 1, prev[k - 1] + cost)]
+            k = k + 1
+        }
+        prev = curr
+        i = i + 1
+    }
+    prev[n]
+}
+
+fn cc_nearest_canon(axis: str, value: str): str {
+    var cands = cc_axis_canon_values(axis)
+    var best = ""
+    var bestd: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= cands.len { break }
+        var d = cc_edit_distance(value, cands[i])
+        if best == "" || d < bestd {
+            best = cands[i]
+            bestd = d
+        }
+        i = i + 1
+    }
+    best
+}
+
+fn cc_axis_value_diag(axis: str, value: str, line: u32, col: u32): null | error {
+    var canon = cc_axis_canon_values(axis)
+    if canon.len == 0 { return null }
+    if cc_str_list_has(canon, value) { return null }
+    var hint = cc_axis_alias_hint(axis, value)
+    if hint == "" { hint = cc_nearest_canon(axis, value) }
+    error { message = $"{line}:{col}: unknown {axis} \"{value}\" (did you mean \"{hint}\"?)" }
+}
+
+fn parse_cc_region(tokens: []lexer::Token, pos: u64, outer: Pred): ParsedRegion | error {
+    var head = match parse_cc_paren_pred(tokens, pos + 2) { Parsed<Pred> as x => x; error as e => return e }
+    var arm_pred = head.node
+    var p = head.next
+    var earlier = pred_true()
+    var arm_guard = attr_guard_and(outer, attr_guard_and(earlier, arm_pred))
+    var decls: []@Decl() = []
+    var guards: []Pred = []
+    var saw_else = false
+    loop {
+        p = skip_trivia(tokens, p)
+        if is_cc_marker(tokens, p, "endif") { return ParsedRegion { decls = decls; guards = guards; next = p + 2 } }
+        if is_cc_marker(tokens, p, "elseif") {
+            if saw_else { return err_at(tokens, p, "`#elseif` may not follow `#else` in a `#if` region") }
+            earlier = attr_guard_and(earlier, pred_not(arm_pred))
+            var nx = match parse_cc_paren_pred(tokens, p + 2) { Parsed<Pred> as x => x; error as e => return e }
+            arm_pred = nx.node
+            p = nx.next
+            arm_guard = attr_guard_and(outer, attr_guard_and(earlier, arm_pred))
+            continue
+        }
+        if is_cc_else(tokens, p) {
+            if saw_else { return err_at(tokens, p, "a `#if` region may have only one `#else`") }
+            saw_else = true
+            earlier = attr_guard_and(earlier, pred_not(arm_pred))
+            p = p + 2
+            arm_guard = attr_guard_and(outer, earlier)
+            continue
+        }
+        if !has_token(tokens, p) { return err_at(tokens, p, "unterminated `#if` region (expected `#endif`)") }
+        var armed = match parse_cc_arm_item(tokens, p, arm_guard) { ParsedRegion as x => x; error as e => return e }
+        decls = append_decls(decls, armed.decls)
+        guards = append_guards(guards, armed.guards)
+        p = armed.next
+        if !has_token(tokens, p) { return err_at(tokens, p, "unterminated `#if` region (expected `#endif`)") }
+        if !is_sep(tokens, p) && !is_cc_region_boundary(tokens, p) {
+            return err_at(tokens, p, "expected ';' or a newline after a declaration inside a `#if` region")
+        }
+    }
+    err_at(tokens, p, "unterminated `#if` region (expected `#endif`)")
+}
+
+fn is_cc_region_boundary(tokens: []lexer::Token, pos: u64): bool {
+    is_cc_marker(tokens, pos, "endif") || is_cc_marker(tokens, pos, "elseif") || is_cc_else(tokens, pos)
+}
+
+fn parse_cc_arm_item(tokens: []lexer::Token, pos: u64, arm_guard: Pred): ParsedRegion | error {
+    if is_cc_if_start(tokens, pos) {
+        return parse_cc_region(tokens, pos, arm_guard)
+    }
+    var d = match parse_decl(tokens, pos) { ParsedDecl as x => x; error as e => return e }
+    var one_decl: []@Decl() = [d.node]
+    var one_guard: []Pred = [attr_guard_and(arm_guard, d.guard)]
+    ParsedRegion { decls = one_decl; guards = one_guard; next = d.next }
+}
+
+fn append_decls(a: []@Decl(), b: []@Decl()): []@Decl() {
+    var out = a
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = [..out, b[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn append_guards(a: []Pred, b: []Pred): []Pred {
+    var out = a
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = [..out, b[i]]
+        i = i + 1
+    }
+    out
+}

@@ -1,0 +1,64 @@
+// surface_scope.tk -- a name declared inside a block belongs to that block and
+// to nothing else. The table of locals is marked at every `{` and cut back at
+// the matching `}` (teko_stmt.tk's tk_block, registered through
+// `syntax_stmt("{")`, which is how a module owns every block --
+// mc docs/reference/hooks.md § syntax_stmt), and the static-type oracle walks
+// the tree under the same rule (teko_typeof.tk), so the `Ledger s` of an inner
+// block neither answers outside it nor poisons the `Shape s` it shadowed.
+//
+// Two classes declare `area`, and they are unrelated: whichever one the `.`
+// picks is visible in the exit code. `report` is the program the defect was
+// measured on -- it used to run `ledger_area` on a `Shape` and return 2.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+class Shape {
+    public virtual i64 area() { return 1; }
+}
+
+class Ledger {
+    public i64 total;
+    public i64 area() { return 2; }
+}
+
+// the shadow dies at the `}`: the answer is Shape's, 1
+i64 report(Shape s) {
+    if (1) {
+        Ledger s = new Ledger;
+        s.total = 99;
+    }
+    return s.area();
+}
+
+// two levels deep, and the name in force is the innermost one still open:
+// 2 (Ledger) + 1 (Shape) + 2 (the Ledger again) + 1 (the parameter) = 6
+i64 nested(Shape s) {
+    i64 n = 0;
+    {
+        Ledger s = new Ledger;
+        n = n + s.area();
+        {
+            Shape s = new Shape;
+            n = n + s.area();
+        }
+        n = n + s.area();
+    }
+    return n + s.area();
+}
+
+// a `return` that leaves an inner block: the scope is a parse-time stack, and
+// the parser reaches the `}` whatever the run-time path does
+i64 early(Shape s) {
+    if (1) {
+        Ledger s = new Ledger;
+        if (s.area() == 2) return 35;
+    }
+    return s.area();
+}
+
+i64 main() {
+    Shape sh = new Shape;
+    return report(sh) + nested(sh) + early(sh);
+}

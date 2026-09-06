@@ -1,0 +1,48 @@
+fn cstr(s: str): i64 {
+    teko::sys::ptr_word(teko::mem::as_cstr(s))
+}
+
+fn cstr_len(addr: i64): u64 {
+    var n: u64 = 0
+    loop {
+        if teko::mem::load_u8((addr + (n to i64)) to u64) == 0 { break }
+        n = n + 1
+    }
+    n
+}
+
+fn name_is(addr: i64, want: str): bool {
+    if cstr_len(addr) != want.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= want.len { break }
+        if teko::mem::load_u8((addr + (i to i64)) to u64) != (want[i] to u64) { return false }
+        i = i + 1
+    }
+    true
+}
+
+/** fx::run — open "/" as a directory, read its entries with SYS_getdents64 into a buffer, parse the
+ * linux_dirent64 records by field offset, and return 0 when an entry named "usr" is found. */
+pub fn run(): i64 {
+    var fd = teko::sys::syscall4(teko::sys::SYS_OPENAT, teko::sys::AT_FDCWD, cstr("/"), teko::sys::O_RDONLY | teko::sys::O_DIRECTORY, 0)
+    if fd < 0 { return 10 }
+    var buf = teko::sys::ptr_word(teko::mem::buf_ptr(8192))
+    var found = false
+    loop {
+        var nread = teko::sys::syscall3(teko::sys::SYS_GETDENTS64, fd, buf, 8192)
+        if nread <= 0 { break }
+        var pos: i64 = 0
+        loop {
+            if pos >= nread { break }
+            var rec = buf + pos
+            var reclen = (teko::mem::load_u64((rec + 16) to u64) & 0xFFFF) to i64
+            if reclen <= 0 { break }
+            if name_is(rec + 19, "usr") { found = true }
+            pos = pos + reclen
+        }
+    }
+    _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, fd)
+    if found { return 0 }
+    1
+}

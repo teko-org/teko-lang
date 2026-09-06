@@ -1,0 +1,390 @@
+
+const PHASE_UNIT: str = "unit"
+
+const PHASE_REGRESSION: str = "regression"
+
+pub type Finding = struct {
+        phase: str
+        writer: str
+        label: str
+        reason: str
+}
+
+pub type PhaseTally = struct {
+        unit: u64
+        regression: u64
+        total: u64
+}
+
+fn zero_tally(): PhaseTally { PhaseTally { unit = 0; regression = 0; total = 0 } }
+
+pub type CovTriple = struct {
+        functions_cov: u64
+        functions_val: u64
+        lines_cov: u64
+        lines_val: u64
+        branches_cov: u64
+        branches_val: u64
+}
+
+fn zero_cov(): CovTriple {
+    CovTriple { functions_cov = 0; functions_val = 0; lines_cov = 0; lines_val = 0; branches_cov = 0; branches_val = 0 }
+}
+
+pub type RunSummary = struct {
+        run: str
+        passed: PhaseTally
+        failed: PhaseTally
+        skipped: PhaseTally
+        never_ran: PhaseTally
+        fails: []Finding
+        skips: []Finding
+        dead: []Finding
+        cov: CovTriple
+        cov_missing: u64
+}
+
+fn phase_of(writer: str): str {
+    if writer.len > 0 && writer[0] == b's' { return PHASE_UNIT }
+    if writer.len > 0 && writer[0] == b'r' { return PHASE_REGRESSION }
+    ""
+}
+
+fn tally_bump(t: PhaseTally, phase: str, n: u64): PhaseTally {
+    if phase == PHASE_UNIT { return PhaseTally { unit = t.unit + n; regression = t.regression; total = t.total + n } }
+    if phase == PHASE_REGRESSION { return PhaseTally { unit = t.unit; regression = t.regression + n; total = t.total + n } }
+    t
+}
+
+fn str_list_contains(xs: []str, x: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == x { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn distinct_writers(recs: []Record): []str {
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= recs.len { break }
+        if !str_list_contains(out, recs[i].writer) { out = [..out, recs[i].writer] }
+        i = i + 1
+    }
+    out
+}
+
+fn first_tab_index(s: str): u64 {
+    var i: u64 = 0
+    loop {
+        if i >= s.len { return s.len }
+        if s[i] == b'\t' { return i }
+        i = i + 1
+    }
+}
+
+fn payload_label(payload: str): str { payload.slice_to(first_tab_index(payload)) }
+
+fn payload_reason(payload: str): str {
+    var t = first_tab_index(payload)
+    if t >= payload.len { return "" }
+    payload.slice_from(t + 1)
+}
+
+fn finding_of(r: Record): Finding {
+    Finding { phase = phase_of(r.writer); writer = r.writer; label = payload_label(r.payload); reason = payload_reason(r.payload) }
+}
+
+type WriterStat = struct {
+        writer: str
+        phase: str
+        plan: u64
+        has_plan: bool
+        ok: u64
+        fail: u64
+        skip: u64
+        has_end: bool
+        has_incomplete: bool
+        last_begin: str
+        has_cov: bool
+        cov: CovTriple
+}
+
+fn parse_u64(s: str): u64 {
+    var v: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        var c = s[i]
+        if c < b'0' || c > b'9' { break }
+        v = (v * 10) + ((c to u64) - (b'0' to u64))
+        i = i + 1
+    }
+    v
+}
+
+fn nth_field(s: str, n: u64): str {
+    var tab = b'\t'
+    var start: u64 = 0
+    var field: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= s.len {
+            if field == n { return s.slice_from(start) }
+            return ""
+        }
+        if s[i] == tab {
+            if field == n { return s.slice(start, i) }
+            field = field + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+fn cov_of_payload(payload: str): CovTriple {
+    CovTriple {
+        functions_cov = parse_u64(nth_field(payload, 0))
+        functions_val = parse_u64(nth_field(payload, 1))
+        lines_cov = parse_u64(nth_field(payload, 2))
+        lines_val = parse_u64(nth_field(payload, 3))
+        branches_cov = parse_u64(nth_field(payload, 4))
+        branches_val = parse_u64(nth_field(payload, 5))
+    }
+}
+
+fn cov_add(a: CovTriple, b: CovTriple): CovTriple {
+    CovTriple {
+        functions_cov = a.functions_cov + b.functions_cov
+        functions_val = a.functions_val + b.functions_val
+        lines_cov = a.lines_cov + b.lines_cov
+        lines_val = a.lines_val + b.lines_val
+        branches_cov = a.branches_cov + b.branches_cov
+        branches_val = a.branches_val + b.branches_val
+    }
+}
+
+fn stat_of(recs: []Record, writer: str): WriterStat {
+    var st = WriterStat {
+        writer = writer; phase = phase_of(writer); plan = 0; has_plan = false
+        ok = 0; fail = 0; skip = 0; has_end = false; has_incomplete = false; last_begin = ""
+        has_cov = false; cov = zero_cov()
+    }
+    var i: u64 = 0
+    loop {
+        if i >= recs.len { break }
+        var r = recs[i]
+        if r.writer == writer { st = fold_writer_record(st, r) }
+        i = i + 1
+    }
+    st
+}
+
+fn fold_writer_record(st: WriterStat, r: Record): WriterStat {
+    if r.kind == KIND_PLAN {
+        return WriterStat {
+            writer = st.writer; phase = st.phase; plan = parse_u64(r.payload); has_plan = true
+            ok = st.ok; fail = st.fail; skip = st.skip; has_end = st.has_end; has_incomplete = st.has_incomplete
+            last_begin = st.last_begin; has_cov = st.has_cov; cov = st.cov
+        }
+    }
+    if r.kind == KIND_BEGIN { return with_last_begin(st, r.payload) }
+    if r.kind == KIND_OK { return bump_ok(st) }
+    if r.kind == KIND_FAIL { return bump_fail(st) }
+    if r.kind == KIND_SKIP { return bump_skip(st) }
+    if r.kind == KIND_COV { return with_cov(st, cov_of_payload(r.payload)) }
+    if r.kind == KIND_INCOMPLETE { return with_incomplete(st, r.payload) }
+    if r.kind == KIND_END || r.kind == KIND_STOP { return with_end(st) }
+    st
+}
+
+fn with_last_begin(st: WriterStat, label: str): WriterStat {
+    WriterStat {
+        writer = st.writer; phase = st.phase; plan = st.plan; has_plan = st.has_plan
+        ok = st.ok; fail = st.fail; skip = st.skip; has_end = st.has_end; has_incomplete = st.has_incomplete
+        last_begin = label; has_cov = st.has_cov; cov = st.cov
+    }
+}
+
+fn bump_ok(st: WriterStat): WriterStat {
+    WriterStat {
+        writer = st.writer; phase = st.phase; plan = st.plan; has_plan = st.has_plan
+        ok = st.ok + 1; fail = st.fail; skip = st.skip; has_end = st.has_end; has_incomplete = st.has_incomplete
+        last_begin = st.last_begin; has_cov = st.has_cov; cov = st.cov
+    }
+}
+
+fn bump_fail(st: WriterStat): WriterStat {
+    WriterStat {
+        writer = st.writer; phase = st.phase; plan = st.plan; has_plan = st.has_plan
+        ok = st.ok; fail = st.fail + 1; skip = st.skip; has_end = st.has_end; has_incomplete = st.has_incomplete
+        last_begin = st.last_begin; has_cov = st.has_cov; cov = st.cov
+    }
+}
+
+fn bump_skip(st: WriterStat): WriterStat {
+    WriterStat {
+        writer = st.writer; phase = st.phase; plan = st.plan; has_plan = st.has_plan
+        ok = st.ok; fail = st.fail; skip = st.skip + 1; has_end = st.has_end; has_incomplete = st.has_incomplete
+        last_begin = st.last_begin; has_cov = st.has_cov; cov = st.cov
+    }
+}
+
+fn with_end(st: WriterStat): WriterStat {
+    WriterStat {
+        writer = st.writer; phase = st.phase; plan = st.plan; has_plan = st.has_plan
+        ok = st.ok; fail = st.fail; skip = st.skip; has_end = true; has_incomplete = st.has_incomplete
+        last_begin = st.last_begin; has_cov = st.has_cov; cov = st.cov
+    }
+}
+
+fn with_cov(st: WriterStat, c: CovTriple): WriterStat {
+    WriterStat {
+        writer = st.writer; phase = st.phase; plan = st.plan; has_plan = st.has_plan
+        ok = st.ok; fail = st.fail; skip = st.skip; has_end = st.has_end; has_incomplete = st.has_incomplete
+        last_begin = st.last_begin; has_cov = true; cov = c
+    }
+}
+
+fn with_incomplete(st: WriterStat, label: str): WriterStat {
+    WriterStat {
+        writer = st.writer; phase = st.phase; plan = st.plan; has_plan = st.has_plan
+        ok = st.ok; fail = st.fail; skip = st.skip; has_end = st.has_end; has_incomplete = true
+        last_begin = label; has_cov = st.has_cov; cov = st.cov
+    }
+}
+
+fn is_dead(st: WriterStat): bool { st.has_incomplete || (st.has_plan && !st.has_end) }
+
+fn ran_of(st: WriterStat): u64 { st.ok + st.fail + st.skip }
+
+fn collect_findings(recs: []Record, kind: str): []Finding {
+    var out: []Finding = []
+    var i: u64 = 0
+    loop {
+        if i >= recs.len { break }
+        if recs[i].kind == kind { out = [..out, finding_of(recs[i])] }
+        i = i + 1
+    }
+    out
+}
+
+fn run_of(recs: []Record): str { if recs.len > 0 { recs[0].run } else { "" } }
+
+pub fn summarize(recs: []Record): RunSummary {
+    var writers = distinct_writers(recs)
+    var passed = zero_tally()
+    var failed = zero_tally()
+    var skipped = zero_tally()
+    var never_ran = zero_tally()
+    var dead: []Finding = []
+    var cov = zero_cov()
+    var cov_missing: u64 = 0
+    var w: u64 = 0
+    loop {
+        if w >= writers.len { break }
+        var st = stat_of(recs, writers[w])
+        passed = tally_bump(passed, st.phase, st.ok)
+        failed = tally_bump(failed, st.phase, st.fail)
+        skipped = tally_bump(skipped, st.phase, st.skip)
+        cov = cov_add(cov, st.cov)
+        if st.has_plan && !st.has_cov { cov_missing = cov_missing + 1 }
+        if is_dead(st) {
+            var ran = ran_of(st)
+            var nr = if st.plan > ran { st.plan - ran } else { 0 }
+            never_ran = tally_bump(never_ran, st.phase, nr)
+            dead = [..dead, Finding { phase = st.phase; writer = st.writer; label = st.last_begin; reason = "" }]
+        }
+        w = w + 1
+    }
+    RunSummary {
+        run = run_of(recs)
+        passed = passed
+        failed = failed
+        skipped = skipped
+        never_ran = never_ran
+        fails = collect_findings(recs, KIND_FAIL)
+        skips = collect_findings(recs, KIND_SKIP)
+        dead = dead
+        cov = cov
+        cov_missing = cov_missing
+    }
+}
+
+pub fn with_coverage(s: RunSummary, cov: CovTriple, cov_missing: u64): RunSummary {
+    RunSummary {
+        run = s.run
+        passed = s.passed
+        failed = s.failed
+        skipped = s.skipped
+        never_ran = s.never_ran
+        fails = s.fails
+        skips = s.skips
+        dead = s.dead
+        cov = cov
+        cov_missing = cov_missing
+    }
+}
+
+fn render_tally_line(label: str, p: u64, f: u64, s: u64, n: u64): str {
+    $"teko:   {label}  {p} passed  {f} failed  {s} skipped  {n} never-ran\n"
+}
+
+fn render_finding_line(f: Finding): str {
+    if f.reason.len == 0 { return $"teko:     {f.phase}  {f.writer}  {f.label}\n" }
+    $"teko:     {f.phase}  {f.writer}  {f.label}: {f.reason}\n"
+}
+
+fn render_findings(fs: []Finding): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= fs.len { break }
+        out = out ~ render_finding_line(fs[i])
+        i = i + 1
+    }
+    out
+}
+
+fn cov_metric_pct(cov: u64, val: u64): u64 { if val == 0 { 100 } else { cov * 100 / val } }
+
+fn render_coverage_line(cov: CovTriple, missing: u64): str {
+    var out = $"teko:   COVERAGE ({missing} missing):\n"
+    out = out ~ $"teko:     functions  {cov_metric_pct(cov.functions_cov, cov.functions_val)}% ({cov.functions_cov}/{cov.functions_val})\n"
+    out = out ~ $"teko:     lines      {cov_metric_pct(cov.lines_cov, cov.lines_val)}% ({cov.lines_cov}/{cov.lines_val})\n"
+    out = out ~ $"teko:     branches   {cov_metric_pct(cov.branches_cov, cov.branches_val)}% ({cov.branches_cov}/{cov.branches_val})\n"
+    out
+}
+
+fn run_is_green(s: RunSummary): bool {
+    if s.failed.total > 0 { return false }
+    if s.never_ran.total > 0 { return false }
+    s.dead.len == 0
+}
+
+fn render_closing_line(s: RunSummary): str {
+    var word = if run_is_green(s) { "PASSED" } else { "FAILED" }
+    $"teko: ===== {s.failed.total} failed, {s.skipped.total} skipped — run {word} =====\n"
+}
+
+pub fn render_summary(s: RunSummary): str {
+    if s.run.len == 0 { return "teko: ===== summary — no records — run produced nothing =====\n" }
+    var out = $"teko: ===== summary (run {s.run}) =====\n"
+    out = out ~ render_tally_line("unit      ", s.passed.unit, s.failed.unit, s.skipped.unit, s.never_ran.unit)
+    out = out ~ render_tally_line("regression", s.passed.regression, s.failed.regression, s.skipped.regression, s.never_ran.regression)
+    out = out ~ render_tally_line("TOTAL     ", s.passed.total, s.failed.total, s.skipped.total, s.never_ran.total)
+    if s.fails.len > 0 {
+        out = out ~ "teko:\n" ~ $"teko:   FAILED ({s.fails.len}):\n" ~ render_findings(s.fails)
+    }
+    if s.skips.len > 0 {
+        out = out ~ "teko:\n" ~ $"teko:   SKIPPED ({s.skips.len}) — SKIPPED IS FAILURE IN THIS PROJECT'S OWN CI:\n" ~ render_findings(s.skips)
+    }
+    if s.dead.len > 0 {
+        out = out ~ "teko:\n" ~ $"teko:   DEAD ({s.dead.len}) — writer ended with no terminal record:\n" ~ render_findings(s.dead)
+    }
+    out = out ~ "teko:\n" ~ render_coverage_line(s.cov, s.cov_missing)
+    out ~ render_closing_line(s)
+}

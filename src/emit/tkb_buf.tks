@@ -1,81 +1,104 @@
-// src/emit/tkb_buf.tks  (namespace 'teko::emit')
 
-// extract the low 8 bits as a byte.
-fn lo8(x: u32) -> byte { (x & 0xFF) to byte }
+fn lo8(x: u32): byte { (x & 0xFF) to byte }
 
-fn write_u8(buf: []byte, x: byte) -> []byte { teko::list::push(buf, x) }
+type Wb = struct { data: []byte; len: u64 }
 
-fn write_u32(buf: []byte, x: u32) -> []byte {
-    mut b = buf
-    b = teko::list::push(b, lo8(x))
-    b = teko::list::push(b, lo8(x >> 8))
-    b = teko::list::push(b, lo8(x >> 16))
-    b = teko::list::push(b, lo8(x >> 24))
+fn wb_new(): Wb { Wb { data = []; len = 0 } }
+
+fn wb_grow(b: Wb, need: u64): Wb {
+    if b.len + need <= b.data.len { return b }
+    var cap = if b.data.len == 0 { 256 } else { b.data.len }
+    loop { if cap >= b.len + need { break }; cap = cap * 2 }
+    var nd: [cap]byte = []
+    var i: u64 = 0
+    loop { if i >= b.len { break }; nd[i] = b.data[i]; i++ }
+    Wb { data = nd; len = b.len }
+}
+
+fn wb_flat(b: Wb): []byte {
+    var out: [b.len]byte = []
+    var i: u64 = 0
+    loop { if i >= b.len { break }; out[i] = b.data[i]; i++ }
+    out
+}
+
+fn write_u8(buf: Wb, x: byte): Wb {
+    var b = wb_grow(buf, 1)
+    b.data[b.len] = x
+    Wb { data = b.data; len = b.len + 1 }
+}
+
+fn wb_append(buf: Wb, src: []byte): Wb {
+    var b = wb_grow(buf, src.len)
+    var i: u64 = 0
+    loop { if i >= src.len { break }; b.data[b.len + i] = src[i]; i++ }
+    Wb { data = b.data; len = b.len + src.len }
+}
+
+fn write_u32(buf: Wb, x: u32): Wb {
+    var b = write_u8(buf, lo8(x))
+    b = write_u8(b, lo8(x >> 8))
+    b = write_u8(b, lo8(x >> 16))
+    b = write_u8(b, lo8(x >> 24))
     b
 }
 
-// a u64 as low u32 then high u32 — the exact inverse of read_u64 (lo | hi<<32).
-fn write_u64(buf: []byte, x: u64) -> []byte {
-    mut b = write_u32(buf, (x & 0xFFFFFFFF) to u32)
+fn write_u64(buf: Wb, x: u64): Wb {
+    var b = write_u32(buf, (x & 0xFFFFFFFF) to u32)
     b = write_u32(b, (x >> 32) to u32)
     b
 }
 
-// an i64 as 8 LE bytes. codec i64s are non-negative (TNumber magnitudes), so the value conversion is exact.
-fn write_i64(buf: []byte, x: i64) -> []byte {
-    mut b = buf
-    mut bits = x to u64   // codec i64s are non-negative (TNumber magnitudes), so the value conversion is exact
-    mut k = 0
+fn write_i64(buf: Wb, x: i64): Wb {
+    var b = buf
+    var bits = x to u64
+    var k = 0
     loop {
         if k >= 8 { break }
-        b = teko::list::push(b, lo8((bits & 0xFF) to u32))
+        b = write_u8(b, lo8((bits & 0xFF) to u32))
         bits = bits >> 8
         k++
     }
     b
 }
 
-// a length-prefixed byte run (used by the string table).
-fn write_bytes(buf: []byte, s: str) -> []byte {
-    mut b = write_u32(buf, s.len to u32)
-    mut i = 0
+fn write_bytes(buf: Wb, s: str): Wb {
+    var b = write_u32(buf, s.len to u32)
+    var i = 0
     loop {
         if i >= s.len { break }
-        b = teko::list::push(b, s[i])
+        b = write_u8(b, s[i])
         i++
     }
     b
 }
 
-// --- the string table: dedup; nodes reference strings by u32 index ---
 
 type StrTable = struct { strings: []str }
 type Interned = struct { table: StrTable; index: u32 }
 
-fn st_empty() -> StrTable { StrTable { strings = teko::list::empty() } }
+fn st_empty(): StrTable { StrTable { strings = [] } }
 
-fn st_find(t: StrTable, s: str) -> u32 {
-    mut i = 0
+fn st_find(t: StrTable, s: str): u32 {
+    var i = 0
     loop {
         if i >= t.strings.len { break }
         if t.strings[i] == s { return i to u32 }
         i++
     }
-    0xFFFFFFFF   // sentinel: not found
+    0xFFFFFFFF
 }
 
-// intern s → its index, adding it if new (dedup = exact round-trip + compact).
-fn st_intern(t: StrTable, s: str) -> Interned {
-    let found = st_find(t, s)
+fn st_intern(t: StrTable, s: str): Interned {
+    var found = st_find(t, s)
     if found != 0xFFFFFFFF { return Interned { table = t; index = found } }
-    let idx = t.strings.len to u32
-    Interned { table = StrTable { strings = teko::list::push(t.strings, s) }; index = idx }
+    var idx = t.strings.len to u32
+    Interned { table = StrTable { strings = [..t.strings, s] }; index = idx }
 }
 
-// serialize the whole string table into the buffer (count, then each string).
-fn write_strtable(buf: []byte, t: StrTable) -> []byte {
-    mut b = write_u32(buf, t.strings.len to u32)
-    mut i = 0
+fn write_strtable(buf: Wb, t: StrTable): Wb {
+    var b = write_u32(buf, t.strings.len to u32)
+    var i = 0
     loop {
         if i >= t.strings.len { break }
         b = write_bytes(b, t.strings[i])
@@ -84,18 +107,14 @@ fn write_strtable(buf: []byte, t: StrTable) -> []byte {
     b
 }
 
-// --- FNV-1a (alteration detection; keyed signing is evolution) ---
 
-// FNV-1a over data[start..]. The C twin (tk_fnv1a) takes a byte POINTER + length and the caller
-// offsets the pointer (data + 16); Teko has no pointer arithmetic, so this takes a START index
-// into the whole []byte instead (start = 0 hashes the whole buffer). Semantically equivalent.
-fn fnv1a(data: []byte, start: u64) -> u64 {
-    mut h: u64 = 0xCBF29CE484222325   // offset basis (u64 — the FNV hash width)
-    mut i = start
+fn fnv1a(data: []byte, start: u64): u64 {
+    var h: u64 = 0xCBF29CE484222325
+    var i = start
     loop {
         if i >= data.len { break }
-        h = h ^ (data[i] to u64)   // data[i] is a byte; byte→u64 widening
-        h = h * 0x100000001B3   // FNV prime
+        h = h ^ (data[i] to u64)
+        h = h * 0x100000001B3
         i++
     }
     h

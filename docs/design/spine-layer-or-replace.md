@@ -124,7 +124,7 @@ The product lattice is `pt × bf × us`, height ≤ 3 per axis ⇒ **finite, fix
 
 ### Where the fixpoint runs, the join, and termination
 
-- **Where:** a new `pub fn fn_spine(f: TFunction) -> Spine` beside `fn_escaping_vars` (`escape.tks:323`),
+- **Where:** a new `pub fn fn_spine(f: TFunction): Spine` beside `fn_escaping_vars` (`escape.tks:323`),
   reading the same `f.body`. It runs a **per-function** worklist fixpoint over the finite cell universe
   of `f` (its bindings + one-hop field paths + `Reference` params). It does **not** touch `mark_*`.
 - **The join** is the componentwise product-lattice join above (union for `pt`, `none < param(i)/local < ⊤`
@@ -283,8 +283,7 @@ Precisely:
   codegen branch.
 
 **Therefore the BUILD (#331) requires the FULL shared-checker discipline:** full gate (C + self-host +
-native) + FIXPOINT (gen1==gen2 byte-identical) + `diff_vm_native` (`scripts/diff_vm_native.sh`,
-VM==native on every regression) + **independent review**. The build is **NOT** trivially additive —
+native) + FIXPOINT (gen1==gen2 byte-identical) + **native regression validation** + **independent review**. The build is **NOT** trivially additive —
 the query is additive, but the gate relaxations it enables are shared-checker-touching. This recon
 records that requirement so #331 inherits it (issue #330 §5 "the downstream build is NOT additive").
 
@@ -294,7 +293,7 @@ records that requirement so #331 inherits it (issue #330 §5 "the downstream bui
 
 Under `examples/regressions/`, following the `examples/regressions/mem_free/` pattern
 (`mem_free.tkp` with `name`/`source`/`[artifact] kind = "binary"`; a `main.tks`; a `src/<mod>/work.tks`;
-exit code is the observable, VM==native asserted by `scripts/diff_vm_native.sh`). Each is named with the
+exit code is the observable, validated natively). Each is named with the
 gate it exercises:
 
 1. **`stored_borrow_outlives_referent`** (MUST STAY REJECTED — the counter-example).
@@ -307,7 +306,7 @@ gate it exercises:
 
 2. **`stored_borrow_sound`** (MUST BE ACCEPTED — the positive case the spine unlocks).
    A `Ref` bound to / stored under a unique, frame-local, one-hop container whose referent is a
-   parameter that provably outlives it. Expected: **compiles**, runs, VM exit == native exit == a fixed
+   parameter that provably outlives it. Expected: **compiles**, runs, native exit == a fixed
    sentinel (e.g. reads through the borrow and returns a known sum, mirroring the `mem_free` exit-code
    pattern). This proves the spine actually relaxed `typer.tks:2450/2512` for the sound shape.
 
@@ -326,7 +325,7 @@ gate it exercises:
    Guards that the blanket collection/variant gates were **not** touched by the BUILD.
 
 Fixtures 1, 3, 4, 5 are **compile-reject** fixtures (the observable is "build fails with the named
-diagnostic"); fixture 2 is a **run** fixture (VM exit == native exit == sentinel). All follow the
+diagnostic"); fixture 2 is a **run** fixture (native exit == sentinel). All follow the
 `mem_free` project layout.
 
 ---

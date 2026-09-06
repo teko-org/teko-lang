@@ -1,0 +1,194 @@
+use teko::crypto
+use teko::encoding::base64
+use teko::encoding::xml
+use teko::numeric::bigint
+
+fn require_key_matches_alg(alg: SignatureAlg, kind: SigningKeyKind): crypto::CryptoError | null {
+    match alg {
+        RsaSha256 => if kind == SigningKeyKind::RsaPrivate { null } else { crypto::crypto_error("xmldsig: rsa-sha256 requires an RSA private key") }
+        EcdsaSha256 => if kind == SigningKeyKind::EcdsaPrivate { null } else { crypto::crypto_error("xmldsig: ecdsa-sha256 requires an EC P-256 private scalar") }
+        HmacSha256 => if kind == SigningKeyKind::HmacSecret { null } else { crypto::crypto_error("xmldsig: hmac-sha256 requires a shared secret") }
+    }
+}
+
+fn sign_ecdsa(scalar: bigint::BigInt, message: []byte): crypto::P256Signature | crypto::CryptoError {
+    var attempt: u64 = 0
+    loop {
+        if attempt >= 16 {
+            return crypto::crypto_error("xmldsig: ECDSA signing failed to derive a valid nonce")
+        }
+        var k = bigint::from_bytes_be(crypto::secure_bytes(32))
+        match crypto::ecdsa_p256_sign(scalar, crypto::EcHashAlg::Sha256, message, k) {
+            crypto::P256Signature as sig => return sig
+            crypto::CryptoError => attempt = attempt + 1
+        }
+    }
+    crypto::crypto_error("xmldsig: ECDSA signing unreachable")
+}
+
+fn p256_sig_to_bytes(sig: crypto::P256Signature): []byte | crypto::CryptoError {
+    var r_bytes = match bigint::to_bytes_be_padded(sig.r, 32) {
+        []byte as b => b
+        error => return crypto::crypto_error("xmldsig: ECDSA signature 'r' does not fit 32 bytes")
+    }
+    var s_bytes = match bigint::to_bytes_be_padded(sig.s, 32) {
+        []byte as b => b
+        error => return crypto::crypto_error("xmldsig: ECDSA signature 's' does not fit 32 bytes")
+    }
+    xmldsig_bytes_concat(r_bytes, s_bytes)
+}
+
+fn sign_raw(alg: SignatureAlg, key: SigningKey, message: []byte): []byte | crypto::CryptoError {
+    match alg {
+        RsaSha256 => crypto::rsa_sign_pkcs1v15(key.rsa_key, crypto::RsaHashAlg::Sha256, message)
+        HmacSha256 => crypto::hmac_sha256_of(key.hmac_secret, message)
+        EcdsaSha256 => {
+            var sig = match sign_ecdsa(key.ec_scalar, message) {
+                crypto::P256Signature as s => s
+                crypto::CryptoError as e => return e
+            }
+            p256_sig_to_bytes(sig)
+        }
+    }
+}
+
+fn build_reference(uri: str, transforms: []xml::XmlNode, digest_alg: DigestAlg, digest_value: str): xml::XmlNode {
+    var children: [3]xml::XmlNode = []
+    var count: u64 = 0
+    if transforms.len > 0 {
+        children[count] = xmldsig_element("Transforms", [], transforms)
+        count++
+    }
+    children[count] = xmldsig_element("DigestMethod", xmldsig_one_attr(xmldsig_attr("Algorithm", digest_alg_uri(digest_alg))), [])
+    count++
+    children[count] = xmldsig_element("DigestValue", [], xmldsig_one_node(xml::text_node(digest_value)))
+    count++
+    xmldsig_element("Reference", xmldsig_one_attr(xmldsig_attr("URI", uri)), teko::collections::arr_slice(children, 0, count))
+}
+
+fn build_reference_enveloped(digest_alg: DigestAlg, digest_value: str): xml::XmlNode {
+    var transform = xmldsig_element("Transform", xmldsig_one_attr(xmldsig_attr("Algorithm", enveloped_signature_transform_uri())), [])
+    build_reference("", xmldsig_one_node(transform), digest_alg, digest_value)
+}
+
+fn build_signed_info(sig_alg: SignatureAlg, references: []xml::XmlNode): xml::XmlNode {
+    var children: [2 + references.len]xml::XmlNode = []
+    children[0] = xmldsig_element("CanonicalizationMethod", xmldsig_one_attr(xmldsig_attr("Algorithm", c14n_algorithm_uri())), [])
+    children[1] = xmldsig_element("SignatureMethod", xmldsig_one_attr(xmldsig_attr("Algorithm", signature_alg_uri(sig_alg))), [])
+    var i: u64 = 0
+    loop {
+        if i >= references.len { break }
+        children[2 + i] = references[i]
+        i++
+    }
+    xmldsig_element("SignedInfo", [], children)
+}
+
+fn build_signature(signed_info: xml::XmlNode, signature_value_b64: str, key_info: xml::XmlNode | null, object_node: xml::XmlNode | null): xml::XmlNode {
+    var attrs = xmldsig_one_attr(xmldsig_xmlns_attr("", xmldsig_namespace_uri()))
+    var children: [4]xml::XmlNode = []
+    var count: u64 = 0
+    children[count] = signed_info
+    count++
+    children[count] = xmldsig_element("SignatureValue", [], xmldsig_one_node(xml::text_node(signature_value_b64)))
+    count++
+    match key_info {
+        xml::XmlNode as ki => {
+            children[count] = ki
+            count++
+        }
+        null => { }
+    }
+    match object_node {
+        xml::XmlNode as obj => {
+            children[count] = obj
+            count++
+        }
+        null => { }
+    }
+    xmldsig_element("Signature", attrs, teko::collections::arr_slice(children, 0, count))
+}
+
+fn canonical_signed_info_bytes(signed_info: xml::XmlNode, key_info: xml::XmlNode | null, object_node: xml::XmlNode | null): []byte | crypto::CryptoError {
+    var placeholder = build_signature(signed_info, "", key_info, object_node)
+    var canonical = match find_element_with_inlined_namespaces(placeholder, "SignedInfo", ns_scope_root()) {
+        xml::XmlNode as n => n
+        null => return crypto::crypto_error("xmldsig_sign: internal error building SignedInfo")
+    }
+    xml::canonicalize(canonical).bytes()
+}
+
+/**
+ * Signs `document` with an ENVELOPED signature (XML-DSig Core §4.4, `URI=""` with the
+ * `...#enveloped-signature` transform): digests the whole document, builds and signs `SignedInfo`
+ * over it, and appends the finished `Signature` as the document's last child.
+ */
+exp fn xmldsig_sign_enveloped(document: xml::XmlNode, sig_alg: SignatureAlg, digest_alg: DigestAlg, key: SigningKey, key_info: xml::XmlNode | null): xml::XmlNode | crypto::CryptoError {
+    match require_key_matches_alg(sig_alg, key.kind) {
+        null => { }
+        crypto::CryptoError as e => return e
+    }
+    var digest_value = base64::encode_standard(digest_node(digest_alg, document))
+    var reference = build_reference_enveloped(digest_alg, digest_value)
+    var signed_info = build_signed_info(sig_alg, xmldsig_one_node(reference))
+    var signing_bytes = match canonical_signed_info_bytes(signed_info, key_info, null) {
+        []byte as b => b
+        crypto::CryptoError as e => return e
+    }
+    var raw_sig = match sign_raw(sig_alg, key, signing_bytes) {
+        []byte as s => s
+        crypto::CryptoError as e => return e
+    }
+    var signature = build_signature(signed_info, base64::encode_standard(raw_sig), key_info, null)
+    xmldsig_append_child(document, signature)
+}
+
+/**
+ * Signs `node` with a DETACHED signature (XML-DSig Core §4.4): the `Signature` travels apart
+ * from `node`, referencing it via a caller-chosen `reference_uri` (an external URI, or `""` when
+ * the caller's own convention identifies the target another way) with no transform. Returns the
+ * standalone `<Signature>` element only — never embeds it into `node`.
+ */
+exp fn xmldsig_sign_detached(node: xml::XmlNode, reference_uri: str, sig_alg: SignatureAlg, digest_alg: DigestAlg, key: SigningKey, key_info: xml::XmlNode | null): xml::XmlNode | crypto::CryptoError {
+    match require_key_matches_alg(sig_alg, key.kind) {
+        null => { }
+        crypto::CryptoError as e => return e
+    }
+    var digest_value = base64::encode_standard(digest_node(digest_alg, node))
+    var reference = build_reference(reference_uri, [], digest_alg, digest_value)
+    var signed_info = build_signed_info(sig_alg, xmldsig_one_node(reference))
+    var signing_bytes = match canonical_signed_info_bytes(signed_info, key_info, null) {
+        []byte as b => b
+        crypto::CryptoError as e => return e
+    }
+    var raw_sig = match sign_raw(sig_alg, key, signing_bytes) {
+        []byte as s => s
+        crypto::CryptoError as e => return e
+    }
+    build_signature(signed_info, base64::encode_standard(raw_sig), key_info, null)
+}
+
+/**
+ * Signs `data` with an ENVELOPING signature (XML-DSig Core §4.4): wraps `data` in
+ * `<Object Id="object_id">`, embeds that `Object` as a child of `Signature`, and references it
+ * via `URI="#object_id"` with no transform.
+ */
+exp fn xmldsig_sign_enveloping(object_id: str, data: xml::XmlNode, sig_alg: SignatureAlg, digest_alg: DigestAlg, key: SigningKey, key_info: xml::XmlNode | null): xml::XmlNode | crypto::CryptoError {
+    match require_key_matches_alg(sig_alg, key.kind) {
+        null => { }
+        crypto::CryptoError as e => return e
+    }
+    var object_node = xmldsig_element("Object", xmldsig_one_attr(xmldsig_attr("Id", object_id)), xmldsig_one_node(data))
+    var digest_value = base64::encode_standard(digest_node(digest_alg, object_node))
+    var reference = build_reference(concat("#", object_id), [], digest_alg, digest_value)
+    var signed_info = build_signed_info(sig_alg, xmldsig_one_node(reference))
+    var signing_bytes = match canonical_signed_info_bytes(signed_info, key_info, object_node) {
+        []byte as b => b
+        crypto::CryptoError as e => return e
+    }
+    var raw_sig = match sign_raw(sig_alg, key, signing_bytes) {
+        []byte as s => s
+        crypto::CryptoError as e => return e
+    }
+    build_signature(signed_info, base64::encode_standard(raw_sig), key_info, object_node)
+}

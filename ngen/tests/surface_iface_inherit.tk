@@ -1,0 +1,146 @@
+// surface_iface_inherit.tk -- interface INHERITANCE, C#'s `interface I2 : I1`
+// (§50 I1, docs/design/plano-ngen-entrega4.md): `I2`'s own conformance set
+// carries `I1` too, flattened rather than followed at dispatch time (decision
+// 15), so a class that names only `I2` in its own `:` list still owes every
+// method `I1` declares, still answers `I1 x = <the I2 value>`, and still
+// answers `.` called straight on the `I2`-typed value (`tk_ifmeth_find_deep`).
+//
+// `I1`'s own `area` is a DEFAULT BODY (D223) `Sq` never redeclares -- proof
+// that the default reaches the class through `I1`'s OWN itab entry, an entry
+// the class earns only because it extends `I2`. `unit` is `static abstract`
+// (C# 11): `Sq.unit()` answers it directly, unaffected by which interface's
+// `:` list happened to name it.
+//
+// `I1.Value` is an inherited PROPERTY (item 2 of this crumb's own §55 -- the
+// ressalva `tk_ifmeth_find_deep` left open): `tk_ifprop_find_deep` walks the
+// same closure for a property, so `i2.Value`'s getter AND setter reach `I1`'s
+// itab entry through an `I2`-typed value, a PASS-deferred parameter
+// (`bump_via_i2`) and `I2`'s own default body (`doubled`) all resolve it.
+//
+// `IC : IA, IB`, both declaring `m()` at the same signature, is the diamond
+// C# accepts: `Box` implements `m` once, and the itab entries of `IA`, `IB`
+// AND `IC` (which declares nothing of its own) all point at the same symbol.
+//
+// `Animal`/`Dog` (D226 compat crumb, item 1): `Animal an = d;` proves the
+// implicit reference conversion the new assignment-compatibility check
+// accepts on top of `I2 i2 = q;`/`IA a = bx;` above -- a DERIVED class into a
+// BASE-typed slot, not just a class into an interface it implements.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+interface I1 {
+    i64 side();
+
+    i64 Value { get; set; }
+
+    i64 area() {
+        return this.side() * this.side();
+    }
+
+    static abstract i64 unit();
+}
+
+interface I2 : I1 {
+    i64 tag();
+
+    i64 doubled() {
+        return Value * 2;
+    }
+}
+
+class Sq : I2 {
+    public i64 w;
+    public i64 Value { get; set; }
+
+    public i64 side() {
+        return w;
+    }
+
+    public i64 tag() {
+        return 7;
+    }
+
+    public static i64 unit() {
+        return 5;
+    }
+}
+
+i64 bump_via_i2(I2 v) {
+    v.Value = v.Value + 5;
+    return v.Value;
+}
+
+interface IA {
+    i64 m();
+}
+
+interface IB {
+    i64 m();
+}
+
+interface IC : IA, IB {
+}
+
+class Box : IC {
+    public i64 v;
+
+    public i64 m() {
+        return v * 2;
+    }
+}
+
+class Animal {
+    public i64 legs;
+
+    public i64 legs_count() {
+        return legs;
+    }
+}
+
+class Dog : Animal {
+    public i64 bark_count;
+}
+
+i64 checks() {
+    Sq q = new Sq;
+    q.w = 3;
+    I2 i2 = q;
+    if (i2.tag() != 7) return 1;
+    if (i2.area() != 9) return 2;                // I1's default, reached through an I2-typed value
+    I1 x = q;
+    if (x.area() != 9) return 3;                 // the same default, through I1 directly
+    if (Sq.unit() != 5) return 4;                // static abstract, inherited from I1
+
+    q.Value = 10;
+    if (i2.Value != 10) return 9;                // I1's inherited getter, through an I2-typed value
+    i2.Value = 20;
+    if (q.Value != 20) return 10;                // I1's inherited setter, through an I2-typed value
+    if (i2.doubled() != 40) return 11;           // I2's own default body reading I1's property
+    if (bump_via_i2(i2) != 25) return 12;        // a PASS-deferred I2 parameter, get and set
+
+    Box bx = new Box;
+    bx.v = 4;
+    IA a = bx;
+    IB b = bx;
+    IC c = bx;
+    if (a.m() != 8) return 5;
+    if (b.m() != 8) return 6;
+    if (c.m() != 8) return 7;                    // IC declares nothing of its own; `m` reached via IA
+
+    Dog d = new Dog;
+    d.legs = 4;
+    Animal an = d;                                // derived -> base (D226 compat crumb)
+    if (an.legs_count() != 4) return 13;
+
+    return 0;
+}
+
+i64 main() {
+    i64 floor = rt_live();
+    i64 bad = checks();
+    if (bad != 0) return bad;
+    if (rt_live() != floor) return 8;
+    return 42;
+}

@@ -1,30 +1,154 @@
-// src/assert/assert.tks   (namespace 'teko::assert')
-//
-// teko::assert — the testing-assertion namespace. INJECTED, non-shadowable, under the
-// reserved `teko::` root (like teko::print) — referenced by absolute path, no `use`.
-//
-// WHY A PAIR (M.3 — honesty). This is the canonical Teko ORIGINAL; the C SEED realizes
-// the same symbols in src/runtime/teko_rt.c (teko__assert__is_true / _is_false /
-// _str_contains) so generated programs link them TODAY. The seed pairing exists because
-// the self-hosted compiler does not yet compile this file — same contract as main.tks.
-// The generic CALL lowering already emits `teko__assert__<name>(...)`, so the seed needs
-// no codegen change; the typer injects the signatures (src/checker/scope.c::tk_builtin_fn).
-//
-// FAIL LOUD (M.1). A false assertion is a PANIC, not a soft return; hard-fail in the seed
-// (soft-fail reporting is a later evolution per the roadmap).
-//
-// SEED SUBSET (NON-generic). The roadmap also proposes equals/not_equals/is_error/is_ok;
-// those need GENERICS or the result/error types and are NOT expressible in the seed yet —
-// DEFERRED honestly (M.3) until generics land.
+fn scenario_prefix_rt(): str { teko::runtime::scenario_prefix() }
 
+fn scenario_set_rt(name: str) { teko::runtime::scenario_set(name) }
+
+fn scenario_ok_rt() { teko::runtime::scenario_ok() }
+
+fn quoted(s: str): str { teko::str::concat("\"", s, "\"") }
+
+fn fail(what: str, detail: str) {
+    panic(teko::str::concat(scenario_prefix_rt(), "assertion failed: ", what, " — ", detail))
+}
+
+fn fail_bare(what: str) {
+    panic(teko::str::concat(scenario_prefix_rt(), "assertion failed: ", what))
+}
+
+fn fail_two_texts(what: str, relation: str, subject: str, got: str) {
+    fail(what, teko::str::concat("expected ", relation, " ", quoted(subject), ", got ", quoted(got)))
+}
+
+/** teko::assert::scenario_begin — name the case that follows. */
+exp fn scenario_begin(name: str) { scenario_set_rt(name) }
+
+/** teko::assert::scenario_ok — declare the named case passed.
+ * @throws when no scenario is named. */
+exp fn scenario_ok() { scenario_ok_rt() }
+
+/** teko::assert::is_true — the predicate must hold. */
 exp fn is_true(c: bool) {
-    if !c { panic("assertion failed: is_true") }
+    if !c { fail_bare("is_true") }
 }
 
+/** teko::assert::is_false — the predicate must not hold. */
 exp fn is_false(c: bool) {
-    if c { panic("assertion failed: is_false") }
+    if c { fail_bare("is_false") }
 }
 
+/** teko::assert::eq_i64 — signed integer equality. */
+exp fn eq_i64(got: i64, want: i64) {
+    if got != want { fail("eq_i64", $"expected {want}, got {got}") }
+}
+
+/** teko::assert::ne_i64 — signed integer difference. */
+exp fn ne_i64(got: i64, want: i64) {
+    if got == want { fail("ne_i64", $"expected anything but {want}, got {got}") }
+}
+
+/** teko::assert::lt_i64 — `got` must be strictly below `bound`. */
+exp fn lt_i64(got: i64, bound: i64) {
+    if got >= bound { fail("lt_i64", $"expected < {bound}, got {got}") }
+}
+
+/** teko::assert::le_i64 — `got` must not exceed `bound`. */
+exp fn le_i64(got: i64, bound: i64) {
+    if got > bound { fail("le_i64", $"expected <= {bound}, got {got}") }
+}
+
+/** teko::assert::gt_i64 — `got` must be strictly above `bound`. */
+exp fn gt_i64(got: i64, bound: i64) {
+    if got <= bound { fail("gt_i64", $"expected > {bound}, got {got}") }
+}
+
+/** teko::assert::ge_i64 — `got` must be at least `bound`. */
+exp fn ge_i64(got: i64, bound: i64) {
+    if got < bound { fail("ge_i64", $"expected >= {bound}, got {got}") }
+}
+
+/** teko::assert::eq_u64 — unsigned integer equality. */
+exp fn eq_u64(got: u64, want: u64) {
+    if got != want { fail("eq_u64", $"expected {want}, got {got}") }
+}
+
+/** teko::assert::eq_f64 — float equality within an absolute tolerance `tol`. */
+exp fn eq_f64(got: f64, want: f64, tol: f64) {
+    var diff = if got < want { want - got } else { got - want }
+    if diff > tol { fail("eq_f64", $"expected {want} within {tol}, got {got}") }
+}
+
+/** teko::assert::eq_str — byte equality of two strings. */
+exp fn eq_str(got: str, want: str) {
+    if got != want { fail(
+            "eq_str", teko::str::concat("expected ", quoted(want), ", got ", quoted(got))) }
+}
+
+/** teko::assert::ne_str — byte difference of two strings. */
+exp fn ne_str(got: str, want: str) {
+    if got == want { fail_two_texts("ne_str", "anything but", want, got) }
+}
+
+/** teko::assert::str_contains — `needle` must appear in `hay`. */
 exp fn str_contains(hay: str, needle: str) {
-    if !teko::str::contains(hay, needle) { panic("assertion failed: str_contains") }   // function call (method typing is deferred — B.29)
+    if !hay.contains(needle) { fail_two_texts("str_contains", "to contain", needle, hay) }
+}
+
+/** teko::assert::str_absent — `needle` must not appear in `hay`. */
+exp fn str_absent(hay: str, needle: str) {
+    if hay.contains(needle) { fail_two_texts("str_absent", "NOT to contain", needle, hay) }
+}
+
+/** teko::assert::str_starts_with — `hay` must open with `prefix`. */
+exp fn str_starts_with(hay: str, prefix: str) {
+    if prefix.len > hay.len { fail_two_texts("str_starts_with", "to start with", prefix, hay) }
+    if hay.slice_to(prefix.len) != prefix { fail_two_texts("str_starts_with", "to start with", prefix, hay) }
+}
+
+/** teko::assert::str_ends_with — `hay` must close with `suffix`. */
+exp fn str_ends_with(hay: str, suffix: str) {
+    if !hay.ends_with(suffix) { fail_two_texts("str_ends_with", "to end with", suffix, hay) }
+}
+
+/** teko::assert::len_eq — the length assertion for any sequence: pass `xs.len`. */
+exp fn len_eq(got: u64, want: u64) {
+    if got != want { fail("len_eq", $"expected length {want}, got {got}") }
+}
+
+/** teko::assert::bytes_eq — element-wise equality of two `[]byte`; reports the first differing
+ * index. */
+exp fn bytes_eq(got: []byte, want: []byte) {
+    if got.len != want.len { fail("bytes_eq", $"expected {want.len} bytes, got {got.len}") }
+    var i: u64 = 0
+    loop {
+        if i >= got.len { break }
+        if got[i] != want[i] {
+            var w = want[i] to u64
+            var g = got[i] to u64
+            fail("bytes_eq", $"expected byte {w} at index {i}, got {g}")
+        }
+        i = i + 1
+    }
+}
+
+/** teko::assert::is_present — `what` (a `T | null`'s narrowed member) must be present.
+ * @param present whether the caller's `match` reached the non-null arm. */
+exp fn is_present(what: str, present: bool) {
+    if !present { fail("is_present", teko::str::concat("expected ", what, " to be present, got null")) }
+}
+
+/** teko::assert::is_absent — `what` (a `T | null`) must be null.
+ * @param present whether the caller's `match` reached the non-null arm. */
+exp fn is_absent(what: str, present: bool) {
+    if present { fail("is_absent", teko::str::concat("expected ", what, " to be null, got a present value")) }
+}
+
+/** teko::assert::is_ok — `what` (a `T | error`) must have yielded its value member.
+ * @param ok whether the caller's `match` reached the value arm. */
+exp fn is_ok(what: str, ok: bool) {
+    if !ok { fail("is_ok", teko::str::concat("expected ", what, " to succeed, got the error member")) }
+}
+
+/** teko::assert::is_error — `what` (a `T | error`) must have yielded its error member.
+ * @param ok whether the caller's `match` reached the value arm. */
+exp fn is_error(what: str, ok: bool) {
+    if ok { fail("is_error", teko::str::concat("expected ", what, " to yield its error member, got a value")) }
 }

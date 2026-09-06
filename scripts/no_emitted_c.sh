@@ -24,16 +24,24 @@
 #   Env: TEKO_EMITTED_C_BASELINE — override the baseline (newline-separated paths, "" = expect none).
 #
 # THE BASELINE, AND WHY IT IS NOT YET EMPTY
-#   `docs/design/gate-sem-c-0.3.0.31.md` §2.3 measured the own/native backend against the compiler's
-#   own program: it honest-stops before lowering a single function, and stops on a five-line program
-#   that interpolates. The gate binary IS the compiler's program plus a test `main`, so porting the
-#   gate to the native route today would replace "a gate that emits C" with "no gate at all". Until
-#   that gap closes, these two emissions are the measured, declared truth — not an exemption.
+#   `bin/teko-tktest.c` SHRANK OUT of this baseline in 0.3.1.0 (tests-native-no-c): the gate binary
+#   (`run_native_gate`/`native_gate_build`, src/build/project.tks) now builds through the own-AOT
+#   backend (`emit_native`) — the SAME driver `TEKO_BACKEND=native` uses for a normal program — so no
+#   `.c` translation unit is written for the test program at all any more (`cc` still runs, but only
+#   as the LINKER, exactly as every native build already used it).
 #
-#     bin/teko-tktest.c    run_native_gate          (project.tks:2698) — every `teko test`/`teko build`
-#     bin/teko-regrcov.c   build_regression_cov_exe (project.tks:4353) — the self-test's regression tier
+#   `bin/teko-regrcov.c` remains, and is not an oversight: `docs/design/gate-sem-c-0.3.0.31.md` §2.3
+#   measured the own/native backend against the compiler's own program and it is not there yet, and
+#   separately `build_regression_cov_exe` needs the C emitter's `ProgramCov` coverage instrumentation
+#   (per-line/per-branch marks) to feed the regression tier's coverage — the native backend has no
+#   such instrumentation pass yet (the SAME gap `native_gate_build`'s own doc names for the test
+#   gate's floors). Until that lands, this ONE emission is the measured, declared truth — not an
+#   exemption.
 #
-#   `--per-test-cov` and `--analyzer` add their own (`bin/teko-tkanalyze.c`, the per-test scratch);
+#     bin/teko-regrcov.c   build_regression_cov_exe (src/build/project.tks) — the self-test's regression tier
+#
+#   `--per-test-cov` and `--analyzer` add their own (`bin/teko-tkanalyze.c`, the per-test scratch) —
+#   both STILL C-only paths, untouched by 0.3.1.0 (dev-time/advisory surfaces, never wired into CI);
 #   pass TEKO_EMITTED_C_BASELINE when running the gate under those flags.
 set -eu
 
@@ -49,8 +57,7 @@ git ls-files '*.c' | LC_ALL=C sort > "$tracked"
 find . -name '*.c' -not -path './.git/*' | sed 's|^\./||' | LC_ALL=C sort > "$present"
 comm -13 "$tracked" "$present" > "$emitted"
 
-baseline_default='bin/teko-regrcov.c
-bin/teko-tktest.c'
+baseline_default='bin/teko-regrcov.c'
 baseline="${TEKO_EMITTED_C_BASELINE-$baseline_default}"
 
 expected="$(mktemp)"

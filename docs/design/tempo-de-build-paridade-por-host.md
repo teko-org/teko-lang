@@ -218,7 +218,7 @@ hoje — usá-lo seria comparar duas emulações distintas fingindo que são uma
 Este é um modelo, não um fato, e está aqui porque é FALSEÁVEL por UMA linha de log
 (§8.2) — quem tiver acesso à API confirma ou mata em dois minutos.
 
-`macos-arm64` = 123 s. Na corrida `28763999356` o `Test gate (VM)` do macOS — um
+`macos-arm64` = 123 s. Na corrida `28763999356` o `Test gate` do macOS — um
 self-build COMPLETO mais a execução de 863 `#test` — custou 75 s; um build
 `--no-verify` (sem o gate) fica bem abaixo disso. Se o macOS pagou os **3 builds** da
 escada fixada (§3), cada build sai a **~41 s**, e 3 × 41 = 123 s fecha exatamente.

@@ -1,93 +1,38 @@
 use teko::parser
 
-/**
- * Render a diagnostic's LOCATION and message as the one line the driver prints:
- * `file:line:col: msg`, with any part the caller does not know omitted (M.3 — show what we know,
- * never invent a position). W-loc-2.
- *
- * @param file  the source file the diagnostic belongs to ("" when unknown)
- * @param line  the 1-based line ( 0 when unknown)
- * @param col   the 1-based column (read only when `line` is known)
- * @param msg   the diagnostic's own text
- * @return      the located diagnostic line
- */
-fn diag_at(file: str, line: u32, col: u32, msg: str) -> str {
+fn diag_at(file: str, line: u32, col: u32, msg: str): str {
     if file != "" && line > 0 { return $"{file}:{line}:{col}: {msg}" }
     if file != "" { return $"{file}: {msg}" }
     if line > 0 { return $"{line}:{col}: {msg}" }
     msg
 }
 
-/**
- * Locate an already-built checker `error` at a declaration, yielding the diagnostic TEXT a
- * collecting pass records. The error's OWN line/col wins over the declaration's when it carries
- * one (C1-POS — an inner-expression position is more precise than the declaration's).
- *
- * A collecting pass records TEXT rather than the error value on purpose: a collected diagnostic
- * is never re-thrown, only printed, so the structured position/expected/actual a re-thrown error
- * would carry has no reader.
- *
- * @param file       the declaration's source file (W-loc-2)
- * @param decl_line  the declaration's line, used when the error carries none
- * @param decl_col   the declaration's column, used when the error carries none
- * @param inner      the checker error to locate
- * @return           the `file:line:col: text` diagnostic line
- * @since 0.3.1
- */
-fn located_diag(file: str, decl_line: u32, decl_col: u32, inner: error) -> str {
-    let line = if inner.line != 0 { inner.line } else { decl_line }
-    let col = if inner.line != 0 { inner.col } else { decl_col }
+fn located_diag(file: str, decl_line: u32, decl_col: u32, inner: error): str {
+    var line = if inner.line != 0 { inner.line } else { decl_line }
+    var col = if inner.line != 0 { inner.col } else { decl_col }
     diag_at(file, line, col, inner.message)
 }
 
-/**
- * `b`'s diagnostics appended to `a`'s, in order — the single way a collecting pass grows its
- * accumulator, so report order stays exactly the order the passes walked (source, then line, then
- * column, by construction: every walk visits `program.items` in sorted-path order and every
- * intra-item walk visits declaration order).
- *
- * @param a  the diagnostics collected first
- * @param b  the diagnostics to append
- * @return   the concatenation, `a` before `b`
- * @since 0.3.1
- */
-fn concat_diags(a: []str, b: []str) -> []str {
+fn concat_diags(a: []str, b: []str): []str {
     if b.len == 0 { return a }
     if a.len == 0 { return b }
-    mut out = a
-    mut i: u64 = 0
+    var out = a
+    var i: u64 = 0
     loop {
         if i >= b.len { break }
-        out = teko::list::push(out, b[i])
+        out = [..out, b[i]]
         i = i + 1
     }
     out
 }
 
-/**
- * The single-element diagnostic list a pass records when exactly one check failed — the common
- * case, spelled once so no call site has to build a list by hand.
- *
- * @param d  the diagnostic line
- * @return   a one-element list holding it
- * @since 0.3.1
- */
-fn one_diag(d: str) -> []str {
-    teko::list::push(teko::list::empty(), d)
+fn one_diag(d: str): []str {
+    [d]
 }
 
-/**
- * Render a collected diagnostic list as the newline-separated block the driver prints. Mirrors
- * `teko::build::join_diags`; duplicated rather than shared because the checker must not depend on
- * the build layer.
- *
- * @param diags  the collected diagnostics, in report order
- * @return       the diagnostics joined by newlines ("" for an empty list)
- * @since 0.3.1
- */
-pub fn join_checker_diags(diags: []str) -> str {
-    mut out = ""
-    mut i: u64 = 0
+pub fn join_checker_diags(diags: []str): str {
+    var out = ""
+    var i: u64 = 0
     loop {
         if i >= diags.len { break }
         if i > 0 { out = out ~ "\n" }
@@ -97,16 +42,117 @@ pub fn join_checker_diags(diags: []str) -> str {
     out
 }
 
-/**
- * The single `error` a collecting pass's `error`-shaped wrapper raises once it has collected
- * everything: one value whose message is EVERY diagnostic, newline-separated. Callers that still
- * speak `T | error` (the checker's own `#test` suite, `type_program`) keep their contract while
- * the pass underneath reports the whole build.
- *
- * @param diags  the collected diagnostics, in report order (must be non-empty)
- * @return       the joined error
- * @since 0.3.1
- */
-fn diags_error(diags: []str) -> error {
+fn diags_error(diags: []str): error {
     error { message = join_checker_diags(diags) }
+}
+
+pub type DiagLevel = enum { Error; Warning; Info; Hint }
+
+pub type Diagnostic = struct {
+    file: str
+    line: u32
+    col: u32
+    end_line: u32
+    end_col: u32
+    severity: DiagLevel
+    message: str
+}
+
+type DiagNum = struct {
+    value: u32
+    next: u64
+    ok: bool
+}
+
+fn diag_read_u32(s: str, from: u64): DiagNum {
+    var i = from
+    var n: u64 = 0
+    var any = false
+    loop {
+        if i >= s.len { break }
+        if s[i] < b'0' || s[i] > b'9' { break }
+        n = n * 10 + ((s[i] to u64) - (b'0' to u64))
+        any = true
+        i = i + 1
+    }
+    DiagNum { value = n to u32; next = i; ok = any }
+}
+
+fn has_diag_prefix(s: str, prefix: str): bool {
+    if s.len < prefix.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= prefix.len { break }
+        if s[i] != prefix[i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn matches_diag_file(diag: str, file: str): bool {
+    if file == "" { return false }
+    if diag.len <= file.len { return false }
+    if diag[file.len] != b':' { return false }
+    has_diag_prefix(diag, file)
+}
+
+fn file_prefix_of(diag: str, files: []str): str {
+    var i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        if matches_diag_file(diag, files[i]) { return files[i] }
+        i = i + 1
+    }
+    ""
+}
+
+fn strip_leading_diag_space(s: str): str {
+    if s.len > 0 && s[0] == b' ' { return s.slice_from(1) }
+    s
+}
+
+fn to_diagnostic(diag: str, files: []str, severity: DiagLevel): Diagnostic {
+    var file = file_prefix_of(diag, files)
+    if file == "" {
+        return Diagnostic { file = ""; line = 0; col = 0; end_line = 0; end_col = 0; severity = severity; message = diag }
+    }
+    var rest = diag.slice_from(file.len + 1)
+    var p1 = diag_read_u32(rest, 0)
+    if !p1.ok || p1.next >= rest.len || rest[p1.next] != b':' {
+        return Diagnostic { file = file; line = 0; col = 0; end_line = 0; end_col = 0; severity = severity; message = strip_leading_diag_space(rest) }
+    }
+    var p2 = diag_read_u32(rest, p1.next + 1)
+    if !p2.ok || p2.next >= rest.len || rest[p2.next] != b':' {
+        return Diagnostic { file = file; line = 0; col = 0; end_line = 0; end_col = 0; severity = severity; message = strip_leading_diag_space(rest) }
+    }
+    var j = p2.next + 1
+    if j < rest.len && rest[j] == b' ' { j = j + 1 }
+    var msg = rest.slice_from(j)
+    var line = p1.value
+    var col = p2.value
+    Diagnostic { file = file; line = line; col = col; end_line = line; end_col = col + 1; severity = severity; message = msg }
+}
+
+fn structure_diags(diags: []str, files: []str, severity: DiagLevel): []Diagnostic {
+    var out: []Diagnostic = []
+    var i: u64 = 0
+    loop {
+        if i >= diags.len { break }
+        out = [..out, to_diagnostic(diags[i], files, severity)]
+        i = i + 1
+    }
+    out
+}
+
+fn concat_structured_diags(a: []Diagnostic, b: []Diagnostic): []Diagnostic {
+    if b.len == 0 { return a }
+    if a.len == 0 { return b }
+    var out = a
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = [..out, b[i]]
+        i = i + 1
+    }
+    out
 }

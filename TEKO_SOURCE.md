@@ -162,7 +162,7 @@ type Lead = struct {
 // surrogates (U+D800..U+DFFF), and codepoints > U+10FFFF. The FIRST continuation
 // byte carries the tightest constraint; the rest are plain 0x80..0xBF. One
 // deterministic walk — no heuristic, no guessing (M.3).
-fn valid_utf8(s: []byte) -> bool {
+fn valid_utf8(s: []byte): bool {
     mut i = 0
     loop {
         if i >= s.len { break }
@@ -200,7 +200,7 @@ fn valid_utf8(s: []byte) -> bool {
 // raw bytes to a str (B.36 — a str MEANS valid UTF-8, so it IS). Zero-copy on
 // success (the str views the same bytes, re-typed). Teko never guesses an
 // encoding (M.3) — it validates the one codepage it declares (UTF-8).
-fn str_from_utf8(b: []byte) -> str | error {
+fn str_from_utf8(b: []byte): str | error {
     if !valid_utf8(b) { return error { message = "invalid UTF-8" } }
     str(b)                // []byte -> str: the validated newtype wrap [form TBD]
 }
@@ -436,29 +436,29 @@ type ByteVal = struct {
 // --- byte access ---
 
 // the byte at p, or 0 if out of bounds (a safe peek for look-ahead — maximal munch).
-fn at(source: str, p: u64) -> byte {
+fn at(source: str, p: u64): byte {
     if p >= source.len { return 0 }
     source[p]
 }
 
 // --- predicates (pure, over a single byte; ASCII syntax → byte literals) ---
 
-fn is_digit(c: byte) -> bool {
+fn is_digit(c: byte): bool {
     c >= b'0' && c <= b'9'
 }
 
-fn is_alpha(c: byte) -> bool {
+fn is_alpha(c: byte): bool {
     (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z')
 }
 
-fn is_ident_continue(c: byte) -> bool {
+fn is_ident_continue(c: byte): bool {
     is_alpha(c) || is_digit(c) || c == b'_'
 }
 
 // --- whitespace & comments (pure: take pos, return the new pos) ---
 
 // skip spaces/tabs/CR — NOT newlines (a newline is a significant token, B.26).
-fn skip_spaces(source: str, pos: u64) -> u64 {
+fn skip_spaces(source: str, pos: u64): u64 {
     mut p = pos
     loop {
         if p >= source.len { break }
@@ -470,7 +470,7 @@ fn skip_spaces(source: str, pos: u64) -> u64 {
 }
 
 // skip a `//` line comment: advance to the newline (or end), leaving it for the loop.
-fn skip_line(source: str, pos: u64) -> u64 {
+fn skip_line(source: str, pos: u64): u64 {
     mut p = pos
     loop {
         if p >= source.len { break }
@@ -481,7 +481,7 @@ fn skip_line(source: str, pos: u64) -> u64 {
 }
 
 // skip a block comment `/* … */` (not nested); returns the pos after the `*/`.
-fn skip_block_comment(source: str, pos: u64) -> u64 | error {
+fn skip_block_comment(source: str, pos: u64): u64 | error {
     mut p = pos + 2                       // past `/*`
     loop {
         if p + 1 >= source.len { return error { message = "unterminated block comment" } }
@@ -491,7 +491,7 @@ fn skip_block_comment(source: str, pos: u64) -> u64 | error {
 }
 
 // read a DOC comment `/** … */` → a Doc token spanning the whole comment.
-fn read_doc_comment(source: str, pos: u64) -> Scan | error {
+fn read_doc_comment(source: str, pos: u64): Scan | error {
     mut p = pos + 3                       // past `/**`
     loop {
         if p + 1 >= source.len { return error { message = "unterminated doc comment" } }
@@ -505,14 +505,14 @@ fn read_doc_comment(source: str, pos: u64) -> Scan | error {
 
 // --- a token spanning n bytes from pos (the common Scan builder) ---
 
-fn sym(source: str, pos: u64, n: u64, kind: TokenKind) -> Scan {
+fn sym(source: str, pos: u64, n: u64, kind: TokenKind): Scan {
     Scan { token = Token { kind = kind; text = slice(source, pos, pos + n) }; next = pos + n }
 }
 
 // --- numbers & identifiers ---
 
 // digits, allowing `_` as a separator BETWEEN digits (B.28): `1_000`.
-fn read_number(source: str, pos: u64) -> Scan {
+fn read_number(source: str, pos: u64): Scan {
     mut p = pos
     loop {
         if p >= source.len { break }
@@ -526,7 +526,7 @@ fn read_number(source: str, pos: u64) -> Scan {
     Scan { token = Token { kind = TokenKind::Number; text = slice(source, pos, p) }; next = p }
 }
 
-fn read_ident(source: str, pos: u64) -> Scan {
+fn read_ident(source: str, pos: u64): Scan {
     mut p = pos
     loop {
         if p >= source.len { break }
@@ -538,7 +538,7 @@ fn read_ident(source: str, pos: u64) -> Scan {
 
 // a run of `_` then a letter/digit is ONE identifier (`_foo`, `__bar`); a `_` not so
 // followed is the wildcard token (emitted one at a time — the parser rejects a run).
-fn read_underscore(source: str, pos: u64) -> Scan {
+fn read_underscore(source: str, pos: u64): Scan {
     mut p = pos
     loop {
         if p >= source.len { break }
@@ -555,7 +555,7 @@ fn read_underscore(source: str, pos: u64) -> Scan {
 
 // --- keywords (an ident whose text matches the table — B.19) ---
 
-fn keyword_kind(text: str) -> TokenKind {
+fn keyword_kind(text: str): TokenKind {
     if text == "fn"       { return TokenKind::Fn }
     if text == "type"     { return TokenKind::Type }
     if text == "struct"   { return TokenKind::Struct }
@@ -579,7 +579,7 @@ fn keyword_kind(text: str) -> TokenKind {
     TokenKind::Ident
 }
 
-fn keyword_or_ident(source: str, pos: u64) -> Scan {
+fn keyword_or_ident(source: str, pos: u64): Scan {
     let s = read_ident(source, pos)
     let k = keyword_kind(s.token.text)
     Scan { token = Token { kind = k; text = s.token.text }; next = s.next }
@@ -588,7 +588,7 @@ fn keyword_or_ident(source: str, pos: u64) -> Scan {
 // --- escapes & fresh-byte → str (reference-deferred; see the note above) ---
 
 // decode `\` + one byte → the byte; the set is the structural minimum (it can grow).
-fn escape_byte(source: str, pos: u64) -> EscByte | error {
+fn escape_byte(source: str, pos: u64): EscByte | error {
     let after = pos + 1
     if after >= source.len { return error { message = "unterminated escape" } }
     let v = match source[after] {
@@ -605,7 +605,7 @@ fn escape_byte(source: str, pos: u64) -> EscByte | error {
 }
 
 // one byte of a byte literal: a raw byte, or an escape.
-fn byte_value(source: str, pos: u64) -> ByteVal | error {
+fn byte_value(source: str, pos: u64): ByteVal | error {
     if source[pos] == b'\\' {
         let e = match escape_byte(source, pos) {
             EscByte as eb => eb
@@ -619,19 +619,19 @@ fn byte_value(source: str, pos: u64) -> ByteVal | error {
 // build a str from FRESH bytes (a decoded literal), not a view into the source.
 // Escapes are ASCII and literal bytes come from the validated source, so validity
 // holds; the str-from-bytes primitive is the same as text.tks's `str(b)` [TBD].
-fn one_byte(b: byte) -> str {
+fn one_byte(b: byte): str {
     mut xs = teko::list::empty()
     xs = teko::list::push(xs, b)
     str(xs)
 }
-fn str_of_bytes(xs: []byte) -> str {
+fn str_of_bytes(xs: []byte): str {
     str(xs)
 }
 
 // --- string & byte literals ---
 
 // `"` at pos. Collect bytes until the closing `"`, decoding escapes.
-fn read_str(source: str, pos: u64) -> Scan | error {
+fn read_str(source: str, pos: u64): Scan | error {
     mut p = pos + 1                          // past the opening quote
     mut bytes = teko::list::empty()
     loop {
@@ -655,7 +655,7 @@ fn read_str(source: str, pos: u64) -> Scan | error {
 }
 
 // `b'…'`: pos points at `b`, `'` at pos+1. One byte (raw or escaped) then a closing `'`.
-fn read_byte_lit(source: str, pos: u64) -> Scan | error {
+fn read_byte_lit(source: str, pos: u64): Scan | error {
     let inner = pos + 2                       // past `b'`
     if inner >= source.len { return error { message = "unterminated byte literal" } }
     let v = match byte_value(source, inner) {
@@ -668,7 +668,7 @@ fn read_byte_lit(source: str, pos: u64) -> Scan | error {
 
 // --- symbols: operators, delimiters, punctuation (maximal munch — B.23) ---
 
-fn read_symbol(source: str, pos: u64) -> Scan | error {
+fn read_symbol(source: str, pos: u64): Scan | error {
     let c  = source[pos]
     let c1 = at(source, pos + 1)
     let c2 = at(source, pos + 2)
@@ -734,7 +734,7 @@ fn read_symbol(source: str, pos: u64) -> Scan | error {
 
 // --- one token at pos (already past spaces/comments/newline), or fail ---
 
-fn next_token(source: str, pos: u64) -> Scan | error {
+fn next_token(source: str, pos: u64): Scan | error {
     let c = source[pos]
     // a byte literal `b'…'` — `b` would otherwise begin an identifier
     if c == b'b' && at(source, pos + 1) == b'\'' { return read_byte_lit(source, pos) }
@@ -747,7 +747,7 @@ fn next_token(source: str, pos: u64) -> Scan | error {
 
 // --- the main loop ---
 
-fn tokenize(source: str) -> []Token | error {
+fn tokenize(source: str): []Token | error {
     mut pos: u64 = 0
     mut tokens = teko::list::empty()
 
@@ -833,7 +833,7 @@ main virtual) é a refatoração **R-main** — ver roadmap.
 // main). (`assert` and failure semantics are not yet pinned — alpha.)
 
 // helper (not a test): is str_from_utf8(bytes) ok?
-fn is_valid(bytes: []byte) -> bool {
+fn is_valid(bytes: []byte): bool {
     match str_from_utf8(bytes) {
         str   => true
         error => false
@@ -872,7 +872,7 @@ fn rejects_malformed_utf8() {
 
 // helpers (not tests):
 // the kinds of the tokens of `source` (already validated), or error if it fails.
-fn kinds_of(source: str) -> []TokenKind | error {
+fn kinds_of(source: str): []TokenKind | error {
     let toks = match tokenize(source) {
         ts: []Token => ts
         error       => return error { message = "lex failed" }
@@ -888,7 +888,7 @@ fn kinds_of(source: str) -> []TokenKind | error {
 }
 
 // do the kinds of `source` equal `want`, in order?
-fn kinds_eq(source: str, want: []TokenKind) -> bool {
+fn kinds_eq(source: str, want: []TokenKind): bool {
     let got = match kinds_of(source) {
         ks: []TokenKind => ks
         error           => return false
@@ -904,7 +904,7 @@ fn kinds_eq(source: str, want: []TokenKind) -> bool {
 }
 
 // does lexing `source` fail with an error?
-fn is_error(source: str) -> bool {
+fn is_error(source: str): bool {
     match tokenize(source) {
         []Token => false
         error   => true
@@ -1162,31 +1162,31 @@ type Annotation    = struct { has_type: bool; type_ann: TypeExpr; next: u64 }  /
 
 ```teko
 // Is there a token at `pos`? Position/index are always u64.
-fn has_token(tokens: []lexer::Token, pos: u64) -> bool {
+fn has_token(tokens: []lexer::Token, pos: u64): bool {
     pos < tokens.len
 }
 
 // The kind at `pos` (caller guarantees has_token first).
-fn kind_at(tokens: []lexer::Token, pos: u64) -> lexer::TokenKind {
+fn kind_at(tokens: []lexer::Token, pos: u64): lexer::TokenKind {
     tokens[pos].kind
 }
 
 // has_token + kind compare, folded flat (guard over nest).
-fn is_kind_at(tokens: []lexer::Token, pos: u64, k: lexer::TokenKind) -> bool {
+fn is_kind_at(tokens: []lexer::Token, pos: u64, k: lexer::TokenKind): bool {
     if !has_token(tokens, pos) { return false }
     kind_at(tokens, pos) == k
 }
 
 // Demand a specific kind at `pos`; return the position AFTER it, or an error (B.1).
 // The shared helper that flattens "is there a token? is it right? else error."
-fn expect(tokens: []lexer::Token, pos: u64, kind: lexer::TokenKind, msg: str) -> u64 | error {
+fn expect(tokens: []lexer::Token, pos: u64, kind: lexer::TokenKind, msg: str): u64 | error {
     if !has_token(tokens, pos) { return error { message = msg } }
     if kind_at(tokens, pos) != kind { return error { message = msg } }
     pos + 1
 }
 
 // Skip a run of Newline terminators (blank lines / empty statements — B.17).
-fn skip_terminators(tokens: []lexer::Token, pos: u64) -> u64 {
+fn skip_terminators(tokens: []lexer::Token, pos: u64): u64 {
     mut p = pos
     loop {
         if !has_token(tokens, p) { break }
@@ -1197,12 +1197,12 @@ fn skip_terminators(tokens: []lexer::Token, pos: u64) -> u64 {
 }
 
 // is there a separator at `pos` — `;` or a newline? (B.17 — inside `{}`)
-fn is_sep(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_sep(tokens: []lexer::Token, pos: u64): bool {
     is_kind_at(tokens, pos, lexer::TokenKind::Semicolon) || is_kind_at(tokens, pos, lexer::TokenKind::Newline)
 }
 
 // skip a run of separators (`;` and newlines). Shared by field lists, arms (P3d), blocks (P4).
-fn skip_seps(tokens: []lexer::Token, pos: u64) -> u64 {
+fn skip_seps(tokens: []lexer::Token, pos: u64): u64 {
     mut p = pos
     loop {
         if !is_sep(tokens, p) { break }
@@ -1216,33 +1216,33 @@ fn skip_seps(tokens: []lexer::Token, pos: u64) -> u64 {
 
 ```teko
 // level 2 — unary prefix
-fn is_unary(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_unary(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Minus || k == lexer::TokenKind::Tilde || k == lexer::TokenKind::Bang
 }
 // level 3 — shift
-fn is_shift(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_shift(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Shl || k == lexer::TokenKind::Shr
 }
 // level 4 — multiplicative `* / %` AND bitwise `&` (Julia model; AND≈*)
-fn is_multiplicative(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_multiplicative(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Star || k == lexer::TokenKind::Slash ||
     k == lexer::TokenKind::Percent || k == lexer::TokenKind::Amp
 }
 // level 5 — additive `+ -` AND bitwise `| ^` (OR/XOR≈+)
-fn is_additive(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_additive(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Plus || k == lexer::TokenKind::Minus ||
     k == lexer::TokenKind::Pipe || k == lexer::TokenKind::Caret
 }
 // level 6 — comparison
-fn is_comparison(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_comparison(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Lt || k == lexer::TokenKind::Gt ||
@@ -1250,17 +1250,17 @@ fn is_comparison(tokens: []lexer::Token, pos: u64) -> bool {
     k == lexer::TokenKind::EqEq || k == lexer::TokenKind::Ne
 }
 // level 7 — logical AND
-fn is_andand(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_andand(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     tokens[pos].kind == lexer::TokenKind::AndAnd
 }
 // level 8 — logical OR
-fn is_oror(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_oror(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     tokens[pos].kind == lexer::TokenKind::OrOr
 }
 // statement level — assignment (plain `=` or any compound; B.4)
-fn is_assign_op(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_assign_op(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Assign    ||
@@ -1309,7 +1309,7 @@ sem `use` é cross-namespace; os helpers de cursor são do mesmo namespace, bare
 // src/parser/parse_path.tks   (namespace 'teko::parser')
 // A path: one or more Idents joined by `::` (B.14). At least one segment; fails (B.1)
 // if there is no leading Ident. Shared by NamedType and by call callees.
-fn parse_path(tokens: []lexer::Token, pos: u64) -> ParsedPath | error {
+fn parse_path(tokens: []lexer::Token, pos: u64): ParsedPath | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::Ident) {
         return error { message = "expected a name" }
     }
@@ -1336,7 +1336,7 @@ fn parse_path(tokens: []lexer::Token, pos: u64) -> ParsedPath | error {
 
 // A primary type: a slice `[]T` or a named path. (Members of a `|` union and a
 // slice's element are primaries — the union level is `parse_type` below.)
-fn parse_primary(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_primary(tokens: []lexer::Token, pos: u64): ParsedType | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::LBracket) {
         return parse_slice(tokens, pos)
     }
@@ -1344,14 +1344,14 @@ fn parse_primary(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
 }
 
 // A named type is a path: `u64`, `lexer::Token` (nominal — B.13).
-fn parse_named(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_named(tokens: []lexer::Token, pos: u64): ParsedType | error {
     let pp = match parse_path(tokens, pos) { ParsedPath as x => x; error as e => return e }
     ParsedType { node = NamedType { path = pp.node }, next = pp.next }
 }
 
 // `[]T` — `pos` is at `[` (parse_primary checked). The element is a PRIMARY, so
 // `[]A | B` is `([]A) | B`; nested slices recurse (`[][]T`). Recursive — B.8.
-fn parse_slice(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_slice(tokens: []lexer::Token, pos: u64): ParsedType | error {
     if !is_kind_at(tokens, pos + 1, lexer::TokenKind::RBracket) {
         return error { message = "expected ']' to close '[' in a slice type '[]T'" }
     }
@@ -1362,7 +1362,7 @@ fn parse_slice(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
 // THE TYPE ENTRY — the union level (`|`, the lowest-precedence type operator, B.14):
 // one or more primaries. One → that primary (no needless UnionType — M.5); two or
 // more → a UnionType.
-fn parse_type(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_type(tokens: []lexer::Token, pos: u64): ParsedType | error {
     let first = match parse_primary(tokens, pos) { ParsedType as x => x; error as e => return e }
     mut members = teko::list::empty()
     members = teko::list::push(members, first.node)
@@ -1475,20 +1475,20 @@ tk_parsed_type_result tk_parse_type(const tk_token *t, size_t n, size_t pos) {
 // functions the compiler collects (a runner — ALPHA). C mirror: a `main` harness.
 
 // helper: lex `source`, then parse a type from position 0 — the TypeExpr, or error.
-fn type_of(source: str) -> TypeExpr | error {
+fn type_of(source: str): TypeExpr | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pt = match parse_type(toks, 0) { ParsedType as x => x; error as e => return e }
     pt.node
 }
 
 // does parsing a type from `source` fail (the barrier)?
-fn type_errors(source: str) -> bool {
+fn type_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_type(toks, 0) { ParsedType => false; error => true }
 }
 
 // is `t` a single-segment NamedType named `name`?
-fn named_is(t: TypeExpr, name: str) -> bool {
+fn named_is(t: TypeExpr, name: str): bool {
     match t {
         NamedType as n => n.path.segments.len == 1 && n.path.segments[0].name == name
         _              => false
@@ -1496,7 +1496,7 @@ fn named_is(t: TypeExpr, name: str) -> bool {
 }
 
 // the arity of a union type (0 if `t` is not a UnionType).
-fn union_arity(t: TypeExpr) -> u64 {
+fn union_arity(t: TypeExpr): u64 {
     match t {
         UnionType as u => u.members.len
         _              => 0
@@ -1608,7 +1608,7 @@ gap que a AST F2/Parte-1 deixou). `parse_expr` aponta provisoriamente para `pars
 
 // a Number token's text (decimal digits with `_` separators) → i64. (Other bases and
 // overflow are not in the seed's literal path.) Dogfooding `to`: byte→i64 widens (ok).
-fn lit_int(text: str) -> i64 {
+fn lit_int(text: str): i64 {
     mut acc = 0
     mut i = 0
     loop {
@@ -1623,7 +1623,7 @@ fn lit_int(text: str) -> i64 {
 }
 
 // a Byte token's text is the already-decoded octet (the lexer resolved escapes/quotes).
-fn lit_byte(text: str) -> byte {
+fn lit_byte(text: str): byte {
     text[0]
 }
 ```
@@ -1636,7 +1636,7 @@ fn lit_byte(text: str) -> byte {
 // `( e, e, … )` — `pos` is at `(`. Empty `()` allowed; comma-separated; no trailing
 // comma (strict — M.2). Returns the args and the position after `)`. Used by Call (here)
 // and by MethodCall (P2b).
-fn parse_call_args(tokens: []lexer::Token, pos: u64) -> ParsedArgs | error {
+fn parse_call_args(tokens: []lexer::Token, pos: u64): ParsedArgs | error {
     mut p = pos + 1                                  // consume `(`
     mut args = teko::list::empty()
     if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
@@ -1656,7 +1656,7 @@ fn parse_call_args(tokens: []lexer::Token, pos: u64) -> ParsedArgs | error {
 }
 
 // the LEAF: a literal, a name/path/call, `( expr )`, or an `if`/`match` expression (B.20/B.15).
-fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     if !has_token(tokens, pos) { return error { message = "expected an expression" } }
     let k = kind_at(tokens, pos)
     if k == lexer::TokenKind::Number {
@@ -1697,7 +1697,7 @@ fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 
 // THE EXPRESSION ENTRY — descends the whole ladder (P2 complete: or → and → comparison
 // → additive → multiplicative → shift → cast → unary → postfix → atom).
-fn parse_expr(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_expr(tokens: []lexer::Token, pos: u64): Parsed | error {
     parse_or(tokens, pos)
 }
 ```
@@ -1786,14 +1786,14 @@ tk_parsed_result tk_parse_expr(const tk_token *t, size_t n, size_t pos) {
 // appended to parser_test.tkt — P2a expression-atom tests. #test collected.
 
 // helper: lex `source`, parse an expression from 0 — the Expr, or error.
-fn expr_of(source: str) -> Expr | error {
+fn expr_of(source: str): Expr | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pe = match parse_expr(toks, 0) { Parsed as x => x; error as e => return e }
     pe.node
 }
 
 // does parsing an expression from `source` fail (the barrier)?
-fn expr_errors(source: str) -> bool {
+fn expr_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_expr(toks, 0) { Parsed => false; error => true }
 }
@@ -1856,7 +1856,7 @@ caminho — `f(x)` — já é montada no `parse_atom`; o `(args)` aqui pertence 
 ```teko
 // postfix: a chain of `.field` and `.method(args)` after an atom (tightest after the
 // leaf). Left-assoc. `a.b`, `a.b().c`, `f(x).g`.
-fn parse_postfix(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_postfix(tokens: []lexer::Token, pos: u64): Parsed | error {
     let prim = match parse_atom(tokens, pos) { Parsed as x => x; error as e => return e }
     mut node = prim.node
     mut p = prim.next
@@ -1967,7 +1967,7 @@ Re-enraíza `parse_expr := parse_cast`.
 
 ```teko
 // prefix unary `- ~ !` (right-assoc: `!!a` is `!(!a)`). Below `to`.
-fn parse_unary(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_unary(tokens: []lexer::Token, pos: u64): Parsed | error {
     if is_unary(tokens, pos) {
         let op = kind_at(tokens, pos)
         let operand = match parse_unary(tokens, pos + 1) { Parsed as x => x; error as e => return e }
@@ -1978,7 +1978,7 @@ fn parse_unary(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 
 // cast `x to T` (F2) — below unary, above all binary. Left-assoc. The target is a
 // type-PRIMARY (parse_primary, P1): `x to u32`, `x to []u8`, `x to lexer::Token`.
-fn parse_cast(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_cast(tokens: []lexer::Token, pos: u64): Parsed | error {
     let first = match parse_unary(tokens, pos) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
@@ -2092,7 +2092,7 @@ primeiro + uma lista de termos `(op, operando)`; sem termo → o primeiro nu. Re
 
 ```teko
 // level 3 — shift `<< >>` (left-assoc; the tightest binary, just above cast).
-fn parse_shift(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_shift(tokens: []lexer::Token, pos: u64): Parsed | error {
     let first = match parse_cast(tokens, pos) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
@@ -2107,7 +2107,7 @@ fn parse_shift(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 4 — multiplicative `* / %` and bitwise `&` (left-assoc).
-fn parse_multiplicative(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_multiplicative(tokens: []lexer::Token, pos: u64): Parsed | error {
     let first = match parse_shift(tokens, pos) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
@@ -2122,7 +2122,7 @@ fn parse_multiplicative(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 5 — additive `+ -` and bitwise `| ^` (left-assoc).
-fn parse_additive(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_additive(tokens: []lexer::Token, pos: u64): Parsed | error {
     let first = match parse_multiplicative(tokens, pos) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
@@ -2138,7 +2138,7 @@ fn parse_additive(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 
 // level 6 — comparison. A CHAIN `a < b < c` is kept as written (M.3): a first + a list
 // of (op, operand) terms; no term → the bare first.
-fn parse_comparison(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_comparison(tokens: []lexer::Token, pos: u64): Parsed | error {
     let first = match parse_additive(tokens, pos) { Parsed as x => x; error as e => return e }
     mut terms = teko::list::empty()
     mut p = first.next
@@ -2207,7 +2207,7 @@ static tk_parsed_result parse_comparison(const tk_token *t, size_t n, size_t pos
 // appended to parser_test.tkt — P2d binary + comparison tests.
 
 // is `e` a Binary with op `op`?
-fn binop_is(e: Expr, op: lexer::TokenKind) -> bool {
+fn binop_is(e: Expr, op: lexer::TokenKind): bool {
     match e { Binary as b => b.op == op; _ => false }
 }
 
@@ -2274,7 +2274,7 @@ descer a **escada inteira** — o P2 está **completo**.
 
 ```teko
 // level 7 — logical AND `&&` (left-assoc).
-fn parse_and(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_and(tokens: []lexer::Token, pos: u64): Parsed | error {
     let first = match parse_comparison(tokens, pos) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
@@ -2288,7 +2288,7 @@ fn parse_and(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 8 — logical OR `||` (left-assoc, the loosest; the ladder's top).
-fn parse_or(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_or(tokens: []lexer::Token, pos: u64): Parsed | error {
     let first = match parse_and(tokens, pos) { Parsed as x => x; error as e => return e }
     mut node = first.node
     mut p = first.next
@@ -2425,7 +2425,7 @@ provisoriamente para `parse_pattern_primary`.
 
 // the BASE pattern: wildcard or a scalar literal. (Bind/field added in P3b; range/alt
 // wrap this in parse_pattern at P3c.)
-fn parse_pattern_primary(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
+fn parse_pattern_primary(tokens: []lexer::Token, pos: u64): ParsedPattern | error {
     if !has_token(tokens, pos) { return error { message = "expected a pattern" } }
     let k = kind_at(tokens, pos)
     if k == lexer::TokenKind::Underscore {
@@ -2461,7 +2461,7 @@ fn parse_pattern_primary(tokens: []lexer::Token, pos: u64) -> ParsedPattern | er
 
 // a primary pattern, optionally a range `lo ..= hi` (inclusive; both bounds must be
 // literals — their Exprs are extracted). [P3c]
-fn parse_pattern_range(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
+fn parse_pattern_range(tokens: []lexer::Token, pos: u64): ParsedPattern | error {
     let lo_pat = match parse_pattern_primary(tokens, pos) { ParsedPattern as x => x; error as e => return e }
     if !is_kind_at(tokens, lo_pat.next, lexer::TokenKind::DotDotEq) {
         return lo_pat
@@ -2474,7 +2474,7 @@ fn parse_pattern_range(tokens: []lexer::Token, pos: u64) -> ParsedPattern | erro
 
 // THE PATTERN ENTRY (P3c): the alt level — one or more range-or-primaries separated by
 // `|`. One → that pattern (no needless AltPattern — M.5); two or more → an AltPattern.
-fn parse_pattern(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
+fn parse_pattern(tokens: []lexer::Token, pos: u64): ParsedPattern | error {
     let first = match parse_pattern_range(tokens, pos) { ParsedPattern as x => x; error as e => return e }
     mut options = teko::list::empty()
     options = teko::list::push(options, first.node)
@@ -2592,14 +2592,14 @@ tk_parsed_pattern_result tk_parse_pattern(const tk_token *t, size_t n, size_t po
 // appended to parser_test.tkt — P3a pattern tests.
 
 // helper: lex `source`, parse a pattern from 0 — the Pattern, or error.
-fn pattern_of(source: str) -> Pattern | error {
+fn pattern_of(source: str): Pattern | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pp = match parse_pattern(toks, 0) { ParsedPattern as x => x; error as e => return e }
     pp.node
 }
 
 // does parsing a pattern from `source` fail (the barrier)?
-fn pattern_errors(source: str) -> bool {
+fn pattern_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_pattern(toks, 0) { ParsedPattern => false; error => true }
 }
@@ -2700,7 +2700,7 @@ campos é `;`/newline; lista vazia e separador final permitidos.
 ```teko
 // `{ f; g }` — a field-name list; `;` or newline separates; empty `{ }` allowed; a
 // trailing separator is allowed. `pos` is at `{`. (Shared shape with blocks/arms — B.17.)
-fn parse_field_names(tokens: []lexer::Token, pos: u64) -> ParsedNames | error {
+fn parse_field_names(tokens: []lexer::Token, pos: u64): ParsedNames | error {
     mut p = skip_seps(tokens, pos + 1)        // consume `{`, skip leading separators
     mut names = teko::list::empty()
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
@@ -2860,7 +2860,7 @@ com `parse_block`); aqui fica o arm unitário, já testável (usa `parse_pattern
 
 // an optional `when guard` before `=>`. Absent → has_when=false (guard is a placeholder
 // Number 0, never read — gated by has_when). `pos` is right after the pattern.
-fn parse_guard(tokens: []lexer::Token, pos: u64) -> Guard | error {
+fn parse_guard(tokens: []lexer::Token, pos: u64): Guard | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::When) {
         return Guard { has_when = false, guard = Number { value = 0 }, next = pos }
     }
@@ -2870,7 +2870,7 @@ fn parse_guard(tokens: []lexer::Token, pos: u64) -> Guard | error {
 
 // a match arm: `pattern [when guard] => body`. The body is an expression (B.15); the
 // `when` guard does NOT count for exhaustiveness (M.1).
-fn parse_arm(tokens: []lexer::Token, pos: u64) -> ParsedArm | error {
+fn parse_arm(tokens: []lexer::Token, pos: u64): ParsedArm | error {
     let pat = match parse_pattern(tokens, pos) { ParsedPattern as x => x; error as e => return e }
     let g = match parse_guard(tokens, pat.next) { Guard as x => x; error as e => return e }
     if !is_kind_at(tokens, g.next, lexer::TokenKind::FatArrow) {
@@ -2921,13 +2921,13 @@ tk_parsed_arm_result tk_parse_arm(const tk_token *t, size_t n, size_t pos) {
 // appended to parser_test.tkt — P3d arm tests.
 
 // helper: lex `source`, parse an arm from 0 — the Arm, or error.
-fn arm_of(source: str) -> Arm | error {
+fn arm_of(source: str): Arm | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pa = match parse_arm(toks, 0) { ParsedArm as x => x; error as e => return e }
     pa.node
 }
 
-fn arm_errors(source: str) -> bool {
+fn arm_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_arm(toks, 0) { ParsedArm => false; error => true }
 }
@@ -3009,7 +3009,7 @@ representação.
 
 // dispatch a statement. P4a: `return [expr]` and a bare-expression statement. P4b–P4d add
 // bindings, assignment, loop/break/continue.
-fn parse_statement(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_statement(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     if !has_token(tokens, pos) { return error { message = "expected a statement" } }
     if is_kind_at(tokens, pos, lexer::TokenKind::Return) {
         // `return` with an optional value: bare `return` ends at a separator or `}`.
@@ -3045,7 +3045,7 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
 
 // a `{ … }` block: a sequence of statements, `;`/newline separated; empty `{ }` allowed;
 // trailing separator allowed. `pos` is at `{`. (Same separator shape as field lists — B.17.)
-fn parse_block(tokens: []lexer::Token, pos: u64) -> ParsedBlock | error {
+fn parse_block(tokens: []lexer::Token, pos: u64): ParsedBlock | error {
     mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
     mut stmts = teko::list::empty()
     loop {
@@ -3143,13 +3143,13 @@ tk_parsed_block_result tk_parse_block(const tk_token *t, size_t n, size_t pos) {
 // appended to parser_test.tkt — P4a block + statement tests.
 
 // helper: lex `source`, parse a block from 0 — the []Statement, or error.
-fn block_of(source: str) -> []Statement | error {
+fn block_of(source: str): []Statement | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pb = match parse_block(toks, 0) { ParsedBlock as x => x; error as e => return e }
     pb.statements
 }
 
-fn block_errors(source: str) -> bool {
+fn block_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_block(toks, 0) { ParsedBlock => false; error => true }
 }
@@ -3205,13 +3205,13 @@ existem.
 
 ```teko
 // a placeholder TypeExpr for an absent annotation (never read — gated by has_type).
-fn no_type() -> TypeExpr {
+fn no_type(): TypeExpr {
     NamedType { path = Path { segments = teko::list::empty() } }
 }
 
 // an optional `: T` annotation. Absent → has_type=false (type_ann a placeholder). `pos`
 // is where the `:` would be.
-fn parse_annotation(tokens: []lexer::Token, pos: u64) -> Annotation | error {
+fn parse_annotation(tokens: []lexer::Token, pos: u64): Annotation | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::Colon) {
         return Annotation { has_type = false, type_ann = no_type(), next = pos }
     }
@@ -3221,7 +3221,7 @@ fn parse_annotation(tokens: []lexer::Token, pos: u64) -> Annotation | error {
 
 // `let|mut|const TARGET [: T] = value` (B.13, B.21). TARGET is a name or a destructure
 // `{ x; y }` (parse_bind_target).
-fn parse_binding(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_binding(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     let kw = kind_at(tokens, pos)
     mut kind = BindKind::Let
     if kw == lexer::TokenKind::Mut   { kind = BindKind::Mut }
@@ -3292,13 +3292,13 @@ static tk_parsed_stmt_result parse_binding(const tk_token *t, size_t n, size_t p
 // appended to parser_test.tkt — P4b binding tests.
 
 // helper: parse a single statement from `source` — the Statement, or error.
-fn stmt_of(source: str) -> Statement | error {
+fn stmt_of(source: str): Statement | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let ps = match parse_statement(toks, 0) { ParsedStmt as x => x; error as e => return e }
     ps.node
 }
 
-fn stmt_errors(source: str) -> bool {
+fn stmt_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_statement(toks, 0) { ParsedStmt => false; error => true }
 }
@@ -3358,7 +3358,7 @@ AST (só nome simples — seed); `x.f` parseia como expressão e o `=` sobra (er
 ```teko
 // a binding target: a simple name or a destructure `{ x; y }` (B.13). `pos` after the kw.
 // Reuses parse_field_names for the `{ … }` name list.
-fn parse_bind_target(tokens: []lexer::Token, pos: u64) -> ParsedTarget | error {
+fn parse_bind_target(tokens: []lexer::Token, pos: u64): ParsedTarget | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::LBrace) {
         let names = match parse_field_names(tokens, pos) { ParsedNames as x => x; error as e => return e }
         return ParsedTarget { node = DestructurePattern { names = names.names }, next = names.next }
@@ -3371,7 +3371,7 @@ fn parse_bind_target(tokens: []lexer::Token, pos: u64) -> ParsedTarget | error {
 
 // `name op= value` (B.4 — assignment is statement-only). Simple-name target; the op
 // (= += -= …) is captured. (is_assign_op already checked at dispatch.)
-fn parse_assign(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_assign(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     let name = tokens[pos].text
     let op = kind_at(tokens, pos + 1)
     let v = match parse_expr(tokens, pos + 2) { Parsed as x => x; error as e => return e }
@@ -3519,7 +3519,7 @@ statement e padrão fecham o ciclo mutuamente recursivo** — o parser está com
 
 // `if cond { then } [else { else } | else if …]` — if/else is an EXPRESSION (B.20).
 // `pos` is at `if`. `else if` is the else-block holding the nested if as one statement.
-fn parse_if(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_if(tokens: []lexer::Token, pos: u64): Parsed | error {
     let cond = match parse_expr(tokens, pos + 1) { Parsed as x => x; error as e => return e }
     if !is_kind_at(tokens, cond.next, lexer::TokenKind::LBrace) {
         return error { message = "expected '{' after the `if` condition" }
@@ -3551,7 +3551,7 @@ fn parse_if(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 
 // the arm list of a `match`: `{ arm; arm; … }` — `;`/newline separates; ≥1 arm (a match
 // needs a branch — M.1). `pos` is at `{`.
-fn parse_arms(tokens: []lexer::Token, pos: u64) -> ParsedArms | error {
+fn parse_arms(tokens: []lexer::Token, pos: u64): ParsedArms | error {
     mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
     mut arms = teko::list::empty()
     loop {
@@ -3572,7 +3572,7 @@ fn parse_arms(tokens: []lexer::Token, pos: u64) -> ParsedArms | error {
 }
 
 // `match subject { arms }` — match is an EXPRESSION (B.15). `pos` is at `match`.
-fn parse_match(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_match(tokens: []lexer::Token, pos: u64): Parsed | error {
     let subj = match parse_expr(tokens, pos + 1) { Parsed as x => x; error as e => return e }
     if !is_kind_at(tokens, subj.next, lexer::TokenKind::LBrace) {
         return error { message = "expected '{' after the `match` subject" }
@@ -3782,12 +3782,12 @@ type ParsedMainFile = struct { node: MainFile;      next: u64 }   // a parsed ma
 
 // does the token at `pos` start a top-level declaration (`fn` or `type`)? (Shared with
 // parse_module — R-main-c.)
-fn is_decl_start(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_decl_start(tokens: []lexer::Token, pos: u64): bool {
     is_kind_at(tokens, pos, lexer::TokenKind::Fn) || is_kind_at(tokens, pos, lexer::TokenKind::Type)
 }
 
 // `use a::b::c [as alias]` (B.33). `pos` is at `use`.
-fn parse_use(tokens: []lexer::Token, pos: u64) -> ParsedUse | error {
+fn parse_use(tokens: []lexer::Token, pos: u64): ParsedUse | error {
     let pp = match parse_path(tokens, pos + 1) { ParsedPath as x => x; error as e => return e }
     mut has_alias = false
     mut alias = ""
@@ -3805,7 +3805,7 @@ fn parse_use(tokens: []lexer::Token, pos: u64) -> ParsedUse | error {
 
 // the `use` header: zero or more `use` decls at the top, separator-terminated. Returns the
 // uses and the position where the body/decls begin. (Shared with parse_module.)
-fn parse_use_header(tokens: []lexer::Token, pos: u64) -> ParsedUses | error {
+fn parse_use_header(tokens: []lexer::Token, pos: u64): ParsedUses | error {
     mut p = skip_seps(tokens, pos)
     mut uses = teko::list::empty()
     loop {
@@ -3824,7 +3824,7 @@ fn parse_use_header(tokens: []lexer::Token, pos: u64) -> ParsedUses | error {
 
 // main.tks: the `use` header, then the VIRTUAL MAIN's body (statements). Rejects any
 // type/function declaration. `pos` is 0 (file start).
-fn parse_main_file(tokens: []lexer::Token, pos: u64) -> ParsedMainFile | error {
+fn parse_main_file(tokens: []lexer::Token, pos: u64): ParsedMainFile | error {
     let hdr = match parse_use_header(tokens, pos) { ParsedUses as x => x; error as e => return e }
     mut p = skip_seps(tokens, hdr.next)
     mut body = teko::list::empty()
@@ -3916,13 +3916,13 @@ tk_parsed_main_file_result tk_parse_main_file(const tk_token *t, size_t n, size_
 ```teko
 // appended to parser_test.tkt — R-main-b main-file tests.
 
-fn main_file_of(source: str) -> MainFile | error {
+fn main_file_of(source: str): MainFile | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pf = match parse_main_file(toks, 0) { ParsedMainFile as x => x; error as e => return e }
     pf.node
 }
 
-fn main_file_errors(source: str) -> bool {
+fn main_file_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_main_file(toks, 0) { ParsedMainFile => false; error => true }
 }
@@ -3977,7 +3977,7 @@ de R-main.
 
 ### P5a — `parse_params` + `Function`
 
-`[doc] [exp] fn nome(params) -> ret { corpo }` (B.21, B.29). Doc (`/** */`, token `Doc`) e
+`[doc] [exp] fn nome(params): ret { corpo }` (B.21, B.29). Doc (`/** */`, token `Doc`) e
 `exp` são opcionais e precedem `fn`. Os params são `nome: T` separados por **vírgula**
 (B.17 — vírgula em `()`), imutáveis (B.21). O **`-> ret` é opcional** — ausente = retorno
 void (como nas `#test fn …() {}`); por isso `Function` ganhou `has_return` (com `return_type`
@@ -3990,7 +3990,7 @@ placeholder via `no_type()`). O corpo é um bloco (P4a).
 
 // `( name: T, name: T, … )` — comma-separated params; empty `()` allowed; params are
 // immutable (B.21). `pos` is at `(`.
-fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
+fn parse_params(tokens: []lexer::Token, pos: u64): ParsedParams | error {
     mut p = pos + 1                                  // consume `(`
     mut params = teko::list::empty()
     if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
@@ -4016,9 +4016,9 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
     ParsedParams { params = params, next = p + 1 }
 }
 
-// `[doc] [exp] fn name(params) -> ret { body }` (B.21, B.29). Doc + `exp` optional and
+// `[doc] [exp] fn name(params): ret { body }` (B.21, B.29). Doc + `exp` optional and
 // precede `fn`; `-> ret` optional (absent = void). `pos` is at the doc, `exp`, or `fn`.
-fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
+fn parse_function(tokens: []lexer::Token, pos: u64): ParsedDecl | error {
     mut p = pos
     mut has_doc = false
     mut doc = ""
@@ -4139,21 +4139,21 @@ tk_parsed_decl_result tk_parse_function(const tk_token *t, size_t n, size_t pos)
 // appended to parser_test.tkt — P5a function tests.
 
 // helper: parse a function decl from `source` — the Function, or error.
-fn func_of(source: str) -> Function | error {
+fn func_of(source: str): Function | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pd = match parse_function(toks, 0) { ParsedDecl as x => x; error as e => return e }
     match pd.node { Function as f => f; _ => error { message = "not a function" } }
 }
 
-fn func_errors(source: str) -> bool {
+fn func_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_function(toks, 0) { ParsedDecl => false; error => true }
 }
 
 #test
 fn parses_functions() {
-    // fn f() -> u8 { return 1 }
-    match func_of("fn f() -> u8 { return 1 }") {
+    // fn f(): u8 { return 1 }
+    match func_of("fn f(): u8 { return 1 }") {
         Function as f => {
             assert f.name == "f"
             assert f.params.len == 0
@@ -4181,16 +4181,16 @@ fn parses_functions() {
 fn rejects_malformed_functions() {
     assert func_errors("fn { }")           // no name
     assert func_errors("fn f { }")         // no params
-    assert func_errors("fn f() -> { }")    // `->` with no return type
-    assert func_errors("fn f() -> u8")     // no body
+    assert func_errors("fn f(): { }")    // `->` with no return type
+    assert func_errors("fn f(): u8")     // no body
     assert func_errors("fn f(x) { }")      // param with no type
 }
 ```
 
 > **C mirror dos testes (harness `main`, alpha).** Mesmos casos: feliz —
-> `fn f() -> u8 { return 1 }` (com retorno), `exp fn g(x: u8, y: str) { }` (exp, 2 params,
-> void), `/** hi */ fn h() { }` (doc); barreira — `fn { }`, `fn f { }`, `fn f() -> { }`,
-> `fn f() -> u8`, `fn f(x) { }`. (Asserts sobre `.as.function.name`, `.n_params`,
+> `fn f(): u8 { return 1 }` (com retorno), `exp fn g(x: u8, y: str) { }` (exp, 2 params,
+> void), `/** hi */ fn h() { }` (doc); barreira — `fn { }`, `fn f { }`, `fn f(): { }`,
+> `fn f(): u8`, `fn f(x) { }`. (Asserts sobre `.as.function.name`, `.n_params`,
 > `.has_return`, `.is_exp`, `.has_doc`.)
 
 
@@ -4207,7 +4207,7 @@ lexer). Resultado novo: `ParsedFields`.
 ```teko
 // `{ name: T; name: T; … }` — field list; `;`/newline separates; empty `{ }` allowed;
 // trailing separator allowed. `pos` is at `{`. (Inside `{}` → `;`/newline, B.17.)
-fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedFields | error {
+fn parse_fields(tokens: []lexer::Token, pos: u64): ParsedFields | error {
     mut p = skip_seps(tokens, pos + 1)   // consume `{`, skip leading separators
     mut fields = teko::list::empty()
     if is_kind_at(tokens, p, lexer::TokenKind::RBrace) {
@@ -4236,7 +4236,7 @@ fn parse_fields(tokens: []lexer::Token, pos: u64) -> ParsedFields | error {
 
 // the body of a type declaration. P5b: `struct { fields }`. (enum/variant → P5c.) `pos` is
 // at `struct`/`enum`/`variant`.
-fn parse_type_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
+fn parse_type_body(tokens: []lexer::Token, pos: u64): ParsedBody | error {
     if is_kind_at(tokens, pos, lexer::TokenKind::Struct) {
         if !is_kind_at(tokens, pos + 1, lexer::TokenKind::LBrace) {
             return error { message = "expected '{' after `struct`" }
@@ -4260,7 +4260,7 @@ fn parse_type_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
 
 // `[doc] [exp] type Name = <body>` (B.13, nominal). Doc + `exp` precede `type`. `pos` is at
 // the doc, `exp`, or `type`.
-fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
+fn parse_type_decl(tokens: []lexer::Token, pos: u64): ParsedDecl | error {
     mut p = pos
     mut has_doc = false
     mut doc = ""
@@ -4386,13 +4386,13 @@ tk_parsed_decl_result tk_parse_type_decl(const tk_token *t, size_t n, size_t pos
 ```teko
 // appended to parser_test.tkt — P5b struct type-decl tests.
 
-fn type_decl_of(source: str) -> TypeDecl | error {
+fn type_decl_of(source: str): TypeDecl | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pd = match parse_type_decl(toks, 0) { ParsedDecl as x => x; error as e => return e }
     match pd.node { TypeDecl as td => td; _ => error { message = "not a type decl" } }
 }
 
-fn type_decl_errors(source: str) -> bool {
+fn type_decl_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_type_decl(toks, 0) { ParsedDecl => false; error => true }
 }
@@ -4513,13 +4513,13 @@ estão completos e testados; o **R-main-c** (`parse_module`) já tem tudo que co
 ```teko
 // appended to parser_test.tkt — P5d standalone `use` tests.
 
-fn use_of(source: str) -> UseDecl | error {
+fn use_of(source: str): UseDecl | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pu = match parse_use(toks, 0) { ParsedUse as x => x; error as e => return e }
     pu.node
 }
 
-fn use_errors(source: str) -> bool {
+fn use_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_use(toks, 0) { ParsedUse => false; error => true }
 }
@@ -4575,7 +4575,7 @@ type ParsedModule = struct { node: Module; next: u64 }   // a parsed module file
 // dispatch a top-level declaration: a function or a type decl (each may be preceded by a
 // doc comment and/or `exp`). Peeks past the doc/exp prefix to choose. `pos` is at the
 // doc, `exp`, `fn`, or `type`.
-fn parse_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
+fn parse_decl(tokens: []lexer::Token, pos: u64): ParsedDecl | error {
     mut k = pos
     if is_kind_at(tokens, k, lexer::TokenKind::Doc) { k = k + 1 }
     if is_kind_at(tokens, k, lexer::TokenKind::Exp) { k = k + 1 }
@@ -4590,7 +4590,7 @@ fn parse_decl(tokens: []lexer::Token, pos: u64) -> ParsedDecl | error {
 
 // a module file: the `use` header, then a loop of declarations. Rejects loose statements.
 // `pos` is 0 (file start).
-fn parse_module(tokens: []lexer::Token, pos: u64) -> ParsedModule | error {
+fn parse_module(tokens: []lexer::Token, pos: u64): ParsedModule | error {
     let hdr = match parse_use_header(tokens, pos) { ParsedUses as x => x; error as e => return e }
     mut p = skip_seps(tokens, hdr.next)
     mut decls = teko::list::empty()
@@ -4650,13 +4650,13 @@ tk_parsed_module_result tk_parse_module(const tk_token *t, size_t n, size_t pos)
 ```teko
 // appended to parser_test.tkt — R-main-c module tests.
 
-fn module_of(source: str) -> Module | error {
+fn module_of(source: str): Module | error {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return error { message = "lex failed" } }
     let pm = match parse_module(toks, 0) { ParsedModule as x => x; error as e => return e }
     pm.node
 }
 
-fn module_errors(source: str) -> bool {
+fn module_errors(source: str): bool {
     let toks = match tokenize(source) { ts: []lexer::Token => ts; error => return true }
     match parse_module(toks, 0) { ParsedModule => false; error => true }
 }
@@ -4669,7 +4669,7 @@ fn parses_module() {
         _ => assert false
     }
     // exp + doc on a declaration.
-    match module_of("/** d */ exp fn g() -> u8 { return 1 }") {
+    match module_of("/** d */ exp fn g(): u8 { return 1 }") {
         Module as m => {
             assert m.uses.len == 0
             assert m.decls.len == 1
@@ -4691,7 +4691,7 @@ fn rejects_statements_in_module() {
 
 > **C mirror dos testes (harness `main`, alpha).** Mesmos casos: feliz —
 > `use teko::lexer; type T = struct { x: u8 }; fn f() { }` (1 use + 2 decls),
-> `/** d */ exp fn g() -> u8 { return 1 }` (exp+doc), `""` (módulo vazio); barreira —
+> `/** d */ exp fn g(): u8 { return 1 }` (exp+doc), `""` (módulo vazio); barreira —
 > `let x = 1`, `x = 5`, `f()` (statements num módulo). (Asserts sobre `.n_uses`,
 > `.n_decls`, `.decls[0].as.function.is_exp`.)
 
@@ -4712,7 +4712,7 @@ main reais parseiam com a estrutura certa; barreira: malformados falham (localiz
 #test
 fn integration_module() {
     // a realistic module: use + a struct + an enum + a function with a conditional return.
-    let src = "use teko::lexer; type Tok = struct { kind: u8; text: str }; type Kind = enum { A; B }; fn classify(t: Tok) -> Kind { if t.kind == 0 { return Kind::A }; Kind::B }"
+    let src = "use teko::lexer; type Tok = struct { kind: u8; text: str }; type Kind = enum { A; B }; fn classify(t: Tok): Kind { if t.kind == 0 { return Kind::A }; Kind::B }"
     match module_of(src) {
         Module as m => {
             assert m.uses.len == 1
@@ -4797,7 +4797,7 @@ type Artifact = enum { Executable; Library }
 // it. Returns the artifact (pass-through) on success, an error otherwise. The build driver
 // supplies `artifact` (from the manifest) and `has_main` (from the file set) — that wiring is
 // deferred (M.4).
-fn check_main_file_rule(artifact: Artifact, has_main: bool) -> Artifact | error {
+fn check_main_file_rule(artifact: Artifact, has_main: bool): Artifact | error {
     if artifact == Artifact::Executable && !has_main {
         return error { message = "an executable project requires a main.tks" }
     }
@@ -4830,7 +4830,7 @@ tk_artifact_result tk_check_main_file_rule(tk_artifact artifact, bool has_main) 
 // src/build/tkp_rule_test.tkt — tests for teko::build. #test collected.
 
 // does the rule hold for (artifact, has_main)?
-fn rule_ok(artifact: Artifact, has_main: bool) -> bool {
+fn rule_ok(artifact: Artifact, has_main: bool): bool {
     match check_main_file_rule(artifact, has_main) { Artifact => true; error => false }
 }
 

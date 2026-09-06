@@ -1,0 +1,309 @@
+use teko::encoding::json
+
+fn jstr(s: str): @JsonValue() {
+    json::JsonString { value = s }
+}
+
+fn jnum(v: f64): @JsonValue() {
+    json::JsonNumber { value = v }
+}
+
+fn jnull(): @JsonValue() {
+    json::JsonNull { }
+}
+
+fn jbool(b: bool): @JsonValue() {
+    json::JsonBool { value = b }
+}
+
+fn jobj(keys: []str, values: []@JsonValue()): @JsonValue() {
+    json::JsonObject { keys = keys; values = values }
+}
+
+fn object_field(req: @JsonValue(), key: str): @JsonValue() | null {
+    match req {
+        json::JsonObject as o => json::object_get(o, key)
+        _ => null
+    }
+}
+
+fn as_str(v: @JsonValue()): str | null {
+    match v {
+        json::JsonString as s => s.value
+        _ => null
+    }
+}
+
+fn request_id(req: @JsonValue()): @JsonValue() {
+    match object_field(req, "id") {
+        (@JsonValue()) as v => v
+        null => jnull()
+    }
+}
+
+fn has_id(req: @JsonValue()): bool {
+    match object_field(req, "id") {
+        null => false
+        _ => true
+    }
+}
+
+pub fn method_of(body: @JsonValue()): str {
+    match object_field(body, "method") {
+        (@JsonValue()) as v => match as_str(v) { str as s => s; null => "" }
+        null => ""
+    }
+}
+
+fn response(id: @JsonValue(), result: @JsonValue()): @JsonValue() {
+    jobj(["jsonrpc", "id", "result"], [jstr("2.0"), id, result])
+}
+
+fn error_response(id: @JsonValue(), code: i64, message: str): @JsonValue() {
+    var err = jobj(["code", "message"], [jnum(code to f64), jstr(message)])
+    jobj(["jsonrpc", "id", "error"], [jstr("2.0"), id, err])
+}
+
+fn completion_options(): @JsonValue() {
+    jobj(["triggerCharacters"], [jarr([jstr("."), jstr(":")])])
+}
+
+fn initialize_result(id: @JsonValue()): @JsonValue() {
+    var server_info = jobj(["name", "version"], [jstr("teko"), jstr(teko::env::version())])
+    var capability_keys = ["textDocumentSync", "documentFormattingProvider", "hoverProvider", "definitionProvider", "completionProvider"]
+    var capability_values = [jnum(1.0), jbool(true), jbool(true), jbool(true), completion_options()]
+    var capabilities = jobj(capability_keys, capability_values)
+    var result = jobj(["capabilities", "serverInfo"], [capabilities, server_info])
+    response(id, result)
+}
+
+type DocRef = struct {
+        uri: str
+        text: str
+}
+
+fn str_field(v: @JsonValue(), key: str): str | null {
+    match object_field(v, key) {
+        (@JsonValue()) as fv => as_str(fv)
+        null => null
+    }
+}
+
+fn text_document_of(req: @JsonValue()): @JsonValue() | null {
+    var params = match object_field(req, "params") { (@JsonValue()) as v => v; null => return null }
+    object_field(params, "textDocument")
+}
+
+fn open_doc(req: @JsonValue()): DocRef | null {
+    var td = match text_document_of(req) { (@JsonValue()) as v => v; null => return null }
+    var uri = match str_field(td, "uri") { str as s => s; null => return null }
+    var text = match str_field(td, "text") { str as s => s; null => return null }
+    DocRef { uri = uri; text = text }
+}
+
+fn change_doc(req: @JsonValue()): DocRef | null {
+    var td = match text_document_of(req) { (@JsonValue()) as v => v; null => return null }
+    var uri = match str_field(td, "uri") { str as s => s; null => return null }
+    var params = match object_field(req, "params") { (@JsonValue()) as v => v; null => return null }
+    var changes = match object_field(params, "contentChanges") { (@JsonValue()) as v => v; null => return null }
+    match changes {
+        json::JsonArray as arr => {
+            if arr.items.len == 0 { return null }
+            var last = arr.items[arr.items.len - 1]
+            match str_field(last, "text") { str as s => DocRef { uri = uri; text = s }; null => null }
+        }
+        _ => null
+    }
+}
+
+fn close_uri(req: @JsonValue()): str | null {
+    var td = match text_document_of(req) { (@JsonValue()) as v => v; null => return null }
+    str_field(td, "uri")
+}
+
+fn one_message(v: @JsonValue()): []@JsonValue() {
+    [v]
+}
+
+fn no_messages(): []@JsonValue() {
+    []
+}
+
+type DocStore = struct {
+        uris: []str
+        texts: []str
+}
+
+type Dispatch = struct {
+        store: DocStore
+        out: []@JsonValue()
+}
+
+fn store_empty(): DocStore {
+    DocStore { uris = []; texts = [] }
+}
+
+fn store_put(store: DocStore, uri: str, text: str): DocStore {
+    var uris: []str = []
+    var texts: []str = []
+    var found = false
+    var i: u64 = 0
+    loop {
+        if i >= store.uris.len { break }
+        uris = [..uris, store.uris[i]]
+        if store.uris[i] == uri {
+            texts = [..texts, text]
+            found = true
+        } else {
+            texts = [..texts, store.texts[i]]
+        }
+        i = i + 1
+    }
+    if !found {
+        uris = [..uris, uri]
+        texts = [..texts, text]
+    }
+    DocStore { uris = uris; texts = texts }
+}
+
+fn store_get(store: DocStore, uri: str): str | null {
+    var i: u64 = 0
+    loop {
+        if i >= store.uris.len { break }
+        if store.uris[i] == uri { return store.texts[i] }
+        i = i + 1
+    }
+    null
+}
+
+fn store_remove(store: DocStore, uri: str): DocStore {
+    var uris: []str = []
+    var texts: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= store.uris.len { break }
+        if store.uris[i] != uri {
+            uris = [..uris, store.uris[i]]
+            texts = [..texts, store.texts[i]]
+        }
+        i = i + 1
+    }
+    DocStore { uris = uris; texts = texts }
+}
+
+fn dispatch_of(store: DocStore, out: []@JsonValue()): Dispatch {
+    Dispatch { store = store; out = out }
+}
+
+fn open_dispatch(store: DocStore, req: @JsonValue()): Dispatch {
+    match open_doc(req) {
+        DocRef as d => dispatch_of(store_put(store, d.uri, d.text), one_message(diagnostics_notification(d.uri, d.text)))
+        null => dispatch_of(store, no_messages())
+    }
+}
+
+fn change_dispatch(store: DocStore, req: @JsonValue()): Dispatch {
+    match change_doc(req) {
+        DocRef as d => dispatch_of(store_put(store, d.uri, d.text), one_message(diagnostics_notification(d.uri, d.text)))
+        null => dispatch_of(store, no_messages())
+    }
+}
+
+fn close_dispatch(store: DocStore, req: @JsonValue()): Dispatch {
+    match close_uri(req) {
+        str as uri => dispatch_of(store_remove(store, uri), one_message(publish_diagnostics(uri, [])))
+        null => dispatch_of(store, no_messages())
+    }
+}
+
+type Pos = struct {
+        line: u32
+        col: u32
+}
+
+fn end_position_of(text: str): Pos {
+    var line: u32 = 0
+    var col: u32 = 0
+    var i: u64 = 0
+    loop {
+        if i >= text.len { break }
+        if text[i] == b'\n' {
+            line = line + 1
+            col = 0
+        } else {
+            col = col + 1
+        }
+        i = i + 1
+    }
+    Pos { line = line; col = col }
+}
+
+fn text_edit_full(text: str, new_text: str): @JsonValue() {
+    var ep = end_position_of(text)
+    var range = jobj(["start", "end"], [encode_position(0, 0), encode_position(ep.line, ep.col)])
+    jobj(["range", "newText"], [range, jstr(new_text)])
+}
+
+fn format_uri(req: @JsonValue()): str | null {
+    var td = match text_document_of(req) { (@JsonValue()) as v => v; null => return null }
+    str_field(td, "uri")
+}
+
+fn format_response(store: DocStore, req: @JsonValue()): Dispatch {
+    var id = request_id(req)
+    var uri = match format_uri(req) { str as u => u; null => return dispatch_of(store, one_message(response(id, jnull()))) }
+    var text = match store_get(store, uri) { str as t => t; null => return dispatch_of(store, one_message(response(id, jnull()))) }
+    match teko::fmt::format_source(text) {
+        str as formatted => dispatch_of(store, one_message(response(id, jarr(one_message(text_edit_full(text, formatted))))))
+        error => dispatch_of(store, one_message(response(id, jnull())))
+    }
+}
+
+pub fn handle_request(store: DocStore, req: @JsonValue()): Dispatch {
+    var method = match object_field(req, "method") {
+        (@JsonValue()) as v => match as_str(v) { str as s => s; null => return dispatch_of(store, no_messages()) }
+        null => return dispatch_of(store, no_messages())
+    }
+    var id = request_id(req)
+    if method == "initialize" { return dispatch_of(store, one_message(initialize_result(id))) }
+    if method == "shutdown" { return dispatch_of(store, one_message(response(id, jnull()))) }
+    if method == "initialized" { return dispatch_of(store, no_messages()) }
+    if method == "exit" { return dispatch_of(store, no_messages()) }
+    if method == "textDocument/didOpen" { return open_dispatch(store, req) }
+    if method == "textDocument/didChange" { return change_dispatch(store, req) }
+    if method == "textDocument/didClose" { return close_dispatch(store, req) }
+    if method == "textDocument/formatting" { return format_response(store, req) }
+    if method == "textDocument/hover" { return hover_response(store, req) }
+    if method == "textDocument/definition" { return definition_response(store, req) }
+    if method == "textDocument/completion" { return completion_response(store, req) }
+    if has_id(req) { return dispatch_of(store, one_message(error_response(id, -32601, teko::str::concat("method not found: ", method)))) }
+    dispatch_of(store, no_messages())
+}
+
+fn write_all(msgs: []@JsonValue()) {
+    var i: u64 = 0
+    loop {
+        if i >= msgs.len { break }
+        write_message(msgs[i])
+        i = i + 1
+    }
+}
+
+pub fn run_lsp(): i32 {
+    var shutdown_seen = false
+    var store = store_empty()
+    loop {
+        match read_message() {
+            RpcMessage as msg => {
+                var method = method_of(msg.body)
+                if method == "exit" { break }
+                if method == "shutdown" { shutdown_seen = true }
+                var d = handle_request(store, msg.body)
+                store = d.store
+                write_all(d.out)
+            }
+            error => break
+        }
+    }
+    if shutdown_seen { 0 } else { 1 }
+}

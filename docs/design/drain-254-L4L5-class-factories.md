@@ -1,3 +1,5 @@
+> **[HISTÓRICO]** — documenta o dreno #254 L4/L5 (genéricos), já executado. Não descreve o estado atual do projeto.
+
 # Drain — #254 L4/L5: generic CLASS factories + self-construct inside a generic template
 
 **Status:** DESIGN-AHEAD (architect). No product code changed. Verified at file:line against
@@ -7,8 +9,8 @@ shipped through L3 (struct methods) and deferred at L4/L5 as a genuine design ga
 **Unblocks:** #163 (collections `Map`/`List`/`Set`/`BTree` are generic CLASSES with factories like
 `Map::new()` / `Map<K,V>::new()`).
 **Rule:** every snippet is full-Javadoc, `.tks`-only. C twins FROZEN (only `teko_rt.{c,h}` maintained —
-none needed here). Ritual per crumb = full gate (gen1 native `#test` + `./bin/teko test .` VM +
-FIXPOINT gen1==gen2 byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit).
+none needed here). Ritual per crumb = full gate (gen1 native `#test` + `./bin/teko test .` legacy engine +
+FIXPOINT gen1==gen2 byte-identical + `diff_c_own.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit).
 
 ---
 
@@ -129,7 +131,7 @@ Concretely, three touches inside `type_struct_lit`, all gated so the corpus is b
  * @return             true iff this is a self-construct of the enclosing generic template
  * @since onda-3 (#254 L4/L5)
  */
-fn is_self_generic_construct(base_name: str, owner_type: str, decl_tparams: []str) -> bool {
+fn is_self_generic_construct(base_name: str, owner_type: str, decl_tparams: []str): bool {
     if decl_tparams.len == 0 { return false }
     if owner_type == "" { return false }
     teko::runtime::str_eq(name_last_segment(owner_type), base_name)
@@ -153,7 +155,7 @@ so it matches the `-> Box<T>` return spelling byte-for-byte:
  * @return             the phantom instance name (`Box__g__T`)
  * @since onda-3 (#254 L4/L5)
  */
-fn phantom_self_inst_name(base_name: str, owner_tparams: []str) -> str {
+fn phantom_self_inst_name(base_name: str, owner_tparams: []str): str {
     mut args: []Type = teko::list::empty()
     mut i = 0
     loop { if i >= owner_tparams.len { break }; args = teko::list::push(args, Named { name = owner_tparams[i] }); i++ }
@@ -186,7 +188,7 @@ ONE more remap: `phantom → inst`, where `phantom = phantom_self_inst_name(base
 (built from the SAME `generic_inst_name` so the spelling matches 2a). Then
 `subst_type(Named{"Box__g__T"}, s)` (`resolve.tks:1039`) resolves to `Named{"Box__g__i64"}` and the
 `TStructInit` arm at `monomorph.tks:547-558` rewrites `type = nt = Named{"Box__g__i64"}`
-automatically — codegen/VM emit the concrete instance.
+automatically — codegen/legacy engine emit the concrete instance.
 
 ```teko
 /**
@@ -205,7 +207,7 @@ automatically — codegen/VM emit the concrete instance.
  * @return            the L3 Subst extended with the phantom → instance remap
  * @since onda-3 (#254 L4/L5)
  */
-fn instance_method_subst_l5(template: parser::TypeDecl, template_ns: str, inst: parser::TypeDecl, table: TypeTable) -> Subst {
+fn instance_method_subst_l5(template: parser::TypeDecl, template_ns: str, inst: parser::TypeDecl, table: TypeTable): Subst {
     let s = instance_method_subst(template, template_ns, inst, table)
     if template.type_params.len == 0 { return s }
     let base = g_instance_base(inst.name)
@@ -298,7 +300,7 @@ maps it to the stamped `Cell__g__i64::make`:
  * @throws       when a type-arg fails to resolve
  * @since onda-3 (#254 L5)
  */
-fn retarget_generic_static_callee(c: parser::Call, table: TypeTable, ref_ns: str) -> parser::Path | error {
+fn retarget_generic_static_callee(c: parser::Call, table: TypeTable, ref_ns: str): parser::Path | error {
     if c.type_args.len == 0 || c.callee.segments.len < 2 { return c.callee }
     let owner_idx = c.callee.segments.len - 2
     let base = c.callee.segments[owner_idx].name
@@ -350,28 +352,28 @@ Add `retarget_generic_static_callee` (call at `type_call` head, `typer.tks:878`)
 no-op when `type_args` empty. **Fixture:** `generic_class_factory` runs both engines.
 
 **Crumb L5.3 — corpus `#test`s.**
-Add generic-class-factory + self-construct `#test`s to `checker/generics_test.tkt` (VM covers the
-mono method path both engines). Gate: full VM gate.
+Add generic-class-factory + self-construct `#test`s to `checker/generics_test.tkt` (legacy engine covers the
+mono method path both engines). Gate: full legacy engine gate.
 
-### Fixtures (VM==native unless noted)
+### Fixtures (legacy engine==native unless noted)
 
 - **`examples/regressions/generic_method_self_construct/`** (proves L4). Struct:
-  `type Box<T> = struct { value: T; pub fn dup(self) -> Box<T> { Box { value = self.value } };
-  pub fn get(self) -> T { self.value } }`. Program:
+  `type Box<T> = struct { value: T; pub fn dup(self): Box<T> { Box { value = self.value } };
+  pub fn get(self): T { self.value } }`. Program:
   `Box<i64>{value=21}.dup().get()` + a SECOND instance `Box<u8>{value=1}.dup().get() to i64`
   → `exit(21 + 21 + …)`; pick constants summing to a distinct exit (e.g. 21+21 → **exit 42**,
   with the `u8` instance proving per-instance retarget, not a shared phantom). Fails to type-check
   today; passes both engines after L4.
 - **`examples/regressions/generic_class_factory/`** (proves L5 + L4). Class:
-  `type Cell<T> = class { pub v: T; pub fn make(x: T) -> Cell<T> { Cell { v = x } };
-  pub fn read(self) -> T { self.v } }`. Program:
+  `type Cell<T> = class { pub v: T; pub fn make(x: T): Cell<T> { Cell { v = x } };
+  pub fn read(self): T { self.v } }`. Program:
   `Cell<i64>::make(7).read()` + `Cell<str>::make("ab").read().len` → **exit (7+2)=9** (two distinct
   instantiations prove the factory stamps per instance; the `str` case proves the parser type-arg
-  path + arena-per-object ref semantics on a non-scalar). cc-rejects / VM-panics today; both pass
+  path + arena-per-object ref semantics on a non-scalar). cc-rejects / legacy engine-panics today; both pass
   after L5. **Second file** with the bare `Cell::make(...)` under a `let x: Cell<i64> = Cell::make(7)`
   annotation is OPTIONAL (bare-form inference is out of scope — include only as an xfail note).
-- **`checker/generics_test.tkt`** — VM `#test`s mirroring both above (self-returning method + static
-  factory, ≥2 instances) so the mono method path is exercised in the VM gate.
+- **`checker/generics_test.tkt`** — legacy engine `#test`s mirroring both above (self-returning method + static
+  factory, ≥2 instances) so the mono method path is exercised in the legacy engine gate.
 
 ---
 

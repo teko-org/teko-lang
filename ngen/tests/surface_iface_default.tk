@@ -1,0 +1,92 @@
+// surface_iface_default.tk -- the interface C# 8 and C# 11 grew (D223, entrega
+// 5): a method with a DEFAULT BODY, a property, and a `static abstract` member.
+//
+// `Square` says nothing about `area`, so its interface table points at the
+// interface's own `shape_area` -- and `Fixed`, which redeclares it, points at
+// its own. `doubled` is the proof that a default is not a shortcut: it reaches
+// `area` on `this`, through the interface table, so the class that redeclared
+// it is the one that answers -- 200 for `Fixed`, not the 2 * 9 the default
+// would have computed on its own.
+//
+// `unit` is `static abstract`: the implementing TYPE provides it, `Square.unit()`
+// resolves at compile time, and the member takes no slot in any method table --
+// `Label`, declared after it, is reached all the same.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+interface Shape {
+    i64 side();
+
+    i64 area() {
+        return this.side() * this.side();
+    }
+
+    i64 doubled() {
+        return area() * 2;                       // unqualified: `this`, through the itab
+    }
+
+    static abstract i64 unit();
+
+    i64 Label { get; set; }
+}
+
+class Square : Shape {
+    public i64 w;
+    public i64 Label { get; set; }
+
+    public i64 side() {
+        return w;
+    }
+
+    public static i64 unit() {
+        return 5;
+    }
+}
+
+class Fixed : Shape {
+    public i64 Label { get; set; }
+
+    public i64 side() {
+        return 3;
+    }
+
+    public i64 area() {
+        return 100;
+    }
+
+    public static i64 unit() {
+        return 7;
+    }
+}
+
+i64 doubled_of(Shape s) {
+    return s.doubled();                          // a receiver only the oracle types
+}
+
+i64 main() {
+    Square q = new Square;
+    q.w = 4;
+    Shape s = q;
+    if (s.area() != 16) return 1;                // the interface's own body
+    if (s.doubled() != 32) return 2;             // a default reaching another member
+    if (doubled_of(s) != 32) return 3;
+
+    Fixed f = new Fixed;
+    Shape t = f;
+    if (t.area() != 100) return 4;               // the class redeclares it
+    if (t.doubled() != 200) return 5;            // ...and the default dispatches to it
+    if (doubled_of(t) != 200) return 6;
+
+    s.Label = 11;
+    if (s.Label != 11) return 7;                 // an interface property, through the itab
+    if (q.Label != 11) return 8;
+    t.Label = 3;
+    if (f.Label != 3) return 9;
+
+    if (Square.unit() != 5) return 10;           // `static abstract`, resolved by the type
+    if (Fixed.unit() != 7) return 11;
+
+    return s.area() + t.Label + Square.unit() + Fixed.unit() + q.Label;  // 16+3+5+7+11
+}

@@ -1,29 +1,10 @@
-/**
- * f_arith — the fold-opaque MUL/ADD probe. `n` is a `mut` local, so const-folding may not collapse
- * the expression at compile time and the native backend must actually emit the two arithmetic
- * instructions.
- *
- * @return 42, the value `main.tks` pins
- */
-fn f_arith() -> i64 { mut n = 3; n * 10 + 12 }
+fn f_arith(): i64 { var n = 3; n * 10 + 12 }
 
-/**
- * f_sub — the fold-opaque MUL/SUB probe, the subtraction twin of `f_arith` and opaque for the same
- * reason: `n` is a `mut` local.
- *
- * @return 42, the value `main.tks` pins
- */
-fn f_sub() -> i64 { mut n = 3; n * 20 - 18 }
+fn f_sub(): i64 { var n = 3; n * 20 - 18 }
 
-/**
- * f_defer — a `defer` registered INSIDE a match arm must run when that arm's scope ends and its
- * write must be visible to the enclosing function afterwards.
- *
- * @return 101 — the initial 1 plus the deferred arm's +100
- */
-fn f_defer() -> i64 {
-    mut s = 1
-    let x = 1
+fn f_defer(): i64 {
+    var s = 1
+    var x = 1
     match x {
         1 => { defer { s = s + 100 } }
         _ => { }
@@ -31,72 +12,35 @@ fn f_defer() -> i64 {
     s
 }
 
-/**
- * f_exit_code — the smallest possible exit-code probe: a literal return the whole vertical must
- * carry from the emitter to the process status.
- *
- * @return 42
- */
-fn f_exit_code() -> i64 { 42 }
+fn f_exit_code(): i64 { 42 }
 
-/**
- * f_exit_zero — the SUCCESS status, pinned separately from `f_exit_code` because zero is the value
- * a broken vertical is most likely to produce by accident.
- *
- * @return 0
- */
-fn f_exit_zero() -> i64 { 0 }
+fn f_exit_zero(): i64 { 0 }
 
-/**
- * f_if_exit — an `if`/`else` whose BOTH arms diverge with `return`, so the function has no
- * fall-through tail for the emitter to reach.
- *
- * @return 1 — the then-arm, since 5 > 3
- */
-fn f_if_exit() -> i64 { if 5 > 3 { return 1 } else { return 2 } }
+fn f_if_exit(): i64 { if 5 > 3 { return 1 } else { return 2 } }
 
-/**
- * f_if_value_rhs_shadow — a value-`if` whose arm SHADOWS an outer `x` and whose enclosing block then
- * REASSIGNS that outer `x`. The shadow must not alias the outer binding, so the reassignment is the
- * value observed at the end.
- *
- * @return 7 — the reassigned outer `x` (the shadowed 99 cancels out through `seen - seen`)
- */
-fn f_if_value_rhs_shadow() -> i64 {
-    mut x = 1
-    mut seen = 0
+fn f_if_value_rhs_shadow(): i64 {
+    var x = 1
+    var seen = 0
     if 1 == 1 {
-        let y = if 1 == 1 { let x = 99; x } else { 0 }
+        var y = if 1 == 1 { var x = 99; x } else { 0 }
         seen = y
         x = 7
     }
     x + seen - seen
 }
 
-/**
- * f_logical_not — logical negation over a `bool` local and over two comparison expressions, each
- * guarding an early return so a mis-lowered `!` is observable as a wrong exit code.
- *
- * @return 7 — reached only when all three negations evaluate correctly
- */
-fn f_logical_not() -> i64 {
-    mut b = true
+fn f_logical_not(): i64 {
+    var b = true
     if !b { return 1 }
     if !(1 < 2) { return 2 }
     if !(2 < 1) { return 7 }
     0
 }
 
-/**
- * f_loop_nested_range — LABELLED control flow across nested range loops: `continue OUTER` from the
- * inner loop must resume the OUTER loop's next iteration, and `break OUTER` must leave both.
- *
- * @return 0 when the accumulated sum is the expected 4, else 1
- */
-fn f_loop_nested_range() -> i64 {
-    mut sum = 0
-    OUTER: loop mut i in 0..3 {
-        loop mut j in 0..3 {
+fn f_loop_nested_range(): i64 {
+    var sum = 0
+    OUTER: loop var i in 0..3 {
+        loop var j in 0..3 {
             if j == 2 { continue OUTER }
             if i == 2 { break OUTER }
             sum = sum + i + j
@@ -106,173 +50,88 @@ fn f_loop_nested_range() -> i64 {
     0
 }
 
-/**
- * f_loop_range_native — the four range-loop laws in one body: an exclusive range, an inclusive
- * range, `continue` inside a range, and a bound that is SNAPSHOT at loop entry (writing `n` inside
- * the body must not extend the iteration count).
- *
- * @return 0 when all four hold, else 1/2/3/4 naming the one that failed
- */
-fn f_loop_range_native() -> i64 {
-    mut s = 0
-    loop mut i in 0..3 { s = s + i }
+fn f_loop_range_native(): i64 {
+    var s = 0
+    loop var i in 0..3 { s = s + i }
     if s != 3 { return 1 }
-    mut s2 = 0
-    loop mut i in 0..=3 { s2 = s2 + i }
+    var s2 = 0
+    loop var i in 0..=3 { s2 = s2 + i }
     if s2 != 6 { return 2 }
-    mut s3 = 0
-    loop mut i in 0..5 { if i == 2 { continue }; s3 = s3 + i }
+    var s3 = 0
+    loop var i in 0..5 { if i == 2 { continue }; s3 = s3 + i }
     if s3 != 8 { return 3 }
-    mut n = 3
-    mut cnt = 0
-    loop mut i in 0..n { n = 100; cnt = cnt + 1 }
+    var n = 3
+    var cnt = 0
+    loop var i in 0..n { n = 100; cnt = cnt + 1 }
     if cnt != 3 { return 4 }
     0
 }
 
-/**
- * f_match_arm_reassign_vs_shadow — a match arm that REASSIGNS an outer local beside an arm that
- * SHADOWS it. The two must not share a slot: the taken arm decides which of the two effects the
- * caller observes.
- *
- * @return 6 — 5 from the reassigning arm plus 1 from the untouched outer binding
- */
-fn f_match_arm_reassign_vs_shadow() -> i64 {
-    let k1 = 1
-    mut a = 1
-    match k1 { 1 => { a = 5 }; _ => { mut a = 99; a = a + 1 } }
-    let k0 = 0
-    mut b = 1
-    match k0 { 1 => { b = 5 }; _ => { mut b = 99; b = b + 1 } }
+fn f_match_arm_reassign_vs_shadow(): i64 {
+    var k1 = 1
+    var a = 1
+    match k1 { 1 => { a = 5 }; _ => { var a = 99; a = a + 1 } }
+    var k0 = 0
+    var b = 1
+    match k0 { 1 => { b = 5 }; _ => { var b = 99; b = b + 1 } }
     a + b
 }
 
-/**
- * f_match_exit — a value-`match` used as the function's tail expression, so the arm's value is the
- * returned one.
- *
- * @return 7 — the arm selected by subject 0
- */
-fn f_match_exit() -> i64 { let k = 0; match k { 0 => 7; _ => 9 } }
+fn f_match_exit(): i64 { var k = 0; match k { 0 => 7; _ => 9 } }
 
-/**
- * f_match_reassign_then_shadow — one arm that first REASSIGNS the outer `x` and then SHADOWS it. The
- * shadow's later writes must not reach the outer binding the function returns.
- *
- * @return 3 — the reassignment, never the shadow's 100
- */
-fn f_match_reassign_then_shadow() -> i64 {
-    let k = 1
-    mut x = 1
-    match k { 1 => { x = 3; mut x = 99; x = x + 1 }; _ => { } }
+fn f_match_reassign_then_shadow(): i64 {
+    var k = 1
+    var x = 1
+    match k { 1 => { x = 3; var x = 99; x = x + 1 }; _ => { } }
     x
 }
 
-/**
- * f_value_if_rhs_reassign — a value-`if` whose arm REASSIGNS the outer local it also reads, so the
- * write must be visible both to the arm's own value and to the enclosing function.
- *
- * @return 5 — the reassigned `x` (the arm's value cancels through `seen - seen`)
- */
-fn f_value_if_rhs_reassign() -> i64 {
-    mut x = 1
-    mut seen = 0
-    if 1 == 1 { let y = if 1 == 1 { x = 5; x } else { 0 }; seen = y }
+fn f_value_if_rhs_reassign(): i64 {
+    var x = 1
+    var seen = 0
+    if 1 == 1 { var y = if 1 == 1 { x = 5; x } else { 0 }; seen = y }
     x + seen - seen
 }
 
-/**
- * f_null_union_reassign_to_null — (B-S1) the own backend must coerce into a null-union at EVERY
- * placement that declares a type, not only at the binding. `x = null` after a `T | null` binding
- * used to write a raw `const 0` into the VReg the following `match` then read as the wrapper's base
- * address — a load from address 0.
- *
- * @return 42 — 40 from the null arm plus 2 from the re-assigned value arm
- */
-fn f_null_union_reassign_to_null() -> i64 {
-    mut x: i64 | null = 5
+fn f_null_union_reassign_to_null(): i64 {
+    var x: i64 | null = 5
     x = null
-    let a = match x { i64 as v => v; null => 40 }
+    var a = match x { i64 as v => v; null => 40 }
     x = 2
-    let b = match x { i64 as v => v; null => 0 }
+    var b = match x { i64 as v => v; null => 0 }
     a + b
 }
 
-/**
- * LayoutPair — the STRUCT control of the class-layout probe. It is the arm of the native lowering's
- * layout collector that already worked, so a fix that broke it fails here instead of passing
- * quietly.
- */
 type LayoutPair = struct {
-    /** small — the leading 4-byte field, the one a wrong stride reads back wrong. */
     small: i32
 
-    /** big — the 8-byte field the leading one must not overlap. */
     big: i64
 
-    /** flag — the trailing 1-byte field, the one a wrong total size drops. */
     flag: bool
 }
 
-/**
- * LayoutBase — an ABSTRACT base whose fields are the PREFIX of every derived instance, which is
- * what field-flattening composition means for the emitted object.
- */
 type LayoutBase = abstract class {
-    /** small — the inherited 4-byte field. */
     pub small: i32
 
-    /** big — the inherited 8-byte field. */
     pub big: i64
 }
 
-/**
- * LayoutLeaf — the concrete leaf: `LayoutBase`'s two fields followed by its own two. An overlapping
- * or reordered slot shows up as a wrong read-back, never as a compile error.
- */
 type LayoutLeaf = class LayoutBase {
-    /** flag — the leaf's own 1-byte field, placed after the inherited prefix. */
     pub flag: bool
 
-    /** extra — the leaf's own 8-byte field. */
     pub extra: i64
 
-    /**
-     * make — the static factory, naming the INHERITED fields alongside its own.
-     *
-     * @param s  the inherited small field
-     * @param b  the inherited big field
-     * @param f  the own flag field
-     * @param e  the own extra field
-     * @return   a fresh LayoutLeaf
-     */
-    pub fn make(s: i32, b: i64, f: bool, e: i64) -> LayoutLeaf { LayoutLeaf { small = s; big = b; flag = f; extra = e } }
+    pub fn make(s: i32, b: i64, f: bool, e: i64): LayoutLeaf { LayoutLeaf { small = s; big = b; flag = f; extra = e } }
 
-    /**
-     * total — sums an INHERITED field with an OWN one, so a slot shared between the two halves of
-     * the flattened layout yields a wrong sum.
-     *
-     * @return small + big + extra
-     */
-    pub fn total(self) -> i64 { self.small + self.big + self.extra }
+    pub fn total(): i64 { self.small + self.big + self.extra }
 }
 
-/**
- * f_class_layout_effective_fields — a `ClassBody` must register the layout of its EFFECTIVE
- * instance fields. The native lowering collected a layout for a `StructBody` only; a `ClassBody`
- * fell through the catch-all arm of `collect_struct_layout_decl` and registered NOTHING, so EVERY
- * class instantiation died at compile time with "no layout registered for struct `…`" — one class
- * in one namespace, with no same-name type anywhere, was enough to trigger it.
- *
- * @return 0 when the struct control and every inherited and own field read back the value they were
- *         constructed with, else 1..8 naming the one that failed
- */
-fn f_class_layout_effective_fields() -> i64 {
-    let pair = LayoutPair { small = 3; big = 7; flag = true }
+fn f_class_layout_effective_fields(): i64 {
+    var pair = LayoutPair { small = 3; big = 7; flag = true }
     if pair.small != 3 { return 1 }
     if pair.big != 7 { return 2 }
     if !pair.flag { return 3 }
-    let leaf = LayoutLeaf::make(2, 13, true, 17)
+    var leaf = LayoutLeaf::make(2, 13, true, 17)
     if leaf.small != 2 { return 4 }
     if leaf.big != 13 { return 5 }
     if !leaf.flag { return 6 }
@@ -281,33 +140,19 @@ fn f_class_layout_effective_fields() -> i64 {
     0
 }
 
-/**
- * LpShade — a plain declared `enum`, whose value is its integer CARRIER rather than an address.
- * A slice of these is the non-primitive half of the register-value element set the native list
- * builtin lowers.
- */
 type LpShade = enum { Dim; Mid; Bright }
 
-/**
- * f_list_push_scalar_loop — the canonical accumulation the whole compiler is written in:
- * `loop { xs = teko::list::push(xs, …) }` growing an empty list, then read back by index. It
- * exercises the runtime's amortized grow (the in-place live-tail hit AND the geometric copy-grow,
- * since eight pushes cross several doublings) through the native lowering's `(ptr, len, &item,
- * sizeof, &out_len)` call shape.
- *
- * @return 0 when the length and every element read back as pushed, else 1..3 naming the failure
- */
-fn f_list_push_scalar_loop() -> i64 {
-    mut xs: []u64 = teko::list::empty()
-    mut i: u64 = 0
+fn f_list_push_scalar_loop(): i64 {
+    var xs: [8]u64 = []
+    var i: u64 = 0
     loop {
         if i >= 8 { break }
-        xs = teko::list::push(xs, i * 3)
+        xs[i] = i * 3
         i++
     }
     if xs.len != 8 { return 1 }
-    mut sum: u64 = 0
-    mut j: u64 = 0
+    var sum: u64 = 0
+    var j: u64 = 0
     loop {
         if j >= xs.len { break }
         sum = sum + xs[j]
@@ -318,19 +163,11 @@ fn f_list_push_scalar_loop() -> i64 {
     0
 }
 
-/**
- * f_list_push_value_semantics — a push RETURNS a new list and never mutates its base: two pushes
- * onto the SAME base must produce two independent lists, and the base itself must keep its own
- * length. This is the assertion the runtime's in-place live-tail cache is most likely to break, so
- * it is pinned separately from the plain accumulation.
- *
- * @return 0 when both branches and the shared base read back independently, else 1..5
- */
-fn f_list_push_value_semantics() -> i64 {
-    let base = teko::list::push(teko::list::push(teko::list::empty(), 10), 20)
-    let left = teko::list::push(base, 30)
-    let right = teko::list::push(base, 40)
-    if base.len != 2 { return 1 }
+fn f_list_push_value_semantics(): i64 {
+    var seed = [10, 20]
+    var left = [..seed, 30]
+    var right = [..seed, 40]
+    if seed.len != 2 { return 1 }
     if left.len != 3 { return 2 }
     if right.len != 3 { return 3 }
     if left[2] != 30 { return 4 }
@@ -338,61 +175,2757 @@ fn f_list_push_value_semantics() -> i64 {
     0
 }
 
-/**
- * f_list_push_fo_widths — the `teko::mem::push_fo` DECREE (the free-old-on-grow runtime entry) over
- * a NARROW element: a `[]u32` element is four bytes wide, so the `sizeof` the lowering hands the
- * runtime must be the ELEMENT's width and not the register's, or the buffer reads back shifted.
- *
- * @return 0 when the decreed chain reads back as pushed, else 1..3 naming the failure
- */
-fn f_list_push_fo_widths() -> i64 {
-    mut xs: []u32 = teko::list::empty()
-    mut i: u32 = 0
-    loop {
-        if i >= 6 { break }
-        xs = teko::mem::push_fo(xs, i + 100)
-        i++
-    }
-    if xs.len != 6 { return 1 }
-    if xs[0] != 100 { return 2 }
-    if xs[5] != 105 { return 3 }
-    0
-}
-
-/**
- * f_list_push_bool_and_enum — the two remaining register-value element classes: a `bool` (a
- * one-byte carrier) and a declared `enum` (its integer carrier). A slice of either must round-trip
- * through the grow with its own width.
- *
- * @return 0 when both slices read back as pushed, else 1..4 naming the failure
- */
-fn f_list_push_bool_and_enum() -> i64 {
-    mut marks: []bool = teko::list::empty()
-    marks = teko::list::push(marks, true)
-    marks = teko::list::push(marks, false)
-    marks = teko::list::push(marks, true)
+fn f_list_push_bool_and_enum(): i64 {
+    var marks: []bool = [true, false, true]
     if marks.len != 3 { return 1 }
     if !marks[0] { return 2 }
     if marks[1] { return 3 }
-    mut shades: []LpShade = teko::list::empty()
-    shades = teko::list::push(shades, LpShade::Bright)
-    shades = teko::list::push(shades, LpShade::Dim)
+    var shades: []LpShade = [LpShade::Bright, LpShade::Dim]
     if shades[0] != LpShade::Bright { return 4 }
     0
 }
 
-/**
- * f_list_empty_has_no_elements — a bare `teko::list::empty()` is the (null, 0) pair: its length is
- * zero with no runtime call at all, and pushing onto it starts a fresh buffer rather than growing
- * whatever the previous list left in the allocator's live-tail cache.
- *
- * @return 0 when the empty list is empty and the fresh push holds only its own item, else 1..3
- */
-fn f_list_empty_has_no_elements() -> i64 {
-    let e: []u64 = teko::list::empty()
+fn f_list_empty_has_no_elements(): i64 {
+    var e: []u64 = []
     if e.len != 0 { return 1 }
-    let one = teko::list::push(e, 7)
+    var one = [..e, 7]
     if one.len != 1 { return 2 }
     if one[0] != 7 { return 3 }
+    0
+}
+
+fn sc_yes(n: i64): bool { n >= 0 }
+
+fn sc_no(n: i64): bool { n < 0 }
+
+fn sc_trap(d: i64): bool { (10 / d) > 0 }
+
+fn f_short_circuit_and_or(): i64 {
+    if !(sc_yes(1) && sc_yes(2)) { return 1 }
+    if sc_yes(1) && sc_no(2) { return 2 }
+    if sc_no(1) && sc_yes(2) { return 3 }
+    if sc_no(1) && sc_no(2) { return 4 }
+    if !(sc_yes(1) || sc_no(2)) { return 5 }
+    if !(sc_no(1) || sc_yes(2)) { return 6 }
+    if sc_no(1) || sc_no(2) { return 7 }
+    if !(sc_yes(1) && sc_yes(2) && sc_yes(3)) { return 8 }
+    if sc_no(1) && sc_trap(0) { return 9 }
+    if !(sc_yes(1) || sc_trap(0)) { return 10 }
+    if !(sc_yes(1) && sc_no(2) || sc_yes(3)) { return 11 }
+    0
+}
+
+type BoxPt = struct {
+    x: i64
+
+    y: i64
+}
+
+type BoxCounter = class {
+    pub seen: i64
+
+    pub fn make(v: i64): BoxCounter { BoxCounter { seen = v } }
+}
+
+fn push_pts(n: i64): []BoxPt {
+    var ps: [n]BoxPt = []
+    var i: i64 = 0
+    loop {
+        if i >= n { break }
+        ps[i] = BoxPt { x = i; y = i * 10 }
+        i++
+    }
+    ps
+}
+
+fn f_push_aggregate_in_loop(): i64 {
+    var ps = push_pts(4)
+    if ps.len != 4 { return 1 }
+    var i: i64 = 0
+    loop {
+        if i >= 4 { break }
+        if ps[i].x != i { return 2 }
+        if ps[i].y != i * 10 { return 3 }
+        i++
+    }
+    if ps[0].x == ps[3].x { return 4 }
+    if ps[0].y == ps[3].y { return 5 }
+    0
+}
+
+fn f_push_aggregate_copies_the_item(): i64 {
+    var p = BoxPt { x = 1; y = 2 }
+    var ps: []BoxPt = [p]
+    p.x = 99
+    p.y = 98
+    if ps.len != 1 { return 1 }
+    if ps[0].x != 1 { return 2 }
+    if ps[0].y != 2 { return 3 }
+    0
+}
+
+fn f_push_class_in_loop(): i64 {
+    var cs: [3]BoxCounter = []
+    var i: i64 = 0
+    loop {
+        if i >= 3 { break }
+        cs[i] = BoxCounter::make(i * 7)
+        i++
+    }
+    if cs.len != 3 { return 1 }
+    if cs[0].seen != 0 { return 2 }
+    if cs[1].seen != 7 { return 3 }
+    if cs[2].seen != 14 { return 4 }
+    0
+}
+
+fn fat_match_word(n: i64): str {
+    match n {
+        0 => "zero"
+        1 => "one"
+        2 => "two"
+        _ => "many"
+    }
+}
+
+fn fat_match_digits(n: i64): []i64 {
+    match n {
+        1 => [7]
+        2 => [7, 8]
+        _ => [7, 8, 9]
+    }
+}
+
+fn fat_match_with_reassign(n: i64): i64 {
+    var count: i64 = 0
+    var word = match n {
+        1 => { count = 10; "a" }
+        _ => { count = 20; "bb" }
+    }
+    count + (word.len to i64)
+}
+
+fn f_fat_match_value(): i64 {
+    if fat_match_word(0).len != 4 { return 1 }
+    if fat_match_word(0)[0] != b'z' { return 2 }
+    if fat_match_word(2).len != 3 { return 3 }
+    if fat_match_word(2)[0] != b't' { return 4 }
+    if fat_match_word(9).len != 4 { return 11 }
+    if fat_match_word(9)[0] != b'm' { return 12 }
+    if fat_match_word(1)[2] != b'e' { return 13 }
+    if fat_match_digits(1).len != 1 { return 5 }
+    if fat_match_digits(2).len != 2 { return 6 }
+    if fat_match_digits(5).len != 3 { return 7 }
+    if fat_match_digits(2)[1] != 8 { return 8 }
+    if fat_match_with_reassign(1) != 11 { return 9 }
+    if fat_match_with_reassign(4) != 22 { return 10 }
+    0
+}
+
+fn fat_variant_digits(n: i64): []i64 | error {
+    if n == 0 { return error { message = "empty" } }
+    var xs: [n]i64 = []
+    var i: i64 = 0
+    loop {
+        if i >= n { break }
+        xs[i] = i * 3
+        i++
+    }
+    return xs
+}
+
+fn fat_variant_digits_len(n: i64): i64 {
+    match fat_variant_digits(n) {
+        []i64 as xs => xs.len to i64
+        error => 0 - 1
+    }
+}
+
+fn fat_variant_digits_sum(n: i64): i64 {
+    match fat_variant_digits(n) {
+        []i64 as xs => {
+            var acc: i64 = 0
+            var i: u64 = 0
+            loop {
+                if i >= xs.len { break }
+                acc = acc + xs[i]
+                i++
+            }
+            acc
+        }
+        error => 0 - 1
+    }
+}
+
+fn fat_variant_word(n: i64): str | error {
+    if n == 0 { return error { message = "empty" } }
+    if n == 1 { return "a" }
+    return "abcde"
+}
+
+fn fat_variant_word_len(n: i64): i64 {
+    match fat_variant_word(n) {
+        str as s => s.len to i64
+        error => 0 - 1
+    }
+}
+
+fn fat_null_union_word(n: i64): str | null {
+    if n == 0 { return null }
+    return "xyz"
+}
+
+fn f_variant_fat_member(): i64 {
+    if fat_variant_digits_len(3) != 3 { return 1 }
+    if fat_variant_digits_len(7) != 7 { return 2 }
+    if fat_variant_digits_len(0) != 0 - 1 { return 3 }
+    if fat_variant_digits_sum(4) != 18 { return 4 }
+    if fat_variant_word_len(1) != 1 { return 5 }
+    if fat_variant_word_len(2) != 5 { return 6 }
+    if fat_variant_word_len(0) != 0 - 1 { return 7 }
+    match fat_null_union_word(1) {
+        str as s => {
+            if s.len != 3 { return 8 }
+            if s[2] != b'z' { return 9 }
+        }
+        null => { return 10 }
+    }
+    match fat_variant_word(2) {
+        str as s => { if s[4] != b'e' { return 11 } }
+        error => { return 12 }
+    }
+    0
+}
+
+fn str_eq_word(n: i64): str {
+    if n == 0 { return "alpha" }
+    if n == 1 { return "alphb" }
+    ""
+}
+
+fn f_str_equality(): i64 {
+    var a = "alpha"
+    var b = str_eq_word(0)
+    var c = str_eq_word(1)
+    if !(a == b) { return 1 }
+    if a != b { return 2 }
+    if a == c { return 3 }
+    if !(a != c) { return 4 }
+    if a == "alph" { return 5 }
+    if a == "alphaa" { return 6 }
+    if !("" == str_eq_word(9)) { return 7 }
+    if "" != str_eq_word(9) { return 8 }
+    if "" == a { return 9 }
+    0
+}
+
+type DvCircle = struct {
+    r: i64
+}
+
+type DvSquare = struct {
+    s: i64
+}
+
+type DvTri = struct {
+    t: i64
+}
+
+type DvShape = variant DvCircle | DvSquare | DvTri
+
+fn dv_pick(n: i64): DvShape {
+    if n == 0 { return DvCircle { r = 7 } }
+    if n == 1 { return DvSquare { s = 9 } }
+    DvTri { t = 11 }
+}
+
+fn f_declared_variant_arms(): i64 {
+    match dv_pick(0) {
+        DvCircle as c => { if c.r != 7 { return 1 } }
+        DvSquare as s => { return 2 }
+        DvTri as t => { return 3 }
+    }
+    match dv_pick(1) {
+        DvCircle as c => { return 4 }
+        DvSquare as s => { if s.s != 9 { return 5 } }
+        DvTri as t => { return 6 }
+    }
+    match dv_pick(2) {
+        DvCircle as c => { return 7 }
+        DvSquare as s => { return 8 }
+        DvTri as t => { if t.t != 11 { return 9 } }
+    }
+    0
+}
+
+fn dv_arm_code(n: i64): i64 {
+    match dv_pick(n) {
+        DvCircle as c => 1
+        DvSquare as s => 2
+        DvTri as t => 3
+    }
+}
+
+fn f_declared_variant_match_value(): i64 {
+    if dv_arm_code(0) != 1 { return 1 }
+    if dv_arm_code(1) != 2 { return 2 }
+    if dv_arm_code(2) != 3 { return 3 }
+    match dv_pick(2) {
+        DvCircle => { return 4 }
+        DvSquare => { return 5 }
+        DvTri => { }
+    }
+    match dv_pick(0) {
+        DvCircle { r } => { if r != 7 { return 6 } }
+        DvSquare { s } => { return 7 }
+        DvTri { t } => { return 8 }
+    }
+    match dv_pick(1) {
+        DvCircle { r } => { return 9 }
+        DvSquare { s } => { if s != 9 { return 10 } }
+        DvTri { t } => { return 11 }
+    }
+    0
+}
+
+type DvBoxOrErr = variant DvCircle | DvSquare | error
+
+fn dv_or_err(n: i64): DvBoxOrErr {
+    if n == 0 { return error { message = "dv" } }
+    if n == 1 { return DvCircle { r = 7 } }
+    DvSquare { s = 9 }
+}
+
+fn dv_maybe_circle(n: i64): DvCircle | null {
+    if n == 0 { return null }
+    DvCircle { r = 7 }
+}
+
+fn f_declared_variant_error_and_null(): i64 {
+    match dv_or_err(0) {
+        error as e => { }
+        DvCircle as c => { return 1 }
+        DvSquare as s => { return 2 }
+    }
+    match dv_or_err(1) {
+        error as e => { return 3 }
+        DvCircle as c => { if c.r != 7 { return 4 } }
+        DvSquare as s => { return 5 }
+    }
+    match dv_or_err(2) {
+        error as e => { return 6 }
+        DvCircle as c => { return 7 }
+        DvSquare as s => { if s.s != 9 { return 8 } }
+    }
+    match dv_maybe_circle(0) {
+        null => { }
+        DvCircle as c => { return 9 }
+    }
+    match dv_maybe_circle(1) {
+        null => { return 10 }
+        DvCircle as c => { if c.r != 7 { return 11 } }
+    }
+    0
+}
+
+fn pad_word(n: i64, width: u64): str {
+    var out = $"n={n}"
+    loop {
+        if out.len >= width { break }
+        out = teko::str::concat(out, " ")
+    }
+    out
+}
+
+fn self_interp_loop(n: i64): str {
+    var out = "a"
+    var i: i64 = 0
+    loop {
+        if i >= n { break }
+        out = $"{out}"
+        i = i + 1
+    }
+    out
+}
+
+fn f_interp_fat_positions(): i64 {
+    var p = pad_word(7, 6 to u64)
+    if p.len != 6 { return 1 }
+    if p != "n=7   " { return 2 }
+    var s = self_interp_loop(3)
+    if s.len != 1 { return 3 }
+    if s != "a" { return 4 }
+    var x: i64 = 12
+    var y = "mid"
+    var multi = $"x={x}-{y}-end"
+    if multi.len != 12 { return 5 }
+    if multi != "x=12-mid-end" { return 6 }
+    var joined = teko::str::concat("a", "b", "c", "d")
+    if joined.len != 4 { return 7 }
+    if joined != "abcd" { return 8 }
+    0
+}
+
+type FatHolder = struct { name: str; n: i64 }
+
+type FatHolderShift = struct { n: i64; name: str }
+
+type FatSliceHolder = struct { xs: []i64; n: i64 }
+
+fn f_fat_field_roundtrip(): i64 {
+    var h = FatHolder { name = "abcde"; n = 7 }
+    if h.n != 7 { return 1 }
+    if h.name.len != 5 { return 2 }
+    if h.name != "abcde" { return 3 }
+    0
+}
+
+fn f_fat_field_offset_shift(): i64 {
+    var h = FatHolderShift { n = 7; name = "abcde" }
+    if h.n != 7 { return 1 }
+    if h.name.len != 5 { return 2 }
+    if h.name != "abcde" { return 3 }
+    0
+}
+
+fn f_fat_field_reassign(): i64 {
+    var h = FatHolder { name = "abcde"; n = 7 }
+    h.name = "xy"
+    if h.name.len != 2 { return 1 }
+    if h.name != "xy" { return 2 }
+    0
+}
+
+fn f_fat_field_len(s: str): i64 { s.len to i64 }
+
+fn f_fat_field_as_argument(): i64 {
+    var h = FatHolder { name = "abcde"; n = 7 }
+    if f_fat_field_len(h.name) != 5 { return 1 }
+    0
+}
+
+fn f_fat_slice_field(): i64 {
+    var h = FatSliceHolder { xs = [10, 20, 30]; n = 1 }
+    if h.xs.len != 3 { return 1 }
+    if h.xs[2] != 30 { return 2 }
+    0
+}
+
+fn f_fat_slice_literal_index(): i64 {
+    var xs: []str = ["one", "two", "three"]
+    if xs.len != 3 { return 1 }
+    if xs[0].len != 3 { return 2 }
+    if xs[0] != "one" { return 3 }
+    if xs[1] != "two" { return 4 }
+    if xs[2] != "three" { return 5 }
+    0
+}
+
+fn f_fat_slice_push_in_loop(): i64 {
+    var names: []str = ["alpha", "beta", "gamma", "delta"]
+    var out: [names.len]str = []
+    var i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        out[i] = names[i]
+        i++
+    }
+    if out.len != 4 { return 1 }
+    if out[0].len != 5 { return 2 }
+    if out[0] != "alpha" { return 3 }
+    if out[3] != "delta" { return 4 }
+    0
+}
+
+fn f_str_contains_and_ends_with(): i64 {
+    if !"hello world".contains("lo wo") { return 1 }
+    if "hello world".contains("xyz") { return 2 }
+    if !"hello".contains("") { return 3 }
+    if !"hello world".ends_with("world") { return 4 }
+    if "hello world".ends_with("worldx") { return 5 }
+    if !"hello".ends_with("") { return 6 }
+    0
+}
+
+fn f_str_slice_family(): i64 {
+    var s = "hello world"
+    var mid = s.slice(6, 11)
+    if mid.len != 5 { return 1 }
+    if mid != "world" { return 2 }
+    var head = s.slice_to(5)
+    if head.len != 5 { return 3 }
+    if head != "hello" { return 4 }
+    var tail = s.slice_from(6)
+    if tail.len != 5 { return 5 }
+    if tail != "world" { return 6 }
+    0
+}
+
+type AliasCorpusS = str
+
+type AliasCorpusHolder = struct { s: AliasCorpusS; n: i64 }
+
+fn f_alias_fat_field(): i64 {
+    var h = AliasCorpusHolder { s = "abcde"; n = 41 }
+    if h.n != 41 { return 1 }
+    if h.s.len != 5 { return 2 }
+    if h.s != "abcde" { return 3 }
+    0
+}
+
+type OwnedFatCorpus<T> = struct { value: T; sibling: i64 }
+
+fn f_owned_fat_field(): i64 {
+    var h = OwnedFatCorpus<str> { value = "abcde"; sibling = 41 }
+    if h.sibling != 41 { return 1 }
+    if h.value.len != 5 { return 2 }
+    if h.value != "abcde" { return 3 }
+    0
+}
+
+fn f_int_to_str(): i64 {
+    if teko::u64_to_str(0) != "0" { return 1 }
+    if teko::u64_to_str(42) != "42" { return 2 }
+    var u64_max: u64 = 18446744073709551615
+    if teko::u64_to_str(u64_max) != "18446744073709551615" { return 3 }
+    if teko::i64_to_str(0) != "0" { return 4 }
+    if teko::i64_to_str(42) != "42" { return 5 }
+    if teko::i64_to_str(-42) != "-42" { return 6 }
+    var i64_max: i64 = 9223372036854775807
+    if teko::i64_to_str(i64_max) != "9223372036854775807" { return 7 }
+    var i64_min: i64 = -9223372036854775808
+    if teko::i64_to_str(i64_min) != "-9223372036854775808" { return 8 }
+    0
+}
+
+fn gcd_subtract(x: i64, y: i64): i64 {
+    var a = x
+    var b = y
+    loop {
+        if a == b { return a }
+        loop { if a <= b { break }; a = a - b }
+        loop { if b <= a { break }; b = b - a }
+    }
+}
+
+fn f_loop_tail_no_break(): i64 {
+    if gcd_subtract(30, 18) != 6 { return 1 }
+    if gcd_subtract(17, 5) != 1 { return 2 }
+    if gcd_subtract(9, 9) != 9 { return 3 }
+    0
+}
+
+fn strip_leading_hash_lines(text: str): str {
+    var rest = text
+    loop {
+        if rest.len == 0 || rest[0] != b'#' { return rest }
+        var k: u64 = 0
+        loop {
+            if k >= rest.len { break }
+            if rest[k] == b'\n' { break }
+            k = k + 1
+        }
+        if k >= rest.len { return "" }
+        rest = rest.slice(k + 1, rest.len)
+    }
+}
+
+fn f_fat_loop_tail_no_break(): i64 {
+    if strip_leading_hash_lines("hello") != "hello" { return 1 }
+    if strip_leading_hash_lines("#a\nhello") != "hello" { return 2 }
+    if strip_leading_hash_lines("#a\n#b\nhello") != "hello" { return 3 }
+    if strip_leading_hash_lines("#a") != "" { return 4 }
+    if strip_leading_hash_lines("") != "" { return 5 }
+    0
+}
+
+type GBox<T> = struct { value: T }
+
+fn make_gbox_i64(ok: bool): GBox<i64> | error {
+    if !ok { return error { message = "no" } }
+    GBox<i64> { value = 99 }
+}
+
+fn make_gbox_str(ok: bool): GBox<str> | error {
+    if !ok { return error { message = "no" } }
+    GBox<str> { value = "hi" }
+}
+
+fn f_generic_variant_match(): i64 {
+    match make_gbox_i64(true) {
+        GBox<i64> as b => { if b.value != 99 { return 1 } }
+        error => return 2
+    }
+    match make_gbox_i64(false) {
+        GBox<i64> as b => return 3
+        error as e => { if e.message != "no" { return 4 } }
+    }
+    match make_gbox_str(true) {
+        GBox<str> as b => { if b.value != "hi" { return 5 } }
+        error => return 6
+    }
+    match make_gbox_str(false) {
+        GBox<str> as b => return 7
+        error as e => { if e.message != "no" { return 8 } }
+    }
+    0
+}
+
+fn f_last_index_of(): i64 {
+    match teko::str::last_index_of("hello world", "o") {
+        u64 as i => { if i != 7 { return 1 } }
+        error => return 2
+    }
+    match teko::str::last_index_of("hello world", "xyz") {
+        u64 as i => return 3
+        error as e => { if e.message != "" { return 4 } }
+    }
+    match teko::str::last_index_of("hello world", "") {
+        u64 as i => { if i != 11 { return 5 } }
+        error => return 6
+    }
+    match teko::str::last_index_of("aaa", "a") {
+        u64 as i => { if i != 2 { return 7 } }
+        error => return 8
+    }
+    0
+}
+
+fn f_str_of_bytes(): i64 {
+    var bs: []byte = [b'h', b'i', b'!']
+    var s = str_of_bytes(bs)
+    if s.len != 3 { return 1 }
+    if s != "hi!" { return 2 }
+    var empty: []byte = []
+    var es = str_of_bytes(empty)
+    if es.len != 0 { return 3 }
+    if es != "" { return 4 }
+    0
+}
+
+fn f_host_info(): i64 {
+    var os = os()
+    if os != "linux" && os != "macos" && os != "windows" && os != "unknown" { return 1 }
+    var arch = arch()
+    if arch != "x86_64" && arch != "arm64" && arch != "unknown" { return 2 }
+    var ver = teko::env::version()
+    if ver.len > 64 { return 3 }
+    var rss = teko::mem::peak_rss()
+    if rss > 1099511627776 { return 4 }
+    0
+}
+
+type RdPoint = struct { x: i64; y: i64 }
+
+fn rd_bump_scalar(ref n: u64) {
+    n.value = n.value + 1
+}
+
+fn rd_bump_point(ref p: RdPoint) {
+    p.value = RdPoint { x = p.x + 1; y = p.y * 2 }
+}
+
+fn rd_set_msg(ref s: str, v: str) {
+    s.value = v
+}
+
+fn rd_tick_fn(ref last: u64, ref total: u64): action<u64, u64> {
+    (n: u64, m: u64) => {
+        last.value = n
+        total.value = m
+    }
+}
+
+fn rd_loop_sum(ref acc: u64, n: u64) {
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        acc.value = acc.value + i
+        i = i + 1
+    }
+}
+
+fn f_ref_deref_assign(): i64 {
+    var n: u64 = 5
+    rd_bump_scalar(n)
+    if n != 6 { return 1 }
+    rd_bump_scalar(n)
+    if n != 7 { return 2 }
+    var p = RdPoint { x = 1; y = 2 }
+    rd_bump_point(p)
+    if p.x != 2 { return 3 }
+    if p.y != 4 { return 4 }
+    rd_bump_point(p)
+    if p.x != 3 { return 5 }
+    if p.y != 8 { return 6 }
+    var s: str = "a"
+    rd_set_msg(s, "hello")
+    if s.len != 5 { return 7 }
+    if s != "hello" { return 8 }
+    rd_set_msg(s, "hi")
+    if s.len != 2 { return 9 }
+    if s != "hi" { return 10 }
+    var last: u64 = 0
+    var total: u64 = 0
+    var tick = rd_tick_fn(last, total)
+    tick(3, 10)
+    if last != 3 { return 11 }
+    if total != 10 { return 12 }
+    tick(7, 20)
+    if last != 7 { return 13 }
+    if total != 20 { return 14 }
+    var acc: u64 = 0
+    rd_loop_sum(acc, 5)
+    if acc != 10 { return 15 }
+    0
+}
+
+fn f_static_format_spec(): i64 {
+    var n: i64 = 255
+    if $"{n:D5}" != "00255" { return 1 }
+    if $"{n:D}" != "255" { return 2 }
+    if $"{n:X}" != "FF" { return 3 }
+    if $"{n:x}" != "ff" { return 4 }
+    if $"{n:b}" != "11111111" { return 5 }
+    var big: i64 = 1234567
+    if $"{big:N}" != "1,234,567" { return 6 }
+    var neg: i64 = -1
+    if $"{neg:X}" != "FFFFFFFFFFFFFFFF" { return 7 }
+    if $"{neg:b}" != "1111111111111111111111111111111111111111111111111111111111111111" { return 8 }
+    var u: u64 = 10
+    if $"{u:D3}" != "010" { return 9 }
+    if $"{u:X}" != "A" { return 10 }
+    0
+}
+
+fn f_dynamic_format_spec(): i64 {
+    var n: i64 = 255
+    var spec_d5: str = "D5"
+    if $"{n:[spec_d5]}" != "00255" { return 1 }
+    var spec_x_up: str = "X"
+    if $"{n:[spec_x_up]}" != "FF" { return 2 }
+    var spec_x_lo: str = "x"
+    if $"{n:[spec_x_lo]}" != "ff" { return 3 }
+    var spec_b: str = "b"
+    if $"{n:[spec_b]}" != "11111111" { return 4 }
+    var big: i64 = 1234567
+    var spec_n: str = "N"
+    if $"{big:[spec_n]}" != "1,234,567" { return 5 }
+    var u: u64 = 10
+    if $"{u:[spec_x_up]}" != "A" { return 6 }
+    0
+}
+
+fn ces_char_word(n: i64): char {
+    if n == 0 { return c'a' }
+    if n == 1 { return c'b' }
+    c'a'
+}
+
+fn f_char_and_slice_equality(): i64 {
+    if !(ces_char_word(0) == ces_char_word(0)) { return 1 }
+    if ces_char_word(0) == ces_char_word(1) { return 2 }
+    if ces_char_word(0) != ces_char_word(0) { return 3 }
+    if !(ces_char_word(0) != ces_char_word(1)) { return 4 }
+    if !(c'é' == c'é') { return 5 }
+    if c'é' == c'🐝' { return 6 }
+    if !(c'é' != c'🐝') { return 7 }
+
+    var ints_a = [1, 2, 3]
+    var ints_b = [1, 2, 3]
+    var ints_c = [1, 2, 4]
+    var ints_d = [1, 2, 3, 4]
+    var ints_empty_1: []i64 = []
+    var ints_empty_2: []i64 = []
+    if !(ints_a == ints_b) { return 8 }
+    if ints_a == ints_c { return 9 }
+    if ints_a == ints_d { return 10 }
+    if !(ints_a != ints_c) { return 11 }
+    if !(ints_empty_1 == ints_empty_2) { return 12 }
+    if ints_empty_1 == ints_a { return 13 }
+
+    var strs_a = ["café🐝", "beta"]
+    var strs_b = ["café🐝", "beta"]
+    var strs_c = ["café🐝", "betb"]
+    var strs_d = ["café🐝", "beta", "gamma"]
+    var strs_empty_1: []str = []
+    var strs_empty_2: []str = []
+    if !(strs_a == strs_b) { return 14 }
+    if strs_a == strs_c { return 15 }
+    if strs_a == strs_d { return 16 }
+    if !(strs_a != strs_c) { return 17 }
+    if !(strs_empty_1 == strs_empty_2) { return 18 }
+    if strs_empty_1 == strs_a { return 19 }
+
+    var chars_a = [c'c', c'a', c'f', c'é', c'🐝']
+    var chars_b = [c'c', c'a', c'f', c'é', c'🐝']
+    var chars_c = [c'c', c'a', c'f', c'e']
+    if !(chars_a == chars_b) { return 20 }
+    if chars_a == chars_c { return 21 }
+    if !(chars_a != chars_c) { return 22 }
+    0
+}
+
+fn f_bytes_of_str(): i64 {
+    var s = "café🐝"
+    var bs = s.bytes()
+    if bs.len != 9 { return 1 }
+    if str_of_bytes(bs) != s { return 2 }
+    var empty = ""
+    var ebs = empty.bytes()
+    if ebs.len != 0 { return 3 }
+    0
+}
+
+fn f_str_from_utf8(): i64 {
+    var s = "café🐝"
+    var bs = s.bytes()
+    match teko::text::str_from_utf8(bs) {
+        str as r => { if r != s { return 1 } }
+        error => return 2
+    }
+    var lone_continuation: []byte = [0x80 to byte, 0x41 to byte]
+    match teko::text::str_from_utf8(lone_continuation) {
+        str => return 3
+        error as e => { if e.message != "invalid UTF-8" { return 4 } }
+    }
+    var truncated_lead: []byte = [0x41 to byte, 0xE2 to byte, 0x82 to byte]
+    match teko::text::str_from_utf8(truncated_lead) {
+        str => return 5
+        error as e => { if e.message != "invalid UTF-8" { return 6 } }
+    }
+    0
+}
+
+fn f_error_diagnostic_fields(): i64 {
+    var e = error { message = "x" }
+    if e.line != 0 { return 1 }
+    if e.col != 0 { return 2 }
+    if e.file != "" { return 3 }
+    if e.expected != "" { return 4 }
+    if e.actual != "" { return 5 }
+    if e.message != "x" { return 6 }
+    match mk_error_union() {
+        str => return 7
+        error as w => {
+            if w.line != 0 { return 8 }
+            if w.message != "y" { return 9 }
+        }
+    }
+    0
+}
+
+fn mk_error_union(): str | error { error { message = "y" } }
+
+fn f_err_loc(): i64 {
+    var orig = error { message = "boom" }
+    var adorned = teko::error::err_loc(orig, 7, 3)
+    if adorned.line != 7 { return 1 }
+    if adorned.col != 3 { return 2 }
+    if adorned.message != "boom" { return 3 }
+    if orig.line != 0 { return 4 }
+    if orig.col != 0 { return 5 }
+    0
+}
+
+fn f_err_typed(): i64 {
+    var orig = teko::error::err_loc(error { message = "mismatch" }, 11, 4)
+    var adorned = teko::error::err_typed(orig, "i64", "str")
+    if adorned.expected != "i64" { return 1 }
+    if adorned.actual != "str" { return 2 }
+    if adorned.line != 11 { return 3 }
+    if adorned.message != "mismatch" { return 4 }
+    if orig.expected != "" { return 5 }
+    if orig.actual != "" { return 6 }
+    0
+}
+
+fn takes_bool_arg(b: bool): i32 {
+    if b { 1 } else { 0 }
+}
+
+fn eq_null_ret(a: i32 | null): bool {
+    a == null
+}
+
+fn f_variant_member_compare(): i64 {
+    var some: i32 | null = 7
+    var none: i32 | null = null
+
+    if some == null { return 1 }
+    if some != null { } else { return 2 }
+    if none != null { return 3 }
+    if none == null { } else { return 4 }
+
+    var l1: bool = some != null
+    if !l1 { return 5 }
+    var l2: bool = none == null
+    if !l2 { return 6 }
+
+    if takes_bool_arg(some != null) != 1 { return 7 }
+    if takes_bool_arg(none == null) != 1 { return 8 }
+
+    if eq_null_ret(some) { return 9 }
+    if !eq_null_ret(none) { return 10 }
+
+    if some != 7 { return 11 }
+    if some == 7 { } else { return 12 }
+
+    0
+}
+
+fn wide_product(a: u32, b: u32): u64 { (a to u64) * b }
+
+fn f_d1_boundary_widen_cast_compiles(): i64 {
+    if (wide_product(7 to u32, 6 to u32) & 255) != 42 { return 1 }
+    0
+}
+
+fn spread_di(a: u32, b: u32): i64 {
+    var d = (a to i64) - (b to i64)
+    if d < 0 && (a to i64) < (b to i64) { return 42 }
+    0
+}
+
+fn f_d1_cast_pair_parity(): i64 {
+    spread_di(1 to u32, 2 to u32)
+}
+
+fn bump_through(ref p: i64) {
+    ref q: i64 = p
+    q = 42
+}
+
+fn probe_mcni(): i64 {
+    var n: i64 = 1
+    bump_through(n)
+    n
+}
+
+fn f_ref_forwarding_same_referent_compiles(): i64 {
+    probe_mcni()
+}
+
+fn f_tilde_concat(): i64 {
+    var x = "hello"
+    var y = "world"
+    var a = "lit" ~ "eral" ~ "-fold"
+    var b = x ~ " " ~ y
+    var c = "pre-" ~ "fix-" ~ x ~ "-suf" ~ "-fix"
+
+    var name = "world"
+    var m1 = "foo" ~ "bar"
+    var m2 = @"C:\raw" ~ "-tail"
+    var m3 = """multi
+line""" ~ "-tail"
+    var m4 = @"""verbatim
+multi""" ~ "-tail"
+    var m5 = $"hi {name}" ~ "!"
+    var m6 = $"""hi
+{name}""" ~ "!"
+    var m7 = $@"raw {name}\n" ~ "!"
+    var m8 = $@"""raw
+{name}""" ~ "!"
+    var m9 = "pre-" ~ @"""mid
+part""" ~ name ~ "-post"
+    var m10 = $"no holes here" ~ "-tail"
+    var m11 = $@"""no holes
+multiline""" ~ "-tail"
+
+    var total = a.len + b.len + c.len + m1.len + m2.len + m3.len + m4.len + m5.len + m6.len + m7.len + m8.len + m9.len + m10.len + m11.len
+    if total != 198 { return 1 }
+    0
+}
+
+fn grow_bridge<T>(ref x: []T, v: T) {
+    x[2] = v
+}
+
+fn f_list_grow_bridge(): i64 {
+    var x: [3]i64 = [1, 2]
+    grow_bridge(x, 3)
+    if x.len != 3 { return 1 }
+    if x[0] != 1 { return 1 }
+    if x[1] != 2 { return 1 }
+    if x[2] != 3 { return 1 }
+    0
+}
+
+pub extern fn c_abs(x: i32): i32 = "abs"
+
+fn f_c_extern_unsafe_accepted(): i64 {
+    var negated: i32 = -42
+    if c_abs(negated) != 42 { return 1 }
+    0
+}
+
+pub type c_int = i32
+
+pub type c_uchar = u8
+
+pub type c_ulonglong = u64
+
+fn round_trip_int(i: c_int): c_int {
+    i
+}
+
+fn round_trip_uchar(u: c_uchar): c_uchar {
+    u
+}
+
+fn round_trip_ulonglong(n: c_ulonglong): c_ulonglong {
+    n
+}
+
+fn f_c_types_alias_identity(): i64 {
+    var i: c_int = 5
+    var u: c_uchar = 2
+    var n: c_ulonglong = 0
+    var ri = round_trip_int(i)
+    var ru = round_trip_uchar(u)
+    var rn = round_trip_ulonglong(n)
+    var total: i32 = ri + ru + (rn to i32)
+    if total != 7 { return 1 }
+    0
+}
+
+fn f_qualified_optional_cross_ns(): i64 {
+    if qualified_optional_ns::scenario() != 22 { return 1 }
+    0
+}
+
+fn f_member_const_cross_ns_pub_inherit(): i64 {
+    var s = sub::Sub::make(7)
+    if sub::reach() != 5 { return 1 }
+    if s.kind() != 7 { return 2 }
+    0
+}
+
+fn f_same_bare_method_dispatch(): i64 {
+    if same_bare_method_dispatch_ns::scenario() != 10 { return 1 }
+    0
+}
+
+fn f_native_gate_coercions(): i64 {
+    if native_gate::scenario() != 21 { return 1 }
+    0
+}
+
+type Point_iface = struct {
+    x: i64
+    y: i64
+}
+
+fn sum_or(p: Point_iface | null, fallback: i64): i64 {
+    match p { Point_iface as v => v.x + v.y; null => fallback }
+}
+
+fn f_null_union_struct_present_and_absent(): i64 {
+    var present: Point_iface | null = Point_iface { x = 10; y = 20 }
+    var absent: Point_iface | null = null
+    if sum_or(present, 0) + sum_or(absent, 12) != 42 { return 1 }
+    0
+}
+
+type Counter_mcni = class {
+    pub n: i64
+
+    pub fn make(v: i64): Counter_mcni { Counter_mcni { n = v } }
+
+    pub fn bump(): i64 { self.n + 1 }
+}
+
+fn bump_or(c: Counter_mcni | null, fallback: i64): i64 {
+    match c { Counter_mcni as v => v.bump(); null => fallback }
+}
+
+fn f_null_union_class_present_and_absent(): i64 {
+    var present: Counter_mcni | null = Counter_mcni::make(9)
+    var absent: Counter_mcni | null = null
+    if bump_or(present, 0) + bump_or(absent, 32) != 42 { return 1 }
+    0
+}
+
+type Point_mcni = struct {
+    x: i64
+    y: i64
+}
+
+fn maybe_point(present: bool): Point_mcni | null {
+    if present { return Point_mcni { x = 21; y = 21 } }
+    null
+}
+
+fn read_or(p: Point_mcni | null, fallback: i64): i64 {
+    match p { Point_mcni as v => v.x + v.y; null => fallback }
+}
+
+fn f_forward_un_narrowed_null_union_return(): i64 {
+    if read_or(maybe_point(true), 0) + read_or(maybe_point(false), 0) != 42 { return 1 }
+    0
+}
+
+fn f_match_value_literal_join(): i64 {
+    var present: i32 | null = 7
+    var r = match present { i32 as n => n; null => 0 }
+    if r != 7 { return 1 }
+    var absent: i32 | null = null
+    var s = match absent { i32 as n => n; null => 0 }
+    if s != 0 { return 2 }
+    var reordered: i32 | null = 3
+    var t = match reordered { null => 0; i32 as n => n }
+    if t != 3 { return 3 }
+    var misfit: u8 | null = null
+    var u: u8 | i64 = match misfit { u8 as n => n; null => 999 }
+    var uval = match u { u8 as x => x to i64; i64 as y => y }
+    if uval != 999 { return 4 }
+    0
+}
+
+fn f_array_lit_literal_join(): i64 {
+    var n: i32 = 7
+    var xs = [n, 0]
+    if xs[0] != 7 { return 1 }
+    if xs[1] != 0 { return 2 }
+    var ys = [0, n]
+    if ys[0] != 0 { return 3 }
+    if ys[1] != 7 { return 4 }
+    0
+}
+
+fn dv_shape_or_err(n: i64): DvShape | error {
+    if n == 0 { return error { message = "dv nested" } }
+    if n == 1 { return DvCircle { r = 5 } }
+    if n == 2 { return DvSquare { s = 6 } }
+    DvTri { t = 7 }
+}
+
+fn f_declared_variant_nested_alias(): i64 {
+    match dv_shape_or_err(0) {
+        error as e => { if e.message != "dv nested" { return 1 } }
+        DvShape as s => { return 2 }
+    }
+    match dv_shape_or_err(1) {
+        error as e => { return 3 }
+        DvShape as s => match s {
+            DvCircle as c => { if c.r != 5 { return 4 } }
+            DvSquare as sq => { return 5 }
+            DvTri as t => { return 6 }
+        }
+    }
+    match dv_shape_or_err(2) {
+        error as e => { return 7 }
+        DvShape as s => match s {
+            DvCircle as c => { return 8 }
+            DvSquare as sq => { if sq.s != 6 { return 9 } }
+            DvTri as t => { return 10 }
+        }
+    }
+    match dv_shape_or_err(3) {
+        error as e => { return 11 }
+        DvShape as s => match s {
+            DvCircle as c => { return 12 }
+            DvSquare as sq => { return 13 }
+            DvTri as t => { if t.t != 7 { return 14 } }
+        }
+    }
+    0
+}
+
+fn array_lit_i64_a(): []i64 { [10, 20, 30] }
+
+fn array_lit_i64_b(): []i64 { [40, 50, 60] }
+
+fn array_lit_str_a(): []str { ["un", "deux", "trois"] }
+
+fn array_lit_str_b(): []str { ["one", "two", "three"] }
+
+fn array_lit_i64_empty(): []i64 { [] }
+
+fn f_array_lit_return_escape(): i64 {
+    var ia = array_lit_i64_a()
+    var ib = array_lit_i64_b()
+    if ia.len != 3 { return 1 }
+    if ia[0] != 10 { return 2 }
+    if ia[1] != 20 { return 3 }
+    if ia[2] != 30 { return 4 }
+    if ib.len != 3 { return 5 }
+    if ib[0] != 40 { return 6 }
+    if ib[1] != 50 { return 7 }
+    if ib[2] != 60 { return 8 }
+    var sa = array_lit_str_a()
+    var sb = array_lit_str_b()
+    if sa.len != 3 { return 9 }
+    if sa[0] != "un" { return 10 }
+    if sa[1] != "deux" { return 11 }
+    if sa[2] != "trois" { return 12 }
+    if sb.len != 3 { return 13 }
+    if sb[0] != "one" { return 14 }
+    if sb[1] != "two" { return 15 }
+    if sb[2] != "three" { return 16 }
+    var e = array_lit_i64_empty()
+    if e.len != 0 { return 17 }
+    0
+}
+
+type Arm64BigLeaf = struct {
+    a: i64
+    b: i64
+    c: i64
+    d: i64
+    e: i64
+    f: i64
+    g: i64
+    h: i64
+}
+
+fn zero_arm64_big_leaf(n: i64): Arm64BigLeaf {
+    Arm64BigLeaf { a = 0; b = 0; c = 0; d = 0; e = 0; f = 0; g = 0; h = n }
+}
+
+type Arm64BigMid = struct {
+    a: Arm64BigLeaf
+    b: Arm64BigLeaf
+    c: Arm64BigLeaf
+    d: Arm64BigLeaf
+    e: Arm64BigLeaf
+    f: Arm64BigLeaf
+    g: Arm64BigLeaf
+    h: Arm64BigLeaf
+}
+
+fn zero_arm64_big_mid(n: i64): Arm64BigMid {
+    var z = zero_arm64_big_leaf(n)
+    Arm64BigMid { a = z; b = z; c = z; d = z; e = z; f = z; g = z; h = z }
+}
+
+type Arm64BigFrame = struct {
+    a: Arm64BigMid
+    b: Arm64BigMid
+    c: Arm64BigMid
+    d: Arm64BigMid
+    e: Arm64BigMid
+    f: Arm64BigMid
+    g: Arm64BigMid
+    h: Arm64BigMid
+}
+
+fn zero_arm64_big_frame(n: i64): Arm64BigFrame {
+    var z = zero_arm64_big_mid(n)
+    Arm64BigFrame { a = z; b = z; c = z; d = z; e = z; f = z; g = z; h = z }
+}
+
+fn check_arm64_bigframe_one(): i64 {
+    var one = zero_arm64_big_frame(1)
+    if one.a.a.h != 1 { return 1 }
+    if one.h.h.h != 1 { return 2 }
+    0
+}
+
+fn check_arm64_bigframe_two(): i64 {
+    var two = zero_arm64_big_frame(2)
+    if two.a.a.h != 2 { return 3 }
+    if two.h.h.h != 2 { return 4 }
+    0
+}
+
+fn f_arm64_bigframe_locals(): i64 {
+    var a = check_arm64_bigframe_one()
+    if a != 0 { return a }
+    check_arm64_bigframe_two()
+}
+
+type DivGuardHolder = struct { v: i64 }
+
+fn f_div_signed_i32_value(): i64 {
+    var n: i32 = 4
+    var q1: i32 = 100 to i32 / n
+    if q1 != 25 { return 1 }
+    n = 3
+    var q2: i32 = -100 to i32 / n
+    if q2 != -33 { return 2 }
+    0
+}
+
+fn f_div_unsigned_u32_value(): i64 {
+    var n: u32 = 7 to u32
+    var q: u32 = 4294967295 to u32 / n
+    if q != 613566756 to u32 { return 1 }
+    0
+}
+
+fn f_rem_signed_i32_value(): i64 {
+    var n: i32 = 9
+    var r1: i32 = 100 to i32 % n
+    if r1 != 1 { return 1 }
+    n = 9
+    var r2: i32 = -100 to i32 % n
+    if r2 != -1 { return 2 }
+    0
+}
+
+fn f_rem_unsigned_u32_value(): i64 {
+    var n: u32 = 9 to u32
+    var r: u32 = 4294967295 to u32 % n
+    if r != 3 to u32 { return 1 }
+    0
+}
+
+fn f_div_signed_i64_value(): i64 {
+    var n: i64 = 4
+    var q1 = 100 / n
+    if q1 != 25 { return 1 }
+    n = 3
+    var q2 = -100 / n
+    if q2 != -33 { return 2 }
+    0
+}
+
+fn f_div_unsigned_u64_value(): i64 {
+    var u64_max: u64 = 18446744073709551615
+    var n: u64 = 7 to u64
+    var q: u64 = u64_max / n
+    if q != 2635249153387078802 to u64 { return 1 }
+    0
+}
+
+fn f_rem_signed_i64_value(): i64 {
+    var n: i64 = 9
+    var r1 = 100 % n
+    if r1 != 1 { return 1 }
+    n = 9
+    var r2 = -100 % n
+    if r2 != -1 { return 2 }
+    0
+}
+
+fn f_rem_unsigned_u64_value(): i64 {
+    var u64_max: u64 = 18446744073709551615
+    var n: u64 = 9 to u64
+    var r: u64 = u64_max % n
+    if r != 6 to u64 { return 1 }
+    0
+}
+
+fn f_compound_div_assign_value(): i64 {
+    var x: i64 = 100
+    var n: i64 = 3
+    x /= n
+    if x != 33 { return 1 }
+    0
+}
+
+fn f_compound_rem_assign_field_value(): i64 {
+    var h = DivGuardHolder { v = 107 }
+    var n: i64 = 10
+    h.v %= n
+    if h.v != 7 { return 1 }
+    0
+}
+
+fn f64_bits_of(tag: i64): u64 {
+    if tag == 0 { return 4613937818241073152 }
+    if tag == 1 { return 4611686018427387904 }
+    13835058055282163712
+}
+
+fn f_f64_bits_roundtrip(): i64 {
+    var a = teko::f64_from_bits(f64_bits_of(0))
+    var b = teko::f64_from_bits(f64_bits_of(1))
+    var c = teko::f64_from_bits(f64_bits_of(2))
+    var ba = teko::f64_bits(a)
+    var bb = teko::f64_bits(b)
+    var bc = teko::f64_bits(c)
+    if ba != f64_bits_of(0) { return 1 }
+    if bb != f64_bits_of(1) { return 2 }
+    if bc != f64_bits_of(2) { return 3 }
+    if (bc & 0x8000000000000000) == 0 { return 4 }
+    if (ba & 0x8000000000000000) != 0 { return 5 }
+    0
+}
+
+fn f_f64_bitcast_arith(): i64 {
+    var x = teko::f64_from_bits(f64_bits_of(0))
+    var y = teko::f64_from_bits(f64_bits_of(1))
+    var sum = teko::f64_bits(x + y)
+    var diff = teko::f64_bits(x - y)
+    var prod = teko::f64_bits(x * y)
+    var quot = teko::f64_bits(x / y)
+    if sum != 4617315517961601024 { return 1 }
+    if diff != 4607182418800017408 { return 2 }
+    if prod != 4618441417868443648 { return 3 }
+    if quot != 4609434218613702656 { return 4 }
+    0
+}
+
+type HolderD25 = struct {
+    n: i64 | null
+    s: str | null
+}
+
+type ShapeD25 = variant CircD25 | SqD25
+
+type CircD25 = struct {
+    r: i64
+}
+
+type SqD25 = struct {
+    side: i64
+}
+
+type CarrierD25 = struct {
+    sh: ShapeD25 | null
+}
+
+type BoxD25 = class {
+    pub k: i64 | null
+
+    pub fn make(v: i64 | null): BoxD25 { BoxD25 { k = v } }
+}
+
+fn d25_scalar_of(h: HolderD25): i64 { match h.n { null => 0 - 1; i64 as v => v } }
+
+fn d25_text_len_of(h: HolderD25): i64 { match h.s { null => 0 - 1; str as t => t.len to i64 } }
+
+fn d25_text_head_of(h: HolderD25): i64 { match h.s { null => 0 - 1; str as t => t[0] to i64 } }
+
+fn d25_arg_or(x: i64 | null, fallback: i64): i64 { match x { null => fallback; i64 as v => v } }
+
+fn d25_box_or(b: BoxD25, fallback: i64): i64 { match b.k { null => fallback; i64 as v => v } }
+
+fn d25_shape_side_of(c: CarrierD25): i64 {
+    match c.sh {
+        null => 0 - 1
+        ShapeD25 as s => match s {
+            CircD25 as cc => cc.r
+            SqD25 as sq => sq.side
+            _ => 0 - 2
+        }
+    }
+}
+
+fn f_union_placement_field_and_argument(): i64 {
+    var absent = HolderD25 { n = null; s = null }
+    var present = HolderD25 { n = 41; s = "abcde" }
+    if d25_scalar_of(absent) != 0 - 1 { return 1 }
+    if d25_text_len_of(absent) != 0 - 1 { return 2 }
+    if d25_scalar_of(present) != 41 { return 3 }
+    if d25_text_len_of(present) != 5 { return 4 }
+    if d25_text_head_of(present) != 97 { return 5 }
+    if d25_arg_or(null, 7) != 7 { return 6 }
+    if d25_arg_or(13, 7) != 13 { return 7 }
+    if d25_box_or(BoxD25::make(null), 3) != 3 { return 8 }
+    if d25_box_or(BoxD25::make(19), 3) != 19 { return 9 }
+    0
+}
+
+fn f_union_placement_nested_variant(): i64 {
+    if d25_shape_side_of(CarrierD25 { sh = null }) != 0 - 1 { return 1 }
+    if d25_shape_side_of(CarrierD25 { sh = SqD25 { side = 23 } }) != 23 { return 2 }
+    if d25_shape_side_of(CarrierD25 { sh = CircD25 { r = 29 } }) != 29 { return 3 }
+    var bound: ShapeD25 | null = SqD25 { side = 31 }
+    match bound {
+        null => return 4
+        ShapeD25 as s => match s { CircD25 => return 5; SqD25 as sq => if sq.side != 31 { return 6 }; _ => return 7 }
+    }
+    0
+}
+
+type CastWidenHolder = struct {
+    wide: i64
+}
+
+fn cast_widen_consumer(v: i64): i64 { v }
+
+fn f_cast_narrow_in_range_keeps_value(): i64 {
+    var a: u64 = 44
+    if (a to u8) != 44 to u8 { return 1 }
+    a = 255
+    if (a to u8) != 255 to u8 { return 2 }
+    var b: u64 = 65535
+    if (b to u16) != 65535 to u16 { return 3 }
+    var c: i64 = 2147483647
+    if (c to i32) != 2147483647 to i32 { return 4 }
+    0
+}
+
+fn f_cast_narrow_negative_keeps_sign(): i64 {
+    var a: i64 = -5
+    if (a to i32) != -5 to i32 { return 1 }
+    if (a to i16) != -5 to i16 { return 2 }
+    if (a to i8) != -5 to i8 { return 3 }
+    var b: i64 = -2147483648
+    if (b to i32) != -2147483648 to i32 { return 4 }
+    0
+}
+
+fn f_cast_same_width_sign_change_keeps_value(): i64 {
+    var a: i64 = 1099511627776
+    if (a to u64) != 1099511627776 to u64 { return 1 }
+    var b: u64 = 1099511627776
+    if (b to i64) != 1099511627776 { return 2 }
+    var c: i64 = 0
+    if (c to u64) != 0 to u64 { return 3 }
+    0
+}
+
+fn f_cast_widen_keeps_value(): i64 {
+    var a: u8 = 200 to u8
+    var wide_unsigned: u64 = a to u64
+    if wide_unsigned != 200 to u64 { return 1 }
+    var b: i32 = -5 to i32
+    var wide_signed: i64 = b to i64
+    if wide_signed != -5 { return 2 }
+    var c: u32 = 4294967295 to u32
+    var wide_peer: i64 = c to i64
+    if wide_peer != 4294967295 { return 3 }
+    0
+}
+
+fn f_implicit_widen_owner_snippet(): i64 {
+    var a: i32 = 1000
+    var b: i64 = 1
+    b += a
+    if b != 1001 { return 1 }
+    b = 3
+    b *= a
+    if b != 3000 { return 2 }
+    b = a
+    if b != 1000 { return 3 }
+    0
+}
+
+fn f_implicit_widen_boundary_values(): i64 {
+    var a: u32 = 4294967295 to u32
+    var wide: u64 = 0 to u64
+    wide = a
+    if wide != 4294967295 to u64 { return 1 }
+    var signed_wide: i64 = 0
+    signed_wide = a
+    if signed_wide != 4294967295 { return 2 }
+    var b: i32 = -2147483648 to i32
+    signed_wide = b
+    if signed_wide != -2147483648 { return 3 }
+    var c: u8 = 255 to u8
+    wide = c
+    if wide != 255 to u64 { return 4 }
+    0
+}
+
+fn f_implicit_widen_targets(): i64 {
+    var n: i32 = 7
+    var bound: i64 = n
+    if bound != 7 { return 1 }
+    var h = CastWidenHolder { wide = 0 }
+    h.wide = n
+    if h.wide != 7 { return 2 }
+    var xs: []i64 = [0]
+    xs[0] = n
+    if xs[0] != 7 { return 3 }
+    if cast_widen_consumer(n) != 7 { return 4 }
+    0
+}
+
+type ElemShade = enum { Off; Warm; Hot }
+
+type ElemPt = struct {
+    x: i64
+
+    y: i64
+}
+
+fn d28_zeros(n: i64): []i64 {
+    var ys: [n]i64 = []
+    ys
+}
+
+fn f_slice_elem_store_boundaries(): i64 {
+    var xs: []i64 = [10, 20, 30, 40, 50]
+    xs[0] = 11
+    if xs[0] != 11 { return 1 }
+    if xs[1] != 20 { return 2 }
+    xs[2] = 33
+    if xs[2] != 33 { return 3 }
+    if xs[1] != 20 { return 4 }
+    if xs[3] != 40 { return 5 }
+    xs[4] = 55
+    if xs[4] != 55 { return 6 }
+    if xs[3] != 40 { return 7 }
+    if xs[0] != 11 { return 8 }
+    if xs.len != 5 { return 9 }
+    var ys = d28_zeros(5)
+    var i: i64 = 0
+    loop {
+        if i >= 5 { break }
+        ys[i] = i * 7 + 1
+        i++
+    }
+    i = 0
+    loop {
+        if i >= 5 { break }
+        if ys[i] != i * 7 + 1 { return 10 }
+        i++
+    }
+    if ys.len != 5 { return 11 }
+    0
+}
+
+const D27_TENTH_F32: f32 = 0.1
+
+const D27_HALVES_F32: f32 = 2.5
+
+fn d27_ftoa_of(tag: i64): str {
+    var zero: f64 = 0.0
+    var minus_one: f64 = -1.0
+    var one: f64 = 1.0
+    var two_and_a_half: f64 = 2.5
+    var three: f64 = 3.0
+    if tag == 0 { return teko::ftoa(zero) }
+    if tag == 1 { return teko::ftoa(minus_one * zero) }
+    if tag == 2 { return teko::ftoa(one) }
+    if tag == 3 { return teko::ftoa(minus_one * two_and_a_half) }
+    teko::ftoa(one / three)
+}
+
+fn d27_infinity(): f64 {
+    var huge: f64 = 1.0e308
+    var ten: f64 = 10.0
+    huge * ten
+}
+
+fn d27_not_a_number(): f64 {
+    d27_infinity() - d27_infinity()
+}
+
+fn f_ftoa_runtime_text(): i64 {
+    if d27_ftoa_of(0) != "0" { return 1 }
+    if d27_ftoa_of(1) != "-0" { return 2 }
+    if d27_ftoa_of(2) != "1" { return 3 }
+    if d27_ftoa_of(3) != "-2.5" { return 4 }
+    if d27_ftoa_of(4) != "0.33333333333333331" { return 5 }
+    0
+}
+
+fn f_slice_elem_store_widths(): i64 {
+    var a: []i32 = [1 to i32, 2 to i32, 3 to i32]
+    a[1] = 77 to i32
+    if a[1] != 77 to i32 { return 1 }
+    if a[0] != 1 to i32 { return 2 }
+    if a[2] != 3 to i32 { return 3 }
+    var b: []u8 = [1 to u8, 2 to u8, 3 to u8]
+    b[2] = 250 to u8
+    if b[2] != 250 to u8 { return 4 }
+    if b[1] != 2 to u8 { return 5 }
+    var c: []byte = [0 to byte, 0 to byte, 0 to byte]
+    c[1] = 200 to byte
+    if c[1] != 200 to byte { return 6 }
+    if c[0] != 0 to byte { return 7 }
+    if c[2] != 0 to byte { return 8 }
+    var d: []bool = [false, false, true]
+    d[0] = true
+    if !d[0] { return 9 }
+    if d[1] { return 10 }
+    if !d[2] { return 11 }
+    var e: []f64 = [1.0, 2.0, 3.0]
+    e[2] = 2.5
+    if e[2] != 2.5 { return 12 }
+    if e[0] != 1.0 { return 13 }
+    var f: []ElemShade = [ElemShade::Off, ElemShade::Off, ElemShade::Off]
+    f[1] = ElemShade::Hot
+    if f[1] != ElemShade::Hot { return 14 }
+    if f[0] != ElemShade::Off { return 15 }
+    if f[2] != ElemShade::Off { return 16 }
+    0
+}
+
+fn f_ftoa_literal_text(): i64 {
+    if teko::ftoa(0.0) != "0" { return 1 }
+    if teko::ftoa(-0.0) != "-0" { return 2 }
+    if teko::ftoa(1.0) != "1" { return 3 }
+    if teko::ftoa(-2.5) != "-2.5" { return 4 }
+    if teko::ftoa(1.0e300) != "1.0000000000000001e+300" { return 5 }
+    if teko::ftoa(5.0e-324) != "4.9406564584124654e-324" { return 6 }
+    if teko::ftoa(1.0e400) != "inf" { return 7 }
+    0
+}
+
+fn f_slice_elem_compound_ops(): i64 {
+    var xs: []i64 = [10, 20, 30, 40, 45]
+    xs[0] += 5
+    if xs[0] != 15 { return 1 }
+    if xs[1] != 20 { return 2 }
+    xs[1] -= 6
+    if xs[1] != 14 { return 3 }
+    xs[2] *= 3
+    if xs[2] != 90 { return 4 }
+    xs[3] /= 4
+    if xs[3] != 10 { return 5 }
+    xs[4] %= 7
+    if xs[4] != 3 { return 6 }
+    if xs[0] != 15 { return 7 }
+    var i: i64 = 2
+    xs[i] += 10
+    if xs[2] != 100 { return 8 }
+    if xs[1] != 14 { return 9 }
+    if xs[3] != 10 { return 10 }
+    0
+}
+
+fn f_ftoa_nonfinite_text(): i64 {
+    teko::assert::scenario_begin("ftoa_nonfinite_text")
+    var minus_one: f64 = -1.0
+    teko::assert::eq_str(teko::ftoa(d27_infinity()), "inf")
+    teko::assert::eq_str(teko::ftoa(minus_one * d27_infinity()), "-inf")
+    var nan_text = teko::ftoa(d27_not_a_number())
+    teko::assert::str_contains(nan_text, "nan")
+    0
+}
+
+fn f_slice_elem_store_fat(): i64 {
+    var ss: []str = ["a", "bb", "ccc"]
+    ss[1] = "dddd"
+    if ss[1].len != 4 { return 1 }
+    if ss[1] != "dddd" { return 2 }
+    if ss[0] != "a" { return 3 }
+    if ss[2] != "ccc" { return 4 }
+    ss[0] = ""
+    if ss[0].len != 0 { return 5 }
+    if ss[2].len != 3 { return 6 }
+    ss[2] = teko::str::concat("ee", "fff")
+    if ss[2] != "eefff" { return 7 }
+    if ss[2].len != 5 { return 8 }
+    var nested: [][]i64 = [[1, 2], [3, 4]]
+    nested[0] = [7, 8, 9]
+    if nested[0].len != 3 { return 9 }
+    if nested[0][0] != 7 { return 10 }
+    if nested[0][2] != 9 { return 11 }
+    if nested[1].len != 2 { return 12 }
+    if nested[1][1] != 4 { return 13 }
+    0
+}
+
+fn f_slice_elem_store_aggregate(): i64 {
+    var ps: []ElemPt = [ElemPt { x = 0; y = 0 }, ElemPt { x = 0; y = 0 }, ElemPt { x = 0; y = 0 }]
+    var i: i64 = 0
+    loop {
+        if i >= 3 { break }
+        ps[i] = ElemPt { x = i + 1; y = (i + 1) * 10 }
+        i++
+    }
+    if ps[0].x != 1 { return 1 }
+    if ps[0].y != 10 { return 2 }
+    if ps[1].x != 2 { return 3 }
+    if ps[1].y != 20 { return 4 }
+    if ps[2].x != 3 { return 5 }
+    if ps[2].y != 30 { return 6 }
+    if ps[0].x == ps[2].x { return 7 }
+    var src = ElemPt { x = 9; y = 90 }
+    ps[1] = src
+    src.x = 111
+    src.y = 222
+    if ps[1].x != 9 { return 8 }
+    if ps[1].y != 90 { return 9 }
+    if ps[0].x != 1 { return 10 }
+    if ps[2].x != 3 { return 11 }
+    0
+}
+
+fn d27_f64_case(tag: i64): f64 {
+    var zero: f64 = 0.0
+    var minus_one: f64 = -1.0
+    var one: f64 = 1.0
+    var two_and_a_half: f64 = 2.5
+    var three: f64 = 3.0
+    if tag == 0 { return zero }
+    if tag == 1 { return minus_one * zero }
+    if tag == 2 { return one }
+    if tag == 3 { return minus_one * two_and_a_half }
+    one / three
+}
+
+fn f_float_hole_natural_form(): i64 {
+    var i: i64 = 0
+    loop {
+        if i > 4 { break }
+        var x = d27_f64_case(i)
+        if $"{x}" != teko::ftoa(x) { return 1 }
+        i++
+    }
+    var negative_zero = d27_f64_case(1)
+    if $"[{negative_zero}]" != "[-0]" { return 2 }
+    var a_third = d27_f64_case(4)
+    if $"{a_third}" != "0.33333333333333331" { return 3 }
+    0
+}
+
+fn f_slice_elem_foreach_writeback(): i64 {
+    var xs: []i64 = [1, 2, 3, 4]
+    loop v in xs { v = v * 10 }
+    if xs[0] != 10 { return 1 }
+    if xs[1] != 20 { return 2 }
+    if xs[2] != 30 { return 3 }
+    if xs[3] != 40 { return 4 }
+    if xs.len != 4 { return 5 }
+    var ss: []str = ["a", "bb"]
+    loop s in ss { s = s ~ "!" }
+    if ss[0] != "a!" { return 6 }
+    if ss[1] != "bb!" { return 7 }
+    if ss[1].len != 3 { return 8 }
+    0
+}
+
+fn f_f32_text_is_its_own_value(): i64 {
+    var tenth = D27_TENTH_F32
+    var halves = D27_HALVES_F32
+    if teko::ftoa(tenth) != "0.10000000149011612" { return 1 }
+    if $"{tenth}" != "0.10000000149011612" { return 3 }
+    if teko::ftoa(halves) != "2.5" { return 4 }
+    if $"{halves}" != "2.5" { return 5 }
+    if $"{halves:F2}" != "2.50" { return 6 }
+    if $"{tenth:F4}" != "0.1000" { return 7 }
+    if $"{halves:G}" != "2.5" { return 8 }
+    if $"{halves:E3}" != "2.500e+00" { return 9 }
+    if $"{halves:N2}" != "2.50" { return 10 }
+    if $"{halves:P1}" != "250.0%" { return 11 }
+    if $"{halves:[d27_dynamic_spec()]}" != "2.500" { return 12 }
+    if $"{tenth:[d27_dynamic_spec()]}" != "0.100" { return 13 }
+    0
+}
+
+fn f_float_hole_bare_literal_stays_runtime(): i64 {
+    if $"{2.5}" != teko::ftoa(2.5) { return 1 }
+    if $"{0.1}" != teko::ftoa(0.1) { return 2 }
+    if $"{2.5}" != "2.5" { return 3 }
+    if $"{2.5:F2}" != "2.50" { return 4 }
+    0
+}
+
+fn oobr_grown(n: i64): []i64 {
+    var ys: [n]i64 = []
+    var i: i64 = 0
+    loop {
+        if i >= n { break }
+        ys[i] = i + 1
+        i++
+    }
+    ys
+}
+
+fn f_slice_elem_read_boundaries(): i64 {
+    var xs: []i64 = [10, 20, 30, 40, 50]
+    if xs[0] != 10 { return 1 }
+    if xs[2] != 30 { return 2 }
+    if xs[4] != 50 { return 3 }
+    var i: i64 = 0
+    loop {
+        if i >= 5 { break }
+        if xs[i] != (i + 1) * 10 { return 4 }
+        i++
+    }
+    var ys = oobr_grown(5)
+    if ys[0] != 1 { return 5 }
+    if ys[4] != 5 { return 6 }
+    i = 0
+    var sum: i64 = 0
+    loop {
+        if i >= ys.len to i64 { break }
+        sum = sum + ys[i]
+        i++
+    }
+    if sum != 15 { return 7 }
+    0
+}
+
+fn f_slice_elem_read_widths(): i64 {
+    var a: []i32 = [1 to i32, 2 to i32, 3 to i32]
+    if a[1] != 2 to i32 { return 1 }
+    if a[2] != 3 to i32 { return 2 }
+    var b: []u8 = [1 to u8, 250 to u8, 3 to u8]
+    if b[1] != 250 to u8 { return 3 }
+    if b[0] != 1 to u8 { return 4 }
+    var c: []byte = [0 to byte, 200 to byte, 7 to byte]
+    if c[1] != 200 to byte { return 5 }
+    if c[2] != 7 to byte { return 6 }
+    var d: []bool = [false, true, false]
+    if !d[1] { return 7 }
+    if d[2] { return 8 }
+    var e: []f64 = [1.5, 2.5, 3.5]
+    if e[1] != 2.5 { return 9 }
+    if e[2] != 3.5 { return 10 }
+    var g: []ElemShade = [ElemShade::Off, ElemShade::Hot, ElemShade::Warm]
+    if g[1] != ElemShade::Hot { return 11 }
+    if g[2] != ElemShade::Warm { return 12 }
+    0
+}
+
+fn f_slice_elem_read_fat(): i64 {
+    var ss: []str = ["alpha", "be", "c"]
+    if ss[0] != "alpha" { return 1 }
+    if ss[0].len != 5 { return 2 }
+    if ss[2] != "c" { return 3 }
+    if ss[2].len != 1 { return 4 }
+    var nn: [][]i64 = [[1, 2, 3], [4], [5, 6]]
+    if nn[0].len != 3 { return 5 }
+    if nn[1].len != 1 { return 6 }
+    if nn[2].len != 2 { return 7 }
+    if nn[0][2] != 3 { return 8 }
+    if nn[2][1] != 6 { return 9 }
+    var i: i64 = 0
+    var total: i64 = 0
+    loop {
+        if i >= 3 { break }
+        total = total + ss[i].len to i64
+        i++
+    }
+    if total != 8 { return 10 }
+    0
+}
+
+fn f_slice_elem_read_nested(): i64 {
+    var nn: [][]i64 = [[1, 2, 3], [4], [5, 6]]
+    var r: i64 = 0
+    var total: i64 = 0
+    loop {
+        if r >= nn.len to i64 { break }
+        var c: i64 = 0
+        loop {
+            if c >= nn[r].len to i64 { break }
+            total = total + nn[r][c]
+            c++
+        }
+        r++
+    }
+    if total != 21 { return 1 }
+    if nn[nn.len to i64 - 1][1] != 6 { return 2 }
+    0
+}
+
+fn d27_dynamic_spec(): str { "F3" }
+
+fn f_str_index_in_bounds(): i64 {
+    var s = "abc"
+    if s[0] to i64 != 97 { return 1 }
+    if s[1] to i64 != 98 { return 2 }
+    if s[2] to i64 != 99 { return 3 }
+    var t = "ab" ~ "cd"
+    if t.len != 4 { return 4 }
+    if t[3] to i64 != 100 { return 5 }
+    var i: i64 = 0
+    var sum: i64 = 0
+    loop {
+        if i >= t.len to i64 { break }
+        sum = sum + t[i] to i64
+        i++
+    }
+    if sum != 394 { return 6 }
+    var u = "é"
+    if u.len != 2 { return 7 }
+    if u[0] to i64 != 195 { return 8 }
+    if u[1] to i64 != 169 { return 9 }
+    0
+}
+
+type D30Sq = struct {
+    side: i64
+}
+
+type D30Holder = struct {
+    inner: i64 | null
+}
+
+type D30Nest = struct {
+    deep: D30Sq | null
+}
+
+fn d30_three_i64(n: i64): i64 | null | error {
+    if n == 0 { return null }
+    if n < 0 { return error { message = "d30 negative" } }
+    n * 2
+}
+
+fn d30_three_str(n: i64): str | null | error {
+    if n == 0 { return null }
+    if n < 0 { return error { message = "d30 negative" } }
+    "abc"
+}
+
+fn d30_three_slice(n: i64): []i64 | null | error {
+    if n == 0 { return null }
+    if n < 0 { return error { message = "d30 negative" } }
+    [n, n + 1]
+}
+
+fn d30_three_named(n: i64): D30Sq | null | error {
+    if n == 0 { return null }
+    if n < 0 { return error { message = "d30 negative" } }
+    D30Sq { side = n }
+}
+
+fn d30_two_i64(n: i64): i64 | null {
+    if n == 0 { return null }
+    n * 3
+}
+
+fn d30_read_arg(x: i64 | null): i64 {
+    match x {
+        i64 as v => v
+        null => 7
+    }
+}
+
+fn f_d30_null_arm_three_member(): i64 {
+    if d30_read_three(3) != 6 { return 1 }
+    if d30_read_three(0) != 7 { return 2 }
+    if d30_read_three(-1) != 9 { return 3 }
+    if d30_read_three(1) != 2 { return 4 }
+    if d30_read_two(3) != 9 { return 5 }
+    if d30_read_two(0) != 7 { return 6 }
+    0
+}
+
+fn d30_read_three(n: i64): i64 {
+    match d30_three_i64(n) {
+        i64 as v => v
+        null => 7
+        error => 9
+    }
+}
+
+fn d30_read_two(n: i64): i64 {
+    match d30_two_i64(n) {
+        i64 as v => v
+        null => 7
+    }
+}
+
+fn f_d30_null_arm_orders(): i64 {
+    if d30_read_three_nullfirst(3) != 6 { return 1 }
+    if d30_read_three_nullfirst(0) != 7 { return 2 }
+    if d30_read_three_nullfirst(-1) != 9 { return 3 }
+    if d30_read_two_nullfirst(3) != 9 { return 4 }
+    if d30_read_two_nullfirst(0) != 7 { return 5 }
+    if d30_read_three_nullfirst(3) != d30_read_three(3) { return 6 }
+    if d30_read_three_nullfirst(0) != d30_read_three(0) { return 7 }
+    if d30_read_three_nullfirst(-1) != d30_read_three(-1) { return 8 }
+    0
+}
+
+fn d30_read_three_nullfirst(n: i64): i64 {
+    match d30_three_i64(n) {
+        null => 7
+        i64 as v => v
+        error => 9
+    }
+}
+
+fn d30_read_two_nullfirst(n: i64): i64 {
+    match d30_two_i64(n) {
+        null => 7
+        i64 as v => v
+    }
+}
+
+fn f_d30_null_arm_fat_payload(): i64 {
+    if d30_read_three_str(3) != 3 { return 1 }
+    if d30_read_three_str(0) != 7 { return 2 }
+    if d30_read_three_str(-1) != 9 { return 3 }
+    if d30_read_three_slice(3) != 7 { return 4 }
+    if d30_read_three_slice(0) != 7 { return 5 }
+    if d30_read_three_slice(-1) != 9 { return 6 }
+    if d30_read_three_slice_len(4) != 2 { return 7 }
+    0
+}
+
+fn d30_read_three_str(n: i64): i64 {
+    match d30_three_str(n) {
+        str as s => s.len to i64
+        null => 7
+        error => 9
+    }
+}
+
+fn d30_read_three_slice(n: i64): i64 {
+    match d30_three_slice(n) {
+        []i64 as xs => xs[0] + xs[1]
+        null => 7
+        error => 9
+    }
+}
+
+fn d30_read_three_slice_len(n: i64): i64 {
+    match d30_three_slice(n) {
+        []i64 as xs => xs.len to i64
+        null => 0
+        error => 0
+    }
+}
+
+fn f_d30_null_arm_named_payload(): i64 {
+    if d30_read_three_named(3) != 3 { return 1 }
+    if d30_read_three_named(0) != 7 { return 2 }
+    if d30_read_three_named(-1) != 9 { return 3 }
+    if d30_read_nested(5) != 5 { return 4 }
+    if d30_read_nested(0) != 7 { return 5 }
+    0
+}
+
+fn d30_read_three_named(n: i64): i64 {
+    match d30_three_named(n) {
+        D30Sq as s => s.side
+        null => 7
+        error => 9
+    }
+}
+
+fn d30_read_nested(n: i64): i64 {
+    var nn = D30Nest { deep = if n == 0 { null } else { D30Sq { side = n } } }
+    match nn.deep {
+        D30Sq as s => s.side
+        null => 7
+    }
+}
+
+fn f_d30_null_placement_field_arg_local(): i64 {
+    if d30_read_field(4) != 4 { return 1 }
+    if d30_read_field(0) != 7 { return 2 }
+    if d30_read_arg(4) != 4 { return 3 }
+    if d30_read_arg(null) != 7 { return 4 }
+    if d30_read_local(4) != 4 { return 5 }
+    if d30_read_local(0) != 7 { return 6 }
+    0
+}
+
+fn d30_read_field(n: i64): i64 {
+    var h = D30Holder { inner = if n == 0 { null } else { n } }
+    match h.inner {
+        i64 as v => v
+        null => 7
+    }
+}
+
+fn d30_read_local(n: i64): i64 {
+    var l: i64 | null = if n == 0 { null } else { n }
+    match l {
+        i64 as v => v
+        null => 7
+    }
+}
+
+fn f_d30_null_placement_assign(): i64 {
+    if d30_assign_three(6) != 6 { return 1 }
+    if d30_assign_three(0) != 7 { return 2 }
+    if d30_assign_three(-1) != 9 { return 3 }
+    0
+}
+
+fn d30_assign_three(n: i64): i64 {
+    var l: i64 | null | error = null
+    if n != 0 { l = n }
+    if n < 0 { l = error { message = "d30 negative" } }
+    match l {
+        i64 as v => v
+        null => 7
+        error => 9
+    }
+}
+
+fn f_d30_null_compare_eq(): i64 {
+    if d30_cmp_two(8) != 1 { return 1 }
+    if d30_cmp_two(0) != 7 { return 2 }
+    if d30_cmp_three(8) != 1 { return 3 }
+    if d30_cmp_three(0) != 7 { return 4 }
+    0
+}
+
+fn d30_cmp_two(n: i64): i64 {
+    var a: i64 | null = if n == 0 { null } else { n }
+    if a == null { return 7 }
+    if a != null { return 1 }
+    9
+}
+
+fn d30_cmp_three(n: i64): i64 {
+    var a = d30_three_i64(n)
+    if a == null { return 7 }
+    1
+}
+
+fn f_d30_null_union_of_slice(): i64 {
+    if d30_local_slice(3) != 6 { return 1 }
+    if d30_local_slice(0) != 7 { return 2 }
+    if d30_local_slice_len(3) != 2 { return 3 }
+    if d30_local_slice_len(0) != 0 { return 4 }
+    0
+}
+
+fn d30_local_slice(n: i64): i64 {
+    var xs: []i64 | null = if n == 0 { null } else { [n, n] }
+    match xs {
+        []i64 as v => v[0] + v[1]
+        null => 7
+    }
+}
+
+fn d30_local_slice_len(n: i64): i64 {
+    var xs: []i64 | null = if n == 0 { null } else { [n, n] }
+    match xs {
+        []i64 as v => v.len to i64
+        null => 0
+    }
+}
+
+fn f_d30_null_arm_exhaustive_selection(): i64 {
+    var present = 0
+    var absent = 0
+    var failed = 0
+    var i = -1
+    loop {
+        if i > 1 { break }
+        match d30_three_i64(i) {
+            i64 => present++
+            null => absent++
+            error => failed++
+        }
+        i++
+    }
+    if present != 1 { return 1 }
+    if absent != 1 { return 2 }
+    if failed != 1 { return 3 }
+    if present + absent + failed != 3 { return 4 }
+    0
+}
+
+fn f_d30_null_arm_wrong_arm_guard(): i64 {
+    if d30_arm_tag(2) != 1 { return 1 }
+    if d30_arm_tag(0) != 2 { return 2 }
+    if d30_arm_tag(-2) != 3 { return 3 }
+    if d30_arm_tag(2) == d30_arm_tag(0) { return 4 }
+    if d30_arm_tag(0) == d30_arm_tag(-2) { return 5 }
+    if d30_arm_tag(2) == d30_arm_tag(-2) { return 6 }
+    0
+}
+
+fn d30_arm_tag(n: i64): i64 {
+    match d30_three_i64(n) {
+        i64 => 1
+        null => 2
+        error => 3
+    }
+}
+
+const D29_TENTH_F64: f64 = 0.1
+
+const D29_TENTH_F32: f32 = 0.1
+
+const D29_HALVES_F64: f64 = 2.5
+
+const D29_HALVES_F32: f32 = 2.5
+
+fn d29_f64_runtime(tag: i64): f64 {
+    var tenth: f64 = 0.1
+    var halves: f64 = 2.5
+    var neg: f64 = -7.25
+    var zero: f64 = 0.0
+    if tag == 0 { return tenth }
+    if tag == 1 { return halves }
+    if tag == 2 { return neg }
+    zero
+}
+
+fn d29_f32_runtime(tag: i64): f32 {
+    var tenth: f32 = 0.1
+    var halves: f32 = 2.5
+    var neg: f32 = -7.25
+    var zero: f32 = 0.0
+    if tag == 0 { return tenth }
+    if tag == 1 { return halves }
+    if tag == 2 { return neg }
+    zero
+}
+
+fn f_d29_f64_arith_values(): i64 {
+    var a = d29_f64_runtime(0)
+    var b = d29_f64_runtime(1)
+    if teko::ftoa(a + b) != "2.6000000000000001" { return 1 }
+    if teko::ftoa(a - b) != "-2.3999999999999999" { return 2 }
+    if teko::ftoa(a * b) != "0.25" { return 3 }
+    if teko::ftoa(a / b) != "0.040000000000000001" { return 4 }
+    if teko::ftoa(a + a + a) != "0.30000000000000004" { return 5 }
+    if teko::ftoa(D29_TENTH_F64 + D29_HALVES_F64) != "2.6000000000000001" { return 6 }
+    if teko::ftoa(D29_TENTH_F64 - D29_HALVES_F64) != "-2.3999999999999999" { return 7 }
+    if teko::ftoa(D29_TENTH_F64 * D29_HALVES_F64) != "0.25" { return 8 }
+    if teko::ftoa(D29_TENTH_F64 / D29_HALVES_F64) != "0.040000000000000001" { return 9 }
+    var neg = d29_f64_runtime(2)
+    if teko::ftoa(neg + b) != "-4.75" { return 10 }
+    if teko::ftoa(neg * b) != "-18.125" { return 11 }
+    0
+}
+
+fn f_d29_f32_arith_values(): i64 {
+    var a = d29_f32_runtime(0)
+    var b = d29_f32_runtime(1)
+    if teko::ftoa(a + b) != "2.5999999046325684" { return 1 }
+    if teko::ftoa(a - b) != "-2.4000000953674316" { return 2 }
+    if teko::ftoa(a * b) != "0.25" { return 3 }
+    if teko::ftoa(a / b) != "0.039999999105930328" { return 4 }
+    if teko::ftoa(a + a + a) != "0.30000001192092896" { return 5 }
+    if teko::ftoa(D29_TENTH_F32 + D29_HALVES_F32) != "2.5999999046325684" { return 6 }
+    if teko::ftoa(D29_TENTH_F32 - D29_HALVES_F32) != "-2.4000000953674316" { return 7 }
+    if teko::ftoa(D29_TENTH_F32 * D29_HALVES_F32) != "0.25" { return 8 }
+    if teko::ftoa(D29_TENTH_F32 / D29_HALVES_F32) != "0.039999999105930328" { return 9 }
+    if teko::ftoa(a to f64) != "0.10000000149011612" { return 10 }
+    if teko::ftoa((D29_TENTH_F64 to f32) to f64) != "0.10000000149011612" { return 11 }
+    var neg = d29_f32_runtime(2)
+    if teko::ftoa(neg + b) != "-4.75" { return 12 }
+    if teko::ftoa(neg * b) != "-18.125" { return 13 }
+    0
+}
+
+fn f_d29_float_compare_ordered(): i64 {
+    var a = d29_f64_runtime(0)
+    var b = d29_f64_runtime(1)
+    if !(a < b) { return 1 }
+    if !(a <= b) { return 2 }
+    if a > b { return 3 }
+    if a >= b { return 4 }
+    if a == b { return 5 }
+    if !(a != b) { return 6 }
+    if !(b <= b) { return 7 }
+    if !(b >= b) { return 8 }
+    if !(b == b) { return 9 }
+    var c = d29_f32_runtime(0)
+    var d = d29_f32_runtime(1)
+    if !(c < d) { return 10 }
+    if !(c <= d) { return 11 }
+    if c > d { return 12 }
+    if c >= d { return 13 }
+    if c == d { return 14 }
+    if !(c != d) { return 15 }
+    var neg = d29_f64_runtime(2)
+    if !(neg < a) { return 16 }
+    if !(a > neg) { return 17 }
+    var zero = d29_f64_runtime(3)
+    var minus_zero = d29_f64_runtime(2) * zero
+    if !(zero == minus_zero) { return 18 }
+    if !(zero <= minus_zero) { return 19 }
+    if !(zero >= minus_zero) { return 20 }
+    if zero < minus_zero { return 21 }
+    0
+}
+
+fn f_d29_float_compare_unordered(): i64 {
+    var nan = d29_nan()
+    var b = d29_f64_runtime(1)
+    if nan < b { return 1 }
+    if nan <= b { return 2 }
+    if nan > b { return 3 }
+    if nan >= b { return 4 }
+    if b < nan { return 5 }
+    if b <= nan { return 6 }
+    if b > nan { return 7 }
+    if b >= nan { return 8 }
+    if nan == nan { return 9 }
+    if !(nan != nan) { return 10 }
+    if nan == b { return 11 }
+    if !(nan != b) { return 12 }
+    var nan32 = nan to f32
+    var d = d29_f32_runtime(1)
+    if nan32 < d { return 13 }
+    if nan32 <= d { return 14 }
+    if nan32 > d { return 15 }
+    if nan32 >= d { return 16 }
+    if nan32 == nan32 { return 17 }
+    if !(nan32 != nan32) { return 18 }
+    0
+}
+
+fn d29_positive_infinity(): f64 {
+    var huge: f64 = 1.0e308
+    var ten: f64 = 10.0
+    huge * ten
+}
+
+fn d29_nan(): f64 {
+    var pinf = d29_positive_infinity()
+    pinf - pinf
+}
+
+fn f_d29_int_float_casts(): i64 {
+    if d29_f64_runtime(2) to i64 != -7 { return 1 }
+    if d29_f64_runtime(1) to i64 != 2 { return 2 }
+    if d29_f64_runtime(0) to i64 != 0 { return 3 }
+    if d29_f32_runtime(2) to i64 != -7 { return 4 }
+    if d29_f32_runtime(1) to i64 != 2 { return 5 }
+    if d29_f32_runtime(0) to i64 != 0 { return 6 }
+    var n: i64 = -9
+    if teko::ftoa(n to f64) != "-9" { return 7 }
+    if teko::ftoa((n to f32) to f64) != "-9" { return 8 }
+    var big: i64 = 16777217
+    if teko::ftoa(big to f64) != "16777217" { return 9 }
+    if teko::ftoa((big to f32) to f64) != "16777216" { return 10 }
+    if (big to f64) to i64 != 16777217 { return 11 }
+    if (big to f32) to i64 != 16777216 { return 12 }
+    var small: i64 = 3
+    if teko::ftoa(small to f64) != "3" { return 13 }
+    if teko::ftoa((small to f32) to f64) != "3" { return 14 }
+    0
+}
+
+fn f_d29_float_negate_signed_zero(): i64 {
+    var zero = d29_f64_runtime(3)
+    var minus_one = d29_f64_runtime(2)
+    if teko::ftoa(-zero) != "-0" { return 1 }
+    if teko::ftoa(zero - zero) != "0" { return 2 }
+    if teko::ftoa(minus_one * zero) != "-0" { return 3 }
+    if teko::ftoa(- -zero) != "0" { return 4 }
+    var halves = d29_f64_runtime(1)
+    if teko::ftoa(-halves) != "-2.5" { return 5 }
+    if teko::ftoa(- -halves) != "2.5" { return 6 }
+    var tenth = d29_f64_runtime(0)
+    if teko::ftoa(-tenth) != "-0.10000000000000001" { return 7 }
+    var zero32 = d29_f32_runtime(3)
+    if teko::ftoa(-zero32) != "-0" { return 8 }
+    var halves32 = d29_f32_runtime(1)
+    if teko::ftoa(-halves32) != "-2.5" { return 9 }
+    var tenth32 = d29_f32_runtime(0)
+    if teko::ftoa(-tenth32) != "-0.10000000149011612" { return 10 }
+    var nan = d29_nan()
+    var pinf = d29_positive_infinity()
+    if teko::ftoa(pinf) != "inf" { return 11 }
+    if teko::ftoa(-pinf) != "-inf" { return 12 }
+    if nan == nan { return 13 }
+    0
+}
+
+fn d29_fp_sum8(p0: f64, p1: f64, p2: f64, p3: f64, p4: f64, p5: f64, p6: f64, p7: f64): f64 {
+    p0 + p1 + p2 + p3 + p4 + p5 + p6 + p7
+}
+
+fn d29_mixed_abi(i0: i64, f0: f64, i1: i64, f1: f64, i2: i64, f2: f64, i3: i64, f3: f64): i64 {
+    var ints = i0 * 1000 + i1 * 100 + i2 * 10 + i3
+    var floats = f0 + f1 + f2 + f3
+    ints + (floats to i64)
+}
+
+fn d29_f32_sum4(p0: f32, p1: f32, p2: f32, p3: f32): f32 {
+    p0 + p1 + p2 + p3
+}
+
+fn f_d29_float_registers_and_return(): i64 {
+    var t = d29_f64_runtime(0)
+    var h = d29_f64_runtime(1)
+    if teko::ftoa(d29_fp_sum8(t, t, t, t, t, t, t, t)) != "0.79999999999999993" { return 1 }
+    if teko::ftoa(d29_fp_sum8(h, h, h, h, h, h, h, h)) != "20" { return 2 }
+    if teko::ftoa(d29_fp_sum8(t, h, t, h, t, h, t, h)) != "10.399999999999999" { return 3 }
+    if d29_mixed_abi(1, h, 2, h, 3, h, 4, h) != 1244 { return 4 }
+    if d29_mixed_abi(9, t, 8, t, 7, t, 6, t) != 9876 { return 5 }
+    var t32 = d29_f32_runtime(0)
+    var h32 = d29_f32_runtime(1)
+    if teko::ftoa(d29_f32_sum4(t32, t32, t32, t32) to f64) != "0.40000000596046448" { return 6 }
+    if teko::ftoa(d29_f32_sum4(h32, h32, h32, h32) to f64) != "10" { return 7 }
+    if teko::ftoa(d29_f32_sum4(t32, h32, t32, h32) to f64) != "5.1999998092651367" { return 8 }
+    0
+}
+
+fn d29_scale(x: f64): f64 {
+    var two: f64 = 2.0
+    x * two
+}
+
+fn f_d29_float_spill_across_call(): i64 {
+    var a = d29_f64_runtime(0)
+    var b = d29_f64_runtime(1)
+    var v00 = a + b
+    var v01 = a - b
+    var v02 = a * b
+    var v03 = a / b
+    var v04 = v00 + a
+    var v05 = v01 + a
+    var v06 = v02 + a
+    var v07 = v03 + a
+    var v08 = v00 * b
+    var v09 = v01 * b
+    var v10 = v02 * b
+    var v11 = v03 * b
+    var v12 = v04 - b
+    var v13 = v05 - b
+    var v14 = v06 - b
+    var v15 = v07 - b
+    var scaled = d29_scale(a)
+    var left = v00 + v01 + v02 + v03 + v04 + v05 + v06 + v07
+    var right = v08 + v09 + v10 + v11 + v12 + v13 + v14 + v15
+    if teko::ftoa(left + right + scaled) != "-6.3049999999999988" { return 1 }
+    0
+}
+
+type D29Widths = struct {
+    narrow: f32
+    wide: f64
+}
+
+fn f_d29_float_memory_widths(): i64 {
+    var w = D29Widths { narrow = d29_f32_runtime(0); wide = d29_f64_runtime(0) }
+    if teko::ftoa(w.narrow to f64) != "0.10000000149011612" { return 1 }
+    if teko::ftoa(w.wide) != "0.10000000000000001" { return 2 }
+    w.narrow = d29_f32_runtime(1)
+    if teko::ftoa(w.narrow to f64) != "2.5" { return 3 }
+    if teko::ftoa(w.wide) != "0.10000000000000001" { return 4 }
+    w.wide = d29_f64_runtime(2)
+    if teko::ftoa(w.wide) != "-7.25" { return 5 }
+    if teko::ftoa(w.narrow to f64) != "2.5" { return 6 }
+    var ds: []f64 = [1.0, 2.0, 3.0]
+    ds[1] = d29_f64_runtime(0)
+    if teko::ftoa(ds[0]) != "1" { return 7 }
+    if teko::ftoa(ds[1]) != "0.10000000000000001" { return 8 }
+    if teko::ftoa(ds[2]) != "3" { return 9 }
+    var ss: []f32 = [1.0, 2.0, 3.0]
+    ss[2] = d29_f32_runtime(0)
+    if teko::ftoa(ss[0] to f64) != "1" { return 10 }
+    if teko::ftoa(ss[1] to f64) != "2" { return 11 }
+    if teko::ftoa(ss[2] to f64) != "0.10000000149011612" { return 12 }
+    if teko::ftoa(ds[1] + ss[2] to f64) != "0.20000000149011612" { return 13 }
+    0
+}
+
+type GvfFn = struct {
+    name: str
+    a: i64
+}
+
+type GvfTy = struct {
+    name: str
+    b: i64
+}
+
+type GvfCo = struct {
+    name: str
+    c: i64
+}
+
+type GvfDecl = variant GvfFn | GvfTy | GvfCo
+
+type GvfParsed<T> = struct {
+    node: T
+    next: u64
+}
+
+fn gvf_case_digit(k: i64): i64 {
+    var p = GvfParsed<GvfDecl> { node = GvfCo { name = "co"; c = 3 }; next = 3 }
+    if k == 1 { p = GvfParsed<GvfDecl> { node = GvfFn { name = "fn"; a = 1 }; next = 1 } }
+    if k == 2 { p = GvfParsed<GvfDecl> { node = GvfTy { name = "ty"; b = 2 }; next = 2 } }
+    match p.node {
+        GvfFn as f => 1
+        GvfTy as t => 2
+        GvfCo as c => 3
+    }
+}
+
+fn f_generic_variant_field(): i64 {
+    var acc: i64 = 0
+    var k: i64 = 1
+    loop {
+        if k > 3 { break }
+        acc = acc * 10 + gvf_case_digit(k)
+        k = k + 1
+    }
+    acc
+}
+
+fn f_native_union_scalar(): i64 {
+    nunion::probe() to i64
+}
+
+fn f_native_union_nested(): i64 {
+    nunion_nested::probe() to i64
+}
+
+fn f_one_byte_score(): i64 {
+    ob::score()
+}
+
+fn f_null_birth_null_type(): i64 {
+    var reassigned: i64 | null = 5
+    reassigned = null
+    var r = match reassigned { i64 => 1; null => 0 }
+    if r != 0 { return 1 }
+
+    var bound: i64 | null = null
+    var b = match bound { i64 => 1; null => 0 }
+    if b != 0 { return 2 }
+
+    var absent: Point_iface | null = null
+    if sum_or(absent, 12) != 12 { return 3 }
+    if sum_or(null, 7) != 7 { return 4 }
+    0
+}
+
+fn f_null_narrow_match(): i64 {
+    var present: i64 | null = 9
+    var bound = match present { i64 as v => v; null => -1 }
+    if bound != 9 { return 1 }
+    var absent: i64 | null = null
+    var missing = match absent { i64 as v => v; null => -1 }
+    if missing != -1 { return 2 }
+    var reordered = match present { null => -1; i64 as v => v }
+    if reordered != 9 { return 3 }
+    0
+}
+
+fn f_null_narrow_ifguard(): i64 {
+    var big: i64 | null = 9
+    var a = match big {
+        i64 as v when v > 5 => v * 2
+        i64 as v => v
+        null => -1
+    }
+    if a != 18 { return 1 }
+    var small: i64 | null = 3
+    var b = match small {
+        i64 as v when v > 5 => v * 2
+        i64 as v => v
+        null => -1
+    }
+    if b != 3 { return 2 }
+    var absent: i64 | null = null
+    var c = match absent {
+        i64 as v when v > 5 => v * 2
+        i64 as v => v
+        null => -1
+    }
+    if c != -1 { return 3 }
+    0
+}
+
+fn f_empty_slice_sentinel_untouched(): i64 {
+    var e: [0]i64 = []
+    if e.len != 0 { return 1 }
+    var one = [..e, 11]
+    if one.len != 1 { return 2 }
+    if one[0] != 11 { return 3 }
+    var nested: [][]i64 = []
+    if nested.len != 0 { return 4 }
+    0
+}
+
+fn match_arm_null_widen(tag: i64): i64 | null {
+    match tag {
+        0 => 9
+        1 => match tag { 0 => null; _ => null }
+        _ => -1
+    }
+}
+
+fn if_branch_null_widen(flag: bool): i64 | null {
+    if flag {
+        if flag { null } else { null }
+    } else {
+        13
+    }
+}
+
+fn assign_null_widen(tag: i64): i64 | null {
+    var x: i64 | null = 0
+    if tag == 0 {
+        x = if tag == 0 { null } else { null }
+    } else {
+        x = 21
+    }
+    x
+}
+
+fn unwrap_or_native_null_widen(v: i64 | null, sentinel: i64): i64 {
+    match v {
+        i64 as n => n
+        null => sentinel
+    }
+}
+
+fn f_null_widen_native_subpositions(): i64 {
+    if unwrap_or_native_null_widen(match_arm_null_widen(0), -101) != 9 { return 1 }
+    if unwrap_or_native_null_widen(match_arm_null_widen(1), -101) != -101 { return 2 }
+    if unwrap_or_native_null_widen(match_arm_null_widen(2), -101) != -1 { return 3 }
+    if unwrap_or_native_null_widen(if_branch_null_widen(true), -102) != -102 { return 4 }
+    if unwrap_or_native_null_widen(if_branch_null_widen(false), -102) != 13 { return 5 }
+    if unwrap_or_native_null_widen(assign_null_widen(0), -103) != -103 { return 6 }
+    if unwrap_or_native_null_widen(assign_null_widen(1), -103) != 21 { return 7 }
+    0
+}
+
+type GfcBox<T> = struct { v: T }
+
+fn gfc_wrap<T>(x: T): GfcBox<T> { GfcBox<T>{ v = x } }
+
+fn gfc_seed_i(n: i64): GfcBox<i64> { GfcBox<i64>{ v = n } }
+fn gfc_seed_u(n: u8): GfcBox<u8> { GfcBox<u8>{ v = n } }
+
+fn f_generic_fn_constructs_generic(): i64 {
+    var a = gfc_wrap(40)
+    var b = gfc_wrap(2 to u8)
+    var si = gfc_seed_i(0)
+    var su = gfc_seed_u(0 to u8)
+    a.v + (b.v to i64) + si.v + (su.v to i64)
+}
+
+const CK1_SHADOWED: i64 = 100
+
+const CK1_ALPHA: i64 = 11
+
+const CK1_BETA: i64 = 22
+
+const CK1_GAMMA: i64 = 33
+
+fn f_ck1_shadow_local(): bool {
+    var CK1_SHADOWED: i64 = 7
+    CK1_SHADOWED == 7
+}
+
+fn f_ck1_global_via_index(): bool {
+    CK1_BETA == 22
+}
+
+fn f_ck1_many_globals_resolve(): bool {
+    CK1_ALPHA == 11 && CK1_BETA == 22 && CK1_GAMMA == 33
+}
+
+fn f_ck1_ns_call(): bool {
+    aa::ck1_ns_probe(10) == 11 && bb::ck1_ns_probe(10) == 110
+}
+
+fn f_ck1_type_same_bare(): bool {
+    var t1 = aa::Thing { v = 5 }
+    var t2 = bb::Thing { w = 9 }
+    t1.v == 5 && t2.w == 9
+}
+
+pub fn f_mem_intrinsics_safe_callable(): i64 {
+    var p = "xy".as_ptr()
+    var bytes = teko::mem::bytes_from_ptr(p, 2 to u64)
+    if bytes.len != 2 to u64 { return 1 }
+    (bytes[0] to i64) + (bytes[1] to i64)
+}
+
+fn mem_scope_drop_build_and_read(): i64 {
+    var xs: [1]i64 = []
+    xs[0] = 7
+    xs[0]
+}
+
+fn f_mem_scope_drop_replaces_free(): i64 {
+    mem_scope_drop_build_and_read()
+}
+
+fn f_ffi_wrap_boundary(): i64 {
+    var x: i64 = 33
+    var p = ptr::__unwrap<i64>(x)
+    match p.__wrap<i64>() {
+        i64 as v => v
+        error => 1
+        null => 2
+    }
+}
+
+fn f_len_builtin_call(): i64 {
+    if str_eq_word(0).len() != 5 { return 1 }
+    if str_eq_word(2).len() != 0 { return 2 }
     0
 }

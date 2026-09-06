@@ -1,0 +1,51 @@
+# syntax.tkr — the project-regressor for the IDENTITY axis of the binding modes (ref_mutable_binder).
+#
+# THE LAW (owner ruling 2026-07-30): *"`ref mut` does not make sense, by definition a `ref` can only
+# be mutable"*. `let`/`mut` is the MUTABILITY axis; `ref` is the IDENTITY axis — value versus
+# reference — and is born mutable. So `ref mut`/`mut ref` do not exist (the parser is right to
+# refuse them) and EVERY `ref` grants write-through, in BOTH binder positions.
+#
+# WHAT IT PINS, measured on the seed 0.3.0.31-beta before the fix (C route, exit codes read from the
+# built binary, not inferred):
+#
+#   * `fn shut(ref ch: Ch) { ch.open = false }` did not COMPILE — "cannot assign to a field of an
+#     immutable binding — declare it `mut` (B.21)". The writability of a binding was decided from
+#     the binder's declared `mut`-ness alone, and a parameter always declares false; the binding's
+#     `Reference` TYPE was never consulted.
+#   * `ref r = d` (no annotation) compiled into a silent COPY — exit 1 where the alias demands 0,
+#     with zero diagnostics — while `ref r: Ch = d` over the SAME `mut` source aliased correctly
+#     (exit 0). The reference-ness survived only inside the `Ref<>`-wrapped ANNOTATION, so the
+#     un-annotated form reached the checker indistinguishable from `mut r = d`.
+#
+# WHY THE EXIT CODE IS A BIT-SCORE AND NOT A BOOLEAN. A scenario that merely asserted "it compiles"
+# would pass trivially without any write ever crossing the reference, and a scenario that asserted
+# only the value AFTER the write would pass on a field that already held it. Every direction here
+# therefore records a BEFORE and an AFTER reading of the SAME cell and scores them together
+# (`flipped`/`raised` — inverted guards that fail on either end), contributing its own bit:
+#
+#   1  the write landed in the `ref` PARAMETER's own view (the callee's read-back)
+#   2  the caller's variable SAW the write made through the `ref` parameter
+#   4  an un-annotated `ref r = d` saw a write made to its SOURCE
+#   8  the SOURCE saw a write made THROUGH the un-annotated reference (the identity axis proper)
+#  16  the annotated `ref r: Ch = d` control still agrees with the inferred spelling
+#  32  under a `let` handle, the class's OWN METHOD still writes its field (the `private set` half)
+#  64  the same DIRECT field write through a `mut` handle is still admitted (the guard's inversion)
+#
+# A regression therefore does not merely go non-zero: the missing bits name WHICH direction broke.
+#
+# THE THIRD MODE, and why bits 32 and 64 live here. The owner's model has three modes: `let`
+# protects deeply, `mut` is its inverse, `ref` is the value AS a reference. `let` protecting a
+# CLASS's fields at every level (2026-07-30, `{ public get; private set; }`) is the SAME decision as
+# `ref` being mutable, read from the other side — one guard, two signals that were crossed: the
+# `ref` was treated as immutable when it is mutable by definition, and a class was treated as
+# mutable when under `let` it is read-only. The two directions scored here are the ones a careless
+# fix breaks: bit 32 fails if the `let` protection is made a blanket ban on class writes, bit 64
+# fails if the guard rejects the write for being a CLASS rather than for the handle being immutable.
+# The REJECTED halves of the same law live in `examples/regressions/diagnostics` (c68/c69/c70),
+# which pays no extra build for them.
+
+Feature: ref_mutable_binder — `ref` is mutable by definition; `let` protects at every level
+
+  Scenario: every direction of write-through holds, in the parameter and in the un-annotated local
+    When built and run
+    Then stdout pattern = "127"

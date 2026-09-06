@@ -1,0 +1,172 @@
+fn spaces(n: u64): str {
+    var out: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = [..out, b' ']
+        i = i + 1
+    }
+    str(out)
+}
+
+fn is_scalar_kind(k: YamlKind): bool {
+    k == YamlKind::Null || k == YamlKind::Bool || k == YamlKind::Int || k == YamlKind::Float || k == YamlKind::Str
+}
+
+fn renders_inline(v: YamlValue): bool {
+    if is_scalar_kind(v.kind) { return true }
+    if v.kind == YamlKind::Seq { return v.items.len == 0 }
+    v.keys.len == 0
+}
+
+fn format_yaml_float(v: f64): str {
+    if teko::math::is_nan(v) { return ".nan" }
+    if teko::math::is_inf(v) { return if v < 0.0 { "-.inf" } else { ".inf" } }
+    ensure_float_looking(teko::runtime::f64_g17(v))
+}
+
+fn ensure_float_looking(text: str): str {
+    var b = text.bytes()
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        if b[i] == b'.' || b[i] == b'e' || b[i] == b'E' { return text }
+        i = i + 1
+    }
+    concat(text, ".0")
+}
+
+fn has_unsafe_plain_chars(s: str): bool {
+    var b = s.bytes()
+    if is_blank_byte(b[0]) || is_blank_byte(b[b.len - 1]) { return true }
+    if is_unsafe_leading_byte(b[0]) { return true }
+    if b[0] == b'-' && (b.len == 1 || b[1] == b' ') { return true }
+    scan_for_unsafe_run(b)
+}
+
+fn is_unsafe_leading_byte(c: byte): bool {
+    c == b'?' || c == b':' || c == b',' || c == b'[' || c == b']' || c == b'{' || c == b'}' || c == b'#' || c == b'&' || c == b'*' || c == b'!' || c == b'|' || c == b'>' || c == b'\'' || c == b'"' || c == b'%' || c == b'@' || c == b'`' || c == b'~'
+}
+
+fn scan_for_unsafe_run(b: []byte): bool {
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        var c = b[i]
+        if c == b'\n' || c == b'\t' || c == b',' || c == b'[' || c == b']' || c == b'{' || c == b'}' { return true }
+        if c == b':' && (i + 1 >= b.len || b[i + 1] == b' ') { return true }
+        if c == b'#' && i > 0 && b[i - 1] == b' ' { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn needs_quoting(s: str): bool {
+    if s.len == 0 { return true }
+    if resolve_scalar(s).kind != YamlKind::Str { return true }
+    has_unsafe_plain_chars(s)
+}
+
+fn encode_double_quoted_str(s: str): str {
+    var out: []byte = [b'"']
+    var b = s.bytes()
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        var c = b[i]
+        if c == b'"' { out = append_all(out, "\\\"".bytes()); i = i + 1; continue }
+        if c == b'\\' { out = append_all(out, "\\\\".bytes()); i = i + 1; continue }
+        if c == b'\n' { out = append_all(out, "\\n".bytes()); i = i + 1; continue }
+        if c == b'\r' { out = append_all(out, "\\r".bytes()); i = i + 1; continue }
+        if c == 0x09 to byte { out = append_all(out, "\\t".bytes()); i = i + 1; continue }
+        if c < 0x20 to byte { out = append_all(out, escape_control_hex(c)); i = i + 1; continue }
+        out = [..out, c]
+        i = i + 1
+    }
+    out = [..out, b'"']
+    str(out)
+}
+
+fn escape_control_hex(c: byte): []byte {
+    var hex_digits = "0123456789abcdef".bytes()
+    var hi = (c to u64) >> 4
+    var lo = (c to u64) & 0xF
+    var out = "\\u00".bytes()
+    out = [..out, hex_digits[hi]]
+    [..out, hex_digits[lo]]
+}
+
+fn encode_scalar_str(s: str): str {
+    if needs_quoting(s) { return encode_double_quoted_str(s) }
+    s
+}
+
+fn encode_inline(v: YamlValue): str {
+    match v.kind {
+        YamlKind::Null => "null"
+        YamlKind::Bool => if v.bool_val { "true" } else { "false" }
+        YamlKind::Int => i64_to_str(v.int_val)
+        YamlKind::Float => format_yaml_float(v.float_val)
+        YamlKind::Str => encode_scalar_str(v.text)
+        YamlKind::Seq => "[]"
+        YamlKind::Map => "{}"
+    }
+}
+
+fn encode_seq_block(items: []YamlValue, indent: u64): str {
+    var out: []byte = []
+    var pad = spaces(indent).bytes()
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        var item = items[i]
+        out = append_all(out, pad)
+        if renders_inline(item) {
+            out = append_all(out, "- ".bytes())
+            out = append_all(out, encode_inline(item).bytes())
+            out = [..out, b'\n']
+        } else {
+            out = append_all(out, "-\n".bytes())
+            out = append_all(out, render_block(item, indent + 2).bytes())
+        }
+        i = i + 1
+    }
+    str(out)
+}
+
+fn encode_map_block(keys: []str, vals: []YamlValue, indent: u64): str {
+    var out: []byte = []
+    var pad = spaces(indent).bytes()
+    var i: u64 = 0
+    loop {
+        if i >= keys.len { break }
+        var v = vals[i]
+        out = append_all(out, pad)
+        out = append_all(out, encode_scalar_str(keys[i]).bytes())
+        if renders_inline(v) {
+            out = append_all(out, ": ".bytes())
+            out = append_all(out, encode_inline(v).bytes())
+            out = [..out, b'\n']
+        } else {
+            out = append_all(out, ":\n".bytes())
+            out = append_all(out, render_block(v, indent + 2).bytes())
+        }
+        i = i + 1
+    }
+    str(out)
+}
+
+fn render_block(v: YamlValue, indent: u64): str {
+    if v.kind == YamlKind::Seq { return encode_seq_block(v.items, indent) }
+    encode_map_block(v.keys, v.vals, indent)
+}
+
+/**
+ * Renders `v` as a complete YAML document. A non-empty root `Seq`/`Map` renders as a full block
+ * starting at column `0`; an empty root `Seq`/`Map` renders as `[]`/`{}`; any other root renders
+ * as its inline scalar token, each followed by a trailing newline.
+ */
+exp fn encode_yaml(v: YamlValue): str {
+    if renders_inline(v) { return concat(encode_inline(v), "\n") }
+    render_block(v, 0)
+}

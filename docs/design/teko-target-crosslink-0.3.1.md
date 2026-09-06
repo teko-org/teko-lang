@@ -102,7 +102,7 @@ the predefines; this doc states the contract only.)
 Front-end wiring mirrors `os` EXACTLY at the two sites that make it usable by the compiler
 (the compiler is compiled by the frozen C backend, so C emission is what matters):
 
-- `src/checker/scope.tks` — beside line 450, add the `arch` signature (`() -> str`).
+- `src/checker/scope.tks` — beside line 450, add the `arch` signature (`(): str`).
 - `src/codegen/codegen.tks` — beside line 3036, add `else if last == "arch" { builtin =
   "tk_rt_arch"; has_builtin = true }`.
 - Native N1 lowering is OPTIONAL: a corpus program calling `teko::arch()` under `--backend=native`
@@ -134,7 +134,7 @@ the honest-error message.
  * @throws when "<arch>-<os>" is absent from supported_targets
  * @since 0.3.1
  */
-fn host_target() -> NativeTarget | error { /* crumb C3 */ }
+fn host_target(): NativeTarget | error { /* crumb C3 */ }
 
 /**
  * supported_targets — the SINGLE source of truth (D39) for own-backend targets: the ordered list
@@ -145,7 +145,7 @@ fn host_target() -> NativeTarget | error { /* crumb C3 */ }
  * @return the canonical (name, variant) pairs, in display order for the honest-error message
  * @since 0.3.1
  */
-fn supported_targets() -> []TargetRow { /* crumb C3 */ }
+fn supported_targets(): []TargetRow { /* crumb C3 */ }
 
 /**
  * TargetRow — one row of the supported-targets table: the canonical os-arch name, its NativeTarget
@@ -154,7 +154,7 @@ fn supported_targets() -> []TargetRow { /* crumb C3 */ }
  *
  * @field name    the canonical "<arch>-<os>" key (e.g. "x86_64-linux")
  * @field variant the dispatch discriminant for emit_native
- * @field objfmt  the object format token ("elf" | "macho" | "coff" | "wasm")
+ * @field objfmt  the object format token ("elf" | "macho" | "coff")
  * @since 0.3.1
  */
 type TargetRow = struct { name: str; variant: NativeTarget; objfmt: str }
@@ -166,7 +166,7 @@ arm64 fallback) on miss:
 ```teko
 /**
  * target_from_name — map a raw TEKO_TARGET value (canonical name or a recognized alias, e.g.
- * "x86_64-elf" → x86_64-linux, "wasm" → wasm32-wasi) to its NativeTarget via supported_targets.
+ * "x86_64-elf" → x86_64-linux) to its NativeTarget via supported_targets.
  * REPLACES the pre-0.3.1 silent Arm64Macho fallback: an unsupported/typo value is now a hard error
  * (R2) whose message lists the supported set from supported_targets — no silent mis-lower.
  *
@@ -175,7 +175,7 @@ arm64 fallback) on miss:
  * @throws when name is neither a canonical supported name nor a known alias (R2)
  * @since 0.3.1
  */
-fn target_from_name(name: str) -> NativeTarget | error { /* touches src/build/project.tks:1077 */ }
+fn target_from_name(name: str): NativeTarget | error { /* touches src/build/project.tks:1077 */ }
 
 /**
  * native_target — the effective own-backend target: host_target() when TEKO_TARGET is unset (R1),
@@ -188,7 +188,7 @@ fn target_from_name(name: str) -> NativeTarget | error { /* touches src/build/pr
  * @throws when the host os-arch (unset) or the requested value (set) is unsupported
  * @since 0.3.1
  */
-fn native_target() -> NativeTarget | error { /* touches src/build/project.tks:1108 */ }
+fn native_target(): NativeTarget | error { /* touches src/build/project.tks:1108 */ }
 ```
 
 Note the return-type change `NativeTarget → NativeTarget | error` ripples to `emit_native()`
@@ -221,14 +221,14 @@ fabricated pass. Design:
  * @return a record { is_cross: bool; note: str } for the build report
  * @since 0.3.1
  */
-fn cross_note(target: NativeTarget) -> CrossNote { /* crumb C5 */ }
+fn cross_note(target: NativeTarget): CrossNote { /* crumb C5 */ }
 ```
 
 Reporting surface: a field on the build report, printed as an explicit line, e.g.
 `cross: emitted x86_64-windows on host x86_64-linux — not executed`. This reuses the exact
 honest-skip discipline the regressor already uses for absent run-wrappers
 (`resolve_run_wrapper`, `docs/design/regressor-principal-0.3.1.md` §2g). A cross native build is,
-for the run step, the same shape as a wasm target whose wrapper is absent: emitted, verified
+for the run step: emitted, verified
 well-formed (`check_object_wellformed`, §2f of that doc), NOT run.
 
 ---
@@ -327,7 +327,7 @@ flagged as a spec-fill for owner ratification, separate from the ratified §4.1 
  * @throws when a static: lib for target is not pointed-at or not present locally (R4/M.3)
  * @since 0.3.1
  */
-fn validate_static_libs_for_target(m: Manifest, target: NativeTarget) -> error? { /* crumb C4 */ }
+fn validate_static_libs_for_target(m: Manifest, target: NativeTarget): error? { /* crumb C4 */ }
 ```
 
 Manifest struct delta (`src/build/manifest.tks:31` type `Manifest`, and the builder `:311+`): the
@@ -487,7 +487,7 @@ harness:
   post-build check that a cross object is the RIGHT format — this is the direct regressor for the
   motivating bug (a linux-host default MUST produce ELF, asserted by `check_elf`, not Mach-O).
 
-New scenarios to add (inputs → expected exit, VM=interp and native where applicable):
+New scenarios to add (inputs → expected exit, LIR oracle and native where applicable):
 
 | # | scenario | target/env | expect |
 |---|---|---|---|
@@ -501,7 +501,7 @@ New scenarios to add (inputs → expected exit, VM=interp and native where appli
 | T7b | cross shared: lib absent, WITH --allow-undef (ELF) | set, cross, --allow-undef | emit + link ok (blind); run SKIPPED honest (R5 opt-in) |
 | T8 | cross shared: on x86_64-windows, no import lib (even with --allow-undef) | set, cross | honest error / named stop (R5 COFF gap) |
 
-VM vs native: T1-T3 assert absolute exit on both engines where the snippet runs; T4/T6/T8 are
+LIR oracle vs native: T1-T3 assert absolute exit on both engines where the snippet runs; T4/T6/T8 are
 compile-fail (engine-independent, diagnostic-pinned per the F1 inversion); T5/T7 assert emit + object
 well-formed with an honest RUN-skip label.
 

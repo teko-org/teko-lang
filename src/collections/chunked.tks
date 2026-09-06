@@ -1,0 +1,213 @@
+type SegChunk<T> = class {
+    intern data: []T
+    intern used: u32
+    intern next: SegChunk<T>|null
+
+    pub static fn make(): SegChunk<T> {
+        var d: [teko::collections::CHUNK]T = []
+        .{ data = d; used = 0; next = null }
+    }
+
+    pub fn count_used(): u32 { self.used }
+
+    pub fn succ(): SegChunk<T>|null { self.next }
+
+    pub fn write(x: T) {
+        self.data[self.used] = x
+        self.used = self.used + 1
+    }
+
+    pub fn read(p: u32): T { self.data[p] }
+
+    pub fn link(nx: SegChunk<T>) { self.next = nx }
+
+    pub fn last_val(): T { self.data[self.used - 1] }
+
+    pub fn walk(i: u64): T {
+        if i < teko::collections::CHUNK { return self.data[i] }
+        match self.next {
+            teko::collections::SegChunk<T> as n => n.walk(i - teko::collections::CHUNK)
+            null => panic("teko::collections::chunked: index out of range")
+        }
+    }
+
+    pub fn walk_set(i: u64, x: T) {
+        if i < teko::collections::CHUNK {
+            self.data[i] = x
+            return
+        }
+        match self.next {
+            teko::collections::SegChunk<T> as n => n.walk_set(i - teko::collections::CHUNK, x)
+            null => panic("teko::collections::chunked: index out of range")
+        }
+    }
+}
+
+/**
+ * A grow-without-recopy sequence of `T` for the IR builders: appends land in fixed leaf chunks
+ * (`SegChunk`) that are never reallocated or moved, so building `n` elements costs O(n) writes and
+ * ZERO element recopy (unlike `[..xs, x]` copy-grow). Reference-semantic: `push` mutates the receiver.
+ *
+ * Access is O(1) append (`push`), O(1) `len`/`first`/`last`, O(1)-amortized forward iteration
+ * (`iter`), and O(n/CHUNK) random `get` (rare — see the module audit). NEVER geometric/capacity-
+ * doubling (D207): the chain grows by one fixed chunk when the tail fills.
+ *
+ * @see ChunkedIter
+ */
+exp type Chunked<T> = class {
+    intern head: SegChunk<T>|null
+    intern tail: SegChunk<T>|null
+    intern count: u64
+
+    /**
+     * Builds an empty `Chunked<T>`.
+     *
+     * @return a sequence with `len() == 0`
+     */
+    pub static fn make(): Chunked<T> { .{ head = null; tail = null; count = 0 } }
+
+    /**
+     * The number of elements appended so far.
+     *
+     * @return the element count
+     */
+    pub fn len(): u64 { self.count }
+
+    /**
+     * True iff `len() == 0`.
+     *
+     * @return whether the sequence is empty
+     */
+    pub fn is_empty(): bool { self.count == 0 }
+
+    /**
+     * Appends `x` after the last element, in place; opens a fresh tail chunk when the current one is
+     * full. The element is written once and never moved.
+     *
+     * @param x the value to append
+     */
+    pub fn push(x: T) {
+        match self.tail {
+            teko::collections::SegChunk<T> as t => {
+                if t.count_used() to u64 < teko::collections::CHUNK {
+                    t.write(x)
+                    self.count = self.count + 1
+                    return
+                }
+                var nx = SegChunk<T>::make()
+                nx.write(x)
+                t.link(nx)
+                self.tail = nx
+                self.count = self.count + 1
+            }
+            null => {
+                var first = SegChunk<T>::make()
+                first.write(x)
+                self.head = first
+                self.tail = first
+                self.count = 1
+            }
+        }
+    }
+
+    /**
+     * Reads the first element; the sequence must be non-empty.
+     *
+     * @return element 0
+     * @throws panic when `is_empty()`
+     */
+    pub fn first(): T {
+        match self.head {
+            teko::collections::SegChunk<T> as h => h.read(0)
+            null => panic("teko::collections::chunked: first of empty sequence")
+        }
+    }
+
+    /**
+     * Reads the last element; the sequence must be non-empty.
+     *
+     * @return element `len()-1`
+     * @throws panic when `is_empty()`
+     */
+    pub fn last(): T {
+        match self.tail {
+            teko::collections::SegChunk<T> as t => t.last_val()
+            null => panic("teko::collections::chunked: last of empty sequence")
+        }
+    }
+
+    /**
+     * Reads the element at `i`; walks the chunk chain (O(i/CHUNK)). Prefer `iter` for sequential scans.
+     *
+     * @param i a 0-based index in `[0, len())`
+     * @return the element at `i`
+     * @throws panic when `i >= len()`
+     */
+    pub fn get(i: u64): T {
+        match self.head {
+            teko::collections::SegChunk<T> as h => h.walk(i)
+            null => panic("teko::collections::chunked: index out of range")
+        }
+    }
+
+    /**
+     * Overwrites the element at `i` in place; walks the chunk chain (O(i/CHUNK)).
+     *
+     * @param i the 0-based index in `[0, len())`
+     * @param x the replacement value
+     * @throws panic when `i >= len()`
+     */
+    pub fn set(i: u64, x: T) {
+        match self.head {
+            teko::collections::SegChunk<T> as h => h.walk_set(i, x)
+            null => panic("teko::collections::chunked: index out of range")
+        }
+    }
+
+    /**
+     * A forward cursor over the elements in append order.
+     *
+     * @return a fresh iterator positioned before element 0
+     */
+    pub fn iter(): ChunkedIter<T> { ChunkedIter<T>::over(self.head) }
+}
+
+/**
+ * A single-pass forward cursor over a `Chunked<T>`; `next` yields elements in append order until the
+ * chain is exhausted.
+ *
+ * @see Chunked
+ */
+exp type ChunkedIter<T> = class {
+    intern node: SegChunk<T>|null
+    intern pos: u32
+
+    /**
+     * Builds a cursor positioned before the first element of the chain rooted at `head`.
+     *
+     * @param head  the first chunk, or `null` for an empty sequence
+     * @return      a fresh cursor
+     */
+    pub static fn over(head: SegChunk<T>|null): ChunkedIter<T> { .{ node = head; pos = 0 } }
+
+    /**
+     * Yields the next element, or `null` when the sequence is exhausted; advances the cursor.
+     *
+     * @return the next element wrapped, or `null` at the end
+     */
+    pub fn next(): T|null {
+        match self.node {
+            teko::collections::SegChunk<T> as n => {
+                if self.pos >= n.count_used() {
+                    self.node = n.succ()
+                    self.pos = 0
+                    return self.next()
+                }
+                var v = n.read(self.pos)
+                self.pos = self.pos + 1
+                v
+            }
+            null => null
+        }
+    }
+}

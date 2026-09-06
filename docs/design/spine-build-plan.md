@@ -157,7 +157,7 @@ pub type Spine = struct {
  * @see      docs/design/spine-layer-or-replace.md §2c.2
  * @since    0.1.0.0-beta (#331 L1)
  */
-pub fn fn_spine(f: TFunction) -> Spine { /* build universe → seed → worklist-join to fixpoint */ }
+pub fn fn_spine(f: TFunction): Spine { /* build universe → seed → worklist-join to fixpoint */ }
 ```
 
 **Seeding** (the initial climb-floor): every bare cell starts `pt = PtFrame`, `bf = BfNone`,
@@ -195,7 +195,7 @@ lattice × monotone transfers on the two climbing axes ⇒ fixpoint in ≤ `|cel
  * @param referent the cell index of the referent (or a sentinel when un-nameable)
  * @return         true iff the borrow provably does not outlive its referent
  */
-pub fn ref_target_outlives(s: Spine, borrow: u32, referent: u32) -> bool { /* read bf, pt of referent */ }
+pub fn ref_target_outlives(s: Spine, borrow: u32, referent: u32): bool { /* read bf, pt of referent */ }
 
 /**
  * Is `binding` the SOLE live handle at `site` — `us(binding) = UsUnique`? The affine `mem::free`
@@ -206,7 +206,7 @@ pub fn ref_target_outlives(s: Spine, borrow: u32, referent: u32) -> bool { /* re
  * @param binding  the cell index of the consumed binding
  * @return         true iff `binding` is provably unique (safe to free/move)
  */
-pub fn is_unique_at(s: Spine, binding: u32) -> bool { /* us(binding) == UsUnique */ }
+pub fn is_unique_at(s: Spine, binding: u32): bool { /* us(binding) == UsUnique */ }
 ```
 
 `is_unique_at` does not need a distinct per-`site` value in the first build: the fixpoint joins
@@ -261,7 +261,7 @@ body becomes an early-return guard (W15 flatten):
  * @param ref_ce the cell index of the referent
  * @return       true iff the ref-bind is sound and the gate should ADMIT it
  */
-fn ref_bind_is_sound(bound: Type, s: Spine, borrow: u32, ref_ce: u32) -> bool {
+fn ref_bind_is_sound(bound: Type, s: Spine, borrow: u32, ref_ce: u32): bool {
     if !type_contains_ref(bound) { return true }
     ref_target_outlives(s, borrow, ref_ce)
 }
@@ -286,7 +286,7 @@ new-code coverage debt; cover the unreachable arms via a fabricated-`Spine` unit
 
 **PHASE ORDERING (why §2.3's "thread fn_spine into the gates" is INFEASIBLE):** `fn_spine` needs a typed
 `TFunction`; `type_binding`/`type_assign` run mid-typing on `parser::` nodes before any `TFunction`
-exists. So the consumer is a **post-typing pass** `check_ref_storability(tf) -> null | error`, run ONCE
+exists. So the consumer is a **post-typing pass** `check_ref_storability(tf): null | error`, run ONCE
 per function after the body is assembled (`type_function` after `check_must_free`, ~typer.tks:3700, over
 the `TFunction` built at :3701; `type_method` over the assembled body ~:3635). Build `fn_spine(tf)` ONCE
 from the ACTUAL `fixed_params` (so `is_ref_param`/`seed_bf` yield `BfParam` — a stripped shell seeds
@@ -327,7 +327,7 @@ existing string `"a reference cannot be bound to a local (parameter-only in this
 - `b.slot = <ref>` (store a ref into a field) → **REJECT / KEEP the inline gate byte-identical**. This is **VACUOUS**: no struct/class field can be DECLARED `Ref`-typed (collect.tks:1496+/resolve.tks:1373+), so `field_t` is never a `Reference` — wiring a spine narrow-relax here would be dead, uncoverable code. **DEFER §2.1(ii) entirely.**
 
 **★ SKEPTIC AMENDMENT 1 (UNSOUND — MUST ship in PR-2): closure-capture is an escape route the rationale
-missed.** `fn leak(p: Ref<i64>) -> (fn()->i64) { let r = p; () => { r.value } }` — admitting `let r = p`
+missed.** `fn leak(p: Ref<i64>): (fn():i64) { let r = p; () => { r.value } }` — admitting `let r = p`
 lets a closure capture `r` into its heap env and RETURN it, carrying a ref to the caller's (now-dead)
 object past the frame → UAF. The "R3/R4/R2/field-store = complete escape set" claim is FALSE. **Fix:** in
 `type_lambda` (typer.tks:~158-163 capture loop) REJECT any capture whose captured type satisfies
@@ -346,7 +346,7 @@ inherited `BfParam` tag already proves param-rooted.
 (typer.tks:2900/:3006); (3) `check_ref_storability(tf)` post-pass wired in `type_function`/`type_method`,
 with amendment-2's chain-link skip; (4) the closure-capture ref-reject in `type_lambda` (amendment 1);
 (5) fixtures — `stored_borrow_sound` reshaped as a ref-to-local **BIND** (take `Ref<i64>`, `let r = p`,
-read AND write `r.value`, return a sentinel; VM==native) + a negative un-nameable-RHS EXPECT_COMPILE_FAIL
+read AND write `r.value`, return a sentinel) + a negative un-nameable-RHS EXPECT_COMPILE_FAIL
 (added to BOTH `diff_vm_native.sh` COMPILE_FAIL[] and the `sanitizers.yml` skip loop) + a
 closure-capture-of-ref-local EXPECT_COMPILE_FAIL + a fabricated-`Spine` unit test covering the
 `BfNone`/`BfTop`/`PtAdopter`/cell-not-found reject arms (100%-new-code) + a ref-to-local inside a match arm
@@ -483,7 +483,7 @@ independent review — the recon's `ADDITIVE-BUT-GATE-TOUCHING` classification):
    `BorrowedFrom`/`Unique`/`Spine`/`fn_spine`/`ref_target_outlives`/`is_unique_at`. **No gate site
    changes yet** — the query is computed but consulted nowhere. Because it emits no C and relaxes no
    gate, **FIXPOINT is preserved by construction** (a new pure query changes no generated output).
-   Gate: full gate confirms the new module compiles on both engines; fixpoint trivially holds. This
+   Gate: full gate confirms the new module compiles natively; fixpoint trivially holds. This
    PR is the safe landing of the whole lattice, reviewable in isolation. Ships `stored_borrow_sound`
    ACCEPT is NOT yet true here (the gate still rejects) — so no positive fixture lands in PR-1; only
    the negative KEEP-forever fixtures (`ref_returned_rejected`, `ref_in_collection_rejected`) land
@@ -533,10 +533,10 @@ the marker). **Keep the two in sync** (the `must_free_leak` marker file says so 
 | # | Fixture | Kind | Observable | Lands in | Guards |
 |---|---|---|---|---|---|
 | 1 | `stored_borrow_outlives_referent` | **COMPILE-REJECT** (`EXPECT_COMPILE_FAIL`) | `teko build` AND `teko run` both exit non-zero with the `typer.tks:2870` "stored in a field" diagnostic | PR-2 | spine's field-store relax did NOT over-accept a container-outlives-referent case |
-| 2 | `stored_borrow_sound` | **RUN** | VM exit == native exit == fixed sentinel (reads through the borrow, returns a known sum, mirror `mem_free`'s exit-code shape) | PR-2 | spine actually RELAXED R5/field-store for the unique frame-local one-hop shape |
-| 3 | `ref_returned_rejected` | **COMPILE-REJECT** (`EXPECT_COMPILE_FAIL`) | both engines reject with `typer.tks:3456`/`:3527` "cannot return a reference (pass-down only)" | PR-1 | R3 KEEP-FOREVER (§2c.4b) — the one-function bound must never relax this |
-| 4 | `free_aliased_rejected` | **COMPILE-REJECT** (`EXPECT_COMPILE_FAIL`) | both engines reject with the L2b "aliased … sole live handle" diagnostic | PR-3 | the `us = shared` affine guard — the one real native UAF gap (remodel §5) |
-| 5 | `ref_in_collection_rejected` | **COMPILE-REJECT** (`EXPECT_COMPILE_FAIL`) | both engines reject with `resolve.tks:1187`/`:1204` "stored in a struct/variant/collection" | PR-1 | the KEEP-forever collection/variant anchor — BUILD touched neither |
+| 2 | `stored_borrow_sound` | **RUN** | native exit == fixed sentinel (reads through the borrow, returns a known sum, mirror `mem_free`'s exit-code shape) | PR-2 | spine actually RELAXED R5/field-store for the unique frame-local one-hop shape |
+| 3 | `ref_returned_rejected` | **COMPILE-REJECT** (`EXPECT_COMPILE_FAIL`) | rejects with `typer.tks:3456`/`:3527` "cannot return a reference (pass-down only)" | PR-1 | R3 KEEP-FOREVER (§2c.4b) — the one-function bound must never relax this |
+| 4 | `free_aliased_rejected` | **COMPILE-REJECT** (`EXPECT_COMPILE_FAIL`) | rejects with the L2b "aliased … sole live handle" diagnostic | PR-3 | the `us = shared` affine guard — the one real native UAF gap (remodel §5) |
+| 5 | `ref_in_collection_rejected` | **COMPILE-REJECT** (`EXPECT_COMPILE_FAIL`) | rejects with `resolve.tks:1187`/`:1204` "stored in a struct/variant/collection" | PR-1 | the KEEP-forever collection/variant anchor — BUILD touched neither |
 
 Fixture 4 PAIRS with the existing `examples/regressions/mem_free/` (unique free → must keep PASSING
 at exit 67). Fixtures 3 + 5 land in **PR-1** as pre-existing-behavior guards (they already reject

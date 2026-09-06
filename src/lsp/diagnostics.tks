@@ -1,0 +1,243 @@
+use teko::encoding::json
+use teko::parser
+use teko::lexer
+use teko::checker
+
+pub type DiagSeverity = enum { Error; Warning; Info; Hint }
+
+pub type LspDiagnostic = struct {
+        start_line: u32
+        start_col: u32
+        end_line: u32
+        end_col: u32
+        severity: DiagSeverity
+        message: str
+}
+
+type ParsedNum = struct {
+        value: u32
+        next: u64
+        ok: bool
+}
+
+fn severity_code(s: DiagSeverity): f64 {
+    match s {
+        DiagSeverity::Error => 1.0
+        DiagSeverity::Warning => 2.0
+        DiagSeverity::Info => 3.0
+        DiagSeverity::Hint => 4.0
+    }
+}
+
+fn checker_severity(s: checker::DiagLevel): DiagSeverity {
+    match s {
+        checker::DiagLevel::Error => DiagSeverity::Error
+        checker::DiagLevel::Warning => DiagSeverity::Warning
+        checker::DiagLevel::Info => DiagSeverity::Info
+        checker::DiagLevel::Hint => DiagSeverity::Hint
+    }
+}
+
+fn is_ident_byte(b: byte): bool {
+    if b >= b'a' && b <= b'z' { return true }
+    if b >= b'A' && b <= b'Z' { return true }
+    if b >= b'0' && b <= b'9' { return true }
+    b == b'_'
+}
+
+fn line_start_offset(text: str, line1: u32): u64 {
+    if line1 <= 1 { return 0 }
+    var cur: u32 = 1
+    var i: u64 = 0
+    loop {
+        if i >= text.len { return text.len }
+        if text[i] == b'\n' {
+            cur = cur + 1
+            if cur == line1 { return i + 1 }
+        }
+        i = i + 1
+    }
+}
+
+fn word_end_col(text: str, line1: u32, col1: u32): u32 {
+    if col1 == 0 { return 1 }
+    var start = line_start_offset(text, line1)
+    var off = start + ((col1 - 1) to u64)
+    if off >= text.len { return col1 + 1 }
+    if !is_ident_byte(text[off]) { return col1 + 1 }
+    var c = col1
+    loop {
+        if off >= text.len { break }
+        if text[off] == b'\n' { break }
+        if !is_ident_byte(text[off]) { break }
+        off = off + 1
+        c = c + 1
+    }
+    c
+}
+
+fn make_diag(text: str, line1: u32, col1: u32, sev: DiagSeverity, message: str): LspDiagnostic {
+    if line1 == 0 {
+        return LspDiagnostic { start_line = 0; start_col = 0; end_line = 0; end_col = 0; severity = sev; message = message }
+    }
+    var sl = line1 - 1
+    var sc = if col1 > 0 { col1 - 1 } else { 0 }
+    var start_c1 = if col1 > 0 { col1 } else { 1 }
+    var end1 = word_end_col(text, line1, start_c1)
+    var ec = if end1 > 0 { end1 - 1 } else { sc + 1 }
+    LspDiagnostic { start_line = sl; start_col = sc; end_line = sl; end_col = ec; severity = sev; message = message }
+}
+
+fn to_lsp_diagnostic(text: str, d: checker::Diagnostic): LspDiagnostic {
+    make_diag(text, d.line, d.col, checker_severity(d.severity), d.message)
+}
+
+fn read_u32(s: str, from: u64): ParsedNum {
+    var i = from
+    var n: u64 = 0
+    var any = false
+    loop {
+        if i >= s.len { break }
+        if s[i] < b'0' || s[i] > b'9' { break }
+        n = n * 10 + ((s[i] to u64) - (b'0' to u64))
+        any = true
+        i = i + 1
+    }
+    ParsedNum { value = n to u32; next = i; ok = any }
+}
+
+fn has_prefix(s: str, prefix: str): bool {
+    if s.len < prefix.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= prefix.len { break }
+        if s[i] != prefix[i] { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn strip_leading_location(msg: str): str {
+    var p1 = read_u32(msg, 0)
+    if !p1.ok || p1.next >= msg.len || msg[p1.next] != b':' { return msg }
+    var p2 = read_u32(msg, p1.next + 1)
+    if !p2.ok || p2.next >= msg.len || msg[p2.next] != b':' { return msg }
+    var j = p2.next + 1
+    if j < msg.len && msg[j] == b' ' { j = j + 1 }
+    msg.slice_from(j)
+}
+
+fn doc_is_main(path: str): bool {
+    if !path.ends_with("main.tks") { return false }
+    if path.len == 8 { return true }
+    path[path.len - 9] == b'/'
+}
+
+fn main_items(mf: parser::MainFile, path: str): []parser::Item {
+    var items: []parser::Item = []
+    var ui: u64 = 0
+    loop {
+        if ui >= mf.uses.len { break }
+        items = [..items, parser::Item { content = mf.uses[ui]; namespace = ""; file = path; guard = parser::pred_true() }]
+        ui = ui + 1
+    }
+    var si: u64 = 0
+    loop {
+        if si >= mf.body.len { break }
+        items = [..items, parser::Item { content = mf.body[si]; namespace = ""; file = path; guard = parser::pred_true() }]
+        si = si + 1
+    }
+    items
+}
+
+fn module_items_guard(m: parser::Module, di: u64): parser::Pred {
+    if di < m.decl_guards.len { return m.decl_guards[di] }
+    parser::pred_true()
+}
+
+fn module_items(m: parser::Module, path: str): []parser::Item {
+    var items: []parser::Item = []
+    var ui: u64 = 0
+    loop {
+        if ui >= m.uses.len { break }
+        items = [..items, parser::Item { content = m.uses[ui]; namespace = ""; file = path; guard = parser::pred_true() }]
+        ui = ui + 1
+    }
+    var di: u64 = 0
+    loop {
+        if di >= m.decls.len { break }
+        var g = module_items_guard(m, di)
+        items = match m.decls[di] {
+            parser::Function as f => [..items, parser::Item { content = f; namespace = ""; file = path; guard = g }]
+            parser::TypeDecl as t => [..items, parser::Item { content = t; namespace = ""; file = path; guard = g }]
+            parser::ConstDecl as c => [..items, parser::Item { content = c; namespace = ""; file = path; guard = g }]
+            parser::MacroDecl as md => [..items, parser::Item { content = md; namespace = ""; file = path; guard = g }]
+            parser::ComptimeDecl as cd => [..items, parser::Item { content = cd; namespace = ""; file = path; guard = g }]
+            parser::EmbedDecl => items
+        }
+        di = di + 1
+    }
+    items
+}
+
+fn document_program(path: str, text: str): parser::Program | error {
+    var tokens = match lexer::tokenize_file(text, path) { []lexer::Token as t => t; error as e => return e }
+    if doc_is_main(path) {
+        var mf = match parser::parse_main_file(tokens, 0) { parser::Parsed<parser::MainFile> as x => x.node; error as e => return e }
+        return parser::Program { items = main_items(mf, path) }
+    }
+    var m = match parser::parse_module(tokens, 0) { parser::Parsed<parser::Module> as x => x.node; error as e => return e }
+    parser::Program { items = module_items(m, path) }
+}
+
+pub fn diagnose_document(path: str, text: str): []LspDiagnostic {
+    match document_program(path, text) {
+        parser::Program as prog => {
+            var raw = checker::collect_diagnostics_structured(prog)
+            var out: []LspDiagnostic = []
+            var i: u64 = 0
+            loop {
+                if i >= raw.len { break }
+                out = [..out, to_lsp_diagnostic(text, raw[i])]
+                i = i + 1
+            }
+            out
+        }
+        error as e => [make_diag(text, e.line, e.col, DiagSeverity::Error, strip_leading_location(e.message))]
+    }
+}
+
+fn jarr(items: []@JsonValue()): @JsonValue() {
+    json::JsonArray { items = items }
+}
+
+fn encode_position(line: u32, col: u32): @JsonValue() {
+    jobj(["line", "character"], [jnum((line to u64) to f64), jnum((col to u64) to f64)])
+}
+
+fn encode_diagnostic(d: LspDiagnostic): @JsonValue() {
+    var range = jobj(["start", "end"], [encode_position(d.start_line, d.start_col), encode_position(d.end_line, d.end_col)])
+    jobj(["range", "severity", "source", "message"], [range, jnum(severity_code(d.severity)), jstr("teko"), jstr(d.message)])
+}
+
+pub fn uri_to_path(uri: str): str {
+    var scheme = "file://"
+    if has_prefix(uri, scheme) { return uri.slice_from(scheme.len) }
+    uri
+}
+
+pub fn publish_diagnostics(uri: str, diags: []LspDiagnostic): @JsonValue() {
+    var items: []@JsonValue() = []
+    var i: u64 = 0
+    loop {
+        if i >= diags.len { break }
+        items = [..items, encode_diagnostic(diags[i])]
+        i = i + 1
+    }
+    var params = jobj(["uri", "diagnostics"], [jstr(uri), jarr(items)])
+    jobj(["jsonrpc", "method", "params"], [jstr("2.0"), jstr("textDocument/publishDiagnostics"), params])
+}
+
+pub fn diagnostics_notification(uri: str, text: str): @JsonValue() {
+    publish_diagnostics(uri, diagnose_document(uri_to_path(uri), text))
+}

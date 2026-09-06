@@ -1,3 +1,5 @@
+> **[HISTÓRICO]** — documenta o crumb T-B3 da onda const (Tier-B), já executado. Não descreve o estado atual do projeto.
+
 # T-B3 — writers Mach-O + COFF emitem relocations com patch site DENTRO da seção de dados (#594 Tier-B)
 
 Status: READY-TO-IMPLEMENT (architect, 2026-07-18). Track: Tier-B pointer-bearing
@@ -13,10 +15,10 @@ LIR, honest-stop `honest_data_reloc` em `encode_rodata`; ELF `ElfObject.rodata_r
 > writers Mach-O (arm64) e COFF (x86-64) a CAPACIDADE de emitir uma relocation cujo
 > campo relocado fica DENTRO de `__const`/`.rdata` (um ponteiro data→data de um const
 > Tier-B). **Nenhum produtor a exercita ainda** — o honest-stop de T-B1 em
-> `encode_rodata` permanece e só abre em T-B5 (quando a cadeia encoder→writer→VM
+> `encode_rodata` permanece e só abre em T-B5 (quando a cadeia encoder→writer→motor legado
 > estiver completa). Como hoje toda relocation que chega aos writers é `sect == Text`,
 > a partição rodata é sempre vazia, o objeto é **byte-idêntico** e todos os
-> goldens/fixpoint ficam intactos. **encode_*/wasm/VM intocados; honest-stop
+> goldens/fixpoint ficam intactos. **encode_*/wasm/motor legado intocados; honest-stop
 > permanece; sem seed bump** (o 🔑 SEED BUMP #3 é depois de T-B5, plano §8).
 
 ---
@@ -220,7 +222,7 @@ pub type MRelocKind = enum { PageHi; PageLo; Call; Abs64 }
  * @param MRelocKind k  the relocation kind
  * @return u32  the `r_type` field value
  */
-fn reloc_type_value(k: MRelocKind) -> u32 {
+fn reloc_type_value(k: MRelocKind): u32 {
     match k {
         PageHi => 3 to u32
         PageLo => 4 to u32
@@ -234,7 +236,7 @@ fn reloc_type_value(k: MRelocKind) -> u32 {
 PC-relativo):
 
 ```teko
-fn reloc_pcrel(k: MRelocKind) -> u32 {
+fn reloc_pcrel(k: MRelocKind): u32 {
     match k {
         PageHi => 1 to u32
         PageLo => 0 to u32
@@ -260,7 +262,7 @@ kind (2 = 4 bytes para os fixups de instrução; 3 = 8 bytes para o ponteiro abs
  * @param MRelocKind k  the relocation kind
  * @return u32  the `r_length` field value (2 or 3)
  */
-fn reloc_length(k: MRelocKind) -> u32 {
+fn reloc_length(k: MRelocKind): u32 {
     match k {
         Abs64 => 3 to u32
         PageHi => 2 to u32
@@ -303,7 +305,7 @@ type MachoRelocParts = struct {
  * @param []Reloc relocs  the module's relocations, `.sect`-tagged, in emission order
  * @return MachoRelocParts  the `text` and `rodata` partitions
  */
-fn macho_partition_relocs(relocs: []Reloc) -> MachoRelocParts {
+fn macho_partition_relocs(relocs: []Reloc): MachoRelocParts {
     mut text: []Reloc = teko::list::empty()
     mut rodata: []Reloc = teko::list::empty()
     mut i: u64 = 0
@@ -343,7 +345,7 @@ fn macho_partition_relocs(relocs: []Reloc) -> MachoRelocParts {
 tira da partição) e a computar a segunda tabela:
 
 ```teko
-fn compute_macho_layout(enc: EncodedModule, strtab_size: u32, nreloc_text: u32, nreloc_const: u32) -> MachoLayout
+fn compute_macho_layout(enc: EncodedModule, strtab_size: u32, nreloc_text: u32, nreloc_const: u32): MachoLayout
 ```
 
 Corpo — trocar `let nreloc = enc.relocs.len to u32` por `nreloc_text`, e após
@@ -395,7 +397,7 @@ partição) e usar `reloc_length(r.kind)`:
  * @param []Symbol symbols  the module's symbol table (for the target indices)
  * @return []byte  `buf` followed by the relocation entries
  */
-fn emit_reloc_table(buf: []byte, relocs: []Reloc, symbols: []Symbol) -> []byte {
+fn emit_reloc_table(buf: []byte, relocs: []Reloc, symbols: []Symbol): []byte {
     mut b = buf
     mut i: u64 = 0
     loop {
@@ -414,7 +416,7 @@ fn emit_reloc_table(buf: []byte, relocs: []Reloc, symbols: []Symbol) -> []byte {
 **`emit_macho`** (`:735`) costura a partição + a segunda tabela:
 
 ```teko
-pub fn emit_macho(enc: EncodedModule) -> []byte {
+pub fn emit_macho(enc: EncodedModule): []byte {
     let parts = macho_partition_relocs(enc.relocs)
     let strtab = build_strtab(enc.symbols)
     let lay = compute_macho_layout(enc, strtab.bytes.len to u32, parts.text.len to u32, parts.rodata.len to u32)
@@ -472,7 +474,7 @@ type CoffRelocParts = struct {
  * @param []RelocX86 relocs  the module's relocations, `.sect`-tagged, in order
  * @return CoffRelocParts  the `text` and `rdata` partitions
  */
-fn coff_partition_relocs(relocs: []RelocX86) -> CoffRelocParts {
+fn coff_partition_relocs(relocs: []RelocX86): CoffRelocParts {
     mut text: []RelocX86 = teko::list::empty()
     mut rdata: []RelocX86 = teko::list::empty()
     mut i: u64 = 0
@@ -516,7 +518,7 @@ bytes baixos e os 4 altos ficam 0 (o slot é zero-init pelo serializer). Novo he
  * @param []RelocX86 relocs  the `.rdata` partition, in emission order
  * @return []byte  `rodata` with each data reloc's target offset folded in-place
  */
-fn coff_apply_data_reloc_addends(rodata: []byte, symbols: []Symbol, relocs: []RelocX86) -> []byte {
+fn coff_apply_data_reloc_addends(rodata: []byte, symbols: []Symbol, relocs: []RelocX86): []byte {
     mut buf = rodata
     mut i: u64 = 0
     loop {
@@ -548,7 +550,7 @@ fn coff_apply_data_reloc_addends(rodata: []byte, symbols: []Symbol, relocs: []Re
 **`compute_coff_layout`** (`:512`) recebe as duas contagens:
 
 ```teko
-fn compute_coff_layout(enc: EncodedModuleX86, num_symbols: u32, num_text_relocs: u32, num_rdata_relocs: u32) -> CoffLayout
+fn compute_coff_layout(enc: EncodedModuleX86, num_symbols: u32, num_text_relocs: u32, num_rdata_relocs: u32): CoffLayout
 ```
 
 Corpo — trocar `num_relocs` por `num_text_relocs` e após `reloc_offset`:
@@ -581,7 +583,7 @@ Quando `num_rdata_relocs=0`: `rdata_reloc_ptr=0`, `nreloc=0` — byte-idêntico 
 **`emit_coff`** (`:708`) costura a partição + a segunda tabela + o fold de dados:
 
 ```teko
-pub fn emit_coff(enc: EncodedModuleX86) -> []byte {
+pub fn emit_coff(enc: EncodedModuleX86): []byte {
     let parts = coff_partition_relocs(enc.relocs)
     let coffsyms = coff_build_symbols(enc.symbols)
     let strtab = build_coff_strtab(coffsyms)
@@ -644,7 +646,7 @@ O **fixpoint gen1==gen2** + ambas as engines são a prova viva final. **QED.**
 
 Todas constroem `EncodedModule`/`EncodedModuleX86` À MÃO e chamam o `pub fn`
 `emit_macho`/`emit_coff` diretamente — o precedente de `co_abs64_module` e das
-fixtures ELF T-B2. Rodam idênticas na VM e no harness nativo. Offsets computados
+fixtures ELF T-B2. Rodam idênticas no motor legado e no harness nativo. Offsets computados
 abaixo; o implementer os confirma na 1ª run verde e os fixa (como as fixtures ELF/
 Mach-O existentes).
 
@@ -664,7 +666,7 @@ datum-alvo (`0x41` + 7 zero, offset 8); dois símbolos locais section-2 (`ptr`@0
  *
  * @return EncodedModule  the hand-built rodata-internal-pointer module
  */
-fn mo_rodata_ptr_enc() -> EncodedModule {
+fn mo_rodata_ptr_enc(): EncodedModule {
     let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
     let ptr = Symbol { name = "ptr"; defined = true; sect = 2 to u8; offset = 0 to u32; local = true }
     let target = Symbol { name = "target"; defined = true; sect = 2 to u8; offset = 8 to u32; local = true }
@@ -729,7 +731,7 @@ sect=Rodata }`.
  *
  * @return EncodedModuleX86  the hand-built rodata-internal-pointer module
  */
-fn co_rodata_ptr_module() -> EncodedModuleX86 {
+fn co_rodata_ptr_module(): EncodedModuleX86 {
     let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
     let ptr = co_sym("ptr", true, true, 2 to u8, 0 to u32)
     let target = co_sym("target", true, true, 2 to u8, 8 to u32)
@@ -811,10 +813,10 @@ o arquivo compila a cada passo.
 | E6 | `src/backend/objfile_coff.tks` | `emit_coff_sections` `.rdata` reloc-ptr condicional; `emit_coff` costura (partição + `coff_build_relocs` reusada + 2ª tabela + fold de dados) (§2.3) | **todos** os goldens COFF byte-idênticos (`parts.rdata` vazia) |
 | E7 | `objfile_macho_test.tkt` + `objfile_coff_test.tkt` | fixtures §4 (mo_rodata_ptr + colapso; co_rodata_ptr + colapso; unitárias §4.5) | os próprios testes novos (verde) |
 
-> Writers ELF/wasm e a VM **NÃO são tocados** em T-B3 (ELF é T-B2, wasm T-B4, VM
+> Writers ELF/wasm e o motor legado **NÃO são tocados** em T-B3 (ELF é T-B2, wasm T-B4, motor legado
 > T-B5). `encode_*.tks` só muda em `minst.tks` (o enum `MRelocKind` + o arm de nome) —
 > o honest-stop `encode_rodata` de T-B1 **permanece** intocado. Sem edição de
-> `lower.tks`/`lir_interp.tks`.
+> `lower.tks`/`lir_oracle.tks`.
 
 **Ritual points:**
 
@@ -822,8 +824,8 @@ o arquivo compila a cada passo.
 - **RITUAL POINT — fim de T-B3:** gate COMPLETO — todos os goldens de backend
   byte-idênticos (`objfile_macho_test.tkt`, `objfile_coff_test.tkt`,
   `objfile_elf_test.tkt`, um backend ELF writer, `encode_*_test.tkt`,
-  `minst_test.tkt`, `lower_test.tkt`, `lir_interp_test.tkt`, `tkb_test.tkt`) +
-  **fixpoint gen1==gen2** + ambas as engines (VM + nativo) + 100% de cobertura do
+  `minst_test.tkt`, `lower_test.tkt`, `lir_oracle_test.tkt`, `tkb_test.tkt`) +
+  **fixpoint gen1==gen2** + ambas as engines (motor legado + nativo) + 100% de cobertura do
   delta (as fixtures §4.1/§4.3 cobrem o braço rodata-reloc; §4.2/§4.4 o colapso; §4.5
   os helpers/arms novos; os goldens existentes o braço `parts.rodata` vazia). **Sem
   seed bump** — T-B3 não adiciona capacidade que o corpus use (o 🔑 SEED BUMP #3 é
@@ -889,9 +891,9 @@ implementer):
 - **Popular a partição `rodata`/`rdata`** a partir de um const Tier-B real: o
   `encode_rodata` deixar de honest-stopar e produzir `Reloc`/`RelocX86` com
   `sect=Rodata` (offset `__const`/`.rdata`-relativo, kind `Abs64`) a partir de
-  `LRodata.relocs`. Isso é o crumb que fecha a cadeia (junto com T-B4 wasm + T-B5 VM);
+  `LRodata.relocs`. Isso é o crumb que fecha a cadeia (junto com T-B4 wasm + T-B5 motor legado);
   só então `parts.rodata` é não-vazia em compilação real. Até lá, o caminho `__const`/
   `.rdata` reloc só é exercitado pelas fixtures §4.
-- **T-B4 (wasm)** e **T-B5 (VM)** completam a cadeia; o 🔑 SEED BUMP #3 (depois de
+- **T-B4 (wasm)** e **T-B5 (motor legado)** completam a cadeia; o 🔑 SEED BUMP #3 (depois de
   T-B5) libera T-B6 (migrar os ABI descriptors). Nada disso bloqueia T-B3 — os dois
   writers estão prontos.

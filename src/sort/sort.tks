@@ -1,159 +1,255 @@
-/**
- * Select the string comparator for a merge pass: the natural (ordinal) order when `natural` is
- * true, otherwise the plain lexicographic byte order. A concrete internal dispatch — NOT the
- * generic comparator API (that lands in the 0.3.2 generic-stack); it exists only so the two public
- * string sorts can share one merge implementation.
- *
- * @param a        the left string
- * @param b        the right string
- * @param natural  select `teko::sort::cmp_natural` when true, else `teko::sort::cmp`
- * @return         -1, 0, or 1 as `a` orders before, equal to, or after `b`
- */
-fn cmp_str_mode(a: str, b: str, natural: bool) -> i32 {
+fn cmp_str_mode(a: str, b: str, natural: bool): i32 {
     if natural { return teko::sort::cmp_natural(a, b) }
     teko::sort::cmp(a, b)
 }
 
-/**
- * Stably merge two already-sorted `[]str` runs into one fresh sorted slice. On a tie (comparator
- * returns 0) the element from `left` is emitted first — this left-bias is what makes the whole sort
- * STABLE: `left` always holds the earlier-in-input elements, so equal keys keep their original
- * relative order. The result is a single arena-allocated slice grown by `teko::list::push` (M.0:
- * one output buffer per merge, no in-place slice writes in the value-thread model).
- *
- * @param left     the left run, already sorted
- * @param right    the right run, already sorted
- * @param natural  whether to merge under natural order (see `cmp_str_mode`)
- * @return         a new slice holding every element of `left` and `right` in sorted, stable order
- */
-fn merge_str(left: []str, right: []str, natural: bool) -> []str {
-    mut out: []str = teko::list::empty()
-    mut i: u64 = 0
-    mut j: u64 = 0
+fn merge_str(left: []str, right: []str, natural: bool): []str {
+    var n = left.len + right.len
+    var out: [n]str = []
+    var i: u64 = 0
+    var j: u64 = 0
+    var k: u64 = 0
     loop {
         if i >= left.len { break }
         if j >= right.len { break }
         if cmp_str_mode(left[i], right[j], natural) <= 0 {
-            out = teko::list::push(out, left[i])
+            out[k] = left[i]
             i++
+            k++
             continue
         }
-        out = teko::list::push(out, right[j])
+        out[k] = right[j]
         j++
+        k++
     }
-    loop { if i >= left.len { break }; out = teko::list::push(out, left[i]); i++ }
-    loop { if j >= right.len { break }; out = teko::list::push(out, right[j]); j++ }
+    loop { if i >= left.len { break }; out[k] = left[i]; i++; k++ }
+    loop { if j >= right.len { break }; out[k] = right[j]; j++; k++ }
     out
 }
 
-/**
- * Top-down stable merge sort of the half-open range `xs[lo..hi)`, returning a fresh sorted slice of
- * that range's elements. The range is split at its midpoint, each half is sorted recursively, and
- * the two sorted halves are stably merged. Stability follows from `merge_str`'s left-bias and the
- * split keeping earlier elements in the left half.
- *
- * @param xs       the source slice (read only; never mutated in place)
- * @param lo       the inclusive start of the range to sort
- * @param hi       the exclusive end of the range to sort (`lo <= hi <= xs.len`)
- * @param natural  whether to sort under natural order (see `cmp_str_mode`)
- * @return         a new slice holding `xs[lo..hi)` in sorted, stable order
- */
-fn msort_str(xs: []str, lo: u64, hi: u64, natural: bool) -> []str {
-    mut out: []str = teko::list::empty()
+fn msort_str(xs: []str, lo: u64, hi: u64, natural: bool): []str {
+    var out: []str = []
     if hi - lo <= 1 {
-        if hi - lo == 1 { out = teko::list::push(out, xs[lo]) }
+        if hi - lo == 1 { out = [xs[lo]] }
         return out
     }
-    let mid = lo + (hi - lo) / 2
-    let left = msort_str(xs, lo, mid, natural)
-    let right = msort_str(xs, mid, hi, natural)
+    var mid = lo + (hi - lo) / 2
+    var left = msort_str(xs, lo, mid, natural)
+    var right = msort_str(xs, mid, hi, natural)
     merge_str(left, right, natural)
 }
 
-/**
- * Return a new slice holding `xs` sorted ascending under lexicographic byte order
- * (`teko::sort::cmp`). The sort is STABLE — equal keys keep their input order — which the future
- * multi-factor (sort-by-A-then-B) surface relies on. `xs` is not mutated; a fresh slice is returned.
- *
- * @param xs  the strings to sort
- * @return    a new slice of `xs`'s elements in ascending lexicographic, stable order
- */
-pub fn sort_str(xs: []str) -> []str {
+/** Sorts `xs` ascending, stably, under lexicographic byte order. */
+exp fn sort_str(xs: []str): []str {
     msort_str(xs, 0, xs.len, false)
 }
 
-/**
- * Return a new slice holding `xs` sorted ascending under natural / ordinal order
- * (`teko::sort::cmp_natural`), so `"file2"` sorts before `"file10"`. The sort is STABLE: strings
- * that share a natural key (e.g. `"x1"` and `"x01"`, equal because leading zeros are insignificant)
- * keep their input order. `xs` is not mutated; a fresh slice is returned.
- *
- * @param xs  the strings to sort
- * @return    a new slice of `xs`'s elements in ascending natural, stable order
- */
-pub fn sort_str_natural(xs: []str) -> []str {
+/** Sorts `xs` ascending, stably, under natural/ordinal order (`"file2"` before `"file10"`). */
+exp fn sort_str_natural(xs: []str): []str {
     msort_str(xs, 0, xs.len, true)
 }
 
-/**
- * Stably merge two already-sorted `[]i64` runs into one fresh sorted slice, left-biased on ties
- * exactly like `merge_str` (so the whole i64 sort is stable). One arena-allocated output buffer,
- * grown by `teko::list::push`.
- *
- * @param left   the left run, already sorted ascending
- * @param right  the right run, already sorted ascending
- * @return       a new slice holding every element of `left` and `right` in sorted, stable order
- */
-fn merge_i64(left: []i64, right: []i64) -> []i64 {
-    mut out: []i64 = teko::list::empty()
-    mut i: u64 = 0
-    mut j: u64 = 0
+fn merge_i64(left: []i64, right: []i64): []i64 {
+    var n = left.len + right.len
+    var out: [n]i64 = []
+    var i: u64 = 0
+    var j: u64 = 0
+    var k: u64 = 0
     loop {
         if i >= left.len { break }
         if j >= right.len { break }
         if left[i] <= right[j] {
-            out = teko::list::push(out, left[i])
+            out[k] = left[i]
             i++
+            k++
             continue
         }
-        out = teko::list::push(out, right[j])
+        out[k] = right[j]
         j++
+        k++
     }
-    loop { if i >= left.len { break }; out = teko::list::push(out, left[i]); i++ }
-    loop { if j >= right.len { break }; out = teko::list::push(out, right[j]); j++ }
+    loop { if i >= left.len { break }; out[k] = left[i]; i++; k++ }
+    loop { if j >= right.len { break }; out[k] = right[j]; j++; k++ }
     out
 }
 
-/**
- * Top-down stable merge sort of the half-open range `xs[lo..hi)` of signed integers, returning a
- * fresh sorted slice. Mirrors `msort_str` with the native `<=` order on `i64` (negatives sort
- * before positives).
- *
- * @param xs  the source slice (read only; never mutated in place)
- * @param lo  the inclusive start of the range to sort
- * @param hi  the exclusive end of the range to sort (`lo <= hi <= xs.len`)
- * @return    a new slice holding `xs[lo..hi)` in ascending, stable order
- */
-fn msort_i64(xs: []i64, lo: u64, hi: u64) -> []i64 {
-    mut out: []i64 = teko::list::empty()
+fn msort_i64(xs: []i64, lo: u64, hi: u64): []i64 {
+    var out: []i64 = []
     if hi - lo <= 1 {
-        if hi - lo == 1 { out = teko::list::push(out, xs[lo]) }
+        if hi - lo == 1 { out = [xs[lo]] }
         return out
     }
-    let mid = lo + (hi - lo) / 2
-    let left = msort_i64(xs, lo, mid)
-    let right = msort_i64(xs, mid, hi)
+    var mid = lo + (hi - lo) / 2
+    var left = msort_i64(xs, lo, mid)
+    var right = msort_i64(xs, mid, hi)
     merge_i64(left, right)
 }
 
-/**
- * Return a new slice holding `xs` sorted ascending under the native signed order (negatives first).
- * The sort is STABLE — equal values keep their input order. `xs` is not mutated; a fresh slice is
- * returned.
- *
- * @param xs  the integers to sort
- * @return    a new slice of `xs`'s elements in ascending, stable order
- */
-pub fn sort_i64(xs: []i64) -> []i64 {
+/** Sorts `xs` ascending, stably, under the native signed order. */
+exp fn sort_i64(xs: []i64): []i64 {
     msort_i64(xs, 0, xs.len)
+}
+
+fn merge_u64(left: []u64, right: []u64): []u64 {
+    var n = left.len + right.len
+    var out: [n]u64 = []
+    var i: u64 = 0
+    var j: u64 = 0
+    var k: u64 = 0
+    loop {
+        if i >= left.len { break }
+        if j >= right.len { break }
+        if left[i] <= right[j] {
+            out[k] = left[i]
+            i++
+            k++
+            continue
+        }
+        out[k] = right[j]
+        j++
+        k++
+    }
+    loop { if i >= left.len { break }; out[k] = left[i]; i++; k++ }
+    loop { if j >= right.len { break }; out[k] = right[j]; j++; k++ }
+    out
+}
+
+fn msort_u64(xs: []u64, lo: u64, hi: u64): []u64 {
+    var out: []u64 = []
+    if hi - lo <= 1 {
+        if hi - lo == 1 { out = [xs[lo]] }
+        return out
+    }
+    var mid = lo + (hi - lo) / 2
+    var left = msort_u64(xs, lo, mid)
+    var right = msort_u64(xs, mid, hi)
+    merge_u64(left, right)
+}
+
+/** Sorts `xs` ascending, stably, under the native unsigned order. */
+exp fn sort_u64(xs: []u64): []u64 {
+    msort_u64(xs, 0, xs.len)
+}
+
+fn merge_f64(left: []f64, right: []f64): []f64 {
+    var n = left.len + right.len
+    var out: [n]f64 = []
+    var i: u64 = 0
+    var j: u64 = 0
+    var k: u64 = 0
+    loop {
+        if i >= left.len { break }
+        if j >= right.len { break }
+        if teko::sort::cmp_f64(left[i], right[j]) <= 0 {
+            out[k] = left[i]
+            i++
+            k++
+            continue
+        }
+        out[k] = right[j]
+        j++
+        k++
+    }
+    loop { if i >= left.len { break }; out[k] = left[i]; i++; k++ }
+    loop { if j >= right.len { break }; out[k] = right[j]; j++; k++ }
+    out
+}
+
+fn msort_f64(xs: []f64, lo: u64, hi: u64): []f64 {
+    var out: []f64 = []
+    if hi - lo <= 1 {
+        if hi - lo == 1 { out = [xs[lo]] }
+        return out
+    }
+    var mid = lo + (hi - lo) / 2
+    var left = msort_f64(xs, lo, mid)
+    var right = msort_f64(xs, mid, hi)
+    merge_f64(left, right)
+}
+
+/** Sorts `xs` ascending, stably, under `cmp_f64`'s NaN-last total order. */
+exp fn sort_f64(xs: []f64): []f64 {
+    msort_f64(xs, 0, xs.len)
+}
+
+fn merge_bytes(left: []byte, right: []byte): []byte {
+    var n = left.len + right.len
+    var out: [n]byte = []
+    var i: u64 = 0
+    var j: u64 = 0
+    var k: u64 = 0
+    loop {
+        if i >= left.len { break }
+        if j >= right.len { break }
+        if left[i] <= right[j] {
+            out[k] = left[i]
+            i++
+            k++
+            continue
+        }
+        out[k] = right[j]
+        j++
+        k++
+    }
+    loop { if i >= left.len { break }; out[k] = left[i]; i++; k++ }
+    loop { if j >= right.len { break }; out[k] = right[j]; j++; k++ }
+    out
+}
+
+fn msort_bytes(xs: []byte, lo: u64, hi: u64): []byte {
+    var out: []byte = []
+    if hi - lo <= 1 {
+        if hi - lo == 1 { out = [xs[lo]] }
+        return out
+    }
+    var mid = lo + (hi - lo) / 2
+    var left = msort_bytes(xs, lo, mid)
+    var right = msort_bytes(xs, mid, hi)
+    merge_bytes(left, right)
+}
+
+/** Sorts `xs` ascending, stably, as unsigned octets. */
+exp fn sort_bytes(xs: []byte): []byte {
+    msort_bytes(xs, 0, xs.len)
+}
+
+fn merge_ord<T: IOrd>(left: []T, right: []T): []T {
+    var n = left.len + right.len
+    var out: [n]T = []
+    var i: u64 = 0
+    var j: u64 = 0
+    var k: u64 = 0
+    loop {
+        if i >= left.len { break }
+        if j >= right.len { break }
+        if left[i] <= right[j] {
+            out[k] = left[i]
+            i++
+            k++
+            continue
+        }
+        out[k] = right[j]
+        j++
+        k++
+    }
+    loop { if i >= left.len { break }; out[k] = left[i]; i++; k++ }
+    loop { if j >= right.len { break }; out[k] = right[j]; j++; k++ }
+    out
+}
+
+fn msort_ord<T: IOrd>(xs: []T, lo: u64, hi: u64): []T {
+    var out: []T = []
+    if hi - lo <= 1 {
+        if hi - lo == 1 { out = [xs[lo]] }
+        return out
+    }
+    var mid = lo + (hi - lo) / 2
+    var left = msort_ord(xs, lo, mid)
+    var right = msort_ord(xs, mid, hi)
+    merge_ord(left, right)
+}
+
+/** Sorts `xs` ascending, stably, ordering any `IOrd`-conforming element type `T`. */
+exp fn sort<T: IOrd>(xs: []T): []T {
+    msort_ord(xs, 0, xs.len)
 }

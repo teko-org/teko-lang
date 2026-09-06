@@ -37,7 +37,7 @@ bodies); **`class`** = the OOP unit (single base + field-flattening inheritance,
 type Timestamped = trait {
     created_at: i64                       // a field the deriver gains
     updated_at: i64
-    fn touch(self: Ref<Timestamped>) -> void { self.updated_at = now() }   // a method with a body
+    fn touch(self: Ref<Timestamped>) { self.updated_at = now() }   // a method with a body
 }
 
 // any struct or class DERIVES it → gains created_at, updated_at, and touch():
@@ -115,10 +115,10 @@ methods fold in (a deriver-defined method IS the override; two traits providing 
 no override = compile error, never an implicit order), bodyless requirements checked against the FOLDED
 table (a class's inherited methods can satisfy; a shared requirement is satisfied once), field collisions =
 compile error, direct instantiation + trait-in-value-position rejected with TR1 pointers, `<T: Trait>` =
-TR1 honest stop; `codegen`+`vm` — a trait decl emits NOTHING (members live in the derivers after the
+TR1 honest stop; `codegen`+`legacy engine` — a trait decl emits NOTHING (members live in the derivers after the
 fold); the bodyless-requirement VTABLE is TR1's dynamic-value unit, not TR0's. **Verified:** 18 corpus
 tests (parser + checker; struct AND class derivers, override, requirement, collisions, non-instantiability,
-contextual identifier) + `examples/regressions/trait_basics` — VM == native, gen-2 == gen-3, 632 tests
+contextual identifier) + `examples/regressions/trait_basics` — legacy engine == native, gen-2 == gen-3, 632 tests
 both engines.
 
 **▪ TR1 — trait as generic constraint + dynamic value.** **Deps:** TR0, S6 (W11 ✅), W10b.D3 dynamic
@@ -133,13 +133,13 @@ deriver's fields/types/doc used to synthesize structural-trait bodies. No surfac
 `Ord`, `Hash`, `Clone`, `Default` (field-wise synthesized; overridable). Immediately unblocks `Map` keys
 (`Hashable & Eq`). **As landed:** synthesis emits AST inside `fold_traits` (`synth.tks`) — each derived
 structural trait builds `parser::Function` bodies from the TR2 field view, folded into the deriver, so the
-existing type/emit path handles them (zero new codegen, zero new VM node, VM==native automatic). `eq`
+existing type/emit path handles them (zero new codegen, zero new legacy engine node, legacy engine==native automatic). `eq`
 (field-wise `==`, `&&`), `compare` (lexicographic ±1/0), `hash` (FNV-1a fold; `tk_str_hash` for str),
 `clone` (field-wise deep copy), `default` (static, field-wise zero/empty). `Hashable`≡`Hash` /
 `Comparable`≡`Ord` synonyms. Nested Named recurses (must co-derive), and a hand-written method overrides the
 synthesized default. Slice/optional/enum/variant/ptr/ref/func fields are an honest stop in v1. **Verified:**
 7 `.tkt` checker tests (recognition, synthesis, override, honest stops, synonym constraint) + 5 regression
-fixtures (`trait_derive_eq/hash/ord/clone_default/nested`, VM==native), a derived `eq`/`hash` matches a
+fixtures (`trait_derive_eq/hash/ord/clone_default/nested`, legacy engine==native), a derived `eq`/`hash` matches a
 hand-written one.
 
 **▪ TR4 — serialization traits.** **Deps:** TR3, `teko::encoding` (JSON first → protobuf/CBOR). `Json`

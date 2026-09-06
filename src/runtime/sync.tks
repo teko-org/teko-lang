@@ -1,0 +1,84 @@
+const INT_MAX: i64 = 2147483647
+
+#os("windows")
+extern fn WaitOnAddress(addr: u64, compare: u64, size: u64, ms: u32): i32 = "WaitOnAddress" from "synchronization"
+
+#os("windows")
+extern fn WakeByAddressSingle(addr: u64) = "WakeByAddressSingle" from "synchronization"
+
+#os("windows")
+extern fn WakeByAddressAll(addr: u64) = "WakeByAddressAll" from "synchronization"
+
+#os("linux")
+fn futex_wait(addr: u64, expected: i64) {
+    _ = teko::sys::syscall6(teko::sys::SYS_FUTEX, addr to i64,
+        teko::sys::FUTEX_WAIT | teko::sys::FUTEX_PRIVATE_FLAG, expected, 0, 0, 0)
+}
+
+#os("macos")
+fn futex_wait(addr: u64, expected: i64) {
+    _ = teko::sys::abi::os_sync_wait_on_address(addr, (expected to u64) & 0xffffffff, 4, teko::sys::OS_SYNC_WAIT_ON_ADDRESS_NONE)
+}
+
+#os("windows")
+fn futex_wait(addr: u64, expected: i64) {
+    var scratch = teko::sys::ptr_word(teko::mem::buf_ptr(8)) to u64
+    teko::mem::store_u64(scratch, expected to u64)
+    _ = WaitOnAddress(addr, scratch, 4, teko::sys::WIN_INFINITE)
+}
+
+#os("linux")
+fn futex_wake(addr: u64, n: i64) {
+    _ = teko::sys::syscall6(teko::sys::SYS_FUTEX, addr to i64,
+        teko::sys::FUTEX_WAKE | teko::sys::FUTEX_PRIVATE_FLAG, n, 0, 0, 0)
+}
+
+#os("macos")
+fn futex_wake(addr: u64, n: i64) {
+    if n == 1 {
+        _ = teko::sys::abi::os_sync_wake_by_address_any(addr, 4, teko::sys::OS_SYNC_WAKE_BY_ADDRESS_NONE)
+        return
+    }
+    _ = teko::sys::abi::os_sync_wake_by_address_all(addr, 4, teko::sys::OS_SYNC_WAKE_BY_ADDRESS_NONE)
+}
+
+#os("windows")
+fn futex_wake(addr: u64, n: i64) {
+    if n == 1 {
+        WakeByAddressSingle(addr)
+        return
+    }
+    WakeByAddressAll(addr)
+}
+
+pub fn mtx_lock(m: u64) {
+    var c = teko::sys::atomic_cas_u32(m to i64, 0, 1)
+    if c == 0 { return }
+    if c != 2 { c = teko::sys::atomic_xchg_u32(m to i64, 2) }
+    loop {
+        if c == 0 { break }
+        futex_wait(m, 2)
+        c = teko::sys::atomic_xchg_u32(m to i64, 2)
+    }
+}
+
+pub fn mtx_unlock(m: u64) {
+    if teko::sys::atomic_xchg_u32(m to i64, 0) == 2 { futex_wake(m, 1) }
+}
+
+pub fn cv_wait(seq: u64, m: u64) {
+    var s = teko::sys::atomic_load_u32(seq to i64)
+    mtx_unlock(m)
+    futex_wait(seq, s)
+    mtx_lock(m)
+}
+
+pub fn cv_signal(seq: u64) {
+    _ = teko::sys::atomic_add_u32(seq to i64, 1)
+    futex_wake(seq, 1)
+}
+
+pub fn cv_broadcast(seq: u64) {
+    _ = teko::sys::atomic_add_u32(seq to i64, 1)
+    futex_wake(seq, INT_MAX)
+}

@@ -14,7 +14,7 @@
 > **Sequenciamento (ordem do legislador):** *concluir TODO o trabalho atual ANTES* de construir o
 > backend nativo. O transpile-para-C é **revogado como backend PRIMÁRIO/de release, porém RETIDO —
 > mantido equalizado — como FALLBACK permanente e COMPARATIVO de corretude diferencial** ("we need to
-> keep a fallback and comparative"). Logo **três** caminhos devem concordar: a **VM `.tkb`**, o
+> keep a fallback and comparative"). Logo **três** caminhos devem concordar: o **motor legado `.tkb`**, o
 > **transpile-para-C/`cc`** (fallback+comparativo) e o futuro **backend nativo** (primário). **Cada onda
 > (W4/W5/…) entra em TODOS os caminhos ativos — o codegen NÃO é congelado.**
 > *(↺ supersede a decisão original transpile-para-C — HISTORY §B.34/§B.35; ver LEGISLATION "Backend nativo próprio".)*
@@ -116,7 +116,7 @@ ast.h/result.h como headers reais + `tk_expr`/helpers/corpos → B0d `tk_str_eq`
 |---|---|---|---|
 | B3a ◑ | **Runtime de valor** — **str feito**: `tk_str` (view `[]byte` UTF-8, B.36) em `runtime/teko_rt.h`, literais baixados com **comprimento explícito** (NUL-safe, não `strlen` — M.1); inteiros/bool já nativos (stdint). `list` (`TK_LIST`) **diferido** (não bloqueia o 1º programa com saída) | M.0 | P |
 | B3b ◑ | **Os pânicos** — **superfície criada** em `runtime/teko_rt.{h,c}`: `tk_panic` (→ stderr + abort não-zero) + `tk_panic_div0`/`oob`/`cast`/`overflow` (`_Noreturn`). **Cablagem no codegen pendente** (guards de ÷0 / conversão-impossível / overflow-debug que o C gerado chama) — próximo incremento | M.1 | M |
-| B3c ✓ | **IO** — **feito**: `print`/`println : (str) -> Unit` injetados (stdlib não-importada, não-sombreável — `tk_builtin_fn` espelha `tk_builtin_type`); codegen mapeia `print`/`println` → `tk_print`/`tk_println` (`fwrite` byte-exato, sem assumir NUL); driver passa `-I$TK_RT_DIR` + compila `teko_rt.c` no mesmo `cc` (M.5) | M.1 | P |
+| B3c ✓ | **IO** — **feito**: `print`/`println : (str): Unit` injetados (stdlib não-importada, não-sombreável — `tk_builtin_fn` espelha `tk_builtin_type`); codegen mapeia `print`/`println` → `tk_print`/`tk_println` (`fwrite` byte-exato, sem assumir NUL); driver passa `-I$TK_RT_DIR` + compila `teko_rt.c` no mesmo `cc` (M.5) | M.1 | P |
 | B3d ✓ | **Entry + saída** — virtual-main → `main` C; exit codes (early-exit) **+ saída real via `print`**; pânico → `abort`/stderr com mensagem (`tk_panic`) | M.1 | P |
 
 > **MARCO ZERO (M0) ✅ ALCANÇADO no F2** — via **exit-code** (não precisou de runtime): `main.tks` de aritmética
@@ -129,7 +129,7 @@ ast.h/result.h como headers reais + `tk_expr`/helpers/corpos → B0d `tk_str_eq`
 >
 > **F3 — incremento 1 ✅ (saída observável de verdade):** `print("hello, teko\n")` → `teko` → C+`teko_rt.c` → `cc` →
 > binário que **imprime** e sai 0. Entregue: `runtime/teko_rt.{h,c}` (str/IO + superfície de pânicos), typer injeta
-> `print`/`println:(str)->Unit`, codegen baixa literais `str` (escaping + len explícito) / `byte` e mapeia as chamadas
+> `print`/`println:(str):Unit`, codegen baixa literais `str` (escaping + len explícito) / `byte` e mapeia as chamadas
 > built-in, driver+CMake fiam o runtime no `cc`. Verificado: hello-world imprime; `let s: str` + `println(s)`; em-dash
 > UTF-8 → octal byte-exato; `print(42)` → erro honesto de tipo (M.3); aritmética-exit-code sem regressão.
 > **Incremento 2 (próximo):** cablar **B3b** no codegen — guard de **conversão-impossível** (`x to T` runtime → `tk_panic_cast`),
@@ -144,7 +144,7 @@ ast.h/result.h como headers reais + `tk_expr`/helpers/corpos → B0d `tk_str_eq`
 "puro") · codec `.tkb` de statement (→ `if`/`match`) · análise de divergência (C5) · reconciliação
 geral newtype↔base · `str↔bytes` transcodificação.
 
-> **Modo VM (planejado, futuro).** O segundo modo de execução — a **VM/interpretador do `.tkb`**
+> **Modo motor legado (planejado, futuro).** O segundo modo de execução — o **motor legado do `.tkb`**
 > (estágio-1) — entra **depois** do M0. Pré-requisito real dele: o **codec `.tkb` de statement/programa**
 > (hoje o codec só serializa `TExpr`; `if`/`match`/funções/programa faltam). Não está descartado — é o
 > caminho do dev-loop rápido e do bootstrap interpretado; só não bloqueia o primeiro binário.

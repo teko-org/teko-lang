@@ -82,11 +82,13 @@ run_flag
 #
 # AND THEN A THIRD RULING LANDED, which is why this block reads the way it does now. The C backend
 # came BACK (`theory/volta-o-backend-c`), and with it the plan the fixpoint gate records: *".31 com
-# as duas rotas, .32 ensina o nativo, .33 remove"*. So on 0.3.1 there are TWO backends and
-# `TEKO_BACKEND` is the live way to choose between them — `scripts/fixpoint_gate.sh` pins it to `c`
-# to get a gen2 at all. The 2026-07-27 ruling is not cancelled, it is DEFERRED to .33.
+# as duas rotas, .32 ensina o nativo, .33 remove"* — RESEQUENCED BY PLATFORM on the 0.3.1 lane,
+# where the Linux leg generates native first, macOS/Windows keep the C route, and THE C LIVES
+# UNTIL 0.3.1.4. So there are TWO backends today and `TEKO_BACKEND` is the live way to choose
+# between them — `scripts/fixpoint_gate.sh` pins it to `c` to get a gen2 at all. The 2026-07-27
+# ruling is not cancelled, it is DEFERRED to the wagon that retires the C, after 0.3.1.4.
 #
-# KNOWN-STOP (.33), by owner ruling 2026-07-28: *"Converter em KNOWN-STOP explícito."* The lane
+# KNOWN-STOP (post-0.3.1.4), by owner ruling 2026-07-28: *"Converter em KNOWN-STOP explícito."* The lane
 # stops demanding the end state and starts ASSERTING TODAY'S, which is the same discipline the
 # three native-backend fixtures use — a scenario that keeps asking its question every run, and
 # whose answer changing is the event we want to be told about:
@@ -95,10 +97,10 @@ run_flag
 #      positional (the original point of this block, and the one part no ruling has touched);
 #   2. the message names the flag as REMOVED, so a user who typed `--backend` is told the flag
 #      died rather than that the spelling is wrong;
-#   3. the message DOES point at `TEKO_BACKEND`, because on .31 that is true and a lane that
-#      forbade it would be forbidding the only working instruction there is.
+#   3. the message DOES point at `TEKO_BACKEND`, because until 0.3.1.4 that is true and a lane
+#      that forbade it would be forbidding the only working instruction there is.
 #
-# THE DAY .33 REMOVES THE ENV VAR, ASSERTION 3 GOES RED. That failure is the SIGNAL to restore the
+# THE DAY THE ENV VAR IS REMOVED (after 0.3.1.4), ASSERTION 3 GOES RED. That failure is the SIGNAL to restore the
 # end-state form this replaced — `grep -q "only one backend"` plus the negative assertion that the
 # message must NOT mention `TEKO_BACKEND` — and to delete this note with it.
 #
@@ -118,7 +120,7 @@ assert_backend_rejected() {
     printf '%s\n' "$ERR" | grep -q -- "--backend was removed" \
         || fail "'$shape' stderr does not say the FLAG is gone: $ERR"
     printf '%s\n' "$ERR" | grep -q "TEKO_BACKEND" \
-        || fail "'$shape' stderr does not point at TEKO_BACKEND — if .33 removed the env var, PROMOTE this lane back to the end-state form documented above: $ERR"
+        || fail "'$shape' stderr does not point at TEKO_BACKEND — if the env var is gone (after 0.3.1.4), PROMOTE this lane back to the end-state form documented above: $ERR"
 }
 
 run_flag build --backend=native "$BACKEND_FIXTURE_DIR"

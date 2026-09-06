@@ -157,7 +157,6 @@ pending` skip otherwise):
 | `built as static library` | `static` → `.a` | build exit 0 + `artifact exists` | .30 after **KP16** (own-native `.a` archive writer) |
 | `built as shared library` | `shared` → `.so`/`.dylib`/`.dll` | build exit 0 + `artifact exists` | .30 after **KP16+KP17** (`.o` + system-`ld -shared`) |
 | `linked and run` | `binary` consuming `Given dependency` artifacts | exit + stdout of the consumer run (interop) | package-dep: now; static/shared-dep: .30 after KP16/KP17 |
-| `run on "<target>"` | wasm target | wasmtime/host exit + stdout | wasm32-wasi: .30 once the runner wasmtime harness lands (§9); wasm-browser: .31 unless the browser slice lands |
 | `exports c abi` | `binary`/`shared` with `[artifact] abi = "c"` | `.h` emitted + `ns_name`/`= "SYM"` flat symbol; a C driver links + runs | .30 after **KP10+KP11** (+KP16/KP17 link) |
 | `imports c abi` | `binary` with `extern fn/type` | links a C lib + runs; observable result | .30 after **KP7+KP12+KP13** (+ system-`ld`) |
 
@@ -191,8 +190,8 @@ pinned as an end-to-end build, but it is no longer a standalone curated project 
 
 A `Then` step may be prefixed `on "<os-arch>"` to route the expectation into a
 `[expect.<os-arch>]` override (`TkrExpect`) or a `[golden.<os-arch>]` byte golden
-(`TkrGolden`), for legitimate per-target divergence (e.g. a wasm trap exit differing from a
-native abort). Resolution at run time is the existing `tkr_expect_for` / `resolve_stream`.
+(`TkrGolden`), for legitimate per-target divergence (e.g. a Windows trap exit differing from a
+POSIX abort). Resolution at run time is the existing `tkr_expect_for` / `resolve_stream`.
 
 ## 7. The runtime-operand law
 
@@ -224,11 +223,6 @@ because .30 pulls the enabling capabilities into gen1:
   dependency subdir to its artifact (`.tkl` now; `.a`/`.so` at KP16/KP17), provisions a scratch
   `packages/` (mirroring `crossmodule_regressions.sh`), builds the consumer, runs it.
   Package-interop is live NOW; static/shared-interop joins at KP16/KP17.
-- **wasm run-oracle.** A `run_wasm_captured(module, args, stdin, prefix)` invoking `wasmtime run`
-  (mirroring `validate_wasm_own.sh`), same `CapResult` shape as `run_captured`. The wasm32-wasi
-  BUILD exists in gen1 today; this workstream's own crumb (companion C7) adds the RUN oracle —
-  live in .30. wasm-browser additionally needs the JS-import runtime + a headless driver → .31
-  unless that slice lands in .30.
 - **FFI (import/export) = the kill-C §5 lane.** `imports c abi` / `exports c abi` verbs,
   `[artifact] abi = "c"`, `extern fn/type`, `.h` emission, the `ns_name`/`= "SYM"` flat-symbol
   convention, `Given backend = "own"`, and `Given pending = "<KP>"` skips. These ARE the fixtures
@@ -242,11 +236,11 @@ Discovery scans a regressor directory for EVERY `.tkr` file (not the first) and 
 project's verdict is the aggregate over all of them. The signature shift from the single-spec
 model:
 
-- `dir_tkr_files(dir) -> []str` — the basenames of ALL `*.tkr` in `dir` (replaces the
+- `dir_tkr_files(dir): []str` — the basenames of ALL `*.tkr` in `dir` (replaces the
   first-only `dir_first_tkr`/`dir_first_spec`; a dir IS a regressor iff this is non-empty).
-- `discover_source(source) -> []str` — unchanged in shape (regressor directories), but a dir
+- `discover_source(source): []str` — unchanged in shape (regressor directories), but a dir
   qualifies when `dir_tkr_files(dir).len > 0`.
-- `run_one_regressor(exe, dir, prefix) -> RegrOutcome` — iterates `dir_tkr_files(dir)`, parses
+- `run_one_regressor(exe, dir, prefix): RegrOutcome` — iterates `dir_tkr_files(dir)`, parses
   each with `parse_tkr` (→ `[]TkrFeature`), runs every feature's every scenario, and folds the
   verdicts (FIRST failure wins, else pass). The per-file scratch prefix includes the `.tkr`
   basename so captures never collide across files.

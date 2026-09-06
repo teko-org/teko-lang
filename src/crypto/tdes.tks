@@ -1,0 +1,263 @@
+/**
+ * A TDEA key: three independently-scheduled `teko::crypto::des` keys `K1`, `K2`, `K3` (2-key
+ * keying sets `K3 = K1`), so a caller schedules once (`tdes_key_expand`) and reuses it across
+ * every block via `tdes_encrypt_block_ks`/`tdes_decrypt_block_ks`.
+ */
+exp type TdesKey = struct {
+    /** the `K1` round-key schedule */
+    k1: DesKey
+    /** the `K2` round-key schedule */
+    k2: DesKey
+    /** the `K3` round-key schedule (equals the `K1` schedule under 2-key keying) */
+    k3: DesKey
+}
+
+fn tdes_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+fn tdes_append(dst: []byte, src: []byte): []byte {
+    [..dst, ..src]
+}
+
+fn tdes_xor8(a: []byte, b: []byte): []byte {
+    var out: [8]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 8 { break }
+        out[i] = ((a[i] to u32) ^ (b[i] to u32)) to byte
+        i++
+    }
+    out
+}
+
+fn tdes_keys_equal(a: []byte, b: []byte): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+fn tdes_keying_is_strong(k1b: []byte, k2b: []byte, k3b: []byte, has_k3: bool): bool {
+    if des_is_weak_key(k1b) || des_is_weak_key(k2b) || des_is_weak_key(k3b) { return false }
+    if tdes_keys_equal(k1b, k2b) { return false }
+    if has_k3 && tdes_keys_equal(k2b, k3b) { return false }
+    true
+}
+
+/**
+ * Expands a TDEA key into a reusable `TdesKey` (NIST SP 800-67 §5): 24 bytes selects 3-key
+ * keying (`K1 || K2 || K3`); 16 bytes selects 2-key keying (`K1 || K2`, with `K3 = K1`). Rejects
+ * a short/wrong-length key and a weak keying set (`tdes_keying_is_strong`).
+ */
+exp fn tdes_key_expand(key: []byte): TdesKey | CryptoError {
+    if key.len != 16 && key.len != 24 {
+        return crypto_error("tdes: key must be exactly 16 (2-key) or 24 (3-key) bytes")
+    }
+    var k1b = tdes_slice(key, 0, 8)
+    var k2b = tdes_slice(key, 8, 16)
+    var has_k3 = key.len == 24
+    var k3b = if has_k3 { tdes_slice(key, 16, 24) } else { k1b }
+    if !tdes_keying_is_strong(k1b, k2b, k3b, has_k3) {
+        return crypto_error("tdes: weak keying set (weak component key or K1/K2/K3 collision)")
+    }
+    var k1 = match des_key_expand(k1b) { DesKey as k => k; CryptoError as e => return e }
+    var k2 = match des_key_expand(k2b) { DesKey as k => k; CryptoError as e => return e }
+    var k3 = match des_key_expand(k3b) { DesKey as k => k; CryptoError as e => return e }
+    TdesKey { k1 = k1; k2 = k2; k3 = k3 }
+}
+
+/**
+ * Encrypts one 8-byte block under a pre-expanded TDEA key: the EDE construction
+ * `E_{K3}(D_{K2}(E_{K1}(block)))` (NIST SP 800-67 §5.1).
+ */
+exp fn tdes_encrypt_block_ks(ks: TdesKey, block8: []byte): []byte {
+    var stage1 = des_encrypt_block_ks(ks.k1, block8)
+    var stage2 = des_decrypt_block_ks(ks.k2, stage1)
+    des_encrypt_block_ks(ks.k3, stage2)
+}
+
+/**
+ * Decrypts one 8-byte block under a pre-expanded TDEA key: the inverse EDE construction
+ * `D_{K1}(E_{K2}(D_{K3}(block)))` (NIST SP 800-67 §5.1).
+ */
+exp fn tdes_decrypt_block_ks(ks: TdesKey, block8: []byte): []byte {
+    var stage1 = des_decrypt_block_ks(ks.k3, block8)
+    var stage2 = des_encrypt_block_ks(ks.k2, stage1)
+    des_decrypt_block_ks(ks.k1, stage2)
+}
+
+/**
+ * Encrypts one 8-byte block under `key`, expanding the keying set on the spot — the one-shot
+ * form. For many blocks under the same key, expand once with `tdes_key_expand` and call
+ * `tdes_encrypt_block_ks`.
+ */
+exp fn tdes_encrypt_block(key: []byte, block8: []byte): []byte | CryptoError {
+    if block8.len != 8 { return crypto_error("tdes: block must be exactly 8 bytes") }
+    var ks = match tdes_key_expand(key) { TdesKey as k => k; CryptoError as e => return e }
+    tdes_encrypt_block_ks(ks, block8)
+}
+
+/**
+ * Decrypts one 8-byte block under `key`, expanding the keying set on the spot.
+ */
+exp fn tdes_decrypt_block(key: []byte, block8: []byte): []byte | CryptoError {
+    if block8.len != 8 { return crypto_error("tdes: block must be exactly 8 bytes") }
+    var ks = match tdes_key_expand(key) { TdesKey as k => k; CryptoError as e => return e }
+    tdes_decrypt_block_ks(ks, block8)
+}
+
+fn tdes_require_iv8(iv: []byte): []byte | CryptoError {
+    if iv.len != 8 { return crypto_error("tdes: IV must be exactly 8 bytes") }
+    iv
+}
+
+/**
+ * TDEA-ECB encryption (each block independently enciphered, NIST SP 800-38A §6.1 with the block
+ * cipher instantiated as TDEA). No chaining, no padding — the plaintext length must be a whole
+ * number of 8-byte blocks. ECB leaks repeated-plaintext patterns; prefer CBC.
+ */
+exp fn tdes_ecb_encrypt(key: []byte, pt: []byte): []byte | CryptoError {
+    if pt.len % 8 != 0 { return crypto_error("tdes_ecb: plaintext length must be a multiple of 8") }
+    var ks = match tdes_key_expand(key) { TdesKey as k => k; CryptoError as e => return e }
+    var out: []byte = []
+    var off: u64 = 0
+    loop {
+        if off >= pt.len { break }
+        out = tdes_append(out, tdes_encrypt_block_ks(ks, tdes_slice(pt, off, off + 8)))
+        off = off + 8
+    }
+    out
+}
+
+/**
+ * TDEA-ECB decryption, the inverse of `tdes_ecb_encrypt`.
+ */
+exp fn tdes_ecb_decrypt(key: []byte, ct: []byte): []byte | CryptoError {
+    if ct.len % 8 != 0 { return crypto_error("tdes_ecb: ciphertext length must be a multiple of 8") }
+    var ks = match tdes_key_expand(key) { TdesKey as k => k; CryptoError as e => return e }
+    var out: []byte = []
+    var off: u64 = 0
+    loop {
+        if off >= ct.len { break }
+        out = tdes_append(out, tdes_decrypt_block_ks(ks, tdes_slice(ct, off, off + 8)))
+        off = off + 8
+    }
+    out
+}
+
+/**
+ * CBC encryption (NIST SP 800-38A §6.2) parameterized on an injected 64-bit block cipher — the
+ * SEAM `tdes_cbc_encrypt`/`aes_cbc_encrypt`'s counterparts use: `C_i = CIPH_K(P_i ⊕ C_{i-1})`,
+ * `C_0 = IV`. The plaintext length must already be a whole number of 8-byte blocks.
+ */
+exp fn tdes_cbc_encrypt_with_cipher(encrypt_block: func<[]byte, []byte>, iv8: []byte, pt: []byte): []byte {
+    var out: []byte = []
+    var prev = iv8
+    var off: u64 = 0
+    loop {
+        if off >= pt.len { break }
+        var c = encrypt_block(tdes_xor8(tdes_slice(pt, off, off + 8), prev))
+        out = tdes_append(out, c)
+        prev = c
+        off = off + 8
+    }
+    out
+}
+
+/**
+ * CBC decryption (NIST SP 800-38A §6.2) parameterized on an injected 64-bit block cipher:
+ * `P_i = CIPH_K^{-1}(C_i) ⊕ C_{i-1}`, `C_0 = IV`.
+ */
+exp fn tdes_cbc_decrypt_with_cipher(decrypt_block: func<[]byte, []byte>, iv8: []byte, ct: []byte): []byte {
+    var out: []byte = []
+    var prev = iv8
+    var off: u64 = 0
+    loop {
+        if off >= ct.len { break }
+        var cblock = tdes_slice(ct, off, off + 8)
+        out = tdes_append(out, tdes_xor8(decrypt_block(cblock), prev))
+        prev = cblock
+        off = off + 8
+    }
+    out
+}
+
+/**
+ * TDEA-CBC encryption — wires `tdes_encrypt_block_ks` into `tdes_cbc_encrypt_with_cipher` after
+ * expanding the key once. No padding (see `tdes_pkcs7_pad` for a caller that needs it): the
+ * plaintext length must be a whole number of 8-byte blocks.
+ */
+exp fn tdes_cbc_encrypt(key: []byte, iv: []byte, pt: []byte): []byte | CryptoError {
+    var iv8 = match tdes_require_iv8(iv) { []byte as v => v; CryptoError as e => return e }
+    if pt.len % 8 != 0 { return crypto_error("tdes_cbc: plaintext length must be a multiple of 8") }
+    var ks = match tdes_key_expand(key) { TdesKey as k => k; CryptoError as e => return e }
+    tdes_cbc_encrypt_with_cipher((b: []byte) => tdes_encrypt_block_ks(ks, b), iv8, pt)
+}
+
+/**
+ * TDEA-CBC decryption, the inverse of `tdes_cbc_encrypt`.
+ */
+exp fn tdes_cbc_decrypt(key: []byte, iv: []byte, ct: []byte): []byte | CryptoError {
+    var iv8 = match tdes_require_iv8(iv) { []byte as v => v; CryptoError as e => return e }
+    if ct.len % 8 != 0 { return crypto_error("tdes_cbc: ciphertext length must be a multiple of 8") }
+    var ks = match tdes_key_expand(key) { TdesKey as k => k; CryptoError as e => return e }
+    tdes_cbc_decrypt_with_cipher((b: []byte) => tdes_decrypt_block_ks(ks, b), iv8, ct)
+}
+
+/**
+ * PKCS#7 padding to the 8-byte TDEA block size (RFC 5652 §6.3): appends `n` bytes each holding
+ * the value `n`, where `n = 8 - (data.len % 8)` (a full 8-byte pad block when `data.len` is
+ * already a multiple of 8, so the padding is always unambiguous to strip). OPTIONAL — `tdes_cbc_
+ * encrypt`/`decrypt` require an already-block-aligned length; a caller with arbitrary-length data
+ * pads with this first.
+ */
+exp fn tdes_pkcs7_pad(data: []byte): []byte {
+    var pad_len = 8 - (data.len % 8)
+    var out: [data.len + pad_len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= data.len { break }
+        out[i] = data[i]
+        i++
+    }
+    var j: u64 = 0
+    loop {
+        if j >= pad_len { break }
+        out[data.len + j] = pad_len to byte
+        j++
+    }
+    out
+}
+
+/**
+ * Strips PKCS#7 padding applied by `tdes_pkcs7_pad`, validating every pad byte.
+ */
+exp fn tdes_pkcs7_unpad(data: []byte): []byte | CryptoError {
+    if data.len == 0 || data.len % 8 != 0 {
+        return crypto_error("tdes_pkcs7_unpad: length must be a nonzero multiple of 8")
+    }
+    var pad_len = data[data.len - 1] to u64
+    if pad_len == 0 || pad_len > 8 {
+        return crypto_error("tdes_pkcs7_unpad: invalid pad length")
+    }
+    var i = data.len - pad_len
+    loop {
+        if i >= data.len { break }
+        if data[i] != (pad_len to byte) { return crypto_error("tdes_pkcs7_unpad: malformed pad bytes") }
+        i++
+    }
+    tdes_slice(data, 0, data.len - pad_len)
+}

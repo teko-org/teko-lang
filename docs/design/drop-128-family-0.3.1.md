@@ -1,5 +1,7 @@
 # Drop the 128-bit family (i128 / u128) + f16 from the Teko language — carrier-detox then surface-removal (crumb plan)
 
+> **[NOTA]** — este documento descreve oráculos diferenciais ativos durante o bring-up do backend nativo. Ambos os oráculos foram desde então **retirados** (#524 e seguintes); o restante deste documento é registro histórico do método usado, não descreve o estado atual do projeto.
+
 **Status:** DESIGN (doc-only; owner ratifies before any code). Proposal of the owner, 2026-07-23.
 Two scope messages fold in: (1) drop i128/u128 from the language (f128 never existed); (2) also drop
 f16. Branch `design/drop-128-family`, base conceptually **`origin/main` AFTER the null-union pivot
@@ -11,7 +13,7 @@ Every file:line below is cited against `origin/main` as of this writing; **offse
 > `teko::numeric` BigInt / Decimal (landed in .30) or roll their own. Remove NOW the whole topology and
 > backend for the 128-bit cases, and also f16, limiting the language to **integers 8–64 bit
 > (u8..u64 / i8..i64) + floats f32/f64**. Motivation: the kill-C critical path becomes *float-only* —
-> it deletes register-pair materialization, 128-bit ABI classification across the 4 ABIs, the interpreter
+> it deletes register-pair materialization, 128-bit ABI classification across the 4 ABIs, the legacy engine
 > 128 arms, and the isel honest-stops. **Final surface: 8/16/32/64-bit ints + f32/f64.**
 
 ---
@@ -29,16 +31,16 @@ signed bits) without loss. It is not 6 spot-edits; it is **~11 carrier subsystem
 | `checker::comptime_fold::CVInt.bits: u128` (const-fold value) | `src/checker/comptime_fold.tks:34` | **127** | **L** |
 | `checker::typer::value_fits(v: i128, …)` + `tast::TPathExpr.value: u128` | `src/checker/typer.tks:1566`, `tast.tks:72` | 11 | M |
 | `lir::LConstInt.val: i128` (LIR constant) | `src/lir/lir.tks:45` | — | S |
-| `lir::lir_interp` value carrier (`RegFile.values: []i128`, `IResult.value: i128`) | `src/lir/lir_interp.tks:23,48` | **84** | **L** |
-| `backend::minst_interp` value carrier (mirror of the above) | `src/backend/minst_interp.tks` | **85** | **L** |
+| `lir::lir_oracle` value carrier (`RegFile.values: []i128`, `IResult.value: i128`) | `src/lir/lir_oracle.tks:23,48` | **84** | **L** |
+| `backend::minst_oracle` value carrier (mirror of the above) | `src/backend/minst_oracle.tks` | **85** | **L** |
 | `lir::lower_const` const-fold + `lir::lir_print::i128_dec` | `src/lir/lower_const.tks:76+`, `lir_print.tks:34` | ~15 | M |
 | `codegen` `cb_u128_digits` (emits decimal of u64-range values) | `src/codegen/codegen.tks:113+` | **75** | M |
 | `numeric::bigint` `mag128: i128` (abs of `i64::MIN`) | `src/numeric/bigint/bigint.tks:454` | 2 | S |
 | `parser::FlagsBody.values: []u128` (flags bit-values) | `src/parser/ast.tks:290` | 1 + json | M |
 | **timestamps**: `teko::time` ticks + `teko_rt.c` datetime externs + `build::progress`/`project` | `src/time/time.tks:15-19`, `src/runtime/teko_rt.c:2445`, `src/build/progress.tks:85`, `src/build/project.tks` (11 fns) | ~20 | M |
 
-**The two interpreters (169 combined hits) and `comptime_fold` (127) are the real weight**, and the
-interpreters carry a *behavioral* choice (§9-g). f16, by contrast, is **zero-use** and a **pure Wave-B
+**The two legacy engines (169 combined hits) and `comptime_fold` (127) are the real weight**, and the
+legacy engines carry a *behavioral* choice (§9-g). f16, by contrast, is **zero-use** and a **pure Wave-B
 deletion** (§8), so it costs nothing to fold in.
 
 **Structure — TWO waves, each crumb independently gate-able (GATE-G = build seed + `test` + fixpoint
@@ -47,17 +49,17 @@ deletion** (§8), so it costs nothing to fold in.
 - **Wave A — CARRIER DETOX (A1–A7).** Rewrite the ~11 internal carriers so **no compiler-internal
   declaration is typed `i128`/`u128`**, while the **surface still accepts** i128/u128/f16. Immediate,
   bankable win the instant Wave A closes: **native self-host stops needing 128-bit isel** (the corpus it
-  compiles no longer contains an i128 value), so the isel/stackify honest-stops become unreachable.
+  compiles no longer contains an i128 value), so the isel honest-stops become unreachable.
 - **Wave B — SURFACE + TOPOLOGY REMOVAL (B1–B6).** Checker rejects `i128`/`u128`/`f16` with an honest
   diagnostic (pointing at `bigint`/`dec`/`f32`); rejection tests; delete the backend topology
-  (isel routes, 128-bit ABI classification, interpreter width-128 arms, `lower`, `PrimKind::{I128,U128,
+  (isel routes, 128-bit ABI classification, legacy engine width-128 arms, `lower`, `PrimKind::{I128,U128,
   F16}` and its whole match cascade, `LType::{I128,F16}`); sweep corpus/tests/fixtures; amend B.38; docs.
 
 Wave A must land **first** and **whole** (a half-detoxed corpus still forces 128-bit isel). Wave B is
 mechanical once Wave A holds.
 
 > **Three owner proposals were validated (2026-07-23).** Plan B (swap internal carriers to
-> `teko::numeric::BigInt`) — **rejected** (§0.9: arena blow-up in the hot fold/interp paths, overhead
+> `teko::numeric::BigInt`) — **rejected** (§0.9: arena blow-up in the hot fold/oracle paths, overhead
 > everywhere else, impossible across the `teko_rt` C ABI). Plan C (accept i128/u128 syntax but silently
 > undersize to 64) — its *mechanism* is sound but its "compile em falso" carries an M.3 honesty debt, and
 > its f16→f32 "existing precedent" is **false** (§0.95: f16 is a real distinct `_Float16` type).
@@ -91,7 +93,7 @@ is_neg/is_zero`. Three facts decide everything below:
 | Carrier | BigInt-swap verdict | Why |
 |---|---|---|
 | `comptime_fold::CVInt.bits` (**127 hits**) | **TRAP — much worse** | Does two's-complement `&`/`\|`/`^`/`~`/`<<`/`>>` + width-mask. BigInt has none (F1) and is sign-magnitude — you'd **re-implement a two's-complement layer on top of BigInt**. The u64-narrow is a mechanical `u128→u64` (all widths ≤64; existing u64 bit-ops just work). |
-| `lir_interp` + `minst_interp` (**169 hits**) | **TRAP — worse + slower** (point 2) | The oracle must MATCH native's 64-bit wrap ⇒ `rem 2^64` (an allocation) after *every* op. i64-wrapping IS the native model, zero alloc. See §9-g. |
+| `lir_oracle` + `minst_oracle` (**169 hits**) | **TRAP — worse + slower** (point 2) | The oracle must MATCH native's 64-bit wrap ⇒ `rem 2^64` (an allocation) after *every* op. i64-wrapping IS the native model, zero alloc. See §9-g. |
 | `parser::Number.value` / `TNumber.value` (literal) | **Pure overhead** (point 4) | Once the surface is removed, a literal's range is **already ≤ u64::MAX** by construction (see below) — a BigInt to hold a guaranteed-u64 value, needing a new `of_u64` (F2) and per-literal alloc (F3). `{neg,mag:u64}` is strictly cheaper and sufficient. Also feeds bitwise literal fold (`~5`, `1<<40`) ⇒ needs the width layer BigInt lacks (F1). |
 | `lir::LConstInt.val` + `lower_const` + `lir_print` | **TRAP — nonsensical** | The backend materializes a **machine constant** into a register; a limb-vector cannot be a `mov imm`. Must be i64/u64. |
 | `codegen::cb_u128_digits` (75 hits) | **Overhead** | Prints decimal of *u64-range* mark values; `to_str(BigInt)` allocates to print a u64. `cb_u64_digits` is trivial. |
@@ -102,23 +104,23 @@ is_neg/is_zero`. Three facts decide everything below:
 | `numeric::bigint::mag128` | **N/A** | It is inside BigInt itself; must be u64-narrow regardless (A7). |
 
 **Conclusion (point 1):** BigInt-swap is *mechanical and safe* in **essentially zero** of the carriers
-that matter. It is a **trap** wherever two's-complement/bitwise/wrap semantics live (const-fold, interps,
+that matter. It is a **trap** wherever two's-complement/bitwise/wrap semantics live (const-fold, oracles,
 LIR/backend), **pure overhead** where the value is already u64-bounded (literal, ordinal, codegen digits),
 and **impossible** where a C ABI or a machine register is crossed (timestamps, LConstInt). The one place
 it adds capability (flags > 64) is out of scope and breaks the runtime mask model. **The "hybrid where
 BigInt is mechanical" collapses to "u64-narrow almost everywhere"** — there is no carrier where BigInt is
 *both* cheaper *and* safe.
 
-**Point 2 (interpreters) — CONFIRMED.** i64-wrapping is better *and* more faithful; BigInt+mask reimposes
+**Point 2 (legacy engines) — CONFIRMED.** i64-wrapping is better *and* more faithful; BigInt+mask reimposes
 the wrap BigInt was supposed to abstract, at an allocation per op. Keep decision §9-g (i64-wrapping).
 
 **Point 3 (M.0 / arena blow-up) — REAL, and disqualifying for the hot paths.** `comptime_fold` runs over
-the WHOLE corpus at compile time; the interpreters run the whole `.tkt` gate — both are long, no-free
+the WHOLE corpus at compile time; the legacy engines run the whole `.tkt` gate — both are long, no-free
 executions. Swapping their O(1) scalar carriers to BigInt turns every constant/fold/register-write into a
 **permanent limb-vector allocation** (F3) on an arena that already peaks ~780 MB during self-host. The
-blow-up is unbounded-in-principle (proportional to fold/interp op count, which scales with corpus size)
+blow-up is unbounded-in-principle (proportional to fold/oracle op count, which scales with corpus size)
 and would land as a *self-inflicted* transitional regression that .32 then has to *undo*. **Not acceptable
-even transitionally** for `comptime_fold` and the interpreters. (For a handful of literal values it would
+even transitionally** for `comptime_fold` and the legacy engines. (For a handful of literal values it would
 be tolerable — but those are exactly the places BigInt buys nothing.)
 
 **Point 4 (fixpoint / tkb / literal range) — resolved, and it removes BigInt's supposed advantage.**
@@ -174,7 +176,7 @@ map silently breaks wherever the compiler's OWN source depends on the wide carri
 - **(a) `Number.value`** — `parse_lit::lit_int` accumulates in i128; positive **u64-range literals
   `2^63 .. 2^64-1`** do not fit i64. These occur in the compiler ITSELF — e.g. the mask
   `0xFFFFFFFFFFFFFFFF` at `tkb_write.tks:100-101,178,601`, the `0x8000000000000000` sign boundaries in
-  `minst_interp`. A blind i64 narrow makes `value_fits`'s unsigned gate (`v >= 0`) reject them and the
+  `minst_oracle`. A blind i64 narrow makes `value_fits`'s unsigned gate (`v >= 0`) reject them and the
   fold read them wrong → **the compiler miscompiles itself → fixpoint break.** This is NOT a transitional
   wart; it is disqualifying. **Requires the sign+65-bit carrier fix (A1-lite) regardless** — Plan C does
   NOT avoid A1.
@@ -185,7 +187,7 @@ map silently breaks wherever the compiler's OWN source depends on the wide carri
   intermediate `1<<64` needs the guard). This is a **mechanical adjustment of the existing guard**, not
   new math — the fold ops *mirror surface widths*, so with widths ≤64 they are 64-safe once the guard
   moves.
-- **(d) interpreters** — a 64-bit **wrap** is acceptable and becomes decision §9-g (auto-acquired).
+- **(d) legacy engines** — a 64-bit **wrap** is acceptable and becomes decision §9-g (auto-acquired).
 - **(e) timestamps / flags / `TPathExpr`** — 64-safe under the proposed rulings.
 So the non-64-safe set is exactly **(a), (b), (c)** — the same two intrinsic fixes as Plan A (A1, A7)
 **plus** the mechanical `comptime_fold` top-width guard move. Everything else narrows mechanically.
@@ -213,7 +215,7 @@ but the doc must record the exception, its deadline, and its mitigation:
 **This is correct and it collapses Wave A.** The ~11 internal carriers exist to **carry user 128-bit
 values through the pipeline**, not because the compiler intrinsically computes in >64 bits:
 `Number.value` is i128 to hold a *user's* 128-bit literal; `CVInt.bits` is u128 to fold a *user's* 128
-constant; the interpreters carry i128 to interpret a *user's* 128-bit op; `flags []u128` to allow a
+constant; the legacy engines carry i128 to execute a *user's* 128-bit op; `flags []u128` to allow a
 *user's* 128-member flags. **The only real producers of >64-bit values in an accepted program are the 128
 tests/fixtures.** Delete those first, and **no value above 64 bits flows through any carrier** — so the
 narrowing is mechanical and any >64-bit semantic divergence is **unobservable**.
@@ -221,7 +223,7 @@ narrowing is mechanical and any >64-bit semantic divergence is **unobservable**.
 **Consequence 1 — the preservation proof becomes EMPIRICAL, not analytic.** Order: **sweep the 128
 tests/fixtures FIRST**, then narrow. The gate itself is the demonstration: **byte-identical fixpoint
 (`gen1==gen2`) + the full `.tkt` suite + the own==C differential.** The fixpoint is an especially strong
-net *here* because the compiler self-hosts — it exercises its OWN fold/interp/carrier paths on its OWN
+net *here* because the compiler self-hosts — it exercises its OWN fold/oracle/carrier paths on its OWN
 source (e.g. a wrong `width_mask(64)` would miscompile the compiler and break the fixpoint). No
 site-by-site analytic proof is required; the three point-fixes (§0.95-a/b/c) are the only spots that
 touch a genuinely-wide value, and each is guarded by a targeted fixture.
@@ -235,13 +237,13 @@ ops parametrize on the *surface* width, and the surface dies.
 **Consequence 3 — re-estimate DOWN; the L's dehydrate.** Under the empirical lens the per-carrier
 analytic rewrites of §3 (A2/A3/A4/A5/A6, sized L/M for a *proven* rewrite) **collapse into ONE mechanical
 narrowing crumb** (rename the type names i128→i64 / u128→u64 across the 64-safe carriers; the values
-already fit) **plus** the two point-fixes. `comptime_fold`'s 127 hits and the interpreters' 169 hits are
+already fit) **plus** the two point-fixes. `comptime_fold`'s 127 hits and the legacy engines' 169 hits are
 now **mechanical renames**, not reasoned rewrites — M, not L.
 
 **Consequence 4 — with the cost collapsed, EVERYTHING fits in .31.** Narrowing + surface **rejection**
 (B1) + topology deletion (B2) + f16 kill + sweeps + B.38 all land now; .32 holds only residual polish.
 Because the narrowing removes every 128 *producer*, `PrimKind::{I128,U128,F16}` and `LType::{I128,F16}`
-have no producers → their members **and** the register-pair/ABI/interp topology are dead → deletable in
+have no producers → their members **and** the register-pair/ABI/oracle topology are dead → deletable in
 .31 (no need to defer to .32). **The honesty exception of Plan C (§0.95-3) is therefore NOT taken** — we
 reject the surface outright in .31 rather than "compile em falso," so M.3 holds.
 
@@ -251,7 +253,7 @@ reject the surface outright in .31 rather than "compile em falso," so M.3 holds.
 |---|---|---|---|---|
 | Carrier work | 7 crumbs, 4×L (proven site-by-site) | swap to BigInt | ≈3 resolver arms + 2 fixes, surface stays | **1 mechanical narrow crumb + 2 point-fixes (A1-lite, A7) + guard move** |
 | Surface | reject in .31 | reject in .31 | accept-but-truncate (M.3 debt) | **reject in .31 (honest, M.3 holds)** |
-| Topology (isel/ABI/interp-128) | .32 defer | .32 | .31 possible | **delete in .31 (no producers left)** |
+| Topology (isel/ABI/oracle-128) | .32 defer | .32 | .31 possible | **delete in .31 (no producers left)** |
 | Fixpoint risk | low (proven) | 2× re-baseline/carrier, arena blow-up | low IF fixes applied | **low — fixpoint+suite+own==C is the empirical proof** |
 | Arena / M.0 | fine | **blows up (disqualifying)** | fine | **fine** |
 | Dies in .31 | surface + carriers | surface + carriers | border + tests | **MAXIMUM — carriers + surface + topology + tests + f16 + spec** |
@@ -268,8 +270,8 @@ retained as the implementer's site map and fallback.
 | Crumb | What | Size | Re-baseline |
 |---|---|---|---|
 | **R0** | **Sweep 128 tests/fixtures FIRST** — delete `u128_high_bit/`, convert `lit_i128_if_assign`/`lit_arg_if_over_i64` → u64 (§6), prune isel `_test.tkt` 128/F16 cases. *(Removes every >64 producer so the narrow is observably safe.)* | **S** | none (fixtures only) |
-| **R1** | **Mechanical narrow + 2 point-fixes** — rename internal `i128→i64` / `u128→u64` across the 64-safe carriers (`comptime_fold` 127, interps 169, `LConstInt`, `codegen` digits, timestamps, flags, `TPathExpr`, LIR/print); **A1-lite** `Number.value → {neg,mag:u64}` + sign-aware `value_fits`/parse + reject `>u64::MAX` literal; **A7** bigint abs; move `comptime_fold` top-width guard 128→64. Wire stays compat (§7). | **M** | 1 |
-| **R2** | **B1 reject surface + topology delete** — `scope.tks` honest-error arms for i128/u128/f16 (§4 B1); delete `PrimKind::{I128,U128,F16}` + `LType::{I128,F16}` + the match cascade + isel register-pair routes + ABI size-16 legs + interp width-128 arms (§4 B7/B8). Rejection fixtures born (§6). | **M–L** | 1 |
+| **R1** | **Mechanical narrow + 2 point-fixes** — rename internal `i128→i64` / `u128→u64` across the 64-safe carriers (`comptime_fold` 127, oracles 169, `LConstInt`, `codegen` digits, timestamps, flags, `TPathExpr`, LIR/print); **A1-lite** `Number.value → {neg,mag:u64}` + sign-aware `value_fits`/parse + reject `>u64::MAX` literal; **A7** bigint abs; move `comptime_fold` top-width guard 128→64. Wire stays compat (§7). | **M** | 1 |
+| **R2** | **B1 reject surface + topology delete** — `scope.tks` honest-error arms for i128/u128/f16 (§4 B1); delete `PrimKind::{I128,U128,F16}` + `LType::{I128,F16}` + the match cascade + isel register-pair routes + ABI size-16 legs + oracle width-128 arms (§4 B7/B8). Rejection fixtures born (§6). | **M–L** | 1 |
 | **R3** | **Tidies** — ffi prose (B4), `checked.tks` (B3), **B.38 amendment** + DECISION_LOG + docs (B6). | **S** | none (docs) |
 
 **Total: 2 re-baselines, all .31-feasible.** (R1 and R2 may merge into one re-baseline if reviewed
@@ -308,10 +310,9 @@ correctness cost. But by design intent the owner's "maximum death now" is achiev
   member name** mirroring PrimKind's shape (issue #263) — that is an identifier, NOT the builtin `f16`
   type, and **must survive** the sweep. The f16 sweep keys on the builtin type `f16`, never the token.
 
-**`math/checked.tks:25-31`** — the 128-bit `checked_*` family is *deliberately not shipped* (the retired
-VM's `norm_int` trapping `raw to u128` PANICS on a high-bit u128). Wave B **formalizes** this: the
-"once the VM reinterpret is corrected, u128/i128 are a mechanical extension" prose is deleted (there is
-no longer any 128 to extend to).
+**`math/checked.tks:25-31`** — the 128-bit `checked_*` family is *deliberately not shipped*. Wave B
+**formalizes** this: the prose about conditional future extension of the 128-bit family is deleted
+(there is no longer any 128 to extend to).
 
 **`.tkb` wire (frozen codec).** `parser::Number.value` (an i128) is serialized as **two u64 halves —
 hi = `(value >> 64)`, lo = `(value & 0xFFFF…FFFF)`** at `src/emit/tkb_write.tks:100-101` (general
@@ -358,32 +359,32 @@ the carrier (const-fold `+`/`-`/`~`/unary-`-`, `value_fits`) becomes sign-magnit
  * @param k  the target integer prim kind (U8..U64 / I8..I64)
  * @return   true iff `v` is representable in `k`
  */
-fn numint_fits(v: NumInt, k: PrimKind) -> bool
+fn numint_fits(v: NumInt, k: PrimKind): bool
 ```
 
-### 2.2 Raw 64-bit wrapping carrier — for the *interpreter register files*
+### 2.2 Raw 64-bit wrapping carrier — for the *legacy engine register files*
 
-The two differential interpreters (`lir_interp`, `minst_interp`) hold **`RegFile.values: []i128`** and
-`IResult.value: i128` as an *unmasked* carrier (`lir_interp.tks:11` "Values are the i128 carrier; a
+The two differential legacy engines (`lir_oracle`, `minst_oracle`) hold **`RegFile.values: []i128`** and
+`IResult.value: i128` as an *unmasked* carrier (`lir_oracle.tks:11` "Values are the i128 carrier; a
 numeric `to` cast masks to the target"). After the drop, the carrier becomes a **64-bit two's-complement
-register value held in `i64`**, with per-op width/sign reinterpretation retained (mirroring the retired
-VM's `norm_int`). See §9-g for the **behavioral decision** this forces (unmasked-i128 → 64-bit-wrapping),
+register value held in `i64`**, with per-op width/sign reinterpretation retained (maintaining
+historical semantics). See §9-g for the **behavioral decision** this forces (unmasked-i128 → 64-bit-wrapping),
 which is a *ratification item*, not a default.
 
 ```teko
 /**
- * IResult — the interpreter step result, carrier-detoxed off i128 (drop-128). `value` is now the raw
+ * IResult — the legacy engine step result, carrier-detoxed off i128 (drop-128). `value` is now the raw
  * 64-bit two's-complement register value (was an unmasked i128 carrier). Arithmetic wraps mod 2^64 —
  * the same wrap the native backend produces — and per-op reinterpretation (sign/zero-extend for
- * compares/shifts/div) is applied at the op, exactly as `minst_interp` must mirror it.
+ * compares/shifts/div) is applied at the op, exactly as `minst_oracle` must mirror it.
  */
 pub type IResult = struct { tag: u32; value: i64; message: str }
 ```
 
 `RegFile.values: []i128` → `[]i64`; `two_pow_64`/`decode_signed64` and the `two_pow_32` helpers
-(`minst_interp.tks:28+`) collapse (a 64-bit carrier needs no widening to 128 to decode a 64-bit
-pattern). **Both interpreters change in lockstep** — the interp-vs-interp equivalence oracle is
-preserved because both apply the identical model; the interp-vs-native check *improves* (a 64-bit
+(`minst_oracle.tks:28+`) collapse (a 64-bit carrier needs no widening to 128 to decode a 64-bit
+pattern). **Both legacy engines change in lockstep** — the oracle-vs-oracle equivalence check is
+preserved because both apply the identical model; the oracle-vs-native check *improves* (a 64-bit
 wrapping register models a real machine register more faithfully than an unmasked i128).
 
 ### 2.3 Clean narrowings — no new shape needed
@@ -421,7 +422,7 @@ in the runtime C and the `teko::time` module:
   signatures may be narrowed to `int64_t` under this issue.
 - `src/time/time.tks:15-19` — `DateTime.ticks: i128`, `TimeSpan.ticks: i128`, `DateTimeOffset.ticks:
   i128`; extern decls `datetime_now`/`datetime_to_unix_ns` (`:24,45`) mirror the C `__int128`.
-- `src/build/progress.tks:85` `Phase.start: i128`, `:98` `now_ns() -> i128` (chains
+- `src/build/progress.tks:85` `Phase.start: i128`, `:98` `now_ns(): i128` (chains
   `datetime_to_unix_ns(datetime_now())`), `:145` `elapsed_str`.
 - `src/build/project.tks` — 11 functions thread `start: i128` (`:1568,1611,1626,1813,1841,1872,1879`).
 
@@ -432,10 +433,19 @@ honest-stop; a comment-only touch). **`teko::time`'s `DateTime`/`TimeSpan`/`Date
 stdlib types** — narrowing their tick field is an observable stdlib change (a 292-year range instead of
 an astronomical one). Ratify with (c).
 
-> Note on `teko_rt.c`'s *arithmetic* helpers `tk_div`/`tk_rem`/`tk_int_to_float` (`teko_rt.c:2327+`,
-> `__int128` params): these are the runtime's INTERNAL wide-arith and are **out of scope** — the language
-> ceases to *expose* i128, but the runtime may keep a wider internal type. They are reachable only via
-> codegen for 64-bit division; nothing in Wave A/B requires touching them. Flagged, not changed.
+> Note on `teko_rt.c`'s *arithmetic* helpers `tk_div`/`tk_rem`/`tk_int_to_float` (`__int128` params):
+> this doc called them the runtime's INTERNAL wide-arith and put them **out of scope**, on the reasoning
+> that the language may stop *exposing* i128 while the runtime keeps a wider internal type.
+> **SUPERSEDED by the owner ruling of 2026-07-30** (*"é pra remover suporte de 128 bits como primitivas
+> (inteiros e flutuantes), para isto foram criados os arbitrários bigint e dec"*): they are REMOVED,
+> together with the whole `*_i128`/`*_u128` helper family, the `tk_to_{u,i}128*` casts and the 128-bit
+> cast CARRIER (now `int64_t`/`uint64_t`). Two facts closed it: (1) nothing ever called the trio —
+> integer `/` and `%` route through the per-width `tk_div_<tag>`/`tk_mod_<tag>` helpers and an int->float
+> cast is a plain C cast; (2) being the runtime's only NON-static `__int128` functions, they were the
+> sole reason `teko_rt.o` referenced the libgcc 128-bit builtins `__divti3`/`__udivti3`/`__modti3`/
+> `__umodti3`/`__floattidf`/`__floatuntidf`, which MSVC's `link.exe` cannot resolve — six LNK2019s that
+> reddened `artifact / windows-x86_64` the moment the Windows leg moved off mingw. "Internal wide-arith
+> the surface cannot reach" was still a cost, and it was being paid at the link.
 
 ---
 
@@ -476,12 +486,12 @@ the largest single edit; a stray `to u128` cast left behind reintroduces the typ
 isel `fits_i64` honest-stop text in place (it is now unreachable but still valid Teko) — Wave B deletes
 it. **Ritual:** GATE-G.
 
-### A4 — interpreter carriers `lir_interp` + `minst_interp` `i128 → i64` (LOCKSTEP)  — **L**
-**Targets:** `src/lir/lir_interp.tks` (`IResult.value`, `RegFile.values`, `ires_*`, `eval_bin`/`eval_un`/
-`eval_div` arms — 84 hits) and `src/backend/minst_interp.tks` (mirror — 85 hits;
+### A4 — legacy engine carriers `lir_oracle` + `minst_oracle` `i128 → i64` (LOCKSTEP)  — **L**
+**Targets:** `src/lir/lir_oracle.tks` (`IResult.value`, `RegFile.values`, `ires_*`, `eval_bin`/`eval_un`/
+`eval_div` arms — 84 hits) and `src/backend/minst_oracle.tks` (mirror — 85 hits;
 `two_pow_32/64`/`decode_signed{32,64}` collapse). **Carries the §9-g behavioral decision** — resolve it
-BEFORE this crumb. **Risk:** the two must stay bit-equivalent; any asymmetry breaks the interp-equiv
-oracle in `{lir_interp,minst_interp}_test.tkt`. Do both files in ONE crumb. **Ritual:** GATE-G +
+BEFORE this crumb. **Risk:** the two must stay bit-equivalent; any asymmetry breaks the oracle-equiv
+oracle in `{lir_oracle,minst_oracle}_test.tkt`. Do both files in ONE crumb. **Ritual:** GATE-G +
 `isel_*_test.tkt` (the differential harness) green.
 
 ### A5 — flags + enum-value carriers  — **M**
@@ -507,7 +517,7 @@ elapsed time).
 over `i64::MIN → bigint` guards it. **Ritual:** GATE-G.
 
 **End of Wave A — bankable result:** no compiler-internal declaration is `i128`/`u128`; the corpus the
-native backend self-compiles contains no i128 value; the isel/stackify 128 honest-stops are unreachable;
+native backend self-compiles contains no i128 value; the isel 128 honest-stops are unreachable;
 the surface still resolves i128/u128/f16 (Wave B removes that). f16 is untouched by Wave A (zero use).
 
 ---
@@ -538,7 +548,7 @@ Precondition: **all of Wave A landed** (removing `scope.tks`'s `i128` arm also s
 use) — it can even ship as its own tiny crumb ahead of the i128/u128 arm if the detox slips (§10).
 
 #### B3(.31) — `math/checked.tks` — formalize the removal  — **S**
-Delete the `checked.tks:24-31` "128-bit deferred / mechanical extension once the VM is fixed" prose;
+Delete the `checked.tks:24-31` prose about conditional future extension of 128-bit support;
 restate the width scope as **"exactly u8..u64 / i8..i64 — the language's full integer set"**. No code
 change (the family was never shipped). **Ritual:** GATE-G.
 
@@ -564,7 +574,7 @@ The dying + surviving fixtures (§6 details the exit codes):
 Amend **B.38 "native set"** (the ratified type surface) — in `tooling/shared/src/spec_json.tks` and any
 Constitution/spec mirror — to **u8..u64 / i8..i64 + f32/f64** (drop U128/I128/F16; note f128 never
 existed). DECISION_LOG entry (D-number, base = this ruling). MASTER_PLAN mark. Update the `ast.tks`/
-`tast.tks`/`lir_interp` doc-comment prose that still says "any width incl u128/i128" / "canonical Teko
+`tast.tks`/`lir_oracle` doc-comment prose that still says "any width incl u128/i128" / "canonical Teko
 uses i128". **Ritual:** the closing .31 gate — `gen1==gen2`.
 
 ### .32 crumbs (topology dead-code cleanup — safe to defer; the code is unreachable after .31)
@@ -577,11 +587,11 @@ now-dead arm in the SAME crumb (or the matches go non-exhaustive): `type.tks:11-
 371`, `ffi_export.tks:118-119` (dead surface-name arms), `expr.tks:10`/`revalidate.tks` predicates,
 `lir.tks:20,527,540` (`LType` members + `ltype_size` `16`/`F16 => 2`). **Ritual:** GATE-G.
 
-#### B8(.32) — delete the backend register-pair / ABI-128 / interp-width-128 topology  — **L**
+#### B8(.32) — delete the backend register-pair / ABI-128 / oracle-width-128 topology  — **L**
 The isel i128 routes + honest-stops — `isel_x86_64.tks` (~11 incl. `select_const_int_x86`'s register-pair
 stop, now unreachable), `isel_arm64.tks` (~35), um isel de backend (~29); the 128-bit ABI classification —
-literal `128`; key on the size-16/two-register path, not a grep); `lower.tks` residual; `stackify.tks`
-`C1-i128` stop; the `if width == 128` arms remaining in `lir_interp`/`minst_interp` (the carrier already
+literal `128`; key on the size-16/two-register path, not a grep); `lower.tks` residual
+`C1-i128` stop; the `if width == 128` arms remaining in `lir_oracle`/`minst_oracle` (the carrier already
 went in A4); `lir_print` residual. Prune the isel `_test.tkt` i128/F16 cases. **Ritual:** GATE-G +
 own==C differential (`diff_c_own.sh`) with the i128 **KNOWN-STOP guards removed** (§6) — the differential
 runs with no 128 skip. **This is the closing ritual of the whole issue.**
@@ -595,7 +605,7 @@ runs with no 128 skip. **This is the closing ritual of the whole issue.**
 | After | Ritual | Proves |
 |---|---|---|
 | **R0** | GATE-G (fixtures only; no re-baseline) | the 128 producers are gone; suite still green |
-| **R1** | GATE-G + `.tkb` byte-identity (literal-heavy module) + isel differential (`_test.tkt`) + `now_ns` smoke | the mechanical narrow preserves the fixpoint (the empirical proof); wire compat (§7); interps agree under 64-wrap (§9-g); the `i64::MIN`/`u64::MAX`/`width_mask(64)` point-fixes hold |
+| **R1** | GATE-G + `.tkb` byte-identity (literal-heavy module) + isel differential (`_test.tkt`) + `now_ns` smoke | the mechanical narrow preserves the fixpoint (the empirical proof); wire compat (§7); oracles agree under 64-wrap (§9-g); the `i64::MIN`/`u64::MAX`/`width_mask(64)` point-fixes hold |
 | **R2** | GATE-G + rejection fixtures + own==C differential (i128 KNOWN-STOP guards removed, §6) | i128/u128/f16 honestly refused; topology deleted; differential green with no 128 skip |
 | **R3** | **FULL closing gate** + final `gen1==gen2` | spec/B.38/docs match reality; whole issue green in .31 |
 
@@ -622,7 +632,7 @@ carries exactly ONE re-baseline).
 | `` | exercise i128 + F16 plumbing | removed | **PRUNE** the 128/F16 cases |
 | `enum_member_shadows_primkind/src/kinds.tks` | user enum member `F16` | unaffected | **KEEP** (identifier, not the builtin) |
 
-**Rejection fixtures born (native exit codes; VM is retired — native-only, cf. `vm-retirement.md`):**
+**Rejection fixtures born (native exit codes — updated for native-only, per the legacy engine retirement):**
 
 | New fixture | Input | Expected |
 |---|---|---|
@@ -733,28 +743,28 @@ a reasoned rewrite; the ONE thought-spot is moving `width_mask`/`msb_value`'s to
 128→64 (`comptime_fold.tks:148-215`). Confirmed: no fold mask genuinely needs >64 (ops mirror the dying
 surface widths). Folded into crumb R1.
 
-**(g) Interpreter carrier BEHAVIOR — the one substantive semantic choice.** The differential interpreters
-hold an **unmasked i128** carrier today (`lir_interp.tks:11`); moving to a **64-bit wrapping `i64`**
+**(g) Legacy-engine carrier BEHAVIOR — the one substantive semantic choice.** The differential legacy engines
+hold an **unmasked i128** carrier today (`lir_oracle.tks:11`); moving to a **64-bit wrapping `i64`**
 carrier (§2.2) changes intermediate-overflow behavior: an i64/u64 arithmetic result that momentarily
 exceeded 64 bits used to be held wide and only masked at a `to` cast — it now **wraps mod 2^64 at the
 op**. RECOMMEND the wrapping carrier: it is **more faithful to the native backend** (real 64-bit
-registers wrap), and both interpreters change in lockstep so the interp-equiv oracle is preserved. *Risk:*
+registers wrap), and both legacy engines change in lockstep so the oracle-equiv oracle is preserved. *Risk:*
 a corpus test whose exit code depended on the unmasked-then-masked intermediate could shift; the A4
-ritual (isel differential) surfaces any such case. **This is the interpreters' analogue of the retired
-VM's `norm_int` — the same "reinterpret at the boundary" model the `checked.tks:22` note describes.**
+ritual (isel differential) surfaces any such case. **The legacy engines follow the "reinterpret at the
+boundary" model the `checked.tks:22` note describes.**
 Ratify the wrapping model (or, alternatively, keep an unmasked model on a `{neg,mag}` pair — heavier, and
 it re-introduces a non-machine value model; not recommended).
 
 **(h) SCOPE — reconciled under the reframe.** The ~11 carrier subsystems (§0 table) are real, but the
 owner's reframe (§0.99) reclassifies them correctly: they are **surface-SUPPORT**, not intrinsic use, so
-narrowing them is **mechanical** (one rename crumb R1), not 7 reasoned crumbs. The interpreters (169 hits)
-and `comptime_fold` (127) are the bulk of the rename but carry only ONE thought-spot each (interp wrap =
+narrowing them is **mechanical** (one rename crumb R1), not 7 reasoned crumbs. The legacy engines (169 hits)
+and `comptime_fold` (127) are the bulk of the rename but carry only ONE thought-spot each (oracle wrap =
 §9-g; fold guard = §9-f). The two genuinely-intrinsic wide uses are `Number.value` (§9-a) and `bigint`
 `abs(i64::MIN)` (A7). **Net: the empirical lens collapses the cost from L-heavy to M — this is the finding
 that makes "everything in .31" affordable.**
 
 **Risks already covered by rituals (recommended route):** the mechanical narrow's correctness = R1's
-byte-identical fixpoint (self-host is the oracle); wire round-trip = R1 `.tkb` diff; interp wrap = R1 isel
+byte-identical fixpoint (self-host is the oracle); wire round-trip = R1 `.tkb` diff; oracle wrap = R1 isel
 differential; timestamp C-ABI marshal = R1 `now_ns` smoke; surface rejection + topology exhaustiveness =
 R2; own==C without the 128 KNOWN-STOP = R2.
 
@@ -765,11 +775,11 @@ R2; own==C without the 128 KNOWN-STOP = R2.
 - **Depends on / sequences after:** the null-union pivot (C6-C7), the corpus-wide `ref` adoption, and
   KP16 objfile — all in flight. This wave **engages after the ref lands** (it rewrites the corpus; every
   line:offset here shifts — re-grep the symbol). Cite offsets as *approximate*.
-- **Interaction with `vm-retirement.md` (#524):** that issue removes `src/vm/` but **NOT** `lir_interp`/
-  `minst_interp` (they live in `src/lir`/`src/backend`, not `src/vm`), so A4's interpreter detox is
-  **independent** of #524 and needed regardless. If #524 lands first, one fewer coverage/VM interaction
-  to reason about; no ordering hard-dependency either way. `checked.tks:26` references the *retired* VM's
-  `norm_int` — B3's prose cleanup should also drop the stale `src/vm/vm.tks` pointer if #524 already deleted it.
+- **Interaction with the legacy engine detox:** the LIR legacy engine (`lir_oracle`) and machine-code
+  legacy engine (`minst_oracle`, in `src/lir`/`src/backend`) are orthogonal to the native backend (A4) and
+  needed regardless. If the legacy engine detox (#524) lands first, one fewer coverage interaction to reason about;
+  no ordering hard-dependency either way. `checked.tks:26` references the `norm_int` constant — B3's prose
+  cleanup should also review this reference to ensure it aligns with the current integer model.
 - **Interaction with KP16 (objfile) + the float-slice work:** R2's ABI edits (size-16/eightbyte-pair
   classification) touch the same `abi_*.tks` files the float-slice work touches — sequence R2 to NOT
   overlap a float-slice re-baseline (one re-baseline in flight). The float isel family (f32/f64) is

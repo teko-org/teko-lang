@@ -1,0 +1,553 @@
+/**
+ * The kind discriminant of a `MsgValue`: which MessagePack type-family it holds (see the module
+ * doc's VALUE MODEL note). `Int` is a signed integer, `Uint` an unsigned one; `Str` is UTF-8 text,
+ * `Bin` opaque bytes; `Ext` is an application extension.
+ */
+exp type MsgKind = enum {
+    Nil; Bool; Uint; Int; Float; Str; Bin; Array; Map; Ext
+}
+
+/**
+ * One MessagePack value as a tagged struct spanning every `MsgKind`: `kind` selects which fields
+ * below carry meaning.
+ */
+exp type MsgValue = struct {
+    /**
+     * Which MessagePack type-family this is; selects which of the fields below are meaningful.
+     */
+    kind: MsgKind
+    /**
+     * The unsigned value for `Uint`. Zero otherwise.
+     */
+    uint_val: u64
+    /**
+     * The signed value for `Int`, and the extension type code for `Ext`. Zero otherwise.
+     */
+    int_val: i64
+    /**
+     * The floating-point value for `Float`. Zero otherwise.
+     */
+    real: f64
+    /**
+     * The boolean value for `Bool`. `false` otherwise.
+     */
+    flag: bool
+    /**
+     * The text content for `Str`. Empty otherwise.
+     */
+    text: str
+    /**
+     * The payload bytes for `Bin` and `Ext`. Empty otherwise.
+     */
+    bytes: []byte
+    /**
+     * The elements for `Array`. Empty otherwise.
+     */
+    items: []MsgValue
+    /**
+     * The keys of a `Map`, parallel to `vals`. Empty otherwise.
+     */
+    keys: []MsgValue
+    /**
+     * The values of a `Map`, parallel to `keys`. Empty otherwise.
+     */
+    vals: []MsgValue
+}
+
+type MsgRead = struct {
+    value: MsgValue
+    pos: u64
+}
+
+fn no_bytes(): []byte {
+    []
+}
+
+fn no_vals(): []MsgValue {
+    []
+}
+
+fn mk_value(kind: MsgKind, uint_val: u64, int_val: i64, real: f64, flag: bool, text: str, bytes: []byte, items: []MsgValue, keys: []MsgValue, vals: []MsgValue): MsgValue {
+    MsgValue { kind = kind; uint_val = uint_val; int_val = int_val; real = real; flag = flag; text = text; bytes = bytes; items = items; keys = keys; vals = vals }
+}
+
+/**
+ * The `nil` value.
+ */
+exp fn msg_nil(): MsgValue {
+    mk_value(MsgKind::Nil, 0, 0, 0.0, false, "", no_bytes(), no_vals(), no_vals(), no_vals())
+}
+
+/**
+ * Wraps a boolean.
+ */
+exp fn msg_bool(b: bool): MsgValue {
+    mk_value(MsgKind::Bool, 0, 0, 0.0, b, "", no_bytes(), no_vals(), no_vals(), no_vals())
+}
+
+/**
+ * Wraps an unsigned integer (encoded as the shortest unsigned format).
+ */
+exp fn msg_uint(v: u64): MsgValue {
+    mk_value(MsgKind::Uint, v, 0, 0.0, false, "", no_bytes(), no_vals(), no_vals(), no_vals())
+}
+
+/**
+ * Wraps a signed integer, choosing an unsigned representation for non-negative values (so a
+ * non-negative round-trips as the `Uint` a decoder reconstructs from a positive fixint / `uintN`)
+ * and the signed representation for negative ones.
+ */
+exp fn msg_int(v: i64): MsgValue {
+    if v >= 0 { return msg_uint(v to u64) }
+    mk_int(v)
+}
+
+fn mk_int(v: i64): MsgValue {
+    mk_value(MsgKind::Int, 0, v, 0.0, false, "", no_bytes(), no_vals(), no_vals(), no_vals())
+}
+
+/**
+ * Wraps a floating-point number (encoded as `float64`).
+ */
+exp fn msg_float(x: f64): MsgValue {
+    mk_value(MsgKind::Float, 0, 0, x, false, "", no_bytes(), no_vals(), no_vals(), no_vals())
+}
+
+/**
+ * Wraps a UTF-8 string.
+ */
+exp fn msg_str(s: str): MsgValue {
+    mk_value(MsgKind::Str, 0, 0, 0.0, false, s, no_bytes(), no_vals(), no_vals(), no_vals())
+}
+
+/**
+ * Wraps opaque binary data.
+ */
+exp fn msg_bin(b: []byte): MsgValue {
+    mk_value(MsgKind::Bin, 0, 0, 0.0, false, "", b, no_vals(), no_vals(), no_vals())
+}
+
+/**
+ * Wraps a sequence of elements as an array.
+ */
+exp fn msg_array(items: []MsgValue): MsgValue {
+    mk_value(MsgKind::Array, 0, 0, 0.0, false, "", no_bytes(), items, no_vals(), no_vals())
+}
+
+/**
+ * Wraps parallel key/value slices as a map. `keys[i]` maps to `vals[i]`; the two slices must have
+ * the same length.
+ */
+exp fn msg_map(keys: []MsgValue, vals: []MsgValue): MsgValue {
+    mk_value(MsgKind::Map, 0, 0, 0.0, false, "", no_bytes(), no_vals(), keys, vals)
+}
+
+/**
+ * Wraps an application extension: a signed type code and its payload bytes.
+ */
+exp fn msg_ext(ext_type: i64, data: []byte): MsgValue {
+    mk_value(MsgKind::Ext, 0, ext_type, 0.0, false, "", data, no_vals(), no_vals(), no_vals())
+}
+
+fn append_all(out: []byte, more: []byte): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= more.len { break }
+        acc = [..acc, more[i]]
+        i++
+    }
+    acc
+}
+
+fn append_be(out: []byte, v: u64, count: u64): []byte {
+    var acc = out
+    var i = count
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        acc = [..acc, ((v >> (i * 8)) & 0xFF) to byte]
+    }
+    acc
+}
+
+fn append_be_i64(out: []byte, v: i64, count: u64): []byte {
+    var acc = out
+    var i = count
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        acc = [..acc, ((v >> (i * 8)) & 0xFF) to byte]
+    }
+    acc
+}
+
+fn encode_uint(out: []byte, u: u64): []byte {
+    if u < 128 { return [..out, u to byte] }
+    if u <= 0xFF { return append_be([..out, 0xCC to byte], u, 1) }
+    if u <= 0xFFFF { return append_be([..out, 0xCD to byte], u, 2) }
+    if u <= 0xFFFFFFFF { return append_be([..out, 0xCE to byte], u, 4) }
+    append_be([..out, 0xCF to byte], u, 8)
+}
+
+fn encode_int(out: []byte, v: i64): []byte {
+    if v >= -32 { return [..out, (v & 0xFF) to byte] }
+    if v >= -128 { return append_be_i64([..out, 0xD0 to byte], v, 1) }
+    if v >= -32768 { return append_be_i64([..out, 0xD1 to byte], v, 2) }
+    if v >= -2147483648 { return append_be_i64([..out, 0xD2 to byte], v, 4) }
+    append_be_i64([..out, 0xD3 to byte], v, 8)
+}
+
+fn encode_str(out: []byte, s: str): []byte {
+    var raw = s.bytes()
+    var head = string_head(raw.len)
+    append_all(append_all(out, head), raw)
+}
+
+fn string_head(n: u64): []byte {
+    if n < 32 { return [..no_bytes(), (0xA0 | n) to byte] }
+    if n <= 0xFF { return append_be([..no_bytes(), 0xD9 to byte], n, 1) }
+    if n <= 0xFFFF { return append_be([..no_bytes(), 0xDA to byte], n, 2) }
+    append_be([..no_bytes(), 0xDB to byte], n, 4)
+}
+
+fn encode_bin(out: []byte, b: []byte): []byte {
+    var head: []byte = no_bytes()
+    if b.len <= 0xFF {
+        head = append_be([..no_bytes(), 0xC4 to byte], b.len, 1)
+    } else if b.len <= 0xFFFF {
+        head = append_be([..no_bytes(), 0xC5 to byte], b.len, 2)
+    } else {
+        head = append_be([..no_bytes(), 0xC6 to byte], b.len, 4)
+    }
+    append_all(append_all(out, head), b)
+}
+
+fn encode_array(out: []byte, items: []MsgValue): []byte {
+    var acc = append_all(out, container_head(0x90 to byte, 0xDC to byte, 0xDD to byte, items.len))
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        acc = encode_value(acc, items[i])
+        i++
+    }
+    acc
+}
+
+fn encode_map(out: []byte, keys: []MsgValue, vals: []MsgValue): []byte {
+    var acc = append_all(out, container_head(0x80 to byte, 0xDE to byte, 0xDF to byte, keys.len))
+    var i: u64 = 0
+    loop {
+        if i >= keys.len { break }
+        acc = encode_value(encode_value(acc, keys[i]), vals[i])
+        i++
+    }
+    acc
+}
+
+fn container_head(fix: byte, wide16: byte, wide32: byte, n: u64): []byte {
+    if n < 16 { return [..no_bytes(), ((fix to u64) | n) to byte] }
+    if n <= 0xFFFF { return append_be([..no_bytes(), wide16], n, 2) }
+    append_be([..no_bytes(), wide32], n, 4)
+}
+
+fn encode_ext(out: []byte, v: MsgValue): []byte {
+    var acc = append_all(out, ext_head(v.bytes.len))
+    acc = append_be_i64(acc, v.int_val, 1)
+    append_all(acc, v.bytes)
+}
+
+fn ext_head(n: u64): []byte {
+    if n == 1 { return [..no_bytes(), 0xD4 to byte] }
+    if n == 2 { return [..no_bytes(), 0xD5 to byte] }
+    if n == 4 { return [..no_bytes(), 0xD6 to byte] }
+    if n == 8 { return [..no_bytes(), 0xD7 to byte] }
+    if n == 16 { return [..no_bytes(), 0xD8 to byte] }
+    if n <= 0xFF { return append_be([..no_bytes(), 0xC7 to byte], n, 1) }
+    if n <= 0xFFFF { return append_be([..no_bytes(), 0xC8 to byte], n, 2) }
+    append_be([..no_bytes(), 0xC9 to byte], n, 4)
+}
+
+fn encode_value(out: []byte, v: MsgValue): []byte {
+    match v.kind {
+        MsgKind::Nil => [..out, 0xC0 to byte]
+        MsgKind::Bool => [..out, (if v.flag { 0xC3 } else { 0xC2 }) to byte]
+        MsgKind::Uint => encode_uint(out, v.uint_val)
+        MsgKind::Int => encode_int(out, v.int_val)
+        MsgKind::Float => append_be([..out, 0xCB to byte], f64_bits(v.real), 8)
+        MsgKind::Str => encode_str(out, v.text)
+        MsgKind::Bin => encode_bin(out, v.bytes)
+        MsgKind::Array => encode_array(out, v.items)
+        MsgKind::Map => encode_map(out, v.keys, v.vals)
+        MsgKind::Ext => encode_ext(out, v)
+    }
+}
+
+/**
+ * Encodes a complete `MsgValue` to a fresh byte slice using the shortest format throughout.
+ */
+exp fn encode(v: MsgValue): []byte {
+    encode_value(no_bytes(), v)
+}
+
+fn read_error(what: str, pos: u64): error {
+    error { message = concat("msgpack: ", what, " at offset ", i64_to_str(pos to i64)) }
+}
+
+fn read_be_u(p: []byte, pos: u64, count: u64): u64 {
+    var v: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= count { break }
+        v = (v << 8) | (p[pos + i] to u64)
+        i++
+    }
+    v
+}
+
+fn read_be_signed(p: []byte, pos: u64, count: u64): i64 {
+    var u = read_be_u(p, pos, count)
+    var bits = count * 8
+    if ((u >> (bits - 1)) & 1) == 1 { return (u to i64) - ((1 to i64) << bits) }
+    u to i64
+}
+
+fn read_be_i64(p: []byte, pos: u64): i64 {
+    var high = read_be_signed(p, pos, 4)
+    var low = read_be_u(p, pos + 4, 4) to i64
+    high * 4294967296 + low
+}
+
+fn single_to_f64(s: u64): f64 {
+    var sign = (s >> 31) & 0x1
+    var ebits = (s >> 23) & 0xFF
+    var mant = s & 0x7FFFFF
+    if ebits == 0 {
+        if mant == 0 { return f64_from_bits(sign << 63) }
+        return subnormal_single(sign, mant)
+    }
+    if ebits == 0xFF { return f64_from_bits((sign << 63) | 0x7FF0000000000000 | (if mant != 0 { (0x8000000000000 | (mant << 29)) } else { 0 })) }
+    var exp64 = (ebits + 1023 - 127)
+    f64_from_bits((sign << 63) | (exp64 << 52) | (mant << 29))
+}
+
+fn subnormal_single(sign: u64, mant: u64): f64 {
+    var mag = (mant to f64) * f64_from_bits(((1023 - 149) to u64) << 52)
+    if sign == 1 { return -mag }
+    mag
+}
+
+fn take_bytes(p: []byte, pos: u64, n: u64): []byte | error {
+    if pos + n > p.len { return read_error("truncated value", pos) }
+    var out: []byte = no_bytes()
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = [..out, p[pos + i]]
+        i++
+    }
+    out
+}
+
+fn read_str(p: []byte, pos: u64, len: u64): MsgRead | error {
+    var raw = match take_bytes(p, pos, len) { []byte as b => b; error as e => return e }
+    MsgRead { value = msg_str(str_of_bytes(raw)); pos = pos + len }
+}
+
+fn read_bin(p: []byte, pos: u64, len: u64): MsgRead | error {
+    var raw = match take_bytes(p, pos, len) { []byte as b => b; error as e => return e }
+    MsgRead { value = msg_bin(raw); pos = pos + len }
+}
+
+fn read_array(p: []byte, pos: u64, n: u64): MsgRead | error {
+    var items: []MsgValue = no_vals()
+    var at = pos
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        var el = match decode_at(p, at) { MsgRead as r => r; error as e => return e }
+        items = [..items, el.value]
+        at = el.pos
+        i++
+    }
+    MsgRead { value = msg_array(items); pos = at }
+}
+
+fn read_map(p: []byte, pos: u64, n: u64): MsgRead | error {
+    var keys: []MsgValue = no_vals()
+    var vals: []MsgValue = no_vals()
+    var at = pos
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        var k = match decode_at(p, at) { MsgRead as r => r; error as e => return e }
+        var v = match decode_at(p, k.pos) { MsgRead as r => r; error as e => return e }
+        keys = [..keys, k.value]
+        vals = [..vals, v.value]
+        at = v.pos
+        i++
+    }
+    MsgRead { value = msg_map(keys, vals); pos = at }
+}
+
+fn read_ext(p: []byte, pos: u64, len: u64): MsgRead | error {
+    if pos + 1 > p.len { return read_error("truncated extension type", pos) }
+    var ext_type = read_be_signed(p, pos, 1)
+    var data = match take_bytes(p, pos + 1, len) { []byte as b => b; error as e => return e }
+    MsgRead { value = msg_ext(ext_type, data); pos = pos + 1 + len }
+}
+
+fn need(p: []byte, pos: u64, count: u64): error | null {
+    if pos + count > p.len { return read_error("truncated value", pos) }
+    null
+}
+
+fn decode_at(p: []byte, pos: u64): MsgRead | error {
+    if pos >= p.len { return read_error("unexpected end of input", pos) }
+    var b = p[pos] to u64
+    if b < 0x80 { return MsgRead { value = msg_uint(b); pos = pos + 1 } }
+    if b >= 0xE0 { return MsgRead { value = mk_int((b to i64) - 256); pos = pos + 1 } }
+    if b >= 0xA0 && b <= 0xBF { return read_str(p, pos + 1, b & 0x1F) }
+    if b >= 0x90 && b <= 0x9F { return read_array(p, pos + 1, b & 0x0F) }
+    if b >= 0x80 && b <= 0x8F { return read_map(p, pos + 1, b & 0x0F) }
+    decode_prefixed(p, pos, b)
+}
+
+fn decode_prefixed(p: []byte, pos: u64, b: u64): MsgRead | error {
+    if b == 0xC0 { return MsgRead { value = msg_nil(); pos = pos + 1 } }
+    if b == 0xC2 { return MsgRead { value = msg_bool(false); pos = pos + 1 } }
+    if b == 0xC3 { return MsgRead { value = msg_bool(true); pos = pos + 1 } }
+    if b == 0xCA { return decode_float32(p, pos) }
+    if b == 0xCB { return decode_float64(p, pos) }
+    var scalar = decode_scalar(p, pos, b)
+    match scalar {
+        MsgRead as r => return r
+        error as e => return e
+        null => null
+    }
+    decode_container(p, pos, b)
+}
+
+fn decode_scalar(p: []byte, pos: u64, b: u64): MsgRead | error | null {
+    if b == 0xCC || b == 0xCD || b == 0xCE || b == 0xCF {
+        match decode_uint(p, pos, b) { MsgRead as r => return r; error as e => return e }
+    }
+    if b == 0xD0 || b == 0xD1 || b == 0xD2 || b == 0xD3 {
+        match decode_sint(p, pos, b) { MsgRead as r => return r; error as e => return e }
+    }
+    null
+}
+
+fn decode_uint(p: []byte, pos: u64, b: u64): MsgRead | error {
+    var n = (1 to u64) << (b - 0xCC)
+    match need(p, pos + 1, n) { error as e => return e; null => null }
+    MsgRead { value = msg_uint(read_be_u(p, pos + 1, n)); pos = pos + 1 + n }
+}
+
+fn decode_sint(p: []byte, pos: u64, b: u64): MsgRead | error {
+    var n = (1 to u64) << (b - 0xD0)
+    match need(p, pos + 1, n) { error as e => return e; null => null }
+    if n == 8 { return MsgRead { value = mk_int(read_be_i64(p, pos + 1)); pos = pos + 9 } }
+    MsgRead { value = mk_int(read_be_signed(p, pos + 1, n)); pos = pos + 1 + n }
+}
+
+fn decode_container(p: []byte, pos: u64, b: u64): MsgRead | error {
+    if b == 0xC4 || b == 0xC5 || b == 0xC6 { return decode_length_then(p, pos, b, 0xC4, false) }
+    if b == 0xD9 || b == 0xDA || b == 0xDB { return decode_length_then(p, pos, b, 0xD9, true) }
+    if b == 0xDC { return decode_wide_array_map(p, pos, 2, true) }
+    if b == 0xDD { return decode_wide_array_map(p, pos, 4, true) }
+    if b == 0xDE { return decode_wide_array_map(p, pos, 2, false) }
+    if b == 0xDF { return decode_wide_array_map(p, pos, 4, false) }
+    if b >= 0xD4 && b <= 0xD8 { return read_ext(p, pos + 1, fixext_len(b)) }
+    if b == 0xC7 || b == 0xC8 || b == 0xC9 { return decode_ext_prefixed(p, pos, b) }
+    read_error("reserved or unknown format byte", pos)
+}
+
+fn fixext_len(b: u64): u64 {
+    (1 to u64) << (b - 0xD4)
+}
+
+fn decode_length_then(p: []byte, pos: u64, b: u64, base_byte: u64, is_str: bool): MsgRead | error {
+    var width = (1 to u64) << (b - base_byte)
+    match need(p, pos + 1, width) { error as e => return e; null => null }
+    var len = read_be_u(p, pos + 1, width)
+    if is_str { return read_str(p, pos + 1 + width, len) }
+    read_bin(p, pos + 1 + width, len)
+}
+
+fn decode_wide_array_map(p: []byte, pos: u64, width: u64, is_array: bool): MsgRead | error {
+    match need(p, pos + 1, width) { error as e => return e; null => null }
+    var n = read_be_u(p, pos + 1, width)
+    if is_array { return read_array(p, pos + 1 + width, n) }
+    read_map(p, pos + 1 + width, n)
+}
+
+fn decode_ext_prefixed(p: []byte, pos: u64, b: u64): MsgRead | error {
+    var width = (1 to u64) << (b - 0xC7)
+    match need(p, pos + 1, width) { error as e => return e; null => null }
+    var len = read_be_u(p, pos + 1, width)
+    read_ext(p, pos + 1 + width, len)
+}
+
+fn decode_float32(p: []byte, pos: u64): MsgRead | error {
+    match need(p, pos + 1, 4) { error as e => return e; null => null }
+    MsgRead { value = msg_float(single_to_f64(read_be_u(p, pos + 1, 4))); pos = pos + 5 }
+}
+
+fn decode_float64(p: []byte, pos: u64): MsgRead | error {
+    match need(p, pos + 1, 8) { error as e => return e; null => null }
+    MsgRead { value = msg_float(f64_from_bits(read_be_u(p, pos + 1, 8))); pos = pos + 9 }
+}
+
+/**
+ * Decodes a complete MessagePack document: exactly one top-level value, with any trailing bytes
+ * reported as a checked error.
+ */
+exp fn decode(p: []byte): MsgValue | error {
+    var r = match decode_at(p, 0) { MsgRead as x => x; error as e => return e }
+    if r.pos != p.len { return read_error("trailing bytes after top-level value", r.pos) }
+    r.value
+}
+
+/**
+ * Structurally compares two `MsgValue` trees for equality, recursing through arrays and maps (in
+ * slice order). Floats compare by `f64` bit pattern (the round-trip identity relation); `Int` and
+ * `Uint` are distinct kinds and never compare equal even at the same numeric magnitude.
+ */
+exp fn msg_equal(a: MsgValue, b: MsgValue): bool {
+    if a.kind != b.kind { return false }
+    match a.kind {
+        MsgKind::Nil => true
+        MsgKind::Bool => a.flag == b.flag
+        MsgKind::Uint => a.uint_val == b.uint_val
+        MsgKind::Int => a.int_val == b.int_val
+        MsgKind::Float => f64_bits(a.real) == f64_bits(b.real)
+        MsgKind::Str => bytes_equal(a.text.bytes(), b.text.bytes())
+        MsgKind::Bin => bytes_equal(a.bytes, b.bytes)
+        MsgKind::Ext => a.int_val == b.int_val && bytes_equal(a.bytes, b.bytes)
+        MsgKind::Array => vals_equal(a.items, b.items)
+        MsgKind::Map => vals_equal(a.keys, b.keys) && vals_equal(a.vals, b.vals)
+    }
+}
+
+fn bytes_equal(a: []byte, b: []byte): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+fn vals_equal(a: []MsgValue, b: []MsgValue): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if !msg_equal(a[i], b[i]) { return false }
+        i++
+    }
+    true
+}

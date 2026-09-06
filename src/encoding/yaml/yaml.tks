@@ -1,0 +1,265 @@
+/**
+ * The kind discriminant of a `YamlValue`: which YAML core-schema value shape it holds. `Str` covers
+ * every YAML string form (plain, single-/double-quoted, literal/folded block — all normalize to the
+ * same decoded `text`); `Seq` holds `items` (in source order); `Map` holds the parallel `keys`/
+ * `vals` slices (source order preserved).
+ */
+exp type YamlKind = enum {
+    Null; Bool; Int; Float; Str; Seq; Map
+}
+
+/**
+ * One YAML value as a tagged struct spanning every `YamlKind`: `kind` selects which fields below
+ * carry meaning.
+ */
+exp type YamlValue = struct {
+    /**
+     * Which YAML value shape this is; selects which of the fields below are meaningful.
+     */
+    kind: YamlKind
+    /**
+     * The decoded text for `Str`. Empty otherwise.
+     */
+    text: str
+    /**
+     * The value for `Int`. Zero otherwise.
+     */
+    int_val: i64
+    /**
+     * The value for `Float`. Zero otherwise.
+     */
+    float_val: f64
+    /**
+     * The value for `Bool`. `false` otherwise.
+     */
+    bool_val: bool
+    /**
+     * The elements, in source order, for `Seq`. Empty otherwise.
+     */
+    items: []YamlValue
+    /**
+     * The keys, in source order, for `Map`. Empty otherwise.
+     */
+    keys: []str
+    /**
+     * The values for `Map`, parallel to `keys`. Empty otherwise.
+     */
+    vals: []YamlValue
+}
+
+fn no_items(): []YamlValue {
+    []
+}
+
+fn no_keys(): []str {
+    []
+}
+
+fn mk_value(kind: YamlKind, text: str, int_val: i64, float_val: f64, bool_val: bool, items: []YamlValue, keys: []str, vals: []YamlValue): YamlValue {
+    YamlValue { kind = kind; text = text; int_val = int_val; float_val = float_val; bool_val = bool_val; items = items; keys = keys; vals = vals }
+}
+
+fn append_all(out: []byte, more: []byte): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= more.len { break }
+        acc = [..acc, more[i]]
+        i++
+    }
+    acc
+}
+
+/**
+ * The YAML `null` value (from `~`, `null`, an empty scalar, or a programmatically built document).
+ */
+exp fn yaml_null(): YamlValue {
+    mk_value(YamlKind::Null, "", 0, 0.0, false, no_items(), no_keys(), no_items())
+}
+
+/**
+ * Wraps a boolean as a `YamlValue`.
+ */
+exp fn yaml_bool(v: bool): YamlValue {
+    mk_value(YamlKind::Bool, "", 0, 0.0, v, no_items(), no_keys(), no_items())
+}
+
+/**
+ * Wraps a signed 64-bit integer as a `YamlValue`.
+ */
+exp fn yaml_int(v: i64): YamlValue {
+    mk_value(YamlKind::Int, "", v, 0.0, false, no_items(), no_keys(), no_items())
+}
+
+/**
+ * Wraps a floating-point number as a `YamlValue`.
+ */
+exp fn yaml_float(v: f64): YamlValue {
+    mk_value(YamlKind::Float, "", 0, v, false, no_items(), no_keys(), no_items())
+}
+
+/**
+ * Wraps decoded text as a `YamlValue` string (every YAML string form — plain, quoted, block —
+ * decodes to this one kind).
+ */
+exp fn yaml_string(s: str): YamlValue {
+    mk_value(YamlKind::Str, s, 0, 0.0, false, no_items(), no_keys(), no_items())
+}
+
+/**
+ * Wraps a sequence of values as a YAML sequence, in the given order.
+ */
+exp fn yaml_seq(items: []YamlValue): YamlValue {
+    mk_value(YamlKind::Seq, "", 0, 0.0, false, items, no_keys(), no_items())
+}
+
+/**
+ * A fresh, empty YAML mapping — the starting point for building a document programmatically (grow
+ * it with `yaml_map_set`), and the shape every mapping node the parser builds starts from.
+ */
+exp fn yaml_map_empty(): YamlValue {
+    mk_value(YamlKind::Map, "", 0, 0.0, false, no_items(), no_keys(), no_items())
+}
+
+/**
+ * Returns a new mapping equal to `map` with `key` set to `value`: replacing the existing entry in
+ * place (preserving its position) when `key` is already present, else appending a new entry at the
+ * end. This is the ONLY way to grow a `Map` value (no index-assignment, per house style).
+ */
+exp fn yaml_map_set(map: YamlValue, key: str, value: YamlValue): YamlValue {
+    if map.kind != YamlKind::Map { return map }
+    var new_keys: []str = no_keys()
+    var new_vals: []YamlValue = no_items()
+    var replaced = false
+    var i: u64 = 0
+    loop {
+        if i >= map.keys.len { break }
+        new_keys = [..new_keys, map.keys[i]]
+        if map.keys[i] == key {
+            new_vals = [..new_vals, value]
+            replaced = true
+        } else {
+            new_vals = [..new_vals, map.vals[i]]
+        }
+        i++
+    }
+    if !replaced {
+        new_keys = [..new_keys, key]
+        new_vals = [..new_vals, value]
+    }
+    mk_value(YamlKind::Map, map.text, map.int_val, map.float_val, map.bool_val, map.items, new_keys, new_vals)
+}
+
+/**
+ * Looks up `key` in `map`'s direct entries (one level — nested lookups walk `yaml_get` segment by
+ * segment).
+ */
+exp fn yaml_get(map: YamlValue, key: str): YamlValue | null {
+    if map.kind != YamlKind::Map { return null }
+    var i: u64 = 0
+    loop {
+        if i >= map.keys.len { break }
+        if map.keys[i] == key { return map.vals[i] }
+        i++
+    }
+    null
+}
+
+/**
+ * Looks up element `i` of `seq` (bounds-checked).
+ */
+exp fn yaml_index(seq: YamlValue, i: u64): YamlValue | null {
+    if seq.kind != YamlKind::Seq { return null }
+    if i >= seq.items.len { return null }
+    seq.items[i]
+}
+
+/**
+ * Reads `v` as a string, requiring `kind == Str` (a strict, honest-types accessor — see the module
+ * doc's ERROR MODEL note; a caller wanting looser coercion inspects `v.kind` directly).
+ */
+exp fn yaml_to_str(v: YamlValue): str | error {
+    if v.kind != YamlKind::Str { return yaml_type_error("string", v.kind) }
+    v.text
+}
+
+/**
+ * Reads `v` as a signed 64-bit integer, requiring `kind == Int`.
+ */
+exp fn yaml_to_int(v: YamlValue): i64 | error {
+    if v.kind != YamlKind::Int { return yaml_type_error("int", v.kind) }
+    v.int_val
+}
+
+/**
+ * Reads `v` as a 64-bit float, requiring `kind == Float`.
+ */
+exp fn yaml_to_float(v: YamlValue): f64 | error {
+    if v.kind != YamlKind::Float { return yaml_type_error("float", v.kind) }
+    v.float_val
+}
+
+/**
+ * Reads `v` as a boolean, requiring `kind == Bool`.
+ */
+exp fn yaml_to_bool(v: YamlValue): bool | error {
+    if v.kind != YamlKind::Bool { return yaml_type_error("bool", v.kind) }
+    v.bool_val
+}
+
+fn yaml_type_error(wanted: str, got: YamlKind): error {
+    error { message = concat("yaml: value is not a ", wanted, " (kind ", yaml_kind_name(got), ")") }
+}
+
+fn yaml_kind_name(k: YamlKind): str {
+    match k {
+        YamlKind::Null => "null"
+        YamlKind::Bool => "bool"
+        YamlKind::Int => "int"
+        YamlKind::Float => "float"
+        YamlKind::Str => "string"
+        YamlKind::Seq => "sequence"
+        YamlKind::Map => "mapping"
+    }
+}
+
+/**
+ * Structurally compares two `YamlValue` trees for equality, recursing through sequences and
+ * mappings (in slice order — two mappings with the same entries in a different order are NOT
+ * equal, matching `teko::encoding::toml::toml_equal`'s slice-order convention). Floats compare by
+ * `f64` bit pattern (so `NaN` equals `NaN`, and `-0.0` differs from `0.0`).
+ */
+exp fn yaml_equal(a: YamlValue, b: YamlValue): bool {
+    if a.kind != b.kind { return false }
+    match a.kind {
+        YamlKind::Null => true
+        YamlKind::Bool => a.bool_val == b.bool_val
+        YamlKind::Int => a.int_val == b.int_val
+        YamlKind::Float => f64_bits(a.float_val) == f64_bits(b.float_val)
+        YamlKind::Str => a.text == b.text
+        YamlKind::Seq => items_equal(a.items, b.items)
+        YamlKind::Map => keys_equal(a.keys, b.keys) && items_equal(a.vals, b.vals)
+    }
+}
+
+fn items_equal(a: []YamlValue, b: []YamlValue): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if !yaml_equal(a[i], b[i]) { return false }
+        i++
+    }
+    true
+}
+
+fn keys_equal(a: []str, b: []str): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}

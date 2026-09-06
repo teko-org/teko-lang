@@ -1,0 +1,635 @@
+const BYTE_MASK: u64 = 0xFF
+
+const LEB_LOW7: u64 = 0x7F
+
+const LEB_MORE: u64 = 0x80
+
+const SLEB_SIGN: i64 = 0x40
+
+const SLEB_LOW7: i64 = 0x7F
+
+const SLEB_MORE: i64 = 0x80
+
+fn emit_byte(v: u64): byte {
+    (v & BYTE_MASK) to byte
+}
+
+fn emit_u16_le(v: u64): []byte {
+    var b0 = emit_byte(v)
+    var b1 = emit_byte(v >> 8)
+    [b0, b1]
+}
+
+fn emit_u32_le_dw(v: u64): []byte {
+    var b0 = emit_byte(v)
+    var b1 = emit_byte(v >> 8)
+    var b2 = emit_byte(v >> 16)
+    var b3 = emit_byte(v >> 24)
+    [b0, b1, b2, b3]
+}
+
+fn emit_u64_le_dw(v: u64): []byte {
+    var b0 = emit_byte(v)
+    var b1 = emit_byte(v >> 8)
+    var b2 = emit_byte(v >> 16)
+    var b3 = emit_byte(v >> 24)
+    var b4 = emit_byte(v >> 32)
+    var b5 = emit_byte(v >> 40)
+    var b6 = emit_byte(v >> 48)
+    var b7 = emit_byte(v >> 56)
+    [b0, b1, b2, b3, b4, b5, b6, b7]
+}
+
+fn emit_addr_slot(): []byte {
+    emit_u64_le_dw(0 to u64)
+}
+
+fn emit_cstr(s: str): []byte {
+    var b = s.bytes()
+    if b[b.len - 1] == 0 {
+        return b
+    }
+
+    [..b, 0 to byte]
+}
+
+pub fn uleb128(v: u64): []byte {
+    var b: []byte = []
+    var val = v
+
+    loop {
+        var group = val & LEB_LOW7
+        val = val >> 7
+        if val != 0 {
+            b = [..b, (group | LEB_MORE) to byte]
+        } else {
+            b = [..b, group to byte]
+            break
+        }
+    }
+    b
+}
+
+pub fn sleb128(v: i64): []byte {
+    var b: []byte = []
+    var val = v
+    loop {
+        var group = val & SLEB_LOW7
+        val = val >> 7
+        var sign_set = (group & SLEB_SIGN) != 0
+        var done = (val == 0 && !sign_set) || (val == -1 && sign_set)
+        if done {
+            b = [..b, group to byte]
+            break
+        }
+        b = [..b, (group | SLEB_MORE) to byte]
+    }
+    b
+}
+
+pub type DwReloc = struct {
+    offset: u64
+    symbol: str
+}
+
+pub type DwSection = struct {
+    bytes: []byte
+    relocs: []DwReloc
+}
+
+pub type DwSubprogram = struct {
+    name: str
+    decl_file: i64
+    decl_line: u32
+    symbol: str
+    code_size: u64
+}
+
+pub type DwCompileUnit = struct {
+    producer: str
+    language: u32
+    name: str
+    comp_dir: str
+    text_symbol: str
+    text_size: u64
+    subprograms: []DwSubprogram
+}
+
+pub type DwLineRow = struct {
+    pc_advance: u64
+    line: u32
+    file: i64
+}
+
+const DW_TAG_COMPILE_UNIT: u64 = 0x11
+
+const DW_TAG_SUBPROGRAM: u64 = 0x2e
+
+const DW_TAG_BASE_TYPE: u64 = 0x24
+
+const DW_TAG_FORMAL_PARAMETER: u64 = 0x05
+
+const DW_TAG_VARIABLE: u64 = 0x34
+
+const DW_TAG_LEXICAL_BLOCK: u64 = 0x0b
+
+const DW_OP_FBREG: u64 = 0x91
+
+const ABBREV_FORMAL_PARAMETER: u64 = 4
+
+const ABBREV_VARIABLE: u64 = 5
+
+pub const DW_ATE_BOOLEAN: u64 = 0x02
+
+pub const DW_ATE_SIGNED: u64 = 0x05
+
+pub const DW_ATE_UNSIGNED: u64 = 0x07
+
+pub const DW_ATE_FLOAT: u64 = 0x04
+
+pub const DW_OP_REG6_RBP_PLACEHOLDER: u64 = 0x56
+
+pub fn debug_abbrev(): []byte {
+    [
+        ..uleb128(1 to u64),
+        ..uleb128(DW_TAG_COMPILE_UNIT),
+        0x01,
+        0x25, 0x08,
+        0x13, 0x05,
+        0x03, 0x08,
+        0x1b, 0x08,
+        0x11, 0x01,
+        0x12, 0x07,
+        0x10, 0x17,
+        0x00, 0x00,
+        ..uleb128(2 to u64),
+        ..uleb128(DW_TAG_SUBPROGRAM),
+        0x00,
+        0x03, 0x08,
+        0x3a, 0x0d,
+        0x3b, 0x05,
+        0x11, 0x01,
+        0x12, 0x07,
+        0x3f, 0x19,
+        0x00, 0x00,
+        0x00,
+    ]
+}
+
+fn emit_subprogram_die(body: []byte, relocs: []DwReloc, base_off: u64, sub: DwSubprogram): DwSection {
+    var b: []byte = [
+        ..body,
+        0x02 to byte,
+        ..emit_cstr(sub.name),
+        ..sleb128(sub.decl_file),
+        ..emit_u16_le(sub.decl_line to u64),
+        ..emit_addr_slot(),
+        ..emit_u64_le_dw(sub.code_size),
+    ]
+    var low_pc_off = base_off + b.len
+    var r = DwReloc { offset = low_pc_off; symbol = sub.symbol }
+    DwSection { bytes = b; relocs = [..relocs, r] }
+}
+
+pub fn debug_info(cu: DwCompileUnit): DwSection {
+    var body: []byte = [
+        0x01,
+        ..emit_cstr(cu.producer),
+        ..emit_u16_le(cu.language to u64),
+        ..emit_cstr(cu.name),
+        ..emit_cstr(cu.comp_dir),
+    ]
+    var cu_low_pc_off = HEADER_LEN_PREFIX + body.len
+    var relocs: []DwReloc = [DwReloc { offset = cu_low_pc_off; symbol = cu.text_symbol }]
+    body = [
+        ..body,
+        ..emit_addr_slot(),
+        ..emit_u64_le_dw(cu.text_size),
+        ..emit_u32_le_dw(0 to u64)
+    ]
+    var i: u64 = 0
+    loop {
+        if i >= cu.subprograms.len { break }
+        var child = emit_subprogram_die(body, relocs, HEADER_LEN_PREFIX, cu.subprograms[i])
+        body = child.bytes
+        relocs = child.relocs
+        i = i + 1
+    }
+    body = [..body, 0x00]
+    var unit_length = body.len + 2 + 4 + 1
+    var out: []byte = [
+        ..emit_u32_le_dw(unit_length),
+        ..emit_u16_le(4 to u64),
+        ..emit_u32_le_dw(0 to u64),
+        0x08,
+        ..body
+    ]
+    
+    DwSection { bytes = out; relocs = relocs }
+}
+
+const HEADER_LEN_PREFIX: u64 = 11
+
+fn line_header_body(files: []str): []byte {
+    [
+        0x01,
+        0x01,
+        0x01,
+        0xfb,
+        0x0e,
+        0x0d,
+        ..APPEND_STD_OPCODE_LENGTHS,
+        0x00,
+        ..append_file_entries(files),
+        0x00
+    ]
+}
+
+fn append_file_entries(files: []str): []byte {
+    var b: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        b = [
+            ..b,
+            ..emit_cstr(files[i]),
+            ..uleb128(0 to u64),
+            ..uleb128(0 to u64),
+            ..uleb128(0 to u64),
+        ]
+        i = i + 1
+    }
+    b
+}
+
+const APPEND_STD_OPCODE_LENGTHS: []byte = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]
+
+const DW_LNS_COPY: u64 = 0x01
+
+const DW_LNS_ADVANCE_PC: u64 = 0x02
+
+const DW_LNS_ADVANCE_LINE: u64 = 0x03
+
+const DW_LNS_SET_FILE: u64 = 0x04
+
+const DW_LNS_SET_COLUMN: u64 = 0x05
+
+const LINE_FIRST_FILE: i64 = 1
+
+fn emit_line_row(row: DwLineRow, prev: u32, cur_file: i64, first: bool): []byte {
+    var b: []byte = []
+    if !first {
+        b = [..b, DW_LNS_ADVANCE_PC to byte, ..uleb128(row.pc_advance)]
+    }
+    if row.file != cur_file {
+        b = [..b, DW_LNS_SET_FILE to byte, ..uleb128(row.file to u64)]
+    }
+    b = [..b, DW_LNS_ADVANCE_LINE to byte, ..sleb128((row.line to i64) - (prev to i64))]
+    if first {
+        b = [..b, DW_LNS_SET_COLUMN to byte, ..uleb128(1 to u64)]
+    }
+    [..b, DW_LNS_COPY to byte]
+}
+
+pub fn debug_line(files: []str, start_symbol: str, rows: []DwLineRow, final_pc_advance: u64): DwSection {
+    var header = line_header_body(files)
+    var set_addr_slot = LINE_PREFIX_LEN + header.len + 3
+    var prog: []byte = [0x00, 0x09, 0x02, ..emit_addr_slot()]
+    var prev: u32 = 1
+    var cur_file: i64 = LINE_FIRST_FILE
+    var i: u64 = 0
+    loop {
+        if i >= rows.len { break }
+        prog = [..prog, ..emit_line_row(rows[i], prev, cur_file, i == 0)]
+        prev = rows[i].line
+        cur_file = rows[i].file
+        i = i + 1
+    }
+    prog = [
+        ..prog,
+        DW_LNS_ADVANCE_PC to byte,
+        ..uleb128(final_pc_advance),
+        0x00,
+        0x01,
+        0x01
+    ]
+    var header_length = header.len
+    var unit_length = header.len + prog.len + 2 + 4
+    var out: []byte = [
+        ..emit_u32_le_dw(unit_length),
+        ..emit_u16_le(4 to u64),
+        ..emit_u32_le_dw(header_length),
+        ..header,
+        ..prog
+    ]
+    var relocs = [DwReloc { offset = set_addr_slot; symbol = start_symbol }]
+    DwSection { bytes = out; relocs = relocs }
+}
+
+const LINE_PREFIX_LEN: u64 = 10
+
+pub type DwarfSink = struct {
+    present: bool
+    abbrev: []byte
+    info: DwSection
+    line: DwSection
+}
+
+fn empty_dw_section(): DwSection {
+    DwSection { bytes = []; relocs = [] }
+}
+
+pub fn no_dwarf_sink(): DwarfSink {
+    DwarfSink { present = false; abbrev = []; info = empty_dw_section(); line = empty_dw_section() }
+}
+
+pub fn build_dwarf_sink(cu: DwCompileUnit, files: []str, rows: []DwLineRow, final_pc_advance: u64): DwarfSink {
+    DwarfSink {
+        present = true
+        abbrev = debug_abbrev()
+        info = debug_info(cu)
+        line = debug_line(files, cu.text_symbol, rows, final_pc_advance)
+    }
+}
+
+pub type DwBaseType = struct {
+    name: str
+    byte_size: u64
+    encoding: u64
+}
+
+pub type DwBaseTypeLookup = struct {
+    found: bool
+    base_type: DwBaseType
+}
+
+fn dw_bt_found(name: str, byte_size: u64, encoding: u64): DwBaseTypeLookup {
+    DwBaseTypeLookup { found = true; base_type = DwBaseType { name = name; byte_size = byte_size; encoding = encoding } }
+}
+
+fn dw_bt_not_found(): DwBaseTypeLookup {
+    DwBaseTypeLookup { found = false; base_type = DwBaseType { name = ""; byte_size = 0 to u64; encoding = 0 to u64 } }
+}
+
+pub fn frozen_base_type(name: str): DwBaseTypeLookup {
+    if name == "bool" { return dw_bt_found(name, 1 to u64, DW_ATE_BOOLEAN) }
+    if name == "byte" { return dw_bt_found(name, 1 to u64, DW_ATE_UNSIGNED) }
+    if name == "u8" { return dw_bt_found(name, 1 to u64, DW_ATE_UNSIGNED) }
+    if name == "u16" { return dw_bt_found(name, 2 to u64, DW_ATE_UNSIGNED) }
+    if name == "u32" { return dw_bt_found(name, 4 to u64, DW_ATE_UNSIGNED) }
+    if name == "u64" { return dw_bt_found(name, 8 to u64, DW_ATE_UNSIGNED) }
+    if name == "i8" { return dw_bt_found(name, 1 to u64, DW_ATE_SIGNED) }
+    if name == "i16" { return dw_bt_found(name, 2 to u64, DW_ATE_SIGNED) }
+    if name == "i32" { return dw_bt_found(name, 4 to u64, DW_ATE_SIGNED) }
+    if name == "i64" { return dw_bt_found(name, 8 to u64, DW_ATE_SIGNED) }
+    if name == "f32" { return dw_bt_found(name, 4 to u64, DW_ATE_FLOAT) }
+    if name == "f64" { return dw_bt_found(name, 8 to u64, DW_ATE_FLOAT) }
+    if name == "usize" { return dw_bt_found(name, 8 to u64, DW_ATE_UNSIGNED) }
+    if name == "isize" { return dw_bt_found(name, 8 to u64, DW_ATE_SIGNED) }
+    dw_bt_not_found()
+}
+
+pub type DwLocal = struct {
+    name: str
+    is_param: bool
+    type_index: u64
+    fbreg_offset: i64
+}
+
+pub type DwScope = struct {
+    locals: []DwLocal
+}
+
+pub type DwSubprogramLocals = struct {
+    name: str
+    decl_file: i64
+    decl_line: u32
+    symbol: str
+    code_size: u64
+    frame_base_op: u64
+    params: []DwLocal
+    locals: []DwLocal
+    blocks: []DwScope
+}
+
+pub type DwLocalsUnit = struct {
+    producer: str
+    language: u32
+    name: str
+    comp_dir: str
+    text_symbol: str
+    text_size: u64
+    base_types: []DwBaseType
+    subprograms: []DwSubprogramLocals
+}
+
+pub type DwLocalsInfo = struct {
+    section: DwSection
+    base_type_offsets: []u64
+}
+
+pub fn debug_abbrev_locals(): []byte {
+    [
+        ..emit_abbrev_compile_unit(),
+        ..emit_abbrev_base_type(),
+        ..emit_abbrev_subprogram_locals(),
+        ..emit_abbrev_leaf_local(ABBREV_FORMAL_PARAMETER, DW_TAG_FORMAL_PARAMETER),
+        ..emit_abbrev_leaf_local(ABBREV_VARIABLE, DW_TAG_VARIABLE),
+        ..emit_abbrev_lexical_block(),
+        0x00,
+    ]
+}
+
+fn emit_abbrev_compile_unit(): []byte {
+    [
+        ..uleb128(1 to u64),
+        ..uleb128(DW_TAG_COMPILE_UNIT),
+        0x01,
+        0x25, 0x08,
+        0x13, 0x05,
+        0x03, 0x08,
+        0x1b, 0x08,
+        0x11, 0x01,
+        0x12, 0x07,
+        0x10, 0x17,
+        0x00, 0x00,
+    ]
+}
+
+fn emit_abbrev_base_type(): []byte {
+    [
+        ..uleb128(2 to u64),
+        ..uleb128(DW_TAG_BASE_TYPE),
+        0x00,
+        0x03, 0x08,
+        0x3e, 0x0b,
+        0x0b, 0x0b,
+        0x00, 0x00,
+    ]
+}
+
+fn emit_abbrev_subprogram_locals(): []byte {
+    [
+        ..uleb128(3 to u64),
+        ..uleb128(DW_TAG_SUBPROGRAM),
+        0x01,
+        0x03, 0x08,
+        0x3a, 0x0d,
+        0x3b, 0x05,
+        0x11, 0x01,
+        0x12, 0x07,
+        0x40, 0x18,
+        0x3f, 0x19,
+        0x00, 0x00,
+    ]
+}
+
+fn emit_abbrev_leaf_local(code: u64, tag: u64): []byte {
+    [
+        ..uleb128(code),
+        ..uleb128(tag),
+        0x00,
+        0x03, 0x08,
+        0x49, 0x13,
+        0x02, 0x18,
+        0x00, 0x00,
+    ]
+}
+
+fn emit_abbrev_lexical_block(): []byte {
+    [
+        ..uleb128(6 to u64),
+        ..uleb128(DW_TAG_LEXICAL_BLOCK),
+        0x01,
+        0x00, 0x00,
+    ]
+}
+
+pub fn debug_info_locals(cu: DwLocalsUnit): DwLocalsInfo {
+    var body: []byte = [
+        0x01,
+        ..emit_cstr(cu.producer),
+        ..emit_u16_le(cu.language to u64),
+        ..emit_cstr(cu.name),
+        ..emit_cstr(cu.comp_dir),
+    ]
+    var cu_low_pc_off = HEADER_LEN_PREFIX + body.len
+    var relocs: []DwReloc = [DwReloc { offset = cu_low_pc_off; symbol = cu.text_symbol }]
+    body = [
+        ..body,
+        ..emit_addr_slot(),
+        ..emit_u64_le_dw(cu.text_size),
+        ..emit_u32_le_dw(0 to u64),
+    ]
+    var base_type_offsets: []u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= cu.base_types.len { break }
+        base_type_offsets = [..base_type_offsets, HEADER_LEN_PREFIX + body.len]
+        body = [..body, ..emit_base_type_die(cu.base_types[i])]
+        i = i + 1
+    }
+    i = 0
+    loop {
+        if i >= cu.subprograms.len { break }
+        var child = emit_locals_subprogram(body, relocs, cu.subprograms[i], base_type_offsets)
+        body = child.bytes
+        relocs = child.relocs
+        i = i + 1
+    }
+    body = [..body, 0x00]
+    var unit_length = body.len + 2 + 4 + 1
+    var out: []byte = [
+        ..emit_u32_le_dw(unit_length),
+        ..emit_u16_le(4 to u64),
+        ..emit_u32_le_dw(0 to u64),
+        0x08,
+        ..body,
+    ]
+    DwLocalsInfo { section = DwSection { bytes = out; relocs = relocs }; base_type_offsets = base_type_offsets }
+}
+
+fn emit_base_type_die(bt: DwBaseType): []byte {
+    [
+        0x02,
+        ..emit_cstr(bt.name),
+        bt.encoding to byte,
+        bt.byte_size to byte,
+    ]
+}
+
+fn emit_locals_subprogram(body: []byte, relocs: []DwReloc, sub: DwSubprogramLocals, base_type_offsets: []u64): DwSection {
+    var head: []byte = [
+        ..body,
+        0x03 to byte,
+        ..emit_cstr(sub.name),
+        ..sleb128(sub.decl_file),
+        ..emit_u16_le(sub.decl_line to u64),
+    ]
+    var low_pc_off = HEADER_LEN_PREFIX + head.len
+    var b: []byte = [
+        ..head,
+        ..emit_addr_slot(),
+        ..emit_u64_le_dw(sub.code_size),
+        ..emit_frame_base(sub.frame_base_op),
+        ..emit_local_list(sub.params, base_type_offsets),
+        ..emit_local_list(sub.locals, base_type_offsets),
+        ..emit_scope_list(sub.blocks, base_type_offsets),
+        0x00,
+    ]
+    var r = DwReloc { offset = low_pc_off; symbol = sub.symbol }
+    DwSection { bytes = b; relocs = [..relocs, r] }
+}
+
+fn emit_frame_base(op: u64): []byte {
+    [..uleb128(1 to u64), op to byte]
+}
+
+fn emit_local_list(locals: []DwLocal, base_type_offsets: []u64): []byte {
+    var b: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= locals.len { break }
+        b = [..b, ..emit_local_die(locals[i], base_type_offsets)]
+        i = i + 1
+    }
+    b
+}
+
+fn emit_local_die(local: DwLocal, base_type_offsets: []u64): []byte {
+    [
+        local_abbrev_code(local.is_param) to byte,
+        ..emit_cstr(local.name),
+        ..emit_u32_le_dw(base_type_offsets[local.type_index]),
+        ..emit_fbreg_location(local.fbreg_offset),
+    ]
+}
+
+fn local_abbrev_code(is_param: bool): u64 {
+    if is_param { return ABBREV_FORMAL_PARAMETER }
+    ABBREV_VARIABLE
+}
+
+fn emit_fbreg_location(offset: i64): []byte {
+    var expr: []byte = [DW_OP_FBREG to byte, ..sleb128(offset)]
+    [..uleb128(expr.len), ..expr]
+}
+
+fn emit_scope_list(scopes: []DwScope, base_type_offsets: []u64): []byte {
+    var b: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= scopes.len { break }
+        b = [..b, ..emit_scope_block(scopes[i], base_type_offsets)]
+        i = i + 1
+    }
+    b
+}
+
+fn emit_scope_block(scope: DwScope, base_type_offsets: []u64): []byte {
+    [
+        0x06,
+        ..emit_local_list(scope.locals, base_type_offsets),
+        0x00,
+    ]
+}

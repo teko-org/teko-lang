@@ -1,50 +1,1018 @@
-// src/process/process.tks  (namespace teko::process)
-// C7.5: real extern-fn declarations for the teko::process host surface.
-//
-// The runtime symbol is implemented in src/runtime/teko_rt.c and declared in
-// teko_rt.h. The codegen intercepts calls to `run` by last-segment name (the
-// CG_FFI_RUN path in codegen.c) and lowers the []str slice to the two-word
-// (ptr + len) ABI that tk_rt_run expects — no special lowering is needed here.
-//
-// The VM rejects extern fn calls with vm_unsupported; callers that need
-// `process::run` at test time must compile with `teko build` rather than
-// interpreting with `teko run` (C7.1a contract).
+pub const SPAWN_FAILED: i32 = -1
 
-/**
- * run — fork/exec `args[0]` with the given argument vector and wait for it to exit.
- *
- * The returned status is the CHILD's: 0–255 for a child that exited, 128+signo for one killed by a
- * signal (so an aborting child reports 134, the same number `sh` would report for it).
- *
- * That 128+signo shape is POSIX's, and this call reports whatever the HOST reports — on Windows
- * there are no signals and `_spawnvp` hands back the process exit code, so an aborting child is
- * NOT 134 there. Do not treat any particular number as "the program panicked": a panic identifies
- * itself on stderr, with the `TK_PANIC_MARKER` line (src/runtime/teko_rt.h). PR #94 cost a lane
- * learning this — a Windows run that panicked exactly as intended reported 127.
- *
- * `TK_RT_SPAWN_FAILED` (-1, src/runtime/teko_rt.h) means something else entirely — the runtime never
- * got a child running (`args` empty, or the spawn/fork/wait failed). It is NEGATIVE on purpose: no
- * child status can be, so "I could not run it" is distinguishable from every code a child could
- * produce. It used to be 127, which is simultaneously `sh`'s command-not-found, the POSIX
- * exec-failed convention, and a legal choice for a child — three diagnoses wearing one number, and
- * a CI failure reading `exit 127` was therefore unanswerable.
- *
- * The codegen CG_FFI_RUN path splits the `[]str` slice into (ptr, len) before calling `tk_rt_run`.
- *
- * @param args  the argument vector; `args[0]` is the executable
- * @return      the child's exit status, or `TK_RT_SPAWN_FAILED` when no child ran
- */
-pub extern fn run(args: []str) -> i32 = "tk_rt_run" from "teko_rt"
+pub const NO_FD: i64 = -1
 
-/**
- * run_quiet — the same contract as `run`, with the child's stdout/stderr redirected to the null
- * device.
- *
- * (issue #73) Used by the build backend's cc flag-family probe — compiling a throwaway empty
- * translation unit to test whether the host cc accepts clang-only flags — so a deliberately-rejected
- * flag does not leak an "unrecognized option" diagnostic into the user's build output.
- *
- * @param args  the argument vector; `args[0]` is the executable
- * @return      the child's exit status, or `TK_RT_SPAWN_FAILED` when no child ran
- */
-pub extern fn run_quiet(args: []str) -> i32 = "tk_rt_run_quiet" from "teko_rt"
+const SIGNAL_EXIT_BASE: i64 = 128
+
+const PIPE_CAPACITY: u64 = 65536
+
+const STAGE_HDR_STAGED: u64 = 0
+
+const STAGE_HDR_TAKEN: u64 = 8
+
+const STAGE_HDR_BUF: u64 = 16
+
+const FD_WAIT_ERROR: i32 = -1
+
+const FD_WAIT_TIMEOUT: i32 = 0
+
+const FD_WAIT_READY: i32 = 1
+
+const FILL_TIMEOUT: i64 = -1
+
+const FILL_ERROR: i64 = -2
+
+const TAKE_EXHAUSTED: i32 = -1
+
+const STDIN_FD: i64 = 0
+
+const STDOUT_FD: i64 = 1
+
+const STDERR_FD: i64 = 2
+
+const CHILD_EXEC_FAIL: i64 = 127
+
+const CHAR_SLASH: u64 = 47
+
+const CHAR_COLON: u64 = 58
+
+const CHAR_DOT: u64 = 46
+
+const DEFAULT_PATH: str = "/usr/local/bin:/usr/bin:/bin"
+
+/** ProcHandle — an opaque handle to a child process `spawn_redirected` launched and not yet
+ * collected by `wait_one`. May be waited on at most once. */
+exp type ProcHandle = struct {
+    /** the host's opaque process reference (pid on POSIX, a HANDLE cast to i64 on Windows) */
+    raw: i64
+}
+
+/** Pipe — the two ends of one anonymous pipe: bytes written to `write_fd` are read from
+ * `read_fd`. Both ends are owned by the caller of `pipe()`; neither is closed automatically. */
+exp type Pipe = struct {
+    /** the reading end */
+    read_fd: i64
+    /** the writing end */
+    write_fd: i64
+}
+
+fn cstr_addr(s: str): i64 {
+    teko::sys::ptr_word(teko::mem::as_cstr(s))
+}
+
+fn cstr_word(s: str): u64 {
+    teko::sys::ptr_word(teko::mem::as_cstr(s)) to u64
+}
+
+fn prog_alloc(n: u64): u64 {
+    teko::sys::ptr_word(teko::runtime::Arena::current().program().alloc(n)) to u64
+}
+
+fn build_argv(args: []str): u64 {
+    var arr = prog_alloc((args.len + 1) * 8)
+    var i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        teko::mem::store_u64(arr + i * 8, cstr_word(args[i]))
+        i++
+    }
+    teko::mem::store_u64(arr + args.len * 8, 0)
+    arr
+}
+
+fn snapshot_len(snap: u64): u64 {
+    var n: u64 = 0
+    loop {
+        if teko::mem::load_u64(snap + n * 8) == 0 { break }
+        n++
+    }
+    n
+}
+
+fn spawn_envp(env: []str): u64 {
+    var snap = teko::env::env_snapshot()
+    var snap_n = snapshot_len(snap)
+    var total = env.len + snap_n
+    var arr = prog_alloc((total + 1) * 8)
+    var k: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= env.len { break }
+        teko::mem::store_u64(arr + k * 8, cstr_word(env[i]))
+        k++
+        i++
+    }
+    var j: u64 = 0
+    loop {
+        if j >= snap_n { break }
+        teko::mem::store_u64(arr + k * 8, teko::mem::load_u64(snap + j * 8))
+        k++
+        j++
+    }
+    teko::mem::store_u64(arr + total * 8, 0)
+    arr
+}
+
+fn pack_pipe(read_fd: i64, write_fd: i64): i64 {
+    (write_fd << 32) | (read_fd & 0xffffffff)
+}
+
+fn unpack_read(packed: i64): i64 {
+    if packed < 0 { return NO_FD }
+    packed & 0xffffffff
+}
+
+fn unpack_write(packed: i64): i64 {
+    if packed < 0 { return NO_FD }
+    (packed >> 32) & 0xffffffff
+}
+
+fn decode_wait_status(status: u64): i32 {
+    var low = status & 0x7f
+    if low == 0 { return ((status >> 8) & 0xff) to i32 }
+    if low != 0x7f { return (SIGNAL_EXIT_BASE + (low to i64)) to i32 }
+    SPAWN_FAILED
+}
+
+fn dir_is_here(dir: str): bool {
+    if dir.len == 0 { return true }
+    if dir.len == 1 && (dir[0] to u64) == CHAR_DOT { return true }
+    false
+}
+
+type RedirectFd = struct {
+    fd: i64
+    owned: bool
+}
+
+#os("linux")
+fn posix_fork(): i64 {
+    teko::sys::syscall5(teko::sys::SYS_CLONE, teko::sys::SIGCHLD, 0, 0, 0, 0)
+}
+
+#os("linux")
+fn posix_child_fail() {
+    _ = teko::sys::syscall1(teko::sys::SYS_EXIT_GROUP, CHILD_EXEC_FAIL)
+}
+
+#os("linux")
+fn posix_execve(path: str, argv: u64, envp: u64) {
+    _ = teko::sys::syscall3(teko::sys::SYS_EXECVE, cstr_addr(path), argv to i64, envp to i64)
+}
+
+#os("linux")
+fn resolve_path_env(): str {
+    match teko::env::var("PATH") {
+        str as v => if v.len == 0 { DEFAULT_PATH } else { v }
+        error => DEFAULT_PATH
+    }
+}
+
+#os("linux")
+fn posix_try_dir(dir: str, argv0: str, argv: u64, envp: u64) {
+    var cand = if dir.len == 0 { argv0 } else { teko::str::concat(dir, "/", argv0) }
+    posix_execve(cand, argv, envp)
+}
+
+#os("linux")
+fn posix_exec_search(path: str, argv0: str, argv: u64, envp: u64) {
+    var start: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= path.len { break }
+        if (path[i] to u64) == CHAR_COLON {
+            posix_try_dir(path.slice(start, i), argv0, argv, envp)
+            start = i + 1
+        }
+        i++
+    }
+    posix_try_dir(path.slice(start, path.len), argv0, argv, envp)
+}
+
+#os("linux")
+fn posix_exec_resolved(argv0: str, argv: u64, envp: u64) {
+    if argv0.contains("/") {
+        posix_execve(argv0, argv, envp)
+        posix_child_fail()
+    }
+    posix_exec_search(resolve_path_env(), argv0, argv, envp)
+    posix_child_fail()
+}
+
+#os("linux")
+fn posix_quiet_redirect() {
+    var nfd = teko::sys::syscall4(teko::sys::SYS_OPENAT, teko::sys::AT_FDCWD, cstr_addr("/dev/null"), teko::sys::O_WRONLY, 0)
+    if nfd < 0 { return }
+    _ = teko::sys::syscall3(teko::sys::SYS_DUP3, nfd, STDOUT_FD, 0)
+    _ = teko::sys::syscall3(teko::sys::SYS_DUP3, nfd, STDERR_FD, 0)
+    _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, nfd)
+}
+
+#os("linux")
+fn posix_wait_status(pid: i64): i32 {
+    var sbuf = teko::sys::ptr_word(teko::mem::buf_ptr(8))
+    teko::mem::store_u64(sbuf to u64, 0)
+    var r = teko::sys::syscall4(teko::sys::SYS_WAIT4, pid, sbuf, 0, 0)
+    if r < 0 { return SPAWN_FAILED }
+    decode_wait_status(teko::mem::load_u64(sbuf to u64))
+}
+
+#os("linux")
+fn os_run(args: []str, quiet: bool): i32 {
+    if args.len == 0 { return SPAWN_FAILED }
+    var envp = teko::env::env_snapshot()
+    var argv = build_argv(args)
+    var pid = posix_fork()
+    if pid < 0 { return SPAWN_FAILED }
+    if pid == 0 {
+        if quiet { posix_quiet_redirect() }
+        posix_exec_resolved(args[0], argv, envp)
+        posix_child_fail()
+    }
+    posix_wait_status(pid)
+}
+
+#os("linux")
+fn open_redirect(path: str, given: i64, oflags: i64): RedirectFd {
+    if given >= 0 { return RedirectFd { fd = given; owned = false } }
+    if path.len == 0 { return RedirectFd { fd = NO_FD; owned = false } }
+    var fd = teko::sys::syscall4(teko::sys::SYS_OPENAT, teko::sys::AT_FDCWD, cstr_addr(path), oflags, teko::sys::OPEN_MODE_644)
+    RedirectFd { fd = fd; owned = true }
+}
+
+#os("linux")
+fn child_lift(r: RedirectFd): RedirectFd {
+    if r.fd < 0 { return r }
+    if r.fd > STDERR_FD { return r }
+    var hi = teko::sys::syscall3(teko::sys::SYS_FCNTL, r.fd, teko::sys::F_DUPFD, STDERR_FD + 1)
+    if hi < 0 { return r }
+    RedirectFd { fd = hi; owned = true }
+}
+
+#os("linux")
+fn child_drop(fd: i64, already_a: i64, already_b: i64) {
+    if fd <= STDERR_FD { return }
+    if fd == already_a || fd == already_b { return }
+    _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, fd)
+}
+
+#os("linux")
+fn child_bind_all(in_r: RedirectFd, out_r: RedirectFd, err_r: RedirectFd) {
+    var a = child_lift(in_r)
+    var b = child_lift(out_r)
+    var c = child_lift(err_r)
+    if a.fd >= 0 { _ = teko::sys::syscall3(teko::sys::SYS_DUP3, a.fd, STDIN_FD, 0) }
+    if b.fd >= 0 { _ = teko::sys::syscall3(teko::sys::SYS_DUP3, b.fd, STDOUT_FD, 0) }
+    if c.fd >= 0 { _ = teko::sys::syscall3(teko::sys::SYS_DUP3, c.fd, STDERR_FD, 0) }
+    if a.fd >= 0 { child_drop(a.fd, NO_FD, NO_FD) }
+    if b.fd >= 0 { child_drop(b.fd, a.fd, NO_FD) }
+    if c.fd >= 0 { child_drop(c.fd, a.fd, b.fd) }
+}
+
+#os("linux")
+fn parent_release(r: RedirectFd) {
+    if r.owned && r.fd >= 0 { _ = teko::sys::syscall1(teko::sys::SYS_CLOSE, r.fd) }
+}
+
+#os("linux")
+fn os_spawn(argv: []str, dir: str, env: []str, in_path: str, out_path: str, err_path: str, in_fd: i64, out_fd: i64, err_fd: i64): i64 {
+    if argv.len == 0 { return SPAWN_FAILED to i64 }
+    var envp = spawn_envp(env)
+    var argvp = build_argv(argv)
+    var in_r = open_redirect(in_path, in_fd, teko::sys::O_RDONLY)
+    var out_r = open_redirect(out_path, out_fd, teko::sys::O_WRONLY | teko::sys::O_CREAT | teko::sys::O_TRUNC)
+    var err_r = open_redirect(err_path, err_fd, teko::sys::O_WRONLY | teko::sys::O_CREAT | teko::sys::O_TRUNC)
+    var pid = posix_fork()
+    if pid < 0 {
+        parent_release(in_r)
+        parent_release(out_r)
+        parent_release(err_r)
+        return SPAWN_FAILED to i64
+    }
+    if pid == 0 {
+        child_bind_all(in_r, out_r, err_r)
+        if !dir_is_here(dir) && teko::sys::syscall1(teko::sys::SYS_CHDIR, cstr_addr(dir)) != 0 { posix_child_fail() }
+        posix_exec_resolved(argv[0], argvp, envp)
+        posix_child_fail()
+    }
+    parent_release(in_r)
+    parent_release(out_r)
+    parent_release(err_r)
+    pid
+}
+
+#os("linux")
+fn os_wait_one(raw: i64): i32 {
+    if raw < 0 { return SPAWN_FAILED }
+    posix_wait_status(raw)
+}
+
+#os("linux")
+fn os_pipe(): i64 {
+    var fds = teko::sys::ptr_word(teko::mem::buf_ptr(8))
+    if teko::sys::syscall2(teko::sys::SYS_PIPE2, fds, teko::sys::O_CLOEXEC) < 0 { return NO_FD }
+    var pair = teko::mem::load_u64(fds to u64)
+    pack_pipe((pair & 0xffffffff) to i64, ((pair >> 32) & 0xffffffff) to i64)
+}
+
+#os("linux")
+fn os_close_fd(fd: i64): i32 {
+    if fd < 0 { return NO_FD to i32 }
+    if teko::sys::syscall1(teko::sys::SYS_CLOSE, fd) == 0 { return 0 }
+    NO_FD to i32
+}
+
+#os("linux")
+fn os_fd_wait_readable(fd: i64, timeout_ms: i64): i32 {
+    if fd < 0 { return FD_WAIT_ERROR }
+    var pfd = teko::sys::ptr_word(teko::mem::buf_ptr(8))
+    teko::mem::store_u64(pfd to u64, (fd to u64) | (teko::sys::POLLIN << 32))
+    var tsarg: i64 = 0
+    if timeout_ms >= 0 {
+        var ts = teko::sys::ptr_word(teko::mem::buf_ptr(16))
+        teko::mem::store_u64(ts to u64, (timeout_ms / 1000) to u64)
+        teko::mem::store_u64((ts + 8) to u64, ((timeout_ms % 1000) * 1000000) to u64)
+        tsarg = ts
+    }
+    var r = teko::sys::syscall5(teko::sys::SYS_PPOLL, pfd, 1, tsarg, 0, 0)
+    if r < 0 { return FD_WAIT_ERROR }
+    if r == 0 { return FD_WAIT_TIMEOUT }
+    var revents = (teko::mem::load_u64(pfd to u64) >> 48) & 0xffff
+    if (revents & (teko::sys::POLLIN | teko::sys::POLLHUP)) != 0 { return FD_WAIT_READY }
+    FD_WAIT_ERROR
+}
+
+fn fd_stage_base(): u64 {
+    var existing = teko::runtime::fd_stage_slot()
+    if existing != 0 { return existing }
+    var b = prog_alloc(STAGE_HDR_BUF + PIPE_CAPACITY)
+    teko::mem::store_u64(b + STAGE_HDR_STAGED, 0)
+    teko::mem::store_u64(b + STAGE_HDR_TAKEN, 0)
+    teko::runtime::set_fd_stage_slot(b)
+    b
+}
+
+#os("linux")
+fn os_fd_fill(fd: i64, timeout_ms: i64): i64 {
+    var stg = fd_stage_base()
+    teko::mem::store_u64(stg + STAGE_HDR_STAGED, 0)
+    teko::mem::store_u64(stg + STAGE_HDR_TAKEN, 0)
+    if fd < 0 { return FILL_ERROR }
+    var ready = os_fd_wait_readable(fd, timeout_ms)
+    if ready == FD_WAIT_TIMEOUT { return FILL_TIMEOUT }
+    if ready != FD_WAIT_READY { return FILL_ERROR }
+    var got = teko::sys::syscall3(teko::sys::SYS_READ, fd, (stg + STAGE_HDR_BUF) to i64, PIPE_CAPACITY to i64)
+    if got < 0 { return FILL_ERROR }
+    teko::mem::store_u64(stg + STAGE_HDR_STAGED, got to u64)
+    got
+}
+
+fn stage_take_byte(): i32 {
+    var stg = fd_stage_base()
+    var staged = teko::mem::load_u64(stg + STAGE_HDR_STAGED)
+    var taken = teko::mem::load_u64(stg + STAGE_HDR_TAKEN)
+    if taken >= staged { return TAKE_EXHAUSTED }
+    var b = teko::mem::load_u8(stg + STAGE_HDR_BUF + taken)
+    teko::mem::store_u64(stg + STAGE_HDR_TAKEN, taken + 1)
+    b to i32
+}
+
+#os("linux")
+fn os_fd_take_byte(): i32 {
+    stage_take_byte()
+}
+
+#os("macos")
+fn os_fd_take_byte(): i32 {
+    stage_take_byte()
+}
+
+#os("macos")
+fn mac_child_fail() {
+    teko::sys::abi::os_exit(CHILD_EXEC_FAIL to i32)
+}
+
+#os("macos")
+fn mac_execve(path: str, argv: u64, envp: u64) {
+    _ = teko::sys::abi::os_execve_raw(cstr_addr(path) to u64, argv, envp)
+}
+
+#os("macos")
+fn mac_resolve_path_env(): str {
+    match teko::env::var("PATH") {
+        str as v => if v.len == 0 { DEFAULT_PATH } else { v }
+        error => DEFAULT_PATH
+    }
+}
+
+#os("macos")
+fn mac_try_dir(dir: str, argv0: str, argv: u64, envp: u64) {
+    var cand = if dir.len == 0 { argv0 } else { teko::str::concat(dir, "/", argv0) }
+    mac_execve(cand, argv, envp)
+}
+
+#os("macos")
+fn mac_exec_search(path: str, argv0: str, argv: u64, envp: u64) {
+    var start: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= path.len { break }
+        if (path[i] to u64) == CHAR_COLON {
+            mac_try_dir(path.slice(start, i), argv0, argv, envp)
+            start = i + 1
+        }
+        i++
+    }
+    mac_try_dir(path.slice(start, path.len), argv0, argv, envp)
+}
+
+#os("macos")
+fn mac_exec_resolved(argv0: str, argv: u64, envp: u64) {
+    if argv0.contains("/") {
+        mac_execve(argv0, argv, envp)
+        mac_child_fail()
+    }
+    mac_exec_search(mac_resolve_path_env(), argv0, argv, envp)
+    mac_child_fail()
+}
+
+#os("macos")
+fn mac_quiet_redirect() {
+    var nfd = teko::sys::abi::os_open_raw(cstr_addr("/dev/null") to u64, teko::sys::O_WRONLY to i32, 0)
+    if nfd < 0 { return }
+    _ = teko::sys::abi::os_dup2_raw(nfd, STDOUT_FD to i32)
+    _ = teko::sys::abi::os_dup2_raw(nfd, STDERR_FD to i32)
+    _ = teko::sys::abi::os_close_raw(nfd)
+}
+
+#os("macos")
+fn mac_wait_status(pid: i64): i32 {
+    var status: i32 = 0
+    var rusage: teko::sys::abi::Rusage = teko::sys::abi::Rusage { ru_maxrss = 0 }
+    if teko::sys::abi::os_wait4_raw(pid to i32, status, 0, rusage) < 0 { return SPAWN_FAILED }
+    decode_wait_status((status to u32) to u64)
+}
+
+#os("macos")
+fn os_run(args: []str, quiet: bool): i32 {
+    if args.len == 0 { return SPAWN_FAILED }
+    var envp = teko::env::env_snapshot()
+    var argv = build_argv(args)
+    var pid = teko::sys::abi::os_fork() to i64
+    if pid < 0 { return SPAWN_FAILED }
+    if pid == 0 {
+        if quiet { mac_quiet_redirect() }
+        mac_exec_resolved(args[0], argv, envp)
+        mac_child_fail()
+    }
+    mac_wait_status(pid)
+}
+
+#os("macos")
+fn mac_open_redirect(path: str, given: i64, oflags: i64): RedirectFd {
+    if given >= 0 { return RedirectFd { fd = given; owned = false } }
+    if path.len == 0 { return RedirectFd { fd = NO_FD; owned = false } }
+    var fd = teko::sys::abi::os_open_raw(cstr_addr(path) to u64, oflags to i32, teko::sys::OPEN_MODE_644 to i32) to i64
+    RedirectFd { fd = fd; owned = true }
+}
+
+#os("macos")
+fn mac_child_lift(r: RedirectFd): RedirectFd {
+    if r.fd < 0 { return r }
+    if r.fd > STDERR_FD { return r }
+    var hi = teko::sys::abi::os_fcntl_dupfd(r.fd to i32, teko::sys::F_DUPFD to i32, (STDERR_FD + 1) to i32) to i64
+    if hi < 0 { return r }
+    RedirectFd { fd = hi; owned = true }
+}
+
+#os("macos")
+fn mac_child_drop(fd: i64, already_a: i64, already_b: i64) {
+    if fd <= STDERR_FD { return }
+    if fd == already_a || fd == already_b { return }
+    _ = teko::sys::abi::os_close_raw(fd to i32)
+}
+
+#os("macos")
+fn mac_child_bind_all(in_r: RedirectFd, out_r: RedirectFd, err_r: RedirectFd) {
+    var a = mac_child_lift(in_r)
+    var b = mac_child_lift(out_r)
+    var c = mac_child_lift(err_r)
+    if a.fd >= 0 { _ = teko::sys::abi::os_dup2_raw(a.fd to i32, STDIN_FD to i32) }
+    if b.fd >= 0 { _ = teko::sys::abi::os_dup2_raw(b.fd to i32, STDOUT_FD to i32) }
+    if c.fd >= 0 { _ = teko::sys::abi::os_dup2_raw(c.fd to i32, STDERR_FD to i32) }
+    if a.fd >= 0 { mac_child_drop(a.fd, NO_FD, NO_FD) }
+    if b.fd >= 0 { mac_child_drop(b.fd, a.fd, NO_FD) }
+    if c.fd >= 0 { mac_child_drop(c.fd, a.fd, b.fd) }
+}
+
+#os("macos")
+fn mac_parent_release(r: RedirectFd) {
+    if r.owned && r.fd >= 0 { _ = teko::sys::abi::os_close_raw(r.fd to i32) }
+}
+
+#os("macos")
+fn os_spawn(argv: []str, dir: str, env: []str, in_path: str, out_path: str, err_path: str, in_fd: i64, out_fd: i64, err_fd: i64): i64 {
+    if argv.len == 0 { return SPAWN_FAILED to i64 }
+    var envp = spawn_envp(env)
+    var argvp = build_argv(argv)
+    var in_r = mac_open_redirect(in_path, in_fd, teko::sys::O_RDONLY)
+    var out_r = mac_open_redirect(out_path, out_fd, teko::sys::O_WRONLY | teko::sys::O_CREAT | teko::sys::O_TRUNC)
+    var err_r = mac_open_redirect(err_path, err_fd, teko::sys::O_WRONLY | teko::sys::O_CREAT | teko::sys::O_TRUNC)
+    var pid = teko::sys::abi::os_fork() to i64
+    if pid < 0 {
+        mac_parent_release(in_r)
+        mac_parent_release(out_r)
+        mac_parent_release(err_r)
+        return SPAWN_FAILED to i64
+    }
+    if pid == 0 {
+        mac_child_bind_all(in_r, out_r, err_r)
+        if !dir_is_here(dir) && teko::sys::abi::os_chdir_raw(cstr_addr(dir) to u64) != 0 { mac_child_fail() }
+        mac_exec_resolved(argv[0], argvp, envp)
+        mac_child_fail()
+    }
+    mac_parent_release(in_r)
+    mac_parent_release(out_r)
+    mac_parent_release(err_r)
+    pid
+}
+
+#os("macos")
+fn os_wait_one(raw: i64): i32 {
+    if raw < 0 { return SPAWN_FAILED }
+    mac_wait_status(raw)
+}
+
+#os("macos")
+fn mac_set_cloexec(fd: i64) {
+    _ = teko::sys::abi::os_fcntl_dupfd(fd to i32, teko::sys::F_SETFD to i32, teko::sys::FD_CLOEXEC to i32)
+}
+
+#os("macos")
+fn os_pipe(): i64 {
+    var fds = teko::sys::ptr_word(teko::mem::buf_ptr(8))
+    if teko::sys::abi::os_pipe_raw2(fds to u64) != 0 { return NO_FD }
+    var pair = teko::mem::load_u64(fds to u64)
+    var read_fd = (pair & 0xffffffff) to i64
+    var write_fd = ((pair >> 32) & 0xffffffff) to i64
+    mac_set_cloexec(read_fd)
+    mac_set_cloexec(write_fd)
+    pack_pipe(read_fd, write_fd)
+}
+
+#os("macos")
+fn os_close_fd(fd: i64): i32 {
+    if fd < 0 { return NO_FD to i32 }
+    if teko::sys::abi::os_close_raw(fd to i32) == 0 { return 0 }
+    NO_FD to i32
+}
+
+#os("macos")
+fn os_fd_wait_readable(fd: i64, timeout_ms: i64): i32 {
+    if fd < 0 { return FD_WAIT_ERROR }
+    var pfd = teko::sys::ptr_word(teko::mem::buf_ptr(8))
+    teko::mem::store_u64(pfd to u64, (fd to u64) | (teko::sys::POLLIN << 32))
+    var r = teko::sys::abi::os_poll_raw(pfd to u64, 1, timeout_ms to i32)
+    if r < 0 { return FD_WAIT_ERROR }
+    if r == 0 { return FD_WAIT_TIMEOUT }
+    var revents = (teko::mem::load_u64(pfd to u64) >> 48) & 0xffff
+    if (revents & (teko::sys::POLLIN | teko::sys::POLLHUP)) != 0 { return FD_WAIT_READY }
+    FD_WAIT_ERROR
+}
+
+#os("macos")
+fn os_fd_fill(fd: i64, timeout_ms: i64): i64 {
+    var stg = fd_stage_base()
+    teko::mem::store_u64(stg + STAGE_HDR_STAGED, 0)
+    teko::mem::store_u64(stg + STAGE_HDR_TAKEN, 0)
+    if fd < 0 { return FILL_ERROR }
+    var ready = os_fd_wait_readable(fd, timeout_ms)
+    if ready == FD_WAIT_TIMEOUT { return FILL_TIMEOUT }
+    if ready != FD_WAIT_READY { return FILL_ERROR }
+    var got = teko::sys::abi::os_read_raw(fd to i32, (stg + STAGE_HDR_BUF) to u64, PIPE_CAPACITY)
+    if got < 0 { return FILL_ERROR }
+    teko::mem::store_u64(stg + STAGE_HDR_STAGED, got to u64)
+    got
+}
+
+#os("windows")
+const CHAR_SPACE: u64 = 32
+
+#os("windows")
+const CHAR_TAB: u64 = 9
+
+#os("windows")
+const CHAR_QUOTE: u64 = 34
+
+#os("windows")
+const CHAR_BACKSLASH: u64 = 92
+
+#os("windows")
+const STARTUPINFOA_SIZE: u64 = 104
+
+#os("windows")
+const STARTUPINFOA_CB: u64 = 0
+
+#os("windows")
+const STARTUPINFOA_DWFLAGS: u64 = 60
+
+#os("windows")
+const STARTUPINFOA_HSTDINPUT: u64 = 80
+
+#os("windows")
+const STARTUPINFOA_HSTDOUTPUT: u64 = 88
+
+#os("windows")
+const STARTUPINFOA_HSTDERROR: u64 = 96
+
+#os("windows")
+const PROCESS_INFORMATION_SIZE: u64 = 24
+
+#os("windows")
+const PROCINFO_HPROCESS: u64 = 0
+
+#os("windows")
+const PROCINFO_HTHREAD: u64 = 8
+
+#os("windows")
+const SECURITY_ATTRIBUTES_SIZE: u64 = 24
+
+#os("windows")
+const SA_NLENGTH: u64 = 0
+
+#os("windows")
+const SA_BINHERIT: u64 = 16
+
+#os("windows")
+const STARTF_USESTDHANDLES: u32 = 0x00000100
+
+#os("windows")
+const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6
+
+#os("windows")
+const GENERIC_WRITE: u32 = 0x40000000
+
+#os("windows")
+const FILE_SHARE_RW: u32 = 0x00000003
+
+#os("windows")
+const OPEN_EXISTING: u32 = 3
+
+#os("windows")
+const INVALID_HANDLE: u64 = 0xFFFFFFFFFFFFFFFF
+
+#os("windows")
+extern fn win_spawn_redirected(payload: str): i64 = "tk_rt_spawn_redirected" from "teko_rt"
+
+#os("windows")
+extern fn win_wait_one(raw: i64): i32 = "tk_rt_wait_one" from "teko_rt"
+
+#os("windows")
+extern fn win_pipe(): i64 = "tk_rt_pipe" from "teko_rt"
+
+#os("windows")
+extern fn win_close_fd(fd: i64): i32 = "tk_rt_close_fd" from "teko_rt"
+
+#os("windows")
+extern fn win_fd_wait_readable(fd: i64, timeout_ms: i64): i32 = "tk_rt_fd_wait_readable" from "teko_rt"
+
+#os("windows")
+extern fn win_fd_fill(fd: i64, timeout_ms: i64): i64 = "tk_rt_fd_fill" from "teko_rt"
+
+#os("windows")
+extern fn win_fd_take_byte(): i32 = "tk_rt_fd_take_byte" from "teko_rt"
+
+#os("windows")
+const TOKEN_SEP: str = "\0"
+
+#os("windows")
+fn count_prefixed_list(items: []str): str {
+    var out = teko::str::u64_to_str(items.len)
+    var k: u64 = 0
+    loop {
+        if k >= items.len { break }
+        out = out ~ TOKEN_SEP ~ items[k]
+        k = k + 1
+    }
+    out
+}
+
+#os("windows")
+fn fd_token(fd: i64): str {
+    if fd < 0 { return "" }
+    teko::str::i64_to_str(fd)
+}
+
+#os("windows")
+fn spawn_payload(argv: []str, dir: str, env: []str, in_path: str, out_path: str, err_path: str, in_fd: i64, out_fd: i64, err_fd: i64): str {
+    var lists = count_prefixed_list(argv) ~ TOKEN_SEP ~ count_prefixed_list(env)
+    var paths = dir ~ TOKEN_SEP ~ in_path ~ TOKEN_SEP ~ out_path ~ TOKEN_SEP ~ err_path
+    var fds = fd_token(in_fd) ~ TOKEN_SEP ~ fd_token(out_fd) ~ TOKEN_SEP ~ fd_token(err_fd)
+    lists ~ TOKEN_SEP ~ paths ~ TOKEN_SEP ~ fds
+}
+
+#os("windows")
+fn store_u32_at(addr: u64, value: u32) {
+    var x = value to u64
+    teko::mem::store_u8(addr, x & 0xff)
+    teko::mem::store_u8(addr + 1, (x >> 8) & 0xff)
+    teko::mem::store_u8(addr + 2, (x >> 16) & 0xff)
+    teko::mem::store_u8(addr + 3, (x >> 24) & 0xff)
+}
+
+#os("windows")
+fn zero_bytes(addr: u64, n: u64) {
+    var k: u64 = 0
+    loop {
+        if k + 8 > n { break }
+        teko::mem::store_u64(addr + k, 0)
+        k = k + 8
+    }
+    loop {
+        if k >= n { break }
+        teko::mem::store_u8(addr + k, 0)
+        k = k + 1
+    }
+}
+
+#os("windows")
+fn backslashes(n: u64): str {
+    var out = ""
+    var k: u64 = 0
+    loop {
+        if k >= n { break }
+        out = out ~ "\\"
+        k = k + 1
+    }
+    out
+}
+
+#os("windows")
+fn arg_needs_quote(a: str): bool {
+    if a.len == 0 { return true }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        var c = a[i] to u64
+        if c == CHAR_SPACE || c == CHAR_TAB || c == CHAR_QUOTE { return true }
+        i = i + 1
+    }
+    false
+}
+
+#os("windows")
+fn quote_arg(a: str): str {
+    if !arg_needs_quote(a) { return a }
+    var out = "\""
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        var bs: u64 = 0
+        loop {
+            if i >= a.len || (a[i] to u64) != CHAR_BACKSLASH { break }
+            bs = bs + 1
+            i = i + 1
+        }
+        if i >= a.len {
+            out = out ~ backslashes(bs * 2)
+            break
+        }
+        if (a[i] to u64) == CHAR_QUOTE {
+            out = out ~ backslashes(bs * 2 + 1) ~ "\""
+        } else {
+            out = out ~ backslashes(bs) ~ a.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    out ~ "\""
+}
+
+#os("windows")
+fn build_cmdline(args: []str): str {
+    var out = ""
+    var i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if i > 0 { out = out ~ " " }
+        out = out ~ quote_arg(args[i])
+        i = i + 1
+    }
+    out
+}
+
+#os("windows")
+fn win_open_nul(): u64 {
+    var sa = teko::sys::ptr_word(teko::mem::buf_ptr(SECURITY_ATTRIBUTES_SIZE)) to u64
+    zero_bytes(sa, SECURITY_ATTRIBUTES_SIZE)
+    store_u32_at(sa + SA_NLENGTH, SECURITY_ATTRIBUTES_SIZE to u32)
+    store_u32_at(sa + SA_BINHERIT, 1)
+    teko::sys::abi::CreateFileA(cstr_word("NUL"), GENERIC_WRITE, FILE_SHARE_RW, sa, OPEN_EXISTING, 0, 0)
+}
+
+#os("windows")
+fn win_startup_info(quiet: bool, nul: u64): u64 {
+    var startup = teko::sys::ptr_word(teko::mem::buf_ptr(STARTUPINFOA_SIZE)) to u64
+    zero_bytes(startup, STARTUPINFOA_SIZE)
+    teko::mem::store_u64(startup + STARTUPINFOA_CB, STARTUPINFOA_SIZE)
+    if quiet {
+        store_u32_at(startup + STARTUPINFOA_DWFLAGS, STARTF_USESTDHANDLES)
+        teko::mem::store_u64(startup + STARTUPINFOA_HSTDINPUT, teko::sys::abi::GetStdHandle(STD_INPUT_HANDLE))
+        teko::mem::store_u64(startup + STARTUPINFOA_HSTDOUTPUT, nul)
+        teko::mem::store_u64(startup + STARTUPINFOA_HSTDERROR, nul)
+    }
+    startup
+}
+
+#os("windows")
+fn win_process_exit(hproc: u64): i32 {
+    _ = teko::sys::abi::WaitForSingleObject(hproc, teko::sys::WIN_INFINITE)
+    var codebuf = teko::sys::ptr_word(teko::mem::buf_ptr(8)) to u64
+    teko::mem::store_u64(codebuf, 0)
+    var got = teko::sys::abi::GetExitCodeProcess(hproc, codebuf)
+    if got == 0 { return SPAWN_FAILED }
+    (teko::mem::load_u64(codebuf) & 0xffffffff) to i32
+}
+
+#os("windows")
+fn os_run(args: []str, quiet: bool): i32 {
+    if args.len == 0 { return SPAWN_FAILED }
+    var nul: u64 = 0
+    if quiet {
+        nul = win_open_nul()
+        if nul == INVALID_HANDLE { return SPAWN_FAILED }
+    }
+    var startup = win_startup_info(quiet, nul)
+    var pinfo = teko::sys::ptr_word(teko::mem::buf_ptr(PROCESS_INFORMATION_SIZE)) to u64
+    zero_bytes(pinfo, PROCESS_INFORMATION_SIZE)
+    var inherit: i32 = if quiet { 1 } else { 0 }
+    var ok = teko::sys::abi::CreateProcessA(0, cstr_word(build_cmdline(args)), 0, 0, inherit, 0, 0, 0, startup, pinfo)
+    if quiet { _ = teko::sys::abi::CloseHandle(nul) }
+    if ok == 0 { return SPAWN_FAILED }
+    var hproc = teko::mem::load_u64(pinfo + PROCINFO_HPROCESS)
+    var hthread = teko::mem::load_u64(pinfo + PROCINFO_HTHREAD)
+    var code = win_process_exit(hproc)
+    _ = teko::sys::abi::CloseHandle(hproc)
+    _ = teko::sys::abi::CloseHandle(hthread)
+    code
+}
+
+#os("windows")
+fn os_spawn(argv: []str, dir: str, env: []str, in_path: str, out_path: str, err_path: str, in_fd: i64, out_fd: i64, err_fd: i64): i64 {
+    win_spawn_redirected(spawn_payload(argv, dir, env, in_path, out_path, err_path, in_fd, out_fd, err_fd))
+}
+
+#os("windows")
+fn os_wait_one(raw: i64): i32 {
+    win_wait_one(raw)
+}
+
+#os("windows")
+fn os_pipe(): i64 {
+    win_pipe()
+}
+
+#os("windows")
+fn os_close_fd(fd: i64): i32 {
+    win_close_fd(fd)
+}
+
+#os("windows")
+fn os_fd_wait_readable(fd: i64, timeout_ms: i64): i32 {
+    win_fd_wait_readable(fd, timeout_ms)
+}
+
+#os("windows")
+fn os_fd_fill(fd: i64, timeout_ms: i64): i64 {
+    win_fd_fill(fd, timeout_ms)
+}
+
+#os("windows")
+fn os_fd_take_byte(): i32 {
+    win_fd_take_byte()
+}
+
+/** teko::process::run — fork/exec `args[0]` with the given argument vector and wait for it to
+ * exit. On POSIX the executable is resolved against `PATH` in Teko (the `execvp` replacement) and
+ * the child inherits the parent's `teko::env` overlay via `execve`.
+ * @return the child's exit status (0-255, or 128+signo on POSIX for a signal-killed child), or
+ * `SPAWN_FAILED` when no child ran. */
+exp fn run(args: []str): i32 {
+    os_run(args, false)
+}
+
+/** teko::process::run_quiet — `run`, with the child's stdout/stderr redirected to the null
+ * device. */
+exp fn run_quiet(args: []str): i32 {
+    os_run(args, true)
+}
+
+/** teko::process::pipe — create one anonymous pipe and return both of its ends. Neither end
+ * leaks into an unrelated child (POSIX `O_CLOEXEC` / Windows `_O_NOINHERIT`).
+ * @throws when the host could not create a pipe. */
+exp fn pipe(): Pipe | error {
+    var packed = os_pipe()
+    if packed < 0 { return error { message = "teko::process::pipe: the host refused to create a pipe" } }
+    Pipe { read_fd = unpack_read(packed); write_fd = unpack_write(packed) }
+}
+
+/** teko::process::close_fd — close one descriptor.
+ * @throws when `fd` named no open descriptor, or the host's close failed. */
+exp fn close_fd(fd: i64): null | error {
+    if os_close_fd(fd) == 0 { return null }
+    error { message = "teko::process::close_fd: not an open descriptor" }
+}
+
+/** teko::process::spawn_redirected — launch `argv` without waiting for it, with its three
+ * standard streams redirected to the paths named ("" = inherit) and its working directory set
+ * to `dir` ("" = the parent's); `env` (`K=V`) is layered over the child's inherited environment.
+ * @return the child's handle, or a handle with `raw = SPAWN_FAILED` when none started. */
+exp fn spawn_redirected(argv: []str, dir: str, env: []str, in_path: str, out_path: str, err_path: str): ProcHandle {
+    ProcHandle { raw = os_spawn(argv, dir, env, in_path, out_path, err_path, NO_FD, NO_FD, NO_FD) }
+}
+
+/** teko::process::spawn_redirected_fds — `spawn_redirected`, with the child's three standard
+ * streams bound to descriptors the caller already owns (`NO_FD` = inherit) instead of files.
+ * Ownership does not transfer: the caller must `close_fd` its own copy of any descriptor handed
+ * to the child.
+ * @return the child's handle, or a handle with `raw = SPAWN_FAILED` when none started. */
+exp fn spawn_redirected_fds(argv: []str, dir: str, env: []str, in_fd: i64, out_fd: i64, err_fd: i64): ProcHandle {
+    ProcHandle { raw = os_spawn(argv, dir, env, "", "", "", in_fd, out_fd, err_fd) }
+}
+
+/** teko::process::wait_one — block until `h` terminates.
+ * @return the child's exit status, or `SPAWN_FAILED` when `h` never named a real child. */
+exp fn wait_one(h: ProcHandle): i32 {
+    os_wait_one(h.raw)
+}
+
+pub const VERDICT_CHANNEL_ENV: str = "TEKO_VERDICT_CHANNEL"
+
+pub fn verdict_channel_path(): str {
+    match teko::env::var(VERDICT_CHANNEL_ENV) { str as v => v; error => "" }
+}
+
+pub fn verdict_emit(line: str): null | error {
+    var path = verdict_channel_path()
+    if path.len == 0 { teko::io::eprintln(line); return null }
+    teko::journal::append_raw(path, line)
+}
+
+/** teko::process::fd_wait_readable — block until reading `fd` would not block, or until
+ * `timeout_ms` elapses ("ready" also covers end-of-file).
+ * @return true when a read would not block, false when the deadline expired first.
+ * @throws when `fd` could not be observed at all. */
+exp fn fd_wait_readable(fd: i64, timeout_ms: i64): bool | error {
+    var r = os_fd_wait_readable(fd, timeout_ms)
+    if r < 0 { return error { message = "teko::process::fd_wait_readable: the descriptor could not be observed" } }
+    r == 1
+}
+
+/** teko::process::fd_fill — stage one buffer's worth of `fd`, under a deadline. One staging
+ * buffer for the whole process: a fill discards whatever the previous one left unread.
+ * @return how many bytes were staged; 0 at end-of-file.
+ * @throws when the deadline expired, or the descriptor could not be read. */
+exp fn fd_fill(fd: i64, timeout_ms: i64): u64 | error {
+    var n = os_fd_fill(fd, timeout_ms)
+    if n == FILL_TIMEOUT { return error { message = "teko::process::fd_fill: the deadline expired with neither bytes nor end-of-file; a write end is still open somewhere" } }
+    if n == FILL_ERROR { return error { message = "teko::process::fd_fill: the descriptor could not be read" } }
+    n to u64
+}
+
+fn take_staged(acc: []byte, n: u64): []byte {
+    var out = acc
+    var k: u64 = 0
+    loop {
+        if k >= n { break }
+        var b = os_fd_take_byte()
+        if b == TAKE_EXHAUSTED { break }
+        out = [..out, b to byte]
+        k = k + 1
+    }
+    out
+}
+
+/** teko::process::read_to_eof — drain `fd` until end-of-file, under a total deadline across all
+ * of its fills.
+ * @return everything the writer sent, as UTF-8 text.
+ * @throws when the deadline expired before end-of-file, a fill failed, or the bytes were not
+ * valid UTF-8. */
+exp fn read_to_eof(fd: i64, deadline_ms: i64): str | error {
+    var started = now_ms()
+    var acc: []byte = []
+    loop {
+        var left = deadline_ms - (now_ms() - started)
+        if left <= 0 { return deadline_expired(acc.len) }
+        var n = match fd_fill(fd, left) { u64 as v => v; error as e => return e }
+        if n == 0 { break }
+        acc = take_staged(acc, n)
+    }
+    teko::text::str_from_utf8(acc)
+}
+
+fn now_ms(): i64 {
+    teko::time::span_monotonic_now().ticks / 1000000
+}
+
+fn deadline_expired(drained: u64): error {
+    error { message = "teko::process::read_to_eof: deadline expired after " ~ teko::str::u64_to_str(drained) ~ " bytes; a write end is still open somewhere" }
+}

@@ -1,0 +1,319 @@
+/** The quotient-and-remainder pair returned by `divmod`. */
+exp type DivMod = struct {
+    quot: BigInt
+    rem: BigInt
+}
+
+fn limb_at(a: []u64, i: u64): u64 {
+    if i >= a.len { return 0 }
+    a[i]
+}
+
+fn pow2_mag(n: u64): []u64 {
+    mag_setbit([], n)
+}
+
+fn reduce(n: BigInt, m: BigInt): BigInt {
+    var dm = mag_divmod(n.limbs, m.limbs)
+    if mag_is_zero(dm.r) { return zero() }
+    if n.neg { return mk(false, mag_sub(m.limbs, dm.r)) }
+    mk(false, dm.r)
+}
+
+fn mulmod(x: BigInt, y: BigInt, m: BigInt): BigInt {
+    reduce(mul(x, y), m)
+}
+
+/**
+ * Truncating division of `a` by `b`, returning both quotient and remainder. A zero divisor is a
+ * returned error, never a panic.
+ */
+exp fn divmod(a: BigInt, b: BigInt): DivMod | error {
+    if is_zero(b) { return error { message = "bigint::divmod: division by zero" } }
+    var dm = mag_divmod(a.limbs, b.limbs)
+    DivMod { quot = mk(a.neg != b.neg, dm.q); rem = mk(a.neg, dm.r) }
+}
+
+/**
+ * Euclidean modulo — the non-negative residue of `n` modulo `m` in `[0, |m|)`. Unlike `rem`, this
+ * always returns a value in `[0, |m|)`. A zero modulus is a returned error.
+ */
+exp fn modulo(n: BigInt, m: BigInt): BigInt | error {
+    if is_zero(m) { return error { message = "bigint::modulo: zero modulus" } }
+    reduce(n, m)
+}
+
+/** The greatest common divisor of `a` and `b`, always non-negative (`gcd(0, 0) = 0`). */
+exp fn gcd(a: BigInt, b: BigInt): BigInt {
+    var x = mag_norm(a.limbs)
+    var y = mag_norm(b.limbs)
+    loop {
+        if mag_is_zero(y) { break }
+        var r = mag_divmod(x, y)
+        x = y
+        y = r.r
+    }
+    mk(false, x)
+}
+
+/** Left shift — `x * 2^n`, preserving the sign. */
+exp fn shl(x: BigInt, n: u64): BigInt {
+    if is_zero(x) { return zero() }
+    if n == 0 { return x }
+    mk(x.neg, mag_mul(x.limbs, pow2_mag(n)))
+}
+
+/** Right shift — the magnitude of `x` divided by `2^n`, truncated toward zero, sign of `x` preserved. */
+exp fn shr(x: BigInt, n: u64): BigInt {
+    if is_zero(x) { return zero() }
+    if n == 0 { return x }
+    var dm = mag_divmod(x.limbs, pow2_mag(n))
+    mk(x.neg, dm.q)
+}
+
+/** The number of significant bits in the magnitude of `x` (`0` for zero). */
+exp fn bit_length(x: BigInt): u64 {
+    mag_bitlen(x.limbs)
+}
+
+/** Is `x` even? */
+exp fn is_even(x: BigInt): bool {
+    mag_bit(x.limbs, 0) == 0
+}
+
+/** Bitwise AND of two non-negative values. Negative operands return an error. */
+exp fn bit_and(a: BigInt, b: BigInt): BigInt | error {
+    if a.neg || b.neg { return error { message = "bigint::bit_and: negative operand" } }
+    var n = if a.limbs.len < b.limbs.len { a.limbs.len } else { b.limbs.len }
+    var out: [n]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = a.limbs[i] & b.limbs[i]
+        i = i + 1
+    }
+    mk(false, out)
+}
+
+/** Bitwise OR of two non-negative values. Negative operands return an error. */
+exp fn bit_or(a: BigInt, b: BigInt): BigInt | error {
+    if a.neg || b.neg { return error { message = "bigint::bit_or: negative operand" } }
+    var n = if a.limbs.len > b.limbs.len { a.limbs.len } else { b.limbs.len }
+    var out: [n]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = limb_at(a.limbs, i) | limb_at(b.limbs, i)
+        i = i + 1
+    }
+    mk(false, out)
+}
+
+/** Bitwise XOR of two non-negative values. Negative operands return an error. */
+exp fn bit_xor(a: BigInt, b: BigInt): BigInt | error {
+    if a.neg || b.neg { return error { message = "bigint::bit_xor: negative operand" } }
+    var n = if a.limbs.len > b.limbs.len { a.limbs.len } else { b.limbs.len }
+    var out: [n]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = limb_at(a.limbs, i) ^ limb_at(b.limbs, i)
+        i = i + 1
+    }
+    mk(false, out)
+}
+
+/**
+ * Modular exponentiation — `base^exponent mod modulus`. Left-to-right square-and-multiply, NOT
+ * constant-time (branches on exponent bits). Result is the canonical representative in `[0, modulus)`.
+ */
+exp fn mod_pow(ground: BigInt, exponent: BigInt, modulus: BigInt): BigInt | error {
+    if is_zero(modulus) || is_neg(modulus) { return error { message = "bigint::mod_pow: modulus must be positive" } }
+    if is_neg(exponent) { return error { message = "bigint::mod_pow: negative exponent" } }
+    if eq(modulus, one()) { return zero() }
+    var result = one()
+    var acc = reduce(ground, modulus)
+    var nbits = mag_bitlen(exponent.limbs)
+    var i: u64 = 0
+    loop {
+        if i >= nbits { break }
+        if mag_bit(exponent.limbs, i) == 1 { result = mulmod(result, acc, modulus) }
+        acc = mulmod(acc, acc, modulus)
+        i = i + 1
+    }
+    result
+}
+
+/**
+ * The modular inverse — the unique `y` in `[0, modulus)` with `a*y ≡ 1 (mod modulus)`, via the
+ * extended Euclidean algorithm. Returns an error when `a` is not invertible modulo `modulus`.
+ */
+exp fn mod_inverse(a: BigInt, modulus: BigInt): BigInt | error {
+    if cmp(modulus, one()) <= 0 { return error { message = "bigint::mod_inverse: modulus must be > 1" } }
+    var newr = reduce(a, modulus)
+    if is_zero(newr) { return error { message = "bigint::mod_inverse: value not invertible" } }
+    var t = zero()
+    var newt = one()
+    var r = modulus
+    loop {
+        if is_zero(newr) { break }
+        var q = div(r, newr)
+        var nt = sub(t, mul(q, newt))
+        t = newt
+        newt = nt
+        var nr = sub(r, mul(q, newr))
+        r = newr
+        newr = nr
+    }
+    if cmp(r, one()) > 0 { return error { message = "bigint::mod_inverse: value not invertible" } }
+    if is_neg(t) { return add(t, modulus) }
+    t
+}
+
+fn mag_bytes_be(x: BigInt): []byte {
+    var digs: [x.limbs.len * 8]byte = []
+    var ndigs: u64 = 0
+    var m = x.limbs
+    loop {
+        if mag_is_zero(m) { break }
+        var dm = mag_divmod_small(m, 256)
+        digs[ndigs] = dm.r to byte
+        ndigs++
+        m = dm.q
+    }
+    var out: [ndigs]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= ndigs { break }
+        out[i] = digs[ndigs - 1 - i]
+        i++
+    }
+    out
+}
+
+fn pad_be(raw: []byte, length: u64): []byte | error {
+    if raw.len > length { return error { message = "bigint::to_bytes_be_padded: value wider than field" } }
+    var pad = length - raw.len
+    var out: [length]byte = []
+    var j: u64 = 0
+    loop {
+        if j >= raw.len { break }
+        out[pad + j] = raw[j]
+        j = j + 1
+    }
+    out
+}
+
+/** Parse an unsigned big-endian byte string into a non-negative `BigInt` (`OS2IP`). */
+exp fn from_bytes_be(bytes: []byte): BigInt {
+    var mag: []u64 = []
+    var b256 = one_limb(256)
+    var i: u64 = 0
+    loop {
+        if i >= bytes.len { break }
+        mag = mag_add(mag_mul(mag, b256), one_limb(bytes[i] to u64))
+        i = i + 1
+    }
+    mk(false, mag)
+}
+
+/** The minimal unsigned big-endian encoding of a non-negative `x` (`I2OSP`, no fixed width). */
+exp fn to_bytes_be(x: BigInt): []byte | error {
+    if is_neg(x) { return error { message = "bigint::to_bytes_be: negative value" } }
+    if is_zero(x) { return [0 to byte] }
+    mag_bytes_be(x)
+}
+
+/** The fixed-length unsigned big-endian encoding of a non-negative `x`, left-padded with zero bytes. */
+exp fn to_bytes_be_padded(x: BigInt, length: u64): []byte | error {
+    if is_neg(x) { return error { message = "bigint::to_bytes_be_padded: negative value" } }
+    match pad_be(mag_bytes_be(x), length) {
+        []byte as out => out
+        error as e => e
+    }
+}
+
+fn hex_digit(nib: u64): byte {
+    if nib < 10 { return ((b'0' to u64) + nib) to byte }
+    ((b'a' to u64) + nib - 10) to byte
+}
+
+fn hex_value(c: byte): u64 | error {
+    if c >= b'0' && c <= b'9' { return (c to u64) - (b'0' to u64) }
+    if c >= b'a' && c <= b'f' { return (c to u64) - (b'a' to u64) + 10 }
+    if c >= b'A' && c <= b'F' { return (c to u64) - (b'A' to u64) + 10 }
+    error { message = "bigint::from_hex: invalid hex digit" }
+}
+
+/** Render `x` as a lowercase hexadecimal string (leading `-` for negative, no `0x` prefix). */
+exp fn to_hex(x: BigInt): str {
+    if is_zero(x) { return "0" }
+    var digs: [x.limbs.len * 16]byte = []
+    var ndigs: u64 = 0
+    var m = x.limbs
+    loop {
+        if mag_is_zero(m) { break }
+        var dm = mag_divmod_small(m, 16)
+        digs[ndigs] = hex_digit(dm.r)
+        ndigs++
+        m = dm.q
+    }
+    var neg_len = if x.neg { 1 to u64 } else { 0 to u64 }
+    var out: [ndigs + neg_len]byte = []
+    var pos: u64 = 0
+    if x.neg {
+        out[pos] = b'-'
+        pos++
+    }
+    var i = ndigs
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        out[pos] = digs[i]
+        pos++
+    }
+    match teko::text::str_from_utf8(out) {
+        str as s => s
+        error => ""
+    }
+}
+
+/**
+ * Parse a hexadecimal string into a `BigInt`. Accepts an optional leading `+`/`-`, an optional `0x`
+ * or `0X` prefix, hex digits of either case, and `_` group separators.
+ */
+exp fn from_hex(s: str): BigInt | error {
+    if s.len == 0 { return error { message = "bigint::from_hex: empty string" } }
+    var i: u64 = 0
+    var neg = false
+    if s[0] == b'-' { neg = true; i = 1 } else { if s[0] == b'+' { i = 1 } }
+    if i + 1 < s.len && s[i] == b'0' && (s[i + 1] == b'x' || s[i + 1] == b'X') { i = i + 2 }
+    var sixteen = one_limb(16)
+    var mag: []u64 = []
+    var saw_digit = false
+    loop {
+        if i >= s.len { break }
+        var c = s[i]
+        if c == b'_' { i = i + 1; continue }
+        match hex_value(c) {
+            u64 as v => {
+                mag = mag_add(mag_mul(mag, sixteen), one_limb(v))
+                saw_digit = true
+            }
+            error as e => { return e }
+        }
+        i = i + 1
+    }
+    if !saw_digit { return error { message = "bigint::from_hex: no digits" } }
+    mk(neg, mag)
+}
+
+/** Parse a decimal string into a `BigInt` (the crypto/serialization spelling of `from_str`). */
+exp fn from_dec_str(s: str): BigInt | error {
+    from_str(s)
+}
+
+/** Render `x` to its canonical decimal string (the crypto/serialization spelling of `to_str`). */
+exp fn to_dec_str(x: BigInt): str {
+    to_str(x)
+}

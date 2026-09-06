@@ -1,0 +1,158 @@
+/**
+ * One fixed-width record: its fields, in column order, each already sliced to its declared width.
+ */
+exp type FixedRecord = struct {
+    /**
+     * The record's field values, in column order.
+     */
+    fields: []str
+}
+
+fn bytes_slice(bytes: []byte, from: u64, to: u64): []byte {
+    var out: []byte = []
+    var i = from
+    loop {
+        if i >= to { break }
+        out = [..out, bytes[i]]
+        i++
+    }
+    out
+}
+
+fn strip_trailing_cr(bytes: []byte): []byte {
+    if bytes.len > 0 && bytes[bytes.len - 1] == b'\r' { return bytes_slice(bytes, 0, bytes.len - 1) }
+    bytes
+}
+
+fn split_lines(text: str): []str {
+    var bytes = text.bytes()
+    var lines: []str = []
+    var start: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= bytes.len { break }
+        if bytes[i] == b'\n' {
+            lines = [..lines, str(strip_trailing_cr(bytes_slice(bytes, start, i)))]
+            start = i + 1
+        }
+        i++
+    }
+    if start < bytes.len { lines = [..lines, str(strip_trailing_cr(bytes_slice(bytes, start, bytes.len)))] }
+    lines
+}
+
+fn widths_sum(widths: []u64): u64 {
+    var total: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= widths.len { break }
+        total = total + widths[i]
+        i++
+    }
+    total
+}
+
+fn trim_trailing_spaces(bytes: []byte): str {
+    var end = bytes.len
+    loop {
+        if end == 0 { break }
+        if bytes[end - 1] != b' ' { break }
+        end = end - 1
+    }
+    str(bytes_slice(bytes, 0, end))
+}
+
+fn parse_line_fields(line: str, widths: []u64, trim: bool): []str | error {
+    var bytes = line.bytes()
+    var need = widths_sum(widths)
+    if bytes.len < need { return error { message = concat("fixed: line has ", u64_to_str(bytes.len), " bytes, needs ", u64_to_str(need)) } }
+    var fields: []str = []
+    var pos: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= widths.len { break }
+        var w = widths[i]
+        var field_bytes = bytes_slice(bytes, pos, pos + w)
+        var field = if trim { trim_trailing_spaces(field_bytes) } else { str(field_bytes) }
+        fields = [..fields, field]
+        pos = pos + w
+        i++
+    }
+    fields
+}
+
+/**
+ * Parses `text` as fixed-width columns, each field kept exactly as sliced (including any
+ * trailing pad spaces).
+ */
+exp fn parse_fixed(text: str, widths: []u64): []FixedRecord | error {
+    parse_fixed_core(text, widths, false)
+}
+
+/**
+ * Parses `text` as fixed-width columns, stripping trailing ASCII spaces from every sliced field.
+ */
+exp fn parse_fixed_trimmed(text: str, widths: []u64): []FixedRecord | error {
+    parse_fixed_core(text, widths, true)
+}
+
+fn parse_fixed_core(text: str, widths: []u64, trim: bool): []FixedRecord | error {
+    var lines = split_lines(text)
+    var out: []FixedRecord = []
+    var i: u64 = 0
+    loop {
+        if i >= lines.len { break }
+        var fields = match parse_line_fields(lines[i], widths, trim) { []str as f => f; error as e => return e }
+        out = [..out, FixedRecord { fields = fields }]
+        i++
+    }
+    out
+}
+
+fn append_padded_field(out: []byte, field: str, width: u64): []byte {
+    var bytes = field.bytes()
+    var acc = out
+    var n = if bytes.len < width { bytes.len } else { width }
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        acc = [..acc, bytes[i]]
+        i++
+    }
+    var pad = width - n
+    var j: u64 = 0
+    loop {
+        if j >= pad { break }
+        acc = [..acc, b' ']
+        j++
+    }
+    acc
+}
+
+fn append_record(out: []byte, record: FixedRecord, widths: []u64): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= widths.len { break }
+        var field = if i < record.fields.len { record.fields[i] } else { "" }
+        acc = append_padded_field(acc, field, widths[i])
+        i++
+    }
+    acc
+}
+
+/**
+ * Renders `records` as fixed-width text: each record's columns padded/truncated to `widths`,
+ * `\n`-terminated. Total (M.3): any `[]FixedRecord` and `[]u64` have a valid rendering.
+ */
+exp fn write_fixed(records: []FixedRecord, widths: []u64): str {
+    var out: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= records.len { break }
+        out = append_record(out, records[i], widths)
+        out = [..out, b'\n']
+        i++
+    }
+    str(out)
+}

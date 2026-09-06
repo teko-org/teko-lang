@@ -159,17 +159,17 @@ type Scan = struct {
 
 // --- predicates (pure, over a single byte) ---
 
-fn is_digit(c: u8) -> bool {
+fn is_digit(c: u8): bool {
     c >= '0' && c <= '9'
 }
 
-fn is_alpha(c: u8) -> bool {
+fn is_alpha(c: u8): bool {
     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 // --- position advance (pure: takes pos, returns the new pos) ---
 
-fn skip_spaces(source: str, pos: u64) -> u64 {
+fn skip_spaces(source: str, pos: u64): u64 {
     mut p = pos
     loop {
         if p >= source.len { break }
@@ -183,7 +183,7 @@ fn skip_spaces(source: str, pos: u64) -> u64 {
 
 // reads digits, allowing `_` as a separator BETWEEN digits (B.28): `1_000`.
 // (A trailing `_` or `_` not between digits is not consumed here.)
-fn read_number(source: str, pos: u64) -> Scan {
+fn read_number(source: str, pos: u64): Scan {
     mut p = pos
     loop {
         if p >= source.len { break }
@@ -205,11 +205,11 @@ fn read_number(source: str, pos: u64) -> Scan {
 // identifier continuation: letter, digit, or underscore (snake_case).
 // (Start is handled in the dispatch: a letter starts an ident directly;
 //  a `_` starts one only if a letter/digit follows — see tokenize.)
-fn is_ident_continue(c: u8) -> bool {
+fn is_ident_continue(c: u8): bool {
     is_alpha(c) || is_digit(c) || c == '_'
 }
 
-fn read_ident(source: str, pos: u64) -> Scan {
+fn read_ident(source: str, pos: u64): Scan {
     mut p = pos
     loop {
         if p >= source.len { break }
@@ -223,7 +223,7 @@ fn read_ident(source: str, pos: u64) -> Scan {
 }
 
 // A single-character token (operators, parentheses).
-fn single(source: str, pos: u64, kind: TokenKind) -> Scan {
+fn single(source: str, pos: u64, kind: TokenKind): Scan {
     Scan {
         token = Token { kind = kind; text = slice(source, pos, pos + 1) }
         next = pos + 1
@@ -237,7 +237,7 @@ fn single(source: str, pos: u64, kind: TokenKind) -> Scan {
 // `_` token; a run like `__` (no letter/digit after) becomes two wildcard
 // tokens across two dispatch iterations — the parser then fails naturally
 // (no production for consecutive wildcards). Exclusion by construction.
-fn read_underscore(source: str, pos: u64) -> Scan {
+fn read_underscore(source: str, pos: u64): Scan {
     // look past the run of underscores
     mut p = pos
     loop {
@@ -257,7 +257,7 @@ fn read_underscore(source: str, pos: u64) -> Scan {
 
 // --- main loop ---
 
-fn tokenize(source: str) -> []Token | error {
+fn tokenize(source: str): []Token | error {
     mut pos: u64 = 0
     mut tokens = teko::list::empty()
 
@@ -382,12 +382,12 @@ type Parsed = struct {
 // --- pure cursor helpers (over the token slice + a position) ---
 
 // Is there a token at `pos`? Position/index are always u64.
-fn has_token(tokens: []lexer::Token, pos: u64) -> bool {
+fn has_token(tokens: []lexer::Token, pos: u64): bool {
     pos < tokens.len
 }
 
 // The kind at `pos` (caller guarantees `has_token` first).
-fn kind_at(tokens: []lexer::Token, pos: u64) -> lexer::TokenKind {
+fn kind_at(tokens: []lexer::Token, pos: u64): lexer::TokenKind {
     tokens[pos].kind
 }
 
@@ -397,14 +397,14 @@ fn kind_at(tokens: []lexer::Token, pos: u64) -> lexer::TokenKind {
 // else error" pattern — used wherever a specific token must appear (a `)`, a
 // `=`, an Ident). It returns `u64 | error` (the new position, or a reason): an
 // honest result (M.3). Calling it with the guard pattern keeps the caller flat.
-fn expect(tokens: []lexer::Token, pos: u64, kind: lexer::TokenKind, msg: str) -> u64 | error {
+fn expect(tokens: []lexer::Token, pos: u64, kind: lexer::TokenKind, msg: str): u64 | error {
     if !has_token(tokens, pos) { return error { message = msg } }
     if kind_at(tokens, pos) != kind { return error { message = msg } }
     pos + 1
 }
 
 // Is the kind at `pos` one of the two additive operators?
-fn is_additive(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_additive(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     // `==` on the nominal enum (B.31/B.13); `||` is the symbol operator (B.19)
@@ -412,7 +412,7 @@ fn is_additive(tokens: []lexer::Token, pos: u64) -> bool {
 }
 
 // Is the kind at `pos` one of the two multiplicative operators?
-fn is_multiplicative(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_multiplicative(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Star || k == lexer::TokenKind::Slash
@@ -429,7 +429,7 @@ fn is_multiplicative(tokens: []lexer::Token, pos: u64) -> bool {
 // factor = Number | '(' expr ')'        (tightest — the atom)
 // Dispatches on the leading token; each case is a small flat function (guard
 // over nest — M.2). Renamed conceptually to "atom" (the tightest level).
-fn parse_factor(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_factor(tokens: []lexer::Token, pos: u64): Parsed | error {
     if !has_token(tokens, pos) {
         return error { message = "unexpected end of input in factor" }
     }
@@ -441,7 +441,7 @@ fn parse_factor(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // a literal number leaf (text→i64 elided — the seed's numeric reader, B.28)
-fn parse_number_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_number_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     let n = to_i64(tokens[pos].text)
     Parsed { node = Number { value = n }; next = pos + 1 }
 }
@@ -449,7 +449,7 @@ fn parse_number_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 // '(' expr ')' — recurse into a full expression, then demand ')'. FLAT: each
 // fallible step is a guard line (extract-or-return), the result built at the top
 // level — no nesting of the work inside the Parsed arm (guard over nest).
-fn parse_paren_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_paren_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     // pos is '(' ; parse the inner expression (guard: extract or propagate, B.16)
     let inner = match parse_expr(tokens, pos + 1) {
         error as e => return e
@@ -466,7 +466,7 @@ fn parse_paren_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 // term = factor (('*' | '/') factor)*     (multiplicative — left-associative)
 // FLAT (guard over nest): the first operand is a guard line; the loop folds left
 // with the rhs extracted by a guard. State flows by reassignment (B.7).
-fn parse_term(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_term(tokens: []lexer::Token, pos: u64): Parsed | error {
     let start = match parse_factor(tokens, pos) {
         error as e => return e
         Parsed as s => s
@@ -487,7 +487,7 @@ fn parse_term(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // expr = term (('+' | '-') term)*         (additive — loosest, left-associative)
-fn parse_expr(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_expr(tokens: []lexer::Token, pos: u64): Parsed | error {
     let start = match parse_term(tokens, pos) {
         error as e => return e
         Parsed as s => s
@@ -510,7 +510,7 @@ fn parse_expr(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 // The entry point: parse a full expression and require that ALL tokens were
 // consumed (trailing tokens = error). Returns the root Expr or an error (B.1).
 // FLAT: the parse result is a guard line; the trailing-token check is at top level.
-fn parse(tokens: []lexer::Token) -> Expr | error {
+fn parse(tokens: []lexer::Token): Expr | error {
     let p = match parse_expr(tokens, 0) {
         error as e => return e
         Parsed as p => p
@@ -601,14 +601,14 @@ type TokenKind = enum {
 // Keyword lookup (B.19): read a word as an Ident run, THEN check the table.
 // `let` → the Let keyword; anything else stays an Ident. (The lexer reads the
 // word first and looks it up — it does not special-case letters mid-scan.)
-fn keyword_or_ident(text: str) -> TokenKind {
+fn keyword_or_ident(text: str): TokenKind {
     // bytes_eq compares a byte slice to a literal (a stdlib leaf, like to_i64)
     if bytes_eq(text, "let") { return TokenKind::Let }
     TokenKind::Ident
 }
 
 // read_ident, after reading the run, classifies via the table:
-fn read_word(source: str, pos: u64) -> Scan {
+fn read_word(source: str, pos: u64): Scan {
     let scan = read_ident(source, pos)            // reuse A.1's run reader
     let kind = keyword_or_ident(scan.token.text)  // then classify (B.19)
     Scan {
@@ -685,7 +685,7 @@ type ParsedStmt = struct {
 // src/parser/statement.tks   (namespace 'teko::parser') — the statement level
 
 // Skip any run of Newline terminators (blank lines / empty statements).
-fn skip_terminators(tokens: []lexer::Token, pos: u64) -> u64 {
+fn skip_terminators(tokens: []lexer::Token, pos: u64): u64 {
     mut p = pos
     loop {
         if !has_token(tokens, p) { break }
@@ -698,7 +698,7 @@ fn skip_terminators(tokens: []lexer::Token, pos: u64) -> u64 {
 // parse_let: consume `let`, then the name Ident, then `=`, then an expression.
 // Each missing piece is an error-as-value (B.1). Returns a ParsedStmt (its node
 // is a Statement — the Let case of the variant).
-fn parse_let(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_let(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     // caller guarantees tokens[pos] is Let; step past it
     mut p = pos + 1
 
@@ -734,7 +734,7 @@ fn parse_let(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
 
 // parse_statement: dispatch on the first token. `let` → a binding; otherwise an
 // expression statement. (One construct decides, by the leading token — B.15.)
-fn parse_statement(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_statement(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a statement" }
     }
@@ -746,7 +746,7 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
 
 // an expression statement: parse an expression, lift it into ExprStmt (a Statement
 // case). FLAT: the expression is a guard line, the wrap is at top level.
-fn parse_expr_stmt(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_expr_stmt(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     let p = match parse_expr(tokens, pos) {
         error as e => return e
         Parsed as p => p
@@ -758,7 +758,7 @@ fn parse_expr_stmt(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
 // parse_program: the entry point. A loop of statements, each followed by a
 // terminator (Newline) or end-of-input. Left-to-right, ref-less state (B.7).
 // FLAT: the statement is a guard line; the terminator check is at top level.
-fn parse_program(tokens: []lexer::Token) -> Program | error {
+fn parse_program(tokens: []lexer::Token): Program | error {
     mut stmts = teko::list::empty()
     mut p     = skip_terminators(tokens, 0)    // ignore leading blank lines
 
@@ -877,7 +877,7 @@ type TokenKind = enum {
 // src/lexer/lexer.tks   (namespace 'teko::lexer') — additions only
 
 // Keyword table grows (B.19): `let`, `mut`, `const` are keywords; else Ident.
-fn keyword_or_ident(text: str) -> TokenKind {
+fn keyword_or_ident(text: str): TokenKind {
     if bytes_eq(text, "let")   { return TokenKind::Let }
     if bytes_eq(text, "mut")   { return TokenKind::Mut }
     if bytes_eq(text, "const") { return TokenKind::Const }
@@ -941,7 +941,7 @@ type Statement = Binding | Assign | ExprStmt
 // total over what reaches here. The `_` valve marks the genuinely impossible
 // (M.1 — rather than a false default that would lie about an unreachable path, it
 // panics: a reached `_` is a compiler bug, not a value).
-fn bind_kind_of(k: lexer::TokenKind) -> BindKind {
+fn bind_kind_of(k: lexer::TokenKind): BindKind {
     match k {
         lexer::TokenKind::Let   => BindKind::BindLet
         lexer::TokenKind::Mut   => BindKind::BindMut
@@ -953,7 +953,7 @@ fn bind_kind_of(k: lexer::TokenKind) -> BindKind {
 // parse_binding: KEYWORD name (':' type)? '=' expr
 // One parser for all three bindings — they differ only in the leading keyword
 // (B.21: same shape, the kind is the role). The annotation is optional.
-fn parse_binding(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_binding(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     let kind = bind_kind_of(kind_at(tokens, pos))
     let p0 = pos + 1     // past the binding keyword
 
@@ -1004,7 +1004,7 @@ type Annotation = struct {
 
 // parse_opt_annotation: if the token at `pos` is ':', read ':' Ident; otherwise
 // no annotation (pass through). FLAT: each step guards or returns.
-fn parse_opt_annotation(tokens: []lexer::Token, pos: u64) -> Annotation | error {
+fn parse_opt_annotation(tokens: []lexer::Token, pos: u64): Annotation | error {
     // no ':' → no annotation
     if !has_token(tokens, pos) {
         return Annotation { has_type = false; type_name = empty_slice(); next = pos }
@@ -1028,7 +1028,7 @@ fn parse_opt_annotation(tokens: []lexer::Token, pos: u64) -> Annotation | error 
 // parse_assign: name '=' expr   (simple reassignment of an existing mut)
 // Entered when a statement starts with an Ident immediately followed by `=`.
 // FLAT: the value is a guard line, the node built at the top level.
-fn parse_assign(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_assign(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     let name = tokens[pos].text     // caller checked tokens[pos] is Ident
     let p = pos + 2                 // past the Ident and the `=`
 
@@ -1048,7 +1048,7 @@ fn parse_assign(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
 //   let/mut/const   → a binding (creates a name)
 //   Ident '='       → a simple reassignment (rebinds an existing mut)
 //   otherwise       → an expression statement
-fn parse_statement(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_statement(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a statement" }
     }
@@ -1068,7 +1068,7 @@ fn parse_statement(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
 
 // is_reassignment: an Ident at `pos` immediately followed by `=`. Folds the
 // "Ident then Assign" test into one flat predicate (guard over nest).
-fn is_reassignment(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_reassignment(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     if kind_at(tokens, pos) != lexer::TokenKind::Ident { return false }
     if !has_token(tokens, pos + 1) { return false }
@@ -1278,8 +1278,8 @@ type Expr = Number | Binary | Unary | Compare
 // are module-level, stateless (no capture), so this is exactly the seed-legal
 // form 1 (a code address, no `ref`, no state). The two named function types
 // (B.13 — nominal) document the shapes:
-type OpPredicate = fn([]lexer::Token, u64) -> bool
-type LevelParser = fn([]lexer::Token, u64) -> Parsed | error
+type OpPredicate = fn([]lexer::Token, u64): bool
+type LevelParser = fn([]lexer::Token, u64): Parsed | error
 
 // parse_binary_level: `next (op next)*`, folding LEFT. One helper for every
 // ordinary binary level (or, and, additive, multiplicative, shift) — no longer
@@ -1288,7 +1288,7 @@ type LevelParser = fn([]lexer::Token, u64) -> Parsed | error
 fn parse_binary_level(
     tokens: []lexer::Token, pos: u64,
     is_op: OpPredicate, next: LevelParser
-) -> Parsed | error {
+): Parsed | error {
     let start = match next(tokens, pos) {           // call the passed parser (with ())
         error as e => return e
         Parsed as s => s
@@ -1309,17 +1309,17 @@ fn parse_binary_level(
 }
 
 // level 9 entry → delegates to level 8 (assignment is statement-level, A.4)
-fn parse_expr(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_expr(tokens: []lexer::Token, pos: u64): Parsed | error {
     parse_or(tokens, pos)
 }
 
 // level 8 — `||` (logical OR). Pass is_oror + the next level by bare name.
-fn parse_or(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_or(tokens: []lexer::Token, pos: u64): Parsed | error {
     parse_binary_level(tokens, pos, is_oror, parse_and)
 }
 
 // level 7 — `&&` (logical AND)
-fn parse_and(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_and(tokens: []lexer::Token, pos: u64): Parsed | error {
     parse_binary_level(tokens, pos, is_andand, parse_comparison)
 }
 
@@ -1327,7 +1327,7 @@ fn parse_and(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 // one of the parse_binary_level levels: a run of comparisons becomes ONE Compare
 // node preserving the chain (the AND-semantics and single-evaluation is codegen's
 // — M.3, honest to the source). `a` alone (no comparison) passes through.
-fn parse_comparison(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_comparison(tokens: []lexer::Token, pos: u64): Parsed | error {
     let start = match parse_additive(tokens, pos) {
         error as e => return e
         Parsed as s => s
@@ -1353,24 +1353,24 @@ fn parse_comparison(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // level 5 — additive `+ -` AND bitwise `| ^` (same rank; OR/XOR≈+)
-fn parse_additive(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_additive(tokens: []lexer::Token, pos: u64): Parsed | error {
     parse_binary_level(tokens, pos, is_additive, parse_multiplicative)
 }
 
 // level 4 — multiplicative `* / %` AND bitwise `&` (same rank; AND≈*)
-fn parse_multiplicative(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_multiplicative(tokens: []lexer::Token, pos: u64): Parsed | error {
     parse_binary_level(tokens, pos, is_multiplicative, parse_shift)
 }
 
 // level 3 — shift `<< >>` (its own level, just below multiplication)
-fn parse_shift(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_shift(tokens: []lexer::Token, pos: u64): Parsed | error {
     parse_binary_level(tokens, pos, is_shift, parse_unary)
 }
 
 // level 2 — unary PREFIX `- ~ !`, RIGHT-associative (recursion, not a loop):
 // if the current token is a unary operator, consume it and recurse into unary
 // (so `--x` = Unary(-, Unary(-, x))); otherwise fall through to the atom.
-fn parse_unary(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_unary(tokens: []lexer::Token, pos: u64): Parsed | error {
     if !is_unary(tokens, pos) {
         return parse_atom(tokens, pos)
     }
@@ -1384,7 +1384,7 @@ fn parse_unary(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 
 // level 1 — atom: a number, or a parenthesised expression. Dispatches to small
 // flat per-case functions (guard over nest — M.2), as in A.2.
-fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     if !has_token(tokens, pos) {
         return error { message = "unexpected end of input" }
     }
@@ -1396,13 +1396,13 @@ fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // a literal number leaf (text→i64 elided — B.28)
-fn parse_number_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_number_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     let n = to_i64(tokens[pos].text)
     Parsed { node = Number { value = n }; next = pos + 1 }
 }
 
 // '(' expr ')' — recurse, then demand ')'. FLAT: each fallible step is a guard.
-fn parse_paren_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_paren_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     let inner = match parse_expr(tokens, pos + 1) {
         error as e => return e
         Parsed as p => p
@@ -1422,19 +1422,19 @@ fn parse_paren_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 // that precedence level. All are small and uniform (cohesion, M.5). Each does
 // the `has_token` guard then compares the kind.
 
-fn is_unary(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_unary(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Minus || k == lexer::TokenKind::Tilde || k == lexer::TokenKind::Bang
 }
 
-fn is_shift(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_shift(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Shl || k == lexer::TokenKind::Shr
 }
 
-fn is_multiplicative(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_multiplicative(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     // `* / %` and bitwise `&` share this level (Julia model; AND≈*)
@@ -1442,7 +1442,7 @@ fn is_multiplicative(tokens: []lexer::Token, pos: u64) -> bool {
     k == lexer::TokenKind::Percent || k == lexer::TokenKind::Amp
 }
 
-fn is_additive(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_additive(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     // `+ -` and bitwise `| ^` share this level (OR/XOR≈+)
@@ -1450,7 +1450,7 @@ fn is_additive(tokens: []lexer::Token, pos: u64) -> bool {
     k == lexer::TokenKind::Pipe || k == lexer::TokenKind::Caret
 }
 
-fn is_comparison(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_comparison(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Lt || k == lexer::TokenKind::Gt ||
@@ -1458,12 +1458,12 @@ fn is_comparison(tokens: []lexer::Token, pos: u64) -> bool {
     k == lexer::TokenKind::EqEq || k == lexer::TokenKind::Ne
 }
 
-fn is_andand(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_andand(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     tokens[pos].kind == lexer::TokenKind::AndAnd
 }
 
-fn is_oror(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_oror(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     tokens[pos].kind == lexer::TokenKind::OrOr
 }
@@ -1554,7 +1554,7 @@ type Expr = Number | Var | Binary | Unary | Compare
 
 // level 1 — atom: a number, a VARIABLE reference, or a parenthesised expression.
 // Dispatches on the leading token; each case is a small flat function.
-fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     if !has_token(tokens, pos) {
         return error { message = "unexpected end of input" }
     }
@@ -1568,7 +1568,7 @@ fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 
 // a variable reference: the identifier's text becomes a Var leaf. Trivial — one
 // token, no fallible sub-parse, so no guard needed.
-fn parse_var_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_var_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     Parsed { node = Var { name = tokens[pos].text }; next = pos + 1 }
 }
 ```
@@ -1686,7 +1686,7 @@ type Assign = struct {
 // src/parser/binding.tks   (namespace 'teko::parser') — reassignment widened
 
 // Is the token at `pos` an assignment operator — plain `=` or any compound?
-fn is_assign_op(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_assign_op(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     let k = tokens[pos].kind
     k == lexer::TokenKind::Assign    ||
@@ -1700,7 +1700,7 @@ fn is_assign_op(tokens: []lexer::Token, pos: u64) -> bool {
 
 // An Ident at `pos` immediately followed by an assignment operator (plain or
 // compound). Widens A.4's "Ident then `=`" to "Ident then any assign op."
-fn is_reassignment(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_reassignment(tokens: []lexer::Token, pos: u64): bool {
     if !has_token(tokens, pos) { return false }
     if kind_at(tokens, pos) != lexer::TokenKind::Ident { return false }
     is_assign_op(tokens, pos + 1)
@@ -1709,7 +1709,7 @@ fn is_reassignment(tokens: []lexer::Token, pos: u64) -> bool {
 // parse_assign: name OP expr   (reassignment of an existing mut; OP plain or
 // compound). FLAT (guard over nest): the value is a guard line, the node built at
 // the top level. The op is recorded as written — not desugared (codegen's job).
-fn parse_assign(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_assign(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     let name = tokens[pos].text     // caller checked tokens[pos] is Ident
     let op   = tokens[pos + 1].kind  // caller checked is_assign_op at pos+1
     let p    = pos + 2
@@ -1853,7 +1853,7 @@ type ParsedType = struct {
 // src/parser/type.tks   (namespace 'teko::parser') — recursive descent for types
 
 // path = Ident ('::' Ident)*      (tightest — a qualified name)
-fn parse_path(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_path(tokens: []lexer::Token, pos: u64): ParsedType | error {
     // the first segment: an Ident
     if !has_token(tokens, pos) {
         return error { message = "expected a type name" }
@@ -1885,7 +1885,7 @@ fn parse_path(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
 // slice = '[]' slice | path        (slice binds tighter than union)
 // A '[' must be immediately followed by ']' (the seed has no fixed-size `[N]T`
 // yet — that is a later layer); '[]' then a slice-or-path is the element.
-fn parse_slice(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_slice(tokens: []lexer::Token, pos: u64): ParsedType | error {
     // not a '[' → it is a path (a plain or qualified name)
     if !has_token(tokens, pos) {
         return error { message = "expected a type" }
@@ -1910,7 +1910,7 @@ fn parse_slice(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
 // type = union = slice ('|' slice)*    (union loosest, left-associative)
 // The entry point. A single slice with no '|' passes through as itself; a run of
 // '|' collects the members into a UnionType.
-fn parse_type(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_type(tokens: []lexer::Token, pos: u64): ParsedType | error {
     let first = match parse_slice(tokens, pos) {
         error as e => return e
         ParsedType as t => t
@@ -1963,7 +1963,7 @@ type Binding = struct {
 
 // parse_opt_annotation now calls parse_type for the type (instead of expecting a
 // single Ident). The rest of its shape is unchanged (guard over nest):
-fn parse_opt_annotation(tokens: []lexer::Token, pos: u64) -> Annotation | error {
+fn parse_opt_annotation(tokens: []lexer::Token, pos: u64): Annotation | error {
     if !has_token(tokens, pos) {
         return Annotation { has_type = false; type_ann = unit_type(); next = pos }
     }
@@ -2005,10 +2005,10 @@ is a placeholder type for the no-annotation case — a single later concern, lik
   (then `has_type` + `type_ann` collapse into `type_ann: TypeExpr?`).
 - **Out of scope (later layers):** fixed-size arrays (`[N]T`), nullable (`T?`),
   generics (`List(T)`), and function types as first-class type expressions
-  (`fn(...) -> ...` *as* a written type — the passing form 1 uses it; making it a
+  (`fn(...): ...` *as* a written type — the passing form 1 uses it; making it a
   parseable type expression can fold in with `fn`). These await their layers.
 - **Now unblocked:** `fn` (next) — parameter types and return types are type
-  expressions; `parse_type` is what makes `fn tokenize(source: []u8) -> []Token |
+  expressions; `parse_type` is what makes `fn tokenize(source: []u8): []Token |
   error` parseable.
 
 ### A.9 — `fn`: function declaration and call
@@ -2117,7 +2117,7 @@ type Expr = Number | Var | Call | Binary | Unary | Compare
 
 // parse a parameter list `(p1: T1, p2: T2, …)` — comma-separated, possibly empty.
 // Returns the params and the position after the ')'. FLAT (guard over nest).
-fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
+fn parse_params(tokens: []lexer::Token, pos: u64): ParsedParams | error {
     // demand '('
     let p0 = match expect(tokens, pos, lexer::TokenKind::LParen, "expected '(' for parameters") {
         error as e => return e
@@ -2172,9 +2172,9 @@ fn parse_params(tokens: []lexer::Token, pos: u64) -> ParsedParams | error {
     ParsedParams { params = params; next = p + 1 }   // past the ')'
 }
 
-// parse a function declaration: `fn name(params) -> ret { body }`.
+// parse a function declaration: `fn name(params): ret { body }`.
 // caller guarantees tokens[pos] is Fn.
-fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
+fn parse_function(tokens: []lexer::Token, pos: u64): ParsedItem | error {
     // name
     let p_name = pos + 1
     if !has_token(tokens, p_name) {
@@ -2217,7 +2217,7 @@ fn parse_function(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
 
 // parse a block `{ statement* }` — statements until the closing '}'. Distinct from
 // parse_program (which runs until end-of-input). FLAT (guard over nest).
-fn parse_block(tokens: []lexer::Token, pos: u64) -> ParsedBlock | error {
+fn parse_block(tokens: []lexer::Token, pos: u64): ParsedBlock | error {
     let p0 = match expect(tokens, pos, lexer::TokenKind::LBrace, "expected '{' to open a block") {
         error as e => return e
         u64 as np  => np
@@ -2257,7 +2257,7 @@ fn parse_block(tokens: []lexer::Token, pos: u64) -> ParsedBlock | error {
 // src/parser/program.tks   (namespace 'teko::parser') — top level dispatches items
 
 // parse_program: a sequence of top-level ITEMS (functions or statements).
-fn parse_program(tokens: []lexer::Token) -> Program | error {
+fn parse_program(tokens: []lexer::Token): Program | error {
     mut items = teko::list::empty()
     mut p = skip_terminators(tokens, 0)
 
@@ -2282,7 +2282,7 @@ fn parse_program(tokens: []lexer::Token) -> Program | error {
 }
 
 // parse_item: `fn` → a function; otherwise → a statement (lifted into an Item).
-fn parse_item(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
+fn parse_item(tokens: []lexer::Token, pos: u64): ParsedItem | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a top-level item" }
     }
@@ -2314,7 +2314,7 @@ fn parse_item(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
 // parse_atom's Ident case is now: a path, then — if a '(' follows — a CALL;
 // otherwise a variable reference (A.6). The presence of '(' is the whole
 // distinction (M.3 — reading a variable vs. calling a function).
-fn parse_var_or_call(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_var_or_call(tokens: []lexer::Token, pos: u64): Parsed | error {
     // the name (possibly qualified: lexer::foo) — reuse the type path reader's
     // shape, but at expression level we read a path of identifiers.
     let path = match parse_expr_path(tokens, pos) {
@@ -2340,7 +2340,7 @@ fn parse_var_or_call(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 
 // parse an argument list `(e1, e2, …)` — comma-separated expressions, possibly
 // empty. Returns the args and the position after ')'. FLAT (guard over nest).
-fn parse_args(tokens: []lexer::Token, pos: u64) -> ParsedArgs | error {
+fn parse_args(tokens: []lexer::Token, pos: u64): ParsedArgs | error {
     let p0 = match expect(tokens, pos, lexer::TokenKind::LParen, "expected '(' for arguments") {
         error as e => return e
         u64 as np  => np
@@ -2406,7 +2406,7 @@ fn parse_args(tokens: []lexer::Token, pos: u64) -> ParsedArgs | error {
   return type, body block).
 - **Out of scope (later/evolution):** closures and capture (`use`/`inject` —
   evolution, B.10), nested functions (banned, B.10), generics, default/named
-  arguments, methods, and `fn(...) -> ...` written *as* a first-class type
+  arguments, methods, and `fn(...): ...` written *as* a first-class type
   expression (the passing form 1 already types it; making it a parseable type can
   fold into A.8 when needed). State ref-less (B.7), error a value (B.1), no `?`
   (B.16), guard over nest — all as established.
@@ -2515,7 +2515,7 @@ type Item = Function | TypeDecl | Statement
 
 // parse_type_decl: `type Name = <body>` where <body> is struct/enum/variant.
 // caller guarantees tokens[pos] is Type. FLAT (guard over nest).
-fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
+fn parse_type_decl(tokens: []lexer::Token, pos: u64): ParsedItem | error {
     // name
     let p_name = pos + 1
     if !has_token(tokens, p_name) {
@@ -2542,7 +2542,7 @@ fn parse_type_decl(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
 
 // parse_type_body: `struct {…}` | `enum {…}` | <type> (variant). The variant case
 // reuses parse_type (A.8) — a variant is a union of declared types.
-fn parse_type_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
+fn parse_type_body(tokens: []lexer::Token, pos: u64): ParsedBody | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a type body (struct, enum, or a type)" }
     }
@@ -2554,7 +2554,7 @@ fn parse_type_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
 }
 
 // `struct { name: Type; … }` — `;`/newline-separated fields (B.26).
-fn parse_struct_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
+fn parse_struct_body(tokens: []lexer::Token, pos: u64): ParsedBody | error {
     // past `struct`, demand `{`
     let p0 = match expect(tokens, pos + 1, lexer::TokenKind::LBrace, "expected '{' after 'struct'") {
         error as e => return e
@@ -2601,7 +2601,7 @@ fn parse_struct_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
 }
 
 // `enum { Name; … }` — `;`/newline-separated member names (B.26).
-fn parse_enum_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
+fn parse_enum_body(tokens: []lexer::Token, pos: u64): ParsedBody | error {
     let p0 = match expect(tokens, pos + 1, lexer::TokenKind::LBrace, "expected '{' after 'enum'") {
         error as e => return e
         u64 as np  => np
@@ -2639,7 +2639,7 @@ fn parse_enum_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
 
 // a variant body: a union type (A.8). `type Expr = Number | Binary | Unary`.
 // Reuses parse_type entirely — a variant RHS *is* a union of declared types.
-fn parse_variant_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
+fn parse_variant_body(tokens: []lexer::Token, pos: u64): ParsedBody | error {
     let t = match parse_type(tokens, pos) {
         error as e => return e
         ParsedType as t => t
@@ -2653,7 +2653,7 @@ fn parse_variant_body(tokens: []lexer::Token, pos: u64) -> ParsedBody | error {
 
 // parse_item: `fn` → a function; `type` → a type declaration; otherwise → a
 // statement (lifted into an Item). One added arm over A.9.
-fn parse_item(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
+fn parse_item(tokens: []lexer::Token, pos: u64): ParsedItem | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a top-level item" }
     }
@@ -2755,7 +2755,7 @@ type Binding = struct {
 
 // parse_bind_target: after the binding keyword, the target is a name or a `{…}`
 // pattern. Dispatch on the leading token. FLAT (guard over nest).
-fn parse_bind_target(tokens: []lexer::Token, pos: u64) -> ParsedTarget | error {
+fn parse_bind_target(tokens: []lexer::Token, pos: u64): ParsedTarget | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a name or '{' after the binding keyword" }
     }
@@ -2767,14 +2767,14 @@ fn parse_bind_target(tokens: []lexer::Token, pos: u64) -> ParsedTarget | error {
 }
 
 // a simple name target (A.4's case): one identifier.
-fn parse_simple_target(tokens: []lexer::Token, pos: u64) -> ParsedTarget | error {
+fn parse_simple_target(tokens: []lexer::Token, pos: u64): ParsedTarget | error {
     let name = tokens[pos].text
     ParsedTarget { node = SimpleName { name = name }; next = pos + 1 }
 }
 
 // a destructuring pattern `{ x; y }` — `;`/newline-separated field names (B.26),
 // nominal partial selection (B.13). FLAT.
-fn parse_destructure_target(tokens: []lexer::Token, pos: u64) -> ParsedTarget | error {
+fn parse_destructure_target(tokens: []lexer::Token, pos: u64): ParsedTarget | error {
     // pos is `{`. The `{}` field-name reader is shared with the match field pattern
     // (A.14) — one reader, `parse_field_names` (A.17). This target just wraps the names
     // into a `DestructurePattern` (the binding form).
@@ -2789,7 +2789,7 @@ fn parse_destructure_target(tokens: []lexer::Token, pos: u64) -> ParsedTarget | 
 // parse_binding (A.4) now reads a target instead of a bare name. Only the target
 // step changes; the optional annotation, the `=`, and the value are as A.4 (and
 // the whole function stays FLAT via the guard pattern).
-fn parse_binding(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_binding(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     let kind = bind_kind_of(kind_at(tokens, pos))
 
     // target: a name or a destructuring pattern (NEW — replaces A.4's name step)
@@ -2933,7 +2933,7 @@ type Statement = Binding | Assign | Return | ExprStmt
 
 // parse_if: `if cond { then } [else { else } | else if …]`. FLAT (guard over
 // nest). Returns a Parsed whose node is an IfExpr.
-fn parse_if(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_if(tokens: []lexer::Token, pos: u64): Parsed | error {
     // pos is `if`; parse the condition (a full expression)
     let c = match parse_expr(tokens, pos + 1) {
         error as e => return e
@@ -2987,7 +2987,7 @@ fn parse_if(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 // (placed among the binding-keyword checks, before the reassignment/expr cases.)
 
 // parse_return: `return e` — early exit carrying a value. FLAT.
-fn parse_return(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_return(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     // pos is `return`; parse the value expression
     let v = match parse_expr(tokens, pos + 1) {
         error as e => return e
@@ -3001,7 +3001,7 @@ fn parse_return(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
 **Notes for implementers (and the C23 port):**
 - **`if` is an expression at the atom level (B.20).** `parse_atom` gains the `If`
   arm; the if-expression yields a value, so `let m = if … { … } else { … }` and
-  `fn max(...) -> i32 { if a > b { a } else { b } }` both work. A statement-level
+  `fn max(...): i32 { if a > b { a } else { b } }` both work. A statement-level
   `if c { … }` is an expression-statement whose value is discarded. The C23 port
   adds the `If` case to the expression union and the `parse_atom` branch.
 - **`else if` is recursion, not a new construct.** The `else` branch, when it leads
@@ -3101,7 +3101,7 @@ type Statement = Binding | Assign | Return | LoopStmt | BreakStmt | ContinueStmt
 // (placed among the other statement-keyword checks.)
 
 // parse_loop: `loop { body }`. Reuses parse_block (A.9) for the body. FLAT.
-fn parse_loop(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_loop(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     // pos is `loop`; the body block follows
     let b = match parse_block(tokens, pos + 1) {
         error as e => return e
@@ -3112,12 +3112,12 @@ fn parse_loop(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
 }
 
 // parse_break: the bare `break` keyword. No value, no sub-parse.
-fn parse_break(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_break(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     ParsedStmt { node = BreakStmt {}; next = pos + 1 }
 }
 
 // parse_continue: the bare `continue` keyword.
-fn parse_continue(tokens: []lexer::Token, pos: u64) -> ParsedStmt | error {
+fn parse_continue(tokens: []lexer::Token, pos: u64): ParsedStmt | error {
     ParsedStmt { node = ContinueStmt {}; next = pos + 1 }
 }
 ```
@@ -3281,7 +3281,7 @@ type Expr = Number | Var | Call | IfExpr | MatchExpr | Binary | Unary | Compare
 //     lexer::TokenKind::Match => parse_match(tokens, pos)
 
 // parse_match: `match subject { arm; arm; … }`. FLAT (guard over nest).
-fn parse_match(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_match(tokens: []lexer::Token, pos: u64): Parsed | error {
     // pos is `match`; the subject expression
     let subj = match parse_expr(tokens, pos + 1) {
         error as e => return e
@@ -3324,7 +3324,7 @@ fn parse_match(tokens: []lexer::Token, pos: u64) -> Parsed | error {
 }
 
 // parse_arm: `pattern [when guard] => body`. FLAT.
-fn parse_arm(tokens: []lexer::Token, pos: u64) -> ParsedArm | error {
+fn parse_arm(tokens: []lexer::Token, pos: u64): ParsedArm | error {
     // the pattern
     let pat = match parse_pattern(tokens, pos) {
         error as e => return e
@@ -3356,7 +3356,7 @@ fn parse_arm(tokens: []lexer::Token, pos: u64) -> ParsedArm | error {
 }
 
 // parse_opt_guard: an optional `when <expr>`. Pass-through if no `when`. FLAT.
-fn parse_opt_guard(tokens: []lexer::Token, pos: u64) -> Guard | error {
+fn parse_opt_guard(tokens: []lexer::Token, pos: u64): Guard | error {
     if !has_token(tokens, pos) {
         return Guard { has_when = false; guard = no_expr(); next = pos }
     }
@@ -3376,7 +3376,7 @@ fn parse_opt_guard(tokens: []lexer::Token, pos: u64) -> Guard | error {
 
 // parse_pattern: dispatch on the leading token. `_` → wildcard; a literal → a
 // value/range/alt pattern; an Ident (a type) → a variant bind/field pattern. FLAT.
-fn parse_pattern(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
+fn parse_pattern(tokens: []lexer::Token, pos: u64): ParsedPattern | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a pattern" }
     }
@@ -3389,7 +3389,7 @@ fn parse_pattern(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
 }
 
 // `_` → the catch-all.
-fn parse_wildcard_pattern(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
+fn parse_wildcard_pattern(tokens: []lexer::Token, pos: u64): ParsedPattern | error {
     ParsedPattern { node = WildcardPattern {}; next = pos + 1 }
 }
 
@@ -3397,14 +3397,14 @@ fn parse_wildcard_pattern(tokens: []lexer::Token, pos: u64) -> ParsedPattern | e
 // "has_token then kind_at" pair into one flat predicate (guard over nest), as
 // is_reassignment did in A.4. Used wherever a single look-ahead would otherwise
 // nest two `if`s.
-fn is_kind_at(tokens: []lexer::Token, pos: u64, k: lexer::TokenKind) -> bool {
+fn is_kind_at(tokens: []lexer::Token, pos: u64, k: lexer::TokenKind): bool {
     if !has_token(tokens, pos) { return false }
     kind_at(tokens, pos) == k
 }
 
 // a value pattern: a literal, possibly a range (`lo ..= hi`) or alternatives
 // (`a | b`). Reads the first literal, then looks for `..=` or `|`. FLAT.
-fn parse_value_pattern(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
+fn parse_value_pattern(tokens: []lexer::Token, pos: u64): ParsedPattern | error {
     let lo = match parse_atom(tokens, pos) {
         error as e => return e
         Parsed as a => a
@@ -3427,7 +3427,7 @@ fn parse_value_pattern(tokens: []lexer::Token, pos: u64) -> ParsedPattern | erro
 
 // a variant pattern: `Type as name` (bind whole) or `Type { f; g }` (select
 // fields — reuses A.11's field-name reader). Reads the type path, then `as`/`{`.
-fn parse_variant_pattern(tokens: []lexer::Token, pos: u64) -> ParsedPattern | error {
+fn parse_variant_pattern(tokens: []lexer::Token, pos: u64): ParsedPattern | error {
     let path = match parse_expr_path(tokens, pos) {
         error as e => return e
         ParsedPath as pth => pth
@@ -3561,7 +3561,7 @@ type Item = Function | TypeDecl | UseDecl | Statement
 
 // parse_use: `use <path> [as <name>]`. Reuses parse_expr_path for the path.
 // caller guarantees tokens[pos] is Use. FLAT (guard over nest).
-fn parse_use(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
+fn parse_use(tokens: []lexer::Token, pos: u64): ParsedItem | error {
     // the absolute path (reuses the expression-level path reader — A.9)
     let path = match parse_expr_path(tokens, pos + 1) {
         error as e => return e
@@ -3590,10 +3590,10 @@ fn parse_use(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
 }
 
 // small builders: a UseDecl with no explicit alias, or with one.
-fn use_no_alias(path: Path) -> UseDecl {
+fn use_no_alias(path: Path): UseDecl {
     UseDecl { path = path; has_alias = false; alias = empty_slice() }
 }
-fn use_with_alias(path: Path, name: str) -> UseDecl {
+fn use_with_alias(path: Path, name: str): UseDecl {
     UseDecl { path = path; has_alias = true; alias = name }
 }
 ```
@@ -3603,7 +3603,7 @@ fn use_with_alias(path: Path, name: str) -> UseDecl {
 
 // parse_item: `fn` → function; `type` → type decl; `use` → a use; otherwise →
 // a statement (lifted into an Item). One added arm over A.10.
-fn parse_item(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
+fn parse_item(tokens: []lexer::Token, pos: u64): ParsedItem | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a top-level item" }
     }
@@ -3671,7 +3671,7 @@ type str = []byte
 // well-formedness; the only door from raw bytes to `str`. Always-on, so `str` never
 // lies about being UTF-8 (M.3/M.1). (Body: a byte-structure walk — lead byte → its
 // continuation bytes — elided here; its CONTRACT is "valid UTF-8 or error".)  [BOOTSTRAP]
-fn str_from_utf8(b: []byte) -> str | error { /* validate well-formedness; reject if not */ }
+fn str_from_utf8(b: []byte): str | error { /* validate well-formedness; reject if not */ }
 
 // ALPHA — native (the language has it though the byte-level bootstrap does not use it,
 // exactly like bitwise):
@@ -3680,8 +3680,8 @@ fn str_from_utf8(b: []byte) -> str | error { /* validate well-formedness; reject
 //   // iterate a `str` as `char`s, classify, decode to the numeric codepoint, etc.
 //
 // EVOLUTION — foreign codepages only (interop with legacy systems):
-//   fn from_latin1(b: []byte) -> str           // transcode a DECLARED codepage in
-//   fn to_latin1(s: str) -> []byte | error     // transcode out (fails if unrepresentable)
+//   fn from_latin1(b: []byte): str           // transcode a DECLARED codepage in
+//   fn to_latin1(s: str): []byte | error     // transcode out (fails if unrepresentable)
 // Teko NEVER detects an encoding — it validates UTF-8 (always) or transcodes from a
 // codepage the CALLER declares (M.3 — never guess).
 ```
@@ -3731,16 +3731,16 @@ type TokenKind = enum {
 // ASCII, so the scan element is a `byte` and character classes match BYTE literals
 // (B.36). `[]byte` lives only at the IO boundary (read_file → []byte → str_from_utf8 →
 // str). FLAT (guard over nest).
-fn is_digit(c: byte) -> bool {
+fn is_digit(c: byte): bool {
     c >= b'0' && c <= b'9'
 }
-fn is_alpha(c: byte) -> bool {
+fn is_alpha(c: byte): bool {
     (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z')
 }
 
 // read a string literal: `"` already seen at `pos`. Collect bytes until the closing
 // `"`, processing escapes. Returns the token + new pos, or an error (unterminated).
-fn read_str(source: str, pos: u64) -> Scan | error {
+fn read_str(source: str, pos: u64): Scan | error {
     mut p = pos + 1               // past the opening quote
     mut bytes = teko::list::empty()
     loop {
@@ -3769,7 +3769,7 @@ fn read_str(source: str, pos: u64) -> Scan | error {
 
 // read a byte literal: `b'` already seen at `pos` (pos points at `b`). One byte (or
 // one escape) then a closing `'`.
-fn read_byte_lit(source: str, pos: u64) -> Scan | error {
+fn read_byte_lit(source: str, pos: u64): Scan | error {
     let p_open = pos + 2                          // past `b'`
     if p_open >= source.len {
         return error { message = "unterminated byte literal" }
@@ -3809,7 +3809,7 @@ type Expr = Number | Var | Call | IfExpr | MatchExpr | StrLit | ByteLit | Binary
 
 // parse_atom: a Str token → a string node; a Byte token → a byte node. Two arms over
 // A.6 (which added the Ident/Var case). FLAT.
-fn parse_atom(tokens: []lexer::Token, pos: u64) -> Parsed | error {
+fn parse_atom(tokens: []lexer::Token, pos: u64): Parsed | error {
     if !has_token(tokens, pos) {
         return error { message = "expected an expression" }
     }
@@ -3897,7 +3897,7 @@ type Guard         = struct { has_when: bool; guard: Expr; next: u64 } // an opt
 // analogue of A.8's type-level `parse_path`; the segment-reading core is identical, so
 // A.8's `parse_path` is exactly this wrapped in a `NamedType` (see the note). Reused by
 // A.9 (call/var), A.14 (variant pattern), and A.15 (`use`). FLAT (guard over nest).
-fn parse_expr_path(tokens: []lexer::Token, pos: u64) -> ParsedPath | error {
+fn parse_expr_path(tokens: []lexer::Token, pos: u64): ParsedPath | error {
     if !has_token(tokens, pos) {
         return error { message = "expected a name" }
     }
@@ -3933,7 +3933,7 @@ fn parse_expr_path(tokens: []lexer::Token, pos: u64) -> ParsedPath | error {
 // body as part of `parse_destructure_target`). Now ONE reader serves both — A.11's
 // binding target wraps the names in a `DestructurePattern`, A.14's field pattern uses
 // them directly. `pos` is at `{`. FLAT.
-fn parse_field_names(tokens: []lexer::Token, pos: u64) -> ParsedNames | error {
+fn parse_field_names(tokens: []lexer::Token, pos: u64): ParsedNames | error {
     mut names = teko::list::empty()
     mut p = skip_terminators(tokens, pos + 1)       // past `{`
 
@@ -3971,7 +3971,7 @@ fn parse_field_names(tokens: []lexer::Token, pos: u64) -> ParsedNames | error {
 // `parse_value_pattern`); `pos` is at the first `|`. Each `|` is followed by another
 // literal atom; each alternative becomes a `LiteralPattern` (a case of `Pattern`, so it
 // drops straight into `options: []Pattern`). FLAT.
-fn parse_alt_pattern(tokens: []lexer::Token, first: Expr, pos: u64) -> ParsedPattern | error {
+fn parse_alt_pattern(tokens: []lexer::Token, first: Expr, pos: u64): ParsedPattern | error {
     mut options = teko::list::empty()
     options = teko::list::push(options, LiteralPattern { value = first })
     mut p = pos
@@ -3998,7 +3998,7 @@ fn parse_alt_pattern(tokens: []lexer::Token, first: Expr, pos: u64) -> ParsedPat
 // TypeDecl | UseDecl | Statement — A.15). Parse one statement and return it as the item;
 // no wrapper, the union membership carries it (B.14 — a case value is a value of the
 // union). FLAT.
-fn parse_stmt_item(tokens: []lexer::Token, pos: u64) -> ParsedItem | error {
+fn parse_stmt_item(tokens: []lexer::Token, pos: u64): ParsedItem | error {
     let st = match parse_statement(tokens, pos) {
         error as e => return e
         ParsedStmt as s => s
@@ -4658,10 +4658,10 @@ to be audited. A **closed system, without gaps.**
     entirely outside the `ref` ban's jurisdiction (which governs aliasing of mutable *data*, with arenas
     and lifetimes a module-level function does not have).
     - **Syntax (designed here — B.10 gave the concept, this gives the form):**
-      - **The function type** is `fn(ArgTypes) -> RetType` — `fn` doubles as "declare a function" and
+      - **The function type** is `fn(ArgTypes): RetType` — `fn` doubles as "declare a function" and
         "the type of a function," coherently (it means *function* in both; no lie, no new keyword — M.5).
-        Example: `fn([]lexer::Token, u64) -> bool`. It may be **named** with a `type` alias (nominal,
-        B.13) to cut repetition: `type OpPredicate = fn([]lexer::Token, u64) -> bool`.
+        Example: `fn([]lexer::Token, u64): bool`. It may be **named** with a `type` alias (nominal,
+        B.13) to cut repetition: `type OpPredicate = fn([]lexer::Token, u64): bool`.
       - **Passing** is by **bare name**: `parse_level(parse_and, is_oror)`. **Calling** is with
         parentheses: `parse_and(x)`. The presence of `()` distinguishes *call* from *refer* — honest
         (M.3), explicit (M.2), and it needs **no `&`** (the C/Rust "address-of"): introducing `&` would
@@ -4677,9 +4677,9 @@ to be audited. A **closed system, without gaps.**
     module-level function is passed to a higher-order, and a local variable is fixed into it, **named
     in a `use` clause the user writes**:
     ```teko
-    fn maior_que(item: i32, limite: i32) -> bool { item > limite }
+    fn maior_que(item: i32, limite: i32): bool { item > limite }
 
-    fn processa(numeros: []i32) -> []i32 {
+    fn processa(numeros: []i32): []i32 {
         let limite = calcula_limite()
         filter(numeros, maior_que use (limite))   // local state, explicit & nominal
     }
@@ -4699,7 +4699,7 @@ to be audited. A **closed system, without gaps.**
     title → sentence → footnote → chapter:
     ```teko
     #singleton
-    fn get_current_user() -> User
+    fn get_current_user(): User
         inject (http: teko::net::IHttpClient)
     {
         let resp = http.get("/me")
@@ -4830,7 +4830,7 @@ to be audited. A **closed system, without gaps.**
   forced by the prerequisites, not by preference.
 - **Agent rule:** never implement **magic closures** (implicit scope capture) — ever; they lie (M.3).
   **Stateless function passing (form 1) IS seed** — pass a module-level function by bare name, type it
-  `fn(args) -> ret`, call it with `()`; no `&`, no captured state, confined to top-level functions by
+  `fn(args): ret`, call it with `()`; no `&`, no captured state, confined to top-level functions by
   construction. Do **not** implement `use` (form 2) or `inject` (form 3) in the seed — those carry state
   and are evolution. When they arrive, they are the honest forms of "behavior + state," distinguished by
   state-origin (none → function pointer, *now in seed*; caller-local declared → `use`; injected →
@@ -5284,7 +5284,7 @@ to be audited. A **closed system, without gaps.**
   last expression of a block is the value; `return` is only for early exit"). So a
   function ending in `if` —
   ```teko
-  fn max(a: i32, b: i32) -> i32 { if a > b { a } else { b } }
+  fn max(a: i32, b: i32): i32 { if a > b { a } else { b } }
   ```
   — *must* have that `if` produce the return value (it's the last expression). If
   `if` were a statement-only, you'd be forced to write `return` in each branch,
@@ -5423,7 +5423,7 @@ to be audited. A **closed system, without gaps.**
      function:** it's how the operator is *compiled* (the operator already exists; the sign-check is
      its lowering), so it needs no generics and lives in the seed. The operator returns **`bool`**
      (for conditions). For three-way ordering in one evaluation (sort, chained comparators), a
-     **`compare(a, b) -> Ordering`** function returns the **`Ordering` enum** (see B.31). M.1 (the
+     **`compare(a, b): Ordering`** function returns the **`Ordering` enum** (see B.31). M.1 (the
      trap is removed) + M.0 (the sign-check is the direct metal sequence) compose here.
 - **Shift count mechanics (settled carefully — this is metal, define it, no UB):**
   - The rule the programmer sees: the count `n` in `x << n` may be **any integer
@@ -5637,14 +5637,14 @@ to be audited. A **closed system, without gaps.**
   the package/pre-linker model is recorded in LEGISLATION. (The pre-linker + loader are future — pipeline phase.)
 - **First-binary backend = TRANSPILE-TO-C (legislator's choice).** *WAS* — the materialization stages
   (LEGISLATION) named stage 1 = `.tkb` *interpreted* (the bootstrap step) and stage 2 = AOT-native (what ships),
-  implying the first runnable would be an interpreter over the typed tree / `.tkb`. *IS* — for the FIRST
-  executable, the legislator chose to **skip the stage-1 interpreter** and go straight to **transpiling the
+  implying the first runnable would be an legacy engine over the typed tree / `.tkb`. *IS* — for the FIRST
+  executable, the legislator chose to **skip the stage-1 legacy engine** and go straight to **transpiling the
   typed tree to C**, letting the host `cc` produce a native binary. *WHY* — **M.5** (reuse the host toolchain;
-  do not write a native codegen — or even an interpreter VM — when lowering to C reaches a real binary fastest)
+  do not write a native codegen — or even an legacy engine — when lowering to C reaches a real binary fastest)
   **+ M.0** (the metal mapping is direct: Teko ints→stdint, the operators→C operators) **+ M.4** (it still rests
   on the completed checker/typed-AST). Transpile-to-C is thus a *realization of stage 2* (AOT-native via C), not
   a new stage. **Teko targets BOTH execution modes:** (1) transpile-to-C / AOT (this, first) and (2) the
-  `.tkb` VM/interpreter (stage 1) — the VM is a **planned future mode**, not dropped; it just does not gate the
+  `.tkb` legacy engine (stage 1) — the legacy engine is a **planned future mode**, not dropped; it just does not gate the
   first binary (its real prerequisite is the statement/program-level `.tkb` codec, today expression-only). The full path is defined in
   TEKO_ROADMAP_BINARY.md (F0 compile the C mirror → F1 wire the pipeline → F2 emit C + call cc → F3 minimal
   runtime; M0 = a `main.tks` of integer arithmetic + print runs as a native binary).
@@ -5793,7 +5793,7 @@ to be audited. A **closed system, without gaps.**
   - **`::`** — static path (compile-time; *before* an instance): namespaces, nested
     namespaces, and **type constants**. `graph::Node` (type in namespace),
     `teko::math::add` (fn in nested namespace), `Node::MAX` (constant of a type).
-  - **`->`** — return-type arrow in a signature (`fn f(x: i32) -> i32`). Always
+  - **`->`** — return-type arrow in a signature (`fn f(x: i32): i32`). Always
     present (see `void` below). Signature-only, never a match arm.
   - **`=>`** — match-arm arrow (`Circle as c => c.r * c.r * pi`). Match-only, never a
     signature.
@@ -6117,13 +6117,13 @@ to be audited. A **closed system, without gaps.**
     produce the method for the type).
   - **`parse` is static (`::`)**, `to_string` is instance (`.`) — mirroring the
     `::`(static)/`.`(instance) split: `parse` *creates* from a string (`i32::parse("42")`),
-    `to_string` *operates on* an existing value (`x.to_string()`). `parse(value: str?) ->
+    `to_string` *operates on* an existing value (`x.to_string()`). `parse(value: str?):
     T | error` where **T is decorative** (the owning concrete type — `i32::parse ->
     i32 | error`), **not generics** (each `parse` is monomorphized).
 - **Structs get NEITHER auto-imbued — "Inês é morta" (for auto-imbuing):** a struct
   `to_string`/`parse` is not *generated by the compiler* (that would need user-declared `static`
   [banned] or generics [evolution]). **But the user can write them** — either as a **free function**
-  (`fn parse_ponto(s: str?) -> Ponto | error`) or, since B.29, as a **function inside the struct**
+  (`fn parse_ponto(s: str?): Ponto | error`) or, since B.29, as a **function inside the struct**
   (`to_string(self)` instance via `.`, `parse(...)` static via `::`) — discouraged but available, no
   static, no generics, no method-in-struct machinery beyond the bare-`self` sugar. Both forms
   coexist. (See B.29 for the full method model. The interpolation of a struct is still an error
@@ -6131,7 +6131,7 @@ to be audited. A **closed system, without gaps.**
 - **Exception — `error` is a special built-in type with `to_string`:** `error` is
   **global (no namespace**, available everywhere without importing, like the primitives —
   it appears in `T | error` on every checked operation, so importing it everywhere would
-  be absurd), **known to the compiler** (built-in), with an auto-imbued **`to_string() ->
+  be absurd), **known to the compiler** (built-in), with an auto-imbued **`to_string():
   str`**. This is an exception to "structs get no auto-imbued `to_string`," justified by
   necessity: errors exist to be *communicated* (displayed, logged, shown in a panic),
   which requires `error → string`; without it the type can't serve its purpose.
@@ -6352,7 +6352,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
   governs the representation (metal `i8`), while the `enum` (not raw `i8`) honors M.3's naming at
   near-zero cost — both satisfied without the `variant`'s M.5 violation.
 - **Agent rule:** for a boolean test use the operators (`a < b`); for three-way order use
-  `compare(a, b) -> Ordering` and read `Ordering::Less/Equal/Greater`. Do not model three-way order
+  `compare(a, b): Ordering` and read `Ordering::Less/Equal/Greater`. Do not model three-way order
   as a `variant`; the `enum` is the right weight.
 
 ### B.11 — Generics deferred (constraints are the cost)
@@ -6483,9 +6483,9 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
     C/Rust/Zig sense — **compatible with running on a host OS**.
   - **"Bare-metal" — the aspiration, not now:** no OS, device drivers, bare hardware.
     The north star, years away.
-  - **Three materialization stages (build-order, M.4):** **(1) `.tkb`** — IL/bytecode,
-    *interpreted*: the **first materialization** and bootstrap stepping-stone (least
-    "metal," simplest to reach; IO via the interpreter's host syscalls). **(2) AOT-native
+  - **Three materialization stages (build-order, M.4):** **(1) `.tkb`** — the serialized IL
+    form: the **first materialization** and bootstrap stepping-stone (least
+    "metal," simplest to reach; IO via the legacy engine's host syscalls). **(2) AOT-native
     on a host OS** — **the LTS**: native code, no GC, no hidden runtime — the *ethos*
     fully realized; IO via direct host syscalls — **this is what ships**. **(3) bare-metal**
     — the aspiration: native, no OS, IO via drivers; isolated behind the IO boundary
@@ -6507,7 +6507,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
 - **Was (open):** how does the compiler access physical data (read source, write output,
   emit diagnostics)? Streams or whole-file?
 - **Is (slurp, not streams — for the seed):** the seed reads and writes **whole files**:
-  `read_file(path) -> []byte | error` (open, read all, close), `write_file(path, []byte)
+  `read_file(path): []byte | error` (open, read all, close), `write_file(path, []byte)
   -> () | error` (write the whole buffer), and `write_err([]byte)` (diagnostics to
   stderr). **Streams are deferred to evolution** (they enter when large inputs justify
   their weight — the same "enters when use justifies it" pattern as function pointers).
@@ -6519,7 +6519,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
 - **Is (the IO boundary — `teko::io`):** the stdlib module that does file/console IO is
   the **named, thin, isolated** boundary between Teko and the host. Its **interface**
   (`read_file`, `write_file`) is **stable across the materialization stages** (B.34); only
-  its **implementation** descends the stack: the `.tkb` interpreter (stage 1) and the
+  its **implementation** descends the stack: the `.tkb` legacy engine (stage 1) and the
   AOT-native code (stage 2) implement it as host syscalls; a bare-metal target (stage 3)
   would implement it as device drivers. So the aspiration is reachable by **swapping the
   boundary's implementation**, not redesigning.
@@ -6581,7 +6581,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
   is **guessing**, the lie **M.3** forbids. So Teko **never detects**. Two honest paths:
   **(1) validate** UTF-8 (the **always-on** `str_from_utf8` above — the honest substitute
   for detection: it does not prove the file's intent, it *guarantees the invariant*); and
-  **(2) transcode** from/to a **declared** codepage (`from_<cp>(bytes) -> str`, `to_<cp>(str)
+  **(2) transcode** from/to a **declared** codepage (`from_<cp>(bytes): str`, `to_<cp>(str)
   -> []byte | error` — the *caller* declares the codepage; Teko transcodes faithfully, never
   guesses). Path (2) is **evolution**; path (1) is bootstrap.
 - **Why:** **M.3** — a *fixed* `char` would lie about a variable codepoint; a `str` that
@@ -6633,7 +6633,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
      nullable**: `Value? | i32` is illegal → the dev declares `type Val = Value | i32` and marks the
      *return* `-> Val?`. The two failure domains are **disjoint**: value-absence flows through
      `?.`/`??`; recoverable error flows through `match`. The seed implements `T?` **fully** (model +
-     parser + checker + codegen + VM). *(Already canon: `REBOOT_PLAN §202–203`; `LEGISLATION §75` "`?`
+     parser + checker + codegen + legacy engine). *(Already canon: `REBOOT_PLAN §202–203`; `LEGISLATION §75` "`?`
      is reserved strictly for nullability"; B.2.)*
   4. **`error` is the NATIVE lowercase type.** It **supersedes** `Error` / `teko::Error` / `Valor |
      Error`. *(Already lowercase in `src/core.tks`.)*
@@ -6693,7 +6693,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
   - Plus the existing **`bool`** (two values, boolean algebra) and **`byte`** (an octet, newtype over `u8` —
     B.36). **This supersedes the seed's narrower `u8…u64`/`i8…i64` set.**
   - **Staging:** **Tier 1** (`u128`/`i128` + `f16`/`f32`/`f64`) is implemented **now** (lexer → checker →
-    codegen → VM, end-to-end); **`dec`** and **`bigint`** are **named-but-deferred** — larger,
+    codegen → legacy engine, end-to-end); **`dec`** and **`bigint`** are **named-but-deferred** — larger,
     **runtime-backed** types (a 512-bit decimal; a heap-limb bignum) that land when their runtime is built.
 
 - **Is (the three float rulings, ratified):**
@@ -6714,7 +6714,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
   never silent. **M.3** (honest, explicit) — the **literal default is documented** (`f64`) and a narrower
   width is *asked for* by **annotation**, not silently chosen; each type names exactly what it is (`dec` is
   decimal, not binary float; `byte` is an octet, not a number). **M.4** (build order) — Tier 1 enters because
-  lexer/checker/codegen/VM carry it; `dec`/`bigint` are **deferred behind their runtime**, named now so the
+  lexer/checker/codegen/legacy engine carry it; `dec`/`bigint` are **deferred behind their runtime**, named now so the
   spelling is reserved without building ahead of the layer. **M.5** (austere) — naming the deferred types
   costs nothing; only Tier 1 carries implementation weight in the seed.
 
@@ -6736,13 +6736,13 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
 - **Was:** the AOT backend was **transpile-to-C** — the codegen lowered the typed tree to **C**, and the host
   **`cc`** compiled it to a native binary (the legislator's original choice — §B.34/§B.35; TEKO_ROADMAP_BINARY
   Fase 2 "TC"). *Why then:* **M.5** (reuse the host toolchain; realize stage-2 AOT-native without writing a
-  native code generator). Two execution modes were planned: (1) transpile-to-C/AOT, (2) the `.tkb` VM.
+  native code generator). Two execution modes were planned: (1) transpile-to-C/AOT, (2) the `.tkb` legacy engine.
 
 - **Is (legislator, 2026-06-24):** **transpile-to-C is REVOKED** as the destination architecture. Teko will
   build its **OWN native backend** — a direct native code generator (typed tree / `.tkb` → native object/binary),
   realizing the Constitution's **stage-2 (AOT-native on a host OS)** *without* `cc` as an intermediary.
   **Sequencing:** *conclude ALL current work FIRST*; the native backend is **not started** until the rest is
-  done. The **`.tkb` VM (stage-1)** is **unaffected** and stays (debug/test + differential-correctness anchor).
+  done. The **`.tkb` legacy engine (stage-1)** is **unaffected** and stays (debug/test + differential-correctness anchor).
 
 - **Why:** **M.0** (the *ethos* is the metal — native code with no C middleman is closer to the silicon than
   "native via a transpiled C intermediary"). **M.4** (build order — the front end + checker + middle must be
@@ -6752,12 +6752,12 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
 
 - **Resolved (operational, legislator 2026-06-24):** transpile-to-C is **revoked as PRIMARY but RETAINED — kept
   fully equalized — as a permanent FALLBACK and DIFFERENTIAL-CORRECTNESS COMPARATIVE.** *Why:* "we need to keep a
-  fallback and comparative." So **three** execution paths must agree: the `.tkb` **VM**, the **transpile-to-C/`cc`**
+  fallback and comparative." So **three** execution paths must agree: the `.tkb` **legacy engine**, the **transpile-to-C/`cc`**
   path (fallback + comparative), and the future **native backend** (primary). **Every wave lands in ALL active
-  paths — codegen is NOT frozen** (W4/W5 etc. go into VM *and* codegen now; the native backend later).
+  paths — codegen is NOT frozen** (W4/W5 etc. go into legacy engine *and* codegen now; the native backend later).
 
 - **Agent rule:** do **not** start the native backend yet; **conclude the current equalization** first, applying
-  each wave to **both** the VM and the transpile-to-C codegen (they + the future native backend are the differential
+  each wave to **both** the legacy engine and the transpile-to-C codegen (they + the future native backend are the differential
   anchor — M.1). Do not delete the C path. The Constitution's three materialization stages are unchanged (only
   stage-2's *shipping implementation* moves from C-transpile to a native codegen; C-transpile lives on as fallback).
 
@@ -6766,7 +6766,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
 - **Was (§B.38):** the native numeric set was **`u8…u128`/`i8…i128`** + **`f16`/`f32`/`f64`** + `dec` +
   `bigint`, staged as **Tier 1** (`u128`/`i128` + the three floats) implemented now, `dec`/`bigint`
   named-but-deferred. The ~11 internal carrier subsystems (the parser's `Number.value`, the const-fold
-  value, the two differential interpreters, the LIR constant, codegen's digit printer, `bigint`'s own
+  value, the two differential legacy engines, the LIR constant, codegen's digit printer, `bigint`'s own
   internal magnitude, `FlagsBody`'s bit-values, and the `teko::time`/`teko_rt` timestamp chain) were all
   typed `i128`/`u128` to carry a *user's* potential 128-bit value losslessly through the pipeline.
 
@@ -6779,7 +6779,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
   `scope.tks::builtin_type` honestly rejects the three names with a diagnostic naming the escape hatch,
   rather than falling through to a generic "unknown type" error (M.3). Every internal carrier the ~11
   subsystems used is narrowed to a plain `i64`/`u64` (a sign+64-bit-magnitude pair for the literal/
-  const-fold carriers, a raw 64-bit two's-complement register for the two interpreters), and the whole
+  const-fold carriers, a raw 64-bit two's-complement register for the two legacy engines), and the whole
   128-bit backend topology (register-pair isel routes on multiple targets, the wasm `C1-i128`/`C1-f16`
   honest-stops, the `PrimKind`/`LType` enum members and their match cascades) is deleted as dead code —
   no producer can ever construct a value needing it again.
@@ -6793,7 +6793,7 @@ the struct's namespace, method = sugar), adapted to Teko (value-semantics, no `r
   a silent truncation ("compilar em falso" was explicitly considered and rejected — the reframe makes
   honest rejection affordable instead). **M.3** (name the barrier) — the three honest-stop diagnostics
   name exactly what was removed and where to go instead. **M.5** (austerity) — deleting ~11 carrier
-  subsystems' 128-bit special-casing plus the register-pair backend topology (isel/ABI/interp arms with
+  subsystems' 128-bit special-casing plus the register-pair backend topology (isel/ABI/oracle arms with
   no remaining producer) is pure weight reduction; nothing shipped ever depended on a value actually
   exceeding 64 bits (the only producers were the 128-bit tests/fixtures themselves, swept first).
 
@@ -6921,9 +6921,9 @@ type Retangulo = struct {
     largura: f64
     altura: f64
 
-    fn area(r) -> f64 { r.largura * r.altura }            // instance (self = r, copy)
-    fn to_string(r) -> str { $"{r.largura}x{r.altura}" }  // instance
-    fn quadrado(lado: f64) -> Retangulo {                  // static (no self) — constructor
+    fn area(r): f64 { r.largura * r.altura }            // instance (self = r, copy)
+    fn to_string(r): str { $"{r.largura}x{r.altura}" }  // instance
+    fn quadrado(lado: f64): Retangulo {                  // static (no self) — constructor
         Retangulo { largura = lado; altura = lado }
     }
 }
@@ -6948,7 +6948,7 @@ type Texto  = struct { conteudo: str }
 type No = variant Numero | Texto
 
 // match binds with `as` (whole) or struct-form { } (by field); newline separators:
-fn render(no: No) -> str {
+fn render(no: No): str {
     match no {
         Numero as n  => n.valor.to_string()
         Texto as t   => t.conteudo
@@ -6956,7 +6956,7 @@ fn render(no: No) -> str {
 }
 
 // error is ALWAYS handled with match (no `?` propagation in the seed — B.16):
-fn carrega(caminho: str) -> Config | error {
+fn carrega(caminho: str): Config | error {
     let dados = arquivo::le(caminho)   // → str | error
     match dados {
         str as texto => Config::parse(texto)

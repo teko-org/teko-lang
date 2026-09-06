@@ -1,72 +1,45 @@
-// src/build/discover.tks   (namespace 'teko::build')
-//
-// File-set enumeration + namespace mapping — the SECOND step of project-based
-// compilation (after the manifest read, A1). Given the canonical root `name` and
-// the `source` dir, walk the source tree and map every `.tks`/`.tkt` to its
-// namespace (LEGISLATION §181–188; REBOOT_PLAN §2.6 — "namespaces = diretório").
 
-// a discovered source file: its path on disk and the namespace it belongs to.
-// (.tkt tests live BESIDE the code they test — same namespace, no /test dir.)
 pub type SourceFile = struct {
-    path: str   // path on disk (relative to the project, e.g. "src/lexer/lexer.tks")
-    namespace: str   // canonical namespace (e.g. "teko::lexer")
+    path: str
+    namespace: str
+    content: str
 }
 
-// discover — walk the `source` dir recursively, collect every `.tks`/`.tkt`, and
-// map each file to its namespace. THE RULE: the namespace is `name` + the file's
-// directory path RELATIVE to `source`, each directory segment joined by `::`; the
-// `source` root itself is INVISIBLE (stripped). A file directly under `source` is
-// the bare root `name`. Examples for name="teko", source="src":
-//   src/lexer/lexer.tks    → teko::lexer
-//   src/checker/typer.tks  → teko::checker
-//   src/build/manifest.tks → teko::build
-//   src/core.tks           → teko          (bare root)
-// (main.tks lives at the PROJECT root, NOT under source — out of scope; discover
-//  walks only `source`.)
-// does `name` end with `.tks` or `.tkt`? (the Teko source/test extensions.)
-fn dsc_is_teko_source(name: str) -> bool {
-    teko::str::ends_with(name, ".tks") || teko::str::ends_with(name, ".tkt")
+fn dsc_is_teko_source(name: str): bool {
+    name.ends_with(".tks") || name.ends_with(".tkt")
 }
 
-// append every element of `b` onto `a` (slices are fixed; grow by copy — collections #2).
-fn dsc_append(a: []SourceFile, b: []SourceFile) -> []SourceFile {
-    mut out = a
-    mut i: u64 = 0
+fn dsc_append(a: []SourceFile, b: []SourceFile): []SourceFile {
+    var out = a
+    var i: u64 = 0
     loop {
         if i >= b.len { break }
-        out = teko::list::push(out, b[i])
+        out = [..out, b[i]]
         i = i + 1
     }
     out
 }
 
-// the recursive walk (mirrors discover.c::walk). `dir` is the directory on disk; `ns` is the
-// namespace for files DIRECTLY in it (the source root already stripped). An entry is CLASSIFIED
-// by trying to list it: list_dir succeeds on a directory (→ recurse with ns + "::" + name),
-// fails on a regular file (→ collect a .tks/.tkt under THIS namespace). This mirrors the C
-// seed's opendir-to-classify (no d_type — M.1, one contained host edge: teko::fs::list_dir).
-fn dsc_walk(dir: str, ns: str) -> []SourceFile | error {
-    let entries = match teko::fs::list_dir(dir) {
+fn dsc_walk(dir: str, ns: str): []SourceFile | error {
+    var entries = match teko::fs::list_dir(dir) {
         []str as e => e
         error => return error { message = teko::str::concat("discover: cannot open source directory: ", dir) }
     }
-    mut out: []SourceFile = teko::list::empty()
-    mut i: u64 = 0
+    var out: []SourceFile = []
+    var i: u64 = 0
     loop {
         if i >= entries.len { break }
-        let nm = entries[i]
-        let child = teko::str::concat(dir, "/", nm)   // child path on disk
+        var nm = entries[i]
+        var child = teko::str::concat(dir, "/", nm)
         match teko::fs::list_dir(child) {
             []str as _ => {
-                // a directory → recurse with the extended namespace ns + "::" + name.
-                let cns = teko::str::concat(ns, "::", nm)
-                let sub = match dsc_walk(child, cns) { []SourceFile as s => s; error as e => return e }
+                var cns = teko::str::concat(ns, "::", nm)
+                var sub = match dsc_walk(child, cns) { []SourceFile as s => s; error as e => return e }
                 out = dsc_append(out, sub)
             }
             error => {
-                // a regular file → keep only .tks/.tkt, mapped to THIS dir's namespace.
                 if dsc_is_teko_source(nm) {
-                    out = teko::list::push(out, SourceFile { path = child; namespace = ns })
+                    out = [..out, SourceFile { path = child; namespace = ns; content = "" }]
                 }
             }
         }
@@ -75,9 +48,6 @@ fn dsc_walk(dir: str, ns: str) -> []SourceFile | error {
     out
 }
 
-// discover — seed the walk at `source` with the bare root `name`, so files directly under
-// `source` get the bare root namespace and the source root is invisible (never a segment).
-// (.tks mirror of discover.c::tk_discover.)
-fn discover(name: str, source: str) -> []SourceFile | error {
+fn discover(name: str, source: str): []SourceFile | error {
     dsc_walk(source, name)
 }

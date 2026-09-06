@@ -1,127 +1,41 @@
-// src/checker/metrics.tks  (namespace 'teko::checker')
 
 use teko::parser
 
-/**
- * The D4 determinism gate (`cast-width-hygiene-0.3.1.md` §5, owner ruling 2026-07-24,
- * ">=98% determinístico"): ARITH-CAST-RATE = the fraction of arithmetic/assignment
- * expressions (`TBinary` over an arith/bitwise op, `TAssign`, `TBinding`) whose operand
- * tree carries a "conversion" — a bare `x to T` (`TCast`) OR a `teko::casting::*` call
- * (D5 refinement; both are the raríssima exception the gate bounds, counted as the SAME
- * unit per §5). Target: `total == 0` is vacuously 0% (an empty/degenerate program is not
- * a violation); otherwise `with_conversion / total <= 0.02`.
- */
 pub type ArithCastRateReport = struct {
-    /**
-     * total — the number of arithmetic/assignment expressions visited.
-     */
     total: u64
-    /**
-     * with_conversion — how many of those carry a `to` or a `teko::casting::*` call
-     * anywhere in their own operand tree.
-     */
     with_conversion: u64
 }
 
-/**
- * arith_cast_rate_empty — the zero-visits report (an empty program vacuously gates green).
- *
- * @return the empty `ArithCastRateReport`
- */
-fn arith_cast_rate_empty() -> ArithCastRateReport { ArithCastRateReport { total = 0; with_conversion = 0 } }
+fn arith_cast_rate_empty(): ArithCastRateReport { ArithCastRateReport { total = 0; with_conversion = 0 } }
 
-/**
- * arith_cast_rate_note — `w` with one more arithmetic/assignment expression visited, its
- * `with_conversion` bumped iff `e`'s own operand tree carries a conversion.
- *
- * @param w  the accumulated report so far
- * @param e  the arithmetic/assignment expression node just visited (the WHOLE node, so its
- *           own operand tree is exactly what `expr_has_conversion` walks)
- * @return   the updated report
- */
-fn arith_cast_rate_note(w: ArithCastRateReport, e: TExpr) -> ArithCastRateReport {
-    let bump: u64 = if expr_has_conversion(e) { 1 } else { 0 }
+pub fn arith_cast_rate_from(total: u64, with_conversion: u64): ArithCastRateReport {
+    ArithCastRateReport { total = total; with_conversion = with_conversion }
+}
+
+fn arith_cast_rate_note(w: ArithCastRateReport, e: TExpr): ArithCastRateReport {
+    var bump: u64 = if expr_has_conversion(e) { 1 } else { 0 }
     ArithCastRateReport { total = w.total + 1; with_conversion = w.with_conversion + bump }
 }
 
-/**
- * arith_cast_rate_pct — the report's ARITH-CAST-RATE as a percentage (0.0 when `total == 0`
- * — vacuously green).
- *
- * @param r  the accumulated report
- * @return   `100.0 * with_conversion / total`, or `0.0` when `total == 0`
- */
-pub fn arith_cast_rate_pct(r: ArithCastRateReport) -> f64 {
+pub fn arith_cast_rate_pct(r: ArithCastRateReport): f64 {
     if r.total == 0 { return 0.0 }
     (100.0 * (r.with_conversion to f64)) / (r.total to f64)
 }
 
-/**
- * ARITH_CAST_RATE_CEILING — the D4 ceiling, in percent.
- *
- * **5%, not the originally ratified 2%, and this is a DATED CONCESSION with a stated
- * ratchet — not a quiet relaxation.** Owner ruling 2026-07-27: *"Arith, podemos finalizar
- * isso na .32, ou vamos piorar o cenário sem entregar nada por mais uma semana, ou, posso
- * baixar a guarda: <= 5% e então habilita o D4."*
- *
- * The 2% ceiling (D4, ratified 2026-07-24) was never enforced by anything: the corpus has
- * measured ~3.40% since C4 landed, so wiring the gate at 2% would have reddened every PR
- * against the existing tree. The result was a ceiling that existed only in documentation
- * while the class it bounds went unmeasured in CI — and that mattered a great deal more
- * once D1 was downgraded from an error to a warning (2026-07-27), because D4 became the
- * ONLY instrument still enforcing the cast-hygiene policy.
- *
- * A ceiling of 5% that RUNS beats a ceiling of 2% that does not. At ~3.40% the corpus has
- * real but finite headroom: the gate cannot be satisfied by drift, and any wagon that adds
- * conversions in bulk trips it.
- *
- * **The ratchet:** this number only ever goes DOWN. The signature sweep over the remaining
- * cast-dense wire-format files (`*_consts.tks`/`objfile_*.tks` — C3's own explicitly
- * out-of-scope tier) is what buys the return to 2%, and the owner named .32 as its window.
- * Raising it requires a new ruling; lowering it requires only that the corpus got better.
- *
- * @since 0.3.1 (C5); ceiling revised 2026-07-27
- */
 pub const ARITH_CAST_RATE_CEILING: f64 = 5.0
 
-/**
- * arith_cast_rate_gate_ok — the D4 gate itself: true iff the rate is at or under
- * `ARITH_CAST_RATE_CEILING`.
- *
- * @param r  the accumulated report
- * @return   whether the corpus passes the ceiling
- */
-pub fn arith_cast_rate_gate_ok(r: ArithCastRateReport) -> bool {
+pub fn arith_cast_rate_gate_ok(r: ArithCastRateReport): bool {
     arith_cast_rate_pct(r) <= ARITH_CAST_RATE_CEILING
 }
 
-/**
- * call_is_casting — is `c` a call into the `teko::casting` module (the D5 no-panic
- * checked-narrowing surface)? Its resolved namespace (`call_ns`, set by the checker's
- * `call_ns` — §49) is the one source of truth; a bare/unresolved/builtin call carries `""`.
- *
- * @param c  the typed call node
- * @return   whether `c` targets `teko::casting::*`
- */
-fn call_is_casting(c: TCall) -> bool { c.call_ns == "teko::casting" }
+fn call_is_casting(c: TCall): bool { c.call_ns == "teko::casting" }
 
-/**
- * expr_has_conversion — true iff `e`'s own operand subtree contains a `TCast` (a bare `to`)
- * OR a call into `teko::casting::*` ANYWHERE beneath it (D5 — both count as the SAME
- * "conversion" unit, §5). Mirrors `coverage.tks::cov_walk_expr`'s exhaustive descent (every
- * `TExprKind` arm), folding a boolean OR instead of accumulating line/branch state; recurses
- * into a nested `if`/`match`'s branch BLOCKS too (`block_has_conversion`) since a conversion
- * hiding inside a value-producing branch is still part of the enclosing expression's tree.
- *
- * @param e  the expression whose operand tree is searched
- * @return   whether a conversion is present anywhere beneath `e` (including `e` itself)
- */
-fn expr_has_conversion(e: TExpr) -> bool {
+fn expr_has_conversion(e: TExpr): bool {
     match e.kind {
         TCast => true
         TCall as c => {
             if call_is_casting(c) { return true }
-            mut i = 0
+            var i = 0
             loop { if i >= c.args.len { break }; if expr_has_conversion(c.args[i]) { return true }; i++ }
             false
         }
@@ -129,7 +43,7 @@ fn expr_has_conversion(e: TExpr) -> bool {
         TUnary as u => expr_has_conversion(u.operand)
         TCompare as cm => {
             if expr_has_conversion(cm.first) { return true }
-            mut i = 0
+            var i = 0
             loop { if i >= cm.rest.len { break }; if expr_has_conversion(cm.rest[i].operand) { return true }; i++ }
             false
         }
@@ -141,7 +55,7 @@ fn expr_has_conversion(e: TExpr) -> bool {
         }
         TMatchExpr as m => {
             if expr_has_conversion(m.subject) { return true }
-            mut i = 0
+            var i = 0
             loop {
                 if i >= m.arms.len { break }
                 if m.arms[i].has_when && expr_has_conversion(m.arms[i].guard) { return true }
@@ -151,23 +65,21 @@ fn expr_has_conversion(e: TExpr) -> bool {
             false
         }
         TFieldAccess as fa => expr_has_conversion(fa.receiver)
-        TSafeFieldAccess as sfa => expr_has_conversion(sfa.receiver)
-        TCoalesce as co => expr_has_conversion(co.left) || expr_has_conversion(co.right)
         TIndex as ix => expr_has_conversion(ix.receiver) || expr_has_conversion(ix.index)
         TStructInit as si => {
-            mut i = 0
+            var i = 0
             loop { if i >= si.field_vals.len { break }; if expr_has_conversion(si.field_vals[i]) { return true }; i++ }
             false
         }
         TInterp as ip => {
-            mut i = 0
+            var i = 0
             loop {
                 if i >= ip.holes.len { break }
                 if expr_has_conversion(ip.holes[i]) { return true }
                 if i < ip.specs.len {
                     match ip.specs[i].kind {
                         TFSpecDynamic as fd => {
-                            mut k = 0
+                            var k = 0
                             loop { if k >= fd.args.len { break }; if expr_has_conversion(fd.args[k]) { return true }; k++ }
                         }
                         _ => { }
@@ -179,42 +91,28 @@ fn expr_has_conversion(e: TExpr) -> bool {
         }
         TInExpr as ie => {
             if expr_has_conversion(ie.lhs) { return true }
-            mut i = 0
+            var i = 0
             loop { if i >= ie.elems.len { break }; if expr_has_conversion(ie.elems[i]) { return true }; i++ }
             false
         }
         TArrayLit as al => {
-            mut i = 0
+            var i = 0
             loop { if i >= al.elements.len { break }; if expr_has_conversion(al.elements[i].expr) { return true }; i++ }
             false
         }
         TBorrow as bo => expr_has_conversion(bo.operand)
+        TBlockExpr as b => block_has_conversion(b.body)
         _ => false
     }
 }
 
-/**
- * block_has_conversion — true iff any statement of `stmts` (recursively) carries a
- * conversion, the block-level twin of `expr_has_conversion`.
- *
- * @param stmts  the statement block to search
- * @return       whether a conversion is present anywhere in the block
- */
-fn block_has_conversion(stmts: []TStatement) -> bool {
-    mut i = 0
+fn block_has_conversion(stmts: []@TStatement()): bool {
+    var i = 0
     loop { if i >= stmts.len { break }; if stmt_has_conversion(stmts[i]) { return true }; i++ }
     false
 }
 
-/**
- * stmt_has_conversion — true iff `s`'s own expression(s) carry a conversion anywhere,
- * recursing into a nested block (`loop`/`adopt`) the same way `coverage.tks::cov_walk_stmt`
- * does for its own metrics.
- *
- * @param s  the statement to search
- * @return   whether a conversion is present anywhere in `s`
- */
-fn stmt_has_conversion(s: TStatement) -> bool {
+fn stmt_has_conversion(s: @TStatement()): bool {
     match s {
         TBinding as b => expr_has_conversion(b.value)
         TAssign as a => expr_has_conversion(a.value) || (parser::assign_has_target(a.kind) && expr_has_conversion(a.target))
@@ -222,49 +120,39 @@ fn stmt_has_conversion(s: TStatement) -> bool {
         TLoopStmt as l => block_has_conversion(l.init) || block_has_conversion(l.body)
         TExprStmt as x => expr_has_conversion(x.expr)
         TAdoptStmt as ad => block_has_conversion(ad.body)
+        TBlockStmt as b => block_has_conversion(b.body)
         _ => false
     }
 }
 
-/**
- * arith_cast_rate_walk_expr — visit `e` and every expression reachable from it, noting each
- * `TBinary` over an arith/bitwise op (`op_is_arith`/`op_is_arith_bitwise`, `expr.tks`) into
- * `w` (D4's target regime — NOT shift, NOT logical `&&`/`||`, matching the W-RULE's own
- * scope). Descends into every `TExprKind` arm so a nested arith op inside a larger
- * expression (an `if`/`match` arm, a call argument, …) is visited too.
- *
- * @param e  the expression to walk
- * @param w  the accumulated report
- * @return   `w` with every arith/bitwise `TBinary` reachable from `e` noted
- */
-fn arith_cast_rate_walk_expr(e: TExpr, w: ArithCastRateReport) -> ArithCastRateReport {
+fn arith_cast_rate_walk_expr(e: TExpr, w: ArithCastRateReport): ArithCastRateReport {
     match e.kind {
         TBinary as b => {
-            let w1 = if op_is_arith(b.op) || op_is_arith_bitwise(b.op) { arith_cast_rate_note(w, e) } else { w }
+            var w1 = if op_is_arith(b.op) || op_is_arith_bitwise(b.op) { arith_cast_rate_note(w, e) } else { w }
             arith_cast_rate_walk_expr(b.right, arith_cast_rate_walk_expr(b.left, w1))
         }
         TUnary as u => arith_cast_rate_walk_expr(u.operand, w)
         TCompare as cm => {
-            mut a = arith_cast_rate_walk_expr(cm.first, w)
-            mut i = 0
+            var a = arith_cast_rate_walk_expr(cm.first, w)
+            var i = 0
             loop { if i >= cm.rest.len { break }; a = arith_cast_rate_walk_expr(cm.rest[i].operand, a); i++ }
             a
         }
         TCall as c => {
-            mut a = w
-            mut i = 0
+            var a = w
+            var i = 0
             loop { if i >= c.args.len { break }; a = arith_cast_rate_walk_expr(c.args[i], a); i++ }
             a
         }
         TCast as c => arith_cast_rate_walk_expr(c.expr, w)
         TIfExpr as f => {
-            let a1 = arith_cast_rate_walk_expr(f.cond, w)
-            let a2 = arith_cast_rate_walk_block(f.then_blk, a1)
+            var a1 = arith_cast_rate_walk_expr(f.cond, w)
+            var a2 = arith_cast_rate_walk_block(f.then_blk, a1)
             if f.has_else { arith_cast_rate_walk_block(f.else_blk, a2) } else { a2 }
         }
         TMatchExpr as m => {
-            mut a = arith_cast_rate_walk_expr(m.subject, w)
-            mut i = 0
+            var a = arith_cast_rate_walk_expr(m.subject, w)
+            var i = 0
             loop {
                 if i >= m.arms.len { break }
                 if m.arms[i].has_when { a = arith_cast_rate_walk_expr(m.arms[i].guard, a) }
@@ -274,25 +162,23 @@ fn arith_cast_rate_walk_expr(e: TExpr, w: ArithCastRateReport) -> ArithCastRateR
             a
         }
         TFieldAccess as fa => arith_cast_rate_walk_expr(fa.receiver, w)
-        TSafeFieldAccess as sfa => arith_cast_rate_walk_expr(sfa.receiver, w)
-        TCoalesce as co => arith_cast_rate_walk_expr(co.right, arith_cast_rate_walk_expr(co.left, w))
         TIndex as ix => arith_cast_rate_walk_expr(ix.index, arith_cast_rate_walk_expr(ix.receiver, w))
         TStructInit as si => {
-            mut a = w
-            mut i = 0
+            var a = w
+            var i = 0
             loop { if i >= si.field_vals.len { break }; a = arith_cast_rate_walk_expr(si.field_vals[i], a); i++ }
             a
         }
         TInterp as ip => {
-            mut a = w
-            mut i = 0
+            var a = w
+            var i = 0
             loop {
                 if i >= ip.holes.len { break }
                 a = arith_cast_rate_walk_expr(ip.holes[i], a)
                 if i < ip.specs.len {
                     match ip.specs[i].kind {
                         TFSpecDynamic as fd => {
-                            mut k = 0
+                            var k = 0
                             loop { if k >= fd.args.len { break }; a = arith_cast_rate_walk_expr(fd.args[k], a); k++ }
                         }
                         _ => { }
@@ -303,81 +189,56 @@ fn arith_cast_rate_walk_expr(e: TExpr, w: ArithCastRateReport) -> ArithCastRateR
             a
         }
         TInExpr as ie => {
-            mut a = arith_cast_rate_walk_expr(ie.lhs, w)
-            mut i = 0
+            var a = arith_cast_rate_walk_expr(ie.lhs, w)
+            var i = 0
             loop { if i >= ie.elems.len { break }; a = arith_cast_rate_walk_expr(ie.elems[i], a); i++ }
             a
         }
         TArrayLit as al => {
-            mut a = w
-            mut i = 0
+            var a = w
+            var i = 0
             loop { if i >= al.elements.len { break }; a = arith_cast_rate_walk_expr(al.elements[i].expr, a); i++ }
             a
         }
         TBorrow as bo => arith_cast_rate_walk_expr(bo.operand, w)
+        TBlockExpr as b => arith_cast_rate_walk_block(b.body, w)
         _ => w
     }
 }
 
-/**
- * arith_cast_rate_walk_stmt — visit `s`, noting its own `TBinding`/`TAssign` (D4's other two
- * target node kinds — `TBinary` is noted by `arith_cast_rate_walk_expr` itself) and
- * descending into its expression(s) for nested arith ops, mirroring
- * `coverage.tks::cov_walk_stmt`'s statement shape.
- *
- * @param s  the statement to walk
- * @param w  the accumulated report
- * @return   `w` with every arith/bitwise `TBinary` plus `s`'s own `TBinding`/`TAssign`
- *           (if any) noted
- */
-fn arith_cast_rate_walk_stmt(s: TStatement, w: ArithCastRateReport) -> ArithCastRateReport {
+fn arith_cast_rate_walk_stmt(s: @TStatement(), w: ArithCastRateReport): ArithCastRateReport {
     match s {
         TBinding as b => arith_cast_rate_walk_expr(b.value, arith_cast_rate_note(w, b.value))
         TAssign as a => {
-            let w1 = arith_cast_rate_note(w, a.value)
-            let w2 = arith_cast_rate_walk_expr(a.value, w1)
+            var w1 = arith_cast_rate_note(w, a.value)
+            var w2 = arith_cast_rate_walk_expr(a.value, w1)
             if parser::assign_has_target(a.kind) { arith_cast_rate_walk_expr(a.target, w2) } else { w2 }
         }
         TReturn as r => if r.has_value { arith_cast_rate_walk_expr(r.value, w) } else { w }
         TLoopStmt as l => arith_cast_rate_walk_block(l.body, arith_cast_rate_walk_block(l.init, w))
         TExprStmt as x => arith_cast_rate_walk_expr(x.expr, w)
         TAdoptStmt as ad => arith_cast_rate_walk_block(ad.body, w)
+        TBlockStmt as b => arith_cast_rate_walk_block(b.body, w)
         _ => w
     }
 }
 
-/**
- * arith_cast_rate_walk_block — walk every statement of `stmts` in order, threading the
- * report through.
- *
- * @param stmts  the statement block to walk
- * @param w      the accumulated report
- * @return       `w` with the whole block noted
- */
-fn arith_cast_rate_walk_block(stmts: []TStatement, w: ArithCastRateReport) -> ArithCastRateReport {
-    mut a = w
-    mut i = 0
+fn arith_cast_rate_walk_block(stmts: []@TStatement(), w: ArithCastRateReport): ArithCastRateReport {
+    var a = w
+    var i = 0
     loop { if i >= stmts.len { break }; a = arith_cast_rate_walk_stmt(stmts[i], a); i++ }
     a
 }
 
-/**
- * arith_cast_rate_report — the D4 ARITH-CAST-RATE report over a whole typed program: every
- * function body, every top-level loose statement, and every module-level `const`
- * initializer.
- *
- * @param prog  the typed program
- * @return      the accumulated `ArithCastRateReport`
- */
-pub fn arith_cast_rate_report(prog: TProgram) -> ArithCastRateReport {
-    mut w = arith_cast_rate_empty()
-    mut i = 0
+pub fn arith_cast_rate_report(prog: TProgram): ArithCastRateReport {
+    var w = arith_cast_rate_empty()
+    var i = 0
     loop {
         if i >= prog.items.len { break }
         match prog.items[i] {
             TFunction as f => w = arith_cast_rate_walk_block(f.body, w)
             TConstDecl as cd => w = arith_cast_rate_walk_expr(cd.init, w)
-            TStatement as s => w = arith_cast_rate_walk_stmt(s, w)
+            (@TStatement()) as s => w = arith_cast_rate_walk_stmt(s, w)
             _ => { }
         }
         i++

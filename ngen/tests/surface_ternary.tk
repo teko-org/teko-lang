@@ -1,0 +1,109 @@
+// surface_ternary.tk -- the ternary operator `c ? a : b` (D228, entrega 5,
+// crumb ternary): C#'s own spelling, hoisted at a pass() to the `if`/local
+// the core already lowers to (ngen/teko_ternary.tk).
+//
+// What each part of `main` proves, in order:
+//
+//   1. an initializer, and an argument position;
+//   2. a right-associative chain, `c1 ? a : c2 ? b : d`;
+//   3. lazy arms -- a counter proves only the taken branch ever runs;
+//   4. the condition of a `while`, reevaluated every iteration (the loop
+//      runs exactly the number of times the ternary's own condition allows);
+//   5. class-typed arms, and `rt_live()` proving no object was allocated
+//      just to pick between two that already existed;
+//   6. a `return` inside an `if` written without braces;
+//   7. a ternary inside a method's own body.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 calls_true = 0;
+i64 calls_false = 0;
+
+i64 pick_true(i64 v) {
+    calls_true = calls_true + 1;
+    return v;
+}
+
+i64 pick_false(i64 v) {
+    calls_false = calls_false + 1;
+    return v;
+}
+
+i64 sum(i64 a, i64 b) {
+    return a + b;
+}
+
+i64 chained(i64 n) {
+    return n == 1 ? 10 : n == 2 ? 20 : 30;
+}
+
+i64 with_return(i64 c) {
+    if (c != 0) return c == 1 ? 100 : 200;
+    return 0;
+}
+
+class Cell {
+    public i64 v;
+    public Cell(i64 x) { v = x; }
+}
+
+class Box {
+    public i64 factor;
+    public Box(i64 f) { factor = f; }
+    public i64 pick(i64 c, i64 a, i64 b) {
+        return c != 0 ? a * factor : b * factor;
+    }
+}
+
+i64 main() {
+    i64 x = 1 != 0 ? 42 : 0;
+    if (x != 42) return 1;
+
+    if (sum(1, 1 != 0 ? 2 : 3) != 3) return 2;
+
+    if (chained(1) != 10) return 3;
+    if (chained(2) != 20) return 4;
+    if (chained(3) != 30) return 5;
+
+    calls_true = 0;
+    calls_false = 0;
+    i64 lazy = 1 != 0 ? pick_true(7) : pick_false(9);
+    if (lazy != 7) return 6;
+    if (calls_true != 1) return 7;
+    if (calls_false != 0) return 8;
+
+    calls_true = 0;
+    calls_false = 0;
+    lazy = 0 != 0 ? pick_true(7) : pick_false(9);
+    if (lazy != 9) return 9;
+    if (calls_true != 0) return 10;
+    if (calls_false != 1) return 11;
+
+    i64 i = 0;
+    i64 total = 0;
+    while (i < 5 ? 1 : 0) {
+        total = total + i;
+        i = i + 1;
+    }
+    if (total != 10) return 12;
+
+    Box box = new Box(2);
+    if (box.pick(1, 3, 5) != 6) return 13;
+    if (box.pick(0, 3, 5) != 10) return 14;
+
+    {
+        Cell a = new Cell(11);
+        Cell b = new Cell(22);
+        Cell picked = 1 != 0 ? a : b;
+        if (picked.v != 11) return 15;
+        if (rt_live() != 3) return 16;           // box, a and b -- picked owns no new object
+    }
+    if (rt_live() != 1) return 17;               // box is still alive
+
+    if (with_return(1) != 100) return 18;
+    if (with_return(0) != 0) return 19;
+
+    return 42;
+}

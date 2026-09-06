@@ -1,0 +1,397 @@
+// surface_refout.tk -- `ref T` and `out T` (K2, D221 §41): C#'s by-reference
+// parameter forms, over a side table of the pointee a parameter's own node
+// carries (teko_ref.tk).
+//
+// What each helper proves, in order:
+//
+//   1. `scheck` -- a scalar `ref` (`bump(ref i64 x)`) mutates the caller's
+//      own local, unlike the by-value overload of the same name
+//      (`bump(i64 x)`), which `teko_over.tk` resolves by the argument's own
+//      `ref` tag, not merely its type; `split(v, out hi, out lo)` writes
+//      both `out` parameters; `f(i64)`/`f(ref i64)` resolve the same way.
+//   2. `fcheck` -- `ref` over a field (`bump(ref p.x)`) and over a local
+//      array element (`bump(ref a[1])`), the two addresses `teko_expr.tk`'s
+//      field store and `teko_array.tk`'s own `tk_arr_addr` already build.
+//   3. `mcheck` -- `ref` as a METHOD parameter (`Doubler.twice`).
+//   4. `rcheck` -- a `ref` of COUNTED (class) pointee: `replace` reassigns
+//      the caller's own `Cell`, `rt_live()`/the destructor prove the old one
+//      is released exactly once, through `rt_store`'s own old-value
+//      `rc_dec` -- the one exception `teko_rc.tk`'s `tk_rc_assign` grew.
+//   5. `outcheck` -- K2b bug 1: `Box x;` (no initializer) starts released, so
+//      the FIRST `mkbox(out x)` finds nothing to `rc_dec`, and the SECOND
+//      releases exactly the Box the first one made; a THIRD call over an
+//      already-initialized local proves the same for that shape too.
+//   6. `chaincheck` -- K2b bug 2: a scalar `ref` repassed through three
+//      levels (`a` -> `b` -> `c`), each adding 1 to the caller's own local.
+//   7. `outrelaycheck` -- the same repass over an `out` parameter.
+//   8. `rcheck_relay` -- a `ref Cell` repassed one level down and reassigned
+//      at the bottom: the caller sees the new `Cell`, `rt_live()` proves the
+//      original was released.
+//   9. `gcheck` (higiene 2, item 2) -- `setGem(ref Gem g)` called with a
+//      `Gem`-typed local: the pointee CHECK this crumb adds accepts an
+//      identical match, over a class distinct from `Cell`'s own -- a
+//      mismatched pointee (`ref Cell`/`ref Square`) is a probe, not a
+//      fixture, per this crumb's own instruction.
+//  10. `scopecheck` (higiene 3, item A) -- the pointee check reaches SCALARS
+//      too, so a `ref i64` argument is now matched against the parameter's
+//      own `i64`: one local declared in an inner block, one in the function
+//      body, and `lvl_b`'s own repass of a `ref i64` PARAMETER under a name
+//      (`x`) that `outcheck` declares as a `Box`. The last one is what makes
+//      the check read the enclosing declaration instead of the unit-wide
+//      table of locals, which answers with the unrelated `Box`. A
+//      mismatched scalar (`ref i64` given a `ref u8`) is a probe.
+//  11. `narrowcheck` (K2w) -- a POINTEE narrower than a word: the slot of a
+//      `ref`/`out` parameter is declared at pointer width, so the address it
+//      carries is no longer stored and reloaded at the pointee's own 1/2/4
+//      bytes (which truncated it: `bumpb(ref u8 b)` faulted). `bumpb` writes
+//      one byte and wrapping at 255 proves it is one byte, not eight;
+//      `set32` writes a negative `i32` through an `out`; and `relayb` repasses
+//      a `ref u8` PARAMETER one level down.
+//  12. `floatcheck` (higiene 4) -- a pointee, a class field and the `ref`
+//      parameter of a METHOD, all of type `f64`: an indirect access to a
+//      float picks `<float>`'s own `ldf64`/`stf64`, so the eight bytes land
+//      in the register file the arithmetic reads. Through the integer pair,
+//      `bumpf(ref x)` left 1.5 untouched and `g.v = g.v + 1.0` wrote a word
+//      the float unit never saw.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+void bump(i64 x) {
+    x = x + 1;
+}
+
+void bump(ref i64 x) {
+    x = x + 1;
+}
+
+void split(i64 v, out i64 hi, out i64 lo) {
+    hi = v / 10;
+    lo = v % 10;
+}
+
+i64 f(i64 k) {
+    return k;
+}
+
+i64 f(ref i64 k) {
+    k = k + 100;
+    return k;
+}
+
+i64 scheck() {
+    i64 a = 1;
+    bump(a);
+    if (a != 1) return 1;
+    bump(ref a);
+    if (a != 2) return 2;
+
+    i64 hi = 0;
+    i64 lo = 0;
+    split(57, out hi, out lo);
+    if (hi != 5) return 3;
+    if (lo != 7) return 4;
+
+    i64 z = 1;
+    if (f(z) != 1) return 5;
+    if (z != 1) return 6;
+    if (f(ref z) != 101) return 7;
+    if (z != 101) return 8;
+    return 0;
+}
+
+class Point {
+    public i64 x;
+    public i64 y;
+}
+
+i64 fcheck() {
+    Point p = new Point;
+    p.x = 10;
+    bump(ref p.x);
+    if (p.x != 11) return 1;
+
+    i64 a[3];
+    a[0] = 1;
+    a[1] = 2;
+    a[2] = 3;
+    bump(ref a[1]);
+    if (a[1] != 3) return 2;
+    if (a[0] != 1) return 3;
+    if (a[2] != 3) return 4;
+    return 0;
+}
+
+class Doubler {
+    public void twice(ref i64 v) {
+        v = v * 2;
+    }
+}
+
+i64 mcheck() {
+    Doubler d = new Doubler;
+    i64 y = 5;
+    d.twice(ref y);
+    if (y != 10) return 1;
+    return 0;
+}
+
+i64 cell_dtors = 0;
+
+class Cell {
+    public i64 v;
+
+    public Cell(i64 x) {
+        v = x;
+    }
+
+    ~Cell() {
+        cell_dtors = cell_dtors + 1;
+    }
+}
+
+void replace(ref Cell c, i64 nv) {
+    c = new Cell(nv);
+}
+
+i64 rcheck() {
+    Cell c = new Cell(1);
+    replace(ref c, 5);
+    if (c.v != 5) return 1;
+    if (cell_dtors != 1) return 2;                // the original Cell(1), released on reassignment
+    c = null;
+    if (cell_dtors != 2) return 3;
+    return 0;
+}
+
+i64 box_dtors = 0;
+
+class Box {
+    public i64 v;
+
+    public Box(i64 x) {
+        v = x;
+    }
+
+    ~Box() {
+        box_dtors = box_dtors + 1;
+    }
+}
+
+void mkbox(out Box b) {
+    b = new Box(1);
+}
+
+i64 outcheck() {
+    Box x;
+    mkbox(out x);
+    if (x.v != 1) return 1;
+    if (box_dtors != 0) return 2;                 // `x` started released; nothing to free yet
+    mkbox(out x);
+    if (box_dtors != 1) return 3;                 // the first Box, released on the second call
+    if (rt_live() != 1) return 4;
+
+    Box y = new Box(2);
+    mkbox(out y);
+    if (box_dtors != 2) return 5;                 // the Box(2) the initializer made
+    if (rt_live() != 2) return 6;
+
+    x = null;
+    y = null;
+    if (box_dtors != 4) return 7;
+    if (rt_live() != 0) return 8;
+    return 0;
+}
+
+void lvl_c(ref i64 x) {
+    x = x + 1;
+}
+
+void lvl_b(ref i64 x) {
+    lvl_c(ref x);
+    x = x + 1;
+}
+
+void lvl_a(ref i64 x) {
+    lvl_b(ref x);
+}
+
+i64 chaincheck() {
+    i64 v = 1000;
+    lvl_a(ref v);
+    if (v != 1002) return 1;
+    return 0;
+}
+
+void setter_out(out i64 y) {
+    y = 55;
+}
+
+void relay_out(out i64 y) {
+    setter_out(out y);
+}
+
+i64 outrelaycheck() {
+    i64 w = 0;
+    relay_out(out w);
+    if (w != 55) return 1;
+    return 0;
+}
+
+void replace_deep(ref Cell c, i64 nv) {
+    replace(ref c, nv);
+}
+
+i64 rcheck_relay() {
+    Cell c = new Cell(10);
+    replace_deep(ref c, 20);
+    if (c.v != 20) return 1;
+    if (cell_dtors != 3) return 2;                // the Cell(10) `replace` released one level down
+    c = null;
+    if (cell_dtors != 4) return 3;
+    if (rt_live() != 0) return 4;
+    return 0;
+}
+
+class Gem {
+    public i64 carats;
+}
+
+void setGem(ref Gem g) {
+    g.carats = g.carats + 1;
+}
+
+i64 gcheck() {
+    Gem gem = new Gem;
+    gem.carats = 2;
+    setGem(ref gem);
+    if (gem.carats != 3) return 1;
+    return 0;
+}
+
+i64 scopecheck() {
+    i64 outer = 1;
+    if (outer == 1) {
+        i64 inner = 5;
+        lvl_c(ref inner);
+        if (inner != 6) return 1;
+    }
+    lvl_c(ref outer);
+    if (outer != 2) return 2;
+    return 0;
+}
+
+void bumpb(ref u8 b) {
+    b = b + 1;
+}
+
+void relayb(ref u8 b) {
+    bumpb(ref b);
+}
+
+void set32(out i32 w) {
+    w = 0 - 70000;
+}
+
+i64 narrowcheck() {
+    u8 b = 7;
+    bumpb(ref b);
+    if (b != 8) return 1;
+
+    u8 top = 255;
+    bumpb(ref top);
+    if (top != 0) return 2;                       // one byte wide, so it wraps
+
+    u8 r = 200;
+    relayb(ref r);
+    if (r != 201) return 3;
+
+    i32 w = 1;
+    set32(out w);
+    if (w != 0 - 70000) return 4;                 // wider than u16, still signed
+    return 0;
+}
+
+void bumpf(ref f64 v) {
+    v = v + 1.0;
+}
+
+void setf(out f64 v) {
+    v = 3.25;
+}
+
+class Gauge {
+    public f64 v;
+
+    public void raise(ref f64 x) {
+        x = x + v;
+    }
+}
+
+i64 floatcheck() {
+    f64 x = 1.5;
+    bumpf(ref x);
+    if (x != 2.5) return 1;
+
+    f64 o = 1.0;
+    setf(out o);
+    if (o != 3.25) return 2;
+
+    Gauge g = new Gauge;
+    g.v = 1.5;
+    g.v = g.v + 1.0;
+    if (g.v != 2.5) return 3;
+
+    f64 y = 10.0;
+    g.raise(ref y);
+    if (y != 12.5) return 4;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = scheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = fcheck();
+    if (bad != 0) return 20 + bad;
+    if (rt_live() != 0) return 25;
+
+    bad = mcheck();
+    if (bad != 0) return 30 + bad;
+    if (rt_live() != 0) return 35;
+
+    bad = rcheck();
+    if (bad != 0) return 40 + bad;
+    if (rt_live() != 0) return 45;
+    if (cell_dtors != 2) return 50 + cell_dtors;
+
+    bad = outcheck();
+    if (bad != 0) return 60 + bad;
+    if (rt_live() != 0) return 69;
+
+    bad = chaincheck();
+    if (bad != 0) return 70 + bad;
+
+    bad = outrelaycheck();
+    if (bad != 0) return 80 + bad;
+
+    bad = rcheck_relay();
+    if (bad != 0) return 90 + bad;
+    if (rt_live() != 0) return 99;
+
+    bad = gcheck();
+    if (bad != 0) return 100 + bad;
+
+    bad = scopecheck();
+    if (bad != 0) return 110 + bad;
+
+    bad = narrowcheck();
+    if (bad != 0) return 120 + bad;
+
+    bad = floatcheck();
+    if (bad != 0) return 130 + bad;
+    if (rt_live() != 0) return 139;
+
+    return 42;
+}

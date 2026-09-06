@@ -1,5 +1,7 @@
 # Kill-C PULL-FORWARD into 0.3.0.30 — own-backend maturity inventory + FFI own-native validation
 
+> **[NOTA]** — este documento descreve oráculos diferenciais ativos durante o bring-up do backend nativo. Ambos os oráculos foram desde então **retirados** (#524 e seguintes); o restante deste documento é registro histórico do método usado, não descreve o estado atual do projeto.
+
 > **Status:** DESIGN-AHEAD, doc-only. **NOT implemented — the owner ratifies before code.** Addendum to
 > `docs/design/star-ref-and-ffi-0.3.1.md`. **Owner standing rule:** *everything that can be pulled
 > forward into .30 toward KILLING the C backend must be — to shrink the future waves.* This doc maps
@@ -28,7 +30,7 @@
 > `src/lir/lir.tks`, `` (32 honest-stops, dominated by the
 > `B1-fp` float family + i128), `src/backend/encode_*`, `objfile_{elf,macho,coff}.tks`,
 > `src/codegen/codegen.tks` (`cb_fn_name` the `__` mangle; `f.c_symbol` extern no-mangle at :7515),
-> the IMPORT convention `docs/design/drain-fase3-stdlib-order.md:127/136/146` + `vm-retirement.md:327`
+> the IMPORT convention `docs/design/drain-fase3-stdlib-order.md:127/136/146` + the native-only consolidation decision
 > (`extern fn … = "SYM" from "lib"`), `src/build/regression.tks` + `docs/design/tkr-regression-format.md`,
 > `teko.tkp` `[tests]`/`[platforms]`.
 
@@ -45,7 +47,7 @@ The own AOT backend is **mature in its BOTTOM half, immature in its TOP half:**
 | **encode** | `` | mature, tested (~80 KB each); full integer/mem/control instruction set. |
 | **regalloc** | `` | present, tested. |
 | **objfile** | `objfile_{elf,macho,coff}.tks`, um backend ELF writer | emit **relocatable objects** with undef symbols + relocations; needs completion to the **whole-program** section/symbol/reloc set + **`.a` archive** emission. Final link is the **system `ld`**; the own **E1 linker** (`objfile_elf.tks:383`) is a LATER *link-independence* epic, **NOT a kill-C prerequisite** (§4). |
-| **oracle** | `lir_interp.tks`, `minst_interp.tks` | interpret the covered subset, **mirroring the C backend's honest-stops** — how the native path is validated **without producing binaries** today. |
+| **oracle** | `lir_oracle.tks`, `minst_oracle.tks` | run the covered subset, **mirroring the C backend's honest-stops** — how the native path is validated **without producing binaries** today. |
 
 **The 60 `lower.tks` honest-stops, categorized:**
 
@@ -76,7 +78,7 @@ float/i128 isel** (own-native, no external dep). Objfile emission must complete 
 
 | item | verdict | detail |
 |---|---|---|
-| integer comparisons; bitwise/shift; `~`; remainder | **PODE .30** | LIR/isel/encode/interp ready — `lower.tks` completion |
+| integer comparisons; bitwise/shift; `~`; remainder | **PODE .30** | LIR/isel/encode/oracle ready — `lower.tks` completion |
 | fat-pointer (str/slice) ABI + lowering | **PODE .30** | pin the fat ABI once |
 | struct/field/index; match; if-value; destructuring; integer interpolation | **PODE .30** | mem ops / variant repr known |
 | **float family** (+ float interpolation/match) | **DEP DURA (own-native)** | X = own-backend float isel (`B1-fp`) + FPR regalloc/spill — no external dep; residual SW13 |
@@ -117,7 +119,7 @@ float/i128 isel** (own-native, no external dep). Objfile emission must complete 
 ## 3. The .30 pull-forward crumb sequence
 
 Each is own-native, additive, seed-safe, riding **GATE-G + fixpoint gen1==gen2**; lowering crumbs are
-validated by the **interp oracle** + backend unit tests.
+validated by the **oracle** + backend unit tests.
 
 | crumb | size | closes | notes |
 |---|---|---|---|
@@ -133,7 +135,7 @@ validated by the **interp oracle** + backend unit tests.
 | **KP10** **`cabi` callback** + **`exp fn` C-ABI export** (explicit `= "SYM"` or flattened canonical, §5.2.1) + FFI-safe gate | M | FFI G3 / reverse-FFI | objfile GLOBAL/FUNC; NO `#[export]` |
 | **KP11** **`emit_c_header` `.h`** (prototypes + `#define` consts; close G5) | M | reverse-FFI | pure text |
 | **KP12** **macro resolver** Tier 0 + Tier 2 + Tier 3 honest-error | L | FFI macros | Tier 1 link via system `ld` |
-| **KP13** **vararg ABI rule set** (SysV/AAPCS64/Win64) + interp | M | FFI KC1 | native call via system `ld` |
+| **KP13** **vararg ABI rule set** (SysV/AAPCS64/Win64) + oracle | M | FFI KC1 | native call via system `ld` |
 | **KP14** **`#cconv` + `teko::ffi::errno()`** | S–M | FFI G4 | common cconv cases |
 | **KP15** **`teko_rt_init/shutdown`** + panic-not-into-C | S | reverse-FFI | own-native |
 | **KP16** complete whole-program **`.o`** + **`.a` archive** writer | L | §2(b) | the kill-C substrate |
@@ -220,9 +222,9 @@ explicit `= "SYM"` (import-symmetric) **or** flattened canonical default, §5.2.
 ### 5.2.1 The C export SYMBOL-NAME rule (`exp` + `abi="c"`) — RATIFIABLE, symmetric with the IMPORT convention
 
 **The owner's steer:** for IMPORT (FFI-in) the convention is already ratified — the dev names the C
-symbol EXPLICITLY in the `extern` clause: **`[pub|exp] extern fn name(...) -> R = "c_symbol" from "lib"`**
-(verified: `drain-fase3-stdlib-order.md:127/136/146` — `pub extern fn sqrt(x: f64) -> f64 = "sqrt" from
-"m"`; `vm-retirement.md:327` — `exp extern fn cov_merge(path: str) -> bool = "tk_cov_merge" from
+symbol EXPLICITLY in the `extern` clause: **`[pub|exp] extern fn name(...): R = "c_symbol" from "lib"`**
+(verified: `drain-fase3-stdlib-order.md:127/136/146` — `pub extern fn sqrt(x: f64): f64 = "sqrt" from
+"m"`; the native-only consolidation decision — `exp extern fn cov_merge(path: str): bool = "tk_cov_merge" from
 "teko_rt"`; also `embed-vfs.md`). The C symbol lives in the **`= "SYM"`** clause, the library in
 **`from "lib"`**. **EXPORT is the mirror of this** — the same `= "SYM"` clause names the C symbol; **no
 new `#[export]` attribute.**
@@ -246,9 +248,9 @@ foundation.
 1. **EXPLICIT symbol (symmetric with import — the primary form).** An `exp fn` in an `abi="c"` artifact
    names its C symbol with the SAME **`= "c_name"`** clause `extern` uses on import:
    ```
-   exp fn add(a: i64, b: i64) -> i64 = "teko_add" { a + b }     // exports the C symbol `teko_add`
+   exp fn add(a: i64, b: i64): i64 = "teko_add" { a + b }     // exports the C symbol `teko_add`
    ```
-   Exact mirror of `extern fn add(...) -> i64 = "teko_add" from "lib"` (import): the same `= "SYM"`
+   Exact mirror of `extern fn add(...): i64 = "teko_add" from "lib"` (import): the same `= "SYM"`
    clause names the C symbol on the SAME `fn` grammar; on import the body is ABSENT (foreign), on export
    the body is PRESENT (Teko) — the only difference. **No `#[export]`; no new token — `= "STR"` and `exp`
    already exist.** *(Grammar note: the parser already reads `= "STR"` after an `extern fn` signature;
@@ -321,7 +323,7 @@ type tag, and (compositionally) to each exported member/method/variant symbol. `
 | **struct** (`#repr("c")`) | `typedef struct <tag> { <fields> } <tag>;` — `<tag>` = flattened canonical `ns_Name` or `= "SYM"` | field names carried verbatim (C identifiers) | every field must be **FFI-safe** (scalar / `ptr<T>` / nested `#repr("c")`); a Teko **slice/fat-pointer**, closure, or bare `ref` field ⇒ **compile error** (export it as an explicit `ptr<T>+len` pair or don't export) |
 | **enum** | `typedef enum <tag> { ns_Name_A, ns_Name_B, … } <tag>;` | variants → **`<tag>_<Variant>`** constants | ordinals are the **ABI contract** — source order fixes `0..n`; **reordering variants is an ABI break** (documented). C `enum` is int-width — fine for a plain enum |
 | **flags** | `typedef <uintN> <tag>;` + **`#define <tag>_<MEMBER> <1u<<k>`** per bit (mirrors the internal `tk_t_<Name>_<MEMBER>` power-of-2 scheme, `codegen.tks:471`) | bits → **`<tag>_<MEMBER>`** | `#define`/`static const`, **not** a C `enum` (flags are `u128`-capable, wider than int); underlying `typedef` picks `uint32/64_t`/`unsigned __int128` by width |
-| **class** | **opaque handle** `typedef struct <tag>* <tag>;` (C never sees the layout — matches the Teko class `{data,vtable}` reference-object) | methods → **`<tag>_<method>(<tag> self, …)`**; ctor → `<tag>_new(…) -> <tag>`; dtor → `<tag>_free(<tag> self)` | **polymorphism DOES cross via the exported method wrappers**: each `<tag>_<method>` wrapper does the Teko-side vtable dispatch internally; the C side stays vtable-agnostic. **Honest-stop: C cannot SUBCLASS / override virtuals** (that needs C to supply a vtable — the abstraction can't cross); export is for C to *use*, not *extend* |
+| **class** | **opaque handle** `typedef struct <tag>* <tag>;` (C never sees the layout — matches the Teko class `{data,vtable}` reference-object) | methods → **`<tag>_<method>(<tag> self, …)`**; ctor → `<tag>_new(…): <tag>`; dtor → `<tag>_free(<tag> self)` | **polymorphism DOES cross via the exported method wrappers**: each `<tag>_<method>` wrapper does the Teko-side vtable dispatch internally; the C side stays vtable-agnostic. **Honest-stop: C cannot SUBCLASS / override virtuals** (that needs C to supply a vtable — the abstraction can't cross); export is for C to *use*, not *extend* |
 | **interface** | **vtable struct-of-function-pointers** `typedef struct <tag> { R (*method)(void* self, …); … } <tag>;` + the boundary value is a `{ void* self; const <tag>* vtable; }` fat pointer | methods → the fn-pointer field names | this is the honest C form of an interface (a vtable). **Dynamic dispatch crosses** (C calls through the fn-pointer table). C MAY implement it (supply its own fn pointers) — the one decl kind that crosses both ways cleanly. Default/generic interface methods ⇒ honest-stop |
 | **variant** (tagged union) | `typedef struct <tag> { <int> tag; union { <members> } u; } <tag>;` (`#repr("c")`) | members → `<tag>_<Member>` tag constants | doable as a C tagged struct; a member that is itself non-FFI-safe ⇒ honest-stop |
 | **alias / trait** | alias → the aliased C type inline; trait → **nothing** (compile-time only, like today) | — | trait never reaches the boundary |

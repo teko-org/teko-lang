@@ -1,45 +1,19 @@
-// Every parser returns the parsed thing + where parsing resumed. (DRY-dedup) the
-// once-concrete `Parsed*` family is now TWO generics: `Parsed<T>` (a single node +
-// resume index) and `ParsedList<T>` (a `[]T` payload + resume index). The remaining
-// concrete types are genuine OUTLIERS (an extra `pending_gt`, or different fields).
-type Parsed<T> = struct { node: T; next: u64 }   // a single parsed node + resume index
-type ParsedList<T> = struct { items: []T; next: u64 }   // a `[]T` payload (block/arms/args/…) + resume index
+type Parsed<T> = struct { node: T; next: u64 }
+type ParsedList<T> = struct { items: []T; next: u64 }
 
-type ParsedType = struct { node: TypeExpr; next: u64; pending_gt: u64 }   // a type expr; pending_gt = extra `>` left by a compound `>>` close (S4 nested generics)
-type ParsedTypeArgs = struct { args: []TypeExpr; next: u64; pending_gt: u64 }   // (W9.4) a `<T1, T2, …>` arg list at a construction/pattern site; pending_gt = extra `>` left by a `>>` close
-type ParsedTypeParams = struct { names: []str; constraints: []ConstraintExpr; next: u64 }   // (W11/S6) a `<T, U: A & B, …>` list — names/constraints PARALLEL, same length
-type Guard = struct { has_when: bool; guard: Expr; next: u64 }   // an optional `when`
-type Annotation = struct { has_type: bool; type_ann: TypeExpr; next: u64 }   // an optional `: T`
-type ParsedCallArgs = struct { args: []Expr; arg_names: []str; next: u64 }   // DEFARGS (2026-07-01) — parse_call_args' result; arg_names[i] PARALLEL to args, "" = positional else the named param
-/**
- * ParsedStructBody — a struct/class/trait body's INTERLEAVED fields + methods + type-member consts,
- * plus the resume index (OOP A1). `consts` carries the static `const NAME: T = …` members (#594
- * crumb 7); it is empty for a body that declares none.
- *
- * @param fields   the parsed fields, in source order
- * @param methods  the parsed methods, in source order
- * @param consts   the parsed static type-member consts, in source order
- * @param next     the index just past the body's closing `}`
- */
+type ParsedType = struct { node: @TypeExpr(); next: u64; pending_gt: u64 }
+type ParsedTypeArgs = struct { args: []@TypeExpr(); next: u64; pending_gt: u64 }
+type ParsedConstraintTerm = struct { node: @ConstraintExpr(); next: u64; pending_gt: u64 }
+type ParsedTypeParams = struct { names: []str; constraints: []@ConstraintExpr(); next: u64 }
+type Guard = struct { has_when: bool; guard: Expr; next: u64 }
+type Annotation = struct { has_type: bool; type_ann: @TypeExpr(); next: u64 }
+type ParsedCallArgs = struct { args: []Expr; arg_names: []str; next: u64 }
 type ParsedStructBody = struct { fields: []Field; methods: []Function; consts: []ConstDecl; next: u64 }
 
-/** (W10c/MEM-3) the leading-attribute block a `parse_decl` collects before the declaration
- *  keyword: the function-only `#test`/`#os`/`#inject`/`#arena_size` overlay and the type-only
- *  lifetime annotation. `di_kind`/`has_key`/`key` describe a `#singleton`/`#scoped`/`#transient`
- *  (with an optional — deferred to #173 — `@Key`); `has_inject`/`injects` the parsed
- *  `#inject(…)` bindings; `has_arena_size`/`arena_size` the parsed `#arena_size(N)` byte budget
- *  (#453); `must_free` (S2, 0.1.0.0-beta memory+unsafe remodel #336) is a type-only relevant-type
- *  marker — a bare `#must_free` (no payload), parallel to the lifetime attributes; `next` resumes
- *  at the doc/visibility/keyword that follows. */
-type ParsedAttributes = struct { is_test: bool; os_guard: str; di_kind: DiKind; has_key: bool; key: str; has_inject: bool; injects: []InjectBinding; must_free: bool; has_arena_size: bool; arena_size: u64; next: u64 }
+type ReadonlyMarker = struct { present: bool; next: u64 }
 
-/**
- * (issue #285) an OPTIONAL leading Javadoc `parse_decl` peels off BEFORE the `#…`
- * attributes — the standard Javadoc placement, above every modifier (`#test`/`#os`/`#inject`/the
- * DI lifetimes included). Absent when no doc precedes the attributes.
- *
- * @param has_doc  true iff a leading doc-comment was present
- * @param doc      the doc-comment's raw text (valid iff has_doc; "" otherwise)
- * @param next     the resume index — the first attribute/keyword after the doc (seps skipped)
- */
-type ParsedLeadingDoc = struct { has_doc: bool; doc: str; next: u64 }
+type ParsedAttributes = struct { is_test: bool; os_guard: str; guard: Pred; next: u64 }
+
+type ParsedDecl = struct { node: @Decl(); guard: Pred; next: u64 }
+
+type ParsedLeadingDoc = struct { has_doc: bool; doc: DocSpan; next: u64 }

@@ -1,4 +1,4 @@
-# Onda-3 — the monomorphization + VM + 128-bit keystone cluster
+# Onda-3 — the monomorphization + legacy engine + 128-bit keystone cluster
 
 **Status:** DESIGN-AHEAD (architect). No product code changed. Ready to implement the instant #300 merges.
 **Seed:** `0.0.1.37-alpha` (teko.tkp).
@@ -22,8 +22,8 @@ different implementer.
   round-trip), `#290` (same-bare cross-ns method dispatch). These share the mono pass
   (`src/checker/monomorph.tks`), the method→free-fn lowering, and the codegen mangle/dispatch seam.
 - **Sub-cluster B — the 128-bit arithmetic family (INDEPENDENT).**
-  `#296` (VM `norm_int` u128 trapping) and `#299` (codegen `cb_i128` negative `Number` literal). Both are
-  self-contained two's-complement-reinterpret bugs — one VM-only, one native-only — touching neither the
+  `#296` (u128 normalization trapping, historical) and `#299` (codegen `cb_i128` negative `Number` literal). Both are
+  self-contained two's-complement-reinterpret bugs — one historically legacy engine-only, one native-only — touching neither the
   mono pass nor dispatch. They gate the u128/i128 math family (#185/#187/#194), not the generic stdlib.
 
 **Recommendation:** run B in parallel with A from day one (two implementers, two branches). B is small,
@@ -35,16 +35,16 @@ low-risk, and unblocks the 128-bit math family without waiting on A. A is the re
 
 ### Sub-cluster B (independent, do these first — they are small and unblock 128-bit math)
 
-#### #296 — VM `norm_int` reinterprets u128 via a TRAPPING `raw to u128`
-- **Root:** `src/vm/vm.tks:1598` — inside `fn norm_int(raw: i128, signed: bool, width: u8)` the unsigned
+#### #296 — u128 normalization trap (historical)
+- **Root:** (historically) — inside `fn norm_int(raw: i128, signed: bool, width: u8)` the unsigned
   128-bit arm is `else { raw to u128 }`. `raw` is the `i128` carrier; a u128 with the high bit set is
   stored as a *negative* i128, and `i128 to u128` is a **checked** cast that PANICS on a negative source
-  ("impossible conversion"). So `u128::MAX`, `2^127`, any high-bit value → VM panic; native lowers it as a
-  plain two's-complement `(unsigned __int128)` and is correct → **VM≠native divergence.**
-- **Layer:** none of the five mono layers — this is the **VM value-normalization** layer (the `.tks`
-  stand-in for the C `tag` switch), entirely inside the interpreter.
-- **Kind:** VM-only.
-- **The idiom already exists** three functions up: `wrap_hole_to_u64` (`vm.tks:1332`) does the non-trapping
+  ("impossible conversion"). So `u128::MAX`, `2^127`, any high-bit value: the former legacy engine would panic; native lowers it as a
+  plain two's-complement `(unsigned __int128)` and is correct → **divergence historically present.**
+- **Layer:** none of the five mono layers — this is the **value-normalization** layer (historically in legacy engine) (the `.tks`
+  stand-in for the C `tag` switch), entirely inside the legacy engine.
+- **Kind:** historically legacy engine-only.
+- **The idiom already exists** three functions up: `wrap_hole_to_u64` ((historically)) does the non-trapping
   reinterpret as `(raw & mask) to u64`. #296 is the u128-width sibling: there is no 128-bit-wide
   non-trapping cast primitive, so the fix builds the u128 from its two masked 64-bit halves.
 
@@ -63,7 +63,7 @@ low-risk, and unblocks the 128-bit math family without waiting on A. A is the re
 
 **Shared root of B:** both are the *checked/trapping* `to u128` cast standing where a *non-trapping
 two's-complement reinterpret* is meant. The language has no 128-bit non-trapping cast op; the pattern is
-"mask/rebuild through 64-bit halves" (VM) and "reinterpret the bit pattern" (codegen). Neither touches the
+"mask/rebuild through 64-bit halves" (historically) and "reinterpret the bit pattern" (codegen). Neither touches the
 mono pass. A single helper in each engine closes both.
 
 ### Sub-cluster A (the keystone — shared mono/dispatch machinery)
@@ -87,7 +87,7 @@ Grounded against the current tree:
    `monomorph.tks:814`) emits the concrete type-decls whose bodies were method-stripped by layer 2.
 4. **no return-type-as-expected threading (layer: TExpr.types / typer).**
    `type_return`/`type_block` do not propagate the declared return type as an expected context, so
-   `fn box_make<T>(v: T) -> Box<T> { Box { value = v } }` fails (`cannot infer` / `Box__g__T` not stamped).
+   `fn box_make<T>(v: T): Box<T> { Box { value = v } }` fails (`cannot infer` / `Box__g__T` not stamped).
    The annotation-driven struct-init retarget exists ONLY for `let`-bindings (`type_binding` →
    `type_struct_lit(expected)`, see S4 memory), not for a return position.
 5. **classes need a static factory (layer: all of 1–4 + auto-construction).**
@@ -104,10 +104,10 @@ Grounded against the current tree:
   classes nominally (so the struct *satisfies* the constraint — `constraint_atom_satisfied`,
   `monomorph.tks:72`), but the codegen upcast + `tk_vt_<T>_<iface>` vtable are gated on
   `cg_is_class_named` (`codegen.tks:441`, and every `tk_vt_`/`tk_base_` site). A struct has no fat-pointer
-  `{data, vtable}` rep, so a `x.measure()` on a constraint-bound struct either panics on the VM (no vtable
+  `{data, vtable}` rep, so a `x.measure()` on a constraint-bound struct either panicked in the former legacy engine (no vtable
   to name-dispatch through as a value) or emits an upcast to a never-generated symbol natively.
 - **Layer:** straddles **stamp/rewrite-calls** (`rekey_iface_dispatch`) and **codegen** (vtable emission).
-- **Kind:** both engines (VM panic; native cc-reject / miscompile).
+- **Kind:** both engines (former legacy engine panic; native cc-reject / miscompile).
 - **Design fork (see §4):** structs are value types with no vtable slot. There are two law-clean
   resolutions; one is a genuine scope decision → **HALT candidate** (resolved below, but flagged).
 
@@ -120,14 +120,14 @@ Grounded against the current tree:
   `codegen.tks:849`) and the annotation path (`codegen.tks:1214`) DO know `checker::Func => "tk_closure"` —
   the mangle family is the sole gap. Also `cg_opt_mangle_texpr_str` (`codegen.tks:1086`) has no
   `FunctionType` arm (its `_` is the syntactic twin of the same gap).
-- **VM root:** a closure (`FuncVal`) re-seated into a `Ref` cell (`cell_set`) is dropped across a call
+- **Former legacy engine root:** a closure (`FuncVal`) re-seated into a `Ref` cell (`cell_set`) is dropped across a call
   boundary. The cell store threads back correctly for scalars (`with_cells(caller, fe.env.cells)`,
-  `vm.tks:3223`), so the drop is in the closure-value *capture-vs-cell* path: a `FuncVal` carries its
-  `cap_vals` by SNAPSHOT (`eval_lambda_call`, `vm.tks:2933`), so a closure written into a cell after
+  historically at (historically)), so the drop is in the closure-value *capture-vs-cell* path: a `FuncVal` carries its
+  `cap_vals` by SNAPSHOT (`eval_lambda_call`, historically at (historically)), so a closure written into a cell after
   capture is not observed by an already-captured copy. Minimal repro (from #301): `reseat(cell: Ref<IntFn>, n)`
   returns wrong values on BOTH engines.
-- **Layer:** native = **codegen** (the mangle leaf, layer-5); VM = the interpreter's ref-cell/closure
-  layer (not a mono layer). Same *conceptual* root as #294/#254: a function type is a first-class value the
+- **Layer:** native = **codegen** (the mangle leaf, layer-5); historically the legacy engine handled ref-cell/closure
+  semantics (not in the mono layer). Same *conceptual* root as #294/#254: a function type is a first-class value the
   aggregate-lowering seams do not fully cover.
 - **Kind:** both engines. Gate of `flat_map` (ITER0 #184, parked) and of `ReadFn | error` union arms
   (a function-typed union member hits the SAME mangle gap → forced `file_read_fn`/`zip_reader` to return a
@@ -188,7 +188,7 @@ Grounded against the current tree:
     generic `Iterator<T>` whose element is a closure (the ITER0 generic layer).
   - `#294` depends on the §4 scope ruling, not on code. Once ruled, it slots after #254 (it reuses the
     stamped-method machinery for the struct case).
-- **VM-only:** #296. **Native-only:** #299. **Both engines:** #254, #294, #301, #290.
+- **Historically legacy engine-only:** #296. **Native-only:** #299. **Both engines:** #254, #294, #301, #290.
 
 **Recommended landing order (A):** `#290` → `#301` → `#254` → `#294`. **(B) in parallel:** `#296` + `#299`.
 
@@ -203,14 +203,14 @@ clean keying + mangle base; #294 is the ruled scope decision layered on the stam
 > All snippets are full-Javadoc, `.tks`-only. C twins are FROZEN — do NOT touch `.c/.h` except the
 > maintained runtime seam (`teko_rt.{c,h}`), which none of these need. Ritual = the full gate
 > (`teko-verify-both-with-test-gate`): gen1 `teko . -o bin` (native #test gate) + `./bin/teko test .`
-> (VM) + FIXPOINT `gen1==gen2` byte-identical + `diff_vm_native.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit.
+> (historically legacy engine) + FIXPOINT `gen1==gen2` byte-identical + `diff_c_own.sh` + `TEKO_MEM_PARANOID=1` + `//`-audit.
 
-### B/#296 — VM u128 non-trapping reinterpret (VM-only, ~1 crumb)
+### B/#296 — u128 non-trapping reinterpret (formerly legacy engine-specific, ~1 crumb)
 
-**File:** `src/vm/vm.tks`. **Touches:** `norm_int` (1586). **Adds:** one helper.
+**File:** (historically). **Touches:** `norm_int` (1586). **Adds:** one helper.
 
 **Crumb 1 — a non-trapping u128 reinterpret helper + rewire the 128 arm.**
-Replace `else { raw to u128 }` at `vm.tks:1598` with a call to a new helper that rebuilds the u128 from
+Replace `else { raw to u128 }` at (historically) with a call to a new helper that rebuilds the u128 from
 two masked 64-bit halves (no 128-bit-wide checked cast exists, so we go through halves like
 `wrap_hole_to_u64` does for 64-bit):
 
@@ -218,32 +218,30 @@ two masked 64-bit halves (no 128-bit-wide checked cast exists, so we go through 
 /**
  * Reinterpret an i128 carrier's raw BITS as a u128, two's-complement, never trapping.
  *
- * The VM carries every integer Value in an i128; a u128 with the high bit set is stored as a
- * NEGATIVE i128, and a checked `i128 to u128` PANICS on it ("impossible conversion") — a VM≠native
- * divergence (native lowers a u128 as a plain `(unsigned __int128)` reinterpret). There is no
+ * Historically, the legacy engine carried integer Values in an i128; a u128 with the high bit set was stored as a
+ * NEGATIVE i128, and a checked `i128 to u128` would PANIC on it ("impossible conversion") — this was a historical divergence from native (which lowers a u128 as a plain `(unsigned __int128)` reinterpret). There is no
  * 128-bit-wide non-trapping cast op, so we rebuild the value from its two 64-bit halves: the low
  * half is masked out non-trapping (`wrap_hole_to_u64`), the high half is the arithmetic shift's low
  * 64 bits, and they are recomposed in u128 space where every sub-op is total.
  *
  * @param raw  the integer Value's raw bits as an i128 carrier
  * @return     the same bit pattern as a u128 (two's-complement reinterpret, never panics)
- * @see wrap_hole_to_u64 the 64-bit sibling reinterpret (vm.tks)
+ * @see wrap_hole_to_u64 the 64-bit sibling reinterpret ((historically))
  * @since onda-3 (#296)
  */
-fn reinterpret_i128_to_u128(raw: i128) -> u128 {
+fn reinterpret_i128_to_u128(raw: i128): u128 {
     let lo = wrap_hole_to_u64(raw) to u128
     let hi = wrap_hole_to_u64(raw >> 64) to u128
     (hi << 64) | lo
 }
 ```
-Then `vm.tks:1598` becomes `else { reinterpret_i128_to_u128(raw) }`.
+Then (historically) becomes `else { reinterpret_i128_to_u128(raw) }`.
 
-- **Fixtures:** `examples/regressions/u128_high_bit/` (VM==native, exit-code protocol).
+- **Fixtures:** `examples/regressions/u128_high_bit/` (exit-code protocol).
   Program: `let m: u128 = 340282366920938463463374607431768211455  // u128::MAX`; assert
   `m >> 120 == 255` → `exit((m >> 120) to i64 as u8)` = **exit 255**; plus `2^127` high-bit
   (`let h: u128 = 170141183460469231731687303715884105728`; `if h >> 127 != 1 { exit(1) }`) → exit 255.
-  The .tkp mirrors the `iter_protocol` shape (`kind = "binary"`). This fixture PANICS on the VM today
-  (proving the bug) and passes on both after the fix.
+  The .tkp mirrors the `iter_protocol` shape (`kind = "binary"`). This fixture historically PANICS (proving the bug) and will pass after the fix.
 - **Ritual point:** full gate. Extra vigilance on FIXPOINT (norm_int runs in the self-host's own literal
   lowering — but the corpus carries no u128 high-bit literal, so gen1==gen2 must stay byte-identical;
   the no-op-on-existing-corpus property is the guard).
@@ -272,7 +270,7 @@ Rewrite the `v < 0` arm so the magnitude never goes through a checked `to u128`:
  * @return     `buf` with the C constant expression appended
  * @since onda-3 (#299)
  */
-fn cb_i128(buf: []byte, v: i128) -> []byte {
+fn cb_i128(buf: []byte, v: i128): []byte {
     if v < 0 {
         let mag = (~ reinterpret_i128_bits_u128(v)) + (1 to u128)   // two's-complement magnitude, non-trapping
         mut b = cb(buf, "-(")
@@ -284,7 +282,7 @@ fn cb_i128(buf: []byte, v: i128) -> []byte {
 ```
 where `reinterpret_i128_bits_u128` is the codegen-side twin of #296's helper (same
 mask-through-halves construction, placed local to codegen's `cb_*` family since codegen must not depend
-on vm.tks). If a shared home is preferred, both can call a single `teko::runtime`-level reinterpret — but
+on (historically)). If a shared home is preferred, both can call a single `teko::runtime`-level reinterpret — but
 the FROZEN-C-twin rule makes a small per-module helper the lower-risk choice (no cross-module surface
 churn, no `.c` twin to touch). **DECISION (law-first, M.3 honest-simple):** duplicate the tiny helper
 per engine; do NOT introduce a new runtime symbol for a 6-line bit trick.
@@ -330,7 +328,7 @@ alongside the path so `type_call` resolves against the exact namespace rather th
  * @return             the fully-qualified `[..ns.., Class, method]` callee path
  * @since onda-3 (#290)
  */
-fn method_dispatch_callee(struct_name: str, method: str) -> parser::Path {
+fn method_dispatch_callee(struct_name: str, method: str): parser::Path {
     mut segs: []parser::Segment = teko::list::empty()
     let qual = name_qualifier(struct_name)   // "" for a root type, else the owning ns
     if qual.len > 0 {
@@ -368,7 +366,7 @@ the CLASS and there is a leading qualifier, require the binding's ns to END WITH
  * @return          true iff `b_ns` ends with the callee's `<owner-segments>::<Class>` tail
  * @since onda-3 (#290)
  */
-fn ns_matches_qualified_class(b_ns: str, callee: parser::Path) -> bool {
+fn ns_matches_qualified_class(b_ns: str, callee: parser::Path): bool {
     // reconstruct the `owner::…::Class` tail from every segment EXCEPT the trailing method
     let want = join_ns(path_prefix_segments(callee))   // all but the last segment, `::`-joined
     b_ns == want || ends_with_ns(b_ns, want)
@@ -380,10 +378,10 @@ predicate when the path has ≥2 leading segments (a class-qualified dispatch); 
 names a class in the table" vs "names a namespace"). This is the exact #109-family disambiguation already
 proven for optionals/tags (`qualified_optional` fixture).
 
-- **Fixtures:** `examples/regressions/same_bare_method_dispatch/` (VM==native), modeled on
+- **Fixtures:** `examples/regressions/same_bare_method_dispatch/` (consistent), modeled on
   `di_same_name_cross_ns` (which reads a FIELD precisely because method dispatch was broken — #290's own
-  report). Two namespaces `left`/`right`, each `type Svc = class { pub tag: i64; pub fn make(x) -> Svc; pub
-  fn tag_of(self) -> i64 { self.tag } }`; `left::Svc::make(3).tag_of()` == 3 and `right::Svc::make(7).tag_of()`
+  report). Two namespaces `left`/`right`, each `type Svc = class { pub tag: i64; pub fn make(x): Svc; pub
+  fn tag_of(self): i64 { self.tag } }`; `left::Svc::make(3).tag_of()` == 3 and `right::Svc::make(7).tag_of()`
   == 7; `exit(l + r)` = **exit 10**. Fails to type-check today (`argument type mismatch`), passes on both
   after. Also **flip** `di_same_name_cross_ns` to CALL the method (not read the field) once #290 lands —
   that fixture's field-read workaround becomes obsolete (report it, do not silently rewrite unrelated
@@ -453,7 +451,7 @@ free generic fn's. The discovery seed: a constructor / method call on a generic-
 
 **Crumb 4: return-type-as-expected threading (#254 layer 4).**
 `type_return` — thread the enclosing fn's declared `return_type` as the expected context into the returned
-expression's typing, so `fn box_make<T>(v: T) -> Box<T> { Box { value = v } }` retargets the struct-init to
+expression's typing, so `fn box_make<T>(v: T): Box<T> { Box { value = v } }` retargets the struct-init to
 the concrete instance exactly as `type_binding` already does for `let`. Reuse `type_struct_lit(expected)`
 (the annotation-driven retarget) — pass the fn's return type as the expected type at the return position.
 ```teko
@@ -466,17 +464,17 @@ is the generic instance now type-checks and stamps. Add the class-body method ca
 covered by the ClassBody arm) and verify the arena-per-object ref semantics survive stamping (the stamped
 method set reuses the same class-lowering; no new codegen).
 
-- **Fixtures (VM==native unless noted):**
-  - `examples/regressions/generic_struct_method/` — `type Box<T> = struct { value: T; pub fn get(self) -> T
+- **Fixtures (consistent unless noted):**
+  - `examples/regressions/generic_struct_method/` — `type Box<T> = struct { value: T; pub fn get(self): T
     { self.value } }`; `Box<i64>{value=42}.get()` → **exit 42**; a second instantiation `Box<u8>` proves
     per-instance stamping.
-  - `examples/regressions/generic_class_factory/` — `type Cell<T> = class { pub v: T; pub fn make(x: T) ->
-    Cell<T> { Cell { v = x } }; pub fn read(self) -> T { self.v } }`; `Cell<i64>::make(7).read()` → exit 7.
+  - `examples/regressions/generic_class_factory/` — `type Cell<T> = class { pub v: T; pub fn make(x: T):
+    Cell<T> { Cell { v = x } }; pub fn read(self): T { self.v } }`; `Cell<i64>::make(7).read()` → exit 7.
   - `examples/regressions/generic_method_self_construct/` — a method that CONSTRUCTS its own type
-    (`fn dup(self) -> Box<T> { Box { value = self.value } }`) — proves the return-type-as-expected thread.
+    (`fn dup(self): Box<T> { Box { value = self.value } }`) — proves the return-type-as-expected thread.
   - `examples/regressions/generic_method_trait_fold/` — a `<K: Hashable & Eq>` chain method (the #163 Map
     key path) — proves the constraint gate + trait fold survive method stamping.
-  - Plus corpus `#test`s in `generics_test.tkt` (run on the VM → cover the mono method path both engines).
+  - Plus corpus `#test`s in `generics_test.tkt` (to cover the mono method path across implementations).
 - **Ritual points:** full gate at EACH crumb (they are independently gate-able). The no-op-on-non-generic
   guard (`monomorphize` `any_generic`, `:739`) MUST still hold → gen1==gen2 byte-identical (the compiler
   itself has zero generic methods). This is the single most important fixpoint guard in the cluster.
@@ -498,9 +496,8 @@ checker::Func => "func"
 parser::FunctionType => "func"
 ```
 
-**#301 crumb 2 — the VM ref-cell closure round-trip.**
-The VM drops a `FuncVal` re-seated into a cell across a call boundary because `eval_lambda_call`
-(`vm.tks:2918`) binds captures by SNAPSHOT (`fv.cap_vals`, `:2933`). Design: a closure that must observe a
+**#301 crumb 2 — ref-cell closure round-trip (historically legacy engine-specific).**
+Historically, the legacy engine would drop a `FuncVal` re-seated into a cell across a call boundary because `eval_lambda_call` (historically at (historically)) would bind captures by SNAPSHOT (`fv.cap_vals`). Design: a closure that must observe a
 cell WRITE performed after its capture must capture the CELL INDEX (a `RefVal`), not the value — which is
 already the sound pattern (#300's "make_counter returns 1,1,1" proof). For the `reseat(cell: Ref<IntFn>, n)`
 repro, the fix is to ensure a `Ref<Fn>` cell's `.value` write (`cell_set`) and read (`cell_get`) carry the
@@ -510,20 +507,19 @@ callee frame. **Implementer probe first:** minimal repro under `TEKO_TRACE`; con
 (a) the merge, (b) the snapshot, or (c) a coerce_to on a Func value. The design lands whichever the probe
 proves; the mangle arm (crumb 1) is the load-bearing native half and unblocks the union-arm case regardless.
 
-- **Fixtures:** `examples/regressions/closure_in_ref_roundtrip/` (VM==native) — the `reseat` repro;
+- **Fixtures:** `examples/regressions/closure_in_ref_roundtrip/` (consistent) — the `reseat` repro;
   `examples/regressions/closure_optional_field/` (native — the `tk_opt_func` typedef must cc-compile);
   a `flat_map`-shaped `iter_test.tkt` once round-trip holds (unparks the ITER0 gap).
 
 **#294 crumb (post-ruling):** see §4. If ruled "structs dispatch via a synthesized value-vtable", the crumb
-adds a struct arm to the fat-pointer wrap in codegen (mirroring `cg_is_class_named` sites) + a VM
-name-dispatch for struct receivers under a constraint. If ruled "constraint-bound structs stay
+adds a struct arm to the fat-pointer wrap in codegen (mirroring `cg_is_class_named` sites) and name-dispatch for struct receivers under a constraint. If ruled "constraint-bound structs stay
 monomorphic-direct" (no vtable), the crumb makes `rekey_iface_dispatch` + emit dispatch a constraint-bound
 struct call DIRECTLY to its stamped concrete method (no upcast) — which is strictly simpler and needs no
 new rep.
 
 ---
 
-## 4. Risk / law notes (fixpoint, VM==native parity, constitutional tensions)
+## 4. Risk / law notes (fixpoint, native parity, constitutional tensions)
 
 ### Fixpoint (gen-2 == gen-3 byte-identity)
 - **Highest risk: #254.** The mono pass runs on the self-host compiler itself. The compiler is 100%
@@ -538,14 +534,14 @@ new rep.
 - **#296/#299** are guarded by "no u128 high-bit / direct-negative-`Number` literal in the corpus" → no-op
   on the self-host, fixpoint trivially preserved.
 
-### VM == native parity (native is authoritative — `teko-no-gc-vm-role`)
-- **#296 is a parity FIX** (VM was wrong, native correct) — closes a divergence.
-- **#299 is native-only** — the VM already handles negative literals; the fixture is native-only or a
+### Divergence closure (historical — native is authoritative)
+- **#296 is a closure FIX** (historically divergent; native is authoritative) — closes a historical divergence.
+- **#299 is native-only** — already handled in earlier implementations; the fixture is native-only or a
   codegen unit. No new parity surface.
-- **#301** must land BOTH engines together (the mangle arm is native, the cell round-trip is VM). Ship them
-  in the same PR so `diff_vm_native.sh` never sees a half-fixed state.
-- **#254/#294** — every fixture is VM==native (exit-code protocol). The stamped method set must produce
-  identical dispatch on both. Native is authoritative on any divergence.
+- **#301** must land both parts together (the mangle arm is native, cell semantics separate). Ship them
+  in the same PR to ensure consistency.
+- **#254/#294** — every fixture is native (exit-code protocol). The stamped method set must produce
+  identical dispatch. Native is authoritative on any divergence.
 
 ### Constitutional tensions (evolution phase — passes-all-Laws wins; log in DECISION_LOG.md)
 
@@ -593,7 +589,7 @@ still open, #254's crumbs 1–2 (collect/resolve) are the conflict-prone ones �
 
 ## 5. What remains BLOCKED (design-ahead honesty)
 
-- **#301 VM crumb 2** needs a `TEKO_TRACE` probe to pin the exact drop (merge vs snapshot vs coerce). The
+- **#301 crumb 2** (ref-cell/closure semantics) needs a `TEKO_TRACE` probe to pin the exact drop (merge vs snapshot vs coerce). The
   DESIGN is complete (capture-the-cell-index, not the value); the one-line site is probe-gated. The native
   mangle arm (crumb 1) is fully specified and unblocks the union-arm/`ReadFn | error` case immediately.
 - **#294** is gated on #254 landing (needs the stamped concrete method). Ruling (a) is applied and

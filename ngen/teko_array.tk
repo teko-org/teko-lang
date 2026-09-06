@@ -1,0 +1,574 @@
+// teko_array.tk -- fixed-size arrays of a SCALAR element type, local and
+// global (entrega 5, crumb "arrays"): `T a[N];` a local or a global the core
+// already parses (language.md § Locals/§ Globals -- `nd_val` is the element
+// count, `nd_type` the element type, on an `N_VAR` for a local and an
+// `N_GLOBAL` for a global), plus `a[i]`, `a[i] = e` and `a.Length`, which the
+// core does not have (there is no `[` in its Pratt grammar and no member
+// access on a plain word).
+//
+// TWO DIFFERENT RESOLUTIONS, because a local and a global are visible to a
+// module at different times:
+//
+//   - A LOCAL is observable at PARSE TIME, the same way teko_struct.tk's own
+//     `lv_` table sees a local of struct type: `on_stmt` reports the `N_VAR`
+//     the moment the core builds it, before any further token of the body is
+//     read, and teko_stmt.tk's `tk_block` already marks/restores a scope on
+//     every `{`/`}` -- `tk_narr` rides the very same rhythm, so a local array
+//     stops answering at the brace that closes its block, exactly like a
+//     local of struct type does. `a[i]` inside the SAME scope is therefore
+//     resolved AT ONCE, in the `[` handler, with no placeholder left behind
+//     -- the struct-field precedent (`teko_struct.tk`'s `tk_array_index`).
+//
+//   - A GLOBAL is not: `on_stmt` only fires inside a function body (mc
+//     docs/reference/hooks.md § on_stmt), and there is no public hook over a
+//     top-level declaration at all. So a global array is collected in a
+//     `pass()`, once the whole unit exists (the same reason
+//     teko_typeof.tk's oracle needs one for a parameter's type) -- and `[`
+//     over a name this module cannot yet place is left exactly as the core's
+//     own fallback already builds it, an `N_INDEX` node nothing lowers, so
+//     the pass can find it and rewrite it later without disturbing whatever
+//     ELSE that same fallback already serves (`params`' own `xs[i]`,
+//     teko_params.tk). A WRITE cannot wait for the pass, though -- the core
+//     rejects `g[i] = e;` at PARSE time, "left side of assignment must be a
+//     name" -- so `[` reads a trailing `=`/`+=`/`-=`/`++`/`--` itself, for
+//     ANY name it could not resolve locally, and records the deferred write
+//     the same way teko_typeof.tk defers a `.` it cannot type: a placeholder
+//     call nothing declares, replaced in place once the pass knows whether
+//     the name is a global array at all.
+//
+// BOUNDS: a literal index outside `[0, N)` is a compile-time error, on both
+// paths. A non-literal one is NOT guarded at run time in this crumb -- the
+// guard the struct-field precedent already has (`teko_struct.tk`'s `tk_ix`)
+// calls `rt_panic`, and `panic` is not yet surface teko; wiring a bespoke
+// guard ahead of it would be its own, unreviewed design. Registered as a
+// debt, not worked around.
+//
+// NOT TAUGHT: an array whose element is a struct or class -- the element
+// would be an object slot with no local name for `teko_rc.tk`'s pass to walk
+// (RC covers a name, not an array cell), so it stays unowned and leaks the
+// moment it is overwritten. Refused where it is declared, local or global,
+// with the debt spelled out in the message.
+//
+// G1 (§50): a GLOBAL `T[]` of HEAP (K3, teko_heaparr.tk) -- `i64[] g;`, with
+// no bracket count of its own, `g = new i64[n];` at some later statement --
+// rides the exact same two mechanisms above, collected in the SAME pass
+// (`hg_*`, right beside `gv_*`) and rewritten through the SAME `N_INDEX`
+// fallback and deferred write. What differs is the RESOLUTION, not the
+// collection or the parse-time plumbing: a heap element's address is
+// run-time-checked (`teko_heaparr.tk`'s `tk_ha_load`/`tk_ha_store`/
+// `tk_ha_compound`, over `tk_arr_at`), never a compile-time bound, because
+// the element count is whatever the last `new T[n]` gave it, not a constant
+// the declaration carries. The global itself is a ROOT (§50 decision 16): it
+// keeps the reference correctly (a counted element earns the SAME `rt_store`/
+// `rt_store_own` split a local's own store does) but is never released, the
+// same debt a class's own `static` field already carries.
+
+#define TK_MAXARR   1024               // local array declarations in scope so far
+#define TK_MAXGARR  512                // global arrays declared in one source
+#define TK_MAXGDEF  512                // deferred writes into a possibly-global array
+#define TK_MAXHG    32                 // global `T[]` of heap declared in one source
+
+#define TK_ASTORE    0                 // a[i] = e
+#define TK_ACOMPOUND 1                 // a[i] += e / -= e / ++ / --
+
+// ---- a local array in scope: name, element type, element count ----
+uptr av_name[TK_MAXARR];
+i64  av_ty[TK_MAXARR];
+i64  av_nel[TK_MAXARR];
+i64  tk_narr = 0;
+
+// ---- a global array, collected once the unit exists ----
+uptr gv_name[TK_MAXGARR];
+i64  gv_ty[TK_MAXGARR];
+i64  gv_nel[TK_MAXGARR];
+i64  tk_ngv = 0;
+
+// ---- a global `T[]` of heap (G1), collected in the SAME pass ----
+uptr hg_name[TK_MAXHG];
+i64  hg_ty[TK_MAXHG];                  // the `T[]` row type itself (teko_heaparr.tk's tk_ha_row)
+i64  tk_nhg = 0;
+
+// teko_heaparr.tk is included after this file: the run-time-checked
+// address/load/store/compound a heap array's LOCAL, FIELD and PARAMETER
+// forms already share (K3) is exactly what a GLOBAL one resolves through too.
+i64 tk_ha_load(i64 base, i64 ety, i64 idx);
+i64 tk_ha_store(i64 base, i64 ety, i64 idx, i64 v);
+i64 tk_ha_compound(i64 base, i64 ety, i64 idx, i64 op, i64 v);
+
+// ---- a write the parser read but could not yet place ----
+i64  gd_node[TK_MAXGDEF];             // the placeholder the pass rewrites in place
+i64  gd_base[TK_MAXGDEF];             // the name, parsed once
+i64  gd_idx[TK_MAXGDEF];              // the index, parsed once
+i64  gd_form[TK_MAXGDEF];             // TK_ASTORE or TK_ACOMPOUND
+i64  gd_op[TK_MAXGDEF];               // K_ADD or K_SUB, when the form is TK_ACOMPOUND
+i64  gd_val[TK_MAXGDEF];              // the assigned or added expression
+i64  gd_line[TK_MAXGDEF];
+uptr gd_file[TK_MAXGDEF];
+i64  tk_ngd = 0;
+
+// ---- table accessors (no raw ld64/st64 outside this section) ----
+uptr av_name_at(i64 i) { return ld64(av_name + i * 8); }
+i64  av_ty_at(i64 i)   { return ld64(av_ty + i * 8); }
+i64  av_nel_at(i64 i)  { return ld64(av_nel + i * 8); }
+void set_av_name_at(i64 i, uptr v) { st64(av_name + i * 8, v); }
+void set_av_ty_at(i64 i, i64 v)    { st64(av_ty + i * 8, v); }
+void set_av_nel_at(i64 i, i64 v)   { st64(av_nel + i * 8, v); }
+
+uptr gv_name_at(i64 i) { return ld64(gv_name + i * 8); }
+i64  gv_ty_at(i64 i)   { return ld64(gv_ty + i * 8); }
+i64  gv_nel_at(i64 i)  { return ld64(gv_nel + i * 8); }
+void set_gv_name_at(i64 i, uptr v) { st64(gv_name + i * 8, v); }
+void set_gv_ty_at(i64 i, i64 v)    { st64(gv_ty + i * 8, v); }
+void set_gv_nel_at(i64 i, i64 v)   { st64(gv_nel + i * 8, v); }
+
+uptr hg_name_at(i64 i) { return ld64(hg_name + i * 8); }
+i64  hg_ty_at(i64 i)   { return ld64(hg_ty + i * 8); }
+void set_hg_name_at(i64 i, uptr v) { st64(hg_name + i * 8, v); }
+void set_hg_ty_at(i64 i, i64 v)    { st64(hg_ty + i * 8, v); }
+
+i64  gd_node_at(i64 i) { return ld64(gd_node + i * 8); }
+i64  gd_base_at(i64 i) { return ld64(gd_base + i * 8); }
+i64  gd_idx_at(i64 i)  { return ld64(gd_idx + i * 8); }
+i64  gd_form_at(i64 i) { return ld64(gd_form + i * 8); }
+i64  gd_op_at(i64 i)   { return ld64(gd_op + i * 8); }
+i64  gd_val_at(i64 i)  { return ld64(gd_val + i * 8); }
+i64  gd_line_at(i64 i) { return ld64(gd_line + i * 8); }
+uptr gd_file_at(i64 i) { return ld64(gd_file + i * 8); }
+void set_gd_node_at(i64 i, i64 v)  { st64(gd_node + i * 8, v); }
+void set_gd_base_at(i64 i, i64 v)  { st64(gd_base + i * 8, v); }
+void set_gd_idx_at(i64 i, i64 v)   { st64(gd_idx + i * 8, v); }
+void set_gd_form_at(i64 i, i64 v)  { st64(gd_form + i * 8, v); }
+void set_gd_op_at(i64 i, i64 v)    { st64(gd_op + i * 8, v); }
+void set_gd_val_at(i64 i, i64 v)   { st64(gd_val + i * 8, v); }
+void set_gd_line_at(i64 i, i64 v)  { st64(gd_line + i * 8, v); }
+void set_gd_file_at(i64 i, uptr v) { st64(gd_file + i * 8, v); }
+
+// ---- local array: the table is a STACK, marked at `{` and cut back at `}`
+// (teko_stmt.tk's tk_block), the same rhythm as teko_struct.tk's `lv_` table ----
+i64 tk_arr_find(uptr name) {
+    i64 i = tk_narr - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(av_name_at(i), name)) return i;
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+void tk_arr_add(uptr name, i64 ty, i64 nel) {
+    if (tk_narr == TK_MAXARR) err_at(tk_file, tk_line, "teko: too many local arrays");
+    set_av_name_at(tk_narr, name);
+    set_av_ty_at(tk_narr, ty);
+    set_av_nel_at(tk_narr, nel);
+    tk_narr = tk_narr + 1;
+}
+
+// on_stmt's own view of a local `N_VAR`: `nd_val` is the element count, 0 for
+// a scalar (teko_struct.tk's `tk_on_stmt` skips those the other way around).
+// A struct/class element has no name of its own for `teko_rc.tk` to track --
+// refused here, at the declaration, rather than left to leak silently.
+i64 tk_arr_on_stmt(i64 n) {
+    if (n == 0) return n;
+    if (nd_kind(n) != N_VAR) return n;
+    if (nd_val(n) == 0) return n;
+    i64 ety = nd_type(n);
+    if (tk_struct_by_ty(ety) >= 0)
+        err_at(nd_file(n), nd_line(n), "teko: an array of objects is not taught yet; use a field array or wait for T[]");
+    tk_line = nd_line(n);
+    tk_file = nd_file(n);
+    tk_arr_add(nd_name(n), ety, nd_val(n));
+    return n;
+}
+
+// ---- global array: collected once, in a pass() ----
+i64 tk_garr_find(uptr name) {
+    i64 i = tk_ngv - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(gv_name_at(i), name)) return i;
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+void tk_gv_add(uptr name, i64 ty, i64 nel, i64 line, uptr fl) {
+    if (tk_ngv == TK_MAXGARR) err_at(fl, line, "teko: too many global arrays");
+    set_gv_name_at(tk_ngv, name);
+    set_gv_ty_at(tk_ngv, ty);
+    set_gv_nel_at(tk_ngv, nel);
+    tk_ngv = tk_ngv + 1;
+}
+
+void tk_garr_collect() {
+    i64 n = 1;
+    loop {
+        if (n >= nnodes) break;
+        if (nd_kind(n) == N_GLOBAL && nd_val(n) != 0) {
+            i64 ety = nd_type(n);
+            if (tk_struct_by_ty(ety) >= 0)
+                err_at(nd_file(n), nd_line(n), "teko: an array of objects is not taught yet; use a field array or wait for T[]");
+            tk_gv_add(nd_name(n), ety, nd_val(n), nd_line(n), nd_file(n));
+        }
+        n = n + 1;
+    }
+}
+
+// ---- global `T[]` of heap (G1): collected in the SAME sweep, keyed by TYPE
+// rather than by `nd_val` -- `i64[] g;` carries no bracket count of its own,
+// so a plain `nd_val(n) != 0` test (above) would never see it ----
+i64 tk_hg_find(uptr name) {
+    i64 i = tk_nhg - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(hg_name_at(i), name)) return i;
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+void tk_hg_add(uptr name, i64 ty) {
+    if (tk_nhg == TK_MAXHG) err_at(tk_file, tk_line, "teko: too many global `T[]` of heap");
+    set_hg_name_at(tk_nhg, name);
+    set_hg_ty_at(tk_nhg, ty);
+    tk_nhg = tk_nhg + 1;
+}
+
+void tk_hg_collect() {
+    i64 n = 1;
+    loop {
+        if (n >= nnodes) break;
+        if (nd_kind(n) == N_GLOBAL && tk_is_ha(tk_struct_by_ty(nd_type(n))))
+            tk_hg_add(nd_name(n), nd_type(n));
+        n = n + 1;
+    }
+}
+
+// the element type a global `T[]` row carries, for the load/store/compound
+// machinery below -- teko_heaparr.tk's own `ha_ety_at`, over the row
+// `tk_struct_by_ty` finds for the type `tk_hg_add` recorded.
+i64 tk_hg_ety_at(i64 i) { return ha_ety_at(tk_struct_by_ty(hg_ty_at(i))); }
+
+// the type of a global `T[]`, for teko_typeof.tk's oracle (`tk_ty_of`) --
+// -1 for anything else, a global SCALAR included, so the oracle keeps
+// answering "not known" for one the way it always has.
+i64 tk_ty_global_ha(uptr name) {
+    i64 hi = tk_hg_find(name);
+    if (hi < 0) return 0 - 1;
+    return hg_ty_at(hi);
+}
+
+// ---- shared address/load/store machinery, LOCAL and GLOBAL alike ----
+uptr tk_arr_msg(i64 k, uptr name, i64 nel) {
+    return tk_join3(tk_join3("teko: index ", tk_num(k), " is out of range for "),
+                    name, tk_join3("[", tk_num(nel), "]"));
+}
+
+// a LITERAL index is decided here, against the array's own known count. A
+// non-literal one is returned as is -- no run-time guard in this crumb (the
+// header above spells out why).
+i64 tk_arr_bounds(i64 idx, i64 nel, uptr name, i64 line, uptr fl) {
+    if (nd_kind(idx) != N_INT) return idx;
+    i64 k = nd_val(idx);
+    if (k < 0 || k >= nel) err_at(fl, line, tk_arr_msg(k, name, nel));
+    return idx;
+}
+
+i64 tk_arr_addr(i64 base, i64 ety, i64 idx) {
+    return tk_bin(K_ADD, base, tk_bin(K_MUL, idx, tk_int(type_width(ety))));
+}
+
+i64 tk_cast(i64 ty, i64 e) {
+    i64 n = tk_nd(N_CAST);
+    set_nd_type(n, ty);
+    set_nd_a(n, e);
+    return n;
+}
+
+// the cast an INDIRECT call has to carry: `callp` names no callee, so the core
+// types the node `TY_I64` (mc src/gen_resolve.mc) unless a cast sits DIRECTLY
+// on it -- that cast is the only place the return type can be declared, and
+// what makes `walk_ret_type()` answer float so <float>'s `fa_result` moves
+// `d0`/`xmm0` into the destination. A narrow INTEGER takes the same cast, by
+// the core's own rule (`walk_narrow`, mc src/gen_walk.mc): `uptr` is the
+// machine word and never narrow, what is neither TK_INT nor TK_SINT belongs to
+// a module, and a void return takes no cast at all.
+//
+// The caller wraps at the site that BUILDS the call, and every registration by
+// node position (`tk_xt_put`/`tk_xt_add`, and the `node_assign`/
+// `tk_node_replace` that copies a result into the tree) is about the node this
+// RETURNS, never the `callp` underneath: a node between the cast and the
+// `callp` breaks the core's match in silence.
+i64 tk_callp_ret(i64 ret, i64 call) {
+    if (ret == TY_VOID) return call;
+    i64 k = type_kind(ret);
+    if (k == TK_FLOAT) return tk_cast(ret, call);
+    if (ret == TY_UPTR) return call;
+    if (k != TK_INT && k != TK_SINT) return call;
+    if (type_width(ret) < 8) return tk_cast(ret, call);
+    return call;
+}
+
+// the raw load is always zero-extending (language.md § 2: "the signed read of
+// raw memory ... spelled (i32) ld32(p)"), so a signed narrower-than-word
+// element -- `i32`, today's only one -- is cast to its own type afterward.
+i64 tk_arr_load(i64 ety, i64 at) {
+    i64 r = tk_call(tk_ldn(ety), at);
+    if (type_kind(ety) == TK_SINT && type_width(ety) < 8) return tk_cast(ety, r);
+    return r;
+}
+
+i64 tk_arr_store(i64 ety, i64 at, i64 v) {
+    return tk_call2(tk_stn(ety), at, v);
+}
+
+// `a[i] OP= e` / `a[i]++` / `a[i]--`: the address is built TWICE (`tk_clone`
+// on both `base` and `idx`), once for the read and once for the write, since
+// a node lives in only one sibling list. Re-evaluating a pure `idx` twice is
+// the same trade the struct-field precedent leaves open (`teko_struct.tk`'s
+// own header never claims otherwise); no crumb fixture indexes with a call.
+i64 tk_arr_compound(i64 base, i64 ety, i64 idx, i64 op, i64 e) {
+    i64 idx2 = tk_clone(idx);
+    i64 base2 = tk_clone(base);
+    i64 cur = tk_arr_load(ety, tk_arr_addr(base, ety, idx));
+    i64 val = tk_bin(op, cur, e);
+    return tk_arr_store(ety, tk_arr_addr(base2, ety, idx2), val);
+}
+
+// whether the token(s) right after an already-parsed index spell a write:
+// `=`, `+=`/`-=`, `++`/`--` -- declared here so a receiver sunk through a
+// `- ! ~` chain (below) can consult it before either LOCAL or FIELD array
+// indexing accepts one; defined further down, where a GLOBAL array's own
+// deferred write already needed it.
+i64 tk_arr_write_follows();
+
+// ---- LOCAL `a[i]`: resolved AT ONCE, teko_struct.tk's `tk_array_index` shape ----
+// A receiver sunk through a `- ! ~` chain (teko_prefix.tk) is never the write
+// target the source named: `!b[1] = e` refuses of its own accord instead of
+// building a store the wrapping `!` would then choke on.
+i64 tk_arr_index_of(i64 base, i64 ety, i64 nel, uptr name) {
+    i64 line = p_line();
+    uptr fl = p_file();
+    i64 idxRaw = parse_expr(0);
+    p_expect(K_RBRACK, "expected ] after the index");
+    tk_line = line;
+    tk_file = fl;
+    i64 idx = tk_arr_bounds(idxRaw, nel, name, line, fl);
+    if (tk_bracket_no_write && tk_arr_write_follows())
+        err_at(fl, line, "teko: the left side of = is not a place");
+    if (p_accept(K_ASSIGN)) {
+        i64 v = parse_expr(0);
+        tk_line = line;
+        tk_file = fl;
+        return tk_arr_store(ety, tk_arr_addr(base, ety, idx), v);
+    }
+    if (p_id() == tk_pluseq_tok || p_id() == tk_minuseq_tok) {
+        i64 op = K_ADD;
+        if (p_id() == tk_minuseq_tok) op = K_SUB;
+        p_next();
+        i64 e = parse_expr(0);
+        tk_line = line;
+        tk_file = fl;
+        return tk_arr_compound(base, ety, idx, op, e);
+    }
+    if (p_id() == tk_incr_tok || p_id() == tk_decr_tok) {
+        i64 op = K_ADD;
+        if (p_id() == tk_decr_tok) op = K_SUB;
+        p_next();
+        tk_line = line;
+        tk_file = fl;
+        return tk_arr_compound(base, ety, idx, op, tk_int(1));
+    }
+    return tk_arr_load(ety, tk_arr_addr(base, ety, idx));
+}
+
+// `a.Length` -- the one member a local array answers, decided here because
+// the `[` handler already knows `a` is one; a global's is not (dívida, no
+// fixture asks for it). `a.Length = e` is left to the core's own "left side
+// of assignment must be a name" (a `tk_int` is not one).
+i64 tk_arr_length_of(i64 ai, uptr m, i64 line, uptr fl) {
+    if (!str_eq(m, "Length"))
+        err_at2(fl, line, "teko: an array has no member", m);
+    tk_line = line;
+    tk_file = fl;
+    return tk_int(av_nel_at(ai));
+}
+
+// ---- GLOBAL `a[i]`: a write is deferred at parse time, a read is left as
+// the core's own N_INDEX fallback and rewritten in the pass ----
+i64 tk_arr_write_follows() {
+    i64 t = p_id();
+    if (t == K_ASSIGN) return 1;
+    if (t == tk_pluseq_tok || t == tk_minuseq_tok) return 1;
+    if (t == tk_incr_tok || t == tk_decr_tok) return 1;
+    return 0;
+}
+
+void tk_gd_add(i64 n, i64 base, i64 idx, i64 form, i64 op, i64 val, i64 line, uptr fl) {
+    if (tk_ngd == TK_MAXGDEF) err_at(fl, line, "teko: too many array writes waiting to be resolved");
+    set_gd_node_at(tk_ngd, n);
+    set_gd_base_at(tk_ngd, base);
+    set_gd_idx_at(tk_ngd, idx);
+    set_gd_form_at(tk_ngd, form);
+    set_gd_op_at(tk_ngd, op);
+    set_gd_val_at(tk_ngd, val);
+    set_gd_line_at(tk_ngd, line);
+    set_gd_file_at(tk_ngd, fl);
+    tk_ngd = tk_ngd + 1;
+}
+
+// `left`, `idx` and the trailing `]` are already read; what is left is the
+// write itself. A call to a symbol nothing declares stands in the tree until
+// the pass knows what `left` is -- teko_typeof.tk's `tk_defer_member` is the
+// same idiom for a deferred `.`.
+i64 tk_arr_defer_write(i64 left, i64 idx, i64 line, uptr fl) {
+    i64 form = TK_ASTORE;
+    i64 op = 0;
+    i64 val = 0;
+    if (p_accept(K_ASSIGN)) {
+        val = parse_expr(0);
+    } else if (p_id() == tk_pluseq_tok || p_id() == tk_minuseq_tok) {
+        form = TK_ACOMPOUND;
+        op = K_ADD;
+        if (p_id() == tk_minuseq_tok) op = K_SUB;
+        p_next();
+        val = parse_expr(0);
+    } else {
+        form = TK_ACOMPOUND;
+        op = K_ADD;
+        if (p_id() == tk_decr_tok) op = K_SUB;
+        p_next();
+        val = tk_int(1);
+    }
+    tk_line = line;
+    tk_file = fl;
+    i64 n = tk_call("tk_unresolved_array", 0);
+    tk_gd_add(n, left, idx, form, op, val, line, fl);
+    return n;
+}
+
+// children first, then the node, then the sibling -- teko_params.tk's own
+// `tk_va_walk` shape, reused here for the same reason: a rewrite in place has
+// to see the WHOLE tree once parsing is over.
+void tk_array_walk_reads(i64 n) {
+    loop {
+        if (n == 0) break;
+        tk_array_walk_reads(nd_a(n));
+        tk_array_walk_reads(nd_b(n));
+        tk_array_walk_reads(nd_c(n));
+        tk_array_walk_reads(nd_d(n));
+        if (nd_kind(n) == N_INDEX) tk_array_maybe_rewrite_index(n);
+        n = nd_next(n);
+    }
+}
+
+// an `N_INDEX` whose base is not a known global array is none of this
+// module's business -- left exactly as `tk_bracket`'s own fallback built it,
+// for `params`' own walk (teko_params.tk) to find right after this pass runs.
+void tk_array_maybe_rewrite_index(i64 n) {
+    i64 base = nd_a(n);
+    if (nd_kind(base) != N_IDENT) return;
+    i64 gi = tk_garr_find(nd_name(base));
+    if (gi < 0) { tk_hg_rewrite_index(n); return; }
+    i64 ety = gv_ty_at(gi);
+    i64 nel = gv_nel_at(gi);
+    uptr nm = gv_name_at(gi);
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    tk_line = line;
+    tk_file = fl;
+    i64 idx = tk_arr_bounds(nd_b(n), nel, nm, line, fl);
+    i64 keep = nd_next(n);
+    node_assign(n, tk_arr_load(ety, tk_arr_addr(base, ety, idx)));
+    set_nd_next(n, keep);
+}
+
+// `g[i]` on a global `T[]` (G1): unlike a FIXED array's own rewrite above,
+// there is no compile-time bound to check against -- the element count is
+// whatever the last `new T[n]` gave it -- so the load is the run-time-checked
+// one K3's local/field/parameter forms already share (`tk_ha_load`, over
+// `tk_arr_at`). A base this table does not know either is none of this
+// module's business, same as the fixed-array branch it mirrors: it is left
+// for `params`' own walk (teko_params.tk) to find, unrewritten.
+void tk_hg_rewrite_index(i64 n) {
+    i64 base = nd_a(n);
+    i64 hi = tk_hg_find(nd_name(base));
+    if (hi < 0) return;
+    i64 ety = tk_hg_ety_at(hi);
+    tk_line = nd_line(n);
+    tk_file = nd_file(n);
+    i64 keep = nd_next(n);
+    node_assign(n, tk_ha_load(base, ety, nd_b(n)));
+    set_nd_next(n, keep);
+    i64 es = tk_struct_by_ty(ety);                // the same re-mark tk_ha_load
+    if (es >= 0) tk_xt_add(n, es, 1);              // gives its OWN return node
+}
+
+// a deferred write whose base never turns out to be a global array is not a
+// silent no-op: the core would have refused it outright before this crumb
+// (`left side of assignment must be a name`), so failing here is a strict
+// improvement, not a new restriction.
+void tk_array_resolve_write(i64 i) {
+    i64 base = gd_base_at(i);
+    i64 line = gd_line_at(i);
+    uptr fl = gd_file_at(i);
+    i64 gi = tk_garr_find(nd_name(base));
+    if (gi < 0) { tk_hg_resolve_write(i); return; }
+    i64 ety = gv_ty_at(gi);
+    i64 nel = gv_nel_at(gi);
+    uptr nm = gv_name_at(gi);
+    tk_line = line;
+    tk_file = fl;
+    i64 idx = tk_arr_bounds(gd_idx_at(i), nel, nm, line, fl);
+    i64 r = 0;
+    if (gd_form_at(i) == TK_ASTORE) r = tk_arr_store(ety, tk_arr_addr(base, ety, idx), gd_val_at(i));
+    else                            r = tk_arr_compound(base, ety, idx, gd_op_at(i), gd_val_at(i));
+    i64 n = gd_node_at(i);
+    i64 keep = nd_next(n);
+    node_assign(n, r);
+    set_nd_next(n, keep);
+}
+
+// the write half of a global `T[]` (G1): the address is the SAME
+// run-time-checked one the read side above uses, so a store past the end
+// panics exactly as an out-of-range LOAD would (K3's own guard, `tk_arr_at`).
+// A base neither table knows is the same "not a known array" the fixed-array
+// branch above already gives.
+void tk_hg_resolve_write(i64 i) {
+    i64 base = gd_base_at(i);
+    i64 line = gd_line_at(i);
+    uptr fl = gd_file_at(i);
+    i64 hi = tk_hg_find(nd_name(base));
+    if (hi < 0) err_at2(fl, line, "teko: not a known array", nd_name(base));
+    i64 ety = tk_hg_ety_at(hi);
+    tk_line = line;
+    tk_file = fl;
+    i64 idx = gd_idx_at(i);
+    i64 r = 0;
+    if (gd_form_at(i) == TK_ASTORE) r = tk_ha_store(base, ety, idx, gd_val_at(i));
+    else                            r = tk_ha_compound(base, ety, idx, gd_op_at(i), gd_val_at(i));
+    i64 n = gd_node_at(i);
+    i64 keep = nd_next(n);
+    node_assign(n, r);
+    set_nd_next(n, keep);
+    if (tk_is_counted(ety)) tk_os_add(n);          // the same re-mark tk_ha_store
+}                                                   // gives its OWN return node
+
+void tk_array_resolve_writes() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_ngd) break;
+        tk_array_resolve_write(i);
+        i = i + 1;
+    }
+}
+
+// registered AHEAD of tk_params_pass (teko.tk): a global array's own N_INDEX
+// nodes have to be gone before that walk runs unconditionally over every
+// N_INDEX in the unit once a `params` list exists anywhere in it.
+i64 tk_array_pass(i64 root) {
+    tk_garr_collect();
+    tk_hg_collect();
+    if (tk_ngv > 0 || tk_nhg > 0) tk_array_walk_reads(root);
+    tk_array_resolve_writes();
+    return root;
+}

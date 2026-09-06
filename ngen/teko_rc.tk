@@ -1,0 +1,535 @@
+// teko_rc.tk -- the reclaim (D218): reference counting per SCOPE, injected over
+// the tree of every function body. It is what turns the fixed 4 MiB arena of
+// ngen/lib/rt.tk into memory a program gets back: a local of class type is
+// released at the `}` that closes its block, at every jump that leaves it, and
+// at the `return` that leaves the function, and the release the count reaches
+// runs the destructor, releases the object's own counted fields and hands the
+// block to its size class.
+//
+// What the pass writes, and nothing else:
+//
+//   C x = e;            ->  C x = rt_own(e);        (e borrowed; `new` moves in)
+//   x = e;              ->  rt_store(&x, e);        (rt_store_own when e is owned)
+//   p.f = e;            ->  rt_store(p + F, e);     (the parser marked the store)
+//   { ... }             ->  { ... rc_dec(x); }      (reverse declaration order)
+//   break N; continue N; -> { rc_dec(x); break/continue N; } (every scope inside)
+//   return e;           ->  { T $t = e; rc_inc($t); rc_dec(x); return $t; }
+//   f();                ->  rt_drop(f());           (a reference nobody took)
+//   g(f())              ->  g(rt_park(f()))         (...and a fence around the
+//                                                    statement that built it)
+//
+// TEMPORARIES. A function that answers with a class hands out a reference of
+// the caller's own -- that is the protocol the `return` above keeps, and it is
+// what lets `C x = f();` take the value without incrementing. So an owned value
+// that lands anywhere that gives it NO owner (an argument, which the callee
+// borrows; the receiver of a `.`; an operand) would live for the rest of the
+// run. Every one of them is parked (ngen/lib/rt.tk) and released when the
+// statement ends, which is where C# and C++ end the full expression too. The
+// condition of an `if` is read into a name of its own first, because `if (c)
+// return 1;` would jump straight over a sweep written after it.
+//
+// WHY A PASS AND NOT THE PARSER. The scope half of this could be written where
+// the block is parsed, as `mc/examples/lang` writes it (`lang_stmt.mc`
+// lg_decs_from) -- but the OWNERSHIP half cannot. Whether `e` already carries a
+// reference of its own is a question about `e`'s static TYPE, and in the ngen a
+// member access on a receiver the parser cannot type is DEFERRED by design
+// (teko_expr.tk's tk_defer_member): at parse time such a node is a placeholder
+// with no type at all. Guessing there is a silent leak (an increment too many)
+// or a silent use-after-free (one too few), and the alert the mc session raised
+// is that scope must have ONE owner and never two. So both halves live here,
+// after teko_typeof.tk has resolved every deferred access and every node has
+// its type -- the pass being the single source, which is what that alert asked
+// for. The parser's own table of locals is untouched and still does what it
+// always did, resolve `.`.
+//
+// Two more things the lx gets for free and this pass has to earn. `loop` is a
+// CORE keyword, and `word_add` refuses to let a module own one
+// (mc/src/hooks.mc), so there is no `syntax_stmt("loop")` to push a mark from
+// and `on_jump`'s `depth` counts BLOCKS, not loops -- here the N_LOOP node is
+// in the tree, so `break N` reads the mark of the N-th loop out. And a
+// destructor may reach a field the release is about to drop, so the destructors
+// run before any field is released (teko_class.tk's tk_release_fn).
+//
+// A program that declares no class and no interface is not this pass's
+// business: the root comes back untouched, so a `struct`-only source keeps the
+// tree it had, byte for byte.
+
+#define TK_MAXLOOP 32                 // loops open at one point of one function
+
+i64 rc_lp[TK_MAXLOOP];                // the scope top at the head of each open loop
+i64 tk_nlp = 0;
+i64 tk_rc_floor = 0;                  // where the body's own locals start: past the parameters
+i64 tk_rc_ret = 0 - 1;                // the declared return type of the function being walked
+i64 tk_rc_cur_fn = 0;                 // the N_FUNC this pass is walking (K2's own `ref`/`out` exception)
+i64 tk_nparked = 0;                   // temporaries parked so far: a change detector
+i64 tk_rc_swept = 0;                  // 1 when the statement swept its own temporaries
+i64 tk_rc_root = 0;                   // the unit, for the return type of a callee
+
+i64 rc_lp_at(i64 i)          { return ld64(rc_lp + i * 8); }
+void set_rc_lp_at(i64 i, i64 v) { st64(rc_lp + i * 8, v); }
+
+void tk_rc_stmt(i64 n);
+void tk_rc_block(i64 n);
+
+// nodes this pass builds report the position of the statement they replace
+void tk_rc_at(i64 n) {
+    tk_line = nd_line(n);
+    tk_file = nd_file(n);
+}
+
+// 1 when the function `name` answers with a counted reference. The answer comes
+// from the TREE and not from `decl_find`, which is keyed by name alone: two
+// overloads of one name are still two declarations spelled the same here (the
+// mangling pass runs behind this one), and a name whose declarations disagree
+// answers "borrowed" -- an increment too many is a leak, one too few is a
+// use-after-free, and only one of the two is worth risking on an ambiguity.
+i64 tk_rc_call_owned(uptr name) {
+    i64 seen = 0;
+    i64 ans = 0;
+    i64 f = tk_rc_root;
+    loop {
+        if (f == 0) break;
+        if (nd_kind(f) == N_FUNC && str_eq(nd_name(f), name)) {
+            i64 c = tk_is_counted(nd_type(f));
+            if (seen && c != ans) return 0;
+            ans = c;
+            seen = 1;
+        }
+        f = nd_next(f);
+    }
+    return ans;
+}
+
+// 1 when the value already carries a reference of its own: `new C(...)`, or a
+// call to anything declared to answer with a class or an interface -- every such
+// function hands out a reference of the caller's own, which is the protocol the
+// return lowering below keeps. A name, a field load and an element load are
+// BORROWED: the object belongs to whoever the load read it from.
+i64 tk_rc_own(i64 e) {
+    if (e == 0) return 0;
+    i64 x = tk_xt_at(e);
+    if (x >= 0) {
+        if (xt_pure_at(x)) return 0;
+        return tk_is_counted(xt_ty_at(x));
+    }
+    if (nd_kind(e) != N_CALL) return 0;
+    return tk_rc_call_owned(nd_name(e));
+}
+
+// where `name` sits in the scope stack, or -1: below the floor it is a
+// parameter, which is borrowed and never released
+i64 tk_rc_index(uptr name) {
+    i64 i = tk_nscope - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(sc_name_at(i), name)) return i;
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// the rc_dec of every counted local from `base` to the top of the scope, in
+// REVERSE declaration order: an object built from one declared before it is
+// released first, so the reference it holds is still valid while it runs
+i64 tk_rc_releases(i64 base) {
+    i64 head = 0;
+    i64 i = tk_nscope - 1;
+    loop {
+        if (i < base) break;
+        if (tk_is_counted(sc_ty_at(i)))
+            head = list_append(head, tk_stmt(tk_call("rc_dec", tk_id(sc_name_at(i)))));
+        i = i - 1;
+    }
+    return head;
+}
+
+// ---- the statements the pass rewrites ----
+
+// `C x = e;`: an owning slot takes a reference. A value that already carries
+// one moves in; a borrowed one is incremented, so the local and whoever it was
+// read from each hold their own. `C x;` (K2b bug 1a) is the SAME slot with no
+// `e` at all -- the frame `parse_var` reserves is not zeroed, so it is given
+// the borrowed `0` a plain `null` initializer would carry, through the same
+// `rt_own` every other counted local's slot is filled by, rather than left to
+// whatever the stack happened to hold.
+void tk_rc_var(i64 n) {
+    if (nd_val(n) != 0) return;                  // `C tbl[4]`: references, not one object
+    i64 e = nd_a(n);
+    if (e != 0) tk_check_compat(nd_type(n), tk_ty_of(e), e, nd_line(n), nd_file(n));
+    if (!tk_is_counted(nd_type(n))) return;
+    if (e == 0) e = tk_int(0);
+    else if (tk_rc_own(e)) return;
+    tk_rc_at(n);
+    set_nd_a(n, tk_call("rt_own", e));
+}
+
+// `x = e;` on a local of class type: one call keeps both counts straight, and
+// the old object of the slot is released the moment it stops being reachable.
+// A PARAMETER is borrowed -- the caller's reference was never counted on entry,
+// so releasing it here would free an object the caller still holds. K2's own
+// exception: a `ref`/`out` parameter of counted type already IS the caller's
+// own slot address, so writing through it is exactly what the parameter is
+// for -- `x` itself is the destination, not `&x`.
+void tk_rc_assign(i64 n) {
+    i64 li = tk_rc_index(nd_name(n));
+    if (li < 0) return;
+    tk_check_compat(sc_ty_at(li), tk_ty_of(nd_a(n)), nd_a(n), nd_line(n), nd_file(n));
+    if (!tk_is_counted(sc_ty_at(li))) return;
+    tk_rc_at(n);
+    i64 dest = tk_addr(nd_name(n));
+    if (li < tk_rc_floor) {
+        if (tk_rp_named_in(tk_rc_cur_fn, nd_name(n)) < 0)
+            err_at2(tk_file, tk_line, "teko: a parameter of class type is borrowed; it is not reassigned",
+                    nd_name(n));
+        dest = tk_id(nd_name(n));
+    }
+    uptr fn = "rt_store";
+    if (tk_rc_own(nd_a(n))) fn = "rt_store_own";
+    i64 call = tk_call2(fn, dest, nd_a(n));
+    set_nd_kind(n, N_EXPRSTMT);
+    set_nd_name(n, 0);
+    set_nd_a(n, call);
+}
+
+// `return e;` becomes `{ T $t = e; [rc_inc($t);] releases...; return $t; }`.
+// The temporary is what makes the releases safe: the value is computed before
+// the locals go away, and a borrowed one is incremented first, so the caller
+// receives a reference of its own whatever the expression was. A `return` that
+// parked temporaries sweeps them ITSELF, before it leaves: a sweep written
+// after it would never run.
+void tk_rc_return(i64 n, i64 p0) {
+    i64 e = nd_a(n);
+    if (e != 0) tk_check_compat(tk_rc_ret, tk_ty_of(e), e, nd_line(n), nd_file(n));
+    i64 parked = tk_nparked > p0;
+    i64 needinc = 0;
+    if (e != 0 && tk_is_counted(tk_rc_ret)) needinc = !tk_rc_own(e);
+    i64 rel = tk_rc_releases(tk_rc_floor);
+    if (rel == 0 && !needinc && !parked) return;
+    tk_rc_at(n);
+    i64 st = 0;
+    uptr m = 0;
+    if (parked) {
+        m = gensym_new();
+        st = tk_var(TY_I64, m, tk_call("rt_mark", 0));
+    }
+    i64 rv = 0;
+    if (e != 0 && tk_rc_ret == TY_VOID) {
+        st = list_append(st, tk_stmt(e));
+    } else if (e != 0) {
+        uptr t = gensym_new();
+        st = list_append(st, tk_var(tk_rc_ret, t, e));
+        if (needinc) st = list_append(st, tk_stmt(tk_call("rc_inc", tk_id(t))));
+        rv = tk_id(t);
+    }
+    if (parked) st = list_append(st, tk_stmt(tk_call("rt_sweep", tk_id(m))));
+    st = list_append(st, rel);
+    st = list_append(st, tk_ret(rv));
+    set_nd_kind(n, N_BLOCK);
+    set_nd_type(n, 0);
+    set_nd_val(n, 0);
+    set_nd_name(n, 0);
+    set_nd_a(n, st);
+    tk_rc_swept = 1;
+    tk_nparked = p0;
+}
+
+// `break N` / `continue N` leave every scope opened inside the loop they jump
+// out of, and the block's own releases at the `}` are exactly what they skip.
+// The mark of the target loop is the scope top at its head, which is why the
+// loop stack is kept while the tree is walked; `continue N` counts levels the
+// same way `break N` does (mc 0.14.1), `nd_val` 0 read as 1 for both.
+void tk_rc_jump(i64 n) {
+    if (tk_nlp == 0) return;
+    i64 lvl = nd_val(n);
+    if (lvl < 1) lvl = 1;
+    i64 idx = tk_nlp - lvl;
+    if (idx < 0) return;
+    i64 rel = tk_rc_releases(rc_lp_at(idx));
+    if (rel == 0) return;
+    tk_rc_at(n);
+    i64 j = node_new(nd_kind(n), tk_line, tk_file);
+    set_nd_val(j, nd_val(n));
+    set_nd_kind(n, N_BLOCK);
+    set_nd_val(n, 0);
+    set_nd_a(n, list_append(rel, j));
+}
+
+// `f();` on its own line, where `f` hands out a reference of the caller's own:
+// nobody took it, so it is released where it was produced instead of living for
+// the rest of the run
+void tk_rc_exprstmt(i64 n) {
+    i64 e = nd_a(n);
+    if (!tk_rc_own(e)) return;
+    tk_rc_at(n);
+    set_nd_a(n, tk_call("rt_drop", e));
+}
+
+// a store into a slot of counted type, recorded where the parser built it: the
+// pass is what can tell an owned value from a borrowed one, so it is the pass
+// that picks between the two stores
+void tk_rc_store(i64 n) {
+    if (!tk_os_has(n)) return;
+    i64 v = nd_next(nd_a(n));                    // stW(address, value): the second argument
+    if (tk_rc_own(v)) set_nd_name(n, "rt_store_own");
+    else              set_nd_name(n, "rt_store");
+}
+
+// ---- the walk ----
+// An expression is walked for the marked stores and the temporaries it hands to
+// a call; a statement is walked for everything else. A statement the pass
+// rewrote is NOT walked again: the block it became holds the very node that was
+// just lowered.
+
+// a shallow copy of `n`, so that the original may be overwritten in place while
+// what it held keeps its children and its place in the tree
+i64 tk_rc_detach(i64 n) {
+    i64 c = node_new(nd_kind(n), nd_line(n), nd_file(n));
+    set_nd_op(c, nd_op(n));
+    set_nd_type(c, nd_type(n));
+    set_nd_val(c, nd_val(n));
+    set_nd_name(c, nd_name(n));
+    set_nd_a(c, nd_a(n));
+    set_nd_b(c, nd_b(n));
+    set_nd_c(c, nd_c(n));
+    set_nd_d(c, nd_d(n));
+    return c;
+}
+
+// the value a marked store moves into the slot, which is the one place inside
+// an expression where an owned reference finds an owner
+i64 tk_rc_consumed(i64 n) {
+    if (!tk_os_has(n)) return 0;
+    return nd_next(nd_a(n));                     // stW(address, value)
+}
+
+// a reference of its own, in a place that gives it no owner: an argument the
+// callee borrows, the receiver of a `.`, an operand. It is PARKED, and the
+// statement that built it releases it at its end.
+void tk_rc_park(i64 n) {
+    if (!tk_rc_own(n)) return;
+    tk_rc_at(n);
+    i64 keep = nd_next(n);
+    node_assign(n, tk_call("rt_park", tk_rc_detach(n)));
+    set_nd_next(n, keep);
+    tk_nparked = tk_nparked + 1;
+}
+
+// D226 compat crumb: a CALL's own arguments against the callee's declared
+// parameter types, by INDEX -- `tk_decl_param_ty` (teko_ref.tk over the core's
+// own `decl_param_type`, K2w) answers for whatever `decl_find` resolves, and by the time this pass runs every
+// overload already carries its final, unambiguous name (teko_over.tk's
+// rename, teko_default.tk's fill, both registered ahead of this one) --
+// which is also why a virtual or an interface call (`callp`, never a name
+// `decl_find` would know) is not this walk's to check: teko_typeof.tk's own
+// deferred/direct emission is where those are caught instead.
+void tk_rc_call_args(i64 n) {
+    i64 d = decl_find(nd_name(n));
+    if (d < 0) return;
+    i64 a = nd_a(n);
+    i64 i = 0;
+    loop {
+        if (a == 0) break;
+        tk_check_compat(tk_decl_param_ty(d, i), tk_ty_of(a), a, nd_line(n), nd_file(n));
+        a = nd_next(a);
+        i = i + 1;
+    }
+}
+
+// walks one expression and the siblings after it. `owner` is the node of THIS
+// sibling list that an owning slot is about to take -- the initializer of a
+// local, the value of an assignment, what a `return` hands back -- and is the
+// only one not parked; every other owned value in the expression has nowhere to
+// live past the statement.
+void tk_rc_walk(i64 n, i64 owner) {
+    loop {
+        if (n == 0) break;
+        tk_rc_store(n);
+        if (nd_kind(n) == N_CALL) tk_rc_call_args(n);
+        tk_rc_walk(nd_a(n), tk_rc_consumed(n));
+        tk_rc_walk(nd_b(n), 0);
+        tk_rc_walk(nd_c(n), 0);
+        tk_rc_walk(nd_d(n), 0);
+        if (n != owner) tk_rc_park(n);
+        n = nd_next(n);
+    }
+}
+
+void tk_rc_expr(i64 n) { tk_rc_walk(n, n); }
+
+// `i64 $m = rt_mark();` before the statement and `rt_sweep($m);` after it: what
+// the statement parked dies with it. The mark is read at run time rather than
+// counted here, because `a && f(new C())` may park nothing at all.
+i64 tk_rc_fence(i64 dst, i64 n) {
+    uptr m = gensym_new();
+    dst = list_append(dst, tk_var(TY_I64, m, tk_call("rt_mark", 0)));
+    dst = list_append(dst, n);
+    return list_append(dst, tk_stmt(tk_call("rt_sweep", tk_id(m))));
+}
+
+// the statements of one block, walked in order and rebuilt: a statement that
+// parked a temporary comes back fenced between its mark and its sweep
+i64 tk_rc_stmts(i64 head) {
+    i64 base = tk_nparked;
+    i64 dst = 0;
+    i64 n = head;
+    loop {
+        if (n == 0) break;
+        i64 nx = nd_next(n);
+        set_nd_next(n, 0);
+        i64 p0 = tk_nparked;
+        tk_rc_swept = 0;
+        tk_rc_stmt(n);
+        if (tk_nparked > p0 && !tk_rc_swept) dst = tk_rc_fence(dst, n);
+        else                                 dst = list_append(dst, n);
+        n = nx;
+    }
+    tk_nparked = base;                           // every one of them is fenced by now
+    return dst;
+}
+
+// `{ ... }`: the locals it declares die at its `}`, in reverse order, and the
+// releases are appended to the list the block already holds
+void tk_rc_block(i64 n) {
+    i64 mark = tk_nscope;
+    set_nd_a(n, tk_rc_stmts(nd_a(n)));
+    tk_rc_at(n);
+    i64 rel = tk_rc_releases(mark);
+    tk_nscope = mark;
+    if (rel == 0) return;
+    set_nd_a(n, list_append(nd_a(n), rel));
+}
+
+// the single statement an `if` or a `loop` may carry instead of a block. It is
+// not in a list, so a fence around it has to become a block of its own -- and
+// only when it really parked something, so a program that parks nothing keeps
+// the tree it had.
+void tk_rc_branch(i64 n) {
+    if (n == 0) return;
+    if (nd_kind(n) == N_BLOCK) {
+        tk_rc_block(n);
+        return;
+    }
+    i64 p0 = tk_nparked;
+    i64 keepswept = tk_rc_swept;
+    tk_rc_swept = 0;
+    tk_rc_stmt(n);
+    i64 fence = tk_nparked > p0 && !tk_rc_swept;
+    tk_rc_swept = keepswept;
+    tk_nparked = p0;                             // fenced here, or swept by the statement
+    if (!fence) return;
+    i64 c = tk_rc_detach(n);
+    i64 keep = nd_next(n);
+    tk_rc_at(n);
+    node_assign(n, tk_blk(tk_rc_fence(0, c)));
+    set_nd_next(n, keep);
+}
+
+void tk_rc_loop(i64 n) {
+    if (tk_nlp == TK_MAXLOOP) err_at(tk_file, tk_line, "teko: loops nested too deep");
+    set_rc_lp_at(tk_nlp, tk_nscope);
+    tk_nlp = tk_nlp + 1;
+    tk_rc_branch(nd_a(n));
+    tk_nlp = tk_nlp - 1;
+}
+
+// A condition that parked temporaries is HOISTED: `if (c) return 1;` would jump
+// straight over a sweep written after it, so the condition is read into a name
+// of its own and its temporaries die there, before either branch runs -- which
+// is where C# and C++ end the full expression too.
+void tk_rc_hoist_cond(i64 n) {
+    tk_rc_at(n);
+    uptr m = gensym_new();
+    uptr c = gensym_new();
+    i64 st = tk_var(TY_I64, m, tk_call("rt_mark", 0));
+    st = list_append(st, tk_var(TY_I64, c, nd_a(n)));
+    st = list_append(st, tk_stmt(tk_call("rt_sweep", tk_id(m))));
+    set_nd_a(n, tk_id(c));
+    i64 body = tk_rc_detach(n);
+    i64 keep = nd_next(n);
+    node_assign(n, tk_blk(list_append(st, body)));
+    set_nd_next(n, keep);
+    tk_rc_swept = 1;
+}
+
+void tk_rc_if(i64 n) {
+    i64 p0 = tk_nparked;
+    tk_rc_walk(nd_a(n), 0);                      // a condition owns nothing
+    i64 hoist = tk_nparked > p0;
+    tk_nparked = p0;
+    tk_rc_branch(nd_b(n));
+    tk_rc_branch(nd_c(n));
+    if (hoist) tk_rc_hoist_cond(n);
+}
+
+void tk_rc_stmt(i64 n) {
+    if (n == 0) return;
+    i64 k = nd_kind(n);
+    if (k == N_BLOCK)    { tk_rc_block(n);    return; }
+    if (k == N_LOOP)     { tk_rc_loop(n);     return; }
+    if (k == N_IF)       { tk_rc_if(n);       return; }
+    if (k == N_RETURN) {
+        i64 p0 = tk_nparked;
+        tk_rc_expr(nd_a(n));
+        tk_rc_return(n, p0);
+        return;
+    }
+    if (k == N_BREAK)    { tk_rc_jump(n);     return; }
+    if (k == N_CONTINUE) { tk_rc_jump(n);     return; }
+    if (k == N_VAR) {
+        tk_rc_expr(nd_a(n));
+        tk_rc_var(n);
+        tk_ty_scope_var(n);                      // in scope only AFTER its initializer
+        return;
+    }
+    if (k == N_ASSIGN)   { tk_rc_expr(nd_a(n)); tk_rc_assign(n); return; }
+    if (k == N_EXPRSTMT) { tk_rc_expr(nd_a(n)); tk_rc_exprstmt(n); return; }
+    tk_rc_expr(n);
+}
+
+// the parameters of the function being walked: borrowed, every one of them, so
+// they are in scope for what reads them and below the floor the releases start
+// at
+void tk_rc_fn(i64 f) {
+    tk_nscope = 0;
+    tk_nlp = 0;
+    tk_rc_cur_fn = f;
+    tk_ty_scope_params(nd_a(f));
+    tk_rc_floor = tk_nscope;
+    tk_rc_ret = nd_type(f);
+    tk_rc_stmt(nd_b(f));
+    tk_nscope = 0;
+}
+
+// 1 when the program declares something the reclaim has anything to do with:
+// any row of teko_struct.tk's type table `tk_is_counted` answers for -- a
+// class, an interface, or (K1) a delegate
+i64 tk_rc_needed() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nstruct) break;
+        if (tk_is_counted(sr_ty_at(i))) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// D226 compat crumb: a program of nothing but `struct` never needs the
+// reclaim (`tk_rc_needed` above answers 0 for it, a struct having no vtable
+// to release), but it still has slots the assignment check has to visit --
+// the walk itself is a no-op wherever `tk_is_counted` already gated it, so
+// widening this to "the unit declares ANY teko type at all" costs nothing a
+// struct-only program did not already pay.
+i64 tk_compat_needed() { return tk_nstruct > 0; }
+
+i64 tk_rc_pass(i64 root) {
+    if (!tk_rc_needed() && !tk_compat_needed()) return root;
+    tk_rc_root = root;
+    i64 f = root;
+    loop {
+        if (f == 0) break;
+        if (nd_kind(f) == N_FUNC) tk_rc_fn(f);
+        f = nd_next(f);
+    }
+    tk_rc_ret = 0 - 1;
+    return root;
+}

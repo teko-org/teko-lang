@@ -1,0 +1,682 @@
+// teko_fwd.tk -- free order of declaration for a type name (§50 O1/O2/O3,
+// docs/design/plano-ngen-entrega4.md), the C6 debt the handoff named: a
+// one-pass parser refuses `Box b = new Box();` written above `class Box`.
+//
+// The fix is a LEXICAL pre-scan of the whole source. Since mc 0.15.3 the
+// scan is driven by a single `on_source` registration (`tk_fwd_init`,
+// §55): the lexer itself calls `tk_fwd_on_source` for every source it
+// opens -- the entry file (announced by REPLAY at registration time,
+// hooks.md § on_source), every `#include` the CORE resolves on its own (a
+// raw `#include "parts/x.tk"`, the gap O2 left open), every `import`
+// (`tk_import`, teko_ns.tk, which still calls `lex_include` itself but no
+// longer scans anything after it) and every `<bundle>`/`p_push_source`
+// replay -- and the callback filters by name (`tk_fwd_is_source_name`) down
+// to real `.tk` sources before it walks the raw bytes looking for
+// `class`/`struct`/`interface`/`delegate`/`trait`, skipping
+// comments, strings, char literals and `#directive` lines, and following
+// `namespace A.B { ... }`/`namespace A.B;` to qualify a name the same way
+// `tk_ns_qualify` does. Nothing it finds is parsed -- it never consumes a
+// real token, never refuses, never reports an error: a name already claimed
+// (a core keyword, a generic, another registration) is simply left alone,
+// and the real declaration gives its usual message when it is read for real.
+//
+// What the scan reserves is the WORD -- `type_new` plus the same
+// `syntax_expr`/`syntax_stmt` a plain type registers, and `tk_ns_register`
+// for a namespaced one's short name -- never a row of the type table. A row
+// is materialized LATE, at the real declaration or at the first use,
+// because its INDEX is what `tk_itab` emits into the tree (teko_iface.tk):
+// creating rows during the scan would reorder every interface's vtable slot
+// and break the `--dump-ast` gate on a program already in order. A trait
+// carries no such index (D216: no `type_new`, no vtable), so its body is
+// captured whole at scan time and simply overwritten with the authoritative
+// `p_skip_balanced` span once the real `trait` is read (teko_trait.tk).
+//
+// The row a use materializes ahead of its declaration carries `sr_part ==
+// TK_PFWD` (teko_struct.tk); the real declaration ADOPTS it in place
+// (`tk_type_add`) instead of appending a second one, which is what keeps the
+// row's index -- and therefore every `tk_itab` already emitted against it --
+// stable. Only IDENTITY-only sites (a field, a parameter, a return type, a
+// local, `on_stmt`, the reference-counted-ness of a type) resolve through a
+// placeholder; `new` and a delegate construction defer to a pass (O2). A base
+// class or an interface named in a `:` list needs the row WHOLE right where
+// it stands -- `tk_base_take` (teko_class.tk) lays the derived object out
+// from it immediately -- so the scan also captures each class/struct/
+// interface's own SPAN (`fw_span`/`fw_spanlen` below), and `tk_conf_name`
+// (teko_class.tk) replays it on the spot through `tk_fwd_materialize`, whole,
+// the moment the name is not found any other way (O3).
+
+// teko_ns.tk is included before this file: the short name of a namespaced
+// type reserves through the very function a real declaration already calls
+void tk_ns_register(uptr curto);
+
+// teko_access.tk is included after this file: a type's word opens the same
+// two positions here as it does at a real declaration (teko_access.tk's own
+// `tk_type_word`)
+i64 tk_type_expr();
+i64 tk_type_stmt();
+
+// teko_access.tk is included after this file too: the origin (project or
+// not) of the file being scanned, the same question `tk_take_decl_proj`
+// answers for a real declaration that says nothing
+i64 tk_origin_of_file(uptr f);
+
+// teko_expr.tk/teko_access.tk are included after this file: §50 O2's own two
+// resolvers, run from `tk_fwd_pass` below once every forward-scanned type is
+// either adopted or reported by the backstop -- a `new`/`Type.member` this
+// unit deferred (teko_expr.tk's `tk_fwd_defer_new`, teko_access.tk's
+// `tk_fwd_defer_static`) is rewritten in place here, over the placeholder its
+// own parse-time call already built
+void tk_fwd_resolve_all_new();
+void tk_fwd_resolve_all_static();
+
+// teko_trait.tk is included after this file: a trait's body is captured
+// whole here, under the same table the real `trait Name { ... }` fills in
+void tk_trait_scan(uptr name, uptr text, i64 len, i64 vis, i64 proj);
+
+#define TK_MAXFWD 32                   // classes/structs/interfaces/delegates scanned ahead of use
+
+uptr fw_name[TK_MAXFWD];               // the qualified name -- what `type_new` reserved
+i64  fw_ty[TK_MAXFWD];                 // the id `type_new` returned for it
+i64  fw_kind[TK_MAXFWD];               // TK_KSTRUCT/KCLASS/KIFACE/KDELEG
+i64  fw_vis[TK_MAXFWD];                // TK_TINTERNAL by default: the scan never reads public/internal
+i64  fw_proj[TK_MAXFWD];
+uptr fw_span[TK_MAXFWD];               // §50 O3: the declaration's own span, `class`/`struct`/`interface` through the closing `}`
+i64  fw_spanlen[TK_MAXFWD];            // 0 when the scan never found the `{` (a delegate, or a malformed source)
+i64  fw_multi[TK_MAXFWD];              // 1 once a SECOND scanned occurrence names this same qualified name (a `partial` part, or a plain duplicate): the span alone is one part, so materializing it would build an incomplete object
+i64  fw_mat[TK_MAXFWD];                // 1 once `tk_fwd_materialize` (teko_class.tk) has replayed this span whole -- the real declaration, reached later, is skipped rather than read again
+i64  tk_nfwd = 0;
+
+uptr fw_name_at(i64 i)    { return ld64(fw_name + i * 8); }
+i64  fw_ty_at(i64 i)      { return ld64(fw_ty + i * 8); }
+i64  fw_kind_at(i64 i)    { return ld64(fw_kind + i * 8); }
+i64  fw_vis_at(i64 i)     { return ld64(fw_vis + i * 8); }
+i64  fw_proj_at(i64 i)    { return ld64(fw_proj + i * 8); }
+uptr fw_span_at(i64 i)    { return ld64(fw_span + i * 8); }
+i64  fw_spanlen_at(i64 i) { return ld64(fw_spanlen + i * 8); }
+i64  fw_multi_at(i64 i)   { return ld64(fw_multi + i * 8); }
+i64  fw_mat_at(i64 i)     { return ld64(fw_mat + i * 8); }
+
+void set_fw_name_at(i64 i, uptr v)    { st64(fw_name + i * 8, v); }
+void set_fw_ty_at(i64 i, i64 v)       { st64(fw_ty + i * 8, v); }
+void set_fw_kind_at(i64 i, i64 v)     { st64(fw_kind + i * 8, v); }
+void set_fw_vis_at(i64 i, i64 v)      { st64(fw_vis + i * 8, v); }
+void set_fw_proj_at(i64 i, i64 v)     { st64(fw_proj + i * 8, v); }
+void set_fw_span_at(i64 i, uptr v)    { st64(fw_span + i * 8, v); }
+void set_fw_spanlen_at(i64 i, i64 v)  { st64(fw_spanlen + i * 8, v); }
+void set_fw_multi_at(i64 i, i64 v)    { st64(fw_multi + i * 8, v); }
+void set_fw_mat_at(i64 i, i64 v)      { st64(fw_mat + i * 8, v); }
+
+i64 tk_fwd_find(uptr qname) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfwd) break;
+        if (str_eq(fw_name_at(i), qname)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+i64 tk_fwd_ty(i64 fi)   { return fw_ty_at(fi); }
+i64 tk_fwd_kind(i64 fi) { return fw_kind_at(fi); }
+
+// 1 when `qname` was reserved by the scan and the real declaration has not
+// adopted a row for it yet -- `tk_newname`'s own signal to accept the word
+// instead of refusing it as already taken
+i64 tk_fwd_pending(uptr qname) {
+    i64 fi = tk_fwd_find(qname);
+    if (fi < 0) return 0;
+    i64 si = tk_struct_find_exact(qname);
+    if (si < 0) return 1;
+    return sr_part_at(si) == TK_PFWD;
+}
+
+// the row of `qname`, materializing a TK_PFWD placeholder on first ask when
+// the scan reserved the word but nothing has used or declared it yet; -1
+// when `qname` was never scanned as a type at all
+i64 tk_fwd_row(uptr qname) {
+    i64 si = tk_struct_find_exact(qname);
+    if (si >= 0) return si;
+    i64 fi = tk_fwd_find(qname);
+    if (fi < 0) return 0 - 1;
+    return tk_type_add_pending(fw_name_at(fi), fw_ty_at(fi), fw_kind_at(fi), fw_vis_at(fi), fw_proj_at(fi));
+}
+
+// the row of the scanned type whose `type_new` id is `ty` -- what
+// `tk_struct_by_ty` falls back to once its own linear scan of real rows
+// finds nothing, so `tk_is_counted`/`on_stmt` know a forward type's kind
+// without waiting for its declaration
+i64 tk_fwd_row_by_ty(i64 ty) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfwd) break;
+        if (fw_ty_at(i) == ty) return tk_fwd_row(fw_name_at(i));
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// the real declaration, through `tk_type_add`, giving its (now adopted) row
+// the visibility/origin the declaration itself carries -- the scan's own
+// defaults (§50 O1) were only ever a placeholder for these two fields.
+// Whether the row is STILL pending is `sr_part_at(si) == TK_PFWD` itself
+// (`tk_type_add` has already flipped it to TK_PWHOLE by the time this runs),
+// so no separate "adopted" bookkeeping is needed here.
+void tk_fwd_adopt(i64 si, i64 vis, i64 proj) {
+    set_sr_vis_at(si, vis);
+    set_sr_proj_at(si, proj);
+}
+
+void tk_fwd_add(uptr name, i64 ty, i64 kind, i64 vis, i64 proj) {
+    if (tk_nfwd == TK_MAXFWD) err_at(tk_file, tk_line, "teko: too many forward-declared types");
+    set_fw_name_at(tk_nfwd, name);
+    set_fw_ty_at(tk_nfwd, ty);
+    set_fw_kind_at(tk_nfwd, kind);
+    set_fw_vis_at(tk_nfwd, vis);
+    set_fw_proj_at(tk_nfwd, proj);
+    set_fw_span_at(tk_nfwd, 0);
+    set_fw_spanlen_at(tk_nfwd, 0);
+    set_fw_multi_at(tk_nfwd, 0);
+    set_fw_mat_at(tk_nfwd, 0);
+    tk_nfwd = tk_nfwd + 1;
+}
+
+// ---- §50 O3: the in-flight materialization stack, for `A : B` / `B : A` ----
+// a base out of order may itself derive from one not yet declared either, so
+// `tk_fwd_materialize` (teko_class.tk) may recurse into this same function --
+// what is currently being pushed and parsed, outermost first, is what a cycle
+// recurses back into
+uptr fl_name[TK_MAXFWD];
+i64  tk_nflight = 0;
+
+i64 tk_fwd_in_flight(uptr qname) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nflight) break;
+        if (str_eq(ld64(fl_name + i * 8), qname)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+void tk_fwd_flight_push(uptr qname) {
+    st64(fl_name + tk_nflight * 8, qname);
+    tk_nflight = tk_nflight + 1;
+}
+
+void tk_fwd_flight_pop() { tk_nflight = tk_nflight - 1; }
+
+// "Animal forward-materialized from prog.tk:9" -- what `err_at` prints for
+// every error inside a base's own body, replayed ahead of the place it was
+// written, the same idea `tk_gen_frame` (teko_generic.tk) names an instance by
+uptr tk_fwd_frame(uptr qname, uptr fl, i64 line) {
+    return tk_join3(qname, " forward-materialized from ", tk_join3(fl, ":", tk_num(line)));
+}
+
+// §50 O3: the declaration a use already materialized whole -- its own tokens
+// are still sitting, unread, right where the source wrote them. `tk_class`/
+// `tk_interface` (teko_class.tk/teko_iface.tk) call this the instant they see
+// their own name is one of these, in place of reading it a second time: the
+// name, an optional `: Base, Iface, ...` list (read the same way `tk_conf_name`
+// reads one, whole names only, no semantic check -- the materialized replay
+// already ran every one of those) and the `{ ... }` body, real tokens this
+// time, so a `{`/`}` inside a string or a comment is never miscounted.
+i64 tk_fwd_skip_decl(i64 fi) {
+    p_next();                                    // the type's own name
+    if (p_accept(K_COLON)) {
+        loop {
+            tk_ns_read_path(xalloc(8));
+            if (!p_accept(K_COMMA)) break;
+        }
+    }
+    i64 n = 0;
+    p_skip_balanced(K_LBRACE, K_RBRACE, &n);
+    p_accept(K_SEMI);
+    return fi;
+}
+
+// §50 O3b: `tk_class`/`tk_interface`, right before calling `tk_fwd_skip_decl`
+// above, already read this declaration's own `public`/`internal`/`abstract`
+// from the real tokens -- `vis`/`abst` here. They can never disagree with
+// what `tk_fwd_materialize` (teko_class.tk) put on the row, since it replayed
+// the very same source text (kwstart now reaches back over the modifiers,
+// §50 O3b); the check stays as a backstop rather than a silent skip.
+void tk_fwd_check_materialized(i64 si, i64 vis, i64 abst, uptr qname) {
+    uptr short_nm = tk_ns_short_of(qname);
+    if (vis != sr_vis_at(si))
+        err_at2(tk_file, tk_line, "teko: the declaration disagrees with its materialized form on `public`/`internal`", short_nm);
+    if (abst != sr_abst_at(si))
+        err_at2(tk_file, tk_line, "teko: the declaration disagrees with its materialized form on `abstract`", short_nm);
+}
+
+// ---- the scanner itself: a byte-level automaton over the raw source, never
+// the parser's own tokens (none has been read yet when it runs) ----
+
+uptr tk_fwd_skip_line(uptr p, uptr end) {
+    loop {
+        if (p >= end) break;
+        i64 c = ld8(p);
+        p = p + 1;
+        if (c == 10) break;
+    }
+    return p;
+}
+
+uptr tk_fwd_skip_block_comment(uptr p, uptr end) {
+    loop {
+        if (p >= end) break;
+        if (ld8(p) == '*' && p + 1 < end && ld8(p + 1) == '/') return p + 2;
+        p = p + 1;
+    }
+    return p;
+}
+
+uptr tk_fwd_skip_quoted(uptr p, uptr end, i64 q) {
+    loop {
+        if (p >= end) break;
+        i64 c = ld8(p);
+        p = p + 1;
+        if (c == '\\') { if (p < end) p = p + 1; continue; }
+        if (c == q) break;
+    }
+    return p;
+}
+
+// whitespace, `//`/`/* */` comments and a `#directive` line, all insignificant
+// to the scan -- the one place a `{`/`}` inside any of them could miscount
+// depth if it were not skipped whole
+uptr tk_fwd_skip_ws(uptr p, uptr end) {
+    loop {
+        if (p >= end) break;
+        i64 c = ld8(p);
+        if (c == ' ' || c == 9 || c == 10 || c == 13) { p = p + 1; continue; }
+        if (c == '#') { p = tk_fwd_skip_line(p + 1, end); continue; }
+        if (c == '/' && p + 1 < end && ld8(p + 1) == '/') { p = tk_fwd_skip_line(p + 2, end); continue; }
+        if (c == '/' && p + 1 < end && ld8(p + 1) == '*') { p = tk_fwd_skip_block_comment(p + 2, end); continue; }
+        break;
+    }
+    return p;
+}
+
+// an identifier-shaped run starting at `p`: returns its start, writes its
+// length through `plen` (the `p_skip_balanced` idiom this codebase already
+// uses for "position plus a secondary result")
+uptr tk_fwd_word(uptr p, uptr end, uptr plen) {
+    uptr s = p;
+    loop {
+        if (p >= end) break;
+        if (!is_alnum(ld8(p))) break;
+        p = p + 1;
+    }
+    st64(plen, p - s);
+    return s;
+}
+
+i64 tk_fwd_word_eq(uptr p, i64 n, uptr kw) {
+    i64 kl = cstrlen(kw);
+    if (kl != n) return 0;
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        if (ld8(p + i) != ld8(kw + i)) return 0;
+        i = i + 1;
+    }
+    return 1;
+}
+
+// a dotted path (`A.B.C`), "__"-joined exactly as `tk_ns_qualify` joins one --
+// the same shape a real `namespace`/`using` reads with `tk_ns_read_path`.
+// `pseg0` gets the FIRST segment alone, what `tk_ns_seg_register` reserves.
+uptr tk_fwd_read_path(uptr p, uptr end, uptr pfull, uptr pseg0) {
+    i64 nlen = 0;
+    uptr n = tk_fwd_word(p, end, &nlen);
+    p = n + nlen;
+    uptr seg0 = xstrdup(n, nlen);
+    uptr full = seg0;
+    loop {
+        uptr q = tk_fwd_skip_ws(p, end);
+        if (q >= end || ld8(q) != '.') break;
+        q = tk_fwd_skip_ws(q + 1, end);
+        if (q >= end || !is_alpha(ld8(q))) break;
+        i64 slen = 0;
+        uptr s = tk_fwd_word(q, end, &slen);
+        full = tk_join3(full, "__", xstrdup(s, slen));
+        p = s + slen;
+    }
+    st64(pfull, full);
+    st64(pseg0, seg0);
+    return p;
+}
+
+// reserves `qname` the way a real declaration's `tk_type_word` does, unless
+// it is reserved already (a second `partial class Foo` part, or a repeat
+// scan of the same file): `type_new` + the two grammar positions, plus the
+// short word for a namespaced one
+void tk_fwd_reg_type(uptr qname, uptr shortname, i64 kind, uptr file, i64 has_ns) {
+    if (tk_fwd_find(qname) >= 0) return;
+    i64 ty = type_new(qname, 8, 8, TK_INT);
+    syntax_expr(qname, &tk_type_expr);
+    syntax_stmt(qname, &tk_type_stmt);
+    if (has_ns) tk_ns_register(shortname);
+    tk_fwd_add(qname, ty, kind, TK_TINTERNAL, tk_origin_of_file(file));
+}
+
+// the first `{` at or after `p`, comments and directives skipped -- a `:`
+// list of dotted names never itself carries a brace, so this is always the
+// body's own opening one
+uptr tk_fwd_lbrace(uptr p, uptr end) {
+    loop {
+        p = tk_fwd_skip_ws(p, end);
+        if (p >= end) break;
+        if (ld8(p) == '{') break;
+        p = p + 1;
+    }
+    return p;
+}
+
+// from `{` through the byte past its matching `}`, strings/chars/comments
+// respected -- the body span `tk_fwd_try_trait` and (§50 O3) `tk_fwd_try_decl`
+// both capture, shared rather than walked twice
+uptr tk_fwd_brace_end(uptr b, uptr end) {
+    i64 bdepth = 0;
+    uptr q = b;
+    loop {
+        if (q >= end) break;
+        i64 c = ld8(q);
+        if (c == '"') { q = tk_fwd_skip_quoted(q + 1, end, '"'); continue; }
+        if (c == '\'') { q = tk_fwd_skip_quoted(q + 1, end, '\''); continue; }
+        if (c == '/' && q + 1 < end && ld8(q + 1) == '/') { q = tk_fwd_skip_line(q + 2, end); continue; }
+        if (c == '/' && q + 1 < end && ld8(q + 1) == '*') { q = tk_fwd_skip_block_comment(q + 2, end); continue; }
+        if (c == '{') { bdepth = bdepth + 1; q = q + 1; continue; }
+        if (c == '}') {
+            bdepth = bdepth - 1;
+            q = q + 1;
+            if (bdepth == 0) break;
+            continue;
+        }
+        q = q + 1;
+    }
+    return q;
+}
+
+// `class`/`struct`/`interface`/`delegate` just consumed, already known to sit
+// at `top_depth` (D220: a nested type is not taught, so the caller never
+// calls this deeper): reads the name that follows and reserves it, unless it
+// names a GENERIC (`Name<`). A delegate spells its RETURN TYPE first
+// (`delegate i64 Op(...)`, teko_deleg.tk's own `p_type()` before
+// `tk_newname`), so that one word is skipped before the name is read.
+//
+// §50 O3: a class/struct/interface's own span, `kwstart` (the caller backs
+// this up over any `public`/`internal`/`abstract`/`partial` run that sits
+// right before the keyword -- §50 O3b, `tk_fwd_scan` below -- so the replay
+// reads the very same modifiers the real declaration would) through the byte
+// past its `{ ... }`, is captured for `tk_fwd_materialize` (teko_class.tk) --
+// UNLESS this is a SECOND scanned occurrence of the same qualified name
+// (`fw_multi`, decision unwritten in §50: a `partial` type split across
+// parts, or a plain duplicate), whose span alone would build an incomplete
+// object. A delegate has no body to capture and is never a base, so it is
+// left exactly as before.
+uptr tk_fwd_try_decl(uptr p, uptr end, uptr cur_ns, i64 kind, uptr file, uptr kwstart) {
+    p = tk_fwd_skip_ws(p, end);
+    if (kind == TK_KDELEG && p < end && is_alpha(ld8(p))) {
+        i64 rlen = 0;
+        uptr r = tk_fwd_word(p, end, &rlen);
+        p = tk_fwd_skip_ws(r + rlen, end);
+    }
+    if (p >= end || !is_alpha(ld8(p))) return p;
+    i64 nlen = 0;
+    uptr n = tk_fwd_word(p, end, &nlen);
+    p = n + nlen;
+    uptr peek = tk_fwd_skip_ws(p, end);
+    if (peek < end && ld8(peek) == '<') return p;
+    uptr name = xstrdup(n, nlen);
+    uptr qname = name;
+    if (cur_ns != 0) qname = tk_join3(cur_ns, "__", name);
+    i64 seen = tk_fwd_find(qname);
+    tk_fwd_reg_type(qname, name, kind, file, cur_ns != 0);
+    i64 fi = tk_fwd_find(qname);
+    if (seen >= 0) { set_fw_multi_at(fi, 1); return p; }
+    if (kind == TK_KDELEG) return p;
+    uptr bend = tk_fwd_brace_end(tk_fwd_lbrace(p, end), end);
+    set_fw_span_at(fi, kwstart);
+    set_fw_spanlen_at(fi, bend - kwstart);
+    return p;
+}
+
+// `trait` just consumed, already known to sit at `top_depth`: same name/
+// generic rule as a type, but the body is not parsed -- it is captured as a
+// raw span (braces, strings, comments and chars all respected) exactly as
+// `p_skip_balanced` would slice it, and handed to `tk_trait_scan`
+// (teko_trait.tk), which files it under the trait table directly (D216: a
+// trait is never a row of the type table)
+uptr tk_fwd_try_trait(uptr p, uptr end, uptr cur_ns, uptr file) {
+    p = tk_fwd_skip_ws(p, end);
+    if (p >= end || !is_alpha(ld8(p))) return p;
+    i64 nlen = 0;
+    uptr n = tk_fwd_word(p, end, &nlen);
+    p = n + nlen;
+    uptr peek = tk_fwd_skip_ws(p, end);
+    if (peek < end && ld8(peek) == '<') return p;
+    uptr name = xstrdup(n, nlen);
+    uptr qname = name;
+    if (cur_ns != 0) qname = tk_join3(cur_ns, "__", name);
+    uptr b = tk_fwd_skip_ws(p, end);
+    if (b >= end || ld8(b) != '{') return b;
+    uptr q = tk_fwd_brace_end(b, end);
+    tk_trait_scan(qname, b, q - b, TK_TINTERNAL, tk_origin_of_file(file));
+    return q;
+}
+
+// `namespace` just consumed: reads the dotted path and, when it opens a
+// block or is file-scoped (`;`), remembers it through the three out-params --
+// a malformed spelling (neither) is left for the real parser to reject and
+// changes nothing here. Returns the position just past the path. §50 O2
+// ressalva 2: the path's own FIRST segment is reserved here too
+// (`tk_ns_seg_register`, teko_ns.tk, idempotent, included before this file)
+// -- otherwise a qualified reference (`Geo.Item`) written ABOVE this same
+// `namespace Geo { ... }` never dispatches through `tk_ns_seg_stmt`/
+// `tk_ns_seg_expr` at all, since today only the REAL declaration reserves
+// the word.
+uptr tk_fwd_try_namespace(uptr p, uptr end, i64 depth, uptr pcur_ns, uptr pns_block, uptr pns_depth) {
+    p = tk_fwd_skip_ws(p, end);
+    uptr full = 0;
+    uptr seg0 = 0;
+    p = tk_fwd_read_path(p, end, &full, &seg0);
+    tk_ns_seg_register(seg0);
+    uptr peek = tk_fwd_skip_ws(p, end);
+    if (peek < end && ld8(peek) == '{') {
+        st64(pcur_ns, full);
+        st64(pns_block, 1);
+        st64(pns_depth, depth + 1);
+        return p;
+    }
+    if (peek < end && ld8(peek) == ';') {
+        st64(pcur_ns, full);
+        st64(pns_block, 0);
+    }
+    return p;
+}
+
+// 1 for a word the type-declaration head (`tk_decl_head`, teko_access.tk)
+// itself accepts before `class`/`struct`/`interface`/`delegate` -- the same
+// four, since `static` is not one of them
+i64 tk_fwd_is_modifier(uptr w, i64 wlen) {
+    if (tk_fwd_word_eq(w, wlen, "public"))   return 1;
+    if (tk_fwd_word_eq(w, wlen, "internal")) return 1;
+    if (tk_fwd_word_eq(w, wlen, "abstract")) return 1;
+    if (tk_fwd_word_eq(w, wlen, "partial"))  return 1;
+    return 0;
+}
+
+// the whole scan, over one source: whatever `.tk` file `tk_fwd_on_source`
+// (§55, below) just let through -- the entry, a raw `#include`, an `import`,
+// or a `<bundle>` frame the name filter would have rejected. Namespace state
+// is local to the call -- a file-scoped `namespace A.B;` only ever applies to the
+// file it is written in, matching `tk_ns_file_get`'s own per-file table.
+// `namespace` is recognized at ANY depth (a nested one is already refused
+// where the real parser opens it, D31.13-adjacent); `class`/`struct`/
+// `interface`/`delegate`/`trait` only at the depth a declaration may sit at
+// -- 0 with no namespace open or a file-scoped one, `ns_depth` inside an
+// open namespace BLOCK (D220's rule, kept in sync with `ns_block`/`ns_depth`
+// every iteration rather than cached, since either may change mid-scan).
+//
+// §50 O3b: `mod_start` remembers where a contiguous run of `public`/
+// `internal`/`abstract`/`partial` began, so the type keyword's own `kwstart`
+// (what `tk_fwd_try_decl` captures as the span's start) reaches back over it
+// -- otherwise the replay `tk_fwd_materialize` runs is missing exactly the
+// tokens that say the class is abstract or public. Any other token resets
+// the run: a modifier only counts when it sits right before the keyword.
+void tk_fwd_scan(uptr p, uptr end, uptr file) {
+    i64 depth = 0;
+    uptr cur_ns = 0;
+    i64 ns_block = 0;
+    i64 ns_depth = 0;
+    uptr mod_start = 0;
+    loop {
+        p = tk_fwd_skip_ws(p, end);
+        if (p >= end) break;
+        i64 c = ld8(p);
+        if (c == '"') { p = tk_fwd_skip_quoted(p + 1, end, '"'); mod_start = 0; continue; }
+        if (c == '\'') { p = tk_fwd_skip_quoted(p + 1, end, '\''); mod_start = 0; continue; }
+        if (c == '{') { depth = depth + 1; p = p + 1; mod_start = 0; continue; }
+        if (c == '}') {
+            depth = depth - 1;
+            if (ns_block && depth == ns_depth - 1) { cur_ns = 0; ns_block = 0; ns_depth = 0; }
+            p = p + 1;
+            mod_start = 0;
+            continue;
+        }
+        if (!is_alpha(c)) { p = p + 1; continue; }
+        i64 wlen = 0;
+        uptr w = tk_fwd_word(p, end, &wlen);
+        p = w + wlen;
+        if (tk_fwd_word_eq(w, wlen, "namespace")) {
+            mod_start = 0;
+            p = tk_fwd_try_namespace(p, end, depth, &cur_ns, &ns_block, &ns_depth);
+            continue;
+        }
+        i64 top_depth = 0;
+        if (ns_block) top_depth = ns_depth;
+        if (depth != top_depth) { mod_start = 0; continue; }
+        if (tk_fwd_is_modifier(w, wlen)) {
+            if (mod_start == 0) mod_start = w;
+            continue;
+        }
+        uptr kwstart = w;
+        if (mod_start != 0) kwstart = mod_start;
+        mod_start = 0;
+        if (tk_fwd_word_eq(w, wlen, "class"))     { p = tk_fwd_try_decl(p, end, cur_ns, TK_KCLASS, file, kwstart); continue; }
+        if (tk_fwd_word_eq(w, wlen, "struct"))    { p = tk_fwd_try_decl(p, end, cur_ns, TK_KSTRUCT, file, kwstart); continue; }
+        if (tk_fwd_word_eq(w, wlen, "interface")) { p = tk_fwd_try_decl(p, end, cur_ns, TK_KIFACE, file, kwstart); continue; }
+        if (tk_fwd_word_eq(w, wlen, "delegate"))  { p = tk_fwd_try_decl(p, end, cur_ns, TK_KDELEG, file, kwstart); continue; }
+        if (tk_fwd_word_eq(w, wlen, "trait"))     { p = tk_fwd_try_trait(p, end, cur_ns, file); continue; }
+    }
+}
+
+// §55 (mc 0.15.3's `on_source`): true for a name this scanner should walk.
+// Every OTHER name the lexer ever announces here spells itself with a space
+// or a colon (`tk_fwd_frame`/`tk_gen_frame`/`tk_frame`'s own joins, all
+// above) or is a bare bundled/pushed name (`<teko-loop-prelude>`, `mc/core`,
+// `prelude`) -- none of them ends in `.tk`, and neither does a raw
+// `#include "../lib/rt.tk"` a `.tk` PROGRAM writes, so the suffix alone is
+// the whole filter. No "already scanned" table is needed either: the
+// core's own `lex_seen` already keeps a repeated `#include`/`import` of the
+// same name from pushing (and therefore from being announced) twice.
+i64 tk_fwd_is_source_name(uptr name) {
+    i64 n = cstrlen(name);
+    if (n < 3) return 0;
+    return ld8(name + n - 3) == '.' && ld8(name + n - 2) == 't' && ld8(name + n - 1) == 'k';
+}
+
+// S4.2 (mc 0.15.8's `source_claim`, docs/reference/hooks.md § source_claim):
+// 1 while teko is pushing a source of its OWN making -- a generic
+// instantiation, a trait body, a forward-materialized declaration, the loop
+// prelude, a `params` instance. Those frames carry teko source under a frame
+// NAME (`Box__Circle__4 instantiated from f.tk:12`, `<teko-loop-prelude>`),
+// not a file name, so the `.tk` suffix alone would answer 0 for them and the
+// replay would be read with the core's vocabulary -- `class`, `str`, `public`
+// lexing as ordinary identifiers in text teko itself wrote. Every push teko
+// makes goes through `tk_push_source` below, which is what sets this.
+i64 tk_claim_own = 0;
+
+// S4.2: the `source_claim` handler -- which sources this dialect's words
+// apply in. A word a module registers (`syntax`/`syntax_stmt`/`syntax_expr`/
+// `type_alias`/`type_new` -> `word_add`) is reserved PROGRAM-WIDE without
+// this hook, and a self-hosted teko has to read the core's own `.mc` files,
+// where `type`, `out` and `params` are parameter names. So: the `.tk` sources
+// (a program, a fixture, `lib/rt.tk`, the 31 modules of the `teko` package
+// when the compiler compiles ITSELF) plus teko's own pushed frames, and
+// nothing else -- `<mc/host>`, `<mc/objmodel>`, `<sys>`, `<prelude>` and
+// every `.mc` are read with the core's vocabulary, exactly as the untaught
+// `mc` reads them.
+i64 tk_source_claim(uptr name) {
+    if (tk_claim_own) return 1;
+    return tk_fwd_is_source_name(name);
+}
+
+// S4.2: the ONE road teko pushes a source through, so the claim above answers
+// 1 for it. The flag is set for the duration of the push and cleared right
+// after: `source_claim` is asked once per frame, INSIDE `lex_push_mem`
+// (hooks.md § source_claim: "asked once per frame, at push time"), so the
+// window is exactly this call. Clearing it afterwards is what keeps a nested
+// push -- a generic instantiated from inside a trait body -- honest: each one
+// sets the flag for its own push.
+void tk_push_source(uptr name, uptr text, i64 len) {
+    tk_claim_own = 1;
+    p_push_source(name, text, len);
+    tk_claim_own = 0;
+}
+
+// §55: the single `on_source` handler, replacing the two sites this module
+// used to scan from by hand -- the entry file's own line at the top of
+// `user_init`, and `tk_import`'s call right after `lex_include`
+// (teko_ns.tk). The lexer now calls this for EVERY source it opens,
+// including the entry (by REPLAY, at registration time -- hooks.md § on_source
+// itself, "the entry file is announced too") and a raw `#include "parts/x.tk"`
+// the core resolves on its own, which O2 left unscanned (the gap this item
+// closes). The one guard `on_source` enforces (no push from inside the
+// callback) is never at risk here: this handler only reads `src`/`len`.
+void tk_fwd_on_source(uptr name, uptr src, i64 len) {
+    if (!tk_fwd_is_source_name(name)) return;
+    tk_fwd_scan(src, src + len, name);
+}
+
+// registers the two lexer-side callbacks. Order no longer matters against
+// `tk_loop_init`'s own prelude push (the old §50 (a).4 note): the callback
+// runs once per source regardless of when it is pushed, and the name filter
+// throws the prelude's own announcement away on its own.
+//
+// S4.2: `source_claim` registers FIRST and, because `teko_init` calls this
+// function ahead of every `syntax`/`type_alias` registration, it is in place
+// before a single word is reserved. Registration order is not what makes it
+// correct -- the hook re-asks every frame already open when a handler
+// registers (hooks.md § source_claim, the replay rule) -- but it keeps the
+// reading of `teko_init` honest: the scope is declared before the vocabulary
+// it scopes.
+void tk_fwd_init() {
+    source_claim(&tk_source_claim);
+    on_source(&tk_fwd_on_source);
+}
+
+// every forward-scanned type whose row is STILL TK_PFWD once the whole unit
+// has been parsed -- a use materialized it (`tk_fwd_row`) and no real
+// declaration ever adopted it. `tk_type_add` flips the state to TK_PWHOLE the
+// moment a declaration IS read (adopted or not, a name never used before its
+// declaration never becomes TK_PFWD at all), so this is a false positive of
+// the scan, the only way it fires (decision 14, §50). Run BEFORE the two
+// resolvers below: a `new`/`Type.member` deferred against a name that turns
+// out to be this same false positive gets the clear message here instead of
+// a confusing one from a constructor/field pick over an empty placeholder.
+i64 tk_fwd_pass(i64 root) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfwd) break;
+        i64 si = tk_struct_find_exact(fw_name_at(i));
+        if (si >= 0 && sr_part_at(si) == TK_PFWD)
+            err_at(sr_hfile_at(si), sr_hline_at(si),
+                   tk_join3("teko: ", tk_ns_short_of(fw_name_at(i)), " is used but never declared"));
+        i = i + 1;
+    }
+    tk_fwd_resolve_all_new();
+    tk_fwd_resolve_all_static();
+    return root;
+}

@@ -1,145 +1,94 @@
-// src/regex/regex.tks   (namespace 'teko::regex') — ROUND 0 minimal regex engine.
-//
-// SCOPE (ROUND 0 — the last item of the strings/encoding checklist). A real but
-// DELIBERATELY MINIMAL engine: literals, `.` (any codepoint), the quantifiers
-// `*`/`+`/`?`, character classes `[abc]` / `[a-z]` / `[^abc]`, alternation `|`,
-// grouping `(...)`, and the anchors `^`/`$`. NOT implemented (documented, later
-// rounds): escape sequences (`\d`, `\w`, `\s`, `\.`, …), bounded repetition
-// (`{m,n}`), non-greedy quantifiers, capture groups, backreferences, lookaround.
-// A bare `\` in a pattern is a compile error (M.3 — honest, not silently wrong).
-//
-// ⚠ THIS MODULE IS LOAD-BEARING FOR THE TEST GATE. Since 0.3.1 the regression runner's
-// `Then <stream> pattern = "…"` step (TkrMatchMode::Pattern — src/build/tkr.tks,
-// src/build/regression.tks::match_stream) judges scenario output by calling `is_match`
-// here. That makes this engine part of the ORACLE, not just a library: it decides whether
-// other tests passed.
-//
-// The failure that matters is ASYMMETRIC. An engine bug that matches too LITTLE turns a
-// good scenario red — loud, and someone fixes it within the hour. An engine bug that
-// matches too MUCH turns a BROKEN scenario green, silently, and nothing anywhere will ever
-// say so; the gate simply stops being a gate. Over-matching is therefore the direction that
-// must be pinned down, and the only instrument that pins it is coverage: for every operator
-// a `.tkr` pattern is allowed to use, `regex_test.tkt` must assert the NON-matching case as
-// well as the matching one — that `^` really refuses a mid-string hit, that `[0-9]+`
-// really refuses `47a`, that a quantifier does not quietly become `.*`. Adding an operator
-// (or a new `.tkr` pattern shape) without its negative test widens the oracle's blind spot.
-//
-// It was a considered choice NOT to defend this with machinery. Anchoring `Pattern` matches
-// implicitly at both ends was proposed and REFUSED (owner ruling, 2026-07-26): it would have
-// forced every scenario to write `.*<it>.*` while stopping nobody from doing precisely that,
-// so it would have bought no safety and cost every pattern its readability. The defence is
-// tests, deliberately, and it has to be maintained as one.
-//
-// ALGORITHM — a deliberate DEVIATION from Thompson's construction (a genuine design
-// tension, resolved here rather than guessed around; see the task's "STOP and report"
-// clause). Thompson's construction needs a MUTABLE transition table: each
-// sub-expression's NFA fragment carries "dangling out" edges that get PATCHED once
-// the following fragment's start state is known (the classic patch-list technique).
-// Teko's assignment model (B.4/B.21) has NO index assignment (`arr[i] = x` is not
-// expressible — `TAssign.name` is a bare variable name only) and no struct-field
-// assignment except through a `Ref<T>` (MEM-1b-ii, a narrow escape hatch this module
-// doesn't need). A plain `mut` binding only ever REBINDS the whole variable. Building
-// a patch-and-mutate transition graph purely in Teko is therefore not expressible
-// today. So this engine takes the well-known alternative shape instead — a backtracking
-// recursive matcher over an immutable AST (Kernighan & Pike's `match`/`matchstar`,
-// *The Practice of Programming* / *Beautiful Code*): parse the pattern into a RegexNode
-// tree (recursion is fine, B.8 — just not in-place mutation), then match by recursive
-// descent with backtracking, threading an explicit CONTINUATION LIST (the sibling nodes
-// still to match) since Teko closures aren't used here — first-order CPS, spelled out
-// as data. Same regular-language power for this feature subset (no backreferences), but
-// the WORST-CASE COMPLEXITY of a backtracking engine, not the linear-time guarantee of a
-// true Thompson NFA simulation — an honest, documented trade, not a hidden one. Revisit
-// if/when Teko gains in-place mutation (index assignment / mutable arrays) and a real
-// state-table NFA becomes expressible.
-//
-// A SECOND, NARROWER workaround lives in the AST shape itself: every "single child"
-// field (RStar/RPlus/ROpt/RGroup's operand) is stored as `[]RegexNode` (a ONE-element
-// slice), never a bare `inner: RegexNode`, and always read back via `[0]`. This routes
-// around a confirmed VM defect (VM-only — the native engine is unaffected): reading a
-// BARE variant-typed struct field off a variable that is itself bound by an enclosing
-// `match … as x =>` arm returns a corrupted value (reproduced in isolation — a
-// self-referential variant is not even required; any variant-typed struct field
-// triggers it). The identical field wrapped as a one-element `[]T` and read via `[0]`
-// is unaffected — slices already go through a different (correct) VM code path. Filed
-// as a VM bug for a future fix; this module works around it rather than blocking on it.
+pub type RChar = struct { cp: u32 }
+pub type RAny = struct { }
+pub type RRange = struct { lo: u32; hi: u32 }
+pub type RClass = struct { negate: bool; ranges: []RRange }
+pub type RConcat = struct { parts: []@RegexNode() }
+pub type RAlt = struct { branches: []@RegexNode() }
+pub type RStar = struct { inner: []@RegexNode() }
+pub type RPlus = struct { inner: []@RegexNode() }
+pub type ROpt = struct { inner: []@RegexNode() }
+pub type RGroup = struct { inner: []@RegexNode() }
+pub type RStart = struct { }
+pub type REnd = struct { }
+pub type REmpty = struct { }
 
-// --- the AST (RegexNode) — one named struct per arm (no inline variant bodies; the
-// canonical pattern used by e.g. checker::Type — inline anonymous variant bodies are
-// a rejected shape per project ruling). ---
+macro RegexNode() { lowering { RChar | RAny | RClass | RConcat | RAlt | RStar | RPlus | ROpt | RGroup | RStart | REnd | REmpty } }
 
-pub type RChar = struct { cp: u32 }   // a literal codepoint
-pub type RAny = struct { }   // `.`
-pub type RRange = struct { lo: u32; hi: u32 }   // one class member: a single cp (lo==hi) or a-b range
-pub type RClass = struct { negate: bool; ranges: []RRange }   // `[...]` / `[^...]`
-pub type RConcat = struct { parts: []RegexNode }   // sequential composition
-pub type RAlt = struct { branches: []RegexNode }   // `a|b|c`
-// `inner` is a ONE-element `[]RegexNode` (never a bare `RegexNode` field) — see the VM
-// workaround note above. Built via `one(node)`, read via `one_of(x.inner)`.
-pub type RStar = struct { inner: []RegexNode }   // `x*`  (0 or more, greedy)
-pub type RPlus = struct { inner: []RegexNode }   // `x+`  (1 or more, greedy)
-pub type ROpt = struct { inner: []RegexNode }   // `x?`  (0 or 1)
-pub type RGroup = struct { inner: []RegexNode }   // `(...)` — grouping only (no captures yet)
-pub type RStart = struct { }   // `^` — anchors the match to input start
-pub type REnd = struct { }   // `$` — anchors the match to input end
-pub type REmpty = struct { }   // the empty pattern / empty alternative branch
+/** Regex — a compiled pattern: the source text plus its parsed AST. */
+exp type Regex = struct { pattern: str; ast: @RegexNode() }
 
-pub type RegexNode = variant RChar | RAny | RClass | RConcat | RAlt | RStar | RPlus | ROpt | RGroup | RStart | REnd | REmpty
+fn one(node: @RegexNode()): []@RegexNode() { [node] }
+fn one_of(wrapped: []@RegexNode()): @RegexNode() { wrapped[0] }
 
-// a COMPILED pattern — the parsed AST plus the source text (kept for diagnostics /
-// re-display; matching only ever reads `ast`). No struct methods yet (project ruling —
-// structs stay pure data), so every operation is a free function taking `Regex` by value.
-pub type Regex = struct { pattern: str; ast: RegexNode }
-
-// --- the []RegexNode-of-one helper pair (the VM workaround plumbing) ---
-
-fn one(node: RegexNode) -> []RegexNode { teko::list::push(teko::list::empty(), node) }
-fn one_of(wrapped: []RegexNode) -> RegexNode { wrapped[0] }
-
-// --- pattern scanning helpers (over the pattern's raw ASCII bytes) ---
-
-// one ASCII pattern byte decoded to its `char` value (via the ROUND 0 codepoint-ops
-// bridge: wrap the byte as a 1-byte str, then read its first — only — codepoint).
-fn byte_char(b: byte) -> char {
-    char_at(one_byte(b), 0)
+pub type CPScan = struct {
+    cp: u32
+    width: u64
 }
 
-fn byte_cp(b: byte) -> u32 {
-    byte_char(b) to u32
+fn utf8_width(b0: byte): u64 {
+    if b0 <= 0x7F { return 1 }
+    if b0 <= 0xDF { return 2 }
+    if b0 <= 0xEF { return 3 }
+    4
 }
 
-// --- the parser: recursive descent, `[]byte` pattern -> RegexNode | error ---
-// Grammar (standard regex precedence, low to high):
-//   alt      := concat ('|' concat)*
-//   concat   := repeat*
-//   repeat   := atom ('*' | '+' | '?')?
-//   atom     := '.' | class | group | '^' | '$' | literal
+fn decode_codepoint(p: []byte, pos: u64): CPScan {
+    var width = utf8_width(p[pos])
+    if width == 1 { return CPScan { cp = p[pos] to u32; width = width } }
+    if width == 2 {
+        var b0 = p[pos] to u32
+        var b1 = p[pos + 1] to u32
+        return CPScan { cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F); width = width }
+    }
+    if width == 3 {
+        var b0 = p[pos] to u32
+        var b1 = p[pos + 1] to u32
+        var b2 = p[pos + 2] to u32
+        return CPScan { cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F); width = width }
+    }
+    var b0 = p[pos] to u32
+    var b1 = p[pos + 1] to u32
+    var b2 = p[pos + 2] to u32
+    var b3 = p[pos + 3] to u32
+    CPScan { cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F); width = width }
+}
 
-// a parse result: the position just past what was consumed, plus the node built.
-// Threaded through by return value (no mutable out-param — REBIND on each step,
-// the same idiom the lexer itself uses).
-pub type PState = struct { pos: u64; node: RegexNode }
+fn codepoints_of(input: str): []u32 {
+    var bytes = input.bytes()
+    var out: []u32 = []
+    var pos: u64 = 0
+    loop {
+        if pos >= bytes.len { break }
+        var scan = decode_codepoint(bytes, pos)
+        out = [..out, scan.cp]
+        pos = pos + scan.width
+    }
+    out
+}
 
-fn parse_alt(p: []byte, pos: u64) -> PState | error {
-    let first = match parse_concat(p, pos) { PState as s => s; error as e => return e }
-    mut branches: []RegexNode = teko::list::push(teko::list::empty(), first.node)
-    mut at = first.pos
+pub type PState = struct { pos: u64; node: @RegexNode() }
+
+fn parse_alt(p: []byte, pos: u64): PState | error {
+    var first = match parse_concat(p, pos) { PState as s => s; error as e => return e }
+    var branches: []@RegexNode() = [first.node]
+    var at = first.pos
     loop {
         if at >= p.len || p[at] != b'|' { break }
-        let next = match parse_concat(p, at + 1) { PState as s => s; error as e => return e }
-        branches = teko::list::push(branches, next.node)
+        var next = match parse_concat(p, at + 1) { PState as s => s; error as e => return e }
+        branches = [..branches, next.node]
         at = next.pos
     }
     if branches.len == 1 { return PState { pos = at; node = first.node } }
     PState { pos = at; node = RAlt { branches = branches } }
 }
 
-fn parse_concat(p: []byte, pos: u64) -> PState | error {
-    mut parts: []RegexNode = teko::list::empty()
-    mut at = pos
+fn parse_concat(p: []byte, pos: u64): PState | error {
+    var parts: []@RegexNode() = []
+    var at = pos
     loop {
         if at >= p.len || p[at] == b'|' || p[at] == b')' { break }
-        let step = match parse_repeat(p, at) { PState as s => s; error as e => return e }
-        parts = teko::list::push(parts, step.node)
+        var step = match parse_repeat(p, at) { PState as s => s; error as e => return e }
+        parts = [..parts, step.node]
         at = step.pos
     }
     if parts.len == 0 { return PState { pos = at; node = REmpty { } } }
@@ -147,28 +96,28 @@ fn parse_concat(p: []byte, pos: u64) -> PState | error {
     PState { pos = at; node = RConcat { parts = parts } }
 }
 
-fn parse_repeat(p: []byte, pos: u64) -> PState | error {
-    let base = match parse_atom(p, pos) { PState as s => s; error as e => return e }
-    if base.pos < p.len && p[base.pos] == b'*' {
-        return PState { pos = base.pos + 1; node = RStar { inner = one(base.node) } }
+fn parse_repeat(p: []byte, pos: u64): PState | error {
+    var atom = match parse_atom(p, pos) { PState as s => s; error as e => return e }
+    if atom.pos < p.len && p[atom.pos] == b'*' {
+        return PState { pos = atom.pos + 1; node = RStar { inner = one(atom.node) } }
     }
-    if base.pos < p.len && p[base.pos] == b'+' {
-        return PState { pos = base.pos + 1; node = RPlus { inner = one(base.node) } }
+    if atom.pos < p.len && p[atom.pos] == b'+' {
+        return PState { pos = atom.pos + 1; node = RPlus { inner = one(atom.node) } }
     }
-    if base.pos < p.len && p[base.pos] == b'?' {
-        return PState { pos = base.pos + 1; node = ROpt { inner = one(base.node) } }
+    if atom.pos < p.len && p[atom.pos] == b'?' {
+        return PState { pos = atom.pos + 1; node = ROpt { inner = one(atom.node) } }
     }
-    base
+    atom
 }
 
-fn parse_atom(p: []byte, pos: u64) -> PState | error {
+fn parse_atom(p: []byte, pos: u64): PState | error {
     if pos >= p.len { return error { message = "regex: unexpected end of pattern" } }
-    let b = p[pos]
+    var b = p[pos]
     if b == b'.' { return PState { pos = pos + 1; node = RAny { } } }
     if b == b'^' { return PState { pos = pos + 1; node = RStart { } } }
     if b == b'$' { return PState { pos = pos + 1; node = REnd { } } }
     if b == b'(' {
-        let inner = match parse_alt(p, pos + 1) { PState as s => s; error as e => return e }
+        var inner = match parse_alt(p, pos + 1) { PState as s => s; error as e => return e }
         if inner.pos >= p.len || p[inner.pos] != b')' {
             return error { message = "regex: unterminated group — expected ')'" }
         }
@@ -176,213 +125,164 @@ fn parse_atom(p: []byte, pos: u64) -> PState | error {
     }
     if b == b'[' { return parse_class(p, pos + 1) }
     if b == b'\\' {
-        return error { message = "regex: escape sequences are not supported yet (ROUND 0 scope)" }
+        return error { message = "regex: escape sequences are not supported yet" }
     }
     if b == b')' { return error { message = "regex: unexpected ')'" } }
     if b == b'*' || b == b'+' || b == b'?' {
         return error { message = "regex: quantifier with nothing to repeat" }
     }
-    PState { pos = pos + 1; node = RChar { cp = byte_cp(b) } }
+    var scan = decode_codepoint(p, pos)
+    PState { pos = pos + scan.width; node = RChar { cp = scan.cp } }
 }
 
-// `[...]` — pos is just AFTER the `[`. Supports `^` negation (first byte) and `a-z`
-// ranges; a lone trailing `-` (e.g. `[a-]`) is a literal `-`, mirroring common practice.
-fn parse_class(p: []byte, pos: u64) -> PState | error {
-    mut at = pos
-    mut negate = false
+fn parse_class(p: []byte, pos: u64): PState | error {
+    var at = pos
+    var negate = false
     if at < p.len && p[at] == b'^' { negate = true; at = at + 1 }
-    mut ranges: []RRange = teko::list::empty()
-    mut first = true
+    var ranges: []RRange = []
+    var first = true
     loop {
         if at >= p.len { return error { message = "regex: unterminated character class — expected ']'" } }
         if p[at] == b']' && !first { break }
         first = false
-        let lo = byte_cp(p[at])
-        // a range `a-z`: needs a '-' NOT immediately followed by ']' (that '-' is literal).
-        if at + 2 < p.len && p[at + 1] == b'-' && p[at + 2] != b']' {
-            let hi = byte_cp(p[at + 2])
-            if hi < lo { return error { message = "regex: character class range out of order" } }
-            ranges = teko::list::push(ranges, RRange { lo = lo; hi = hi })
-            at = at + 3
+        var lo = decode_codepoint(p, at)
+        var after_lo = at + lo.width
+        if after_lo + 1 < p.len && p[after_lo] == b'-' && p[after_lo + 1] != b']' {
+            var hi = decode_codepoint(p, after_lo + 1)
+            if hi.cp < lo.cp { return error { message = "regex: character class range out of order" } }
+            ranges = [..ranges, RRange { lo = lo.cp; hi = hi.cp }]
+            at = after_lo + 1 + hi.width
         } else {
-            ranges = teko::list::push(ranges, RRange { lo = lo; hi = lo })
-            at = at + 1
+            ranges = [..ranges, RRange { lo = lo.cp; hi = lo.cp }]
+            at = after_lo
         }
     }
     if ranges.len == 0 { return error { message = "regex: empty character class" } }
     PState { pos = at + 1; node = RClass { negate = negate; ranges = ranges } }
 }
 
-// compile(pattern) — parse a pattern string into a Regex, or a compile error (M.3 —
-// a malformed pattern is a checked failure, following the fallible-builtin convention
-// used by str_from_utf8 / DateTime parses elsewhere in ROUND 0).
-pub fn compile(pattern: str) -> Regex | error {
-    let bytes = bytes_of_str(pattern)
-    let parsed = match parse_alt(bytes, 0) { PState as s => s; error as e => return e }
+/** teko::regex::compile — parse `pattern` into a `Regex`.
+ * @return the compiled pattern, or a compile error on a malformed pattern. */
+exp fn compile(pattern: str): Regex | error {
+    var bytes = pattern.bytes()
+    var parsed = match parse_alt(bytes, 0) { PState as s => s; error as e => return e }
     if parsed.pos != bytes.len {
         return error { message = "regex: unexpected trailing input in pattern" }
     }
     Regex { pattern = pattern; ast = parsed.node }
 }
 
-// --- the matcher: recursive backtracking over input CODEPOINTS ---
-//
-// `m_node(node, input, i, cont)` tries to match `node` starting at codepoint index `i`
-// of `input` (an `[]char`, ROUND 0 codepoint-ops), then matches the CONTINUATION `cont`
-// — the sibling nodes still to match, in order — starting at the index just past this
-// match. Returns true iff `node` then `cont` succeeds somewhere. This is first-order
-// CPS: `cont` stands in for "the rest of the pattern", letting `*`/`+`/`?`/alternation
-// backtrack (retry a shorter/alternate match of `node`) when `cont` fails to follow.
+type MCont = struct {
+    head: @RegexNode()
+    tail: []MCont
+}
 
-fn class_matches(cls: RClass, cp: u32) -> bool {
-    mut i: u64 = 0
-    mut hit = false
+fn mc_end(): []MCont { [] }
+
+fn mc_push(node: @RegexNode(), cont: []MCont): []MCont {
+    [MCont { head = node; tail = cont }]
+}
+
+fn mc_push_all(parts: []@RegexNode(), cont: []MCont): []MCont {
+    var out = cont
+    var j = parts.len
+    loop {
+        if j == 0 { break }
+        j = j - 1
+        out = mc_push(parts[j], out)
+    }
+    out
+}
+
+fn mc_of_node(node: @RegexNode(), cont: []MCont): []MCont {
+    match node {
+        RConcat as c => mc_push_all(c.parts, cont)
+        _ => mc_push(node, cont)
+    }
+}
+
+fn class_matches(cls: RClass, cp: u32): bool {
+    var i: u64 = 0
+    var hit = false
     loop {
         if i >= cls.ranges.len { break }
-        let r = cls.ranges[i]
+        var r = cls.ranges[i]
         if cp >= r.lo && cp <= r.hi { hit = true; break }
         i++
     }
     if cls.negate { !hit } else { hit }
 }
 
-// match the continuation list in order: cont[0] then cont[1..] as ITS continuation.
-fn m_cont(cont: []RegexNode, input: []char, i: u64) -> bool {
+fn m_cont(cont: []MCont, input: []u32, i: u64): bool {
     if cont.len == 0 { return true }
-    let head = cont[0]
-    let tail = cont_tail(cont)
-    m_node(head, input, i, tail)
+    m_node(cont[0].head, input, i, cont[0].tail)
 }
 
-fn cont_tail(cont: []RegexNode) -> []RegexNode {
-    mut out: []RegexNode = teko::list::empty()
-    mut i: u64 = 1
-    loop {
-        if i >= cont.len { break }
-        out = teko::list::push(out, cont[i])
-        i++
-    }
-    out
-}
-
-// prepend `node` to `cont` (a fresh list; Teko has no in-place splice).
-fn cont_push_front(node: RegexNode, cont: []RegexNode) -> []RegexNode {
-    mut out: []RegexNode = teko::list::push(teko::list::empty(), node)
-    mut i: u64 = 0
-    loop {
-        if i >= cont.len { break }
-        out = teko::list::push(out, cont[i])
-        i++
-    }
-    out
-}
-
-fn m_node(node: RegexNode, input: []char, i: u64, cont: []RegexNode) -> bool {
+fn m_node(node: @RegexNode(), input: []u32, i: u64, cont: []MCont): bool {
     match node {
         REmpty => m_cont(cont, input, i)
-        RChar as c => {
-            if i >= input.len { false }
-            else if (input[i] to u32) == c.cp { m_cont(cont, input, i + 1) }
-            else { false }
-        }
-        RAny => {
-            if i >= input.len { false } else { m_cont(cont, input, i + 1) }
-        }
-        RClass as cls => {
-            if i >= input.len { false }
-            else if class_matches(cls, input[i] to u32) { m_cont(cont, input, i + 1) }
-            else { false }
-        }
-        RStart => {
-            if i == 0 { m_cont(cont, input, i) } else { false }
-        }
-        REnd => {
-            if i == input.len { m_cont(cont, input, i) } else { false }
-        }
+        RChar as c => m_one(i < input.len && input[i] == c.cp, input, i, cont)
+        RAny => m_one(i < input.len, input, i, cont)
+        RClass as cls => m_one(i < input.len && class_matches(cls, input[i]), input, i, cont)
+        RStart => i == 0 && m_cont(cont, input, i)
+        REnd => i == input.len && m_cont(cont, input, i)
         RGroup as g => m_node(one_of(g.inner), input, i, cont)
-        RConcat as c => m_concat(c.parts, input, i, cont)
+        RConcat as c => m_cont(mc_push_all(c.parts, cont), input, i)
         RAlt as a => m_alt(a.branches, 0, input, i, cont)
         RStar as s => m_star(one_of(s.inner), input, i, cont)
-        // `x+` = one copy of x, then `x*` — reuse m_star's own backtracking by making
-        // the FIRST match's continuation "star again, then whatever cont already held".
-        RPlus as pl => {
-            let x = one_of(pl.inner)
-            m_node(x, input, i, cont_push_front(RStar { inner = one(x) }, cont))
-        }
-        // `x?` — greedy: try matching x (then cont); if that fails, skip x (match cont
-        // as-is at the SAME position).
-        ROpt as o => {
-            let x = one_of(o.inner)
-            if m_node(x, input, i, cont) { true } else { m_cont(cont, input, i) }
-        }
+        RPlus as pl => m_plus(one_of(pl.inner), input, i, cont)
+        ROpt as o => m_opt(one_of(o.inner), input, i, cont)
     }
 }
 
-// a concat's parts are just prepended (in order) onto `cont` — matching `parts[0]`
-// with continuation `parts[1..] ++ cont` naturally recurses through the rest.
-fn m_concat(parts: []RegexNode, input: []char, i: u64, cont: []RegexNode) -> bool {
-    if parts.len == 0 { return m_cont(cont, input, i) }
-    let combined = concat_onto(parts, cont)
-    m_cont(combined, input, i)
+fn m_one(accepted: bool, input: []u32, i: u64, cont: []MCont): bool {
+    accepted && m_cont(cont, input, i + 1)
 }
 
-// parts ++ cont, as a fresh list (no in-place append in Teko).
-fn concat_onto(parts: []RegexNode, cont: []RegexNode) -> []RegexNode {
-    mut out: []RegexNode = teko::list::empty()
-    mut i: u64 = 0
-    loop {
-        if i >= parts.len { break }
-        out = teko::list::push(out, parts[i])
-        i++
-    }
-    mut j: u64 = 0
-    loop {
-        if j >= cont.len { break }
-        out = teko::list::push(out, cont[j])
-        j++
-    }
-    out
-}
-
-fn m_alt(branches: []RegexNode, idx: u64, input: []char, i: u64, cont: []RegexNode) -> bool {
+fn m_alt(branches: []@RegexNode(), idx: u64, input: []u32, i: u64, cont: []MCont): bool {
     if idx >= branches.len { return false }
     if m_node(branches[idx], input, i, cont) { return true }
     m_alt(branches, idx + 1, input, i, cont)
 }
 
-// `x*` — greedy: try "one more copy of x, then star again" before "stop here"
-// (longest-first backtracking star, the classic shape).
-fn m_star(inner: RegexNode, input: []char, i: u64, cont: []RegexNode) -> bool {
-    if m_node(inner, input, i, cont_push_front(RStar { inner = one(inner) }, cont)) { return true }
+fn m_star(inner: @RegexNode(), input: []u32, i: u64, cont: []MCont): bool {
+    if m_node(inner, input, i, mc_push(RStar { inner = one(inner) }, cont)) { return true }
     m_cont(cont, input, i)
 }
 
-// is_match(re, input) — true iff `re`'s pattern matches SOMEWHERE in `input` (the
-// conventional "search", not "fullmatch"): tries every start offset in turn, which for
-// this backtracking engine is observably the same as prepending an implicit `.*?`.
-// `^`/`$` inside the pattern still anchor to the TRUE start/end of `input` (not to
-// whichever start offset is currently being tried).
-pub fn is_match(re: Regex, input: str) -> bool {
-    let cps = chars(input)
-    mut start: u64 = 0
+fn m_plus(inner: @RegexNode(), input: []u32, i: u64, cont: []MCont): bool {
+    m_node(inner, input, i, mc_push(RStar { inner = one(inner) }, cont))
+}
+
+fn m_opt(inner: @RegexNode(), input: []u32, i: u64, cont: []MCont): bool {
+    if m_node(inner, input, i, cont) { return true }
+    m_cont(cont, input, i)
+}
+
+/** teko::regex::is_match — whether `re`'s pattern matches somewhere in `input` (a search, not
+ * a full match); `^`/`$` still anchor to the true start/end of `input`. */
+exp fn is_match(re: Regex, input: str): bool {
+    var cps = codepoints_of(input)
+    var cont = mc_of_node(re.ast, mc_end())
+    var start: u64 = 0
     loop {
-        if m_node(re.ast, cps, start, teko::list::empty()) { return true }
+        if m_cont(cont, cps, start) { return true }
         if start >= cps.len { break }
         start++
     }
     false
 }
 
-// is_match_pattern(pattern, input) — one-shot convenience: compile then match.
-// Propagates a bad pattern as `error` (fallible-builtin convention, e.g. str_from_utf8).
-pub fn is_match_pattern(pattern: str, input: str) -> bool | error {
-    let re = match compile(pattern) { Regex as r => r; error as e => return e }
+/** teko::regex::is_match_pattern — compile `pattern` and search `input` with it.
+ * @throws the compile error on a malformed pattern. */
+exp fn is_match_pattern(pattern: str, input: str): bool | error {
+    var re = match compile(pattern) { Regex as r => r; error as e => return e }
     is_match(re, input)
 }
 
-// full_match(re, input) — true iff the ENTIRE input matches (start to end), i.e. the
-// pattern is implicitly anchored on both sides regardless of any literal `^`/`$` in it.
-pub fn full_match(re: Regex, input: str) -> bool {
-    let cps = chars(input)
-    m_node(re.ast, cps, 0, teko::list::push(teko::list::empty(), REnd { }))
+/** teko::regex::full_match — whether the entire `input` matches `re`, start to end (implicitly
+ * anchored regardless of any literal `^`/`$` in the pattern). */
+exp fn full_match(re: Regex, input: str): bool {
+    var cps = codepoints_of(input)
+    m_cont(mc_of_node(re.ast, mc_push(REnd { }, mc_end())), cps, 0)
 }

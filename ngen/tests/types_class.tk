@@ -1,0 +1,156 @@
+// types_class.tk -- `class` (entrega 3, D214): word 0 of the object is the
+// vtable and word 1 the reference count (D218), fields are laid out base-first
+// (SHAPE_SIDE at 16 stays at 16 in
+// Square, whose own field lands after it), a plain method is a direct call and
+// a `virtual`/`override` pair dispatches through the vtable -- `s.area()` on a
+// name declared `Shape` runs `square_area` when the object is a Square.
+//
+// The receiver is not written (D219): `side` is `this.side` because no local or
+// parameter is called that, `this.side` says the same thing out loud, an
+// unqualified `area()` is `this.area()` and still goes through the vtable, and
+// `base.area()` runs Shape's own implementation directly -- which is what lets
+// an `override` build on the method it overrides instead of recursing.
+//
+// `VShape.useCircle(Circle)` (higiene 2, item 1): a virtual method's own
+// argument checked against its declared parameter type through the vtable --
+// `b.useCircle(circ)` on a `VShape`-typed receiver holding a `VSquare`
+// dispatches to the override, and the argument's own teko type is checked at
+// the call site, not just at the direct-call sites `tk_rc_call_args` already
+// covered.
+//
+// `fvcheck` (V1): a virtual method that returns `f64`, through the three shapes
+// a virtual call is built in -- the written receiver, the implicit `this`, and
+// a receiver only the oracle types (a base-typed parameter). Each one carries
+// the cast that declares the indirect call's return type, without which
+// `1.0 + p.area()` reads whatever the untyped `callp` left behind.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+class Shape {
+    public i64 side;
+
+    public i64 twice() {
+        return side * 2;
+    }
+
+    public virtual i64 area() {
+        return this.side;
+    }
+
+    public virtual i64 scaled(i64 k) {
+        return area() * k;
+    }
+}
+
+class Square : Shape {
+    public i64 tag;
+
+    public override i64 area() {
+        return base.area() * side;
+    }
+}
+
+i64 area_of(Shape s) {
+    return s.area();
+}
+
+class Circle {
+    public i64 r;
+}
+
+class VShape {
+    public i64 side;
+
+    public virtual i64 useCircle(Circle c) {
+        return c.r + side;
+    }
+}
+
+class VSquare : VShape {
+    public override i64 useCircle(Circle c) {
+        return c.r * side;
+    }
+}
+
+class FShape {
+    public f64 side;
+
+    public virtual f64 area() {
+        return side;
+    }
+
+    public f64 boosted() {
+        return 1.0 + area();
+    }
+}
+
+class FSquare : FShape {
+    public override f64 area() {
+        return base.area() * side;
+    }
+}
+
+f64 farea_of(FShape s) {
+    return 1.0 + s.area();
+}
+
+i64 fvcheck() {
+    FShape p = new FShape;
+    p.side = 3.0;
+    if (p.area() != 3.0) return 1;
+    if (1.0 + p.area() != 4.0) return 2;          // the written receiver
+
+    FShape r = new FSquare;
+    r.side = 4.0;
+    if (1.0 + r.area() != 17.0) return 3;         // the override, through the vtable
+
+    if (p.boosted() != 4.0) return 4;             // the implicit `this`
+    if (r.boosted() != 17.0) return 5;
+
+    if (farea_of(r) != 17.0) return 6;            // a receiver only the oracle types
+    return 0;
+}
+
+i64 vcheck() {
+    Circle circ = new Circle;
+    circ.r = 3;
+    VShape b = new VSquare;
+    b.side = 4;
+    if (b.useCircle(circ) != 12) return 1;         // the override, through the vtable
+    return 0;
+}
+
+i64 main() {
+    if (SHAPE_SIDE != 16) return 1;
+    if (SHAPE_SIZE != 24) return 2;
+    if (SQUARE_TAG != 24) return 3;
+    if (SQUARE_SIZE != 32) return 4;
+
+    Shape p = new Shape;
+    p.side = 3;
+    if (p.area() != 3) return 5;
+    if (p.twice() != 6) return 6;
+    if (p.scaled(2) != 6) return 7;
+
+    Square q = new Square;
+    q.side = 5;
+    q.tag = 1;
+    if (q.area() != 25) return 8;                // base.area() * side
+    if (q.twice() != 10) return 9;
+
+    Shape r = new Square;
+    r.side = 4;
+    if (r.area() != 16) return 10;               // the override, through the vtable
+    if (r.scaled(2) != 32) return 11;            // an inherited virtual calling it
+    if (area_of(r) != 16) return 12;             // ...and through a parameter
+
+    i64 vbad = vcheck();
+    if (vbad != 0) return 20 + vbad;
+
+    i64 fbad = fvcheck();
+    if (fbad != 0) return 30 + fbad;
+
+    return p.area() + q.area() + r.area() - 2;
+}

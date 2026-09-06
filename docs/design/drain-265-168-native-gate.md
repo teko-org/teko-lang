@@ -1,11 +1,13 @@
 # Native test-gate keystone — #265 (line/branch cov) + #168 (compile-once partition)
 
+> **[HISTÓRICO]** — documenta o planejamento da drenagem de teste nativa (#265, #168), já executado. Não descreve o estado atual do projeto.
+
 Status: DESIGN (architect). Implementation crumbs. Companion to
 `teko-native-test-gate` (owner standing ruling 2026-07-06: the `#test` gate NEVER runs on
-the VM — it compiles to a NATIVE binary that knows the product-under-test + its access
-points; VM stays dev/debug/WASM only). This is THE shared-villain kill: it drops the
+the legacy engine — it compiles to a NATIVE binary that knows the product-under-test + its access
+points; legacy engine stays dev/debug only). This is THE shared-villain kill: it drops the
 compiler's gate-time peak from 1595 MB → ~366 MB (the child runs in its own process) AND
-the 15.6 s VM interpret → a sub-second native run. Both axes bank it once.
+the 15.6 s legacy engine run → a sub-second native run. Both axes bank it once.
 
 ## 0. What already exists (do NOT rebuild)
 
@@ -22,7 +24,7 @@ Verified in-tree — the infrastructure is REAL and opt-in today:
   via `getenv("TEKO_TKCOV")` → `tk_cov_dump`.
 - **Function-level marks.** `emit_function_mode` (`codegen.tks:7659`) → `emit_function_cov`
   (`codegen.tks:5895`) emits `tk_cov_mark(cov_idx)` on entry of every PRODUCTION fn (skips
-  `is_test` + `teko::vm`), keyed by `fn_items_index` (`codegen.tks:7674`). `cov_idx < 0` ⇒
+  `is_test` + legacy engine-internal items), keyed by `fn_items_index` (`codegen.tks:7674`). `cov_idx < 0` ⇒
   no prologue ⇒ byte-identical (Program/TestPlain).
 - **Runtime sinks (all present, cross-process).** `teko_rt.{h,c}`:
   `tk_cov_line(line)` / `tk_cov_branch(line,col,outcome)` key by the CURRENT fn on a
@@ -31,42 +33,42 @@ Verified in-tree — the infrastructure is REAL and opt-in today:
   (`teko_rt.c:1659`); `tk_cov_dump`/`tk_cov_merge` speak the `TKCOV1` `.tkcov` protocol
   (`teko_rt.c:1768/1801`) — the SAME protocol #168 uses.
 - **Orchestration.** `run_native_gate` (`project.tks:734`) emits the TestCov TU → `run_cc`
-  → run child → `vm::cov_merge(covfile)` (`vm.tks:3983` → `tk_cov_merge`). `run_gate`
+  → run child → the legacy engine's `cov_merge(covfile)` (→ `tk_cov_merge`). `run_gate`
   (`project.tks:807`) dispatches `native_gate ? run_gate_native : run_gate_vm`. CLI/env
   plumbing `--native-gate` / `TEKO_NATIVE_GATE=1` (`native_gate_of`, `project.tks:904`) done.
 - **Engine-independent floors.** `line_coverage`/`branch_coverage`/`functions_coverage`
-  (`vm.tks:4051/4085/4050`) statically walk each production fn body (`cov_walk_block`,
-  `vm.tks:3866`) and query `tk_cov_line_hit(i, line)` / `tk_cov_branch_hit(i,line,col,o)`
+  (`the legacy engine`) statically walk each production fn body (`cov_walk_block`,
+  `the legacy engine`) and query `tk_cov_line_hit(i, line)` / `tk_cov_branch_hit(i,line,col,o)`
   where **`i` = the prog.items index**. They read the runtime sinks — they DO NOT care which
   engine populated them.
 
 ## 1. THE gap (the entire compiler work item)
 
 The native binary populates the FUNCTION sink (`tk_cov_mark`) but NOT the LINE and BRANCH
-sinks INSIDE production fn bodies. The VM populates them at three AST sites:
+sinks INSIDE production fn bodies. The legacy engine populates them at three AST sites:
 
-- `eval_expr` head: `teko::cov_line(e.line)` on EVERY evaluated expr (`vm.tks:2157`).
-- `exec_if`: `cov_branch(e.line,e.col,0)` then-taken / `(…,1)` else-taken (`vm.tks:3697/3701`).
-- `exec_match` / value-match: `cov_branch(e.line,e.col,i)` for arm `i` (`vm.tks:2082/2121`).
+- `eval_expr` head: `teko::cov_line(e.line)` on EVERY evaluated expr (`the legacy engine`).
+- `exec_if`: `cov_branch(e.line,e.col,0)` then-taken / `(…,1)` else-taken (`the legacy engine`).
+- `exec_match` / value-match: `cov_branch(e.line,e.col,i)` for arm `i` (`the legacy engine`).
 
 So `native_function_floor` (`project.tks:719`) enforces ONLY the function floor; line+branch
-floors are left to the VM lane. **Closing #265 = emit those `tk_cov_line`/`tk_cov_branch`
-calls in the TestCov codegen so native enforces ALL THREE floors → the VM lane can leave PR CI.**
+floors are left to the legacy engine lane. **Closing #265 = emit those `tk_cov_line`/`tk_cov_branch`
+calls in the TestCov codegen so native enforces ALL THREE floors → the legacy engine lane can leave PR CI.**
 
 ### 1.1 THE load-bearing keying subtlety (get this right or the floor reads garbage)
 
 `tk_cov_line`/`tk_cov_branch` attribute to `tk_fn_stack[sp-1]` — the fn most recently
 `tk_cov_enter`'d. The STATIC floor walk queries with `fn = prog.items index of the production
 fn`. TODAY the native gate only enters the **TEST's** index at the test call
-(`emit_test_call` cov branch). That is CORRECT for the VM (whose `eval_call` does
-`cov_enter(h.idx)` for the CALLED production fn too — `vm.tks:3165/3256/3594`), but the native
+(`emit_test_call` cov branch). That is CORRECT for the legacy engine (whose `eval_call` does
+`cov_enter(h.idx)` for the CALLED production fn too — `the legacy engine`), but the native
 path never enters the production fn. **Therefore native line/branch marks would all attribute
 to the TEST's index, and every production fn would read as 0% line/branch — a false floor.**
 
-**Resolution (mirror the VM exactly):** every PRODUCTION fn body, under TestCov, must be
+**Resolution (mirror the legacy engine exactly):** every PRODUCTION fn body, under TestCov, must be
 bracketed `tk_cov_enter(<own items-index>)` … `tk_cov_leave()` around its body, so its interior
-`tk_cov_line`/`tk_cov_branch` marks key on ITS index (matching the static walk's `i`). The VM
-does this in `eval_call`/`call_value` (enter on entry, leave on return, `vm.tks:3165/3256/3594`).
+`tk_cov_line`/`tk_cov_branch` marks key on ITS index (matching the static walk's `i`). The legacy engine
+does this in `eval_call`/`call_value` (enter on entry, leave on return, `the legacy engine`).
 The `tk_cov_mark(idx)` prologue `emit_function_cov` already emits gives us the index for free.
 `tk_cov_leave` must fire on EVERY exit edge (returns + fall-through). Simpler, equivalent, and
 exit-edge-proof: **do NOT use enter/leave inside bodies; instead emit the fn's own index as an
@@ -76,7 +78,7 @@ explicit argument** — see N2 (the recommended shape avoids the exit-edge probl
 
 Two independent tracks: **Track A = #265 line/branch instrumentation** (compiler, unblocks
 line/branch floors on native); **Track B = #168 compile-once partition** (compiler+CI, unblocks
-the sub-second win). A is the correctness prerequisite for demoting the VM lane; B is the speed
+the sub-second win). A is the correctness prerequisite for demoting the legacy engine lane; B is the speed
 prerequisite for making native the DEFAULT. Do A first (it is the memory+correctness keystone),
 then B (the speed keystone), then the CI flip (QW-1a).
 
@@ -99,7 +101,7 @@ so the thread is one value, not a bool viral through 30 signatures:
  *
  * Carries whether line/branch `tk_cov_*` calls are emitted and the OWNING production fn's
  * prog.items index (so interior line/branch marks key on the same `fn` the static floor walk
- * queries — `line_coverage`/`branch_coverage` in vm.tks use `i to u64`). `on == false` is the
+ * queries — `line_coverage`/`branch_coverage` in the legacy engine's Teko twin use `i to u64`). `on == false` is the
  * default for every non-TestCov path → NO `tk_cov_*` emitted → byte-identical output → the
  * gen1==gen2 fixpoint is untouched.
  *
@@ -120,7 +122,7 @@ type CovCtx = struct {
  * @return a CovCtx with `on = false` → emit_cov_line/emit_cov_branch emit ZERO bytes.
  * @since #265
  */
-fn cov_off() -> CovCtx { CovCtx { on = false; fn_idx = 0 } }
+fn cov_off(): CovCtx { CovCtx { on = false; fn_idx = 0 } }
 ```
 
 Thread `CovCtx` as the LAST parameter of the body-emission spine only:
@@ -130,8 +132,8 @@ Thread `CovCtx` as the LAST parameter of the body-emission spine only:
 `emit_function_cov` passes a live `CovCtx { on = cov_idx >= 0; fn_idx = cov_idx to u64 }`.
 
 **A2 — Emit `tk_cov_line` at the expression-statement / binding chokepoint (NOT per sub-expr).**
-The VM marks on EVERY `eval_expr`; naively mirroring that is a mark per sub-expression, which
-bloats the TU and is unnecessary — the floor walk (`cov_walk_expr`, `vm.tks:3781`) collects the
+The legacy engine marks on EVERY `eval_expr`; naively mirroring that is a mark per sub-expression, which
+bloats the TU and is unnecessary — the floor walk (`cov_walk_expr`, `the legacy engine`) collects the
 DISTINCT set of `e.line` values reachable in the body, so a line counts as covered if ANY expr on
 it ran. Emitting one `tk_cov_line(<line>)` at the START of each emitted STATEMENT (binding / assign
 / return / expr-stmt / loop-header / if-cond / match-subject) covers the same distinct-line set the
@@ -150,7 +152,7 @@ walk enumerates, because `cov_walk_stmt`/`cov_walk_expr` add the statement's own
  * @return the buffer with the mark appended, or `buf` unchanged when off
  * @since #265
  */
-fn emit_cov_line(buf: []byte, ctx: CovCtx, line: u32, indent: str) -> []byte {
+fn emit_cov_line(buf: []byte, ctx: CovCtx, line: u32, indent: str): []byte {
     if !ctx.on { return buf }
     if line == 0 { return buf }
     cb(cb_u128_digits(cb(cb(buf, indent), "tk_cov_line("), line to u128), ");\n")
@@ -160,15 +162,15 @@ fn emit_cov_line(buf: []byte, ctx: CovCtx, line: u32, indent: str) -> []byte {
 Call it at the head of `emit_stmt` (once, on `s`'s line) — that is the single statement
 chokepoint, so ONE edit covers bindings/assigns/returns/expr-stmts/loops. Verify the line field
 name on each `TStatement` case (`b.line`/`a.line`/`r.line`/`x.line`/`l.line`) — the checker
-carries a `line` on each; the VM reads `e.line` off the expr, so prefer the statement's primary
+carries a `line` on each; the legacy engine reads `e.line` off the expr, so prefer the statement's primary
 expr line where a stmt has no own line, matching `cov_walk_stmt` (which recurses into the expr).
 
 **A3 — Emit `tk_cov_branch` at the `if` chokepoints (statement + value + tail forms).**
-Three emission sites, each mirroring one VM `cov_branch` call:
+Three emission sites, each mirroring one legacy engine `cov_branch` call:
 
 - `emit_if_stmt` (`codegen.tks:5288`): after `if (<cond>) {\n`, emit `tk_cov_branch(<line>,<col>,0);`
   at the top of the then-block; in the `else {` (synthesize an `else` even when `!has_else` so the
-  outcome-1 mark exists — the VM marks outcome 1 on the SKIP path too, `vm.tks:3701`) emit
+  outcome-1 mark exists — the legacy engine marks outcome 1 on the SKIP path too, `the legacy engine`) emit
   `tk_cov_branch(<line>,<col>,1);`. **Static-walk parity:** `cov_addsite(w, e.line, e.col, 2)` —
   2 outcomes always, so a bare `if` with no else STILL has a total of 2; without the synthesized
   else mark, outcome 1 can never be hit → the branch floor is unreachable at 100%. This is the
@@ -183,7 +185,7 @@ Three emission sites, each mirroring one VM `cov_branch` call:
 ```teko
 /**
  * emit_cov_branch — under an active CovCtx, emit one `tk_cov_branch(line, col, outcome)` mark for a
- * taken branch outcome (the VM's exec_if/exec_match cov_branch twin). No-op when off → byte-identical.
+ * taken branch outcome (the legacy engine's exec_if/exec_match cov_branch twin). No-op when off → byte-identical.
  *
  * @param buf     the emission buffer
  * @param ctx     the coverage context
@@ -194,7 +196,7 @@ Three emission sites, each mirroring one VM `cov_branch` call:
  * @return the buffer with the mark appended, or `buf` unchanged when off
  * @since #265
  */
-fn emit_cov_branch(buf: []byte, ctx: CovCtx, line: u32, col: u32, outcome: u64, indent: str) -> []byte {
+fn emit_cov_branch(buf: []byte, ctx: CovCtx, line: u32, col: u32, outcome: u64, indent: str): []byte {
     if !ctx.on { return buf }
     mut b = cb(cb(buf, indent), "tk_cov_branch(")
     b = cb(cb_u128_digits(b, line to u128), ", ")
@@ -207,7 +209,7 @@ fn emit_cov_branch(buf: []byte, ctx: CovCtx, line: u32, col: u32, outcome: u64, 
 `emit_match_stmt` (`codegen.tks:4701`), `emit_match_value` (`codegen.tks:4547`), `emit_match_tail`
 (`codegen.tks:4616`). Each lowers arms to an if/else chain (or switch). At the TOP of arm `i`'s
 body emit `tk_cov_branch(e.line, e.col, i)`. `n = m.arms.len` outcomes — matches
-`cov_addsite(w0, e.line, e.col, m.arms.len)` (`vm.tks:3796`). The subject is evaluated once
+`cov_addsite(w0, e.line, e.col, m.arms.len)` (`the legacy engine`). The subject is evaluated once
 before the chain (its own line already marked by A2's statement mark on the enclosing stmt).
 
 **A5 — Bracket production fn bodies with the fn-stack so interior marks key correctly.**
@@ -227,7 +229,7 @@ fragile (the body has many), use the RAII-free alternative that the runtime alre
   stack). Codegen (A2–A4) emits `_at` with `ctx.fn_idx`. This removes ALL exit-edge bookkeeping —
   no enter/leave inside bodies, no leave-on-every-return. Declare in `teko_rt.h`, define next to
   `tk_cov_line`/`tk_cov_branch`, expose as `teko::cov_line_at`/`teko::cov_branch_at` builtins in
-  `codegen.tks:2075`-area (the same `else if last == "cov_line"` dispatch block). The VM continues
+  `codegen.tks:2075`-area (the same `else if last == "cov_line"` dispatch block). The legacy engine continues
   to use the stack-based `cov_line`/`cov_branch` unchanged (it has a live enter/leave via eval_call).
 - **Alternative (no runtime change, more fragile):** enter/leave brackets on entry + before every
   return + at fall-through. Rejected as default — the body has too many return edges (variant
@@ -236,8 +238,8 @@ fragile (the body has many), use the RAII-free alternative that the runtime alre
 
 **A6 — Wire the native floors to line/branch.** In `project.tks`, replace `native_function_floor`
 (`project.tks:719`) with the full three-floor `coverage_gate_result` (`project.tks:700`) — which
-already reads `vm::line_coverage_pct`/`branch_coverage_pct`/`coverage_pct` off the merged sinks.
-After A2–A5 the native run populates all three sinks, so `coverage_gate_result` (the VM path's own
+already reads the legacy engine's `line_coverage_pct`/`branch_coverage_pct`/`coverage_pct` off the merged sinks.
+After A2–A5 the native run populates all three sinks, so `coverage_gate_result` (the legacy engine path's own
 floor fn) works VERBATIM on the native path. `run_gate_native` (`project.tks:791`) calls
 `coverage_gate_result(dir, fe)` instead of `native_function_floor(dir, fe)`. This is the crumb
 that CLOSES #265 (native enforces all three floors). Update the `native_function_floor` doc-comment
@@ -257,7 +259,7 @@ Do NOT design against a `.tkb` load path that does not exist. What is UNBLOCKED 
 **B1 — Emit the test TU ONCE per gate, not per-invocation (Phase A, unblocked).** Today
 `run_native_gate` emits + `run_cc`'s the TestCov TU on every gate call. Within a single
 `compile_project_g` there is exactly one gate call, so the per-invocation cost is already once;
-the DOUBLING the compile-time doc names is at the CI level (VM gate + native gate both run). The
+the DOUBLING the compile-time doc names is at the CI level (legacy engine gate + native gate both run). The
 compiler-side "compile once" that matters: the TestCov TU shares the SAME front-end product (`fe.prog`)
 as the release build — the front-end (lex/parse/check/mono, ~17 s) is ALREADY done once and reused
 (`run_gate_native` takes `fe`). The native gate's only ADDED cost over `--no-verify` is
@@ -268,9 +270,9 @@ only in `main`): acceptable — one extra cc of 102k lines = 0.7 s (#249). **Pha
 already satisfied; the crumb is to DOCUMENT that and NOT to add a re-front-end.**
 
 **B2 — Per-process isolation for the MEMORY win (Phase B-lite, unblocked without C7.16).** The
-memory balloon (1595 MB) is the VM interpreting tests IN-PROCESS. The native gate already runs the
+memory balloon (1595 MB) is the legacy engine running tests IN-PROCESS. The native gate already runs the
 tests in a CHILD process (`teko::process::run`, `project.tks:748`) → the compiler's own peak drops
-to the codegen-only 366 MB the moment the VM gate is no longer the default. This is Phase B's core
+to the codegen-only 366 MB the moment the legacy engine gate is no longer the default. This is Phase B's core
 benefit (OS reclaims between contexts) achieved by process boundary ALONE, without needing
 `.tkb`-per-context. The full Phase B (one process PER test-context for even lower child peak) needs
 C7.16 and is deferred; the child test binary's own peak is small (it runs compiled code with real
@@ -286,21 +288,21 @@ doc-comment honest-stop in `run_native_gate` naming C7.16 as the blocker. Do NOT
 
 ### Track C — the CI flip (QW-1a, CI-config, after A6 lands)
 
-**C1 — Make native the DEFAULT gate; demote VM to a periodic lane.** After A6 (native enforces all
+**C1 — Make native the DEFAULT gate; demote legacy engine to a periodic lane.** After A6 (native enforces all
 three floors), `run_gate` (`project.tks:807`) default flips: `compile_project_g` passes
-`native_gate = true` by default (or `native_gate_of` defaults true unless `--vm-gate` opts out).
-`native.yml`: drop the "Test gate (VM)" step (`native.yml:82`) from the 5 build-test platforms;
-keep ONE nightly/periodic lane running `teko test .` (the VM) over the full corpus for VM regression
-(#265 governance: the VM lane stays as a SEPARATE CI job, not per-PR). `diff-vm-native`
-(`native.yml`) keeps proving VM==native on the 79 `examples/regressions/` fixtures. This realizes
+`native_gate = true` by default (or `native_gate_of` defaults true unless the alternate-gate opt-out flag is passed).
+`native.yml`: drop the legacy engine-gate test step (`native.yml:82`) from the 5 build-test platforms;
+keep ONE nightly/periodic lane running `teko test .` (the legacy engine) over the full corpus for legacy engine regression
+(#265 governance: the legacy engine lane stays as a SEPARATE CI job, not per-PR). `diff-legacy-native`
+(`native.yml`) keeps proving legacy engine==native on the 79 `examples/regressions/` fixtures. This realizes
 the 16m→~5-6m + the memory win. **This is CI-config, gate-able independently, LOW risk once A6
-proves the three native floors match the VM floors on the fixtures (§4 A-parity fixture).**
+proves the three native floors match the legacy engine floors on the fixtures (§4 A-parity fixture).**
 
 ## 3. Type signatures / function shapes (what the implementer adds)
 
-New (codegen.tks): `type CovCtx = struct { on: bool; fn_idx: u64 }`; `fn cov_off() -> CovCtx`;
-`fn emit_cov_line(buf: []byte, ctx: CovCtx, line: u32, indent: str) -> []byte`;
-`fn emit_cov_branch(buf: []byte, ctx: CovCtx, line: u32, col: u32, outcome: u64, indent: str) -> []byte`.
+New (codegen.tks): `type CovCtx = struct { on: bool; fn_idx: u64 }`; `fn cov_off(): CovCtx`;
+`fn emit_cov_line(buf: []byte, ctx: CovCtx, line: u32, indent: str): []byte`;
+`fn emit_cov_branch(buf: []byte, ctx: CovCtx, line: u32, col: u32, outcome: u64, indent: str): []byte`.
 New (teko_rt.h/.c — MAINTAINED runtime seam, permitted C): `void tk_cov_line_at(uint64_t fn, uint32_t line);`
 `void tk_cov_branch_at(uint64_t fn, uint32_t line, uint32_t col, uint64_t outcome);` (delegate to the
 existing `tk_line_id`/`tk_branch_id` packing, bypassing the fn-stack).
@@ -315,17 +317,17 @@ Touched (project.tks): `run_gate_native` (`:791`) calls `coverage_gate_result` n
 `native_function_floor`; delete `native_function_floor` (`:719`); doc-comment truth in
 `run_native_gate` (`:734`). Default flip in `compile_project_g`/`native_gate_of` (Track C).
 Untouched: `line_coverage`/`branch_coverage`/`functions_coverage`/`cov_walk_*`/`cov_merge`
-(engine-independent — they already work once the sinks are populated). The VM's own
-`cov_line`/`cov_branch` marking (`vm.tks:2157/3697/…`) is UNTOUCHED (VM lane unchanged).
+(engine-independent — they already work once the sinks are populated). The legacy engine's own
+`cov_line`/`cov_branch` marking (`the legacy engine`/…`) is UNTOUCHED (legacy engine lane unchanged).
 
 ## 4. Regression fixtures (inputs → expected exit codes)
 
-Add under `examples/regressions/` (the `diff-vm-native` harness set) + `.tkt` gate fixtures. Each
+Add under `examples/regressions/` (the `diff-legacy-native` harness set) + `.tkt` gate fixtures. Each
 runs on BOTH engines during the transition (the diff harness stays), and the NATIVE exit is the
-authority per the VM=dev/native=production ruling.
+authority per the legacy engine=dev/native=production ruling.
 
 1. **cov_line_native_parity** — a fn with N distinct executable lines, a `#test` exercising a
-   subset; assert `line_coverage_pct(native-merged) == line_coverage_pct(vm)`. Native exit 0.
+   subset; assert `line_coverage_pct(native-merged) == line_coverage_pct(legacy engine)`. Native exit 0.
 2. **cov_branch_if_native** — a fn with an `if`/`else` where only the then-branch is tested; the
    branch floor must count 1/2 taken on BOTH engines (proves the synthesized-else outcome-1 mark
    and the A3 site). Under-floor ⇒ nonzero exit (floor failure); at-floor ⇒ 0.
@@ -344,19 +346,19 @@ authority per the VM=dev/native=production ruling.
    all set; a passing test set exits 0 on `teko . -o out --native-gate`; dropping one test below a
    floor exits nonzero with the matching floor message. Proves A6 (native enforces all three).
 8. **A-parity (the Track-C unblock gate)** — over the 79 `examples/regressions/` fixtures, assert
-   `{functions,lines,branches}_coverage_pct` are EQUAL VM-vs-native. This is the fixture the CI flip
-   (C1) waits on: only when native==VM on all three floors across the corpus may the VM lane leave PR.
+   `{functions,lines,branches}_coverage_pct` are EQUAL legacy engine-vs-native. This is the fixture the CI flip
+   (C1) waits on: only when native==legacy engine on all three floors across the corpus may the legacy engine lane leave PR.
 
 ## 5. Ritual points (where the FULL gate must pass) + fixpoint survival
 
 - **After A1** (thread `CovCtx`, all call-sites `cov_off()`): FULL gate. This crumb MUST be
   byte-identical (fixture 6) — it only adds an unused parameter. Gate proves no accidental drift.
 - **After A5** (all instrumentation + `_at` keying): FULL gate on a project WITH `--native-gate`;
-  the native run must populate line/branch sinks and the floors must MATCH the VM (fixtures 1–5).
+  the native run must populate line/branch sinks and the floors must MATCH the legacy engine (fixtures 1–5).
 - **After A6** (native enforces three floors): FULL gate; `run_gate_native` now three-floor. This is
   the #265-closing ritual.
 - **Before C1** (CI flip): fixture 8 (A-parity) GREEN across the 79 fixtures — the mandatory
-  precondition to demote the VM lane (main-integrity: never drop a floor that catches a regression).
+  precondition to demote the legacy engine lane (main-integrity: never drop a floor that catches a regression).
 
 **Fixpoint (gen1.c==gen2.c byte-identity) survival — the non-negotiable invariant.** The fixpoint
 compares the `Program`-mode emission (the release TU). ALL #265 instrumentation is gated on
@@ -365,14 +367,14 @@ ZERO `tk_cov_*` bytes → the release `teko.c` is byte-for-byte unchanged → **
 structurally untouched.** Fixture 6 makes this a REGRESSION-GATED fact, not a hope. The `_at` runtime
 additions (A5) are new SYMBOLS in `teko_rt.c`; they are referenced only by the TestCov TU, never by
 the `Program` TU, so they do not appear in the release emission and cannot perturb the fixpoint. The
-native gate's coverage MERGE (`vm::cov_merge`) is order-independent (dedup'd id sets) → no ordering
+native gate's coverage MERGE (the legacy engine's `cov_merge`) is order-independent (dedup'd id sets) → no ordering
 hazard. **No crumb in this plan touches `emit_program_main` or the `Program` branch of
 `emit_mode_main` — that is the fixpoint oracle and it stays frozen.**
 
 **Coverage-floor survival.** The floors are computed by the SAME engine-independent static walk
 (`line_coverage`/`branch_coverage`) reading the SAME packed ids. Native populates them with the SAME
-`tk_line_id`/`tk_branch_id` packing the VM uses (A2–A5 emit the same `(fn,line)` / `(fn,line,col,
-outcome)` tuples the VM marks). Fixture 8 proves EQUALITY before the VM lane is demoted → the floor
+`tk_line_id`/`tk_branch_id` packing the legacy engine uses (A2–A5 emit the same `(fn,line)` / `(fn,line,col,
+outcome)` tuples the legacy engine marks). Fixture 8 proves EQUALITY before the legacy engine lane is demoted → the floor
 bar cannot silently drop. The `[coverage]` floor VALUES in `teko.tkp` are unchanged.
 
 ## 6. Risks + law tensions (recommended resolution)
@@ -391,13 +393,13 @@ bar cannot silently drop. The `[coverage]` floor VALUES in `teko.tkp` are unchan
   or, worse, a lowered floor to compensate (regression). **Resolution: A3 synthesizes the else mark
   under `ctx.on`; fixture 3 pins 1/2.**
 - **R4 (double cc cost, LOW).** The native gate cc's a second TU (test) alongside the release TU.
-  #249 measures cc at 0.7 s / 2.4% — negligible; the net is still a massive win (kills the 15.6 s VM
-  interpret). Documented in B1; no action.
-- **R5 (law tension — main-integrity vs demoting the VM lane).** `teko-main-integrity-absolute`:
-  never weaken the gate so a regression slips. Demoting the VM lane (C1) is safe ONLY if native
+  #249 measures cc at 0.7 s / 2.4% — negligible; the net is still a massive win (kills the 15.6 s legacy engine
+  run). Documented in B1; no action.
+- **R5 (law tension — main-integrity vs demoting the legacy engine lane).** `teko-main-integrity-absolute`:
+  never weaken the gate so a regression slips. Demoting the legacy engine lane (C1) is safe ONLY if native
   enforces EQUAL floors. **Resolution: fixture 8 (A-parity across 79 fixtures) is the mandatory
-  precondition; the VM lane stays as a nightly job (#265 governance) so VM regressions are still
-  caught. No genuine tension remains — the laws RESOLVE it (equal-or-stronger floors + retained VM
+  precondition; the legacy engine lane stays as a nightly job (#265 governance) so legacy engine regressions are still
+  caught. No genuine tension remains — the laws RESOLVE it (equal-or-stronger floors + retained legacy engine
   nightly).** Not a HALT.
 - **R6 (C7.16 dependency — #168 Phase B).** Full per-context `.tkb` partition is BLOCKED on C7.16.
   **Resolution: B1+B2-lite (process-boundary isolation) deliver the 1595→366 memory win and the

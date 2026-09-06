@@ -1,0 +1,235 @@
+use teko::numeric::bigint
+
+const ASN1_U64_MAX: u64 = 0xFFFFFFFFFFFFFFFF
+
+type Asn1IdentifierRead = struct {
+    tag_class: Asn1Class
+    constructed: bool
+    num: u64
+    pos: u64
+}
+
+type Asn1LengthRead = struct {
+    value: u64
+    pos: u64
+}
+
+type Asn1TlvRead = struct {
+    value: Asn1Value
+    pos: u64
+}
+
+type Asn1ArcRead = struct {
+    value: u64
+    pos: u64
+}
+
+fn decode_error(what: str, pos: u64): error {
+    error { message = concat("asn1: ", what, " at offset ", u64_to_str(pos)) }
+}
+
+fn content_error(what: str): error {
+    error { message = concat("asn1: ", what) }
+}
+
+fn bytes_slice(p: []byte, from: u64, to: u64): []byte {
+    var out: []byte = []
+    var i = from
+    loop {
+        if i >= to { break }
+        out = [..out, p[i]]
+        i++
+    }
+    out
+}
+
+fn decode_base128(p: []byte, pos: u64): Asn1ArcRead | error {
+    var v: u64 = 0
+    var i = pos
+    loop {
+        if i >= p.len { return decode_error("truncated base-128 value", pos) }
+        var b = p[i] to u64
+        if v > (ASN1_U64_MAX >> 7) { return decode_error("base-128 value exceeds 64 bits", pos) }
+        v = (v << 7) | (b & 0x7F)
+        i++
+        if (b & 0x80) == 0 { return Asn1ArcRead { value = v; pos = i } }
+    }
+}
+
+fn decode_identifier(p: []byte, pos: u64): Asn1IdentifierRead | error {
+    if pos >= p.len { return decode_error("unexpected end of input reading identifier", pos) }
+    var b = p[pos] to u64
+    var tag_class = class_of_bits((b >> 6) & 0x3)
+    var constructed = ((b >> 5) & 1) == 1
+    var num5 = b & 0x1F
+    if num5 < 31 { return Asn1IdentifierRead { tag_class = tag_class; constructed = constructed; num = num5; pos = pos + 1 } }
+    var arc = match decode_base128(p, pos + 1) { Asn1ArcRead as r => r; error as e => return e }
+    Asn1IdentifierRead { tag_class = tag_class; constructed = constructed; num = arc.value; pos = arc.pos }
+}
+
+fn read_be_u64(p: []byte, pos: u64, count: u64): u64 {
+    var v: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= count { break }
+        v = (v << 8) | (p[pos + i] to u64)
+        i++
+    }
+    v
+}
+
+fn decode_length(p: []byte, pos: u64): Asn1LengthRead | error {
+    if pos >= p.len { return decode_error("unexpected end of input reading length", pos) }
+    var b = p[pos] to u64
+    if b == 0x80 { return decode_error("indefinite length is not supported", pos) }
+    if b < 128 { return Asn1LengthRead { value = b; pos = pos + 1 } }
+    var nbytes = b & 0x7F
+    if nbytes > 8 { return decode_error("length field wider than 8 bytes is not supported", pos) }
+    if pos + 1 + nbytes > p.len { return decode_error("truncated length", pos) }
+    Asn1LengthRead { value = read_be_u64(p, pos + 1, nbytes); pos = pos + 1 + nbytes }
+}
+
+fn decode_boolean(content: []byte): Asn1Value | error {
+    if content.len != 1 { return content_error("BOOLEAN content must be exactly one byte") }
+    asn1_boolean(content[0] != 0)
+}
+
+fn parse_integer_content(content: []byte): bigint::BigInt | error {
+    if content.len == 0 { return content_error("INTEGER content must not be empty") }
+    if ((content[0] to u64) & 0x80) == 0 { return bigint::from_bytes_be(content) }
+    var raw = bigint::from_bytes_be(content)
+    var full = bigint::shl(bigint::one(), 8 * content.len)
+    bigint::neg(bigint::sub(full, raw))
+}
+
+fn decode_integer(content: []byte): Asn1Value | error {
+    var x = match parse_integer_content(content) { bigint::BigInt as b => b; error as e => return e }
+    asn1_integer(x)
+}
+
+fn decode_bit_string(content: []byte): Asn1Value | error {
+    if content.len == 0 { return content_error("BIT STRING content must not be empty") }
+    var unused = content[0] to u64
+    asn1_bit_string(bytes_slice(content, 1, content.len), unused)
+}
+
+fn decode_null(content: []byte): Asn1Value | error {
+    if content.len != 0 { return content_error("NULL content must be empty") }
+    asn1_null()
+}
+
+fn first_two_arcs(combined: u64): []u64 {
+    var a0: u64 = if combined < 40 { 0 } else { if combined < 80 { 1 } else { 2 } }
+    var out = [a0]
+    [..out, combined - a0 * 40]
+}
+
+fn decode_oid(content: []byte): Asn1Value | error {
+    if content.len == 0 { return content_error("OBJECT IDENTIFIER content must not be empty") }
+    var first = match decode_base128(content, 0) { Asn1ArcRead as r => r; error as e => return e }
+    var arcs = first_two_arcs(first.value)
+    var pos = first.pos
+    loop {
+        if pos >= content.len { break }
+        var next = match decode_base128(content, pos) { Asn1ArcRead as r => r; error as e => return e }
+        arcs = [..arcs, next.value]
+        pos = next.pos
+    }
+    asn1_oid(arcs)
+}
+
+fn decode_utf8_string(content: []byte): Asn1Value | error {
+    var s = match teko::text::str_from_utf8(content) { str as t => t; error as e => return e }
+    asn1_utf8_string(s)
+}
+
+fn decode_printable_string(content: []byte): Asn1Value | error {
+    var s = match teko::text::str_from_utf8(content) { str as t => t; error as e => return e }
+    asn1_printable_string(s)
+}
+
+fn decode_ia5_string(content: []byte): Asn1Value | error {
+    var s = match teko::text::str_from_utf8(content) { str as t => t; error as e => return e }
+    asn1_ia5_string(s)
+}
+
+fn decode_utc_time(content: []byte): Asn1Value | error {
+    var s = match teko::text::str_from_utf8(content) { str as t => t; error as e => return e }
+    asn1_utc_time(s)
+}
+
+fn decode_generalized_time(content: []byte): Asn1Value | error {
+    var s = match teko::text::str_from_utf8(content) { str as t => t; error as e => return e }
+    asn1_generalized_time(s)
+}
+
+fn decode_all(content: []byte): []Asn1Value | error {
+    var items: []Asn1Value = []
+    var pos: u64 = 0
+    loop {
+        if pos >= content.len { break }
+        var r = match decode_tlv(content, pos) { Asn1TlvRead as x => x; error as e => return e }
+        items = [..items, r.value]
+        pos = r.pos
+    }
+    items
+}
+
+fn decode_sequence(content: []byte): Asn1Value | error {
+    var items = match decode_all(content) { []Asn1Value as xs => xs; error as e => return e }
+    asn1_sequence(items)
+}
+
+fn decode_set(content: []byte): Asn1Value | error {
+    var items = match decode_all(content) { []Asn1Value as xs => xs; error as e => return e }
+    asn1_set(items)
+}
+
+fn decode_universal_value(kind: Asn1Tag, content: []byte): Asn1Value | error {
+    if kind == Asn1Tag::Boolean { return decode_boolean(content) }
+    if kind == Asn1Tag::Integer { return decode_integer(content) }
+    if kind == Asn1Tag::BitString { return decode_bit_string(content) }
+    if kind == Asn1Tag::OctetString { return asn1_octet_string(content) }
+    if kind == Asn1Tag::Null { return decode_null(content) }
+    if kind == Asn1Tag::ObjectIdentifier { return decode_oid(content) }
+    if kind == Asn1Tag::Utf8String { return decode_utf8_string(content) }
+    if kind == Asn1Tag::PrintableString { return decode_printable_string(content) }
+    if kind == Asn1Tag::IA5String { return decode_ia5_string(content) }
+    if kind == Asn1Tag::UtcTime { return decode_utc_time(content) }
+    if kind == Asn1Tag::GeneralizedTime { return decode_generalized_time(content) }
+    if kind == Asn1Tag::Sequence { return decode_sequence(content) }
+    decode_set(content)
+}
+
+fn decode_universal(id: Asn1IdentifierRead, content: []byte, end: u64): Asn1TlvRead | error {
+    var kind = match kind_of_universal_tag(id.num) { Asn1Tag as k => k; error as e => return e }
+    var value = match decode_universal_value(kind, content) { Asn1Value as v => v; error as e => return e }
+    Asn1TlvRead { value = value; pos = end }
+}
+
+fn decode_tagged(id: Asn1IdentifierRead, content: []byte, end: u64): Asn1TlvRead | error {
+    if !id.constructed { return Asn1TlvRead { value = asn1_tagged_primitive(id.tag_class, id.num, content); pos = end } }
+    var items = match decode_all(content) { []Asn1Value as xs => xs; error as e => return e }
+    Asn1TlvRead { value = asn1_tagged_constructed(id.tag_class, id.num, items); pos = end }
+}
+
+fn decode_tlv(p: []byte, pos: u64): Asn1TlvRead | error {
+    var id = match decode_identifier(p, pos) { Asn1IdentifierRead as r => r; error as e => return e }
+    var len = match decode_length(p, id.pos) { Asn1LengthRead as r => r; error as e => return e }
+    var start = len.pos
+    var end = start + len.value
+    if end > p.len { return decode_error("truncated content", start) }
+    var content = bytes_slice(p, start, end)
+    if id.tag_class != Asn1Class::Universal { return decode_tagged(id, content, end) }
+    decode_universal(id, content, end)
+}
+
+/**
+ * Decodes a complete DER/BER document: exactly one top-level TLV, with any trailing bytes
+ * reported as a checked error (an ASN.1-encoded value is a single top-level TLV).
+ */
+exp fn der_decode(bytes: []byte): Asn1Value | error {
+    var r = match decode_tlv(bytes, 0) { Asn1TlvRead as x => x; error as e => return e }
+    if r.pos != bytes.len { return decode_error("trailing bytes after top-level value", r.pos) }
+    r.value
+}

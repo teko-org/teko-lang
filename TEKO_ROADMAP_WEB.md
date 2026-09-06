@@ -39,8 +39,8 @@ comments are already parsed (`has_doc`/`doc`), so OpenAPI/descriptions can reuse
 interfaces (W10b.IF ✅). **Files:** `src/web/router.tks`, `src/web/context.tks`.
 ```teko
 type Context = struct { /* request, response writer, path params, values */ }
-type Handler    = interface { fn handle(self, ctx: Ref<Context>) -> error? }
-type Middleware = interface { fn wrap(self, next: Handler) -> Handler }
+type Handler    = interface { fn handle(self, ctx: Ref<Context>): error? }
+type Middleware = interface { fn wrap(self, next: Handler): Handler }
 ```
 Route table (static + `:param` + `*wildcard`), method dispatch, 404/405, param extraction, a
 `ServeMux`/`Router` that composes a middleware chain around a `Handler`. **The composability backbone** —
@@ -83,7 +83,7 @@ typed response encoded by content negotiation. The single biggest ergonomics win
 structural-`trait` decision.** **Verify:** `.tkt` binding + validation-failure → 400 problem+json.
 
 **▪ W9 — OpenAPI generation (PACKAGE).** **Deps:** W0, W8, **TRAITS (schema)**, doc-comments. Emit an OpenAPI 3.1
-spec from routes + typed handlers + doc-comments; optional Swagger-UI static serve. API-first. **Verify:**
+spec from routes + typed handlers + doc-comments. API-first. **Verify:**
 `.tkt` spec snapshot for a sample API.
 
 **▪ W10 — GraphQL (PACKAGE).** **Deps:** W0, S-JSON. Schema type system, query parser, executor +
@@ -136,6 +136,6 @@ W9 OpenAPI, W10 GraphQL, W11, W14, and any full opinionated framework composing 
 2. **stdlib/package split** above — confirm the boundary.
 3. **Handler result shape:** handler returns `error?` writing to `Ctx` (rec, Go-style) vs returning a typed
    `Response` value the framework writes.
-4. **Middleware model:** `interface`-based `wrap(next) -> Handler` (rec) vs closure `(Handler) -> Handler`.
+4. **Middleware model:** `interface`-based `wrap(next): Handler` (rec) vs closure `(Handler): Handler`.
 5. **Full web framework:** keep it a first-party PACKAGE built on W0–W8 (rec), not stdlib — so the small
    surface (M.0) holds and consumers opt in via the registry.

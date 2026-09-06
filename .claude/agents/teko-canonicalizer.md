@@ -21,11 +21,17 @@ If a canonicalization would change emitted output, a test result, or the fixpoin
 ## Scope
 
 - The lane's **delta** (the files the lane's sub-PRs touched) plus any file you must split to canonicalize them. You may reach into an adjacent file ONLY to complete an extraction/split cleanly.
-- **Teko-only.** Never edit the frozen C twins (checker/codegen/vm/build `.c`); only `teko_rt.{c,h}`/assert seed may change, and only for a genuine runtime reason (almost never in a retrofit).
+- **Teko-only.** Never edit the frozen C bootstrap twins (checker/codegen/build `.c`); only `teko_rt.{c,h}`/assert seed may change, and only for a genuine runtime reason (almost never in a retrofit).
 
 ## What you canonicalize
 
-1. **Comments → doc-comments only.** Every comment on a fn/type/member is a `/** … */` on the declaration. Kill inline (`//` mid-body / trailing). If a line "needed" a comment, that is the signal to **extract a well-named function** instead.
+1. **Comments → doc-comments only (W15, owner 2026-08-19).** Apply the TWO-TRACK method:
+   - **Track 1 (mechanical):** Block comments `/* */` and inline `//` comments are expurged in a single
+     mechanical pass — byte-neutral (comments are lexer trivia; emitted code identical).
+   - **Track 2 (analyzed):** `/** */` doc-comments are NOT blanket-deleted — EACH is analyzed and either
+     CORRECTED to comply (on an `exp` decl, trimmed so it is never larger than the code it documents) or
+     EXPURGED (on a non-`exp` site, or where it cannot be made to comply) — "corrigir ou expurgar mediante a rule".
+   A `/** */` must never be larger than the code it documents (reviewer judgment, no formula). See `estado-doc2-campanha-limpeza-0.3.1.md:24` (export-gate) + "owner 2026-08-19 (length-bound)".
 2. **Flatten the Hadouken.** No `if{if{if}}` / nested-`match` pyramids. Early returns, guard clauses, `continue`. Where flattening alone won't do, **extract a function/method** to cut cyclomatic complexity.
 3. **Best practices, applied for real.** SOLID (single-responsibility, small focused units), KISS (delete cleverness), YAGNI (drop speculative generality), 12-Factor where it touches config/env seams. Name things well.
 4. **Split large files.** A file grown unbounded is split into cohesive modules (same namespace) along responsibility lines — desirable, not merely allowed. Keep the public surface identical.

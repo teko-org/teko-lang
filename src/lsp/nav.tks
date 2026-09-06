@@ -1,0 +1,176 @@
+use teko::encoding::json
+use teko::parser
+use teko::lexer
+
+fn num_field(v: @JsonValue(), key: str): f64 | null {
+    var fv = match object_field(v, key) { (@JsonValue()) as x => x; null => return null }
+    match fv {
+        json::JsonNumber as n => n.value
+        _ => null
+    }
+}
+
+fn position_of(req: @JsonValue()): Pos | null {
+    var params = match object_field(req, "params") { (@JsonValue()) as v => v; null => return null }
+    var pos = match object_field(params, "position") { (@JsonValue()) as v => v; null => return null }
+    var line = match num_field(pos, "line") { f64 as v => v; null => return null }
+    var character = match num_field(pos, "character") { f64 as v => v; null => return null }
+    Pos { line = line to u32; col = character to u32 }
+}
+
+fn word_at_position(text: str, line0: u32, char0: u32): str | null {
+    var tokens = match lexer::tokenize(text) { []lexer::Token as t => t; error => return null }
+    var line1 = line0 + 1
+    var col1 = char0 + 1
+    var i: u64 = 0
+    loop {
+        if i >= tokens.len { break }
+        var t = tokens[i]
+        if t.kind == lexer::TokenKind::Ident && t.line == line1 {
+            var start = t.col
+            var end = t.col + (t.text.len to u32)
+            if col1 >= start && col1 < end { return t.text }
+        }
+        i = i + 1
+    }
+    null
+}
+
+fn symbol_named(syms: []Symbol, name: str): Symbol | null {
+    var i: u64 = 0
+    loop {
+        if i >= syms.len { break }
+        if syms[i].name == name { return syms[i] }
+        i = i + 1
+    }
+    null
+}
+
+fn resolve_symbol_at(path: str, text: str, line0: u32, char0: u32): Symbol | null {
+    var word = match word_at_position(text, line0, char0) { str as w => w; null => return null }
+    var prog = match document_program(path, text) { parser::Program as p => p; error => return null }
+    symbol_named(build_symbol_index(prog), word)
+}
+
+fn hover_contents(sym: Symbol): @JsonValue() {
+    var code = teko::str::concat("```teko\n", sym.signature, "\n```")
+    var value = if sym.doc.len > 0 { teko::str::concat(code, "\n\n", sym.doc) } else { code }
+    jobj(["kind", "value"], [jstr("markdown"), jstr(value)])
+}
+
+fn path_to_uri(path: str): str {
+    teko::str::concat("file://", path)
+}
+
+fn symbol_range(sym: Symbol): @JsonValue() {
+    var line0 = if sym.line > 0 { sym.line - 1 } else { 0 }
+    var col0 = if sym.col > 0 { sym.col - 1 } else { 0 }
+    var end_col = col0 + (sym.name.len to u32)
+    jobj(["start", "end"], [encode_position(line0, col0), encode_position(line0, end_col)])
+}
+
+fn definition_location(sym: Symbol): @JsonValue() {
+    jobj(["uri", "range"], [jstr(path_to_uri(sym.file)), symbol_range(sym)])
+}
+
+fn navigation_symbol(store: DocStore, req: @JsonValue()): Symbol | null {
+    var uri = match format_uri(req) { str as u => u; null => return null }
+    var text = match store_get(store, uri) { str as t => t; null => return null }
+    var pos = match position_of(req) { Pos as p => p; null => return null }
+    resolve_symbol_at(uri_to_path(uri), text, pos.line, pos.col)
+}
+
+fn hover_response(store: DocStore, req: @JsonValue()): Dispatch {
+    var id = request_id(req)
+    match navigation_symbol(store, req) {
+        Symbol as sym => dispatch_of(store, one_message(response(id, jobj(["contents"], [hover_contents(sym)]))))
+        null => dispatch_of(store, one_message(response(id, jnull())))
+    }
+}
+
+fn definition_response(store: DocStore, req: @JsonValue()): Dispatch {
+    var id = request_id(req)
+    match navigation_symbol(store, req) {
+        Symbol as sym => dispatch_of(store, one_message(response(id, definition_location(sym))))
+        null => dispatch_of(store, one_message(response(id, jnull())))
+    }
+}
+
+fn completion_kind_code(kind: SymKind): f64 {
+    match kind {
+        SymKind::Function => 3.0
+        SymKind::Method => 2.0
+        SymKind::Type => 7.0
+        SymKind::Const => 21.0
+        SymKind::Field => 5.0
+    }
+}
+
+fn symbol_completion_item(sym: Symbol): @JsonValue() {
+    var keys: []str = ["label", "kind", "detail"]
+    var values: []@JsonValue() = [jstr(sym.name), jnum(completion_kind_code(sym.kind)), jstr(sym.signature)]
+    if sym.doc.len > 0 {
+        keys = [..keys, "documentation"]
+        values = [..values, jstr(sym.doc)]
+    }
+    jobj(keys, values)
+}
+
+fn symbol_completion_items(syms: []Symbol): []@JsonValue() {
+    var out: []@JsonValue() = []
+    var i: u64 = 0
+    loop {
+        if i >= syms.len { break }
+        out = [..out, symbol_completion_item(syms[i])]
+        i = i + 1
+    }
+    out
+}
+
+const RESERVED_KEYWORDS: []str = [
+    "fn", "type", "struct", "enum", "flags", "variant", "const",
+    "if", "else", "loop", "break", "continue", "return", "defer", "match", "when",
+    "in", "as", "to", "use", "pub", "exp", "extern", "true", "false", "null",
+    "class", "abstract", "virtual", "override", "intern", "interface"
+]
+
+fn keyword_completion_item(word: str): @JsonValue() {
+    jobj(["label", "kind"], [jstr(word), jnum(14.0)])
+}
+
+fn keyword_completion_items(): []@JsonValue() {
+    var out: []@JsonValue() = []
+    var i: u64 = 0
+    loop {
+        if i >= RESERVED_KEYWORDS.len { break }
+        out = [..out, keyword_completion_item(RESERVED_KEYWORDS[i])]
+        i = i + 1
+    }
+    out
+}
+
+fn append_all(head: []@JsonValue(), extra: []@JsonValue()): []@JsonValue() {
+    var out = head
+    var i: u64 = 0
+    loop {
+        if i >= extra.len { break }
+        out = [..out, extra[i]]
+        i = i + 1
+    }
+    out
+}
+
+fn document_completion_items(store: DocStore, req: @JsonValue()): []@JsonValue() {
+    var uri = match format_uri(req) { str as u => u; null => return [] }
+    var keywords = keyword_completion_items()
+    var text = match store_get(store, uri) { str as t => t; null => return keywords }
+    match document_program(uri_to_path(uri), text) {
+        parser::Program as prog => append_all(keywords, symbol_completion_items(build_symbol_index(prog)))
+        error => keywords
+    }
+}
+
+fn completion_response(store: DocStore, req: @JsonValue()): Dispatch {
+    var id = request_id(req)
+    dispatch_of(store, one_message(response(id, jarr(document_completion_items(store, req)))))
+}

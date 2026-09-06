@@ -1,0 +1,33 @@
+# const.tkr — the compile-time-constant channel: two members, one native build, each addressed by
+# NAME through `scenario` (main.tks + src/scenario.tks, the own_native member convention). The
+# fingerprints (46, 96) are route-independent, so the members share the default native build; a value
+# that drifted through canonicalization or the rodata serializer moves its member's number and names
+# itself in the `scenario` panic.
+
+Feature: const — a struct-ctor const and a fat-element slice const each materialize their exact value
+
+  # (const_struct_ctor) a STRUCT const initialized by an allowlisted COMPTIME CONSTRUCTOR CALL
+  # (`const RAX: Reg = preg(3 + 4, 3)`), the exact shape the compiler's own backends use for their
+  # physical-register consts. The checker canonicalizes the FOLD'S OUTPUT (`canonicalize_const_ctors`)
+  # into the struct literal the constructor's body builds, so the LIR's rodata materializer keeps
+  # seeing only the aggregate literal it already knows how to serialize; without that step the build
+  # dies with "const struct: initializer is not a struct literal". The score is
+  # `id * 6 + klass + is_phys` = `7 * 6 + 3 + 1` = 46: it reads back the folded argument (`3 + 4` -> 7),
+  # the literal argument (3) and the constructor body's own `is_phys = true`, so no field can be
+  # dropped, reordered or re-valued without failing this member.
+  Scenario: const_struct_ctor — a struct const built by a comptime constructor call materializes 46
+    When built and run
+    Then stdout pattern = "scenario const_struct_ctor: ok"
+
+  # (const_slice_of_str) an AGGREGATE const whose ELEMENT is FAT, pinned in two measured degraus:
+  # (1) the rodata image (`src/lir/lower_const.tks`) — the serializer only knew flat scalar elements, so
+  # `const TABLE: []str = [...]` stopped with "slice element is pointer/slice-bearing"; (2) the fold
+  # termination (`src/checker/comptime_fold.tks`) — `TABLE[0]` over a non-integer-literal element
+  # recursed `fold_index -> fold_splice -> fold_children -> fold_index` (a compiler SEGFAULT on both
+  # routes). The score reads lengths AND content at three nesting levels (`[]str`, `[][]str`, a struct's
+  # `[]str` field) by two lowering paths (constant and variable index): 23 (TABLE) + 35 (GRID) +
+  # 18 (DESC) + 20 (membership) = 96, so a doubled `.len`, a swapped leaf, a mis-offset relocation or a
+  # wrong element stride moves the number.
+  Scenario: const_slice_of_str — a const slice with fat elements materializes 96
+    When built and run
+    Then stdout pattern = "scenario const_slice_of_str: ok"

@@ -1,13 +1,9 @@
-// src/lexer/lexer.tks   (namespace 'teko::lexer') — the complete scanner.
 
-// A read result: the token produced + where scanning stopped. (A struct because
-// Teko has no tuples; it packages result + new state.)
 type Scan = struct {
     token: Token
     next: u64
 }
 
-// A decoded escape / a byte-literal value: the byte + the pos after it.
 type EscByte = struct {
     value: byte
     next: u64
@@ -17,30 +13,23 @@ type ByteVal = struct {
     next: u64
 }
 
-// A source LOCATION: the 1-based (line, col) of a byte. (A struct because Teko has
-// no tuples — it packages the two out-params of compute_loc.)
 type Loc = struct {
     line: u32
     col: u32
 }
 
-// --- byte access ---
 
-// the byte at p, or 0 if out of bounds (a safe peek for look-ahead — maximal munch).
-fn at(source: str, p: u64) -> byte {
+fn at(source: str, p: u64): byte {
     if p >= source.len { return 0 }
     source[p]
 }
 
-// --- source LOCATION: the 1-based (line, col) of byte `pos` (for token stamping +
-//     file:line:col diagnostics — M.3 honest about WHERE). O(pos) scan; the bootstrap
-//     files are small (M.5 — a line table is a later optimization, not needed now). ---
 
-fn compute_loc(source: str, pos: u64) -> Loc {
-    mut line: u32 = 1
-    mut col: u32 = 1
-    let limit = if pos < source.len { pos } else { source.len }
-    mut i: u64 = 0
+fn compute_loc(source: str, pos: u64): Loc {
+    var line: u32 = 1
+    var col: u32 = 1
+    var limit = if pos < source.len { pos } else { source.len }
+    var i: u64 = 0
     loop {
         if i >= limit { break }
         if source[i] == b'\n' { line = line + 1; col = 1 } else { col = col + 1 }
@@ -49,74 +38,44 @@ fn compute_loc(source: str, pos: u64) -> Loc {
     Loc { line = line; col = col }
 }
 
-// stamp a token with an ALREADY-COMPUTED 1-based (line, col). `tokenize` threads a location
-// cursor that advances MONOTONICALLY with the token-start position, so each source byte is
-// crossed exactly once across the whole file — O(1) amortized per token (a line table without
-// the table). The old per-token compute_loc rescan was O(pos), i.e. O(N²) over a file.
-fn stamp_loc(tok: Token, line: u32, col: u32) -> Token {
-    Token { kind = tok.kind; text = tok.text; line = line; col = col }
+fn stamp_loc(tok: Token, line: u32, col: u32, byte_off: u64, file: str): Token {
+    Token { kind = tok.kind; text = tok.text; line = line; col = col; byte_off = byte_off; file = file }
 }
 
-// a LOCATED lexer error: "line:col: msg" at byte `pos` (the file is prepended later by the
-// driver/assemble — same shape as parse errors, so lexer errors carry file:line:col too — M.3).
-fn scan_err_at(source: str, pos: u64, msg: str) -> error {
-    let loc = compute_loc(source, pos)
+fn scan_err_at(source: str, pos: u64, msg: str): error {
+    var loc = compute_loc(source, pos)
     error { message = $"{loc.line}:{loc.col}: {msg}" }
 }
 
-// --- predicates (pure, over a single byte; ASCII syntax → byte literals) ---
 
-fn is_digit(c: byte) -> bool {
+fn is_digit(c: byte): bool {
     c >= b'0' && c <= b'9'
 }
 
-fn is_hex_digit(c: byte) -> bool {
+fn is_hex_digit(c: byte): bool {
     is_digit(c) || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F')
 }
 
-fn is_alpha(c: byte) -> bool {
+fn is_alpha(c: byte): bool {
     (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z')
 }
 
-fn is_ident_continue(c: byte) -> bool {
+fn is_ident_continue(c: byte): bool {
     is_alpha(c) || is_digit(c) || c == b'_'
 }
 
-/**
- * is_upper_uc — is `c` an ASCII upper-case letter (`[A-Z]`)? The lead-character class of an
- * UPPER_SNAKE loop label (#517).
- *
- * @param c  the byte to classify
- * @return   true iff `c` lies in `A`..`Z`
- */
-fn is_upper_uc(c: byte) -> bool {
+fn is_upper_uc(c: byte): bool {
     c >= b'A' && c <= b'Z'
 }
 
-/**
- * is_upper_snake_continue — is `c` a legal NON-lead UPPER_SNAKE character (`[A-Z0-9_]`)? The
- * tail-character class of an UPPER_SNAKE loop label (#517).
- *
- * @param c  the byte to classify
- * @return   true iff `c` is an upper-case letter, a digit, or an underscore
- */
-fn is_upper_snake_continue(c: byte) -> bool {
+fn is_upper_snake_continue(c: byte): bool {
     is_upper_uc(c) || is_digit(c) || c == b'_'
 }
 
-/**
- * is_upper_snake — does `text` match the UPPER_SNAKE identifier grammar `[A-Z][A-Z0-9_]*`, the
- * ONLY legal loop-label form (#517)? An empty string is rejected; the first byte must be an
- * upper-case letter and every following byte an upper-case letter, digit, or underscore. A
- * lower-case letter, a leading underscore or digit, and any other byte all fail.
- *
- * @param text  the candidate label text
- * @return      true iff `text` is a non-empty UPPER_SNAKE identifier
- */
-pub fn is_upper_snake(text: str) -> bool {
+pub fn is_upper_snake(text: str): bool {
     if text.len == 0 { return false }
     if !is_upper_uc(text[0]) { return false }
-    mut i: u64 = 1
+    var i: u64 = 1
     loop {
         if i >= text.len { break }
         if !is_upper_snake_continue(text[i]) { return false }
@@ -125,23 +84,20 @@ pub fn is_upper_snake(text: str) -> bool {
     true
 }
 
-// --- whitespace & comments (pure: take pos, return the new pos) ---
 
-// skip spaces/tabs/CR — NOT newlines (a newline is a significant token, B.26).
-fn skip_spaces(source: str, pos: u64) -> u64 {
-    mut p = pos
+fn skip_spaces(source: str, pos: u64): u64 {
+    var p = pos
     loop {
         if p >= source.len { break }
-        let c = source[p]
+        var c = source[p]
         if c != b' ' && c != b'\t' && c != b'\r' { break }
         p++
     }
     p
 }
 
-// skip a `//` line comment: advance to the newline (or end), leaving it for the loop.
-fn skip_line(source: str, pos: u64) -> u64 {
-    mut p = pos
+fn skip_line(source: str, pos: u64): u64 {
+    var p = pos
     loop {
         if p >= source.len { break }
         if source[p] == b'\n' { break }
@@ -150,9 +106,8 @@ fn skip_line(source: str, pos: u64) -> u64 {
     p
 }
 
-// skip a block comment `/* … */` (not nested); returns the pos after the `*/`.
-fn skip_block_comment(source: str, pos: u64) -> u64 | error {
-    mut p = pos + 2   // past `/*`
+fn skip_block_comment(source: str, pos: u64): u64 | error {
+    var p = pos + 2
     loop {
         if p + 1 >= source.len { return error { message = "unterminated block comment" } }
         if source[p] == b'*' && source[p + 1] == b'/' { return p + 2 }
@@ -160,33 +115,29 @@ fn skip_block_comment(source: str, pos: u64) -> u64 | error {
     }
 }
 
-// read a DOC comment `/** … */` → a Doc token spanning the whole comment.
-fn read_doc_comment(source: str, pos: u64) -> Scan | error {
-    mut p = pos + 3   // past `/**`
+fn read_doc_comment(source: str, pos: u64): Scan | error {
+    var p = pos + 3
     loop {
         if p + 1 >= source.len { return error { message = "unterminated doc comment" } }
         if source[p] == b'*' && source[p + 1] == b'/' {
-            let end = p + 2
-            return Scan { token = Token { kind = TokenKind::Doc; text = slice(source, pos, end); line = 0; col = 0 }; next = end }
+            var end = p + 2
+            return Scan { token = Token { kind = TokenKind::Doc; text = source.slice(pos, end); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = end }
         }
         p++
     }
 }
 
-// --- a token spanning n bytes from pos (the common Scan builder) ---
 
-fn sym(source: str, pos: u64, n: u64, kind: TokenKind) -> Scan {
-    Scan { token = Token { kind = kind; text = slice(source, pos, pos + n); line = 0; col = 0 }; next = pos + n }
+fn sym(source: str, pos: u64, n: u64, kind: TokenKind): Scan {
+    Scan { token = Token { kind = kind; text = source.slice(pos, pos + n); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = pos + n }
 }
 
-// --- numbers & identifiers ---
 
-// a run of digits, allowing `_` as a separator BETWEEN digits (B.28): `1_000`.
-fn scan_digits(source: str, pos: u64) -> u64 {
-    mut p = pos
+fn scan_digits(source: str, pos: u64): u64 {
+    var p = pos
     loop {
         if p >= source.len { break }
-        let c = source[p]
+        var c = source[p]
         if is_digit(c) { p++; continue }
         if c == b'_' {
             if p + 1 < source.len && is_digit(at(source, p + 1)) { p++; continue }
@@ -196,49 +147,41 @@ fn scan_digits(source: str, pos: u64) -> u64 {
     p
 }
 
-// a Number token — integer (`123`, `1_000`) OR float (`3.14`, `1.5e3`, `1e9`) (N1 —
-// TEKO_CORRECTION_PLAN §5). The token stays TokenKind::Number carrying the raw text;
-// the int-vs-float decision is made by the literal decoders (lit_is_float). No float
-// SUFFIXES (`1.5f`): the default is f64, an annotation picks f16/f32.
-fn read_number(source: str, pos: u64) -> Scan {
-    // hex `0x…` / binary `0b…` integer literals (B.28; no fraction/exponent). `_` may
-    // separate digits. The raw text (incl the prefix) rides the token; lit_int decodes.
+fn read_number(source: str, pos: u64): Scan {
     if at(source, pos) == b'0' && (at(source, pos + 1) == b'x' || at(source, pos + 1) == b'X') {
-        mut h = pos + 2
+        var h = pos + 2
         loop {
             if h >= source.len { break }
-            let c = source[h]
+            var c = source[h]
             if is_hex_digit(c) { h++; continue }
             if c == b'_' {
                 if h + 1 < source.len && is_hex_digit(at(source, h + 1)) { h++; continue }
             }
             break
         }
-        return Scan { token = Token { kind = TokenKind::Number; text = slice(source, pos, h); line = 0; col = 0 }; next = h }
+        return Scan { token = Token { kind = TokenKind::Number; text = source.slice(pos, h); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = h }
     }
     if at(source, pos) == b'0' && (at(source, pos + 1) == b'b' || at(source, pos + 1) == b'B') && is_bin_body_start(at(source, pos + 2)) {
-        mut bp = pos + 2
+        var bp = pos + 2
         loop {
             if bp >= source.len { break }
-            let c = source[bp]
+            var c = source[bp]
             if c == b'0' || c == b'1' { bp++; continue }
             if c == b'_' {
                 if bp + 1 < source.len && (at(source, bp + 1) == b'0' || at(source, bp + 1) == b'1') { bp++; continue }
             }
             break
         }
-        return Scan { token = Token { kind = TokenKind::Number; text = slice(source, pos, bp); line = 0; col = 0 }; next = bp }
+        return Scan { token = Token { kind = TokenKind::Number; text = source.slice(pos, bp); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = bp }
     }
-    mut p = scan_digits(source, pos)   // integer part
+    var p = scan_digits(source, pos)
 
-    // fractional part: a `.` FOLLOWED BY a digit (so `1.method` / `1..=` stay ints).
     if at(source, p) == b'.' && is_digit(at(source, p + 1)) {
         p = scan_digits(source, p + 1)
     }
 
-    // exponent: `[eE][+-]?<digits>` — only consume `e` if a valid exponent follows.
     if at(source, p) == b'e' || at(source, p) == b'E' {
-        mut q = p + 1
+        var q = p + 1
         if at(source, q) == b'+' || at(source, q) == b'-' { q = q + 1 }
         if is_digit(at(source, q)) {
             p = scan_digits(source, q)
@@ -246,55 +189,31 @@ fn read_number(source: str, pos: u64) -> Scan {
     }
 
     if at(source, p) == b'b' && at(source, p + 1) == b'i' && !is_ident_continue(at(source, p + 2)) {
-        return Scan { token = Token { kind = TokenKind::Number; text = slice(source, pos, p + 2); line = 0; col = 0 }; next = p + 2 }
+        return Scan { token = Token { kind = TokenKind::Number; text = source.slice(pos, p + 2); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + 2 }
     }
     if at(source, p) == b'd' && !is_ident_continue(at(source, p + 1)) {
-        return Scan { token = Token { kind = TokenKind::Number; text = slice(source, pos, p + 1); line = 0; col = 0 }; next = p + 1 }
+        return Scan { token = Token { kind = TokenKind::Number; text = source.slice(pos, p + 1); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + 1 }
     }
 
-    Scan { token = Token { kind = TokenKind::Number; text = slice(source, pos, p); line = 0; col = 0 }; next = p }
+    Scan { token = Token { kind = TokenKind::Number; text = source.slice(pos, p); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p }
 }
 
-/**
- * is_bin_body_start — may `c` begin the body of a binary literal after the `0b` prefix (a binary
- * digit or a `_` group separator)? This GUARDS the binary-literal branch so `0b` NOT followed by a
- * binary digit (e.g. `0bi`) is not mistaken for a binary literal, letting the `bi`/`d` suffix path
- * treat it as an arbitrary-precision literal instead. A real binary literal always has a digit here.
- *
- * @param c  the byte after the `0b` prefix
- * @return   true iff `c` is `0`, `1`, or `_`
- */
-fn is_bin_body_start(c: byte) -> bool {
+fn is_bin_body_start(c: byte): bool {
     c == b'0' || c == b'1' || c == b'_'
 }
 
-fn read_ident(source: str, pos: u64) -> Scan {
-    mut p = pos
+fn read_ident(source: str, pos: u64): Scan {
+    var p = pos
     loop {
         if p >= source.len { break }
         if !is_ident_continue(source[p]) { break }
         p++
     }
-    Scan { token = Token { kind = TokenKind::Ident; text = slice(source, pos, p); line = 0; col = 0 }; next = p }
+    Scan { token = Token { kind = TokenKind::Ident; text = source.slice(pos, p); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p }
 }
 
-/**
- * read_underscore — lex a token that starts with `_`, enforcing the write-only discard rules
- * (owner ruling 2026-07-15). A run of underscores immediately followed by a LETTER is an
- * ordinary identifier (`_foo`, `__bar`, `_x_1`), read whole from the first underscore. A PURE
- * run of underscores is the discard: a single `_` is the `Underscore` token; two or more in a
- * row (`__`, `___`) are rejected outright. A run of underscores followed by a DIGIT carries no
- * letter, so it matches neither the identifier grammar `[_]*[a-zA-Z]+[a-zA-Z0-9_]*` nor the
- * lone discard, and is likewise rejected.
- *
- * @param source  the whole source text
- * @param pos     the byte offset of the leading `_`
- * @return        the `Scan` for the identifier, or the single `Underscore` token
- * @throws        when the run is two-or-more pure underscores (`__`), or an underscore run is
- *                immediately followed by a digit (a letterless, non-identifier token)
- */
-fn read_underscore(source: str, pos: u64) -> Scan | error {
-    mut p = pos
+fn read_underscore(source: str, pos: u64): Scan | error {
+    var p = pos
     loop {
         if p >= source.len { break }
         if source[p] != b'_' { break }
@@ -312,32 +231,14 @@ fn read_underscore(source: str, pos: u64) -> Scan | error {
     sym(source, pos, 1, TokenKind::Underscore)
 }
 
-// --- keywords (an ident whose text matches the table — B.19) ---
 
-/**
- * Classifies an already-scanned identifier's text as a reserved keyword's TokenKind,
- * or `TokenKind::Ident` if it is not reserved.
- *
- * A number of words are deliberately ABSENT from this table because they are
- * CONTEXTUAL keywords — significant only in specific syntactic positions, and a
- * plain `Ident` everywhere else (so they stay legal identifiers/path segments):
- * `from` (see token.tks), `params`/`self`/`base` (see token.tks's W10b.CLASS note),
- * and `unsafe` (U1, 0.1.0.0-beta memory+unsafe remodel §3 — a declaration modifier
- * on `type`/`fn`; staying contextual is what keeps `teko::mem::unsafe` legal as a
- * `::`-path segment).
- *
- * @param str text  the scanned identifier's exact text
- * @return TokenKind  the matching reserved-keyword TokenKind, or `TokenKind::Ident`
- */
-fn keyword_kind(text: str) -> TokenKind {
+fn keyword_kind(text: str): TokenKind {
     if text == "fn" { return TokenKind::Fn }
     if text == "type" { return TokenKind::Type }
     if text == "struct" { return TokenKind::Struct }
     if text == "enum" { return TokenKind::Enum }
     if text == "flags" { return TokenKind::Flags }
     if text == "variant" { return TokenKind::Variant }
-    if text == "let" { return TokenKind::Let }
-    if text == "mut" { return TokenKind::Mut }
     if text == "const" { return TokenKind::Const }
     if text == "if" { return TokenKind::If }
     if text == "else" { return TokenKind::Else }
@@ -345,43 +246,46 @@ fn keyword_kind(text: str) -> TokenKind {
     if text == "break" { return TokenKind::Break }
     if text == "continue" { return TokenKind::Continue }
     if text == "return" { return TokenKind::Return }
-    if text == "defer" { return TokenKind::Defer }   // scoped cleanup block (C7.18)
+    if text == "defer" { return TokenKind::Defer }
     if text == "match" { return TokenKind::Match }
     if text == "when" { return TokenKind::When }
-    if text == "in" { return TokenKind::In }   // the membership operator (x in [ … ]) — Phase 2
+    if text == "in" { return TokenKind::In }
     if text == "as" { return TokenKind::As }
-    if text == "to" { return TokenKind::To }   // the cast operator (x to T) — F1/E7
+    if text == "to" { return TokenKind::To }
     if text == "use" { return TokenKind::Use }
-    if text == "pub" { return TokenKind::Pub }   // public within the project (B.9)
+    if text == "pub" { return TokenKind::Pub }
     if text == "exp" { return TokenKind::Exp }
-    if text == "extern" { return TokenKind::Extern }   // foreign-function declarator (C7.1a)
-    if text == "true" { return TokenKind::True }   // bool literal (LEGISLATION §75)
-    if text == "false" { return TokenKind::False }   // bool literal (LEGISLATION §75)
-    if text == "null" { return TokenKind::Null }   // null literal (REBOOT_PLAN §202)
-    if text == "class" { return TokenKind::Class }   // W10b.CLASS (2026-07-01)
+    if text == "extern" { return TokenKind::Extern }
+    if text == "true" { return TokenKind::True }
+    if text == "false" { return TokenKind::False }
+    if text == "null" { return TokenKind::Null }
+    if text == "class" { return TokenKind::Class }
     if text == "abstract" { return TokenKind::Abstract }
     if text == "virtual" { return TokenKind::Virtual }
     if text == "override" { return TokenKind::Override }
     if text == "intern" { return TokenKind::Intern }
-    if text == "interface" { return TokenKind::Interface }   // (W10b.IF)
-    // `params` is deliberately NOT here — it's a contextual keyword like `from` (see token.tks).
-    // `self`/`base` are likewise deliberately NOT here — see token.tks's W10b.CLASS note.
+    if text == "interface" { return TokenKind::Interface }
+    if text == "self" { return TokenKind::SelfKw }
+    if text == "base" { return TokenKind::Base }
+    if text == "static" { return TokenKind::Static }
+    if text == "global" { return TokenKind::Global }
+    if text == "service" { return TokenKind::Service }
+    if text == "macro" { return TokenKind::Macro }
+    if text == "comptime" { return TokenKind::Comptime }
     TokenKind::Ident
 }
 
-fn keyword_or_ident(source: str, pos: u64) -> Scan {
-    let s = read_ident(source, pos)
-    let k = keyword_kind(s.token.text)
-    Scan { token = Token { kind = k; text = s.token.text; line = 0; col = 0 }; next = s.next }
+fn keyword_or_ident(source: str, pos: u64): Scan {
+    var s = read_ident(source, pos)
+    var k = keyword_kind(s.token.text)
+    Scan { token = Token { kind = k; text = s.token.text; line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = s.next }
 }
 
-// --- escapes & fresh-byte → str (reference-deferred; see the note above) ---
 
-// decode `\` + one byte → the byte; the set is the structural minimum (it can grow).
-fn escape_byte(source: str, pos: u64) -> EscByte | error {
-    let after = pos + 1
+fn escape_byte(source: str, pos: u64): EscByte | error {
+    var after = pos + 1
     if after >= source.len { return error { message = "unterminated escape" } }
-    let v = match source[after] {
+    var v = match source[after] {
         b'n' => 0x0A
         b't' => 0x09
         b'r' => 0x0D
@@ -391,13 +295,12 @@ fn escape_byte(source: str, pos: u64) -> EscByte | error {
         b'0' => 0x00
         _ => return error { message = "unknown escape" }
     }
-    EscByte { value = v to byte; next = after + 1 }   // the escape table yields int literals; the field is a byte
+    EscByte { value = v to byte; next = after + 1 }
 }
 
-// one byte of a byte literal: a raw byte, or an escape.
-fn byte_value(source: str, pos: u64) -> ByteVal | error {
+fn byte_value(source: str, pos: u64): ByteVal | error {
     if source[pos] == b'\\' {
-        let e = match escape_byte(source, pos) {
+        var e = match escape_byte(source, pos) {
             EscByte as eb => eb
             error as err => return err
         }
@@ -406,174 +309,185 @@ fn byte_value(source: str, pos: u64) -> ByteVal | error {
     ByteVal { value = source[pos]; next = pos + 1 }
 }
 
-// build a str from FRESH bytes (a decoded literal), not a view into the source.
-// Escapes are ASCII and literal bytes come from the validated source, so validity
-// holds; the str-from-bytes primitive is the same as text.tks's `str(b)` [TBD].
-fn one_byte(b: byte) -> str {
-    mut xs: []byte = teko::list::empty()
-    xs = teko::list::push(xs, b)
-    str(xs)
-}
-fn str_of_bytes(xs: []byte) -> str {
+fn str_of_bytes(xs: []byte): str {
     str(xs)
 }
 
-// --- string & byte literals ---
 
-// ---- the UNIFIED string reader: two ORTHOGONAL prefix modifiers × two delimiters ----
-//
-// A string START is an optional run of `$`/`@` (each at most once, ANY order: `$@` == `@$`)
-// followed by the opening delimiter `"` (single-line) or `"""` (multi-line). The eight
-// combinations are all valid; `$` and `@` COMPOSE freely (C# `$@"…"`).
-//   `$`  = interpolation (holes `{expr}`, literal braces `{{`/`}}`).
-//   `@`  = verbatim / raw  (NO escape processing — a `\` is a literal byte).
-// One unified body scanner is parameterized by (has_interp, has_verbatim, multiline).
-// Non-interp → fully-decoded Str; interp → Interp (parser decodes escapes) or InterpRaw
-// (parser does NOT decode escapes).
-//
-// InterpRaw REPRESENTATION (the parser splits it the same way as Interp, but appends literal
-// bytes verbatim): for SINGLE-line verbatim the lexer copies the inner text to FRESH bytes,
-// applying the depth-0-outside-holes `""`→`"` collapse while leaving `\` and the hole `{…}`
-// spans intact; for MULTI-line verbatim the inner text is copied AS-IS (a lone `"`/`""` is
-// literal — only `"""` closes). Thus the `""`-collapse lives ONLY here, in the lexer, so the
-// parser can treat single- vs multi-line InterpRaw uniformly. For non-verbatim Interp the
-// raw-VIEW + parser-decodes-escapes path is unchanged.
 
-// the closing delimiter matches at `p`? (three quotes if multiline, else one).
-fn str_close_at(source: str, p: u64, multiline: bool) -> bool {
+fn str_close_at(source: str, p: u64, multiline: bool): bool {
     if source[p] != b'"' { return false }
     if !multiline { return true }
     at(source, p + 1) == b'"' && at(source, p + 2) == b'"'
 }
 
-// the UNIFIED string body scanner. `inner` is the first byte AFTER the opening delimiter;
-// (has_interp, has_verbatim, multiline) select the four behaviours.
-fn read_string_body(source: str, pos: u64, inner: u64, has_interp: bool, has_verbatim: bool, multiline: bool) -> Scan | error {
-    mut delim: u64 = 1
-    if multiline { delim = 3 }
-    if has_interp {
-        if !has_verbatim {
-            // plain interp → keep the zero-copy raw-VIEW; the parser decodes escapes.
-            mut p = inner
-            mut depth: u64 = 0   // brace nesting inside holes
-            loop {
-                if p >= source.len { return scan_err_at(source, pos, "unterminated interpolated string") }
-                let c = source[p]
-                if !multiline && c == b'\\' {   // an escape — skip the next byte too (single-line only)
-                    if p + 1 >= source.len { return scan_err_at(source, pos, "unterminated escape in interpolated string") }
-                    p = p + 2
-                    continue
-                }
-                if depth == 0 && c == b'{' && at(source, p + 1) == b'{' { p = p + 2; continue }   // `{{` literal — depth unchanged
-                if depth == 0 && c == b'}' && at(source, p + 1) == b'}' { p = p + 2; continue }   // `}}` literal — depth unchanged
-                if c == b'{' { depth = depth + 1; p++; continue }
-                if c == b'}' { if depth > 0 { depth = depth - 1 }; p++; continue }
-                if depth == 0 && str_close_at(source, p, multiline) {
-                    return Scan { token = Token { kind = TokenKind::Interp; text = slice(source, inner, p); line = 0; col = 0 }; next = p + delim }
-                }
-                p++
-            }
-        }
-        // VERBATIM interp → emit FRESH inner bytes (single-line collapses `""`→`"` at depth 0;
-        // multi-line copies as-is). `\` stays literal; hole `{…}` spans are copied intact.
-        mut p = inner
-        mut depth: u64 = 0
-        mut bytes: []byte = teko::list::empty()
-        loop {
-            if p >= source.len { return scan_err_at(source, pos, "unterminated interpolated string") }
-            let c = source[p]
-            if depth == 0 && c == b'{' && at(source, p + 1) == b'{' {   // `{{` literal — copy BOTH bytes AS-IS, depth unchanged
-                bytes = teko::list::push(bytes, b'{'); bytes = teko::list::push(bytes, b'{'); p = p + 2; continue
-            }
-            if depth == 0 && c == b'}' && at(source, p + 1) == b'}' {   // `}}` literal — copy BOTH bytes AS-IS, depth unchanged
-                bytes = teko::list::push(bytes, b'}'); bytes = teko::list::push(bytes, b'}'); p = p + 2; continue
-            }
-            if c == b'{' { depth = depth + 1; bytes = teko::list::push(bytes, c); p++; continue }
-            if c == b'}' { if depth > 0 { depth = depth - 1 }; bytes = teko::list::push(bytes, c); p++; continue }
-            if c == b'"' && depth == 0 {
-                if !multiline {
-                    if at(source, p + 1) == b'"' {   // doubled quote → one literal `"`, continue
-                        bytes = teko::list::push(bytes, b'"')
-                        p = p + 2
-                        continue
-                    }
-                    return Scan { token = Token { kind = TokenKind::InterpRaw; text = str_of_bytes(bytes); line = 0; col = 0 }; next = p + 1 }
-                }
-                if str_close_at(source, p, true) {   // only `"""` closes; a lone `"`/`""` is literal
-                    return Scan { token = Token { kind = TokenKind::InterpRaw; text = str_of_bytes(bytes); line = 0; col = 0 }; next = p + 3 }
-                }
-            }
-            bytes = teko::list::push(bytes, c)   // every other byte (incl `\` and `\n`) is literal
-            p++
-        }
-    }
-    // NON-INTERP: fully decode to a Str token.
-    mut p = inner
-    mut bytes: []byte = teko::list::empty()
+fn interp_raw_span(source: str, pos: u64, inner: u64, multiline: bool): u64 | error {
+    var p = inner
+    var depth: u64 = 0
     loop {
-        if p >= source.len { return scan_err_at(source, pos, "unterminated string literal") }
-        let c = source[p]
-        if has_verbatim {
-            // verbatim: NO escapes. SINGLE-line `""`→`"` (a doubled quote is content, NOT a close —
-            // checked BEFORE str_close_at); multi-line a lone `"`/`""` is literal.
-            if !multiline && c == b'"' && at(source, p + 1) == b'"' {
-                bytes = teko::list::push(bytes, b'"')
-                p = p + 2
-                continue
+        if p >= source.len { return scan_err_at(source, pos, "unterminated interpolated string") }
+        var c = source[p]
+        if depth == 0 && c == b'{' && at(source, p + 1) == b'{' { p = p + 2; continue }
+        if depth == 0 && c == b'}' && at(source, p + 1) == b'}' { p = p + 2; continue }
+        if c == b'{' { depth = depth + 1; p++; continue }
+        if c == b'}' { if depth > 0 { depth = depth - 1 }; p++; continue }
+        if c == b'"' && depth == 0 {
+            if !multiline {
+                if at(source, p + 1) == b'"' { p = p + 2; continue }
+                return p
             }
-            if str_close_at(source, p, multiline) {
-                return Scan { token = Token { kind = TokenKind::Str; text = str_of_bytes(bytes); line = 0; col = 0 }; next = p + delim }
-            }
-            bytes = teko::list::push(bytes, c)   // every other byte (incl `\` and `\n`) is literal
-            p++
-            continue
+            if str_close_at(source, p, true) { return p }
         }
-        if str_close_at(source, p, multiline) {
-            return Scan { token = Token { kind = TokenKind::Str; text = str_of_bytes(bytes); line = 0; col = 0 }; next = p + delim }
-        }
-        // plain (escapes on).
-        if c == b'\\' {
-            let e = match escape_byte(source, p) {
-                EscByte as eb => eb
-                error as err => return err
-            }
-            bytes = teko::list::push(bytes, e.value)
-            p = e.next
-            continue
-        }
-        bytes = teko::list::push(bytes, c)   // a literal byte (ASCII or UTF-8 cont.)
         p++
     }
 }
 
-// recognize a string START at `pos`: an optional run of `$`/`@` (each ≤1, any order) then a
-// `"`. On match, scan the prefix flags + delimiter and dispatch to read_string_body. Mirrors
-// the C twin's read_string; the caller (next_token) checks for a `"`/`$`/`@` lead first.
-fn read_string(source: str, pos: u64) -> Scan | error {
-    mut has_interp = false
-    mut has_verbatim = false
-    mut p = pos
+fn str_body_span(source: str, pos: u64, inner: u64, has_verbatim: bool, multiline: bool): u64 | error {
+    var p = inner
     loop {
-        let c = at(source, p)
+        if p >= source.len { return scan_err_at(source, pos, "unterminated string literal") }
+        var c = source[p]
+        if has_verbatim {
+            if !multiline && c == b'"' && at(source, p + 1) == b'"' { p = p + 2; continue }
+            if str_close_at(source, p, multiline) { return p }
+            p++
+            continue
+        }
+        if str_close_at(source, p, multiline) { return p }
+        if c == b'\\' {
+            var e = match escape_byte(source, p) {
+                EscByte as eb => eb
+                error as err => return err
+            }
+            p = e.next
+            continue
+        }
+        p++
+    }
+}
+
+fn read_string_body(source: str, pos: u64, inner: u64, has_interp: bool, has_verbatim: bool, multiline: bool): Scan | error {
+    var delim: u64 = 1
+    if multiline { delim = 3 }
+    if has_interp {
+        if !has_verbatim {
+            var p = inner
+            var depth: u64 = 0
+            loop {
+                if p >= source.len { return scan_err_at(source, pos, "unterminated interpolated string") }
+                var c = source[p]
+                if !multiline && c == b'\\' {
+                    if p + 1 >= source.len { return scan_err_at(source, pos, "unterminated escape in interpolated string") }
+                    p = p + 2
+                    continue
+                }
+                if depth == 0 && c == b'{' && at(source, p + 1) == b'{' { p = p + 2; continue }
+                if depth == 0 && c == b'}' && at(source, p + 1) == b'}' { p = p + 2; continue }
+                if c == b'{' { depth = depth + 1; p++; continue }
+                if c == b'}' { if depth > 0 { depth = depth - 1 }; p++; continue }
+                if depth == 0 && str_close_at(source, p, multiline) {
+                    return Scan { token = Token { kind = TokenKind::Interp; text = source.slice(inner, p); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + delim }
+                }
+                p++
+            }
+        }
+        var end = match interp_raw_span(source, pos, inner, multiline) {
+            u64 as s => s
+            error as err => return err
+        }
+        var p = inner
+        var depth: u64 = 0
+        var bytes: [end - inner]byte = []
+        var n: u64 = 0
+        loop {
+            if p >= source.len { return scan_err_at(source, pos, "unterminated interpolated string") }
+            var c = source[p]
+            if depth == 0 && c == b'{' && at(source, p + 1) == b'{' {
+                bytes[n] = b'{'; n++; bytes[n] = b'{'; n++; p = p + 2; continue
+            }
+            if depth == 0 && c == b'}' && at(source, p + 1) == b'}' {
+                bytes[n] = b'}'; n++; bytes[n] = b'}'; n++; p = p + 2; continue
+            }
+            if c == b'{' { depth = depth + 1; bytes[n] = c; n++; p++; continue }
+            if c == b'}' { if depth > 0 { depth = depth - 1 }; bytes[n] = c; n++; p++; continue }
+            if c == b'"' && depth == 0 {
+                if !multiline {
+                    if at(source, p + 1) == b'"' {
+                        bytes[n] = b'"'; n++
+                        p = p + 2
+                        continue
+                    }
+                    return Scan { token = Token { kind = TokenKind::InterpRaw; text = str_of_bytes(teko::collections::arr_slice(bytes, 0, n)); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + 1 }
+                }
+                if str_close_at(source, p, true) {
+                    return Scan { token = Token { kind = TokenKind::InterpRaw; text = str_of_bytes(teko::collections::arr_slice(bytes, 0, n)); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + 3 }
+                }
+            }
+            bytes[n] = c; n++
+            p++
+        }
+    }
+    var end = match str_body_span(source, pos, inner, has_verbatim, multiline) {
+        u64 as s => s
+        error as err => return err
+    }
+    var p = inner
+    var bytes: [end - inner]byte = []
+    var n: u64 = 0
+    loop {
+        if p >= source.len { return scan_err_at(source, pos, "unterminated string literal") }
+        var c = source[p]
+        if has_verbatim {
+            if !multiline && c == b'"' && at(source, p + 1) == b'"' {
+                bytes[n] = b'"'; n++
+                p = p + 2
+                continue
+            }
+            if str_close_at(source, p, multiline) {
+                return Scan { token = Token { kind = TokenKind::Str; text = str_of_bytes(teko::collections::arr_slice(bytes, 0, n)); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + delim }
+            }
+            bytes[n] = c; n++
+            p++
+            continue
+        }
+        if str_close_at(source, p, multiline) {
+            return Scan { token = Token { kind = TokenKind::Str; text = str_of_bytes(teko::collections::arr_slice(bytes, 0, n)); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + delim }
+        }
+        if c == b'\\' {
+            var e = match escape_byte(source, p) {
+                EscByte as eb => eb
+                error as err => return err
+            }
+            bytes[n] = e.value; n++
+            p = e.next
+            continue
+        }
+        bytes[n] = c; n++
+        p++
+    }
+}
+
+fn read_string(source: str, pos: u64): Scan | error {
+    var has_interp = false
+    var has_verbatim = false
+    var p = pos
+    loop {
+        var c = at(source, p)
         if c == b'$' { if has_interp { break }; has_interp = true; p = p + 1; continue }
         if c == b'@' { if has_verbatim { break }; has_verbatim = true; p = p + 1; continue }
         break
     }
-    // the caller only routes here when a string start is certain (a `"` follows the prefix run).
-    let multiline = at(source, p + 1) == b'"' && at(source, p + 2) == b'"'
-    let inner = if multiline { p + 3 } else { p + 1 }
+    var multiline = at(source, p + 1) == b'"' && at(source, p + 2) == b'"'
+    var inner = if multiline { p + 3 } else { p + 1 }
     read_string_body(source, pos, inner, has_interp, has_verbatim, multiline)
 }
 
-// is there a string START at `pos`? an optional `$`/`@` prefix run (each ≤1, any order)
-// then a `"`. Used by next_token to decide between the unified string reader and falling
-// through (a bare `$`/`@` not so followed is an unexpected character via read_symbol).
-fn is_string_start(source: str, pos: u64) -> bool {
-    mut has_interp = false
-    mut has_verbatim = false
-    mut p = pos
+fn is_string_start(source: str, pos: u64): bool {
+    var has_interp = false
+    var has_verbatim = false
+    var p = pos
     loop {
-        let c = at(source, p)
+        var c = at(source, p)
         if c == b'$' { if has_interp { break }; has_interp = true; p = p + 1; continue }
         if c == b'@' { if has_verbatim { break }; has_verbatim = true; p = p + 1; continue }
         break
@@ -581,65 +495,72 @@ fn is_string_start(source: str, pos: u64) -> bool {
     at(source, p) == b'"'
 }
 
-// `b'…'`: pos points at `b`, `'` at pos+1. One byte (raw or escaped) then a closing `'`.
-fn read_byte_lit(source: str, pos: u64) -> Scan | error {
-    let inner = pos + 2   // past `b'`
+fn read_byte_lit(source: str, pos: u64): Scan | error {
+    var inner = pos + 2
     if inner >= source.len { return error { message = "unterminated byte literal" } }
-    let v = match byte_value(source, inner) {
+    var v = match byte_value(source, inner) {
         ByteVal as bv => bv
         error as err => return err
     }
     if at(source, v.next) != b'\'' { return error { message = "expected closing ' in byte literal" } }
-    Scan { token = Token { kind = TokenKind::Byte; text = one_byte(v.value); line = 0; col = 0 }; next = v.next + 1 }
+    Scan { token = Token { kind = TokenKind::Byte; text = teko::runtime::one_byte(v.value); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = v.next + 1 }
 }
 
-// expected UTF-8 codepoint length (1–4) from the LEAD byte, or 0 if `b` is not a valid lead.
-// Mirrors the lead-byte classification of teko::text::valid_utf8 (RFC 3629 ranges).
-fn utf8_codepoint_len(b: byte) -> u64 {
-    if b <= 0x7F { return 1 }   // ASCII — single byte
-    if b >= 0xC2 && b <= 0xDF { return 2 }
-    if b >= 0xE0 && b <= 0xEF { return 3 }
-    if b >= 0xF0 && b <= 0xF4 { return 4 }
-    0   // 0x80..0xC1, 0xF5..0xFF — never a valid lead
-}
-
-// `c'…'`: pos points at `c`, `'` at pos+1. Collects bytes (each raw byte OR an escape decoded to
-// one ASCII byte) up to a closing `'`, then VALIDATES they form EXACTLY ONE UTF-8 codepoint.
-// `c'A'`=1 byte, `c'é'`=2, `c'😀'`=4, `c'\n'`=one escaped byte. The token's text is the raw UTF-8.
-fn read_char_lit(source: str, pos: u64) -> Scan | error {
-    let inner = pos + 2   // past `c'`
-    if inner >= source.len { return error { message = "unterminated char literal" } }
-    mut bytes: []byte = teko::list::empty()
-    mut p = inner
+fn read_byte_str(source: str, pos: u64): Scan | error {
+    var p = pos + 2
+    var bytes: []byte = []
     loop {
-        if p >= source.len { return error { message = "expected closing ' in char literal" } }
-        if source[p] == b'\'' { break }   // closing quote
-        let v = match byte_value(source, p) {
+        if p >= source.len { return error { message = "unterminated byte string literal" } }
+        if source[p] == b'"' { break }
+        var v = match byte_value(source, p) {
             ByteVal as bv => bv
             error as err => return err
         }
-        bytes = teko::list::push(bytes, v.value)
+        bytes = [..bytes, v.value]
+        p = v.next
+    }
+    Scan { token = Token { kind = TokenKind::ByteStr; text = str_of_bytes(bytes); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + 1 }
+}
+
+fn utf8_codepoint_len(b: byte): u64 {
+    if b <= 0x7F { return 1 }
+    if b >= 0xC2 && b <= 0xDF { return 2 }
+    if b >= 0xE0 && b <= 0xEF { return 3 }
+    if b >= 0xF0 && b <= 0xF4 { return 4 }
+    0
+}
+
+fn read_char_lit(source: str, pos: u64): Scan | error {
+    var inner = pos + 2
+    if inner >= source.len { return error { message = "unterminated char literal" } }
+    var bytes: []byte = []
+    var p = inner
+    loop {
+        if p >= source.len { return error { message = "expected closing ' in char literal" } }
+        if source[p] == b'\'' { break }
+        var v = match byte_value(source, p) {
+            ByteVal as bv => bv
+            error as err => return err
+        }
+        bytes = [..bytes, v.value]
         p = v.next
     }
     if bytes.len == 0 { return error { message = "empty char literal — a char must be exactly one codepoint" } }
     if !teko::text::valid_utf8(bytes) { return error { message = "invalid UTF-8 in char literal" } }
     if utf8_codepoint_len(bytes[0]) != bytes.len { return error { message = "char literal must be exactly one codepoint" } }
-    Scan { token = Token { kind = TokenKind::Char; text = str_of_bytes(bytes); line = 0; col = 0 }; next = p + 1 }
+    Scan { token = Token { kind = TokenKind::Char; text = str_of_bytes(bytes); line = 0; col = 0; byte_off = 0 to u64; file = "" }; next = p + 1 }
 }
 
-// --- symbols: operators, delimiters, punctuation (maximal munch — B.23) ---
 
-fn read_symbol(source: str, pos: u64) -> Scan | error {
-    let c = source[pos]
-    let c1 = at(source, pos + 1)
-    let c2 = at(source, pos + 2)
+fn read_symbol(source: str, pos: u64): Scan | error {
+    var c = source[pos]
+    var c1 = at(source, pos + 1)
+    var c2 = at(source, pos + 2)
 
-    // 3-byte (longest first)
     if c == b'<' && c1 == b'<' && c2 == b'=' { return sym(source, pos, 3, TokenKind::ShlEq) }
     if c == b'>' && c1 == b'>' && c2 == b'=' { return sym(source, pos, 3, TokenKind::ShrEq) }
     if c == b'.' && c1 == b'.' && c2 == b'=' { return sym(source, pos, 3, TokenKind::DotDotEq) }
 
-    // 2-byte
     if c == b'=' && c1 == b'=' { return sym(source, pos, 2, TokenKind::EqEq) }
     if c == b'=' && c1 == b'>' { return sym(source, pos, 2, TokenKind::FatArrow) }
     if c == b'!' && c1 == b'=' { return sym(source, pos, 2, TokenKind::Ne) }
@@ -647,12 +568,12 @@ fn read_symbol(source: str, pos: u64) -> Scan | error {
     if c == b'>' && c1 == b'=' { return sym(source, pos, 2, TokenKind::Ge) }
     if c == b'<' && c1 == b'<' { return sym(source, pos, 2, TokenKind::Shl) }
     if c == b'>' && c1 == b'>' { return sym(source, pos, 2, TokenKind::Shr) }
-    if c == b'-' && c1 == b'>' { return sym(source, pos, 2, TokenKind::Arrow) }
     if c == b':' && c1 == b':' { return sym(source, pos, 2, TokenKind::ColonColon) }
+    if c == b':' && c1 == b'=' { return sym(source, pos, 2, TokenKind::Walrus) }
     if c == b'&' && c1 == b'&' { return sym(source, pos, 2, TokenKind::AndAnd) }
     if c == b'|' && c1 == b'|' { return sym(source, pos, 2, TokenKind::OrOr) }
-    if c == b'+' && c1 == b'+' { return sym(source, pos, 2, TokenKind::PlusPlus) }   // ++ (maximal munch, before +/+=)
-    if c == b'-' && c1 == b'-' { return sym(source, pos, 2, TokenKind::MinusMinus) }   // -- (before -/-=/->)
+    if c == b'+' && c1 == b'+' { return sym(source, pos, 2, TokenKind::PlusPlus) }
+    if c == b'-' && c1 == b'-' { return sym(source, pos, 2, TokenKind::MinusMinus) }
     if c == b'+' && c1 == b'=' { return sym(source, pos, 2, TokenKind::PlusEq) }
     if c == b'-' && c1 == b'=' { return sym(source, pos, 2, TokenKind::MinusEq) }
     if c == b'*' && c1 == b'=' { return sym(source, pos, 2, TokenKind::StarEq) }
@@ -662,16 +583,10 @@ fn read_symbol(source: str, pos: u64) -> Scan | error {
     if c == b'|' && c1 == b'=' { return sym(source, pos, 2, TokenKind::PipeEq) }
     if c == b'^' && c1 == b'=' { return sym(source, pos, 2, TokenKind::CaretEq) }
 
-    // nullability composites (maximal munch — `??`/`?.` before a lone `?`).
-    // `?` is EXCLUSIVE to nullability (LEGISLATION §75; REBOOT_PLAN §202–203).
-    if c == b'?' && c1 == b'?' { return sym(source, pos, 2, TokenKind::QQ) }
-    if c == b'?' && c1 == b'.' { return sym(source, pos, 2, TokenKind::QDot) }
 
-    // `..` — bare range / spread (C6.7); `..=` is already consumed above by the 3-byte check.
     if c == b'.' && c1 == b'.' { return sym(source, pos, 2, TokenKind::DotDot) }
 
-    // 1-byte
-    let one = match c {
+    var one = match c {
         b'+' => TokenKind::Plus
         b'-' => TokenKind::Minus
         b'*' => TokenKind::Star
@@ -695,91 +610,111 @@ fn read_symbol(source: str, pos: u64) -> Scan | error {
         b'}' => TokenKind::RBrace
         b'[' => TokenKind::LBracket
         b']' => TokenKind::RBracket
-        b'?' => TokenKind::Question   // lone `?` — the type-suffix (T?)
-        b'#' => TokenKind::Hash   // attribute marker (`#test`) — D2 test gate
+        b'#' => TokenKind::Hash
         _ => return scan_err_at(source, pos, "unexpected character")
     }
     sym(source, pos, 1, one)
 }
 
-// --- one token at pos (already past spaces/comments/newline), or fail ---
 
-fn next_token(source: str, pos: u64) -> Scan | error {
-    let c = source[pos]
-    // a byte literal `b'…'` — `b` would otherwise begin an identifier
+fn next_token(source: str, pos: u64): Scan | error {
+    var c = source[pos]
     if c == b'b' && at(source, pos + 1) == b'\'' { return read_byte_lit(source, pos) }
-    // a char literal `c'…'` — `c` would otherwise begin an identifier
+    if c == b'b' && at(source, pos + 1) == b'"' { return read_byte_str(source, pos) }
     if c == b'c' && at(source, pos + 1) == b'\'' { return read_char_lit(source, pos) }
-    // a string literal: an optional `$`/`@` prefix run (each ≤1, any order) then `"` / `"""`.
-    // Covers `"`, `$"`, `@"`, `$@"`, `@$"` and the `"""` variants — the unified reader. A bare
-    // `$`/`@` not followed (after the prefix run) by a quote is NOT a string start.
     if (c == b'"' || c == b'$' || c == b'@') && is_string_start(source, pos) { return read_string(source, pos) }
+    if c == b'@' { return sym(source, pos, 1, TokenKind::At) }
+    if c == b'$' { return sym(source, pos, 1, TokenKind::Dollar) }
     if is_digit(c) { return read_number(source, pos) }
     if is_alpha(c) { return keyword_or_ident(source, pos) }
     if c == b'_' { return read_underscore(source, pos) }
     read_symbol(source, pos)
 }
 
-// --- the main loop ---
 
-pub fn tokenize(source: str) -> []Token | error {
-    mut pos: u64 = 0
-    // (#148 R3 DECREE) `tokens` is a linear chain: born empty, self-append-only, read only
-    // after the loop — every copy-grow frees the superseded buffer (mem::push_fo; paranoid-gated).
-    mut tokens: []Token = teko::list::empty()
-    // location cursor: (cur_line, cur_col) is the 1-based location of byte `cur_pos`. It
-    // advances forward to each token-start `pos`; since the token starts are monotonic, the
-    // total advance work is O(N) (each byte crossed once) — replacing the old O(N²) stamping.
-    mut cur_pos: u64 = 0
-    mut cur_line: u32 = 1
-    mut cur_col: u32 = 1
+type LexStep = struct {
+    token: Token
+    start: u64
+    next: u64
+    has_token: bool
+    done: bool
+}
+
+fn empty_token(): Token {
+    Token { kind = TokenKind::Newline; text = ""; line = 0; col = 0; byte_off = 0 to u64; file = "" }
+}
+
+fn lex_step(source: str, pos: u64): LexStep | error {
+    var p = skip_spaces(source, pos)
+    if p >= source.len {
+        return LexStep { token = empty_token(); start = p; next = p; has_token = false; done = true }
+    }
+
+    var c = source[p]
+
+    if c == b'/' && at(source, p + 1) == b'/' {
+        return LexStep { token = empty_token(); start = p; next = skip_line(source, p); has_token = false; done = false }
+    }
+    if c == b'/' && at(source, p + 1) == b'*' {
+        if at(source, p + 2) == b'*' && at(source, p + 3) != b'/' {
+            var scan = match read_doc_comment(source, p) { Scan as sc => sc; error as e => return e }
+            return LexStep { token = scan.token; start = p; next = scan.next; has_token = true; done = false }
+        }
+        var np = match skip_block_comment(source, p) { u64 as q => q; error as e => return e }
+        return LexStep { token = empty_token(); start = p; next = np; has_token = false; done = false }
+    }
+    if c == b'\n' {
+        return LexStep { token = sym(source, p, 1, TokenKind::Newline).token; start = p; next = p + 1; has_token = true; done = false }
+    }
+
+    var scan = match next_token(source, p) {
+        Scan as sc => sc
+        error as e => return e
+    }
+    LexStep { token = scan.token; start = p; next = scan.next; has_token = true; done = false }
+}
+
+fn count_tokens(source: str): u64 | error {
+    var pos: u64 = 0
+    var n: u64 = 0
+    loop {
+        var step = match lex_step(source, pos) { LexStep as s => s; error as e => return e }
+        if step.done { break }
+        if step.has_token { n = n + 1 }
+        pos = step.next
+    }
+    n
+}
+
+pub fn tokenize(source: str): []Token | error {
+    tokenize_file(source, "")
+}
+
+pub fn tokenize_file(source: str, file: str): []Token | error {
+    var ntok = match count_tokens(source) { u64 as n => n; error as e => return e }
+    var tokens: [ntok]Token = []
+    var count: u64 = 0
+    var pos: u64 = 0
+    var cur_pos: u64 = 0
+    var cur_line: u32 = 1
+    var cur_col: u32 = 1
 
     loop {
-        pos = skip_spaces(source, pos)
-        if pos >= source.len { break }
+        var step = match lex_step(source, pos) { LexStep as s => s; error as e => return e }
+        if step.done { break }
 
-        // advance the cursor from cur_pos up to the token start `pos`, counting newlines.
         loop {
-            if cur_pos >= pos { break }
+            if cur_pos >= step.start { break }
             if source[cur_pos] == b'\n' { cur_line = cur_line + 1; cur_col = 1 } else { cur_col = cur_col + 1 }
             cur_pos = cur_pos + 1
         }
 
-        let c = source[pos]
-
-        // `//` line comment → skip to the newline
-        if c == b'/' && at(source, pos + 1) == b'/' {
-            pos = skip_line(source, pos)
-            continue
+        if step.has_token {
+            tokens[count] = stamp_loc(step.token, cur_line, cur_col, step.start, file)
+            count++
         }
-        // `/* … */` block & `/** … */` doc comments
-        if c == b'/' && at(source, pos + 1) == b'*' {
-            // a DOC comment `/** … */` (but NOT the empty `/**/`) becomes a Doc
-            // TOKEN (the parser attaches it to the next type/fn declaration); a plain
-            // block comment is skipped.
-            if at(source, pos + 2) == b'*' && at(source, pos + 3) != b'/' {
-                let scan = match read_doc_comment(source, pos) { Scan as sc => sc; error as e => return e }
-                tokens = teko::mem::push_fo(tokens, stamp_loc(scan.token, cur_line, cur_col))
-                pos = scan.next
-                continue
-            }
-            pos = match skip_block_comment(source, pos) { u64 as p => p; error as e => return e }
-            continue
-        }
-        // a significant newline (B.26) is a token
-        if c == b'\n' {
-            tokens = teko::mem::push_fo(tokens, stamp_loc(sym(source, pos, 1, TokenKind::Newline).token, cur_line, cur_col))
-            pos = pos + 1
-            continue
-        }
-
-        let scan = match next_token(source, pos) {
-            Scan as sc => sc
-            error as e => return e
-        }
-        tokens = teko::mem::push_fo(tokens, stamp_loc(scan.token, cur_line, cur_col))
-        pos = scan.next
+        pos = step.next
     }
 
-    tokens
+    teko::collections::arr_slice(tokens, 0, count)
 }

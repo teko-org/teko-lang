@@ -1,0 +1,474 @@
+const ARGON2_VERSION: u64 = 0x13
+
+const ARGON2_TYPE_ID: u64 = 2
+
+fn argon2_rotr64(x: u64, count: u32): u64 {
+    (x >> (count to u64)) | (x << ((64 - count) to u64))
+}
+
+fn argon2_le32_bytes(x: u32): []byte {
+    [
+        (x & 0xFF) to byte,
+        ((x >> 8) & 0xFF) to byte,
+        ((x >> 16) & 0xFF) to byte,
+        ((x >> 24) & 0xFF) to byte,
+    ]
+}
+
+fn argon2_le64_bytes(x: u64): []byte {
+    [..argon2_le32_bytes((x & 0xFFFFFFFF) to u32), ..argon2_le32_bytes(((x >> 32) & 0xFFFFFFFF) to u32)]
+}
+
+fn argon2_le_u64_at(b: []byte, off: u64): u64 {
+    var lo = (b[off] to u64) | ((b[off + 1] to u64) << 8) | ((b[off + 2] to u64) << 16) | ((b[off + 3] to u64) << 24)
+    var hi = (b[off + 4] to u64) | ((b[off + 5] to u64) << 8) | ((b[off + 6] to u64) << 16) | ((b[off + 7] to u64) << 24)
+    lo | (hi << 32)
+}
+
+fn argon2_bytes_append(dst: []byte, src: []byte): []byte {
+    [..dst, ..src]
+}
+
+fn argon2_bytes_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+fn argon2_h_t(a: []byte, t: u64): []byte {
+    blake2b_of([..argon2_le32_bytes(t to u32), ..a], t)
+}
+
+fn argon2_hprime(x: []byte, out_len: u64): []byte {
+    if out_len <= 64 { return argon2_h_t(x, out_len) }
+    var prefix = argon2_le32_bytes(out_len to u32)
+    var v = blake2b_of([..prefix, ..x], 64)
+    var out: [out_len]byte = []
+    var pos: u64 = 0
+    var j: u64 = 0
+    loop {
+        if j >= 32 { break }
+        out[pos] = v[j]
+        pos++
+        j++
+    }
+    var produced: u64 = 32
+    loop {
+        if out_len - produced <= 64 { break }
+        v = blake2b_of(v, 64)
+        var k: u64 = 0
+        loop {
+            if k >= 32 { break }
+            out[pos] = v[k]
+            pos++
+            k++
+        }
+        produced = produced + 32
+    }
+    var last = blake2b_of(v, out_len - produced)
+    var m: u64 = 0
+    loop {
+        if m >= last.len { break }
+        out[pos] = last[m]
+        pos++
+        m++
+    }
+    out
+}
+
+fn argon2_h0(password: []byte, salt: []byte, secret: []byte, ad: []byte, parallelism: u64, tag_len: u64, m_cost_kib: u64, t_cost: u64): []byte {
+    var msg: []byte = [
+        ..argon2_le32_bytes(parallelism to u32),
+        ..argon2_le32_bytes(tag_len to u32),
+        ..argon2_le32_bytes(m_cost_kib to u32),
+        ..argon2_le32_bytes(t_cost to u32),
+        ..argon2_le32_bytes(ARGON2_VERSION to u32),
+        ..argon2_le32_bytes(ARGON2_TYPE_ID to u32),
+        ..argon2_le32_bytes(password.len to u32),
+        ..password,
+        ..argon2_le32_bytes(salt.len to u32),
+        ..salt,
+        ..argon2_le32_bytes(secret.len to u32),
+        ..secret,
+        ..argon2_le32_bytes(ad.len to u32),
+        ..ad,
+    ]
+    blake2b_of(msg, 64)
+}
+
+fn argon2_bytes_to_words(b: []byte): []u64 {
+    var out: [128]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= 128 { break }
+        out[i] = argon2_le_u64_at(b, i * 8)
+        i++
+    }
+    out
+}
+
+fn argon2_words_to_bytes(w: []u64): []byte {
+    var out: [1024]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 128 { break }
+        var le = argon2_le64_bytes(w[i])
+        var boff = i * 8
+        var j: u64 = 0
+        loop {
+            if j >= 8 { break }
+            out[boff + j] = le[j]
+            j++
+        }
+        i++
+    }
+    out
+}
+
+fn argon2_zero_block(): []u64 {
+    var out: [128]u64 = []
+    out
+}
+
+fn argon2_set4(v: []u64, ia: u64, na: u64, ib: u64, nb: u64, ic: u64, nc: u64, id: u64, nd: u64): []u64 {
+    var out: [v.len]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= v.len { break }
+        var val = v[i]
+        if i == ia { val = na }
+        if i == ib { val = nb }
+        if i == ic { val = nc }
+        if i == id { val = nd }
+        out[i] = val
+        i++
+    }
+    out
+}
+
+fn argon2_blamka(a: u64, b: u64): u64 {
+    var lo_a = a & 0xFFFFFFFF
+    var lo_b = b & 0xFFFFFFFF
+    var product = teko::math::wrapping_mul_u64(lo_a, lo_b)
+    var doubled = teko::math::wrapping_add_u64(product, product)
+    teko::math::wrapping_add_u64(teko::math::wrapping_add_u64(a, b), doubled)
+}
+
+fn argon2_mix4(v: []u64, a: u64, b: u64, c: u64, d: u64): []u64 {
+    var va = v[a]
+    var vb = v[b]
+    var vc = v[c]
+    var vd = v[d]
+    va = argon2_blamka(va, vb)
+    vd = argon2_rotr64(vd ^ va, 32)
+    vc = argon2_blamka(vc, vd)
+    vb = argon2_rotr64(vb ^ vc, 24)
+    va = argon2_blamka(va, vb)
+    vd = argon2_rotr64(vd ^ va, 16)
+    vc = argon2_blamka(vc, vd)
+    vb = argon2_rotr64(vb ^ vc, 63)
+    argon2_set4(v, a, va, b, vb, c, vc, d, vd)
+}
+
+fn argon2_p16(v: []u64): []u64 {
+    var w = v
+    w = argon2_mix4(w, 0, 4, 8, 12)
+    w = argon2_mix4(w, 1, 5, 9, 13)
+    w = argon2_mix4(w, 2, 6, 10, 14)
+    w = argon2_mix4(w, 3, 7, 11, 15)
+    w = argon2_mix4(w, 0, 5, 10, 15)
+    w = argon2_mix4(w, 1, 6, 11, 12)
+    w = argon2_mix4(w, 2, 7, 8, 13)
+    w = argon2_mix4(w, 3, 4, 9, 14)
+    w
+}
+
+fn argon2_words_range(w: []u64, from: u64, to: u64): []u64 {
+    var n = to - from
+    var out: [n]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = w[from + i]
+        i++
+    }
+    out
+}
+
+fn argon2_words_append(dst: []u64, src: []u64): []u64 {
+    [..dst, ..src]
+}
+
+fn argon2_p_rows(r: []u64): []u64 {
+    var out: [128]u64 = []
+    var row: u64 = 0
+    loop {
+        if row >= 8 { break }
+        var row_off = row * 16
+        var mixed = argon2_p16(argon2_words_range(r, row_off, row_off + 16))
+        var j: u64 = 0
+        loop {
+            if j >= 16 { break }
+            out[row_off + j] = mixed[j]
+            j++
+        }
+        row++
+    }
+    out
+}
+
+fn argon2_extract_column(z: []u64, col: u64): []u64 {
+    var out: [16]u64 = []
+    var row: u64 = 0
+    loop {
+        if row >= 8 { break }
+        out[2 * row] = z[16 * row + 2 * col]
+        out[2 * row + 1] = z[16 * row + 2 * col + 1]
+        row++
+    }
+    out
+}
+
+fn argon2_assemble_from_columns(colvals: []u64): []u64 {
+    var out: [128]u64 = []
+    var p: u64 = 0
+    loop {
+        if p >= 128 { break }
+        var j = p / 16
+        var k = p % 16
+        var i = k / 2
+        var s = k % 2
+        out[p] = colvals[16 * i + 2 * j + s]
+        p++
+    }
+    out
+}
+
+fn argon2_p_cols(z: []u64): []u64 {
+    var col_results: [128]u64 = []
+    var col: u64 = 0
+    loop {
+        if col >= 8 { break }
+        var mixed = argon2_p16(argon2_extract_column(z, col))
+        var j: u64 = 0
+        loop {
+            if j >= 16 { break }
+            col_results[col * 16 + j] = mixed[j]
+            j++
+        }
+        col++
+    }
+    argon2_assemble_from_columns(col_results)
+}
+
+fn argon2_xor_block(a: []u64, b: []u64): []u64 {
+    var out: [128]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= 128 { break }
+        out[i] = a[i] ^ b[i]
+        i++
+    }
+    out
+}
+
+fn argon2_g_block(x: []u64, y: []u64): []u64 {
+    var r = argon2_xor_block(x, y)
+    argon2_xor_block(argon2_p_cols(argon2_p_rows(r)), r)
+}
+
+fn argon2_mem_read_block(mem: []u64, block_index: u64): []u64 {
+    argon2_words_range(mem, block_index * 128, block_index * 128 + 128)
+}
+
+fn argon2_mem_write_block(mem: []u64, block_index: u64, block: []u64): []u64 {
+    var blk_off = block_index * 128
+    var out: [mem.len]u64 = []
+    var i: u64 = 0
+    loop {
+        if i >= mem.len { break }
+        if i >= blk_off && i < blk_off + 128 {
+            out[i] = block[i - blk_off]
+        } else {
+            out[i] = mem[i]
+        }
+        i++
+    }
+    out
+}
+
+fn argon2_mem_zero(total_words: u64): []u64 {
+    var out: [total_words]u64 = []
+    out
+}
+
+fn argon2_build_input_block(pass: u64, lane: u64, slice: u64, m_prime: u64, t_cost: u64, counter: u64): []u64 {
+    var out: [128]u64 = []
+    out[0] = pass
+    out[1] = lane
+    out[2] = slice
+    out[3] = m_prime
+    out[4] = t_cost
+    out[5] = ARGON2_TYPE_ID
+    out[6] = counter
+    out
+}
+
+fn argon2_pseudo_rand_indep(pass: u64, lane: u64, slice: u64, m_prime: u64, t_cost: u64, index: u64): u64 {
+    var counter = index / 128 + 1
+    var input_block = argon2_build_input_block(pass, lane, slice, m_prime, t_cost, counter)
+    var zero = argon2_zero_block()
+    var addr_block = argon2_g_block(zero, argon2_g_block(zero, input_block))
+    addr_block[index % 128]
+}
+
+fn argon2_ref_area_size(pass: u64, slice: u64, segment_length: u64, lane_length: u64, index: u64, same_lane: bool): u64 {
+    if pass == 0 {
+        if same_lane { return slice * segment_length + index - 1 }
+        if index == 0 { return slice * segment_length - 1 }
+        return slice * segment_length
+    }
+    if same_lane { return lane_length - segment_length + index - 1 }
+    if index == 0 { return lane_length - segment_length - 1 }
+    lane_length - segment_length
+}
+
+fn argon2_start_position(pass: u64, slice: u64, segment_length: u64): u64 {
+    if pass == 0 { return 0 }
+    if slice == 3 { return 0 }
+    (slice + 1) * segment_length
+}
+
+fn argon2_map_j1_to_relative(w_size: u64, j1: u64): u64 {
+    var x = (j1 * j1) >> 32
+    var y = (w_size * x) >> 32
+    w_size - 1 - y
+}
+
+fn argon2_fill_index(mem: []u64, pass: u64, lane: u64, slice: u64, index: u64, m_prime: u64, lanes: u64, lane_length: u64, segment_length: u64, t_cost: u64): []u64 {
+    var curr_abs = lane * lane_length + slice * segment_length + index
+    var prev_abs = if curr_abs % lane_length == 0 { curr_abs + lane_length - 1 } else { curr_abs - 1 }
+    var prev_block = argon2_mem_read_block(mem, prev_abs)
+    var data_independent = pass == 0 && slice < 2
+    var pseudo = if data_independent { argon2_pseudo_rand_indep(pass, lane, slice, m_prime, t_cost, index) } else { prev_block[0] }
+    var j1 = pseudo & 0xFFFFFFFF
+    var j2 = (pseudo >> 32) & 0xFFFFFFFF
+    var ref_lane = if pass == 0 && slice == 0 { lane } else { j2 % lanes }
+    var same_lane = ref_lane == lane
+    var w_size = argon2_ref_area_size(pass, slice, segment_length, lane_length, index, same_lane)
+    var start_pos = argon2_start_position(pass, slice, segment_length)
+    var ref_index = (start_pos + argon2_map_j1_to_relative(w_size, j1)) % lane_length
+    var ref_block = argon2_mem_read_block(mem, ref_lane * lane_length + ref_index)
+    var fresh = argon2_g_block(prev_block, ref_block)
+    var new_block = if pass == 0 { fresh } else { argon2_xor_block(fresh, argon2_mem_read_block(mem, curr_abs)) }
+    argon2_mem_write_block(mem, curr_abs, new_block)
+}
+
+fn argon2_fill_segment(mem: []u64, pass: u64, lane: u64, slice: u64, m_prime: u64, lanes: u64, lane_length: u64, segment_length: u64, t_cost: u64): []u64 {
+    var result = mem
+    var start: u64 = if pass == 0 && slice == 0 { 2 } else { 0 }
+    var index = start
+    loop {
+        if index >= segment_length { break }
+        result = argon2_fill_index(result, pass, lane, slice, index, m_prime, lanes, lane_length, segment_length, t_cost)
+        index++
+    }
+    result
+}
+
+fn argon2_run_slice(mem: []u64, pass: u64, slice: u64, lanes: u64, lane_length: u64, segment_length: u64, m_prime: u64, t_cost: u64): []u64 {
+    var result = mem
+    var lane: u64 = 0
+    loop {
+        if lane >= lanes { break }
+        result = argon2_fill_segment(result, pass, lane, slice, m_prime, lanes, lane_length, segment_length, t_cost)
+        lane++
+    }
+    result
+}
+
+fn argon2_run_pass(mem: []u64, pass: u64, lanes: u64, lane_length: u64, segment_length: u64, m_prime: u64, t_cost: u64): []u64 {
+    var result = mem
+    var slice: u64 = 0
+    loop {
+        if slice >= 4 { break }
+        result = argon2_run_slice(result, pass, slice, lanes, lane_length, segment_length, m_prime, t_cost)
+        slice++
+    }
+    result
+}
+
+fn argon2_run_passes(mem: []u64, t_cost: u64, lanes: u64, lane_length: u64, segment_length: u64, m_prime: u64): []u64 {
+    var result = mem
+    var pass: u64 = 0
+    loop {
+        if pass >= t_cost { break }
+        result = argon2_run_pass(result, pass, lanes, lane_length, segment_length, m_prime, t_cost)
+        pass++
+    }
+    result
+}
+
+fn argon2_initial_block(h0: []byte, block_num: u64, lane: u64): []byte {
+    argon2_hprime([..h0, ..argon2_le32_bytes(block_num to u32), ..argon2_le32_bytes(lane to u32)], 1024)
+}
+
+fn argon2_init_memory(h0: []byte, m_prime: u64, lanes: u64, lane_length: u64): []u64 {
+    var mem = argon2_mem_zero(m_prime * 128)
+    var lane: u64 = 0
+    loop {
+        if lane >= lanes { break }
+        mem = argon2_mem_write_block(mem, lane * lane_length, argon2_bytes_to_words(argon2_initial_block(h0, 0, lane)))
+        mem = argon2_mem_write_block(mem, lane * lane_length + 1, argon2_bytes_to_words(argon2_initial_block(h0, 1, lane)))
+        lane++
+    }
+    mem
+}
+
+fn argon2_final_block(mem: []u64, lanes: u64, lane_length: u64): []byte {
+    var c = argon2_mem_read_block(mem, lane_length - 1)
+    var lane: u64 = 1
+    loop {
+        if lane >= lanes { break }
+        c = argon2_xor_block(c, argon2_mem_read_block(mem, lane * lane_length + lane_length - 1))
+        lane++
+    }
+    argon2_words_to_bytes(c)
+}
+
+fn argon2_derive(password: []byte, salt: []byte, secret: []byte, ad: []byte, t_cost: u64, m_cost_kib: u64, parallelism: u64, tag_len: u64): []byte {
+    var m_prime = 4 * parallelism * (m_cost_kib / (4 * parallelism))
+    var lane_length = m_prime / parallelism
+    var segment_length = lane_length / 4
+    var h0 = argon2_h0(password, salt, secret, ad, parallelism, tag_len, m_cost_kib, t_cost)
+    var mem = argon2_init_memory(h0, m_prime, parallelism, lane_length)
+    mem = argon2_run_passes(mem, t_cost, parallelism, lane_length, segment_length, m_prime)
+    argon2_hprime(argon2_final_block(mem, parallelism, lane_length), tag_len)
+}
+
+/**
+ * Argon2id (RFC 9106): the memory-hard password-hashing function, general entry with optional
+ * secret key and associated data. Validated against the official RFC 9106 §5.3 known-answer
+ * vector (`t=3`, `m=32` KiB, `p=4`, non-empty secret and associated data).
+ */
+exp fn argon2id(password: []byte, salt: []byte, secret: []byte, ad: []byte, t_cost: u64, m_cost_kib: u64, parallelism: u64, tag_len: u64): []byte | CryptoError {
+    if parallelism == 0 { return crypto_error("argon2id: parallelism must be at least 1") }
+    if t_cost == 0 { return crypto_error("argon2id: t_cost must be at least 1") }
+    if m_cost_kib < 8 * parallelism { return crypto_error("argon2id: m_cost_kib must be at least 8 * parallelism") }
+    if salt.len < 8 { return crypto_error("argon2id: salt must be at least 8 bytes") }
+    if tag_len < 4 { return crypto_error("argon2id: tag_len must be at least 4 bytes") }
+    argon2_derive(password, salt, secret, ad, t_cost, m_cost_kib, parallelism, tag_len)
+}
+
+/**
+ * Argon2id with no secret key and no associated data — the common password-hashing case.
+ */
+exp fn argon2id_hash(password: []byte, salt: []byte, t_cost: u64, m_cost_kib: u64, parallelism: u64, tag_len: u64): []byte | CryptoError {
+    argon2id(password, salt, [], [], t_cost, m_cost_kib, parallelism, tag_len)
+}

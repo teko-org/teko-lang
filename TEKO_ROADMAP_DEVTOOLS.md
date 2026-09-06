@@ -17,7 +17,7 @@
 The frontend already produces everything these tools need: the lexer emits tokens with `file:line:col`
 (E1), the parser builds a full AST, and **doc-comments are already parsed** (`has_doc`/`doc`, `/** … */`
 in `ast.tks`). Nothing consumes them yet. A formatter re-prints the AST; a doc generator walks it. Both
-are pure-Teko passes over structures that already exist — no new runtime, VM-`.tkt`-testable.
+are pure-Teko passes over structures that already exist — no new runtime, `.tkt`-testable.
 
 ---
 
@@ -63,11 +63,11 @@ only, `[..xs, x]` over push chains — the Phase-11 sweep targets), unused impor
 unhandled-`match`-arm hints. `teko lint <path>`, `--fix` for the mechanical ones. **Verify:** `.tkt`
 per-lint fixtures.
 
-### ▪ DT3 — `teko repl` (adjacent, T3)
-**Deps:** VM (`teko run`). **Files:** `src/repl/*.tks`. An interactive read-eval-print loop on the VM
-(which already tree-walks the checked program): evaluate expressions/decls incrementally, inspect values.
-The VM makes this feasible without codegen. **Verify:** native session smoke (scripted input → expected
-output).
+### ▪ DT3 — `teko repl` (RETIRED)
+Superseded by the native-only consolidation (DECISION_LOG D37, 2026-07-12): the REPL depended on the
+tree-walking legacy engine's evaluate-without-codegen capability, which no longer exists now that native
+is the sole execution engine. `teko repl` falls back to the generic "not a project" path (exit 1); the
+dev-loop equivalent is `teko run` (native debug build-and-exec, `cargo run`-style).
 
 ## 2. Dependency graph + tiers
 
@@ -75,7 +75,7 @@ output).
 lexer/parser/AST ─┬─ DT0 fmt   (comment re-attachment is the hard part)
                   ├─ DT1 doc   (doc-comments already parsed) ── --serve via teko::web
                   └─ DT2 lint  (reuses checker) ── --fix
-VM ─────────────── DT3 repl
+DT3 repl ── RETIRED (D37)
 ```
 
 **Tiers.** **T1:** DT0 `fmt` (highest ecosystem ROI, plus a CI `--check` gate), DT1 `doc`.

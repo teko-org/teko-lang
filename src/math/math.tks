@@ -1,141 +1,56 @@
-// src/math/math.tks   (namespace 'teko::math') — M0, the `teko::math` ROOT unit.
-// Per TEKO_ROADMAP_MATH.md §1 "M0 — teko::math root (common)":
-//
-//   "Constants (pi, tau, e, sqrt2, ln2, …; inf, nan producers); float classification
-//   (is_nan/is_inf/is_finite/is_normal); abs/sign/copysign; min/max/clamp (generic);
-//   integer helpers gcd/lcm/isqrt/ipow (checked). Pure Teko. Verify: .tkt."
-//
-// WHOLE-NAMESPACE GROUND RULE (§0 of the roadmap doc, quoted): "No operators — named
-// functions/methods... Errors are values. Domain/edge failures return T | error (or
-// error?), never panic." M0 has no domain failures of its own EXCEPT the integer
-// helpers (division-shaped: gcd/lcm/isqrt/ipow can overflow or hit an invalid input),
-// which per the doc are explicitly "(checked)" — they return `<int> | error` rather
-// than panicking, consistent with M1's checked_* family this unit hands off to.
-//
-// GENERIC min/max/clamp — DEVIATION FROM THE LITERAL WORDING, DOCUMENTED (M.3 honesty,
-// not silently wrong). The roadmap prose says "min/max/clamp (generic)". Verified against
-// the checker as it stands today (src/checker/expr.tks::is_numeric/is_comparable,
-// src/checker/typer.tks::type_binary/type_compare): comparison and arithmetic operators
-// only type-check against a concrete `Prim` type. A free generic `fn min<T>(a: T, b: T)`
-// body using `<`/`>` on the unconstrained (or nominally-constrained) type parameter T
-// does NOT type-check — S6 (constraint-gated operator availability on a generic type
-// parameter) is DESIGNED but not yet implemented (see teko-generics-constraints-rules
-// project memory: "OPERATING on T (members/operators) requires a constraint (S6)").
-// `examples/regressions/generic_constraints` only exercises PASS-THROUGH generics
-// (identity), never an operator on T — confirming this is not yet expressible.
-// So min/max/clamp ship here as a PER-TYPE family over the two numeric types the
-// project's own `Numeric` constraint precedent already recognizes (i64, f64) — mirrors
-// M1's own fallback wording ("Generic over the int types where possible, else a
-// per-width family"). A single truly generic entry point is a mechanical follow-up
-// once S6 lands; this is flagged, not silently narrowed.
-//
-// NO LIBM. §0 of the roadmap doc explicitly scopes M0 to constants/classification/
-// abs/sign/copysign/min/max/clamp/integer-helpers — none of these need a transcendental
-// function, so M0 needs no `extern` FFI at all (that begins at M2 `teko::math::real`,
-// a separate unit; the root `teko.tkp` manifest's `[extern.libs.*]` sections stay
-// untouched by this unit). Float classification (is_nan/is_inf/is_finite/is_normal) is
-// done via IEEE-754 bit inspection through the existing `teko::f64_bits`/
-// `teko::f64_from_bits` builtins (already wired end-to-end: checker/scope.tks,
-// codegen/codegen.tks, vm/vm.tks, runtime/teko_rt.c) — no new compiler-core surface
-// needed, no libm link.
+/** Ratio of a circle's circumference to its diameter. */
+exp const PI: f64 = 3.14159265358979323846
 
-// --- constants -----------------------------------------------------------------------
+/** `2 * PI`. */
+exp const TAU: f64 = 6.28318530717958647692
 
-/**
- * `PI` — the ratio of a circle's circumference to its diameter.
- */
-pub const PI: f64 = 3.14159265358979323846
+/** Euler's number, the base of the natural logarithm. */
+exp const E: f64 = 2.71828182845904523536
 
-/**
- * `TAU` — `2 * PI`, kept as its own literal (not folded from `PI`) so the
- * value does not depend on `*` folding order.
- */
-pub const TAU: f64 = 6.28318530717958647692
+/** Square root of 2. */
+exp const SQRT2: f64 = 1.41421356237309504880
 
-/**
- * `E` — Euler's number, the base of the natural logarithm.
- */
-pub const E: f64 = 2.71828182845904523536
+/** Natural logarithm of 2. */
+exp const LN2: f64 = 0.69314718055994530942
 
-/**
- * `SQRT2` — the square root of 2.
- */
-pub const SQRT2: f64 = 1.41421356237309504880
+/** Natural logarithm of 10. */
+exp const LN10: f64 = 2.30258509299404568402
 
-/**
- * `LN2` — the natural logarithm of 2.
- */
-pub const LN2: f64 = 0.69314718055994530942
-
-/**
- * `LN10` — the natural logarithm of 10.
- */
-pub const LN10: f64 = 2.30258509299404568402
-
-/**
- * `EXPONENT_MASK` — the IEEE-754 binary64 exponent field (bits 62..52, 11
- * bits; all-ones = `0x7FF` marks inf/nan).
- */
 const EXPONENT_MASK: u64 = 0x7FF0000000000000
-
-/**
- * `MANTISSA_MASK` — the IEEE-754 binary64 mantissa field (bits 51..0, 52
- * bits; zero mantissa + all-ones exponent = infinity, nonzero mantissa +
- * all-ones exponent = NaN).
- */
 const MANTISSA_MASK: u64 = 0x000FFFFFFFFFFFFF
-
-/**
- * `SIGN_MASK` — the IEEE-754 binary64 sign bit (bit 63).
- */
 const SIGN_MASK: u64 = 0x8000000000000000
 
-// inf() — positive IEEE-754 infinity (exponent all-ones, mantissa zero, sign clear).
-pub fn inf() -> f64 { teko::f64_from_bits(0x7FF0000000000000) }
+/** Positive IEEE-754 infinity. */
+exp fn inf(): f64 { teko::f64_from_bits(0x7FF0000000000000) }
 
-// nan() — a quiet NaN (exponent all-ones, mantissa's top bit set — the canonical
-// "quiet" pattern; sign clear). Any nonzero-mantissa all-ones-exponent pattern is
-// equally a NaN per IEEE-754; this is simply A representative producer.
-pub fn nan() -> f64 { teko::f64_from_bits(0x7FF8000000000000) }
+/** A quiet NaN. */
+exp fn nan(): f64 { teko::f64_from_bits(0x7FF8000000000000) }
 
-// --- float classification --------------------------------------------------------------
-
-// is_nan — true iff `v`'s bit pattern has an all-ones exponent AND a nonzero mantissa.
-// Deliberately NOT `v != v` (the classic self-inequality NaN trick): this goes straight
-// to the bit pattern so classification is exact regardless of how each engine happens
-// to implement float comparison against NaN.
-pub fn is_nan(v: f64) -> bool {
-    let bits = teko::f64_bits(v)
+/** True iff `v` is NaN. */
+exp fn is_nan(v: f64): bool {
+    var bits = teko::f64_bits(v)
     (bits & EXPONENT_MASK) == EXPONENT_MASK && (bits & MANTISSA_MASK) != 0
 }
 
-// is_inf — true iff `v`'s bit pattern has an all-ones exponent and a zero mantissa
-// (either sign — this reports BOTH +inf and -inf; there is no signed variant here
-// since the roadmap only asks for a plain classifier).
-pub fn is_inf(v: f64) -> bool {
-    let bits = teko::f64_bits(v)
+/** True iff `v` is positive or negative infinity. */
+exp fn is_inf(v: f64): bool {
+    var bits = teko::f64_bits(v)
     (bits & EXPONENT_MASK) == EXPONENT_MASK && (bits & MANTISSA_MASK) == 0
 }
 
-// is_finite — neither NaN nor infinite (the exponent field is not all-ones).
-pub fn is_finite(v: f64) -> bool {
+/** True iff `v` is neither NaN nor infinite. */
+exp fn is_finite(v: f64): bool {
     (teko::f64_bits(v) & EXPONENT_MASK) != EXPONENT_MASK
 }
 
-// is_normal — finite, nonzero, AND not a subnormal (denormal): the exponent field is
-// neither all-zero (zero/subnormal) nor all-ones (inf/nan).
-pub fn is_normal(v: f64) -> bool {
-    let exp_bits = teko::f64_bits(v) & EXPONENT_MASK
+/** True iff `v` is finite, nonzero, and not subnormal. */
+exp fn is_normal(v: f64): bool {
+    var exp_bits = teko::f64_bits(v) & EXPONENT_MASK
     exp_bits != 0 && exp_bits != EXPONENT_MASK
 }
 
-// --- abs / sign / copysign --------------------------------------------------------------
-// Per-type family (i64, f64) — mirrors the min/max/clamp note above; no operator-generic
-// form is expressible today (S6). i64 abs additionally covers the classic
-// `abs(i64::MIN)` overflow edge honestly: MIN has no positive counterpart in two's
-// complement, so `abs_i64` returns `i64 | error` rather than silently wrapping.
-
-pub fn abs_i64(v: i64) -> i64 | error {
+/** Absolute value; `i64::MIN` has no representable result. */
+exp fn abs_i64(v: i64): i64 | error {
     if v == -9223372036854775807 - 1 {
         return error { message = "math::abs_i64: i64::MIN has no representable absolute value" }
     }
@@ -143,72 +58,61 @@ pub fn abs_i64(v: i64) -> i64 | error {
     v
 }
 
-// abs_f64 — IEEE-754 fabs semantics: clear the SIGN BIT (bit 63), branch-free. This is
-// deliberately a bit operation and not `if v < 0.0 { -v }`: the comparison form misses
-// -0.0 (IEEE-754 says `-0.0 < 0.0` is FALSE, so -0.0 would pass through with its sign
-// bit still set), while the bit-clear returns +0.0 for -0.0, +inf for -inf, and a NaN
-// (sign cleared, same payload) for NaN — exactly fabs.
-pub fn abs_f64(v: f64) -> f64 {
+/** Absolute value (IEEE-754 fabs). */
+exp fn abs_f64(v: f64): f64 {
     teko::f64_from_bits(teko::f64_bits(v) & ~SIGN_MASK)
 }
 
-// sign — returns -1 / 0 / 1 (i64) for an i64 input's algebraic sign.
-pub fn sign_i64(v: i64) -> i64 {
+/** Algebraic sign of `v`: -1, 0, or 1. */
+exp fn sign_i64(v: i64): i64 {
     if v > 0 { return 1 }
     if v < 0 { return -1 }
     0
 }
 
-// sign — returns -1.0 / 0.0 / 1.0 (f64) for an f64 input's algebraic sign. NaN has no
-// meaningful sign for this purpose — returned as-is so the caller sees the domain edge
-// rather than a silently-wrong 0.0.
-pub fn sign_f64(v: f64) -> f64 {
+/** Algebraic sign of `v`: -1.0, 0.0, or 1.0; NaN returned as-is. */
+exp fn sign_f64(v: f64): f64 {
     if is_nan(v) { return v }
     if v > 0.0 { return 1.0 }
     if v < 0.0 { return -1.0 }
     0.0
 }
 
-// copysign — the magnitude of `magnitude` with the SIGN of `signed_value` (IEEE-754
-// copysign semantics; a bit-level operation, not `if signed_value < 0`, so it also
-// handles a signed zero / NaN `signed_value` correctly).
-pub fn copysign_f64(magnitude: f64, signed_value: f64) -> f64 {
-    let mag_bits = teko::f64_bits(magnitude) & ~SIGN_MASK
-    let sign_bit = teko::f64_bits(signed_value) & SIGN_MASK
+/** Magnitude of `magnitude` with the sign of `signed_value` (IEEE-754 copysign). */
+exp fn copysign_f64(magnitude: f64, signed_value: f64): f64 {
+    var mag_bits = teko::f64_bits(magnitude) & ~SIGN_MASK
+    var sign_bit = teko::f64_bits(signed_value) & SIGN_MASK
     teko::f64_from_bits(mag_bits | sign_bit)
 }
 
-// --- min / max / clamp (per-type family — see the header note on generic min/max/clamp) --
+exp fn min_i64(a: i64, b: i64): i64 { if a < b { return a }; b }
+exp fn max_i64(a: i64, b: i64): i64 { if a > b { return a }; b }
 
-pub fn min_i64(a: i64, b: i64) -> i64 { if a < b { return a }; b }
-pub fn max_i64(a: i64, b: i64) -> i64 { if a > b { return a }; b }
-
-// NaN-avoiding: if either operand is NaN, the OTHER (non-NaN) operand wins — mirrors
-// IEEE-754 minNum/maxNum semantics rather than propagating NaN silently through `<`.
-pub fn min_f64(a: f64, b: f64) -> f64 {
+/** Smaller of `a`/`b`; if either is NaN, the other wins. */
+exp fn min_f64(a: f64, b: f64): f64 {
     if is_nan(a) { return b }
     if is_nan(b) { return a }
     if a < b { return a }
     b
 }
-pub fn max_f64(a: f64, b: f64) -> f64 {
+/** Larger of `a`/`b`; if either is NaN, the other wins. */
+exp fn max_f64(a: f64, b: f64): f64 {
     if is_nan(a) { return b }
     if is_nan(b) { return a }
     if a > b { return a }
     b
 }
 
-// clamp — restrict `v` to `[lo, hi]`. An inverted range (`lo > hi`) is a domain error
-// (the caller's contract, not a value to silently reinterpret) — returns `T | error`
-// per the roadmap's "errors are values" ground rule.
-pub fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 | error {
+/** Restricts `v` to `[lo, hi]`; errors if `lo > hi`. */
+exp fn clamp_i64(v: i64, lo: i64, hi: i64): i64 | error {
     if lo > hi { return error { message = "math::clamp_i64: lo > hi" } }
     if v < lo { return lo }
     if v > hi { return hi }
     v
 }
 
-pub fn clamp_f64(v: f64, lo: f64, hi: f64) -> f64 | error {
+/** Restricts `v` to `[lo, hi]`; errors if `lo > hi`; NaN passes through. */
+exp fn clamp_f64(v: f64, lo: f64, hi: f64): f64 | error {
     if lo > hi { return error { message = "math::clamp_f64: lo > hi" } }
     if is_nan(v) { return v }
     if v < lo { return lo }
@@ -216,67 +120,41 @@ pub fn clamp_f64(v: f64, lo: f64, hi: f64) -> f64 | error {
     v
 }
 
-// --- integer helpers: gcd / lcm / isqrt / ipow (checked) --------------------------------
-// All over i64 (the project's default machine-int width for non-FFI code — mirrors the
-// Numeric constraint precedent and M1's own family shape). Every one of these is
-// "checked" per the roadmap: a domain/overflow edge is a returned error, never a panic.
-
-// gcd — Euclid's algorithm via `loop` (Teko's ONLY loop form — B.no-while/for). Defined
-// over non-negative inputs; a negative operand is a domain error (this module does not
-// silently `abs` it, since `gcd(i64::MIN, x)` cannot be made positive — see abs_i64).
-pub fn gcd(a: i64, b: i64) -> i64 | error {
+/** Greatest common divisor of two non-negative integers (Euclid's algorithm). */
+exp fn gcd(a: i64, b: i64): i64 | error {
     if a < 0 || b < 0 { return error { message = "math::gcd: operands must be non-negative" } }
-    mut x = a
-    mut y = b
+    var x = a
+    var y = b
     loop {
         if y == 0 { break }
-        let r = x % y
+        var r = x % y
         x = y
         y = r
     }
     x
 }
 
-// lcm — a*b/gcd(a,b), computed as (a/gcd)*b to reduce overflow risk versus (a*b)/gcd;
-// still checked: `(a/gcd) * b` can itself overflow i64 for large enough operands, and
-// a zero operand makes the quantity undefined — both are reported as errors.
-//
-// NOTE ON SHAPE: the `gcd(a, b)` unwrap below is a bare STATEMENT match (assigning into
-// a pre-declared `mut`), not a value-position match — a `match` used as a sub-expression
-// (e.g. `let g = match … { … => return e }`) cannot carry `return` in an arm on the VM
-// today ("control flow inside a `match` used as a sub-expression not yet supported" —
-// an honest VM limitation, confirmed live against this very module). This shape sidesteps
-// it while staying byte-for-byte equivalent on the native engine.
-pub fn lcm(a: i64, b: i64) -> i64 | error {
+/** Least common multiple of two non-negative integers. */
+exp fn lcm(a: i64, b: i64): i64 | error {
     if a < 0 || b < 0 { return error { message = "math::lcm: operands must be non-negative" } }
     if a == 0 || b == 0 { return error { message = "math::lcm: undefined for a zero operand" } }
-    mut g: i64 = 0
+    var g: i64 = 0
     match gcd(a, b) {
         i64 as v => { g = v }
         error as e => return e
     }
-    let scaled = a / g
+    var scaled = a / g
     if scaled != 0 && b > I64_MAX / scaled { return error { message = "math::lcm: result overflows i64" } }
     scaled * b
 }
 
-// isqrt — the integer square root: floor(sqrt(n)) for n >= 0, computed by Newton's
-// method over integers only (no float sqrt — that lives in M2/teko::math::real; M0
-// stays libm-free). Negative input is a domain error.
-//
-// OVERFLOW SAFETY (this module's own checked-arithmetic contract): the initial guess is
-// `n / 2 + 1`, NOT `(n + 1) / 2` — the latter's `n + 1` wraps at n = i64::MAX and
-// silently corrupts the whole iteration. With n >= 4 the guess is < n (the loop always
-// enters) and every subsequent intermediate is bounded: once x >= floor(sqrt(n)),
-// `x + n / x <= x + sqrt(n) <= n/2 + 1 + sqrt(n) < i64::MAX` — no expression in the
-// loop can wrap. n in 1..=3 (where `n/2 + 1` would NOT descend below x for n = 2) is
-// answered directly: floor(sqrt(1..3)) = 1.
-pub fn isqrt(n: i64) -> i64 | error {
+/** Integer square root: `floor(sqrt(n))` for `n >= 0`. */
+exp fn isqrt(n: i64): i64 | error {
     if n < 0 { return error { message = "math::isqrt: n must be non-negative" } }
     if n == 0 { return 0 }
     if n < 4 { return 1 }
-    mut x = n
-    mut y = n / 2 + 1
+    var x = n
+    var y = n / 2 + 1
     loop {
         if y >= x { break }
         x = y
@@ -285,23 +163,12 @@ pub fn isqrt(n: i64) -> i64 | error {
     x
 }
 
-// ipow — checked integer exponentiation by squaring: base^exp for exp >= 0. A negative
-// exponent has no integer result (checked error, not a truncating 0/1). Overflow of any
-// intermediate or final i64 result is checked (never wrapped).
-//
-// CONVENTION: `ipow(0, 0) == 1` — the empty product (the standard discrete-math /
-// programming-language convention, matching C's pow(0,0)=1 and every mainstream integer
-// pow). Callers needing the "0^0 undefined" analysis-style treatment must check for the
-// (0, 0) input themselves; this function does not error on it.
-//
-// NOTE ON SHAPE: `checked_mul_i64`'s result is unwrapped via a bare-STATEMENT match (into
-// a pre-declared `mut`), not a value-position match — see the identical note on `lcm`
-// above (VM: no `return` inside a value-position match arm).
-pub fn ipow(base: i64, exponent: i64) -> i64 | error {
+/** Checked integer exponentiation: `pow_base^exponent` for `exponent >= 0`. */
+exp fn ipow(pow_base: i64, exponent: i64): i64 | error {
     if exponent < 0 { return error { message = "math::ipow: negative exponent has no integer result" } }
-    mut result: i64 = 1
-    mut b = base
-    mut e = exponent
+    var result: i64 = 1
+    var b = pow_base
+    var e = exponent
     loop {
         if e == 0 { break }
         if e % 2 == 1 {

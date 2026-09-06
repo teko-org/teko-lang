@@ -1,0 +1,122 @@
+const SHARD_SEEN: u64 = 34664
+
+const SHARD_COUNT: u64 = 34672
+
+const SHARD_INDEX: u64 = 34680
+
+const SHARD_PARSED: u64 = 34688
+
+const SHARD_ENV: str = "TEKO_TEST_SHARD"
+
+fn scope_byte_ok(c: byte): bool {
+    if c >= b'a' && c <= b'z' { return true }
+    if c >= b'A' && c <= b'Z' { return true }
+    if c >= b'0' && c <= b'9' { return true }
+    c == b'_' || c == b'-'
+}
+
+fn sanitize(label: str): str {
+    var xs: [label.len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= label.len { break }
+        xs[i] = if scope_byte_ok(label[i]) { label[i] } else { b'_' }
+        i++
+    }
+    str(xs)
+}
+
+fn all_digits(s: str): bool {
+    if s.len == 0 { return false }
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        if s[i] < b'0' || s[i] > b'9' { return false }
+        i++
+    }
+    true
+}
+
+fn to_uint(s: str): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        n = n * 10 + ((s[i] to u64) - (b'0' to u64))
+        i++
+    }
+    n
+}
+
+fn find_slash(v: str): u64 {
+    var i: u64 = 0
+    loop {
+        if i >= v.len { break }
+        if v[i] == b'/' { return i }
+        i++
+    }
+    v.len
+}
+
+fn shard_parse() {
+    teko::runtime::ctrl_set(SHARD_PARSED, 1)
+    teko::runtime::ctrl_set(SHARD_COUNT, 0)
+    teko::runtime::ctrl_set(SHARD_INDEX, 0)
+    var v = match teko::env::var(SHARD_ENV) { str as s => s; error => return }
+    var slash = find_slash(v)
+    if slash >= v.len { return }
+    var ipart = v.slice_to(slash)
+    var npart = v.slice_from(slash + 1)
+    if !all_digits(ipart) || !all_digits(npart) { return }
+    var i = to_uint(ipart)
+    var n = to_uint(npart)
+    if n <= 1 || i >= n { return }
+    teko::runtime::ctrl_set(SHARD_INDEX, i)
+    teko::runtime::ctrl_set(SHARD_COUNT, n)
+}
+
+fn active_shard_index(): u64 {
+    if teko::runtime::ctrl_get(SHARD_PARSED) == 0 { shard_parse() }
+    if teko::runtime::ctrl_get(SHARD_COUNT) > 1 { return teko::runtime::ctrl_get(SHARD_INDEX) }
+    0
+}
+
+/**
+ * teko::test::shard_take — advance the suite ordinal and report whether THIS shard runs the current
+ * test. Round-robin by ordinal modulo the shard count from `TEKO_TEST_SHARD` (`<i>/<n>`); a missing or
+ * malformed value runs the whole suite.
+ *
+ * @return  true when the current test belongs to this shard (always true when unsharded)
+ * @since 0.3.1
+ */
+exp fn shard_take(): bool {
+    if teko::runtime::ctrl_get(SHARD_PARSED) == 0 { shard_parse() }
+    var ordinal = teko::runtime::ctrl_get(SHARD_SEEN)
+    teko::runtime::ctrl_set(SHARD_SEEN, ordinal + 1)
+    var count = teko::runtime::ctrl_get(SHARD_COUNT)
+    if count <= 1 { return true }
+    (ordinal % count) == teko::runtime::ctrl_get(SHARD_INDEX)
+}
+
+/**
+ * teko::test::scope — a filesystem-safe token for the test whose channel is open, `.s<shard>-<label>`
+ * with every non-alphanumeric label byte folded to `_`. Empty when no test is running.
+ *
+ * @return  the per-test scope token, or "" when called outside a running test
+ * @since 0.3.1
+ */
+exp fn scope(): str {
+    var label = teko::runtime::test_label()
+    if label.len == 0 { return "" }
+    teko::str::concat(".s", teko::str::u64_to_str(active_shard_index()), "-", sanitize(label))
+}
+
+/**
+ * teko::test::scoped — the scratch path `stem` resolves to for the running test, isolating each test's
+ * temporary files under its own scope directory.
+ *
+ * @param stem  the scratch path stem to resolve
+ * @return      the scoped scratch path
+ * @since 0.3.1
+ */
+exp fn scoped(stem: str): str { teko::journal::scratch(stem) }

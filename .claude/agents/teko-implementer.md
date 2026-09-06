@@ -12,8 +12,8 @@ The compiler is the latest RELEASED teko binary (CI seeds from it). Before doing
 
 ## The flow (1 issue = 1 branch = 1 PR)
 1. Branch off `main`: `<type>/issue-NNN-slug` (`feat/` for features, `fix/` for bugs, `perf/`, `chore/`, `docs/`). If the issue says "sub-PRs", make the parent branch and stack sub-branches, one draft PR each.
-2. Implement in **`.tks` only**. NEVER edit the frozen C twins (checker/codegen/vm/build `.c`) — the sole maintained C is `src/runtime/teko_rt.{c,h}` + the assert seed (the runtime linked into generated programs; touch it only when the issue is genuinely a runtime/FFI change).
-3. Add the regression fixtures the issue/architect specifies (VM and native expected exit codes).
+2. Implement in **`.tks` only**. NEVER edit the frozen C bootstrap twins (checker/codegen/build `.c`) — the sole maintained C is `src/runtime/teko_rt.{c,h}` + the assert seed (the runtime linked into generated programs; touch it only when the issue is genuinely a runtime/FFI change).
+3. Add the regression fixtures the issue/architect specifies (native expected exit codes).
 4. Run the ritual (see below). If it fails, fix; do not open the PR red.
 5. Open a **draft** PR base `main`, body: what it delivers + `Closes #NNN` + the ritual results. Push after each green commit.
 
@@ -39,7 +39,7 @@ The compiler is the latest RELEASED teko binary (CI seeds from it). Before doing
 - Keep the Teko style laws: only `loop { }`; never `match` on a bool; casts `bool→numeric` only.
 
 ## The ritual (compiler changes)
-Self-hosted gate BOTH engines (VM `teko test .` + native build), `bash scripts/diff_vm_native.sh` (51/0/1), `TEKO_MEM_PARANOID=1` build exit 0, FIXPOINT gen-2 == gen-3 byte-identical, and note the self-reported peak. Pure-Teko libs/examples: at least VM + native run agree on the regression's exit code.
+Self-hosted gate native build (`teko test .` native gate), `bash scripts/diff_c_own.sh` own-vs-C differential, `TEKO_MEM_PARANOID=1` build exit 0, FIXPOINT gen-2 == gen-3 byte-identical, and note the self-reported peak. Pure-Teko libs/examples: regression fixtures pass native gate + own==C differential agrees.
 
 ## Standing laws
 - **Issues are 100%:** deliver the whole proposal, zero regressions. A gap/bug/failure WITHIN your task's scope is fixed NOW — never honest-stop-and-defer it, even if the fix pulls forward future-planned work (owner no-deferral ruling 2026-07-16); HALT only if it needs a genuine owner product decision or a prerequisite you cannot pull in. Found something genuinely ADJACENT/out of scope? REPORT it in your final message (the integrator resolves it in-wave, not later) — never `gh issue create` yourself, never expand scope, never frame a real failure as a deferrable "follow-up".

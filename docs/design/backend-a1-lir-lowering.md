@@ -1,5 +1,7 @@
 # A1 / N2a — closing the LIR lowering coverage frontier (crumb plan)
 
+> **[NOTA]** — este documento descreve oráculos diferenciais ativos durante o bring-up do backend nativo. Ambos os oráculos foram desde então **retirados** (#524 e seguintes); o restante deste documento é registro histórico do método usado, não descreve o estado atual do projeto.
+
 **Status:** PLAN (doc-only). Sub-PR of the 0.3 own-AOT-backend wave (umbrella
 `remodel/backend-build`). Issue **#382**. Branch `fix/issue-382-lir-lowering`, which becomes a
 **mini-umbrella**: A1 is XL, so it is drained as an ordered set of sub-sub-PRs based on this branch
@@ -7,7 +9,7 @@ itself, each independently gate-able and kept well under the timebox. Base for t
 `docs/design/own-backend-architecture.md` §3.2 (the N2 coverage frontier) and §4 Phase A.
 
 > The deliverable of A1 is a COMPLETE TAST→LIR lowering (every construct the checker produces)
-> proven by the LIR-interpreter oracle (exit-code parity vs the VM over the runnable subset) plus
+> proven by the LIR oracle (exit-code parity vs the LIR oracle over the runnable subset) plus
 > golden LIR-dump diffs. A1 emits NO machine code: isel/regalloc/encode/objfile are A2–A4. The value
 > of A1 is lowering completeness, validated independently of any target.
 
@@ -35,7 +37,7 @@ Grounded in `src/lir/lower.tks`:
   VRegs `0..n_params` (`lower_function` `:554-570`), a synthesized virtual `main` over the loose
   top-level statements (`lower_program`/`lower_virtual_main` `:624-678`).
 
-The LIR interpreter (`lir_interp.tks`) runs exactly this subset: integer const/bin/un/param/ret + a
+The LIR oracle (`lir_oracle.tks`) runs exactly this subset: integer const/bin/un/param/ret + a
 direct Teko call + `tk_exit`. Floats are lowered but **not run** (`:166`); `LJump`/`LBranch` are
 declared but honest-stop at runtime (`:172-173`). The printer (`lir_print.tks`) is already complete
 for the whole *declared* op set — it prints `jump`/`branch`/block-args (`:162-174`, `:197-201`) even
@@ -72,7 +74,7 @@ the IR to grow:
    in N2"). **A1 EXTENDS `LOp` and `LModule`** — this is explicitly sanctioned (`lir.tks:15-17`,
    `:96`): the *scalar* enums (`LType`, `LBinOp`, `LUnOp`) are frozen, but the instruction set and the
    module were always going to grow in N2. Each new `LOp` case must extend three sites in lockstep:
-   `lir_print.print_op`, `lir_interp.interp_inst`, and (where value-producing) the lowering.
+   `lir_print.print_op`, `lir_oracle.oracle_inst`, and (where value-producing) the lowering.
 
 There is **no `.tkb`/serialization concern** for these additions: the LIR is in-memory only (lowered,
 then consumed by isel); only the TAST is codec'd. So extending `LOp` touches no wire format.
@@ -154,7 +156,7 @@ pub type LCallIndirect = struct { target: u32; args: []u32; variadic: bool }
 `LOp` grows to
 `… | LAlloca | LFieldAddr | LLoad | LStore | LGlobalAddr | LFuncAddr | LCallIndirect`, and every one
 gets an `lir.tks` builder (`alloca_inst`, `load_inst`, …) mirroring the existing `*_inst` helpers, a
-`lir_print` case, and an `lir_interp` case.
+`lir_print` case, and an `lir_oracle` case.
 
 ### 2.2 `LModule` growth (A1-3 / A1-4)
 
@@ -223,13 +225,13 @@ words at `offset` and `offset+8`.
 
 Each row is a PR **based on `fix/issue-382-lir-lowering`**, drained in order to preserve the seed
 sequence; each is independently gate-able (its own `.tkt` fixtures + golden dump) and sized under the
-timebox. `LIR-interp` and `lir_print` grow one case per closed honest-stop, in the same PR.
+timebox. `LIR-oracle` and `lir_print` grow one case per closed honest-stop, in the same PR.
 
 | # | Title | Depends | One-line scope |
 |---|-------|---------|----------------|
 | **A1-1** | control-flow core: multi-block + comparisons + `if` | — | block alloc/switch infra + block-args, `TCompare`, `if`-expr/`if`-stmt via `LBranch`/`LJump` |
 | **A1-2** | `loop` / `break` / `continue` / `defer` | A1-1 | loop-target stack, break/continue jumps, defer-replay at every scope exit |
-| **A1-3** | memory + aggregates + scalar leaves | A1-1 | new `LAlloca`/`LFieldAddr`/`LLoad`/`LStore` + interp memory model + `LStructLayout`; `TStructInit`/`TFieldAccess`/`TIndex`/`TArrayLit`/`TAssign`; `TByteLit`/`TCharLit`/`TBoolLit`/`TNullLit`/`TPathExpr` |
+| **A1-3** | memory + aggregates + scalar leaves | A1-1 | new `LAlloca`/`LFieldAddr`/`LLoad`/`LStore` + oracle memory model + `LStructLayout`; `TStructInit`/`TFieldAccess`/`TIndex`/`TArrayLit`/`TAssign`; `TByteLit`/`TCharLit`/`TBoolLit`/`TNullLit`/`TPathExpr` |
 | **A1-4** | rodata + `str`/`slice` fat-pointers + interpolation | A1-3 | `LRodata`/`LGlobal`/`LGlobalAddr`, `TStrLit`, fat-pointer two-VReg threading, `.len`, `TInterp`, `TInExpr`, `TSafeFieldAccess`/`TCoalesce` |
 | **A1-5** | `match` (all arms) | A1-1, A1-4 | full `TMatchExpr`/match-stmt: scalar + variant-tag + string arms, `when` guards, binding patterns |
 | **A1-6** | interface dispatch (vtable load + indirect call) | A1-3 | `LCallIndirect`; load vtable slot from the receiver fat pointer, indirect call (`TCall.is_iface_dispatch`) |
@@ -241,38 +243,38 @@ after it. When A1-7 merges, the branch's honest-stops are all closed and the min
 
 ### A1-1 · control-flow core
 
-- **Touches:** `lir.tks` (add `alloc_block(f) -> {func, block_id}`, and make `LowerCtx`/`ctx_append`
+- **Touches:** `lir.tks` (add `alloc_block(f): {func, block_id}`, and make `LowerCtx`/`ctx_append`
   block-aware — already parametric on `block_id`, so mainly a block-allocator + a helper to *start*
   emitting into a new block); `lower.tks` (add `lower_compare`, `lower_if_expr`, dispatch `TIfExpr`
-  in `lower_expr`; teach `lower_block` that a branch/jump also terminates); `lir_interp.tks`
-  (multi-block execution: `interp_block` must follow `LJump`/`LBranch` to the target block, binding
+  in `lower_expr`; teach `lower_block` that a branch/jump also terminates); `lir_oracle.tks`
+  (multi-block execution: `oracle_block` must follow `LJump`/`LBranch` to the target block, binding
   block-args into the target's param VRegs; add comparison arms to `eval_bin`); `lir_print.tks`
   (already complete — verify block-arg printing).
 - **New shapes:** block-args as the SSA-lite merge (§2.4); `lower_compare` maps a `TCompare`
   (`first` + `rest` chain) to `ICmp*`/`FCmp*` picked by operand `PrimKind` + token, ANDing multi-term
   chains.
-- **Interp cases added:** `LBranch` (read cond, pass block-args, jump), `LJump` (pass block-args,
-  jump), `ICmpEq`…`ICmpGeU`/`FCmp*` in `eval_bin`. The interp gains a block-lookup + a bounded
+- **Oracle cases added:** `LBranch` (read cond, pass block-args, jump), `LJump` (pass block-args,
+  jump), `ICmpEq`…`ICmpGeU`/`FCmp*` in `eval_bin`. The oracle gains a block-lookup + a bounded
   block-step loop (guard against a cycle with a step budget, like the depth guard).
 - **Fixtures:** `lower_test.tkt` — golden dump of `if a < b { return a } return b` (assert the
-  `branch`/`jump`/`#B` structure + the merge block-arg). `lir_interp_test.tkt` — F6 `exit(if x<y {x} else {y})` parity; F7 a comparison chain `a<b<c`. Golden LIR-dump fixture for the if.
-- **Verifies via:** interp exit-code parity for F6/F7 + golden if-dump diff.
+  `branch`/`jump`/`#B` structure + the merge block-arg). `lir_oracle_test.tkt` — F6 `exit(if x<y {x} else {y})` parity; F7 a comparison chain `a<b<c`. Golden LIR-dump fixture for the if.
+- **Verifies via:** oracle exit-code parity for F6/F7 + golden if-dump diff.
 
 ### A1-2 · loop / break / continue / defer
 
 - **Touches:** `lower.tks` (`LowerCtx` gains `loop_targets: []LoopTargets` and `defers: [][]TStatement`;
   `lower_loop`, `lower_break`, `lower_continue`, `lower_defer`; an `exit_scope` helper that replays
-  defers before a terminator; dispatch the four `TStatement`s in `lower_stmt`); `lir_interp.tks`
+  defers before a terminator; dispatch the four `TStatement`s in `lower_stmt`); `lir_oracle.tks`
   (nothing new structurally — loops are just jumps the multi-block executor already follows once A1-1
   lands; keep the step budget). `lir_print.tks` unchanged.
 - **New shapes:** loop-target stack + defer stack (§2.4). Labelled break/continue resolve by scanning
   the stack for the matching label (empty label = innermost).
-- **Interp cases added:** none (jumps reuse A1-1); add a fixture-driven loop-termination step budget
+- **Oracle cases added:** none (jumps reuse A1-1); add a fixture-driven loop-termination step budget
   if not already present.
 - **Fixtures:** `lower_test.tkt` — golden dump of a counting loop with `break`; a `defer` that runs
-  before `return`. `lir_interp_test.tkt` — F8 `let s=0; loop { ...; break }; exit(s)` sums to a known
+  before `return`. `lir_oracle_test.tkt` — F8 `let s=0; loop { ...; break }; exit(s)` sums to a known
   code; F9 a `defer`-ordered side effect observable through the returned value.
-- **Verifies via:** interp parity for F8/F9 + golden loop/defer dump.
+- **Verifies via:** oracle parity for F8/F9 + golden loop/defer dump.
 
 ### A1-3 · memory + aggregates + scalar leaves
 
@@ -280,18 +282,18 @@ after it. When A1-7 merges, the branch's honest-stops are all closed and the min
   `LModule` with `layouts`; add `LStructLayout` + a `layout_of(name, checker types)` computing
   declared-order natural-alignment offsets); `lower.tks` (dispatch `TStructInit`, `TFieldAccess`,
   `TIndex`, `TArrayLit`, `TAssign`, and the scalar leaves `TByteLit`/`TCharLit`/`TBoolLit`/`TNullLit`/
-  `TPathExpr`); `lir_interp.tks` (a **memory model** — see §5.1 decision: a growable `[]i128` cell
+  `TPathExpr`); `lir_oracle.tks` (a **memory model** — see §5.1 decision: a growable `[]i128` cell
   store keyed by address, addresses are cell indices; `LAlloca` reserves cells, `LStore`/`LLoad`
   write/read a cell, `LFieldAddr` is base+offset arithmetic over cell indices); `lir_print.tks` (print
   the four new ops + a module rodata/layout header).
 - **New shapes:** §2.1 memory ops, §2.2 `LStructLayout`. Scalar leaves are trivial: `TBoolLit`/
   `TByteLit`/`TCharLit`→`LConstInt` (char = its codepoint scalar), `TNullLit`→a null Ptr const,
   `TPathExpr`→`LConstInt` of the resolved `.value`.
-- **Interp cases added:** `LAlloca`, `LFieldAddr`, `LLoad`, `LStore` over the cell store.
+- **Oracle cases added:** `LAlloca`, `LFieldAddr`, `LLoad`, `LStore` over the cell store.
 - **Fixtures:** `lower_test.tkt` — golden dump of `struct{a;b}` init + field read; `arr[i]` index.
-  `lir_interp_test.tkt` — F10 `let p = Point{x=3;y=4}; exit(p.x + p.y)` → 7; F11
+  `lir_oracle_test.tkt` — F10 `let p = Point{x=3;y=4}; exit(p.x + p.y)` → 7; F11
   `let a = [10,20,30]; exit(a[1])` → 20; F12 a field mutation via `TAssign`.
-- **Verifies via:** interp parity F10–F12 + golden aggregate dump. `lir_test.tkt` gains a
+- **Verifies via:** oracle parity F10–F12 + golden aggregate dump. `lir_test.tkt` gains a
   `layout_of` unit test (offsets/size/align for a mixed-width struct).
 
 ### A1-4 · rodata + str/slice fat-pointers + interpolation
@@ -300,31 +302,31 @@ after it. When A1-7 merges, the branch's honest-stops are all closed and the min
   `add_global`; widen `LModule`); `lower.tks` (`TStrLit`→intern rodata + materialize `{ptr,len}`;
   fat-pointer threading `FatVReg`; `.len` field read short-circuits to the len VReg; `TInterp`→a
   sequence of runtime formatter calls building a string; `TInExpr`; `TSafeFieldAccess`/`TCoalesce`→a
-  null-check branch reusing A1-1); `lir_interp.tks` (a rodata byte table; `LGlobalAddr` yields a
+  null-check branch reusing A1-1); `lir_oracle.tks` (a rodata byte table; `LGlobalAddr` yields a
   rodata address; string ops the fixtures need — keep fixtures exit-code-observable via `.len`/byte
   index so no `tk_println` is required, §4); `lir_print.tks` (rodata section printing + `LGlobalAddr`).
 - **New shapes:** §2.2 rodata/globals, §2.3 fat pointers.
-- **Interp cases added:** `LGlobalAddr` (rodata address), byte-load from rodata (reuse `LLoad`).
+- **Oracle cases added:** `LGlobalAddr` (rodata address), byte-load from rodata (reuse `LLoad`).
 - **Fixtures:** `lower_test.tkt` — golden dump of `"hi"` (rodata entry + `{ptr,len}`); a `??` coalesce.
-  `lir_interp_test.tkt` — F13 `exit("hello".len)` → 5; F14 `exit("abc"[0] to i32)` → 97; F15 a `??`
+  `lir_oracle_test.tkt` — F13 `exit("hello".len)` → 5; F14 `exit("abc"[0] to i32)` → 97; F15 a `??`
   fallback returning a known code.
-- **Verifies via:** interp parity F13–F15 + golden rodata/str dump.
+- **Verifies via:** oracle parity F13–F15 + golden rodata/str dump.
 
 ### A1-5 · match (all arms)
 
 - **Touches:** `lower.tks` (`lower_match`: subject once, per-arm test chain, `when` guards, binding
   patterns bind the subject/payload VReg into the arm env, merge block for the expr result; handles
   scalar arms via `ICmpEq`, variant arms via a tag load + payload field addresses, string arms via a
-  runtime compare); `lir_interp.tks` (nothing new structurally — reuses branches + loads); the
+  runtime compare); `lir_oracle.tks` (nothing new structurally — reuses branches + loads); the
   existing `lwt_honest_stop_on_match_expr` test (`lower_test.tkt:243-249`) **flips** from asserting
   the honest-stop to asserting the lowered dump.
 - **New shapes:** the match test-chain (§2.4). Variant tag offset comes from `LStructLayout`
   (the tag is field 0 of a variant's runtime image).
-- **Interp cases added:** none (composition of A1-1 branches + A1-3/A1-4 loads).
+- **Oracle cases added:** none (composition of A1-1 branches + A1-3/A1-4 loads).
 - **Fixtures:** `lower_test.tkt` — golden dump of a 3-arm enum match with a wildcard; a variant match
-  binding a payload. `lir_interp_test.tkt` — F16 `match e { A=>1; B=>2; _=>0 }` fed to `exit`; F17 a
+  binding a payload. `lir_oracle_test.tkt` — F16 `match e { A=>1; B=>2; _=>0 }` fed to `exit`; F17 a
   `when`-guarded arm; F18 a variant-payload arm returning the payload.
-- **Verifies via:** interp parity F16–F18 + golden match dump + the flipped honest-stop test.
+- **Verifies via:** oracle parity F16–F18 + golden match dump + the flipped honest-stop test.
 
 ### A1-6 · interface dispatch (vtable load + indirect call)
 
@@ -332,17 +334,17 @@ after it. When A1-7 merges, the branch's honest-stops are all closed and the min
   `:381`: the receiver `args[0]` is the interface fat pointer `{data, vtable}`; load the vtable ptr
   (field 1), load slot `iface_slot` (`LFieldAddr` base=vtable, offset=`iface_slot*8`; `LLoad` Ptr),
   then `LCallIndirect` with `data` prepended to the remaining args — mirrors the C backend's
-  `value.vtable[slot](args)`, `codegen.tks:2058-2118`); `lir_interp.tks` (`LCallIndirect`: resolve the
+  `value.vtable[slot](args)`, `codegen.tks:2058-2118`); `lir_oracle.tks` (`LCallIndirect`: resolve the
   target VReg to a function via a vtable model — see §5.2; recurse like `LCall`); `lir_print.tks`
   (`LCallIndirect` as `call.indirect %t(args)`).
 - **New shapes:** §2.1 `LCallIndirect`; the vtable is an rodata array of `LFuncAddr` slots
   (symbol `tk_vt_<Class>_<Base>`, matching the C symbol so A4's differential holds).
-- **Interp cases added:** `LCallIndirect`; a vtable/function-pointer model (an address→symbol map
+- **Oracle cases added:** `LCallIndirect`; a vtable/function-pointer model (an address→symbol map
   populated when a vtable rodata entry is built).
 - **Fixtures:** `lower_test.tkt` — golden dump of an interface-method call (vtable load + indirect
-  call). `lir_interp_test.tkt` — F19 a two-impl interface dispatched dynamically, each returning a
+  call). `lir_oracle_test.tkt` — F19 a two-impl interface dispatched dynamically, each returning a
   distinct exit code.
-- **Verifies via:** interp parity F19 + golden iface-dispatch dump.
+- **Verifies via:** oracle parity F19 + golden iface-dispatch dump.
 
 ### A1-7 · closures + function-as-value
 
@@ -350,15 +352,15 @@ after it. When A1-7 merges, the branch's honest-stops are all closed and the min
   arm `:326`: a bare fn → a closure literal `{fn = LFuncAddr sym, env = null}`; `TLambda` → the lifted
   fn's `LFuncAddr` + an env aggregate of the captures (`LAlloca` + field stores, reusing A1-3);
   `lower_call` closure arm `:380`: load the `fn` field, `LCallIndirect` passing the `env` — mirrors
-  the C backend's `((R(*)(A,B))f.fn)(args)`); `lir_interp.tks` (`LFuncAddr` yields a function address
+  the C backend's `((R(*)(A,B))f.fn)(args)`); `lir_oracle.tks` (`LFuncAddr` yields a function address
   the vtable/fn-pointer model resolves; closure call recurses like A1-6); `lir_print.tks`
   (`LFuncAddr` as `funcaddr @sym`).
 - **New shapes:** §2.1 `LFuncAddr`; closure aggregate `{fn, env}` (layout via A1-3).
-- **Interp cases added:** `LFuncAddr` (reuses A1-6's fn-pointer model).
+- **Oracle cases added:** `LFuncAddr` (reuses A1-6's fn-pointer model).
 - **Fixtures:** `lower_test.tkt` — golden dump of `let f = add; f(2,3)` and a capturing lambda.
-  `lir_interp_test.tkt` — F20 a function-as-value called indirectly → known code; F21 a lambda
+  `lir_oracle_test.tkt` — F20 a function-as-value called indirectly → known code; F21 a lambda
   capturing a local, called, returning the captured value.
-- **Verifies via:** interp parity F20/F21 + golden closure dump. On merge, all honest-stops are
+- **Verifies via:** oracle parity F20/F21 + golden closure dump. On merge, all honest-stops are
   closed — assert (in a final review, not a new test) that `lower_expr`/`lower_stmt` catch-alls are now
   only reachable by internal invariant breaks, not by any checker-produced node.
 
@@ -368,12 +370,12 @@ after it. When A1-7 merges, the branch's honest-stops are all closed and the min
 
 A1 has **no machine code**, so correctness is proven two ways, both cheap and host-only:
 
-1. **The LIR-interpreter oracle — exit-code parity vs the VM.** Each sub-sub-PR adds `iwt_*` fixtures
-   (`lir_interp_test.tkt`) that build the construct as LIR (by hand or via the lowering) and assert
-   the exit code `interp_lmodule` produces equals what the VM produces for the equivalent Teko source.
+1. **The LIR oracle — exit-code parity vs the LIR oracle.** Each sub-sub-PR adds `iwt_*` fixtures
+   (`lir_oracle_test.tkt`) that build the construct as LIR (by hand or via the lowering) and assert
+   the exit code `oracle_lmodule` produces validates the lowering for the equivalent Teko source.
    **All A1 fixtures must be exit-code-observable** — `exit(n)`, a returned value, or `.len`/byte-index
-   into a constant — because the interp honest-stops on `tk_println` and the other non-subset runtime
-   calls (`lir_interp.tks:270-271`). Do NOT write print-based fixtures for A1.
+   into a constant — because the oracle honest-stops on `tk_println` and the other non-subset runtime
+   calls (`lir_oracle.tks:270-271`). Do NOT write print-based fixtures for A1.
 
 2. **Golden LIR-dump diffs.** `lir_print.print_lmodule` is the deterministic diff spine. Each PR adds
    a golden dump (checked into the test as the expected string, the pattern `lower_test.tkt` already
@@ -384,8 +386,8 @@ New golden fixtures are needed for: the `if` merge-block shape (A1-1), the loop/
 the aggregate alloca/field layout (A1-3), the rodata + fat-pointer form (A1-4), the match test-chain
 (A1-5), the vtable-load + indirect-call sequence (A1-6), and the closure `{fn,env}` form (A1-7).
 
-The full ritual gate (VM gate · paranoid · differential · fixpoint) runs at each sub-sub-PR's merge —
-but note the differential leg here is **only** the LIR-interp-vs-VM leg; the C-native-vs-own-native
+The full ritual gate (paranoid · differential · fixpoint) runs at each sub-sub-PR's merge —
+but note the differential leg here is **only** the LIR-oracle validation; the C-native-vs-own-native
 differential is born later, at A4. Fixpoint must hold because the lowering is additive to `src/` and
 does not change any existing emitted artifact.
 
@@ -400,22 +402,22 @@ merge (A1 close), which is the seed-advancing event.
 None HALTs. Each is resolved against the Constitution laws and recorded so the implementer proceeds
 without re-litigating.
 
-### 5.1 The interpreter's memory model (resolved)
-**Tension:** the N1 interp is pure-register (i128 cells). Running struct/slice/str fixtures needs a
+### 5.1 The oracle's memory model (resolved)
+**Tension:** the N1 oracle is pure-register (i128 cells). Running struct/slice/str fixtures needs a
 memory abstraction. A byte-accurate flat `[]byte` heap (option A) is faithful to the machine but heavy;
 a value-cell store (option B — address = cell index, each cell an i128, plus a separate rodata byte
-table) is far simpler. **Resolution (law-first):** option **B**. The interp is an ORACLE over exit
+table) is far simpler. **Resolution (law-first):** option **B**. The oracle is an ORACLE over exit
 codes, not a layout verifier (M.3 — its honest job is lowering-correctness, not ABI); real byte layout
 is validated by the C-vs-own differential at A4. B keeps the oracle small and deterministic (M.1/M.2).
 The `LStructLayout` offsets are still computed byte-accurately (declared-order natural alignment) so
-A2+ inherits a real layout — only the *interp's* execution uses cell indices.
+A2+ inherits a real layout — only the *oracle's* execution uses cell indices.
 
-### 5.2 The interp's function-pointer / vtable model (resolved)
-**Tension:** `LCallIndirect`/`LFuncAddr` need the interp to turn an address back into a callable. A
-real machine uses a code address; the interp has none. **Resolution:** the interp keeps an
+### 5.2 The oracle's function-pointer / vtable model (resolved)
+**Tension:** `LCallIndirect`/`LFuncAddr` need the oracle to turn an address back into a callable. A
+real machine uses a code address; the oracle has none. **Resolution:** the oracle keeps an
 address→symbol map, populated when a vtable rodata array or an `LFuncAddr` is materialized; `LFuncAddr`
 yields a synthetic address, `LCallIndirect` resolves it through the map and recurses via the existing
-`find_lfunc`/`interp_call`. Deterministic (M.2), no machine code (honest for A1's scope).
+`find_lfunc`/`oracle_call`. Deterministic (M.2), no machine code (honest for A1's scope).
 
 ### 5.3 Struct layout: who owns offsets (resolved, note for A4)
 The C backend **never computed offsets** — it emitted C structs and let `cc` lay them out
@@ -434,7 +436,7 @@ A1 does **not** touch. No `.tkb`/wire concern exists (LIR is in-memory only). Re
 does not flag the new `LOp` cases as a frozen-enum violation.
 
 ### 5.5 No genuine unresolved tension
-Every construct in §1.2 has a concrete lowering above; every new op has a print + interp + fixture
+Every construct in §1.2 has a concrete lowering above; every new op has a print + oracle + fixture
 plan; the sequencing respects the memory-before-match / memory-before-dispatch dependencies. **A1 does
 not HALT.**
 
@@ -477,7 +479,7 @@ mirroring `promote_env`/`jump_args_for_names` (the SAME machinery loop headers a
  * @param LEnv env  the pre-branch scalar environment (the promotable names)
  * @return []str  the distinct enclosing scalar names re-assigned in any arm
  */
-fn reassigned_scalars(arms: []checker::TStatement, env: LEnv) -> []str { … }
+fn reassigned_scalars(arms: []checker::TStatement, env: LEnv): []str { … }
 ```
 
 Each merge then adds one block-param per reassigned name (after any existing value param), every
@@ -657,7 +659,7 @@ leaving `j` at VReg(3); the merge reads `j` → `3`. This is precisely the C beh
  * @param u32 vreg  the reassignment's fresh result VReg
  * @return LEnv  `env` with the newest `name` slot's VReg replaced in place
  */
-pub fn lenv_reassign(env: LEnv, name: str, vreg: u32) -> LEnv { … }
+pub fn lenv_reassign(env: LEnv, name: str, vreg: u32): LEnv { … }
 ```
 
 `lower_assign_simple` (`lower.tks:4322`) swaps its two `ctx_bind` calls for a `ctx_reassign` wrapper
@@ -675,7 +677,7 @@ pattern binds are UNTOUCHED (they must keep appending — that IS the shadow).
  * @param []str names  the threaded scalar names, in merge-param order
  * @return []u64  each name's pre-branch index, in the SAME order as `names`
  */
-fn merge_scalar_indices(env: LEnv, names: []str) -> []u64 { … }
+fn merge_scalar_indices(env: LEnv, names: []str): []u64 { … }
 
 /**
  * arm_scalar_args — one jump-arg per threaded scalar, read from `arm_env` at the
@@ -689,7 +691,7 @@ fn merge_scalar_indices(env: LEnv, names: []str) -> []u64 { … }
  * @param []u64 indices  the threaded scalars' pre-branch indices, in param order
  * @return []u32  each index's current VReg, in the SAME order as `indices`
  */
-fn arm_scalar_args(arm_env: LEnv, indices: []u64) -> []u32 { … }
+fn arm_scalar_args(arm_env: LEnv, indices: []u64): []u32 { … }
 ```
 
 `close_arm_replaying_defers` (`:2697`) swaps its `names: []str` param for `indices: []u64` and computes
@@ -727,7 +729,7 @@ indices). `reassigned_scalars` (`:2257`) drops its `bound`/exclusion term;
 - **`lwt_if_stmt_non_mutating_arm_keeps_zero_param_merge` stays green** (no assign → `names` empty →
   zero-param merge, byte-identical).
 
-### 6.2.6 Regression fixtures (own == C, both VM-oracle exit and own-native/own-wasm binary)
+### 6.2.6 Regression fixtures (own == C, both LIR-oracle validation and own-native/own-wasm binary)
 
 New `examples/regressions/` binary fixtures (kind = "binary", `scripts/validate_wasm_own.sh`,
 own-native/own-wasm exit == C-native exit):
@@ -762,8 +764,8 @@ Golden LIR-dump fixtures in `src/lir/lower_test.tkt`:
 ### 6.2.7 Ritual points
 
 Doc-only design PR: no ritual gate beyond a clean build (it emits no code). The IMPLEMENTATION carries
-the gate. Split into two crumbs, each a ritual point (full gate — VM gate · paranoid · differential
-(LIR-interp-vs-VM over the runnable subset AND own-vs-C binary for the new regressions) · fixpoint) at
+the gate. Split into two crumbs, each a ritual point (full gate — paranoid · differential
+(LIR-oracle validation over the runnable subset AND own-vs-C binary for the new regressions) · fixpoint) at
 its merge into `fix/issue-389-c1-8-keystone`:
 
 - **Crumb 1 (reassign-in-place, pure refactor):** add `lenv_reassign`; switch `lower_assign_simple`'s

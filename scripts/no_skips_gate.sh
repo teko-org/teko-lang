@@ -6,8 +6,8 @@
 # para não imputar o comportamento no fonte do teko mas sim no CI)."*
 #
 # WHY THIS IS A SCRIPT AND NOT A CHANGE TO `teko test`. A skipped row is a legitimate outcome of the
-# LANGUAGE: a user's project may declare a regressor whose capability (a cross-linker, a wasm
-# runtime) is genuinely absent on their machine, and refusing to run the other rows would be the
+# LANGUAGE: a user's project may declare a regressor whose capability (a cross-linker, a leaf
+# checker) is genuinely absent on their machine, and refusing to run the other rows would be the
 # tool bullying its user. That choice belongs to whoever runs the suite. What does NOT belong to
 # them is OUR OWN CI reporting green over rows it never executed. So the rule lives HERE, at the
 # lane, applied to the run's OUTPUT — the compiler's semantics are untouched and no `.tks` gains a

@@ -1,0 +1,407 @@
+use teko::crypto
+use teko::encoding::base64
+use teko::encoding::xml
+use teko::numeric::bigint
+
+/**
+ * The XML-DSig namespace URI (`http://www.w3.org/2000/09/xmldsig#`) this module's own `Signature`
+ * elements declare.
+ */
+exp fn xmldsig_namespace_uri(): str {
+    "http://www.w3.org/2000/09/xmldsig#"
+}
+
+/**
+ * The Canonical XML 1.0 (inclusive) algorithm URI — the only `CanonicalizationMethod`/
+ * `DigestMethod`-adjacent C14N this module produces or accepts, matching `xml_c14n`'s coverage.
+ */
+exp fn c14n_algorithm_uri(): str {
+    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
+}
+
+/**
+ * The enveloped-signature transform URI: the transform an enveloped `Reference` (`URI=""`) names
+ * to say "digest the host document with its own `Signature` element removed."
+ */
+exp fn enveloped_signature_transform_uri(): str {
+    "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
+}
+
+fn digest_sha256_uri(): str {
+    "http://www.w3.org/2001/04/xmlenc#sha256"
+}
+
+fn digest_sha1_uri(): str {
+    "http://www.w3.org/2000/09/xmldsig#sha1"
+}
+
+fn signature_rsa_sha256_uri(): str {
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+}
+
+fn signature_ecdsa_sha256_uri(): str {
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
+}
+
+fn signature_hmac_sha256_uri(): str {
+    "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"
+}
+
+/**
+ * The digest algorithm a `Reference`'s `DigestMethod` selects. `Sha1` ships for legacy interop
+ * only (reading a signature produced by an older tool) — cryptographically broken, never the
+ * default for new signing.
+ */
+exp type DigestAlg = enum { Sha256; Sha1 }
+
+/**
+ * The signature algorithm a `SignedInfo`'s `SignatureMethod` selects: the key family it requires
+ * is fixed per member (`RsaSha256` an RSA key, `EcdsaSha256` a P-256 key, `HmacSha256` a shared
+ * secret).
+ */
+exp type SignatureAlg = enum { RsaSha256; EcdsaSha256; HmacSha256 }
+
+fn digest_alg_uri(alg: DigestAlg): str {
+    match alg {
+        Sha256 => digest_sha256_uri()
+        Sha1 => digest_sha1_uri()
+    }
+}
+
+fn signature_alg_uri(alg: SignatureAlg): str {
+    match alg {
+        RsaSha256 => signature_rsa_sha256_uri()
+        EcdsaSha256 => signature_ecdsa_sha256_uri()
+        HmacSha256 => signature_hmac_sha256_uri()
+    }
+}
+
+fn digest_alg_from_uri(uri: str): DigestAlg | crypto::CryptoError {
+    if xmldsig_str_eq(uri, digest_sha256_uri()) { return DigestAlg::Sha256 }
+    if xmldsig_str_eq(uri, digest_sha1_uri()) { return DigestAlg::Sha1 }
+    crypto::crypto_error(concat("xmldsig: unsupported DigestMethod Algorithm: ", uri))
+}
+
+fn signature_alg_from_uri(uri: str): SignatureAlg | crypto::CryptoError {
+    if xmldsig_str_eq(uri, signature_rsa_sha256_uri()) { return SignatureAlg::RsaSha256 }
+    if xmldsig_str_eq(uri, signature_ecdsa_sha256_uri()) { return SignatureAlg::EcdsaSha256 }
+    if xmldsig_str_eq(uri, signature_hmac_sha256_uri()) { return SignatureAlg::HmacSha256 }
+    crypto::crypto_error(concat("xmldsig: unsupported SignatureMethod Algorithm: ", uri))
+}
+
+fn digest_bytes(alg: DigestAlg, data: []byte): []byte {
+    match alg {
+        Sha256 => crypto::sha256_of(data)
+        Sha1 => crypto::sha1_of(data)
+    }
+}
+
+fn digest_node(alg: DigestAlg, node: xml::XmlNode): []byte {
+    digest_bytes(alg, xml::canonicalize(node).bytes())
+}
+
+/**
+ * Which concrete key `SigningKey` carries — selects which of its fields is meaningful.
+ */
+exp type SigningKeyKind = enum { RsaPrivate; EcdsaPrivate; HmacSecret }
+
+/**
+ * A signing key for one `SignatureAlg` family. A tagged struct (mirrors `teko::encoding::xml`'s
+ * `XmlNode` — see this module's header) rather than an inline `@Macro()` union: only one of
+ * `rsa_key`/`ec_scalar`/`hmac_secret` is meaningful, selected by `kind`. Built via
+ * `signing_key_rsa`/`signing_key_ecdsa`/`signing_key_hmac`, never constructed directly.
+ */
+exp type SigningKey = struct {
+    /** which key family this is; selects which field below carries meaning */
+    kind: SigningKeyKind
+    /** the RSA private key; meaningful only when `kind == RsaPrivate` */
+    rsa_key: crypto::RsaPrivateKey
+    /** the EC P-256 private scalar `d`; meaningful only when `kind == EcdsaPrivate` */
+    ec_scalar: bigint::BigInt
+    /** the shared HMAC secret; meaningful only when `kind == HmacSecret` */
+    hmac_secret: []byte
+}
+
+/**
+ * Which concrete key `VerificationKey` carries — selects which of its fields is meaningful.
+ */
+exp type VerificationKeyKind = enum { RsaPublic; EcdsaPublic; HmacSecret }
+
+/**
+ * A verification key for one `SignatureAlg` family. A tagged struct (see `SigningKey`'s doc):
+ * only one of `rsa_key`/`ec_point`/`hmac_secret` is meaningful, selected by `kind`. Built via
+ * `verification_key_rsa`/`verification_key_ecdsa`/`verification_key_hmac`.
+ */
+exp type VerificationKey = struct {
+    /** which key family this is; selects which field below carries meaning */
+    kind: VerificationKeyKind
+    /** the RSA public key; meaningful only when `kind == RsaPublic` */
+    rsa_key: crypto::RsaPublicKey
+    /** the EC P-256 public point `Q`; meaningful only when `kind == EcdsaPublic` */
+    ec_point: crypto::P256Point
+    /** the shared HMAC secret; meaningful only when `kind == HmacSecret` */
+    hmac_secret: []byte
+}
+
+fn zero_rsa_private_key(): crypto::RsaPrivateKey {
+    crypto::RsaPrivateKey { n = bigint::zero(); d = bigint::zero(); e = bigint::zero() }
+}
+
+fn zero_rsa_public_key(): crypto::RsaPublicKey {
+    crypto::RsaPublicKey { n = bigint::zero(); e = bigint::zero() }
+}
+
+fn zero_p256_point(): crypto::P256Point {
+    crypto::P256Point { infinity = true; x = bigint::zero(); y = bigint::zero() }
+}
+
+/**
+ * Builds a `SigningKey` for `rsa-sha256` from an RSA private key.
+ */
+exp fn signing_key_rsa(key: crypto::RsaPrivateKey): SigningKey {
+    SigningKey { kind = SigningKeyKind::RsaPrivate; rsa_key = key; ec_scalar = bigint::zero(); hmac_secret = [] }
+}
+
+/**
+ * Builds a `SigningKey` for `ecdsa-sha256` from an EC P-256 private scalar.
+ */
+exp fn signing_key_ecdsa(scalar: bigint::BigInt): SigningKey {
+    SigningKey { kind = SigningKeyKind::EcdsaPrivate; rsa_key = zero_rsa_private_key(); ec_scalar = scalar; hmac_secret = [] }
+}
+
+/**
+ * Builds a `SigningKey` for `hmac-sha256` from a shared secret.
+ */
+exp fn signing_key_hmac(secret: []byte): SigningKey {
+    SigningKey { kind = SigningKeyKind::HmacSecret; rsa_key = zero_rsa_private_key(); ec_scalar = bigint::zero(); hmac_secret = secret }
+}
+
+/**
+ * Builds a `VerificationKey` for `rsa-sha256` from an RSA public key.
+ */
+exp fn verification_key_rsa(key: crypto::RsaPublicKey): VerificationKey {
+    VerificationKey { kind = VerificationKeyKind::RsaPublic; rsa_key = key; ec_point = zero_p256_point(); hmac_secret = [] }
+}
+
+/**
+ * Builds a `VerificationKey` for `ecdsa-sha256` from an EC P-256 public point.
+ */
+exp fn verification_key_ecdsa(point: crypto::P256Point): VerificationKey {
+    VerificationKey { kind = VerificationKeyKind::EcdsaPublic; rsa_key = zero_rsa_public_key(); ec_point = point; hmac_secret = [] }
+}
+
+/**
+ * Builds a `VerificationKey` for `hmac-sha256` from a shared secret.
+ */
+exp fn verification_key_hmac(secret: []byte): VerificationKey {
+    VerificationKey { kind = VerificationKeyKind::HmacSecret; rsa_key = zero_rsa_public_key(); ec_point = zero_p256_point(); hmac_secret = secret }
+}
+
+fn xmldsig_str_eq(a: str, b: str): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+fn xmldsig_bytes_concat(a: []byte, b: []byte): []byte {
+    [..a, ..b]
+}
+
+fn xmldsig_bytes_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+fn xmldsig_slice_from(s: str, from: u64): str {
+    var out: str = ""
+    var i = from
+    loop {
+        if i >= s.len { break }
+        out = out ~ one_byte(s[i])
+        i++
+    }
+    out
+}
+
+fn xmldsig_one_node(node: xml::XmlNode): []xml::XmlNode {
+    [node]
+}
+
+fn xmldsig_one_attr(a: xml::XmlAttr): []xml::XmlAttr {
+    [a]
+}
+
+fn xmldsig_element(name: str, attrs: []xml::XmlAttr, children: []xml::XmlNode): xml::XmlNode {
+    xml::XmlNode { kind = xml::NodeKind::Element; name = name; prefix = ""; local = name; namespace_uri = ""; text = ""; attributes = attrs; children = children }
+}
+
+fn xmldsig_attr(name: str, value: str): xml::XmlAttr {
+    xml::XmlAttr { name = name; prefix = ""; local = name; namespace_uri = ""; value = value }
+}
+
+fn xmldsig_xmlns_attr(prefix: str, uri: str): xml::XmlAttr {
+    if prefix.len == 0 {
+        return xml::XmlAttr { name = "xmlns"; prefix = ""; local = "xmlns"; namespace_uri = xml::xmlns_namespace_uri(); value = uri }
+    }
+    xml::XmlAttr { name = concat("xmlns:", prefix); prefix = "xmlns"; local = prefix; namespace_uri = xml::xmlns_namespace_uri(); value = uri }
+}
+
+fn xmldsig_append_child(node: xml::XmlNode, child: xml::XmlNode): xml::XmlNode {
+    xml::XmlNode { kind = node.kind; name = node.name; prefix = node.prefix; local = node.local; namespace_uri = node.namespace_uri; text = node.text; attributes = node.attributes; children = [..node.children, child] }
+}
+
+type NsScope = struct {
+    prefixes: []str
+    uris: []str
+}
+
+fn ns_scope_root(): NsScope {
+    NsScope { prefixes = []; uris = [] }
+}
+
+fn ns_scope_extend(scope: NsScope, prefix: str, uri: str): NsScope {
+    NsScope { prefixes = [..scope.prefixes, prefix]; uris = [..scope.uris, uri] }
+}
+
+fn ns_scope_with_decls(scope: NsScope, node: xml::XmlNode): NsScope {
+    var result = scope
+    var i: u64 = 0
+    loop {
+        if i >= node.attributes.len { break }
+        var a = node.attributes[i]
+        if xmldsig_str_eq(a.name, "xmlns") {
+            result = ns_scope_extend(result, "", a.value)
+        } else if xmldsig_str_eq(a.prefix, "xmlns") {
+            result = ns_scope_extend(result, a.local, a.value)
+        }
+        i++
+    }
+    result
+}
+
+fn ns_scope_has_prefix(node: xml::XmlNode, prefix: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= node.attributes.len { break }
+        var a = node.attributes[i]
+        if prefix.len == 0 && xmldsig_str_eq(a.name, "xmlns") { return true }
+        if prefix.len > 0 && xmldsig_str_eq(a.prefix, "xmlns") && xmldsig_str_eq(a.local, prefix) { return true }
+        i++
+    }
+    false
+}
+
+fn ns_list_contains(list: []str, value: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        if xmldsig_str_eq(list[i], value) { return true }
+        i++
+    }
+    false
+}
+
+fn ns_scope_distinct(scope: NsScope): NsScope {
+    var prefixes: [scope.prefixes.len]str = []
+    var uris: [scope.prefixes.len]str = []
+    var count: u64 = 0
+    var i = scope.prefixes.len
+    loop {
+        if i == 0 { break }
+        i--
+        var prefix = scope.prefixes[i]
+        if xmldsig_str_eq(prefix, "xml") { continue }
+        if !ns_list_contains(teko::collections::arr_slice(prefixes, 0, count), prefix) {
+            prefixes[count] = prefix
+            uris[count] = scope.uris[i]
+            count++
+        }
+    }
+    NsScope { prefixes = teko::collections::arr_slice(prefixes, 0, count); uris = teko::collections::arr_slice(uris, 0, count) }
+}
+
+fn inline_namespaces(node: xml::XmlNode, scope: NsScope): xml::XmlNode {
+    var distinct = ns_scope_distinct(scope)
+    var attrs: [node.attributes.len + distinct.prefixes.len]xml::XmlAttr = []
+    var count: u64 = 0
+    var a: u64 = 0
+    loop {
+        if a >= node.attributes.len { break }
+        attrs[count] = node.attributes[a]
+        count++
+        a++
+    }
+    var i: u64 = 0
+    loop {
+        if i >= distinct.prefixes.len { break }
+        var prefix = distinct.prefixes[i]
+        if !ns_scope_has_prefix(node, prefix) {
+            attrs[count] = xmldsig_xmlns_attr(prefix, distinct.uris[i])
+            count++
+        }
+        i++
+    }
+    xml::XmlNode { kind = node.kind; name = node.name; prefix = node.prefix; local = node.local; namespace_uri = node.namespace_uri; text = node.text; attributes = teko::collections::arr_slice(attrs, 0, count); children = node.children }
+}
+
+fn find_element_with_inlined_namespaces(node: xml::XmlNode, target_local: str, scope: NsScope): xml::XmlNode | null {
+    if node.kind != xml::NodeKind::Element {
+        return null
+    }
+    var full_scope = ns_scope_with_decls(scope, node)
+    if xmldsig_str_eq(node.local, target_local) {
+        return inline_namespaces(node, full_scope)
+    }
+    var i: u64 = 0
+    loop {
+        if i >= node.children.len { break }
+        var found = find_element_with_inlined_namespaces(node.children[i], target_local, full_scope)
+        match found {
+            xml::XmlNode as f => return f
+            null => { }
+        }
+        i++
+    }
+    null
+}
+
+fn first_child_local(parent: xml::XmlNode, target_local: str): xml::XmlNode | null {
+    var i: u64 = 0
+    loop {
+        if i >= parent.children.len { break }
+        var c = parent.children[i]
+        if c.kind == xml::NodeKind::Element && xmldsig_str_eq(c.local, target_local) {
+            return c
+        }
+        i++
+    }
+    null
+}
+
+fn strip_signature_children(node: xml::XmlNode): xml::XmlNode {
+    var kept: [node.children.len]xml::XmlNode = []
+    var count: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= node.children.len { break }
+        var c = node.children[i]
+        if !(c.kind == xml::NodeKind::Element && xmldsig_str_eq(c.local, "Signature")) {
+            kept[count] = c
+            count++
+        }
+        i++
+    }
+    xml::XmlNode { kind = node.kind; name = node.name; prefix = node.prefix; local = node.local; namespace_uri = node.namespace_uri; text = node.text; attributes = node.attributes; children = teko::collections::arr_slice(kept, 0, count) }
+}

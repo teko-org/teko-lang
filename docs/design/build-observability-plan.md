@@ -21,7 +21,7 @@ do projeto, não em `src/`).
 - **R1 — em não-TTY, `phase_begin` NÃO emite START.**
   `src/build/progress.tks:192-195`:
   ```
-  pub fn phase_begin(label: str, initial: str, visible: bool) -> Phase {
+  pub fn phase_begin(label: str, initial: str, visible: bool): Phase {
       if visible { teko::io::eprint(mid_line(label, initial)) }
       Phase { label = label; start = now_ns(); visible = visible }
   }
@@ -177,7 +177,7 @@ pub type Verbosity = enum { Quiet; Normal; Verbose; Debug }
  * @param tty         a real terminal (in-place `\r` updates)
  * @return            the resolved `Report` mode for `phase_begin`
  */
-pub fn report_mode_v(verbosity: Verbosity, quiet_pass: bool, tty: bool) -> Report {
+pub fn report_mode_v(verbosity: Verbosity, quiet_pass: bool, tty: bool): Report {
     if quiet_pass { return Report::Quiet }
     if verbosity == Verbosity::Quiet { return Report::Quiet }
     if tty { Report::Tty } else { Report::Plain }
@@ -193,7 +193,7 @@ pub fn report_mode_v(verbosity: Verbosity, quiet_pass: bool, tty: bool) -> Repor
  * @param quiet_pass  this pass already reported (no heartbeat)
  * @return            true iff a Plain heartbeat line should be emitted
  */
-pub fn heartbeat_on(cfg: ReportCfg, quiet_pass: bool) -> bool {
+pub fn heartbeat_on(cfg: ReportCfg, quiet_pass: bool): bool {
     if quiet_pass { return false }
     if cfg.tty { return false }
     cfg.verbosity == Verbosity::Verbose || cfg.verbosity == Verbosity::Debug
@@ -211,7 +211,7 @@ pub fn heartbeat_on(cfg: ReportCfg, quiet_pass: bool) -> bool {
  * @param args  the full CLI argument vector
  * @return      the resolved `Verbosity` (Normal by default)
  */
-fn verbosity_of(args: []str) -> Verbosity {
+fn verbosity_of(args: []str): Verbosity {
     mut i: u64 = 0
     mut v = Verbosity::Normal
     loop {
@@ -255,7 +255,7 @@ de EXTENSÃO, não de formato. Scaffolding:
  * @param prog  the checked, monomorphized program to cache
  * @return      null on success, else the write error
  */
-fn write_tkc(path: str, prog: checker::TProgram) -> void | error {
+fn write_tkc(path: str, prog: checker::TProgram) | error {
     teko::io::write_file_bytes(path, emit::serialize_program(prog))
 }
 
@@ -268,7 +268,7 @@ fn write_tkc(path: str, prog: checker::TProgram) -> void | error {
  * @param path  the `.tkc` input path
  * @return      the cached program, or an error to fall back on
  */
-fn read_tkc(path: str) -> checker::TProgram | error {
+fn read_tkc(path: str): checker::TProgram | error {
     let raw = match teko::io::read_file_bytes(path) { []byte as b => b; error as e => return e }
     emit::deserialize_program(raw)
 }
@@ -350,7 +350,7 @@ release vira trabalho REPORTADO de verdade, não um "retry quiet").
    * @param on_item  the per-item progress hook (a no-op recovers `tk_emit_c`)
    * @return         the emitted C source, or the first codegen error
    */
-  pub fn tk_emit_c_report(prog0: checker::TProgram, on_item: checker::ProgressFn) -> str | error
+  pub fn tk_emit_c_report(prog0: checker::TProgram, on_item: checker::ProgressFn): str | error
   ```
 - **`cc` (processo externo):** **INVIÁVEL heartbeat DURANTE o `cc`.** `teko::process::run`
   (`project.tks:704,744`) é SÍNCRONO/bloqueante e teko NÃO tem threads nem spawn assíncrono
@@ -370,8 +370,7 @@ observabilidade sumiria. Paridade proposta (mapeando às fases C `codegen`/`emit
 - cada cauda: `select/regalloc/encode` → uma fase `codegen (native)` (em `debug`, três
   sub-fases nomeadas `isel`/`regalloc`/`encode`).
 - `finish_native_object`: `write_file_bytes(.o)` → fase `emit obj`; `link_object` → fase
-  `link` (a START-line antes do `cc`-linker, mesmo motivo do `cc`). `emit_native_wasm`:
-  `emit obj`→ `emit wasm`, sem `link`.
+  `link` (a START-line antes do `cc`-linker, mesmo motivo do `cc`).
 
 Regra: mesmas labels/mesma forma que o caminho C, para o leitor de log não distinguir o
 backend pela ausência de output. Nenhuma dessas fases altera os bytes do `.o`/binário.
@@ -704,7 +703,7 @@ e uma chamada por fragmento sem probe. **Mesmos bytes emitidos** (a ordem/conte�
 
 - **AL4 — Paridade native.** Aplicar AL2/E3 aos `objfile_*`/`encode_*`/`tkb_buf`
   (`list::push` byte-a-byte → builder/append robusto). Fecha o "mesmo vale para native" do
-  owner; `cmp` dos goldens de `.o`/`.wasm` como ritual.
+  owner; `cmp` dos goldens de `.o` como ritual.
 
 ### Ganho honesto
 
@@ -738,7 +737,7 @@ e uma chamada por fragmento sem probe. **Mesmos bytes emitidos** (a ordem/conte�
 - **E3** (`[]byte`→`Builder`): churn de assinaturas + risco de um alias romper o decreto de
   cadeia LINEAR (o mesmo invariante que `append_fo`/`push_fo` já exigem). Evitar contágio unsafe
   (Builder SAFE, não RawBuf). Regressão por crumb: fixpoint + `cmp`.
-- **E4** native: muda memória/perf dos writers, não os bytes; `cmp` dos goldens `.o`/`.wasm`.
+- **E4** native: muda memória/perf dos writers, não os bytes; `cmp` dos goldens `.o`.
 - Todos independentes do const wave.
 
 ---
@@ -772,14 +771,14 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
 ### Crumb 3 — Gap 2: reusar o AST parseado (abordagem (a)) — ELIMINA o re-lex/re-parse + mata a mudez
 - SUBSTITUI o bracket paliativo (rejeitado pelo owner).
 - Arquivos: `src/build/project.tks` (split de `frontend_body` em `frontend_parse` +
-  `frontend_check`; novo `filter_tkt(parser::Program) -> parser::Program`; rewire de
+  `frontend_check`; novo `filter_tkt(parser::Program): parser::Program`; rewire de
   `compile_project_g`/`run_gate`/`run_gate_native`/`release_build_of` para parsear UMA vez e
   derivar gate=`check(parsed_all)` e release=`check(filter_tkt(parsed_all))`).
 - Assinaturas novas:
-  - `fn frontend_parse(include_tests: bool, cfg: ReportCfg) -> ParsedFront | error`
+  - `fn frontend_parse(include_tests: bool, cfg: ReportCfg): ParsedFront | error`
     (`ParsedFront = struct { parsed: parser::Program; manifest: Manifest }`).
-  - `fn frontend_check(pf: ParsedFront, cfg: ReportCfg) -> Frontend | error`.
-  - `fn filter_tkt(p: parser::Program) -> parser::Program` (dropa itens com `.file`
+  - `fn frontend_check(pf: ParsedFront, cfg: ReportCfg): Frontend | error`.
+  - `fn filter_tkt(p: parser::Program): parser::Program` (dropa itens com `.file`
     terminando em `.tkt`; procedência exata, `ast.tks:411`).
 - **Prova de fixpoint** (§"Gap 2", (a)): `filter_tkt(parse(with tests))` ≡ `parse(without
   tests)` (Fatos 3/4) → release byte-idêntico. Ponto ritual: **gate de fixpoint do CI**
@@ -792,7 +791,7 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
 ### Crumb 4 — Heartbeat do checker/mono (estrutural leve)
 - Arquivos: `src/build/project.tks` (`checked_program_of` aceita heartbeat `ProgressFn`;
   emite só se `heartbeat_on(cfg, quiet_pass)`).
-- Novo: `checker_heartbeat_fn(phase, cfg) -> checker::ProgressFn` (tick por N itens / ~1 s).
+- Novo: `checker_heartbeat_fn(phase, cfg): checker::ProgressFn` (tick por N itens / ~1 s).
 - Após o crumb 3, o check+mono de release já reporta; o heartbeat cobre corpos longos em
   `Plain`+`verbose`.
 - Regressão: `--verbose`+`CI=1` → múltiplas linhas de heartbeat de `checker`.
@@ -803,7 +802,7 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
 - Só entra se o gate de fixpoint do CI confirmar a invariância (§"Gap 2", (c)).
 - Arquivos: `src/build/project.tks` — checar a árvore completa UMA vez (`pre_all`), gate=
   `mono(pre_all.prog)`, release=`mono(filter_tkt_titem(pre_all.prog), table)`.
-- Novo: `filter_tkt_titem(prog: checker::TProgram) -> checker::TProgram` (procedência em
+- Novo: `filter_tkt_titem(prog: checker::TProgram): checker::TProgram` (procedência em
   nível de `TItem`; auditar `file` em TypeDecl/TStatement/ConstDecl).
 - **Risco de FIXPOINT (invariância do checker) — reversão automática para o estado do crumb 3
   se o golden do `gen2.c` regredir no CI.** Ponto ritual: gate de fixpoint.
@@ -829,8 +828,8 @@ já no seed: enums+`==`, structs, closures/`ProgressFn` já usados).
 
 ### Crumb 7 — Paridade native (estrutural, muitas caudas)
 - Arquivos: `src/build/project.tks` (`emit_native` + 5 caudas + `finish_native_object`
-  recebem `cfg`; fases `lower`/`codegen (native)`/`emit obj`/`link`; wasm: `emit wasm`).
-- **Sem mudar bytes** do `.o`/binário/`.wasm`. Regressão: `diff_c_own.sh`/`native_regressions.sh`
+  recebem `cfg`; fases `lower`/`codegen (native)`/`emit obj`/`link`).
+- **Sem mudar bytes** do `.o`/binário. Regressão: `diff_c_own.sh`/`native_regressions.sh`
   como ponto ritual; um `.tkt` de fixture native com `CI=1` mostrando START `link …`.
 - Risco: estrutural (mecânico). Independe do const wave.
 

@@ -1,195 +1,160 @@
-// src/parser/parse_type.tks   (namespace 'teko::parser')
 
 use teko::lexer
 
-// A primary type: a slice `[]T` or a named path. (Members of a `|` union and a
-// slice's element are primaries — the union level is `parse_type` below.)
-// (W10a) a function/closure VALUE type `(A, B) -> R` — `pos` is at `(`. NO `fn` keyword. The
-// parameter list is comma-separated types (empty `()` allowed); `->` is mandatory; the return type
-// is parsed greedily via `parse_type` (so `(i64) -> A | B` returns `A | B`, mirroring fn-decl
-// returns). `pending_gt` is threaded from the return so a function type nests inside a generic arg
-// (`List<(i64) -> Box<i64>>`). A `(` is unambiguous in a type position (there is no type grouping).
-fn parse_function_type(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
-    mut params: []TypeExpr = teko::list::empty()
-    mut p = pos + 1
-    if is_kind_at(tokens, p, lexer::TokenKind::RParen) {
-        p = p + 1
-    } else {
-        loop {
-            let a = match parse_type(tokens, p) { ParsedType as x => x; error as e => return e }
-            params = teko::list::push(params, a.node)
-            p = a.next
-            if is_kind_at(tokens, p, lexer::TokenKind::Comma) { p = p + 1 }
-            else if is_kind_at(tokens, p, lexer::TokenKind::RParen) { p = p + 1; break }
-            else { return err_at(tokens, p, "expected ',' or ')' in a function type's parameter list '(A, B) -> R'") }
+
+fn delegate_unit_ret(): @TypeExpr() {
+    NamedType { path = Path { segments = [Segment { name = "()" }] }; args = [] }
+}
+
+fn is_delegate_kw_at(tokens: []lexer::Token, pos: u64): bool {
+    if !is_kind_at(tokens, pos, lexer::TokenKind::Ident) { return false }
+    if !(tokens[pos].text == "func" || tokens[pos].text == "action") { return false }
+    !is_kind_at(tokens, pos + 1, lexer::TokenKind::ColonColon)
+}
+
+fn parse_delegate_type(tokens: []lexer::Token, pos: u64): ParsedType | error {
+    var is_action = tokens[pos].text == "action"
+    if !is_kind_at(tokens, pos + 1, lexer::TokenKind::Lt) {
+        if is_action {
+            return ParsedType { node = FunctionType { params = []; ret = delegate_unit_ret() }; next = pos + 1; pending_gt = 0 }
         }
+        return err_at(tokens, pos, "`func` needs a return type: write `func<R>` (a zero-parameter function returning `R`)")
     }
-    if !is_kind_at(tokens, p, lexer::TokenKind::Arrow) {
-        return err_at(tokens, p, "a function type '(A, B) -> R' needs '->' before the return type")
+    var args: []@TypeExpr() = []
+    var p = pos + 2
+    var pend = 0 to u64
+    loop {
+        var a = match parse_type(tokens, p) { ParsedType as x => x; error as e => return e }
+        args = [..args, a.node]
+        if a.pending_gt > 0 { p = a.next; pend = a.pending_gt - 1; break }
+        p = a.next
+        if is_kind_at(tokens, p, lexer::TokenKind::Comma) { p = p + 1 }
+        else if is_kind_at(tokens, p, lexer::TokenKind::Gt) { p = p + 1; break }
+        else if is_kind_at(tokens, p, lexer::TokenKind::Shr) { p = p + 1; pend = 1; break }
+        else { return err_at(tokens, p, "expected ',' or '>' in a `func`/`action` type-argument list") }
     }
-    let ret = match parse_type(tokens, p + 1) { ParsedType as x => x; error as e => return e }
-    ParsedType { node = FunctionType { params = params; ret = ret.node }; next = ret.next; pending_gt = ret.pending_gt }
+    if args.len > 16 {
+        return err_at(tokens, pos, "a `func`/`action` delegate type may carry at most 16 type arguments")
+    }
+    if is_action {
+        if args.len == 0 { return err_at(tokens, pos, "`action<>` is empty — write `action` for a zero-parameter no-return function type") }
+        return ParsedType { node = FunctionType { params = args; ret = delegate_unit_ret() }; next = p; pending_gt = pend }
+    }
+    if args.len == 0 { return err_at(tokens, pos, "`func<>` is empty — a `func` needs at least a return type: write `func<R>`") }
+    var params: []@TypeExpr() = []
+    var i = 0 to u64
+    loop { if i >= args.len - 1 { break }; params = [..params, args[i]]; i++ }
+    ParsedType { node = FunctionType { params = params; ret = args[args.len - 1] }; next = p; pending_gt = pend }
 }
 
-/**
- * Build the `null` type-atom (null-as-union). The `null` keyword in a type position denotes the
- * `Null` unit type; it is carried as a single-segment `NamedType` named "null" (a reserved keyword,
- * so it can never collide with a user type), which the checker's `resolve_type` maps to `checker::Null`.
- *
- * @param pos  the position of the `null` keyword token
- * @return     the parsed `null` type atom, consuming exactly the one keyword token
- */
-fn parse_null_type(pos: u64) -> ParsedType {
-    let segs = teko::list::push(teko::list::empty(), Segment { name = "null" })
-    ParsedType { node = NamedType { path = Path { segments = segs }; args = teko::list::empty() }; next = pos + 1; pending_gt = 0 }
+fn parse_null_type(pos: u64): ParsedType {
+    var segs = [Segment { name = "null" }]
+    ParsedType { node = NamedType { path = Path { segments = segs }; args = [] }; next = pos + 1; pending_gt = 0 }
 }
 
-/**
- * is_ref_grafia_at — is the token at `pos` the contextual `ref` keyword used as the SAFE-reference
- * type grafia (0.3.0.30 Part A)? `ref` is NOT a reserved token (the lexer emits a plain `Ident`);
- * it becomes the reference grafia only in a type position, when the `ref` identifier is immediately
- * followed by another token that can begin a type (a name, `[`, `(`, or `ref` again for nesting).
- * A bare identifier literally named `ref` at the end of a type (none exist in the corpus) stays an
- * ordinary named type. Legal in every ordinary type position (a return, a field, a generic
- * argument, a slice element — `ref-transparent-model.md:56`); the ONE position that does NOT reach
- * this function is the two BINDER sites (`ref x: T = e`, `fn f(ref x: T)`), which each consume
- * their own leading `ref` token before ever calling `parse_type`/`parse_type_primary` — so a `let`
- * or `mut` binding's annotation reaching THIS function with `ref` inside it is a real misuse of a
- * different, narrower kind: `type_binding` (0.3.1, owner ruling 2026-07-24) rejects a `let`/`mut`
- * binding whose annotation resolves to a `Reference`, since only a `ref` binding may hold one.
- *
- * @param tokens  the token stream
- * @param pos     the candidate `ref` position
- * @return        true iff `pos` opens a `ref`-grafia reference type
- */
-fn is_ref_grafia_at(tokens: []lexer::Token, pos: u64) -> bool {
+fn is_ref_grafia_at(tokens: []lexer::Token, pos: u64): bool {
     if !(is_kind_at(tokens, pos, lexer::TokenKind::Ident) && tokens[pos].text == "ref") { return false }
     is_name_at(tokens, pos + 1) || is_kind_at(tokens, pos + 1, lexer::TokenKind::LBracket) || is_kind_at(tokens, pos + 1, lexer::TokenKind::LParen)
 }
 
-/**
- * wrap_ref_type — build the compiler-internal reference type `Ref<inner>` (checker `Reference{inner}`)
- * that the surface `ref`-grafia desugars to. `Ref` is the compiler-internal name of the safe reference
- * (invisible on the surface, per the ratified 0.3.1 model); the `ref` keyword is its only user grafia.
- *
- * @param inner  the referenced (pointee) type
- * @return       a `NamedType` `Ref<inner>` resolving to `checker::Reference{inner}`
- */
-fn wrap_ref_type(inner: TypeExpr) -> TypeExpr {
-    let segs = teko::list::push(teko::list::empty(), Segment { name = "Ref" })
-    let args = teko::list::push(teko::list::empty(), inner)
+fn wrap_ref_type(inner: @TypeExpr()): @TypeExpr() {
+    var segs = [Segment { name = "Ref" }]
+    var args = [inner]
     NamedType { path = Path { segments = segs }; args = args }
 }
 
-fn parse_type_primary(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_macro_type(tokens: []lexer::Token, pos: u64): ParsedType | error {
+    var p = pos + 1
+    if !is_name_at(tokens, p) {
+        return err_at(tokens, p, "expected a macro name after `@` in a type position")
+    }
+    var pp = match parse_path(tokens, p) { Parsed<Path> as x => x; error as e => return e }
+    var type_args: []@TypeExpr() = []
+    var after = pp.next
+    if is_kind_at(tokens, after, lexer::TokenKind::Lt) {
+        match parse_type_args(tokens, after) {
+            ParsedTypeArgs as ta => {
+                if ta.pending_gt == 0 && is_kind_at(tokens, ta.next, lexer::TokenKind::LParen) {
+                    type_args = ta.args
+                    after = ta.next
+                } else {
+                    return err_at(tokens, after, "expected `(` after `@name<…>` in a type position — a macro call takes an argument list")
+                }
+            }
+            error as e => return e
+        }
+    }
+    if !is_kind_at(tokens, after, lexer::TokenKind::LParen) {
+        return err_at(tokens, after, "expected `(` — `@name` in a type position is a macro call and needs an argument list")
+    }
+    var ca = match parse_call_args(tokens, after) { ParsedCallArgs as x => x; error as e => return e }
+    ParsedType { node = MacroType { callee = pp.node; args = ca.args; callee_type_args = type_args }; next = ca.next; pending_gt = 0 }
+}
+
+fn parse_grouped_type(tokens: []lexer::Token, pos: u64): ParsedType | error {
+    var inner = match parse_type(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
+    if inner.pending_gt > 0 {
+        return err_at(tokens, inner.next, "a grouped type '(A | B)' cannot close inside a generic's '>>' — parenthesize the inner type separately")
+    }
+    var q = skip_seps(tokens, inner.next)
+    if !is_kind_at(tokens, q, lexer::TokenKind::RParen) {
+        return err_at(tokens, q, "expected ')' to close a grouped type '(A | B)'")
+    }
+    ParsedType { node = inner.node; next = q + 1; pending_gt = 0 }
+}
+
+fn parse_type_primary(tokens: []lexer::Token, pos: u64): ParsedType | error {
     if is_ref_grafia_at(tokens, pos) {
-        let inner = match parse_type_primary(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
+        var inner = match parse_type_primary(tokens, pos + 1) { ParsedType as x => x; error as e => return e }
         return ParsedType { node = wrap_ref_type(inner.node); next = inner.next; pending_gt = inner.pending_gt }
     }
-    let base = if is_kind_at(tokens, pos, lexer::TokenKind::LBracket) {
+    var head = if is_kind_at(tokens, pos, lexer::TokenKind::SelfKw) {
+        ParsedType { node = NamedType { path = Path { segments = [Segment { name = "self" }] }; args = [] }; next = pos + 1; pending_gt = 0 }
+    } else if is_kind_at(tokens, pos, lexer::TokenKind::LBracket) {
         match parse_slice(tokens, pos) { ParsedType as x => x; error as e => return e }
     } else if is_kind_at(tokens, pos, lexer::TokenKind::LParen) {
-        match parse_function_type(tokens, pos) { ParsedType as x => x; error as e => return e }
+        match parse_grouped_type(tokens, pos) { ParsedType as x => x; error as e => return e }
+    } else if is_delegate_kw_at(tokens, pos) {
+        match parse_delegate_type(tokens, pos) { ParsedType as x => x; error as e => return e }
     } else if is_kind_at(tokens, pos, lexer::TokenKind::Null) {
         parse_null_type(pos)
+    } else if is_kind_at(tokens, pos, lexer::TokenKind::At) {
+        match parse_macro_type(tokens, pos) { ParsedType as x => x; error as e => return e }
     } else {
         match parse_named(tokens, pos) { ParsedType as x => x; error as e => return e }
     }
-    mut node = base.node
-    mut p = base.next
-    // A pending compound-`>` close (`>>` from a nested generic) means we are mid-close: no postfix
-    // `?` can apply here — propagate the leftover up to the enclosing generic's close (S4).
-    if base.pending_gt > 0 {
-        return ParsedType { node = node; next = p; pending_gt = base.pending_gt }
-    }
-    if is_kind_at(tokens, p, lexer::TokenKind::Question) {
-        return err_at(tokens, p, "the `T?` nullable sugar has been removed — write the explicit union 'T | null' instead")
+    var node = head.node
+    var p = head.next
+    if head.pending_gt > 0 {
+        return ParsedType { node = node; next = p; pending_gt = head.pending_gt }
     }
     ParsedType { node = node; next = p; pending_gt = 0 }
 }
 
-/**
- * hide_ref_surface_at — the 0.3.1 adoption gate: the compiler-internal reference name `Ref` is no
- * longer user-spellable as an ordinary named type (the `ref` keyword grafia, `wrap_ref_type` above,
- * is the ONLY surface). This fires only for the literal capitalized identifier `Ref` reached through
- * the ORDINARY named-type path (`parse_named`, below) — the `ref`-keyword grafia branch in
- * `parse_type_primary` returns before ever calling `parse_named`, so it never re-enters this gate,
- * and a `ref T | null` union member (the null-union R2-relaxed shape) still resolves normally.
- *
- * The name is reserved at BOTH ends: `parse_type_decl` refuses to DECLARE a type called `Ref`
- * (`is_reserved_type_name`). Without that, a user's own `pub type Ref` parsed fine and then every
- * USE of it failed here with a message about a compiler-internal name the author never wrote — a
- * diagnostic that names the wrong thing at the wrong place.
- *
- * @param path    the just-parsed type path
- * @return        true iff the path is the single, bare, reserved segment `Ref`
- */
-fn hide_ref_surface_at(path: Path) -> bool {
+fn hide_ref_surface_at(path: Path): bool {
     path.segments.len == 1 && path.segments[0].name == "Ref"
 }
 
-/**
- * is_reserved_type_name — may a user DECLARE a type with this name? `Ref` is reserved: it is the
- * compiler-internal safe reference `wrap_ref_type` builds, so a declaration of that name would be
- * unusable (every reference to it is rejected by `hide_ref_surface_at`) and its rejection message
- * would describe a construct the author never spelled.
- *
- * @param name  the declared type name
- * @return      true iff the name is reserved for the compiler
- */
-pub fn is_reserved_type_name(name: str) -> bool {
+pub fn is_reserved_type_name(name: str): bool {
     name == "Ref"
 }
 
-/**
- * is_ref_grafia_annotation — is `te` a BARE `ref T` annotation (the `Ref<T>` node `wrap_ref_type`
- * builds)? A `let`/`mut`/`const` binding may not carry one: the `ref` IS the binding modifier, so
- * `mut r: ref i64 = x` used to be silently accepted as a full-blown reference binding —
- * indistinguishable, after the parse, from the `ref r: i64 = x` the tripartite law prescribes, and
- * flatly contradicting this unit's own documented rule. A union that CONTAINS a reference
- * (`ref i32 | null`, the R2-relaxed absence shape) is not a bare `ref T` and stays legal.
- *
- * @param te  the parsed annotation type-expression
- * @return    true iff the annotation is a top-level `ref T`
- */
-pub fn is_ref_grafia_annotation(te: TypeExpr) -> bool {
+pub fn is_ref_grafia_annotation(te: @TypeExpr()): bool {
     match te {
         NamedType as nt => nt.args.len == 1 && hide_ref_surface_at(nt.path)
         _ => false
     }
 }
 
-/**
- * A named type is a path: `u64`, `lexer::Token` (nominal — B.13). It may carry generic type
- * ARGUMENTS `<T1, T2, …>` (S4 type-generics — `Box<i64>`, `Result<i64, str>`, nested `Box<Box<i64>>`).
- * Inference-only: type-args appear ONLY in a type position, never as a call turbofish.
- *
- * The `<…>` is parsed SPECULATIVELY and backtracks if it is not a closed argument list: the cast
- * target is a type-PRIMARY (`x to i64 < y`), so a bare `<` after a type name must stay available as
- * the comparison operator. The close handles the `>>` (Shr) compound: it closes THIS list with one
- * `>` and leaves the other for the enclosing generic (threaded via `ParsedType.pending_gt`), so
- * `Box<Box<i64>>` parses at any nesting depth. (A `>=`/`>>=` close — `>` immediately before `=`,
- * no space — still backtracks; write a space before `=`.)
- *
- * @param tokens  the token stream
- * @param pos     the index of the type name's first token
- * @return        the parsed named type (with any `<…>` type-argument list)
- * @throws        when the reserved compiler-internal name `Ref` is spelled directly (0.3.1 — use `ref T`)
- */
-fn parse_named(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
-    let pp = match parse_path(tokens, pos) { Parsed<Path> as x => x; error as e => return e }
-    if hide_ref_surface_at(pp.node) {
-        return err_at(tokens, pos, "`Ref<T>` is compiler-internal — write the `ref` keyword instead (`ref T` in a type position, `ref x: T` to bind)")
-    }
-    let plain = ParsedType { node = NamedType { path = pp.node; args = teko::list::empty() }; next = pp.next; pending_gt = 0 }
+fn parse_named(tokens: []lexer::Token, pos: u64): ParsedType | error {
+    var pp = match parse_path(tokens, pos) { Parsed<Path> as x => x; error as e => return e }
+    var plain = ParsedType { node = NamedType { path = pp.node; args = [] }; next = pp.next; pending_gt = 0 }
     if !is_kind_at(tokens, pp.next, lexer::TokenKind::Lt) { return plain }
-    mut args: []TypeExpr = teko::list::empty()
-    mut p = pp.next + 1
+    var args: []@TypeExpr() = []
+    var p = pp.next + 1
     loop {
-        let a = match parse_type(tokens, p) { ParsedType as x => x; error => return plain }   // not a type → backtrack
-        args = teko::list::push(args, a.node)
-        // A nested generic just closed with a compound `>>`: the arg carries a leftover `>` that
-        // closes THIS list. Consume one; pass any remainder (deeper nesting) up.
+        var a = match parse_type(tokens, p) { ParsedType as x => x; error => return plain }
+        args = [..args, a.node]
         if a.pending_gt > 0 {
             return ParsedType { node = NamedType { path = pp.node; args = args }; next = a.next; pending_gt = a.pending_gt - 1 }
         }
@@ -199,26 +164,19 @@ fn parse_named(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
             return ParsedType { node = NamedType { path = pp.node; args = args }; next = p + 1; pending_gt = 0 }
         }
         else if is_kind_at(tokens, p, lexer::TokenKind::Shr) {
-            // `>>` closes THIS list with its first `>` and leaves one `>` for an enclosing generic.
             return ParsedType { node = NamedType { path = pp.node; args = args }; next = p + 1; pending_gt = 1 }
         }
-        else { return plain }   // not a closed arg list → backtrack (e.g. `x to i64 < y`)
+        else { return plain }
     }
 }
 
-// (W9.4) parse a `<T1, T2, …>` type-argument list — `pos` is at the `<`. Mirrors parse_named's `<…>`
-// loop, but standalone (shared by struct-construction `Foo<i64>{…}` and the `Foo<i64> as x` pattern).
-// Returns `error` to SIGNAL BACKTRACK when it is not a closed list (the caller swallows it, so a bare
-// `<` stays a comparison). The `>>` (Shr) compound closes THIS list with one `>` and leaves pending_gt.
-fn parse_type_args(tokens: []lexer::Token, pos: u64) -> ParsedTypeArgs | error {
+fn parse_type_args(tokens: []lexer::Token, pos: u64): ParsedTypeArgs | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::Lt) { return err_at(tokens, pos, "expected '<' to open a type-argument list") }
-    mut args: []TypeExpr = teko::list::empty()
-    mut p = pos + 1
+    var args: []@TypeExpr() = []
+    var p = pos + 1
     loop {
-        let a = match parse_type(tokens, p) { ParsedType as x => x; error as e => return e }   // not a type → backtrack
-        args = teko::list::push(args, a.node)
-        // A nested generic just closed with a compound `>>`: the arg carries a leftover `>` that
-        // closes THIS list. Consume one; pass any remainder (deeper nesting) up via pending_gt.
+        var a = match parse_type(tokens, p) { ParsedType as x => x; error as e => return e }
+        args = [..args, a.node]
         if a.pending_gt > 0 {
             return ParsedTypeArgs { args = args; next = a.next; pending_gt = a.pending_gt - 1 }
         }
@@ -230,40 +188,40 @@ fn parse_type_args(tokens: []lexer::Token, pos: u64) -> ParsedTypeArgs | error {
         else if is_kind_at(tokens, p, lexer::TokenKind::Shr) {
             return ParsedTypeArgs { args = args; next = p + 1; pending_gt = 1 }
         }
-        else { return err_at(tokens, p, "not a closed type-argument list") }   // backtrack (e.g. `a < b`)
+        else { return err_at(tokens, p, "not a closed type-argument list") }
     }
 }
 
-// `[]T` — `pos` is at `[` (parse_type_primary checked). The element is a PRIMARY, so
-// `[]A | B` is `([]A) | B`; nested slices recurse (`[][]T`). Recursive — B.8.
-fn parse_slice(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
+fn parse_slice(tokens: []lexer::Token, pos: u64): ParsedType | error {
     if !is_kind_at(tokens, pos + 1, lexer::TokenKind::RBracket) {
-        return err_at(tokens, pos + 1, "expected ']' to close '[' in a slice type '[]T'")
+        return parse_sized_array(tokens, pos)
     }
-    let elem = match parse_type_primary(tokens, pos + 2) { ParsedType as x => x; error as e => return e }
+    var elem = match parse_type_primary(tokens, pos + 2) { ParsedType as x => x; error as e => return e }
     ParsedType { node = SliceType { element = elem.node }; next = elem.next; pending_gt = elem.pending_gt }
 }
 
-// THE TYPE ENTRY — the union level (`|`, the lowest-precedence type operator, B.14):
-// one or more primaries. One → that primary (no needless UnionType — M.5); two or
-// more → a UnionType.
-fn parse_type(tokens: []lexer::Token, pos: u64) -> ParsedType | error {
-    let first = match parse_type_primary(tokens, pos) { ParsedType as x => x; error as e => return e }
-    mut members: []TypeExpr = teko::list::empty()
-    members = teko::list::push(members, first.node)
-    mut p = first.next
-    mut pend = first.pending_gt
-    // A `|` may be led by a newline (MULTI-LINE type union, e.g. a wide `variant` over many lines);
-    // separators may also follow the `|`. We only advance `p` once a `|` is found, so a trailing
-    // newline that ENDS the type (no continuation `|`) is left intact for the caller. A pending
-    // compound-`>` close (a nested generic mid-close) cannot be followed by `|` — stop and propagate.
+fn parse_sized_array(tokens: []lexer::Token, pos: u64): ParsedType | error {
+    var size = match parse_expr(tokens, pos + 1) { Parsed<Expr> as x => x; error as e => return e }
+    if !is_kind_at(tokens, size.next, lexer::TokenKind::RBracket) {
+        return err_at(tokens, size.next, "expected ']' to close the size in a sized-array type '[n]T'")
+    }
+    var elem = match parse_type_primary(tokens, size.next + 1) { ParsedType as x => x; error as e => return e }
+    ParsedType { node = SizedArrayType { size = size.node; element = elem.node }; next = elem.next; pending_gt = elem.pending_gt }
+}
+
+fn parse_type(tokens: []lexer::Token, pos: u64): ParsedType | error {
+    var first = match parse_type_primary(tokens, pos) { ParsedType as x => x; error as e => return e }
+    var members: []@TypeExpr() = []
+    members = [..members, first.node]
+    var p = first.next
+    var pend = first.pending_gt
     loop {
         if pend > 0 { break }
-        let q = skip_seps(tokens, p)
+        var q = skip_seps(tokens, p)
         if !is_kind_at(tokens, q, lexer::TokenKind::Pipe) { break }
-        let mp = skip_seps(tokens, q + 1)
-        let m = match parse_type_primary(tokens, mp) { ParsedType as x => x; error as e => return e }
-        members = teko::list::push(members, m.node)
+        var mp = skip_seps(tokens, q + 1)
+        var m = match parse_type_primary(tokens, mp) { ParsedType as x => x; error as e => return e }
+        members = [..members, m.node]
         p = m.next
         pend = m.pending_gt
     }

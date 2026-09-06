@@ -1,0 +1,221 @@
+fn kdf_append(dst: []byte, src: []byte): []byte {
+    [..dst, ..src]
+}
+
+fn kdf_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+fn kdf_xor(a: []byte, b: []byte): []byte {
+    var out: [a.len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        out[i] = ((a[i] to u32) ^ (b[i] to u32)) to byte
+        i++
+    }
+    out
+}
+
+fn kdf_be_u32_bytes(x: u64): []byte {
+    [
+        ((x >> 24) & 0xFF) to byte,
+        ((x >> 16) & 0xFF) to byte,
+        ((x >> 8) & 0xFF) to byte,
+        (x & 0xFF) to byte,
+    ]
+}
+
+fn kdf_sha1_key0(key: []byte): []byte {
+    var k = if key.len > 64 { sha1_of(key) } else { key }
+    var out: [64]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= k.len { break }
+        out[i] = k[i]
+        i++
+    }
+    out
+}
+
+fn kdf_sha1_xor(buf: []byte, pad: u32): []byte {
+    var out: [buf.len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= buf.len { break }
+        out[i] = ((buf[i] to u32) ^ pad) to byte
+        i++
+    }
+    out
+}
+
+fn kdf_hmac_sha1_of(key: []byte, msg: []byte): []byte {
+    var k0 = kdf_sha1_key0(key)
+    var inner = sha1_of(kdf_append(kdf_sha1_xor(k0, 0x36), msg))
+    sha1_of(kdf_append(kdf_sha1_xor(k0, 0x5c), inner))
+}
+
+fn kdf_hkdf_expand(prf: func<[]byte, []byte, []byte>, hash_len: u64, prk: []byte, info: []byte, length: u64): []byte | CryptoError {
+    if length > 255 * hash_len { return crypto_error("hkdf: requested length exceeds 255 * hash_len") }
+    var n_blocks = (length + hash_len - 1) / hash_len
+    var okm: [n_blocks * hash_len]byte = []
+    var t: []byte = []
+    var pos: u64 = 0
+    var i: u64 = 1
+    loop {
+        if i > n_blocks { break }
+        t = prf(prk, [..t, ..info, ..single_byte(i)])
+        var j: u64 = 0
+        loop {
+            if j >= t.len { break }
+            okm[pos] = t[j]
+            pos++
+            j++
+        }
+        i++
+    }
+    kdf_slice(okm, 0, length)
+}
+
+fn single_byte(value: u64): []byte {
+    [(value & 0xFF) to byte]
+}
+
+fn kdf_pbkdf2_f(prf: func<[]byte, []byte, []byte>, password: []byte, salt: []byte, iterations: u64, block_index: u64): []byte {
+    var u = prf(password, [..kdf_slice(salt, 0, salt.len), ..kdf_be_u32_bytes(block_index)])
+    var acc = u
+    var j: u64 = 1
+    loop {
+        if j >= iterations { break }
+        u = prf(password, u)
+        acc = kdf_xor(acc, u)
+        j++
+    }
+    acc
+}
+
+fn kdf_pbkdf2(prf: func<[]byte, []byte, []byte>, hash_len: u64, password: []byte, salt: []byte, iterations: u64, dk_len: u64): []byte | CryptoError {
+    if iterations == 0 { return crypto_error("pbkdf2: iterations must be at least 1") }
+    if dk_len > 0xffffffff * hash_len { return crypto_error("pbkdf2: derived key too long") }
+    var n_blocks = (dk_len + hash_len - 1) / hash_len
+    var dk: [n_blocks * hash_len]byte = []
+    var pos: u64 = 0
+    var i: u64 = 1
+    loop {
+        if i > n_blocks { break }
+        var block = kdf_pbkdf2_f(prf, password, salt, iterations, i)
+        var j: u64 = 0
+        loop {
+            if j >= block.len { break }
+            dk[pos] = block[j]
+            pos++
+            j++
+        }
+        i++
+    }
+    kdf_slice(dk, 0, dk_len)
+}
+
+/**
+ * HKDF-Extract with HMAC-SHA-256 (RFC 5869 §2.2): compresses the (possibly non-uniform) input
+ * keying material `ikm` into a 32-byte pseudorandom key `PRK = HMAC-SHA-256(salt, ikm)`. An empty
+ * `salt` is equivalent to a string of `HashLen` zero bytes (HMAC zero-pads a short key), matching
+ * the RFC's "salt not provided" default.
+ */
+exp fn hkdf_sha256_extract(salt: []byte, ikm: []byte): []byte {
+    hmac_sha256_of(salt, ikm)
+}
+
+/**
+ * HKDF-Expand with HMAC-SHA-256 (RFC 5869 §2.3): expands a pseudorandom key into `length` bytes of
+ * output keying material bound to `info`.
+ */
+exp fn hkdf_sha256_expand(prk: []byte, info: []byte, length: u64): []byte | CryptoError {
+    kdf_hkdf_expand((k: []byte, m: []byte) => hmac_sha256_of(k, m), 32, prk, info, length)
+}
+
+/**
+ * One-shot HKDF with HMAC-SHA-256 (RFC 5869): extract-then-expand, deriving `length` bytes of
+ * output keying material from `ikm`, `salt`, and `info` in a single call.
+ */
+exp fn hkdf_sha256(ikm: []byte, salt: []byte, info: []byte, length: u64): []byte | CryptoError {
+    hkdf_sha256_expand(hkdf_sha256_extract(salt, ikm), info, length)
+}
+
+/**
+ * HKDF-Extract with HMAC-SHA-512 (RFC 5869 §2.2): `PRK = HMAC-SHA-512(salt, ikm)`, a 64-byte key.
+ */
+exp fn hkdf_sha512_extract(salt: []byte, ikm: []byte): []byte {
+    hmac_sha512_of(salt, ikm)
+}
+
+/**
+ * HKDF-Expand with HMAC-SHA-512 (RFC 5869 §2.3): expands a pseudorandom key into `length` bytes of
+ * output keying material bound to `info`.
+ */
+exp fn hkdf_sha512_expand(prk: []byte, info: []byte, length: u64): []byte | CryptoError {
+    kdf_hkdf_expand((k: []byte, m: []byte) => hmac_sha512_of(k, m), 64, prk, info, length)
+}
+
+/**
+ * One-shot HKDF with HMAC-SHA-512 (RFC 5869): extract-then-expand in a single call.
+ */
+exp fn hkdf_sha512(ikm: []byte, salt: []byte, info: []byte, length: u64): []byte | CryptoError {
+    hkdf_sha512_expand(hkdf_sha512_extract(salt, ikm), info, length)
+}
+
+/**
+ * HKDF-Extract with HMAC-SHA-1 (RFC 5869 §2.2): `PRK = HMAC-SHA-1(salt, ikm)`, a 20-byte key. SHA-1
+ * is retained for interop with protocols that specify it; new designs should prefer SHA-256.
+ */
+exp fn hkdf_sha1_extract(salt: []byte, ikm: []byte): []byte {
+    kdf_hmac_sha1_of(salt, ikm)
+}
+
+/**
+ * HKDF-Expand with HMAC-SHA-1 (RFC 5869 §2.3): expands a pseudorandom key into `length` bytes of
+ * output keying material bound to `info`.
+ */
+exp fn hkdf_sha1_expand(prk: []byte, info: []byte, length: u64): []byte | CryptoError {
+    kdf_hkdf_expand((k: []byte, m: []byte) => kdf_hmac_sha1_of(k, m), 20, prk, info, length)
+}
+
+/**
+ * One-shot HKDF with HMAC-SHA-1 (RFC 5869): extract-then-expand in a single call. Retained for
+ * interop; new designs should prefer `hkdf_sha256`.
+ */
+exp fn hkdf_sha1(ikm: []byte, salt: []byte, info: []byte, length: u64): []byte | CryptoError {
+    hkdf_sha1_expand(hkdf_sha1_extract(salt, ikm), info, length)
+}
+
+/**
+ * PBKDF2 with HMAC-SHA-1 (RFC 8018 §5.2, vectors RFC 6070): derives a `dk_len`-byte key from
+ * `password` and `salt` by iterating HMAC-SHA-1 `iterations` times per output block.
+ */
+exp fn pbkdf2_sha1(password: []byte, salt: []byte, iterations: u64, dk_len: u64): []byte | CryptoError {
+    kdf_pbkdf2((k: []byte, m: []byte) => kdf_hmac_sha1_of(k, m), 20, password, salt, iterations, dk_len)
+}
+
+/**
+ * PBKDF2 with HMAC-SHA-256 (RFC 8018 §5.2): derives a `dk_len`-byte key from `password` and `salt`
+ * by iterating HMAC-SHA-256 `iterations` times per output block.
+ */
+exp fn pbkdf2_sha256(password: []byte, salt: []byte, iterations: u64, dk_len: u64): []byte | CryptoError {
+    kdf_pbkdf2((k: []byte, m: []byte) => hmac_sha256_of(k, m), 32, password, salt, iterations, dk_len)
+}
+
+/**
+ * PBKDF2 with HMAC-SHA-512 (RFC 8018 §5.2): derives a `dk_len`-byte key from `password` and `salt`
+ * by iterating HMAC-SHA-512 `iterations` times per output block.
+ */
+exp fn pbkdf2_sha512(password: []byte, salt: []byte, iterations: u64, dk_len: u64): []byte | CryptoError {
+    kdf_pbkdf2((k: []byte, m: []byte) => hmac_sha512_of(k, m), 64, password, salt, iterations, dk_len)
+}

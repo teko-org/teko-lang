@@ -90,10 +90,10 @@ by the current codegen.
 
 | Teko name | C impl | Behaviour |
 |-----------|--------|-----------|
-| `as_ptr(str) -> ptr` | `tk_as_ptr` | Returns `s.ptr` as `void *` — a **borrow** of the str's buffer. Not NUL-terminated. |
-| `as_cstr(str) -> ptr` | `tk_cstr_dup` | `malloc`s a NUL-terminated copy.  Caller must ensure the `ptr` outlives its use; Teko has no destructor to free it. |
-| `str_from_cstr(ptr) -> str` | `tk_str_from_cstr` | Copies a C string into a fresh Teko str.  NULL-safe (yields empty str). |
-| `bytes_from_ptr(ptr, u64) -> []byte` | `tk_bytes_from_ptr` | Copies `n` bytes from a foreign pointer into a fresh slice. NULL-safe. |
+| `as_ptr(str): ptr` | `teko::runtime::as_ptr` (Teko) | Returns `s.ptr` as `void *` — a **borrow** of the str's buffer. Not NUL-terminated. |
+| `as_cstr(str): ptr` | `tk_cstr_dup` | `malloc`s a NUL-terminated copy.  Caller must ensure the `ptr` outlives its use; Teko has no destructor to free it. |
+| `str_from_cstr(ptr): str` | `tk_str_from_cstr` | Copies a C string into a fresh Teko str.  NULL-safe (yields empty str). |
+| `bytes_from_ptr(ptr, u64): []byte` | `tk_bytes_from_ptr` | Copies `n` bytes from a foreign pointer into a fresh slice. NULL-safe. |
 
 ### Findings
 

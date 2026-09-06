@@ -1,0 +1,97 @@
+// surface_overload_free.tk -- overload of a TOP-LEVEL function (entrega 4,
+// crumb C4): one name, several signatures, no new word. The core gives a name
+// one symbol, so the pass gives each signature its own -- `pick(i64)` becomes
+// `pick__i64`, `pick(Vec)` `pick__Vec`, `pick(i64, i64)` `pick__i64__i64` and
+// `tally()` `tally__void`, the suffix an overloaded METHOD already carries
+// (surface_overload_method.tk).
+//
+// The call site is what chooses: the ARGUMENT TYPES, from the C3 oracle. An
+// integer literal has no type of its own and lands on `i64`, `v` is a `Vec`
+// because its declaration says so, and `pick(pick(3, 4))` reads the inner
+// overload's return type -- the inner call is resolved before the outer one
+// asks. `steps` calls ITSELF: the unit is complete inside a pass, so a
+// recursive site is an ordinary site.
+//
+// What is NOT touched is half the point. `plain` has one signature and keeps
+// the symbol `_plain`; `chmod` is an `extern` and owns `_chmod`, which is the
+// C ABI and not ours to move; and `steps` is declared by a PROTOTYPE above its
+// definition, so both ends of it get the same new symbol and the core still
+// pairs them. `chmod` is the extern because it is the one this fixture can call
+// on all five CI legs: libSystem and glibc have it, and on Windows -- where
+// there is no libc at all -- it is in the system layer the link already carries
+// (`mc` lib/sys_windows_host.mc). It returns C `int`, so the declaration is
+// `extern i32` (M45: a call reads back what it declares, sign-extended). It is
+// asked about a path that does not exist, so it changes nothing, and its RESULT
+// is deliberately dropped: the call is the whole assertion (the symbol resolved
+// and it ran), while the value is not comparable across the five legs -- POSIX
+// answers -1 and the Windows shim answers 0, because NTFS has no mode bits to
+// set.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+extern i32 chmod(uptr path, i64 mode);
+
+struct Vec {
+    public i64 x;
+    public i64 y;
+}
+
+i64 steps(i64 n);
+
+i64 pick(i64 n) {
+    return n + 1;
+}
+
+i64 pick(Vec v) {
+    return v.x + v.y;
+}
+
+i64 pick(i64 a, i64 b) {
+    return a * b;
+}
+
+i64 tally() {
+    return 2;
+}
+
+i64 tally(i64 k) {
+    return k;
+}
+
+i64 steps(i64 n) {
+    if (n <= 0) return 0;
+    i64 m = n - 1;
+    return 1 + steps(m);
+}
+
+i64 steps(Vec v) {
+    return v.x - v.y + 4;
+}
+
+i64 plain(i64 n) {
+    return n;
+}
+
+i64 main() {
+    Vec v = new Vec;
+    v.x = 4;
+    v.y = 6;
+
+    if (pick(9) != 10) return 1;                  // pick__i64
+    if (pick(v) != 10) return 2;                  // pick__Vec
+    if (pick(3, 4) != 12) return 3;               // pick__i64__i64
+    if (pick(pick(3, 4)) != 13) return 4;         // the inner call types the outer
+
+    if (tally() != 2) return 5;                   // tally__void
+    if (tally(5) != 5) return 6;
+
+    if (steps(3) != 3) return 7;                  // recursive, rewritten in place
+    if (steps(v) != 2) return 8;                  // ...and its other signature
+
+    if (plain(4) != 4) return 9;                  // one signature: symbol untouched
+    chmod("no-such-file.teko", 0);                // an extern: never renamed
+
+    return pick(9) + pick(v) + pick(3, 4) + tally() + plain(8);   // 10+10+12+2+8
+}

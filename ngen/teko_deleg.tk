@@ -1,0 +1,1174 @@
+// teko_deleg.tk -- K1 (D221/§41): a NAMED delegate (C# 1.0), not a generic
+// `Func<>`/`Action<>` -- one `type_new` per declaration, the signature kept in
+// a small table of its own beside teko_struct.tk's type row.
+//
+//   public delegate i64 Op(i64 a, i64 b);
+//   i64 add(i64 a, i64 b) { return a + b; }
+//   Op f = add;                 // contextual: a local of delegate type
+//   Op g = new Op(add);         // explicit, valid anywhere `new` is
+//   f(3, 4)                     // rebaixed in a pass() to a typed `callp`
+//
+// A delegate value IS an object, with the same layout a class carries: word 0
+// the vtable (release only, `TK_VT_FIXED` words, no itab), word 1 the count,
+// word 2 the CODE pointer. `tk_is_counted` (teko_struct.tk) already answers
+// for a `TK_KDELEG` row, so the reclaim (teko_rc.tk) needs zero new line: a
+// local, a field, a parameter of delegate type is scoped and released exactly
+// as a class reference is.
+//
+// ABI: every function reached through a delegate takes the OBJECT as an
+// invisible first parameter (an `__env`, unused by a plain function -- K4's
+// captures read it), so `callp(code, obj, args...)` is the ONE calling
+// convention every delegate value shares, captures or none. A free function
+// with no capture gets a THUNK that forwards to it, memoized per (delegate,
+// function) pair: `Op__thunk_add(uptr __env, i64 a, i64 b) { return add(a,
+// b); }`. Its own vtable, release and allocator are generated alongside it
+// (`Op__vt_add`, `Op__release_add`, `Op__new_add`) -- the layout is per
+// LAMBDA, not per delegate TYPE, so K4's captures cost no rewrite here.
+//
+// `f(3, 4)` on a local/parameter of delegate type is core grammar (an
+// identifier followed by `(`), parsed with no hook at all -- `tk_deleg_pass`
+// rewrites every such `N_CALL` into the typed `callp` above, reusing
+// teko_typeof.tk's own scope walk (`tk_ty_pass_walk`); what it does not
+// rewrite dies at `call to unknown function`, never in silence. A field of
+// delegate type (`h.cb(2, 3)`) is resolved where it is written instead,
+// teko_expr.tk's `tk_field_use`.
+
+#define TK_DGMAX (MAXPARAMS - 2)      // callp: code + obj + params, <= MAXPARAMS
+#define TK_DGOBJSIZE 24                // vtable + count + code, no capture (K1)
+#define TK_MAXDGI 64                   // (delegate, function) pairs one unit wraps
+
+#define TK_MAXLAMCAP 32                // `use (...)` names, summed across every lambda still in
+                                       // flight (higiene 2, item 6: a nested lambda's own captures
+                                       // share this table with every enclosing one's, unreleased
+                                       // until each returns) -- 8 per lambda nested four deep
+#define TK_MAXLAMREF 64                // lambdas that capture at least one name by reference
+#define TK_MAXLAMGLOB 64               // D226 compat crumb: lambda-body names a global read
+                                       // might be, resolved once teko_array.tk's own `N_GLOBAL`
+                                       // rows exist -- there is no hook over a top-level
+                                       // declaration (teko_array.tk's own header), so a name
+                                       // this early check cannot place waits for `tk_deleg_pass`
+
+// K4 (D221/§41): lambda, local named function, `use (a, &b)` -- the same
+// object K1 wraps a plain function into, built inline where `new Op(...)`
+// finds a `(` instead of a bare name. Defined at the end of this file, after
+// the capture table and the reclaim helpers it shares with `teko_ref.tk`'s
+// own `tk_arr_load`/`tk_arr_store`; forward-declared here for `tk_new_deleg`
+// and `tk_deleg_return`, which run ahead of it in the file.
+i64 tk_lambda_build(i64 si, i64 line, uptr fl);
+i64 tk_lam_escapes(i64 e);
+
+i64 dg_ret[TK_MAXSTRUCT];             // the declared return type
+i64 dg_np[TK_MAXSTRUCT];              // how many parameters
+i64 dg_pty[TK_MAXSTRUCT * TK_DGMAX];  // the parameter types, flattened
+i64 dg_pk[TK_MAXSTRUCT * TK_DGMAX];   // ...and the `ref`/`out` kind of each (K2w)
+
+i64  dg_ret_at(i64 i)         { return ld64(dg_ret + i * 8); }
+i64  dg_np_at(i64 i)          { return ld64(dg_np + i * 8); }
+i64  dg_pty_at(i64 si, i64 j) { return ld64(dg_pty + (si * TK_DGMAX + j) * 8); }
+i64  dg_pk_at(i64 si, i64 j)  { return ld64(dg_pk + (si * TK_DGMAX + j) * 8); }
+
+void set_dg_ret_at(i64 i, i64 v)         { st64(dg_ret + i * 8, v); }
+void set_dg_np_at(i64 i, i64 v)          { st64(dg_np + i * 8, v); }
+void set_dg_pty_at(i64 si, i64 j, i64 v) { st64(dg_pty + (si * TK_DGMAX + j) * 8, v); }
+void set_dg_pk_at(i64 si, i64 j, i64 v)  { st64(dg_pk + (si * TK_DGMAX + j) * 8, v); }
+
+// the slot a delegate parameter is declared at: an ADDRESS for a `ref`/`out`
+// one (K2w), the pointee's own width otherwise
+i64 dg_pslot_at(i64 si, i64 j) {
+    if (dg_pk_at(si, j) != TK_RP_NONE) return TY_UPTR;
+    return dg_pty_at(si, j);
+}
+
+uptr dgi_row[TK_MAXDGI];              // the delegate row a wrap targets
+uptr dgi_fn[TK_MAXDGI];               // the function it wraps
+uptr dgi_alloc[TK_MAXDGI];            // the allocator symbol already built for it
+i64  tk_ndgi = 0;
+
+i64  dgi_row_at(i64 i)   { return ld64(dgi_row + i * 8); }
+uptr dgi_fn_at(i64 i)    { return ld64(dgi_fn + i * 8); }
+uptr dgi_alloc_at(i64 i) { return ld64(dgi_alloc + i * 8); }
+
+void set_dgi_row_at(i64 i, i64 v)   { st64(dgi_row + i * 8, v); }
+void set_dgi_fn_at(i64 i, uptr v)   { st64(dgi_fn + i * 8, v); }
+void set_dgi_alloc_at(i64 i, uptr v) { st64(dgi_alloc + i * 8, v); }
+
+// `Op(i64, i64)`, for a mismatch message
+uptr tk_deleg_sig_str(i64 si) {
+    uptr s = tk_join(sr_name_at(si), "(");
+    i64 np = dg_np_at(si);
+    i64 i = 0;
+    loop {
+        if (i >= np) break;
+        if (i > 0) s = tk_join(s, ", ");
+        i64 k = dg_pk_at(si, i);
+        if (k != TK_RP_NONE) s = tk_join3(s, tk_ref_kindname(k), " ");
+        s = tk_join(s, type_name(dg_pty_at(si, i)));
+        i = i + 1;
+    }
+    return tk_join(s, ")");
+}
+
+// the row of a delegate row-index `ty` names, or -1 for anything else --
+// teko_struct.tk's own type table, filtered to `TK_KDELEG`
+i64 tk_deleg_row(i64 ty) {
+    i64 si = tk_struct_by_ty(ty);
+    if (si < 0) return 0 - 1;
+    if (!tk_is_deleg(si)) return 0 - 1;
+    return si;
+}
+
+// the delegate row named `name`, or -1 for a plain type/no type at all: the
+// early branch `tk_new()` takes before its own struct/class lookup. §50 O2
+// ressalva 3: a row a use materialized ahead of its real declaration
+// (`TK_PFWD`) is not a delegate YET -- `dg_ret`/`dg_np` are still unset --
+// so it is left for `tk_new()`'s own struct/class path to report honestly,
+// rather than answered here as a zero-parameter delegate.
+i64 tk_deleg_find(uptr name) {
+    i64 si = tk_struct_find(name);
+    if (si < 0) return 0 - 1;
+    if (sr_part_at(si) == TK_PFWD) return 0 - 1;
+    if (!tk_is_deleg(si)) return 0 - 1;
+    return si;
+}
+
+// `d`'s signature has to match `si`'s exactly: same arity, same return, same
+// parameter types in order -- `add does not match the delegate Op(i64, i64)`
+void tk_deleg_check_sig(i64 si, uptr fn, i64 d) {
+    i64 np = dg_np_at(si);
+    i64 ok = decl_nparams(d) == np && decl_ret(d) == dg_ret_at(si);
+    i64 i = 0;
+    loop {
+        if (!ok) break;
+        if (i >= np) break;
+        if (tk_decl_param_ty(d, i) != dg_pty_at(si, i)) ok = 0;
+        if (tk_rp_kind(tk_decl_param_node(d, i)) != dg_pk_at(si, i)) ok = 0;
+        i = i + 1;
+    }
+    if (ok) return;
+    err_at(tk_file, tk_line,
+           tk_join(tk_join(tk_join("teko: ", fn), " does not match the delegate "),
+                   tk_deleg_sig_str(si)));
+}
+
+// `i64 Op__thunk_add(uptr env, i64 a, i64 b) { return add(a, b); }` -- the
+// ABI every delegate value shares, so a plain function needs a forwarder
+i64 tk_deleg_thunk_fn(i64 si, uptr thunkname, uptr fn) {
+    i64 prs = param_new(TY_UPTR, "env");
+    i64 args = 0;
+    i64 np = dg_np_at(si);
+    i64 i = 0;
+    loop {
+        if (i >= np) break;
+        uptr pn = tk_join("a", tk_num(i));
+        prs = list_append(prs, param_new(dg_pslot_at(si, i), pn));
+        args = list_append(args, tk_id(pn));
+        i = i + 1;
+    }
+    i64 ret = dg_ret_at(si);
+    i64 call = tk_call(fn, args);
+    i64 body;
+    if (ret == TY_VOID) body = tk_blk(tk_stmt(call));
+    else                body = tk_blk(tk_ret(call));
+    return tk_func(ret, thunkname, prs, body);
+}
+
+// `void Op__release_add(uptr this) { rt_free(this, 24); }` -- no capture in
+// K1, so nothing but the block itself to hand back
+i64 tk_deleg_release_fn(uptr relname) {
+    i64 st = tk_stmt(tk_call2("rt_free", tk_id(tk_this_name()), tk_int(TK_DGOBJSIZE)));
+    return tk_func(TY_VOID, relname, param_new(TY_UPTR, tk_this_name()), tk_blk(st));
+}
+
+// `Op Op__new_add() { ... }` -- the vtable's word 0 is filled on every call,
+// idempotently, the same shape `tk_new_install` (teko_class.tk) fills a
+// class's; the count starts at 1, the reference `new`/the coercion hands out
+i64 tk_deleg_alloc_fn(i64 si, uptr allocname, uptr vtname, uptr relname, uptr thunkname) {
+    i64 st = tk_var(TY_UPTR, "p", tk_call("rt_alloc", tk_int(TK_DGOBJSIZE)));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_id(vtname), tk_addr(relname))));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_id("p"), tk_id(vtname))));
+    i64 cnt = tk_bin(K_ADD, tk_id("p"), tk_int(8));
+    st = list_append(st, tk_stmt(tk_call2("st64", cnt, tk_int(1))));
+    i64 code = tk_bin(K_ADD, tk_id("p"), tk_int(16));
+    st = list_append(st, tk_stmt(tk_call2("st64", code, tk_addr(thunkname))));
+    i64 r = tk_id("p");
+    tk_xt_add(r, si, 0);                          // already owned: the count above, not rc_inc
+    st = list_append(st, tk_ret(r));
+    return tk_func(sr_ty_at(si), allocname, 0, tk_blk(st));
+}
+
+// the allocator that wraps `fn` as a value of delegate row `si`, generated and
+// memoized the first time the pair is asked for -- `Op__new_add`
+uptr tk_deleg_thunk(i64 si, uptr fn) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_ndgi) break;
+        if (dgi_row_at(i) == si && str_eq(dgi_fn_at(i), fn)) return dgi_alloc_at(i);
+        i = i + 1;
+    }
+    i64 d = decl_find(fn);
+    if (d < 0 || !decl_valid(d)) err_at2(tk_file, tk_line, "teko: unknown function", fn);
+    tk_deleg_check_sig(si, fn, d);
+    uptr base = sr_name_at(si);
+    uptr allocname = tk_join(tk_join(base, "__new_"), fn);
+    uptr thunkname = tk_join(tk_join(base, "__thunk_"), fn);
+    uptr vtname = tk_join(tk_join(base, "__vt_"), fn);
+    uptr relname = tk_join(tk_join(base, "__release_"), fn);
+    top_add(tk_deleg_thunk_fn(si, thunkname, fn));
+    top_add(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
+    top_add(tk_deleg_release_fn(relname));
+    top_add(tk_deleg_alloc_fn(si, allocname, vtname, relname, thunkname));
+    if (tk_ndgi == TK_MAXDGI) err_at(tk_file, tk_line, "teko: too many delegate targets");
+    set_dgi_row_at(tk_ndgi, si);
+    set_dgi_fn_at(tk_ndgi, fn);
+    set_dgi_alloc_at(tk_ndgi, allocname);
+    tk_ndgi = tk_ndgi + 1;
+    return allocname;
+}
+
+// `delegate i64 Op(i64 a, i64 b);` -- the parameter list's own types, read by
+// the core's `parse_params()` (the exact grammar a delegate's own list needs)
+// and kept; the names themselves are not
+void tk_deleg_set_sig(i64 si, i64 ret, i64 prs, i64 line, uptr fl) {
+    set_dg_ret_at(si, ret);
+    i64 n = 0;
+    i64 p = prs;
+    loop {
+        if (p == 0) break;
+        if (n == TK_DGMAX)
+            err_at(fl, line, "teko: method with too many parameters (the receiver counts, and so does the vtable pointer of a virtual call)");
+        set_dg_pty_at(si, n, tk_param_ty(p));
+        set_dg_pk_at(si, n, tk_rp_kind(p));
+        n = n + 1;
+        p = nd_next(p);
+    }
+    set_dg_np_at(si, n);
+}
+
+// `[public|internal] delegate T Name(params);` -- a top-level declaration,
+// C#'s own default visibility (teko_access.tk's `tk_take_decl_vis`)
+void tk_delegate() {
+    i64 line = p_line();
+    uptr fl = p_file();
+    p_next();                                     // the `delegate` word
+    i64 vis = tk_take_decl_vis();
+    i64 proj = tk_take_decl_proj();
+    i64 ret = p_type();
+    uptr name = tk_newname("delegate");
+    name = tk_ns_qualify(name);
+    i64 ty = tk_type_word(name);
+    i64 si = tk_type_add(name, ty, 0 - 1, TK_KDELEG, vis, proj);
+    p_set_decl_name(name);
+    i64 prs = parse_params();
+    p_expect(K_SEMI, "expected ; after the delegate declaration");
+    tk_deleg_set_sig(si, ret, prs, line, fl);
+}
+
+// `new Op(add)` / `Op f = add;`: the object `tk_deleg_thunk` allocates,
+// re-typed to the delegate row `si`
+i64 tk_deleg_wrap(i64 si, uptr fname, i64 line, uptr fl) {
+    tk_line = line;
+    tk_file = fl;
+    i64 n = tk_call(tk_deleg_thunk(si, fname), 0);
+    tk_xt_put(n, si, sr_ty_at(si), 0);
+    return n;
+}
+
+// `new Op(add)`: valid anywhere `new` is, including a function-livre argument
+// (D221 decision 19's explicit form). A `(` right after the outer one opens a
+// lambda's own parameter list (K4, §41): `new Op((i64 a, i64 b) => a + b)`,
+// never a plain function name, which is a bare identifier here.
+i64 tk_new_deleg(i64 si, i64 line, uptr fl) {
+    tk_check_type_use(si, line, fl);
+    p_expect(K_LPAR, "expected ( after the delegate name");
+    i64 r;
+    if (p_id() == K_LPAR) r = tk_lambda_build(si, line, fl);
+    else {
+        i64 e = parse_expr(0);
+        if (nd_kind(e) != N_IDENT)
+            err_at(fl, line, "teko: `new Op(...)` takes the name of a function or a lambda");
+        r = tk_deleg_wrap(si, nd_name(e), line, fl);
+    }
+    p_expect(K_RPAR, "expected ) after the delegate target");
+    return r;
+}
+
+// a delegate call's own arguments against the KIND its signature declares:
+// a `ref`/`out` slot is an ADDRESS (K2w), so an argument that carries a value
+// would be written through as if it were one -- the same two diagnostics
+// `tk_ref_check_call` (teko_ref.tk) gives a direct call
+void tk_deleg_check_arg_kinds(i64 si, i64 args, i64 line, uptr fl) {
+    i64 a = args;
+    i64 i = 0;
+    loop {
+        if (a == 0) break;
+        i64 pk = dg_pk_at(si, i);
+        i64 ak = tk_rfarg_kind(a);
+        if (pk != ak) {
+            if (pk == TK_RP_NONE)
+                err_at(fl, line, tk_join3("teko: argument ", tk_num(i + 1), " is not passed by reference"));
+            err_at(fl, line,
+                   tk_join(tk_join3("teko: argument ", tk_num(i + 1), " needs `"),
+                           tk_join(tk_ref_kindname(pk), "` at the call site")));
+        }
+        i = i + 1;
+        a = nd_next(a);
+    }
+}
+
+// `code`/`obj`/`args` -> the typed `callp` expression, shared by the bare-call
+// rewrite (`tk_deleg_call`) and a field call (teko_expr.tk's `tk_field_use`).
+// `obj` is read TWICE -- once for the code pointer, once as the call's own
+// object argument -- so it has to be pure; a name and a field load both are.
+// The return type is NOT registered here: the node this builds may still be
+// copied into another node's position by the caller (`node_assign`), and the
+// xt table is keyed by node POSITION (teko_struct.tk), so the entry has to
+// land on whatever identity actually ends up in the tree -- the caller's job,
+// same split `tk_pend_do` (teko_typeof.tk) keeps between building and typing.
+i64 tk_deleg_build(i64 si, i64 obj, i64 args, i64 na, i64 line, uptr fl) {
+    tk_line = line;
+    tk_file = fl;
+    if (na != dg_np_at(si))
+        err_at(fl, line, tk_join("teko: wrong number of arguments for ", sr_name_at(si)));
+    tk_deleg_check_arg_kinds(si, args, line, fl);
+    i64 code = tk_call("tk_deleg_code", tk_clone(obj));
+    i64 call = tk_call("callp", list_append(list_append(code, obj), args));
+    return tk_callp_ret(dg_ret_at(si), call);
+}
+
+// how many arguments an already-parsed sibling list holds
+i64 tk_deleg_argc(i64 args) {
+    i64 n = 0;
+    i64 a = args;
+    loop {
+        if (a == 0) break;
+        n = n + 1;
+        a = nd_next(a);
+    }
+    return n;
+}
+
+// `f(3, 4)` where `f` is a local/parameter of delegate row `di`: rewritten IN
+// PLACE into the typed `callp` above (hooks.md § pass())
+i64 tk_deleg_call(i64 n, i64 di) {
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    i64 args = nd_a(n);
+    i64 obj = tk_id(nd_name(n));
+    i64 r = tk_deleg_build(di, obj, args, tk_deleg_argc(args), line, fl);
+    i64 keep = nd_next(n);
+    node_assign(n, r);
+    set_nd_next(n, keep);
+    // the node that ends up in the TREE is `n`, not `r` -- the count the
+    // reclaim pass (teko_rc.tk) reads is by node POSITION, so the entry has
+    // to be under `n`'s identity or a counted return (`Cell c = f(7);`)
+    // reads as "borrowed" and picks up an rc_inc it never sheds
+    i64 ret = dg_ret_at(di);
+    tk_xt_put(n, tk_struct_by_ty(ret), ret, 0);
+    return n;
+}
+
+i64 tk_deleg_cur_ns = 0;              // the namespace of the function this pass walks
+i64 tk_deleg_cur_ret = 0 - 1;          // the declared return type of the function this pass walks
+i64 tk_deleg_root = 0;                 // the unit, for the same decl-count guard C6 already uses
+
+i64 tk_default_decl_count(i64 root, uptr name);   // teko_default.tk, included after this file
+
+// `gadd`, named bare inside `namespace geo { ... }`, is not this pass's own
+// call/const rewrite (teko_ns.tk's `tk_ns_pass` ran first and only touches an
+// `N_CALL`/`N_ADDR`/a const `N_IDENT`) -- a plain function reference is left
+// exactly as the source wrote it, so the wrap has to try the DECLARED symbol
+// first and only then the same namespace/`using` search a call already gets
+uptr tk_deleg_resolve_fn(uptr fname, i64 line, uptr fl) {
+    if (decl_find(fname) >= 0) return fname;
+    i64 d = tk_ns_call_try_prefixes(fname, tk_deleg_cur_ns);
+    if (d < 0) d = tk_ns_call_try_usings(fname, fl, line);
+    if (d < 0) return fname;
+    return nd_name(d);
+}
+
+// the static type a slot of delegate type would read `e` as, peeking through
+// a CALL THROUGH a delegate-typed local before this pass's own walk gets to
+// rewrite it (the same `dg_ret_at` lookup `tk_deleg_call` makes once it does)
+// -- everything else is the general oracle's own answer (a local/param, a
+// field already resolved, a call to a plain function, or an already-wrapped
+// `new Op(...)`, xt-typed since the parser built it)
+i64 tk_deleg_expr_ty(i64 e) {
+    if (nd_kind(e) == N_CALL) {
+        i64 di = tk_deleg_row(tk_ty_scope_find(nd_name(e)));
+        if (di >= 0) return dg_ret_at(di);
+    }
+    return tk_ty_of(e);
+}
+
+// `teko: Op takes a function, another Op, or null`
+uptr tk_deleg_mismatch_msg(i64 si) {
+    uptr nm = sr_name_at(si);
+    return tk_join(tk_join3("teko: ", nm, " takes a function, another "), tk_join(nm, ", or null"));
+}
+
+// the one validator every slot of delegate type `si` shares -- a var
+// initializer, an assignment, a call argument, a `return`. Only four shapes
+// read a delegate object correctly: `null`, a call already typed `si` (a
+// local/param/field, or a plain function's return), a compatible function
+// name (wrapped here, the same thunk a var declaration gets), or a value a
+// nested delegate call already answers with row `si`. Anything else -- a
+// literal, arithmetic, a mismatched type -- is a silent wrong-width copy
+// that segfaults the first time the slot is called
+i64 tk_deleg_coerce(i64 si, i64 e, i64 line, uptr fl) {
+    if (e == 0) return e;
+    if (nd_kind(e) == N_INT && nd_val(e) == 0) return e;             // `null`
+    if (nd_kind(e) == N_CALL && str_eq(nd_name(e), "tk_ternary")) {
+        i64 c = nd_a(e);                          // K4c item 3: `c ? a : b`, still the
+        i64 a = nd_next(c);                       // raw placeholder here (this pass runs
+        i64 b = nd_next(a);                       // ahead of teko_ternary.tk's own lowering)
+        set_nd_next(c, tk_deleg_coerce(si, a, line, fl));
+        set_nd_next(nd_next(c), tk_deleg_coerce(si, b, line, fl));
+        return e;
+    }
+    if (nd_kind(e) == N_IDENT && tk_ty_scope_find(nd_name(e)) < 0)
+        return tk_deleg_wrap(si, tk_deleg_resolve_fn(nd_name(e), line, fl), line, fl);
+    if (tk_deleg_expr_ty(e) == sr_ty_at(si)) return e;
+    err_at(fl, line, tk_deleg_mismatch_msg(si));
+    return e;
+}
+
+// `Op f = add;` / `Op f = new Op(mul);` / `Op maybe = null;` -- a local or
+// field initializer of delegate type `si`
+void tk_deleg_var(i64 n) {
+    if (nd_val(n) != 0) return;                   // `Op tbl[4]`: references
+    i64 si = tk_deleg_row(nd_type(n));
+    if (si < 0) return;
+    set_nd_a(n, tk_deleg_coerce(si, nd_a(n), nd_line(n), nd_file(n)));
+}
+
+// `f = add;` on a local/parameter of delegate type -- the assignment form of
+// the initializer above. A qualified target (`h.cb = e;`) is a different
+// node shape entirely (teko_expr.tk's field store), untouched here.
+void tk_deleg_assign(i64 n) {
+    i64 si = tk_deleg_row(tk_ty_scope_find(nd_name(n)));
+    if (si < 0) return;
+    set_nd_a(n, tk_deleg_coerce(si, nd_a(n), nd_line(n), nd_file(n)));
+}
+
+// `return add;` / `return f(x);` from a function declared to answer a
+// delegate type. D221 decision 21's first escape: a lambda that captures a
+// name by reference dies with the scope that owns it, so handing the
+// closure back to the caller is refused here, where it is rebaixed.
+void tk_deleg_return(i64 n) {
+    if (tk_lam_escapes(nd_a(n)))
+        err_at(nd_file(n), nd_line(n), "teko: a lambda that captures by reference cannot leave its scope");
+    if (tk_deleg_cur_ret < 0) return;
+    i64 si = tk_deleg_row(tk_deleg_cur_ret);
+    if (si < 0) return;
+    set_nd_a(n, tk_deleg_coerce(si, nd_a(n), nd_line(n), nd_file(n)));
+}
+
+// every argument of a call to a function declared ONCE in the unit (an
+// overloaded name is `teko_over.tk`'s call to make, later, and is left
+// alone here -- the same guard `tk_default_pass`'s own arg-filling uses):
+// each parameter of delegate type gets the one validator above, the argument
+// list spliced in place when a bare function name needs its wrap
+void tk_deleg_check_call_args(i64 n) {
+    uptr name = nd_name(n);
+    if (tk_default_decl_count(tk_deleg_root, name) != 1) return;
+    i64 d = decl_find(name);
+    if (d < 0) return;
+    i64 np = decl_nparams(d);
+    i64 i = 0;
+    i64 prev = 0;
+    i64 a = nd_a(n);
+    loop {
+        if (i >= np || a == 0) break;
+        i64 nxt = nd_next(a);
+        i64 psi = tk_deleg_row(tk_decl_param_ty(d, i));
+        if (psi >= 0) {
+            i64 fixed = tk_deleg_coerce(psi, a, nd_line(a), nd_file(a));
+            if (fixed != a) {
+                set_nd_next(fixed, nxt);
+                if (prev == 0) set_nd_a(n, fixed);
+                else set_nd_next(prev, fixed);
+                a = fixed;
+            }
+        }
+        prev = a;
+        a = nxt;
+        i = i + 1;
+    }
+}
+
+void tk_deleg_visit(i64 n) {
+    i64 k = nd_kind(n);
+    if (k == N_VAR)    { tk_deleg_var(n);    return; }
+    if (k == N_ASSIGN) { tk_deleg_assign(n); return; }
+    if (k == N_RETURN) { tk_deleg_return(n); return; }
+    if (k != N_CALL) return;
+    i64 di = tk_deleg_row(tk_ty_scope_find(nd_name(n)));
+    if (di >= 0) { tk_deleg_call(n, di); return; }
+    tk_deleg_check_call_args(n);
+}
+
+// the same shape teko_typeof.tk's own `tk_ty_walk_list` walks a function's
+// body in -- a block scoped, marked and cut back, a local joining scope only
+// after its own initializer is walked -- but a walk OF ITS OWN rather than a
+// reuse of that one: `tk_deleg_var`'s namespace lookup needs to know which
+// function it is inside (`tk_deleg_cur_ns`), which is set per top-level
+// N_FUNC below, and the shared walk has nowhere to carry that
+void tk_deleg_walk(i64 n) {
+    loop {
+        if (n == 0) break;
+        tk_deleg_visit(n);
+        if (nd_kind(n) == N_BLOCK) {
+            i64 mark = tk_nscope;
+            tk_deleg_walk(nd_a(n));
+            tk_nscope = mark;
+        } else {
+            tk_deleg_walk(nd_a(n));
+            tk_deleg_walk(nd_b(n));
+            tk_deleg_walk(nd_c(n));
+            tk_deleg_walk(nd_d(n));
+            tk_ty_scope_var(n);
+        }
+        n = nd_next(n);
+    }
+}
+
+// ---- K4: lambda, local named function, `use (a, &b)` (D221/§41) ----
+
+uptr lamref_name[TK_MAXLAMREF];       // allocator names whose lambda owns >= 1 by-reference capture
+i64  tk_nlamref = 0;
+i64  tk_nlam = 0;                     // gensym counter, unique over the whole unit
+i64  tk_lam_body_depth = 0;           // > 0 while the token stream is reading a lambda's own body
+
+// teko_di.tk (included before this file) reads this to refuse an `inject`
+// lexically inside a lambda's own body that is itself lexically inside an
+// open `scope { }` (DI4).
+i64 tk_lam_in_body() { return tk_lam_body_depth > 0; }
+
+void tk_lamref_add(uptr name) {
+    if (tk_nlamref == TK_MAXLAMREF) err_at(tk_file, tk_line, "teko: too many capturing lambdas");
+    st64(lamref_name + tk_nlamref * 8, name);
+    tk_nlamref = tk_nlamref + 1;
+}
+
+i64 tk_lamref_has(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nlamref) break;
+        if (str_eq(ld64(lamref_name + i * 8), name)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// K4b (D221/§41, item 2 of the verifier's own ressalva): a NAME that holds
+// the value of an escaping lambda, not the allocator CALL itself -- `Op f =
+// new Op(...) use (&acc) => ...; return f;` is the same escape as `return
+// new Op(...) use (&acc) => ...;`, one indirection later. Flow-insensitive
+// WITHIN one function by design: once a name is tainted it stays tainted for
+// the rest of the function, a strict superset of the UB the two forms above
+// already refuse, never a false negative. K4c (D221/§41): keyed by (owner,
+// name), owner the enclosing function/method -- a clean lambda named `f` in
+// one function no longer inherits the taint of an unrelated `f` elsewhere.
+uptr taint_owner[TK_MAXLAMREF];
+uptr taint_name[TK_MAXLAMREF];
+i64  tk_ntaint = 0;
+
+i64 tk_taint_find(uptr owner, uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_ntaint) break;
+        if (str_eq(ld64(taint_owner + i * 8), owner) && str_eq(ld64(taint_name + i * 8), name))
+            return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+void tk_taint_add(uptr owner, uptr name) {
+    if (tk_taint_find(owner, name)) return;
+    if (tk_ntaint == TK_MAXLAMREF) err_at(tk_file, tk_line, "teko: too many tainted lambda locals");
+    st64(taint_owner + tk_ntaint * 8, owner);
+    st64(taint_name + tk_ntaint * 8, name);
+    tk_ntaint = tk_ntaint + 1;
+}
+
+// K4c: the enclosing declaration's own name -- `p_decl_name()` while parsing
+// is reading it (the on_stmt hook below, and the three call sites that check
+// an assignment right where `parse_expr` reads it), `tk_cur_fn_name`
+// (teko_typeof.tk) once parsing is over and a pass() walk stands on the
+// N_FUNC instead (this file's own loop, and `tk_this_assign`'s).
+uptr tk_taint_owner() {
+    uptr d = p_decl_name();
+    if (d != 0) return d;
+    return tk_cur_fn_name;
+}
+
+// `e` escapes its scope: a call to an allocator whose lambda captures at
+// least one name by reference, or a NAME already tainted with one (the
+// propagation above). The one shape D221 decision 21's escapes share,
+// checked where a slot of delegate type is WRITTEN (`tk_deleg_return`
+// above, `teko_expr.tk`'s `tk_field_use`/`tk_call_method_args`,
+// `teko_access.tk`'s `tk_static_use`, `teko_heaparr.tk`'s `tk_ha_index`) --
+// everywhere BUT an argument of `new Op(...)`, which a callee only ever
+// reads, C-like, never stores.
+i64 tk_lam_escapes(i64 e) {
+    if (e == 0) return 0;
+    i64 k = nd_kind(e);
+    if (k == N_CALL) return tk_lamref_has(nd_name(e));
+    if (k == N_IDENT) return tk_taint_find(tk_taint_owner(), nd_name(e));
+    return 0;
+}
+
+// M21.5's statement hook, K4b: `Op g = f;` and `g = f;` propagate the taint
+// of the right side onto the name written -- the one point every write of a
+// local runs through no matter how early its own module resolves the write
+// (field/array stores read the escape at PARSE time), since it fires the
+// instant the core finishes reading the statement.
+i64 tk_lam_taint_stmt(i64 n) {
+    if (n == 0) return n;
+    i64 k = nd_kind(n);
+    if (k != N_VAR && k != N_ASSIGN) return n;
+    if (tk_lam_escapes(nd_a(n))) tk_taint_add(tk_taint_owner(), nd_name(n));
+    return n;
+}
+
+// ---- `use (a, &b)`: the captures of the lambda being read right now ----
+// higiene 2, item 6: ONE table over the whole unit, not reset per lambda --
+// a lambda literal built INSIDE another one's own body (`new Op(...) use (k)
+// => new Op(...) use (k) => ...`) is fully finished (its own `use`, body walk
+// AND cleanup) before the ENCLOSING lambda's body-parse that contains it
+// even returns, so a hard reset to 0 at either end wiped out whatever the
+// outer lambda had already recorded. `tk_lc_base` is the CURRENT lambda's own
+// window into the table (`[tk_lc_base, tk_nlc)`), saved/restored around the
+// body exactly like `p_decl_name` a few lines below -- the table itself only
+// ever grows and shrinks like a stack, never truly clears until the
+// outermost lambda's own `tk_lambda_finish` returns.
+uptr lc_name[TK_MAXLAMCAP];
+i64  lc_byref[TK_MAXLAMCAP];
+i64  lc_ty[TK_MAXLAMCAP];
+i64  tk_nlc = 0;
+i64  tk_lc_base = 0;
+
+uptr lc_name_at(i64 i)  { return ld64(lc_name + i * 8); }
+i64  lc_byref_at(i64 i) { return ld64(lc_byref + i * 8); }
+i64  lc_ty_at(i64 i)    { return ld64(lc_ty + i * 8); }
+
+i64 tk_lc_dup(uptr name) {
+    i64 i = tk_lc_base;
+    loop {
+        if (i >= tk_nlc) break;
+        if (str_eq(lc_name_at(i), name)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+i64 tk_lc_find(uptr name) {
+    i64 i = tk_lc_base;
+    loop {
+        if (i >= tk_nlc) break;
+        if (str_eq(lc_name_at(i), name)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// each captured name has to already be a local the enclosing function
+// declared (teko_struct.tk's `tk_slv_find`, `tk_on_stmt` extended to track
+// every local for this): a function/type name is refused here, before the
+// lambda's own body is even read
+void tk_lambda_use(i64 line, uptr fl) {
+    p_next();                                     // the `use` word
+    p_expect(K_LPAR, "expected ( after use");
+    loop {
+        i64 byref = p_accept(K_AND);
+        if (p_id() != T_IDENT) err_at(p_file(), p_line(), "teko: expected a captured name");
+        uptr name = p_ident();
+        if (tk_lc_dup(name)) err_at2(fl, line, "teko: use (...) already captures", name);
+        i64 ty = tk_slv_find(name);
+        if (ty < 0) err_at2(fl, line, "teko: `use` captures a local; this name is not one", name);
+        if (byref && tk_is_counted(ty))
+            err_at2(fl, line, "teko: a capture by reference of a counted type is not taught yet", name);
+        if (tk_nlc == TK_MAXLAMCAP) err_at(fl, line, "teko: too many captures in one lambda");
+        st64(lc_name + tk_nlc * 8, name);
+        st64(lc_byref + tk_nlc * 8, byref);
+        st64(lc_ty + tk_nlc * 8, ty);
+        tk_nlc = tk_nlc + 1;
+        if (!p_accept(K_COMMA)) break;
+    }
+    p_expect(K_RPAR, "expected ) after the captures");
+}
+
+// the lambda's own parameter list against the delegate's: D221 decision 19
+// asks for explicit types AND a known target, so every parameter has to name
+// the pointee the delegate itself declares, in order
+void tk_lambda_check_params(i64 si, i64 prs, i64 line, uptr fl) {
+    i64 np = dg_np_at(si);
+    i64 i = 0;
+    i64 p = prs;
+    loop {
+        if (i >= np || p == 0) break;
+        if (tk_param_ty(p) != dg_pty_at(si, i) || tk_rp_kind(p) != dg_pk_at(si, i))
+            err_at2(fl, line, "teko: the lambda does not match the delegate", tk_deleg_sig_str(si));
+        i = i + 1;
+        p = nd_next(p);
+    }
+    if (i != np || p != 0)
+        err_at2(fl, line, "teko: the lambda does not match the delegate", tk_deleg_sig_str(si));
+}
+
+void tk_lam_replace(i64 n, i64 repl) {
+    i64 nx = nd_next(n);
+    node_assign(n, repl);
+    set_nd_next(n, nx);
+}
+
+// the local a by-reference capture derefs through: never the captured name
+// itself (K2's own restriction on `ref` as a local declaration would refuse
+// that), a plain `uptr` holding the address the prologue loaded
+uptr tk_lam_refaddr(i64 ci) { return tk_join("__lamref", tk_num(ci)); }
+
+// D226 compat crumb: a name a global might still turn out to be -- teko_array.tk's
+// own header explains why the answer waits for a pass (no hook exists over a
+// top-level declaration): `n` is recorded here and `tk_deleg_pass`, once the
+// whole unit's `N_GLOBAL` rows exist, is what actually accepts or refuses it.
+i64  lg_node[TK_MAXLAMGLOB];
+i64  tk_nlg = 0;
+
+void tk_lg_add(i64 n) {
+    if (tk_nlg == TK_MAXLAMGLOB) err_at(nd_file(n), nd_line(n), "teko: too many unresolved names in one lambda");
+    st64(lg_node + tk_nlg * 8, n);
+    tk_nlg = tk_nlg + 1;
+}
+
+// a name that is neither a param, a local the body itself declares, a
+// capture, a function nor a type -- C#'s own rule keeps every one of the
+// program's STATICS (a top-level global, a `const`, a free function) visible
+// with no `use (...)` at all; only a name none of those turns out to be is
+// truly `D221`'s own wording for it, and that answer waits on `tk_deleg_pass`
+// below (`tk_lg_add`), the one point a global's own row is knowable.
+void tk_lam_check_name(i64 n) {
+    uptr name = nd_name(n);
+    if (tk_ty_scope_find(name) >= 0) return;
+    if (tk_lc_find(name) >= 0) return;
+    if (decl_find(name) >= 0) return;
+    if (tk_struct_find(name) >= 0) return;
+    tk_lg_add(n);
+}
+
+// the freshly built body of ONE lambda: a by-reference capture's every read
+// and write is rewritten through the address its prologue loaded
+// (teko_ref.tk's own `tk_arr_load`/`tk_arr_store`, the exact helpers a
+// `ref`/`out` parameter already derefs with); a by-value capture is already
+// an ordinary local by the time this runs (its own prologue `T name = ...;`
+// is walked like any other declaration), so it needs no rewrite at all --
+// only the check that every OTHER name is a param, a local, or a global.
+void tk_lam_walk(i64 n) {
+    loop {
+        if (n == 0) break;
+        i64 k = nd_kind(n);
+        if (k == N_IDENT) {
+            i64 ci = tk_lc_find(nd_name(n));
+            if (ci >= 0 && lc_byref_at(ci)) {
+                tk_lam_replace(n, tk_arr_load(lc_ty_at(ci), tk_id(tk_lam_refaddr(ci))));
+                n = nd_next(n);
+                continue;
+            }
+            tk_lam_check_name(n);
+        } else if (k == N_ASSIGN) {
+            i64 ci = tk_lc_find(nd_name(n));
+            if (ci >= 0 && lc_byref_at(ci)) {
+                tk_lam_walk(nd_a(n));
+                i64 store = tk_arr_store(lc_ty_at(ci), tk_id(tk_lam_refaddr(ci)), nd_a(n));
+                set_nd_kind(n, N_EXPRSTMT);
+                set_nd_name(n, 0);
+                set_nd_a(n, store);
+                n = nd_next(n);
+                continue;
+            }
+        }
+        if (k == N_BLOCK) {
+            i64 mark = tk_nscope;
+            tk_lam_walk(nd_a(n));
+            tk_nscope = mark;
+        } else {
+            tk_lam_walk(nd_a(n));
+            tk_lam_walk(nd_b(n));
+            tk_lam_walk(nd_c(n));
+            tk_lam_walk(nd_d(n));
+            tk_ty_scope_var(n);
+        }
+        n = nd_next(n);
+    }
+}
+
+// `Op__lam3(uptr __env, T1 a, T2 b) { ... }`'s own prologue: one local per
+// by-value capture, read out of the closure at every call (`rt_own`/`rc_dec`
+// fall out of the ordinary scope machinery, teko_rc.tk, because this is a
+// real N_VAR the walk above sees like any other local); one local per
+// by-reference capture, holding the address `tk_lam_walk` derefs through.
+//
+// K4b: a by-value capture of DELEGATE type builds `Op inner = ld64(addr);`,
+// an `N_CALL` the later `tk_deleg_pass` walk (this same file) also visits as
+// an ordinary local initializer -- `tk_deleg_coerce` would refuse it outright
+// (a call to `ld64` matches none of the four shapes a delegate slot accepts).
+// The call node built here IS the final one (nothing copies over it before
+// that walk reads it, unlike `tk_deleg_call`'s own node -- K1b's own
+// lesson), so tagging it with the delegate's row right away, the same
+// `tk_field_use` (teko_expr.tk) tags a field LOAD of delegate type with,
+// makes the oracle answer the row's own type and the coercion a no-op.
+i64 tk_lambda_prologue(uptr envname) {
+    i64 pre = 0;
+    i64 i = tk_lc_base;
+    loop {
+        if (i >= tk_nlc) break;
+        i64 addr = tk_bin(K_ADD, tk_id(envname), tk_int(24 + 8 * (i - tk_lc_base)));
+        if (lc_byref_at(i)) {
+            pre = list_append(pre, tk_var(TY_UPTR, tk_lam_refaddr(i), tk_call("ld64", addr)));
+        } else {
+            i64 ld = tk_call(tk_ldn(lc_ty_at(i)), addr);
+            i64 dsi = tk_deleg_row(lc_ty_at(i));
+            if (dsi >= 0) tk_xt_put(ld, dsi, sr_ty_at(dsi), 1);
+            pre = list_append(pre, tk_var(lc_ty_at(i), lc_name_at(i), ld));
+        }
+        i = i + 1;
+    }
+    return pre;
+}
+
+// `rc_dec` of every by-value COUNTED capture: a by-reference one is an
+// address, never owned, and the code pointer/vtable carry no reference
+i64 tk_lambda_release_fn(uptr relname, i64 objsize) {
+    i64 st = 0;
+    i64 i = tk_lc_base;
+    loop {
+        if (i >= tk_nlc) break;
+        if (!lc_byref_at(i) && tk_is_counted(lc_ty_at(i))) {
+            i64 addr = tk_bin(K_ADD, tk_id(tk_this_name()), tk_int(24 + 8 * (i - tk_lc_base)));
+            st = list_append(st, tk_stmt(tk_call("rc_dec", tk_call("ld64", addr))));
+        }
+        i = i + 1;
+    }
+    st = list_append(st, tk_stmt(tk_call2("rt_free", tk_id(tk_this_name()), tk_int(objsize))));
+    return tk_func(TY_VOID, relname, param_new(TY_UPTR, tk_this_name()), tk_blk(st));
+}
+
+// the allocator's own body: K1's own three-word head written into the object
+// the CALLER hands over, already carrying every capture (`tk_lambda_capture_
+// chain` below). higiene 3, item B: the captures used to arrive as one
+// PARAMETER each, which put the mc ABI's own `MAXPARAMS` (12) in front of
+// `TK_MAXLAMCAP` -- a `use (...)` of thirteen names died on the CORE's own
+// `at most 12 parameters`, in a file it named wrong, instead of this
+// module's own ceiling. The object is one parameter no matter how many
+// names a lambda closes over.
+i64 tk_lambda_alloc_stmts(uptr vtname, uptr relname, uptr lamname) {
+    i64 st = tk_stmt(tk_call2("st64", tk_id(vtname), tk_addr(relname)));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_id("p"), tk_id(vtname))));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_bin(K_ADD, tk_id("p"), tk_int(8)), tk_int(1))));
+    st = list_append(st, tk_stmt(tk_call2("st64", tk_bin(K_ADD, tk_id("p"), tk_int(16)), tk_addr(lamname))));
+    return st;
+}
+
+i64 tk_lambda_alloc_fn(i64 si, uptr allocname, uptr vtname, uptr relname, uptr lamname) {
+    i64 st = tk_lambda_alloc_stmts(vtname, relname, lamname);
+    i64 r = tk_id("p");
+    tk_xt_add(r, si, 0);
+    st = list_append(st, tk_ret(r));
+    return tk_func(sr_ty_at(si), allocname, param_new(TY_UPTR, "p"), tk_blk(st));
+}
+
+// the link that writes ONE by-value capture: the value crosses into the
+// closure as an argument, so its own register file decides which of the three
+// writers of lib/rt.tk carries it -- a float in an `i64` parameter is never
+// received at all (higiene 4), and a counted one owes a reference.
+uptr tk_cap_writer(i64 ty) {
+    if (type_kind(ty) == TK_FLOAT) {
+        if (type_width(ty) == 4) return "tk_cap_putf32";
+        if (type_width(ty) == 8) return "tk_cap_putf";
+    }
+    if (tk_is_counted(ty)) return "tk_cap_own";
+    return "tk_cap_put";
+}
+
+// the object the allocator is handed: a fresh block with one `tk_cap_put`
+// link per capture (lib/rt.tk), each writing the value or the ADDRESS taken
+// AT THAT INSTANT -- the "frozen copy" D221 decision 20 asks a by-value
+// capture for, now written at the creation site instead of passed inward.
+// A capture of counted type goes through `tk_cap_own`, which takes the
+// closure's own reference the way the allocator's `rc_inc` used to.
+i64 tk_lambda_capture_chain(i64 objsize) {
+    i64 blk = tk_call("rt_alloc", tk_int(objsize));
+    i64 i = tk_lc_base;
+    loop {
+        if (i >= tk_nlc) break;
+        i64 off = tk_int(24 + 8 * (i - tk_lc_base));
+        if (lc_byref_at(i)) {
+            blk = tk_call3("tk_cap_put", blk, off, tk_addr(lc_name_at(i)));
+        } else {
+            blk = tk_call3(tk_cap_writer(lc_ty_at(i)), blk, off, tk_id(lc_name_at(i)));
+        }
+        i = i + 1;
+    }
+    return blk;
+}
+
+// 1 when at least one capture is taken by reference -- the escape D221
+// decision 21 tracks through `tk_lamref_add`
+i64 tk_lambda_has_byref() {
+    i64 i = tk_lc_base;
+    loop {
+        if (i >= tk_nlc) break;
+        if (lc_byref_at(i)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// a name unique over the whole unit, namespace-qualified exactly as a named
+// `delegate` is (`tk_delegate` above): two lambdas of the same delegate type
+// never collide, in or out of a `namespace`
+uptr tk_lambda_gensym(uptr base) {
+    uptr nm = tk_ns_qualify(tk_join3(base, "__lam", tk_num(tk_nlam)));
+    tk_nlam = tk_nlam + 1;
+    return nm;
+}
+
+// the tail every lambda grafia shares once its own parameter list is known:
+// `[use (...)] => body`, the generated function, its vtable, its release,
+// its allocator, and the CALL to that allocator handed back in the
+// initializer's own place. `name`/`saved` are `tk_lambda_gensym`'s own
+// result and the enclosing declaration's name, opened by the CALLER (K4b:
+// a caller that reads its own parameter list, the short grafia below, opens
+// them BEFORE reading it too, exactly as `tk_lambda_build` always has,
+// since `p_decl_name` has to be the lambda's own for `parse_params` itself).
+// K4c: `saved` is restored only at the very END, after every `top_add` this
+// function makes -- `top_add` clears `p_decl_name()` as a side effect (mc
+// docs/reference/hooks.md § Asking about the parse), so restoring it BEFORE
+// the lambda's own `top_add(f)` (and the vtable/release/allocator ones right
+// behind it) left the ENCLOSING statement's own on_stmt hooks reading 0 for
+// the rest of that declaration's body -- `tk_taint_owner()`'s own bug.
+i64 tk_lambda_finish(i64 si, uptr name, uptr saved, i64 prs, i64 line, uptr fl) {
+    tk_lambda_check_params(si, prs, line, fl);
+    i64 saved_lc_base = tk_lc_base;               // higiene 2, item 6: a stack, not a reset
+    tk_lc_base = tk_nlc;
+    if (tk_word("use")) tk_lambda_use(line, fl);
+    p_expect(K_ARROW, "expected => after the lambda parameters");
+    i64 ret = dg_ret_at(si);
+    uptr envname = "__env";
+    i64 allparams = list_append(param_new(TY_UPTR, envname), prs);
+    tk_lam_body_depth = tk_lam_body_depth + 1;
+    i64 f;
+    if (p_id() == K_LBRACE) {
+        f = parse_function(ret, name, allparams);
+    } else {
+        i64 e = parse_expr(0);
+        i64 body;
+        if (ret == TY_VOID) body = tk_blk(tk_stmt(e));
+        else                body = tk_blk(tk_ret(e));
+        f = tk_func(ret, name, allparams, body);
+    }
+    tk_lam_body_depth = tk_lam_body_depth - 1;
+    set_nd_a(nd_b(f), list_append(tk_lambda_prologue(envname), nd_a(nd_b(f))));
+    tk_nscope = 0;
+    tk_ty_scope_params(allparams);
+    tk_lam_walk(nd_b(f));
+    tk_nscope = 0;
+    top_add(f);
+    i64 objsize = 24 + 8 * (tk_nlc - tk_lc_base);
+    uptr vtname = tk_join(name, "__vt");
+    uptr relname = tk_join(name, "__release");
+    uptr allocname = tk_join(name, "__new");
+    top_add(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
+    top_add(tk_lambda_release_fn(relname, objsize));
+    top_add(tk_lambda_alloc_fn(si, allocname, vtname, relname, name));
+    if (tk_lambda_has_byref()) tk_lamref_add(allocname);
+    i64 call = tk_call(allocname, tk_lambda_capture_chain(objsize));
+    tk_xt_add(call, si, 0);
+    tk_nlc = tk_lc_base;                          // higiene 2, item 6: pop THIS lambda's own window
+    tk_lc_base = saved_lc_base;
+    p_set_decl_name(saved);
+    return call;
+}
+
+// `(i64 a, i64 b) [use (...)] => body`, already past `new Op(` -- the whole
+// closure, its own parameter list read from the LIVE token stream (K4b's own
+// two grafias below feed `tk_lambda_finish` a parameter list read some other
+// way instead)
+i64 tk_lambda_build(i64 si, i64 line, uptr fl) {
+    uptr name = tk_lambda_gensym(sr_name_at(si));
+    uptr saved = p_decl_name();
+    p_set_decl_name(name);
+    i64 prs = parse_params();
+    return tk_lambda_finish(si, name, saved, prs, line, fl);
+}
+
+// 1 when the token right after the current one spells `=>` -- K4b's own
+// short lambda grafia (`x => body`), the same `p_cp()` scan `tk_dot_follows`
+// (teko_access.tk) already reads a `.` with, extended to a two-byte pair
+i64 tk_arrow_follows() {
+    uptr p = p_cp();
+    uptr e = p_src_end();
+    loop {
+        if (p >= e) return 0;
+        i64 c = ld8(p);
+        if (c != ' ' && c != 9 && c != 10 && c != 13) break;
+        p = p + 1;
+    }
+    if (p + 1 >= e) return 0;
+    return ld8(p) == '=' && ld8(p + 1) == '>';
+}
+
+// `x => body` -- the delegate's own declared parameter fills the ONE
+// implicit one (D221 decision 19: only when the target gives the type), so
+// `tk_lambda_check_params` still catches a delegate that does not take
+// exactly one, exactly as an explicit mismatch does
+i64 tk_deleg_short_lambda(i64 si, i64 line, uptr fl) {
+    uptr pname = p_ident();
+    uptr name = tk_lambda_gensym(sr_name_at(si));
+    uptr saved = p_decl_name();
+    p_set_decl_name(name);
+    i64 prs = param_new(dg_pty_at(si, 0), pname);
+    return tk_lambda_finish(si, name, saved, prs, line, fl);
+}
+
+// non-consuming: does the balanced `(...)` the CURRENT `(` opens end in
+// `use` or `=>`? A parameter list holds no string literal that could
+// unbalance a raw scan, so counting bytes from `p_cp()` is exact -- and,
+// unlike `p_skip_balanced`, it touches no token at all: `p_push_source`
+// right after a peek DISCARDS that peek's own pending lookahead (mc
+// `docs/reference/hooks.md` § Record and replay, "the push does not touch
+// the pending lookahead token"), which is exactly the `=>` this decision
+// needs to still be there once it is made.
+i64 tk_paren_lambda_follows() {
+    uptr p = p_cp();
+    uptr e = p_src_end();
+    i64 depth = 1;
+    loop {
+        if (p >= e) return 0;
+        i64 c = ld8(p);
+        p = p + 1;
+        if (c == '(') depth = depth + 1;
+        else if (c == ')') { depth = depth - 1; if (depth == 0) break; }
+    }
+    loop {
+        if (p >= e) return 0;
+        i64 c = ld8(p);
+        if (c != ' ' && c != 9 && c != 10 && c != 13) break;
+        p = p + 1;
+    }
+    if (p + 1 < e && ld8(p) == '=' && ld8(p + 1) == '>') return 1;
+    if (p + 3 <= e && ld8(p) == 'u' && ld8(p + 1) == 's' && ld8(p + 2) == 'e') {
+        i64 nx = ld8(p + 3);
+        return nx == ' ' || nx == '(' || nx == 9;
+    }
+    return 0;
+}
+
+// `(params) [use (...)] => body`, no `new` -- decided by the non-consuming
+// scan above, so BOTH branches read the LIVE stream directly: a lambda
+// calls `tk_lambda_build`, sitting on the same unconsumed `(` `new
+// Op((params) => ...)` already hands it; anything else is `parse_expr(0)`,
+// the ordinary grouped/cast expression the parens always could have been.
+i64 tk_deleg_paren_init(i64 si, i64 line, uptr fl) {
+    if (tk_paren_lambda_follows()) return tk_lambda_build(si, line, fl);
+    return parse_expr(0);
+}
+
+// the initializer of a delegate-typed declaration (K4b): the two lambda
+// grafias above, or `parse_expr(0)` unchanged -- a bare function name,
+// `new Op(...)`, `null`, or another delegate expression, everything
+// `tk_deleg_coerce`'s later pass already knows how to read
+i64 tk_deleg_init_expr(i64 si, i64 line, uptr fl) {
+    if (p_id() == K_LPAR) return tk_deleg_paren_init(si, line, fl);
+    if (p_id() == T_IDENT && tk_arrow_follows()) return tk_deleg_short_lambda(si, line, fl);
+    return parse_expr(0);
+}
+
+// `Op f = <init>;` -- K4b: the module reads the declaration itself once the
+// type word is known to name a delegate, instead of handing it to the
+// core's own `parse_var`, so the two grafias above get a look at the
+// initializer before the core's `(` -- a cast/group disambiguation with no
+// fallback -- would refuse `(i64 x) => ...` outright (§46's own finding).
+// An array of delegate elements is refused exactly as `tk_var_after_type`
+// (teko_ns.tk) refuses one of a namespaced type: `teko_array.tk` already
+// refuses ANY row of the type table as an array element, delegates
+// included, so this is unreachable rather than a new restriction. Anything
+// else is `parse_expr(0)`, so the `N_VAR` this builds is byte-identical to
+// what `parse_var` always produced.
+i64 tk_deleg_var_stmt(i64 si, i64 line, uptr fl) {
+    p_next();                                     // the type word
+    uptr vn = p_ident();
+    if (p_id() == K_LBRACK)
+        err_at2(fl, line, "teko: an array of this type is not taught yet", vn);
+    i64 init = 0;
+    if (p_accept(K_ASSIGN)) init = tk_deleg_init_expr(si, line, fl);
+    p_expect(K_SEMI, "expected ; after declaration");
+    tk_line = line;
+    tk_file = fl;
+    return tk_var(sr_ty_at(si), vn, init);
+}
+
+// 1 when the program declares at least one delegate: a program that declares
+// none is untouched, byte for byte
+i64 tk_any_deleg() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nstruct) break;
+        if (tk_is_deleg(i)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// D226 compat crumb: 1 when `name` names an `N_GLOBAL` of the unit -- the
+// same kind of root scan `teko_array.tk`'s own `tk_array_pass` runs for a
+// heap array's row, here over every global regardless of its type
+i64 tk_global_find(i64 root, uptr name) {
+    i64 f = root;
+    loop {
+        if (f == 0) break;
+        if (nd_kind(f) == N_GLOBAL && str_eq(nd_name(f), name)) return 1;
+        f = nd_next(f);
+    }
+    return 0;
+}
+
+// the names `tk_lam_check_name` could not place while a lambda's own body was
+// still being read: with the whole unit here, a global answers for itself,
+// and a name that still answers for nothing is genuinely `is not captured`
+void tk_lam_resolve_globals(i64 root) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nlg) break;
+        i64 n = ld64(lg_node + i * 8);
+        if (!tk_global_find(root, nd_name(n)))
+            err_at(nd_file(n), nd_line(n),
+                   tk_join3("teko: ", nd_name(n), " is not captured; add it to use (...)"));
+        i = i + 1;
+    }
+    tk_nlg = 0;
+}
+
+i64 tk_deleg_pass(i64 root) {
+    if (!tk_any_deleg()) return root;
+    tk_deleg_root = root;
+    i64 f = root;
+    loop {
+        if (f == 0) break;
+        if (nd_kind(f) == N_FUNC) {
+            tk_nscope = 0;
+            tk_cur_fn_name = nd_name(f);          // K4c: this function's own taint bucket
+            tk_deleg_cur_ns = tk_ns_of_name(nd_name(f));
+            tk_deleg_cur_ret = nd_type(f);
+            tk_ty_scope_params(nd_a(f));
+            tk_deleg_walk(nd_b(f));
+            tk_nscope = 0;
+        }
+        f = nd_next(f);
+    }
+    tk_deleg_cur_ns = 0;
+    tk_deleg_cur_ret = 0 - 1;
+    tk_cur_fn_name = 0;
+    tk_lam_resolve_globals(root);
+    return root;
+}

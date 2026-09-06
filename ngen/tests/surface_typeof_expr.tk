@@ -1,0 +1,72 @@
+// surface_typeof_expr.tk -- the oracle over a COMPOSITE expression and over a
+// scalar member (entrega 4, crumb C3b). Which overload of `pick` a site calls
+// is decided by the type of its argument, and until now an argument that was
+// not a bare name, a call, a literal or a cast had no type at all: `pick(n - 1)`
+// was refused with `the type of argument 1 of pick is not known here`.
+//
+// The rule is not this module's invention, it is the CORE's, the one codegen
+// applies to the very same node (mc/src/gen_resolve.mc, res_binary and
+// res_expr's N_UNARY arm): a comparison and a logical operator are `i64`, `!`
+// is `i64`, and every other binary or unary keeps its operand's type -- the
+// LEFT one, which is why `v + zero` is still a `Vec` and picks `pick__Vec`
+// while `n - 1` is an `i64` and picks `pick__i64`.
+//
+// `this.side` and `b.side` are the other half: an `i64` field is no type of the
+// type table, and answering "no type" for it left the two commonest member
+// expressions untypable. Both routes to a member are here -- `this`, typed
+// while the body is parsed, and the parameter `b`, deferred to the pass -- and
+// both feed the same overload.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+struct Vec {
+    public i64 x;
+    public i64 y;
+}
+
+i64 pick(i64 n) {
+    return n + 1;
+}
+
+i64 pick(Vec v) {
+    return v.x + v.y;
+}
+
+class Box {
+    public i64 side;
+
+    public i64 tally() {
+        return pick(this.side);                  // a scalar member, typed at the parse
+    }
+}
+
+i64 audit(Box b) {
+    return pick(b.side);                         // the same member, typed in the pass
+}
+
+i64 main() {
+    Vec v = new Vec;
+    v.x = 13;
+    v.y = 12;
+
+    Box b = new Box;
+    b.side = 7;
+
+    i64 n = 5;
+    i64 zero = 0;
+    i64 x = 3;
+    i64 y = 3;
+    i64 k = 0;
+
+    if (pick(n - 1) != 5) return 1;              // the left operand: i64
+    if (pick(v + zero) != 25) return 2;          // the left operand: Vec
+    if (pick(x == y) != 2) return 3;             // a comparison: i64
+    if (pick(x < y) != 1) return 4;              // ...false is a type all the same
+    if (pick(!k) != 2) return 5;                 // `!`: i64
+    if (b.tally() != 8) return 6;                // pick(this.side)
+    if (audit(b) != 8) return 7;                 // pick(b.side), deferred
+
+    return pick(n - 1) + pick(v + zero) + pick(x == y) + pick(!k) + b.tally();
+}

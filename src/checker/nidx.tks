@@ -1,0 +1,100 @@
+type NameSlot = struct {
+    hash: u64
+    pos: u64
+}
+
+type NameIndex = struct {
+    slots: []NameSlot
+}
+
+fn nidx_empty(): NameIndex {
+    NameIndex { slots = [] }
+}
+
+fn nidx_merge_run(src: []NameSlot, dst: ref []NameSlot, lo: u64, mid: u64, hi: u64) {
+    var i = lo
+    var j = mid
+    var k = lo
+    loop {
+        if i >= mid { break }
+        if j >= hi { break }
+        if src[i].hash <= src[j].hash {
+            dst[k] = src[i]
+            k++
+            i++
+            continue
+        }
+        dst[k] = src[j]
+        k++
+        j++
+    }
+    loop { if i >= mid { break }; dst[k] = src[i]; k++; i++ }
+    loop { if j >= hi { break }; dst[k] = src[j]; k++; j++ }
+}
+
+fn nidx_merge_pass(src: []NameSlot, dst: ref []NameSlot, width: u64, n: u64) {
+    var lo: u64 = 0
+    loop {
+        if lo >= n { break }
+        var mid = lo + width
+        if mid > n { mid = n }
+        var hi = lo + width + width
+        if hi > n { hi = n }
+        nidx_merge_run(src, dst, lo, mid, hi)
+        lo = lo + width + width
+    }
+}
+
+fn nidx_copy_slots(slots: []NameSlot): []NameSlot {
+    var n = slots.len
+    var out: [n]NameSlot = []
+    var i: u64 = 0
+    loop { if i >= n { break }; out[i] = slots[i]; i++ }
+    out
+}
+
+fn nidx_sorted(slots: []NameSlot): []NameSlot {
+    var n = slots.len
+    if n <= 1 { return nidx_copy_slots(slots) }
+    var a: [n]NameSlot = []
+    var b: [n]NameSlot = []
+    var f: u64 = 0
+    loop { if f >= n { break }; a[f] = slots[f]; f++ }
+    var from_a = true
+    var width: u64 = 1
+    loop {
+        if width >= n { break }
+        if from_a {
+            nidx_merge_pass(a, b, width, n)
+        } else {
+            nidx_merge_pass(b, a, width, n)
+        }
+        from_a = !from_a
+        width = width + width
+    }
+    if from_a { return a }
+    b
+}
+
+fn nidx_build(names: []str): NameIndex {
+    var n = names.len
+    var slots: [n]NameSlot = []
+    var i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        slots[i] = NameSlot { hash = teko::runtime::str_hash(names[i]); pos = i }
+        i++
+    }
+    NameIndex { slots = nidx_sorted(slots) }
+}
+
+fn nidx_lower_bound(idx: NameIndex, h: u64): u64 {
+    var lo: u64 = 0
+    var hi: u64 = idx.slots.len
+    loop {
+        if lo >= hi { break }
+        var mid = lo + (hi - lo) / 2
+        if idx.slots[mid].hash < h { lo = mid + 1 } else { hi = mid }
+    }
+    lo
+}

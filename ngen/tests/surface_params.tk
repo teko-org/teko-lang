@@ -1,0 +1,92 @@
+// surface_params.tk -- `params`, the C# multi-parameter (entrega 4, crumbs C7
+// and C7c). The declaration takes ONE list and the call site takes as many
+// arguments as it likes; `xs_len` is the count the compiler names after the
+// list, and `xs[i]` is its i-th element. The spelling is the mc core's own --
+// type first, no `fn` -- and `params i64[] xs` is deliberately not it: the core
+// has no `[` in parameter position (docs/design/plano-ngen-entrega4.md §3).
+//
+// The declaration is a GENERIC IN THE COUNT: a site with k arguments
+// instantiates the body with `N = k`, so `total(1, 2)` and `total(1, 2, 3, 4,
+// 5)` are two functions, `total__2` and `total__5`, each with its own constant.
+// `first_and` is what that buys -- a LITERAL index is checked against the
+// instance's own N at compile time, in both of the instances it is called at,
+// and costs no run-time guard. Only a computed index keeps one.
+//
+// `offset_total` is the mixed shape: a fixed parameter keeps its place and only
+// the tail is packed. Zero, one and five arguments cover the empty list (the
+// pointer is never read), the single one, and a list longer than any fixed
+// arity would allow.
+//
+// The list is allocated per call site (`tk_va_new`/`tk_va_put`, ngen/lib/rt.tk),
+// so there is nothing to share and nothing to reenter: a variadic call NESTED
+// in another one, in a fixed position or inside the packed tail, and a variadic
+// function whose body calls one, all compile and each keeps its own list.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 total(params xs) {
+    i64 s = 0;
+    i64 i = 0;
+    loop {
+        if (i >= xs_len) break;
+        s = s + xs[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+i64 offset_total(i64 base, params rest) {
+    i64 s = base;
+    i64 i = 0;
+    loop {
+        if (i >= rest_len) break;
+        s = s + rest[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+// a variadic whose own body calls a variadic, once per element: the two lists
+// are alive at the same time and neither disturbs the other
+i64 doubled_total(params xs) {
+    i64 s = 0;
+    i64 i = 0;
+    loop {
+        if (i >= xs_len) break;
+        s = s + total(xs[i], xs[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+// two LITERAL indexes, read in two instances of different N: `xs[1]` is the
+// last element of the two-argument one and an interior element of the
+// five-argument one, and in neither of them does the program pay for a check --
+// the constant the instance was made with answered at compile time
+i64 first_and(params xs) {
+    return xs[0] + xs[1];
+}
+
+i64 main() {
+    if (total() != 0) return 1;
+    if (total(7) != 7) return 2;
+    if (total(1, 2, 3, 4, 5) != 15) return 3;
+    if (total(0 - 4, 4) != 0) return 4;
+
+    if (offset_total(10) != 10) return 5;
+    if (offset_total(10, 1, 2, 3) != 16) return 6;
+
+    if (total(total(1, 2), 3) != 6) return 7;
+    if (total(total(1, 2), total(3, 4), 5) != 15) return 8;
+    if (offset_total(total(1, 2), total(3, 4)) != 10) return 9;
+
+    if (doubled_total(1, 2, 3) != 12) return 10;
+    if (doubled_total(total(2, 3)) != 10) return 11;
+
+    if (first_and(1, 2) != 3) return 12;
+    if (first_and(10, 20, 30, 40, 50) != 30) return 13;
+
+    return total(20, 20, 2);
+}

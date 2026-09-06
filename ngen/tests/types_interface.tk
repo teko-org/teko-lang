@@ -1,0 +1,115 @@
+// types_interface.tk -- `interface` (entrega 3, D214): a declaration that
+// produces no code, a class conforming to TWO of them in the list after `:`,
+// and dispatch through the object's own interface table -- so the same object
+// answers `Shape` and `Named`, a derived class's `override` reaches the
+// interface as well, and an interface-typed parameter (whose type the core
+// never reports to the module) still runs the right implementation.
+//
+// A signature declares no receiver either (D219): `i64 area();` is the whole
+// of it, and the conforming method is written the same way.
+//
+// `ficheck` (V1): an interface member that returns `f64`, by a receiver of
+// interface type and by an interface-typed parameter. The itab call is a
+// `callp` like the other two indirect forms, so it carries the cast that
+// declares its return type -- without it `1.0 + s.span()` reads the integer
+// result register the float never reached.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+interface Shape {
+    i64 area();
+    i64 scaled(i64 k);
+}
+
+interface Named {
+    i64 tag();
+}
+
+class Rect : Shape, Named {
+    public i64 w;
+    public i64 h;
+
+    public virtual i64 area() {
+        return w * h;
+    }
+
+    public i64 scaled(i64 k) {
+        return area() * k;
+    }
+
+    public i64 tag() {
+        return 3;
+    }
+}
+
+class Cube : Rect {
+    public override i64 area() {
+        return base.area() * 2;
+    }
+}
+
+i64 area_of(Shape s) {
+    return s.area();
+}
+
+interface FSpan {
+    f64 span();
+}
+
+class FRect : FSpan {
+    public f64 w;
+
+    public f64 span() {
+        return w * 2.0;
+    }
+}
+
+f64 span_of(FSpan s) {
+    return 1.0 + s.span();
+}
+
+i64 ficheck() {
+    FRect r = new FRect;
+    r.w = 3.0;
+
+    FSpan s = r;
+    if (s.span() != 6.0) return 1;
+    if (1.0 + s.span() != 7.0) return 2;          // the nested form, at a moved depth
+    if (span_of(s) != 7.0) return 3;              // an interface-typed parameter
+    return 0;
+}
+
+i64 main() {
+    if (RECT_W != 16) return 1;                  // words 0 and 1 are the vtable and the count
+    if (RECT_SIZE != 32) return 2;
+    if (CUBE_SIZE != 32) return 3;               // Cube adds no field of its own
+
+    Rect r = new Rect;
+    r.w = 3;
+    r.h = 4;
+
+    Shape s = r;
+    if (s.area() != 12) return 4;                // through the itab
+    if (s.scaled(2) != 24) return 5;             // an interface method with an argument
+
+    Named n = r;
+    if (n.tag() != 3) return 6;                  // the second interface of the same class
+
+    Cube c = new Cube;
+    c.w = 2;
+    c.h = 5;
+
+    Shape t = c;
+    if (t.area() != 20) return 7;                // the override, in Cube's own table
+    if (t.scaled(3) != 60) return 8;             // an inherited method calling it
+
+    if (area_of(s) != 12) return 9;              // an interface-typed parameter
+    if (area_of(t) != 20) return 10;
+
+    i64 fbad = ficheck();
+    if (fbad != 0) return 20 + fbad;
+
+    return s.area() + t.area() + n.tag() + 7;    // 12 + 20 + 3 + 7
+}

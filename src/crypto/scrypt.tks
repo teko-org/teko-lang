@@ -1,0 +1,256 @@
+type SalsaQuad = struct {
+    a: u32
+    b: u32
+    c: u32
+    d: u32
+}
+
+fn scrypt_rotl32(x: u32, count: u32): u32 {
+    (x << count) | (x >> (32 - count))
+}
+
+fn scrypt_le_u32_at(b: []byte, off: u64): u32 {
+    (b[off] to u32) | ((b[off + 1] to u32) << 8) | ((b[off + 2] to u32) << 16) | ((b[off + 3] to u32) << 24)
+}
+
+fn scrypt_le32_bytes(x: u32): []byte {
+    [
+        (x & 0xFF) to byte,
+        ((x >> 8) & 0xFF) to byte,
+        ((x >> 16) & 0xFF) to byte,
+        ((x >> 24) & 0xFF) to byte,
+    ]
+}
+
+fn scrypt_bytes_append(dst: []byte, src: []byte): []byte {
+    [..dst, ..src]
+}
+
+fn scrypt_bytes_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+fn scrypt_bytes_xor(a: []byte, b: []byte): []byte {
+    var out: [a.len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        out[i] = ((a[i] to u32) ^ (b[i] to u32)) to byte
+        i++
+    }
+    out
+}
+
+fn scrypt_is_pow2_gt1(n: u64): bool {
+    n > 1 && (n & (n - 1)) == 0
+}
+
+fn scrypt_quarterround(a: u32, b: u32, c: u32, d: u32): SalsaQuad {
+    var nb = b ^ scrypt_rotl32(teko::math::wrapping_add_u32(a, d), 7)
+    var nc = c ^ scrypt_rotl32(teko::math::wrapping_add_u32(nb, a), 9)
+    var nd = d ^ scrypt_rotl32(teko::math::wrapping_add_u32(nc, nb), 13)
+    var na = a ^ scrypt_rotl32(teko::math::wrapping_add_u32(nd, nc), 18)
+    SalsaQuad { a = na; b = nb; c = nc; d = nd }
+}
+
+fn scrypt_salsa_core(input: []byte): []byte {
+    var in0 = scrypt_le_u32_at(input, 0)
+    var in1 = scrypt_le_u32_at(input, 4)
+    var in2 = scrypt_le_u32_at(input, 8)
+    var in3 = scrypt_le_u32_at(input, 12)
+    var in4 = scrypt_le_u32_at(input, 16)
+    var in5 = scrypt_le_u32_at(input, 20)
+    var in6 = scrypt_le_u32_at(input, 24)
+    var in7 = scrypt_le_u32_at(input, 28)
+    var in8 = scrypt_le_u32_at(input, 32)
+    var in9 = scrypt_le_u32_at(input, 36)
+    var in10 = scrypt_le_u32_at(input, 40)
+    var in11 = scrypt_le_u32_at(input, 44)
+    var in12 = scrypt_le_u32_at(input, 48)
+    var in13 = scrypt_le_u32_at(input, 52)
+    var in14 = scrypt_le_u32_at(input, 56)
+    var in15 = scrypt_le_u32_at(input, 60)
+    var x0 = in0
+    var x1 = in1
+    var x2 = in2
+    var x3 = in3
+    var x4 = in4
+    var x5 = in5
+    var x6 = in6
+    var x7 = in7
+    var x8 = in8
+    var x9 = in9
+    var x10 = in10
+    var x11 = in11
+    var x12 = in12
+    var x13 = in13
+    var x14 = in14
+    var x15 = in15
+    var round: u64 = 0
+    loop {
+        if round >= 4 { break }
+        var c0 = scrypt_quarterround(x0, x4, x8, x12)
+        x0 = c0.a
+        x4 = c0.b
+        x8 = c0.c
+        x12 = c0.d
+        var c1 = scrypt_quarterround(x5, x9, x13, x1)
+        x5 = c1.a
+        x9 = c1.b
+        x13 = c1.c
+        x1 = c1.d
+        var c2 = scrypt_quarterround(x10, x14, x2, x6)
+        x10 = c2.a
+        x14 = c2.b
+        x2 = c2.c
+        x6 = c2.d
+        var c3 = scrypt_quarterround(x15, x3, x7, x11)
+        x15 = c3.a
+        x3 = c3.b
+        x7 = c3.c
+        x11 = c3.d
+        var r0 = scrypt_quarterround(x0, x1, x2, x3)
+        x0 = r0.a
+        x1 = r0.b
+        x2 = r0.c
+        x3 = r0.d
+        var r1 = scrypt_quarterround(x5, x6, x7, x4)
+        x5 = r1.a
+        x6 = r1.b
+        x7 = r1.c
+        x4 = r1.d
+        var r2 = scrypt_quarterround(x10, x11, x8, x9)
+        x10 = r2.a
+        x11 = r2.b
+        x8 = r2.c
+        x9 = r2.d
+        var r3 = scrypt_quarterround(x15, x12, x13, x14)
+        x15 = r3.a
+        x12 = r3.b
+        x13 = r3.c
+        x14 = r3.d
+        round++
+    }
+    var words: []u32 = [
+        teko::math::wrapping_add_u32(x0, in0),
+        teko::math::wrapping_add_u32(x1, in1),
+        teko::math::wrapping_add_u32(x2, in2),
+        teko::math::wrapping_add_u32(x3, in3),
+        teko::math::wrapping_add_u32(x4, in4),
+        teko::math::wrapping_add_u32(x5, in5),
+        teko::math::wrapping_add_u32(x6, in6),
+        teko::math::wrapping_add_u32(x7, in7),
+        teko::math::wrapping_add_u32(x8, in8),
+        teko::math::wrapping_add_u32(x9, in9),
+        teko::math::wrapping_add_u32(x10, in10),
+        teko::math::wrapping_add_u32(x11, in11),
+        teko::math::wrapping_add_u32(x12, in12),
+        teko::math::wrapping_add_u32(x13, in13),
+        teko::math::wrapping_add_u32(x14, in14),
+        teko::math::wrapping_add_u32(x15, in15),
+    ]
+    var out: [64]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        var lw = scrypt_le32_bytes(words[i])
+        out[i * 4] = lw[0]
+        out[i * 4 + 1] = lw[1]
+        out[i * 4 + 2] = lw[2]
+        out[i * 4 + 3] = lw[3]
+        i++
+    }
+    out
+}
+
+fn scrypt_blockmix(input: []byte, r: u64): []byte {
+    var blocks = 2 * r
+    var x = scrypt_bytes_slice(input, (blocks - 1) * 64, blocks * 64)
+    var y: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= blocks { break }
+        var bi = scrypt_bytes_slice(input, i * 64, i * 64 + 64)
+        x = scrypt_salsa_core(scrypt_bytes_xor(x, bi))
+        y = scrypt_bytes_append(y, x)
+        i++
+    }
+    var out: []byte = []
+    var e: u64 = 0
+    loop {
+        if e >= blocks { break }
+        out = scrypt_bytes_append(out, scrypt_bytes_slice(y, e * 64, e * 64 + 64))
+        e = e + 2
+    }
+    var o: u64 = 1
+    loop {
+        if o >= blocks { break }
+        out = scrypt_bytes_append(out, scrypt_bytes_slice(y, o * 64, o * 64 + 64))
+        o = o + 2
+    }
+    out
+}
+
+fn scrypt_integerify(block: []byte, r: u64): u64 {
+    var off = (2 * r - 1) * 64
+    var lo = scrypt_le_u32_at(block, off) to u64
+    var hi = scrypt_le_u32_at(block, off + 4) to u64
+    lo | (hi << 32)
+}
+
+fn scrypt_romix(input: []byte, r: u64, n: u64): []byte {
+    var block_bytes = 128 * r
+    var x = input
+    var v: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        v = scrypt_bytes_append(v, x)
+        x = scrypt_blockmix(x, r)
+        i++
+    }
+    var j: u64 = 0
+    loop {
+        if j >= n { break }
+        var idx = scrypt_integerify(x, r) % n
+        var vj = scrypt_bytes_slice(v, idx * block_bytes, idx * block_bytes + block_bytes)
+        x = scrypt_blockmix(scrypt_bytes_xor(x, vj), r)
+        j++
+    }
+    x
+}
+
+/**
+ * scrypt (RFC 7914 §6): the password-based key-derivation function built from
+ * `PBKDF2-HMAC-SHA-256` (reusing `pbkdf2_sha256`, `kdf.tks`) bracketing `p` independent
+ * `scryptROMix` memory-hard passes. Deliberately slow and memory-hungry — the caller tunes
+ * `n`/`r`/`p` for the target hardware.
+ */
+exp fn scrypt(password: []byte, salt: []byte, n: u64, r: u64, p: u64, dk_len: u64): []byte | CryptoError {
+    if !scrypt_is_pow2_gt1(n) { return crypto_error("scrypt: n must be a power of two greater than 1") }
+    if r == 0 { return crypto_error("scrypt: r must be at least 1") }
+    if p == 0 { return crypto_error("scrypt: p must be at least 1") }
+    if dk_len == 0 { return crypto_error("scrypt: dk_len must be at least 1") }
+    var block_bytes = 128 * r
+    var seed = match pbkdf2_sha256(password, salt, 1, p * block_bytes) {
+        []byte as s => s
+        CryptoError as e => return e
+    }
+    var mixed: []byte = []
+    var i: u64 = 0
+    loop {
+        if i >= p { break }
+        var bi = scrypt_bytes_slice(seed, i * block_bytes, i * block_bytes + block_bytes)
+        mixed = scrypt_bytes_append(mixed, scrypt_romix(bi, r, n))
+        i++
+    }
+    pbkdf2_sha256(password, mixed, 1, dk_len)
+}

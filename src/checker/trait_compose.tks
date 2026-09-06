@@ -1,0 +1,200 @@
+use teko::parser
+
+pub fn flatten_trait_composition(trait_name: str, tb: parser::TraitBody, table: TypeTable, seen: []str): FoldedMembers | error {
+    var si: u64 = 0
+    loop {
+        if si >= seen.len { break }
+        if seen[si] == trait_name { return error { message = $"cyclic trait composition: '{trait_name}' composes itself (directly or transitively)" } }
+        si++
+    }
+    var seen2 = [..seen, trait_name]
+    var ref_ns = type_ns_of(table, trait_name)
+    var split = split_trait_derives(tb.implements, table, ref_ns)
+    var fields = tb.fields
+    var methods = tb.methods
+    var consts = tb.consts
+    var i: u64 = 0
+    loop {
+        if i >= split.traits.len { break }
+        var cname = split.traits[i]
+        if trait_name_seen_before(split.traits, i, cname) { i++; continue }
+        var ctb = match find_trait_body(cname, table) { parser::TraitBody as t => t; error as e => return e }
+        var eff = match flatten_trait_composition(cname, ctb, table, seen2) { FoldedMembers as f => f; error as e => return e }
+        fields = match fold_trait_fields(trait_name, cname, fields, eff.fields, false) { []parser::Field as f => f; error as e => return e }
+        consts = match fold_trait_consts(trait_name, cname, consts, eff.consts) { []parser::ConstDecl as c => c; error as e => return e }
+        methods = match fold_trait_methods(trait_name, cname, tb.methods, methods, eff.methods, table) { []parser::Function as m => m; error as e => return e }
+        i++
+    }
+    FoldedMembers { fields = fields; methods = methods; consts = consts }
+}
+
+fn self_contained_surface_names(surface: FoldedMembers): []str {
+    var names: []str = []
+    var fi: u64 = 0
+    loop { if fi >= surface.fields.len { break }; names = [..names, surface.fields[fi].name]; fi++ }
+    var mi: u64 = 0
+    loop {
+        if mi >= surface.methods.len { break }
+        names = [..names, surface.methods[mi].name]
+        if surface.methods[mi].accessor_prop != "" { names = [..names, surface.methods[mi].accessor_prop] }
+        mi++
+    }
+    var ci: u64 = 0
+    loop { if ci >= surface.consts.len { break }; names = [..names, surface.consts[ci].name]; ci++ }
+    names
+}
+
+fn name_in_list(names: []str, name: str): bool {
+    var i: u64 = 0
+    loop { if i >= names.len { break }; if names[i] == name { return true }; i++ }
+    false
+}
+
+fn expr_is_self(e: parser::Expr): bool {
+    match e.kind { parser::Var as v => v.name == "self"; _ => false }
+}
+
+fn self_ref_stmts(stmts: []@Statement(), acc: []str): []str {
+    var out = acc
+    var i: u64 = 0
+    loop { if i >= stmts.len { break }; out = self_ref_stmt(stmts[i], out); i++ }
+    out
+}
+
+fn self_ref_stmt(s: @Statement(), acc: []str): []str {
+    match s {
+        parser::Binding as b => self_ref_expr(b.value, acc)
+        parser::Assign as a => self_ref_expr(a.value, if parser::assign_has_target(a.kind) { self_ref_expr(a.target, acc) } else { acc })
+        parser::Return as r => self_ref_exprs(r.values, self_ref_expr(r.value, acc))
+        parser::LoopStmt as l => self_ref_stmts(l.body, self_ref_stmts(l.init, acc))
+        parser::BreakStmt => acc
+        parser::ContinueStmt => acc
+        parser::ExprStmt as es => self_ref_expr(es.expr, acc)
+        parser::DeferStmt as d => self_ref_stmts(d.body, acc)
+        parser::AdoptStmt as ad => self_ref_stmts(ad.body, acc)
+        parser::BlockStmt as bk => self_ref_stmts(bk.body, acc)
+        parser::MultiBind as mb => self_ref_exprs(mb.values, acc)
+        parser::LoweringFrag => acc
+        parser::Spawn as sp => self_ref_expr(sp.call, acc)
+    }
+}
+
+fn self_ref_exprs(es: []parser::Expr, acc: []str): []str {
+    var out = acc
+    var i: u64 = 0
+    loop { if i >= es.len { break }; out = self_ref_expr(es[i], out); i++ }
+    out
+}
+
+fn self_ref_expr(e: parser::Expr, acc: []str): []str {
+    match e.kind {
+        parser::FieldAccess as fa => {
+            var a2 = self_ref_expr(fa.receiver, acc)
+            if expr_is_self(fa.receiver) { [..a2, fa.field] } else { a2 }
+        }
+        parser::MethodCall as mc => {
+            var a2 = self_ref_exprs(mc.args, self_ref_expr(mc.receiver, acc))
+            if expr_is_self(mc.receiver) { [..a2, mc.method] } else { a2 }
+        }
+        parser::Call as c => self_ref_exprs(c.args, acc)
+        parser::Binary as b => self_ref_expr(b.right, self_ref_expr(b.left, acc))
+        parser::Unary as u => self_ref_expr(u.operand, acc)
+        parser::Compare as cm => self_ref_cmpterms(cm.rest, self_ref_expr(cm.first, acc))
+        parser::Cast as ca => self_ref_expr(ca.expr, acc)
+        parser::Index as ix => self_ref_expr(ix.index, self_ref_expr(ix.receiver, acc))
+        parser::IfExpr as ife => self_ref_stmts(ife.else_blk, self_ref_stmts(ife.then_blk, self_ref_expr(ife.cond, acc)))
+        parser::MatchExpr as me => self_ref_arms(me.arms, self_ref_expr(me.subject, acc))
+        parser::StructLit as sl => self_ref_exprs(sl.field_vals, acc)
+        parser::Interp as ip => self_ref_exprs(ip.holes, acc)
+        parser::InExpr as ie => self_ref_exprs(ie.elems, self_ref_expr(ie.lhs, acc))
+        parser::ArrayLit as al => self_ref_arrayelems(al.elements, acc)
+        parser::Lambda as la => self_ref_stmts(la.body, acc)
+        parser::Borrow as bo => self_ref_expr(bo.operand, acc)
+        parser::Block as bk => self_ref_stmts(bk.body, acc)
+        parser::MacroCall as mc => self_ref_exprs(mc.args, acc)
+        parser::Number => acc
+        parser::Var => acc
+        parser::StrLit => acc
+        parser::ByteStrLit => acc
+        parser::ByteLit => acc
+        parser::CharLit => acc
+        parser::BoolLit => acc
+        parser::NullLit => acc
+        parser::PathExpr => acc
+    }
+}
+
+fn self_ref_cmpterms(ts: []parser::CmpTerm, acc: []str): []str {
+    var out = acc
+    var i: u64 = 0
+    loop { if i >= ts.len { break }; out = self_ref_expr(ts[i].operand, out); i++ }
+    out
+}
+
+fn self_ref_arrayelems(els: []parser::ArrayElem, acc: []str): []str {
+    var out = acc
+    var i: u64 = 0
+    loop { if i >= els.len { break }; out = self_ref_expr(els[i].expr, out); i++ }
+    out
+}
+
+fn self_ref_arms(arms: []parser::Arm, acc: []str): []str {
+    var out = acc
+    var i: u64 = 0
+    loop {
+        if i >= arms.len { break }
+        var a = arms[i]
+        if a.has_when { out = self_ref_expr(a.guard, out) }
+        out = self_ref_stmts(a.body, out)
+        i++
+    }
+    out
+}
+
+fn check_trait_self_contained(trait_name: str, trait_body: parser::TraitBody, surface: FoldedMembers): null | error {
+    var allowed = self_contained_surface_names(surface)
+    var refs: []str = []
+    var mi: u64 = 0
+    loop { if mi >= trait_body.methods.len { break }; refs = self_ref_stmts(trait_body.methods[mi].body, refs); mi++ }
+    var ri: u64 = 0
+    loop {
+        if ri >= refs.len { break }
+        if !name_in_list(allowed, refs[ri]) {
+            return error { message = $"trait '{trait_name}' references `self.{refs[ri]}` but declares no member '{refs[ri]}' — a trait is self-contained: every `self.X` must be declared by the trait or a trait it composes" }
+        }
+        ri++
+    }
+    null
+}
+
+fn check_trait_carries_interface(trait_name: str, type_ns: str, flattened: FoldedMembers, iface_name: str, table: TypeTable): error | null {
+    check_one_interface(trait_name, type_ns, flattened.methods, iface_name, table, true)
+}
+
+fn trait_carried_interface_diags(reg: TypeReg, trb: parser::TraitBody, surface: FoldedMembers, table: TypeTable): []str {
+    var type_ns = type_ns_of(table, reg.decl.name)
+    var split = split_trait_derives(trb.implements, table, type_ns)
+    var diags: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= split.ifaces.len { break }
+        match check_trait_carries_interface(reg.decl.name, type_ns, surface, split.ifaces[i], table) {
+            error as e => { diags = [..diags, decl_diag(reg, e.message)] }
+            null => { }
+        }
+        i++
+    }
+    diags
+}
+
+fn trait_composition_diags(reg: TypeReg, trb: parser::TraitBody, table: TypeTable): []str {
+    var surface = match flatten_trait_composition(reg.decl.name, trb, table, []) {
+        FoldedMembers as f => f
+        error as e => return one_diag(decl_diag(reg, e.message))
+    }
+    var self_diags = match check_trait_self_contained(reg.decl.name, trb, surface) {
+        error as e => one_diag(decl_diag(reg, e.message))
+        null => []
+    }
+    concat_diags(self_diags, trait_carried_interface_diags(reg, trb, surface, table))
+}

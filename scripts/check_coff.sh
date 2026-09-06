@@ -17,17 +17,36 @@
 # so this script runs on macOS-arm64 and linux-x86_64 too — the machine-free proof the
 # emitted bytes are well-formed even where the PE cannot EXECUTE (the executing
 # C-vs-own differential is the windows-x86_64 runner, diff_c_own.sh). It honest-skips
-# (exit 0) when no object is provided, the object is absent, or `llvm-readobj` is not
-# installed — the byte goldens in `teko test .` are the fallback proof there.
+# FAIL-CLOSED SINCE 2026-07-29, in step with check_elf.sh / check_macho.sh. An absent
+# object or an absent `llvm-readobj` used to return 0, which the CI reads as PASS — a gate
+# that passes with nothing to check is exactly the "erro escondido que não dispara" the
+# trunk bar forbids, and pointing at the byte goldens as "fallback proof" does not change
+# the fact that THIS row reported green having validated nothing. Scheduling belongs to the
+# caller. `OBJ_CHECK_ALLOW_SKIP=1` restores lenience for a local sandbox; CI never sets it.
 #
 # usage: scripts/check_coff.sh <object.o>
+#   OBJ_CHECK_ALLOW_SKIP=1   (default: unset) — downgrade a hard failure to an honest skip.
 
 set -u
 
+allow_skip="${OBJ_CHECK_ALLOW_SKIP:-0}"
+
+fail() { echo "check_coff: FAIL — $1" >&2; exit 1; }
+
+skip_or_fail() {
+    if [[ "$allow_skip" == "1" ]]; then
+        echo "check_coff: skipped (OBJ_CHECK_ALLOW_SKIP=1) — $1"
+        exit 0
+    fi
+    fail "$1 — a gate that passes with nothing to check is a hidden error; set OBJ_CHECK_ALLOW_SKIP=1 only in a local sandbox"
+}
+
 OBJ="${1:-}"
-if [[ -z "$OBJ" || ! -f "$OBJ" ]]; then
-    echo "check_coff: skipped — no object provided (the diff_c_own.sh windows lane writes the .o; goldens pin bytes)"
-    exit 0
+if [[ -z "$OBJ" ]]; then
+    skip_or_fail "no object argument given (arg1 empty)"
+fi
+if [[ ! -f "$OBJ" ]]; then
+    skip_or_fail "the object '$OBJ' does not exist — its producer did not write it"
 fi
 
 READOBJ="${LLVM_READOBJ:-llvm-readobj}"
@@ -35,11 +54,8 @@ OBJDUMP="${LLVM_OBJDUMP:-llvm-objdump}"
 LLD_LINK="${LLD_LINK:-lld-link}"
 
 if ! command -v "$READOBJ" >/dev/null 2>&1; then
-    echo "check_coff: skipped — needs llvm-readobj (cross-format COFF parser); not found on $(uname -s)-$(uname -m)"
-    exit 0
+    skip_or_fail "the cross-format COFF parser '$READOBJ' is absent on $(uname -s)-$(uname -m)"
 fi
-
-fail() { echo "check_coff: FAIL — $1"; exit 1; }
 
 hdr="$("$READOBJ" --file-headers "$OBJ" 2>/dev/null)" || fail "$READOBJ could not parse $OBJ"
 echo "$hdr" | grep -q "IMAGE_FILE_MACHINE_AMD64" || fail "not an IMAGE_FILE_MACHINE_AMD64 object"

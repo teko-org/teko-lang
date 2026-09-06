@@ -1,0 +1,342 @@
+use teko::parser
+use teko::lexer
+
+pub type Absorb = struct { }
+pub type Overload = struct { }
+pub type Conflict = struct { }
+
+fn strs_equal(a: []str, b: []str): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if a[i] != b[i] { return false }; i++ }
+    true
+}
+
+fn path_equal(a: parser::Path, b: parser::Path): bool {
+    if a.segments.len != b.segments.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.segments.len { break }; if a.segments[i].name != b.segments[i].name { return false }; i++ }
+    true
+}
+
+fn typeexpr_equal(a: @TypeExpr(), b: @TypeExpr()): bool {
+    match a {
+        parser::NamedType as an => match b { parser::NamedType as bn => path_equal(an.path, bn.path) && typeexprs_equal(an.args, bn.args); _ => false }
+        parser::SliceType as asl => match b { parser::SliceType as bsl => typeexpr_equal(asl.element, bsl.element); _ => false }
+        parser::SizedArrayType as asa => match b { parser::SizedArrayType as bsa => typeexpr_equal(asa.element, bsa.element); _ => false }
+        parser::UnionType as au => match b { parser::UnionType as bu => typeexprs_equal(au.members, bu.members); _ => false }
+        parser::FunctionType as af => match b { parser::FunctionType as bf => typeexprs_equal(af.params, bf.params) && typeexpr_equal(af.ret, bf.ret); _ => false }
+        parser::MacroType as amt => match b { parser::MacroType as bmt => path_equal(amt.callee, bmt.callee); _ => false }
+    }
+}
+
+fn typeexprs_equal(a: []@TypeExpr(), b: []@TypeExpr()): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !typeexpr_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn typeexpr_opt_equal(a: @TypeExpr() | null, b: @TypeExpr() | null): bool {
+    match a {
+        (@TypeExpr()) as at => match b { (@TypeExpr()) as bt => typeexpr_equal(at, bt); null => false }
+        null => match b { null => true; _ => false }
+    }
+}
+
+fn constraint_equal(a: @ConstraintExpr(), b: @ConstraintExpr()): bool {
+    match a {
+        parser::ConstraintAtom as aa => match b { parser::ConstraintAtom as ba => aa.name == ba.name; _ => false }
+        parser::ConstraintType as at => match b { parser::ConstraintType as bt => typeexpr_equal(at.ty, bt.ty); _ => false }
+        parser::ConstraintAnd as an => match b { parser::ConstraintAnd as bn => constraint_equal(an.left, bn.left) && constraint_equal(an.right, bn.right); _ => false }
+        parser::ConstraintOr as ao => match b { parser::ConstraintOr as bo => constraint_equal(ao.left, bo.left) && constraint_equal(ao.right, bo.right); _ => false }
+        parser::ConstraintForm as af => match b { parser::ConstraintForm as bf => af.form == bf.form && af.has_lifetime == bf.has_lifetime && (!af.has_lifetime || lifetime_eq(af.lifetime, bf.lifetime)); _ => false }
+        parser::ConstraintNotNull => match b { parser::ConstraintNotNull => true; _ => false }
+        parser::NoConstraint => match b { parser::NoConstraint => true; _ => false }
+    }
+}
+
+fn constraints_equal(a: []@ConstraintExpr(), b: []@ConstraintExpr()): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !constraint_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn numint_equal(a: parser::NumInt, b: parser::NumInt): bool {
+    a.neg == b.neg && a.mag == b.mag
+}
+
+fn param_equal(a: parser::Param, b: parser::Param): bool {
+    if a.name != b.name { return false }
+    if a.has_type != b.has_type { return false }
+    if a.has_type && !typeexpr_equal(a.type_ann, b.type_ann) { return false }
+    if a.is_params != b.is_params { return false }
+    if a.has_default != b.has_default { return false }
+    if a.has_default && !expr_equal(a.default_expr, b.default_expr) { return false }
+    true
+}
+
+fn params_equal(a: []parser::Param, b: []parser::Param): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !param_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn lambdaparam_equal(a: parser::LambdaParam, b: parser::LambdaParam): bool {
+    if a.name != b.name { return false }
+    if a.has_type != b.has_type { return false }
+    if a.has_type && !typeexpr_equal(a.type_ann, b.type_ann) { return false }
+    true
+}
+
+fn lambdaparams_equal(a: []parser::LambdaParam, b: []parser::LambdaParam): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !lambdaparam_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn arrayelem_equal(a: parser::ArrayElem, b: parser::ArrayElem): bool {
+    a.is_spread == b.is_spread && expr_equal(a.expr, b.expr)
+}
+
+fn arrayelems_equal(a: []parser::ArrayElem, b: []parser::ArrayElem): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !arrayelem_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn cmpterm_equal(a: parser::CmpTerm, b: parser::CmpTerm): bool {
+    a.op == b.op && expr_equal(a.operand, b.operand)
+}
+
+fn cmpterms_equal(a: []parser::CmpTerm, b: []parser::CmpTerm): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !cmpterm_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn fspec_equal(a: parser::FSpec, b: parser::FSpec): bool {
+    match a.kind {
+        parser::FSpecNone => match b.kind { parser::FSpecNone => true; _ => false }
+        parser::FSpecStatic as asx => match b.kind { parser::FSpecStatic as bsx => asx.s == bsx.s; _ => false }
+        parser::FSpecDynamic as adx => match b.kind { parser::FSpecDynamic as bdx => exprs_equal(adx.args, bdx.args); _ => false }
+    }
+}
+
+fn fspecs_equal(a: []parser::FSpec, b: []parser::FSpec): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !fspec_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn pattern_equal(a: @Pattern(), b: @Pattern()): bool {
+    match a {
+        parser::LiteralPattern as al => match b { parser::LiteralPattern as bl => expr_equal(al.value, bl.value); _ => false }
+        parser::RangePattern as ar => match b { parser::RangePattern as br => expr_equal(ar.lo, br.lo) && expr_equal(ar.hi, br.hi); _ => false }
+        parser::AltPattern as aa => match b { parser::AltPattern as ba => patterns_equal(aa.options, ba.options); _ => false }
+        parser::BindPattern as ab => match b { parser::BindPattern as bb => bindpattern_equal(ab, bb); _ => false }
+        parser::FieldPattern as af => match b { parser::FieldPattern as bf => path_equal(af.type_name, bf.type_name) && strs_equal(af.fields, bf.fields); _ => false }
+        parser::WildcardPattern => match b { parser::WildcardPattern => true; _ => false }
+        parser::NullPattern => match b { parser::NullPattern => true; _ => false }
+        parser::GroupBindPattern as ag => match b { parser::GroupBindPattern as bg => ag.binding == bg.binding && patterns_equal(ag.options, bg.options); _ => false }
+        parser::MacroPattern as am => match b { parser::MacroPattern as bm => typeexpr_equal(am.macro_call, bm.macro_call); _ => false }
+    }
+}
+
+fn bindpattern_equal(a: parser::BindPattern, b: parser::BindPattern): bool {
+    if !path_equal(a.type_name, b.type_name) { return false }
+    if a.has_binding != b.has_binding { return false }
+    if a.binding != b.binding { return false }
+    if a.is_slice != b.is_slice { return false }
+    if !typeexpr_opt_equal(a.slice_type, b.slice_type) { return false }
+    typeexprs_equal(a.type_args, b.type_args)
+}
+
+fn patterns_equal(a: []@Pattern(), b: []@Pattern()): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !pattern_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn arm_equal(a: parser::Arm, b: parser::Arm): bool {
+    if !pattern_equal(a.pattern, b.pattern) { return false }
+    if a.has_when != b.has_when { return false }
+    if a.has_when && !expr_equal(a.guard, b.guard) { return false }
+    stmts_equal(a.body, b.body)
+}
+
+fn arms_equal(a: []parser::Arm, b: []parser::Arm): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !arm_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn bindtarget_equal(a: @BindTarget(), b: @BindTarget()): bool {
+    match a {
+        parser::SimpleName as asn => match b { parser::SimpleName as bsn => asn.name == bsn.name; _ => false }
+        parser::DestructurePattern as ad => match b { parser::DestructurePattern as bd => strs_equal(ad.names, bd.names); _ => false }
+    }
+}
+
+fn bindelem_equal(a: @BindElem(), b: @BindElem()): bool {
+    match a {
+        parser::BindName as an => match b { parser::BindName as bn => an.name == bn.name; _ => false }
+        parser::BindSkip => match b { parser::BindSkip => true; _ => false }
+        parser::BindRest => match b { parser::BindRest => true; _ => false }
+    }
+}
+
+fn bindelems_equal(a: []@BindElem(), b: []@BindElem()): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !bindelem_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn expr_equal(a: parser::Expr, b: parser::Expr): bool {
+    match a.kind {
+        parser::Number as an => match b.kind { parser::Number as bn => an.is_float == bn.is_float && numint_equal(an.value, bn.value) && an.fval == bn.fval; _ => false }
+        parser::Var as av => match b.kind { parser::Var as bv => av.name == bv.name; _ => false }
+        parser::Call as ac => match b.kind { parser::Call as bc => path_equal(ac.callee, bc.callee) && exprs_equal(ac.args, bc.args) && strs_equal(ac.arg_names, bc.arg_names) && typeexprs_equal(ac.owner_type_args, bc.owner_type_args) && typeexprs_equal(ac.callee_type_args, bc.callee_type_args); _ => false }
+        parser::IfExpr as ai => match b.kind { parser::IfExpr as bi => expr_equal(ai.cond, bi.cond) && stmts_equal(ai.then_blk, bi.then_blk) && ai.has_else == bi.has_else && stmts_equal(ai.else_blk, bi.else_blk); _ => false }
+        parser::MatchExpr as am => match b.kind { parser::MatchExpr as bm => expr_equal(am.subject, bm.subject) && arms_equal(am.arms, bm.arms); _ => false }
+        parser::StrLit as asl => match b.kind { parser::StrLit as bsl => asl.text == bsl.text; _ => false }
+        parser::ByteStrLit as absl => match b.kind { parser::ByteStrLit as bbsl => absl.text == bbsl.text; _ => false }
+        parser::ByteLit as aby => match b.kind { parser::ByteLit as bby => aby.value == bby.value; _ => false }
+        parser::CharLit as ach => match b.kind { parser::CharLit as bch => ach.bytes == bch.bytes; _ => false }
+        parser::BoolLit as abl => match b.kind { parser::BoolLit as bbl => abl.value == bbl.value; _ => false }
+        parser::NullLit => match b.kind { parser::NullLit => true; _ => false }
+        parser::Binary as abin => match b.kind { parser::Binary as bbin => abin.op == bbin.op && expr_equal(abin.left, bbin.left) && expr_equal(abin.right, bbin.right); _ => false }
+        parser::Unary as aun => match b.kind { parser::Unary as bun => aun.op == bun.op && expr_equal(aun.operand, bun.operand); _ => false }
+        parser::Compare as acmp => match b.kind { parser::Compare as bcmp => expr_equal(acmp.first, bcmp.first) && cmpterms_equal(acmp.rest, bcmp.rest); _ => false }
+        parser::FieldAccess as afa => match b.kind { parser::FieldAccess as bfa => expr_equal(afa.receiver, bfa.receiver) && afa.field == bfa.field; _ => false }
+        parser::MethodCall as amc => match b.kind { parser::MethodCall as bmc => expr_equal(amc.receiver, bmc.receiver) && amc.method == bmc.method && exprs_equal(amc.args, bmc.args) && strs_equal(amc.arg_names, bmc.arg_names) && typeexprs_equal(amc.type_args, bmc.type_args); _ => false }
+        parser::Cast as aca => match b.kind { parser::Cast as bca => expr_equal(aca.expr, bca.expr) && typeexpr_equal(aca.target, bca.target); _ => false }
+        parser::PathExpr as ape => match b.kind { parser::PathExpr as bpe => path_equal(ape.path, bpe.path); _ => false }
+        parser::StructLit as astl => match b.kind { parser::StructLit as bstl => path_equal(astl.type_path, bstl.type_path) && typeexprs_equal(astl.type_args, bstl.type_args) && strs_equal(astl.field_names, bstl.field_names) && exprs_equal(astl.field_vals, bstl.field_vals); _ => false }
+        parser::Index as aix => match b.kind { parser::Index as bix => expr_equal(aix.receiver, bix.receiver) && expr_equal(aix.index, bix.index); _ => false }
+        parser::Interp as ain => match b.kind { parser::Interp as bin => strs_equal(ain.pieces, bin.pieces) && exprs_equal(ain.holes, bin.holes) && fspecs_equal(ain.specs, bin.specs); _ => false }
+        parser::InExpr as aie => match b.kind { parser::InExpr as bie => expr_equal(aie.lhs, bie.lhs) && exprs_equal(aie.elems, bie.elems); _ => false }
+        parser::ArrayLit as aal => match b.kind { parser::ArrayLit as bal => arrayelems_equal(aal.elements, bal.elements); _ => false }
+        parser::Lambda as ala => match b.kind { parser::Lambda as bla => lambdaparams_equal(ala.params, bla.params) && stmts_equal(ala.body, bla.body); _ => false }
+        parser::Borrow as abo => match b.kind { parser::Borrow as bbo => expr_equal(abo.operand, bbo.operand); _ => false }
+        parser::Block as abk => match b.kind { parser::Block as bbk => stmts_equal(abk.body, bbk.body); _ => false }
+        parser::MacroCall as amc => match b.kind { parser::MacroCall as bmc => path_equal(amc.callee, bmc.callee) && exprs_equal(amc.args, bmc.args) && typeexprs_equal(amc.callee_type_args, bmc.callee_type_args); _ => false }
+    }
+}
+
+fn exprs_equal(a: []parser::Expr, b: []parser::Expr): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !expr_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn stmt_equal(a: @Statement(), b: @Statement()): bool {
+    match a {
+        parser::Binding as ab => match b { parser::Binding as bb => binding_equal(ab, bb); _ => false }
+        parser::Assign as aa => match b { parser::Assign as ba => assign_equal(aa, ba); _ => false }
+        parser::Return as ar => match b { parser::Return as br => ar.has_value == br.has_value && expr_equal(ar.value, br.value) && exprs_equal(ar.values, br.values); _ => false }
+        parser::LoopStmt as al => match b { parser::LoopStmt as bl => al.label == bl.label && stmts_equal(al.init, bl.init) && stmts_equal(al.body, bl.body); _ => false }
+        parser::BreakStmt as abr => match b { parser::BreakStmt as bbr => abr.label == bbr.label; _ => false }
+        parser::ContinueStmt as ac => match b { parser::ContinueStmt as bc => ac.label == bc.label; _ => false }
+        parser::ExprStmt as aes => match b { parser::ExprStmt as bes => expr_equal(aes.expr, bes.expr); _ => false }
+        parser::DeferStmt as ad => match b { parser::DeferStmt as bd => stmts_equal(ad.body, bd.body); _ => false }
+        parser::AdoptStmt as aad => match b { parser::AdoptStmt as bad => aad.name == bad.name && stmts_equal(aad.body, bad.body); _ => false }
+        parser::BlockStmt as abk => match b { parser::BlockStmt as bbk => stmts_equal(abk.body, bbk.body); _ => false }
+        parser::MultiBind as amb => match b { parser::MultiBind as bmb => multibind_equal(amb, bmb); _ => false }
+        parser::LoweringFrag as alf => match b { parser::LoweringFrag as blf => lowering_frags_equal(alf, blf); _ => false }
+        parser::Spawn as asp => match b { parser::Spawn as bsp => expr_equal(asp.call, bsp.call); _ => false }
+    }
+}
+
+fn lowering_frags_equal(a: parser::LoweringFrag, b: parser::LoweringFrag): bool {
+    if a.tokens.len != b.tokens.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.tokens.len { break }
+        if a.tokens[i].kind != b.tokens[i].kind || a.tokens[i].text != b.tokens[i].text { return false }
+        i++
+    }
+    true
+}
+
+fn binding_equal(a: parser::Binding, b: parser::Binding): bool {
+    if a.kind != b.kind { return false }
+    if !bindtarget_equal(a.target, b.target) { return false }
+    if a.has_type != b.has_type { return false }
+    if a.has_type && !typeexpr_equal(a.type_ann, b.type_ann) { return false }
+    if a.is_ref != b.is_ref { return false }
+    expr_equal(a.value, b.value)
+}
+
+fn assign_equal(a: parser::Assign, b: parser::Assign): bool {
+    if a.kind != b.kind { return false }
+    if a.name != b.name { return false }
+    if a.op != b.op { return false }
+    if a.deref != b.deref { return false }
+    if parser::assign_has_target(a.kind) && !expr_equal(a.target, b.target) { return false }
+    expr_equal(a.value, b.value)
+}
+
+fn multibind_equal(a: parser::MultiBind, b: parser::MultiBind): bool {
+    if a.kind != b.kind { return false }
+    if a.shape != b.shape { return false }
+    if !bindelems_equal(a.targets, b.targets) { return false }
+    if a.has_type != b.has_type { return false }
+    if a.has_type && !typeexpr_equal(a.type_ann, b.type_ann) { return false }
+    exprs_equal(a.values, b.values)
+}
+
+fn stmts_equal(a: []@Statement(), b: []@Statement()): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop { if i >= a.len { break }; if !stmt_equal(a[i], b[i]) { return false }; i++ }
+    true
+}
+
+fn functions_ast_equal(a: parser::Function, b: parser::Function): bool {
+    if a.name != b.name { return false }
+    if !strs_equal(a.type_params, b.type_params) { return false }
+    if !constraints_equal(a.type_constraints, b.type_constraints) { return false }
+    if !params_equal(a.params, b.params) { return false }
+    if a.has_return != b.has_return { return false }
+    if a.has_return && !typeexpr_equal(a.return_type, b.return_type) { return false }
+    if !typeexprs_equal(a.ret_types, b.ret_types) { return false }
+    if a.is_static != b.is_static { return false }
+    if a.is_getter != b.is_getter { return false }
+    if a.is_setter != b.is_setter { return false }
+    if a.accessor_prop != b.accessor_prop { return false }
+    if a.is_operator != b.is_operator { return false }
+    if a.is_abstract != b.is_abstract { return false }
+    if a.is_virtual != b.is_virtual { return false }
+    if a.is_override != b.is_override { return false }
+    if a.is_intern != b.is_intern { return false }
+    if a.is_extern != b.is_extern { return false }
+    if a.c_symbol != b.c_symbol { return false }
+    if a.from_lib != b.from_lib { return false }
+    if a.os_guard != b.os_guard { return false }
+    stmts_equal(a.body, b.body)
+}
+
+fn fields_ast_equal(a: parser::Field, b: parser::Field): bool {
+    a.name == b.name && typeexpr_equal(a.type_ann, b.type_ann) && a.is_readonly == b.is_readonly
+}
+
+fn consts_ast_equal(a: parser::ConstDecl, b: parser::ConstDecl): bool {
+    a.name == b.name && typeexpr_equal(a.ty, b.ty) && expr_equal(a.init, b.init)
+}
+
+pub fn merge_named_members(existing: parser::Function, incoming: parser::Function, table: TypeTable, ref_ns: str, self_type: str): Absorb | Overload | Conflict {
+    if functions_ast_equal(existing, incoming) { return Absorb { } }
+    if method_sig_matches(existing, incoming, table, ref_ns, self_type) { return Conflict { } }
+    Overload { }
+}

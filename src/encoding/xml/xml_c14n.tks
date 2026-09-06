@@ -1,0 +1,314 @@
+pub type NsLookup = struct {
+    found: bool
+    uri: str
+}
+
+fn output_lookup(output: NsScope, prefix: str): NsLookup {
+    var i = output.prefixes.len
+    loop {
+        if i == 0 { break }
+        i--
+        if str_eq(output.prefixes[i], prefix) { return NsLookup { found = true; uri = output.uris[i] } }
+    }
+    NsLookup { found = false; uri = "" }
+}
+
+pub type NsBindings = struct {
+    prefixes: []str
+    uris: []str
+}
+
+fn distinct_bindings(scope: NsScope): NsBindings {
+    var prefixes: []str = []
+    var uris: []str = []
+    var i = scope.prefixes.len
+    loop {
+        if i == 0 { break }
+        i--
+        var prefix = scope.prefixes[i]
+        if str_eq(prefix, "xml") { continue }
+        if !contains_str(prefixes, prefix) {
+            prefixes = [..prefixes, prefix]
+            uris = [..uris, scope.uris[i]]
+        }
+    }
+    NsBindings { prefixes = sort_str(prefixes, uris); uris = reorder_by_sorted(prefixes, uris) }
+}
+
+fn contains_str(list: []str, value: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= list.len { break }
+        if str_eq(list[i], value) { return true }
+        i++
+    }
+    false
+}
+
+fn str_less(a: str, b: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= a.len || i >= b.len { break }
+        if a[i] != b[i] { return a[i] < b[i] }
+        i++
+    }
+    a.len < b.len
+}
+
+fn sort_str(prefixes: []str, uris: []str): []str {
+    var order = sorted_indices_by_prefix(prefixes)
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= order.len { break }
+        out = [..out, prefixes[order[i]]]
+        i++
+    }
+    out
+}
+
+fn reorder_by_sorted(prefixes: []str, uris: []str): []str {
+    var order = sorted_indices_by_prefix(prefixes)
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= order.len { break }
+        out = [..out, uris[order[i]]]
+        i++
+    }
+    out
+}
+
+fn sorted_indices_by_prefix(prefixes: []str): []u64 {
+    var order: []u64 = []
+    var used: []bool = []
+    var k: u64 = 0
+    loop {
+        if k >= prefixes.len { break }
+        used = [..used, false]
+        k++
+    }
+    var n: u64 = 0
+    loop {
+        if n >= prefixes.len { break }
+        var best = first_unused(used)
+        var j: u64 = 0
+        loop {
+            if j >= prefixes.len { break }
+            if !used[j] && str_less(prefixes[j], prefixes[best]) { best = j }
+            j++
+        }
+        used = set_true(used, best)
+        order = [..order, best]
+        n++
+    }
+    order
+}
+
+fn first_unused(used: []bool): u64 {
+    var i: u64 = 0
+    loop {
+        if i >= used.len { break }
+        if !used[i] { return i }
+        i++
+    }
+    0
+}
+
+fn set_true(used: []bool, index: u64): []bool {
+    var out: []bool = []
+    var i: u64 = 0
+    loop {
+        if i >= used.len { break }
+        out = [..out, if i == index { true } else { used[i] }]
+        i++
+    }
+    out
+}
+
+pub type NsRender = struct {
+    text: str
+    output: NsScope
+}
+
+fn render_namespaces(full_scope: NsScope, output: NsScope): NsRender {
+    var bindings = distinct_bindings(full_scope)
+    var text: str = ""
+    var out = output
+    var i: u64 = 0
+    loop {
+        if i >= bindings.prefixes.len { break }
+        var prefix = bindings.prefixes[i]
+        var uri = bindings.uris[i]
+        if namespace_needs_render(out, prefix, uri) {
+            text = text ~ render_one_namespace(prefix, uri)
+            out = scope_extend(out, prefix, uri)
+        }
+        i++
+    }
+    NsRender { text = text; output = out }
+}
+
+fn namespace_needs_render(output: NsScope, prefix: str, uri: str): bool {
+    var prior = output_lookup(output, prefix)
+    if prefix.len == 0 && uri.len == 0 {
+        return prior.found && prior.uri.len > 0
+    }
+    !prior.found || !str_eq(prior.uri, uri)
+}
+
+fn render_one_namespace(prefix: str, uri: str): str {
+    if prefix.len == 0 {
+        return concat(" xmlns=\"", concat(c14n_escape_attr(uri), "\""))
+    }
+    concat(" xmlns:", concat(prefix, concat("=\"", concat(c14n_escape_attr(uri), "\""))))
+}
+
+fn canonical_attributes(attrs: []XmlAttr): []XmlAttr {
+    var kept: []XmlAttr = []
+    var i: u64 = 0
+    loop {
+        if i >= attrs.len { break }
+        if !is_namespace_decl(attrs[i]) { kept = [..kept, attrs[i]] }
+        i++
+    }
+    sort_attributes(kept)
+}
+
+fn is_namespace_decl(a: XmlAttr): bool {
+    str_eq(a.name, "xmlns") || str_eq(a.prefix, "xmlns")
+}
+
+fn sort_attributes(attrs: []XmlAttr): []XmlAttr {
+    var used: []bool = []
+    var k: u64 = 0
+    loop {
+        if k >= attrs.len { break }
+        used = [..used, false]
+        k++
+    }
+    var out: []XmlAttr = []
+    var n: u64 = 0
+    loop {
+        if n >= attrs.len { break }
+        var best = first_unused(used)
+        var j: u64 = 0
+        loop {
+            if j >= attrs.len { break }
+            if !used[j] && attr_less(attrs[j], attrs[best]) { best = j }
+            j++
+        }
+        used = set_true(used, best)
+        out = [..out, attrs[best]]
+        n++
+    }
+    out
+}
+
+fn attr_less(a: XmlAttr, b: XmlAttr): bool {
+    if !str_eq(a.namespace_uri, b.namespace_uri) { return str_less(a.namespace_uri, b.namespace_uri) }
+    str_less(a.local, b.local)
+}
+
+fn c14n_escape_text(s: str): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        var b = s[i]
+        if b == b'&' { out = out ~ "&amp;" } else if b == b'<' { out = out ~ "&lt;" } else if b == b'>' { out = out ~ "&gt;" } else if b == b'\r' { out = out ~ "&#xD;" } else { out = out ~ one_byte(b) }
+        i++
+    }
+    out
+}
+
+fn c14n_escape_attr(s: str): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        out = out ~ c14n_escape_attr_byte(s[i])
+        i++
+    }
+    out
+}
+
+fn c14n_escape_attr_byte(b: byte): str {
+    if b == b'&' { return "&amp;" }
+    if b == b'<' { return "&lt;" }
+    if b == b'"' { return "&quot;" }
+    if b == b'\t' { return "&#x9;" }
+    if b == b'\n' { return "&#xA;" }
+    if b == b'\r' { return "&#xD;" }
+    one_byte(b)
+}
+
+fn c14n_element(node: XmlNode, parent_scope: NsScope, output: NsScope, with_comments: bool): str {
+    var full_scope = scope_with_declarations(parent_scope, node.attributes)
+    var ns = render_namespaces(full_scope, output)
+    var attrs = canonical_attributes(node.attributes)
+    var out = concat("<", concat(node.name, concat(ns.text, render_attribute_list(attrs))))
+    out = out ~ ">"
+    out = out ~ c14n_children(node.children, full_scope, ns.output, with_comments)
+    out ~ concat("</", concat(node.name, ">"))
+}
+
+fn render_attribute_list(attrs: []XmlAttr): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= attrs.len { break }
+        out = out ~ concat(" ", concat(attrs[i].name, concat("=\"", concat(c14n_escape_attr(attrs[i].value), "\""))))
+        i++
+    }
+    out
+}
+
+fn c14n_children(children: []XmlNode, scope: NsScope, output: NsScope, with_comments: bool): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= children.len { break }
+        out = out ~ c14n_node(children[i], scope, output, with_comments)
+        i++
+    }
+    out
+}
+
+fn c14n_node(node: XmlNode, parent_scope: NsScope, output: NsScope, with_comments: bool): str {
+    match node.kind {
+        NodeKind::Element => c14n_element(node, parent_scope, output, with_comments)
+        NodeKind::Text => c14n_escape_text(node.text)
+        NodeKind::CData => c14n_escape_text(node.text)
+        NodeKind::Comment => if with_comments { concat("<!--", concat(node.text, "-->")) } else { "" }
+        NodeKind::ProcessingInstruction => c14n_pi(node)
+    }
+}
+
+fn c14n_pi(node: XmlNode): str {
+    if node.text.len == 0 {
+        return concat("<?", concat(node.name, "?>"))
+    }
+    concat("<?", concat(node.name, concat(" ", concat(node.text, "?>"))))
+}
+
+/**
+ * Produces the inclusive Canonical XML 1.0 form of a node subtree, WITHOUT comments (the
+ * default C14N used for signing). Treats `node` as a complete subtree: only its own and its
+ * descendants' namespace declarations are in scope.
+ */
+exp fn canonicalize(node: XmlNode): str {
+    c14n_node(node, root_scope(), empty_output(), false)
+}
+
+/**
+ * Produces the inclusive Canonical XML 1.0 form of a node subtree WITH comments preserved
+ * (the `#WithComments` variant).
+ */
+exp fn canonicalize_with_comments(node: XmlNode): str {
+    c14n_node(node, root_scope(), empty_output(), true)
+}
+
+fn empty_output(): NsScope {
+    NsScope { prefixes = []; uris = [] }
+}

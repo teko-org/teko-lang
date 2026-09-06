@@ -1,0 +1,747 @@
+use teko::lexer
+
+fn max_macro_depth(): u64 { 64 to u64 }
+
+type MacroHoles = struct { active: bool; args: []Expr }
+
+fn no_holes(): MacroHoles { MacroHoles { active = false; args = [] } }
+
+fn hole_placeholder_prefix(): str { "__mhole_" }
+
+pub fn expand_macros_syntactic(prog: Program): Program | error {
+    if !program_has_macros(prog) { return prog }
+    var out: [prog.items.len]Item = []
+    var count: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        if item_is_macro_decl(prog.items[i]) { i++; continue }
+        var it = match rewrite_item(prog.items[i], prog, 0 to u64) { Item as x => x; error as e => return e }
+        out[count] = it
+        count = count + 1
+        i++
+    }
+    Program { items = teko::collections::arr_slice(out, 0, count) }
+}
+
+fn item_is_macro_decl(it: Item): bool {
+    match it.content {
+        MacroDecl => true
+        _ => false
+    }
+}
+
+fn program_has_macros(prog: Program): bool {
+    var i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        if item_has_macro(prog.items[i]) { return true }
+        i++
+    }
+    false
+}
+
+fn item_has_macro(it: Item): bool {
+    match it.content {
+        MacroDecl => true
+        ComptimeDecl => true
+        _ => false
+    }
+}
+
+fn rewrite_item(it: Item, prog: Program, depth: u64): Item | error {
+    match it.content {
+        Function as f => {
+            var fs = match rewrite_fn_sig(f, prog, depth) { Function as x => x; error as e => return e }
+            var nb = match walk_stmts(fs.body, prog, no_holes(), depth) { []@Statement() as s => s; error as e => return e }
+            Item { content = with_fn_body(fs, nb); namespace = it.namespace; file = it.file; guard = it.guard }
+        }
+        TypeDecl as td => {
+            var nd = match rewrite_type_decl(td, prog, depth) { TypeDecl as x => x; error as e => return e }
+            Item { content = nd; namespace = it.namespace; file = it.file; guard = it.guard }
+        }
+        (@Statement()) as s => {
+            var ns = match walk_stmt(s, prog, no_holes(), depth) { (@Statement()) as x => x; error as e => return e }
+            Item { content = ns; namespace = it.namespace; file = it.file; guard = it.guard }
+        }
+        ConstDecl as cd => {
+            var ncd = match rewrite_const_decl(cd, prog, depth) { ConstDecl as x => x; error as e => return e }
+            Item { content = ncd; namespace = it.namespace; file = it.file; guard = it.guard }
+        }
+        _ => it
+    }
+}
+
+fn rewrite_const_decl(cd: ConstDecl, prog: Program, depth: u64): ConstDecl | error {
+    var ty = match walk_type(cd.ty, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+    var iv = match walk_expr(cd.init, prog, no_holes(), depth) { Expr as x => x; error as e => return e }
+    ConstDecl { name = cd.name; ty = ty; init = iv; vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col; is_global = cd.is_global }
+}
+
+fn rewrite_fn_sig(f: Function, prog: Program, depth: u64): Function | error {
+    var ps = match rewrite_params(f.params, prog, depth) { []Param as p => p; error as e => return e }
+    var rt = f.return_type
+    if f.has_return {
+        rt = match walk_type(f.return_type, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+    }
+    Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = ps; has_return = f.has_return; return_type = rt; body = f.body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; is_static = f.is_static; is_getter = f.is_getter; is_setter = f.is_setter; accessor_prop = f.accessor_prop; ret_types = f.ret_types; is_operator = f.is_operator; is_global = f.is_global }
+}
+
+fn rewrite_params(params: []Param, prog: Program, depth: u64): []Param | error {
+    var out: [params.len]Param = []
+    var i: u64 = 0
+    loop {
+        if i >= params.len { break }
+        var p = params[i]
+        var ta = p.type_ann
+        if p.has_type {
+            ta = match walk_type(p.type_ann, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+        }
+        out[i] = Param { name = p.name; has_type = p.has_type; type_ann = ta; is_params = p.is_params; has_default = p.has_default; default_expr = p.default_expr }
+        i++
+    }
+    out
+}
+
+fn rewrite_lambda_params(params: []LambdaParam, prog: Program, depth: u64): []LambdaParam | error {
+    var out: [params.len]LambdaParam = []
+    var i: u64 = 0
+    loop {
+        if i >= params.len { break }
+        var p = params[i]
+        var ta = p.type_ann
+        if p.has_type {
+            ta = match walk_type(p.type_ann, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+        }
+        out[i] = LambdaParam { name = p.name; has_type = p.has_type; type_ann = ta }
+        i++
+    }
+    out
+}
+
+fn rewrite_type_decl(td: TypeDecl, prog: Program, depth: u64): TypeDecl | error {
+    var nb = match td.body {
+        StructBody as sb => {
+            var fs = match rewrite_fields(sb.fields, prog, depth) { []Field as f => f; error as e => return e }
+            StructBody { fields = fs; methods = sb.methods; implements = sb.implements; consts = sb.consts; is_readonly = sb.is_readonly }
+        }
+        ClassBody as cb => {
+            var fs = match rewrite_fields(cb.fields, prog, depth) { []Field as f => f; error as e => return e }
+            ClassBody { kind = cb.kind; has_base = cb.has_base; base_name = cb.base_name; has_base_binding = cb.has_base_binding; base_binding_name = cb.base_binding_name; implements = cb.implements; fields = fs; methods = cb.methods; consts = cb.consts; is_service = cb.is_service; service_lifetime = cb.service_lifetime }
+        }
+        VariantBody as vb => {
+            var te = match walk_type(vb.type_expr, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+            VariantBody { type_expr = te }
+        }
+        NewtypeBody as nt => {
+            var bk = match walk_type(nt.backing, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+            NewtypeBody { backing = bk; methods = nt.methods; consts = nt.consts }
+        }
+        AliasBody as ab => {
+            var al = match walk_type(ab.alias, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+            AliasBody { alias = al }
+        }
+        _ => td.body
+    }
+    TypeDecl { name = td.name; type_params = td.type_params; type_constraints = td.type_constraints; body = nb; vis = td.vis; has_doc = td.has_doc; doc = td.doc; line = td.line; col = td.col; is_global = td.is_global }
+}
+
+fn rewrite_fields(fields: []Field, prog: Program, depth: u64): []Field | error {
+    var out: [fields.len]Field = []
+    var i: u64 = 0
+    loop {
+        if i >= fields.len { break }
+        var fl = fields[i]
+        var ta = match walk_type(fl.type_ann, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+        out[i] = Field { name = fl.name; type_ann = ta; vis = fl.vis; is_intern = fl.is_intern; has_doc = fl.has_doc; doc = fl.doc; is_readonly = fl.is_readonly }
+        i++
+    }
+    out
+}
+
+fn with_fn_body(f: Function, body: []@Statement()): Function {
+    Function { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; has_return = f.has_return; return_type = f.return_type; body = body; vis = f.vis; has_doc = f.has_doc; doc = f.doc; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; os_guard = f.os_guard; is_intern = f.is_intern; is_abstract = f.is_abstract; is_virtual = f.is_virtual; is_override = f.is_override; is_static = f.is_static; is_getter = f.is_getter; is_setter = f.is_setter; accessor_prop = f.accessor_prop; ret_types = f.ret_types; is_operator = f.is_operator; is_global = f.is_global }
+}
+
+fn macro_decl_by_name(prog: Program, name: str): MacroDecl | null {
+    var i: u64 = 0
+    loop {
+        if i >= prog.items.len { break }
+        match prog.items[i].content {
+            MacroDecl as md => { if md.name == name { return md } }
+            _ => { }
+        }
+        i++
+    }
+    null
+}
+
+fn expand_macro_call(mc: MacroCall, prog: Program, depth: u64): Expr | error {
+    if depth >= max_macro_depth() {
+        return err_expand(mc, "macro expansion exceeded the maximum depth")
+    }
+    var name = macro_call_name(mc)
+    var md = match macro_decl_by_name(prog, name) { MacroDecl as m => m; null => return Expr { kind = mc; line = 0; col = 0 } }
+    var frag = match single_lowering_frag(md) { LoweringFrag as lf => lf; error as e => return e }
+    var subst = match splice_hole_tokens(frag.tokens, md, mc) { []lexer::Token as t => t; error as e => return e }
+    var parsed = match parse_expr(subst, 0 to u64) { Parsed<Expr> as pe => pe.node; error as e => return err_expand(mc, teko::str::concat("the `lowering` fragment does not parse as an expression: ", e.message)) }
+    walk_expr(parsed, prog, MacroHoles { active = true; args = mc.args }, depth + 1 to u64)
+}
+
+fn single_lowering_frag(md: MacroDecl): LoweringFrag | error {
+    if md.body.len != 1 {
+        return error { message = teko::str::concat("macro `", teko::str::concat(md.name, "`: body must be exactly one `lowering { … }` fragment")) }
+    }
+    match md.body[0] {
+        LoweringFrag as lf => lf
+        _ => error { message = teko::str::concat("macro `", teko::str::concat(md.name, "`: its body must be a single `lowering { … }` fragment")) }
+    }
+}
+
+type MacroParamBinds = struct { names: []str; vals: []bool }
+
+fn macro_bind_of(binds: MacroParamBinds, name: str): bool | null {
+    var i: u64 = 0
+    loop {
+        if i >= binds.names.len { break }
+        if binds.names[i] == name { return binds.vals[i] }
+        i++
+    }
+    null
+}
+
+fn macro_cond_bool(cond: Expr, binds: MacroParamBinds): bool | error {
+    match cond.kind {
+        BoolLit as b => b.value
+        Var as v => match macro_bind_of(binds, v.name) {
+            bool as x => x
+            null => error { message = teko::str::concat("a type-macro `if` condition must be a bool parameter or its negation — `", teko::str::concat(v.name, "` is not a bound bool parameter")) }
+        }
+        Unary as u => if u.op == lexer::TokenKind::Bang {
+            match macro_cond_bool(u.operand, binds) { bool as x => !x; error as e => return e }
+        } else {
+            error { message = "a type-macro `if` condition supports only the `!` unary operator" }
+        }
+        _ => error { message = "a type-macro `if` condition must be a bool literal, a bool parameter, or `!` of one" }
+    }
+}
+
+fn macro_arg_bool(e: Expr, pname: str): bool | error {
+    match e.kind {
+        BoolLit as b => b.value
+        Unary as u => if u.op == lexer::TokenKind::Bang {
+            match macro_arg_bool(u.operand, pname) { bool as x => !x; error as er => return er }
+        } else {
+            error { message = teko::str::concat("type-macro argument `", teko::str::concat(pname, "` must be a bool literal `true`/`false`")) }
+        }
+        _ => error { message = teko::str::concat("type-macro argument `", teko::str::concat(pname, "` must be a bool literal `true`/`false`")) }
+    }
+}
+
+fn macro_bind_params(md: MacroDecl, mt: MacroType): MacroParamBinds | error {
+    var names: [md.params.len]str = []
+    var vals: [md.params.len]bool = []
+    var i: u64 = 0
+    loop {
+        if i >= md.params.len { break }
+        var argexpr = no_expr()
+        if i < mt.args.len {
+            argexpr = mt.args[i]
+        } else if md.params[i].has_default {
+            argexpr = md.params[i].default_expr
+        } else {
+            return error { message = teko::str::concat("type-macro `", teko::str::concat(md.name, teko::str::concat("`: parameter `", teko::str::concat(md.params[i].name, "` needs an argument or a default")))) }
+        }
+        var b = match macro_arg_bool(argexpr, md.params[i].name) { bool as x => x; error as e => return e }
+        names[i] = md.params[i].name
+        vals[i] = b
+        i++
+    }
+    MacroParamBinds { names = names; vals = vals }
+}
+
+fn select_lowering_frag(md: MacroDecl, binds: MacroParamBinds): LoweringFrag | error {
+    select_lowering_from(md.body, md.name, binds)
+}
+
+fn select_lowering_from(stmts: []@Statement(), mname: str, binds: MacroParamBinds): LoweringFrag | error {
+    if stmts.len != 1 {
+        return error { message = teko::str::concat("macro `", teko::str::concat(mname, "`: its body must be a single `lowering { … }` or a single comptime `if/else` selecting one")) }
+    }
+    match stmts[0] {
+        LoweringFrag as lf => lf
+        ExprStmt as es => match es.expr.kind {
+            IfExpr as iff => {
+                if !iff.has_else {
+                    return error { message = teko::str::concat("macro `", teko::str::concat(mname, "`: a comptime `if` selecting a lowering must have an `else` — both branches must lower")) }
+                }
+                var c = match macro_cond_bool(iff.cond, binds) { bool as x => x; error as e => return e }
+                if c { select_lowering_from(iff.then_blk, mname, binds) } else { select_lowering_from(iff.else_blk, mname, binds) }
+            }
+            _ => error { message = teko::str::concat("macro `", teko::str::concat(mname, "`: a type-macro body must be a `lowering { … }` or a comptime `if/else`")) }
+        }
+        _ => error { message = teko::str::concat("macro `", teko::str::concat(mname, "`: a type-macro body must be a `lowering { … }` or a comptime `if/else`")) }
+    }
+}
+
+fn splice_hole_tokens(toks: []lexer::Token, md: MacroDecl, mc: MacroCall): []lexer::Token | error {
+    var out: []lexer::Token = []
+    var i: u64 = 0
+    loop {
+        if i >= toks.len { break }
+        if toks[i].kind == lexer::TokenKind::Dollar {
+            if i + 3 >= toks.len || toks[i + 1].kind != lexer::TokenKind::LBrace || toks[i + 2].kind != lexer::TokenKind::Ident || toks[i + 3].kind != lexer::TokenKind::RBrace {
+                return err_expand(mc, "a `${…}` injection hole must be `${param}` — a single macro-parameter name in braces")
+            }
+            var hole_name = toks[i + 2].text
+            var idx = param_index(md, hole_name)
+            if idx < 0 {
+                return err_expand(mc, teko::str::concat("`${", teko::str::concat(hole_name, "}` names no parameter of this macro")))
+            }
+            out = [..out, lexer::Token { kind = lexer::TokenKind::Ident; text = teko::str::concat(hole_placeholder_prefix(), teko::u64_to_str(idx to u64)); line = toks[i].line; col = toks[i].col; byte_off = toks[i].byte_off; file = toks[i].file }]
+            i = i + 4
+            continue
+        }
+        out = [..out, toks[i]]
+        i++
+    }
+    out
+}
+
+fn param_index(md: MacroDecl, name: str): i64 {
+    var i: u64 = 0
+    loop {
+        if i >= md.params.len { break }
+        if md.params[i].name == name { return i to i64 }
+        i++
+    }
+    -1 to i64
+}
+
+fn hole_index_of(name: str): i64 {
+    var pfx = hole_placeholder_prefix()
+    if name.len <= pfx.len { return -1 to i64 }
+    var i: u64 = 0
+    loop {
+        if i >= pfx.len { break }
+        if name[i] != pfx[i] { return -1 to i64 }
+        i++
+    }
+    match parse_u64_digits(name.slice(pfx.len, name.len)) { u64 as v => v to i64; null => -1 to i64 }
+}
+
+fn parse_u64_digits(s: str): u64 | null {
+    if s.len == 0 { return null }
+    var v: u64 = 0 to u64
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        if s[i] < b'0' || s[i] > b'9' { return null }
+        v = v * (10 to u64) + ((s[i] to u64) - (b'0' to u64))
+        i++
+    }
+    v
+}
+
+fn macro_call_name(mc: MacroCall): str {
+    if mc.callee.segments.len == 0 { return "" }
+    mc.callee.segments[mc.callee.segments.len - 1].name
+}
+
+fn err_expand(mc: MacroCall, msg: str): error {
+    var line = if mc.callee.segments.len > 0 { 0 to u32 } else { 0 to u32 }
+    error { message = msg }
+}
+
+fn with_kind(e: Expr, k: @ExprKind()): Expr { Expr { kind = k; line = e.line; col = e.col } }
+
+fn walk_exprs(es: []Expr, prog: Program, holes: MacroHoles, depth: u64): []Expr | error {
+    var out: [es.len]Expr = []
+    var i: u64 = 0
+    loop {
+        if i >= es.len { break }
+        var x = match walk_expr(es[i], prog, holes, depth) { Expr as e => e; error as er => return er }
+        out[i] = x
+        i++
+    }
+    out
+}
+
+fn walk_cmpterms(ts: []CmpTerm, prog: Program, holes: MacroHoles, depth: u64): []CmpTerm | error {
+    var out: [ts.len]CmpTerm = []
+    var i: u64 = 0
+    loop {
+        if i >= ts.len { break }
+        var o = match walk_expr(ts[i].operand, prog, holes, depth) { Expr as e => e; error as er => return er }
+        out[i] = CmpTerm { op = ts[i].op; operand = o }
+        i++
+    }
+    out
+}
+
+fn walk_arrayelems(els: []ArrayElem, prog: Program, holes: MacroHoles, depth: u64): []ArrayElem | error {
+    var out: [els.len]ArrayElem = []
+    var i: u64 = 0
+    loop {
+        if i >= els.len { break }
+        var x = match walk_expr(els[i].expr, prog, holes, depth) { Expr as e => e; error as er => return er }
+        out[i] = ArrayElem { is_spread = els[i].is_spread; expr = x }
+        i++
+    }
+    out
+}
+
+fn walk_pattern(p: @Pattern(), prog: Program, depth: u64): @Pattern() | error {
+    match p {
+        BindPattern as bp => {
+            var st = bp.slice_type
+            match bp.slice_type {
+                (@TypeExpr()) as t => { st = match walk_type(t, prog, depth) { (@TypeExpr()) as x => x; error as e => return e } }
+                null => { }
+            }
+            var ta = match walk_types(bp.type_args, prog, depth) { []@TypeExpr() as x => x; error as e => return e }
+            BindPattern { type_name = bp.type_name; has_binding = bp.has_binding; binding = bp.binding; is_slice = bp.is_slice; slice_type = st; type_args = ta }
+        }
+        AltPattern as ap => {
+            var opts = match walk_group_options(ap.options, prog, depth) { []@Pattern() as x => x; error as e => return e }
+            AltPattern { options = opts }
+        }
+        GroupBindPattern as gp => {
+            var opts = match walk_group_options(gp.options, prog, depth) { []@Pattern() as x => x; error as e => return e }
+            GroupBindPattern { options = opts; binding = gp.binding }
+        }
+        MacroPattern as mp => {
+            var opts = match macro_pattern_options(mp, prog, depth) { []@Pattern() as x => x; error as e => return e }
+            if opts.len == 1 { opts[0] } else { AltPattern { options = opts } }
+        }
+        _ => p
+    }
+}
+
+fn walk_group_options(ps: []@Pattern(), prog: Program, depth: u64): []@Pattern() | error {
+    var out: []@Pattern() = []
+    var i: u64 = 0
+    loop {
+        if i >= ps.len { break }
+        match ps[i] {
+            MacroPattern as mp => {
+                var cases = match macro_pattern_options(mp, prog, depth) { []@Pattern() as c => c; error as e => return e }
+                var j: u64 = 0
+                loop {
+                    if j >= cases.len { break }
+                    out = [..out, cases[j]]
+                    j++
+                }
+            }
+            _ => {
+                var np = match walk_pattern(ps[i], prog, depth) { (@Pattern()) as x => x; error as e => return e }
+                out = [..out, np]
+            }
+        }
+        i++
+    }
+    out
+}
+
+fn macro_pattern_options(mp: MacroPattern, prog: Program, depth: u64): []@Pattern() | error {
+    var te = match walk_type(mp.macro_call, prog, depth) { (@TypeExpr()) as t => t; error as e => return e }
+    match te {
+        UnionType as ut => {
+            var out: []@Pattern() = []
+            var i: u64 = 0
+            loop {
+                if i >= ut.members.len { break }
+                var opt = match union_member_option(ut.members[i]) { (@Pattern()) as p => p; error as e => return e }
+                out = [..out, opt]
+                i++
+            }
+            out
+        }
+        NamedType => {
+            var opt = match union_member_option(te) { (@Pattern()) as p => p; error as e => return e }
+            [opt]
+        }
+        _ => error { message = "a `@Type()` macro in a pattern position must expand to a union of named cases" }
+    }
+}
+
+fn union_member_option(te: @TypeExpr()): @Pattern() | error {
+    match te {
+        NamedType as nt => BindPattern { type_name = nt.path; has_binding = false; binding = ""; is_slice = false; slice_type = null; type_args = nt.args }
+        UnionType as ut => {
+            var opts: []@Pattern() = []
+            var i: u64 = 0
+            loop {
+                if i >= ut.members.len { break }
+                var o = match union_member_option(ut.members[i]) { (@Pattern()) as p => p; error as e => return e }
+                opts = [..opts, o]
+                i++
+            }
+            GroupBindPattern { options = opts; binding = "" }
+        }
+        _ => error { message = "a `@Type()` macro in a pattern position must expand to a union of named cases" }
+    }
+}
+
+fn walk_arms(arms: []Arm, prog: Program, holes: MacroHoles, depth: u64): []Arm | error {
+    var out: [arms.len]Arm = []
+    var i: u64 = 0
+    loop {
+        if i >= arms.len { break }
+        var pat = match walk_pattern(arms[i].pattern, prog, depth) { (@Pattern()) as p => p; error as er => return er }
+        var g = match walk_expr(arms[i].guard, prog, holes, depth) { Expr as e => e; error as er => return er }
+        var b = match walk_stmts(arms[i].body, prog, holes, depth) { []@Statement() as s => s; error as er => return er }
+        out[i] = Arm { pattern = pat; has_when = arms[i].has_when; guard = g; body = b }
+        i++
+    }
+    out
+}
+
+fn walk_expr(e: Expr, prog: Program, holes: MacroHoles, depth: u64): Expr | error {
+    match e.kind {
+        MacroCall as mc => {
+            var sargs = match walk_exprs(mc.args, prog, holes, depth) { []Expr as a => a; error as er => return er }
+            var cta = match walk_types(mc.callee_type_args, prog, depth) { []@TypeExpr() as t => t; error as er => return er }
+            expand_macro_call(MacroCall { callee = mc.callee; args = sargs; callee_type_args = cta }, prog, depth)
+        }
+        Var as v => {
+            if holes.active {
+                var hi = hole_index_of(v.name)
+                if hi >= 0 to i64 {
+                    if (hi to u64) >= holes.args.len { return error { message = "internal: macro hole index out of range" } }
+                    return walk_expr(holes.args[hi to u64], prog, holes, depth)
+                }
+            }
+            e
+        }
+        Number => e
+        StrLit => e
+        ByteStrLit => e
+        ByteLit => e
+        CharLit => e
+        BoolLit => e
+        NullLit => e
+        PathExpr => e
+        Binary as b => {
+            var l = match walk_expr(b.left, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var r = match walk_expr(b.right, prog, holes, depth) { Expr as x => x; error as er => return er }
+            with_kind(e, Binary { op = b.op; left = l; right = r })
+        }
+        Unary as u => {
+            var o = match walk_expr(u.operand, prog, holes, depth) { Expr as x => x; error as er => return er }
+            with_kind(e, Unary { op = u.op; operand = o })
+        }
+        Compare as c => {
+            var f = match walk_expr(c.first, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var rest = match walk_cmpterms(c.rest, prog, holes, depth) { []CmpTerm as t => t; error as er => return er }
+            with_kind(e, Compare { first = f; rest = rest })
+        }
+        Call as cl => {
+            var args = match walk_exprs(cl.args, prog, holes, depth) { []Expr as x => x; error as er => return er }
+            var ota = match walk_types(cl.owner_type_args, prog, depth) { []@TypeExpr() as t => t; error as er => return er }
+            var cta = match walk_types(cl.callee_type_args, prog, depth) { []@TypeExpr() as t => t; error as er => return er }
+            with_kind(e, Call { callee = cl.callee; args = args; arg_names = cl.arg_names; owner_type_args = ota; callee_type_args = cta })
+        }
+        MethodCall as mc2 => {
+            var recv = match walk_expr(mc2.receiver, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var args = match walk_exprs(mc2.args, prog, holes, depth) { []Expr as x => x; error as er => return er }
+            var ta = match walk_types(mc2.type_args, prog, depth) { []@TypeExpr() as t => t; error as er => return er }
+            with_kind(e, MethodCall { receiver = recv; method = mc2.method; args = args; arg_names = mc2.arg_names; type_args = ta })
+        }
+        IfExpr as f => {
+            var cond = match walk_expr(f.cond, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var tb = match walk_stmts(f.then_blk, prog, holes, depth) { []@Statement() as s => s; error as er => return er }
+            var eb = match walk_stmts(f.else_blk, prog, holes, depth) { []@Statement() as s => s; error as er => return er }
+            with_kind(e, IfExpr { cond = cond; then_blk = tb; has_else = f.has_else; else_blk = eb })
+        }
+        MatchExpr as m => {
+            var subj = match walk_expr(m.subject, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var arms = match walk_arms(m.arms, prog, holes, depth) { []Arm as a => a; error as er => return er }
+            with_kind(e, MatchExpr { subject = subj; arms = arms })
+        }
+        FieldAccess as fa => {
+            var recv = match walk_expr(fa.receiver, prog, holes, depth) { Expr as x => x; error as er => return er }
+            with_kind(e, FieldAccess { receiver = recv; field = fa.field })
+        }
+        Cast as ct => {
+            var x = match walk_expr(ct.expr, prog, holes, depth) { Expr as y => y; error as er => return er }
+            var tgt = match walk_type(ct.target, prog, depth) { (@TypeExpr()) as t => t; error as er => return er }
+            with_kind(e, Cast { expr = x; target = tgt })
+        }
+        StructLit as sl => {
+            var fv = match walk_exprs(sl.field_vals, prog, holes, depth) { []Expr as x => x; error as er => return er }
+            var ta = match walk_types(sl.type_args, prog, depth) { []@TypeExpr() as t => t; error as er => return er }
+            with_kind(e, StructLit { type_path = sl.type_path; type_args = ta; field_names = sl.field_names; field_vals = fv })
+        }
+        Index as ix => {
+            var recv = match walk_expr(ix.receiver, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var idx = match walk_expr(ix.index, prog, holes, depth) { Expr as x => x; error as er => return er }
+            with_kind(e, Index { receiver = recv; index = idx })
+        }
+        Interp as in => {
+            var hs = match walk_exprs(in.holes, prog, holes, depth) { []Expr as x => x; error as er => return er }
+            with_kind(e, Interp { pieces = in.pieces; holes = hs; specs = in.specs })
+        }
+        InExpr as n => {
+            var lhs = match walk_expr(n.lhs, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var elems = match walk_exprs(n.elems, prog, holes, depth) { []Expr as x => x; error as er => return er }
+            with_kind(e, InExpr { lhs = lhs; elems = elems })
+        }
+        ArrayLit as a => {
+            var els = match walk_arrayelems(a.elements, prog, holes, depth) { []ArrayElem as x => x; error as er => return er }
+            with_kind(e, ArrayLit { elements = els })
+        }
+        Lambda as lam => {
+            var lp = match rewrite_lambda_params(lam.params, prog, depth) { []LambdaParam as p => p; error as er => return er }
+            var b = match walk_stmts(lam.body, prog, holes, depth) { []@Statement() as s => s; error as er => return er }
+            with_kind(e, Lambda { params = lp; body = b })
+        }
+        Borrow as bo => {
+            var o = match walk_expr(bo.operand, prog, holes, depth) { Expr as x => x; error as er => return er }
+            with_kind(e, Borrow { operand = o })
+        }
+        Block as blk => {
+            var b = match walk_stmts(blk.body, prog, holes, depth) { []@Statement() as s => s; error as er => return er }
+            with_kind(e, Block { body = b })
+        }
+    }
+}
+
+fn walk_stmts(ss: []@Statement(), prog: Program, holes: MacroHoles, depth: u64): []@Statement() | error {
+    var out: [ss.len]@Statement() = []
+    var i: u64 = 0
+    loop {
+        if i >= ss.len { break }
+        var s = match walk_stmt(ss[i], prog, holes, depth) { (@Statement()) as x => x; error as er => return er }
+        out[i] = s
+        i++
+    }
+    out
+}
+
+fn walk_binding_type_ann(has_type: bool, type_ann: @TypeExpr(), prog: Program, depth: u64): @TypeExpr() | error {
+    if !has_type { return type_ann }
+    walk_type(type_ann, prog, depth)
+}
+
+fn walk_stmt(s: @Statement(), prog: Program, holes: MacroHoles, depth: u64): @Statement() | error {
+    match s {
+        Binding as b => {
+            var v = match walk_expr(b.value, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var ta = match walk_binding_type_ann(b.has_type, b.type_ann, prog, depth) { (@TypeExpr()) as t => t; error as er => return er }
+            Binding { kind = b.kind; target = b.target; has_type = b.has_type; type_ann = ta; is_ref = b.is_ref; value = v }
+        }
+        Assign as a => {
+            var v = match walk_expr(a.value, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var t = match walk_expr(a.target, prog, holes, depth) { Expr as x => x; error as er => return er }
+            Assign { kind = a.kind; name = a.name; op = a.op; value = v; deref = a.deref; target = t }
+        }
+        Return as r => {
+            var v = match walk_expr(r.value, prog, holes, depth) { Expr as x => x; error as er => return er }
+            var vs = match walk_exprs(r.values, prog, holes, depth) { []Expr as x => x; error as er => return er }
+            Return { has_value = r.has_value; value = v; values = vs }
+        }
+        LoopStmt as l => {
+            var init = match walk_stmts(l.init, prog, holes, depth) { []@Statement() as x => x; error as er => return er }
+            var body = match walk_stmts(l.body, prog, holes, depth) { []@Statement() as x => x; error as er => return er }
+            LoopStmt { label = l.label; init = init; body = body }
+        }
+        BreakStmt => s
+        ContinueStmt => s
+        ExprStmt as es => {
+            var x = match walk_expr(es.expr, prog, holes, depth) { Expr as y => y; error as er => return er }
+            ExprStmt { expr = x }
+        }
+        DeferStmt as d => {
+            var b = match walk_stmts(d.body, prog, holes, depth) { []@Statement() as x => x; error as er => return er }
+            DeferStmt { body = b }
+        }
+        AdoptStmt as ad => {
+            var b = match walk_stmts(ad.body, prog, holes, depth) { []@Statement() as x => x; error as er => return er }
+            AdoptStmt { name = ad.name; body = b }
+        }
+        BlockStmt as bs => {
+            var b = match walk_stmts(bs.body, prog, holes, depth) { []@Statement() as x => x; error as er => return er }
+            BlockStmt { body = b }
+        }
+        MultiBind as mb => {
+            var vs = match walk_exprs(mb.values, prog, holes, depth) { []Expr as x => x; error as er => return er }
+            var ta = match walk_binding_type_ann(mb.has_type, mb.type_ann, prog, depth) { (@TypeExpr()) as t => t; error as er => return er }
+            MultiBind { kind = mb.kind; shape = mb.shape; targets = mb.targets; has_type = mb.has_type; type_ann = ta; values = vs; line = mb.line; col = mb.col }
+        }
+        LoweringFrag => s
+        Spawn as sp => {
+            var c = match walk_expr(sp.call, prog, holes, depth) { Expr as x => x; error as er => return er }
+            Spawn { call = c }
+        }
+    }
+}
+
+fn macro_type_name(mt: MacroType): str {
+    if mt.callee.segments.len == 0 { return "" }
+    mt.callee.segments[mt.callee.segments.len - 1].name
+}
+
+fn frag_has_hole(toks: []lexer::Token): bool {
+    var i: u64 = 0
+    loop {
+        if i >= toks.len { break }
+        if toks[i].kind == lexer::TokenKind::Dollar { return true }
+        i++
+    }
+    false
+}
+
+fn expand_macro_type(mt: MacroType, prog: Program, depth: u64): @TypeExpr() | error {
+    if depth >= max_macro_depth() {
+        return error { message = "macro expansion exceeded the maximum depth in a type position" }
+    }
+    var name = macro_type_name(mt)
+    var md = match macro_decl_by_name(prog, name) { MacroDecl as m => m; null => return mt }
+    var binds = match macro_bind_params(md, mt) { MacroParamBinds as b => b; error as e => return e }
+    var frag = match select_lowering_frag(md, binds) { LoweringFrag as lf => lf; error as e => return e }
+    if frag_has_hole(frag.tokens) {
+        return error { message = teko::str::concat("macro `", teko::str::concat(name, "`: a `${}` hole in a TYPE-position `lowering` fragment is not yet supported")) }
+    }
+    var parsed = match parse_type(frag.tokens, 0 to u64) { ParsedType as pt => pt.node; error as e => return error { message = teko::str::concat("the `lowering` fragment does not parse as a type: ", e.message) } }
+    walk_type(parsed, prog, depth + 1 to u64)
+}
+
+fn walk_type(te: @TypeExpr(), prog: Program, depth: u64): @TypeExpr() | error {
+    match te {
+        MacroType as mt => expand_macro_type(mt, prog, depth)
+        NamedType as nt => {
+            var args = match walk_types(nt.args, prog, depth) { []@TypeExpr() as a => a; error as er => return er }
+            NamedType { path = nt.path; args = args }
+        }
+        SliceType as st => {
+            var el = match walk_type(st.element, prog, depth) { (@TypeExpr()) as t => t; error as er => return er }
+            SliceType { element = el }
+        }
+        SizedArrayType as sa => {
+            var el = match walk_type(sa.element, prog, depth) { (@TypeExpr()) as t => t; error as er => return er }
+            SizedArrayType { size = sa.size; element = el }
+        }
+        UnionType as ut => {
+            var ms = match walk_types(ut.members, prog, depth) { []@TypeExpr() as m => m; error as er => return er }
+            UnionType { members = ms }
+        }
+        FunctionType as ft => {
+            var ps = match walk_types(ft.params, prog, depth) { []@TypeExpr() as p => p; error as er => return er }
+            var r = match walk_type(ft.ret, prog, depth) { (@TypeExpr()) as t => t; error as er => return er }
+            FunctionType { params = ps; ret = r }
+        }
+    }
+}
+
+fn walk_types(tes: []@TypeExpr(), prog: Program, depth: u64): []@TypeExpr() | error {
+    var out: [tes.len]@TypeExpr() = []
+    var i: u64 = 0
+    loop {
+        if i >= tes.len { break }
+        var t = match walk_type(tes[i], prog, depth) { (@TypeExpr()) as x => x; error as er => return er }
+        out[i] = t
+        i++
+    }
+    out
+}

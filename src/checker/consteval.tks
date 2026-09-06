@@ -1,21 +1,8 @@
 use teko::parser
 
-/**
- * is_scalar_const_type — true iff `t` is a SCALAR const type (a primitive int/float/bool, a `byte`,
- * or a `char`) — the family the crumb-5 inliner substitutes at every use site as a `mov imm` (#594
- * crumb 5). A `str`, slice, struct, or variant is an AGGREGATE (crumb 6): it is NOT inlined here — its
- * TConstDecl passes through to lowering unchanged. Kept minimal: only the flat immediate-representable
- * primitives inline.
- *
- * @param t  the const's resolved value type
- * @return   whether `t` is a scalar (inline-at-use) const type
- * @since #594
- */
-fn is_scalar_const_type(t: Type) -> bool {
+fn is_scalar_const_type(t: @Type()): bool {
     match t {
         Slice => false
-        Str => false
-        Optional => false
         Named => false
         Variant => false
         Func => false
@@ -31,35 +18,10 @@ fn is_scalar_const_type(t: Type) -> bool {
     }
 }
 
-/**
- * ScalarConstMap — the crumb-5/8b substitution table: three PARALLEL lists over every scalar
- * module-level const (dependency-ordered, initializers collapsed). A reference is rewritten by a
- * `(name, namespace)` lookup — the SAME key `lookup_binding` resolved to (`func_ns` on the `TVar`),
- * so the inliner and the type-checker never diverge (#594 crumb 8b; the c8-reviewer's dep/project
- * collision).
- *
- * @field names  the scalar consts' names, in dependency order (dependencies first)
- * @field nss    PARALLEL to `names` — each const's declaring namespace (matched against `TVar.func_ns`)
- * @field inits  PARALLEL to `names` — each const's collapsed checked initializer
- */
 type ScalarConstMap = struct { names: []str; nss: []str; inits: []TExpr }
 
-/**
- * scalar_const_init — the collapsed initializer for the scalar const named `name` declared in
- * namespace `ns`, or null when no scalar module-level const matches BOTH (a local, a function, an
- * aggregate const, or a same-name const in a DIFFERENT module). Keying on `(name, ns)` makes the
- * inliner agree with `lookup_binding`'s namespace-aware, tail-first resolution: a project const
- * shadows a dep const of the same bare name (#594 crumb 8b). A linear scan over the small const set
- * the program declares.
- *
- * @param map   the scalar substitution table (parallel names/nss/inits)
- * @param name  the referenced name
- * @param ns    the namespace the type-checker resolved the reference to (`TVar.func_ns`)
- * @return      the matching const's collapsed initializer, or null
- * @since #594
- */
-fn scalar_const_init(map: ScalarConstMap, name: str, ns: str) -> TExpr | null {
-    mut i: u64 = 0
+fn scalar_const_init(map: ScalarConstMap, name: str, ns: str): TExpr | null {
+    var i: u64 = 0
     loop {
         if i >= map.names.len { break }
         if map.names[i] == name && map.nss[i] == ns { return map.inits[i] }
@@ -68,21 +30,26 @@ fn scalar_const_init(map: ScalarConstMap, name: str, ns: str) -> TExpr | null {
     null
 }
 
-/**
- * collect_module_consts — every module-level TConstDecl on the program's item surface, in
- * declaration order (the inliner's dependency-graph and drop set) (#594 crumb 5).
- *
- * @param items  the typed program's top-level items
- * @return       the module-level constants, in declaration order
- * @since #594
- */
-fn collect_module_consts(items: []TItem) -> []TConstDecl {
-    mut out: []TConstDecl = teko::list::empty()
-    mut i: u64 = 0
+fn count_const_decls(items: []@TItem()): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        match items[i] { TConstDecl => n = n + 1; _ => { } }
+        i++
+    }
+    n
+}
+
+fn collect_module_consts(items: []@TItem()): []TConstDecl {
+    var n = count_const_decls(items)
+    var out: [n]TConstDecl = []
+    var k: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= items.len { break }
         match items[i] {
-            TConstDecl as cd => out = teko::list::push(out, cd)
+            TConstDecl as cd => { out[k] = cd; k = k + 1 }
             _ => { }
         }
         i++
@@ -90,95 +57,361 @@ fn collect_module_consts(items: []TItem) -> []TConstDecl {
     out
 }
 
-/**
- * build_scalar_map — build the crumb-5 substitution table from the dependency-ordered consts (#594
- * crumb 5). Walked in dependency order so a scalar const's initializer is collapsed against the
- * ALREADY-collapsed initializers of the consts it references before it is itself added — nested
- * references (`const B = A + 1; const A = 1`) fully collapse. An aggregate const contributes no
- * entry (it is not inlined at crumb 5).
- *
- * @param ordered  the module-level consts in dependency order (from `const_dep_order`)
- * @return         the scalar consts' names + collapsed initializers
- * @since #594
- */
-fn build_scalar_map(ordered: []TConstDecl) -> ScalarConstMap {
-    mut smap = ScalarConstMap { names = teko::list::empty(); nss = teko::list::empty(); inits = teko::list::empty() }
-    mut i: u64 = 0
-    loop {
-        if i >= ordered.len { break }
-        let cd = ordered[i]
-        if is_scalar_const_type(cd.ty) {
-            let collapsed = inline_rw_expr(cd.init, smap)
-            smap = ScalarConstMap { names = teko::list::push(smap.names, cd.name); nss = teko::list::push(smap.nss, cd.namespace); inits = teko::list::push(smap.inits, collapsed) }
-        }
-        i++
-    }
-    smap
+pub type ConstQName = struct {
+    namespace: str
+    name: str
 }
 
-/**
- * inline_rw_fspec — rewrite an interpolation-hole format spec, substituting scalar-const references
- * inside a dynamic (`:[…]`) spec's argument expressions; a none/static spec is returned unchanged
- * (#594 crumb 5).
- *
- * @param sp   the format spec to rewrite
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the spec with scalar-const references substituted in its dynamic args
- * @since #594
- */
-fn inline_rw_fspec(sp: TFSpec, map: ScalarConstMap) -> TFSpec {
-    match sp.kind {
-        TFSpecDynamic as fd => {
-            mut args: []TExpr = teko::list::empty()
-            mut k: u64 = 0
-            loop {
-                if k >= fd.args.len { break }
-                args = teko::list::push(args, inline_rw_expr(fd.args[k], map))
-                k++
-            }
-            TFSpec { kind = TFSpecDynamic { args = args } }
-        }
-        _ => sp
+fn tg_axis_os_vocab(): []str {
+    ["linux", "macos", "windows"]
+}
+
+fn tg_axis_arch_vocab(): []str {
+    ["x86_64", "arm64"]
+}
+
+fn tg_atoms_are_target(p: parser::Pred): bool {
+    match p.kind {
+        parser::PTrue => true
+        parser::PEq as e => e.axis == "os" || e.axis == "arch"
+        parser::PFlag => false
+        parser::PNot as n => tg_atoms_are_target(n.inner)
+        parser::PAnd as a => tg_atoms_are_target(a.left) && tg_atoms_are_target(a.right)
+        parser::POr as o => tg_atoms_are_target(o.left) && tg_atoms_are_target(o.right)
     }
 }
 
-/**
- * inline_rw_exprs — rewrite every expression in `xs`, substituting scalar-const references, in order
- * (#594 crumb 5). Shared by the call/array/struct/in arms of `inline_rw_expr`.
- *
- * @param xs   the expressions to rewrite
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the rewritten expressions, in order
- * @since #594
- */
-fn inline_rw_exprs(xs: []TExpr, map: ScalarConstMap) -> []TExpr {
-    mut out: []TExpr = teko::list::empty()
-    mut i: u64 = 0
+pub fn pred_is_target_guard(p: parser::Pred): bool {
+    match p.kind {
+        parser::PTrue => false
+        _ => tg_atoms_are_target(p)
+    }
+}
+
+fn tg_eval(p: parser::Pred, os: str, arch: str): bool {
+    match p.kind {
+        parser::PTrue => true
+        parser::PEq as e => if e.axis == "os" { os == e.value } else if e.axis == "arch" { arch == e.value } else { false }
+        parser::PFlag => false
+        parser::PNot as n => !tg_eval(n.inner, os, arch)
+        parser::PAnd as a => tg_eval(a.left, os, arch) && tg_eval(a.right, os, arch)
+        parser::POr as o => tg_eval(o.left, os, arch) || tg_eval(o.right, os, arch)
+    }
+}
+
+pub fn preds_target_disjoint(a: parser::Pred, b: parser::Pred): bool {
+    var oss = tg_axis_os_vocab()
+    var ars = tg_axis_arch_vocab()
+    var i: u64 = 0
     loop {
-        if i >= xs.len { break }
-        out = teko::list::push(out, inline_rw_expr(xs[i], map))
+        if i >= oss.len { break }
+        var j: u64 = 0
+        loop {
+            if j >= ars.len { break }
+            if tg_eval(a, oss[i], ars[j]) && tg_eval(b, oss[i], ars[j]) { return false }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn count_family_arms(consts: []TConstDecl, ns: str, name: str): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        if consts[i].namespace == ns && consts[i].name == name { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+fn cond_family_arms(consts: []TConstDecl, ns: str, name: str): []TConstDecl {
+    var n = count_family_arms(consts, ns, name)
+    var out: [n]TConstDecl = []
+    var k: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        if consts[i].namespace == ns && consts[i].name == name { out[k] = consts[i]; k = k + 1 }
+        i = i + 1
+    }
+    out
+}
+
+fn arms_all_target_guards(arms: []TConstDecl): bool {
+    var i: u64 = 0
+    loop {
+        if i >= arms.len { break }
+        if !pred_is_target_guard(arms[i].guard) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn arms_pairwise_disjoint(arms: []TConstDecl): bool {
+    var a: u64 = 0
+    loop {
+        if a >= arms.len { break }
+        var b = a + 1
+        loop {
+            if b >= arms.len { break }
+            if !preds_target_disjoint(arms[a].guard, arms[b].guard) { return false }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    true
+}
+
+fn is_target_conditional_family(consts: []TConstDecl, ci: TConstDecl): bool {
+    var arms = cond_family_arms(consts, ci.namespace, ci.name)
+    if arms.len < 2 { return false }
+    if !arms_all_target_guards(arms) { return false }
+    arms_pairwise_disjoint(arms)
+}
+
+pub fn is_cond_const(ns: str, name: str, set: []ConstQName): bool {
+    var i: u64 = 0
+    loop {
+        if i >= set.len { break }
+        if set[i].namespace == ns && set[i].name == name { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn cond_const_names_prefix(scratch: []ConstQName, k: u64): []ConstQName {
+    var out: [k]ConstQName = []
+    var i: u64 = 0
+    loop {
+        if i >= k { break }
+        out[i] = scratch[i]
         i++
     }
     out
 }
 
-/**
- * inline_rw_expr — rewrite one typed expression, replacing every `TVar` that names a scalar
- * module-level const with a clone of that const's collapsed checked initializer, recursing TOTALLY
- * into every child (#594 crumb 5). A leaf that is not a const reference (and every non-`TVar` leaf)
- * is returned unchanged; the substituted initializer is already fully collapsed, so it is spliced in
- * without a further walk. TOTAL over every `TExprKind` — a missed case would silently leave a const
- * reference for lowering to trip on.
- *
- * @param e    the typed expression to rewrite
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the expression with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_expr(e: TExpr, map: ScalarConstMap) -> TExpr {
+pub fn cond_const_names(items: []@TItem()): []ConstQName {
+    var consts = collect_module_consts(items)
+    var scratch: [consts.len]ConstQName = []
+    var k: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        var ci = consts[i]
+        if is_target_conditional_family(consts, ci) && !is_cond_const(ci.namespace, ci.name, scratch) {
+            scratch[k] = ConstQName { namespace = ci.namespace; name = ci.name }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    cond_const_names_prefix(scratch, k)
+}
+
+fn count_kept_consts(consts: []TConstDecl, cond: []ConstQName): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        if !is_cond_const(consts[i].namespace, consts[i].name, cond) { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+fn drop_cond_consts(consts: []TConstDecl, cond: []ConstQName): []TConstDecl {
+    var n = count_kept_consts(consts, cond)
+    var out: [n]TConstDecl = []
+    var k: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= consts.len { break }
+        if !is_cond_const(consts[i].namespace, consts[i].name, cond) { out[k] = consts[i]; k = k + 1 }
+        i = i + 1
+    }
+    out
+}
+
+fn count_scalar_consts(ordered: []TConstDecl): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= ordered.len { break }
+        if is_scalar_const_type(ordered[i].ty) { n = n + 1 }
+        i++
+    }
+    n
+}
+
+fn build_scalar_map(ordered: []TConstDecl): ScalarConstMap {
+    var m = count_scalar_consts(ordered)
+    var names: [m]str = []
+    var nss: [m]str = []
+    var inits: [m]TExpr = []
+    var k: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= ordered.len { break }
+        var cd = ordered[i]
+        if is_scalar_const_type(cd.ty) {
+            var collapsed = inline_rw_expr(cd.init, ScalarConstMap { names = names; nss = nss; inits = inits })
+            names[k] = cd.name
+            nss[k] = cd.namespace
+            inits[k] = collapsed
+            k = k + 1
+        }
+        i++
+    }
+    ScalarConstMap { names = names; nss = nss; inits = inits }
+}
+
+fn inline_rw_fspec(sp: TFSpec, map: ScalarConstMap): TFSpec {
+    match sp.kind {
+        TFSpecDynamic as fd => TFSpec { kind = TFSpecDynamic { args = inline_rw_exprs(fd.args, map) } }
+        _ => sp
+    }
+}
+
+fn scalar_ref_in_exprs(xs: []TExpr, map: ScalarConstMap): bool {
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if scalar_ref_in_expr(xs[i], map) { return true }
+        i++
+    }
+    false
+}
+
+fn scalar_ref_in_fspecs(xs: []TFSpec, map: ScalarConstMap): bool {
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        match xs[i].kind {
+            TFSpecDynamic as fd => if scalar_ref_in_exprs(fd.args, map) { return true }
+            _ => { }
+        }
+        i++
+    }
+    false
+}
+
+fn scalar_ref_in_var(v: TVar, map: ScalarConstMap): bool {
+    if v.is_func { return false }
+    match scalar_const_init(map, v.name, v.func_ns) { TExpr => true; null => false }
+}
+
+fn scalar_ref_in_compare(c: TCompare, map: ScalarConstMap): bool {
+    if scalar_ref_in_expr(c.first, map) { return true }
+    var i: u64 = 0
+    loop {
+        if i >= c.rest.len { break }
+        if scalar_ref_in_expr(c.rest[i].operand, map) { return true }
+        i++
+    }
+    false
+}
+
+fn scalar_ref_in_arm(arm: TArm, map: ScalarConstMap): bool {
+    if arm.has_when && scalar_ref_in_expr(arm.guard, map) { return true }
+    scalar_ref_in_block(arm.body, map)
+}
+
+fn scalar_ref_in_match(m: TMatchExpr, map: ScalarConstMap): bool {
+    if scalar_ref_in_expr(m.subject, map) { return true }
+    var i: u64 = 0
+    loop {
+        if i >= m.arms.len { break }
+        if scalar_ref_in_arm(m.arms[i], map) { return true }
+        i++
+    }
+    false
+}
+
+fn scalar_ref_in_array(a: TArrayLit, map: ScalarConstMap): bool {
+    var i: u64 = 0
+    loop {
+        if i >= a.elements.len { break }
+        if scalar_ref_in_expr(a.elements[i].expr, map) { return true }
+        i++
+    }
+    false
+}
+
+fn scalar_ref_in_expr(e: TExpr, map: ScalarConstMap): bool {
+    match e.kind {
+        TVar as v => scalar_ref_in_var(v, map)
+        TBinary as b => scalar_ref_in_expr(b.left, map) || scalar_ref_in_expr(b.right, map)
+        TUnary as u => scalar_ref_in_expr(u.operand, map)
+        TCompare as c => scalar_ref_in_compare(c, map)
+        TCall as cl => scalar_ref_in_exprs(cl.args, map)
+        TIfExpr as f => scalar_ref_in_expr(f.cond, map) || scalar_ref_in_block(f.then_blk, map) || scalar_ref_in_block(f.else_blk, map)
+        TMatchExpr as m => scalar_ref_in_match(m, map)
+        TCast as c => scalar_ref_in_expr(c.expr, map)
+        TFieldAccess as fa => scalar_ref_in_expr(fa.receiver, map)
+        TStructInit as si => scalar_ref_in_exprs(si.field_vals, map)
+        TIndex as ix => scalar_ref_in_expr(ix.receiver, map) || scalar_ref_in_expr(ix.index, map)
+        TInterp as in => scalar_ref_in_exprs(in.holes, map) || scalar_ref_in_fspecs(in.specs, map)
+        TInExpr as n => scalar_ref_in_expr(n.lhs, map) || scalar_ref_in_exprs(n.elems, map)
+        TArrayLit as a => scalar_ref_in_array(a, map)
+        TSliceOfLen as s => scalar_ref_in_expr(s.size, map)
+        TLambda as lam => scalar_ref_in_block(lam.body, map)
+        TBorrow as b => scalar_ref_in_expr(b.operand, map)
+        TBlockExpr as b => scalar_ref_in_block(b.body, map)
+        _ => false
+    }
+}
+
+fn scalar_ref_in_assign(a: TAssign, map: ScalarConstMap): bool {
+    if scalar_ref_in_expr(a.value, map) { return true }
+    if parser::assign_has_target(a.kind) && scalar_ref_in_expr(a.target, map) { return true }
+    false
+}
+
+fn scalar_ref_in_stmt(st: @TStatement(), map: ScalarConstMap): bool {
+    match st {
+        TBinding as b => scalar_ref_in_expr(b.value, map)
+        TAssign as a => scalar_ref_in_assign(a, map)
+        TReturn as r => r.has_value && scalar_ref_in_expr(r.value, map)
+        TLoopStmt as l => scalar_ref_in_block(l.init, map) || scalar_ref_in_block(l.body, map)
+        TBreakStmt => false
+        TContinueStmt => false
+        TExprStmt as es => scalar_ref_in_expr(es.expr, map)
+        TDeferStmt as d => scalar_ref_in_block(d.body, map)
+        TAdoptStmt as a => scalar_ref_in_block(a.body, map)
+        TBlockStmt as b => scalar_ref_in_block(b.body, map)
+        TSpawn as sp => scalar_ref_in_expr(sp.call, map)
+    }
+}
+
+fn scalar_ref_in_block(stmts: []@TStatement(), map: ScalarConstMap): bool {
+    var i: u64 = 0
+    loop {
+        if i >= stmts.len { break }
+        if scalar_ref_in_stmt(stmts[i], map) { return true }
+        i++
+    }
+    false
+}
+
+fn inline_rw_exprs(xs: []TExpr, map: ScalarConstMap): []TExpr {
+    var n = xs.len
+    var out: [n]TExpr = []
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        out[i] = inline_rw_expr(xs[i], map)
+        i++
+    }
+    out
+}
+
+fn inline_rw_expr(e: TExpr, map: ScalarConstMap): TExpr {
     match e.kind {
         TNumber => e
         TStrLit => e
+        TByteStrLit => e
         TByteLit => e
         TCharLit => e
         TBoolLit => e
@@ -188,39 +421,25 @@ fn inline_rw_expr(e: TExpr, map: ScalarConstMap) -> TExpr {
         TBinary as b => TExpr { kind = TBinary { op = b.op; left = inline_rw_expr(b.left, map); right = inline_rw_expr(b.right, map) }; type = e.type; line = e.line; col = e.col }
         TUnary as u => TExpr { kind = TUnary { op = u.op; operand = inline_rw_expr(u.operand, map) }; type = e.type; line = e.line; col = e.col }
         TCompare as c => inline_rw_compare(c, e, map)
-        TCall as cl => TExpr { kind = TCall { callee = cl.callee; args = inline_rw_exprs(cl.args, map); call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = e.type; line = e.line; col = e.col }
+        TCall as cl => TExpr { kind = TCall { overload_suffix = cl.overload_suffix; callee = cl.callee; args = inline_rw_exprs(cl.args, map); call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot; type_args = cl.type_args; ret_extra = cl.ret_extra }; type = e.type; line = e.line; col = e.col }
         TIfExpr as f => TExpr { kind = TIfExpr { cond = inline_rw_expr(f.cond, map); then_blk = inline_rw_block(f.then_blk, map); has_else = f.has_else; else_blk = inline_rw_block(f.else_blk, map) }; type = e.type; line = e.line; col = e.col }
         TMatchExpr as m => inline_rw_match(m, e, map)
         TCast as c => TExpr { kind = TCast { expr = inline_rw_expr(c.expr, map) }; type = e.type; line = e.line; col = e.col }
         TFieldAccess as fa => TExpr { kind = TFieldAccess { receiver = inline_rw_expr(fa.receiver, map); field = fa.field }; type = e.type; line = e.line; col = e.col }
-        TSafeFieldAccess as sfa => TExpr { kind = TSafeFieldAccess { receiver = inline_rw_expr(sfa.receiver, map); field = sfa.field }; type = e.type; line = e.line; col = e.col }
-        TCoalesce as co => TExpr { kind = TCoalesce { left = inline_rw_expr(co.left, map); right = inline_rw_expr(co.right, map) }; type = e.type; line = e.line; col = e.col }
         TStructInit as si => TExpr { kind = TStructInit { field_names = si.field_names; field_vals = inline_rw_exprs(si.field_vals, map) }; type = e.type; line = e.line; col = e.col }
         TIndex as ix => TExpr { kind = TIndex { receiver = inline_rw_expr(ix.receiver, map); index = inline_rw_expr(ix.index, map) }; type = e.type; line = e.line; col = e.col }
         TInterp as in => inline_rw_interp(in, e, map)
         TInExpr as n => TExpr { kind = TInExpr { lhs = inline_rw_expr(n.lhs, map); elems = inline_rw_exprs(n.elems, map) }; type = e.type; line = e.line; col = e.col }
         TArrayLit as a => inline_rw_array(a, e, map)
+        TSliceOfLen as s => TExpr { kind = TSliceOfLen { size = inline_rw_expr(s.size, map); element = s.element }; type = e.type; line = e.line; col = e.col }
+        TZeroOf => e
         TLambda as lam => TExpr { kind = TLambda { params = lam.params; body = inline_rw_block(lam.body, map); captures = lam.captures; ret = lam.ret; lift_id = lam.lift_id }; type = e.type; line = e.line; col = e.col }
         TBorrow as b => TExpr { kind = TBorrow { operand = inline_rw_expr(b.operand, map) }; type = e.type; line = e.line; col = e.col }
+        TBlockExpr as b => TExpr { kind = TBlockExpr { body = inline_rw_block(b.body, map) }; type = e.type; line = e.line; col = e.col }
     }
 }
 
-/**
- * inline_rw_var — rewrite a reference `TVar`: replaced by a clone of the collapsed initializer of the
- * scalar module-level const whose `(name, namespace)` equals `(v.name, v.func_ns)`; any other `TVar`
- * (a local, a param, a fn-value, a different-module same-name const) passes through unchanged (#594
- * crumb 5/8b). A function-value reference (`is_func`) is never a const and is left intact. Keying on
- * `v.func_ns` — the namespace the type-checker resolved the reference to — makes the substitution
- * identical to `lookup_binding`'s by construction, so a project const shadows a dep const of the same
- * bare name.
- *
- * @param v    the reference node
- * @param e    the original expression (returned when `v` is not a matching scalar const)
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the substituted initializer (widened to the reference's type when needed), or `e` unchanged
- * @since #594
- */
-fn inline_rw_var(v: TVar, e: TExpr, map: ScalarConstMap) -> TExpr {
+fn inline_rw_var(v: TVar, e: TExpr, map: ScalarConstMap): TExpr {
     if v.is_func { return e }
     match scalar_const_init(map, v.name, v.func_ns) {
         TExpr as sub => widen_inlined_const(e, sub)
@@ -228,236 +447,114 @@ fn inline_rw_var(v: TVar, e: TExpr, map: ScalarConstMap) -> TExpr {
     }
 }
 
-/**
- * widen_inlined_const — reconcile the type of a const's collapsed initializer `sub` with the type the
- * type-checker resolved for the reference site `e` before splicing it in (#630). A VARIANT-typed const
- * (`const R: SomeVariant = SomeMember { }`) is checked with its initializer typed as the CASE MEMBER
- * (`SomeMember`), not the declared variant — so a bare splice would drop the variant type of the
- * reference and leave a member-typed node behind. In a match-subject position the C backend then
- * re-derives the case tags from the member struct (which has neither a `tag` nor the variant's case
- * constants) and the generated C fails to compile; in an argument position the member is only saved by
- * the call site's own `emit_as` widening. Both are fixed the same way: when the reference type differs
- * from the initializer type, wrap the member construction in a widening node (`TCast` to the reference
- * type) whose `.type` is the variant (so tag derivation is correct everywhere) while the member type
- * survives on the wrapped child (so codegen's `emit_as`/`emit_variant_wrap` still identifies the case and
- * emits `.tag = TK_TAG_<Variant>_<Member>`). A same-typed initializer (every scalar/struct/array const)
- * is spliced unchanged, so the pass is a no-op for the self-host (whose consts are never a match subject),
- * preserving the C-emission fixpoint.
- *
- * @param e    the reference-site expression, carrying the type the checker resolved for the const use
- * @param sub  the const's collapsed, checked initializer (the case-member construction for a variant const)
- * @return     `sub` unchanged when its type already matches, else `sub` wrapped in a widening node typed as `e.type`
- * @since #630
- */
-fn widen_inlined_const(e: TExpr, sub: TExpr) -> TExpr {
+fn widen_inlined_const(e: TExpr, sub: TExpr): TExpr {
     if type_eq(e.type, sub.type) { return sub }
     TExpr { kind = TCast { expr = sub }; type = e.type; line = e.line; col = e.col }
 }
 
-/**
- * inline_rw_compare — rewrite a comparison chain, substituting scalar-const references in its first
- * operand and every subsequent term (#594 crumb 5).
- *
- * @param c    the typed comparison expression
- * @param e    the enclosing typed expression (for its type/position)
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the comparison with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_compare(c: TCompare, e: TExpr, map: ScalarConstMap) -> TExpr {
-    mut terms: []TCmpTerm = teko::list::empty()
-    mut i: u64 = 0
+fn inline_rw_compare(c: TCompare, e: TExpr, map: ScalarConstMap): TExpr {
+    var n = c.rest.len
+    var terms: [n]TCmpTerm = []
+    var i: u64 = 0
     loop {
-        if i >= c.rest.len { break }
-        terms = teko::list::push(terms, TCmpTerm { op = c.rest[i].op; operand = inline_rw_expr(c.rest[i].operand, map) })
+        if i >= n { break }
+        terms[i] = TCmpTerm { op = c.rest[i].op; operand = inline_rw_expr(c.rest[i].operand, map) }
         i++
     }
     TExpr { kind = TCompare { first = inline_rw_expr(c.first, map); rest = terms }; type = e.type; line = e.line; col = e.col }
 }
 
-/**
- * inline_rw_match — rewrite a match expression, substituting scalar-const references in its subject
- * and every arm's guard + body (#594 crumb 5).
- *
- * @param m    the typed match expression
- * @param e    the enclosing typed expression (for its type/position)
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the match with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_match(m: TMatchExpr, e: TExpr, map: ScalarConstMap) -> TExpr {
-    mut arms: []TArm = teko::list::empty()
-    mut i: u64 = 0
+fn inline_rw_match(m: TMatchExpr, e: TExpr, map: ScalarConstMap): TExpr {
+    var n = m.arms.len
+    var arms: [n]TArm = []
+    var i: u64 = 0
     loop {
-        if i >= m.arms.len { break }
-        arms = teko::list::push(arms, inline_rw_arm(m.arms[i], map))
+        if i >= n { break }
+        arms[i] = inline_rw_arm(m.arms[i], map)
         i++
     }
     TExpr { kind = TMatchExpr { subject = inline_rw_expr(m.subject, map); arms = arms }; type = e.type; line = e.line; col = e.col }
 }
 
-/**
- * inline_rw_arm — rewrite one match arm, substituting scalar-const references in its guard (when
- * present) and its body block; the pattern is syntactic and carries no const reference (#594 crumb
- * 5).
- *
- * @param arm  the typed match arm
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the arm with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_arm(arm: TArm, map: ScalarConstMap) -> TArm {
-    let guard = if arm.has_when { inline_rw_expr(arm.guard, map) } else { arm.guard }
+fn inline_rw_arm(arm: TArm, map: ScalarConstMap): TArm {
+    var guard = if arm.has_when { inline_rw_expr(arm.guard, map) } else { arm.guard }
     TArm { pattern = arm.pattern; has_when = arm.has_when; guard = guard; body = inline_rw_block(arm.body, map) }
 }
 
-/**
- * inline_rw_interp — rewrite a string interpolation, substituting scalar-const references in every
- * hole expression and every dynamic format spec (#594 crumb 5).
- *
- * @param in   the typed interpolation expression
- * @param e    the enclosing typed expression (for its type/position)
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the interpolation with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_interp(in: TInterp, e: TExpr, map: ScalarConstMap) -> TExpr {
-    mut holes: []TExpr = teko::list::empty()
-    mut specs: []TFSpec = teko::list::empty()
-    mut i: u64 = 0
+fn inline_rw_fspecs(xs: []TFSpec, map: ScalarConstMap): []TFSpec {
+    var n = xs.len
+    var out: [n]TFSpec = []
+    var i: u64 = 0
     loop {
-        if i >= in.holes.len { break }
-        holes = teko::list::push(holes, inline_rw_expr(in.holes[i], map))
-        if i < in.specs.len { specs = teko::list::push(specs, inline_rw_fspec(in.specs[i], map)) }
-        i++
-    }
-    TExpr { kind = TInterp { pieces = in.pieces; holes = holes; specs = specs }; type = e.type; line = e.line; col = e.col }
-}
-
-/**
- * inline_rw_array — rewrite an array/slice literal, substituting scalar-const references in every
- * element (a spread element's sub-slice expression included) (#594 crumb 5).
- *
- * @param a    the typed array literal
- * @param e    the enclosing typed expression (for its type/position)
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the array literal with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_array(a: TArrayLit, e: TExpr, map: ScalarConstMap) -> TExpr {
-    mut elems: []TArrayElem = teko::list::empty()
-    mut i: u64 = 0
-    loop {
-        if i >= a.elements.len { break }
-        elems = teko::list::push(elems, TArrayElem { is_spread = a.elements[i].is_spread; expr = inline_rw_expr(a.elements[i].expr, map) })
-        i++
-    }
-    TExpr { kind = TArrayLit { elements = elems }; type = e.type; line = e.line; col = e.col }
-}
-
-/**
- * inline_rw_block — rewrite a statement block, substituting scalar-const references in each statement
- * (#594 crumb 5).
- *
- * @param stmts  the typed statement block
- * @param map    the scalar substitution table (parallel names/nss/inits)
- * @return       the block with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_block(stmts: []TStatement, map: ScalarConstMap) -> []TStatement {
-    mut out: []TStatement = teko::list::empty()
-    mut i: u64 = 0
-    loop {
-        if i >= stmts.len { break }
-        out = teko::list::push(out, inline_rw_stmt(stmts[i], map))
+        if i >= n { break }
+        out[i] = inline_rw_fspec(xs[i], map)
         i++
     }
     out
 }
 
-/**
- * inline_rw_stmt — rewrite one typed statement, substituting scalar-const references in every
- * expression and nested block it carries (#594 crumb 5). TOTAL over every `TStatement` case; a
- * value-less `return`/`break`/`continue` is returned unchanged.
- *
- * @param st   the typed statement to rewrite
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the statement with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_stmt(st: TStatement, map: ScalarConstMap) -> TStatement {
+fn inline_rw_interp(in: TInterp, e: TExpr, map: ScalarConstMap): TExpr {
+    TExpr { kind = TInterp { pieces = in.pieces; holes = inline_rw_exprs(in.holes, map); specs = inline_rw_fspecs(in.specs, map) }; type = e.type; line = e.line; col = e.col }
+}
+
+fn inline_rw_array(a: TArrayLit, e: TExpr, map: ScalarConstMap): TExpr {
+    var n = a.elements.len
+    var elems: [n]TArrayElem = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        elems[i] = TArrayElem { is_spread = a.elements[i].is_spread; expr = inline_rw_expr(a.elements[i].expr, map) }
+        i++
+    }
+    TExpr { kind = TArrayLit { elements = elems }; type = e.type; line = e.line; col = e.col }
+}
+
+fn inline_rw_block(stmts: []@TStatement(), map: ScalarConstMap): []@TStatement() {
+    var n = stmts.len
+    var out: [n]@TStatement() = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = inline_rw_stmt(stmts[i], map)
+        i++
+    }
+    out
+}
+
+fn inline_rw_stmt(st: @TStatement(), map: ScalarConstMap): @TStatement() {
     match st {
         TBinding as b => TBinding { kind = b.kind; target = b.target; bound = b.bound; value = inline_rw_expr(b.value, map) }
         TAssign as a => inline_rw_assign(a, map)
-        TReturn as r => if r.has_value { TReturn { has_value = true; value = inline_rw_expr(r.value, map) } } else { st }
+        TReturn as r => if r.has_value { TReturn { has_value = true; value = inline_rw_expr(r.value, map); values = [] } } else { st }
         TLoopStmt as l => TLoopStmt { label = l.label; init = inline_rw_block(l.init, map); body = inline_rw_block(l.body, map) }
         TBreakStmt => st
         TContinueStmt => st
         TExprStmt as es => TExprStmt { expr = inline_rw_expr(es.expr, map) }
         TDeferStmt as d => TDeferStmt { body = inline_rw_block(d.body, map) }
         TAdoptStmt as a => TAdoptStmt { name = a.name; body = inline_rw_block(a.body, map) }
+        TBlockStmt as b => TBlockStmt { body = inline_rw_block(b.body, map) }
+        TSpawn as sp => TSpawn { call = inline_rw_expr(sp.call, map); id = sp.id }
     }
 }
 
-/**
- * inline_rw_assign — rewrite an assignment, substituting scalar-const references in its value and, for
- * a field target, in the typed LHS field-access expression (#594 crumb 5). A simple/ref-deref target
- * carries no rewritable expression, so its sentinel `target` is preserved unchanged.
- *
- * @param a    the typed assignment
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the assignment with scalar-const references substituted
- * @since #594
- */
-fn inline_rw_assign(a: TAssign, map: ScalarConstMap) -> TStatement {
-    let value = inline_rw_expr(a.value, map)
+fn inline_rw_assign(a: TAssign, map: ScalarConstMap): @TStatement() {
+    var value = inline_rw_expr(a.value, map)
     if parser::assign_has_target(a.kind) {
         return TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = value; deref = a.deref; target = inline_rw_expr(a.target, map) }
     }
     TAssign { kind = a.kind; name = a.name; op = a.op; bound = a.bound; value = value; deref = a.deref; target = a.target }
 }
 
-/**
- * rewrite_function — rewrite a top-level function's body, substituting every scalar module-level const
- * reference with a clone of the const's collapsed checked initializer (#594 crumb 5). Signature,
- * visibility, and metadata are preserved; only the body is walked.
- *
- * @param f    the typed function
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     the function with scalar-const references substituted in its body
- * @since #594
- */
-fn rewrite_function(f: TFunction, map: ScalarConstMap) -> TFunction {
-    TFunction { name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = f.return_type; body = inline_rw_block(f.body, map); vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; has_arena_size = f.has_arena_size; arena_size = f.arena_size }
+fn rewrite_function(f: TFunction, map: ScalarConstMap): TFunction {
+    if !scalar_ref_in_block(f.body, map) { return f }
+    TFunction { overload_suffix = f.overload_suffix; name = f.name; type_params = f.type_params; type_constraints = f.type_constraints; params = f.params; return_type = f.return_type; body = inline_rw_block(f.body, map); vis = f.vis; has_doc = f.has_doc; doc = f.doc; namespace = f.namespace; file = f.file; line = f.line; col = f.col; is_test = f.is_test; is_extern = f.is_extern; c_symbol = f.c_symbol; from_lib = f.from_lib; ret_extra = f.ret_extra; guard = f.guard }
 }
 
-/**
- * rewrite_const_init — a copy of the aggregate const declaration `cd` with every scalar-const
- * reference INSIDE its initializer substituted by that scalar's collapsed value (#594). A surviving
- * aggregate const (crumb 6 materializes it in rodata, or the C backend inlines it) can reference a
- * scalar const in a field/element (`const M: Point = Point { x = ORIGIN_X }`); inlining the scalar
- * here means the aggregate's initializer is a pure aggregate-of-literals both backends can serialize.
- *
- * @param cd   the aggregate const declaration
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     `cd` with scalar-const references substituted in its initializer
- * @since #594
- */
-fn rewrite_const_init(cd: TConstDecl, map: ScalarConstMap) -> TConstDecl {
-    TConstDecl { name = cd.name; namespace = cd.namespace; ty = cd.ty; init = inline_rw_expr(cd.init, map); vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col }
+fn rewrite_const_init(cd: TConstDecl, map: ScalarConstMap): TConstDecl {
+    TConstDecl { name = cd.name; namespace = cd.namespace; ty = cd.ty; init = inline_rw_expr(cd.init, map); vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col; guard = cd.guard }
 }
 
-/**
- * const_is_exported — true iff a const's visibility is `pub` or `exp`, the surface a consuming module
- * may reach cross-module (#594 crumb 8). An exported SCALAR const survives `inline_consts` (rewritten,
- * a lowering no-op) so its typed initializer rides the owning module's `.tkb` for the consumer to
- * inline; a `private` scalar is dropped, having been inlined at every same-module use.
- *
- * @param cd  the typed const declaration
- * @return    whether the const is part of the module's public (cross-module) surface
- * @since #594
- */
-fn const_is_exported(cd: TConstDecl) -> bool {
+fn const_is_exported(cd: TConstDecl): bool {
     match cd.vis {
         parser::Visibility::Private => false
         parser::Visibility::Pub => true
@@ -465,100 +562,50 @@ fn const_is_exported(cd: TConstDecl) -> bool {
     }
 }
 
-/**
- * inline_scalar_const_item — fold a SCALAR const declaration: a `private` scalar is DROPPED (it emits
- * no code — inlined at every same-module use), while a `pub`/`exp` scalar SURVIVES (its initializer's
- * nested scalar references collapsed by `rewrite_const_init`) so the const's value rides the module's
- * `.tkb` and a consuming module inlines it identically (#594 crumb 8). A surviving scalar is a
- * lowering/codegen no-op in every backend, exactly like an aggregate const's declaration.
- *
- * @param out  the rewritten items accumulated so far
- * @param cd   the scalar const declaration to fold
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     `out` unchanged (private) or grown with the collapsed exported scalar const
- * @since #594
- */
-fn inline_scalar_const_item(out: []TItem, cd: TConstDecl, map: ScalarConstMap) -> []TItem {
-    if const_is_exported(cd) { return teko::list::push(out, rewrite_const_init(cd, map)) }
-    out
+fn inline_scalar_const_value(cd: TConstDecl, map: ScalarConstMap): @TItem() | null {
+    if const_is_exported(cd) { return rewrite_const_init(cd, map) }
+    null
 }
 
-/**
- * inline_place_item — fold one program item into the rewritten item list: a function's body is walked
- * for scalar-const references; a loose statement is walked; a `private` SCALAR const declaration is
- * DROPPED (it emits no code — no fn body, no arena) while a `pub`/`exp` scalar SURVIVES for `.tkb`
- * export (crumb 8); an aggregate const declaration survives (its initializer's scalar references
- * substituted, `rewrite_const_init`) for crumb-6 rodata materialization; every type/use declaration
- * passes through unchanged (#594 crumb 5).
- *
- * @param out  the rewritten items accumulated so far
- * @param it   the program item to fold
- * @param map  the scalar substitution table (parallel names/nss/inits)
- * @return     `out` grown with `it`'s rewritten form (or unchanged when `it` is a dropped private scalar const)
- * @since #594
- */
-fn inline_place_item(out: []TItem, it: TItem, map: ScalarConstMap) -> []TItem {
+fn inline_place_item_value(it: @TItem(), map: ScalarConstMap): @TItem() | null {
     match it {
-        TFunction as f => teko::list::push(out, rewrite_function(f, map))
-        TConstDecl as cd => if is_scalar_const_type(cd.ty) { inline_scalar_const_item(out, cd, map) } else { teko::list::push(out, rewrite_const_init(cd, map)) }
-        TStatement as s => teko::list::push(out, inline_rw_stmt(s, map))
-        _ => teko::list::push(out, it)
+        TFunction as f => rewrite_function(f, map)
+        TConstDecl as cd => if is_scalar_const_type(cd.ty) { inline_scalar_const_value(cd, map) } else { rewrite_const_init(cd, map) }
+        (@TStatement()) as s => if scalar_ref_in_stmt(s, map) { inline_rw_stmt(s, map) } else { s }
+        _ => it
     }
 }
 
-/**
- * inline_consts — rewrite the typed program, replacing every reference to a scalar module-level
- * constant with a clone of that constant's checked initializer, in dependency order so nested const
- * references collapse fully (#594 crumb 5). The scalar TConstDecl items are then dropped from the
- * program (they emit no code — no fn body, no arena, no global). An AGGREGATE const is NOT inlined
- * here — its TConstDecl passes through to lowering (crumb 6). Runs in the checker pipeline AFTER
- * `monomorphize` and BEFORE lowering, so lowering sees no scalar const reference and never reaches a
- * globals honest-stop for a scalar-only program. After substitution the pass composes the local-binding
- * const-propagation (`propagate_locals`, #comptime-fold CF3) and then the CF2 fold (`fold_program`):
- * every name-free provably-const integer op-tree — a substituted module const's `~(0 to u64)`, a
- * propagated LOCAL `let a: u64 = 0xFF` used as `a >> 4`, or any inline literal op-tree — collapses to
- * its literal, so BOTH engines load an immediate instead of re-executing the op-tree, and a
- * provably-const overflow/÷0/out-of-range becomes a located compile error (M.1). The fold + propagation
- * run for EVERY program, including a const-free one (a function-local `let a = 0xFF` folds without any
- * module const present).
- *
- * @param prog  the fully typed, monomorphized program
- * @return      the program with scalar const references substituted, scalar const decls removed,
- *              provably-const local bindings propagated and integer op-trees folded to literals
- * @throws      a located error when the module-level consts form a reference cycle (`const_dep_order`)
- *              or a folded constant overflows / divides by zero / is out of range (#comptime-fold)
- * @since #594
- */
-pub fn inline_consts(prog: TProgram) -> TProgram | error {
-    let substituted = match substitute_module_consts(prog) { error as e => return e; TProgram as sp => sp }
-    let agg = match build_module_agg_map(substituted) { error as e => return e; ScalarConstMap as m => m }
+fn substituted_item_kept(it: @TItem()): bool {
+    match it {
+        TConstDecl as cd => if is_scalar_const_type(cd.ty) { const_is_exported(cd) } else { true }
+        _ => true
+    }
+}
+
+fn count_substituted_items(items: []@TItem()): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        if substituted_item_kept(items[i]) { n = n + 1 }
+        i++
+    }
+    n
+}
+
+pub fn inline_consts(prog: TProgram): TProgram | error {
+    var substituted = match substitute_module_consts(prog) { error as e => return e; TProgram as sp => sp }
+    var agg = match build_module_agg_map(substituted) { error as e => return e; ScalarConstMap as m => m }
     fold_program(propagate_locals(substituted), agg)
 }
 
-/**
- * const_ctor_return_value — the value a `return` statement yields, or null for a value-less `return`
- * (whose `value` field is a placeholder the const-constructor canonicalizer must never splice).
- *
- * @param r  the typed return statement
- * @return   the returned value expression, or null when the return carries no value
- * @since #degrau-1
- */
-fn const_ctor_return_value(r: TReturn) -> TExpr | null {
+fn const_ctor_return_value(r: TReturn): TExpr | null {
     if !r.has_value { return null }
     r.value
 }
 
-/**
- * const_ctor_tail_expr — the single value expression a one-statement function body yields: the value
- * of a `return <expr>` or the expression of a tail `<expr>` statement. Any other statement shape (a
- * binding, a loop, an assignment) yields null, so a constructor carrying real control flow is never
- * mistaken for one that simply builds a literal.
- *
- * @param st  the function body's only statement
- * @return    the yielded value expression, or null when the statement yields no single value
- * @since #degrau-1
- */
-fn const_ctor_tail_expr(st: TStatement) -> TExpr | null {
+fn const_ctor_tail_expr(st: @TStatement()): TExpr | null {
     match st {
         TReturn as r => const_ctor_return_value(r)
         TExprStmt as es => es.expr
@@ -566,33 +613,14 @@ fn const_ctor_tail_expr(st: TStatement) -> TExpr | null {
     }
 }
 
-/**
- * struct_literal_or_null — `e` itself when it is a struct literal, else null. The single place the
- * canonicalizer decides that a constructor's body is a shape it may splice.
- *
- * @param e  the candidate expression
- * @return   `e` when its kind is `TStructInit`, else null
- * @since #degrau-1
- */
-fn struct_literal_or_null(e: TExpr) -> TExpr | null {
+fn struct_literal_or_null(e: TExpr): TExpr | null {
     match e.kind {
         TStructInit => e
         _ => null
     }
 }
 
-/**
- * const_ctor_literal — the struct literal a STRUCT-CONSTRUCTOR function returns, or null when `f` is
- * not one. A struct constructor is a non-`extern` function whose whole body is ONE statement yielding
- * a struct literal (`preg`'s `MReg { id = id; reg_class = reg_class; is_phys = true }`); any longer or
- * differently shaped body disqualifies it, so the canonicalizer only ever reproduces a value the
- * function itself would have returned.
- *
- * @param f  the typed function to classify
- * @return   the struct literal its body yields, or null when `f` is not a struct constructor
- * @since #degrau-1
- */
-fn const_ctor_literal(f: TFunction) -> TExpr | null {
+fn const_ctor_literal(f: TFunction): TExpr | null {
     if f.is_extern { return null }
     if f.body.len != 1 { return null }
     match const_ctor_tail_expr(f.body[0]) {
@@ -601,129 +629,68 @@ fn const_ctor_literal(f: TFunction) -> TExpr | null {
     }
 }
 
-/**
- * push_when_const_ctor — accumulate `f` onto `acc` when it is a struct constructor, unchanged
- * otherwise (the fold step of `collect_const_ctors`).
- *
- * @param acc  the constructors collected so far
- * @param f    the typed function to classify
- * @return     `acc`, grown with `f` when `f` is a struct constructor
- * @since #degrau-1
- */
-fn push_when_const_ctor(acc: []TFunction, f: TFunction) -> []TFunction {
-    match const_ctor_literal(f) {
-        TExpr => teko::list::push(acc, f)
-        null => acc
-    }
+fn function_is_const_ctor(f: TFunction): bool {
+    match const_ctor_literal(f) { TExpr => true; null => false }
 }
 
-/**
- * collect_const_ctor_item — accumulate one program item's struct constructor onto `acc`; every
- * non-function item passes through unchanged.
- *
- * @param acc  the constructors collected so far
- * @param it   the program item to fold
- * @return     `acc`, grown when `it` is a struct-constructor function
- * @since #degrau-1
- */
-fn collect_const_ctor_item(acc: []TFunction, it: TItem) -> []TFunction {
-    match it {
-        TFunction as f => push_when_const_ctor(acc, f)
-        _ => acc
-    }
-}
-
-/**
- * collect_const_ctors — every STRUCT-CONSTRUCTOR function the program declares, in declaration order:
- * the table `canonicalize_const_ctors` resolves a const initializer's allowlisted call against. Built
- * ONCE per program by the fold, so canonicalization costs one linear scan plus a lookup per const.
- *
- * @param items  the typed program's top-level items
- * @return       the struct-constructor functions, in declaration order
- * @since #degrau-1
- */
-pub fn collect_const_ctors(items: []TItem) -> []TFunction {
-    mut out: []TFunction = teko::list::empty()
-    mut i: u64 = 0
+fn count_const_ctors(items: []@TItem()): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= items.len { break }
-        out = collect_const_ctor_item(out, items[i])
+        match items[i] {
+            TFunction as f => if function_is_const_ctor(f) { n = n + 1 }
+            _ => { }
+        }
+        i++
+    }
+    n
+}
+
+pub fn collect_const_ctors(items: []@TItem()): []TFunction {
+    var n = count_const_ctors(items)
+    var out: [n]TFunction = []
+    var k: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        match items[i] {
+            TFunction as f => if function_is_const_ctor(f) { out[k] = f; k = k + 1 }
+            _ => { }
+        }
         i++
     }
     out
 }
 
-/**
- * callee_bare_name — the LAST segment of a resolved callee path (`backend::preg` → `preg`), the name a
- * declared function is matched by; the empty string for an empty path.
- *
- * @param p  the resolved callee path
- * @return   the path's last segment name, or "" when the path has no segment
- * @since #degrau-1
- */
-fn callee_bare_name(p: parser::Path) -> str {
+fn callee_bare_name(p: parser::Path): str {
     if p.segments.len == 0 { return "" }
     p.segments[p.segments.len - 1].name
 }
 
-/**
- * const_ctor_matches — whether the constructor `f` is the target of a call named `bare` resolved to
- * namespace `call_ns`. An empty `call_ns` (a builtin/local call the checker did not namespace) matches
- * on the bare name alone; the caller then demands UNIQUENESS, so an ambiguous bare name canonicalizes
- * nothing rather than guessing.
- *
- * @param f        the candidate struct constructor
- * @param bare     the callee path's last segment
- * @param call_ns  the namespace the checker resolved the call to ("" when it namespaced none)
- * @return         whether `f` is a candidate target of that call
- * @since #degrau-1
- */
-fn const_ctor_matches(f: TFunction, bare: str, call_ns: str) -> bool {
+fn const_ctor_matches(f: TFunction, bare: str, call_ns: str): bool {
     if f.name != bare { return false }
     if call_ns == "" { return true }
     f.namespace == call_ns
 }
 
-/**
- * find_const_ctor — the UNIQUE struct constructor a const initializer's call targets, or null when
- * none matches or more than one does. Ambiguity yields null on purpose: splicing the body of a
- * same-named constructor from another namespace would silently change the const's value, which in the
- * register allocator is a miscompilation, so an ambiguous name is left as a call for the lowering's
- * located honest-stop to report.
- *
- * @param ctors    the program's struct-constructor table (`collect_const_ctors`)
- * @param callee   the call's resolved callee path
- * @param call_ns  the namespace the checker resolved the call to
- * @return         the single matching constructor, or null when the match is absent or ambiguous
- * @since #degrau-1
- */
-fn find_const_ctor(ctors: []TFunction, callee: parser::Path, call_ns: str) -> TFunction | null {
-    let bare = callee_bare_name(callee)
+fn find_const_ctor(ctors: []TFunction, callee: parser::Path, call_ns: str): TFunction | null {
+    var bare = callee_bare_name(callee)
     if bare == "" { return null }
-    mut found: []TFunction = teko::list::empty()
-    mut i: u64 = 0
+    var match_count: u64 = 0
+    var sole: TFunction | null = null
+    var i: u64 = 0
     loop {
         if i >= ctors.len { break }
-        if const_ctor_matches(ctors[i], bare, call_ns) { found = teko::list::push(found, ctors[i]) }
+        if const_ctor_matches(ctors[i], bare, call_ns) { match_count = match_count + 1; sole = ctors[i] }
         i++
     }
-    if found.len != 1 { return null }
-    found[0]
+    if match_count != 1 { return null }
+    sole
 }
 
-/**
- * const_ctor_arg_for_param — the argument bound to the parameter named `name`, or null when no
- * parameter carries that name. The caller has already proven `params.len == args.len`, so the index
- * that matches a parameter also indexes its argument.
- *
- * @param params  the constructor's declared parameters, in signature order
- * @param args    the call's arguments, PARALLEL to `params`
- * @param name    the parameter name a body reference spells
- * @return        the bound argument expression, or null when `name` is not a parameter
- * @since #degrau-1
- */
-fn const_ctor_arg_for_param(params: []parser::Param, args: []TExpr, name: str) -> TExpr | null {
-    mut i: u64 = 0
+fn const_ctor_arg_for_param(params: []parser::Param, args: []TExpr, name: str): TExpr | null {
+    var i: u64 = 0
     loop {
         if i >= params.len { break }
         if params[i].name == name { return args[i] }
@@ -732,36 +699,12 @@ fn const_ctor_arg_for_param(params: []parser::Param, args: []TExpr, name: str) -
     null
 }
 
-/**
- * const_ctor_var_value — the value a bare-name reference inside a constructor body stands for: the
- * argument bound to the parameter of that name. A reference to a function VALUE, or to any name that
- * is not a parameter, yields null and aborts the canonicalization — the value would not be reproduced
- * faithfully.
- *
- * @param tv      the reference node inside the constructor's struct literal
- * @param params  the constructor's declared parameters, in signature order
- * @param args    the call's arguments, PARALLEL to `params`
- * @return        the bound argument expression, or null when the reference is not a parameter
- * @since #degrau-1
- */
-fn const_ctor_var_value(tv: TVar, params: []parser::Param, args: []TExpr) -> TExpr | null {
+fn const_ctor_var_value(tv: TVar, params: []parser::Param, args: []TExpr): TExpr | null {
     if tv.is_func { return null }
     const_ctor_arg_for_param(params, args, tv.name)
 }
 
-/**
- * const_ctor_field_value — one field value of the constructor's struct literal, rewritten for the call
- * site: a parameter reference becomes the ALREADY-FOLDED argument the call passes, a literal stands for
- * itself, and every other form yields null so the whole canonicalization is abandoned rather than
- * producing a value the function would not have returned.
- *
- * @param v       the field value as the constructor's body spells it
- * @param params  the constructor's declared parameters, in signature order
- * @param args    the call's arguments, PARALLEL to `params`
- * @return        the field value at the call site, or null when it is not reproducible
- * @since #degrau-1
- */
-fn const_ctor_field_value(v: TExpr, params: []parser::Param, args: []TExpr) -> TExpr | null {
+fn const_ctor_field_value(v: TExpr, params: []parser::Param, args: []TExpr): TExpr | null {
     match v.kind {
         TVar as tv => const_ctor_var_value(tv, params, args)
         TNumber => v
@@ -774,127 +717,57 @@ fn const_ctor_field_value(v: TExpr, params: []parser::Param, args: []TExpr) -> T
     }
 }
 
-/**
- * const_ctor_substituted — the constructor's struct literal with every field value rewritten for the
- * call site, carried at the CALL's own type and source position (so the canonical node reports where
- * the const initializer is written, not where the constructor is declared). Null when any field value
- * is not reproducible.
- *
- * @param call    the (argument-canonicalized) call expression being replaced
- * @param si      the constructor body's struct literal
- * @param params  the constructor's declared parameters, in signature order
- * @param args    the call's arguments, PARALLEL to `params`
- * @return        the canonical struct literal, or null when a field value is not reproducible
- * @since #degrau-1
- */
-fn const_ctor_substituted(call: TExpr, si: TStructInit, params: []parser::Param, args: []TExpr) -> TExpr | null {
-    mut vals: []TExpr = teko::list::empty()
-    mut i: u64 = 0
+fn const_ctor_substituted(call: TExpr, si: TStructInit, params: []parser::Param, args: []TExpr): TExpr | null {
+    var n = si.field_vals.len
+    var vals: [n]TExpr = []
+    var i: u64 = 0
     loop {
-        if i >= si.field_vals.len { break }
-        let fv = match const_ctor_field_value(si.field_vals[i], params, args) { TExpr as x => x; null => return null }
-        vals = teko::list::push(vals, fv)
+        if i >= n { break }
+        vals[i] = match const_ctor_field_value(si.field_vals[i], params, args) { TExpr as x => x; null => return null }
         i++
     }
     TExpr { kind = TStructInit { field_names = si.field_names; field_vals = vals }; type = call.type; line = call.line; col = call.col }
 }
 
-/**
- * canon_ctor_call — replace an allowlisted pure-constructor call by the struct literal its callee
- * returns, or leave the call untouched when the callee is not a uniquely resolvable struct constructor
- * (`teko::f64_from_bits` returns a float, not a struct, and stays a call). The spliced literal is the
- * constructor's OWN body with its parameters bound to the call's already-folded arguments, so the
- * const's value is preserved exactly.
- *
- * @param cl     the typed call, as the const initializer spells it
- * @param args   the call's arguments, already canonicalized
- * @param call   the call expression rebuilt over `args` (the value returned when no rewrite applies)
- * @param ctors  the program's struct-constructor table
- * @return       the canonical struct literal, or `call` unchanged
- * @since #degrau-1
- */
-fn canon_ctor_call(cl: TCall, args: []TExpr, call: TExpr, ctors: []TFunction) -> TExpr {
-    let f = match find_const_ctor(ctors, cl.callee, cl.call_ns) { TFunction as x => x; null => return call }
+fn canon_ctor_call(cl: TCall, args: []TExpr, call: TExpr, ctors: []TFunction): TExpr {
+    var f = match find_const_ctor(ctors, cl.callee, cl.call_ns) { TFunction as x => x; null => return call }
     if f.params.len != args.len { return call }
-    let lit = match const_ctor_literal(f) { TExpr as x => x; null => return call }
-    let si = match lit.kind { TStructInit as s => s; _ => return call }
+    var lit = match const_ctor_literal(f) { TExpr as x => x; null => return call }
+    var si = match lit.kind { TStructInit as s => s; _ => return call }
     match const_ctor_substituted(call, si, f.params, args) { TExpr as x => x; null => call }
 }
 
-/**
- * canon_call — canonicalize a call inside a const initializer: its arguments first, then the call
- * itself when its callee is a struct constructor.
- *
- * @param cl     the typed call expression
- * @param e      the enclosing typed expression (for its type/position)
- * @param ctors  the program's struct-constructor table
- * @return       the canonical struct literal, or the call rebuilt over canonical arguments
- * @since #degrau-1
- */
-fn canon_call(cl: TCall, e: TExpr, ctors: []TFunction) -> TExpr {
-    let args = canon_exprs(cl.args, ctors)
-    let call = TExpr { kind = TCall { callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot }; type = e.type; line = e.line; col = e.col }
+fn canon_call(cl: TCall, e: TExpr, ctors: []TFunction): TExpr {
+    var args = canon_exprs(cl.args, ctors)
+    var call = TExpr { kind = TCall { overload_suffix = cl.overload_suffix; callee = cl.callee; args = args; call_ns = cl.call_ns; is_closure_call = cl.is_closure_call; callee_type = cl.callee_type; is_iface_dispatch = cl.is_iface_dispatch; iface_slot = cl.iface_slot; type_args = cl.type_args; ret_extra = cl.ret_extra }; type = e.type; line = e.line; col = e.col }
     canon_ctor_call(cl, args, call, ctors)
 }
 
-/**
- * canon_exprs — canonicalize every expression in `xs`, in order.
- *
- * @param xs     the expressions to canonicalize
- * @param ctors  the program's struct-constructor table
- * @return       the canonicalized expressions, in order
- * @since #degrau-1
- */
-fn canon_exprs(xs: []TExpr, ctors: []TFunction) -> []TExpr {
-    mut out: []TExpr = teko::list::empty()
-    mut i: u64 = 0
+fn canon_exprs(xs: []TExpr, ctors: []TFunction): []TExpr {
+    var n = xs.len
+    var out: [n]TExpr = []
+    var i: u64 = 0
     loop {
-        if i >= xs.len { break }
-        out = teko::list::push(out, canonicalize_const_ctors(xs[i], ctors))
+        if i >= n { break }
+        out[i] = canonicalize_const_ctors(xs[i], ctors)
         i++
     }
     out
 }
 
-/**
- * canon_array — canonicalize an array/slice literal's elements (a spread's sub-slice included).
- *
- * @param a      the typed array literal
- * @param e      the enclosing typed expression (for its type/position)
- * @param ctors  the program's struct-constructor table
- * @return       the array literal with canonicalized elements
- * @since #degrau-1
- */
-fn canon_array(a: TArrayLit, e: TExpr, ctors: []TFunction) -> TExpr {
-    mut elems: []TArrayElem = teko::list::empty()
-    mut i: u64 = 0
+fn canon_array(a: TArrayLit, e: TExpr, ctors: []TFunction): TExpr {
+    var n = a.elements.len
+    var elems: [n]TArrayElem = []
+    var i: u64 = 0
     loop {
-        if i >= a.elements.len { break }
-        elems = teko::list::push(elems, TArrayElem { is_spread = a.elements[i].is_spread; expr = canonicalize_const_ctors(a.elements[i].expr, ctors) })
+        if i >= n { break }
+        elems[i] = TArrayElem { is_spread = a.elements[i].is_spread; expr = canonicalize_const_ctors(a.elements[i].expr, ctors) }
         i++
     }
     TExpr { kind = TArrayLit { elements = elems }; type = e.type; line = e.line; col = e.col }
 }
 
-/**
- * canonicalize_const_ctors — rewrite a FOLDED const initializer so that every allowlisted
- * pure-constructor call (Tier 5 of the const grammar, `is_const_allowlisted_callee`) that returns a
- * STRUCT becomes the canonical struct literal the constructor's own body builds.
- *
- * The const grammar admits `const RAX_X86: MReg = preg(0, MRegClass::GPR)`, but the LIR's rodata
- * materializer only knows how to serialize a struct LITERAL — a surviving `TCall` reaches it as
- * "const struct: initializer is not a struct literal". Canonicalizing the fold's OUTPUT here keeps that
- * knowledge in ONE place: lowering gains no new concept, and the value is preserved exactly because the
- * literal spliced in IS the callee's body with its parameters bound to the call's already-folded
- * arguments. Recurses through the const-expr grammar (cast / unary / binary / aggregate / call); any
- * other form is returned unchanged.
- *
- * @param e      the folded const initializer expression
- * @param ctors  the program's struct-constructor table (`collect_const_ctors`)
- * @return       the initializer with every struct-returning constructor call replaced by its literal
- * @since #degrau-1
- */
-pub fn canonicalize_const_ctors(e: TExpr, ctors: []TFunction) -> TExpr {
+pub fn canonicalize_const_ctors(e: TExpr, ctors: []TFunction): TExpr {
     match e.kind {
         TCall as cl => canon_call(cl, e, ctors)
         TCast as c => TExpr { kind = TCast { expr = canonicalize_const_ctors(c.expr, ctors) }; type = e.type; line = e.line; col = e.col }
@@ -906,143 +779,118 @@ pub fn canonicalize_const_ctors(e: TExpr, ctors: []TFunction) -> TExpr {
     }
 }
 
-/**
- * build_module_agg_map — the module-aggregate resolution table the Layer-1c index fold reads (CF4),
- * built ONCE from the substituted program: collect the module consts, order them by dependency, and
- * collapse every AGGREGATE const's initializer (`build_aggregate_map`, the same table the C-backend
- * aggregate inliner uses). A `TVar` receiver of a const `TIndex` resolves through this map, so `G[0]`
- * folds to its element without inlining `G` (the shared-rodata model is preserved — only the specific
- * `G[i]` sites fold; every other use of `G` stays a single interned `TVar`). A const-free program
- * yields the empty map. Distinct from `inline_aggregate_consts`, which substitutes every aggregate
- * reference and is C-backend-only.
- *
- * @param prog  the scalar-substituted typed program
- * @return      the module-aggregate resolution table, or a located cycle error (`const_dep_order`)
- * @throws      a located error when the module-level consts form a reference cycle
- * @since #comptime-fold
- */
-pub fn build_module_agg_map(prog: TProgram) -> AggConstMap | error {
-    let consts = collect_module_consts(prog.items)
-    if consts.len == 0 { return ScalarConstMap { names = teko::list::empty(); nss = teko::list::empty(); inits = teko::list::empty() } }
-    let ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
+pub fn build_module_agg_map(prog: TProgram): AggConstMap | error {
+    var consts = drop_cond_consts(collect_module_consts(prog.items), cond_const_names(prog.items))
+    if consts.len == 0 { return ScalarConstMap { names = []; nss = []; inits = [] } }
+    var ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
     build_aggregate_map(ordered)
 }
 
-/**
- * substitute_module_consts — the module-level leg of `inline_consts`: replace every scalar
- * module-const reference with a clone of its dependency-collapsed initializer and drop the scalar
- * TConstDecl items (#594 crumb 5). A const-free program is returned UNCHANGED (the local propagation +
- * fold that follow apply to it regardless). Split out from `inline_consts` so the substitution stays a
- * single-responsibility pass composed before `propagate_locals` (#comptime-fold CF3) and `fold_program`.
- *
- * @param prog  the fully typed, monomorphized program
- * @return      the program with scalar module-const references substituted and scalar decls removed
- * @throws      a located error when the module-level consts form a reference cycle (`const_dep_order`)
- * @since #594
- */
-fn substitute_module_consts(prog: TProgram) -> TProgram | error {
-    let consts = collect_module_consts(prog.items)
+fn substitute_module_consts(prog: TProgram): TProgram | error {
+    var consts = drop_cond_consts(collect_module_consts(prog.items), cond_const_names(prog.items))
     if consts.len == 0 { return prog }
-    let ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
-    let smap = build_scalar_map(ordered)
-    mut out: []TItem = teko::list::empty()
-    mut i: u64 = 0
+    var ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
+    var smap = build_scalar_map(ordered)
+    var n = count_substituted_items(prog.items)
+    var out: [n]@TItem() = []
+    var k: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= prog.items.len { break }
-        out = inline_place_item(out, prog.items[i], smap)
+        match inline_place_item_value(prog.items[i], smap) {
+            (@TItem()) as v => { out[k] = v; k = k + 1 }
+            null => { }
+        }
         i++
     }
     TProgram { items = out }
 }
 
-/**
- * build_aggregate_map — the AGGREGATE substitution table from the dependency-ordered consts (#594
- * crumb 6, C-backend leg): the mirror of `build_scalar_map` for the NON-scalar family. Each aggregate
- * const's initializer is collapsed against the already-collapsed initializers of the aggregate consts
- * it references before it is itself added, so a nested aggregate reference (`const B = [..A..]; const
- * A = [..]`) fully collapses in dependency order. A scalar const contributes no entry (scalars were
- * already inlined + dropped by `inline_consts`).
- *
- * @param ordered  the module-level consts in dependency order (from `const_dep_order`)
- * @return         the aggregate consts' names + collapsed initializers
- * @since #594
- */
-fn build_aggregate_map(ordered: []TConstDecl) -> ScalarConstMap {
-    mut amap = ScalarConstMap { names = teko::list::empty(); nss = teko::list::empty(); inits = teko::list::empty() }
-    mut i: u64 = 0
+fn count_aggregate_consts(ordered: []TConstDecl): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= ordered.len { break }
-        let cd = ordered[i]
+        if !is_scalar_const_type(ordered[i].ty) { n = n + 1 }
+        i++
+    }
+    n
+}
+
+fn build_aggregate_map(ordered: []TConstDecl): ScalarConstMap {
+    var m = count_aggregate_consts(ordered)
+    var names: [m]str = []
+    var nss: [m]str = []
+    var inits: [m]TExpr = []
+    var k: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= ordered.len { break }
+        var cd = ordered[i]
         if !is_scalar_const_type(cd.ty) {
-            let collapsed = inline_rw_expr(cd.init, amap)
-            amap = ScalarConstMap { names = teko::list::push(amap.names, cd.name); nss = teko::list::push(amap.nss, cd.namespace); inits = teko::list::push(amap.inits, collapsed) }
+            var collapsed = inline_rw_expr(cd.init, ScalarConstMap { names = names; nss = nss; inits = inits })
+            names[k] = cd.name
+            nss[k] = cd.namespace
+            inits[k] = collapsed
+            k = k + 1
         }
         i++
     }
-    amap
+    ScalarConstMap { names = names; nss = nss; inits = inits }
 }
 
-/**
- * inline_place_item_agg — fold one program item into the rewritten list, INLINING aggregate consts
- * (the C-backend leg of #594 crumb 6): a function body / loose statement has every aggregate-const
- * reference substituted by a clone of that const's collapsed initializer. The aggregate const
- * DECLARATION itself is KEPT as a residual, no-op item (`tk_emit_c_mode`'s item loop and
- * `emit_program_main` both already treat every `TConstDecl` as a total no-op, emitting nothing for
- * it) rather than dropped, so `prog.items` keeps the SAME length and per-index identity as the
- * pre-aggregate-inline program the caller also hands to `coverage::line_coverage`/`branch_coverage`
- * (both walk `fe.prog` by raw item index — #594 c9 finding: dropping the item here shifted every
- * later function's `fn_items_index` out of sync with the coverage walk's indices, corrupting
- * line/branch coverage for the whole remainder of the program). Unlike the LIR path (which
- * materializes ONE shared rodata entry), the C backend emits an aggregate value as a self-contained
- * statement-expression, so a per-use clone is both correct (the value is read-only) and the only
- * form a C `static const` initializer cannot take for a runtime-allocated slice. A residual scalar
- * const (there should be none post-`inline_consts`) passes through unchanged, same as an aggregate.
- *
- * @param out  the rewritten items accumulated so far
- * @param it   the program item to fold
- * @param map  the aggregate substitution table (parallel names/nss/inits)
- * @return     `out` grown with `it`'s rewritten form (every item is kept, none dropped)
- * @since #594
- */
-fn inline_place_item_agg(out: []TItem, it: TItem, map: ScalarConstMap) -> []TItem {
+pub fn collapse_agg_const_decls(prog: TProgram): TProgram | error {
+    var consts = drop_cond_consts(collect_module_consts(prog.items), cond_const_names(prog.items))
+    if consts.len == 0 { return prog }
+    var ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
+    var amap = build_aggregate_map(ordered)
+    var n = prog.items.len
+    var out: [n]@TItem() = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = collapse_agg_const_decl_item(prog.items[i], amap)
+        i++
+    }
+    TProgram { items = out }
+}
+
+fn collapse_agg_const_decl_item(it: @TItem(), amap: ScalarConstMap): @TItem() {
     match it {
-        TFunction as f => teko::list::push(out, rewrite_function(f, map))
-        TStatement as s => teko::list::push(out, inline_rw_stmt(s, map))
-        _ => teko::list::push(out, it)
+        TConstDecl as cd => collapse_agg_const_decl(cd, amap)
+        _ => it
     }
 }
 
-/**
- * inline_aggregate_consts — the C-BACKEND-ONLY companion to `inline_consts` (#594 crumb 6): substitute
- * every reference to a module-level AGGREGATE const with a clone of its checked initializer (in
- * dependency order). The aggregate const DECLARATION itself is KEPT as a no-op residual item (#594
- * c9 finding) rather than dropped, so `prog.items` keeps the SAME length/per-index identity as the
- * caller's pre-aggregate-inline program — the program `coverage::line_coverage`/`branch_coverage` walk
- * by raw item index; dropping the item here shifted every later function's `fn_items_index` out of
- * sync with that walk, corrupting line/branch coverage for the whole remainder of the program. The C
- * backend emits an aggregate value as a self-contained expression, so inlining each use is correct and
- * side-steps needing a C static-initializer for a runtime-allocated `[]T`. The LIR/native + VM path
- * does NOT run this pass — it materializes ONE shared rodata entry per aggregate const instead
- * (`lower_program`'s `intern_aggregate_consts`), so the two backends diverge in mechanism but agree in
- * value. A const-free program (the self-host itself) is returned unchanged, so the C-emission
- * fixpoint is byte-identical.
- *
- * @param prog  the fully typed, monomorphized, scalar-inlined program (what the C backend emits)
- * @return      the program with aggregate const references substituted, every item kept (none dropped)
- * @throws      a located error when the module-level consts form a reference cycle (`const_dep_order`)
- * @since #594
- */
-pub fn inline_aggregate_consts(prog: TProgram) -> TProgram | error {
-    let consts = collect_module_consts(prog.items)
+fn collapse_agg_const_decl(cd: TConstDecl, amap: ScalarConstMap): @TItem() {
+    if is_scalar_const_type(cd.ty) { return cd }
+    TConstDecl {
+        name = cd.name; namespace = cd.namespace; ty = cd.ty
+        init = inline_rw_expr(cd.init, amap)
+        vis = cd.vis; has_doc = cd.has_doc; doc = cd.doc; line = cd.line; col = cd.col; guard = cd.guard
+    }
+}
+
+fn inline_place_item_agg(it: @TItem(), map: ScalarConstMap): @TItem() {
+    match it {
+        TFunction as f => rewrite_function(f, map)
+        (@TStatement()) as s => if scalar_ref_in_stmt(s, map) { inline_rw_stmt(s, map) } else { s }
+        _ => it
+    }
+}
+
+pub fn inline_aggregate_consts(prog: TProgram): TProgram | error {
+    var consts = drop_cond_consts(collect_module_consts(prog.items), cond_const_names(prog.items))
     if consts.len == 0 { return prog }
-    let ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
-    let amap = build_aggregate_map(ordered)
+    var ordered = match const_dep_order(consts) { []TConstDecl as o => o; error as e => return e }
+    var amap = build_aggregate_map(ordered)
     if amap.names.len == 0 { return prog }
-    mut out: []TItem = teko::list::empty()
-    mut i: u64 = 0
+    var n = prog.items.len
+    var out: [n]@TItem() = []
+    var i: u64 = 0
     loop {
-        if i >= prog.items.len { break }
-        out = inline_place_item_agg(out, prog.items[i], amap)
+        if i >= n { break }
+        out[i] = inline_place_item_agg(prog.items[i], amap)
         i++
     }
     TProgram { items = out }

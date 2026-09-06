@@ -206,9 +206,9 @@ build_glibc() {
     # lives in `libdl` up to glibc 2.33 and was folded INTO `libc` at 2.34. The runner's glibc is
     # past that fold, so the flag is a no-op there — but it costs nothing, and dropping it would
     # silently make this line wrong for any host still on the pre-fold split.
-    bg_cc_line="cc -std=c2x -w -O2 -DTEKO_VERSION_STRING=$TEKO_VERSION_STRING \
+    bg_cc_line="cc -std=c2x -w -O2 -pthread -DTEKO_VERSION_STRING=$TEKO_VERSION_STRING \
         -I$R_SRC/runtime -I$R_SRC/assert \
-        $R_TEKO_C $R_SRC/runtime/teko_rt.c $R_SRC/assert/assert.c -lm -ldl \
+        $R_TEKO_C $R_SRC/runtime/teko_rt.c $R_SRC/assert/assert.c -ldl \
         -o $GD/teko"
 
     {
@@ -276,9 +276,9 @@ build_musl() {
     echo "=== $LABEL — native build with musl-gcc (no container) ==="
 
     bm_static="-static"
-    bm_cc_line="musl-gcc -std=c2x -w -O2 -DTEKO_VERSION_STRING=$TEKO_VERSION_STRING $bm_static \
+    bm_cc_line="musl-gcc -std=c2x -w -O2 -pthread -DTEKO_VERSION_STRING=$TEKO_VERSION_STRING $bm_static \
         -I$R_SRC/runtime -I$R_SRC/assert \
-        $R_TEKO_C $R_SRC/runtime/teko_rt.c $R_SRC/assert/assert.c -lm -ldl \
+        $R_TEKO_C $R_SRC/runtime/teko_rt.c $R_SRC/assert/assert.c -ldl \
         -o $GD/teko"
 
     {

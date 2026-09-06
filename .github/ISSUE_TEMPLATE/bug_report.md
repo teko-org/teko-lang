@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: A compiler, VM or generated-code defect
+about: A compiler or generated-code defect
 title: ''
 labels: bug
 assignees: ''
@@ -16,8 +16,8 @@ assignees: ''
 
 ## What happens
 
-<!-- Exact command + output. If VM and native disagree, show BOTH:
-     `teko run .` vs `teko build . && ./out`. A VM≠native divergence is itself a bug. -->
+<!-- Exact command + output. If debug and release disagree, show BOTH:
+     `teko run .` vs `teko build . && ./out`. A debug≠release divergence is itself a bug. -->
 
 ## What you expected
 

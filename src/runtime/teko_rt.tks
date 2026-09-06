@@ -1,527 +1,114 @@
-// ─── C7.14: concrete list type instantiations — SUPREME-RULE twin ─────────────
-// In C: teko_rt.h defines TK_RT_LIST(T, Name) and instantiates three concrete
-// growable-array types. Each generates a struct {T *ptr; size_t len; size_t cap}
-// plus three static-inline helpers (_empty / _push / _free). The instantiations:
-//
-//   TK_RT_LIST(tk_byte, tk_byte_list)  →  Teko surface: []byte
-//   TK_RT_LIST(tk_str,  tk_str_list)   →  Teko surface: []str
-//   TK_RT_LIST(int64_t, tk_i64_list)   →  Teko surface: []i64
-//
-// In Teko, the list type is `[]T`; `teko::list::empty()` creates an empty list
-// and `teko::list::push(xs, item)` appends one element (consume-and-return, value
-// semantics). These builtins are ALREADY used throughout teko_rt.tks (see
-// str_concat, u64_to_str, str_of_bytes, etc. below). No new Teko declarations
-// are needed — the language provides `[]T` natively. This block closes the
-// SUPREME-RULE gap: the C macro expansion in the header is twinned here with an
-// honest documentation of the Teko-surface equivalence. (C7.14)
-
-/**
- * teko::runtime — the EXECUTION runtime for GENERATED Teko programs (M.1 fail-loud). The metal
- * bottom: `print`/`println` write bytes to the host, the panics fail loud and abort, the F3
- * guards turn raw division and narrowing casts into checked ops that PANIC rather than corrupt.
- * This is the canonical Teko ORIGINAL of `src/runtime/teko_rt.{c,h}` — they must stay
- * SEMANTICALLY EQUIVALENT.
- *
- * THE METAL BOTTOM IS REAL, NOT DEFERRED. `extern fn` to a foreign symbol resolves and links
- * TODAY — proven elsewhere in this tree (`examples/probes/arena_bottom`, the bulk regression's
- * `q026`/`q170` bodies, `builtin_name_not_hijacked`'s `getpid`) — there is no missing compiler
- * primitive left to justify calling this bottom "deferred". `print`, `println`, `write`,
- * `ewrite`, `eprint`, `eprintln` below each DECLARE their OWN `extern fn` directly; none of them
- * delegates to a helper Teko function, and no new C is written by this file.
- *
- * WHY THE `str` PARAMETER STILL NAMES A `teko_rt` SYMBOL (an honest scope note). A general
- * `extern fn` parameter is restricted to a primitive/`byte`/`ptr`/`uptr`/`extern type` handle
- * (C7.1a) — `str` is a fat `{ptr, len}` pair, not one of those. The checker (C7.2) and the native
- * lowering (`lir/lower.tks::is_str_arg_builtin`) carry exactly ONE closed exception: a
- * `str`-taking `extern fn` declared `from "teko_rt"` whose bound symbol is one of seven names —
- * `tk_print`/`tk_println`/`tk_eprint`/`tk_eprintln`/`tk_write`/`tk_ewrite`/`tk_panic_str` — the
- * runtime's own io/panic group. That is the ONE door the compiler opens for a `str`-shaped host
- * call, and it is what every function below binds through. Widening that door to arbitrary
- * foreign symbols is a separate, larger compiler change — out of this file's scope.
- *
- * THE RESIDUAL THIS FILE DOES NOT CLOSE (honest, not swept under the rug). A bare
- * `print(...)`/`write(...)`/`panic(...)` call anywhere in Teko source — including the compiler's
- * own — still lowers DIRECTLY to `tk_print`/`tk_write`/`tk_panic_str` via the native backend's
- * builtin dispatch (`lir/lower.tks::native_builtin_symbol`), never reaching the bodies here. Only
- * a FULLY QUALIFIED `teko::runtime::print(...)` (as `teko_rt_test.tkt` already does for this
- * namespace's other functions, e.g. `teko::runtime::str_eq`) resolves to what is declared below.
- * Rerouting the bare-name dispatch to call INTO this file — so a plain `print("x")` anywhere runs
- * this code instead of the parallel C path — is the next step toward retiring `teko_rt.c`; it
- * touches the native backend's core call lowering and needs the full self-host gate to validate,
- * so it is not this change.
- *
- * FAIL LOUD (M.1). Every panic prints "teko: deliberate panic: <msg>" to stderr and exits
- * non-zero. The word "deliberate" is the marker a regressor scenario asserts on instead of an
- * exit code — see TK_PANIC_MARKER in teko_rt.h for why the proof had to move to stderr.
- *
- * SINGLE-EVALUATION (F3). Each guard takes its operands BY VALUE — the caller computes each once
- * — so codegen never duplicates an operand subtree.
- *
- * @param s  the exact bytes to write to stdout, unchanged (no newline, no NUL added)
- */
-exp extern fn print(s: str) -> void = "tk_print" from "teko_rt"
-
-/**
- * `print(s)` followed by a single `\n` (0x0A) on stdout.
- *
- * @param s  the bytes to write before the trailing newline
- */
-exp extern fn println(s: str) -> void = "tk_println" from "teko_rt"
-
-/**
- * Write exactly `s.len` bytes from `s` to stdout — no newline, no NUL. The same host bottom as
- * `print` (both bind the runtime's stdout-side twin); kept as a distinct name because
- * `teko::io` and the bare-name builtin surface both address it as `write`.
- *
- * @param s  the exact bytes to write, unchanged
- */
-exp extern fn write(s: str) -> void = "tk_write" from "teko_rt"
-
-/**
- * Write exactly `s.len` bytes from `s` to stderr — no newline, no NUL.
- *
- * @param s  the exact bytes to write, unchanged
- */
-exp extern fn ewrite(s: str) -> void = "tk_ewrite" from "teko_rt"
-
-/**
- * Write exactly `s.len` bytes from `s` to stderr — no newline, no NUL. Behaviorally identical to
- * `ewrite`; kept as a distinct name because the bare-name builtin surface addresses a stderr
- * write as either `eprint` or `ewrite` depending on call site.
- *
- * @param s  the exact bytes to write, unchanged
- */
-exp extern fn eprint(s: str) -> void = "tk_eprint" from "teko_rt"
-
-/**
- * `eprint(s)` followed by a single `\n` (0x0A) on stderr.
- *
- * @param s  the bytes to write before the trailing newline
- */
-exp extern fn eprintln(s: str) -> void = "tk_eprintln" from "teko_rt"
-
-// float_parse — teko::float::parse(str) -> f64. strtod over a NUL-terminated copy of s
-// (s may contain no NUL and is not NUL-terminated); a non-numeric / empty string yields 0.0
-// (strtod's no-conversion result). The host strtod is the SAME deferred FFI bottom (C1) as the
-// other host edges; the C twin (teko_rt.c::tk_float_parse) carries the behavior. (C: tk_float_parse.)
-exp fn float_parse(s: str) -> f64 {
-    teko::float::parse(s)   // DEFERRED host strtod (FFI bottom — C1)
+exp fn float_parse(s: str): f64 {
+    teko::float::parse(s)
 }
 
-// --- string interpolation `$"…{expr}…"` builders (self-host parity) ---
-// concat — a fresh str holding a's bytes then b's bytes; the result OWNS the buffer.
-// Leak-tolerant (M.5 — short-lived). Used by the lowering of `$"…"` (each piece/hole
-// concatenated). str(holes are stringified by int_to_str / passed through for str holes).
-exp fn str_concat(a: str, b: str) -> str {
-    mut xs: []byte = teko::list::empty()
-    mut i: u64 = 0
-    loop { if i >= a.len { break }; xs = teko::list::push(xs, a[i]); i++ }
-    mut j: u64 = 0
-    loop { if j >= b.len { break }; xs = teko::list::push(xs, b[j]); j++ }
+exp fn str_concat(a: str, b: str): str {
+    var xs: [a.len + b.len]byte = []
+    var k: u64 = 0
+    var i: u64 = 0
+    loop { if i >= a.len { break }; xs[k] = a[i]; k++; i++ }
+    var j: u64 = 0
+    loop { if j >= b.len { break }; xs[k] = b[j]; k++; j++ }
     str(xs)
 }
 
-// u64_to_str / i64_to_str — the integer's DECIMAL text in a fresh str. The interp lowering
-// widens every signed int hole to i64 and every unsigned hole to u64 (every Teko integer
-// prim except u128/i128 fits; the checker scopes holes to what the corpus needs).
-exp fn u64_to_str(v: u64) -> str {
+/** teko::runtime::u64_to_str — `v`'s decimal digits ("0" when `v` is zero). */
+exp fn u64_to_str(v: u64): str {
     if v == 0 { return "0" }
-    mut digits: []byte = teko::list::empty()   // byte builder (indexed below — needs a concrete element)
-    mut n = v
+    var w: u64 = 0
+    var t = v
+    loop { if t == 0 { break }; t = t / 10; w = w + 1 }
+    var xs: [w]byte = []
+    var rem = v
+    var i = w
     loop {
-        if n == 0 { break }
-        digits = teko::list::push(digits, (b'0' to u64 + n % 10) to byte)
-        n = n / 10
+        if i == 0 { break }
+        i = i - 1
+        xs[i] = (b'0' to u64 + rem % 10) to byte
+        rem = rem / 10
     }
-    // digits are least-significant first — reverse into the result.
-    mut xs: []byte = teko::list::empty()
-    mut k = digits.len
-    loop { if k == 0 { break }; k = k - 1; xs = teko::list::push(xs, digits[k]) }
     str(xs)
 }
 
-exp fn i64_to_str(v: i64) -> str {
+exp fn i64_to_str(v: i64): str {
     if v >= 0 { return u64_to_str(v to u64) }
-    let mag = ((-(v + 1)) to u64) + 1   // |i64::MIN| without overflow
-    str_concat("-", u64_to_str(mag))
-}
-
-// --- Phase 3 str/byte stdlib (mirror of teko_rt.c's tk_str_of_bytes / tk_one_byte /
-// tk_str_concat3 / tk_ftoa). Same contract as str_concat — a fresh owned str, leak-tolerant
-// (M.5 — short-lived). These are the canonical originals of the four recognized builtins. ---
-
-// str_of_bytes — COPY a []byte slice into a fresh owned str (the `str` builtin aliases it).
-// A []byte slice indexes like a str view here; the C twin copies the {ptr,len} buffer.
-exp fn str_of_bytes(bytes: []byte) -> str {
-    mut xs: []byte = teko::list::empty()
-    mut i: u64 = 0
-    loop { if i >= bytes.len { break }; xs = teko::list::push(xs, bytes[i]); i++ }
-    str(xs)
-}
-
-// one_byte — a fresh 1-byte str holding c.
-exp fn one_byte(c: byte) -> str {
-    mut xs: []byte = teko::list::empty()
-    xs = teko::list::push(xs, c)
-    str(xs)
-}
-
-// concat — the LEGISLATED public string-building API (`teko::string::concat` /
-// `teko::text::concat` — resolved by bare last segment like every other builtin, so any of
-// those spellings dispatch here): fold N pieces pairwise via str_concat. Removed `concat3`
-// (2026-07-01) — `params` (a variadic-parameter modifier) supersedes the fixed-arity form.
-exp fn concat(params pieces: []str) -> str {
-    mut acc = ""
-    mut i: u64 = 0
-    loop { if i >= pieces.len { break }; acc = str_concat(acc, pieces[i]); i++ }
-    acc
-}
-
-// ftoa — x rendered as %.17g float text (exact binary64 round-trip) in a fresh str. Teko has
-// no snprintf, so the true realization rides the host float renderer (the same DEFERRED FFI
-// bottom as print/panic — C1); the C twin (teko_rt.c::tk_ftoa) carries the behavior today.
-exp fn ftoa(x: f64) -> str {
-    teko::fmt::f64_g17(x)   // DEFERRED host float renderer (FFI bottom — C1)
-}
-
-/**
- * Left-pad `body` with `pad` bytes until its total length reaches `width`.
- *
- * Used by the zero-padded integer format (`$"{n:D5}"`). A `body` already at or beyond
- * `width` is returned unchanged; the padding is prepended, so a signed value's `-` is NOT
- * kept in front of the zeros (matching C's `%0*d`, whose padding placement is handled by the
- * caller when a sign is present — see `fmt_d`).
- *
- * @param body   the already-rendered digit text
- * @param width  the minimum total width to pad `body` up to
- * @param pad    the single byte used for each padding position
- * @return       `body` left-padded with `pad` to at least `width` bytes
- */
-fn pad_left(body: str, width: i64, pad: byte) -> str {
-    let have = body.len to i64
-    if have >= width { return body }
-    mut xs: []byte = teko::list::empty()
-    mut i = have
-    loop { if i >= width { break }; xs = teko::list::push(xs, pad); i++ }
-    str_concat(str(xs), body)
-}
-
-/**
- * Insert a comma between every group of three decimal digits of `digits`, right-aligned.
- *
- * `digits` is the plain (sign-free) decimal text; the caller re-attaches any sign. Grouping
- * starts from the least-significant digit, so "1234567" becomes "1,234,567". A digit run of
- * three or fewer is returned unchanged.
- *
- * @param digits  the sign-free decimal digit text to group
- * @return        `digits` with a comma inserted after each group of three, from the right
- */
-fn group_thousands(digits: str) -> str {
-    let n = digits.len to i64
-    mut xs: []byte = teko::list::empty()
-    mut i = 0
+    var mag = ((-(v + 1)) to u64) + 1
+    var w: u64 = 1
+    var t = mag
+    loop { if t == 0 { break }; t = t / 10; w = w + 1 }
+    var xs: [w]byte = []
+    xs[0] = b'-'
+    var rem = mag
+    var i = w
     loop {
-        if i >= n { break }
-        let remaining = n - i
-        if i > 0 && remaining % 3 == 0 { xs = teko::list::push(xs, b',') }
-        xs = teko::list::push(xs, digits[i to u64])
-        i++
+        if i == 1 { break }
+        i = i - 1
+        xs[i] = (b'0' to u64 + rem % 10) to byte
+        rem = rem / 10
     }
     str(xs)
 }
 
-/**
- * Render the unsigned magnitude of `x` in base `radix` (2..=16) using `alphabet` for digits.
- *
- * The hex and binary format families lower to this: base 16 with an upper- or lower-case
- * digit alphabet, or base 2. Zero renders as a single "0". No sign is emitted (the families
- * that use this take an already-unsigned value).
- *
- * @param x         the unsigned magnitude to render
- * @param radix     the numeric base, 2 through 16
- * @param alphabet  the 16-byte digit table (index 0..radix-1 selects the digit byte)
- * @return          the base-`radix` text of `x`
- */
-fn to_radix(x: u64, radix: u64, alphabet: str) -> str {
-    if x == 0 { return "0" }
-    mut digits: []byte = teko::list::empty()
-    mut n = x
-    loop {
-        if n == 0 { break }
-        digits = teko::list::push(digits, alphabet[n % radix])
-        n = n / radix
-    }
-    mut xs: []byte = teko::list::empty()
-    mut k = digits.len
-    loop { if k == 0 { break }; k = k - 1; xs = teko::list::push(xs, digits[k]) }
+fn u64_to_str_len(v: u64, out_len: u64): i64 {
+    var s = u64_to_str(v)
+    teko::mem::store_u64(out_len, s.len)
+    teko::sys::ptr_word(s.as_ptr())
+}
+
+fn i64_to_str_len(v: i64, out_len: u64): i64 {
+    var s = i64_to_str(v)
+    teko::mem::store_u64(out_len, s.len)
+    teko::sys::ptr_word(s.as_ptr())
+}
+
+exp fn str_of_bytes(bytes: []byte): str {
+    var xs: [bytes.len]byte = []
+    var i: u64 = 0
+    loop { if i >= bytes.len { break }; xs[i] = bytes[i]; i++ }
     str(xs)
 }
 
-/**
- * fmt_d — `x` as decimal, zero-padded on the left to a minimum field `width` (`$"{n:D5}"`).
- *
- * Mirrors C's `%0*` `PRId64`: a negative value keeps its `-` in front of the zero padding, so
- * the sign occupies one of the `width` positions. A `width` at or below the natural digit
- * count leaves the value unpadded.
- *
- * @param x      the signed integer to render
- * @param width  the minimum total field width (including any sign)
- * @return       `x` in decimal, left-padded with zeros to at least `width` bytes
- */
-exp fn fmt_d(x: i64, width: i64) -> str {
-    if x >= 0 { return pad_left(i64_to_str(x), width, b'0') }
-    let mag = ((-(x + 1)) to u64) + 1
-    let padded = pad_left(u64_to_str(mag), width - 1, b'0')
-    str_concat("-", padded)
+exp fn one_byte(c: byte): str {
+    var xs: [1]byte = []
+    xs[0] = c
+    str(xs)
 }
 
-/**
- * fmt_x_upper — `x` as upper-case hexadecimal (`$"{n:X}"`), no `0x` prefix, no padding.
- *
- * @param x  the unsigned value to render
- * @return   the upper-case base-16 text of `x`
- */
-exp fn fmt_x_upper(x: u64) -> str { to_radix(x, 16, "0123456789ABCDEF") }
-
-/**
- * fmt_x_lower — `x` as lower-case hexadecimal (`$"{n:x}"`), no `0x` prefix, no padding.
- *
- * @param x  the unsigned value to render
- * @return   the lower-case base-16 text of `x`
- */
-exp fn fmt_x_lower(x: u64) -> str { to_radix(x, 16, "0123456789abcdef") }
-
-/**
- * fmt_b — `x` as binary (`$"{n:b}"`), no `0b` prefix, no padding, minimal width.
- *
- * @param x  the unsigned value to render
- * @return   the base-2 text of `x`
- */
-exp fn fmt_b(x: u64) -> str { to_radix(x, 2, "0123456789ABCDEF") }
-
-/**
- * fmt_n_i — `x` as decimal with a comma every three digits (`$"{n:N}"` on an integer hole).
- *
- * A negative value keeps its leading `-`; grouping applies only to the magnitude digits.
- *
- * @param x  the signed integer to render
- * @return   `x` in decimal with thousands separators
- */
-exp fn fmt_n_i(x: i64) -> str {
-    if x >= 0 { return group_thousands(u64_to_str(x to u64)) }
-    let mag = ((-(x + 1)) to u64) + 1
-    str_concat("-", group_thousands(u64_to_str(mag)))
-}
-
-/**
- * fmt_f — `x` rounded to `prec` fractional digits, fixed-point (`$"{x:F2}"`).
- *
- * The float families bottom out at the host `%.*f`/`%.*e`/`%.*g` renderer — the SAME deferred
- * FFI edge (C1) `ftoa`/`f64_g17` bottom out at. Reproducing libc's binary64-to-decimal rounding
- * byte-for-byte in Teko needs a precision-aware host primitive the current seed does not yet
- * expose, so this body renders through the seed-known `ftoa` bottom; the C twin
- * (teko_rt.c::tk_fmt_f) carries the precise `%.*f` behavior, and the VM intercepts `fmt_f` by
- * name at the interpolation layer so `teko run` matches the native build.
- *
- * @param x     the value to render
- * @param prec  the number of fractional digits (may be 0)
- * @return      `x` as fixed-point text with exactly `prec` fractional digits
- */
-exp fn fmt_f(x: f64, prec: i64) -> str { ftoa(x) }
-
-/**
- * fmt_e — `x` in scientific notation with `prec` fractional mantissa digits (`$"{x:E3}"`).
- *
- * Deferred host bottom, like `fmt_f`; the C twin (teko_rt.c::tk_fmt_e) carries the `%.*e`
- * behavior and the VM intercepts `fmt_e` by name.
- *
- * @param x     the value to render
- * @param prec  the number of fractional mantissa digits
- * @return      `x` in `d.dddde±dd` scientific text
- */
-exp fn fmt_e(x: f64, prec: i64) -> str { ftoa(x) }
-
-/**
- * fmt_g — `x` in the shorter of fixed/scientific with `prec` significant digits (`$"{x:G4}"`).
- *
- * Deferred host bottom, like `fmt_f`; the C twin (teko_rt.c::tk_fmt_g) carries the `%.*g`
- * behavior and the VM intercepts `fmt_g` by name.
- *
- * @param x     the value to render
- * @param prec  the number of significant digits
- * @return      `x` in the shorter general representation
- */
-exp fn fmt_g(x: f64, prec: i64) -> str { ftoa(x) }
-
-/**
- * fmt_n_f — `x` as fixed-point with `prec` fractional digits AND thousands separators
- * (`$"{x:N2}"`).
- *
- * Deferred host bottom, like `fmt_f` (the `%.*f` render precedes the Teko grouping the C twin
- * teko_rt.c::tk_fmt_n_f performs); the VM intercepts `fmt_n_f` by name.
- *
- * @param x     the value to render
- * @param prec  the number of fractional digits
- * @return      `x` as grouped fixed-point text (comma every three integer digits)
- */
-exp fn fmt_n_f(x: f64, prec: i64) -> str { ftoa(x) }
-
-/**
- * fmt_p — `x` scaled by 100 and rendered as a percentage with `prec` fractional digits and a
- * trailing `%` (`$"{x:P1}"`, so 0.25 → "25.0%").
- *
- * Deferred host bottom, like `fmt_f`; the C twin (teko_rt.c::tk_fmt_p) carries the `%.*f%%`
- * behavior and the VM intercepts `fmt_p` by name.
- *
- * @param x     the fraction to render as a percent
- * @param prec  the number of fractional digits
- * @return      `x * 100` as fixed-point text followed by `%`
- */
-exp fn fmt_p(x: f64, prec: i64) -> str { ftoa(x) }
-
-/**
- * fmt_dyn_f64 — dynamic-spec float formatting (`$"{x:[spec]}"`), dispatching on the first
- * spec byte (case-insensitive) with an optional trailing precision.
- *
- * @param x     the value to render
- * @param spec  the runtime spec string (e.g. "F2", "e3", "N", "p1")
- * @return      `x` formatted per `spec`; an empty/unknown spec falls back to `ftoa`
- */
-exp fn fmt_dyn_f64(x: f64, spec: str) -> str {
-    if spec.len == 0 { return ftoa(x) }
-    let prec = fmt_parse_prec(spec, 6)
-    let fc = fmt_lead_lower(spec)
-    if fc == b'f' { return fmt_f(x, prec) }
-    if fc == b'e' { return fmt_e(x, prec) }
-    if fc == b'g' { return fmt_g(x, prec) }
-    if fc == b'n' { return fmt_n_f(x, prec) }
-    if fc == b'p' { return fmt_p(x, prec) }
-    ftoa(x)
-}
-
-/**
- * fmt_dyn_i64 — dynamic-spec signed-integer formatting (`$"{n:[spec]}"`).
- *
- * @param x     the signed value to render
- * @param spec  the runtime spec string (e.g. "D5", "X", "b", "N")
- * @return      `x` formatted per `spec`; an empty/unknown spec falls back to decimal
- */
-exp fn fmt_dyn_i64(x: i64, spec: str) -> str {
-    if spec.len == 0 { return i64_to_str(x) }
-    let prec = fmt_parse_prec(spec, 0)
-    let fc = fmt_lead_lower(spec)
-    if fc == b'd' { return fmt_d(x, if prec > 0 { prec } else { 1 }) }
-    if fc == b'x' {
-        if spec[0] == b'X' { return fmt_x_upper(x to u64) }
-        return fmt_x_lower(x to u64)
-    }
-    if fc == b'b' { return fmt_b(x to u64) }
-    if fc == b'n' { return fmt_n_i(x) }
-    i64_to_str(x)
-}
-
-/**
- * fmt_dyn_u64 — dynamic-spec unsigned-integer formatting (`$"{u:[spec]}"`).
- *
- * @param x     the unsigned value to render
- * @param spec  the runtime spec string (e.g. "D5", "X", "b", "N")
- * @return      `x` formatted per `spec`; an empty/unknown spec falls back to decimal
- */
-exp fn fmt_dyn_u64(x: u64, spec: str) -> str {
-    if spec.len == 0 { return u64_to_str(x) }
-    let prec = fmt_parse_prec(spec, 0)
-    let fc = fmt_lead_lower(spec)
-    if fc == b'd' { return fmt_d(x to i64, if prec > 0 { prec } else { 1 }) }
-    if fc == b'x' {
-        if spec[0] == b'X' { return fmt_x_upper(x) }
-        return fmt_x_lower(x)
-    }
-    if fc == b'b' { return fmt_b(x) }
-    if fc == b'n' { return fmt_n_i(x to i64) }
-    u64_to_str(x)
-}
-
-/**
- * Lower-case the leading byte of a dynamic format spec (ASCII A–Z → a–z), for the
- * case-insensitive family dispatch in the `fmt_dyn_*` helpers.
- *
- * @param spec  the runtime spec string (assumed non-empty by the callers)
- * @return      the spec's first byte, lower-cased if it was an upper-case ASCII letter
- */
-fn fmt_lead_lower(spec: str) -> byte {
-    let c = spec[0]
-    if c >= b'A' && c <= b'Z' { return (c to u64 + 32) to byte }
-    c
-}
-
-/**
- * Parse the optional trailing decimal precision out of a dynamic format spec (e.g. "F2" → 2).
- *
- * Skips the leading non-digit family byte(s), then reads the digit run. A spec with no digits
- * yields `def`. The accumulator is clamped at 10000 (matching the C twin's FMT_PREC_MAX) so a
- * pathologically long digit run cannot overflow.
- *
- * @param spec  the runtime spec string
- * @param def   the precision to use when the spec carries no digits
- * @return      the parsed precision, or `def` when absent
- */
-fn fmt_parse_prec(spec: str, def: i64) -> i64 {
-    mut i = 0 to u64
-    loop { if i >= spec.len { break }; let c = spec[i]; if c >= b'0' && c <= b'9' { break }; i++ }
-    if i >= spec.len { return def }
-    mut p = 0
+exp fn concat(params pieces: []str): str {
+    var total: u64 = 0
+    var i: u64 = 0
+    loop { if i >= pieces.len { break }; total = total + pieces[i].len; i++ }
+    var xs: [total]byte = []
+    var k: u64 = 0
+    var p: u64 = 0
     loop {
-        if i >= spec.len { break }
-        let c = spec[i]
-        if c < b'0' || c > b'9' { break }
-        if p < 10000 { p = p * 10 + (c to i64 - 48) }
-        if p > 10000 { p = 10000 }
-        i++
+        if p >= pieces.len { break }
+        var j: u64 = 0
+        loop { if j >= pieces[p].len { break }; xs[k] = pieces[p][j]; k++; j++ }
+        p++
     }
-    p
+    str(xs)
 }
 
-// --- Phase 3 str query/slice builtins (mirror of teko_rt.c's tk_str_eq / tk_str_slice /
-// tk_str_slice_to / tk_str_slice_from / tk_str_len / tk_str_ends_with / tk_str_contains /
-// tk_f64_g17). The query helpers ALLOCATE NOTHING; the slice helpers return a fresh owned str
-// (str() copies the byte builder), and an out-of-range slice PANICS (M.1, parity with the VM). ---
-
-// str_eq — same length AND same bytes. Compares byte-by-byte (the C twin uses memcmp; embedded
-// NUL tolerated). A zero-length pair is equal.
-exp fn str_eq(a: str, b: str) -> bool {
+exp fn str_eq(a: str, b: str): bool {
     if a.len != b.len { return false }
-    mut i: u64 = 0
+    var i: u64 = 0
     loop { if i >= a.len { break }; if a[i] != b[i] { return false }; i++ }
     true
 }
 
-/**
- * (TR3) FNV-1a over the str's bytes (offset basis 14695981039346656037, prime 1099511628211, u64
- * wraparound); an empty str hashes to the offset basis. The Teko twin of the C `tk_str_hash`; its
- * derivation matches `di_type_id` so a str-field structural `Hash` folds identically on both engines.
- *
- * @param s the string to hash
- * @return the FNV-1a hash of `s`'s bytes
- */
-exp fn str_hash(s: str) -> u64 {
-    mut h: u64 = 14695981039346656037
-    mut i: u64 = 0
+/** teko::runtime::str_hash — the FNV-1a hash of `s`'s bytes. */
+exp global fn str_hash(s: str): u64 {
+    var h: u64 = 14695981039346656037
+    var i: u64 = 0
     loop { if i >= s.len { break }; h = (h ^ (s[i] to u64)) * 1099511628211; i++ }
     h
 }
 
-/**
- * (TR3) Lexicographic byte compare (unsigned): -1 (a < b) / 0 (equal) / 1 (a > b); when one str is a
- * prefix of the other the shorter one is the lesser. The Teko twin of the C `tk_str_cmp`; used by a
- * str-field structural `Ord`.
- *
- * @param a the left string
- * @param b the right string
- * @return -1, 0, or 1 as `a` orders before, equal to, or after `b`
- */
-exp fn str_compare(a: str, b: str) -> i64 {
-    let n = if a.len < b.len { a.len } else { b.len }
-    mut i: u64 = 0
+/** teko::runtime::str_compare — lexicographic byte compare: -1 (a < b), 0 (equal), 1 (a > b). */
+exp global fn str_compare(a: str, b: str): i64 {
+    var n = if a.len < b.len { a.len } else { b.len }
+    var i: u64 = 0
     loop {
         if i >= n { break }
         if (a[i] to u64) < (b[i] to u64) { return -1 }
@@ -533,54 +120,40 @@ exp fn str_compare(a: str, b: str) -> i64 {
     0
 }
 
-// str_slice — the bytes [start, end) COPIED into a fresh owned str. An out-of-range slice
-// (start > end, or end past the byte length) PANICS (M.1, fail-loud — matches the VM's bounds
-// check). The empty slice (start == end, in range) is a valid empty str.
-exp fn str_slice(s: str, start: u64, end: u64) -> str {
-    if start > end || end > s.len { panic("string slice out of range") }
-    mut xs: []byte = teko::list::empty()
-    mut i = start
-    loop { if i >= end { break }; xs = teko::list::push(xs, s[i]); i++ }
-    str(xs)
+exp fn str_slice(s: str, start: u64, end: u64): str {
+    if start > end || end > s.len { panic_str_slice_oob() }
+    slice_view(s, start, end)
 }
 
-// str_slice_to — slice from the start to `end`.
-exp fn str_slice_to(s: str, end: u64) -> str {
+exp fn str_slice_to(s: str, end: u64): str {
     str_slice(s, 0, end)
 }
 
-// str_slice_from — slice from `start` to the byte length.
-exp fn str_slice_from(s: str, start: u64) -> str {
+exp fn str_slice_from(s: str, start: u64): str {
     str_slice(s, start, s.len)
 }
 
-// str_len — the byte length (no allocation).
-exp fn str_len(s: str) -> u64 {
+exp global fn str_len(s: str): u64 {
     s.len
 }
 
-// str_ends_with — the tail of s equals suffix. A suffix longer than s can't match; otherwise the
-// last suffix.len bytes are compared (the C twin uses memcmp). An empty suffix matches.
-exp fn str_ends_with(s: str, suffix: str) -> bool {
+exp fn str_ends_with(s: str, suffix: str): bool {
     if suffix.len > s.len { return false }
-    let base = s.len - suffix.len
-    mut i: u64 = 0
-    loop { if i >= suffix.len { break }; if s[base + i] != suffix[i] { return false }; i++ }
+    var start = s.len - suffix.len
+    var i: u64 = 0
+    loop { if i >= suffix.len { break }; if s[start + i] != suffix[i] { return false }; i++ }
     true
 }
 
-// str_contains — naive byte search: true iff needle occurs anywhere in s. An empty needle is
-// trivially contained; each candidate offset is compared against needle (the last offset is
-// s.len - needle.len, inclusive).
-exp fn str_contains(s: str, needle: str) -> bool {
+exp fn str_contains(s: str, needle: str): bool {
     if needle.len == 0 { return true }
     if needle.len > s.len { return false }
-    let last = s.len - needle.len
-    mut i: u64 = 0
+    var last = s.len - needle.len
+    var i: u64 = 0
     loop {
         if i > last { break }
-        mut matched = true
-        mut j: u64 = 0
+        var matched = true
+        var j: u64 = 0
         loop { if j >= needle.len { break }; if s[i + j] != needle[j] { matched = false; break }; j++ }
         if matched { return true }
         i++
@@ -588,183 +161,796 @@ exp fn str_contains(s: str, needle: str) -> bool {
     false
 }
 
-// f64_g17 — x as %.17g in a fresh owned str (the host float renderer; same behavior as ftoa,
-// riding the DEFERRED host edge — C1). The C twin (teko_rt.c::tk_f64_g17) carries it today.
-exp fn f64_g17(x: f64) -> str {
-    teko::fmt::f64_g17(x)   // DEFERRED host float renderer (FFI bottom — C1)
+/** teko::runtime::bytes_of_str — the str's bytes as a `[]byte`, a zero-copy reinterpret (same
+ * `{ptr, len}`). */
+exp global fn bytes_of_str(s: str): []byte {
+    s
 }
 
-// --- ROUND 0 UTF-8 string / char builtins -----------------------------------------------
-// NOTE: len_chars(str)->i64 and chars(str)->[]char are injected BUILTINS (resolved by
-// tk_builtin_fn / try_str_builtin, NOT as user functions). The VM intercepts all calls to
-// them via try_str_builtin (last=="len_chars" / last=="chars"); codegen emits the C runtime
-// twins directly (tk_str_len_chars / tk_str_chars). No Teko function body is needed here —
-// attempting to write one would require `str to char` (undefined cast) for `chars`.
-// (This comment documents the design; both builtins are registered in scope.c + codegen.c/tks + vm.c/tks.)
+/** teko::runtime::as_ptr — the raw byte address of a str's buffer (NOT NUL-terminated). */
+exp global fn as_ptr(s: str): ptr {
+    teko::mem::byte_ptr(s, 0)
+}
 
-// NOTE: str_from_utf8(bytes: []byte) -> str | error is ALSO an injected BUILTIN (ROUND 0 /
-// B.36) — the user-facing validated bytes->str door, resolved by tk_builtin_fn/builtin_fn
-// like bytes_of_str. It is the SRES-shaped host-FFI bottom (same {ok,value,err} lift as
-// read_file/getenv, `sres_byteslice` kind — the []byte arg is split into ptr+len like
-// write_file_bytes's data arg): codegen lowers it to tk_rt_str_from_utf8 (emit_host_ffi);
-// the VM intercepts it directly and calls the SAME C runtime fn (try_str_builtin). No Teko
-// function body is needed here — the RFC 3629 validation logic lives once, in teko_rt.c
-// (rt_valid_utf8), NOT duplicated in this .tks (the SUPREME RULE covers the runtime SEAM
-// signature/wiring, not a source-language reimplementation of a host-FFI bottom's guts —
-// same precedent as str_of_bytes/one_byte/read_file all bottoming out at deferred C1 edges).
-// (Distinct from teko::text::str_from_utf8 in src/text/text.tks — that is the COMPILER'S OWN
-// bootstrap door, used internally by the lexer/parser/driver to validate their own source
-// input; this builtin is the general-purpose surface any Teko PROGRAM can call.)
+fn utf8_lead_width(b0: byte): u64 {
+    var v = b0 to u64
+    if v < 128 { return 1 }
+    if v < 192 { return 1 }
+    if v < 224 { return 2 }
+    if v < 240 { return 3 }
+    4
+}
 
-// --- panics: fail loud (M.1) — message to stderr, then non-zero exit ---
+fn utf8_codepoint_count(s: str): u64 {
+    var count: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        i = i + utf8_lead_width(s[i])
+        count = count + 1
+    }
+    count
+}
 
-// (C1.9) NATIVE STACK TRACES — the C twin (teko_rt.c) prints a backtrace on panic and installs a
-// fatal-signal handler (SIGSEGV/BUS/ILL/FPE) so a generated program's crash shows the call stack.
-// Those use the host `signal`/`backtrace`/`backtrace_symbols_fd` — the SAME `extern` edge as
-// `teko::abort`, DEFERRED to the FFI work (C1/C2). Per-frame Teko file:line via `.tsym` is Eixo E3.
-// No Teko-surface mirror yet (host edge); the C twin carries the behavior. (See teko_rt.c.)
+/** teko::runtime::len_chars — the number of UTF-8 codepoints in `s`. */
+exp global fn len_chars(s: str): i64 {
+    utf8_codepoint_count(s) to i64
+}
 
-// (S0) tk_alloc — the ALLOCATION SEAM the generated code uses (`malloc(n||1)`; tk_panic on OOM, M.1).
-// It hands back a RAW `void *` (a fresh, uniquely-addressable block — n→1 so a zero-size alloc still
-// yields a distinct pointer). Teko has NO raw-pointer surface (the type model is void/error/variant/
-// nullable — never an untyped address), so there is no faithful functional mirror: the host
-// malloc/OOM edge is the SAME deferred `extern`/syscall bottom as `teko::abort` / the host write.
-// The C twin (teko_rt.c::tk_alloc) carries the behavior; codegen emits `tk_alloc(...)` directly at
-// the boxing/copy-append seams. This note closes the SUPREME-RULE pairing HONESTLY rather than
-// inventing a pointer type Teko does not have. (C: tk_alloc.)
+/** teko::runtime::chars — `s` split into one `char` per UTF-8 codepoint; each borrows into `s`. */
+exp global fn chars(s: str): []char {
+    var n = utf8_codepoint_count(s)
+    var arr: [n]char = []
+    var ci: u64 = 0
+    var pos: u64 = 0
+    loop {
+        if pos >= s.len { break }
+        var w = utf8_lead_width(s[pos])
+        if w > s.len - pos { w = s.len - pos }
+        arr[ci] = s.slice(pos, pos + w)
+        ci = ci + 1
+        pos = pos + w
+    }
+    arr
+}
 
-// (S1) tk_region_new / tk_region_alloc / tk_region_drop / tk_region_root — the ARENA PRIMITIVE
-// (TEKO_EVOLUTION_DESIGN §5.2): a bump-allocator region (chunk-list, OOM-panics) plus the process
-// root region. Like tk_alloc above, these hand back RAW pointers (void * blocks and tk_region *
-// handles) into host memory — the SAME deferred extern/syscall host edge as tk_alloc / teko::abort.
-// Teko has NO raw-pointer surface (the type model is void/error/variant/nullable, never an untyped
-// address), so there is NO faithful functional mirror; inventing a pointer-typed signature would be
-// the lie the doctrine forbids. The C twin (teko_rt.c::tk_region_*) carries the behavior. This
-// closes the SUPREME-RULE pairing honestly.
-// (C: tk_region_new / tk_region_alloc / tk_region_drop / tk_region_root.)
-//
-// (S2, 2026-07-01) ARENA PARENT-PTR TREE + PER-ARENA REGISTRY — tk_region_new now takes the
-// enclosing region as its PARENT (NULL = no parent); codegen threads the correct C EXPRESSION at
-// each of its emission call sites (the function frame, the innermost open block region, or the
-// process root — see codegen.tks's cg_enclosing_region_expr / cg_enclosing_region_expr_framed,
-// which ARE faithfully mirrored in both engines since they operate on Teko-level region-name
-// STRINGS, not raw pointers). The runtime-side storage (tk_region_register/tk_region_lookup) stays
-// a RAW host-memory primitive with the same "no faithful functional mirror" honesty as the region
-// itself — a future DI `#scoped` feature is the first consumer that will make the checker/codegen
-// reason about WHICH type_id to register/look up (out of scope here — S2 only builds the tree +
-// registry primitive; nothing calls tk_region_register/tk_region_lookup yet).
-// (C: tk_region_new(parent) / tk_region_register / tk_region_lookup.)
+/** teko::runtime::char_at — the `char` at 0-based codepoint index `i` in `s` (borrows into `s`).
+ * Panics when `i` is out of range. */
+exp global fn char_at(s: str, i: i64): char {
+    if i < 0 { panic("char_at: negative codepoint index") }
+    var idx = i to u64
+    var pos: u64 = 0
+    var ci: u64 = 0
+    loop {
+        if pos >= s.len { break }
+        var w = utf8_lead_width(s[pos])
+        if w > s.len - pos { w = s.len - pos }
+        if ci == idx { return s.slice(pos, pos + w) }
+        ci = ci + 1
+        pos = pos + w
+    }
+    panic("char_at: codepoint index out of range")
+}
 
-// (W9.3b) tk_regions_free_all — free EVERY still-live region (the root + every live scoped frame/block
-// region) and empty the registry, so an abnormal termination (panic/exit) does not leak the stack-local
-// scoped regions a diverging path skips dropping. The C twin (teko_rt.c) maintains an INTRUSIVE global
-// registry (tk_region_new prepends, tk_region_drop unlinks) and calls free_all at the termination choke
-// points: tk_panic*/tk_exit explicitly, plus an atexit hook for normal return. Like the region primitive
-// above, this operates on RAW host-memory handles (tk_region *) — there is NO faithful Teko-surface
-// mirror (the type model has no untyped address), so this note closes the SUPREME-RULE pairing honestly.
-// codegen emits nothing for it. (C: tk_regions_free_all.)
+/** teko::runtime::str_slice_chars — the substring of `s` from codepoint index `from` (inclusive)
+ * to `to` (exclusive), as a zero-copy view. Panics when the range is invalid. */
+exp global fn str_slice_chars(s: str, from: i64, to: i64): str {
+    if from < 0 || to < 0 { panic("str_slice_chars: negative codepoint index") }
+    var ufrom = from to u64
+    var uto = to to u64
+    if ufrom > uto { panic("str_slice_chars: from > to") }
+    var byte_from: u64 = 0
+    var byte_to: u64 = 0
+    var ci: u64 = 0
+    var pos: u64 = 0
+    loop {
+        if ci == ufrom { byte_from = pos }
+        if ci == uto { byte_to = pos; break }
+        if pos == s.len { panic("str_slice_chars: codepoint index out of range") }
+        var w = utf8_lead_width(s[pos])
+        if w > s.len - pos { w = s.len - pos }
+        ci = ci + 1
+        pos = pos + w
+    }
+    s.slice(byte_from, byte_to)
+}
 
-/**
- * The libc process-abort primitive, reached DIRECTLY as a foreign symbol — `panic`'s termination
- * bottom. Zero parameters and a `void` return trivially satisfy the general `extern fn` typing
- * rule (C7.1a: a primitive, `byte`, `ptr`, `uptr`, an `extern type` handle, or absent — `void`
- * needs none of those), so this needs no `teko_rt` bypass: it is portable libc `abort()`, present
- * under the same name on every target this compiler ships for (POSIX and the Windows UCRT).
- *
- * @return  nothing (diverges — `abort()` never returns; it raises `SIGABRT` and the process ends)
- */
-exp extern fn rt_abort() -> void = "abort" from "c"
+/** teko::runtime::to_lower — the ASCII lowercase of `c`; non-ASCII codepoints are unchanged. */
+exp global fn to_lower(c: char): char {
+    var cp = c to u32
+    if cp >= 65 && cp <= 90 { return one_byte((cp + 32) to byte) }
+    c
+}
 
-/**
- * panic — write the TK_PANIC_MARKER line (`"teko: deliberate panic: <msg>\n"`) to stderr, then a
- * stack trace (C1.9), then abort.
- *
- * The marker text is spelled here to mirror the C twin's `#define TK_PANIC_MARKER` (teko_rt.h),
- * which carries the contract and the rationale. In short: the abort's exit STATUS is manufactured
- * by whatever ran the child — a POSIX shell reports 128+SIGABRT, Windows reports something else
- * entirely — so the status can never be the proof that a guard fired. This line can, because
- * nothing but the program itself is able to write it.
- *
- * @param msg  the reason, rendered after the marker on the same line
- * @return     void (diverges — the host abort never returns)
- */
-exp fn panic(msg: str) {
-    ewrite(teko::str::concat("teko: deliberate panic: ", msg, "\n"))
-    rt_abort()
+/** teko::runtime::to_upper — the ASCII uppercase of `c`; non-ASCII codepoints are unchanged. */
+exp global fn to_upper(c: char): char {
+    var cp = c to u32
+    if cp >= 97 && cp <= 122 { return one_byte((cp - 32) to byte) }
+    c
+}
+
+/** teko::runtime::char_eq — true iff `a` and `b` are the same codepoint. */
+exp fn char_eq(a: char, b: char): bool {
+    (a to u32) == (b to u32)
+}
+
+/** teko::runtime::is_alpha — true iff the codepoint is an ASCII letter or any non-ASCII byte. */
+exp global fn is_alpha(c: char): bool {
+    var cp = c to u32
+    (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || cp > 127
+}
+
+/** teko::runtime::is_digit — true iff the codepoint is an ASCII decimal digit '0'-'9'. */
+exp global fn is_digit(c: char): bool {
+    var cp = c to u32
+    cp >= 48 && cp <= 57
+}
+
+/** teko::runtime::is_space — true iff the codepoint is ASCII whitespace. */
+exp global fn is_space(c: char): bool {
+    var cp = c to u32
+    cp == 32 || cp == 9 || cp == 10 || cp == 13 || cp == 12 || cp == 11
 }
 
 /**
- * The division-by-zero panic (F3's checked `div`/`mod` guard).
+ * teko::runtime::slice_eq_bytes — byte-for-byte equality of two POD `[]T` slices addressed by raw
+ * pointer words: same length AND identical bytes across `a_len * elem_size` bytes.
  *
- * @return  nothing (diverges — see `panic`)
+ * @param a_ptr      the first slice's base address, as a word
+ * @param a_len      the first slice's element count
+ * @param b_ptr      the second slice's base address, as a word
+ * @param b_len      the second slice's element count
+ * @param elem_size  the element's byte width
+ * @return           true iff both slices hold the same length and bytes
  */
-exp fn panic_div0() { panic("division by zero") }
+exp fn slice_eq_bytes(a_ptr: u64, a_len: u64, b_ptr: u64, b_len: u64, elem_size: u64): bool {
+    if a_len != b_len { return false }
+    var total = a_len * elem_size
+    var i: u64 = 0
+    loop {
+        if i >= total { break }
+        if teko::mem::load_u8(a_ptr + i) != teko::mem::load_u8(b_ptr + i) { return false }
+        i++
+    }
+    true
+}
 
 /**
- * The index-out-of-bounds panic (a slice/array access whose index is outside `[0, len)`).
+ * teko::runtime::slice_f64_eq — element-wise IEEE `==` equality of two `[]f64` slices addressed
+ * by raw pointer words: same length AND every element bit-identical-or-equal by native `f64`
+ * comparison (NOT memcmp — a float's bits are not its value equality).
  *
- * @return  nothing (diverges — see `panic`)
+ * @param a_ptr  the first slice's base address, as a word
+ * @param a_len  the first slice's element count
+ * @param b_ptr  the second slice's base address, as a word
+ * @param b_len  the second slice's element count
+ * @return       true iff both slices hold the same length and every `f64` compares equal
  */
-exp fn panic_oob() { panic("index out of bounds") }
+exp fn slice_f64_eq(a_ptr: u64, a_len: u64, b_ptr: u64, b_len: u64): bool {
+    if a_len != b_len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a_len { break }
+        var av = teko::f64_from_bits(teko::mem::load_u64(a_ptr + i * 8))
+        var bv = teko::f64_from_bits(teko::mem::load_u64(b_ptr + i * 8))
+        if av != bv { return false }
+        i++
+    }
+    true
+}
 
-/**
- * The impossible-narrowing-conversion panic — the `x to T` guard (B.36 / M.1) fires this when
- * `x` does not fit `T`.
- *
- * @return  nothing (diverges — see `panic`)
- */
-exp fn panic_cast() { panic("impossible conversion") }
+/** teko::runtime::panic_div0 — the division-by-zero panic. Diverges. */
+exp global fn panic_div0() { panic("division by zero") }
 
-/**
- * The integer-overflow panic, reserved for the profile-dependent `+`/`-`/`*` overflow guard
- * (DEFERRED — not yet wired by codegen; this entry point exists for that future caller).
- *
- * @return  nothing (diverges — see `panic`)
- */
-exp fn panic_overflow() { panic("integer overflow") }
+/** teko::runtime::panic_oob — the index-out-of-bounds panic. Diverges. */
+exp global fn panic_oob() { panic("index out of bounds") }
 
-/**
- * The POSITIONED out-of-bounds panic: prints `"line:col: "` then the canonical OOB panic, so the
- * VM and the native backend locate an index-out-of-bounds failure identically (mirror of
- * `teko_rt.c::tk_panic_oob_at` and the VM's `vm_panic_pos`). Native-only globals
- * `_tk_cast_loc_line`/`_tk_cast_loc_col` (defined in `teko_rt.c`) carry the SAME position for the
- * cast guard: codegen wraps every `tk_to_*` call in a statement-expression that stores the cast
- * node's source position into those globals just before the call, and `tk_panic_cast()` reads them
- * to prefix `"line:col: "` the same way; the VM carries its own position via its eval frame
- * instead, so it needs no Teko-side twin for that half.
- *
- * @param line  the 1-based source line of the failing index expression
- * @param col   the 1-based source column of the failing index expression
- * @return      nothing (diverges — see `panic`)
- */
+/** teko::runtime::panic_cast — the impossible-narrowing-conversion panic. Diverges. */
+exp global fn panic_cast() { panic("impossible conversion") }
+
+/** teko::runtime::panic_overflow — the integer-overflow panic. Diverges. */
+exp global fn panic_overflow() { panic("integer overflow") }
+
+/** teko::runtime::panic_oob_at — the out-of-bounds panic, prefixed with `"line:col: "`.
+ * Diverges. */
 exp fn panic_oob_at(line: u32, col: u32) {
     ewrite(teko::str::concat(teko::u64_to_str(line to u64), ":", teko::u64_to_str(col to u64)))
     ewrite(": ")
     panic_oob()
 }
 
-// --- F3 checked division / modulo: panic on a zero divisor (no UB / SIGFPE) ---
-// One helper per signed/unsigned width in the seed; here the canonical form is the i64
-// shape — codegen selects the concrete width from the binary node's prim. (NOTE, out of
-// scope: overflow guarding for +,-,* is profile-dependent and DEFERRED; panic_overflow
-// above exists for that future wiring.)
+/** teko::runtime::panic_null_deref_at — the null-reference-dereference panic, prefixed with
+ * `"line:col: "`. Diverges. */
+exp fn panic_null_deref_at(line: u32, col: u32) {
+    ewrite(teko::str::concat(teko::u64_to_str(line to u64), ":", teko::u64_to_str(col to u64)))
+    ewrite(": ")
+    panic("null reference dereference")
+}
 
-exp fn div(a: i64, b: i64) -> i64 {
+/** teko::runtime::panic_str_slice_oob — the string-slice-out-of-range panic. Diverges. */
+exp global fn panic_str_slice_oob() { panic("string slice out of range") }
+
+/** teko::runtime::panic_oom — the out-of-memory panic. Diverges. */
+exp global fn panic_oom() { panic("out of memory") }
+
+/** teko::runtime::panic_cast_at — the impossible-conversion panic; prefixed with `"line:col: "`
+ * when `line != 0`, plain otherwise. Diverges. */
+exp fn panic_cast_at(line: u32, col: u32) {
+    if line != 0 {
+        ewrite(teko::str::concat(teko::u64_to_str(line to u64), ":", teko::u64_to_str(col to u64)))
+        ewrite(": ")
+    }
+    panic_cast()
+}
+
+/** teko::runtime::cast_check_u8_s — trap `i64 -> u8` out of `[0, 255]`. */
+exp fn cast_check_u8_s(v: i64, line: u32, col: u32) { if v < 0 || v > 255 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u16_s — trap `i64 -> u16` out of `[0, 65535]`. */
+exp fn cast_check_u16_s(v: i64, line: u32, col: u32) { if v < 0 || v > 65535 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u32_s — trap `i64 -> u32` out of `[0, 4294967295]`. */
+exp fn cast_check_u32_s(v: i64, line: u32, col: u32) { if v < 0 || v > 4294967295 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u64_s — trap `i64 -> u64` when negative. */
+exp fn cast_check_u64_s(v: i64, line: u32, col: u32) { if v < 0 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i8_s — trap `i64 -> i8` out of `[-128, 127]`. */
+exp fn cast_check_i8_s(v: i64, line: u32, col: u32) { if v < -128 || v > 127 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i16_s — trap `i64 -> i16` out of `[-32768, 32767]`. */
+exp fn cast_check_i16_s(v: i64, line: u32, col: u32) { if v < -32768 || v > 32767 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i32_s — trap `i64 -> i32` out of `[-2147483648, 2147483647]`. */
+exp fn cast_check_i32_s(v: i64, line: u32, col: u32) { if v < -2147483648 || v > 2147483647 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u8_u — trap `u64 -> u8` over `255`. */
+exp fn cast_check_u8_u(v: u64, line: u32, col: u32) { if v > 255 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u16_u — trap `u64 -> u16` over `65535`. */
+exp fn cast_check_u16_u(v: u64, line: u32, col: u32) { if v > 65535 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u32_u — trap `u64 -> u32` over `4294967295`. */
+exp fn cast_check_u32_u(v: u64, line: u32, col: u32) { if v > 4294967295 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i8_u — trap `u64 -> i8` over `127`. */
+exp fn cast_check_i8_u(v: u64, line: u32, col: u32) { if v > 127 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i16_u — trap `u64 -> i16` over `32767`. */
+exp fn cast_check_i16_u(v: u64, line: u32, col: u32) { if v > 32767 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i32_u — trap `u64 -> i32` over `2147483647`. */
+exp fn cast_check_i32_u(v: u64, line: u32, col: u32) { if v > 2147483647 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i64_u — trap `u64 -> i64` over `9223372036854775807`. */
+exp fn cast_check_i64_u(v: u64, line: u32, col: u32) { if v > 9223372036854775807 { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u8_from_f64 — trap `f64 -> u8` outside `[0, 255]` (NaN/inf trap). */
+exp fn cast_check_u8_from_f64(v: f64, line: u32, col: u32) { if !(v >= 0.0 && v <= 255.0) { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u16_from_f64 — trap `f64 -> u16` outside `[0, 65535]` (NaN/inf trap). */
+exp fn cast_check_u16_from_f64(v: f64, line: u32, col: u32) { if !(v >= 0.0 && v <= 65535.0) { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u32_from_f64 — trap `f64 -> u32` outside `[0, 4294967295]` (NaN/inf trap). */
+exp fn cast_check_u32_from_f64(v: f64, line: u32, col: u32) { if !(v >= 0.0 && v <= 4294967295.0) { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_u64_from_f64 — trap `f64 -> u64` outside `[0, 2^64)` (NaN/inf trap). */
+exp fn cast_check_u64_from_f64(v: f64, line: u32, col: u32) { if !(v >= 0.0 && v < 18446744073709551616.0) { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i8_from_f64 — trap `f64 -> i8` outside `[-128, 127]` (NaN/inf trap). */
+exp fn cast_check_i8_from_f64(v: f64, line: u32, col: u32) { if !(v >= -128.0 && v <= 127.0) { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i16_from_f64 — trap `f64 -> i16` outside `[-32768, 32767]` (NaN/inf trap). */
+exp fn cast_check_i16_from_f64(v: f64, line: u32, col: u32) { if !(v >= -32768.0 && v <= 32767.0) { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i32_from_f64 — trap `f64 -> i32` outside `[-2147483648, 2147483647]` (NaN/inf trap). */
+exp fn cast_check_i32_from_f64(v: f64, line: u32, col: u32) { if !(v >= -2147483648.0 && v <= 2147483647.0) { panic_cast_at(line, col) } }
+
+/** teko::runtime::cast_check_i64_from_f64 — trap `f64 -> i64` outside `[-2^63, 2^63)` (NaN/inf trap). */
+exp fn cast_check_i64_from_f64(v: f64, line: u32, col: u32) { if !(v >= -9223372036854775808.0 && v < 9223372036854775808.0) { panic_cast_at(line, col) } }
+
+exp fn div(a: i64, b: i64): i64 {
     if b == 0 { panic_div0() }
     a / b
 }
 
-exp fn mod(a: i64, b: i64) -> i64 {
+exp fn mod(a: i64, b: i64): i64 {
     if b == 0 { panic_div0() }
     a % b
 }
 
-// --- F3 checked narrowing conversion: panic if the value can't fit the target ---
-// The source is widened to a carrier WITHOUT loss (codegen only emits these when the
-// SOURCE prim fits the carrier); the range check catches an out-of-range value and PANICS.
-// One helper per target width/signedness in the seed; the canonical shape is shown for u8.
-
-exp fn to_u8(v: i64) -> u8 {
+exp fn to_u8(v: i64): u8 {
     if v < 0 || v > 255 { panic_cast() }
     v to u8
+}
+
+const INTERN_BUCKETS: u64 = 1024
+
+const INTERN_BUCKET_MASK: u64 = 1023
+
+const INTERN_KEY_PTR: u64 = 0
+
+const INTERN_KEY_LEN: u64 = 8
+
+const INTERN_VAL_PTR: u64 = 16
+
+const INTERN_VAL_LEN: u64 = 24
+
+const INTERN_NEXT: u64 = 32
+
+const INTERN_ENTRY_BYTES: u64 = 40
+
+/**
+ * Returns the intern region handle as a word, materializing the region (a child of the program
+ * region) on first use so the interned entries outlive every per-test arena rewind.
+ *
+ * @return  the intern region handle as a word
+ */
+fn intern_region_word(): u64 {
+    var existing = teko::runtime::intern_region_slot()
+    if existing != 0 { return existing }
+    var region = teko::runtime::region_new(teko::runtime::region_program())
+    var word = teko::sys::ptr_word(region) to u64
+    teko::runtime::set_intern_region_slot(word)
+    word
+}
+
+/**
+ * Bump-allocates `n` bytes (rounded up from zero to one) inside the intern region and returns the
+ * raw address.
+ *
+ * @param n  the number of bytes to reserve
+ * @return   the base address of the reserved block
+ */
+fn intern_alloc(n: u64): u64 {
+    var region = teko::sys::word_ptr(intern_region_word() to i64)
+    var size = if n == 0 { 1 } else { n }
+    teko::sys::ptr_word(teko::runtime::region_alloc(region, size)) to u64
+}
+
+/**
+ * Returns the interning bucket table's base address, allocating and zero-filling a fresh
+ * `INTERN_BUCKETS`-slot table in the intern region the first time it is needed.
+ *
+ * @return  the bucket-table base address
+ */
+fn intern_table(): u64 {
+    var existing = teko::runtime::intern_table_slot()
+    if existing != 0 { return existing }
+    var tbase = intern_alloc(INTERN_BUCKETS * 8)
+    var i: u64 = 0
+    loop {
+        if i >= INTERN_BUCKETS { break }
+        teko::mem::store_u64(tbase + i * 8, 0)
+        i++
+    }
+    teko::runtime::set_intern_table_slot(tbase)
+    tbase
+}
+
+/**
+ * Copies `s`'s bytes into a fresh block in the intern region and returns the block's address.
+ *
+ * @param s  the string whose bytes are copied into intern-region storage
+ * @return   the base address of the stored copy
+ */
+fn intern_store_bytes(s: str): u64 {
+    var addr = intern_alloc(s.len)
+    var i: u64 = 0
+    loop {
+        if i >= s.len { break }
+        teko::mem::store_u8(addr + i, s[i] to u64)
+        i++
+    }
+    addr
+}
+
+/**
+ * Tests whether the intern-region key at `kaddr` (length `klen`) equals `key` byte for byte.
+ *
+ * @param kaddr  the stored key's base address
+ * @param klen   the stored key's length in bytes
+ * @param key    the query key
+ * @return       true when the stored key and `key` are byte-identical
+ */
+fn intern_key_eq(kaddr: u64, klen: u64, key: str): bool {
+    if klen != key.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= klen { break }
+        if teko::mem::load_u8(kaddr + i) != (key[i] to u64) { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * Walks the bucket chain rooted at `head` for the entry whose key equals `key`.
+ *
+ * @param head  the first entry address of the bucket chain, or 0 for an empty bucket
+ * @param key   the key to locate
+ * @return      the matching entry's address, or 0 when the chain holds no such key
+ */
+fn intern_find(head: u64, key: str): u64 {
+    var e = head
+    loop {
+        if e == 0 { break }
+        if intern_key_eq(teko::mem::load_u64(e + INTERN_KEY_PTR), teko::mem::load_u64(e + INTERN_KEY_LEN), key) { return e }
+        e = teko::mem::load_u64(e + INTERN_NEXT)
+    }
+    0
+}
+
+/**
+ * Builds a fresh copy, in the current region, of the value bytes held by entry `e`.
+ *
+ * @param e  the entry whose value is copied out
+ * @return   an independent `str` owning a copy of the entry's value
+ */
+fn intern_read_val(e: u64): str {
+    var vptr = teko::mem::load_u64(e + INTERN_VAL_PTR)
+    var vlen = teko::mem::load_u64(e + INTERN_VAL_LEN)
+    var xs: [vlen]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= vlen { break }
+        xs[i] = teko::mem::load_u8(vptr + i) to byte
+        i++
+    }
+    str(xs)
+}
+
+/**
+ * Looks up `key` in the string-interning cache, returning a fresh independent copy of the cached
+ * value. Migrates the C `tk_intern_get` (an FNV-1a hash-map over the arena); the returned `str`
+ * never views the table's own storage, so a later `intern_put` cannot dangle it.
+ *
+ * @param key  the key to look up
+ * @return     a copy of the cached value, or the empty string when the key is not present
+ */
+pub global fn intern_get(key: str): str {
+    var table = intern_table()
+    var bucket = table + (teko::runtime::str_hash(key) & INTERN_BUCKET_MASK) * 8
+    var e = intern_find(teko::mem::load_u64(bucket), key)
+    if e == 0 { return "" }
+    intern_read_val(e)
+}
+
+/**
+ * Interns `value` under `key`, replacing any prior value, and returns `value`. Migrates the C
+ * `tk_intern_put`; key and value bytes are copied into the intern region so the cache owns them.
+ *
+ * @param key    the key to store under
+ * @param value  the value to associate with `key`
+ * @return       `value`, unchanged
+ */
+pub global fn intern_put(key: str, value: str): str {
+    var table = intern_table()
+    var bucket = table + (teko::runtime::str_hash(key) & INTERN_BUCKET_MASK) * 8
+    var e = intern_find(teko::mem::load_u64(bucket), key)
+    if e != 0 {
+        teko::mem::store_u64(e + INTERN_VAL_PTR, intern_store_bytes(value))
+        teko::mem::store_u64(e + INTERN_VAL_LEN, value.len)
+        return value
+    }
+    var entry = intern_alloc(INTERN_ENTRY_BYTES)
+    teko::mem::store_u64(entry + INTERN_KEY_PTR, intern_store_bytes(key))
+    teko::mem::store_u64(entry + INTERN_KEY_LEN, key.len)
+    teko::mem::store_u64(entry + INTERN_VAL_PTR, intern_store_bytes(value))
+    teko::mem::store_u64(entry + INTERN_VAL_LEN, value.len)
+    teko::mem::store_u64(entry + INTERN_NEXT, teko::mem::load_u64(bucket))
+    teko::mem::store_u64(bucket, entry)
+    value
+}
+
+/**
+ * Empties the string-interning cache, dropping the intern region so every entry's storage is
+ * reclaimed at once. Migrates the C `tk_intern_reset`; the next access lazily rebuilds the table.
+ */
+pub global fn intern_reset() {
+    var region = teko::runtime::intern_region_slot()
+    if region == 0 { return }
+    teko::runtime::region_drop(teko::sys::word_ptr(region to i64))
+    teko::runtime::set_intern_region_slot(0)
+    teko::runtime::set_intern_table_slot(0)
+}
+
+const NAMES_GEN_SHIFT: u64 = 32
+
+const NAMES_SLOT_MASK: u64 = 4294967295
+
+const NAMES_NO_SLOT: u64 = 4294967295
+
+const NAMES_GEN_MAX: u64 = 4294967295
+
+const NAMES_INITIAL_CAP: u64 = 16
+
+const NAMES_KIND_CELL: u64 = 1
+
+const NAMES_OK: i64 = 0
+
+const NAMES_ERR_UNKNOWN: i64 = -1
+
+const NAMES_ERR_CLOSED: i64 = -2
+
+const NAMES_ERR_KIND: i64 = -3
+
+const NAMES_NO_VALUE: i64 = -9223372036854775807 - 1
+
+const NS_TABLE: u64 = 0
+
+const NS_CAP: u64 = 8
+
+const NS_USED: u64 = 16
+
+const NS_LIVE: u64 = 24
+
+const NS_FREE: u64 = 32
+
+const NS_BYTES: u64 = 40
+
+const NAME_RESOURCE: u64 = 0
+
+const NAME_GEN: u64 = 8
+
+const NAME_KIND: u64 = 16
+
+const NAME_NEXT_FREE: u64 = 24
+
+const NAME_LIVE: u64 = 32
+
+const NAME_SLOT_BYTES: u64 = 40
+
+/**
+ * Returns the name-registry state block, allocating and initializing it in the program region the
+ * first time the registry is touched so the handle table is program-resident (survives task exit).
+ *
+ * @return  the state-block address
+ */
+fn names_state(): u64 {
+    var existing = teko::runtime::names_state_slot()
+    if existing != 0 { return existing }
+    var block = teko::sys::ptr_word(teko::runtime::Arena::current().program().alloc(NS_BYTES)) to u64
+    teko::mem::store_u64(block + NS_TABLE, 0)
+    teko::mem::store_u64(block + NS_CAP, 0)
+    teko::mem::store_u64(block + NS_USED, 0)
+    teko::mem::store_u64(block + NS_LIVE, 0)
+    teko::mem::store_u64(block + NS_FREE, NAMES_NO_SLOT)
+    teko::runtime::set_names_state_slot(block)
+    block
+}
+
+/**
+ * Returns the address of slot `index` within the registry's slot array.
+ *
+ * @param st     the registry state block
+ * @param index  the zero-based slot index
+ * @return       the slot's base address
+ */
+fn names_slot_addr(st: u64, index: u64): u64 {
+    teko::mem::load_u64(st + NS_TABLE) + index * NAME_SLOT_BYTES
+}
+
+/**
+ * Doubles the slot array inside the program region and copies the live prefix over. The bump
+ * allocator has no realloc, so the previous array is abandoned until process exit.
+ *
+ * @param st  the registry state block
+ * @return    true when the array grew, false when the index space is exhausted
+ */
+fn names_grow(st: u64): bool {
+    var cap = teko::mem::load_u64(st + NS_CAP)
+    var ncap = if cap == 0 { NAMES_INITIAL_CAP } else { cap * 2 }
+    if ncap > NAMES_NO_SLOT { ncap = NAMES_NO_SLOT }
+    if ncap <= cap { return false }
+    var grown = teko::sys::ptr_word(teko::runtime::Arena::current().program().alloc(ncap * NAME_SLOT_BYTES)) to u64
+    var used_bytes = teko::mem::load_u64(st + NS_USED) * NAME_SLOT_BYTES
+    var old = teko::mem::load_u64(st + NS_TABLE)
+    var i: u64 = 0
+    loop {
+        if i >= used_bytes { break }
+        teko::mem::store_u64(grown + i, teko::mem::load_u64(old + i))
+        i = i + 8
+    }
+    teko::mem::store_u64(st + NS_TABLE, grown)
+    teko::mem::store_u64(st + NS_CAP, ncap)
+    true
+}
+
+/**
+ * Reserves a slot and returns its index, recycling the free list when possible and growing the
+ * array otherwise, without touching `kind` or `resource` (the caller decides those).
+ *
+ * @param st  the registry state block
+ * @return    the reserved slot index, or `NAMES_NO_SLOT` when no slot can be issued
+ */
+fn names_take(st: u64): u64 {
+    var free = teko::mem::load_u64(st + NS_FREE)
+    var index: u64 = 0
+    if free != NAMES_NO_SLOT {
+        index = free
+        teko::mem::store_u64(st + NS_FREE, teko::mem::load_u64(names_slot_addr(st, index) + NAME_NEXT_FREE))
+    } else {
+        var used = teko::mem::load_u64(st + NS_USED)
+        if used == teko::mem::load_u64(st + NS_CAP) {
+            if !names_grow(st) { return NAMES_NO_SLOT }
+        }
+        index = used
+        teko::mem::store_u64(st + NS_USED, used + 1)
+        var fresh = names_slot_addr(st, index)
+        teko::mem::store_u64(fresh + NAME_RESOURCE, 0)
+        teko::mem::store_u64(fresh + NAME_GEN, 1)
+        teko::mem::store_u64(fresh + NAME_KIND, 0)
+    }
+    var slot = names_slot_addr(st, index)
+    teko::mem::store_u64(slot + NAME_NEXT_FREE, NAMES_NO_SLOT)
+    teko::mem::store_u64(slot + NAME_LIVE, 1)
+    teko::mem::store_u64(st + NS_LIVE, teko::mem::load_u64(st + NS_LIVE) + 1)
+    index
+}
+
+/**
+ * Mints the name (generation in the high half, slot index in the low half) that slot `index`
+ * currently carries.
+ *
+ * @param st     the registry state block
+ * @param index  the slot index
+ * @return       the packed name
+ */
+fn names_name_of(st: u64, index: u64): u64 {
+    (teko::mem::load_u64(names_slot_addr(st, index) + NAME_GEN) << NAMES_GEN_SHIFT) | index
+}
+
+/**
+ * Classifies `name` against the registry: live, never-issued, or closed. The three generation
+ * comparisons are the guarantee — a stamp above the slot's was never issued, one below belonged to a
+ * closed tenant, and a non-live slot is unknown.
+ *
+ * @param st    the registry state block
+ * @param name  the name to classify
+ * @return      `NAMES_OK`, `NAMES_ERR_UNKNOWN`, or `NAMES_ERR_CLOSED`
+ */
+fn names_check(st: u64, name: u64): i64 {
+    var index = name & NAMES_SLOT_MASK
+    var gen = name >> NAMES_GEN_SHIFT
+    if gen == 0 || index >= teko::mem::load_u64(st + NS_USED) { return NAMES_ERR_UNKNOWN }
+    var sgen = teko::mem::load_u64(names_slot_addr(st, index) + NAME_GEN)
+    if gen > sgen { return NAMES_ERR_UNKNOWN }
+    if gen < sgen { return NAMES_ERR_CLOSED }
+    if teko::mem::load_u64(names_slot_addr(st, index) + NAME_LIVE) == 0 { return NAMES_ERR_UNKNOWN }
+    NAMES_OK
+}
+
+/**
+ * Returns the resource `name` stands for when it is a live handle of `kind`, else 0.
+ *
+ * @param st    the registry state block
+ * @param name  the name to resolve
+ * @param kind  the required resource kind
+ * @return      the resource address, or 0 when the name is stale or of another kind
+ */
+fn names_lookup(st: u64, name: u64, kind: u64): u64 {
+    if names_check(st, name) != NAMES_OK { return 0 }
+    var slot = names_slot_addr(st, name & NAMES_SLOT_MASK)
+    if teko::mem::load_u64(slot + NAME_KIND) != kind { return 0 }
+    teko::mem::load_u64(slot + NAME_RESOURCE)
+}
+
+/**
+ * Opens a cell (one int64 in the program region) holding `value` and returns its name. Migrates
+ * `tk_names_cell_open`; a recycled slot reuses its previous cell's storage.
+ *
+ * @param value  the initial cell value; `NAMES_NO_VALUE` is refused (not storable)
+ * @return       the fresh name, or 0 on refusal or slot exhaustion
+ */
+pub fn names_cell_open(value: i64): u64 {
+    if value == NAMES_NO_VALUE { return 0 }
+    var st = names_state()
+    var index = names_take(st)
+    if index == NAMES_NO_SLOT { return 0 }
+    var slot = names_slot_addr(st, index)
+    if teko::mem::load_u64(slot + NAME_KIND) != NAMES_KIND_CELL || teko::mem::load_u64(slot + NAME_RESOURCE) == 0 {
+        var cell = teko::sys::ptr_word(teko::runtime::Arena::current().program().alloc(8)) to u64
+        teko::mem::store_u64(slot + NAME_RESOURCE, cell)
+        teko::mem::store_u64(slot + NAME_KIND, NAMES_KIND_CELL)
+    }
+    teko::mem::store_u64(teko::mem::load_u64(slot + NAME_RESOURCE), value to u64)
+    names_name_of(st, index)
+}
+
+/**
+ * Reads the value held by the cell named `name`, or `NAMES_NO_VALUE` for a dead name. Migrates
+ * `tk_names_cell_read`.
+ *
+ * @param name  the cell's name
+ * @return      the cell's value, or `NAMES_NO_VALUE` when the name is not a live cell
+ */
+pub fn names_cell_read(name: u64): i64 {
+    var cell = names_lookup(names_state(), name, NAMES_KIND_CELL)
+    if cell == 0 { return NAMES_NO_VALUE }
+    teko::mem::load_u64(cell) to i64
+}
+
+/**
+ * Reports whether `name` is a live cell, else the failure mode. Migrates `tk_names_cell_status`.
+ *
+ * @param name  the name to check
+ * @return      `NAMES_OK`, or the failure status (`NAMES_ERR_KIND` when it names another kind)
+ */
+pub fn names_cell_status(name: u64): i64 {
+    var st = names_state()
+    var status = names_check(st, name)
+    if status != NAMES_OK { return status }
+    if teko::mem::load_u64(names_slot_addr(st, name & NAMES_SLOT_MASK) + NAME_KIND) != NAMES_KIND_CELL { return NAMES_ERR_KIND }
+    NAMES_OK
+}
+
+/**
+ * Reports the liveness/staleness status of `name`, kind-agnostic. Migrates `tk_names_status`.
+ *
+ * @param name  the name to classify
+ * @return      `NAMES_OK` or the failure mode
+ */
+pub fn names_status(name: u64): i64 {
+    names_check(names_state(), name)
+}
+
+/**
+ * Closes `name`, bumping its slot's generation so every name ever issued for that slot becomes
+ * strictly older, and recycles the slot unless its stamp has retired. Migrates `tk_names_close`.
+ *
+ * @param name  the name to close
+ * @return      `NAMES_OK`, or the failure mode when the name was not live
+ */
+pub fn names_close(name: u64): i64 {
+    var st = names_state()
+    var status = names_check(st, name)
+    if status != NAMES_OK { return status }
+    var index = name & NAMES_SLOT_MASK
+    var slot = names_slot_addr(st, index)
+    teko::mem::store_u64(slot + NAME_LIVE, 0)
+    teko::mem::store_u64(slot + NAME_GEN, teko::mem::load_u64(slot + NAME_GEN) + 1)
+    teko::mem::store_u64(st + NS_LIVE, teko::mem::load_u64(st + NS_LIVE) - 1)
+    if teko::mem::load_u64(slot + NAME_GEN) >= NAMES_GEN_MAX { return NAMES_OK }
+    teko::mem::store_u64(slot + NAME_NEXT_FREE, teko::mem::load_u64(st + NS_FREE))
+    teko::mem::store_u64(st + NS_FREE, index)
+    NAMES_OK
+}
+
+/**
+ * Returns how many names are live right now. Migrates `tk_names_live_count`.
+ *
+ * @return  the live-name count
+ */
+pub fn names_live_count(): u64 {
+    teko::mem::load_u64(names_state() + NS_LIVE)
+}
+
+/**
+ * Returns the slot array's current capacity. Migrates `tk_names_capacity`.
+ *
+ * @return  the number of slots the array can hold
+ */
+pub fn names_capacity(): u64 {
+    teko::mem::load_u64(names_state() + NS_CAP)
+}
+
+/**
+ * Extracts the slot index encoded in `name`. Migrates `tk_names_slot_of`.
+ *
+ * @param name  the packed name
+ * @return      the slot index (the name's low half)
+ */
+pub fn names_slot_of(name: u64): u64 {
+    name & NAMES_SLOT_MASK
+}
+
+/**
+ * Extracts the generation stamp encoded in `name`. Migrates `tk_names_generation_of`.
+ *
+ * @param name  the packed name
+ * @return      the generation stamp (the name's high half)
+ */
+pub fn names_generation_of(name: u64): u64 {
+    name >> NAMES_GEN_SHIFT
 }

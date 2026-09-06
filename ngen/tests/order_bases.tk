@@ -1,0 +1,154 @@
+// order_bases.tk -- free order of declaration for a class's BASE and a
+// class's INTERFACE (§50 O3, docs/design/plano-ngen-entrega4.md): a `:` list
+// naming a type declared further down materializes that declaration on the
+// spot (teko_fwd.tk's `tk_fwd_materialize`), so the base is whole -- fields,
+// virtual slots and a constructor -- before the derived class lays itself
+// out, and a class derives from an interface declared below it the same way.
+//
+// `GrandDog : Dog` sits above `class Dog : Animal`, itself above `class
+// Animal` -- three levels chained out of order, all materialized in a
+// single recursive descent. `Dog` runs `: base(n)` to chain to Animal's own
+// constructor, overrides a virtual method and calls `base.speak()` from the
+// override; `GrandDog`, with no constructor of its own, proves the chain
+// reaches two levels up through `base.speak()` alone. The whole hierarchy
+// sits inside `namespace Zoo`, reached from `main`/`checks` (outside it)
+// through `using Zoo;` -- a base out of order and a namespace together.
+// `Sq : IShape` sits above `interface IShape`, outside any namespace.
+//
+// §50 O3b: `Circle : Shape` sits above `abstract class Shape`, `Tri :
+// PubBase` above `public class PubBase`, and `Pent : PubIface` above
+// `public interface PubIface` -- the modifier scan backs `kwstart` up over
+// (`abstract`/`public`) so the replay reads the very same tokens the real
+// declaration would, and the materialized row carries the right
+// abstractness/visibility instead of the concrete/internal defaults the
+// bug used to leave it with.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+using Zoo;
+
+namespace Zoo {
+    class GrandDog : Dog {
+        public override i64 speak() {
+            return base.speak() + 10;
+        }
+    }
+
+    class Dog : Animal {
+        public i64 tricks;
+
+        public Dog(i64 n) : base(n) {
+            tricks = 0;
+        }
+
+        public override i64 speak() {
+            return base.speak() + 1;
+        }
+    }
+
+    class Animal {
+        public i64 legs;
+
+        public Animal(i64 n) {
+            legs = n;
+        }
+
+        public virtual i64 speak() {
+            return legs;
+        }
+    }
+}
+
+class Sq : IShape {
+    public i64 side;
+
+    public i64 area() {
+        return side * side;
+    }
+}
+
+interface IShape {
+    i64 area();
+}
+
+class Circle : Shape {
+    public i64 r;
+
+    public override i64 area() {
+        return r * r;
+    }
+}
+
+abstract class Shape {
+    public abstract i64 area();
+}
+
+class Tri : PubBase {
+    public i64 height;
+
+    public Tri(i64 h) : base(h) {
+        height = h;
+    }
+
+    public i64 doubled() {
+        return val * 2;
+    }
+}
+
+public class PubBase {
+    public i64 val;
+
+    public PubBase(i64 v) {
+        val = v;
+    }
+}
+
+class Pent : PubIface {
+    public i64 side;
+
+    public i64 area() {
+        return side * side * 5;
+    }
+}
+
+public interface PubIface {
+    i64 area();
+}
+
+i64 checks() {
+    Dog d = new Dog(4);
+    if (d.legs != 4) return 1;
+    if (d.speak() != 5) return 2;
+
+    GrandDog g = new GrandDog;
+    if (g.speak() != 11) return 3;               // legs(0) + Dog's +1 + GrandDog's +10
+
+    Sq sq = new Sq;
+    sq.side = 3;
+    IShape shp = sq;
+    if (shp.area() != 9) return 4;
+
+    Circle c = new Circle;
+    c.r = 5;
+    if (c.area() != 25) return 6;
+
+    Tri t = new Tri(7);
+    if (t.doubled() != 14) return 7;
+
+    Pent p = new Pent;
+    p.side = 2;
+    PubIface pi = p;
+    if (pi.area() != 20) return 8;
+
+    return 0;
+}
+
+i64 main() {
+    i64 floor = rt_live();
+    i64 bad = checks();
+    if (bad != 0) return bad;
+    if (rt_live() != floor) return 5;
+    return 42;
+}

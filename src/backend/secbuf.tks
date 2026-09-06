@@ -1,0 +1,95 @@
+pub type SectionBuf = class {
+    intern wstream: teko::io::FileStream | null
+    intern rstream: teko::io::FileStream | null
+    intern path: str
+    intern total: u64
+
+    pub static fn open(stem: str, tag: str): SectionBuf | error {
+        var path = $"{stem}.{tag}.sect"
+        var ws = match teko::io::open_write(path) { teko::io::FileStream as fs => fs; error as e => return e }
+        SectionBuf { wstream = ws; rstream = null; path = path; total = 0 }
+    }
+
+    pub fn append(data: []byte): u64 | error {
+        var ws = match self.wstream {
+            teko::io::FileStream as fs => fs
+            null => panic($"teko::backend::secbuf: append after finish_writing ({self.path})")
+        }
+        var start = self.total
+        var written = match teko::io::stream_write(ws, data) { u64 as n => n; error as e => return e }
+        self.total = start + written
+        start
+    }
+
+    pub fn append_prefix(data: []byte, n: u64): u64 | error {
+        var ws = match self.wstream {
+            teko::io::FileStream as fs => fs
+            null => panic($"teko::backend::secbuf: append_prefix after finish_writing ({self.path})")
+        }
+        var start = self.total
+        var written = match teko::io::stream_write_prefix(ws, data, n) { u64 as w => w; error as e => return e }
+        self.total = start + written
+        start
+    }
+
+    pub fn size(): u64 { self.total }
+
+    pub fn finish_writing(): error | null {
+        match self.wstream {
+            teko::io::FileStream as ws => {
+                match teko::io::stream_close(ws) { error as e => return e; null => { } }
+            }
+            null => { }
+        }
+        self.wstream = null
+        var rs = match teko::io::open_read(self.path) { teko::io::FileStream as fs => fs; error as e => return e }
+        self.rstream = rs
+        null
+    }
+
+    pub fn copy_range_into(out: teko::io::FileStream, start: u64, end: u64): u64 | error {
+        if start > end || end > self.total {
+            return error { message = $"teko::backend::secbuf: copy_range_into: range [{start},{end}) exceeds section size {self.total} ({self.path})" }
+        }
+        var rs = match self.rstream {
+            teko::io::FileStream as fs => fs
+            null => panic($"teko::backend::secbuf: copy_range_into before finish_writing ({self.path})")
+        }
+        match teko::io::stream_seek(rs, start to i64, teko::io::Whence::Start) { u64 => { }; error as e => return e }
+        var scratch: [teko::io::CHUNK]byte = []
+        var pos = start
+        loop {
+            if pos >= end { break }
+            var remain = end - pos
+            var want = if remain < teko::io::CHUNK { remain } else { teko::io::CHUNK }
+            var view = slice(scratch, 0, want)
+            var got = match teko::io::stream_read(rs, view) { u64 as c => c; error as e => return e }
+            if got == 0 { return error { message = $"teko::backend::secbuf: copy_range_into: unexpected EOF at {pos} ({self.path})" } }
+            match teko::io::stream_write_prefix(out, scratch, got) { u64 => { }; error as e => return e }
+            pos = pos + got
+        }
+        end - start
+    }
+
+    pub fn copy_into(out: teko::io::FileStream): u64 | error {
+        self.copy_range_into(out, 0, self.total)
+    }
+
+    pub fn dispose(): error | null {
+        match self.wstream {
+            teko::io::FileStream as ws => {
+                match teko::io::stream_close(ws) { error as e => return e; null => { } }
+            }
+            null => { }
+        }
+        self.wstream = null
+        match self.rstream {
+            teko::io::FileStream as rs => {
+                match teko::io::stream_close(rs) { error as e => return e; null => { } }
+            }
+            null => { }
+        }
+        self.rstream = null
+        teko::fs::remove_file(self.path)
+    }
+}

@@ -1,0 +1,166 @@
+// surface_reclaim.tk -- the reclaim (D218): the fixed 4 MiB arena with a free
+// list per size class (ngen/lib/rt.tk), reference counting per SCOPE injected
+// over the tree (ngen/teko_rc.tk), and C#'s constructor and destructor.
+//
+// What each part of `main` proves, in order:
+//
+//   1. `public Cell(i64 x)` and `public Cell(i64 x, i64 y)` -- a constructor
+//      with arguments, overloaded by signature, reached by `new Cell(40)`;
+//      `new Cell` with no argument still hands out the zeroed object;
+//   2. `~Cell()` runs when the count reaches zero, and `rt_live()` is back to 0
+//      once the block that held the objects has closed;
+//   3. a class-typed FIELD reassigned releases the object it held, and the
+//      object that holds it releases the field when it dies itself;
+//   4. a million `new` inside a loop, each one discarded at the `}` of the
+//      iteration: without the free lists this walks 24 MB through a 4 MiB
+//      arena and aborts, so reaching the next line at all is the proof;
+//   5. `break` and `return` release the scopes they leave, which the `}` they
+//      jump over would have released;
+//   6. a destructor chain runs the DERIVED class's before the base's, as C#
+//      runs a finalizer chain, and `: base(...)` runs the other way round.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 dtors = 0;                                   // how many destructors have run
+i64 order = 0;                                   // ...and in what order the chain ran
+
+class Cell {
+    public i64 v;
+
+    public Cell(i64 x) {
+        v = x;
+    }
+
+    public Cell(i64 x, i64 y) {
+        v = x + y;
+    }
+
+    ~Cell() {
+        dtors = dtors + 1;
+    }
+}
+
+class Node {
+    public Cell head;
+
+    public Node(i64 x) {
+        head = new Cell(x);
+    }
+}
+
+class Base {
+    public i64 tag;
+
+    public Base(i64 t) {
+        tag = t;
+    }
+
+    ~Base() {
+        order = order * 10 + 1;
+    }
+}
+
+class Derived : Base {
+    public Derived(i64 t) : base(t + 1) {
+    }
+
+    ~Derived() {
+        order = order * 10 + 2;
+    }
+}
+
+// an early `return` out of an inner block: the object the block holds is
+// released on the way out, which the `}` it jumps over would have released
+i64 early(i64 want) {
+    Cell outer = new Cell(1);
+    {
+        Cell inner = new Cell(2);
+        if (inner.v == want) return outer.v;
+    }
+    return 0;
+}
+
+// a `break` out of an inner block, same question asked of the other edge
+i64 broken() {
+    i64 seen = 0;
+    loop {
+        Cell c = new Cell(7);
+        seen = seen + c.v;
+        if (seen >= 14) break;
+    }
+    return seen;
+}
+
+i64 constructors_answer() {
+    Cell a = new Cell(40);
+    Cell b = new Cell(1, 1);
+    Cell z = new Cell;
+    if (a.v != 40) return 1;
+    if (b.v != 2) return 2;
+    if (z.v != 0) return 3;
+    if (dtors != 0) return 4;
+    if (rt_live() != 3) return 5;
+    return 0;
+}
+
+i64 fields_answer() {
+    Node n = new Node(5);
+    if (n.head.v != 5) return 1;
+    if (rt_live() != 2) return 2;                // the node and the cell it built
+    n.head = new Cell(6);                        // the old cell has no owner left
+    if (dtors != 1) return 3;
+    if (n.head.v != 6) return 4;
+    if (rt_live() != 2) return 5;
+    return 0;
+}
+
+i64 million() {
+    i64 i = 0;
+    loop {
+        Cell c = new Cell(i);
+        i = i + 1;
+        if (i >= 1000000) break;
+    }
+    return i;
+}
+
+i64 main() {
+    i64 bad = constructors_answer();
+    if (bad != 0) return 10 + bad;
+    if (dtors != 3) return 20;                   // the three cells died with the block
+    if (rt_live() != 0) return 21;
+
+    dtors = 0;
+    bad = fields_answer();
+    if (bad != 0) return 30 + bad;
+    if (dtors != 2) return 40;                   // the replaced cell, then the field's own
+    if (rt_live() != 0) return 41;
+
+    dtors = 0;
+    if (early(2) != 1) return 50;
+    if (dtors != 2) return 51;                   // the inner cell, then the outer one
+    if (rt_live() != 0) return 52;
+
+    dtors = 0;
+    if (broken() != 14) return 60;
+    if (dtors != 2) return 61;                   // one per iteration, the `break` included
+    if (rt_live() != 0) return 62;
+
+    dtors = 0;
+    if (million() != 1000000) return 70;
+    if (dtors != 1000000) return 71;
+    if (rt_live() != 0) return 72;
+    if (rt_peak() > 4096) return 73;             // one block, reused a million times
+
+    order = 0;
+    {
+        Derived d = new Derived(1);
+        if (d.tag != 2) return 80;               // `: base(t + 1)` ran the base's own
+    }
+    if (order != 21) return 81;                  // the derived's destructor, then the base's
+    if (rt_live() != 0) return 82;
+
+    return 42;
+}

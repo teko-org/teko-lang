@@ -6,7 +6,7 @@ source: DECISION_LOG.md (D29 round-2, D31b empirical findings), .claude/skills/d
 
 # Teko Memory Model Empirical Findings (2026-07-13)
 
-From D29/D31 VM+native empirical: **1.5GB was the VM interpreter (in-process functional env), not the arena.** The compiler's arena is ~366 MB (codegen + front-end), leak-to-root batch-safe with right-sizing (free-list + first-rung tuning + free-old-on-grow).
+From D29/D31 empirical benchmarking: **compiler's arena budget is ~366 MB (codegen + front-end), leak-to-root batch-safe with right-sizing (free-list + first-rung tuning + free-old-on-grow).**
 
 **Free-of-aliased is ASan-invisible:** only `TEKO_MEM_PARANOID=1` catches double-free or use-after-free of aliased pointers (the spine doesn't track them); vanilla ASan is silent (no instrumentation overhead). Native gate ASan + UBSan audit the production path's UB; PARANOID mode is dev-time defense.
 

@@ -1,0 +1,443 @@
+use teko::numeric::bigint
+
+/**
+ * The tag class of an identifier octet (X.690 §8.1.2.2): `Universal` (the fixed, standard
+ * meanings this module natively models — BOOLEAN, INTEGER, …), `Application`,
+ * `ContextSpecific` (the common case for a schema-defined tagged field, e.g. X.509's `[0]`
+ * version), and `Private`.
+ */
+exp type Asn1Class = enum { Universal; Application; ContextSpecific; Private }
+
+/**
+ * The kind discriminant of an `Asn1Value`: which ASN.1 type it holds, or `Tagged` for a
+ * context/application/private-tagged value carried outside the universal class. See the module
+ * doc's VALUE MODEL and TAGGED VALUES notes for which `Asn1Value` fields each kind reads.
+ */
+exp type Asn1Tag = enum {
+    Boolean; Integer; BitString; OctetString; Null; ObjectIdentifier;
+    Utf8String; PrintableString; IA5String; UtcTime; GeneralizedTime;
+    Sequence; Set; Tagged
+}
+
+/**
+ * One ASN.1 value as a tagged struct spanning every `Asn1Tag`: `kind` selects which fields below
+ * carry meaning. Never construct this directly outside
+ * this file — use the validating `asn1_*` builders, which are the sole source of the invariants
+ * (a `BitString`'s `unused_bits <= 7`, a valid `ObjectIdentifier` arc list, a charset-checked
+ * `PrintableString`/`IA5String`, a canonical-form `UtcTime`/`GeneralizedTime`) the encoder and
+ * `asn1_equal` rely on.
+ */
+exp type Asn1Value = struct {
+    /**
+     * Which ASN.1 type this is; selects which of the fields below are meaningful.
+     */
+    kind: Asn1Tag
+    /**
+     * The boolean value for `Boolean`. `false` otherwise.
+     */
+    flag: bool
+    /**
+     * The arbitrary-precision value for `Integer`. Zero otherwise.
+     */
+    integer: bigint::BigInt
+    /**
+     * The payload bytes for `BitString`/`OctetString`, and the raw primitive content for a
+     * primitive `Tagged` value (`constructed = false`). Empty otherwise.
+     */
+    bytes: []byte
+    /**
+     * The count of unused trailing bits (`0..7`) in the last byte of `bytes` for `BitString`.
+     * Zero otherwise.
+     */
+    unused_bits: u64
+    /**
+     * The arc list for `ObjectIdentifier` (e.g. `[1, 2, 840, 113549, 1, 1, 1]`). Empty otherwise.
+     */
+    oid: []u64
+    /**
+     * The text for `Utf8String`/`PrintableString`/`IA5String`/`UtcTime`/`GeneralizedTime`. Empty
+     * otherwise.
+     */
+    text: str
+    /**
+     * The elements for `Sequence`/`Set`, and the children for a constructed `Tagged` value
+     * (`constructed = true`). Empty otherwise.
+     */
+    items: []Asn1Value
+    /**
+     * The tag class for `Tagged`. `Universal` for every other kind.
+     */
+    tag_class: Asn1Class
+    /**
+     * The tag number for `Tagged`. Zero for every other kind (whose tag number is implied by
+     * `kind` itself — see `universal_tag_num`).
+     */
+    tag_num: u64
+    /**
+     * Whether a `Tagged` value's content is constructed (`items`) or primitive (`bytes`).
+     * `true` for `Sequence`/`Set` (always constructed); `false` for every other non-`Tagged`
+     * kind (always primitive).
+     */
+    constructed: bool
+}
+
+fn no_bytes(): []byte {
+    []
+}
+
+fn no_arcs(): []u64 {
+    []
+}
+
+fn no_items(): []Asn1Value {
+    []
+}
+
+fn mk_value(kind: Asn1Tag, flag: bool, integer: bigint::BigInt, bytes: []byte, unused_bits: u64, oid: []u64, text: str, items: []Asn1Value, tag_class: Asn1Class, tag_num: u64, constructed: bool): Asn1Value {
+    Asn1Value { kind = kind; flag = flag; integer = integer; bytes = bytes; unused_bits = unused_bits; oid = oid; text = text; items = items; tag_class = tag_class; tag_num = tag_num; constructed = constructed }
+}
+
+/**
+ * Wraps a boolean as a BOOLEAN value.
+ */
+exp fn asn1_boolean(v: bool): Asn1Value {
+    mk_value(Asn1Tag::Boolean, v, bigint::zero(), no_bytes(), 0, no_arcs(), "", no_items(), Asn1Class::Universal, 0, false)
+}
+
+/**
+ * Wraps an arbitrary-precision integer as an INTEGER value.
+ */
+exp fn asn1_integer(v: bigint::BigInt): Asn1Value {
+    mk_value(Asn1Tag::Integer, false, v, no_bytes(), 0, no_arcs(), "", no_items(), Asn1Class::Universal, 0, false)
+}
+
+/**
+ * Builds a BIT STRING value from `payload` bytes plus a count of unused trailing bits in the
+ * last byte.
+ */
+exp fn asn1_bit_string(payload: []byte, unused_bits: u64): Asn1Value | error {
+    if unused_bits > 7 { return error { message = "asn1: BIT STRING unused-bit count must be 0..7" } }
+    if payload.len == 0 && unused_bits != 0 { return error { message = "asn1: an empty BIT STRING must have zero unused bits" } }
+    bit_string_raw(payload, unused_bits)
+}
+
+fn bit_string_raw(payload: []byte, unused_bits: u64): Asn1Value {
+    mk_value(Asn1Tag::BitString, false, bigint::zero(), payload, unused_bits, no_arcs(), "", no_items(), Asn1Class::Universal, 0, false)
+}
+
+/**
+ * Wraps raw bytes as an OCTET STRING value.
+ */
+exp fn asn1_octet_string(payload: []byte): Asn1Value {
+    mk_value(Asn1Tag::OctetString, false, bigint::zero(), payload, 0, no_arcs(), "", no_items(), Asn1Class::Universal, 0, false)
+}
+
+/**
+ * The ASN.1 NULL value.
+ */
+exp fn asn1_null(): Asn1Value {
+    mk_value(Asn1Tag::Null, false, bigint::zero(), no_bytes(), 0, no_arcs(), "", no_items(), Asn1Class::Universal, 0, false)
+}
+
+/**
+ * Builds an OBJECT IDENTIFIER value from its arc list (e.g. `[1, 2, 840, 113549, 1, 1, 1]` for
+ * `1.2.840.113549.1.1.1`), validating the X.690 §8.19.4 first/second-arc constraint.
+ */
+exp fn asn1_oid(arcs: []u64): Asn1Value | error {
+    if arcs.len < 2 { return error { message = "asn1: OBJECT IDENTIFIER needs at least two arcs" } }
+    if arcs[0] > 2 { return error { message = "asn1: OBJECT IDENTIFIER first arc must be 0, 1, or 2" } }
+    if arcs[0] < 2 && arcs[1] > 39 { return error { message = "asn1: OBJECT IDENTIFIER second arc must be 0..39 when the first arc is 0 or 1" } }
+    oid_raw(arcs)
+}
+
+fn oid_raw(arcs: []u64): Asn1Value {
+    mk_value(Asn1Tag::ObjectIdentifier, false, bigint::zero(), no_bytes(), 0, arcs, "", no_items(), Asn1Class::Universal, 0, false)
+}
+
+/**
+ * Wraps text as a UTF8String value. Total: a Teko `str` is always valid UTF-8, so every `str`
+ * has a UTF8String rendering.
+ */
+exp fn asn1_utf8_string(s: str): Asn1Value {
+    mk_value(Asn1Tag::Utf8String, false, bigint::zero(), no_bytes(), 0, no_arcs(), s, no_items(), Asn1Class::Universal, 0, false)
+}
+
+fn is_printable_string_byte(b: byte): bool {
+    if b >= b'A' && b <= b'Z' { return true }
+    if b >= b'a' && b <= b'z' { return true }
+    if b >= b'0' && b <= b'9' { return true }
+    b == b' ' || b == b'\'' || b == b'(' || b == b')' || b == b'+' || b == b',' || b == b'-' || b == b'.' || b == b'/' || b == b':' || b == b'=' || b == b'?'
+}
+
+fn is_printable_string(s: str): bool {
+    var b = s.bytes()
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        if !is_printable_string_byte(b[i]) { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * Wraps text as a PrintableString value, validating its restricted charset (X.680 §41.4).
+ */
+exp fn asn1_printable_string(s: str): Asn1Value | error {
+    if !is_printable_string(s) { return error { message = "asn1: PrintableString contains a disallowed character" } }
+    mk_value(Asn1Tag::PrintableString, false, bigint::zero(), no_bytes(), 0, no_arcs(), s, no_items(), Asn1Class::Universal, 0, false)
+}
+
+fn is_ia5_charset(s: str): bool {
+    var b = s.bytes()
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        if b[i] > 127 { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * Wraps text as an IA5String value, validating it is 7-bit ASCII.
+ */
+exp fn asn1_ia5_string(s: str): Asn1Value | error {
+    if !is_ia5_charset(s) { return error { message = "asn1: IA5String contains a non-ASCII byte" } }
+    mk_value(Asn1Tag::IA5String, false, bigint::zero(), no_bytes(), 0, no_arcs(), s, no_items(), Asn1Class::Universal, 0, false)
+}
+
+fn all_digits(s: str, from: u64, to: u64): bool {
+    var b = s.bytes()
+    var i = from
+    loop {
+        if i >= to { break }
+        if b[i] < b'0' || b[i] > b'9' { return false }
+        i++
+    }
+    true
+}
+
+fn is_valid_utc_time(s: str): bool {
+    if s.len != 13 { return false }
+    if !all_digits(s, 0, 12) { return false }
+    s.bytes()[12] == b'Z'
+}
+
+/**
+ * Wraps text as a UTCTime value, validating the DER canonical `YYMMDDHHMMSSZ` form (RFC 5280
+ * §4.1.2.5.1 — no fractional seconds, no explicit offset, UTC only).
+ */
+exp fn asn1_utc_time(s: str): Asn1Value | error {
+    if !is_valid_utc_time(s) { return error { message = "asn1: UTCTime must be the canonical YYMMDDHHMMSSZ form" } }
+    mk_value(Asn1Tag::UtcTime, false, bigint::zero(), no_bytes(), 0, no_arcs(), s, no_items(), Asn1Class::Universal, 0, false)
+}
+
+fn is_valid_generalized_time(s: str): bool {
+    if s.len != 15 { return false }
+    if !all_digits(s, 0, 14) { return false }
+    s.bytes()[14] == b'Z'
+}
+
+/**
+ * Wraps text as a GeneralizedTime value, validating the DER canonical `YYYYMMDDHHMMSSZ` form
+ * (RFC 5280 §4.1.2.5.2 — no fractional seconds, UTC only).
+ */
+exp fn asn1_generalized_time(s: str): Asn1Value | error {
+    if !is_valid_generalized_time(s) { return error { message = "asn1: GeneralizedTime must be the canonical YYYYMMDDHHMMSSZ form" } }
+    mk_value(Asn1Tag::GeneralizedTime, false, bigint::zero(), no_bytes(), 0, no_arcs(), s, no_items(), Asn1Class::Universal, 0, false)
+}
+
+/**
+ * Wraps a sequence of values as a SEQUENCE.
+ */
+exp fn asn1_sequence(items: []Asn1Value): Asn1Value {
+    mk_value(Asn1Tag::Sequence, false, bigint::zero(), no_bytes(), 0, no_arcs(), "", items, Asn1Class::Universal, 0, true)
+}
+
+/** Wraps a sequence of values as a SET. `der_encode` sorts the encoded members into bytewise ascending order; the order given here need not already be sorted. */
+exp fn asn1_set(items: []Asn1Value): Asn1Value {
+    mk_value(Asn1Tag::Set, false, bigint::zero(), no_bytes(), 0, no_arcs(), "", items, Asn1Class::Universal, 0, true)
+}
+
+/**
+ * Builds a constructed context/application/private-tagged value — EXPLICIT tagging of a single
+ * child (`items` of length 1) or a constructed IMPLICIT-tagged aggregate (any length).
+ */
+exp fn asn1_tagged_constructed(tag_class: Asn1Class, num: u64, items: []Asn1Value): Asn1Value {
+    mk_value(Asn1Tag::Tagged, false, bigint::zero(), no_bytes(), 0, no_arcs(), "", items, tag_class, num, true)
+}
+
+/**
+ * Builds a primitive context/application/private-tagged value (typically an IMPLICIT-tagged
+ * primitive type) carrying its content as opaque raw bytes.
+ */
+exp fn asn1_tagged_primitive(tag_class: Asn1Class, num: u64, payload: []byte): Asn1Value {
+    mk_value(Asn1Tag::Tagged, false, bigint::zero(), payload, 0, no_arcs(), "", no_items(), tag_class, num, false)
+}
+
+/**
+ * Parses a dotted-decimal OID string (e.g. `"1.2.840.113549.1.1.1"`) into its arc list.
+ */
+exp fn asn1_oid_from_str(s: str): []u64 | error {
+    if s.len == 0 { return error { message = "asn1: empty OID string" } }
+    var b = s.bytes()
+    var arcs: []u64 = no_arcs()
+    var cur: u64 = 0
+    var saw_digit = false
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        var c = b[i]
+        if c == b'.' {
+            if !saw_digit { return error { message = "asn1: OID has an empty arc" } }
+            arcs = [..arcs, cur]
+            cur = 0
+            saw_digit = false
+            i++
+            continue
+        }
+        if c < b'0' || c > b'9' { return error { message = "asn1: OID arc must be decimal digits" } }
+        cur = cur * 10 + ((c to u64) - (b'0' to u64))
+        saw_digit = true
+        i++
+    }
+    if !saw_digit { return error { message = "asn1: OID has an empty arc" } }
+    arcs = [..arcs, cur]
+    if arcs.len < 2 { return error { message = "asn1: OID needs at least two arcs" } }
+    arcs
+}
+
+/**
+ * Renders an arc list as a dotted-decimal OID string (e.g. `[1, 2, 840]` -> `"1.2.840"`).
+ */
+exp fn asn1_oid_to_str(arcs: []u64): str {
+    var out = ""
+    var i: u64 = 0
+    loop {
+        if i >= arcs.len { break }
+        if i > 0 { out = concat(out, ".") }
+        out = concat(out, u64_to_str(arcs[i]))
+        i++
+    }
+    out
+}
+
+fn bytes_equal(a: []byte, b: []byte): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+fn arcs_equal(a: []u64, b: []u64): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+fn items_equal(a: []Asn1Value, b: []Asn1Value): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if !asn1_equal(a[i], b[i]) { return false }
+        i++
+    }
+    true
+}
+
+/**
+ * Structurally compares two `Asn1Value` trees for equality, recursing through SEQUENCE, SET, and
+ * constructed tagged content.
+ */
+exp fn asn1_equal(a: Asn1Value, b: Asn1Value): bool {
+    if a.kind != b.kind { return false }
+    match a.kind {
+        Asn1Tag::Boolean => a.flag == b.flag
+        Asn1Tag::Integer => bigint::eq(a.integer, b.integer)
+        Asn1Tag::BitString => a.unused_bits == b.unused_bits && bytes_equal(a.bytes, b.bytes)
+        Asn1Tag::OctetString => bytes_equal(a.bytes, b.bytes)
+        Asn1Tag::Null => true
+        Asn1Tag::ObjectIdentifier => arcs_equal(a.oid, b.oid)
+        Asn1Tag::Utf8String => a.text == b.text
+        Asn1Tag::PrintableString => a.text == b.text
+        Asn1Tag::IA5String => a.text == b.text
+        Asn1Tag::UtcTime => a.text == b.text
+        Asn1Tag::GeneralizedTime => a.text == b.text
+        Asn1Tag::Sequence => items_equal(a.items, b.items)
+        Asn1Tag::Set => items_equal(a.items, b.items)
+        Asn1Tag::Tagged => tagged_equal(a, b)
+    }
+}
+
+fn tagged_equal(a: Asn1Value, b: Asn1Value): bool {
+    if a.tag_class != b.tag_class || a.tag_num != b.tag_num || a.constructed != b.constructed { return false }
+    if a.constructed { return items_equal(a.items, b.items) }
+    bytes_equal(a.bytes, b.bytes)
+}
+
+fn universal_tag_num(kind: Asn1Tag): u64 {
+    match kind {
+        Asn1Tag::Boolean => 1
+        Asn1Tag::Integer => 2
+        Asn1Tag::BitString => 3
+        Asn1Tag::OctetString => 4
+        Asn1Tag::Null => 5
+        Asn1Tag::ObjectIdentifier => 6
+        Asn1Tag::Utf8String => 12
+        Asn1Tag::PrintableString => 19
+        Asn1Tag::IA5String => 22
+        Asn1Tag::UtcTime => 23
+        Asn1Tag::GeneralizedTime => 24
+        Asn1Tag::Sequence => 16
+        Asn1Tag::Set => 17
+        Asn1Tag::Tagged => 0
+    }
+}
+
+fn kind_of_universal_tag(num: u64): Asn1Tag | error {
+    if num == 1 { return Asn1Tag::Boolean }
+    if num == 2 { return Asn1Tag::Integer }
+    if num == 3 { return Asn1Tag::BitString }
+    if num == 4 { return Asn1Tag::OctetString }
+    if num == 5 { return Asn1Tag::Null }
+    if num == 6 { return Asn1Tag::ObjectIdentifier }
+    if num == 12 { return Asn1Tag::Utf8String }
+    if num == 19 { return Asn1Tag::PrintableString }
+    if num == 22 { return Asn1Tag::IA5String }
+    if num == 23 { return Asn1Tag::UtcTime }
+    if num == 24 { return Asn1Tag::GeneralizedTime }
+    if num == 16 { return Asn1Tag::Sequence }
+    if num == 17 { return Asn1Tag::Set }
+    error { message = concat("asn1: unsupported universal tag number ", u64_to_str(num)) }
+}
+
+fn is_constructed_kind(kind: Asn1Tag): bool {
+    kind == Asn1Tag::Sequence || kind == Asn1Tag::Set
+}
+
+fn class_bits(tag_class: Asn1Class): u64 {
+    match tag_class {
+        Asn1Class::Universal => 0
+        Asn1Class::Application => 1
+        Asn1Class::ContextSpecific => 2
+        Asn1Class::Private => 3
+    }
+}
+
+fn class_of_bits(bits: u64): Asn1Class {
+    if bits == 0 { return Asn1Class::Universal }
+    if bits == 1 { return Asn1Class::Application }
+    if bits == 2 { return Asn1Class::ContextSpecific }
+    Asn1Class::Private
+}

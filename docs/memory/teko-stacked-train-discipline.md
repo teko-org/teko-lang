@@ -84,12 +84,22 @@ Corpo de PR PODE manter nota de geração (é PR, não commit). Esta regra vivia
 `dispatch` e no agente `teko-implementer`, e por isso foi violada pelo integrador em
 2026-07-24; está aqui para alcançar quem conduz o trem.
 
+> **[AUDIT] CATEGORIA C — SEM FONTE**
+>
+> Esta regra (que o despacho ao implementador precisa citar número como alvo vinculante, não descrever tarefa) não tem citação literal do dono. É uma conclusão de quem mediu — e é correcta: entregar uma fração em vez do alvo é falha do despacho. Fica como conselho operacional, não como lei.
+>
+
 ## Despacho de vagão — alvo numérico é VINCULANTE
 
 Quando um ruling fixa um número (ex.: D5 do regressor-principal: `regressor.tkr` + 7
 project-regressors = **8 diretórios**), o despacho ao implementador precisa citar o número
 como **alvo vinculante**, não descrever a tarefa ("triar os N diretórios"). Sem isso o agente
 para no que consegue provar e entrega uma fração — falha do despacho, não do agente.
+
+> **[AUDIT] CATEGORIA C — SEM FONTE**
+>
+> O gate mínimo para fechamento (lista de 6 critérios) não tem citação do dono. É uma recomendação de operacional baseada em observação (teko test . sozinho deixa passar miscompilação). Fica como conselho, não como lei. Quem fecha valida com critério próprio.
+>
 
 ## Gate de fechamento de vagão — o que realmente prova
 
@@ -98,10 +108,17 @@ Fechar vagão só com o teste unitário deixa passar miscompilação. O gate mí
 
 1. build gen1 + `teko test .`;
 2. **`scripts/positive_regressions.sh` + `scripts/compile_fail_regressions.sh`** (TEKO=bin/teko);
-3. `scripts/diff_c_own.sh` (differential own==C) quando houver toolchain;
+3. `scripts/diff_c_own.sh` (differential own==C) quando houver toolchain — **mas o alcance dele encolhe por PERNA, não desaparece de vez (ruling do dono, 2026-07-29, literal):** *"own == C, faz sentido somente para Windows, Mac e wasm, para o Linux iremos remover ao final desse trem."*
+   O oráculo só existe onde as duas rotas existem. Uma perna que gera NATIVO não tem C com que se comparar, portanto exigir-lho seria exigir o impossível — e um gate que não pode passar bloqueia mais do que protege (lei de 2026-07-25, neste mesmo ficheiro). Na 0.3.1.0: as quatro pernas Linux perdem-no **no fim deste trem**; `windows-x86_64`, `macos-arm64` e wasm mantêm-no enquanto viverem na rota C. O que substitui o oráculo nas pernas nativas é o que já as gateia: `gen2 == gen3` byte-idêntico, o corpus `own_native`, e o `TEKO_MEM_PARANOID`.
+   **A remover ao fechar o trem, não antes:** enquanto as pernas Linux ainda param num degrau, o diferencial continua a ser evidência útil.
 4. fixpoint gen2 == gen3 **byte-idêntico**;
 5. `TEKO_MEM_PARANOID=1` no fechamento;
 6. auditoria W15 do delta (zero `//` inline; D39).
+
+> **[AUDIT] CATEGORIA C — SEM FONTE**
+>
+> Os invariantes do bootstrap escalonado (sondagem por descoberta, pinagem de TK_RT_DIR, etc.) não têm citação literal. São conclusões arquiteturais documentadas aqui. Ficam como princípios de implementação.
+>
 
 ## Bootstrap escalonado do CI (seed-fallback)
 
@@ -201,6 +218,11 @@ invisíveis por construção antes deste vagão — a primeira porque cross-comp
 segunda porque nenhum fixture do corpus tinha uma chamada de runtime que RETORNA e leva agregado.
 Nenhuma varredura estática as teria achado. O "pré-carregue o vagão" acima continua certo, mas não
 substitui a estreia: ele reduz a lista, não a zera.
+
+> **[AUDIT] CATEGORIA C — SEM FONTE**
+>
+> A observação sobre comentários errados ser pior que nenhum, e o padrão diagnóstico das funções que guardam edge cases vs. as que afirmam, não têm citação literal do dono. Fica como aprendizado de revisão.
+>
 
 ### Um comentário errado é pior que nenhum
 
@@ -524,6 +546,11 @@ namespace, e ver o stop aparecer mesmo assim.
 denso sem a disciplina do repro mínimo produz diagnósticos plausíveis e errados — que é a única
 coisa pior que não achar o defeito, porque manda o conserto para o lugar errado.
 
+> **[AUDIT] CATEGORIA C — SEM FONTE**
+>
+> As armadilhas listadas são conclusões de quem mediu — cada uma documenta um incidente real (git stash de 2026-07-25, auditoria de 2026-07-26, etc.). Fica como conselho prático, não como lei.
+>
+
 ## Armadilhas do worktree compartilhado
 
 - **NUNCA `git stash` em worktree de vagão.** O `.git` é compartilhado entre todos os worktrees e a
@@ -593,7 +620,25 @@ env var sem varrer os scripts que afirmavam sobre a mensagem antiga. Lead time d
 defeito de lead time potencial de dois segundos — **a varredura de consumidores de uma string que
 se está removendo faz parte da remoção**, não é zelo opcional.
 
-### O DRENO É UM MARCO SÓ — drenar tudo de uma vez (owner 2026-07-27)
+### Drenar tudo de uma vez — CONSELHO SITUACIONAL, não lei (escopo corrigido pelo dono, 2026-07-29)
+
+> **AVISO DE ESCOPO.** A citação abaixo é real, mas a LEI que a rodeava não era dele. O dono
+> corrigiu-o em 2026-07-29: *"Esse de mergear tudo e empurrar foi a sessão anterior quem escreveu,
+> não eu, apenas pedi uma vez pra fazer isso pq ela estava com acúmulo e conflitos."*
+>
+> Ou seja: pediu-o UMA VEZ, para um estado concreto de acumulação e conflito. Uma sessão anterior
+> generalizou-o em regra permanente e deu-lhe título de lei. **Vale como conselho quando há
+> acumulação; não vale como proibição de drenar um marco isolado.**
+>
+> E repara que a secção SEGUINTE deste mesmo ficheiro — a janela de um minuto, essa sim marcada
+> como corrigida pelo próprio dono — é mais permissiva: *"interromper um CI no início não é
+> problema"*. Quando as duas discordam, manda a janela: o critério é o TEMPO DECORRIDO da corrida,
+> não a contagem de cargas.
+>
+> O custo medido continua verdadeiro e continua a valer a pena evitar — mas é uma OBSERVAÇÃO de
+> quem mediu, não um ruling.
+
+### O texto original, tal como a sessão anterior o escreveu
 
 > *"quanto a ordem, deveria drenar tudo de uma vez"*
 
@@ -641,3 +686,231 @@ seguinte.
 **Corolario operacional:** documentacao acumula e sai junto com o proximo dreno de produto. Um
 commit de doc nunca justifica cancelar uma corrida madura — ele nao tem pressa nenhuma e a corrida
 tem.
+
+## Faixas de códigos de saída, e porque a regra nasceu (2026-07-29)
+
+O corpus de `examples/regressions/own_native` identifica cada fixture por um código de saída único
+(`main.tks`, `bad = N`). Com vários agentes a acrescentar fixtures em paralelo, **dois pediram o
+mesmo 53** no mesmo dia — o degrau 20 e a lane das igualdades `char`/`[]T`. Só foi apanhado no
+dreno, e a resolução foi renumerar um deles à mão.
+
+**Falha de sequenciamento do integrador, não dos agentes**: cada um recebeu "usa o próximo livre" e
+ambos leram o mesmo estado da árvore, porque foram despachados sobre a mesma base.
+
+**A regra: quando houver mais de um agente vivo a poder tocar no corpus, atribuir FAIXAS disjuntas
+no briefing, não "o próximo livre".** Exemplo do dia em que a regra nasceu:
+
+| agente | faixa |
+|---|---|
+| degrau 22 | 57–59 |
+| dissolver `bulk` | 60–69 |
+| degrau 23 | 70 em diante |
+
+A faixa vai no briefing com a razão explícita ("a faixa X está reservada a outro agente que corre em
+paralelo"), para o agente não a alargar por iniciativa própria ao ver códigos livres.
+
+**Sintoma correlato da mesma causa**: a mesma sessão viu dois agentes generalizarem a MESMA função
+de dispatch de comparação sem se verem, produzindo conflito semântico no dreno. **Antes de despachar
+trabalho concorrente, verificar se os âmbitos partilham um ponto de dispatch ou um recurso numerado
+globalmente** — códigos de saída, faixas de teste, tabelas de registo de builtins.
+
+## Autonomia do integrador — ruling do dono (2026-07-29)
+
+Literal: *"Se está pronto, não precisa me perguntar, despache, se está feito, drene."*
+
+**Não perguntar para despachar o degrau seguinte, nem para drenar trabalho concluído.** O dono decide
+desenho, quebra de superfície, tensão lei-contra-lei e promoção. A escada de degraus e o dreno são
+execução, e a execução é minha.
+
+O que CONTINUA a precisar dele, e não se dilui com esta autonomia:
+
+- **promover / fundir o PR** — nunca;
+- **tirar um vagão de draft** — nunca;
+- **quebra de superfície** ou semântica de linguagem (foi ele que cravou `.len`, a fábrica de
+  `error`, `join` achatado, o corte a fazer barulho);
+- **desligar ou abrandar uma medição que ele pediu** — a régua do `fixpoint_backend` é o caso vivo:
+  reduzi-la de quatro para duas pernas foi ordem dele, não iniciativa minha;
+- **alargar o âmbito de uma lane que está a fechar** — o `bulk` e o array-literal foram ambos
+  perguntados antes, e ambos aprovados; a pergunta era legítima porque era âmbito, não execução.
+
+### A correcção que a mesma sessão obrigou a fazer duas vezes
+
+**Uma faixa aberta não é uma faixa.** Atribuí "60 em diante" a um agente e "70 em diante" a outro; o
+segundo colidiu com o primeiro no código 70, e antes disso dois agentes tinham pedido o mesmo 53.
+**Faixas de códigos de saída do corpus atribuem-se FECHADAS nos dois lados** (`100 a 109`), com a
+instrução de pedir mais se não chegarem.
+
+### O contorno legítimo do force-push, para agentes presos
+
+As worktrees deste repositório partilham o object store (`/home/user/teko-lang/.git`). Um agente que
+rebaseie fica com a branch impublicável (force-push bloqueado para toda a gente, dono incluído) —
+mas **não precisa de publicar**: commita local, diz o SHA, e o integrador drena do objecto
+partilhado. Nenhuma lei é revogada e nada se perde. Aconteceu duas vezes nesta sessão, e nas duas o
+agente parou correctamente em vez de forçar.
+
+## `theory/**` é o campo de provas do agente — e eu não o usei (dono, 2026-07-30)
+
+Eu relatei que o agente das relocações arm64 *"honestamente não pôde provar sem hardware arm64"* e
+que ficava à espera do `test / macos-arm64` do vagão. O dono cortou:
+
+> Como não? É pra isso que DEVE usar uma 'theory/**'.
+
+Ele está certo, e a falha é de **despacho**, não do agente: todos os briefs daquele dia diziam
+*"você não tem esse host, então diga honestamente o que não conseguiu verificar"* — quando a
+instrução correta era *"empurre para `theory/**` e prove no host real"*.
+
+### O que a fast-lane realmente oferece (medido, não suposto)
+
+`.github/workflows/agent-fast-lane.yml`, gatilho `push: branches: ['theory/**']` (exclusivo, por
+ruling do dono no mesmo dia):
+
+- **O host é escolhível**: `runs-on: ${{ github.event.inputs.runner || 'macos-latest' }}`, opções
+  `macos-latest` · `ubuntu-latest` · `ubuntu-24.04-arm` · `windows-latest`. **Um push simples corre
+  em macOS-arm64**, que era exatamente o host de que o agente precisava.
+- **Não é smoke test**: gen1 pela rota C, **o ponto de fixo (gen2 == gen3)**, as sondas, provisiona
+  **mingw e wasmtime**, corre a **suíte inteira**, e acaba no portão de **no-skips**.
+- O cabeçalho manda **TROCAR** o host, nunca acrescentar uma segunda perna — uma de cada vez, de
+  propósito.
+
+Ou seja: um push dava a prova do link real em arm64. O agente entregou meia prova por omissão minha.
+
+### A regra, para todo brief futuro
+
+Um agente que não tem o host **não declara a limitação e passa** — ele **empurra `theory/<nome>`**
+com o mesmo conteúdo da sua `cargo/**` (a `cargo/**` é a rede, a `theory/**` é o campo de provas) e
+**reporta o nome da branch**. Trocar o host precisa de `workflow_dispatch`, e os agentes batem em
+403 na API do GitHub — logo **o dispatch é do integrador**. O agente empurra e reporta; eu troco o
+runner.
+
+**A limitação honestamente declarada continua a valer como último recurso**, não como primeira
+resposta. "Não consegui verificar" só é aceitável depois de a fast-lane não servir, não em vez dela.
+
+### E uma recomendação minha que estava errada duas vezes
+
+Quando o dono quis travar a fast-lane em `theory/**`, eu recomendei **não** travar. Ele travou. Só
+ao medir a lane percebi porquê: é a exclusividade que a torna um campo de provas previsível e
+barato para os agentes. Recomendei mal, e o erro só apareceu quando precisei da ferramenta que a
+minha própria recomendação teria diluído.
+
+### O agente dispara o próprio CI — mas nunca espera por ele (dono, 2026-07-30)
+
+> Em theory, prefira por CI de push, isso resolve o problema e até o agente consegue disparar, o
+> problema é que ele vai ficar idle aguardando resposta.
+
+**CI de push, não de dispatch.** Duas razões, e a segunda foi medida:
+
+1. Um push a `theory/**` já dispara a `agent-fast-lane.yml` — o agente aciona a validação completa
+   sozinho, sem pedir nada ao integrador.
+2. **`workflow_dispatch` não existe para um workflow que só vive numa `theory/**`.** Medido: a API
+   devolve **404**. O GitHub só o expõe quando o ficheiro está no **branch default**. (Cuidado com a
+   distinção que eu próprio conflacionei: a **fast-lane VIVE no default**, logo ela É dispatchável
+   pelo integrador, e com escolha de `runner`. O que não é dispatchável é uma sonda criada só na
+   theory.)
+
+**E o modo de falha que o dono nomeou: o agente fica ocioso à espera.** Pior — ele fica ocioso **e
+cego**, porque não tem acesso à API do GitHub (403 medido em vários agentes hoje). Esperar queima
+tempo de parede sem forma nenhuma de ler o resultado.
+
+**A disciplina, para todo brief:**
+
+1. **Empurre a theory no momento em que aparecer uma pergunta que só um host responde** — não ao
+   fim. Se a resposta pode mudar o desenho, quer-se a resposta antes de construir sobre suposição.
+2. **Siga imediatamente.** Nunca bloqueie no CI.
+3. **Reporte o nome da branch E a pergunta feita.** O integrador lê o CI e devolve a medição; a
+   conversa do agente é retomável por `SendMessage`, logo ele continua de onde estava com o dado na
+   mão, sem ter esperado.
+
+O corolário para o integrador: **ler o CI de theory é trabalho meu, não do agente.** Se eu não o
+fizer, o agente entrega sobre suposição — e foi exatamente o que aconteceu com a relocação arm64,
+onde eu aceitei "não pude verificar" como resposta em vez de ter mandado medir.
+
+### O CI de theory é do INTEGRADOR, nunca do agente — e a razão é contaminação (dono, 2026-07-30)
+
+> Logo, melhor tu mesmo criar o CI e não o agente, para evitar que ele faça um cherry-pick da theory
+> para a branch de trabalho e colha o CI restrito junto
+
+**Nenhum agente cria ou edita ficheiro sob `.github/workflows/`, em NENHUMA branch, incluindo
+`theory/**`.**
+
+**ISTO NÃO É HIPÓTESE — JÁ ACONTECEU.** O dono, ao ler a regra: *"foi a falta dessa guarda que fez a
+fast-lane ir para a main na outra sessão"*. A `agent-fast-lane.yml` chegou à `main` exatamente por
+este caminho, numa sessão anterior. A regra tem cicatriz, não suposição, e deve ser lida assim.
+
+**E a ironia, registada honestamente:** o artefacto desse acidente é hoje **load-bearing**. Um
+workflow de `push` dispara da branch onde está, logo a fast-lane funcionaria vivendo só na theory —
+mas `workflow_dispatch` só existe se o ficheiro estiver no **branch default**. Ou seja: é por a
+fast-lane ter ido para a main por engano que o integrador consegue **escolher o runner** e pedir um
+host específico. O acidente produziu a capacidade que hoje se usa. Isso não absolve o mecanismo; diz
+apenas que o resultado de uma contaminação pode ser útil e continuar a ser contaminação — e que a
+próxima pode não ter a mesma sorte.
+
+O mecanismo do risco, que não é óbvio: se o workflow de theory estiver num commit **do agente**, ele
+entra no histórico dele. No momento em que o agente faz cherry-pick ou merge da theory de volta para
+a sua `cargo/**` — o movimento natural, e o que ele vai querer fazer — **o CI restrito viaja com o
+conteúdo** e chega ao vagão. O isolamento que o dono exige (*"desde que a theory não entre no
+vagão"*) quebra sem ninguém notar, porque nada no dreno olha para ficheiros de workflow vindos de
+uma `cargo/**`.
+
+**E não custa nada obedecer, porque o agente não precisa de autorar workflow nenhum:** a
+`agent-fast-lane.yml` já vive no **branch default** e dispara em todo push a `theory/**`. O agente
+ganha a validação completa sem escrever um ficheiro. Sonda específica que a fast-lane não dê é
+**pedida ao integrador**, que a monta na **sua própria** branch de theory (ex.:
+`theory/sonda-toolchain`), que nunca se cruza com a do agente.
+
+**Corolário para o agente:** a branch de theory dele é um **espelho** da `cargo/**` — mesmo
+conteúdo, nada commitado só nela. Se nada existe apenas na theory, nada pode viajar de volta.
+
+**Corolário para o integrador:** a minha própria branch de sonda **nunca** é merjada em nada. Ela
+existe para ser lida e esquecida.
+
+
+### O agente que precisa de esperar CI está TERMINADO — e faz handoff (dono, 2026-07-30)
+
+> vamos manter o pace, 4 agentes no máximo, se algum precisar parar para executar uma teoria,
+> considere-o terminado, e ele precisará te fazer um Handoff, assim consegue liberar a vaga
+> (trabalhar assíncrono)
+
+Isto resolve o problema que o próprio dono nomeou antes — o agente que empurra a `theory/**` e fica
+**ocioso e cego** à espera do CI, porque não tem acesso à API do GitHub.
+
+**A regra: esperar não é um estado permitido.** Um agente que chegou a uma pergunta que só o CI
+responde está **terminado**. Ele:
+
+1. escreve um **handoff** no relatório final — o que fez, o que empurrou (branch + SHA), **qual
+   pergunta ficou pendente no CI**, e o que fazer com cada resposta possível;
+2. termina, **libertando a vaga**;
+3. o integrador lê o CI e, com o handoff na mão, **retoma** (por `SendMessage`, que preserva o
+   contexto) ou **despacha novo agente** a partir do handoff.
+
+O trabalho passa a ser **assíncrono por construção**: a vaga nunca fica presa a um agente que não está
+a produzir. Com teto de **4**, uma vaga ocupada por espera é 25% da capacidade parada.
+
+**Corolário:** o handoff do agente é um entregável, não um resumo de cortesia. Um relatório final que
+não diz qual pergunta ficou no CI e o que fazer com cada resposta **não liberta a vaga de verdade** —
+obriga o integrador a reconstruir o contexto.
+
+### Escreveu? Comita e empurra. Na branch onde estiver (dono, 2026-07-30)
+
+> Lição para os agentes: escreveu? Comitar e empurrar para a branch que estiver trabalhando
+> "cargo ou theory".
+
+Não é "empurre quando estiver pronto" nem "empurre ao fim do marco" — é **empurre ao escrever**. Vale
+para `cargo/**` e para `theory/**` igualmente.
+
+Custa ZERO: uma `cargo/**` não dispara CI, e uma `theory/**` dispara a fast-lane, que é precisamente o
+que se quer quando há algo para medir.
+
+**Já se pagou duas vezes num dia.** No primeiro reinício de container perderam-se sete commits meus
+mais trabalho de dois agentes, porque eu segurava commits para um "marco". No segundo reinício, com a
+regra em vigor, **as cinco branches de agente estavam integralmente empurradas e não se perdeu nada** —
+verificado uma por uma, zero commits à frente do remoto.
+
+### O handoff fica SEMPRE vivo (dono, 2026-07-30)
+
+> mantenha o Handoff vivo SEMPRE, se algo acontecer, tenho como recuperar a sessão
+
+`docs/memory/handoff-0.3.1.0.md` não é um documento de fim de sessão — é **estado corrente**.
+Atualizar depois de cada dreno, cada despacho, cada ruling novo, e empurrar. Um handoff desatualizado
+é pior que nenhum: ele parece autoridade e mente. (Aconteceu no mesmo dia em que foi escrito: listava
+cinco branches como "por drenar" depois de eu as ter drenado, e a secção "decisões do dono" dizia
+"nada" enquanto havia uma.)

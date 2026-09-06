@@ -1,0 +1,593 @@
+name: ngen (mc) CI
+
+# Builds and tests `ngen/` -- the teko-over-mc port (docs/design/port-teko-mc.md,
+# DECISION_LOG.md D211/D212/D213) -- with the mc toolchain (github.com/minicompiler/mc)
+# PINNED to `ngen/MC_VERSION` (ngen/HANDOFF.md §3.2). `src/` is frozen (D211/D212):
+# the escada gen0->gen3 this repository's other workflows run is irrelevant to
+# `ngen/` and is deliberately NOT run here.
+#
+# FIVE NATIVE LEGS (dono 2026-09-04): linux/x86_64, linux/aarch64, macos/aarch64,
+# windows/x86_64 and windows/aarch64. Each one runs on a runner of its own
+# operating system AND architecture, downloads the mc release built for THAT
+# pair, teaches the compiler there and RUNS every fixture there -- the exit code
+# is the oracle, so nothing is cross-compiled and left unproven. `mc --host` is
+# asserted against the leg before anything is built, which is what makes
+# "native" a checked fact rather than a runner label.
+#
+# The five legs are one matrix job, and the required check on `main` is the
+# AGGREGATOR job below, which keeps the name the ruleset already asks for
+# (`mc build ngen && run`) and fails if any leg failed.
+#
+# The SIXTH job is `fixpoint` (S4.3, S4.3b): the self-hosting ladder teko0 ->
+# teko1 -> teko2 -> teko3 over `ngen/mc_teko.tk`, on the SAME FIVE PAIRS. It
+# proves a different thing from the legs -- that the compiler reproduces itself,
+# not that a fixture exits 42 -- and it is deliberately NOT wired into the
+# aggregator: `mc build ngen && run` is the name the ruleset requires and its
+# meaning stays exactly what it says. Promoting the ladder to a required check
+# is a ruleset decision, taken outside this workflow.
+#
+# THIS WORKFLOW IS ALSO THE RELEASE GATE (R1). `release.yml` calls it with
+# `workflow_call` instead of repeating the matrix: a release must publish the
+# BINARY THE GATE PROVED, never a sibling rebuilt at tag time, and the only way
+# to have both properties is for the job that runs the fixtures to be the job
+# that packages. `package: true` turns on two steps that are off for an ordinary
+# push -- the per-leg tarball and the fixpoint provenance file. There is no
+# `ref` input: a `workflow_call` runs on the CALLER's own ref, and `release.yml`
+# only ever calls this workflow from a run that is already on the tag (a `push`
+# of the tag itself, or a `workflow_dispatch` the operator ran with
+# `--ref vX.Y.Z`) -- so every checkout below is a plain `actions/checkout@v5`
+# with no ref of its own to trust or distrust.
+#
+# `push` is filtered to BRANCHES so that pushing `v1.2.3` runs this workflow
+# exactly once, through the release, instead of racing a standalone run of it
+# for the same `github.ref`.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+  workflow_call:
+    inputs:
+      package:
+        description: 'also package each leg as a release asset and archive the fixpoint provenance'
+        required: false
+        type: boolean
+        default: false
+      version:
+        description: 'release version the assets are named after, without its leading `v`'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# `github.workflow` is the CALLER's name when this workflow is called, so a
+# release's gate and an ordinary CI run of the same ref are two groups and
+# cannot cancel one another.
+concurrency:
+  group: ngen-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  leg:
+    name: ngen (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # every leg reports; a red one must not hide the state of the other four
+      fail-fast: false
+      matrix:
+        include:
+          # `arch` is what `mc`'s `[target]` and `mc --host` call the machine
+          # (`aarch64`, never `arm64`); `asset` is what the release file is
+          # called (`arm64`). They differ, so both are written out.
+          #
+          # `config` is what the leg appends to the generated `mc.toml`: the
+          # linker (and, on Windows, the sysroot) that `ngen/mc.toml`'s own
+          # `[linker]` is replaced with. macOS appends NOTHING -- with no
+          # `[linker]` the built-in `macho-exe` backend writes and signs the
+          # executable itself (docs/guide/50-cross-compile.md), which is the
+          # only shape that works there.
+          # Since mc 0.12.0 (M42) the Linux executable slot is filled: `mc build`
+          # writes a dynamic ELF itself, no `[linker]` and no sysroot. The loader
+          # and soname default to musl; the runners are glibc, so `[target]`
+          # names the glibc pair (mc docs/build.md § [target].interp/.libc) --
+          # a musl-interp binary on ubuntu is `not found` ("mc: cannot run").
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            asset: x86_64
+            exe: ''
+            target_tail: |
+              interp = "/lib64/ld-linux-x86-64.so.2"
+            libc_family: gnu
+            config: ''
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+            asset: arm64
+            exe: ''
+            target_tail: |
+              interp = "/lib/ld-linux-aarch64.so.1"
+            libc_family: gnu
+            config: ''
+          - runner: macos-latest
+            target_tail: ''
+            libc_family: ''
+            os: macos
+            arch: aarch64
+            asset: arm64
+            exe: ''
+            config: ''
+          # Windows has no direct-executable backend and no C runtime: the link
+          # is `lld-link` against three files this workflow builds first (the
+          # sysroot step), exactly the line `mc` uses for its own Windows host
+          # (`minicompiler/mc` src/mc.windows-*.toml, scripts/link-windows.sh).
+          # `-stack:` is there because the default reserve is 1 MiB on Windows
+          # against 8 MiB elsewhere, and the compiler is written for the latter.
+          - runner: windows-latest
+            target_tail: ''
+            libc_family: ''
+            os: windows
+            arch: x86_64
+            asset: x86_64
+            exe: '.exe'
+            config: |
+              [sysroot]
+              path = "build/sysroot/windows-x86_64"
+
+              [linker]
+              cmd  = "lld-link"
+              args = ["-machine:x64", "-subsystem:console", "-entry:mc_start", "-nodefaultlib",
+                      "-stack:8388608", "-out:{out}", "{obj}",
+                      "{sysroot}/winstart.obj", "{sysroot}/mcrt.obj", "{sysroot}/kernel32.lib"]
+          - runner: windows-11-arm
+            target_tail: ''
+            libc_family: ''
+            os: windows
+            arch: aarch64
+            asset: arm64
+            exe: '.exe'
+            config: |
+              [sysroot]
+              path = "build/sysroot/windows-aarch64"
+
+              [linker]
+              cmd  = "lld-link"
+              args = ["-machine:arm64", "-subsystem:console", "-entry:mc_start", "-nodefaultlib",
+                      "-stack:8388608", "-out:{out}", "{obj}",
+                      "{sysroot}/winstart.obj", "{sysroot}/mcrt.obj", "{sysroot}/kernel32.lib"]
+    env:
+      MC_OS: ${{ matrix.os }}
+      MC_ARCH: ${{ matrix.arch }}
+      MC_ASSET: ${{ matrix.asset }}
+      MC_CONFIG_TAIL: ${{ matrix.config }}
+      MC_TARGET_TAIL: ${{ matrix.target_tail }}
+      MC_LIBC_FAMILY: ${{ matrix.libc_family }}
+      EXE: ${{ matrix.exe }}
+      # MSYS rewrites an argument that looks like a path, and every dash-form
+      # lld-link option does (`minicompiler/mc` docs/guide/95-windows-host.md § 4).
+      # Harmless where there is no MSYS.
+      MSYS2_ARG_CONV_EXCL: '*'
+    steps:
+      # GitHub's Windows images ship core.autocrlf=true and this leg compiles
+      # sources straight out of the checkout; a `\r` in a `.tk` or a `.mc` is
+      # not worth debugging. A no-op on the other three runners.
+      - name: never translate line endings
+        run: git config --global core.autocrlf false
+
+      - name: checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # `.github/actions/setup-mc` resolves the mc release PINNED by
+      # `ngen/MC_VERSION`, downloads the asset for this pair, verifies the
+      # `.sha256` and asserts `mc --host`; it exports `MC` for the steps below.
+      # The fixpoint job uses the very same action, so the two never test
+      # different compilers.
+      - name: set up the mc toolchain
+        id: mc
+        uses: ./.github/actions/setup-mc
+        with:
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          asset: ${{ matrix.asset }}
+          exe: ${{ matrix.exe }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Windows has no direct-executable backend and no C runtime, so the link
+      # needs three files this workflow builds first. The composite action
+      # assembles them, puts LLVM on `$PATH` in Windows form and points
+      # `TMPDIR` at the runner's own temp; the fixpoint job below uses the very
+      # same action, so the two Windows jobs cannot assemble different sysroots.
+      - name: build the Windows sysroot
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/windows-sysroot
+        with:
+          arch: ${{ matrix.arch }}
+          mc: ${{ steps.mc.outputs.mc }}
+
+      # `ngen/mc.toml` is the single source of truth and is never edited: the
+      # leg config is DERIVED from it, so `[project]`, `[compiler]`, `[include]`
+      # and `[limits]` can never drift between the five legs. Only the machine
+      # and the way it links change -- `[target] os`/`arch`, the `.exe` suffix
+      # the Windows loader requires, and the `[linker]`/`[sysroot]` tail this
+      # leg carries in its matrix entry.
+      - name: generate the leg config
+        env:
+          MC_VERSION: ${{ steps.mc.outputs.version }}
+        run: |
+          set -eu
+          printf '%s' "$MC_TARGET_TAIL" >ngen/mc.target-tail
+          # `[target].libc` changed meaning in the post-M42 patch (mc >= 0.12.1):
+          # a soname ("libc.so.6") became a family ("gnu"|"musl"), and the old
+          # spelling is refused. `ngen/MC_VERSION` can move across that line,
+          # so this still picks the spelling by the resolved version.
+          if [ -n "$MC_LIBC_FAMILY" ]; then
+            if [ "$(printf '%s\n%s\n' 0.12.1 "$MC_VERSION" | sort -V | head -n1)" = "0.12.1" ]; then
+              printf 'libc   = "%s"\n' "$MC_LIBC_FAMILY" >>ngen/mc.target-tail
+            else
+              case "$MC_LIBC_FAMILY" in gnu) printf 'libc   = "libc.so.6"\n' >>ngen/mc.target-tail ;; musl) printf 'libc   = "libc.so"\n' >>ngen/mc.target-tail ;; esac
+            fi
+          fi
+          awk '/^\[/ { skip = ($0 == "[linker]") } !skip' ngen/mc.toml \
+            | sed -e "s#^os   = .*#os   = \"$MC_OS\"#" \
+                  -e "s#^arch = .*#arch = \"$MC_ARCH\"#" \
+                  -e "s#^out   = .*#out   = \"build/teko-hello$EXE\"#" \
+            | sed -e "/^arch = /r ngen/mc.target-tail" \
+            >ngen/mc.ci.toml
+          rm -f ngen/mc.target-tail
+          printf '\n%s\n' "$MC_CONFIG_TAIL" >>ngen/mc.ci.toml
+          cat ngen/mc.ci.toml
+
+      - name: mc build ngen
+        run: |
+          set -eu
+          "$MC" build ngen --config ngen/mc.ci.toml
+
+      - name: run tests/hello.tk, expect exit 42
+        run: |
+          set +e
+          "ngen/build/teko-hello$EXE"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 42 ]; then
+            echo "::error::ngen/build/teko-hello$EXE exited $rc, expected 42" >&2
+            exit 1
+          fi
+          echo "ngen/build/teko-hello$EXE exited 42, as expected"
+
+      - name: run the primitives, types and surface fixtures
+        # `mc --exe` always emits a Mach-O (`minicompiler/mc` src/main.mc:227
+        # hardcodes `bname = "macho-exe"`, ignoring host and [target]), so
+        # compiling a fixture with `teko --exe` produced an unrunnable
+        # binary off macOS (ENOEXEC, exit 126). The only path that honours
+        # `[target]` and `[linker]` is the one `mc build ngen` itself used for
+        # tests/hello.tk (docs/build.md `mc build DIR --config FILE`): a
+        # `[project]` naming the fixture. Each fixture gets its own config,
+        # generated here from the LEG config by swapping only
+        # `[project].entry`/`out` -- so it cannot drift from the leg's own
+        # `[target]`/`[linker]` -- and is fed to the already-built taught
+        # compiler with `--entry-only` (docs/build.md § [compiler]), which
+        # reuses it instead of re-teaching it once per fixture. Each fixture's
+        # own `// expect-exit: N` header is the oracle, the same convention
+        # `mc`'s own tests/*.mc use.
+        #
+        # The runner's default shell already runs with `-e` (bash -e {0}), so
+        # a bare `set -u` here let the FIRST fixture that failed `exit 1` the
+        # whole step immediately -- the loop's own `status=1; continue`
+        # accumulation never got to run past it. `set +e` below is what lets
+        # every fixture in the loop actually run and be reported.
+        run: |
+          set +e -u
+          status=0
+          for src in ngen/tests/primitives_*.tk ngen/tests/types_*.tk ngen/tests/surface_*.tk; do
+            name=$(basename "$src" .tk)
+            want=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
+            if [ -z "$want" ]; then
+              echo "::error::$src has no // expect-exit: N header" >&2
+              status=1
+              continue
+            fi
+            cfg="ngen/mc.$name.toml"
+            sed -e "s#^entry = .*#entry = \"tests/$name.tk\"#" \
+                -e "s#^out   = .*#out   = \"build/$name$EXE\"#" \
+                ngen/mc.ci.toml >"$cfg"
+            if ! "ngen/build/teko$EXE" build ngen --config "$cfg" --entry-only; then
+              echo "::error::$src failed to compile" >&2
+              status=1
+              rm -f "$cfg"
+              continue
+            fi
+            rm -f "$cfg"
+            "ngen/build/$name$EXE"
+            rc=$?
+            if [ "$rc" -ne "$want" ]; then
+              echo "::error::$src exited $rc, expected $want" >&2
+              status=1
+              continue
+            fi
+            echo "$src exited $rc, as expected"
+          done
+          exit $status
+
+      # R1: only when a release is calling. The binary packaged here is the one
+      # the fixtures above have just run against -- the release PROMOTES what
+      # the gate proved instead of recompiling bytes no gate ever saw.
+      - name: package this leg as a release asset
+        if: inputs.package
+        uses: ./.github/actions/package-teko
+        with:
+          version: ${{ inputs.version }}
+          target: ${{ matrix.os }}-${{ matrix.asset }}
+          exe: ${{ matrix.exe }}
+
+      - name: upload the release asset
+        if: inputs.package
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.asset }}
+          path: |
+            dist/teko-*.tar.gz
+            dist/teko-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # The SIXTH job (docs/design/plano-ngen-entrega4.md §64(f) S4.3, §73): the
+  # self-hosting ladder, not the fixture suite. `ngen/scripts/bootstrap.sh` runs
+  # teko0 (`mc build ngen --compiler-only`, the stock mc) -> teko1 -> teko2 ->
+  # teko3, each one compiling `ngen/mc_teko.tk` with the compiler the previous
+  # stage produced, and checks the three criteria of the plan's §64(f): `cmp` of
+  # the OBJECTS teko2.o/teko3.o, an empty diff between the two `--dump-asm`
+  # dumps, and teko1 compiling and running all 45 fixtures.
+  #
+  # The SAME FIVE PAIRS the legs run on (S4.3b): what the ladder proves is a
+  # property of a machine, so proving it on three and asserting it on five would
+  # be the cross-compiled claim this workflow exists to refuse.
+  #
+  # Every derived config the script writes carries a `[linker]`, because a
+  # linker is what makes `mc` write `<out>.o` and hand it over -- without one
+  # the built-in executable backend writes the binary and no object at all, and
+  # there is nothing to `cmp`. On linux and macOS that linker is
+  # `ngen/mc.toml`'s own `cc`, kept as it is. On Windows there is no `cc` and no
+  # C runtime, so the matrix carries the leg's `lld-link` line and the script
+  # takes it through `--linker-toml`, which replaces the `[linker]` block of the
+  # derived config; the three files it links against come from the same
+  # composite action the leg uses. The five legs themselves link differently
+  # (built-in backends off Windows) and are unaffected either way.
+  fixpoint:
+    name: fixpoint (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # every pair reports; a red one must not hide the state of the others
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+            asset: x86_64
+            exe: ''
+            linker: ''
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: aarch64
+            asset: arm64
+            exe: ''
+            linker: ''
+          - runner: macos-latest
+            os: macos
+            arch: aarch64
+            asset: arm64
+            exe: ''
+            linker: ''
+          # `linker` is what `--linker-toml` feeds the script INSTEAD of
+          # `ngen/mc.toml`'s `[linker] cc`: on Windows `cc` is not a linker, and
+          # the ladder still needs one, because a linker is what makes `mc`
+          # leave `<out>.o` on disk for the `cmp`. It is the same line the
+          # native leg carries, against the same sysroot.
+          - runner: windows-latest
+            os: windows
+            arch: x86_64
+            asset: x86_64
+            exe: '.exe'
+            linker: |
+              [sysroot]
+              path = "build/sysroot/windows-x86_64"
+
+              [linker]
+              cmd  = "lld-link"
+              args = ["-machine:x64", "-subsystem:console", "-entry:mc_start", "-nodefaultlib",
+                      "-stack:8388608", "-out:{out}", "{obj}",
+                      "{sysroot}/winstart.obj", "{sysroot}/mcrt.obj", "{sysroot}/kernel32.lib"]
+          - runner: windows-11-arm
+            os: windows
+            arch: aarch64
+            asset: arm64
+            exe: '.exe'
+            linker: |
+              [sysroot]
+              path = "build/sysroot/windows-aarch64"
+
+              [linker]
+              cmd  = "lld-link"
+              args = ["-machine:arm64", "-subsystem:console", "-entry:mc_start", "-nodefaultlib",
+                      "-stack:8388608", "-out:{out}", "{obj}",
+                      "{sysroot}/winstart.obj", "{sysroot}/mcrt.obj", "{sysroot}/kernel32.lib"]
+    env:
+      EXE: ${{ matrix.exe }}
+      MC_LINKER: ${{ matrix.linker }}
+      # MSYS rewrites an argument that looks like a path, and every dash-form
+      # lld-link option does (`minicompiler/mc` docs/guide/95-windows-host.md § 4);
+      # the derived config's path also has to stay RELATIVE (D224). Harmless
+      # where there is no MSYS.
+      MSYS2_ARG_CONV_EXCL: '*'
+    steps:
+      # The Windows images ship core.autocrlf=true and the ladder compiles
+      # sources straight out of the checkout. A no-op on the other runners.
+      - name: never translate line endings
+        run: git config --global core.autocrlf false
+
+      - name: checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: set up the mc toolchain
+        id: mc
+        uses: ./.github/actions/setup-mc
+        with:
+          os: ${{ matrix.os }}
+          arch: ${{ matrix.arch }}
+          asset: ${{ matrix.asset }}
+          exe: ${{ matrix.exe }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The same action the Windows leg uses: `winstart.obj`, `mcrt.obj` and
+      # `kernel32.lib` under `ngen/build/sysroot/windows-<arch>`, which is what
+      # the `[sysroot] path` of the matrix's `linker` block resolves to, plus
+      # LLVM on `$PATH` and a `TMPDIR` the native `mc` can open.
+      - name: build the Windows sysroot
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/windows-sysroot
+        with:
+          arch: ${{ matrix.arch }}
+          mc: ${{ steps.mc.outputs.mc }}
+
+      # `bootstrap.sh` calls `mc` by name -- it is the entry point of the ladder
+      # and the one binary the ladder does not build itself -- so the toolchain
+      # goes on $PATH here instead of being addressed through $MC. On Windows
+      # the directory goes in in WINDOWS form: the runner hands that PATH to a
+      # native process, and an MSYS-shaped entry does not survive the trip.
+      - name: put mc on PATH
+        env:
+          MC_DIR: ${{ steps.mc.outputs.dir }}
+        run: |
+          set -eu
+          dir="$MC_DIR"
+          if [ "$RUNNER_OS" = "Windows" ]; then dir=$(cygpath -w "$dir"); fi
+          echo "$dir" >>"$GITHUB_PATH"
+
+      # Times per stage, sizes of every object and binary, and the three
+      # criteria are all printed by the script itself. `--linker-toml` is passed
+      # only where the matrix carries a linker block -- everywhere else
+      # `ngen/mc.toml`'s own `[linker] cc` is what the derived configs keep.
+      - name: teko0 -> teko1 -> teko2 -> teko3
+        run: |
+          set -eu
+          if [ -n "$MC_LINKER" ]; then
+            printf '%s\n' "$MC_LINKER" >ngen/mc.linker.toml
+            cat ngen/mc.linker.toml
+            sh ngen/scripts/bootstrap.sh --os "${{ matrix.os }}" --arch "${{ matrix.arch }}" \
+              --linker-toml ngen/mc.linker.toml
+          else
+            sh ngen/scripts/bootstrap.sh --os "${{ matrix.os }}" --arch "${{ matrix.arch }}"
+          fi
+
+      # Reported, NOT gated: the `cmp` above already proves the fixed point
+      # WITHIN a run, and whether teko2.o is byte-identical ACROSS runs and
+      # machines is a separate claim (the mc repository pins its own with
+      # tests/golden/mc2.sha256). Printing it is what lets that claim be
+      # checked before anything is pinned to it.
+      # Written to a FILE and then appended to the summary, because a release
+      # quotes the very same table in its notes (`release.yml`, job `release`):
+      # one derivation, two readers, no chance of the published number and the
+      # measured one drifting apart.
+      - name: sizes and sha256 of the objects
+        if: always()
+        run: |
+          set -eu
+          sha256() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
+          mkdir -p ngen/build
+          {
+            printf '### fixpoint (%s/%s), mc %s\n\n' \
+              "${{ matrix.os }}" "${{ matrix.arch }}" "${{ steps.mc.outputs.version }}"
+            printf '| object | bytes | sha256 |\n|---|---:|---|\n'
+            for o in "teko$EXE" "teko1$EXE.o" "teko2$EXE.o" "teko3$EXE.o"; do
+              f="ngen/build/$o"
+              if [ -f "$f" ]; then
+                printf '| `%s` | %s | `%s` |\n' "$o" "$(wc -c <"$f" | tr -d ' ')" "$(sha256 "$f")"
+              else
+                printf '| `%s` | -- | not produced |\n' "$o"
+              fi
+            done
+            printf '\nThe sha256 is reported, not gated.\n'
+          } >ngen/build/provenance.md
+          cat ngen/build/provenance.md >>"$GITHUB_STEP_SUMMARY"
+          cat ngen/build/provenance.md
+
+      - name: upload the fixpoint provenance
+        if: inputs.package
+        uses: actions/upload-artifact@v6
+        with:
+          name: provenance-${{ matrix.os }}-${{ matrix.arch }}
+          path: ngen/build/provenance.md
+          if-no-files-found: error
+
+      # higiene 4 item B: `teko1.o` was once seen differing between two runs of
+      # the ladder on one machine, and it has not reproduced (44 runs, plano
+      # §74(c)). `teko0` (`ngen/build/teko`, the binary the stock mc writes) is
+      # in the table above for that reason -- an identical teko0 with a
+      # different teko1.o is the compiler's own nondeterminism, a different one
+      # is a different input. When stage 1 and stage 2 disagree, the readable
+      # form of both objects is archived: the diff of the two dumps localizes
+      # WHAT moved, which an object cannot.
+      - name: archive the stage-1 dumps when teko1.o != teko2.o
+        if: always()
+        id: dumps
+        run: |
+          set -eu
+          o1="ngen/build/teko1$EXE.o"
+          o2="ngen/build/teko2$EXE.o"
+          if [ ! -f "$o1" ] || [ ! -f "$o2" ]; then exit 0; fi
+          if cmp -s "$o1" "$o2"; then exit 0; fi
+          mkdir -p ngen/build/dumps
+          "ngen/build/teko$EXE"  --dump-asm ngen/mc_teko.tk >ngen/build/dumps/teko0-asm.txt 2>&1 || true
+          "ngen/build/teko1$EXE" --dump-asm ngen/mc_teko.tk >ngen/build/dumps/teko1-asm.txt 2>&1 || true
+          diff ngen/build/dumps/teko0-asm.txt ngen/build/dumps/teko1-asm.txt \
+            >ngen/build/dumps/diff.txt 2>&1 || true
+          echo "archive=yes" >>"$GITHUB_OUTPUT"
+
+      - name: upload the dumps
+        if: always() && steps.dumps.outputs.archive == 'yes'
+        uses: actions/upload-artifact@v6
+        with:
+          name: fixpoint-dumps-${{ matrix.os }}-${{ matrix.arch }}
+          path: ngen/build/dumps
+          retention-days: 14
+
+  # The required check on `main` -- the name the ruleset asks for, kept while
+  # the work moved into a five-way matrix. `needs.leg.result` is the matrix's
+  # aggregate: `success` only when every leg succeeded.
+  gate:
+    name: mc build ngen && run
+    needs: leg
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: every leg must be green
+        env:
+          LEGS: ${{ needs.leg.result }}
+        run: |
+          set -eu
+          echo "the five ngen legs reported: $LEGS"
+          if [ "$LEGS" != "success" ]; then
+            echo "::error::at least one ngen leg is not green ($LEGS)" >&2
+            exit 1
+          fi

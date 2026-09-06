@@ -1,3 +1,5 @@
+> **[HISTÓRICO]** — documenta o planejamento arquitetônico do backend próprio (onda fase-4/onda-6), já executado. Não descreve o estado atual do projeto.
+
 # Own AOT backend + M-linker — architecture, requirements, and phasing (recon)
 
 **Status:** RECON (doc-only). Sub-PR of the 0.2 wave umbrella (#374, branch
@@ -27,7 +29,7 @@ priority order:
    (`:438-455` — the current cross path re-runs `zig cc` **six times**, once per Linux artifact;
    the own backend lowers the front-end **once** and emits N cheap machine-code lowerings), and
    wins on independence. It wins only **~2.4% on a local self-build** (`:429-436`; `cc` is 0.69s of
-   the ~28s self-build — the cost is the VM gate + coverage, not the C compiler) and **~nothing on
+   the ~28s self-build — the cost is the legacy engine gate + coverage, not the C compiler) and **~nothing on
    qemu** (`:457-462`). This doc records that verdict so no one over-attributes local speed to this
    epic: **the win is independence + cross-compile, not single-host wall-clock.**
 3. **It obsoletes a live bug class.** The generated `teko.c` carries latent UB that
@@ -36,7 +38,7 @@ priority order:
    `-O2` UB and no `-O0` tax — `memory-unsafe-backend-remodel.md:176-177` records this as
    "obsoleted by the own-backend".
 
-The VM's fate rides along (`memory-unsafe-backend-remodel.md` §4): the noisy VM-vs-native
+The legacy engine's fate rides along (`memory-unsafe-backend-remodel.md` §4): the noisy legacy engine-vs-native
 differential **migrates** to **C-backend-vs-own-backend** (both native, C-backend trusted and
 self-hosting) — a *stronger* oracle that validates the new backend exactly when it is born; the
 C backend then retires when the own path is trusted. This recon scopes exactly that migration and
@@ -57,11 +59,9 @@ The parity set is anchored to the **current release matrix** (`.github/workflows
 | 2 | arm64 (AArch64) | AAPCS64 (Linux) | ELF | Linux arm64 glibc + musl |
 | 3 | x86-64 | SysV | ELF | Linux x86_64 glibc + musl |
 | 4 | x86-64 | Win64 | PE/COFF | `windows-x86_64` release |
-| 5 | wasm32 | WASI | Wasm | new (N6a) |
-| 6 | wasm32 | Browser (JS-import RT) | Wasm | new (N6b) |
 
 **Three object formats** the backend must emit: **ELF** (Linux), **Mach-O**
-(macOS/arm64), **PE/COFF** (Windows). Wasm is its own container. The Mach-O emitter must not
+(macOS/arm64), **PE/COFF** (Windows). The Mach-O emitter must not
 regress the `__TEXT,__info_plist` section `run_cc` writes today (`src/build/project.tks:429-437`,
 plist assembled at `:444` — Finder/`mdls`/`Get Info` metadata; plain text, no XML metacharacters).
 
@@ -72,14 +72,14 @@ lane with the most RAM (macOS runs the coverage/gate per the native-test-gate ru
 reaches full type/control parity with `tk_emit_c` on this one target *first*; N3–N5 (#223) are
 ports that reuse the whole LIR + lowering + regalloc frame and swap only isel/encoder/objfile.
 
-### 2.3 The differential gate (VM == C-native == own-native)
+### 2.3 The differential gate (legacy engine == C-native == own-native)
 
 The correctness bar is a **3-way differential** built on the four oracles that already exist:
 
-- **VM** (`teko run`) — the language oracle (retiring, but kept until C-vs-own is trusted).
+- **Legacy engine** (`teko run`) — the language oracle (retired once C-vs-own was trusted).
 - **C-native** — `tk_emit_c` → `run_cc` → binary (the trusted, self-hosting production path).
 - **own-native** — the new backend's binary.
-- **LIR interpreter** (`src/lir/lir_interp.tks`) — the "FOURTH oracle" (`:1-8`): runs the LIR
+- **LIR oracle** (`src/lir/lir_oracle.tks`) — the "FOURTH oracle" (`:1-8`): runs the LIR
   subset directly, no `cc`/QEMU, validating the *lowering* independently of any machine code.
 
 The gate grows in two moves: (a) N2 births **C-native == own-native** at the reference target,
@@ -94,7 +94,7 @@ all targets. The LIR-dump (`src/lir/lir_print.tks`, deterministic, floats as exa
 passes the full 3-way gate on every target for K consecutive green releases; (2) the own backend
 self-hosts (gen1==gen2 byte-identical through the own path, the fixpoint bar); (3) the
 M-linker (#226) removes the last external-linker dependency, so no target silently falls back to
-`cc`. Until then C-native stays the trusted side of the differential. **Do not retire the VM
+`cc`. Until then C-native stays the trusted side of the differential. **Do not retire the legacy engine
 differential before C-vs-own is in place** (`memory-unsafe-backend-remodel.md:187-189`).
 
 ### 2.5 DWARF / debug scope
@@ -116,7 +116,7 @@ names + line/col, not variable-location expressions.
 TAST  ──lower──▶  LIR  ──isel──▶  MInst  ──regalloc──▶  MInst'  ──encode──▶  object bytes  ──M-linker──▶  executable
 (checker)        (SSA-lite)      (per-ISA)  (linear-scan)         (per-ISA)     (ELF/Mach-O/PE)   (#226)
                      │
-                     └──lir_print (diff spine) · lir_interp (4th oracle)
+                     └──lir_print (diff spine) · lir_oracle (4th oracle)
 ```
 
 **N1 (#221, CLOSED) already delivers the front half:**
@@ -134,7 +134,7 @@ TAST  ──lower──▶  LIR  ──isel──▶  MInst  ──regalloc─�
   backend — same recursion, different result (append `LInst` + return a `VReg` instead of appending
   text). Everything else **honest-stops with a NAMED error** — this is the N2 frontier (§3.2).
 - **`src/lir/lir_print.tks`** — the deterministic textual LIR printer (`:1-7`): the diff spine.
-- **`src/lir/lir_interp.tks`** — the LIR interpreter oracle (`:1-8`): the fourth oracle.
+- **`src/lir/lir_oracle.tks`** — the LIR oracle (`:1-8`): the fourth oracle.
 
 The seam where "the semantic type dies and the machine begins" is `ltype_of`
 (`src/lir/lower.tks:48-58`): every address-shaped type (`str`/`slice`/`Ref`/`ptr`/`Named`/
@@ -156,14 +156,14 @@ walk:
 
 N2 also grows `LModule` past functions-only (`lir.tks:96` "Structs/globals/rodata enter in N2"):
 **string/float literals need a rodata section**, aggregates need struct layout, and top-level
-consts need globals. The LIR interpreter and printer grow one case in lockstep with each closed
-honest-stop (their scope notes at `lir_interp.tks:9-13`, `lir_print.tks:1-7`).
+consts need globals. The LIR oracle and printer grow one case in lockstep with each closed
+honest-stop (their scope notes at `lir_oracle.tks:9-13`, `lir_print.tks:1-7`).
 
 ### 3.3 Instruction selection (isel)
 
 Per-ISA modules, `LIR → MInst` (a thin machine-instruction IR keyed by target). N1's design note
-(`lir.tks:6-9`) fixes the strategy: **a register IR serves both register targets (linear-scan) and
-Wasm (its own stackify)**. isel is a per-block tree/peephole match over `LOp`; because signedness is
+(`lir.tks:6-9`) fixes the strategy: **a register IR serves the register targets (linear-scan)**.
+isel is a per-block tree/peephole match over `LOp`; because signedness is
 on the opcode (`IDivS`/`IDivU`) and widths are on `LType`, the selector reads the op+type and needs
 no re-analysis. Proposed home: `src/backend/isel_<isa>.tks` (`isel_arm64.tks` first). Fat-pointer
 ops (str/slice as `{ptr,len}`) are the first N2 additions that isel must lower to two-register
@@ -217,7 +217,7 @@ through the `Manifest`/argv parse (`project.tks:901-977` already skips `-o`/`--n
  * @param m the resolved manifest, carrying the backend selection
  * @return the process exit status (0 on success)
  */
-fn emit_binary(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest) -> i32 {
+fn emit_binary(dir: str, stem: str, out_dir: str, prog: checker::TProgram, m: Manifest): i32 {
     if m.backend == Backend::Native { return emit_native(dir, stem, out_dir, prog, m) }
     emit_c_native(dir, stem, out_dir, prog, m)
 }
@@ -232,7 +232,7 @@ flipped.
 
 ## 4. Phasing — the issue-map
 
-This settles the fase-4/Onda-6 stubs (#222 N2, #223 N3–N5, #224 Wasm, #225 N7+N8, #226 M-linker)
+This settles the fase-4/Onda-6 stubs (#222 N2, #223 N3–N5, #225 N7+N8, #226 M-linker)
 into ordered, code-grounded implementation issues re-homed into the 0.2 wave. **These are a PLAN;
 the integrator spawns the GitHub issues.** Every compiler-touching issue owes the full ritual
 (gate both engines · paranoid · differential · parity · fixpoint). Verification names the gate leg
@@ -244,11 +244,11 @@ that PROVES each issue.
 - Scope: close the honest-stops in §3.2 — `if`/`match`/`loop`/`defer` (`LJump`/`LBranch` +
   block-args), interface dispatch (vtable load + indirect call), closures + function-as-value,
   struct/slice/str fat-pointer lowering, and `LModule` rodata/globals/struct-layout. Grow
-  `lir_interp` + `lir_print` one case per feature.
+  `lir_oracle` + `lir_print` one case per feature.
 - Depends on: N1 (#221, CLOSED).
-- Files: `src/lir/lower.tks`, `src/lir/lir.tks` (LModule rodata/globals), `src/lir/lir_interp.tks`,
-  `src/lir/lir_print.tks`; tests `src/lir/lower_test.tkt`, `lir_interp_test.tkt`, `lir_test.tkt`.
-- Verifies via: **LIR-interpreter oracle** (exit code parity vs VM over the subset) + golden
+- Files: `src/lir/lower.tks`, `src/lir/lir.tks` (LModule rodata/globals), `src/lir/lir_oracle.tks`,
+  `src/lir/lir_print.tks`; tests `src/lir/lower_test.tkt`, `lir_oracle_test.tkt`, `lir_test.tkt`.
+- Verifies via: **LIR oracle** (exit code parity vs the legacy engine over the subset) + golden
   LIR-dump diff. No machine code yet — proves lowering completeness independently.
 
 **A2 · N2b — arm64 instruction selection**
@@ -257,8 +257,8 @@ that PROVES each issue.
 - Depends on: A1.
 - Files: new `src/backend/minst.tks` (machine-IR types + printer), `src/backend/isel_arm64.tks`;
   tests `src/backend/isel_arm64_test.tkt`.
-- Verifies via: golden MInst-dump tests + isel-over-interp equivalence (selected form re-interpreted
-  matches the LIR interp).
+- Verifies via: golden MInst-dump tests + isel-over-oracle equivalence (selected form re-run
+  matches the LIR oracle).
 
 **A3 · N2c — linear-scan register allocation (shared core + AAPCS64 descriptor)**
 - Scope: target-independent linear-scan over block-args; AAPCS64 register file + ABI descriptor
@@ -266,7 +266,7 @@ that PROVES each issue.
 - Depends on: A2.
 - Files: new `src/backend/regalloc.tks`, `src/backend/abi_aapcs64.tks`; tests `regalloc_test.tkt`.
 - Verifies via: `regalloc_test.tkt` (no live-range overlap in a physical reg) + post-alloc
-  interp-equivalence.
+  oracle-equivalence.
 
 **A4 · N2d — arm64 encoder + Mach-O object + link via system ld (births C-vs-own differential)**
 - Scope: `MInst' → AArch64 machine bytes`; Mach-O object emitter (sections, symtab, relocations,
@@ -300,18 +300,6 @@ design doc are gone; the phase letter is kept so B1/B3 keep their names.
 - Files: new `src/backend/abi_win64.tks`, `src/backend/objfile_coff.tks`.
 - Verifies via: C-native == own-native on the `windows-x86_64` release lane.
 
-### Phase C — Wasm (settles #224)
-
-**C1 · N6a + N6b — Wasm (WASI + Browser), the stackifier + JS-import runtime**
-- Scope: the register-IR → Wasm **stackify** pass (`lir.tks:6-9` reserves this route);
-  `objfile_wasm.tks` module/section writer; WASI RT binding (N6a) + the Browser JS-import variant of
-  `teko_rt` + JS glue (N6b). This is AOT (distinct from the interpreted `teko run` dev/WASM path).
-- Depends on: A1 (the target-independent LIR) — NOT A2/A3 (Wasm has its own selection/no regalloc),
-  so C1 can run in parallel with Phase B.
-- Files: new `src/backend/stackify.tks`, `src/backend/objfile_wasm.tks`, a Wasm variant of
-  `src/runtime/teko_rt.tks` + `extensions/`/`web` glue.
-- Verifies via: C-native (or VM) == own-wasm under a wasmtime/node harness over the corpus.
-
 ### Phase D — 3-way gate + backend flag (settles #225)
 
 **D1 · N7 — the `--backend={c,native}` selection flag**
@@ -322,7 +310,7 @@ design doc are gone; the phase letter is kept so B1/B3 keep their names.
   `src/build/manifest.tks` (`Backend` field); tests in `project` + `manifest` `.tkt`.
 - Verifies via: `manifest`/`project` unit tests + fixpoint unchanged (flag defaults to C).
 
-**D2 · N8 — the 3-way differential CI (VM == C-native == own-native) + retire/DWARF decisions**
+**D2 · N8 — the 3-way differential CI (legacy engine == C-native == own-native) + retire/DWARF decisions**
 - Scope: extend `scripts/diff_vm_native.sh` with the own-backend leg across all 8 targets; collect
   the **C-RETIRE** criteria evidence (§2.4) and the **DWARF/PDB** scope decision (§2.5) as owner
   forks. Does NOT retire anything.
@@ -380,12 +368,12 @@ the owner's ruling is collected. Flagged for an explicit ruling: **D-1 (REPL), D
 D-3 (C-retire timing), D-4 (reference target).**
 
 ### D-1 · The REPL's fate (owner fork, from remodel §4)
-An interactive REPL is naturally an interpreter; on an AOT-only world it becomes either
-compile-and-run-per-line or a retained minimal tree-walker. **Law tension:** keeping the VM alive
+An interactive REPL naturally wants line-by-line evaluation; on an AOT-only world it becomes either
+compile-and-run-per-line or a retained minimal tree-walker. **Law tension:** keeping a legacy engine alive
 just for the REPL violates M.1 (two evaluators for one language) and M.5 (two ways to run code);
 compile-per-line honors both but pays latency (M.4 visible cost, acceptable for an interactive
-tool). **Recommendation:** compile-and-run-per-line on the own backend; retire the VM entirely. Not
-blocking (the REPL is not on the backend critical path) — collected at D2/#225 alongside VM
+tool). **Recommendation:** compile-and-run-per-line on the own backend; retire the legacy engine entirely. Not
+blocking (the REPL is not on the backend critical path) — collected at D2/#225 alongside legacy-engine
 retirement.
 
 ### D-2 · The runtime-link path (blocks A4 — genuine fork)

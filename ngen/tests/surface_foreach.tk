@@ -1,0 +1,165 @@
+// surface_foreach.tk -- `foreach (T x in xs)` (K5, D221 §41 decision 23): the
+// sugar over `for` with an index, on the three sources with a Length known
+// without an oracle -- a `T[]` of heap (K3), a local fixed array
+// (teko_array.tk), and an inline array field (teko_struct.tk) -- with `in`
+// read contextually (teko_loop.tk).
+//
+// What each helper proves, in order:
+//
+//   1. `heapcheck` -- a `T[]` of heap: `break`/`continue` inside the body.
+//   2. `localcheck` -- a local fixed array.
+//   3. `nestedcheck` -- two `foreach` loops nested, `break 2` reaching past
+//      both -- the SAME jump rewrite `for`'s own nesting already relies on.
+//   4. `circlecheck` -- `Circle[]`, a counted element: the per-iteration
+//      variable is released every pass (a leaked increment would keep the
+//      array's own elements alive past `cs = null;`), and the array itself
+//      at the end -- `rt_live()` proves the floor both times.
+//   5. `methodcheck` -- `foreach` inside a method, over `this.xs` (a `T[]`
+//      heap field) and `this.items` (an inline array field).
+//   6. `widencheck` -- `i64 x in u8[]`, the implicit widening a narrower
+//      element already gets.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 heapcheck() {
+    i64 n = 5;
+    i64[] xs = new i64[n];
+    for (i64 i = 0; i < xs.Length; i++) { xs[i] = i; }
+    i64 sum = 0;
+    foreach (i64 x in xs) {
+        if (x == 2) continue;
+        if (x == 4) break;
+        sum = sum + x;
+    }
+    if (sum != 4) return 1;                       // 0 + 1, 2 skipped, 4 breaks first
+    return 0;
+}
+
+i64 localcheck() {
+    i64 a[4];
+    a[0] = 10;
+    a[1] = 20;
+    a[2] = 30;
+    a[3] = 40;
+    i64 total = 0;
+    foreach (i64 v in a) { total = total + v; }
+    if (total != 100) return 1;
+    return 0;
+}
+
+i64 nestedcheck() {
+    i64 outer[2];
+    outer[0] = 1;
+    outer[1] = 2;
+    i64 inner[3];
+    inner[0] = 1;
+    inner[1] = 2;
+    inner[2] = 3;
+    i64 hits = 0;
+    foreach (i64 o in outer) {
+        foreach (i64 v in inner) {
+            hits = hits + 1;
+            if (o == 2 && v == 2) break 2;
+        }
+    }
+    if (hits != 5) return 1;                      // (1,1)(1,2)(1,3)(2,1)(2,2), then break 2
+    return 0;
+}
+
+i64 circle_dtors2 = 0;
+
+class Circle2 {
+    i64 r;
+
+    public Circle2(i64 r) { this.r = r; }
+    public i64 area() { return r * r; }
+    ~Circle2() { circle_dtors2 = circle_dtors2 + 1; }
+}
+
+i64 circlecheck() {
+    i64 floor = rt_live();
+    Circle2[] cs = new Circle2[3];
+    cs[0] = new Circle2(1);
+    cs[1] = new Circle2(2);
+    cs[2] = new Circle2(3);
+    i64 total = 0;
+    foreach (Circle2 c in cs) {
+        total = total + c.area();
+    }
+    if (total != 14) return 1;                    // 1 + 4 + 9
+    if (circle_dtors2 != 0) return 2;              // foreach only borrows; the array still owns them
+    if (rt_live() != floor + 4) return 3;          // the array object + the 3 circles, no leak
+    cs = null;
+    if (circle_dtors2 != 3) return 4;
+    if (rt_live() != floor) return 5;
+    return 0;
+}
+
+class Holder {
+    i64[] xs;
+    i64 items[4];
+
+    public Holder(i64 n) {
+        this.xs = new i64[n];
+        for (i64 i = 0; i < this.xs.Length; i++) { this.xs[i] = i + 1; }
+        this.items[0] = 5;
+        this.items[1] = 6;
+        this.items[2] = 7;
+        this.items[3] = 8;
+    }
+
+    public i64 sumXs() {
+        i64 s = 0;
+        foreach (i64 v in this.xs) { s = s + v; }
+        return s;
+    }
+
+    public i64 sumItems() {
+        i64 s = 0;
+        foreach (i64 v in this.items) { s = s + v; }
+        return s;
+    }
+}
+
+i64 methodcheck() {
+    Holder h = new Holder(3);
+    if (h.sumXs() != 6) return 1;                 // 1 + 2 + 3
+    if (h.sumItems() != 26) return 2;              // 5 + 6 + 7 + 8
+    return 0;
+}
+
+i64 widencheck() {
+    u8[] bs = new u8[3];
+    bs[0] = 250;
+    bs[1] = 5;
+    bs[2] = 1;
+    i64 sum = 0;
+    foreach (i64 x in bs) { sum = sum + x; }
+    if (sum != 256) return 1;
+    return 0;
+}
+
+i64 main() {
+    i64 bad = heapcheck();
+    if (bad != 0) return 10 + bad;
+
+    bad = localcheck();
+    if (bad != 0) return 20 + bad;
+
+    bad = nestedcheck();
+    if (bad != 0) return 30 + bad;
+
+    bad = circlecheck();
+    if (bad != 0) return 40 + bad;
+    if (rt_live() != 0) return 49;
+
+    bad = methodcheck();
+    if (bad != 0) return 50 + bad;
+
+    bad = widencheck();
+    if (bad != 0) return 60 + bad;
+
+    return 42;
+}

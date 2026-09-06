@@ -27,10 +27,9 @@
   async surface is designed to layer on top later under the settled async model
   ([[teko-async-concurrency-design]]) — **not** in this roadmap. Signatures are chosen so the async
   variants are additive, never a rewrite.
-- **VM honest-stops on externs.** The VM cannot run a raw platform `extern` (only `from "teko_rt"` is
-  VM-backed). So: **pure-Teko logic is `.tkt`-tested on the VM; socket/crypto syscalls are proven by
-  native regression examples.** Per-unit "verify" sections say which applies. This mirrors how
-  `teko::time` and FFI already work ([[teko-ffi-extern]]).
+- **Everything is proven natively.** Native is the sole execution engine. So: **pure-Teko logic
+  is `.tkt`-tested; socket/crypto syscalls are proven by native regression examples.** Per-unit "verify"
+  sections say which applies. This mirrors how `teko::time` and FFI already work ([[teko-ffi-extern]]).
 - **Per-OS via `#os(...)`.** The `#os("linux")` / `#os("macos")` / `#os("windows")` function guard
   (C7.1f) already exists in the parser. glibc vs musl is **not** an `#os` axis — both are `"linux"` and
   share the same libc symbols (`socket`/`bind`/…); the only musl delta is the backtrace degradation
@@ -63,7 +62,7 @@ this tractable:
 **Deps:** none. **Files:** `src/checker/typer.{tks,c}`, `src/codegen/codegen.{tks,c}`, a smoke example.
 **Decision to ratify (law-first, in the design PR):** choose ONE of
 - **(A) `ptr<byte>` + explicit length**, with `teko::net` owning a small **arena-backed mutable byte
-  region** whose address is taken via a new `buf_ptr(region) -> ptr<byte>` builtin (reuses the S1 arena;
+  region** whose address is taken via a new `buf_ptr(region): ptr<byte>` builtin (reuses the S1 arena;
   the region is written by C through the pointer, then read back by length). Keeps the extern ABI at the
   already-legal `ptr`/`uptr` — **smallest compiler change**, and the no-index-assign ruling is respected
   because the buffer is opaque to Teko until read back.
@@ -75,7 +74,7 @@ this tractable:
 model already in place; (B) can be added later as sugar. The rest of this doc is written against a
 `teko::net::buf` abstraction so the choice stays encapsulated.
 **Verify:** a smoke example that calls a libc `extern` (`memset`/`read` on a temp file) filling a buffer
-and reading it back, VM honest-stop + native roundtrip; both twins byte-identical.
+and reading it back, the native roundtrip; both twins byte-identical.
 
 ---
 
@@ -86,10 +85,10 @@ and reading it back, VM honest-stop + native roundtrip; both twins byte-identica
 **▪ N0 — `teko::net` core (common).**
 **Deps:** N-KEYSTONE. **Files:** `src/net/net.tks` (+ `.tkt`).
 Contents: `IpAddr` (v4/v6 variant), `SocketAddr {ip, port}`, parse/format for both; host/network
-**byte-order** helpers (`hton16/32`, `ntoh16/32` — pure Teko bit ops, VM-testable); the `Socket` handle
+**byte-order** helpers (`hton16/32`, `ntoh16/32` — pure Teko bit ops, `.tkt`-testable); the `Socket` handle
 (an `extern type` opaque fd/SOCKET, or an `i64`/`uptr` wrapper); `NetError` (errno/WSA code + message,
 built on the existing `error` value); the `Buf` byte-region abstraction from N-KEYSTONE (alloc, len,
-as-slice, from-slice). **Verify:** `.tkt` on the VM for address parse/format + byte-order (100% pure
+as-slice, from-slice). **Verify:** `.tkt`-tested for address parse/format + byte-order (100% pure
 Teko, no syscalls).
 
 **▪ N1 — `teko::net::tcp`.**
@@ -143,12 +142,12 @@ N3) for cloud environments that mandate encrypted DNS. **Verify:** native resolv
 **▪ N5 — `teko::net::http` (HTTP/1.1).** **Deps:** N1 (client), N3 (https). **Files:** `src/net/http/*.tks`.
 Pure-Teko HTTP/1.1: request/response types, header map, chunked + content-length bodies, a **client**
 (`get`/`post`/… over TcpStream/TlsStream) and a minimal **server** (bind/accept/route→handler). URL
-parser. Cookies, redirects, keep-alive. **Verify:** `.tkt` on the VM for the request/response
+parser. Cookies, redirects, keep-alive. **Verify:** `.tkt`-tested for the request/response
 **parser + encoder** (pure Teko — high-value, high-risk); native client GET against the N5 server.
 
 **▪ N6 — `teko::net::ws` (WebSocket, RFC 6455).** **Deps:** N5, **C1 (SHA-1 for the accept-key)**.
 **Files:** `src/net/ws.tks`. HTTP Upgrade handshake, frame codec (fin/opcode/mask/payload-len), masking,
-close/ping/pong. **Verify:** `.tkt` on the VM for the frame codec + accept-key derivation; native echo.
+close/ping/pong. **Verify:** `.tkt`-tested for the frame codec + accept-key derivation; native echo.
 
 **▪ N7 — `teko::net::sse` (Server-Sent Events).** **Deps:** N5. A thin `text/event-stream` codec on top of
 HTTP (client + server helper). Small but distinct L7 unit; common in cloud dashboards. **Verify:** `.tkt`
@@ -211,7 +210,7 @@ corporate/cloud proxies). Small, high-leverage; **Verify:** `.tkt` for the SOCKS
 ## 2b. Serialization / encoding infrastructure (several protocols depend on these)
 
 Greenfield in the corpus (no JSON / protobuf / ASN.1 today — verified). Each is pure Teko, fully
-VM-`.tkt`-testable, and reusable well beyond networking.
+`.tkt`-testable, and reusable well beyond networking.
 
 **▪ S-JSON — `teko::encoding::json`.** **Deps:** none. Parser + encoder (RFC 8259), streaming + DOM.
 Needed by HTTP APIs, config, DoH, many cloud services. High priority, unblocks a lot. **(T1)**
@@ -238,7 +237,7 @@ reader is bespoke; this is the reusable public one). **(T3)**
 
 `teko::compress` **already exists** (`src/compress/compress.tks`): a pure-Teko **CRC-32** table + a
 **ZIP STORE** reader/writer for `.tkl` (C7.12). Everything below **extends that module**, all pure Teko
-(fully VM-`.tkt`-testable against canonical fixtures), reused by HTTP `Content-Encoding`, `.tkl`/archives,
+(fully `.tkt`-testable against canonical fixtures), reused by HTTP `Content-Encoding`, `.tkl`/archives,
 PGP, and storage. Order matters: DEFLATE is the keystone several formats reuse.
 
 **▪ Z-DEFLATE — `teko::compress::deflate`.** **Deps:** none (CRC-32 exists). RFC 1951: Huffman + LZ77
@@ -259,7 +258,7 @@ CRC/index). Range coder + LZ. Large, delicate. **(T2/T3)**
 default in cloud/storage. FSE + Huffman + LZ. **(T3)**
 **▪ Z-BZIP2 — `teko::compress::bzip2` (T3, optional).** BWT-based; niche but common in archives.
 
-> **Decision to ratify (compression):** pure-Teko DEFLATE/brotli/lzma (portable, VM-testable, no OS dep)
+> **Decision to ratify (compression):** pure-Teko DEFLATE/brotli/lzma (portable, `.tkt`-testable, no OS dep)
 > vs binding `zlib`/`libbrotli`/`liblzma` via FFI where present. **Recommendation:** pure-Teko DEFLATE +
 > gzip + zlib first (bounded, unblocks HTTP + archives, no dependency); brotli/lzma/zstd may start
 > provider-backed and get pure-Teko implementations later.
@@ -282,7 +281,7 @@ enc) are provided ONLY where a real protocol still needs them, and are marked `l
 Byte helpers on `Buf`, **constant-time equality** (`ct_eq`) + constant-time select, secure-zero,
 `CryptoError`. (Hex/base64/base32 live in `teko::encoding` §2b and are re-exported.) **Verify:** `.tkt`.
 
-### Hashes / MACs / KDFs (pure Teko — bounded, VM-testable, no OS dep)
+### Hashes / MACs / KDFs (pure Teko — bounded, `.tkt`-testable, no OS dep)
 
 **▪ C1 — `teko::crypto::hash`.** **Deps:** C0. **Files:** `src/crypto/hash.tks`.
 SHA-2 (224/256/384/512), **SHA-3 + SHAKE128/256** (Keccak), **BLAKE2b/2s** (+ BLAKE3 as a stretch),
@@ -320,7 +319,7 @@ data-dependent table lookups** — a real side-channel concern) vs an OS/AES-NI-
 
 **▪ C6 — `teko::crypto::rand`.** **Deps:** C0. **Files:** `src/crypto/rand.tks`.
 CSPRNG bytes from the OS: `getentropy` (macOS/Linux), `getrandom` (Linux), `BCryptGenRandom` (Windows) via
-`#os` externs. Optional DRBG (HMAC/CTR) on top. **Verify:** native (VM honest-stops on the extern).
+`#os` externs. Optional DRBG (HMAC/CTR) on top. **Verify:** native only (the extern has no non-native fallback).
 
 **▪ C7 — `teko::crypto::pk` (public-key / ASYMMETRIC cryptography).** **Deps:** C0, C1, S-ASN1 (key/cert
 encoding), C6. **Files:** `src/crypto/pk/*.tks`. This is the **asymmetric** surface (the "criptografias

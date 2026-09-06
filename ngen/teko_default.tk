@@ -1,0 +1,282 @@
+// teko_default.tk -- default parameter value in a TOP-LEVEL (free) function,
+// C#-style (entrega 4, crumb C6, unblocked by mc 0.10.3's `syntax_param`):
+//
+//   i64 add(i64 a, i64 b = 10) { return a + b; }
+//   add(1)          ->  add(1, 10)
+//
+// The spelling is the mc core's own parameter list -- no new word. The
+// trailer `= constant` is read by THIS module, at the position `syntax_param`
+// gives it (mc docs/reference/hooks.md), the instant before the core would
+// otherwise demand a comma or a close paren. A parameter with no `=` is
+// handed back through `param_new` exactly as the core's own inline
+// construction would build it -- this module claims it (the core never gets
+// the chance to), but produces the SAME node, so a corpus with no default in
+// it dumps a byte-identical tree (the same proof `lib/user_param_nop.mc`'s
+// own no-op module gives the core).
+//
+// The declaration's own defaults reuse teko_class.tk's shared machinery
+// wholesale rather than a second copy of it: `tk_param_default(mark)` is the
+// fold-to-constant, the "must be a constant" and "no default after a
+// default" checks and their exact messages, and `tk_fill_defaults(args, na,
+// np, nreq, d0)` is the append-the-missing-arguments-as-clones a call site
+// needs. Both already serve every method, constructor and interface
+// signature in the codebase; a free function is one more caller, not a new
+// mechanism.
+//
+// WHERE THE FILL RUNS. A name declared exactly once never leaves this file's
+// own pass(): there is only one signature to complete against, no type to
+// compare, and the table below (keyed by the declaration itself, not by
+// `decl_find`, which only ever answers about the FIRST of several
+// same-named declarations) is enough on its own. A name declared MORE than
+// once -- teko_over.tk's C4 -- is left untouched here on purpose: which
+// overload a short call picks is a question about ALL of its signatures at
+// once (C#'s "a candidate that needs no default wins over one that does",
+// §12.6.4.5), and only teko_over.tk's own match, run over every declaration
+// of the name together, can decide that. This pass therefore runs BEFORE
+// `tk_over_pass`, touches only names it finds declared once, and
+// `tk_default_ndef_of_name`/`tk_default_d0_of_name` below are what
+// teko_over.tk's own fourth round reads for the rest.
+
+#define TK_MAXFDECL 4096               // free-function declarations with a parameter list
+
+uptr fpd_name[TK_MAXFDECL];            // the name pointer `p_decl_name()` gave, at that declaration
+i64  fpd_mark[TK_MAXFDECL];            // teko_class.tk's shared default table: where its own start
+i64  tk_nfdecl = 0;
+
+uptr tk_dflt_owner = 0;               // the declaration `syntax_param` is inside right now
+i64  tk_dflt_row = 0 - 1;             // its row above, or -1 before the first parameter
+
+uptr fpd_name_at(i64 i) { return ld64(fpd_name + i * 8); }
+i64  fpd_mark_at(i64 i) { return ld64(fpd_mark + i * 8); }
+void set_fpd_name_at(i64 i, uptr v) { st64(fpd_name + i * 8, v); }
+void set_fpd_mark_at(i64 i, i64 v)  { st64(fpd_mark + i * 8, v); }
+
+// the parameter position (mc docs/reference/hooks.md §`syntax_param`). Every
+// valid, non-`void` parameter is claimed -- the same shape `lib/
+// user_syntax_demo.mc`'s `sd_param` claims -- so the bookkeeping below sees
+// every declaration's FIRST parameter, whether or not it ever carries a
+// default: `p_decl_name()` changing is what starts a new row, checked before
+// the type is even read, since neither read consumes a token, and a handler
+// may only decline from the position it was called at.
+i64 tk_default_param() {
+    uptr owner = p_decl_name();
+    if (owner != tk_dflt_owner) {
+        if (tk_nfdecl == TK_MAXFDECL)
+            err_at(p_file(), p_line(), "teko: too many free-function declarations with parameters");
+        tk_dflt_owner = owner;
+        tk_dflt_row = tk_nfdecl;
+        set_fpd_name_at(tk_dflt_row, owner);
+        set_fpd_mark_at(tk_dflt_row, tk_ndflt);
+        tk_nfdecl = tk_nfdecl + 1;
+        tk_hp_reset();                            // K3: this declaration's own `T[]` parameters
+    }
+    i64 rk = tk_ref_kind();                      // K2 (§41): `ref`/`out` before the pointee type
+    if (rk != TK_RP_NONE) {
+        p_next();
+        i64 pty = tk_ref_param(rk);
+        uptr pn = p_ident();
+        i64 pnode = param_new(TY_UPTR, pn);      // K2w: the slot carries an ADDRESS, so it is a word wide
+        tk_rp_add(pnode, rk, pty);               // ...and the pointee `T` lives in teko_ref.tk's own table
+        tk_ref_deny_default(rk, p_line(), p_file());
+        return pnode;
+    }
+    i64 ty = tk_ns_param_ty();                   // a namespaced short type name (§31 N1)
+    if (ty >= 0) {
+        p_next();
+    } else {
+        ty = type_of_token(p_id());
+        if (ty < 0 || ty == TY_VOID) return 0;   // not ours: the core's own two diagnostics stand
+        ty = p_type();                           // K3 (§41): lets a `[]` suffix register
+    }
+    uptr pn = p_ident();
+    if (ty == tk_ty_params && p_id() == K_ASSIGN)
+        err_at(p_file(), p_line(), "teko: a `params` list has no default");
+    tk_hp_add(pn, ty);                            // K3: a `T[]` parameter of a free function
+    tk_param_default(fpd_mark_at(tk_dflt_row));
+    return param_new(ty, pn);
+}
+
+// how many DECLARATIONS (not calls, and not rows of the table above) share
+// `name` in the WHOLE unit -- more than one is an overload teko_over.tk
+// resolves, together with its own defaults. This walks `root` rather than
+// the table above on purpose: a sibling overload of arity ZERO (`tally()`
+// beside `tally(i64 k)`) never triggers `syntax_param` at all, so it has no
+// row there, and counting rows alone would miss it -- exactly the mistake
+// that let a call to the zero-arity `tally()` be filled against the other
+// declaration's default instead of left for the core's own exact match.
+i64 tk_default_decl_count(i64 root, uptr name) {
+    i64 c = 0;
+    i64 n = root;
+    loop {
+        if (n == 0) break;
+        if (decl_valid(n) && str_eq(nd_name(n), name)) c = c + 1;
+        n = nd_next(n);
+    }
+    return c;
+}
+
+i64 tk_default_row(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfdecl) break;
+        if (str_eq(fpd_name_at(i), name)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// row `i`'s own share of the shared default table: everything from its mark
+// up to the NEXT row's (or, past the last row, up to the table's current end)
+i64 tk_default_ndef(i64 i) {
+    i64 end = tk_ndflt;
+    if (i + 1 < tk_nfdecl) end = fpd_mark_at(i + 1);
+    return end - fpd_mark_at(i);
+}
+
+// the row whose parameters belong to a declaration, found by the EXACT
+// pointer its name was AT PARSE TIME -- not its spelling, and not its
+// CURRENT `nd_name`. `cur_name()` (mc src/parse.mc) copies the source text
+// afresh at every occurrence, so no two declarations ever share one, and the
+// pointer `parse_top`/`parse_function` hand to `set_nd_name` is the very one
+// `p_decl_name()` gave this module while the declaration's parameters were
+// read -- but `teko_over.tk`'s own `tk_ov_rename` OVERWRITES a node's live
+// `nd_name` with the mangled symbol before its fourth round ever asks about
+// it, so a caller there passes its own `od_name_at(i)` (captured at
+// collection time, before the rename touches the node) rather than
+// `nd_name(d)`. This is what tells two overloads of one spelling apart
+// without a second copy of teko_over.tk's own table.
+i64 tk_default_row_of_name(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfdecl) break;
+        if (fpd_name_at(i) == name) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// how many of a declaration's trailing parameters default, and where they
+// start in the shared table -- 0/0 for one this module never saw a default
+// on. teko_over.tk's fourth round reads both, over EVERY declaration of an
+// overloaded name, since only it compares the arguments already given
+// against each candidate's own parameter TYPES.
+i64 tk_default_ndef_of_name(uptr name) {
+    i64 i = tk_default_row_of_name(name);
+    if (i < 0) return 0;
+    return tk_default_ndef(i);
+}
+
+i64 tk_default_d0_of_name(uptr name) {
+    i64 i = tk_default_row_of_name(name);
+    if (i < 0) return 0;
+    return fpd_mark_at(i);
+}
+
+// moves row `velho`'s own key to `novo` -- a namespace mangling a-rename
+// (entrega 5, crumb N2), which is the ONE other place besides
+// `set_nd_name` a free function's parse-time name pointer has to move to.
+// `novo` MUST be the exact pointer the caller also hands `set_nd_name`:
+// `tk_default_row_of_name`'s own pointer compare (above) is what
+// `teko_over.tk`'s fourth round reads later, and it would miss the row
+// under any other copy of the same text. A name this table never saw a
+// parameter for (`tk_default_row` answers -1) is not this function's
+// business -- there is no default to carry across the rename.
+void tk_default_rename(uptr velho, uptr novo) {
+    i64 i = tk_default_row(velho);
+    if (i < 0) return;
+    set_fpd_name_at(i, novo);
+}
+
+// the node whose name is the EXACT pointer `owner` -- the call-site half of
+// the same identity match `tk_default_row_of_node` makes from the other
+// side. Walking `root` here, rather than trusting `decl_find` (which only
+// ever answers about the FIRST declaration of a name), is what makes this
+// correct even when the name turns out to be overloaded elsewhere in the
+// unit -- a case this pass still has to step aside from cleanly.
+i64 tk_default_node_of(i64 root, uptr owner) {
+    i64 n = root;
+    loop {
+        if (n == 0) break;
+        if (decl_valid(n) && nd_name(n) == owner) return n;
+        n = nd_next(n);
+    }
+    return 0 - 1;
+}
+
+i64 tk_default_nargs(i64 args) {
+    i64 n = 0;
+    i64 a = args;
+    loop {
+        if (a == 0) break;
+        n = n + 1;
+        a = nd_next(a);
+    }
+    return n;
+}
+
+// too few arguments even for the defaults to help: reported here, in the
+// wording the call site earns, rather than the core's own generic "wrong
+// number of arguments" (mc src/gen_resolve.mc), which never gets a chance to
+// run once this pass has filled or refused the call
+uptr tk_default_arity_msg(uptr name, i64 nreq) {
+    return tk_join(tk_join3("teko: ", name, " takes at least "), tk_join(tk_num(nreq), " arguments"));
+}
+
+// row `i`'s call site `n`: a call short of `np` gets the missing tail cloned
+// in from teko_class.tk's own table, the same append `tk_fill_defaults`
+// already gives every method and constructor
+void tk_default_fill(i64 root, i64 n, i64 row) {
+    i64 d = tk_default_node_of(root, fpd_name_at(row));
+    if (d < 0) return;
+    i64 np = decl_nparams(d);
+    i64 na = tk_default_nargs(nd_a(n));
+    if (na >= np) return;                         // exact, or too many: not this pass's business
+    i64 nreq = np - tk_default_ndef(row);
+    if (na < nreq)
+        err_at(nd_file(n), nd_line(n), tk_default_arity_msg(nd_name(n), nreq));
+    set_nd_a(n, tk_fill_defaults(nd_a(n), na, np, nreq, fpd_mark_at(row)));
+}
+
+// `extern` owns its symbol, and its argument list is the C ABI's -- there is
+// no call this compiler lowers that could ever supply a missing word for it.
+// Checked once, over EVERY row, the moment a declaration is read, exactly
+// like `teko_params.tk`'s own `tk_va_check_decl` refuses `params` on an
+// `extern`: a default that no call ever exercises is still a refusal, not a
+// dead default.
+void tk_default_check_decls(i64 root) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfdecl) break;
+        if (tk_default_ndef(i) > 0) {
+            i64 d = tk_default_node_of(root, fpd_name_at(i));
+            if (d >= 0 && nd_kind(d) == N_EXTERN)
+                err_at(nd_file(d), nd_line(d), "teko: an extern parameter has no default");
+        }
+        i = i + 1;
+    }
+}
+
+// every call in the unit, node array order (the same shape `lib/
+// user_syntax_demo.mc`'s own `sd_defaults` walks): no type is asked about,
+// so no scope/tree walk is needed -- a default is always a folded constant,
+// never something that has to be typed to be appended. A unit with no
+// free-function default in it (`tk_nfdecl == 0`) leaves before a single node
+// is read, which is what the no-op proof of a taught construct means.
+i64 tk_default_pass(i64 root) {
+    if (tk_nfdecl == 0) return root;
+    tk_default_check_decls(root);
+    i64 last = nnodes;
+    i64 n = 1;
+    loop {
+        if (n >= last) break;
+        if (nd_kind(n) == N_CALL) {
+            uptr name = nd_name(n);
+            if (tk_default_decl_count(root, name) == 1) {
+                i64 row = tk_default_row(name);
+                if (row >= 0) tk_default_fill(root, n, row);
+            }
+        }
+        n = n + 1;
+    }
+    return root;
+}

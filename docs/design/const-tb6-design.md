@@ -1,11 +1,13 @@
 # T-B6 — o FINALE do Tier-B: abrir o PRODUTOR (`serialize_const`) para agregados com campo slice/ponteiro + migrar os 4 descritores ABI para `const` rodata (#594 Tier-B)
 
+> **[HISTÓRICO]** — documenta o planejamento do crumb T-B6 de Tier-B (2026-07-18), já executado. Não descreve o estado atual do projeto.
+
 Status: READY-TO-IMPLEMENT (architect, 2026-07-18). Track: Tier-B pointer-bearing
 aggregate → rodata (`docs/design/const-module-level-plan.md` §8 crumb **T-B6**, §5.1
 verdict, DECISION_LOG/plano D2/D7). Base: o working tree da const-wave com **T-B1..T-B5
 mergeados + 🔑 SEED BUMP #3 (0.3.0.25 / T25)** — a cadeia data→data CONSUMIDORA está
-completa e no seed: `LDataReloc`/`LRodata.relocs` na LIR (`lir.tks:154/175`); a VM resolve
-o ponteiro rodata-interno na semeadura (`lir_interp.tks:181 resolve_rodata_relocs`); o
+completa e no seed: `LDataReloc`/`LRodata.relocs` na LIR (`lir.tks:154/175`); o motor legado resolve
+o ponteiro rodata-interno na semeadura (`resolve_rodata_relocs`); o
 encoder-bridge nativo produz `Reloc sect=Rodata` (`encode_arm64.tks:2679 encode_rodata` +
 `.rela.rodata` / Mach-O `__const` / COFF `.rdata` / wasm
 `wasm_relocate_rodata`. Predecessores: `const-tb{1,2,3,4,5}-design.md`. crumb 6 (Tier-A →
@@ -38,7 +40,7 @@ rodata): `lower.tks:5137 serialize_const`.
    Determinismo do símbolo da leaf: **função pura de (nome-do-const, nome-do-campo)** —
    `.Lconst_AAPCS64.gpr_arg` — nunca de um contador global.
 3. **PRÉ-REQUISITO DE LEITURA (constatação crítica — ponto 1/3):** a lowering
-   COMPARTILHADA (VM + nativo) **NÃO lê hoje um campo slice de struct** — `lower_fat_expr`
+   COMPARTILHADA (motor legado + nativo) **NÃO lê hoje um campo slice de struct** — `lower_fat_expr`
    (`lower.tks:3769`) honest-stopa num `TFieldAccess` fat-valued ("N2"), e o layout dá ao
    campo slice só 8 bytes (`ltype_of(Slice)=Ptr`, `ltype_size(Ptr)=8`). Logo os descritores
    ABI só são lidos hoje pelo **C backend** (que os inline e usa `tk_slice_u32{ptr,len}`).
@@ -114,8 +116,8 @@ dentro de um struct Named).
 - `store_struct_fields` (`:4105`) grava um campo slice com `ltype_of(field.type)` = `Ptr`
   (8 bytes) — grava só o ptr, PERDE o len.
 
-Isto é coerente com o fato de que o caminho nativo/VM **nunca materializa** um `AbiDescriptor`
-hoje (honest-stopa antes). O layout de 8 bytes é um estado morto — nenhum teste nativo/VM
+Isto é coerente com o fato de que o caminho nativo/motor legado **nunca materializa** um `AbiDescriptor`
+hoje (honest-stopa antes). O layout de 8 bytes é um estado morto — nenhum teste nativo/motor legado
 que passa depende dele.
 
 ### 1.4 A lowering compartilhada NÃO lê um campo slice de struct — honest-stop "N2"
@@ -125,14 +127,14 @@ que passa depende dele.
 `abi.gpr_arg`) → `error "fat-pointer receiver `TFieldAccess` not yet lowered (N2)"`. Como
 `arg_reg`/`allocatable_pool`/`is_caller_saved` (`abi_aapcs64.tks:182/199/211`) LEEM
 `abi.gpr_arg`/`abi.gpr_allocatable`/… como valores fat, essas leituras honest-stopam na
-lowering compartilhada → **nem a VM nem o nativo** as compilam hoje. Os testes ABI/regalloc
+lowering compartilhada → **nem o motor legado nem o nativo** as compilam hoje. Os testes ABI/regalloc
 passam porque o binário do compilador e o harness desses testes rodam pelo **C backend**
 (`codegen.tks`, que representa slice como `tk_slice_<elem>{ptr,len}` e faz INLINE dos consts
-agregados — plano §5.2 tabela). A VM (`lir_interp`) consome a MESMA LIR de `lower.tks`, então
+agregados — plano §5.2 tabela). O motor legado consome a MESMA LIR de `lower.tks`, então
 herda o mesmo honest-stop.
 
 **Consequência para T-B6:** o espelho SOURCE-level dual-engine (um `const AAPCS64` lido
-IDÊNTICO na VM e no nativo — o objetivo declarado de T-B6, T-B5 §5.8) exige que a lowering
+IDÊNTICO no motor legado e no nativo — o objetivo declarado de T-B6, T-B5 §5.8) exige que a lowering
 compartilhada saiba LER um campo fat de struct. Isso é o reader (§4), o PRÉ-REQUISITO deste
 crumb. Sem ele, T-B6 entrega só o produtor (bytes corretos em rodata) mas nenhuma engine
 que consuma LIR consegue LER o const — só o C backend (que ignora rodata e inline).
@@ -140,9 +142,9 @@ que consuma LIR consegue LER o const — só o C backend (que ignora rodata e in
 ### 1.5 A cadeia consumidora T-B1..T-B5 (já pronta, recebe `relocs` vazio hoje)
 
 - `LRodata { symbol; bytes; relocs: []LDataReloc }` (`lir.tks:175`) — o carrier.
-- VM: `resolve_rodata_relocs` (`lir_interp.tks:236`) sobrescreve cada slot de ponteiro
+- motor legado: `resolve_rodata_relocs` sobrescreve cada slot de ponteiro
   rodata-interno com o índice-de-célula do datum-alvo na semeadura (T-B5 §2). Alvo
-  desconhecido → erro nomeado → `interp_lmodule` mapeia a `-1`.
+  desconhecido → erro nomeado → `oracle_lmodule` mapeia a `-1`.
 - Nativo: `encode_rodata` (`encode_arm64.tks:2679``Reloc sect=Rodata`
   por `LDataReloc`, re-baseado ao offset do blob no `.rodata`/`__const` concatenado; os
   writers ELF/Mach-O/COFF/wasm aplicam a relocation UMA vez na emissão.
@@ -181,13 +183,13 @@ Entrada rodata  .Lconst_AAPCS64.gpr_allocatable = [0..14,19..28]   (100B), reloc
 - **`{ptr, len}`, NÃO só ptr.** O len TEM de ser inline porque um `.len` / `[i]` lê da
   memória do struct (o const não carrega o len em registrador como um slice standalone —
   quando lido como CAMPO, ambos vêm de `LFieldAddr`+`LLoad`).
-- **Slot de ponteiro = 8 bytes zero + `LDataReloc(fieldoff, leaf_sym)`.** Resolvido pela VM
+- **Slot de ponteiro = 8 bytes zero + `LDataReloc(fieldoff, leaf_sym)`.** Resolvido pelo motor legado
   (célula-índice do alvo) e pelos writers nativos (endereço absoluto), T-B1..T-B5.
 - **`len` inline = contagem de elementos** (não byte-length), no offset `fieldoff+8`, 8
   bytes LE — casa com `const_fat_len`/`lower_len_field` que devolvem a CONTAGEM.
 - **Array-alvo = entrada rodata SEPARADA**, símbolo próprio, `relocs` vazio (é flat-scalar
   `[]u32`, já materializável por `const_array_bytes`). NÃO inline no mesmo blob: `LDataReloc.
-  target` é um NOME DE SÍMBOLO (`lir.tks:154`), e a resolução (VM/writers) é por símbolo —
+  target` é um NOME DE SÍMBOLO (`lir.tks:154`), e a resolução (motor legado/writers) é por símbolo —
   um reloc intra-blob não existe no modelo. É o mesmo padrão de uma string literal aninhada.
 
 ### 2.2 A largura do campo fat = 16 bytes — a MUDANÇA de layout
@@ -195,11 +197,11 @@ Entrada rodata  .Lconst_AAPCS64.gpr_allocatable = [0..14,19..28]   (100B), reloc
 O layout de HOJE dá 8 bytes (§1.3). T-B6 muda `layout_of_fields`/`field_size_of` para
 dimensionar um campo `str`/`[]T` como **16 bytes, align 8** (`2 * ltype_size(Ptr)`). Prova de
 segurança:
-- Nenhum struct do corpus com campo fat é materializado hoje no caminho nativo/VM (§1.4),
-  então nenhum teste nativo/VM que passa depende do layout de 8 bytes → a ampliação não
+- Nenhum struct do corpus com campo fat é materializado hoje no caminho nativo/motor legado (§1.4),
+  então nenhum teste nativo/motor legado que passa depende do layout de 8 bytes → a ampliação não
   regride nada.
 - O C backend usa o layout C próprio (`tk_slice_<elem>` já é `{ptr,len}` = 16B) — inalterado.
-- A ampliação ALINHA o layout nativo/VM com o C (a direção correta) e é o que o serializer
+- A ampliação ALINHA o layout nativo/motor legado com o C (a direção correta) e é o que o serializer
   e o reader precisam concordar.
 
 ### 2.3 A PROVA pela lowering existente
@@ -215,7 +217,7 @@ segurança:
   que `const_slice_len` derivaria) concordam por construção.
 - **Leitura via LFieldAddr/LLoad nas duas engines:** o reader (§4) baixa `abi.gpr_arg` para
   `ptr = LLoad(LFieldAddr(base, fieldoff))` (Ptr) + `len = LLoad(LFieldAddr(base, fieldoff+8))`
-  (I64). Na VM (T-B5 §1.2) um `LLoad` lê UMA célula: o ptr vem da célula `base+fieldoff`
+  (I64). No motor legado (T-B5 §1.2) um `LLoad` lê UMA célula: o ptr vem da célula `base+fieldoff`
   (sobrescrita por `resolve_rodata_relocs` com o índice-célula do alvo → correto), o len vem
   da célula `base+fieldoff+8` (byte baixo = a contagem; ≤ 32 < 256, dentro da tolerância do
   oráculo "not a byte-accurate layout verifier"). No nativo os loads são width-corretos (8B).
@@ -268,7 +270,7 @@ o comportamento crumb-6 é o caso vazio). Assinatura nova:
  * @throws         um honest-stop para uma forma agregada ainda não materializável
  * @since #594 crumb 6 (bytes) + T-B6 (relocs + leaves)
  */
-fn serialize_const(cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo) -> ConstImage | error
+fn serialize_const(cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo): ConstImage | error
 ```
 
 ### 3.2 O campo slice: `const_struct_field_bytes` deixa de rejeitar `Ptr`
@@ -297,7 +299,7 @@ reloc + uma leaf. O helper novo produz, para o campo `j` no offset `layout.field
  * @throws            quando o inicializador não é materializável (não-literal, spread, elemento ptr)
  * @since #594 T-B6
  */
-fn const_fat_field(const_name: str, field_name: str, fieldoff: u32, field_ty: checker::Type, vexpr: checker::TExpr) -> FatFieldImage | error
+fn const_fat_field(const_name: str, field_name: str, fieldoff: u32, field_ty: checker::Type, vexpr: checker::TExpr): FatFieldImage | error
 ```
 
 onde `FatFieldImage = struct { slot_bytes: []byte; reloc: lir::LDataReloc; leaf: LRodata }`.
@@ -322,7 +324,7 @@ como "Tier-A follow-up" até terem o seu próprio design).
  * O prefixo `.Lconst_` nunca colide com um `.Lstr<N>` de string literal nem com o blob
  * principal `.Lconst_<const_name>` (este tem um `.` + campo a mais). Como cada `(const,
  * campo)` é único e o nome não depende da ordem de travessia, o mesmo `.tks` gera sempre os
- * mesmos símbolos → `LDataReloc.target`, as bases cumulativas da VM e os offsets re-baseados
+ * mesmos símbolos → `LDataReloc.target`, as bases cumulativas do motor legado e os offsets re-baseados
  * dos writers são idênticos entre gerações (fixpoint-safe).
  *
  * @param const_name  o nome do const agregado dono
@@ -330,7 +332,7 @@ como "Tier-A follow-up" até terem o seu próprio design).
  * @return            o símbolo rodata da leaf
  * @since #594 T-B6
  */
-fn const_leaf_symbol(const_name: str, field_name: str) -> str {
+fn const_leaf_symbol(const_name: str, field_name: str): str {
     teko::str::concat(const_rodata_symbol(const_name), teko::str::concat(".", field_name))
 }
 ```
@@ -347,7 +349,7 @@ leaf (em ordem de campo declarada) e DEPOIS o blob principal com as suas relocs.
  * entrada (relocs vazio); um agregado pointer-bearing (descritor ABI) interna primeiro cada
  * entrada LEAF de array-alvo (em ordem de campo, símbolos determinísticos) e DEPOIS o blob
  * principal com as suas `LDataReloc`. A ordem leaves-antes-do-blob é determinística (ordem de
- * campo declarada), então as bases cumulativas (VM) e os offsets re-baseados (writers) são
+ * campo declarada), então as bases cumulativas (motor legado) e os offsets re-baseados (writers) são
  * estáveis entre gerações.
  *
  * @param m        o módulo acumulado
@@ -358,7 +360,7 @@ leaf (em ordem de campo declarada) e DEPOIS o blob principal com as suas relocs.
  * @throws         um honest-stop para um agregado não materializável
  * @since #594 crumb 6 + T-B6
  */
-fn intern_aggregate_const_decl(m: LModule, cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo) -> LModule | error {
+fn intern_aggregate_const_decl(m: LModule, cd: checker::TConstDecl, layouts: []LStructLayout, variants: []LEnumInfo): LModule | error {
     if const_decl_is_scalar(cd.ty) { return m }
     let img = match serialize_const(cd, layouts, variants) { ConstImage as x => x; error as e => return e }
     mut cur = m
@@ -398,7 +400,7 @@ espelho dual-engine (§5.8 do T-B5) T-B6 adiciona:
  * @return    se o campo é um fat-pointer (16 bytes {ptr,len})
  * @since #594 T-B6
  */
-fn typeexpr_is_fat(te: parser::TypeExpr) -> bool {
+fn typeexpr_is_fat(te: parser::TypeExpr): bool {
     match te {
         parser::SliceType => true
         parser::NamedType as nt => single_segment_name_is(nt.path, "str")
@@ -429,7 +431,7 @@ por um segundo load no offset+8 — o mesmo idioma que um struct-by-value aninha
  * @throws     quando o receptor não é um struct com layout registrado, ou o campo não existe
  * @since #594 T-B6
  */
-fn lower_fat_field(ctx: LowerCtx, fa: checker::TFieldAccess) -> LoweredFat | error {
+fn lower_fat_field(ctx: LowerCtx, fa: checker::TFieldAccess): LoweredFat | error {
     let ro = match lower_expr(ctx, fa.receiver) { Lowered as x => x; error as e => return e }
     let name = match named_type_name(fa.receiver.type) { str as s => s; error as e => return e }
     let layout = match find_struct_layout(ro.ctx.layouts, name) { LStructLayout as l => l; error as e => return e }
@@ -537,7 +539,7 @@ Os irmãos expandem os seus `push_range`/helpers idem:
 `regalloc_module`/`_x86`/`` recebem o descritor por parâmetro e LEEM os mesmos campos.
 Como os VALORES de `AAPCS64` são idênticos aos de `aapcs64()` (§6.1 prova), o resultado de
 regalloc é byte-a-byte o mesmo. **Só a materialização do descritor muda** (fn-call+arena →
-rodata-load no nativo/VM, ou inline no C backend) — os bytes que regalloc EMITE não mudam.
+rodata-load no nativo/motor legado, ou inline no C backend) — os bytes que regalloc EMITE não mudam.
 Essa é a barra do ritual.
 
 ---
@@ -566,7 +568,7 @@ caminhos), aparecem entradas rodata reais + relocs data→data:
   ganha entradas. Re-baseiam UMA vez, depois congelam. As fixtures T-B2/T-B3/T-B4 já fixaram os
   BYTES de uma reloc data→data à mão; aqui elas passam a ser dirigidas pelo produtor real.
 - **`lower_test.tkt`:** ganha as fixtures do produtor (§7) — bytes/relocs/leaves novos, esperado.
-- **VM goldens (`lir_interp_test.tkt`):** os testes existentes (relocs vazio) ficam
+- **motor legado goldens (o twin de testes do motor legado):** os testes existentes (relocs vazio) ficam
   byte-idênticos; os novos (§7) exercitam o reader.
 - **O binário do compilador em si:** muda (a fonte migrou: inline de struct-literal em vez de
   fn-call no C backend; ou rodata no nativo). Isso é esperado e NÃO é uma regressão.
@@ -603,11 +605,11 @@ spill_slot_bytes = 8; … }` (ou um mini-struct `type S = struct { xs: []u32; n:
 O `const K: S` acima NÃO honest-stopa (antes de T-B6 dava o erro "pointer/slice-bearing…").
 Contraprova: um campo `char`/Named-by-value ainda honest-stopa (fora do escopo).
 
-### 7.3 (reader, `lir_interp_test.tkt`) ler um campo slice de struct const — deref end-to-end
+### 7.3 (reader, o twin de testes do motor legado) ler um campo slice de struct const — deref end-to-end
 
 `LModule` à mão: as leaves (`.Lconst_K.xs` = `[10,20]` u32) + o blob de `K` (slot ptr zero +
 reloc→leaf, len inline) + um `main` que faz `K.xs[0]` → `field_addr`/`load` → `exit`. Espera
-**exit 10** na VM. (`K.xs[1]` → 20; `K.xs.len` → 2.) Prova que T-B5 resolve o slot e o reader
+**exit 10** no motor legado. (`K.xs[1]` → 20; `K.xs.len` → 2.) Prova que T-B5 resolve o slot e o reader
 o dereferencia. Dual-engine: o mesmo `.tkt` roda no harness nativo.
 
 ### 7.4 (layout) campo fat = 16 bytes, `sizeof` correto
@@ -617,7 +619,7 @@ Asserir que `layout_of_fields` de `type S = struct { xs: []u32; n: u32 }` dá `x
 
 ### 7.5 (dual-engine SOURCE-level, o espelho §5.8 do T-B5) — o AAPCS64 real
 
-Um `.tkt` both-engine: `fn main() -> i64 { let r = arg_reg(AAPCS64, MRegClass::GPR, 0); exit(r.reg.id to i64) }` → **exit 0** (x0) na VM E no nativo; `arg_reg(AAPCS64, GPR, 7).reg.id` → 7;
+Um `.tkt` both-engine: `fn main(): i64 { let r = arg_reg(AAPCS64, MRegClass::GPR, 0); exit(r.reg.id to i64) }` → **exit 0** (x0) no motor legado E no nativo; `arg_reg(AAPCS64, GPR, 7).reg.id` → 7;
 `allocatable_pool(SYSV64, GPR).len` → 12; `is_caller_saved(WIN64, preg(6, GPR))` → false (RSI
 callee-saved no Win64). Este é o teste que T-B5 §5.8 nomeou como bloqueado atrás do BUMP #3 —
 T-B6 o destrava e o entrega.
@@ -637,18 +639,18 @@ golden de equivalência §6.1 temporário).
 ## 8. Ponto 5 — validação local (seed 0.3.0.25 / T25) + sequência de gates
 
 - **O fonte T-B6 compila no seed T25?** SIM. T25 (0.3.0.25) tem a capability data→data
-  CONSUMIDORA (VM/writers/encoder-bridge/wasm) no seed. O fonte de T-B6 (o `const AAPCS64` +
+  CONSUMIDORA (motor legado/writers/encoder-bridge/wasm) no seed. O fonte de T-B6 (o `const AAPCS64` +
   as leituras `abi.gpr_arg` + o novo produtor/reader) é compilado pelo seed via o **C backend**
   (o caminho default do binário liberado — inline dos consts agregados, `tk_slice{ptr,len}`),
   que já sabe tudo isso. Logo o self-hosting fecha sem precisar do reader nativo no seed. O
-  reader nativo/VM que T-B6 adiciona é exercitado pelas fixtures dual-engine (§7.3/§7.5), não
+  reader nativo/motor legado que T-B6 adiciona é exercitado pelas fixtures dual-engine (§7.3/§7.5), não
   pelo bootstrap.
 - **Escada de gates:** `T25 × branch gated`:
   1. gen1 = seed T25 compila o working tree T-B6 (C backend) → OK.
   2. gen2 = gen1 compila o working tree → OK.
   3. gen2 = gen1 compila o working tree → **assert gen1==gen2** (fixpoint).
   4. `.tkt` de cada arquivo editado (por-edit, tabela §9) + o gate COMPLETO no ritual.
-- **Ambas as engines:** as fixtures §7.3/§7.5 rodam VM + nativo pelo harness `.tkt` — a prova
+- **Ambas as engines:** as fixtures §7.3/§7.5 rodam motor legado + nativo pelo harness `.tkt` — a prova
   dual-engine ao nível SOURCE que faltava até o BUMP #3.
 
 ---
@@ -659,7 +661,7 @@ golden de equivalência §6.1 temporário).
 |---|---|---|---|
 | E1 | `src/lir/lir.tks` | `ConstImage` + `FatFieldImage` types (§3.1) | compila |
 | E2 | `src/lir/lower.tks` | `typeexpr_is_fat` + campo fat = 16B em `layout_of_fields`/`field_size_of`/`field_align_of` (§4.1) | `lower_test.tkt` §7.4 |
-| E3 | `src/lir/lower.tks` | `lower_fat_field` + braço `TFieldAccess` em `lower_fat_expr`; (opc.) `store_struct_fields` grava as 2 metades (§4.2/§4.3) | `lir_interp_test.tkt` §7.3 |
+| E3 | `src/lir/lower.tks` | `lower_fat_field` + braço `TFieldAccess` em `lower_fat_expr`; (opc.) `store_struct_fields` grava as 2 metades (§4.2/§4.3) | o twin de testes do motor legado §7.3 |
 | E4 | `src/lir/lower.tks` | `const_leaf_symbol`, `const_fat_field`, `serialize_const`/`const_named_bytes`/`const_struct_bytes`/`const_struct_blob` → `ConstImage`, `intern_aggregate_const_decl` interna leaves+blob (§3) — ABRE o gate `:5142` p/ campo slice | `lower_test.tkt` §7.1/§7.2 |
 | E5 | `src/backend/abi_aapcs64.tks` + `abi_sysv64.tks` + uma ABI + `abi_win64.tks` | golden de equivalência (§6.1) → migrar as 4 fábricas p/ `const UPPER_SNAKE` array-literal → remover as fns mortas (§5) | `abi_*_test.tkt` (equivalência verde, depois byte-idêntico) |
 | E6 | `src/build/project.tks`, `` + doc-comments | use-sites `x()` → `X` (§5.2) | `regalloc_*_test.tkt` byte-idêntico |
@@ -672,10 +674,10 @@ sem E4; ainda assim sequencia-se E4 antes p/ que as fixtures dual-engine E7 tenh
 
 **Ritual points:**
 - **Por-edit:** o `.tkt` da linha.
-- **RITUAL POINT — fim de T-B6:** gate COMPLETO — todos os goldens VM (`lir_interp_test.tkt`)
+- **RITUAL POINT — fim de T-B6:** gate COMPLETO — todos os goldens motor legado (o twin de testes do motor legado)
   + backend (`encode_*_test.tkt`, `objfile_*_test.tkt`, `lower_test.tkt`, `tkb_test.tkt`) +
   **regalloc goldens BYTE-IDÊNTICOS** (`regalloc_*_test.tkt`, `abi_*_test.tkt`) +
-  **fixpoint gen1==gen2** + ambas as engines (VM + nativo) nas fixtures dual-engine + 100% de
+  **fixpoint gen1==gen2** + ambas as engines (motor legado + nativo) nas fixtures dual-engine + 100% de
   cobertura do delta (§7). Object goldens re-baseados UMA vez (se aplicável) e congelados.
 - **Fecho do Tier-B / do #594 pointer-bearing:** T-B6 é o FINALE — a partir daqui `serialize_
   const` não tem mais gate produtor fechado para slice/`str`; a cadeia data→data está viva
@@ -702,17 +704,17 @@ sem E4; ainda assim sequencia-se E4 antes p/ que as fixtures dual-engine E7 tenh
    o reader (campo fat = 16B + `lower_fat_expr` TFieldAccess, §4). É a única capability nova
    além do produtor; law-first (smallest step que fecha o objetivo §5.8 do T-B5). Não é um HALT
    — é trabalho identificado e desenhado aqui. *Reporte adjacente:* o reader torna campos fat
-   de struct first-class no nativo/VM (build via §4.3 + read via §4.2) — um ganho geral que
+   de struct first-class no nativo/motor legado (build via §4.3 + read via §4.2) — um ganho geral que
    destrava qualquer struct-fat futuro, não só os descritores. NÃO vira issue nova (adjacente,
    folded no crumb).
 
 4. **Ampliar o campo fat p/ 16 bytes muda o layout de TODO struct com campo fat.** *Resolução
-   (não é regressão):* nenhum struct-fat é materializado hoje no caminho nativo/VM (honest-stopa,
-   §1.3/§1.4), então nenhum golden nativo/VM que passa depende dos 8 bytes; o C backend usa
-   layout C próprio (já 16B). A ampliação alinha nativo/VM com o C. Asserido em §7.4; fixpoint
+   (não é regressão):* nenhum struct-fat é materializado hoje no caminho nativo/motor legado (honest-stopa,
+   §1.3/§1.4), então nenhum golden nativo/motor legado que passa depende dos 8 bytes; o C backend usa
+   layout C próprio (já 16B). A ampliação alinha nativo/motor legado com o C. Asserido em §7.4; fixpoint
    confirma.
 
-5. **Tolerância multi-byte da VM no slot de `len`.** A VM semeia byte-por-célula e um `LLoad`
+5. **Tolerância multi-byte do motor legado no slot de `len`.** O motor legado semeia byte-por-célula e um `LLoad`
    lê UMA célula (T-B5 §1.2); o `len` de 8 bytes é lido pelo byte baixo. *Resolução:* toda
    contagem de descritor ABI é ≤ 32 < 256 → cabe num byte; dentro da tolerância declarada do
    oráculo ("not a byte-accurate layout verifier"). O ptr é resolvido para o índice-célula
@@ -756,10 +758,10 @@ de granularidade em aberto, com recomendação de INCLUIR (fecha o Tier-B de ver
 - `` — use-sites `:150,636,1041` + docs.
 - doc-comments em `encode_x86_64.tks`, `isel_x86_64.tks`, `regalloc_x86.tks`,
   um regalloc.
-- fixtures: `lower_test.tkt`, `lir_interp_test.tkt`, `abi_*_test.tkt`, `regalloc_*_test.tkt`,
+- fixtures: `lower_test.tkt`, o twin de testes do motor legado, `abi_*_test.tkt`, `regalloc_*_test.tkt`,
   object goldens (re-baseline se nativo-compilado).
 - **Sem tocar:** os C twins; `serialize_const:5142` braço `_` (mantido p/ formas
   não-Str/Slice/Named); a cadeia T-B1..T-B5 (recebe os relocs reais SEM edição — os writers
-  Mach-O/COFF/wasm/ELF e a VM já resolvem).
+  Mach-O/COFF/wasm/ELF e o motor legado já resolvem).
 </content>
 </invoke>

@@ -1,0 +1,144 @@
+# docs/design/debugger-poc/multi.s — the CROSS-FILE line-table proof (D1.x continuation of D0.1).
+#
+# mini.s proved a single-file two-frame backtrace. multi.s proves the piece a REAL Teko program
+# needs that mini.s did not exercise: a `.debug_line` file_names table with TWO entries and a
+# DW_LNS_set_file opcode, so each backtrace frame resolves to its OWN `.tks` source. `add` lives in
+# util.tks (file 2, decl_line 17); `main` lives in hello.tks (file 1, decl_line 40). The code is
+# byte-identical to mini.s — only the DWARF changed — so a wrong file table is the ONLY thing this
+# object can prove wrong.
+#
+# The three debug sections are EXACTLY what src/backend/dwarf.tks emits for this unit:
+#   * .debug_info : two subprograms with decl_file 2 (add) and 1 (main) — DwSubprogram.decl_file.
+#   * .debug_line : a two-entry file_names table (line_header_body's file list) and a set_file 0x02
+#                   before add's rows / set_file 0x01 before main's rows (emit_line_row's file
+#                   register). Verified with `readelf --debug-dump=decodedline` (no gdb needed to
+#                   see the two files decode).
+#
+# Run the assertions with d1_multifile_harness.sh.
+	.text
+	.globl	add
+	.type	add, @function
+add:
+	pushq	%rbp
+	movq	%rsp, %rbp
+	movl	%edi, -4(%rbp)
+	movl	%esi, -8(%rbp)
+	movl	-4(%rbp), %eax
+	addl	-8(%rbp), %eax
+	movl	%eax, -12(%rbp)
+	movl	-12(%rbp), %eax
+	popq	%rbp
+	ret
+	.size	add, .-add
+
+	.globl	main
+	.type	main, @function
+main:
+	pushq	%rbp
+	movq	%rsp, %rbp
+	subq	$16, %rsp
+	movl	$2, %edi
+	movl	$3, %esi
+	call	add
+	movl	%eax, -4(%rbp)
+	movl	-4(%rbp), %eax
+	addq	$16, %rsp
+	popq	%rbp
+	ret
+	.size	main, .-main
+
+	.section	.debug_abbrev,"",@progbits
+	.byte	0x01, 0x11, 0x01
+	.byte	0x25, 0x08
+	.byte	0x13, 0x05
+	.byte	0x03, 0x08
+	.byte	0x1b, 0x08
+	.byte	0x11, 0x01
+	.byte	0x12, 0x07
+	.byte	0x10, 0x17
+	.byte	0x00, 0x00
+	.byte	0x02, 0x2e, 0x00
+	.byte	0x03, 0x08
+	.byte	0x3a, 0x0d
+	.byte	0x3b, 0x05
+	.byte	0x11, 0x01
+	.byte	0x12, 0x07
+	.byte	0x3f, 0x19
+	.byte	0x00, 0x00
+	.byte	0x00
+
+	.section	.debug_info,"",@progbits
+	.byte	0x67, 0x00, 0x00, 0x00
+	.byte	0x04, 0x00
+	.byte	0x00, 0x00, 0x00, 0x00
+	.byte	0x08
+	.byte	0x01
+	.ascii	"teko 0.3.1"
+	.byte	0x00
+	.byte	0x0c, 0x00
+	.ascii	"hello.tks"
+	.byte	0x00
+	.ascii	"."
+	.byte	0x00
+	.quad	add
+	.byte	0x3b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+	.byte	0x00, 0x00, 0x00, 0x00
+	.byte	0x02
+	.ascii	"add"
+	.byte	0x00
+	.byte	0x02
+	.byte	0x11, 0x00
+	.quad	add
+	.byte	0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+	.byte	0x02
+	.ascii	"main"
+	.byte	0x00
+	.byte	0x01
+	.byte	0x28, 0x00
+	.quad	main
+	.byte	0x23, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+	.byte	0x00
+
+	.section	.debug_line,"",@progbits
+	.byte	0x65, 0x00, 0x00, 0x00
+	.byte	0x04, 0x00
+	.byte	0x2d, 0x00, 0x00, 0x00
+	.byte	0x01
+	.byte	0x01
+	.byte	0x01
+	.byte	0xfb
+	.byte	0x0e
+	.byte	0x0d
+	.byte	0x00, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01
+	.byte	0x00
+	.ascii	"hello.tks"
+	.byte	0x00
+	.byte	0x00, 0x00, 0x00
+	.ascii	"util.tks"
+	.byte	0x00
+	.byte	0x00, 0x00, 0x00
+	.byte	0x00
+	.byte	0x00, 0x09, 0x02
+	.quad	add
+	.byte	0x04, 0x02
+	.byte	0x03, 0x10
+	.byte	0x05, 0x01
+	.byte	0x01
+	.byte	0x02, 0x0a
+	.byte	0x03, 0x01
+	.byte	0x01
+	.byte	0x02, 0x09
+	.byte	0x03, 0x01
+	.byte	0x01
+	.byte	0x02, 0x05
+	.byte	0x04, 0x01
+	.byte	0x03, 0x15
+	.byte	0x01
+	.byte	0x02, 0x08
+	.byte	0x03, 0x01
+	.byte	0x01
+	.byte	0x02, 0x12
+	.byte	0x03, 0x01
+	.byte	0x01
+	.byte	0x02, 0x09
+	.byte	0x00, 0x01, 0x01

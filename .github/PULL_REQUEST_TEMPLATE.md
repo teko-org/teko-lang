@@ -5,7 +5,7 @@
 ## Checklist (project invariants — see CONTRIBUTING.md)
 
 - [ ] **Base branch is `main`** (or active remodel umbrella if during a wave)
-- [ ] **Native engine only** (VM retired #524): all code in Teko (`.tks`), no C bootstrap
+- [ ] **Native engine only** (legacy engine retired #524): all code in Teko (`.tks`), no C bootstrap
 - [ ] **Seed from released binary**: `./scripts/fetch_teko.sh && ./.teko/teko . -o bin` (test gate green). The invariant is that the seed builds `main`, not necessarily this PR's tip — CI stages a bootstrap through `gen1(main)` via `scripts/build_with_seed_fallback.sh` when the raw seed cannot compile the tip directly (owner ruling 2026-07-24)
 - [ ] Fixpoint: gen-1 rebuilds itself byte-identical (gen-2 == gen-1 after re-compile)
 - [ ] **Coverage of new code:** at least 100% coverage on the delta

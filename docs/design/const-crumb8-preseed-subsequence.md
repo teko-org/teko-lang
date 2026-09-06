@@ -86,7 +86,7 @@ type ScalarConstMap = struct { names: []str; nss: []str; inits: []TExpr }
  * @return      the matching const's collapsed initializer, or null
  * @since #594
  */
-fn scalar_const_init(map: ScalarConstMap, name: str, ns: str) -> TExpr?
+fn scalar_const_init(map: ScalarConstMap, name: str, ns: str): TExpr?
 
 /**
  * inline_rw_var — rewrite a reference `TVar`: replaced by a clone of the collapsed
@@ -100,7 +100,7 @@ fn scalar_const_init(map: ScalarConstMap, name: str, ns: str) -> TExpr?
  * @return     the substituted initializer, or `e` unchanged
  * @since #594
  */
-fn inline_rw_var(v: TVar, e: TExpr, map: ScalarConstMap) -> TExpr
+fn inline_rw_var(v: TVar, e: TExpr, map: ScalarConstMap): TExpr
 ```
 
 ### Fixtures
@@ -169,7 +169,7 @@ the c8b-keyed inliner substitutes correctly.
  * @return      the matching binding, or a located "unknown value: ns::name" error
  * @since #594
  */
-fn lookup_value_in_ns(env: Env, name: str, ns: str) -> ValBinding | error
+fn lookup_value_in_ns(env: Env, name: str, ns: str): ValBinding | error
 
 /**
  * type_path_expr — type a `Type::Member` / `ns::value` two-segment path used as a VALUE.
@@ -188,12 +188,12 @@ fn lookup_value_in_ns(env: Env, name: str, ns: str) -> ValBinding | error
  * @return       the typed value reference, or a located error
  * @since #594
  */
-fn type_path_expr(pe: parser::PathExpr, table: TypeTable, env: Env) -> TExpr | error
+fn type_path_expr(pe: parser::PathExpr, table: TypeTable, env: Env): TExpr | error
 ```
 
 ### Fixtures
 - **Unit (checker), NEW** — a dep `TProgram` (`m1`) with `pub const P: i64 = 5` +
-  `pub fn twice(x: i64) -> i64`; a project referencing `m1::P` (value) and `m1::twice`
+  `pub fn twice(x: i64): i64`; a project referencing `m1::P` (value) and `m1::twice`
   (fn-value bound to a local then called); assert both type + `m1::P` inlines to 5.
 - **both-engine (E2E)** — the c8d fixture's consumer uses the `m1::P` spelling (see
   c8d); this is where the qualified path is proven through the whole pipeline.
@@ -262,7 +262,7 @@ by the driver running twice.
 
 ## Crumb c8e — assert `EXPECT_COMPILE_FAIL` in CI (finding 4, issue #610) — HARNESS, PARALLEL
 
-`scripts/diff_vm_native.sh` (which once asserted rejection) was retired with the VM lane
+`scripts/diff_c_own.sh` (which once asserted rejection) was retired with the legacy engine lane
 (#524/#395); `native_regressions.sh` only smokes ONE positive fixture;
 `sanitizers.yml:99,191` SKIPS every `EXPECT_COMPILE_FAIL` dir. ~30 negative fixtures
 (incl. crumb-7/8 `member_const_*_rejected` and the new c8c visibility fixture) pass

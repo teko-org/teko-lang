@@ -1,0 +1,177 @@
+// surface_namespace_fn.tk -- a free function declared inside a namespace,
+// mangled and resolved by a pass (entrega 5, crumb N2; plano-ngen-
+// entrega4.md §31/§32/§35). teko_ns.tk's `tk_ns_pass` is the module.
+//
+// What each part of `main` proves, in order:
+//
+//   1. `geo.area(3)` / `geo.area(3, 4)` -- a QUALIFIED call to a free
+//      function overloaded (C4) INSIDE a namespace, `tk_ns_seg_expr`
+//      extended to a call rather than only a static member;
+//   2. `area(5)` -- the SAME overloaded name, bare, resolved through
+//      `using geo;` below;
+//   3. `grow(4)` / `geo.grow(4)` -- a default parameter (C6) on a
+//      namespaced function, bare and qualified, both filled;
+//   4. `geo.offset(1)` -- a namespaced function calling a PLAIN one, bare:
+//      no `geo__helper` exists, so the call is left flat (D31.10);
+//   5. `Derived : Base`, both written with `public Base(i64 v)` / `~Base()`
+//      -- the SHORT name, inside the SAME namespace as the class -- proving
+//      the N1 verifier's finding (teko_class.tk compared a qualified name
+//      against the source's own short spelling) is fixed;
+//   6. a LOCAL `f`, in its own block, shadowing `geo.f` under `using geo;`
+//      -- `&f` takes the local's own address, not the namespaced function's
+//      (N3b, the local/parameter step of the resolution order);
+//   7. `f(5)`, bare, after that block has closed -- a PLAIN top-level `f`
+//      wins over `using geo;`'s own `geo.f`, because a declaration this
+//      exact bare name already answers outranks a `using` (N3b);
+//   8. `geo.use_own_f(5)` -- a bare `f(z)` call written INSIDE `namespace
+//      geo` resolves to `geo`'s OWN `f`, even with the same plain `f` also
+//      visible -- the namespace-prefix step still wins over the plain one
+//      (N3b's own exception, §35);
+//   9. `Circle.test`, `Square.test_base`, `Util.test_static` -- N3c's own
+//      bug: a bare call inside a METHOD reaches the type's OWN member (a
+//      method the type declares itself, one inherited from a base, or a
+//      static one) before it ever reaches `using geo;`'s `geo.f`, the same
+//      order a written-out `this.f()` already gave.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+i64 order = 0;                                   // the destructor chain's own trace
+
+// a plain (non-namespaced) function: `geo.offset` calls it bare, and no
+// `geo__helper` is ever declared, so the call stays exactly as written
+i64 helper(i64 x) {
+    return x + 100;
+}
+
+namespace geo {
+    i64 area(i64 r) {
+        return r * r;
+    }
+
+    i64 area(i64 w, i64 h) {                     // C4: overload of a namespaced function
+        return w * h;
+    }
+
+    i64 grow(i64 r, i64 by = 1) {                // C6: default over a namespaced function
+        return area(r + by);                     // bare, resolved from INSIDE geo (D31.6)
+    }
+
+    i64 offset(i64 x) {
+        return helper(x);                        // bare, a plain global: left flat (D31.10)
+    }
+
+    i64 f(i64 x) {                                // N3b's own target: shadowed by a local,
+        return x + 1000;                          // and outranked by a plain top-level `f`
+    }
+
+    class Base {
+        public i64 n;
+
+        public Base(i64 v) {                     // constructor, the SHORT name
+            n = v;
+        }
+
+        ~Base() {                                // destructor, the SHORT name
+            order = order * 10 + 1;
+        }
+    }
+
+    class Derived : Base {
+        public i64 extra;
+
+        public Derived(i64 v, i64 e) : base(v) {
+            extra = e;
+        }
+
+        ~Derived() {
+            order = order * 10 + 2;
+        }
+    }
+}
+
+// a plain (non-namespaced) `f`: a bare call to `f` OUTSIDE `geo`, with
+// `using geo;` also in scope, resolves HERE -- a `using` never outranks a
+// declaration already visible without it (N3b)
+i64 f(i64 y) {
+    return y + 1;
+}
+
+namespace geo {
+    i64 use_own_f(i64 z) {                        // N3b's own exception: the CURRENT
+        return f(z);                              // namespace's `f` wins over the plain one
+    }
+}
+
+// N3c's own target: this file's `using geo;` brings in `geo.f`, but a bare
+// call inside a method reaches the TYPE before it reaches a namespace/`using`
+// candidate -- the C# member-lookup order, unaffected by which namespace (if
+// any) the call site happens to sit in.
+class Circle {
+    public i64 f(i64 x) {                        // the class's OWN member
+        return x + 1;
+    }
+
+    public i64 test(i64 x) {
+        return f(x);                              // bare: the member above, not geo.f
+    }
+}
+
+class Shape {
+    public i64 f(i64 x) {                        // a BASE's own member
+        return x + 2;
+    }
+}
+
+class Square : Shape {
+    public i64 test_base(i64 x) {
+        return f(x);                              // bare: the INHERITED member, not geo.f
+    }
+}
+
+class Util {
+    public static i64 f(i64 x) {                 // a STATIC member
+        return x + 3;
+    }
+
+    public static i64 test_static(i64 x) {
+        return f(x);                              // bare: the static member, not geo.f
+    }
+}
+
+using geo;
+
+i64 main() {
+    if (geo.area(3) != 9) return 1;              // qualified, single-arg overload
+    if (geo.area(3, 4) != 12) return 2;          // qualified, two-arg overload
+    if (area(5) != 25) return 3;                 // bare, resolved via `using geo;`
+    if (grow(4) != 25) return 4;                 // bare, `by` defaults to 1 -> area(5)
+    if (geo.grow(4) != 25) return 5;             // qualified, same default
+    if (geo.grow(4, 2) != 36) return 6;          // qualified, `by` given explicitly
+    if (geo.offset(1) != 101) return 7;          // a namespaced function calling a plain one
+
+    {
+        Derived d = new Derived(10, 5);
+        if (d.n != 10) return 8;
+        if (d.extra != 5) return 9;
+    }
+    if (order != 21) return 10;                  // derived's destructor first, then the base's
+    if (rt_live() != 0) return 11;
+
+    {
+        i64 f = 123;                              // a LOCAL named exactly like geo.f
+        uptr p = &f;
+        if (ld64(p) != 123) return 12;            // &f is the local's own address
+    }
+    if (f(5) != 6) return 13;                    // the block closed: bare `f` is the PLAIN one
+    if (geo.use_own_f(5) != 1005) return 14;      // inside geo, bare `f` is geo's OWN
+
+    Circle c = new Circle;
+    if (c.test(1) != 2) return 15;               // a member wins over `using geo;`'s `geo.f`
+    Square sq = new Square;
+    if (sq.test_base(1) != 3) return 16;         // ...and so does one inherited from a base
+    if (Util.test_static(1) != 4) return 17;     // ...and so does a static member
+
+    return 42;
+}

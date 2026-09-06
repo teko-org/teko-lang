@@ -65,12 +65,12 @@ corrected to use `match`; none of them depend on a `try` unit anymore.
 ### ▪ IO0 — core interfaces + errors
 **Deps:** interfaces (W10b.IF ✅). **Files:** `src/io/stream.tks` (namespace `teko::io`).
 ```teko
-type Reader = interface { fn read(self, into: Buf)  -> u64 | error }   // bytes read (0 = EOF)
-type Writer = interface { fn write(self, from: Buf) -> u64 | error }   // bytes written
-type Seeker = interface { fn seek(self, off: i64, whence: Whence) -> u64 | error }
-type Closer = interface { fn close(self) -> error? }
+type Reader = interface { fn read(self, into: Buf): u64 | error }   // bytes read (0 = EOF)
+type Writer = interface { fn write(self, from: Buf): u64 | error }   // bytes written
+type Seeker = interface { fn seek(self, off: i64, whence: Whence): u64 | error }
+type Closer = interface { fn close(self): error? }
 ```
-Plus combinators (pure Teko): `read_all(r) -> Buf | error`, `read_exact`, `copy(dst, src) -> u64 | error`,
+Plus combinators (pure Teko): `read_all(r): Buf | error`, `read_exact`, `copy(dst, src): u64 | error`,
 `BufReader`/`BufWriter` (buffering wrappers), `LimitReader`, a bytes/`str` in-memory `Reader`/`Writer`.
 `Buf` is the same arena-backed byte region the net keystone defines (shared). Callers handle the
 `… | error` results with `match`. **Verify:** `.tkt` over in-memory reader/writer + copy + buffering (all
@@ -93,13 +93,13 @@ example piping file → gzip → file via the generic `copy`.
 ### ▪ ITER0 — the protocol + adapters
 **Deps:** closures (W10 ✅), generics (S4 ✅), interfaces (W10b.IF ✅). **Files:** `src/iter/iter.tks`.
 ```teko
-type Iterator<T> = interface { fn next(self) -> T? }   // null = exhausted
+type Iterator<T> = interface { fn next(self): T? }   // null = exhausted
 ```
 Lazy adapters as pure-Teko functions/closures (no intermediate allocation): `map`, `filter`, `take`,
 `skip`, `zip`, `enumerate`, `chain`, `flat_map`; eager terminals: `fold`, `reduce`, `count`, `sum`,
 `any`, `all`, `find`, `collect → []T`. Iterators over `array`/slices and (later) over `teko::collections`
 and `teko::io` lines/bytes. **Verify:** `.tkt` — laziness (a `map` whose closure is never called past a
-`take`), correctness of each adapter/terminal; VM == native.
+`take`), correctness of each adapter/terminal (native).
 
 > **Deliberately NOT added** (Laws): no `for`/`foreach` sugar — iteration is `loop { match it.next() {
 > null => break; T as v => … } }` or the terminals above ([[teko-only-loop]]). `iter` is a library, not
@@ -123,4 +123,4 @@ ITER0           (independent; composes with IO0 for line/byte iteration)
 1. ~~`try` operator~~ — **DECIDED (rejected)**, §1. `match` stays; `?.`/`??` stay for optionals.
 2. **`io` error model**: `read`/`write` return `u64 | error` with EOF as `0` (rec, Go-style) vs a distinct `Eof` error case.
 3. **`Buf`**: confirm `teko::io` and `teko::net` share the ONE arena-backed byte region (from the net keystone), not two.
-4. **`iter` protocol**: `next() -> T?` (rec — reuses the optional model) vs a `(bool, T)` pair or a `Done|Item<T>` variant.
+4. **`iter` protocol**: `next(): T?` (rec — reuses the optional model) vs a `(bool, T)` pair or a `Done|Item<T>` variant.

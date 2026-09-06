@@ -82,7 +82,7 @@ Achado adjacente, REPORTADO e não convertido em issue por mim: o registro de DI
 `examples/probes/arena_bottom/src/bottom.tks` atinge a libc **direto**:
 
 ```teko
-pub extern fn c_aligned_alloc(alignment: u64, size: u64) -> u64 = "aligned_alloc"
+pub extern fn c_aligned_alloc(alignment: u64, size: u64): u64 = "aligned_alloc"
 ```
 
 Isso não é escrever C. É Teko **declarando um símbolo estrangeiro verbatim** e deixando o linker
@@ -107,7 +107,7 @@ Item a item, contra o que o `extern fn` de hoje expressa:
 |---|---|---|
 | `pthread_t` (opaco, 8 bytes em todo alvo 64-bit) | **sim** — `u64` | idêntico ao que `arena_bottom` já faz com endereços; ABI-fiel, ambos chegam no registrador inteiro |
 | `pthread_attr_t *` passado como `NULL` | **sim** — `u64` com valor `0` | nenhum acesso, só travessia |
-| `void *arg` (contexto) | **sim** — `ptr<byte>` de `teko::mem::buf_ptr`, ou `u64` | `buf_ptr(len) -> ptr<byte>` é builtin do checker (`src/checker/scope.tks`:366) |
+| `void *arg` (contexto) | **sim** — `ptr<byte>` de `teko::mem::buf_ptr`, ou `u64` | `buf_ptr(len): ptr<byte>` é builtin do checker (`src/checker/scope.tks`:366) |
 | ler o `pthread_t` que `create` escreveu, para passar por VALOR ao `join` | **sim** — `teko::mem::bytes_from_ptr(p, 8)` + remontagem por deslocamento | builtin (`scope.tks`:638); não exige deref de `ptr<T>`, que não existe |
 | seleção por sistema operacional (pthread × Win32) | **sim** — `#os("linux")` / `#os("windows")` | `os_guard` + `prune_os` (`src/build/project.tks`:110) já podam por alvo, em tempo de build, sem pré-processador |
 | **`void *(*start)(void *)` — o ENDEREÇO de uma função Teko** | **NÃO** | é o único buraco |
@@ -141,7 +141,7 @@ isel já o baixa. **O vão é de superfície e de checagem, não de geração de
 
 Há duas formas possíveis e a lei desempata sem consulta ao owner.
 
-A forma preguiçosa seria um intrínseco `fn_addr(f) -> u64`. Ela é **proibida pela mesma lei que já
+A forma preguiçosa seria um intrínseco `fn_addr(f): u64`. Ela é **proibida pela mesma lei que já
 rejeitou o `tk_cov_dump`**: `docs/design/gate-sem-c-0.3.0.31.md` §2.2(e) recusou passar `{ptr,len}`
 onde se lê `char*` chamando isso de *"trocadilho de ABI — desonesto sob M.3"*. Um `u64` que é na
 verdade um ponteiro de função é o mesmo trocadilho, agravado: qualquer inteiro passaria pela
@@ -154,7 +154,7 @@ A forma honesta já está **reservada e ratificada** em `docs/design/star-ref-an
 > (env-first ABI dropped; capturing = reject); the own backend **emits a plain C-ABI function and
 > takes its address** — native."*
 
-Então o crumb 1 é **essa** peça, e nada além dela: um **tipo de parâmetro `cabi fn(T…) -> R`,
+Então o crumb 1 é **essa** peça, e nada além dela: um **tipo de parâmetro `cabi fn(T…): R`,
 válido apenas em posição de parâmetro de `extern fn`**, que aceita como argumento **apenas** o nome
 nu de uma função de topo não-capturante cujos parâmetros e retorno sejam escalares representáveis
 na ABI C. Coerção → `LFuncAddr(mangle_fn_symbol(ns, name))`. Sem thunk, sem env — o `env-first ABI
@@ -170,7 +170,7 @@ congelar.
 
 **Sim: `pthread_create`/`pthread_join`/`CreateThread` cabem no padrão de `extern fn`, e o chão de
 concorrência é alcançável sem uma linha de C.** O que falta no `extern fn` de hoje é exatamente um
-item — o tipo de parâmetro `cabi fn(…) -> …` e a coerção de nome de função para ele — e a peça de
+item — o tipo de parâmetro `cabi fn(…): …` e a coerção de nome de função para ele — e a peça de
 backend que ele precisa (`LFuncAddr`) já existe e já emite relocação de texto.
 
 Corolário que vale registrar porque desfaz um bloqueio herdado: o cabeçalho de
@@ -183,7 +183,7 @@ alcança. O que impedia não era o mecanismo, era ninguém ter tentado.
 
 ## 3. A superfície proposta — três camadas, uma congelada agora
 
-O MASTER_PLAN reserva **cinco** primitivas (`scope{}`, `spawn`, `channel<T>`, `send`, `recv`) e
+O MASTER_PLAN reserva **cinco** primitivas (`scope{}`, `spawn`, `chan<T>`, `send`, `recv`) e
 proíbe congelá-las *"until parser + real duplication data exist"* (:262). O ruling do owner manda
 adiantar a concorrência. As duas coisas convivem quando se separa **capacidade** de **açúcar**:
 
@@ -222,9 +222,9 @@ não pode nomear tipo `unsafe`). Um arquivo por família de SO.
 pub unsafe extern fn sys_thread_create(
     tid_out: ptr<byte>,
     attr: u64,
-    entry: cabi fn(ptr<byte>) -> ptr<byte>,
+    entry: cabi fn(ptr<byte>): ptr<byte>,
     ctx: ptr<byte>
-) -> i32 = "pthread_create"
+): i32 = "pthread_create"
 
 /**
  * Bloqueia até a thread `tid` terminar e recolhe o valor com que ela terminou.
@@ -235,7 +235,7 @@ pub unsafe extern fn sys_thread_create(
  * @since S8
  */
 #os("linux")
-pub unsafe extern fn sys_thread_join(tid: u64, retval_out: u64) -> i32 = "pthread_join"
+pub unsafe extern fn sys_thread_join(tid: u64, retval_out: u64): i32 = "pthread_join"
 
 /**
  * Termina a thread chamadora imediatamente, devolvendo `retval` a quem a esperar.
@@ -249,7 +249,7 @@ pub unsafe extern fn sys_thread_join(tid: u64, retval_out: u64) -> i32 = "pthrea
  * @since S8
  */
 #os("linux")
-pub unsafe extern fn sys_thread_exit(retval: u64) -> void = "pthread_exit"
+pub unsafe extern fn sys_thread_exit(retval: u64) = "pthread_exit"
 
 /**
  * O identificador da thread chamadora — a chave com que uma raia se reconhece na tabela de raias.
@@ -258,7 +258,7 @@ pub unsafe extern fn sys_thread_exit(retval: u64) -> void = "pthread_exit"
  * @since S8
  */
 #os("linux")
-pub unsafe extern fn sys_thread_self() -> u64 = "pthread_self"
+pub unsafe extern fn sys_thread_self(): u64 = "pthread_self"
 ```
 
 O espelho `#os("windows")` liga `CreateThread` / `WaitForSingleObject` / `ExitThread` /
@@ -297,7 +297,7 @@ pub unsafe type Isolate = struct {
  * @throws       quando o SO recusa criar a thread (limite de threads, memória)
  * @since S8
  */
-pub unsafe fn spawn(entry: cabi fn(ptr<byte>) -> ptr<byte>, ctx: ptr<byte>, lane: u64) -> Isolate | error
+pub unsafe fn spawn(entry: cabi fn(ptr<byte>): ptr<byte>, ctx: ptr<byte>, lane: u64): Isolate | error
 
 /**
  * Espera `t` terminar. Depois deste retorno, tudo que a tarefa escreveu está visível ao chamador.
@@ -311,7 +311,7 @@ pub unsafe fn spawn(entry: cabi fn(ptr<byte>) -> ptr<byte>, ctx: ptr<byte>, lane
  * @throws   quando o SO recusa a junção (alça inválida, junção dupla)
  * @since S8
  */
-pub unsafe fn join(t: Isolate) -> null | error
+pub unsafe fn join(t: Isolate): null | error
 
 /**
  * Executa `count` itens de trabalho em até `lanes` threads e retorna quando o último terminar.
@@ -333,7 +333,7 @@ pub unsafe fn join(t: Isolate) -> null | error
  * @throws       quando alguma raia não pôde ser criada; as já criadas são esperadas antes do erro
  * @since S8
  */
-pub unsafe fn fork_join(count: u64, lanes: u64, entry: cabi fn(ptr<byte>) -> ptr<byte>, ctx: ptr<byte>) -> u64 | error
+pub unsafe fn fork_join(count: u64, lanes: u64, entry: cabi fn(ptr<byte>): ptr<byte>, ctx: ptr<byte>): u64 | error
 
 /**
  * Quantas threads o host consegue executar de fato em paralelo.
@@ -341,23 +341,31 @@ pub unsafe fn fork_join(count: u64, lanes: u64, entry: cabi fn(ptr<byte>) -> ptr
  * @return  o número de processadores online, nunca menor que 1
  * @since S8
  */
-pub fn hardware_parallelism() -> u64
+pub fn hardware_parallelism(): u64
 ```
 
 ### 3.3 L2 — as cinco palavras-chave, RESERVADAS
 
-`scope { }` / `spawn` / `channel<T>` / `send` / `recv` → `T | error` permanecem reservadas, com a
+> **GRAFIA ACTUALIZADA (ruling do dono, 2026-07-29):** a primitiva de canal escreve-se **`chan<T>`**
+> — a forma curta, por coerência com os outros tipos curtos da linguagem. Este documento foi escrito
+> com `channel<T>` e o token foi actualizado nesta secção; **a SUBSTÂNCIA não mudou uma vírgula.** A
+> objecção abaixo (o canal é a única das cinco que ameaça o determinismo) continua a valer como
+> argumento registado, e é respondida — não apagada — em
+> `docs/design/harness-de-testes-gerado.md` §6.10, onde a decisão do dono de a adoptar para o
+> harness convive com o perigo que esta secção nomeou.
+
+`scope { }` / `spawn` / `chan<T>` / `send` / `recv` → `T | error` permanecem reservadas, com a
 forma já registrada no MASTER_PLAN e a decisão de 1:1 OS threads primeiro **já honrada por L0/L1**
 (M:N vira um backing sob a mesma superfície, sem mudança de assinatura). O dado de duplicação que a
 lei exige para congelá-las é produzido pelas cargas C9–C13: quando o gate, o codegen e o regressor
 estiverem todos escritos contra L1, o padrão repetido entre eles É o dado, e a sintaxe se desenha
 sobre ele em vez de sobre suposição.
 
-**`channel<T>` merece nota própria, porque a análise mudou o desenho.** Nenhum dos três ganhos que
+**`chan<T>` merece nota própria, porque a análise mudou o desenho.** Nenhum dos três ganhos que
 o owner nomeou precisa de canal: gate, codegen e regressor são todos **fork-join sobre um intervalo
 de índices, com escrita disjunta e leitura após barreira**. Canal é a primitiva de comunicação
 *durante* a execução, e comunicação durante a execução é precisamente o que introduz ordem
-dependente de tempo. Congelar `channel<T>` agora seria congelar a peça que os casos reais não usam
+dependente de tempo. Congelar `chan<T>` agora seria congelar a peça que os casos reais não usam
 — e a única que ameaça o determinismo. Fica reservada com uma razão escrita, não por omissão.
 
 ---
@@ -406,7 +414,7 @@ avança em vez de ser contornado.**
  * @return     nada; a chamada não retorna nem para a raia nem para o processo
  * @since S8
  */
-pub fn panic(msg: str) -> void
+pub fn panic(msg: str)
 
 /**
  * Registra a raia chamadora como guardada, ligando o seu identificador de thread à casa de
@@ -422,7 +430,7 @@ pub fn panic(msg: str) -> void
  * @return      nada
  * @since S8
  */
-pub unsafe fn guard_lane(slot: ptr<byte>) -> void
+pub unsafe fn guard_lane(slot: ptr<byte>)
 
 /**
  * Desfaz `guard_lane` para a thread chamadora — o caminho normal de saída de uma raia que terminou
@@ -433,7 +441,7 @@ pub unsafe fn guard_lane(slot: ptr<byte>) -> void
  * @return  nada
  * @since S8
  */
-pub unsafe fn unguard_lane() -> void
+pub unsafe fn unguard_lane()
 ```
 
 ### 4.3 Como a saída é atribuída ao teste certo
@@ -512,7 +520,7 @@ O desenho entrega **uma** função `cabi` de raia, não uma por teste:
  * @return     0; o valor de retorno da thread não carrega informação — o veredito vai pela casa
  * @since S8
  */
-cabi fn __tk_gate_lane(ctx: ptr<byte>) -> ptr<byte>
+cabi fn __tk_gate_lane(ctx: ptr<byte>): ptr<byte>
 ```
 
 Uma raia por núcleo, cada uma varrendo `i = lane, lane + lanes, lane + 2*lanes, …`. Isso mantém
@@ -564,8 +572,8 @@ loop {
 E as entradas dessas tabelas são nomeadas pelo **ordinal de inserção**:
 
 ```teko
-fn rodata_symbol(index: u64) -> str { teko::str::concat(".Lstr", teko::u64_to_str(index)) }     // :4616
-fn lift_thunk_symbol(id: u64) -> str { teko::str::concat(".Lclofn", teko::u64_to_str(id)) }      // :1619
+fn rodata_symbol(index: u64): str { teko::str::concat(".Lstr", teko::u64_to_str(index)) }     // :4616
+fn lift_thunk_symbol(id: u64): str { teko::str::concat(".Lclofn", teko::u64_to_str(id)) }      // :1619
 ```
 
 Ou seja: **`.Lstr7` não significa nada; significa "o sétimo literal que este build encontrou"**.
@@ -732,7 +740,7 @@ Cada crumb entrega algo isoladamente gate-ável. **Ponto ritual** = onde o gate 
 passar: `teko build . --no-verify --release && ./bin/teko test .` + fixpoint `gen1 == gen2`
 byte-idêntico + `scripts/no_emitted_c.sh`. Crumbs de desenho e de fixture pulam o fixpoint.
 
-**Nota de forma, importante:** a pauta pedia fixtures "VM e nativo". **A VM foi aposentada em
+**Nota de forma, importante:** a pauta pedia fixtures "motor legado e nativo". **O motor legado foi aposentado em
 2026-07-13 (#524)** — AOT nativo é o único motor. Toda fixture abaixo tem um único par
 entrada → exit code, no caminho nativo. Registrar isso é obrigação; entregar um par que não existe
 mais seria pior.
@@ -740,7 +748,7 @@ mais seria pior.
 | # | crumb | entrega | desbloqueia | ritual |
 |---|---|---|---|---|
 | **C0** | **Sondar, não construir** | (a) `extern fn` aceita `ptr<byte>` em parâmetro e baixa nativamente? (b) `buf_ptr`/`bytes_from_ptr` baixam nativamente — **medido: NÃO**, a tabela de `call_symbol` (`lower.tks`:1215-1267) tem io, cov e arena, e nada mais; (c) o backend próprio baixa um corpo de `#test`? (nunca foi exercitado, `lower.tks`:5655); (d) **atribuir os 271,2 s** por fase, nos dois hosts | tudo; C12 **depende** de (d) | sem fixpoint |
-| **C1** | **`cabi fn(T…) -> R` em parâmetro de `extern fn`** | tipo em posição de parâmetro; coerção de nome nu de função de topo não-capturante → `LFuncAddr(mangle_fn_symbol(ns, name))`; rejeição de capturante, de genérica, de método e de tipo não representável em ABI C | **todo o resto**; é o único vão do chão | **sim** |
+| **C1** | **`cabi fn(T…): R` em parâmetro de `extern fn`** | tipo em posição de parâmetro; coerção de nome nu de função de topo não-capturante → `LFuncAddr(mangle_fn_symbol(ns, name))`; rejeição de capturante, de genérica, de método e de tipo não representável em ABI C | **todo o resto**; é o único vão do chão | **sim** |
 | **C2** | **`buf_ptr`/`bytes_from_ptr` nativos** | duas entradas na tabela de `call_symbol` → `tk_region_alloc`/`tk_bytes_from_ptr`; espelha exatamente o que F3 fez para `cov_*`/`arena_*`; zero C novo | casas de resultado e leitura de `pthread_t` no caminho nativo | **sim** |
 | **C3** | **`panic`/`exit` em Teko** | retargetar `call_symbol` de `tk_panic_str`/`tk_exit` para `teko::rt::panic`/`teko::rt::exit`, em Teko, com bottom por `extern fn` para `write`/`abort`. Saída não-guardada **byte-idêntica**, exit 134 preservado | C7; e fecha o *"FFI bottom, crumb C1, DEFERRED"* de `teko_rt.tks` | **sim** |
 | **C4** | **Região raiz por tarefa** | `arena_push`/`pop`/`commit` passam a operar sobre a raiz da tarefa chamadora. É a peça de §8.1 e é **bloqueante** | C5 em diante | **sim** |

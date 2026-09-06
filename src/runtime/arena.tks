@@ -1,0 +1,1280 @@
+extern fn tk_arena_control_get(): u64 = "tk_arena_control_get" from "teko_rt"
+
+extern fn tk_arena_control_set(addr: u64) = "tk_arena_control_set" from "teko_rt"
+
+extern fn tk_arena_paranoid(): u64 = "tk_arena_paranoid" from "teko_rt"
+
+const ARENA_ALIGN: u64 = 16
+
+const DEFAULT_CHUNK: u64 = 65536
+
+const WORD: u64 = 8
+
+const CHUNK_NEXT: u64 = 0
+
+const CHUNK_CAP: u64 = 8
+
+const CHUNK_USED: u64 = 16
+
+const CHUNK_HEADER: u64 = 32
+
+const REGION_HEAD: u64 = 0
+
+const REGION_REG_NEXT: u64 = 8
+
+const REGION_PARENT: u64 = 16
+
+const REGION_ENTRIES: u64 = 24
+
+const REGION_NENTRIES: u64 = 32
+
+const REGION_ENTRIES_CAP: u64 = 40
+
+const REGION_GEN: u64 = 48
+
+const REGION_ROOT: u64 = 56
+
+const REGION_CHILDREN: u64 = 64
+
+const REGION_SIB_NEXT: u64 = 72
+
+const REGION_BYTES: u64 = 80
+
+const ENTRY_TYPE_ID: u64 = 0
+
+const ENTRY_INSTANCE: u64 = 8
+
+const ENTRY_BYTES: u64 = 16
+
+const ENTRIES_FIRST_CAP: u64 = 4
+
+const CTRL_MAGIC: u64 = 0
+
+const CTRL_REGS: u64 = 8
+
+const CTRL_ROOT: u64 = 16
+
+const CTRL_GEN: u64 = 24
+
+const CTRL_MSP: u64 = 32
+
+const CTRL_FREE_LARGE: u64 = 40
+
+const CTRL_META_SLAB: u64 = 48
+
+const CTRL_META_CURSOR: u64 = 56
+
+const CTRL_META_END: u64 = 64
+
+const CTRL_HDR_FREE: u64 = 72
+
+const CTRL_PROGRAM: u64 = 80
+
+const CTRL_MARKS: u64 = 128
+
+const MARK_CHUNK: u64 = 0
+
+const MARK_USED: u64 = 8
+
+const MARK_BYTES: u64 = 16
+
+const MARK_SLOTS: u64 = 64
+
+const CTRL_FREE_BINS: u64 = 1152
+
+const FREE_BINS: u64 = 4096
+
+const CTRL_CUR_SP: u64 = 33920
+
+const CTRL_CUR_STACK: u64 = 33928
+
+const CUR_STACK_SLOTS: u64 = 64
+
+const CTRL_WRAP_LOCK: u64 = 34448
+
+const CTRL_WRAP_TABLE: u64 = 34456
+
+const CTRL_WRAP_COUNT: u64 = 34464
+
+const CTRL_RET_DEST: u64 = 34472
+
+const CTRL_ENVIRON: u64 = 34480
+
+const CTRL_FD_STAGE: u64 = 34488
+
+const CTRL_INTERN_TABLE: u64 = 34496
+
+const CTRL_INTERN_REGION: u64 = 34504
+
+const CTRL_NAMES_STATE: u64 = 34512
+
+const CTRL_CAPTURE_SP: u64 = 34520
+
+const CTRL_CAPTURE_MSG_PTR: u64 = 34528
+
+const CTRL_CAPTURE_MSG_LEN: u64 = 34536
+
+const CTRL_PANIC_PENDING: u64 = 34544
+
+const CTRL_COV_STATE: u64 = 34552
+
+const CTRL_BYTES: u64 = 34800
+
+const CTRL_MAGIC_VALUE: u64 = 2596069104
+
+const WRAP_TABLE_CAP: u64 = 4096
+
+const WRAP_ENTRY_BYTES: u64 = 16
+
+const WRAP_ENTRY_ADDR: u64 = 0
+
+const WRAP_ENTRY_COUNT: u64 = 8
+
+const FREENODE_NEXT: u64 = 0
+
+const FREENODE_BYTES: u64 = 8
+
+const FREENODE_BYTES_MIN: u64 = 16
+
+const FREE_BIN_MAX_BYTES: u64 = 65536
+
+const FREE_LARGE_SCAN: u64 = 32
+
+const AR_META_SLAB: u64 = 65536
+
+const AR_SLAB_LINK: u64 = 0
+
+const AR_SLAB_HEADER: u64 = 16
+
+const AR_OOM_CODE: i64 = 137
+
+const AR_POISON_WORD: u64 = 15987178197214944733
+
+fn ar_align_up(n: u64): u64 {
+    var slack = n % ARENA_ALIGN
+    if slack == 0 { return n }
+    n + ARENA_ALIGN - slack
+}
+
+fn ar_align_down(n: u64): u64 {
+    n - n % ARENA_ALIGN
+}
+
+fn ar_load(address: u64): u64 {
+    teko::mem::load_u64(address)
+}
+
+fn ar_store(address: u64, value: u64) {
+    teko::mem::store_u64(address, value)
+}
+
+#os("linux")
+fn ar_mmap(length: u64): u64 {
+    var result = teko::sys::syscall6(teko::sys::SYS_MMAP, 0, length to i64,
+        teko::sys::PROT_READ | teko::sys::PROT_WRITE,
+        teko::sys::MAP_PRIVATE | teko::sys::MAP_ANONYMOUS, -1, 0)
+    if result >= -4095 && result <= -1 { return 0 }
+    result to u64
+}
+
+#os("macos")
+fn ar_mmap(length: u64): u64 {
+    var r = teko::sys::abi::os_mmap(0, length, teko::sys::PROT_READ | teko::sys::PROT_WRITE,
+        teko::sys::MAP_PRIVATE | teko::sys::MAP_ANON, -1 to i32, 0)
+    if r == teko::sys::MAP_FAILED_WORD { return 0 }
+    r
+}
+
+#os("windows")
+fn ar_mmap(length: u64): u64 {
+    teko::sys::abi::VirtualAlloc(0, length, teko::sys::MEM_COMMIT | teko::sys::MEM_RESERVE, teko::sys::PAGE_READWRITE)
+}
+
+#os("linux")
+fn ar_munmap(address: u64, length: u64) {
+    _ = teko::sys::syscall2(teko::sys::SYS_MUNMAP, address to i64, length to i64)
+}
+
+#os("macos")
+fn ar_munmap(address: u64, length: u64) {
+    _ = teko::sys::abi::os_munmap(address, length)
+}
+
+#os("windows")
+fn ar_munmap(address: u64, length: u64) {
+    _ = length
+    _ = teko::sys::abi::VirtualFree(address, 0, teko::sys::MEM_RELEASE)
+}
+
+#os("linux")
+fn ar_oom() {
+    _ = teko::sys::syscall1(teko::sys::SYS_EXIT_GROUP, AR_OOM_CODE)
+}
+
+#os("macos")
+fn ar_oom() {
+    teko::sys::abi::os_exit(AR_OOM_CODE to i32)
+}
+
+#os("windows")
+fn ar_oom() {
+    teko::sys::abi::ExitProcess(AR_OOM_CODE to u32)
+}
+
+#os("linux")
+fn rt_exit_os(code: i64) {
+    _ = teko::sys::syscall1(teko::sys::SYS_EXIT_GROUP, code)
+}
+
+#os("macos")
+fn rt_exit_os(code: i64) {
+    teko::sys::abi::os_exit(code to i32)
+}
+
+#os("windows")
+fn rt_exit_os(code: i64) {
+    teko::sys::abi::ExitProcess(code to u32)
+}
+
+/** teko::runtime::rt_exit — terminate the whole process with status `code` (low byte) via the raw
+ * OS exit primitive; the `exit(...)` builtin and `panic` lower here. Diverges. */
+pub fn rt_exit(code: i64) {
+    rt_exit_os(code)
+}
+
+fn ar_ctrl_get(control: u64, field: u64): u64 {
+    ar_load(control + field)
+}
+
+fn ar_ctrl_set(control: u64, field: u64, value: u64) {
+    ar_store(control + field, value)
+}
+
+pub fn ctrl_get(field: u64): u64 {
+    ar_ctrl_get(ar_control(), field)
+}
+
+pub fn ctrl_set(field: u64, value: u64) {
+    ar_ctrl_set(ar_control(), field, value)
+}
+
+fn ar_meta_slab_new(slab_bytes: u64): u64 {
+    var slab = ar_mmap(slab_bytes)
+    if slab == 0 { ar_oom() }
+    ar_store(slab + AR_SLAB_LINK, 0)
+    slab
+}
+
+fn ar_meta_alloc(control: u64, bytes: u64): u64 {
+    var size = ar_align_up(bytes)
+    var cursor = ar_ctrl_get(control, CTRL_META_CURSOR)
+    var end = ar_ctrl_get(control, CTRL_META_END)
+    if cursor + size > end {
+        var need = AR_SLAB_HEADER + size
+        var slab_bytes = if need > AR_META_SLAB { ar_align_up(need) } else { AR_META_SLAB }
+        var slab = ar_meta_slab_new(slab_bytes)
+        ar_store(slab + AR_SLAB_LINK, ar_ctrl_get(control, CTRL_META_SLAB))
+        ar_ctrl_set(control, CTRL_META_SLAB, slab)
+        cursor = slab + AR_SLAB_HEADER
+        ar_ctrl_set(control, CTRL_META_END, slab + slab_bytes)
+    }
+    ar_ctrl_set(control, CTRL_META_CURSOR, cursor + size)
+    cursor
+}
+
+fn ar_header_alloc(control: u64): u64 {
+    var recycled = ar_ctrl_get(control, CTRL_HDR_FREE)
+    if recycled != 0 {
+        ar_ctrl_set(control, CTRL_HDR_FREE, ar_load(recycled))
+        return recycled
+    }
+    ar_meta_alloc(control, REGION_BYTES)
+}
+
+fn ar_header_free(control: u64, region: u64) {
+    ar_store(region, ar_ctrl_get(control, CTRL_HDR_FREE))
+    ar_ctrl_set(control, CTRL_HDR_FREE, region)
+}
+
+fn ar_control(): u64 {
+    var existing = tk_arena_control_get()
+    if existing != 0 { return existing }
+    var slab = ar_meta_slab_new(AR_META_SLAB)
+    var control = slab + AR_SLAB_HEADER
+    ar_ctrl_set(control, CTRL_MAGIC, CTRL_MAGIC_VALUE)
+    ar_ctrl_set(control, CTRL_META_SLAB, slab)
+    ar_ctrl_set(control, CTRL_META_CURSOR, ar_align_up(control + CTRL_BYTES))
+    ar_ctrl_set(control, CTRL_META_END, slab + AR_META_SLAB)
+    tk_arena_control_set(control)
+    control
+}
+
+fn ar_chunk_get(chunk: u64, field: u64): u64 {
+    ar_load(chunk + field)
+}
+
+fn ar_chunk_set(chunk: u64, field: u64, value: u64) {
+    ar_store(chunk + field, value)
+}
+
+fn ar_chunk_payload(chunk: u64): u64 {
+    chunk + CHUNK_HEADER
+}
+
+fn ar_chunk_try(payload: u64): u64 {
+    var chunk = ar_mmap(CHUNK_HEADER + payload)
+    if chunk == 0 { return 0 }
+    ar_chunk_set(chunk, CHUNK_NEXT, 0)
+    ar_chunk_set(chunk, CHUNK_CAP, payload)
+    ar_chunk_set(chunk, CHUNK_USED, 0)
+    chunk
+}
+
+fn ar_chunk_free(chunk: u64) {
+    ar_munmap(chunk, CHUNK_HEADER + ar_chunk_get(chunk, CHUNK_CAP))
+}
+
+fn ar_chunk_free_list(head: u64) {
+    var chunk = head
+    loop {
+        if chunk == 0 { break }
+        var next = ar_chunk_get(chunk, CHUNK_NEXT)
+        ar_chunk_free(chunk)
+        chunk = next
+    }
+}
+
+fn ar_chunk_free_until(head: u64, stop: u64) {
+    var chunk = head
+    loop {
+        if chunk == 0 { break }
+        if chunk == stop { break }
+        var next = ar_chunk_get(chunk, CHUNK_NEXT)
+        ar_chunk_free(chunk)
+        chunk = next
+    }
+}
+
+fn ar_chunk_fit_offset(chunk: u64, size: u64): u64 {
+    var cap = ar_chunk_get(chunk, CHUNK_CAP)
+    var base_off = ar_align_up(ar_chunk_get(chunk, CHUNK_USED))
+    if base_off > cap { return cap + 1 }
+    if size > cap - base_off { return cap + 1 }
+    base_off
+}
+
+fn ar_chunk_offset_fits(chunk: u64, offset: u64): bool {
+    offset <= ar_chunk_get(chunk, CHUNK_CAP)
+}
+
+fn ar_region_get(region: u64, field: u64): u64 {
+    ar_load(region + field)
+}
+
+fn ar_region_set(region: u64, field: u64, value: u64) {
+    ar_store(region + field, value)
+}
+
+fn ar_region_child_link(parent: u64, region: u64) {
+    if parent == 0 {
+        ar_region_set(region, REGION_SIB_NEXT, 0)
+        return
+    }
+    ar_region_set(region, REGION_SIB_NEXT, ar_region_get(parent, REGION_CHILDREN))
+    ar_region_set(parent, REGION_CHILDREN, region)
+}
+
+fn ar_region_child_unlink(parent: u64, region: u64) {
+    if parent == 0 { return }
+    var head = ar_region_get(parent, REGION_CHILDREN)
+    if head == region {
+        ar_region_set(parent, REGION_CHILDREN, ar_region_get(region, REGION_SIB_NEXT))
+        return
+    }
+    var prev = head
+    loop {
+        if prev == 0 { break }
+        var next = ar_region_get(prev, REGION_SIB_NEXT)
+        if next == region {
+            ar_region_set(prev, REGION_SIB_NEXT, ar_region_get(region, REGION_SIB_NEXT))
+            break
+        }
+        prev = next
+    }
+}
+
+fn ar_region_new_w(control: u64, parent: u64): u64 {
+    var region = ar_header_alloc(control)
+    ar_region_set(region, REGION_HEAD, 0)
+    ar_region_set(region, REGION_REG_NEXT, ar_ctrl_get(control, CTRL_REGS))
+    ar_ctrl_set(control, CTRL_REGS, region)
+    ar_region_set(region, REGION_PARENT, parent)
+    ar_region_set(region, REGION_ENTRIES, 0)
+    ar_region_set(region, REGION_NENTRIES, 0)
+    ar_region_set(region, REGION_ENTRIES_CAP, 0)
+    var generation = ar_ctrl_get(control, CTRL_GEN) + 1
+    ar_ctrl_set(control, CTRL_GEN, generation)
+    ar_region_set(region, REGION_GEN, generation)
+    ar_region_set(region, REGION_ROOT, if parent == 0 { region } else { ar_region_get(parent, REGION_ROOT) })
+    ar_region_set(region, REGION_CHILDREN, 0)
+    ar_region_child_link(parent, region)
+    region
+}
+
+fn ar_region_new_sized_w(control: u64, parent: u64, floor: u64): u64 {
+    var region = ar_region_new_w(control, parent)
+    if floor == 0 { return region }
+    var chunk = ar_chunk_try(ar_align_up(floor))
+    if chunk == 0 { ar_oom() }
+    ar_chunk_set(chunk, CHUNK_USED, 0)
+    ar_chunk_set(chunk, CHUNK_NEXT, ar_region_get(region, REGION_HEAD))
+    ar_region_set(region, REGION_HEAD, chunk)
+    region
+}
+
+fn ar_region_root_w(control: u64): u64 {
+    var existing = ar_ctrl_get(control, CTRL_ROOT)
+    if existing != 0 { return existing }
+    var root = ar_region_new_w(control, 0)
+    ar_ctrl_set(control, CTRL_ROOT, root)
+    root
+}
+
+fn ar_region_program_w(control: u64): u64 {
+    var existing = ar_ctrl_get(control, CTRL_PROGRAM)
+    if existing != 0 { return existing }
+    var program = ar_region_new_w(control, 0)
+    ar_ctrl_set(control, CTRL_PROGRAM, program)
+    program
+}
+
+fn ar_cur_slot(control: u64, depth: u64): u64 {
+    control + CTRL_CUR_STACK + depth * WORD
+}
+
+fn ar_cur_current(control: u64): u64 {
+    var sp = ar_ctrl_get(control, CTRL_CUR_SP)
+    if sp > 0 && sp <= CUR_STACK_SLOTS {
+        var region = ar_load(ar_cur_slot(control, sp - 1))
+        if region != 0 { return region }
+    }
+    ar_region_root_w(control)
+}
+
+fn ar_cur_enter(control: u64, child: u64) {
+    var sp = ar_ctrl_get(control, CTRL_CUR_SP)
+    if sp < CUR_STACK_SLOTS { ar_store(ar_cur_slot(control, sp), child) }
+    ar_ctrl_set(control, CTRL_CUR_SP, sp + 1)
+}
+
+fn ar_cur_leave(control: u64) {
+    var sp = ar_ctrl_get(control, CTRL_CUR_SP)
+    if sp == 0 { return }
+    ar_ctrl_set(control, CTRL_CUR_SP, sp - 1)
+}
+
+fn ar_region_bump(region: u64, offset: u64, size: u64): u64 {
+    var chunk = ar_region_get(region, REGION_HEAD)
+    ar_chunk_set(chunk, CHUNK_USED, offset + size)
+    ar_chunk_payload(chunk) + offset
+}
+
+fn ar_region_grow(control: u64, region: u64, size: u64): u64 {
+    var want = if size > DEFAULT_CHUNK { size } else { DEFAULT_CHUNK }
+    var chunk = ar_chunk_try(want)
+    if chunk == 0 {
+        if want != size { chunk = ar_chunk_try(size) }
+    }
+    if chunk == 0 { ar_oom() }
+    ar_chunk_set(chunk, CHUNK_USED, size)
+    ar_chunk_set(chunk, CHUNK_NEXT, ar_region_get(region, REGION_HEAD))
+    ar_region_set(region, REGION_HEAD, chunk)
+    ar_chunk_payload(chunk)
+}
+
+fn ar_region_alloc_w(control: u64, region: u64, n: u64): u64 {
+    var size = ar_align_up(if n == 0 { 1 } else { n })
+    if region == ar_ctrl_get(control, CTRL_ROOT) {
+        var reused = ar_free_take(control, size)
+        if reused != 0 { return reused }
+    }
+    var head = ar_region_get(region, REGION_HEAD)
+    if head != 0 {
+        var offset = ar_chunk_fit_offset(head, size)
+        if ar_chunk_offset_fits(head, offset) { return ar_region_bump(region, offset, size) }
+    }
+    ar_region_grow(control, region, size)
+}
+
+fn ar_registry_unlink(control: u64, region: u64) {
+    var head = ar_ctrl_get(control, CTRL_REGS)
+    if head == region {
+        ar_ctrl_set(control, CTRL_REGS, ar_region_get(region, REGION_REG_NEXT))
+        return
+    }
+    var prev = head
+    loop {
+        if prev == 0 { break }
+        var next = ar_region_get(prev, REGION_REG_NEXT)
+        if next == region {
+            ar_region_set(prev, REGION_REG_NEXT, ar_region_get(region, REGION_REG_NEXT))
+            break
+        }
+        prev = next
+    }
+}
+
+fn ar_region_release(control: u64, region: u64) {
+    var head = ar_region_get(region, REGION_HEAD)
+    ar_region_set(region, REGION_HEAD, 0)
+    ar_chunk_free_list(head)
+    ar_region_set(region, REGION_ENTRIES, 0)
+    ar_region_set(region, REGION_NENTRIES, 0)
+    ar_region_set(region, REGION_ENTRIES_CAP, 0)
+    ar_header_free(control, region)
+}
+
+fn ar_region_drop_w(control: u64, region: u64) {
+    if region == 0 { return }
+    ar_registry_unlink(control, region)
+    ar_region_child_unlink(ar_region_get(region, REGION_PARENT), region)
+    ar_region_set(region, REGION_REG_NEXT, 0)
+    ar_region_release(control, region)
+}
+
+fn ar_region_reaches(region: u64, root: u64): bool {
+    var current = region
+    loop {
+        if current == 0 { break }
+        if current == root { return true }
+        current = ar_region_get(current, REGION_PARENT)
+    }
+    false
+}
+
+fn ar_subtree_collect(control: u64, root: u64): u64 {
+    var doomed: u64 = 0
+    var current = ar_ctrl_get(control, CTRL_REGS)
+    loop {
+        if current == 0 { break }
+        var next = ar_region_get(current, REGION_REG_NEXT)
+        if ar_region_reaches(current, root) {
+            ar_registry_unlink(control, current)
+            ar_region_set(current, REGION_REG_NEXT, doomed)
+            doomed = current
+        }
+        current = next
+    }
+    doomed
+}
+
+fn ar_region_drop_subtree_w(control: u64, root: u64) {
+    if root == 0 { return }
+    ar_region_child_unlink(ar_region_get(root, REGION_PARENT), root)
+    var doomed = ar_subtree_collect(control, root)
+    loop {
+        if doomed == 0 { break }
+        var next = ar_region_get(doomed, REGION_REG_NEXT)
+        ar_region_release(control, doomed)
+        doomed = next
+    }
+}
+
+fn ar_entry_slot(region: u64, index: u64): u64 {
+    ar_region_get(region, REGION_ENTRIES) + index * ENTRY_BYTES
+}
+
+fn ar_entry_index_of(region: u64, type_id: u64): u64 {
+    var count = ar_region_get(region, REGION_NENTRIES)
+    var i: u64 = 0
+    loop {
+        if i >= count { break }
+        if ar_load(ar_entry_slot(region, i) + ENTRY_TYPE_ID) == type_id { return i }
+        i++
+    }
+    count
+}
+
+fn ar_words_copy(dst: u64, src: u64, word_count: u64) {
+    var i: u64 = 0
+    loop {
+        if i >= word_count { break }
+        ar_store(dst + i * WORD, ar_load(src + i * WORD))
+        i++
+    }
+}
+
+fn ar_entries_grow(control: u64, region: u64) {
+    var old_cap = ar_region_get(region, REGION_ENTRIES_CAP)
+    var new_cap = if old_cap == 0 { ENTRIES_FIRST_CAP } else { old_cap * 2 }
+    var old_table = ar_region_get(region, REGION_ENTRIES)
+    var new_table = ar_meta_alloc(control, new_cap * ENTRY_BYTES)
+    var used_words = ar_region_get(region, REGION_NENTRIES) * ENTRY_BYTES / WORD
+    if used_words > 0 { ar_words_copy(new_table, old_table, used_words) }
+    ar_region_set(region, REGION_ENTRIES, new_table)
+    ar_region_set(region, REGION_ENTRIES_CAP, new_cap)
+}
+
+fn ar_region_register_w(control: u64, region: u64, type_id: u64, instance: u64) {
+    if region == 0 { return }
+    var count = ar_region_get(region, REGION_NENTRIES)
+    var found = ar_entry_index_of(region, type_id)
+    if found < count {
+        ar_store(ar_entry_slot(region, found) + ENTRY_INSTANCE, instance)
+        return
+    }
+    if count == ar_region_get(region, REGION_ENTRIES_CAP) { ar_entries_grow(control, region) }
+    var slot = ar_entry_slot(region, count)
+    ar_store(slot + ENTRY_TYPE_ID, type_id)
+    ar_store(slot + ENTRY_INSTANCE, instance)
+    ar_region_set(region, REGION_NENTRIES, count + 1)
+}
+
+fn ar_region_lookup_w(region: u64, type_id: u64): u64 {
+    var current = region
+    loop {
+        if current == 0 { break }
+        var count = ar_region_get(current, REGION_NENTRIES)
+        var found = ar_entry_index_of(current, type_id)
+        if found < count { return ar_load(ar_entry_slot(current, found) + ENTRY_INSTANCE) }
+        current = ar_region_get(current, REGION_PARENT)
+    }
+    0
+}
+
+fn ar_mark_slot(control: u64, depth: u64): u64 {
+    control + CTRL_MARKS + depth * MARK_BYTES
+}
+
+fn ar_write_mark(control: u64, depth: u64) {
+    var head = ar_region_get(ar_region_root_w(control), REGION_HEAD)
+    var slot = ar_mark_slot(control, depth)
+    ar_store(slot + MARK_CHUNK, head)
+    if head == 0 {
+        ar_store(slot + MARK_USED, 0)
+        return
+    }
+    ar_store(slot + MARK_USED, ar_chunk_get(head, CHUNK_USED))
+}
+
+fn ar_checkpoint_push_w(control: u64) {
+    var depth = ar_ctrl_get(control, CTRL_MSP)
+    ar_ctrl_set(control, CTRL_MSP, depth + 1)
+    if depth >= MARK_SLOTS { return }
+    ar_write_mark(control, depth)
+}
+
+fn ar_checkpoint_pop_w(control: u64) {
+    var depth = ar_ctrl_get(control, CTRL_MSP)
+    if depth == 0 { return }
+    ar_ctrl_set(control, CTRL_MSP, depth - 1)
+    if depth - 1 >= MARK_SLOTS { return }
+    ar_free_purge(control)
+    var slot = ar_mark_slot(control, depth - 1)
+    var marked_chunk = ar_load(slot + MARK_CHUNK)
+    var marked_used = ar_load(slot + MARK_USED)
+    var root = ar_region_root_w(control)
+    ar_chunk_free_until(ar_region_get(root, REGION_HEAD), marked_chunk)
+    ar_region_set(root, REGION_HEAD, marked_chunk)
+    if marked_chunk != 0 { ar_chunk_set(marked_chunk, CHUNK_USED, marked_used) }
+}
+
+fn ar_checkpoint_commit_w(control: u64) {
+    var depth = ar_ctrl_get(control, CTRL_MSP)
+    if depth == 0 { return }
+    ar_ctrl_set(control, CTRL_MSP, depth - 1)
+}
+
+fn ar_free_bin_slot(control: u64, bytes: u64): u64 {
+    control + CTRL_FREE_BINS + (bytes / ARENA_ALIGN - 1) * WORD
+}
+
+fn ar_free_is_binnable(bytes: u64): bool {
+    if bytes == 0 { return false }
+    bytes <= FREE_BIN_MAX_BYTES
+}
+
+fn ar_freenode_get(node: u64, field: u64): u64 {
+    ar_load(node + field)
+}
+
+fn ar_free_purge(control: u64) {
+    var i: u64 = 0
+    loop {
+        if i >= FREE_BINS { break }
+        ar_store(control + CTRL_FREE_BINS + i * WORD, 0)
+        i++
+    }
+    ar_ctrl_set(control, CTRL_FREE_LARGE, 0)
+}
+
+fn ar_free_take_binned(control: u64, size: u64): u64 {
+    var slot = ar_free_bin_slot(control, size)
+    var node = ar_load(slot)
+    if node == 0 { return 0 }
+    ar_store(slot, ar_freenode_get(node, FREENODE_NEXT))
+    node
+}
+
+fn ar_free_block_fits(bytes: u64, size: u64): bool {
+    if bytes < size { return false }
+    bytes <= size * 2
+}
+
+fn ar_free_take_large(control: u64, size: u64): u64 {
+    var prev: u64 = 0
+    var node = ar_ctrl_get(control, CTRL_FREE_LARGE)
+    var scanned: u64 = 0
+    loop {
+        if node == 0 { break }
+        if scanned >= FREE_LARGE_SCAN { break }
+        var next = ar_freenode_get(node, FREENODE_NEXT)
+        var bytes = ar_freenode_get(node, FREENODE_BYTES)
+        if ar_free_block_fits(bytes, size) {
+            if prev == 0 { ar_ctrl_set(control, CTRL_FREE_LARGE, next) } else { ar_store(prev + FREENODE_NEXT, next) }
+            return node
+        }
+        prev = node
+        node = next
+        scanned++
+    }
+    0
+}
+
+fn ar_free_take(control: u64, size: u64): u64 {
+    var wanted = ar_align_up(size)
+    if ar_free_is_binnable(wanted) { return ar_free_take_binned(control, wanted) }
+    ar_free_take_large(control, wanted)
+}
+
+fn ar_free_park(control: u64, block: u64, usable: u64) {
+    ar_store(block + FREENODE_BYTES, usable)
+    if ar_free_is_binnable(usable) {
+        var slot = ar_free_bin_slot(control, usable)
+        ar_store(block + FREENODE_NEXT, ar_load(slot))
+        ar_store(slot, block)
+        return
+    }
+    ar_store(block + FREENODE_NEXT, ar_ctrl_get(control, CTRL_FREE_LARGE))
+    ar_ctrl_set(control, CTRL_FREE_LARGE, block)
+}
+
+fn ar_poison(block: u64, usable: u64) {
+    var i: u64 = 0
+    loop {
+        if i >= usable { break }
+        ar_store(block + i, AR_POISON_WORD)
+        i = i + WORD
+    }
+}
+
+fn ar_free_block(control: u64, block: u64, bytes: u64) {
+    if block == 0 { return }
+    var usable = ar_align_down(bytes)
+    if tk_arena_paranoid() == 1 {
+        if usable > 0 { ar_poison(block, usable) }
+        return
+    }
+    if usable < FREENODE_BYTES_MIN { return }
+    ar_free_park(control, block, usable)
+}
+
+pub fn region_alloc(r: ptr, n: u64): ptr {
+    var control = ar_control()
+    var address = ar_region_alloc_w(control, teko::sys::ptr_word(r) to u64, n)
+    teko::sys::word_ptr(address to i64)
+}
+
+pub fn free_block(addr: u64, n: u64) {
+    if addr == 0 { return }
+    ar_free_block(ar_control(), addr, n)
+}
+
+pub fn region_new(parent: ptr): ptr {
+    var control = ar_control()
+    teko::sys::word_ptr(ar_region_new_w(control, teko::sys::ptr_word(parent) to u64) to i64)
+}
+
+pub fn region_new_sized(parent: ptr, floor: u64): ptr {
+    var control = ar_control()
+    teko::sys::word_ptr(ar_region_new_sized_w(control, teko::sys::ptr_word(parent) to u64, floor) to i64)
+}
+
+pub fn region_drop(r: ptr) {
+    ar_region_drop_w(ar_control(), teko::sys::ptr_word(r) to u64)
+}
+
+pub fn region_drop_subtree(r: ptr) {
+    ar_region_drop_subtree_w(ar_control(), teko::sys::ptr_word(r) to u64)
+}
+
+pub fn chunk_node_link(r: ptr, prev_head: ptr, payload: u64): ptr {
+    var chunk = ar_chunk_try(payload)
+    if chunk == 0 { ar_oom() }
+    ar_chunk_set(chunk, CHUNK_NEXT, teko::sys::ptr_word(prev_head) to u64)
+    teko::sys::word_ptr(chunk to i64)
+}
+
+pub fn region_root(): ptr {
+    teko::sys::word_ptr(ar_region_root_w(ar_control()) to i64)
+}
+
+pub fn region_current(): ptr {
+    teko::sys::word_ptr(ar_cur_current(ar_control()) to i64)
+}
+
+pub fn region_enter(child: ptr) {
+    ar_cur_enter(ar_control(), teko::sys::ptr_word(child) to u64)
+}
+
+pub fn region_leave() {
+    ar_cur_leave(ar_control())
+}
+
+pub fn alloc(n: u64): ptr {
+    var control = ar_control()
+    teko::sys::word_ptr(ar_region_alloc_w(control, ar_cur_current(control), n) to i64)
+}
+
+pub fn region_program(): ptr {
+    teko::sys::word_ptr(ar_region_program_w(ar_control()) to i64)
+}
+
+pub fn environ_slot(): u64 {
+    ar_ctrl_get(ar_control(), CTRL_ENVIRON)
+}
+
+pub fn set_environ_slot(addr: u64) {
+    ar_ctrl_set(ar_control(), CTRL_ENVIRON, addr)
+}
+
+pub fn fd_stage_slot(): u64 {
+    ar_ctrl_get(ar_control(), CTRL_FD_STAGE)
+}
+
+pub fn set_fd_stage_slot(addr: u64) {
+    ar_ctrl_set(ar_control(), CTRL_FD_STAGE, addr)
+}
+
+/**
+ * Reads the process-resident address of the string-interning bucket table.
+ *
+ * @return  the bucket-table base address, or 0 before the intern subsystem is first touched
+ */
+pub fn intern_table_slot(): u64 {
+    ar_ctrl_get(ar_control(), CTRL_INTERN_TABLE)
+}
+
+/**
+ * Installs the process-resident address of the string-interning bucket table.
+ *
+ * @param addr  the bucket-table base address to record in the arena control block
+ */
+pub fn set_intern_table_slot(addr: u64) {
+    ar_ctrl_set(ar_control(), CTRL_INTERN_TABLE, addr)
+}
+
+/**
+ * Reads the region handle that backs the interning table and its entries.
+ *
+ * @return  the intern region handle as a word, or 0 before the subsystem is first touched
+ */
+pub fn intern_region_slot(): u64 {
+    ar_ctrl_get(ar_control(), CTRL_INTERN_REGION)
+}
+
+/**
+ * Installs the region handle that backs the interning table and its entries.
+ *
+ * @param addr  the intern region handle, as a word, to record in the arena control block
+ */
+pub fn set_intern_region_slot(addr: u64) {
+    ar_ctrl_set(ar_control(), CTRL_INTERN_REGION, addr)
+}
+
+/**
+ * Reads the address of the name-registry state block (its slot array, capacity and free list),
+ * program-resident so it outlives every task.
+ *
+ * @return  the state-block address, or 0 before the name registry is first touched
+ */
+pub fn names_state_slot(): u64 {
+    ar_ctrl_get(ar_control(), CTRL_NAMES_STATE)
+}
+
+/**
+ * Installs the address of the name-registry state block.
+ *
+ * @param addr  the state-block address to record in the arena control block
+ */
+pub fn set_names_state_slot(addr: u64) {
+    ar_ctrl_set(ar_control(), CTRL_NAMES_STATE, addr)
+}
+
+pub fn cov_state_slot(): u64 {
+    ar_ctrl_get(ar_control(), CTRL_COV_STATE)
+}
+
+pub fn set_cov_state_slot(addr: u64) {
+    ar_ctrl_set(ar_control(), CTRL_COV_STATE, addr)
+}
+
+/**
+ * capture_depth — how many `capture` frames are currently armed on this task, tested by `panic` to
+ * decide whether a raised panic is caught here or terminates the process.
+ *
+ * @return  the current capture nesting depth (0 when no `capture` frame is armed)
+ * @since 0.3.1
+ */
+exp fn capture_depth(): u64 {
+    ar_ctrl_get(ar_control(), CTRL_CAPTURE_SP)
+}
+
+/**
+ * capture_arm — mark that a `capture` frame is now active on this task, so a panic raised inside its
+ * body sets the pending flag and returns cooperatively rather than terminating the process.
+ *
+ * @since 0.3.1
+ */
+exp fn capture_arm() {
+    var ctrl = ar_control()
+    ar_ctrl_set(ctrl, CTRL_CAPTURE_SP, ar_ctrl_get(ctrl, CTRL_CAPTURE_SP) + 1)
+}
+
+/**
+ * capture_disarm — retire the innermost `capture` frame once its body returns, whether or not a panic
+ * was caught. Balances a prior `capture_arm`.
+ *
+ * @since 0.3.1
+ */
+exp fn capture_disarm() {
+    var ctrl = ar_control()
+    var sp = ar_ctrl_get(ctrl, CTRL_CAPTURE_SP)
+    if sp == 0 { return }
+    ar_ctrl_set(ctrl, CTRL_CAPTURE_SP, sp - 1)
+}
+
+/**
+ * capture_deliver — copy `msg` into the program region (so it outlives the panicking body's arena),
+ * record it for `take_panic`, and raise the per-task pending-panic flag. The raising frame then runs
+ * its own defers/drops and returns its sentinel; no stack is unwound.
+ *
+ * @param msg  the panic message the enclosing `capture` frame will recover
+ * @since 0.3.1
+ */
+exp fn capture_deliver(msg: str) {
+    var ctrl = ar_control()
+    var need = if msg.len == 0 { 1 } else { msg.len }
+    var dst = ar_region_alloc_w(ctrl, ar_region_program_w(ctrl), need)
+    if msg.len > 0 { _ = teko::runtime::rt_memcpy(dst, teko::sys::ptr_word(msg.as_ptr()) to u64, msg.len) }
+    ar_ctrl_set(ctrl, CTRL_CAPTURE_MSG_PTR, dst)
+    ar_ctrl_set(ctrl, CTRL_CAPTURE_MSG_LEN, msg.len)
+    teko::runtime::capture_longjmp(0 to u64)
+}
+
+pub fn panic_raise() {
+    ar_ctrl_set(ar_control(), CTRL_PANIC_PENDING, 1)
+}
+
+/**
+ * panicking — whether a panic is pending on this task, tested after every call that may panic so the
+ * frame can run its defers/drops and return its sentinel before the panic reaches its `capture`.
+ *
+ * @return  true if a panic is pending and unconsumed on the current task
+ * @since 0.3.1
+ */
+exp fn panicking(): bool {
+    ar_ctrl_get(ar_control(), CTRL_PANIC_PENDING) != 0
+}
+
+/**
+ * take_panic — consume the pending panic on the current task: clear the flag and return an independent
+ * copy of the stashed message. Read by the `capture` frame on its recovery arm.
+ *
+ * @return  the caught panic message
+ * @since 0.3.1
+ */
+exp fn take_panic(): str {
+    var ctrl = ar_control()
+    ar_ctrl_set(ctrl, CTRL_PANIC_PENDING, 0)
+    var n = ar_ctrl_get(ctrl, CTRL_CAPTURE_MSG_LEN)
+    if n == 0 { return " " }
+    var bytes = teko::mem::bytes_from_ptr(teko::sys::word_ptr(ar_ctrl_get(ctrl, CTRL_CAPTURE_MSG_PTR) to i64), n)
+    teko::runtime::str_of_bytes(bytes)
+}
+
+pub fn set_ret_dest(r: ptr) {
+    ar_ctrl_set(ar_control(), CTRL_RET_DEST, teko::sys::ptr_word(r) to u64)
+}
+
+pub fn ret_dest(): ptr {
+    teko::sys::word_ptr(ar_ctrl_get(ar_control(), CTRL_RET_DEST) to i64)
+}
+
+/**
+ * region_control — the control-block reachable from any region by walking its parent chain to the root
+ * (the root, born in `_start`, owns the control). It supersedes the ambient `ar_control()` thread-local
+ * first-touch once the region is threaded as a parameter: every task-global accessor (program region,
+ * intern, names, panic, environ) reads its control via `region_control(<region-param>)` instead of a
+ * thread-local read. Added with no caller (the sweep reroutes the accessors); until the root owns the
+ * control it delegates to `ar_control()`, so the teaching build stays inert and byte-identical.
+ *
+ * @param r  any region in the task's region tree (an opaque handle)
+ * @return   the control-block handle for the task that owns `r`
+ * @since 0.3.1
+ */
+pub fn region_control(r: ptr): ptr {
+    _ = teko::sys::ptr_word(r)
+    teko::sys::word_ptr(ar_control() to i64)
+}
+
+pub fn arena_push() {
+    ar_checkpoint_push_w(ar_control())
+}
+
+pub fn arena_pop() {
+    ar_checkpoint_pop_w(ar_control())
+}
+
+pub fn arena_commit() {
+    ar_checkpoint_commit_w(ar_control())
+}
+
+pub fn region_register(r: ptr, tid: u64, inst: ptr) {
+    ar_region_register_w(ar_control(), teko::sys::ptr_word(r) to u64, tid, teko::sys::ptr_word(inst) to u64)
+}
+
+pub fn region_lookup(r: ptr, tid: u64): ptr {
+    teko::sys::word_ptr(ar_region_lookup_w(teko::sys::ptr_word(r) to u64, tid) to i64)
+}
+
+fn ar_wrap_table(control: u64): u64 {
+    var existing = ar_ctrl_get(control, CTRL_WRAP_TABLE)
+    if existing != 0 { return existing }
+    var table = ar_meta_alloc(control, WRAP_TABLE_CAP * WRAP_ENTRY_BYTES)
+    ar_ctrl_set(control, CTRL_WRAP_TABLE, table)
+    table
+}
+
+fn ar_wrap_entry(table: u64, i: u64): u64 {
+    table + i * WRAP_ENTRY_BYTES
+}
+
+fn ar_wrap_find(control: u64, table: u64, addr: u64): u64 {
+    var n = ar_ctrl_get(control, CTRL_WRAP_COUNT)
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        if ar_load(ar_wrap_entry(table, i) + WRAP_ENTRY_ADDR) == addr { return i }
+        i++
+    }
+    n
+}
+
+fn ar_wrap_inc(control: u64, addr: u64) {
+    var table = ar_wrap_table(control)
+    var n = ar_ctrl_get(control, CTRL_WRAP_COUNT)
+    var i = ar_wrap_find(control, table, addr)
+    if i < n {
+        var e = ar_wrap_entry(table, i)
+        ar_store(e + WRAP_ENTRY_COUNT, ar_load(e + WRAP_ENTRY_COUNT) + 1)
+        return
+    }
+    if n >= WRAP_TABLE_CAP { return }
+    var e = ar_wrap_entry(table, n)
+    ar_store(e + WRAP_ENTRY_ADDR, addr)
+    ar_store(e + WRAP_ENTRY_COUNT, 1)
+    ar_ctrl_set(control, CTRL_WRAP_COUNT, n + 1)
+}
+
+fn ar_wrap_remove(control: u64, table: u64, i: u64, n: u64) {
+    var last = n - 1
+    if i != last {
+        var src = ar_wrap_entry(table, last)
+        var dst = ar_wrap_entry(table, i)
+        ar_store(dst + WRAP_ENTRY_ADDR, ar_load(src + WRAP_ENTRY_ADDR))
+        ar_store(dst + WRAP_ENTRY_COUNT, ar_load(src + WRAP_ENTRY_COUNT))
+    }
+    ar_ctrl_set(control, CTRL_WRAP_COUNT, last)
+}
+
+fn ar_wrap_dec(control: u64, addr: u64): bool {
+    var table = ar_wrap_table(control)
+    var n = ar_ctrl_get(control, CTRL_WRAP_COUNT)
+    var i = ar_wrap_find(control, table, addr)
+    if i >= n { return false }
+    var e = ar_wrap_entry(table, i)
+    var c = ar_load(e + WRAP_ENTRY_COUNT)
+    if c > 1 {
+        ar_store(e + WRAP_ENTRY_COUNT, c - 1)
+        return false
+    }
+    ar_wrap_remove(control, table, i, n)
+    true
+}
+
+pub fn wrap_retain(obj: ptr) {
+    var addr = teko::sys::ptr_word(obj) to u64
+    if addr == 0 { return }
+    var control = ar_control()
+    mtx_lock(control + CTRL_WRAP_LOCK)
+    ar_wrap_inc(control, addr)
+    mtx_unlock(control + CTRL_WRAP_LOCK)
+}
+
+pub fn wrap_release(obj: ptr) {
+    var addr = teko::sys::ptr_word(obj) to u64
+    if addr == 0 { return }
+    var control = ar_control()
+    mtx_lock(control + CTRL_WRAP_LOCK)
+    var at_zero = ar_wrap_dec(control, addr)
+    mtx_unlock(control + CTRL_WRAP_LOCK)
+    if at_zero { region_drop(obj) }
+}
+
+fn ar_wrap_alive(control: u64, addr: u64): bool {
+    var table = ar_wrap_table(control)
+    var n = ar_ctrl_get(control, CTRL_WRAP_COUNT)
+    ar_wrap_find(control, table, addr) < n
+}
+
+pub fn wrap_weak_get(obj: ptr): ptr {
+    var addr = teko::sys::ptr_word(obj) to u64
+    if addr == 0 { return teko::sys::word_ptr(0) }
+    var control = ar_control()
+    mtx_lock(control + CTRL_WRAP_LOCK)
+    var alive = ar_wrap_alive(control, addr)
+    mtx_unlock(control + CTRL_WRAP_LOCK)
+    if alive { obj } else { teko::sys::word_ptr(0) }
+}
+
+/** Writes `src` into `dst` at `dst[at + i] = src[i]`, in place, with no growth. */
+exp fn copy(dst: ref []byte, at: u64, src: []byte) {
+    var i: u64 = 0
+    loop {
+        if i >= src.len { break }
+        dst[at + i] = src[i]
+        i++
+    }
+}
+
+fn region_to_ptr(a: uptr): ptr {
+    teko::sys::word_ptr(a to i64)
+}
+
+fn region_of_ptr(p: ptr): Region {
+    Region { addr = teko::sys::ptr_word(p) to uptr }
+}
+
+fn region_of_word(w: u64): Region {
+    Region { addr = w to uptr }
+}
+
+fn arena_of_ptr(p: ptr): Arena {
+    Arena { addr = teko::sys::ptr_word(p) to uptr }
+}
+
+/** Arena — the per-task control block: the checkpoint stack and the task-global slots. */
+exp type Arena = struct {
+    /** The address of the 64-bit control block in the arena's meta memory. */
+    addr: uptr
+
+    /** Arena::current — the current task's control block, allocated on first touch. */
+    static fn current(): Arena { Arena { addr = ar_control() to uptr } }
+
+    /** Arena::at — wrap a raw control-block address as a handle. */
+    static fn at(addr: uptr): Arena { Arena { addr = addr } }
+
+    /** root — the task's root region. */
+    fn root(): Region { region_of_ptr(region_root()) }
+
+    /** program — the program-lifetime region, outliving every task-local scope. */
+    fn program(): Region { region_of_ptr(region_program()) }
+
+    /** push — open an arena checkpoint over the root region. */
+    fn push() { arena_push() }
+
+    /** pop — release every allocation made since the innermost checkpoint. */
+    fn pop() { arena_pop() }
+
+    /** commit — retire the innermost checkpoint, keeping its allocations. */
+    fn commit() { arena_commit() }
+
+    /** environ — the recorded environ block address. */
+    fn environ(): uptr { environ_slot() to uptr }
+
+    /** set_environ — record the environ block address. */
+    fn set_environ(a: uptr) { set_environ_slot(a to u64) }
+
+    /** fd_stage — the recorded fd-staging block address. */
+    fn fd_stage(): uptr { fd_stage_slot() to uptr }
+
+    /** set_fd_stage — record the fd-staging block address. */
+    fn set_fd_stage(a: uptr) { set_fd_stage_slot(a to u64) }
+
+    /** intern_table — the string-interning bucket-table address. */
+    fn intern_table(): uptr { intern_table_slot() to uptr }
+
+    /** set_intern_table — record the string-interning bucket-table address. */
+    fn set_intern_table(a: uptr) { set_intern_table_slot(a to u64) }
+
+    /** intern_region — the region handle backing the interning table. */
+    fn intern_region(): uptr { intern_region_slot() to uptr }
+
+    /** set_intern_region — record the region handle backing the interning table. */
+    fn set_intern_region(a: uptr) { set_intern_region_slot(a to u64) }
+
+    /** names_state — the name-registry state block address. */
+    fn names_state(): uptr { names_state_slot() to uptr }
+
+    /** set_names_state — record the name-registry state block address. */
+    fn set_names_state(a: uptr) { set_names_state_slot(a to u64) }
+}
+
+/** Region — a per-scope / per-object allocator handle addressing a 64-byte region-control block. */
+exp type Region = struct {
+    /** The address of this region's control block in the arena's meta memory. */
+    addr: uptr
+
+    /** Region::at — wrap a raw region-control address as a handle. */
+    static fn at(addr: uptr): Region { Region { addr = addr } }
+
+    /** alloc — reserve `n` bytes from this region. */
+    fn alloc(n: usize): ptr { region_alloc(region_to_ptr(self.addr), n) }
+
+    /** child — open a fresh child region under this one. */
+    fn child(): Region { region_of_ptr(region_new(region_to_ptr(self.addr))) }
+
+    /** child_sized — open a child pre-seeded with a `floor`-byte first chunk. */
+    fn child_sized(floor: usize): Region {
+        region_of_ptr(region_new_sized(region_to_ptr(self.addr), floor))
+    }
+
+    /** drop — release this region and its storage. */
+    fn drop() { region_drop(region_to_ptr(self.addr)) }
+
+    /** drop_subtree — release this region together with all its descendants. */
+    fn drop_subtree() { region_drop_subtree(region_to_ptr(self.addr)) }
+
+    /** register — bind `inst` under `tid` in this region's registry. */
+    fn register(tid: u64, inst: ptr) { region_register(region_to_ptr(self.addr), tid, inst) }
+
+    /** lookup — resolve the instance bound to `tid`, walking up to the root. */
+    fn lookup(tid: u64): ptr { region_lookup(region_to_ptr(self.addr), tid) }
+
+    /** parent — this region's enclosing region. */
+    fn parent(): Region { region_of_word(ar_region_get(self.addr to u64, REGION_PARENT)) }
+
+    /** root — the root region of this region's tree. */
+    fn root(): Region { region_of_word(ar_region_get(self.addr to u64, REGION_ROOT)) }
+
+    /** control — the arena control block owning this region. */
+    fn control(): Arena { arena_of_ptr(region_control(region_to_ptr(self.addr))) }
+
+    /** free_block — return `n` bytes at `addr` to the arena's free list. */
+    fn free_block(addr: ptr, n: usize) {
+        var w = teko::sys::ptr_word(addr) to u64
+        if w == 0 { return }
+        ar_free_block(ar_control(), w, n to u64)
+    }
+}

@@ -1,0 +1,294 @@
+// teko_ternary.tk -- the ternary operator `c ? a : b` (D228, entrega 5): C#'s
+// own spelling, associative to the right, one precedence step below `||`.
+//
+// The core has no control flow in expression position -- `parse_expr` builds
+// only the fifteen binary rows of mc docs/reference/language.md's own table,
+// never an `if` -- so `tk_tern_infix` (`syntax_infix("?", TK_TERN_PREC, ...)`)
+// can only build a PLACEHOLDER: a call to `tk_ternary`, a name nothing
+// declares, the very trick teko_typeof.tk's own `tk_defer_member` already
+// plays for a `.` the parser cannot resolve yet. If the pass below were never
+// registered the core's own resolver would refuse the call outright ("call to
+// unknown function"), never silently miscompile -- the same safety net
+// `tk_defer_member`'s header explains.
+//
+// `TK_TERN_PREC` is 1, tied with `||` and not below it: `syntax_infix`
+// refuses a precedence outside 1..100 (mc docs/reference/hooks.md §
+// syntax_infix), and 1 is already the table's lowest row. Tying the two
+// still parses `a || b ? c : d` as `(a || b) ? c : d` -- the Pratt loop
+// finishes combining every `||` at the outer call's own precedence floor
+// before it ever offers `?` a `left` -- and reading `b` with
+// `parse_expr(TK_TERN_PREC)` (the SAME floor, not one above it) is what makes
+// the operator right-associative: a `?` appearing while `b` is being read is
+// offered to THIS floor too, so `c1 ? a : c2 ? b : d` reads as `c1 ? a : (c2
+// ? b : d)`.
+//
+// WHY THIS PASS RUNS RIGHT AFTER teko_typeof.tk, not right after teko_ns.tk
+// as the crumb's own first guess. `tk_ty_of`, the oracle `tk_tern_lower`
+// leans on to type an arm, answers a `.` on a receiver the parser could not
+// type (a parameter, a field of unknown static type) only once
+// teko_typeof.tk's own pass has rewritten the deferred placeholder into the
+// field load / call it stands for -- ahead of that the placeholder is a call
+// to a name nothing declares, and `tk_ty_of` reports -1 for it, same as it
+// would for a ternary read too early. teko_rc.tk runs LAST for the identical
+// reason ("after teko_typeof.tk has resolved every deferred access and every
+// node has its type", that file's own header). So this file runs BEHIND the
+// oracle and AHEAD of every pass that only has to see ordinary `if`s and
+// ordinary locals -- teko_ops.tk, teko_default.tk, teko_over.tk, teko_rc.tk
+// -- none of the four has to learn what a ternary was.
+//
+// LAZY ARMS. `c ? a : b` runs exactly one of `a`/`b`, so `tk_tern_lower`
+// hoists each into the BRANCH that reads it, never into the statement's own
+// preamble. A ternary nested inside an arm -- `c1 ? a : c2 ? b : d`, which
+// the right-associative read above turns into `tk_ternary(c1, a,
+// tk_ternary(c2, b, d))`, the same shape a literally nested arm
+// `c ? (x ? y : z) : w` already has -- is lowered from the inside out
+// (`tk_tern_scan`'s own recursion visits `a`/`b` before it visits `n`
+// itself), but the INNER `if` always lands inside the OUTER's own branch:
+// laziness survives nesting. Only the CONDITION is hoisted unconditionally,
+// into the SAME list the ternary itself joins -- it runs whichever branch is
+// taken, so hoisting it there costs nothing.
+//
+// A ternary in the condition of a `while`/`for` (teko_loop.tk's own
+// `if (!(c)) break;`, inside the loop's body block) is hoisted into that
+// SAME body block, ahead of the guard -- which is what makes it run again
+// every iteration, the same way any other read of a loop-carried local would.
+// A ternary in a `return`/`if` written without braces is hoisted by wrapping
+// the lone statement into a block of its own (`tk_tern_branch`), exactly the
+// fencing teko_rc.tk's own `tk_rc_branch` already does for a parked
+// temporary.
+//
+// A program that never writes `?` leaves before a single node is read
+// (`tk_ntern == 0`, incremented only by the parser reading one) -- the same
+// no-op proof every other pass here carries.
+
+#define TK_TERN_PREC 1
+
+i64 tk_ntern = 0;
+
+// `c ? a : b`, `left` already parsed and consumed by the Pratt loop: this
+// handler owns everything from `a` onward, `:` included -- the placeholder it
+// returns is unpacked by `tk_ternary_pass`, never by the core.
+i64 tk_tern_infix(i64 c) {
+    i64 line = p_line();
+    uptr fl = p_file();
+    i64 a = parse_expr(0);
+    p_expect(K_COLON, "expected ':' in a ternary");
+    i64 b = parse_expr(TK_TERN_PREC);
+    tk_line = line;
+    tk_file = fl;
+    i64 n = tk_call("tk_ternary", list_append(list_append(c, a), b));
+    tk_ntern = tk_ntern + 1;
+    return n;
+}
+
+i64 tk_tern_assign(uptr name, i64 val) {
+    i64 n = tk_nd(N_ASSIGN);
+    set_nd_name(n, name);
+    set_nd_a(n, val);
+    return n;
+}
+
+// a shallow copy of `n`, the same one teko_rc.tk's `tk_rc_detach` takes: what
+// `n` held keeps its own children and its place in the tree while `n`'s own
+// slot is overwritten in place
+i64 tk_tern_detach(i64 n) {
+    i64 c = node_new(nd_kind(n), nd_line(n), nd_file(n));
+    set_nd_op(c, nd_op(n));
+    set_nd_type(c, nd_type(n));
+    set_nd_val(c, nd_val(n));
+    set_nd_name(c, nd_name(n));
+    set_nd_a(c, nd_a(n));
+    set_nd_b(c, nd_b(n));
+    set_nd_c(c, nd_c(n));
+    set_nd_d(c, nd_d(n));
+    return c;
+}
+
+void tk_tern_at(i64 n) {
+    tk_line = nd_line(n);
+    tk_file = nd_file(n);
+}
+
+void tk_tern_scan(i64 n, uptr dst);
+void tk_tern_hoist_var(i64 n, uptr dst);
+void tk_tern_stmt(i64 n, uptr pre);
+i64  tk_tern_stmts(i64 head);
+void tk_tern_branch(i64 n);
+
+// lowers ONE `tk_ternary(c, a, b)` placeholder: `c` joins `*out` (the same
+// list the ternary's own `if` joins -- it runs unconditionally, alongside the
+// `if` it drives), and `a`/`b` are each reduced first, into their OWN branch,
+// so a ternary nested in either stays lazy. The oracle then types the
+// (already-reduced) arms -- a nested one has, by now, become a plain
+// reference to ITS own temporary, already in scope (`tk_ty_scope_add`, right
+// below) for exactly this reason.
+void tk_tern_lower(i64 n, uptr dst) {
+    i64 c = nd_a(n);
+    i64 a = nd_next(c);
+    i64 b = nd_next(a);
+    set_nd_next(c, 0);
+    set_nd_next(a, 0);
+    set_nd_next(b, 0);
+    tk_tern_scan(c, dst);
+
+    i64 thenOut = 0;
+    tk_tern_scan(a, &thenOut);
+    i64 elseOut = 0;
+    tk_tern_scan(b, &elseOut);
+
+    i64 ty = tk_ty_of(a);
+    tk_tern_at(n);
+    if (ty < 0 || ty != tk_ty_of(b))
+        err_at(tk_file, tk_line, "teko: the two arms of ?: have different types");
+
+    uptr t = gensym_new();
+    tk_ty_scope_add(t, ty);
+    thenOut = list_append(thenOut, tk_tern_assign(t, a));
+    elseOut = list_append(elseOut, tk_tern_assign(t, b));
+
+    i64 ifn = tk_if(c, tk_blk(thenOut));
+    set_nd_c(ifn, tk_blk(elseOut));
+
+    // D226 compat crumb: the placeholder never survives to be read (both
+    // branches of `ifn` overwrite it before anything else touches `t`), but
+    // a teko-typed one is `null` rather than a plain `0` -- the one shape the
+    // assignment-compatibility check already knows fits any such slot.
+    i64 init = tk_int(0);
+    if (tk_struct_by_ty(ty) >= 0) init = tk_null();
+    st64(dst, list_append(ld64(dst), tk_var(ty, t, init)));
+    st64(dst, list_append(ld64(dst), ifn));
+
+    i64 keep = nd_next(n);
+    node_assign(n, tk_id(t));
+    set_nd_next(n, keep);
+}
+
+// walks one expression -- and its own sibling list, which is what an
+// N_CALL's argument list already is -- for a `tk_ternary` placeholder
+// anywhere inside it, lowering each one found into `*out`. Never asked to
+// walk a statement list: a block never sits inside an expression's own
+// children in this grammar, so no statement-position node is skipped by not
+// special-casing one here.
+void tk_tern_scan(i64 n, uptr dst) {
+    loop {
+        if (n == 0) break;
+        if (nd_kind(n) == N_CALL && str_eq(nd_name(n), "tk_ternary")) {
+            tk_tern_lower(n, dst);
+        } else if (nd_kind(n) == N_VAR) {
+            tk_tern_hoist_var(n, dst);
+        } else {
+            tk_tern_scan(nd_a(n), dst);
+            tk_tern_scan(nd_b(n), dst);
+            tk_tern_scan(nd_c(n), dst);
+            tk_tern_scan(nd_d(n), dst);
+        }
+        n = nd_next(n);
+    }
+}
+
+// a real `N_VAR` node another module (teko_switch.tk's own operand hoist,
+// D222) embeds mid-expression as a placeholder: an `N_VAR` never legitimately
+// sits inside an expression on its own, so finding one here always means a
+// value has to be read exactly once before the ternary chain around it
+// starts testing conditions. Hoisted into `*out` -- unconditionally, same as
+// a ternary's own `c` -- and the node itself is overwritten in place by a
+// bare read of the name it declares, `tk_tern_lower`'s own "build fresh,
+// rewrite the original in place" shape.
+void tk_tern_hoist_var(i64 n, uptr dst) {
+    uptr nm = nd_name(n);
+    i64 ty = nd_type(n);
+    i64 init = nd_a(n);
+    tk_tern_scan(init, dst);
+    tk_ty_scope_add(nm, ty);
+    tk_tern_at(n);
+    st64(dst, list_append(ld64(dst), tk_var(ty, nm, init)));
+    i64 keep = nd_next(n);
+    node_assign(n, tk_id(nm));
+    set_nd_next(n, keep);
+}
+
+// the single statement an `if`/`loop` may carry instead of a block: fenced
+// into a block of its own, and only when it really held a ternary --
+// teko_rc.tk's `tk_rc_branch` fences a parked temporary the same way
+void tk_tern_branch(i64 n) {
+    if (n == 0) return;
+    if (nd_kind(n) == N_BLOCK) {
+        tk_tern_stmt(n, 0);
+        return;
+    }
+    i64 pre = 0;
+    tk_tern_stmt(n, &pre);
+    if (pre == 0) return;
+    i64 keep = nd_next(n);
+    i64 body = tk_tern_detach(n);
+    tk_tern_at(n);
+    node_assign(n, tk_blk(list_append(pre, body)));
+    set_nd_next(n, keep);
+}
+
+// one statement: `pre` is the enclosing block's own accumulator, and every
+// arm of every control-flow node below feeds either `pre` (a condition, which
+// always runs) or a branch of its own (teko_rc.tk's `tk_rc_stmt` is the same
+// shape, one arm per node kind it rewrites)
+void tk_tern_stmt(i64 n, uptr pre) {
+    if (n == 0) return;
+    i64 k = nd_kind(n);
+    if (k == N_BLOCK) {
+        i64 mark = tk_nscope;
+        set_nd_a(n, tk_tern_stmts(nd_a(n)));
+        tk_nscope = mark;
+        return;
+    }
+    if (k == N_LOOP) { tk_tern_branch(nd_a(n)); return; }
+    if (k == N_IF) {
+        tk_tern_scan(nd_a(n), pre);
+        tk_tern_branch(nd_b(n));
+        tk_tern_branch(nd_c(n));
+        return;
+    }
+    if (k == N_RETURN)   { tk_tern_scan(nd_a(n), pre); return; }
+    if (k == N_VAR)      { tk_tern_scan(nd_a(n), pre); tk_ty_scope_var(n); return; }
+    if (k == N_ASSIGN)   { tk_tern_scan(nd_a(n), pre); return; }
+    if (k == N_EXPRSTMT) { tk_tern_scan(nd_a(n), pre); return; }
+    if (k == N_BREAK)    return;
+    if (k == N_CONTINUE) return;
+    tk_tern_scan(n, pre);
+}
+
+// the statements of one block, rebuilt in order: a statement whose own
+// expression held a ternary comes back preceded by the local it hoisted
+i64 tk_tern_stmts(i64 head) {
+    i64 dst = 0;
+    i64 n = head;
+    loop {
+        if (n == 0) break;
+        i64 nx = nd_next(n);
+        set_nd_next(n, 0);
+        i64 pre = 0;
+        tk_tern_stmt(n, &pre);
+        if (pre != 0) dst = list_append(dst, pre);
+        dst = list_append(dst, n);
+        n = nx;
+    }
+    return dst;
+}
+
+void tk_tern_fn(i64 f) {
+    tk_nscope = 0;
+    tk_ty_scope_params(nd_a(f));
+    tk_tern_stmt(nd_b(f), 0);
+    tk_nscope = 0;
+}
+
+// a unit that never writes `?` leaves untouched -- `tk_ntern` counts what the
+// parser built, and nothing here runs without at least one
+i64 tk_ternary_pass(i64 root) {
+    if (tk_ntern == 0) return root;
+    i64 f = root;
+    loop {
+        if (f == 0) break;
+        if (nd_kind(f) == N_FUNC) tk_tern_fn(f);
+        f = nd_next(f);
+    }
+    return root;
+}

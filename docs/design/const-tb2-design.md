@@ -1,3 +1,5 @@
+> **[HISTÓRICO]** — documenta o crumb T-B2 da onda const (Tier-B), já executado. Não descreve o estado atual do projeto.
+
 # T-B2 — writer ELF emite `.rela.rodata` (#594 Tier-B)
 
 Status: READY-TO-IMPLEMENT (architect, 2026-07-18). Track: Tier-B pointer-bearing
@@ -11,7 +13,7 @@ honest-stop `honest_data_reloc` em `encode_rodata`). Predecessor:
 > the section set at `objfile_elf.tks:455`) + its relas." Este crumb dá ao writer ELF
 > a CAPACIDADE de emitir `.rela.rodata`; **nenhum produtor a exercita ainda** — o
 > honest-stop de T-B1 em `encode_rodata` permanece e só abre em T-B5 (quando a cadeia
-> encoder→writer→VM estiver completa). Como hoje `rodata_relocs` chega sempre vazia
+> encoder→writer→motor legado estiver completa). Como hoje `rodata_relocs` chega sempre vazia
 > aos writers, o objeto é **byte-idêntico** e todos os goldens/fixpoint ficam intactos.
 
 ---
@@ -27,12 +29,12 @@ mão; o honest-stop de `encode_rodata` **FICA**. A opção (b) — descer o fio 
 1. **Smallest safe step + independência de crumb (Lei "issues são 100%", gate-abilidade
    por passo).** A proposta de T-B2 é exatamente "o writer ELF emite `.rela.rodata`".
    A opção (b) removeria o único choke point (`encode_rodata`) que protege os writers
-   AINDA-INCOMPLETOS. Mach-O/COFF (T-B3), wasm (T-B4) e a VM (T-B5) não sabem resolver
+   AINDA-INCOMPLETOS. Mach-O/COFF (T-B3), wasm (T-B4) e o motor legado (T-B5) não sabem resolver
    um ponteiro rodata-interno. Se o honest-stop descesse para "o writer não-ELF" em
-   T-B2, um módulo Tier-B compilado para Mach-O/COFF/wasm/VM passaria a depender de
+   T-B2, um módulo Tier-B compilado para Mach-O/COFF/wasm/motor legado passaria a depender de
    guardas espalhadas em quatro lugares diferentes, em vez de um só — e um esquecimento
    emitiria **bytes errados silenciosamente**. O honest-stop em `encode_rodata` é o
-   ponto mais estreito e deve permanecer até o ÚLTIMO writer/VM (T-B5). Isto é
+   ponto mais estreito e deve permanecer até o ÚLTIMO writer/motor legado (T-B5). Isto é
    exatamente o que a decisão §2.5 do doc T-B1 já ratificou ("T-B1's honest-stop lives
    at `encode_rodata` … The writer `sect` handling is introduced by the crumb that
    actually emits it") e o que este brief antecipou ("o honest-stop FICA, abre em
@@ -213,7 +215,7 @@ os bytes de `.shstrtab` — e todos os offsets subsequentes — ficam idênticos
  * @param has_rodata_relocs  se há ao menos uma relocation cujo patch site é `.rodata`
  * @return  os nomes das seções, em ordem de header (7 ou 8)
  */
-fn elf_section_names(has_rodata_relocs: bool) -> []str {
+fn elf_section_names(has_rodata_relocs: bool): []str {
     let base = ["", ".text", ".rodata", ".symtab", ".strtab", ".shstrtab", ".rela.text"]
     if has_rodata_relocs { return teko::list::push(base, ".rela.rodata") }
     base
@@ -226,7 +228,7 @@ fn elf_section_names(has_rodata_relocs: bool) -> []str {
 segue `5` (`.shstrtab` não muda de índice). Assinatura:
 
 ```teko
-fn emit_elf_header(buf: []byte, lay: ElfLayout, e_machine: u32, e_flags: u32, nsects: u32) -> []byte
+fn emit_elf_header(buf: []byte, lay: ElfLayout, e_machine: u32, e_flags: u32, nsects: u32): []byte
 ```
 
 Corpo: trocar `b = emit_u16_le_elf(b, 7 to u32)` por `b = emit_u16_le_elf(b, nsects)`.
@@ -236,7 +238,7 @@ Callsite `emit_elf_object` (`:964`) passa `lay.nsects`. Byte-inerte quando
 ### 2.5 `compute_elf_layout` computa `.rela.rodata` (`objfile_elf.tks:624`)
 
 ```teko
-fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, nrela_rodata: u32, strtab_len: u32, shstrtab_len: u32, first_global: u32, nsects: u32) -> ElfLayout
+fn compute_elf_layout(obj: ElfObject, nsyms: u32, nrela: u32, nrela_rodata: u32, strtab_len: u32, shstrtab_len: u32, first_global: u32, nsects: u32): ElfLayout
 ```
 
 Corpo (após `rela_size`, antes de `shoff`):
@@ -275,7 +277,7 @@ preservação de comportamento):
  * @param secidx   o índice do símbolo de seção `.rodata`
  * @return         a linha `Elf64_Rela` resolvida
  */
-fn elf_resolve_rela(r: ElfRelocReq, symbols: []Symbol, syms: []ElfSym, secidx: u32) -> ElfRela {
+fn elf_resolve_rela(r: ElfRelocReq, symbols: []Symbol, syms: []ElfSym, secidx: u32): ElfRela {
     let hit = elf_rodata_hit(symbols, r.sym)
     let symidx = if hit.found { secidx } else { elf_symbol_index(syms, r.sym) }
     let addend = if hit.found { r.addend + (hit.offset to i64) } else { r.addend }
@@ -294,7 +296,7 @@ fn elf_resolve_rela(r: ElfRelocReq, symbols: []Symbol, syms: []ElfSym, secidx: u
  * @param syms  a tabela de símbolos resolvida (para os índices)
  * @return      as linhas de relocation de `.rela.rodata`, em ordem de emissão
  */
-fn elf_build_rodata_relas(obj: ElfObject, syms: []ElfSym) -> []ElfRela {
+fn elf_build_rodata_relas(obj: ElfObject, syms: []ElfSym): []ElfRela {
     let secidx = elf_rodata_secsym_index(syms)
     mut out: []ElfRela = teko::list::empty()
     mut i: u64 = 0
@@ -336,7 +338,7 @@ passa a `b = emit_elf_shdr(...)` seguida do bloco condicional e de `b` como valo
 ### 2.8 `emit_elf_object` costura tudo (`objfile_elf.tks:956`)
 
 ```teko
-pub fn emit_elf_object(obj: ElfObject) -> []byte {
+pub fn emit_elf_object(obj: ElfObject): []byte {
     let has_rr = obj.rodata_relocs.len > (0 to u64)
     let syms = elf_build_symbols(obj.symbols)
     let strtab = build_elf_strtab(elf_sym_names(syms))
@@ -402,7 +404,7 @@ Todas em `objfile_elf_test.tkt` (x86) com espelho em testes paralelos de outros 
 (outros backends), construindo `ElfObject` À MÃO e chamando o `pub fn emit_elf_object`
 diretamente — o padrão-precedente de `el_abs64_module`/`el_rodata_off_module`, agora um
 nível abaixo (no writer neutro) porque o eixo rodata vive em `ElfObject`, não em
-`EncodedModuleX86`. Rodam idênticas na VM e no harness nativo (mesma saída de bytes).
+`EncodedModuleX86`. Rodam idênticas no motor legado e no harness nativo (mesma saída de bytes).
 
 ### 4.1 (i) `ElfObject` com 1 rodata-reloc → bytes de `.rela.rodata` (novo comportamento)
 
@@ -411,7 +413,7 @@ zero, offset 0) + datum-alvo (`0x41` + 7 zeros, offset 8); um `rodata_reloc` no 
 apontando para o alvo em offset 8.
 
 ```teko
-fn eo_rodata_ptr_object() -> ElfObject {
+fn eo_rodata_ptr_object(): ElfObject {
     let rodata = [0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0x41 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte, 0 to byte]
     let ptr = Symbol { name = "ptr"; defined = true; sect = 2 to u8; offset = 0 to u32; local = true }
     let target = Symbol { name = "target"; defined = true; sect = 2 to u8; offset = 8 to u32; local = true }
@@ -498,7 +500,7 @@ o arquivo compila a cada passo.
 | E7 | `src/backend/objfile_elf.tks` | `emit_elf_shdrs` 8º header condicional (§2.7); `emit_elf_object` costura (§2.8) | **todos** os goldens ELF de múltiplos backends byte-idênticos (`has_rr=false`) |
 | E8 | `objfile_elf_test.tkt` + testes paralelos de outros backends | fixtures §4 | os próprios testes novos (verde) |
 
-> Writers Mach-O/COFF/wasm e a VM **NÃO são tocados** em T-B2 (são T-B3/T-B4/T-B5). O
+> Writers Mach-O/COFF/wasm e o motor legado **NÃO são tocados** em T-B2 (são T-B3/T-B4/T-B5). O
 > honest-stop `encode_rodata` de T-B1 **permanece** — não editar `encode_*.tks`.
 
 **Ritual points:**
@@ -507,8 +509,8 @@ o arquivo compila a cada passo.
 - **RITUAL POINT — fim de T-B2:** gate COMPLETO — todos os goldens de backend
   byte-idênticos (`objfile_elf_test.tkt`, testes paralelos de outros backends,
   `objfile_coff_test.tkt`, `objfile_macho_test.tkt`, `encode_*_test.tkt`,
-  `lower_test.tkt`, `lir_interp_test.tkt`, `tkb_test.tkt`) + **fixpoint gen1==gen2** +
-  ambas as engines (VM + nativo) + 100% de cobertura do delta (as fixtures §4 cobrem o
+  `lower_test.tkt`, `lir_oracle_test.tkt`, `tkb_test.tkt`) + **fixpoint gen1==gen2** +
+  ambas as engines (motor legado + nativo) + 100% de cobertura do delta (as fixtures §4 cobrem o
   braço `has_rr=true`; os goldens cobrem `has_rr=false`; §4.4 cobre os dois braços de
   `elf_resolve_rela`). **Sem seed bump** — T-B2 não adiciona capacidade que o corpus
   use (o 🔑 SEED BUMP #3 é depois de T-B5, plano §8).

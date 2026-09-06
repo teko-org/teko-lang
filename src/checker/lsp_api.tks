@@ -1,0 +1,46 @@
+use teko::parser
+
+fn lsp_no_progress(done: u64, total: u64) { }
+
+pub fn collect_diagnostics(program: parser::Program): []str {
+    var empty_dep = TProgram { items = [] }
+    match type_program_with_deps_pre_mono(program, empty_dep, lsp_no_progress, false) {
+        PreMono as pre => concat_diags(pre.diags, collect_warnings(pre.prog))
+        error as e => [e.message]
+    }
+}
+
+fn contains_file(files: []str, f: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        if files[i] == f { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn program_files(program: parser::Program): []str {
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= program.items.len { break }
+        var f = program.items[i].file
+        if f != "" && !contains_file(out, f) { out = [..out, f] }
+        i = i + 1
+    }
+    out
+}
+
+pub fn collect_diagnostics_structured(program: parser::Program): []Diagnostic {
+    var files = program_files(program)
+    var empty_dep = TProgram { items = [] }
+    match type_program_with_deps_pre_mono(program, empty_dep, lsp_no_progress, false) {
+        PreMono as pre => {
+            var errs = structure_diags(pre.diags, files, DiagLevel::Error)
+            var warns = structure_diags(collect_warnings(pre.prog), files, DiagLevel::Warning)
+            concat_structured_diags(errs, warns)
+        }
+        error as e => [to_diagnostic(e.message, files, DiagLevel::Error)]
+    }
+}

@@ -1,0 +1,484 @@
+
+extern fn open_seg_rt(path: str): i64 = "tk_journal_open" from "teko_rt"
+
+extern fn append_seg_rt(rec: str, seg: i64): i32 = "tk_journal_append" from "teko_rt"
+
+extern fn arm_note_rt(prefix: str) = "tk_journal_arm" from "teko_rt"
+
+extern fn rename_rt(from: str, to: str): i32 = "tk_rt_rename" from "teko_rt"
+
+extern fn pid_rt(): i64 = "tk_rt_pid" from "teko_rt"
+
+extern fn pid_alive_rt(pid: i64): bool = "tk_rt_pid_alive" from "teko_rt"
+
+extern fn note_write_rt(sig: i32) = "tk_journal_note" from "teko_rt"
+
+const BAD_DESCRIPTOR: i64 = -1
+
+const FIELD_SEP: str = "\t"
+
+pub const RUN_ENV: str = "TEKO_RUN"
+
+pub const TKRUN_DIR: str = "bin/.tkrun"
+
+const LOCK_NAME: str = ".lock"
+
+pub const KIND_BEGIN: str = "begin"
+
+pub const KIND_PLAN: str = "plan"
+
+pub const KIND_OK: str = "ok"
+
+pub const KIND_FAIL: str = "fail"
+
+pub const KIND_SKIP: str = "skip"
+
+pub const KIND_END: str = "end"
+
+pub const KIND_STOP: str = "stop"
+
+pub const KIND_INCOMPLETE: str = "incomplete"
+
+pub const KIND_COV: str = "cov"
+
+pub type Journal = struct {
+        run: str
+        writer: str
+        seg: i64
+}
+
+pub type Record = struct {
+        run: str
+        writer: str
+        kind: str
+        payload: str
+}
+
+pub fn run_id(): str {
+    match teko::env::var(RUN_ENV) {
+        str as v => { if v.len > 0 { return v } }
+        error => { }
+    }
+    var id = teko::str::concat(teko::str::i64_to_str(teko::time::monotonic_ns()), "-", teko::str::i64_to_str(pid_rt()))
+    match teko::env::set_var(RUN_ENV, id) { error => { }; null => { } }
+    id
+}
+
+fn run_id_is_fresh(): bool {
+    match teko::env::var(RUN_ENV) {
+        str as v => v.len == 0
+        error => true
+    }
+}
+
+pub fn run_root(): str { teko::str::concat(TKRUN_DIR, "/", run_id()) }
+
+fn lock_path(root: str): str { teko::str::concat(root, "/", LOCK_NAME) }
+
+fn seg_path(root: str, writer: str): str { teko::str::concat(root, "/", writer) }
+
+fn mkdir_p(dir: str): error | null {
+    var i: u64 = 0
+    loop {
+        if i >= dir.len { break }
+        if dir[i] == b'/' && i > 0 {
+            match teko::fs::mkdir(dir.slice_to(i)) { error as e => return e; null => { } }
+        }
+        i = i + 1
+    }
+    teko::fs::mkdir(dir)
+}
+
+fn claim_root(root: str, fresh: bool): str | error {
+    if fresh && root_is_live(root) {
+        return error { message = teko::str::concat("teko::journal: run root already in use by a live process (", root, ")") }
+    }
+    match mkdir_p(root) { error => { }; null => { } }
+    record_self_pid(root)
+    root
+}
+
+fn ensure_root(): str | error {
+    var fresh = run_id_is_fresh()
+    claim_root(run_root(), fresh)
+}
+
+fn record_line(run: str, writer: str, kind: str, payload: str): str {
+    teko::str::concat(run, FIELD_SEP, writer, FIELD_SEP, kind, FIELD_SEP, payload)
+}
+
+fn open_seg(path: str, run: str, writer: str): Journal | error {
+    var fd = open_seg_rt(path)
+    if fd == BAD_DESCRIPTOR {
+        return error { message = teko::str::concat("teko::journal: could not open segment ", path) }
+    }
+    arm_note_rt(record_line(run, writer, KIND_STOP, ""))
+    Journal { run = run; writer = writer; seg = fd }
+}
+
+pub fn open(writer: str): Journal | error {
+    var run = run_id()
+    var root = match ensure_root() { str as r => r; error as e => return e }
+    open_seg(seg_path(root, writer), run, writer)
+}
+
+pub fn append(j: Journal, kind: str, payload: str): null | error {
+    var rec = teko::str::concat(record_line(j.run, j.writer, kind, payload), "\n")
+    if append_seg_rt(rec, j.seg) != 0 {
+        return error { message = teko::str::concat("teko::journal::append: write failed on writer ", j.writer) }
+    }
+    null
+}
+
+pub fn note(sig: i32) { note_write_rt(sig) }
+
+pub fn rename(from: str, to: str): null | error {
+    if rename_rt(from, to) != 0 {
+        return error { message = teko::str::concat("teko::journal::rename: could not publish ", from) }
+    }
+    null
+}
+
+pub fn append_raw(path: str, line: str): null | error {
+    var fd = open_seg_rt(path)
+    if fd == BAD_DESCRIPTOR {
+        return error { message = teko::str::concat("teko::journal::append_raw: could not open ", path) }
+    }
+    var rc = append_seg_rt(teko::str::concat(line, "\n"), fd)
+    _ = close_fd_rt(fd)
+    if rc != 0 {
+        return error { message = teko::str::concat("teko::journal::append_raw: write failed on ", path) }
+    }
+    null
+}
+
+fn writer_dir(scope: str): str {
+    if scope.len > 0 && scope[0] == b'.' { return scope.slice_from(1) }
+    scope
+}
+
+fn dir_of(path: str): str {
+    var i: u64 = path.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        if path[i] == b'/' { return path.slice_to(i) }
+    }
+    ""
+}
+
+pub fn scratch(dir: str): str {
+    var scope = teko::test::scope()
+    if scope.len == 0 { return dir }
+    var composed = teko::str::concat(run_root(), "/", writer_dir(scope), "/", dir)
+    var parent = dir_of(composed)
+    if parent.len > 0 { match mkdir_p(parent) { error => { }; null => { } } }
+    composed
+}
+
+fn is_terminal_kind(kind: str): bool {
+    if kind == KIND_END { return true }
+    if kind == KIND_STOP { return true }
+    kind == KIND_INCOMPLETE
+}
+
+fn parse_record(want_run: str, line: str): Record | null {
+    var i: u64 = 0
+    var t1: u64 = 0
+    var t2: u64 = 0
+    var t3: u64 = 0
+    var n: u64 = 0
+    loop {
+        if i >= line.len { break }
+        if line[i] == b'\t' {
+            n = n + 1
+            if n == 1 { t1 = i }
+            if n == 2 { t2 = i }
+            if n == 3 { t3 = i; break }
+        }
+        i = i + 1
+    }
+    if n < 3 { return null }
+    var run = line.slice_to(t1)
+    if run != want_run { return null }
+    Record {
+        run = run
+        writer = line.slice(t1 + 1, t2)
+        kind = line.slice(t2 + 1, t3)
+        payload = line.slice_from(t3 + 1)
+    }
+}
+
+fn is_dir(path: str): bool {
+    match teko::fs::list_dir(path) { []str => true; error => false }
+}
+
+fn fold_segment(acc: []Record, root: str, name: str, run: str): []Record {
+    if name == LOCK_NAME { return acc }
+    var path = teko::str::concat(root, "/", name)
+    if is_dir(path) { return acc }
+    var content = match teko::io::read_file(path) { str as s => s; error => return acc }
+    var out: []Record = acc
+    var writer: str = ""
+    var last_begin: str = ""
+    var saw_terminal: bool = false
+    var saw_any: bool = false
+    var start: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= content.len { break }
+        if content[i] == b'\n' {
+            match parse_record(run, content.slice(start, i)) {
+                Record as r => {
+                    out = [..out, r]
+                    writer = r.writer
+                    saw_any = true
+                    if r.kind == KIND_BEGIN { last_begin = r.payload }
+                    if is_terminal_kind(r.kind) { saw_terminal = true }
+                }
+                null => { }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if saw_any && !saw_terminal {
+        out = [..out, Record { run = run; writer = writer; kind = KIND_INCOMPLETE; payload = last_begin }]
+    }
+    out
+}
+
+fn str_less(a: str, b: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= a.len { return b.len > a.len }
+        if i >= b.len { return false }
+        if a[i] < b[i] { return true }
+        if a[i] > b[i] { return false }
+        i = i + 1
+    }
+}
+
+fn remove_at(xs: []str, idx: u64): []str {
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if i != idx { out = [..out, xs[i]] }
+        i = i + 1
+    }
+    out
+}
+
+fn sort_names(names: []str): []str {
+    var remaining: []str = names
+    var ordered: []str = []
+    loop {
+        if remaining.len == 0 { break }
+        var min_idx: u64 = 0
+        var j: u64 = 1
+        loop {
+            if j >= remaining.len { break }
+            if str_less(remaining[j], remaining[min_idx]) { min_idx = j }
+            j = j + 1
+        }
+        ordered = [..ordered, remaining[min_idx]]
+        remaining = remove_at(remaining, min_idx)
+    }
+    ordered
+}
+
+pub fn fold(root: str, run: str): []Record {
+    var entries = match teko::fs::list_dir(root) { []str as e => e; error => [] }
+    var names = sort_names(entries)
+    var out: []Record = []
+    var i: u64 = 0
+    loop {
+        if i >= names.len { break }
+        out = fold_segment(out, root, names[i], run)
+        i = i + 1
+    }
+    out
+}
+
+fn last_segment(path: str): str {
+    var i: u64 = path.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        if path[i] == b'/' { return path.slice_from(i + 1) }
+    }
+    path
+}
+
+fn parse_pid(line: str): i64 {
+    var v: i64 = 0
+    var i: u64 = 0
+    var seen: bool = false
+    loop {
+        if i >= line.len { break }
+        var c = line[i]
+        if c >= b'0' && c <= b'9' {
+            v = (v * 10) + ((c to i64) - (b'0' to i64))
+            seen = true
+        }
+        if seen && (c < b'0' || c > b'9') { break }
+        i = i + 1
+    }
+    v
+}
+
+fn lock_pids(root: str): []i64 {
+    var body = match teko::io::read_file(lock_path(root)) { str as s => s; error => return [] }
+    var out: []i64 = []
+    var start: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= body.len { break }
+        if body[i] == b'\n' {
+            var p = parse_pid(body.slice(start, i))
+            if p > 0 { out = [..out, p] }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < body.len {
+        var p = parse_pid(body.slice_from(start))
+        if p > 0 { out = [..out, p] }
+    }
+    out
+}
+
+fn root_is_live(root: str): bool {
+    var pids = lock_pids(root)
+    var i: u64 = 0
+    loop {
+        if i >= pids.len { break }
+        if pid_alive_rt(pids[i]) { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn pid_in_lock(root: str, pid: i64): bool {
+    var pids = lock_pids(root)
+    var i: u64 = 0
+    loop {
+        if i >= pids.len { break }
+        if pids[i] == pid { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn record_self_pid(root: str) {
+    var pid = pid_rt()
+    if pid_in_lock(root, pid) { return }
+    match teko::io::append_file(lock_path(root), teko::str::concat(teko::str::i64_to_str(pid), "\n")) { error => { }; null => { } }
+}
+
+fn rmtree(path: str): bool {
+    match teko::fs::list_dir(path) {
+        []str as entries => {
+            var ok: bool = true
+            var i: u64 = 0
+            loop {
+                if i >= entries.len { break }
+                if !rmtree(teko::str::concat(path, "/", entries[i])) { ok = false }
+                i = i + 1
+            }
+            if !ok { return false }
+            match teko::fs::remove_file(path) { error => false; null => true }
+        }
+        error => {
+            match teko::fs::remove_file(path) { error => false; null => true }
+        }
+    }
+}
+
+fn sweep_under(dir: str, keep: str): u64 {
+    var keep_id = last_segment(keep)
+    var entries = match teko::fs::list_dir(dir) { []str as e => e; error => [] }
+    var removed: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= entries.len { break }
+        var name = entries[i]
+        var path = teko::str::concat(dir, "/", name)
+        if name != keep_id && !root_is_live(path) {
+            if rmtree(path) { removed = removed + 1 }
+        }
+        i = i + 1
+    }
+    removed
+}
+
+pub fn sweep(keep: str): u64 { sweep_under(TKRUN_DIR, keep) }
+
+extern fn close_fd_rt(fd: i64): i32 = "tk_rt_close_fd" from "teko_rt"
+
+const TEST_SHARD_ENV: str = "TEKO_TEST_SHARD"
+
+fn shard_index_of(v: str): u64 {
+    var i: u64 = 0
+    var n: u64 = 0
+    loop {
+        if i >= v.len { break }
+        if v[i] == b'/' { break }
+        if v[i] < b'0' || v[i] > b'9' { return 0 }
+        n = (n * 10) + ((v[i] to u64) - (b'0' to u64))
+        i = i + 1
+    }
+    n
+}
+
+fn test_writer(): str {
+    match teko::env::var(TEST_SHARD_ENV) {
+        str as v => teko::str::concat("s", teko::str::u64_to_str(shard_index_of(v)))
+        error => "s0"
+    }
+}
+
+fn note_open_append_close(writer: str, kind: str, payload: str) {
+    match open(writer) {
+        Journal as j => {
+            match append(j, kind, payload) { error => { }; null => { } }
+            _ = close_fd_rt(j.seg)
+        }
+        error => { }
+    }
+}
+
+pub fn note_test_begin(label: str) { note_open_append_close(test_writer(), KIND_BEGIN, label) }
+
+pub fn note_test_ok(label: str) { note_open_append_close(test_writer(), KIND_OK, label) }
+
+pub fn note_test_panicked(label: str) {
+    note_open_append_close(test_writer(), KIND_FAIL, fail_payload(label, "panicked"))
+}
+
+fn fail_payload(label: str, reason: str): str { teko::str::concat(label, FIELD_SEP, reason) }
+
+fn exited_reason(code: i32): str { teko::str::concat("exited ", teko::str::i64_to_str(code to i64)) }
+
+pub fn note_test_exited(label: str, code: i32) {
+    note_open_append_close(test_writer(), KIND_FAIL, fail_payload(label, exited_reason(code)))
+}
+
+pub fn note_test_end() { note_open_append_close(test_writer(), KIND_END, "") }
+
+const ROW_WRITER: str = "r0"
+
+pub fn note_row_begin(label: str) { note_open_append_close(ROW_WRITER, KIND_BEGIN, label) }
+
+pub fn note_row_ok(label: str) { note_open_append_close(ROW_WRITER, KIND_OK, label) }
+
+pub fn note_row_fail(label: str, reason: str) {
+    note_open_append_close(ROW_WRITER, KIND_FAIL, fail_payload(label, reason))
+}
+
+pub fn note_row_skip(label: str, reason: str) {
+    note_open_append_close(ROW_WRITER, KIND_SKIP, fail_payload(label, reason))
+}
+
+pub fn note_row_end() { note_open_append_close(ROW_WRITER, KIND_END, "") }

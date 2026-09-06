@@ -169,7 +169,7 @@ pub type PrimKind = enum {
  * @return true iff k is a floating-point prim
  * @since NUMERIC-COMPLETENESS
  */
-fn prim_is_float(k: PrimKind) -> bool {
+fn prim_is_float(k: PrimKind): bool {
     match k { F16 => true; F32 => true; F64 => true; F8E4M3 => true; F8E5M2 => true; _ => false }
 }
 
@@ -182,7 +182,7 @@ fn prim_is_float(k: PrimKind) -> bool {
  * @return true iff k is F8E4M3 or F8E5M2
  * @since NUMERIC-COMPLETENESS
  */
-fn prim_is_f8(k: PrimKind) -> bool {
+fn prim_is_f8(k: PrimKind): bool {
     match k { F8E4M3 => true; F8E5M2 => true; _ => false }
 }
 ```
@@ -209,7 +209,7 @@ compares by `kind`, so `f8e4m3 != f8e5m2 != f16` falls out for free.
  * @return the decoded PrimKind (falls back to Bool on an unknown byte — forward-compat guard)
  * @since NUMERIC-COMPLETENESS
  */
-fn prim_of(b: byte) -> checker::PrimKind {
+fn prim_of(b: byte): checker::PrimKind {
     // … existing 0..12 …
     if b == 13 { return checker::PrimKind::Bool }
     if b == 14 { return checker::PrimKind::F8E4M3 }
@@ -253,13 +253,13 @@ fn prim_of(b: byte) -> checker::PrimKind {
   `:1160`, `:1857`.
 - **Runtime helpers — maintained-C seed (`teko_rt.c`, the allowed exception).** A small
   branch-free family, round-to-nearest-even, format-correct saturation/NaN:
-  `tk_f32_to_f8e4m3(float) -> tk_f8e4m3`, `tk_f8e4m3_to_f32(tk_f8e4m3) -> float`, the e5m2 pair,
+  `tk_f32_to_f8e4m3(float): tk_f8e4m3`, `tk_f8e4m3_to_f32(tk_f8e4m3): float`, the e5m2 pair,
   and `tk_f8e4m3_to_f8e5m2` / reverse. f8 arithmetic in emitted C is `to_f32 → C float op →
   from_f32` (no `tk_f8_add` needed; `%` stays rejected per `:2144`, `/` panics on ÷0 via the f32
   substrate). **Owner note:** these C helpers are the *reference* semantics; §3.7 mirrors them
   pure-Teko for kill-c.
 - **Determinism.** Round-to-nearest-ties-to-even, fixed saturation, single canonical NaN
-  (e4m3) — pinned so VM and native agree byte-for-byte (the round-trip fixtures gate this).
+  (e4m3) — pinned so native implementations agree byte-for-byte (the round-trip fixtures gate this).
 
 ### 3.7 CODEGEN — own-backend (isel) — couples to the `B1-fp` float epic
 
@@ -338,7 +338,7 @@ widening (explicit `to bigint`), matching the language's no-implicit-narrowing p
 **RECOMMEND the digit engine live in pure-Teko stdlib modules** `teko::math::bigint` and
 `teko::math::dec`, operating on `[]u64` limbs via existing slice ops — **not** as new
 `teko_rt.c` intrinsics. Reason (law-first, §6.2): `teko_rt.c` is frozen-except-maintained; the
-own-backend end-state is **no C**. A pure-Teko engine compiles under both backends and **survives
+own-backend end-state is **no C**. A pure-Teko engine compiles under both backends (C and native) and **survives
 kill-c** with zero porting. The compiler-known `bigint`/`dec` names desugar their literals/operators
 to calls into these modules (the same way `str` methods lower to `tk_str_*` today, but here the
 target is Teko, not C). `teko_rt.c` gets **at most** a thin optional fast-path intrinsic later
@@ -430,10 +430,10 @@ per-sub-wave merge gate).
 
 ---
 
-## 8. Regression fixtures (inputs → expected exit code; VM **and** native must agree)
+## 8. Regression fixtures (inputs → expected exit code; native validation required)
 
 > Convention: a program that computes and `exit(n)`s an expected byte; a mismatch/panic path
-> `exit`s a distinct code. Every fixture runs under both the VM/C backend and (where the train
+> `exit`s a distinct code. Every fixture runs on the C backend and (where the train
 > reaches it) the own-backend; the two must agree byte-for-byte.
 
 **f8 round-trip / arithmetic (f8-A, f8-B):**

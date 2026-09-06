@@ -1,0 +1,676 @@
+fn mac_bytes_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+fn xor_with_byte(buf: []byte, pad: u32): []byte {
+    var out: [buf.len]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= buf.len { break }
+        out[i] = ((buf[i] to u32) ^ pad) to byte
+        i++
+    }
+    out
+}
+
+fn hmac_key0(key: []byte, block_size: u64, hash: func<[]byte, []byte>): []byte {
+    var k = if key.len > block_size { hash(key) } else { key }
+    var out: [block_size]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= k.len { break }
+        out[i] = k[i]
+        i++
+    }
+    out
+}
+
+/**
+ * The streaming state of an in-progress HMAC-SHA-256 computation: the inner SHA-256 state
+ * (already primed with `K0 ⊕ ipad` and every message chunk fed so far) and the outer key
+ * block `K0 ⊕ opad` applied once at finalize time.
+ */
+exp type HmacSha256 = struct {
+    /** the inner SHA-256 state, primed with `K0 ⊕ ipad` and advanced by every message chunk */
+    inner: Sha256State
+    /** the outer key block `K0 ⊕ opad`, hashed with the inner digest at finalize time */
+    outer: []byte
+}
+
+/**
+ * Starts a streaming HMAC-SHA-256 keyed by `key` (RFC 2104): primes the inner hash with
+ * `K0 ⊕ ipad` and stores the outer block `K0 ⊕ opad` for finalization. Feed message bytes with
+ * `hmac_sha256_update`, then `hmac_sha256_finalize`.
+ */
+exp fn hmac_sha256_init(key: []byte): HmacSha256 {
+    var k0 = hmac_key0(key, 64, (m: []byte) => sha256_of(m))
+    HmacSha256 { inner = sha256_update(sha256_init(), xor_with_byte(k0, 0x36)); outer = xor_with_byte(k0, 0x5c) }
+}
+
+/**
+ * Feeds `data` into an in-progress HMAC-SHA-256 computation — may be called any number of times.
+ */
+exp fn hmac_sha256_update(state: HmacSha256, data: []byte): HmacSha256 {
+    HmacSha256 { inner = sha256_update(state.inner, data); outer = state.outer }
+}
+
+/**
+ * Completes an HMAC-SHA-256 computation: finishes the inner hash, then hashes
+ * `(K0 ⊕ opad) || inner_digest` to produce the 32-byte tag.
+ */
+exp fn hmac_sha256_finalize(state: HmacSha256): []byte {
+    var inner_digest = sha256_finalize(state.inner)
+    sha256_finalize(sha256_update(sha256_update(sha256_init(), state.outer), inner_digest))
+}
+
+/**
+ * One-shot HMAC-SHA-256: the 32-byte tag authenticating `msg` under `key`.
+ */
+exp fn hmac_sha256_of(key: []byte, msg: []byte): []byte {
+    hmac_sha256_finalize(hmac_sha256_update(hmac_sha256_init(key), msg))
+}
+
+/**
+ * `hmac_sha256_of`, rendered as a lowercase hex string — the form RFC 4231's vectors use.
+ */
+exp fn hmac_sha256_hex_of(key: []byte, msg: []byte): str {
+    to_hex(hmac_sha256_of(key, msg))
+}
+
+/**
+ * Constant-time HMAC-SHA-256 verification: recomputes the tag over `msg`/`key` and compares it
+ * against `tag` with `ct_eq`, so the running time never leaks where a forged tag first diverges.
+ */
+exp fn hmac_sha256_verify(key: []byte, msg: []byte, tag: []byte): bool {
+    ct_eq(hmac_sha256_of(key, msg), tag)
+}
+
+/**
+ * The streaming state of an in-progress HMAC-SHA-512 computation — the SHA-512 analogue of
+ * `HmacSha256` (128-byte block, 64-byte tag).
+ */
+exp type HmacSha512 = struct {
+    /** the inner SHA-512 state, primed with `K0 ⊕ ipad` and advanced by every message chunk */
+    inner: Sha512State
+    /** the outer key block `K0 ⊕ opad`, hashed with the inner digest at finalize time */
+    outer: []byte
+}
+
+/**
+ * Starts a streaming HMAC-SHA-512 keyed by `key` (RFC 2104), block size 128 bytes.
+ */
+exp fn hmac_sha512_init(key: []byte): HmacSha512 {
+    var k0 = hmac_key0(key, 128, (m: []byte) => sha512_of(m))
+    HmacSha512 { inner = sha512_update(sha512_init(), xor_with_byte(k0, 0x36)); outer = xor_with_byte(k0, 0x5c) }
+}
+
+/**
+ * Feeds `data` into an in-progress HMAC-SHA-512 computation — may be called any number of times.
+ */
+exp fn hmac_sha512_update(state: HmacSha512, data: []byte): HmacSha512 {
+    HmacSha512 { inner = sha512_update(state.inner, data); outer = state.outer }
+}
+
+/**
+ * Completes an HMAC-SHA-512 computation: hashes `(K0 ⊕ opad) || inner_digest` into the 64-byte tag.
+ */
+exp fn hmac_sha512_finalize(state: HmacSha512): []byte {
+    var inner_digest = sha512_finalize(state.inner)
+    sha512_finalize(sha512_update(sha512_update(sha512_init(), state.outer), inner_digest))
+}
+
+/**
+ * One-shot HMAC-SHA-512: the 64-byte tag authenticating `msg` under `key`.
+ */
+exp fn hmac_sha512_of(key: []byte, msg: []byte): []byte {
+    hmac_sha512_finalize(hmac_sha512_update(hmac_sha512_init(key), msg))
+}
+
+/**
+ * `hmac_sha512_of`, rendered as a lowercase hex string.
+ */
+exp fn hmac_sha512_hex_of(key: []byte, msg: []byte): str {
+    to_hex(hmac_sha512_of(key, msg))
+}
+
+/**
+ * Constant-time HMAC-SHA-512 verification (see `hmac_sha256_verify`).
+ */
+exp fn hmac_sha512_verify(key: []byte, msg: []byte, tag: []byte): bool {
+    ct_eq(hmac_sha512_of(key, msg), tag)
+}
+
+/**
+ * The streaming state of an in-progress HMAC-SHA-384 computation — the SHA-384 analogue of
+ * `HmacSha256` (128-byte block, shared with SHA-512; 48-byte tag).
+ */
+exp type HmacSha384 = struct {
+    /** the inner SHA-384 state, primed with `K0 ⊕ ipad` and advanced by every message chunk */
+    inner: Sha384State
+    /** the outer key block `K0 ⊕ opad`, hashed with the inner digest at finalize time */
+    outer: []byte
+}
+
+/**
+ * Starts a streaming HMAC-SHA-384 keyed by `key` (RFC 2104), block size 128 bytes (shared with
+ * SHA-512).
+ */
+exp fn hmac_sha384_init(key: []byte): HmacSha384 {
+    var k0 = hmac_key0(key, 128, (m: []byte) => sha384_of(m))
+    HmacSha384 { inner = sha384_update(sha384_init(), xor_with_byte(k0, 0x36)); outer = xor_with_byte(k0, 0x5c) }
+}
+
+/**
+ * Feeds `data` into an in-progress HMAC-SHA-384 computation — may be called any number of times.
+ */
+exp fn hmac_sha384_update(state: HmacSha384, data: []byte): HmacSha384 {
+    HmacSha384 { inner = sha384_update(state.inner, data); outer = state.outer }
+}
+
+/**
+ * Completes an HMAC-SHA-384 computation: hashes `(K0 ⊕ opad) || inner_digest` into the 48-byte tag.
+ */
+exp fn hmac_sha384_finalize(state: HmacSha384): []byte {
+    var inner_digest = sha384_finalize(state.inner)
+    sha384_finalize(sha384_update(sha384_update(sha384_init(), state.outer), inner_digest))
+}
+
+/**
+ * One-shot HMAC-SHA-384: the 48-byte tag authenticating `msg` under `key`.
+ */
+exp fn hmac_sha384_of(key: []byte, msg: []byte): []byte {
+    hmac_sha384_finalize(hmac_sha384_update(hmac_sha384_init(key), msg))
+}
+
+/**
+ * `hmac_sha384_of`, rendered as a lowercase hex string.
+ */
+exp fn hmac_sha384_hex_of(key: []byte, msg: []byte): str {
+    to_hex(hmac_sha384_of(key, msg))
+}
+
+/**
+ * Constant-time HMAC-SHA-384 verification (see `hmac_sha256_verify`).
+ */
+exp fn hmac_sha384_verify(key: []byte, msg: []byte, tag: []byte): bool {
+    ct_eq(hmac_sha384_of(key, msg), tag)
+}
+
+/**
+ * One-shot HMAC-SHA3-256 (RFC 2104 over FIPS 202): the 32-byte tag authenticating `msg` under
+ * `key`, using the SHA3-256 sponge whose HMAC block size is its 136-byte rate.
+ */
+exp fn hmac_sha3_256_of(key: []byte, msg: []byte): []byte {
+    var k0 = hmac_key0(key, 136, (m: []byte) => sha3_256_of(m))
+    var inner = keccak_finalize(keccak_update(keccak_update(sha3_256_init(), xor_with_byte(k0, 0x36)), msg), 32)
+    keccak_finalize(keccak_update(keccak_update(sha3_256_init(), xor_with_byte(k0, 0x5c)), inner), 32)
+}
+
+/**
+ * `hmac_sha3_256_of`, rendered as a lowercase hex string.
+ */
+exp fn hmac_sha3_256_hex_of(key: []byte, msg: []byte): str {
+    to_hex(hmac_sha3_256_of(key, msg))
+}
+
+/**
+ * Constant-time HMAC-SHA3-256 verification (see `hmac_sha256_verify`).
+ */
+exp fn hmac_sha3_256_verify(key: []byte, msg: []byte, tag: []byte): bool {
+    ct_eq(hmac_sha3_256_of(key, msg), tag)
+}
+
+type Poly1305Ctx = struct {
+    r: []u64
+    s: []u64
+    pad: []u64
+}
+
+fn le_u32_at_u64(b: []byte, off: u64): u64 {
+    (b[off] to u64) | ((b[off + 1] to u64) << 8) | ((b[off + 2] to u64) << 16) | ((b[off + 3] to u64) << 24)
+}
+
+fn mac_le_u32_bytes(x: u64): []byte {
+    [
+        (x & 0xFF) to byte,
+        ((x >> 8) & 0xFF) to byte,
+        ((x >> 16) & 0xFF) to byte,
+        ((x >> 24) & 0xFF) to byte,
+    ]
+}
+
+fn poly1305_ctx(key: []byte): Poly1305Ctx {
+    var r0 = le_u32_at_u64(key, 0) & 0x3ffffff
+    var r1 = (le_u32_at_u64(key, 3) >> 2) & 0x3ffff03
+    var r2 = (le_u32_at_u64(key, 6) >> 4) & 0x3ffc0ff
+    var r3 = (le_u32_at_u64(key, 9) >> 6) & 0x3f03fff
+    var r4 = (le_u32_at_u64(key, 12) >> 8) & 0x00fffff
+    var r: []u64 = [r0, r1, r2, r3, r4]
+    var s: []u64 = [r1 * 5, r2 * 5, r3 * 5, r4 * 5]
+    var pad: []u64 = [
+        le_u32_at_u64(key, 16),
+        le_u32_at_u64(key, 20),
+        le_u32_at_u64(key, 24),
+        le_u32_at_u64(key, 28),
+    ]
+    Poly1305Ctx { r = r; s = s; pad = pad }
+}
+
+fn poly1305_block(h: []u64, block: []byte, hibit: u64, ctx: Poly1305Ctx): []u64 {
+    var h0 = h[0] + (le_u32_at_u64(block, 0) & 0x3ffffff)
+    var h1 = h[1] + ((le_u32_at_u64(block, 3) >> 2) & 0x3ffffff)
+    var h2 = h[2] + ((le_u32_at_u64(block, 6) >> 4) & 0x3ffffff)
+    var h3 = h[3] + ((le_u32_at_u64(block, 9) >> 6) & 0x3ffffff)
+    var h4 = h[4] + ((le_u32_at_u64(block, 12) >> 8) | hibit)
+    var r0 = ctx.r[0]
+    var r1 = ctx.r[1]
+    var r2 = ctx.r[2]
+    var r3 = ctx.r[3]
+    var r4 = ctx.r[4]
+    var s1 = ctx.s[0]
+    var s2 = ctx.s[1]
+    var s3 = ctx.s[2]
+    var s4 = ctx.s[3]
+    var d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+    var d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+    var d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+    var d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+    var d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+    var c = d0 >> 26
+    var n0 = d0 & 0x3ffffff
+    d1 = d1 + c
+    c = d1 >> 26
+    var n1 = d1 & 0x3ffffff
+    d2 = d2 + c
+    c = d2 >> 26
+    var n2 = d2 & 0x3ffffff
+    d3 = d3 + c
+    c = d3 >> 26
+    var n3 = d3 & 0x3ffffff
+    d4 = d4 + c
+    c = d4 >> 26
+    var n4 = d4 & 0x3ffffff
+    n0 = n0 + c * 5
+    c = n0 >> 26
+    n0 = n0 & 0x3ffffff
+    n1 = n1 + c
+    [n0, n1, n2, n3, n4]
+}
+
+fn poly1305_pad_final(msg: []byte, off: u64): []byte {
+    var remaining = msg.len - off
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= remaining { break }
+        out[i] = msg[off + i]
+        i++
+    }
+    out[remaining] = 0x01 to byte
+    out
+}
+
+fn poly1305_emit(h: []u64, ctx: Poly1305Ctx): []byte {
+    var h0 = h[0]
+    var h1 = h[1]
+    var h2 = h[2]
+    var h3 = h[3]
+    var h4 = h[4]
+    var c = h1 >> 26
+    h1 = h1 & 0x3ffffff
+    h2 = h2 + c
+    c = h2 >> 26
+    h2 = h2 & 0x3ffffff
+    h3 = h3 + c
+    c = h3 >> 26
+    h3 = h3 & 0x3ffffff
+    h4 = h4 + c
+    c = h4 >> 26
+    h4 = h4 & 0x3ffffff
+    h0 = h0 + c * 5
+    c = h0 >> 26
+    h0 = h0 & 0x3ffffff
+    h1 = h1 + c
+    var g0 = h0 + 5
+    c = g0 >> 26
+    g0 = g0 & 0x3ffffff
+    var g1 = h1 + c
+    c = g1 >> 26
+    g1 = g1 & 0x3ffffff
+    var g2 = h2 + c
+    c = g2 >> 26
+    g2 = g2 & 0x3ffffff
+    var g3 = h3 + c
+    c = g3 >> 26
+    g3 = g3 & 0x3ffffff
+    var g4 = h4 + c
+    var use_g = (g4 >> 26) & 1
+    g4 = g4 & 0x3ffffff
+    var mask_g = teko::math::wrapping_sub_u64(0, use_g)
+    var mask_h = ~mask_g
+    h0 = (h0 & mask_h) | (g0 & mask_g)
+    h1 = (h1 & mask_h) | (g1 & mask_g)
+    h2 = (h2 & mask_h) | (g2 & mask_g)
+    h3 = (h3 & mask_h) | (g3 & mask_g)
+    h4 = (h4 & mask_h) | (g4 & mask_g)
+    var t0 = (h0 | (h1 << 26)) & 0xffffffff
+    var t1 = ((h1 >> 6) | (h2 << 20)) & 0xffffffff
+    var t2 = ((h2 >> 12) | (h3 << 14)) & 0xffffffff
+    var t3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff
+    var f = t0 + ctx.pad[0]
+    var o0 = f & 0xffffffff
+    f = t1 + ctx.pad[1] + (f >> 32)
+    var o1 = f & 0xffffffff
+    f = t2 + ctx.pad[2] + (f >> 32)
+    var o2 = f & 0xffffffff
+    f = t3 + ctx.pad[3] + (f >> 32)
+    var o3 = f & 0xffffffff
+    var words: []u64 = [o0, o1, o2, o3]
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 4 { break }
+        var lw = mac_le_u32_bytes(words[i])
+        out[i * 4] = lw[0]
+        out[i * 4 + 1] = lw[1]
+        out[i * 4 + 2] = lw[2]
+        out[i * 4 + 3] = lw[3]
+        i++
+    }
+    out
+}
+
+/**
+ * One-shot Poly1305 (RFC 8439 §2.5): the 16-byte one-time authenticator tag of `msg` under the
+ * 32-byte one-time `key`. The key MUST be used for exactly one message — reusing it across
+ * messages catastrophically breaks the scheme (M.3 honesty: the caller owns that contract).
+ */
+exp fn poly1305(key: []byte, msg: []byte): []byte | CryptoError {
+    if key.len != 32 { return crypto_error("poly1305: key must be exactly 32 bytes") }
+    var ctx = poly1305_ctx(key)
+    var h: []u64 = [0, 0, 0, 0, 0]
+    var off: u64 = 0
+    loop {
+        if msg.len - off < 16 { break }
+        h = poly1305_block(h, mac_bytes_slice(msg, off, off + 16), 0x1000000, ctx)
+        off = off + 16
+    }
+    if off < msg.len {
+        h = poly1305_block(h, poly1305_pad_final(msg, off), 0, ctx)
+    }
+    poly1305_emit(h, ctx)
+}
+
+/**
+ * `poly1305`, rendered as a lowercase hex string.
+ */
+exp fn poly1305_hex(key: []byte, msg: []byte): str | CryptoError {
+    var tag = match poly1305(key, msg) { []byte as t => t; CryptoError as e => return e }
+    to_hex(tag)
+}
+
+/**
+ * Constant-time Poly1305 verification: recomputes the tag over `msg`/`key` and compares it
+ * against `tag` with `ct_eq`.
+ */
+exp fn poly1305_verify(key: []byte, msg: []byte, tag: []byte): bool | CryptoError {
+    var computed = match poly1305(key, msg) { []byte as t => t; CryptoError as e => return e }
+    ct_eq(computed, tag)
+}
+
+type CmacSubkeys = struct {
+    k1: []byte
+    k2: []byte
+}
+
+fn zero_block16(): []byte {
+    var out: [16]byte = []
+    out
+}
+
+fn xor_block(a: []byte, b: []byte): []byte {
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        out[i] = ((a[i] to u32) ^ (b[i] to u32)) to byte
+        i++
+    }
+    out
+}
+
+fn cmac_double(b: []byte): []byte {
+    var msb = (b[0] to u32) >> 7
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        var cur = (b[i] to u32) << 1
+        var nxt = if i + 1 < 16 { (b[i + 1] to u32) >> 7 } else { 0 to u32 }
+        var v = (cur | nxt) & 0xFF
+        if i == 15 { v = v ^ (msb * 0x87) }
+        out[i] = v to byte
+        i++
+    }
+    out
+}
+
+/**
+ * Derives the CMAC subkeys `K1`, `K2` from `l = CIPH_K(0^128)` (NIST SP 800-38B §6.1):
+ * `K1 = dbl(L)`, `K2 = dbl(K1)`. Exposed on its own because it is independently testable against
+ * the NIST worked example without any actual block cipher.
+ */
+exp fn cmac_gen_subkeys(l: []byte): CmacSubkeys {
+    var k1 = cmac_double(l)
+    CmacSubkeys { k1 = k1; k2 = cmac_double(k1) }
+}
+
+fn cmac_prefix_block_count(msg: []byte): u64 {
+    if msg.len == 0 { return 0 }
+    (msg.len + 15) / 16 - 1
+}
+
+fn cmac_pad10(chunk: []byte): []byte {
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= chunk.len { break }
+        out[i] = chunk[i]
+        i++
+    }
+    out[chunk.len] = 0x80 to byte
+    out
+}
+
+fn cmac_last_block(msg: []byte, sub: CmacSubkeys): []byte {
+    if msg.len == 0 { return xor_block(cmac_pad10([]), sub.k2) }
+    var complete = msg.len % 16 == 0
+    var start = if complete { msg.len - 16 } else { (msg.len / 16) * 16 }
+    var chunk = mac_bytes_slice(msg, start, msg.len)
+    if complete { return xor_block(chunk, sub.k1) }
+    xor_block(cmac_pad10(chunk), sub.k2)
+}
+
+/**
+ * CMAC (NIST SP 800-38B) parameterized on an injected 128-bit block cipher — the AES SEAM. AES is
+ * the Lane-4 `teko::crypto::cipher` primitive and does not exist yet, so `encrypt_block` (a
+ * single-block ECB encryption under an already-bound key) is supplied by the caller. When AES
+ * lands this becomes `cmac_with_cipher((b) => aes_encrypt_block(key, b), msg)`.
+ */
+exp fn cmac_with_cipher(encrypt_block: func<[]byte, []byte>, msg: []byte): []byte {
+    var sub = cmac_gen_subkeys(encrypt_block(zero_block16()))
+    var last = cmac_last_block(msg, sub)
+    var prefix = cmac_prefix_block_count(msg)
+    var c = zero_block16()
+    var i: u64 = 0
+    loop {
+        if i >= prefix { break }
+        c = encrypt_block(xor_block(c, mac_bytes_slice(msg, i * 16, i * 16 + 16)))
+        i++
+    }
+    encrypt_block(xor_block(c, last))
+}
+
+/**
+ * CMAC-AES (NIST SP 800-38B) — the one-liner wiring of `cmac_with_cipher` onto AES. The key is
+ * expanded ONCE and the resulting schedule is captured by the injected block cipher
+ * `(b) => aes_encrypt_block_ks(ks, b)`, so every CBC-MAC block reuses the same schedule.
+ */
+exp fn cmac_aes(key: []byte, msg: []byte): []byte | CryptoError {
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    cmac_with_cipher((b: []byte) => aes_encrypt_block_ks(ks, b), msg)
+}
+
+type GfBlock = struct {
+    hi: u64
+    lo: u64
+}
+
+fn mac_be_u64_at(b: []byte, off: u64): u64 {
+    var acc: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= 8 { break }
+        acc = (acc << 8) | (b[off + i] to u64)
+        i++
+    }
+    acc
+}
+
+fn mac_be_u64_bytes(x: u64): []byte {
+    var out: [8]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 8 { break }
+        out[i] = ((x >> ((7 - i) * 8)) & 0xFF) to byte
+        i++
+    }
+    out
+}
+
+fn gf_mul(x: GfBlock, y: GfBlock): GfBlock {
+    var z_hi: u64 = 0
+    var z_lo: u64 = 0
+    var v_hi = y.hi
+    var v_lo = y.lo
+    var i: u64 = 0
+    loop {
+        if i >= 128 { break }
+        var xbit = if i < 64 { (x.hi >> (63 - i)) & 1 } else { (x.lo >> (127 - i)) & 1 }
+        var mask_x = teko::math::wrapping_sub_u64(0, xbit)
+        z_hi = z_hi ^ (v_hi & mask_x)
+        z_lo = z_lo ^ (v_lo & mask_x)
+        var lsb = v_lo & 1
+        var new_hi = v_hi >> 1
+        var new_lo = (v_lo >> 1) | ((v_hi & 1) << 63)
+        var mask_lsb = teko::math::wrapping_sub_u64(0, lsb)
+        new_hi = new_hi ^ (0xe100000000000000 & mask_lsb)
+        v_hi = new_hi
+        v_lo = new_lo
+        i++
+    }
+    GfBlock { hi = z_hi; lo = z_lo }
+}
+
+fn ghash_block_at(data: []byte, off: u64): GfBlock {
+    var padded: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        if off + i < data.len { padded[i] = data[off + i] }
+        i++
+    }
+    GfBlock { hi = mac_be_u64_at(padded, 0); lo = mac_be_u64_at(padded, 8) }
+}
+
+/**
+ * GHASH (NIST SP 800-38D §6.4): the universal hash `Y_i = (Y_{i-1} ⊕ X_i) · H` over the
+ * 16-byte blocks of `data` (the final short block zero-padded), the pure GF(2^128) core of GMAC.
+ * The caller supplies the full GHASH input (AAD ‖ padding ‖ length block); this routine only does
+ * the block chaining, so it is independently GCM-vector-testable given `H`.
+ */
+exp fn ghash(h: []byte, data: []byte): []byte | CryptoError {
+    if h.len != 16 { return crypto_error("ghash: H must be exactly 16 bytes") }
+    var hb = GfBlock { hi = mac_be_u64_at(h, 0); lo = mac_be_u64_at(h, 8) }
+    var y = GfBlock { hi = 0; lo = 0 }
+    var off: u64 = 0
+    loop {
+        if off >= data.len { break }
+        var blk = ghash_block_at(data, off)
+        y = gf_mul(GfBlock { hi = y.hi ^ blk.hi; lo = y.lo ^ blk.lo }, hb)
+        off = off + 16
+    }
+    [..mac_be_u64_bytes(y.hi), ..mac_be_u64_bytes(y.lo)]
+}
+
+fn gmac_round_up16(n: u64): u64 {
+    var r = n
+    loop {
+        if r % 16 == 0 { break }
+        r++
+    }
+    r
+}
+
+fn gmac_build_input(aad: []byte): []byte {
+    var padded_len = gmac_round_up16(aad.len)
+    var out: [padded_len + 16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= aad.len { break }
+        out[i] = aad[i]
+        i++
+    }
+    var lenbytes = mac_be_u64_bytes(aad.len * 8)
+    var j: u64 = 0
+    loop {
+        if j >= 8 { break }
+        out[padded_len + j] = lenbytes[j]
+        j++
+    }
+    out
+}
+
+fn gmac_j0(iv: []byte): []byte {
+    var out: [iv.len + 4]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= iv.len { break }
+        out[i] = iv[i]
+        i++
+    }
+    out[iv.len + 3] = 1 to byte
+    out
+}
+
+/**
+ * GMAC (NIST SP 800-38D) parameterized on an injected 128-bit block cipher — the AES SEAM, the
+ * GCM authentication tag over authenticated data with no ciphertext. Like `cmac_with_cipher`,
+ * `encrypt_block` is supplied by the caller because AES (Lane 4) does not exist yet; when it
+ * lands this becomes `gmac_with_cipher((b) => aes_encrypt_block(key, b), iv, aad)`. The IV is the
+ * common 96-bit form (`J0 = IV ‖ 0^31 ‖ 1`).
+ */
+exp fn gmac_with_cipher(encrypt_block: func<[]byte, []byte>, iv: []byte, aad: []byte): []byte | CryptoError {
+    if iv.len != 12 { return crypto_error("gmac_with_cipher: IV must be exactly 12 bytes (96-bit)") }
+    var h = encrypt_block(zero_block16())
+    var s = match ghash(h, gmac_build_input(aad)) { []byte as x => x; CryptoError as e => return e }
+    xor_block(s, encrypt_block(gmac_j0(iv)))
+}
+
+/**
+ * GMAC-AES (NIST SP 800-38D) — the one-liner wiring of `gmac_with_cipher` onto AES with the common
+ * 96-bit IV. The key is expanded ONCE and captured by the injected block cipher
+ * `(b) => aes_encrypt_block_ks(ks, b)`, reusing the schedule for both `H = E(0)` and `E(J0)`.
+ */
+exp fn gmac_aes(key: []byte, iv: []byte, aad: []byte): []byte | CryptoError {
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    gmac_with_cipher((b: []byte) => aes_encrypt_block_ks(ks, b), iv, aad)
+}

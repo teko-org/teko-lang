@@ -1,0 +1,114 @@
+// surface_generics.tk -- generics with constants (entrega 4, crumb C8): the
+// body of `Box<T, const N: i64>` is RECORDED and re-parsed once per (T, N), so
+// `T items[N]` is a real inline array whose length the instantiation FIXES.
+// `Box<Circle, 2>` and `Box<Circle, 4>` come out of one source text with two
+// different layouts, `N` is an integer literal inside every method, and
+// `Holder<Box<Circle, 2>>` closes on a `>>`. An inline array is reached through
+// the receiver written out (`this.items[i]`), which is the one member the bare
+// name does not reach: `[` is lowered by the `.` handler.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+class Circle {
+    public i64 r;
+}
+
+class Box<T, const N: i64> {
+    T items[N];
+    i64 count;
+
+    public i64 cap() {
+        return N;
+    }
+
+    public i64 add(T it) {
+        if (count >= N) {
+            return 0;
+        }
+        this.items[this.count] = it;
+        count = count + 1;
+        return 1;
+    }
+
+    public i64 total() {
+        i64 s = 0;
+        i64 i = 0;
+        loop {
+            if (i >= count) {
+                break;
+            }
+            T c = this.items[i];
+            s = s + c.r;
+            i = i + 1;
+        }
+        return s;
+    }
+}
+
+class Holder<T> {
+    public T inner;
+
+    public T get() {
+        return inner;
+    }
+}
+
+struct Slot<T, const N: i64> {
+    public T v[N];
+
+    public i64 room() {
+        return N;
+    }
+}
+
+i64 main() {
+    Box<Circle, 4> b4 = new Box<Circle, 4>;      // an instance is born at its first use,
+    Box<Circle, 2> b2 = new Box<Circle, 2>;      // so its `#define`s exist from here down
+    Holder<Box<Circle, 2>> h = new Holder<Box<Circle, 2>>;
+    Slot<i64, 3> s = new Slot<i64, 3>;
+
+    if (BOX__CIRCLE__2_SIZE != 40) return 1;     // 16 header + 2*8 items + 8 count
+    if (BOX__CIRCLE__4_SIZE != 56) return 2;     // the same body, four slots
+    if (BOX__CIRCLE__2_COUNT != 32) return 3;    // the field AFTER the array moves
+    if (BOX__CIRCLE__4_COUNT != 48) return 4;
+    if (SLOT__I64__3_SIZE != 24) return 5;       // a struct: no header at all
+    if (HOLDER__BOX__CIRCLE__2_SIZE != 24) return 6;
+
+    if (b4.cap() != 4) return 7;
+    i64 i = 1;
+    loop {
+        if (i > 4) {
+            break;
+        }
+        Circle c = new Circle;
+        c.r = i;
+        if (b4.add(c) != 1) return 8;
+        i = i + 1;
+    }
+    if (b4.total() != 10) return 9;
+
+    if (b2.cap() != 2) return 10;
+    Circle p = new Circle;
+    p.r = 5;
+    Circle q = new Circle;
+    q.r = 6;
+    if (b2.add(p) != 1) return 11;
+    if (b2.add(q) != 1) return 12;
+    Circle x = new Circle;
+    x.r = 7;
+    if (b2.add(x) != 0) return 13;               // the constant closed this box
+    if (b2.total() != 11) return 14;
+
+    h.inner = b2;
+    if (h.get().total() != 11) return 15;
+
+    if (s.room() != 3) return 16;
+    s.v[0] = 1;
+    s.v[2] = 8;
+    if (s.v[2] != 8) return 17;
+
+    return b4.total() + b4.cap() + b2.total() + b2.cap()
+         + h.get().total() + s.v[0] + s.room();
+}

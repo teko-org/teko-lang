@@ -1,0 +1,889 @@
+type KeyStep = struct {
+    key: str
+    next: u64
+}
+
+type KeyPathStep = struct {
+    keys: []str
+    next: u64
+}
+
+type HeaderStep = struct {
+    path: []str
+    is_array: bool
+    next: u64
+}
+
+type KeyValStep = struct {
+    path: []str
+    value: TomlValue
+    next: u64
+}
+
+type ValStep = struct {
+    value: TomlValue
+    next: u64
+}
+
+type DigitRunResult = struct {
+    out: []byte
+    next: u64
+}
+
+type PStrStep = struct {
+    text: str
+    next: u64
+}
+
+type EscStep = struct {
+    bytes: []byte
+    next: u64
+}
+
+type ContStep = struct {
+    matched: bool
+    next: u64
+}
+
+type DescendResult = struct {
+    child: TomlValue
+    via_array: bool
+    container_array: TomlValue
+}
+
+fn toml_error(what: str, pos: u64): error {
+    error { message = concat("toml: ", what, " at offset ", i64_to_str(pos to i64)) }
+}
+
+fn semantic_error(what: str): error {
+    error { message = concat("toml: ", what) }
+}
+
+fn is_toml_ws(b: byte): bool {
+    b == b' ' || b == b'\t'
+}
+
+fn skip_ws(input: []byte, pos: u64): u64 {
+    var at = pos
+    loop {
+        if at < input.len && is_toml_ws(input[at]) { at = at + 1; continue }
+        break
+    }
+    at
+}
+
+fn skip_to_eol(input: []byte, pos: u64): u64 {
+    var at = pos
+    loop {
+        if at >= input.len || input[at] == b'\n' { break }
+        at = at + 1
+    }
+    at
+}
+
+fn skip_ws_nl_comments(input: []byte, pos: u64): u64 {
+    var at = pos
+    loop {
+        if at >= input.len { break }
+        var b = input[at]
+        if b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' { at = at + 1; continue }
+        if b == b'#' { at = skip_to_eol(input, at); continue }
+        break
+    }
+    at
+}
+
+fn expect_line_end(input: []byte, pos: u64): u64 | error {
+    var at = skip_ws(input, pos)
+    if at < input.len && input[at] == b'#' { at = skip_to_eol(input, at) }
+    if at >= input.len { return at }
+    if at + 1 < input.len && input[at] == b'\r' && input[at + 1] == b'\n' { return at + 2 }
+    if input[at] == b'\n' { return at + 1 }
+    toml_error("expected end of line", at)
+}
+
+fn is_bare_key_char(b: byte): bool {
+    (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') || b == b'_' || b == b'-'
+}
+
+fn is_bare_key_char_at(input: []byte, pos: u64): bool {
+    pos < input.len && is_bare_key_char(input[pos])
+}
+
+fn is_digit_byte(b: byte): bool {
+    b >= b'0' && b <= b'9'
+}
+
+fn is_digit_at(input: []byte, pos: u64): bool {
+    pos < input.len && is_digit_byte(input[pos])
+}
+
+fn matches_literal(input: []byte, pos: u64, word: str): bool {
+    var wb = word.bytes()
+    if pos + wb.len > input.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= wb.len { break }
+        if input[pos + i] != wb[i] { return false }
+        i++
+    }
+    true
+}
+
+fn at_triple(input: []byte, pos: u64, q: byte): bool {
+    pos + 3 <= input.len && input[pos] == q && input[pos + 1] == q && input[pos + 2] == q
+}
+
+fn radix_digit_value(b: byte): i64 {
+    if b >= b'0' && b <= b'9' { return (b to i64) - (b'0' to i64) }
+    if b >= b'a' && b <= b'f' { return (b to i64) - (b'a' to i64) + 10 }
+    if b >= b'A' && b <= b'F' { return (b to i64) - (b'A' to i64) + 10 }
+    -1
+}
+
+fn digit_valid_for_radix(b: byte, radix: u64): bool {
+    var v = radix_digit_value(b)
+    v >= 0 && (v to u64) < radix
+}
+
+fn slice_bytes_str(input: []byte, from: u64, to: u64): str {
+    var out: []byte = []
+    var i = from
+    loop {
+        if i >= to { break }
+        out = [..out, input[i]]
+        i++
+    }
+    str(out)
+}
+
+fn one_byte_slice(b: byte): []byte {
+    [b]
+}
+
+fn push_codepoint_utf8(out: []byte, cp: u32): []byte {
+    if cp <= 0x7F { return [..out, cp to byte] }
+    if cp <= 0x7FF {
+        var o = [..out, (0xC0 | (cp >> 6)) to byte]
+        return [..o, (0x80 | (cp & 0x3F)) to byte]
+    }
+    if cp <= 0xFFFF {
+        var o = [..out, (0xE0 | (cp >> 12)) to byte]
+        o = [..o, (0x80 | ((cp >> 6) & 0x3F)) to byte]
+        return [..o, (0x80 | (cp & 0x3F)) to byte]
+    }
+    var o = [..out, (0xF0 | (cp >> 18)) to byte]
+    o = [..o, (0x80 | ((cp >> 12) & 0x3F)) to byte]
+    o = [..o, (0x80 | ((cp >> 6) & 0x3F)) to byte]
+    [..o, (0x80 | (cp & 0x3F)) to byte]
+}
+
+fn read_hex_n(input: []byte, pos: u64, n: u64): u32 | error {
+    if pos + n > input.len { return toml_error("truncated unicode escape", pos) }
+    var v: u32 = 0
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        var d = radix_digit_value(input[pos + i])
+        if d < 0 { return toml_error("invalid hex digit in unicode escape", pos + i) }
+        v = (v * 16) + (d to u32)
+        i++
+    }
+    v
+}
+
+fn parse_key(input: []byte, pos: u64): KeyStep | error {
+    if pos >= input.len { return toml_error("expected key", pos) }
+    var b = input[pos]
+    if b == b'"' {
+        var s = match parse_basic_single(input, pos + 1) { PStrStep as r => r; error as e => return e }
+        return KeyStep { key = s.text; next = s.next }
+    }
+    if b == b'\'' {
+        var s = match parse_literal_single(input, pos + 1) { PStrStep as r => r; error as e => return e }
+        return KeyStep { key = s.text; next = s.next }
+    }
+    if !is_bare_key_char(b) { return toml_error("invalid key", pos) }
+    var at = pos
+    loop {
+        if at < input.len && is_bare_key_char(input[at]) { at = at + 1; continue }
+        break
+    }
+    KeyStep { key = slice_bytes_str(input, pos, at); next = at }
+}
+
+fn parse_key_path(input: []byte, pos: u64): KeyPathStep | error {
+    var k1 = match parse_key(input, pos) { KeyStep as k => k; error as e => return e }
+    var keys: []str = [k1.key]
+    var at = skip_ws(input, k1.next)
+    loop {
+        if at < input.len && input[at] == b'.' {
+            at = skip_ws(input, at + 1)
+            var kn = match parse_key(input, at) { KeyStep as k => k; error as e => return e }
+            keys = [..keys, kn.key]
+            at = skip_ws(input, kn.next)
+            continue
+        }
+        break
+    }
+    KeyPathStep { keys = keys; next = at }
+}
+
+fn decode_basic_escape(input: []byte, at: u64): EscStep | error {
+    if at + 1 >= input.len { return toml_error("unterminated escape sequence", at) }
+    var esc = input[at + 1]
+    if esc == b'"' { return EscStep { bytes = one_byte_slice(b'"'); next = at + 2 } }
+    if esc == b'\\' { return EscStep { bytes = one_byte_slice(b'\\'); next = at + 2 } }
+    if esc == b'b' { return EscStep { bytes = one_byte_slice(0x08 to byte); next = at + 2 } }
+    if esc == b't' { return EscStep { bytes = one_byte_slice(0x09 to byte); next = at + 2 } }
+    if esc == b'n' { return EscStep { bytes = one_byte_slice(0x0A to byte); next = at + 2 } }
+    if esc == b'f' { return EscStep { bytes = one_byte_slice(0x0C to byte); next = at + 2 } }
+    if esc == b'r' { return EscStep { bytes = one_byte_slice(0x0D to byte); next = at + 2 } }
+    if esc == b'u' {
+        var cp = match read_hex_n(input, at + 2, 4) { u32 as c => c; error as e => return e }
+        if cp >= 0xD800 && cp <= 0xDFFF { return toml_error("invalid unicode scalar value in \\u escape", at) }
+        return EscStep { bytes = push_codepoint_utf8([], cp); next = at + 6 }
+    }
+    if esc == b'U' {
+        var cp2 = match read_hex_n(input, at + 2, 8) { u32 as c => c; error as e => return e }
+        if cp2 > 0x10FFFF || (cp2 >= 0xD800 && cp2 <= 0xDFFF) { return toml_error("invalid unicode scalar value in \\U escape", at) }
+        return EscStep { bytes = push_codepoint_utf8([], cp2); next = at + 10 }
+    }
+    toml_error("invalid escape sequence", at)
+}
+
+fn parse_basic_single(input: []byte, pos: u64): PStrStep | error {
+    var out: []byte = []
+    var at = pos
+    loop {
+        if at >= input.len { return toml_error("unterminated string", at) }
+        var b = input[at]
+        if b == b'"' { return PStrStep { text = str(out); next = at + 1 } }
+        if b == b'\n' || b == b'\r' { return toml_error("newline in single-line string", at) }
+        if b == b'\\' {
+            var step = match decode_basic_escape(input, at) { EscStep as e2 => e2; error as e => return e }
+            out = append_all(out, step.bytes)
+            at = step.next
+            continue
+        }
+        out = [..out, b]
+        at = at + 1
+    }
+    toml_error("unreachable", at)
+}
+
+fn parse_literal_single(input: []byte, pos: u64): PStrStep | error {
+    var at = pos
+    loop {
+        if at >= input.len { return toml_error("unterminated string", at) }
+        var b = input[at]
+        if b == b'\'' { return PStrStep { text = slice_bytes_str(input, pos, at); next = at + 1 } }
+        if b == b'\n' || b == b'\r' { return toml_error("newline in single-line string", at) }
+        at = at + 1
+    }
+    toml_error("unreachable", at)
+}
+
+fn trim_leading_newline(input: []byte, pos: u64): u64 {
+    if pos < input.len && input[pos] == b'\n' { return pos + 1 }
+    if pos + 1 < input.len && input[pos] == b'\r' && input[pos + 1] == b'\n' { return pos + 2 }
+    pos
+}
+
+fn count_quotes(input: []byte, pos: u64, q: byte): u64 {
+    var at = pos
+    loop {
+        if at < input.len && input[at] == q { at = at + 1; continue }
+        break
+    }
+    at - pos
+}
+
+fn append_quote_run(out: []byte, q: byte, n: u64): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        acc = [..acc, q]
+        i++
+    }
+    acc
+}
+
+fn try_line_continuation(input: []byte, at: u64): ContStep {
+    var p = at + 1
+    loop {
+        if p < input.len && is_toml_ws(input[p]) { p = p + 1; continue }
+        break
+    }
+    var is_crlf = p + 1 < input.len && input[p] == b'\r' && input[p + 1] == b'\n'
+    var is_lf = p < input.len && input[p] == b'\n'
+    if !is_crlf && !is_lf { return ContStep { matched = false; next = at } }
+    var q = if is_crlf { p + 2 } else { p + 1 }
+    loop {
+        if q < input.len && (is_toml_ws(input[q]) || input[q] == b'\n' || input[q] == b'\r') { q = q + 1; continue }
+        break
+    }
+    ContStep { matched = true; next = q }
+}
+
+fn parse_multiline_basic(input: []byte, pos: u64): PStrStep | error {
+    var at = trim_leading_newline(input, pos)
+    var out: []byte = []
+    loop {
+        if at >= input.len { return toml_error("unterminated multi-line string", at) }
+        var b = input[at]
+        if b == b'"' {
+            var n = count_quotes(input, at, b'"')
+            if n >= 3 {
+                var extra = n - 3
+                out = append_quote_run(out, b'"', extra)
+                return PStrStep { text = str(out); next = at + extra + 3 }
+            }
+            out = append_quote_run(out, b'"', n)
+            at = at + n
+            continue
+        }
+        if b == b'\\' {
+            var cont = try_line_continuation(input, at)
+            if cont.matched {
+                at = cont.next
+                continue
+            }
+            var step = match decode_basic_escape(input, at) { EscStep as e2 => e2; error as e => return e }
+            out = append_all(out, step.bytes)
+            at = step.next
+            continue
+        }
+        out = [..out, b]
+        at = at + 1
+    }
+    toml_error("unreachable", at)
+}
+
+fn parse_multiline_literal(input: []byte, pos: u64): PStrStep | error {
+    var at = trim_leading_newline(input, pos)
+    var out: []byte = []
+    loop {
+        if at >= input.len { return toml_error("unterminated multi-line string", at) }
+        var b = input[at]
+        if b == b'\'' {
+            var n = count_quotes(input, at, b'\'')
+            if n >= 3 {
+                var extra = n - 3
+                out = append_quote_run(out, b'\'', extra)
+                return PStrStep { text = str(out); next = at + extra + 3 }
+            }
+            out = append_quote_run(out, b'\'', n)
+            at = at + n
+            continue
+        }
+        out = [..out, b]
+        at = at + 1
+    }
+    toml_error("unreachable", at)
+}
+
+fn parse_toml_string(input: []byte, pos: u64): ValStep | error {
+    var b = input[pos]
+    if b == b'"' {
+        if at_triple(input, pos, b'"') {
+            var m = match parse_multiline_basic(input, pos + 3) { PStrStep as r => r; error as e => return e }
+            return ValStep { value = toml_string(m.text); next = m.next }
+        }
+        var s = match parse_basic_single(input, pos + 1) { PStrStep as r => r; error as e => return e }
+        return ValStep { value = toml_string(s.text); next = s.next }
+    }
+    if at_triple(input, pos, b'\'') {
+        var ml = match parse_multiline_literal(input, pos + 3) { PStrStep as r => r; error as e => return e }
+        return ValStep { value = toml_string(ml.text); next = ml.next }
+    }
+    var sl = match parse_literal_single(input, pos + 1) { PStrStep as r => r; error as e => return e }
+    ValStep { value = toml_string(sl.text); next = sl.next }
+}
+
+fn scan_uint_digits(input: []byte, pos: u64, restrict_leading_zero: bool): DigitRunResult | error {
+    if pos >= input.len || !is_digit_byte(input[pos]) { return toml_error("expected digit", pos) }
+    var out: []byte = [input[pos]]
+    var first = input[pos]
+    var at = pos + 1
+    if restrict_leading_zero && first == b'0' {
+        if at < input.len && (is_digit_byte(input[at]) || input[at] == b'_') {
+            return toml_error("leading zero not allowed", pos)
+        }
+        return DigitRunResult { out = out; next = at }
+    }
+    loop {
+        if at < input.len && is_digit_byte(input[at]) { out = [..out, input[at]]; at = at + 1; continue }
+        if at < input.len && input[at] == b'_' {
+            if at + 1 >= input.len || !is_digit_byte(input[at + 1]) { return toml_error("invalid underscore placement", at) }
+            at = at + 1
+            continue
+        }
+        break
+    }
+    DigitRunResult { out = out; next = at }
+}
+
+fn scan_radix_digits(input: []byte, pos: u64, radix: u64): DigitRunResult | error {
+    if pos >= input.len || !digit_valid_for_radix(input[pos], radix) { return toml_error("expected digit", pos) }
+    var out: []byte = [input[pos]]
+    var at = pos + 1
+    loop {
+        if at < input.len && digit_valid_for_radix(input[at], radix) {
+            out = [..out, input[at]]
+            at = at + 1
+            continue
+        }
+        if at < input.len && input[at] == b'_' {
+            if at + 1 >= input.len || !digit_valid_for_radix(input[at + 1], radix) {
+                return toml_error("invalid underscore placement", at)
+            }
+            at = at + 1
+            continue
+        }
+        break
+    }
+    DigitRunResult { out = out; next = at }
+}
+
+fn digits_to_u64_checked(digits: []byte, radix: u64): u64 | error {
+    var mag: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= digits.len { break }
+        var dv = radix_digit_value(digits[i]) to u64
+        var m1 = match teko::math::checked_mul_u64(mag, radix) { u64 as m => m; error as e2 => return semantic_error("integer literal out of range") }
+        var m2 = match teko::math::checked_add_u64(m1, dv) { u64 as m => m; error as e2 => return semantic_error("integer literal out of range") }
+        mag = m2
+        i++
+    }
+    mag
+}
+
+fn decimal_magnitude_to_i64(mag: u64, negative: bool): i64 | error {
+    var i64_max_u: u64 = 9223372036854775807
+    var i64_min_mag: u64 = 9223372036854775808
+    if !negative {
+        if mag > i64_max_u { return semantic_error("integer literal out of range") }
+        return mag to i64
+    }
+    if mag == i64_min_mag { return teko::math::i64_min() }
+    if mag > i64_min_mag { return semantic_error("integer literal out of range") }
+    var pos_i = mag to i64
+    -pos_i
+}
+
+fn parse_radix_integer(input: []byte, pos: u64): ValStep | error {
+    var marker = input[pos + 1]
+    var radix: u64 = if marker == b'x' { 16 } else if marker == b'o' { 8 } else { 2 }
+    var dr = match scan_radix_digits(input, pos + 2, radix) { DigitRunResult as d => d; error as e => return e }
+    var mag = match digits_to_u64_checked(dr.out, radix) { u64 as m => m; error as e => return e }
+    if mag > 9223372036854775807 { return semantic_error("hex/octal/binary integer literal exceeds this codec's i64 range") }
+    ValStep { value = toml_integer(mag to i64); next = dr.next }
+}
+
+fn build_float_text(has_sign: bool, sign_neg: bool, int_digits: []byte, has_frac: bool, frac_digits: []byte, has_exp: bool, exp_has_sign: bool, exp_sign_neg: bool, exp_digits: []byte): str {
+    var out: []byte = []
+    if has_sign { out = [..out, if sign_neg { b'-' } else { b'+' }] }
+    out = append_all(out, int_digits)
+    if has_frac {
+        out = [..out, b'.']
+        out = append_all(out, frac_digits)
+    }
+    if has_exp {
+        out = [..out, b'e']
+        if exp_has_sign { out = [..out, if exp_sign_neg { b'-' } else { b'+' }] }
+        out = append_all(out, exp_digits)
+    }
+    str(out)
+}
+
+fn parse_decimal_or_float(input: []byte, pos: u64, has_sign: bool, sign_neg: bool): ValStep | error {
+    var ip = match scan_uint_digits(input, pos, true) { DigitRunResult as d => d; error as e => return e }
+    var at = ip.next
+    var is_float = false
+    var has_frac = false
+    var frac_digits: []byte = []
+    if at < input.len && input[at] == b'.' {
+        is_float = true
+        has_frac = true
+        var fp = match scan_uint_digits(input, at + 1, false) { DigitRunResult as d => d; error as e => return e }
+        frac_digits = fp.out
+        at = fp.next
+    }
+    var has_exp = false
+    var exp_has_sign = false
+    var exp_sign_neg = false
+    var exp_digits: []byte = []
+    if at < input.len && (input[at] == b'e' || input[at] == b'E') {
+        is_float = true
+        has_exp = true
+        var eat = at + 1
+        if eat < input.len && (input[eat] == b'+' || input[eat] == b'-') {
+            exp_has_sign = true
+            exp_sign_neg = input[eat] == b'-'
+            eat = eat + 1
+        }
+        var ep = match scan_uint_digits(input, eat, false) { DigitRunResult as d => d; error as e => return e }
+        exp_digits = ep.out
+        at = ep.next
+    }
+    if is_float {
+        var text = build_float_text(has_sign, sign_neg, ip.out, has_frac, frac_digits, has_exp, exp_has_sign, exp_sign_neg, exp_digits)
+        return ValStep { value = toml_float(teko::float::parse(text)); next = at }
+    }
+    var mag = match digits_to_u64_checked(ip.out, 10) { u64 as m => m; error as e => return e }
+    var iv = match decimal_magnitude_to_i64(mag, has_sign && sign_neg) { i64 as v => v; error as e => return e }
+    ValStep { value = toml_integer(iv); next = at }
+}
+
+fn parse_number(input: []byte, pos: u64): ValStep | error {
+    var at = pos
+    var has_sign = false
+    var sign_neg = false
+    if at < input.len && (input[at] == b'+' || input[at] == b'-') {
+        has_sign = true
+        sign_neg = input[at] == b'-'
+        at = at + 1
+    }
+    if matches_literal(input, at, "inf") {
+        var v = if sign_neg { -teko::math::inf() } else { teko::math::inf() }
+        return ValStep { value = toml_float(v); next = at + 3 }
+    }
+    if matches_literal(input, at, "nan") {
+        return ValStep { value = toml_float(teko::math::nan()); next = at + 3 }
+    }
+    if !has_sign && at + 1 < input.len && input[at] == b'0' && (input[at + 1] == b'x' || input[at + 1] == b'o' || input[at + 1] == b'b') {
+        return parse_radix_integer(input, at)
+    }
+    parse_decimal_or_float(input, at, has_sign, sign_neg)
+}
+
+fn digit_pair_value(input: []byte, pos: u64): i64 {
+    ((input[pos] to i64) - (b'0' to i64)) * 10 + ((input[pos + 1] to i64) - (b'0' to i64))
+}
+
+fn looks_like_date(input: []byte, pos: u64): bool {
+    pos + 5 <= input.len && is_digit_at(input, pos) && is_digit_at(input, pos + 1) && is_digit_at(input, pos + 2) && is_digit_at(input, pos + 3) && input[pos + 4] == b'-'
+}
+
+fn looks_like_time(input: []byte, pos: u64): bool {
+    pos + 3 <= input.len && is_digit_at(input, pos) && is_digit_at(input, pos + 1) && input[pos + 2] == b':'
+}
+
+fn validate_date_part(input: []byte, pos: u64): error | null {
+    if pos + 10 > input.len { return toml_error("truncated date", pos) }
+    if !(is_digit_at(input, pos) && is_digit_at(input, pos + 1) && is_digit_at(input, pos + 2) && is_digit_at(input, pos + 3)) { return toml_error("invalid date", pos) }
+    if input[pos + 4] != b'-' { return toml_error("invalid date", pos) }
+    if !(is_digit_at(input, pos + 5) && is_digit_at(input, pos + 6)) { return toml_error("invalid date", pos) }
+    if input[pos + 7] != b'-' { return toml_error("invalid date", pos) }
+    if !(is_digit_at(input, pos + 8) && is_digit_at(input, pos + 9)) { return toml_error("invalid date", pos) }
+    var month = digit_pair_value(input, pos + 5)
+    var day = digit_pair_value(input, pos + 8)
+    if month < 1 || month > 12 { return toml_error("month out of range", pos) }
+    if day < 1 || day > 31 { return toml_error("day out of range", pos) }
+    null
+}
+
+fn validate_time_part(input: []byte, pos: u64): u64 | error {
+    if pos + 8 > input.len { return toml_error("truncated time", pos) }
+    if !(is_digit_at(input, pos) && is_digit_at(input, pos + 1)) { return toml_error("invalid time", pos) }
+    if input[pos + 2] != b':' { return toml_error("invalid time", pos) }
+    if !(is_digit_at(input, pos + 3) && is_digit_at(input, pos + 4)) { return toml_error("invalid time", pos) }
+    if input[pos + 5] != b':' { return toml_error("invalid time", pos) }
+    if !(is_digit_at(input, pos + 6) && is_digit_at(input, pos + 7)) { return toml_error("invalid time", pos) }
+    var hour = digit_pair_value(input, pos)
+    var minute = digit_pair_value(input, pos + 3)
+    var second = digit_pair_value(input, pos + 6)
+    if hour > 23 { return toml_error("hour out of range", pos) }
+    if minute > 59 { return toml_error("minute out of range", pos) }
+    if second > 60 { return toml_error("second out of range", pos) }
+    var at = pos + 8
+    if at < input.len && input[at] == b'.' {
+        at = at + 1
+        if !is_digit_at(input, at) { return toml_error("invalid fractional seconds", at) }
+        loop {
+            if at < input.len && is_digit_byte(input[at]) { at = at + 1; continue }
+            break
+        }
+    }
+    at
+}
+
+fn validate_offset_part(input: []byte, pos: u64): u64 | error {
+    if pos + 6 > input.len { return toml_error("truncated offset", pos) }
+    if !(is_digit_at(input, pos + 1) && is_digit_at(input, pos + 2)) { return toml_error("invalid offset", pos) }
+    if input[pos + 3] != b':' { return toml_error("invalid offset", pos) }
+    if !(is_digit_at(input, pos + 4) && is_digit_at(input, pos + 5)) { return toml_error("invalid offset", pos) }
+    var oh = digit_pair_value(input, pos + 1)
+    var om = digit_pair_value(input, pos + 4)
+    if oh > 23 { return toml_error("offset hour out of range", pos) }
+    if om > 59 { return toml_error("offset minute out of range", pos) }
+    pos + 6
+}
+
+fn parse_datetime(input: []byte, pos: u64): ValStep | error {
+    var has_date = looks_like_date(input, pos)
+    var date_end = pos
+    if has_date {
+        match validate_date_part(input, pos) { null => { }; error as e => return e }
+        date_end = pos + 10
+    }
+    var cursor = date_end
+    var has_time = !has_date
+    var time_start = cursor
+    if has_date && cursor < input.len && (input[cursor] == b'T' || input[cursor] == b't' || input[cursor] == b' ') {
+        var sep = input[cursor]
+        var candidate = cursor + 1
+        if sep != b' ' || looks_like_time(input, candidate) {
+            has_time = true
+            time_start = candidate
+        }
+    }
+    if !has_time {
+        return ValStep { value = toml_datetime(slice_bytes_str(input, pos, date_end)); next = date_end }
+    }
+    var tend = match validate_time_part(input, time_start) { u64 as p => p; error as e => return e }
+    var end = tend
+    if has_date {
+        if end < input.len && (input[end] == b'Z' || input[end] == b'z') {
+            end = end + 1
+        } else if end < input.len && (input[end] == b'+' || input[end] == b'-') {
+            end = match validate_offset_part(input, end) { u64 as p => p; error as e => return e }
+        }
+    }
+    ValStep { value = toml_datetime(slice_bytes_str(input, pos, end)); next = end }
+}
+
+fn parse_value(input: []byte, pos: u64): ValStep | error {
+    if pos >= input.len { return toml_error("expected value", pos) }
+    var b = input[pos]
+    if b == b'"' || b == b'\'' { return parse_toml_string(input, pos) }
+    if b == b't' && matches_literal(input, pos, "true") && !is_bare_key_char_at(input, pos + 4) { return ValStep { value = toml_boolean(true); next = pos + 4 } }
+    if b == b'f' && matches_literal(input, pos, "false") && !is_bare_key_char_at(input, pos + 5) { return ValStep { value = toml_boolean(false); next = pos + 5 } }
+    if b == b'[' { return parse_array(input, pos) }
+    if b == b'{' { return parse_inline_table(input, pos) }
+    if is_digit_byte(b) && looks_like_date(input, pos) { return parse_datetime(input, pos) }
+    if is_digit_byte(b) && looks_like_time(input, pos) { return parse_datetime(input, pos) }
+    if is_digit_byte(b) || b == b'+' || b == b'-' || b == b'i' || b == b'n' { return parse_number(input, pos) }
+    toml_error("unexpected character in value", pos)
+}
+
+fn parse_array(input: []byte, pos: u64): ValStep | error {
+    var at = skip_ws_nl_comments(input, pos + 1)
+    var items: []TomlValue = []
+    if at < input.len && input[at] == b']' { return ValStep { value = toml_array(items); next = at + 1 } }
+    loop {
+        var v = match parse_value(input, at) { ValStep as s => s; error as e => return e }
+        items = [..items, v.value]
+        at = skip_ws_nl_comments(input, v.next)
+        if at < input.len && input[at] == b',' {
+            at = skip_ws_nl_comments(input, at + 1)
+            if at < input.len && input[at] == b']' { return ValStep { value = toml_array(items); next = at + 1 } }
+            continue
+        }
+        if at < input.len && input[at] == b']' { return ValStep { value = toml_array(items); next = at + 1 } }
+        return toml_error("expected ',' or ']' in array", at)
+    }
+    toml_error("unreachable", at)
+}
+
+fn with_sealed(t: TomlValue): TomlValue {
+    mk_value(t.kind, t.text, t.int_val, t.float_val, t.bool_val, t.items, t.keys, t.vals, true, t.t_opened, t.a_of_tables)
+}
+
+fn parse_inline_table(input: []byte, pos: u64): ValStep | error {
+    var at = skip_ws(input, pos + 1)
+    if at < input.len && input[at] == b'}' { return ValStep { value = with_sealed(toml_table_empty()); next = at + 1 } }
+    var table = toml_table_empty()
+    loop {
+        if at < input.len && (input[at] == b'\n' || input[at] == b'\r') { return toml_error("newline inside inline table", at) }
+        var kp = match parse_key_path(input, at) { KeyPathStep as k => k; error as e => return e }
+        var at2 = skip_ws(input, kp.next)
+        if at2 >= input.len || input[at2] != b'=' { return toml_error("expected '=' in inline table", at2) }
+        at2 = skip_ws(input, at2 + 1)
+        var v = match parse_value(input, at2) { ValStep as s => s; error as e => return e }
+        table = match set_leaf_path(table, kp.keys, v.value) { TomlValue as t => t; error as e => return e }
+        at = skip_ws(input, v.next)
+        if at < input.len && input[at] == b',' { at = skip_ws(input, at + 1); continue }
+        if at < input.len && input[at] == b'}' { at = at + 1; break }
+        return toml_error("expected ',' or '}' in inline table", at)
+    }
+    ValStep { value = with_sealed(table); next = at }
+}
+
+fn find_key_index(table: TomlValue, key: str): i64 {
+    var i: u64 = 0
+    loop {
+        if i >= table.keys.len { break }
+        if table.keys[i] == key { return i to i64 }
+        i++
+    }
+    -1
+}
+
+fn descend_table(table: TomlValue, key: str): DescendResult | error {
+    var idx = find_key_index(table, key)
+    if idx < 0 {
+        return DescendResult { child = toml_table_empty(); via_array = false; container_array = toml_table_empty() }
+    }
+    var val = table.vals[idx to u64]
+    if val.kind == TomlKind::Table {
+        if val.t_sealed { return semantic_error(concat("cannot extend sealed inline table '", key, "'")) }
+        return DescendResult { child = val; via_array = false; container_array = val }
+    }
+    if val.kind == TomlKind::Array && val.a_of_tables && val.items.len > 0 {
+        return DescendResult { child = val.items[val.items.len - 1]; via_array = true; container_array = val }
+    }
+    semantic_error(concat("key '", key, "' is not a table"))
+}
+
+fn replace_last_item(arr: TomlValue, new_last: TomlValue): TomlValue {
+    var n = arr.items.len
+    var out: []TomlValue = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        if i == n - 1 { out = [..out, new_last] } else { out = [..out, arr.items[i]] }
+        i++
+    }
+    mk_value(arr.kind, arr.text, arr.int_val, arr.float_val, arr.bool_val, out, arr.keys, arr.vals, arr.t_sealed, arr.t_opened, arr.a_of_tables)
+}
+
+fn attach_child(table: TomlValue, key: str, child: TomlValue, d: DescendResult): TomlValue {
+    if d.via_array { return toml_table_set(table, key, replace_last_item(d.container_array, child)) }
+    toml_table_set(table, key, child)
+}
+
+fn insert_new_leaf(table: TomlValue, key: str, value: TomlValue): TomlValue | error {
+    if find_key_index(table, key) >= 0 { return semantic_error(concat("duplicate key '", key, "'")) }
+    toml_table_set(table, key, value)
+}
+
+fn set_leaf_at(table: TomlValue, path: []str, i: u64, value: TomlValue): TomlValue | error {
+    if i == path.len - 1 { return insert_new_leaf(table, path[i], value) }
+    var d = match descend_table(table, path[i]) { DescendResult as r => r; error as e => return e }
+    var updated = match set_leaf_at(d.child, path, i + 1, value) { TomlValue as t => t; error as e => return e }
+    attach_child(table, path[i], updated, d)
+}
+
+fn set_leaf_path(root: TomlValue, path: []str, value: TomlValue): TomlValue | error {
+    if path.len == 0 { return semantic_error("empty key path") }
+    set_leaf_at(root, path, 0, value)
+}
+
+fn with_opened(t: TomlValue): TomlValue {
+    mk_value(t.kind, t.text, t.int_val, t.float_val, t.bool_val, t.items, t.keys, t.vals, t.t_sealed, true, t.a_of_tables)
+}
+
+fn open_final_table(table: TomlValue, key: str): TomlValue | error {
+    var idx = find_key_index(table, key)
+    if idx < 0 { return toml_table_set(table, key, with_opened(toml_table_empty())) }
+    var val = table.vals[idx to u64]
+    if val.kind != TomlKind::Table || val.t_sealed || val.t_opened { return semantic_error(concat("duplicate or conflicting table header '", key, "'")) }
+    toml_table_set(table, key, with_opened(val))
+}
+
+fn open_table_at(table: TomlValue, path: []str, i: u64): TomlValue | error {
+    if i == path.len - 1 { return open_final_table(table, path[i]) }
+    var d = match descend_table(table, path[i]) { DescendResult as r => r; error as e => return e }
+    var updated = match open_table_at(d.child, path, i + 1) { TomlValue as t => t; error as e => return e }
+    attach_child(table, path[i], updated, d)
+}
+
+fn open_table_path(root: TomlValue, path: []str): TomlValue | error {
+    if path.len == 0 { return semantic_error("empty table header") }
+    open_table_at(root, path, 0)
+}
+
+fn open_final_array_table(table: TomlValue, key: str): TomlValue | error {
+    var idx = find_key_index(table, key)
+    if idx < 0 {
+        var one: []TomlValue = [toml_table_empty()]
+        var arr = mk_value(TomlKind::Array, "", 0, 0.0, false, one, no_keys(), no_items(), false, false, true)
+        return toml_table_set(table, key, arr)
+    }
+    var val = table.vals[idx to u64]
+    if val.kind != TomlKind::Array || !val.a_of_tables { return semantic_error(concat("key '", key, "' is not an array of tables")) }
+    var grown = mk_value(val.kind, val.text, val.int_val, val.float_val, val.bool_val, [..val.items, toml_table_empty()], val.keys, val.vals, val.t_sealed, val.t_opened, val.a_of_tables)
+    toml_table_set(table, key, grown)
+}
+
+fn open_array_table_at(table: TomlValue, path: []str, i: u64): TomlValue | error {
+    if i == path.len - 1 { return open_final_array_table(table, path[i]) }
+    var d = match descend_table(table, path[i]) { DescendResult as r => r; error as e => return e }
+    var updated = match open_array_table_at(d.child, path, i + 1) { TomlValue as t => t; error as e => return e }
+    attach_child(table, path[i], updated, d)
+}
+
+fn open_array_table_path(root: TomlValue, path: []str): TomlValue | error {
+    if path.len == 0 { return semantic_error("empty table header") }
+    open_array_table_at(root, path, 0)
+}
+
+fn concat_path(a: []str, b: []str): []str {
+    var out = a
+    var i: u64 = 0
+    loop {
+        if i >= b.len { break }
+        out = [..out, b[i]]
+        i++
+    }
+    out
+}
+
+fn parse_header(input: []byte, pos: u64): HeaderStep | error {
+    var is_array = pos + 1 < input.len && input[pos + 1] == b'['
+    var at = if is_array { pos + 2 } else { pos + 1 }
+    at = skip_ws(input, at)
+    var kp = match parse_key_path(input, at) { KeyPathStep as k => k; error as e => return e }
+    at = kp.next
+    if at >= input.len || input[at] != b']' { return toml_error("expected ']'", at) }
+    at = at + 1
+    if is_array {
+        if at >= input.len || input[at] != b']' { return toml_error("expected ']]'", at) }
+        at = at + 1
+    }
+    var after = match expect_line_end(input, at) { u64 as p => p; error as e => return e }
+    HeaderStep { path = kp.keys; is_array = is_array; next = after }
+}
+
+fn parse_keyval(input: []byte, pos: u64): KeyValStep | error {
+    var kp = match parse_key_path(input, pos) { KeyPathStep as k => k; error as e => return e }
+    var at = kp.next
+    if at >= input.len || input[at] != b'=' { return toml_error("expected '='", at) }
+    at = skip_ws(input, at + 1)
+    var v = match parse_value(input, at) { ValStep as s => s; error as e => return e }
+    var after = match expect_line_end(input, v.next) { u64 as p => p; error as e => return e }
+    KeyValStep { path = kp.keys; value = v.value; next = after }
+}
+
+/**
+ * Parses a complete TOML v1.0.0 document into its root table.
+ */
+exp fn parse_toml(text: str): TomlValue | error {
+    var input = text.bytes()
+    var root = toml_table_empty()
+    var cursor: []str = []
+    var pos = skip_ws_nl_comments(input, 0)
+    loop {
+        if pos >= input.len { break }
+        if input[pos] == b'[' {
+            var h = match parse_header(input, pos) { HeaderStep as s => s; error as e => return e }
+            if h.is_array {
+                root = match open_array_table_path(root, h.path) { TomlValue as r => r; error as e => return e }
+            } else {
+                root = match open_table_path(root, h.path) { TomlValue as r => r; error as e => return e }
+            }
+            cursor = h.path
+            pos = skip_ws_nl_comments(input, h.next)
+            continue
+        }
+        var kv = match parse_keyval(input, pos) { KeyValStep as s => s; error as e => return e }
+        var full_path = concat_path(cursor, kv.path)
+        root = match set_leaf_path(root, full_path, kv.value) { TomlValue as r => r; error as e => return e }
+        pos = skip_ws_nl_comments(input, kv.next)
+    }
+    root
+}

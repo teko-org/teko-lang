@@ -1,0 +1,146 @@
+name: set up the mc toolchain
+description: >
+  Resolve the mc release this repository is PINNED to (`ngen/MC_VERSION`, or
+  `inputs.version` when the caller names one explicitly), download the asset
+  built for one (os, arch) pair, verify its `.sha256` and assert that
+  `mc --host` agrees with that pair. Every `ngen` job -- the five native legs,
+  the fixpoint ladder and the release publisher -- obtains `mc` through this
+  one action, so no two jobs can silently disagree about which compiler they
+  tested. `latest` resolves the newest minicompiler/mc release, but only when
+  asked for: an unannounced release must never change what CI tests.
+
+inputs:
+  os:
+    description: 'what `mc --host` calls the operating system: linux | macos | windows'
+    required: true
+  arch:
+    description: 'what `mc --host` calls the machine: x86_64 | aarch64 (never arm64)'
+    required: true
+  asset:
+    description: 'what the release file calls the machine: x86_64 | arm64'
+    required: true
+  exe:
+    description: 'suffix an executable carries on this operating system (`.exe` on Windows)'
+    required: false
+    default: ''
+  version:
+    description: >
+      mc version to install (e.g. `0.15.12`) or `latest` to resolve the newest
+      minicompiler/mc release. Empty (the default) reads `ngen/MC_VERSION`,
+      this repository's pin -- the source of truth `ngen/HANDOFF.md` §3.2
+      documents.
+    required: false
+    default: ''
+  token:
+    description: 'token for the GitHub releases API; `secrets.GITHUB_TOKEN` is enough'
+    required: true
+
+outputs:
+  mc:
+    description: 'the mc binary, as a path relative to the repository root'
+    value: ${{ steps.toolchain.outputs.mc }}
+  dir:
+    description: 'absolute directory holding the mc binary, for `$GITHUB_PATH`'
+    value: ${{ steps.toolchain.outputs.dir }}
+  tag:
+    description: 'tag of the release that was resolved (`v0.15.10`)'
+    value: ${{ steps.release.outputs.tag }}
+  version:
+    description: 'the same tag without its leading `v` (`0.15.10`)'
+    value: ${{ steps.release.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: resolve the pinned mc release
+      id: release
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        MC_VERSION_INPUT: ${{ inputs.version }}
+      run: |
+        set -eu
+        requested="$MC_VERSION_INPUT"
+        if [ -z "$requested" ]; then
+          if [ ! -f ngen/MC_VERSION ]; then
+            echo "::error::no version given and ngen/MC_VERSION does not exist" >&2
+            exit 1
+          fi
+          requested="$(tr -d '[:space:]' <ngen/MC_VERSION)"
+        fi
+        if [ "$requested" = "latest" ]; then
+          api="https://api.github.com/repos/minicompiler/mc/releases/latest"
+        else
+          api="https://api.github.com/repos/minicompiler/mc/releases/tags/v${requested#v}"
+        fi
+        resp="$(curl -fsSL \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+          "$api")" || {
+          echo "::error::could not reach the minicompiler/mc releases API ($api)" >&2
+          exit 1
+        }
+        tag="$(printf '%s' "$resp" | jq -r '.tag_name // empty')"
+        if [ -z "$tag" ]; then
+          echo "::error::minicompiler/mc has no release matching '$requested' (or the API response has no tag_name)" >&2
+          printf '%s\n' "$resp" >&2
+          exit 1
+        fi
+        ver="${tag#v}"
+        echo "tag=$tag"     >>"$GITHUB_OUTPUT"
+        echo "version=$ver" >>"$GITHUB_OUTPUT"
+        if [ "$requested" = "latest" ]; then
+          echo "resolved minicompiler/mc latest -> $tag"
+        else
+          echo "pinned minicompiler/mc $tag"
+        fi
+
+    # The toolchain is unpacked INSIDE the workspace and addressed by a
+    # relative path from here on: every step runs with the repository root as
+    # its working directory, and a relative path is the one form Git Bash,
+    # bash and `mc` itself read the same way. The absolute `dir` output exists
+    # for the one consumer that cannot take a relative path -- `$GITHUB_PATH`,
+    # which the fixpoint job needs because `bootstrap.sh` calls `mc` by name.
+    - name: download and verify the mc toolchain
+      id: toolchain
+      shell: bash
+      env:
+        MC_OS: ${{ inputs.os }}
+        MC_ARCH: ${{ inputs.arch }}
+        MC_ASSET: ${{ inputs.asset }}
+        EXE: ${{ inputs.exe }}
+        MC_TAG: ${{ steps.release.outputs.tag }}
+        MC_VERSION: ${{ steps.release.outputs.version }}
+      run: |
+        set -eu
+        name="mc-${MC_VERSION}-${MC_OS}-${MC_ASSET}"
+        asset="$name.tar.gz"
+        base="https://github.com/minicompiler/mc/releases/download/${MC_TAG}"
+        rm -rf .mc-toolchain
+        mkdir -p .mc-toolchain
+        for f in "$asset" "$asset.sha256"; do
+          if ! curl -fsSL -o ".mc-toolchain/$f" "$base/$f"; then
+            echo "::error::missing release asset: $base/$f" >&2
+            exit 1
+          fi
+        done
+        if command -v sha256sum >/dev/null 2>&1; then
+          (cd .mc-toolchain && sha256sum -c "$asset.sha256")
+        else
+          (cd .mc-toolchain && shasum -a 256 -c "$asset.sha256")
+        fi
+        tar xzf ".mc-toolchain/$asset" -C .mc-toolchain
+        mc=".mc-toolchain/$name/mc$EXE"
+        chmod 755 "$mc"
+        "$mc" --host
+        # the job is only native if the binary agrees; a wrong asset here
+        # would otherwise surface as a mystery ENOEXEC three steps later
+        host_os=$("$mc" --host | sed -n 's|^os *||p')
+        host_arch=$("$mc" --host | sed -n 's|^arch *||p')
+        if [ "$host_os" != "$MC_OS" ] || [ "$host_arch" != "$MC_ARCH" ]; then
+          echo "::error::the mc binary says it is hosted on '$host_os/$host_arch', not $MC_OS/$MC_ARCH" >&2
+          exit 1
+        fi
+        echo "MC=$mc" >>"$GITHUB_ENV"
+        echo "mc=$mc" >>"$GITHUB_OUTPUT"
+        echo "dir=$(cd ".mc-toolchain/$name" && pwd)" >>"$GITHUB_OUTPUT"

@@ -2,6 +2,38 @@
 # scripts/build_with_seed_fallback.sh — build gen1 (the tip's compiler) from the released
 # seed, with a STAGED BOOTSTRAP fallback for when the seed cannot compile the tip directly.
 #
+# ── THE CHAIN THIS SCRIPT WALKS (owner ruling 2026-07-28) ─────────────────────────────────────
+#
+#   release 0.3.0.31 --TEKO_BACKEND=c--> gen0 --TEKO_BACKEND=c--> gen1 (emits teko.c)
+#                    --native--> gen2 --native--> gen3            ASSERT gen2 == gen3
+#
+# THIS SCRIPT OWNS THE FIRST TWO LINKS and hands `$OUT_DIR/teko` — gen1 — to
+# `scripts/fixpoint_gate.sh`, which owns the last two and the verdict.
+#
+# gen0 IS NEW, AND IT IS NOT A SECOND LADDER. Every route below (the declared degrau, the released
+# seed, the committed host seed, the pinned SHA rungs) ends at ONE compiler built from the tip's
+# source; that compiler is gen0, and `gen0_to_gen1` then has it rebuild the very same source. The
+# doubling is what makes gen1's emitted `teko.c` the output of a compiler whose own algorithm is
+# THIS tree's — which is the only C worth versioning, since versioning it is the point (owner:
+# the C *"deixa de ser ENTRADA e passa a ser SAÍDA"*).
+#
+# `bootstrap/teko.c` IS NO LONGER AN INPUT UNLESS A DEGRAU SAYS SO. Owner ruling 2026-07-28: *"só
+# podemos usar teko.c se e somente se identificarmos degrau."* The old rung -1 keyed off the FILE's
+# presence, which was sound while the file could only exist as a bootstrap emergency; now that the
+# same file is this train's own harvested OUTPUT, presence means nothing and a versioned
+# declaration (`bootstrap/DEGRAU`, see scripts/degrau.sh) means everything.
+#
+# WHEN A DEGRAU IS DECLARED IT IS THE SEED — FORCED — AND ITS FAILURE IS FATAL. Owner ruling
+# 2026-08-18 (CLAUDE.md "PROVENANCE/reseed"): provenance is REVOKED. A declared `bootstrap/DEGRAU`
+# short-circuits the ENTIRE chain below — the released seed, the committed host seed and the pinned
+# SHA ladder are NEVER tried. `bootstrap/teko.c` is compiled straight into gen0 and `gen0_to_gen1`
+# doubles it to gen1. If that gen0 cannot build the tip, the script EXITS NON-ZERO on the spot: no
+# release probe, no ladder, no version-old seed. The release predates this tree's syntax (it dies on
+# the retired `T?`/`i128`/`Ref<T>`), so falling back to it only buries the real failure under the
+# wrong one and, worse, would publish gen0 from the release instead of from this tree's own compiler.
+# The degrau ends by DELETING `bootstrap/DEGRAU` the day the released seed reaches the tip again —
+# never by a silent fallback. Everything from the FAST PATH down is reached ONLY with no degrau.
+#
 # INVARIANT (owner ruling 2026-07-24, replacing the older "seed builds the tip" rule): the
 # released seed only has to build the PR's BASE lineage. A compiler built from an ancestor is
 # itself a valid seed for a newer commit, so when the RAW released seed cannot compile the tip
@@ -46,19 +78,31 @@
 # the "no bootstrap gap" guard fails loud instead of pretending a fallback exists — a released seed
 # that cannot build main is a real regression, not a capability gap.
 #
-# TRANSITIONAL: the whole ladder is a .31 measure. Owner ruling — the first wagon of .32 cuts the
-# .31 release as the seed and REMOVES this file's reason to exist.
+# TRANSITIONAL: the FALLBACK ladder is a transitional measure. With 0.3.0.31 published, the normal
+# chain starts at that release and every rung below the fast path exists only for the day it does
+# not — which is precisely the day a degrau has to be DECLARED rather than inferred.
 #
 # The intermediate builds are DRY (`--no-verify`, no test gate) because CI already gated each of
 # those commits on the PR that landed it; owner ruling 2026-07-24: the dry intermediate build is
-# a TRANSITIONAL .31 measure, to be undone in .32 and not repeated.
+# a TRANSITIONAL measure, to be undone with the ladder and not repeated.
 #
 # Usage:   sh scripts/build_with_seed_fallback.sh [OUT_DIR]
-#          OUT_DIR defaults to "bin" and receives the SAME gen1 binary the direct call to
-#          `<seed> . -o OUT_DIR --no-verify --release` would have produced — callers do not
-#          need to know which path was taken.
+#          OUT_DIR defaults to "bin" and receives GEN1 — the tip's compiler, one generation past
+#          whatever route reached the tip first (see `gen0_to_gen1`) — plus, while the C route is
+#          alive, `OUT_DIR/teko.c`, which is GEN1's OWN emitted C and the harvest candidate.
+#          Callers do not need to know which route was taken.
 #
 # Env:
+#   TEKO_DEGRAU_FILE                the degrau declaration (default: bootstrap/DEGRAU). See
+#                                   scripts/degrau.sh — it decides whether `bootstrap/teko.c` is a
+#                                   rung or merely a payload this train produced.
+#   TEKO_DEGRAU_LDFLAGS             extra link flags forwarded verbatim to the rung -1 degrau `cc`
+#                                   invocation (default: empty). This rung is C-linked OUTSIDE teko's
+#                                   own run_cc, so any linker adjustment that path normally applies
+#                                   must be supplied here by the caller. CI's Windows leg sets it to
+#                                   `-Wl,/STACK:67108864` (64 MiB PE stack reserve) because consteval
+#                                   recursion overflows Windows' ~1 MiB default; other platforms leave
+#                                   it empty and the link is unchanged.
 #   TEKO_SEED_FALLBACK_SEED_BIN     the seed command to invoke (default: teko, resolved on PATH)
 #   TEKO_SEED_FALLBACK_BASE_BRANCH  the branch the fallback bootstraps from (default: GITHUB_BASE_REF
 #                                   when Actions sets it — a STACKED PR bootstraps from its BASE
@@ -72,6 +116,9 @@ set -eu
 # shellcheck source=scripts/ci_phase_clock.sh
 . "$(dirname "$0")/ci_phase_clock.sh"
 phase_clock_init
+
+# shellcheck source=scripts/degrau.sh
+. "$(dirname "$0")/degrau.sh"
 
 OUT_DIR="${1:-bin}"
 SEED_BIN="${TEKO_SEED_FALLBACK_SEED_BIN:-teko}"
@@ -89,6 +136,20 @@ cleanup() {
   return 0
 }
 trap cleanup EXIT
+
+# ── THE CHAIN'S FIRST QUESTION, ASKED ONCE ────────────────────────────────────────────────────
+# Whether `bootstrap/teko.c` is a rung or a payload is decided HERE, from a versioned human claim,
+# and every route below reads the answer instead of re-deriving it. A broken declaration is fatal
+# on the spot: it means someone tried to bridge a gap and the bridge is not where they said, and
+# quietly walking the chain they declared broken would report the wrong failure.
+DEGRAU_RC=0
+degrau_scan "$PWD" || DEGRAU_RC=$?
+if [ "$DEGRAU_RC" = "2" ]; then
+  log "FATAL: the degrau declaration is broken (see the lines above) — refusing to pick a chain."
+  exit 1
+fi
+degrau_report
+[ "$DEGRAU_RC" = "0" ] || degrau_note_undeclared_c "$PWD"
 
 # build_project BIN DIR OUT LOGFILE [RT_DIR] — runs "BIN . -o OUT --no-verify --release"
 # with cwd DIR, tees combined output to LOGFILE, and returns the build's own exit status.
@@ -158,6 +219,53 @@ resolve_bin() {
   fi
 }
 
+# gen0_to_gen1 ORIGIN — THE DOUBLING. The compiler now sitting in $OUT_DIR was built from the tip's
+# source by ORIGIN, whatever route reached it: that binary is gen0. This moves it to `.gen0/` and
+# has IT rebuild the identical source, so what $OUT_DIR finally holds is gen1 — and every caller
+# downstream (produce_assets.sh, fixpoint_gate.sh, every workflow) keeps its contract unchanged,
+# because the contract was always "the tip's compiler at $OUT_DIR".
+#
+# WHY THE SECOND BUILD IS NOT WASTE, stated in the terms that make it worth its ~90s. gen0 was
+# LOWERED by an older compiler — the release, or the degrau's C — so gen0's `teko.c` is that older
+# algorithm's rendering of this tree. gen1's is THIS tree's algorithm rendering itself, which is
+# the only C that can honestly be committed as the next bootstrap (owner ruling 2026-07-28: the
+# harvest is *"colhido do gen1 (a última geração que emite C)"*). It is also the generation the
+# fixpoint stands on, and standing it on gen0 would mix "did the new compiler change?" with "did
+# the old compiler lower it differently?" — two questions, one red.
+#
+# THE ARTEFACT IT LEAVES: $OUT_DIR/teko.c IS gen1's C, because gen0 emitted it while producing
+# gen1. gen0's own C is kept beside gen0 for diagnosis rather than overwritten in place.
+#
+# ON FAILURE IT LEAVES NO BINARY AT $OUT_DIR, deliberately: gen0 was MOVED, not copied, so a lane
+# that ignored this function's status cannot go on holding gen0 while believing it holds gen1.
+gen0_to_gen1() {
+  g_origin="$1"
+  if ! g_gen0="$(resolve_bin "$OUT_DIR")"; then
+    log "FATAL: $g_origin reported success but left no teko binary in $OUT_DIR — no gen0, no gen1."
+    return 1
+  fi
+  g_stage="$PWD/.gen0"
+  rm -rf "$g_stage"
+  mkdir -p "$g_stage"
+  mv "$g_gen0" "$g_stage/$(basename "$g_gen0")"
+  [ -f "$OUT_DIR/teko.c" ] && cp "$OUT_DIR/teko.c" "$g_stage/teko.c"
+  g_bin="$g_stage/$(basename "$g_gen0")"
+  log "gen0 ready, built by $g_origin ($("$g_bin" --version 2>&1 | head -n1)) — building gen1 = gen0(source)"
+  g_log="$(mktemp)"
+  if ! build_project "$g_bin" "$PWD" "$OUT_DIR" "$g_log" "$(rt_dir_of "$PWD")"; then
+    log "FATAL: gen0 does not rebuild the source it came from — the chain breaks at gen1."
+    log "----- gen0's build of the tip (failure) -----"
+    sed 's/^/teko-ci:   | /' "$g_log" >&2
+    rm -f "$g_log"
+    return 1
+  fi
+  cat "$g_log"
+  rm -f "$g_log"
+  phase_mark "gen1 = gen0(source)"
+  log "gen1 ready at $OUT_DIR — and $OUT_DIR/teko.c, when present, is gen1's own emitted C"
+  return 0
+}
+
 # logical_head — the commit whose ancestry should be compared against $BASE_BRANCH. A
 # `pull_request`-triggered checkout sits on GitHub's synthetic merge commit (parent 1 = the
 # base branch, parent 2 = the PR's own tip) — merge-basing against parent 1 would trivially
@@ -181,14 +289,29 @@ ensure_full_history() {
   git fetch origin "$BASE_BRANCH"
 }
 
-committed_c_rung() {
-  cc_src="${TEKO_BOOTSTRAP_C:-bootstrap/teko.c}"
-  if [ ! -f "$cc_src" ]; then
-    log "rung -1: no committed C at $cc_src — skipping (this is the normal state once a release can seed)"
+declared_degrau_rung() {
+  if [ "$DEGRAU_RC" != "0" ]; then
+    log "rung -1: no degrau is declared — the committed C, if any, is this train's OUTPUT and is"
+    log "         NOT an input. Skipping to the published release, which is where the chain starts."
     return 1
   fi
-  if ! command -v cc >/dev/null 2>&1; then
-    log "rung -1: $cc_src is present but no cc is on PATH — skipping"
+  cc_src="$DEGRAU_C"
+  # On Windows the toolchain MUST be clang, not MinGW gcc (owner ruling 2026-08-05). MinGW gcc is
+  # pathologically slow on the 10 MB bootstrap C (its -O2 optimizer is superlinear — a single
+  # produce step measured 55 min), its separate `cc1` backend breaks under any PATH wrapper
+  # (`cannot execute 'cc1': CreateProcess`), and its MSVC-family linker has no `m.lib` so `-lm` is a
+  # hard link error. clang (x86_64-pc-windows-msvc, already on the runner) is monolithic, fast, and
+  # needs no libm — the same Windows rules build_cc_argv already applies for gen1 and beyond.
+  deg_cc="cc"; deg_std="-std=c2x"; deg_libm=""; deg_tgt=""; deg_pthread="-pthread"; deg_syslibs=""
+  case "$(uname -s 2>/dev/null)" in
+    # Windows: the §16 sync primitives call WaitOnAddress/WakeByAddressSingle/WakeByAddressAll, which
+    # live in Synchronization.lib (an API-set lib, NOT auto-linked like kernel32). teko's own run_cc
+    # adds it for gen1+ via [extern.libs.windows], but this rung -1 links the raw C directly, so it
+    # names the lib here or the link dies with LNK2019 unresolved externals.
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) deg_cc="clang"; deg_std="-std=c23"; deg_libm=""; deg_tgt="--target=x86_64-pc-windows-msvc"; deg_pthread=""; deg_syslibs="-lSynchronization" ;;
+  esac
+  if ! command -v "$deg_cc" >/dev/null 2>&1; then
+    log "rung -1: a degrau is declared at $cc_src but no $deg_cc is on PATH — the forced seed cannot be built"
     return 1
   fi
   cc_out="$PWD/.rung-c"
@@ -198,50 +321,83 @@ committed_c_rung() {
   # standing hypothesis for the generation-to-generation slowdown; measured on the wagon it made the
   # x86_64 lane SLOWER (780s -> 869s), so the flag was reverted everywhere. It survived in this
   # function only because rung -1 was written while the experiment was still live.
-  log "rung -1: building the bootstrap compiler from $cc_src"
-  if ! cc -std=c2x -w -O2 \
+  log "rung -1: building the degrau's compiler from $cc_src (cc=$deg_cc)"
+  if ! "$deg_cc" "$deg_std" $deg_tgt -w -O2 $deg_pthread ${TEKO_DEGRAU_LDFLAGS:-} \
         -I src/runtime -I src/assert \
-        "$cc_src" src/runtime/teko_rt.c src/assert/assert.c -lm \
+        "$cc_src" src/runtime/teko_rt.c src/assert/assert.c $deg_libm $deg_syslibs \
         -o "$cc_out/teko" >"$cc_log" 2>&1; then
-    log "rung -1: the committed C did not compile — skipping to the next rung. cc said:"
+    log "rung -1: the declared C did not compile — the forced seed cannot be built. cc said:"
     sed 's/^/teko-ci:   | /' "$cc_log" >&2
     rm -f "$cc_log"
     return 1
   fi
   rm -f "$cc_log"
-  log "rung -1: bootstrap compiler ready ($("$cc_out/teko" --version 2>&1 | head -n1))"
+  log "rung -1: degrau compiler ready ($("$cc_out/teko" --version 2>&1 | head -n1))"
   cc_tip_log="$(mktemp)"
   if ! build_project "$cc_out/teko" "$PWD" "$OUT_DIR" "$cc_tip_log" "$PWD/src/runtime"; then
-    log "rung -1: the bootstrap compiler could not build the tip — skipping to the next rung."
-    log "----- tip build with the committed-C compiler (failure) -----"
+    log "rung -1: the degrau's compiler could not build the tip — the forced seed does not reach it."
+    log "----- tip build with the declared-C compiler (failure) -----"
     sed 's/^/teko-ci:   | /' "$cc_tip_log" >&2
     rm -f "$cc_tip_log"
     return 1
   fi
   cat "$cc_tip_log"
   rm -f "$cc_tip_log"
-  phase_mark "rung -1 (committed C, no ladder)"
-  log "rung -1: the tip was built from the committed C — NO LADDER WAS WALKED"
+  phase_mark "rung -1 (declared degrau, no ladder)"
+  log "rung -1: gen0 was built from the DECLARED C — NO LADDER WAS WALKED"
   return 0
 }
 
-# THE COMMITTED C RUNS BEFORE THE SEED IS EVEN TRIED, and that ordering is the point rather than an
-# optimization. `bootstrap/teko.c` is only ever committed BECAUSE the released seed cannot build
-# this tip — that is the whole reason the file exists — so trying the seed first is a failure we
-# have already paid for and already know the answer to. Measured: the seed's doomed attempt walks
-# the checker to item 784 before dying on B.22, ~94s per job, six jobs, every push. When the seed
-# can build the tip again the FILE is what goes away (owner: *"podemos apagar o teko.c e voltar a
-# construcao normal"*), not this ordering.
-if committed_c_rung; then
-  exit 0
+# THE DECLARED DEGRAU IS THE SEED — FORCED — AND ITS FAILURE IS FATAL (owner ruling 2026-08-18,
+# CLAUDE.md "PROVENANCE/reseed"). Provenance is REVOKED: when `bootstrap/DEGRAU` is declared, the C
+# it names IS gen0's seed, used DIRECTLY, and the published release and the pinned SHA ladder are
+# NOT tried at all — not before it, not after it. A degrau is only ever DECLARED because the
+# released seed cannot build this tip, so "fall back to the release when the degrau fails" would
+# fall back to a seed we already know is broken, wear the fixpoint green by detour, and — worst —
+# publish gen0 from the 0.3.0.31 release instead of from this tree's own current-syntax compiler.
+# Measured on PR #110: the fall-through did exactly that, and the release died on `T?`/`i128`/`Ref<T>`
+# because it predates their removal. So when a degrau is declared and it cannot build the tip, CI
+# FAILS HERE, IMMEDIATELY, WITHOUT PROBING ANYTHING OLDER. What ends the degrau is DELETING THE
+# DECLARATION the day the released seed reaches the tip again — never a silent fallback.
+if [ "$DEGRAU_RC" = "0" ]; then
+  if declared_degrau_rung; then
+    gen0_to_gen1 "rung -1 (the DECLARED degrau — forced seed)" || exit 1
+    exit 0
+  fi
+  log "FATAL: a degrau is DECLARED ($DEGRAU_FILE) — it IS the forced seed — but it could not build"
+  log "the tip (the failure is above). Owner ruling 2026-08-18: with a declared degrau there is NO"
+  log "fallback to the published release and NO pinned ladder; the release predates this tree's"
+  log "syntax and probing it would only report the wrong failure while burying this one."
+  log "Fix bootstrap/teko.c so it compiles this tree, or DELETE bootstrap/DEGRAU to return to the"
+  log "normal released-seed chain."
+  exit 1
+fi
+
+# ── NO DEGRAU DECLARED: THE NORMAL RELEASED-SEED CHAIN, UNCHANGED, RUNS BELOW ──────────────────
+# Everything from here down (fast-path release, rung 0 committed seed, the pinned SHA ladder) is
+# reached ONLY when no degrau is declared. With a degrau declared, the block above has already
+# either produced gen1 or failed the run — it never reaches this point.
+
+# THE SEED MUST EXIST BEFORE IT CAN FAIL. With no degrau declared, the published release IS the
+# chain's first link — so a missing seed is not a slow path, it is a broken premise, and the
+# fallbacks below cannot repair it: rung 0 needs a committed blob this train no longer ships and
+# the SHA ladder needs rungs the squash-merge destroyed. Saying so HERE names the real cause;
+# letting it fall through would report "the tip is unreachable after N stages" instead.
+if ! command -v "$SEED_BIN" >/dev/null 2>&1; then
+  log "FATAL: no degrau is declared and '$SEED_BIN' is not on PATH — the chain has no first link."
+  log "Provision the published release first (scripts/ci_provision_teko.sh <label>), or, if the"
+  log "release genuinely cannot build this tree, declare the degrau:"
+  degrau_recipe
+  exit 1
 fi
 
 FAST_LOG="$(mktemp)"
 if build_project "$SEED_BIN" "$PWD" "$OUT_DIR" "$FAST_LOG"; then
   cat "$FAST_LOG"
-  log "seed builds the tip directly — fast path, no fallback engaged"
-  phase_mark "seed direct build (fast path, no ladder)"
+  log "the published release built gen0 directly — fast path, no fallback engaged"
+  phase_mark "release -> gen0 (fast path, no ladder)"
   rm -f "$FAST_LOG"
+  gen0_to_gen1 "the published release" || exit 1
   exit 0
 fi
 log "seed FAILED to build the tip directly — engaging the staged bootstrap ladder"
@@ -340,12 +496,18 @@ commit_seed_rung() {
   return 1
 }
 
-# committed_c_rung — RUNG -1: build the compiler from a VERSIONED `teko.c` and let THAT build the
-# tip. Tried before every other rung, and when it works there is no ladder at all: one generation,
-# no pinned SHAs, no ancestor checkouts, no network beyond the checkout already in hand.
+# declared_degrau_rung — RUNG -1: build the compiler from the C a DEGRAU DECLARATION names, and let
+# THAT build gen0. Tried before every other rung, and when it works there is no ladder at all: no
+# pinned SHAs, no ancestor checkouts, no network beyond the checkout already in hand.
 #
 # THE IDEA IS THE OWNER'S (2026-07-27): *"não precisamos construir escada na org, apenas no vagão e
 # versionar a saída teko.c"* — walk the ladder ONCE, on the wagon, and commit the C it produced.
+#
+# WHAT CHANGED ON 2026-07-28, and it is the whole reason this rung is now gated by a declaration:
+# the C the wagon commits is no longer only an emergency bridge, it is the train's HARVESTED
+# OUTPUT. Presence therefore stopped meaning "the seed cannot build this tree", and a rung that
+# still keyed off presence would divert gen0 through `cc` on every push, forever, without a line in
+# the log saying why. *"Só podemos usar teko.c se e somente se identificarmos degrau."*
 #
 # WHY A `.c` AND NOT A BINARY, which is what `commit_seed_rung` (rung 0) was designed to hold: a
 # binary is per-host, so the same bootstrap needs five blobs and each one is opaque. A `teko.c` is
@@ -360,17 +522,18 @@ commit_seed_rung() {
 # carries that fix compiled INTO it — which is why this rung works where every other approach was
 # stuck choosing between rewriting the compiler's foundational recursive type and keeping a ladder.
 #
-# THE `.c` IS THE FIRST RUNG'S OUTPUT, deliberately: what the SEED emitted. The compiler built from
-# it has already learned not to emit C, so `gen1 → genN` stays clean and the owner's zero-C law
-# holds by construction rather than by a gate. And because the file is TRACKED, `no_emitted_c.sh`
-# ignores it for free — that gate defines an emission as a `.c` git does NOT track.
+# THE `.c` IS A GENERATION'S OUTPUT, and since 2026-07-28 it is gen1's specifically — the last
+# generation the chain builds down the C route. Because the file is TRACKED, `no_emitted_c.sh`
+# ignores it for free: that gate defines an emission as a `.c` git does NOT track.
 #
-# TRANSITIONAL BY DESIGN. It dies at the next train: once a release is cut FROM this tree, the
-# published seed builds the tip directly and this file is deleted. Nothing here should outlive that
-# — no provenance ceremony, no manifest (owner: *"dado que morre no próximo trem, não tem motivos"*).
+# TRANSITIONAL BY DESIGN, AND THE DECLARATION IS WHAT EXPIRES. Once the published release reaches
+# the tip again, `bootstrap/DEGRAU` is deleted and this rung self-disables in the same commit —
+# the C may stay in the tree as a harvested payload without ever being walked on again. Nothing
+# here should outlive that (owner: *"dado que morre no próximo trem, não tem motivos"*).
 
 if commit_seed_rung; then
   rm -f "$FAST_LOG"
+  gen0_to_gen1 "rung 0 (the committed host seed)" || exit 1
   exit 0
 fi
 log "rung 0 did not reach the tip — falling through to the PINNED SHA ladder (canonical-repo only:"
@@ -423,6 +586,23 @@ TIP_LOG="$(mktemp)"
 # compiler can build. BOTH are needed — that run shows the seed probing and rejecting rung 2 — so
 # do not "optimize" the first one away. Refresh with TEKO_LADDER_DISCOVER=1 (by hand, never in CI)
 # when a pin goes stale, and paste the rungs the discovery log names back into this line.
+#
+# THE INVARIANT THAT WAS MISSING, and the measurement that found it (2026-07-31, run 30613192858 —
+# nine artifact legs, docs/medicoes/2026-07-31-seed-compat-e-escada.md). A RUNG OLDER THAN THE SEED'S
+# OWN RELEASE COMMIT IS POISON. These two are 0.3.0.30-era (2026-07-24) and were discovered for the
+# 0.3.0.30 seed; the released seed is now 0.3.0.31-beta (tag v0.3.0.31-beta = 4e6c4e4b), and 0.3.1
+# REMOVED `i128`/`u128`/`f16` and the `T?` sugar. Building rung 1 with that seed was measured here:
+# 124 removed-type diagnostics across ~40 files. The ladder walks BACKWARDS across a language
+# removal, so it cannot climb — and it says so only when the seed itself fails, which is why the
+# defect stayed latent until a tip stopped being seed-buildable.
+#
+# THESE PINS ARE KNOWINGLY LEFT AS THEY ARE, and that is a report, not an oversight. Discovery cannot
+# replace them from this era: `git merge-base HEAD origin/main` IS 4e6c4e4b, the seed's own release
+# commit, so every candidate the probe can reach (newest first-parent ancestor at-or-before the
+# merge-base) is the seed or older than it — a rung with zero capability gain, or the pre-0.3.1 wall.
+# The ladder has nothing left to climb until a NEWER seed is released (from a commit >= c64178e9);
+# until then the invariant that keeps CI green is the one the unit tier now guards, that the tip
+# stays buildable by the published seed (`compiler_sources_carry_no_seed_hostile_match_arm`).
 LADDER_RUNGS="71c763d0ccec64df9fcd6c285a6782c642254e38 071c9c172f70c4fec5ff495e285cfc9cdef97fcb"
 
 # build_rung SHA STAGE — check the ladder worktree out at SHA and build it with $CURRENT_BIN into a
@@ -445,7 +625,14 @@ build_rung() {
 # the determinism the owner asked for would quietly evaporate.
 stale_pin_fatal() {
   log "FATAL: pinned ladder rung $1 FAILED to build — the pin in LADDER_RUNGS is obsolete."
-  log "This script does NOT fall back to probing (that is what the pins removed). To refresh:"
+  log "This script does NOT fall back to probing (that is what the pins removed)."
+  log "READ THE RUNG LOG BELOW FIRST. If it names REMOVED types or syntax ('type i128 was removed',"
+  log "'the \`T?\` nullable sugar has been removed'), the rung PREDATES the released seed and no"
+  log "refresh can help: discovery only walks BACK from the merge-base with $BASE_BRANCH, and when"
+  log "that merge-base is at-or-before the seed's own release commit every candidate is the seed or"
+  log "older. The fix is then to keep the TIP buildable by the published seed, or to release a newer"
+  log "seed — never to re-pin. (Measured 2026-07-31: docs/medicoes/2026-07-31-seed-compat-e-escada.md)"
+  log "Otherwise, when the rung failed on a capability the seed genuinely lacks, refresh by hand:"
   log "  TEKO_LADDER_DISCOVER=1 sh scripts/build_with_seed_fallback.sh   # run by hand, not in CI"
   log "then paste the rung SHAs it reports into LADDER_RUNGS in this file."
   log "----- pinned rung build log ($1) -----"
@@ -493,9 +680,10 @@ if [ "${TEKO_LADDER_DISCOVER:-0}" != "1" ] && [ -n "$LADDER_RUNGS" ]; then
     exit 1
   fi
   cat "$TIP_LOG"
-  phase_mark "dry build (gen$((STAGE + 1)))"
+  phase_mark "gen0 (after $STAGE pinned ladder stage(s))"
   rm -f "$FAST_LOG" "$TIP_LOG"
-  log "staged bootstrap complete — tip built by $CURRENT_DESC after $STAGE PINNED ladder stage(s)"
+  log "staged bootstrap complete — gen0 built by $CURRENT_DESC after $STAGE PINNED ladder stage(s)"
+  gen0_to_gen1 "$CURRENT_DESC" || exit 1
   exit 0
 fi
 
@@ -507,7 +695,8 @@ while :; do
   if build_project "$CURRENT_BIN" "$PWD" "$OUT_DIR" "$TIP_LOG" "$TIP_RT_DIR"; then
     cat "$TIP_LOG"
     rm -f "$FAST_LOG" "$TIP_LOG"
-    log "staged bootstrap complete — tip built by $CURRENT_DESC after $STAGE ladder stage(s)"
+    log "staged bootstrap complete — gen0 built by $CURRENT_DESC after $STAGE ladder stage(s)"
+    gen0_to_gen1 "$CURRENT_DESC" || exit 1
     exit 0
   fi
   if [ "$STAGE" -eq 0 ]; then

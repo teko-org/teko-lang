@@ -36,7 +36,7 @@ full W15 Javadoc; implementers copy them verbatim.
    native runner.
 3. **The regression shell scripts are still alive** and wired into `native.yml`:
    `compile_fail_regressions.sh`, `positive_regressions.sh`, `native_regressions.sh`,
-   `crossmodule_regressions.sh`, `diff_c_own.sh`, `validate_wasm_own.sh` (gen1-checks
+   `crossmodule_regressions.sh`, `diff_c_own.sh` (gen1-checks
    L286-390; removed in 0.3.1
    lane run regressions NATIVELY; `regressives-full-stack-0.3.0.30.md` §4 instead KEPT four of
    them ("distinct invocation / backend differential"). That divergence is failure #3.
@@ -85,7 +85,6 @@ regression = [
   "examples/regressions/lib_static/lib_static.tkr",
   "examples/regressions/lib_shared/lib_shared.tkr",
   "examples/regressions/cwd_build/cwd_build.tkr",
-  "examples/regressions/wasm_target/wasm_target.tkr",
 ]
 gate = true
 ```
@@ -146,7 +145,7 @@ New core loop (copy-paste — replaces the discover-and-walk body of `run_regres
  * @return     0 when the tier passes (or is advisory), 1 when a failure/missing-path gates it
  * @since 0.3.1
  */
-fn run_regression_sources(exe: str, m: Manifest) -> i32 {
+fn run_regression_sources(exe: str, m: Manifest): i32 {
     let work = "bin/.regr-work"
     match mkdir_p(teko::str::concat(work, "/")) { error => { }; null => { } }
     mut fails: u64 = 0
@@ -190,7 +189,7 @@ STRUCTURAL property plus the sentinel backstop:
   (`guard_no_project_build_at_root`, honest error), forcing self-project scenarios to be
   snippet-scoped. The compiler-as-SUT compiles SNIPPETS, never itself.
 - **Declarative meta-scenarios stay skip.** The four existing `# verified-by:` scenarios
-  (self-host build, own gate, gen1==gen2 fixpoint, own==C/own==wasm) CANNOT execute without
+  (self-host build, own gate, gen1==gen2 fixpoint, own==C) CANNOT execute without
   recursion; they remain verb-less and are honest-SKIPPED as living documentation (§2c).
 - **Backstop unchanged:** `TEKO_IN_REGRESSION` in `run_regression_phase` still refuses a nested
   `teko test .` re-entry. The runner only ever `teko build`s a snippet/project — never
@@ -211,7 +210,7 @@ STRUCTURAL property plus the sentinel backstop:
  * @throws          when `regr_dir` is the project root and the scenario has no inline/explicit source
  * @since 0.3.1
  */
-fn guard_no_project_build_at_root(regr_dir: str, t: Tkr) -> null | error {
+fn guard_no_project_build_at_root(regr_dir: str, t: Tkr): null | error {
     let at_root = regr_dir == "." || regr_dir.len == 0
     let has_src = t.source_inline.len > 0 || t.source_file.len > 0
     if at_root && t.kind != TkrKind::CompileFail && !has_src {
@@ -226,7 +225,7 @@ fn guard_no_project_build_at_root(regr_dir: str, t: Tkr) -> null | error {
 ## 2. Runner extensions (crumbs, with copy-paste signatures)
 
 The bank needs four capabilities the runner lacks today. Each is an independent, gate-able
-crumb (§6). None needs a new runtime symbol — env injection and the wasm/qemu run-wrappers all
+crumb (§6). None needs a new runtime symbol — env injection and the qemu run-wrappers all
 ride the existing `sh -c` command string and `teko::process::run`/`teko::io`/`teko::fs`.
 
 ### 2a. Inline source — a snippet in the `.tkr` itself (no on-disk project)
@@ -262,7 +261,7 @@ inputs the lowering fills):
  * @return          the captured build outcome (+ the produced binary path in `stdout`-adjacent scratch)
  * @since 0.3.1
  */
-fn compile_inline_source(exe: str, src_text: str, env: []str, prefix: str) -> CapResult {
+fn compile_inline_source(exe: str, src_text: str, env: []str, prefix: str): CapResult {
     let srcp = prefix ~ ".src.tks"
     match mkdir_p(teko::str::concat(dirname_of(srcp), "/")) { error => { }; null => { } }
     match teko::io::write_file(srcp, src_text) { error => { }; null => { } }
@@ -283,8 +282,8 @@ The single-file compile path (`teko <file> -o bin --no-verify`) is already prove
 
 New nouns: `Given backend = "own"` (sugar → `TEKO_BACKEND=native`), `Given backend = "c"`
 (the default; explicit for a paired differential row), and the general
-`Given env = ["TEKO_TARGET=wasm32-wasi", "FOO=bar"]`. Env applies to BOTH the compile and the
-run. This is what lets the own-vs-C and own-vs-wasm BACKEND differentials be EXPRESSED as
+`Given env = ["TEKO_TARGET=x86_64-windows", "FOO=bar"]`. Env applies to BOTH the compile and the
+run. This is what lets the own-vs-C BACKEND differential be EXPRESSED as
 scenarios: an `Examples` table over `backend` runs the SAME snippet under each backend and
 asserts the SAME absolute expected exit/stdout — if own passes N and C passes N, then own==C
 TRANSITIVELY, with no bespoke diff harness.
@@ -315,7 +314,7 @@ runtime symbol, no parent-process `set_var` leak:
  * @return            the captured exit/stdout/stderr
  * @since 0.3.1
  */
-fn run_captured_env(argv: []str, stdin_data: str, env: []str, prefix: str) -> CapResult {
+fn run_captured_env(argv: []str, stdin_data: str, env: []str, prefix: str): CapResult {
     mut cmd = ""
     mut k: u64 = 0
     if env.len > 0 { cmd = "env" }
@@ -352,7 +351,7 @@ matrix lives alongside it.
  * @return    true when the scenario declares no `When` verb
  * @since 0.3.1
  */
-fn tkb_scenario_is_declarative(sc: TkbScenario) -> bool { sc_when_verb(sc).len == 0 }
+fn tkb_scenario_is_declarative(sc: TkbScenario): bool { sc_when_verb(sc).len == 0 }
 ```
 
 ### 2d. What the six scripts do, mapped one-by-one (runner capability OR death by duplication)
@@ -363,7 +362,6 @@ fn tkb_scenario_is_declarative(sc: TkbScenario) -> bool { sc_when_verb(sc).len =
 | `positive_regressions.sh` | 46 single-project `EXPECT_EXIT`: build + run, assert exit | **DIES.** Each language/const fixture → an inline `When built and run` + `Then exit` scenario in the relevant `regressor.tkr` Feature (§3). |
 | `native_regressions.sh` | #64 `cd <proj> && teko build .` CWD-relative runtime shape, on seed + gen1 | **DIES; capability moves to the runner** as a new entry verb `When built in place` (compile with CWD == `regr_dir`, `teko build .`). Kept as ONE project-regressor (`cwd_build.tkr`, §4) — a distinct INVOCATION shape, not a language feature. |
 | `crossmodule_regressions.sh` | dep→`.tkl`→provision `packages/`→build consumer→run | **DIES; capability moves to the runner** as `Background: Given dependency "<subdir>"` (§2e). Kept as one project-regressor (`crossmodule.tkr`). The heaviest new runner crumb. |
-| `validate_wasm_own.sh` | own-wasm == C-native via `wasmtime`; `wasm-validate` structural check; memory64 | **DIES (orchestration).** → backend+target scenarios (`backend = "own"`, `target ∈ {wasm32-wasi, wasm64-wasi}`) with a `wasmtime` run-wrapper (§2g); `wasm-validate` → a `Then module valid` verb (leaf tool). Honest-skip when the engine is absent (fail-closed on the provisioned CI lane — §7). |
 
 ### 2e. Dependency provisioning — `Background: Given dependency "<subdir>"`
 
@@ -388,7 +386,7 @@ drop it into a scratch `packages/`, then compile the consumer against it. Exactl
  * @throws                  on a missing/malformed dep manifest, a dep build failure, or no `.tkl`
  * @since 0.3.1
  */
-fn provision_dependency(exe: str, dep_dir: str, scratch_packages: str, prefix: str) -> str | error { /* crumb C4 */ }
+fn provision_dependency(exe: str, dep_dir: str, scratch_packages: str, prefix: str): str | error { /* crumb C4 */ }
 ```
 
 ### 2f. `Then object well-formed` — the surviving leaf tools
@@ -413,33 +411,15 @@ absent host tool is an honest per-scenario skip (never a fabricated pass).
  * @return        the verdict (ok / FAIL / skip-when-tool-absent)
  * @since 0.3.1
  */
-fn check_object_wellformed(objp: str, target: str) -> RegrOutcome { /* crumb C3 */ }
+fn check_object_wellformed(objp: str, target: str): RegrOutcome { /* crumb C3 */ }
 ```
 
-### 2g. Target + run-wrapper — `Given target` (wasm), honest os-arch skip
+### 2g. Target selection — `Given target`, honest os-arch skip
 
-A `Given target = "wasm32-wasi"` sets `TEKO_TARGET` in `env` AND selects
-the RUN wrapper: `wasmtime` for wasm (`-W memory64=y` for `wasm64-wasi`).
-When the wrapper tool is absent the scenario honest-SKIPS with a named
-reason and the os-arch in the label (so a macOS dev host skipping the qemu lane is honest, not a
-false green). On a provisioned CI lane, a `REGRESSION_REQUIRE_TOOLS`-style fail-closed turns the
-skip into a hard failure (§7, mirroring the old `REQUIRE_WASM_ENGINE`).
-
-```teko
-/**
- * resolve_run_wrapper — the executor prefix argv for `target`: [] for a native host target,
- * `["wasmtime", "run"]` (plus `"-W","memory64=y"` for `wasm64-wasi`) for a wasm target.
- * Returns an error tagged `skip:<reason>` when
- * the required tool is absent on this host (the caller turns it into an honest os-arch skip,
- * unless a fail-closed CI flag is set — §7).
- *
- * @param target  the effective os-arch / wasm target
- * @return        the run-wrapper argv prefix, or a skip-tagged error when its tool is absent
- * @throws        (skip-tagged) when `wasmtime` is not on PATH
- * @since 0.3.1
- */
-fn resolve_run_wrapper(target: str) -> []str | error { /* crumb C3 */ }
-```
+A `Given target = "<os-arch>"` sets `TEKO_TARGET` in `env`. When the target's own toolchain is
+absent the scenario honest-SKIPS with a named reason and the os-arch in the label (so a macOS dev
+host skipping the qemu lane is honest, not a false green). On a provisioned CI lane,
+`REGRESSION_REQUIRE_TOOLS` turns the skip into a hard failure (§7).
 
 ---
 
@@ -451,7 +431,7 @@ listed FIRST in `teko.tkp`. Feature breakdown with scenario-count estimates:
 
 | Feature | content | est. scenarios |
 |---|---|---|
-| **F0 meta (declarative)** | the four R0 `# verified-by:` contracts (self-host build, own gate, gen1==gen2 fixpoint, own==C/own==wasm) — verb-less, honest-SKIPPED (§2c) | 4 (skip) |
+| **F0 meta (declarative)** | the four R0 `# verified-by:` contracts (self-host build, own gate, gen1==gen2 fixpoint, own==C) — verb-less, honest-SKIPPED (§2c) | 4 (skip) |
 | **F1 diagnostics / syntax** | ALL 39 `EXPECT_COMPILE_FAIL` rejections as inline `When compilation fails` + `Then diagnostic` — the ~6 already-pinnable PLUS the ~33 formerly "diagnostic-less" ones, each now with its EMITTED diagnostic ASSERTED (§5.2 inversion: a pinned regressive is stronger than the old exit-only marker AND than a checker `#test`) | ~39 |
 | **F2 semantics / types** | the language corpus subsumed from the plain + positive `EXPECT_EXIT` dirs, grouped: traits/derive (~10), classes/oop (~8), generics/monomorph (~6), match/patterns (~6), closures/lambda (~4), loops/labels (~5), str/char ops (~4), arena/ownership (~5), misc (~10) | ~50 |
 | **F3 capabilities — NULL-UNION MATRIX** | the COMPLETE `shapes × recursion × FFI` matrix (§3.1) — the 4th incomplete pass must not exist | ~22 |
@@ -497,7 +477,7 @@ snippet — multi-module, a real artifact kind, an FFI C-consumer, a distinct in
 stays as a small on-disk project-regressor, listed by path. The **≤10** set (owner's
 `artifact-kind × target × FFI`):
 
-1. **`regressor.tkr`** — the compiler / native `binary` kind / all backends (own, C, wasm,
+1. **`regressor.tkr`** — the compiler / native `binary` kind / all backends (own, C,
 2. **`crossmodule.tkr`** — `package` (`.tkl`) artifact + multi-module: dep→`.tkl`→consumer via
    `Background: Given dependency` (§2e). Folds the 1 `dep/consumer` fixture.
 3. **`ffi_import.tkr`** — FFI-in: `extern fn … = "SYM" from "lib"` + libc link + a C stub
@@ -508,7 +488,6 @@ stays as a small on-disk project-regressor, listed by path. The **≤10** set (o
 6. **`lib_shared.tkr`** — `kind = "shared"` (`.so`/`.dylib`/`.dll`) artifact built + linked.
 7. **`cwd_build.tkr`** — the #64 `cd <proj> && teko build .` CWD-relative invocation shape
    (`When built in place`, §2d). Folds `native_regressions.sh`.
-8. **`wasm_target.tkr`** — the wasm target with the `wasmtime`/`wasm-validate`/memory64 toolchain
    (§2g) kept separate from `regressor.tkr` because its host tooling and honest-skip surface are
    distinct. (ALTERNATIVE: fold into F5 — recommended AGAINST, to keep `regressor.tkr` toolchain-free.)
 
@@ -533,7 +512,6 @@ criterion (mechanical, ordered — first match wins):
 2. FFI needing a C stub / `consumer.c` / link (`extern_fn_libc_call`, `repr_c_struct_byval`,
    `cabi_callback_*`, `revffi_*`, `variadic_printf`) → **(b)** `ffi_import`/`ffi_export`.
 3. `own_*` (backend-differential corpus, ~18) → **(a) inline** F5 `backend`-`Examples` scenario.
-4. `wasm_*` (~9 + wasm64) → **(b)** `wasm_target.tkr` (or (a) F5 if folded).
 5. ANY `EXPECT_COMPILE_FAIL` (all 39) → **(a) inline** F1 `compilation fails` + `diagnostic`.
    The ~6 already-pinnable keep their message; the ~33 formerly-"diagnostic-less" get their
    EMITTED diagnostic captured and PINNED (0.1 inversion — a diagnostic-pinned regressive is
@@ -548,7 +526,7 @@ Approximate counts over the 231 (revised under 0.1):
 | group | fate | count |
 |---|---|---|
 | (a) inline scenarios in `regressor.tkr` (F1-F7) | language / const / null-union / own-backend / rt / ALL 39 diag-pinned rejections | ~213 |
-| (b) survive as one of the ≤10 project-regressors | crossmodule (1) + ffi (build 2) + lib_static/shared (build 2) + cwd_build (1) + wasm (~10) | ~16 dirs consolidated into 7 projects |
+| (b) survive as one of the ≤10 project-regressors | crossmodule (1) + ffi (build 2) + lib_static/shared (build 2) + cwd_build (1) | ~6 dirs consolidated into 6 projects |
 | (c) die by duplication | **none** — regressives outrank `.tkt`; the `.tkt` die instead (§5.2) | 0 |
 
 Net: **231 dirs → 1 `regressor.tkr` (~159 executable scenarios) + 7 project-regressors + 0
@@ -623,7 +601,7 @@ Themes that STAY (NO regressive equivalent — they assert INTERNAL function out
 observable program behavior; the ruling's "prefer killing `.tkt`" applies to DUPLICATES, not to
 these):
 
-- **backend encoder / regalloc / isel / stackify BYTE goldens** (`src/backend`, 23 files;
+- **backend encoder / regalloc / isel BYTE goldens** (`src/backend`, 23 files;
   `src/lir`, 3) — a regressive asserts exit/stdout equality (own==C), never the exact emitted
   bytes; the goldens are irreplaceable.
 - **pure-library units** (`math`, `crypto`, `compress`, `collections`, `encoding/*`, `text`,
@@ -671,7 +649,7 @@ the seed; nothing sequences ahead of its seed feature.
   own==C parity over one snippet. `[RITUAL]` **DONE (feat/0.3.1-regressor-runner, wave A).**
 - **C3 — Runner: target + run-wrapper + leaf-tool verbs.** `Given target` → `env`+wrapper
   (`resolve_run_wrapper`, §2g); `When built in place` (#64 CWD shape); `Then object well-formed`
-  (`check_object_wellformed`, §2f); `Then module valid` (wasm-validate). Honest os-arch skips.
+  (`check_object_wellformed`, §2f). Honest os-arch skips.
   `[RITUAL]` **DONE (feat/0.3.1-regressor-runner, wave A).**
 - **C4 — Runner: dependency provisioning.** `Background: Given dependency "<subdir>"` →
   `provision_dependency` (§2e). The heaviest runner crumb. `[RITUAL]`
@@ -682,7 +660,7 @@ the seed; nothing sequences ahead of its seed feature.
   it FIRST in `teko.tkp`. First light of the compiler-as-SUT bank. `[RITUAL]` — measure the
   duration delta (R1).
 - **C6 — POPULATE the project-regressors** (§4): author `crossmodule`, `ffi_import`, `ffi_export`,
-  `lib_static`, `lib_shared`, `cwd_build`, `wasm_target`; list each by path. Fold the source
+  `lib_static`, `lib_shared`, `cwd_build`; list each by path. Fold the source
   fixtures in. `[RITUAL]`
 - **C-cov — Runner CONTRIBUTES to coverage (0.1 prerequisite of the sweep).** Cov-A (§5.1): the
   `teko test` lane builds the regression `exe` coverage-instrumented, each snippet-compile gets
@@ -717,7 +695,7 @@ null-union C3-C7. No blocked API remains for the runner or the bank skeleton.
 regression (#64)" (`native_regressions.sh`), "EXPECT_COMPILE_FAIL (#610)"
 (`compile_fail_regressions.sh`), "EXPECT_EXIT positive (#594 8f)" (`positive_regressions.sh`),
 "E2E cross-module (#594 8d)" (`crossmodule_regressions.sh`), "C-vs-own differential"
-(`diff_c_own.sh`), the wasm differential (`validate_wasm_own.sh`), and the removed in 0.3.1
+(`diff_c_own.sh`), and the removed in 0.3.1
 `diff_c_own.sh` invocation. `native.yml` keeps only the non-regression CLI smokes
 (`cli_flags_test.sh`, `fmt_cli_test.sh`, `region_drop_subtree_test.sh`) and the
 cross-compile-linux smoke.
@@ -725,17 +703,16 @@ cross-compile-linux smoke.
 **`tests.yml` — becomes the SOLE regression executor.** `./bin/teko test .` now runs the
 regression phase (because `teko.tkp` declares `[tests] regression = […]`). ADD, on the lanes that
 can host them, provisioning for the backend toolchains the folded differentials need —
-`wasmtime` + `wasm-validate` (F5 wasm / `wasm_target`), plus the windows lane runs the coff
+the qemu emulator for the cross legs, plus the windows lane runs the coff
 differential NATIVELY.
 Set a fail-closed env (a `REGRESSION_REQUIRE_TOOLS=1`, mirroring the retired
-`REQUIRE_WASM_ENGINE`) on the provisioned lanes so a broken provisioning step is a HARD failure,
+fail-closed) on the provisioned lanes so a broken provisioning step is a HARD failure,
 not a silently-green honest-skip (D6/R2).
 
 **Surviving `scripts/*`:** `check_elf.sh`, `check_macho.sh`, `check_coff.sh` — leaf tools the
-`Then object well-formed` verb shells (§2f). External tools the runner invokes: `wasmtime`,
-`wasm-validate`. **DELETED after C7 green:** `compile_fail_regressions.sh`,
+`Then object well-formed` verb shells (§2f). **DELETED after C7 green:** `compile_fail_regressions.sh`,
 `positive_regressions.sh`, `native_regressions.sh`, `crossmodule_regressions.sh`,
-`diff_c_own.sh`, `validate_wasm_own.sh`.
+`diff_c_own.sh`.
 
 **`sanitizers.yml`** build-all loops (`for proj in examples/regressions/*/`) currently ASan/
 paranoid-build EVERY fixture dir — a SEPARATE corpus concern from regressions. Deleting the
@@ -751,8 +728,8 @@ drained dirs (§5) shrinks that corpus; see R5 for the ratifiable resolution.
   Mitigate: honest-skip where a tool is absent; provision heavy toolchains only on the lanes that
   afford them; MEASURE the delta at every `[RITUAL]` (C5/C6/C-cov). Not a HALT — the pressure is
   bounded (snippet compiles, not full builds).
-- **R2 (honest-skip erosion).** If a CI lane silently lacks `wasmtime`/`qemu`, the F5 scenarios
-  skip and coverage drops vs the old `REQUIRE_WASM_ENGINE` fail-closed. RESOLUTION: the
+- **R2 (honest-skip erosion).** If a CI lane silently lacks `qemu`, the F5 scenarios
+  skip and coverage drops vs the old fail-closed gate. RESOLUTION: the
   `REGRESSION_REQUIRE_TOOLS=1` fail-closed flag on provisioned lanes (§7/D6). A dev laptop keeps
   the honest-skip default.
 - **R3 (tree cleanliness).** Inline snippets compile into `bin/.regr-work/` (already the runner's
@@ -796,7 +773,7 @@ HALT required.**
   `dir_is_self_project` dies; anti-recursion = `guard_no_project_build_at_root` + the sentinel;
   the 4 meta-scenarios stay declarative-skip.
 - **D4** — the 6 orchestration scripts DIE; `check_{elf,macho,coff}.sh` + external
-  `wasmtime`/`wasm-validate`/`qemu` SURVIVE as scenario-invoked leaf tools.
+  `qemu` SURVIVES as a scenario-invoked leaf tool.
 - **D5** (SEALED — owner 2026-07-24) — the ≤10 set = `regressor.tkr` + `{crossmodule, ffi_import,
   backends Feature F5 (env/target + os-arch routing), NOT isolated as their own projects.
 - **D6** — `tests.yml` is the sole regression executor and PROVISIONS the backend toolchains with

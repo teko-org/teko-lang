@@ -1,0 +1,167 @@
+const FRAME_ESCAPE_LIMIT: u64 = 20
+
+type FrameSet = struct {
+    marked: []bool
+
+    grew: bool
+}
+
+pub fn frame_escape_guard(m: LModule): null | error {
+    var offenders = frame_escaping_funcs(m)
+    if offenders.len == 0 { return null }
+    error { message = teko::str::concat("native backend N1: ", teko::str::concat(teko::u64_to_str(offenders.len), teko::str::concat(" function(s) return an address inside their OWN frame, which the `ret` pops (internal) — ", frame_escape_lines(offenders)))) }
+}
+
+fn frame_escaping_funcs(m: LModule): []str {
+    var found: [m.funcs.len()]str = []
+    var count: u64 = 0
+    var it = m.funcs.iter()
+    loop {
+        match it.next() {
+            LFunc as f => {
+                if func_returns_frame_address(f) {
+                    found[count] = f.symbol
+                    count++
+                }
+            }
+            null => break
+        }
+    }
+    found[0..count]
+}
+
+fn frame_escape_lines(offenders: []str): str {
+    var out: str = ""
+    var i: u64 = 0
+    loop {
+        if i >= offenders.len || i >= FRAME_ESCAPE_LIMIT { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, teko::str::concat("`", teko::str::concat(offenders[i], "`")))
+        i++
+    }
+    if offenders.len <= FRAME_ESCAPE_LIMIT { return out }
+    teko::str::concat(out, teko::str::concat(" and ", teko::str::concat(teko::u64_to_str(offenders.len - FRAME_ESCAPE_LIMIT), " more")))
+}
+
+fn func_returns_frame_address(f: LFunc): bool {
+    var marks = frame_marks_of(f)
+    var it = f.blocks.iter()
+    loop {
+        match it.next() {
+            LBlock as b => {
+                if block_returns_frame_address(b, marks) { return true }
+            }
+            null => break
+        }
+    }
+    false
+}
+
+fn block_returns_frame_address(b: LBlock, marks: []bool): bool {
+    var it = b.insts.iter()
+    loop {
+        match it.next() {
+            LInst as inst => {
+                match inst.op {
+                    LRet as r => if r.has_value && flag_at(marks, r.value) { return true }
+                    _ => { }
+                }
+            }
+            null => break
+        }
+    }
+    false
+}
+
+fn frame_marks_of(f: LFunc): []bool {
+    var set = FrameSet { marked = false_marks(f.next_vreg); grew = true }
+    loop {
+        if !set.grew { break }
+        set = frame_sweep(f, FrameSet { marked = set.marked; grew = false })
+    }
+    set.marked
+}
+
+fn frame_sweep(f: LFunc, set: FrameSet): FrameSet {
+    var acc = set
+    var it = f.blocks.iter()
+    loop {
+        match it.next() {
+            LBlock as b => { acc = frame_sweep_block(f, acc, b) }
+            null => break
+        }
+    }
+    acc
+}
+
+fn frame_sweep_block(f: LFunc, set: FrameSet, b: LBlock): FrameSet {
+    var acc = set
+    var it = b.insts.iter()
+    loop {
+        match it.next() {
+            LInst as inst => { acc = frame_sweep_inst(f, acc, inst) }
+            null => break
+        }
+    }
+    acc
+}
+
+fn frame_sweep_inst(f: LFunc, set: FrameSet, inst: LInst): FrameSet {
+    match inst.op {
+        LAlloca => return frame_mark(set, inst.result)
+        LFieldAddr as fa => return if flag_at(set.marked, fa.base_vreg) { frame_mark(set, inst.result) } else { set }
+        LJump as j => return frame_pass_args(f, set, j.target, j.args)
+        LBranch as br => return frame_pass_args(f, frame_pass_args(f, set, br.t_target, br.t_args), br.f_target, br.f_args)
+        _ => { }
+    }
+    set
+}
+
+fn frame_pass_args(f: LFunc, set: FrameSet, target: u32, args: []u32): FrameSet {
+    var params = match block_params_of(f, target) { []u32 as p => p; null => return set }
+    var acc = set
+    var i: u64 = 0
+    loop {
+        if i >= args.len || i >= params.len { break }
+        if flag_at(acc.marked, args[i]) { acc = frame_mark(acc, params[i]) }
+        i++
+    }
+    acc
+}
+
+fn block_params_of(f: LFunc, id: u32): []u32 | null {
+    var it = f.blocks.iter()
+    loop {
+        match it.next() {
+            LBlock as b => {
+                if b.id == id { return b.params }
+            }
+            null => break
+        }
+    }
+    null
+}
+
+fn frame_mark(set: FrameSet, v: u32): FrameSet {
+    if flag_at(set.marked, v) { return set }
+    if v >= set.marked.len { return set }
+    var fs = set.marked
+    fs[v to u64] = true
+    FrameSet { marked = fs; grew = true }
+}
+
+fn flag_at(marks: []bool, v: u32): bool {
+    if v >= marks.len { return false }
+    marks[v to u64]
+}
+
+fn false_marks(n: u32): []bool {
+    var fs: []bool = []
+    var i: u32 = 0
+    loop {
+        if i >= n { break }
+        fs = [..fs, false]
+        i++
+    }
+    fs
+}

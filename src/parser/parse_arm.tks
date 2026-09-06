@@ -1,36 +1,26 @@
-// src/parser/parse_arm.tks   (namespace 'teko::parser')
 
 use teko::lexer
 
-// an optional `when guard` before `=>`. Absent → has_when=false (guard is a placeholder
-// Number 0, never read — gated by has_when). `pos` is right after the pattern.
-fn parse_guard(tokens: []lexer::Token, pos: u64) -> Guard | error {
+fn parse_guard(tokens: []lexer::Token, pos: u64): Guard | error {
     if !is_kind_at(tokens, pos, lexer::TokenKind::When) {
         return Guard { has_when = false; guard = Expr { kind = Number { is_float = false; value = numint_of_u64(0); fval = 0.0 }; line = 0; col = 0 }; next = pos }
     }
-    let g = match parse_expr(tokens, pos + 1) { Parsed<Expr> as x => x; error as e => return e }
+    var g = match parse_expr(tokens, pos + 1) { Parsed<Expr> as x => x; error as e => return e }
     Guard { has_when = true; guard = g.node; next = g.next }
 }
 
-// a match arm: `pattern [when guard] => body`. The body is a STATEMENT BLOCK, exactly like
-// an `if` then/else branch (B.20): a `{ … }` block, or one bracketless statement right after
-// `=>` (`=> expr`, `=> return x`, `=> break`, `=> continue`). The `when` guard does NOT
-// count for exhaustiveness (M.1).
-fn parse_arm(tokens: []lexer::Token, pos: u64) -> Parsed<Arm> | error {
-    let pat = match parse_pattern(tokens, pos) { Parsed<Pattern> as x => x; error as e => return e }
-    let g = match parse_guard(tokens, pat.next) { Guard as x => x; error as e => return e }
+fn parse_arm(tokens: []lexer::Token, pos: u64): Parsed<Arm> | error {
+    var pat = match parse_pattern(tokens, pos) { Parsed<@Pattern()> as x => x; error as e => return e }
+    var g = match parse_guard(tokens, pat.next) { Guard as x => x; error as e => return e }
     if !is_kind_at(tokens, g.next, lexer::TokenKind::FatArrow) {
         return err_at(tokens, g.next, "expected '=>' after a match pattern")
     }
-    let bpos = g.next + 1
-    // REUSE parse_if_body for the braced / next-line form; a same-line bracketless body
-    // (`=> expr`) parses one statement directly (an `if` branch's bracketless body sits on
-    // the NEXT line, but an arm's follows `=>` on the SAME line).
-    let body = if is_kind_at(tokens, bpos, lexer::TokenKind::LBrace) || is_sep(tokens, bpos) {
-        match parse_if_body(tokens, bpos, "expected '{' or a body after '=>'") { ParsedList<Statement> as x => x; error as e => return e }
+    var bpos = g.next + 1
+    var body = if is_kind_at(tokens, bpos, lexer::TokenKind::LBrace) || is_sep(tokens, bpos) {
+        match parse_if_body(tokens, bpos, "expected '{' or a body after '=>'") { ParsedList<@Statement()> as x => x; error as e => return e }
     } else {
-        let s = match parse_statement(tokens, bpos) { Parsed<Statement> as x => x; error as e => return e }
-        ParsedList<Statement> { items = teko::list::push(teko::list::empty(), s.node); next = s.next }
+        var s = match parse_statement(tokens, bpos) { Parsed<@Statement()> as x => x; error as e => return e }
+        ParsedList<@Statement()> { items = [s.node]; next = s.next }
     }
     Parsed<Arm> { node = Arm { pattern = pat.node; has_when = g.has_when; guard = g.guard; body = body.items }; next = body.next }
 }

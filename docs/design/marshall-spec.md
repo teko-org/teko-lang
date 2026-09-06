@@ -1,5 +1,9 @@
 # Marshall — the maximal safe↔unsafe pointer boundary (design 0.3.1)
 
+> **Status: RETIRED (superseded by §5 of docs/design/mudancas-superficie-0.3.1.md)** — the
+> opaque atomic `ptr`/`uptr` + `__wrap`/`__unwrap` surface replaces this design. See §5 for the
+> ratified shape.
+
 > **Status:** DESIGN-AHEAD, doc-only. **NOT implemented.** Companion + downstream of
 > `docs/design/ref-transparent-model.md` (the ratified `Ref<T>`/`ref` model, §5 "Marshall & a
 > fronteira `Ref`/`Ptr`") and `docs/design/memory-unsafe-backend-remodel.md` (unsafe-by-TYPE, §2).
@@ -77,7 +81,7 @@ you for the rest). Everything in §5 is a corollary of that one picture.
 
 For the implementer, the meta-types (from `src/checker/type.tks`):
 
-- **`Reference { inner: Type }`** — surface `Ref<T>`. Never null (R2). C-repr = bare `T *`. The safe
+- **`Reference { inner: Type }`** — surface `ref` (user-written keyword); internal checker notation `Ref<T>`. Never null (R2). C-repr = bare `T *`. The safe
   side. Auto-deref is type-directed (§4 ref model). **Depends on the transparent redesign** (today it
   is `.value`-based; the redesign makes it transparent).
 - **`Ptr { inner: Type? }`** — surface `ptr<T>`. `inner = null` is the opaque `ptr` (≡ `ptr<void>` ≡
@@ -174,7 +178,7 @@ safe `ref T` that legally crosses back to safe code (§2 boundary rule: a safe t
  * @example ref node: Node = teko::marshall::wrap<Node>(raw_node_ptr)  // result is ref Node
  * @since 0.3.1
  */
-pub unsafe fn wrap<T>(p: ptr<T>) -> ref T {
+pub unsafe fn wrap<T>(p: ptr<T>): ref T {
     // BLOCKED on the transparent ref redesign (§4 ref model). Body: null-panic guard, then
     // reinterpret p as the bare `T *` a Reference{T} already is (zero-cost, §3).
 }
@@ -205,7 +209,7 @@ Honesty demands we state: `unwrap` is *infallible at the crossing and dangerous 
  * @example let raw: ptr<Node> = teko::marshall::unwrap(node_ref)  // result is ptr<Node>
  * @since 0.3.1
  */
-pub unsafe fn unwrap<T>(r: Ref<T>) -> ptr<T> {
+pub unsafe fn unwrap<T>(r: Ref<T>): ptr<T> {
     // BLOCKED on the transparent ref redesign. Body: reinterpret the Reference{T}'s bare
     // `T *` as ptr<T> (zero-cost, §3). No guard.
 }
@@ -232,7 +236,7 @@ pub unsafe fn unwrap<T>(r: Ref<T>) -> ptr<T> {
  * @return ptr<T>  a null `ptr<T>` (address 0)
  * @since 0.3.1
  */
-pub unsafe fn null<T>() -> ptr<T> { /* codegen: (T *)0 */ }
+pub unsafe fn null<T>(): ptr<T> { /* codegen: (T *)0 */ }
 
 /**
  * Tests whether a raw `ptr<T>` is null (address 0) — the explicit null check that replaces the
@@ -242,7 +246,7 @@ pub unsafe fn null<T>() -> ptr<T> { /* codegen: (T *)0 */ }
  * @return bool  true iff `p` is the null pointer
  * @since 0.3.1
  */
-pub unsafe fn is_null<T>(p: ptr<T>) -> bool { /* codegen: p == (T *)0 */ }
+pub unsafe fn is_null<T>(p: ptr<T>): bool { /* codegen: p == (T *)0 */ }
 ```
 
 ### 5.4 ptr ↔ integer bridge — `to_uptr` / `from_uptr` (D35 precedent)
@@ -265,7 +269,7 @@ fns only cross the *pointer/word* line.
  * @return uptr  `p`'s address as an opaque word
  * @since 0.3.1
  */
-pub unsafe fn to_uptr<T>(p: ptr<T>) -> uptr { /* codegen: (uintptr_t)p */ }
+pub unsafe fn to_uptr<T>(p: ptr<T>): uptr { /* codegen: (uintptr_t)p */ }
 
 /**
  * Reinterprets an opaque `uptr` address as a raw `ptr<T>` — the integer->ptr half. The element
@@ -277,7 +281,7 @@ pub unsafe fn to_uptr<T>(p: ptr<T>) -> uptr { /* codegen: (uintptr_t)p */ }
  * @example let p: ptr<Node> = teko::marshall::from_uptr<Node>(word)
  * @since 0.3.1
  */
-pub unsafe fn from_uptr<T>(u: uptr) -> ptr<T> { /* codegen: (T *)u */ }
+pub unsafe fn from_uptr<T>(u: uptr): ptr<T> { /* codegen: (T *)u */ }
 ```
 
 ### 5.5 Raw-pointer OPERATORS and the sigils `*` / `&` / `->`
@@ -309,7 +313,7 @@ surface token; if the lexer lacks a distinct arrow, it desugars to `(*p).field` 
 
 Not Marshall proper (never touches `ptr`); the sole SAFE member of the namespace. Swaps the
 *pointed-at values* of two `ref T` via R4 write-through both ways — a target-rebind is structurally
-impossible (R4). Runs on the VM **and** native (it is safe), so its fixture is a *differential*
+impossible (R4). Runs natively (it is safe), so its fixture validates correctness
 oracle, unlike every unsafe fixture (native-only). Costs three `T`-copies (temp + two writes);
 acceptable, and honest about the copy (M.5 "you see the copy").
 
@@ -318,7 +322,7 @@ acceptable, and honest about the copy (M.5 "you see the copy").
  * Swaps the VALUES two references point at — write-through both (R4), never a target-rebind
  * (rebinding a reference is impossible outside `Ptr`/`unsafe`). The SAFE, sanctioned exchange
  * primitive: it stays entirely inside the safe reference world (it names no `ptr`), so it is a
- * plain `pub fn`, runs on the VM and native alike, and is subject to no unsafe gate. After the
+ * plain `pub fn`, runs natively and is subject to no unsafe gate. After the
  * call `a` holds `b`'s former value and vice-versa; the two references still alias the same two
  * storage slots they did before.
  *
@@ -396,7 +400,7 @@ element on the way in — no cheaper than the loop). Documented so the implement
  * @throws panic  on the first null element
  * @since 0.3.1
  */
-pub unsafe fn wrap_slice<T>(ps: []ptr<T>) -> []ref T { /* deferred; loop of wrap */ }
+pub unsafe fn wrap_slice<T>(ps: []ptr<T>): []ref T { /* deferred; loop of wrap */ }
 ```
 
 ---
@@ -475,12 +479,12 @@ boundary zone.
  * @param ptr<byte> c_name  a NUL-terminated C string the caller prepared
  * @return ptr<byte>  the C API's own result pointer (ownership per the C API's contract)
  */
-pub unsafe fn greet_raw(c_name: ptr<byte>) -> ptr<byte> {
+pub unsafe fn greet_raw(c_name: ptr<byte>): ptr<byte> {
     c_api_greet(c_name)
 }
 
 // the CALLER makes every copy visibly, at the call site:
-unsafe fn caller(name: str) -> str {
+unsafe fn caller(name: str): str {
     let c_in: ptr<byte> = teko::mem::as_cstr(name)     // VISIBLE copy #1 (NUL-terminated)
     let c_out: ptr<byte> = greet_raw(c_in)
     teko::mem::str_from_cstr(c_out)                    // VISIBLE copy #2 (back to safe str)
@@ -507,7 +511,7 @@ pub unsafe fn fill(ref buf: []byte) {
  * @param ptr<Node> raw  a raw, non-null node pointer from C
  * @return i64  a value computed by the safe helper
  */
-pub unsafe fn summarize(raw: ptr<Node>) -> i64 {
+pub unsafe fn summarize(raw: ptr<Node>): i64 {
     ref n: Node = teko::marshall::wrap<Node>(raw)      // null-panics if raw is null; result is ref Node
     node_weight(n)                                     // a plain SAFE fn taking ref Node
 }
@@ -539,7 +543,7 @@ convention as `arena_manual_ok`/`unsafe_rawbuf_roundtrip`). REJECT fixtures carr
 
 | fixture | oracle | exercises |
 |---|---|---|
-| `marshall_swap_values` | **VM + native** (swap is SAFE) | §5.6 write-through both ways; exit = f(swapped values) |
+| `marshall_swap_values` | **native** (swap is SAFE) | §5.6 write-through both ways; exit = f(swapped values) |
 | `marshall_wrap_unwrap_roundtrip` | native-only | `unwrap` then `wrap` an identity; exit = value read back through the round-tripped Ref |
 | `marshall_uptr_roundtrip` | native-only | §5.4 `to_uptr`→`from_uptr` identity; exit = deref of the rebuilt ptr |
 | `marshall_ptr_arith_index` | native-only | §5.5 `p + n`, `p[n]`, `*p`, `&x` inside `unsafe fn`; exit = summed elements |
@@ -628,7 +632,7 @@ Smallest safe steps, each independently gate-able. **UNBLOCKED** crumbs land aga
   `marshall_ptr_arith_index`, `marshall_ptr_arith_in_safe_rejected`.
 
 - **C3 — `swap` [UNBLOCKED].** Add `teko::marshall::swap<T>` (§5.6; compiles against today's Ref).
-  Fixtures: `marshall_swap_values` (VM+native differential), `marshall_swap_on_let_rejected`.
+  Fixtures: `marshall_swap_values` (native validation), `marshall_swap_on_let_rejected`.
   **Ritual: full gate** (first SAFE Marshall member; the safe surface is now complete).
 
 - **C4 — `wrap` [BLOCKED on transparent ref].** Add `teko::marshall::wrap<T>` (§5.1): static

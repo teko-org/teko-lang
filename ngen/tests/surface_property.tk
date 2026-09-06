@@ -1,0 +1,109 @@
+// surface_property.tk -- properties, as C# writes them (D223, entrega 5): a
+// member that reads like a field at every use site and is a pair of methods
+// everywhere else.
+//
+// The three forms are here: the AUTO-property (`{ get; set; }`, which gets a
+// backing field of its own), the expression-bodied one (`get => e;` /
+// `set => s;`) and the block-bodied one (`get { ... }`). `value` is the name
+// the `set` is handed; `Area` written bare inside the type is the same call
+// `this.Area` would be; and an accessor may narrow the property's visibility
+// (`{ get; private set; }`).
+//
+// The `override` is the point of the middle of this file: `Square` redeclares
+// the `get` alone, so a `Shape`-typed name holding a `Square` reads the
+// override and writes the setter it did NOT redeclare -- one vtable slot per
+// accessor, and the base's own getter (`Twice`) reaching the override through
+// the same slot.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+trait Labelled {
+    public i64 Label { get => 7; }
+}
+
+class Shape {
+    public i64 side;
+
+    public virtual i64 Area {
+        get => side;
+        set => side = value;
+    }
+
+    public i64 Twice {
+        get { return Area * 2; }
+    }
+}
+
+class Square : Shape {
+    public override i64 Area {
+        get => side * side;
+    }
+}
+
+struct Meter {
+    public i64 Raw { get; set; }
+    public static i64 Made { get; set; }
+
+    public i64 doubled() {
+        return Raw * 2;
+    }
+}
+
+class Counter {
+    use Labelled;
+
+    public i64 N { get; private set; }
+
+    public i64 bump(i64 k) {
+        N = N + k;                               // the private setter, from inside
+        return N;
+    }
+}
+
+i64 area_of(Shape s) {
+    return s.Area;                               // a receiver only the oracle types
+}
+
+i64 set_area(Shape s, i64 v) {
+    s.Area = v;
+    return s.Area;
+}
+
+i64 main() {
+    Shape s = new Shape;
+    s.side = 3;
+    if (s.Area != 3) return 1;
+    s.Area = 5;                                  // the `set`, and its `value`
+    if (s.side != 5) return 2;
+    if (s.Twice != 10) return 3;                 // a block-bodied, get-only property
+
+    Square q = new Square;
+    q.side = 4;
+    if (q.Area != 16) return 4;                  // the override
+    if (q.Twice != 32) return 5;                 // the base's getter, reaching it
+
+    Shape b = q;
+    if (b.Area != 16) return 6;                  // through the base's own slot
+    if (area_of(b) != 16) return 7;
+    if (set_area(b, 6) != 36) return 8;          // the `set` the override kept
+    if (q.side != 6) return 9;
+
+    Meter m = new Meter;
+    m.Raw = 8;
+    if (m.Raw != 8) return 10;
+    if (m.doubled() != 16) return 11;
+    if (METER_SIZE != 8) return 12;              // one auto-property, one word
+    Meter.Made = 2;
+    if (Meter.Made != 2) return 13;              // a static one answers to its type
+
+    Counter c = new Counter;
+    if (c.bump(3) != 3) return 14;
+    if (c.bump(4) != 7) return 15;
+    if (c.N != 7) return 16;
+    if (c.Label != 7) return 17;                 // a property a trait brought
+
+    s.Area = 4;
+    return q.Area + Meter.Made + s.Area;         // 36 + 2 + 4
+}

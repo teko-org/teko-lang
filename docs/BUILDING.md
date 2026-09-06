@@ -12,14 +12,17 @@ Technical instructions for compiling the Teko toolchain and for building Teko pr
 
 No other dependencies: the compiler links **nothing beyond libc** (no libm on macOS/Windows, no pthread, no third-party libraries). On Windows, `kernel32` is used for directory enumeration.
 
-## 2. The two engines
+## 2. The execution model
 
-Teko ships one binary with two execution engines, and the project treats their agreement as a correctness gate:
+Native is the sole execution engine, in the toolchain and in generated programs:
 
-- **Native** — `teko build` lowers the checked program to C, then invokes `cc`. Production path.
-- **VM** — `teko run` / `teko test` tree-walk the same checked program. Development/test path.
+- `teko build` lowers the checked program to C, then invokes `cc` for an optimized release
+  binary. Production path.
+- `teko run` builds the same checked program natively under `-O0` and executes it
+  immediately in-process. Development path.
+- `teko test` runs the project's `#test` functions natively (see §6 "The test gate").
 
-Every validated change must produce identical behavior on both (*differential equivalence*).
+All three go through the same native codegen; there is no second engine to keep in agreement.
 
 ## 3. Building the bootstrap compiler
 
@@ -35,7 +38,7 @@ This produces:
 
 Notes baked into the CMake configuration:
 
-- The `teko` executable links `src/runtime/teko_rt.c` (the same runtime source it hands to `cc` for generated programs) and gets a **64 MB stack** on all platforms — the VM uses deep C recursion when interpreting the compiler's own parser during `teko test`.
+- The `teko` executable links `src/runtime/teko_rt.c` (the same runtime source it hands to `cc` for generated programs) and gets a **64 MB stack** on all platforms — the compiler's own recursive-descent parser and checker use deep native recursion when processing the corpus during `teko test`.
 - `TK_RT_DIR`/`TK_SRC_DIR` compile definitions tell the driver where the runtime lives, so generated programs can be compiled from any working directory.
 
 ## 4. Self-hosting — THE validation gate
@@ -59,7 +62,7 @@ After **any** compiler change, verify both engines and the fixpoint before consi
 
 ```sh
 ./build/teko build . -o bin          # C bootstrap: full build + .tkt test gate
-./bin/teko  build . -o /tmp/gen2     # self-hosted: same, through vm.tks
+./bin/teko  build . -o /tmp/gen2     # self-hosted: same, natively
 # and: the two generated C outputs must be byte-identical after gensym normalization
 ```
 
@@ -72,7 +75,7 @@ A project is a directory containing a `*.tkp` manifest (TOML — see [../teko.tk
 ```sh
 teko build <dir>              # type-check, run tests, emit native binary
 teko build <dir> -o <outdir>  # choose the output directory
-teko run   <dir>              # execute on the VM
+teko run   <dir>              # native debug build (-O0) and immediate execution
 teko test  <dir>              # run #test functions (files ending in .tkt)
 teko test  <dir> --coverage   # also emit a Cobertura cobertura.xml report
 ```

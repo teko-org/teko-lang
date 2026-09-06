@@ -1,0 +1,702 @@
+const AES_SBOX: []u32 = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5,
+    0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
+    0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc,
+    0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a,
+    0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0,
+    0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b,
+    0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85,
+    0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5,
+    0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17,
+    0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88,
+    0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c,
+    0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9,
+    0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6,
+    0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e,
+    0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94,
+    0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68,
+    0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
+]
+
+const AES_INV_SBOX: []u32 = [
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38,
+    0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87,
+    0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d,
+    0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2,
+    0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16,
+    0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda,
+    0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a,
+    0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02,
+    0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea,
+    0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85,
+    0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89,
+    0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20,
+    0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31,
+    0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d,
+    0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0,
+    0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26,
+    0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d
+]
+
+const AES_RCON: []u32 = [
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
+]
+
+/**
+ * An expanded AES key: the full round-key schedule flattened to bytes plus the round count, so a
+ * caller expands a key once (`aes_key_expand`) and reuses it across every block of a mode.
+ */
+exp type AesKey = struct {
+    /** the round keys `w0..w{4(Nr+1)-1}` serialized big-endian to `16 · (Nr+1)` bytes */
+    round_keys: []byte
+    /** the number of AES rounds `Nr` (10 for AES-128, 12 for AES-192, 14 for AES-256) */
+    rounds: u64
+}
+
+fn cipher_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+fn gf_mul8(a: u32, b: u32): u32 {
+    var p: u32 = 0
+    var x = a & 0xFF
+    var y = b & 0xFF
+    var i: u64 = 0
+    loop {
+        if i >= 8 { break }
+        var bit = y & 1
+        p = p ^ (x * bit)
+        var carry = (x >> 7) & 1
+        x = ((x << 1) & 0xFF) ^ (0x1b * carry)
+        y = y >> 1
+        i++
+    }
+    p & 0xFF
+}
+
+fn aes_be_word(b: []byte, off: u64): u32 {
+    ((b[off] to u32) << 24) | ((b[off + 1] to u32) << 16) | ((b[off + 2] to u32) << 8) | (b[off + 3] to u32)
+}
+
+fn aes_be_word_bytes(x: u32): []byte {
+    [
+        ((x >> 24) & 0xFF) to byte,
+        ((x >> 16) & 0xFF) to byte,
+        ((x >> 8) & 0xFF) to byte,
+        (x & 0xFF) to byte,
+    ]
+}
+
+fn aes_sub_word(w: u32): u32 {
+    var b0 = AES_SBOX[((w >> 24) & 0xFF) to u64]
+    var b1 = AES_SBOX[((w >> 16) & 0xFF) to u64]
+    var b2 = AES_SBOX[((w >> 8) & 0xFF) to u64]
+    var b3 = AES_SBOX[(w & 0xFF) to u64]
+    (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+}
+
+fn aes_rot_word(w: u32): u32 {
+    ((w << 8) | (w >> 24)) & 0xFFFFFFFF
+}
+
+fn aes_expand_words(key: []byte, nk: u64, nr: u64): []u32 {
+    var total = 4 * (nr + 1)
+    var w: [total]u32 = []
+    var i: u64 = 0
+    loop {
+        if i >= nk { break }
+        w[i] = aes_be_word(key, i * 4)
+        i++
+    }
+    loop {
+        if i >= total { break }
+        var temp = w[i - 1]
+        var m = i % nk
+        if m == 0 {
+            temp = aes_sub_word(aes_rot_word(temp)) ^ (AES_RCON[i / nk] << 24)
+        } else if nk > 6 && m == 4 {
+            temp = aes_sub_word(temp)
+        }
+        w[i] = w[i - nk] ^ temp
+        i++
+    }
+    w
+}
+
+/**
+ * Expands an AES key (16, 24, or 32 bytes) into a reusable `AesKey` (FIPS 197 §5.2). Expand once,
+ * then feed the result to `aes_encrypt_block_ks`/`aes_decrypt_block_ks` (or the mode functions) for
+ * every block under that key.
+ */
+exp fn aes_key_expand(key: []byte): AesKey | CryptoError {
+    if key.len != 16 && key.len != 24 && key.len != 32 {
+        return crypto_error("aes: key must be 16, 24, or 32 bytes")
+    }
+    var nk = key.len / 4
+    var nr = nk + 6
+    var words = aes_expand_words(key, nk, nr)
+    var rk: [words.len * 4]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= words.len { break }
+        var bw = aes_be_word_bytes(words[i])
+        rk[i * 4] = bw[0]
+        rk[i * 4 + 1] = bw[1]
+        rk[i * 4 + 2] = bw[2]
+        rk[i * 4 + 3] = bw[3]
+        i++
+    }
+    AesKey { round_keys = rk; rounds = nr }
+}
+
+fn aes_sub_bytes(s: []byte, box: []u32): []byte {
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        out[i] = box[s[i] to u64] to byte
+        i++
+    }
+    out
+}
+
+fn aes_shift_rows(s: []byte): []byte {
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        var r = i % 4
+        var c = i / 4
+        var src = r + 4 * ((c + r) % 4)
+        out[i] = s[src]
+        i++
+    }
+    out
+}
+
+fn aes_inv_shift_rows(s: []byte): []byte {
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        var r = i % 4
+        var c = i / 4
+        var src = r + 4 * ((c + 4 - r) % 4)
+        out[i] = s[src]
+        i++
+    }
+    out
+}
+
+fn aes_mix_one_column(s0: u32, s1: u32, s2: u32, s3: u32): []byte {
+    var o0 = gf_mul8(s0, 2) ^ gf_mul8(s1, 3) ^ s2 ^ s3
+    var o1 = s0 ^ gf_mul8(s1, 2) ^ gf_mul8(s2, 3) ^ s3
+    var o2 = s0 ^ s1 ^ gf_mul8(s2, 2) ^ gf_mul8(s3, 3)
+    var o3 = gf_mul8(s0, 3) ^ s1 ^ s2 ^ gf_mul8(s3, 2)
+    [
+        (o0 & 0xFF) to byte,
+        (o1 & 0xFF) to byte,
+        (o2 & 0xFF) to byte,
+        (o3 & 0xFF) to byte,
+    ]
+}
+
+fn aes_inv_mix_one_column(s0: u32, s1: u32, s2: u32, s3: u32): []byte {
+    var o0 = gf_mul8(s0, 14) ^ gf_mul8(s1, 11) ^ gf_mul8(s2, 13) ^ gf_mul8(s3, 9)
+    var o1 = gf_mul8(s0, 9) ^ gf_mul8(s1, 14) ^ gf_mul8(s2, 11) ^ gf_mul8(s3, 13)
+    var o2 = gf_mul8(s0, 13) ^ gf_mul8(s1, 9) ^ gf_mul8(s2, 14) ^ gf_mul8(s3, 11)
+    var o3 = gf_mul8(s0, 11) ^ gf_mul8(s1, 13) ^ gf_mul8(s2, 9) ^ gf_mul8(s3, 14)
+    [
+        (o0 & 0xFF) to byte,
+        (o1 & 0xFF) to byte,
+        (o2 & 0xFF) to byte,
+        (o3 & 0xFF) to byte,
+    ]
+}
+
+fn aes_mix_columns(s: []byte): []byte {
+    var out: [16]byte = []
+    var c: u64 = 0
+    loop {
+        if c >= 4 { break }
+        var col = aes_mix_one_column(s[4 * c] to u32, s[4 * c + 1] to u32, s[4 * c + 2] to u32, s[4 * c + 3] to u32)
+        out[4 * c] = col[0]
+        out[4 * c + 1] = col[1]
+        out[4 * c + 2] = col[2]
+        out[4 * c + 3] = col[3]
+        c++
+    }
+    out
+}
+
+fn aes_inv_mix_columns(s: []byte): []byte {
+    var out: [16]byte = []
+    var c: u64 = 0
+    loop {
+        if c >= 4 { break }
+        var col = aes_inv_mix_one_column(s[4 * c] to u32, s[4 * c + 1] to u32, s[4 * c + 2] to u32, s[4 * c + 3] to u32)
+        out[4 * c] = col[0]
+        out[4 * c + 1] = col[1]
+        out[4 * c + 2] = col[2]
+        out[4 * c + 3] = col[3]
+        c++
+    }
+    out
+}
+
+fn aes_add_round_key(s: []byte, rk: []byte, round: u64): []byte {
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        out[i] = ((s[i] to u32) ^ (rk[16 * round + i] to u32)) to byte
+        i++
+    }
+    out
+}
+
+/**
+ * Encrypts one 16-byte block under a pre-expanded key (FIPS 197 §5.1) — the fast path the modes
+ * and the CMAC/GMAC seams reuse so the key schedule is computed once, not per block.
+ */
+exp fn aes_encrypt_block_ks(ks: AesKey, block: []byte): []byte {
+    var state = aes_add_round_key(block, ks.round_keys, 0)
+    var round: u64 = 1
+    loop {
+        if round >= ks.rounds { break }
+        state = aes_add_round_key(aes_mix_columns(aes_shift_rows(aes_sub_bytes(state, AES_SBOX))), ks.round_keys, round)
+        round++
+    }
+    aes_add_round_key(aes_shift_rows(aes_sub_bytes(state, AES_SBOX)), ks.round_keys, ks.rounds)
+}
+
+/**
+ * Decrypts one 16-byte block under a pre-expanded key using the equivalent inverse cipher
+ * (FIPS 197 §5.3).
+ */
+exp fn aes_decrypt_block_ks(ks: AesKey, block: []byte): []byte {
+    var state = aes_add_round_key(block, ks.round_keys, ks.rounds)
+    var round = ks.rounds - 1
+    loop {
+        if round == 0 { break }
+        state = aes_inv_mix_columns(aes_add_round_key(aes_inv_sub_bytes_state(state), ks.round_keys, round))
+        round = round - 1
+    }
+    aes_add_round_key(aes_inv_sub_bytes_state(state), ks.round_keys, 0)
+}
+
+fn aes_inv_sub_bytes_state(s: []byte): []byte {
+    aes_sub_bytes(aes_inv_shift_rows(s), AES_INV_SBOX)
+}
+
+/**
+ * Encrypts one 16-byte block under `key` (FIPS 197), expanding the key on the spot — the one-shot
+ * form for a caller that encrypts a single block. For many blocks, expand once with
+ * `aes_key_expand` and call `aes_encrypt_block_ks`.
+ */
+exp fn aes_encrypt_block(key: []byte, block: []byte): []byte | CryptoError {
+    if block.len != 16 { return crypto_error("aes: block must be exactly 16 bytes") }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    aes_encrypt_block_ks(ks, block)
+}
+
+/**
+ * Decrypts one 16-byte block under `key` (FIPS 197), expanding the key on the spot.
+ */
+exp fn aes_decrypt_block(key: []byte, block: []byte): []byte | CryptoError {
+    if block.len != 16 { return crypto_error("aes: block must be exactly 16 bytes") }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    aes_decrypt_block_ks(ks, block)
+}
+
+fn cipher_xor16(a: []byte, b: []byte): []byte {
+    var out: [16]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        out[i] = ((a[i] to u32) ^ (b[i] to u32)) to byte
+        i++
+    }
+    out
+}
+
+fn ctr_increment(block: []byte): []byte {
+    var out: [16]byte = []
+    var carry: u32 = 1
+    var i: u64 = 16
+    loop {
+        if i == 0 { break }
+        i--
+        var v = (block[i] to u32) + carry
+        out[i] = (v & 0xFF) to byte
+        carry = v >> 8
+    }
+    out
+}
+
+fn require_iv16(iv: []byte): []byte | CryptoError {
+    if iv.len != 16 { return crypto_error("aes: IV must be exactly 16 bytes") }
+    iv
+}
+
+/**
+ * AES-CBC encryption (NIST SP 800-38A §6.2): `C_i = CIPH_K(P_i ⊕ C_{i-1})`, `C_0 = IV`. No
+ * padding — the plaintext length must be a whole number of 16-byte blocks (a caller needing
+ * partial data pads first, e.g. PKCS#7).
+ */
+exp fn aes_cbc_encrypt(key: []byte, iv: []byte, pt: []byte): []byte | CryptoError {
+    var iv16 = match require_iv16(iv) { []byte as v => v; CryptoError as e => return e }
+    if pt.len % 16 != 0 { return crypto_error("aes_cbc: plaintext length must be a multiple of 16") }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var out: [pt.len]byte = []
+    var prev = iv16
+    var off: u64 = 0
+    loop {
+        if off >= pt.len { break }
+        var c = aes_encrypt_block_ks(ks, cipher_xor16(cipher_slice(pt, off, off + 16), prev))
+        var j: u64 = 0
+        loop {
+            if j >= 16 { break }
+            out[off + j] = c[j]
+            j++
+        }
+        prev = c
+        off = off + 16
+    }
+    out
+}
+
+/**
+ * AES-CBC decryption (NIST SP 800-38A §6.2): `P_i = CIPH_K^{-1}(C_i) ⊕ C_{i-1}`, `C_0 = IV`.
+ */
+exp fn aes_cbc_decrypt(key: []byte, iv: []byte, ct: []byte): []byte | CryptoError {
+    var iv16 = match require_iv16(iv) { []byte as v => v; CryptoError as e => return e }
+    if ct.len % 16 != 0 { return crypto_error("aes_cbc: ciphertext length must be a multiple of 16") }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var out: [ct.len]byte = []
+    var prev = iv16
+    var off: u64 = 0
+    loop {
+        if off >= ct.len { break }
+        var cblock = cipher_slice(ct, off, off + 16)
+        var pblock = cipher_xor16(aes_decrypt_block_ks(ks, cblock), prev)
+        var j: u64 = 0
+        loop {
+            if j >= 16 { break }
+            out[off + j] = pblock[j]
+            j++
+        }
+        prev = cblock
+        off = off + 16
+    }
+    out
+}
+
+/**
+ * AES-CTR (NIST SP 800-38A §6.5): XORs the data with the keystream `CIPH_K(T_i)`, where the
+ * counter block starts at `iv` and is incremented as a big-endian 128-bit integer per block.
+ * Encryption and decryption are the same operation, so this one function serves both. The data may
+ * be any length (the final partial block is truncated to fit).
+ */
+exp fn aes_ctr(key: []byte, iv: []byte, data: []byte): []byte | CryptoError {
+    var counter = match require_iv16(iv) { []byte as v => v; CryptoError as e => return e }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var out: [data.len]byte = []
+    var off: u64 = 0
+    loop {
+        if off >= data.len { break }
+        var block = aes_encrypt_block_ks(ks, counter)
+        var n = if data.len - off < 16 { data.len - off } else { 16 }
+        var j: u64 = 0
+        loop {
+            if j >= n { break }
+            out[off + j] = ((data[off + j] to u32) ^ (block[j] to u32)) to byte
+            j++
+        }
+        counter = ctr_increment(counter)
+        off = off + 16
+    }
+    out
+}
+
+/**
+ * AES-OFB (NIST SP 800-38A §6.4): the keystream is the repeated re-encryption of the IV
+ * (`O_i = CIPH_K(O_{i-1})`, `O_0 = IV`), XORed into the data. Encryption and decryption are the
+ * same operation. The data may be any length.
+ */
+exp fn aes_ofb(key: []byte, iv: []byte, data: []byte): []byte | CryptoError {
+    var feedback = match require_iv16(iv) { []byte as v => v; CryptoError as e => return e }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var out: [data.len]byte = []
+    var off: u64 = 0
+    loop {
+        if off >= data.len { break }
+        feedback = aes_encrypt_block_ks(ks, feedback)
+        var n = if data.len - off < 16 { data.len - off } else { 16 }
+        var j: u64 = 0
+        loop {
+            if j >= n { break }
+            out[off + j] = ((data[off + j] to u32) ^ (feedback[j] to u32)) to byte
+            j++
+        }
+        off = off + 16
+    }
+    out
+}
+
+/**
+ * AES-CFB encryption with full 128-bit feedback (NIST SP 800-38A §6.3, the CFB-128 variant):
+ * `C_i = P_i ⊕ CIPH_K(C_{i-1})`, `C_0 = IV`. The data may be any length (the final partial block
+ * is XORed with the leading bytes of the keystream).
+ */
+exp fn aes_cfb_encrypt(key: []byte, iv: []byte, pt: []byte): []byte | CryptoError {
+    var feedback = match require_iv16(iv) { []byte as v => v; CryptoError as e => return e }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var out: [pt.len]byte = []
+    var off: u64 = 0
+    loop {
+        if off >= pt.len { break }
+        var ksblock = aes_encrypt_block_ks(ks, feedback)
+        var n = if pt.len - off < 16 { pt.len - off } else { 16 }
+        var cblock: [n]byte = []
+        var j: u64 = 0
+        loop {
+            if j >= n { break }
+            cblock[j] = ((pt[off + j] to u32) ^ (ksblock[j] to u32)) to byte
+            j++
+        }
+        var k: u64 = 0
+        loop {
+            if k >= n { break }
+            out[off + k] = cblock[k]
+            k++
+        }
+        feedback = cblock
+        off = off + 16
+    }
+    out
+}
+
+/**
+ * AES-CFB decryption with full 128-bit feedback (NIST SP 800-38A §6.3): `P_i = C_i ⊕
+ * CIPH_K(C_{i-1})`, `C_0 = IV` — the feedback is the ciphertext, so decryption still uses the
+ * forward block cipher.
+ */
+exp fn aes_cfb_decrypt(key: []byte, iv: []byte, ct: []byte): []byte | CryptoError {
+    var feedback = match require_iv16(iv) { []byte as v => v; CryptoError as e => return e }
+    var ks = match aes_key_expand(key) { AesKey as k => k; CryptoError as e => return e }
+    var out: [ct.len]byte = []
+    var off: u64 = 0
+    loop {
+        if off >= ct.len { break }
+        var ksblock = aes_encrypt_block_ks(ks, feedback)
+        var n = if ct.len - off < 16 { ct.len - off } else { 16 }
+        var j: u64 = 0
+        loop {
+            if j >= n { break }
+            out[off + j] = ((ct[off + j] to u32) ^ (ksblock[j] to u32)) to byte
+            j++
+        }
+        feedback = cipher_slice(ct, off, off + n)
+        off = off + 16
+    }
+    out
+}
+
+type ChaChaQuad = struct {
+    a: u32
+    b: u32
+    c: u32
+    d: u32
+}
+
+fn chacha_quarter_round(a: u32, b: u32, c: u32, d: u32): ChaChaQuad {
+    var na = teko::math::wrapping_add_u32(a, b)
+    var nd = rotl32(d ^ na, 16)
+    var nc = teko::math::wrapping_add_u32(c, nd)
+    var nb = rotl32(b ^ nc, 12)
+    na = teko::math::wrapping_add_u32(na, nb)
+    nd = rotl32(nd ^ na, 8)
+    nc = teko::math::wrapping_add_u32(nc, nd)
+    nb = rotl32(nb ^ nc, 7)
+    ChaChaQuad { a = na; b = nb; c = nc; d = nd }
+}
+
+fn cipher_le_word(b: []byte, off: u64): u32 {
+    (b[off] to u32) | ((b[off + 1] to u32) << 8) | ((b[off + 2] to u32) << 16) | ((b[off + 3] to u32) << 24)
+}
+
+fn cipher_le_word_bytes(x: u32): []byte {
+    [
+        (x & 0xFF) to byte,
+        ((x >> 8) & 0xFF) to byte,
+        ((x >> 16) & 0xFF) to byte,
+        ((x >> 24) & 0xFF) to byte,
+    ]
+}
+
+fn chacha20_init_state(key: []byte, nonce: []byte, counter: u32): []u32 {
+    [
+        0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+        cipher_le_word(key, 0),
+        cipher_le_word(key, 4),
+        cipher_le_word(key, 8),
+        cipher_le_word(key, 12),
+        cipher_le_word(key, 16),
+        cipher_le_word(key, 20),
+        cipher_le_word(key, 24),
+        cipher_le_word(key, 28),
+        counter,
+        cipher_le_word(nonce, 0),
+        cipher_le_word(nonce, 4),
+        cipher_le_word(nonce, 8),
+    ]
+}
+
+fn chacha20_rounds(s: []u32): []u32 {
+    var x0 = s[0]
+    var x1 = s[1]
+    var x2 = s[2]
+    var x3 = s[3]
+    var x4 = s[4]
+    var x5 = s[5]
+    var x6 = s[6]
+    var x7 = s[7]
+    var x8 = s[8]
+    var x9 = s[9]
+    var x10 = s[10]
+    var x11 = s[11]
+    var x12 = s[12]
+    var x13 = s[13]
+    var x14 = s[14]
+    var x15 = s[15]
+    var round: u64 = 0
+    loop {
+        if round >= 10 { break }
+        var q0 = chacha_quarter_round(x0, x4, x8, x12)
+        x0 = q0.a
+        x4 = q0.b
+        x8 = q0.c
+        x12 = q0.d
+        var q1 = chacha_quarter_round(x1, x5, x9, x13)
+        x1 = q1.a
+        x5 = q1.b
+        x9 = q1.c
+        x13 = q1.d
+        var q2 = chacha_quarter_round(x2, x6, x10, x14)
+        x2 = q2.a
+        x6 = q2.b
+        x10 = q2.c
+        x14 = q2.d
+        var q3 = chacha_quarter_round(x3, x7, x11, x15)
+        x3 = q3.a
+        x7 = q3.b
+        x11 = q3.c
+        x15 = q3.d
+        var q4 = chacha_quarter_round(x0, x5, x10, x15)
+        x0 = q4.a
+        x5 = q4.b
+        x10 = q4.c
+        x15 = q4.d
+        var q5 = chacha_quarter_round(x1, x6, x11, x12)
+        x1 = q5.a
+        x6 = q5.b
+        x11 = q5.c
+        x12 = q5.d
+        var q6 = chacha_quarter_round(x2, x7, x8, x13)
+        x2 = q6.a
+        x7 = q6.b
+        x8 = q6.c
+        x13 = q6.d
+        var q7 = chacha_quarter_round(x3, x4, x9, x14)
+        x3 = q7.a
+        x4 = q7.b
+        x9 = q7.c
+        x14 = q7.d
+        round++
+    }
+    [x0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15]
+}
+
+fn chacha20_block(key: []byte, nonce: []byte, counter: u32): []byte {
+    var s = chacha20_init_state(key, nonce, counter)
+    var w = chacha20_rounds(s)
+    var out: [64]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= 16 { break }
+        var lw = cipher_le_word_bytes(teko::math::wrapping_add_u32(w[i], s[i]))
+        out[i * 4] = lw[0]
+        out[i * 4 + 1] = lw[1]
+        out[i * 4 + 2] = lw[2]
+        out[i * 4 + 3] = lw[3]
+        i++
+    }
+    out
+}
+
+/**
+ * ChaCha20 stream cipher (RFC 8439 §2.4): XORs `data` with the keystream generated from the
+ * 32-byte `key`, 12-byte `nonce`, and 32-bit initial block `counter` (RFC 8439 uses counter 1 for
+ * the first message block). Encryption and decryption are the same operation. The counter is
+ * 32-bit-wrapping per block.
+ */
+exp fn chacha20(key: []byte, nonce: []byte, counter: u32, data: []byte): []byte | CryptoError {
+    if key.len != 32 { return crypto_error("chacha20: key must be exactly 32 bytes") }
+    if nonce.len != 12 { return crypto_error("chacha20: nonce must be exactly 12 bytes (96-bit)") }
+    var out: [data.len]byte = []
+    var off: u64 = 0
+    var block_counter = counter
+    loop {
+        if off >= data.len { break }
+        var ks = chacha20_block(key, nonce, block_counter)
+        var n = if data.len - off < 64 { data.len - off } else { 64 }
+        var j: u64 = 0
+        loop {
+            if j >= n { break }
+            out[off + j] = ((data[off + j] to u32) ^ (ks[j] to u32)) to byte
+            j++
+        }
+        block_counter = teko::math::wrapping_add_u32(block_counter, 1)
+        off = off + 64
+    }
+    out
+}

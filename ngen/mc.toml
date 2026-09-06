@@ -1,0 +1,122 @@
+# mc.toml -- the whole directory built by `mc build`, no make and no
+# hand-written ld line (docs/build.md):
+#
+#   mc build ngen              # from the repository root
+#   mc build                   # from inside ngen/
+#
+# Two steps come out of it: the taught compiler (`build/teko`, D64.1's
+# five parts -- `core_teko.mc` names four of them, `[compiler].core` the
+# fifth -- plus `teko.tk`, docs/design/port-teko-mc.md) and then
+# tests/hello.tk compiled BY that binary into a native executable.
+# Nothing in the `mc` repository's `src/` changes, and nothing in THIS
+# repository's `src/` changes either -- `src/` is frozen (D211/D212 in
+# this repo's DECISION_LOG.md); every new construct lives here, in `ngen/`.
+
+# `os = "linux"` / `arch = "x86_64"` matches the CI runner (ubuntu-latest)
+# and this repository's dev host; there is no `[sysroot]` because `[linker]`
+# is the system's own `cc`, which already knows where its crt objects and
+# libc are -- one line instead of pinning a musl sysroot for a program that,
+# so far, links no libc symbol beyond `write`/`exit` (ngen/lib/rt.tk).
+
+[project]
+name  = "teko"
+entry = "tests/hello.tk"
+out   = "build/teko-hello"
+kind  = "exe"
+
+[target]
+os   = "linux"
+arch = "x86_64"
+
+[compiler]
+core    = "<mc/core_min>"
+modules = ["core_teko.mc", "teko.tk", "user.mc"]
+out     = "build/teko"
+
+[linker]
+cmd  = "cc"
+args = ["-o", "{out}", "{obj}"]
+
+# the static estimate is a function of source bytes and a taught compiler
+# this small does not land anywhere near it; 1.0 is examples/lang's own
+# starting point (see that project's mc.toml for the full rationale) and
+# `mc limits ngen` is what tells whether it still holds once this project
+# grows past the vertical slice.
+[limits]
+tolerance = 1.0
+
+[include]
+paths = ["lib"]
+
+# S3 (D64.7, docs/reference/packages.md §3): the `teko` package, "both", the
+# runtime carried WITH the module -- lib/rt.tk is what a PROGRAM includes,
+# teko.tk is what a COMPILER includes. This table is inert to `mc build`
+# (only `[project]`/`[target]`/`[compiler]`/`[linker]`/`[include]`/`[limits]`
+# drive a build); it is what `mc pkg hash` reads.
+#
+# `check` is what the registry COMPILES to validate a tag, each entry on its
+# own, in a sandbox with no network, by the mc OF THE SHELF -- no teko module
+# loaded (docs/guide/27-publishing.md §5, docs/reference/packages.md §3). That
+# rules out every `.tk` of the package except one:
+#
+#   lib/rt.tk    `void panic(str msg)` -- `str` is a word TEKO teaches, so the
+#                stock mc stops at `lib/rt.tk:64: type expected in parameter`
+#   teko.tk      a fragment, not a unit: it assumes <mc/host> and the core are
+#                already included, and alone it is
+#                `machine_arm64_float:332: initializer must be constant`
+#
+# `mc_teko.tk` is the whole taught compiler as ONE unit -- <mc/host>, the core,
+# the parts, the 31 modules and this project's own main()/user_init() -- and it
+# compiles with the stock mc, which is exactly the property the validator asks
+# for. It is the same shape `minicompiler/mc` uses for its own package
+# (`check = ["src/mc_linux_x86_64.mc"]`, one entry point, docs/reference/
+# packages.md §11), including the two files that entry needs and the bundle
+# does not serve: `core_teko.mc` and `user.mc` are in `files` for that reason
+# (a check unit not covered by the tree hash is refused by the validator).
+#
+# This holds while the modules are a transliteration of the mc core's own
+# surface. Teko-ifying the compiler (S4.4+) would make `mc_teko.tk` unreadable
+# to a stock parser and cost this package its `check` -- registered as debt in
+# ngen/HANDOFF.md §3.3.
+[package]
+name   = "teko"
+lib    = "lib/rt.tk"
+module = "teko.tk"
+files  = [
+    "core_teko.mc",
+    "lib/rt.tk",
+    "mc_teko.tk",
+    "teko.tk",
+    "teko_access.tk",
+    "teko_array.tk",
+    "teko_class.tk",
+    "teko_const.tk",
+    "teko_default.tk",
+    "teko_deleg.tk",
+    "teko_di.tk",
+    "teko_expr.tk",
+    "teko_float.tk",
+    "teko_fwd.tk",
+    "teko_generic.tk",
+    "teko_heaparr.tk",
+    "teko_iface.tk",
+    "teko_loop.tk",
+    "teko_ns.tk",
+    "teko_ops.tk",
+    "teko_over.tk",
+    "teko_params.tk",
+    "teko_prefix.tk",
+    "teko_prop.tk",
+    "teko_rc.tk",
+    "teko_ref.tk",
+    "teko_stmt.tk",
+    "teko_struct.tk",
+    "teko_switch.tk",
+    "teko_ternary.tk",
+    "teko_this.tk",
+    "teko_trait.tk",
+    "teko_type.tk",
+    "teko_typeof.tk",
+    "user.mc",
+]
+check  = ["mc_teko.tk"]

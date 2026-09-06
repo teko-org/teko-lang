@@ -1,0 +1,213 @@
+/**
+ * EmbedCompress — the closed set of codecs an `#embed` directive may name. `None` stores bytes
+ * verbatim; `Deflate` is raw DEFLATE (`teko::compress::deflate`); `Gzip` is the gzip container
+ * (`teko::compress::gzip_compress`). The codec is applied AT BUILD TIME; the bytes sit compressed in
+ * rodata and the VFS returns them RAW — the reader decompresses.
+ *
+ * @since 0.3.1
+ */
+exp type EmbedCompress = enum { None; Deflate; Gzip }
+
+/**
+ * ReadableFS — the segregated read-only file-system contract: a bodyless interface a read-only VFS
+ * conforms to. `get` fetches a file HANDLE (not its content); `exists` is the error-free presence
+ * companion; `list` enumerates. A `FileSystem` up-casts to a `ReadableFS` interface value.
+ *
+ * @since 0.3.1
+ */
+exp type ReadableFS = interface {
+    /** get — the handle of the embedded file at `path`, or an error when absent. */
+    fn get(path: str): RoFile | error
+    /** exists — whether a file at `path` was embedded (no error branch). */
+    fn exists(path: str): bool
+    /** list — every embedded logical path, in emit order. */
+    fn list(): []str
+}
+
+/**
+ * RoFile — an embedded-file handle: its logical name, its content as a read-only stream over the raw
+ * (possibly compressed) rodata bytes, and the codec tag. The content is NOT decompressed — the caller
+ * reads `content` (chunk-by-chunk, at most 1024 bytes) and, when `compress != None`, inflates with
+ * `teko::compress::inflate` (Deflate) or `gzip_decompress` (Gzip). Nothing materializes the whole file.
+ *
+ * @since 0.3.1
+ */
+exp type RoFile = struct {
+    /** The logical (normalized) path this handle was embedded under. */
+    name: str
+    /** The raw content cursor over the rodata blob slice; still compressed when `compress != None`. */
+    content: teko::io::FileStream
+    /** The codec the content was compressed with at build time. */
+    compress: EmbedCompress
+}
+
+/**
+ * FileSystem — the process-global, read-only, compile-time-materialized VFS. Every `#embed` across the
+ * whole program accumulates into ONE view (`teko::embed::files()`). Internally FLATTENED over four
+ * Tier-A rodata consts; this class is a thin cursor. EMPTY when no `#embed` exists (zero entries,
+ * costing nothing). Conforms to `ReadableFS`.
+ *
+ * @since 0.3.1
+ */
+exp type FileSystem = class & ReadableFS {
+    /** The concatenated UTF-8 path heap (a zero-copy slice over the `EMBED_NAMES` Tier-A const). */
+    pub names: []byte
+    /** The concatenated (possibly compressed) content heap (a slice over `EMBED_BLOBS`). */
+    pub blobs: []byte
+    /** The packed fixed-width record table (a slice over `EMBED_TABLE`). */
+    pub table: []byte
+    /** The entry count. */
+    pub count: u64
+
+    /**
+     * view — the thin `FileSystem` cursor over the four Tier-A embed heaps (zero-copy; the slices point
+     * into rodata).
+     *
+     * @param names  the concatenated path heap
+     * @param blobs  the concatenated content heap
+     * @param table  the packed record table
+     * @param count  the entry count
+     * @return       the flattened read-only view
+     */
+    pub static fn view(names: []byte, blobs: []byte, table: []byte, count: u64): FileSystem {
+        FileSystem { names = names; blobs = blobs; table = table; count = count }
+    }
+
+    /**
+     * get — fetch the handle of the embedded file whose normalized key matches `path`. Scans the packed
+     * table (O(count)); on a hit builds a `RoFile` whose `content` is a read-only cursor over the raw
+     * blob slice (zero copy into rodata) tagged with the stored codec — the caller decompresses.
+     *
+     * @param path  the embedded logical path
+     * @return      the file handle, or an error when no such path is embedded
+     * @throws      `no such embedded file: "<path>"` when absent
+     */
+    pub fn get(path: str): RoFile | error {
+        var i: u64 = 0
+        loop {
+            if i >= self.count { break }
+            var r = i * EMBED_RECORD_BYTES
+            var name_off = table_u64(self.table, r)
+            var name_len = table_u64(self.table, r + 8)
+            if names_match(self.names, name_off, name_len, path) {
+                var blob_off = table_u64(self.table, r + 16)
+                var blob_len = table_u64(self.table, r + 24)
+                var comp_tag = table_u64(self.table, r + 40)
+                var slice = teko::collections::arr_slice(self.blobs, blob_off, blob_off + blob_len)
+                return RoFile { name = path; content = teko::io::of_slice(slice); compress = comp_of_tag(comp_tag) }
+            }
+            i = i + 1
+        }
+        error { message = teko::str::concat("no such embedded file: ", path) }
+    }
+
+    /**
+     * exists — whether a file at `path` was embedded. O(count) over the packed table.
+     *
+     * @param path  the embedded logical path
+     * @return      true when a matching entry exists
+     */
+    pub fn exists(path: str): bool {
+        var i: u64 = 0
+        loop {
+            if i >= self.count { break }
+            var r = i * EMBED_RECORD_BYTES
+            if names_match(self.names, table_u64(self.table, r), table_u64(self.table, r + 8), path) { return true }
+            i = i + 1
+        }
+        false
+    }
+
+    /**
+     * list — every embedded logical path, in directive/emit order.
+     *
+     * @return      the ordered logical paths
+     */
+    pub fn list(): []str {
+        var out: [self.count]str = []
+        var i: u64 = 0
+        loop {
+            if i >= self.count { break }
+            var r = i * EMBED_RECORD_BYTES
+            var name_off = table_u64(self.table, r)
+            var name_len = table_u64(self.table, r + 8)
+            out[i] = str_of_bytes(teko::collections::arr_slice(self.names, name_off, name_off + name_len))
+            i = i + 1
+        }
+        out
+    }
+}
+
+/**
+ * table_u64 — read a little-endian u64 field from the packed record table at byte offset `at`.
+ *
+ * @param table  the packed record table
+ * @param at     the field byte offset
+ * @return       the decoded value
+ */
+fn table_u64(table: []byte, at: u64): u64 {
+    var v: u64 = 0
+    var j: u64 = 0
+    loop {
+        if j >= 8 { break }
+        v = v | ((table[at + j] to u64) << (j * 8))
+        j = j + 1
+    }
+    v
+}
+
+/**
+ * names_match — whether the `len` bytes of the name heap at `off` equal the text of `path`.
+ *
+ * @param names  the concatenated name heap
+ * @param off    the name's start offset
+ * @param len    the name's byte length
+ * @param path   the requested path
+ * @return       true when the bytes match
+ */
+fn names_match(names: []byte, off: u64, len: u64, path: str): bool {
+    if len != path.len { return false }
+    var j: u64 = 0
+    loop {
+        if j >= len { break }
+        if names[off + j] != path[j] { return false }
+        j = j + 1
+    }
+    true
+}
+
+/**
+ * comp_of_tag — the `EmbedCompress` for a stored numeric codec tag (0=None, 1=Deflate, 2=Gzip).
+ *
+ * @param tag  the stored tag value
+ * @return     the codec
+ */
+fn comp_of_tag(tag: u64): EmbedCompress {
+    if tag == 1 { return EmbedCompress::Deflate }
+    if tag == 2 { return EmbedCompress::Gzip }
+    EmbedCompress::None
+}
+
+/** EMBED_NAMES — the concatenated UTF-8 path heap; empty until an `#embed` directive populates it. */
+const EMBED_NAMES: []byte = []
+
+/** EMBED_BLOBS — the concatenated (possibly compressed) content heap; empty until populated. */
+const EMBED_BLOBS: []byte = []
+
+/** EMBED_TABLE — the packed fixed-width record table; empty until populated. */
+const EMBED_TABLE: []byte = []
+
+/** EMBED_COUNT — the number of embedded entries; zero until populated. */
+const EMBED_COUNT: u64 = 0
+
+/**
+ * files — the process-global read-only VFS. A thin `FileSystem` view built over the four Tier-A embed
+ * consts (`EMBED_NAMES`/`EMBED_BLOBS`/`EMBED_TABLE`/`EMBED_COUNT`) — zero-copy (the slices point into
+ * rodata). When no `#embed` exists the consts are empty and every accessor is a costless empty answer.
+ *
+ * @return  the flattened read-only view over the four embed consts
+ * @since 0.3.1
+ */
+exp fn files(): FileSystem {
+    FileSystem::view(EMBED_NAMES, EMBED_BLOBS, EMBED_TABLE, EMBED_COUNT)
+}

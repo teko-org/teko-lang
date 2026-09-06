@@ -8,7 +8,7 @@
 #
 #   teko fmt --check <file>       unformatted file → prints its path, exit 1
 #   teko fmt --check <file>       canonical file    → prints nothing, exit 0
-#   teko fmt <file>                rewrites in place, prints the path, exit 0 (then idempotent)
+#   teko fmt --apply <file>        rewrites in place, prints the path, exit 0 (then idempotent)
 #   teko fmt -                     stdin -> stdout, no file touched, exit 0
 #   teko fmt --check -             stdin would change -> "<stdin>", exit 1 ; canonical -> exit 0
 #   teko fmt -                     empty stdin -> empty stdout, exit 0
@@ -24,8 +24,8 @@ fail() { echo "fmt_cli_test: FAIL: $*" >&2; exit 1; }
 work="$(mktemp -d "${TMPDIR:-/tmp}/teko-fmt-cli.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
-UNFORMATTED=$'fn a() -> i64 {\nreturn 1\n}\n'
-CANONICAL=$'fn a() -> i64 {\n    return 1\n}\n'
+UNFORMATTED=$'fn a(): i64 {\nreturn 1\n}\n'
+CANONICAL=$'fn a(): i64 {\n    return 1\n}\n'
 INVALID=$'fn (\n'
 
 assert_check_mode() {
@@ -51,17 +51,17 @@ canonical_file="$work/canonical.tks"
 printf '%s' "$CANONICAL" >"$canonical_file"
 assert_check_mode "$canonical_file" 0 no
 
-# --- file mode: a plain rewrite fixes the file in place, then --check on it is a no-op -------
+# --- file mode: --apply rewrites the file in place, then --check on it is a no-op ------------
 rewrite_file="$work/rewrite.tks"
 printf '%s' "$UNFORMATTED" >"$rewrite_file"
 set +e
-out="$("$BIN" fmt "$rewrite_file" 2>"$work/err")"; rc=$?
+out="$("$BIN" fmt --apply "$rewrite_file" 2>"$work/err")"; rc=$?
 set -e
-[ "$rc" -eq 0 ] || fail "fmt $rewrite_file exit $rc (want 0)"
-[ "$out" = "$rewrite_file" ] || fail "fmt $rewrite_file stdout '$out' (want '$rewrite_file')"
+[ "$rc" -eq 0 ] || fail "fmt --apply $rewrite_file exit $rc (want 0)"
+[ "$out" = "$rewrite_file" ] || fail "fmt --apply $rewrite_file stdout '$out' (want '$rewrite_file')"
 got="$(cat "$rewrite_file")"
 want="$(printf '%s' "$CANONICAL")"
-[ "$got" = "$want" ] || fail "fmt $rewrite_file did not rewrite to the canonical form"
+[ "$got" = "$want" ] || fail "fmt --apply $rewrite_file did not rewrite to the canonical form"
 assert_check_mode "$rewrite_file" 0 no
 
 # --- stdin mode: `teko fmt -` formats to stdout, touching no file ----------------------------

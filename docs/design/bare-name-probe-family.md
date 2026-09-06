@@ -67,7 +67,7 @@ não só de checker — por isso não coube no vagão 20.
 `src/checker/resolve.tks:1795`:
 
 ```
-pub fn generic_inst_name(base: str, args: []Type) -> str
+pub fn generic_inst_name(base: str, args: []Type): str
 ```
 
 O nome carimbado de uma instância genérica é `<base>__g__<arg0>[__<arg1>…]`. Os **argumentos** são

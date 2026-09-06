@@ -1,0 +1,71 @@
+// surface_typeof_param.tk -- the static-type oracle (entrega 4, crumb C3): the
+// type of a PARAMETER, which the core reports only once the whole unit exists
+// (`decl_param_type`, mc docs/reference/hooks.md § "Asking about a declaration
+// the core already parsed"), so the answer arrives in a `pass()`.
+//
+// Every `.` below sits on a parameter whose member name is declared by TWO
+// unrelated types, which is the case the name alone cannot decide: before the
+// oracle each one of them was rejected with `teko: the type of the left side of
+// `.` is not known here`. Field load, field store, direct call and virtual call
+// are all here, and the virtual one proves the deferred form still dispatches
+// through the vtable: `report` is declared over `Shape` and answers 36 for a
+// `Square`.
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+class Shape {
+    public i64 side;
+
+    public virtual i64 area() {
+        return side;
+    }
+}
+
+class Square : Shape {
+    public override i64 area() {
+        return side * side;
+    }
+}
+
+class Ledger {
+    public i64 side;                             // `side` and `area` now belong
+                                                 // to two unrelated types
+    public i64 area() {
+        return side + 1;
+    }
+}
+
+i64 report(Shape s) {
+    return s.area();                             // virtual call on a parameter
+}
+
+i64 audit(Ledger l) {
+    return l.area();                             // direct call on a parameter
+}
+
+i64 side_of(Ledger l) {
+    return l.side;                               // field load from a parameter
+}
+
+void widen(Shape s, i64 k) {
+    s.side = k;                                  // field store into a parameter
+}
+
+i64 main() {
+    Shape p = new Shape;
+    widen(p, 5);
+    if (report(p) != 5) return 1;
+
+    Shape q = new Square;
+    widen(q, 6);
+    if (report(q) != 36) return 2;               // the override, through the vtable
+
+    Ledger l = new Ledger;
+    l.side = 9;
+    if (side_of(l) != 9) return 3;
+    if (audit(l) != 10) return 4;
+
+    return report(p) + report(q) + 1;            // 5 + 36 + 1
+}

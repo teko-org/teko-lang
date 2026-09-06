@@ -1,17 +1,19 @@
 # A2 / N2b — arm64 instruction selection (crumb plan)
 
+> **[NOTA]** — este documento descreve oráculos diferenciais ativos durante o bring-up do backend nativo. Ambos os oráculos foram desde então **retirados** (#524 e seguintes); o restante deste documento é registro histórico do método usado, não descreve o estado atual do projeto.
+
 **Status:** DESIGN (doc-only). Sub-PR of the 0.3 own-AOT-backend wave (umbrella
 `remodel/backend-build`). Issue **#383**. Branch `fix/issue-383-isel-arm64`. Base for the
 design: `docs/design/own-backend-architecture.md` §3.3 (isel) and §2 (AAPCS64), grounded in
-the merged A1 code (`src/lir/lir.tks`, `lir_interp.tks`, `lir_print.tks`, PR #396 on the
+the merged A1 code (`src/lir/lir.tks`, `lir_oracle.tks`, `lir_print.tks`, PR #396 on the
 umbrella).
 
 > This is a PLAN. It designs the machine-IR (`MInst`) + printer and the AArch64 instruction
 > selector (`LIR -> MInst`), decomposes A2 into ordered, independently gate-able sub-sub-PRs,
-> and specifies the verification (golden MInst-dump + isel-over-interp equivalence). A2 emits
+> and specifies the verification (golden MInst-dump + isel-over-oracle equivalence). A2 emits
 > **no register allocation** (A3) and **no machine bytes** (A4): `MInst` stays on virtual
-> registers over an abstract operand model, and the selected form is proven by re-interpreting
-> it against the LIR interpreter's exit code.
+> registers over an abstract operand model, and the selected form is proven by re-running
+> it against the LIR oracle's exit code.
 
 ---
 
@@ -53,12 +55,12 @@ with the closed `LBinOp` (arithmetic `IAdd..IRemU`, bitwise `IAnd/IOr/IXor`, shi
 
 ### 1.1 The verification oracle A2 must match
 
-The LIR interpreter (`lir_interp.tks`) is an **exit-code oracle**, not a byte-layout verifier
+The LIR oracle (`lir_oracle.tks`) is an **exit-code oracle**, not a byte-layout verifier
 (`:93-97`): an address IS a memory-cell index (one cell per byte-granular address,
 `MemStore`), `alloca` bumps a cursor, rodata is seeded one-cell-per-byte before entry
 (`seed_rodata`), and a function pointer is a **synthetic negative sentinel** `-(index+1)`
-resolved on demand (`func_slot_addr`/`resolve_func_addr`, `:238-286`). A2's isel-over-interp
-harness re-interprets the SELECTED `MInst` form over this SAME abstract model and asserts the
+resolved on demand (`func_slot_addr`/`resolve_func_addr`, `:238-286`). A2's isel-over-oracle
+harness re-runs the SELECTED `MInst` form over this SAME abstract model and asserts the
 same exit code (§4). Byte-accurate layout is A4's job (the C-vs-own differential); A2 stays at
 the exit-code oracle so it needs no encoder.
 
@@ -67,8 +69,8 @@ the exit-code oracle so it needs no encoder.
 ## 2. The `MInst` machine-IR (new `src/backend/minst.tks`)
 
 `MInst` is a thin, AArch64-keyed machine-instruction IR: a variant of instruction-shaped
-structs, mirroring `LOp`'s shape so the printer and the isel-over-interp harness are flat
-per-case matches (the A1 `lir_print`/`lir_interp` precedent). It carries **virtual registers**
+structs, mirroring `LOp`'s shape so the printer and the isel-over-oracle harness are flat
+per-case matches (the A1 `lir_print`/`lir_oracle` precedent). It carries **virtual registers**
 that A3 colors and **physical-register pins** for the ABI; it holds no encoded bytes.
 
 ### 2.1 The operand model
@@ -189,7 +191,7 @@ from `LModule` (A4 emits them; isel does not touch their bytes).
 
 ## 3. The instruction selector (new `src/backend/isel_arm64.tks`)
 
-`select_module(m: LModule) -> MModule` walks each `LFunc`, threading a `SelCtx` that carries
+`select_module(m: LModule): MModule` walks each `LFunc`, threading a `SelCtx` that carries
 the in-progress `MFunc`, the current block, the **`class_of` side-table** (VReg -> `MRegClass`,
 populated at each op's result so argument/return classification is exact), and a scratch-VReg
 allocator (fresh virtual ids past `LFunc.next_vreg`). Selection is a flat per-`LOp` match; the
@@ -206,7 +208,7 @@ mapping:
   `IShrU`->LSR). **`IRemS`/`IRemU`** -> `MAlu` SDIV/UDIV into a scratch quotient, then
   `MMSub` (`rem = a - q*b`).
 - **`LBin` float** -> one `MFAlu` (`FAdd`->FADD …).
-- **`LBin` compare** (`ICmp*`/`FCmp*`) -> when the value is consumed by a `LBranch` and by
+- **`LBin` compare** (`ICmp*`/`FCmp*`): when the value is consumed by a `LBranch` and by
   nothing else, it is **fused** (§3.2) and emits nothing here; otherwise `MCmp`/`MFCmp` then
   `MCSet dst, cond` materializing the 0/1 result. `cond` from the opcode's `MCond`.
 - **`LUn`** -> `INeg`->`MNeg`; `INot`->`MMvn`; `FNeg`->`MFNeg`; `Trunc`->`MMov` (W-view write
@@ -288,7 +290,7 @@ notes:
 
 ---
 
-## 4. Verification — golden dumps + isel-over-interp equivalence
+## 4. Verification — golden dumps + isel-over-oracle equivalence
 
 Two legs, both machine-byte-free (A2 emits nothing to link):
 
@@ -298,25 +300,25 @@ machine blocks, `@sym` for symbols) renders `MModule` to stable text. Unit tests
 (`isel_arm64_test.tkt`) build a small `LModule` by hand, run `select_module`, and assert
 `str_contains` over the dump — the machine-IR's version of the LIR diff spine.
 
-**(2) isel-over-interp equivalence.** A new `MInst` interpreter
-(`src/backend/minst_interp.tks`) re-interprets the SELECTED form over the **same abstract model
-as `lir_interp`** — a `MemStore` (cell-per-address), rodata seeded before entry, the synthetic
+**(2) isel-over-oracle equivalence.** A new `MInst` oracle
+(`src/backend/minst_oracle.tks`) re-runs the SELECTED form over the **same abstract model
+as `lir_oracle`** — a `MemStore` (cell-per-address), rodata seeded before entry, the synthetic
 negative func-address sentinel for `MCallIndirect`, physical arg registers x0..x7/v0..v7 as
 their own register slots. For each fixture the harness asserts:
 
 ```
-minst_interp(select_module(m), "main", args)  ==  interp_lmodule(m, "main", args)
+minst_oracle(select_module(m), "main", args)  ==  oracle_lmodule(m, "main", args)
 ```
 
-i.e. the selected form, re-run, produces the LIR interpreter's exit code. The fixture corpus
-is A1's own interp fixtures (`lir_interp_test.tkt` F1-F5 and the control/memory/call cases A1
+i.e. the selected form, re-run, produces the LIR oracle's exit code. The fixture corpus
+is A1's own oracle fixtures (`lir_oracle_test.tkt` F1-F5 and the control/memory/call cases A1
 added) driven through isel — so equivalence is checked against a KNOWN-GOOD oracle for exactly
 the programs A1 proved lower correctly. A float or i128-heavy op the oracle honest-stops on is
 skipped identically on both sides (the harness compares the honest-stop, not a fabricated
 value).
 
-The `MInst` interpreter is a permanent A2-scoped oracle (it retires when A4's real
-C-vs-own byte differential subsumes it), mirroring how `lir_interp` is the permanent N1 oracle.
+The `MInst` oracle is a permanent A2-scoped oracle (it retires when A4's real
+C-vs-own byte differential subsumes it), mirroring how `lir_oracle` is the permanent N1 oracle.
 
 ---
 
@@ -339,13 +341,13 @@ each names the fixtures that PROVE it. No machine bytes in any of them.
 ### A2-2 · isel core (const · arith · unary · move · param · ret) + the equivalence harness
 - **Scope:** `select_module`/`SelCtx`/`class_of`, `materialize_int`, and the §3.1 mappings for
   `LConstInt`/`LConstFloat`/`LBin`(arith/bitwise/shift)/`LUn`/`LParam`/`LRet`. **The
-  `minst_interp` harness lands here** (the whole equivalence method, §4), scoped to the
+  `minst_oracle` harness lands here** (the whole equivalence method, §4), scoped to the
   straight-line integer subset.
-- **Files:** new `src/backend/isel_arm64.tks`, `src/backend/minst_interp.tks`; tests
-  `src/backend/isel_arm64_test.tkt`, `src/backend/minst_interp_test.tkt`.
+- **Files:** new `src/backend/isel_arm64.tks`, `src/backend/minst_oracle.tks`; tests
+  `src/backend/isel_arm64_test.tkt`, `src/backend/minst_oracle_test.tkt`.
 - **Deps:** A2-1.
 - **Proven by:** golden-dump (a two-param `add`, a const+ret, a rem-via-MSUB, a negate) +
-  isel-over-interp on A1's F1-F5 straight-line fixtures (exit code == `interp_lmodule`).
+  isel-over-oracle on A1's F1-F5 straight-line fixtures (exit code == `oracle_lmodule`).
 
 ### A2-3 · control flow (compares → cmp+b.cond/cbz · jumps · block-arg edge moves)
 - **Scope:** the §3.2 lowering — `LJump`, `LBranch`, the compare-fusion peephole, the parallel-
@@ -355,20 +357,20 @@ each names the fixtures that PROVE it. No machine bytes in any of them.
   execution), tests in `isel_arm64_test.tkt`.
 - **Deps:** A2-2.
 - **Proven by:** golden-dump (a fused `if a < b`, a generic CBNZ branch, a merge with one
-  block-arg → single edge `MMov`) + isel-over-interp on A1's `if`/`match`/`loop` fixtures
-  (exit-code parity through the interp).
+  block-arg → single edge `MMov`) + isel-over-oracle on A1's `if`/`match`/`loop` fixtures
+  (exit-code parity through the oracle).
 
 ### A2-4 · memory + aggregates + rodata addressing
 - **Scope:** the §3.3 lowering — `LAlloca` (frame slot + `MFrameAddr`), `LFieldAddr`
   (`MAluImm` ADD), `LLoad`/`LStore` (sized), `LGlobalAddr`/`LFuncAddr` (ADRP+ADD reloc pairs),
   and passing `LModule.rodata`/`globals`/`layouts` through to `MModule` unchanged.
 - **Files:** `src/backend/isel_arm64.tks` (+ harness gains alloca/load/store/global-addr over
-  the `MemStore` model, mirroring `lir_interp`'s seeded rodata + synthetic func addresses),
+  the `MemStore` model, mirroring `lir_oracle`'s seeded rodata + synthetic func addresses),
   tests in `isel_arm64_test.tkt`.
 - **Deps:** A2-2 (independent of A2-3; may drain in parallel, sequenced after for a clean
   single lane).
 - **Proven by:** golden-dump (an alloca+field_addr+store+load round-trip, a `global_addr @sym`
-  ADRP/ADD pair) + isel-over-interp on A1's struct/rodata fixtures — exit code matches, and the
+  ADRP/ADD pair) + isel-over-oracle on A1's struct/rodata fixtures — exit code matches, and the
   synthetic func-address sentinel resolves identically on both sides.
 
 ### A2-5 · calls direct + indirect + AAPCS64 argument lowering
@@ -382,7 +384,7 @@ each names the fixtures that PROVE it. No machine bytes in any of them.
 - **Deps:** A2-4 (needs `global_addr`/`func_addr` + memory for the vtable/closure indirect
   path).
 - **Proven by:** golden-dump (a direct `tk_exit(%0)` BL with x0 pin, an indirect vtable call, a
-  9-arg call spilling to the stack, a variadic call) + isel-over-interp on A1's call / interface-
+  9-arg call spilling to the stack, a variadic call) + isel-over-oracle on A1's call / interface-
   dispatch / closure fixtures. **A2 CLOSES here.**
 
 ### Ordering
@@ -406,11 +408,11 @@ opcode; the two-register outcome falls out of ordinary per-VReg selection + AAPC
 This is the M.1/M.5 answer (no redundant machinery, one way to move a value) and is the honest
 reading of the code (M.3). Recorded, not open.
 
-### 6.2 The `MInst` interpreter mirrors `lir_interp`'s abstract model (resolved)
+### 6.2 The `MInst` oracle mirrors `lir_oracle`'s abstract model (resolved)
 A2 verifies at the **exit-code** oracle, not byte layout (byte accuracy is A4's C-vs-own
-differential). The `minst_interp` therefore reuses `lir_interp`'s cell-per-address `MemStore`,
-seeded rodata, and synthetic negative func-address sentinel, so `minst_interp(select(m)) ==
-interp_lmodule(m)` is a like-for-like comparison. Building a second, byte-accurate interpreter
+differential). The `minst_oracle` therefore reuses `lir_oracle`'s cell-per-address `MemStore`,
+seeded rodata, and synthetic negative func-address sentinel, so `minst_oracle(select(m)) ==
+oracle_lmodule(m)` is a like-for-like comparison. Building a second, byte-accurate oracle
 now would be M.4 hidden cost with no added signal before A4. Resolved.
 
 ### 6.3 i128 multiply/divide/remainder lower via runtime helpers (recommended — owner confirm)

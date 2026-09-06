@@ -1,0 +1,172 @@
+// surface_loops.tk -- `while`, `do ... while` and `for` as C# spells them
+// (entrega 5, D218/D221/D226, teko_loop.tk), lowered at parse time to the
+// core's own `loop`/`if`/`break N`. Each block below adds one contribution
+// to `sum`; the total only comes out 42 if every lowering -- the block and
+// the single-statement `while` body, `continue` landing on a `do`'s own
+// condition instead of looping forever, `continue` running a `for`'s step,
+// `break` in an infinite `for`, `break 2` leaving two nested `for`s at once,
+// a `for` inside a method (the reference-counting pass walking a synthesized
+// tree), and the four compound-assignment statements -- does what it says.
+// `nested_continue2`/`box_probe`, checked separately below with their own
+// non-42 codes, prove `continue N` (mc 0.14.1): a `for` nested in a `for`,
+// `continue 2` in the inner one running only the OUTER's own step (skipping
+// the rest of both bodies), and the reference-counting pass releasing an
+// object opened on either side of that jump (teko_rc.tk's `tk_rc_jump`).
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+class Counter {
+    public i64 sumTo(i64 n) {
+        i64 acc = 0;
+        for (i64 i = 1; i <= n; i++) {
+            acc = acc + i;
+        }
+        return acc;
+    }
+}
+
+// `for` nested in `for`, `continue 2` in the inner one: the inner loop is
+// abandoned at `bb == 1` (it never reaches `bb == 2`) and so is the rest of
+// the OUTER's own body (`outerTail` never grows) -- only the OUTER's step
+// runs, three times.
+i64 nested_continue2() {
+    i64 outerTop = 0;
+    i64 outerTail = 0;
+    i64 innerHits = 0;
+    for (i64 a = 0; a < 3; a++) {
+        outerTop = outerTop + 1;
+        for (i64 bb = 0; bb < 3; bb++) {
+            if (bb == 1) continue 2;
+            innerHits = innerHits + 1;
+        }
+        outerTail = outerTail + 1;
+    }
+    return outerTop * 100 + outerTail * 10 + innerHits;
+}
+
+class Box {
+    public i64 v;
+    public Box(i64 x) { v = x; }
+}
+
+// TWO `while`s, not `for`s: a `continue 2` that targets a plain `while`
+// directly is never rewritten to a `break` (teko_loop.tk only converts one
+// that fully escapes a `for`/`do`'s own two-loop wrapper) -- it reaches the
+// reference-counting pass as an actual `N_CONTINUE` carrying a level above 1,
+// exactly what `tk_rc_jump` has to read right. One `Box` opens in the OUTER
+// while's own body and one in the INNER's, on both sides of the jump: it has
+// to release both, not just the inner one, or `rt_live()` never comes back
+// down. Both counters advance BEFORE anything else in their own body, so the
+// jump landing straight on the outer condition (a `while`'s own `continue`,
+// unlike a `for`'s, never runs a separate step) still terminates.
+i64 box_probe() {
+    i64 total = 0;
+    i64 a = 0 - 1;
+    while (a < 1) {
+        a = a + 1;
+        Box outerB = new Box(a);
+        total = total + outerB.v;
+        i64 bb = 0 - 1;
+        while (bb < 1) {
+            bb = bb + 1;
+            Box innerB = new Box(bb);
+            total = total + innerB.v;
+            if (bb == 1) continue 2;
+        }
+    }
+    return total;
+}
+
+i64 main() {
+    i64 sum = 0;
+
+    // while, with a block body
+    i64 i = 0;
+    while (i < 3) {
+        sum = sum + 1;
+        i = i + 1;
+    }
+
+    // while, with a single-statement body (no braces)
+    i64 j = 0;
+    while (j < 2) j = j + 1;
+    sum = sum + j;
+
+    // while (true), the C# infinite loop, stopped only by `break`, and the
+    // `bool` literals (M45) picking when
+    i64 trueLoops = 0;
+    bool done = false;
+    while (true) {
+        trueLoops = trueLoops + 1;
+        if (trueLoops == 3) done = true;
+        if (done == true) break;
+    }
+    sum = sum + trueLoops - 3;
+
+    // do ... while, with a `continue` that has to land on the condition
+    // check and not loop forever
+    i64 k = 0;
+    i64 doSum = 0;
+    do {
+        k = k + 1;
+        if (k == 2) continue;
+        doSum = doSum + 1;
+    } while (k < 4);
+    sum = sum + doSum;
+
+    // for, classic, with `i++` as the step
+    i64 forSum = 0;
+    for (i64 m = 0; m < 5; m++) {
+        forSum = forSum + 1;
+    }
+    sum = sum + forSum;
+
+    // for, with a `continue` that has to run the step: without it `n` would
+    // never pass 2 and the loop would never end
+    i64 stepSum = 0;
+    for (i64 n = 0; n < 5; n++) {
+        if (n == 2) continue;
+        stepSum = stepSum + n;
+    }
+    sum = sum + stepSum;
+
+    // for (;;), stopped only by `break`
+    i64 infCount = 0;
+    for (;;) {
+        infCount = infCount + 1;
+        if (infCount == 4) break;
+    }
+    sum = sum + infCount;
+
+    // for nested in for, `break 2` leaving both at once
+    i64 outerHits = 0;
+    i64 innerHits = 0;
+    for (i64 a = 0; a < 3; a++) {
+        for (i64 b = 0; b < 3; b++) {
+            if (b == 1) break 2;
+            innerHits = innerHits + 1;
+        }
+        outerHits = outerHits + 1;
+    }
+    sum = sum + innerHits + outerHits;
+
+    // for inside a class method, over an object
+    Counter c = new Counter;
+    sum = sum + c.sumTo(4);
+
+    // x++, x--, x += e, x -= e as their own statements
+    i64 z = 5;
+    z++;
+    z--;
+    z += 3;
+    z -= 2;
+    sum = sum + z;
+
+    if (nested_continue2() != 303) return 100;
+    if (box_probe() != 3) return 101;
+    if (rt_live() != 1) return 102;           // c, from above, is still live
+
+    return sum;
+}

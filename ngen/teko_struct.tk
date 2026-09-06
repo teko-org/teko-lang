@@ -1,0 +1,1248 @@
+// teko_struct.tk -- the type table teko's `struct` and `class` share, and the
+// `struct` declaration itself: entrega 3's first two constructs (D214:
+// primitivas -> TIPOS -> superfície), taught from outside `mc`'s `src/` with
+// the registrations the mc guide names for a declaration a `#rule` cannot reach
+// (docs/guide/30-teaching.md § step 3). The layout machinery is
+// `mc/examples/api/oop.mc`'s; `struct` is the case with no vtable, so its
+// fields start at offset 0 (`class` is teko_class.tk, and starts at 8).
+//
+// Form (D213: C-like, the mc core's own spelling -- teko-classic's
+// `type X = struct {}` is NOT inherited by this port):
+//
+//   struct Point {                    #define POINT_X 0
+//       i64 x;                        #define POINT_FLAG 8
+//       u8  flag;                     #define POINT_SIZE 16
+//   }                                 Point point_new()  -> rt_alloc(POINT_SIZE)
+//                                     type_new("Point", 8, 8, TK_INT)
+//
+// A value of struct or class type is a POINTER to the allocation, eight bytes
+// wide, the same reference shape `oop.mc` gives a class -- `type_new` rather
+// than `type_alias(TY_UPTR)` because the id has to stay DISTINCT: `p.x` needs
+// the static type of `p`, and the only place that survives the core's own parse
+// of `Point p = new Point;` is the type id on the N_VAR node, which `tk_on_stmt`
+// reads back. Width 8, `TK_INT`: a pointer is an integer the core's own
+// operators already fit, so no derived machine and no intrinsic is needed.
+//
+// The runtime belongs to the PROGRAM, not to this file: `Name_new` calls
+// `rt_alloc(n)` from `ngen/lib/rt.tk`, which hands out `n` zeroed bytes, so a
+// field nobody assigned reads as 0 and a reference field reads as null.
+//
+// A struct body is read by the very machine a class body is read by
+// (`tk_member`, teko_class.tk), so a struct declares METHODS -- with the same
+// implicit receiver, with default arguments and with overloads -- under one
+// difference: no vtable,
+// hence no `virtual`/`override` and no trait, both refused by name.
+
+#define TK_MAXSTRUCT 32               // structs, classes and interfaces declared in one source
+#define TK_MAXFIELD  256              // fields, summed across all of them
+#define TK_MAXLOCAL  256              // locals of struct/class type seen so far
+#define TK_MAXXT     256              // expressions whose type this module knows
+#define TK_MAXAX     128              // array-field addresses this module handed out
+#define TK_MAXOS     128              // stores into a slot of counted type
+#define TK_MAXSLV    8192             // every local seen via on_stmt, any type (K4's `use`)
+
+// teko_generic.tk is included after this file, because a generic body is
+// re-parsed by the very machine below; these two are what the declaration of a
+// type has to ask it before there is a type at all
+i64 tk_gen_find(uptr name);
+void tk_gen_record(uptr name, i64 kind, i64 vis, i64 proj, i64 abst, i64 part);
+
+// teko_ns.tk is included after this file: the fallback below is what gives a
+// namespaced short type name its identity when the exact scan finds nothing,
+// and `tk_ns_qualify` is what `struct`'s own declaration (below) calls on its
+// name -- the identity function outside a namespace, so a plain `struct`
+// declares exactly as it always has
+i64 tk_ns_resolve(uptr curto);
+uptr tk_ns_qualify(uptr nome);
+uptr tk_ns_qualified_name(uptr nome);
+i64 tk_ns_short_known(uptr curto);
+
+// teko_ns.tk's own `using`/namespace-outward search, but landing on a name the
+// forward scan (teko_fwd.tk, §50 O1) reserved rather than one a row already
+// exists for -- the plain `tk_ns_resolve` above never takes this route, so a
+// base class or a constructed value still needs the row WHOLE before it
+// resolves (O2/O3)
+i64 tk_ns_resolve_fwd(uptr curto);
+
+// teko_fwd.tk is included after this file: the forward scan runs before ANY
+// token is read (the whole entry source, §50 (a).4), pre-reserving every
+// class/struct/interface/delegate word so a field, a parameter, a return type
+// or a local of a type declared BELOW resolves at its first mention.
+// `tk_fwd_pending` is what `tk_newname` below asks to accept such a word
+// instead of refusing it; `tk_fwd_row`/`tk_fwd_row_by_ty` materialize the
+// placeholder row an identity-only site needs, on demand; `tk_fwd_adopt` is
+// what the real declaration calls, through `tk_type_add`, once the row is no
+// longer a placeholder
+i64 tk_fwd_pending(uptr qname);
+i64 tk_fwd_row(uptr qname);
+i64 tk_fwd_row_by_ty(i64 ty);
+void tk_fwd_adopt(i64 si, i64 vis, i64 proj);
+
+// teko_access.tk is included after this file too -- it reads the tables below --
+// and these three are what a type declaration has to ask it: the modifier that
+// came before the word, whether the file it is written in belongs to the
+// project, and the registration of the name itself, which is a word of the
+// language in three positions at once (a type, `Name.member`, and the statement
+// that starts with either)
+i64 tk_take_decl_vis();
+i64 tk_take_decl_proj();
+i64 tk_type_word(uptr name);
+
+// what a row of the type table declares: struct/class/interface/delegate share
+// the table because a value of any of them is one 8-byte reference, and `.`
+// (or `callp`, for a delegate) has to tell them apart
+#define TK_KSTRUCT 0
+#define TK_KCLASS  1
+#define TK_KIFACE  2
+#define TK_KDELEG  3
+#define TK_KARRAY  4
+
+// how much of a class has been read: one declared in one place is whole where
+// it stands, and a `partial` one stays OPEN until the first use of it closes.
+// TK_PFWD (§50 O1) is a fourth state: the row a use materialized ahead of the
+// real declaration, adopted in place once that declaration is read.
+#define TK_PWHOLE 0
+#define TK_POPEN  1
+#define TK_PDONE  2
+#define TK_PFWD   3
+
+// where a member may be reached from, C#'s three words; a member with no
+// modifier at all is `private`
+#define TK_VPRIVATE   0
+#define TK_VPROTECTED 1
+#define TK_VPUBLIC    2
+
+// ...and where a TOP-LEVEL type may be reached from: `internal` is the code of
+// the project itself, and it is what a type with no modifier is
+#define TK_TINTERNAL 0
+#define TK_TPUBLIC   1
+
+uptr sr_name[TK_MAXSTRUCT];
+i64  sr_ty[TK_MAXSTRUCT];             // the id type_new returned for the name
+i64  sr_size[TK_MAXSTRUCT];
+i64  sr_base[TK_MAXSTRUCT];           // the base class, or -1
+i64  sr_form[TK_MAXSTRUCT];           // TK_KSTRUCT, TK_KCLASS or TK_KIFACE
+i64  sr_nv[TK_MAXSTRUCT];             // how many virtual slots it has, its own and the base's
+i64  sr_m0[TK_MAXSTRUCT];             // an interface's slice [m0, m0+mn) of the signature table
+i64  sr_mn[TK_MAXSTRUCT];
+i64  sr_ni[TK_MAXSTRUCT];             // ...and how many interfaces it implements
+i64  sr_vis[TK_MAXSTRUCT];            // TK_TPUBLIC or TK_TINTERNAL
+i64  sr_proj[TK_MAXSTRUCT];           // 1 when the project itself declared it
+i64  sr_abst[TK_MAXSTRUCT];           // 1 for an `abstract` class: no object, no constructor
+i64  sr_part[TK_MAXSTRUCT];           // TK_PWHOLE, TK_POPEN or TK_PDONE
+i64  sr_off[TK_MAXSTRUCT];            // where the next field goes: carried across the parts
+i64  sr_hline[TK_MAXSTRUCT];          // where the FIRST part was written, which is where a
+uptr sr_hfile[TK_MAXSTRUCT];          // ...refusal at closing time is reported
+i64  ha_ety[TK_MAXSTRUCT];            // a TK_KARRAY row's own element type (K3, §41)
+i64  tk_nstruct = 0;
+
+uptr fd_name[TK_MAXFIELD];
+i64  fd_cls[TK_MAXFIELD];             // the type that declares it: the row this field belongs to
+i64  fd_off[TK_MAXFIELD];
+i64  fd_ty[TK_MAXFIELD];
+i64  fd_nel[TK_MAXFIELD];             // elements of an INLINE array field, 0 for a scalar
+i64  fd_vis[TK_MAXFIELD];             // TK_VPRIVATE, TK_VPROTECTED or TK_VPUBLIC
+uptr fd_sym[TK_MAXFIELD];             // a STATIC field's global; 0 when it lives in the object
+i64  tk_nfield = 0;
+
+i64  ax_node[TK_MAXAX];               // the address node of an array field, and its shape
+i64  ax_ty[TK_MAXAX];
+i64  ax_nel[TK_MAXAX];
+uptr ax_name[TK_MAXAX];
+i64  tk_nax = 0;
+
+uptr lv_name[TK_MAXLOCAL];            // a local the CORE declared, seen via on_stmt
+i64  lv_str[TK_MAXLOCAL];
+i64  tk_nlocal = 0;
+
+uptr slv_name[TK_MAXSLV];             // every local's NAME, whatever its type
+i64  slv_ty[TK_MAXSLV];               // ...and the type it was declared with
+i64  tk_nslv = 0;
+
+i64  xt_node[TK_MAXXT];               // a node this module built, and its type
+i64  xt_str[TK_MAXXT];                // the row of the type table, or -1 for a scalar
+i64  xt_ty[TK_MAXXT];                 // the type id itself, scalar ones included
+i64  xt_pure[TK_MAXXT];               // 1 when re-evaluating the node is free of effects
+i64  tk_nxt = 0;
+
+i64  os_node[TK_MAXOS];               // a store into a slot of counted type
+i64  tk_nos = 0;
+
+// position used on generated nodes and on declaration-level errors
+i64  tk_line = 0;
+uptr tk_file = 0;
+
+// ---- table accessors (no raw ld64/st64 outside this section) ----
+uptr sr_name_at(i64 i)  { return ld64(sr_name + i * 8); }
+i64  sr_ty_at(i64 i)    { return ld64(sr_ty + i * 8); }
+i64  sr_size_at(i64 i)  { return ld64(sr_size + i * 8); }
+i64  sr_base_at(i64 i)  { return ld64(sr_base + i * 8); }
+i64  sr_kind_at(i64 i)  { return ld64(sr_form + i * 8); }
+i64  sr_nv_at(i64 i)    { return ld64(sr_nv + i * 8); }
+i64  sr_m0_at(i64 i)    { return ld64(sr_m0 + i * 8); }
+i64  sr_mn_at(i64 i)    { return ld64(sr_mn + i * 8); }
+i64  sr_ni_at(i64 i)    { return ld64(sr_ni + i * 8); }
+i64  sr_vis_at(i64 i)   { return ld64(sr_vis + i * 8); }
+i64  sr_proj_at(i64 i)  { return ld64(sr_proj + i * 8); }
+i64  sr_abst_at(i64 i)  { return ld64(sr_abst + i * 8); }
+i64  sr_part_at(i64 i)  { return ld64(sr_part + i * 8); }
+i64  sr_off_at(i64 i)   { return ld64(sr_off + i * 8); }
+i64  sr_hline_at(i64 i) { return ld64(sr_hline + i * 8); }
+uptr sr_hfile_at(i64 i) { return ld64(sr_hfile + i * 8); }
+i64  ha_ety_at(i64 i)   { return ld64(ha_ety + i * 8); }
+void set_ha_ety_at(i64 i, i64 v) { st64(ha_ety + i * 8, v); }
+uptr fd_name_at(i64 i)  { return ld64(fd_name + i * 8); }
+i64  fd_cls_at(i64 i)   { return ld64(fd_cls + i * 8); }
+i64  fd_off_at(i64 i)   { return ld64(fd_off + i * 8); }
+i64  fd_ty_at(i64 i)    { return ld64(fd_ty + i * 8); }
+i64  fd_nel_at(i64 i)   { return ld64(fd_nel + i * 8); }
+i64  fd_vis_at(i64 i)   { return ld64(fd_vis + i * 8); }
+uptr fd_sym_at(i64 i)   { return ld64(fd_sym + i * 8); }
+i64  ax_node_at(i64 i)  { return ld64(ax_node + i * 8); }
+i64  ax_ty_at(i64 i)    { return ld64(ax_ty + i * 8); }
+i64  ax_nel_at(i64 i)   { return ld64(ax_nel + i * 8); }
+uptr ax_name_at(i64 i)  { return ld64(ax_name + i * 8); }
+uptr lv_name_at(i64 i)  { return ld64(lv_name + i * 8); }
+i64  lv_str_at(i64 i)   { return ld64(lv_str + i * 8); }
+uptr slv_name_at(i64 i) { return ld64(slv_name + i * 8); }
+i64  slv_ty_at(i64 i)   { return ld64(slv_ty + i * 8); }
+i64  xt_node_at(i64 i)  { return ld64(xt_node + i * 8); }
+i64  xt_str_at(i64 i)   { return ld64(xt_str + i * 8); }
+i64  xt_ty_at(i64 i)    { return ld64(xt_ty + i * 8); }
+i64  xt_pure_at(i64 i)  { return ld64(xt_pure + i * 8); }
+i64  os_node_at(i64 i)  { return ld64(os_node + i * 8); }
+
+void set_sr_name_at(i64 i, uptr v)  { st64(sr_name + i * 8, v); }
+void set_sr_ty_at(i64 i, i64 v)     { st64(sr_ty + i * 8, v); }
+void set_sr_size_at(i64 i, i64 v)   { st64(sr_size + i * 8, v); }
+void set_sr_base_at(i64 i, i64 v)   { st64(sr_base + i * 8, v); }
+void set_sr_kind_at(i64 i, i64 v)   { st64(sr_form + i * 8, v); }
+void set_sr_nv_at(i64 i, i64 v)     { st64(sr_nv + i * 8, v); }
+void set_sr_m0_at(i64 i, i64 v)     { st64(sr_m0 + i * 8, v); }
+void set_sr_mn_at(i64 i, i64 v)     { st64(sr_mn + i * 8, v); }
+void set_sr_ni_at(i64 i, i64 v)     { st64(sr_ni + i * 8, v); }
+void set_sr_vis_at(i64 i, i64 v)    { st64(sr_vis + i * 8, v); }
+void set_sr_proj_at(i64 i, i64 v)   { st64(sr_proj + i * 8, v); }
+void set_sr_abst_at(i64 i, i64 v)   { st64(sr_abst + i * 8, v); }
+void set_sr_part_at(i64 i, i64 v)   { st64(sr_part + i * 8, v); }
+void set_sr_off_at(i64 i, i64 v)    { st64(sr_off + i * 8, v); }
+void set_sr_hline_at(i64 i, i64 v)  { st64(sr_hline + i * 8, v); }
+void set_sr_hfile_at(i64 i, uptr v) { st64(sr_hfile + i * 8, v); }
+
+i64 tk_is_class(i64 si) { return sr_kind_at(si) == TK_KCLASS; }
+i64 tk_is_iface(i64 si) { return sr_kind_at(si) == TK_KIFACE; }
+i64 tk_is_deleg(i64 si) { return sr_kind_at(si) == TK_KDELEG; }
+i64 tk_is_ha(i64 si)    { return si >= 0 && sr_kind_at(si) == TK_KARRAY; }
+void set_fd_name_at(i64 i, uptr v)  { st64(fd_name + i * 8, v); }
+void set_fd_cls_at(i64 i, i64 v)    { st64(fd_cls + i * 8, v); }
+void set_fd_off_at(i64 i, i64 v)    { st64(fd_off + i * 8, v); }
+void set_fd_ty_at(i64 i, i64 v)     { st64(fd_ty + i * 8, v); }
+void set_fd_nel_at(i64 i, i64 v)    { st64(fd_nel + i * 8, v); }
+void set_fd_vis_at(i64 i, i64 v)    { st64(fd_vis + i * 8, v); }
+void set_fd_sym_at(i64 i, uptr v)   { st64(fd_sym + i * 8, v); }
+void set_ax_node_at(i64 i, i64 v)   { st64(ax_node + i * 8, v); }
+void set_ax_ty_at(i64 i, i64 v)     { st64(ax_ty + i * 8, v); }
+void set_ax_nel_at(i64 i, i64 v)    { st64(ax_nel + i * 8, v); }
+void set_ax_name_at(i64 i, uptr v)  { st64(ax_name + i * 8, v); }
+void set_lv_name_at(i64 i, uptr v)  { st64(lv_name + i * 8, v); }
+void set_lv_str_at(i64 i, i64 v)    { st64(lv_str + i * 8, v); }
+void set_slv_name_at(i64 i, uptr v) { st64(slv_name + i * 8, v); }
+void set_slv_ty_at(i64 i, i64 v)    { st64(slv_ty + i * 8, v); }
+void set_xt_node_at(i64 i, i64 v)   { st64(xt_node + i * 8, v); }
+void set_xt_str_at(i64 i, i64 v)    { st64(xt_str + i * 8, v); }
+void set_xt_ty_at(i64 i, i64 v)     { st64(xt_ty + i * 8, v); }
+void set_xt_pure_at(i64 i, i64 v)   { st64(xt_pure + i * 8, v); }
+void set_os_node_at(i64 i, i64 v)   { st64(os_node + i * 8, v); }
+
+// ---- derived names ----
+i64 tk_lower_ch(i64 c) { if (c >= 'A' && c <= 'Z') return c + 32; return c; }
+i64 tk_upper_ch(i64 c) { if (c >= 'a' && c <= 'z') return c - 32; return c; }
+
+// copy of `s` with the letters' case forced: up = 1 uppercase, 0 lowercase
+uptr tk_case(uptr s, i64 up) {
+    i64 n = cstrlen(s);
+    uptr d = xalloc(n + 1);
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        i64 c = ld8(s + i);
+        if (up) st8(d + i, tk_upper_ch(c));
+        else    st8(d + i, tk_lower_ch(c));
+        i = i + 1;
+    }
+    st8(d + n, 0);
+    return d;
+}
+
+uptr tk_join(uptr a, uptr b) {
+    i64 la = cstrlen(a);
+    i64 lb = cstrlen(b);
+    uptr d = xalloc(la + lb + 1);
+    mem_copy(d, a, la);
+    mem_copy(d + la, b, lb);
+    st8(d + la + lb, 0);
+    return d;
+}
+
+uptr tk_join3(uptr a, uptr b, uptr c) { return tk_join(tk_join(a, b), c); }
+
+// an integer as the decimal text a name and a message are built from: the
+// const argument of a generic travels as a LEXEME, so `Box__Circle__4` and the
+// substitution that produced it come from one and the same spelling
+uptr tk_num(i64 v) {
+    u8 tmp[24];
+    i64 neg = 0;
+    if (v < 0) { neg = 1; v = 0 - v; }
+    i64 i = 24;
+    loop {
+        i = i - 1;
+        st8(tmp + i, '0' + v % 10);
+        v = v / 10;
+        if (v == 0) break;
+    }
+    if (neg) { i = i - 1; st8(tmp + i, '-'); }
+    return xstrdup(tmp + i, 24 - i);
+}
+
+// Point         ->  point_new       (the generated allocator)
+uptr tk_ctor_name(uptr name) { return tk_join(tk_case(name, 0), "_new"); }
+// Point         ->  point_release   (word 0 of the vtable, what rc_dec calls)
+uptr tk_release_name(uptr name) { return tk_join(tk_case(name, 0), "_release"); }
+// Point + __i64 ->  point_ctor__i64 (the body of `public Point(i64 x) { ... }`)
+uptr tk_ctor_sym(uptr name, uptr sig) { return tk_join3(tk_case(name, 0), "_ctor", sig); }
+// ...and the allocator that calls it: point_new__i64
+uptr tk_new_sym(uptr name, uptr sig) { return tk_join(tk_ctor_name(name), sig); }
+// Point         ->  point_dtor      (the body of `~Point() { ... }`)
+uptr tk_dtor_sym(uptr name) { return tk_join(tk_case(name, 0), "_dtor"); }
+
+// the two names the method table files a constructor and a destructor under.
+// Neither is an identifier, so no member the source writes can collide with
+// them and no `.` can ever reach one -- C#'s own spelling for the same reason.
+uptr tk_ctor_key() { return ".ctor"; }
+uptr tk_dtor_key() { return ".dtor"; }
+// Point + area  ->  point_area      (a method, with an implicit receiver)
+uptr tk_fname(uptr name, uptr m) { return tk_join3(tk_case(name, 0), "_", m); }
+// Point + x     ->  POINT_X         (the #define of the field's offset)
+uptr tk_cname(uptr name, uptr m) { return tk_join3(tk_case(name, 1), "_", tk_case(m, 1)); }
+
+// ---- node constructors: only node_new/set_nd_* from src/ast.mc ----
+i64 tk_nd(i64 kind) { return node_new(kind, tk_line, tk_file); }
+
+i64 tk_int(i64 v) {
+    i64 n = tk_nd(N_INT);
+    set_nd_val(n, v);
+    set_nd_type(n, TY_I64);
+    return n;
+}
+
+i64 tk_id(uptr name) {
+    i64 n = tk_nd(N_IDENT);
+    set_nd_name(n, name);
+    set_nd_type(n, TY_I64);
+    return n;
+}
+
+// &name of a function: M10's uptr
+i64 tk_addr(uptr name) {
+    i64 n = tk_nd(N_ADDR);
+    set_nd_name(n, name);
+    set_nd_type(n, TY_UPTR);
+    return n;
+}
+
+i64 tk_bin(i64 op, i64 a, i64 b) {
+    i64 n = tk_nd(N_BINARY);
+    set_nd_op(n, op);
+    set_nd_a(n, a);
+    set_nd_b(n, b);
+    return n;
+}
+
+i64 tk_call(uptr name, i64 args) {
+    i64 n = tk_nd(N_CALL);
+    set_nd_name(n, name);
+    set_nd_a(n, args);
+    set_nd_type(n, TY_I64);
+    return n;
+}
+
+i64 tk_call2(uptr name, i64 a, i64 b) { return tk_call(name, list_append(a, b)); }
+
+i64 tk_call3(uptr name, i64 a, i64 b, i64 c) { return tk_call(name, list_append(list_append(a, b), c)); }
+
+i64 tk_ret(i64 e) {
+    i64 n = tk_nd(N_RETURN);
+    set_nd_a(n, e);
+    return n;
+}
+
+i64 tk_stmt(i64 e) {
+    i64 n = tk_nd(N_EXPRSTMT);
+    set_nd_a(n, e);
+    return n;
+}
+
+i64 tk_blk(i64 stmts) {
+    i64 n = tk_nd(N_BLOCK);
+    set_nd_a(n, stmts);
+    return n;
+}
+
+i64 tk_var(i64 ty, uptr name, i64 init) {
+    i64 n = tk_nd(N_VAR);
+    set_nd_name(n, name);
+    set_nd_type(n, ty);
+    set_nd_a(n, init);
+    return n;
+}
+
+i64 tk_func(i64 ty, uptr name, i64 prs, i64 body) {
+    i64 f = tk_nd(N_FUNC);
+    set_nd_name(f, name);
+    set_nd_type(f, ty);
+    set_nd_a(f, prs);
+    set_nd_b(f, body);
+    return f;
+}
+
+i64 tk_str(uptr s) {
+    i64 n = tk_nd(N_STR);
+    set_nd_name(n, s);
+    set_nd_val(n, cstrlen(s));
+    set_nd_type(n, TY_UPTR);
+    return n;
+}
+
+i64 tk_if(i64 cond, i64 then) {
+    i64 n = tk_nd(N_IF);
+    set_nd_a(n, cond);
+    set_nd_b(n, then);
+    return n;
+}
+
+// a global with no initializer: it goes to __bss, already zeroed
+i64 tk_glb(i64 ty, uptr name, i64 nel) {
+    i64 n = tk_nd(N_GLOBAL);
+    set_nd_name(n, name);
+    set_nd_type(n, ty);
+    set_nd_val(n, nel);
+    return n;
+}
+
+// ---- copying an expression the parser handed over ----
+// A virtual call reads the receiver twice (its vtable, and the object), and a node
+// may sit in only ONE sibling list -- list_append would rewire the copy inside
+// the vtable load. tk_clone is the way out, and tk_pure below is what keeps it
+// honest: only a receiver whose re-evaluation costs nothing is ever cloned.
+i64 tk_clone(i64 n);
+
+i64 tk_clone_list(i64 n) {
+    if (n == 0) return 0;
+    i64 c = tk_clone(n);
+    set_nd_next(c, tk_clone_list(nd_next(n)));
+    return c;
+}
+
+i64 tk_clone(i64 n) {
+    if (n == 0) return 0;
+    i64 c = node_new(nd_kind(n), nd_line(n), nd_file(n));
+    set_nd_op(c, nd_op(n));
+    set_nd_type(c, nd_type(n));
+    set_nd_val(c, nd_val(n));
+    set_nd_name(c, nd_name(n));
+    set_nd_a(c, tk_clone_list(nd_a(n)));
+    set_nd_b(c, tk_clone_list(nd_b(n)));
+    set_nd_c(c, tk_clone_list(nd_c(n)));
+    set_nd_d(c, tk_clone_list(nd_d(n)));
+    return c;
+}
+
+// memory-access intrinsic matching the field type's width AND its register
+// file. Width alone is not the whole answer: `<float>` carries an f32/f64 in
+// the machine's OTHER register file (v0..v7/x0..x7 under AAPCS64), so the
+// integer `ld64`/`st64` pair moves the right eight bytes to the WRONG place --
+// every indirect access to a float (a `ref`/`out` pointee, a class field, an
+// array element, a closure capture) read or wrote a value the arithmetic never
+// saw. `<float>`'s own `ldf32`/`ldf64`/`stf32`/`stf64` (M24, lib/float.mc) are
+// what address that file, and they are picked here, by KIND, before width.
+uptr tk_ldn(i64 ty) {
+    i64 w = type_width(ty);
+    if (type_kind(ty) == TK_FLOAT) {
+        if (w == 4) return "ldf32";
+        if (w == 8) return "ldf64";
+    }
+    if (w == 1) return "ld8";
+    if (w == 2) return "ld16";
+    if (w == 4) return "ld32";
+    return "ld64";
+}
+
+uptr tk_stn(i64 ty) {
+    i64 w = type_width(ty);
+    if (type_kind(ty) == TK_FLOAT) {
+        if (w == 4) return "stf32";
+        if (w == 8) return "stf64";
+    }
+    if (w == 1) return "st8";
+    if (w == 2) return "st16";
+    if (w == 4) return "st32";
+    return "st64";
+}
+
+// ---- lookups, linear and in declaration order (mc docs/determinism.md rule 1) ----
+// the scan alone, no namespace resolution: what a name ALREADY qualified (a
+// declaration's own exact-match check, or a candidate teko_ns.tk constructed
+// while resolving one) is tested against -- calling the fallback-carrying
+// `tk_struct_find` below on a name IT itself built would recurse without ever
+// converging (each failed candidate grows a new one to try)
+i64 tk_struct_find_exact(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nstruct) break;
+        if (str_eq(sr_name_at(i), name)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// the exact scan first, always; the fallback is namespace resolution -- the
+// current namespace outward, then the file's own `using`s (teko_ns.tk's
+// `tk_ns_resolve`) -- which answers -1 with zero further work when the
+// program declares no namespace at all, so a plain type's lookup is unchanged
+i64 tk_struct_find(uptr name) {
+    i64 si = tk_struct_find_exact(name);
+    if (si >= 0) return si;
+    return tk_ns_resolve(name);
+}
+
+// the twin an IDENTITY-only site (§50 (b2): a field, a parameter, a return
+// type, a local) takes instead: the same search, but landing on a
+// forward-scanned name (teko_fwd.tk) materializes its placeholder row rather
+// than answering -1. `tk_struct_find` above stays untouched for every site
+// that needs the row WHOLE -- a base class, `new`, a delegate construction --
+// where a placeholder would silently lay a derived class out wrong or
+// allocate the wrong size.
+i64 tk_struct_find_fwd(uptr name) {
+    i64 si = tk_struct_find_exact(name);
+    if (si >= 0) return si;
+    si = tk_ns_resolve_fwd(name);
+    if (si >= 0) return si;
+    return tk_fwd_row(name);
+}
+
+i64 tk_struct_by_ty(i64 ty) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nstruct) break;
+        if (sr_ty_at(i) == ty) return i;
+        i = i + 1;
+    }
+    return tk_fwd_row_by_ty(ty);
+}
+
+// 1 when a value of type `ty` is a COUNTED reference: a class, an interface, a
+// delegate or a T[] of heap (K3), whose object carries the vtable and the
+// count the reclaim works through. A struct is not one -- it has no vtable,
+// hence no release to reach and no count to keep, which ngen/lib/rt.tk
+// declares as the debt of this slice.
+i64 tk_is_counted(i64 ty) {
+    i64 si = tk_struct_by_ty(ty);
+    if (si < 0) return 0;
+    if (tk_is_class(si)) return 1;
+    if (tk_is_deleg(si)) return 1;
+    if (tk_is_ha(si)) return 1;
+    return tk_is_iface(si);
+}
+
+// the row of `T[]` for element type `ety`, one per distinct element, made the
+// first time it is asked for (K3, §41): the type identity is the array's own
+// bracket spelling (a lexeme the lexer can never form, `lib/user_typearr.mc`'s
+// own precedent), which is what keeps it collision-free with a user name --
+// the mangling of a GENERATED SYMBOL for it never uses this spelling, since a
+// symbol name may not carry `[`/`]` (see `tk_ty_mangle_name`).
+i64 tk_ha_row(i64 ety) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nstruct) break;
+        if (tk_is_ha(i) && ha_ety_at(i) == ety) return sr_ty_at(i);
+        i = i + 1;
+    }
+    uptr name = tk_join(type_name(ety), "[]");
+    i64 ty = type_new(name, 8, 8, TK_INT);
+    i64 si = tk_type_add(name, ty, 0 - 1, TK_KARRAY, TK_TPUBLIC, 1);
+    set_ha_ety_at(si, ety);
+    return ty;
+}
+
+// 1 when the program spells at least one `T[]`
+i64 tk_ha_any() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nstruct) break;
+        if (tk_is_ha(i)) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// the identifier a MANGLED SYMBOL embeds for type `ty`: the plain type name,
+// except for `T[]` (K3), whose own registered spelling carries `[`/`]` --
+// safe for `--dump-ast` and for the word table, unsafe for a linker symbol.
+// `arr_i64`/`arr_Circle` is what an overload/constructor/method suffix uses
+// instead (`teko_ref.tk`'s own `tk_ty_sfx`).
+uptr tk_ty_mangle_name(i64 ty) {
+    i64 si = tk_struct_by_ty(ty);
+    if (tk_is_ha(si)) return tk_join("arr_", type_name(ha_ety_at(si)));
+    return type_name(ty);
+}
+
+// ---- a `T[]` PARAMETER of the declaration currently being read (K3) ----
+// The core never reports a parameter to a module mid-body any more than it
+// reports a struct/class one (teko_expr.tk's own header) -- but a `T[]`
+// parameter's TYPE is known the instant the parser reads it, at the SAME
+// point a struct/class local's is (`tk_on_stmt`, above). This table is that
+// same early knowledge for a PARAMETER: reset once at the start of the
+// declaration's own parameter list (`tk_hp_reset`, called by
+// `teko_default.tk`'s own per-declaration bookkeeping for a free function
+// and by `teko_class.tk`'s own `tk_params` for a member) and filled as each
+// parameter is read, so `xs[i]`/`xs.Length` on a `T[]` parameter resolve AT
+// PARSE TIME too (`teko_params.tk`'s `tk_bracket`, `teko_expr.tk`'s
+// `tk_dot`) -- with no oracle, and no placeholder left for a later pass.
+#define TK_MAXHP 32
+
+uptr hp_name[TK_MAXHP];
+i64  hp_ty[TK_MAXHP];
+i64  tk_nhp = 0;
+
+uptr hp_name_at(i64 i) { return ld64(hp_name + i * 8); }
+i64  hp_ty_at(i64 i)   { return ld64(hp_ty + i * 8); }
+void set_hp_name_at(i64 i, uptr v) { st64(hp_name + i * 8, v); }
+void set_hp_ty_at(i64 i, i64 v)    { st64(hp_ty + i * 8, v); }
+
+void tk_hp_reset() { tk_nhp = 0; }
+
+void tk_hp_add(uptr name, i64 ty) {
+    if (!tk_is_ha(tk_struct_by_ty(ty))) return;
+    if (tk_nhp == TK_MAXHP) err_at(tk_file, tk_line, "teko: too many `T[]` parameters in one declaration");
+    set_hp_name_at(tk_nhp, name);
+    set_hp_ty_at(tk_nhp, ty);
+    tk_nhp = tk_nhp + 1;
+}
+
+// the type of a `T[]` parameter named `name`, or -1: the newest one wins,
+// the same rule `tk_local_find` gives a shadowed local.
+i64 tk_hp_find(uptr name) {
+    i64 i = tk_nhp - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(hp_name_at(i), name)) return hp_ty_at(i);
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// a store this module emitted into a slot of counted type -- a field, an
+// element of an inline array, an auto-property's backing. The node is recorded
+// where it is BUILT, which is the only place the slot's declared type is at
+// hand, and the reclaim pass (teko_rc.tk) turns it into the store that keeps
+// both counts straight: it is the pass, not the parser, that can tell whether
+// the value being stored is already owned.
+void tk_os_add(i64 n) {
+    if (tk_nos == TK_MAXOS) err_at(tk_file, tk_line, "teko: too many stores into a slot of class type");
+    set_os_node_at(tk_nos, n);
+    tk_nos = tk_nos + 1;
+}
+
+// records the store only when the slot really is a counted one
+i64 tk_os_mark(i64 n, i64 ty) {
+    if (tk_is_counted(ty)) tk_os_add(n);
+    return n;
+}
+
+i64 tk_os_has(i64 n) {
+    i64 i = tk_nos - 1;
+    loop {
+        if (i < 0) break;
+        if (os_node_at(i) == n) return 1;
+        i = i - 1;
+    }
+    return 0;
+}
+
+// index into the field table of `name` in `si` or in one of its bases -- the
+// base's fields keep their offsets in the derived object (base-first layout),
+// so the entry found up the chain is valid as it stands. A row OWNS its fields
+// rather than holding a slice of the table: the parts of a partial class are
+// read with whatever else the source declares between them, so the fields of
+// one type are not a contiguous run.
+i64 tk_field_find(i64 si, uptr name) {
+    loop {
+        if (si < 0) break;
+        i64 i = 0;
+        loop {
+            if (i >= tk_nfield) break;
+            if (fd_cls_at(i) == si) {
+                if (str_eq(fd_name_at(i), name)) return i;
+            }
+            i = i + 1;
+        }
+        si = sr_base_at(si);
+    }
+    return 0 - 1;
+}
+
+// the type that DECLARES the field at index `fi`, which is the type an access
+// to it is checked against: a field found up the base chain belongs to the base,
+// not to the receiver's own type
+i64 tk_field_owner(i64 fi) { return fd_cls_at(fi); }
+
+// the field called `name` when the left side's type is NOT known statically --
+// a parameter, or a global, neither of which the core reports to a module. The
+// answer is the field itself when exactly ONE type declares that name, which is
+// the same "resolve the name in the module's own table" `mc`'s own teaching
+// demo does for `p ~> len` (lib/user_syntax_demo.mc). -1 = no type declares it,
+// -2 = more than one does and the left side has to be statically known.
+i64 tk_field_by_name(uptr name) {
+    i64 found = 0 - 1;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nfield) break;
+        if (str_eq(fd_name_at(i), name)) {
+            if (found >= 0) return 0 - 2;
+            found = i;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+// the table is a STACK, marked at every `{` and cut back at the matching `}`
+// (teko_stmt.tk's tk_block), so what it holds is exactly the names in scope
+// where the parser stands; the newest entry wins, which is what makes an inner
+// declaration shadow an outer one for as long as its block is open
+i64 tk_local_find(uptr name) {
+    i64 i = tk_nlocal - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(lv_name_at(i), name)) return lv_str_at(i);
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+i64 tk_xt_at(i64 n) {
+    i64 i = tk_nxt - 1;
+    loop {
+        if (i < 0) break;
+        if (xt_node_at(i) == n) return i;
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+i64 tk_xt_find(i64 n) {
+    i64 x = tk_xt_at(n);
+    if (x < 0) return 0 - 1;
+    return xt_str_at(x);
+}
+
+// the node's own type id, which a SCALAR one has as well: a field of `i64` is
+// no row of the type table, and answering -1 for it is what left `this.side`
+// untypable to whoever asks (teko_typeof.tk's tk_ty_of, and through it the
+// overload resolution)
+i64 tk_xt_ty(i64 n) {
+    i64 x = tk_xt_at(n);
+    if (x < 0) return 0 - 1;
+    return xt_ty_at(x);
+}
+
+// 1 when the node may be evaluated twice with no observable difference: a name,
+// or a field load this module built. A constructor and a method call answer 0,
+// so `new C().m()` is refused instead of allocating twice.
+i64 tk_pure(i64 n) {
+    if (n == 0) return 0;
+    if (nd_kind(n) == N_IDENT) return 1;
+    i64 x = tk_xt_at(n);
+    if (x < 0) return 0;
+    return xt_pure_at(x);
+}
+
+// ---- table appends ----
+void tk_local_add(uptr name, i64 si) {
+    if (tk_nlocal == TK_MAXLOCAL) err_at(tk_file, tk_line, "teko: too many locals of struct type");
+    set_lv_name_at(tk_nlocal, name);
+    set_lv_str_at(tk_nlocal, si);
+    tk_nlocal = tk_nlocal + 1;
+}
+
+// the node's type as this module knows it: the row of the type table when the
+// type has one, and the type id in every case. `si` is -1 for a scalar, which
+// is the answer `.` and the oracle both need to tell "not a struct" from
+// "nothing known".
+void tk_xt_put(i64 n, i64 si, i64 ty, i64 pure) {
+    if (tk_nxt == TK_MAXXT) err_at(tk_file, tk_line, "teko: too many expressions whose type is known");
+    set_xt_node_at(tk_nxt, n);
+    set_xt_str_at(tk_nxt, si);
+    set_xt_ty_at(tk_nxt, ty);
+    set_xt_pure_at(tk_nxt, pure);
+    tk_nxt = tk_nxt + 1;
+}
+
+void tk_xt_add(i64 n, i64 si, i64 pure) { tk_xt_put(n, si, sr_ty_at(si), pure); }
+
+// appends the field under its owner, so a method parsed further down the same
+// body already sees the fields declared above it. `sym` is the global a STATIC
+// field lives in, and 0 for one that lives in the object.
+void tk_field_add(i64 si, uptr name, i64 off, i64 ty, i64 nel, i64 vis, uptr sym) {
+    if (tk_nfield == TK_MAXFIELD) err_at(tk_file, tk_line, "teko: too many fields");
+    set_fd_cls_at(tk_nfield, si);
+    set_fd_name_at(tk_nfield, name);
+    set_fd_off_at(tk_nfield, off);
+    set_fd_ty_at(tk_nfield, ty);
+    set_fd_nel_at(tk_nfield, nel);
+    set_fd_vis_at(tk_nfield, vis);
+    set_fd_sym_at(tk_nfield, sym);
+    tk_nfield = tk_nfield + 1;
+}
+
+// a fresh row, in state `part`, at whatever position and file/line the caller
+// hands over -- the ONE place that lays out every field of the type table
+// (`tk_type_add` below for a real declaration, `tk_fwd_row`/`tk_fwd_row_by_ty`
+// in teko_fwd.tk for a placeholder one, §50 O1)
+i64 tk_type_row_new(uptr name, i64 ty, i64 base, i64 kind, i64 vis, i64 proj, i64 part, i64 line, uptr fl) {
+    if (tk_nstruct == TK_MAXSTRUCT) err_at(fl, line, "teko: too many type declarations");
+    set_sr_name_at(tk_nstruct, name);
+    set_sr_ty_at(tk_nstruct, ty);
+    set_sr_size_at(tk_nstruct, 0);
+    set_sr_base_at(tk_nstruct, base);
+    set_sr_kind_at(tk_nstruct, kind);
+    set_sr_nv_at(tk_nstruct, 0);
+    set_sr_m0_at(tk_nstruct, 0);
+    set_sr_mn_at(tk_nstruct, 0);
+    set_sr_ni_at(tk_nstruct, 0);
+    set_sr_vis_at(tk_nstruct, vis);
+    set_sr_proj_at(tk_nstruct, proj);
+    set_sr_abst_at(tk_nstruct, 0);
+    set_sr_part_at(tk_nstruct, part);
+    set_sr_off_at(tk_nstruct, 0);
+    set_sr_hline_at(tk_nstruct, line);
+    set_sr_hfile_at(tk_nstruct, fl);
+    tk_nstruct = tk_nstruct + 1;
+    return tk_nstruct - 1;
+}
+
+// the row is appended BEFORE the body is read, so a field or a method body may
+// name the type being declared -- UNLESS a use already materialized it ahead
+// of this declaration (§50 O1, TK_PFWD): then the placeholder is ADOPTED in
+// place instead of appended again, so its row index -- already read back by
+// every site that resolved through it -- never moves.
+i64 tk_type_add(uptr name, i64 ty, i64 base, i64 kind, i64 vis, i64 proj) {
+    i64 si = tk_struct_find_exact(name);
+    if (si >= 0 && sr_part_at(si) == TK_PFWD) {
+        set_sr_base_at(si, base);
+        set_sr_kind_at(si, kind);
+        set_sr_part_at(si, TK_PWHOLE);
+        set_sr_hline_at(si, tk_line);
+        set_sr_hfile_at(si, tk_file);
+        tk_fwd_adopt(si, vis, proj);
+        return si;
+    }
+    return tk_type_row_new(name, ty, base, kind, vis, proj, TK_PWHOLE, tk_line, tk_file);
+}
+
+// the placeholder a `Box`-typed field, parameter, return, local or global
+// resolves to before `class Box` is ever read (teko_fwd.tk's own
+// `tk_fwd_row`/`tk_fwd_row_by_ty`): no base, no layout, TK_PFWD -- everything
+// `tk_type_add` above fills in once the real declaration adopts it.
+i64 tk_type_add_pending(uptr name, i64 ty, i64 kind, i64 vis, i64 proj) {
+    return tk_type_row_new(name, ty, 0 - 1, kind, vis, proj, TK_PFWD, p_line(), p_file());
+}
+
+// ---- the static type of an already parsed expression ----
+// Three sources, in the order that keeps the precise answer ahead of the
+// heuristic one: a node this module built (a field of struct type, so `a.b.c`
+// chains), a local the core declared (its N_VAR carried the type's own id,
+// which is what type_new buys over type_alias), and a call, whose declared
+// return type the core publishes through decl_find/decl_ret -- `new Point`
+// lowers to `point_new()`, declared to return `Point`.
+i64 tk_struct_of_expr(i64 n) {
+    if (n == 0) return 0 - 1;
+    i64 x = tk_xt_find(n);
+    if (x >= 0) return x;
+    if (nd_kind(n) == N_IDENT) return tk_local_find(nd_name(n));
+    if (nd_kind(n) == N_CALL) {
+        i64 d = decl_find(nd_name(n));
+        if (d < 0) return 0 - 1;
+        return tk_struct_by_ty(decl_ret(d));
+    }
+    return 0 - 1;
+}
+
+// ---- assignment compatibility (C#'s own implicit reference conversion) ----
+// `tk_impl_has` (teko_iface.tk) is included after this file, and this
+// section is read by it as much as the other way around -- forward-declared
+// the same way every other early cross-file need already is here (§50 O1).
+i64 tk_impl_has(i64 ci, i64 fi);
+
+// 1 when `n` is the `null` literal (teko_type.tk's tk_null): the one ordinary
+// N_INT this project ever types TY_UPTR, so a class, an interface, a struct,
+// a delegate or a T[] of heap all accept it without needing a zero of their
+// own.
+i64 tk_is_null_lit(i64 n) {
+    return n != 0 && nd_kind(n) == N_INT && nd_type(n) == TY_UPTR && nd_val(n) == 0;
+}
+
+// 1 when a value declared `ei` (a row of this table, or -1 when it names no
+// row at all) fits a slot declared `ti`: identical, `ei` a class deriving
+// from `ti`, or `ei` implementing `ti` -- `tk_impl_has` already flattens
+// interface-extends-interface and copies a base class's own interfaces onto
+// the derived one, so the same call answers both. A `T[]` or a delegate
+// fits only its own identity, checked by the caller before this runs.
+i64 tk_row_fits(i64 ti, i64 ei) {
+    if (ti == ei) return 1;
+    if (ei < 0) return 0;
+    if (tk_is_ha(ti) || tk_is_deleg(ti)) return 0;
+    if (tk_is_class(ei)) {
+        i64 b = sr_base_at(ei);
+        loop {
+            if (b < 0) break;
+            if (b == ti) return 1;
+            b = sr_base_at(b);
+        }
+    }
+    return tk_impl_has(ei, ti);
+}
+
+// C#'s own wording for a failed implicit reference conversion, one name on
+// each side
+void tk_reject_compat(uptr ename, uptr tname, i64 line, uptr fl) {
+    err_at(fl, line, tk_join(tk_join3("teko: a value of type ", ename, " does not convert to "), tname));
+}
+
+// `p.f = e` / `p.items[i] = e` once the receiver's type IS known, at parse
+// time: the field's own row against whatever `tk_struct_of_expr` can already
+// tell about `v` -- a local, a field load, a `new` -- and nothing else,
+// because a call whose return only the pass will resolve is not this early
+// check's to guess at.
+void tk_check_field_store(i64 fty, i64 v, i64 line, uptr fl) {
+    i64 ti = tk_struct_by_ty(fty);
+    if (ti < 0) return;
+    if (tk_is_null_lit(v)) return;
+    i64 ei = tk_struct_of_expr(v);
+    if (ei < 0) return;
+    if (tk_row_fits(ti, ei)) return;
+    tk_reject_compat(sr_name_at(ei), sr_name_at(ti), line, fl);
+}
+
+// every local's (name, declared type), whatever the type -- K4's `use (a,
+// &b)` needs a capture's type at the exact point it reads the clause, and
+// only a struct/class local is tracked by `tk_local_add` below. Grown
+// ever-forward over the whole unit, like `tk_local_add` itself: the most
+// recent declaration of a name is the one a lookup right after it means.
+void tk_slv_add(uptr name, i64 ty) {
+    if (tk_nslv == TK_MAXSLV) err_at(tk_file, tk_line, "teko: too many locals in one unit");
+    set_slv_name_at(tk_nslv, name);
+    set_slv_ty_at(tk_nslv, ty);
+    tk_nslv = tk_nslv + 1;
+}
+
+i64 tk_slv_find(uptr name) {
+    i64 i = tk_nslv - 1;
+    loop {
+        if (i < 0) break;
+        if (str_eq(slv_name_at(i), name)) return slv_ty_at(i);
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// higiene 2, item 1: a node's type as far as PARSING it alone can tell -- an
+// already-tagged node's own tag (`tk_xt_ty`, e.g. a fresh `new C()`), a bare
+// local's declared type (`tk_slv_find`, the same fallback K4's own `use (...)`
+// already trusts), or, since V0 item 3, the declared RETURN TYPE of a call
+// whose callee the unit has already declared (`decl_find`/`decl_ret`, the very
+// pair the pass-time oracle `tk_ty_of` reads for the same node -- so an
+// argument position now answers what an initializer position already did).
+// Anything else (a field load not yet tagged, a callee declared further down,
+// an indirect `callp` no declaration names) answers -1, silently skipped by
+// `tk_check_compat` rather than guessed at -- a vtable/itab call's own
+// arguments are checked at the PARSE-TIME call site (teko_expr.tk's
+// `tk_vcall_args_check`, teko_iface.tk's `tk_ifargs_check`), before the
+// pass-time scope table (`tk_ty_scope_find`) exists.
+i64 tk_pty_of(i64 n) {
+    i64 t = tk_xt_ty(n);
+    if (t >= 0) return t;
+    i64 k = nd_kind(n);
+    if (k == N_IDENT) return tk_slv_find(nd_name(n));
+    if (k == N_CALL)  return decl_ret(decl_find(nd_name(n)));
+    return 0 - 1;
+}
+
+// M21.5's statement hook: a local the CORE declared (`Point p = new Point;`)
+// is observable here as the N_VAR node, and its type id is the struct or class.
+// Nothing is rewritten -- the node that arrives is the node that leaves.
+// `nd_val` is the array length, so `Point tbl[4];` (four pointers, not one
+// object) is skipped.
+i64 tk_on_stmt(i64 n) {
+    if (n == 0) return n;
+    if (nd_kind(n) != N_VAR) return n;
+    if (nd_val(n) != 0) return n;
+    tk_slv_add(nd_name(n), nd_type(n));
+    i64 si = tk_struct_by_ty(nd_type(n));
+    if (si >= 0) {
+        tk_line = nd_line(n);
+        tk_file = nd_file(n);
+        tk_local_add(nd_name(n), si);
+    }
+    return n;
+}
+
+// ---- the constructor ----
+// Name Name_new() { uptr p = rt_alloc(NAME_SIZE); <install> return p; }
+// The declared return type is the type's own id, which is what makes
+// `Point p = new Point;` and a call in `.` position resolve to it. `install` is
+// empty for a struct and the vtable store for a class (teko_class.tk).
+i64 tk_ctor(uptr name, i64 ty, i64 size, i64 install) {
+    i64 stmts = tk_var(TY_UPTR, "p", tk_call("rt_alloc", tk_int(size)));
+    if (install) stmts = list_append(stmts, install);
+    i64 r = tk_id("p");
+    tk_xt_add(r, tk_struct_by_ty(ty), 0);         // D226 compat crumb: `p` is `uptr`, the
+                                                   // fresh object it names is the type itself
+    stmts = list_append(stmts, tk_ret(r));
+    return tk_func(ty, tk_ctor_name(name), 0, tk_blk(stmts));
+}
+
+// a name being declared: an identifier that is still free. `type_new` reserves
+// the word, so a second `struct Point` (or `struct str`) arrives here as a
+// keyword rather than as T_IDENT -- without this guard the error would come out
+// as an unexplained "name expected".
+//
+// A namespaced short type word (§31 N1) is ALSO reserved this way from its
+// second declaration onward -- `geo.Circle` claims the word "Circle" for
+// EVERY namespace, so `mesh { class Circle { ... } }` would otherwise fail
+// this same way. It is accepted here, but only when the CURRENT namespace has
+// not already declared it: the qualified exact-match answers a genuine
+// `mesh.Circle` beside `geo.Circle` (two different rows) from a true
+// duplicate `geo.Circle` declared twice with no `partial` (`tk_class`'s own
+// reopen check already took the `partial` case before this is ever reached).
+// §58 DI1: `teko_di.tk` is included after every type declaration in this
+// file, but a service marker's name is reserved from the very first
+// declaration this function ever reads
+i64 tk_di_marker(uptr nm);
+
+uptr tk_newname(uptr what) {
+    if (tk_gen_find(p_name()) >= 0)
+        err_at2(p_file(), p_line(), "teko: the name is already a generic", p_name());
+    if (tk_di_marker(p_name()) >= 0)
+        err_at(p_file(), p_line(), tk_join3("teko: ", p_name(), " is the service marker"));
+    if (p_id() == T_IDENT) return p_ident();
+    if (tk_fwd_pending(tk_ns_qualified_name(p_name()))) {
+        uptr nm = p_name();
+        p_next();
+        return nm;
+    }
+    if (tk_ns_short_known(p_name())) {
+        uptr nm = p_name();
+        if (tk_struct_find_exact(tk_ns_qualified_name(nm)) >= 0)
+            err_at2(p_file(), p_line(), "teko: the name is already a type", nm);
+        p_next();
+        return nm;
+    }
+    if (alias_find(p_id()) >= 0)
+        err_at2(p_file(), p_line(), "teko: the name is already a type", p_name());
+    err_at2(p_file(), p_line(), tk_join3("teko: name of ", what, " expected"), p_name());
+    return 0;
+}
+
+// `[4]` after a field name: an INLINE array of that many elements, whose size
+// the instantiation of a generic fixes (`T items[N]`, N substituted by
+// p_subst_int). 0 when the field is a scalar.
+i64 tk_field_dim() {
+    if (!p_accept(K_LBRACK)) return 0;
+    if (p_id() != T_INT)
+        err_at(p_file(), p_line(), "teko: an array field size is an integer literal");
+    i64 n = p_val();
+    if (n < 1) err_at(p_file(), p_line(), "teko: an array field size is positive");
+    p_next();
+    p_expect(K_RBRACK, "expected ] after the array field size");
+    return n;
+}
+
+// what both shapes of a field declaration refuse before they place anything
+void tk_field_gate(i64 si, uptr m, i64 fty) {
+    if (fty == TY_VOID) err_at2(tk_file, tk_line, "teko: field of type void", m);
+    if (tk_field_find(si, m) >= 0) err_at2(tk_file, tk_line, "teko: duplicate field", m);
+}
+
+// places `m`, of type `fty`, at or after `off` and returns the next offset:
+// the natural alignment of the field's own width, the `#define` of the offset,
+// and the row in the field table. `nel` elements when the field is an array,
+// laid out inline, so the object grows with the constant the generic was
+// instantiated with.
+i64 tk_field_place(i64 si, uptr tname, uptr m, i64 fty, i64 nel, i64 off, i64 vis) {
+    tk_field_gate(si, m, fty);
+    i64 w = type_width(fty);
+    off = (off + w - 1) & ~(w - 1);
+    def_add(tk_cname(tname, m), off, tk_line, tk_file);
+    tk_field_add(si, m, off, fty, nel, vis, 0);
+    if (nel > 0) return off + w * nel;
+    return off + w;
+}
+
+// a STATIC field is one global of the field's own width, named `Type_field`, and
+// no part of the object at all -- so the layout, and every `#define` of an
+// offset after it, is what it would be if the field were not written
+void tk_static_field(i64 si, uptr tname, uptr m, i64 fty, i64 nel, i64 vis) {
+    tk_field_gate(si, m, fty);
+    uptr sym = tk_fname(tname, m);
+    i64 n = nel;
+    if (n == 0) n = 1;
+    top_add(tk_glb(TY_U8, sym, type_width(fty) * n));
+    tk_field_add(si, m, 0, fty, nel, vis, sym);
+}
+
+// ---- an array field, and the `[` that is the only way to reach one ----
+void tk_ax_add(i64 n, i64 ty, i64 nel, uptr name) {
+    if (tk_nax == TK_MAXAX) err_at(tk_file, tk_line, "teko: too many array-field accesses");
+    set_ax_node_at(tk_nax, n);
+    set_ax_ty_at(tk_nax, ty);
+    set_ax_nel_at(tk_nax, nel);
+    set_ax_name_at(tk_nax, name);
+    tk_nax = tk_nax + 1;
+}
+
+i64 tk_ax_find(i64 n) {
+    i64 i = tk_nax - 1;
+    loop {
+        if (i < 0) break;
+        if (ax_node_at(i) == n) return i;
+        i = i - 1;
+    }
+    return 0 - 1;
+}
+
+// `p.items` is the ADDRESS of the array, tagged with the element type and the
+// length so that `[` can bound-check it. The array itself is not a value: there
+// is nothing for `p.items` alone, or for `p.items = e`, to be.
+i64 tk_array_of(i64 addr, i64 fi, i64 line, uptr fl) {
+    if (p_id() == K_ASSIGN)
+        err_at2(fl, line, "teko: an array field is assigned one element at a time", fd_name_at(fi));
+    if (p_id() != K_LBRACK)
+        err_at2(fl, line, "teko: an array field is read one element at a time", fd_name_at(fi));
+    tk_ax_add(addr, fd_ty_at(fi), fd_nel_at(fi), fd_name_at(fi));
+    return addr;
+}
+
+uptr tk_ax_msg(i64 k, uptr what, uptr name, i64 nel) {
+    return tk_join3(tk_join3("teko: index ", tk_num(k), what),
+                    name, tk_join3("[", tk_num(nel), "]"));
+}
+
+// i64 tk_ix(i64 i, i64 n) { if (i < 0) rt_panic(...); if (i >= n) rt_panic(...);
+// return i; } -- emitted ONCE, into the program, and only when a program really
+// indexes an array field with something other than a literal. A program that
+// does not is left with exactly the tree it had, which is what the no-op proof
+// of a taught construct means.
+i64 tk_ix_emitted = 0;
+
+void tk_ix_emit() {
+    if (tk_ix_emitted) return;
+    tk_ix_emitted = 1;
+    i64 low = tk_if(tk_bin(K_LT, tk_id("i"), tk_int(0)),
+                    tk_stmt(tk_call("rt_panic", tk_str("index below zero into an array field"))));
+    i64 high = tk_if(tk_bin(K_GE, tk_id("i"), tk_id("n")),
+                     tk_stmt(tk_call("rt_panic", tk_str("index past the end of an array field"))));
+    i64 body = tk_blk(list_append(list_append(low, high), tk_ret(tk_id("i"))));
+    i64 prs = list_append(param_new(TY_I64, "i"), param_new(TY_I64, "n"));
+    top_add(tk_func(TY_I64, "tk_ix", prs, body));
+}
+
+// A LITERAL index is decided here, against the constant the instantiation
+// fixed -- which is the whole point of a generic taking a `const N`. Anything
+// else is checked at run time by tk_ix, so no index ever reads past the object
+// in silence.
+i64 tk_ax_index(i64 idx, i64 nel, uptr name, i64 line, uptr fl) {
+    if (nd_kind(idx) != N_INT) {
+        tk_ix_emit();
+        return tk_call2("tk_ix", idx, tk_int(nel));
+    }
+    i64 k = nd_val(idx);
+    if (k < 0) err_at(fl, line, tk_ax_msg(k, " is before the start of ", name, nel));
+    if (k >= nel) err_at(fl, line, tk_ax_msg(k, " is past the end of ", name, nel));
+    return idx;
+}
+
+// `p.items[i]` and `p.items[i] = e`: the load or the store of the element's own
+// width. `=` is read here for the same reason tk_field_use reads it -- it is not
+// in the core's infix table, so the Pratt loop has already stopped. A receiver
+// sunk through a `- ! ~` chain (teko_prefix.tk, `tk_bracket_no_write`) is never
+// the write target the source named: `!p.items[0] = e` refuses of its own accord
+// instead of building a store the wrapping `!` would then choke on.
+i64 tk_array_index(i64 addr, i64 x) {
+    i64 line = p_line();
+    uptr fl = p_file();
+    i64 ety = ax_ty_at(x);
+    i64 idx = parse_expr(0);
+    p_expect(K_RBRACK, "expected ] after the index");
+    tk_line = line;
+    tk_file = fl;
+    i64 k = tk_ax_index(idx, ax_nel_at(x), ax_name_at(x), line, fl);
+    i64 at = tk_bin(K_ADD, addr, tk_bin(K_MUL, k, tk_int(type_width(ety))));
+    if (tk_bracket_no_write && p_id() == K_ASSIGN)
+        err_at(fl, line, "teko: the left side of = is not a place");
+    if (p_accept(K_ASSIGN)) {
+        i64 v = parse_expr(0);
+        tk_line = line;
+        tk_file = fl;
+        tk_check_field_store(ety, v, line, fl);
+        return tk_os_mark(tk_call2(tk_stn(ety), at, v), ety);
+    }
+    i64 r = tk_call(tk_ldn(ety), at);
+    i64 es = tk_struct_by_ty(ety);
+    if (es >= 0) tk_xt_add(r, es, 1);
+    return r;
+}
+
+// the whole object is aligned to 8, and exists even with no field at all
+i64 tk_size_of(i64 off) {
+    off = (off + 7) & ~7;
+    if (off == 0) return 8;
+    return off;
+}
+
+// ---- struct Name { type field; ... } ----
+void tk_struct() {
+    tk_line = p_line();
+    tk_file = p_file();
+    i64 head_line = tk_line;                     // position of the `struct` word
+    uptr head_file = tk_file;
+    p_next();                                    // the `struct` word
+    i64 vis = tk_take_decl_vis();                // the `public`/`internal` before the word
+    i64 proj = tk_take_decl_proj();
+    uptr name = tk_newname("struct");
+    if (p_id() == K_LT) {                        // struct Name<T, const N: i64>
+        tk_gen_record(name, TK_KSTRUCT, vis, proj, 0, 0);   // recorded, not declared
+        return;
+    }
+    name = tk_ns_qualify(name);                  // the current namespace, if any (§31 N1)
+    i64 ty = tk_type_word(name);                 // a field of its own type parses
+    i64 si = tk_type_add(name, ty, 0 - 1, TK_KSTRUCT, vis, proj);   // no base, no vtable: offset 0
+    tk_use_reset();
+    p_expect(K_LBRACE, "expected { in the struct body");
+    i64 off = 0;
+    loop {
+        if (p_id() == K_RBRACE) break;
+        if (p_id() == T_EOF) err_at(head_file, head_line, "unterminated struct");
+        tk_line = p_line();                      // errors and nodes for this member
+        tk_file = p_file();
+        off = tk_member(si, name, off, 0 - 1);   // fields and methods, the class's own machine
+    }
+    p_next();                                    // }
+    p_accept(K_SEMI);                            // a C programmer's trailing ;
+    tk_line = head_line;                         // back to the struct's own level
+    tk_file = head_file;
+    i64 size = tk_size_of(off);
+    set_sr_size_at(si, size);
+    def_add(tk_join(tk_case(name, 1), "_SIZE"), size, tk_line, tk_file);
+    top_add(tk_ctor(name, ty, size, 0));
+}

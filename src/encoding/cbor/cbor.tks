@@ -1,0 +1,629 @@
+/**
+ * The kind discriminant of a `CborValue`: which CBOR data item shape it holds. `Uint` and `Nint`
+ * are the two integer majors (`Nint` stores its `-1 - n` argument in `uint`); `Bytes` and `Text`
+ * are the two string majors (both keep their raw bytes in `bytes`); `Array` and `Map` are the two
+ * container majors; `Tag` is a tagged item (tag number in `uint`, tagged value in `items[0]`);
+ * `Simple` is a bare simple value (in `uint`); `Float`, `Bool`, `Null`, and `Undefined` are the
+ * distinguished major-type-7 values.
+ */
+exp type CborKind = enum {
+    Uint; Nint; Bytes; Text; Array; Map; Tag; Simple; Float; Bool; Null; Undefined
+}
+
+/**
+ * One CBOR data item as a tagged struct spanning every `CborKind`: `kind` selects which fields
+ * below carry meaning.
+ */
+exp type CborValue = struct {
+    /**
+     * Which CBOR item shape this is; selects which of the fields below are meaningful.
+     */
+    kind: CborKind
+    /**
+     * The unsigned magnitude: the value for `Uint`; the argument `n` (encoding `-1 - n`) for
+     * `Nint`; the tag number for `Tag`; the simple value for `Simple`. Zero otherwise.
+     */
+    uint: u64
+    /**
+     * The floating-point value for `Float`. Zero otherwise.
+     */
+    real: f64
+    /**
+     * The boolean value for `Bool`. `false` otherwise.
+     */
+    flag: bool
+    /**
+     * The raw content bytes for `Bytes`, and the UTF-8 bytes of the string for `Text`. Empty
+     * otherwise.
+     */
+    bytes: []byte
+    /**
+     * The elements for `Array`, and the single tagged item (at index 0) for `Tag`. Empty
+     * otherwise.
+     */
+    items: []CborValue
+    /**
+     * The keys of a `Map`, parallel to `vals`. Empty otherwise.
+     */
+    keys: []CborValue
+    /**
+     * The values of a `Map`, parallel to `keys`. Empty otherwise.
+     */
+    vals: []CborValue
+}
+
+type CborRead = struct {
+    value: CborValue
+    pos: u64
+}
+
+type ArgRead = struct {
+    arg: u64
+    pos: u64
+    indefinite: bool
+}
+
+type BytesRead = struct {
+    data: []byte
+    pos: u64
+}
+
+type CanonEntry = struct {
+    key: []byte
+    body: []byte
+}
+
+fn no_bytes(): []byte {
+    []
+}
+
+fn no_values(): []CborValue {
+    []
+}
+
+fn mk_value(kind: CborKind, uint: u64, real: f64, flag: bool, bytes: []byte, items: []CborValue, keys: []CborValue, vals: []CborValue): CborValue {
+    CborValue { kind = kind; uint = uint; real = real; flag = flag; bytes = bytes; items = items; keys = keys; vals = vals }
+}
+
+/**
+ * Wraps an unsigned integer as a major-type-0 value.
+ */
+exp fn cbor_uint(v: u64): CborValue {
+    mk_value(CborKind::Uint, v, 0.0, false, no_bytes(), no_values(), no_values(), no_values())
+}
+
+/**
+ * Wraps a negative integer given as its CBOR argument `n`, which encodes the value `-1 - n`
+ * (so `n = 0` is `-1` and `n = 9` is `-10`). This spelling reaches every negative down to
+ * `-2^64` without a signed overflow.
+ */
+exp fn cbor_nint(n: u64): CborValue {
+    mk_value(CborKind::Nint, n, 0.0, false, no_bytes(), no_values(), no_values(), no_values())
+}
+
+/**
+ * Wraps a signed integer, choosing major type 0 for non-negative values and major type 1 for
+ * negative ones. Values in `[-2^63, 2^63 - 1]` (the `i64` range) map cleanly; the wider CBOR
+ * integer range is reachable through `cbor_uint` / `cbor_nint` directly.
+ */
+exp fn cbor_int(v: i64): CborValue {
+    if v >= 0 { return cbor_uint(v to u64) }
+    cbor_nint(((-(v + 1)) to u64))
+}
+
+/**
+ * Wraps a byte string as a major-type-2 value.
+ */
+exp fn cbor_bytes(b: []byte): CborValue {
+    mk_value(CborKind::Bytes, 0, 0.0, false, b, no_values(), no_values(), no_values())
+}
+
+/**
+ * Wraps a text string as a major-type-3 value, holding its UTF-8 bytes.
+ */
+exp fn cbor_text(s: str): CborValue {
+    mk_value(CborKind::Text, 0, 0.0, false, s.bytes(), no_values(), no_values(), no_values())
+}
+
+/**
+ * Wraps a sequence of items as a major-type-4 array.
+ */
+exp fn cbor_array(items: []CborValue): CborValue {
+    mk_value(CborKind::Array, 0, 0.0, false, no_bytes(), items, no_values(), no_values())
+}
+
+/**
+ * Wraps parallel key/value slices as a major-type-5 map. `keys[i]` maps to `vals[i]`; the two
+ * slices must have the same length (the encoder reads `keys.len` pairs).
+ */
+exp fn cbor_map(keys: []CborValue, vals: []CborValue): CborValue {
+    mk_value(CborKind::Map, 0, 0.0, false, no_bytes(), no_values(), keys, vals)
+}
+
+/**
+ * Wraps a tagged item as a major-type-6 value: the tag number plus the single tagged content.
+ */
+exp fn cbor_tag(tag: u64, content: CborValue): CborValue {
+    var one: []CborValue = [..no_values(), content]
+    mk_value(CborKind::Tag, tag, 0.0, false, no_bytes(), one, no_values(), no_values())
+}
+
+/**
+ * Wraps a boolean as the major-type-7 `false` (20) / `true` (21) simple value.
+ */
+exp fn cbor_bool(b: bool): CborValue {
+    mk_value(CborKind::Bool, 0, 0.0, b, no_bytes(), no_values(), no_values(), no_values())
+}
+
+/**
+ * The major-type-7 `null` (22) simple value.
+ */
+exp fn cbor_null(): CborValue {
+    mk_value(CborKind::Null, 0, 0.0, false, no_bytes(), no_values(), no_values(), no_values())
+}
+
+/**
+ * The major-type-7 `undefined` (23) simple value.
+ */
+exp fn cbor_undefined(): CborValue {
+    mk_value(CborKind::Undefined, 0, 0.0, false, no_bytes(), no_values(), no_values(), no_values())
+}
+
+/**
+ * Wraps a floating-point number as a major-type-7 float (encoded as the 64-bit form).
+ */
+exp fn cbor_float(x: f64): CborValue {
+    mk_value(CborKind::Float, 0, x, false, no_bytes(), no_values(), no_values(), no_values())
+}
+
+/**
+ * Wraps a bare simple value (major type 7, additional information other than the distinguished
+ * float/bool/null/undefined encodings).
+ */
+exp fn cbor_simple(v: u64): CborValue {
+    mk_value(CborKind::Simple, v, 0.0, false, no_bytes(), no_values(), no_values(), no_values())
+}
+
+fn append_all(out: []byte, more: []byte): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= more.len { break }
+        acc = [..acc, more[i]]
+        i++
+    }
+    acc
+}
+
+fn append_be(out: []byte, v: u64, count: u64): []byte {
+    var acc = out
+    var i = count
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        acc = [..acc, ((v >> (i * 8)) & 0xFF) to byte]
+    }
+    acc
+}
+
+fn encode_head(major: u64, arg: u64): []byte {
+    var out: []byte = no_bytes()
+    if arg < 24 {
+        return [..out, ((major << 5) | arg) to byte]
+    }
+    if arg <= 0xFF {
+        out = [..out, ((major << 5) | 24) to byte]
+        return [..out, arg to byte]
+    }
+    if arg <= 0xFFFF {
+        out = [..out, ((major << 5) | 25) to byte]
+        return append_be(out, arg, 2)
+    }
+    if arg <= 0xFFFFFFFF {
+        out = [..out, ((major << 5) | 26) to byte]
+        return append_be(out, arg, 4)
+    }
+    out = [..out, ((major << 5) | 27) to byte]
+    append_be(out, arg, 8)
+}
+
+fn encode_simple(out: []byte, v: u64): []byte {
+    if v < 24 {
+        return [..out, (0xE0 | v) to byte]
+    }
+    var o = [..out, 0xF8 to byte]
+    [..o, v to byte]
+}
+
+fn encode_value(out: []byte, v: CborValue): []byte {
+    match v.kind {
+        CborKind::Uint => append_all(out, encode_head(0, v.uint))
+        CborKind::Nint => append_all(out, encode_head(1, v.uint))
+        CborKind::Bytes => append_all(append_all(out, encode_head(2, v.bytes.len)), v.bytes)
+        CborKind::Text => append_all(append_all(out, encode_head(3, v.bytes.len)), v.bytes)
+        CborKind::Array => encode_array(out, v.items)
+        CborKind::Map => encode_map(out, v.keys, v.vals)
+        CborKind::Tag => encode_value(append_all(out, encode_head(6, v.uint)), v.items[0])
+        CborKind::Simple => encode_simple(out, v.uint)
+        CborKind::Float => append_be([..out, 0xFB to byte], f64_bits(v.real), 8)
+        CborKind::Bool => [..out, (if v.flag { 0xF5 } else { 0xF4 }) to byte]
+        CborKind::Null => [..out, 0xF6 to byte]
+        CborKind::Undefined => [..out, 0xF7 to byte]
+    }
+}
+
+fn encode_array(out: []byte, items: []CborValue): []byte {
+    var acc = append_all(out, encode_head(4, items.len))
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        acc = encode_value(acc, items[i])
+        i++
+    }
+    acc
+}
+
+fn encode_map(out: []byte, keys: []CborValue, vals: []CborValue): []byte {
+    var acc = append_all(out, encode_head(5, keys.len))
+    var i: u64 = 0
+    loop {
+        if i >= keys.len { break }
+        acc = encode_value(encode_value(acc, keys[i]), vals[i])
+        i++
+    }
+    acc
+}
+
+/**
+ * Encodes a complete `CborValue` to a fresh byte slice using preferred (shortest) head lengths
+ * throughout. Map entries keep their given order — use `encode_canonical` when a signing-stable
+ * key order is required.
+ */
+exp fn encode(v: CborValue): []byte {
+    encode_value(no_bytes(), v)
+}
+
+fn bytes_less(a: []byte, b: []byte): bool {
+    var i: u64 = 0
+    loop {
+        if i >= a.len { return b.len > a.len }
+        if i >= b.len { return false }
+        if a[i] != b[i] { return a[i] < b[i] }
+        i++
+    }
+}
+
+fn insert_sorted(sorted: []CanonEntry, e: CanonEntry): []CanonEntry {
+    var out: []CanonEntry = []
+    var placed = false
+    var i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if !placed && bytes_less(e.key, sorted[i].key) {
+            out = [..out, e]
+            placed = true
+        }
+        out = [..out, sorted[i]]
+        i++
+    }
+    if !placed { out = [..out, e] }
+    out
+}
+
+fn encode_map_canonical(out: []byte, keys: []CborValue, vals: []CborValue): []byte {
+    var sorted: []CanonEntry = []
+    var i: u64 = 0
+    loop {
+        if i >= keys.len { break }
+        var keybytes = encode_canonical(keys[i])
+        var body = append_all(keybytes, encode_canonical(vals[i]))
+        sorted = insert_sorted(sorted, CanonEntry { key = keybytes; body = body })
+        i++
+    }
+    var acc = append_all(out, encode_head(5, keys.len))
+    var j: u64 = 0
+    loop {
+        if j >= sorted.len { break }
+        acc = append_all(acc, sorted[j].body)
+        j++
+    }
+    acc
+}
+
+/**
+ * Encodes a complete `CborValue` in canonical form (RFC 8949 §4.2.1): preferred head lengths
+ * everywhere plus map keys sorted into bytewise lexicographic order of their encodings. Suitable
+ * for producing a signing-stable byte string.
+ */
+exp fn encode_canonical(v: CborValue): []byte {
+    if v.kind == CborKind::Map { return encode_map_canonical(no_bytes(), v.keys, v.vals) }
+    if v.kind == CborKind::Array {
+        var acc = append_all(no_bytes(), encode_head(4, v.items.len))
+        var i: u64 = 0
+        loop {
+            if i >= v.items.len { break }
+            acc = append_all(acc, encode_canonical(v.items[i]))
+            i++
+        }
+        return acc
+    }
+    if v.kind == CborKind::Tag { return append_all(append_all(no_bytes(), encode_head(6, v.uint)), encode_canonical(v.items[0])) }
+    encode(v)
+}
+
+fn read_be(p: []byte, pos: u64, count: u64): u64 {
+    var v: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= count { break }
+        v = (v << 8) | (p[pos + i] to u64)
+        i++
+    }
+    v
+}
+
+fn read_error(what: str, pos: u64): error {
+    error { message = concat("cbor: ", what, " at offset ", i64_to_str(pos to i64)) }
+}
+
+fn read_arg(p: []byte, pos: u64, ai: u64): ArgRead | error {
+    if ai < 24 { return ArgRead { arg = ai; pos = pos + 1; indefinite = false } }
+    if ai == 31 { return ArgRead { arg = 0; pos = pos + 1; indefinite = true } }
+    if ai == 24 {
+        if pos + 2 > p.len { return read_error("truncated 1-byte argument", pos) }
+        return ArgRead { arg = p[pos + 1] to u64; pos = pos + 2; indefinite = false }
+    }
+    var count = arg_byte_count(ai)
+    if count == 0 { return read_error("reserved additional information", pos) }
+    if pos + 1 + count > p.len { return read_error("truncated argument", pos) }
+    ArgRead { arg = read_be(p, pos + 1, count); pos = pos + 1 + count; indefinite = false }
+}
+
+fn arg_byte_count(ai: u64): u64 {
+    if ai == 25 { return 2 }
+    if ai == 26 { return 4 }
+    if ai == 27 { return 8 }
+    0
+}
+
+fn take_bytes(p: []byte, pos: u64, n: u64): BytesRead | error {
+    if pos + n > p.len { return read_error("truncated string", pos) }
+    var out: []byte = no_bytes()
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out = [..out, p[pos + i]]
+        i++
+    }
+    BytesRead { data = out; pos = pos + n }
+}
+
+fn is_break(p: []byte, pos: u64): bool {
+    pos < p.len && p[pos] == 0xFF
+}
+
+fn decode_string(p: []byte, a: ArgRead, maj: u64): CborRead | error {
+    if !a.indefinite {
+        var got = match take_bytes(p, a.pos, a.arg) { BytesRead as r => r; error as e => return e }
+        return CborRead { value = wrap_string(maj, got.data); pos = got.pos }
+    }
+    var acc: []byte = no_bytes()
+    var at = a.pos
+    loop {
+        if at >= p.len { return read_error("unterminated indefinite string", at) }
+        if is_break(p, at) { return CborRead { value = wrap_string(maj, acc); pos = at + 1 } }
+        var chunk = match decode_at(p, at) { CborRead as r => r; error as e => return e }
+        if !chunk_matches(chunk.value, maj) { return read_error("indefinite string chunk of wrong type", at) }
+        acc = append_all(acc, chunk.value.bytes)
+        at = chunk.pos
+    }
+}
+
+fn chunk_matches(v: CborValue, maj: u64): bool {
+    if maj == 2 { return v.kind == CborKind::Bytes }
+    v.kind == CborKind::Text
+}
+
+fn wrap_string(maj: u64, data: []byte): CborValue {
+    if maj == 2 { return cbor_bytes(data) }
+    mk_value(CborKind::Text, 0, 0.0, false, data, no_values(), no_values(), no_values())
+}
+
+fn decode_array(p: []byte, a: ArgRead): CborRead | error {
+    var items: []CborValue = no_values()
+    var at = a.pos
+    if a.indefinite {
+        loop {
+            if at >= p.len { return read_error("unterminated indefinite array", at) }
+            if is_break(p, at) { return CborRead { value = cbor_array(items); pos = at + 1 } }
+            var el = match decode_at(p, at) { CborRead as r => r; error as e => return e }
+            items = [..items, el.value]
+            at = el.pos
+        }
+    }
+    var i: u64 = 0
+    loop {
+        if i >= a.arg { break }
+        var el = match decode_at(p, at) { CborRead as r => r; error as e => return e }
+        items = [..items, el.value]
+        at = el.pos
+        i++
+    }
+    CborRead { value = cbor_array(items); pos = at }
+}
+
+fn decode_map(p: []byte, a: ArgRead): CborRead | error {
+    var keys: []CborValue = no_values()
+    var vals: []CborValue = no_values()
+    var at = a.pos
+    if a.indefinite {
+        loop {
+            if at >= p.len { return read_error("unterminated indefinite map", at) }
+            if is_break(p, at) { return CborRead { value = cbor_map(keys, vals); pos = at + 1 } }
+            var k = match decode_at(p, at) { CborRead as r => r; error as e => return e }
+            var v = match decode_at(p, k.pos) { CborRead as r => r; error as e => return e }
+            keys = [..keys, k.value]
+            vals = [..vals, v.value]
+            at = v.pos
+        }
+    }
+    var i: u64 = 0
+    loop {
+        if i >= a.arg { break }
+        var k = match decode_at(p, at) { CborRead as r => r; error as e => return e }
+        var v = match decode_at(p, k.pos) { CborRead as r => r; error as e => return e }
+        keys = [..keys, k.value]
+        vals = [..vals, v.value]
+        at = v.pos
+        i++
+    }
+    CborRead { value = cbor_map(keys, vals); pos = at }
+}
+
+fn decode_simple_or_float(p: []byte, pos: u64, a: ArgRead, ai: u64): CborRead | error {
+    if ai == 31 { return read_error("unexpected break", pos) }
+    if ai == 25 {
+        if pos + 3 > p.len { return read_error("truncated half float", pos) }
+        return CborRead { value = cbor_float(half_to_f64(read_be(p, pos + 1, 2))); pos = pos + 3 }
+    }
+    if ai == 26 {
+        if pos + 5 > p.len { return read_error("truncated single float", pos) }
+        return CborRead { value = cbor_float(single_to_f64(read_be(p, pos + 1, 4))); pos = pos + 5 }
+    }
+    if ai == 27 {
+        if pos + 9 > p.len { return read_error("truncated double float", pos) }
+        return CborRead { value = cbor_float(f64_from_bits(read_be(p, pos + 1, 8))); pos = pos + 9 }
+    }
+    CborRead { value = simple_value(a.arg); pos = a.pos }
+}
+
+fn simple_value(arg: u64): CborValue {
+    if arg == 20 { return cbor_bool(false) }
+    if arg == 21 { return cbor_bool(true) }
+    if arg == 22 { return cbor_null() }
+    if arg == 23 { return cbor_undefined() }
+    cbor_simple(arg)
+}
+
+fn half_to_f64(h: u64): f64 {
+    var sign = (h >> 15) & 0x1
+    var ebits = (h >> 10) & 0x1F
+    var mant = h & 0x3FF
+    if ebits == 0 { return apply_sign(sign, (mant to f64) * two_pow(-24)) }
+    if ebits == 0x1F { return half_non_finite(sign, mant) }
+    var value = (1.0 + (mant to f64) * two_pow(-10)) * two_pow((ebits to i64) - 15)
+    apply_sign(sign, value)
+}
+
+fn half_non_finite(sign: u64, mant: u64): f64 {
+    if mant != 0 { return f64_from_bits(0x7FF8000000000000) }
+    f64_from_bits((sign << 63) | 0x7FF0000000000000)
+}
+
+fn single_to_f64(s: u64): f64 {
+    var sign = (s >> 31) & 0x1
+    var ebits = (s >> 23) & 0xFF
+    var mant = s & 0x7FFFFF
+    if ebits == 0 {
+        if mant == 0 { return f64_from_bits(sign << 63) }
+        return apply_sign(sign, (mant to f64) * two_pow(-149))
+    }
+    if ebits == 0xFF { return f64_from_bits((sign << 63) | 0x7FF0000000000000 | (if mant != 0 { (0x8000000000000 | (mant << 29)) } else { 0 })) }
+    var exp64 = (ebits + 1023 - 127)
+    f64_from_bits((sign << 63) | (exp64 << 52) | (mant << 29))
+}
+
+fn apply_sign(sign: u64, mag: f64): f64 {
+    if sign == 1 { return -mag }
+    mag
+}
+
+fn two_pow(e: i64): f64 {
+    f64_from_bits((((e + 1023) to u64) & 0x7FF) << 52)
+}
+
+fn decode_at(p: []byte, pos: u64): CborRead | error {
+    if pos >= p.len { return read_error("unexpected end of input", pos) }
+    var ib = p[pos] to u64
+    var major = ib >> 5
+    var ai = ib & 0x1F
+    if major == 7 {
+        var a7 = match read_arg(p, pos, ai) { ArgRead as r => r; error as e => return e }
+        return decode_simple_or_float(p, pos, a7, ai)
+    }
+    var a = match read_arg(p, pos, ai) { ArgRead as r => r; error as e => return e }
+    if major == 0 {
+        if a.indefinite { return read_error("integer cannot be indefinite length", pos) }
+        return CborRead { value = cbor_uint(a.arg); pos = a.pos }
+    }
+    if major == 1 {
+        if a.indefinite { return read_error("integer cannot be indefinite length", pos) }
+        return CborRead { value = cbor_nint(a.arg); pos = a.pos }
+    }
+    if major == 2 { return decode_string(p, a, 2) }
+    if major == 3 { return decode_string(p, a, 3) }
+    if major == 4 { return decode_array(p, a) }
+    if major == 5 { return decode_map(p, a) }
+    decode_tag(p, a)
+}
+
+fn decode_tag(p: []byte, a: ArgRead): CborRead | error {
+    if a.indefinite { return read_error("tag cannot be indefinite length", a.pos) }
+    var content = match decode_at(p, a.pos) { CborRead as r => r; error as e => return e }
+    CborRead { value = cbor_tag(a.arg, content.value); pos = content.pos }
+}
+
+/**
+ * Decodes a complete CBOR document: exactly one top-level item, with any trailing bytes reported
+ * as a checked error (a CBOR-encoded data item is a single item).
+ */
+exp fn decode(p: []byte): CborValue | error {
+    var r = match decode_at(p, 0) { CborRead as x => x; error as e => return e }
+    if r.pos != p.len { return read_error("trailing bytes after top-level item", r.pos) }
+    r.value
+}
+
+/**
+ * Structurally compares two `CborValue` trees for equality, recursing through arrays, maps (in
+ * slice order), and tagged content. Floats compare by `f64` bit pattern, so `NaN` equals `NaN`
+ * with the same payload and `-0.0` differs from `0.0` — the round-trip identity relation.
+ */
+exp fn cbor_equal(a: CborValue, b: CborValue): bool {
+    if a.kind != b.kind { return false }
+    match a.kind {
+        CborKind::Uint => a.uint == b.uint
+        CborKind::Nint => a.uint == b.uint
+        CborKind::Simple => a.uint == b.uint
+        CborKind::Bool => a.flag == b.flag
+        CborKind::Null => true
+        CborKind::Undefined => true
+        CborKind::Float => f64_bits(a.real) == f64_bits(b.real)
+        CborKind::Bytes => bytes_equal(a.bytes, b.bytes)
+        CborKind::Text => bytes_equal(a.bytes, b.bytes)
+        CborKind::Array => values_equal(a.items, b.items)
+        CborKind::Tag => a.uint == b.uint && cbor_equal(a.items[0], b.items[0])
+        CborKind::Map => values_equal(a.keys, b.keys) && values_equal(a.vals, b.vals)
+    }
+}
+
+fn bytes_equal(a: []byte, b: []byte): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if a[i] != b[i] { return false }
+        i++
+    }
+    true
+}
+
+fn values_equal(a: []CborValue, b: []CborValue): bool {
+    if a.len != b.len { return false }
+    var i: u64 = 0
+    loop {
+        if i >= a.len { break }
+        if !cbor_equal(a[i], b[i]) { return false }
+        i++
+    }
+    true
+}

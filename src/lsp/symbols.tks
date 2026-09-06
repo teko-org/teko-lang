@@ -1,0 +1,204 @@
+use teko::parser
+
+pub type SymKind = enum { Function; Type; Const; Field; Method }
+
+pub type Symbol = struct {
+        name: str
+        namespace: str
+        file: str
+        line: u32
+        col: u32
+        kind: SymKind
+        doc: str
+        signature: str
+}
+
+fn render_path(path: parser::Path): str {
+    var out = ""
+    var i: u64 = 0
+    loop {
+        if i >= path.segments.len { break }
+        if i > 0 { out = teko::str::concat(out, "::") }
+        out = teko::str::concat(out, path.segments[i].name)
+        i = i + 1
+    }
+    out
+}
+
+fn render_type_args(args: []@TypeExpr()): str {
+    if args.len == 0 { return "" }
+    var inner = ""
+    var i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        if i > 0 { inner = teko::str::concat(inner, ", ") }
+        inner = teko::str::concat(inner, render_type_expr(args[i]))
+        i = i + 1
+    }
+    teko::str::concat("<", inner, ">")
+}
+
+fn render_union_members(members: []@TypeExpr()): str {
+    var out = ""
+    var i: u64 = 0
+    loop {
+        if i >= members.len { break }
+        if i > 0 { out = teko::str::concat(out, " | ") }
+        out = teko::str::concat(out, render_type_expr(members[i]))
+        i = i + 1
+    }
+    out
+}
+
+fn render_function_type(ft: parser::FunctionType): str {
+    var params = ""
+    var i: u64 = 0
+    loop {
+        if i >= ft.params.len { break }
+        if i > 0 { params = teko::str::concat(params, ", ") }
+        params = teko::str::concat(params, render_type_expr(ft.params[i]))
+        i = i + 1
+    }
+    teko::str::concat("(", params, "): ", render_type_expr(ft.ret))
+}
+
+fn render_type_expr(te: @TypeExpr()): str {
+    match te {
+        parser::NamedType as nt => teko::str::concat(render_path(nt.path), render_type_args(nt.args))
+        parser::SliceType as st => teko::str::concat("[]", render_type_expr(st.element))
+        parser::SizedArrayType as sa => teko::str::concat("[]", render_type_expr(sa.element))
+        parser::UnionType as ut => render_union_members(ut.members)
+        parser::FunctionType as ft => render_function_type(ft)
+        parser::MacroType as mt => teko::str::concat("@", render_path(mt.callee))
+    }
+}
+
+fn render_param(p: parser::Param): str {
+    if !p.has_type { return p.name }
+    teko::str::concat(p.name, ": ", render_type_expr(p.type_ann))
+}
+
+fn render_params(params: []parser::Param): str {
+    var out = ""
+    var i: u64 = 0
+    loop {
+        if i >= params.len { break }
+        if i > 0 { out = teko::str::concat(out, ", ") }
+        out = teko::str::concat(out, render_param(params[i]))
+        i = i + 1
+    }
+    out
+}
+
+fn render_function_signature(f: parser::Function): str {
+    var params = render_params(f.params)
+    if !f.has_return { return teko::str::concat("fn ", f.name, "(", params, ")") }
+    teko::str::concat("fn ", f.name, "(", params, "): ", render_type_expr(f.return_type))
+}
+
+fn render_type_params(params: []str): str {
+    if params.len == 0 { return "" }
+    var inner = ""
+    var i: u64 = 0
+    loop {
+        if i >= params.len { break }
+        if i > 0 { inner = teko::str::concat(inner, ", ") }
+        inner = teko::str::concat(inner, params[i])
+        i = i + 1
+    }
+    teko::str::concat("<", inner, ">")
+}
+
+fn render_type_signature(t: parser::TypeDecl): str {
+    teko::str::concat("type ", t.name, render_type_params(t.type_params))
+}
+
+fn render_const_signature(c: parser::ConstDecl): str {
+    teko::str::concat("const ", c.name, ": ", render_type_expr(c.ty))
+}
+
+fn render_field_signature(f: parser::Field): str {
+    teko::str::concat(f.name, ": ", render_type_expr(f.type_ann))
+}
+
+fn doc_of(has_doc: bool, doc: parser::DocSpan): str {
+    if has_doc { return doc.read() }
+    ""
+}
+
+fn symbol_of_function(f: parser::Function, ns: str, file: str, kind: SymKind): Symbol {
+    Symbol {
+        name = f.name; namespace = ns; file = file; line = f.line; col = f.col
+        kind = kind; doc = doc_of(f.has_doc, f.doc); signature = render_function_signature(f)
+    }
+}
+
+fn symbol_of_type(t: parser::TypeDecl, ns: str, file: str): Symbol {
+    Symbol {
+        name = t.name; namespace = ns; file = file; line = t.line; col = t.col
+        kind = SymKind::Type; doc = doc_of(t.has_doc, t.doc); signature = render_type_signature(t)
+    }
+}
+
+fn symbol_of_const(c: parser::ConstDecl, ns: str, file: str): Symbol {
+    Symbol {
+        name = c.name; namespace = ns; file = file; line = c.line; col = c.col
+        kind = SymKind::Const; doc = doc_of(c.has_doc, c.doc); signature = render_const_signature(c)
+    }
+}
+
+fn symbol_of_field(field: parser::Field, owner: parser::TypeDecl, ns: str, file: str): Symbol {
+    Symbol {
+        name = field.name; namespace = ns; file = file; line = owner.line; col = owner.col
+        kind = SymKind::Field; doc = doc_of(field.has_doc, field.doc); signature = render_field_signature(field)
+    }
+}
+
+fn append_fields(out: []Symbol, owner: parser::TypeDecl, fields: []parser::Field, ns: str, file: str): []Symbol {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= fields.len { break }
+        acc = [..acc, symbol_of_field(fields[i], owner, ns, file)]
+        i = i + 1
+    }
+    acc
+}
+
+fn append_methods(out: []Symbol, methods: []parser::Function, ns: str, file: str): []Symbol {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= methods.len { break }
+        acc = [..acc, symbol_of_function(methods[i], ns, file, SymKind::Method)]
+        i = i + 1
+    }
+    acc
+}
+
+fn append_type_members(out: []Symbol, owner: parser::TypeDecl, ns: str, file: str): []Symbol {
+    match owner.body {
+        parser::StructBody as sb => append_methods(append_fields(out, owner, sb.fields, ns, file), sb.methods, ns, file)
+        parser::ClassBody as cb => append_methods(append_fields(out, owner, cb.fields, ns, file), cb.methods, ns, file)
+        parser::TraitBody as tb => append_methods(append_fields(out, owner, tb.fields, ns, file), tb.methods, ns, file)
+        parser::InterfaceBody as ib => append_methods(out, ib.methods, ns, file)
+        _ => out
+    }
+}
+
+pub fn build_symbol_index(program: parser::Program): []Symbol {
+    var out: []Symbol = []
+    var i: u64 = 0
+    loop {
+        if i >= program.items.len { break }
+        var item = program.items[i]
+        out = match item.content {
+            parser::Function as f => [..out, symbol_of_function(f, item.namespace, item.file, SymKind::Function)]
+            parser::TypeDecl as t => append_type_members([..out, symbol_of_type(t, item.namespace, item.file)], t, item.namespace, item.file)
+            parser::ConstDecl as c => [..out, symbol_of_const(c, item.namespace, item.file)]
+            _ => out
+        }
+        i = i + 1
+    }
+    out
+}

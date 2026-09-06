@@ -1,0 +1,397 @@
+
+type SourceStructure = struct {
+    depth: i64
+    orphan_doc_line: u64
+}
+
+fn line_end_at(text: str, from: u64): u64 {
+    var k = from
+    loop {
+        if k >= text.len { break }
+        if text[k] == b'\n' { break }
+        k = k + 1
+    }
+    k
+}
+
+fn doc_fence_closes_on_line(line: str): bool {
+    line.contains("*" ~ "/")
+}
+
+fn scan_source_structure(text: str): SourceStructure {
+    var depth: i64 = 0
+    var orphan: u64 = 0
+    var in_str = false
+    var in_comment = false
+    var cur: u64 = 0
+    var lineno: u64 = 0
+    loop {
+        if cur >= text.len { break }
+        var eol = line_end_at(text, cur)
+        var line = text.slice(cur, eol)
+        lineno = lineno + 1
+        cur = if eol < text.len { eol + 1 } else { eol }
+        if in_comment || in_str {
+            var carry = snippet_brace_delta(line, in_str, in_comment)
+            depth = depth + carry.delta
+            in_str = carry.in_str
+            in_comment = carry.in_comment
+            continue
+        }
+        if mf_starts_with(tkr_trim(line), "/**") {
+            if depth != 0 && orphan == 0 && mf_starts_with(line, "/**") { orphan = lineno }
+            in_comment = !doc_fence_closes_on_line(line)
+            continue
+        }
+        var scan = snippet_brace_delta(line, in_str, in_comment)
+        depth = depth + scan.delta
+        in_str = scan.in_str
+        in_comment = scan.in_comment
+    }
+    SourceStructure { depth = depth; orphan_doc_line = orphan }
+}
+
+fn source_structure_defect(path: str): str {
+    var text = match teko::io::read_file(path) { str as s => s; error as e => return $"{path}: unreadable ({e.message})" }
+    var st = scan_source_structure(text)
+    if st.orphan_doc_line > 0 { return $"{path}:{st.orphan_doc_line}: a top-level doc-comment opens inside an unclosed block — a merge spliced two hunks here" }
+    if st.depth != 0 { return $"{path}: brace depth {st.depth} at end-of-file — a block was never closed" }
+    ""
+}
+
+fn is_teko_source(name: str): bool {
+    name.ends_with(".tks") || name.ends_with(".tkt")
+}
+
+fn collect_teko_sources(dir: str): []str {
+    var out: []str = []
+    var entries = match teko::fs::list_dir(dir) { []str as e => e; error => return out }
+    var i: u64 = 0
+    loop {
+        if i >= entries.len { break }
+        var full = dir ~ "/" ~ entries[i]
+        match teko::fs::list_dir(full) {
+            []str => {
+                var sub = collect_teko_sources(full)
+                var si: u64 = 0
+                loop {
+                    if si >= sub.len { break };
+                    out = [..out, sub[si]];
+                    si = si + 1
+                }
+            }
+            error => { if is_teko_source(full) { out = [..out, full] } }
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn structural_defects_under(dir: str): []str {
+    var files = collect_teko_sources(dir)
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        var defect = source_structure_defect(files[i])
+        if defect.len > 0 { out = [..out, defect] }
+        i = i + 1
+    }
+    out
+}
+
+fn ident_end_at(text: str, from: u64): u64 {
+    var k = from
+    loop {
+        if k >= text.len { break }
+        if !is_ident_byte(text[k]) { break }
+        k = k + 1
+    }
+    k
+}
+
+fn list_has_str(xs: []str, needle: str): bool {
+    var i: u64 = 0
+    loop {
+        if i >= xs.len { break }
+        if xs[i] == needle { return true }
+        i = i + 1
+    }
+    false
+}
+
+fn called_names_with_prefix(text: str, prefix: str): []str {
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= text.len { break }
+        if i > 0 && is_ident_byte(text[i - 1]) { i = i + 1; continue }
+        var end = ident_end_at(text, i)
+        if end == i { i = i + 1; continue }
+        var name = text.slice(i, end)
+        var called = end < text.len && text[end] == b'('
+        if called && mf_starts_with(name, prefix) && !list_has_str(out, name) { out = [..out, name] }
+        i = end
+    }
+    out
+}
+
+fn declared_fn_name_on_line(line: str): str {
+    var at: u64 = 0
+    if mf_starts_with(line, "fn ") { at = 3 }
+    if mf_starts_with(line, "pub fn ") { at = 7 }
+    if at == 0 { return "" }
+    var end = ident_end_at(line, at)
+    line.slice(at, end)
+}
+
+fn declared_fn_names(text: str): []str {
+    var out: []str = []
+    var cur: u64 = 0
+    loop {
+        if cur >= text.len { break }
+        var eol = line_end_at(text, cur)
+        var name = declared_fn_name_on_line(text.slice(cur, eol))
+        if name.len > 0 { out = [..out, name] }
+        cur = if eol < text.len { eol + 1 } else { eol }
+    }
+    out
+}
+
+fn count_declared_fns(text: str): u64 {
+    declared_fn_names(text).len
+}
+
+fn undeclared_helper_calls(caller_text: str, decl_text: str, prefix: str): []str {
+    var called = called_names_with_prefix(caller_text, prefix)
+    var declared = declared_fn_names(decl_text)
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= called.len { break }
+        if !list_has_str(declared, called[i]) { out = [..out, called[i]] }
+        i = i + 1
+    }
+    out
+}
+
+type CodeScan = struct {
+    text: str
+    in_str: bool
+    in_comment: bool
+}
+
+fn code_only_line(line: str, in_str: bool, in_comment: bool): CodeScan {
+    var out = ""
+    var k: u64 = 0
+    var open = in_str
+    var comment = in_comment
+    var quote: byte = b'"'
+    loop {
+        if k >= line.len { break }
+        var c = line[k]
+        if comment {
+            if c == b'*' && k + 1 < line.len && line[k + 1] == b'/' { comment = false; out = out ~ "  "; k = k + 2; continue }
+            out = out ~ " "
+            k = k + 1
+            continue
+        }
+        if open {
+            if c == b'\\' && k + 1 < line.len { out = out ~ "  "; k = k + 2; continue }
+            if c == quote { open = false }
+            out = out ~ " "
+            k = k + 1
+            continue
+        }
+        if c == b'/' && k + 1 < line.len && line[k + 1] == b'/' { break }
+        if c == b'/' && k + 1 < line.len && line[k + 1] == b'*' { comment = true; out = out ~ "  "; k = k + 2; continue }
+        if c == b'"' || c == b'\'' { open = true; quote = c; out = out ~ " "; k = k + 1; continue }
+        out = out ~ line.slice(k, k + 1)
+        k = k + 1
+    }
+    CodeScan { text = out; in_str = open; in_comment = comment }
+}
+
+fn code_only_text(text: str): str {
+    var out = ""
+    var cur: u64 = 0
+    var first = true
+    var open = false
+    var comment = false
+    loop {
+        if cur >= text.len { break }
+        var eol = line_end_at(text, cur)
+        var scan = code_only_line(text.slice(cur, eol), open, comment)
+        open = scan.in_str
+        comment = scan.in_comment
+        if !first { out = out ~ "\n" }
+        out = out ~ scan.text
+        first = false
+        cur = if eol < text.len { eol + 1 } else { eol }
+    }
+    out
+}
+
+fn is_decimal_byte(b: byte): bool {
+    b >= b'0' && b <= b'9'
+}
+
+fn is_bare_number(s: str): bool {
+    if s.len == 0 { return false }
+    var k: u64 = 0
+    if s[0] == b'-' { k = 1 }
+    var digits: u64 = 0
+    var dots: u64 = 0
+    loop {
+        if k >= s.len { break }
+        var c = s[k]
+        if is_decimal_byte(c) { digits = digits + 1; k = k + 1; continue }
+        if c == b'_' { k = k + 1; continue }
+        if c == b'.' && dots == 0 { dots = 1; k = k + 1; continue }
+        return false
+    }
+    digits > 0
+}
+
+fn ends_with_narrowing_cast(s: str): bool {
+    if s.ends_with(" to i8") { return true }
+    if s.ends_with(" to i16") { return true }
+    if s.ends_with(" to i32") { return true }
+    if s.ends_with(" to u8") { return true }
+    if s.ends_with(" to u16") { return true }
+    if s.ends_with(" to u32") { return true }
+    if s.ends_with(" to u64") { return true }
+    if s.ends_with(" to f32") { return true }
+    s.ends_with(" to byte")
+}
+
+fn arrow_index(s: str): u64 {
+    var k: u64 = 0
+    loop {
+        if k + 1 >= s.len { break }
+        if s[k] == b'=' && s[k + 1] == b'>' { return k }
+        k = k + 1
+    }
+    s.len
+}
+
+fn match_arm_values(body: str): []str {
+    var out: []str = []
+    var depth: i64 = 0
+    var cur = ""
+    var k: u64 = 0
+    loop {
+        if k > body.len { break }
+        var at_end = k == body.len
+        var c = if at_end { b'\n' } else { body[k] }
+        if c == b'(' || c == b'[' || c == b'{' { depth = depth + 1 }
+        if c == b')' || c == b']' || c == b'}' { depth = depth - 1 }
+        if depth == 0 && (c == b';' || c == b'\n') {
+            var arrow = arrow_index(cur)
+            if arrow < cur.len { out = [..out, tkr_trim(cur.slice(arrow + 2, cur.len))] }
+            cur = ""
+            k = k + 1
+            continue
+        }
+        if !at_end { cur = cur ~ body.slice(k, k + 1) }
+        k = k + 1
+    }
+    out
+}
+
+fn seed_hostile_match_body(body: str): bool {
+    var vals = match_arm_values(body)
+    var bare: u64 = 0
+    var anchors: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= vals.len { break }
+        var v = vals[i]
+        i = i + 1
+        if mf_starts_with(v, "return") { continue }
+        if is_bare_number(v) { bare = bare + 1; continue }
+        if ends_with_narrowing_cast(v) { anchors = anchors + 1 }
+    }
+    bare > 0 && anchors > 0
+}
+
+fn match_keyword_at(code: str, i: u64): bool {
+    if i + 6 > code.len { return false }
+    if code.slice(i, i + 6) != "match " { return false }
+    if i == 0 { return true }
+    !is_ident_byte(code[i - 1])
+}
+
+fn brace_open_on_line(code: str, from: u64): u64 {
+    var k = from
+    loop {
+        if k >= code.len { break }
+        if code[k] == b'\n' { return code.len }
+        if code[k] == b'{' { return k }
+        k = k + 1
+    }
+    code.len
+}
+
+fn matching_brace(code: str, open: u64): u64 {
+    var depth: i64 = 0
+    var k = open
+    loop {
+        if k >= code.len { break }
+        if code[k] == b'{' { depth = depth + 1 }
+        if code[k] == b'}' {
+            depth = depth - 1
+            if depth == 0 { return k }
+        }
+        k = k + 1
+    }
+    code.len
+}
+
+fn seed_hostile_arm_lines(text: str): []u64 {
+    var code = code_only_text(text)
+    var out: []u64 = []
+    var line: u64 = 1
+    var i: u64 = 0
+    loop {
+        if i >= code.len { break }
+        if code[i] == b'\n' { line = line + 1; i = i + 1; continue }
+        if !match_keyword_at(code, i) { i = i + 1; continue }
+        var open = brace_open_on_line(code, i + 6)
+        if open >= code.len { i = i + 6; continue }
+        var close = matching_brace(code, open)
+        if close >= code.len { i = i + 6; continue }
+        if seed_hostile_match_body(code.slice(open + 1, close)) { out = [..out, line] }
+        i = i + 6
+    }
+    out
+}
+
+fn seed_hostile_arm_defects(path: str): []str {
+    var text = match teko::io::read_file(path) { str as s => s; error as e => return [$"{path}: unreadable ({e.message})"] }
+    var lines = seed_hostile_arm_lines(text)
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= lines.len { break }
+        out = [..out, $"{path}:{lines[i]}: a bare numeric literal arm shares this `match` with a narrowing-cast arm — annotate the literal (`0 to i32`), or a seed without match-arm literal cross-adoption types the join as a union"]
+        i = i + 1
+    }
+    out
+}
+
+fn seed_hostile_arms_under(dir: str): []str {
+    var files = collect_teko_sources(dir)
+    var out: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        if files[i].ends_with(".tks") {
+            var defects = seed_hostile_arm_defects(files[i])
+            var d: u64 = 0
+            loop { if d >= defects.len { break }; out = [..out, defects[d]]; d = d + 1 }
+        }
+        i = i + 1
+    }
+    out
+}

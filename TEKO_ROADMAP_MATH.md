@@ -4,7 +4,7 @@
 >
 > A specialized mathematics surface under `teko::math::*`: elementary + advanced **functions** and
 > numeric **types** that (a) are called by **name, not operators**, and (b) **return `T | error` instead
-> of panicking** on a domain/edge failure. Implemented 100% in Teko; the pure units are VM-`.tkt`-testable,
+> of panicking** on a domain/edge failure. Implemented 100% in Teko; the pure units are `.tkt`-testable,
 > the libm-backed ones go through the existing `extern` FFI (C7.1) with `#os` guards.
 >
 > Companion to [`TEKO_ROADMAP_NET_CRYPTO.md`](TEKO_ROADMAP_NET_CRYPTO.md). This doc **resolves two of that
@@ -33,10 +33,10 @@ for hot arithmetic where a bug should abort.
   type's min/max. This is the clean answer to "how does crypto get wrap-around math without relying on
   release-mode UB."
 
-**Ground rules:** pure Teko where the algorithm is bounded (VM-`.tkt`-tested against reference vectors);
+**Ground rules:** pure Teko where the algorithm is bounded (`.tkt`-tested against reference vectors);
 elementary transcendentals may bind **libm** (`sqrt`/`pow`/`sin`/… `from "libc"`/`"m"`, `#os`-guarded)
 for correctness+speed, with the *domain guard* (the error-returning wrapper) written in pure Teko so it
-is VM-testable; a pure-Teko polynomial-approximation fallback is an optional later unit for freestanding
+is `.tkt`-testable; a pure-Teko polynomial-approximation fallback is an optional later unit for freestanding
 targets. Every unit honors the SUPREME RULE and the verify-both gate.
 
 ---

@@ -1,0 +1,169 @@
+// surface_namespace.tk -- `namespace A.B { ... }` / `namespace A.B;`
+// (file-scoped, C# 10) and `using A.B;` (entrega 5, crumb N1; plano-ngen-
+// entrega4.md §31). teko_ns.tk is the module; a free function declared
+// inside a namespace stays out of scope here (N2 mangles it).
+//
+// Two namespaces (`geo`, `mesh`) each declare their own `Circle`, proving the
+// real point of a namespace: the two coexist, `type_new` never collides. The
+// SAME `geo` is reopened in a second block (reabertura = merge, nothing to
+// fuse), a multi-segment namespace (`A.B`) is exercised too, and a
+// file-scoped namespace arrives through `#include` (parts/ns_file.tk),
+// proving the current namespace reverts the moment control returns to this
+// file. `using geo;` lets the bare `Circle` resolve both inside and outside
+// any namespace, `geo.Circle.made` is the static access, and `Holder`/
+// `bigger` exercise a namespaced short type as a field, a method's parameter
+// and return type, and a free function's own parameter and return type.
+//
+// N1b (§31/§32 errata) adds `geo.IShape` and `geo.Loud`: a base/interface
+// list entry read as a dotted path (`mesh.Rhomb : geo.IShape`, qualified;
+// `Trapezoid : IShape` after `using geo;`, bare) and a `use` of a namespaced
+// trait, whose short name is a reserved word by the time `use` reads it
+// (`Speaker`'s `use Loud;`, bare via `using geo;`; `Echoer`'s
+// `use geo.Loud;`, qualified, needing no `using` at all).
+//
+// expect-exit: 42
+
+#include "../lib/rt.tk"
+
+namespace geo {
+    interface IShape {
+        i64 sides();
+    }
+
+    trait Loud {
+        public i64 shout() {
+            return 7;
+        }
+    }
+
+    class Circle {
+        public static i64 made;
+        public i64 r;
+
+        public i64 area() {
+            made = made + 1;
+            return r * r;
+        }
+    }
+}
+
+namespace mesh {
+    class Circle {
+        public i64 side;
+
+        public i64 area() {
+            return side * side;
+        }
+    }
+
+    class Rhomb : geo.IShape {
+        public i64 sides() {
+            return 4;
+        }
+    }
+}
+
+// reabertura do mesmo namespace: adds a second type to `geo`, in a second block
+namespace geo {
+    class Box {
+        public i64 v;
+    }
+}
+
+// A.B: a two-segment namespace path, read once with `tk_ns_read_path`
+namespace A.B {
+    class Widget {
+        public i64 w;
+    }
+}
+
+#include "parts/ns_file.tk"
+
+using geo;
+
+// `IShape` resolved bare, through `using geo;` above -- `tk_conf_name`'s own
+// search order, the same rule a plain type reference already follows
+class Trapezoid : IShape {
+    public i64 sides() {
+        return 4;
+    }
+}
+
+// `Loud`'s short name is a reserved word (its declaration went through
+// `tk_ns_qualify`'s `tk_ns_register`, same as a namespaced type's), so `use`
+// reads it with `tk_ns_read_path`, never `p_ident()` -- bare, through the
+// `using geo;` above
+class Speaker {
+    use Loud;
+}
+
+// the qualified form of the same trait, needing no `using` at all
+class Echoer {
+    use geo.Loud;
+}
+
+// a plain (non-namespaced) class using the namespaced short type as a field,
+// a method parameter and a method return type -- teko_generic.tk's `tk_gen_ty`
+class Holder {
+    public Circle mine;
+
+    public Circle same(Circle c) {
+        return c;
+    }
+}
+
+// a top-level function returning the namespaced short type by name (the one
+// position the core reads with no hook, `tk_ns_top`) and taking two of them
+// as parameters (`tk_default_param`'s own namespace branch)
+Circle bigger(Circle a, Circle b) {
+    if (a.area() > b.area()) return a;
+    return b;
+}
+
+i64 main() {
+    geo.Circle gc = new geo.Circle();
+    gc.r = 3;
+    i64 a1 = gc.area();                          // 9, made = 1
+
+    mesh.Circle mc = new mesh.Circle();
+    mc.side = 2;
+    i64 a2 = mc.area();                          // 4
+
+    if (geo.Circle.made != 1) return 1;
+
+    Circle c2 = new Circle();                    // bare, resolved via `using geo;`
+    c2.r = 5;
+    i64 a3 = c2.area();                          // 25, made = 2
+
+    if (geo.Circle.made != 2) return 2;
+
+    geo.Box gb = new geo.Box();
+    gb.v = 2;
+
+    A.B.Widget wd = new A.B.Widget();
+    wd.w = 1;
+
+    parts.Marker mk = new parts.Marker();
+    mk.m = 1;
+
+    Holder h = new Holder();
+    h.mine = c2;
+    if (h.same(c2).r != 5) return 3;
+
+    Circle big = bigger(gc, c2);                 // c2's area (25) beats gc's (9)
+    if (big.r != 5) return 4;
+
+    mesh.Rhomb rh = new mesh.Rhomb();
+    if (rh.sides() != 4) return 5;               // interface, qualified base
+
+    Trapezoid tz = new Trapezoid();
+    if (tz.sides() != 4) return 6;               // interface, bare base via `using`
+
+    Speaker sp = new Speaker();
+    if (sp.shout() != 7) return 7;               // trait, bare `use` via `using`
+
+    Echoer ec = new Echoer();
+    if (ec.shout() != 7) return 8;               // trait, qualified `use`
+
+    return a1 + a2 + a3 + gb.v + wd.w + mk.m;    // 9 + 4 + 25 + 2 + 1 + 1 = 42
+}

@@ -11,8 +11,8 @@ You are the **gate**. You run the ritual and report the truth — you never chan
 The compiler is the latest RELEASED teko binary (CI seeds from it). Before doing anything, refresh your local copy: `sh scripts/fetch_teko.sh` (version-cached; strips the macOS quarantine) and put `.teko` on PATH (`export PATH="$PWD/.teko:$PATH"`). Re-run it when you START the PR and after any merge, so you build with the same compiler CI will use. Never rely on a hand-installed teko.
 
 ## What you run (on the assigned branch/worktree)
-1. Rebuild the self-hosted compiler from the seed, then the gate BOTH engines: VM (`teko test .`) and native (`teko . -o bin` / `./bin/teko . -o gen2`) — report the test count and any failure verbatim.
-2. `bash scripts/diff_vm_native.sh` — expect `51 passed, 0 failed, 1 expected-fail` (report the exact tally).
+1. Rebuild the self-hosted compiler from the seed, then the native gate: `teko test .` native + native build (`teko . -o bin` / `./bin/teko . -o gen2`) — report the test count and any failure verbatim.
+2. `bash scripts/diff_c_own.sh` own-vs-C backend differential — report the tally (native regressions / own vs C divergences).
 3. `TEKO_MEM_PARANOID=1` full build — expect exit 0 (the arena-reuse oracle).
 4. FIXPOINT: `gen1 → gen2`, `cmp gen1/teko.c gen2/teko.c` byte-identical; plus temp-normalized parity where relevant.
 5. The self-reported memory peak (`teko: memory: peak N MB`) — flag any regression past the ≤300 MB pure-build target.

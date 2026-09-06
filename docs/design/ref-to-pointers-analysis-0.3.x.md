@@ -135,7 +135,7 @@ The iterator/stream idiom is where `Ref<T>` + `.value` is densest —
 `src/iter/int_iter.tks`:
 
 ```teko
-pub fn over_array(xs: []i64, cur: Ref<ArrayCursor>) -> IntIter {
+pub fn over_array(xs: []i64, cur: Ref<ArrayCursor>): IntIter {
     // ...
     if cur.value.pos >= xs.len { return null }
     let v = xs[cur.value.pos]
@@ -148,7 +148,7 @@ Four `cur.value` in five lines — this is the dev's "verbose." Under the **alre
 ratified** transparent model (`ref-transparent-model.md` §4), the same reads:
 
 ```teko
-pub fn over_array(xs: []i64, cur: ref ArrayCursor) -> IntIter {
+pub fn over_array(xs: []i64, cur: ref ArrayCursor): IntIter {
     if cur.pos >= xs.len { return null }        // auto-deref: `.value` gone
     let v = xs[cur.pos]
     cur = ArrayCursor { pos = cur.pos + 1 }      // write-through, still R4
@@ -368,19 +368,19 @@ parallel one.
 
 ```teko
 // TODAY (as-built, the dev's complaint)
-pub fn over_array(xs: []i64, cur: Ref<ArrayCursor>) -> IntIter {
+pub fn over_array(xs: []i64, cur: Ref<ArrayCursor>): IntIter {
     if cur.value.pos >= xs.len { return null }
     cur.value = ArrayCursor { pos = cur.value.pos + 1 }
 }
 
 // RATIFIED transparent `ref` (already on the books, kills the verbosity)
-pub fn over_array(xs: []i64, cur: ref ArrayCursor) -> IntIter {
+pub fn over_array(xs: []i64, cur: ref ArrayCursor): IntIter {
     if cur.pos >= xs.len { return null }
     cur = ArrayCursor { pos = cur.pos + 1 }
 }
 
 // POINTER-SPELLING `*T` (the proposal) — with EXPLICIT deref
-pub fn over_array(xs: []i64, cur: *ArrayCursor) -> IntIter {
+pub fn over_array(xs: []i64, cur: *ArrayCursor): IntIter {
     if (*cur).pos >= xs.len { return null }     // `*p` deref sigil is BACK
     *cur = ArrayCursor { pos = (*cur).pos + 1 }
 }

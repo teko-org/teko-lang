@@ -1,0 +1,263 @@
+use teko::crypto
+use teko::encoding::base64
+use teko::encoding::xml
+use teko::numeric::bigint
+
+fn require_key_matches_verification_alg(alg: SignatureAlg, kind: VerificationKeyKind): crypto::CryptoError | null {
+    match alg {
+        RsaSha256 => if kind == VerificationKeyKind::RsaPublic { null } else { crypto::crypto_error("xmldsig: rsa-sha256 requires an RSA public key") }
+        EcdsaSha256 => if kind == VerificationKeyKind::EcdsaPublic { null } else { crypto::crypto_error("xmldsig: ecdsa-sha256 requires an EC P-256 public point") }
+        HmacSha256 => if kind == VerificationKeyKind::HmacSecret { null } else { crypto::crypto_error("xmldsig: hmac-sha256 requires a shared secret") }
+    }
+}
+
+fn verify_ecdsa(point: crypto::P256Point, message: []byte, sig: []byte): bool {
+    if sig.len != 64 {
+        return false
+    }
+    var r = bigint::from_bytes_be(xmldsig_bytes_slice(sig, 0, 32))
+    var s = bigint::from_bytes_be(xmldsig_bytes_slice(sig, 32, 64))
+    crypto::ecdsa_p256_verify(point, crypto::EcHashAlg::Sha256, message, r, s)
+}
+
+fn verify_raw(alg: SignatureAlg, key: VerificationKey, message: []byte, sig: []byte): bool {
+    match alg {
+        RsaSha256 => crypto::rsa_verify_pkcs1v15(key.rsa_key, crypto::RsaHashAlg::Sha256, message, sig)
+        HmacSha256 => crypto::ct_eq(crypto::hmac_sha256_of(key.hmac_secret, message), sig)
+        EcdsaSha256 => verify_ecdsa(key.ec_point, message, sig)
+    }
+}
+
+fn extract_text_child(parent: xml::XmlNode, local_name: str): str | crypto::CryptoError {
+    match first_child_local(parent, local_name) {
+        xml::XmlNode as n => xml::text_content(n)
+        null => crypto::crypto_error(concat("xmldsig_verify: missing element ", local_name))
+    }
+}
+
+fn extract_attribute_child(parent: xml::XmlNode, child_local: str, attr_name: str): str | crypto::CryptoError {
+    var child = match first_child_local(parent, child_local) {
+        xml::XmlNode as n => n
+        null => return crypto::crypto_error(concat("xmldsig_verify: missing element ", child_local))
+    }
+    match xml::get_attribute(child, attr_name) {
+        str as s => s
+        null => crypto::crypto_error(concat("xmldsig_verify: missing attribute ", attr_name))
+    }
+}
+
+fn extract_signature_alg(signed_info: xml::XmlNode): SignatureAlg | crypto::CryptoError {
+    var alg_uri = match extract_attribute_child(signed_info, "SignatureMethod", "Algorithm") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    signature_alg_from_uri(alg_uri)
+}
+
+fn find_by_id(node: xml::XmlNode, id: str): xml::XmlNode | null {
+    if node.kind == xml::NodeKind::Element && matches_id(node, id) {
+        return node
+    }
+    var i: u64 = 0
+    loop {
+        if i >= node.children.len { break }
+        var found = find_by_id(node.children[i], id)
+        match found {
+            xml::XmlNode as n => return n
+            null => { }
+        }
+        i++
+    }
+    null
+}
+
+fn matches_id(node: xml::XmlNode, id: str): bool {
+    if attribute_equals(node, "Id", id) { return true }
+    if attribute_equals(node, "ID", id) { return true }
+    attribute_equals(node, "id", id)
+}
+
+fn attribute_equals(node: xml::XmlNode, attr_name: str, value: str): bool {
+    match xml::get_attribute(node, attr_name) {
+        str as v => xmldsig_str_eq(v, value)
+        null => false
+    }
+}
+
+fn resolve_reference_target(signed_document: xml::XmlNode, signature_node: xml::XmlNode, uri: str): xml::XmlNode | crypto::CryptoError {
+    if uri.len == 0 {
+        return strip_signature_children(signed_document)
+    }
+    if uri[0] == b'#' {
+        var id = xmldsig_slice_from(uri, 1)
+        match find_by_id(signature_node, id) {
+            xml::XmlNode as n => return n
+            null => { }
+        }
+        match find_by_id(signed_document, id) {
+            xml::XmlNode as n => return n
+            null => { }
+        }
+        return crypto::crypto_error(concat("xmldsig_verify: no element with Id ", id))
+    }
+    crypto::crypto_error(concat("xmldsig_verify: external Reference URI not supported: ", uri))
+}
+
+fn verify_one_reference(signed_document: xml::XmlNode, signature_node: xml::XmlNode, reference: xml::XmlNode): bool | crypto::CryptoError {
+    var uri = match xml::get_attribute(reference, "URI") {
+        str as s => s
+        null => ""
+    }
+    var digest_alg_uri_value = match extract_attribute_child(reference, "DigestMethod", "Algorithm") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    var alg = match digest_alg_from_uri(digest_alg_uri_value) {
+        DigestAlg as a => a
+        crypto::CryptoError as e => return e
+    }
+    var expected_digest = match extract_text_child(reference, "DigestValue") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    var target = match resolve_reference_target(signed_document, signature_node, uri) {
+        xml::XmlNode as n => n
+        crypto::CryptoError as e => return e
+    }
+    var actual_digest = base64::encode_standard(digest_node(alg, target))
+    xmldsig_str_eq(actual_digest, expected_digest)
+}
+
+fn verify_references(signed_document: xml::XmlNode, signature_node: xml::XmlNode, signed_info: xml::XmlNode): bool | crypto::CryptoError {
+    var children = xml::element_children(signed_info)
+    var i: u64 = 0
+    var checked: u64 = 0
+    loop {
+        if i >= children.len { break }
+        var c = children[i]
+        if xmldsig_str_eq(c.local, "Reference") {
+            var ok = match verify_one_reference(signed_document, signature_node, c) {
+                bool as v => v
+                crypto::CryptoError as e => return e
+            }
+            if !ok {
+                return crypto::crypto_error("xmldsig_verify: digest mismatch")
+            }
+            checked = checked + 1
+        }
+        i++
+    }
+    if checked == 0 {
+        return crypto::crypto_error("xmldsig_verify: SignedInfo has no Reference elements")
+    }
+    true
+}
+
+fn verify_signature_value(signature_node: xml::XmlNode, signed_info_node: xml::XmlNode, key: VerificationKey): bool | crypto::CryptoError {
+    var sig_alg = match extract_signature_alg(signed_info_node) {
+        SignatureAlg as a => a
+        crypto::CryptoError as e => return e
+    }
+    match require_key_matches_verification_alg(sig_alg, key.kind) {
+        null => { }
+        crypto::CryptoError as e => return e
+    }
+    var signature_value = match extract_text_child(signature_node, "SignatureValue") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    var raw_sig = match base64::decode_standard(signature_value) {
+        []byte as b => b
+        error => return crypto::crypto_error("xmldsig_verify: SignatureValue is not valid base64")
+    }
+    var signing_bytes = xml::canonicalize(signed_info_node).bytes()
+    verify_raw(sig_alg, key, signing_bytes, raw_sig)
+}
+
+/**
+ * Verifies a `Signature` found anywhere within `signed_document` (matching XML-DSig's enveloped
+ * shape, and — through `Reference URI="#id"` resolution — the enveloping shape's own `Object` and
+ * a same-document detached reference): checks `SignatureValue`, then every `Reference` digest.
+ */
+exp fn xmldsig_verify(signed_document: xml::XmlNode, key: VerificationKey): bool | crypto::CryptoError {
+    var signature_node = match find_element_with_inlined_namespaces(signed_document, "Signature", ns_scope_root()) {
+        xml::XmlNode as n => n
+        null => return crypto::crypto_error("xmldsig_verify: no Signature element found")
+    }
+    var signed_info_node = match find_element_with_inlined_namespaces(signature_node, "SignedInfo", ns_scope_root()) {
+        xml::XmlNode as n => n
+        null => return crypto::crypto_error("xmldsig_verify: Signature has no SignedInfo")
+    }
+    var sig_ok = match verify_signature_value(signature_node, signed_info_node, key) {
+        bool as v => v
+        crypto::CryptoError as e => return e
+    }
+    if !sig_ok {
+        return crypto::crypto_error("xmldsig_verify: signature verification failed")
+    }
+    verify_references(signed_document, signature_node, signed_info_node)
+}
+
+/**
+ * Verifies a `Signature` element that lives APART from the content it covers (a fully external
+ * detached signature — see this module's header): checks `SignatureValue`, then digests
+ * `referenced_node` once and compares it against every `Reference`'s `DigestValue` (a
+ * single-target simplification — there is no document to resolve a `Reference`'s `URI` against,
+ * so every `Reference` is checked against the same caller-supplied node).
+ */
+exp fn xmldsig_verify_detached(signature_node: xml::XmlNode, referenced_node: xml::XmlNode, key: VerificationKey): bool | crypto::CryptoError {
+    var signed_info_node = match find_element_with_inlined_namespaces(signature_node, "SignedInfo", ns_scope_root()) {
+        xml::XmlNode as n => n
+        null => return crypto::crypto_error("xmldsig_verify_detached: Signature has no SignedInfo")
+    }
+    var sig_ok = match verify_signature_value(signature_node, signed_info_node, key) {
+        bool as v => v
+        crypto::CryptoError as e => return e
+    }
+    if !sig_ok {
+        return crypto::crypto_error("xmldsig_verify_detached: signature verification failed")
+    }
+    verify_references_against(signed_info_node, referenced_node)
+}
+
+fn verify_references_against(signed_info: xml::XmlNode, referenced_node: xml::XmlNode): bool | crypto::CryptoError {
+    var children = xml::element_children(signed_info)
+    var i: u64 = 0
+    var checked: u64 = 0
+    loop {
+        if i >= children.len { break }
+        var c = children[i]
+        if xmldsig_str_eq(c.local, "Reference") {
+            var ok = match verify_one_reference_against(referenced_node, c) {
+                bool as v => v
+                crypto::CryptoError as e => return e
+            }
+            if !ok {
+                return crypto::crypto_error("xmldsig_verify_detached: digest mismatch")
+            }
+            checked = checked + 1
+        }
+        i++
+    }
+    if checked == 0 {
+        return crypto::crypto_error("xmldsig_verify_detached: SignedInfo has no Reference elements")
+    }
+    true
+}
+
+fn verify_one_reference_against(referenced_node: xml::XmlNode, reference: xml::XmlNode): bool | crypto::CryptoError {
+    var digest_alg_uri_value = match extract_attribute_child(reference, "DigestMethod", "Algorithm") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    var alg = match digest_alg_from_uri(digest_alg_uri_value) {
+        DigestAlg as a => a
+        crypto::CryptoError as e => return e
+    }
+    var expected_digest = match extract_text_child(reference, "DigestValue") {
+        str as s => s
+        crypto::CryptoError as e => return e
+    }
+    var actual_digest = base64::encode_standard(digest_node(alg, referenced_node))
+    xmldsig_str_eq(actual_digest, expected_digest)
+}

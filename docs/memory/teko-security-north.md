@@ -12,6 +12,6 @@ Cost proportional to risk: opt-in machinery (unsafe, raw allocation, `adopt`) at
 
 **Containment layers:** arena (default, invisible) → `adopt` (lexical, bulk-drop) → `unsafe` (type modifier, full risk visible) → RawBuf (malloc/free cru, explicit). Each layer explicit at declaration; no spillover.
 
-**Fail-loud inside / fail-soft at trust boundary:** panics/asserts inside (safe code aborts on invariant violation), but FFI boundary catches (C errors → `error` values, no crash); WASM capability firewall (no import = no capability).
+**Fail-loud inside / fail-soft at trust boundary:** panics/asserts inside (safe code aborts on invariant violation), but FFI boundary catches (C errors → `error` values, no crash).
 
-**Blazor anchor (explicit contract like JSInvokable):** per-module `extern` FFI surface (allowlist), per-module capability firewall (WASM Model 1/2 #530/#535), leadbox container (bounded by libc + runtime seam), language-neutral contract.
+**Blazor anchor (explicit contract like JSInvokable):** per-module `extern` FFI surface (allowlist), per-module capability firewall, leadbox container (bounded by libc + runtime seam), language-neutral contract.

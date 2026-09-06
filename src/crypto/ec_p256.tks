@@ -1,0 +1,285 @@
+use teko::numeric::bigint
+
+/**
+ * A point on the P-256 curve in affine coordinates, or the point at infinity (the group's
+ * identity element) when `infinity` is `true` — `x`/`y` are unspecified and ignored in that case.
+ */
+exp type P256Point = struct {
+    /** `true` iff this is the point at infinity (the additive identity); `x`/`y` are ignored */
+    infinity: bool
+    /** the affine X coordinate, meaningful only when `infinity` is `false` */
+    x: bigint::BigInt
+    /** the affine Y coordinate, meaningful only when `infinity` is `false` */
+    y: bigint::BigInt
+}
+
+/**
+ * An ECDSA signature: the pair `(r, s)`, both in `[1, order)` for a signature produced by
+ * `ecdsa_p256_sign` (SEC 1 §4.1.3).
+ */
+exp type P256Signature = struct {
+    /** the first signature component, `r = x-coordinate of k*G mod order` */
+    r: bigint::BigInt
+    /** the second signature component, `s = k^-1 * (z + r*d) mod order` */
+    s: bigint::BigInt
+}
+
+/**
+ * The hash algorithm an ECDSA operation is performed under. Limited to the three SHA-2 members
+ * JOSE/COSE pair with P-256 (ES256 is SHA-256 + P-256, the JOSE-critical combination); SHA-384/512
+ * are included for the less common ES384/ES512-with-P-256 pairings some profiles allow.
+ */
+exp type EcHashAlg = enum { Sha256; Sha384; Sha512 }
+
+fn ec_p256_const_of_hex(hex: str): bigint::BigInt {
+    match bigint::from_hex(hex) {
+        bigint::BigInt as b => b
+        error as e => panic(e.message)
+    }
+}
+
+fn ec_p256_prime(): bigint::BigInt {
+    ec_p256_const_of_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+}
+
+fn ec_p256_a(): bigint::BigInt {
+    bigint::sub(ec_p256_prime(), bigint::of(3))
+}
+
+fn ec_p256_b(): bigint::BigInt {
+    ec_p256_const_of_hex("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")
+}
+
+fn ec_p256_order(): bigint::BigInt {
+    ec_p256_const_of_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+}
+
+fn ec_p256_gx(): bigint::BigInt {
+    ec_p256_const_of_hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+}
+
+fn ec_p256_gy(): bigint::BigInt {
+    ec_p256_const_of_hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+}
+
+fn ec_p256_infinity(): P256Point {
+    P256Point { infinity = true; x = bigint::zero(); y = bigint::zero() }
+}
+
+/**
+ * The P-256 base point `G`, the generator of the signing group.
+ */
+exp fn ec_p256_generator(): P256Point {
+    P256Point { infinity = false; x = ec_p256_gx(); y = ec_p256_gy() }
+}
+
+fn ec_p256_reduce_p(x: bigint::BigInt): bigint::BigInt {
+    match bigint::modulo(x, ec_p256_prime()) {
+        bigint::BigInt as b => b
+        error as e => panic(e.message)
+    }
+}
+
+fn ec_p256_reduce_n(x: bigint::BigInt): bigint::BigInt {
+    match bigint::modulo(x, ec_p256_order()) {
+        bigint::BigInt as b => b
+        error as e => panic(e.message)
+    }
+}
+
+fn ec_p256_fadd(x: bigint::BigInt, y: bigint::BigInt): bigint::BigInt {
+    ec_p256_reduce_p(bigint::add(x, y))
+}
+
+fn ec_p256_fsub(x: bigint::BigInt, y: bigint::BigInt): bigint::BigInt {
+    ec_p256_reduce_p(bigint::sub(x, y))
+}
+
+fn ec_p256_fmul(x: bigint::BigInt, y: bigint::BigInt): bigint::BigInt {
+    ec_p256_reduce_p(bigint::mul(x, y))
+}
+
+fn ec_p256_finv(x: bigint::BigInt): bigint::BigInt {
+    match bigint::mod_inverse(x, ec_p256_prime()) {
+        bigint::BigInt as b => b
+        error as e => panic(e.message)
+    }
+}
+
+fn ec_p256_point_double(p: P256Point): P256Point {
+    if p.infinity { return p }
+    if bigint::is_zero(p.y) { return ec_p256_infinity() }
+    var numerator = ec_p256_fadd(ec_p256_fmul(bigint::of(3), ec_p256_fmul(p.x, p.x)), ec_p256_a())
+    var denominator = ec_p256_fmul(bigint::of(2), p.y)
+    var lambda = ec_p256_fmul(numerator, ec_p256_finv(denominator))
+    var x3 = ec_p256_fsub(ec_p256_fmul(lambda, lambda), ec_p256_fmul(bigint::of(2), p.x))
+    var y3 = ec_p256_fsub(ec_p256_fmul(lambda, ec_p256_fsub(p.x, x3)), p.y)
+    P256Point { infinity = false; x = x3; y = y3 }
+}
+
+fn ec_p256_point_add(p: P256Point, q: P256Point): P256Point {
+    if p.infinity { return q }
+    if q.infinity { return p }
+    if bigint::eq(p.x, q.x) {
+        if bigint::eq(p.y, q.y) { return ec_p256_point_double(p) }
+        return ec_p256_infinity()
+    }
+    var lambda = ec_p256_fmul(ec_p256_fsub(q.y, p.y), ec_p256_finv(ec_p256_fsub(q.x, p.x)))
+    var x3 = ec_p256_fsub(ec_p256_fsub(ec_p256_fmul(lambda, lambda), p.x), q.x)
+    var y3 = ec_p256_fsub(ec_p256_fmul(lambda, ec_p256_fsub(p.x, x3)), p.y)
+    P256Point { infinity = false; x = x3; y = y3 }
+}
+
+fn ec_p256_scalar_mul(k: bigint::BigInt, p: P256Point): P256Point {
+    var result = ec_p256_infinity()
+    var addend = p
+    var exponent = k
+    loop {
+        if bigint::is_zero(exponent) { break }
+        if !bigint::is_even(exponent) { result = ec_p256_point_add(result, addend) }
+        addend = ec_p256_point_double(addend)
+        exponent = bigint::shr(exponent, 1)
+    }
+    result
+}
+
+/**
+ * Checks that a point satisfies the P-256 short Weierstrass equation `y^2 = x^3 + a*x + b (mod p)`.
+ * The point at infinity is vacuously on the curve (it is the group's identity, not a solution of
+ * the affine equation, but every curve-membership check in this file treats it as valid).
+ */
+exp fn ec_p256_is_on_curve(p: P256Point): bool {
+    if p.infinity { return true }
+    var lhs = ec_p256_fmul(p.y, p.y)
+    var x_cubed = ec_p256_fmul(ec_p256_fmul(p.x, p.x), p.x)
+    var rhs = ec_p256_fadd(ec_p256_fadd(x_cubed, ec_p256_fmul(ec_p256_a(), p.x)), ec_p256_b())
+    bigint::eq(lhs, rhs)
+}
+
+fn ec_p256_bytes_concat(a: []byte, b: []byte): []byte {
+    [..a, ..b]
+}
+
+fn ec_p256_bytes_slice(data: []byte, from: u64, to: u64): []byte {
+    var n = to - from
+    var out: [n]byte = []
+    var i: u64 = 0
+    loop {
+        if i >= n { break }
+        out[i] = data[from + i]
+        i++
+    }
+    out
+}
+
+/**
+ * Encodes a finite point as the uncompressed SEC 1 §2.3.3 octet string `0x04 || X || Y`, each
+ * coordinate a fixed 32-byte big-endian field (`I2OSP` via `bigint::to_bytes_be_padded`).
+ */
+exp fn ec_p256_point_to_uncompressed(p: P256Point): []byte | CryptoError {
+    if p.infinity {
+        return crypto_error("ec_p256_point_to_uncompressed: point at infinity has no encoding")
+    }
+    var xb = match bigint::to_bytes_be_padded(p.x, 32) {
+        []byte as b => b
+        error => return crypto_error("ec_p256_point_to_uncompressed: X coordinate out of range")
+    }
+    var yb = match bigint::to_bytes_be_padded(p.y, 32) {
+        []byte as b => b
+        error => return crypto_error("ec_p256_point_to_uncompressed: Y coordinate out of range")
+    }
+    [0x04 to byte, ..xb, ..yb]
+}
+
+/**
+ * Decodes an uncompressed SEC 1 §2.3.4 octet string `0x04 || X || Y` into a `P256Point`, rejecting
+ * anything but exactly 65 bytes starting with `0x04`, and rejecting a point that fails the curve
+ * equation (an off-curve "public key" is a forged/corrupted input, never accepted).
+ */
+exp fn ec_p256_point_from_uncompressed(bytes: []byte): P256Point | CryptoError {
+    if bytes.len != 65 {
+        return crypto_error("ec_p256_point_from_uncompressed: expected a 65-byte 04||X||Y encoding")
+    }
+    if bytes[0] != 0x04 to byte {
+        return crypto_error("ec_p256_point_from_uncompressed: missing the 0x04 prefix")
+    }
+    var x = bigint::from_bytes_be(ec_p256_bytes_slice(bytes, 1, 33))
+    var y = bigint::from_bytes_be(ec_p256_bytes_slice(bytes, 33, 65))
+    var p = P256Point { infinity = false; x = x; y = y }
+    if !ec_p256_is_on_curve(p) {
+        return crypto_error("ec_p256_point_from_uncompressed: point does not satisfy the curve equation")
+    }
+    p
+}
+
+fn ec_p256_hash(alg: EcHashAlg, message: []byte): []byte {
+    match alg {
+        Sha256 => sha256_of(message)
+        Sha384 => sha384_of(message)
+        Sha512 => sha512_of(message)
+    }
+}
+
+fn ec_p256_hash_to_scalar(alg: EcHashAlg, message: []byte): bigint::BigInt {
+    var digest = ec_p256_hash(alg, message)
+    var order_bits = bigint::bit_length(ec_p256_order())
+    var digest_bits = digest.len * 8
+    var z = bigint::from_bytes_be(digest)
+    if digest_bits > order_bits {
+        return bigint::shr(z, digest_bits - order_bits)
+    }
+    z
+}
+
+/**
+ * ECDSA signature generation over P-256 (SEC 1 §4.1.3 / FIPS 186-4 §6.4), with a CALLER-SUPPLIED
+ * ephemeral scalar `k` rather than one drawn from an RNG. Rejects `k` outside `[1, order)` and
+ * the two structurally-invalid-nonce outcomes SEC 1 names (`r == 0`, `s == 0`) as `CryptoError`
+ * rather than silently producing an unusable signature.
+ */
+exp fn ecdsa_p256_sign(priv_scalar: bigint::BigInt, hash_alg: EcHashAlg, message: []byte, k: bigint::BigInt): P256Signature | CryptoError {
+    var order = ec_p256_order()
+    if bigint::is_zero(k) || bigint::is_neg(k) || bigint::cmp(k, order) >= 0 {
+        return crypto_error("ecdsa_p256_sign: nonce k out of range [1, order)")
+    }
+    var r_point = ec_p256_scalar_mul(k, ec_p256_generator())
+    if r_point.infinity {
+        return crypto_error("ecdsa_p256_sign: invalid nonce (k*G is the point at infinity)")
+    }
+    var r = ec_p256_reduce_n(r_point.x)
+    if bigint::is_zero(r) {
+        return crypto_error("ecdsa_p256_sign: invalid nonce (r == 0)")
+    }
+    var k_inv = match bigint::mod_inverse(k, order) {
+        bigint::BigInt as b => b
+        error => return crypto_error("ecdsa_p256_sign: nonce k is not invertible modulo the order")
+    }
+    var z = ec_p256_hash_to_scalar(hash_alg, message)
+    var s = ec_p256_reduce_n(bigint::mul(k_inv, ec_p256_reduce_n(bigint::add(z, ec_p256_reduce_n(bigint::mul(r, priv_scalar))))))
+    if bigint::is_zero(s) {
+        return crypto_error("ecdsa_p256_sign: invalid nonce (s == 0)")
+    }
+    P256Signature { r = r; s = s }
+}
+
+/**
+ * ECDSA signature verification over P-256 (SEC 1 §4.1.4 / FIPS 186-4 §6.4). Never panics: an
+ * out-of-range `r`/`s`, an off-curve public key, or a mismatching signature all simply yield
+ * `false`.
+ */
+exp fn ecdsa_p256_verify(pub_point: P256Point, hash_alg: EcHashAlg, message: []byte, r: bigint::BigInt, s: bigint::BigInt): bool {
+    var order = ec_p256_order()
+    if bigint::is_zero(r) || bigint::is_neg(r) || bigint::cmp(r, order) >= 0 { return false }
+    if bigint::is_zero(s) || bigint::is_neg(s) || bigint::cmp(s, order) >= 0 { return false }
+    if pub_point.infinity || !ec_p256_is_on_curve(pub_point) { return false }
+    var s_inv = match bigint::mod_inverse(s, order) {
+        bigint::BigInt as b => b
+        error => return false
+    }
+    var z = ec_p256_hash_to_scalar(hash_alg, message)
+    var u1 = ec_p256_reduce_n(bigint::mul(z, s_inv))
+    var u2 = ec_p256_reduce_n(bigint::mul(r, s_inv))
+    var candidate = ec_p256_point_add(ec_p256_scalar_mul(u1, ec_p256_generator()), ec_p256_scalar_mul(u2, pub_point))
+    if candidate.infinity { return false }
+    bigint::eq(ec_p256_reduce_n(candidate.x), r)
+}

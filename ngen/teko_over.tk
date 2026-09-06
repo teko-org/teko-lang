@@ -1,0 +1,557 @@
+// teko_over.tk -- overload of a TOP-LEVEL function by signature (entrega 4,
+// crumb C4), in one pass().
+//
+//   i64 pick(i64 n)         { return n + 1; }
+//   i64 pick(Vec v)         { return v.x + v.y; }
+//   i64 pick(i64 a, i64 b)  { return a * b; }
+//   pick(9) + pick(v) + pick(3, 4)
+//
+// The spelling is the mc core's own -- type first, no `fn`, not one new word
+// (D215). What the core gives is ONE symbol per name: two definitions under one
+// name are `function declared twice` (mc src/gen_resolve.mc:171). That check
+// runs AFTER the passes, so a pass arrives in time to give the two of them two
+// symbols; and a pass is the only place where the whole unit exists at once, so
+// a call written above the declaration it targets resolves like any other (a
+// parser hook sees nothing of what has not been parsed yet -- `decl_find`
+// answers -1, hooks.md § "Asking about a declaration the core already parsed").
+//
+// Three sweeps:
+//
+//   1. every declaration of the unit goes into a table with the signature
+//      `decl_param_type` reports -- the id `type_new` returned, not a collapsed
+//      TY_*, which is what lets a class type tell two overloads apart;
+//   2. every declaration of a name that carries MORE THAN ONE signature is
+//      renamed: `pick(i64)` becomes `pick__i64`, `pick(Vec)` `pick__Vec` and
+//      `pick()` `pick__void` -- the same suffix teko_class.tk gives an
+//      overloaded method, `void` naming the one type a parameter cannot have.
+//      A name with a single signature keeps its symbol, so a program that never
+//      overloads emits exactly what it emitted before;
+//   3. every call to such a name is rewritten to the symbol its ARGUMENT TYPES
+//      pick, and every `&name` of one is refused.
+//
+// ALL the declarations of an overloaded name take the suffix, the first one
+// included -- unlike a method, where the first of a name keeps the plain
+// `class_method` (teko_class.tk, tk_method_symbol). A free function's plain
+// symbol is what the linker, an `extern` and the C ABI see, so leaving it on
+// one of the overloads would make "which one is it" depend on declaration
+// order; with every overload suffixed, a call site this pass fails to rewrite
+// reaches the linker as a missing symbol instead of silently landing on
+// whichever overload came first.
+//
+// What is NEVER renamed: `main`, any `extern`, and any name whose declarations
+// do not disagree on a signature. The C ABI stays intact, and a name that would
+// need it to move is refused instead (an overloaded `extern`, an overloaded
+// `main`, an overloaded `params` list).
+//
+// The types come from the C3 oracle (teko_typeof.tk): `tk_ty_of` under the
+// scope `tk_ty_pass_walk` enters for each function, so a parameter, a local, a
+// literal, a cast, a call and a binary or unary expression all answer -- the
+// last two by the core's own rule (`cmp_cond`, the divide/shift signed form).
+// An argument it cannot type is an ERROR naming that argument -- never a
+// guess, since guessing means calling another function than the one written.
+//
+// Order matters twice. The pass is registered AFTER `tk_params_pass`, which
+// rewrites `i64 total(params xs)` into `i64 total(uptr xs, i64 xs_len)`, so
+// what is read here is an ordinary parameter list and nothing here knows what a
+// `params` list is; and AFTER `tk_typeof_pass`, which rebuilds the deferred `.`
+// accesses, so `pick(s.area())` has a call to ask about rather than a
+// placeholder. The declarations are renamed BEFORE the call sites are rewritten
+// so that `decl_find` answers about a call this pass has already resolved --
+// which is what makes `pick(pick(3, 4))` and recursion work: a call inside the
+// body of the very function it names is an ordinary call site here, the unit
+// being complete.
+//
+// C6 (teko_default.tk) adds a FOURTH round to the resolution below, tried only
+// once the two exact-arity ones have both failed: a call short of a
+// candidate's own parameter count still matches when what is missing is all
+// defaulted. Trying it last, never together with the exact rounds, is what
+// gives C# its "a candidate that needs no default beats one that does"
+// (§12.6.4.5) for free: `add(1)` against `add(i64)` and `add(i64, i64 = 10)`
+// is resolved -- unambiguously, to the first -- before the second is ever
+// asked whether it could cover the call too.
+
+#define TK_MAXODECL 8192              // declarations of one unit
+#define TK_MAXOVER  64                // names declared at more than one signature
+
+uptr od_name[TK_MAXODECL];            // the name as the source wrote it
+uptr od_sig[TK_MAXODECL];             // "__i64__Vec", empty for a parameterless one
+i64  od_node[TK_MAXODECL];            // the N_FUNC / N_PROTO / N_EXTERN
+i64  od_kind[TK_MAXODECL];
+i64  tk_nodecl = 0;
+
+uptr ov_names[TK_MAXOVER];            // the names this pass mangles
+i64  tk_nover = 0;
+
+// ---- table accessors (no raw ld64/st64 outside this section) ----
+uptr od_name_at(i64 i) { return ld64(od_name + i * 8); }
+uptr od_sig_at(i64 i)  { return ld64(od_sig + i * 8); }
+i64  od_node_at(i64 i) { return ld64(od_node + i * 8); }
+i64  od_kind_at(i64 i) { return ld64(od_kind + i * 8); }
+uptr ov_name_at(i64 i) { return ld64(ov_names + i * 8); }
+
+void set_od_name_at(i64 i, uptr v) { st64(od_name + i * 8, v); }
+void set_od_sig_at(i64 i, uptr v)  { st64(od_sig + i * 8, v); }
+void set_od_node_at(i64 i, i64 v)  { st64(od_node + i * 8, v); }
+void set_od_kind_at(i64 i, i64 v)  { st64(od_kind + i * 8, v); }
+void set_ov_name_at(i64 i, uptr v) { st64(ov_names + i * 8, v); }
+
+// ---- names ----
+// a positive count as decimal digits: the argument number a diagnostic names
+uptr tk_ov_num(i64 v) {
+    uptr d = xalloc(24);
+    i64 i = 23;
+    st8(d + i, 0);
+    loop {
+        if (v == 0) break;
+        i = i - 1;
+        st8(d + i, '0' + v - (v / 10) * 10);
+        v = v / 10;
+    }
+    return d + i;
+}
+
+// the signature key of a declaration: `__i64__Vec` for `(i64 a, Vec v)`, and
+// empty for one that takes nothing. `tk_ty_sfx` (teko_ref.tk) reports the id
+// `type_new` returned, so `Vec` really is `Vec` and not the `uptr` it is laid
+// out as -- and the POINTEE of a `ref`/`out` parameter, whose own slot is a
+// pointer since K2w.
+uptr tk_ov_sig(i64 d) {
+    uptr s = "";
+    i64 p = nd_a(d);
+    loop {
+        if (p == 0) break;
+        s = tk_join3(s, "__", tk_ty_sfx(p));      // `ref_i64`/`out_Circle`, or the plain type (K2)
+        p = nd_next(p);
+    }
+    return s;
+}
+
+// the symbol an overload reaches the linker under
+uptr tk_ov_symbol(uptr name, uptr sig) {
+    if (cstrlen(sig) == 0) return tk_join(name, "__void");
+    return tk_join(name, sig);
+}
+
+// ---- the declarations of the unit ----
+void tk_ov_decl_add(i64 n) {
+    if (tk_nodecl == TK_MAXODECL)
+        err_at(nd_file(n), nd_line(n), "teko: too many declarations in one unit");
+    set_od_name_at(tk_nodecl, nd_name(n));
+    set_od_sig_at(tk_nodecl, tk_ov_sig(n));
+    set_od_node_at(tk_nodecl, n);
+    set_od_kind_at(tk_nodecl, nd_kind(n));
+    tk_nodecl = tk_nodecl + 1;
+}
+
+void tk_ov_collect(i64 root) {
+    i64 n = root;
+    loop {
+        if (n == 0) break;
+        i64 k = nd_kind(n);
+        if (k == N_FUNC || k == N_PROTO || k == N_EXTERN) tk_ov_decl_add(n);
+        n = nd_next(n);
+    }
+}
+
+// the first row that carries `name`
+i64 tk_ov_row(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (str_eq(od_name_at(i), name)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// index of `name` among the names this pass mangles, or -1
+i64 tk_ov_find(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nover) break;
+        if (str_eq(ov_name_at(i), name)) return i;
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+void tk_ov_mark(uptr name, i64 n) {
+    if (tk_nover == TK_MAXOVER)
+        err_at(nd_file(n), nd_line(n), "teko: too many overloaded names in one unit");
+    set_ov_name_at(tk_nover, name);
+    tk_nover = tk_nover + 1;
+}
+
+// ---- the guards ----
+// 1 when some signature of `name` is DEFINED twice -- a body, or an extern's
+// symbol. A prototype ahead of its own definition is not that: it declares the
+// signature, it does not occupy it.
+i64 tk_ov_dup_def(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (str_eq(od_name_at(i), name) && od_kind_at(i) != N_PROTO) {
+            i64 j = i + 1;
+            loop {
+                if (j >= tk_nodecl) break;
+                if (str_eq(od_name_at(j), name) && od_kind_at(j) != N_PROTO) {
+                    if (str_eq(od_sig_at(j), od_sig_at(i))) return 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// how many DIFFERENT signatures `name` carries
+i64 tk_ov_nsig(uptr name) {
+    i64 n = 0;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (str_eq(od_name_at(i), name)) {
+            i64 j = tk_ov_row(name);
+            i64 first = 1;
+            loop {
+                if (j >= i) break;
+                if (str_eq(od_name_at(j), name) && str_eq(od_sig_at(j), od_sig_at(i))) first = 0;
+                j = j + 1;
+            }
+            if (first) n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// 1 when some declaration of `name` is one of `kind`
+i64 tk_ov_has_kind(uptr name, i64 kind) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (str_eq(od_name_at(i), name) && od_kind_at(i) == kind) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// K2 (§41 decision 16): two declarations of `name` whose parameter types are
+// otherwise identical and differ ONLY in `ref`-vs-`out` at some position
+// (never a plain value against either) -- the one combination C# itself
+// refuses, distinct from `f(i64)`/`f(ref i64)` (a different bare signature,
+// and legitimately two)
+i64 tk_ov_refout_pair_clash(i64 d1, i64 d2) {
+    i64 p1 = nd_a(d1);
+    i64 p2 = nd_a(d2);
+    i64 any = 0;
+    loop {
+        if (p1 == 0 || p2 == 0) break;
+        if (tk_param_ty(p1) != tk_param_ty(p2)) return 0;
+        i64 k1 = tk_rp_kind(p1);
+        i64 k2 = tk_rp_kind(p2);
+        if (k1 != k2) {
+            if (k1 == TK_RP_NONE || k2 == TK_RP_NONE) return 0;
+            any = 1;
+        }
+        p1 = nd_next(p1);
+        p2 = nd_next(p2);
+    }
+    if (p1 != 0 || p2 != 0) return 0;
+    return any;
+}
+
+i64 tk_ov_refout_clash(uptr name) {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (str_eq(od_name_at(i), name)) {
+            i64 j = i + 1;
+            loop {
+                if (j >= tk_nodecl) break;
+                if (str_eq(od_name_at(j), name) && tk_ov_refout_pair_clash(od_node_at(i), od_node_at(j)))
+                    return 1;
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// the verdict on one name, taken once, at its first row. Two declarations of the
+// SAME signature are not this pass's business -- the core reports them where it
+// always did. A `params` list never reaches here: teko_params.tk instantiates it
+// per call site under `name__k` and refuses its overloading itself.
+void tk_ov_judge(i64 i) {
+    uptr name = od_name_at(i);
+    i64 d = od_node_at(i);
+    if (tk_ov_nsig(name) < 2) return;
+    if (str_eq(name, "main"))
+        err_at2(nd_file(d), nd_line(d), "teko: `main` takes one signature", name);
+    if (tk_ov_has_kind(name, N_EXTERN))
+        err_at2(nd_file(d), nd_line(d), "teko: an `extern` name owns its symbol and cannot be overloaded", name);
+    if (tk_ov_refout_clash(name))
+        err_at2(nd_file(d), nd_line(d), "teko: two overloads differ only by `ref`/`out`", name);
+    tk_ov_mark(name, d);
+}
+
+void tk_ov_scan() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (tk_ov_row(od_name_at(i)) == i) tk_ov_judge(i);
+        i = i + 1;
+    }
+}
+
+void tk_ov_rename() {
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (tk_ov_find(od_name_at(i)) >= 0)
+            set_nd_name(od_node_at(i), tk_ov_symbol(od_name_at(i), od_sig_at(i)));
+        i = i + 1;
+    }
+}
+
+// ---- resolution ----
+// the core's integers, which is where an integer literal may land. `uptr` is
+// not one of them: a pointer takes a pointer, and `str`/`ptr` are that same
+// `uptr` under teko's own spelling (teko_type.tk).
+i64 tk_ov_int_ty(i64 t) {
+    if (t == TY_U8) return 1;
+    if (t == TY_U16) return 1;
+    if (t == TY_U32) return 1;
+    if (t == TY_U64) return 1;
+    if (t == TY_I64) return 1;
+    return 0;
+}
+
+i64 tk_ov_resolve(i64 n);
+
+// the type of one argument. A call to a name still waiting for its symbol is
+// resolved FIRST -- its own arguments decide which overload it is, and that
+// overload's return type is what the outer call sees.
+i64 tk_ov_arg_ty(i64 a) {
+    i64 rk = tk_rfarg_kind(a);
+    if (rk != TK_RP_NONE) {
+        i64 pty = tk_rfarg_pointee(a);
+        if (pty >= 0) return pty;
+        if (nd_kind(a) == N_ADDR) return tk_ty_scope_find(nd_name(a));   // a bare local: not typed until now
+        return 0 - 1;
+    }
+    if (nd_kind(a) == N_CALL) {
+        if (tk_ov_find(nd_name(a)) >= 0) return tk_ov_resolve(a);
+    }
+    return tk_ty_of(a);
+}
+
+// the arguments actually given, checked against `d`'s parameters one by one --
+// arity is the caller's business, not this loop's. An integer literal carries
+// no type of its own: at `loose` it lands on any of the core's integers, and
+// without it only on `i64` -- which is the tie-break, since the exact round is
+// tried first and `pick(1)` with both `pick(i64)` and `pick(u8)` in reach is
+// `pick(i64)`.
+i64 tk_ov_args_fit(i64 d, i64 args, uptr tys, i64 loose) {
+    i64 a = args;
+    i64 i = 0;
+    loop {
+        if (a == 0) break;
+        i64 pt = tk_decl_param_ty(d, i);
+        if (tk_rp_kind(tk_decl_param_node(d, i)) != tk_rfarg_kind(a)) return 0;   // K2: `ref`/`out` kind must match too
+        if (nd_kind(a) == N_INT) {
+            if (loose) {
+                if (!tk_ov_int_ty(pt)) return 0;
+            } else {
+                if (pt != TY_I64) return 0;
+            }
+        } else {
+            if (ld64(tys + i * 8) != pt) return 0;
+        }
+        i = i + 1;
+        a = nd_next(a);
+    }
+    return 1;
+}
+
+// 1 when the arguments land on `d`'s parameters, all of them, exactly
+i64 tk_ov_fits(i64 d, i64 args, i64 na, uptr tys, i64 loose) {
+    if (decl_nparams(d) != na) return 0;
+    return tk_ov_args_fit(d, args, tys, loose);
+}
+
+// `na` short of `d`'s own parameter count, but not short of what its
+// defaults (teko_default.tk's shared table) can cover. Tried only by the
+// fourth round, after the two exact-arity ones above have both failed --
+// what makes a same-arity candidate that needs no default win outright.
+// `orig_name` is `d`'s OWN name as `od_name_at` captured it, at collection
+// time, before `tk_ov_rename` overwrites `nd_name(d)` with the mangled
+// symbol -- teko_default.tk's table is keyed by that original pointer, from
+// when the parameters were parsed, and never sees the rename at all.
+i64 tk_ov_fits_default(i64 d, uptr orig_name, i64 args, i64 na, uptr tys, i64 loose) {
+    i64 np = decl_nparams(d);
+    if (na >= np) return 0;
+    if (na < np - tk_default_ndef_of_name(orig_name)) return 0;
+    return tk_ov_args_fit(d, args, tys, loose);
+}
+
+// the row of `name` the arguments land on, and through `pn` how many signatures
+// do -- more than one is what makes the call ambiguous rather than resolved. A
+// prototype and its definition are one signature and count once.
+i64 tk_ov_match(uptr name, i64 args, i64 na, uptr tys, i64 loose, uptr pn) {
+    i64 found = 0 - 1;
+    i64 count = 0;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (str_eq(od_name_at(i), name)) {
+            if (tk_ov_fits(od_node_at(i), args, na, tys, loose)) {
+                if (found < 0) {
+                    found = i;
+                    count = 1;
+                } else if (!str_eq(od_sig_at(found), od_sig_at(i))) {
+                    count = count + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    st64(pn, count);
+    return found;
+}
+
+// the same search as `tk_ov_match`, over the fourth (default-completing)
+// round instead of an exact one
+i64 tk_ov_match_default(uptr name, i64 args, i64 na, uptr tys, i64 loose, uptr pn) {
+    i64 found = 0 - 1;
+    i64 count = 0;
+    i64 i = 0;
+    loop {
+        if (i >= tk_nodecl) break;
+        if (str_eq(od_name_at(i), name)) {
+            if (tk_ov_fits_default(od_node_at(i), od_name_at(i), args, na, tys, loose)) {
+                if (found < 0) {
+                    found = i;
+                    count = 1;
+                } else if (!str_eq(od_sig_at(found), od_sig_at(i))) {
+                    count = count + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    st64(pn, count);
+    return found;
+}
+
+i64 tk_ov_nargs(i64 args) {
+    i64 n = 0;
+    i64 a = args;
+    loop {
+        if (a == 0) break;
+        n = n + 1;
+        a = nd_next(a);
+    }
+    return n;
+}
+
+// the call site, rewritten to the symbol its arguments pick; returns the return
+// type of the overload chosen, which is what an enclosing call reads. The
+// argument types are computed ONCE, into an array of this frame: resolving an
+// argument may resolve another call, and a table shared between the two would
+// be the reentrancy the `params` list already paid for once.
+i64 tk_ov_resolve(i64 n) {
+    uptr name = nd_name(n);
+    i64 line = nd_line(n);
+    uptr fl = nd_file(n);
+    i64 args = nd_a(n);
+    i64 na = tk_ov_nargs(args);
+    if (na > MAXPARAMS) err_at2(fl, line, "teko: too many arguments", name);
+    i64 tys[MAXPARAMS];
+    i64 a = args;
+    i64 i = 0;
+    loop {
+        if (a == 0) break;
+        i64 t = tk_ov_arg_ty(a);
+        if (t < 0 && nd_kind(a) != N_INT)
+            err_at(fl, line, tk_join3(tk_join3("teko: the type of argument ", tk_ov_num(i + 1), " of "),
+                                      name, " is not known here"));
+        st64(tys + i * 8, t);
+        i = i + 1;
+        a = nd_next(a);
+    }
+    i64 count = 0;
+    i64 r = tk_ov_match(name, args, na, tys, 0, &count);
+    if (r < 0) r = tk_ov_match(name, args, na, tys, 1, &count);
+    // the fourth round: only a call still unmatched at exact arity ever asks
+    // a default-bearing candidate whether it could cover it instead
+    if (r < 0) r = tk_ov_match_default(name, args, na, tys, 0, &count);
+    if (r < 0) r = tk_ov_match_default(name, args, na, tys, 1, &count);
+    if (r < 0)
+        err_at(fl, line, tk_join3("teko: no overload of ", name, " matches these arguments"));
+    if (count > 1)
+        err_at(fl, line, tk_join3("teko: more than one overload of ", name, " matches these arguments"));
+    i64 d = od_node_at(r);
+    i64 np = decl_nparams(d);
+    if (na < np) {
+        uptr orig_name = od_name_at(r);
+        set_nd_a(n, tk_fill_defaults(nd_a(n), na, np, np - tk_default_ndef_of_name(orig_name),
+                                      tk_default_d0_of_name(orig_name)));
+    }
+    set_nd_name(n, tk_ov_symbol(name, od_sig_at(r)));
+    return decl_ret(d);
+}
+
+// `&pick` names a symbol, and an overloaded name has as many as it has
+// signatures -- nothing in `&name` says which. A local of the same name is what
+// `&` binds first (mc src/gen_resolve.mc, res_addr: local, then global, then
+// function), so one that is in scope answers and the refusal is not its.
+void tk_ov_check_addr(i64 n) {
+    if (tk_ov_find(nd_name(n)) < 0) return;
+    if (tk_ty_scope_find(nd_name(n)) >= 0) return;
+    err_at2(nd_file(n), nd_line(n),
+            "teko: cannot take the address of an overloaded function", nd_name(n));
+}
+
+void tk_ov_visit(i64 n) {
+    i64 k = nd_kind(n);
+    if (k == N_ADDR) {
+        tk_ov_check_addr(n);
+        return;
+    }
+    if (k != N_CALL) return;
+    if (tk_ov_find(nd_name(n)) < 0) return;
+    tk_ov_resolve(n);
+}
+
+// a call the walk never reached -- one outside every function body -- would
+// reach the linker naming a symbol the renaming took away, so it is reported
+// where it was written instead
+void tk_ov_check_left() {
+    i64 n = 1;
+    loop {
+        if (n >= nnodes) break;
+        if (nd_kind(n) == N_CALL) {
+            if (tk_ov_find(nd_name(n)) >= 0)
+                err_at2(nd_file(n), nd_line(n),
+                        "teko: an overloaded call outside a function body has no arguments to resolve it",
+                        nd_name(n));
+        }
+        n = n + 1;
+    }
+}
+
+// A unit in which no name carries two signatures leaves the pass before a
+// single node is read, let alone moved: the table is this module's own memory,
+// and the tree goes back exactly as it came.
+i64 tk_over_pass(i64 root) {
+    tk_ov_collect(root);
+    tk_ov_scan();
+    if (tk_nover == 0) return root;
+    tk_ov_rename();
+    tk_ty_pass_walk(root, &tk_ov_visit);
+    tk_ov_check_left();
+    return root;
+}

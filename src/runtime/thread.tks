@@ -1,0 +1,64 @@
+const STACK_BYTES: u64 = 2097152
+
+const GUARD_BYTES: u64 = 4096
+
+#os("linux")
+fn thr_mmap(length: u64): u64 {
+    var result = teko::sys::syscall6(teko::sys::SYS_MMAP, 0, length to i64,
+        teko::sys::PROT_READ | teko::sys::PROT_WRITE,
+        teko::sys::MAP_PRIVATE | teko::sys::MAP_ANONYMOUS, -1, 0)
+    if result >= -4095 && result <= -1 { return 0 }
+    result to u64
+}
+
+#os("macos")
+fn thr_mmap(length: u64): u64 {
+    var r = teko::sys::abi::os_mmap(0, length, teko::sys::PROT_READ | teko::sys::PROT_WRITE,
+        teko::sys::MAP_PRIVATE | teko::sys::MAP_ANON, -1 to i32, 0)
+    if r == teko::sys::MAP_FAILED_WORD { return 0 }
+    r
+}
+
+#os("windows")
+fn thr_mmap(length: u64): u64 {
+    teko::sys::abi::VirtualAlloc(0, length, teko::sys::MEM_COMMIT | teko::sys::MEM_RESERVE, teko::sys::PAGE_READWRITE)
+}
+
+#os("linux")
+fn thr_guard(low: u64) {
+    _ = teko::sys::syscall3(teko::sys::SYS_MPROTECT, low to i64, GUARD_BYTES to i64,
+        teko::sys::PROT_NONE)
+}
+
+#os("macos")
+fn thr_guard(low: u64) {
+    _ = teko::sys::abi::os_mprotect(low, GUARD_BYTES, teko::sys::PROT_NONE)
+}
+
+#os("windows")
+fn thr_guard(low: u64) {
+    var old = teko::sys::ptr_word(teko::mem::buf_ptr(8)) to u64
+    _ = teko::sys::abi::VirtualProtect(low, GUARD_BYTES, teko::sys::PAGE_NOACCESS, old)
+}
+
+#os("linux")
+pub fn thread_stack_free(stack_top: u64) {
+    _ = teko::sys::syscall2(teko::sys::SYS_MUNMAP, (stack_top - STACK_BYTES) to i64, STACK_BYTES to i64)
+}
+
+#os("macos")
+pub fn thread_stack_free(stack_top: u64) {
+    _ = teko::sys::abi::os_munmap(stack_top - STACK_BYTES, STACK_BYTES)
+}
+
+#os("windows")
+pub fn thread_stack_free(stack_top: u64) {
+    _ = teko::sys::abi::VirtualFree(stack_top - STACK_BYTES, 0, teko::sys::MEM_RELEASE)
+}
+
+pub fn thread_stack_new(): u64 {
+    var low = thr_mmap(STACK_BYTES)
+    if low == 0 { return 0 }
+    thr_guard(low)
+    low + STACK_BYTES
+}

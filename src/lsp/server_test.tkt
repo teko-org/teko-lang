@@ -1,0 +1,233 @@
+use teko::encoding::json
+use teko::checker
+
+const DOC_URI: str = "file:///proj/foo.tks"
+
+const DOC_PATH: str = "/proj/foo.tks"
+
+const BUGGY_DOC: str = "pub fn f(x: Bogus): i64 { return 0 }"
+
+const CLEAN_DOC: str = "pub fn f(): i64 { return 0 }"
+
+const TYPE_MISSING: str = "unknown type: Bogus"
+
+const WARN_DOC: str = "fn dead(): i64 { return 0 }"
+
+const UNUSED_FN_MISSING: str = "unused private function `dead`"
+
+fn didopen_request(uri: str, text: str): @JsonValue() {
+    var td = jobj(["uri", "text"], [jstr(uri), jstr(text)])
+    var params = jobj(["textDocument"], [td])
+    jobj(["jsonrpc", "method", "params"], [jstr("2.0"), jstr("textDocument/didOpen"), params])
+}
+
+#test
+fn diagnose_document_reports_type_error() {
+    var diags = diagnose_document(DOC_PATH, BUGGY_DOC)
+    teko::assert::is_true(diags.len >= 1)
+    teko::assert::str_contains(diags[0].message, TYPE_MISSING)
+}
+
+#test
+fn diagnose_document_clean_is_empty() {
+    var diags = diagnose_document(DOC_PATH, CLEAN_DOC)
+    teko::assert::eq_u64(diags.len, 0)
+}
+
+#test
+fn didopen_dispatch_publishes_diagnostics() {
+    var out = handle_request(store_empty(), didopen_request(DOC_URI, BUGGY_DOC)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "textDocument/publishDiagnostics")
+    teko::assert::str_contains(wire, DOC_URI)
+    teko::assert::str_contains(wire, TYPE_MISSING)
+    teko::assert::str_contains(wire, "severity")
+    teko::assert::str_contains(wire, "range")
+}
+
+#test
+fn didopen_clean_publishes_empty() {
+    var out = handle_request(store_empty(), didopen_request(DOC_URI, CLEAN_DOC)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "textDocument/publishDiagnostics")
+    teko::assert::str_contains(wire, "\"diagnostics\":[]")
+}
+
+#test
+fn didopen_dispatch_publishes_a_collected_warning() {
+    var out = handle_request(store_empty(), didopen_request(DOC_URI, WARN_DOC)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "textDocument/publishDiagnostics")
+    teko::assert::str_contains(wire, DOC_URI)
+    teko::assert::str_contains(wire, UNUSED_FN_MISSING)
+    teko::assert::str_contains(wire, "\"severity\":2")
+}
+
+#test
+fn jsonrpc_loop_open_to_publish() {
+    var frame = encode_frame(didopen_request(DOC_URI, BUGGY_DOC))
+    var msg = match decode_frame_bytes(frame.bytes()) {
+        RpcMessage as m => m
+        error as e => { teko::assert::eq_str(e.message, "no error expected"); return }
+    }
+    var out = handle_request(store_empty(), msg.body).out
+    teko::assert::eq_u64(out.len, 1)
+    var reply = encode_frame(out[0])
+    teko::assert::str_contains(reply, "textDocument/publishDiagnostics")
+    teko::assert::str_contains(reply, TYPE_MISSING)
+}
+
+fn formatting_request(uri: str, id: f64): @JsonValue() {
+    var td = jobj(["uri"], [jstr(uri)])
+    var options = jobj(["tabSize", "insertSpaces"], [jnum(4.0), jbool(true)])
+    var params = jobj(["textDocument", "options"], [td, options])
+    jobj(["jsonrpc", "id", "method", "params"], [jstr("2.0"), jnum(id), jstr("textDocument/formatting"), params])
+}
+
+#test
+fn formatting_returns_full_range_edit() {
+    var opened = handle_request(store_empty(), didopen_request(DOC_URI, CLEAN_DOC))
+    var out = handle_request(opened.store, formatting_request(DOC_URI, 7.0)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "\"id\":7")
+    teko::assert::str_contains(wire, "newText")
+    teko::assert::str_contains(wire, "range")
+    teko::assert::str_contains(wire, "fn f")
+}
+
+#test
+fn formatting_unopened_is_null() {
+    var out = handle_request(store_empty(), formatting_request(DOC_URI, 9.0)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "\"result\":null")
+    teko::assert::str_absent(wire, "newText")
+}
+
+#test
+fn initialize_advertises_formatting() {
+    var req = jobj(["jsonrpc", "id", "method"], [jstr("2.0"), jnum(1.0), jstr("initialize")])
+    var out = handle_request(store_empty(), req).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "documentFormattingProvider")
+}
+
+#test
+fn initialize_advertises_hover_and_definition() {
+    var req = jobj(["jsonrpc", "id", "method"], [jstr("2.0"), jnum(1.0), jstr("initialize")])
+    var out = handle_request(store_empty(), req).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "hoverProvider")
+    teko::assert::str_contains(wire, "definitionProvider")
+}
+
+fn position_request(method: str, uri: str, id: f64, line: f64, character: f64): @JsonValue() {
+    var td = jobj(["uri"], [jstr(uri)])
+    var position = jobj(["line", "character"], [jnum(line), jnum(character)])
+    var params = jobj(["textDocument", "position"], [td, position])
+    jobj(["jsonrpc", "id", "method", "params"], [jstr("2.0"), jnum(id), jstr(method), params])
+}
+
+#test
+fn hover_returns_signature_and_doc_for_symbol_under_cursor() {
+    var opened = handle_request(store_empty(), didopen_request(DOC_URI, CLEAN_DOC))
+    var out = handle_request(opened.store, position_request("textDocument/hover", DOC_URI, 11.0, 0.0, 7.0)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "\"id\":11")
+    teko::assert::str_contains(wire, "contents")
+    teko::assert::str_contains(wire, "fn f(): i64")
+}
+
+#test
+fn hover_on_no_symbol_is_null() {
+    var opened = handle_request(store_empty(), didopen_request(DOC_URI, CLEAN_DOC))
+    var out = handle_request(opened.store, position_request("textDocument/hover", DOC_URI, 12.0, 100.0, 0.0)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "\"result\":null")
+}
+
+#test
+fn hover_unopened_is_null() {
+    var out = handle_request(store_empty(), position_request("textDocument/hover", DOC_URI, 14.0, 0.0, 7.0)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "\"result\":null")
+}
+
+#test
+fn definition_returns_location_of_symbol_under_cursor() {
+    var opened = handle_request(store_empty(), didopen_request(DOC_URI, CLEAN_DOC))
+    var out = handle_request(opened.store, position_request("textDocument/definition", DOC_URI, 13.0, 0.0, 7.0)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "\"id\":13")
+    teko::assert::str_contains(wire, DOC_URI)
+    teko::assert::str_contains(wire, "\"line\":0")
+}
+
+#test
+fn completion_returns_symbol_and_keyword_items_for_open_document() {
+    var opened = handle_request(store_empty(), didopen_request(DOC_URI, CLEAN_DOC))
+    var out = handle_request(opened.store, position_request("textDocument/completion", DOC_URI, 15.0, 0.0, 0.0)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "\"id\":15")
+    teko::assert::str_contains(wire, "\"label\":\"f\"")
+    teko::assert::str_contains(wire, "\"detail\":\"fn f(): i64\"")
+    teko::assert::str_contains(wire, "\"kind\":3")
+    teko::assert::str_contains(wire, "\"label\":\"fn\"")
+    teko::assert::str_contains(wire, "\"kind\":14")
+}
+
+#test
+fn completion_unopened_document_still_returns_keywords() {
+    var out = handle_request(store_empty(), position_request("textDocument/completion", DOC_URI, 16.0, 0.0, 0.0)).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "\"label\":\"fn\"")
+    teko::assert::str_absent(wire, "\"label\":\"f\"")
+}
+
+#test
+fn initialize_advertises_completion() {
+    var req = jobj(["jsonrpc", "id", "method"], [jstr("2.0"), jnum(1.0), jstr("initialize")])
+    var out = handle_request(store_empty(), req).out
+    teko::assert::eq_u64(out.len, 1)
+    var wire = json::encode(out[0])
+    teko::assert::str_contains(wire, "completionProvider")
+    teko::assert::str_contains(wire, "triggerCharacters")
+}
+
+#test
+fn checker_severity_maps_every_checker_severity_to_its_lsp_twin() {
+    teko::assert::is_true(checker_severity(checker::DiagLevel::Error) == DiagSeverity::Error)
+    teko::assert::is_true(checker_severity(checker::DiagLevel::Warning) == DiagSeverity::Warning)
+    teko::assert::is_true(checker_severity(checker::DiagLevel::Info) == DiagSeverity::Info)
+    teko::assert::is_true(checker_severity(checker::DiagLevel::Hint) == DiagSeverity::Hint)
+}
+
+fn struct_diag(file: str, line: u32, col: u32, sev: checker::DiagLevel, message: str): checker::Diagnostic {
+    checker::Diagnostic { file = file; line = line; col = col; end_line = line; end_col = col + 1; severity = sev; message = message }
+}
+
+#test
+fn to_lsp_diagnostic_reads_severity_from_the_field_not_the_message_text() {
+    var d = struct_diag("foo.tks", 4, 2, checker::DiagLevel::Error, "unexpected token near \"warning:\"")
+    var lsp = to_lsp_diagnostic("mut x = 1\n", d)
+    teko::assert::is_true(lsp.severity == DiagSeverity::Error)
+}
+
+#test
+fn to_lsp_diagnostic_reads_a_warning_severity_from_the_field_too() {
+    var d = struct_diag("foo.tks", 1, 4, checker::DiagLevel::Warning, "dead private function `f`")
+    var lsp = to_lsp_diagnostic("fn f(): i64 { return 0 }\n", d)
+    teko::assert::is_true(lsp.severity == DiagSeverity::Warning)
+}

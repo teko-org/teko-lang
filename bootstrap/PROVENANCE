@@ -1,0 +1,161 @@
+# bootstrap/PROVENANCE — provenance for the bootstrap/teko.c currently committed to this tree.
+#
+# RESEED (hand-harvest, isolated worktree, forward-only) — CRUMB 3 UPTR CAST (D203/D204,
+# feat/crumb3-uptr-cast). Ensina `prim_kind_of` (src/lir/lower.tks) a resolver `checker::Uptr` como
+# `PrimKind::U64` — mesmo mapeamento que o checker já usa em `cast_kind` (typer.tks). Remove o 3º
+# bloqueio universal do backend native (o stop `uptr has no single PrimKind ... region_to_ptr`),
+# que travava todo programa native porque a arena chama `region_to_ptr` sempre. Zero LIR novo: o
+# cast cai em `lower_int_cast(U64, I64)`, caminho já percorrido. Sem C, sem mudança de superfície.
+#   - FIXPOINT: gen2.c == gen3.c byte-idêntico (rota C, Linux), 21973735 bytes.
+#   - MEM_PARANOID=1: build seco exit 0.
+#
+# RESEED (hand-harvest, isolated worktree, forward-only) — D108 REFACTOR ABI NAMESPACE
+# (expurgo/abi-namespace, D90/D102/D107/D108). Consolidou TODOS os externs de ABI-do-SO (from
+# "System"/"kernel32") num namespace único teko::sys::abi, cada símbolo declarado UMA vez — encerra
+# a classe de bug "mesmo símbolo declarado em 2+ módulos com sig divergente".
+#   - ESTRUTURA: src/sys/abi/mac.tks (#os macos por decl; 31 fn + `extern type Rusage from "rusage"`
+#     = 32 decls) e src/sys/abi/windows.tks (#os windows; 29 fn). SEM linux.tks (Linux usa syscall
+#     cru, zero externs de SO). 69 externs from "System"/"kernel32" em 9 arquivos -> 60 fn únicos
+#     (mac 37->31, win 32->29) + Rusage 2->1.
+#   - DUPLICADOS RESOLVIDOS (mesmo símbolo C, agora 1 decl): open/read/close (file_stream+process),
+#     write (os_write_raw de file_stream + rtio_write_raw de rtio -> os_write_raw), chdir
+#     (process+env), _exit (os_underscore_exit de process + os_exit de arena -> os_exit, void),
+#     CloseHandle (file_stream+process), WriteFile (file_stream+rtio); type Rusage (rtio+process).
+#   - SIG DIVERGENTE (o bug-alvo): GetStdHandle era u32 (process) E i32 (rtio) na MESMA TU -> agora
+#     UMA decl u32 (DWORD); rtio passa 0xFFFFFFF4/0xFFFFFFF5 to u32 (STD_ERROR/STD_OUTPUT_HANDLE).
+#   - SIGS CASADAS COM O SDK (ref/from "tag", D102/D107): getrusage(int32_t, struct rusage *),
+#     wait4(int32_t, int32_t *, int32_t, struct rusage *), _exit(int32_t)->void, GetStdHandle(uint32_t).
+#   - CALL-SITES: os 9 arquivos qualificados p/ teko::sys::abi::<nome>, incl. refs cross-file no
+#     mesmo namespace teko::runtime (thread.tks usava os_mmap/os_munmap/VirtualAlloc/VirtualFree
+#     declarados em arena.tks). FORA DE ESCOPO, mantidos onde estavam: from "synchronization"
+#     (WaitOnAddress/WakeByAddress*), from "teko_rt", from "rusage".
+#   - NAO EDITEI teko_rt.c/.h (método D90). Linux INALTERADO na lógica: diff base->reseed, após
+#     normalizar nºs de linha/coluna de diagnóstico, só contém blocos extern #if __APPLE__/_WIN32 +
+#     os 4 call-sites GetStdHandle (dentro de #if _WIN32). O único delta no emit Linux é nº de linha
+#     embutido (removi linhas físicas de decl acima de código).
+#   - PROVA de símbolos (bootstrap/teko.c reseedado): getrusage/wait4/_exit/GetStdHandle +
+#     open/read/close/write/chdir/WriteFile/CloseHandle -> 1 decl cada.
+#   - FIXPOINT: gen2.c == gen3.c byte-idêntico (rota C, Linux), 20744807 bytes; gen1.c==gen2.c==gen3.c.
+#   - MEM_PARANOID=1: build seco exit 0. Pico RSS (rota C, gen3): 1133.7 MB.
+#
+# RESEED (hand-harvest, isolated worktree, forward-only) — §16 RT-L5 INTERNING + NAMES
+# (expurgo/rt-l5-interning-task, D90/D100). Migrou duas das quatro familias L5 do teko_rt.c para
+# Teko sobre a arena L1 (metodo D90: teko_rt.c/.h INTOCADOS; os wrappers C viram mortos, morrem no F9):
+#   - INTERNING (tk_intern_find/_dup/_get/_put/_reset): hash-map FNV-1a sobre a arena; tabela de
+#     baldes (1024) + entradas bump-alocadas numa regiao dedicada filha da regiao de programa
+#     (sobrevive ao arena_pop por-teste; intern_reset larga a regiao). O builtin intern_* emite o
+#     simbolo Teko (teko_teko__runtime__intern_*) em codegen.tks e lower.tks.
+#   - NAMES (tk_names_open/_lookup/_close/_status/_grow/_take/_cell_*/_live_count/_capacity/_slot_of/
+#     _generation_of): tabela de handles geracional na regiao de programa (sede de chan/wait_group).
+#     names.tks delega em teko::runtime::names_*. O CAS cross-thread (S16-SYNC) e antecipatorio pro
+#     chan; o C atual e single-threaded e o port preserva isso — corretude raciocinada, validada no CI.
+#   - Bloco de controlo da arena: +3 slots (CTRL_INTERN_TABLE/_REGION, CTRL_NAMES_STATE);
+#     CTRL_BYTES 34496 -> 34520.
+#   - NAO migrados neste lote: COVERAGE e TASK (tk_task_reset). task_reset agrega o reset de estado de
+#     test-harness Categoria-C (tally/chan/scope/cast_loc/stdin/fd) FORA do escopo do RT-L5; e o reset
+#     por-teste dos sinks de cobertura e chamado por task_reset -> coverage fica ACOPLADA ao
+#     task_reset bloqueado. Reportado ao integrador (fork: migrar o Categoria-C ou rachar o task_reset).
+#   - FIXPOINT: gen2.c == gen3.c byte-identico (rota C, Linux), 20745646 bytes; gen1.c==gen2.c==gen3.c;
+#     reproducao gen0(bootstrap novo) -> gen1.c == bootstrap/teko.c.
+#   - PROVA de simbolos: no gen2.c emitido, 0 refs tk_intern_ / tk_names_; 8 refs
+#     teko_teko__runtime__intern_, 67 refs teko_teko__runtime__names_ (o path do compilador usa os
+#     simbolos Teko; os tk_intern_/tk_names_ remanescentes vem SO do teko_rt.c morto).
+#   - MEM_PARANOID=1: build seco exit 0. Pico RSS (rota C, gen2): 1132.7 MB. Base gen1 (gen0->src)
+#     1132.6 -> 1136.5 (+3.9, add proporcional D100 — reclamado no F9 quando o C morto sai).
+#
+# RESEED (hand-harvest, isolated worktree, forward-only) — CROSS-PLATFORM F6 (fix/f6-crossplatform,
+# D90/D102). Conserta o CI vermelho de macOS E Windows aberto pela migração F6 process/exec (Linux
+# ficou verde só porque o reseed foi buildado no Linux). Só src/process/process.tks mudou; teko_rt.c/
+# .h/win32_compat.h INTOCADOS (método D90). Braços #os-guarded -> Linux byte-idêntico ao F6+getrusage.
+#   - macOS wait4 (D102): `os_wait4_raw(pid:i32, status:u64, options:i32, rusage:u64)` colidia com o
+#     SDK `pid_t wait4(pid_t, int*, int, struct rusage*)` (<sys/wait.h> puxado por <stdlib.h>). Agora
+#     `extern type Rusage = struct { ru_maxrss: i64 } from "rusage"` + `os_wait4_raw(pid: i32,
+#     ref status: i32, options: i32, ref rusage: Rusage)` -> emite `wait4(int32_t, int32_t*, int32_t,
+#     struct rusage*)`, redeclaração COMPATÍVEL (int32_t==int no macOS). mac_wait_status passa
+#     `&status`/`&rusage` (locais); decode lê `(status to u32) to u64`.
+#   - macOS _exit: `os_underscore_exit(code:i32):i32` (process.tks) divergia do `os_exit(status:i32)`
+#     void (arena.tks) — DUAS decls do mesmo símbolo `_exit`, i32 vs void, conflito na mesma TU.
+#     Unificado: os_underscore_exit agora é `void` (casa o SDK `void _exit(int)`); caller sem `_ =`.
+#   - Windows run/run_quiet MIGRADOS pra Teko-native kernel32 (removem a dep de tk_rt_run/
+#     tk_rt_run_quiet, que morrem): CreateProcessA + WaitForSingleObject + GetExitCodeProcess +
+#     CloseHandle; run_quiet redireciona stdout/stderr pro NUL via CreateFileA(SECURITY_ATTRIBUTES
+#     herdável) + STARTF_USESTDHANDLES. STARTUPINFOA/PROCESS_INFORMATION/SECURITY_ATTRIBUTES montados
+#     como buffers crus (buf_ptr + store_u64/store_u8 por offset x64) — NÃO via `from "tag"`, que
+#     exigiria <windows.h> na TU e colidiria com os protótipos kernel32 que o próprio Teko emite
+#     (mesmo mecanismo do conflito wait4). Command line construído com quoting MS (backslash/aspas).
+#     kernel32 já em [extern.libs.windows]; `#pragma comment(lib,"kernel32")` auto-emitido.
+#   - PRÓXIMO PASSO Windows-native (NÃO deferido pra Fase E): os_spawn/os_wait_one/os_pipe/
+#     os_close_fd/os_fd_wait_readable/os_fd_fill/os_fd_take_byte ainda em tk_rt_* (compilam, aridade
+#     OK — não quebravam o CI). Migram pra CreatePipe/ReadFile/PeekNamedPipe/WaitForSingleObject/
+#     TerminateProcess/SetHandleInformation no próximo lote; aí tk_rt_spawn_redirected/… morrem.
+#   - FIXPOINT: gen2.c == gen3.c byte-idêntico (rota C, Linux); gen1.c == gen2.c == gen3.c;
+#     genmp.c == gen2.c (reprodução).
+#   - MEM_PARANOID=1: build seco exit 0. Pico RSS (rota C, gen2): 1129.8 MB (+1.8 sobre o F6 1128.0;
+#     código Windows-native novo, a compensar quando os wrappers C do braço Windows saírem).
+#
+# RESEED (hand-harvest, isolated worktree, forward-only) — §16-FASE6 PROCESS/EXEC POSIX
+# (expurgo/f6-process-exec, D90/D99/D101). Migrou a metade POSIX da família teko::process
+# (run/run_quiet/spawn_redirected/wait_one/pipe/close_fd/fd_wait_readable/fd_fill/fd_take_byte) do
+# FFI teko_rt.c para Teko:
+#   - LINUX (syscall cru): fork = clone(SIGCHLD,0,0,0,0); exec = execve + resolvedor de PATH em Teko
+#     (substitui o execvp da libc: '/' em argv[0] -> execve direto, senão varre teko::env::var("PATH")
+#     por ':'); wait4 (decode WIFEXITED/(status>>8)&0xff, WIFSIGNALED 128+signo); pipe2(O_CLOEXEC);
+#     dup3 para stdin/out/err + fcntl(F_DUPFD) lift; ppoll para fd_wait_readable; read/close.
+#     SYS consts #arch-split (execve 59/221, wait4 61/260, pipe2 293/59, dup3 292/24, ppoll 271/73,
+#     fcntl 72/25) + SIGCHLD/O_CLOEXEC/POLLIN/POLLHUP. Fork com clone(SIGCHLD) e args 0 é
+#     arch-agnóstico (a ordem parent_tid/child_tid/tls varia por arch, mas todos 0 aqui).
+#   - PROPAGAÇÃO (D99): envp montado por teko::env::env_snapshot() (overlay -> char** KEY=VALUE em
+#     region_program) ANTES do fork -> o filho herda os set_var do pai via execve.
+#   - macOS (libSystem, D101): fork/execve/wait4/pipe/dup2/poll/read/close/open/chdir/fcntl como
+#     extern fn from "System". Windows: fica no extern C (tk_rt_run/…) aguardando o import-lib
+#     linker (Fase E) — braço kernel32/CreateProcess adiado, reportado ao backend.
+#   - fd staging (Linux/macOS) num slot novo da arena (CTRL_FD_STAGE); teko_rt.c INTOCADO (os
+#     wrappers POSIX tk_rt_run/… ficam mortos-mas-presentes, morrem no F9-SWEEP; os
+#     fork/execvp/waitpid/pipe/poll/dup2 que nm -u ainda lista vêm SÓ deles).
+#   - FIXPOINT: gen2.c == gen3.c byte-idêntico (rota C, Linux) — o cc-spawn de cada geração roda
+#     pelo process::run migrado (clone/execve/PATH), validando o exec funcionalmente.
+#   - MEM_PARANOID=1: build seco exit 0. Pico RSS (rota C, gen2): 1128.0 MB (base 1123.9; +4.1 MB
+#     proporcional ao código migrado, D100). NÃO editei teko_rt.c/.h (método D90).
+#
+# RESEED (hand-harvest, isolated worktree, forward-only) — CONFLITO getrusage macOS
+# (fix/macos-getrusage-conflict, D90). Corrige o build vermelho do macOS: o braço #os("macos") de
+# teko::runtime::peak_rss emitia `extern int32_t getrusage(int32_t, uint64_t)`, cujo `uint64_t`
+# colide com o `int getrusage(int, struct rusage *)` do SDK (puxado por <sys/resource.h> via
+# <stdlib.h> -> <sys/wait.h>). No Linux é SYS_GETRUSAGE (sem símbolo, sem conflito); por isso só o
+# macOS quebrava.
+#   1. CODEGEN — extern struct type nativo provido por header: um `extern type T = struct { … }
+#      from "tag"` passa a emitir `struct <tag>` nas referências e NÃO emite typedef próprio (o
+#      header do SO define o struct). ExternStructBody ganha o campo `c_tag`; parser aceita
+#      `from "tag"` após o corpo (espelha o `from "lib"` dos extern fn); tkb serializa. As demais
+#      extern structs (sem `from`, ex.: Statx) seguem tk_t_… inalteradas -> o Linux não muda.
+#      emit_type/emit_type_str unificados numa única resolução cg_find_decl (byte-idêntico p/
+#      não-extern, provado pelo fixpoint).
+#   2. rtio.tks (macOS): `extern type Rusage = struct { ru_maxrss: i64 } from "rusage"` +
+#      `os_getrusage(who: i32, ref rbuf: Rusage)` emite `getrusage(int32_t, struct rusage *)` —
+#      idêntico ao SDK (int32_t == int no macOS), sem redeclaração conflitante. peak_rss lê
+#      `ru.ru_maxrss` (BYTES no Darwin — sem o *1024 do Linux). Braços Linux/Windows intocados.
+#      NÃO editei teko_rt.c/.h (método D90).
+#   - EMIT (bootstrap/teko.c, braço #if __APPLE__): ANTES `extern int32_t getrusage(int32_t who,
+#     uint64_t rbuf);` -> DEPOIS `extern int32_t getrusage(int32_t who, struct rusage * rbuf);`;
+#     corpo `struct rusage ru = (struct rusage){ .ru_maxrss = 0 }; getrusage(0, &ru);
+#     return (uint64_t)(ru.ru_maxrss);`. Nenhum typedef tk_t_…rusage emitido.
+#   - RESEED STAGED (from "tag" é token novo): teach (seed atual compila o código que IMPLEMENTA o
+#     token, rtio antigo) -> reseed A local -> use (rtio com from "rusage") -> reseed B (este).
+#   - FIXPOINT: gen2.c == gen3.c byte-idêntico (rota C, Linux); gen1.c == gen2.c == gen3.c;
+#     reprodução gen0(bootstrap)->gen1.c == bootstrap/teko.c (out_mp/teko.c idêntico).
+#   - MEM_PARANOID=1: build seco exit 0. Pico RSS (rota C): 1122.2 MB.
+#
+# HISTÓRICO — §16-FASE5 ASSERT (expurgo/f5-assert-teko, D90). Fechou a família teko::assert como
+# Teko puro sobre o panic migrado (S16-IO/FASE2), zerando o uso do seed C assert.c: nenhum caminho
+# referencia os símbolos teko__assert__* do assert.c. Call lowering -> corpo Teko (cg_assert_symbol/
+# assert_seed_symbol), prelude injection (teko::assert no prelude injetado), assert.c/.h
+# mortos-mas-presentes (F9 SWEEP os deleta). NÃO editou assert.c/teko_rt.c/.h (método D90).
+#
+# HISTÓRICO — §16-FASE4 FS + TIME + RUSAGE (expurgo/f4-fs-env-time-random, D90): migrou as pernas de
+# filesystem, relógio e pico de RSS do teko.c emitido do FFI teko_rt.c para syscall intrínseco (Linux)
+# / extern fn por-target (macOS libSystem, Windows kernel32), zerando o libc dessas pernas no objeto
+# do teko.c (FS -> getdents64/mkdirat/unlinkat/statx; TIME -> clock_gettime; RUSAGE -> getrusage +
+# /proc/self/statm; SYS consts #arch-split). env e wall_offset_minutes (TZ) ficaram diferidos em
+# teko_rt.c.
+#
+# O DEGRAU (bootstrap/DEGRAU) segue declarado: o release publicado nao compila esta arvore.

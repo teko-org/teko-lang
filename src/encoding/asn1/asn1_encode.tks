@@ -1,0 +1,202 @@
+use teko::numeric::bigint
+
+fn single_byte(b: byte): []byte {
+    [..no_bytes(), b]
+}
+
+fn append_all(out: []byte, more: []byte): []byte {
+    var acc = out
+    var i: u64 = 0
+    loop {
+        if i >= more.len { break }
+        acc = [..acc, more[i]]
+        i++
+    }
+    acc
+}
+
+fn encode_base128(v: u64): []byte {
+    var groups: []u64 = []
+    var x = v
+    loop {
+        groups = [..groups, x & 0x7F]
+        x = x >> 7
+        if x == 0 { break }
+    }
+    var out: []byte = no_bytes()
+    var i = groups.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        var g = groups[i]
+        var lead = if i > 0 { g | 0x80 } else { g }
+        out = [..out, lead to byte]
+    }
+    out
+}
+
+fn encode_identifier(tag_class: Asn1Class, constructed: bool, num: u64): []byte {
+    var pc: u64 = if constructed { 0x20 } else { 0 }
+    var lead = (class_bits(tag_class) << 6) | pc
+    if num < 31 { return single_byte((lead | num) to byte) }
+    append_all(single_byte((lead | 0x1F) to byte), encode_base128(num))
+}
+
+fn be_minimal_bytes(v: u64): []byte {
+    var rev: []byte = no_bytes()
+    var x = v
+    loop {
+        rev = [..rev, (x & 0xFF) to byte]
+        x = x >> 8
+        if x == 0 { break }
+    }
+    var out: []byte = no_bytes()
+    var i = rev.len
+    loop {
+        if i == 0 { break }
+        i = i - 1
+        out = [..out, rev[i]]
+    }
+    out
+}
+
+fn encode_length(len: u64): []byte {
+    if len < 128 { return single_byte(len to byte) }
+    var body = be_minimal_bytes(len)
+    append_all(single_byte((0x80 | body.len) to byte), body)
+}
+
+fn encode_tlv(tag_class: Asn1Class, constructed: bool, num: u64, content: []byte): []byte {
+    append_all(append_all(encode_identifier(tag_class, constructed, num), encode_length(content.len)), content)
+}
+
+fn content_boolean(flag: bool): []byte {
+    single_byte((if flag { 0xFF } else { 0x00 }) to byte)
+}
+
+fn positive_integer_body(x: bigint::BigInt): []byte {
+    var raw = match bigint::to_bytes_be(x) { []byte as b => b; error => no_bytes() }
+    if ((raw[0] to u64) & 0x80) != 0 { return append_all(single_byte(0), raw) }
+    raw
+}
+
+fn negative_integer_body(x: bigint::BigInt): []byte {
+    var mag = bigint::neg(x)
+    var raw = match bigint::to_bytes_be(mag) { []byte as b => b; error => no_bytes() }
+    var k = raw.len
+    var boundary = bigint::shl(bigint::one(), 8 * k - 1)
+    var width = if bigint::cmp(mag, boundary) <= 0 { k } else { k + 1 }
+    var twos = bigint::sub(bigint::shl(bigint::one(), 8 * width), mag)
+    match bigint::to_bytes_be_padded(twos, width) { []byte as b => b; error => no_bytes() }
+}
+
+fn content_integer(x: bigint::BigInt): []byte {
+    if bigint::is_zero(x) { return single_byte(0) }
+    if bigint::is_neg(x) { return negative_integer_body(x) }
+    positive_integer_body(x)
+}
+
+fn content_bit_string(payload: []byte, unused_bits: u64): []byte {
+    append_all(single_byte(unused_bits to byte), payload)
+}
+
+fn content_oid(arcs: []u64): []byte {
+    var out = encode_base128(40 * arcs[0] + arcs[1])
+    var i: u64 = 2
+    loop {
+        if i >= arcs.len { break }
+        out = append_all(out, encode_base128(arcs[i]))
+        i++
+    }
+    out
+}
+
+fn content_items(items: []Asn1Value): []byte {
+    var out: []byte = no_bytes()
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        out = append_all(out, der_encode(items[i]))
+        i++
+    }
+    out
+}
+
+type Asn1SetEntry = struct {
+    encoded: []byte
+}
+
+fn set_entry_less(a: []byte, b: []byte): bool {
+    var i: u64 = 0
+    loop {
+        if i >= a.len { return b.len > a.len }
+        if i >= b.len { return false }
+        if a[i] != b[i] { return a[i] < b[i] }
+        i++
+    }
+}
+
+fn insert_set_entry(sorted: []Asn1SetEntry, e: Asn1SetEntry): []Asn1SetEntry {
+    var out: []Asn1SetEntry = []
+    var placed = false
+    var i: u64 = 0
+    loop {
+        if i >= sorted.len { break }
+        if !placed && set_entry_less(e.encoded, sorted[i].encoded) {
+            out = [..out, e]
+            placed = true
+        }
+        out = [..out, sorted[i]]
+        i++
+    }
+    if !placed { out = [..out, e] }
+    out
+}
+
+fn content_set(items: []Asn1Value): []byte {
+    var sorted: []Asn1SetEntry = []
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        sorted = insert_set_entry(sorted, Asn1SetEntry { encoded = der_encode(items[i]) })
+        i++
+    }
+    var out: []byte = no_bytes()
+    var j: u64 = 0
+    loop {
+        if j >= sorted.len { break }
+        out = append_all(out, sorted[j].encoded)
+        j++
+    }
+    out
+}
+
+fn content_for(v: Asn1Value): []byte {
+    match v.kind {
+        Asn1Tag::Boolean => content_boolean(v.flag)
+        Asn1Tag::Integer => content_integer(v.integer)
+        Asn1Tag::BitString => content_bit_string(v.bytes, v.unused_bits)
+        Asn1Tag::OctetString => v.bytes
+        Asn1Tag::Null => no_bytes()
+        Asn1Tag::ObjectIdentifier => content_oid(v.oid)
+        Asn1Tag::Utf8String => v.text.bytes()
+        Asn1Tag::PrintableString => v.text.bytes()
+        Asn1Tag::IA5String => v.text.bytes()
+        Asn1Tag::UtcTime => v.text.bytes()
+        Asn1Tag::GeneralizedTime => v.text.bytes()
+        Asn1Tag::Sequence => content_items(v.items)
+        Asn1Tag::Set => content_set(v.items)
+        Asn1Tag::Tagged => no_bytes()
+    }
+}
+
+fn encode_tagged(v: Asn1Value): []byte {
+    var content = if v.constructed { content_items(v.items) } else { v.bytes }
+    encode_tlv(v.tag_class, v.constructed, v.tag_num, content)
+}
+
+/** Encodes a complete `Asn1Value` to canonical DER. Total over any value built through this module's validating constructors. */
+exp fn der_encode(v: Asn1Value): []byte {
+    if v.kind == Asn1Tag::Tagged { return encode_tagged(v) }
+    encode_tlv(Asn1Class::Universal, is_constructed_kind(v.kind), universal_tag_num(v.kind), content_for(v))
+}

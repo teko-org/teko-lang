@@ -1,177 +1,121 @@
-// src/build/assemble.tks   (namespace 'teko::build')
-//
-// Multi-file project ASSEMBLY — the THIRD step of project-based compilation (after
-// the manifest read A1 and discovery A2). Given the discovered file set, read and
-// parse every file and MERGE all top-level items into ONE program, so the WHOLE
-// program is seen before it is resolved (M.1; REBOOT_PLAN §2.6 — "compila o projeto
-// inteiro de uma vez — vê todos os arquivos antes de resolver").
-//
-// THE RULE per file:
-//   * the file at the project root named `main.tks` → parsed as the entry MainFile
-//   * every other file                              → parsed as a Module
-// Every merged item is TAGGED with the SourceFile it came from — BOTH the `namespace`
-// (provenance for later codegen name-mangling) AND the `file` path (W-loc-2 — so the
-// checker's file:line:col diagnostics name WHERE the error is). The checker resolves
-// over one flat program; the merged program is the input it (tk_type_program) consumes.
-//
-// PER-FILE DIAGNOSTIC PREFIX (M.3 — name WHERE the error is). Any lex/parse error
-// surfaced for a file is prefixed with that SourceFile's path → `$"{sf.path}:{inner.message}"`.
-// Since an inner located error reads "line:col: text", this yields "path:line:col: text"
-// (the C23 seed's diag_file helper does exactly this "path:msg" prefix).
 
 use teko::parser
 use teko::lexer
 
-// Is this file the project ENTRY point? (basename == "main.tks".) Mirrors assemble.c::
-// is_main_file: a bare "main.tks", or one preceded by a path separator — so "domain.tks"
-// (which also ENDS with "main.tks") is NOT mistaken for the entry (it lives at the root).
-fn asm_is_main(path: str) -> bool {
-    if !teko::str::ends_with(path, "main.tks") { return false }
+fn asm_is_main(path: str): bool {
+    if !path.ends_with("main.tks") { return false }
     if path.len == 8 { return true }
     path[path.len - 9] == b'/'
 }
 
-// reconcile a parsed MainFile into a flat item list (uses → UseDecl items; body statements →
-// Statement items). namespace/file are stamped by the caller (assemble). Mirrors driver.tks's
-// main_file_to_program, kept local to this step (M.5 — DRY consolidation is a later sweep).
-fn asm_main_items(mf: parser::MainFile) -> []parser::Item {
-    mut items: []parser::Item = teko::list::empty()
-    mut ui: u64 = 0
+fn asm_main_items(mf: parser::MainFile): []parser::Item {
+    var items: [mf.uses.len + mf.body.len]parser::Item = []
+    var ui: u64 = 0
     loop {
         if ui >= mf.uses.len { break }
-        items = teko::list::push(items, parser::Item { content = mf.uses[ui]; namespace = ""; file = "" })
+        items[ui] = parser::Item { content = mf.uses[ui]; namespace = ""; file = ""; guard = parser::pred_true() }
         ui = ui + 1
     }
-    mut si: u64 = 0
+    var si: u64 = 0
     loop {
         if si >= mf.body.len { break }
-        items = teko::list::push(items, parser::Item { content = mf.body[si]; namespace = ""; file = "" })
+        items[mf.uses.len + si] = parser::Item { content = mf.body[si]; namespace = ""; file = ""; guard = parser::pred_true() }
         si = si + 1
     }
     items
 }
 
-// reconcile a parsed Module into a flat item list (uses → UseDecl; decls → Function/TypeDecl).
-fn asm_module_items(m: parser::Module) -> []parser::Item {
-    mut items: []parser::Item = teko::list::empty()
-    mut ui: u64 = 0
-    loop {
-        if ui >= m.uses.len { break }
-        items = teko::list::push(items, parser::Item { content = m.uses[ui]; namespace = ""; file = "" })
-        ui = ui + 1
-    }
-    mut di: u64 = 0
-    loop {
-        if di >= m.decls.len { break }
-        items = match m.decls[di] {
-            parser::Function as f => teko::list::push(items, parser::Item { content = f; namespace = ""; file = "" })
-            parser::TypeDecl as t => teko::list::push(items, parser::Item { content = t; namespace = ""; file = "" })
-            parser::ConstDecl as c => teko::list::push(items, parser::Item { content = c; namespace = ""; file = "" })
-        }
-        di = di + 1
-    }
-    items
+pub type AsmUnit = struct {
+    items: []parser::Item
+    embeds: []parser::EmbedDecl
 }
 
-// parse + reconcile ONE file's tokens to its item list (entry → main-file parser; else module).
-fn asm_parse(path: str, tokens: []lexer::Token) -> []parser::Item | error {
-    if asm_is_main(path) {
-        let mf = match parser::parse_main_file(tokens, 0) { parser::Parsed<parser::MainFile> as x => x.node; error as e => return e }
-        asm_main_items(mf)
-    } else {
-        let m = match parser::parse_module(tokens, 0) { parser::Parsed<parser::Module> as x => x.node; error as e => return e }
-        asm_module_items(m)
-    }
-}
-
-/**
- * asm_lex_and_parse — lex `src` and parse it into ONE file's item list, freeing the token buffer on
- * the success path. Extracted so `assemble_sel`'s per-file loop matches on a single result instead
- * of holding a `tokens` binding across two fallible steps: the collector needs the failure arms to
- * fall through to the next file, and a `tokens` alive across them is a second live handle that
- * `mem::free` (rightly) refuses.
- *
- * @param path  the source file's path (selects the entry-file vs module grammar)
- * @param src   the file's contents
- * @return      the file's parsed items, or the lex/parse error (already located, un-prefixed)
- * @since 0.3.1
- */
-fn asm_lex_and_parse(path: str, src: str) -> []parser::Item | error {
-    mut tokens = match lexer::tokenize(src) { []lexer::Token as t => t; error as e => return e }
-    let one = match asm_parse(path, tokens) { []parser::Item as items => items; error as e => return e }
-    teko::mem::free(tokens)
-    one
-}
-
-/**
- * How many of `files` are ELIGIBLE for lex/parse under `include_tests` — every file
- * except a `.tkt` test excluded from a production build/run. `assemble_sel`'s
- * `lexer`/`parser` observability phases use this as their known-upfront total (a
- * skipped `.tkt` never enters either phase's count).
- *
- * @param files          the discovered project file set
- * @param include_tests  true to count `.tkt` files too (the `teko test` path)
- * @return               the number of files `assemble_sel` will actually lex/parse
- */
-fn eligible_file_count(files: []SourceFile, include_tests: bool) -> u64 {
-    mut n: u64 = 0
-    mut i: u64 = 0
+fn count_embed_decls(m: parser::Module): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
     loop {
-        if i >= files.len { break }
-        if include_tests || !teko::str::ends_with(files[i].path, ".tkt") { n = n + 1 }
+        if i >= m.decls.len { break }
+        match m.decls[i] { parser::EmbedDecl => n = n + 1; _ => { } }
         i = i + 1
     }
     n
 }
 
-/**
- * The `.tks` mirror of `assemble.c::tk_assemble`, run SILENTLY (no build-observability
- * output) — for callers that only want the merged program, not the `teko build`
- * phase reporting.
- *
- * @param files  the discovered project file set
- * @return       the merged program, or every collected lex/parse diagnostic as one error
- */
-fn assemble(files: []SourceFile) -> parser::Program | error {
-    let a = match assemble_sel(files, false, false, false) { Assembled as x => x; error as e => return e }
+fn asm_module_items(m: parser::Module): AsmUnit {
+    var nembed = count_embed_decls(m)
+    var items: [m.uses.len + (m.decls.len - nembed)]parser::Item = []
+    var embeds: [nembed]parser::EmbedDecl = []
+    var ui: u64 = 0
+    loop {
+        if ui >= m.uses.len { break }
+        items[ui] = parser::Item { content = m.uses[ui]; namespace = ""; file = ""; guard = parser::pred_true() }
+        ui = ui + 1
+    }
+    var di: u64 = 0
+    var oi: u64 = m.uses.len
+    var ei: u64 = 0
+    loop {
+        if di >= m.decls.len { break }
+        var g = asm_decl_guard(m, di)
+        match m.decls[di] {
+            parser::Function as f => { items[oi] = parser::Item { content = f; namespace = ""; file = ""; guard = g }; oi = oi + 1 }
+            parser::TypeDecl as t => { items[oi] = parser::Item { content = t; namespace = ""; file = ""; guard = g }; oi = oi + 1 }
+            parser::ConstDecl as c => { items[oi] = parser::Item { content = c; namespace = ""; file = ""; guard = g }; oi = oi + 1 }
+            parser::MacroDecl as md => { items[oi] = parser::Item { content = md; namespace = ""; file = ""; guard = g }; oi = oi + 1 }
+            parser::ComptimeDecl as cd => { items[oi] = parser::Item { content = cd; namespace = ""; file = ""; guard = g }; oi = oi + 1 }
+            parser::EmbedDecl as ed => { embeds[ei] = ed; ei = ei + 1 }
+        }
+        di = di + 1
+    }
+    AsmUnit { items = items; embeds = embeds }
+}
+
+fn asm_decl_guard(m: parser::Module, di: u64): parser::Pred {
+    if di < m.decl_guards.len { return m.decl_guards[di] }
+    parser::pred_true()
+}
+
+fn asm_parse(path: str, tokens: []lexer::Token): AsmUnit | error {
+    if asm_is_main(path) {
+        var mf = match parser::parse_main_file(tokens, 0) { parser::Parsed<parser::MainFile> as x => x.node; error as e => return e }
+        AsmUnit { items = asm_main_items(mf); embeds = [] }
+    } else {
+        var m = match parser::parse_module(tokens, 0) { parser::Parsed<parser::Module> as x => x.node; error as e => return e }
+        asm_module_items(m)
+    }
+}
+
+fn asm_lex_and_parse(path: str, src: str): AsmUnit | error {
+    var tokens = match lexer::tokenize_file(src, path) { []lexer::Token as t => t; error as e => return e }
+    match asm_parse(path, tokens) { AsmUnit as u => u; error as e => return e }
+}
+
+fn eligible_file_count(files: []SourceFile, include_tests: bool): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        if include_tests || !files[i].path.ends_with(".tkt") { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+fn assemble(files: []SourceFile): parser::Program | error {
+    var a = match assemble_sel(files, false, false, false) { Assembled as x => x; error as e => return e }
     if a.diags.len > 0 { return error { message = join_diags(a.diags) } }
     a.program
 }
 
-/**
- * Assembled — the output of `assemble_sel`: the merged program built from every file that lexed
- * and parsed CLEANLY, plus one diagnostic per file that did not (`diags`, in file order).
- *
- * The two travel together because a lex/parse failure is isolated at the FILE boundary (owner
- * ruling 2026-07-26 — "checa o arquivo, registra o diagnóstico, segue para o próximo"): a bad file
- * contributes no items and does not stop the walk, so the files after it are still read, and the
- * CHECKER still runs over everything that parsed. One build therefore reports every file's
- * diagnostic, the same way `teko test` reports every test rather than stopping at the first
- * failure. `diags` empty ⇒ the assembly was clean and `program` is exactly what the
- * stop-at-the-first-error assembler produced (the success path is unchanged — the fixpoint is
- * untouched).
- *
- * @since 0.3.1
- */
 pub type Assembled = struct {
-    /** the merged program: every item of every file that lexed and parsed cleanly, in file order. */
     program: parser::Program
-    /** one `path:line:col: text` diagnostic per file that failed to lex or parse, in file order. */
     diags: []str
+    embeds: []parser::EmbedDecl
 }
 
-/**
- * join_diags — render a collected diagnostic list as the newline-separated block the driver prints
- * (and a `.tkr` compile-fail scenario substring-matches against). One diagnostic per line, in the
- * order they were collected, with no trailing newline — `fail` supplies the framing.
- *
- * @param diags  the collected diagnostics
- * @return       the diagnostics joined by newlines ("" for an empty list)
- * @since 0.3.1
- */
-pub fn join_diags(diags: []str) -> str {
-    mut out = ""
-    mut i: u64 = 0
+pub fn join_diags(diags: []str): str {
+    var out = ""
+    var i: u64 = 0
     loop {
         if i >= diags.len { break }
         if i > 0 { out = out ~ "\n" }
@@ -181,61 +125,41 @@ pub fn join_diags(diags: []str) -> str {
     out
 }
 
-/**
- * The assembly core: read -> lex -> parse -> reconcile -> MERGE every eligible
- * file's items into ONE program (M.1 — the whole program is seen before it is
- * resolved). A `.tkt` test is NOT production source (it carries `#test` attributes
- * the module grammar rejects) unless `include_tests` says otherwise (the `teko
- * test` path, D2). Every merged item is re-stamped with its SourceFile's namespace
- * (codegen provenance) AND file path (W-loc-2 — the checker's file:line:col
- * diagnostics). Per-file lex/parse errors are prefixed with the file path ->
- * "path:line:col: text".
- *
- * Reports the `lexer`/`parser` BUILD-OUTPUT OBSERVABILITY phases when `report` is
- * set, replacing the historical one-line-per-file wall: each phase ticks its own
- * "N/M files" counter as files are processed and settles with the elapsed time — a
- * lex failure settles `lexer` failed; a parse failure settles `parser` failed (the
- * prior files having already lexed/parsed cleanly).
- *
- * @param files          the discovered project file set
- * @param include_tests  `false` (production build/run) skips every `.tkt`; `true`
- *                       (`teko test`) includes them so `#test` functions enter scope
- * @param report         print the `lexer`/`parser` phase lines (`false` for an
- *                       already-reported retry pass, or a silent caller)
- * @param tty            render the phases' in-place `\r` updates (irrelevant when
- *                       `report` is `false`)
- * @return               the merged program plus one diagnostic per file that failed to lex or
- *                       parse (`Assembled`), or an `error` when a file cannot be READ at all
- *                       (an I/O fault, not a source defect — nothing to report per-file)
- */
-fn assemble_sel(files: []SourceFile, include_tests: bool, report: bool, tty: bool) -> Assembled | error {
-    mut merged: []parser::Item = teko::list::empty()
-    mut diags: []str = teko::list::empty()
-    let total = eligible_file_count(files, include_tests)
-    let mode = report_mode(!report, tty)
-    let lex_phase = phase_begin("lexer", count_unit_text(0, total, "files"), mode)
-    let parse_phase = phase_begin("parser", count_unit_text(0, total, "files"), mode)
-    mut lexed: u64 = 0
-    mut parsed: u64 = 0
-    mut i: u64 = 0
+type AsmFileItems = struct {
+    items: []parser::Item
+    embeds: []parser::EmbedDecl
+    namespace: str
+    path: str
+}
+
+fn assemble_sel(files: []SourceFile, include_tests: bool, report: bool, tty: bool): Assembled | error {
+    var diags: []str = []
+    var total = eligible_file_count(files, include_tests)
+    var mode = report_mode(!report, tty)
+    var lex_phase = phase_begin("lexer", count_unit_text(0, total, "files"), mode)
+    var parse_phase = phase_begin("parser", count_unit_text(0, total, "files"), mode)
+    var lexed: u64 = 0
+    var parsed: u64 = 0
+    var per_file: [files.len]AsmFileItems = []
+    var nfiles: u64 = 0
+    var total_items: u64 = 0
+    var total_embeds: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= files.len { break }
-        let sf = files[i]
-        if teko::str::ends_with(sf.path, ".tkt") && !include_tests {
+        var sf = files[i]
+        if sf.path.ends_with(".tkt") && !include_tests {
             i = i + 1
             continue
         }
-        let src = match teko::io::read_file(sf.path) { str as s => s; error as e => return e }
-        // FILE-boundary isolation: a file that fails to lex or parse records its diagnostic,
-        // contributes no items, and does NOT stop the walk — the files after it are still read and
-        // the checker still runs over everything that parsed. The `ok` flag carries the verdict out
-        // of the value-position match, since a `continue` may not live inside one.
-        mut one: []parser::Item = teko::list::empty()
-        mut ok = true
+        var src = match source_text_of(sf) { str as s => s; error as e => return e }
+        var one: []parser::Item = []
+        var one_embeds: []parser::EmbedDecl = []
+        var ok = true
         match asm_lex_and_parse(sf.path, src) {
-            []parser::Item as items => { one = items }
+            AsmUnit as u => { one = u.items; one_embeds = u.embeds }
             error as e => {
-                diags = teko::list::push(diags, teko::str::concat(sf.path, ":", e.message))
+                diags = [..diags, teko::str::concat(sf.path, ":", e.message)]
                 ok = false
             }
         }
@@ -247,20 +171,102 @@ fn assemble_sel(files: []SourceFile, include_tests: bool, report: bool, tty: boo
         parsed = parsed + 1
         phase_tick(lex_phase, count_unit_text(lexed, total, "files"))
         phase_tick(parse_phase, count_unit_text(parsed, total, "files"))
-        mut k: u64 = 0
-        loop {
-            if k >= one.len { break }
-            merged = teko::list::push(merged, parser::Item { content = one[k].content; namespace = sf.namespace; file = sf.path })
-            k = k + 1
-        }
+        per_file[nfiles] = AsmFileItems { items = one; embeds = one_embeds; namespace = sf.namespace; path = sf.path }
+        nfiles++
+        total_items = total_items + one.len
+        total_embeds = total_embeds + one_embeds.len
         i = i + 1
+    }
+    var merged: [total_items]parser::Item = []
+    var embeds: [total_embeds]parser::EmbedDecl = []
+    var mi: u64 = 0
+    var embi: u64 = 0
+    var fi: u64 = 0
+    loop {
+        if fi >= nfiles { break }
+        var pf = per_file[fi]
+        var k: u64 = 0
+        loop {
+            if k >= pf.items.len { break }
+            merged[mi] = parser::Item { content = pf.items[k].content; namespace = pf.namespace; file = pf.path; guard = pf.items[k].guard }
+            mi++
+            k++
+        }
+        var e: u64 = 0
+        loop {
+            if e >= pf.embeds.len { break }
+            embeds[embi] = pf.embeds[e]
+            embi++
+            e++
+        }
+        fi++
     }
     if diags.len > 0 {
         phase_end_fail(lex_phase, count_unit_text(lexed, total, "files"), diags[0])
         phase_end_fail(parse_phase, count_unit_text(parsed, total, "files"), diags[0])
-        return Assembled { program = parser::Program { items = merged }; diags = diags }
+        return Assembled { program = parser::Program { items = merged }; diags = diags; embeds = embeds }
     }
     phase_end_ok(lex_phase, count_unit_text(lexed, total, "files"))
     phase_end_ok(parse_phase, count_unit_text(parsed, total, "files"))
-    Assembled { program = parser::Program { items = merged }; diags = diags }
+    Assembled { program = parser::Program { items = merged }; diags = diags; embeds = embeds }
+}
+
+pub type FileOverride = struct {
+    path: str
+    content: str
+}
+
+fn overridden_content(overrides: []FileOverride, path: str): str | null {
+    var i: u64 = 0
+    loop {
+        if i >= overrides.len { break }
+        if overrides[i].path == path { return overrides[i].content }
+        i = i + 1
+    }
+    null
+}
+
+fn source_text_of(sf: SourceFile): str | error {
+    if sf.content.len > 0 { return sf.content }
+    match teko::io::read_file(sf.path) { str as s => s; error as e => return e }
+}
+
+fn read_source_with_overrides(sf: SourceFile, overrides: []FileOverride): str | error {
+    match overridden_content(overrides, sf.path) {
+        str as c => return c
+        null => { }
+    }
+    source_text_of(sf)
+}
+
+fn append_tagged_items(merged: []parser::Item, items: []parser::Item, sf: SourceFile): []parser::Item {
+    var out = merged
+    var i: u64 = 0
+    loop {
+        if i >= items.len { break }
+        out = [..out, parser::Item { content = items[i].content; namespace = sf.namespace; file = sf.path; guard = items[i].guard }]
+        i = i + 1
+    }
+    out
+}
+
+pub fn assemble_with_overrides(files: []SourceFile, overrides: []FileOverride): Assembled | error {
+    var merged: []parser::Item = []
+    var diags: []str = []
+    var i: u64 = 0
+    loop {
+        if i >= files.len { break }
+        var sf = files[i]
+        if sf.path.ends_with(".tkt") {
+            i = i + 1
+            continue
+        }
+        var src = match read_source_with_overrides(sf, overrides) { str as s => s; error as e => return e }
+        match asm_lex_and_parse(sf.path, src) {
+            AsmUnit as u => { merged = append_tagged_items(merged, u.items, sf) }
+            error as e => { diags = [..diags, teko::str::concat(sf.path, ":", e.message)] }
+        }
+        i = i + 1
+    }
+    Assembled { program = parser::Program { items = merged }; diags = diags; embeds = [] }
 }

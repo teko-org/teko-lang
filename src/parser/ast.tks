@@ -1,504 +1,213 @@
-// --- expressions ---
 
 use teko::lexer
 
-/**
- * NumInt — the resolved integer-literal carrier, sign + 64-bit magnitude (drop-128,
- * 2026-07-24). Holds any value in the language's integer range `[i64::MIN, u64::MAX]`:
- * `neg=false` covers `0..=u64::MAX`, `neg=true` covers `i64::MIN..=-1`. Replaces the old
- * `i128` carrier, whose only reason to exist was to hold a high-bit u64 losslessly — a
- * u64 with its high bit set needs 65 signed bits, not 128.
- *
- * @field neg  true iff the value is strictly negative (only ever set for a signed target)
- * @field mag  the magnitude: the value itself when `neg=false`, else its absolute value.
- *             `i64::MIN` is representable as `{ neg = true; mag = 0x8000000000000000 }`
- *             (`|i64::MIN|` = 2^63 fits u64)
- * @since 0.3.1 (drop-128-family)
- */
 pub type NumInt = struct { neg: bool; mag: u64 }
 
-/**
- * numint_of_u64 — a non-negative `NumInt` carrying the magnitude `m` (`neg=false`). The
- * constructor every non-negated integer literal / synthesized constant value uses.
- *
- * @param m  the non-negative magnitude
- * @return   `{ neg = false; mag = m }`
- * @since 0.3.1 (drop-128-family)
- */
-pub fn numint_of_u64(m: u64) -> NumInt { NumInt { neg = false; mag = m } }
+pub fn numint_of_u64(m: u64): NumInt { NumInt { neg = false; mag = m } }
 
-/**
- * numint_of_i64 — the `NumInt` a plain signed `i64` value denotes (sign-splits it). Safe at
- * the `i64::MIN` boundary: `-(v+1)` never overflows (`v+1` stays in range even at `i64::MIN`,
- * and negating it lands at worst on `i64::MAX`), and `+1` recovers the true magnitude — the
- * classic MIN-safe negation, avoiding the CHECKED `i64 -> u64` cast (M.1) a direct negation
- * would need.
- *
- * @param v  the signed value to convert
- * @return   `v` as a sign-magnitude `NumInt`
- * @since 0.3.1 (drop-128-family)
- */
-pub fn numint_of_i64(v: i64) -> NumInt {
+pub fn numint_of_i64(v: i64): NumInt {
     if v >= 0 { return numint_of_u64(v to u64) }
     NumInt { neg = true; mag = ((0 - (v + 1)) to u64) + 1 }
 }
 
-/**
- * numint_negate — the arithmetic negation of `v` (unary `-`). Zero stays zero (canonical
- * non-negative); every other magnitude flips its sign flag, magnitude unchanged (sign +
- * magnitude negation never touches the magnitude bits, unlike two's-complement negation).
- *
- * @param v  the value to negate
- * @return   `-v`
- * @since 0.3.1 (drop-128-family)
- */
-pub fn numint_negate(v: NumInt) -> NumInt {
+pub fn numint_negate(v: NumInt): NumInt {
     if v.mag == 0 { v } else { NumInt { neg = !v.neg; mag = v.mag } }
 }
 
-/**
- * numint_is_zero — is `v` the value zero? (`neg` is ignored — a canonical `NumInt` never
- * carries `neg=true` at magnitude 0, but a caller-built one might; this checks the value,
- * not the representation.)
- *
- * @param v  the value to test
- * @return   true iff `v` denotes zero
- * @since 0.3.1 (drop-128-family)
- */
-pub fn numint_is_zero(v: NumInt) -> bool { v.mag == 0 }
+pub fn numint_is_zero(v: NumInt): bool { v.mag == 0 }
 
-/**
- * U64_ALL_ONES — every bit of a `u64` set (`2^64 - 1`). The subtrahend `numint_bits` negates a
- * magnitude against, so the two's-complement negation never leaves the `u64` domain.
- *
- * @since 0.3.1 (drop-128-family)
- */
 const U64_ALL_ONES: u64 = 0xFFFFFFFFFFFFFFFF
 
-/**
- * I64_SIGN_BIT_U — `2^63` as a `u64`: the smallest bit pattern whose SIGNED reading is negative,
- * and exactly the distance between the unsigned and the signed reading of any pattern at or above
- * it (`signed = unsigned - 2^63 + i64::MIN`).
- *
- * @since 0.3.1 (drop-128-family)
- */
 const I64_SIGN_BIT_U: u64 = 9223372036854775808
 
-/**
- * I64_MIN — the most negative `i64` (`-2^63`). Spelled as a subtraction because `2^63` itself has
- * no `i64` literal form (the language's largest is `i64::MAX`).
- *
- * @since 0.3.1 (drop-128-family)
- */
 const I64_MIN: i64 = -9223372036854775807 - 1
 
-/**
- * numint_to_i64 — `v`'s raw 64-bit two's-complement bit pattern, reinterpreted as `i64` (the SAME
- * register value the native backend would hold). Every carrier that needs a plain machine-register
- * view of a literal (LIR constants, the interpreters, const-aggregate serialization) goes through
- * this one conversion.
- *
- * PROOF THAT NO STEP CAN TRAP OR OVERFLOW, in any build mode (the reason the pre-0.3.1 32-bit split
- * was replaced): the old form computed `((mag >> 32) to i64) * 4294967296 + (mag & 0xFFFFFFFF)`,
- * and for any `mag >= 2^63` — a magnitude the corpus really carries, e.g. the
- * `18446744073709551615` literal in `parse_lit.tks` — that multiplication overflows `i64`, which is
- * UNDEFINED behavior in the emitted C (`tk_mul_i64` is a bare `*` unless `TEKO_OVERFLOW_DEBUG` is
- * set, and a panic if it ever is). The result happened to be right on wrapping hardware; the
- * derivation was not. The split is also unnecessary — `mag` already IS the bit pattern.
- *
- * The form below reaches the same value in three provably-in-range steps:
- *   1. `numint_bits` produces the 64-bit pattern in the UNSIGNED domain: `mag` itself when
- *      non-negative, else `(U64_ALL_ONES - mag) + 1` (the textbook two's-complement negation). The
- *      subtraction cannot underflow (`mag <= U64_ALL_ONES`) and the `+ 1` cannot overflow (`mag >= 1`
- *      on that branch, so the difference is `<= U64_ALL_ONES - 1`); `mag == 0` returns 0 directly.
- *   2. a pattern below `2^63` casts straight across: it is inside `i64`'s positive range, so the
- *      CHECKED `u64 -> i64` cast (M.1 — it panics past `i64::MAX`, which is why the full magnitude
- *      is never cast directly) always succeeds.
- *   3. a pattern at or above `2^63` casts `bits - 2^63` (in `[0, 2^63)`, so again inside the
- *      positive range) and adds `I64_MIN`; the sum lies in `[i64::MIN, -1]`, so the signed addition
- *      cannot overflow either.
- * Total over the whole `NumInt` domain, exact at `i64::MIN`, and identical to the old result for
- * every value that did not overflow.
- *
- * @param v  the value to reinterpret
- * @return   `v`'s value as a raw i64 register bit pattern
- * @since 0.3.1 (drop-128-family)
- */
-pub fn numint_to_i64(v: NumInt) -> i64 {
+pub fn numint_to_i64(v: NumInt): i64 {
     i64_of_u64_bits(numint_bits(v))
 }
 
-/**
- * numint_bits — `v`'s 64-bit two's-complement pattern, as a `u64`: the magnitude itself when `v` is
- * non-negative, else its two's-complement negation computed with in-range unsigned steps only (see
- * `numint_to_i64`'s proof, step 1). The same value the frozen `.tkb` wire encoding writes as its
- * `lo` half (`tkb_write.numint_lo`).
- *
- * @param v  the value whose bit pattern is wanted
- * @return   the 64-bit pattern denoting `v`
- * @since 0.3.1 (drop-128-family)
- */
-fn numint_bits(v: NumInt) -> u64 {
+fn numint_bits(v: NumInt): u64 {
     if !v.neg { return v.mag }
     if v.mag == 0 { return 0 }
     (U64_ALL_ONES - v.mag) + 1
 }
 
-/**
- * i64_of_u64_bits — the signed value a 64-bit pattern denotes: a straight reinterpretation, done
- * with two in-range steps because the `u64 -> i64` cast is CHECKED (see `numint_to_i64`'s proof,
- * steps 2 and 3).
- *
- * @param bits  the 64-bit two's-complement pattern
- * @return      its signed reading
- * @since 0.3.1 (drop-128-family)
- */
-fn i64_of_u64_bits(bits: u64) -> i64 {
+fn i64_of_u64_bits(bits: u64): i64 {
     if bits < I64_SIGN_BIT_U { return bits to i64 }
     ((bits - I64_SIGN_BIT_U) to i64) + I64_MIN
 }
 
-/**
- * A literal number leaf (N1 — TEKO_CORRECTION_PLAN §5). Carries the RAW value; the resolved
- * type (set by the typer) decides width/signedness/float-kind.
- *
- * @field is_float  false for an integer literal (`value` holds it, any width u8..u64/i8..i64),
- *                   true for a float literal (f32/f64; `fval` holds it, default f64)
- * @field value      the raw integer literal value as a sign+64-bit-magnitude pair (meaningful
- *                    only when `!is_float`) — see `NumInt`
- * @field fval       the raw float literal value (meaningful only when `is_float`)
- */
 pub type Number = struct { is_float: bool; value: NumInt; fval: f64 }
-pub type Var = struct { name: str }   // a variable reference (reading)
-pub type StrLit = struct { text: str }   // "…"  (B.36)
-pub type ByteLit = struct { value: byte }   // b'x' (B.36)
-pub type CharLit = struct { bytes: str }   // c'x' — one UTF-8 codepoint (1–4 bytes), carried as its raw UTF-8
-pub type BoolLit = struct { value: bool }   // true / false (LEGISLATION §75)
-pub type NullLit = struct { }   // null (REBOOT_PLAN §202) — no payload; typed `T?` by the checker
-pub type Binary = struct { op: lexer::TokenKind; left: Expr; right: Expr }   // any binary op
-pub type Unary = struct { op: lexer::TokenKind; operand: Expr }   // - ~ ! (prefix)
-/**
- * One continuation term of a `Compare` chain (`<op> operand`) — e.g. the `< c` in `a < b < c`.
- * ((TR3) `pub` so the structural-trait synthesis can build a `Compare` node directly.)
- */
+pub type Var = struct { name: str }
+pub type StrLit = struct { text: str }
+pub type ByteStrLit = struct { text: str }
+pub type ByteLit = struct { value: byte }
+pub type CharLit = struct { bytes: str }
+pub type BoolLit = struct { value: bool }
+pub type NullLit = struct { }
+pub type Binary = struct { op: lexer::TokenKind; left: Expr; right: Expr }
+pub type Unary = struct { op: lexer::TokenKind; operand: Expr }
 pub type CmpTerm = struct { op: lexer::TokenKind; operand: Expr }
-pub type Compare = struct { first: Expr; rest: []CmpTerm }   // a<b<c chain, kept as written (M.3)
-/**
- * A call expression `f(x)` / `lexer::foo(x)` / `Cell<i64>::make(7)`.
- *
- * @param callee    the callee path (the function or generic-instance factory owner)
- * @param args      the positional/named argument expressions
- * @param arg_names PARALLEL to `args` (DEFARGS 2026-07-01) — "" = positional, else the NAMED param this
- *                  arg targets (`f(name = x)`); named-LAST ordering enforced at parse time
- * @param type_args (#254 L5) explicit `Cell<i64>::make(…)` construction-site generic args — empty for a
- *                  bare call. TRANSIENT: the `.tkb` codec persists `checker::TCall`, not `parser::Call`
- */
-pub type Call = struct { callee: Path; args: []Expr; arg_names: []str; type_args: []TypeExpr }
-pub type IfExpr = struct {   // if/else is an EXPRESSION (B.20)
-    cond: Expr
-    then_blk: []Statement
-    has_else: bool
-    else_blk: []Statement
-}
-pub type MatchExpr = struct { subject: Expr; arms: []Arm }   // match is an EXPRESSION (B.15)
+pub type Compare = struct { first: Expr; rest: []CmpTerm }
+pub type Call = struct { callee: Path; args: []Expr; arg_names: []str; owner_type_args: []@TypeExpr(); callee_type_args: []@TypeExpr() }
 
-// --- postfix access & cast (F2) — recursive over Expr (compiler-managed indirection) ---
-pub type FieldAccess = struct { receiver: Expr; field: str }   // x.field — read a struct field (the checker's own `s.token`/`b.left` shape; B.29)
-pub type SafeFieldAccess = struct { receiver: Expr; field: str }   // x?.field — null-propagating access (REBOOT_PLAN §203)
-pub type Coalesce = struct { left: Expr; right: Expr }   // x ?? y — Elvis / null-coalescing (REBOOT_PLAN §203)
-pub type MethodCall = struct { receiver: Expr; method: str; args: []Expr }   // recv.method(a, …) — B.29 instance call via `.`; method *checking* is deferred (M.4)
-pub type SafeMethodCall = struct { receiver: Expr; method: str; args: []Expr }   // recv?.method(a, …) — null-propagating method call (NP-OOP, issue #116)
-pub type Cast = struct { expr: Expr; target: TypeExpr }   // x to T — explicit conversion; preserves→ok / loses→compile-error (E7; M.0+M.1)
-/**
- * Borrow — the prefix `&x` safe mutable-borrow expression (AL wave F1). Takes a live
- * borrow of the operand lvalue, surfacing the auto-ref that is implicit in argument
- * position today as an explicit operator. Types to `Reference<T>`; mutability is inferred
- * from the operand's binding + the consuming position (bare `&x`, no `&mut`). A borrow of
- * an immutable (`let`) binding in mutable position is a checker error (auto-enforces F2).
- * `&` is the SAFE `ref` surface here — NOT the unsafe raw-pointer sigil (that stays unsafe;
- * `*`/deref untouched, prospecção §12).
- */
-pub type Borrow = struct { operand: Expr }   // &x — safe mutable borrow (AL wave F1)
-pub type PathExpr = struct { path: Path }   // a qualified path as a VALUE — Enum::Member (e.g. PrimKind::U32), module statics (P2; the F2/Part-1 AST had only single-name Var)
-pub type StructLit = struct { type_path: Path; type_args: []TypeExpr; field_names: []str; field_vals: []Expr }   // Name { field = value, … } — a struct VALUE constructor (W4a); (W9.4) type_args = explicit `Foo<i64>{ … }` generic args (empty for bare `Foo { … }`); parallel slices (.len replaces nfields)
-pub type Index = struct { receiver: Expr; index: Expr }   // recv[index] — str→byte, []T→T (W5-idx)
-// Format spec for a single $"…{expr:spec}…" hole. Three variants:
-//   FSpecNone    — no colon in hole (existing behavior)
-//   FSpecStatic  — `:literal` → static spec string (e.g. "F2")
-//   FSpecDynamic — `:[arg1, arg2, …]` → arg expressions evaluated at runtime
+pub type MacroCall = struct { callee: Path; args: []Expr; callee_type_args: []@TypeExpr() }
+pub type IfExpr = struct {
+    cond: Expr
+    then_blk: []@Statement()
+    has_else: bool
+    else_blk: []@Statement()
+}
+pub type MatchExpr = struct { subject: Expr; arms: []Arm }
+
+pub type FieldAccess = struct { receiver: Expr; field: str }
+pub type MethodCall = struct {
+    receiver: Expr
+    method: str
+    args: []Expr
+    arg_names: []str
+    type_args: []@TypeExpr()
+}
+pub type Cast = struct { expr: Expr; target: @TypeExpr() }
+pub type Borrow = struct { operand: Expr }
+pub type PathExpr = struct { path: Path }
+pub type StructLit = struct { type_path: Path; type_args: []@TypeExpr(); field_names: []str; field_vals: []Expr }
+pub type Index = struct { receiver: Expr; index: Expr }
 pub type FSpecNone = struct { }
 pub type FSpecStatic = struct { s: str }
 pub type FSpecDynamic = struct { args: []Expr }
-pub type FSpecKind = variant FSpecNone | FSpecStatic | FSpecDynamic
-pub type FSpec = struct { kind: FSpecKind }
-// `$"pre {a} mid {b} post"` — string interpolation (self-host parity). The string is
-// pieces[0] ++ str(holes[0]) ++ pieces[1] ++ … ++ pieces[nholes] — so pieces.len == holes.len + 1.
-// Pieces are DECODED literal str spans (escapes resolved, like StrLit); each hole is a full Expr.
-// specs[i] carries the optional format spec for holes[i] (specs.len == holes.len).
-pub type Interp = struct { pieces: []str; holes: []Expr; specs: []FSpec }   // $"…{expr}…" (self-host parity)
-// `<expr> in [ e0, e1, … ]` → bool (Phase 2). True iff the LHS equals any element; the LHS is
-// EVALUATED ONCE. The `[ … ]` is a SPECIAL membership-set syntax valid ONLY here (no general
-// array literal). Empty set `x in []` is allowed → always false.
-pub type InExpr = struct { lhs: Expr; elems: []Expr }   // x in [ … ] — membership test (Phase 2)
-pub type ArrayElem = struct { is_spread: bool; expr: Expr }   // one element in an array literal: plain (is_spread=false) or spread (is_spread=true, ..expr)
-pub type ArrayLit = struct { elements: []ArrayElem }   // [ e0, e1, … ] — a slice/array literal (Increment B+); element type unified by the checker
-// (W10) a closure LITERAL `(params) => expr` / `(params) => { … }` — an anonymous function value
-// (NO `fn` keyword). A param's type is OPTIONAL (`has_type` false ⇒ inferred from the target type,
-// per the W10 ruling). The body is a STATEMENT BLOCK (a `=> expr` form is stored as one trailing
-// ExprStmt, like a fn body), so the trailing value is the closure's result. The return type is
-// inferred (no `-> R` on a literal). The checker types it to a `Func` and lifts it to a top-level
-// function + capture env. (`.type` ends up the closure's Func type.)
-pub type LambdaParam = struct { name: str; has_type: bool; type_ann: TypeExpr }
-pub type Lambda = struct { params: []LambdaParam; body: []Statement }
+pub type FSpec = struct { kind: FSpecNone | FSpecStatic | FSpecDynamic }
+pub type Interp = struct { pieces: []str; holes: []Expr; specs: []FSpec }
+pub type InExpr = struct { lhs: Expr; elems: []Expr }
+pub type ArrayElem = struct { is_spread: bool; expr: Expr }
+pub type ArrayLit = struct { elements: []ArrayElem }
+pub type LambdaParam = struct { name: str; has_type: bool; type_ann: @TypeExpr() }
+pub type Lambda = struct { params: []LambdaParam; body: []@Statement() }
 
-// (C1-POS/E1) Expr is a STRUCT WRAPPER over the variant of node kinds — mirroring the typed
-// `TExpr` (tast.tks) and the C `tk_expr` (ast.h), so EVERY expression node carries its 1-based
-// source position. The parser stamps line/col from the node's first token; the checker copies
-// it onto the typed node and onto type-errors, so a message points at the failing expression.
-pub type ExprKind = variant Number | Var | Call | IfExpr | MatchExpr | StrLit | ByteLit | CharLit | BoolLit | NullLit | Binary | Unary | Compare | FieldAccess | SafeFieldAccess | Coalesce | MethodCall | SafeMethodCall | Cast | PathExpr | StructLit | Index | Interp | InExpr | ArrayLit | Lambda | Borrow
-pub type Expr = struct { kind: ExprKind; line: u32; col: u32 }
+pub type Block = struct { body: []@Statement() }
 
-// --- statements ---
-pub type BindKind = enum { Let; Mut; Const }
+macro ExprKind() { lowering { parser::Number | parser::Var | parser::Call | parser::IfExpr | parser::MatchExpr | parser::StrLit | parser::ByteStrLit | parser::ByteLit | parser::CharLit | parser::BoolLit | parser::NullLit | parser::Binary | parser::Unary | parser::Compare | parser::FieldAccess | parser::MethodCall | parser::Cast | parser::PathExpr | parser::StructLit | parser::Index | parser::Interp | parser::InExpr | parser::ArrayLit | parser::Lambda | parser::Borrow | parser::Block | parser::MacroCall } }
+pub type Expr = struct { kind: @ExprKind(); line: u32; col: u32 }
+
+pub type BindKind = enum { Var; Const }
 pub type SimpleName = struct { name: str }
-pub type DestructurePattern = struct { names: []str }   // let { x; y } = … (B.13 partial)
-pub type BindTarget = variant SimpleName | DestructurePattern
+pub type DestructurePattern = struct { names: []str }
+macro BindTarget(local: bool = false) {
+    if local { lowering { SimpleName | DestructurePattern } }
+    else     { lowering { parser::SimpleName | parser::DestructurePattern } }
+}
 
-pub type Binding = struct {   // let/mut/const TARGET [: T] = value
+pub type Binding = struct {
     kind: BindKind
-    target: BindTarget
+    target: @BindTarget()
     has_type: bool
-    type_ann: TypeExpr   // the parsed annotation (A.8)
+    type_ann: @TypeExpr()
+    is_ref: bool
     value: Expr
 }
-/**
- * AssignKind — the target shape of an assignment (#88). One of four, tagged on `Assign`/`TAssign`:
- *
- * @field Simple    `name op= value` — the bare binding `name` (deref=false; target = no_expr()).
- * @field RefDeref  `name.value op= value` — write THROUGH a `Ref<T>` handle `name` (deref=true, the
- *                  legacy MEM-1b-ii flag; target = no_expr()).
- * @field Field     `recv.field op= value` — a struct/class field write; `target` is the LHS field-access
- *                  EXPR (a FieldAccess, arbitrarily nested); `name`/`deref` unused.
- * @field Index     `ids[i] op= value` — a slice/array ELEMENT write; `target` is the LHS index EXPR (an
- *                  `Index{receiver,index}`); `name`/`deref` unused. Appended LAST so the three legacy
- *                  ordinals (and thus the TKB `assign_kind_byte` layout) are unchanged. `deref` stays a
- *                  plain bool == (kind==RefDeref); Field/Index both carry the general lvalue in `target`
- *                  (see `assign_has_target`).
- */
 pub type AssignKind = enum { Simple; RefDeref; Field; Index }
-pub type Assign = struct { kind: AssignKind; name: str; op: lexer::TokenKind; value: Expr; deref: bool; target: Expr }   // x = / += / … (B.4); see AssignKind above
+pub type Assign = struct { kind: AssignKind; name: str; op: lexer::TokenKind; value: Expr; deref: bool; target: Expr }
 
-/**
- * assign_has_target — does an `AssignKind` carry a general lvalue EXPRESSION in `Assign.target` /
- * `TAssign.target`? True for the two expr-target shapes — `Field` (`recv.field`) and `Index`
- * (`ids[i]`) — and false for `Simple` / `RefDeref` (which write a bare `name`). Every AST/TAST walk
- * that descends into a field assignment's `target` must descend an index assignment's `target` too
- * (both hold sub-expressions naming free variables), so the two share this single predicate.
- *
- * @param kind  the assignment's target discriminant
- * @return      true iff `target` holds a walkable lvalue expression (`Field` or `Index`)
- */
-pub fn assign_has_target(kind: AssignKind) -> bool {
+pub fn assign_has_target(kind: AssignKind): bool {
     match kind {
         AssignKind::Field => true
         AssignKind::Index => true
         _ => false
     }
 }
-pub type Return = struct { has_value: bool; value: Expr }   // `return [expr]` — bare `return` (no value) has has_value=false, value a placeholder (B.20; P4a)
-/**
- * `[LABEL:] loop [<head>] { … }` (M.5, #517). The head is fully desugared by the parser: `init`
- * holds the run-once, LOOP-SCOPED preamble (counter/bound/`_first` for range & 3-part, `_it` for
- * for-each; empty for infinite & while) and `body` already contains the folded condition-break, the
- * guarded step, and/or the closure-iterator `match`. `label` empty (len 0) = unlabeled.
- *
- * @field label the UPPER_SNAKE prefix label, or "" when unlabeled
- * @field init  the loop-scoped preamble, run once before the first iteration; it does NOT leak past
- *              the loop (checker scope / VM base-pop / codegen brace)
- * @field body  the iteration body (folded head + user statements)
- */
-pub type LoopStmt = struct { label: str; init: []Statement; body: []Statement }
-pub type BreakStmt = struct { label: str }   // break [NAME] — label empty = innermost loop
-pub type ContinueStmt = struct { label: str }   // continue [NAME] — label empty = innermost loop
-pub type ExprStmt = struct { expr: Expr }   // a bare expression on its own line
-// `defer { stmts }` (C7.18) — scoped cleanup block; executes LIFO at ANY scope exit
-// (normal return, early return inside a loop, break out of a function).
-// Panic does NOT run deferred blocks (simplifies implementation).
-// Nested `defer` is rejected by the checker.
-pub type DeferStmt = struct { body: []Statement }
+pub type Return = struct { has_value: bool; value: Expr; values: []Expr }
+pub type LoopStmt = struct { label: str; init: []@Statement(); body: []@Statement() }
+pub type BreakStmt = struct { label: str }
+pub type ContinueStmt = struct { label: str }
+pub type ExprStmt = struct { expr: Expr }
+pub type DeferStmt = struct { body: []@Statement() }
 
-/**
- * `adopt [name] { stmts }` — opens an ADOPTER region; every object allocated lexically inside
- * belongs to it, and the closing brace BULK-drops the whole subtree at once (cycles irrelevant —
- * nothing is freed per-object). The C1 closer of the memory remodel (§1 L4). `adopt` is a
- * CONTEXTUAL statement head (not a hard keyword) recognized by ident text at statement position.
- *
- * @field name  the optional bound name (`adopt r { … }`); empty = anonymous adopter. The region
- *              is opened/dropped either way; the name only matters when a future increment lets
- *              code reference the region handle.
- * @field body  the statements executed inside the adopter region.
- */
-pub type AdoptStmt = struct { name: str; body: []Statement }
+pub type AdoptStmt = struct { name: str; body: []@Statement() }
 
-pub type Statement = variant Binding | Assign | Return | LoopStmt | BreakStmt | ContinueStmt | ExprStmt | DeferStmt | AdoptStmt
+pub type Spawn = struct { call: Expr }
 
-// --- generic type-parameter CONSTRAINTS (W11/S6, 2026-07-01) -----------------------------
-// `<T: ConstraintExpr>` — a DEDICATED boolean grammar over NOMINAL atoms (variant/struct
-// names), syntactically distinct from a type-expression `|` (that's a type UNION; this is a
-// boolean AND/OR over membership tests). `&` binds tighter than `|`: `C1 & C2 | C3` parses as
-// `(C1 & C2) | C3`. An atom is a bare name; the checker rejects `?`/null/void atoms (a
-// constraint targets a concrete nominal type, never a use-position nullable/void). Checked AT
-// MONOMORPHIZATION (when a generic is instantiated with a concrete type), never at definition
-// (an unconstrained T stays OPAQUE — store/pass/return only; operating on members needs a
-// constraint). NoConstraint is the sentinel for a type-param with no `: …` clause, so
-// Function/TypeDecl.type_constraints stays PARALLEL to type_params (same length, index i's
-// constraint governs type_params[i]) without an Optional wrapper.
-pub type ConstraintAtom = struct { name: str }   // a nominal variant/struct name
-pub type ConstraintAnd = struct { left: ConstraintExpr; right: ConstraintExpr }   // C1 & C2 — both must hold
-pub type ConstraintOr = struct { left: ConstraintExpr; right: ConstraintExpr }   // C1 | C2 — either must hold
-pub type NoConstraint = struct { }   // sentinel: the type-param has no `: …` clause
-pub type ConstraintExpr = variant ConstraintAtom | ConstraintAnd | ConstraintOr | NoConstraint
+pub type BlockStmt = struct { body: []@Statement() }
 
-// --- top-level items ---
-pub type Param = struct { name: str; has_type: bool; type_ann: TypeExpr; is_params: bool; has_default: bool; default_expr: Expr }   // immutable (B.21); is_params = C#-style variadic modifier (2026-07-01), trailing-only, type_ann must be a Slice; has_default/default_expr = DEFARGS (2026-07-01) — TRAILING-ONLY (once one param defaults, every later param must too), default_expr valid iff has_default; has_type = OOP A1 (2026-07-01) — false ONLY for a struct method's 1st param (the RECEIVER, name free, type injected by the checker as the enclosing struct); every other param is always typed (type_ann valid iff has_type)
+pub type BindName = struct { name: str }
+pub type BindSkip = struct { }
+pub type BindRest = struct { }
+macro BindElem(local: bool = false) {
+    if local { lowering { BindName | BindSkip | BindRest } }
+    else     { lowering { parser::BindName | parser::BindSkip | parser::BindRest } }
+}
 
-/** A dependency-injection lifetime (W10c/MEM-3). `None` = the type carries no
- *  `#singleton`/`#scoped`/`#transient` annotation; the three others are the design's three
- *  DI lifetimes — a singleton lives in the root region, a scoped instance in its owning
- *  region (walking up the arena tree), a transient one is freshly built per use. */
-pub type DiKind = enum { None; Singleton; Scoped; Transient }
+pub type MultiTargetKind = enum { Parallel; ArrayDecomp }
 
-/** One `#inject(name: Type)` binding on a fn overlay (W10c/MEM-3). `has_key`/`key` carry
- *  an optional `@Key` selector — parsed so issue #173 (keys + `#wire`) needs no AST churn,
- *  but rejected by the core-DI checker (keys are out of core scope). `line`/`col` point at
- *  the binding name for diagnostics. */
-pub type InjectBinding = struct { name: str; type_ann: TypeExpr; has_key: bool; key: str; line: u32; col: u32 }
+pub type MultiBind = struct {
+    kind: BindKind
+    shape: MultiTargetKind
+    targets: []@BindElem()
+    has_type: bool
+    type_ann: @TypeExpr()
+    values: []Expr
+    line: u32
+    col: u32
+}
 
-// Visibility — a declaration's REACH (LEGISLATION "Visibility — pub vs exp"; B.9).
-// Private (default, no keyword) = own namespace only; Pub = across the project's
-// namespaces (not in the binary header); Exp = exported in the `.tkh` (the public ABI),
-// pub by definition. Ordered by increasing reach: Private < Pub < Exp.
-pub type Visibility = enum { Private; Pub; Exp }
+pub type LoweringFrag = struct { tokens: []lexer::Token }
+
+macro Statement() { lowering { parser::Binding | parser::Assign | parser::Return | parser::LoopStmt | parser::BreakStmt | parser::ContinueStmt | parser::ExprStmt | parser::DeferStmt | parser::AdoptStmt | parser::BlockStmt | parser::MultiBind | parser::LoweringFrag | parser::Spawn } }
+
+pub type ConstraintAtom = struct { name: str }
+pub type ConstraintAnd = struct { left: @ConstraintExpr(); right: @ConstraintExpr() }
+pub type ConstraintOr = struct { left: @ConstraintExpr(); right: @ConstraintExpr() }
+pub type NoConstraint = struct { }
+pub type ConstraintNotNull = struct { }
+pub type ConstraintForm = struct { form: str; has_lifetime: bool; lifetime: ServiceLifetime }
+pub type ConstraintType = struct { ty: @TypeExpr() }
+macro ConstraintExpr() { lowering { parser::ConstraintAtom | parser::ConstraintForm | parser::ConstraintNotNull | parser::ConstraintAnd | parser::ConstraintOr | parser::ConstraintType | parser::NoConstraint } }
+
+pub type Param = struct { name: str; has_type: bool; type_ann: @TypeExpr(); is_params: bool; has_default: bool; default_expr: Expr }
+
+/** A declaration's reach: `Private` (own namespace) < `Pub` (cross-namespace) < `Exp` (exported ABI). */
+exp type Visibility = enum { Private; Pub; Exp }
 
 pub type Function = struct {
     name: str
-    type_params: []str   // generic type-parameter names (S4 — empty for a non-generic fn; e.g. `fn id<T>` → ["T"])
-    type_constraints: []ConstraintExpr   // (W11/S6) PARALLEL to type_params (same length); NoConstraint{} = no `: …` clause
+    type_params: []str
+    type_constraints: []@ConstraintExpr()
     params: []Param
-    has_return: bool   // `-> ret` present? (absent = Unit return; P5a)
-    return_type: TypeExpr   // the return type (valid iff has_return)
-    body: []Statement
-    vis: Visibility   // private (default) / pub / exp
-    has_doc: bool   // a `/** … */` doc precedes it?
-    doc: str   // the doc span (valid iff has_doc)
-    line: u32   // the name's 1-based source line (W-loc-2 diagnostics)
-    col: u32   // the name's 1-based source column (W-loc-2 diagnostics)
-    is_test: bool   // a `#test` attribute precedes it? (D2 — run by `teko test` / the build gate)
-    is_extern: bool   // an `extern` foreign-function declaration? (C7.1a — no body)
-    c_symbol: str   // the C symbol it binds (valid iff is_extern)
-    from_lib: str   // the providing library ("" = implicit libc; valid iff is_extern)
-    os_guard: str   // a `#os("…")` conditional-compile guard ("" = all OSes; C7.1f)
-    is_intern: bool   // (W10b.CLASS, 2026-07-01) visible to inheritors (combines WITH vis, not a 4th tier); struct members always false
-    is_abstract: bool   // `abstract fn` — signature only, no body (abstract classes only)
-    is_virtual: bool   // `virtual fn` — overridable by a derived class
-    is_override: bool   // `override fn` — overrides a base virtual/abstract method
-    has_inject: bool
-    injects: []InjectBinding
-    /**
-     * An `unsafe fn` — the owner-total risk marker on a namespace function (U1, the
-     * 0.1.0.0-beta memory+unsafe remodel §2). `unsafe` is a contextual keyword (not
-     * reserved), so this flag is parsed but NOT enforced here: the checker (U2) is
-     * what makes an unsafe fn's contents actually unlock the risky operations. A
-     * method's `Function` (inside a struct/class body) always carries `is_unsafe =
-     * false` — per design, unsafe-ness attaches to the ENCLOSING TypeDecl, not to
-     * individual methods; `TypeDecl.is_unsafe` is the sole source of truth there.
-     */
-    is_unsafe: bool
-    /**
-     * A `#arena_size(N)` directive precedes it (#453, the 0.3.1 SW1 resource/arena foundation) —
-     * a DEVELOPER-DECLARED per-function arena budget in bytes, covering the function's own frame
-     * region AND every child scope it opens (nested block/loop/arm regions all parent to that
-     * same frame). Additive-only: `src/` does not adopt it (the pre-0.3.1 seed must keep building
-     * gen1), and it is parsed ONLY at the top-level `fn` position — a method's `Function` always
-     * carries `has_arena_size = false` (methods do not go through `parse_decl_attributes`). The
-     * compiler never INFERS this number (owner ruling 2026-07-13): a later `teko profile` (#479)
-     * may SUGGEST one, never assign it.
-     */
-    has_arena_size: bool
-    /**
-     * The `#arena_size(N)` byte count itself (valid iff `has_arena_size`; `0` otherwise). Parsed
-     * as an unsigned, strictly positive integer literal — `#arena_size(0)` is rejected at parse
-     * time (a zero-byte arena is not a budget).
-     */
-    arena_size: u64
+    has_return: bool
+    return_type: @TypeExpr()
+    body: []@Statement()
+    vis: Visibility
+    has_doc: bool
+    doc: DocSpan
+    line: u32
+    col: u32
+    is_test: bool
+    is_extern: bool
+    c_symbol: str
+    from_lib: str
+    os_guard: str
+    is_intern: bool
+    is_abstract: bool
+    is_virtual: bool
+    is_override: bool
+    is_static: bool
+    is_getter: bool
+    is_setter: bool
+    accessor_prop: str
+    ret_types: []@TypeExpr()
+    is_operator: bool
+    is_global: bool
 }
-/**
- * StructBody — a `struct [I & …] { fields; methods; consts }` body (OOP A1). A struct's members
- * (fields + methods) stay ALL PUBLIC. `implements` is the `struct I1 & I2 { … }` interface list,
- * empty when the struct declares none.
- *
- * @param fields      the interleaved `name: T` fields, in source order
- * @param methods     the interleaved `fn` decls — an untyped 1st param marks an INSTANCE method
- *                    (the receiver), else a STATIC method
- * @param implements  the interface names the struct conforms to (`& I1 & I2`), empty when none
- * @param consts      the static type-member `const NAME: T = …` declarations (#594 crumb 7); each
- *                    occupies NO layout slot and is resolved by `StructName::NAME`
- */
-pub type StructBody = struct { fields: []Field; methods: []Function; implements: []str; consts: []ConstDecl }
-/**
- * One field of a struct/class/trait body.
- *
- * `vis` is the field's REACH (W10b.CLASS, 2026-07-01) — the usual Private/Pub/Exp; `is_intern`
- * widens it to "also visible to inheritors" (orthogonal, not a 4th Visibility tier — see
- * Visibility's own doc). A struct's Field always carries vis=Pub/is_intern=false (struct members
- * stay all-public per W10b.0.A); only class-body fields actually vary these.
- *
- * `has_doc`/`doc` (issue #285) mirror Function's own: a leading Javadoc directly above the field
- * attaches here, so a class/struct body can carry a full-Javadoc per field (W15).
- *
- * @param name       the field's name
- * @param type_ann   the field's declared type
- * @param vis        the field's reach (Private/Pub/Exp)
- * @param is_intern  visible to inheritors? (class bodies only; always false for a struct field)
- * @param has_doc    a Javadoc directly precedes this field?
- * @param doc        the doc-comment's text (valid iff has_doc)
- */
-pub type Field = struct { name: str; type_ann: TypeExpr; vis: Visibility; is_intern: bool; has_doc: bool; doc: str }
-pub type EnumBody = struct { members: []str }   // member names, in order
-/**
- * A `flags` type body: member names + their power-of-2 bit-values (C8.3 assigns member `i`
- * → `1 << i`; C8.6 serializes). The bit-value carrier is `u64` (drop-128, 2026-07-24), so a
- * flags type is capped at 64 members — bit 63 is the last representable; a 65th member is a
- * checker error naming the cap.
- *
- * @field members  the member names, in declaration order
- * @field values    the resolved bit-value of each member, PARALLEL to `members` (≤ 64 entries)
- */
-pub type FlagsBody = struct { members: []str; values: []u64 }
-pub type VariantBody = struct { type_expr: TypeExpr }   // a union (A.8)
-pub type AliasBody = struct { alias: TypeExpr }   // `type Name = <type-expr>` — a TRANSPARENT alias (self-host parity)
-pub type ExternBody = struct { }   // `extern type Name` — an OPAQUE foreign handle (C7.1a; lowers to `void *`)
-// (W10b.CLASS, 2026-07-01) a class's KIND — Teko INVERTS the usual default: SEALED (final,
-// instantiable, NOT inheritable) is the DEFAULT (bare `class`); `abstract class` = inheritable,
-// NOT instantiable; `virtual class` = instantiable AND inheritable.
+pub type StructBody = struct { fields: []Field; methods: []Function; implements: []str; consts: []ConstDecl; is_readonly: bool }
+pub type Field = struct { name: str; type_ann: @TypeExpr(); vis: Visibility; is_intern: bool; has_doc: bool; doc: DocSpan; is_readonly: bool }
+pub type EnumBody = struct { members: []str; methods: []Function; consts: []ConstDecl }
+pub type FlagsBody = struct { members: []str; values: []u64; methods: []Function; consts: []ConstDecl }
+pub type VariantBody = struct { type_expr: @TypeExpr() }
+pub type AliasBody = struct { alias: @TypeExpr() }
+pub type NewtypeBody = struct { backing: @TypeExpr(); methods: []Function; consts: []ConstDecl }
+pub type ExternBody = struct { }
+pub type ExternStructBody = struct { fields: []Field; c_tag: str }
 pub type ClassKind = enum { Sealed; Abstract; Virtual }
-/**
- * ClassBody — a `type C = <kind> [Base[(binding)]] [& I1 & I2 …] { fields; methods; consts }` body
- * (W10b.CLASS). AT MOST one base class (itself Abstract or Virtual, enforced by the checker). Members
- * (fields + methods) are PRIVATE BY DEFAULT (`pub`/`intern` widen) — the inverse of a struct.
- *
- * @param kind              SEALED (default), Abstract, or Virtual (see ClassKind)
- * @param has_base          does this class extend a base class?
- * @param base_name         the base class's name (valid iff has_base)
- * @param has_base_binding  is a base-binding name declared (`Base(parent)`)?
- * @param base_binding_name the name INSTANCE methods use to reach the base object (valid iff has_base_binding)
- * @param implements        the `& I1 & I2` interface/derive list
- * @param fields            the interleaved `name: T` fields, in source order
- * @param methods           the interleaved `fn` decls (instance/static, per receiver shape)
- * @param consts            the static type-member `const NAME: T = …` declarations (#594 crumb 7);
- *                          each occupies NO layout slot and is resolved by `ClassName::NAME` (a
- *                          subclass reaches a base's `pub`/`exp` member const by name)
- */
+pub type ServiceLifetime = enum { Singleton; Scoped; Transient }
 pub type ClassBody = struct {
     kind: ClassKind
     has_base: bool
@@ -509,136 +218,99 @@ pub type ClassBody = struct {
     fields: []Field
     methods: []Function
     consts: []ConstDecl
+    is_service: bool
+    service_lifetime: ServiceLifetime
 }
-// (W10b.IF) an INTERFACE — a PURE SIGNATURE CONTRACT: `type X = interface [I1 & I2 …] { fn sig; … }`.
-// `extends: []str` — the interfaces this one extends (multiple inheritance; the `I1 & I2` list between
-// `interface` and `{`). `methods: []Function` — INSTANCE-method SIGNATURES only (each is a bodyless
-// `Function`: 1st param untyped = the receiver; NO body, NO statics, NO default bodies; all members
-// public). A type conforms by providing every method (transitively through `extends`) with a matching
-// signature. An interface has NO runtime representation yet (dynamic dispatch = ROUND 3); it is a
-// compile-time contract only, so codegen/VM emit nothing for it and reject it as a value type.
 pub type InterfaceBody = struct { extends: []str; methods: []Function }
-/**
- * TraitBody — a `trait { fields; methods; consts }` body (TR0): a struct-shaped, NON-instantiable
- * bundle a struct/class DERIVES (`type Post = struct Timestamped { … }`, the `&`-list position).
- * The checker FOLDS derived traits into each deriver before typing (fold_traits), so codegen/VM
- * never see a trait in a value position; the decl itself emits nothing (like InterfaceBody).
- *
- * @param fields   the provided members, folded into the deriver (class field-flattening)
- * @param methods  a method WITH a body is PROVIDED (overridable); a bodyless one is a REQUIREMENT
- *                 the deriver must satisfy (like interface conformance)
- * @param consts   the static type-member `const NAME: T = …` declarations (#594 crumb 7); each
- *                 folds into every deriver like a field, resolved by `DeriverName::NAME`
- */
-pub type TraitBody = struct { fields: []Field; methods: []Function; consts: []ConstDecl }
-pub type TypeBody = variant StructBody | EnumBody | FlagsBody | VariantBody | AliasBody | ExternBody | ClassBody | InterfaceBody | TraitBody   // pub: TypeDecl.body surface + the .tkb codec (C7.16)
-pub type TypeDecl = struct {   // nominal (B.13)
+pub type TraitBody = struct { fields: []Field; methods: []Function; consts: []ConstDecl; implements: []str }
+macro TypeBody() { lowering { parser::StructBody | parser::EnumBody | parser::FlagsBody | parser::VariantBody | parser::AliasBody | parser::NewtypeBody | parser::ExternBody | parser::ExternStructBody | parser::ClassBody | parser::InterfaceBody | parser::TraitBody } }
+pub type TypeDecl = struct {
     name: str
-    type_params: []str   // generic type-parameter names (S4 — empty for a non-generic type; e.g. `type Box<T>` → ["T"])
-    type_constraints: []ConstraintExpr   // (W11/S6) PARALLEL to type_params (same length); NoConstraint{} = no `: …` clause
-    body: TypeBody
-    vis: Visibility   // private (default) / pub / exp
+    type_params: []str
+    type_constraints: []@ConstraintExpr()
+    body: @TypeBody()
+    vis: Visibility
     has_doc: bool
-    doc: str   // the doc span (valid iff has_doc)
-    line: u32   // the name's 1-based source line (W-loc-2 diagnostics)
-    col: u32   // the name's 1-based source column (W-loc-2 diagnostics)
-    di_kind: DiKind
-    has_di_key: bool
-    di_key: str
-    /**
-     * An `unsafe type M = struct|class { … }` — the owner-total risk marker on a
-     * type declaration (U1, the 0.1.0.0-beta memory+unsafe remodel §2). `unsafe` is
-     * a contextual keyword (not reserved), so this flag is parsed but NOT enforced
-     * here: the checker (U2) is what makes the contagion-by-composition and
-     * uncolored-calls rules bite. A trait/interface/enum/flags/extern TypeDecl
-     * likewise just carries this flag (default `false` unless `unsafe` precedes it),
-     * and it stays meaningful for every one of them — they all stay NOMINAL through
-     * resolution, so the stamp is always found again by name.
-     *
-     * An `AliasBody` (`type Name = <type-expr>`) is the ONE exception: a pure alias
-     * resolves straight THROUGH to its target and never survives as a `Named` of its
-     * own name (`resolve.tks:794`), so `unsafe` on it would otherwise compile and do
-     * nothing — a silent checker hole (docs/design/c-types-and-marshalling-0.3.1.md
-     * §9.2). The checker (`reject_unsafe_alias`, `collect.tks`) REJECTS this flag
-     * being `true` on an `AliasBody` at compile time, regardless of the alias's
-     * right-hand side; a real unsafe-typed wrapper must be a nominal
-     * `unsafe type M = struct { … }` / `= class { … }` instead.
-     */
-    is_unsafe: bool
-    /**
-     * A `#must_free type M = struct|class { … }` — the RELEVANT-type marker (S2, the
-     * 0.1.0.0-beta memory+unsafe remodel #336), the DUAL of affine: a value of this type must
-     * be consumed (freed or moved) on at least one control-flow path, or the checker's local
-     * consume-or-fail dataflow (`type_function`) rejects the function at compile time. Parsed
-     * as a plain `#`-attribute (no payload), like `#singleton`/`#scoped`/`#transient`, but it
-     * may ONLY precede a `type` (never a `fn`/`flags`, never a `let`). Default `false` unless
-     * `#must_free` precedes the declaration.
-     */
-    must_free: bool
+    doc: DocSpan
+    line: u32
+    col: u32
+    is_global: bool
 }
-/**
- * A `use` declaration, in one of three forms (S1, the 0.1.0.0-beta remodel §3.1):
- * bare `use a::b`, aliased `use a::b as c`, or grouped `use a::b::[ X, Y ]`.
- */
 pub type UseDecl = struct {
-    /** the owning namespace path (`a::b`), common to all three forms. */
     path: Path
-    /** true iff an `as alias` follows the path (never true for the grouped form). */
     has_alias: bool
-    /** the bound alias name (valid iff `has_alias`; `""` for bare/grouped forms). */
     alias: str
-    /**
-     * the grouped import's names (`use a::b::[ X, Y ]` → `["X", "Y"]`); EMPTY for the two
-     * existing forms (bare and aliased) — an empty list is the "not a grouped import"
-     * sentinel the checker's `build_aliases` guards on.
-     */
     names: []str
 }
 
-/**
- * ConstDecl — a module-level named compile-time constant `const NAME: Type = init`
- * (#594). Distinct from the local `BindKind::Const` binding (`parse_stmt.tks`): a
- * ConstDecl is a top-level Decl with visibility, a mandatory type annotation, and a
- * const-expr initializer (validated by `teko::checker::is_const_expr`). It carries
- * no scope and opens no arena — the checker inlines it (scalars) or the backend
- * materializes it in rodata (aggregates, C-agg-2).
- *
- * @param name    the constant's identifier
- * @param ty      the mandatory declared type annotation
- * @param init    the const-expr initializer
- * @param vis     Pub/Exp/private, mirroring a function's
- * @param has_doc whether a doc-comment was attached
- * @param doc     the attached doc-comment text (valid iff has_doc)
- * @param line    the `const` keyword's source line
- * @param col     the `const` keyword's source column
- * @since #594
- */
-pub type ConstDecl = struct { name: str; ty: TypeExpr; init: Expr; vis: Visibility; has_doc: bool; doc: str; line: u32; col: u32 }
+pub type ConstDecl = struct { name: str; ty: @TypeExpr(); init: Expr; vis: Visibility; has_doc: bool; doc: DocSpan; line: u32; col: u32; is_global: bool }
 
-// --- R-main: a `.tks` file is a MAIN (executable entry) or a MODULE. ---
-/**
- * A top-level declaration — a module's content: a `fn` (Function), a `type`/`flags`
- * (TypeDecl), or a module-level `const` (ConstDecl, #594).
- *
- * @since #594 widened with ConstDecl (was `Function | TypeDecl`).
- */
-pub type Decl = variant Function | TypeDecl | ConstDecl
-pub type MainFile = struct { uses: []UseDecl; body: []Statement }   // main.tks: the `use` header + the VIRTUAL MAIN's body (statements only — no type/fn decls)
-pub type Module = struct { uses: []UseDecl; decls: []Decl }   // a module: the `use` header + declarations (no loose statements)
-type File = variant MainFile | Module   // a `.tks` is exactly one; the file's role decides (main.tks ⇔ an executable `.tkp`)
+pub type MacroDecl = struct { name: str; params: []Param; body: []@Statement(); vis: Visibility }
 
-// --- the FLATTENED item/program — the CHECKER's input view (mirror of the C tk_item /
-//     tk_program in ast.h). The parser produces File/Module/Decl; the DRIVER flattens
-//     them into this `Program` of `Item`s, which the checker (collect/typer) consumes.
-//     Each `Item` is a tagged payload (the C union) PLUS the namespace it came from (A3
-//     provenance for codegen name-mangling; resolution/typing IGNORE it). ---
-/**
- * The C `tk_item` tag+union, as a Teko variant — a flattened top-level item's
- * payload: a `use`, a loose statement (main files), a `fn`, a `type`/`flags`, or a
- * module-level `const` (ConstDecl, #594).
- *
- * @since #594 widened with ConstDecl (was `UseDecl | Statement | Function | TypeDecl`).
- */
-pub type ItemKind = variant UseDecl | Statement | Function | TypeDecl | ConstDecl
-pub type Item = struct { content: ItemKind; namespace: str; file: str }   // a flattened top-level item + its source namespace (A3) + source file (W-loc-2: assemble tags it so a flattened-program error resolves to file:line:col; empty on the single-file compile/run path)
-pub type Program = struct { items: []Item }   // the flat item list the checker consumes
+pub type ComptimeDecl = struct { name: str; type_params: []str; params: []Param; ret: @TypeExpr(); body: []@Statement(); vis: Visibility; is_global: bool }
+
+pub type EmbedDecl = struct { pattern: str; has_compression: bool; comp: teko::embed::EmbedCompress; level: i64; src_path: str; line: u32; col: u32 }
+
+macro Decl() { lowering { parser::Function | parser::TypeDecl | parser::ConstDecl | parser::MacroDecl | parser::ComptimeDecl | parser::EmbedDecl } }
+pub type MainFile = struct { uses: []UseDecl; body: []@Statement() }
+pub type Module = struct { uses: []UseDecl; decls: []@Decl(); decl_guards: []Pred }
+
+macro ItemKind() { lowering { UseDecl | @Statement() | Function | TypeDecl | ConstDecl | MacroDecl | ComptimeDecl } }
+
+pub type Item = struct { content: @ItemKind(); namespace: str; file: str; guard: Pred }
+pub type Program = struct { items: []Item }
+
+macro PredKind() { lowering { parser::PTrue | parser::PEq | parser::PFlag | parser::PNot | parser::PAnd | parser::POr } }
+
+pub type PTrue = struct { }
+
+pub type PEq = struct {
+    axis: str
+    value: str
+}
+
+pub type PFlag = struct {
+    name: str
+}
+
+pub type PNot = struct {
+    inner: Pred
+}
+
+pub type PAnd = struct {
+    left: Pred
+    right: Pred
+}
+
+pub type POr = struct {
+    left: Pred
+    right: Pred
+}
+
+pub type Pred = struct {
+    kind: @PredKind()
+}
+
+pub fn pred_true(): Pred {
+    Pred { kind = PTrue { } }
+}
+
+pub fn pred_os(value: str): Pred {
+    Pred { kind = PEq { axis = "os"; value = value } }
+}
+
+pub fn pred_arch(value: str): Pred {
+    Pred { kind = PEq { axis = "arch"; value = value } }
+}
+
+pub fn pred_and(a: Pred, b: Pred): Pred {
+    Pred { kind = PAnd { left = a; right = b } }
+}
+
+pub fn pred_or(a: Pred, b: Pred): Pred {
+    Pred { kind = POr { left = a; right = b } }
+}
+
+pub fn pred_not(a: Pred): Pred {
+    Pred { kind = PNot { inner = a } }
+}

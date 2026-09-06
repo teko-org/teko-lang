@@ -1,191 +1,145 @@
-// src/checker/type.tks  (namespace 'teko::checker')
 
-/**
- * PrimKind — the injected scalar primitives (B.19), distinct real types. Native numeric set
- * (B.38 / TEKO_CORRECTION_PLAN §5): unsigned/signed integers 8–64 bit and the two IEEE floats
- * f32/f64. `dec`/`bigint` remain deferred (runtime-backed). The 128-bit widths (`U128`/`I128`)
- * and the half-precision float (`F16`) are REMOVED (drop-128, 2026-07-24) — the surface no
- * longer accepts them (`scope.tks::builtin_type` honest-stops on `i128`/`u128`/`f16`), so no
- * member for them exists here; `Bool` stays LAST.
- */
 pub type PrimKind = enum {
     U8; U16; U32; U64
     I8; I16; I32; I64
     F32; F64
     Bool
+    Isize; Usize
 }
 
 /**
- * prim_is_float — true for the IEEE float prims (F32/F64).
- *
- * @param k  the prim kind to classify
- * @return   whether `k` is a float
+ * Target — the compilation target as far as the type layer needs it: the machine-word width in bits.
+ * It is the single carrier of target-dependence threaded into `prim_width`, so the machine-word kinds
+ * `isize`/`usize` resolve to the target's word width (64 on the x86_64/arm64 fixpoint targets, 32 on a
+ * 32-bit target).
  */
-fn prim_is_float(k: PrimKind) -> bool {
+pub type Target = struct {
+    /** The target machine-word width in bits (64 on the fixpoint targets). */
+    word_width: u32
+}
+
+/**
+ * host_target — the compilation target the compiler currently emits for: the 64-bit host machine word.
+ * It is the value the checker and codegen pass to `prim_width` for the machine-word kinds until a real
+ * target is threaded from the build configuration; on the 64-bit fixpoint targets `isize`/`usize` share
+ * `i64`/`u64` bit-for-bit.
+ *
+ * @return  the host compilation target (a 64-bit machine word)
+ * @since 0.3.1
+ */
+pub fn host_target(): Target {
+    Target { word_width = 64 }
+}
+
+fn prim_is_float(k: PrimKind): bool {
     match k { F32 => true; F64 => true; _ => false }
 }
 
-/**
- * prim_is_int — true for the integer prims (U8..U64, I8..I64). NOT bool, NOT float.
- *
- * @param k  the prim kind to classify
- * @return   whether `k` is an integer
- */
-fn prim_is_int(k: PrimKind) -> bool {
+fn prim_is_int(k: PrimKind): bool {
     match k {
         U8 => true; U16 => true; U32 => true; U64 => true
         I8 => true; I16 => true; I32 => true; I64 => true
+        Isize => true; Usize => true
         _ => false
     }
 }
 
-/**
- * prim_is_signed — true for the SIGNED integer prims (I8..I64). Floats are signed by nature, but
- * this predicate is about INTEGER signedness — call it only for ints (it returns false for
- * floats and bool, which carry no integer-signedness concept).
- *
- * @param k  the prim kind to classify
- * @return   whether `k` is a signed integer
- */
-fn prim_is_signed(k: PrimKind) -> bool {
+fn prim_is_signed(k: PrimKind): bool {
     match k {
         I8 => true; I16 => true; I32 => true; I64 => true
+        Isize => true
         _ => false
     }
 }
 
 /**
- * prim_width — the bit width of a prim: ints 8/16/32/64, floats 32/64, bool 1.
+ * prim_width — the bit width of a primitive, target-parameterized for the machine-word kinds: `Isize`
+ * and `Usize` return the TARGET word width (64 on the x86_64/arm64 fixpoint targets, 32 on a 32-bit
+ * target). This is the ONLY place target-dependence enters the type; every other prim has a fixed
+ * width. On the 64-bit fixpoint targets `Usize`/`Isize` share `U64`/`I64`'s width bit-for-bit, so a
+ * `u64`→`usize` reball is byte-preserving on the fixpoint.
  *
- * @param k  the prim kind to measure
- * @return   its bit width
+ * @param k       the primitive kind
+ * @param target  the compilation target (its machine-word width)
+ * @return        the bit width of `k` on `target`
+ * @since 0.3.1
  */
-pub fn prim_width(k: PrimKind) -> u32 {
+pub fn prim_width(k: PrimKind, target: Target): u32 {
     match k {
         U8 => 8; U16 => 16; U32 => 32; U64 => 64
         I8 => 8; I16 => 16; I32 => 32; I64 => 64
         F32 => 32; F64 => 64
         Bool => 1
+        Isize => target.word_width; Usize => target.word_width
     }
 }
 
-// Doctrinal correction (TEKO_CORRECTION_PLAN §3 [Z1]; Laws M.0/M.1/M.3):
-//   - `Unit` (the value-less struct) is EXCISED. "Returns no value" is `void`.
-//   - `void` is a RETURN-ONLY marker: legal ONLY as `Func.ret`. It is never a
-//     value, never a binding type, never a variant member. (Enforced in the
-//     checker, Z2a — the model only needs to REPRESENT it.)
-//   - `error` is the native lowercase type — it SUPERSEDES the old capitalized
-//     `Error` / `teko::Error`.
-//   - `Optional` (`T?`) is the built-in unary type-former for nullability
-//     (complete in the seed, Z3=a). A variant member may NOT be optional
-//     (enforced in the checker, Z2a).
-
-// the cases that carry data (Teko has no payload on a bare enum — a variant case
-// is a struct). Byte/Str/error/void are markers (no payload).
 pub type Prim = struct { kind: PrimKind }
-pub type Slice = struct { element: Type }   // []T — recursive (B.8)
-pub type Optional = struct { inner: Type }   // T? — built-in nullable former (like Slice)
-pub type Named = struct { name: str }   // a user type, equal by NAME (nominal)
-pub type Variant = struct { members: []Type }   // A | B | … (two or more); members are COMPLETE types
-pub type Func = struct { params: []Type; ret: Type; variadic: bool; param_names: []str; n_required: u64; defaults: []parser::Expr }   // (params) -> ret (ret may be void); variadic = the LAST param is a C#-style `params` slice (2026-07-01) — false for closures/FFI/lambda types, true ONLY for a declared fn whose last source param carried `params`. DEFARGS (2026-07-01): param_names PARALLEL to params (empty []str for closures/FFI/builtins — no named-call, rule B); n_required = count of LEADING params with NO default (params[n_required..] all have one, TRAILING-ONLY rule A); defaults = the n_required..params.len default EXPRESSIONS, in order (params.len - n_required entries)
-pub type Byte = struct { }   // the octet type
-pub type Char = struct { }   // a UTF-8 codepoint (1–4 bytes); distinct by tag, runtime layout == []byte
-pub type Str = struct { }   // validated UTF-8
-pub type Error = struct { }   // the native `error` (lowercase; supersedes `Error`)
-pub type Void = struct { }   // return-only marker; legal ONLY as Func.ret
-/**
- * Ptr — the checker representation of `ptr<T>`, a TYPED machine address. The internal meta-name
- * differs from the surface `ptr<T>` exactly as `Optional`↔`T?` and `Slice`↔`[]T`; it is the primitive
- * inside `Ref<T>`.
- */
+pub type Slice = struct { element: @Type() }
+pub type Named = struct { name: str }
+pub type Variant = struct { members: []@Type() }
+pub type Func = struct { params: []@Type(); ret: @Type(); variadic: bool; param_names: []str; n_required: u64; defaults: []parser::Expr; ret_extra: []@Type() }
+pub type Byte = struct { }
+pub type Char = struct { }
+pub type Error = struct { }
+pub type Void = struct { }
 pub type Ptr = struct {
-    /** the pointed-to type, or `null` for the opaque `ptr` ≡ `ptr<void>` ≡ `*void` (pointer-only, NOT the value-`void`). */
-    inner: Type | null
+    inner: @Type() | null
 }
-pub type Uptr = struct { }   // (C7.1a) opaque word-size unsigned — transport-only at the FFI boundary
-// (MEM-1b) `Reference` — the META-level representation of the SAFE reference (user surface `Ref<T>`,
-// a compiler-known "C pointer WITHOUT `*`/`&`"). The meta-name differs from the surface name exactly
-// as `Ptr`↔`ptr<T>`, `Optional`↔`T?`, `Slice`↔`[]T` (the lowercase/distinct convention avoids the
-// surface name colliding with this internal type-case during self-host codegen). Reuses generics (no
-// keyword). Mutable-target only and NEVER null (R2), so `inner` is a plain `Type` (not optional) and
-// there is no opaque/bare form (unlike `Ptr`). Deref/assign via `.value`+`mut`; auto-ref when a `mut`
-// lvalue is passed where `Ref<T>` is expected. C representation = bare `<T> *` today (the `{p,
-// metadata}` struct wrapper waits until regions/DI add metadata fields — W9+).
-pub type Reference = struct { inner: Type }
+pub type Uptr = struct { }
+pub type Reference = struct { inner: @Type() }
 
-/**
- * The `null` unit type — the sole member of its own domain, a 1-byte zero-fill
- * value (`0b00000000`). Distinct from `void` (return-only, never a value): a
- * `Null` IS a bindable value meaning "absent". Ratified (owner, 2026-07-19).
- *
- * @since null-as-union
- */
 pub type Null = struct { }
 
-// a semantic type. (Compiler-managed indirection for the recursive cases.)
-pub type Type = variant Prim | Byte | Char | Str | Slice | Optional | Named | Variant | Func | Error | Void | Ptr | Uptr | Reference | Null
+macro Type() { lowering { checker::Prim | checker::Byte | checker::Char | checker::Slice | checker::Named | checker::Variant | checker::Func | checker::Error | checker::Void | checker::Ptr | checker::Uptr | checker::Reference | checker::Null } }
 
-// `void` recognition (M.3): the checker (Z2a) calls this to admit void in a
-// `Func.ret` position and to reject it everywhere else (value / binding / member).
-fn type_is_void(t: Type) -> bool {
+fn type_is_void(t: @Type()): bool {
     match t { Void => true; _ => false }
 }
 
-// (S-mem) two ptr inners equal: both null (opaque ptr) → equal; one null → not; else by type.
-fn ptr_inner_eq(a: Type | null, b: Type | null) -> bool {
+fn ptr_inner_eq(a: @Type() | null, b: @Type() | null): bool {
     match a {
-        null => match b { null => true; Type => false }
-        Type as ta => match b { null => false; Type as tb => type_eq(ta, tb) }
+        null => match b { null => true; (@Type()) as _gt5 => false }
+        (@Type()) as ta => match b { null => false; (@Type()) as tb => type_eq(ta, tb) }
     }
 }
 
-// nominal type equality (B.13): structural over the shape, but Named is by name.
-fn type_eq(a: Type, b: Type) -> bool {
+pub fn is_str_type(t: @Type()): bool {
+    match t {
+        Named as nm => nm.name == "teko::base::str"
+        _ => false
+    }
+}
+
+pub fn type_eq(a: @Type(), b: @Type()): bool {
     match a {
         Prim as pa => match b { Prim as pb => pa.kind == pb.kind; _ => false }
         Byte => match b { Byte => true; _ => false }
-        Char => match b { Char => true; _ => false }   // char == char only (distinct from byte / []byte)
-        Str => match b { Str => true; _ => false }
-        Error => match b { Error => true; _ => false }   // native `error`
-        Void => match b { Void => true; _ => false }   // return-only marker
-        // []T == []U iff elements equal (built-in unary former). A `teko::list::empty()` carries
-        // the SENTINEL slice (its element is the `Void` marker; the C twin uses a NULL element
-        // pointer): it unifies with ANY concrete slice, so a bare `empty()` flows into a typed slot
-        // / a `push` whose item fixes the element type. A real slice never has a `void` element.
+        Char => match b { Char => true; _ => false }
+        Error => match b { Error => true; Named as nb => nb.name == "teko::checker::Error"; _ => false }
+        Void => match b { Void => true; _ => false }
         Slice as sa => match b {
             Slice as sb => {
                 match sa.element { Void => true; _ => match sb.element { Void => true; _ => type_eq(sa.element, sb.element) } }
             }
             _ => false
         }
-        // T? == U? iff inners equal (built-in unary former, like Slice). A bare `null` literal
-        // carries the SENTINEL optional (its inner is the `Void` marker — REBOOT_PLAN §202; the
-        // C twin uses a NULL inner pointer): it unifies with ANY concrete optional, so `if`/
-        // `match` arms and binding/return slots accept it. The concrete type wins at the
-        // destination (via assignable / emit_as). A real optional never has a `void` inner.
-        Optional as oa => match b {
-            Optional as ob => {
-                match oa.inner { Void => true; _ => match ob.inner { Void => true; _ => type_eq(oa.inner, ob.inner) } }
-            }
-            _ => false
-        }
-        Named as na => match b { Named as nb => na.name == nb.name; _ => false }
+        Named as na => match b { Named as nb => na.name == nb.name; Error => na.name == "teko::checker::Error"; Null => na.name == "teko::checker::Null"; _ => false }
         Variant as va => match b { Variant as vb => types_eq(va.members, vb.members); _ => false }
         Func as fa => match b {
             Func as fb => type_eq(fa.ret, fb.ret) && types_eq(fa.params, fb.params)
             _ => false
         }
-        Ptr as pa => match b { Ptr as pb => ptr_inner_eq(pa.inner, pb.inner); _ => false }   // ptr<T> equal by pointed type (null inner = opaque ptr)
-        Uptr => match b { Uptr => true; _ => false }   // (C7.1a) opaque, same-kind only
-        Reference as ra => match b { Reference as rb => type_eq(ra.inner, rb.inner); _ => false }   // (MEM-1b) Ref<T> equal by referenced type (never null)
-        Null => match b { Null => true; _ => false }
+        Ptr as pa => match b { Ptr as pb => ptr_inner_eq(pa.inner, pb.inner); _ => false }
+        Uptr => match b { Uptr => true; _ => false }
+        Reference as ra => match b { Reference as rb => type_eq(ra.inner, rb.inner); _ => false }
+        Null => match b { Null => true; Named as nb => nb.name == "teko::checker::Null"; _ => false }
     }
 }
 
-// element-wise equality of two type lists (same length, each equal in order).
-fn types_eq(xs: []Type, ys: []Type) -> bool {
+fn types_eq(xs: []@Type(), ys: []@Type()): bool {
     if xs.len != ys.len { return false }
-    mut i = 0
+    var i = 0
     loop {
         if i >= xs.len { break }
         if !type_eq(xs[i], ys[i]) { return false }
@@ -194,25 +148,17 @@ fn types_eq(xs: []Type, ys: []Type) -> bool {
     true
 }
 
-// (MEM Step 0) ESCAPE-GATE PREDICATE — does `t` carry a Reference anywhere a value can be stored?
-// The invariant: a Reference may appear ONLY as a bare scalar function PARAMETER; in EVERY other
-// value position it is forbidden, even nested. So this returns true if t IS a Reference, OR a Slice
-// whose element contains a ref, OR an Optional whose inner contains a ref, OR a Variant any of whose
-// members contains a ref. Recursive. The annotated forms are already caught by resolve (R2/R4), but
-// an INFERRED slice/optional element (e.g. `let xs = [r, r]`) only surfaces here. C: tk_type_contains_ref.
-fn type_contains_ref(t: Type) -> bool {
+fn type_contains_ref(t: @Type()): bool {
     match t {
         Reference => true
         Slice as s => type_contains_ref(s.element)
-        Optional as o => type_contains_ref(o.inner)
         Variant as v => types_contain_ref(v.members)
         _ => false
     }
 }
 
-// any-of helper for type_contains_ref over a variant's member list.
-fn types_contain_ref(xs: []Type) -> bool {
-    mut i = 0
+fn types_contain_ref(xs: []@Type()): bool {
+    var i = 0
     loop {
         if i >= xs.len { break }
         if type_contains_ref(xs[i]) { return true }
@@ -221,26 +167,12 @@ fn types_contain_ref(xs: []Type) -> bool {
     false
 }
 
-/**
- * is_ref_null_variant — is `t` the two-member absence union `Ref<T> | null` (exactly one `Null`
- * member and one `Reference` member, in either source order)? This is the SOLE ref-bearing shape the
- * null-union C3 resolve gate admits (owner D3), and the ONE shape whose LOCAL binding null-union C5
- * lifts out of the "references are parameter-only" restriction: the borrow-spine still proves the
- * handle does not outlive its referent, and the universal narrowing invariant fences the deref (a
- * `Ref<T> | null` cannot be dereferenced until narrowed to a bare `Ref<T>`), so the bare-reference R2
- * promise stays sound. Any other ref-carrying type (a bare `Reference`, a slice/optional/struct that
- * reaches a `Reference`, a `> 2`-member union) is NOT this shape and stays rejected.
- *
- * @param t  the resolved type to classify
- * @return   true iff `t` is a `Variant` whose members are exactly `{ null, Reference }`
- * @since 0.3.0.30 (null-union C5)
- */
-fn is_ref_null_variant(t: Type) -> bool {
-    let ms = match t { Variant as v => v.members; _ => return false }
+fn is_ref_null_variant(t: @Type()): bool {
+    var ms = match t { Variant as v => v.members; _ => return false }
     if ms.len != 2 { return false }
-    mut has_null = false
-    mut has_ref = false
-    mut i = 0
+    var has_null = false
+    var has_ref = false
+    var i = 0
     loop {
         if i >= ms.len { break }
         match ms[i] {

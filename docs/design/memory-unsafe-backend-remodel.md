@@ -1,7 +1,15 @@
 # Remodel: Memory Model + `unsafe` + Own Backend — Design Base
 
+> **SUPERSEDED-by-§6 (0.3.1 surface migration, 2026-08-11).** The `unsafe`-by-TYPE seal this
+> document ratified LOST ITS FUNCTION and was RETIRED by §6 of `mudancas-superficie-0.3.1.md`
+> (see `plano-secao6-aposentar-unsafe.md`): with an opaque `ptr` + `__wrap<T>()` (§5) there is no
+> raw operation left to guard, so the `unsafe` keyword, its contagion, and the manual-memory
+> surface (`mem::free`/`#must_free`/`Arena`/`RawBuf`/`Owned<T>`) were removed from the language.
+> This document is KEPT as ratified base (memory safety = arena capability + lifetime + F1), not
+> deleted; only the `unsafe` seal it describes is historical.
+
 **Status:** RATIFIED by the owner 2026-07-06. This document is the base for a **parallel
-remodel branch**. It records the decisions from the memory-model / VM / backend discussion so
+remodel branch**. It records the decisions from the memory-model and backend discussion so
 the branch starts from a settled design and does not re-litigate.
 
 Teko is a **functional, no-GC, systems-capable** language whose apps come **after the compiler is
@@ -12,9 +20,9 @@ the model is for the user programs Teko will host.
 
 ## 0. The honest framing — what "the memory problem" is, and is not
 
-- **The 1.5 GB was the VM, not the arena.** Isolation (measured): pure codegen ≈ 366 MB; the old
-  VM test-gate ≈ 1566 MB (the VM's functional-env O(n) rebuild interpreting the whole `#test`
-  corpus in-process adds ~1.2 GB). `#324` flipped the gate VM→native → ~937 MB, VM out of the
+- **Previously, 1.5 GB was consumed by legacy-engine test execution, not the arena.** Isolation (measured): pure codegen ≈ 366 MB; the old
+  test-gate with the legacy engine ≈ 1566 MB (the functional-env O(n) rebuild running the whole `#test`
+  corpus in-process added ~1.2 GB). `#324` moved the gate to native execution → ~937 MB, removing the legacy engine from the
   per-PR gate. The compiler's own arena is ~366 MB, a **safe batch leak-to-root** (it exits; the OS
   reclaims). It is NOT a runaway.
 - **The 8.5 GB → 293 MB self-host win was already banked** by the arena machinery (free-list reuse +
@@ -105,7 +113,7 @@ to the (lexical, safe) `adopt { }`.
 
 ```teko
 unsafe #must_free type Arena = ...        // both markers coexist on the TypeDecl (U1 is_unsafe + S2 must_free)
-unsafe fn build() -> i64 {
+unsafe fn build(): i64 {
     mut a = Arena::new()                  // tk_region_new (fresh child region)
     let p = a.alloc<Node>(...)            // ptr<Node> attached to a's lifetime
     mem::free(a)                          // bulk-free the whole region (the #must_free consume)
@@ -160,33 +168,33 @@ valid segment), OR name the namespace `teko::mem::raw` and reserve `unsafe` as a
 
 ---
 
-## 4. VM & backend direction
+## 4. Backend direction (legacy engine retired)
 
 - **Build a new own AOT backend + linker**, to leave C codegen + external `cc`/linker. North-star:
   toolchain independence, compile speed, the bare-metal/OS vision.
-- **The VM retires** (eventually). Its roles and their fates:
-  - `teko run` (interpret, `driver.tks:207`) — **unused today**; the own-backend's fast AOT replaces it.
-  - **REPL** (`teko repl`, `vm::exec_stmt`) — the **one role to decide**: an interactive REPL is
-    naturally an interpreter; on an AOT backend it becomes compile-and-run-per-line, or keep a minimal
+- **The legacy engine has been retired.** Its roles were handled as follows:
+  - `teko run` (`driver.tks:207`) — **unused today**; the own-backend's fast AOT replaces it.
+  - **REPL** (`teko repl`) — was the one role to decide: an interactive REPL wants
+    a legacy engine; on an AOT backend it becomes compile-and-run-per-line, or keep a minimal
     tree-walker just for it. **Decide consciously.**
-  - **Differential (`diff_vm_native`)** — the VM was "often the wrong side," so the oracle is noisy.
+  - **Differential** — the legacy engine was "often the wrong side," so the oracle became noisy and was replaced.
     It **migrates** to **C-backend vs own-backend** (both native, C-backend trusted/self-hosting) — a
     *stronger* oracle that validates the new backend exactly when it is born. Then retire the C-backend.
-  - **LSan with per-`#test` arena rewind** — the VM gate's rewind (`tk_arena_push/pop`) is what makes
+  - **LSan with per-`#test` arena rewind** — the legacy engine gate's rewind (`tk_arena_push/pop`) was what made
     leak-detection *meaningful* (LSan sees leaks beyond the rewound set). The native gate runs
     without rewind → the arena holds everything to exit → LSan cannot tell a deliberate hold from a
     real leak (this broke `#327`'s native lane; fixed by `detect_leaks=0` there). **LSan's meaningful
-    home is a per-test-rewound run — the nightly VM lane**, if leak coverage is wanted.
+    home would be a per-test-rewound run — which is no longer available after the legacy engine was retired**.
   - **No comptime / const-eval dependency** — VERIFIED (`escape`/`fold` in the checker are type-table
-    folds, not VM evaluation). This is what **de-risks** retiring the VM: killing it does not break
+    folds, not separate evaluation). This de-risked the legacy engine's retirement: its removal does not break
     *compilation*.
 - **The native-ASan gate is a rolling UB audit** of the production native path — it has already
   driven root fixes for the `#291` trait-vtable function-pointer UB, `tk_mul_u16` overflow, and the
-  systemic arena `__int128` under-alignment. This hardening is the right prep for a VM-less future
+  systemic arena `__int128` under-alignment. This hardening was right prep for a native-only future
   where native is the sole path.
-- **Sequence:** keep C-transpile shipping; build the own-backend validated against it; flip when
-  trusted; then retire the VM (or its noisy differential earlier). Do **not** retire the VM
-  differential *before* C-vs-own is in place — unless the VM's noise already exceeds its signal.
+- **Sequence (executed):** kept C-transpile shipping; built the own-backend validated against it; flipped when
+  trusted; then retired the legacy engine and its differential. This was the right order: completing C-vs-own first ensured
+  we had a solid alternative before removing the legacy engine.
 
 ---
 
@@ -249,5 +257,5 @@ to learn whether it layers or replaces. `unsafe` is a **type/function modifier**
 ownership, nominal containment, contagious by composition) and ships **first**, independent of the
 spine. `adopt` is the opt-in cyclic-reclamation closer, reusing the arena tree. The surface cost is
 tiny (contextual keywords + a few declaration modifiers + `use path::[…]`). In parallel, build the
-**own AOT backend + linker**; validate it against the trusted C-backend (the differential migrates
-there from the VM); retire the VM when its remaining roles (REPL, LSan-with-rewind) are decided.
+**own AOT backend + linker**; validate it against the trusted C-backend (the differential moved
+to backend-vs-backend comparison); the legacy engine has been retired with its roles (REPL, LSan-with-rewind) handled or discontinued.

@@ -52,7 +52,7 @@ because redefinition is a legislative act.)*
 | `bigint` | **A NAMED NATIVE numeric type, deferred** (runtime-backed, heap-limb bignum) — it enters the native set when its runtime is built. ↺ **Supersedes B.30's "library type (evolution), not native"**: the legislator's B.38 numeric set names `bigint` as native-but-deferred; the sign-check (B.22) still removes the comparison ceiling, so `bigint` is not *needed* for ordering, but it is legislated as a named native type, staged behind its runtime. | **M.0** (native arbitrary-precision is metal-adjacent) **+ M.4** (deferred behind its runtime) **+ M.5** | → HISTORY §B.30, §B.38 |
 | Native numeric set / floats | **The native set is `u8…u64`/`i8…i64` + `f32`/`f64` + `dec` + `bigint`, plus `bool`/`byte`.** ↺ **Supersedes B.38's `u8…u128`/`i8…i128` + `f16`/`f32`/`f64` set — drop-128 (2026-07-24) REMOVES `i128`/`u128`/`f16` from the language entirely** (a caller needing more than 64 bits writes a `123bi` BigInt literal or uses `Decimal`); floats stay UN-DEFERRED at `f32`/`f64`. `dec`/`bigint` remain named-but-deferred. Float rulings unchanged: literal `3.14`/`1.5e3` defaults to **`f64`** (f32 by annotation); float ÷0 **PANICS**; `float↔int` via `to` is **runtime-guarded** (truncates toward zero; doesn't-fit/NaN/∞ → panic). | **M.0** (the widths exist on the metal) **+ M.1** (÷0 + conversion panic — no silent loss/poison; a literal beyond `u64::MAX` is a hard compile error, never silent truncation) **+ M.3** (explicit literal default + annotation; each type names what it is; the removed types honest-stop naming the escape hatch) **+ M.5** (austerity — the 128-bit carriers/topology were pure weight with no intrinsic use) | → HISTORY §B.38, §B.40 |
 | Three-way comparison | `compare → Ordering`, an **`enum`** `{ Less=-1; Equal=0; Greater=1 }` (i8-backed). | **M.0 ≺ M.3 ≺ M.5** | → HISTORY §B.31 |
-| Closures | **Magic closures banned** (M.3 — they lie); **stateless function passing is SEED** (`fn(args)->ret` type, bare-name passing, no `&`, top-level only); stateful forms `use`/`inject` are evolution; DI lifetimes are `#` directives. | **M.3** (primary) | → HISTORY §B.10 |
+| Closures | **Magic closures banned** (M.3 — they lie); **stateless function passing is SEED** (`fn(args):ret` type, bare-name passing, no `&`, top-level only); stateful forms `use`/`inject` are evolution; DI lifetimes are `#` directives. | **M.3** (primary) | → HISTORY §B.10 |
 | `static` | **Banned** (disguised global state). Replacement: DI (`inject`) + singleton — evolution. `static` distinct from `inject`. | **M.1** + **M.5** | → HISTORY §B.25, §B.10 |
 | Numeric conversions (`to`) | **Any defined numeric→numeric conversion is allowed** (incl. byte↔int — byte AS u8, B.36; **and `float↔int`, `int→float`, `float→float` widths — B.38**), incl. narrowing/sign (`i32 to i8`, `i32 to u32`); loss is **caught, never silent**. **Validating whether a conversion is possible lives at RUNTIME** — an impossible conversion (the value doesn't fit; `float→int` overflow / `NaN` / `∞`, which truncates toward zero else **PANICS** — B.38) **PANICS** (debug AND release; parity with ÷0/OOB). **Constants are the exception**: a constant out of range is a **compile error** (fail early, static). `bool`↔num and non-numeric = undefined → compile error. **Supersedes** the early "forbid every lossy conversion at compile time" *and* the interim "defined-release truncation" (↺ refined: conversions panic, they do not wrap); **extended to `float↔int` — B.38**. | **M.1** (forbids *silent* loss; the panic-guard cures it — fail loudly) **+ M.0** (keep the metal conversion attempt) **+ §II** (parity with ÷0/OOB) | → HISTORY conversions block, §B.38 |
 | `AltPattern` axis (`\|` in `match`) | An `Alt` option may be a **value pattern** (literal/range) **or a bare variant case** (`BindPattern`, `has_binding=false`) — so `RED \| GREEN` against a variant subject is legal and **counts toward variant-axis exhaustiveness** (C7b expands it). **Bindings inside an `Alt` option are forbidden** (`Foo as x \| Bar`, or a `FieldPattern` inside `\|`) → error. **Supersedes** A.14's "Alt = value axis only" annotation (the canonical axis-exclusive parse). | **M.0** (alternation is generous; `\|` already means "one of these" in the type grammar) **+ M.2** (legible at the call site) **+ M.5** (one unified parse path) **+ M.1** (exhaustiveness stays sound: Alt expands, bindings excluded by construction) | → HISTORY §A.14 (↺ Alt axis) |
@@ -93,7 +93,7 @@ because redefinition is a legislative act.)*
   generics).** `T?` in type position, `?.` safe access, `??` Elvis. **A variant member cannot be
   nullable**: `Value? | i32` is illegal → declare `type Val = Value | i32` and mark the *return*
   `-> Val?`. The two failure domains are **disjoint**: value-absence → `?.`/`??`; recoverable error →
-  `match`. The seed implements `T?` **fully** (model + parser + checker + codegen + VM). **Governing
+  `match`. The seed implements `T?` **fully** (model + parser + checker + codegen). **Governing
   Law: M.1** (disjoint domains, each fully handled; nullable-member excluded by construction) **+ M.2**
   (`?` marks nullability at the type). *(Canon: REBOOT_PLAN §202–203; §75 below. → HISTORY §B.2, §B.37.)*
 - **`error` is the NATIVE lowercase type.** It **supersedes** `Error` / `teko::Error` / `Valor |
@@ -217,7 +217,7 @@ because redefinition is a legislative act.)*
   literals are **`str` (`"…"`)** and **`byte` (`b'+'`)**; the lexer is **byte-level** (matches ASCII syntax
   with byte literals, collects string bytes). `str` **always validates** — UTF-8 is **forced**: a `str`
   *means* valid UTF-8, so it *is* (the invariant), guaranteed from the bootstrap via the always-on
-  `str_from_utf8(bytes) -> str | error` (↺ `error` lowercase native — B.37). **Governing Law: M.3** (UTF-8 named; `str` cannot lie about being
+  `str_from_utf8(bytes): str | error` (↺ `error` lowercase native — B.37). **Governing Law: M.3** (UTF-8 named; `str` cannot lie about being
   valid) **+ M.1** (valid by construction) **+ B.12/B.13.** *(→ HISTORY §B.36.)*
 - **A *fixed* `char` is rejected; the *variable* `char = []byte` is alpha-native.** A UTF-8 codepoint is
   variable (1–4 bytes), so a fixed `char = [4]byte` would lie; the honest **`char = []byte`** (the variable
@@ -343,7 +343,7 @@ because redefinition is a legislative act.)*
   and resolved — is deferred until the phases are finalized.)*
 - **The Teko file-extension registry (legislator, 2026-06-24).** The canonical set, each name one role:
   - **`.tks`** — *Teko Source* (a source file; namespace = its directory).
-  - **`.tkt`** — *Teko Test* (a test file; runs on the VM in the test sub-profile, beside its `.tks`, never an artifact).
+  - **`.tkt`** — *Teko Test* (a test file; runs natively in the test sub-profile, beside its `.tks`, never an artifact).
   - **`.tkp`** — *Teko Project* (the TOML manifest: name/source/artifact/dependencies/aliases — B.33).
   - **`.tkb`** — *Teko Binary* (the serialized **typed tree** / Teko IL — NOT a native `.o`; the pre-linker's unit).
   - **`.tkh`** — *Teko Header* (the `exp` **interface** a consumer type-checks against — the `pub`/`exp` surface).
@@ -357,9 +357,9 @@ because redefinition is a legislative act.)*
   `cc` produced the binary — HISTORY §B.34/§B.35; TEKO_ROADMAP_BINARY Fase 2 "TC"). **Sequencing (M.4):
   conclude ALL current work FIRST**, then build the native backend — it is not started until the rest is done.
   **Transpile-to-C is REVOKED as the PRIMARY/shipping backend but RETAINED — kept fully equalized — as a
-  permanent FALLBACK and a DIFFERENTIAL-CORRECTNESS COMPARATIVE** (legislator, 2026-06-24). So THREE execution
-  paths must stay behaviorally equivalent: the **VM (`.tkb` interpreter, stage-1)**, the **transpile-to-C/`cc`
-  path** (fallback + comparative), and the future **native backend** (primary). **Every wave (value layer,
+  permanent FALLBACK and a DIFFERENTIAL-CORRECTNESS COMPARATIVE** (legislator, 2026-06-24). So the execution
+  paths must stay behaviorally equivalent: the **transpile-to-C/`cc`
+  path** (fallback + comparative), and the **native backend** (primary). **Every wave (value layer,
   execution, …) lands in ALL active paths** — codegen is NOT frozen. **Governing Law: M.0** (native code is the
   metal *ethos*, no C middleman) **+ M.4** (build order — finish the front/middle before the new back) **+ M.1**
   (three agreeing paths = differential-correctness safety net) **+ M.3** (the shipping path is honestly native).
@@ -394,7 +394,7 @@ because redefinition is a legislative act.)*
   is an **ethos** (no GC, no hidden runtime, no managed heap; you control memory via arenas — B.7; visible
   costs; a thin, explicit host boundary), **not** a deployment target — fully compatible with a host OS.
   **Bare-metal** (no OS, drivers, bare hardware) is the **aspiration**, years away. Three materialization
-  stages (build-order): **(1) `.tkb`** — IL/bytecode, interpreted, the first materialization and bootstrap
+  stages (build-order): **(1) `.tkb`** — the serialized IL form, the first materialization and bootstrap
   step; **(2) AOT-native on a host OS** — the **LTS**, the ethos fully realized, **what ships**; **(3)
   bare-metal** — the aspiration, isolated behind the IO boundary. Teko ships stage 2 and **never claims**
   stage 3 for what ships; "metal" reads as the ethos, never as bare-metal. **Governing Law: M.3** (the
@@ -403,14 +403,14 @@ because redefinition is a legislative act.)*
   CONSTITUTION M.0; HISTORY §B.34.)*
   - **First-binary realization = TRANSPILE-TO-C.** Stage 2 (AOT-native) is first realized by **lowering the
     typed tree to C** and letting the host `cc` produce the binary — reusing the toolchain (**M.5**), not a
-    bespoke native codegen. **Both execution modes are planned:** transpile-to-C/AOT (first) and the **stage-1
-    `.tkb` VM/interpreter** — the VM is a **future mode** (not dropped), it just does not gate the first binary
-    (it needs the statement/program `.tkb` codec, today expression-only). The path is TEKO_ROADMAP_BINARY.md.
+    bespoke native codegen. Native AOT is the execution model; the `.tkb` serialized form is the
+    packaging/bootstrap IL (it needs the statement/program `.tkb` codec, today expression-only). The path
+    is TEKO_ROADMAP_BINARY.md.
     *(legislator's choice — → HISTORY first-binary backend.)*
-- **IO is slurp (whole-file `[]byte`), not streams — for the seed.** `read_file(path) -> []byte | error`,
-  (open, read all, close), `write_file(path, []byte) -> error?` (↺ superseded the **illegal**
+- **IO is slurp (whole-file `[]byte`), not streams — for the seed.** `read_file(path): []byte | error`,
+  (open, read all, close), `write_file(path, []byte): error?` (↺ superseded the **illegal**
   `-> () | Error` void-in-variant — a fallible-no-value fn is `error?`, null = ok / `error` = failure,
-  B.37), `write_err([]byte) -> void` (stderr; ↺ `-> void` return marker, B.37). **Streams are deferred**
+  B.37), `write_err([]byte)` (stderr; ↺ `-> void` return marker, B.37). **Streams are deferred**
   (they enter when large inputs justify the weight). `read_file` returns **raw `[]byte`** (octets), not
   `[]u8` — a file *is* bytes; interpreting them as text (UTF-8 → `char` → `str`) is a separate step
   (`byte` is distinct from `u8` — B.12). **Governing Law: M.5** (small files don't justify stream weight)
@@ -419,14 +419,14 @@ because redefinition is a legislative act.)*
 - **The IO boundary (`teko::io`) is the thin, named, swappable host edge.** The stdlib module doing
   file/console IO is the isolated boundary between Teko and the host; its **interface** (`read_file`,
   `write_file`) is **stable across the stages**, while its **implementation** descends the stack
-  (interpreter syscalls → AOT syscalls → bare-metal drivers). The aspiration is reached by swapping the
+  (host syscalls → AOT syscalls → bare-metal drivers). The aspiration is reached by swapping the
   implementation, not redesigning. **Governing Law: M.4** (a clean isolated layer) **+ M.3** (named, not
   magic) **+ M.0** (thin over syscalls, no fat IO runtime). *(→ HISTORY §B.35.)*
 
 ### FFI / `extern` (host boundary) — C7.0, ratified 2026-06-27
 
-- **`extern` form — `extern fn name(params) -> ret = "symbol" from "lib"` (no body).** A foreign function is a bodyless `fn` declaration binding a Teko-typed signature to a C symbol via `= "symbol"`, optionally naming its providing library via `from "lib"`. The Teko name is decoupled from the C symbol, so the surface stays idiomatic (`host_exit`, not `_exit`). `from` is **optional**: omitted → the symbol is expected in the implicit host libc — a *legislated* default of the Constitution's stage-2 (AOT-on-host), **not** an inference; `[extern] freestanding = true` drops the implicit libc and makes `from` mandatory on every `extern`. Visibility is the ordinary `pub`/`exp`/private: an `extern` is typically private at a module bottom, wrapped by an `exp fn` host surface (`teko::io`, `teko::fs`, …). **Governing Law: M.5** (reuses the existing `fn` grammar — no new block construct) **+ M.3** (the foreign symbol and library are explicit, never guessed) **+ M.2** (the host boundary is a named, visible declaration). Relates to the `ptr`/`uptr` opaque-pointer clause (Memory & references).
-- **Marshalling is `ptr`-only; one opcode → platform convention.** `extern` params/returns are restricted to the primitives (`i8…i64`/`u8…u64`/`f32`/`f64`/`bool`/`byte`) plus `ptr`/`uptr`/`void`. Aggregates cross the boundary only through EXPLICIT marshalling (`teko::mem::as_ptr(str|[]byte) -> ptr`, `s.len`), never auto-converted — the unsafe seam stays visible (no `extern fn puts(s: str)` magic). Data coming BACK from foreign memory (where `ptr` cannot be dereferenced) uses either a hand-written C shim returning a Teko value, or a SMALL fixed set of bounded copy-in primitives (`str_from_cstr`, `bytes_from_ptr`). errno-style failure is lifted to `T | error` in the Teko wrapper, not in the `extern` (which mirrors the raw ABI 1:1). **Variadic `extern` is forbidden** (unbounded ABI is unsafe — wrap a fixed arity). The whole call lowers to a single `OP_CALL_EXTERN` that each backend lowers to the platform calling convention. **Governing Law: M.0** (one opcode, no per-call magic) **+ M.1** (the unsafe metal is contained and the failure is explicit) **+ M.3** (the marshalling is visible, never pretend-safe).
+- **`extern` form — `extern fn name(params): ret = "symbol" from "lib"` (no body).** A foreign function is a bodyless `fn` declaration binding a Teko-typed signature to a C symbol via `= "symbol"`, optionally naming its providing library via `from "lib"`. The Teko name is decoupled from the C symbol, so the surface stays idiomatic (`host_exit`, not `_exit`). `from` is **optional**: omitted → the symbol is expected in the implicit host libc — a *legislated* default of the Constitution's stage-2 (AOT-on-host), **not** an inference; `[extern] freestanding = true` drops the implicit libc and makes `from` mandatory on every `extern`. Visibility is the ordinary `pub`/`exp`/private: an `extern` is typically private at a module bottom, wrapped by an `exp fn` host surface (`teko::io`, `teko::fs`, …). **Governing Law: M.5** (reuses the existing `fn` grammar — no new block construct) **+ M.3** (the foreign symbol and library are explicit, never guessed) **+ M.2** (the host boundary is a named, visible declaration). Relates to the `ptr`/`uptr` opaque-pointer clause (Memory & references).
+- **Marshalling is `ptr`-only; one opcode → platform convention.** `extern` params/returns are restricted to the primitives (`i8…i64`/`u8…u64`/`f32`/`f64`/`bool`/`byte`) plus `ptr`/`uptr`/`void`. Aggregates cross the boundary only through EXPLICIT marshalling (`teko::mem::as_ptr(str|[]byte): ptr`, `s.len`), never auto-converted — the unsafe seam stays visible (no `extern fn puts(s: str)` magic). Data coming BACK from foreign memory (where `ptr` cannot be dereferenced) uses either a hand-written C shim returning a Teko value, or a SMALL fixed set of bounded copy-in primitives (`str_from_cstr`, `bytes_from_ptr`). errno-style failure is lifted to `T | error` in the Teko wrapper, not in the `extern` (which mirrors the raw ABI 1:1). **Variadic `extern` is forbidden** (unbounded ABI is unsafe — wrap a fixed arity). The whole call lowers to a single `OP_CALL_EXTERN` that each backend lowers to the platform calling convention. **Governing Law: M.0** (one opcode, no per-call magic) **+ M.1** (the unsafe metal is contained and the failure is explicit) **+ M.3** (the marshalling is visible, never pretend-safe).
 - **Library resolution lives in the `.tkp`, indirected by a logical name.** The `.tks` carries only a logical handle (`from "ssl"`); the `.tkp [extern.libs]` table maps that handle to a concrete link spec — so the source stays portable and the platform detail stays in the manifest. Array-element vocabulary: `[]` → `-l<key>` (a leading `lib` stripped); a bare name → `-l<name>`; `static:<name>`/`shared:<name>` → forced static/dynamic linkage; a path (has `/` or a `.a`/`.lib`/`.so`/`.dylib`/`.dll`/`.o` extension) → linked as a direct file (the extension decides static vs shared); a `-flag` element → passed verbatim (the M.5 escape). `[extern] prefer = "static"|"shared"` sets the default linkage; `[extern.search]` adds `-L` paths (**per-OS; a non-existent path is dropped softly, an explicitly-named missing lib file is a hard error**); a shared lib auto-emits an rpath for its resolved directory. `[extern] cc`/`target`/`sysroot` select the C driver/sysroot (musl-ready — a follow-on, subsumed by the C3 own-backend that retires `cc`). A missing symbol at link time produces a fail-loud diagnostic naming the declaration and hinting `from "<lib>"`. **Governing Law: M.4** (platform/link detail in the manifest; portable source) **+ M.2** (the boundary surface is explicit) **+ M.5** (reuse the host linker's flat symbol namespace — no per-symbol lib binding the linker would ignore).
 - **`extern type Name` — a named, distinct, OPAQUE foreign handle.** Lowers to C `void *` (pointer-sized). It is the typed form of `ptr` for handle-based C APIs (`FILE`, `DIR`, `sqlite3`, sockets): `extern type File` makes `File` a nominal type distinct from every other handle and from `ptr`, so the checker forbids mixing a `File` with a `Dir` while C stays the unsafe substrate (the safety lives in Teko — M.3). It is fully OPAQUE: no dereference, no field access, no arithmetic, no construction in Teko code; only an `extern fn` produces or consumes a handle. It is non-null by default; a maybe-null handle is `Name?` (the ordinary `T?` doctrine — there is no separate "null pointer" concept). **Governing Law: M.3** (a typed, honest boundary — not everything is an interchangeable `ptr`) **+ M.5** (small surface, high use — the common FFI shape) **+ M.0** (a handle is one word — no ABI weight). Relates to the pointer-family note below.
 - **Pointer family — one untyped pointer, a named opaque handle, and (deferred) a typed pointer.** `ptr` IS the untyped void pointer (it lowers to `void *`); there is **no `void_ptr`** (a synonym would violate M.5). `extern type Name` is the named opaque handle (above). A *typed* pointer `ptr<T>` (with dereference permitted only behind an explicit unsafe `#repr(C)` context, for reading foreign struct fields) is **deferred to generics (S4)**; it does not affect the calling convention (a pointer is one word, so it sidesteps — never solves — struct-by-value ABI). If S4 generic uniformity ever needs it, `ptr ≡ ptr<void>` (bare `ptr` is canonical; `ptr<void>` is a spelling that normalizes to it; the `void`-as-type-argument exception is scoped to `ptr` alone — `void` stays return-only everywhere else). `uptr` is not parameterizable (it is a numeric address). The SAFE, region-checked, never-null, Teko-internal reference is `ref` (evolution S3) — orthogonal to the unsafe foreign `ptr`. **Governing Law: M.4** (refine with real self-hosting data — ship `ptr` now, `ptr<T>` when generics exist) **+ M.5** (one concept, one canonical name) **+ M.1** (the unsafe pointer and the safe `ref` stay distinct). *(legislator's ruling, 2026-06-27.)*
@@ -698,7 +698,7 @@ because redefinition is a legislative act.)*
 > for writing a type (`parse_type`: simple names, slices `[]T`, unions `A | B`, qualified names
 > `lexer::T` via paths), used throughout the examples' signatures but previously unparseable (A.4's
 > annotation read a single `Ident`); it completes A.4's annotation and is the prerequisite for `fn`.
-> **A.9** is **`fn`** — function declaration (`fn name(params) -> ret { body }`: comma-separated immutable
+> **A.9** is **`fn`** — function declaration (`fn name(params): ret { body }`: comma-separated immutable
 > typed params, required return type via `parse_type`, body a statement block parsed to `}`) and **calls**
 > (`f(args)`, completing `parse_atom` — a path with `(` is a call, without is a variable); `Program`
 > becomes `[]Item` (`Function | Statement`). Parameter binding is the assignment dimension's fourth strand

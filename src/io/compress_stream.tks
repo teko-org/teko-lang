@@ -1,68 +1,33 @@
-/**
- * zip_seal — seal a `MemWriter`'s accumulated bytes into a one-entry ZIP-STORE archive under `name`.
- * A `MemWriter` IS a `Writer`, so any combinator (`copy`, `write_all`) can accumulate the payload;
- * this turns it into a raw archive Buf (a `.tkl`/`.zip` payload) ready to write to disk. Honest
- * naming: ZIP-STORE (method 0, lossless, no compression), NOT gzip — there is no DEFLATE in
- * `teko::compress` yet (reported up as a separate compress roadmap item).
- *
- * @param name  the entry name to store the bytes under
- * @param acc   the accumulator holding the payload bytes
- * @return      the ZIP-STORE archive as a Buf
- * @since IO1
- */
-pub fn zip_seal(name: str, acc: MemWriter) -> Buf {
-    let entry = teko::compress::ZipEntry { name = name; data = acc.content().bytes() }
-    let archive = teko::compress::write_zip([entry])
+/** zip_seal — seal a `MemWriter`'s accumulated bytes into a one-entry ZIP-STORE (uncompressed)
+ * archive under `name`. */
+exp fn zip_seal(name: str, acc: MemWriter): Buf {
+    var entry = teko::compress::ZipEntry { name = name; data = acc.content().bytes() }
+    var archive = teko::compress::write_zip([entry])
     Buf::from_bytes(archive)
 }
 
-/**
- * ZipReader — expose a ZIP-STORE archive's FIRST entry as a one-shot `Reader` VALUE: the first `read`
- * decodes the archive and yields the whole entry as one Buf (or the decode error), every later `read`
- * yields EOF. A CLASS, so the "already delivered" flag advances across dispatched reads; it up-casts
- * into `Reader` and drives any combinator. Mirrors `FileReader`'s whole-buffer-into-the-contract
- * shape (true streaming decompression waits on the arena Buf half).
- */
-pub type ZipReader = class & Reader {
+/** ZipReader — a one-shot `Reader` over a ZIP-STORE archive's first entry: the first `read`
+ * decodes the archive, every later `read` yields EOF. */
+exp type ZipReader = class & Reader {
     /** The raw archive bytes decoded on the first pull. */
     pub archive: Buf
     /** Whether the entry's bytes have already been handed out. */
     pub delivered: bool
 
-    /**
-     * of — a reader over `archive`'s first entry, positioned before its (single) whole-buffer read.
-     *
-     * @param archive  the raw archive bytes
-     * @return         the constructed reader
-     */
-    pub fn of(archive: Buf) -> ZipReader { ZipReader { archive = archive; delivered = false } }
+    /** of — a reader over `archive`'s first entry. */
+    pub static fn of(archive: Buf): ZipReader { ZipReader { archive = archive; delivered = false } }
 
-    /**
-     * read — on the first call, decode and yield the first entry's bytes (the decode error rides the
-     * `Buf | error` channel); on every later call, yield EOF.
-     *
-     * @param max  the requested chunk size (ignored — the whole entry is one chunk)
-     * @return     the entry bytes on the first call, then the empty chunk, or the decode error
-     * @throws     the `read_zip` error on malformed data, or an empty-archive error
-     */
-    pub fn read(self, max: u64) -> Buf | error {
+    /** read — on the first call, decode and yield the first entry's bytes; on every later call,
+     * yield EOF. */
+    pub fn read(max: u64): Buf | error {
         if self.delivered { return Buf::empty() }
         self.delivered = true
         first_entry_buf(self.archive)
     }
 }
 
-/**
- * first_entry_buf — decode a ZIP-STORE archive and return its first entry's data as a Buf, or an
- * `error` on a malformed or empty archive. Extracted so `ZipReader::read` stays a single expression.
- *
- * @param archive  the raw archive bytes
- * @return         the first entry's payload, or an `error`
- * @throws         the `read_zip` error on malformed data, or an empty-archive error
- * @since IO1
- */
-fn first_entry_buf(archive: Buf) -> Buf | error {
-    let entries = match teko::compress::read_zip(archive.bytes()) {
+fn first_entry_buf(archive: Buf): Buf | error {
+    var entries = match teko::compress::read_zip(archive.bytes()) {
         []teko::compress::ZipEntry as e => e
         error as e => return e
     }

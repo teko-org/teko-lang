@@ -1,347 +1,179 @@
 use teko::lir
 
-/**
- * SelCtxX86 — the x86-64 instruction selector's threaded state, mirroring
- * arm64's `SelCtx` (`isel_arm64.tks:132`) over the parallel `MFuncX86`: the
- * in-progress machine function, the neutral `class_of` side-table (`VInfoTable`,
- * REUSED unchanged — it names no ISA instruction), the next fresh scratch VReg
- * id (past the source `LFunc`'s own `next_vreg`, so an isel-introduced
- * temporary — a shift count's landing register or a field-offset immediate —
- * never collides with a LIR-numbered VReg), and the current/next machine-block
- * ids the emit cursor and edge-splitter draw from.
- *
- * @since #386 B1-3
- */
 type SelCtxX86 = struct {
-    /**
-     * func — the machine function built so far.
-     */
     func: MFuncX86
-    /**
-     * vinfo — the neutral `class_of` side-table for every VReg selected so far
-     * (reused from the arm64 isel; it records register file + width only).
-     */
     vinfo: VInfoTable
-    /**
-     * next_scratch — the next fresh scratch VReg id the selector may hand out.
-     */
     next_scratch: u32
-    /**
-     * cur_block — the machine-block id `selctx_x86_emit` currently appends to.
-     */
     cur_block: u32
-    /**
-     * next_block — the next fresh machine-block id `selctx_x86_new_block` hands
-     * out for a split edge block (starts past the highest `LBlock` id so an
-     * edge block never collides with a mirror block).
-     */
     next_block: u32
 }
 
-/**
- * selctx_x86_emit — append `inst` to the selector's current machine block,
- * returning the advanced context.
- *
- * @param SelCtxX86 ctx  the context to extend
- * @param MInstX86 inst  the instruction to append
- * @return SelCtxX86  the advanced context
- */
-fn selctx_x86_emit(ctx: SelCtxX86, inst: MInstX86) -> SelCtxX86 {
+fn selctx_x86_emit(ctx: SelCtxX86, inst: @MInstX86()): SelCtxX86 {
     SelCtxX86 { func = append_minst_x86(ctx.func, ctx.cur_block, inst); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
 }
 
-/**
- * selctx_x86_switch — retarget the context so subsequent `selctx_x86_emit`s
- * append to machine block `block_id` (used when selection moves from one
- * `LBlock`'s mirror to the next, or into a freshly-split edge block).
- *
- * @param SelCtxX86 ctx  the context to retarget
- * @param u32 block_id  the machine-block id to emit into next
- * @return SelCtxX86  the retargeted context
- */
-fn selctx_x86_switch(ctx: SelCtxX86, block_id: u32) -> SelCtxX86 {
+fn selctx_x86_switch(ctx: SelCtxX86, block_id: u32): SelCtxX86 {
     SelCtxX86 { func = ctx.func; vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = block_id; next_block = ctx.next_block }
 }
 
-/**
- * FreshBlockX86 — a freshly-allocated machine block (its id) plus the advanced
- * context that reserved it and appended the empty block to the function.
- *
- * @since #386 B1-3
- */
 type FreshBlockX86 = struct {
-    /**
-     * ctx — the context with the block reserved and appended.
-     */
     ctx: SelCtxX86
-    /**
-     * id — the reserved machine-block id.
-     */
     id: u32
 }
 
-/**
- * selctx_x86_new_block — append a fresh empty machine block (no params — a
- * split edge block carries its merge values as edge moves, never as block
- * params) and hand back its id. The context's emit target is left unchanged;
- * call `selctx_x86_switch` to start emitting into it.
- *
- * @param SelCtxX86 ctx  the context to extend
- * @return FreshBlockX86  the advanced context + the reserved block id
- */
-fn selctx_x86_new_block(ctx: SelCtxX86) -> FreshBlockX86 {
-    let id = ctx.next_block
-    let blk = MBlockX86 { id = id; params = teko::list::empty(); insts = teko::list::empty() }
-    let advanced = SelCtxX86 { func = append_block_x86(ctx.func, blk); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = id + 1 }
+fn selctx_x86_new_block(ctx: SelCtxX86): FreshBlockX86 {
+    var id = ctx.next_block
+    var blk = MBlockX86 { id = id; params = []; insts = teko::collections::Chunked<MInstX86Node>::make() }
+    var advanced = SelCtxX86 { func = append_block_x86(ctx.func, blk); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = id + 1 }
     FreshBlockX86 { ctx = advanced; id = id }
 }
 
-/**
- * selctx_x86_set_vinfo — record `reg_class`/`wide` for VReg `id` in the
- * context's neutral side-table, returning the advanced context.
- *
- * @param SelCtxX86 ctx  the context to extend
- * @param u32 id  the VReg id being recorded
- * @param MRegClass reg_class  its register file
- * @param bool wide  its width flag
- * @return SelCtxX86  the advanced context
- */
-fn selctx_x86_set_vinfo(ctx: SelCtxX86, id: u32, reg_class: MRegClass, wide: bool) -> SelCtxX86 {
+fn selctx_x86_set_vinfo(ctx: SelCtxX86, id: u32, reg_class: MRegClass, wide: bool): SelCtxX86 {
     SelCtxX86 { func = ctx.func; vinfo = vinfo_set(ctx.vinfo, id, reg_class, wide); next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
 }
 
-/**
- * FreshScratchX86 — a freshly-allocated scratch VReg (an isel-only temporary,
- * never a source `LFunc` VReg id) plus the advanced context that reserved it.
- *
- * @since #386 B1-3
- */
 type FreshScratchX86 = struct {
-    /**
-     * ctx — the context with the scratch id reserved.
-     */
     ctx: SelCtxX86
-    /**
-     * reg — the freshly-allocated virtual register operand.
-     */
     reg: MReg
 }
 
-/**
- * selctx_x86_scratch — reserve a fresh scratch VReg in `reg_class` (the
- * field-offset immediate a `LFieldAddr` materializes before its two-address
- * add, or the zero register a generic boolean branch compares against).
- *
- * @param SelCtxX86 ctx  the context to extend
- * @param MRegClass reg_class  which register file the scratch lives in
- * @return FreshScratchX86  the advanced context + the reserved register
- */
-fn selctx_x86_scratch(ctx: SelCtxX86, reg_class: MRegClass) -> FreshScratchX86 {
-    let id = ctx.next_scratch
-    let advanced = SelCtxX86 { func = ctx.func; vinfo = ctx.vinfo; next_scratch = id + 1; cur_block = ctx.cur_block; next_block = ctx.next_block }
+fn selctx_x86_scratch(ctx: SelCtxX86, reg_class: MRegClass): FreshScratchX86 {
+    var id = ctx.next_scratch
+    var advanced = SelCtxX86 { func = ctx.func; vinfo = ctx.vinfo; next_scratch = id + 1; cur_block = ctx.cur_block; next_block = ctx.next_block }
     FreshScratchX86 { ctx = advanced; reg = vreg(id, reg_class) }
 }
 
-/**
- * RAX_X86 — the physical RAX register (GPR id 0), the SysV integer RESULT
- * register isel pins at a value return / call-result site. Distinct from the
- * first integer ARGUMENT register RDI(7): SysV's result register is not its
- * first argument register, unlike AAPCS64 where both are x0 (decision D-A,
- * §3 of the B1 plan), so the result is pinned to RAX directly here rather than
- * read from `arg_reg(...,0)`. A flat-POD `MReg` aggregate const (#594 crumb 9b).
- */
 const RAX_X86: MReg = preg(0, MRegClass::GPR)
 
-/**
- * RCX_X86 — the physical RCX register (GPR id 1), whose low byte `CL` holds a
- * variable shift count. A shift's count operand is moved into RCX before the
- * `shl`/`shr`/`sar dst, cl` (§4.1 of the B1 plan) so the shift instruction
- * itself names only the shifted destination. A flat-POD `MReg` aggregate const
- * (#594 crumb 9b).
- */
 const RCX_X86: MReg = preg(1, MRegClass::GPR)
 
-/**
- * select_const_int_x86 — the `LConstInt` selection: one `mov r64, imm` (the
- * encoder later narrows to `mov r32, imm32` / `movabs r64, imm64` from the
- * value). Defaults to the widest, no-information-loss 64-bit form, matching
- * `LConstInt.val`'s own i64 two's-complement carrier (drop-128, 2026-07-24),
- * since the LIR carries no per-value width for a bare constant.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LConstInt c  the constant op
- * @return SelCtxX86  the advanced context
- */
-fn select_const_int_x86(ctx0: SelCtxX86, inst: lir::LInst, c: lir::LConstInt) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+const XMM0_X86: MReg = preg(0, MRegClass::FPR)
+
+fn select_const_int_x86(ctx0: SelCtxX86, inst: lir::LInst, c: lir::LConstInt): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
     selctx_x86_emit(ctx1, movimm_x86(dst, c.val, true))
 }
 
-/**
- * select_const_float_x86 — the `LConstFloat` selection: materializing an IEEE
- * bit pattern into an XMM register needs the SSE move family, the `B1-fp`
- * honest-stop (0.3.1). The integer/control/memory corpus never reaches it (the
- * exit(n) fixtures carry no float literal).
- *
- * @param SelCtxX86 ctx0  the context (unused — the op honest-stops)
- * @param lir::LInst inst  the enclosing instruction (unused)
- * @param lir::LConstFloat c  the float constant op (unused)
- * @return SelCtxX86 | error  always the `B1-fp` honest-stop
- */
-fn select_const_float_x86(ctx0: SelCtxX86, inst: lir::LInst, c: lir::LConstFloat) -> SelCtxX86 | error {
-    error { message = "isel x86-64: B1-fp — a float literal materializes into an XMM register via the SSE move family, the float honest-stop (0.3.1)" }
+fn select_const_float_x86(ctx0: SelCtxX86, inst: lir::LInst, c: lir::LConstFloat): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::FPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::FPR, c.wide)
+    var scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
+    var ctx2 = selctx_x86_emit(scratch.ctx, movimm_x86(scratch.reg, decode_signed64(c.bits), true))
+    if c.wide {
+        return selctx_x86_emit(ctx2, fmov_x86(dst, scratch.reg, true))
+    }
+    var staged = selctx_x86_scratch(ctx2, MRegClass::FPR)
+    var ctx3 = selctx_x86_emit(staged.ctx, fmov_x86(staged.reg, scratch.reg, true))
+    selctx_x86_emit(ctx3, cvt_x86(MCvtOpX86::Cvtsd2ss, dst, staged.reg))
 }
 
-/**
- * select_alu_x86 — the two-address `LBin` selection shared by every integer
- * arithmetic/bitwise x86 ALU case (§4.2 of the B1 plan). x86's `OP dst, src` is
- * destructive (`dst = dst OP src`), so a three-address `r = a OP b` lowers to a
- * COPY of the left operand into the result register followed by the
- * read-modify-write op: `mov dst, a` ; `OP dst, b`. The RMW op reports `dst` as
- * BOTH a def and a use (the shape arm64's `MMovK` already carries), so the
- * shared regalloc handles it unchanged. The extra copy is an honest cost a
- * later coalescer removes; the copy-elision-free correctness-first form always
- * inserts it. The whole two-address concept lives HERE, in the ISA that has it,
- * never in the shared allocator (a regalloc operand-tie is rejected, D-B).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param MAluOpX86 op  the x86 ALU mnemonic (Add/Sub/And/Or/Xor)
- * @param a  the left-operand VReg (copied into dst)
- * @param b  the right-operand VReg (the RMW source)
- * @param bool wide  true for the 64-bit r64 form, false for the 32-bit r32 form
- * @return SelCtxX86  the advanced context
- */
-fn select_alu_x86(ctx0: SelCtxX86, inst: lir::LInst, op: MAluOpX86, a: u32, b: u32, wide: bool) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
-    let ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
+fn select_alu_x86(ctx0: SelCtxX86, inst: lir::LInst, op: MAluOpX86, a: u32, b: u32, wide: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    var ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
     selctx_x86_emit(ctx2, alu_rm_x86(op, dst, vreg(b, MRegClass::GPR), wide))
 }
 
-/**
- * select_imul_x86 — the `IMul` selection: the two-address copy-first shape of
- * `select_alu_x86` over the two-operand `imul dst, src` (§4.1). Unlike the
- * one-operand `imul`/`mul` (which pin RDX:RAX), the two-operand form needs no
- * fixed register, so it rides the same `mov dst, a` ; `imul dst, b` pattern.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param a  the left-operand VReg (copied into dst)
- * @param b  the right-operand VReg (the multiplicand)
- * @param bool wide  true for the 64-bit r64 form, false for the 32-bit r32 form
- * @return SelCtxX86  the advanced context
- */
-fn select_imul_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, b: u32, wide: bool) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
-    let ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
+fn select_imul_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, b: u32, wide: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    var ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
     selctx_x86_emit(ctx2, imul_x86(dst, vreg(b, MRegClass::GPR), wide))
 }
 
-/**
- * select_div_x86 — the `IDivS`/`IDivU`/`IRemS`/`IRemU` selection: one
- * `MDivSeqX86` macro-instruction carrying the whole fixed-register sequence's
- * operands (§4.4). x86 `idiv`/`div` divides `RDX:RAX` by the divisor, quotient
- * into RAX and remainder into RDX, so the RAX/RDX pins + the `cqo`/`xor edx,edx`
- * widening are the encoder's expansion of this one case — isel emits the macro
- * and the shared regalloc (via `inst_regs_x86`, B1-4) reads its RAX/RDX
- * defs+clobbers as the fixed intervals the scan already avoids.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param bool is_signed  true for `idiv`/`cqo`, false for `div`/`xor edx,edx`
- * @param bool is_rem  true for the remainder (RDX), false for the quotient (RAX)
- * @param a  the dividend VReg (moved into RAX before the divide)
- * @param b  the divisor VReg (the `idiv`/`div` r/m operand)
- * @param bool wide  true for the 64-bit r64 form, false for the 32-bit r32 form
- * @return SelCtxX86  the advanced context
- */
-fn select_div_x86(ctx0: SelCtxX86, inst: lir::LInst, is_signed: bool, is_rem: bool, a: u32, b: u32, wide: bool) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+fn select_div_x86(ctx0: SelCtxX86, inst: lir::LInst, is_signed: bool, is_rem: bool, a: u32, b: u32, wide: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
     selctx_x86_emit(ctx1, divseq_x86(dst, vreg(a, MRegClass::GPR), vreg(b, MRegClass::GPR), is_signed, is_rem, wide))
 }
 
-/**
- * select_shift_x86 — the `IShl`/`IShrS`/`IShrU` selection: the two-address
- * copy of the shifted value into `dst`, the count pinned into `CL` (RCX's low
- * byte), then the `shl`/`shr`/`sar dst, cl` (§4.1). The destination is seeded
- * BEFORE the count is pinned so a left operand that happens to occupy RCX is
- * read before `mov cl, b` overwrites it; the shift's implicit RCX use (reported
- * by `inst_regs_x86`, B1-4) keeps the destination off RCX.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param MShiftOpX86 op  the shift mnemonic (Shl/Shr/Sar)
- * @param a  the shifted-value VReg (copied into dst)
- * @param b  the count VReg (moved into CL)
- * @param bool wide  true for the 64-bit r64 form, false for the 32-bit r32 form
- * @return SelCtxX86  the advanced context
- */
-fn select_shift_x86(ctx0: SelCtxX86, inst: lir::LInst, op: MShiftOpX86, a: u32, b: u32, wide: bool) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
-    let ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
-    let ctx3 = selctx_x86_emit(ctx2, mov_x86(RCX_X86, vreg(b, MRegClass::GPR), wide))
+fn select_shift_x86(ctx0: SelCtxX86, inst: lir::LInst, op: MShiftOpX86, a: u32, b: u32, wide: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    var ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
+    var ctx3 = selctx_x86_emit(ctx2, mov_x86(RCX_X86, vreg(b, MRegClass::GPR), wide))
     selctx_x86_emit(ctx3, shift_x86(op, dst, wide))
 }
 
-/**
- * select_icmp_x86 — an integer compare `LBin` used as a plain VALUE (not fused
- * into a branch): `cmp a, b` sets the flags, `setcc dst` materializes the 0/1
- * result (the encoder appends the zero-extend, §6.3). The boolean lands at the
- * narrow (32-bit) width booleans conventionally use.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param MCond cond  the condition code the source opcode picks
- * @param a  the first compared VReg
- * @param b  the second compared VReg
- * @param bool wide  the COMPARED operands' width (true for the 64-bit r64 form)
- * @return SelCtxX86  the advanced context
- */
-fn select_icmp_x86(ctx0: SelCtxX86, inst: lir::LInst, cond: MCond, a: u32, b: u32, wide: bool) -> SelCtxX86 {
-    let ctx1 = selctx_x86_emit(ctx0, cmp_x86(vreg(a, MRegClass::GPR), vreg(b, MRegClass::GPR), wide))
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx2 = selctx_x86_set_vinfo(ctx1, inst.result, MRegClass::GPR, false)
+fn select_icmp_x86(ctx0: SelCtxX86, inst: lir::LInst, cond: MCond, a: u32, b: u32, wide: bool): SelCtxX86 {
+    var ctx1 = selctx_x86_emit(ctx0, cmp_x86(vreg(a, MRegClass::GPR), vreg(b, MRegClass::GPR), wide))
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx2 = selctx_x86_set_vinfo(ctx1, inst.result, MRegClass::GPR, false)
     selctx_x86_emit(ctx2, setcc_x86(dst, cond))
 }
 
-/**
- * bin_fp_stop_x86 — the shared `B1-fp` honest-stop every float `LBin` case
- * (float ALU + float compare used as a value) routes through: the SSE float
- * family is deferred to 0.3.1 (mirrors `A4-fp`).
- *
- * @return SelCtxX86 | error  always the `B1-fp` honest-stop
- */
-fn bin_fp_stop_x86() -> SelCtxX86 | error {
-    error { message = "isel x86-64: B1-fp — an SSE float ALU/compare op is the float-family honest-stop (0.3.1)" }
+fn select_falu_x86(ctx0: SelCtxX86, inst: lir::LInst, op: MFAluOpX86, a: u32, b: u32, dbl: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::FPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::FPR, dbl)
+    var ctx2 = selctx_x86_emit(ctx1, fmov_x86(dst, vreg(a, MRegClass::FPR), dbl))
+    selctx_x86_emit(ctx2, falu_x86(op, dst, vreg(b, MRegClass::FPR), dbl))
 }
 
-/**
- * select_bin_x86 — the `LBin` dispatch (§4.1/§4.2): the two-address integer
- * arithmetic/bitwise selection, the fixed-register div/rem, the CL-count shift,
- * and the value-producing compare — each float case honest-stops via the `_`
- * arm (`bin_fp_stop_x86`). A compare fused into a branch (its result read
- * exactly once, as that branch's condition) emits NOTHING here — the branch
- * re-emits the compare (`select_branch_x86`). `wide` is read from the first
- * operand's recorded `class_of` entry (an SSA guarantee: the operand was
- * selected before this use).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LFunc f  the enclosing function (the fusion test reads its uses)
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LBin b  the binary op
- * @return SelCtxX86 | error  the advanced context, or a `B1-fp` honest-stop
- */
-fn select_bin_x86(ctx0: SelCtxX86, f: lir::LFunc, inst: lir::LInst, b: lir::LBin) -> SelCtxX86 | error {
+fn select_fcmp_value_x86(ctx0: SelCtxX86, dst: MReg, cond: MCond, a: u32, b: u32, dbl: bool): SelCtxX86 {
+    var av = vreg(a, MRegClass::FPR)
+    var bv = vreg(b, MRegClass::FPR)
+    match cond {
+        EQ => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(av, bv, dbl))
+            var ctx2 = selctx_x86_emit(ctx1, setcc_x86(dst, MCond::EQ))
+            var ordered = selctx_x86_scratch(ctx2, MRegClass::GPR)
+            var ctx3 = selctx_x86_emit(ordered.ctx, setp_x86(ordered.reg, true))
+            selctx_x86_emit(ctx3, alu_rm_x86(MAluOpX86::And, dst, ordered.reg, false))
+        }
+        NE => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(av, bv, dbl))
+            var ctx2 = selctx_x86_emit(ctx1, setcc_x86(dst, MCond::NE))
+            var unordered = selctx_x86_scratch(ctx2, MRegClass::GPR)
+            var ctx3 = selctx_x86_emit(unordered.ctx, setp_x86(unordered.reg, false))
+            selctx_x86_emit(ctx3, alu_rm_x86(MAluOpX86::Or, dst, unordered.reg, false))
+        }
+        LT => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(bv, av, dbl))
+            selctx_x86_emit(ctx1, setcc_x86(dst, MCond::HI))
+        }
+        LE => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(bv, av, dbl))
+            selctx_x86_emit(ctx1, setcc_x86(dst, MCond::HS))
+        }
+        GT => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(av, bv, dbl))
+            selctx_x86_emit(ctx1, setcc_x86(dst, MCond::HI))
+        }
+        GE => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(av, bv, dbl))
+            selctx_x86_emit(ctx1, setcc_x86(dst, MCond::HS))
+        }
+        LO => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(bv, av, dbl))
+            selctx_x86_emit(ctx1, setcc_x86(dst, MCond::HI))
+        }
+        LS => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(bv, av, dbl))
+            selctx_x86_emit(ctx1, setcc_x86(dst, MCond::HS))
+        }
+        HI => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(av, bv, dbl))
+            selctx_x86_emit(ctx1, setcc_x86(dst, MCond::HI))
+        }
+        HS => {
+            var ctx1 = selctx_x86_emit(ctx0, fcmp_x86(av, bv, dbl))
+            selctx_x86_emit(ctx1, setcc_x86(dst, MCond::HS))
+        }
+    }
+}
+
+fn select_fcmp_x86(ctx0: SelCtxX86, inst: lir::LInst, cond: MCond, a: u32, b: u32, dbl: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, false)
+    select_fcmp_value_x86(ctx1, dst, cond, a, b, dbl)
+}
+
+fn select_bin_x86(ctx0: SelCtxX86, f: lir::LFunc, inst: lir::LInst, b: lir::LBin): SelCtxX86 | error {
     if cmp_kind_of(b.op).is_cmp && is_fused_compare(f, inst.result) {
         return ctx0
     }
-    let a_info = vinfo_get(ctx0.vinfo, b.a)
+    var a_info = vinfo_get(ctx0.vinfo, b.a)
     match b.op {
         lir::LBinOp::IAdd => select_alu_x86(ctx0, inst, MAluOpX86::Add, b.a, b.b, a_info.wide)
         lir::LBinOp::ISub => select_alu_x86(ctx0, inst, MAluOpX86::Sub, b.a, b.b, a_info.wide)
@@ -366,724 +198,586 @@ fn select_bin_x86(ctx0: SelCtxX86, f: lir::LFunc, inst: lir::LInst, b: lir::LBin
         lir::LBinOp::ICmpGtU => select_icmp_x86(ctx0, inst, MCond::HI, b.a, b.b, a_info.wide)
         lir::LBinOp::ICmpGeS => select_icmp_x86(ctx0, inst, MCond::GE, b.a, b.b, a_info.wide)
         lir::LBinOp::ICmpGeU => select_icmp_x86(ctx0, inst, MCond::HS, b.a, b.b, a_info.wide)
-        _ => bin_fp_stop_x86()
+        lir::LBinOp::FAdd => select_falu_x86(ctx0, inst, MFAluOpX86::FAdd, b.a, b.b, a_info.wide)
+        lir::LBinOp::FSub => select_falu_x86(ctx0, inst, MFAluOpX86::FSub, b.a, b.b, a_info.wide)
+        lir::LBinOp::FMul => select_falu_x86(ctx0, inst, MFAluOpX86::FMul, b.a, b.b, a_info.wide)
+        lir::LBinOp::FDiv => select_falu_x86(ctx0, inst, MFAluOpX86::FDiv, b.a, b.b, a_info.wide)
+        lir::LBinOp::FCmpEq => select_fcmp_x86(ctx0, inst, MCond::EQ, b.a, b.b, a_info.wide)
+        lir::LBinOp::FCmpNe => select_fcmp_x86(ctx0, inst, MCond::NE, b.a, b.b, a_info.wide)
+        lir::LBinOp::FCmpLt => select_fcmp_x86(ctx0, inst, MCond::LT, b.a, b.b, a_info.wide)
+        lir::LBinOp::FCmpLe => select_fcmp_x86(ctx0, inst, MCond::LE, b.a, b.b, a_info.wide)
+        lir::LBinOp::FCmpGt => select_fcmp_x86(ctx0, inst, MCond::GT, b.a, b.b, a_info.wide)
+        lir::LBinOp::FCmpGe => select_fcmp_x86(ctx0, inst, MCond::GE, b.a, b.b, a_info.wide)
     }
 }
 
-/**
- * select_ineg_x86 — the `INeg` selection: the two-address copy of the operand
- * into `dst`, then the read-modify-write `neg dst`.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param a  the operand VReg (copied into dst)
- * @param bool wide  true for the 64-bit r64 form, false for the 32-bit r32 form
- * @return SelCtxX86  the advanced context
- */
-fn select_ineg_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, wide: bool) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
-    let ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
+fn select_ineg_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, wide: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    var ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
     selctx_x86_emit(ctx2, neg_x86(dst, wide))
 }
 
-/**
- * select_inot_x86 — the `INot` selection: the two-address copy of the operand
- * into `dst`, then the read-modify-write `not dst`.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param a  the operand VReg (copied into dst)
- * @param bool wide  true for the 64-bit r64 form, false for the 32-bit r32 form
- * @return SelCtxX86  the advanced context
- */
-fn select_inot_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, wide: bool) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
-    let ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
+fn select_inot_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, wide: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+    var ctx2 = selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
     selctx_x86_emit(ctx2, not_x86(dst, wide))
 }
 
-/**
- * select_identity_mov_x86 — the `Trunc`/`ZExt`/`SExt` selection: a plain
- * register-to-register `mov`. The LIR carries no per-value width for these, and
- * the LIR interpreter oracle treats all three as the identity over its carrier,
- * so a bit-preserving move is the honest match rather than an unfounded narrow
- * form isel has no real type to justify (mirrors arm64's `select_identity_mov`).
- * `Trunc` picks the 32-bit form (its write zeroes the upper half).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param a  the operand VReg
- * @param bool wide  true for the 64-bit r64 form, false for the 32-bit r32 form
- * @return SelCtxX86  the advanced context
- */
-fn select_identity_mov_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, wide: bool) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
+fn select_identity_mov_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, wide: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
     selctx_x86_emit(ctx1, mov_x86(dst, vreg(a, MRegClass::GPR), wide))
 }
 
-/**
- * un_fp_stop_x86 — the shared `B1-fp` honest-stop every float `LUn` case
- * (`FNeg`/`IToF`/`FToI`/`FToF`) routes through: the SSE convert/negate family
- * is deferred to 0.3.1.
- *
- * @return SelCtxX86 | error  always the `B1-fp` honest-stop
- */
-fn un_fp_stop_x86() -> SelCtxX86 | error {
-    error { message = "isel x86-64: B1-fp — an SSE float negate/convert op is the float-family honest-stop (0.3.1)" }
+fn f64_sign_bit_mask_x86(): i64 {
+    MINST_I64_MIN
 }
 
-/**
- * select_un_x86 — the `LUn` dispatch (§4.1): the two-address integer
- * negate/complement, the identity move for the extend/truncate ops, and the
- * `B1-fp` honest-stop for the float negate/convert family (the `_` arm).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LUn u  the unary op
- * @return SelCtxX86 | error  the advanced context, or a `B1-fp` honest-stop
- */
-fn select_un_x86(ctx0: SelCtxX86, inst: lir::LInst, u: lir::LUn) -> SelCtxX86 | error {
-    let a_info = vinfo_get(ctx0.vinfo, u.a)
+fn f32_sign_bit_mask_x86(): i64 {
+    (0) - X86_IMM32_MIN_MAGNITUDE
+}
+
+fn select_bits_cross_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, to_float: bool): SelCtxX86 {
+    var dst_class = if to_float { MRegClass::FPR } else { MRegClass::GPR }
+    var src_class = if to_float { MRegClass::GPR } else { MRegClass::FPR }
+    var dst = vreg(inst.result, dst_class)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, dst_class, true)
+    selctx_x86_emit(ctx1, fmov_x86(dst, vreg(a, src_class), true))
+}
+
+fn select_fneg_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, dbl: bool): SelCtxX86 {
+    var bits = selctx_x86_scratch(ctx0, MRegClass::GPR)
+    var ctx1 = selctx_x86_emit(bits.ctx, fmov_x86(bits.reg, vreg(a, MRegClass::FPR), dbl))
+    var mask = selctx_x86_scratch(ctx1, MRegClass::GPR)
+    var mask_val = if dbl { f64_sign_bit_mask_x86() } else { f32_sign_bit_mask_x86() }
+    var ctx2 = selctx_x86_emit(mask.ctx, movimm_x86(mask.reg, mask_val, dbl))
+    var ctx3 = selctx_x86_emit(ctx2, alu_rm_x86(MAluOpX86::Xor, bits.reg, mask.reg, dbl))
+    var dst = vreg(inst.result, MRegClass::FPR)
+    var ctx4 = selctx_x86_set_vinfo(ctx3, inst.result, MRegClass::FPR, dbl)
+    selctx_x86_emit(ctx4, fmov_x86(dst, bits.reg, dbl))
+}
+
+fn select_itof_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::FPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::FPR, true)
+    selctx_x86_emit(ctx1, cvt_x86(MCvtOpX86::Cvtsi2sd, dst, vreg(a, MRegClass::GPR)))
+}
+
+fn select_ftoi_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, a_wide: bool): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    var op = if a_wide { MCvtOpX86::Cvttsd2si } else { MCvtOpX86::Cvttss2si }
+    selctx_x86_emit(ctx1, cvt_x86(op, dst, vreg(a, MRegClass::FPR)))
+}
+
+fn select_ftof_x86(ctx0: SelCtxX86, inst: lir::LInst, a: u32, a_wide: bool): SelCtxX86 {
+    var dst_wide = !a_wide
+    var op = if a_wide { MCvtOpX86::Cvtsd2ss } else { MCvtOpX86::Cvtss2sd }
+    var dst = vreg(inst.result, MRegClass::FPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::FPR, dst_wide)
+    selctx_x86_emit(ctx1, cvt_x86(op, dst, vreg(a, MRegClass::FPR)))
+}
+
+fn select_un_x86(ctx0: SelCtxX86, inst: lir::LInst, u: lir::LUn): SelCtxX86 {
+    var a_info = vinfo_get(ctx0.vinfo, u.a)
     match u.op {
         lir::LUnOp::INeg => select_ineg_x86(ctx0, inst, u.a, a_info.wide)
         lir::LUnOp::INot => select_inot_x86(ctx0, inst, u.a, a_info.wide)
+        lir::LUnOp::FNeg => select_fneg_x86(ctx0, inst, u.a, a_info.wide)
         lir::LUnOp::Trunc => select_identity_mov_x86(ctx0, inst, u.a, false)
         lir::LUnOp::ZExt => select_identity_mov_x86(ctx0, inst, u.a, a_info.wide)
         lir::LUnOp::SExt => select_identity_mov_x86(ctx0, inst, u.a, a_info.wide)
-        _ => un_fp_stop_x86()
+        lir::LUnOp::IToF => select_itof_x86(ctx0, inst, u.a)
+        lir::LUnOp::FToI => select_ftoi_x86(ctx0, inst, u.a, a_info.wide)
+        lir::LUnOp::FToF => select_ftof_x86(ctx0, inst, u.a, a_info.wide)
+        lir::LUnOp::IToFBits => select_bits_cross_x86(ctx0, inst, u.a, true)
+        lir::LUnOp::FToIBits => select_bits_cross_x86(ctx0, inst, u.a, false)
     }
 }
 
-/**
- * select_param_x86 — the `LParam` selection (§4.5): move the target ABI's
- * integer argument register for the parameter's GPR-class index (SysV
- * RDI/RSI/RDX/RCX/R8/R9; Win64 RCX/RDX/R8/R9), read through `arg_reg(abi, ...)`
- * because neither argument sequence is the contiguous encoding order, into the
- * parameter's VReg. The `abi` descriptor is threaded from the emit driver, so
- * the SAME isel code receives arguments in SysV registers on x86-linux and in
- * the Win64 registers on x86_64-windows (the byte-identical SysV path passes
- * `SYSV64`, exactly the descriptor the old hardcode named). A float-class
- * parameter needs an XMM move (the `B1-fp` stop), and a parameter past the
- * ABI's integer-argument register window the stack-arg slot (the `B1-args`
- * stop).
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LFunc f  the enclosing function (its `param_types`)
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LParam p  the parameter op
- * @return SelCtxX86 | error  the advanced context, or a NAMED honest-stop
- */
-fn select_param_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc, inst: lir::LInst, p: lir::LParam) -> SelCtxX86 | error {
+fn arg_slot_size_x86(reg_class: MRegClass, wide: bool): MMemSizeX86 {
+    if reg_class == MRegClass::FPR {
+        return if wide { MMemSizeX86::F64 } else { MMemSizeX86::F32 }
+    }
+    if wide { MMemSizeX86::Q } else { MMemSizeX86::D }
+}
+
+fn param_class_index_x86(abi: AbiDescriptor, param_types: []lir::LType, index: u32): u32 {
+    if abi.arg_slots_shared { return index }
+    if mregclass_of_ltype(param_types[index to u64]) == MRegClass::FPR {
+        return fpr_index_before(param_types, index)
+    }
+    gpr_index_before(param_types, index)
+}
+
+fn stack_index_before(abi: AbiDescriptor, param_types: []lir::LType, index: u32): u32 {
+    var count: u32 = 0
+    var i: u64 = 0
+    loop {
+        if i >= index { break }
+        var cls = mregclass_of_ltype(param_types[i])
+        if !arg_reg(abi, cls, param_class_index_x86(abi, param_types, i to u32)).ok { count++ }
+        i++
+    }
+    count
+}
+
+fn select_param_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc, inst: lir::LInst, p: lir::LParam): SelCtxX86 | error {
     if p.index >= f.param_types.len {
         return error { message = "isel x86-64: param index out of range (internal)" }
     }
-    let ty = f.param_types[p.index to u64]
-    if mregclass_of_ltype(ty) == MRegClass::FPR {
-        return error { message = "isel x86-64: B1-fp — a float parameter arrives in an XMM register via an SSE move, the float honest-stop (0.3.1)" }
-    }
-    let class_index = gpr_index_before(f.param_types, p.index)
-    let slot = arg_reg(abi, MRegClass::GPR, class_index)
+    var ty = f.param_types[p.index to u64]
+    var reg_class = mregclass_of_ltype(ty)
+    var wide = ltype_is_wide(ty)
+    var is_fpr = reg_class == MRegClass::FPR
+    var slot = arg_reg(abi, reg_class, param_class_index_x86(abi, f.param_types, p.index))
+    var dst = vreg(inst.result, reg_class)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, reg_class, wide)
     if !slot.ok {
-        return error { message = "isel x86-64: B1-args — an integer parameter past the ABI's argument-register window needs the stack-arg slot (0.3.1)" }
+        var stack_index = stack_index_before(abi, f.param_types, p.index)
+        return selctx_x86_emit(ctx1, in_arg_x86(arg_slot_size_x86(reg_class, wide), dst, stack_index))
     }
-    let wide = ltype_is_wide(ty)
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
-    selctx_x86_emit(ctx1, mov_x86(dst, slot.reg, wide))
+    var mv = if is_fpr { fmov_x86(dst, slot.reg, wide) } else { mov_x86(dst, slot.reg, wide) }
+    selctx_x86_emit(ctx1, mv)
 }
 
-/**
- * select_ret_x86 — the `LRet` selection (§4.5): for a value-carrying return,
- * pin the returned VReg into the SysV integer result register RAX (decision
- * D-A — the result register is NOT the first argument register) via `mov`, then
- * emit `ret`; a void return emits `ret` alone. A float return pins XMM0 via an
- * SSE move (the `B1-fp` stop).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LRet r  the return op
- * @return SelCtxX86 | error  the advanced context, or a `B1-fp` honest-stop
- */
-fn select_ret_x86(ctx0: SelCtxX86, r: lir::LRet) -> SelCtxX86 | error {
+fn select_ret_x86(ctx0: SelCtxX86, r: lir::LRet): SelCtxX86 {
     if !r.has_value {
         return selctx_x86_emit(ctx0, ret_x86())
     }
-    let info = vinfo_get(ctx0.vinfo, r.value)
-    if info.reg_class == MRegClass::FPR {
-        return error { message = "isel x86-64: B1-fp — a float return pins XMM0 via an SSE move, the float honest-stop (0.3.1)" }
-    }
-    let ctx1 = selctx_x86_emit(ctx0, mov_x86(RAX_X86, vreg(r.value, MRegClass::GPR), info.wide))
+    var info = vinfo_get(ctx0.vinfo, r.value)
+    var is_fpr = info.reg_class == MRegClass::FPR
+    var pinned = if is_fpr { XMM0_X86 } else { RAX_X86 }
+    var mv = if is_fpr { fmov_x86(pinned, vreg(r.value, MRegClass::FPR), info.wide) } else { mov_x86(pinned, vreg(r.value, MRegClass::GPR), info.wide) }
+    var ctx1 = selctx_x86_emit(ctx0, mv)
     selctx_x86_emit(ctx1, ret_x86())
 }
 
-/**
- * selctx_x86_set_block_param — refine mirror block `block_id`'s parameter at
- * `index` to `reg` in the context's function (the class becomes known when the
- * feeding edge move is selected).
- *
- * @param SelCtxX86 ctx  the context to update
- * @param u32 block_id  the target block
- * @param u32 index  the parameter position
- * @param MReg reg  the refined parameter register
- * @return SelCtxX86  the updated context
- */
-fn selctx_x86_set_block_param(ctx: SelCtxX86, block_id: u32, index: u32, reg: MReg) -> SelCtxX86 {
+fn selctx_x86_set_block_param(ctx: SelCtxX86, block_id: u32, index: u32, reg: MReg): SelCtxX86 {
     SelCtxX86 { func = set_block_param_x86(ctx.func, block_id, index, reg); vinfo = ctx.vinfo; next_scratch = ctx.next_scratch; cur_block = ctx.cur_block; next_block = ctx.next_block }
 }
 
-/**
- * emit_edge_moves_x86 — the parallel-copy of `args` into the block params of
- * `target`, emitted into the current block just before the branch. A plain
- * sequential copy is correct by construction: a block param is always a FRESH
- * VReg (from `add_block_param`), disjoint from every jump arg, so no source is
- * also a destination and no cycle can arise. Each move refines the target
- * param's register class and records the param's `class_of`. A float-class edge
- * value needs an XMM move (the `B1-fp` stop).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LFunc f  the enclosing function (for the target's params)
- * @param u32 target  the destination block id
- * @param args  the block-args this edge supplies, positionally
- * @return SelCtxX86 | error  the advanced context, or a NAMED honest-stop
- */
-fn emit_edge_moves_x86(ctx0: SelCtxX86, f: lir::LFunc, target: u32, args: []u32) -> SelCtxX86 | error {
-    let params = block_params_of(f, target)
+fn emit_edge_moves_x86(ctx0: SelCtxX86, f: lir::LFunc, target: u32, args: []u32): SelCtxX86 | error {
+    var params = block_params_of(f, target)
     if params.len != args.len {
         return error { message = "isel x86-64: edge arg count does not match target block param count (internal)" }
     }
-    mut ctx = ctx0
-    mut i: u64 = 0
+    var ctx = ctx0
+    var i: u64 = 0
     loop {
         if i >= args.len { break }
-        let src = args[i]
-        let src_info = vinfo_get(ctx.vinfo, src)
-        if src_info.reg_class == MRegClass::FPR {
-            return error { message = "isel x86-64: B1-fp — a float block-arg edge move needs an SSE move, the float honest-stop (0.3.1)" }
-        }
-        let dst = vreg(params[i], MRegClass::GPR)
-        let ctx_a = selctx_x86_emit(ctx, mov_x86(dst, vreg(src, MRegClass::GPR), src_info.wide))
-        let ctx_b = selctx_x86_set_block_param(ctx_a, target, i to u32, dst)
-        ctx = selctx_x86_set_vinfo(ctx_b, params[i], MRegClass::GPR, src_info.wide)
+        var src = args[i]
+        var src_info = vinfo_get(ctx.vinfo, src)
+        var dst = vreg(params[i], src_info.reg_class)
+        var mv = if src_info.reg_class == MRegClass::FPR { fmov_x86(dst, vreg(src, MRegClass::FPR), src_info.wide) } else { mov_x86(dst, vreg(src, MRegClass::GPR), src_info.wide) }
+        var ctx_a = selctx_x86_emit(ctx, mv)
+        var ctx_b = selctx_x86_set_block_param(ctx_a, target, i to u32, dst)
+        ctx = selctx_x86_set_vinfo(ctx_b, params[i], src_info.reg_class, src_info.wide)
         i++
     }
     ctx
 }
 
-/**
- * select_jump_x86 — the `LJump` selection: the parallel-copy of its block-args
- * into the target's params, then an unconditional `jmp` to the target (the
- * explicit terminator form — no fall-through emission, §4.1).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LFunc f  the enclosing function
- * @param lir::LJump j  the jump op
- * @return SelCtxX86 | error  the advanced context, or a propagated error
- */
-fn select_jump_x86(ctx0: SelCtxX86, f: lir::LFunc, j: lir::LJump) -> SelCtxX86 | error {
-    let ctx1 = match emit_edge_moves_x86(ctx0, f, j.target, j.args) { SelCtxX86 as c => c; error as e => return e }
+fn select_jump_x86(ctx0: SelCtxX86, f: lir::LFunc, j: lir::LJump): SelCtxX86 | error {
+    var ctx1 = match emit_edge_moves_x86(ctx0, f, j.target, j.args) { SelCtxX86 as c => c; error as e => return e }
     selctx_x86_emit(ctx1, jmp_x86(j.target))
 }
 
-/**
- * EdgeResX86 — a resolved branch edge: the block the branch actually targets
- * (the real block for an empty-arg edge, or a freshly-split edge block that
- * performs the moves then jumps on), plus the advanced context.
- *
- * @since #386 B1-3
- */
 type EdgeResX86 = struct {
-    /**
-     * ctx — the advanced context (edge block appended when one was split).
-     */
     ctx: SelCtxX86
-    /**
-     * block — the machine-block id the branch transfers control to.
-     */
     block: u32
 }
 
-/**
- * resolve_edge_x86 — the landing block for one branch edge. A conditional `jcc`
- * cannot carry moves, so an edge that supplies block-args is split into its own
- * block (the moves, then `jmp` to the real target) and the branch targets that
- * edge block; an empty-arg edge branches straight to its target (the fast path
- * the corpus hits in practice). The current emit target is restored before
- * returning.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LFunc f  the enclosing function
- * @param u32 target  the edge's real destination block
- * @param args  the block-args the edge supplies (empty for the fast path)
- * @return EdgeResX86 | error  the landing block + advanced context, or an error
- */
-fn resolve_edge_x86(ctx0: SelCtxX86, f: lir::LFunc, target: u32, args: []u32) -> EdgeResX86 | error {
+fn resolve_edge_x86(ctx0: SelCtxX86, f: lir::LFunc, target: u32, args: []u32): EdgeResX86 | error {
     if args.len == 0 {
         return EdgeResX86 { ctx = ctx0; block = target }
     }
-    let saved = ctx0.cur_block
-    let fb = selctx_x86_new_block(ctx0)
-    let ctx_in = selctx_x86_switch(fb.ctx, fb.id)
-    let ctx_moved = match emit_edge_moves_x86(ctx_in, f, target, args) { SelCtxX86 as c => c; error as e => return e }
-    let ctx_end = selctx_x86_emit(ctx_moved, jmp_x86(target))
-    let ctx_back = selctx_x86_switch(ctx_end, saved)
+    var saved = ctx0.cur_block
+    var fb = selctx_x86_new_block(ctx0)
+    var ctx_in = selctx_x86_switch(fb.ctx, fb.id)
+    var ctx_moved = match emit_edge_moves_x86(ctx_in, f, target, args) { SelCtxX86 as c => c; error as e => return e }
+    var ctx_end = selctx_x86_emit(ctx_moved, jmp_x86(target))
+    var ctx_back = selctx_x86_switch(ctx_end, saved)
     EdgeResX86 { ctx = ctx_back; block = fb.id }
 }
 
-/**
- * select_fused_branch_x86 — the taken-edge selection when the branch condition
- * is a compare fused into this branch: re-emit the `cmp` over its operands
- * (nothing was materialized at the compare site) then a `jcc` to the taken
- * block. A fused FLOAT compare needs SSE `ucomisd` + a parity-aware `jcc` (the
- * `B1-fp` stop).
- *
- * @param SelCtxX86 ctx1  the context to extend (edges already resolved)
- * @param DefCmp dc  the resolved compare definition (opcode + operands)
- * @param u32 taken  the machine-block id taken when the compare holds
- * @return SelCtxX86 | error  the advanced context, or a `B1-fp` honest-stop
- */
-fn select_fused_branch_x86(ctx1: SelCtxX86, dc: DefCmp, taken: u32) -> SelCtxX86 | error {
-    let ck = cmp_kind_of(dc.op)
-    if ck.is_float {
-        return error { message = "isel x86-64: B1-fp — a fused float compare needs an SSE ucomisd + parity-aware jcc, the float honest-stop (0.3.1)" }
+fn select_fused_float_branch_x86(ctx1: SelCtxX86, cond: MCond, a: u32, b: u32, dbl: bool, taken: u32): SelCtxX86 {
+    match cond {
+        LT => selctx_x86_emit(selctx_x86_emit(ctx1, fcmp_x86(vreg(b, MRegClass::FPR), vreg(a, MRegClass::FPR), dbl)), jcc_x86(MCond::HI, taken))
+        LE => selctx_x86_emit(selctx_x86_emit(ctx1, fcmp_x86(vreg(b, MRegClass::FPR), vreg(a, MRegClass::FPR), dbl)), jcc_x86(MCond::HS, taken))
+        GT => selctx_x86_emit(selctx_x86_emit(ctx1, fcmp_x86(vreg(a, MRegClass::FPR), vreg(b, MRegClass::FPR), dbl)), jcc_x86(MCond::HI, taken))
+        GE => selctx_x86_emit(selctx_x86_emit(ctx1, fcmp_x86(vreg(a, MRegClass::FPR), vreg(b, MRegClass::FPR), dbl)), jcc_x86(MCond::HS, taken))
+        LO => selctx_x86_emit(selctx_x86_emit(ctx1, fcmp_x86(vreg(b, MRegClass::FPR), vreg(a, MRegClass::FPR), dbl)), jcc_x86(MCond::HI, taken))
+        LS => selctx_x86_emit(selctx_x86_emit(ctx1, fcmp_x86(vreg(b, MRegClass::FPR), vreg(a, MRegClass::FPR), dbl)), jcc_x86(MCond::HS, taken))
+        HI => selctx_x86_emit(selctx_x86_emit(ctx1, fcmp_x86(vreg(a, MRegClass::FPR), vreg(b, MRegClass::FPR), dbl)), jcc_x86(MCond::HI, taken))
+        HS => selctx_x86_emit(selctx_x86_emit(ctx1, fcmp_x86(vreg(a, MRegClass::FPR), vreg(b, MRegClass::FPR), dbl)), jcc_x86(MCond::HS, taken))
+        EQ => {
+            var scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
+            var ctx2 = select_fcmp_value_x86(scratch.ctx, scratch.reg, MCond::EQ, a, b, dbl)
+            var zero = selctx_x86_scratch(ctx2, MRegClass::GPR)
+            var ctx3 = selctx_x86_emit(zero.ctx, movimm_x86(zero.reg, 0, false))
+            var ctx4 = selctx_x86_emit(ctx3, cmp_x86(scratch.reg, zero.reg, false))
+            selctx_x86_emit(ctx4, jcc_x86(MCond::NE, taken))
+        }
+        NE => {
+            var scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
+            var ctx2 = select_fcmp_value_x86(scratch.ctx, scratch.reg, MCond::NE, a, b, dbl)
+            var zero = selctx_x86_scratch(ctx2, MRegClass::GPR)
+            var ctx3 = selctx_x86_emit(zero.ctx, movimm_x86(zero.reg, 0, false))
+            var ctx4 = selctx_x86_emit(ctx3, cmp_x86(scratch.reg, zero.reg, false))
+            selctx_x86_emit(ctx4, jcc_x86(MCond::NE, taken))
+        }
     }
-    let a_info = vinfo_get(ctx1.vinfo, dc.a)
-    let ca = selctx_x86_emit(ctx1, cmp_x86(vreg(dc.a, MRegClass::GPR), vreg(dc.bb, MRegClass::GPR), a_info.wide))
+}
+
+fn select_fused_branch_x86(ctx1: SelCtxX86, dc: DefCmp, taken: u32): SelCtxX86 {
+    var ck = cmp_kind_of(dc.op)
+    var a_info = vinfo_get(ctx1.vinfo, dc.a)
+    if ck.is_float {
+        return select_fused_float_branch_x86(ctx1, ck.cond, dc.a, dc.bb, a_info.wide, taken)
+    }
+    var ca = selctx_x86_emit(ctx1, cmp_x86(vreg(dc.a, MRegClass::GPR), vreg(dc.bb, MRegClass::GPR), a_info.wide))
     selctx_x86_emit(ca, jcc_x86(ck.cond, taken))
 }
 
-/**
- * select_boolean_branch_x86 — the taken-edge selection for a generic boolean
- * condition (a value NOT produced by a fused compare): x86 has no
- * compare-and-branch, so the boolean is tested against a materialized zero
- * (`mov scratch, #0` ; `cmp cond, scratch`) and a `jne` takes the edge when the
- * condition is nonzero (true). The `MInstX86` alphabet has no compare-immediate
- * or `test`, so the explicit zero register keeps the selection within the
- * frozen B1-2 IR.
- *
- * @param SelCtxX86 ctx1  the context to extend (edges already resolved)
- * @param u32 cond  the boolean condition VReg
- * @param u32 taken  the machine-block id taken when `cond` is nonzero
- * @return SelCtxX86 | error  the advanced context
- */
-fn select_boolean_branch_x86(ctx1: SelCtxX86, cond: u32, taken: u32) -> SelCtxX86 | error {
-    let c_info = vinfo_get(ctx1.vinfo, cond)
-    let scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
-    let cz = selctx_x86_emit(scratch.ctx, movimm_x86(scratch.reg, 0, c_info.wide))
-    let cc = selctx_x86_emit(cz, cmp_x86(vreg(cond, MRegClass::GPR), scratch.reg, c_info.wide))
+fn select_boolean_branch_x86(ctx1: SelCtxX86, cond: u32, taken: u32): SelCtxX86 | error {
+    var c_info = vinfo_get(ctx1.vinfo, cond)
+    var scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
+    var cz = selctx_x86_emit(scratch.ctx, movimm_x86(scratch.reg, 0, c_info.wide))
+    var cc = selctx_x86_emit(cz, cmp_x86(vreg(cond, MRegClass::GPR), scratch.reg, c_info.wide))
     selctx_x86_emit(cc, jcc_x86(MCond::NE, taken))
 }
 
-/**
- * select_branch_x86 — the `LBranch` selection (§4.1): resolve each edge to a
- * landing block (splitting an arg-carrying edge), emit the conditional `jcc` to
- * the taken edge, then an unconditional `jmp` to the else edge — the explicit
- * pair form the reachability-aware regalloc expects (no fall-through). When the
- * condition is a compare fused into this branch, re-emit `cmp` + `jcc`;
- * otherwise test the boolean condition against zero.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LFunc f  the enclosing function
- * @param lir::LBranch br  the branch op
- * @return SelCtxX86 | error  the advanced context, or a propagated error
- */
-fn select_branch_x86(ctx0: SelCtxX86, f: lir::LFunc, br: lir::LBranch) -> SelCtxX86 | error {
-    let t_land = match resolve_edge_x86(ctx0, f, br.t_target, br.t_args) { EdgeResX86 as r => r; error as e => return e }
-    let f_land = match resolve_edge_x86(t_land.ctx, f, br.f_target, br.f_args) { EdgeResX86 as r => r; error as e => return e }
-    let ctx1 = f_land.ctx
-    let dc = find_cmp_def(f, br.cond)
-    let branched = if dc.found && is_fused_compare(f, br.cond) {
+fn select_branch_x86(ctx0: SelCtxX86, f: lir::LFunc, br: lir::LBranch): SelCtxX86 | error {
+    var t_land = match resolve_edge_x86(ctx0, f, br.t_target, br.t_args) { EdgeResX86 as r => r; error as e => return e }
+    var f_land = match resolve_edge_x86(t_land.ctx, f, br.f_target, br.f_args) { EdgeResX86 as r => r; error as e => return e }
+    var ctx1 = f_land.ctx
+    var dc = find_cmp_def(f, br.cond)
+    var branched = if dc.found && is_fused_compare(f, br.cond) {
         select_fused_branch_x86(ctx1, dc, t_land.block)
     } else {
         select_boolean_branch_x86(ctx1, br.cond, t_land.block)
     }
-    let ctx2 = match branched { SelCtxX86 as c => c; error as e => return e }
+    var ctx2 = match branched { SelCtxX86 as c => c; error as e => return e }
     selctx_x86_emit(ctx2, jmp_x86(f_land.block))
 }
 
-/**
- * mem_size_of_x86 — the load/store transfer size for a machine class: B/W/D/Q
- * for the integer widths (and Ptr = Q). A float access (F32/F64) needs an SSE
- * move (the `B1-fp` stop), and a void-typed access is malformed.
- *
- * @param lir::LType t  the accessed value's machine class
- * @return MMemSizeX86 | error  the transfer size, or a NAMED honest-stop
- */
-fn mem_size_of_x86(t: lir::LType) -> MMemSizeX86 | error {
+fn mem_size_of_x86(t: lir::LType): MMemSizeX86 | error {
     match t {
         lir::LType::I8 => MMemSizeX86::B
         lir::LType::I16 => MMemSizeX86::W
         lir::LType::I32 => MMemSizeX86::D
         lir::LType::I64 => MMemSizeX86::Q
         lir::LType::Ptr => MMemSizeX86::Q
-        lir::LType::F32 => error { message = "isel x86-64: B1-fp — an f32 memory access uses an SSE move, the float honest-stop (0.3.1)" }
-        lir::LType::F64 => error { message = "isel x86-64: B1-fp — an f64 memory access uses an SSE move, the float honest-stop (0.3.1)" }
+        lir::LType::F32 => MMemSizeX86::F32
+        lir::LType::F64 => MMemSizeX86::F64
         lir::LType::Void => error { message = "isel x86-64: a void-typed memory access is malformed (internal)" }
     }
 }
 
-/**
- * select_alloca_x86 — the `LAlloca` selection: reserve a frame slot (its index
- * is the current frame length) and materialize its address with
- * `MFrameAddrX86`; the encoder resolves the slot to an `lea dst, [rsp+off]`
- * (base-RSP forces a SIB byte, §6.5). The address is a Ptr (wide GPR).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LAlloca a  the alloca op (its byte-size/alignment shape)
- * @return SelCtxX86  the advanced context
- */
-fn select_alloca_x86(ctx0: SelCtxX86, inst: lir::LInst, a: lir::LAlloca) -> SelCtxX86 {
-    let slot = ctx0.func.frame.len
-    let ctx1 = SelCtxX86 { func = append_frame_x86(ctx0.func, a); vinfo = ctx0.vinfo; next_scratch = ctx0.next_scratch; cur_block = ctx0.cur_block; next_block = ctx0.next_block }
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx2 = selctx_x86_set_vinfo(ctx1, inst.result, MRegClass::GPR, true)
+fn select_alloca_x86(ctx0: SelCtxX86, inst: lir::LInst, a: lir::LAlloca): SelCtxX86 {
+    var slot = ctx0.func.frame.len
+    var ctx1 = SelCtxX86 { func = append_frame_x86(ctx0.func, a); vinfo = ctx0.vinfo; next_scratch = ctx0.next_scratch; cur_block = ctx0.cur_block; next_block = ctx0.next_block }
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx2 = selctx_x86_set_vinfo(ctx1, inst.result, MRegClass::GPR, true)
     selctx_x86_emit(ctx2, frame_addr_x86(dst, slot))
 }
 
-/**
- * select_field_addr_x86 — the `LFieldAddr` selection: `dst = base + offset`.
- * The `MInstX86` alphabet carries no add-immediate form (the two-address RMW is
- * register-register only), and the general `lea dst, [base+disp]` is not in the
- * B1-2 IR, so the constant offset is materialized into a scratch register
- * (`mov scratch, #offset`) then folded in with the two-address add
- * (`mov dst, base` ; `add dst, scratch`). This stays within the frozen alphabet
- * (smallest blast, M.1); a later pass folds the offset into a following load's
- * `MMem` displacement (§6.4).
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LFieldAddr fa  the field-address op
- * @return SelCtxX86  the advanced context
- */
-fn select_field_addr_x86(ctx0: SelCtxX86, inst: lir::LInst, fa: lir::LFieldAddr) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
-    let scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
-    let ctx2 = selctx_x86_emit(scratch.ctx, movimm_x86(scratch.reg, fa.offset to i64, true))
-    let ctx3 = selctx_x86_emit(ctx2, mov_x86(dst, vreg(fa.base, MRegClass::GPR), true))
+fn select_field_addr_x86(ctx0: SelCtxX86, inst: lir::LInst, fa: lir::LFieldAddr): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    var scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
+    var ctx2 = selctx_x86_emit(scratch.ctx, movimm_x86(scratch.reg, fa.offset to i64, true))
+    var ctx3 = selctx_x86_emit(ctx2, mov_x86(dst, vreg(fa.base_vreg, MRegClass::GPR), true))
     selctx_x86_emit(ctx3, alu_rm_x86(MAluOpX86::Add, dst, scratch.reg, true))
 }
 
-/**
- * select_load_x86 — the `LLoad` selection: `mov dst, [addr + 0]` at the size +
- * register file the loaded `ty` picks. Loads zero-extend (`sign=false`): a
- * narrow value's own producing extend chain already fixed its class, so the
- * load itself does not re-sign.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LLoad l  the load op
- * @return SelCtxX86 | error  the advanced context, or a propagated size error
- */
-fn select_load_x86(ctx0: SelCtxX86, inst: lir::LInst, l: lir::LLoad) -> SelCtxX86 | error {
-    let size = match mem_size_of_x86(l.ty) { MMemSizeX86 as s => s; error as e => return e }
-    let wide = ltype_is_wide(l.ty)
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, wide)
-    selctx_x86_emit(ctx1, load_x86(size, false, dst, MMem { base = vreg(l.addr, MRegClass::GPR); offset = 0 to i32 }))
+fn select_load_x86(ctx0: SelCtxX86, inst: lir::LInst, l: lir::LLoad): SelCtxX86 | error {
+    var size = match mem_size_of_x86(l.ty) { MMemSizeX86 as s => s; error as e => return e }
+    var reg_class = mregclass_of_ltype(l.ty)
+    var wide = ltype_is_wide(l.ty)
+    var dst = vreg(inst.result, reg_class)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, reg_class, wide)
+    selctx_x86_emit(ctx1, load_x86(size, false, dst, MMem { base_reg = vreg(l.addr, MRegClass::GPR); offset = 0 to i32 }))
 }
 
-/**
- * select_store_x86 — the `LStore` selection: `mov [addr + 0], src` at the size
- * the stored `ty` picks. No result VReg.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LStore s  the store op
- * @return SelCtxX86 | error  the advanced context, or a propagated size error
- */
-fn select_store_x86(ctx0: SelCtxX86, s: lir::LStore) -> SelCtxX86 | error {
-    let size = match mem_size_of_x86(s.ty) { MMemSizeX86 as sz => sz; error as e => return e }
-    selctx_x86_emit(ctx0, store_x86(size, vreg(s.value, MRegClass::GPR), MMem { base = vreg(s.addr, MRegClass::GPR); offset = 0 to i32 }))
+fn select_store_x86(ctx0: SelCtxX86, s: lir::LStore): SelCtxX86 | error {
+    var size = match mem_size_of_x86(s.ty) { MMemSizeX86 as sz => sz; error as e => return e }
+    var reg_class = mregclass_of_ltype(s.ty)
+    selctx_x86_emit(ctx0, store_x86(size, vreg(s.value, reg_class), MMem { base_reg = vreg(s.addr, MRegClass::GPR); offset = 0 to i32 }))
 }
 
-/**
- * select_global_addr_x86 — the `LGlobalAddr` selection: a single
- * `lea dst, [rip + disp32]` with one `Pc32` relocation (§4.3). The x86
- * single-instruction rip-relative form COLLAPSES arm64's ADRP+ADD pair (two
- * relocations) into one instruction the ELF writer patches with one entry.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LGlobalAddr g  the global-address op
- * @return SelCtxX86  the advanced context
- */
-fn select_global_addr_x86(ctx0: SelCtxX86, inst: lir::LInst, g: lir::LGlobalAddr) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+fn select_global_addr_x86(ctx0: SelCtxX86, inst: lir::LInst, g: lir::LGlobalAddr): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
     selctx_x86_emit(ctx1, lea_rip_x86(dst, g.symbol, RelocKindX86::Pc32))
 }
 
-/**
- * select_func_addr_x86 — the `LFuncAddr` selection: the same single
- * `lea dst, [rip + disp32]` as a global address, addressing a function symbol
- * with a `Pc32` relocation (the standard `lea foo(%rip)` form for a
- * locally-defined function; an external symbol's PLT/GOT indirection is the
- * `B1-globals`/linker concern, §7.2). Both address materializations collapse to
- * the one rip-relative lea, distinguished only by their symbol.
- *
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LFuncAddr fa  the function-address op
- * @return SelCtxX86  the advanced context
- */
-fn select_func_addr_x86(ctx0: SelCtxX86, inst: lir::LInst, fa: lir::LFuncAddr) -> SelCtxX86 {
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+fn select_func_addr_x86(ctx0: SelCtxX86, inst: lir::LInst, fa: lir::LFuncAddr): SelCtxX86 {
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
     selctx_x86_emit(ctx1, lea_rip_x86(dst, fa.symbol, RelocKindX86::Pc32))
 }
 
-/**
- * PinnedArgsX86 — the outcome of lowering a call's arguments into their SysV
- * argument registers: the advanced context + the pinned physical registers (the
- * `uses` the `MCallX86`/`MCallIndX86` records for regalloc liveness).
- *
- * @since #386 B1-3
- */
 type PinnedArgsX86 = struct {
-    /**
-     * ctx — the context with every argument pinned into its ABI register.
-     */
     ctx: SelCtxX86
-    /**
-     * uses — the physical argument registers pinned, in argument order.
-     */
     uses: []MReg
 }
 
-/**
- * pin_args_x86 — lower each argument into the target ABI's integer slot (§4.5):
- * pin it with a `mov` into the physical register `arg_reg(abi, GPR, n)` names
- * (SysV RDI/RSI/RDX/RCX/R8/R9; Win64 RCX/RDX/R8/R9, read through the descriptor
- * because neither argument order is the contiguous encoding order), collecting
- * the physregs as the call's `uses`. The `abi` descriptor is threaded from the
- * emit driver so the SAME isel places a call's outgoing arguments in SysV
- * registers on x86-linux and in the Win64 registers on x86_64-windows. A
- * float-class argument needs an XMM move (the `B1-fp` stop), an argument past
- * the ABI's argument-register window the stack-arg slot (the `B1-args` stop),
- * and a variadic call the register/stack split + the AL vector count (also
- * `B1-args`) — `LCall` carries neither, so both honest-stop.
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
- * @param SelCtxX86 ctx0  the context to extend
- * @param args  the argument VRegs, in declaration order
- * @param bool variadic  whether the call is variadic (honest-stops here)
- * @return PinnedArgsX86 | error  the pinned args, or a NAMED honest-stop
- */
-fn pin_args_x86(abi: AbiDescriptor, ctx0: SelCtxX86, args: []u32, variadic: bool) -> PinnedArgsX86 | error {
+fn pin_args_x86(abi: AbiDescriptor, ctx0: SelCtxX86, args: []u32, variadic: bool): PinnedArgsX86 | error {
     if variadic {
-        return error { message = "isel x86-64: B1-args — a variadic call needs the register/stack split and the AL vector count; LCall carries no arity (0.3.1)" }
+        return error { message = "isel x86-64: B1-args — a variadic call needs the AL vector count (SysV) and the dual-file float rule (Win64); LCall carries no arity (0.3.1)" }
     }
-    mut ctx = ctx0
-    mut uses: []MReg = teko::list::empty()
-    mut gpr_n: u32 = 0
-    mut i: u64 = 0
+    pin_reg_args_x86(abi, store_stack_args_x86(abi, ctx0, args), args)
+}
+
+fn arg_class_index_x86(abi: AbiDescriptor, ctx: SelCtxX86, args: []u32, i: u64): u32 {
+    if abi.arg_slots_shared { return i to u32 }
+    var is_fpr = vinfo_get(ctx.vinfo, args[i]).reg_class == MRegClass::FPR
+    var n: u32 = 0
+    var j: u64 = 0
+    loop {
+        if j >= i { break }
+        if (vinfo_get(ctx.vinfo, args[j]).reg_class == MRegClass::FPR) == is_fpr { n++ }
+        j++
+    }
+    n
+}
+
+fn arg_slot_x86(abi: AbiDescriptor, ctx: SelCtxX86, args: []u32, i: u64): ArgReg {
+    var cls = vinfo_get(ctx.vinfo, args[i]).reg_class
+    arg_reg(abi, cls, arg_class_index_x86(abi, ctx, args, i))
+}
+
+fn store_stack_args_x86(abi: AbiDescriptor, ctx0: SelCtxX86, args: []u32): SelCtxX86 {
+    var ctx = ctx0
+    var stack_n: u32 = 0
+    var i: u64 = 0
     loop {
         if i >= args.len { break }
-        let a = args[i]
-        let info = vinfo_get(ctx.vinfo, a)
-        if info.reg_class == MRegClass::FPR {
-            return error { message = "isel x86-64: B1-fp — a float call argument arrives in an XMM register via an SSE move, the float honest-stop (0.3.1)" }
+        if !arg_slot_x86(abi, ctx, args, i).ok {
+            var info = vinfo_get(ctx.vinfo, args[i])
+            ctx = selctx_x86_emit(ctx, out_arg_x86(arg_slot_size_x86(info.reg_class, info.wide), vreg(args[i], info.reg_class), stack_n))
+            stack_n++
         }
-        let slot = arg_reg(abi, MRegClass::GPR, gpr_n)
-        if !slot.ok {
-            return error { message = "isel x86-64: B1-args — an integer call argument past the ABI's argument-register window needs the stack-arg slot (0.3.1)" }
+        i++
+    }
+    ctx
+}
+
+fn pin_reg_args_x86(abi: AbiDescriptor, ctx0: SelCtxX86, args: []u32): PinnedArgsX86 {
+    var ctx = ctx0
+    var uses: []MReg = []
+    var i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        var slot = arg_slot_x86(abi, ctx, args, i)
+        if slot.ok {
+            var info = vinfo_get(ctx.vinfo, args[i])
+            var is_fpr = info.reg_class == MRegClass::FPR
+            var mv = if is_fpr { fmov_x86(slot.reg, vreg(args[i], MRegClass::FPR), info.wide) } else { mov_x86(slot.reg, vreg(args[i], MRegClass::GPR), info.wide) }
+            ctx = selctx_x86_emit(ctx, mv)
+            uses = [..uses, slot.reg]
         }
-        ctx = selctx_x86_emit(ctx, mov_x86(slot.reg, vreg(a, MRegClass::GPR), info.wide))
-        uses = teko::list::push(uses, slot.reg)
-        gpr_n++
         i++
     }
     PinnedArgsX86 { ctx = ctx; uses = uses }
 }
 
-/**
- * X86_STR_ARG_BYTES — the byte size of a `tk_str` (`teko_rt.h:45-48`: a pointer
- * plus a `size_t`, both 8 bytes on every x86-64 target). The threshold
- * `max_reg_arg_bytes` is compared against to decide register-vs-reference
- * passing, and the size of the frame slot the by-reference copy lives in.
- */
 const X86_STR_ARG_BYTES: u32 = 16 to u32
 
-/**
- * X86_STR_ARG_ALIGN — the alignment of a `tk_str` frame copy (8: its widest
- * field is an 8-byte pointer).
- */
 const X86_STR_ARG_ALIGN: u32 = 8 to u32
 
-/**
- * X86_STR_LEN_OFFSET — the byte offset of `tk_str`'s `len` field inside the
- * struct (`ptr` at 0, `len` at 8) — the displacement the by-reference copy's
- * second store writes at.
- */
 const X86_STR_LEN_OFFSET: i32 = 8 to i32
 
-/**
- * str_pair_by_ref_x86 — must this call's argument list, which the TARGET-NEUTRAL
- * LIR flattened from ONE by-value `tk_str` into the two scalar operands
- * `(ptr, len)` (`lower.tks::lower_str_arg_call`), be re-materialized and passed
- * BY REFERENCE instead?
- *
- * True exactly when the ABI cannot carry a 16-byte aggregate in registers
- * (`max_reg_arg_bytes < 16` — Win64, which passes an aggregate in a register
- * ONLY at size 1/2/4/8) AND the callee is one of the closed set of
- * single-`tk_str`-argument runtime entries (`lir::is_str_arg_builtin`, read from
- * the LIR so the list is single-sourced) AND the flat pair is actually present.
- * On SysV/AAPCS64/LP64D (`max_reg_arg_bytes == 16`) it is always false, so those
- * targets keep the byte-identical two-register sequence (FIXPOINT).
- *
- * @param AbiDescriptor abi  the target ABI register file
- * @param str symbol  the call's already-final runtime symbol
- * @param []u32 args  the call's flattened argument VRegs
- * @return bool  true iff the pair must travel by reference
- */
-fn str_pair_by_ref_x86(abi: AbiDescriptor, symbol: str, args: []u32) -> bool {
-    abi.max_reg_arg_bytes < X86_STR_ARG_BYTES && lir::is_str_arg_builtin(symbol) && args.len == (2 to u64)
+fn by_ref_fat_pairs_x86(abi: AbiDescriptor, symbol: str): u64 {
+    if abi.max_reg_arg_bytes >= X86_STR_ARG_BYTES { return 0 }
+    lir::fat_arg_builtin_arity(symbol)
 }
 
-/**
- * pin_str_pair_by_ref_x86 — pass a flattened `(ptr, len)` `tk_str` pair the
- * Win64 way: BY REFERENCE. Reserve a 16-byte frame slot, take its address
- * (`MFrameAddrX86` — the encoder resolves it to `lea scratch, [rsp+off]`, above
- * the shadow region `compute_frame_layout_x86` already reserves), store `ptr` at
- * +0 and `len` at +8, then pin that ADDRESS into the ABI's FIRST integer
- * argument register (RCX) as the call's single `use`.
- *
- * This is the whole content of the B3 Windows differential's `own_print_exit`
- * SIGSEGV: emitting SysV's two-register form on Win64 makes the C-built callee
- * (`void tk_print(tk_str s)`, which under Win64 compiles to `movq (%rcx), %rcx` /
- * `movl 0x8(%rcx), %r8d`) read the STRING'S OWN first 16 bytes as `{ptr; len}`
- * and `fwrite` through the resulting garbage pointer. `tk_exit(i32)` — a scalar —
- * was unaffected, which is why the `own_exit_code` fixture passed while
- * `own_print_exit` faulted.
- *
- * Both halves store at `Q` width. `len` is a `size_t`, and the SysV path already
- * relies on the same invariant (it moves the whole 64-bit register into RSI), so
- * a narrow producer's zero-extended upper half is not a new assumption. Neither
- * half can be float-class — `lower_str_arg_call` builds the pair from a fat
- * pointer's address and byte length — so there is no `B1-fp` arm here.
- *
- * @param AbiDescriptor abi  the target ABI register file (its first GPR arg reg)
- * @param SelCtxX86 ctx0  the context to extend
- * @param []u32 args  the flattened pair — `args[0]` = ptr, `args[1]` = len
- * @return PinnedArgsX86 | error  the pinned address, or a NAMED honest-stop
- */
-fn pin_str_pair_by_ref_x86(abi: AbiDescriptor, ctx0: SelCtxX86, args: []u32) -> PinnedArgsX86 | error {
-    let slot = arg_reg(abi, MRegClass::GPR, 0 to u32)
-    if !slot.ok {
-        return error { message = "isel x86-64: an ABI with no integer argument register cannot pass a by-reference aggregate (internal)" }
+type FatSlotsX86 = struct {
+    ctx: SelCtxX86
+    addrs: []MReg
+}
+
+fn materialize_one_fat_pair_x86(ctx0: SelCtxX86, ptr: u32, len: u32): FreshScratchX86 {
+    var frame_slot = ctx0.func.frame.len
+    var with_slot = append_frame_x86(ctx0.func, lir::LAlloca { bytes = X86_STR_ARG_BYTES; align = X86_STR_ARG_ALIGN })
+    var ctx1 = SelCtxX86 { func = with_slot; vinfo = ctx0.vinfo; next_scratch = ctx0.next_scratch; cur_block = ctx0.cur_block; next_block = ctx0.next_block }
+    var scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
+    var ctx2 = selctx_x86_emit(scratch.ctx, frame_addr_x86(scratch.reg, frame_slot))
+    var ctx3 = selctx_x86_emit(ctx2, store_x86(MMemSizeX86::Q, vreg(ptr, MRegClass::GPR), MMem { base_reg = scratch.reg; offset = 0 to i32 }))
+    var ctx4 = selctx_x86_emit(ctx3, store_x86(MMemSizeX86::Q, vreg(len, MRegClass::GPR), MMem { base_reg = scratch.reg; offset = X86_STR_LEN_OFFSET }))
+    FreshScratchX86 { ctx = ctx4; reg = scratch.reg }
+}
+
+fn materialize_fat_pairs_x86(ctx0: SelCtxX86, args: []u32, pairs: u64): FatSlotsX86 {
+    var ctx = ctx0
+    var addrs: [pairs]MReg = []
+    var k: u64 = 0
+    loop {
+        if k >= pairs { break }
+        var one = materialize_one_fat_pair_x86(ctx, args[k * 2], args[k * 2 + 1])
+        ctx = one.ctx
+        addrs[k] = one.reg
+        k++
     }
-    let frame_slot = ctx0.func.frame.len
-    let with_slot = append_frame_x86(ctx0.func, lir::LAlloca { bytes = X86_STR_ARG_BYTES; align = X86_STR_ARG_ALIGN })
-    let ctx1 = SelCtxX86 { func = with_slot; vinfo = ctx0.vinfo; next_scratch = ctx0.next_scratch; cur_block = ctx0.cur_block; next_block = ctx0.next_block }
-    let scratch = selctx_x86_scratch(ctx1, MRegClass::GPR)
-    let ctx2 = selctx_x86_emit(scratch.ctx, frame_addr_x86(scratch.reg, frame_slot))
-    let ctx3 = selctx_x86_emit(ctx2, store_x86(MMemSizeX86::Q, vreg(args[0], MRegClass::GPR), MMem { base = scratch.reg; offset = 0 to i32 }))
-    let ctx4 = selctx_x86_emit(ctx3, store_x86(MMemSizeX86::Q, vreg(args[1], MRegClass::GPR), MMem { base = scratch.reg; offset = X86_STR_LEN_OFFSET }))
-    let ctx5 = selctx_x86_emit(ctx4, mov_x86(slot.reg, scratch.reg, true))
-    PinnedArgsX86 { ctx = ctx5; uses = teko::list::push(teko::list::empty(), slot.reg) }
+    FatSlotsX86 { ctx = ctx; addrs = addrs }
 }
 
-/**
- * pin_call_args_x86 — the argument-pinning entry a DIRECT call goes through: the
- * by-reference `tk_str` path when the target ABI demands it
- * (`str_pair_by_ref_x86`), else the plain per-argument register pinning
- * (`pin_args_x86`). An indirect call never reaches a `tk_str` runtime builtin (it
- * has no symbol), so it stays on `pin_args_x86` directly.
- *
- * @param AbiDescriptor abi  the target ABI register file
- * @param SelCtxX86 ctx0  the context to extend
- * @param str symbol  the call's already-final runtime symbol
- * @param []u32 args  the call's flattened argument VRegs, in declaration order
- * @param bool variadic  whether the call is variadic (honest-stops downstream)
- * @return PinnedArgsX86 | error  the pinned args, or a NAMED honest-stop
- */
-fn pin_call_args_x86(abi: AbiDescriptor, ctx0: SelCtxX86, symbol: str, args: []u32, variadic: bool) -> PinnedArgsX86 | error {
-    if !variadic && str_pair_by_ref_x86(abi, symbol, args) {
-        return pin_str_pair_by_ref_x86(abi, ctx0, args)
+fn pin_fat_slot_addrs_x86(abi: AbiDescriptor, ctx0: SelCtxX86, addrs: []MReg): PinnedArgsX86 | error {
+    var ctx = ctx0
+    var uses: [addrs.len]MReg = []
+    var k: u64 = 0
+    loop {
+        if k >= addrs.len { break }
+        var slot = arg_reg(abi, MRegClass::GPR, k to u32)
+        if !slot.ok {
+            return error { message = "isel x86-64: an ABI with no integer argument register cannot pass a by-reference aggregate (internal)" }
+        }
+        ctx = selctx_x86_emit(ctx, mov_x86(slot.reg, addrs[k], true))
+        uses[k] = slot.reg
+        k++
     }
-    pin_args_x86(abi, ctx0, args, variadic)
+    PinnedArgsX86 { ctx = ctx; uses = uses }
 }
 
-/**
- * select_call_result_x86 — after a call, move its result out of the SysV result
- * register RAX into the result VReg (when the call produces one). The result
- * class is taken as GPR (RAX): `LInst` carries no result type, so a
- * float-returning call (XMM0) is a documented limitation until the LIR records
- * a call's result type.
- *
- * @param SelCtxX86 ctx0  the post-call context to extend
- * @param lir::LInst inst  the call instruction (its result VReg + `has_result`)
- * @param MReg ret_reg  the ABI result register the call wrote (RAX)
- * @return SelCtxX86  the advanced context
- */
-fn select_call_result_x86(ctx0: SelCtxX86, inst: lir::LInst, ret_reg: MReg) -> SelCtxX86 {
+fn pin_trailing_scalar_args_x86(abi: AbiDescriptor, pinned: PinnedArgsX86, args: []u32, pairs: u64): PinnedArgsX86 | error {
+    var ctx = pinned.ctx
+    var uses: [args.len]MReg = []
+    var i: u64 = pairs * 2
+    loop {
+        if i >= args.len { break }
+        var info = vinfo_get(ctx.vinfo, args[i])
+        var is_fpr = info.reg_class == MRegClass::FPR
+        var slot = arg_reg(abi, info.reg_class, (i - pairs) to u32)
+        if !slot.ok {
+            return error { message = "isel x86-64: B1-args — an argument after a by-reference aggregate overflowed the argument window (0.3.1)" }
+        }
+        var mv = if is_fpr { fmov_x86(slot.reg, vreg(args[i], MRegClass::FPR), info.wide) } else { mov_x86(slot.reg, vreg(args[i], MRegClass::GPR), info.wide) }
+        ctx = selctx_x86_emit(ctx, mv)
+        uses[i] = slot.reg
+        i++
+    }
+    PinnedArgsX86 { ctx = ctx; uses = [..pinned.uses, ..uses] }
+}
+
+fn pin_fat_pairs_by_ref_x86(abi: AbiDescriptor, ctx0: SelCtxX86, args: []u32, pairs: u64): PinnedArgsX86 | error {
+    var slots = materialize_fat_pairs_x86(ctx0, args, pairs)
+    var refs = match pin_fat_slot_addrs_x86(abi, slots.ctx, slots.addrs) { PinnedArgsX86 as p => p; error as e => return e }
+    pin_trailing_scalar_args_x86(abi, refs, args, pairs)
+}
+
+fn pin_call_args_x86(abi: AbiDescriptor, ctx0: SelCtxX86, symbol: str, args: []u32, variadic: bool): PinnedArgsX86 | error {
+    var pairs = by_ref_fat_pairs_x86(abi, symbol)
+    if variadic || pairs == 0 { return pin_args_x86(abi, ctx0, args, variadic) }
+    if args.len < pairs * 2 {
+        return error { message = teko::str::concat("isel x86-64: `", symbol, "` was lowered with fewer flattened operands than its by-value `tk_str` arity (internal)") }
+    }
+    pin_fat_pairs_by_ref_x86(abi, ctx0, args, pairs)
+}
+
+fn select_call_result_x86(ctx0: SelCtxX86, inst: lir::LInst, ret_reg: MReg, ret_type: lir::LType): SelCtxX86 {
     if !inst.has_result {
         return ctx0
     }
-    let dst = vreg(inst.result, MRegClass::GPR)
-    let ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
+    if mregclass_of_ltype(ret_type) == MRegClass::FPR {
+        var wide = ltype_is_wide(ret_type)
+        var fdst = vreg(inst.result, MRegClass::FPR)
+        var fctx = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::FPR, wide)
+        return selctx_x86_emit(fctx, fmov_x86(fdst, ret_reg, wide))
+    }
+    var dst = vreg(inst.result, MRegClass::GPR)
+    var ctx1 = selctx_x86_set_vinfo(ctx0, inst.result, MRegClass::GPR, true)
     selctx_x86_emit(ctx1, mov_x86(dst, ret_reg, true))
 }
 
-/**
- * select_call_x86 — the `LCall` selection (§4.5): lower the arguments into
- * the target ABI's registers (`pin_call_args_x86` — which routes a flattened
- * `tk_str` pair through the by-reference path on an ABI that demands it), emit
- * `MCallX86{sym, uses, ret_reg, has_result, variadic}` with the result pinned to
- * RAX (decision D-A —
- * RAX is the integer result on both SysV and Win64), then move the result out
- * of RAX if the call produces one.
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LCall c  the call op
- * @return SelCtxX86 | error  the advanced context, or a propagated error
- */
-fn select_call_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, c: lir::LCall) -> SelCtxX86 | error {
-    let pinned = match pin_call_args_x86(abi, ctx0, c.symbol, c.args, c.variadic) { PinnedArgsX86 as p => p; error as e => return e }
-    let ret_reg = RAX_X86
-    let ctx1 = selctx_x86_emit(pinned.ctx, call_x86(c.symbol, pinned.uses, ret_reg, inst.has_result, c.variadic))
-    select_call_result_x86(ctx1, inst, ret_reg)
+fn call_result_reg_x86(ret_type: lir::LType): MReg {
+    if mregclass_of_ltype(ret_type) == MRegClass::FPR { return XMM0_X86 }
+    RAX_X86
 }
 
-/**
- * select_call_indirect_x86 — the `LCallIndirect` selection: identical argument
- * lowering, then `MCallIndX86{target, uses, ret_reg, has_result}` (a `call`
- * through the target Ptr VReg), then the result move.
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LInst inst  the enclosing instruction (its result VReg)
- * @param lir::LCallIndirect ci  the indirect-call op
- * @return SelCtxX86 | error  the advanced context, or a propagated error
- */
-fn select_call_indirect_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, ci: lir::LCallIndirect) -> SelCtxX86 | error {
-    let pinned = match pin_args_x86(abi, ctx0, ci.args, ci.variadic) { PinnedArgsX86 as p => p; error as e => return e }
-    let ret_reg = RAX_X86
-    let ctx1 = selctx_x86_emit(pinned.ctx, call_ind_x86(vreg(ci.target, MRegClass::GPR), pinned.uses, ret_reg, inst.has_result))
-    select_call_result_x86(ctx1, inst, ret_reg)
+fn select_call_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, c: lir::LCall): SelCtxX86 | error {
+    var pinned = match pin_call_args_x86(abi, ctx0, c.symbol, c.args, c.variadic) { PinnedArgsX86 as p => p; error as e => return e }
+    var ret_reg = call_result_reg_x86(c.ret_type)
+    var ctx1 = selctx_x86_emit(pinned.ctx, call_x86(c.symbol, pinned.uses, ret_reg, inst.has_result, c.variadic))
+    select_call_result_x86(ctx1, inst, ret_reg, c.ret_type)
 }
 
-/**
- * select_inst_x86 — the per-`LOp` dispatch: the whole `LOp` frontier selects
- * into `MInstX86` — constants, integer arithmetic/bitwise/shift/compare, unary
- * ops, parameters, returns, control flow (jumps/branches), memory
- * (alloca/field-addr/load/store), address materialization, and calls. The float
- * literal case honest-stops (`B1-fp`); every other float route stops inside its
- * own selection helper.
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64), read
- *                           by the parameter-receipt and call-argument arms
- * @param SelCtxX86 ctx  the context to extend
- * @param lir::LFunc f  the enclosing function (`LParam`/`LJump`/`LBranch` read it)
- * @param lir::LInst inst  the instruction to select
- * @return SelCtxX86 | error  the advanced context, or a propagated/named error
- */
-fn select_inst_x86(abi: AbiDescriptor, ctx: SelCtxX86, f: lir::LFunc, inst: lir::LInst) -> SelCtxX86 | error {
+fn select_call_indirect_x86(abi: AbiDescriptor, ctx0: SelCtxX86, inst: lir::LInst, ci: lir::LCallIndirect): SelCtxX86 | error {
+    var pinned = match pin_args_x86(abi, ctx0, ci.args, ci.variadic) { PinnedArgsX86 as p => p; error as e => return e }
+    var ret_reg = call_result_reg_x86(ci.ret_type)
+    var ctx1 = selctx_x86_emit(pinned.ctx, call_ind_x86(vreg(ci.target, MRegClass::GPR), pinned.uses, ret_reg, inst.has_result))
+    select_call_result_x86(ctx1, inst, ret_reg, ci.ret_type)
+}
+
+fn syscall_reg_x86(index: u64): MReg {
+    if index == 0 { return preg(0, MRegClass::GPR) }
+    if index == 1 { return preg(7, MRegClass::GPR) }
+    if index == 2 { return preg(6, MRegClass::GPR) }
+    if index == 3 { return preg(2, MRegClass::GPR) }
+    if index == 4 { return preg(10, MRegClass::GPR) }
+    if index == 5 { return preg(8, MRegClass::GPR) }
+    preg(9, MRegClass::GPR)
+}
+
+fn pin_syscall_args_x86(ctx0: SelCtxX86, args: []u32): PinnedArgsX86 {
+    var ctx = ctx0
+    var uses: [args.len]MReg = []
+    var i: u64 = 0
+    loop {
+        if i >= args.len { break }
+        var reg = syscall_reg_x86(i)
+        ctx = selctx_x86_emit(ctx, mov_x86(reg, vreg(args[i], MRegClass::GPR), true))
+        uses[i] = reg
+        i++
+    }
+    PinnedArgsX86 { ctx = ctx; uses = uses }
+}
+
+fn select_syscall_x86(ctx0: SelCtxX86, inst: lir::LInst, s: lir::LSyscall): SelCtxX86 {
+    var pinned = pin_syscall_args_x86(ctx0, s.args)
+    var ret_reg = RAX_X86
+    var ctx1 = selctx_x86_emit(pinned.ctx, syscall_x86(pinned.uses, ret_reg, inst.has_result))
+    select_call_result_x86(ctx1, inst, ret_reg, lir::LType::I64)
+}
+
+fn atomic_addr_reg_x86(): MReg { preg(1, MRegClass::GPR) }
+
+fn atomic_val_reg_x86(): MReg { preg(0, MRegClass::GPR) }
+
+fn atomic_desired_reg_x86(): MReg { preg(2, MRegClass::GPR) }
+
+fn pin_atomic_arg_x86(ctx0: SelCtxX86, reg: MReg, arg: u32): SelCtxX86 {
+    selctx_x86_emit(ctx0, mov_x86(reg, vreg(arg, MRegClass::GPR), true))
+}
+
+fn pin_atomic_args_x86(ctx0: SelCtxX86, kind: lir::LAtomicKind, args: []u32): PinnedArgsX86 {
+    var ctx = pin_atomic_arg_x86(ctx0, atomic_addr_reg_x86(), args[0])
+    match kind {
+        Load => return PinnedArgsX86 { ctx = ctx; uses = [atomic_addr_reg_x86()] }
+        Cas => {
+            var c1 = pin_atomic_arg_x86(ctx, atomic_val_reg_x86(), args[1])
+            var c2 = pin_atomic_arg_x86(c1, atomic_desired_reg_x86(), args[2])
+            return PinnedArgsX86 { ctx = c2; uses = [atomic_addr_reg_x86(), atomic_val_reg_x86(), atomic_desired_reg_x86()] }
+        }
+        _ => {
+            var c1 = pin_atomic_arg_x86(ctx, atomic_val_reg_x86(), args[1])
+            return PinnedArgsX86 { ctx = c1; uses = [atomic_addr_reg_x86(), atomic_val_reg_x86()] }
+        }
+    }
+}
+
+fn select_atomic_x86(ctx0: SelCtxX86, inst: lir::LInst, a: lir::LAtomicRmw): SelCtxX86 {
+    var pinned = pin_atomic_args_x86(ctx0, a.kind, a.args)
+    var ret_reg = RAX_X86
+    var ctx1 = selctx_x86_emit(pinned.ctx, atomic_x86(a.kind, pinned.uses, ret_reg, inst.has_result))
+    select_call_result_x86(ctx1, inst, ret_reg, lir::LType::I64)
+}
+
+fn select_inst_x86(abi: AbiDescriptor, ctx: SelCtxX86, f: lir::LFunc, inst: lir::LInst): SelCtxX86 | error {
     match inst.op {
         lir::LConstInt as c => select_const_int_x86(ctx, inst, c)
         lir::LConstFloat as c => select_const_float_x86(ctx, inst, c)
@@ -1101,150 +795,96 @@ fn select_inst_x86(abi: AbiDescriptor, ctx: SelCtxX86, f: lir::LFunc, inst: lir:
         lir::LCallIndirect as ci => select_call_indirect_x86(abi, ctx, inst, ci)
         lir::LFuncAddr as fa => select_func_addr_x86(ctx, inst, fa)
         lir::LCall as c => select_call_x86(abi, ctx, inst, c)
+        lir::LSyscall as s => select_syscall_x86(ctx, inst, s)
+        lir::LAtomicRmw as a => select_atomic_x86(ctx, inst, a)
     }
 }
 
-/**
- * select_insts_x86 — select every instruction of `insts`, in order, threading
- * the context forward and short-circuiting on the first error.
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
- * @param SelCtxX86 ctx0  the context to extend
- * @param lir::LFunc f  the enclosing function
- * @param insts  the instruction stream to select
- * @return SelCtxX86 | error  the fully-advanced context, or the first
- *                            propagated error
- */
-fn select_insts_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc, insts: []lir::LInst) -> SelCtxX86 | error {
-    mut ctx = ctx0
-    mut i: u64 = 0
+fn select_insts_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc, insts: teko::collections::Chunked<lir::LInst>): SelCtxX86 | error {
+    var ctx = ctx0
+    var it = insts.iter()
     loop {
-        if i >= insts.len { break }
-        let stepped = match select_inst_x86(abi, ctx, f, insts[i]) { SelCtxX86 as c => c; error as e => return e }
-        ctx = stepped
-        i++
+        match it.next() {
+            lir::LInst as inst => {
+                var stepped = match select_inst_x86(abi, ctx, f, inst) { SelCtxX86 as c => c; error as e => return e }
+                ctx = stepped
+            }
+            null => break
+        }
     }
     ctx
 }
 
-/**
- * provisional_params_x86 — a mirror block's params built from its `LBlock`
- * param VRegs with a provisional GPR class; each entry is refined to its real
- * class by `emit_edge_moves_x86` when a feeding edge is selected.
- *
- * @param pids  the block's param VReg ids
- * @return []MReg  the provisional param registers
- */
-fn provisional_params_x86(pids: []u32) -> []MReg {
-    mut out: []MReg = teko::list::empty()
-    mut i: u64 = 0
+fn provisional_params_x86(pids: []u32): []MReg {
+    var out: [pids.len]MReg = []
+    var i: u64 = 0
     loop {
         if i >= pids.len { break }
-        out = teko::list::push(out, vreg(pids[i], MRegClass::GPR))
+        out[i] = vreg(pids[i], MRegClass::GPR)
         i++
     }
     out
 }
 
-/**
- * build_mirror_blocks_x86 — an `MFuncX86` with one empty machine block per
- * `LBlock`, same id + (provisionally-classed) params, in source order.
- * Selection then fills each block's instructions and splits edge blocks in past
- * them.
- *
- * @param lir::LFunc f  the function whose block skeleton is mirrored
- * @return MFuncX86  the empty-bodied mirror function
- */
-fn build_mirror_blocks_x86(f: lir::LFunc) -> MFuncX86 {
-    mut blocks: []MBlockX86 = teko::list::empty()
-    mut i: u64 = 0
+fn build_mirror_blocks_x86(f: lir::LFunc): MFuncX86 {
+    var blocks = teko::collections::Chunked<MBlockX86>::make()
+    var it = f.blocks.iter()
     loop {
-        if i >= f.blocks.len { break }
-        let lb = f.blocks[i]
-        blocks = teko::list::push(blocks, MBlockX86 { id = lb.id; params = provisional_params_x86(lb.params); insts = teko::list::empty() })
-        i++
+        match it.next() {
+            lir::LBlock as lb => {
+                blocks.push(MBlockX86 { id = lb.id; params = provisional_params_x86(lb.params); insts = teko::collections::Chunked<MInstX86Node>::make() })
+            }
+            null => break
+        }
     }
-    MFuncX86 { symbol = f.symbol; blocks = blocks; frame = teko::list::empty() }
+    MFuncX86 { symbol = f.symbol; blocks = blocks; frame = [] }
 }
 
-/**
- * max_block_id_x86 — the highest `LBlock` id in `f` (edge blocks are numbered
- * past it so a split edge block never collides with a mirror block).
- *
- * @param lir::LFunc f  the function to scan
- * @return u32  its greatest block id
- */
-fn max_block_id_x86(f: lir::LFunc) -> u32 {
-    mut m: u32 = 0
-    mut i: u64 = 0
+fn max_block_id_x86(f: lir::LFunc): u32 {
+    var m: u32 = 0
+    var it = f.blocks.iter()
     loop {
-        if i >= f.blocks.len { break }
-        if f.blocks[i].id > m { m = f.blocks[i].id }
-        i++
+        match it.next() {
+            lir::LBlock as b => { if b.id > m { m = b.id } }
+            null => break
+        }
     }
     m
 }
 
-/**
- * select_all_blocks_x86 — select every `LBlock` of `f` in order, retargeting
- * the emit cursor to each block's mirror before selecting its instructions.
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
- * @param SelCtxX86 ctx0  the initial context (targeting the entry block)
- * @param lir::LFunc f  the function to select
- * @return SelCtxX86 | error  the fully-advanced context, or the first error
- */
-fn select_all_blocks_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc) -> SelCtxX86 | error {
-    mut ctx = ctx0
-    mut i: u64 = 0
+fn select_all_blocks_x86(abi: AbiDescriptor, ctx0: SelCtxX86, f: lir::LFunc): SelCtxX86 | error {
+    var ctx = ctx0
+    var it = f.blocks.iter()
     loop {
-        if i >= f.blocks.len { break }
-        let lb = f.blocks[i]
-        let switched = selctx_x86_switch(ctx, lb.id)
-        let stepped = match select_insts_x86(abi, switched, f, lb.insts) { SelCtxX86 as c => c; error as e => return e }
-        ctx = stepped
-        i++
+        match it.next() {
+            lir::LBlock as lb => {
+                var switched = selctx_x86_switch(ctx, lb.id)
+                var stepped = match select_insts_x86(abi, switched, f, lb.insts) { SelCtxX86 as c => c; error as e => return e }
+                ctx = stepped
+            }
+            null => break
+        }
     }
     ctx
 }
 
-/**
- * select_lfunc_x86 — select one `LFunc` into an `MFuncX86`: build the mirror
- * block skeleton, then select every block's instructions (the full control-flow
- * set — jumps, branches, and their split edge blocks) under the target ABI.
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
- * @param lir::LFunc f  the function to select
- * @return MFuncX86 | error  the selected function, or any instruction's own
- *                           propagated error
- */
-pub fn select_lfunc_x86(abi: AbiDescriptor, f: lir::LFunc) -> MFuncX86 | error {
-    let ctx0 = SelCtxX86 { func = build_mirror_blocks_x86(f); vinfo = vinfo_empty(); next_scratch = f.next_vreg; cur_block = 0; next_block = max_block_id_x86(f) + 1 }
-    let done = match select_all_blocks_x86(abi, ctx0, f) { SelCtxX86 as c => c; error as e => return e }
+pub fn select_lfunc_x86(abi: AbiDescriptor, f: lir::LFunc): MFuncX86 | error {
+    var ctx0 = SelCtxX86 { func = build_mirror_blocks_x86(f); vinfo = vinfo_empty(); next_scratch = f.next_vreg; cur_block = 0; next_block = max_block_id_x86(f) + 1 }
+    var done = match select_all_blocks_x86(abi, ctx0, f) { SelCtxX86 as c => c; error as e => return e }
     done.func
 }
 
-/**
- * select_module_x86 — select every function of `m` into an `MModuleX86` under
- * the target ABI, carrying its rodata/globals/layouts tables through UNCHANGED
- * (isel never touches their bytes — the encoder/ELF/COFF writer does). The
- * `abi` descriptor is threaded from the emit driver: `emit_native_x86` passes
- * `SYSV64` (the byte-identical x86-linux path) and `emit_native_win` passes
- * `WIN64` (call/return arguments land in RCX/RDX/R8/R9).
- *
- * @param AbiDescriptor abi  the target ABI register file (SysV or Win64)
- * @param lir::LModule m  the module to select
- * @return MModuleX86 | error  the selected module, or the first function's
- *                             propagated error
- */
-pub fn select_module_x86(abi: AbiDescriptor, m: lir::LModule) -> MModuleX86 | error {
-    mut out = MModuleX86 { funcs = teko::list::empty(); rodata = m.rodata; globals = m.globals; layouts = m.layouts }
-    mut i: u64 = 0
+pub fn select_module_x86(abi: AbiDescriptor, m: lir::LModule): MModuleX86 | error {
+    var out = MModuleX86 { funcs = teko::collections::Chunked<MFuncX86>::make(); rodata = m.rodata; globals = m.globals; layouts = m.layouts }
+    var it = m.funcs.iter()
     loop {
-        if i >= m.funcs.len { break }
-        let mf = match select_lfunc_x86(abi, m.funcs[i]) { MFuncX86 as x => x; error as e => return e }
-        out = add_mfunc_x86(out, mf)
-        i++
+        match it.next() {
+            lir::LFunc as f => {
+                var mf = match select_lfunc_x86(abi, f) { MFuncX86 as x => x; error as e => return e }
+                out = add_mfunc_x86(out, mf)
+            }
+            null => break
+        }
     }
     out
 }

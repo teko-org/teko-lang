@@ -167,7 +167,7 @@ constraint solving, or a whole-program borrow checker:
  * @see            docs/design/ref-transparent-model.md §7 (the single root soundness hole)
  * @since          0.3.1.0-beta (#498 A1)
  */
-pub fn type_reaches_ref(t: Type, visited: []str) -> bool { /* struct/collection/variant/closure walk */ }
+pub fn type_reaches_ref(t: Type, visited: []str): bool { /* struct/collection/variant/closure walk */ }
 ```
 
 This is Go-style escape reachability, not Andersen/Steensgaard. It answers "could this value smuggle a
@@ -207,7 +207,7 @@ pub type BorrowSummary = struct { returns_borrow_of: []u32; returns_all: bool }
  * @return            the borrow summary of `f`
  * @since 0.3.1.0-beta (#498 A1 interprocedural)
  */
-pub fn fn_borrow_summary(f: TFunction, callee_sum: BorrowSummaryEnv) -> BorrowSummary { /* one forward pass */ }
+pub fn fn_borrow_summary(f: TFunction, callee_sum: BorrowSummaryEnv): BorrowSummary { /* one forward pass */ }
 ```
 
 **Why this is bounded, not a whole-program borrow checker:** one bit-set per function; a single
@@ -245,11 +245,11 @@ dataflow). At a `TBinding` whose declared/inferred type is a `Reference` and who
  * @return   true iff `b` is a reference binding WITHOUT a valid initializer (⇒ REJECT)
  * @since    0.3.1.0-beta (#498 A4)
  */
-fn ref_binding_missing_init(b: parser::Binding) -> bool { /* is-ref-typed ∧ no init */ }
+fn ref_binding_missing_init(b: parser::Binding): bool { /* is-ref-typed ∧ no init */ }
 ```
 
-**Fixtures:** `ref_uninit_rejected` (COMPILE-REJECT, both engines, non-zero) · `ref_init_ok`
-(RUN, VM==native, sentinel 0).
+**Fixtures:** `ref_uninit_rejected` (COMPILE-REJECT, native, non-zero) · `ref_init_ok`
+(RUN, native, sentinel 0).
 
 **Honest-stop:** none — this is total and local. **Dogfooding exposure:** ZERO (the compiler declares
 no `ref` local; refs are param-only today). A4 is future-proofing the surface.
@@ -275,11 +275,11 @@ category today, so introduce a predicate (NOT a type-system change):
  * @return   true iff `e` denotes an addressable place (⇒ R7 borrow-down); false ⇒ R5 copy
  * @since    0.3.1.0-beta (#498 A3)
  */
-fn arg_is_lvalue(e: TExpr) -> bool { /* TVar | (TFieldAccess/TIndex over an lvalue) */ }
+fn arg_is_lvalue(e: TExpr): bool { /* TVar | (TFieldAccess/TIndex over an lvalue) */ }
 ```
 
 **Fixtures:** `refparam_lvalue_aliases` (RUN — pass a `mut` local, callee writes through, caller
-observes the mutation; VM==native, sentinel encodes the written value) · `refparam_rvalue_copies` (RUN
+observes the mutation; native, sentinel encodes the written value) · `refparam_rvalue_copies` (RUN
 — pass a temporary, callee's write does NOT escape; sentinel encodes the unchanged caller state).
 
 **Honest-stop:** an access-path whose addressability the classifier cannot confirm ⇒ treat as **rvalue
@@ -320,7 +320,7 @@ target, REJECT. The reachability walk is the §B2.1(a) predicate; the "roots at"
  * @return      true iff `val` may carry a reachable Ref past its safe lifetime (⇒ REJECT)
  * @since       0.3.1.0-beta (#498 A1)
  */
-fn escaping_value_leaks_ref(val: TExpr, s: Spine, sum: BorrowSummary) -> bool { /* reachability + root test */ }
+fn escaping_value_leaks_ref(val: TExpr, s: Spine, sum: BorrowSummary): bool { /* reachability + root test */ }
 ```
 
 **Fixtures:**
@@ -328,7 +328,7 @@ fn escaping_value_leaks_ref(val: TExpr, s: Spine, sum: BorrowSummary) -> bool { 
   engines non-zero with the A1 diagnostic. THE hole made a static error.
 - `leak_ref_in_returned_collection` (COMPILE-REJECT) — `[]Ref<T>` built from locals, returned.
 - `sound_ref_struct_frame_local` (RUN) — a `Holder { r = <param-rooted borrow> }` used within the frame,
-  never returned; VM==native sentinel. Proves A1 does not over-reject the frame-local case.
+  never returned; native sentinel. Proves A1 does not over-reject the frame-local case.
 
 **Honest-stop:** anything the reachability walk cannot resolve (an opaque generic `U` before
 monomorphization, a `.tkb`-imported type whose Ref-reachability is not serialized) ⇒ treat as
@@ -340,7 +340,7 @@ closure-capture case, which slice 1b resolves.
 ### Slice 1b — A1-interproc: the `return-borrows-params` summary [the lean-knob; unblocks the stdlib SOUNDLY]
 
 **This is the load-bearing slice for dogfooding.** The 28 `src/iter`+`src/io` functions return a CLOSURE
-capturing a `Ref<Cursor>` parameter (e.g. `over_array(xs, cur: Ref<ArrayCursor>) -> IntIter` returns
+capturing a `Ref<Cursor>` parameter (e.g. `over_array(xs, cur: Ref<ArrayCursor>): IntIter` returns
 `() => { … cur.value … }`). A1-detect (slice 1) sees "an escaping closure whose capture reaches a Ref"
 and would REJECT — breaking self-host on `int_iter.tks` line 1.
 
@@ -354,7 +354,7 @@ analysis prove it, in two moves:
 2. **Caller-side soundness (the summary):** `fn_borrow_summary(over_array)` records `returns_borrow_of =
    {xs, cur}`. At a caller, when an argument fed to a summarized borrowed param is a **local** (not a
    param), the call RESULT is treated as borrowing that local; if the result then ESCAPES the caller,
-   REJECT. This catches the genuine UAF `fn make() -> IntIter { mut c = Cursor{}; over_array(xs, c) }`
+   REJECT. This catches the genuine UAF `fn make(): IntIter { mut c = Cursor{}; over_array(xs, c) }`
    (feeds a LOCAL `c`, escapes the closure — `c` dies, the closure dangles).
 
 ```
@@ -370,17 +370,17 @@ analysis prove it, in two moves:
  * @return       true iff the escaping call-result carries a borrow of a caller local (⇒ REJECT)
  * @since        0.3.1.0-beta (#498 A1 interprocedural)
  */
-fn borrowed_result_escapes(call: TCall, s: Spine, sum: BorrowSummary) -> bool { /* map summary onto args */ }
+fn borrowed_result_escapes(call: TCall, s: Spine, sum: BorrowSummary): bool { /* map summary onto args */ }
 ```
 
 **Fixtures:**
 - `iter_over_param_ref_ok` (RUN) — `over_array`-shaped: take `Ref<Cursor>` + slice PARAMS, return a
-  closure, caller drives it within the frame; VM==native, sentinel = sum of yielded elements. Proves the
+  closure, caller drives it within the frame; native, sentinel = sum of yielded elements. Proves the
   stdlib idiom COMPILES.
 - `iter_over_local_escapes_rejected` (COMPILE-REJECT) — the `make()` UAF: feed a LOCAL cursor, return the
-  closure; both engines non-zero with the A1-interproc diagnostic. Proves soundness for users.
+  closure; native validation, non-zero with the A1-interproc diagnostic. Proves soundness for users.
 - `iter_combinator_chain_ok` (RUN) — `take(skip(over_array(xs, c1), c2), c3)`-shaped nesting, exercising
-  the ACYCLIC bottom-up summary composition; VM==native. Proves the summary composes without widening.
+  the ACYCLIC bottom-up summary composition; native. Proves the summary composes without widening.
 
 **Honest-stop / KNOWN BOUNDS (must be documented in `spine.tks`):**
 - **Higher-order opacity:** a combinator that takes an `IntIter` (a closure) as a param and RE-wraps it
@@ -415,7 +415,7 @@ capturing a narrower local ref is rejected.
 
 **Fixtures:** `borrow_stored_in_field_rejected` (COMPILE-REJECT) · `borrow_in_escaping_closure_rejected`
 (COMPILE-REJECT) · `borrow_down_used_locally_ok` (RUN — the accumulator idiom: pass `mut acc` down,
-mutate `.value`, read `acc` after; VM==native — THE compiler's own pattern).
+mutate `.value`, read `acc` after; native — THE compiler's own pattern).
 
 **Honest-stop:** the closure body modeling in the spine is shallow (the #331 `spine.tks` does not descend
 into lambda bodies — documented in `spine-build-plan.md` "KNOWN BOUND"); A2 relies on the CAPTURE LIST
@@ -445,7 +445,7 @@ of each field along the path:
  * @return       true iff every segment is mutable (⇒ borrow-eligible)
  * @since        0.3.1.0-beta (#498 A5)
  */
-fn access_path_all_mut(place: TExpr, env: Env) -> bool { /* root kind + field mut chain */ }
+fn access_path_all_mut(place: TExpr, env: Env): bool { /* root kind + field mut chain */ }
 ```
 
 **Fixtures:** `borrow_immutable_path_rejected` (COMPILE-REJECT — borrow a field off a `let`-rooted path)
@@ -485,7 +485,7 @@ provider ≥L; `singleton ≤ scoped ≤ transient` by region depth) OR is desug
  * @return      true iff `name` is provably unique AND owned (⇒ free is legal)
  * @since       0.3.1.0-beta (#498 A6)
  */
-fn free_target_is_owned(s: Spine, name: str) -> bool { /* is_unique_at ∧ bf = BfNone */ }
+fn free_target_is_owned(s: Spine, name: str): bool { /* is_unique_at ∧ bf = BfNone */ }
 ```
 
 **Fixtures:** `free_borrowed_ref_rejected` (COMPILE-REJECT — `defer { mem::free(r) }` on a `ref` param)

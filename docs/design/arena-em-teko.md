@@ -18,10 +18,10 @@ remove esse C; se ele sumir da base, recupere com `git show`.
 backend nativo, sem hop pela stdlib:
 
 ```
-pub extern fn c_aligned_alloc(alignment: u64, size: u64) -> u64  = "aligned_alloc"
-pub extern fn c_free(block: u64)                         -> void = "free"
-pub extern fn c_memset(block: u64, value: i32, count: u64) -> u64 = "memset"
-pub extern fn c_memcmp(left: u64, right: u64, count: u64)  -> i32 = "memcmp"
+pub extern fn c_aligned_alloc(alignment: u64, size: u64): u64  = "aligned_alloc"
+pub extern fn c_free(block: u64) = "free"
+pub extern fn c_memset(block: u64, value: i32, count: u64): u64 = "memset"
+pub extern fn c_memcmp(left: u64, right: u64, count: u64): i32 = "memcmp"
 ```
 
 ```
@@ -94,7 +94,7 @@ A instrução existe; o que muda é a seção.
 
 **Alternativa sem mudança de linguagem (fallback):** mapear o bloco de controle em um
 endereço virtual FIXO, escolhido em build time, via
-`extern fn c_mmap(...) -> u64` com `MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE` (e
+`extern fn c_mmap(...): u64` com `MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE` (e
 `VirtualAlloc` no Windows). O endereço do bloco vira uma **constante**, e uma palavra
 mágica no offset 0 diz se ele já foi inicializado — lida por P1. Isto elimina P2 por
 completo ao custo de um endereço codificado e de introduzir `mmap` onde hoje só há

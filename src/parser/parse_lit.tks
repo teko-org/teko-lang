@@ -1,54 +1,22 @@
-// src/parser/parse_lit.tks   (namespace 'teko::parser')
 
-/**
- * lit_overflow_err — the located-free "literal too wide" error (drop-128, 2026-07-24): a
- * decimal/hex/binary `Number` literal's magnitude cannot exceed `u64::MAX` — the language's
- * widest integer is 64-bit. A wider constant is a distinct literal FORM, a `bi` BigInt
- * literal (`teko::numeric::bigint`), never a `Number`.
- *
- * @return the overflow error (the caller positions it via the enclosing `Parsed<Expr>`)
- */
-fn lit_overflow_err() -> error {
+fn lit_overflow_err(): error {
     error { message = "integer literal exceeds u64::MAX — the language's widest integer is 64-bit; write it as a BigInt: `123bi`" }
 }
 
-/**
- * lit_int_accum — fold one decoded digit `d` (`0 <= d < radix`) into the running magnitude
- * `acc`, erroring when `acc * radix + d` would overflow `u64::MAX` (checked BEFORE the
- * multiply via the standard `acc > (MAX - d) / radix` guard — never a silent wrap, M.1).
- *
- * @param acc    the magnitude accumulated so far
- * @param d      the next digit's value
- * @param radix  2, 10, or 16
- * @return       the new accumulated magnitude, or an overflow error
- * @throws       when the accumulation would exceed `u64::MAX`
- */
-fn lit_int_accum(acc: u64, d: u64, radix: u64) -> u64 | error {
+fn lit_int_accum(acc: u64, d: u64, radix: u64): u64 | error {
     if acc > (18446744073709551615 - d) / radix { return lit_overflow_err() }
     acc * radix + d
 }
 
-/**
- * lit_int — a Number token's text (decimal/hex/binary digits with `_` separators) → its
- * sign-magnitude literal carrier (N1 — TEKO_CORRECTION_PLAN §5; drop-128, 2026-07-24). The
- * literal node carries the raw magnitude (always non-negative here — a source negative
- * parses as `Unary(Minus, Number)`, never a negative `Number`); its resolved type (set by
- * the typer) decides the real width/signedness.
- *
- * @param text  the Number token's text
- * @return      the literal's magnitude carrier, or an overflow error
- * @throws      when the literal's magnitude exceeds `u64::MAX` (`lit_overflow_err`)
- */
-fn lit_int(text: str) -> NumInt | error {
-    // hex `0x…` / binary `0b…` (B.28) decode by radix; `_` separators ignored.
+fn lit_int(text: str): NumInt | error {
     if text.len >= 2 && text[0] == b'0' && (text[1] == b'x' || text[1] == b'X') {
-        mut acc: u64 = 0
-        mut i = 2
+        var acc: u64 = 0
+        var i = 2
         loop {
             if i >= text.len { break }
-            let c = text[i]
+            var c = text[i]
             if c == b'_' { i++; continue }
-            mut d: i64 = -1
+            var d: i64 = -1
             if c >= b'0' && c <= b'9' { d = (c to i64) - (b'0' to i64) }
             else if c >= b'a' && c <= b'f' { d = (c to i64) - (b'a' to i64) + 10 }
             else if c >= b'A' && c <= b'F' { d = (c to i64) - (b'A' to i64) + 10 }
@@ -59,11 +27,11 @@ fn lit_int(text: str) -> NumInt | error {
         return numint_of_u64(acc)
     }
     if text.len >= 2 && text[0] == b'0' && (text[1] == b'b' || text[1] == b'B') {
-        mut acc: u64 = 0
-        mut i = 2
+        var acc: u64 = 0
+        var i = 2
         loop {
             if i >= text.len { break }
-            let c = text[i]
+            var c = text[i]
             if c == b'_' { i++; continue }
             if c != b'0' && c != b'1' { break }
             acc = match lit_int_accum(acc, (c to u64) - (b'0' to u64), 2) { u64 as v => v; error as e => return e }
@@ -71,11 +39,11 @@ fn lit_int(text: str) -> NumInt | error {
         }
         return numint_of_u64(acc)
     }
-    mut acc: u64 = 0
-    mut i = 0
+    var acc: u64 = 0
+    var i = 0
     loop {
         if i >= text.len { break }
-        let c = text[i]
+        var c = text[i]
         if c != b'_' {
             acc = match lit_int_accum(acc, (c to u64) - (b'0' to u64), 10) { u64 as v => v; error as e => return e }
         }
@@ -84,39 +52,24 @@ fn lit_int(text: str) -> NumInt | error {
     numint_of_u64(acc)
 }
 
-// a FLOAT Number token's text (`3.14`, `1.5e3`) → f64 (the default; an annotation picks
-// f16/f32 later). `_` separators are stripped before the host float parse. Contained:
-// no token suffixes (`1.5f` is NOT a thing — N1). (Host strtod in the C bootstrap.)
-fn lit_float(text: str) -> f64 {
+fn lit_float(text: str): f64 {
     teko::float::parse(text)
 }
 
-// predicate: does this Number token's text denote a FLOAT? (contains `.` or `e`/`E`).
-// The parser/typer uses this to choose the integer vs float carrier (N1).
-fn lit_is_float(text: str) -> bool {
-    // a hex/binary literal is ALWAYS an integer — its digits may include 'e'/'E' (hex E)
-    // which must NOT be mistaken for a float exponent.
+fn lit_is_float(text: str): bool {
     if text.len >= 2 && text[0] == b'0' &&
     (text[1] == b'x' || text[1] == b'X' || text[1] == b'b' || text[1] == b'B') { return false }
-    mut i = 0
+    var i = 0
     loop {
         if i >= text.len { break }
-        let c = text[i]
+        var c = text[i]
         if c == b'.' || c == b'e' || c == b'E' { return true }
         i++
     }
     false
 }
 
-/**
- * lit_has_radix_prefix — does this Number token carry a hex (`0x`) or binary (`0b<digit>`) radix
- * prefix? The binary check requires a binary digit (or `_`) after `0b`, so `0bi` (bigint zero) is NOT
- * a radix prefix and stays available to the `bi`-suffix path.
- *
- * @param text  the Number token text
- * @return      true iff the text begins with a hex/binary radix prefix
- */
-fn lit_has_radix_prefix(text: str) -> bool {
+fn lit_has_radix_prefix(text: str): bool {
     if text.len < 2 || text[0] != b'0' { return false }
     if text[1] == b'x' || text[1] == b'X' { return true }
     if text[1] == b'b' || text[1] == b'B' {
@@ -125,48 +78,24 @@ fn lit_has_radix_prefix(text: str) -> bool {
     false
 }
 
-/**
- * lit_is_bigint — does this Number token carry the `bi` arbitrary-precision-integer suffix? A radix
- * literal never does (its digits are decoded by radix, not suffixed).
- *
- * @param text  the Number token text
- * @return      true iff the text is a `…bi` bigint literal
- */
-fn lit_is_bigint(text: str) -> bool {
+fn lit_is_bigint(text: str): bool {
     if lit_has_radix_prefix(text) { return false }
     text.len >= 3 && text[text.len - 2] == b'b' && text[text.len - 1] == b'i'
 }
 
-/**
- * lit_is_dec — does this Number token carry the `d` arbitrary-precision-decimal suffix?
- *
- * @param text  the Number token text
- * @return      true iff the text is a `…d` dec literal
- */
-fn lit_is_dec(text: str) -> bool {
+fn lit_is_dec(text: str): bool {
     if lit_has_radix_prefix(text) { return false }
     text.len >= 2 && text[text.len - 1] == b'd'
 }
 
-/**
- * lit_strip_suffix — the numeric text of a `bi`/`d` literal with its suffix removed (`"123bi"` →
- * `"123"`, `"1.5d"` → `"1.5"`), ready to hand to the numeric library's `of_lit` constructor.
- *
- * @param text  the suffixed Number token text
- * @param n     the suffix length (2 for `bi`, 1 for `d`)
- * @return      the numeric text without the suffix
- */
-fn lit_strip_suffix(text: str, n: u64) -> str {
-    teko::str::slice_to(text, text.len - n)
+fn lit_strip_suffix(text: str, n: u64): str {
+    text.slice_to(text.len - n)
 }
 
-// a Byte token's text is the already-decoded octet (the lexer resolved escapes/quotes).
-fn lit_byte(text: str) -> byte {
+fn lit_byte(text: str): byte {
     text[0]
 }
 
-// a Char token's text IS the codepoint's raw UTF-8 bytes (the lexer decoded escapes and
-// validated exactly one codepoint). The literal node carries them verbatim.
-fn lit_char(text: str) -> str {
+fn lit_char(text: str): str {
     text
 }

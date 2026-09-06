@@ -87,11 +87,10 @@ the desugar bridge (C5) makes `T?` ≡ `T | null` before the corpus is rewritten
 - **[RITUAL: size probe]** — a native throughput gate: an emitted-C fixture under
   `examples/regressions/` that `EXPECT_EXIT`s on `sizeof`/heap assertions matching
   the base §6.2/§6.5 targets. Any crumb changing representation carries one.
-- **[RITUAL: dual-engine]** — the fixture runs on BOTH engines: the LIR-interp
-  oracle (`src/lir/lir_interp.tks`, the semantic oracle that replaced the retired
-  VM — #524) AND native (the C backend; and, where in the differential corpus, the
-  own AOT backend via `scripts/diff_c_own.sh`). "VM and native" in this plan means
-  exactly this oracle + native pair.
+- **[RITUAL: dual-engine]** — the fixture runs on native (the C backend; and, where in the
+  differential corpus, the own AOT backend via `scripts/diff_c_own.sh`). *(This ritual line
+  predates the retirement of the LIR oracle that had itself replaced the tree-walking
+  legacy engine, #524 — native is now the sole engine.)*
 - **[RITUAL: full gate]** — the whole `teko test .` suite + all `scripts/*_regressions.sh`
   legs `completed + success`. Reserved for C7 (the ratified end-state).
 
@@ -155,7 +154,7 @@ tagged path (with the `uint8` tag, once C3 lands, for any null-bearing union).
   `Reference => return error{…}` arm with the shape-aware helper below.
 - `src/backend/*` / `src/lir/lower.tks` — the LIR/own-backend value model learns
   the niche load (a bare pointer whose 0 is `null`) and the `uint8`-tag load. The
-  LIR-interp oracle carries `Null` as a zero word already (`lower.tks` null lit).
+  LIR oracle carries `Null` as a zero word already (`lower.tks` null lit).
 
 ### New / changed function shapes (copy-paste, full Javadoc)
 
@@ -174,7 +173,7 @@ tagged path (with the `uint8` tag, once C3 lands, for any null-bearing union).
  * @see      cg_union_tag_ctype (the inline `uint8`-tag path this gates)
  * @since 0.3.0.30 (null-union C3)
  */
-fn cg_union_niche_member(v: checker::Variant) -> checker::Type | null | error
+fn cg_union_niche_member(v: checker::Variant): checker::Type | null | error
 
 /**
  * variant_member_admissible — the C3 replacement for the flat `Reference`
@@ -190,7 +189,7 @@ fn cg_union_niche_member(v: checker::Variant) -> checker::Type | null | error
  * @return          null when `member` is admissible; an error naming why not
  * @since 0.3.0.30 (null-union C3)
  */
-fn variant_member_admissible(member: checker::Type, siblings: []checker::Type, table: TypeTable) -> null | error
+fn variant_member_admissible(member: checker::Type, siblings: []checker::Type, table: TypeTable): null | error
 
 /**
  * cg_union_tag_ctype — the C type of a null-bearing tagged union's discriminant:
@@ -203,7 +202,7 @@ fn variant_member_admissible(member: checker::Type, siblings: []checker::Type, t
  * @return     `buf` with `uint8_t` appended, or an error
  * @since 0.3.0.30 (null-union C3)
  */
-fn cg_union_tag_ctype(buf: []byte, v: checker::Variant) -> []byte | error
+fn cg_union_tag_ctype(buf: []byte, v: checker::Variant): []byte | error
 ```
 
 ### Fixtures this crumb adds
@@ -218,7 +217,7 @@ fn cg_union_tag_ctype(buf: []byte, v: checker::Variant) -> []byte | error
   field still `EXPECT_COMPILE_FAIL`s (R4 intact).
 - `t/repr_niche_roundtrip.tks` (checker/codegen unit) — a niche `ClassRef|null`
   and a tagged `i32|null` each round-trip null↔present with identical observable
-  behavior on the LIR-interp oracle and native.
+  behavior on the LIR oracle and native.
 
 ### Ritual gate
 
@@ -278,7 +277,7 @@ parser does not cover. This crumb adds a binding/field attribute channel:
   non-null construct; load-through on read); honor `#inline` by flipping THAT
   binding/field to the inline-tag struct. One switch serves local + field.
 - `src/lir/lower.tks` + `src/backend/*` — the box handle's alloc/load in the LIR
-  and own backend; the LIR-interp oracle models the handle as a boxed word.
+  and own backend; the LIR oracle models the handle as a boxed word.
 
 ### New / changed function shapes (copy-paste, full Javadoc)
 
@@ -297,7 +296,7 @@ parser does not cover. This crumb adds a binding/field attribute channel:
  * @return       null when `#inline` is legal; an error naming the ineligible class
  * @since 0.3.0.30 (null-union C4)
  */
-fn inline_attr_eligible(t: checker::Type, table: TypeTable) -> null | error
+fn inline_attr_eligible(t: checker::Type, table: TypeTable): null | error
 
 /**
  * union_repr_class — classify how a resolved union is stored: `Niche` (bare, C3),
@@ -311,7 +310,7 @@ fn inline_attr_eligible(t: checker::Type, table: TypeTable) -> null | error
  * @return          the representation class, or an error on a malformed member
  * @since 0.3.0.30 (null-union C4)
  */
-fn union_repr_class(v: checker::Variant, forced_inline: bool, table: TypeTable) -> UnionRepr | error
+fn union_repr_class(v: checker::Variant, forced_inline: bool, table: TypeTable): UnionRepr | error
 
 /**
  * The physical storage class chosen for a resolved union type. Orthogonal to the
@@ -413,7 +412,7 @@ bytes, which is the precondition for C6's byte-identical corpus rewrite.
  * @see         match narrowing (checker/match.tks arm binding)
  * @since 0.3.0.30 (null-union C5)
  */
-fn narrow_on_eq_guard(cond: checker::TExpr, env: FlowEnv) -> BranchEnvs
+fn narrow_on_eq_guard(cond: checker::TExpr, env: FlowEnv): BranchEnvs
 
 /**
  * desugar_optional_type — the transitional BRIDGE lowering (retired in C7): map a
@@ -426,7 +425,7 @@ fn narrow_on_eq_guard(cond: checker::TExpr, env: FlowEnv) -> BranchEnvs
  * @deprecated   transitional; deleted in C7 once no source uses `T?`
  * @since 0.3.0.30 (null-union C5)
  */
-fn desugar_optional_type(inner: checker::Type) -> checker::Type
+fn desugar_optional_type(inner: checker::Type): checker::Type
 
 /**
  * require_narrowed — reject a use of a `T | null` (any union) payload AS a bare
@@ -441,7 +440,7 @@ fn desugar_optional_type(inner: checker::Type) -> checker::Type
  * @return          null when the use is legal; an error demanding narrowing
  * @since 0.3.0.30 (null-union C5)
  */
-fn require_narrowed(use_site: checker::TExpr, val_type: checker::Type, narrowed: bool) -> null | error
+fn require_narrowed(use_site: checker::TExpr, val_type: checker::Type, narrowed: bool): null | error
 ```
 
 ### Fixtures this crumb adds
@@ -456,7 +455,7 @@ fn require_narrowed(use_site: checker::TExpr, val_type: checker::Type, narrowed:
   BYTE-IDENTICAL C (the precondition for C6).
 - `examples/regressions/error_union_pivot/` — **[size probe]** a former `error?`
   site now `sizeof == 16` (niche), round-trips success (`null`) and failure
-  (`error`) on both engines. Exit 0.
+  (`error`) natively. Exit 0.
 
 ### Ritual gate
 
@@ -579,7 +578,7 @@ This is REMOVED code that OFFSETS the C1/C3 additions (base §7).
 ### Ritual gate
 
 Fixpoint (final ratified end-state; `gen1==gen2`) + FULL GATE (whole `teko test .`
-+ every `scripts/*_regressions.sh` leg `completed + success`, VM-oracle + native).
++ every `scripts/*_regressions.sh` leg `completed + success`, LIR oracle + native).
 
 ---
 

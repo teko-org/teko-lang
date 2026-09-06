@@ -1,1336 +1,456 @@
-/**
- * CapResult — the captured outcome of running a child process through a `/bin/sh -c` wrapper: its
- * exit status plus the bytes it wrote to stdout/stderr. `teko::process::run` returns only the exit
- * code, so the regression runner redirects the child's streams to scratch files (feeding stdin from
- * one) and reads them back — the least-invasive way to observe stdout/stderr without a new runtime
- * symbol.
- *
- * @since 0.3.0.29
- */
 type CapResult = struct {
-    /** the child's exit status (for a signal-killed child, the shell's 128+signo, i.e. non-zero). */
     exit: i32
-    /** the bytes the child wrote to stdout ("" when none / unreadable). */
     stdout: str
-    /** the bytes the child wrote to stderr ("" when none / unreadable). */
     stderr: str
-    /**
-     * monotonic ns spent OUTSIDE the child on this capture: creating the scratch directory, writing
-     * the stdin file, and reading the two capture files back (0 for a result the runner synthesized
-     * without spawning anything). Observability only — see `regr_timing.tks`.
-     */
     harness_ns: i64
-    /** monotonic ns spent INSIDE the child process (the `sh -c` and everything under it). */
     child_ns: i64
-    /**
-     * the EXACT command string handed to `sh -c` (redirections included), or "" for a result the
-     * runner synthesized without spawning anything. Carried so a failure message can quote what
-     * actually ran: an exit code alone cannot distinguish a child that ran and misbehaved from a
-     * shell that never found what it was asked to run, and on Windows — where `sh` is MSYS and the
-     * paths in that string have been through `to_sh_path` — the command text is the only place the
-     * difference is visible.
-     */
     cmd: str
+    chan_text: str
 }
 
-/**
- * RegrOutcome — the verdict for one regressive: whether it passed, whether it was honest-skipped
- * (e.g. a non-host variant with no runner), and a human-readable message for the report line.
- *
- * @since 0.3.0.29
- */
 type RegrOutcome = struct {
-    /** true when every declared expectation held. */
     ok: bool
-    /** true when the regressive could not be run here and was honest-skipped (not a failure). */
     skipped: bool
-    /**
-     * how many capability skips this verdict AGGREGATES — the count the summary line reports so a
-     * run that skipped everything can never read as a run that checked everything (M.3). 1 for a
-     * `regr_skip` leaf, 0 for a pass/fail leaf, and the sum of its parts for an aggregate verdict
-     * built by `regr_add_skips`.
-     */
     skips: u64
-    /** the report message (the mismatch on failure, "ok" on success, the reason on skip). */
     message: str
 }
 
-/**
- * regr_fail — an `RegrOutcome` describing a failure with `msg`.
- *
- * @param msg  the failure description
- * @return     a failing outcome
- * @since 0.3.0.29
- */
-fn regr_fail(msg: str) -> RegrOutcome { RegrOutcome { ok = false; skipped = false; skips = 0; message = msg } }
+fn regr_fail(msg: str): RegrOutcome { RegrOutcome { ok = false; skipped = false; skips = 0; message = msg } }
 
-/**
- * regr_pass — the passing `RegrOutcome`.
- *
- * @return a passing outcome
- * @since 0.3.0.29
- */
-fn regr_pass() -> RegrOutcome { RegrOutcome { ok = true; skipped = false; skips = 0; message = "ok" } }
+fn regr_pass(): RegrOutcome { RegrOutcome { ok = true; skipped = false; skips = 0; message = "ok" } }
 
-/**
- * regr_skip — an honest-skipped `RegrOutcome` carrying `msg` (the reason). Not a failure: the runner
- * reports it and does not tally it against the gate, but it DOES tally into the summary's `skipped`
- * column (`skips = 1`) so the report never presents a skip as a check. Used for a missing host
- * toolchain / run-wrapper (0.3.1 C3) and for a declarative (verb-less) scenario (0.3.1 C1).
- *
- * @param msg  the skip reason (shown after the report label)
- * @return     a skipped outcome carrying one skip
- * @since 0.3.0.30
- */
-fn regr_skip(msg: str) -> RegrOutcome { RegrOutcome { ok = true; skipped = true; skips = 1; message = msg } }
+fn regr_skip(msg: str): RegrOutcome { RegrOutcome { ok = true; skipped = true; skips = 1; message = msg } }
 
-/**
- * regr_add_skips — `oc` with `extra` more aggregated capability skips folded into its `skips` tally.
- * The aggregation primitive every level of the runner uses to carry a nested row's skip count up to
- * the summary line, so the count survives the row → scenario → feature → file → run chain instead
- * of being lost at the first pass verdict.
- *
- * @param oc     the verdict to extend
- * @param extra  how many skips to add to its tally
- * @return       `oc` with `skips = oc.skips + extra`
- * @since 0.3.1
- */
-fn regr_add_skips(oc: RegrOutcome, extra: u64) -> RegrOutcome {
+fn regr_add_skips(oc: RegrOutcome, extra: u64): RegrOutcome {
     RegrOutcome { ok = oc.ok; skipped = oc.skipped; skips = oc.skips + extra; message = oc.message }
 }
 
-/**
- * sh_squote — POSIX single-quote one argument for a `/bin/sh -c` command line: wrap it in single
- * quotes and rewrite every embedded `'` as `'\''`, so the argument reaches the child verbatim
- * regardless of spaces or shell metacharacters.
- *
- * @param arg  the raw argument
- * @return     the single-quoted shell token
- * @since 0.3.0.29
- */
-fn sh_squote(arg: str) -> str {
-    mut out = "'"
-    mut k: u64 = 0
-    loop {
-        if k >= arg.len { break }
-        if arg[k] == b'\'' { out = out ~ "'\\''" } else { out = out ~ teko::str::slice(arg, k, k + 1) }
-        k = k + 1
-    }
-    out ~ "'"
+type ProcSpec = struct {
+    argv: []str
+    dir: str
+    env: []str
+    stdin_data: str
+    prefix: str
 }
 
-/**
- * windows_path_to_sh — rewrite every backslash in a Windows-style path to a forward slash — the FIRST
- * of the two rewrites `to_sh_path` applies on a Windows host (`windows_drive_to_mount` is the
- * second). Extracted so the conversion itself (not just the OS gate) is unit-testable on every CI
- * host, independent of `teko::os()`.
- *
- * @param path  a Windows-style filesystem path (drive-letter + backslash separators)
- * @return      `path` with every `\` rewritten to `/`
- * @since 0.3.0.30
- */
-fn windows_path_to_sh(path: str) -> str {
-    mut out = ""
-    mut k: u64 = 0
-    loop {
-        if k >= path.len { break }
-        if path[k] == b'\\' { out = out ~ "/" } else { out = out ~ teko::str::slice(path, k, k + 1) }
-        k = k + 1
-    }
-    out
-}
-
-/**
- * windows_drive_to_mount — rewrite a forward-slashed, drive-letter-prefixed path (`D:/a/b`) to its
- * git-bash/MSYS POSIX MOUNT form (`/d/a/b`) — the canonical, unambiguous form `cygpath -u` produces
- * and the one every MSYS tool's own PATH/HOME already uses natively. A bare `D:/...` string, while
- * often accepted for opening a FILE, is not guaranteed to resolve the same way when a shell decides
- * HOW TO LAUNCH a command (its "is this a path?" check looks for a leading `/`); the mount form
- * removes that ambiguity entirely. The drive letter is lowercased (matching `cygpath -u` — MSYS's
- * fixed mount table is keyed on the lowercase letter). `path` unchanged when it carries no
- * `<letter>:` prefix (already POSIX, or not a path at all).
- *
- * @param path  a forward-slashed path, possibly `<letter>:`-prefixed
- * @return      the MSYS mount-style POSIX form, or `path` unchanged when it carries no drive letter
- * @since 0.3.0.30
- */
-fn windows_drive_to_mount(path: str) -> str {
-    if path.len < 2 || !is_ascii_alpha(path[0]) || path[1] != b':' { return path }
-    let d = path[0]
-    let lower_idx = if d >= b'A' && d <= b'Z' { (d to u64) - (b'A' to u64) } else { (d to u64) - (b'a' to u64) }
-    let drive = teko::str::slice("abcdefghijklmnopqrstuvwxyz", lower_idx, lower_idx + 1)
-    "/" ~ drive ~ teko::str::slice(path, 2, path.len)
-}
-
-/**
- * to_sh_path — normalize a FILESYSTEM PATH for the `/bin/sh -c` this runner spawns children through:
- * on a Windows host that `sh` is git-bash/MSYS, whose child-launch path resolution wants a POSIX
- * mount-style absolute path (`/d/a/.../teko.exe`), not the native backslash form (`D:\a\...\teko.exe`,
- * the shape a Windows CI runner hands the compiler as `argv[0]`/CWD-joined paths) — unconverted, the
- * spawned command reads as "command not found" instead of the compiler. `windows_path_to_sh` handles
- * the backslash-to-slash rewrite, then `windows_drive_to_mount` folds the drive letter into the mount
- * form. A no-op on every other host, where a path never carries a `\` or a drive letter to begin with.
- *
- * @param path  a filesystem path as this host's `teko::env`/argv APIs return it
- * @return      the git-bash mount-style form of `path` on a Windows host, else `path` unchanged
- * @since 0.3.0.30
- */
-fn to_sh_path(path: str) -> str {
-    if teko::os() != "windows" { return path }
-    windows_drive_to_mount(windows_path_to_sh(path))
-}
-
-/**
- * sh_join — join an argv into a single space-separated, individually single-quoted `sh -c` command
- * fragment.
- *
- * @param argv  the argument vector
- * @return      the quoted command fragment
- * @since 0.3.0.29
- */
-fn sh_join(argv: []str) -> str {
-    mut out = ""
-    mut k: u64 = 0
+fn spec_argv_display(argv: []str): str {
+    var out = ""
+    var k: u64 = 0
     loop {
         if k >= argv.len { break }
         if k > 0 { out = out ~ " " }
-        out = out ~ sh_squote(argv[k])
+        out = out ~ argv[k]
         k = k + 1
     }
     out
 }
 
-/**
- * captured_sh_cmd — build the exact `/bin/sh -c` text one captured child runs, and write its stdin
- * file. SEPARATED FROM RUNNING IT, because the batch runner needs the command WITHOUT spawning it:
- * a command that can be built and then held is a command that can be launched alongside its
- * siblings. Extracting it also means the serial path and the parallel path cannot drift into two
- * different spellings of the same invocation — there is one, here.
- *
- * @param cmd_prefix  the raw shell text to prepend before the joined, redirected `argv` (may be "")
- * @param argv        the command to run (argv[0] is the executable)
- * @param stdin_data  bytes to feed the child's stdin (written to `<prefix>.in`)
- * @param prefix      the scratch-file path prefix (its parent directory is created)
- * @return            the shell command text, redirections included
- * @since 0.3.1
- */
-fn captured_sh_cmd(cmd_prefix: str, argv: []str, stdin_data: str, prefix: str) -> str {
-    match mkdir_p(teko::str::concat(dirname_of(prefix), "/")) { error => { }; null => { } }
-    let si = prefix ~ ".in"
-    match teko::io::write_file(si, stdin_data) { error => { }; null => { } }
-    let body = sh_join(argv) ~ " < " ~ sh_squote(to_sh_path(si)) ~ " > " ~ sh_squote(to_sh_path(prefix ~ ".out")) ~ " 2> " ~ sh_squote(to_sh_path(prefix ~ ".err"))
-    cmd_prefix ~ body
+fn spec_env_with_channel(spec: ProcSpec): []str {
+    [..spec.env, teko::str::concat(teko::process::VERDICT_CHANNEL_ENV, teko::str::concat("=", spec.prefix ~ ".chan"))]
 }
 
-/**
- * run_captured_cmd_prefixed — the shared redirection body every capture-run function funnels
- * through: run `cmd_prefix ~ sh_join(argv)` (plus stdin/stdout/stderr redirection to scratch files
- * under `prefix`) via `/bin/sh -c`, then read the captured streams back. `cmd_prefix` carries
- * whatever the caller needs prepended verbatim (an `env K=V …` token run, a `cd <dir> &&`, both, or
- * "" for neither) — extracted so `run_captured_env`/`run_captured_in_dir` stay flat one-liners
- * (0.3.1 C2).
- *
- * @param cmd_prefix  the raw shell text to prepend before the joined, redirected `argv` (may be "")
- * @param argv        the command to run (argv[0] is the executable)
- * @param stdin_data  bytes to feed the child's stdin
- * @param prefix      the scratch-file path prefix (its parent directory is created)
- * @return            the captured exit/stdout/stderr
- * @since 0.3.1
- */
-fn run_captured_cmd_prefixed(cmd_prefix: str, argv: []str, stdin_data: str, prefix: str) -> CapResult {
-    let t_start = regr_now_ns()
-    let sh_cmd = captured_sh_cmd(cmd_prefix, argv, stdin_data, prefix)
-    mut shv: []str = teko::list::push(teko::list::empty(), "sh")
-    shv = teko::list::push(shv, "-c")
-    shv = teko::list::push(shv, sh_cmd)
-    let t_spawn = regr_now_ns()
-    let rc = teko::process::run(shv)
-    let t_reaped = regr_now_ns()
-    let out = match teko::io::read_file(prefix ~ ".out") { str as s => s; error => "" }
-    let err = match teko::io::read_file(prefix ~ ".err") { str as s => s; error => "" }
-    let t_end = regr_now_ns()
+fn spawn_spec(spec: ProcSpec): teko::process::ProcHandle {
+    match mkdir_p(teko::str::concat(dirname_of(spec.prefix), "/")) { error => { }; null => { } }
+    match teko::io::write_file(spec.prefix ~ ".in", spec.stdin_data) { error => { }; null => { } }
+    teko::process::spawn_redirected(spec.argv, spec.dir, spec_env_with_channel(spec), spec.prefix ~ ".in", spec.prefix ~ ".out", spec.prefix ~ ".err")
+}
+
+fn harvest_spec(spec: ProcSpec, h: teko::process::ProcHandle, t_spawn: i64, t_harness0: i64): CapResult {
+    var rc = teko::process::wait_one(h)
+    var t_waited = regr_now_ns()
+    var out = match teko::io::read_file(spec.prefix ~ ".out") { str as s => s; error => "" }
+    var err = match teko::io::read_file(spec.prefix ~ ".err") { str as s => s; error => "" }
+    var chan = match teko::io::read_file(spec.prefix ~ ".chan") { str as s => s; error => "" }
+    var t_read = regr_now_ns()
     CapResult {
         exit = rc; stdout = out; stderr = err
-        harness_ns = (t_spawn - t_start) + (t_end - t_reaped)
-        child_ns = t_reaped - t_spawn
-        cmd = sh_cmd
+        harness_ns = (t_spawn - t_harness0) + (t_read - t_waited)
+        child_ns = t_waited - t_spawn
+        cmd = spec_argv_display(spec.argv)
+        chan_text = chan
     }
 }
 
-/**
- * REGR_JOBS_DEFAULT — how many captured children run CONCURRENTLY when the run names no number.
- *
- * Four, and the number is deliberately modest. Each child is a full `teko` build holding its own
- * arena — the wagon's own self-host peaked at 1.3 GB — so a job count tuned to core count would
- * trade a runner's memory for wall clock and lose. A CI leg that knows its machine raises it
- * through the env; the default only has to be safe on the smallest runner in the matrix.
- */
-const REGR_JOBS_DEFAULT: u64 = 4
+fn run_captured_spec(spec: ProcSpec): CapResult {
+    var t_start = regr_now_ns()
+    var h = spawn_spec(spec)
+    var t_spawn = regr_now_ns()
+    harvest_spec(spec, h, t_spawn, t_start)
+}
 
-/** REGR_JOBS_ENV — the env key a run overrides `REGR_JOBS_DEFAULT` through (12-Factor: the
-    concurrency of the machine is the machine's business, not the source's). */
-const REGR_JOBS_ENV: str = "TEKO_REGR_JOBS"
+extern fn nproc_rt(): u64 = "tk_rt_nproc" from "teko_rt"
 
-/** REGR_RC_SUFFIX — the per-child file the batch script writes each exit status into. A backgrounded
-    child's status cannot be read from `$?` after `wait`, so each one records its own. */
-const REGR_RC_SUFFIX: str = ".rc"
+const MEMINFO_PATH: str = "/proc/meminfo"
 
-/** REGR_BATCH_UNREADABLE_RC — the status a child is credited with when its `.rc` never appeared: the
-    shell's own "could not execute". Never 0 — a run that lost a child's verdict must not read as a
-    child that passed. */
-const REGR_BATCH_UNREADABLE_RC: i32 = 127
+const MEM_AVAILABLE_LABEL: str = "MemAvailable:"
 
-/**
- * regr_jobs_of — parse a `TEKO_REGR_JOBS` value into a job count, falling back to the default for
- * anything that is not a positive decimal number. A malformed value is a CONFIGURATION mistake, and
- * the safe reading of one is "the author did not mean zero children".
- *
- * @param raw  the env value as written
- * @return     the parsed count, or `REGR_JOBS_DEFAULT` when it is empty, non-numeric or zero
- * @since 0.3.1
- */
-fn regr_jobs_of(raw: str) -> u64 {
-    mut v: u64 = 0
-    mut i: u64 = 0
+const MEM_PER_JOB_KIB: u64 = 2097152
+
+const NO_MEM_CAP: u64 = 1000000
+
+fn mem_available_kib(content: str): u64 {
+    var at = mem_label_end(content, MEM_AVAILABLE_LABEL)
+    if at >= content.len { return 0 }
+    var i = at
     loop {
-        if i >= raw.len { break }
-        let c = raw[i]
-        if c < b'0' { return REGR_JOBS_DEFAULT }
-        if c > b'9' { return REGR_JOBS_DEFAULT }
+        if i >= content.len { break }
+        if content[i] != b' ' { break }
+        i = i + 1
+    }
+    var v: u64 = 0
+    var seen = false
+    loop {
+        if i >= content.len { break }
+        var c = content[i]
+        if c < b'0' || c > b'9' { break }
         v = (v * 10) + ((c to u64) - (b'0' to u64))
-        i = i + 1
-    }
-    if v == 0 { return REGR_JOBS_DEFAULT }
-    v
-}
-
-/**
- * regr_jobs — how many captured children this run may have in flight at once.
- *
- * @return the effective job count
- * @since 0.3.1
- */
-fn regr_jobs() -> u64 {
-    match teko::env::var(REGR_JOBS_ENV) { str as v => regr_jobs_of(v); error => REGR_JOBS_DEFAULT }
-}
-
-/**
- * regr_batch_script — the one `/bin/sh -c` text that runs every command in `cmds` CONCURRENTLY,
- * `jobs` at a time, each recording its own exit status.
- *
- * WHY A SCRIPT AND NOT N SPAWNS: this language has no threads, and the runner's only child-launching
- * primitive is a synchronous `teko::process::run`. The shell already has the scheduler — `&` and
- * `wait` — so the concurrency is expressed where it already exists rather than invented here.
- *
- * THE LIMITER IS A BARRIER EVERY `jobs` LAUNCHES, not a sliding window, because POSIX `sh` has no
- * portable `wait -n` (it is a bash extension, and this runs on macOS `/bin/sh`). A barrier wastes
- * the tail of each batch when one child is slower than its peers; a non-portable window would waste
- * the whole run on the host that does not have it.
- *
- * @param cmds      the redirected shell commands, one per child
- * @param prefixes  each child's scratch prefix (its `.rc` is written beside its `.out`/`.err`)
- * @param jobs      how many may be in flight at once
- * @return          the script text
- * @since 0.3.1
- */
-fn regr_batch_script(cmds: []str, prefixes: []str, jobs: u64) -> str {
-    mut s = ""
-    mut i: u64 = 0
-    loop {
-        if i >= cmds.len { break }
-        let rc = sh_squote(to_sh_path(prefixes[i] ~ REGR_RC_SUFFIX))
-        s = s ~ "{ " ~ cmds[i] ~ "; echo $? > " ~ rc ~ "; } &\n"
-        i = i + 1
-        if (i % jobs) == 0 { s = s ~ "wait\n" }
-    }
-    s ~ "wait\n"
-}
-
-/**
- * regr_batch_rc — read back one child's recorded exit status.
- *
- * @param prefix  the child's scratch prefix
- * @return        the status it recorded, or `REGR_BATCH_UNREADABLE_RC` when it recorded none
- * @since 0.3.1
- */
-fn regr_batch_rc(prefix: str) -> i32 {
-    match teko::io::read_file(prefix ~ REGR_RC_SUFFIX) {
-        str as s => regr_rc_of_text(s)
-        error => REGR_BATCH_UNREADABLE_RC
-    }
-}
-
-/**
- * regr_rc_of_text — the leading decimal of a `.rc` file's contents (the shell writes a trailing
- * newline, and on Windows shells a CR before it).
- *
- * @param s  the file contents
- * @return   the parsed status, or `REGR_BATCH_UNREADABLE_RC` for text holding no digit
- * @since 0.3.1
- */
-fn regr_rc_of_text(s: str) -> i32 {
-    mut v: i32 = 0
-    mut seen = false
-    mut i: u64 = 0
-    loop {
-        if i >= s.len { break }
-        let c = s[i]
-        if c < b'0' { break }
-        if c > b'9' { break }
-        v = (v * 10) + ((c to i32) - (b'0' to i32))
         seen = true
         i = i + 1
     }
-    if !seen { return REGR_BATCH_UNREADABLE_RC }
+    if !seen { return 0 }
     v
 }
 
-/**
- * regr_batch_capture — assemble one child's `CapResult` from the files it left behind.
- *
- * THE TIME IT REPORTS IS A SHARE, AND SAYING SO IS THE POINT. There is no portable per-child timer
- * — `date +%s%N` is a GNU extension and this runs on macOS — so the runner measures the BATCH's
- * wall clock once and divides it evenly. The SUM across a batch is therefore exact (it is the wall
- * clock the run actually paid), while any single row's figure is an average, not a measurement.
- * That is the same trade `scripts/ci_phase_clock.sh` already documents for the producer's parallel
- * asset builds: *"the only concurrent phase in the pipeline … deliberately times ITSELF locally"*.
- *
- * @param prefix    the child's scratch prefix
- * @param share_ns  this child's share of the batch's wall clock
- * @return          the captured outcome
- * @since 0.3.1
- */
-fn regr_batch_capture(prefix: str, share_ns: i64) -> CapResult {
-    CapResult {
-        exit = regr_batch_rc(prefix)
-        stdout = match teko::io::read_file(prefix ~ ".out") { str as s => s; error => "" }
-        stderr = match teko::io::read_file(prefix ~ ".err") { str as s => s; error => "" }
-        harness_ns = 0
-        child_ns = share_ns
-        cmd = ""
+fn mem_label_end(content: str, label: str): u64 {
+    if label.len == 0 || label.len > content.len { return content.len }
+    var i: u64 = 0
+    var last = content.len - label.len
+    loop {
+        if i > last { return content.len }
+        if content.slice(i, i + label.len) == label { return i + label.len }
+        i = i + 1
     }
 }
 
-/**
- * run_captured_batch — run every command CONCURRENTLY and return one `CapResult` each, in order.
- *
- * ISOLATION IS THE CALLER'S, CONCURRENCY IS THIS FUNCTION'S, and the split matters. Nothing here
- * keeps two children from colliding — that is guaranteed upstream, by each one owning its own
- * project directory and its own scratch prefix. What this adds is that N isolated builds cost one
- * batch instead of N, so a run reports N VERDICTS instead of stopping at the first.
- *
- * That is the whole reason it exists (owner, 2026-07-28): *"precisamos ganhar qualidade, quero
- * dizer, poder rodar tudo em paralelo para capturar tudo, ao invés de ter que rodar inúmeras vezes
- * para pegar somente um erro."*
- *
- * @param cmds      the redirected shell commands, one per child
- * @param prefixes  each child's scratch prefix, parallel to `cmds`
- * @return          one capture per command, in the order given (empty for no commands)
- * @since 0.3.1
- */
-fn run_captured_batch(cmds: []str, prefixes: []str) -> []CapResult {
-    mut caps: []CapResult = teko::list::empty()
-    if cmds.len == 0 { return caps }
-    let jobs = regr_jobs()
-    mut shv: []str = teko::list::push(teko::list::empty(), "sh")
-    shv = teko::list::push(shv, "-c")
-    shv = teko::list::push(shv, regr_batch_script(cmds, prefixes, jobs))
-    let t_spawn = regr_now_ns()
-    let batch_rc = teko::process::run(shv)
-    let wall_ns = regr_now_ns() - t_spawn
-    if batch_rc != 0 { teko::io::println($"teko: regression batch shell exited {batch_rc} — each child's own status is read from its .rc below") }
-    let share = wall_ns / (cmds.len to i64)
-    mut i: u64 = 0
+fn mem_job_cap_at(path: str): u64 {
+    var content = match teko::io::read_file(path) { str as s => s; error => return NO_MEM_CAP }
+    var avail = mem_available_kib(content)
+    if avail == 0 { return NO_MEM_CAP }
+    var cap = avail / MEM_PER_JOB_KIB
+    if cap < 1 { return 1 }
+    cap
+}
+
+fn mem_job_cap(): u64 { mem_job_cap_at(MEMINFO_PATH) }
+
+fn os_max_of(cpu: u64, mem: u64): u64 { if mem < cpu { mem } else { cpu } }
+
+fn os_max(): u64 { os_max_of(nproc_rt(), mem_job_cap()) }
+
+fn clamp_jobs(v: u64): u64 {
+    var m = os_max()
+    if v < 1 { return 1 }
+    if v > m { return m }
+    v
+}
+
+const REGR_JOBS_ENV: str = "TEKO_REGR_JOBS"
+
+fn regr_jobs_of(raw: str): u64 { regr_jobs_of_default(raw, os_max()) }
+
+fn regr_jobs_of_default(raw: str, fallback: u64): u64 {
+    var v: u64 = 0
+    var i: u64 = 0
     loop {
-        if i >= cmds.len { break }
-        caps = teko::list::push(caps, regr_batch_capture(prefixes[i], share))
+        if i >= raw.len { break }
+        var c = raw[i]
+        if c < b'0' { return fallback }
+        if c > b'9' { return fallback }
+        v = (v * 10) + ((c to u64) - (b'0' to u64))
         i = i + 1
+    }
+    if v == 0 { return fallback }
+    v
+}
+
+fn regr_jobs(): u64 {
+    match teko::env::var(REGR_JOBS_ENV) { str as v => clamp_jobs(regr_jobs_of(v)); error => os_max() }
+}
+
+fn pool_window(n: u64, jobs: u64): u64 {
+    if jobs < 1 { return 1 }
+    if jobs > n { return n }
+    jobs
+}
+
+pub fn run_pool(specs: []ProcSpec, jobs: u64): []CapResult {
+    var n = specs.len
+    if n == 0 { return [] }
+    var caps: [n]CapResult = []
+    var window = pool_window(n, jobs)
+    var t_pool0 = regr_now_ns()
+    var handles: [window]teko::process::ProcHandle = []
+    var spawned_at: [window]i64 = []
+    var launched: u64 = 0
+    loop {
+        if launched >= window { break }
+        handles[launched] = spawn_spec(specs[launched])
+        spawned_at[launched] = regr_now_ns()
+        launched = launched + 1
+    }
+    var harvested: u64 = 0
+    loop {
+        if harvested >= n { break }
+        caps[harvested] = harvest_spec(specs[harvested], handles[harvested], spawned_at[harvested], t_pool0)
+        harvested = harvested + 1
+        if launched < n {
+            handles = [..handles, spawn_spec(specs[launched])]
+            spawned_at = [..spawned_at, regr_now_ns()]
+            launched = launched + 1
+        }
     }
     caps
 }
 
-/**
- * regr_now_ns — the monotonic clock reading every measurement here subtracts. NEVER a wall clock: a
- * wall-clock jump would produce a negative or absurd interval, and the readings are only ever used
- * as differences.
- *
- * @return the monotonic nanosecond reading
- * @since 0.3.1
- */
-fn regr_now_ns() -> i64 {
+fn regr_now_ns(): i64 {
     teko::time::span_monotonic_now().ticks
 }
 
-/**
- * cap_synthetic — a `CapResult` the runner produced WITHOUT spawning anything (a guard rejection, an
- * unreadable source file, the empty initial build cache). Its phases are zero because no child ran.
- *
- * @param exit    the exit status to report
- * @param stderr  the message that stands in for the child's diagnostics
- * @return        the synthesized capture
- * @since 0.3.1
- */
-fn cap_synthetic(exit: i32, stderr: str) -> CapResult {
-    CapResult { exit = exit; stdout = ""; stderr = stderr; harness_ns = 0; child_ns = 0; cmd = "" }
+fn cap_synthetic(exit: i32, stderr: str): CapResult {
+    CapResult { exit = exit; stdout = ""; stderr = stderr; harness_ns = 0; child_ns = 0; cmd = ""; chan_text = "" }
 }
 
-/**
- * cap_with_extra_harness — `c` with `ns` more nanoseconds attributed to its HARNESS phase: the
- * scratch-tree work a caller did around the capture (wiping and repopulating a snippet project, for
- * instance) belongs to the same row's harness cost, not to the child's.
- *
- * @param c   the capture to attribute onto
- * @param ns  the extra harness nanoseconds
- * @return    `c` with its harness phase extended
- * @since 0.3.1
- */
-fn cap_with_extra_harness(c: CapResult, ns: i64) -> CapResult {
-    CapResult { exit = c.exit; stdout = c.stdout; stderr = c.stderr; harness_ns = c.harness_ns + ns; child_ns = c.child_ns; cmd = c.cmd }
+fn cap_with_extra_harness(c: CapResult, ns: i64): CapResult {
+    CapResult { exit = c.exit; stdout = c.stdout; stderr = c.stderr; harness_ns = c.harness_ns + ns; child_ns = c.child_ns; cmd = c.cmd; chan_text = c.chan_text }
 }
 
-/**
- * env_prefix_cmd — the `env K=V … ` shell fragment for `env` (each token individually
- * single-quoted), or "" when `env` is empty — the `run_captured_env` prefix that reaches ONLY the
- * spawned child (never the runner's own process env, so no `teko::env::set_var` leak across
- * scenarios).
- *
- * @param env  the child environment as `K=V` tokens
- * @return     the `env …` shell fragment (with a trailing space), or ""
- * @since 0.3.1
- */
-fn env_prefix_cmd(env: []str) -> str {
-    mut cmd = ""
-    mut k: u64 = 0
-    if env.len > 0 { cmd = "env" }
-    loop {
-        if k >= env.len { break }
-        cmd = cmd ~ " " ~ sh_squote(env[k])
-        k = k + 1
-    }
-    if env.len > 0 { cmd = cmd ~ " " }
-    cmd
+fn run_captured_env(argv: []str, stdin_data: str, env: []str, prefix: str): CapResult {
+    run_captured_spec(ProcSpec { argv = argv; dir = ""; env = env; stdin_data = stdin_data; prefix = prefix })
 }
 
-/**
- * cd_prefix_cmd — the `cd <dir> && ` shell fragment for `dir`, or "" when `dir` is "" or "."
- * (already the shell's cwd) — the `run_captured_in_dir` prefix behind `When built in place` (the
- * #64 CWD-relative shape).
- *
- * @param dir  the directory to `cd` into before the command
- * @return     the `cd …&& ` shell fragment, or ""
- * @since 0.3.1
- */
-fn cd_prefix_cmd(dir: str) -> str {
-    if dir.len == 0 || dir == "." { return "" }
-    "cd " ~ sh_squote(to_sh_path(dir)) ~ " && "
+fn run_captured_in_dir(argv: []str, stdin_data: str, env: []str, dir: str, prefix: str): CapResult {
+    var effective_dir = if dir == "." { "" } else { dir }
+    run_captured_spec(ProcSpec { argv = argv; dir = effective_dir; env = env; stdin_data = stdin_data; prefix = prefix })
 }
 
-/**
- * run_captured_env — `run_captured` with a per-child environment: run `argv` under `env`
- * (`K=V` tokens) with `stdin_data` on its stdin, capturing exit/stdout/stderr via the same
- * `/bin/sh -c` redirection. Implemented by prefixing the command with `env K=V …` (each token
- * single-quoted), so the environment reaches ONLY the child — the runner's own env is untouched
- * (no `teko::env::set_var` leak across scenarios). `env == []` is byte-identical to the old
- * `run_captured`.
- *
- * @param argv        the command to run (argv[0] is the executable)
- * @param stdin_data  bytes to feed the child's stdin
- * @param env         the child environment as `K=V` tokens ([] = inherit only)
- * @param prefix      the scratch-file path prefix (its parent directory is created)
- * @return            the captured exit/stdout/stderr
- * @since 0.3.1
- */
-fn run_captured_env(argv: []str, stdin_data: str, env: []str, prefix: str) -> CapResult {
-    run_captured_cmd_prefixed(env_prefix_cmd(env), argv, stdin_data, prefix)
+fn run_captured(argv: []str, stdin_data: str, prefix: str): CapResult {
+    run_captured_env(argv, stdin_data, [], prefix)
 }
 
-/**
- * run_captured_in_dir — `run_captured_env` with the command additionally `cd`-ed into `dir` first
- * (the #64 CWD-relative shape `When built in place` needs: `teko build .` with CWD == `dir`, not
- * `teko build <dir>` from the runner's own cwd). `dir == "."` (or "") is a no-op `cd`.
- *
- * @param argv        the command to run (argv[0] is the executable)
- * @param stdin_data  bytes to feed the child's stdin
- * @param env         the child environment as `K=V` tokens ([] = inherit only)
- * @param dir         the directory to run `argv` from
- * @param prefix      the scratch-file path prefix (its parent directory is created)
- * @return            the captured exit/stdout/stderr
- * @since 0.3.1
- */
-fn run_captured_in_dir(argv: []str, stdin_data: str, env: []str, dir: str, prefix: str) -> CapResult {
-    run_captured_cmd_prefixed(cd_prefix_cmd(dir) ~ env_prefix_cmd(env), argv, stdin_data, prefix)
-}
-
-/**
- * run_captured — run `argv` with `stdin_data` on its stdin, capturing exit/stdout/stderr via a
- * `/bin/sh -c` redirection to scratch files under `prefix` (`.in`/`.out`/`.err`). The scratch
- * directory is created if missing. On a read failure the captured stream is "". The native
- * `mkdir_p`/`write_file`/`read_file` calls use `prefix`'s host-native form (backslash on Windows is
- * fine there); only the redirection tokens embedded in the `sh -c` command line go through
- * `to_sh_path` (`argv` itself is the caller's job — see `compile_regressive`/`argv_with_args`, which
- * convert the PATH entries they build before handing the argv here). An `env`-less
- * `run_captured_env` call (0.3.1 C2).
- *
- * @param argv        the command to run (argv[0] is the executable)
- * @param stdin_data  bytes to feed the child's stdin
- * @param prefix      the scratch-file path prefix (its parent directory is created)
- * @return            the captured exit/stdout/stderr
- * @since 0.3.0.29
- */
-fn run_captured(argv: []str, stdin_data: str, prefix: str) -> CapResult {
-    run_captured_env(argv, stdin_data, teko::list::empty(), prefix)
-}
-
-/**
- * tool_on_path — is `name` an executable reachable on the child shell's `PATH`? Shells `command -v
- * <name>` (POSIX-portable, unlike `which`) and reads its exit status; used to honest-skip a
- * run-wrapper / leaf-tool step whose host toolchain is absent (0.3.1 C3), rather than fabricate a
- * pass or crash on a missing binary.
- *
- * @param name  the executable name to probe
- * @return      true when `command -v name` succeeds
- * @since 0.3.1
- */
-fn tool_on_path(name: str) -> bool {
-    let cmd = teko::str::concat("command -v ", sh_squote(name)) ~ " >/dev/null 2>&1"
-    mut shv: []str = teko::list::push(teko::list::empty(), "sh")
-    shv = teko::list::push(shv, "-c")
-    shv = teko::list::push(shv, cmd)
+fn tool_on_path(name: str): bool {
+    var shv: []str = ["sh", "-c", teko::str::concat("command -v ", name) ~ " >/dev/null 2>&1"]
     teko::process::run_quiet(shv) == 0
 }
 
-/**
- * TOOL_QUERY_PREFIX — the scratch-file prefix every toolchain QUERY (`tool_query_line`) captures
- * through, inside `REGR_WORK_DIR` (spelled out rather than concatenated from it — a `const` may not
- * call `~`, #594). One fixed prefix, not a per-call unique one: these queries are idempotent
- * readings of the host toolchain, so the last one's capture files are the only ones worth keeping,
- * and a unique prefix per call would litter the work tree with a file per row for no diagnostic
- * gain.
- */
 const TOOL_QUERY_PREFIX: str = "bin/.regr-work/.toolquery"
 
-/**
- * tool_query_line — ASK a host tool a question and read its one-line answer: run `argv`, and on a
- * ZERO exit return the first line of its stdout with any trailing carriage return stripped (a `sh`
- * on Windows can deliver CRLF); on any non-zero exit — including the shell's 127 for an absent
- * executable — return "". The empty answer is therefore ALWAYS "this host could not tell me", never
- * a fact, which is what lets every caller here fail SAFE by treating "" as "no reason to skip".
- *
- * This is the measurement style the capability probes use: ask the very toolchain that will do the
- * work what it is, rather than infer it from the kernel (`uname -m`) or from a path convention. The
- * two are NOT interchangeable — a Windows-on-ARM host whose `cc` is an emulated x86-64 toolchain
- * reports `aarch64` to `uname` and `x86_64` to the compiler, and it is the COMPILER that links.
- *
- * @param argv  the tool invocation (argv[0] is the executable)
- * @return      the first line of the tool's stdout, or "" when it failed or is absent
- * @since 0.3.1
- */
-fn tool_query_line(argv: []str) -> str {
-    let cap = run_captured(argv, "", TOOL_QUERY_PREFIX)
+fn tool_query_prefix(): str { teko::test::scoped(TOOL_QUERY_PREFIX) }
+
+fn tool_query_line(argv: []str): str {
+    var cap = run_captured(argv, "", tool_query_prefix())
     if cap.exit != 0 { return "" }
-    let line = first_line(cap.stdout)
-    if line.len > 0 && line[line.len - 1] == b'\r' { return teko::str::slice_to(line, line.len - 1) }
-    line
+    trimmed_line(first_line(cap.stdout))
 }
 
-/**
- * REGRESSION_REQUIRE_TOOLS_VAR — the environment-variable key of the fail-closed toggle: on a
- * provisioned CI lane, setting it to `"1"` turns an absent-toolchain honest-skip (`Given target`'s
- * run-wrapper, a leaf-tool `Then` step) into a hard FAILURE instead — a broken provisioning step
- * must not silently degrade to green (R2, mirroring the retired `REQUIRE_WASM_ENGINE`). A dev
- * laptop with the var unset keeps the honest-skip default.
- */
 const REGRESSION_REQUIRE_TOOLS_VAR: str = "REGRESSION_REQUIRE_TOOLS"
 
-/**
- * tool_skip_or_fail — turn a missing-toolchain `reason` into an honest skip, UNLESS
- * `REGRESSION_REQUIRE_TOOLS=1` is set (a provisioned CI lane), in which case it is a hard failure
- * (R2).
- *
- * @param reason  the missing-tool explanation
- * @return        a skip outcome by default, a fail outcome under the fail-closed flag
- * @since 0.3.1
- */
-fn tool_skip_or_fail(reason: str) -> RegrOutcome {
-    let require = match teko::env::var(REGRESSION_REQUIRE_TOOLS_VAR) { str as v => v == "1"; error => false }
+fn tool_skip_or_fail(reason: str): RegrOutcome {
+    var require = match teko::env::var(REGRESSION_REQUIRE_TOOLS_VAR) { str as v => v == "1"; error => false }
     if require { return regr_fail(reason) }
     regr_skip(reason)
 }
 
-/**
- * regressive_name — the `name` of the regressive project at `regr_dir` (read from its single
- * `<name>.tkp`), used to locate the built binary at `<regr_dir>/bin/<name>`.
- *
- * @param regr_dir  the regressive project directory
- * @return          the project name, or an `error` when no single `.tkp` parses
- * @throws          when the directory has no `.tkp` or its manifest is malformed
- * @since 0.3.0.29
- */
-fn regressive_name(regr_dir: str) -> str | error {
-    let entries = match teko::fs::list_dir(regr_dir) { []str as e => e; error as e => return e }
-    mut tkp = ""
-    mut k: u64 = 0
+fn regressive_name(regr_dir: str): str | error {
+    var entries = match teko::fs::list_dir(regr_dir) { []str as e => e; error as e => return e }
+    var tkp = ""
+    var k: u64 = 0
     loop {
         if k >= entries.len { break }
-        if teko::str::ends_with(entries[k], ".tkp") { tkp = entries[k] }
+        if entries[k].ends_with(".tkp") { tkp = entries[k] }
         k = k + 1
     }
     if tkp.len == 0 { return error { message = "regressive has no .tkp manifest" } }
-    let text = match teko::io::read_file(regr_dir ~ "/" ~ tkp) { str as s => s; error as e => return e }
-    let m = match parse_manifest(text) { Manifest as mm => mm; error as e => return e }
+    var text = match teko::io::read_file(regr_dir ~ "/" ~ tkp) { str as s => s; error as e => return e }
+    var m = match parse_manifest(text) { Manifest as mm => mm; error as e => return e }
     m.name
 }
 
-/**
- * argv_with_args — build the run argv: the binary path (`to_sh_path`-normalized, so the `sh -c` that
- * `run_captured` spawns can exec it on Windows) followed by the `.tkr` `args` UNCHANGED (the
- * fold-opaque runtime operands — never path-normalized, since they are not necessarily paths).
- *
- * @param binp  the built binary path
- * @param args  the argv operands from the `.tkr`
- * @return      the full run argv
- * @since 0.3.0.29
- */
-fn argv_with_args(binp: str, args: []str) -> []str {
-    mut out: []str = teko::list::push(teko::list::empty(), to_sh_path(binp))
-    mut k: u64 = 0
-    loop {
-        if k >= args.len { break }
-        out = teko::list::push(out, args[k])
-        k = k + 1
-    }
-    out
+fn argv_with_args(binp: str, args: []str): []str {
+    [binp, ..args]
 }
 
-/**
- * wrap_argv_with_wrapper — `argv` with `wrapper`'s tokens prepended (e.g. `["wasmtime", "run"]`), or
- * `argv` unchanged when `wrapper` is `[]` (a native host target — the common case).
- *
- * @param wrapper  the run-wrapper argv prefix (from `resolve_run_wrapper`)
- * @param argv     the binary + args argv (from `argv_with_args`)
- * @return         `wrapper ~ argv`, or `argv` unchanged when `wrapper` is empty
- * @since 0.3.1
- */
-fn wrap_argv_with_wrapper(wrapper: []str, argv: []str) -> []str {
-    if wrapper.len == 0 { return argv }
-    mut out: []str = teko::list::empty()
-    mut k: u64 = 0
-    loop {
-        if k >= wrapper.len { break }
-        out = teko::list::push(out, wrapper[k])
-        k = k + 1
-    }
-    mut j: u64 = 0
-    loop {
-        if j >= argv.len { break }
-        out = teko::list::push(out, argv[j])
-        j = j + 1
-    }
-    out
-}
-
-/**
- * resolve_run_wrapper — the executor prefix argv for `target`: `[]` for a native host target
- * (`""`/`"host"`), `["wasmtime", "run"]` (plus `"-W", "memory64=y"` for `wasm64-wasi`/`wasm64`) for
- * a wasm target. Returns an error carrying a
- * human-readable reason when the required CAPABILITY is not whole on this host; the caller
- * (`tkr_run_one_row`, via `tool_skip_or_fail`) turns that into an honest os-arch skip, unless the
- * `REGRESSION_REQUIRE_TOOLS` fail-closed flag is set (§7).
- *
- * @param target  the effective os-arch / wasm target ("" / "host" → no wrapper)
- * @return        the run-wrapper argv prefix, or an error naming the missing capability
- * @throws        when `wasmtime` is required by `target` and this host does not have it
- * @since 0.3.1
- */
-fn resolve_run_wrapper(target: str) -> []str | error {
-    let no_wrapper: []str = teko::list::empty()
-    if target.len == 0 || target == HOST_TARGET { return no_wrapper }
-    if target == "wasm32-wasi" || target == "wasm32" || target == "wasm" || target == "wasi" {
-        if !tool_on_path("wasmtime") { return error { message = teko::str::concat("wasmtime not found on PATH for target ", target) } }
-        return teko::list::push(teko::list::push(teko::list::empty(), "wasmtime"), "run")
-    }
-    if target == "wasm64-wasi" || target == "wasm64" {
-        if !tool_on_path("wasmtime") { return error { message = teko::str::concat("wasmtime not found on PATH for target ", target) } }
-        mut w: []str = teko::list::push(teko::list::empty(), "wasmtime")
-        w = teko::list::push(w, "run")
-        w = teko::list::push(w, "-W")
-        return teko::list::push(w, "memory64=y")
-    }
-    no_wrapper
-}
-
-/**
- * tkr_effective_target — the os-arch a leaf-tool check runs against: the scenario's declared
- * `Given target` when it names a REAL cross target, else this build host's own `teko::os()`. The
- * `HOST_TARGET` sentinel (`"host"`) resolves to the host exactly like an undeclared target — it is
- * the spelling a two-column backend×target `Examples` table uses for its host row, and it must
- * never be handed to a leaf-tool selector as if it were an os-arch name.
- *
- * @param target  the scenario's declared target ("" / "host" → host default)
- * @return        the effective os-arch
- * @since 0.3.1
- */
-fn tkr_effective_target(target: str) -> str {
+fn tkr_effective_target(target: str): str {
     if target.len > 0 && target != HOST_TARGET { return target }
-    teko::os()
+    os()
 }
 
-/**
- * HOST_CC_NAME — the compiler token `resolve_cc`/`default_cc_for_target` return for a target that
- * links with the BUILD HOST's own toolchain. A target resolving to it needs no cross-toolchain
- * probe, so the name is pinned here rather than spelled inline at the comparison site.
- */
 const HOST_CC_NAME: str = "cc"
 
-/**
- * cross_cc_for_target — the CROSS-compiler a `Given target` build will actually link through, or ""
- * when `target` links with the host `cc`. Delegates to the very functions the build itself uses
- * (`target_from_name` + `default_cc_for_target`, the `TEKO_TARGET` arm of `resolve_cc`), so the
- * runner's pre-build capability probe can never drift from the linker the build then invokes. An
- * unrecognised target name yields "" — its honest R2 stop belongs to `emit_native`, not here.
- *
- * @param target  the scenario's declared target ("" / "host" → the host toolchain)
- * @return        the cross-compiler command, or "" when the host `cc` links this target
- * @since 0.3.1
- */
-fn cross_cc_for_target(target: str) -> str {
+fn cross_cc_for_target(target: str): str {
     if target.len == 0 || target == HOST_TARGET { return "" }
-    let cc = match target_from_name(target) { NativeTarget as t => default_cc_for_target(t); error => "" }
+    var cc = match target_from_name(target) { NativeTarget as t => default_cc_for_target(t); error => "" }
     if cc == HOST_CC_NAME { return "" }
     cc
 }
 
-/**
- * host_cc_cannot_link_cross_reason — "" unless `target` is a CROSS target whose link step would run
- * through the build host's own `cc` with no cross toolchain pinned, in which case it names why the
- * row cannot be built here. `default_cc_for_target` returns the host `cc` for every target that has
- * no dedicated cross driver (`x86_64-linux`, `arm64-macos`), and the host `cc` cannot link an object
- * of a foreign format — so on an arm64-macos host a `Given target = "x86_64-linux"` row would die in
- * `ld` with a cross-format error indistinguishable from a real regression. Reuses the build's OWN
- * cross classification (`cross_note_for_name`) and its `TEKO_CC` seam (`teko_cc_env` — a pinned
- * cross driver lifts the skip), so the runner never invents a second idea of what "cross" means.
- * Wasm targets are exempt: they have no link step at all (`target_links_with_cc`).
- *
- * @param target  the scenario's declared target ("" / "host" → never cross)
- * @return        "" when this host can link `target`, else the honest reason it cannot
- * @since 0.3.1
- */
-fn host_cc_cannot_link_cross_reason(target: str) -> str {
+fn host_cc_cannot_link_cross_reason(target: str): str {
     if !cross_note_for_name(target).is_cross { return "" }
-    let t = match target_from_name(target) { NativeTarget as x => x; error => return "" }
+    var t = match target_from_name(target) { NativeTarget as x => x; error => return "" }
     if !target_links_with_cc(t) { return "" }
     if default_cc_for_target(t) != HOST_CC_NAME { return "" }
     if teko_cc_env().len > 0 { return "" }
     $"the host cc cannot link a {target_name(t)} object and no cross toolchain is pinned (TEKO_CC)"
 }
 
-/**
- * HOST_CC_MACHINE_FLAG — the flag that makes a gcc/clang-compatible driver print the TARGET TRIPLE
- * it compiles and links for (`x86_64-linux-gnu`, `aarch64-linux-gnu`, `arm64-apple-darwin24`, …).
- * A driver that does not understand it exits non-zero, which `tool_query_line` reports as "" — the
- * fail-safe answer.
- */
 const HOST_CC_MACHINE_FLAG: str = "-dumpmachine"
 
-/**
- * arch_token_canonical — one CPU spelled one way. A compiler triple's first field and this project's
- * canonical os-arch names (`target_arch_name`) do not always agree on the name of the same CPU:
- * GNU/Linux triples say `aarch64` where the canonical name is `arm64`, and `amd64`/`x64` appear for
- * `x86_64`. Folding both sides through this function is what lets the two be COMPARED at all; an
- * unrecognised token is returned unchanged, so a CPU nobody here knows simply never matches.
- *
- * @param tok  an arch token from either vocabulary
- * @return     its canonical spelling
- * @since 0.3.1
- */
-fn arch_token_canonical(tok: str) -> str {
+fn arch_token_canonical(tok: str): str {
     if tok == "aarch64" { return "arm64" }
     if tok == "amd64" || tok == "x64" { return "x86_64" }
     tok
 }
 
-/**
- * host_cc_arch — the CPU the build host's own `cc` targets, canonically spelled, or "" when this
- * host cannot say (no `cc`, or a driver with no `-dumpmachine`). Read off the LINKER, not off the
- * kernel: `uname -m` reports the CPU the OS runs on, which is the wrong question — what decides
- * whether a link succeeds is the arch the compiler driver itself is built to emit and consume. The
- * two differ exactly where it would hurt most: on a Windows-on-ARM host running an emulated x86-64
- * toolchain, `uname -m` says `aarch64` while the `cc` that links says `x86_64`, and it is the `cc`
- * that is right.
- *
- * @return the host `cc`'s target arch, or "" when unknown
- * @since 0.3.1
- */
-fn host_cc_arch() -> str {
-    mut argv: []str = teko::list::push(teko::list::empty(), HOST_CC_NAME)
-    argv = teko::list::push(argv, HOST_CC_MACHINE_FLAG)
-    let triple = tool_query_line(argv)
-    mut k: u64 = 0
+fn host_cc_arch(): str {
+    var argv: []str = [HOST_CC_NAME, HOST_CC_MACHINE_FLAG]
+    var triple = tool_query_line(argv)
+    var k: u64 = 0
     loop {
         if k >= triple.len { break }
         if triple[k] == b'-' { break }
         k = k + 1
     }
-    arch_token_canonical(teko::str::slice_to(triple, k))
+    arch_token_canonical(triple.slice_to(k))
 }
 
-/**
- * host_cc_cannot_link_host_default_reason — the HOST-DEFAULT sibling of
- * `host_cc_cannot_link_cross_reason`, and the answer to the one case that one structurally cannot
- * see. That function only ever fires for a target the build classes as CROSS; a row that declares
- * no target (or the `HOST_TARGET` sentinel) is by definition NOT cross, so nothing checked whether
- * this host can link the object the host default would actually produce — and on one host shape it
- * cannot.
- *
- * THE HOST SHAPE. `host_target_for_os` is OS-ONLY (it maps `linux` → `x86_64-linux`
- * unconditionally), because the arch half needs `teko::arch()`, which is not yet a seed-recognized
- * builtin. On an aarch64 LINUX host that mapping is simply wrong: the own backend emits an
- * ELF x86-64 object, the host `cc` refuses to link it, and the row dies with `cc failed to link the
- * own-backend object` — a message a reader cannot tell apart from a real codegen regression. This
- * is the same defect the `host_default_target` doc-comment records for the old hardcoded
- * `Arm64Macho` default, mirrored: there, a linux host emitted arm64 Mach-O; here, an arm64 host
- * emits x86-64 ELF.
- *
- * WHY IT MEASURES THE `cc` AND NOT THE KERNEL. The question is not "what CPU is this host" but "can
- * the linker that will run accept this object", so the reading comes from `cc -dumpmachine`
- * (`host_cc_arch`). Every unknown is fail-SAFE: an absent `cc`, a driver without `-dumpmachine`, a
- * triple this file cannot parse, or a wasm target with no arch at all all yield "" and NO skip, so a
- * host that cannot be measured behaves exactly as it did before this rule existed.
- *
- * WHY ONLY ELF. An arch mismatch is FATAL only where the system linker is arch-locked, and of the
- * three object formats here that is ELF: `ld` refuses an object whose `e_machine` is not its own,
- * full stop. The Mach-O and PE/COFF toolchains are cross-arch BY DESIGN — Apple's `ld` takes
- * `-arch` and builds fat binaries, and the LLVM/MS Windows linkers take the machine type from the
- * object — so on those hosts a mismatched `-dumpmachine` reading does NOT imply a failed link, and
- * skipping on it would silence rows that currently pass on a macOS host, whose host default is
- * x86-64 and whose own-backend rows are green). Narrowing to ELF keeps
- * this rule fail-CLOSED: where it declines to fire, the host still reports whatever really happens.
- *
- * WHY IT IS NOT AN EMPIRICAL LINK PROBE. The obvious alternative — emit a tiny object with the
- * host-default target and try to link it once — measures the real thing, and is FAIL-OPEN in the one
- * way that matters: a genuine regression in the own backend's object emission also makes that probe
- * fail, so every own-backend row would honest-skip and the gate would go GREEN on a real codegen
- * break. This rule's two inputs are the host `cc` and a pure enum→string function, so no compiler
- * change can trigger it.
- *
- * WHY IT REMOVES ITSELF (R4). The skip is keyed on a MISMATCH between the host `cc`'s arch and the
- * arch of the target the host default resolves to. The day an `arm64-linux` target exists and
- * `host_target_for_os` becomes arch-aware, that mismatch stops occurring on an arm64 host and the
- * rule falls silent on its own — no edit here, and none needed. It stays correct meanwhile for any
- * OTHER host whose arch the own backend has no target for.
- *
- * @param target       the scenario's declared target ("" / `HOST_TARGET` → the host default; an
- *                     explicit cross belongs to `host_cc_cannot_link_cross_reason`)
- * @param own_backend  whether the row builds with the own backend (the only path that emits an
- *                     object for a `NativeTarget`)
- * @return             "" when this host can link what it would emit, else the honest reason it cannot
- * @since 0.3.1
- */
-fn host_cc_cannot_link_host_default_reason(target: str, own_backend: bool) -> str {
+fn host_default_unsupported_skip_reason(is_host_default_row: bool, e: error): str {
+    if !is_host_default_row { return "" }
+    $"this row needs the own backend's host-default target, but this host has none: {e.message}"
+}
+
+fn host_cc_cannot_link_host_default_reason(target: str, own_backend: bool): str {
     if !own_backend { return "" }
     if teko_cc_env().len > 0 { return "" }
     if cross_note_for_name(target).is_cross { return "" }
-    let sel = match own_backend_target_of_row(target) { NativeTarget as x => x; error => return "" }
+    var is_host_default_row = target.len == 0 || target == HOST_TARGET
+    var sel = match own_backend_target_of_row(target) {
+        NativeTarget as x => x
+        error as e => return host_default_unsupported_skip_reason(is_host_default_row, e)
+    }
     if !target_links_with_cc(sel) { return "" }
     if default_cc_for_target(sel) != HOST_CC_NAME { return "" }
     if target_objfmt(sel) != OBJFMT_ELF { return "" }
-    let want = target_arch_name(sel)
+    var want = target_arch_name(sel)
     if want.len == 0 { return "" }
-    let have = host_cc_arch()
+    var have = host_cc_arch()
     if have.len == 0 || have == want { return "" }
-    $"this row emits for {target_name(sel)} ({want} ELF) but the host cc targets {have}, and the host cc cannot link a foreign-arch object — the own backend has no {have}-{target_os_name(sel)} target, because host_target_for_os is OS-only until teko::arch() is seed-recognized"
+    $"this row emits for {target_name(sel)} ({want} ELF) but the host cc targets {have}, and the host cc cannot link a foreign-arch object — its own `arch()` reading and its `cc`'s target arch disagree"
 }
 
-/**
- * own_backend_target_of_row — the `NativeTarget` an own-backend row actually emits for: the host
- * default when the row declares no target (or the literal `HOST_TARGET`), else the declared name
- * resolved through the build's OWN resolver.
- *
- * Split out because comparing target STRINGS is what let a real red through. `HOST_TARGET` is the
- * literal `"host"`, not a canonical target name, so a guard written as
- * `target != HOST_TARGET → not my business` silently exempted every row that spells its target
- * out — and `own_explicit_host_os_arch_runs`, which declares `x86_64-linux`, is exactly such a row.
- * On an arm64 host it walked past the guard and died in `ld` with
- * `Relocations in generic ELF (EM: 62)`: the same foreign-arch failure the guard exists to convert
- * into an honest skip. Resolving to the enum and comparing the ARCH cannot be fooled by a spelling,
- * an alias (`x86_64-elf`), or a row that names the host default explicitly.
- *
- * THE DIVISION OF LABOUR IS RESTORED SEMANTICALLY, NOT BY STRING. A genuinely CROSS target stays
- * `host_cc_cannot_link_cross_reason`'s question, and the caller now asks `cross_note_for_name`
- * instead of comparing to `HOST_TARGET` — which is what makes the two rules partition rather than
- * overlap. The distinction is real and host-dependent: on macOS, `x86_64-linux` IS cross and the
- * cross rule answers; on an arm64 LINUX host the same name is NOT cross (the host default is
- * OS-derived and says `x86_64-linux`), the cross rule stays silent, and this rule is the only one
- * that can see the arch mismatch. Getting this wrong is not theoretical: the first version of this
- * generalisation answered for both, and `macos-arm64` went red on
- * `host_cc_cannot_link_host_default_reason_only_fires_for_an_own_host_row` — a lane an x86_64
- * gate cannot reproduce, because there the two arches agree and every branch collapses.
- *
- * @param target  the scenario's declared target ("" / `HOST_TARGET` → the host default)
- * @return        the resolved own-backend target, or the resolver's honest error
- * @since 0.3.1
- */
-fn own_backend_target_of_row(target: str) -> NativeTarget | error {
+fn own_backend_target_of_row(target: str): NativeTarget | error {
     if target.len == 0 || target == HOST_TARGET { return host_default_target() }
     target_from_name(target)
 }
 
-/**
- * target_toolchain_skip_reason — "" when every tool a `Given target` scenario needs is on this
- * host's PATH, else the human-readable reason the scenario cannot honestly run here. Probed BEFORE
- * the artifact is built, because a missing CROSS-LINKER surfaces as a `cc` failure the runner cannot
- * distinguish from a real compiler regression — the run-wrapper check alone (`resolve_run_wrapper`,
- * consulted only after a successful build) would therefore turn "this host has no cross toolchain"
- * into a red gate on every host that legitimately has none. The same argument covers a cross target
- * with NO dedicated cross driver (`host_cc_cannot_link_cross_reason`), which would otherwise reach
- * the host `ld` and fail on the object format.
- *
- * A capability is checked WHOLE or not at all: having a target's emulator on PATH is not the
- * capability by itself when the artifact also needs a cross-linker to exist at all. A half-probed
- * capability is worse than an unprobed one — it PASSES the gate and then dies past the build, which
- * is the very confusion this function exists to prevent.
- *
- * @param target  the scenario's declared target ("" / "host" → always runnable)
- * @return        "" when the target is runnable here, else the missing-capability reason
- * @since 0.3.1
- */
-fn target_toolchain_skip_reason(target: str) -> str {
-    let cc = cross_cc_for_target(target)
+fn target_toolchain_skip_reason(target: str): str {
+    var cc = cross_cc_for_target(target)
     if cc.len > 0 && !tool_on_path(cc) {
         return $"{cc} (the cross-linker for target {target}) not found on PATH"
     }
-    let host_cc = host_cc_cannot_link_cross_reason(target)
-    if host_cc.len > 0 { return host_cc }
-    match resolve_run_wrapper(target) { []str => ""; error as e => e.message }
+    host_cc_cannot_link_cross_reason(target)
 }
 
-/**
- * tkr_row_capability_skip_reason — "" when this host can honestly run `t`, else the ONE reason it
- * cannot. The row's whole pre-build capability question in one place: what its DECLARED target needs
- * (`target_toolchain_skip_reason` — a cross linker, an emulator and its sysroot, a wasm engine) and,
- * for a row that declares no target at all, whether this host can link what the host default would
- * emit for it (`host_cc_cannot_link_host_default_reason`). The two are complementary by
- * construction: the first is silent for a host row, the second is silent for a cross one.
- *
- * Both are answered BEFORE any build, which is the whole point — every capability gap in this list
- * would otherwise surface as a `cc`/`ld`/`exit 255` failure the reader cannot tell apart from a real
- * compiler regression.
- *
- * @param t  the lowered row
- * @return   "" when the row can run here, else the honest reason it cannot
- * @since 0.3.1
- */
-fn tkr_row_capability_skip_reason(t: Tkr) -> str {
-    let missing = target_toolchain_skip_reason(t.target)
+fn tkr_row_capability_skip_reason(t: Tkr): str {
+    var missing = target_toolchain_skip_reason(t.target)
     if missing.len > 0 { return missing }
     host_cc_cannot_link_host_default_reason(t.target, true)
 }
 
-/**
- * wellformed_script_for — the surviving host-toolchain leaf script for `target`'s object format:
- * `scripts/check_coff.sh` for a windows target, `scripts/check_macho.sh` for macOS, else
- * `scripts/check_elf.sh` for linux. "" for a wasm target — a `.wasm` module is checked by `Then module
- * valid` (`check_module_valid`), never `Then object well-formed`.
- *
- * @param target  the effective os-arch
- * @return        the leaf script path, or "" when `target` names a wasm target
- * @since 0.3.1
- */
-fn wellformed_script_for(target: str) -> str {
-    if teko::str::contains(target, "wasm") { return "" }
-    if teko::str::contains(target, "windows") { return "scripts/check_coff.sh" }
-    if teko::str::contains(target, "macos") || teko::str::contains(target, "macho") || teko::str::contains(target, "darwin") { return "scripts/check_macho.sh" }
+fn wellformed_script_for(target: str): str {
+    if target.contains("windows") { return "scripts/check_coff.sh" }
+    if target.contains("macos") || target.contains("macho") || target.contains("darwin") { return "scripts/check_macho.sh" }
     "scripts/check_elf.sh"
 }
 
-/**
- * check_object_wellformed — post-build cross-check the emitted `<name>.o` with the host
- * toolchain leaf tool for the effective target: `scripts/check_elf.sh` (ELF),
- * `scripts/check_macho.sh` (Mach-O), `scripts/check_coff.sh` (PE/COFF). A `Then object
- * well-formed` scenario runs this after a `backend = "own"` build. A rejected object is a FAIL;
- * an absent tool is an honest SKIP with a named reason (never a pass) — the leaf scripts
- * themselves already honest-skip (exit 0) when their host toolchain is absent, so a non-zero exit
- * here is always a genuine rejection. These three scripts are the ONLY `scripts/*` that survive
- * the regression-script cull — leaf tools, not orchestration.
- *
- * @param objp    the emitted object path (`<oout>/<name>.o`)
- * @param target  the effective os-arch (selects elf/macho/coff)
- * @return        the verdict (ok / FAIL / skip-when-no-checker-for-target)
- * @since 0.3.1
- */
-fn check_object_wellformed(objp: str, target: str) -> RegrOutcome {
-    let script = wellformed_script_for(target)
+fn check_object_wellformed(objp: str, target: str): RegrOutcome {
+    var script = wellformed_script_for(target)
     if script.len == 0 { return regr_skip(teko::str::concat("no object well-formedness checker for target ", target)) }
-    mut argv: []str = teko::list::push(teko::list::empty(), script)
-    argv = teko::list::push(argv, to_sh_path(objp))
-    let cap = run_captured(argv, "", objp ~ ".wellformed")
+    var argv: []str = [script, objp, target]
+    var cap = run_captured(argv, "", objp ~ ".wellformed")
     if cap.exit != 0 {
         return regr_fail($"object well-formedness check failed{captured_output_block(cap)}")
     }
     regr_pass()
 }
 
-/**
- * check_module_valid — post-build cross-check the emitted `.wasm` module with the host
- * `wasm-validate` tool (a `Then module valid` scenario, the wasm sibling of `Then object
- * well-formed`). A rejected module is a FAIL; an absent `wasm-validate` is an honest SKIP — or a
- * hard FAILURE under `REGRESSION_REQUIRE_TOOLS=1` (`tool_skip_or_fail`), which is what that flag
- * documents itself as covering: on a lane that PROVISIONED the tool, its absence is a broken
- * provisioning step, and degrading that to green is the fail-open the flag exists to close.
- *
- * @param objp  the emitted `.wasm` module path (the wasm target's binary IS the module — no
- *              separate link step)
- * @return      the verdict (ok / FAIL / skip-when-wasm-validate-absent)
- * @since 0.3.1
- */
-fn check_module_valid(objp: str) -> RegrOutcome {
-    if !tool_on_path("wasm-validate") { return tool_skip_or_fail("wasm-validate not found on PATH") }
-    mut argv: []str = teko::list::push(teko::list::empty(), "wasm-validate")
-    argv = teko::list::push(argv, to_sh_path(objp))
-    let cap = run_captured(argv, "", objp ~ ".wasmvalid")
-    if cap.exit != 0 {
-        return regr_fail($"wasm-validate rejected the module{captured_output_block(cap)}")
-    }
-    regr_pass()
-}
-
-/**
- * compile_regressive — build the regressive project at `regr_dir` with the current compiler `exe`
- * (`teko <regr_dir> -o bin --no-verify`) under `env`, capturing the build's exit/stderr (the stderr
- * carries the diagnostic a `compile_fail` regressive pins). The binary lands at
- * `<regr_dir>/bin/<name>`. Both `exe` and `regr_dir` are `to_sh_path`-normalized before they enter
- * the argv, so the `sh -c` this spawns through can exec them on Windows.
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressive project directory
- * @param env       per-scenario child env (`K=V` tokens; 0.3.1 C2) — [] for the historic behavior
- * @param prefix    the scratch-file prefix for this compile
- * @return          the captured build outcome
- * @since 0.3.0.29
- */
-fn compile_regressive(exe: str, regr_dir: str, env: []str, prefix: str) -> CapResult {
+fn compile_regressive(exe: str, regr_dir: str, env: []str, prefix: str): CapResult {
     run_captured_env(compile_regressive_argv(exe, regr_dir), "", env, prefix)
 }
 
-/**
- * compile_regressive_argv — the argv `compile_regressive` runs. Named so the SERIAL path and the
- * BATCH path build the same command from one place; a second spelling of a build invocation is a
- * second thing that can drift.
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressive project directory to build
- * @return          the argv
- * @since 0.3.1
- */
-fn compile_regressive_argv(exe: str, regr_dir: str) -> []str {
-    mut argv: []str = teko::list::push(teko::list::empty(), to_sh_path(exe))
-    argv = teko::list::push(argv, to_sh_path(regr_dir))
-    argv = teko::list::push(argv, "-o")
-    argv = teko::list::push(argv, "bin")
-    argv = teko::list::push(argv, "--no-verify")
-    argv
+fn compile_regressive_argv(exe: str, regr_dir: str): []str {
+    [exe, regr_dir, "-o", "bin", "--no-verify"]
 }
 
-/**
- * compile_regressive_cmd — the shell text `compile_regressive` would run, WITHOUT running it, so a
- * caller can hand it to `run_captured_batch` alongside its siblings.
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressive project directory to build
- * @param env       per-scenario child env (`K=V` tokens)
- * @param prefix    the scratch-file prefix this build's capture files hang off
- * @return          the redirected shell command
- * @since 0.3.1
- */
-fn compile_regressive_cmd(exe: str, regr_dir: str, env: []str, prefix: str) -> str {
-    captured_sh_cmd(env_prefix_cmd(env), compile_regressive_argv(exe, regr_dir), "", prefix)
+fn compile_regressive_spec(exe: str, regr_dir: str, env: []str, prefix: str): ProcSpec {
+    ProcSpec { argv = compile_regressive_argv(exe, regr_dir); dir = ""; env = env; stdin_data = ""; prefix = prefix }
 }
 
-/**
- * compile_in_place — build the regressive project at `regr_dir` with the current compiler `exe`
- * from WITHIN `regr_dir` (`cd <regr_dir> && teko . -o bin --no-verify`), the #64 CWD-relative
- * invocation shape a `When built in place` scenario exercises — distinct from `compile_regressive`,
- * which builds `<regr_dir>` from the runner's OWN cwd without `cd`-ing into it. The binary lands at
- * `<regr_dir>/bin/<name>`, same as `compile_regressive`.
- *
- * `prefix` is resolved to an ABSOLUTE path before the capture runs: the shell command
- * `run_captured_in_dir` builds is `cd <regr_dir> && … < prefix.in > prefix.out 2> prefix.err`,
- * so the redirection targets are evaluated AFTER the `cd` — a relative `prefix` (e.g. the
- * runner's own `bin/.regr-work/…`) would resolve against `regr_dir`, not the directory it was
- * actually written under, and the shell would fail to open it (never a silent skip; caught here).
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressive project directory (the directory the CWD-relative build runs in)
- * @param env       per-scenario child env (`K=V` tokens; 0.3.1 C2)
- * @param prefix    the scratch-file prefix for this compile (relative or absolute)
- * @return          the captured build outcome
- * @since 0.3.1
- */
-fn compile_in_place(exe: str, regr_dir: str, env: []str, prefix: str) -> CapResult {
-    mut argv: []str = teko::list::push(teko::list::empty(), to_sh_path(exe))
-    argv = teko::list::push(argv, ".")
-    argv = teko::list::push(argv, "-o")
-    argv = teko::list::push(argv, "bin")
-    argv = teko::list::push(argv, "--no-verify")
-    let cwd = match teko::env::cwd() { str as c => c; error => "" }
-    run_captured_in_dir(argv, "", env, regr_dir, abs_path_of(prefix, cwd))
+fn compile_in_place(exe: str, regr_dir: str, env: []str, prefix: str): CapResult {
+    var argv: []str = [exe, ".", "-o", "bin", "--no-verify"]
+    run_captured_in_dir(argv, "", env, regr_dir, prefix)
 }
 
-/**
- * SNIPPET_PROJECT_NAME — the fixed project name every scratch snippet project
- * (`compile_snippet_text`) is stamped with, so the built binary's path (`<proj>/bin/<name>`) is
- * always known to the caller without re-parsing the synthesized `.tkp`.
- */
 const SNIPPET_PROJECT_NAME: str = "snippet"
 
-/**
- * snippet_manifest_text — the minimal `.tkp` text every scratch snippet project is given: a
- * `binary` artifact named `SNIPPET_PROJECT_NAME` with an (empty) `src` source root — `teko`
- * compiles PROJECTS, never a bare `.tks` file (main.tks's CLI law), so a one-off snippet needs
- * this synthesized wrapper.
- *
- * @return the `.tkp` text
- * @since 0.3.1
- */
-fn snippet_manifest_text() -> str {
+fn snippet_manifest_text(): str {
     "name = \"" ~ SNIPPET_PROJECT_NAME ~ "\"\nsource = \"src\"\n\n[artifact]\nkind = \"binary\"\n"
 }
 
-/**
- * SnippetSplit — an inline snippet's source, split into its top-level DECLARATIONS (`type`/`fn`/
- * `use`/`const`, brace-depth-scoped) and its top-level STATEMENTS, each half in original source
- * order (`split_snippet_decls_and_stmts`).
- *
- * @since 0.3.1
- */
 type SnippetSplit = struct {
-    /** the concatenated declaration chunks, in source order ("" when the snippet declares none). */
     decls: str
-    /** the concatenated statement chunks, in source order. */
     stmts: str
-    /**
-     * the LAST statement chunk (with its trailing separator) — a literal SUFFIX of `stmts`, never a
-     * part removed from it. It is singled out because the virtual-main rule (#423/#382) gives the
-     * last loose statement a meaning the others do not have: a non-void expression there IS the
-     * program's exit code. A grouped build moves the statements into a function body, where that
-     * rule no longer applies, so `regr_group.tks` has to see the tail separately to make the exit
-     * explicit. "" when the snippet has no statements.
-     */
     tail: str
 }
 
-/**
- * snippet_chunk_head_keyword_start — the byte offset where `t` (a trimmed chunk) begins its
- * declaration head keyword, after stripping any leading modifier tokens (`pub `, `exp `,
- * `unsafe `, `extern `, in any combination/order — e.g. `pub unsafe fn`).
- *
- * @param t  the trimmed chunk text
- * @return   the offset of the first byte past every leading modifier token
- * @since 0.3.1
- */
-fn snippet_chunk_head_keyword_start(t: str) -> u64 {
-    mut rest = t
-    mut off: u64 = 0
+fn snippet_chunk_head_keyword_start(t: str): u64 {
+    var rest = t
+    var off: u64 = 0
     loop {
-        let before = rest
-        if mf_starts_with(rest, "pub ") { rest = teko::str::slice(rest, 4, rest.len); off = off + 4 }
-        if mf_starts_with(rest, "exp ") { rest = teko::str::slice(rest, 4, rest.len); off = off + 4 }
-        if mf_starts_with(rest, "unsafe ") { rest = teko::str::slice(rest, 7, rest.len); off = off + 7 }
-        if mf_starts_with(rest, "extern ") { rest = teko::str::slice(rest, 7, rest.len); off = off + 7 }
+        var before = rest
+        if mf_starts_with(rest, "pub ") { rest = rest.slice(4, rest.len); off = off + 4 }
+        if mf_starts_with(rest, "exp ") { rest = rest.slice(4, rest.len); off = off + 4 }
+        if mf_starts_with(rest, "unsafe ") { rest = rest.slice(7, rest.len); off = off + 7 }
+        if mf_starts_with(rest, "extern ") { rest = rest.slice(7, rest.len); off = off + 7 }
         if rest == before { break }
     }
     off
 }
 
-/**
- * snippet_chunk_skip_attr_lines — the remainder of `text` after every leading bare attribute line
- * (`#…`, one per line — e.g. `#test`) is dropped. `split_snippet_decls_and_stmts` accumulates a
- * leading attribute onto the declaration it decorates into ONE chunk, so the head-keyword read
- * must skip past it to find the actual declaration line.
- *
- * @param text  the chunk text (one or more full lines, `\n`-joined)
- * @return      `text` with every leading attribute line removed
- * @since 0.3.1
- */
-fn snippet_chunk_skip_attr_lines(text: str) -> str {
-    mut rest = text
+fn snippet_chunk_skip_attr_lines(text: str): str {
+    var rest = text
     loop {
         if !mf_starts_with(tkr_trim(rest), "#") { return rest }
-        mut k: u64 = 0
+        var k: u64 = 0
         loop {
             if k >= rest.len { break }
             if rest[k] == b'\n' { break }
             k = k + 1
         }
         if k >= rest.len { return "" }
-        rest = teko::str::slice(rest, k + 1, rest.len)
+        rest = rest.slice(k + 1, rest.len)
     }
 }
 
-/**
- * snippet_chunk_is_decl — does the top-level chunk `chunk` (past any leading attribute lines,
- * `snippet_chunk_skip_attr_lines`) open with a declaration keyword (`type`/`fn`/`class`/`flags`/
- * `interface`/`use`/`const`), after any leading modifier tokens (`pub`/`exp`/`unsafe`/`extern`,
- * `snippet_chunk_head_keyword_start`)? Everything else (an expression, `let`/`mut`, `if`/`loop`,
- * …) is a virtual-main STATEMENT.
- *
- * @param chunk  one top-level source chunk (brace-depth-balanced)
- * @return       true when `chunk` is a declaration
- * @since 0.3.1
- */
-fn snippet_chunk_is_decl(chunk: str) -> bool {
-    let t = tkr_trim(snippet_chunk_skip_attr_lines(chunk))
-    let head = teko::str::slice(t, snippet_chunk_head_keyword_start(t), t.len)
+fn snippet_chunk_is_decl(chunk: str): bool {
+    var t = tkr_trim(snippet_chunk_skip_attr_lines(chunk))
+    var head = t.slice(snippet_chunk_head_keyword_start(t), t.len)
     mf_starts_with(head, "type ") || mf_starts_with(head, "fn ") || mf_starts_with(head, "class ") || mf_starts_with(head, "flags ") || mf_starts_with(head, "interface ") || mf_starts_with(head, "use ") || mf_starts_with(head, "const ")
 }
 
-/**
- * BraceScan — the result of scanning one line for its net brace delta OUTSIDE string/char
- * literals and slash-star block comments (`snippet_brace_delta`): the delta itself, plus whether
- * the line ends INSIDE an unterminated string/char literal or an unterminated block comment,
- * each threaded into the next line's scan.
- *
- * @since 0.3.1
- */
 type BraceScan = struct {
-    /** the net `{`/`}` count outside any string/char literal, block comment, or `//` comment. */
     delta: i64
-    /** true when the line ends inside an open (unterminated) string/char literal. */
     in_str: bool
-    /** true when the line ends inside an open (unterminated) slash-star block comment. */
     in_comment: bool
 }
 
-/**
- * snippet_brace_delta — the net `{`/`}` count of `line` OUTSIDE any string/char literal, a
- * slash-star block comment (including a nested Javadoc field doc), or an unquoted `//` line
- * comment (each `{` is +1, each `}` is -1) — the brace-depth increment
- * `split_snippet_decls_and_stmts` accumulates per line. Walks bytes tracking whether a `"`/`'`
- * literal or a block comment is open (`\` escapes the next byte inside a literal, never itself a
- * close), so a literal brace (e.g. `let brace = "{"`) and a brace inside PROSE (e.g. a field's
- * nested Javadoc doc-comment, whose apostrophe would otherwise desync the literal-open state) are
- * never miscounted as real ones; a triple-quoted (`"""`) literal is tracked by the same
- * open/close toggle — its odd-length open/close runs carry the right parity across lines even
- * though this scanner is not delimiter-width-aware. `in_str`/`in_comment` carry an already-open
- * span in from a PRIOR line and report whether it is still open at end-of-line, so the caller
- * threads both into the next call.
- *
- * @param line        one source line
- * @param in_str      true when `line` begins inside an already-open string/char literal
- * @param in_comment  true when `line` begins inside an already-open block comment
- * @return            the net brace delta outside literals/comments, and whether a literal or a
- *                     block comment is still open at end-of-line
- * @since 0.3.1
- */
-fn snippet_brace_delta(line: str, in_str: bool, in_comment: bool) -> BraceScan {
-    mut d: i64 = 0
-    mut open = in_str
-    mut quote: byte = b'"'
-    mut comment = in_comment
-    mut k: u64 = 0
+fn snippet_brace_delta(line: str, in_str: bool, in_comment: bool): BraceScan {
+    var d: i64 = 0
+    var open = in_str
+    var quote: byte = b'"'
+    var comment = in_comment
+    var k: u64 = 0
     loop {
         if k >= line.len { break }
-        let c = line[k]
+        var c = line[k]
         if comment {
             if c == b'*' && k + 1 < line.len && line[k + 1] == b'/' { comment = false; k = k + 2; continue }
             k = k + 1
@@ -1352,84 +472,46 @@ fn snippet_brace_delta(line: str, in_str: bool, in_comment: bool) -> BraceScan {
     BraceScan { delta = d; in_str = open; in_comment = comment }
 }
 
-/**
- * snippet_skip_doc_comment — the cursor just past the closing fence of a doc-comment block
- * opening at `from` (a folded fixture's own W15 Javadoc is DISCARDED here, never reclassified —
- * a Doc token with no declaration immediately after it is a parse error, C7.9's "a comment with
- * no declaration after it is deleted, not converted" rule, and `split_snippet_decls_and_stmts`
- * cannot always keep a doc-comment attached to the declaration that follows once decls and
- * statements are separated into different files). EOF with no closing fence returns `src.len`
- * (the caller's outer loop then simply stops).
- *
- * @param src   the inline snippet's whole source text
- * @param from  the cursor at the start of the doc-comment's opening line
- * @return      the cursor just past the line carrying the closing fence
- * @since 0.3.1
- */
-fn snippet_skip_doc_comment(src: str, from: u64) -> u64 {
-    mut cur = from
+fn snippet_skip_doc_comment(src: str, from: u64): u64 {
+    var cur = from
     loop {
         if cur >= src.len { return cur }
-        mut eol = cur
+        var eol = cur
         loop {
             if eol >= src.len { break }
             if src[eol] == b'\n' { break }
             eol = eol + 1
         }
-        let line = teko::str::slice(src, cur, eol)
-        let next = if eol < src.len { eol + 1 } else { eol }
-        if teko::str::contains(line, "*/") { return next }
+        var line = src.slice(cur, eol)
+        var next = if eol < src.len { eol + 1 } else { eol }
+        if line.contains("*/") { return next }
         cur = next
     }
     src.len
 }
 
-/**
- * split_snippet_decls_and_stmts — split an inline snippet's source into its top-level
- * declarations and statements (0.3.1): `main.tks` may declare neither `type` nor `fn` (the C7.9
- * virtual-main rule), so a snippet needing a custom type or helper function cannot be a single
- * `main.tks`. A leading doc-comment before a top-level construct is discarded
- * (`snippet_skip_doc_comment`) — never carried into either half. Walks the remaining `src` line by
- * line tracking BRACE DEPTH OUTSIDE string/char literals AND block comments (`snippet_brace_delta`,
- * threading its `in_str`/`in_comment` across lines — a `type`/`fn` body may span many lines, a
- * literal brace such as `let brace = "{"` must never look like a real one, and a NESTED Javadoc
- * field doc-comment inside the body must never leak its prose apostrophes into the literal-open
- * state); a new top-level chunk starts at depth 0 on a non-blank,
- * non-doc-comment line. A chunk consisting SO FAR of only bare attribute lines (`#…`) never closes
- * on its own — the attribute accumulates onto the declaration it decorates, so both are classified
- * together (`snippet_chunk_is_decl` skips the leading attribute lines when reading the head
- * keyword). Every other chunk ends when depth RETURNS to 0 and is classified
- * (`snippet_chunk_is_decl`), appended in order to the matching half. The LAST statement chunk is
- * additionally kept in `tail` (a suffix of `stmts`, never removed from it) — the virtual-main rule
- * gives it a meaning the other chunks do not have, which a grouped build has to reproduce
- * explicitly (`regr_group.tks`).
- *
- * @param src  the inline snippet's whole source text
- * @return     the source split into its declaration and statement halves
- * @since 0.3.1
- */
-fn split_snippet_decls_and_stmts(src: str) -> SnippetSplit {
-    mut decls = ""
-    mut stmts = ""
-    mut tail = ""
-    mut chunk = ""
-    mut depth: i64 = 0
-    mut in_chunk = false
-    mut in_str = false
-    mut in_comment = false
-    mut attr_only = true
-    mut cur: u64 = 0
+fn split_snippet_decls_and_stmts(src: str): SnippetSplit {
+    var decls = ""
+    var stmts = ""
+    var tail = ""
+    var chunk = ""
+    var depth: i64 = 0
+    var in_chunk = false
+    var in_str = false
+    var in_comment = false
+    var attr_only = true
+    var cur: u64 = 0
     loop {
         if cur >= src.len { break }
-        mut eol = cur
+        var eol = cur
         loop {
             if eol >= src.len { break }
             if src[eol] == b'\n' { break }
             eol = eol + 1
         }
-        let line = teko::str::slice(src, cur, eol)
-        let next = if eol < src.len { eol + 1 } else { eol }
-        let trimmed = tkr_trim(line)
+        var line = src.slice(cur, eol)
+        var next = if eol < src.len { eol + 1 } else { eol }
+        var trimmed = tkr_trim(line)
         if !in_chunk && trimmed.len == 0 { cur = next; continue }
         if !in_chunk && mf_starts_with(trimmed, "/**") { cur = snippet_skip_doc_comment(src, cur); continue }
         if !in_chunk { attr_only = true }
@@ -1437,7 +519,7 @@ fn split_snippet_decls_and_stmts(src: str) -> SnippetSplit {
         if chunk.len > 0 { chunk = chunk ~ "\n" }
         chunk = chunk ~ line
         if trimmed.len > 0 && !mf_starts_with(trimmed, "#") { attr_only = false }
-        let scan = snippet_brace_delta(line, in_str, in_comment)
+        var scan = snippet_brace_delta(line, in_str, in_comment)
         depth = depth + scan.delta
         in_str = scan.in_str
         in_comment = scan.in_comment
@@ -1455,242 +537,143 @@ fn split_snippet_decls_and_stmts(src: str) -> SnippetSplit {
     SnippetSplit { decls = decls; stmts = stmts; tail = tail }
 }
 
-/**
- * sh_rm_rf — recursively delete `path` via `rm -rf` (best-effort — `path` may not already exist).
- * The shared shell idiom `copy_dir` (0.3.1 C4) and `compile_snippet_text` (0.3.1 splitter fix)
- * both need to make a scratch tree hermetic before writing into it.
- *
- * @param path  the path to delete
- * @return      `null` on success, or an `error` when the shell delete fails
- * @throws      when `rm -rf` exits non-zero
- * @since 0.3.1
- */
-fn sh_rm_rf(path: str) -> null | error {
-    mut shv: []str = teko::list::push(teko::list::empty(), "sh")
-    shv = teko::list::push(shv, "-c")
-    shv = teko::list::push(shv, teko::str::concat("rm -rf ", sh_squote(to_sh_path(path))))
-    if teko::process::run(shv) != 0 { return error { message = teko::str::concat("failed to remove ", path) } }
+fn rm_rf(path: str): null | error {
+    var argv: []str = ["rm", "-rf", path]
+    if teko::process::run(argv) != 0 { return error { message = teko::str::concat("failed to remove ", path) } }
     null
 }
 
-/**
- * compile_snippet_text — build a SINGLE Teko program `src_text` as a SCRATCH project under
- * `<prefix>.proj/` (a synthesized minimal `.tkp` + the program's STATEMENTS at the project-root
- * `main.tks`, required by the C7.9 main-file rule) with the current compiler `exe`, under `env`.
- * When `src_text` declares a top-level `type`/`fn` (a struct/class/variant/helper the statements
- * need — `main.tks` alone cannot carry one), its declarations are split out
- * (`split_snippet_decls_and_stmts`) into a sibling `src/regr_decls.tks` module, sharing the
- * project's flat namespace with `main.tks` unqualified — mirroring the existing on-disk fixture
- * shape (`main.tks` + `src/lib.tks`). A pure-statement snippet (no declarations) writes `src_text`
- * UNCHANGED to `main.tks`, byte-identical to the pre-split behavior. The scratch tree is wiped
- * (`sh_rm_rf`) before being repopulated, so no `main.tks`/`src/regr_decls.tks`/`bin/` from a PRIOR
- * row sharing this `prefix` can ever survive into this one (0.3.1 splitter fix (4)). No on-disk
- * project is touched — this is the compiler-as-SUT over a snippet, with zero committed fixture
- * tree. The shared tail of `compile_inline_source`/`compile_standalone_source`.
- *
- * @param exe       the absolute path to this compiler binary (gen1)
- * @param src_text  the whole `.tks` program to compile
- * @param env       per-scenario child env (`K=V` tokens; 0.3.1 C2) — e.g. `TEKO_TARGET=x86_64-windows`
- * @param prefix    the scratch-file prefix for this compile (the scratch project lives at
- *                  `<prefix>.proj/`, the binary at `<prefix>.proj/bin/snippet`)
- * @return          the captured build outcome
- * @since 0.3.1
- */
-fn compile_snippet_text(exe: str, src_text: str, env: []str, prefix: str) -> CapResult {
-    let t_start = regr_now_ns()
-    let proj = prefix ~ ".proj"
-    match sh_rm_rf(proj) { error => { }; null => { } }
+fn compile_snippet_text(exe: str, src_text: str, env: []str, prefix: str): CapResult {
+    var t_start = regr_now_ns()
+    var proj = prefix ~ ".proj"
+    match rm_rf(proj) { error => { }; null => { } }
     match mkdir_p(teko::str::concat(proj, "/src/")) { error => { }; null => { } }
     match teko::io::write_file(proj ~ "/teko.tkp", snippet_manifest_text()) { error => { }; null => { } }
-    let split = split_snippet_decls_and_stmts(src_text)
+    var split = split_snippet_decls_and_stmts(src_text)
     if split.decls.len == 0 {
         match teko::io::write_file(proj ~ "/main.tks", src_text) { error => { }; null => { } }
     } else {
         match teko::io::write_file(proj ~ "/src/regr_decls.tks", split.decls) { error => { }; null => { } }
         match teko::io::write_file(proj ~ "/main.tks", split.stmts) { error => { }; null => { } }
     }
-    let scratch_ns = regr_now_ns() - t_start
+    var scratch_ns = regr_now_ns() - t_start
     cap_with_extra_harness(compile_regressive(exe, proj, env, prefix ~ ".compile"), scratch_ns)
 }
 
-/**
- * snippet_project_binp — the binary path `compile_snippet_text` produces for the scratch project
- * at `<prefix>.proj/`.
- *
- * @param prefix  the scratch-file prefix a snippet compile used
- * @return        the built binary's path
- * @since 0.3.1
- */
-fn snippet_project_binp(prefix: str) -> str { prefix ~ ".proj/bin/" ~ SNIPPET_PROJECT_NAME }
+fn snippet_project_binp(prefix: str): str { prefix ~ ".proj/bin/" ~ SNIPPET_PROJECT_NAME }
 
-/**
- * artifact_path_for_target — the ACTUAL on-disk artifact path for `target`, given the base binary
- * path `base_binp` a native build would produce: a wasm target's own-backend build writes a
- * self-contained `<base_binp>.wasm` module directly (no separate link step — `emit_native_wasm`),
- * never a bare `<base_binp>`; every other target (including the native host default) IS
- * `base_binp` unchanged. Applied wherever a scenario resolves its run/leaf-tool artifact, so
- * `Given target = "wasm32-wasi"` finds the module `wasmtime`/`wasm-validate` actually need.
- *
- * @param base_binp  the native-shaped binary path (`<dir>/bin/<name>` or a snippet project's)
- * @param target     the scenario's declared target ("" → host default, no suffix)
- * @return           `base_binp` unchanged, or `<base_binp>.wasm` for a wasm target
- * @since 0.3.1
- */
-fn artifact_path_for_target(base_binp: str, target: str) -> str {
-    if target == "wasm32-wasi" || target == "wasm32" || target == "wasm" || target == "wasi" || target == "wasm64-wasi" || target == "wasm64" {
-        return base_binp ~ ".wasm"
-    }
-    base_binp
+fn row_artifact_target(target: str): NativeTarget {
+    match own_backend_target_of_row(target) { NativeTarget as t => t; error => host_default_target_guess() }
 }
 
-/**
- * compile_standalone_source — build a SINGLE standalone source file `srcp` (an explicit `Given
- * source = "<file>"`, relative to `regr_dir`, joined by the caller) as a scratch snippet project
- * (`compile_snippet_text`) under `env`. Honest error when `srcp` cannot be read.
- *
- * @param exe     the absolute path to this compiler binary
- * @param srcp    the standalone `.tks` source file to compile
- * @param env     per-scenario child env (`K=V` tokens; 0.3.1 C2)
- * @param prefix  the scratch-file prefix for this compile
- * @return        the captured build outcome
- * @since 0.3.1
- */
-fn compile_standalone_source(exe: str, srcp: str, env: []str, prefix: str) -> CapResult {
-    let text = match teko::io::read_file(srcp) {
+fn artifact_path_for_target(base_binp: str, target: str): str {
+    base_binp ~ executable_suffix(row_artifact_target(target))
+}
+
+fn compile_standalone_source(exe: str, srcp: str, env: []str, prefix: str): CapResult {
+    var text = match teko::io::read_file(srcp) {
         str as s => s
         error as e => return cap_synthetic(1, teko::str::concat("cannot read source file: ", e.message))
     }
     compile_snippet_text(exe, text, env, prefix)
 }
 
-/**
- * compile_inline_source — build a SINGLE inline Teko program `src_text` (from `Given source
- * inline`) as a scratch snippet project (`compile_snippet_text`) under `env`, capturing the
- * build's exit/stderr (the stderr carries the diagnostic a `compilation fails` inline scenario
- * pins). No on-disk project is touched — this is the compiler-as-SUT over a snippet.
- *
- * @param exe       the absolute path to this compiler binary (gen1)
- * @param src_text  the inline `.tks` program to compile
- * @param env       per-scenario child env (`K=V` tokens; §2b) — e.g. `TEKO_TARGET=x86_64-windows`
- * @param prefix    the scratch-file prefix for this compile
- * @return          the captured build outcome
- * @since 0.3.1
- */
-fn compile_inline_source(exe: str, src_text: str, env: []str, prefix: str) -> CapResult {
+fn compile_inline_source(exe: str, src_text: str, env: []str, prefix: str): CapResult {
     compile_snippet_text(exe, src_text, env, prefix)
 }
 
-/**
- * copy_dir — recursively copy `src` to `dst` (`rm -rf dst && cp -R src dst`, creating `dst`'s
- * parent first), used to provision a SCRATCH working copy of a consumer project before a dependency
- * build populates its `packages/` — the committed fixture tree is never written (`Background:
- * Given dependency`, 0.3.1 C4).
- *
- * @param src  the source directory to copy
- * @param dst  the destination path (recreated fresh)
- * @return     `null` on success, or an `error` when the shell copy fails
- * @throws     when `cp -R` exits non-zero
- * @since 0.3.1
- */
-fn copy_dir(src: str, dst: str) -> null | error {
-    let cmd = teko::str::concat("rm -rf ", sh_squote(to_sh_path(dst))) ~ " && mkdir -p " ~ sh_squote(to_sh_path(dirname_of(dst))) ~ " && cp -R " ~ sh_squote(to_sh_path(src)) ~ " " ~ sh_squote(to_sh_path(dst))
-    mut shv: []str = teko::list::push(teko::list::empty(), "sh")
-    shv = teko::list::push(shv, "-c")
-    shv = teko::list::push(shv, cmd)
-    if teko::process::run(shv) != 0 { return error { message = teko::str::concat("failed to copy directory ", src) } }
+fn copy_dir(src: str, dst: str): null | error {
+    match rm_rf(dst) { error as e => return e; null => { } }
+    match mkdir_p(teko::str::concat(dirname_of(dst), "/")) { error as e => return e; null => { } }
+    var argv: []str = ["cp", "-R", src, dst]
+    if teko::process::run(argv) != 0 { return error { message = teko::str::concat("failed to copy directory ", src) } }
     null
 }
 
-/**
- * provision_dependency — build the `kind = "package"` sub-project at `dep_dir` with gen1 (`exe`)
- * to a `.tkl`, then copy that `.tkl` into `scratch_packages/` (created if missing) so a subsequent
- * consumer compile resolves it. The committed fixture tree is never written — the `.tkl` and the
- * consumer build live under scratch. Mirrors `crossmodule_regressions.sh`'s build-dep → provision
- * step. Honest error on a missing dep manifest / a failed dep build / no `.tkl` produced (M.3).
- * The `-o` value is resolved to an ABSOLUTE path before it reaches the dep build: `teko <dir> -o
- * <out>` chdir's INTO `<dir>` before resolving a relative `<out>`, so a scratch `<out>` computed
- * relative to the RUNNER's own cwd (never `dep_dir`) would land inside `dep_dir` itself instead —
- * exactly the polluted-fixture-tree outcome this whole crumb exists to avoid.
- *
- * @param exe               the absolute path to this compiler binary (gen1)
- * @param dep_dir           the dependency sub-project directory (`regr_dir/<dep_subdir>`)
- * @param scratch_packages  the scratch `packages/` dir to provision the built `.tkl` into
- * @param prefix            the scratch-file prefix for the dep build
- * @return                  the provisioned `.tkl` path, or an error
- * @throws                  on a missing/malformed dep manifest, a dep build failure, or no `.tkl`
- * @since 0.3.1
- */
-fn provision_dependency(exe: str, dep_dir: str, scratch_packages: str, prefix: str) -> str | error {
+fn provision_dependency(exe: str, dep_dir: str, scratch_packages: str, prefix: str): str | error {
     match mkdir_p(teko::str::concat(scratch_packages, "/")) { error => { }; null => { } }
-    let cwd = match teko::env::cwd() { str as c => c; error => "" }
-    let dep_out = abs_path_of(prefix ~ ".depout", cwd)
-    mut argv: []str = teko::list::push(teko::list::empty(), to_sh_path(exe))
-    argv = teko::list::push(argv, to_sh_path(dep_dir))
-    argv = teko::list::push(argv, "-o")
-    argv = teko::list::push(argv, to_sh_path(dep_out))
-    argv = teko::list::push(argv, "--no-verify")
-    let comp = run_captured_env(argv, "", with_regr_cov_env(teko::list::empty(), prefix ~ ".dep_compile"), prefix ~ ".dep_compile")
+    var cwd = match teko::env::cwd() { str as c => c; error => "" }
+    var dep_out = abs_path_of(prefix ~ ".depout", cwd)
+    var argv: []str = [exe, dep_dir, "-o", dep_out, "--no-verify"]
+    var comp = run_captured_env(argv, "", with_regr_cov_env([], prefix ~ ".dep_compile"), prefix ~ ".dep_compile")
     if comp.exit != 0 { return error { message = teko::str::concat("dependency build failed: ", compile_failure_message(comp)) } }
-    let entries = match teko::fs::list_dir(dep_out) { []str as e => e; error as e => return e }
-    mut tkl = ""
-    mut k: u64 = 0
+    var entries = match teko::fs::list_dir(dep_out) { []str as e => e; error as e => return e }
+    var tkl = ""
+    var k: u64 = 0
     loop {
         if k >= entries.len { break }
-        if teko::str::ends_with(entries[k], ".tkl") { tkl = entries[k] }
+        if entries[k].ends_with(".tkl") { tkl = entries[k] }
         k = k + 1
     }
     if tkl.len == 0 { return error { message = "dependency build produced no .tkl artifact" } }
-    let bytes = match teko::io::read_file(dep_out ~ "/" ~ tkl) { str as s => s; error as e => return e }
-    let dst = scratch_packages ~ "/" ~ tkl
+    var bytes = match teko::io::read_file(dep_out ~ "/" ~ tkl) { str as s => s; error as e => return e }
+    var dst = scratch_packages ~ "/" ~ tkl
     match teko::io::write_file(dst, bytes) { error as e => return e; null => { } }
     dst
 }
 
-/**
- * first_line — the first line of `s` (up to, excluding, the first newline).
- *
- * @param s  the text
- * @return   the first line
- * @since 0.3.0.29
- */
-fn first_line(s: str) -> str {
-    mut k: u64 = 0
+fn first_line(s: str): str {
+    var k: u64 = 0
     loop {
         if k >= s.len { break }
         if s[k] == b'\n' { break }
         k = k + 1
     }
-    teko::str::slice(s, 0, k)
+    s.slice(0, k)
 }
 
-/**
- * COMPILE_FAIL_TAIL_LINES — how many TRAILING lines of a failed compile's captured output the
- * scenario's failure message reproduces. The host `cc`'s own diagnostics are the tail of that
- * stream (the compiler prints its own "cc failed to build the generated C" line LAST), so a
- * one-line excerpt names the symptom and hides the cause; this bound keeps the whole cause in the
- * report without letting a pathological build dump megabytes into one gate line.
- */
 const COMPILE_FAIL_TAIL_LINES: u64 = 40
 
-/**
- * tail_lines — the last `n` lines of `s` (trailing newline tolerant), or all of `s` when it holds
- * `n` lines or fewer. Walks back from the end counting newlines, so nothing is copied twice.
- *
- * @param s  the text
- * @param n  how many trailing lines to keep (0 → "")
- * @return   the trailing `n` lines, without a trailing newline
- * @since 0.3.1
- */
-fn tail_lines(s: str, n: u64) -> str {
+const COMPILE_FAIL_HEAD_LINES: u64 = 20
+
+fn count_text_lines(s: str): u64 {
+    var end = s.len
+    loop {
+        if end == 0 { return 0 }
+        if s[end - 1] != b'\n' { break }
+        end = end - 1
+    }
+    var n: u64 = 1
+    var i: u64 = 0
+    loop {
+        if i >= end { break }
+        if s[i] == b'\n' { n = n + 1 }
+        i = i + 1
+    }
+    n
+}
+
+fn head_lines(s: str, n: u64): str {
     if n == 0 { return "" }
-    mut end = s.len
+    var end = s.len
     loop {
         if end == 0 { break }
         if s[end - 1] != b'\n' { break }
         end = end - 1
     }
-    mut start = end
-    mut seen: u64 = 0
+    var stop: u64 = 0
+    var seen: u64 = 0
+    loop {
+        if stop >= end { break }
+        if s[stop] == b'\n' {
+            seen = seen + 1
+            if seen == n { break }
+        }
+        stop = stop + 1
+    }
+    s.slice(0, stop)
+}
+
+fn tail_lines(s: str, n: u64): str {
+    if n == 0 { return "" }
+    var end = s.len
+    loop {
+        if end == 0 { break }
+        if s[end - 1] != b'\n' { break }
+        end = end - 1
+    }
+    var start = end
+    var seen: u64 = 0
     loop {
         if start == 0 { break }
         if s[start - 1] == b'\n' {
@@ -1699,340 +682,143 @@ fn tail_lines(s: str, n: u64) -> str {
         }
         start = start - 1
     }
-    teko::str::slice(s, start, end)
+    s.slice(start, end)
 }
 
-/**
- * compile_failure_message — the honest failure text for a scenario whose BUILD failed: the label
- * plus the TAIL of what the build actually wrote. The regression runner redirects the compiler
- * child's streams to capture files, and the host `cc` the compiler spawns inherits them — so the
- * `cc` diagnostics ARE captured; quoting only the compiler's own last line (which merely says the
- * `cc` failed) threw the real cause away and left a CI log with no way to tell WHY (M.3: an error
- * that will not say why is polite, not honest). `stderr` carries both streams' diagnostics; the
- * `stdout` tail is the fallback for a toolchain that reports on stdout only.
- *
- * @param comp  the captured build outcome (non-zero `exit`)
- * @return      the failure message, carrying the captured output tail
- * @since 0.3.1
- */
-fn compile_failure_message(comp: CapResult) -> str {
-    let err_tail = tail_lines(comp.stderr, COMPILE_FAIL_TAIL_LINES)
-    if err_tail.len > 0 { return $"compile failed (exit {comp.exit}); captured output tail:\n{err_tail}" }
-    let out_tail = tail_lines(comp.stdout, COMPILE_FAIL_TAIL_LINES)
-    if out_tail.len > 0 { return $"compile failed (exit {comp.exit}); captured stdout tail:\n{out_tail}" }
+fn compile_fail_excerpt(s: str): str {
+    var total = count_text_lines(s)
+    var kept = COMPILE_FAIL_HEAD_LINES + COMPILE_FAIL_TAIL_LINES
+    if total <= kept { return tail_lines(s, total) }
+    var elided = total - kept
+    var head = head_lines(s, COMPILE_FAIL_HEAD_LINES)
+    var tail = tail_lines(s, COMPILE_FAIL_TAIL_LINES)
+    $"{head}\n… {elided} line(s) elided; the excerpt keeps both ends …\n{tail}"
+}
+
+fn compile_failure_message(comp: CapResult): str {
+    var err_part = compile_fail_excerpt(comp.stderr)
+    if err_part.len > 0 { return $"compile failed (exit {comp.exit}); captured output excerpt:\n{err_part}" }
+    var out_part = compile_fail_excerpt(comp.stdout)
+    if out_part.len > 0 { return $"compile failed (exit {comp.exit}); captured stdout excerpt:\n{out_part}" }
     $"compile failed (exit {comp.exit}); the build wrote nothing to stdout or stderr"
 }
 
-/**
- * match_stream — does the captured `actual` stream satisfy the expectation `m`? `Ignore` always
- * holds; `Literal` compares bytes exactly; `Sha256` compares the lowercase-hex sha256 of `actual`;
- * `Pattern` SEARCHES `actual` for the declared `teko::regex` pattern.
- *
- * A pattern that will not COMPILE is not a mismatch — it is a broken scenario, and this predicate
- * cannot say so in a bool. It answers `false`, and `stream_match_failure` (which compiles the same
- * pattern to build the message) is what distinguishes the two for the reader. Answering `false` is
- * the safe half of the ambiguity: a scenario with an unparseable pattern goes RED, never green.
- *
- * @param m       the expectation
- * @param actual  the captured stream bytes
- * @return        true when the expectation holds
- * @since 0.3.0.29
- */
-fn match_stream(m: TkrMatch, actual: str) -> bool {
+fn match_stream(m: TkrMatch, actual: str): bool {
     if m.mode == TkrMatchMode::Ignore { return true }
     if m.mode == TkrMatchMode::Literal { return actual == m.text }
     if m.mode == TkrMatchMode::Pattern {
         match teko::regex::is_match_pattern(m.text, actual) { bool as b => return b; error => return false }
     }
-    teko::crypto::sha256_hex_of(bytes_of_str(actual)) == m.text
+    teko::crypto::sha256_hex_of(actual.bytes()) == m.text
 }
 
-/**
- * stream_match_failure — the honest failure text for a stream that did not satisfy its
- * expectation, or "" when it did.
- *
- * A `Pattern` expectation gets the long form, because the short one is unreadable: "stderr did not
- * match the expectation" tells a CI reader neither what was demanded nor what arrived, and the
- * whole reason patterns exist here is to diagnose output that differs BY PLATFORM — the one case
- * where the person reading the log cannot reproduce the run. So the message quotes the pattern and
- * the tail of the stream, the same evidence `exit_mismatch_message` learned to carry. A pattern
- * that does not COMPILE is reported as exactly that, never as a mismatch: those are faults in
- * opposite places (the scenario vs. the program), and M.3 forbids conflating them.
- *
- * @param m       the effective (override-resolved) expectation
- * @param actual  the captured stream bytes
- * @param stream  the stream's name, for the message ("stdout" / "stderr")
- * @return        the failure message, or "" when the expectation holds
- * @since 0.3.1
- */
-fn stream_match_failure(m: TkrMatch, actual: str, stream: str) -> str {
+fn stream_match_failure(m: TkrMatch, actual: str, stream: str): str {
     if m.mode != TkrMatchMode::Pattern {
         if match_stream(m, actual) { return "" }
         return $"{stream} did not match the expectation"
     }
-    let re = match teko::regex::compile(m.text) {
+    var re = match teko::regex::compile(m.text) {
         teko::regex::Regex as r => r
         error as e => return $"{stream} pattern is not a valid regex: {e.message}\n  pattern: {m.text}"
     }
     if teko::regex::is_match(re, actual) { return "" }
-    let tail = tail_lines(actual, RUN_FAIL_TAIL_LINES)
+    var tail = tail_lines(actual, RUN_FAIL_TAIL_LINES)
     if tail.len > 0 { return $"{stream} did not contain the declared pattern\n  pattern: {m.text}\n  captured {stream} tail:\n{tail}" }
     $"{stream} did not contain the declared pattern\n  pattern: {m.text}\n  the program wrote nothing to {stream}"
 }
 
-/**
- * resolve_stream — the effective expectation for a stream: the per-os-arch override when it is not
- * `Ignore`, else the inherited top-level expectation.
- *
- * @param base  the top-level expectation
- * @param ov    the override (possibly `Ignore` = inherit)
- * @return      the effective expectation
- * @since 0.3.0.29
- */
-fn resolve_stream(base: TkrMatch, ov: TkrMatch) -> TkrMatch {
-    if ov.mode == TkrMatchMode::Ignore { return base }
+fn resolve_stream(base_match: TkrMatch, ov: TkrMatch): TkrMatch {
+    if ov.mode == TkrMatchMode::Ignore { return base_match }
     ov
 }
 
-/**
- * check_compile_fail — the `compile_fail`-kind verdict: the build MUST have failed, and when a
- * `diagnostic` substring is declared the captured stderr must contain it (the strict upgrade over
- * the legacy exit-only marker).
- *
- * @param t     the parsed spec
- * @param comp  the captured build outcome
- * @return      the verdict
- * @since 0.3.0.29
- */
-fn check_compile_fail(t: Tkr, comp: CapResult) -> RegrOutcome {
+fn check_compile_fail(t: Tkr, comp: CapResult): RegrOutcome {
     if comp.exit == 0 {
         return regr_fail($"expected a compile failure but the build succeeded{captured_output_block(comp)}")
     }
-    if t.diagnostic.len > 0 && !teko::str::contains(comp.stderr, t.diagnostic) {
+    if t.diagnostic.len > 0 && !comp.stderr.contains(t.diagnostic) {
         return regr_fail($"build failed but its diagnostic omitted: {t.diagnostic}{captured_output_block(comp)}")
     }
     regr_pass()
 }
 
-/**
- * captured_output_block — the build's OWN output, in full, appended to a `compile_fail` verdict.
- *
- * THE DEFECT THIS CLOSES, and it cost a full CI cycle to learn (owner, 2026-07-27): *"Isso não
- * seria problema em diagnosticar se estivesse imprimindo a saída completa do comando de build dos
- * projetos regressores"*. The verdict used to name only what was EXPECTED —
- *
- *     build failed but its diagnostic omitted: nested bare-null optional
- *
- * — and said nothing about what actually appeared. That is half a fact: the reader learns the
- * expectation was missed but not what replaced it, so a regression that is fully described in the
- * captured stderr becomes undiagnosable from the log and has to be reproduced locally just to be
- * READ. Under M.3 an honest error names the observation, not only the expectation.
- *
- * IN FULL, NOT TAILED, and that is deliberate. `RUN_FAIL_TAIL_LINES` bounds a failed RUN's output
- * because a program under test can print without limit; a `compile_fail` build is bounded by
- * construction — the compiler stops at the failure it is being asserted about. Tailing it could cut
- * the FIRST diagnostic, which is exactly the one that displaced the expected one.
- *
- * BOTH STREAMS. The match is on stderr, but a compiler that wrote its complaint to stdout would
- * otherwise produce a verdict claiming nothing was said at all.
- *
- * @param comp  the captured build outcome
- * @return      the block to append: the two streams verbatim, each explicitly marked when empty
- * @since 0.3.1
- */
-fn captured_output_block(comp: CapResult) -> str {
-    mut err = "(the build wrote nothing to stderr)\n"
+fn captured_output_block(comp: CapResult): str {
+    var err = "(the build wrote nothing to stderr)\n"
     if comp.stderr.len > 0 { err = comp.stderr }
-    mut out = "(the build wrote nothing to stdout)\n"
+    var out = "(the build wrote nothing to stdout)\n"
     if comp.stdout.len > 0 { out = comp.stdout }
     $"\n  the build's own output follows IN FULL — this is what the compiler actually said:\n--- build stderr (exit {comp.exit}) ---\n{err}--- build stdout ---\n{out}--- end of build output ---"
 }
 
-/**
- * SPAWN_FAILED_EXIT — the runtime's "I could not start a child at all" sentinel (`TK_RT_SPAWN_FAILED`
- * in src/runtime/teko_rt.h), mirrored here so the report can NAME it instead of printing a bare
- * `-1`. It is negative precisely because no child status can be: 0..255 for an exit, 128+signo for a
- * signal. Before it existed the runtime said 127, which is simultaneously `sh`'s command-not-found,
- * the POSIX exec-failed convention, and a perfectly legal choice for a child — one number for three
- * diagnoses, so `exit 127` was unanswerable no matter how many times CI reproduced it.
- *
- * @since 0.3.1
- */
 const SPAWN_FAILED_EXIT: i32 = -1
 
-/**
- * SH_NOT_FOUND_EXIT — the exit status `sh` reports for a command it could not find. Now that the
- * runtime has stopped producing this number (`SPAWN_FAILED_EXIT` above), it means exactly one
- * thing on a captured run: the SHELL failed to resolve what it was asked to run — a path or
- * quoting problem, never a compiler one.
- *
- * @since 0.3.1
- */
-const SH_NOT_FOUND_EXIT: i32 = 127
+const EXEC_FAILED_EXIT: i32 = 127
 
-/**
- * exit_origin_note — the clause that says WHERE an observed exit code came from, when the code
- * itself is one whose origin a reader cannot assume.
- *
- * Two are worth naming. `SPAWN_FAILED_EXIT` means the runtime never got a child running, so nothing
- * about the scenario has been tested and the fault is in the harness or the host. `127` no longer
- * comes from the runtime at all, which makes it exactly one thing here: `sh` itself said
- * command-not-found (or the child chose it) — a path/quoting problem, not a compiler one.
- *
- * @param code  the observed exit code
- * @return      the parenthesised origin note, or "" when the code needs no gloss
- * @since 0.3.1
- */
-fn exit_origin_note(code: i32) -> str {
+fn exit_origin_note(code: i32): str {
     if code == SPAWN_FAILED_EXIT { return " (the runtime could not start the child at all — harness/host fault, the scenario never ran)" }
-    if code == SH_NOT_FOUND_EXIT { return " (this comes from `sh`, not from the runtime: command-not-found, or the child chose it)" }
+    if code == EXEC_FAILED_EXIT { return " (the child forked but could not exec — command-not-found, or the child chose 127 itself)" }
     ""
 }
 
-/**
- * exit_mismatch_message — the honest failure text for a run whose EXIT CODE did not match: the
- * codes, where an unusual code came from, the EXACT command handed to the shell, and the TAIL of
- * what the program actually wrote.
- *
- * The build-failure message already carries its captured tail (`compile_failure_message`); the RUN
- * failure was left blind in exactly the same way, and the readings it conflates are OPPOSITE
- * diagnoses. An `exit 127` with an EMPTY stderr says "the binary never ran"; the same line with
- * `panic: …` on stderr says "it aborted exactly as the scenario wanted, and the exit code was
- * translated wrongly on this platform". A message that cannot tell those apart sends the reader to
- * the wrong half of the system (M.3).
- *
- * The COMMAND STRING is here because the tail alone did not settle it. PR #94's `test / windows`
- * reported `exit 127, expected 134` with a real panic on stderr — the child had plainly run — and
- * neither number nor tail could say whether `sh` failed to find something, whether `_spawnvp`
- * failed, or whether Windows simply translates an aborting child differently. The exact text handed
- * to the shell is the missing evidence, and it is one line.
- *
- * @param run       the captured run outcome
- * @param exp_exit  the exit code the scenario declared
- * @return          the failure message, carrying the origin note, the command and the output tail
- * @since 0.3.1
- */
-fn exit_mismatch_message(run: CapResult, exp_exit: i32) -> str {
-    let head = $"exit {run.exit}, expected {exp_exit}{exit_origin_note(run.exit)}"
-    let cmd_line = if run.cmd.len > 0 { $"\n  sh -c: {run.cmd}" } else { "" }
-    let err_tail = tail_lines(run.stderr, RUN_FAIL_TAIL_LINES)
+fn exit_mismatch_message(run: CapResult, exp_exit: i32): str {
+    var head = $"exit {run.exit}, expected {exp_exit}{exit_origin_note(run.exit)}"
+    var cmd_line = if run.cmd.len > 0 { $"\n  argv: {run.cmd}" } else { "" }
+    var err_tail = tail_lines(run.stderr, RUN_FAIL_TAIL_LINES)
     if err_tail.len > 0 { return $"{head}{cmd_line}; captured stderr tail:\n{err_tail}" }
-    let out_tail = tail_lines(run.stdout, RUN_FAIL_TAIL_LINES)
+    var out_tail = tail_lines(run.stdout, RUN_FAIL_TAIL_LINES)
     if out_tail.len > 0 { return $"{head}{cmd_line}; captured stdout tail:\n{out_tail}" }
     $"{head}{cmd_line}; the program wrote nothing to stdout or stderr"
 }
 
-/**
- * RUN_FAIL_TAIL_LINES — how many TRAILING lines of a failed RUN's captured output the scenario's
- * failure message reproduces. Smaller than the compile bound: a program's own output is the
- * scenario's own tiny source, so a handful of lines is the whole story, while a failed build has a
- * whole toolchain's diagnostics to quote.
- */
 const RUN_FAIL_TAIL_LINES: u64 = 12
 
-/**
- * check_run — the `exit`/`print`/`trap` verdict for one host run: `trap` asserts a non-zero exit;
- * the others assert the exact (override-resolved) exit and the stdout/stderr expectations.
- *
- * @param t       the parsed spec
- * @param target  the os-arch the run was for (used to resolve `[expect.<os-arch>]` overrides)
- * @param run     the captured run outcome
- * @return        the verdict
- * @since 0.3.0.29
- */
-fn check_run(t: Tkr, target: str, run: CapResult) -> RegrOutcome {
-    let ov = tkr_expect_for(t, target)
-    let exp_exit = match ov { TkrExpect as e => if e.has_exit { e.exit } else { t.exit }; null => t.exit }
-    let so = match ov { TkrExpect as e => resolve_stream(t.stdout, e.stdout); null => t.stdout }
-    let se = match ov { TkrExpect as e => resolve_stream(t.stderr, e.stderr); null => t.stderr }
+fn check_run(t: Tkr, target: str, run: CapResult): RegrOutcome {
+    var ov = tkr_expect_for(t, target)
+    var exp_exit = match ov { TkrExpect as e => if e.has_exit { e.exit } else { t.exit }; null => t.exit }
+    var so = match ov { TkrExpect as e => resolve_stream(t.stdout, e.stdout); null => t.stdout }
+    var se = match ov { TkrExpect as e => resolve_stream(t.stderr, e.stderr); null => t.stderr }
     if t.kind == TkrKind::Trap {
         if run.exit == 0 { return regr_fail("expected a trap (non-zero exit) but the program exited 0") }
     } else {
         if run.exit != exp_exit { return regr_fail(exit_mismatch_message(run, exp_exit)) }
     }
-    let out_bad = stream_match_failure(so, run.stdout, "stdout")
+    var out_bad = stream_match_failure(so, run.stdout, "stdout")
     if out_bad.len > 0 { return regr_fail(out_bad) }
-    let err_bad = stream_match_failure(se, run.stderr, "stderr")
+    var err_bad = stream_match_failure(se, run.stderr, "stderr")
     if err_bad.len > 0 { return regr_fail(err_bad) }
     regr_pass()
 }
 
-/**
- * REGR_WORK_DIR — the regression scratch work tree every scenario's capture files land under
- * (`run_regression_sources`), and the root `merge_regression_coverage` walks after the phase runs.
- * Pinned here so both never drift apart.
- *
- * @since 0.3.1
- */
 pub const REGR_WORK_DIR: str = "bin/.regr-work"
 
-/**
- * with_regr_cov_env — append a `TEKO_TKCOV=<abs prefix>.tkcov` token onto `env` (0.3.1 C-cov):
- * every regressive COMPILE carries a per-row covfile target, resolved to an ABSOLUTE path first —
- * a project compile (`teko <dir> -o bin …`) chdir's INTO `<dir>` before resolving a relative `-o`
- * (`provision_dependency`'s own note), so a RELATIVE `TEKO_TKCOV` would resolve against that
- * new cwd instead of the runner's own by the time the dump fires, landing nowhere
- * `merge_regression_coverage` looks. Harmless when the compiler under test is NOT
- * coverage-instrumented — a plain (`CgMode::Program`) build never reads `TEKO_TKCOV`, so no file
- * is produced; when it IS (`regression_coverage_exe`'s `CgMode::ProgramCov` build, the compiler's
- * own project), the file this compile's child process dumps is exactly what gets merged back into
- * `fe.prog`.
- *
- * @param env     the scenario's own child env (`K=V` tokens; `Given env`)
- * @param prefix  the scratch-file prefix for this compile row (its covfile is `<abs prefix>.tkcov`)
- * @return        `env` with the covfile token appended
- * @since 0.3.1
- */
-fn with_regr_cov_env(env: []str, prefix: str) -> []str {
-    let cwd = match teko::env::cwd() { str as c => c; error => "" }
-    teko::list::push(env, $"TEKO_TKCOV={abs_path_of(prefix, cwd)}.tkcov")
+fn with_regr_cov_env(env: []str, prefix: str): []str {
+    var cwd = match teko::env::cwd() { str as c => c; error => "" }
+    [..env, $"TEKO_TKCOV={abs_path_of(prefix, cwd)}.tkcov"]
 }
 
-/**
- * collect_tkcov_files — recursively list every `*.tkcov` file under `dir` (the regression scratch
- * work tree), depth-first. `teko::fs::list_dir` doubles as the is-directory probe here: an entry
- * `list_dir` can open is a subdirectory (recurse into it), one it cannot is a plain file (keep it
- * when its name ends `.tkcov`). A plain (non-instrumented) regression run creates none, so this
- * walk then returns `[]`.
- *
- * @param dir  the directory to walk (the regression scratch work tree, or one of its subdirectories)
- * @return     every `.tkcov` file path found, in directory-listing order
- * @since 0.3.1
- */
-fn collect_tkcov_files(dir: str) -> []str {
-    mut out: []str = teko::list::empty()
-    let entries = match teko::fs::list_dir(dir) { []str as e => e; error => return out }
-    mut i: u64 = 0
+fn collect_tkcov_files(dir: str): []str {
+    var out: []str = []
+    var entries = match teko::fs::list_dir(dir) { []str as e => e; error => return out }
+    var i: u64 = 0
     loop {
         if i >= entries.len { break }
-        let full = dir ~ "/" ~ entries[i]
+        var full = dir ~ "/" ~ entries[i]
         match teko::fs::list_dir(full) {
             []str => {
-                let sub = collect_tkcov_files(full)
-                mut si: u64 = 0
-                loop { if si >= sub.len { break }; out = teko::list::push(out, sub[si]); si = si + 1 }
+                var sub = collect_tkcov_files(full)
+                var si: u64 = 0
+                loop { if si >= sub.len { break }; out = [..out, sub[si]]; si = si + 1 }
             }
-            error => { if teko::str::ends_with(full, ".tkcov") { out = teko::list::push(out, full) } }
+            error => { if full.ends_with(".tkcov") { out = [..out, full] } }
         }
         i = i + 1
     }
     out
 }
 
-/**
- * merge_regression_coverage — fold every `.tkcov` file the regression phase's compiles produced
- * (under `REGR_WORK_DIR`, 0.3.1 C-cov) into this process's coverage sinks via
- * `teko::coverage::cov_merge`, so a subsequent `coverage_floor_misses` read of `fe.prog` counts the
- * compiler-source lines those compiles exercised. A no-op (0 merged) when the regression tier's exe
- * was not coverage-instrumented — every project except the compiler's own
- * (`regression_coverage_exe`, `src/build/project.tks`).
- *
- * @return how many `.tkcov` files were merged
- * @since 0.3.1
- */
-pub fn merge_regression_coverage() -> u64 {
-    let files = collect_tkcov_files(REGR_WORK_DIR)
-    mut i: u64 = 0
+pub fn merge_regression_coverage(): u64 {
+    var files = collect_tkcov_files(REGR_WORK_DIR)
+    var i: u64 = 0
     loop {
         if i >= files.len { break }
         teko::coverage::cov_merge(files[i])
@@ -2041,53 +827,17 @@ pub fn merge_regression_coverage() -> u64 {
     files.len
 }
 
-/**
- * RegrBuildKind — which build shape a `RegrBuilt` cache slot holds. `None` is the empty slot;
- * the other three are the shapes `tkr_ensure_artifact` can be asked for, and a slot only satisfies
- * a scenario asking for its OWN kind (see `RegrBuilt.kind` for what keying on `done` alone cost).
- *
- * @since 0.3.1
- */
 type RegrBuildKind = enum { None; Project; Dependency; InPlace }
 
-/**
- * RegrSrcBuild — ONE cached `Given source = "<file>"` build: the `key` it is filed under, the
- * captured build outcome, and the binary it produced.
- *
- * @since 0.3.1
- */
 type RegrSrcBuild = struct {
-    /** the (source file, declared env) identity this build answers for (`regr_src_key`). */
     key: str
-    /** the captured build outcome, replayed verbatim to every later row with the same key. */
     comp: CapResult
-    /** the scratch binary this build produced (meaningful when `comp.exit == 0`). */
     binp: str
 }
 
-/**
- * regr_src_key — the identity of a standalone-source build: the source FILE plus the row's DECLARED
- * env, joined by a newline (neither a path nor a `K=V` token may contain one, so no two distinct
- * builds can collide into one key).
- *
- * KEYED ON THE ENV, NOT ON THE FILE ALONE, and that is the whole safety argument. Two rows naming
- * the same file under a different `Given target`/`Given env` are legitimately
- * DIFFERENT builds — collapsing them is the same defect class `RegrBuilt` already produced in this
- * repo when it was keyed on `done` alone: a green row asserting an artifact it never built. The
- * F5 corpus is the live proof — `own_differential.tks` is named by four configurations at once.
- *
- * The env keyed on is the row's DECLARED env, never the coverage-augmented one: `with_regr_cov_env`
- * appends a `TEKO_TKCOV=<prefix>.tkcov` token built from the ROW's scratch prefix, so no two rows
- * ever share that env and a key including it could never hit.
- *
- * @param srcp  the resolved source file path
- * @param env   the row's declared child env (`K=V` tokens)
- * @return      the cache key
- * @since 0.3.1
- */
-fn regr_src_key(srcp: str, env: []str) -> str {
-    mut out = srcp
-    mut i: u64 = 0
+fn regr_src_key(srcp: str, env: []str): str {
+    var out = srcp
+    var i: u64 = 0
     loop {
         if i >= env.len { break }
         out = out ~ "\n" ~ env[i]
@@ -2096,17 +846,8 @@ fn regr_src_key(srcp: str, env: []str) -> str {
     out
 }
 
-/**
- * regr_src_lookup — the cached standalone-source build filed under `key`, or `null` when this
- * `.tkr` file has not built it yet.
- *
- * @param built  the shared cache slot carried into this row
- * @param key    the identity to look for (`regr_src_key`)
- * @return       the cached build, or `null`
- * @since 0.3.1
- */
-fn regr_src_lookup(built: RegrBuilt, key: str) -> RegrSrcBuild | null {
-    mut i: u64 = 0
+fn regr_src_lookup(built: RegrBuilt, key: str): RegrSrcBuild | null {
+    var i: u64 = 0
     loop {
         if i >= built.srcs.len { break }
         if built.srcs[i].key == key { return built.srcs[i] }
@@ -2115,202 +856,65 @@ fn regr_src_lookup(built: RegrBuilt, key: str) -> RegrSrcBuild | null {
     null
 }
 
-/**
- * regr_src_remember — `built` with the standalone-source build `entry` added to its cache.
- *
- * @param built  the cache slot to extend
- * @param entry  the build to file
- * @return       the extended cache slot
- * @since 0.3.1
- */
-fn regr_src_remember(built: RegrBuilt, entry: RegrSrcBuild) -> RegrBuilt {
-    RegrBuilt { done = built.done; kind = built.kind; comp = built.comp; binp = built.binp; srcs = teko::list::push(built.srcs, entry) }
+fn regr_src_remember(built: RegrBuilt, entry: RegrSrcBuild): RegrBuilt {
+    RegrBuilt { done = built.done; kind = built.kind; comp = built.comp; binp = built.binp; srcs = [..built.srcs, entry] }
 }
 
-/**
- * tkr_standalone_artifact — resolve a `Given source = "<file>"` row's artifact, building the file
- * at most ONCE per (file, declared env) per `.tkr` (`regr_src_key`).
- *
- * Every row this serves after the first reports `fresh = false`, exactly as a second row of a shared
- * PROJECT build does: the measurement must not re-count a build the run never performed. Before this
- * cache the three `F8 target` rows compiled the identical one-line file three times to read three
- * substrings out of the identical diagnostic.
- *
- * @param exe       the absolute path to this compiler binary
- * @param srcp      the resolved source file path
- * @param t         the lowered row
- * @param prefix    the row's scratch-file prefix (used only when this row is the one that BUILDS)
- * @param built     the shared cache slot
- * @return          the row's artifact, with the cache slot threaded back
- * @since 0.3.1
- */
-fn tkr_standalone_artifact(exe: str, srcp: str, t: Tkr, prefix: str, built: RegrBuilt) -> TkrArtifact {
-    let key = regr_src_key(srcp, t.env)
+fn tkr_standalone_artifact(exe: str, srcp: str, t: Tkr, prefix: str, built: RegrBuilt): TkrArtifact {
+    var key = regr_src_key(srcp, t.env)
     match regr_src_lookup(built, key) {
         RegrSrcBuild as hit => return TkrArtifact { comp = hit.comp; binp = hit.binp; built = built; fresh = false }
         null => { }
     }
-    let comp = compile_standalone_source(exe, srcp, with_regr_cov_env(t.env, prefix), prefix)
-    let binp = artifact_path_for_target(snippet_project_binp(prefix), t.target)
+    var comp = compile_standalone_source(exe, srcp, with_regr_cov_env(t.env, prefix), prefix)
+    var binp = artifact_path_for_target(snippet_project_binp(prefix), t.target)
     TkrArtifact { comp = comp; binp = binp; built = regr_src_remember(built, RegrSrcBuild { key = key; comp = comp; binp = binp }); fresh = true }
 }
 
-/**
- * RegrBuilt — the lazily-built artifact of a project-based regressor: whether the project's `.tkp`
- * has been compiled yet (`done`), the captured build outcome (`comp`), and the built binary path
- * (`binp`). Threaded so several RUN scenarios (across features, across an entire `.tkr` file) share
- * ONE compile (a project's `.tkp` is compiled at most once per file), while an inline/explicit-file/
- * dependency-provisioned scenario compiles its OWN artifact and never touches this cache
- * (`tkr_ensure_artifact`).
- *
- * @since 0.3.0.30
- */
 type RegrBuilt = struct {
-    /** true once the project has been compiled (the compile is attempted at most once). */
     done: bool
-    /**
-     * WHICH build shape produced `comp`/`binp`. The cache is keyed on it, because the three shapes
-     * compile genuinely different things: `Project` is `teko <dir> -o bin` from the runner's cwd,
-     * `Dependency` is a SCRATCH consumer copy whose `packages/` was provisioned from a sub-project,
-     * and `InPlace` is `cd <dir> && teko . -o bin` (the #64 CWD-relative shape). Before this field
-     * existed the cache was keyed on `done` alone, so a `.tkr` holding two of the three shapes had
-     * whichever scenario ran FIRST serve the others — the later one asserted the earlier one's
-     * artifact and passed without ever exercising the shape it names.
-     */
     kind: RegrBuildKind
-    /** the captured build outcome (meaningful once `done`). */
     comp: CapResult
-    /** the built binary path (meaningful once `done` and the build succeeded). */
     binp: str
-    /**
-     * every `Given source = "<file>"` build this `.tkr` has already paid for, keyed on (file,
-     * declared env) — `tkr_standalone_artifact`. Separate from the single `done`/`kind` slot above
-     * because a standalone source is not the PROJECT: a `.tkr` may name many of them, and two rows
-     * naming the same one under the same configuration are one build, not two.
-     */
     srcs: []RegrSrcBuild
 }
 
-/**
- * tkr_ensure_built — compile the regressor project once (lazily), returning the shared `RegrBuilt`.
- * A no-op when `built.done` (the project is compiled at most once per `.tkr` file).
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressor project directory
- * @param env       the per-scenario child env for the FIRST scenario reaching this cache slot
- * @param prefix    the scratch-file prefix for the compile
- * @param built     the current build state
- * @return          the build state, compiled when it was not already
- * @since 0.3.0.30
- */
-fn tkr_ensure_built(exe: str, regr_dir: str, env: []str, prefix: str, built: RegrBuilt) -> RegrBuilt {
+fn tkr_ensure_built(exe: str, regr_dir: str, env: []str, prefix: str, built: RegrBuilt): RegrBuilt {
     if regr_built_serves(built, RegrBuildKind::Project) { return built }
-    let comp = compile_regressive(exe, regr_dir, env, prefix ~ ".compile")
-    let name = match regressive_name(regr_dir) { str as s => s; error => "" }
+    var comp = compile_regressive(exe, regr_dir, env, prefix ~ ".compile")
+    var name = match regressive_name(regr_dir) { str as s => s; error => "" }
     RegrBuilt { done = true; kind = RegrBuildKind::Project; comp = comp; binp = regr_dir ~ "/bin/" ~ name; srcs = built.srcs }
 }
 
-/**
- * regr_built_serves — may the cache slot `built` serve a scenario asking for a `want`-shaped build?
- * Only when it holds a completed build OF THAT SHAPE. A slot of a different shape does NOT serve:
- * the caller compiles what it actually asked for and replaces the slot, so a `.tkr` mixing shapes
- * pays one build per shape instead of silently asserting the wrong artifact.
- *
- * @param built  the cache slot carried into this scenario
- * @param want   the build shape the scenario needs
- * @return       true when `built` already holds a `want`-shaped artifact
- * @since 0.3.1
- */
-fn regr_built_serves(built: RegrBuilt, want: RegrBuildKind) -> bool {
+fn regr_built_serves(built: RegrBuilt, want: RegrBuildKind): bool {
     if !built.done { return false }
     built.kind == want
 }
 
-/**
- * guard_no_project_build_at_root — REFUSE a scenario that would compile the project ROOT itself
- * (the compiler) as a regressor. A root-listed `regressor.tkr` scenario MUST be snippet-scoped
- * (inline `source` / explicit `source` file); a `built and run` with no source at `regr_dir ==
- * "."`/"" would rebuild the compiler and recurse. Returns an honest error in that case, else
- * null. The structural half of the self-project anti-recursion guard; the `TEKO_IN_REGRESSION`
- * sentinel is the backstop.
- *
- * @param regr_dir  the regressor directory (dirname of the listed `.tkr`)
- * @param t         the lowered scenario
- * @return          an error when the scenario would build the project root, else null
- * @throws          when `regr_dir` is the project root and the scenario has no inline/explicit source
- * @since 0.3.1
- */
-fn guard_no_project_build_at_root(regr_dir: str, t: Tkr) -> null | error {
-    let at_root = regr_dir == "." || regr_dir.len == 0
-    let has_src = t.source_inline.len > 0 || t.source_file.len > 0
+fn guard_no_project_build_at_root(regr_dir: str, t: Tkr): null | error {
+    var at_root = regr_dir == "." || regr_dir.len == 0
+    var has_src = t.source_inline.len > 0 || t.source_file.len > 0
     if at_root && !has_src {
         return error { message = "regressor.tkr scenario at the project root has no inline/explicit `source` — it would rebuild the compiler root" }
     }
     null
 }
 
-/**
- * TkrArtifact — the outcome of resolving ONE lowered scenario's build artifact
- * (`tkr_ensure_artifact`): the captured compile outcome, the path to the binary it runs (when the
- * compile succeeded), and the (possibly newly-populated) shared project `RegrBuilt` cache threaded
- * back for the caller's next row/scenario.
- *
- * @since 0.3.1
- */
 type TkrArtifact = struct {
-    /** the captured build outcome for this row (inline/file/dependency/in-place fresh, or the shared project build). */
     comp: CapResult
-    /** the path to the binary this row runs (meaningful when `comp.exit == 0`). */
     binp: str
-    /** the (possibly newly-built) shared project cache, threaded back for the next scenario/row. */
     built: RegrBuilt
-    /**
-     * did THIS row actually pay for a compile? False when the artifact came from the shared project
-     * cache (`RegrBuilt.done` — a second/third row of the same project `.tkr`), in which case
-     * `comp` is the FIRST row's captured outcome, replayed. The measurement must not re-count it:
-     * the grouped-row path already states the law ("counting it again per member would report a
-     * build count the run never performed"), and the shared project cache is the same situation —
-     * one build, N rows.
-     */
     fresh: bool
 }
 
-/**
- * tkr_artifact_fail — a `TkrArtifact` describing a resolution failure (a guard rejection, a
- * provisioning/copy error) with `msg`, `built` threaded through unchanged.
- *
- * @param msg    the failure description (surfaces as `comp.stderr`)
- * @param built  the shared project cache to thread through unchanged
- * @return       a failing artifact
- * @since 0.3.1
- */
-fn tkr_artifact_fail(msg: str, built: RegrBuilt) -> TkrArtifact {
+fn tkr_artifact_fail(msg: str, built: RegrBuilt): TkrArtifact {
     TkrArtifact { comp = cap_synthetic(1, msg); binp = ""; built = built; fresh = false }
 }
 
-/**
- * tkr_ensure_artifact — resolve ONE lowered scenario's build artifact, dispatching on its declared
- * source: an inline snippet (`compile_inline_source`) or an explicit standalone file
- * (`compile_standalone_source`) each compile their OWN artifact, never touching the shared project
- * cache; a `Background: Given dependency` scenario provisions a SCRATCH consumer copy
- * (`copy_dir` + `provision_dependency`) and compiles THAT (cached per `.tkr` file, since the
- * dependency provisioning is shared across a feature's rows); a `When built in place` scenario
- * compiles the project CWD-relative (`compile_in_place`, also cached); anything else falls back to
- * the ordinary shared project build (`tkr_ensure_built`). `guard_no_project_build_at_root` runs
- * first, refusing a root-scoped scenario with no inline/explicit source before any of the above.
- *
- * @param exe       the absolute path to this compiler binary (gen1)
- * @param regr_dir  the regressor project directory
- * @param t         the lowered scenario
- * @param prefix    the scratch-file prefix for this row
- * @param built     the shared project cache so far
- * @return          the resolved artifact (compile outcome, binary path, updated cache)
- * @since 0.3.1
- */
-fn tkr_ensure_artifact(exe: str, regr_dir: str, t: Tkr, prefix: str, built: RegrBuilt) -> TkrArtifact {
+fn tkr_ensure_artifact(exe: str, regr_dir: str, t: Tkr, prefix: str, built: RegrBuilt): TkrArtifact {
     match guard_no_project_build_at_root(regr_dir, t) { error as e => return tkr_artifact_fail(e.message, built); null => { } }
     if t.source_inline.len > 0 {
-        let comp = compile_inline_source(exe, t.source_inline, with_regr_cov_env(t.env, prefix), prefix)
+        var comp = compile_inline_source(exe, t.source_inline, with_regr_cov_env(t.env, prefix), prefix)
         return TkrArtifact { comp = comp; binp = artifact_path_for_target(snippet_project_binp(prefix), t.target); built = built; fresh = true }
     }
     if t.source_file.len > 0 {
@@ -2318,194 +922,84 @@ fn tkr_ensure_artifact(exe: str, regr_dir: str, t: Tkr, prefix: str, built: Regr
     }
     if t.dep_dir.len > 0 {
         if regr_built_serves(built, RegrBuildKind::Dependency) { return TkrArtifact { comp = built.comp; binp = built.binp; built = built; fresh = false } }
-        let scratch_consumer = prefix ~ ".consumer"
+        var scratch_consumer = prefix ~ ".consumer"
         match copy_dir(regr_dir, scratch_consumer) { error as e => return tkr_artifact_fail(e.message, built); null => { } }
         match provision_dependency(exe, regr_dir ~ "/" ~ t.dep_dir, scratch_consumer ~ "/packages", prefix ~ ".dep") {
             error as e => return tkr_artifact_fail(e.message, built)
             str => { }
         }
-        let comp = compile_regressive(exe, scratch_consumer, with_regr_cov_env(t.env, prefix ~ ".compile"), prefix ~ ".compile")
-        let name = match regressive_name(scratch_consumer) { str as s => s; error => "" }
-        let nb = RegrBuilt { done = true; kind = RegrBuildKind::Dependency; comp = comp; binp = artifact_path_for_target(scratch_consumer ~ "/bin/" ~ name, t.target); srcs = built.srcs }
+        var comp = compile_regressive(exe, scratch_consumer, with_regr_cov_env(t.env, prefix ~ ".compile"), prefix ~ ".compile")
+        var name = match regressive_name(scratch_consumer) { str as s => s; error => "" }
+        var nb = RegrBuilt { done = true; kind = RegrBuildKind::Dependency; comp = comp; binp = artifact_path_for_target(scratch_consumer ~ "/bin/" ~ name, t.target); srcs = built.srcs }
         return TkrArtifact { comp = nb.comp; binp = nb.binp; built = nb; fresh = true }
     }
     if t.in_place {
         if regr_built_serves(built, RegrBuildKind::InPlace) { return TkrArtifact { comp = built.comp; binp = built.binp; built = built; fresh = false } }
-        let comp = compile_in_place(exe, regr_dir, with_regr_cov_env(t.env, prefix ~ ".compile"), prefix ~ ".compile")
-        let name = match regressive_name(regr_dir) { str as s => s; error => "" }
-        let nb = RegrBuilt { done = true; kind = RegrBuildKind::InPlace; comp = comp; binp = artifact_path_for_target(regr_dir ~ "/bin/" ~ name, t.target); srcs = built.srcs }
+        var comp = compile_in_place(exe, regr_dir, with_regr_cov_env(t.env, prefix ~ ".compile"), prefix ~ ".compile")
+        var name = match regressive_name(regr_dir) { str as s => s; error => "" }
+        var nb = RegrBuilt { done = true; kind = RegrBuildKind::InPlace; comp = comp; binp = artifact_path_for_target(regr_dir ~ "/bin/" ~ name, t.target); srcs = built.srcs }
         return TkrArtifact { comp = nb.comp; binp = nb.binp; built = nb; fresh = true }
     }
-    let fresh = !regr_built_serves(built, RegrBuildKind::Project)
-    let nb = tkr_ensure_built(exe, regr_dir, with_regr_cov_env(t.env, prefix), prefix, built)
+    var fresh = !regr_built_serves(built, RegrBuildKind::Project)
+    var nb = tkr_ensure_built(exe, regr_dir, with_regr_cov_env(t.env, prefix), prefix, built)
     TkrArtifact { comp = nb.comp; binp = artifact_path_for_target(nb.binp, t.target); built = nb; fresh = fresh }
 }
 
-/**
- * tkr_row_run_verdict — the RUN half of one row's verdict: execute the built binary under the
- * scenario's `env`/`stdin`/`args` (behind `wrap`, the run-wrapper prefix) and check it via
- * `check_run` — UNLESS the row's target is a CROSS target this host cannot exec, in which case the
- * run is honestly SKIPPED carrying the build's own emitted-not-run note (`cross_note_for_name`,
- *
- * THE BINARY RUNS WITH ITS CWD IN ITS OWN SCRATCH (`<prefix>.cwd/`), not in the repository root.
- * Any fixture that writes a RELATIVE path — the natural way to write a file-IO scenario — used to
- * land that file in the working tree, where it survived the run and dirtied `git status`; the
- * fixture then had to know where it was and clean up after itself, which is a workaround for the
- * runner's own choice, not a property of the scenario. Running in a per-row scratch kills the whole
- * class. Everything the runner hands the shell across that `cd` is ABSOLUTIZED here: the binary
- * (`argv[0]`) and the capture-file prefix, whose `.in`/`.out`/`.err` redirections are evaluated by
- * the shell AFTER the `cd` (the same rule `compile_in_place` already documents). The leaf-tool
- * checks keep the runner-relative `binp` — they run in the runner's own process, not the child's.
- * project.tks — the single source of truth C5 gave the build; the runner does not keep a second
- * one). A wrapper-bearing target (wasm under `wasmtime`) is NOT skipped: the
- * emulator IS how this host executes it. Deliberately `regr_skip` and NOT `tool_skip_or_fail`:
- * `REGRESSION_REQUIRE_TOOLS` is fail-closed for a capability a lane can PROVISION, and no
- * provisioning makes a host exec a foreign-format binary — this skip is a property of the target,
- * not a gap in the lane.
- *
- * @param t       the lowered scenario
- * @param binp    the built binary path
- * @param wrap    the resolved run-wrapper prefix ([] for a directly-executable target)
- * @param prefix  the scratch-file prefix for this run
- * @return        the run verdict, or the honest emitted-not-run skip
- * @since 0.3.1
- */
-fn tkr_row_run_verdict(t: Tkr, binp: str, wrap: []str, prefix: str) -> RowVerdict {
-    // `When built` — the row CLAIMS THE ARTEFACT, NOT THE RUN, so not running it leaves nothing
-    // unverified and the verdict is a PASS. Owner ruling 2026-07-28: *"vale incrementar o que o
-    // regressor faz (ensinar), é necessidade real."*
-    //
-    // NOT A SKIP, and the difference is the whole reason this branch exists. A skip says "nobody
-    // knows whether that construct works"; an `EmitOnly` row asserted the emitted object and had
-    // that assertion CHECKED (`Then object well-formed`, applied by the caller in the runner's own
-    // process). Reporting it as skipped told `no_skips_gate.sh` a claim was outstanding when none
-    // was — and the gate was right to fail on that, which is why the fix belongs HERE and not in
-    // the gate.
-    //
-    // It is checked BEFORE the cross branch on purpose: an `EmitOnly` row never runs, on any host,
-    // so whether the target happens to be cross is irrelevant to its verdict.
-    if t.kind == TkrKind::EmitOnly {
-        return RowVerdict { outcome = regr_pass(); harness_ns = 0; run_ns = 0 }
-    }
-    if wrap.len == 0 {
-        let cross = cross_note_for_name(t.target)
-        if cross.is_cross { return RowVerdict { outcome = regr_skip(cross.note); harness_ns = 0; run_ns = 0 } }
-    }
-    let cwd = match teko::env::cwd() { str as c => c; error => "" }
-    let rundir = prefix ~ ".cwd"
+fn tkr_row_run_verdict(t: Tkr, binp: str, prefix: str): RowVerdict {
+    if t.kind == TkrKind::EmitOnly { return emit_only_row_verdict() }
+    var cross = cross_note_for_name(t.target)
+    if cross.is_cross { return RowVerdict { outcome = regr_skip(cross.note); harness_ns = 0; run_ns = 0 } }
+    var cwd = match teko::env::cwd() { str as c => c; error => "" }
+    var rundir = prefix ~ ".cwd"
     match mkdir_p(teko::str::concat(rundir, "/")) { error => { }; null => { } }
-    let argv = wrap_argv_with_wrapper(wrap, argv_with_args(abs_path_of(binp, cwd), t.args))
-    let run = run_captured_in_dir(argv, t.stdin, t.env, rundir, abs_path_of(prefix, cwd))
+    var argv = argv_with_args(abs_path_of(binp, cwd), t.args)
+    var run = run_captured_in_dir(argv, t.stdin, t.env, rundir, abs_path_of(prefix, cwd))
     RowVerdict { outcome = check_run(t, HOST_TARGET, run); harness_ns = run.harness_ns; run_ns = run.child_ns }
 }
 
-/**
- * RowVerdict — one row's RUN verdict plus the measurement of that run: the harness time around the
- * child and the time inside it. Separate from `RegrOutcome` so the verdict type stays about the
- * verdict and never carries observability into the gate logic.
- *
- * @since 0.3.1
- */
+fn emit_only_row_verdict(): RowVerdict {
+    RowVerdict { outcome = regr_pass(); harness_ns = 0; run_ns = 0 }
+}
+
 type RowVerdict = struct {
-    /** the run's verdict (pass, honest skip, or failure). */
     outcome: RegrOutcome
-    /** ns spent on scratch/plumbing around the run. */
     harness_ns: i64
-    /** ns spent inside the built binary. */
     run_ns: i64
 }
 
-/**
- * tkr_run_one_row — run and check ONE lowered scenario against its already-resolved binary `binp`:
- * resolve the `Given target` run-wrapper (honest-skip/fail-closed when its tool is absent), take the
- * run verdict (`tkr_row_run_verdict` — which honest-skips the run itself for a cross target), then
- * apply any declared leaf-tool checks (`Then object well-formed` / `Then module valid`) on top. The
- * leaf checks run even when the RUN was skipped: a cross row's whole point is that its EMITTED
- * object is well-formed for the target, which is checkable on this host even though the binary is not
- * runnable here.
- *
- * @param t       the lowered scenario
- * @param binp    the built binary path
- * @param prefix  the scratch-file prefix for this run
- * @return        the aggregate verdict (the first failure, else pass/skip), carrying the leaf-tool
- *                 checks' own skip tally
- * @since 0.3.1
- */
-fn tkr_run_one_row(t: Tkr, binp: str, prefix: str) -> RowVerdict {
-    let wrap = match resolve_run_wrapper(t.target) { []str as w => w; error as e => return RowVerdict { outcome = tool_skip_or_fail(e.message); harness_ns = 0; run_ns = 0 } }
-    let rv = tkr_row_run_verdict(t, binp, wrap, prefix)
+fn tkr_run_one_row(t: Tkr, binp: str, prefix: str): RowVerdict {
+    var rv = tkr_row_run_verdict(t, binp, prefix)
     if !rv.outcome.ok { return rv }
-    mut skips: u64 = 0
+    var skips: u64 = 0
     if t.check_wellformed {
-        let wf = check_object_wellformed(binp ~ ".o", tkr_effective_target(t.target))
+        var wf = check_object_wellformed(sibling_object_path(binp, row_artifact_target(t.target)), tkr_effective_target(t.target))
         if !wf.ok && !wf.skipped { return RowVerdict { outcome = wf; harness_ns = rv.harness_ns; run_ns = rv.run_ns } }
         skips = skips + wf.skips
-    }
-    if t.check_module_valid {
-        let mv = check_module_valid(binp)
-        if !mv.ok && !mv.skipped { return RowVerdict { outcome = mv; harness_ns = rv.harness_ns; run_ns = rv.run_ns } }
-        skips = skips + mv.skips
     }
     RowVerdict { outcome = regr_add_skips(rv.outcome, skips); harness_ns = rv.harness_ns; run_ns = rv.run_ns }
 }
 
-/**
- * FeatureRunResult — the outcome of running one feature's RUN scenarios (`tkr_run_scenarios`): the
- * aggregate verdict plus the (possibly newly-populated) shared project `RegrBuilt` cache threaded
- * back to the caller (`run_one_tkr`) for the NEXT feature in the same `.tkr` file.
- *
- * @since 0.3.1
- */
 type FeatureRunResult = struct {
-    /** the aggregate verdict across the feature's scenarios (the first failure, else pass). */
     outcome: RegrOutcome
-    /** the shared project cache, possibly newly built by this feature's scenarios. */
     built: RegrBuilt
-    /** every row this feature measured, in run order (observability only — `regr_timing.tks`). */
     rows: []RowTiming
 }
 
-/**
- * TkrRowRun — the outcome of running ONE expanded `Examples` row (`tkr_run_row`): that row's
- * verdict plus the shared project `RegrBuilt` cache as the row left it, threaded to the next row.
- * Distinct from `FeatureRunResult` (whose verdict spans a whole feature) so neither name lies about
- * the scope of the verdict it carries.
- *
- * @since 0.3.1
- */
 type TkrRowRun = struct {
-    /** the row's verdict: a capability skip, a pass carrying its leaf-tool skips, or a failure. */
     outcome: RegrOutcome
-    /** the shared project cache, possibly newly built by this row. */
     built: RegrBuilt
-    /** the row's three-phase measurement (observability only — `regr_timing.tks`). */
     times: PhaseTimes
 }
 
-/**
- * tkr_run_row — build and check ONE expanded scenario row. The row is honest-SKIPPED BEFORE any
- * build when this host lacks a capability the row needs (`tkr_row_capability_skip_reason`) —
- * probing after the build would let a missing cross-linker surface as an indistinguishable `cc`
- * failure — else the artifact is resolved (`tkr_ensure_artifact`) and checked (`tkr_run_one_row`).
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressor project directory
- * @param t         the lowered row
- * @param prefix    the scratch-file prefix for this row
- * @param built     the shared project cache so far
- * @param groups    the grouped builds this run made before any scenario started
- * @return          the row's verdict plus the (possibly updated) shared cache
- * @since 0.3.1
- */
-fn tkr_run_row(exe: str, regr_dir: str, t: Tkr, prefix: str, built: RegrBuilt, groups: RegrGroups) -> TkrRowRun {
-    let missing = tkr_row_capability_skip_reason(t)
+fn tkr_run_row(exe: str, regr_dir: str, t: Tkr, prefix: str, built: RegrBuilt, groups: RegrGroups): TkrRowRun {
+    var missing = tkr_row_capability_skip_reason(t)
     if missing.len > 0 { return TkrRowRun { outcome = tool_skip_or_fail(missing); built = built; times = phase_zero() } }
     match regr_group_slot(groups, prefix) {
         RegrGroupSlot as slot => return tkr_run_grouped_row(t, slot, prefix, built)
         null => { }
     }
-    let art = tkr_ensure_artifact(exe, regr_dir, t, prefix, built)
-    let build_times = if art.fresh {
+    var art = tkr_ensure_artifact(exe, regr_dir, t, prefix, built)
+    var build_times = if art.fresh {
         PhaseTimes { harness_ns = art.comp.harness_ns; compile_ns = art.comp.child_ns; run_ns = 0; builds = 1 }
     } else {
         phase_zero()
@@ -2513,93 +1007,39 @@ fn tkr_run_row(exe: str, regr_dir: str, t: Tkr, prefix: str, built: RegrBuilt, g
     if art.comp.exit != 0 {
         return TkrRowRun { outcome = regr_fail(compile_failure_message(art.comp)); built = art.built; times = build_times }
     }
-    let rv = tkr_run_one_row(t, art.binp, prefix ~ ".run")
-    let run_times = PhaseTimes { harness_ns = rv.harness_ns; compile_ns = 0; run_ns = rv.run_ns; builds = 0 }
+    var rv = tkr_run_one_row(t, art.binp, prefix ~ ".run")
+    var run_times = PhaseTimes { harness_ns = rv.harness_ns; compile_ns = 0; run_ns = rv.run_ns; builds = 0 }
     TkrRowRun { outcome = rv.outcome; built = art.built; times = phase_add(build_times, run_times) }
 }
 
-/**
- * tkr_run_grouped_row — run and check ONE row whose artifact was already built, together with every
- * other row of its configuration, BEFORE the run started (`regr_group.tks`). The row selects its own
- * snippet inside that artifact through the group selector (`regr_with_entry_env`) and is then checked
- * by the very same `tkr_run_one_row` an ungrouped row goes through — the fold changes WHERE the
- * binary came from and nothing about what is asserted of it.
- *
- * The row's measurement carries NO build: the one build its group paid for is accounted once, in the
- * group's own `PhaseTimes`. Counting it again per member would report a build count the run never
- * performed.
- *
- * @param t       the lowered row
- * @param slot    the row's group artifact and selector
- * @param prefix  the scratch-file prefix for this row
- * @param built   the shared project cache, threaded through untouched (a grouped row never uses it)
- * @return        the row's verdict and its run-only measurement
- * @since 0.3.1
- */
-fn tkr_run_grouped_row(t: Tkr, slot: RegrGroupSlot, prefix: str, built: RegrBuilt) -> TkrRowRun {
-    let rv = tkr_run_one_row(regr_with_entry_env(t, slot.module), slot.binp, prefix ~ ".run")
+fn tkr_run_grouped_row(t: Tkr, slot: RegrGroupSlot, prefix: str, built: RegrBuilt): TkrRowRun {
+    var rv = tkr_run_one_row(regr_with_entry_env(t, slot.module), slot.binp, prefix ~ ".run")
     TkrRowRun {
         outcome = rv.outcome; built = built
         times = PhaseTimes { harness_ns = rv.harness_ns; compile_ns = 0; run_ns = rv.run_ns; builds = 0 }
     }
 }
 
-/**
- * regr_row_skip_line — the report line for ONE honest-skipped scenario row: WHICH row, and WHY.
- * Shaped like the failure line it stands beside (`<scenario>[<row>]: <message>`) so a reader parses
- * both the same way, and marked `skip` rather than `FAIL` so neither can be mistaken for the other.
- *
- * It exists because a COUNT is not an honest report (M.3). The run summary already says how many
- * rows were skipped, but a bare count cannot be audited: a reader cannot tell a legitimately absent
- * cross toolchain from a capability that silently stopped working, and the reason — which every
- * skip already carries in its `RegrOutcome.message` — was being computed and then dropped.
- *
- * @param scenario  the scenario's name
- * @param row       the expanded `Examples` row index
- * @param reason    the honest reason the row cannot run on this host
- * @return          the report line
- * @since 0.3.1
- */
-fn regr_row_skip_line(scenario: str, row: u64, reason: str) -> str {
+fn regr_row_skip_line(scenario: str, row: u64, reason: str): str {
     $"teko: regression skip {scenario}[{row}]: {reason}"
 }
 
-/**
- * tkr_run_scenarios — run every RUN scenario of a parsed feature, in order: a declarative
- * (verb-less) scenario is honest-SKIPPED without touching any artifact (0.3.1 C1 — this is what
- * lets `regressor.tkr`'s meta contract stay living documentation, never a build); every other
- * scenario expands its `Examples` rows and hands each to `tkr_run_row`. The verdict is the FIRST
- * failure — labelled with the scenario NAME and row index, so a red CI log names the scenario
- * instead of leaving the reader to decode a scratch-path index — else a pass carrying the feature's
- * whole capability-skip tally. A row that is honest-SKIPPED reports its reason on its own line
- * (`regr_row_skip_line`) as it happens, so the summary's skip COUNT always has an auditable trail
- * behind it. Compile-fail scenarios are handled by `tkr_run_compile_fail`.
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressor project directory
- * @param feat      the parsed feature
- * @param prefix    the scratch-file prefix for the runs
- * @param built     the shared project cache carried in from a prior feature (or fresh)
- * @param groups    the grouped builds this run made before any scenario started
- * @return          the aggregate run verdict plus the (possibly updated) shared cache
- * @since 0.3.0.30
- */
-fn tkr_run_scenarios(exe: str, regr_dir: str, feat: TkrFeature, prefix: str, built: RegrBuilt, groups: RegrGroups) -> FeatureRunResult {
-    mut cur = built
-    mut skips: u64 = 0
-    mut rows: []RowTiming = teko::list::empty()
-    mut si: u64 = 0
+fn tkr_run_scenarios(exe: str, regr_dir: str, feat: TkrFeature, prefix: str, built: RegrBuilt, groups: RegrGroups): FeatureRunResult {
+    var cur = built
+    var skips: u64 = 0
+    var rows: []RowTiming = []
+    var si: u64 = 0
     loop {
         if si >= feat.scenarios.len { break }
-        let sc = feat.scenarios[si]
+        var sc = feat.scenarios[si]
         if tkb_scenario_is_declarative(sc) { si = si + 1; continue }
-        let specs = match tkr_expand_outline(sc) { []Tkr as xs => xs; error as e => return FeatureRunResult { outcome = regr_fail(e.message); built = cur; rows = rows } }
-        mut ri: u64 = 0
+        var specs = match tkr_expand_outline(sc) { []Tkr as xs => xs; error as e => return FeatureRunResult { outcome = regr_fail(e.message); built = cur; rows = rows } }
+        var ri: u64 = 0
         loop {
             if ri >= specs.len { break }
-            let rr = tkr_run_row(exe, regr_dir, specs[ri], $"{prefix}.{si}.{ri}", cur, groups)
+            var rr = tkr_run_row(exe, regr_dir, specs[ri], $"{prefix}.{si}.{ri}", cur, groups)
             cur = rr.built
-            rows = teko::list::push(rows, RowTiming { feature = feat.name; scenario = sc.name; row = ri; skipped = rr.outcome.skipped; times = rr.times })
+            rows = [..rows, RowTiming { feature = feat.name; scenario = sc.name; row = ri; skipped = rr.outcome.skipped; times = rr.times }]
             if !rr.outcome.ok && !rr.outcome.skipped {
                 return FeatureRunResult { outcome = regr_fail($"{sc.name}[{ri}]: {rr.outcome.message}"); built = cur; rows = rows }
             }
@@ -2612,55 +1052,21 @@ fn tkr_run_scenarios(exe: str, regr_dir: str, feat: TkrFeature, prefix: str, bui
     FeatureRunResult { outcome = regr_add_skips(regr_pass(), skips); built = cur; rows = rows }
 }
 
-/**
- * regr_dir_has_single_tkp — does `regr_dir` contain EXACTLY one `.tkp` manifest? The fail-closed
- * precondition for `tkr_compile_fail_artifact`'s multi-file fallback: a bare source directory
- * (not a real project) must never be silently accepted as one just because the runner's own
- * "no single .tkp manifest" infrastructure error also happens to surface as a non-zero exit,
- * which `check_compile_fail` cannot distinguish from a genuine compiler rejection.
- *
- * @param regr_dir  the directory to probe
- * @return          true when exactly one `*.tkp` entry is present, false otherwise (including an
- *                   unreadable directory)
- * @since 0.3.1
- */
-fn regr_dir_has_single_tkp(regr_dir: str) -> bool {
-    let entries = match teko::fs::list_dir(regr_dir) { []str as e => e; error => return false }
-    mut count: u64 = 0
-    mut i: u64 = 0
+fn regr_dir_has_single_tkp(regr_dir: str): bool {
+    var entries = match teko::fs::list_dir(regr_dir) { []str as e => e; error => return false }
+    var count: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= entries.len { break }
-        if teko::str::ends_with(entries[i], ".tkp") { count = count + 1 }
+        if entries[i].ends_with(".tkp") { count = count + 1 }
         i++
     }
     count == 1
 }
 
-/**
- * tkr_compile_fail_artifact — resolve ONE compile-fail scenario's build: an inline snippet
- * (`compile_inline_source`) or an explicit standalone file (`compile_standalone_source`), each
- * relative to `regr_dir`; with NEITHER declared, falls back to compiling `regr_dir`'s OWN project
- * (`compile_regressive`) — the multi-file-fixture case, where the rejected construct needs its
- * full source tree (e.g. a construct spanning two files) and cannot be a single snippet. Guarded
- * against the project-root recursion (`guard_no_project_build_at_root`) exactly like the RUN
- * path, and — for the multi-file fallback specifically — fail-closed against `regr_dir` not
- * actually being a project (`regr_dir_has_single_tkp`) or the scenario omitting the `diagnostic`
- * it would need to assert against a real compiler-emitted message (0.3.1 M.3: an infrastructure
- * failure must never be consumed as "the compiler rejected the construct").
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressor project directory
- * @param t         the lowered scenario
- * @param prefix    the scratch-file prefix for this row
- * @return          the captured build outcome, or an error when the scenario cannot honestly
- *                   resolve an artifact (a guard rejection, a missing project, or no diagnostic)
- * @throws          when `regr_dir` is the project root with no inline/explicit source, or the
- *                   multi-file fallback has no single `.tkp` project or no declared `diagnostic`
- * @since 0.3.1
- */
-fn tkr_compile_fail_artifact(exe: str, regr_dir: str, t: Tkr, prefix: str, built: RegrBuilt) -> TkrArtifact | error {
+fn tkr_compile_fail_artifact(exe: str, regr_dir: str, t: Tkr, prefix: str, built: RegrBuilt): TkrArtifact | error {
     if t.source_inline.len > 0 {
-        let comp = compile_inline_source(exe, t.source_inline, with_regr_cov_env(t.env, prefix), prefix)
+        var comp = compile_inline_source(exe, t.source_inline, with_regr_cov_env(t.env, prefix), prefix)
         return TkrArtifact { comp = comp; binp = ""; built = built; fresh = true }
     }
     if t.source_file.len > 0 {
@@ -2673,54 +1079,35 @@ fn tkr_compile_fail_artifact(exe: str, regr_dir: str, t: Tkr, prefix: str, built
     if !regr_dir_has_single_tkp(regr_dir) || t.diagnostic.len == 0 {
         return error { message = "a compile-fail scenario with no `Given source`/`Given source inline` needs a `.tkp` project in " ~ regr_dir ~ " and a `Then diagnostic`" }
     }
-    // The PROJECT's own failing build, CACHED across every scenario of the file exactly as a
-    // passing project build is. A `diagnostics` project holds one source file per rejected
-    // construct and the compiler reports EVERY diagnostic in ONE build (0.3.1 all-diagnostics
-    // ruling), so N scenarios pin N diagnostics against that single build — never N builds.
-    let fresh = !regr_built_serves(built, RegrBuildKind::Project)
-    let nb = tkr_ensure_built(exe, regr_dir, with_regr_cov_env(t.env, prefix), prefix, built)
+    var fresh = !regr_built_serves(built, RegrBuildKind::Project)
+    var nb = tkr_ensure_built(exe, regr_dir, with_regr_cov_env(t.env, prefix), prefix, built)
     TkrArtifact { comp = nb.comp; binp = nb.binp; built = nb; fresh = fresh }
 }
 
-/**
- * tkr_run_compile_fail — run the compile-fail scenarios of a parsed feature, returning the same
- * shape a RUN feature does (verdict + measured rows): a declarative
- * scenario is honest-SKIPPED; every other scenario resolves its build artifact
- * (`tkr_compile_fail_artifact` — an inline/explicit-file snippet, or `regr_dir`'s OWN project when
- * neither is declared) and checks it via `check_compile_fail`. The verdict is the FIRST failure,
- * else pass.
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressor project directory
- * @param feat      the parsed feature
- * @param prefix    the scratch-file prefix for the compiles
- * @return          the aggregate compile-fail verdict
- * @since 0.3.0.30
- */
-fn tkr_run_compile_fail(exe: str, regr_dir: str, feat: TkrFeature, prefix: str, built: RegrBuilt) -> FeatureRunResult {
-    mut rows: []RowTiming = teko::list::empty()
-    mut cur = built
-    mut si: u64 = 0
+fn tkr_run_compile_fail(exe: str, regr_dir: str, feat: TkrFeature, prefix: str, built: RegrBuilt): FeatureRunResult {
+    var rows: []RowTiming = []
+    var cur = built
+    var si: u64 = 0
     loop {
         if si >= feat.scenarios.len { break }
-        let sc = feat.scenarios[si]
+        var sc = feat.scenarios[si]
         if tkb_scenario_is_declarative(sc) { si = si + 1; continue }
-        let specs = match tkr_expand_outline(sc) { []Tkr as xs => xs; error as e => return compile_fail_result_at(regr_fail(e.message), rows, cur) }
-        mut ri: u64 = 0
+        var specs = match tkr_expand_outline(sc) { []Tkr as xs => xs; error as e => return compile_fail_result_at(regr_fail(e.message), rows, cur) }
+        var ri: u64 = 0
         loop {
             if ri >= specs.len { break }
-            let t = specs[ri]
-            let row_prefix = $"{prefix}.{si}.{ri}"
-            let art = match tkr_compile_fail_artifact(exe, regr_dir, t, row_prefix, cur) { TkrArtifact as a => a; error as e => return compile_fail_result_at(regr_fail($"{sc.name}[{ri}]: {e.message}"), rows, cur) }
+            var t = specs[ri]
+            var row_prefix = $"{prefix}.{si}.{ri}"
+            var art = match tkr_compile_fail_artifact(exe, regr_dir, t, row_prefix, cur) { TkrArtifact as a => a; error as e => return compile_fail_result_at(regr_fail($"{sc.name}[{ri}]: {e.message}"), rows, cur) }
             cur = art.built
-            let comp = art.comp
-            let oc = check_compile_fail(t, comp)
-            let times = if art.fresh {
+            var comp = art.comp
+            var oc = check_compile_fail(t, comp)
+            var times = if art.fresh {
                 PhaseTimes { harness_ns = comp.harness_ns; compile_ns = comp.child_ns; run_ns = 0; builds = 1 }
             } else {
                 phase_zero()
             }
-            rows = teko::list::push(rows, RowTiming { feature = feat.name; scenario = sc.name; row = ri; skipped = false; times = times })
+            rows = [..rows, RowTiming { feature = feat.name; scenario = sc.name; row = ri; skipped = false; times = times }]
             if !oc.ok { return compile_fail_result_at(regr_fail($"{sc.name}[{ri}]: {oc.message}"), rows, cur) }
             ri = ri + 1
         }
@@ -2729,66 +1116,26 @@ fn tkr_run_compile_fail(exe: str, regr_dir: str, feat: TkrFeature, prefix: str, 
     compile_fail_result_at(regr_pass(), rows, cur)
 }
 
-/**
- * compile_fail_result_at — a `FeatureRunResult` for a COMPILE-FAIL feature: its verdict, its
- * measured rows, and the shared project cache THREADED BACK. A compile-fail feature does build the
- * regressor project when its scenarios declare no source of their own (the `diagnostics` shape), so
- * the slot it filled must reach the next feature — otherwise every feature would rebuild it.
- *
- * @param oc     the feature's verdict
- * @param rows   the rows measured before the verdict was reached
- * @param built  the shared project cache as this feature leaves it
- * @return       the feature result
- * @since 0.3.1
- */
-fn compile_fail_result_at(oc: RegrOutcome, rows: []RowTiming, built: RegrBuilt) -> FeatureRunResult {
+fn compile_fail_result_at(oc: RegrOutcome, rows: []RowTiming, built: RegrBuilt): FeatureRunResult {
     FeatureRunResult { outcome = oc; built = built; rows = rows }
 }
 
-/**
- * tkr_feature_is_compile_fail — does the feature's first scenario classify as `compilation fails`?
- * A feature is uniformly one kind (run-and-check OR compile-fail), so the first scenario's kind
- * selects the runner path.
- *
- * @param feat  the parsed feature
- * @return      true when the feature is a compile-fail feature
- * @since 0.3.0.30
- */
-fn tkr_feature_is_compile_fail(feat: TkrFeature) -> bool {
+fn tkr_feature_is_compile_fail(feat: TkrFeature): bool {
     if feat.scenarios.len == 0 { return false }
     match tkr_lower_scenario(feat.scenarios[0]) { Tkr as t => t.kind == TkrKind::CompileFail; error => false }
 }
 
-/**
- * run_one_tkr — run one `.tkr` file of a regressor: parse it into `[]TkrFeature`, then for every
- * feature dispatch on its kind — a compile-fail feature compiles each non-declarative scenario's
- * `Given source`/`Given source inline` standalone; a RUN feature resolves and runs each
- * non-declarative scenario's own artifact (`tkr_run_scenarios`), sharing ONE project build lazily
- * across every RUN feature in the file. Nothing is compiled until a scenario actually needs it, so
- * a wholly-declarative `.tkr` (living documentation) never touches the filesystem. The verdict is
- * the FIRST failure across all features, else a pass carrying the file's whole capability-skip
- * tally (so the run summary can report skips instead of absorbing them into "run"). Every measured
- * row travels back with it (`TkrFileRun`) for the timing report.
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressor project directory
- * @param tkr_name  the `.tkr` basename inside `regr_dir`
- * @param prefix    the scratch-file prefix for this `.tkr`
- * @param groups    the grouped builds this run made before any scenario started
- * @return          the aggregate verdict for the file, plus its measured rows
- * @since 0.3.0.30
- */
-fn run_one_tkr(exe: str, regr_dir: str, tkr_name: str, prefix: str, groups: RegrGroups) -> TkrFileRun {
-    let src = match teko::io::read_file(regr_dir ~ "/" ~ tkr_name) { str as s => s; error as e => return file_run_of(regr_fail(e.message), teko::list::empty()) }
-    let feats = match parse_tkr(src) { []TkrFeature as xs => xs; error as e => return file_run_of(regr_fail(e.message), teko::list::empty()) }
-    mut built = RegrBuilt { done = false; kind = RegrBuildKind::None; comp = cap_synthetic(0, ""); binp = ""; srcs = teko::list::empty() }
-    mut skips: u64 = 0
-    mut rows: []RowTiming = teko::list::empty()
-    mut fi: u64 = 0
+fn run_one_tkr(exe: str, regr_dir: str, tkr_name: str, prefix: str, groups: RegrGroups): TkrFileRun {
+    var src = match teko::io::read_file(regr_dir ~ "/" ~ tkr_name) { str as s => s; error as e => return file_run_of(regr_fail(e.message), []) }
+    var feats = match parse_tkr(src) { []TkrFeature as xs => xs; error as e => return file_run_of(regr_fail(e.message), []) }
+    var built = RegrBuilt { done = false; kind = RegrBuildKind::None; comp = cap_synthetic(0, ""); binp = ""; srcs = [] }
+    var skips: u64 = 0
+    var rows: []RowTiming = []
+    var fi: u64 = 0
     loop {
         if fi >= feats.len { break }
-        let feat = feats[fi]
-        let fr = run_one_feature(exe, regr_dir, feat, $"{prefix}.f{fi}", built, groups)
+        var feat = feats[fi]
+        var fr = run_one_feature(exe, regr_dir, feat, $"{prefix}.f{fi}", built, groups)
         built = fr.built
         rows = concat_row_timings(rows, fr.rows)
         if !fr.outcome.ok && !fr.outcome.skipped { return file_run_of(fr.outcome, rows) }
@@ -2798,185 +1145,78 @@ fn run_one_tkr(exe: str, regr_dir: str, tkr_name: str, prefix: str, groups: Regr
     file_run_of(regr_add_skips(regr_pass(), skips), rows)
 }
 
-/**
- * TkrFileRun — one `.tkr` file's aggregate verdict plus every row it measured. The two travel
- * together so the report line can carry the file's totals without a second traversal.
- *
- * @since 0.3.1
- */
 type TkrFileRun = struct {
-    /** the file's aggregate verdict (the first failure, else a pass carrying its skip tally). */
     outcome: RegrOutcome
-    /** every measured row of the file, in run order. */
     rows: []RowTiming
 }
 
-/**
- * file_run_of — a `TkrFileRun` of `oc` and `rows`.
- *
- * @param oc    the file's verdict
- * @param rows  the file's measured rows
- * @return      the file result
- * @since 0.3.1
- */
-fn file_run_of(oc: RegrOutcome, rows: []RowTiming) -> TkrFileRun {
+fn file_run_of(oc: RegrOutcome, rows: []RowTiming): TkrFileRun {
     TkrFileRun { outcome = oc; rows = rows }
 }
 
-/**
- * run_one_feature — dispatch ONE feature on its kind: a compile-fail feature compiles each
- * non-declarative scenario's source standalone; a RUN feature resolves and runs each scenario's own
- * artifact, sharing the lazily-built project. Both return the same shape, so `run_one_tkr` folds
- * verdict, cache and timings uniformly instead of branching over two result types.
- *
- * @param exe       the absolute path to this compiler binary
- * @param regr_dir  the regressor project directory
- * @param feat      the parsed feature
- * @param prefix    the scratch-file prefix for this feature
- * @param built     the shared project cache carried in
- * @param groups    the grouped builds this run made before any scenario started
- * @return          the feature's verdict, the (possibly updated) cache, and its measured rows
- * @since 0.3.1
- */
-fn run_one_feature(exe: str, regr_dir: str, feat: TkrFeature, prefix: str, built: RegrBuilt, groups: RegrGroups) -> FeatureRunResult {
+fn run_one_feature(exe: str, regr_dir: str, feat: TkrFeature, prefix: str, built: RegrBuilt, groups: RegrGroups): FeatureRunResult {
     if tkr_feature_is_compile_fail(feat) {
         return tkr_run_compile_fail(exe, regr_dir, feat, prefix, built)
     }
     tkr_run_scenarios(exe, regr_dir, feat, prefix, built, groups)
 }
 
-/**
- * concat_row_timings — `a` followed by `b` (the per-feature measured rows folded into the file's).
- *
- * @param a  the rows accumulated so far
- * @param b  the rows to append
- * @return   the concatenation
- * @since 0.3.1
- */
-fn concat_row_timings(a: []RowTiming, b: []RowTiming) -> []RowTiming {
-    mut out = a
-    mut i: u64 = 0
-    loop {
-        if i >= b.len { break }
-        out = teko::list::push(out, b[i])
-        i++
-    }
-    out
+fn concat_row_timings(a: []RowTiming, b: []RowTiming): []RowTiming {
+    [..a, ..b]
 }
 
-/**
- * report_regressive — print one report line for a regressor's verdict (ok / FAIL / skip). A skip
- * appends its reason when it carries one (the self-project note); a bare skip prints just the label.
- * A PASS that aggregated capability skips says so on its own line — a file reported as a bare "ok"
- * while some of its rows never ran would overstate what this host actually checked (M.3). Every
- * non-skip line also carries the file's TOTALS (builds, wall time, phase shares — `regr_timing.tks`),
- * because a build count and a phase split are what make the number actionable. Those totals are the
- * file's OWN rows: a GROUPED build (`regr_group.tks`) belongs to no single file — one group may hold
- * rows from several `.tkr` files — so its cost is reported on its own line before the run and
- * accounted once in the run's summary line, never split across the files it served.
- *
- * @param rd    the regressor directory (the report label)
- * @param oc    the verdict
- * @param rows  the file's measured rows (their sum is the totals text)
- * @since 0.3.0.29
- */
 fn report_regressive(rd: str, oc: RegrOutcome, rows: []RowTiming) {
     if oc.skipped {
         if oc.message.len > 0 { teko::io::println(teko::str::concat(teko::str::concat("teko: regression skip ", rd), teko::str::concat(" ", oc.message))); return }
         teko::io::println(teko::str::concat("teko: regression skip ", rd)); return
     }
-    let totals = regr_totals_text(rows_total(rows))
+    var totals = regr_totals_text(rows_total(rows))
     if oc.ok && oc.skips > 0 { teko::io::println($"teko: regression ok {rd} ({totals}; {oc.skips} scenario row(s) skipped — capability absent on this host)"); return }
     if oc.ok { teko::io::println($"teko: regression ok {rd} ({totals})"); return }
     teko::io::println($"teko: regression FAIL {rd} ({totals}) — {oc.message}")
 }
 
-/**
- * regr_sanitize — map a path to a filesystem-safe scratch stem (every non-alphanumeric byte → `_`),
- * so each regressive's capture files do not collide.
- *
- * @param s  the path
- * @return   the sanitized stem
- * @since 0.3.0.29
- */
-fn regr_sanitize(s: str) -> str {
-    mut out = ""
-    mut k: u64 = 0
+fn regr_sanitize(s: str): str {
+    var out = ""
+    var k: u64 = 0
     loop {
         if k >= s.len { break }
-        let c = s[k]
-        let alnum = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9')
-        if alnum { out = out ~ teko::str::slice(s, k, k + 1) } else { out = out ~ "_" }
+        var c = s[k]
+        var alnum = (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9')
+        if alnum { out = out ~ s.slice(k, k + 1) } else { out = out ~ "_" }
         k = k + 1
     }
     out
 }
 
-/**
- * regr_summary_line — the one-line verdict a regression phase ends with. THREE columns, not two:
- * `run` counts the listed `.tkr` files, `skipped` counts every capability skip aggregated out of
- * them (a whole regressor skipped, a scenario row whose target toolchain is absent, a leaf-tool
- * check with no checker here), and `failed` counts the files that failed. The `skipped` column is
- * the whole point: with only `run`/`failed`, a run in which NOTHING actually executed printed
- * "N run, 0 failed" and exited 0 — a gate reporting green for work it never did (M.3). The
- * fail-closed answer to a skip that MUST NOT happen is `REGRESSION_REQUIRE_TOOLS=1`, which turns
- * these skips into failures; this line is how a reader sees the skips at all.
- *
- * @param files   how many `.tkr` files the manifest listed (the `run` column)
- * @param skips   how many capability skips the run aggregated (the `skipped` column)
- * @param fails   how many files failed (the `failed` column)
- * @return        the summary line, without a trailing newline
- * @since 0.3.1
- */
-fn regr_summary_line(files: u64, skips: u64, fails: u64) -> str {
+fn regr_summary_line(files: u64, skips: u64, fails: u64): str {
     $"teko: regressions {files} run, {skips} skipped, {fails} failed"
 }
 
-/**
- * run_regression_sources — the CORE regression run (no anti-recursion sentinel): run every
- * `.tkr` file named in `m.test_regression_files`, IN LIST ORDER, on the host lane, printing a
- * report line and tallying BOTH failures and capability skips — the latter reported in their own
- * summary column (`regr_summary_line`) so a run that skipped everything cannot read as a run that
- * checked everything. Each entry is a FILE path (relative to the project root);
- * its parent directory is the regressor project dir (`regr_dir`) a `built and run` scenario
- * compiles. A listed path that does not resolve to a readable file is a MANIFEST ERROR (M.3):
- * the run stops non-zero with the path named — never a silent skip. Returns 1 when any
- * regressor failed (or a path was missing) AND `m.test_gate`, else 0. Called directly by tests;
- * the `teko test` driver wraps it in `run_regression_phase`.
- *
- * The run OPENS with the GROUPED BUILDS (`regr_group.tks`): every inline-snippet row that shares a
- * build configuration is folded into one generated project, built once, and reported before the
- * first scenario executes — the owner's *"poderia executar estes builds ANTES de qualquer teste
- * começar, mostrando a saída deles no início"*. Their cost seeds the phase total, so the summary
- * line still accounts for every build the run paid for. A row the fold did not take (or whose group
- * did not build) reaches `tkr_ensure_artifact` exactly as it always did.
- *
- * @param exe  the absolute path to this compiler binary (compiles each regressor / snippet)
- * @param m    the resolved manifest (its `test_regression_files`/`test_gate` drive the run)
- * @return     0 when the tier passes (or is advisory), 1 when a failure/missing-path gates it
- * @since 0.3.1
- */
-fn run_regression_sources(exe: str, m: Manifest) -> i32 {
-    let work = REGR_WORK_DIR
-    match sh_rm_rf(work) { error => { }; null => { } }
+fn run_regression_sources(exe: str, m: Manifest): i32 {
+    var work = teko::test::scoped(REGR_WORK_DIR)
+    match rm_rf(work) { error => { }; null => { } }
     match mkdir_p(teko::str::concat(work, "/")) { error => { }; null => { } }
-    let groups = regr_build_groups(exe, regr_plan_groups(m, work), work)
-    mut fails: u64 = 0
-    mut skips: u64 = 0
-    mut phase = regr_groups_total(groups)
-    mut si: u64 = 0
+    var groups = regr_build_groups(exe, regr_plan_groups(m, work), work)
+    var fails: u64 = 0
+    var skips: u64 = 0
+    var phase = regr_groups_total(groups)
+    var si: u64 = 0
     loop {
         if si >= m.test_regression_files.len { break }
-        let path = m.test_regression_files[si]
+        var path = m.test_regression_files[si]
         match teko::io::read_file(path) {
             error => {
-                teko::io::println($"teko: regression FAIL {path} — listed regressor file does not exist (M.3)")
+                teko::io::println($"teko: regression FAIL {path} — listed regressor file does not exist")
+                if regression_journal_enabled() { teko::journal::note_row_fail(path, "listed regressor file does not exist") }
                 fails = fails + 1
                 si = si + 1
             }
             str => {
-                let fr = run_one_tkr(exe, dirname_of(path), basename_of(path), work ~ "/" ~ regr_sanitize(path), groups)
+                if regression_journal_enabled() { teko::journal::note_row_begin(path) }
+                var fr = run_one_tkr(exe, dirname_of(path), basename_of(path), work ~ "/" ~ regr_sanitize(path), groups)
                 report_regressive(path, fr.outcome, fr.rows)
+                if regression_journal_enabled() { note_row_outcome(path, fr.outcome) }
                 regr_print_timings(fr.rows)
                 phase = phase_add(phase, rows_total(fr.rows))
                 if !fr.outcome.ok && !fr.outcome.skipped { fails = fails + 1 }
@@ -2986,47 +1226,32 @@ fn run_regression_sources(exe: str, m: Manifest) -> i32 {
         }
     }
     teko::io::println(regr_summary_line(m.test_regression_files.len, skips, fails) ~ $" ({regr_totals_text(phase)})")
+    if regression_journal_enabled() { teko::journal::note_row_end() }
     if fails > 0 && m.test_gate { return 1 }
     0
 }
 
-/**
- * TEKO_IN_REGRESSION_VAR — the environment-variable key of the anti-recursion sentinel: set once a
- * regression phase opens so a nested `teko test` (a regressive that itself built the compiler) cannot
- * re-enter discovery. Pinned here so the probe (`env::var`) and the set (`env::set_var`) never drift.
- */
+fn regression_journal_enabled(): bool { teko::test::scope().len == 0 }
+
+fn note_row_outcome(path: str, oc: RegrOutcome) {
+    if oc.skipped { teko::journal::note_row_skip(path, oc.message); return }
+    if oc.ok { teko::journal::note_row_ok(path); return }
+    teko::journal::note_row_fail(path, oc.message)
+}
+
 const TEKO_IN_REGRESSION_VAR: str = "TEKO_IN_REGRESSION"
 
-/**
- * run_regression_phase — the anti-recursion wrapper the `teko test` driver calls: it REFUSES to
- * start a regression phase when `TEKO_IN_REGRESSION` is already set (so a regressive that itself
- * built the compiler cannot re-enter discovery — the structural belt is that regressives are built,
- * never `teko test`-ed; this sentinel is the backstop). Otherwise it sets the sentinel and runs the
- * core.
- *
- * @param exe  the absolute path to this compiler binary
- * @param m    the resolved manifest
- * @return     0 when skipped (already inside a phase) or the tier passes, 1 on a gated failure
- * @since 0.3.0.29
- */
-fn run_regression_phase(exe: str, m: Manifest) -> i32 {
+fn run_regression_phase(exe: str, m: Manifest): i32 {
     match teko::env::var(TEKO_IN_REGRESSION_VAR) { str => return 0; error => { } }
     match teko::env::set_var(TEKO_IN_REGRESSION_VAR, "1") { error => { }; null => { } }
     run_regression_sources(exe, m)
 }
 
-/**
- * self_exe_path — this compiler binary's absolute path, resolved from `argv[0]` against the launch
- * cwd (BEFORE the front-end chdir's into the project). Falls back to the raw `argv[0]` when it is
- * not filesystem-resolvable (a bare PATH launch), or "teko" when there is no `argv[0]`.
- *
- * @return the compiler's executable path
- * @since 0.3.0.29
- */
-fn self_exe_path() -> str {
-    let argv = teko::env::args()
+fn self_exe_path(): str {
+    var argv = teko::env::args()
     if argv.len == 0 { return "teko" }
-    let cwd = match teko::env::cwd() { str as c => c; error => "" }
-    let a = abs_path_of(argv[0], cwd)
-    if a.len > 0 { a } else { argv[0] }
+    var cwd = match teko::env::cwd() { str as c => c; error => "" }
+    var a = abs_path_of(argv[0], cwd)
+    if a.len > 0 && path_exists(a) { return a }
+    argv[0]
 }

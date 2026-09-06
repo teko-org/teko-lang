@@ -1,0 +1,370 @@
+// rt.tk -- the runtime a teko-taught compiler's PROGRAMS link against: a
+// bump arena, the print helpers, and (since entrega 2) the primitive
+// operations `str`/`f32`/`f64` need that are ordinary functions rather than
+// parser hooks -- trimmed from examples/lang/lib/rt.mc to what this entrega
+// needs. Program code, not compiler code: `#include`d from the `.tk` source
+// itself, so it compiles under the SAME taught vocabulary as that source
+// (`str`/`char`/`f64`/... are already reserved program-wide by the time any
+// file is parsed, teko.tk's `user_init`, docs/surface.md § Tier 3).
+//
+// Since the reclaim crumb (D218) the arena is the one `examples/lang` proves:
+// a FIXED 4 MiB block with a free list per size class, and reference counting
+// per scope on top of it, so a program that churns objects inside a loop hands
+// every block back and never grows. The object layout the class system writes
+// against (ngen/teko_class.tk) is
+//
+//     +0   vtable pointer   (word 0)
+//     +8   reference count  (word 1)
+//     +16  fields, the base class's first
+//
+// and the vtable's own layout is
+//
+//     +0   &Name_release
+//     +8   Name_itab, or 0 when the class implements no interface
+//     +16  virtual slot 0, +24 slot 1, ...
+//
+// which is why `rc_dec` frees an object it knows nothing about: word 0 of the
+// vtable is always that class's release function, and the release runs the
+// destructor, releases the class-typed fields and gives the block back.
+//
+// What is NOT counted in this slice, and is declared debt rather than silence:
+// a `struct` (no vtable, hence no release to reach and no count to keep -- its
+// allocation is live for the run) and the argument block of a `params` call
+// (allocated at the call site, read by the callee, and never handed back).
+// `rt_live()` counts both, so a program that mixes them with classes sees a
+// floor above zero rather than a wrong answer.
+//
+// tests/hello.tk does not call any of this yet -- list/collections are
+// staged for a later entrega (docs/design/port-teko-mc.md §6 step A5).
+
+#include <sys>
+
+#define RT_ARENA 4194304   // 4 MiB, in __bss -- the same floor examples/lang uses
+#define RT_ALIGN 16
+#define RT_NCLASS 16       // free lists: 16, 32, ... 256 bytes
+#define RT_MAXSMALL 256
+
+u8   rt_heap[RT_ARENA];
+i64  rt_hp = 0;
+uptr rt_fl[RT_NCLASS];     // head of each size class's free list
+i64  rt_nlive = 0;         // blocks handed out and not yet given back
+i64  rt_npeak = 0;         // high-water mark of the bump pointer
+
+// aborts with a message on stderr; there is no recovery
+void rt_panic(uptr msg) {
+    write(2, "teko: ", 6);
+    write(2, msg, strlen(msg));
+    write(2, "\n", 1);
+    exit(70);
+}
+
+// the surface name `rt_panic` runs under (K1, D221 §41 decision 18): the same
+// abort, the same exit(70) the arena and `params` already use, so a program
+// that calls it and a program that trips a guard fail the same way
+void panic(str msg) {
+    rt_panic(msg);
+}
+
+uptr rt_fl_at(i64 i)             { return ld64(rt_fl + i * 8); }
+void set_rt_fl_at(i64 i, uptr v) { st64(rt_fl + i * 8, v); }
+
+void rt_zero(uptr p, i64 n) {
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        st8(p + i, 0);
+        i = i + 1;
+    }
+}
+
+// the size class of a block of `sz` bytes (`sz` already a multiple of 16), or
+// -1 when the block is too big for any list to recycle it
+i64 rt_class(i64 sz) {
+    if (sz > RT_MAXSMALL) return 0 - 1;
+    return sz / RT_ALIGN - 1;
+}
+
+// `n` zeroed bytes, 16-byte aligned. The free list of the size class answers
+// first; only when it is empty does the bump pointer move, and only then can
+// the arena run out. Never returns 0.
+uptr rt_alloc(i64 n) {
+    if (n < 0) rt_panic("allocation of a negative size");
+    i64 sz = (n + (RT_ALIGN - 1)) & ~(RT_ALIGN - 1);
+    if (sz == 0) sz = RT_ALIGN;
+    i64 c = rt_class(sz);
+    if (c >= 0) {
+        uptr h = rt_fl_at(c);
+        if (h != 0) {
+            set_rt_fl_at(c, ld64(h));            // word 0 of a free block is the link
+            rt_zero(h, sz);
+            rt_nlive = rt_nlive + 1;
+            return h;
+        }
+    }
+    if (rt_hp + sz > RT_ARENA) rt_panic("arena exhausted");
+    uptr p = rt_heap + rt_hp;
+    rt_hp = rt_hp + sz;
+    if (rt_hp > rt_npeak) rt_npeak = rt_hp;
+    rt_zero(p, sz);
+    rt_nlive = rt_nlive + 1;
+    return p;
+}
+
+// gives the `n` bytes at `p` back to their size class. A block bigger than
+// RT_MAXSMALL is dropped: no list holds it, so the arena never reuses it.
+void rt_free(uptr p, i64 n) {
+    if (p == 0) return;
+    rt_nlive = rt_nlive - 1;
+    i64 sz = (n + (RT_ALIGN - 1)) & ~(RT_ALIGN - 1);
+    if (sz == 0) sz = RT_ALIGN;
+    i64 c = rt_class(sz);
+    if (c < 0) return;
+    st64(p, rt_fl_at(c));
+    set_rt_fl_at(c, p);
+}
+
+i64 rt_used() { return rt_hp; }
+i64 rt_live() { return rt_nlive; }
+i64 rt_peak() { return rt_npeak; }
+
+// ---- reference counting ----
+
+void rc_inc(uptr p) {
+    if (p == 0) return;
+    st64(p + 8, ld64(p + 8) + 1);
+}
+
+// at zero, the class's release runs through word 0 of the vtable: the
+// destructor, then the class-typed fields, then rt_free
+void rc_dec(uptr p) {
+    if (p == 0) return;
+    i64 n = ld64(p + 8) - 1;
+    st64(p + 8, n);
+    if (n > 0) return;
+    if (n < 0) rt_panic("reference count below zero");
+    callp(ld64(ld64(p)), p);
+}
+
+// borrowed -> owned: an owning slot initialized from a value it does not own
+uptr rt_own(uptr p) {
+    rc_inc(p);
+    return p;
+}
+
+// a value of class type produced and thrown away, `f();` on its own line: the
+// reference the callee handed out has no owner, so it is released here
+void rt_drop(uptr p) {
+    rc_dec(p);
+}
+
+// *slot = v, with both counts kept straight. The increment comes first so that
+// `x = x` cannot free the object between the two steps.
+void rt_store(uptr slot, uptr v) {
+    rc_inc(v);
+    uptr old = ld64(slot);
+    st64(slot, v);
+    rc_dec(old);
+}
+
+// the same store when `v` is already owned -- it came from `new`, or from a
+// function that returned a reference of its own: the reference moves in
+void rt_store_own(uptr slot, uptr v) {
+    uptr old = ld64(slot);
+    st64(slot, v);
+    rc_dec(old);
+}
+
+// ---- the temporaries of one statement ----
+//
+// A value of class type handed to a CALL is borrowed by the callee: a parameter
+// carries no count of its own. So `f(new Cell(1))` -- and `p.X = new Cell(1)`,
+// whose `set` accessor is one such call -- produces a reference nothing owns.
+// It is PARKED here and released when the statement that built it ends, which
+// is the same rule C# and C++ give a temporary.
+//
+// A mark, not a count: `a && f(new Cell(1))` may not evaluate its right side at
+// all, so what is released is whatever the statement actually parked. The marks
+// nest with the calls -- a callee's own statements park above the caller's and
+// sweep back down to it.
+
+#define RT_MAXTMP 64
+
+uptr rt_tmp[RT_MAXTMP];
+i64  rt_ntmp = 0;
+
+i64 rt_mark() { return rt_ntmp; }
+
+uptr rt_park(uptr p) {
+    if (rt_ntmp == RT_MAXTMP) rt_panic("too many temporaries of class type in one statement");
+    st64(rt_tmp + rt_ntmp * 8, p);
+    rt_ntmp = rt_ntmp + 1;
+    return p;
+}
+
+void rt_sweep(i64 mark) {
+    loop {
+        if (rt_ntmp <= mark) break;
+        rt_ntmp = rt_ntmp - 1;
+        rc_dec(ld64(rt_tmp + rt_ntmp * 8));
+    }
+}
+
+// releases `n` object slots starting at `base`: an inline array field whose
+// element type is a class or an interface
+void rt_release_array(uptr base, i64 n) {
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        rc_dec(ld64(base + i * 8));
+        st64(base + i * 8, 0);
+        i = i + 1;
+    }
+}
+
+// the method table of interface `id` inside the class whose vtable is `vt`.
+// The vtable's word 1 is the class's interface table, `{ count, (id, methods)* }`
+// in declaration order (ngen/teko_iface.tk), and an interface call is
+// `callp(ld64(tk_itab(ld64(obj), ID) + j * 8), obj, ...)` -- a linear walk over
+// a table with one row per interface the class declares, so a class implements
+// an interface at any vtable slot and two unrelated classes answer the same
+// interface.
+uptr tk_itab(uptr vt, i64 id) {
+    uptr t = ld64(vt + 8);
+    if (t == 0) rt_panic("interface dispatch on a class with no interface table");
+    i64 n = ld64(t);
+    i64 i = 0;
+    loop {
+        if (i >= n) break;
+        if (ld64(t + 8 + i * 16) == id) return ld64(t + 16 + i * 16);
+        i = i + 1;
+    }
+    rt_panic("interface not implemented by this class");
+    return 0;
+}
+
+// a delegate value's own code pointer (word 2 of its object, K1 D221 §41),
+// what `callp(tk_deleg_code(d), d, args...)` calls through -- a null one is a
+// panic, not a segfault
+uptr tk_deleg_code(uptr d) {
+    if (d == 0) panic("call through a null delegate");
+    return ld64(d + 16);
+}
+
+// the guarded address of element `i` of a `T[]` object `a` (K3, D221 §41):
+// `0 <= i < a.Length`, or `panic` -- word 16 of the object is its own length,
+// and the elements start at word 24 (`ngen/teko_heaparr.tk`'s own layout).
+uptr tk_arr_at(uptr a, i64 i, i64 w) {
+    if (a == 0) panic("index into a null array");
+    i64 n = ld64(a + 16);
+    if (i < 0) panic("index below zero into an array");
+    if (i >= n) panic("index past the end of an array");
+    return a + 24 + i * w;
+}
+
+// length of a NUL-terminated `str`. teko's `str` names the same `uptr` mc
+// already gives a C string (`type_alias`, teko_type.tk) -- no separate
+// length field -- so this is `strlen` under teko's own spelling, call-
+// compatible with it because the alias IS the identity, not a new type.
+i64 tk_str_len(str s) {
+    return strlen(s);
+}
+
+// a view of `s` starting at byte `from`, to the same NUL terminator: pointer
+// arithmetic only, zero copy (D197 -- surfacing a view must never regress
+// into a copy).
+str tk_str_slice(str s, i64 from) {
+    return s + from;
+}
+
+// the eight bytes `wrap`/`unwrap` (DECISION_LOG D131/D132) name for a
+// reinterpret between an `f64` and its bit pattern: no cast does this (a
+// `(u64) x` cast on a float VALUE converts it, `docs/specs/M24.md`), so the
+// port's own mapping table (docs/design/port-teko-mc.md §3) names the
+// mechanism as a round trip through `ld64`/`st64` at a shared offset,
+// through the `<float>` library's own `ldf64`/`stf64` accessors
+// (teko_float.tk) -- no magic, no compiler intrinsic beyond what `<float>`
+// already registers. The generic `ptr::unwrap<T>`/`.wrap<T>()` spelling
+// needs record/replay generics (a later, "tipos" entrega, D214); this is the
+// concrete instance primitives need now.
+u8 tk_f64_bits_scratch[8];
+
+u64 tk_f64_bits(f64 x) {
+    stf64(tk_f64_bits_scratch, x);
+    return ld64(tk_f64_bits_scratch);
+}
+
+f64 tk_f64_from_bits(u64 bits) {
+    st64(tk_f64_bits_scratch, bits);
+    return ldf64(tk_f64_bits_scratch);
+}
+
+// the argument list of a `params` call (teko_params.tk). `total(a, b, c)` is
+// rewritten into `total(tk_va_put(tk_va_put(tk_va_put(tk_va_new(3), 0, a), 1,
+// b), 2, c), 3)`: the block is allocated AT THE CALL SITE, on the same bump
+// arena `new` goes through, and the callee reads it with tk_va_at.
+//
+// Per site, so there is no state to share and nothing to reenter: a variadic
+// call may sit inside another one, or inside the body of a variadic function,
+// and each list is its own block. The chain is what carries a write inside an
+// expression -- the core has no comma operator and `st64` is a statement, so
+// every put hands the block back to the next one.
+//
+// DECLARED DEBT: the block is never given back. Freeing it at the end of the
+// call site's scope needs a name to hold it, and there is no name -- the block
+// is born and read inside one expression. So a `params` call in a hot loop
+// still walks the bump pointer forward; `new` in one no longer does.
+uptr tk_va_new(i64 n) {
+    return rt_alloc(n * 8);
+}
+
+uptr tk_va_put(uptr xs, i64 i, i64 v) {
+    st64(xs + i * 8, v);
+    return xs;
+}
+
+// one capture of a closure, written into the object AT THE CREATION SITE
+// (teko_deleg.tk, higiene 3 item B). The chain is the same shape a `params`
+// list is built with, and for the same reason -- a store is a statement and
+// the whole closure has to be ONE expression -- so each link hands the object
+// back to the next. The allocator therefore takes the object and no capture
+// at all: `MAXPARAMS` (12, the mc ABI) stops bounding how many names one
+// `use (...)` may hold.
+//
+// Every slot is a word, whatever the capture's own width, so one `st64` is
+// what writes it; the closure's prologue reads it back at the declared width
+// (`tk_ldn`), which is where a narrower capture is cut back to size.
+uptr tk_cap_put(uptr p, i64 off, i64 v) {
+    st64(p + off, v);
+    return p;
+}
+
+// the same store for a capture of COUNTED type: the closure holds a reference
+// of its own, alongside the one the declaring scope already holds
+uptr tk_cap_own(uptr p, i64 off, uptr v) {
+    rc_inc(v);
+    st64(p + off, v);
+    return p;
+}
+
+// the same link for a capture of FLOAT type (higiene 4). A float argument
+// travels in the machine's other register file, so an `i64` parameter never
+// receives it: the value has to be DECLARED float all the way down, and the
+// slot written through `<float>`'s own accessor -- the write side of the pair
+// `tk_ldn` reads back with `ldf32`/`ldf64`.
+uptr tk_cap_putf(uptr p, i64 off, f64 v) {
+    stf64(p + off, v);
+    return p;
+}
+
+uptr tk_cap_putf32(uptr p, i64 off, f32 v) {
+    stf32(p + off, v);
+    return p;
+}
+
+// xs[i] of a `params` list, guarded: an index outside [0, n) has no word to
+// read, so it panics instead of handing back whatever the arena holds there.
+i64 tk_va_at(uptr xs, i64 n, i64 i) {
+    if (i < 0) rt_panic("index below zero into a `params` list");
+    if (i >= n) rt_panic("index past the end of a `params` list");
+    return ld64(xs + i * 8);
+}

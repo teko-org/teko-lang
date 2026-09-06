@@ -64,15 +64,15 @@ both twins byte-identical.
 ```teko
 type Value      = variant Null | Int | Float | Text | Bytes | Bool | Timestamp | Decimal
 type Row        = struct { cols: []str; vals: []Value }
-type Rows       = interface { fn next(self) -> Row? ; fn close(self) -> error? }   // lazy cursor
+type Rows       = interface { fn next(self): Row? ; fn close(self): error? }   // lazy cursor
 type ExecResult = struct { affected: u64; last_id: i64? }
 type Connection = interface {
-    fn query(self, sql: str, params: []Value) -> Rows | error
-    fn exec (self, sql: str, params: []Value) -> ExecResult | error
-    fn begin(self) -> Tx | error
-    fn close(self) -> error?
+    fn query(self, sql: str, params: []Value): Rows | error
+    fn exec (self, sql: str, params: []Value): ExecResult | error
+    fn begin(self): Tx | error
+    fn close(self): error?
 }
-type Tx = interface { fn commit(self) -> error? ; fn rollback(self) -> error? ; /* + query/exec */ }
+type Tx = interface { fn commit(self): error? ; fn rollback(self): error? ; /* + query/exec */ }
 ```
 Plus `DbError` (SQLSTATE/driver code + message), a `Pool` (connection pooling), and parameter binding
 helpers. Every driver implements `Connection`/`Rows`/`Tx`. **Verify:** `.tkt` for the value model +
@@ -123,7 +123,7 @@ MongoDB, Redis adapter. **T3:** DB-TDS, ODBC, higher-level query builder/ORM (se
    usage-driven `from_lib` collection is new work. *(likely new, small — in the lib collector.)*
 2. **Parameter style**: a single portable placeholder (`?`) rewritten per-driver vs exposing each driver's
    native style (`$1`, `?`, `:name`). *(rec: portable `?` in the common layer, driver rewrites.)*
-3. **Rows model**: lazy cursor (`next() -> Row?`, rec) vs eager `[]Row`. *(rec: lazy — composes with `teko::iter`.)*
+3. **Rows model**: lazy cursor (`next(): Row?`, rec) vs eager `[]Row`. *(rec: lazy — composes with `teko::iter`.)*
 4. **Native vs FFI default for Postgres/MySQL**: ship native as the blessed path (rec), FFI (`libpq`) only
    as an opt-in alternative.
 5. **Async**: sync-first; async DB (`Intent<Rows>`) rides S8, additive — out of scope here.

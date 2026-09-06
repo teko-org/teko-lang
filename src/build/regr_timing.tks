@@ -1,79 +1,24 @@
-/**
- * src/build/regr_timing.tks   (namespace `teko::build`)
- *
- * REGRESSION TIMING — the observability half of the regression runner (owner ruling 2026-07-25:
- * *"colocar o tempo de execução de cada regressão, para entendermos o que pode ser um detrator"*).
- *
- * It is NOT a gate. Nothing here can fail a run, and no time value ever reaches an artifact: the
- * fixpoint requires the compiler to rebuild itself byte-for-byte, so timings live only in the
- * `teko test` report on stdout.
- *
- * WHY THREE PHASES AND NOT ONE NUMBER. Measured on the .31 corpus before this was written: 263
- * declared scenarios expand to ~322 builds (each `Examples` row is a full project build), the whole
- * regression phase took 8m33s in CI, and the largest inline source is NINE lines. That is ~1.6 s per
- * build of a 3-to-9-line program — a per-build FIXED cost (scratch tree, `sh -c`, a whole front-end
- * start-up, a `cc` invocation, the binary itself), not a cost proportional to the fixture. A single
- * number per scenario would print a nearly flat list at ~1.6 s and point at no detractor at all. So
- * every row is measured in three parts:
- *
- *   - `harness` — creating/cleaning the scratch project, writing the source, building argv/env, the
- *     `sh -c` plumbing and reading the capture files back;
- *   - `compile` — the compiler invocation itself, INCLUDING the host `cc` it spawns (they share one
- *     child process, so no cheap split exists here; separating them needs the compiler to report its
- *     own `cc` time, which is a compiler change, not a runner one);
- *   - `run` — executing the built binary (zero for a `compilation fails` scenario).
- */
 
-/**
- * PhaseTimes — one measurement, in monotonic nanoseconds, plus how many BUILDS it covers. Summing
- * two `PhaseTimes` sums each phase and the build count, so the same type serves a row, a scenario, a
- * feature, a file and the whole phase (one aggregation rule, no per-level arithmetic to get wrong).
- */
 pub type PhaseTimes = struct {
-    /** scratch/IO/plumbing time around the children, in ns. */
     harness_ns: i64
-    /** time inside the compiler child (its own `cc` included), in ns. */
     compile_ns: i64
-    /** time inside the built binary, in ns (0 for a compile-fail row). */
     run_ns: i64
-    /** how many project builds this measurement covers. */
     builds: u64
 }
 
-/**
- * RowTiming — the timing of ONE expanded scenario row (one `Examples` line, or the scenario itself
- * when it has no `Examples`), labelled well enough to appear in a report a human reads.
- */
 pub type RowTiming = struct {
-    /** the enclosing feature's name (the table groups by it). */
     feature: str
-    /** the scenario's name. */
     scenario: str
-    /** the row's index within the scenario's expanded `Examples` (0 when there are none). */
     row: u64
-    /** true when the row was honest-SKIPPED (kept in the tables, with its ~0 time, so the aggregate cannot overstate what ran). */
     skipped: bool
-    /** the row's own three-phase measurement. */
     times: PhaseTimes
 }
 
-/**
- * phase_zero — an empty measurement (every phase 0, no builds), the identity for `phase_add`.
- *
- * @return the zero measurement
- */
-pub fn phase_zero() -> PhaseTimes {
+pub fn phase_zero(): PhaseTimes {
     PhaseTimes { harness_ns = 0; compile_ns = 0; run_ns = 0; builds = 0 }
 }
 
-/**
- * phase_add — the sum of two measurements, phase by phase (and build count by build count).
- *
- * @param a  the first measurement
- * @param b  the second measurement
- * @return   their sum
- */
-pub fn phase_add(a: PhaseTimes, b: PhaseTimes) -> PhaseTimes {
+pub fn phase_add(a: PhaseTimes, b: PhaseTimes): PhaseTimes {
     PhaseTimes {
         harness_ns = a.harness_ns + b.harness_ns
         compile_ns = a.compile_ns + b.compile_ns
@@ -82,25 +27,13 @@ pub fn phase_add(a: PhaseTimes, b: PhaseTimes) -> PhaseTimes {
     }
 }
 
-/**
- * phase_total_ns — a measurement's wall total: the three phases added together.
- *
- * @param p  the measurement
- * @return   harness + compile + run, in ns
- */
-pub fn phase_total_ns(p: PhaseTimes) -> i64 {
+pub fn phase_total_ns(p: PhaseTimes): i64 {
     p.harness_ns + p.compile_ns + p.run_ns
 }
 
-/**
- * rows_total — the sum of every row's measurement (the file/phase aggregate).
- *
- * @param rows  the measured rows
- * @return      their summed measurement
- */
-pub fn rows_total(rows: []RowTiming) -> PhaseTimes {
-    mut acc = phase_zero()
-    mut i: u64 = 0
+pub fn rows_total(rows: []RowTiming): PhaseTimes {
+    var acc = phase_zero()
+    var i: u64 = 0
     loop {
         if i >= rows.len { break }
         acc = phase_add(acc, rows[i].times)
@@ -109,17 +42,9 @@ pub fn rows_total(rows: []RowTiming) -> PhaseTimes {
     acc
 }
 
-/**
- * rows_skipped — how many of the measured rows were honest-skipped. Reported alongside the totals so
- * a fast file is never read as a fast file when it was in fact a mostly-skipped one (the same lesson
- * as the `N run, S skipped, F failed` summary).
- *
- * @param rows  the measured rows
- * @return      the count of skipped rows
- */
-pub fn rows_skipped(rows: []RowTiming) -> u64 {
-    mut n: u64 = 0
-    mut i: u64 = 0
+pub fn rows_skipped(rows: []RowTiming): u64 {
+    var n: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= rows.len { break }
         if rows[i].skipped { n = n + 1 }
@@ -128,115 +53,55 @@ pub fn rows_skipped(rows: []RowTiming) -> u64 {
     n
 }
 
-/**
- * REGR_NS_PER_MS — nanoseconds in a millisecond, the unit every rendered duration is rounded to.
- */
 const REGR_NS_PER_MS: i64 = 1000000
 
-/**
- * REGR_MS_PER_S — milliseconds in a second, the split point of the `s`/`ms` rendering.
- */
 const REGR_MS_PER_S: i64 = 1000
 
-/**
- * REGR_PERCENT — the whole, for the phase-share percentages.
- */
 const REGR_PERCENT: i64 = 100
 
-/**
- * REGR_SLOWEST_DEFAULT — how many of the slowest rows the default report lists. 262 scenarios times
- * one line each is noise nobody reads; the top slice is what points at a detractor. `--regr-timings`
- * dumps every row for a diff between runs.
- */
 const REGR_SLOWEST_DEFAULT: u64 = 20
 
-/**
- * REGR_TIMINGS_FLAG — the argv flag that switches the report from "totals + tables" to "every row".
- */
 const REGR_TIMINGS_FLAG: str = "--regr-timings"
 
-/**
- * regr_ms_text — `ns` rendered as milliseconds, or as seconds with one decimal once it passes a
- * second. Milliseconds are the resolution that matters here (a whole build is ~1.6 s and a phase of
- * it can be a few ms); anything finer is runner noise.
- *
- * @param ns  the duration in nanoseconds
- * @return    the rendered duration, unit suffix included
- */
-pub fn regr_ms_text(ns: i64) -> str {
-    let ms = ns / REGR_NS_PER_MS
+pub fn regr_ms_text(ns: i64): str {
+    var ms = ns / REGR_NS_PER_MS
     if ms < REGR_MS_PER_S { return $"{ms}ms" }
-    let tenths = ms / (REGR_MS_PER_S / 10)
+    var tenths = ms / (REGR_MS_PER_S / 10)
     $"{tenths / 10}.{tenths % 10}s"
 }
 
-/**
- * regr_share_text — `part` as a whole-percent share of `whole` ("0%" when `whole` is 0, so a
- * zero-length phase never divides by zero).
- *
- * @param part   the phase's own time
- * @param whole  the total the share is taken of
- * @return       the rendered percentage
- */
-pub fn regr_share_text(part: i64, whole: i64) -> str {
+pub fn regr_share_text(part: i64, whole: i64): str {
     if whole <= 0 { return "0%" }
     $"{(part * REGR_PERCENT) / whole}%"
 }
 
-/**
- * regr_totals_text — the compact totals a per-file report line carries: builds, wall total, and the
- * three phases as shares of it.
- *
- * @param p  the file's summed measurement
- * @return   the parenthesised totals text, e.g. `322 builds, 8.5s: harness 12% / compile 84% / run 4%`
- */
-pub fn regr_totals_text(p: PhaseTimes) -> str {
-    let total = phase_total_ns(p)
-    let h = regr_share_text(p.harness_ns, total)
-    let c = regr_share_text(p.compile_ns, total)
-    let r = regr_share_text(p.run_ns, total)
+pub fn regr_totals_text(p: PhaseTimes): str {
+    var total = phase_total_ns(p)
+    var h = regr_share_text(p.harness_ns, total)
+    var c = regr_share_text(p.compile_ns, total)
+    var r = regr_share_text(p.run_ns, total)
     $"{p.builds} builds, {regr_ms_text(total)}: harness {h} / compile {c} / run {r}"
 }
 
-/**
- * regr_row_line — one row's line in a table: its three phases, its total, and its skip mark.
- *
- * @param rt  the measured row
- * @return    the rendered line (no trailing newline)
- */
-pub fn regr_row_line(rt: RowTiming) -> str {
-    let mark = if rt.skipped { " [skipped]" } else { "" }
-    let t = rt.times
+pub fn regr_row_line(rt: RowTiming): str {
+    var mark = if rt.skipped { " [skipped]" } else { "" }
+    var t = rt.times
     $"    {regr_ms_text(phase_total_ns(t))}  (harness {regr_ms_text(t.harness_ns)} / compile {regr_ms_text(t.compile_ns)} / run {regr_ms_text(t.run_ns)})  {rt.feature} :: {rt.scenario}[{rt.row}]{mark}"
 }
 
-/**
- * feature_names_of — every distinct feature name among `rows`, in first-appearance order (the order
- * the file declares them, which is the order a reader scrolls).
- *
- * @param rows  the measured rows
- * @return      the distinct feature names
- */
-fn feature_names_of(rows: []RowTiming) -> []str {
-    mut names: []str = teko::list::empty()
-    mut i: u64 = 0
+fn feature_names_of(rows: []RowTiming): []str {
+    var names: []str = []
+    var i: u64 = 0
     loop {
         if i >= rows.len { break }
-        if !str_list_has(names, rows[i].feature) { names = teko::list::push(names, rows[i].feature) }
+        if !str_list_has(names, rows[i].feature) { names = [..names, rows[i].feature] }
         i++
     }
     names
 }
 
-/**
- * str_list_has — is `needle` already in `xs`? (The distinct-name accumulator's membership test.)
- *
- * @param xs      the accumulated names
- * @param needle  the name to look for
- * @return        true when present
- */
-fn str_list_has(xs: []str, needle: str) -> bool {
-    mut i: u64 = 0
+fn str_list_has(xs: []str, needle: str): bool {
+    var i: u64 = 0
     loop {
         if i >= xs.len { break }
         if xs[i] == needle { return true }
@@ -245,16 +110,9 @@ fn str_list_has(xs: []str, needle: str) -> bool {
     false
 }
 
-/**
- * feature_total — the summed measurement of every row belonging to `feature`.
- *
- * @param rows     the measured rows
- * @param feature  the feature name to total
- * @return         that feature's summed measurement
- */
-fn feature_total(rows: []RowTiming, feature: str) -> PhaseTimes {
-    mut acc = phase_zero()
-    mut i: u64 = 0
+fn feature_total(rows: []RowTiming, feature: str): PhaseTimes {
+    var acc = phase_zero()
+    var i: u64 = 0
     loop {
         if i >= rows.len { break }
         if rows[i].feature == feature { acc = phase_add(acc, rows[i].times) }
@@ -263,65 +121,43 @@ fn feature_total(rows: []RowTiming, feature: str) -> PhaseTimes {
     acc
 }
 
-/**
- * regr_print_feature_table — the per-feature table: one line per feature with its build count, wall
- * total and mean per build. A dozen features fit a log; a couple of hundred scenarios do not.
- *
- * @param rows  the measured rows of one `.tkr` file
- */
 pub fn regr_print_feature_table(rows: []RowTiming) {
-    let names = feature_names_of(rows)
+    var names = feature_names_of(rows)
     if names.len == 0 { return }
     teko::io::println("teko: regression timings by feature (builds, total, mean/build)")
-    mut i: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= names.len { break }
-        let ft = feature_total(rows, names[i])
-        let total = phase_total_ns(ft)
-        let mean = if ft.builds == 0 { 0 } else { total / (ft.builds to i64) }
+        var ft = feature_total(rows, names[i])
+        var total = phase_total_ns(ft)
+        var mean = if ft.builds == 0 { 0 } else { total / (ft.builds to i64) }
         teko::io::println($"    {ft.builds} builds  {regr_ms_text(total)}  mean {regr_ms_text(mean)}  {names[i]}")
         i++
     }
 }
 
-/**
- * regr_print_slowest — the N slowest rows, each with its three phases. Selection is an N-pass scan
- * of maxima rather than a sort: N is 20 and the row count is in the hundreds, so this stays trivially
- * correct (and allocation-free) where a sort would be a second thing to get right.
- *
- * @param rows  the measured rows of one `.tkr` file
- * @param n     how many rows to list
- */
 pub fn regr_print_slowest(rows: []RowTiming, n: u64) {
     if rows.len == 0 { return }
-    let want = if rows.len < n { rows.len } else { n }
+    var want = if rows.len < n { rows.len } else { n }
     teko::io::println($"teko: regression timings — {want} slowest row(s)")
-    mut taken: []u64 = teko::list::empty()
-    mut k: u64 = 0
+    var taken: [want]u64 = []
+    var k: u64 = 0
     loop {
         if k >= want { break }
-        let pick = slowest_index_excluding(rows, taken)
+        var pick = slowest_index_excluding(rows, taken)
         teko::io::println(regr_row_line(rows[pick]))
-        taken = teko::list::push(taken, pick)
+        taken[k] = pick
         k = k + 1
     }
 }
 
-/**
- * slowest_index_excluding — the index of the slowest row not already in `taken` (index 0 when every
- * row is taken, which `regr_print_slowest`'s bound makes unreachable).
- *
- * @param rows   the measured rows
- * @param taken  the indices already printed
- * @return       the index of the slowest remaining row
- */
-fn slowest_index_excluding(rows: []RowTiming, taken: []u64) -> u64 {
-    mut best: u64 = 0
-    mut best_ns: i64 = -1
-    mut i: u64 = 0
+fn slowest_index_excluding(rows: []RowTiming, taken: []u64): u64 {
+    var best: u64 = 0
+    var best_ns: i64 = -1
+    var i: u64 = 0
     loop {
         if i >= rows.len { break }
-        let t = phase_total_ns(rows[i].times)
+        var t = phase_total_ns(rows[i].times)
         if !u64_list_has(taken, i) && t > best_ns {
             best = i
             best_ns = t
@@ -331,15 +167,8 @@ fn slowest_index_excluding(rows: []RowTiming, taken: []u64) -> u64 {
     best
 }
 
-/**
- * u64_list_has — is `needle` in `xs`? (The already-printed index set's membership test.)
- *
- * @param xs      the accumulated indices
- * @param needle  the index to look for
- * @return        true when present
- */
-fn u64_list_has(xs: []u64, needle: u64) -> bool {
-    mut i: u64 = 0
+fn u64_list_has(xs: []u64, needle: u64): bool {
+    var i: u64 = 0
     loop {
         if i >= xs.len { break }
         if xs[i] == needle { return true }
@@ -348,20 +177,9 @@ fn u64_list_has(xs: []u64, needle: u64) -> bool {
     false
 }
 
-/**
- * regr_timings_verbose — did this invocation ask for the FULL per-row dump (`--regr-timings`)?
- * Read straight off this process's argv, the same shape `allow_undef_selected` (project.tks) uses,
- * so an observability flag needs no plumbing through the test driver.
- *
- * The default is the summary (totals + feature table + slowest rows) for LEGIBILITY, not to save
- * work: every row is measured either way, and flipping the default to "print everything" is a
- * one-line change here if the owner prefers the full dump.
- *
- * @return true iff `--regr-timings` is present in argv
- */
-pub fn regr_timings_verbose() -> bool {
-    let argv = teko::env::args()
-    mut i: u64 = 0
+pub fn regr_timings_verbose(): bool {
+    var argv = teko::env::args()
+    var i: u64 = 0
     loop {
         if i >= argv.len { break }
         if argv[i] == REGR_TIMINGS_FLAG { return true }
@@ -370,15 +188,9 @@ pub fn regr_timings_verbose() -> bool {
     false
 }
 
-/**
- * regr_print_all_rows — every measured row, one line each, in run order: the `--regr-timings` dump,
- * meant to be diffed between two runs.
- *
- * @param rows  the measured rows of one `.tkr` file
- */
 pub fn regr_print_all_rows(rows: []RowTiming) {
     teko::io::println($"teko: regression timings — all {rows.len} row(s)")
-    mut i: u64 = 0
+    var i: u64 = 0
     loop {
         if i >= rows.len { break }
         teko::io::println(regr_row_line(rows[i]))
@@ -386,13 +198,6 @@ pub fn regr_print_all_rows(rows: []RowTiming) {
     }
 }
 
-/**
- * regr_print_timings — the whole per-file timing report: the feature table plus either every row
- * (`--regr-timings`) or the slowest slice. Silent for a file that measured nothing (a wholly
- * declarative `.tkr` builds nothing and has nothing to say).
- *
- * @param rows  the measured rows of one `.tkr` file
- */
 pub fn regr_print_timings(rows: []RowTiming) {
     if rows.len == 0 { return }
     regr_print_feature_table(rows)

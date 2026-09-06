@@ -47,7 +47,7 @@ entry below is anchored to a **real, named demand** in this tree or in a sibling
 full_gate.tks:45`:
 
 ```teko
-pub extern fn c_setenv(name: u64, value: u64, overwrite: i32) -> i32 = "setenv"
+pub extern fn c_setenv(name: u64, value: u64, overwrite: i32): i32 = "setenv"
 ```
 
 `setenv` takes `const char *`. The probe passes addresses as `u64`, and the obligation "this must be
@@ -71,7 +71,7 @@ Every row is a read measurement.
 | a user struct crossing an extern boundary is a **C compile error** even where allowed | measured, recorded | `src/time/time.tks:21-34` |
 | `extern type Name` exists — an opaque foreign handle, lowers to `typedef void *tk_t_Name;` | yes | `src/parser/ast.tks:463`, `parse_decl.tks:822-824`, `src/codegen/codegen.tks:9029-9035` |
 | `ptr<byte>` as an extern param **links and runs** | proven twice in the regressor | `examples/regressions/bulk/src/q026_buf_ptr_memset_roundtrip/body.tks:1`, `q170_unsafe_rawbuf_roundtrip/body.tks:14` |
-| `-> void` on a **raw libc** extern is proven | yes | `feat/issue-runtime-em-teko` `src/runtime/teko_rt.tks:676` (`rt_abort() -> void = "abort" from "c"`) |
+| `-> void` on a **raw libc** extern is proven | yes | `feat/issue-runtime-em-teko` `src/runtime/teko_rt.tks:676` (`rt_abort() = "abort" from "c"`) |
 | `Ptr{inner=null}` (the opaque `ptr`) lowers to literally `void *` | yes | `codegen.tks:1549-1551` |
 | `Uptr` lowers to literally `uintptr_t` | yes | `codegen.tks:1553` |
 | `Void` lowers to literally `void` | yes | `codegen.tks:1502` |
@@ -88,13 +88,13 @@ Every row is a read measurement.
 | `teko::mem::str_from_cstr` → `tk_str_from_cstr`: an **UNBOUNDED `strlen`** on a foreign pointer | yes | `teko_rt.c:167` |
 | `teko::mem::bytes_from_ptr` is **already bounded** (`n` is a required param) | yes | `teko_rt.c:178`, signature at `src/checker/scope.tks:638-642` |
 | `as_ptr` / `as_cstr` / `str_from_cstr` have **ZERO callers** in the whole tree | measured | `rg 'as_cstr\|str_from_cstr\|as_ptr\(' --glob '*.tks'` returns only `scope.tks`, `codegen.tks`, doc-comments |
-| `teko::mem::buf_ptr(len) -> ptr<byte>` bump-allocates into the **ENCLOSING** region | yes | `scope.tks:366-373`, `codegen.tks:3171-3186` |
-| `teko::mem::region_new() -> uptr` / `region_alloc(uptr, T) -> ptr<T>` — a **NAMED** region | yes | `src/checker/typer.tks:935-1000` |
+| `teko::mem::buf_ptr(len): ptr<byte>` bump-allocates into the **ENCLOSING** region | yes | `scope.tks:366-373`, `codegen.tks:3171-3186` |
+| `teko::mem::region_new(): uptr` / `region_alloc(uptr, T): ptr<T>` — a **NAMED** region | yes | `src/checker/typer.tks:935-1000` |
 | `unsafe #must_free type Arena { region: uptr }` — leaking the region is a **compile error** | shipped | `src/mem/unsafe/arena.tks` |
 | Teko has **NO macros**, and none are planned before 1.0 | confirmed | zero hits for `macro` in `src/lexer`, `src/parser`, `src/parser/ast.tks`; `docs/memory/teko-laws-digest.md` "Metaprogramming-out-of-LTS" |
 | `#os("…")` may precede **a function ONLY** — a `type` decl cannot be OS-guarded | yes | `parse_decl.tks:1239` |
-| native targets | `Arm64Macho`, `X8664Linux`, `X8664Windows`, `Wasm32Wasi`, `Wasm64Wasi`, `Wasm32Browser` | `src/build/project.tks:1421` |
-| the VM is **retired** — native AOT is the sole engine | ruled | `docs/memory/teko-laws-digest.md` ("Twins retired, 2026-07-13, #524") |
+| native targets | `Arm64Macho`, `Arm64Linux`, `X8664Linux`, `X8664Windows` | `src/build/project.tks` |
+| native AOT is the sole engine | ruled | `docs/memory/teko-laws-digest.md` ("Twins retired, 2026-07-13, #524") |
 | `Ptr` and `Uptr` are both **admissible union members** (they fall to the permissive arm) | yes | `resolve.tks:1642-1658` (`variant_member_admissible`) |
 | `ptr<T> \| null` lowers to a **bare `T *` with NULL meaning null** — zero overhead, C-identical | yes | `cg_type_is_niche_able`'s `Ptr => true` arm, `codegen.tks:1868-1877`; the emit path at `codegen.tks:1532-1534` |
 | `uptr \| null` is **NOT** niche-able — it falls to `_ => false` and lowers to a **tagged struct** | yes | `codegen.tks:1868-1877` (no `Uptr` arm) |
@@ -153,7 +153,7 @@ This is load-bearing in three directions:
 
 ## 4. The unsafe frontier — the spelling ALREADY EXISTS, and one doc-comment lies about it
 
-**Finding.** `pub extern unsafe fn f(…) -> T = "sym"` **parses today**, and the flag survives.
+**Finding.** `pub extern unsafe fn f(…): T = "sym"` **parses today**, and the flag survives.
 
 The modifier chain in `parse_function` consumes `extern` first (`parse_decl.tks:315-319`) and calls
 `consume_unsafe_modifier` **after** (`:320-322`); the resulting extern `Function` node carries
@@ -221,7 +221,7 @@ An entry enters `teko::c_types` only if **both** hold:
 1. **A named, real caller demands it** — an extern in this tree, an extern the sibling
    `cargo/20-concorrencia-adiantada` design names, or a `teko_rt` binding. No theoretical completeness.
 2. **Its Teko mapping is the SAME on every target the compiler can emit** (`project.tks:1421`:
-   `arm64-macos`, `x86_64-linux`, `x86_64-windows`, `wasm32-wasi`, `wasm64-wasi`, `wasm32-browser`).
+   `arm64-macos`, `arm64-linux`, `x86_64-linux`, `x86_64-windows`).
 
 Rule 2 is the operational form of the owner's *"não mente"*. A `c_types` name is ONE name used
 corpus-wide; if its width differs per target, a single alias would be a lie on some target, and
@@ -266,7 +266,7 @@ both** — nothing else in this document depends on them. Flagged rather than sm
 
 | C shape | Teko | entry? |
 |---|---|---|
-| `void f(…)` (return position) | `void` | **NO ENTRY.** It is literally the same thing, already spelled in one word, already proven on a raw libc extern (`rt_abort() -> void = "abort" from "c"`) and admitted by an explicit checker arm (`typer.tks:5761-5763`). A `type c_void = void` alias would be a **synonym** — a second name for a thing that has a name and is the same thing. §5.2 records it as excluded |
+| `void f(…)` (return position) | `void` | **NO ENTRY.** It is literally the same thing, already spelled in one word, already proven on a raw libc extern (`rt_abort() = "abort" from "c"`) and admitted by an explicit checker arm (`typer.tks:5761-5763`). A `type c_void = void` alias would be a **synonym** — a second name for a thing that has a name and is the same thing. §5.2 records it as excluded |
 | `void *` (an address of the unknown) | `ptr<byte>` **or** the opaque `ptr` — never `uptr`. Rule in §5.3 | **NO ENTRY.** The opaque `ptr` lowers to literally `void *` (`codegen.tks:1550`); an alias would again be a synonym |
 
 *Measured, for the record, because the earlier proposal must be answerable rather than merely
@@ -284,13 +284,13 @@ prototype. The owner's revised ruling avoids both.
 
 | C type | why it is OUT |
 |---|---|
-| **`long` / `unsigned long`** | **Fails rule 2, irreducibly.** 64-bit on LP64 (`x86_64-linux`, `arm64-macos`), 32-bit on LLP64 (`x86_64-windows`) and on `wasm32`. One alias would be a lie on half the targets, and `#os` **cannot guard a type declaration** (`parse_decl.tks:1239`). **The honest workaround, which costs nothing:** an FFI author binding a `long` API names the exact width for the target being bound (`c_int` or `c_longlong`) — which is precisely what the corpus already does with bare `u64`, so this is a zero-regression exclusion. **The unblocker, named:** OS/width-guarded type declarations. REPORTED UP, not turned into an issue here |
-| **`size_t` / `ssize_t` / `ptrdiff_t`** | **Fails rule 2.** 64-bit on all three native targets and `wasm64`; **32-bit on `wasm32`** (both `wasm32-wasi` and `wasm32-browser` are emittable, `project.tks:1421`). Teko has no target-width integer (`PrimKind` is fixed-width only: `type.tks:11-16`), and `uptr` is `uintptr_t`, which is an *address* word, not a *size* word — using it for a length is the same category error §5.3 rejects. **Workaround, already in use:** `c_ulonglong` (`u64`) for the 64-bit targets, which is exactly what `aligned_alloc`/`memset`/`memcmp` declare today. **The unblocker, named:** a `usize`/`isize` primitive. REPORTED UP |
+| **`long` / `unsigned long`** | **Fails rule 2, irreducibly.** 64-bit on LP64 (`x86_64-linux`, `arm64-macos`), 32-bit on LLP64 (`x86_64-windows`). One alias would be a lie on half the targets, and `#os` **cannot guard a type declaration** (`parse_decl.tks:1239`). **The honest workaround, which costs nothing:** an FFI author binding a `long` API names the exact width for the target being bound (`c_int` or `c_longlong`) — which is precisely what the corpus already does with bare `u64`, so this is a zero-regression exclusion. **The unblocker, named:** OS/width-guarded type declarations. REPORTED UP, not turned into an issue here |
+| **`size_t` / `ssize_t` / `ptrdiff_t`** | **Fails rule 2.** 64-bit on every native target the compiler emits, but Teko has no target-width integer (`PrimKind` is fixed-width only: `type.tks:11-16`), and `uptr` is `uintptr_t`, which is an *address* word, not a *size* word — using it for a length is the same category error §5.3 rejects. **Workaround, already in use:** `c_ulonglong` (`u64`) for the 64-bit targets, which is exactly what `aligned_alloc`/`memset`/`memcmp` declare today. **The unblocker, named:** a `usize`/`isize` primitive. REPORTED UP |
 | **`intptr_t` / `uintptr_t`** | Teko's `uptr` already IS `uintptr_t` (`codegen.tks:1553`) and spells it in one word. An alias would be a synonym (M.5: one name, one meaning) |
 | **`uptr \| null`** | **Not buildable, and the reason is representational, not stylistic** (§5.4.3): `Uptr` has no arm in `cg_type_is_niche_able` (`codegen.tks:1868-1877`) because an integer has no spare bit-pattern — `0` is data. It lowers to a two-word tagged struct, which is the wrong ABI, silently. Nullability at the boundary is `ptr<T> \| null`, always |
 | **`void`** | see §5.1 — a synonym for a thing that already has a one-word name [PIN-2] |
 | **`void *`** | ditto: the opaque `ptr` lowers to literally `void *` [PIN-2] |
-| **a C FUNCTION POINTER** (`void *(*)(void *)` — `pthread_create`'s `start_routine`) | `extern_type_ok` rejects `Func` outright (`typer.tks:5119`), and **Teko has no way to produce the address of a Teko function** as a C-callable value. The sibling `cargo/20-concorrencia-adiantada` reached the identical conclusion independently and named the answer: `star-ref-and-ffi-0.3.1.md` §4.4 G3's `cabi fn(T…) -> R` parameter type with coercion from a non-capturing top-level fn — **and explicitly rejected** an `fn_addr -> u64` intrinsic as "o mesmo trocadilho de ABI que o `tk_cov_dump` já teve rejeitado por M.3". c_types must not name a type it cannot construct. **This belongs to the concurrency cargo, not here** |
+| **a C FUNCTION POINTER** (`void *(*)(void *)` — `pthread_create`'s `start_routine`) | `extern_type_ok` rejects `Func` outright (`typer.tks:5119`), and **Teko has no way to produce the address of a Teko function** as a C-callable value. The sibling `cargo/20-concorrencia-adiantada` reached the identical conclusion independently and named the answer: `star-ref-and-ffi-0.3.1.md` §4.4 G3's `cabi fn(T…): R` parameter type with coercion from a non-capturing top-level fn — **and explicitly rejected** an `fn_addr -> u64` intrinsic as "o mesmo trocadilho de ABI que o `tk_cov_dump` já teve rejeitado por M.3". c_types must not name a type it cannot construct. **This belongs to the concurrency cargo, not here** |
 | **`pthread_t`** | On `x86_64-linux` it is `unsigned long` (rule 2 again); the Windows analogue is a `HANDLE` (`void *`) — a different *kind*, not merely a different width. The concurrency design's answer is the right one and needs no c_types entry: declare the binding **per-`#os` on the FUNCTION** (which `#os` does allow), `u64` in the POSIX arm and the opaque `ptr` in the Win32 arm |
 | **struct-by-value C types** (`struct timespec`, `struct stat`, …) | `extern_type_ok`'s `Named` arm admits only an `ExternBody` (`typer.tks:5115-5118`), and `time.tks:21-34` records empirically that a struct across an extern boundary is a **C compile error** under the current codegen. Not expressible; not this issue's to fix |
 | **`wchar_t` / `char16_t` / `char32_t`** | No caller anywhere, in this tree or in any sibling cargo. Teko's text is UTF-8 end to end (`teko_rt.h:44`). Pure YAGNI |
@@ -365,13 +365,13 @@ promotion."*
 
 ```teko
  * @return           the block's base address, or 0 on failure
-pub extern fn c_aligned_alloc(alignment: u64, size: u64) -> u64 = "aligned_alloc"
+pub extern fn c_aligned_alloc(alignment: u64, size: u64): u64 = "aligned_alloc"
 ```
 
 and its caller, `bottom.tks:152-157`:
 
 ```teko
-pub fn acquire_chunk() -> u64 {
+pub fn acquire_chunk(): u64 {
     let block = c_aligned_alloc(arena_align(), default_chunk_bytes())
     demand(block != 0, 10)
     ...
@@ -443,7 +443,7 @@ point, and a reviewer who finds `uptr | null` anywhere in the tree should treat 
 #### 5.4.4 The gap, named: `extern_type_ok` rejects a union today
 
 `extern_type_ok` (`typer.tks:5109-5121`) admits `Prim`, `Byte`, `Ptr`, `Uptr`, and an `ExternBody`
-`Named`. **`Variant` falls to `_ => false`** — so `extern fn f(…) -> ptr<byte> | null` is **rejected
+`Named`. **`Variant` falls to `_ => false`** — so `extern fn f(…): ptr<byte> | null` is **rejected
 right now** with *"an `extern` function return must be a primitive (int/float/bool), `byte`, `ptr`,
 `uptr`, an `extern type` handle, or absent (C7.1a)"*. This is precisely the missing in-tree usage
 pattern `regressor.tkr:87-89` refused to guess at.
@@ -523,7 +523,7 @@ zero callers in the entire tree (§2, measured).
  * TOTAL on every input, with no undefined case:
  *   * `p` is null            -> the empty `str` (never a read)
  *   * a NUL at octet i < max -> the first `i` octets (the ordinary case)
- *   * no NUL in [0, max)     -> exactly `max` octets, and the result is NOT the prefix of a C
+ *   * no NUL in [0, max): exactly `max` octets, and the result is NOT the prefix of a C
  *                              string. This is TRUNCATION, not a panic, and deliberately so: a C
  *                              API may legitimately hand back a FIXED-WIDTH, un-terminated field
  *                              (a `utmp.ut_line`, a fixed-size id array), and panicking would make
@@ -540,7 +540,7 @@ zero callers in the entire tree (§2, measured).
  * @see teko::mem::bytes_from_ptr  the already-bounded byte twin this mirrors
  * @since 0.3.1
  */
-pub unsafe fn str_from_c(p: ptr<byte>, max: u64) -> str
+pub unsafe fn str_from_c(p: ptr<byte>, max: u64): str
 ```
 
 **Where it lives, and why it is a builtin rather than Teko code.** It CANNOT be written in Teko
@@ -649,7 +649,7 @@ wished.
  * @return c_string  an owning handle to a NUL-terminated copy in the enclosing region
  * @since 0.3.1
  */
-pub unsafe fn c_string_for_call(s: str) -> c_string {
+pub unsafe fn c_string_for_call(s: str): c_string {
     c_string { ptr = teko::mem::as_cstr(s); len = s.len }
 }
 
@@ -670,7 +670,7 @@ pub unsafe fn c_string_for_call(s: str) -> c_string {
  * @return c_string  an owning handle to a NUL-terminated copy inside `a`
  * @since 0.3.1
  */
-pub unsafe fn c_string_in_arena(a: Arena, s: str) -> c_string {
+pub unsafe fn c_string_in_arena(a: Arena, s: str): c_string {
     c_string { ptr = teko::mem::region_buf(a.region, s.len + 1, s); len = s.len }
 }
 
@@ -685,7 +685,7 @@ pub unsafe fn c_string_in_arena(a: Arena, s: str) -> c_string {
  * @return ptr<byte>  the base address of `s`'s NUL-terminated buffer, valid for `s`'s region
  * @since 0.3.1
  */
-pub unsafe fn c_string_ptr(s: c_string) -> ptr<byte> {
+pub unsafe fn c_string_ptr(s: c_string): ptr<byte> {
     s.ptr
 }
 ```
@@ -696,7 +696,7 @@ pub unsafe fn c_string_ptr(s: c_string) -> ptr<byte> {
   `Ptr{inner=null}` (`scope.tks:636`), and `ptr_widens_to_opaque` (`resolve.tks:838-848`) permits
   **typed → opaque only** — so an opaque `ptr` cannot initialize a `ptr<byte>` field. One-line
   retype; strictly more honest (it does return a byte buffer); zero callers to migrate.
-* **`teko::mem::region_buf(region: uptr, len: u64, init: str) -> ptr<byte>` does not exist and must
+* **`teko::mem::region_buf(region: uptr, len: u64, init: str): ptr<byte>` does not exist and must
   be added.** `buf_ptr(len)` allocates into the ENCLOSING region only; `region_alloc(region, init)`
   puts ONE value into a named region (`typer.tks:978-1000`). Neither gives "`len` contiguous octets,
   NUL-terminated, in region `r`". The new builtin is the named-region twin of `buf_ptr`, lowering to
@@ -776,7 +776,7 @@ target and the alias's own name never survives. `unsafe_carrying_at` looks the s
 
 ```teko
 pub unsafe type Danger = ptr<byte>       // compiles; the `unsafe` does NOTHING
-pub fn safe_fn(d: Danger) -> u64 { 0 }   // ACCEPTED — the gate never sees an unsafe type
+pub fn safe_fn(d: Danger): u64 { 0 }   // ACCEPTED — the gate never sees an unsafe type
 ```
 
 `validate_field_slot` (`collect.tks:2067`) checks the alias's RHS for contagion, so an alias to an
@@ -887,7 +887,7 @@ wrong, the design fails here and cheaply. *Fixtures:* `c_types_alias_identity` (
 **C2 — `str_from_c`, the bounded inbound scan; retire `str_from_cstr`. [UNBLOCKED]**
 Runtime (maintained C, permitted): replace `tk_str_from_cstr(const void *)` with
 `tk_str_from_c(const void *, uint64_t)` in `teko_rt.{c,h}`. Checker: `scope.tks:637` becomes
-`(ptr<byte>, u64) -> str`. Codegen: `codegen.tks:3684` remaps. Zero callers to migrate (§2).
+`(ptr<byte>, u64): str`. Codegen: `codegen.tks:3684` remaps. Zero callers to migrate (§2).
 *Delivers:* Question 2's answer, and closes a live unbounded foreign read.
 *Fixtures:* `c_str_from_c_totality` (all four cases, one exit code).
 **Ritual: full gate** (a shipped builtin's arity changes).
@@ -940,8 +940,8 @@ it is precisely the thing `c_string` must stay distinguishable from (§7.4).
 
 **C8 — corpus adoption: the NON-ARITHMETIC probe externs. [needs C1+C2b+C4]**
 `full_gate.tks:45,53` and `control.tks:8` re-declare as
-`pub extern unsafe fn c_setenv(name: ptr<byte>, value: ptr<byte>, overwrite: c_int) -> c_int =
-"setenv"` / `pub extern unsafe fn c_getenv(name: ptr<byte>) -> ptr<byte> | null = "getenv"`, and are
+`pub extern unsafe fn c_setenv(name: ptr<byte>, value: ptr<byte>, overwrite: c_int): c_int =
+"setenv"` / `pub extern unsafe fn c_getenv(name: ptr<byte>): ptr<byte> | null = "getenv"`, and are
 fed `c_string_ptr(c_string_for_call(name))`. Per the fixture convention (a fixture/probe cannot `use`
 the compiler's own stdlib — `rawbuf.tks:30-33`, `c55_.../case.tks`), each probe carries a **local
 copy** of the `c_string` shape; that the local copy lowers identically is itself part of what the
@@ -962,9 +962,7 @@ a width-insensitive value.
 
 ## 11. Regression fixtures
 
-The VM is retired (`teko-laws-digest.md`, #524), so **every oracle is native**. There is no
-VM/native differential to state; where the brief asks for "VM and native", the honest answer is that
-one engine remains and the fixtures say so.
+Every oracle is native (`teko-laws-digest.md`, #524). Prior briefs mentioned both engines; now only native remains and the fixtures validate accordingly.
 
 Fixture mechanics follow the house exactly: exit-code oracles are a namespace under
 `examples/regressions/bulk/src/qNNN_<name>/body.tks` plus a `Scenario` in `bulk.tkr`

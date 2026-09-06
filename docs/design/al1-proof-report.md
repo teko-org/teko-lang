@@ -1,3 +1,5 @@
+> **[HISTÓRICO]** — documenta a medição e prova de 2026-07-19 que foi fechada. Registra o censo estático e instrumentação de runtime que validou as hipóteses da onda AL antes de execução de produto. Não descreve o estado atual do projeto.
+
 # AL1 — Relatório da prova (proof-first, fechado)
 
 Status: **FECHADO (2026-07-19).** Medição de runtime + censo estático do gargalo de emit,

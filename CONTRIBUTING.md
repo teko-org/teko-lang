@@ -6,7 +6,7 @@ Thanks for your interest! Teko is a young, fast-moving project with a few **non-
 
 ### 1. Native is the sole engine (ruling 2026-07-13, #524)
 
-**VM retired:** the compiler's canonical source is Teko (`src/**/*.tks`), and the C23 bootstrap files (`src/**/*.{c,h}` except the runtime) are archived at tag `0.0.1.3-bootstrap`. All new work is written in Teko only; do NOT extend the frozen C bootstrap. The one exception is `src/runtime/teko_rt.{c,h}` (and `src/assert/assert.{c,h}`): the execution runtime linked into generated programs stays maintained C — it is the FFI seam for native binaries. CI seeds from the latest released `teko` binary.
+**Teko-only source:** the compiler's canonical source is Teko (`src/**/*.tks`), and the C23 bootstrap files (`src/**/*.{c,h}` except the runtime) are archived at tag `0.0.1.3-bootstrap`. All new work is written in Teko only; do NOT extend the frozen C bootstrap. The one exception is `src/runtime/teko_rt.{c,h}` (and `src/assert/assert.{c,h}`): the execution runtime linked into generated programs stays maintained C — it is the FFI seam for native binaries. CI seeds from the latest released `teko` binary.
 
 **Seed-fallback (owner ruling 2026-07-24):** the invariant is that the released seed builds the PR's base lineage, not necessarily any given PR's tip. A wave is never blocked by a seed capability gap: `scripts/build_with_seed_fallback.sh` first tries the seed directly on the tip (the common case, zero extra cost); only if that fails does it engage the **staged bootstrap ladder**, an iterative walk — *while the compiler in hand cannot build the tip, find the NEWEST first-parent ancestor it CAN build, build that, and climb onto the resulting compiler* — bounded by a stage cap and a no-progress guard. Every CI lane that builds gen1 from the released seed goes through this script, so a genuine language/codegen capability jump introduced by a PR never needs an intermediate version cut.
 
@@ -35,7 +35,7 @@ Language-design tensions are resolved by the laws in [TEKO_CONSTITUTION.md](TEKO
 
 - **Wave dev model (remodel).** Development proceeds in **waves**, one per `0.X` version. Each wave has **one umbrella PR** (branch `remodel/<slug>`, base `main`) that carries the version bump and aggregates the wave. Every feature/fix is a **sub-PR based on the umbrella**, never on `main`, and you **never commit directly to `main`**. Each sub-PR is drained CLEAN (all checks green) into the umbrella. Before the umbrella merges, two passes run **pre-launch**: the **W15 quality sweep** (#234 verifier + #231 lint) and the **doc-sync** (this coherence pass). The umbrella → `main` merge (strict All-Green gate) is what ships the `0.X.0.0-beta` version. Every wave gets its own W15 sweep and doc-sync, until LTS.
 - Outside a wave (a hotfix or tooling change on `main`), base the PR on `main` directly.
-- Use **Conventional Commits** (`feat(parser): …`, `fix(vm): …`, `docs: …`, `chore: …`).
+- Use **Conventional Commits** (`feat(parser): …`, `fix(checker): …`, `docs: …`, `chore: …`).
 - Keep PRs focused: one feature/fix per PR, with its tests and regression examples included.
 
 ## Tests
@@ -57,7 +57,7 @@ The version is `MAJOR.MINOR.PATCH.BUILD-<stage>`, held verbatim in `teko.tkp` (t
 
 ## Reporting issues
 
-Use the issue templates. For suspected compiler bugs, the most valuable artifact is a **minimal `.tks` reproducer** plus the observed VM and native behaviors (they may differ — that difference is itself a bug).
+Use the issue templates. For suspected compiler bugs, the most valuable artifact is a **minimal `.tks` reproducer** plus the observed native behavior vs. what you expected (exit code, panic/error output).
 
 ## Security
 

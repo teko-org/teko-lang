@@ -20,11 +20,13 @@
 #      binary RUNS on its runner, so the caller states which released binary does. A
 #      derivation the caller can get wrong is a derivation that silently picks the wrong blob.
 #   2. THE DRY BUILD + THE LADDER (scripts/build_with_seed_fallback.sh): the newest RELEASED seed
-#      builds the tip directly; else the COMMITTED seed in bootstrap/seeds/; else the pinned SHA
-#      ladder. `--no-verify --release` — DRY, no test gate (the gate is the test layer's whole
-#      job) and `-O2` because every published asset is a release link.
-#      Leaves out/teko[.exe] AND out/teko.c — every asset this producer mints comes from that one
-#      C, so all of them are the same generation of the compiler by construction.
+#      builds gen0 and gen0 builds gen1 — the owner's 0.3.1.0 chain, both links down the C route.
+#      A DECLARED degrau, the COMMITTED seed in bootstrap/seeds/ or the pinned SHA ladder stand in
+#      for the release only when it cannot reach the tip. `--no-verify --release` — DRY, no test
+#      gate (the gate is the test layer's whole job) and `-O2` because every published asset is a
+#      release link. Leaves out/teko[.exe] AND out/teko.c — that C is GEN1's own emission. Every
+#      asset this producer mints comes from that one C, so all of them are the same generation by
+#      construction, and it is what pr.yml harvests over a green fixpoint.
 #   3. LINUX ONLY: one native build per label (scripts/native_linux_asset.sh) — glibc in a
 #      manylinux_2_28 container, musl with the runner's own musl-gcc, no container. When a
 #      producer promises MORE THAN ONE Linux label (glibc + musl), they run IN PARALLEL on this
@@ -197,25 +199,44 @@ log "kind=$KIND seed=$SEED produces='$PRODUCES'"
 # ci_provision_teko.sh appends `.seed` to $GITHUB_PATH, which only affects LATER STEPS — this
 # script is one step, so it puts the seed on its own PATH as well. That also makes the script
 # runnable by hand outside Actions, which is the only way anyone debugs a producer.
-sh scripts/ci_provision_teko.sh "$SEED"
+#
+# PROVISIONING-PRODUCES-NOTHING IS NON-FATAL, and that is the whole recovery this path adds. When
+# there is NO published release candidate for the seed source AND no committed seed in
+# bootstrap/seeds/, ci_provision_teko.sh exits non-zero having staged nothing. That is not a broken
+# producer — it is a release-availability gap, and the tree already carries its own answer: a
+# DECLARED degrau (bootstrap/DEGRAU) names the C bridge that
+# scripts/build_with_seed_fallback.sh's rung -1 compiles with `cc`, needing no provisioned `teko`
+# at all. So a missing seed must not `exit 1` before the ladder; it must fall through to it. The
+# FAST PATH is untouched: when a seed IS provisioned, `teko` is on PATH and everything below behaves
+# exactly as it did before, the ladder still preferring the released seed and only falling back to
+# the degrau when the seed cannot reach the tip.
+sh scripts/ci_provision_teko.sh "$SEED" || log "no released/committed seed was available for '$SEED' — proceeding to the declared degrau ladder"
 if [ -d .seed ]; then
     PATH="$PWD/.seed:$PATH"
     export PATH
 fi
-command -v teko >/dev/null 2>&1 || {
-    log "provisioning reported success but no 'teko' is on PATH"
-    exit 1
-}
-teko --version
 
-# THE SEED VERSION IS RECORDED, and that is not decoration. gen1 is `seed(tree)`: the emitted
-# teko.c is produced BY the seed, so two runs of the SAME tree emit the same C only if they stood
-# on the SAME seed. ci_provision_teko.sh deliberately takes the NEWEST released seed ("SEED = the
+# THE SEED VERSION IS RECORDED, and that is not decoration. gen0 is `seed(tree)` and gen1 is
+# `gen0(tree)`, so the emitted teko.c descends from the seed two links up: two runs of the SAME
+# tree emit the same C only if they stood on the SAME seed. The doubling does not weaken that
+# dependency, it only lengthens it — a different seed still lowers a different gen0, which emits a
+# different C. ci_provision_teko.sh deliberately takes the NEWEST released seed ("SEED = the
 # NEWEST usable released seed, ALWAYS"), which is a function of WHEN the lane ran, not of the tree.
 # On a train that cuts a release per bump, a seed change between a PR's run and the merge push is
 # ordinary — and it is the single most likely honest explanation for two builds of one tree
 # disagreeing. nightly.yml's reproducibility gate reads this to tell that apart from a real defect.
-SEED_VERSION="$(teko --version 2>/dev/null || echo 'unknown')"
+#
+# WHEN NO SEED WAS PROVISIONED, SEED_VERSION DEGRADES TO `degrau` rather than crashing: there is no
+# `teko` to interrogate, and the gen0 that build_with_seed_fallback.sh will mint descends from the
+# declared C bridge, not from a released seed. Recording `degrau` states that honestly for the
+# reproducibility gate instead of pretending a seed version it never stood on.
+if command -v teko >/dev/null 2>&1; then
+    teko --version
+    SEED_VERSION="$(teko --version 2>/dev/null || echo 'unknown')"
+else
+    log "no 'teko' on PATH after provisioning — the declared degrau (bootstrap/DEGRAU) is the seed of last resort"
+    SEED_VERSION="degrau"
+fi
 
 # ── 2. the dry build + the ladder ─────────────────────────────────────────────────────────────
 sh scripts/build_with_seed_fallback.sh out
@@ -295,7 +316,8 @@ done
 # with the runner image.
 #
 # `teko_c_sha256` is the discriminator that makes a failure DIAGNOSABLE rather than merely red.
-# teko.c is what the SEED emitted; each asset is that C compiled. So when two runs disagree:
+# teko.c is what gen0 emitted while producing gen1; each asset is that C compiled. So when two
+# runs disagree:
 #     teko.c differs                → the FRONT half moved (a different seed, or a different rung)
 #     teko.c matches, bytes differ  → the BACK half moved (the C toolchain)
 # One comparison and the cause is already bisected.
