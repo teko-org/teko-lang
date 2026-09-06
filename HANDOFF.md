@@ -13,7 +13,7 @@ módulos (hooks), em vez de um compilador próprio. Desde S4.1 (plano §64(f)) o
 repositório) e `user.mc` (o driver do projeto) ficam `.mc`, por não serem do
 pacote (D64.7).
 
-**`src/` está CONGELADO e NÃO se toca.** Todo trabalho novo vive em `ngen/`.
+**O compilador antigo (`src/`) saiu no passo 1 do rebase.** Todo trabalho vive na raiz deste repositório (era `ngen/` até o rebase).
 
 Contexto completo: `docs/design/port-teko-mc.md` e as entradas **D211, D212,
 D213, D214** do `DECISION_LOG.md`. Leia-as — são leis, não sugestões.
@@ -22,7 +22,7 @@ D213, D214** do `DECISION_LOG.md`. Leia-as — são leis, não sugestões.
 
 **v0.1.0 é release INTERMEDIÁRIA** — o port continua até o mc chegar a 1.0.0 (§7
 segue valendo). O corte fecha com: zero resultado errado silencioso, recusas V0
-para o que ainda não é ensinado, `mc` pinado por `ngen/MC_VERSION`, fixpoint
+para o que ainda não é ensinado, `mc` pinado por `MC_VERSION`, fixpoint
 provado nas cinco pernas, `release.yml` publicando os assets, e a publicação no
 registro do mc gated por variável (D230 adendo 2). Sequência decidida:
 1. Squash de `fix/retirement` na `main` do fork `schivei/teko-lang`.
@@ -31,7 +31,7 @@ registro do mc gated por variável (D230 adendo 2). Sequência decidida:
    rebasear `ngen/` para a raiz do repositório.
 Consequência da mudança de raiz: o manifesto do pacote (`[package]`) migra para
 o `mc.toml` da raiz, **sem `[project]`** (regra do registro, D230 adendo 2);
-`ngen/mc.toml` (ou o que restar dele na raiz) fica só com `[project]`/
+`mc.toml` (ou o que restar dele na raiz) fica só com `[project]`/
 `[compiler]`/`[target]`/… para o `mc build`. Detalhe completo em
 `docs/design/pr-org-ngen.md` §7 e `DECISION_LOG.md` D230.
 
@@ -39,6 +39,16 @@ o `mc.toml` da raiz, **sem `[project]`** (regra do registro, D230 adendo 2);
 38,5 MB de legado — `src/`, `bootstrap/`, `.crumbs/`, `examples/`, `cases/`, `scripts/`,
 `tooling/`, `packaging/`, os 22 `TEKO_*.md` e todo o `docs/` menos `docs/brand/` e as nove docs
 de design vivas; ficam `ngen/`, a raiz cívica, `.github/` e o `DECISION_LOG.md`.
+
+**Passos 2+3 do rebase FEITOS** (mesmo §4, um commit só): `ngen/` deixou de existir — os 89
+ficheiros (`mc.toml`, `mc_teko.tk`, `core_teko.mc`, `user.mc`, os 31 `teko*.tk`, `lib/`,
+`tests/`, `scripts/`, `MC_VERSION`, `README.md`, este `HANDOFF.md`) são a **raiz** do
+repositório, e os caminhos do CI, do `bootstrap.sh`, do `measure.sh` e das receitas abaixo
+acompanharam (`mc build .`, `build/teko build . --config … --entry-only`, `sh
+scripts/bootstrap.sh`, `mc pkg hash .`, `cat MC_VERSION`). O nome do agregador do ruleset
+continua **literalmente** `mc build ngen && run` (§5 R2 do plano: check exigido casa por NOME;
+renomear é passo coordenado com o ruleset da org). Faltam o passo 4 (split do manifesto:
+`mc.toml` só `[package]`, `teko.toml` com o build) e o passo 5 (docs).
 
 ## 2. Leis que valem aqui (resumo do que mais pega)
 
@@ -81,14 +91,14 @@ de design vivas; ficam `ngen/`, a raiz cívica, `.github/` e o `DECISION_LOG.md`
   **`ptr`** (colapsa em `uptr`, o único ponteiro opaco do core), **`str`**
   (**NUL-terminated `uptr`** — D215 registra a forma). **`f32`/`f64`**: a lib
   `<float>` do mc (M24) **já registra essas mesmas palavras** — foi só
-  **conectar** (`ngen/teko_float.mc`), não reimplementar. `lib/rt.mc` ganhou
+  **conectar** (`teko_float.mc`), não reimplementar. `lib/rt.mc` ganhou
   as fns ordinárias (não-hook): `tk_str_len`/`tk_str_slice` (**view por
   ponteiro, zero-cópia — D197**) e `tk_f64_bits`/`tk_f64_from_bits` (o
   reinterpret concreto `f64↔u64`; a forma genérica `<T>` do `wrap`/`unwrap`
   precisa de generics record/replay e fica para a entrega de tipos).
 - **Entrega 3 (tipos) — COMPLETA: `struct`, `class`, `interface` e `trait`
   LANDADOS** (SHAs `984f268e`, `06db615d`, `a8757cef`, `2821c261`). Todos
-  passam pela mesma tabela de tipos (`ngen/teko_struct.mc`), e `struct`/`class`/
+  passam pela mesma tabela de tipos (`teko_struct.mc`), e `struct`/`class`/
   `interface` são registrados com `type_new(nome, 8, 8, TK_INT)` — identidade
   estática preservada para o `.` resolver membro.
   - `class`: palavra 0 da vtable é a itab, slots virtuais depois
@@ -99,7 +109,7 @@ de design vivas; ficam `ngen/`, a raiz cívica, `.github/` e o `DECISION_LOG.md`
     DIRETO (sem vtable). `self` é recusado (`teko: methods take no explicit receiver;
     use this`).
   - `interface`: assinaturas + conformidade checada dentro do `Classe_vt_init`;
-    despacho por `tk_itab` (`ngen/lib/rt.mc:44`), dinâmico.
+    despacho por `tk_itab` (`lib/rt.mc:44`), dinâmico.
   - `trait` (**D216 — modelo do PHP**): corpo gravado por `p_skip_balanced` e
     re-parseado por classe via `p_push_source`; flattening pela MESMA máquina de
     membros; precedência classe > trait > base; **não é tipo** (sem `type_new`);
@@ -146,7 +156,7 @@ na matriz. O check dos legs é `ngen (<os>/<arch>)`; o **agregador** mantém o n
 exato que o ruleset exige, `mc build ngen && run`, e falha se qualquer perna falhar
 (nada a trocar no ruleset).
 
-O config de cada perna é **derivado do `ngen/mc.toml`** (nunca editado): remove-se o
+O config de cada perna é **derivado do `mc.toml`** (nunca editado): remove-se o
 `[linker]`, troca-se `[target] os`/`arch` e o `out` ganha `.exe` no Windows; o resto
 (`[project]`/`[compiler]`/`[include]`/`[limits]`) não pode divergir entre pernas.
 
@@ -163,8 +173,8 @@ antes o sysroot que o link precisa, tudo com o próprio `mc` + LLVM da imagem:
 Job **`fixpoint`**, fora da matriz `leg`, nos **cinco** pares que as pernas nativas cobrem —
 `fixpoint (linux/x86_64)`, `fixpoint (linux/aarch64)`, `fixpoint (macos/aarch64)`,
 `fixpoint (windows/x86_64)` e `fixpoint (windows/aarch64)`. Roda
-`sh ngen/scripts/bootstrap.sh --os <os> --arch <arch>`: teko0 (`mc build ngen
---compiler-only`, mc de prateleira) → teko1 → teko2 → teko3 sobre `ngen/mc_teko.tk`, com os
+`sh scripts/bootstrap.sh --os <os> --arch <arch>`: teko0 (`mc build .
+--compiler-only`, mc de prateleira) → teko1 → teko2 → teko3 sobre `mc_teko.tk`, com os
 TRÊS critérios do plano §64(f) — `cmp` dos objetos `teko2.o`/`teko3.o`, `--dump-asm` de teko2
 vs teko3 com diff vazio, e teko1 compilando e rodando as 45 fixtures. As pernas provam "a
 fixture sai 42"; esta prova "o compilador se reproduz". O script imprime o tempo de CADA
@@ -195,7 +205,7 @@ três arquivos (`winstart.obj`, `mcrt.obj`, `kernel32.lib`). Duas peças, nenhum
   Ela também põe o LLVM no `$PATH` em forma WINDOWS (o `mc` chama o linker por
   `CreateProcessA`, que lê o PATH do Win32) e aponta o `TMPDIR` para o temp do runner (o `mc`
   nativo não abre os caminhos `/tmp/...` do MSYS).
-- **`bootstrap.sh --linker-toml FILE`** troca o `[linker] cc` do `ngen/mc.toml` pelos blocos
+- **`bootstrap.sh --linker-toml FILE`** troca o `[linker] cc` do `mc.toml` pelos blocos
   `[sysroot]`/`[linker]` do arquivo (a matriz do job escreve a MESMA linha que a perna usa).
   O `awk` que remove o bloco velho é o mesmo do config das pernas.
 
@@ -213,13 +223,13 @@ estágios depois (foi assim que o sufixo `.exe` se revelou o do HOST, não o do 
 
 **`[target]` de linux, achado do CI:** o compilador ensinado é escrito pelo backend de
 executável do **HOST**, e o writer ELF do mc põe interpretador/soname **musl** por padrão;
-num runner glibc o `ngen/build/teko` existe e mesmo assim não executa (`not found`, exit
+num runner glibc o `build/teko` existe e mesmo assim não executa (`not found`, exit
 127 — é o loader falando). O `bootstrap.sh` passou a anexar `interp`/`libc = "gnu"` ao
 `[target]` derivado **quando o alvo é linux e aquele loader existe na máquina**; máquina
 musl não anexa nada. (As pernas não sofriam: elas já traziam `interp`/`libc` na matriz.)
 
 O passo que baixa e verifica o `mc` é o MESMO nas dez: `.github/actions/setup-mc` (action
-composta) resolve a versão **PINADA por `ngen/MC_VERSION`** (§3.2) — `latest` só se o
+composta) resolve a versão **PINADA por `MC_VERSION`** (§3.2) — `latest` só se o
 chamador pedir explicitamente por `inputs.version` —, baixa o asset do par, confere o
 `.sha256` e assere `mc --host` — nenhum job pode testar um compilador diferente do outro.
 
@@ -277,7 +287,7 @@ caminho), `INSTALL.txt` gerado, `README.md` do `ngen/` e o `LICENSE`. O empacota
 **reproduzível** (mtime fixo, lista de membros explícita e ordenada, `ustar`, `gzip -n`) —
 a mesma receita do `scripts/release-assets.sh` do `mc`.
 
-**`publish-to-registry` tem duas metades.** A primeira roda SEMPRE: `mc pkg hash ngen` e a
+**`publish-to-registry` tem duas metades.** A primeira roda SEMPRE: `mc pkg hash .` e a
 compilação de cada unidade de `[package].check` pelo `mc` DE PRATELEIRA — que é o que o
 validador do registro faz na caixa dele (guia 27 §5). A segunda é o anúncio
 (`minicompiler/register-action@v1`), **atrás da variável de repositório
@@ -339,11 +349,24 @@ unidade inteira e ainda 100% núcleo é **`mc_teko.tk`** (`mc mc_teko.tk -o x.o`
 o hash de árvore cobre só `files`, e unidade de `check` fora dele é recusada. É a mesma forma do pacote
 do próprio `mc` (`check = ["src/mc_linux_x86_64.mc"]` + o `src/user.mc` que ela precisa).
 
-Hash de árvore do pacote (`mc pkg hash ngen`), depois da mudança:
+Hash de árvore do pacote (`mc pkg hash .`), depois da mudança:
 
 ```
 9318b19cb5b76629c03ca1b354d0d93bc3860e8a4f7747945cd19e235a5e5004   (pós-V0; o R1 mediu 057e7aed…; antes d41a0c80…1a7ada)
 ```
+
+**O hash literal MUDA a cada byte** de `mc.toml` ou de qualquer ficheiro de `[package].files` —
+inclusive um byte de COMENTÁRIO, porque o que ele digere é o ficheiro, não o TOML interpretado. É
+isso que ele existe para dizer. Logo nenhum número colado num documento é permanente: a **fonte** é
+sempre `mc pkg hash .` rodado na raiz, e o valor escrito aqui é só o registro do commit que o mediu.
+O `9318b19c…` acima é **pré-V1**. A `main` da org media
+`379fc9896f633d5db6669dbf07108a17e88fa06e44f5b0e5d1e487f57b6fc26b`, e o rebase para a raiz
+(passos 2+3) o preserva enquanto `mc.toml` não muda — o `git mv` não toca byte nenhum de
+`[package].files`, medido. Com os quatro comentários de `mc.toml` que ainda diziam `ngen`
+corrigidos (`mc build .`, `mc limits .`, `lib/rt.tk`, `HANDOFF.md`; nenhuma chave mudou), passa a
+`6e6bb5dfc0daccb68cd9b2955e56853db208d2535ef690b831540dac3670f5d1`. O split do manifesto (passo 4)
+muda `mc.toml` outra vez e **vai** mudar o hash de novo; é esperado e sem consequência antes da 1ª
+publicação.
 
 A ressalva do adendo continua **viva**: teko-ificar o compilador (S4.4+, fork g3) torna `mc_teko.tk`
 ilegível para o parser de prateleira e o pacote perde o `check`. Não há hoje uma segunda unidade
@@ -351,18 +374,18 @@ candidata — `lib/rt.tk` só voltaria a ser `check` se `panic` deixasse de usar
 
 ## 3.2 O mc que o CI usa hoje: 0.15.13 (2026-09-06)
 
-**Fonte da verdade: `ngen/MC_VERSION` (V2, 2026-09-06).** O CI não resolve mais `latest` por
-padrão — `.github/actions/setup-mc` lê `ngen/MC_VERSION` (uma linha, sem `v`) quando o chamador
+**Fonte da verdade: `MC_VERSION` (V2, 2026-09-06).** O CI não resolve mais `latest` por
+padrão — `.github/actions/setup-mc` lê `MC_VERSION` (uma linha, sem `v`) quando o chamador
 não passa `inputs.version`, e pina exatamente essa release; `latest` só entra se pedido
-explicitamente. "O mc que o CI usa" é sempre `cat ngen/MC_VERSION` — não é preciso ler o log de
+explicitamente. "O mc que o CI usa" é sempre `cat MC_VERSION` — não é preciso ler o log de
 um run para saber. Motivo (medido, 0.15.12): `latest` quebrou o CI sem aviso quando os 12
 globais de `src/driver.mc` viraram acessores (parágrafo abaixo) — um patch release do mc, hoje,
 entraria no gate de todo PR aberto ANTES de qualquer um destes textos ser atualizado.
 
 **Como subir a versão pinada.** (1) baixar a release nova e rodar o baseline local (§4) — as
-45 fixtures têm que fechar 45/45 contra o `mc` novo; (2) `sh ngen/scripts/bootstrap.sh` contra
+45 fixtures têm que fechar 45/45 contra o `mc` novo; (2) `sh scripts/bootstrap.sh` contra
 o `mc` novo tem que fechar `FIXPOINT OK`; **só depois** dos dois verdes (3) trocar o conteúdo de
-`ngen/MC_VERSION` para a versão nova e registrar o que mudou nesta seção, no mesmo padrão dos
+`MC_VERSION` para a versão nova e registrar o que mudou nesta seção, no mesmo padrão dos
 parágrafos abaixo. Nunca trocar o arquivo primeiro e validar depois — é o mesmo acidente do
 `latest` sem aviso, só que manual.
 
@@ -376,7 +399,7 @@ repete um `sxtw` idempotente. É o contrato que o V1 consome nos cinco construto
 bloco V1) — fecha o item 1 do §74(b). Também na release: as conversões single do `<float>` no arm64
 (`FI_SCVTF_D..FI_UCVTF_D`, `FI_FCVTZS_D..FI_FCVTZU_D` com `+2` — item 2 do §74(b)) e a ordem
 resultado/restauração no Win64. Bump validado nesta máquina ANTES de trocar o arquivo, na ordem do parágrafo
-acima: 45/45 com o `mc` novo e `sh ngen/scripts/bootstrap.sh` `FIXPOINT OK` (`teko1.o == teko2.o == teko3.o`,
+acima: 45/45 com o `mc` novo e `sh scripts/bootstrap.sh` `FIXPOINT OK` (`teko1.o == teko2.o == teko3.o`,
 `b45a0446…`), sobre a árvore da base `a66b80c9`.
 
 **0.15.12 (PR #42, "dieta de globais" do driver): os 12 globais de `src/driver.mc` viraram UM registro de arena
@@ -410,7 +433,7 @@ que o módulo registrou por `word_add` (`syntax`/`syntax_stmt`/`syntax_expr`/`sy
 `type_alias`/`type_new`) deixa de ser palavra e lexa como identificador comum -- é o que permite a
 um compilador ensinado ler os fontes do PRÓPRIO núcleo, onde `type`, `out` e `params` são nomes de
 parâmetro. Fora do escopo: `#rule`/`#infix`/`#prefix`/`#token`, `intrinsic()` e o `i32` do núcleo.
-**Adotado pela S4.2** (`ngen/teko_fwd.tk`, `tk_source_claim`/`tk_push_source`; §5) -- e a ressalva
+**Adotado pela S4.2** (`teko_fwd.tk`, `tk_source_claim`/`tk_push_source`; §5) -- e a ressalva
 medida está lá: a marca é por ENTRADA de token, então um lexema que o dialeto ensina E que é
 literal de `#rule` do prelúdio (`while`, `for`) some das fontes não reivindicadas. `mc limits`
 ganha a linha `source_claim`.
@@ -423,18 +446,18 @@ o lexer abre -- a entrada, `#include` que o NÚCLEO resolve sozinho, `<bundle>`/
 `p_push_source`. `name` é o que `lex_file()` imprimiria para aquele quadro. **A entrada também é
 anunciada:** como `lex_init` empurra a entrada antes de `user_init()` rodar, registrar o handler
 dispara um REPLAY, só para ele, de toda fonte já aberta -- então a varredura manual da entrada
-que `tk_fwd_init` fazia deixa de ser necessária. **Adotado** (`ngen/teko_fwd.mc`,
+que `tk_fwd_init` fazia deixa de ser necessária. **Adotado** (`teko_fwd.mc`,
 `tk_fwd_on_source`/`tk_fwd_is_source_name`): `tk_fwd_init` agora só chama `on_source(&tk_fwd_
 on_source)`; o callback filtra por SUFIXO `.tk` (nenhum outro nome que o lexer anuncia termina
 assim -- um frame de `p_push_source` sempre junta palavras com espaço ou dois-pontos, um nome de
 `<bundle>` é uma palavra nua tipo `mc/core`, e um `#include "../lib/rt.mc"` que um PROGRAMA `.tk`
 escreve termina em `.mc`) e chama `tk_fwd_scan` só para os que passam. Nenhuma tabela de
 "já varrido" nova: o `lex_seen` do próprio núcleo já impede um `#include`/`import` repetido de
-empurrar (e portanto de anunciar) o mesmo nome duas vezes. `tk_import` (`ngen/teko_ns.mc`) parou de
+empurrar (e portanto de anunciar) o mesmo nome duas vezes. `tk_import` (`teko_ns.mc`) parou de
 chamar `tk_fwd_scan` depois do seu próprio `lex_include` -- o push já dispara o callback registrado,
 por conta própria. Fecha a dívida do O2: um `#include "parts/x.tk"` CRU (fora de `import`) agora
 tem seu conteúdo varrido no instante em que é empurrado, então um uso escrito ACIMA da declaração
-real, mas DENTRO do arquivo incluído, resolve -- provado por probe (fora de `ngen/tests/`): com o
+real, mas DENTRO do arquivo incluído, resolve -- provado por probe (fora de `tests/`): com o
 compilador da base (pré-0.15.3) o mesmo programa dava `type expected in parameter` (a palavra nunca
 tinha sido reservada); com o callback, compila e roda normal. `mc limits` ganha a linha `on_source`
 (1 registro, na segunda tabela -- a que mede a compilação REAL de um `.tk` pelo compilador
@@ -450,21 +473,21 @@ níveis de laço contados do mais interno; `continue;` = `continue 1;` (mesmo n�
 profundidade → `continue out of range`; `continue outside loop` inalterado; `on_jump` recebe o nó
 ANTES da checagem de nível (o `depth` do gancho continua sendo profundidade de BLOCO, não de laço).
 Consumido pela entrega 5 crumb "adoção do 0.14.1": `tk_switch_rewrite_continue_stmt`
-(`ngen/teko_switch.mc`, era `tk_switch_no_continue_stmt`) e `tk_loop_rewrite_stmt`
-(`ngen/teko_loop.mc`) leem `nd_val` de `N_CONTINUE` a mesma forma que já liam de `N_BREAK`;
-`tk_rc_jump` (`ngen/teko_rc.mc`) idem. Baseline local no 0.14.1: 32/32.
+(`teko_switch.mc`, era `tk_switch_no_continue_stmt`) e `tk_loop_rewrite_stmt`
+(`teko_loop.mc`) leem `nd_val` de `N_CONTINUE` a mesma forma que já liam de `N_BREAK`;
+`tk_rc_jump` (`teko_rc.mc`) idem. Baseline local no 0.14.1: 32/32.
 
 (Registro anterior, 0.13.0:)
 
 **0.13.0 (PR #22, M45):** `i32` (`type_new` pelo NÚCLEO, kind `TK_SINT`, sinal por kind); **uma
 chamada devolve o que declara** (D5) — todo `extern` que devolve C `int` passa a `extern i32`
-(corrigido em `ngen/tests/surface_overload_free.tk`'s `chmod`); **`p_cp()`** público (o cursor do
-lexer sob substituição, usado em `ngen/teko_access.mc`'s `tk_dot_follows`); e o falso positivo
+(corrigido em `tests/surface_overload_free.tk`'s `chmod`); **`p_cp()`** público (o cursor do
+lexer sob substituição, usado em `teko_access.mc`'s `tk_dot_follows`); e o falso positivo
 `region crosses a file boundary` no fim de um arquivo incluído, corrigido no núcleo (nada a tirar
 aqui — `teko_generic.mc` não tinha contorno algum, só o design região-por-parte). O mesmo release
 também respondeu ao lote C5b: `+` unário tem site por `syntax_expr("+")` + `parse_expr(11)` (a
 precedência acima de `*`/`/`/`%`, a mais alta do `--dump-rules`), sem linha nova no núcleo —
-`ngen/teko_ops.mc`'s `tk_unary_plus`. Baseline local no 0.13.0: 25/25.
+`teko_ops.mc`'s `tk_unary_plus`. Baseline local no 0.13.0: 25/25.
 
 (Registro anterior, 0.12.1:)
 
@@ -573,50 +596,50 @@ de `minicompiler/mc` — **nada de submodule**, e **não se usa binário de dent
 mc** (pode estar à frente do que o CI usa). Troque `macos-arm64` pelo seu alvo:
 
 ```sh
-ver=$(cat ngen/MC_VERSION); tag="v$ver"
+ver=$(cat MC_VERSION); tag="v$ver"
 gh release download "$tag" --repo minicompiler/mc --pattern "mc-$ver-macos-arm64.tar.gz*"
 shasum -a 256 -c "mc-$ver-macos-arm64.tar.gz.sha256"
 mkdir -p ~/.local/mc && tar xzf "mc-$ver-macos-arm64.tar.gz" -C ~/.local/mc
 ln -sf ~/.local/mc/mc-$ver-macos-arm64/mc ~/.local/bin/mc
 ```
 
-O CI PINA a release em `ngen/MC_VERSION` (§3.2) — não resolve `latest` por padrão —, então
+O CI PINA a release em `MC_VERSION` (§3.2) — não resolve `latest` por padrão —, então
 uma release nova do mc só entra no gate quando o arquivo mudar (o processo de bump está no
 §3.2). O binário local segue o mesmo arquivo, para nunca validar contra um `mc` diferente do
 que o CI usa.
 
-**Config de host.** O `ngen/mc.toml` versionado mira `linux/x86_64`, o alvo do CI, e
+**Config de host.** O `mc.toml` versionado mira `linux/x86_64`, o alvo do CI, e
 não linka neste host. Deriva-se um config em scratch — `os = "macos"`,
 `arch = "aarch64"` (`arm64` **não** é aceito; `mc --host` diz o par certo) — sem o
 bloco `[linker]`, para o alvo sair pelo backend `macho-exe` embutido:
 
 ```sh
-sed -e 's#^os   = .*#os   = "macos"#' -e 's#^arch = .*#arch = "aarch64"#' ngen/mc.toml \
-  | grep -v '^\[linker\]' | grep -v '^cmd  = ' | grep -v '^args = ' > ngen/mc.macos.toml
-mc build ngen --config ngen/mc.macos.toml
-./ngen/build/teko-hello; echo $?          # 42
+sed -e 's#^os   = .*#os   = "macos"#' -e 's#^arch = .*#arch = "aarch64"#' mc.toml \
+  | grep -v '^\[linker\]' | grep -v '^cmd  = ' | grep -v '^args = ' > mc.macos.toml
+mc build . --config mc.macos.toml
+./build/teko-hello; echo $?          # 42
 ```
 
 **As fixtures**, no mesmo laço que o CI usa — `--entry-only` reaproveita o compilador
 ensinado em vez de reconstruí-lo por fixture:
 
 ```sh
-for src in ngen/tests/*.tk; do
+for src in tests/*.tk; do
   n=$(basename "$src" .tk); w=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
   sed -e "s#^entry = .*#entry = \"tests/$n.tk\"#" -e "s#^out   = .*#out   = \"build/$n\"#" \
-      ngen/mc.macos.toml > "ngen/mc.$n.toml"
-  ngen/build/teko build ngen --config "ngen/mc.$n.toml" --entry-only && "ngen/build/$n"
-  echo "$n exit=$?  want=$w"; rm -f "ngen/mc.$n.toml"
+      mc.macos.toml > "mc.$n.toml"
+  build/teko build . --config "mc.$n.toml" --entry-only && "build/$n"
+  echo "$n exit=$?  want=$w"; rm -f "mc.$n.toml"
 done
 ```
 
-**Config sempre RELATIVO, cwd no repo** (`ngen/mc.macos.toml`, não `/abs/...`): com caminho
+**Config sempre RELATIVO, cwd no repo** (`mc.macos.toml`, não `/abs/...`): com caminho
 absoluto o módulo trata todo arquivo como "fora do projeto" e a checagem de `internal` fica
 cega — o CI pegou um defeito que a validação absoluta não via (D224).
 
 Hoje isso dá **45/45 em exit 42/70** (o número de fixtures cresceu desde que este texto foi
-escrito; o laço em si não mudou). `ngen/mc.macos.toml`, os `ngen/mc.*.toml` transientes
-e `ngen/build/` **nunca se commitam**, e `ngen/mc.toml` fica intacto por padrão — só o
+escrito; o laço em si não mudou). `mc.macos.toml`, os `mc.*.toml` transientes
+e `build/` **nunca se commitam**, e `mc.toml` fica intacto por padrão — só o
 **crumb que o autoriza explicitamente** (S1, plano §64/§65: `[compiler]` ganhou `core`/
 `modules`; S2, plano §64/§66: `[compiler].out` virou `"build/teko"`) pode tocá-lo, e só
 as chaves que esse crumb nomeia. Editá-lo fora de um crumb autorizado quebra o CI. **S4.1**
@@ -696,7 +719,7 @@ o bloco "C6 LANDADO" logo abaixo da fila da entrega 5).
 
 **Entrega 5 — crumb 0 LANDADO: `this` implícito e `base`** (D219, plano §16), o SWEEP que
 vem antes do reclaim e do C5b porque os dois escreveriam código na forma velha:
-- `ngen/teko_this.mc` (novo) — o receptor que o método não declara. `tk_params`
+- `teko_this.mc` (novo) — o receptor que o método não declara. `tk_params`
   (`teko_class.mc`) prepende `this` e RECUSA um parâmetro `self`; `this` é palavra
   (`syntax_expr`) válida só dentro de corpo de tipo; `base` é CONTEXTUAL (só dentro de
   corpo de tipo — segue nome comum em `i64 offset_total(i64 base, ...)`) e `base.m()`
@@ -710,7 +733,7 @@ vem antes do reclaim e do C5b porque os dois escreveriam código na forma velha:
 - Limite conhecido: **campo array inline** só pelo receptor escrito (`this.items[i]`) —
   o `[` é rebaixado pelo handler do `.`, que o nome nu não alcança; a recusa diz isso
   (`teko: an array field is reached through \`this.\`: items`).
-- As **18 fixtures** foram reescritas na forma nova (`grep -rn self ngen/tests` = 0) e a
+- As **18 fixtures** foram reescritas na forma nova (`grep -rn self tests` = 0) e a
   AST final de 16 delas é **byte-idêntica** à da forma velha depois de renomear o
   receptor (`name=self` → `name=this`); as duas que divergem são `types_class` e
   `types_interface`, onde o `override` passou a usar `base.area()` (a diferença é
@@ -736,7 +759,7 @@ reclaim (construtor/destrutor `public`) e o C5b (`public static … operator+`) 
   Distinguem-se **duas** origens (o projeto e todo o resto), logo `internal` lê-se
   "declaração e sítio de uso têm a mesma origem" — dois pacotes externos distintos não se
   distinguem entre si (o mc não tem identidade de pacote). Local e CI batem: o config é
-  `ngen/mc.*.toml`, o diretório do projeto é `ngen`, e `<float>`/`<mc/core>` ficam de fora.
+  `mc.*.toml`, o diretório do projeto é `ngen`, e `<float>`/`<mc/core>` ficam de fora.
   Declaração que **não vem de arquivo** não pergunta: instância de genérico
   (`p_push_source`, cujo "arquivo" é o nome do frame) recebe a origem do **template**, e
   membro copiado de trait vira membro da **classe**, com a origem dela.
@@ -766,7 +789,7 @@ reclaim (construtor/destrutor `public`) e o C5b (`public static … operator+`) 
 
 **Entrega 5 — crumb "propriedades + interface v2" LANDADO** (D223, plano §20), o modelo de
 membro completo que o reclaim (construtor/destrutor) e o C5b escrevem contra:
-- **`ngen/teko_prop.mc` (novo)** — `T Nome { ... }` em `class`/`struct`/`trait`, nas três
+- **`teko_prop.mc` (novo)** — `T Nome { ... }` em `class`/`struct`/`trait`, nas três
   formas do C#: **auto** (`{ get; set; }`, com campo de apoio `private` gerado, `Nome__backing`),
   **`=> expressão;` / `=> statement;`** (o `set` é um STATEMENT porque `side = value` é um —
   `=` não está na tabela infixa do core) e **bloco** (`get { } set { }`).
@@ -820,7 +843,7 @@ corrompe o layout; base só numa parte antes de membros; interfaces em união; m
   entregando o objeto zerado — é por isso que as 22 fixtures anteriores não mudaram de forma.
   **`~Nome() { }`** é destrutor (sem modificador, sem parâmetro, um por classe), chamado pelo
   release **antes** dos campos, derivada antes da base.
-- **`ngen/teko_rc.mc` (novo)** — o passe que injeta o RC. **Vai no PASSE, não no parse** (ver o §5.2
+- **`teko_rc.mc` (novo)** — o passe que injeta o RC. **Vai no PASSE, não no parse** (ver o §5.2
   abaixo: é a decisão que o crumb mandava reportar). Saída de bloco em ordem reversa, `break N`/
   `continue`/`return`, `x = e`, `p.f = e`, `Tipo.f = e`, `x[i] = e` e o `set` de propriedade,
   `rt_drop` para a referência que ninguém pegou, e **temporários** (`rt_park`/`rt_mark`/`rt_sweep`)
@@ -906,7 +929,7 @@ parâmetro em FUNÇÃO DE TOPO, `i64 add(i64 a, i64 b = 10)` → `add(1)` comple
   byte-idêntica à base.
 
 **Entrega 5 — LOOPS LANDADO** (D218/D221/D226, plano §29; 25 fixtures): `while`, `do ... while`
-e `for` como em C# (`ngen/teko_loop.mc`, novo), rebaixados no PARSE ao `loop`/`if`/`break N` do
+e `for` como em C# (`teko_loop.mc`, novo), rebaixados no PARSE ao `loop`/`if`/`break N` do
 núcleo (mantidos, D221) — a mesma forma que `lib/prelude.mc` já mostra, só que via `syntax_stmt`
 em vez de `#rule`, para caber o rewrite de saltos abaixo e para um `.tk` cru ganhar as palavras
 sem `#include`.
@@ -941,7 +964,7 @@ sem `#include`.
 
 **Entrega 5 — M45 crumb LANDADO** (mc 0.13.0, 25 fixtures): três itens, nenhum novo `.tk`.
 - **Adoção do mc 0.13.0**: `p_cp()` público troca a leitura crua de `cp` em `teko_access.mc`'s
-  `tk_dot_follows`; `ngen/tests/surface_overload_free.tk`'s `chmod` (C ABI, devolve `int`) passa a
+  `tk_dot_follows`; `tests/surface_overload_free.tk`'s `chmod` (C ABI, devolve `int`) passa a
   `extern i32` (D5 — uma chamada devolve o que declara, sign-extended); nenhum outro `extern` do
   `ngen` chama C que devolve `int` (`lib/rt.mc` é 100% `callp`). Sem contorno de "region crosses a
   file boundary" a remover — o núcleo corrigiu o falso positivo, e o `teko_generic.mc` nunca teve um.
@@ -1004,7 +1027,7 @@ sem `#include`.
   `main` dentro de namespace FILE-SCOPED (só o BLOCO é pego, pelo laço que este módulo controla);
   generic declarado dentro de namespace continua com nome CURTO simples (D31.14); instanciação de
   genérico qualificada; `using`/namespace fora do topo do arquivo sem checagem de ordem.
-- **Probes de recusa** (fora de `ngen/tests/`): dois `using` ambíguos
+- **Probes de recusa** (fora de `tests/`): dois `using` ambíguos
   (`teko: ambiguous name Circle (geo, mesh)`); `namespace` sem `{` nem `;`; tipo curto sem
   `using` nem qualificação (`teko: unresolved name: Circle`); `extern`/global/`main` dentro de
   bloco de namespace; `partial` reaberto em outro namespace (confirmado: NÃO funde, cada um só
@@ -1086,7 +1109,7 @@ mais um `using A.B;` implícito, e dois consertos de dívida do verificador do N
   (`teko_access.mc`'s `tk_deny_member`/`tk_check_member` — a mensagem `X.m is private` — usa um
   formato próprio, hífen entre `sr_name_at(owner)` e o membro; fora do grep pedido pelo crumb,
   registrado como achado adjacente, não tocado aqui.)
-- **Fixture** `surface_import.tk` + `ngen/tests/parts/geo.tk` (com `namespace parts.geo;`
+- **Fixture** `surface_import.tk` + `tests/parts/geo.tk` (com `namespace parts.geo;`
   file-scoped): `import parts.geo;` DUAS vezes (once-only), `Circle` sem modificador
   (`internal` por D220) alcançada de dentro do projeto, forma qualificada
   (`parts.geo.Circle`/`parts.geo.twice`) e bare via o `using` implícito, `&twice`/
@@ -1114,7 +1137,7 @@ declaração plana de topo → `using`s (`tk_ns_call_cls`, lido de `teko_class.m
 `tk_method_named_find`, os dois já usados por `teko_this.mc` para o mesmo passe posterior).
 
 **Entrega 5 — CONST LANDADO** (D218, plano §36; 29 fixtures): `const` como açúcar sobre o `#define`
-do mc, `ngen/teko_const.mc` (novo).
+do mc, `teko_const.mc` (novo).
 - **Mecanismo:** NEM `do_directive()` NEM `p_push_source`/laço-de-topo — o handler `syntax("const",
   &tk_const_top)` chama `fold(parse_expr(0))` (o mesmo que `#define` chama) e `def_add(nome, valor,
   linha, arquivo)` DIRETO, o mesmo par que o `enum` demo do próprio mc usa (`mc docs/reference/
@@ -1175,7 +1198,7 @@ do mc, `ngen/teko_const.mc` (novo).
   pelo `using`. Nenhum dos dois é tocado por este crumb.
 
 **Entrega 5 — TERNÁRIO LANDADO** (D228, plano §37; 30 fixtures): `c ? a : b`, associativo à
-direita, mesma precedência de `||` (`ngen/teko_ternary.mc`, novo).
+direita, mesma precedência de `||` (`teko_ternary.mc`, novo).
 - **Mecanismo:** o núcleo não tem controle de fluxo em posição de expressão, então
   `syntax_infix("?", TK_TERN_PREC, &tk_tern_infix)` só constrói um PLACEHOLDER — chamada a
   `tk_ternary(c, a, b)`, o mesmo truque de `tk_defer_member` (se o passe não rodar, o núcleo
@@ -1218,7 +1241,7 @@ direita, mesma precedência de `||` (`ngen/teko_ternary.mc`, novo).
   comum sem `[i]=v;` (achado do crumb `const`) segue sem fechamento — fora do escopo do ternário.
 
 **Entrega 5 — SWITCH LANDADO** (D222/D228, plano §19/§38; 31 fixtures): as duas vertentes do C#,
-`ngen/teko_switch.mc` (novo).
+`teko_switch.mc` (novo).
 - **Statement** (`syntax_stmt("switch")`) rebaixa, no PARSE, a um `loop` de uma volta: `x` lido
   UMA vez (`i64 $t = x;`, o 1º statement do loop), um `if` por grupo de rótulos que compartilha um
   corpo (`case 2: case 3: … break;` — rótulo vazio cai no próximo; corpo não-vazio tem de terminar
@@ -1284,7 +1307,7 @@ direita, mesma precedência de `||` (`ngen/teko_ternary.mc`, novo).
 **Entrega 5 — ARRAYS FIXOS LANDADO** (plano §39; 32 fixtures): `T a[N];` local e global, `a[i]`,
 `a[i] = e`, `a[i] += e`/`-=`/`++`/`--` e `a.Length` — o núcleo já lê a DECLARAÇÃO (`N_VAR`/
 `N_GLOBAL` com `nd_val` = a contagem, `language.md` § Locals/§ Globals); o `[`/`.` são só deste
-crumb (`ngen/teko_array.mc`, novo). Um fix pequeno do `switch` num commit separado (abaixo).
+crumb (`teko_array.mc`, novo). Um fix pequeno do `switch` num commit separado (abaixo).
 - **LOCAL, resolvido no parse** — a mesma máquina do campo-array de `teko_struct.mc`. O `N_VAR` de
   um array é observado por um SEGUNDO `on_stmt` (`tk_arr_on_stmt`, ao lado do `tk_on_stmt` que já
   existia) e registrado numa tabela própria (`av_*`/`tk_narr`), com escopo por bloco: `tk_block`
@@ -1397,7 +1420,7 @@ não se generaliza): medido com um handler forçado a devolver um valor distinto
 disparou para `-x` — `parse_unary()` do núcleo acha `-`/`!`/`~` na sua PRÓPRIA tabela de
 prefixo (`ops_init`) e resolve o `N_UNARY` ali, sem nunca chegar em `parse_primary` (onde
 `syntax_expr` mora). Só `+` reaparece por `syntax_expr` porque `ops_init` nunca o
-registrou. A correção real é em `tk_dot`/`tk_bracket` (`ngen/teko_prefix.mc`, novo):
+registrou. A correção real é em `tk_dot`/`tk_bracket` (`teko_prefix.mc`, novo):
 sinkam pela cadeia de `- ! ~` até o operando de verdade, resolvem o `.`/`[` NELE, e
 reembrulham o resultado na mesma cadeia — `-a.x` vira o mesmo `N_UNARY(-, DOT(a,x))` que
 o núcleo constrói para `-(a.x)` escrito com parênteses. `tk_bracket` ganhou uma guarda
@@ -1416,7 +1439,7 @@ not a place`); a declaração de `tk_bracket_no_write` mudou de `teko_params.mc`
 `teko_prefix.mc`, seu dono lógico.
 
 **K1 LANDADO (entrega 5, D221/§41, 2026-09-05):** `delegate` nomeado, ponteiro de função tipado,
-`callp` tipado, `null`. Arquivos: `ngen/teko_deleg.mc` (novo — a tabela de assinatura `dg_*`,
+`callp` tipado, `null`. Arquivos: `teko_deleg.mc` (novo — a tabela de assinatura `dg_*`,
 `tk_delegate`, o wrap `Op f = fn;`/`new Op(fn)` via thunk memoizado por (delegate, função), a
 chamada `f(a, b)` rebaixada num `pass()`), `teko_struct.mc` (`TK_KDELEG`, `tk_is_deleg`,
 `tk_is_counted` — zero linha nova em `teko_rc.mc` além de generalizar `tk_rc_needed` para
@@ -1462,7 +1485,7 @@ parâmetro não dependem dele); **K4** lambda/função local/`use` (estende `tek
 
 **Item 0 LANDADO** (entrega 5, 2026-09-05, commit separado antes do K2): `Op f = 5;` compilava
 limpo e segfaultava — `tk_deleg_var` só interceptava um inicializador `N_IDENT`. `tk_deleg_coerce`
-(`ngen/teko_deleg.mc`) é o validador único que os quatro sítios de um slot de delegate agora usam
+(`teko_deleg.mc`) é o validador único que os quatro sítios de um slot de delegate agora usam
 (var, atribuição de nome nu, `return`, argumento de chamada não-sobrecarregada): `null`, um valor
 já tipado (local/param/campo/retorno/chamada-aninhada-por-delegate, via `tk_deleg_expr_ty`), ou um
 nome de função compatível (embrulhado no mesmo thunk de sempre) passam; qualquer outra coisa é
@@ -1474,7 +1497,7 @@ mais construído com `nd_type` = apontado; nasce com largura de PONTEIRO e o apo
 `tk_param_ty`/`tk_decl_param_ty`, inclusive para `tk_ty_scope_params`, que por isso mudou* --:
 `ref T`/`out T`, C#'s by-reference, sobre uma
 tabela de apontado chaveada pelo NÓ do parâmetro (não `(owner, idx)` — dois desvios medidos, ver
-plano §43). `ngen/teko_ref.mc` (novo) — `type_new("ref"/"out", 8, 8, TK_INT)`, a tabela
+plano §43). `teko_ref.mc` (novo) — `type_new("ref"/"out", 8, 8, TK_INT)`, a tabela
 `tk_rp_add`/`tk_rp_kind`/`tk_rp_pointee`, o mangling `tk_ty_sfx(p)`, o sítio obrigatório
 `syntax_expr("ref"/"out")` (`tk_ref_arg`/`tk_out_arg`, tageado por `tk_rfarg_tag` para o validador
 de chamada e o casador de sobrecarga distinguirem um endereço-por-`ref` de um valor que só parece
@@ -1513,11 +1536,11 @@ palavra de itab que ninguém usa), contagem, e daí `len`/os dados -- `rc_dec` l
 saber nada sobre ele, através da MESMA máquina que já libera classe/interface/delegate
 (`tk_is_counted` estendido, zero linha nova em `teko_rc.mc`).
 
-Arquivos: `ngen/teko_struct.mc` (`TK_KARRAY`, `tk_is_ha`, `tk_ha_row` -- memoizado por elemento,
+Arquivos: `teko_struct.mc` (`TK_KARRAY`, `tk_is_ha`, `tk_ha_row` -- memoizado por elemento,
 a palavra reservada é a forma com colchetes `"i64[]"`/`"Circle[]"`, um lexema que o lexer nunca
 forma, o mesmo truque de `lib/user_typearr.mc` do mc; `tk_ty_mangle_name`, a forma SEGURA pra um
 símbolo mangled, `"arr_i64"`, já que a palavra reservada do tipo carrega `[`/`]` e um símbolo não
-pode; a tabela `tk_hp_*`, ver abaixo), `ngen/teko_heaparr.mc` (novo -- `tk_ha_type` o handler
+pode; a tabela `tk_hp_*`, ver abaixo), `teko_heaparr.mc` (novo -- `tk_ha_type` o handler
 `syntax_type`, `tk_new_array`, `tk_ha_index` leitura/escrita/`+=`/`-=`/`++`/`--`, `tk_ha_member_of`
 o `.Length` só-leitura, `tk_ha_deleg_call` pra `ops[i](args)` sobre um `Op[]`, e o gerador
 vtable/release/alloc por elemento, lazy no primeiro `new`), `lib/rt.mc` (`tk_arr_at(a, i, w)`, o
@@ -1827,7 +1850,7 @@ dreno — branch `feat/ngen-k5-foreach`, forward-only para `fix/retirement`.
 
 **O1 LANDADO** (§50, 2026-09-05): ordem LIVRE de declaração de tipos, o débito do C6 -- um campo,
 um parâmetro, um tipo de retorno, um local ou um global agora resolvem um `class`/`struct`/
-`interface`/`delegate` declarado ABAIXO. A causa-raiz: `ngen/teko_fwd.mc` (novo) varre os BYTES
+`interface`/`delegate` declarado ABAIXO. A causa-raiz: `teko_fwd.mc` (novo) varre os BYTES
 crus da fonte de entrada (`tk_fwd_init`, primeira linha de `user_init`, ANTES do prelúdio de
 `tk_loop_init`) e de todo arquivo que um `import` empurra (`tk_ns_pass`-side, `teko_ns.mc`'s
 `tk_import`), pulando comentário/string/char/diretiva, seguindo `namespace A.B {`/`namespace
@@ -1856,7 +1879,7 @@ que orfanaria o id -- `alias_add` nunca recusa uma segunda registração do mesm
 (logo após `tk_ns_pass`) varre a tabela da varredura: uma linha ainda `TK_PFWD` no fim da unidade é
 o backstop de um falso positivo (decisão 14) -- `is used but never declared`.
 
-Fixture: `ngen/tests/order_types.tk` (`expect-exit: 42`) -- `Holder`/`ShapeUser` usam `Circle`
+Fixture: `tests/order_types.tk` (`expect-exit: 42`) -- `Holder`/`ShapeUser` usam `Circle`
 (namespaced, via `using Geo;` escrito ANTES do `namespace Geo { class Circle }`) e `Shape` (tipo
 plano) como campo, parâmetro e retorno, ambos declarados abaixo; `BoxUser`/`OpUser` têm um local
 `Box b = null;`/`Op f = null;` de classe e delegate declarados mais abaixo ainda; `TraitUser` tem
@@ -1953,7 +1976,7 @@ deferidos para um pass, fechando o bloco §50 (b2) inteiro e três ressalvas do 
   com `expected ; after expression` -- nenhum programa sintaticamente válido chega a acionar SÓ esse
   backstop).
 
-Gate: `rm -rf ngen/build`, build do zero; `--entry-only` **40/40** (nenhuma fixture nova); `--dump-ast`
+Gate: `rm -rf build`, build do zero; `--entry-only` **40/40** (nenhuma fixture nova); `--dump-ast`
 das **39 não tocadas byte-idêntico** ao compilador da base `d9e51b5b` (`same=39 diff=0`); `mc limits`
 `verdict ok`, `intrin` 8/16 nos dois lados (zero intrínseco novo), `passes` 14/13 (a mesma `tk_fwd_pass`
 do O1, sem pass nova -- O2 estendeu o corpo dela).
@@ -2023,7 +2046,7 @@ errata). Sem PR, sem dreno -- branch `feat/ngen-o2-defer`, forward-only para `fi
   limitada pelo tamanho do ciclo, não infinita) e a mensagem sai correta; só não é o caminho mais
   curto possível -- aceitável, já que é um programa que nunca compilaria de qualquer forma.
 
-Gate: `rm -rf ngen/build`, build do zero; `--entry-only` **41/41** (as 40 anteriores + `order_bases`);
+Gate: `rm -rf build`, build do zero; `--entry-only` **41/41** (as 40 anteriores + `order_bases`);
 `--dump-ast` das **40 anteriores byte-idêntico** ao compilador da base `7113acbd` (`same=40 diff=0`);
 `mc limits` `verdict ok`, `intrin` 8/8 nos dois lados (zero intrínseco novo), `passes`/`syntax` 14/14
 (nenhuma pass/palavra nova -- O3 só estendeu corpos já registrados por O1/O2).
@@ -2067,7 +2090,7 @@ O3 registrou (`teko_iface.mc`, "`interface` ainda não tem `:` própria") fecha 
   `tk_interface()`'s `"interface with no methods"` só dispara quando `sr_mn_at(si) == 0 E
   tk_iface_nbase(si) == 0` -- uma interface que só reúne bases não é mais "sem métodos" quando as
   bases têm os seus.
-- **Fixture** `ngen/tests/surface_iface_inherit.tk` (exit 42): `I2 : I1` com `Sq : I2` respondendo
+- **Fixture** `tests/surface_iface_inherit.tk` (exit 42): `I2 : I1` com `Sq : I2` respondendo
   aos dois -- `i2.area()` (só de `I1`, despachado fundo) e `i2.tag()` (de `I2`); `I1 x = q` chamando
   o mesmo `area()` direto; `Sq.unit()` (`static abstract` de `I1`, herdado); diamante `IC : IA, IB`
   com `m()` repetido nas duas e uma única implementação em `Box`, as três formas (`IA`/`IB`/`IC`)
@@ -2076,7 +2099,7 @@ O3 registrou (`teko_iface.mc`, "`interface` ainda não tem `:` própria") fecha 
   `teko: cyclic interface base`; método herdado não implementado -- `... not implemented (via
   \`I2\`)`; base declarada abaixo (com corpo default) -- funciona de primeira, sem dívida.
 
-Gate: `rm -rf ngen/build`, build do zero; `--entry-only` **42/42** (as 41 anteriores + a nova);
+Gate: `rm -rf build`, build do zero; `--entry-only` **42/42** (as 41 anteriores + a nova);
 `--dump-ast` das **41 anteriores byte-idêntico** ao compilador da base `86bc343d` (`same=41 diff=0`);
 `mc limits` `verdict ok`, `intrin` 8/16 nos dois lados (zero intrínseco novo), `passes` 14/14 (zero
 pass nova -- I1 só estendeu `tk_interface`/`tk_conf_apply`/os três sítios de despacho de método).
@@ -2099,7 +2122,7 @@ Sem PR, sem dreno -- branch `feat/ngen-i1-iface`, forward-only para `fix/retirem
   DECLARANTE (não mais o tipo estático do receptor); `tk_pend_iface` (teko_typeof.mc, o mesmo `.`
   quando só o `pass()` tipa o receptor -- um parâmetro); `tk_this_iface_prop` (teko_this.mc, `X`/`X
   = e` bare dentro do corpo DEFAULT de uma interface que ela mesma não declara, herdado de uma base).
-- **Fixture** `ngen/tests/surface_iface_inherit.tk` cresceu (exit 42 recalculado): `I1` ganhou
+- **Fixture** `tests/surface_iface_inherit.tk` cresceu (exit 42 recalculado): `I1` ganhou
   `i64 Value { get; set; }`; `I2 : I1` ganhou um corpo DEFAULT `doubled()` que lê `Value` bare (só de
   `I1`); `Sq` implementa `Value` como auto-propriedade própria; `bump_via_i2(I2 v)` lê e escreve
   `v.Value` sobre um PARÂMETRO (o sítio pass-deferred). `checks()` cobre os quatro sítios: getter e
@@ -2109,7 +2132,7 @@ Sem PR, sem dreno -- branch `feat/ngen-i1-iface`, forward-only para `fix/retirem
   programa contra o compilador PRÉ-fix reproduz o defeito relatado ao pé da letra --
   `teko: unknown member of I2: Value`; com o fix, compila e roda.
 
-Gate: `rm -rf ngen/build`, build do zero; `--entry-only` **42/42** (nenhuma fixture nova, uma
+Gate: `rm -rf build`, build do zero; `--entry-only` **42/42** (nenhuma fixture nova, uma
 tocada); `--dump-ast` das **41 fixtures não tocadas byte-idêntico** (`same=41 diff=0`); `mc limits`
 `verdict ok`, `intrin` 8/8, `passes`/`syntax` 14/14 nos dois lados (zero intrínseco/pass/palavra
 nova -- I1b só estendeu três sítios de despacho já existentes).
@@ -2151,7 +2174,7 @@ registrou e a última fila do §50.
   compila e roda, usado BARE de dentro do próprio namespace; colisão de nome entre dois namespaces
   cada um com seu próprio `T[]` global fica sem resolver, mesma classe das outras dívidas de
   qualificação que este arquivo já lista.
-- **Fixture** `ngen/tests/surface_array_global.tk` (exit 42): `i64[] g;` com `n` de runtime,
+- **Fixture** `tests/surface_array_global.tk` (exit 42): `i64[] g;` com `n` de runtime,
   `g[i]`/`g[i] = e`/`+=`/`-=`/`++`, `g.Length` em `while` E em `for`; `u8[]`/`i32[]` globais provando
   largura e sinal; `Circle[] cs` global -- um ROOT, `rt_live()` medido ANTES do `circlecheck()` (os
   outros globais heap já são roots por si, então o piso muda antes dele) sobe `+4` e NUNCA volta;
@@ -2161,7 +2184,7 @@ registrou e a última fila do §50.
   the end of an array`, exit 70; `foreach (i64 x in g)` sobre o global -> `teko: not a known array: g`
   (a dívida já registrada do K3/§50, recusa clara, sem tabela nova).
 
-Gate: `rm -rf ngen/build`, build do zero; `--entry-only` **43/43** (as 42 anteriores + a nova);
+Gate: `rm -rf build`, build do zero; `--entry-only` **43/43** (as 42 anteriores + a nova);
 `--dump-ast` das **42 anteriores byte-idêntico** ao compilador da base `20d78560` (`same=42
 diff=0`); `mc limits` `verdict ok`, `intrin` sem crescimento, `passes` sem pass nova (G1 só estendeu
 `tk_array_pass`, já registrado).
@@ -2180,7 +2203,7 @@ de nome (este crumb); `params T[]`, `T[][]`, `ref`/`out T[]`; covariância de in
 **DI1 LANDADO** (D229, plano §58; 44 fixtures): os três marcadores de lifetime
 (`IServiceSingleton`/`IServiceScoped`/`IServiceTransient`), o registro em comptime e `inject T` de
 um singleton sem dependência.
-- **`ngen/teko_di.mc` (novo).** Um marcador é um NOME que `tk_di_marker` reconhece onde a lista `:`
+- **`teko_di.mc` (novo).** Um marcador é um NOME que `tk_di_marker` reconhece onde a lista `:`
   já lê um (`tk_conf_name`, teko_class.mc:1159; `tk_iface_base_name`, teko_iface.mc) -- ANTES de
   qualquer busca na tabela de tipos, então um programa sem os três nomes nunca cria uma linha, um
   global ou um símbolo por causa deste arquivo (§58 (h) risco 1: o laço de `tk_di_pass` sobre uma
@@ -2202,7 +2225,7 @@ um singleton sem dependência.
   (`IClock a = inject IClock;`) recebe `xt_pure = 1` só depois que o passe resolve o lifetime, então
   `tk_rc_var` incrementa via `rt_own` como qualquer valor emprestado; o objeto do singleton nunca é
   liberado (a 1ª referência, a da própria alocação, nunca é decrementada -- `rt_live()` prova o piso).
-- **Fixture** `ngen/tests/surface_di.tk`: `Clock : IClock, IServiceSingleton`, duas injeções (uma
+- **Fixture** `tests/surface_di.tk`: `Clock : IClock, IServiceSingleton`, duas injeções (uma
   pela interface, outra pela classe concreta) provando a MESMA instância (`tick()` chega a 2),
   `rt_live() == 1` no fim (o singleton, nunca liberado). Probes (fora de `tests/`, descartados):
   marcador numa `interface`; dois marcadores na mesma classe; `abstract class : IServiceScoped`;
@@ -2210,7 +2233,7 @@ um singleton sem dependência.
   da mesma chave; construtor que só aceita um argumento não-serviço -- as cinco primeiras batem as
   mensagens exatas do plano, as duas últimas (fora da lista do crumb) confirmam a máquina de qualquer
   forma.
-- Gate: `rm -rf ngen/build`, build do zero; `--entry-only` **44/44**; `--dump-ast` das **43
+- Gate: `rm -rf build`, build do zero; `--entry-only` **44/44**; `--dump-ast` das **43
   anteriores byte-idêntico** ao compilador da base `b95d14ec` (`same=43 diff=0`); `mc limits ngen`
   `verdict ok`, `passes` 14->15 (`tk_di_pass`), `intrin` sem crescimento (8->8). A tabela `syntax`
   do relatório fica em 14 nos dois lados -- ela é o MÁXIMO entre `syntax()`/`syntax_stmt()`/
@@ -2255,7 +2278,7 @@ ciclo, e a emissão do singleton em cadeia -- mais o item herdado do verificador
   variable before calling it`. A recusa antiga (`tk_pure`, "a virtual call needs a name or a field on
   the left") só cobria a dupla leitura da vtable; um método comum (`slot < 0` em `tk_emit_call`) nunca
   a consultava, e `inject Widget.tag()` compilava.
-- **Fixture** `ngen/tests/surface_di.tk` cresce para a cadeia de três níveis `Svc(IRepo, IClock) <-
+- **Fixture** `tests/surface_di.tk` cresce para a cadeia de três níveis `Svc(IRepo, IClock) <-
   Repo(IDb) <- Db`: `Db(i64 seed = 5)` (construtor com um parâmetro default preenchido, sem
   dependência nenhuma), `Repo(IDb db)` e `Svc(IRepo repo, IClock clock)` (cada um injetado por
   construtor), uma chamada através da interface (`IRepo r = inject IRepo; r.load()`, provando o
@@ -2263,7 +2286,7 @@ ciclo, e a emissão do singleton em cadeia -- mais o item herdado do verificador
   (fora de `tests/`, descartados): ciclo `A -> B -> A`; duas implementações da chave pedida por um
   construtor; construtor que pede `i64` sem default; dois construtores com a mesma contagem
   injetável; `inject Widget.tag()` sobre método comum.
-- Gate: `rm -rf ngen/build`, build do zero; `--entry-only` **44/44**; `--dump-ast` das **43 fixtures
+- Gate: `rm -rf build`, build do zero; `--entry-only` **44/44**; `--dump-ast` das **43 fixtures
   não tocadas byte-idêntico** ao compilador da base `39a75156` (`same=43 diff=0`); `mc limits ngen`
   `verdict ok`, zero linha `grew` (`intrin` 8->8, `passes` 15->15, `syntax` 14->14 -- DI2 não abre
   hook novo, só cresce funções dentro de `teko_di.mc`/`teko_expr.mc`).
@@ -2288,11 +2311,11 @@ próprio id -- o interno NÃO herda os Scoped do externo (instâncias PRÓPRIAS,
 própria numeração léxica, sem mecanismo extra. Um Singleton constrói seu grafo sob o sentinela
 `tk_scope_svcbld`, que recusa um parâmetro Scoped com mensagem própria (`teko: a singleton taking
 a scoped service is not taught yet`) -- o escopo PRÓPRIO do singleton (decisão 11) é DI4.
-Fixture: `ngen/tests/surface_di_scope.tk` (duas injeções do mesmo Scoped no mesmo `scope { }`,
+Fixture: `tests/surface_di_scope.tk` (duas injeções do mesmo Scoped no mesmo `scope { }`,
 dois `scope { }` seguidos, Transient fresco a cada injeção partilhando o Scoped do escopo
 hospedeiro, `scope { }` aninhado, `return` de dentro do escopo, `rt_live()`/contador de destrutor
 de volta ao piso). Probes (fora de `tests/`, descartados): `scope` sem `{`; `scope { }` dentro de
-um `loop` (uma instância por volta, `rt_live()` plano). Gate: `rm -rf ngen/build`, build do zero;
+um `loop` (uma instância por volta, `rt_live()` plano). Gate: `rm -rf build`, build do zero;
 `--entry-only` **45/45**; `--dump-ast` das **44 anteriores byte-idêntico** ao compilador da base
 `01f5c81a` (`same=44 diff=0`); `mc limits ngen` `verdict ok`, `intrin` sem crescimento (8->8, com
 e sem `scope` no programa).
@@ -2355,7 +2378,7 @@ duas classes implementando interfaces com base comum -> `two services implement`
 de lambda dentro de `scope { }` -> mensagem própria; `inject` dentro de lambda SEM `scope { }` ->
 funciona; `inject app.ICache` sem `app` existir -> `unknown type after inject: app`.
 
-Gate: `rm -rf ngen/build`, build do zero; `--entry-only` **45/45**; `--dump-ast` das **43
+Gate: `rm -rf build`, build do zero; `--entry-only` **45/45**; `--dump-ast` das **43
 fixtures não tocadas byte-idêntico** ao compilador da base `8d8721ff` (`same=43 diff=0`); `mc
 limits ngen` `verdict ok`, `intrin` sem crescimento (8->8), `passes`/`syntax` inalterados (nenhum
 passe/hook novo -- DI4 reusa `tk_di_pass`/`inject`/`scope` de DI1-DI3).
@@ -2383,7 +2406,7 @@ explícita, decoração/substituição de registro, serviço com chave (`[FromKe
   `inject` (`tk_di_ctor_args`) precisou do MESMO tag (`tk_xt_add`), com `pure` fazendo trabalho de
   verdade: a 1ª tentativa marcou `pure=0` e `surface_di.tk` quebrou em runtime ("reference count
   below zero") porque o getter memoizado devolve referência EMPRESTADA, não fresca.
-- **Item 2** -- `tk_arr_at` (`ngen/lib/rt.mc`) ganhou o guard `if (a == 0) panic(...)` antes do
+- **Item 2** -- `tk_arr_at` (`lib/rt.mc`) ganhou o guard `if (a == 0) panic(...)` antes do
   `ld64(a+16)` que segfaultava num `T[]` nunca atribuído -- aditivo puro, as mesmas 7 linhas em
   todo fixture que inclui `rt.mc`.
 - **Item 3** -- `tk_lam_check_name` (`teko_deleg.mc`) parava de recusar global/`const`/função livre
@@ -2396,18 +2419,18 @@ explícita, decoração/substituição de registro, serviço com chave (`[FromKe
   tabela de captura de forma síncrona, risco não justificado por uma melhoria cosmética.
 - **Fixtures:** `surface_iface_inherit.tk` ganhou `Animal`/`Dog` (derivada->base, ao lado do
   class->interface já existente); `surface_lambda.tk` ganhou `global_const_free_check` (item 16,
-  zero `use (...)`). Zero fixture nova. Gate: `rm -rf ngen/build`; build do zero; `--entry-only`
+  zero `use (...)`). Zero fixture nova. Gate: `rm -rf build`; build do zero; `--entry-only`
   **45/45**; `--dump-ast` das 43 fixtures não tocadas byte-idêntico contra `088bf795`, `same=43`
   fora do universo de `rt.mc` (que ganha só a linha aditiva do item 2 em todo fixture que o inclui);
   `mc limits ngen` `verdict ok`. Probes das recusas (item 1: classe não relacionada, interface não
   implementada, downcast, `T[]`/delegate de tipo diferente, argumento errado, retorno errado; item 2:
   índice em array nulo, exit 70; item 3: nome genuinamente desconhecido) rodados fora de
-  `ngen/tests/` e descartados, não commitados.
+  `tests/` e descartados, não commitados.
 
 **S1 LANDADO** (D225, plano §64/§65 — auto-hospedagem etapa 1, "as partes em vez do bundle").
-`ngen/core_teko.mc` (novo) traz `<mc/core_machines>`/`<mc/core_writers>`/`<mc/core_build>`/
+`core_teko.mc` (novo) traz `<mc/core_machines>`/`<mc/core_writers>`/`<mc/core_build>`/
 `<mc/core_bundle>` + `main()` (`host_init`, os quatro `*_init`, `mc_build_init()` — S1 ainda o
-chama, D64.3 tira na S2 — e `mc_main`); `ngen/mc.toml` `[compiler]` ganhou `core = "<mc/core_min>"`
+chama, D64.3 tira na S2 — e `mc_main`); `mc.toml` `[compiler]` ganhou `core = "<mc/core_min>"`
 e `modules = ["core_teko.mc", "teko.mc"]`. `<mc/core_pkg>`/`<mc/core_sandbox>` ficam de fora — nada
 sob `ngen/` chama `pkg`/`update`/`sandbox`. Medido no host macOS/aarch64, `mc` 0.15.5: binário
 **1 489 364 B** contra **1 588 681 B** do bundle inteiro (**−6,25 %**, bate a previsão do §64(b));
@@ -2421,14 +2444,14 @@ usage sem argumento perdeu as 5 linhas de `pkg`/`update`/`sandbox`, manteve as 6
 `out     = ` de `[compiler]`, 5, é o que impede o `sed` de tocar o segundo) — nenhuma mudança em
 `ngen.yml`. Tabela completa em `docs/design/plano-ngen-entrega4.md` §65.
 
-**S1m LANDADO** (mesmo crumb): `ngen/scripts/measure.sh`, POSIX `sh`, dado o binário + o config
+**S1m LANDADO** (mesmo crumb): `scripts/measure.sh`, POSIX `sh`, dado o binário + o config
 imprime bytes, seções (`--dump-syms` sobre o `.mc` gerado, técnica de `scripts/check-parts.sh` do
 mc, sem nome de seção hardcoded — Mach-O/ELF/COFF diferem) e `mc limits DIR --config CONFIG`.
-Roda local hoje (`sh ngen/scripts/measure.sh ngen/build/mc-teko ngen/mc.macos.toml ngen`); ainda
-NÃO ligado ao CI (S4.3 decide isso). `ngen/mc.toml` é o **único** arquivo deste crumb que muda fora
+Roda local hoje (`sh scripts/measure.sh build/mc-teko mc.macos.toml ngen`); ainda
+NÃO ligado ao CI (S4.3 decide isso). `mc.toml` é o **único** arquivo deste crumb que muda fora
 da adição de arquivos novos — a nota do §4 abaixo reflete essa autorização pontual.
 
-**S2 LANDADO** (`ngen/core_teko.mc`, `ngen/teko.mc`, `ngen/mc.toml`, `.github/workflows/ngen.yml` —
+**S2 LANDADO** (`core_teko.mc`, `teko.mc`, `mc.toml`, `.github/workflows/ngen.yml` —
 plano §64/§66): `teko` ganhou driver próprio. `main()` troca `mc_build_init()` (D64.3) pelas peças
 públicas que ela é feita de (`lex_set_libs`/`sysroots_init`/`on_plan(&mc_plan)`) + a tabela própria
 de subcomandos (`tk_build`/`tk_limits`), e intercepta `argc < 2` para chamar `subcommand_usage()`
@@ -2438,39 +2461,39 @@ direto — achado fora do §64(c): `mc` sem argumento cai primeiro nas três lin
 driver; `tk_limits` (achado adicional, dentro do escopo — é o próprio critério de aceite do §64(f))
 faz o mesmo para o `.tk` que o `drv_is_source` do núcleo (só `.mc`) não reconhecia. `[compiler].out`
 virou `"build/teko"` (única chave tocada); `ngen.yml` trocou a UMA linha que nomeava
-`ngen/build/mc-teko` (o laço de fixtures) por `ngen/build/teko`. Prova: build do zero, **45/45**
+`build/mc-teko` (o laço de fixtures) por `build/teko`. Prova: build do zero, **45/45**
 via `teko build ... --entry-only`; `--dump-ast` das 45 contra a base `477ea715` — `same=45 diff=0`;
 `mc limits ngen` `verdict ok`; `teko` sem argumento — só as duas linhas, exit 1; `teko limits
-ngen/tests/hello.tk` roda (exit 3, o "grew" normal de um arquivo avulso sem plano de projeto).
+tests/hello.tk` roda (exit 3, o "grew" normal de um arquivo avulso sem plano de projeto).
 Detalhe completo em `docs/design/plano-ngen-entrega4.md` §66.
 
-**S2d LANDADO** (mesmo crumb, plano §66 + `ngen/README.md`): censo `type_disable`/
+**S2d LANDADO** (mesmo crumb, plano §66 + `README.md`): censo `type_disable`/
 `intrinsic_disable` (D64.6) — **lista vazia**. `bool`/`char`/`byte`/`isize`/`usize`/`ptr`/`str` são
 `type_alias` (identidade, nada a desabilitar); `f32`/`f64` vêm do `type_new` de `<float>`, só
 conectados; `i32`/`ld64`/`st64`/`ld8`/`st8`/`ld32`/`callp` são usados pelas fixtures E pelos fontes
 do núcleo (desabilitar qualquer um quebraria a auto-hospedagem da etapa 4). Nenhum código muda.
 
-**S3 LANDADO** (`ngen/teko.mc`, `ngen/user.mc` (novo), `ngen/mc.toml` — plano §64(d)/§67, D64.7):
+**S3 LANDADO** (`teko.mc`, `user.mc` (novo), `mc.toml` — plano §64(d)/§67, D64.7):
 o pacote `teko`, "ambos" (módulo + runtime versionados juntos). `teko.mc` para de definir
 `user_init` e passa a exportar `void teko_init()` — mesmo corpo, só o nome, seguindo
 `docs/reference/packages.md` §3 ("um pacote nunca define `user_init`; exporta `<nome>_init()` e o
 projeto o chama") e o precedente `tests/pkg/src/teach-1.0.0` do mc (`module = "mc_teach.mc"`,
-exporta `teach_init()`). `ngen/user.mc` é NOVO, do PROJETO — não do pacote —, seis linhas:
-`void user_init() { teko_init(); }`. `ngen/mc.toml`'s `[compiler].modules` ganha `"user.mc"` no
+exporta `teach_init()`). `user.mc` é NOVO, do PROJETO — não do pacote —, seis linhas:
+`void user_init() { teko_init(); }`. `mc.toml`'s `[compiler].modules` ganha `"user.mc"` no
 fim (depois de `"teko.mc"`, para `teko_init()` já estar declarado). `[package]` novo: `name =
 "teko"`, `lib = "lib/rt.mc"` (o que um PROGRAMA inclui), `module = "teko.mc"` (o que um COMPILADOR
 inclui), `files` = os 30 `teko_*.mc` irmãos + `teko.mc` + `lib/rt.mc` (**`core_teko.mc` e
 `user.mc` FICAM DE FORA** — são deste repositório, não do pacote: mesmo precedente
 `teach-1.0.0`, cujo `files` só lista `mc_teach.mc`, nunca o `user.mc`/driver que o consome), `check
 = ["teko.mc", "lib/rt.mc"]` (as duas unidades que `[package]`'s "ambos" produz; toda entrada já
-está em `files`). Nenhuma outra chave de `ngen/mc.toml` muda.
+está em `files`). Nenhuma outra chave de `mc.toml` muda.
 
-Gate: `rm -rf ngen/build`; build do zero (host macOS/aarch64, `mc` 0.15.5); `--entry-only`
+Gate: `rm -rf build`; build do zero (host macOS/aarch64, `mc` 0.15.5); `--entry-only`
 **45/45**; `--dump-ast` das 45 contra o compilador da base `faac4d56` — `same=45 diff=0`; `mc
 limits ngen` `verdict ok` (mesma régua de S1/S2 — `teko limits ngen`, diretório, recompila o
 próprio `build/teko.mc` PELO teko taughtado e bate na colisão de palavra `type` do §64(e)/S4 —
 esperado, fora de escopo aqui, não é regressão de S3: o comando certo para esta medição é sempre `mc
-limits ngen`, o binário de RELEASE, como S1/S2 já faziam); `teko limits ngen/tests/hello.tk`
+limits ngen`, o binário de RELEASE, como S1/S2 já faziam); `teko limits tests/hello.tk`
 inalterado (exit 3, "grew", mesmo de sempre). `mc pkg hash ngen` **estável** entre dois runs —
 `0f85d3fbbced52f69716fd36366c9209cea99a706121de3962061e1a8435fce4` — e **idêntico** rodando de
 dentro de `ngen/` com `mc pkg hash .` (confirma a correção do `dep_under` do mc 0.15.4 para
@@ -2478,14 +2501,14 @@ dentro de `ngen/` com `mc pkg hash .` (confirma a correção do `dep_under` do m
 mc.lock" (sem `[deps]`, sem lock, exit 0); `mc pkg check` não se aplica aqui — lê um `index/
 <nome>.toml` de REGISTRO, não uma árvore local, e o registro segue fechado (§64(d) mesmo
 bloqueio: "tudo menos a publicação pode ser feito hoje"). `.github/workflows/ngen.yml` **não
-muda**: o `awk`/`sed` que deriva `ngen/mc.ci.toml` só corta a seção `[linker]` e reescreve
+muda**: o `awk`/`sed` que deriva `mc.ci.toml` só corta a seção `[linker]` e reescreve
 `[target]`/`entry`/`out` — `[package]` (sem `out`, sem `[linker]`) atravessa intacto, inerte, como
 qualquer outra seção nova já demonstrou em S1 com `[compiler]`. Publicação (Release + tree hash +
 PR em `minicompiler/mc-registry`) fica de fora, como o crumb previu — o registro do mc ainda não
 abriu para o `teko`.
 
 **S4.1 LANDADO** (plano §64(f)/§68): dois commits. (1) renomeia os identificadores internos que
-colidem com palavra registrada pela teko (`word_add`) dentro do próprio `ngen/*.mc`: `scope` →
+colidem com palavra registrada pela teko (`word_add`) dentro do próprio `*.mc`: `scope` →
 `dscope` (21 sítios, `teko_di.mc`), `out` → `dst` (37, `teko_rc.mc`/`teko_ternary.mc`) e — achado
 fora do censo do §64(e), que só auditara `scope`/`out` — `params` → `prs` (75, sete arquivos):
 `type_new("params", ...)` (`teko_type.mc:68`) passa por `alias_add` → `word_add`, a MESMA reserva
@@ -2494,11 +2517,11 @@ as 39 palavras que o ngen registra (censo mecânico, não à mão) confirma só 
 dentro do ngen. (2) `git mv` dos 31 módulos do pacote (`teko.mc` + os 30 `teko_*.mc`) e
 `lib/rt.mc` para `.tk`; `core_teko.mc`/`user.mc` ficam `.mc` (não são do pacote, D64.7/§67);
 `#include`s internos, os 39 fixtures + `parts/ns_file.tk` que incluem `../lib/rt.tk`, e
-`ngen/mc.toml` (`[compiler].modules`, `[package]`) atualizados. **Nenhum shim de 1 linha
+`mc.toml` (`[compiler].modules`, `[package]`) atualizados. **Nenhum shim de 1 linha
 necessário**: o mc estoque não exige sufixo `.mc` em `[compiler].modules` (`drv_include` escreve o
 path cru, sem checar extensão) nem em `#include`/`[package]` (`lex_include` abre por caminho real;
 `libs_open`/`packages.md` — "a trailing `.mc` is dropped... a payload with another extension keeps
-it"). Gate (host macOS/aarch64, `mc` 0.15.5): `rm -rf ngen/build`, build do zero, **45/45**;
+it"). Gate (host macOS/aarch64, `mc` 0.15.5): `rm -rf build`, build do zero, **45/45**;
 `--dump-ast` das 45 byte-idêntico contra a base `6c50aa98`; `mc limits ngen` `verdict ok`;
 `build/teko` **byte-idêntico** (`cmp` limpo) entre antes/depois do `git mv` — mais forte que "a
 menos das strings de nome de arquivo": o único diff é a linha `#include` do glue `build/teko.mc`
@@ -2566,12 +2589,12 @@ checagem/ergonomia do §5, quatro fechadas, duas registradas com o caminho técn
   objeto do closure relativo a `tk_lc_base`. `TK_MAXLAMCAP` sobe 8->32 (a tabela agora soma
   captures de toda lambda em voo, não só uma). `surface_lambda.tk` ganha `nested_check`.
 
-Gate (host macOS/aarch64, `mc` 0.15.5, os três commits juntos): `rm -rf ngen/build`, build do
+Gate (host macOS/aarch64, `mc` 0.15.5, os três commits juntos): `rm -rf build`, build do
 zero; `--entry-only` **45/45** (nenhuma fixture nova, três tocadas: `types_class.tk`,
 `surface_refout.tk`, `surface_lambda.tk`); `--dump-ast` das **42 fixtures não tocadas
 byte-idêntico** à base `4e9c87ea` (`same=42`, as 3 diffs são exatamente as tocadas); `mc limits
 ngen` `verdict ok`, `intrin` 8/8 nos dois lados (zero intrínseco novo). Probes (fora de
-`ngen/tests/`, descartados): item 1 vtable (`Square` onde o parâmetro pede `Circle`, através do
+`tests/`, descartados): item 1 vtable (`Square` onde o parâmetro pede `Circle`, através do
 vtable) e itab (idem, através de uma interface) -- as duas recusadas, e a forma correta (mesmo
 tipo) confirmada sem falso positivo; item 2 mismatch (`ref Circle` chamado com `ref Square`) e
 derivado-pra-base (`ref Animal` chamado com `ref Dog`) -- as duas recusadas; item 6, o mesmo
@@ -2604,7 +2627,7 @@ mapeados dos itens 3/4/5). Sem PR, sem dreno -- branch `feat/ngen-hygiene2`, for
 **S4.2 LANDADO PARCIAL** (D225, plano §64(e)/§70 -- auto-hospedagem, rota A): a superfície toda
 existe e o fixpoint FECHA com um único bloqueio removido, que é do lado do `mc` (abaixo).
 
-- **`source_claim` adotado** (`ngen/teko_fwd.tk`, mc 0.15.8). `tk_source_claim(name)` devolve 1 para
+- **`source_claim` adotado** (`teko_fwd.tk`, mc 0.15.8). `tk_source_claim(name)` devolve 1 para
   **(a)** todo nome terminado em `.tk` -- um programa, uma fixture, `lib/rt.tk`, os 31 módulos do
   pacote quando o compilador compila a si mesmo -- e **(b)** todo quadro que a PRÓPRIA teko empurra,
   que passa a ir por `tk_push_source` (a mesma assinatura de `p_push_source`, entre `tk_claim_own = 1`
@@ -2618,18 +2641,18 @@ existe e o fixpoint FECHA com um único bloqueio removido, que é do lado do `mc
   g1 do §64 está RESOLVIDO pelo `source_claim`, não pelo renome do núcleo** -- e o renome interno que
   a S4.1 fez (`scope`/`out`/`params` dentro do `ngen/`) segue necessário, porque os módulos são `.tk`
   e portanto SÃO reivindicados.
-- **`ngen/mc_teko.tk`** (novo) -- a unidade única da rota A (D64.9): cinco linhas de `#include`
+- **`mc_teko.tk`** (novo) -- a unidade única da rota A (D64.9): cinco linhas de `#include`
   (`<mc/host>`, `<mc/core_min>`, `core_teko.mc` com as outras quatro partes + `main()`, `teko.tk`
   com os 30 irmãos, `user.mc` com `user_init`), a mesma ordem do glue que `mc build` gera
-  (`ngen/build/teko.mc`). É `.tk`, logo reivindicado -- e por isso não tem um identificador próprio:
+  (`build/teko.mc`). É `.tk`, logo reivindicado -- e por isso não tem um identificador próprio:
   toda linha é um include, nada nele pode colidir com palavra ensinada.
-- **`ngen/scripts/bootstrap.sh`** (novo, POSIX `sh`, sem `set -e`, tempo por etapa) -- teko0 (`mc
+- **`scripts/bootstrap.sh`** (novo, POSIX `sh`, sem `set -e`, tempo por etapa) -- teko0 (`mc
   build ngen --compiler-only`) -> teko1 -> teko2 -> teko3, todos por `teko build ngen --config
   <derivado> --entry-only` sobre `mc_teko.tk`; critérios: `cmp build/teko2.o build/teko3.o`,
   `--dump-asm` de teko2 vs teko3 com diff vazio, e as 45 fixtures compiladas por **teko1**. Os
-  configs derivados (`ngen/mc.boot{0,1,2,3}.toml`, `mc.bootfix.toml`) nascem do `ngen/mc.toml` pelo
+  configs derivados (`mc.boot{0,1,2,3}.toml`, `mc.bootfix.toml`) nascem do `mc.toml` pelo
   MESMO `sed` do §4, ficam ao lado dele (o `entry` resolve contra o diretório do CONFIG, não do
-  projeto -- um config em scratch não acha `mc_teko.tk`) e somem no `trap EXIT`; `ngen/mc.toml` não
+  projeto -- um config em scratch não acha `mc_teko.tk`) e somem no `trap EXIT`; `mc.toml` não
   é tocado. **O `.o` vem do fluxo `build`, sem modo cru:** o derivado MANTÉM o bloco `[linker]` --
   com linker o `mc` escreve `<out>.o` e o entrega ao `cc`, e é isso que deixa o objeto em disco; sem
   linker o backend embutido escreve só o executável. (O modo cru `teko mc_teko.tk -o x.o` também
@@ -2651,7 +2674,7 @@ existe e o fixpoint FECHA com um único bloqueio removido, que é do lado do `mc
   `surface_foreach`, `surface_loops`, `surface_switch`, `surface_ternary`), porque a sonda desliga a
   semântica de laço da teko. Fecha só com o patch do `mc`; "fixpoint FECHA" aqui = critérios 1+2 (objeto
   e `--dump-asm`), não os três.
-  **FECHOU (2026-09-06, mc 0.15.10 = `TE_RULE`):** `ngen/scripts/bootstrap.sh` tal como está, sem contorno:
+  **FECHOU (2026-09-06, mc 0.15.10 = `TE_RULE`):** `scripts/bootstrap.sh` tal como está, sem contorno:
   teko0 1,8 s → teko1 3,8 s (`teko1.o` 1 712 808 B) → teko2 4,2 s → teko3 3,8 s; `cmp teko2.o teko3.o` limpo;
   `--dump-asm` 220 651 linhas, diff vazio; **teko1 compila as 45 (45/45)**; total ~40 s; `FIXPOINT OK`. Os três
   critérios da tabela §64(f) fecham. A teko está auto-hospedada sobre o mc (rota A).
@@ -2675,11 +2698,11 @@ compilando qualquer `.mc` que use `while`. **Contorno NÃO foi feito** (a saída
 `tok_set_taught(id, 0)`" faria o handler da teko parsear o `while` do núcleo -- semântica errada e
 transparência perdida).
 
-Gate (host macOS/aarch64, `mc` 0.15.8): `rm -rf ngen/build`, build do zero; `--entry-only`
+Gate (host macOS/aarch64, `mc` 0.15.8): `rm -rf build`, build do zero; `--entry-only`
 **45/45**; `--dump-ast` das 45 byte-idêntico ao compilador da base `c7357b9b` (`same=45 diff=0`) --
 o `source_claim` e os tetos não movem uma árvore; `mc limits ngen --config` `verdict ok`, com a
 linha nova `source_claim 1/8` e `intrin 8/8` (zero intrínseco novo); nenhuma fixture nova
-(`ngen/tests/` intocado); `ngen/scripts/bootstrap.sh` chega ao **stage 1** e para no bloqueio acima,
+(`tests/` intocado); `scripts/bootstrap.sh` chega ao **stage 1** e para no bloqueio acima,
 com a mensagem do compilador impressa. Detalhe completo em `docs/design/plano-ngen-entrega4.md` §70.
 
 **HIGIENE 3 LANDADO** (plano §71, 2026-09-06, base `0fd12888`, dois commits): as DUAS dívidas que o
@@ -2714,9 +2737,9 @@ verificador da higiene 2 registrou acima, as duas fechadas.
   mensagem da teko com arquivo/linha certos (14/20/31/32 compilam e rodam). Fixture:
   `surface_lambda.tk` ganha `manycap_check`, quinze capturas.
 
-Gate (host macOS/aarch64, `mc` 0.15.8): `rm -rf ngen/build`, build do zero; `--entry-only` **45/45**
+Gate (host macOS/aarch64, `mc` 0.15.8): `rm -rf build`, build do zero; `--entry-only` **45/45**
 (nenhuma fixture nova, duas tocadas); `mc limits ngen --config` `verdict ok`, `intrin 8/8`;
-`ngen/mc.toml` intocado. `--dump-ast` das 45 contra o compilador da base `0fd12888`: **3
+`mc.toml` intocado. `--dump-ast` das 45 contra o compilador da base `0fd12888`: **3
 byte-idênticas** (as que não incluem `lib/rt.tk`), **40 com o MESMO diff** (hash igual, 29 linhas =
 as duas declarações novas de `lib/rt.tk`, nada mais), **2 com diff próprio** (as tocadas). Isto
 desvia do "43 byte-idênticas" que o crumb pediu, e o motivo é estrutural: um helper novo em
@@ -2754,14 +2777,14 @@ o que o thunk declara, e com o kind na assinatura passam a existir três checage
 `tk_lambda_check_params` e `tk_deleg_check_arg_kinds` no sítio de chamada (as mesmas duas mensagens
 de `tk_ref_check_call`). A mensagem de incompatibilidade agora soletra o kind: `Bump(ref u8)`.
 
-Gate (host macOS/aarch64, `mc` 0.15.8): `rm -rf ngen/build`, build do zero; `--entry-only`
+Gate (host macOS/aarch64, `mc` 0.15.8): `rm -rf build`, build do zero; `--entry-only`
 **45/45** (nenhuma fixture nova, uma tocada: `surface_refout.tk` ganha `narrowcheck`);
 `mc limits ngen --config` `verdict ok`, `intrin 8/16` e `passes 15/30` -- os MESMOS da base;
-`ngen/mc.toml` e `lib/rt.tk` intocados. `--dump-ast` das 45 contra a base `cc539258`: **44
+`mc.toml` e `lib/rt.tk` intocados. `--dump-ast` das 45 contra a base `cc539258`: **44
 byte-idênticas** (nenhuma outra fixture declara `ref`/`out`) e **1 com diff próprio** -- a tocada,
 cujo diff é 14 linhas `PARAM type=<apontado>` viradas `PARAM type=uptr` mais o `narrowcheck`.
 `--dump-syms` das 45, base × tip sobre as fixtures atuais: **byte-idêntico nas 45**. Probes (fora
-de `ngen/tests/`), cada um rodado TAMBÉM contra o compilador da base para separar correção de
+de `tests/`), cada um rodado TAMBÉM contra o compilador da base para separar correção de
 regressão: os de largura estreita (`ref u8`/`ref i32`/`out u16`/`ref bool`, campo e elemento de
 array `u8`, sobrecarga, método, interface/virtual, genérico, delegate por função nua) dão **139 na
 base e 42 no tip**; os de largura 8 (`ref`/`out` de classe com destrutor e `rt_live()==0`,
@@ -2816,17 +2839,17 @@ ampliou (`ref f64`, campo `f64`).
   `params i64[] xs` foi deliberadamente recusado. Então um argumento float cai na MESMA armadilha da
   captura: `f64 total(params xs)` com `total(1.5, 2.5)` responde errado **no tip E na base** (probe,
   não é regressão). Fechar exige decidir como uma `params` ganha tipo de elemento. Plano §74(b).
-- Gate (host macOS/aarch64, `mc` 0.15.10): `rm -rf ngen/build`, build do zero; `--entry-only`
+- Gate (host macOS/aarch64, `mc` 0.15.10): `rm -rf build`, build do zero; `--entry-only`
   **45/45** (nenhuma fixture nova; `surface_refout.tk` ganha `floatcheck`, e contra o compilador da
   base a MESMA fixture sai 131 = `130 + 1`); `mc limits ngen --config` `verdict ok`, `intrin 8/16` e
-  `passes 15/30`, os mesmos da base; `ngen/mc.toml` intocado. `--dump-ast` das 45, compilador+árvore
+  `passes 15/30`, os mesmos da base; `mc.toml` intocado. `--dump-ast` das 45, compilador+árvore
   da base × tip: **3 byte-idênticas** (`hello`, `primitives_ptr`, `primitives_scalar` -- as que não
   incluem `lib/rt.tk`) e **42 com o MESMO diff** (mesmo sha256 nos 42: as 26 linhas das duas
   declarações novas de `lib/rt.tk`, nada mais), a mesma partição estrutural que a higiene 3 explicou.
 
 **HIGIENE 4 item B — `teko1.o` não determinístico: NÃO REPRODUZ** (plano §74(c), 2026-09-06). A
 dívida que o verificador do S4.3 registrou (logo abaixo) foi caçada em **44 corridas** nesta
-máquina (macOS/aarch64, mc 0.15.10, `ngen/build` apagado antes de cada uma) e **não apareceu uma
+máquina (macOS/aarch64, mc 0.15.10, `build` apagado antes de cada uma) e **não apareceu uma
 vez**: 10 escadas completas na árvore do tip (`teko1.o == teko2.o == teko3.o`, sempre o mesmo
 `sha256`), **4 escadas na árvore da BASE `55ec9ffe`**, que reproduzem o `689dc9a6…` publicado nas
 quatro (o controle: o número documentado É o que esta máquina produz), 20 recompilações de
@@ -2839,22 +2862,22 @@ repositório, e um estágio 1 com o config em caminho ABSOLUTO -- todos o mesmo 
   um ponteiro vazado para a saída teria divergido nas 44); slot de tabela lido além de `n` (BSS e
   `mmap` anônimo são ZERADOS — a leitura fora de `n` é errada, se houver, mas determinística);
   caminho/cwd (as cópias em `/tmp` e o config absoluto dão o mesmo objeto).
-- **A instrumentação é o entregável.** `ngen/scripts/bootstrap.sh` passou a imprimir um bloco
-  `provenance` (não-gated) com `mc --version` e o `sha256` de **teko0** (`ngen/build/teko`, que
+- **A instrumentação é o entregável.** `scripts/bootstrap.sh` passou a imprimir um bloco
+  `provenance` (não-gated) com `mc --version` e o `sha256` de **teko0** (`build/teko`, que
   nenhum relatório tinha), `teko1.o`, `teko2.o` e `teko3.o`, mais a resposta explícita de
   `teko1.o == teko2.o`; e o job `fixpoint` do CI publica `teko0`/`teko3.o` no `summary` e, **só
   quando `teko1.o != teko2.o`**, arquiva por 14 dias o `--dump-asm` do teko0 e o do teko1 sobre
   `mc_teko.tk` com o `diff` dos dois. Assim a PRÓXIMA divergência é atribuível sem rerodar nada:
   teko0 igual + `teko1.o` diferente = não-determinismo do compilador; teko0 diferente = entrada
-  diferente (mc, árvore, ou `ngen/build` sujo).
-- Gate (host macOS/aarch64, `mc` 0.15.10): `rm -rf ngen/build`; `sh ngen/scripts/bootstrap.sh` →
+  diferente (mc, árvore, ou `build` sujo).
+- Gate (host macOS/aarch64, `mc` 0.15.10): `rm -rf build`; `sh scripts/bootstrap.sh` →
   `FIXPOINT OK`, 45/45, 38,5 s, `teko2.o == teko3.o`, `--dump-asm` 221 316 linhas diff vazio;
-  `ngen/mc.toml` e `ngen/tests/` intocados neste commit.
+  `mc.toml` e `tests/` intocados neste commit.
 
 **S4.3 LANDADO** (plano §64(f)/§73, 2026-09-06, base `e50ab97b`, branch `feat/ngen-s43-ci`,
 dois commits): a escada do fixpoint virou a **SEXTA** perna do CI — job `fixpoint`, matriz
 própria de dois runners, `fixpoint (linux/x86_64)` e `fixpoint (macos/aarch64)`, rodando
-`sh ngen/scripts/bootstrap.sh --os <os> --arch <arch>` e provando os três critérios do §64(f).
+`sh scripts/bootstrap.sh --os <os> --arch <arch>` e provando os três critérios do §64(f).
 Descrição no §3.1 acima; detalhe e medições no plano §73.
 
 - **`.github/actions/setup-mc` (novo)** — a resolução do `latest` de `minicompiler/mc`, o
@@ -2863,7 +2886,7 @@ Descrição no §3.1 acima; detalhe e medições no plano §73.
   (absoluto, para o `$GITHUB_PATH` — `bootstrap.sh` chama `mc` pelo NOME), `tag`, `version`.
 - **`bootstrap.sh` ganhou o `[target]` de linux** (segundo commit, causa-raiz do primeiro CI
   vermelho): o compilador ensinado é escrito pelo backend de executável do HOST, e o writer ELF
-  do mc põe `PT_INTERP`/soname musl por padrão → em runner glibc o `ngen/build/teko` existe e
+  do mc põe `PT_INTERP`/soname musl por padrão → em runner glibc o `build/teko` existe e
   não executa (`not found`, exit 127, o loader falando). `write_target_tail` anexa
   `interp`/`libc = "gnu"` **só quando o alvo é linux e aquele loader existe na máquina**; musl
   não anexa nada; macOS não muda. A escada RODA o que constrói, então o loader desta máquina é
@@ -2887,16 +2910,16 @@ Descrição no §3.1 acima; detalhe e medições no plano §73.
   `mc build ngen && run` segue dependendo só da matriz `leg`.
 - **Dívidas:** escada no **Windows** (precisa do sysroot `lld-link` dentro do job) e em
   **linux/aarch64** (o par tem perna; ficou fora só para o job custar dois runners).
-- Gate local (host macOS/aarch64, `mc` 0.15.10): `rm -rf ngen/build`; `sh ngen/scripts/bootstrap.sh`
-  → `FIXPOINT OK`, 45/45, 45,2 s; `ngen/mc.toml`, `ngen/*.tk` e `ngen/tests/` intocados;
+- Gate local (host macOS/aarch64, `mc` 0.15.10): `rm -rf build`; `sh scripts/bootstrap.sh`
+  → `FIXPOINT OK`, 45/45, 45,2 s; `mc.toml`, `*.tk` e `tests/` intocados;
   `git status` limpo.
 
 **V0 — RECUSAS LANDADO** (plano §76, 2026-09-06, base `77019bd6`, três commits): o primeiro crumb do
 desvio "v0.1.0 estável" — a regra do corte é **ZERO resultado errado silencioso**: o que não está
 ensinado é RECUSADO com mensagem, no estilo `teko: <causa curta>`. Nenhuma superfície nova, nenhuma
-fixture nova (as recusas só têm probe — o corpus não tem fixtures de erro), `ngen/mc.toml` intocado.
+fixture nova (as recusas só têm probe — o corpus não tem fixtures de erro), `mc.toml` intocado.
 
-- **Item 1 — float numa lista `params` (fechado, `271718b8`, `ngen/teko_params.tk`).** A lista é de
+- **Item 1 — float numa lista `params` (fechado, `271718b8`, `teko_params.tk`).** A lista é de
   PALAVRAS: `tk_va_put`/`tk_va_at` (lib/rt.tk) gravam e devolvem por parâmetro `i64`, então um valor
   que viaja no banco de float não é gravado nem devolvido por esse par — `f64 total(params xs)` com
   `total(1.5, 2.5)` respondia com o que o banco inteiro tivesse (dívida adjacente da higiene 4,
@@ -2914,14 +2937,14 @@ fixture nova (as recusas só têm probe — o corpus não tem fixtures de erro),
     entra como o `i64` que é e o que volta é o tipo do callee). A mesma regra do
     `tk_check_field_store`: só recusa o que sabe.
 - **Item 2 — `when` no braço `_` final da switch expression (fechado, `ec223f14`,
-  `ngen/teko_switch.tk`).** A dobra vai do ÚLTIMO braço para trás, então esse braço é a base
+  `teko_switch.tk`).** A dobra vai do ÚLTIMO braço para trás, então esse braço é a base
   incondicional e a condição dele — a guarda inclusive — nunca é testada; um `when` escrito ali era
   descartado em silêncio e o braço tomado assim mesmo (dívida registrada pelo crumb SWITCH, D228).
   Recusa na linha do próprio braço: ``teko: the last `_` arm of a switch expression cannot carry a
   `when` ``. **Nada mais muda:** `_ when c` no MEIO continua dobrando para `1 && c` e sendo testado,
   e um braço escrito DEPOIS de um `_` puro segue morto (não errado) — o `1` do `_` casa primeiro.
 - **Item 3 — retorno de chamada passa a ser tipado pelo oráculo de parse (fechado, `1d43f904`,
-  `ngen/teko_struct.tk`).** `tk_pty_of` respondia por nó já tagueado e por local bare, e -1 no resto
+  `teko_struct.tk`).** `tk_pty_of` respondia por nó já tagueado e por local bare, e -1 no resto
   — logo `b.useCircle(f())` com `f()` devolvendo `Square` onde se pede `Circle` passava em silêncio
   (o único furo que o verificador da higiene 2 deixou: campo de outro objeto já era pego, `tk_field_use`
   tagueia). Agora responde para `N_CALL` por `decl_find`/`decl_ret` — o MESMO par que o oráculo
@@ -2935,7 +2958,7 @@ fixture nova (as recusas só têm probe — o corpus não tem fixtures de erro),
     conhece, então a checagem de argumento nem chega a rodar (probe: com receptor LOCAL a mesma
     chamada é recusada, com receptor PARÂMETRO passa; vale na base e no tip).
 
-Probes (em `ngen/_probe/`, apagado; cada um também rodado contra o compilador da base para separar
+Probes (em `_probe/`, apagado; cada um também rodado contra o compilador da base para separar
 correção de regressão): item 1 — literal float, local float, `f64 v = xs[0];`, `v = xs[1];` e
 `return xs[0] + xs[1];` de uma instância `f64` (cinco recusas); item 2 — `_ when g` como último braço
 (recusa) e um controle com `_ when g` no meio + braço guardado depois do `_` (compila, roda 42,
@@ -2943,12 +2966,12 @@ guarda honrada); item 3 — `Square` por vtable e por itab (recusa `teko: a valu
 not convert to Circle` no tip, **exit 0 silencioso na base**) e um controle com o tipo CERTO nas duas
 formas de despacho + chamada escalar em posição de argumento (compila, roda 42).
 
-Gate (host macOS/aarch64, `mc` **0.15.12**): `rm -rf ngen/build`, build do zero; `--entry-only`
+Gate (host macOS/aarch64, `mc` **0.15.12**): `rm -rf build`, build do zero; `--entry-only`
 **45/45**; `--dump-ast` das **45 byte-idêntico** ao compilador da base `77019bd6` (`same=45 diff=0`)
 — recusa não muda código aceito; `mc limits ngen --config` `verdict ok`, `intrin 8/16`, `passes
-15/30`, os mesmos da base; `sh ngen/scripts/bootstrap.sh` → **`FIXPOINT OK`** (teko1.o == teko2.o ==
+15/30`, os mesmos da base; `sh scripts/bootstrap.sh` → **`FIXPOINT OK`** (teko1.o == teko2.o ==
 teko3.o, `sha256` `034843cd…`, `--dump-asm` 191 586 linhas diff vazio, teko1 compila as 45, 62,4 s);
-`ngen/mc.toml`, `ngen/tests/` e `ngen/scripts/` intocados; `git status` limpo.
+`mc.toml`, `tests/` e `scripts/` intocados; `git status` limpo.
 
 **Dívida ADJACENTE achada, NÃO fechada (não é deste crumb):** `xs[0]` de uma lista `params` usado como
 ARGUMENTO de uma chamada por vtable morre em `expression with no codegen` — o `N_INDEX` sobrevive ao
@@ -2958,7 +2981,7 @@ walk da instância porque a chamada já foi rebaixada a `callp` no parse. Reprod
 **S4.3b LANDADO — o `fixpoint` cobre as CINCO pernas** (plano §78, 2026-09-06, base `756fd924`,
 branch `feat/ngen-s43b-fixpoint-all`, três commits): a escada deixa de rodar em dois pares e passa
 a rodar nos **mesmos cinco** que as pernas nativas cobrem. Descrição no §3.1 acima; medições no
-plano §78. Zero mudança em `ngen/*.tk`, `ngen/mc.toml` e `ngen/tests/`.
+plano §78. Zero mudança em `*.tk`, `mc.toml` e `tests/`.
 
 - **linux/aarch64** (`ubuntu-24.04-arm`) era só custo de runner: o par já tinha perna e o
   `write_target_tail` já conhecia o loader dele (`/lib/ld-linux-aarch64.so.1`). Terceira entrada
@@ -2967,7 +2990,7 @@ plano §78. Zero mudança em `ngen/*.tk`, `ngen/mc.toml` e `ngen/tests/`.
   **`.github/actions/windows-sysroot`** (nova) é a montagem do sysroot fatorada para fora da perna
   — os dois jobs Windows a usam, então não há como montarem sysroots diferentes; ela também põe o
   LLVM no `$PATH` em forma Windows e aponta o `TMPDIR` para o temp do runner. E
-  **`bootstrap.sh --linker-toml FILE`** troca o `[linker] cc` do `ngen/mc.toml` pelos blocos
+  **`bootstrap.sh --linker-toml FILE`** troca o `[linker] cc` do `mc.toml` pelos blocos
   `[sysroot]`/`[linker]` do arquivo (a matriz escreve a MESMA linha `lld-link` da perna). POSIX
   `sh`, sem `set -e`, status por passo, como o resto do arquivo.
 - **Nomes com `.exe` e o objeto que o critério compara.** O `mc` anexa o sufixo do host ao
@@ -2996,11 +3019,11 @@ plano §78. Zero mudança em `ngen/*.tk`, `ngen/mc.toml` e `ngen/tests/`.
   ngen && run` continua dependendo só da matriz `leg`; promover a escada a check obrigatório é
   decisão de ruleset. Os cinco nomes novos de context estão listados em
   `docs/design/pr-org-ngen.md` §2/§5.
-- Gate local (host macOS/aarch64, `mc` 0.15.12): `rm -rf ngen/build`;
-  `sh ngen/scripts/bootstrap.sh` → **`FIXPOINT OK`**, 45/45, `034843cd…` nos três objetos,
+- Gate local (host macOS/aarch64, `mc` 0.15.12): `rm -rf build`;
+  `sh scripts/bootstrap.sh` → **`FIXPOINT OK`**, 45/45, `034843cd…` nos três objetos,
   `--dump-asm` 191 586 linhas diff vazio; e o MESMO run por `--linker-toml` com um bloco `cc`
   equivalente reproduz os três hashes byte a byte (é a prova de que a substituição do `[linker]`
-  deriva um config equivalente); `ngen/*.tk`, `ngen/mc.toml` e `ngen/tests/` intocados.
+  deriva um config equivalente); `*.tk`, `mc.toml` e `tests/` intocados.
 
 **V1 — RETORNO FLOAT POR CHAMADA INDIRETA LANDADO** (plano §79 e
 `docs/design/plano-v1-float-callp.md`, 2026-09-06, base `a66b80c9`, cinco commits): o segundo crumb
@@ -3011,7 +3034,7 @@ virtual e método de interface (as três são `callp`) só acertavam por coincid
 Com o **mc 0.15.13** (§3.2) um cast DIRETAMENTE sobre o `callp` declara o retorno, e é essa a única
 grafia possível: a teko passa a emiti-la nos cinco construtores.
 
-- **UM shaper, `tk_callp_ret(ret, call)`** (`ngen/teko_array.tk`, logo abaixo de `tk_cast`): envolve
+- **UM shaper, `tk_callp_ret(ret, call)`** (`teko_array.tk`, logo abaixo de `tk_cast`): envolve
   num cast o retorno FLOAT e o INTEIRO ESTREITO — este pela regra do próprio núcleo (`walk_narrow`,
   `mc/src/gen_walk.mc`: `uptr` é a palavra da máquina e nunca é estreito, o que não é `TK_INT`/
   `TK_SINT` é do módulo, `void` não toma cast) — e devolve a chamada intocada no resto. Espelhar a
@@ -3040,7 +3063,7 @@ grafia possível: a teko passa a emiti-la nos cinco construtores.
   (`virtual f64 area()` + `override`, pelo receptor escrito, pelo `this` implícito e por parâmetro
   tipado na BASE) e `types_interface.tk` `ficheck` (membro `f64 span()` por receptor de tipo
   interface e por parâmetro). `expect-exit: 42` nas três.
-- **Probes (`ngen/_probe/`, apagado), base → tip:** o repro do §74(b) sem nada do ngen — o MESMO
+- **Probes (`_probe/`, apagado), base → tip:** o repro do §74(b) sem nada do ngen — o MESMO
   binário responde 5 com o cast e 3 sem ele, isto é, o contrato do núcleo já valia e o que faltava
   era a teko EMITIR o cast; delegate `f64`/`f32` (base `1.0 + d(2.0)` = 3.0, erro no 2º check → tip
   42); virtual `f64` (base erra já no `p.area()` DIRETO, mais fundo que o delegate → tip 42);
@@ -3061,14 +3084,14 @@ grafia possível: a teko passa a emiti-la nos cinco construtores.
   48, tip 32 — lixo dos dois lados, mesma classe). Fechar exige o tipo de ELEMENTO da `params`
   (`params T[]`, decisão de superfície do §74(b)/§76) ou mover a checagem para depois do passe de
   delegate; um palpite pela tabela `tk_slv_find` recusaria programa CORRETO (armadilha 27).
-- Gate (host macOS/aarch64, `mc` **0.15.13**): `rm -rf ngen/build`, build do zero; `--entry-only`
+- Gate (host macOS/aarch64, `mc` **0.15.13**): `rm -rf build`, build do zero; `--entry-only`
   **45/45**; `--dump-ast` das 45 contra o compilador+árvore da base `a66b80c9`, com o MESMO mc dos
   dois lados: **`same=42 diff=3`** — só as três fixtures tocadas, e o diff de cada uma é ADITIVO
   fora da renumeração dos temporários `$gN` (nenhuma linha removida que não seja um `$gN`
   deslocado); `mc limits ngen --config` `verdict ok`, `intrin 8/16`, `passes 15/30` — os mesmos da
-  base; `sh ngen/scripts/bootstrap.sh` → **`FIXPOINT OK`** (teko1.o == teko2.o == teko3.o,
-  `8482faa6…`, `--dump-asm` 191 811 linhas diff vazio, teko1 compila as 45); `ngen/mc.toml`,
-  `ngen/lib/rt.tk`, `ngen/scripts/` e `.github/` intocados; `git status` limpo.
+  base; `sh scripts/bootstrap.sh` → **`FIXPOINT OK`** (teko1.o == teko2.o == teko3.o,
+  `8482faa6…`, `--dump-asm` 191 811 linhas diff vazio, teko1 compila as 45); `mc.toml`,
+  `lib/rt.tk`, `scripts/` e `.github/` intocados; `git status` limpo.
 
 ## 5.1 Armadilhas já pagas (não repita)
 
@@ -3077,7 +3100,7 @@ grafia possível: a teko passa a emiti-la nos cinco construtores.
    Linux isso gera `Exec format error` (ENOEXEC, exit 126). **Compile sempre
    pelo caminho `mc build DIR --config FILE`**, que honra `[target] os/arch` e
    `[linker]` do toml. O CI já faz assim (gera um toml por fixture a partir do
-   `ngen/mc.toml`, trocando só `[project].entry`/`out`).
+   `mc.toml`, trocando só `[project].entry`/`out`).
 2. **O runner injeta `bash -e`.** Um passo de CI que pretende acumular falhas
    (`status=1; continue`) precisa de **`set +e`** no topo, senão aborta na
    primeira e esconde o estado das demais.
@@ -3120,7 +3143,7 @@ grafia possível: a teko passa a emiti-la nos cinco construtores.
     Rejeita corretamente, mas o diagnóstico é pobre; é consequência de o trait
     não ter `type_new` (por desenho, D216). Dívida cosmética conhecida.
 11. **Campos vindos de trait entram DEPOIS dos campos próprios da classe**,
-    independentemente de onde o `use` aparece no corpo (`ngen/teko_class.mc:439`).
+    independentemente de onde o `use` aparece no corpo (`teko_class.mc:439`).
     Duas classes que usam o mesmo trait têm offsets independentes e corretos.
 
 12. **`extern` de libc POSIX não linka no Windows** (achado ao abrir as 5 pernas).
@@ -3155,10 +3178,10 @@ grafia possível: a teko passa a emiti-la nos cinco construtores.
     Também novo: `[target].link = "dynamic"|"static"`, flags `--libc=`/`--link=`/`--interp=`.
 15. **mc ≥ 0.12.0 (M42): o `mc build` Linux escreve ELF dinâmico SEM `[linker]`, com loader
     e soname **musl por default**.** Num runner glibc (ubuntu) o compilador ensinado sai com
-    `interp` de musl e o `mc build` falha em `mc: cannot run: ngen/build/mc-teko`. As pernas
+    `interp` de musl e o `mc build` falha em `mc: cannot run: build/mc-teko`. As pernas
     Linux do CI nomeiam o par glibc no `[target]` (`interp = "/lib64/ld-linux-x86-64.so.2"` ou
     `"/lib/ld-linux-aarch64.so.1"`, `libc = "libc.so.6"` — mc `docs/build.md` §`[target]`) e
-    não têm mais `[linker]`. `ngen/mc.toml` versionado (linux/x86_64 + `[linker] cc`) segue
+    não têm mais `[linker]`. `mc.toml` versionado (linux/x86_64 + `[linker] cc`) segue
     intacto; o CI deriva o config por perna.
 
 16. **Um lookup com fallback nunca chama a si mesmo (mesma função) sobre uma string que ELE
@@ -3183,7 +3206,7 @@ grafia possível: a teko passa a emiti-la nos cinco construtores.
     escapa dessa armadilha (M45's `tk_unary_plus`) porque `ops_init` nunca o registrou, daí
     ele cai em `parse_primary` como um token comum. A correção é do lado do PÓS-fixo, não
     do prefixo: `tk_dot`/`tk_bracket` sinkam pela cadeia de `- ! ~` que RECEBERAM como
-    `left`, resolvem contra o operando de verdade, e reembrulham (`ngen/teko_prefix.mc`).
+    `left`, resolvem contra o operando de verdade, e reembrulham (`teko_prefix.mc`).
 
 18. **`top_add()` limpa `p_decl_name()` como efeito colateral -- um `top_add` ANINHADO (chamado
     de DENTRO do corpo de uma declaração ainda sendo lida) apaga o nome da declaração
@@ -3319,7 +3342,7 @@ grafia possível: a teko passa a emiti-la nos cinco construtores.
     executável do HOST (`docs/build.md` § `[compiler]`) — num runner glibc ele existe, tem
     tamanho e não executa. A cura é nomear o loader da máquina em `[target]`
     (`interp` + `libc = "gnu"`), não caçar arquivo sumido. Consequência de processo: um config
-    DERIVADO do `ngen/mc.toml` não herda o que as pernas do CI carregam na matriz — o que a
+    DERIVADO do `mc.toml` não herda o que as pernas do CI carregam na matriz — o que a
     perna resolve com `target_tail` a escada tem de resolver por conta (`write_target_tail` no
     `bootstrap.sh`, e detectando o loader, porque quem executa o que constrói é esta máquina).
 
@@ -3342,8 +3365,8 @@ grafia possível: a teko passa a emiti-la nos cinco construtores.
     compilador ensinado tem de RODAR na máquina que o escreveu; já o `[project].out` das etapas
     seguintes é literal — o `mc` não anexa nada e o objeto sai de `out + ".o"`. Consequência: quem
     nomeia os estágios da escada tem de usar o sufixo do HOST nos dois lugares, e um
-    `--os windows` numa máquina macOS produz `ngen/build/teko` (host) enquanto o script procura
-    `ngen/build/teko.exe` (alvo) — `exit 127`, com o binário ali. **A cura não é adivinhar sufixo:
+    `--os windows` numa máquina macOS produz `build/teko` (host) enquanto o script procura
+    `build/teko.exe` (alvo) — `exit 127`, com o binário ali. **A cura não é adivinhar sufixo:
     é RECUSAR alvo ≠ máquina**, porque a escada executa todo estágio que constrói e um ponto fixo
     que não roda não é ponto fixo. `bootstrap.sh` confere `--os`/`--arch` contra `mc --host`.
 
