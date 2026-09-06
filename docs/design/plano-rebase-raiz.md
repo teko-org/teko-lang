@@ -94,7 +94,11 @@ o registro aceita dois subpaths do mesmo repo (raiz e `tool/`) ou o tool vai par
    inalterado: nenhum ficheiro de `ngen/` mudou além do `HANDOFF.md`, que não está em `[package].files`.
 2+3. **`git mv ngen/* .` + ajustar caminhos** (`.github/**`, `scripts/bootstrap.sh`, `measure.sh`,
    CodeQL `paths`) **num único commit** (o `mv` sozinho deixa o CI vermelho) — gate: 5 pernas +
-   `bootstrap.sh` (fixpoint + 45/45).
+   `bootstrap.sh` (fixpoint + 45/45). **✔ FEITO** (branch `ngen/rebase-23-raiz`): 89 ficheiros na
+   raiz, `ngen/` extinto; o filtro `paths:` do CodeQL saiu inteiro (R5); o agregador continua
+   `mc build ngen && run` LITERAL (R2). `mc pkg hash .` = `379fc989…` com o `mc.toml` de antes
+   (prova de que o `mv` não move byte de `[package].files`) e `6e6bb5df…` com os quatro
+   comentários do `mc.toml` que diziam `ngen` corrigidos.
 4. **Split do manifesto** (`mc.toml` = `[package]`; `teko.toml` = build; CI deriva de `teko.toml`) —
    gate: 5 pernas + `bootstrap.sh` + pré-voo do `check` no `release.yml`.
 5. **Docs**: `README.md` raiz (do `ngen/README.md`), `HANDOFF.md` na raiz, `CLAUDE.md` novo,
