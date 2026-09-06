@@ -5,7 +5,7 @@ compiler of its own: every new construct is taught to
 [`mc`](https://github.com/minicompiler/mc) as a module, the way `mc`'s `examples/lang`
 teaches it a class system without touching `mc`'s `src/`. This repository IS that
 module — it lived in `ngen/` until the rebase (docs/design/plano-rebase-raiz.md) and is
-the repository root now — built with `mc`'s own project tooling (`mc.toml`, `mc build`,
+the repository root now — built with `mc`'s own project tooling (`teko.toml`, `mc build`,
 `[compiler]`).
 
 Design and rationale: `docs/design/port-teko-mc.md`, `docs/design/plano-ngen-entrega4.md`
@@ -19,32 +19,39 @@ Needs the [`mc`](https://github.com/minicompiler/mc) toolchain on `PATH`, at the
 too — see "Toolchain version" below). From the repository root:
 
 ```sh
-mc build .
+mc build . --config teko.toml
 build/teko-hello   # exits 42
 ```
+
+Two files, two roles: `teko.toml` is the build (`[project]`, `[target]`, `[compiler]`,
+`[linker]`, `[limits]`, `[include]`), `mc.toml` is the package manifest and carries only
+`[package]`, because `mc pkg hash DIR` reads `DIR/mc.toml` and takes no `--config`. A bare
+`mc build .` is `mc.toml: missing key: project.entry`, on purpose — the same split
+`minicompiler/mc`'s own root uses. The `--config` path stays relative, without `./`, and at
+the repository root (D224).
 
 Two steps come out of `mc build` (`mc`'s own `docs/build.md`): first it links `teko.tk`
 into a taught compiler (`build/teko`), then it uses THAT binary to compile
 `tests/hello.tk` into `build/teko-hello`. Nothing in `mc`'s `src/` changes.
 
-On a host `mc.toml` (which targets `linux/x86_64`) does not link on, derive a config
+On a host `teko.toml` (which targets `linux/x86_64`) does not link on, derive a config
 with the host's own `[target] os`/`arch` and drop `[linker]` so the built-in `macho-exe`/
 ELF backend writes the binary itself (`HANDOFF.md` §4 has the full recipe; never edit
-`mc.toml` itself outside an authorized crumb).
+`teko.toml` itself outside an authorized crumb).
 
 ## Fixtures
 
 Each `tests/*.tk` is a program the taught compiler builds and RUNS; its
 `// expect-exit: N` header is the oracle. `.github/workflows/ngen.yml` compiles and runs
 every one of them on five native legs (linux/x86_64, linux/aarch64, macos/aarch64,
-windows/x86_64, windows/aarch64) with `--entry-only`, reusing the compiler `mc build .`
+windows/x86_64, windows/aarch64) with `--entry-only`, reusing the compiler the build
 already produced instead of rebuilding it per fixture:
 
 ```sh
 for src in tests/*.tk; do
   n=$(basename "$src" .tk); w=$(grep -m1 '// expect-exit:' "$src" | sed 's/.*expect-exit: *//')
   sed -e "s#^entry = .*#entry = \"tests/$n.tk\"#" -e "s#^out   = .*#out   = \"build/$n\"#" \
-      mc.toml >"mc.$n.toml"
+      teko.toml >"mc.$n.toml"
   build/teko build . --config "mc.$n.toml" --entry-only && "build/$n"
   echo "$n exit=$?  want=$w"; rm -f "mc.$n.toml"
 done
@@ -79,8 +86,9 @@ Not shipped yet (v0.1.0 is still ahead), but the shape is decided (D230):
   "user.mc"]` in the consumer's own project (their `mc build` links `teko` locally,
   pinned by the dependency's tree hash); later, `teko` as a tool package
   (`mc tool install teko`).
-* **The registry** is `https://pkg.minicompiler.dev` (D230; `module =` in `mc.toml` is a
-  key the registry and `mc` both ignore today — kept as documentation, not semantics).
+* **The registry** is `https://pkg.minicompiler.dev` (D230). The library is the package
+  `teko`; the taught compiler will be published as the tool `tekoc`, from a manifest of its
+  own (a subpath of this repository), not from this root.
 
 ## What is OUT of v0.1.0
 

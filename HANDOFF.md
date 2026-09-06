@@ -29,11 +29,11 @@ registro do mc gated por variável (D230 adendo 2). Sequência decidida:
 2. PR do fork para `teko-org/teko-lang`.
 3. Já na org: remover o legado (`src/`, workflows do compilador antigo) e
    rebasear `ngen/` para a raiz do repositório.
-Consequência da mudança de raiz: o manifesto do pacote (`[package]`) migra para
-o `mc.toml` da raiz, **sem `[project]`** (regra do registro, D230 adendo 2);
-`mc.toml` (ou o que restar dele na raiz) fica só com `[project]`/
-`[compiler]`/`[target]`/… para o `mc build`. Detalhe completo em
-`docs/design/pr-org-ngen.md` §7 e `DECISION_LOG.md` D230.
+Consequência da mudança de raiz: o manifesto do pacote (`[package]`) fica no
+`mc.toml` da raiz, **sem `[project]`** (regra do registro, D230 adendo 2), e o
+`teko.toml` novo fica com `[project]`/`[target]`/`[compiler]`/`[linker]`/
+`[limits]`/`[include]` para o `mc build` (passo 4, feito). Detalhe completo em
+`docs/design/pr-org-ngen.md` §7, `DECISION_LOG.md` D230/D231 e o §3.3 abaixo.
 
 **Passo 1 do rebase FEITO** (`docs/design/plano-rebase-raiz.md` §4): saíram 1 261 ficheiros /
 38,5 MB de legado — `src/`, `bootstrap/`, `.crumbs/`, `examples/`, `cases/`, `scripts/`,
@@ -47,8 +47,15 @@ repositório, e os caminhos do CI, do `bootstrap.sh`, do `measure.sh` e das rece
 acompanharam (`mc build .`, `build/teko build . --config … --entry-only`, `sh
 scripts/bootstrap.sh`, `mc pkg hash .`, `cat MC_VERSION`). O nome do agregador do ruleset
 continua **literalmente** `mc build ngen && run` (§5 R2 do plano: check exigido casa por NOME;
-renomear é passo coordenado com o ruleset da org). Faltam o passo 4 (split do manifesto:
-`mc.toml` só `[package]`, `teko.toml` com o build) e o passo 5 (docs).
+renomear é passo coordenado com o ruleset da org).
+
+**Passo 4 do rebase FEITO** (mesmo §4): o manifesto foi partido em dois — `mc.toml` só
+`[package]` (sem `[project]`, sem `module =`) e o `teko.toml` novo com a build
+(`mc build . --config teko.toml`); o CI, o `bootstrap.sh`, o `measure.sh` e as receitas do
+`README.md`/§4 derivam do `teko.toml`, e os 30 comentários que ainda diziam `ngen/…` em 19
+ficheiros de código saíram no mesmo passo (o `--dump-ast` das 45 fixtures continua
+byte-idêntico). Detalhe e o hash novo no §3.3. Falta o passo 5 (docs: `CLAUDE.md` novo,
+`CONTRIBUTING.md`, nota de rebase nos `docs/design/*`).
 
 ## 2. Leis que valem aqui (resumo do que mais pega)
 
@@ -156,8 +163,9 @@ na matriz. O check dos legs é `ngen (<os>/<arch>)`; o **agregador** mantém o n
 exato que o ruleset exige, `mc build ngen && run`, e falha se qualquer perna falhar
 (nada a trocar no ruleset).
 
-O config de cada perna é **derivado do `mc.toml`** (nunca editado): remove-se o
-`[linker]`, troca-se `[target] os`/`arch` e o `out` ganha `.exe` no Windows; o resto
+O config de cada perna é **derivado do `teko.toml`** (nunca editado; o `mc.toml` da raiz
+não entra em build nenhum, é só `[package]`): remove-se o `[linker]`, troca-se
+`[target] os`/`arch` e o `out` ganha `.exe` no Windows; o resto
 (`[project]`/`[compiler]`/`[include]`/`[limits]`) não pode divergir entre pernas.
 
 **Windows não tem C runtime nem backend de executável direto**, então a perna monta
@@ -205,7 +213,7 @@ três arquivos (`winstart.obj`, `mcrt.obj`, `kernel32.lib`). Duas peças, nenhum
   Ela também põe o LLVM no `$PATH` em forma WINDOWS (o `mc` chama o linker por
   `CreateProcessA`, que lê o PATH do Win32) e aponta o `TMPDIR` para o temp do runner (o `mc`
   nativo não abre os caminhos `/tmp/...` do MSYS).
-- **`bootstrap.sh --linker-toml FILE`** troca o `[linker] cc` do `mc.toml` pelos blocos
+- **`bootstrap.sh --linker-toml FILE`** troca o `[linker] cc` do `teko.toml` pelos blocos
   `[sysroot]`/`[linker]` do arquivo (a matriz do job escreve a MESMA linha que a perna usa).
   O `awk` que remove o bloco velho é o mesmo do config das pernas.
 
@@ -365,8 +373,38 @@ O `9318b19c…` acima é **pré-V1**. A `main` da org media
 `[package].files`, medido. Com os quatro comentários de `mc.toml` que ainda diziam `ngen`
 corrigidos (`mc build .`, `mc limits .`, `lib/rt.tk`, `HANDOFF.md`; nenhuma chave mudou), passa a
 `6e6bb5dfc0daccb68cd9b2955e56853db208d2535ef690b831540dac3670f5d1`. O split do manifesto (passo 4)
-muda `mc.toml` outra vez e **vai** mudar o hash de novo; é esperado e sem consequência antes da 1ª
-publicação.
+reescreveu o `mc.toml` (só `[package]`, sem `module =`, cabeçalho curto) e limpou os 30 comentários
+que ainda diziam `ngen/…` em 19 ficheiros de `[package].files`: passa a
+`8dd22e12f2ebc451817e6dcca7613c98e6bc4d3a028c84641a6033fe9586b3b6` (medido com o mc 0.15.13, e o
+mesmo valor sai do `scripts/pkg-hash.sh` do repo do mc, a 2ª implementação da regra). Era esperado e
+não tem consequência antes da 1ª publicação.
+
+### O split do manifesto (passo 4 do rebase, 2026-09-06)
+
+Com a raiz do repositório sendo o pacote, os dois papéis deixam de caber num ficheiro só —
+`mc pkg hash DIR` lê `DIR/mc.toml` e **não aceita `--config`**, então o `[package]` tem de morar
+lá. É o mesmo split que o `minicompiler/mc` usa na própria raiz:
+
+| ficheiro | papel |
+|---|---|
+| `mc.toml` | **só `[package]`** (`name`/`lib`/`files`/`check`) + um cabeçalho curto. Sem `[project]` |
+| `teko.toml` | a BUILD: `[project]`, `[target]`, `[compiler]`, `[linker]`, `[limits]`, `[include]` |
+
+- `mc build . --config teko.toml` constrói; `mc build .` responde
+  `mc.toml: missing key: project.entry`, **de propósito** (precedente do mc).
+- O `--config` é **relativo, sem `./`, na RAIZ** do pacote (D224): `./teko.toml` cega o guard de
+  `internal` e `cfg/teko.toml` não acha `core_teko.mc`.
+- **`module =` saiu** — é chave que o `mc` ignora (D230); o que ela documentava está aqui.
+- O `[include] paths = ["lib"]` foi para o `teko.toml`: é chave de BUILD. O pacote continua fechado
+  sobre `files` — nenhum `#include` do repositório depende dela (as fixtures usam
+  `#include "../lib/rt.tk"`, relativo, e os módulos incluem os irmãos pelo nome).
+- Quem deriva config (CI, `scripts/bootstrap.sh`, `scripts/measure.sh`, as receitas do §4 e do
+  `README.md`) parte do **`teko.toml`**; o `release.yml` segue lendo `check`/`lib` do `mc.toml`.
+- O compilador ensinado já preferia `DIR/teko.toml` a `DIR/mc.toml` sem `--config` (D64.5,
+  `teko.tk` `tk_build`) — o split passou a usar essa precedência em vez de contrariá-la.
+- **A lib é o pacote `teko`; a ferramenta será `tekoc`** (ratificado pelo dono em 2026-09-06). O
+  manifesto do tool **não** nasce aqui: vem em subpath próprio, em crumb próprio, e a raiz continua
+  a ser a lib.
 
 A ressalva do adendo continua **viva**: teko-ificar o compilador (S4.4+, fork g3) torna `mc_teko.tk`
 ilegível para o parser de prateleira e o pacote perde o `check`. Não há hoje uma segunda unidade
@@ -608,13 +646,14 @@ uma release nova do mc só entra no gate quando o arquivo mudar (o processo de b
 §3.2). O binário local segue o mesmo arquivo, para nunca validar contra um `mc` diferente do
 que o CI usa.
 
-**Config de host.** O `mc.toml` versionado mira `linux/x86_64`, o alvo do CI, e
-não linka neste host. Deriva-se um config em scratch — `os = "macos"`,
-`arch = "aarch64"` (`arm64` **não** é aceito; `mc --host` diz o par certo) — sem o
-bloco `[linker]`, para o alvo sair pelo backend `macho-exe` embutido:
+**Config de host.** O `teko.toml` versionado (o config de BUILD; o `mc.toml` da raiz é
+só `[package]`, passo 4 do rebase) mira `linux/x86_64`, o alvo do CI, e não linka neste
+host. Deriva-se um config em scratch — `os = "macos"`, `arch = "aarch64"` (`arm64` **não**
+é aceito; `mc --host` diz o par certo) — sem o bloco `[linker]`, para o alvo sair pelo
+backend `macho-exe` embutido:
 
 ```sh
-sed -e 's#^os   = .*#os   = "macos"#' -e 's#^arch = .*#arch = "aarch64"#' mc.toml \
+sed -e 's#^os   = .*#os   = "macos"#' -e 's#^arch = .*#arch = "aarch64"#' teko.toml \
   | grep -v '^\[linker\]' | grep -v '^cmd  = ' | grep -v '^args = ' > mc.macos.toml
 mc build . --config mc.macos.toml
 ./build/teko-hello; echo $?          # 42
@@ -639,10 +678,11 @@ cega — o CI pegou um defeito que a validação absoluta não via (D224).
 
 Hoje isso dá **45/45 em exit 42/70** (o número de fixtures cresceu desde que este texto foi
 escrito; o laço em si não mudou). `mc.macos.toml`, os `mc.*.toml` transientes
-e `build/` **nunca se commitam**, e `mc.toml` fica intacto por padrão — só o
+e `build/` **nunca se commitam**, e `teko.toml`/`mc.toml` ficam intactos por padrão — só o
 **crumb que o autoriza explicitamente** (S1, plano §64/§65: `[compiler]` ganhou `core`/
-`modules`; S2, plano §64/§66: `[compiler].out` virou `"build/teko"`) pode tocá-lo, e só
-as chaves que esse crumb nomeia. Editá-lo fora de um crumb autorizado quebra o CI. **S4.1**
+`modules`; S2, plano §64/§66: `[compiler].out` virou `"build/teko"`; passo 4 do rebase: o
+split em dois manifestos) pode tocá-los, e só as chaves que esse crumb nomeia. Editá-los
+fora de um crumb autorizado quebra o CI. **S4.1**
 (módulos `.tk`, §5) tocou `[compiler].modules`/`[package]` por nome de arquivo, não por chave nova
 — o laço acima e o `sed` de derivação de host continuam idênticos, o `mc build`/`mc limits`
 não distingue `.mc` de `.tk` num módulo.
