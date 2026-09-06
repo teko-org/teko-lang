@@ -13,7 +13,8 @@ módulos (hooks), em vez de um compilador próprio. Desde S4.1 (plano §64(f)) o
 repositório) e `user.mc` (o driver do projeto) ficam `.mc`, por não serem do
 pacote (D64.7).
 
-**`src/` está CONGELADO e NÃO se toca.** Todo trabalho novo vive em `ngen/`.
+**`src/` (o compilador antigo) foi REMOVIDO no passo 1 do rebase (2026-09-06); toda menção a `src/`
+neste documento é histórica.** Todo trabalho novo vive em `ngen/` (e, após o passo 2, na raiz).
 
 Contexto completo: `docs/design/port-teko-mc.md` e as entradas **D211, D212,
 D213, D214** do `DECISION_LOG.md`. Leia-as — são leis, não sugestões.
@@ -34,6 +35,11 @@ o `mc.toml` da raiz, **sem `[project]`** (regra do registro, D230 adendo 2);
 `ngen/mc.toml` (ou o que restar dele na raiz) fica só com `[project]`/
 `[compiler]`/`[target]`/… para o `mc build`. Detalhe completo em
 `docs/design/pr-org-ngen.md` §7 e `DECISION_LOG.md` D230.
+
+**Passo 1 do rebase FEITO** (`docs/design/plano-rebase-raiz.md` §4): saíram 1 261 ficheiros /
+38,5 MB de legado — `src/`, `bootstrap/`, `.crumbs/`, `examples/`, `cases/`, `scripts/`,
+`tooling/`, `packaging/`, os 22 `TEKO_*.md` e todo o `docs/` menos `docs/brand/` e as nove docs
+de design vivas; ficam `ngen/`, a raiz cívica, `.github/` e o `DECISION_LOG.md`.
 
 ## 2. Leis que valem aqui (resumo do que mais pega)
 
@@ -114,7 +120,7 @@ o `mc.toml` da raiz, **sem `[project]`** (regra do registro, D230 adendo 2);
 
 O CI do compilador antigo (`pr.yml` fixpoint/self-host, nightly, seeds, `theory/*`,
 release do bootstrap, tag-on-version-bump) está **desativado** no GitHub — 17
-workflows em `disabled_manually`; os arquivos seguem no repo, `src/` está congelado.
+workflows em `disabled_manually`; os arquivos e o `src/` foram removidos no passo 1 do rebase (histórico).
 Ativos: **`ngen (mc) CI`**, CodeQL, Branch policy, Mirror PR. O ruleset `main` passou
 a exigir **só** o check `mc build ngen && run` (antes: "CI gate" e "Test suite gate" do
 `pr.yml`, que nunca mais fechariam). `fix/retirement` não tem proteção; o ruleset

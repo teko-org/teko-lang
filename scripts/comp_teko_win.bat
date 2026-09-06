@@ -1,1 +1,0 @@
-powershell -File .\scripts\comp_teko_win.ps1 %*

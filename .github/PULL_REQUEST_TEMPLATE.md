@@ -4,14 +4,14 @@
 
 ## Checklist (project invariants — see CONTRIBUTING.md)
 
-- [ ] **Base branch is `main`** (or active remodel umbrella if during a wave)
-- [ ] **Native engine only** (legacy engine retired #524): all code in Teko (`.tks`), no C bootstrap
-- [ ] **Seed from released binary**: `./scripts/fetch_teko.sh && ./.teko/teko . -o bin` (test gate green). The invariant is that the seed builds `main`, not necessarily this PR's tip — CI stages a bootstrap through `gen1(main)` via `scripts/build_with_seed_fallback.sh` when the raw seed cannot compile the tip directly (owner ruling 2026-07-24)
-- [ ] Fixpoint: gen-1 rebuilds itself byte-identical (gen-2 == gen-1 after re-compile)
-- [ ] **Coverage of new code:** at least 100% coverage on the delta
-- [ ] New behavior covered by a regression example (`examples/regressions/…`) and/or `.tkt` tests
+- [ ] **Base branch is `main`**
+- [ ] All work lives in `ngen/` — the teko-over-mc port (`docs/design/port-teko-mc.md`)
+- [ ] Toolchain pinned: built with the `mc` release named by `ngen/MC_VERSION` (never `latest`)
+- [ ] `mc build ngen --config <host config>` builds and the fixture loop is green (exit 42/70)
+- [ ] Fixpoint: `sh ngen/scripts/bootstrap.sh` prints `FIXPOINT OK` (teko1 == teko2, byte-identical)
+- [ ] `ngen (mc) CI` green on every leg
 
 ## Design rulings
 
-<!-- If this PR implements or depends on a design decision, link the law/ruling
-     (TEKO_CONSTITUTION.md / TEKO_LEGISLATION.md / master-plan item). Write "none" otherwise. -->
+<!-- If this PR implements or depends on a design decision, link it (DECISION_LOG.md entry or
+     docs/design/*.md section). Write "none" otherwise. -->
