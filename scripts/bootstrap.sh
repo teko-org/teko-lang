@@ -32,12 +32,12 @@
 # the ladder RUNS every stage it builds, so a target that is not this machine is
 # refused rather than cross-built into something nothing can execute.
 #
-# `--linker-toml FILE` REPLACES `mc.toml`'s own `[linker]` with the blocks
+# `--linker-toml FILE` REPLACES `teko.toml`'s own `[linker]` with the blocks
 # in FILE -- `[sysroot]` and `[linker]` as the CI's Windows leg writes them.
 # Windows has no direct-executable backend and no C runtime, so `cc` is not a
 # linker there: the link is `lld-link` against a sysroot of three files
 # (`.github/actions/windows-sysroot`). Everywhere else the option is not passed
-# and `mc.toml`'s `[linker] cc` stands.
+# and `teko.toml`'s `[linker] cc` stands.
 #
 # `mc` has to already be on PATH -- this script never downloads one. The `mc`
 # the CI puts on PATH before this script runs is the version PINNED by
@@ -49,14 +49,15 @@
 # prelude's `while`/`for` from the core sources once the dialect taught the same
 # lexeme (plano §70(f)); 0.15.10's TE_RULE fixed it and the ladder closes.
 #
-# The derived configs are written next to `mc.toml` (an entry path is
-# resolved against the CONFIG's own directory, so a config in a scratch
-# directory cannot find `mc_teko.tk`) and removed on exit; `mc.toml`
+# The build config is `teko.toml`; the root's `mc.toml` carries only `[package]`
+# and no build reads it. The derived configs are written next to `teko.toml` (an
+# entry path is resolved against the CONFIG's own directory, so a config in a
+# scratch directory cannot find `mc_teko.tk`) and removed on exit; `teko.toml`
 # itself is never touched. They always carry a `[linker]` block on purpose --
-# `mc.toml`'s own, or the one `--linker-toml` names: with a linker `mc`
-# writes `<out>.o` and hands it over, which is what leaves the object on disk
-# for the `cmp`, and without one the built-in executable backend writes the
-# binary and no object at all.
+# `teko.toml`'s own, or the one `--linker-toml` names: with a linker `mc` writes
+# `<out>.o` and hands it over, which is what leaves the object on disk for the
+# `cmp`, and without one the built-in executable backend writes the binary and
+# no object at all.
 #
 # On Windows every stage is named `<name>.exe`, because that is what the loader
 # there requires and what `[compiler].out` already gets from `mc` itself; `mc`
@@ -82,8 +83,8 @@ if [ -n "$linker" ] && [ ! -f "$linker" ]; then
     exit 1
 fi
 
-if [ ! -f mc.toml ]; then
-    echo "FAIL: run from the repository root (mc.toml not found)" >&2
+if [ ! -f teko.toml ]; then
+    echo "FAIL: run from the repository root (teko.toml not found)" >&2
     exit 1
 fi
 if [ ! -f mc_teko.tk ]; then
@@ -163,17 +164,17 @@ write_target_tail() {
     echo "-- glibc machine: [target] interp $loader, libc gnu --"
 }
 
-# `mc.toml` minus the `[linker]` block when one is being substituted; the
+# `teko.toml` minus the `[linker]` block when one is being substituted; the
 # whole file otherwise. Same `awk` the CI's leg config uses.
 base_config() {
     if [ -z "$linker" ]; then
-        cat mc.toml
+        cat teko.toml
         return 0
     fi
-    awk '/^\[/ { skip = ($0 == "[linker]") } !skip' mc.toml
+    awk '/^\[/ { skip = ($0 == "[linker]") } !skip' teko.toml
 }
 
-# derive CONFIG ENTRY OUT -- mc.toml with the host's own target and one
+# derive CONFIG ENTRY OUT -- teko.toml with the host's own target and one
 # stage's entry/output, the same `sed` shape HANDOFF.md §4 uses for a fixture
 derive() {
     base_config \
