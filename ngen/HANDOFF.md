@@ -35,6 +35,11 @@ o `mc.toml` da raiz, **sem `[project]`** (regra do registro, D230 adendo 2);
 `[compiler]`/`[target]`/… para o `mc build`. Detalhe completo em
 `docs/design/pr-org-ngen.md` §7 e `DECISION_LOG.md` D230.
 
+**Passo 1 do rebase FEITO** (`docs/design/plano-rebase-raiz.md` §4): saíram 1 261 ficheiros /
+38,5 MB de legado — `src/`, `bootstrap/`, `.crumbs/`, `examples/`, `cases/`, `scripts/`,
+`tooling/`, `packaging/`, os 22 `TEKO_*.md` e todo o `docs/` menos `docs/brand/` e as nove docs
+de design vivas; ficam `ngen/`, a raiz cívica, `.github/` e o `DECISION_LOG.md`.
+
 ## 2. Leis que valem aqui (resumo do que mais pega)
 
 - **Comunicação com o dono é sempre em PT-BR.** Nunca use menu de opções/quiz;

@@ -87,6 +87,11 @@ o registro aceita dois subpaths do mesmo repo (raiz e `tool/`) ou o tool vai par
 
 1. **Remover o legado** (§1) + podar `.gitignore`/`.gitattributes` — gate: 5 pernas + fixpoint
    (nada muda para o ngen). Remover ANTES do move elimina as duas únicas colisões (`scripts/`, `README.md`).
+   **✔ FEITO** (`ngen/rebase-1-legado`): **1 261 ficheiros / 38,5 MB** removidos, de 1 411 rastreados
+   para 150 (91 deles em `ngen/`). `PULL_REQUEST_TEMPLATE.md` e os dois templates de issue citavam
+   caminhos que saíram (`scripts/fetch_teko.sh`, `examples/regressions/`, `TEKO_CONSTITUTION.md`) —
+   reescritos para o gate do ngen; `CODEOWNERS` não cita caminho e ficou intacto. `mc pkg hash ngen`
+   inalterado: nenhum ficheiro de `ngen/` mudou além do `HANDOFF.md`, que não está em `[package].files`.
 2+3. **`git mv ngen/* .` + ajustar caminhos** (`.github/**`, `scripts/bootstrap.sh`, `measure.sh`,
    CodeQL `paths`) **num único commit** (o `mv` sozinho deixa o CI vermelho) — gate: 5 pernas +
    `bootstrap.sh` (fixpoint + 45/45).

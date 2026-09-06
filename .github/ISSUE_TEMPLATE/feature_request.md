@@ -16,8 +16,8 @@ assignees: ''
 
 ## Law-first analysis
 
-<!-- Teko resolves design tensions via TEKO_CONSTITUTION.md (Laws M.0–M.5), not preference.
-     Which laws does the proposal satisfy? Does it conflict with a ratified ruling in
-     TEKO_LEGISLATION.md or a settled item in TEKO_MASTER_PLAN.md? -->
+<!-- Teko resolves design tensions by ruling, not preference. Which entry of DECISION_LOG.md
+     (or which section of docs/design/*.md) does the proposal satisfy, and does it conflict
+     with a more recent one? The most recent ruling wins. -->
 
 ## Alternatives considered
