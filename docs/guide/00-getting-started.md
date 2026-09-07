@@ -89,7 +89,8 @@ compiler, so it compiles the entry and nothing else.
 
 ## Run the fixtures
 
-Every program in [`../../tests/`](../../tests/) carries a `// expect-exit: N` oracle, and
+Every program in [`tests/`](https://github.com/teko-org/teko-lang/tree/main/tests) carries
+a `// expect-exit: N` oracle, and
 each one exercises one part of the surface. The loop that runs all 45 of them is in
 [`CONTRIBUTING.md`](../../CONTRIBUTING.md); it is the same shape as the two commands
 above, once per file.

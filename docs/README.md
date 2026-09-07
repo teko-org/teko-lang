@@ -55,6 +55,16 @@ compiler, the decision log entries that predate the port, the design documents t
 here — lives in the private repository `teko-org/teko-history`, in Portuguese. This
 repository is English-only and describes only what runs today.
 
+## Where this documentation is published
+
+This tree is the source of [teko-lang.org](https://teko-lang.org). The four sections above
+become the site's four sections; `home-extra.md` is the home page's prose, which is why it
+sits at this root and belongs to no section; `brand/` and `history/` are not rendered, and
+a link to either resolves to the file on GitHub. The generator is `mcsite`,
+`minicompiler/mc`'s own, built from the release `MC_VERSION` pins and never vendored here —
+[`site/README.md`](../site/README.md) is how it is configured and how to look at a page
+locally.
+
 ## How this documentation is checked
 
 `sh scripts/check-docs.sh` (also the `docs` job in CI) checks that every relative

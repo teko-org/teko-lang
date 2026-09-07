@@ -3,7 +3,8 @@
 Task-oriented, read in order: install the toolchain, get a program running, then one page
 per part of the surface. Every fenced example is a **whole program**, compiled and run by
 [`../../scripts/check-docs.sh`](../../scripts/check-docs.sh) with its `// expect-exit: N`
-as the assertion, and derived from the fixtures in [`../../tests/`](../../tests/) — so
+as the assertion, and derived from the fixtures in
+[`tests/`](https://github.com/teko-org/teko-lang/tree/main/tests) — so
 nothing here describes a construct the taught compiler cannot compile.
 
 | page | covers |

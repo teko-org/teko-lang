@@ -1,0 +1,148 @@
+name: site
+
+# Builds teko-lang.org out of `docs/` and deploys it to GitHub Pages.
+#
+# THE GENERATOR IS NOT VENDORED. `mcsite` is `minicompiler/mc`'s own site
+# generator, written in mc: this workflow checks that repository out at the TAG
+# `MC_VERSION` pins -- the same release `setup-mc` downloads -- builds `mcsite`
+# there with that release, and runs the binary over `site/site.toml`. So the
+# generator can never drift from the compiler this repository is pinned to, and
+# raising the pin moves both at once. Everything `mcsite` needs at run time is
+# resolved against the directory holding `site.toml` (the templates, the static
+# files, `tools/*.py`), so nothing of the mc checkout is read after the build.
+#
+# `--check` is the gate: it resolves every internal link of every page it wrote,
+# then spawns `site/tools/checkhtml.py` (structure, accessibility and the three
+# Content-Security-Policy rules) and `site/tools/contrast.py` (WCAG ratios read
+# out of `site/static/site.css`). It runs on a PULL REQUEST too, without
+# deploying, so a documentation page that breaks the site is caught before the
+# merge and not after it.
+#
+# `actions/configure-pages` is deliberately absent: `[site] base_url` is `/`,
+# this site is served at the root of its own domain, and nothing here needs the
+# base path that action computes.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "site/**"
+      - ".github/workflows/site.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "site/**"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time, and never cancel one halfway: `pages` is the group
+# GitHub's own Pages actions expect.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # The same action every other job uses, so the site is rendered by the
+      # generator of the release the fixtures were proved on.
+      - name: set up the mc toolchain
+        id: mc
+        uses: ./.github/actions/setup-mc
+        with:
+          os: linux
+          arch: x86_64
+          asset: x86_64
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: check minicompiler/mc out at the pinned tag
+        uses: actions/checkout@v5
+        with:
+          repository: minicompiler/mc
+          ref: ${{ steps.mc.outputs.tag }}
+          path: _mc
+          persist-credentials: false
+
+      # site/mc.linux.toml is site/mc.toml with the Linux host layer of the
+      # generator (the `struct dirent` offsets); it carries no [target], so the
+      # build takes the pair of this runner and mc's own ELF writer emits the
+      # executable -- no linker and no sysroot. With no [target] it also takes
+      # the DEFAULT PT_INTERP, which is musl's loader; a GitHub runner is
+      # glibc, and such a binary answers `cannot execute: required file not
+      # found` the moment anything runs it. So the config is DERIVED, never
+      # edited: the host pair written out plus this machine's own loader,
+      # exactly the tail ngen.yml's two Linux legs append to teko.toml.
+      # (`libc` is a family since mc 0.12.1; the pin is 0.15.13 and only moves
+      # forward.) The binary lands in _mc/build/mcsite.
+      - name: build mcsite from that checkout
+        env:
+          MC_DIR: ${{ steps.mc.outputs.dir }}
+        run: |
+          set -eu
+          cd _mc
+          cp site/mc.linux.toml site/mc.ci.toml
+          cat >>site/mc.ci.toml <<'TOML'
+
+          [target]
+          os     = "linux"
+          arch   = "x86_64"
+          interp = "/lib64/ld-linux-x86-64.so.2"
+          libc   = "gnu"
+          TOML
+          cat site/mc.ci.toml
+          "$MC_DIR/mc" build site --config site/mc.ci.toml
+          test -x build/mcsite
+
+      - name: render the site and check it
+        run: |
+          set -eu
+          _mc/build/mcsite site --check
+
+      - name: assemble public/
+        run: |
+          set -eu
+          rm -rf public
+          cp -R site/public public
+          # The custom domain, carried in the artifact so a deployment cannot
+          # drop it (DECISION_LOG.md D28).
+          echo teko-lang.org > public/CNAME
+          find public -maxdepth 2 | sort | head -40
+
+      - name: upload the Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    name: deploy
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
