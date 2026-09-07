@@ -113,8 +113,10 @@ direction, and it holds in every slot: a variable initializer, an assignment, a 
 an argument (of a free function, a method, a virtual call, an interface call), an element
 of a `params f64[]`, a field store, and a binary mixing the two — where the integer
 operand is converted whichever side it stands on, so `1 + 2.5` and `2.5 + 1` are both
-three point five. The conversion is a cast the compiler writes for you; nothing is lost,
-because an `f64` holds every `i64` the source can spell as a literal.
+three point five. The conversion is a cast the compiler writes for you, and it rounds the
+way C#'s `long` to `double` does: an `f64` carries 53 bits of precision, so every integer up
+to 2^53 in magnitude arrives exact and a larger one lands on the nearest representable
+double.
 
 ```teko
 // expect-exit: 42
