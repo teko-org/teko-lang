@@ -338,3 +338,33 @@ parameter count, both element types taking the arguments — is
 carries at most **64** arguments, because resolution types them as a set; a name declared
 once has no ceiling. The design, the steps and what each of them measured are
 [`docs/specs/params-typed.md`](docs/specs/params-typed.md).
+
+### D30 · Ownership is a column of its own; purity is never asked to stand in (2026-09-07)
+`tk_xt` ([`teko_struct.tk`](teko_struct.tk)) answers two questions about a node teko built,
+and they are different questions. `xt_pure` is **"may this be evaluated twice?"** — read by
+`tk_pure`, and by the virtual-call shaping alone, before `tk_clone` copies a receiver into
+the vtable load. `xt_own` is **"does the value carry a reference of its own?"** — read by
+`tk_rc_own` ([`teko_rc.tk`](teko_rc.tk)), and through it by the three lowerings of the
+reclaim: a borrowed value is not parked, is incremented into an owning slot, and is
+incremented on the way out of a counted `return`.
+
+They agree for most nodes — a load is pure and borrowed, a call that hands out a reference
+is neither — and that coincidence is what let one column carry both. It cannot: **a node may
+be borrowed and effectful at once.** Every `tkarr_put_T` link of a `params` chain
+([`teko_params.tk`](teko_params.tk)) is one — it stores an element, takes a reference for a
+counted one, and hands the array back — and it was registered `xt_pure = 1` to say the chain
+carries a single reference. That said "duplicate me freely" to whoever would.
+
+The rule: **never mark a node pure to say it is borrowed.** Ownership is `TK_OWNED` or
+`TK_BORROWED` in `xt_own`; `tk_xt_put`/`tk_xt_add` take both answers, so a registration
+states both and the site that knows says so once. The audit of all forty registrations in
+the port is
+[`docs/internals/nodes-and-xt.md`](docs/internals/nodes-and-xt.md) § *Purity and ownership
+are two questions*: the loads are pure and borrowed, the calls are neither, the `params` link
+is borrowed and not pure, and six sites that said `pure = 0` about a NAME to mean "owned" now
+say what they mean.
+
+No accepted program changes by it. The `params` pass runs behind the oracle, the last pass
+that consults `tk_pure`, so nothing had duplicated a link — the correction stops the next
+pass to be moved from inheriting a licence nobody meant to give, and that is worth a column
+rather than a comment.

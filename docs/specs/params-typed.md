@@ -3,9 +3,10 @@
 **Built, and what runs today** is [the parameters reference](../reference/parameters.md)
 § `params`. This page is the design it was built from; the steps stand as
 **P0 ✔** (the probes), **C1 ✔** (the element store), **C2 ✔** (the flip: the modifier, the
-call site, the pass move, and the removal of the word list) and **C3 ✔** (overload
-resolution with a list among the candidates). What the flip and the resolution measured,
-and where each diverged, is recorded at the bottom of this page.
+call site, the pass move, and the removal of the word list), **C2b ✔** (the ownership
+registration corrected: borrowed is not pure) and **C3 ✔** (overload resolution with a list
+among the candidates). What the flip and the resolution measured, and where each diverged,
+is recorded at the bottom of this page.
 
 It needs nothing new from `mc`. The parameter position and the `T[]` type suffix are both
 already reachable, and `params` stops being the parameter's **type** and becomes a
@@ -81,7 +82,8 @@ two halves and both are needed:
 - the **call site** registers the OUTER node as **borrowed**, so the park happens once, at
   the allocator inside — registering it as owned parks the same array once per link, and the
   statement's sweep then releases it as many times as it parked it (`teko: reference count
-  below zero`, measured);
+  below zero`, measured). **Borrowed is the ownership answer and nothing else**: a link is a
+  store, so it is not pure, and the two are separate columns of `tk_xt` (C2b below);
 - the **generated store** registers the name it returns as **owned**, because
   `tk_rc_return` increments a *borrowed* value on the way out of a function whose declared
   return type is counted. An increment per link is the mirror defect: a reference the sweep
@@ -193,6 +195,33 @@ Two mechanisms the design did not name:
   declaration of this name" does not answer for a **parameter** — which is exactly the name
   a list is passed on under (`total(rest)`). The pass reads the parameter list of the
   declaration it is walking, and falls back to that table and then to a global `T[]`.
+
+---
+
+## What C2b corrected
+
+The design above says "registers the outer node as **borrowed**", and the flip wrote that as
+`xt_pure = 1`. Wrong column. `xt_pure` is the flag that says a node is **safe to
+re-evaluate** — `tk_pure`, which the virtual-call shaping reads before `tk_clone` copies a
+receiver into the vtable load. A `tkarr_put_T` link is a **store**, plus an `rt_own` on a
+counted element, so declaring it pure handed out a licence to duplicate both. What the site
+meant was ownership, and ownership is a different question.
+
+So `tk_xt` carries an `xt_own` column of its own, `TK_OWNED` or `TK_BORROWED`; `tk_rc_own`
+reads that and nothing else, `tk_pure` answers purity alone, and both writers take both
+answers so every registration in the port states both. The audit of all forty of them is in
+[nodes-and-xt.md](../internals/nodes-and-xt.md) § *Purity and ownership are two questions*.
+
+**The hazard was latent, not live.** The `params` pass runs behind the oracle, and the
+oracle is the last pass that consults `tk_pure` — so no shaper ever saw a link, and a probe
+that puts a chain in all four positions a shaper reaches for (the receiver of a call, an
+argument of a virtual call, an operand of an overloaded operator, an arm of `?:` and of a
+`switch` expression) counts one construction per element and `rt_live()` back to zero on the
+commit **before** the correction as much as after it. The correction is contractual: it
+stops the next pass to be moved from inheriting a licence nobody meant to give. The receiver
+case is in the fixture (`boxed`), and the shape the purity gate really guards — a chain as
+the receiver of a **virtual** call — is the refusal it always was,
+`teko: a virtual call needs a name or a field on the left`.
 
 ---
 

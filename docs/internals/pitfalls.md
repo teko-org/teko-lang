@@ -20,6 +20,15 @@ the core's function parser, so its statements belong to nobody until the handler
 middle of an argument list truncates the list. *Symptom:* arguments disappear after the
 rewritten one.
 
+**Never say "pure" to mean "borrowed".** `xt_pure` is "safe to re-evaluate", read by the
+virtual-call shaping before it clones a receiver; `xt_own` is "carries a reference of its
+own", read by the reclaim. They agree for a load and for a call, which is what makes the
+conflation look free — but a node may be borrowed **and** effectful, and a `params` chain's
+`tkarr_put_T` link is one: it stores an element and hands the array back. Marking it pure to
+keep the reclaim from parking it twice licensed a later pass to duplicate the store.
+*Symptom:* none, until a pass that consults `tk_pure` is moved behind the one that built the
+node — then a store, and an `rt_own` on a counted element, runs twice.
+
 **The registration goes on the node the shaper returns.** A cast that **declares** a
 `callp`'s return type only counts when it sits directly on it; any node inserted between
 breaks the match in silence. *Symptom:* a float return reads as an integer, or a counted
