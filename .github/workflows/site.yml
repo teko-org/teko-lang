@@ -79,16 +79,33 @@ jobs:
           persist-credentials: false
 
       # site/mc.linux.toml is site/mc.toml with the Linux host layer of the
-      # generator; neither carries a [target] section, so the build takes the
-      # pair of this runner and mc's own ELF writer emits the executable --
-      # no linker and no sysroot. The binary lands in _mc/build/mcsite.
+      # generator (the `struct dirent` offsets); it carries no [target], so the
+      # build takes the pair of this runner and mc's own ELF writer emits the
+      # executable -- no linker and no sysroot. With no [target] it also takes
+      # the DEFAULT PT_INTERP, which is musl's loader; a GitHub runner is
+      # glibc, and such a binary answers `cannot execute: required file not
+      # found` the moment anything runs it. So the config is DERIVED, never
+      # edited: the host pair written out plus this machine's own loader,
+      # exactly the tail ngen.yml's two Linux legs append to teko.toml.
+      # (`libc` is a family since mc 0.12.1; the pin is 0.15.13 and only moves
+      # forward.) The binary lands in _mc/build/mcsite.
       - name: build mcsite from that checkout
         env:
           MC_DIR: ${{ steps.mc.outputs.dir }}
         run: |
           set -eu
           cd _mc
-          "$MC_DIR/mc" build site --config site/mc.linux.toml
+          cp site/mc.linux.toml site/mc.ci.toml
+          cat >>site/mc.ci.toml <<'TOML'
+
+          [target]
+          os     = "linux"
+          arch   = "x86_64"
+          interp = "/lib64/ld-linux-x86-64.so.2"
+          libc   = "gnu"
+          TOML
+          cat site/mc.ci.toml
+          "$MC_DIR/mc" build site --config site/mc.ci.toml
           test -x build/mcsite
 
       - name: render the site and check it
