@@ -57,6 +57,18 @@
 //      under a null one -- a segmentation fault inside the compiler, at the
 //      `str_eq` of `tk_taint_find` (teko_deleg.tk). Written in the natural
 //      order, it now compiles, and `made` and the closure both answer.
+//  20. `partial_close_check` (K6) -- the same trap from the other side: a
+//      `partial class` closes at its first USE, so a `new Shape()` in the
+//      middle of a body is what emits the vtable, the interface table, the
+//      release and the allocators. Those were the last generators still
+//      adding through a bare `top_add`, and a `use (&acc)` written after the
+//      `new` crashed the compiler exactly as item 19 did.
+//  21. `accessor_owner_check` (K6) -- an ARROW accessor (`get => ...;` /
+//      `set => ...;`) reads its own body instead of handing it to
+//      `parse_function`, so it used to belong to no declaration at all: once
+//      any lambda above had tainted a name, the `set`'s own statement asked
+//      `tk_taint_owner` and got a null owner -- the same crash, without a
+//      single generated declaration involved.
 //
 // expect-exit: 42
 
@@ -114,6 +126,26 @@ i64 bump_free(i64 x) {
 
 class Cell<T> {
     public T v;
+}
+
+interface Tagged {
+    i64 tag();
+}
+
+partial class Shape : Tagged {
+    public i64 w;
+}
+
+partial class Shape {
+    public i64 h;
+
+    public i64 tag() {
+        return 7;
+    }
+
+    public i64 area() {
+        return w * h;
+    }
 }
 
 namespace geo {
@@ -307,6 +339,35 @@ i64 midbody_gen_check() {
     return 0;
 }
 
+class Gauge {
+    i64 store;
+
+    public i64 Side {
+        get => store;
+        set => store = value;
+    }
+}
+
+i64 accessor_owner_check() {
+    Gauge g = new Gauge();
+    g.Side = 5;
+    if (g.Side != 5) return 1;
+    return 0;
+}
+
+i64 partial_close_check() {
+    Shape s = new Shape();                         // the partial class closes HERE (K6)
+    s.w = 3;
+    s.h = 4;
+    i64 acc = 0;
+    Op byref = new Op((i64 x) use (&acc) => { acc = acc + x; return acc; });
+    if (s.area() != 12) return 1;
+    if (s.tag() != 7) return 2;                    // its interface table, emitted at the close too
+    if (byref(5) != 5) return 3;
+    if (acc != 5) return 4;
+    return 0;
+}
+
 i64 main() {
     i64 bad = nocap_check();
     if (bad != 0) return 10 + bad;
@@ -382,6 +443,14 @@ i64 main() {
     bad = midbody_gen_check();
     if (bad != 0) return 370 + bad;
     if (rt_live() != 0) return 380;
+
+    bad = partial_close_check();
+    if (bad != 0) return 390 + bad;
+    if (rt_live() != 0) return 400;
+
+    bad = accessor_owner_check();
+    if (bad != 0) return 410 + bad;
+    if (rt_live() != 0) return 420;
 
     return 42;
 }
