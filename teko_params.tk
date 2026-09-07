@@ -36,6 +36,11 @@
 // declared return type is counted, so left alone each would be parked again
 // and the sweep would release the same array once per link.
 //
+// BORROWED IS NOT PURE. A `put` writes a slot and takes a reference for a
+// counted element, so re-evaluating one is not free and nothing may duplicate
+// it; the two answers are separate columns of `tk_xt` for exactly that reason
+// (teko_struct.tk, TK_OWNED/TK_BORROWED beside `xt_pure`).
+//
 // WHERE THE PASS RUNS. Behind the oracle, `ref`, the delegates and the
 // operators, because those are what give an argument its type: a delegate call
 // is only a typed `callp` once teko_deleg.tk has run, and an overloaded
@@ -466,12 +471,13 @@ i64 tk_pm_count(i64 tail) {
 
 // the chain itself: the allocator, then one `put` per argument. The allocator
 // is the one node registered OWNED -- the whole chain carries its single
-// reference -- and every link above it is registered borrowed, so the reclaim
-// parks the array exactly once.
+// reference -- and every link above it is registered BORROWED, so the reclaim
+// parks the array exactly once. Borrowed is the ownership answer and nothing
+// else: a `put` is a STORE, so it is not pure and nothing may re-evaluate it.
 i64 tk_pm_pack(i64 si, i64 ty, i64 ety, i64 tail, i64 v, i64 first, uptr tys, i64 line, uptr fl) {
     tk_ha_ensure_put(si);
     i64 pack = tk_call(tk_ha_allocname(ety), tk_int(v));
-    tk_xt_add(pack, si, 0);
+    tk_xt_add(pack, si, 0, TK_OWNED);
     uptr put = tk_ha_putname(ety);
     i64 w = type_width(ety);
     i64 t = tail;
@@ -482,7 +488,7 @@ i64 tk_pm_pack(i64 si, i64 ty, i64 ety, i64 tail, i64 v, i64 first, uptr tys, i6
         set_nd_next(t, 0);
         tk_pm_check_elem(ety, t, tk_pm_argty_at(t, first + k, tys), line, fl);
         pack = tk_call(put, list_append(list_append(pack, tk_int(TK_HAOBJSIZE + k * w)), t));
-        tk_xt_put(pack, si, ty, 1);
+        tk_xt_put(pack, si, ty, 0, TK_BORROWED);
         k = k + 1;
         t = nxt;
     }

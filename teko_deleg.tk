@@ -191,7 +191,8 @@ i64 tk_deleg_alloc_fn(i64 si, uptr allocname, uptr vtname, uptr relname, uptr th
     i64 code = tk_bin(K_ADD, tk_id("p"), tk_int(16));
     st = list_append(st, tk_stmt(tk_call2("st64", code, tk_addr(thunkname))));
     i64 r = tk_id("p");
-    tk_xt_add(r, si, 0);                          // already owned: the count above, not rc_inc
+    tk_xt_add(r, si, 1, TK_OWNED);                // a NAME, so pure; owned already, from the
+                                                  // count above -- not an rc_inc
     st = list_append(st, tk_ret(r));
     return tk_func(sr_ty_at(si), allocname, 0, tk_blk(st));
 }
@@ -275,7 +276,7 @@ i64 tk_deleg_wrap(i64 si, uptr fname, i64 line, uptr fl) {
     tk_line = line;
     tk_file = fl;
     i64 n = tk_call(tk_deleg_thunk(si, fname), 0);
-    tk_xt_put(n, si, sr_ty_at(si), 0);
+    tk_xt_put(n, si, sr_ty_at(si), 0, TK_OWNED);
     return n;
 }
 
@@ -369,7 +370,7 @@ i64 tk_deleg_call(i64 n, i64 di) {
     // to be under `n`'s identity or a counted return (`Cell c = f(7);`)
     // reads as "borrowed" and picks up an rc_inc it never sheds
     i64 ret = dg_ret_at(di);
-    tk_xt_put(n, tk_struct_by_ty(ret), ret, 0);
+    tk_xt_put(n, tk_struct_by_ty(ret), ret, 0, TK_OWNED);
     return n;
 }
 
@@ -834,7 +835,7 @@ i64 tk_lambda_prologue(uptr envname) {
         } else {
             i64 ld = tk_call(tk_ldn(lc_ty_at(i)), addr);
             i64 dsi = tk_deleg_row(lc_ty_at(i));
-            if (dsi >= 0) tk_xt_put(ld, dsi, sr_ty_at(dsi), 1);
+            if (dsi >= 0) tk_xt_put(ld, dsi, sr_ty_at(dsi), 1, TK_BORROWED);
             pre = list_append(pre, tk_var(lc_ty_at(i), lc_name_at(i), ld));
         }
         i = i + 1;
@@ -878,7 +879,8 @@ i64 tk_lambda_alloc_stmts(uptr vtname, uptr relname, uptr lamname) {
 i64 tk_lambda_alloc_fn(i64 si, uptr allocname, uptr vtname, uptr relname, uptr lamname) {
     i64 st = tk_lambda_alloc_stmts(vtname, relname, lamname);
     i64 r = tk_id("p");
-    tk_xt_add(r, si, 0);
+    tk_xt_add(r, si, 1, TK_OWNED);                // a NAME, so pure; owned from the count
+                                                  // the statements above installed
     st = list_append(st, tk_ret(r));
     return tk_func(sr_ty_at(si), allocname, param_new(TY_UPTR, "p"), tk_blk(st));
 }
@@ -992,7 +994,7 @@ i64 tk_lambda_finish(i64 si, uptr name, uptr saved, i64 prs, i64 line, uptr fl) 
     tk_top_emit(tk_lambda_alloc_fn(si, allocname, vtname, relname, name));
     if (tk_lambda_has_byref()) tk_lamref_add(allocname);
     i64 call = tk_call(allocname, tk_lambda_capture_chain(objsize));
-    tk_xt_add(call, si, 0);
+    tk_xt_add(call, si, 0, TK_OWNED);
     tk_nlc = tk_lc_base;                          // higiene 2, item 6: pop THIS lambda's own window
     tk_lc_base = saved_lc_base;
     p_set_decl_name(saved);
