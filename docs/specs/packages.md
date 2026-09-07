@@ -74,7 +74,8 @@ teko_std = "0.4.0"
 
 [compiler]
 core    = "<mc/core_min>"
-modules = ["<teko/teko.tk>", "user.mc"]
+modules = ["<teko/core_teko.mc>", "<teko/teko.tk>", "user.mc"]
+out     = "build/teko"
 ```
 
 and includes the library by package name:
@@ -89,6 +90,10 @@ is written in full.
 
 Installing the compiler as a tool is the road that opens once `mc` ships `mc tool install`;
 the `[compiler].modules` road runs today and stays valid afterwards.
+
+**Note:** `[replace]` in `mc.toml` does not skip the fetch of a non-published teko package. To develop
+against an unpublished teko, use the vendored path (`deps/teko` on the tag, with `mc.lock` pinning
+its tree hash), as `teko-org/teko-std` does.
 
 ## The closure rule
 
