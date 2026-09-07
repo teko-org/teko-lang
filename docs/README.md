@@ -37,7 +37,8 @@ yet](guide/99-what-is-not-there-yet.md).
 [`specs/`](specs/README.md): [the surface policy](specs/surface.md), [how teko is packaged
 and published](specs/packages.md), [self-hosting](specs/self-hosting.md), [the DI model
 beyond what is built](specs/dependency-injection.md), [the typed variadic
-list](specs/params-typed.md), and a [draft roadmap to v1.0.0](specs/roadmap-1.0.md).
+list](specs/params-typed.md), [`DateTime` and `TimeSpan`](specs/datetime.md),
+[`decimal`](specs/decimal.md), and a [draft roadmap to v1.0.0](specs/roadmap-1.0.md).
 
 ## The internals — how the port itself is built
 
