@@ -197,7 +197,13 @@ i64 tk_deleg_alloc_fn(i64 si, uptr allocname, uptr vtname, uptr relname, uptr th
 }
 
 // the allocator that wraps `fn` as a value of delegate row `si`, generated and
-// memoized the first time the pair is asked for -- `Op__new_add`
+// memoized the first time the pair is asked for -- `Op__new_add`.
+//
+// K6: `new Op(fn)` is an EXPRESSION, so the four declarations below are added
+// in the middle of the declaration that writes it -- through `tk_top_emit`
+// (teko_struct.tk), never a bare `top_add`, which would clear
+// `p_decl_name()` for the whole rest of that body and leave `tk_taint_owner`
+// below with no owner to key K4b's own escapes by.
 uptr tk_deleg_thunk(i64 si, uptr fn) {
     i64 i = 0;
     loop {
@@ -213,10 +219,10 @@ uptr tk_deleg_thunk(i64 si, uptr fn) {
     uptr thunkname = tk_join(tk_join(base, "__thunk_"), fn);
     uptr vtname = tk_join(tk_join(base, "__vt_"), fn);
     uptr relname = tk_join(tk_join(base, "__release_"), fn);
-    top_add(tk_deleg_thunk_fn(si, thunkname, fn));
-    top_add(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
-    top_add(tk_deleg_release_fn(relname));
-    top_add(tk_deleg_alloc_fn(si, allocname, vtname, relname, thunkname));
+    tk_top_emit(tk_deleg_thunk_fn(si, thunkname, fn));
+    tk_top_emit(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
+    tk_top_emit(tk_deleg_release_fn(relname));
+    tk_top_emit(tk_deleg_alloc_fn(si, allocname, vtname, relname, thunkname));
     if (tk_ndgi == TK_MAXDGI) err_at(tk_file, tk_line, "teko: too many delegate targets");
     set_dgi_row_at(tk_ndgi, si);
     set_dgi_fn_at(tk_ndgi, fn);

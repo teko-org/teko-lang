@@ -88,6 +88,22 @@ i64 tk_take_decl_vis();
 i64 tk_take_decl_proj();
 i64 tk_type_word(uptr name);
 
+// `top_add` for a declaration GENERATED while one of the program's own is
+// still being read -- a thunk built at `new Op(fn)`, the three functions
+// `new T[n]` needs, `tk_ix` at an array-field index: every one of them fires
+// from an expression INSIDE a body (or inside a parameter list), and
+// `top_add` CLEARS `p_decl_name()` as a side effect (mc
+// docs/reference/hooks.md § Asking about the parse). The declaration being
+// read does not end there, so whoever asks afterwards -- `tk_taint_owner`
+// (teko_deleg.tk), `tk_default_param` (teko_default.tk) -- must still get its
+// name. Restoring it is what keeps a generator invisible to the parse it
+// interrupted (DECISION_LOG.md D27).
+void tk_top_emit(i64 n) {
+    uptr owner = p_decl_name();
+    top_add(n);
+    p_set_decl_name(owner);
+}
+
 // what a row of the type table declares: struct/class/interface/delegate share
 // the table because a value of any of them is one 8-byte reference, and `.`
 // (or `callp`, for a delegate) has to tell them apart
@@ -1154,7 +1170,7 @@ void tk_ix_emit() {
                      tk_stmt(tk_call("rt_panic", tk_str("index past the end of an array field"))));
     i64 body = tk_blk(list_append(list_append(low, high), tk_ret(tk_id("i"))));
     i64 prs = list_append(param_new(TY_I64, "i"), param_new(TY_I64, "n"));
-    top_add(tk_func(TY_I64, "tk_ix", prs, body));
+    tk_top_emit(tk_func(TY_I64, "tk_ix", prs, body));
 }
 
 // A LITERAL index is decided here, against the constant the instantiation
