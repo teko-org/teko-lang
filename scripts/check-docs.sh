@@ -93,12 +93,14 @@ while read -r md; do
     for tok in $banned; do
         grep -n -F -- "$tok" "$md" 2>/dev/null | sed "s#^#$md:#" >> "$tmp/legacy"
     done
-    grep -n -F -- 'src/' "$md" 2>/dev/null | grep -vi 'mc' | sed "s#^#$md:#" >> "$tmp/legacy"
+    # a bare `src/` is the retired compiler; the mc's own `src/` is fine when the line names
+    # it as such (`minicompiler/mc`, `mc/src/`, `` `mc` ``) -- token match, not substring
+    grep -n -F -- 'src/' "$md" 2>/dev/null | grep -v -E 'minicompiler/mc|mc/src/|`mc`|<mc/' | sed "s#^#$md:#" >> "$tmp/legacy"
 done < "$tmp/live_mdfiles"
 if [ -s "$tmp/legacy" ]; then
     fail "banned legacy references outside docs/history/" "$(cat "$tmp/legacy")"
 else
-    echo "ok legacy: no ngen//.tks/teko.tkp/fetch_teko.sh/bootstrap-teko.c/bare-src outside docs/history/"
+    echo "ok legacy: no ngen/, .tks, teko.tkp, fetch_teko.sh, bootstrap/teko.c or bare src/ outside docs/history/"
 fi
 
 # ------------------------------------------------------------- 3. diagnostics

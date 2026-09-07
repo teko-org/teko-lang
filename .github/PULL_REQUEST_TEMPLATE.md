@@ -13,5 +13,5 @@
 
 ## Design rulings
 
-<!-- If this PR implements or depends on a design decision, link it (DECISION_LOG.md entry or
-     a docs/specs/*.md or docs/history/design/*.md section). Write "none" otherwise. -->
+<!-- If this PR implements or depends on a design decision, link it: a DECISION_LOG.md entry,
+     or a section of docs/specs/*.md or docs/history/design/*.md. Write "none" otherwise. -->
