@@ -694,7 +694,7 @@ i64 tk_mt_fill(i64 ci, uptr cls, i64 fi) {
     uptr mt = tk_mt_name(cls, iname);
     i64 bytes = tk_ifinst(fi) * 8;
     if (bytes == 0) bytes = 8;
-    top_add(tk_glb(TY_U8, mt, bytes));
+    tk_top_emit(tk_glb(TY_U8, mt, bytes));
     i64 stmts = 0;
     i64 slot = 0;
     i64 j = 0;
@@ -743,7 +743,7 @@ i64 tk_vt_init(i64 ci, uptr cls, uptr vt) {
     stmts = list_append(stmts, tk_vt_slots(ci, vt));
     if (sr_ni_at(ci) > 0) {
         uptr itab = tk_itab_name(cls);
-        top_add(tk_glb(TY_U8, itab, 8 + sr_ni_at(ci) * 16));
+        tk_top_emit(tk_glb(TY_U8, itab, 8 + sr_ni_at(ci) * 16));
         i64 idst = tk_bin(K_ADD, tk_id(vt), tk_int(8));
         stmts = list_append(stmts, tk_stmt(tk_call2("st64", idst, tk_id(itab))));
         stmts = list_append(stmts, tk_itab_fill(ci, cls, itab));
@@ -1321,7 +1321,7 @@ void tk_new_fn(i64 ci, uptr name, i64 size, uptr vt, uptr fn, i64 prs, uptr ctor
     i64 r = tk_id("p");
     tk_xt_add(r, ci, 0);                         // the count is 1: the caller's own reference
     st = list_append(st, tk_ret(r));
-    top_add(tk_func(sr_ty_at(ci), fn, prs, tk_blk(st)));
+    tk_top_emit(tk_func(sr_ty_at(ci), fn, prs, tk_blk(st)));
 }
 
 // one allocator per constructor, plus the plain `Name_new()` a `new Name` with
@@ -1351,6 +1351,12 @@ void tk_allocators(i64 ci, uptr name, i64 size, uptr vt) {
 // the reference count reaches, and the allocators `new` calls. An abstract class
 // emits none of them -- there is no object of it to build -- and only the size,
 // which its derived classes lay their own fields after.
+//
+// A PARTIAL class closes at its first use (`tk_close_open` below), and that use
+// may be a `new` in the middle of a body: everything emitted from here goes
+// through `tk_top_emit` (teko_struct.tk) -- here, in `tk_new_fn`, in
+// `tk_vt_init` and in `tk_mt_fill` -- so that the declaration being read keeps
+// its `p_decl_name()` (K6, DECISION_LOG.md D27).
 void tk_class_close(i64 ci) {
     if (sr_part_at(ci) == TK_PDONE) return;
     if (sr_part_at(ci) == TK_POPEN) set_sr_part_at(ci, TK_PDONE);
@@ -1363,9 +1369,9 @@ void tk_class_close(i64 ci) {
     if (sr_abst_at(ci)) return;                  // no object: no vtable and no constructor
     tk_check_overridden(ci);
     uptr vt = tk_join(tk_case(name, 0), "_vt");
-    top_add(tk_glb(TY_U8, vt, (TK_VT_FIXED + sr_nv_at(ci)) * 8));
-    top_add(tk_release_fn(ci, name, size));
-    top_add(tk_vt_init(ci, name, vt));
+    tk_top_emit(tk_glb(TY_U8, vt, (TK_VT_FIXED + sr_nv_at(ci)) * 8));
+    tk_top_emit(tk_release_fn(ci, name, size));
+    tk_top_emit(tk_vt_init(ci, name, vt));
     tk_allocators(ci, name, size, vt);
 }
 

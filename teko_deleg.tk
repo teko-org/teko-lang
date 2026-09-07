@@ -197,7 +197,13 @@ i64 tk_deleg_alloc_fn(i64 si, uptr allocname, uptr vtname, uptr relname, uptr th
 }
 
 // the allocator that wraps `fn` as a value of delegate row `si`, generated and
-// memoized the first time the pair is asked for -- `Op__new_add`
+// memoized the first time the pair is asked for -- `Op__new_add`.
+//
+// K6: `new Op(fn)` is an EXPRESSION, so the four declarations below are added
+// in the middle of the declaration that writes it -- through `tk_top_emit`
+// (teko_struct.tk), never a bare `top_add`, which would clear
+// `p_decl_name()` for the whole rest of that body and leave `tk_taint_owner`
+// below with no owner to key K4b's own escapes by.
 uptr tk_deleg_thunk(i64 si, uptr fn) {
     i64 i = 0;
     loop {
@@ -213,10 +219,10 @@ uptr tk_deleg_thunk(i64 si, uptr fn) {
     uptr thunkname = tk_join(tk_join(base, "__thunk_"), fn);
     uptr vtname = tk_join(tk_join(base, "__vt_"), fn);
     uptr relname = tk_join(tk_join(base, "__release_"), fn);
-    top_add(tk_deleg_thunk_fn(si, thunkname, fn));
-    top_add(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
-    top_add(tk_deleg_release_fn(relname));
-    top_add(tk_deleg_alloc_fn(si, allocname, vtname, relname, thunkname));
+    tk_top_emit(tk_deleg_thunk_fn(si, thunkname, fn));
+    tk_top_emit(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
+    tk_top_emit(tk_deleg_release_fn(relname));
+    tk_top_emit(tk_deleg_alloc_fn(si, allocname, vtname, relname, thunkname));
     if (tk_ndgi == TK_MAXDGI) err_at(tk_file, tk_line, "teko: too many delegate targets");
     set_dgi_row_at(tk_ndgi, si);
     set_dgi_fn_at(tk_ndgi, fn);
@@ -941,12 +947,15 @@ uptr tk_lambda_gensym(uptr base) {
 // a caller that reads its own parameter list, the short grafia below, opens
 // them BEFORE reading it too, exactly as `tk_lambda_build` always has,
 // since `p_decl_name` has to be the lambda's own for `parse_params` itself).
-// K4c: `saved` is restored only at the very END, after every `top_add` this
-// function makes -- `top_add` clears `p_decl_name()` as a side effect (mc
+// K4c: `saved` is restored only at the very END, after every declaration this
+// function emits -- `top_add` clears `p_decl_name()` as a side effect (mc
 // docs/reference/hooks.md § Asking about the parse), so restoring it BEFORE
-// the lambda's own `top_add(f)` (and the vtable/release/allocator ones right
-// behind it) left the ENCLOSING statement's own on_stmt hooks reading 0 for
-// the rest of that declaration's body -- `tk_taint_owner()`'s own bug.
+// the lambda's own function (and the vtable/release/allocator right behind it)
+// left the ENCLOSING statement's own on_stmt hooks reading 0 for the rest of
+// that declaration's body -- `tk_taint_owner()`'s own bug. K6: the four go
+// through `tk_top_emit` (teko_struct.tk) like every other generator, which
+// hands the LAMBDA's own name back between them; `saved` puts the enclosing
+// declaration's back once the lambda is whole.
 i64 tk_lambda_finish(i64 si, uptr name, uptr saved, i64 prs, i64 line, uptr fl) {
     tk_lambda_check_params(si, prs, line, fl);
     i64 saved_lc_base = tk_lc_base;               // higiene 2, item 6: a stack, not a reset
@@ -973,14 +982,14 @@ i64 tk_lambda_finish(i64 si, uptr name, uptr saved, i64 prs, i64 line, uptr fl) 
     tk_ty_scope_params(allparams);
     tk_lam_walk(nd_b(f));
     tk_nscope = 0;
-    top_add(f);
+    tk_top_emit(f);
     i64 objsize = 24 + 8 * (tk_nlc - tk_lc_base);
     uptr vtname = tk_join(name, "__vt");
     uptr relname = tk_join(name, "__release");
     uptr allocname = tk_join(name, "__new");
-    top_add(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
-    top_add(tk_lambda_release_fn(relname, objsize));
-    top_add(tk_lambda_alloc_fn(si, allocname, vtname, relname, name));
+    tk_top_emit(tk_glb(TY_U8, vtname, TK_VT_FIXED * 8));
+    tk_top_emit(tk_lambda_release_fn(relname, objsize));
+    tk_top_emit(tk_lambda_alloc_fn(si, allocname, vtname, relname, name));
     if (tk_lambda_has_byref()) tk_lamref_add(allocname);
     i64 call = tk_call(allocname, tk_lambda_capture_chain(objsize));
     tk_xt_add(call, si, 0);
