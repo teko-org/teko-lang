@@ -6,7 +6,7 @@
 #
 # BINARY is the compiler `mc build` produced (`[compiler].out`, e.g.
 # `build/teko`); CONFIG is the build config `mc build`/`mc limits` read
-# (host-derived from `teko.toml`, per HANDOFF.md §4 -- never `teko.toml`
+# (host-derived from `teko.toml`, per CONTRIBUTING.md -- never `teko.toml`
 # itself, which targets the CI's linux/x86_64 leg, and never `mc.toml`, which
 # is the package manifest and has no `[project]`); DIR is the project
 # directory `mc limits` reads, default `.` (the repository root).
