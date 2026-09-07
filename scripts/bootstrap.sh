@@ -1,7 +1,6 @@
 #!/bin/sh
-# bootstrap.sh -- S4.2 (docs/design/plano-ngen-entrega4.md §64(e), "Rito do
-# fixpoint"): the fixed point of the SELF-HOSTED teko, in the protocol of the
-# `mc` repository's own `scripts/bootstrap.sh`.
+# bootstrap.sh -- the fixpoint rite: the fixed point of the SELF-HOSTED teko,
+# in the protocol of the `mc` repository's own `scripts/bootstrap.sh`.
 #
 #   teko0 = mc build . --config <cfg> --compiler-only     (the stock mc)
 #   teko1 = teko0 build . --config <cfg1> --entry-only     over mc_teko.tk

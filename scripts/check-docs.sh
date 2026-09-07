@@ -115,7 +115,7 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
 else
     find . -type f | sed 's#^\./##' | sort > "$tmp/all_tracked"
 fi
-grep -E '\.(md|tk|mc|sh|yml|yaml|toml|cff)$' "$tmp/all_tracked" \
+grep -E '\.(md|tk|mc|sh|yml|yaml|toml|cff)$|^\.git(ignore|attributes)$' "$tmp/all_tracked" \
     | grep -v -E '^(docs/brand/|tests/|scripts/check-docs\.sh$)' > "$tmp/english_files"
 
 # Two rules. A Portuguese diacritic is decisive on its own -- no English word in this tree
