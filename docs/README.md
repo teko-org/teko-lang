@@ -26,8 +26,9 @@ dependency injection, the self-hosting fixed point.
 
 ## The specs — designed, not yet implemented
 
-[`specs/`](specs/README.md): self-hosting, the DI model beyond what is built, package
-distribution, and the roadmap of what v0.4.0 leaves out.
+[`specs/`](specs/README.md): [how teko is packaged and published](specs/packages.md),
+self-hosting, the DI model beyond what is built, and the roadmap of what v0.4.0 leaves
+out.
 
 ## The internals — how the port itself is built
 

@@ -127,12 +127,11 @@ every other library evolves on its own version line.
 ### D16 · How a consumer uses teko (2026-09-07)
 A consumer pins `[deps] teko = "x.y.z"` and names the taught compiler in its own build:
 `[compiler] modules = ["<teko/teko.tk>", "user.mc"]`, so its `mc` builds teko locally,
-nailed by the tree hash. The registry validates the package through `[package].modules`,
-compiling the declared units with the **stock** `mc` in a sandbox with no network — which
-is why the units a consumer's validation compiles have to stay expressible in `mc`'s core
-surface. Installing the compiler as a tool (`mc tool install`) is the road that opens once
-`mc` ships it; until then the `[compiler] modules` road is the one that runs, and it stays
-valid afterwards.
+nailed by the tree hash. The registry validates the package by building the taught compiler
+from `[package].modules` and the package's `[deps]` **first**, in a sandbox with no network,
+and compiling the `check` units with it (D26). Installing the compiler as a tool
+(`mc tool install`) is the road that opens once `mc` ships it; until then the
+`[compiler] modules` road is the one that runs, and it stays valid afterwards.
 
 ### D17 · Versions are `vX.Y.Z`; the first is v0.4.0 (2026-09-07)
 Three parts, `mc`'s own format. The next release of the line taught to `mc` is **v0.4.0**;
@@ -197,3 +196,17 @@ verbatim to the private repository `teko-org/teko-history`, together with the Po
 link breaks. `CLAUDE.md` was rewritten from scratch for the mc era, and this log restarted
 at D1 with the decisions in force. Nothing was translated: a decision worth keeping was
 worth restating.
+
+### D26 · Teko packages live in mc's registry, marked `toolchain = "teko"` (2026-09-07)
+There is one integrated index, not a teko one beside an mc one: `pkg.minicompiler.dev` is
+its canonical host, `pkg.teko-lang.org` an alias host serving the same bytes, and a
+read-only `/mcp` endpoint answers over the same rows. A teko package **is** an mc package
+plus `[package].toolchain = "teko"`, a key `mc` ignores and the registry classifies on:
+for a package carrying it the registry builds the taught compiler from `[package].modules`
+and the package's `[deps]` first, then compiles the `check` units with it. Three shapes —
+`teko`, the compiler; `teko_std`, the library, versioned in lockstep with it; and every
+other library on its own line over `[deps] teko_std`. The closure rule is `mc`'s: a
+package reaches its own files, the libraries the binary ships and its declared `[deps]`,
+nothing else. On mc 0.16.0 `<float>` and the two float machines move into the `stdlib`
+package and teko declares `[deps] stdlib`. The whole agreement is
+[`docs/specs/packages.md`](docs/specs/packages.md).
