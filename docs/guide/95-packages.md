@@ -32,8 +32,8 @@ check     = ["mc_teko.tk"]
 
 ## Today: consuming teko from a checkout
 
-Until the package is published, a consumer points its own build config at the modules of a
-teko checkout and gets the taught compiler out of its own `mc build`:
+Until the package is published, a consumer names the modules of a teko checkout by path in
+its own build config, and gets the taught compiler out of its own `mc build`:
 
 ```toml
 [compiler]
