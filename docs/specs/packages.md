@@ -23,21 +23,25 @@ The manifest is `mc`'s, with one key added:
 
 ```toml
 [package]
-name      = "teko_std"
-toolchain = "teko"
-licence   = "MIT OR Apache-2.0"
+name     = "teko_std"
+language = "teko"
+licence  = "MIT OR Apache-2.0"
 ```
 
-`[package].toolchain = "teko"` is what the registry classifies on. `mc` itself ignores an
+`[package].language = "teko"` is what the registry classifies on. `mc` itself ignores an
 unknown `[package]` key, so the manifest keeps working with the pinned release; the registry
-records the key when it grows support for it. Everything else — `files`, `check`, `lib`,
-`[deps]`, the lock, the tree hash — is `mc`'s and is not restated here.
+records the key when it grows support for it. **The key is an override, not a requirement**:
+a package that carries `[deps] teko` (`teko_std` and every other library over it) is
+classified `teko` from that dependency alone, with no key of its own to write — only a
+package whose own name does not say so, the compiler package `teko` itself, needs
+`[package].language` written out. Everything else — `files`, `check`, `lib`, `[deps]`, the
+lock, the tree hash — is `mc`'s and is not restated here.
 
-**Validation.** For a package marked `toolchain = "teko"` the registry **builds the taught
-compiler first**, from `[package].modules` and the package's `[deps]`, and compiles the
-`check` units **with it**, in a sandbox with no network. That is what lets a teko library
-declare check units written in teko: without the key they would be handed to the stock `mc`,
-which does not know the surface.
+**Validation.** For a package classified `teko` — by the key or by its `[deps]` — the
+registry **builds the taught compiler first**, from `[package].modules` and the package's
+`[deps]`, and compiles the `check` units **with it**, in a sandbox with no network. That is
+what lets a teko library declare check units written in teko: without the classification
+they would be handed to the stock `mc`, which does not know the surface.
 
 ## The three shapes
 
@@ -116,7 +120,7 @@ dependency is one change, made after the whole local recipe is green on the new 
 ## What is still missing here
 
 - `teko` declares `licence`; `[package].modules` is needed only where the `check` unit needs the taught compiler.
-- The registry records `[package].toolchain` when its own support lands.
+- The registry records `[package].language` when its own support lands.
 - `tekoc`, the compiler as an executable package, is a separate name published later: a
   package's kind is fixed at its first publication, so the library and the tool cannot share
   one.

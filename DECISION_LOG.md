@@ -200,15 +200,27 @@ link breaks. `CLAUDE.md` was rewritten from scratch for the mc era, and this log
 at D1 with the decisions in force. Nothing was translated: a decision worth keeping was
 worth restating.
 
-### D26 · Teko packages live in mc's registry, marked `toolchain = "teko"` (2026-09-07)
+### D26 · Teko packages live in mc's registry, marked `language = "teko"` (2026-09-07)
 There is one integrated index, not a teko one beside an mc one: `pkg.minicompiler.dev` is
 its canonical host, `pkg.teko-lang.org` an alias host serving the same bytes, and a
 read-only `/mcp` endpoint answers over the same rows. A teko package **is** an mc package
-plus `[package].toolchain = "teko"`, a key `mc` ignores and the registry will classify on
+plus `[package].language = "teko"`, a key `mc` ignores and the registry will classify on
 once its support lands (mc's R3): for a package carrying it the registry will build the
 taught compiler from `[package].modules` and the package's `[deps]` first (mc's R2), then
 compile the `check` units with it. Neither is live yet; the key is written now so the first
-publication does not change the manifest again. Three shapes —
+publication does not change the manifest again.
+
+**Correction (2026-09-07, same day):** the key mc's R3 reads is `[package].language`, not
+`toolchain` — `toolchain` is a word this log used for the concept before the mc side had
+settled the key's own spelling, and it is never read by the registry or by `mc` itself.
+R3 also DERIVES the language from `[deps] teko` when the key is absent, so a library that
+only declares that dependency (`teko_std` and every other library over it) is classified
+`teko` without carrying the key at all; `[package].language` is the explicit override a
+package needs only when its own name does not say so on its own (the compiler package
+`teko` itself, which declares no `[deps] teko`). `mc.toml` and
+[`docs/specs/packages.md`](docs/specs/packages.md) carry the corrected key.
+
+Three shapes —
 `teko`, the compiler; `teko_std`, the library, versioned in lockstep with it; and every
 other library on its own line over `[deps] teko_std`. The closure rule is `mc`'s: a
 package reaches its own files, the libraries the binary ships and its declared `[deps]`,
@@ -276,7 +288,7 @@ write` granted to that job and no other; the artifact carries `public/CNAME`, so
 deployment cannot drop the custom domain. The canonical host is **`teko-lang.org`**, served
 from GitHub Pages, and `[site] base_url` is `/` because the site is at the root of its own
 domain. The registry link in the header is the index route that is live today
-(`minicompiler.dev/packages`); it becomes the per-toolchain listing when mc's R3 lands
+(`minicompiler.dev/packages`); it becomes the per-language listing when mc's R3 lands
 (D26).
 
 A link to a repository **directory** is the one shape the generator does not map — it

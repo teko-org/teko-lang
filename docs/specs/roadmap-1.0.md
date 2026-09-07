@@ -51,7 +51,7 @@ None of these is teko's to write, and each changes what teko can promise.
 | needed from `mc` | what it unblocks here |
 |---|---|
 | the registry's **R2** — building the taught compiler from `[package].modules` and the package's `[deps]` before validating | a teko library can declare `check` units written in **teko**; until then every one of them has to be core syntax |
-| the registry's **R3** — classifying on `[package].toolchain = "teko"` | the key is written into `mc.toml` today and ignored; R3 is what makes it mean something |
+| the registry's **R3** — classifying on `[package].language = "teko"`, or on a `[deps] teko` when the key is absent | the key is written into `mc.toml` today and ignored; R3 is what makes it mean something |
 | **`mc tool install`** (the mc project's C3) | `tekoc` as an installable tool. Until it exists, the road that runs is `[compiler] modules`, and that road stays valid afterwards |
 | **stdlib 0.16.0** — `<float>` and the two float machines moving into the `stdlib` package | teko declares `[deps] stdlib` instead of relying on what the release binary bundles |
 | **a closed hook API, with a deprecation policy** | the pin can move without a survey of every module. This is the one that decides whether a 1.0 is maintainable at all |
